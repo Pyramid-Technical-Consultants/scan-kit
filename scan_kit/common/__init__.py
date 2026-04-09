@@ -1,6 +1,6 @@
 """Common utilities for scan-kit analysis scripts."""
 
-from .io import load_csv_from_zip, load_timeslice_device_units
+from .io import load_csv_from_zip, load_timeslice_device_units, load_termination_summary, SessionMeta
 from .transform import remap, IC1_X_MAP, IC1_Y_MAP, IC2_X_MAP, IC2_Y_MAP
 from .validation import create_valid_mask, apply_validation
 from .processing import load_session_raw, process_position_data
@@ -27,6 +27,8 @@ from .plotting import (
 __all__ = [
     "load_csv_from_zip",
     "load_timeslice_device_units",
+    "load_termination_summary",
+    "SessionMeta",
     "remap",
     "IC1_X_MAP",
     "IC1_Y_MAP",

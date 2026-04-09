@@ -11,8 +11,8 @@ from . import (
     dose_ratios_position,
     dose_ratios_time,
     sigma_boxplots,
-    background_current,
     beam_off_rampdown,
+    beam_on_off_current,
 )
 
 VIEWS: list[tuple[str, str, Callable[[list[str], str], None]]] = [
@@ -24,6 +24,6 @@ VIEWS: list[tuple[str, str, Callable[[list[str], str], None]]] = [
     ("Dose Ratios vs Position", "dose_ratios_position", dose_ratios_position.run),
     ("Dose Ratios vs Spot Time", "dose_ratios_time", dose_ratios_time.run),
     ("Sigma X/Y Box Plots", "sigma_boxplots", sigma_boxplots.run),
-    ("Background Current (IC1/IC2/IC3)", "background_current", background_current.run),
     ("Beam-Off Ramp-Down", "beam_off_rampdown", beam_off_rampdown.run),
+    ("Beam-On vs Beam-Off Current", "beam_on_off_current", beam_on_off_current.run),
 ]
