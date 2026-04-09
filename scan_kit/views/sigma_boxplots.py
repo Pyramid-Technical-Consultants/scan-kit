@@ -5,7 +5,14 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from matplotlib.patches import Patch
 
-from ..common import load_session_raw, create_valid_mask
+from ..common import (
+    load_session_raw,
+    create_valid_mask,
+    DEFAULT_SESSION_COLORS,
+    FIG_SIZE_SINGLE,
+    SUPTITLE_KW,
+    GRID_KW,
+)
 
 POS_KEY = "spot_position_raw"
 SIG_KEY = "spot_sigma_raw"
@@ -86,7 +93,8 @@ def run(session_ids: list[str], base_dir: str = "test_data") -> None:
 
     plot_df = pd.DataFrame(combined_data)
 
-    fig, ax = plt.subplots(figsize=(14, 8))
+    fig, ax = plt.subplots(figsize=FIG_SIZE_SINGLE)
+    fig.suptitle("Sigma X and Y by Energy", **SUPTITLE_KW)
 
     unique_energies = sorted(plot_df["energy"].unique())
     unique_sigma_types = ["ic1_sig_x", "ic1_sig_y", "ic2_sig_x", "ic2_sig_y"]
@@ -103,7 +111,7 @@ def run(session_ids: list[str], base_dir: str = "test_data") -> None:
 
     width = 0.2
     x_positions = np.arange(len(unique_energies))
-    colors = ["skyblue", "lightcoral", "limegreen", "orange"]
+    colors = DEFAULT_SESSION_COLORS[:len(unique_sigma_types)]
 
     for i, sigma_type in enumerate(unique_sigma_types):
         data_for_type = []
@@ -125,11 +133,10 @@ def run(session_ids: list[str], base_dir: str = "test_data") -> None:
             )
 
     ax.set_xticks(x_positions)
-    ax.set_xticklabels([f"{e}" for e in unique_energies], rotation=90)
-    ax.set_xlabel("Energy (MeV)", fontsize=12)
-    ax.set_ylabel("Sigma (mm)", fontsize=12)
-    ax.set_title("Sigma X and Y Grouped by Energy", fontsize=14)
-    ax.grid(True, alpha=0.3)
+    ax.set_xticklabels([f"{e:g}" for e in unique_energies], rotation=90)
+    ax.set_xlabel("Energy (MeV)")
+    ax.set_ylabel("Sigma (mm)")
+    ax.grid(**GRID_KW)
 
     legend_elements = [
         Patch(facecolor=colors[i], alpha=0.7, label=unique_sigma_types[i])

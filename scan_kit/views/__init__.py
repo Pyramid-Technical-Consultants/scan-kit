@@ -8,14 +8,22 @@ from . import (
     ic1_ic2_spot_scatter_g3,
     ic1_spot_scatter_g2,
     dose_ratios,
+    dose_ratios_position,
+    dose_ratios_time,
     sigma_boxplots,
+    background_current,
+    beam_off_rampdown,
 )
 
 VIEWS: list[tuple[str, str, Callable[[list[str], str], None]]] = [
     ("IC1 X/Y Position Bars", "ic1_position_bars", ic1_position_bars.run),
     ("IC1 vs IC2 Error Scatter", "ic1_ic2_error_scatter", ic1_ic2_error_scatter.run),
-    ("IC1/IC2 Spot Scatter (G3)", "ic1_ic2_spot_scatter_g3", ic1_ic2_spot_scatter_g3.run),
+    ("IC1 Spot Scatter (G3)", "ic1_ic2_spot_scatter_g3", ic1_ic2_spot_scatter_g3.run),
     ("IC1 Spot Scatter (G2)", "ic1_spot_scatter_g2", ic1_spot_scatter_g2.run),
-    ("Dose Ratios (IC2/IC1, IC3/IC1)", "dose_ratios", dose_ratios.run),
+    ("Dose Ratios vs Energy", "dose_ratios", dose_ratios.run),
+    ("Dose Ratios vs Position", "dose_ratios_position", dose_ratios_position.run),
+    ("Dose Ratios vs Spot Time", "dose_ratios_time", dose_ratios_time.run),
     ("Sigma X/Y Box Plots", "sigma_boxplots", sigma_boxplots.run),
+    ("Background Current (IC1/IC2/IC3)", "background_current", background_current.run),
+    ("Beam-Off Ramp-Down", "beam_off_rampdown", beam_off_rampdown.run),
 ]

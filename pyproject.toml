@@ -16,3 +16,7 @@ dependencies = [
 
 [project.scripts]
 scan-kit = "scan_kit.app:main"
+
+[tool.setuptools.packages.find]
+include = ["scan_kit*"]
+exclude = ["test_data*"]

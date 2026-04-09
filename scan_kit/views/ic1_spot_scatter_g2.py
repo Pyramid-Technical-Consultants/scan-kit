@@ -2,7 +2,15 @@
 
 import matplotlib.pyplot as plt
 
-from ..common import process_position_data
+from ..common import (
+    process_position_data,
+    FIG_SIZE_SINGLE,
+    SUPTITLE_KW,
+    GRID_KW,
+    REFLINE_KW,
+    SCATTER_ALPHA,
+    SCATTER_SIZE,
+)
 
 
 def run(session_ids: list[str], base_dir: str = "test_data") -> None:
@@ -23,52 +31,32 @@ def run(session_ids: list[str], base_dir: str = "test_data") -> None:
         print("No valid session data found!")
         return
 
-    plt.figure(figsize=(12, 10))
+    fig, ax = plt.subplots(figsize=FIG_SIZE_SINGLE)
+    sids = ", ".join(d["session_id"] for d in all_session_data)
+    fig.suptitle(f"IC1 Spot Positions (G2) — Sessions: {sids}", **SUPTITLE_KW)
 
-    center = 0
-    plt.axhline(
-        center,
-        linestyle="--",
-        color="gray",
-        alpha=0.5,
-        linewidth=1,
-        label=f"Center ({center})",
-    )
-    plt.axvline(
-        center,
-        linestyle="--",
-        color="gray",
-        alpha=0.5,
-        linewidth=1,
-    )
+    ax.axhline(y=0, **REFLINE_KW, label="Center")
+    ax.axvline(x=0, **REFLINE_KW)
 
     for session_data in all_session_data:
         session_id = session_data["session_id"]
-        ic1_x = session_data["ic1_x"]
-        ic1_y = session_data["ic1_y"]
-        energy = session_data["energy"]
-
-        scatter1 = plt.scatter(
-            ic1_x,
-            ic1_y,
-            c=energy,
+        scatter1 = ax.scatter(
+            session_data["ic1_x"],
+            session_data["ic1_y"],
+            c=session_data["energy"],
             cmap="viridis",
-            alpha=0.5,
+            alpha=SCATTER_ALPHA,
             label=f"IC1 (Session {session_id})",
             marker="o",
-            s=50,
-            edgecolors="black",
-            linewidth=0,
+            s=SCATTER_SIZE,
+            edgecolors="none",
         )
 
-    plt.colorbar(scatter1, label="Energy (MeV)")
-    plt.xlabel("X Position (mm)")
-    plt.ylabel("Y Position (mm)")
-    plt.title(
-        f"IC1 Spot Positions\nSessions: {', '.join([d['session_id'] for d in all_session_data])}"
-    )
-    plt.legend(bbox_to_anchor=(0, 1), loc="upper left")
-    plt.grid(True, alpha=0.3)
-    plt.axis("equal")
+    plt.colorbar(scatter1, ax=ax, label="Energy (MeV)")
+    ax.set_xlabel("X Position (mm)")
+    ax.set_ylabel("Y Position (mm)")
+    ax.legend(loc="upper left")
+    ax.grid(**GRID_KW)
+    ax.set_aspect("equal")
     plt.tight_layout()
     plt.show()

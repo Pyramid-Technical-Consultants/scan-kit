@@ -6,7 +6,12 @@ import matplotlib.pyplot as plt
 from ..common import (
     process_position_data,
     plot_boxplots_for_column,
+    make_session_legend,
+    style_energy_axes,
     DEFAULT_SESSION_COLORS,
+    FIG_SIZE_1x2,
+    SUPTITLE_KW,
+    REFLINE_KW,
 )
 
 
@@ -30,7 +35,8 @@ def run(session_ids: list[str], base_dir: str = "test_data") -> None:
         print("No valid data found for any session")
         return
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=FIG_SIZE_1x2)
+    fig.suptitle("IC1 X/Y Position Distribution by Energy", **SUPTITLE_KW)
 
     all_energies = set()
     for data in session_data.values():
@@ -46,28 +52,17 @@ def run(session_ids: list[str], base_dir: str = "test_data") -> None:
     y_max = max_val + padding
 
     colors = DEFAULT_SESSION_COLORS[: len(session_ids)]
-    session_labels = [f"Session {sid}" for sid in session_ids]
 
     plot_boxplots_for_column(ax1, session_data, plot_x, energies, colors)
     plot_boxplots_for_column(ax2, session_data, plot_y, energies, colors)
 
     for ax, col in zip([ax1, ax2], [plot_x, plot_y]):
-        ax.set_title(f"{col} Position Distribution by Energy")
-        ax.set_xlabel("Energy (MeV)")
-        ax.set_ylabel(f"{col} Position (mm)")
-        ax.grid(True, alpha=0.3)
+        ax.set_title(f"{col} Position Distribution")
+        style_energy_axes(ax, energies, ylabel=f"{col} Position (mm)")
         ax.set_ylim(y_min, y_max)
-        ax.axhline(y=0, color="gray", linestyle="--", linewidth=1, alpha=0.8)
-        ax.set_xticks(range(len(energies)))
-        ax.set_xticklabels([f"{e}" for e in energies], rotation=90)
+        ax.axhline(y=0, **REFLINE_KW)
 
-    legend_elements = [
-        plt.Rectangle((0, 0), 1, 1, facecolor=colors[i], alpha=0.7, label=session_labels[i])
-        for i in range(len(session_ids))
-    ]
-    ax1.legend(handles=legend_elements, loc="upper right")
-    ax2.legend(handles=legend_elements, loc="upper right")
+    make_session_legend(ax1, session_ids, colors)
 
     plt.tight_layout()
-    plt.suptitle(f"{plot_x} and {plot_y} Position Distribution by Energy", y=1.02)
     plt.show()

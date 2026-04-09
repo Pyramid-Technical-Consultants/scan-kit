@@ -1,8 +1,13 @@
 """Plotting utilities for scan-kit analysis scripts."""
 
+import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 
-# Default colors for multi-session plots
+# ---------------------------------------------------------------------------
+# Shared style constants — import these in views for a consistent look
+# ---------------------------------------------------------------------------
+
 DEFAULT_SESSION_COLORS = [
     "skyblue",
     "lightcoral",
@@ -13,6 +18,32 @@ DEFAULT_SESSION_COLORS = [
     "pink",
     "gray",
 ]
+
+FIG_SIZE_2x2 = (15, 8)
+FIG_SIZE_1x2 = (15, 6)
+FIG_SIZE_SINGLE = (14, 8)
+
+SUPTITLE_KW = dict(fontsize=13, fontweight="bold")
+GRID_KW = dict(visible=True, alpha=0.3)
+REFLINE_KW = dict(color="gray", linestyle="--", linewidth=1, alpha=0.6)
+
+SCATTER_ALPHA = 0.45
+SCATTER_SIZE = 18
+
+SLOPE_LABEL_KW = dict(
+    fontsize=10,
+    color="black",
+    fontweight="normal",
+    va="top",
+    ha="left",
+)
+SLOPE_LABEL_BOX = dict(
+    boxstyle="round,pad=0.3",
+    facecolor="white",
+    edgecolor="lightgray",
+    alpha=0.9,
+    linewidth=0.8,
+)
 
 
 def plot_boxplots_for_column(
@@ -67,6 +98,63 @@ def plot_boxplots_for_column(
             whiskerprops=dict(color="black"),
             capprops=dict(color="black"),
         )
+
+
+def annotate_slopes(ax, labels_and_colors, *, x_anchor=0.03, y_top=0.97):
+    """Stack slope annotations inside the axes with a consistent project style.
+
+    Args:
+        ax: Matplotlib axes.
+        labels_and_colors: List of (text, color) tuples.
+        x_anchor: Horizontal position in axes fraction.
+        y_top: Top of the first label in axes fraction.
+    """
+    dy = min(0.09, 0.88 / max(len(labels_and_colors), 1))
+    for k, (txt, _color) in enumerate(labels_and_colors):
+        ax.text(
+            x_anchor,
+            y_top - k * dy,
+            txt,
+            transform=ax.transAxes,
+            zorder=6,
+            bbox=SLOPE_LABEL_BOX,
+            **SLOPE_LABEL_KW,
+        )
+
+
+def make_session_legend(ax, session_ids, colors, **kwargs):
+    """Add a rectangle-patch legend for sessions on *ax*.
+
+    Args:
+        ax: Matplotlib axes.
+        session_ids: List of session ID strings.
+        colors: Matching list of face colors.
+        **kwargs: Forwarded to ``ax.legend()``.
+    """
+    handles = [
+        plt.Rectangle((0, 0), 1, 1, facecolor=colors[i], alpha=0.7,
+                       label=f"Session {sid}")
+        for i, sid in enumerate(session_ids)
+    ]
+    defaults = dict(loc="upper right")
+    defaults.update(kwargs)
+    ax.legend(handles=handles, **defaults)
+
+
+def style_energy_axes(ax, energies, ylabel=None):
+    """Apply the standard energy x-axis and grid to *ax*.
+
+    Args:
+        ax: Matplotlib axes.
+        energies: Sorted energy list for the x-ticks.
+        ylabel: Optional y-axis label.
+    """
+    ax.set_xlabel("Energy (MeV)")
+    if ylabel:
+        ax.set_ylabel(ylabel)
+    ax.grid(**GRID_KW)
+    ax.set_xticks(np.arange(len(energies)))
+    ax.set_xticklabels([f"{e:g}" for e in energies], rotation=90)
 
 
 def plot_scatter_energy(ax, x, y, energy, **kwargs):

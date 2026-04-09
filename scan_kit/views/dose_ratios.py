@@ -1,12 +1,21 @@
 """Dose ratio box plots (IC2/IC1, IC3/IC1, IC3/IC2) for G2 and G3 sessions."""
 
+import matplotlib.colors as mcolors
 import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
 
 from ..common import (
     process_position_data,
     plot_boxplots_for_column,
+    annotate_slopes,
+    make_session_legend,
+    style_energy_axes,
     DEFAULT_SESSION_COLORS,
+    FIG_SIZE_2x2,
+    SUPTITLE_KW,
+    SLOPE_LABEL_BOX,
+    SLOPE_LABEL_KW,
 )
 
 POSITION_KEY_G2 = "spot_raw"
@@ -50,6 +59,81 @@ def _process_ratios_session(session_id: str, position_key: str, base_dir: str):
     return data
 
 
+def _trend_line_color(face_color):
+    """Slightly darker line color from a patch face color name or tuple."""
+    try:
+        rgb = mcolors.to_rgb(face_color)
+    except ValueError:
+        rgb = mcolors.to_rgb("C0")
+    return tuple(max(0.0, c * 0.55) for c in rgb)
+
+
+def _add_median_trend_lines(
+    ax,
+    session_data: dict,
+    column_name: str,
+    energies: list,
+    colors: list,
+    *,
+    position_offset: float = 0.35,
+    zorder: float = 5,
+):
+    """Linear trend through per-energy medians.
+
+    ``column_name`` values are ratio *differences in percent* (see
+    ``(ratio - 1) * 100`` in :func:`_process_ratios_session`). Fitting
+    ``y`` vs beam energy in MeV gives slope in **percent per MeV** (change in
+    that plotted quantity per MeV).
+    """
+    n_sessions = len(session_data)
+    # (label text, line color) for a compact in-axes legend
+    slope_labels: list[tuple[str, tuple[float, float, float]]] = []
+
+    for enum_i, (sid, data) in enumerate(session_data.items()):
+        if column_name not in data:
+            continue
+        df = pd.DataFrame({column_name: data[column_name], "energy": data["energy"]})
+        e_mev = []
+        y_med = []
+        for j, energy in enumerate(energies):
+            vals = df.loc[df["energy"] == energy, column_name].values
+            if vals.size == 0:
+                continue
+            e_mev.append(float(energy))
+            y_med.append(float(np.median(vals)))
+
+        if len(e_mev) < 2:
+            continue
+
+        # y_med is in %; e_mev is in MeV -> slope is % per MeV (not a hidden /100)
+        slope, intercept = np.polyfit(np.array(e_mev), np.array(y_med), 1)
+        line_color = _trend_line_color(colors[enum_i])
+        xs_line = [
+            j + (enum_i - 0.5) * position_offset for j in range(len(energies))
+        ]
+        ys_line = [slope * float(energies[j]) + intercept for j in range(len(energies))]
+        ax.plot(
+            xs_line,
+            ys_line,
+            color=line_color,
+            linewidth=2.0,
+            linestyle="-",
+            solid_capstyle="round",
+            zorder=zorder,
+            clip_on=True,
+        )
+        prefix = f"{sid}: " if n_sessions > 1 else ""
+        slope_labels.append(
+            (
+                f"{prefix}{slope:+.4g} % per MeV",
+                line_color,
+            )
+        )
+
+    if slope_labels:
+        annotate_slopes(ax, slope_labels)
+
+
 def run(session_ids: list[str], base_dir: str = "test_data") -> None:
     """Run dose ratios analysis and show matplotlib window."""
     if not session_ids:
@@ -69,8 +153,9 @@ def run(session_ids: list[str], base_dir: str = "test_data") -> None:
         return
 
     fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(
-        2, 2, figsize=(15, 6), sharex=False, sharey=False
+        2, 2, figsize=FIG_SIZE_2x2, sharex=False, sharey=False
     )
+    fig.suptitle("Dose Ratios vs Energy", **SUPTITLE_KW)
 
     all_energies = set()
     for data in session_data.values():
@@ -86,7 +171,6 @@ def run(session_ids: list[str], base_dir: str = "test_data") -> None:
 
     loaded_ids = list(session_data.keys())
     colors = DEFAULT_SESSION_COLORS[: len(loaded_ids)]
-    session_labels = [f"Session {sid}" for sid in loaded_ids]
 
     session_data_g3 = {k: v for k, v in session_data.items() if "ic31_ratio" in v}
     colors_g3 = [colors[loaded_ids.index(sid)] for sid in session_data_g3]
@@ -95,44 +179,36 @@ def run(session_ids: list[str], base_dir: str = "test_data") -> None:
         plot_boxplots_for_column(
             ax1, session_data_g3, "ic31_ratio", energies, colors_g3, width=0.3
         )
+        _add_median_trend_lines(
+            ax1, session_data_g3, "ic31_ratio", energies, colors_g3, position_offset=0.35
+        )
     ax1.set_title("IC3/IC1 Ratio Difference (%)")
-    ax1.set_xlabel("Energy (MeV)")
-    ax1.set_ylabel("IC3/IC1 Ratio Difference (%)")
-    ax1.grid(True, alpha=0.3)
+    style_energy_axes(ax1, energies, ylabel="IC3/IC1 Ratio Difference (%)")
     ax1.set_ylim(y_min, y_max)
-    ax1.set_xticks(np.arange(len(energies)))
-    ax1.set_xticklabels([f"{e}" for e in energies], rotation=90)
 
     plot_boxplots_for_column(
         ax2, session_data, "ic21_ratio", energies, colors, width=0.3
     )
+    _add_median_trend_lines(
+        ax2, session_data, "ic21_ratio", energies, colors, position_offset=0.35
+    )
     ax2.set_title("IC2/IC1 Ratio Difference (%)")
-    ax2.set_xlabel("Energy (MeV)")
-    ax2.set_ylabel("IC2/IC1 Ratio Difference (%)")
-    ax2.grid(True, alpha=0.3)
+    style_energy_axes(ax2, energies, ylabel="IC2/IC1 Ratio Difference (%)")
     ax2.set_ylim(y_min, y_max)
-    ax2.set_xticks(np.arange(len(energies)))
-    ax2.set_xticklabels([f"{e}" for e in energies], rotation=90)
 
     if session_data_g3:
         plot_boxplots_for_column(
             ax3, session_data_g3, "ic32_ratio", energies, colors_g3, width=0.3
         )
+        _add_median_trend_lines(
+            ax3, session_data_g3, "ic32_ratio", energies, colors_g3, position_offset=0.35
+        )
     ax3.set_title("IC3/IC2 Ratio Difference (%)")
-    ax3.set_xlabel("Energy (MeV)")
-    ax3.set_ylabel("IC3/IC2 Ratio Difference (%)")
-    ax3.grid(True, alpha=0.3)
+    style_energy_axes(ax3, energies, ylabel="IC3/IC2 Ratio Difference (%)")
     ax3.set_ylim(y_min, y_max)
-    ax3.set_xticks(np.arange(len(energies)))
-    ax3.set_xticklabels([f"{e}" for e in energies], rotation=90)
 
     ax4.axis("off")
-
-    legend_elements = [
-        plt.Rectangle((0, 0), 1, 1, facecolor=colors[i], alpha=0.7, label=session_labels[i])
-        for i in range(len(loaded_ids))
-    ]
-    ax1.legend(handles=legend_elements, loc="upper right")
+    make_session_legend(ax1, loaded_ids, colors)
 
     plt.tight_layout()
     plt.show()

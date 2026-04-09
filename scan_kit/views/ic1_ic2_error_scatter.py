@@ -3,7 +3,15 @@
 import numpy as np
 import matplotlib.pyplot as plt
 
-from ..common import process_position_data
+from ..common import (
+    process_position_data,
+    FIG_SIZE_1x2,
+    SUPTITLE_KW,
+    GRID_KW,
+    REFLINE_KW,
+    SCATTER_ALPHA,
+    SCATTER_SIZE,
+)
 
 
 def run(session_ids: list[str], base_dir: str = "test_data") -> None:
@@ -27,7 +35,7 @@ def run(session_ids: list[str], base_dir: str = "test_data") -> None:
         print("No valid data found for any session")
         return
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(20, 10))
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=FIG_SIZE_1x2)
 
     all_energies = set()
     for data in session_data.values():
@@ -57,8 +65,8 @@ def run(session_ids: list[str], base_dir: str = "test_data") -> None:
                 data[error_column],
                 c=data["energy"],
                 cmap="viridis",
-                alpha=0.2,
-                s=30,
+                alpha=SCATTER_ALPHA,
+                s=SCATTER_SIZE,
                 marker=marker,
             )
 
@@ -73,11 +81,11 @@ def run(session_ids: list[str], base_dir: str = "test_data") -> None:
         ax.set_title(title)
         ax.set_xlabel("IC1 Position (mm)")
         ax.set_ylabel(ylabel)
-        ax.grid(True, alpha=0.3)
+        ax.grid(**GRID_KW)
         ax.set_xlim(x_min, x_max)
         ax.set_ylim(error_min, error_max)
-        ax.axhline(y=0, color="gray", linestyle="--", linewidth=1, alpha=0.8)
-        ax.axvline(x=0, color="gray", linestyle="--", linewidth=1, alpha=0.8)
+        ax.axhline(y=0, **REFLINE_KW)
+        ax.axvline(x=0, **REFLINE_KW)
 
     loaded_ids = list(session_data.keys())
     session_legend_elements = [
@@ -99,8 +107,8 @@ def run(session_ids: list[str], base_dir: str = "test_data") -> None:
     )
     sm.set_array([])
     cbar = plt.colorbar(sm, ax=ax2, location="right")
-    cbar.set_label("Energy (MeV)", fontsize=12)
+    cbar.set_label("Energy (MeV)")
 
-    plt.suptitle("Position Difference Between IC1 and IC2")
+    fig.suptitle("Position Difference Between IC1 and IC2", **SUPTITLE_KW)
     plt.tight_layout()
     plt.show()
