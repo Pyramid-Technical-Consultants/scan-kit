@@ -16,7 +16,7 @@ from ..common import (
 )
 
 # ---- Tweakable window parameters ------------------------------------------
-PRE_OFF_SLICES = 10  # timeslices shown before the falling edge
+PRE_OFF_SLICES = 2  # timeslices shown before the falling edge
 POST_OFF_SLICES = 10  # timeslices shown after the falling edge
 MIN_ON_SLICES = 2  # minimum consecutive above-threshold slices right
 # before the falling edge (filters brief spikes)
