@@ -14,8 +14,6 @@ from ..common import (
     DEFAULT_SESSION_COLORS,
     FIG_SIZE_2x2,
     SUPTITLE_KW,
-    SLOPE_LABEL_BOX,
-    SLOPE_LABEL_KW,
 )
 
 POSITION_KEY_G2 = "spot_raw"
@@ -43,16 +41,11 @@ def _process_ratios_session(session_id: str, position_key: str, base_dir: str):
 
     ic1_dose = data["ic1_total_dose_spot_raw"]
     ic2_dose = data["ic2_total_dose_spot_raw"]
-    data = data.copy()
-    data["ic1_dose"] = ic1_dose
-    data["ic2_dose"] = ic2_dose
+    data = dict(data)
     data["ic21_ratio"] = ((ic2_dose / ic1_dose) - 1.0) * 100.0
-    data["ic1_dist"] = np.sqrt(data["ic1_x"] ** 2 + data["ic1_y"] ** 2)
-    data["ic2_dist"] = np.sqrt(data["ic2_x"] ** 2 + data["ic2_y"] ** 2)
 
     if position_key == POSITION_KEY_G3:
         ic3_dose = data["r_ic3_total_dose_spot_raw"]
-        data["ic3_dose"] = ic3_dose
         data["ic31_ratio"] = ((ic3_dose / ic1_dose) - 1.0) * 100.0
         data["ic32_ratio"] = ((ic3_dose / ic2_dose) - 1.0) * 100.0
 
@@ -95,7 +88,7 @@ def _add_median_trend_lines(
         df = pd.DataFrame({column_name: data[column_name], "energy": data["energy"]})
         e_mev = []
         y_med = []
-        for j, energy in enumerate(energies):
+        for energy in energies:
             vals = df.loc[df["energy"] == energy, column_name].values
             if vals.size == 0:
                 continue

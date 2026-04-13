@@ -1,6 +1,15 @@
 """Common utilities for scan-kit analysis scripts."""
 
-from .io import load_csv_from_zip, load_timeslice_device_units, load_termination_summary, SessionMeta
+from .session_meta import SessionMeta, parse_termination_summary_text
+from .session_source import (
+    SessionSource,
+    resolve_session_source,
+    load_session_csv,
+    load_session_timeslice_device_units,
+    load_session_termination_summary,
+    hydrate_session_metadata,
+    discover_session_entries,
+)
 from .transform import remap, IC1_X_MAP, IC1_Y_MAP, IC2_X_MAP, IC2_Y_MAP
 from .validation import create_valid_mask, apply_validation
 from .processing import load_session_raw, process_position_data
@@ -11,6 +20,7 @@ from .plotting import (
     annotate_slopes,
     make_session_legend,
     style_energy_axes,
+    link_boxplot_to_histogram,
     DEFAULT_SESSION_COLORS,
     FIG_SIZE_2x2,
     FIG_SIZE_1x2,
@@ -25,10 +35,15 @@ from .plotting import (
 )
 
 __all__ = [
-    "load_csv_from_zip",
-    "load_timeslice_device_units",
-    "load_termination_summary",
     "SessionMeta",
+    "parse_termination_summary_text",
+    "SessionSource",
+    "resolve_session_source",
+    "load_session_csv",
+    "load_session_timeslice_device_units",
+    "load_session_termination_summary",
+    "hydrate_session_metadata",
+    "discover_session_entries",
     "remap",
     "IC1_X_MAP",
     "IC1_Y_MAP",
@@ -44,6 +59,7 @@ __all__ = [
     "annotate_slopes",
     "make_session_legend",
     "style_energy_axes",
+    "link_boxplot_to_histogram",
     "DEFAULT_SESSION_COLORS",
     "FIG_SIZE_2x2",
     "FIG_SIZE_1x2",

@@ -1,12 +1,10 @@
 """Data processing utilities for scan-kit session data."""
 
-from pathlib import Path
-
 import pandas as pd
 
-from . import io
 from . import transform
 from . import validation
+from .session_source import load_session_csv, resolve_session_source
 
 
 def load_session_raw(session_id, base_dir="scan_kit"):
@@ -14,14 +12,17 @@ def load_session_raw(session_id, base_dir="scan_kit"):
 
     Args:
         session_id: Session ID.
-        base_dir: Base directory containing session ZIPs. Default "scan_kit".
+        base_dir: Base directory containing session folders or archives.
 
     Returns:
         Tuple of (input_map, spot_data) DataFrames, or (None, None) if loading fails.
     """
-    zip_path = Path(base_dir) / f"{session_id}.zip"
-    input_map = io.load_csv_from_zip(str(zip_path), "input_map.csv", session_id)
-    spot_data = io.load_csv_from_zip(str(zip_path), "spot_data.csv", session_id)
+    src = resolve_session_source(session_id, base_dir)
+    if src is None:
+        print(f"Failed to load data for session {session_id}: no session data found")
+        return None, None
+    input_map = load_session_csv(src, "input_map.csv")
+    spot_data = load_session_csv(src, "spot_data.csv")
     if input_map is None or spot_data is None:
         print(f"Failed to load data for session {session_id}")
         return None, None
@@ -45,8 +46,9 @@ def process_position_data(
         position_key: Column key for position data (e.g., "spot_position_raw", "spot_raw").
         extra_spot_columns: Optional list of extra column names from spot_data to include.
         extra_input_columns: Optional list of extra column names from input_map to include.
-        base_dir: Base directory containing session ZIPs (e.g. "scan_kit" or "test_data").
-            ZIPs are expected at {base_dir}/{session_id}.zip. Default "scan_kit".
+        base_dir: Directory containing session data: unpacked ``{session_id}/`` folders,
+            ``{session_id}.zip``, or ``{session_id}.tgz`` / ``.tar.gz`` / etc.
+            Default "scan_kit".
 
     Returns:
         Dict with session_id, ic1_x, ic1_y, ic2_x, ic2_y, energy, and any extra columns.

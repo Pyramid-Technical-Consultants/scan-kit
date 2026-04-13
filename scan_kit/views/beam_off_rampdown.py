@@ -1,18 +1,19 @@
 """Beam-off ramp-down curve analysis (IC1, IC2, IC3) from timeslice data."""
 
-from pathlib import Path
-
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.ticker import MultipleLocator
 
 from ..common import (
-    load_csv_from_zip,
-    load_timeslice_device_units,
     FIG_SIZE_2x2,
     SUPTITLE_KW,
     GRID_KW,
     REFLINE_KW,
+)
+from ..common.session_source import (
+    load_session_csv,
+    load_session_timeslice_device_units,
+    resolve_session_source,
 )
 
 # ---- Tweakable window parameters ------------------------------------------
@@ -101,15 +102,17 @@ def _extract_rampdown_curves(session_id: str, base_dir: str):
         scaled to 0–100 % (or None if that IC had no valid edges).
     Returns None on failure.
     """
-    zip_path = str(Path(base_dir) / f"{session_id}.zip")
+    src = resolve_session_source(session_id, base_dir)
+    if src is None:
+        return None
 
-    input_map = load_csv_from_zip(zip_path, "input_map.csv", session_id)
+    input_map = load_session_csv(src, "input_map.csv")
     if input_map is None:
         return None
 
     energy_by_layer = input_map.groupby("layer_id")["ENERGY"].first().to_dict()
 
-    frames = load_timeslice_device_units(zip_path, session_id, usecols=_TIMESLICE_COLS)
+    frames = load_session_timeslice_device_units(src, usecols=_TIMESLICE_COLS)
     if not frames:
         return None
 

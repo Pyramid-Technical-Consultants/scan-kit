@@ -1,16 +1,17 @@
 """Beam-on vs beam-off current analysis (IC1, IC2, IC3) from timeslice data."""
 
-from pathlib import Path
-
 import numpy as np
 import matplotlib.pyplot as plt
 
 from ..common import (
-    load_csv_from_zip,
-    load_timeslice_device_units,
     FIG_SIZE_1x2,
     SUPTITLE_KW,
     GRID_KW,
+)
+from ..common.session_source import (
+    load_session_csv,
+    load_session_timeslice_device_units,
+    resolve_session_source,
 )
 
 # ---- Tweakable parameters -------------------------------------------------
@@ -72,15 +73,17 @@ def _extract_on_off(session_id: str, base_dir: str):
         ``ic3_on``, ``ic3_off`` — each a float or None.
     Returns None on failure.
     """
-    zip_path = str(Path(base_dir) / f"{session_id}.zip")
+    src = resolve_session_source(session_id, base_dir)
+    if src is None:
+        return None
 
-    input_map = load_csv_from_zip(zip_path, "input_map.csv", session_id)
+    input_map = load_session_csv(src, "input_map.csv")
     if input_map is None:
         return None
 
     energy_by_layer = input_map.groupby("layer_id")["ENERGY"].first().to_dict()
 
-    frames = load_timeslice_device_units(zip_path, session_id, usecols=_TIMESLICE_COLS)
+    frames = load_session_timeslice_device_units(src, usecols=_TIMESLICE_COLS)
     if not frames:
         return None
 

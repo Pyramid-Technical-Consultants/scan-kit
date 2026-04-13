@@ -1,6 +1,7 @@
 """Plotting utilities for scan-kit analysis scripts."""
 
 import matplotlib.pyplot as plt
+from matplotlib.widgets import SpanSelector
 import numpy as np
 import pandas as pd
 
@@ -195,3 +196,191 @@ def add_energy_colorbar(fig_or_ax, energies=None, vmin=None, vmax=None):
     )
     sm.set_array([])
     return plt.colorbar(sm, ax=fig_or_ax, label="Energy (MeV)")
+
+
+# ---------------------------------------------------------------------------
+# Interactive energy filtering: SpanSelector linking boxplots to histograms
+# ---------------------------------------------------------------------------
+
+
+def _plot_histogram(ax, session_data, col, loaded_ids, colors, *,
+                    energy_mask=None, n_bins=101, ylabel="Probability (%)",
+                    xlabel=None, title=None, ref_val=None):
+    """Draw a probability-weighted histogram on *ax*.
+
+    Args:
+        ax: Matplotlib axes (will be cleared first).
+        session_data: Dict mapping session_id -> data dict.
+        col: Column name to histogram.
+        loaded_ids: Ordered session id list.
+        colors: Matching color list.
+        energy_mask: Optional dict[sid -> bool array] to filter spots.
+        n_bins: Number of bins (edges = n_bins).
+        ylabel: Y-axis label.
+        xlabel: X-axis label.
+        title: Axes title.
+        ref_val: Optional reference line value (vertical).
+    """
+    ax.clear()
+
+    all_chunks = []
+    for sid in loaded_ids:
+        vals = np.asarray(session_data[sid][col], dtype=float)
+        if energy_mask is not None and sid in energy_mask:
+            vals = vals[energy_mask[sid]]
+        vals = vals[np.isfinite(vals)]
+        if vals.size:
+            all_chunks.append(vals)
+
+    if not all_chunks:
+        ax.set_visible(False)
+        return
+
+    all_finite = np.concatenate(all_chunks)
+    bin_edges = np.linspace(all_finite.min(), all_finite.max(), n_bins)
+
+    for sid, color in zip(loaded_ids, colors):
+        vals = np.asarray(session_data[sid][col], dtype=float)
+        if energy_mask is not None and sid in energy_mask:
+            vals = vals[energy_mask[sid]]
+        vals = vals[np.isfinite(vals)]
+        if vals.size == 0:
+            continue
+        weights = np.full_like(vals, 100.0 / vals.size)
+        ax.hist(vals, bins=bin_edges, alpha=0.5, color=color,
+                label=sid, edgecolor="none", weights=weights)
+
+    if title:
+        ax.set_title(title)
+    if xlabel:
+        ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    if ref_val is not None:
+        ax.axvline(x=ref_val, **REFLINE_KW)
+    ax.set_visible(True)
+
+
+def link_boxplot_to_histogram(
+    box_axes,
+    hist_axes,
+    session_data,
+    energies,
+    columns,
+    colors,
+    loaded_ids,
+    *,
+    n_bins=101,
+    hist_ylabel="Probability (%)",
+    hist_xlabels=None,
+    hist_titles=None,
+    hist_refs=None,
+):
+    """Install SpanSelectors on boxplot axes that interactively filter histograms.
+
+    Args:
+        box_axes: Single axis or list of boxplot axes.
+        hist_axes: Matching single axis or list of histogram axes.
+        session_data: Dict mapping session_id -> data dict with ``"energy"`` key.
+        energies: Sorted list of energy values used for boxplot x-ticks.
+        columns: Single column name or list of column names (one per axis pair).
+        colors: Session color list.
+        loaded_ids: Ordered session id list.
+        n_bins: Number of histogram bins.
+        hist_ylabel: Y-axis label for histograms.
+        hist_xlabels: Single or list of x-axis labels for histograms.
+        hist_titles: Single or list of titles for histograms.
+        hist_refs: Single or list of reference-line values (vertical) for histograms.
+
+    Returns:
+        List of SpanSelector objects. **The caller must keep a reference** to
+        prevent garbage collection.
+    """
+    if not isinstance(box_axes, (list, np.ndarray)):
+        box_axes = [box_axes]
+        hist_axes = [hist_axes]
+    if isinstance(columns, str):
+        columns = [columns]
+    if isinstance(hist_xlabels, str) or hist_xlabels is None:
+        hist_xlabels = [hist_xlabels] * len(columns)
+    if isinstance(hist_titles, str) or hist_titles is None:
+        hist_titles = [hist_titles] * len(columns)
+    if not isinstance(hist_refs, (list, np.ndarray, type(None))):
+        hist_refs = [hist_refs] * len(columns)
+    if hist_refs is None:
+        hist_refs = [None] * len(columns)
+
+    energy_arr = np.array(energies, dtype=float)
+    selectors = []
+
+    for box_ax, hist_ax, col, xlabel, title, ref in zip(
+        box_axes, hist_axes, columns, hist_xlabels, hist_titles, hist_refs
+    ):
+        _plot_histogram(
+            hist_ax, session_data, col, loaded_ids, colors,
+            n_bins=n_bins, ylabel=hist_ylabel, xlabel=xlabel,
+            title=title, ref_val=ref,
+        )
+
+        highlight = box_ax.axvspan(0, 0, alpha=0.15, color="gold", visible=False, zorder=0)
+
+        def _make_callback(_hist_ax, _col, _xlabel, _title, _ref, _hl, _span_ref):
+            def _on_select(xmin, xmax):
+                idx_lo = max(0, int(np.floor(xmin + 0.5)))
+                idx_hi = min(len(energy_arr) - 1, int(np.floor(xmax + 0.5)))
+                sel_energies = set(energy_arr[idx_lo:idx_hi + 1])
+
+                mask = {}
+                for sid in loaded_ids:
+                    e = np.asarray(session_data[sid]["energy"], dtype=float)
+                    mask[sid] = np.isin(e, list(sel_energies))
+
+                _plot_histogram(
+                    _hist_ax, session_data, _col, loaded_ids, colors,
+                    energy_mask=mask, n_bins=n_bins, ylabel=hist_ylabel,
+                    xlabel=_xlabel, title=_title, ref_val=_ref,
+                )
+                make_session_legend(_hist_ax, loaded_ids, colors)
+
+                _hl.set_x(idx_lo - 0.5)
+                _hl.set_width(idx_hi - idx_lo + 1)
+                _hl.set_visible(True)
+                _hist_ax.figure.canvas.draw_idle()
+
+            def _on_dblclick(event, _box_ax=box_ax):
+                if not event.dblclick or event.inaxes is not _box_ax:
+                    return
+                _plot_histogram(
+                    _hist_ax, session_data, _col, loaded_ids, colors,
+                    n_bins=n_bins, ylabel=hist_ylabel,
+                    xlabel=_xlabel, title=_title, ref_val=_ref,
+                )
+                make_session_legend(_hist_ax, loaded_ids, colors)
+                _hl.set_visible(False)
+                if _span_ref:
+                    _span_ref[0].clear()
+                _hist_ax.figure.canvas.draw_idle()
+
+            return _on_select, _on_dblclick
+
+        span_ref = []
+        on_select, on_dblclick = _make_callback(
+            hist_ax, col, xlabel, title, ref, highlight, span_ref,
+        )
+
+        span = SpanSelector(
+            box_ax, on_select, "horizontal",
+            useblit=True, interactive=True,
+            props=dict(alpha=0.2, facecolor="gold", zorder=0),
+        )
+        span_ref.append(span)
+        box_ax.figure.canvas.mpl_connect("button_press_event", on_dblclick)
+        selectors.append(span)
+
+    # Match initial y-limits across histogram axes
+    visible_axes = [ax for ax in hist_axes if ax.get_visible()]
+    if visible_axes:
+        y_max = max(ax.get_ylim()[1] for ax in visible_axes)
+        for ax in visible_axes:
+            ax.set_ylim(0, y_max)
+
+    return selectors

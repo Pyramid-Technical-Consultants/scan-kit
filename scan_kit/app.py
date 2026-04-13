@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import atexit
 import os
+import signal
 import subprocess
 import sys
+import threading
 from datetime import datetime
 from pathlib import Path
 
@@ -14,7 +17,8 @@ from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.widgets import Button, Input, SelectionList, Static
 from textual.widgets.selection_list import Selection
 
-from .common.io import SessionMeta
+from .common import SessionMeta
+from .common.session_source import resolve_session_source, load_session_termination_summary
 from .common.sessions import discover_sessions
 from .views import VIEWS
 
@@ -29,6 +33,8 @@ _SORT_LABELS = {
 }
 
 _EPOCH = datetime(1970, 1, 1)
+_SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+_READY_SENTINEL = "__SCAN_KIT_PLOT_READY__"
 
 
 def _sort_key(
@@ -56,11 +62,17 @@ class ScanKitApp(App[None]):
     #right-panel { width: 62% }
     #right-panel > Static { padding: 0; height: 1 }
 
-    #session-label, #base-dir-section, #views-label, #status {
+    #base-dir-section, #views-label, #status {
         color: #00d4aa; padding: 0;
     }
-    #session-label { height: 1 }
-    #status { border: round #00d4aa; background: #0a0e14; min-height: 1 }
+    #status-row { height: 3; width: 100% }
+    #status { border: round #00d4aa; background: #0a0e14; min-height: 1; width: 1fr }
+
+    #clear-btn {
+        width: 5; min-width: 5; height: 3;
+        background: #0a0e14; color: #aa0030; border: round #aa0030; padding: 0;
+    }
+    #clear-btn:hover { color: #ff0040; border: round #ff0040; background: #1a0008 }
 
     #session-list {
         height: 1fr; border: round #00d4aa; padding: 1; background: #0a0e14;
@@ -103,10 +115,14 @@ class ScanKitApp(App[None]):
     }
     .view-button:hover { background: #0d1117; color: #00d4ff; border: round #00d4ff }
     .view-button:focus { background: #001a1f; color: #00d4ff; border: round #00d4ff }
+    .view-button.loading { color: #ffaa00; border: round #ffaa00; background: #1a1200 }
+    .view-button.loading:hover { color: #ffaa00; border: round #ffaa00 }
     """
 
     BINDINGS = [
-        Binding("q", "quit", "Quit"),
+        Binding("escape", "quit", "Quit", priority=True),
+        Binding("ctrl+q", "quit", "Quit", show=False, priority=True),
+        Binding("ctrl+c", "quit", "Quit", show=False, priority=True),
     ]
 
     def __init__(self) -> None:
@@ -115,6 +131,12 @@ class ScanKitApp(App[None]):
         self._sessions: list[str] = []
         self._discovered: list[tuple[str, str, SessionMeta | None]] = []
         self._sort_mode: str = "date"
+        self._hydrate_generation: int = 0
+        self._meta_loading: bool = False
+        self._child_procs: list[subprocess.Popen] = []
+        self._running_views: dict[str, tuple[subprocess.Popen, str]] = {}
+        self._spinner_frame: int = 0
+        self._poll_timer = None
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="main"):
@@ -125,7 +147,6 @@ class ScanKitApp(App[None]):
                     value=str(PROJECT_ROOT / "test_data"),
                     id="base-dir-input",
                 )
-                yield Static("SELECT UP TO 3", id="session-label")
                 with Horizontal(id="sort-row"):
                     for mode in _SORT_MODES:
                         btn = Button(
@@ -137,7 +158,9 @@ class ScanKitApp(App[None]):
                             btn.add_class("active")
                         yield btn
                 yield SelectionList[str](id="session-list")
-                yield Static("", id="status")
+                with Horizontal(id="status-row"):
+                    yield Static("", id="status")
+                    yield Button("✕", id="clear-btn")
             with VerticalScroll(id="right-panel"):
                 yield Static("RUN ANALYSIS", id="views-label")
                 with Vertical(id="buttons-section"):
@@ -171,15 +194,100 @@ class ScanKitApp(App[None]):
         self._repopulate_list()
 
     def _refresh_sessions(self) -> None:
-        """Refresh session list from disk."""
+        """Refresh session list from disk (fast), then load metadata in background."""
+        self._hydrate_generation += 1
+        gen = self._hydrate_generation
         self._discovered = discover_sessions(
             base_dirs=(self._base_dir,),
             project_root=PROJECT_ROOT,
         )
+        self._meta_loading = bool(self._discovered)
         self._repopulate_list()
+        if not self._discovered:
+            self._meta_loading = False
+            self._update_status()
+            return
+        snapshot = list(self._discovered)
+        base_dir = self._base_dir
+        threading.Thread(
+            target=self._hydrate_metadata_worker,
+            args=(gen, snapshot, base_dir),
+            daemon=True,
+        ).start()
+
+    def _hydrate_metadata_worker(
+        self,
+        gen: int,
+        snapshot: list[tuple[str, str, SessionMeta | None]],
+        base_dir: str,
+    ) -> None:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        import os
+
+        base = Path(base_dir)
+        n = len(snapshot)
+        max_workers = max(4, min(24, n, (os.cpu_count() or 4) * 3))
+
+        def _load_one(idx: int, row: tuple[str, str, SessionMeta | None]):
+            sid, path_str, _ = row
+
+            def _on_extracting(session_id: str) -> None:
+                self.call_from_thread(
+                    self._show_extracting_status, gen, session_id,
+                )
+
+            src = resolve_session_source(sid, base, on_extracting=_on_extracting)
+            meta = load_session_termination_summary(src) if src else None
+            return idx, sid, path_str, meta
+
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = {
+                pool.submit(_load_one, i, row): i
+                for i, row in enumerate(snapshot)
+            }
+            for future in as_completed(futures):
+                if gen != self._hydrate_generation:
+                    return
+                idx, sid, path_str, meta = future.result()
+                self.call_from_thread(
+                    self._apply_single_metadata, gen, idx, sid, path_str, meta,
+                )
+
+        self.call_from_thread(self._finish_hydration, gen)
+
+    def _apply_single_metadata(
+        self,
+        gen: int,
+        idx: int,
+        sid: str,
+        path_str: str,
+        meta: SessionMeta | None,
+    ) -> None:
+        if gen != self._hydrate_generation:
+            return
+        for i, (s, p, _) in enumerate(self._discovered):
+            if s == sid:
+                self._discovered[i] = (sid, path_str, meta)
+                break
+        self._repopulate_list()
+
+    def _show_extracting_status(self, gen: int, session_id: str) -> None:
+        if gen != self._hydrate_generation:
+            return
+        status = self.query_one("#status", Static)
+        status.update(f"> Extracting {session_id}… (one-time)")
+
+    def _finish_hydration(self, gen: int) -> None:
+        if gen != self._hydrate_generation:
+            return
+        self._meta_loading = False
+        self._update_status()
 
     def _repopulate_list(self) -> None:
         """Sort and display sessions using the current sort mode."""
+        session_list = self.query_one("#session-list", SelectionList)
+        prev_selected = list(session_list.selected)
+
         reverse = self._sort_mode == "date"
         ordered = sorted(self._discovered, key=lambda t: _sort_key(t, self._sort_mode), reverse=reverse)
         self._sessions = [sid for sid, _zp, _meta in ordered]
@@ -194,7 +302,6 @@ class ScanKitApp(App[None]):
             default=1,
         )
 
-        session_list = self.query_one("#session-list", SelectionList)
         session_list.clear_options()
         for sid, _zp, meta in ordered:
             if meta is not None:
@@ -207,6 +314,12 @@ class ScanKitApp(App[None]):
             else:
                 label = sid
             session_list.add_option(Selection(label, sid))
+        for sid in prev_selected:
+            if sid in self._sessions:
+                try:
+                    session_list.select(sid)
+                except Exception:
+                    pass
         self._update_status()
 
     def _update_status(self) -> None:
@@ -215,10 +328,18 @@ class ScanKitApp(App[None]):
         selected = session_list.selected
         count = len(selected)
         status = self.query_one("#status", Static)
+        extra = "  (loading session details…)" if self._meta_loading else ""
         if count == 0:
-            status.update("> SELECT 1-3 SESSIONS")
+            status.update(f"> SELECT 1-3 SESSIONS{extra}")
         else:
-            status.update(f"> READY: {count} | {', '.join(selected)}")
+            status.update(f"> READY: {count} | {', '.join(selected)}{extra}")
+
+    def _clear_selection(self) -> None:
+        """Deselect all sessions."""
+        session_list = self.query_one("#session-list", SelectionList)
+        for sid in list(session_list.selected):
+            session_list.deselect(sid)
+        self._update_status()
 
     def _enforce_max_sessions(self) -> None:
         """Deselect oldest if more than MAX_SESSIONS selected."""
@@ -238,6 +359,9 @@ class ScanKitApp(App[None]):
     def on_button_pressed(self, event: Button.Pressed) -> None:
         """Handle button presses (sort buttons + analysis views)."""
         button_id = event.button.id
+        if button_id == "clear-btn":
+            self._clear_selection()
+            return
         if button_id and button_id.startswith("sort-"):
             mode = button_id.removeprefix("sort-")
             if mode in _SORT_MODES:
@@ -247,6 +371,11 @@ class ScanKitApp(App[None]):
             return
 
         module_name = button_id.removeprefix("view-")
+
+        if module_name in self._running_views:
+            self.notify("Already running", severity="warning")
+            return
+
         session_list = self.query_one("#session-list", SelectionList)
         selected = session_list.selected
 
@@ -258,7 +387,17 @@ class ScanKitApp(App[None]):
         base_dir = self._base_dir
 
         code = (
-            f"from scan_kit.views.{module_name} import run; "
+            "import matplotlib.pyplot as plt\n"
+            "_real_show = plt.show\n"
+            "def _show(*a, **kw):\n"
+            "    for mgr in plt.get_fignums():\n"
+            "        try: plt.figure(mgr).canvas.manager.window.state('zoomed')\n"
+            "        except Exception:\n"
+            "            try: plt.figure(mgr).canvas.manager.window.showMaximized()\n"
+            "            except Exception: pass\n"
+            f"    print('{_READY_SENTINEL}', flush=True); _real_show(*a, **kw)\n"
+            "plt.show = _show\n"
+            f"from scan_kit.views.{module_name} import run\n"
             f"run({session_ids!r}, {base_dir!r})"
         )
         env = os.environ.copy()
@@ -266,21 +405,138 @@ class ScanKitApp(App[None]):
             os.pathsep + env.get("PYTHONPATH", "") if env.get("PYTHONPATH") else ""
         )
 
+        btn = event.button
+        original_label = str(btn.label)
+
         try:
-            subprocess.run(
+            proc = subprocess.Popen(
                 [sys.executable, "-c", code],
                 cwd=PROJECT_ROOT,
                 env=env,
+                stdout=subprocess.PIPE,
             )
+            self._child_procs.append(proc)
+            self._reap_children()
         except Exception as e:
             self.notify(f"Failed to run analysis: {e}", severity="error")
+            return
+
+        self._running_views[module_name] = (proc, original_label)
+        btn.add_class("loading")
+        self._update_spinner()
+        if self._poll_timer is None:
+            self._poll_timer = self.set_interval(0.12, self._poll_running_views)
+
+        threading.Thread(
+            target=self._watch_subprocess_ready,
+            args=(proc, module_name),
+            daemon=True,
+        ).start()
+
+    def _update_spinner(self) -> None:
+        """Update spinner character on all loading buttons."""
+        frame = _SPINNER[self._spinner_frame % len(_SPINNER)]
+        for module_name, (proc, original_label) in self._running_views.items():
+            try:
+                btn = self.query_one(f"#view-{module_name}", Button)
+                btn.label = f"{frame} {original_label}"
+            except Exception:
+                pass
+
+    def _watch_subprocess_ready(
+        self, proc: subprocess.Popen, module_name: str
+    ) -> None:
+        """Read subprocess stdout in a background thread for the ready sentinel."""
+        try:
+            for line in proc.stdout:
+                if _READY_SENTINEL.encode() in line:
+                    self.call_from_thread(self._mark_view_ready, module_name)
+                    break
+        except Exception:
+            pass
+        try:
+            for _ in proc.stdout:
+                pass
+        except Exception:
+            pass
+
+    def _mark_view_ready(self, module_name: str) -> None:
+        """Called on the UI thread when a view's plot window has appeared."""
+        if module_name not in self._running_views:
+            return
+        _proc, original_label = self._running_views.pop(module_name)
+        try:
+            btn = self.query_one(f"#view-{module_name}", Button)
+            btn.label = original_label
+            btn.remove_class("loading")
+        except Exception:
+            pass
+        if not self._running_views:
+            if self._poll_timer is not None:
+                self._poll_timer.stop()
+                self._poll_timer = None
+
+    def _poll_running_views(self) -> None:
+        """Check for finished subprocesses and update button states."""
+        self._spinner_frame += 1
+        finished = [
+            name for name, (proc, _) in self._running_views.items()
+            if proc.poll() is not None
+        ]
+        for module_name in finished:
+            proc, original_label = self._running_views.pop(module_name)
+            try:
+                btn = self.query_one(f"#view-{module_name}", Button)
+                btn.label = original_label
+                btn.remove_class("loading")
+            except Exception:
+                pass
+            if proc.returncode != 0:
+                self.notify(f"{module_name} exited with error", severity="error")
+
+        if self._running_views:
+            self._update_spinner()
         else:
-            self.notify("Analysis closed", severity="information")
+            if self._poll_timer is not None:
+                self._poll_timer.stop()
+                self._poll_timer = None
+        self._reap_children()
+
+    def _reap_children(self) -> None:
+        """Remove finished processes from the tracking list."""
+        self._child_procs = [p for p in self._child_procs if p.poll() is None]
+
+    def action_quit(self) -> None:
+        """Terminate child analysis processes, then quit."""
+        self._hydrate_generation += 1
+        if self._poll_timer is not None:
+            self._poll_timer.stop()
+            self._poll_timer = None
+        self._running_views.clear()
+        for proc in self._child_procs:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        self._child_procs.clear()
+        self.exit()
 
 
 def main() -> None:
     """Entry point for the scan-kit TUI."""
     app = ScanKitApp()
+
+    def _force_exit(*_args) -> None:
+        for proc in app._child_procs:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        os._exit(0)
+
+    signal.signal(signal.SIGINT, _force_exit)
+    atexit.register(_force_exit)
+
     app.run()
 
 
