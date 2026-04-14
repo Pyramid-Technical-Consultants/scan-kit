@@ -5,6 +5,14 @@ import matplotlib.pyplot as plt
 from matplotlib.ticker import MultipleLocator
 
 from ..common import (
+    C_ENERGY,
+    C_IC1_CURRENT,
+    C_IC2_CURRENT,
+    C_IC3_CURRENT_A,
+    C_IC3_CURRENT_B,
+    C_IC3_CURRENT_C,
+    C_IC3_CURRENT_D,
+    C_LAYER_ID,
     FIG_SIZE_2x2,
     SUPTITLE_KW,
     GRID_KW,
@@ -16,6 +24,10 @@ from ..common.session_source import (
     resolve_session_source,
 )
 
+import logging
+
+_log = logging.getLogger(__name__)
+
 # ---- Tweakable window parameters ------------------------------------------
 PRE_OFF_SLICES = 2  # timeslices shown before the falling edge
 POST_OFF_SLICES = 10  # timeslices shown after the falling edge
@@ -26,13 +38,13 @@ THRESHOLD_FRAC = 0.10  # fraction of (peak − background) used to define the
 # ---------------------------------------------------------------------------
 
 _TIMESLICE_COLS = [
-    "layer_id",
-    "ic1_primary_channel",
-    "ic2_primary_channel",
-    "ic3_current_A",
-    "ic3_current_B",
-    "ic3_current_C",
-    "ic3_current_D",
+    C_LAYER_ID,
+    C_IC1_CURRENT,
+    C_IC2_CURRENT,
+    C_IC3_CURRENT_A,
+    C_IC3_CURRENT_B,
+    C_IC3_CURRENT_C,
+    C_IC3_CURRENT_D,
 ]
 
 SESSION_LINESTYLES = ["-", "--", ":", "-."]
@@ -110,7 +122,9 @@ def _extract_rampdown_curves(session_id: str, base_dir: str):
     if input_map is None:
         return None
 
-    energy_by_layer = input_map.groupby("layer_id")["ENERGY"].first().to_dict()
+    if C_LAYER_ID not in input_map.columns or C_ENERGY not in input_map.columns:
+        return None
+    energy_by_layer = input_map.groupby(C_LAYER_ID)[C_ENERGY].first().to_dict()
 
     frames = load_session_timeslice_device_units(src, usecols=_TIMESLICE_COLS)
     if not frames:
@@ -119,18 +133,18 @@ def _extract_rampdown_curves(session_id: str, base_dir: str):
     result: dict[float, dict[str, np.ndarray | None]] = {}
 
     for df in frames:
-        layer_id = df["layer_id"].iloc[0]
+        layer_id = df[C_LAYER_ID].iloc[0]
         energy = energy_by_layer.get(layer_id)
         if energy is None:
             continue
 
-        ic1 = df["ic1_primary_channel"].values
-        ic2 = df["ic2_primary_channel"].values
+        ic1 = df[C_IC1_CURRENT].values
+        ic2 = df[C_IC2_CURRENT].values
         ic3 = (
-            df["ic3_current_A"].values
-            + df["ic3_current_B"].values
-            + df["ic3_current_C"].values
-            + df["ic3_current_D"].values
+            df[C_IC3_CURRENT_A].values
+            + df[C_IC3_CURRENT_B].values
+            + df[C_IC3_CURRENT_C].values
+            + df[C_IC3_CURRENT_D].values
         )
 
         c1 = _rampdown_for_signal(ic1)
@@ -152,7 +166,7 @@ def _extract_rampdown_curves(session_id: str, base_dir: str):
 def run(session_ids: list[str], base_dir: str = "test_data") -> None:
     """Run beam-off ramp-down analysis and show matplotlib window."""
     if not session_ids:
-        print("No sessions selected")
+        _log.debug("No sessions selected")
         return
 
     session_curves: dict[str, dict] = {}
@@ -162,7 +176,7 @@ def run(session_ids: list[str], base_dir: str = "test_data") -> None:
             session_curves[sid] = curves
 
     if not session_curves:
-        print("No valid ramp-down data found for any session")
+        _log.debug("No valid ramp-down data found for any session")
         return
 
     all_energies: set[float] = set()

@@ -87,6 +87,30 @@ python -m scan_kit.app
 | **Sigma X/Y Box Plots** | Sigma X and Y distributions by energy |
 | **Beam-Off Ramp-Down** | Beam-off current ramp-down curves (IC1/IC2/IC3) |
 | **Beam-On vs Beam-Off Current** | Beam-on and beam-off current distributions by energy |
+| **IC Timeslice Replay** | Interactive media-player style viewer for raw IC1/IC2/IC3 timeslice current |
+
+### IC Timeslice Replay
+
+The replay view uses a media-player layout for browsing raw IC current data:
+
+- **Top panel** (three rows): full-resolution IC1, IC2, and IC3 traces for the
+  currently selected window. Layer boundaries appear as vertical lines with
+  energy annotations.
+- **Bottom panel** (short timeline): a compressed min/max envelope of IC1
+  across the entire session. Click and drag on this timeline to select the
+  window shown in the top panel.
+
+Usage:
+
+1. Select one or more sessions and click **IC Timeslice Replay**.
+2. The bottom timeline shows the full session waveform. Drag a span to zoom
+   the top panel into that region.
+3. Resize or reposition the span to scrub through different parts of the
+   session.
+
+When multiple sessions are selected, traces are overlaid with distinct colors.
+The detail panel auto-decimates when the selected window is very large, so
+interaction stays responsive.
 
 ## Supported Session Data Layout
 

@@ -6,7 +6,10 @@ import pandas as pd
 import matplotlib.pyplot as plt
 
 from ..common import (
+    POSITION_KEY_G3_RAW,
+    add_dose_ratio_columns,
     process_position_data,
+    try_load_position_data,
     plot_boxplots_for_column,
     annotate_slopes,
     make_session_legend,
@@ -16,8 +19,9 @@ from ..common import (
     SUPTITLE_KW,
 )
 
-POSITION_KEY_G2 = "spot_raw"
-POSITION_KEY_G3 = "spot_position_raw"
+import logging
+
+_log = logging.getLogger(__name__)
 
 EXTRA_SPOT_G3 = [
     "ic1_total_dose_spot_raw",
@@ -32,24 +36,13 @@ EXTRA_SPOT_G2 = [
 
 def _process_ratios_session(session_id: str, position_key: str, base_dir: str):
     """Process session and compute dose ratios."""
-    extra = EXTRA_SPOT_G3 if position_key == POSITION_KEY_G3 else EXTRA_SPOT_G2
+    extra = EXTRA_SPOT_G3 if position_key == POSITION_KEY_G3_RAW else EXTRA_SPOT_G2
     data = process_position_data(
         session_id, position_key, extra_spot_columns=extra, base_dir=base_dir
     )
     if data is None:
         return None
-
-    ic1_dose = data["ic1_total_dose_spot_raw"]
-    ic2_dose = data["ic2_total_dose_spot_raw"]
-    data = dict(data)
-    data["ic21_ratio"] = ((ic2_dose / ic1_dose) - 1.0) * 100.0
-
-    if position_key == POSITION_KEY_G3:
-        ic3_dose = data["r_ic3_total_dose_spot_raw"]
-        data["ic31_ratio"] = ((ic3_dose / ic1_dose) - 1.0) * 100.0
-        data["ic32_ratio"] = ((ic3_dose / ic2_dose) - 1.0) * 100.0
-
-    return data
+    return add_dose_ratio_columns(data, include_ic3=position_key == POSITION_KEY_G3_RAW)
 
 
 def _trend_line_color(face_color):
@@ -130,19 +123,17 @@ def _add_median_trend_lines(
 def run(session_ids: list[str], base_dir: str = "test_data") -> None:
     """Run dose ratios analysis and show matplotlib window."""
     if not session_ids:
-        print("No sessions selected")
+        _log.debug("No sessions selected")
         return
 
     session_data = {}
     for sid in session_ids:
-        data = _process_ratios_session(sid, POSITION_KEY_G3, base_dir)
-        if data is None:
-            data = _process_ratios_session(sid, POSITION_KEY_G2, base_dir)
+        data = try_load_position_data(sid, base_dir, _process_ratios_session)
         if data is not None:
             session_data[sid] = data
 
     if not session_data:
-        print("No valid data found for any session")
+        _log.debug("No valid data found for any session")
         return
 
     fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(

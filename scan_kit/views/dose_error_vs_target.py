@@ -7,6 +7,8 @@ import pandas as pd
 import matplotlib.colors as mcolors
 
 from ..common import (
+    POSITION_KEY_G2_RAW,
+    POSITION_KEY_G3_RAW,
     process_position_data,
     plot_boxplots_for_column,
     make_session_legend,
@@ -19,8 +21,9 @@ from ..common import (
     REFLINE_KW,
 )
 
-POSITION_KEY_G2 = "spot_raw"
-POSITION_KEY_G3 = "spot_position_raw"
+import logging
+
+_log = logging.getLogger(__name__)
 
 DELIVERED_COLS = {
     "ic1": "ic1_total_dose_spot",
@@ -113,19 +116,19 @@ def _process_session(session_id: str, position_key: str, base_dir: str):
 def run(session_ids: list[str], base_dir: str = "test_data") -> None:
     """Plot dose error (% of scan target) per IC vs beam energy."""
     if not session_ids:
-        print("No sessions selected")
+        _log.debug("No sessions selected")
         return
 
     session_data: dict = {}
     for sid in session_ids:
-        d = _process_session(sid, POSITION_KEY_G3, base_dir)
+        d = _process_session(sid, POSITION_KEY_G3_RAW, base_dir)
         if d is None:
-            d = _process_session(sid, POSITION_KEY_G2, base_dir)
+            d = _process_session(sid, POSITION_KEY_G2_RAW, base_dir)
         if d is not None:
             session_data[sid] = d
 
     if not session_data:
-        print("No valid dose / target data found for any session")
+        _log.debug("No valid dose / target data found for any session")
         return
 
     all_energies: set = set()
@@ -140,7 +143,7 @@ def run(session_ids: list[str], base_dir: str = "test_data") -> None:
             err_cols.append(key)
 
     if not err_cols:
-        print("No dose error columns available across all sessions")
+        _log.debug("No dose error columns available across all sessions")
         return
 
     loaded_ids = list(session_data.keys())

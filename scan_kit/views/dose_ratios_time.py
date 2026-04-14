@@ -1,11 +1,14 @@
 """Dose ratio vs spot delivery time scatter plots (IC2/IC1, IC3/IC1, IC3/IC2)."""
 
-import numpy as np
-import pandas as pd
 import matplotlib.pyplot as plt
 
 from ..common import (
+    POSITION_KEY_G3_RAW,
+    add_dose_ratio_columns,
+    add_spot_delivery_time,
     process_position_data,
+    scatter_with_trend,
+    try_load_position_data,
     annotate_slopes,
     make_session_legend,
     DEFAULT_SESSION_COLORS,
@@ -16,8 +19,9 @@ from ..common import (
     SCATTER_SIZE,
 )
 
-POSITION_KEY_G2 = "spot_raw"
-POSITION_KEY_G3 = "spot_position_raw"
+import logging
+
+_log = logging.getLogger(__name__)
 
 EXTRA_SPOT_G3 = [
     "ic1_total_dose_spot_raw",
@@ -36,63 +40,17 @@ EXTRA_SPOT_G2 = [
 
 def _process_session(session_id: str, position_key: str, base_dir: str):
     """Load session, compute dose ratios and spot delivery time."""
-    extra = EXTRA_SPOT_G3 if position_key == POSITION_KEY_G3 else EXTRA_SPOT_G2
+    extra = EXTRA_SPOT_G3 if position_key == POSITION_KEY_G3_RAW else EXTRA_SPOT_G2
     data = process_position_data(
         session_id, position_key, extra_spot_columns=extra, base_dir=base_dir
     )
     if data is None:
         return None
 
-    ic1_dose = data["ic1_total_dose_spot_raw"]
-    ic2_dose = data["ic2_total_dose_spot_raw"]
-    data = data.copy()
-    data["ic21_ratio"] = ((ic2_dose / ic1_dose) - 1.0) * 100.0
-
-    if position_key == POSITION_KEY_G3:
-        ic3_dose = data["r_ic3_total_dose_spot_raw"]
-        data["ic31_ratio"] = ((ic3_dose / ic1_dose) - 1.0) * 100.0
-        data["ic32_ratio"] = ((ic3_dose / ic2_dose) - 1.0) * 100.0
-
-    ts = pd.Series(data["timestamp"], name="timestamp")
-    layer = pd.Series(data["layer_id"], name="layer_id")
-    df = pd.DataFrame({"timestamp": ts.values, "layer_id": layer.values})
-    spot_time = df.groupby("layer_id")["timestamp"].diff()
-    # First spot in each layer: use its own timestamp (time from layer start)
-    first_mask = spot_time.isna()
-    spot_time.loc[first_mask] = df.loc[first_mask, "timestamp"]
-    st = spot_time.values
-    keep = st <= 100  # drop flyers over 1 second
-    for key in data:
-        if key == "session_id":
-            continue
-        val = data[key]
-        data[key] = val[keep] if isinstance(val, np.ndarray) else val.iloc[keep.nonzero()[0]]
-    data["spot_time"] = st[keep]
-
-    return data
-
-
-def _scatter_with_trend(ax, x, y, color, label):
-    """Scatter *y* vs *x* with a linear trend line and slope annotation."""
-    ax.scatter(x, y, c=color, alpha=SCATTER_ALPHA, s=SCATTER_SIZE,
-               edgecolors="none", label=label)
-
-    mask = np.isfinite(x) & np.isfinite(y)
-    xf, yf = np.asarray(x)[mask], np.asarray(y)[mask]
-    if len(xf) < 2:
+    data = add_dose_ratio_columns(data, include_ic3=position_key == POSITION_KEY_G3_RAW)
+    if data is None:
         return None
-
-    slope, intercept = np.polyfit(xf, yf, 1)
-    x_range = np.array([xf.min(), xf.max()])
-    ax.plot(
-        x_range,
-        slope * x_range + intercept,
-        color=color,
-        linewidth=2,
-        linestyle="-",
-        zorder=5,
-    )
-    return slope
+    return add_spot_delivery_time(data, max_spot_time_ms=100.0)
 
 
 def _plot_ratio_vs_time(ax, session_data, ratio_col, colors, title):
@@ -101,12 +59,14 @@ def _plot_ratio_vs_time(ax, session_data, ratio_col, colors, title):
     for i, (sid, data) in enumerate(session_data.items()):
         if ratio_col not in data:
             continue
-        slope = _scatter_with_trend(
+        slope = scatter_with_trend(
             ax,
             data["spot_time"],
             data[ratio_col],
-            colors[i],
-            f"Session {sid}",
+            color=colors[i],
+            label=f"Session {sid}",
+            alpha=SCATTER_ALPHA,
+            size=SCATTER_SIZE,
         )
         if slope is not None:
             prefix = f"{sid}: " if len(session_data) > 1 else ""
@@ -124,19 +84,17 @@ def _plot_ratio_vs_time(ax, session_data, ratio_col, colors, title):
 def run(session_ids: list[str], base_dir: str = "test_data") -> None:
     """Run dose-ratio vs spot time analysis and show matplotlib window."""
     if not session_ids:
-        print("No sessions selected")
+        _log.debug("No sessions selected")
         return
 
     session_data: dict[str, dict] = {}
     for sid in session_ids:
-        data = _process_session(sid, POSITION_KEY_G3, base_dir)
-        if data is None:
-            data = _process_session(sid, POSITION_KEY_G2, base_dir)
+        data = try_load_position_data(sid, base_dir, _process_session)
         if data is not None:
             session_data[sid] = data
 
     if not session_data:
-        print("No valid data found for any session")
+        _log.debug("No valid data found for any session")
         return
 
     loaded_ids = list(session_data.keys())

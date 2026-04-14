@@ -172,6 +172,54 @@ def plot_scatter_energy(ax, x, y, energy, **kwargs):
     return ax.scatter(x, y, **defaults)
 
 
+def scatter_with_trend(
+    ax,
+    x,
+    y,
+    *,
+    color,
+    label,
+    alpha=SCATTER_ALPHA,
+    size=SCATTER_SIZE,
+    line_width=2,
+    zorder=5,
+):
+    """Scatter ``y`` vs ``x`` and overlay a linear trend line.
+
+    Returns:
+        Fitted slope, or ``None`` when fewer than two finite points exist.
+    """
+    ax.scatter(
+        x,
+        y,
+        c=color,
+        alpha=alpha,
+        s=size,
+        edgecolors="none",
+        label=label,
+    )
+
+    x_arr = np.asarray(x, dtype=float)
+    y_arr = np.asarray(y, dtype=float)
+    mask = np.isfinite(x_arr) & np.isfinite(y_arr)
+    xf = x_arr[mask]
+    yf = y_arr[mask]
+    if xf.size < 2:
+        return None
+
+    slope, intercept = np.polyfit(xf, yf, 1)
+    x_range = np.array([xf.min(), xf.max()])
+    ax.plot(
+        x_range,
+        slope * x_range + intercept,
+        color=color,
+        linewidth=line_width,
+        linestyle="-",
+        zorder=zorder,
+    )
+    return slope
+
+
 def add_energy_colorbar(fig_or_ax, energies=None, vmin=None, vmax=None):
     """Add a colorbar for energy to a figure or axes.
 

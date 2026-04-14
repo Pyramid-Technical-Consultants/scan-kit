@@ -13,11 +13,15 @@ from ..common import (
     SCATTER_SIZE,
 )
 
+import logging
+
+_log = logging.getLogger(__name__)
+
 
 def run(session_ids: list[str], base_dir: str = "test_data") -> None:
     """Run IC1 vs IC2 error scatter analysis and show matplotlib window."""
     if not session_ids:
-        print("No sessions selected")
+        _log.debug("No sessions selected")
         return
 
     key = "spot_position_raw"
@@ -32,7 +36,7 @@ def run(session_ids: list[str], base_dir: str = "test_data") -> None:
             session_data[sid] = data
 
     if not session_data:
-        print("No valid data found for any session")
+        _log.debug("No valid data found for any session")
         return
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=FIG_SIZE_1x2)

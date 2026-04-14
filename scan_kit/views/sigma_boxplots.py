@@ -14,6 +14,10 @@ from ..common import (
     GRID_KW,
 )
 
+import logging
+
+_log = logging.getLogger(__name__)
+
 POS_KEY = "spot_position_raw"
 SIG_KEY = "spot_sigma_raw"
 
@@ -62,7 +66,7 @@ def _process_session_data(session_id: str, base_dir: str):
 def run(session_ids: list[str], base_dir: str = "test_data") -> None:
     """Run sigma box plots analysis and show matplotlib window."""
     if not session_ids:
-        print("No sessions selected")
+        _log.debug("No sessions selected")
         return
 
     session_data = {}
@@ -72,7 +76,7 @@ def run(session_ids: list[str], base_dir: str = "test_data") -> None:
             session_data[sid] = data
 
     if not session_data:
-        print("No valid data found for any session")
+        _log.debug("No valid data found for any session")
         return
 
     combined_data = []

@@ -1,10 +1,18 @@
 """Spot delivery time analysis: total, beam-on, and overhead time."""
 
 import numpy as np
-import pandas as pd
 import matplotlib.pyplot as plt
 
 from ..common import (
+    C_IC1_CURRENT,
+    C_LAYER_ID,
+    C_SPOT_NO,
+    C_TIMESTAMP,
+    C_TIME_S,
+    C_TIME_NS,
+    resolve_concept_column,
+    add_spot_delivery_time,
+    filter_data_rows,
     process_position_data,
     plot_boxplots_for_column,
     make_session_legend,
@@ -13,6 +21,7 @@ from ..common import (
     DEFAULT_SESSION_COLORS,
     FIG_SIZE_2x2,
     SUPTITLE_KW,
+    try_load_position_data,
 )
 from ..common.session_source import (
     load_session_timeslice_device_units,
@@ -20,16 +29,27 @@ from ..common.session_source import (
 )
 from .dose_ratios import _add_median_trend_lines
 
-POSITION_KEY_G2 = "spot_raw"
-POSITION_KEY_G3 = "spot_position_raw"
+import logging
 
-EXTRA_SPOT = ["timestamp", "layer_id", "spot_no"]
+_log = logging.getLogger(__name__)
+
+EXTRA_SPOT = ["timestamp", "layer_id", "spot_no", "time_s", "time_ns"]
 
 MAX_SPOT_TIME_MS = 100
 
 ON_FRAC = 0.10
 
-_NEEDED_TS_COLS = {"spot_no", "layer_id", "timestamp", "ic1_primary_channel"}
+
+def _ensure_timestamp(data: dict) -> dict:
+    """Synthesize a ``timestamp`` key (ms) from ``time_s`` + ``time_ns`` when missing."""
+    if "timestamp" in data:
+        return data
+    if "time_s" not in data or "time_ns" not in data:
+        return data
+    result = dict(data)
+    ts = np.asarray(result["time_s"], dtype=float) * 1000.0 + np.asarray(result["time_ns"], dtype=float) / 1e6
+    result["timestamp"] = ts
+    return result
 
 
 def _process_session(session_id: str, position_key: str, base_dir: str):
@@ -40,30 +60,26 @@ def _process_session(session_id: str, position_key: str, base_dir: str):
     )
     if data is None:
         return None
-    if "timestamp" not in data or "layer_id" not in data:
-        return None
+    data = _ensure_timestamp(data)
+    return add_spot_delivery_time(data, max_spot_time_ms=MAX_SPOT_TIME_MS)
 
-    data = dict(data)
-    df = pd.DataFrame({
-        "timestamp": np.asarray(data["timestamp"], dtype=float),
-        "layer_id": np.asarray(data["layer_id"]),
-    })
-    spot_time = df.groupby("layer_id")["timestamp"].diff()
-    first_mask = spot_time.isna()
-    spot_time.loc[first_mask] = df.loc[first_mask, "timestamp"]
-    st = spot_time.values
 
-    keep = st <= MAX_SPOT_TIME_MS
-    for key in list(data):
-        if key == "session_id":
-            continue
-        val = data[key]
-        if isinstance(val, np.ndarray):
-            data[key] = val[keep]
-        else:
-            data[key] = val.iloc[keep.nonzero()[0]]
-    data["spot_time"] = st[keep]
-    return data
+def _resolve_ts_timestamp(df):
+    """Return a float timestamp array (ms) from a timeslice frame.
+
+    Prefers a direct ``timestamp`` column; falls back to ``time_s * 1000 + time_ns / 1e6``.
+    Returns None when neither is available.
+    """
+    col_ts = resolve_concept_column(df.columns, C_TIMESTAMP)
+    if col_ts is not None:
+        return df[col_ts].values.astype(float)
+
+    col_s = resolve_concept_column(df.columns, C_TIME_S)
+    col_ns = resolve_concept_column(df.columns, C_TIME_NS)
+    if col_s is not None and col_ns is not None:
+        return df[col_s].values.astype(float) * 1000.0 + df[col_ns].values.astype(float) / 1e6
+
+    return None
 
 
 def _compute_beam_on_times(session_id: str, base_dir: str):
@@ -80,36 +96,45 @@ def _compute_beam_on_times(session_id: str, base_dir: str):
     if not frames:
         return None
 
+    df0 = frames[0].loc[:, ~frames[0].columns.duplicated()]
+    col_layer = resolve_concept_column(df0.columns, C_LAYER_ID)
+    col_spot = resolve_concept_column(df0.columns, C_SPOT_NO)
+    col_ic1 = resolve_concept_column(df0.columns, C_IC1_CURRENT)
+    if not all([col_layer, col_spot, col_ic1]):
+        return None
+
     result: dict[tuple, float] = {}
 
     for df in frames:
         df = df.loc[:, ~df.columns.duplicated()]
-        if not _NEEDED_TS_COLS.issubset(df.columns):
+
+        df_clean = df.dropna(subset=[col_layer, col_spot, col_ic1])
+        if df_clean.empty:
             continue
 
-        df = df.dropna(subset=["layer_id", "spot_no", "ic1_primary_channel"])
-        if df.empty:
+        timestamps = _resolve_ts_timestamp(df_clean)
+        if timestamps is None:
             continue
 
-        layer_id = int(df["layer_id"].iloc[0])
-        ic1 = df["ic1_primary_channel"].values.astype(float)
+        layer_id = int(df_clean[col_layer].iloc[0])
+        ic1 = df_clean[col_ic1].values.astype(float)
 
         bg = np.nanpercentile(ic1, 25)
         pk = np.nanpercentile(ic1, 99)
         dyn = pk - bg
-        if dyn < 1.0:
+        if pk == 0 or abs(dyn / pk) < 0.05:
             continue
         threshold = bg + ON_FRAC * dyn
 
         beam_on = ic1 > threshold
-        timestamps = df["timestamp"].values.astype(float)
-        spot_nos = df["spot_no"].values.astype(int)
+        ts = timestamps
+        spot_nos = df_clean[col_spot].values.astype(int)
 
         unique_spots = np.unique(spot_nos)
         for sno in unique_spots:
             mask = spot_nos == sno
             spot_on = beam_on[mask]
-            spot_ts = timestamps[mask]
+            spot_ts = ts[mask]
             n_on = spot_on.sum()
             if n_on == 0:
                 result[(layer_id, sno)] = 0.0
@@ -146,32 +171,22 @@ def _merge_beam_on_times(data: dict, beam_on_lookup: dict) -> dict:
     overhead = delivery - beam_on_arr
 
     keep = valid & (overhead >= 0) & (delivery <= MAX_SPOT_TIME_MS)
-    for key in list(data):
-        if key == "session_id":
-            continue
-        val = data[key]
-        if isinstance(val, np.ndarray):
-            data[key] = val[keep]
-        else:
-            data[key] = val.iloc[keep.nonzero()[0]]
-
-    data["beam_on_time"] = beam_on_arr[keep]
-    data["overhead_time"] = overhead[keep]
-    data["spot_time"] = delivery[keep]
-    return data
+    filtered = filter_data_rows(data, keep)
+    filtered["beam_on_time"] = beam_on_arr[keep]
+    filtered["overhead_time"] = overhead[keep]
+    filtered["spot_time"] = delivery[keep]
+    return filtered
 
 
 def run(session_ids: list[str], base_dir: str = "test_data") -> None:
     """Plot spot delivery time, beam-on time, and overhead by energy."""
     if not session_ids:
-        print("No sessions selected")
+        _log.debug("No sessions selected")
         return
 
     session_data: dict = {}
     for sid in session_ids:
-        d = _process_session(sid, POSITION_KEY_G3, base_dir)
-        if d is None:
-            d = _process_session(sid, POSITION_KEY_G2, base_dir)
+        d = try_load_position_data(sid, base_dir, _process_session)
         if d is None:
             continue
 
@@ -181,7 +196,7 @@ def run(session_ids: list[str], base_dir: str = "test_data") -> None:
         session_data[sid] = d
 
     if not session_data:
-        print("No valid spot time data found for any session")
+        _log.debug("No valid spot time data found for any session")
         return
 
     all_energies: set = set()

@@ -12,9 +12,14 @@ import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 
+import logging
+
 import pandas as pd
 
 from .session_meta import SessionMeta, parse_termination_summary_text
+from .schema import canonical_column_aliases, canonicalize_dataframe_columns
+
+_log = logging.getLogger(__name__)
 
 _TIMESLICE_RE = re.compile(
     r"^[^/]+/layer-(\d+)/run-(\d+)/timeslice_data_device_units\.csv$"
@@ -29,6 +34,23 @@ _ARCHIVE_SUFFIXES: tuple[str, ...] = (
     ".tar",
     ".zip",
 )
+_DEFAULT_CANONICAL_ALIASES = canonical_column_aliases()
+
+def _read_csv_robust(
+    source,
+    *,
+    usecols: list[str] | None = None,
+    aliases: dict[str, tuple[str, ...]] | None = None,
+) -> pd.DataFrame:
+    """Read a CSV and tolerate schema drift in column naming."""
+    df = pd.read_csv(source, index_col=False, skipinitialspace=True)
+    df = canonicalize_dataframe_columns(df, aliases=aliases or _DEFAULT_CANONICAL_ALIASES)
+    if usecols is None:
+        return df
+    keep = [c for c in usecols if c in df.columns]
+    if not keep:
+        return df.iloc[:, 0:0]
+    return df[keep]
 
 
 def _strip_archive_suffix(filename: str) -> str | None:
@@ -171,12 +193,12 @@ def load_session_csv(source: SessionSource, csv_name: str) -> pd.DataFrame | Non
             p = source.path / csv_name
             if not p.is_file():
                 return None
-            return pd.read_csv(p, index_col=False, skipinitialspace=True)
+            return _read_csv_robust(p)
 
         if source.kind == "zip":
             with zipfile.ZipFile(source.path, "r") as zf:
                 with zf.open(f"{sid}/{csv_name}") as f:
-                    return pd.read_csv(f, index_col=False, skipinitialspace=True)
+                    return _read_csv_robust(f)
 
         if source.kind == "tar":
             with tarfile.open(source.path, "r:*") as tf:
@@ -188,9 +210,9 @@ def load_session_csv(source: SessionSource, csv_name: str) -> pd.DataFrame | Non
                 raw = tf.extractfile(info)
                 if raw is None:
                     return None
-                return pd.read_csv(raw, index_col=False, skipinitialspace=True)
+                return _read_csv_robust(raw)
     except Exception as e:
-        print(f"Error loading {csv_name} from session {sid}: {e}")
+        _log.debug("Error loading %s from session %s: %s", csv_name, sid, e)
         return None
 
 
@@ -219,9 +241,7 @@ def load_session_timeslice_device_units(
             matches.sort(key=lambda t: t[0])
             frames = []
             for layer_idx, p in matches:
-                df = pd.read_csv(
-                    p, usecols=usecols, index_col=False, skipinitialspace=True
-                )
+                df = _read_csv_robust(p, usecols=usecols)
                 df["_layer_idx"] = layer_idx
                 frames.append(df)
             return frames
@@ -234,7 +254,7 @@ def load_session_timeslice_device_units(
             with tarfile.open(source.path, "r:*") as tf:
                 return _timeslices_from_tar(tf, sid, usecols)
     except Exception as e:
-        print(f"Error loading timeslice data from session {sid}: {e}")
+        _log.debug("Error loading timeslice data from session %s: %s", sid, e)
         return []
 
 
@@ -252,7 +272,7 @@ def _timeslices_from_zip(
     frames = []
     for layer_idx, path in matches:
         with zf.open(path) as f:
-            df = pd.read_csv(f, usecols=usecols, index_col=False, skipinitialspace=True)
+            df = _read_csv_robust(f, usecols=usecols)
         df["_layer_idx"] = layer_idx
         frames.append(df)
     return frames
@@ -274,7 +294,7 @@ def _timeslices_from_tar(
         raw = tf.extractfile(info)
         if raw is None:
             continue
-        df = pd.read_csv(raw, usecols=usecols, index_col=False, skipinitialspace=True)
+        df = _read_csv_robust(raw, usecols=usecols)
         df["_layer_idx"] = layer_idx
         frames.append(df)
     return frames

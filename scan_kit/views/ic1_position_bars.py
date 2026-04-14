@@ -1,10 +1,18 @@
-"""IC1 X/Y Position Error box plots for multiple sessions."""
+"""IC1 X/Y Position Error box plots for multiple sessions.
+
+Uses the **non-raw** (processed) position columns which are already in
+the same mm coordinate frame as the plan.  Raw register-level positions
+are a different space and must NOT be subtracted from plan positions.
+"""
 
 import numpy as np
 import matplotlib.pyplot as plt
 
 from ..common import (
+    C_X_POSITION,
+    C_Y_POSITION,
     process_position_data,
+    try_load_position_data,
     plot_boxplots_for_column,
     make_session_legend,
     style_energy_axes,
@@ -15,59 +23,56 @@ from ..common import (
     REFLINE_KW,
 )
 
-POSITION_KEY = "spot_position_raw"
-# Prescribed positions: input map only (spot_data has no expected columns).
-EXPECTED_COLS = ("X_POSITION", "Y_POSITION")
-# Measured positions in the same mm frame as the input map (raw-remapped ic1_* is a different space).
-MEASURED_COLS = ("r_ic1_x_spot_position", "r_ic1_y_spot_position")
+import logging
+
+_log = logging.getLogger(__name__)
+
+
+def _process_session(session_id: str, position_key: str, base_dir: str):
+    """Load non-raw position data and compute IC1 X/Y error vs plan."""
+    data = process_position_data(
+        session_id,
+        position_key,
+        extra_input_columns=[C_X_POSITION, C_Y_POSITION],
+        base_dir=base_dir,
+    )
+    if data is None:
+        return None
+    data = dict(data)
+
+    if C_X_POSITION not in data or C_Y_POSITION not in data:
+        _log.debug("Session %s: input_map missing plan position columns; skipping", session_id)
+        return None
+
+    data["ic1_x_err"] = np.asarray(data["ic1_x"], dtype=float) - np.asarray(
+        data[C_X_POSITION], dtype=float
+    )
+    data["ic1_y_err"] = np.asarray(data["ic1_y"], dtype=float) - np.asarray(
+        data[C_Y_POSITION], dtype=float
+    )
+    return data
 
 
 def run(session_ids: list[str], base_dir: str = "test_data") -> None:
     """Run IC1 X/Y position error analysis and show matplotlib window.
 
-    Error is **measured** ``r_ic1_*_spot_position`` (scaled mm, same coordinate
-    frame as the plan) minus **prescribed** ``X_POSITION`` / ``Y_POSITION`` from
-    ``input_map.csv``. Remapped ``ic1_x``/``ic1_y`` from raw registers are not
-    subtracted from plan positions — that mixes coordinate systems.
+    Error is **measured** non-raw IC1 position (already in plan mm coordinates)
+    minus **prescribed** ``X_POSITION`` / ``Y_POSITION`` from ``input_map.csv``.
+    Raw register-level positions are NOT used here — they live in a different
+    coordinate space.
     """
     if not session_ids:
-        print("No sessions selected")
+        _log.debug("No sessions selected")
         return
 
     session_data = {}
     for sid in session_ids:
-        data = process_position_data(
-            sid,
-            POSITION_KEY,
-            extra_spot_columns=list(MEASURED_COLS),
-            extra_input_columns=list(EXPECTED_COLS),
-            base_dir=base_dir,
-        )
-        if data is None:
-            continue
-        data = dict(data)
-        if EXPECTED_COLS[0] not in data or EXPECTED_COLS[1] not in data:
-            print(
-                f"Session {sid}: input_map missing {EXPECTED_COLS[0]}/"
-                f"{EXPECTED_COLS[1]}; skipping"
-            )
-            continue
-        if MEASURED_COLS[0] not in data or MEASURED_COLS[1] not in data:
-            print(
-                f"Session {sid}: spot_data missing {MEASURED_COLS[0]}/"
-                f"{MEASURED_COLS[1]}; skipping"
-            )
-            continue
-        data["ic1_x_err"] = np.asarray(data[MEASURED_COLS[0]], dtype=float) - np.asarray(
-            data[EXPECTED_COLS[0]], dtype=float
-        )
-        data["ic1_y_err"] = np.asarray(data[MEASURED_COLS[1]], dtype=float) - np.asarray(
-            data[EXPECTED_COLS[1]], dtype=float
-        )
-        session_data[sid] = data
+        data = try_load_position_data(sid, base_dir, _process_session, raw=False)
+        if data is not None:
+            session_data[sid] = data
 
     if not session_data:
-        print("No valid data found for any session")
+        _log.debug("No valid data found for any session")
         return
 
     all_energies = set()
