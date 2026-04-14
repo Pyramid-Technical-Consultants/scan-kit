@@ -150,6 +150,13 @@ def _load_session_timeline(session_id: str, base_dir: str) -> dict | None:
         result["ic1_y"] = transform.remap(np.concatenate(pos_parts["ic1_y"]), *transform.IC1_Y_MAP)
         result["ic2_x"] = transform.remap(np.concatenate(pos_parts["ic2_x"]), *transform.IC2_X_MAP)
         result["ic2_y"] = transform.remap(np.concatenate(pos_parts["ic2_y"]), *transform.IC2_Y_MAP)
+        # Raw values -1 or 0 indicate invalid fits; after remap they fall
+        # outside the valid strip range [-128, 128].  NaN them out so
+        # downstream scatter plots skip them automatically.
+        _POS_LIMIT = transform.IC_MM_MAX  # 128
+        for k in ("ic1_x", "ic1_y", "ic2_x", "ic2_y"):
+            arr = result[k]
+            arr[np.abs(arr) > _POS_LIMIT] = np.nan
     return result
 
 
@@ -216,10 +223,9 @@ def run(session_ids: list[str], base_dir: str = "test_data") -> None:
     n_detail = len(ic_keys)
 
     # -- Layout ----------------------------------------------------------------
-    # Columns: line-chart detail | IC1 scatter | IC2 scatter
-    # Rows: one per IC channel + 1 short timeline row
-    n_cols = 3 if show_pos else 1
-    width_ratios = [3, 1, 1] if show_pos else [1]
+    # Each IC row: [line chart | scatter].  Bottom row: timeline spans full width.
+    n_cols = 2 if show_pos else 1
+    width_ratios = [4, 1] if show_pos else [1]
 
     fig = plt.figure(figsize=(22 if show_pos else 18, 10))
     fig.suptitle("IC Timeslice Replay", **SUPTITLE_KW)
@@ -228,8 +234,8 @@ def run(session_ids: list[str], base_dir: str = "test_data") -> None:
         n_detail + 1, n_cols,
         height_ratios=[1] * n_detail + [0.30],
         width_ratios=width_ratios,
-        hspace=0.08, wspace=0.25,
-        top=0.94, bottom=0.06, left=0.05, right=0.98,
+        hspace=0.18, wspace=0.04,
+        top=0.94, bottom=0.06, left=0.03, right=0.99,
     )
 
     ax_detail = [fig.add_subplot(gs[0, 0])]
@@ -237,11 +243,10 @@ def run(session_ids: list[str], base_dir: str = "test_data") -> None:
         ax_detail.append(fig.add_subplot(gs[i, 0], sharex=ax_detail[0]))
     ax_timeline = fig.add_subplot(gs[n_detail, :])
 
-    ax_scatter_ic1: plt.Axes | None = None
-    ax_scatter_ic2: plt.Axes | None = None
+    ax_scatter: list[plt.Axes | None] = [None] * n_detail
     if show_pos:
-        ax_scatter_ic1 = fig.add_subplot(gs[0:n_detail, 1])
-        ax_scatter_ic2 = fig.add_subplot(gs[0:n_detail, 2], sharex=ax_scatter_ic1, sharey=ax_scatter_ic1)
+        for i in range(n_detail):
+            ax_scatter[i] = fig.add_subplot(gs[i, 1])
 
     for ax in ax_detail[:-1]:
         plt.setp(ax.get_xticklabels(), visible=False)
@@ -342,51 +347,62 @@ def run(session_ids: list[str], base_dir: str = "test_data") -> None:
         if multi:
             ax_detail[0].legend(loc="upper right", fontsize=8)
 
-        # -- Scatter plots for the same window ---------------------------------
-        if show_pos and ax_scatter_ic1 is not None and ax_scatter_ic2 is not None:
-            ax_scatter_ic1.clear()
-            ax_scatter_ic2.clear()
+        # -- Per-row scatter plots for the same window --------------------------
+        if show_pos:
+            _pos_keys = {"ic1": ("ic1_x", "ic1_y"), "ic2": ("ic2_x", "ic2_y")}
 
-            for si, (sid, data) in enumerate(session_data.items()):
-                if not data.get("has_positions"):
+            for ic_idx, ic in enumerate(ic_keys):
+                ax_sc = ax_scatter[ic_idx]
+                if ax_sc is None:
                     continue
-                n = data["n_samples"]
-                a_lo = min(lo, n)
-                a_hi = min(hi, n)
-                if a_hi <= a_lo:
-                    continue
+                ax_sc.clear()
 
-                w_energy = data["energy"][a_lo:a_hi]
-                ic1_x = data["ic1_x"][a_lo:a_hi]
-                ic1_y = data["ic1_y"][a_lo:a_hi]
-                ic2_x = data["ic2_x"][a_lo:a_hi]
-                ic2_y = data["ic2_y"][a_lo:a_hi]
+                xk, yk = _pos_keys.get(ic, (None, None))
+                has_data = xk is not None
 
-                w_len = a_hi - a_lo
-                if w_len > DETAIL_MAX_POINTS:
-                    step = max(1, w_len // DETAIL_MAX_POINTS)
-                    sl = slice(None, None, step)
-                    w_energy, ic1_x, ic1_y = w_energy[sl], ic1_x[sl], ic1_y[sl]
-                    ic2_x, ic2_y = ic2_x[sl], ic2_y[sl]
+                if has_data:
+                    for si, (sid, data) in enumerate(session_data.items()):
+                        if not data.get("has_positions"):
+                            continue
+                        n = data["n_samples"]
+                        a_lo = min(lo, n)
+                        a_hi = min(hi, n)
+                        if a_hi <= a_lo:
+                            continue
 
-                scatter_kw = dict(
-                    c=w_energy, cmap="viridis", norm=norm,
-                    alpha=SCATTER_ALPHA, s=SCATTER_SIZE, edgecolors="none",
-                )
-                ax_scatter_ic1.scatter(ic1_x, ic1_y, **scatter_kw)
-                ax_scatter_ic2.scatter(ic2_x, ic2_y, **scatter_kw)
+                        w_energy = data["energy"][a_lo:a_hi]
+                        wx = data[xk][a_lo:a_hi]
+                        wy = data[yk][a_lo:a_hi]
 
-            for ax_sc in (ax_scatter_ic1, ax_scatter_ic2):
+                        w_len = a_hi - a_lo
+                        if w_len > DETAIL_MAX_POINTS:
+                            step = max(1, w_len // DETAIL_MAX_POINTS)
+                            sl = slice(None, None, step)
+                            w_energy, wx, wy = w_energy[sl], wx[sl], wy[sl]
+
+                        valid = np.isfinite(wx) & np.isfinite(wy)
+                        if not valid.any():
+                            continue
+                        ax_sc.scatter(
+                            wx[valid], wy[valid],
+                            c=w_energy[valid], cmap="viridis", norm=norm,
+                            alpha=SCATTER_ALPHA, s=SCATTER_SIZE, edgecolors="none",
+                        )
+                else:
+                    ax_sc.text(
+                        0.5, 0.5, "No position data",
+                        transform=ax_sc.transAxes, ha="center", va="center",
+                        fontsize=9, color="gray", alpha=0.6,
+                    )
+
                 ax_sc.axhline(y=0, **REFLINE_KW)
                 ax_sc.axvline(x=0, **REFLINE_KW)
                 ax_sc.grid(**GRID_KW)
-                ax_sc.set_xlabel("X (mm)", fontsize=8)
-                ax_sc.set_ylabel("Y (mm)", fontsize=8)
                 ax_sc.set_aspect("equal", adjustable="datalim")
                 ax_sc.tick_params(labelsize=7)
-
-            ax_scatter_ic1.set_title("IC1 Position", fontsize=9)
-            ax_scatter_ic2.set_title("IC2 Position", fontsize=9)
+                ax_sc.set_title(f"{ic_labels[ic_idx]} Position", fontsize=9)
+                if ic_idx == n_detail - 1:
+                    ax_sc.set_xlabel("X (mm)", fontsize=8)
 
         fig.canvas.draw_idle()
 
@@ -403,5 +419,33 @@ def run(session_ids: list[str], base_dir: str = "test_data") -> None:
     )
 
     fig._scan_kit_span = span  # type: ignore[attr-defined]
+
+    # -- Scroll-wheel zoom on the timeline X axis ------------------------------
+    _ZOOM_FACTOR = 0.8  # each scroll tick zooms by 20%
+
+    def _on_scroll(event):
+        if event.inaxes is not ax_timeline:
+            return
+        cur_lo, cur_hi = ax_timeline.get_xlim()
+        rng = cur_hi - cur_lo
+        # Zoom centred on the cursor position
+        cx = event.xdata if event.xdata is not None else (cur_lo + cur_hi) / 2
+        if event.button == "up":
+            new_rng = rng * _ZOOM_FACTOR
+        elif event.button == "down":
+            new_rng = rng / _ZOOM_FACTOR
+        else:
+            return
+        new_rng = max(new_rng, 50)  # don't zoom past ~50 samples
+        new_rng = min(new_rng, max_n)
+        frac = (cx - cur_lo) / rng if rng > 0 else 0.5
+        new_lo = cx - frac * new_rng
+        new_hi = cx + (1 - frac) * new_rng
+        new_lo = max(0, new_lo)
+        new_hi = min(max_n, new_hi)
+        ax_timeline.set_xlim(new_lo, new_hi)
+        fig.canvas.draw_idle()
+
+    fig.canvas.mpl_connect("scroll_event", _on_scroll)
 
     plt.show()
