@@ -220,7 +220,11 @@ def load_session_timeslice_device_units(
     source: SessionSource,
     usecols: list[str] | None = None,
 ) -> list[pd.DataFrame]:
-    """Load all per-layer timeslice_data_device_units CSVs."""
+    """Load all per-layer timeslice_data_device_units CSVs.
+
+    G2 IC current columns are automatically converted from coulombs to nA
+    by the canonicalization step inside ``_read_csv_robust``.
+    """
     sid = source.session_id
     try:
         if source.kind == "directory":

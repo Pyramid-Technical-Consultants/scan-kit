@@ -2,6 +2,22 @@
 
 This module centralizes how scan-kit resolves logical measurement concepts
 to physical CSV column names across schema versions (and G2/G3 variants).
+
+Unit conventions
+----------------
+After canonicalization all IC current columns are in **nanoamperes (nA)**.
+
+* **G3** stores IC current natively in nA in columns like
+  ``ic1_primary_channel``, ``ic2_primary_channel``, ``ic3_current_A/B/C/D``.
+  No conversion is needed.
+* **G2** stores IC current as **charge in coulombs** accumulated over a 1 ms
+  timeslice in columns like ``r_ic1_current_dose``, ``r_ic2_current_dose``.
+  These are converted to nA during canonicalization:
+  ``nA = coulombs / 0.001 s × 1e9 = coulombs × 1e12``.
+
+The ``_COLUMN_SCALE_FACTORS`` dict below lists every G2 column that needs
+scaling.  ``canonicalize_dataframe_columns`` applies these factors
+automatically whenever it renames a column.
 """
 
 from __future__ import annotations
@@ -23,15 +39,21 @@ C_SPOT_NO = "spot_no"
 C_TIMESTAMP = "timestamp"
 C_TIME_S = "time_s"
 C_TIME_NS = "time_ns"
+
+# IC current concepts — after canonicalization these are always in nA.
+# G3 columns (ic1_primary_channel, etc.) are natively nA.
+# G2 columns (r_ic1_current_dose, etc.) are coulombs per 1 ms timeslice;
+# they are scaled to nA by _COLUMN_SCALE_FACTORS during canonicalization.
 C_IC1_CURRENT = "ic1_current"
 C_IC2_CURRENT = "ic2_current"
-C_IC3_CURRENT_A = "ic3_current_a"
-C_IC3_CURRENT_B = "ic3_current_b"
-C_IC3_CURRENT_C = "ic3_current_c"
-C_IC3_CURRENT_D = "ic3_current_d"
+C_IC3_CURRENT_A = "ic3_current_a"  # G3 only (quad IC3)
+C_IC3_CURRENT_B = "ic3_current_b"  # G3 only
+C_IC3_CURRENT_C = "ic3_current_c"  # G3 only
+C_IC3_CURRENT_D = "ic3_current_d"  # G3 only
 C_IC1_TOTAL_DOSE = "ic1_total_dose"
 C_IC2_TOTAL_DOSE = "ic2_total_dose"
 C_IC3_TOTAL_DOSE = "ic3_total_dose"
+C_CHARGE_REQ = "charge_req"
 
 # Raw position concepts (register-level, need coordinate remap)
 C_IC1_X_POS_RAW = "ic1_x_pos_raw"
@@ -58,22 +80,37 @@ _CONCEPT_ALIASES_STATIC: dict[str, tuple[str, ...]] = {
     C_TIMESTAMP: ("timestamp", "time_ms", "time_stamp", "timestamp_ms"),
     C_TIME_S: ("time_s", "time_seconds", "time_sec"),
     C_TIME_NS: ("time_ns", "time_nanoseconds", "time_nano"),
+    # G3 columns (ic1_primary_channel) are nA; G2 columns (r_ic1_current_dose)
+    # are coulombs per 1 ms timeslice — see _COLUMN_SCALE_FACTORS for conversion.
     C_IC1_CURRENT: ("ic1_primary_channel", "ic1", "ic1_current", "ic1_primary", "r_ic1_current_dose", "r_ic1_current_dose_filt"),
     C_IC2_CURRENT: ("ic2_primary_channel", "ic2", "ic2_current", "ic2_primary", "r_ic2_current_dose", "r_ic2_current_dose_filt"),
     C_IC3_CURRENT_A: ("ic3_current_A", "ic3_current_a", "ic3_a_current", "ic3_current_1"),
     C_IC3_CURRENT_B: ("ic3_current_B", "ic3_current_b", "ic3_b_current", "ic3_current_2"),
     C_IC3_CURRENT_C: ("ic3_current_C", "ic3_current_c", "ic3_c_current", "ic3_current_3"),
     C_IC3_CURRENT_D: ("ic3_current_D", "ic3_current_d", "ic3_d_current", "ic3_current_4"),
-    C_IC1_TOTAL_DOSE: ("ic1_total_dose_spot_raw", "ic1_total_dose", "ic1_dose_spot_raw"),
-    C_IC2_TOTAL_DOSE: ("ic2_total_dose_spot_raw", "ic2_total_dose", "ic2_dose_spot_raw"),
+    C_IC1_TOTAL_DOSE: ("ic1_total_dose_spot", "ic1_total_dose_spot_raw", "ic1_total_dose", "ic1_dose_spot_raw"),
+    C_IC2_TOTAL_DOSE: ("ic2_total_dose_spot", "ic2_total_dose_spot_raw", "ic2_total_dose", "ic2_dose_spot_raw"),
     C_IC3_TOTAL_DOSE: (
+        "r_ic3_total_dose_spot",
         "r_ic3_total_dose_spot_raw",
         "ic3_total_dose_spot_raw",
         "ic3_total_dose",
         "r_ic3_total_dose",
     ),
+    C_CHARGE_REQ: ("CHARGE_REQ", "charge_req", "dose_req", "prescribed_dose"),
     C_X_POSITION: ("X_POSITION", "x_position", "xposition", "x_pos", "planned_x"),
     C_Y_POSITION: ("Y_POSITION", "y_position", "yposition", "y_pos", "planned_y"),
+}
+
+
+# G2 IC current columns store charge (coulombs) accumulated over a 1 ms
+# timeslice.  To convert to nA:  nA = C / 0.001 s × 1e9 = C × 1e12.
+# Keys are normalized column names (lowercase, non-alnum collapsed to "_").
+_COLUMN_SCALE_FACTORS: dict[str, float] = {
+    "r_ic1_current_dose":      1e12,  # G2 IC1 current — coulombs → nA
+    "r_ic1_current_dose_filt": 1e12,  # G2 IC1 filtered current — coulombs → nA
+    "r_ic2_current_dose":      1e12,  # G2 IC2 current — coulombs → nA
+    "r_ic2_current_dose_filt": 1e12,  # G2 IC2 filtered current — coulombs → nA
 }
 
 
@@ -205,4 +242,10 @@ def canonicalize_dataframe_columns(
 
     if rename_map:
         out = out.rename(columns=rename_map)
+
+        for original, canonical in rename_map.items():
+            factor = _COLUMN_SCALE_FACTORS.get(normalize_column_name(original))
+            if factor is not None and factor != 1.0:
+                out[canonical] = pd.to_numeric(out[canonical], errors="coerce") * factor
+
     return out
