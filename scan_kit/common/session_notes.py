@@ -23,8 +23,7 @@ def load_notes(base_dir: str | Path) -> dict[str, str]:
 def save_note(base_dir: str | Path, session_id: str, text: str) -> None:
     """Write a single session note, merging into the existing file."""
     notes = load_notes(base_dir)
-    text = text.strip()
-    if text:
+    if text.strip():
         notes[session_id] = text
     else:
         notes.pop(session_id, None)

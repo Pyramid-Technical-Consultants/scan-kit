@@ -1,6 +1,7 @@
 """Common utilities for scan-kit analysis scripts."""
 
 from .session_meta import SessionMeta, parse_termination_summary_text
+from .session_notes import load_notes, save_note
 from .session_source import (
     SessionSource,
     resolve_session_source,
@@ -37,6 +38,8 @@ from .plotting import (
 __all__ = [
     "SessionMeta",
     "parse_termination_summary_text",
+    "load_notes",
+    "save_note",
     "SessionSource",
     "resolve_session_source",
     "load_session_csv",

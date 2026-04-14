@@ -1,12 +1,15 @@
-"""Beam-on vs beam-off current analysis (IC1, IC2, IC3) from timeslice data."""
+"""Beam-on vs beam-off current box plots (IC1, IC2, IC3) from timeslice data."""
 
 import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
 
 from ..common import (
-    FIG_SIZE_1x2,
+    plot_boxplots_for_column,
+    make_session_legend,
+    style_energy_axes,
+    DEFAULT_SESSION_COLORS,
     SUPTITLE_KW,
-    GRID_KW,
 )
 from ..common.session_source import (
     load_session_csv,
@@ -14,11 +17,8 @@ from ..common.session_source import (
     resolve_session_source,
 )
 
-# ---- Tweakable parameters -------------------------------------------------
-ON_FRAC = 0.10   # fraction of dynamic range above background → beam-on
-OFF_FRAC = 0.02  # fraction of dynamic range above background → beam-off ceiling
-# Samples between OFF_FRAC and ON_FRAC are transition (ramp-up/down) and excluded.
-# ---------------------------------------------------------------------------
+ON_FRAC = 0.10
+OFF_FRAC = 0.02
 
 _TIMESLICE_COLS = [
     "layer_id",
@@ -31,47 +31,29 @@ _TIMESLICE_COLS = [
 ]
 
 
-def _classify_signal(signal: np.ndarray):
-    """Return (beam_on_mean, beam_off_mean) for a single IC signal.
+def _classify_timeslices(signal: np.ndarray):
+    """Return boolean masks (beam_on, beam_off) for timeslice classification.
 
-    Two thresholds derived from the signal's dynamic range split the data
-    into three bands:
-
-    * **beam-on**  — above ``bg + ON_FRAC * (peak − bg)``
-    * **beam-off** — below ``bg + OFF_FRAC * (peak − bg)``
-    * **transition** (ramp-up / ramp-down) — between the two, excluded
-      from both averages so it does not dilute either measurement.
+    Two thresholds derived from the signal's dynamic range:
+      beam-on  — above  bg + ON_FRAC  * (peak - bg)
+      beam-off — below  bg + OFF_FRAC * (peak - bg)
+    Samples between are transition (excluded from both).
     """
-    clean = signal[~np.isnan(signal)]
-    if len(clean) == 0:
-        return None, None
-
-    bg = np.percentile(clean, 25)
-    pk = np.percentile(clean, 99)
+    bg = np.nanpercentile(signal, 25)
+    pk = np.nanpercentile(signal, 99)
     dyn = pk - bg
     if dyn < 1.0:
         return None, None
-
-    on_thresh = bg + ON_FRAC * dyn
-    off_thresh = bg + OFF_FRAC * dyn
-
-    on_mask = clean > on_thresh
-    off_mask = clean < off_thresh
-
-    on_mean = float(np.mean(clean[on_mask])) if on_mask.any() else None
-    off_mean = float(np.mean(clean[off_mask])) if off_mask.any() else None
-    return on_mean, off_mean
+    on_mask = signal > (bg + ON_FRAC * dyn)
+    off_mask = signal < (bg + OFF_FRAC * dyn)
+    return on_mask, off_mask
 
 
-def _extract_on_off(session_id: str, base_dir: str):
-    """Extract per-layer beam-on and beam-off mean current for each IC.
+def _extract_on_off_distributions(session_id: str, base_dir: str):
+    """Extract per-timeslice beam-on and beam-off current for each IC.
 
-    Returns
-    -------
-    dict mapping energy (float) -> dict with keys
-        ``ic1_on``, ``ic1_off``, ``ic2_on``, ``ic2_off``,
-        ``ic3_on``, ``ic3_off`` — each a float or None.
-    Returns None on failure.
+    Returns dict with keys ic1_on, ic1_off, ic2_on, ic2_off, ic3_on, ic3_off,
+    and energy — each a 1-D array aligned element-wise.  Returns None on failure.
     """
     src = resolve_session_source(session_id, base_dir)
     if src is None:
@@ -87,7 +69,8 @@ def _extract_on_off(session_id: str, base_dir: str):
     if not frames:
         return None
 
-    result: dict[float, dict] = {}
+    ic_keys = ["ic1", "ic2", "ic3"]
+    accum = {f"{ic}_{state}": [] for ic in ic_keys for state in ("on", "off", "energy_on", "energy_off")}
 
     for df in frames:
         layer_id = df["layer_id"].iloc[0]
@@ -95,37 +78,51 @@ def _extract_on_off(session_id: str, base_dir: str):
         if energy is None:
             continue
 
-        ic1 = df["ic1_primary_channel"].values
-        ic2 = df["ic2_primary_channel"].values
-        ic3 = (
-            df["ic3_current_A"].values
-            + df["ic3_current_B"].values
-            + df["ic3_current_C"].values
-            + df["ic3_current_D"].values
-        )
-
-        ic1_on, ic1_off = _classify_signal(ic1)
-        ic2_on, ic2_off = _classify_signal(ic2)
-        ic3_on, ic3_off = _classify_signal(ic3)
-
-        result[energy] = {
-            "ic1_on": ic1_on, "ic1_off": ic1_off,
-            "ic2_on": ic2_on, "ic2_off": ic2_off,
-            "ic3_on": ic3_on, "ic3_off": ic3_off,
+        signals = {
+            "ic1": df["ic1_primary_channel"].values,
+            "ic2": df["ic2_primary_channel"].values,
+            "ic3": (
+                df["ic3_current_A"].values
+                + df["ic3_current_B"].values
+                + df["ic3_current_C"].values
+                + df["ic3_current_D"].values
+            ),
         }
 
-    return result if result else None
+        e_arr = np.full(len(df), energy)
+
+        for ic in ic_keys:
+            on_mask, off_mask = _classify_timeslices(signals[ic])
+            if on_mask is None:
+                continue
+            accum[f"{ic}_on"].append(signals[ic][on_mask])
+            accum[f"{ic}_energy_on"].append(e_arr[on_mask])
+            accum[f"{ic}_off"].append(signals[ic][off_mask])
+            accum[f"{ic}_energy_off"].append(e_arr[off_mask])
+
+    if not any(accum[f"{ic}_energy_on"] for ic in ic_keys):
+        return None
+
+    result = {}
+    for ic in ic_keys:
+        for state in ("on", "off"):
+            ekey = f"{ic}_energy_{state}"
+            vkey = f"{ic}_{state}"
+            result[vkey] = np.concatenate(accum[vkey]) if accum[vkey] else np.array([])
+            result[ekey] = np.concatenate(accum[ekey]) if accum[ekey] else np.array([])
+
+    return result
 
 
 def run(session_ids: list[str], base_dir: str = "test_data") -> None:
-    """Run beam-on / beam-off current analysis and show matplotlib window."""
+    """Run beam-on / beam-off current box-plot analysis."""
     if not session_ids:
         print("No sessions selected")
         return
 
     session_data: dict[str, dict] = {}
     for sid in session_ids:
-        data = _extract_on_off(sid, base_dir)
+        data = _extract_on_off_distributions(sid, base_dir)
         if data is not None:
             session_data[sid] = data
 
@@ -133,66 +130,57 @@ def run(session_ids: list[str], base_dir: str = "test_data") -> None:
         print("No valid beam-on/off data found for any session")
         return
 
+    all_energies: set[float] = set()
+    for data in session_data.values():
+        for ic in ("ic1", "ic2", "ic3"):
+            all_energies.update(data[f"{ic}_energy_on"])
+            all_energies.update(data[f"{ic}_energy_off"])
+    energies = sorted(all_energies)
+
     loaded_ids = list(session_data.keys())
+    colors = DEFAULT_SESSION_COLORS[: len(loaded_ids)]
 
-    IC_COLORS = {"ic1": "tab:blue", "ic2": "tab:orange", "ic3": "tab:green"}
-    IC_LABELS = {"ic1": "IC1", "ic2": "IC2", "ic3": "IC3 (sum A+B+C+D)"}
-    SESSION_MARKERS = ["o", "s", "^", "D", "v", "P", "X", "*"]
+    fig = plt.figure(figsize=(18, 10))
+    fig.suptitle("Beam-On / Beam-Off Current by Energy", **SUPTITLE_KW)
+    axes = np.empty((2, 3), dtype=object)
+    axes[0, 0] = fig.add_subplot(2, 3, 1)
+    axes[0, 1] = fig.add_subplot(2, 3, 2, sharex=axes[0, 0], sharey=axes[0, 0])
+    axes[0, 2] = fig.add_subplot(2, 3, 3, sharex=axes[0, 0], sharey=axes[0, 0])
+    axes[1, 0] = fig.add_subplot(2, 3, 4, sharex=axes[0, 0])
+    axes[1, 1] = fig.add_subplot(2, 3, 5, sharex=axes[0, 0], sharey=axes[1, 0])
+    axes[1, 2] = fig.add_subplot(2, 3, 6, sharex=axes[0, 0], sharey=axes[1, 0])
 
-    fig, (ax_on, ax_off) = plt.subplots(
-        1, 2, figsize=FIG_SIZE_1x2, sharex=True,
-    )
-    fig.suptitle("Beam-On vs Beam-Off Current by Energy", **SUPTITLE_KW)
+    ic_keys = ["ic1", "ic2", "ic3"]
+    ic_titles = ["IC1", "IC2", "IC3 (sum A+B+C+D)"]
 
-    for ax, state, title in [
-        (ax_on, "on", "Beam-On Current"),
-        (ax_off, "off", "Beam-Off Current"),
-    ]:
-        for si, sid in enumerate(loaded_ids):
-            data = session_data[sid]
-            energies = sorted(data.keys())
-            marker = SESSION_MARKERS[si % len(SESSION_MARKERS)]
+    for col, (ic, title) in enumerate(zip(ic_keys, ic_titles)):
+        ax_on = axes[0, col]
+        ax_off = axes[1, col]
 
-            for prefix in ["ic1", "ic2", "ic3"]:
-                es, vs = [], []
-                for e in energies:
-                    v = data[e][f"{prefix}_{state}"]
-                    if v is not None:
-                        es.append(e)
-                        vs.append(v)
-                label = (
-                    f"{IC_LABELS[prefix]}"
-                    if si == 0 else None
-                )
-                ax.plot(
-                    es, vs,
-                    marker=marker, markersize=4, linewidth=1, alpha=0.8,
-                    color=IC_COLORS[prefix], label=label,
-                )
+        on_data = {
+            sid: {ic: d[f"{ic}_on"], "energy": pd.Series(d[f"{ic}_energy_on"])}
+            for sid, d in session_data.items()
+            if d[f"{ic}_on"].size > 0
+        }
+        off_data = {
+            sid: {ic: d[f"{ic}_off"], "energy": pd.Series(d[f"{ic}_energy_off"])}
+            for sid, d in session_data.items()
+            if d[f"{ic}_off"].size > 0
+        }
+        on_colors = [colors[loaded_ids.index(sid)] for sid in on_data]
+        off_colors = [colors[loaded_ids.index(sid)] for sid in off_data]
 
-        ax.set_title(title)
-        ax.set_xlabel("Energy (MeV)")
-        ax.set_ylabel("Current (nA)")
-        ax.grid(**GRID_KW)
+        if on_data:
+            plot_boxplots_for_column(ax_on, on_data, ic, energies, on_colors, width=0.3)
+        ax_on.set_title(f"{title} — Beam On")
+        style_energy_axes(ax_on, energies, ylabel="Current (nA)")
 
-    # Build legend: IC colors + session markers
-    legend_handles = [
-        plt.Line2D([0], [0], color=c, linewidth=2, label=IC_LABELS[k])
-        for k, c in IC_COLORS.items()
-    ]
-    if len(loaded_ids) > 1:
-        legend_handles.append(plt.Line2D(
-            [0], [0], color="none", label="",
-        ))
-        for si, sid in enumerate(loaded_ids):
-            legend_handles.append(plt.Line2D(
-                [0], [0], color="gray",
-                marker=SESSION_MARKERS[si % len(SESSION_MARKERS)],
-                markersize=6, linewidth=0,
-                label=f"Session {sid}",
-            ))
+        if off_data:
+            plot_boxplots_for_column(ax_off, off_data, ic, energies, off_colors, width=0.3)
+        ax_off.set_title(f"{title} — Beam Off")
+        style_energy_axes(ax_off, energies, ylabel="Current (nA)")
 
-    ax_on.legend(handles=legend_handles, loc="best", fontsize=9, frameon=True)
+    make_session_legend(axes[0, 0], loaded_ids, colors)
 
     plt.tight_layout()
     plt.show()

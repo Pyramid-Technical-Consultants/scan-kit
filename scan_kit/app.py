@@ -18,6 +18,7 @@ from textual.widgets import Button, Input, SelectionList, Static
 from textual.widgets.selection_list import Selection
 
 from .common import SessionMeta
+from .common.session_notes import load_notes, save_note
 from .common.session_source import resolve_session_source, load_session_termination_summary
 from .common.sessions import discover_sessions
 from .views import VIEWS
@@ -117,6 +118,12 @@ class ScanKitApp(App[None]):
     .view-button:focus { background: #001a1f; color: #00d4ff; border: round #00d4ff }
     .view-button.loading { color: #ffaa00; border: round #ffaa00; background: #1a1200 }
     .view-button.loading:hover { color: #ffaa00; border: round #ffaa00 }
+
+    #note-input {
+        background: #0a0e14; color: #00d4ff; border: round #00d4aa;
+        padding: 0 1; height: 3;
+    }
+    #note-input:focus { border: round #00d4ff }
     """
 
     BINDINGS = [
@@ -137,6 +144,8 @@ class ScanKitApp(App[None]):
         self._running_views: dict[str, tuple[subprocess.Popen, str]] = {}
         self._spinner_frame: int = 0
         self._poll_timer = None
+        self._notes: dict[str, str] = {}
+        self._highlighted_sid: str | None = None
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="main"):
@@ -161,6 +170,10 @@ class ScanKitApp(App[None]):
                 with Horizontal(id="status-row"):
                     yield Static("", id="status")
                     yield Button("✕", id="clear-btn")
+                yield Input(
+                    placeholder="Highlight a session to edit its note…",
+                    id="note-input",
+                )
             with VerticalScroll(id="right-panel"):
                 yield Static("RUN ANALYSIS", id="views-label")
                 with Vertical(id="buttons-section"):
@@ -195,6 +208,7 @@ class ScanKitApp(App[None]):
 
     def _refresh_sessions(self) -> None:
         """Refresh session list from disk (fast), then load metadata in background."""
+        self._notes = load_notes(self._base_dir)
         self._hydrate_generation += 1
         gen = self._hydrate_generation
         self._discovered = discover_sessions(
@@ -287,6 +301,8 @@ class ScanKitApp(App[None]):
         """Sort and display sessions using the current sort mode."""
         session_list = self.query_one("#session-list", SelectionList)
         prev_selected = list(session_list.selected)
+        prev_scroll_y = session_list.scroll_y
+        prev_highlighted = session_list.highlighted
 
         reverse = self._sort_mode == "date"
         ordered = sorted(self._discovered, key=lambda t: _sort_key(t, self._sort_mode), reverse=reverse)
@@ -313,6 +329,10 @@ class ScanKitApp(App[None]):
                 )
             else:
                 label = sid
+            note = self._notes.get(sid, "")
+            if note:
+                preview = note if len(note) <= 30 else note[:28] + "…"
+                label += f"  | {preview}"
             session_list.add_option(Selection(label, sid))
         for sid in prev_selected:
             if sid in self._sessions:
@@ -320,6 +340,12 @@ class ScanKitApp(App[None]):
                     session_list.select(sid)
                 except Exception:
                     pass
+        if prev_highlighted is not None:
+            try:
+                session_list.highlighted = prev_highlighted
+            except Exception:
+                pass
+        session_list.scroll_target_y = prev_scroll_y
         self._update_status()
 
     def _update_status(self) -> None:
@@ -355,6 +381,38 @@ class ScanKitApp(App[None]):
         """Handle selection change; enforce max 3 sessions."""
         self._enforce_max_sessions()
         self._update_status()
+
+    def on_selection_list_selection_highlighted(
+        self, event: SelectionList.SelectionHighlighted
+    ) -> None:
+        """Populate the note input when the user highlights a session."""
+        sid = str(event.selection.value)
+        self._highlighted_sid = sid
+        note_input = self.query_one("#note-input", Input)
+        note_input.value = self._notes.get(sid, "")
+        note_input.placeholder = f"Note for {sid}…"
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        """Auto-save note as the user types."""
+        if event.input.id != "note-input":
+            return
+        sid = self._highlighted_sid
+        if sid is None:
+            return
+        current = self._notes.get(sid, "")
+        if event.value == current:
+            return
+        text = event.value
+        if text.strip():
+            self._notes[sid] = text
+        else:
+            self._notes.pop(sid, None)
+        save_note(self._base_dir, sid, event.value)
+        self._refresh_session_label(sid)
+
+    def _refresh_session_label(self, sid: str) -> None:
+        """Update one session's label in-place to reflect a note change."""
+        self._repopulate_list()
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         """Handle button presses (sort buttons + analysis views)."""
