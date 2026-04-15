@@ -53,7 +53,7 @@ hiddenimports = [
 ]
 
 a = Analysis(
-    [str(ROOT / "scan_kit" / "app.py")],
+    [str(ROOT / "scan_kit" / "__main__.py")],
     pathex=[str(ROOT)],
     binaries=[],
     datas=[],
