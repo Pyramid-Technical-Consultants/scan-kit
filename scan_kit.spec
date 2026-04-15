@@ -6,6 +6,7 @@ Usage:
     pyinstaller scan_kit.spec --onefile # single exe (for distribution)
 """
 
+import ctypes.util
 import importlib
 import pkgutil
 import sys
@@ -13,6 +14,24 @@ from pathlib import Path
 
 block_cipher = None
 ROOT = Path(SPECPATH)
+
+# ---------------------------------------------------------------------------
+# On Linux, sounddevice depends on the system libportaudio which PyInstaller
+# won't bundle automatically.  Find it and add it as an extra binary.
+# ---------------------------------------------------------------------------
+_extra_binaries = []
+if sys.platform.startswith("linux"):
+    _pa = ctypes.util.find_library("portaudio")
+    if _pa:
+        import subprocess
+        _ldconfig = subprocess.run(
+            ["ldconfig", "-p"], capture_output=True, text=True,
+        )
+        for line in _ldconfig.stdout.splitlines():
+            if "libportaudio" in line and "=>" in line:
+                _so_path = line.split("=>")[-1].strip()
+                _extra_binaries.append((_so_path, "."))
+                break
 
 # ---------------------------------------------------------------------------
 # Collect all rich._unicode_data submodules (loaded dynamically by rich at
@@ -69,7 +88,7 @@ hiddenimports = [
 a = Analysis(
     [str(ROOT / "scan_kit" / "__main__.py")],
     pathex=[str(ROOT)],
-    binaries=[],
+    binaries=_extra_binaries,
     datas=[],
     hiddenimports=hiddenimports,
     hookspath=[],
