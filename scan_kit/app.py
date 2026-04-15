@@ -484,13 +484,17 @@ class ScanKitApp(App[None]):
             )
             cmd = [sys.executable, "-c", code]
 
+        popen_kwargs: dict = dict(
+            cwd=PROJECT_ROOT,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        if sys.platform == "win32":
+            popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+
         try:
-            proc = subprocess.Popen(
-                cmd,
-                cwd=PROJECT_ROOT,
-                env=env,
-                stdout=subprocess.PIPE,
-            )
+            proc = subprocess.Popen(cmd, **popen_kwargs)
             self._child_procs.append(proc)
             self._reap_children()
         except Exception as e:
@@ -568,7 +572,17 @@ class ScanKitApp(App[None]):
             except Exception:
                 pass
             if proc.returncode != 0:
-                self.notify(f"{module_name} exited with error", severity="error")
+                detail = ""
+                if proc.stderr:
+                    try:
+                        raw = proc.stderr.read()
+                        lines = raw.decode(errors="replace").strip().splitlines()
+                        detail = f": {lines[-1]}" if lines else ""
+                    except Exception:
+                        pass
+                self.notify(
+                    f"{module_name} failed{detail}", severity="error",
+                )
 
         if self._running_views:
             self._update_spinner()
