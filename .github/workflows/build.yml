@@ -80,8 +80,8 @@ jobs:
       - name: Prepare release assets
         run: |
           mv artifacts/scan-kit-windows/scan-kit.exe artifacts/scan-kit-windows.exe
-          mv artifacts/scan-kit-linux/scan-kit       artifacts/scan-kit-linux
-          chmod +x artifacts/scan-kit-linux
+          mv artifacts/scan-kit-linux/scan-kit       artifacts/scan-kit-linux-amd64
+          chmod +x artifacts/scan-kit-linux-amd64
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
@@ -89,4 +89,4 @@ jobs:
           generate_release_notes: true
           files: |
             artifacts/scan-kit-windows.exe
-            artifacts/scan-kit-linux
+            artifacts/scan-kit-linux-amd64
