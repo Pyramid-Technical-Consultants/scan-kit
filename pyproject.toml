@@ -11,8 +11,13 @@ dependencies = [
     "pandas",
     "matplotlib",
     "numpy",
+    "scipy",
+    "sounddevice",
     "textual>=0.27.0",
 ]
+
+[project.optional-dependencies]
+build = ["pyinstaller>=6.0"]
 
 [project.scripts]
 scan-kit = "scan_kit.app:main"

@@ -1,4 +1,7 @@
 pandas
 matplotlib
 numpy
+scipy
+sounddevice
 textual>=0.27.0
+pyinstaller>=6.0

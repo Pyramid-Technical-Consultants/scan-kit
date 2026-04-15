@@ -17,6 +17,7 @@ from . import (
     ic_timeslice_replay,
     dose_accumulation,
     ic_fft_analysis,
+    ic_audio_export,
 )
 
 VIEWS: list[tuple[str, str, Callable[[list[str], str], None]]] = [
@@ -34,4 +35,5 @@ VIEWS: list[tuple[str, str, Callable[[list[str], str], None]]] = [
     ("IC Timeslice Replay", "ic_timeslice_replay", ic_timeslice_replay.run),
     ("Dose Accumulation", "dose_accumulation", dose_accumulation.run),
     ("IC Current FFT Analysis", "ic_fft_analysis", ic_fft_analysis.run),
+    ("IC Audio Export (WAV)", "ic_audio_export", ic_audio_export.run),
 ]

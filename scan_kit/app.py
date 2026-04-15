@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import atexit
+import multiprocessing
 import os
 import signal
 import subprocess
@@ -24,7 +25,12 @@ from .common.sessions import discover_sessions
 from .views import VIEWS
 
 MAX_SESSIONS = 3
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+FROZEN = getattr(sys, "frozen", False)
+
+if FROZEN:
+    PROJECT_ROOT = Path(sys.executable).resolve().parent
+else:
+    PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 _SORT_MODES = ["date", "id", "mu"]
 _SORT_LABELS = {
@@ -134,7 +140,10 @@ class ScanKitApp(App[None]):
 
     def __init__(self) -> None:
         super().__init__()
-        self._base_dir = str(PROJECT_ROOT / "test_data")
+        if FROZEN:
+            self._base_dir = str(Path.cwd())
+        else:
+            self._base_dir = str(PROJECT_ROOT / "test_data")
         self._sessions: list[str] = []
         self._discovered: list[tuple[str, str, SessionMeta | None]] = []
         self._sort_mode: str = "date"
@@ -153,7 +162,7 @@ class ScanKitApp(App[None]):
                 yield Static("DATA SOURCE", id="base-dir-section")
                 yield Input(
                     placeholder="Path to session ZIPs...",
-                    value=str(PROJECT_ROOT / "test_data"),
+                    value=self._base_dir,
                     id="base-dir-input",
                 )
                 with Horizontal(id="sort-row"):
@@ -444,31 +453,40 @@ class ScanKitApp(App[None]):
         session_ids = list(selected)[:MAX_SESSIONS]
         base_dir = self._base_dir
 
-        code = (
-            "import matplotlib.pyplot as plt\n"
-            "_real_show = plt.show\n"
-            "def _show(*a, **kw):\n"
-            "    for mgr in plt.get_fignums():\n"
-            "        try: plt.figure(mgr).canvas.manager.window.state('zoomed')\n"
-            "        except Exception:\n"
-            "            try: plt.figure(mgr).canvas.manager.window.showMaximized()\n"
-            "            except Exception: pass\n"
-            f"    print('{_READY_SENTINEL}', flush=True); _real_show(*a, **kw)\n"
-            "plt.show = _show\n"
-            f"from scan_kit.views.{module_name} import run\n"
-            f"run({session_ids!r}, {base_dir!r})"
-        )
-        env = os.environ.copy()
-        env["PYTHONPATH"] = str(PROJECT_ROOT) + (
-            os.pathsep + env.get("PYTHONPATH", "") if env.get("PYTHONPATH") else ""
-        )
-
         btn = event.button
         original_label = str(btn.label)
+        env = os.environ.copy()
+
+        if FROZEN:
+            cmd = [
+                sys.executable,
+                "--run-view", module_name,
+                "--sessions", ",".join(session_ids),
+                "--base-dir", base_dir,
+            ]
+        else:
+            code = (
+                "import matplotlib.pyplot as plt\n"
+                "_real_show = plt.show\n"
+                "def _show(*a, **kw):\n"
+                "    for mgr in plt.get_fignums():\n"
+                "        try: plt.figure(mgr).canvas.manager.window.state('zoomed')\n"
+                "        except Exception:\n"
+                "            try: plt.figure(mgr).canvas.manager.window.showMaximized()\n"
+                "            except Exception: pass\n"
+                f"    print('{_READY_SENTINEL}', flush=True); _real_show(*a, **kw)\n"
+                "plt.show = _show\n"
+                f"from scan_kit.views.{module_name} import run\n"
+                f"run({session_ids!r}, {base_dir!r})"
+            )
+            env["PYTHONPATH"] = str(PROJECT_ROOT) + (
+                os.pathsep + env.get("PYTHONPATH", "") if env.get("PYTHONPATH") else ""
+            )
+            cmd = [sys.executable, "-c", code]
 
         try:
             proc = subprocess.Popen(
-                [sys.executable, "-c", code],
+                cmd,
                 cwd=PROJECT_ROOT,
                 env=env,
                 stdout=subprocess.PIPE,
@@ -580,8 +598,45 @@ class ScanKitApp(App[None]):
         self.exit()
 
 
+def _run_view_subprocess(module_name: str, session_ids: list[str], base_dir: str) -> None:
+    """Execute a single analysis view (used by frozen exe in --run-view mode)."""
+    import importlib
+    import matplotlib.pyplot as plt
+
+    _real_show = plt.show
+
+    def _patched_show(*a, **kw):
+        for mgr in plt.get_fignums():
+            try:
+                plt.figure(mgr).canvas.manager.window.state("zoomed")
+            except Exception:
+                try:
+                    plt.figure(mgr).canvas.manager.window.showMaximized()
+                except Exception:
+                    pass
+        print(_READY_SENTINEL, flush=True)
+        _real_show(*a, **kw)
+
+    plt.show = _patched_show
+
+    mod = importlib.import_module(f"scan_kit.views.{module_name}")
+    mod.run(session_ids, base_dir)
+
+
 def main() -> None:
     """Entry point for the scan-kit TUI."""
+    multiprocessing.freeze_support()
+
+    if "--run-view" in sys.argv:
+        idx = sys.argv.index("--run-view")
+        module_name = sys.argv[idx + 1]
+        sessions_idx = sys.argv.index("--sessions")
+        session_ids = sys.argv[sessions_idx + 1].split(",")
+        base_idx = sys.argv.index("--base-dir")
+        base_dir = sys.argv[base_idx + 1]
+        _run_view_subprocess(module_name, session_ids, base_dir)
+        return
+
     app = ScanKitApp()
 
     def _force_exit(*_args) -> None:

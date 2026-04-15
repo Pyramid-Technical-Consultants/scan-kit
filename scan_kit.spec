@@ -1,0 +1,97 @@
+# -*- mode: python ; coding: utf-8 -*-
+"""PyInstaller spec for building scan-kit as a single executable.
+
+Usage:
+    pyinstaller scan_kit.spec          # one-dir (faster builds, for testing)
+    pyinstaller scan_kit.spec --onefile # single exe (for distribution)
+"""
+
+import sys
+from pathlib import Path
+
+block_cipher = None
+ROOT = Path(SPECPATH)
+
+# ---------------------------------------------------------------------------
+# Collect all scan_kit submodules so PyInstaller bundles them even though
+# some are only imported dynamically (e.g. via --run-view).
+# ---------------------------------------------------------------------------
+hiddenimports = [
+    # view modules (dynamically imported via importlib in --run-view mode)
+    "scan_kit.views.ic1_position_bars",
+    "scan_kit.views.ic1_ic2_error_scatter",
+    "scan_kit.views.ic1_ic2_spot_scatter",
+    "scan_kit.views.dose_ratios",
+    "scan_kit.views.dose_ratios_position",
+    "scan_kit.views.dose_ratios_time",
+    "scan_kit.views.dose_error_vs_target",
+    "scan_kit.views.spot_delivery_time",
+    "scan_kit.views.sigma_boxplots",
+    "scan_kit.views.beam_off_rampdown",
+    "scan_kit.views.beam_on_off_current",
+    "scan_kit.views.ic_timeslice_replay",
+    "scan_kit.views.dose_accumulation",
+    "scan_kit.views.ic_fft_analysis",
+    "scan_kit.views.ic_audio_export",
+    # common submodules
+    "scan_kit.common.session_meta",
+    "scan_kit.common.session_notes",
+    "scan_kit.common.session_source",
+    "scan_kit.common.sessions",
+    "scan_kit.common.schema",
+    "scan_kit.common.transform",
+    "scan_kit.common.validation",
+    "scan_kit.common.processing",
+    "scan_kit.common.plotting",
+    # third-party modules that PyInstaller sometimes misses
+    "scipy.signal",
+    "scipy.fft",
+    "scipy.fft._pocketfft",
+    "sounddevice",
+    "matplotlib.backends.backend_tkagg",
+    "tkinter",
+]
+
+a = Analysis(
+    [str(ROOT / "scan_kit" / "app.py")],
+    pathex=[str(ROOT)],
+    binaries=[],
+    datas=[],
+    hiddenimports=hiddenimports,
+    hookspath=[],
+    hooksconfig={},
+    runtime_hooks=[],
+    excludes=[
+        "test_data",
+        "pytest",
+        "IPython",
+        "notebook",
+        "sphinx",
+    ],
+    cipher=block_cipher,
+    noarchive=False,
+)
+
+pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
+
+# --onefile build (default: produces a single executable)
+exe = EXE(
+    pyz,
+    a.scripts,
+    a.binaries,
+    a.datas,
+    [],
+    name="scan-kit",
+    debug=False,
+    bootloader_ignore_signals=False,
+    strip=False,
+    upx=True,
+    upx_exclude=[],
+    runtime_tmpdir=None,
+    console=True,
+    disable_windowed_traceback=False,
+    argv_emulation=False,
+    target_arch=None,
+    codesign_identity=None,
+    entitlements_file=None,
+)
