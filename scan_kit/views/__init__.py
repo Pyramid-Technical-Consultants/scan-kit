@@ -17,8 +17,13 @@ from . import (
     ic_timeslice_replay,
     dose_accumulation,
     ic_fft_analysis,
-    ic_audio_export,
 )
+
+try:
+    from . import ic_audio_export
+    _HAS_AUDIO = True
+except (ImportError, OSError):
+    _HAS_AUDIO = False
 
 VIEWS: list[tuple[str, str, Callable[[list[str], str], None]]] = [
     ("IC1 X/Y Position Error", "ic1_position_bars", ic1_position_bars.run),
@@ -35,5 +40,9 @@ VIEWS: list[tuple[str, str, Callable[[list[str], str], None]]] = [
     ("IC Timeslice Replay", "ic_timeslice_replay", ic_timeslice_replay.run),
     ("Dose Accumulation", "dose_accumulation", dose_accumulation.run),
     ("IC Current FFT Analysis", "ic_fft_analysis", ic_fft_analysis.run),
-    ("IC Audio Export (WAV)", "ic_audio_export", ic_audio_export.run),
 ]
+
+if _HAS_AUDIO:
+    VIEWS.append(
+        ("IC Audio Export (WAV)", "ic_audio_export", ic_audio_export.run),
+    )
