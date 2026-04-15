@@ -74,6 +74,34 @@ def try_load_position_data(session_id: str, base_dir: str, loader, *, raw: bool 
     return data
 
 
+def apply_auto_calibration(
+    data: dict,
+    target_col: str,
+    dose_cols: list[str],
+) -> dict:
+    """Scale each dose column so the dose-weighted mean error is zero.
+
+    For each IC dose column, computes ``k = sum(target) / sum(delivered)``
+    over finite spots where both values are positive, then multiplies the
+    dose column by ``k``.  Returns a new dict (shallow copy) with the
+    scaled columns.
+    """
+    result = dict(data)
+    if target_col not in result:
+        return result
+    target = np.asarray(result[target_col], dtype=float)
+    for col in dose_cols:
+        if col not in result:
+            continue
+        delivered = np.asarray(result[col], dtype=float)
+        ok = np.isfinite(target) & np.isfinite(delivered) & (target > 0) & (delivered > 0)
+        if not ok.any():
+            continue
+        k = target[ok].sum() / delivered[ok].sum()
+        result[col] = delivered * k
+    return result
+
+
 def add_dose_ratio_columns(data: dict, *, include_ic3: bool) -> dict | None:
     """Compute ratio-difference (%) columns used by dose-ratio views."""
     required = {C_IC1_TOTAL_DOSE, C_IC2_TOTAL_DOSE}
@@ -199,7 +227,9 @@ def process_position_data(
     resolved_extra_spot: dict[str, str] = {}
     if extra_spot_columns:
         for req in extra_spot_columns:
-            resolved = resolve_requested_column(spot_data.columns, req)
+            resolved = resolve_concept_column(spot_data.columns, req)
+            if resolved is None:
+                resolved = resolve_requested_column(spot_data.columns, req)
             if resolved is None:
                 continue
             resolved_extra_spot[req] = resolved

@@ -132,24 +132,35 @@ def _extract_rampdown_curves(session_id: str, base_dir: str):
 
     result: dict[float, dict[str, np.ndarray | None]] = {}
 
+    ic3_cols = [C_IC3_CURRENT_A, C_IC3_CURRENT_B, C_IC3_CURRENT_C, C_IC3_CURRENT_D]
+
     for df in frames:
+        if C_LAYER_ID not in df.columns:
+            continue
         layer_id = df[C_LAYER_ID].iloc[0]
         energy = energy_by_layer.get(layer_id)
         if energy is None:
             continue
 
-        ic1 = df[C_IC1_CURRENT].values
-        ic2 = df[C_IC2_CURRENT].values
-        ic3 = (
-            df[C_IC3_CURRENT_A].values
-            + df[C_IC3_CURRENT_B].values
-            + df[C_IC3_CURRENT_C].values
-            + df[C_IC3_CURRENT_D].values
-        )
+        if C_IC1_CURRENT not in df.columns and C_IC2_CURRENT not in df.columns:
+            continue
 
-        c1 = _rampdown_for_signal(ic1)
-        c2 = _rampdown_for_signal(ic2)
-        c3 = _rampdown_for_signal(ic3)
+        c1, c2, c3 = None, None, None
+
+        if C_IC1_CURRENT in df.columns:
+            c1 = _rampdown_for_signal(df[C_IC1_CURRENT].values)
+        if C_IC2_CURRENT in df.columns:
+            c2 = _rampdown_for_signal(df[C_IC2_CURRENT].values)
+
+        has_ic3 = all(col in df.columns for col in ic3_cols)
+        if has_ic3:
+            ic3 = (
+                df[C_IC3_CURRENT_A].values
+                + df[C_IC3_CURRENT_B].values
+                + df[C_IC3_CURRENT_C].values
+                + df[C_IC3_CURRENT_D].values
+            )
+            c3 = _rampdown_for_signal(ic3)
 
         if c1 is None and c2 is None and c3 is None:
             continue
@@ -163,7 +174,7 @@ def _extract_rampdown_curves(session_id: str, base_dir: str):
     return result if result else None
 
 
-def run(session_ids: list[str], base_dir: str = "test_data") -> None:
+def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -> None:
     """Run beam-off ramp-down analysis and show matplotlib window."""
     if not session_ids:
         _log.debug("No sessions selected")

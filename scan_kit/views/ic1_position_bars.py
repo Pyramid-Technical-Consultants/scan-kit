@@ -53,7 +53,7 @@ def _process_session(session_id: str, position_key: str, base_dir: str):
     return data
 
 
-def run(session_ids: list[str], base_dir: str = "test_data") -> None:
+def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -> None:
     """Run IC1 X/Y position error analysis and show matplotlib window.
 
     Error is **measured** non-raw IC1 position (already in plan mm coordinates)

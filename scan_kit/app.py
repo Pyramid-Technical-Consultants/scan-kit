@@ -15,11 +15,13 @@ from pathlib import Path
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
-from textual.widgets import Button, Input, SelectionList, Static
+from textual.widgets import Button, Input, SelectionList, Static, Switch
 from textual.widgets.selection_list import Selection
 
+from . import __version__
 from .common import SessionMeta
 from .common.session_notes import load_notes, save_note
+from .common.settings import ViewSettings
 from .common.session_source import resolve_session_source, load_session_termination_summary
 from .common.sessions import discover_sessions
 from .views import VIEWS
@@ -72,6 +74,10 @@ class ScanKitApp(App[None]):
     #base-dir-section, #views-label, #status {
         color: #00d4aa; padding: 0;
     }
+    #header-row { height: 1; width: 100% }
+    #version-label {
+        color: #555; padding: 0; text-align: right; width: 1fr;
+    }
     #status-row { height: 3; width: 100% }
     #status { border: round #00d4aa; background: #0a0e14; min-height: 1; width: 1fr }
 
@@ -108,6 +114,14 @@ class ScanKitApp(App[None]):
     }
     .sort-btn:hover { color: #00d4ff; border: round #00d4ff }
     .sort-btn.active { color: #00d4ff; background: #001a1f; border: round #00d4ff }
+
+    #settings-label {
+        color: #00d4aa; padding: 0;
+    }
+    #settings-section { height: auto; padding: 0 }
+    .setting-row { height: 3; width: 100%; padding: 0 1 }
+    .setting-name { width: 1fr; color: #ccc; padding: 0; content-align: left middle }
+    .setting-row Switch { width: auto }
 
     #buttons-section {
         height: 1fr; overflow-y: auto; padding: 0;
@@ -155,11 +169,14 @@ class ScanKitApp(App[None]):
         self._poll_timer = None
         self._notes: dict[str, str] = {}
         self._highlighted_sid: str | None = None
+        self._settings = ViewSettings()
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="main"):
             with Vertical(id="left-panel"):
-                yield Static("DATA SOURCE", id="base-dir-section")
+                with Horizontal(id="header-row"):
+                    yield Static("DATA SOURCE", id="base-dir-section")
+                    yield Static(f"v{__version__}", id="version-label")
                 yield Input(
                     placeholder="Path to session ZIPs...",
                     value=self._base_dir,
@@ -184,6 +201,11 @@ class ScanKitApp(App[None]):
                     id="note-input",
                 )
             with VerticalScroll(id="right-panel"):
+                yield Static("SETTINGS", id="settings-label")
+                with Vertical(id="settings-section"):
+                    with Horizontal(classes="setting-row"):
+                        yield Static("Auto Calibrate", classes="setting-name")
+                        yield Switch(value=False, id="auto-calibrate")
                 yield Static("RUN ANALYSIS", id="views-label")
                 with Vertical(id="buttons-section"):
                     for display_name, _module_name, _run in VIEWS:
@@ -194,7 +216,22 @@ class ScanKitApp(App[None]):
                         )
 
     def on_mount(self) -> None:
+        self._load_settings()
         self._refresh_sessions()
+
+    def _load_settings(self) -> None:
+        """Load settings from disk and sync the UI."""
+        self._settings = ViewSettings.load(self._base_dir)
+        try:
+            sw = self.query_one("#auto-calibrate", Switch)
+            sw.value = self._settings.auto_calibrate
+        except Exception:
+            pass
+
+    def on_switch_changed(self, event: Switch.Changed) -> None:
+        if event.switch.id == "auto-calibrate":
+            self._settings.auto_calibrate = event.value
+            self._settings.save(self._base_dir)
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         """Handle base directory path change."""
@@ -202,6 +239,7 @@ class ScanKitApp(App[None]):
             path = event.value.strip()
             if path:
                 self._base_dir = path
+                self._load_settings()
                 self._refresh_sessions()
 
     def _set_sort(self, mode: str) -> None:
@@ -457,12 +495,15 @@ class ScanKitApp(App[None]):
         original_label = str(btn.label)
         env = os.environ.copy()
 
+        settings_json = self._settings.to_json()
+
         if FROZEN:
             cmd = [
                 sys.executable,
                 "--run-view", module_name,
                 "--sessions", ",".join(session_ids),
                 "--base-dir", base_dir,
+                "--settings", settings_json,
             ]
         else:
             code = (
@@ -476,8 +517,10 @@ class ScanKitApp(App[None]):
                 "            except Exception: pass\n"
                 f"    print('{_READY_SENTINEL}', flush=True); _real_show(*a, **kw)\n"
                 "plt.show = _show\n"
+                "from scan_kit.common.settings import ViewSettings\n"
+                f"_settings = ViewSettings.from_json({settings_json!r})\n"
                 f"from scan_kit.views.{module_name} import run\n"
-                f"run({session_ids!r}, {base_dir!r})"
+                f"run({session_ids!r}, {base_dir!r}, settings=_settings)"
             )
             env["PYTHONPATH"] = str(PROJECT_ROOT) + (
                 os.pathsep + env.get("PYTHONPATH", "") if env.get("PYTHONPATH") else ""
@@ -612,7 +655,12 @@ class ScanKitApp(App[None]):
         self.exit()
 
 
-def _run_view_subprocess(module_name: str, session_ids: list[str], base_dir: str) -> None:
+def _run_view_subprocess(
+    module_name: str,
+    session_ids: list[str],
+    base_dir: str,
+    settings: ViewSettings | None = None,
+) -> None:
     """Execute a single analysis view (used by frozen exe in --run-view mode)."""
     import importlib
     import matplotlib.pyplot as plt
@@ -634,12 +682,16 @@ def _run_view_subprocess(module_name: str, session_ids: list[str], base_dir: str
     plt.show = _patched_show
 
     mod = importlib.import_module(f"scan_kit.views.{module_name}")
-    mod.run(session_ids, base_dir)
+    mod.run(session_ids, base_dir, settings=settings)
 
 
 def main() -> None:
     """Entry point for the scan-kit TUI."""
     multiprocessing.freeze_support()
+
+    if "--version" in sys.argv or "-V" in sys.argv:
+        print(f"scan-kit {__version__}")
+        return
 
     if "--run-view" in sys.argv:
         idx = sys.argv.index("--run-view")
@@ -648,7 +700,11 @@ def main() -> None:
         session_ids = sys.argv[sessions_idx + 1].split(",")
         base_idx = sys.argv.index("--base-dir")
         base_dir = sys.argv[base_idx + 1]
-        _run_view_subprocess(module_name, session_ids, base_dir)
+        settings = None
+        if "--settings" in sys.argv:
+            settings_idx = sys.argv.index("--settings")
+            settings = ViewSettings.from_json(sys.argv[settings_idx + 1])
+        _run_view_subprocess(module_name, session_ids, base_dir, settings=settings)
         return
 
     app = ScanKitApp()

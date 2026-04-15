@@ -215,7 +215,7 @@ def _style_fft_ax(ax: plt.Axes, ic_label: str, is_bottom: bool) -> None:
         ax.set_xlabel("Frequency (Hz)", fontsize=10)
 
 
-def run(session_ids: list[str], base_dir: str = "test_data") -> None:
+def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -> None:
     """Launch the IC current FFT analysis viewer."""
     if not session_ids:
         print("No sessions selected")

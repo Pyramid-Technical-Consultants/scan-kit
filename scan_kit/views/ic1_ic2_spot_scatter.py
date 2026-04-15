@@ -39,7 +39,7 @@ def _process_session(session_id: str, position_key: str, base_dir: str):
     return out
 
 
-def run(session_ids: list[str], base_dir: str = "test_data") -> None:
+def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -> None:
     """Run IC1/IC2 spot scatter analysis and show matplotlib window."""
     if not session_ids:
         _log.debug("No sessions selected")

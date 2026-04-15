@@ -2,6 +2,7 @@
 
 from .session_meta import SessionMeta, parse_termination_summary_text
 from .session_notes import load_notes, save_note
+from .settings import ViewSettings
 from .schema import (
     POSITION_KEY_G2,
     POSITION_KEY_G2_RAW,
@@ -52,6 +53,7 @@ from .processing import (
     load_session_raw,
     process_position_data,
     try_load_position_data,
+    apply_auto_calibration,
     add_dose_ratio_columns,
     filter_data_rows,
     add_spot_delivery_time,
@@ -111,6 +113,7 @@ __all__ = [
     "resolve_requested_column",
     "load_notes",
     "save_note",
+    "ViewSettings",
     "SessionSource",
     "resolve_session_source",
     "load_session_csv",
@@ -127,6 +130,7 @@ __all__ = [
     "apply_validation",
     "load_session_raw",
     "process_position_data",
+    "apply_auto_calibration",
     "plot_boxplots_for_column",
     "plot_scatter_energy",
     "scatter_with_trend",

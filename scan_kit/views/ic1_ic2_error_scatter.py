@@ -18,7 +18,7 @@ import logging
 _log = logging.getLogger(__name__)
 
 
-def run(session_ids: list[str], base_dir: str = "test_data") -> None:
+def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -> None:
     """Run IC1 vs IC2 error scatter analysis and show matplotlib window."""
     if not session_ids:
         _log.debug("No sessions selected")

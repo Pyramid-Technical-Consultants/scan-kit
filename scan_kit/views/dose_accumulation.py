@@ -82,7 +82,7 @@ def _load_dose_data(session_id: str, base_dir: str) -> dict | None:
     return result
 
 
-def run(session_ids: list[str], base_dir: str = "test_data") -> None:
+def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -> None:
     """Plot expected vs measured cumulative dose for IC1, IC2, IC3."""
     if not session_ids:
         return

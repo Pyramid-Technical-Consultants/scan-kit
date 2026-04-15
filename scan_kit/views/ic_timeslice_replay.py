@@ -189,7 +189,7 @@ def _compress_minmax(signal: np.ndarray, n_bins: int):
 # View entry point
 # ---------------------------------------------------------------------------
 
-def run(session_ids: list[str], base_dir: str = "test_data") -> None:
+def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -> None:
     """Launch the IC timeslice replay viewer."""
     if not session_ids:
         print("No sessions selected")

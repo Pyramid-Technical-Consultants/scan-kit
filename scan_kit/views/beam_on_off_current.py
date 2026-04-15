@@ -136,7 +136,7 @@ def _extract_on_off_distributions(session_id: str, base_dir: str):
     return result
 
 
-def run(session_ids: list[str], base_dir: str = "test_data") -> None:
+def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -> None:
     """Run beam-on / beam-off current box-plot analysis."""
     if not session_ids:
         _log.debug("No sessions selected")

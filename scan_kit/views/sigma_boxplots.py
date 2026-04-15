@@ -63,7 +63,7 @@ def _process_session_data(session_id: str, base_dir: str):
     }
 
 
-def run(session_ids: list[str], base_dir: str = "test_data") -> None:
+def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -> None:
     """Run sigma box plots analysis and show matplotlib window."""
     if not session_ids:
         _log.debug("No sessions selected")

@@ -178,7 +178,7 @@ def _merge_beam_on_times(data: dict, beam_on_lookup: dict) -> dict:
     return filtered
 
 
-def run(session_ids: list[str], base_dir: str = "test_data") -> None:
+def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -> None:
     """Plot spot delivery time, beam-on time, and overhead by energy."""
     if not session_ids:
         _log.debug("No sessions selected")

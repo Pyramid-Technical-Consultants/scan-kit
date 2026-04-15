@@ -3,7 +3,13 @@
 import matplotlib.pyplot as plt
 
 from ..common import (
+    C_IC1_TOTAL_DOSE,
+    C_IC2_TOTAL_DOSE,
+    C_IC3_TOTAL_DOSE,
+    C_CHARGE_REQ,
     POSITION_KEY_G3_RAW,
+    ViewSettings,
+    apply_auto_calibration,
     add_dose_ratio_columns,
     add_spot_delivery_time,
     process_position_data,
@@ -23,30 +29,25 @@ import logging
 
 _log = logging.getLogger(__name__)
 
-EXTRA_SPOT_G3 = [
-    "ic1_total_dose_spot_raw",
-    "ic2_total_dose_spot_raw",
-    "r_ic3_total_dose_spot_raw",
-    "timestamp",
-    "layer_id",
-]
-EXTRA_SPOT_G2 = [
-    "ic1_total_dose_spot_raw",
-    "ic2_total_dose_spot_raw",
-    "timestamp",
-    "layer_id",
-]
+EXTRA_SPOT_G3 = [C_IC1_TOTAL_DOSE, C_IC2_TOTAL_DOSE, C_IC3_TOTAL_DOSE, "timestamp", "layer_id"]
+EXTRA_SPOT_G2 = [C_IC1_TOTAL_DOSE, C_IC2_TOTAL_DOSE, "timestamp", "layer_id"]
 
 
-def _process_session(session_id: str, position_key: str, base_dir: str):
+def _process_session(session_id: str, position_key: str, base_dir: str,
+                     settings: ViewSettings | None = None):
     """Load session, compute dose ratios and spot delivery time."""
     extra = EXTRA_SPOT_G3 if position_key == POSITION_KEY_G3_RAW else EXTRA_SPOT_G2
+    dose_cols = [C_IC1_TOTAL_DOSE, C_IC2_TOTAL_DOSE, C_IC3_TOTAL_DOSE]
+    extra_input = [C_CHARGE_REQ] if settings and settings.auto_calibrate else None
     data = process_position_data(
-        session_id, position_key, extra_spot_columns=extra, base_dir=base_dir
+        session_id, position_key, extra_spot_columns=extra,
+        extra_input_columns=extra_input, base_dir=base_dir,
     )
     if data is None:
         return None
 
+    if settings and settings.auto_calibrate:
+        data = apply_auto_calibration(data, C_CHARGE_REQ, dose_cols)
     data = add_dose_ratio_columns(data, include_ic3=position_key == POSITION_KEY_G3_RAW)
     if data is None:
         return None
@@ -81,15 +82,19 @@ def _plot_ratio_vs_time(ax, session_data, ratio_col, colors, title):
         annotate_slopes(ax, slope_labels)
 
 
-def run(session_ids: list[str], base_dir: str = "test_data") -> None:
+def run(session_ids: list[str], base_dir: str = "test_data",
+        *, settings: ViewSettings | None = None) -> None:
     """Run dose-ratio vs spot time analysis and show matplotlib window."""
     if not session_ids:
         _log.debug("No sessions selected")
         return
 
+    def _loader(sid, pkey, bdir):
+        return _process_session(sid, pkey, bdir, settings=settings)
+
     session_data: dict[str, dict] = {}
     for sid in session_ids:
-        data = try_load_position_data(sid, base_dir, _process_session)
+        data = try_load_position_data(sid, base_dir, _loader)
         if data is not None:
             session_data[sid] = data
 

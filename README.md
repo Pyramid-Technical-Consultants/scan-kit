@@ -1,39 +1,42 @@
 # scan-kit
 
-Open-source proton pencil beam scanning session analysis toolkit with a Textual
-terminal UI and Matplotlib analysis views.
+Open-source proton pencil beam scanning session analysis toolkit with a
+Textual terminal UI and Matplotlib analysis views.
 
-## Requirements
+## Quick Start
 
-- Python 3.10+
-- Session exports available as unpacked folders or archives
+### Pre-built Executables (recommended)
 
-## Installation
+Download the latest release for your platform from
+[**Releases**](https://github.com/Pyramid-Technical-Consultants/scan-kit/releases/latest):
 
-From the repository root:
+| Platform | Asset |
+|----------|-------|
+| Windows  | `scan-kit-windows.exe` |
+| Linux (x86-64) | `scan-kit-linux-amd64` |
+
+No Python installation required — just run the executable.
+
+### From Source
+
+Requires Python 3.10+.
 
 ```bash
-pip install .
+pip install .          # standard install
+pip install -e .       # editable install for development
 ```
 
-Editable install for development:
+Run the app:
 
 ```bash
-pip install -e .
+scan-kit               # via console entry point
+python -m scan_kit     # as a module
 ```
 
-## Run the App
-
-Start the Textual launcher:
+Check version:
 
 ```bash
-scan-kit
-```
-
-You can also run it as a module:
-
-```bash
-python -m scan_kit.app
+scan-kit --version
 ```
 
 ## TUI Workflow
@@ -42,7 +45,7 @@ python -m scan_kit.app
 
 - In `DATA SOURCE`, enter the folder that contains session data
 - Press `Enter` to refresh discovery
-- Default source is `test_data` in the project root
+- Default source is the current working directory (or `test_data` in dev)
 
 ### 2) Sort and select sessions
 
@@ -74,11 +77,10 @@ python -m scan_kit.app
 ## Available Views
 
 | View | What it shows |
-|------|----------------|
+|------|---------------|
 | **IC1 X/Y Position Error** | IC1 X and Y position error by energy (box plots) |
 | **IC1 vs IC2 Error Scatter** | IC1/IC2 position differences in X and Y (scatter) |
-| **IC1 Spot Scatter (G3)** | IC1 and IC2 spot positions for G3 sessions |
-| **IC1 Spot Scatter (G2)** | IC1 spot positions for G2 sessions |
+| **IC1/IC2 Spot Scatter** | IC1 and IC2 spot positions for gantry-specific sessions |
 | **Dose Ratios vs Energy** | IC2/IC1, IC3/IC1, IC3/IC2 ratio differences vs energy |
 | **Dose Ratios vs Position** | Dose-ratio behavior against beam position |
 | **Dose Ratios vs Spot Time** | Dose-ratio behavior against spot delivery time |
@@ -88,6 +90,9 @@ python -m scan_kit.app
 | **Beam-Off Ramp-Down** | Beam-off current ramp-down curves (IC1/IC2/IC3) |
 | **Beam-On vs Beam-Off Current** | Beam-on and beam-off current distributions by energy |
 | **IC Timeslice Replay** | Interactive media-player style viewer for raw IC1/IC2/IC3 timeslice current |
+| **Dose Accumulation** | Cumulative dose delivery analysis |
+| **IC Current FFT Analysis** | Frequency-domain analysis of IC current signals |
+| **IC Audio Export (WAV)** | Export IC current data as audible WAV files (requires PortAudio) |
 
 ### IC Timeslice Replay
 
@@ -135,6 +140,39 @@ read per-layer files from:
 
 `<session_id>/layer-<n>/run-<m>/timeslice_data_device_units.csv`
 
+## Building from Source
+
+To build a standalone executable for your platform:
+
+```bash
+pip install -e ".[build]"   # install with PyInstaller
+python build.py --clean     # build single executable → dist/
+```
+
+The output lands in `dist/scan-kit` (Linux) or `dist\scan-kit.exe` (Windows).
+
+## Releasing
+
+Releases are automated via GitHub Actions. To cut a new release:
+
+1. Update the version in `scan_kit/__init__.py`
+2. Commit and push to `main`
+3. Tag and push:
+
+```bash
+git tag v<version>
+git push origin v<version>
+```
+
+The CI workflow builds executables for Windows and Linux, then creates a GitHub
+Release with the binaries attached automatically.
+
+## Versioning
+
+The project follows [Semantic Versioning](https://semver.org/). The single
+source of truth for the version is `scan_kit/__init__.py` (`__version__`),
+which is read by `pyproject.toml` and displayed in the TUI.
+
 ## License
 
-See [LICENSE](LICENSE).
+MIT — see [LICENSE](LICENSE).

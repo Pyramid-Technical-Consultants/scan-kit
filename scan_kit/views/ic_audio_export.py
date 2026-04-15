@@ -493,7 +493,7 @@ class _AudioPlayerWindow:
 # View entry point
 # ---------------------------------------------------------------------------
 
-def run(session_ids: list[str], base_dir: str = "test_data") -> None:
+def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -> None:
     """Launch the IC audio player for the selected sessions."""
     if not session_ids:
         print("No sessions selected")

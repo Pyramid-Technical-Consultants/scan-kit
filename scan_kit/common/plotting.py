@@ -28,6 +28,8 @@ SUPTITLE_KW = dict(fontsize=13, fontweight="bold")
 GRID_KW = dict(visible=True, alpha=0.3)
 REFLINE_KW = dict(color="gray", linestyle="--", linewidth=1, alpha=0.6)
 
+HIST_PERCENTILE_CLIP = 100  # percentile for histogram outlier filtering (e.g. 99 → 1st–99th)
+
 SCATTER_ALPHA = 0.45
 SCATTER_SIZE = 18
 
@@ -253,7 +255,8 @@ def add_energy_colorbar(fig_or_ax, energies=None, vmin=None, vmax=None):
 
 def _plot_histogram(ax, session_data, col, loaded_ids, colors, *,
                     energy_mask=None, n_bins=101, ylabel="Probability (%)",
-                    xlabel=None, title=None, ref_val=None):
+                    xlabel=None, title=None, ref_val=None,
+                    bin_range=None):
     """Draw a probability-weighted histogram on *ax*.
 
     Args:
@@ -268,11 +271,14 @@ def _plot_histogram(ax, session_data, col, loaded_ids, colors, *,
         xlabel: X-axis label.
         title: Axes title.
         ref_val: Optional reference line value (vertical).
+        bin_range: Optional (lo, hi) tuple for shared bin edges across panels.
     """
     ax.clear()
 
     all_chunks = []
     for sid in loaded_ids:
+        if col not in session_data[sid]:
+            continue
         vals = np.asarray(session_data[sid][col], dtype=float)
         if energy_mask is not None and sid in energy_mask:
             vals = vals[energy_mask[sid]]
@@ -284,14 +290,22 @@ def _plot_histogram(ax, session_data, col, loaded_ids, colors, *,
         ax.set_visible(False)
         return
 
-    all_finite = np.concatenate(all_chunks)
-    bin_edges = np.linspace(all_finite.min(), all_finite.max(), n_bins)
+    if bin_range is not None:
+        lo, hi = bin_range
+    else:
+        all_finite = np.concatenate(all_chunks)
+        pclip = HIST_PERCENTILE_CLIP
+        lo, hi = np.percentile(all_finite, [100 - pclip, pclip])
+    bin_edges = np.linspace(lo, hi, n_bins)
 
     for sid, color in zip(loaded_ids, colors):
+        if col not in session_data[sid]:
+            continue
         vals = np.asarray(session_data[sid][col], dtype=float)
         if energy_mask is not None and sid in energy_mask:
             vals = vals[energy_mask[sid]]
         vals = vals[np.isfinite(vals)]
+        vals = vals[(vals >= lo) & (vals <= hi)]
         if vals.size == 0:
             continue
         weights = np.full_like(vals, 100.0 / vals.size)
@@ -322,6 +336,7 @@ def link_boxplot_to_histogram(
     hist_xlabels=None,
     hist_titles=None,
     hist_refs=None,
+    hist_percentile_clip=None,
 ):
     """Install SpanSelectors on boxplot axes that interactively filter histograms.
 
@@ -359,6 +374,22 @@ def link_boxplot_to_histogram(
 
     energy_arr = np.array(energies, dtype=float)
     selectors = []
+    pclip = hist_percentile_clip if hist_percentile_clip is not None else HIST_PERCENTILE_CLIP
+
+    # Compute a shared bin range across all columns
+    all_hist_vals = []
+    for col in columns:
+        for sid in loaded_ids:
+            if col in session_data[sid]:
+                v = np.asarray(session_data[sid][col], dtype=float)
+                v = v[np.isfinite(v)]
+                if v.size:
+                    all_hist_vals.append(v)
+    if all_hist_vals:
+        combined = np.concatenate(all_hist_vals)
+        shared_bin_range = tuple(np.percentile(combined, [100 - pclip, pclip]))
+    else:
+        shared_bin_range = None
 
     for box_ax, hist_ax, col, xlabel, title, ref in zip(
         box_axes, hist_axes, columns, hist_xlabels, hist_titles, hist_refs
@@ -366,12 +397,13 @@ def link_boxplot_to_histogram(
         _plot_histogram(
             hist_ax, session_data, col, loaded_ids, colors,
             n_bins=n_bins, ylabel=hist_ylabel, xlabel=xlabel,
-            title=title, ref_val=ref,
+            title=title, ref_val=ref, bin_range=shared_bin_range,
         )
 
         highlight = box_ax.axvspan(0, 0, alpha=0.15, color="gold", visible=False, zorder=0)
 
-        def _make_callback(_hist_ax, _col, _xlabel, _title, _ref, _hl, _span_ref):
+        def _make_callback(_hist_ax, _col, _xlabel, _title, _ref, _hl, _span_ref,
+                           _bin_range=shared_bin_range):
             def _on_select(xmin, xmax):
                 idx_lo = max(0, int(np.floor(xmin + 0.5)))
                 idx_hi = min(len(energy_arr) - 1, int(np.floor(xmax + 0.5)))
@@ -386,6 +418,7 @@ def link_boxplot_to_histogram(
                     _hist_ax, session_data, _col, loaded_ids, colors,
                     energy_mask=mask, n_bins=n_bins, ylabel=hist_ylabel,
                     xlabel=_xlabel, title=_title, ref_val=_ref,
+                    bin_range=_bin_range,
                 )
                 make_session_legend(_hist_ax, loaded_ids, colors)
 
@@ -401,6 +434,7 @@ def link_boxplot_to_histogram(
                     _hist_ax, session_data, _col, loaded_ids, colors,
                     n_bins=n_bins, ylabel=hist_ylabel,
                     xlabel=_xlabel, title=_title, ref_val=_ref,
+                    bin_range=_bin_range,
                 )
                 make_session_legend(_hist_ax, loaded_ids, colors)
                 _hl.set_visible(False)

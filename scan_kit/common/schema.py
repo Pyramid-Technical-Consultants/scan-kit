@@ -180,7 +180,13 @@ def resolve_concept_column(
     *,
     position_key: str | None = None,
 ) -> str | None:
-    """Resolve the best matching column for a concept."""
+    """Resolve the best matching column for a concept.
+
+    Tries the canonical name first, then falls back to alias candidates.
+    """
+    resolved = resolve_column_name(columns, concept)
+    if resolved is not None:
+        return resolved
     for candidate in concept_column_candidates(concept, position_key=position_key):
         resolved = resolve_column_name(columns, candidate)
         if resolved is not None:
@@ -201,9 +207,8 @@ def resolve_requested_column(columns: Iterable[str], requested: str) -> str | No
 def canonical_column_aliases() -> dict[str, tuple[str, ...]]:
     """Build canonical-column alias map used for DataFrame normalization."""
     aliases = {
-        candidates[0]: tuple(c for c in candidates[1:])
-        for candidates in _CONCEPT_ALIASES_STATIC.values()
-        if candidates
+        canonical: alt_names
+        for canonical, alt_names in _CONCEPT_ALIASES_STATIC.items()
     }
     all_pos_concepts = _RAW_POS_CONCEPTS | _NONRAW_POS_CONCEPTS
     for key in (POSITION_KEY_G2_RAW, POSITION_KEY_G3_RAW):
