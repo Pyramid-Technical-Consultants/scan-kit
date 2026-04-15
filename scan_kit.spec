@@ -6,11 +6,23 @@ Usage:
     pyinstaller scan_kit.spec --onefile # single exe (for distribution)
 """
 
+import importlib
+import pkgutil
 import sys
 from pathlib import Path
 
 block_cipher = None
 ROOT = Path(SPECPATH)
+
+# ---------------------------------------------------------------------------
+# Collect all rich._unicode_data submodules (loaded dynamically by rich at
+# runtime based on the Unicode version — PyInstaller can't detect these).
+# ---------------------------------------------------------------------------
+_rich_unicode = importlib.import_module("rich._unicode_data")
+_rich_unicode_imports = [
+    f"rich._unicode_data.{m.name}"
+    for m in pkgutil.iter_modules(_rich_unicode.__path__)
+]
 
 # ---------------------------------------------------------------------------
 # Collect all scan_kit submodules so PyInstaller bundles them even though
@@ -50,6 +62,8 @@ hiddenimports = [
     "sounddevice",
     "matplotlib.backends.backend_tkagg",
     "tkinter",
+    # rich unicode data (dynamically loaded based on Unicode version)
+    *_rich_unicode_imports,
 ]
 
 a = Analysis(
