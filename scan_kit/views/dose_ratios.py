@@ -14,6 +14,7 @@ from ..common import (
     POSITION_KEY_G3_RAW,
     ViewSettings,
     apply_auto_calibration,
+    apply_calibration_factors,
     add_dose_ratio_columns,
     process_position_data,
     try_load_position_data,
@@ -49,7 +50,10 @@ def _process_ratios_session(session_id: str, position_key: str, base_dir: str,
     if data is None:
         return None
     if settings and settings.auto_calibrate:
-        data = apply_auto_calibration(data, C_CHARGE_REQ, extra)
+        if settings.cal_factors:
+            data = apply_calibration_factors(data, extra, settings.cal_factors)
+        else:
+            data = apply_auto_calibration(data, C_CHARGE_REQ, extra)
     return add_dose_ratio_columns(data, include_ic3=position_key == POSITION_KEY_G3_RAW)
 
 

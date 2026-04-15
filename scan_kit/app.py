@@ -15,13 +15,13 @@ from pathlib import Path
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
-from textual.widgets import Button, Input, SelectionList, Static, Switch
+from textual.widgets import Button, Input, SelectionList, Static
 from textual.widgets.selection_list import Selection
 
 from . import __version__
 from .common import SessionMeta
 from .common.session_notes import load_notes, save_note
-from .common.settings import ViewSettings
+from .common.settings import ViewSettings, CALIBRATION_MODES
 from .common.session_source import resolve_session_source, load_session_termination_summary
 from .common.sessions import discover_sessions
 from .views import VIEWS
@@ -119,9 +119,15 @@ class ScanKitApp(App[None]):
         color: #00d4aa; padding: 0;
     }
     #settings-section { height: auto; padding: 0 }
-    .setting-row { height: 3; width: 100%; padding: 0 1 }
-    .setting-name { width: 1fr; color: #ccc; padding: 0; content-align: left middle }
-    .setting-row Switch { width: auto }
+    .setting-name { color: #888; padding: 0 1; height: 1 }
+    #cal-mode-row { height: 3; width: 100% }
+    .cal-btn {
+        width: 1fr; background: #0a0e14; color: #555;
+        border: round #333; padding: 0 1; height: 3; min-width: 8;
+    }
+    .cal-btn:hover { color: #00d4ff; border: round #00d4ff }
+    .cal-btn.active { color: #00d4ff; background: #001a1f; border: round #00d4ff }
+    #cal-factors { color: #888; padding: 0 1; height: auto }
 
     #buttons-section {
         height: 1fr; overflow-y: auto; padding: 0;
@@ -203,9 +209,15 @@ class ScanKitApp(App[None]):
             with VerticalScroll(id="right-panel"):
                 yield Static("SETTINGS", id="settings-label")
                 with Vertical(id="settings-section"):
-                    with Horizontal(classes="setting-row"):
-                        yield Static("Auto Calibrate", classes="setting-name")
-                        yield Switch(value=False, id="auto-calibrate")
+                    yield Static("Calibration", classes="setting-name")
+                    with Horizontal(id="cal-mode-row"):
+                        for mode in CALIBRATION_MODES:
+                            label = {"off": "Off", "per_session": "Per-Session", "constrained": "Constrained"}[mode]
+                            btn = Button(label, id=f"cal-{mode}", classes="cal-btn")
+                            if mode == self._settings.calibration_mode:
+                                btn.add_class("active")
+                            yield btn
+                yield Static("", id="cal-factors")
                 yield Static("RUN ANALYSIS", id="views-label")
                 with Vertical(id="buttons-section"):
                     for display_name, _module_name, _run in VIEWS:
@@ -222,16 +234,45 @@ class ScanKitApp(App[None]):
     def _load_settings(self) -> None:
         """Load settings from disk and sync the UI."""
         self._settings = ViewSettings.load(self._base_dir)
-        try:
-            sw = self.query_one("#auto-calibrate", Switch)
-            sw.value = self._settings.auto_calibrate
-        except Exception:
-            pass
+        self._sync_cal_buttons()
 
-    def on_switch_changed(self, event: Switch.Changed) -> None:
-        if event.switch.id == "auto-calibrate":
-            self._settings.auto_calibrate = event.value
-            self._settings.save(self._base_dir)
+    def _sync_cal_buttons(self) -> None:
+        """Highlight the active calibration mode button."""
+        for mode in CALIBRATION_MODES:
+            try:
+                btn = self.query_one(f"#cal-{mode}", Button)
+                if mode == self._settings.calibration_mode:
+                    btn.add_class("active")
+                else:
+                    btn.remove_class("active")
+            except Exception:
+                pass
+
+    def _set_calibration_mode(self, mode: str) -> None:
+        """Switch calibration mode, persist, and update UI."""
+        self._settings.calibration_mode = mode
+        self._settings.cal_factors = None
+        self._settings.save(self._base_dir)
+        self._sync_cal_buttons()
+        self._update_cal_factors_display()
+
+    def _update_cal_factors_display(self) -> None:
+        """Refresh the #cal-factors Static to show current factors or clear."""
+        try:
+            widget = self.query_one("#cal-factors", Static)
+        except Exception:
+            return
+        factors = self._settings.cal_factors
+        if not factors or self._settings.calibration_mode == "off":
+            widget.update("")
+            return
+        from .common.schema import C_IC1_TOTAL_DOSE, C_IC2_TOTAL_DOSE, C_IC3_TOTAL_DOSE
+        labels = {C_IC1_TOTAL_DOSE: "IC1", C_IC2_TOTAL_DOSE: "IC2", C_IC3_TOTAL_DOSE: "IC3"}
+        parts = []
+        for col, label in labels.items():
+            if col in factors:
+                parts.append(f"{label}: {factors[col]:.4f}")
+        widget.update("  ".join(parts) if parts else "")
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         """Handle base directory path change."""
@@ -472,6 +513,11 @@ class ScanKitApp(App[None]):
             if mode in _SORT_MODES:
                 self._set_sort(mode)
             return
+        if button_id and button_id.startswith("cal-"):
+            mode = button_id.removeprefix("cal-")
+            if mode in CALIBRATION_MODES:
+                self._set_calibration_mode(mode)
+            return
         if not button_id or not button_id.startswith("view-"):
             return
 
@@ -490,6 +536,14 @@ class ScanKitApp(App[None]):
 
         session_ids = list(selected)[:MAX_SESSIONS]
         base_dir = self._base_dir
+
+        if self._settings.calibration_mode == "constrained":
+            from .common.processing import compute_calibration_factors
+            factors = compute_calibration_factors(session_ids, base_dir)
+            self._settings.cal_factors = factors if factors else None
+            self._update_cal_factors_display()
+        else:
+            self._settings.cal_factors = None
 
         btn = event.button
         original_label = str(btn.label)

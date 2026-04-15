@@ -102,6 +102,85 @@ def apply_auto_calibration(
     return result
 
 
+def apply_calibration_factors(
+    data: dict,
+    dose_cols: list[str],
+    factors: dict[str, float],
+) -> dict:
+    """Apply pre-computed scale factors to dose columns.
+
+    Unlike :func:`apply_auto_calibration` this does not need a target column;
+    the factors are already known (e.g. computed across multiple sessions).
+    """
+    result = dict(data)
+    for col in dose_cols:
+        if col not in result or col not in factors:
+            continue
+        result[col] = np.asarray(result[col], dtype=float) * factors[col]
+    return result
+
+
+def compute_calibration_factors(
+    session_ids: list[str],
+    base_dir: str,
+    dose_cols: list[str] | None = None,
+    target_col: str | None = None,
+) -> dict[str, float]:
+    """Compute a single scale factor per IC across all *session_ids*.
+
+    Pools ``target`` and ``delivered`` values from every session, then
+    returns ``{col: sum(target) / sum(delivered)}`` for each dose column
+    that has data.
+    """
+    from .schema import C_CHARGE_REQ
+
+    if target_col is None:
+        target_col = C_CHARGE_REQ
+    if dose_cols is None:
+        dose_cols = [C_IC1_TOTAL_DOSE, C_IC2_TOTAL_DOSE, C_IC3_TOTAL_DOSE]
+
+    from .schema import resolve_concept_column
+    from .session_source import load_session_csv, resolve_session_source
+
+    sums_target: dict[str, float] = {c: 0.0 for c in dose_cols}
+    sums_delivered: dict[str, float] = {c: 0.0 for c in dose_cols}
+
+    for sid in session_ids:
+        src = resolve_session_source(sid, base_dir)
+        if src is None:
+            continue
+        input_map = load_session_csv(src, "input_map.csv")
+        spot_data = load_session_csv(src, "spot_data.csv")
+        if input_map is None or spot_data is None:
+            continue
+
+        col_target = resolve_concept_column(input_map.columns, target_col)
+        if col_target is None:
+            continue
+        n = min(len(input_map), len(spot_data))
+        target = pd.to_numeric(input_map[col_target].iloc[:n], errors="coerce").values
+
+        for dc in dose_cols:
+            col_spot = resolve_concept_column(spot_data.columns, dc)
+            if col_spot is None:
+                continue
+            delivered = pd.to_numeric(spot_data[col_spot].iloc[:n], errors="coerce").values
+            ok = (
+                np.isfinite(target) & np.isfinite(delivered)
+                & (target > 0) & (delivered > 0)
+            )
+            if not ok.any():
+                continue
+            sums_target[dc] += target[ok].sum()
+            sums_delivered[dc] += delivered[ok].sum()
+
+    factors: dict[str, float] = {}
+    for dc in dose_cols:
+        if sums_delivered[dc] > 0:
+            factors[dc] = sums_target[dc] / sums_delivered[dc]
+    return factors
+
+
 def add_dose_ratio_columns(data: dict, *, include_ic3: bool) -> dict | None:
     """Compute ratio-difference (%) columns used by dose-ratio views."""
     required = {C_IC1_TOTAL_DOSE, C_IC2_TOTAL_DOSE}

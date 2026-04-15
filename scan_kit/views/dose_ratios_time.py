@@ -10,6 +10,7 @@ from ..common import (
     POSITION_KEY_G3_RAW,
     ViewSettings,
     apply_auto_calibration,
+    apply_calibration_factors,
     add_dose_ratio_columns,
     add_spot_delivery_time,
     process_position_data,
@@ -47,7 +48,10 @@ def _process_session(session_id: str, position_key: str, base_dir: str,
         return None
 
     if settings and settings.auto_calibrate:
-        data = apply_auto_calibration(data, C_CHARGE_REQ, dose_cols)
+        if settings.cal_factors:
+            data = apply_calibration_factors(data, dose_cols, settings.cal_factors)
+        else:
+            data = apply_auto_calibration(data, C_CHARGE_REQ, dose_cols)
     data = add_dose_ratio_columns(data, include_ic3=position_key == POSITION_KEY_G3_RAW)
     if data is None:
         return None

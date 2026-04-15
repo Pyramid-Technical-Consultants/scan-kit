@@ -16,6 +16,7 @@ from ..common import (
     POSITION_KEY_G3_RAW,
     ViewSettings,
     apply_auto_calibration,
+    apply_calibration_factors,
     process_position_data,
     plot_boxplots_for_column,
     make_session_legend,
@@ -194,7 +195,10 @@ def _process_session(session_id: str, position_key: str, base_dir: str,
 
     data = dict(data)
     if settings and settings.auto_calibrate:
-        data = apply_auto_calibration(data, TARGET_COL, list(DELIVERED_COLS.values()))
+        if settings.cal_factors:
+            data = apply_calibration_factors(data, list(DELIVERED_COLS.values()), settings.cal_factors)
+        else:
+            data = apply_auto_calibration(data, TARGET_COL, list(DELIVERED_COLS.values()))
     target = data[TARGET_COL]
     for ic, col in DELIVERED_COLS.items():
         if col in data:

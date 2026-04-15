@@ -12,6 +12,9 @@ from ..common import (
     C_IC2_TOTAL_DOSE,
     C_IC3_TOTAL_DOSE,
     C_LAYER_ID,
+    ViewSettings,
+    apply_auto_calibration,
+    apply_calibration_factors,
     resolve_concept_column,
     DEFAULT_SESSION_COLORS,
     SUPTITLE_KW,
@@ -91,6 +94,15 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
     for sid in session_ids:
         data = _load_dose_data(sid, base_dir)
         if data is not None:
+            if settings and settings.auto_calibrate:
+                dose_cols = [f"{ic}_dose" for ic in data["ic_keys"]]
+                if settings.cal_factors:
+                    _canonical = {"ic1": C_IC1_TOTAL_DOSE, "ic2": C_IC2_TOTAL_DOSE, "ic3": C_IC3_TOTAL_DOSE}
+                    mapped = {f"{ic}_dose": settings.cal_factors[_canonical[ic]]
+                              for ic in data["ic_keys"] if _canonical.get(ic) in (settings.cal_factors or {})}
+                    data = apply_calibration_factors(data, dose_cols, mapped)
+                else:
+                    data = apply_auto_calibration(data, "charge_req", dose_cols)
             session_data[sid] = data
 
     if not session_data:

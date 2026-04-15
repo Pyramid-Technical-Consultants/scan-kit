@@ -3,17 +3,24 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from pathlib import Path
 
 _FILENAME = "settings.json"
+
+CALIBRATION_MODES = ("off", "per_session", "constrained")
 
 
 @dataclass
 class ViewSettings:
     """Lightweight bag of global settings passed from the TUI to view subprocesses."""
 
-    auto_calibrate: bool = False
+    calibration_mode: str = "off"
+    cal_factors: dict[str, float] | None = None
+
+    @property
+    def auto_calibrate(self) -> bool:
+        return self.calibration_mode != "off"
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), separators=(",", ":"))
@@ -21,13 +28,14 @@ class ViewSettings:
     @classmethod
     def from_json(cls, s: str) -> ViewSettings:
         raw = json.loads(s)
-        known = set(cls.__dataclass_fields__)
-        return cls(**{k: v for k, v in raw.items() if k in known})
+        return cls(**cls._clean(raw))
 
     def save(self, base_dir: str | Path) -> None:
         path = Path(base_dir) / _FILENAME
+        d = asdict(self)
+        d.pop("cal_factors", None)
         path.write_text(
-            json.dumps(asdict(self), indent=2, ensure_ascii=False) + "\n",
+            json.dumps(d, indent=2, ensure_ascii=False) + "\n",
             encoding="utf-8",
         )
 
@@ -38,5 +46,17 @@ class ViewSettings:
             raw = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError, ValueError):
             return cls()
+        return cls(**cls._clean(raw))
+
+    @classmethod
+    def _clean(cls, raw: dict) -> dict:
+        """Normalise a raw JSON dict into valid constructor kwargs."""
         known = set(cls.__dataclass_fields__)
-        return cls(**{k: v for k, v in raw.items() if k in known})
+        out = {k: v for k, v in raw.items() if k in known}
+        # Backward compat: old bool auto_calibrate -> calibration_mode
+        if "auto_calibrate" in raw and "calibration_mode" not in raw:
+            out["calibration_mode"] = "per_session" if raw["auto_calibrate"] else "off"
+            out.pop("auto_calibrate", None)
+        if out.get("calibration_mode") not in CALIBRATION_MODES:
+            out["calibration_mode"] = "off"
+        return out
