@@ -13,7 +13,6 @@ from ..common import (
     C_IC3_CURRENT_C,
     C_IC3_CURRENT_D,
     C_LAYER_ID,
-    resolve_concept_column,
     plot_boxplots_for_column,
     make_session_legend,
     style_energy_axes,
@@ -32,6 +31,16 @@ _log = logging.getLogger(__name__)
 
 ON_FRAC = 0.10
 OFF_FRAC = 0.02
+
+_TIMESLICE_COLS = [
+    C_LAYER_ID,
+    C_IC1_CURRENT,
+    C_IC2_CURRENT,
+    C_IC3_CURRENT_A,
+    C_IC3_CURRENT_B,
+    C_IC3_CURRENT_C,
+    C_IC3_CURRENT_D,
+]
 
 
 def _classify_timeslices(signal: np.ndarray):
@@ -66,49 +75,56 @@ def _extract_on_off_distributions(session_id: str, base_dir: str):
     if input_map is None:
         return None
 
-    col_layer_im = resolve_concept_column(input_map.columns, C_LAYER_ID)
-    col_energy_im = resolve_concept_column(input_map.columns, C_ENERGY)
-    if col_layer_im is None or col_energy_im is None:
+    if C_ENERGY not in input_map.columns:
         return None
-    energy_by_layer = input_map.groupby(col_layer_im)[col_energy_im].first().to_dict()
 
-    frames = load_session_timeslice_device_units(src)
+    energy_by_layer_id: dict | None = None
+    energy_by_idx: dict[int, float] | None = None
+
+    if C_LAYER_ID in input_map.columns:
+        energy_by_layer_id = input_map.groupby(C_LAYER_ID)[C_ENERGY].first().to_dict()
+
+    if energy_by_layer_id is None or len(energy_by_layer_id) <= 1:
+        ordered_energies = list(dict.fromkeys(input_map[C_ENERGY].values))
+        energy_by_idx = {i: e for i, e in enumerate(ordered_energies)}
+
+    frames = load_session_timeslice_device_units(src, usecols=_TIMESLICE_COLS)
     if not frames:
         return None
 
     df0 = frames[0].loc[:, ~frames[0].columns.duplicated()]
-    col_layer = resolve_concept_column(df0.columns, C_LAYER_ID)
-    col_ic1 = resolve_concept_column(df0.columns, C_IC1_CURRENT)
-    col_ic2 = resolve_concept_column(df0.columns, C_IC2_CURRENT)
-    if not all([col_layer, col_ic1, col_ic2]):
+    if C_IC1_CURRENT not in df0.columns or C_IC2_CURRENT not in df0.columns:
         return None
 
-    col_ic3a = resolve_concept_column(df0.columns, C_IC3_CURRENT_A)
-    col_ic3b = resolve_concept_column(df0.columns, C_IC3_CURRENT_B)
-    col_ic3c = resolve_concept_column(df0.columns, C_IC3_CURRENT_C)
-    col_ic3d = resolve_concept_column(df0.columns, C_IC3_CURRENT_D)
-    has_ic3 = all([col_ic3a, col_ic3b, col_ic3c, col_ic3d])
+    ic3_cols = [C_IC3_CURRENT_A, C_IC3_CURRENT_B, C_IC3_CURRENT_C, C_IC3_CURRENT_D]
+    has_ic3 = all(col in df0.columns for col in ic3_cols)
 
     ic_keys = ["ic1", "ic2"] + (["ic3"] if has_ic3 else [])
     accum = {f"{ic}_{state}": [] for ic in ic_keys for state in ("on", "off", "energy_on", "energy_off")}
 
     for df in frames:
         df = df.loc[:, ~df.columns.duplicated()]
-        layer_id = df[col_layer].iloc[0]
-        energy = energy_by_layer.get(layer_id)
+
+        energy = None
+        if energy_by_idx is not None and "_layer_idx" in df.columns:
+            idx = int(df["_layer_idx"].iloc[0])
+            energy = energy_by_idx.get(idx)
+        if energy is None and energy_by_layer_id is not None and C_LAYER_ID in df.columns:
+            layer_id = df[C_LAYER_ID].iloc[0]
+            energy = energy_by_layer_id.get(layer_id)
         if energy is None:
             continue
 
         signals = {
-            "ic1": df[col_ic1].values.astype(float),
-            "ic2": df[col_ic2].values.astype(float),
+            "ic1": df[C_IC1_CURRENT].values.astype(float),
+            "ic2": df[C_IC2_CURRENT].values.astype(float),
         }
         if has_ic3:
             signals["ic3"] = (
-                df[col_ic3a].values.astype(float)
-                + df[col_ic3b].values.astype(float)
-                + df[col_ic3c].values.astype(float)
-                + df[col_ic3d].values.astype(float)
+                df[C_IC3_CURRENT_A].values.astype(float)
+                + df[C_IC3_CURRENT_B].values.astype(float)
+                + df[C_IC3_CURRENT_C].values.astype(float)
+                + df[C_IC3_CURRENT_D].values.astype(float)
             )
 
         e_arr = np.full(len(df), energy)

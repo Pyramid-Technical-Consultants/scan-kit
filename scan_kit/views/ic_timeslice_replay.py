@@ -6,9 +6,11 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 import matplotlib.colors as mcolors
+import matplotlib.ticker as mticker
 from matplotlib.widgets import SpanSelector
 
 from ..common import (
+    C_BEAM_CURRENT,
     C_ENERGY,
     C_IC1_CURRENT,
     C_IC2_CURRENT,
@@ -42,6 +44,28 @@ from ..common import transform
 
 TIMELINE_BINS = 4000
 DETAIL_MAX_POINTS = 80_000
+MS_PER_SLICE = 1.0
+
+
+def _time_axis(ax: plt.Axes, lo_ms: float, hi_ms: float) -> None:
+    """Configure *ax* X-axis to display time with adaptive units and dense ticks."""
+    span_ms = hi_ms - lo_ms
+    if span_ms <= 0:
+        return
+
+    if span_ms > 10_000:
+        scale = 1e-3
+        unit = "s"
+    else:
+        scale = 1.0
+        unit = "ms"
+
+    ax.xaxis.set_major_formatter(mticker.FuncFormatter(
+        lambda v, _: f"{v * scale:.6g}"
+    ))
+    ax.set_xlabel(f"Time ({unit})")
+    ax.xaxis.set_minor_locator(mticker.AutoMinorLocator())
+    ax.tick_params(axis="x", which="minor", length=3)
 
 
 # ---------------------------------------------------------------------------
@@ -88,6 +112,9 @@ def _load_session_timeline(session_id: str, base_dir: str) -> dict | None:
     ts_ic3d = _resolve_col(df0.columns, C_IC3_CURRENT_D)
     has_ic3 = all([ts_ic3a, ts_ic3b, ts_ic3c, ts_ic3d])
 
+    ts_beam = _resolve_col(df0.columns, C_BEAM_CURRENT)
+    has_beam = ts_beam is not None
+
     # Position columns — try G3 key first, then G2
     pos_cols: dict[str, str] = {}
     for pos_key in (POSITION_KEY_G3_RAW, POSITION_KEY_G2_RAW):
@@ -105,6 +132,7 @@ def _load_session_timeline(session_id: str, base_dir: str) -> dict | None:
     ic1_parts: list[np.ndarray] = []
     ic2_parts: list[np.ndarray] = []
     ic3_parts: list[np.ndarray] = []
+    beam_parts: list[np.ndarray] = []
     pos_parts: dict[str, list[np.ndarray]] = {k: [] for k in ("ic1_x", "ic1_y", "ic2_x", "ic2_y")}
     energy_parts: list[np.ndarray] = []
     layer_boundaries: list[tuple[int, float]] = []
@@ -124,6 +152,8 @@ def _load_session_timeline(session_id: str, base_dir: str) -> dict | None:
                 + df[ts_ic3c].values
                 + df[ts_ic3d].values
             )
+        if has_beam:
+            beam_parts.append(df[ts_beam].values.astype(float))
         if has_positions:
             for label, col in pos_cols.items():
                 pos_parts[label].append(df[col].values.astype(float))
@@ -140,11 +170,14 @@ def _load_session_timeline(session_id: str, base_dir: str) -> dict | None:
         "layer_boundaries": layer_boundaries,
         "n_samples": offset,
         "has_ic3": has_ic3,
+        "has_beam": has_beam,
         "has_positions": has_positions,
         "energy": np.concatenate(energy_parts),
     }
     if has_ic3:
         result["ic3"] = np.concatenate(ic3_parts)
+    if has_beam:
+        result["beam"] = np.concatenate(beam_parts)
     if has_positions:
         result["ic1_x"] = transform.remap(np.concatenate(pos_parts["ic1_x"]), *transform.IC1_X_MAP)
         result["ic1_y"] = transform.remap(np.concatenate(pos_parts["ic1_y"]), *transform.IC1_Y_MAP)
@@ -169,12 +202,12 @@ def _compress_minmax(signal: np.ndarray, n_bins: int):
     """
     n = len(signal)
     if n <= n_bins * 2:
-        x = np.arange(n, dtype=float)
+        x = np.arange(n, dtype=float) * MS_PER_SLICE
         return x, signal.copy(), signal.copy()
 
     bin_edges = np.linspace(0, n, n_bins + 1, dtype=int)
     starts = bin_edges[:-1]
-    x = (starts + bin_edges[1:]) * 0.5
+    x = (starts + bin_edges[1:]) * 0.5 * MS_PER_SLICE
 
     safe = np.where(np.isnan(signal), np.inf, signal)
     y_min = np.minimum.reduceat(safe, starts)
@@ -210,6 +243,7 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
     multi = len(loaded_ids) > 1
     max_n = max(d["n_samples"] for d in session_data.values())
     show_ic3 = any(d.get("has_ic3", False) for d in session_data.values())
+    show_beam = any(d.get("has_beam", False) for d in session_data.values())
     show_pos = any(d.get("has_positions", False) for d in session_data.values())
 
     ic_keys: list[str] = ["ic1", "ic2"]
@@ -260,10 +294,12 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
             color=sess_colors[si], label=label,
         )
 
-    ax_timeline.set_xlim(0, max_n)
+    max_t = max_n * MS_PER_SLICE
+    ax_timeline.set_xlim(0, max_t)
     ax_timeline.set_ylabel("IC1", fontsize=8)
-    ax_timeline.set_xlabel("Sample index")
-    ax_timeline.grid(**GRID_KW)
+    _time_axis(ax_timeline, 0, max_t)
+    ax_timeline.grid(**GRID_KW, which="major")
+    ax_timeline.grid(which="minor", color="#e0e0e0", linewidth=0.3)
     ax_timeline.tick_params(labelsize=8)
     if multi:
         ax_timeline.legend(loc="upper right", fontsize=7, ncol=len(loaded_ids))
@@ -271,7 +307,7 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
     for sid_data in session_data.values():
         for offset, _energy in sid_data["layer_boundaries"]:
             if offset > 0:
-                ax_timeline.axvline(offset, color="gray", linewidth=0.3, alpha=0.25)
+                ax_timeline.axvline(offset * MS_PER_SLICE, color="gray", linewidth=0.3, alpha=0.25)
 
     # -- Energy colormap for scatter -------------------------------------------
     all_energies = set()
@@ -284,17 +320,25 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
     norm = mcolors.Normalize(vmin=e_min, vmax=e_max)
 
     # -- Detail + scatter redraw callback --------------------------------------
-    initial_end = min(max_n, max(2000, max_n // 10))
+    initial_end_t = min(max_t, max(2000 * MS_PER_SLICE, max_t / 10))
+    _BEAM_COLOR = "#ff8c00"
+    _beam_twins: list[plt.Axes | None] = [None] * n_detail
 
-    def _draw_detail(xmin: float, xmax: float) -> None:
-        lo = max(0, int(xmin))
-        hi = min(max_n, int(xmax))
+    def _draw_detail(xmin_t: float, xmax_t: float) -> None:
+        lo = max(0, int(xmin_t / MS_PER_SLICE))
+        hi = min(max_n, int(xmax_t / MS_PER_SLICE))
         if hi <= lo:
             return
+        lo_t = lo * MS_PER_SLICE
+        hi_t = hi * MS_PER_SLICE
 
         for ic_idx, (ic, label) in enumerate(zip(ic_keys, ic_labels)):
             ax = ax_detail[ic_idx]
             ax.clear()
+
+            if _beam_twins[ic_idx] is not None:
+                _beam_twins[ic_idx].remove()
+                _beam_twins[ic_idx] = None
 
             for si, (sid, data) in enumerate(session_data.items()):
                 sig = data.get(ic)
@@ -311,41 +355,94 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
 
                 if w_len > DETAIL_MAX_POINTS:
                     step = max(1, w_len // DETAIL_MAX_POINTS)
-                    plot_x = np.arange(a_lo, a_hi, step)
+                    plot_x = np.arange(a_lo, a_hi, step) * MS_PER_SLICE
                     plot_y = window[::step]
                 else:
-                    plot_x = np.arange(a_lo, a_hi)
+                    plot_x = np.arange(a_lo, a_hi) * MS_PER_SLICE
                     plot_y = window
 
                 line_color = sess_colors[si] if multi else ic_detail_colors[ic_idx]
                 ax.plot(
                     plot_x, plot_y,
-                    color=line_color, linewidth=0.5, alpha=0.85,
+                    color=line_color, linewidth=0.5,
                     label=sid if (multi and ic_idx == 0) else None,
                 )
 
+            if show_beam:
+                ax_b = ax.twinx()
+                _beam_twins[ic_idx] = ax_b
+                for si, (sid, data) in enumerate(session_data.items()):
+                    beam = data.get("beam")
+                    if beam is None:
+                        continue
+                    n = len(beam)
+                    a_lo = min(lo, n)
+                    a_hi = min(hi, n)
+                    if a_hi <= a_lo:
+                        continue
+                    b_win = beam[a_lo:a_hi]
+                    w_len = a_hi - a_lo
+                    if w_len > DETAIL_MAX_POINTS:
+                        step = max(1, w_len // DETAIL_MAX_POINTS)
+                        bx = np.arange(a_lo, a_hi, step) * MS_PER_SLICE
+                        by = b_win[::step]
+                    else:
+                        bx = np.arange(a_lo, a_hi) * MS_PER_SLICE
+                        by = b_win
+                    beam_label = f"Beam I ({sid})" if multi else "Beam I"
+                    beam_color = sess_colors[si] if multi else ic_detail_colors[ic_idx]
+                    ax_b.plot(
+                        bx, by,
+                        color=beam_color, linewidth=0.4, linestyle=(0, (4, 3)),
+                        label=beam_label if ic_idx == 0 else None,
+                    )
+                ax_b.set_ylabel("Beam I", fontsize=8)
+                ax_b.tick_params(axis="y", labelsize=7)
+
+                ic_lo, ic_hi = ax.get_ylim()
+                b_lo, b_hi = ax_b.get_ylim()
+                if ic_hi != ic_lo and b_hi != b_lo:
+                    ic_frac = -ic_lo / (ic_hi - ic_lo)
+                    b_frac = -b_lo / (b_hi - b_lo)
+                    if abs(ic_frac - b_frac) > 1e-6:
+                        if ic_frac > b_frac:
+                            new_b_lo = -ic_frac * (b_hi - b_lo) / (1 - ic_frac) if ic_frac < 1 else b_lo
+                            ax_b.set_ylim(new_b_lo, b_hi)
+                        else:
+                            new_b_hi = -b_lo * (1 - ic_frac) / ic_frac if ic_frac > 0 else b_hi
+                            ax_b.set_ylim(b_lo, new_b_hi)
+
             for sid_data in session_data.values():
                 for offset, energy in sid_data["layer_boundaries"]:
-                    if lo < offset < hi:
-                        ax.axvline(offset, color="gray", linewidth=0.5, alpha=0.35)
+                    offset_t = offset * MS_PER_SLICE
+                    if lo_t < offset_t < hi_t:
+                        ax.axvline(offset_t, color="gray", linewidth=0.5, alpha=0.35)
                         if ic_idx == 0:
                             ax.text(
-                                offset, 1.0, f" {energy:g} MeV",
+                                offset_t, 1.0, f" {energy:g} MeV",
                                 transform=ax.get_xaxis_transform(),
                                 fontsize=7, va="top", ha="left",
                                 color="gray", alpha=0.7,
                             )
 
-            ax.set_xlim(lo, hi)
+            ax.set_xlim(lo_t, hi_t)
             ax.set_ylabel(f"{label}", fontsize=9)
-            ax.grid(**GRID_KW)
+            ax.grid(**GRID_KW, which="major")
+            ax.grid(which="minor", color="#e0e0e0", linewidth=0.3)
 
         for a in ax_detail[:-1]:
             plt.setp(a.get_xticklabels(), visible=False)
-        ax_detail[-1].set_xlabel("Sample index")
+        _time_axis(ax_detail[-1], lo_t, hi_t)
+        for a in ax_detail:
+            a.xaxis.set_minor_locator(mticker.AutoMinorLocator())
 
-        if multi:
-            ax_detail[0].legend(loc="upper right", fontsize=8)
+        handles, labels = ax_detail[0].get_legend_handles_labels()
+        if show_beam and _beam_twins[0] is not None:
+            bh, bl = _beam_twins[0].get_legend_handles_labels()
+            handles += bh
+            labels += bl
+        if handles:
+            ax_detail[0].legend(handles, labels, loc="upper right", fontsize=8)
 
         # -- Per-row scatter plots for the same window --------------------------
         if show_pos:
@@ -406,7 +503,7 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
 
         fig.canvas.draw_idle()
 
-    _draw_detail(0, initial_end)
+    _draw_detail(0, initial_end_t)
 
     # -- Interactive brush on the timeline -------------------------------------
     def _on_select(xmin: float, xmax: float) -> None:
@@ -428,7 +525,6 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
             return
         cur_lo, cur_hi = ax_timeline.get_xlim()
         rng = cur_hi - cur_lo
-        # Zoom centred on the cursor position
         cx = event.xdata if event.xdata is not None else (cur_lo + cur_hi) / 2
         if event.button == "up":
             new_rng = rng * _ZOOM_FACTOR
@@ -436,13 +532,13 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
             new_rng = rng / _ZOOM_FACTOR
         else:
             return
-        new_rng = max(new_rng, 50)  # don't zoom past ~50 samples
-        new_rng = min(new_rng, max_n)
+        new_rng = max(new_rng, 50 * MS_PER_SLICE)
+        new_rng = min(new_rng, max_t)
         frac = (cx - cur_lo) / rng if rng > 0 else 0.5
         new_lo = cx - frac * new_rng
         new_hi = cx + (1 - frac) * new_rng
         new_lo = max(0, new_lo)
-        new_hi = min(max_n, new_hi)
+        new_hi = min(max_t, new_hi)
         ax_timeline.set_xlim(new_lo, new_hi)
         fig.canvas.draw_idle()
 

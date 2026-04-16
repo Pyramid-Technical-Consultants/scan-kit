@@ -50,6 +50,7 @@ C_IC3_CURRENT_A = "ic3_current_a"  # G3 only (quad IC3)
 C_IC3_CURRENT_B = "ic3_current_b"  # G3 only
 C_IC3_CURRENT_C = "ic3_current_c"  # G3 only
 C_IC3_CURRENT_D = "ic3_current_d"  # G3 only
+C_BEAM_CURRENT = "beam_current"
 C_IC1_TOTAL_DOSE = "ic1_total_dose"
 C_IC2_TOTAL_DOSE = "ic2_total_dose"
 C_IC3_TOTAL_DOSE = "ic3_total_dose"
@@ -88,6 +89,7 @@ _CONCEPT_ALIASES_STATIC: dict[str, tuple[str, ...]] = {
     C_IC3_CURRENT_B: ("ic3_current_B", "ic3_current_b", "ic3_b_current", "ic3_current_2"),
     C_IC3_CURRENT_C: ("ic3_current_C", "ic3_current_c", "ic3_c_current", "ic3_current_3"),
     C_IC3_CURRENT_D: ("ic3_current_D", "ic3_current_d", "ic3_d_current", "ic3_current_4"),
+    C_BEAM_CURRENT: ("c_beam_current", "c_beamI", "c_beami", "r_beamI", "r_beami", "beam_current", "rci_beam_current", "beam_i"),
     C_IC1_TOTAL_DOSE: ("ic1_total_dose_spot", "ic1_total_dose_spot_raw", "ic1_total_dose", "ic1_dose_spot_raw"),
     C_IC2_TOTAL_DOSE: ("ic2_total_dose_spot", "ic2_total_dose_spot_raw", "ic2_total_dose", "ic2_dose_spot_raw"),
     C_IC3_TOTAL_DOSE: (

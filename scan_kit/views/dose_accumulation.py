@@ -3,15 +3,23 @@
 import logging
 
 import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
 
 from ..common import (
     C_CHARGE_REQ,
     C_ENERGY,
+    C_IC1_CURRENT,
+    C_IC2_CURRENT,
+    C_IC3_CURRENT_A,
+    C_IC3_CURRENT_B,
+    C_IC3_CURRENT_C,
+    C_IC3_CURRENT_D,
     C_IC1_TOTAL_DOSE,
     C_IC2_TOTAL_DOSE,
     C_IC3_TOTAL_DOSE,
     C_LAYER_ID,
+    C_SPOT_NO,
     ViewSettings,
     apply_auto_calibration,
     apply_calibration_factors,
@@ -22,10 +30,63 @@ from ..common import (
 )
 from ..common.session_source import (
     load_session_csv,
+    load_session_timeslice_device_units,
     resolve_session_source,
 )
 
 _log = logging.getLogger(__name__)
+
+_IC_CURRENT_COLS = {
+    "ic1": [C_IC1_CURRENT],
+    "ic2": [C_IC2_CURRENT],
+    "ic3": [C_IC3_CURRENT_A, C_IC3_CURRENT_B, C_IC3_CURRENT_C, C_IC3_CURRENT_D],
+}
+
+
+def _load_timeslice_current_sums(
+    session_id: str, base_dir: str, ic_keys: list[str], n_spots: int,
+) -> dict[str, np.ndarray]:
+    """Sum raw IC current per spot from timeslice data.
+
+    Returns ``{"ic1_current_sum": array, ...}`` with one value per spot,
+    ordered to match the spot_data / input_map row order (layer-by-layer,
+    spot-by-spot within each layer).
+    """
+    src = resolve_session_source(session_id, base_dir)
+    if src is None:
+        return {}
+    frames = load_session_timeslice_device_units(src)
+    if not frames:
+        return {}
+
+    per_ic_lists: dict[str, list[np.ndarray]] = {ic: [] for ic in ic_keys}
+
+    for layer_df in frames:
+        if C_SPOT_NO not in layer_df.columns:
+            continue
+        spot_no = layer_df[C_SPOT_NO]
+        for ic in ic_keys:
+            cur_cols = [c for c in _IC_CURRENT_COLS.get(ic, []) if c in layer_df.columns]
+            if not cur_cols:
+                continue
+            cur_total = layer_df[cur_cols].sum(axis=1)
+            grouped = cur_total.groupby(spot_no, sort=False)
+            spot_ids_ordered = spot_no.drop_duplicates()
+            sums = grouped.sum().reindex(spot_ids_ordered).values.astype(float)
+            per_ic_lists[ic].append(sums)
+
+    result: dict[str, np.ndarray] = {}
+    for ic in ic_keys:
+        parts = per_ic_lists[ic]
+        if not parts:
+            continue
+        arr = np.concatenate(parts)
+        if len(arr) > n_spots:
+            arr = arr[:n_spots]
+        elif len(arr) < n_spots:
+            arr = np.pad(arr, (0, n_spots - len(arr)), constant_values=np.nan)
+        result[f"{ic}_current_sum"] = arr
+    return result
 
 
 def _load_dose_data(session_id: str, base_dir: str) -> dict | None:
@@ -103,6 +164,8 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
                     data = apply_calibration_factors(data, dose_cols, mapped)
                 else:
                     data = apply_auto_calibration(data, "charge_req", dose_cols)
+            ts = _load_timeslice_current_sums(sid, base_dir, data["ic_keys"], data["n"])
+            data.update(ts)
             session_data[sid] = data
 
     if not session_data:
@@ -115,17 +178,25 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
     ic_keys = sorted(all_ic_keys)
     ic_labels = {"ic1": "IC1", "ic2": "IC2", "ic3": "IC3"}
 
+    has_current = any(
+        f"{ic}_current_sum" in d for d in session_data.values() for ic in ic_keys
+    )
+    n_rows = 3 if has_current else 2
     n_cols = len(ic_keys)
     loaded_ids = list(session_data.keys())
     colors = DEFAULT_SESSION_COLORS[: len(loaded_ids)]
 
-    fig, axes = plt.subplots(2, n_cols, figsize=(6 * n_cols, 10), squeeze=False)
+    fig, axes = plt.subplots(
+        n_rows, n_cols, figsize=(6 * n_cols, 5 * n_rows), squeeze=False,
+    )
     fig.suptitle("Dose Accumulation: Expected vs Measured", **SUPTITLE_KW)
 
     for col_idx, ic in enumerate(ic_keys):
         ax_cum = axes[0, col_idx]
         ax_err = axes[1, col_idx]
+        ax_raw = axes[2, col_idx] if has_current else None
         dose_key = f"{ic}_dose"
+        cur_key = f"{ic}_current_sum"
 
         for si, (sid, data) in enumerate(session_data.items()):
             if dose_key not in data:
@@ -144,7 +215,6 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
 
             color = colors[si]
 
-            # Row 0: cumulative dose
             ax_cum.plot(
                 spot_idx, cum_expected,
                 color=color, linewidth=1.2, linestyle="--", alpha=0.7,
@@ -156,7 +226,6 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
                 label=f"{sid} measured" if col_idx == 0 else None,
             )
 
-            # Row 1: cumulative dose error (drift)
             cum_error = cum_measured - cum_expected
             ax_err.plot(
                 spot_idx, cum_error,
@@ -164,14 +233,33 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
                 label=sid if col_idx == 0 else None,
             )
 
-            # Layer boundaries on both rows
+            if ax_raw is not None and cur_key in data:
+                raw_cur = data[cur_key][valid]
+                ok = np.isfinite(raw_cur)
+                if ok.any():
+                    cum_raw = np.cumsum(np.where(ok, raw_cur, 0.0))
+                    total_raw = cum_raw[-1] if cum_raw[-1] != 0 else 1.0
+                    total_dose = cum_measured[-1] if cum_measured[-1] != 0 else 1.0
+                    scale = total_dose / total_raw
+                    ax_raw.plot(
+                        spot_idx, cum_measured,
+                        color=color, linewidth=1.0, alpha=0.5,
+                        label=f"{sid} spot dose" if col_idx == 0 else None,
+                    )
+                    ax_raw.plot(
+                        spot_idx, cum_raw * scale,
+                        color=color, linewidth=1.0, linestyle="--", alpha=0.9,
+                        label=f"{sid} Σ current (scaled)" if col_idx == 0 else None,
+                    )
+
+            all_axes = [ax_cum, ax_err] + ([ax_raw] if ax_raw is not None else [])
             if "layer_id" in data:
                 layer_ids = data["layer_id"][valid]
                 energies = data["energy"][valid]
                 changes = np.where(np.diff(layer_ids.astype(float)) != 0)[0] + 1
                 for ci in changes:
-                    ax_cum.axvline(ci, color="#333333", linewidth=0.5, alpha=0.4)
-                    ax_err.axvline(ci, color="#333333", linewidth=0.5, alpha=0.4)
+                    for ax in all_axes:
+                        ax.axvline(ci, color="#333333", linewidth=0.5, alpha=0.4)
                     if col_idx == 0:
                         ax_cum.text(
                             ci, 1.0, f" {energies[ci]:g} MeV",
@@ -187,14 +275,24 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
         ax_cum.grid(**GRID_KW)
 
         ax_err.set_title(f"{label} — Cumulative Dose Error")
-        ax_err.set_xlabel("Spot index")
+        if not has_current:
+            ax_err.set_xlabel("Spot index")
         if col_idx == 0:
             ax_err.set_ylabel("Cumulative dose error")
         ax_err.axhline(0, color="black", linewidth=0.5, alpha=0.3)
         ax_err.grid(**GRID_KW)
 
+        if ax_raw is not None:
+            ax_raw.set_title(f"{label} — Spot Dose vs Raw Σ Current")
+            ax_raw.set_xlabel("Spot index")
+            if col_idx == 0:
+                ax_raw.set_ylabel("Cumulative dose")
+            ax_raw.grid(**GRID_KW)
+
     axes[0, 0].legend(loc="upper left", fontsize=8)
     axes[1, 0].legend(loc="upper left", fontsize=8)
+    if has_current:
+        axes[2, 0].legend(loc="upper left", fontsize=8)
 
     plt.tight_layout()
     fig.subplots_adjust(top=0.93, hspace=0.25)
