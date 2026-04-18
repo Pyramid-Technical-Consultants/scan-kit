@@ -55,7 +55,7 @@ def _classify_timeslices(signal: np.ndarray):
     return on_mask, off_mask
 
 
-def _load_ic_signals(session_id: str, base_dir: str) -> dict | None:
+def _load_ic_signals(session_id: str, base_dir: str, *, bg_subtract: bool = False) -> dict | None:
     """Load timeslice IC currents and split into beam-on / background."""
     src = resolve_session_source(session_id, base_dir)
     if src is None:
@@ -64,6 +64,9 @@ def _load_ic_signals(session_id: str, base_dir: str) -> dict | None:
     frames = load_session_timeslice_device_units(src)
     if not frames:
         return None
+    if bg_subtract:
+        from ..common import subtract_background_frames
+        subtract_background_frames(frames)
 
     df0 = frames[0]
     ts_ic1 = _resolve_col(df0.columns, C_IC1_CURRENT)
@@ -223,7 +226,8 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
 
     session_data: dict[str, dict] = {}
     for sid in session_ids:
-        data = _load_ic_signals(sid, base_dir)
+        bg = settings.bg_subtract if settings else False
+        data = _load_ic_signals(sid, base_dir, bg_subtract=bg)
         if data is not None:
             session_data[sid] = data
 

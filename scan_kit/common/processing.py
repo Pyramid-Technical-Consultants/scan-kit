@@ -384,3 +384,100 @@ def process_position_data(
             result[col] = data_clean[resolved].values
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# Timeslice signal helpers
+# ---------------------------------------------------------------------------
+
+BG_ROLLING_WINDOW = 200
+DEFAULT_THRESHOLD_FRAC = 0.10
+
+
+def sliding_background(
+    signal: np.ndarray,
+    threshold_frac: float = DEFAULT_THRESHOLD_FRAC,
+    rolling_window: int = BG_ROLLING_WINDOW,
+    beam_off_mask: np.ndarray | None = None,
+):
+    """Compute a per-sample background that tracks drift within a layer.
+
+    Parameters
+    ----------
+    beam_off_mask : optional bool array
+        When provided, only samples where this mask is True **and** the
+        current-threshold condition is met are used for background
+        estimation.  This prevents beam-on residual current from leaking
+        into the background model.
+
+    Returns ``(bg_array, bg_global, peak)`` where *bg_array* has the same
+    length as *signal*.  If the layer is too short or flat, *bg_array* is
+    a constant filled with *bg_global*.
+    """
+    from scipy.ndimage import median_filter
+
+    low_mask = signal <= np.nanpercentile(signal, 25)
+    bg_global = float(
+        np.nanmedian(signal[low_mask]) if low_mask.any() else np.nanpercentile(signal, 25)
+    )
+    peak = float(np.nanpercentile(signal, 99))
+    if peak - bg_global < 1.0:
+        return np.full(len(signal), bg_global), bg_global, peak
+
+    thresh = threshold_frac * (peak - bg_global)
+    beam_off = (signal - bg_global) <= thresh
+    if beam_off_mask is not None:
+        beam_off = beam_off & beam_off_mask
+
+    off_idx = np.where(beam_off)[0]
+    if len(off_idx) >= rolling_window:
+        smoothed = median_filter(signal[off_idx], size=rolling_window, mode="reflect")
+        bg_array = np.interp(np.arange(len(signal)), off_idx, smoothed)
+    else:
+        bg_array = np.full(len(signal), bg_global)
+
+    return bg_array, bg_global, peak
+
+
+_IC_CURRENT_CONCEPTS = [
+    "ic1_current",
+    "ic2_current",
+    "ic3_current_a",
+    "ic3_current_b",
+    "ic3_current_c",
+    "ic3_current_d",
+]
+
+
+def _detect_beam_off_mask(df) -> np.ndarray | None:
+    """Build a boolean mask that is True only when the beam is confirmed off.
+
+    G3 systems: ``rci_in_trigger == 0``
+    G2 systems: ``r_beamOk == 0``
+    """
+    if "rci_in_trigger" in df.columns:
+        return df["rci_in_trigger"].values == 0
+    if "r_beamOk" in df.columns:
+        return df["r_beamOk"].values == 0
+    return None
+
+
+def subtract_background_frames(frames: list) -> list:
+    """Apply sliding background subtraction to IC current columns in-place.
+
+    *frames* is a list of DataFrames as returned by
+    ``load_session_timeslice_device_units``.  Each IC current column is
+    independently background-subtracted using :func:`sliding_background`.
+    A hardware beam-off signal (G3 ``rci_in_trigger``, G2 ``r_beamOk``)
+    is used when available to restrict which samples inform the background.
+    Returns the same list (mutated) for convenience.
+    """
+    for df in frames:
+        beam_off = _detect_beam_off_mask(df)
+        for col in _IC_CURRENT_CONCEPTS:
+            if col not in df.columns:
+                continue
+            raw = df[col].values.astype(float)
+            bg, _, _ = sliding_background(raw, beam_off_mask=beam_off)
+            df[col] = raw - bg
+    return frames

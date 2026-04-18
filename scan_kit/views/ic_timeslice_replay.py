@@ -41,6 +41,7 @@ from ..common.schema import (
     POSITION_KEY_G3_RAW,
 )
 from ..common import transform
+from .beam_off_rampdown import detect_beam_off_edges
 
 TIMELINE_BINS = 4000
 DETAIL_MAX_POINTS = 80_000
@@ -77,7 +78,7 @@ def _resolve_col(columns, concept: str) -> str | None:
     return resolve_concept_column(columns, concept)
 
 
-def _load_session_timeline(session_id: str, base_dir: str) -> dict | None:
+def _load_session_timeline(session_id: str, base_dir: str, *, bg_subtract: bool = False) -> dict | None:
     """Load and concatenate all timeslice frames into a unified timeline."""
     src = resolve_session_source(session_id, base_dir)
     if src is None:
@@ -97,6 +98,9 @@ def _load_session_timeline(session_id: str, base_dir: str) -> dict | None:
     frames = load_session_timeslice_device_units(src)
     if not frames:
         return None
+    if bg_subtract:
+        from ..common import subtract_background_frames
+        subtract_background_frames(frames)
 
     df0 = frames[0]
     ts_layer = _resolve_col(df0.columns, C_LAYER_ID)
@@ -129,13 +133,25 @@ def _load_session_timeline(session_id: str, base_dir: str) -> dict | None:
             break
     has_positions = len(pos_cols) == 4
 
+    # Detect available digital signal columns
+    _DIGITAL_DEFS: list[tuple[str, str, str]] = [
+        ("rci_in_trigger", "rci_in_trigger", "RCI Trigger"),
+        ("r_beamOk", "r_beamOk", "Beam OK"),
+    ]
+    digital_cols: list[tuple[str, str]] = []  # (raw_col, label)
+    for raw_col, canonical, label in _DIGITAL_DEFS:
+        if raw_col in df0.columns:
+            digital_cols.append((raw_col, label))
+
     ic1_parts: list[np.ndarray] = []
     ic2_parts: list[np.ndarray] = []
     ic3_parts: list[np.ndarray] = []
     beam_parts: list[np.ndarray] = []
+    digital_parts: dict[str, list[np.ndarray]] = {col: [] for col, _ in digital_cols}
     pos_parts: dict[str, list[np.ndarray]] = {k: [] for k in ("ic1_x", "ic1_y", "ic2_x", "ic2_y")}
     energy_parts: list[np.ndarray] = []
     layer_boundaries: list[tuple[int, float]] = []
+    edge_indices: dict[str, list[int]] = {"ic1": [], "ic2": [], "ic3": []}
     offset = 0
 
     for df in frames:
@@ -143,17 +159,33 @@ def _load_session_timeline(session_id: str, base_dir: str) -> dict | None:
         layer_id = df[ts_layer].iloc[0]
         energy = energy_by_layer.get(layer_id, 0.0)
 
-        ic1_parts.append(df[ts_ic1].values)
-        ic2_parts.append(df[ts_ic2].values)
+        ic1_vals = df[ts_ic1].values
+        ic2_vals = df[ts_ic2].values
+        ic1_parts.append(ic1_vals)
+        ic2_parts.append(ic2_vals)
+
+        for key, vals in [("ic1", ic1_vals), ("ic2", ic2_vals)]:
+            edges = detect_beam_off_edges(vals)
+            edge_indices[key].extend((edges + offset).tolist())
+
         if has_ic3:
-            ic3_parts.append(
+            ic3_vals = (
                 df[ts_ic3a].values
                 + df[ts_ic3b].values
                 + df[ts_ic3c].values
                 + df[ts_ic3d].values
             )
+            ic3_parts.append(ic3_vals)
+            edges = detect_beam_off_edges(ic3_vals)
+            edge_indices["ic3"].extend((edges + offset).tolist())
+
         if has_beam:
             beam_parts.append(df[ts_beam].values.astype(float))
+        for col, _ in digital_cols:
+            if col in df.columns:
+                digital_parts[col].append(df[col].values.astype(float))
+            else:
+                digital_parts[col].append(np.zeros(n))
         if has_positions:
             for label, col in pos_cols.items():
                 pos_parts[label].append(df[col].values.astype(float))
@@ -164,6 +196,11 @@ def _load_session_timeline(session_id: str, base_dir: str) -> dict | None:
     if offset == 0:
         return None
 
+    digital_signals: dict[str, tuple[np.ndarray, str]] = {}
+    for col, label in digital_cols:
+        if digital_parts[col]:
+            digital_signals[col] = (np.concatenate(digital_parts[col]), label)
+
     result: dict = {
         "ic1": np.concatenate(ic1_parts),
         "ic2": np.concatenate(ic2_parts),
@@ -173,6 +210,8 @@ def _load_session_timeline(session_id: str, base_dir: str) -> dict | None:
         "has_beam": has_beam,
         "has_positions": has_positions,
         "energy": np.concatenate(energy_parts),
+        "beam_off_edges": {k: np.asarray(v, dtype=int) for k, v in edge_indices.items()},
+        "digital": digital_signals,
     }
     if has_ic3:
         result["ic3"] = np.concatenate(ic3_parts)
@@ -230,7 +269,8 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
 
     session_data: dict[str, dict] = {}
     for sid in session_ids:
-        data = _load_session_timeline(sid, base_dir)
+        bg = settings.bg_subtract if settings else False
+        data = _load_session_timeline(sid, base_dir, bg_subtract=bg)
         if data is not None:
             session_data[sid] = data
 
@@ -255,18 +295,25 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
         ic_detail_colors.append("#2ca02c")
 
     n_detail = len(ic_keys)
+    has_digital = any(d.get("digital") for d in session_data.values())
 
     # -- Layout ----------------------------------------------------------------
-    # Each IC row: [line chart | scatter].  Bottom row: timeline spans full width.
+    # Rows: IC detail rows, optional digital row, timeline brush.
     n_cols = 2 if show_pos else 1
     width_ratios = [4, 1] if show_pos else [1]
+
+    n_rows = n_detail + (1 if has_digital else 0) + 1  # +1 for timeline
+    heights = [1] * n_detail
+    if has_digital:
+        heights.append(0.25)
+    heights.append(0.30)
 
     fig = plt.figure(figsize=(22 if show_pos else 18, 10))
     fig.suptitle("IC Timeslice Replay", **SUPTITLE_KW)
 
     gs = gridspec.GridSpec(
-        n_detail + 1, n_cols,
-        height_ratios=[1] * n_detail + [0.30],
+        n_rows, n_cols,
+        height_ratios=heights,
         width_ratios=width_ratios,
         hspace=0.18, wspace=0.04,
         top=0.94, bottom=0.06, left=0.03, right=0.99,
@@ -275,15 +322,24 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
     ax_detail = [fig.add_subplot(gs[0, 0])]
     for i in range(1, n_detail):
         ax_detail.append(fig.add_subplot(gs[i, 0], sharex=ax_detail[0]))
-    ax_timeline = fig.add_subplot(gs[n_detail, :])
+
+    ax_digital: plt.Axes | None = None
+    digital_row = n_detail
+    if has_digital:
+        ax_digital = fig.add_subplot(gs[digital_row, 0], sharex=ax_detail[0])
+        digital_row += 1
+
+    ax_timeline = fig.add_subplot(gs[digital_row, :])
 
     ax_scatter: list[plt.Axes | None] = [None] * n_detail
     if show_pos:
         for i in range(n_detail):
             ax_scatter[i] = fig.add_subplot(gs[i, 1])
 
-    for ax in ax_detail[:-1]:
+    for ax in ax_detail:
         plt.setp(ax.get_xticklabels(), visible=False)
+    if ax_digital is not None:
+        plt.setp(ax_digital.get_xticklabels(), visible=False)
 
     # -- Compressed timeline ---------------------------------------------------
     for si, (sid, data) in enumerate(session_data.items()):
@@ -368,6 +424,15 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
                     label=sid if (multi and ic_idx == 0) else None,
                 )
 
+                edges = data.get("beam_off_edges", {}).get(ic)
+                if edges is not None and len(edges):
+                    vis = edges[(edges >= a_lo) & (edges < a_hi)]
+                    for ei in vis:
+                        ax.axvline(
+                            ei * MS_PER_SLICE, color="red",
+                            linewidth=0.6, alpha=0.55, zorder=1,
+                        )
+
             if show_beam:
                 ax_b = ax.twinx()
                 _beam_twins[ic_idx] = ax_b
@@ -430,11 +495,81 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
             ax.grid(**GRID_KW, which="major")
             ax.grid(which="minor", color="#e0e0e0", linewidth=0.3)
 
-        for a in ax_detail[:-1]:
+        # -- Digital signals row ---------------------------------------------------
+        _DIG_COLORS = ["#e67e22", "#3498db", "#2ecc71", "#9b59b6", "#e74c3c"]
+        if ax_digital is not None:
+            ax_digital.clear()
+
+            all_dig_keys: list[str] = []
+            for data in session_data.values():
+                for k in data.get("digital", {}):
+                    if k not in all_dig_keys:
+                        all_dig_keys.append(k)
+
+            lane_height = 1.15
+            lane_gap = 0.25
+            dig_handles: list = []
+            dig_labels_leg: list[str] = []
+            for lane_i, col_key in enumerate(all_dig_keys):
+                y_base = lane_i * (lane_height + lane_gap)
+                color = _DIG_COLORS[lane_i % len(_DIG_COLORS)]
+                for si, (sid, data) in enumerate(session_data.items()):
+                    entry = data.get("digital", {}).get(col_key)
+                    if entry is None:
+                        continue
+                    arr, label = entry
+                    n = len(arr)
+                    a_lo = min(lo, n)
+                    a_hi = min(hi, n)
+                    if a_hi <= a_lo:
+                        continue
+                    win = arr[a_lo:a_hi]
+                    w_len = a_hi - a_lo
+                    if w_len > DETAIL_MAX_POINTS:
+                        step = max(1, w_len // DETAIL_MAX_POINTS)
+                        px = np.arange(a_lo, a_hi, step) * MS_PER_SLICE
+                        py = win[::step]
+                    else:
+                        px = np.arange(a_lo, a_hi) * MS_PER_SLICE
+                        py = win
+                    sig_max = np.nanmax(np.abs(py)) if len(py) else 1.0
+                    if sig_max > 0:
+                        py = py / sig_max
+                    ax_digital.fill_between(
+                        px, y_base, y_base + py * lane_height,
+                        step="post", alpha=0.55, color=color,
+                        linewidth=0,
+                    )
+                    if lane_i < len(dig_labels_leg):
+                        continue
+                    sig_label = f"{label} ({sid})" if multi else label
+                    dig_labels_leg.append(sig_label)
+                    dig_handles.append(
+                        plt.Rectangle((0, 0), 1, 1, fc=color, alpha=0.55)
+                    )
+
+            n_lanes = len(all_dig_keys) or 1
+            ax_digital.set_xlim(lo_t, hi_t)
+            ax_digital.set_ylim(-0.1, n_lanes * (lane_height + lane_gap))
+            ax_digital.set_yticks([])
+            ax_digital.set_ylabel("Digital", fontsize=8)
+            ax_digital.grid(**GRID_KW, which="major")
+            if dig_handles:
+                ax_digital.legend(
+                    dig_handles, dig_labels_leg,
+                    loc="upper right", fontsize=7, ncol=len(dig_labels_leg),
+                )
+            plt.setp(ax_digital.get_xticklabels(), visible=False)
+
+        for a in ax_detail:
             plt.setp(a.get_xticklabels(), visible=False)
-        _time_axis(ax_detail[-1], lo_t, hi_t)
+        last_detail = ax_digital if ax_digital is not None else ax_detail[-1]
+        _time_axis(last_detail, lo_t, hi_t)
+        plt.setp(last_detail.get_xticklabels(), visible=True)
         for a in ax_detail:
             a.xaxis.set_minor_locator(mticker.AutoMinorLocator())
+        if ax_digital is not None:
+            ax_digital.xaxis.set_minor_locator(mticker.AutoMinorLocator())
 
         handles, labels = ax_detail[0].get_legend_handles_labels()
         if show_beam and _beam_twins[0] is not None:

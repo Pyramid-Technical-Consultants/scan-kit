@@ -61,7 +61,7 @@ def _classify_timeslices(signal: np.ndarray):
     return on_mask, off_mask
 
 
-def _extract_on_off_distributions(session_id: str, base_dir: str):
+def _extract_on_off_distributions(session_id: str, base_dir: str, *, bg_subtract: bool = False):
     """Extract per-timeslice beam-on and beam-off current for each IC.
 
     Returns dict with keys ic1_on, ic1_off, ic2_on, ic2_off, (optionally
@@ -91,6 +91,9 @@ def _extract_on_off_distributions(session_id: str, base_dir: str):
     frames = load_session_timeslice_device_units(src, usecols=_TIMESLICE_COLS)
     if not frames:
         return None
+    if bg_subtract:
+        from ..common import subtract_background_frames
+        subtract_background_frames(frames)
 
     df0 = frames[0].loc[:, ~frames[0].columns.duplicated()]
     if C_IC1_CURRENT not in df0.columns or C_IC2_CURRENT not in df0.columns:
@@ -160,7 +163,8 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
 
     session_data: dict[str, dict] = {}
     for sid in session_ids:
-        data = _extract_on_off_distributions(sid, base_dir)
+        bg = settings.bg_subtract if settings else False
+        data = _extract_on_off_distributions(sid, base_dir, bg_subtract=bg)
         if data is not None:
             session_data[sid] = data
 

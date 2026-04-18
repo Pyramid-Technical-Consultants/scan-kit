@@ -60,6 +60,8 @@ from .processing import (
     add_dose_ratio_columns,
     filter_data_rows,
     add_spot_delivery_time,
+    sliding_background,
+    subtract_background_frames,
 )
 from .plotting import (
     plot_boxplots_for_column,
@@ -164,4 +166,6 @@ __all__ = [
     "add_dose_ratio_columns",
     "filter_data_rows",
     "add_spot_delivery_time",
+    "sliding_background",
+    "subtract_background_frames",
 ]

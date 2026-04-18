@@ -19,6 +19,7 @@ from ..common import (
     GRID_KW,
     REFLINE_KW,
 )
+from ..common import sliding_background
 from ..common.session_source import (
     load_session_csv,
     load_session_timeslice_device_units,
@@ -31,7 +32,7 @@ _log = logging.getLogger(__name__)
 
 # ---- Tweakable window parameters ------------------------------------------
 PRE_OFF_SLICES = 2  # timeslices shown before the falling edge
-POST_OFF_SLICES = 10  # timeslices shown after the falling edge
+POST_OFF_SLICES = 9  # timeslices shown after the falling edge
 MIN_ON_SLICES = 2  # minimum consecutive above-threshold slices right
 # before the falling edge (filters brief spikes)
 THRESHOLD_FRAC = 0.10  # fraction of (peak − background) used to define the
@@ -49,6 +50,56 @@ _TIMESLICE_COLS = [
 ]
 
 
+_sliding_background = sliding_background  # local alias for existing call sites
+
+
+def detect_beam_off_edges(
+    signal: np.ndarray,
+    threshold_frac: float = THRESHOLD_FRAC,
+    min_on_slices: int = MIN_ON_SLICES,
+    post_off_slices: int = POST_OFF_SLICES,
+) -> np.ndarray:
+    """Return sample indices where beam-off ramp-down edges are detected.
+
+    Each returned index is the first *below-threshold* sample after a
+    qualifying falling edge (i.e. the first "off" slice).  The same
+    validation rules used by ``_extract_windows`` apply:
+    * at least *min_on_slices* consecutive beam-on slices before the edge,
+    * the signal stays below the threshold for *post_off_slices* after.
+
+    This is a public utility for overlaying edge markers on other views.
+    """
+    clean = signal
+    if np.isnan(signal).any():
+        clean = signal.copy()
+        clean[np.isnan(clean)] = np.nanmedian(clean)
+
+    bg_array, bg_global, peak = _sliding_background(clean, threshold_frac)
+    if peak - bg_global < 1.0:
+        return np.array([], dtype=int)
+
+    sig = clean - bg_array
+    thresh = threshold_frac * (peak - bg_global)
+    beam_on = sig > thresh
+
+    diff = np.diff(beam_on.astype(np.int8))
+    candidates = np.where(diff == -1)[0] + 1
+    n = len(sig)
+
+    edges: list[int] = []
+    for idx in candidates:
+        anchor = idx - 1
+        end = idx + post_off_slices
+        if anchor - min_on_slices + 1 < 0 or end > n:
+            continue
+        if not np.all(beam_on[anchor - min_on_slices + 1 : idx]):
+            continue
+        if np.any(beam_on[idx:end]):
+            continue
+        edges.append(idx)
+    return np.asarray(edges, dtype=int)
+
+
 def _extract_windows(signal: np.ndarray) -> list[np.ndarray]:
     """Extract qualifying ramp-down windows from one IC signal (one layer).
 
@@ -58,15 +109,14 @@ def _extract_windows(signal: np.ndarray) -> list[np.ndarray]:
     if np.isnan(signal).any():
         signal = signal.copy()
         signal[np.isnan(signal)] = np.nanmedian(signal)
-    low_mask = signal <= np.percentile(signal, 25)
-    bg = np.median(signal[low_mask]) if low_mask.any() else np.percentile(signal, 25)
-    peak = np.percentile(signal, 99)
-    if peak - bg < 1.0:
+
+    bg_array, bg_global, peak = _sliding_background(signal)
+    if peak - bg_global < 1.0:
         return []
 
-    sig = signal - bg
+    sig = signal - bg_array
 
-    thresh = THRESHOLD_FRAC * (peak - bg)
+    thresh = THRESHOLD_FRAC * (peak - bg_global)
     beam_on = sig > thresh
 
     diff = np.diff(beam_on.astype(np.int8))
@@ -74,6 +124,7 @@ def _extract_windows(signal: np.ndarray) -> list[np.ndarray]:
 
     windows: list[np.ndarray] = []
     n = len(sig)
+    rise_tol = thresh * 0.5
 
     for idx in edge_indices:
         anchor = idx - 1
@@ -85,7 +136,14 @@ def _extract_windows(signal: np.ndarray) -> list[np.ndarray]:
             continue
         if np.any(beam_on[idx:end]):
             continue
-        windows.append(sig[start:end])
+        win = sig[start:end].copy()
+        tail = win[PRE_OFF_SLICES + 1:]
+        running_min = np.minimum.accumulate(tail)
+        rise_mask = (tail - running_min) > rise_tol
+        if rise_mask.any():
+            cut = int(np.argmax(rise_mask))
+            tail[cut:] = np.nan
+        windows.append(win)
 
     return windows
 
@@ -94,11 +152,147 @@ def _normalise_windows(windows: list[np.ndarray]) -> np.ndarray | None:
     """Average and normalise a collection of ramp-down windows to 0-100 %."""
     if not windows:
         return None
-    avg = np.mean(windows, axis=0)
+    with np.errstate(all="ignore"):
+        avg = np.nanmean(windows, axis=0)
     pk = np.nanmax(np.abs(avg))
     if pk < 1.0:
         return None
     return (avg / pk) * 100.0
+
+
+def _fit_decay(curve: np.ndarray, t_start_idx: int) -> dict | None:
+    """Fit an exponential decay to a normalised ramp-down curve.
+
+    Parameters
+    ----------
+    curve : array
+        Full window (0-100 % normalised), length ``PRE_OFF_SLICES + POST_OFF_SLICES``.
+    t_start_idx : int
+        Index into *curve* where fitting begins (first fully-off sample).
+
+    Returns a dict with keys ``model``, ``tau`` (or ``tau1``/``tau2``),
+    ``f_3dB``, ``r_squared``, ``fit_t``, ``fit_y``.
+    """
+    from scipy.optimize import curve_fit
+
+    y = curve[t_start_idx:]
+    valid = np.isfinite(y)
+    if valid.sum() < 3:
+        return None
+    t = np.arange(len(y), dtype=float) * MS_PER_SLICE
+    y = y[valid]
+    t = t[valid]
+
+    def _single(t, A, tau, C):
+        return A * np.exp(-t / tau) + C
+
+    def _double(t, A1, tau1, A2, tau2, C):
+        return A1 * np.exp(-t / tau1) + A2 * np.exp(-t / tau2) + C
+
+    ss_tot = np.sum((y - np.mean(y)) ** 2)
+    if ss_tot < 1e-12:
+        return None
+
+    # --- single exponential ---
+    try:
+        p0_s = [y[0], 1.0, 0.0]
+        popt_s, _ = curve_fit(
+            _single, t, y, p0=p0_s,
+            bounds=([0, 0.01, -20], [200, 50, 20]),
+            maxfev=5000,
+        )
+        res_s = y - _single(t, *popt_s)
+        r2_s = 1.0 - np.sum(res_s ** 2) / ss_tot
+    except (RuntimeError, ValueError):
+        r2_s = -1.0
+        popt_s = None
+
+    if popt_s is not None and r2_s >= 0.95:
+        tau = float(popt_s[1])
+        fit_t_full = np.linspace(t[0], t[-1], 200)
+        return {
+            "model": "single",
+            "tau": tau,
+            "f_3dB": 1.0 / (2.0 * np.pi * tau * 1e-3),
+            "r_squared": float(r2_s),
+            "fit_t": fit_t_full + t_start_idx * MS_PER_SLICE,
+            "fit_y": _single(fit_t_full, *popt_s),
+        }
+
+    # --- double exponential fallback ---
+    try:
+        p0_d = [y[0] * 0.7, 0.3, y[0] * 0.3, 2.0, 0.0]
+        popt_d, _ = curve_fit(
+            _double, t, y, p0=p0_d,
+            bounds=([0, 0.01, 0, 0.01, -20], [200, 50, 200, 50, 20]),
+            maxfev=10000,
+        )
+        res_d = y - _double(t, *popt_d)
+        r2_d = 1.0 - np.sum(res_d ** 2) / ss_tot
+    except (RuntimeError, ValueError):
+        r2_d = -1.0
+        popt_d = None
+
+    if popt_d is not None and r2_d > (r2_s if popt_s is not None else -1):
+        A1, tau1, A2, tau2, _C = popt_d
+        if tau1 > tau2:
+            A1, tau1, A2, tau2 = A2, tau2, A1, tau1
+        fit_t_full = np.linspace(t[0], t[-1], 200)
+        return {
+            "model": "double",
+            "tau1": float(tau1),
+            "tau2": float(tau2),
+            "A1": float(A1),
+            "A2": float(A2),
+            "f_3dB_fast": 1.0 / (2.0 * np.pi * float(tau1) * 1e-3),
+            "f_3dB_slow": 1.0 / (2.0 * np.pi * float(tau2) * 1e-3),
+            "r_squared": float(r2_d),
+            "fit_t": fit_t_full + t_start_idx * MS_PER_SLICE,
+            "fit_y": _double(fit_t_full, *popt_d),
+        }
+
+    if popt_s is not None:
+        tau = float(popt_s[1])
+        fit_t_full = np.linspace(t[0], t[-1], 200)
+        return {
+            "model": "single",
+            "tau": tau,
+            "f_3dB": 1.0 / (2.0 * np.pi * tau * 1e-3),
+            "r_squared": float(r2_s),
+            "fit_t": fit_t_full + t_start_idx * MS_PER_SLICE,
+            "fit_y": _single(fit_t_full, *popt_s),
+        }
+    return None
+
+
+MS_PER_SLICE = 1.0
+
+
+def _fit_per_energy_taus(
+    per_energy: dict[float, dict],
+    ic_key: str,
+    t_start_idx: int,
+) -> list[float]:
+    """Collect dominant tau values across all energies for one IC.
+
+    For single-exp fits returns tau; for double-exp returns the
+    amplitude-weighted effective tau.
+    """
+    taus: list[float] = []
+    for energy in sorted(per_energy):
+        curve = per_energy[energy].get(ic_key)
+        if curve is None:
+            continue
+        result = _fit_decay(curve, t_start_idx)
+        if result is None:
+            continue
+        if result["model"] == "single":
+            taus.append(result["tau"])
+        else:
+            A1, tau1 = result["A1"], result["tau1"]
+            A2, tau2 = result["A2"], result["tau2"]
+            taus.append((A1 * tau1 + A2 * tau2) / (A1 + A2))
+    return taus
 
 
 def _extract_rampdown_curves(session_id: str, base_dir: str):
@@ -286,6 +480,67 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
         ax.grid(**GRID_KW)
         ax.xaxis.set_major_locator(MultipleLocator(1))
 
+    # --- Fit decay and annotate Row 0 ---
+    fit_start = PRE_OFF_SLICES + 1  # index into curve; skip t=0 transition
+    t_offset = -PRE_OFF_SLICES  # t_axis[0] value
+
+    for col, (key, label) in enumerate(ic_defs):
+        ax = axes[0, col]
+        annotations: list[str] = []
+
+        for si, sid in enumerate(loaded_ids):
+            curve = session_results[sid]["avg"][key]
+            if curve is None:
+                continue
+            fit = _fit_decay(curve, fit_start)
+            if fit is None:
+                continue
+
+            plot_t = fit["fit_t"] + t_offset
+            ax.plot(
+                plot_t, fit["fit_y"],
+                color=colors[si], linewidth=1.2, linestyle="--", alpha=0.85,
+            )
+
+            if fit["model"] == "single":
+                tau_str = f"\u03C4 = {fit['tau']:.2f} ms"
+                bw_str = f"f_3dB = {fit['f_3dB']:.0f} Hz"
+            else:
+                tau_str = (
+                    f"\u03C4\u2081 = {fit['tau1']:.2f} ms  "
+                    f"\u03C4\u2082 = {fit['tau2']:.2f} ms"
+                )
+                bw_str = (
+                    f"f_3dB = {fit['f_3dB_fast']:.0f} / "
+                    f"{fit['f_3dB_slow']:.0f} Hz"
+                )
+
+            pe_taus = _fit_per_energy_taus(
+                session_results[sid]["per_energy"], key, fit_start,
+            )
+            if pe_taus:
+                spread = (
+                    f"Per-energy \u03C4: {np.mean(pe_taus):.2f} "
+                    f"\u00B1 {np.std(pe_taus):.2f} ms  "
+                    f"(n={len(pe_taus)})"
+                )
+            else:
+                spread = ""
+
+            prefix = f"{sid}: " if len(loaded_ids) > 1 else ""
+            line = f"{prefix}{tau_str}   {bw_str}   R\u00B2={fit['r_squared']:.3f}"
+            if spread:
+                line += f"\n{' ' * len(prefix)}{spread}"
+            annotations.append(line)
+
+        if annotations:
+            ax.text(
+                0.97, 0.55, "\n".join(annotations),
+                transform=ax.transAxes, fontsize=7,
+                va="top", ha="right",
+                bbox=dict(facecolor="white", alpha=0.8, edgecolor="none", pad=2),
+            )
+
     axes[0, 0].legend(loc="upper right", fontsize=8)
 
     # --- Rows 1..N: one heatmap row per session (ramp-down only: t >= 1) ---
@@ -303,7 +558,7 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
                     ramp = c[ramp_start:]
                     heatmap_vals.extend(ramp[np.isfinite(ramp)])
     if heatmap_vals:
-        heat_vmin = float(np.min(heatmap_vals))
+        heat_vmin = 0.0
         heat_vmax = float(np.max(heatmap_vals))
     else:
         heat_vmin, heat_vmax = 0.0, 100.0

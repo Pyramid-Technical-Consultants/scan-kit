@@ -82,7 +82,7 @@ def _resolve_ts_timestamp(df):
     return None
 
 
-def _compute_beam_on_times(session_id: str, base_dir: str):
+def _compute_beam_on_times(session_id: str, base_dir: str, *, bg_subtract: bool = False):
     """Compute beam-on time per spot from timeslice IC1 thresholding.
 
     Loads ALL layers (just like beam_on_off_current) and returns a dict
@@ -95,6 +95,9 @@ def _compute_beam_on_times(session_id: str, base_dir: str):
     frames = load_session_timeslice_device_units(src)
     if not frames:
         return None
+    if bg_subtract:
+        from ..common import subtract_background_frames
+        subtract_background_frames(frames)
 
     df0 = frames[0].loc[:, ~frames[0].columns.duplicated()]
     col_layer = resolve_concept_column(df0.columns, C_LAYER_ID)
@@ -190,7 +193,8 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
         if d is None:
             continue
 
-        beam_on = _compute_beam_on_times(sid, base_dir)
+        bg = settings.bg_subtract if settings else False
+        beam_on = _compute_beam_on_times(sid, base_dir, bg_subtract=bg)
         if beam_on is not None:
             d = _merge_beam_on_times(d, beam_on)
         session_data[sid] = d

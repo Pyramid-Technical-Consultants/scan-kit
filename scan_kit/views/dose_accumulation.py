@@ -24,6 +24,7 @@ from ..common import (
     apply_auto_calibration,
     apply_calibration_factors,
     resolve_concept_column,
+    subtract_background_frames,
     DEFAULT_SESSION_COLORS,
     SUPTITLE_KW,
     GRID_KW,
@@ -45,6 +46,7 @@ _IC_CURRENT_COLS = {
 
 def _load_timeslice_current_sums(
     session_id: str, base_dir: str, ic_keys: list[str], n_spots: int,
+    *, bg_subtract: bool = False,
 ) -> dict[str, np.ndarray]:
     """Sum raw IC current per spot from timeslice data.
 
@@ -58,6 +60,8 @@ def _load_timeslice_current_sums(
     frames = load_session_timeslice_device_units(src)
     if not frames:
         return {}
+    if bg_subtract:
+        subtract_background_frames(frames)
 
     per_ic_lists: dict[str, list[np.ndarray]] = {ic: [] for ic in ic_keys}
 
@@ -164,7 +168,9 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
                     data = apply_calibration_factors(data, dose_cols, mapped)
                 else:
                     data = apply_auto_calibration(data, "charge_req", dose_cols)
-            ts = _load_timeslice_current_sums(sid, base_dir, data["ic_keys"], data["n"])
+            bg = settings.bg_subtract if settings else False
+            ts = _load_timeslice_current_sums(sid, base_dir, data["ic_keys"], data["n"],
+                                              bg_subtract=bg)
             data.update(ts)
             session_data[sid] = data
 

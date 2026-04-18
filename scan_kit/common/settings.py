@@ -15,6 +15,7 @@ CALIBRATION_MODES = ("off", "per_session", "constrained")
 class ViewSettings:
     """Lightweight bag of global settings passed from the TUI to view subprocesses."""
 
+    bg_subtract: bool = False
     calibration_mode: str = "off"
     cal_factors: dict[str, float] | None = None
 
@@ -33,7 +34,7 @@ class ViewSettings:
     def save(self, base_dir: str | Path) -> None:
         path = Path(base_dir) / _FILENAME
         d = asdict(self)
-        d.pop("cal_factors", None)
+        d.pop("cal_factors", None)  # runtime-only, not persisted
         path.write_text(
             json.dumps(d, indent=2, ensure_ascii=False) + "\n",
             encoding="utf-8",

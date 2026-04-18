@@ -120,6 +120,7 @@ class ScanKitApp(App[None]):
     }
     #settings-section { height: auto; padding: 0 }
     .setting-name { color: #888; padding: 0 1; height: 1 }
+    #bg-mode-row { height: 3; width: 100% }
     #cal-mode-row { height: 3; width: 100% }
     .cal-btn {
         width: 1fr; background: #0a0e14; color: #555;
@@ -171,6 +172,8 @@ class ScanKitApp(App[None]):
         self._meta_loading: bool = False
         self._child_procs: list[subprocess.Popen] = []
         self._running_views: dict[str, tuple[subprocess.Popen, str]] = {}
+        self._open_views: dict[str, subprocess.Popen] = {}
+        self._launch_args: dict[str, tuple[list[str], str]] = {}
         self._spinner_frame: int = 0
         self._poll_timer = None
         self._notes: dict[str, str] = {}
@@ -209,6 +212,16 @@ class ScanKitApp(App[None]):
             with VerticalScroll(id="right-panel"):
                 yield Static("SETTINGS", id="settings-label")
                 with Vertical(id="settings-section"):
+                    yield Static("BG Subtraction", classes="setting-name")
+                    with Horizontal(id="bg-mode-row"):
+                        bg_off = Button("Off", id="bg-off", classes="cal-btn")
+                        bg_on = Button("On", id="bg-on", classes="cal-btn")
+                        if self._settings.bg_subtract:
+                            bg_on.add_class("active")
+                        else:
+                            bg_off.add_class("active")
+                        yield bg_off
+                        yield bg_on
                     yield Static("Calibration", classes="setting-name")
                     with Horizontal(id="cal-mode-row"):
                         for mode in CALIBRATION_MODES:
@@ -234,7 +247,26 @@ class ScanKitApp(App[None]):
     def _load_settings(self) -> None:
         """Load settings from disk and sync the UI."""
         self._settings = ViewSettings.load(self._base_dir)
+        self._sync_bg_buttons()
         self._sync_cal_buttons()
+
+    def _sync_bg_buttons(self) -> None:
+        """Highlight the active BG subtraction button."""
+        for suffix, active in [("off", not self._settings.bg_subtract),
+                               ("on", self._settings.bg_subtract)]:
+            try:
+                btn = self.query_one(f"#bg-{suffix}", Button)
+                if active:
+                    btn.add_class("active")
+                else:
+                    btn.remove_class("active")
+            except Exception:
+                pass
+
+    def _set_bg_subtract(self, on: bool) -> None:
+        self._settings.bg_subtract = on
+        self._settings.save(self._base_dir)
+        self._sync_bg_buttons()
 
     def _sync_cal_buttons(self) -> None:
         """Highlight the active calibration mode button."""
@@ -513,6 +545,9 @@ class ScanKitApp(App[None]):
             if mode in _SORT_MODES:
                 self._set_sort(mode)
             return
+        if button_id and button_id.startswith("bg-"):
+            self._set_bg_subtract(button_id == "bg-on")
+            return
         if button_id and button_id.startswith("cal-"):
             mode = button_id.removeprefix("cal-")
             if mode in CALIBRATION_MODES:
@@ -535,7 +570,28 @@ class ScanKitApp(App[None]):
             return
 
         session_ids = list(selected)[:MAX_SESSIONS]
-        base_dir = self._base_dir
+        self._launch_view(module_name, session_ids, self._base_dir)
+
+    # ------------------------------------------------------------------
+    # View subprocess management
+    # ------------------------------------------------------------------
+
+    def _launch_view(
+        self, module_name: str, session_ids: list[str], base_dir: str,
+    ) -> None:
+        """Launch (or re-launch) a single analysis view subprocess."""
+        if module_name in self._open_views:
+            try:
+                self._open_views.pop(module_name).kill()
+            except Exception:
+                pass
+        if module_name in self._running_views:
+            try:
+                self._running_views.pop(module_name)[0].kill()
+            except Exception:
+                pass
+
+        self._launch_args[module_name] = (session_ids, base_dir)
 
         if self._settings.calibration_mode == "constrained":
             from .common.processing import compute_calibration_factors
@@ -545,11 +601,8 @@ class ScanKitApp(App[None]):
         else:
             self._settings.cal_factors = None
 
-        btn = event.button
-        original_label = str(btn.label)
-        env = os.environ.copy()
-
         settings_json = self._settings.to_json()
+        env = os.environ.copy()
 
         if FROZEN:
             cmd = [
@@ -561,20 +614,9 @@ class ScanKitApp(App[None]):
             ]
         else:
             code = (
-                "import matplotlib.pyplot as plt\n"
-                "_real_show = plt.show\n"
-                "def _show(*a, **kw):\n"
-                "    for mgr in plt.get_fignums():\n"
-                "        try: plt.figure(mgr).canvas.manager.window.state('zoomed')\n"
-                "        except Exception:\n"
-                "            try: plt.figure(mgr).canvas.manager.window.showMaximized()\n"
-                "            except Exception: pass\n"
-                f"    print('{_READY_SENTINEL}', flush=True); _real_show(*a, **kw)\n"
-                "plt.show = _show\n"
-                "from scan_kit.common.settings import ViewSettings\n"
-                f"_settings = ViewSettings.from_json({settings_json!r})\n"
-                f"from scan_kit.views.{module_name} import run\n"
-                f"run({session_ids!r}, {base_dir!r}, settings=_settings)"
+                "from scan_kit.common.view_runner import run_with_live_settings;"
+                f"from scan_kit.views.{module_name} import run;"
+                f"run_with_live_settings(run, {session_ids!r}, {base_dir!r}, {settings_json!r})"
             )
             env["PYTHONPATH"] = str(PROJECT_ROOT) + (
                 os.pathsep + env.get("PYTHONPATH", "") if env.get("PYTHONPATH") else ""
@@ -598,8 +640,17 @@ class ScanKitApp(App[None]):
             self.notify(f"Failed to run analysis: {e}", severity="error")
             return
 
+        original_label = next(
+            (name for name, mod, _ in VIEWS if mod == module_name),
+            module_name,
+        )
         self._running_views[module_name] = (proc, original_label)
-        btn.add_class("loading")
+        try:
+            btn = self.query_one(f"#view-{module_name}", Button)
+            btn.label = original_label
+            btn.add_class("loading")
+        except Exception:
+            pass
         self._update_spinner()
         if self._poll_timer is None:
             self._poll_timer = self.set_interval(0.12, self._poll_running_views)
@@ -627,7 +678,7 @@ class ScanKitApp(App[None]):
         try:
             for line in proc.stdout:
                 if _READY_SENTINEL.encode() in line:
-                    self.call_from_thread(self._mark_view_ready, module_name)
+                    self.call_from_thread(self._mark_view_ready, module_name, proc)
                     break
         except Exception:
             pass
@@ -637,18 +688,22 @@ class ScanKitApp(App[None]):
         except Exception:
             pass
 
-    def _mark_view_ready(self, module_name: str) -> None:
+    def _mark_view_ready(self, module_name: str, proc: subprocess.Popen) -> None:
         """Called on the UI thread when a view's plot window has appeared."""
         if module_name not in self._running_views:
             return
-        _proc, original_label = self._running_views.pop(module_name)
+        running_proc, original_label = self._running_views[module_name]
+        if running_proc is not proc:
+            return
+        self._running_views.pop(module_name)
+        self._open_views[module_name] = proc
         try:
             btn = self.query_one(f"#view-{module_name}", Button)
             btn.label = original_label
             btn.remove_class("loading")
         except Exception:
             pass
-        if not self._running_views:
+        if not self._running_views and not self._open_views:
             if self._poll_timer is not None:
                 self._poll_timer.stop()
                 self._poll_timer = None
@@ -681,9 +736,17 @@ class ScanKitApp(App[None]):
                     f"{module_name} failed{detail}", severity="error",
                 )
 
+        closed = [
+            name for name, proc in self._open_views.items()
+            if proc.poll() is not None
+        ]
+        for module_name in closed:
+            self._open_views.pop(module_name)
+            self._launch_args.pop(module_name, None)
+
         if self._running_views:
             self._update_spinner()
-        else:
+        if not self._running_views and not self._open_views:
             if self._poll_timer is not None:
                 self._poll_timer.stop()
                 self._poll_timer = None
@@ -700,6 +763,8 @@ class ScanKitApp(App[None]):
             self._poll_timer.stop()
             self._poll_timer = None
         self._running_views.clear()
+        self._open_views.clear()
+        self._launch_args.clear()
         for proc in self._child_procs:
             try:
                 proc.kill()
@@ -717,26 +782,12 @@ def _run_view_subprocess(
 ) -> None:
     """Execute a single analysis view (used by frozen exe in --run-view mode)."""
     import importlib
-    import matplotlib.pyplot as plt
-
-    _real_show = plt.show
-
-    def _patched_show(*a, **kw):
-        for mgr in plt.get_fignums():
-            try:
-                plt.figure(mgr).canvas.manager.window.state("zoomed")
-            except Exception:
-                try:
-                    plt.figure(mgr).canvas.manager.window.showMaximized()
-                except Exception:
-                    pass
-        print(_READY_SENTINEL, flush=True)
-        _real_show(*a, **kw)
-
-    plt.show = _patched_show
+    from .common.view_runner import run_with_live_settings
 
     mod = importlib.import_module(f"scan_kit.views.{module_name}")
-    mod.run(session_ids, base_dir, settings=settings)
+    if settings is None:
+        settings = ViewSettings()
+    run_with_live_settings(mod.run, session_ids, base_dir, settings.to_json())
 
 
 def main() -> None:
