@@ -9,6 +9,8 @@ from ..common import (
     C_ENERGY,
     C_IC1_CURRENT,
     C_IC2_CURRENT,
+    C_IC1_STRIP_SUM,
+    C_IC2_STRIP_SUM,
     C_IC3_CURRENT_A,
     C_IC3_CURRENT_B,
     C_IC3_CURRENT_C,
@@ -39,14 +41,24 @@ THRESHOLD_FRAC = 0.10  # fraction of (peak − background) used to define the
 # beam-on / beam-off boundary on IC1 current
 # ---------------------------------------------------------------------------
 
+_CONFIDENCE_COLS = {
+    "ic1": ("r_ic1_x_confidence", "r_ic1_y_confidence"),
+    "ic2": ("r_ic2_x_confidence", "r_ic2_y_confidence"),
+    "ic3": ("r_px3_1_confidence",),
+}
+_CONFIDENCE_THRESHOLD = 0.0
+
 _TIMESLICE_COLS = [
     C_LAYER_ID,
     C_IC1_CURRENT,
     C_IC2_CURRENT,
+    C_IC1_STRIP_SUM,
+    C_IC2_STRIP_SUM,
     C_IC3_CURRENT_A,
     C_IC3_CURRENT_B,
     C_IC3_CURRENT_C,
     C_IC3_CURRENT_D,
+    *[c for cols in _CONFIDENCE_COLS.values() for c in cols],
 ]
 
 
@@ -100,11 +112,22 @@ def detect_beam_off_edges(
     return np.asarray(edges, dtype=int)
 
 
-def _extract_windows(signal: np.ndarray) -> list[np.ndarray]:
+def _extract_windows(
+    signal: np.ndarray,
+    beam_on_hint: np.ndarray | None = None,
+) -> list[np.ndarray]:
     """Extract qualifying ramp-down windows from one IC signal (one layer).
 
     Each window is background-subtracted and centred on the last beam-on
     slice (t=0).  Returns a list of raw (not normalised) windows.
+
+    Parameters
+    ----------
+    beam_on_hint : optional bool array
+        External beam-on mask (e.g. from a confidence column).  When
+        provided, edge detection uses this instead of thresholding the
+        signal itself — much more reliable for noisy channels like
+        strip sums.
     """
     if np.isnan(signal).any():
         signal = signal.copy()
@@ -115,9 +138,12 @@ def _extract_windows(signal: np.ndarray) -> list[np.ndarray]:
         return []
 
     sig = signal - bg_array
-
     thresh = THRESHOLD_FRAC * (peak - bg_global)
-    beam_on = sig > thresh
+
+    if beam_on_hint is not None:
+        beam_on = beam_on_hint & (sig > thresh)
+    else:
+        beam_on = sig > thresh
 
     diff = np.diff(beam_on.astype(np.int8))
     edge_indices = np.where(diff == -1)[0] + 1
@@ -137,6 +163,8 @@ def _extract_windows(signal: np.ndarray) -> list[np.ndarray]:
         if np.any(beam_on[idx:end]):
             continue
         win = sig[start:end].copy()
+        if beam_on_hint is not None:
+            np.clip(win, 0.0, None, out=win)
         tail = win[PRE_OFF_SLICES + 1:]
         running_min = np.minimum.accumulate(tail)
         rise_mask = (tail - running_min) > rise_tol
@@ -295,6 +323,18 @@ def _fit_per_energy_taus(
     return taus
 
 
+def _confidence_beam_on(df, ic_key: str) -> np.ndarray | None:
+    """Return a boolean beam-on mask by OR-ing all confidence axes for an IC."""
+    cols = _CONFIDENCE_COLS.get(ic_key, ())
+    present = [c for c in cols if c in df.columns]
+    if not present:
+        return None
+    mask = df[present[0]].values.astype(float) > _CONFIDENCE_THRESHOLD
+    for c in present[1:]:
+        mask = mask | (df[c].values.astype(float) > _CONFIDENCE_THRESHOLD)
+    return mask
+
+
 def _extract_rampdown_curves(session_id: str, base_dir: str):
     """Extract averaged, normalised beam-off ramp-down curves per energy.
 
@@ -354,13 +394,26 @@ def _extract_rampdown_curves(session_id: str, base_dir: str):
             continue
 
         if energy not in windows_by_energy:
-            windows_by_energy[energy] = {"ic1": [], "ic2": [], "ic3": []}
+            windows_by_energy[energy] = {
+                "ic1": [], "ic2": [], "ic1_ss": [], "ic2_ss": [], "ic3": [],
+            }
         bucket = windows_by_energy[energy]
+
+        ic1_hint = _confidence_beam_on(df, "ic1")
+        ic2_hint = _confidence_beam_on(df, "ic2")
 
         if C_IC1_CURRENT in df.columns:
             bucket["ic1"].extend(_extract_windows(df[C_IC1_CURRENT].values))
         if C_IC2_CURRENT in df.columns:
             bucket["ic2"].extend(_extract_windows(df[C_IC2_CURRENT].values))
+        if C_IC1_STRIP_SUM in df.columns:
+            bucket["ic1_ss"].extend(
+                _extract_windows(df[C_IC1_STRIP_SUM].values, beam_on_hint=ic1_hint)
+            )
+        if C_IC2_STRIP_SUM in df.columns:
+            bucket["ic2_ss"].extend(
+                _extract_windows(df[C_IC2_STRIP_SUM].values, beam_on_hint=ic2_hint)
+            )
 
         has_ic3 = all(col in df.columns for col in ic3_cols)
         if has_ic3:
@@ -370,35 +423,28 @@ def _extract_rampdown_curves(session_id: str, base_dir: str):
                 + df[C_IC3_CURRENT_C].values
                 + df[C_IC3_CURRENT_D].values
             )
-            bucket["ic3"].extend(_extract_windows(ic3_sig))
+            ic3_hint = _confidence_beam_on(df, "ic3")
+            bucket["ic3"].extend(_extract_windows(ic3_sig, beam_on_hint=ic3_hint))
+
+    _IC_KEYS = ("ic1", "ic2", "ic1_ss", "ic2_ss", "ic3")
 
     per_energy: dict[float, dict[str, np.ndarray | None]] = {}
-    all_windows: dict[str, list[np.ndarray]] = {"ic1": [], "ic2": [], "ic3": []}
+    all_windows: dict[str, list[np.ndarray]] = {k: [] for k in _IC_KEYS}
 
     for energy, bucket in windows_by_energy.items():
-        c1 = _normalise_windows(bucket["ic1"])
-        c2 = _normalise_windows(bucket["ic2"])
-        c3 = _normalise_windows(bucket["ic3"])
-        if c1 is None and c2 is None and c3 is None:
+        curves = {f"{k}_curve": _normalise_windows(bucket[k]) for k in _IC_KEYS}
+        if all(v is None for v in curves.values()):
             continue
-        per_energy[energy] = {
-            "ic1_curve": c1,
-            "ic2_curve": c2,
-            "ic3_curve": c3,
-        }
-        for ic in ("ic1", "ic2", "ic3"):
-            all_windows[ic].extend(bucket[ic])
+        per_energy[energy] = curves
+        for k in _IC_KEYS:
+            all_windows[k].extend(bucket[k])
 
     if not per_energy:
         return None
 
     return {
         "per_energy": per_energy,
-        "avg": {
-            "ic1_curve": _normalise_windows(all_windows["ic1"]),
-            "ic2_curve": _normalise_windows(all_windows["ic2"]),
-            "ic3_curve": _normalise_windows(all_windows["ic3"]),
-        },
+        "avg": {f"{k}_curve": _normalise_windows(all_windows[k]) for k in _IC_KEYS},
     }
 
 
@@ -421,20 +467,27 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
     loaded_ids = list(session_results.keys())
     colors = DEFAULT_SESSION_COLORS[: len(loaded_ids)]
 
-    ic_defs = [
+    ic_defs_full = [
         ("ic1_curve", "IC1"),
         ("ic2_curve", "IC2"),
         ("ic3_curve", "IC3 (A+B+C+D)"),
+        ("ic1_ss_curve", "IC1 Strip Sum"),
+        ("ic2_ss_curve", "IC2 Strip Sum"),
     ]
-    show_ic3 = any(
-        r["avg"]["ic3_curve"] is not None for r in session_results.values()
-    )
-    if not show_ic3:
-        ic_defs = ic_defs[:2]
+    ic_defs = [
+        (key, label) for key, label in ic_defs_full
+        if any(r["avg"].get(key) is not None for r in session_results.values())
+    ]
+    ic_defs_regular = [
+        (key, label) for (key, label) in ic_defs if not key.endswith("_ss_curve")
+    ]
+    ic_defs_strip = [
+        (key, label) for (key, label) in ic_defs if key.endswith("_ss_curve")
+    ]
+    ic_defs = ic_defs_regular + ic_defs_strip
     n_ic = len(ic_defs)
 
     t_axis = np.arange(-PRE_OFF_SLICES, POST_OFF_SLICES, dtype=float)
-    win_len = PRE_OFF_SLICES + POST_OFF_SLICES
 
     all_energies: set[float] = set()
     for r in session_results.values():
@@ -444,8 +497,22 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
     n_sessions = len(loaded_ids)
     n_rows = 1 + n_sessions  # row 0 = averages, rows 1..N = heatmaps
     height_ratios = [1] + [1.3] * n_sessions
-    n_cols_grid = n_ic + 1  # extra narrow column for the colorbar
-    width_ratios = [1] * n_ic + [0.04]
+    has_middle_regular_cbar = bool(ic_defs_regular and ic_defs_strip)
+    has_strip_cbar = bool(ic_defs_strip)
+    n_color_cols = int(has_middle_regular_cbar) + int(has_strip_cbar)
+    n_cols_grid = n_ic + n_color_cols
+    width_ratios = [1] * len(ic_defs_regular)
+    if has_middle_regular_cbar:
+        width_ratios.append(0.035)
+    width_ratios += [1] * len(ic_defs_strip)
+    if has_strip_cbar:
+        width_ratios.append(0.035)
+
+    plot_cols = list(range(len(ic_defs_regular)))
+    strip_start = len(ic_defs_regular) + (1 if has_middle_regular_cbar else 0)
+    plot_cols += list(range(strip_start, strip_start + len(ic_defs_strip)))
+    middle_cbar_col = len(ic_defs_regular) if has_middle_regular_cbar else None
+    strip_cbar_col = (n_cols_grid - 1) if has_strip_cbar else None
 
     fig, axes = plt.subplots(
         n_rows, n_cols_grid,
@@ -456,10 +523,13 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
     fig.suptitle("Beam-Off Ramp-Down Curves  (normalised to beam-on)", **SUPTITLE_KW)
 
     for row_idx in range(n_rows):
-        axes[row_idx, -1].set_visible(False)
+        if middle_cbar_col is not None:
+            axes[row_idx, middle_cbar_col].set_visible(False)
+        if strip_cbar_col is not None:
+            axes[row_idx, strip_cbar_col].set_visible(False)
 
     # --- Row 0: grand-average per session ---
-    for col, (key, label) in enumerate(ic_defs):
+    for (key, label), col in zip(ic_defs, plot_cols):
         ax = axes[0, col]
         for si, sid in enumerate(loaded_ids):
             curve = session_results[sid]["avg"][key]
@@ -484,7 +554,7 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
     fit_start = PRE_OFF_SLICES + 1  # index into curve; skip t=0 transition
     t_offset = -PRE_OFF_SLICES  # t_axis[0] value
 
-    for col, (key, label) in enumerate(ic_defs):
+    for (key, label), col in zip(ic_defs, plot_cols):
         ax = axes[0, col]
         annotations: list[str] = []
 
@@ -549,19 +619,32 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
     ramp_t = t_axis[ramp_start:]
     ramp_len = len(ramp_t)
 
-    heatmap_vals: list[float] = []
+    regular_keys = {k for k, _ in ic_defs_regular}
+    strip_keys = {k for k, _ in ic_defs_strip}
+
+    heatmap_vals_regular: list[float] = []
+    heatmap_vals_strip: list[float] = []
     for r in session_results.values():
         for pe_data in r["per_energy"].values():
             for key, _ in ic_defs:
                 c = pe_data[key]
                 if c is not None:
                     ramp = c[ramp_start:]
-                    heatmap_vals.extend(ramp[np.isfinite(ramp)])
-    if heatmap_vals:
-        heat_vmin = 0.0
-        heat_vmax = float(np.max(heatmap_vals))
-    else:
-        heat_vmin, heat_vmax = 0.0, 100.0
+                    vals = ramp[np.isfinite(ramp)]
+                    if key in strip_keys:
+                        heatmap_vals_strip.extend(vals)
+                    else:
+                        heatmap_vals_regular.extend(vals)
+    heat_vmin_regular = 0.0
+    heat_vmax_regular = (
+        float(np.max(heatmap_vals_regular))
+        if heatmap_vals_regular else 100.0
+    )
+    heat_vmin_strip = 0.0
+    heat_vmax_strip = (
+        float(np.max(heatmap_vals_strip))
+        if heatmap_vals_strip else 100.0
+    )
 
     for si, sid in enumerate(loaded_ids):
         row = 1 + si
@@ -572,7 +655,7 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
         x_orig = np.arange(ramp_len, dtype=float)
         x_fine = np.linspace(0, ramp_len - 1, ramp_len * _UPSAMPLE_X)
 
-        for col, (key, label) in enumerate(ic_defs):
+        for (key, label), col in zip(ic_defs, plot_cols):
             ax = axes[row, col]
             img = np.full((len(energies), ramp_len), np.nan)
             for ei, e in enumerate(energies):
@@ -590,7 +673,8 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
             ax.imshow(
                 img_smooth, aspect="auto", origin="lower",
                 extent=extent, cmap=heatmap_cmap,
-                vmin=heat_vmin, vmax=heat_vmax,
+                vmin=(heat_vmin_strip if key in strip_keys else heat_vmin_regular),
+                vmax=(heat_vmax_strip if key in strip_keys else heat_vmax_regular),
                 interpolation="nearest",
             )
             if col == 0:
@@ -599,16 +683,41 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
                 ax.set_xlabel("Time after beam-off (ms)")
             ax.xaxis.set_major_locator(MultipleLocator(1))
 
-    cbar_ax = fig.add_subplot(
-        axes[1, -1].get_gridspec()[1:, -1],
-    )
-    cbar_ax.set_visible(True)
-    cbar = fig.colorbar(
-        plt.cm.ScalarMappable(cmap=heatmap_cmap, norm=mcolors.Normalize(heat_vmin, heat_vmax)),
-        cax=cbar_ax,
-    )
-    cbar.set_label("Current (%)")
+    cbar_axes: list = []
+
+    if regular_keys and middle_cbar_col is not None:
+        cbar_ax_regular = fig.add_subplot(
+            axes[1, middle_cbar_col].get_gridspec()[1:, middle_cbar_col],
+        )
+        cbar_ax_regular.set_visible(True)
+        cbar_regular = fig.colorbar(
+            plt.cm.ScalarMappable(
+                cmap=heatmap_cmap,
+                norm=mcolors.Normalize(heat_vmin_regular, heat_vmax_regular),
+            ),
+            cax=cbar_ax_regular,
+        )
+        cbar_regular.set_label("Current (%)")
+        cbar_axes.append(cbar_ax_regular)
+
+    if strip_keys and strip_cbar_col is not None:
+        cbar_ax_strip = fig.add_subplot(
+            axes[1, strip_cbar_col].get_gridspec()[1:, strip_cbar_col],
+        )
+        cbar_ax_strip.set_visible(True)
+        cbar_strip = fig.colorbar(
+            plt.cm.ScalarMappable(
+                cmap=heatmap_cmap,
+                norm=mcolors.Normalize(heat_vmin_strip, heat_vmax_strip),
+            ),
+            cax=cbar_ax_strip,
+        )
+        cbar_strip.set_label("Strip Current (%)")
+        cbar_axes.append(cbar_ax_strip)
 
     plt.tight_layout()
     fig.subplots_adjust(top=0.93)
+    for cbar_ax in cbar_axes:
+        pos = cbar_ax.get_position()
+        cbar_ax.set_position([pos.x0 - 0.006, pos.y0, pos.width, pos.height])
     plt.show()

@@ -50,6 +50,8 @@ C_IC3_CURRENT_A = "ic3_current_a"  # G3 only (quad IC3)
 C_IC3_CURRENT_B = "ic3_current_b"  # G3 only
 C_IC3_CURRENT_C = "ic3_current_c"  # G3 only
 C_IC3_CURRENT_D = "ic3_current_d"  # G3 only
+C_IC1_STRIP_SUM = "ic1_strip_sum"  # G3 IC1 strip-sum ADC channel
+C_IC2_STRIP_SUM = "ic2_strip_sum"  # G3 IC2 strip-sum ADC channel
 C_BEAM_CURRENT = "beam_current"
 C_IC1_TOTAL_DOSE = "ic1_total_dose"
 C_IC2_TOTAL_DOSE = "ic2_total_dose"
@@ -85,7 +87,9 @@ _CONCEPT_ALIASES_STATIC: dict[str, tuple[str, ...]] = {
     # are coulombs per 1 ms timeslice — see _COLUMN_SCALE_FACTORS for conversion.
     C_IC1_CURRENT: ("ic1_primary_channel", "ic1", "ic1_current", "ic1_primary", "r_ic1_current_dose", "r_ic1_current_dose_filt"),
     C_IC2_CURRENT: ("ic2_primary_channel", "ic2", "ic2_current", "ic2_primary", "r_ic2_current_dose", "r_ic2_current_dose_filt"),
-    C_IC3_CURRENT_A: ("ic3_current_A", "ic3_current_a", "ic3_a_current", "ic3_current_1"),
+    C_IC1_STRIP_SUM: ("ic1_strip_sum_channel", "ic1_strip_sum", "ic1_stripsum"),
+    C_IC2_STRIP_SUM: ("ic2_strip_sum_channel", "ic2_strip_sum", "ic2_stripsum"),
+    C_IC3_CURRENT_A: ("ic3_current_A", "ic3_current_a", "ic3_a_current", "ic3_current_1", "r_px3_1_strip_sum"),
     C_IC3_CURRENT_B: ("ic3_current_B", "ic3_current_b", "ic3_b_current", "ic3_current_2"),
     C_IC3_CURRENT_C: ("ic3_current_C", "ic3_current_c", "ic3_c_current", "ic3_current_3"),
     C_IC3_CURRENT_D: ("ic3_current_D", "ic3_current_d", "ic3_d_current", "ic3_current_4"),
@@ -113,7 +117,20 @@ _COLUMN_SCALE_FACTORS: dict[str, float] = {
     "r_ic1_current_dose_filt": 1e12,  # G2 IC1 filtered current — coulombs → nA
     "r_ic2_current_dose":      1e12,  # G2 IC2 current — coulombs → nA
     "r_ic2_current_dose_filt": 1e12,  # G2 IC2 filtered current — coulombs → nA
+    "r_px3_1_strip_sum":       1e12,  # G2 PX3 (IC3 equivalent) — coulombs → nA
 }
+
+# G2 per-axis strip sums that need to be summed into a single canonical column.
+# Each entry: (target_canonical, [raw_source_columns], scale_factor).
+# Only applied when target doesn't already exist (G3 provides it natively).
+_DERIVED_SUM_COLUMNS: list[tuple[str, list[str], float]] = [
+    (C_IC1_STRIP_SUM, ["r_ic1_x_strip_sum", "r_ic1_y_strip_sum"], 1e12),
+    (C_IC2_STRIP_SUM, ["r_ic2_x_strip_sum", "r_ic2_y_strip_sum"], 1e12),
+]
+
+# When G2 PX3 maps to ic3_current_a, the B/C/D quad channels don't exist.
+# Fill them with 0 so downstream code that sums A+B+C+D works transparently.
+_IC3_QUAD_ZERO_FILL = [C_IC3_CURRENT_B, C_IC3_CURRENT_C, C_IC3_CURRENT_D]
 
 
 def _position_key_variants(position_key: str) -> tuple[str, ...]:
@@ -254,5 +271,27 @@ def canonicalize_dataframe_columns(
             factor = _COLUMN_SCALE_FACTORS.get(normalize_column_name(original))
             if factor is not None and factor != 1.0:
                 out[canonical] = pd.to_numeric(out[canonical], errors="coerce") * factor
+
+    # Synthesize derived columns (e.g. G2 per-axis strip sums → combined)
+    cur_cols = set(out.columns)
+    norm_cols = {normalize_column_name(c): c for c in cur_cols}
+
+    for target, sources, factor in _DERIVED_SUM_COLUMNS:
+        if target in cur_cols:
+            continue
+        resolved = [norm_cols.get(normalize_column_name(s)) for s in sources]
+        if all(r is not None for r in resolved):
+            combined = sum(
+                pd.to_numeric(out[r], errors="coerce") for r in resolved
+            )
+            if factor != 1.0:
+                combined = combined * factor
+            out[target] = combined
+
+    # Zero-fill IC3 B/C/D when only A exists (G2 PX3 → ic3_current_a)
+    if C_IC3_CURRENT_A in out.columns:
+        for quad in _IC3_QUAD_ZERO_FILL:
+            if quad not in out.columns:
+                out[quad] = 0.0
 
     return out

@@ -1,4 +1,4 @@
-"""Current ratios vs energy from spot-peak currents (median / mean / filtered)."""
+"""Current ratios vs energy from beam-on mean IC currents."""
 
 import logging
 
@@ -24,6 +24,7 @@ from ..common import (
     SUPTITLE_KW,
 )
 from ..common import subtract_background_frames
+from ..common.processing import _detect_beam_off_mask
 from ..common.session_source import (
     load_session_csv,
     load_session_timeslice_device_units,
@@ -32,7 +33,17 @@ from ..common.session_source import (
 
 _log = logging.getLogger(__name__)
 
-_NOISE_FLOOR_NA = 5.0  # minimum current (nA) to be considered part of a pulse
+# ── Tunable parameters ──────────────────────────────────────────────────
+LOWPASS_ORDER = 2  # Butterworth filter order
+LOWPASS_CUTOFF = 0.07  # cutoff as fraction of Nyquist
+OUTLIER_SIGMA = 2.0  # MAD-sigma multiplier for robust fit rejection
+OUTLIER_ITERATIONS = 3  # robust fit re-weighting passes
+HEATMAP_BINS = 100  # Y-axis histogram bins for beam-on current heatmap
+DISPLAY_P95_FRAC = 0.75  # per-IC floor = p95 * frac, for heatmap/curve display only
+MIN_BEAM_SAMPLES = 10  # min beam-on samples per layer for a valid estimate
+# ─────────────────────────────────────────────────────────────────────────
+
+_MAD_SCALE = 1.4826  # median(|x-m|) * factor matches std for normal distribution
 
 _IC_CURRENT_COLS = {
     "ic1": [C_IC1_CURRENT],
@@ -41,27 +52,35 @@ _IC_CURRENT_COLS = {
 }
 
 
-def _extract_spot_peaks(signal: np.ndarray) -> np.ndarray:
-    """Find peak current of each individual spot pulse in *signal*."""
-    above = signal > _NOISE_FLOOR_NA
-    if not above.any():
-        return np.array([])
-    edges = np.diff(above.astype(np.int8))
-    starts = np.where(edges == 1)[0] + 1
-    stops = np.where(edges == -1)[0] + 1
-    if above[0]:
-        starts = np.concatenate([[0], starts])
-    if above[-1]:
-        stops = np.concatenate([stops, [len(signal)]])
-    peaks = []
-    for s, e in zip(starts, stops):
-        if e - s >= 2:
-            peaks.append(signal[s:e].max())
-    return np.array(peaks, dtype=np.float64)
+def _lowpass(values: np.ndarray, energies: np.ndarray) -> np.ndarray:
+    """Butterworth zero-phase low-pass on values sorted by energy.
+
+    Returns an array aligned with the original layer order.
+    """
+    ok = np.isfinite(energies) & np.isfinite(values)
+    min_ok = 2 * (LOWPASS_ORDER + 1)
+    if ok.sum() < min_ok:
+        return values.copy()
+    sort_idx = np.argsort(energies[ok])
+    vals_sorted = values[ok][sort_idx]
+    b, a = butter(LOWPASS_ORDER, LOWPASS_CUTOFF, btype="low")
+    padlen = min(3 * max(len(a), len(b)), len(vals_sorted) - 1)
+    smoothed_sorted = filtfilt(b, a, vals_sorted, padlen=padlen)
+    out = np.full_like(values, np.nan)
+    out[np.where(ok)[0][sort_idx]] = smoothed_sorted
+    return out
 
 
-def _load_current_ratios(session_id: str, base_dir: str, *, bg_subtract: bool = False) -> dict | None:
-    """Load timeslice data, extract spot peaks per IC/energy, compute median ratios."""
+def _sym_pct(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """Symmetric relative difference in percent."""
+    with np.errstate(divide="ignore", invalid="ignore"):
+        return (a - b) / ((a + b) / 2.0) * 100.0
+
+
+def _load_current_ratios(
+    session_id: str, base_dir: str, *, bg_subtract: bool = False
+) -> dict | None:
+    """Load timeslice data, compute beam-on mean current per IC/energy."""
     src = resolve_session_source(session_id, base_dir)
     if src is None:
         return None
@@ -98,13 +117,15 @@ def _load_current_ratios(session_id: str, base_dir: str, *, bg_subtract: bool = 
     energy_by_layer: dict | None = None
     if col_layer_im is not None:
         unique_layers = input_map[col_layer_im].nunique()
-        if unique_layers > 1:
+        if unique_layers >= 2:
             energy_by_layer = (
                 input_map.groupby(col_layer_im)[col_energy].first().to_dict()
             )
 
     energies_out: list[float] = []
-    ic_spot_peaks: dict[str, list[np.ndarray]] = {ic: [] for ic in ic_keys}
+    ic_beam_mean: dict[str, list[float]] = {ic: [] for ic in ic_keys}
+    ic_disp_mean: dict[str, list[float]] = {ic: [] for ic in ic_keys}
+    ic_beam_samples: dict[str, list[np.ndarray]] = {ic: [] for ic in ic_keys}
 
     for frame_i, df in enumerate(frames):
         energy = None
@@ -119,76 +140,86 @@ def _load_current_ratios(session_id: str, base_dir: str, *, bg_subtract: bool = 
 
         energies_out.append(energy)
 
+        beam_off = _detect_beam_off_mask(df)
+        beam_on = ~beam_off if beam_off is not None else None
+
         for ic in ic_keys:
             cur_cols = [c for c in _IC_CURRENT_COLS[ic] if c in df.columns]
             if not cur_cols:
-                ic_spot_peaks[ic].append(np.array([]))
+                ic_beam_mean[ic].append(np.nan)
+                ic_disp_mean[ic].append(np.nan)
+                ic_beam_samples[ic].append(np.array([]))
                 continue
-            row_sums = df[cur_cols].sum(axis=1).to_numpy(dtype=np.float64, na_value=0.0)
-            row_sums[~np.isfinite(row_sums)] = 0.0
-            ic_spot_peaks[ic].append(_extract_spot_peaks(row_sums))
+            sig = df[cur_cols].sum(axis=1).to_numpy(dtype=np.float64, na_value=0.0)
+            sig[~np.isfinite(sig)] = 0.0
+
+            if beam_on is None or beam_on.sum() < MIN_BEAM_SAMPLES:
+                ic_beam_mean[ic].append(np.nan)
+                ic_disp_mean[ic].append(np.nan)
+                ic_beam_samples[ic].append(np.array([]))
+                continue
+
+            on_samples = sig[beam_on]
+
+            # Ratio mean: full hardware beam-on window.  ICs are phase-
+            # shifted ~1-2 samples; cross-IC filtering is invalid but the
+            # inter-spot zeros cancel identically in the ratio.
+            ic_beam_mean[ic].append(float(np.mean(on_samples)))
+
+            # Display: self-reflected p95 floor isolates the beam-current
+            # cluster for heatmap and curve visualisation only.
+            p95 = float(np.nanpercentile(on_samples, 95))
+            floor = max(5.0, p95 * DISPLAY_P95_FRAC)
+            beam_cluster = on_samples[on_samples >= floor]
+            if len(beam_cluster) >= 3:
+                ic_disp_mean[ic].append(float(np.mean(beam_cluster)))
+                ic_beam_samples[ic].append(beam_cluster)
+            else:
+                ic_disp_mean[ic].append(np.nan)
+                ic_beam_samples[ic].append(np.array([]))
 
     if not energies_out:
         return None
 
-    n_layers = len(energies_out)
-    _MIN_SPOTS = 3
     energy_arr = np.array(energies_out, dtype=float)
-
-    def _per_layer(ic, agg):
-        """Per-layer point estimate (median or mean)."""
-        out = np.full(n_layers, np.nan)
-        for i in range(n_layers):
-            pk = ic_spot_peaks[ic][i]
-            if len(pk) < _MIN_SPOTS:
-                continue
-            out[i] = float(agg(pk))
-        return out
-
-    def _filtfilt_curve(ic, cutoff=0.08, order=2):
-        """Zero-phase Butterworth low-pass on per-energy medians.
-
-        Data is sorted by energy before filtering and mapped back so
-        the result aligns with the original layer order.
-        """
-        medians = _per_layer(ic, np.median)
-        ok = np.isfinite(energy_arr) & np.isfinite(medians)
-        if ok.sum() < 2 * (order + 1):
-            return medians
-        sort_idx = np.argsort(energy_arr[ok])
-        vals_sorted = medians[ok][sort_idx]
-        b, a = butter(order, cutoff, btype="low")
-        padlen = min(3 * max(len(a), len(b)), len(vals_sorted) - 1)
-        filtered = filtfilt(b, a, vals_sorted, padlen=padlen)
-        smoothed = np.full(n_layers, np.nan)
-        out_slots = np.where(ok)[0]
-        smoothed[out_slots[sort_idx]] = filtered
-        return smoothed
 
     result: dict = {"energy": pd.Series(energies_out, dtype=float)}
     for ic in ic_keys:
-        result[f"{ic}_spot_peaks"] = ic_spot_peaks[ic]
+        raw = np.array(ic_beam_mean[ic], dtype=float)
+        filt = _lowpass(raw, energy_arr)
+        result[f"{ic}_raw"] = raw
+        result[f"{ic}_filt"] = filt
 
-    estimators = {
-        "median": lambda ic: _per_layer(ic, np.median),
-        "mean":   lambda ic: _per_layer(ic, np.mean),
-        "filt":   lambda ic: _filtfilt_curve(ic),
-    }
+        disp = np.array(ic_disp_mean[ic], dtype=float)
+        disp_filt = _lowpass(disp, energy_arr)
+        result[f"{ic}_disp"] = disp
+        result[f"{ic}_disp_filt"] = disp_filt
+        result[f"{ic}_beam_samples"] = ic_beam_samples[ic]
 
-    for method, est_fn in estimators.items():
-        v1 = est_fn("ic1")
-        v2 = est_fn("ic2")
-        result[f"ic1_{method}"] = v1
-        result[f"ic2_{method}"] = v2
-        with np.errstate(divide="ignore", invalid="ignore"):
-            result[f"ic21_{method}"] = (v2 - v1) / ((v2 + v1) / 2.0) * 100.0
-            if "ic3" in ic_keys:
-                v3 = est_fn("ic3")
-                result[f"ic3_{method}"] = v3
-                result[f"ic31_{method}"] = (v3 - v1) / ((v3 + v1) / 2.0) * 100.0
-                result[f"ic32_{method}"] = (v3 - v2) / ((v3 + v2) / 2.0) * 100.0
+    # Ratios use the plateau-beam means so they are self-consistent with
+    # the curves drawn on top of the heatmaps.  The plateau ratio is the
+    # steady-state gain ratio and is not distorted by per-IC response-shape
+    # differences during spot ramp-up / ramp-down.
+    v1_raw = result["ic1_disp"]
+    v2_raw = result["ic2_disp"]
+    v1_filt = result["ic1_disp_filt"]
+    v2_filt = result["ic2_disp_filt"]
+
+    result["ic21_raw"] = _sym_pct(v2_raw, v1_raw)
+    result["ic21_filt"] = _sym_pct(v2_filt, v1_filt)
+
+    if "ic3" in ic_keys:
+        v3_raw = result["ic3_disp"]
+        v3_filt = result["ic3_disp_filt"]
+        result["ic31_raw"] = _sym_pct(v3_raw, v1_raw)
+        result["ic31_filt"] = _sym_pct(v3_filt, v1_filt)
+        result["ic32_raw"] = _sym_pct(v3_raw, v2_raw)
+        result["ic32_filt"] = _sym_pct(v3_filt, v2_filt)
 
     return result
+
+
+# ── Plotting helpers ─────────────────────────────────────────────────────
 
 
 def _trend_line_color(face_color):
@@ -199,12 +230,6 @@ def _trend_line_color(face_color):
     return tuple(max(0.0, c * 0.55) for c in rgb)
 
 
-_METHODS = [
-    ("filt",   "Filtered"),
-    ("median", "Median"),
-    ("mean",   "Mean"),
-]
-
 _RATIO_PAIRS = [
     ("ic21", "IC2 / IC1", "ic1", "ic2"),
     ("ic31", "IC3 / IC1", "ic1", "ic3"),
@@ -212,52 +237,46 @@ _RATIO_PAIRS = [
 ]
 
 _HEATMAP_ICS = ["ic1", "ic2", "ic3"]
-_HEATMAP_NBINS_Y = 50
+_IC_MARKERS = {"ic1": "o", "ic2": "s", "ic3": "D"}
 
 
-def _plot_current_heatmap(ax, session_data, ic_name: str, loaded_ids, sess_colors):
-    """2D heatmap of per-spot peak current vs energy for one IC, all sessions.
-
-    X = energy (MeV), Y = peak current (nA), colour = probability density
-    normalised per energy column.  A polynomial fit line is drawn per session.
-    """
-    peaks_key = f"{ic_name}_spot_peaks"
+def _plot_heatmap(ax, session_data, ic_name: str, loaded_ids, sess_colors):
+    """Beam-on current density heatmap with Butterworth-filtered mean overlay."""
+    samples_key = f"{ic_name}_beam_samples"
+    filt_key = f"{ic_name}_disp_filt"
 
     combined: dict[float, list[float]] = {}
-    per_session: dict[str, dict[float, list[float]]] = {}
-
     for sid in loaded_ids:
         data = session_data.get(sid)
         if data is None:
             continue
         energies = np.asarray(data["energy"], dtype=float)
-        peaks_list = data.get(peaks_key, [])
-        sess_dict: dict[float, list[float]] = {}
+        samples_list = data.get(samples_key, [])
         for i, e in enumerate(energies):
             if not np.isfinite(e):
                 continue
-            if i < len(peaks_list) and len(peaks_list[i]) > 0:
-                combined.setdefault(e, []).extend(peaks_list[i])
-                sess_dict.setdefault(e, []).extend(peaks_list[i])
-        per_session[sid] = sess_dict
+            if i < len(samples_list) and len(samples_list[i]) > 0:
+                combined.setdefault(e, []).extend(samples_list[i])
 
     if not combined:
-        ax.set_ylabel("Peak Current (nA)")
+        ax.set_ylabel(f"{ic_name.upper()} (nA)")
         ax.grid(visible=True, alpha=0.3)
         return
 
     unique_e = np.sort(np.array(list(combined.keys())))
     if len(unique_e) < 2:
-        ax.set_ylabel("Peak Current (nA)")
+        ax.set_ylabel(f"{ic_name.upper()} (nA)")
         return
 
-    all_peaks = np.concatenate(list(combined.values()))
-    y_lo = max(0, np.percentile(all_peaks, 0.5) * 0.8)
-    y_hi = np.percentile(all_peaks, 99.5) * 1.15
-    y_edges = np.linspace(y_lo, y_hi, _HEATMAP_NBINS_Y + 1)
+    all_vals = np.concatenate(list(combined.values()))
+    y_lo = max(0.0, np.nanpercentile(all_vals, 1) * 0.8)
+    y_hi = np.nanpercentile(all_vals, 99) * 1.15
+    if y_hi <= y_lo:
+        y_hi = y_lo + 1.0
+    y_edges = np.linspace(y_lo, y_hi, HEATMAP_BINS + 1)
     y_centers = 0.5 * (y_edges[:-1] + y_edges[1:])
 
-    density = np.zeros((len(unique_e), _HEATMAP_NBINS_Y))
+    density = np.zeros((len(unique_e), HEATMAP_BINS))
     for col_i, e in enumerate(unique_e):
         vals = np.array(combined[e])
         h, _ = np.histogram(vals, bins=y_edges)
@@ -266,35 +285,74 @@ def _plot_current_heatmap(ax, session_data, ic_name: str, loaded_ids, sess_color
             density[col_i] = h / total
 
     im = ax.pcolormesh(
-        unique_e, y_centers, density.T,
-        cmap="turbo", shading="nearest", zorder=1,
+        unique_e,
+        y_centers,
+        density.T,
+        cmap="turbo",
+        shading="nearest",
+        zorder=1,
     )
     ax.figure.colorbar(im, ax=ax, pad=0.02, aspect=30, label="P(I)")
 
     for si, sid in enumerate(loaded_ids):
-        sess_dict = per_session.get(sid, {})
-        me, mv = [], []
-        for e in sorted(sess_dict):
-            vals = sess_dict[e]
-            if len(vals) >= 3:
-                me.append(e)
-                mv.append(float(np.median(vals)))
-        if len(me) >= 6:
-            mv_a = np.array(mv)
-            b, a = butter(2, 0.08, btype="low")
-            padlen = min(3 * max(len(a), len(b)), len(mv_a) - 1)
-            mv_filt = filtfilt(b, a, mv_a, padlen=padlen)
-            ax.plot(me, mv_filt,
-                    color=sess_colors[si], linewidth=1.5, linestyle="--",
-                    alpha=0.7, zorder=4, label=sid)
+        data = session_data.get(sid)
+        if data is None:
+            continue
+        e = np.asarray(data["energy"], dtype=float)
+        filt = np.asarray(data.get(filt_key, []), dtype=float)
+        ok = np.isfinite(e) & np.isfinite(filt)
+        if ok.sum() < 2:
+            continue
+        sort = np.argsort(e[ok])
+        ax.plot(
+            e[ok][sort],
+            filt[ok][sort],
+            color=sess_colors[si],
+            linewidth=1.5,
+            linestyle="--",
+            alpha=0.7,
+            zorder=4,
+            label=sid,
+        )
 
-    ax.set_ylabel(f"{ic_name.upper()} Peak (nA)")
+    ax.set_ylabel(f"{ic_name.upper()} Beam Current (nA)")
     ax.set_facecolor("black")
     ax.legend(fontsize=7, loc="upper left")
 
 
-def _plot_ratio_vs_energy(ax, session_data, ratio_key, loaded_ids, colors):
-    """Scatter + trend line of one ratio value per energy layer."""
+def _plot_ic_pair(ax, session_data, ic_a, ic_b, loaded_ids, sess_colors):
+    """Overlay the two filtered IC curves that form a ratio pair."""
+    n_sessions = len(loaded_ids)
+    for si, sid in enumerate(loaded_ids):
+        data = session_data.get(sid)
+        if data is None:
+            continue
+        e = np.asarray(data["energy"], dtype=float)
+        for ic_name in (ic_a, ic_b):
+            disp = np.asarray(data.get(f"{ic_name}_disp_filt", []), dtype=float)
+            ok = np.isfinite(e) & np.isfinite(disp)
+            if not ok.any():
+                continue
+            marker = _IC_MARKERS.get(ic_name, "o")
+            label = f"{ic_name.upper()} ({sid})" if n_sessions > 1 else ic_name.upper()
+            ax.scatter(
+                e[ok],
+                disp[ok],
+                c=sess_colors[si],
+                s=14,
+                alpha=0.7,
+                marker=marker,
+                edgecolors="none",
+                zorder=3,
+                label=label,
+            )
+    ax.set_ylabel("Beam Current (nA)")
+    ax.legend(fontsize=7, loc="upper left")
+    ax.grid(visible=True, alpha=0.3)
+
+
+def _plot_ratio(ax, session_data, ratio_key, loaded_ids, colors):
+    """Scatter + robust trend line of ratio vs energy."""
     n_sessions = len(loaded_ids)
     slope_labels: list[tuple[str, tuple]] = []
 
@@ -313,33 +371,46 @@ def _plot_ratio_vs_energy(ax, session_data, ratio_key, loaded_ids, colors):
 
         if e.size >= 2:
             keep = np.ones(e.size, dtype=bool)
-            for _ in range(3):
+            for _ in range(OUTLIER_ITERATIONS):
                 if keep.sum() < 3:
                     break
                 slope, intercept = np.polyfit(e[keep], r[keep], 1)
                 resid = r - (slope * e + intercept)
                 med = np.median(resid[keep])
-                sigma = np.median(np.abs(resid[keep] - med)) * 1.4826
+                sigma = np.median(np.abs(resid[keep] - med)) * _MAD_SCALE
                 if sigma < 1e-12:
                     break
-                keep = np.abs(resid - med) <= 2.0 * sigma
+                keep = np.abs(resid - med) <= OUTLIER_SIGMA * sigma
 
             slope, intercept = np.polyfit(e[keep], r[keep], 1)
 
             rejected = ~keep
             if rejected.any():
-                ax.scatter(e[rejected], r[rejected], c=colors[si], s=18,
-                           alpha=0.25, edgecolors="red", linewidths=0.8,
-                           zorder=2)
+                ax.scatter(
+                    e[rejected],
+                    r[rejected],
+                    c=colors[si],
+                    s=18,
+                    alpha=0.25,
+                    edgecolors="red",
+                    linewidths=0.8,
+                    zorder=2,
+                )
 
             e_range = np.array([e.min(), e.max()])
             line_color = _trend_line_color(colors[si])
-            ax.plot(e_range, slope * e_range + intercept, color=line_color,
-                    linewidth=2.0, linestyle="-", zorder=4)
+            ax.plot(
+                e_range,
+                slope * e_range + intercept,
+                color=line_color,
+                linewidth=2.0,
+                linestyle="-",
+                zorder=4,
+            )
             fit_delta = slope * (e.max() - e.min())
             prefix = f"{sid}: " if n_sessions > 1 else ""
             slope_labels.append(
-                (f"{prefix}{slope:+.4g} %/MeV  (Δ {fit_delta:+.3g}%)", line_color)
+                (f"{prefix}{slope:+.4g} %/MeV  (\u0394 {fit_delta:+.3g}%)", line_color)
             )
 
     if slope_labels:
@@ -348,35 +419,14 @@ def _plot_ratio_vs_energy(ax, session_data, ratio_key, loaded_ids, colors):
     ax.grid(visible=True, alpha=0.3)
 
 
-_IC_MARKERS = {"ic1": "o", "ic2": "s", "ic3": "D"}
+# ── Main entry point ─────────────────────────────────────────────────────
 
-
-def _plot_filtered_pair(ax, session_data, ic_a, ic_b, method, loaded_ids, sess_colors):
-    """Plot the two filtered IC curves that form a ratio, instead of the ratio itself."""
-    n_sessions = len(loaded_ids)
-
-    for si, sid in enumerate(loaded_ids):
-        data = session_data.get(sid)
-        if data is None:
-            continue
-        e = np.asarray(data["energy"], dtype=float)
-
-        for ic_name in (ic_a, ic_b):
-            key = f"{ic_name}_{method}"
-            if key not in data:
-                continue
-            vals = np.asarray(data[key], dtype=float)
-            ok = np.isfinite(e) & np.isfinite(vals)
-            if not ok.any():
-                continue
-            marker = _IC_MARKERS.get(ic_name, "o")
-            label = f"{ic_name.upper()} ({sid})" if n_sessions > 1 else ic_name.upper()
-            ax.scatter(e[ok], vals[ok], c=sess_colors[si], s=14, alpha=0.7,
-                       marker=marker, edgecolors="none", zorder=3, label=label)
-
-    ax.set_ylabel("Filtered Peak (nA)")
-    ax.legend(fontsize=7, loc="upper left")
-    ax.grid(visible=True, alpha=0.3)
+_COL_DEFS = [
+    ("heatmap", "Beam-On Distribution", 3),
+    ("ic_pair", "IC Curves (filtered)", 3),
+    ("raw", "\u0394% (raw)", 3),
+    ("filt", "\u0394% (filtered)", 3),
+]
 
 
 def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -> None:
@@ -397,32 +447,24 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
         return
 
     loaded_ids = list(session_data.keys())
-    colors = DEFAULT_SESSION_COLORS[:len(loaded_ids)]
+    colors = DEFAULT_SESSION_COLORS[: len(loaded_ids)]
 
-    has_ic3 = any("ic31_median" in d for d in session_data.values())
+    has_ic3 = any("ic31_raw" in d for d in session_data.values())
     n_ratio_rows = 3 if has_ic3 else 1
     n_heatmap_rows = 3 if has_ic3 else 2
     n_rows = max(n_ratio_rows, n_heatmap_rows)
-    n_methods = len(_METHODS)
-    n_cols = 1 + n_methods  # heatmap + method columns
-
-    # Column order: heatmap, filtered, median, mean
-    col_order = [("heatmap", "Peak Distribution", 2)]
-    for mi, (mk, ml) in enumerate(_METHODS):
-        col_order.append((mk, ml, 3))
+    n_cols = len(_COL_DEFS)
 
     fig, axes = plt.subplots(
-        n_rows, n_cols,
-        figsize=(5 * n_cols, 3.5 * n_rows + 1),
+        n_rows,
+        n_cols,
+        figsize=(5.0 * n_cols, 3.5 * n_rows + 1.0),
         squeeze=False,
-        width_ratios=[w for _, _, w in col_order],
+        width_ratios=[w for _, _, w in _COL_DEFS],
     )
-    fig.suptitle(
-        "Current Ratios vs Energy  (heatmap · filtered · median · mean)",
-        **SUPTITLE_KW,
-    )
+    fig.suptitle("Current Ratios vs Energy  (plateau mean)", **SUPTITLE_KW)
 
-    session_data_g3 = {k: v for k, v in session_data.items() if "ic31_median" in v}
+    session_data_g3 = {k: v for k, v in session_data.items() if "ic31_raw" in v}
     colors_g3 = [colors[loaded_ids.index(sid)] for sid in session_data_g3]
 
     row_data = [
@@ -441,22 +483,22 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
         else:
             sdata, sids, scols = session_data, loaded_ids, colors
 
-        for ci, (col_key, col_label, _) in enumerate(col_order):
+        for ci, (col_key, col_label, _) in enumerate(_COL_DEFS):
             ax = axes[row, ci]
 
             if col_key == "heatmap":
-                _plot_current_heatmap(ax, sdata, _HEATMAP_ICS[row], sids, scols)
-            elif col_key == "filt":
+                _plot_heatmap(ax, sdata, _HEATMAP_ICS[row], sids, scols)
+            elif col_key == "ic_pair":
                 if has_ratio and sdata:
-                    _plot_filtered_pair(ax, sdata, ic_a, ic_b, col_key, sids, scols)
-                    ax.set_ylabel(f"{pair_label}  filtered (nA)")
+                    _plot_ic_pair(ax, sdata, ic_a, ic_b, sids, scols)
+                    ax.set_ylabel(f"{pair_label}  (nA)")
                 else:
                     ax.set_visible(False)
-            else:
+            elif col_key in ("raw", "filt"):
                 if has_ratio and sdata:
                     ratio_key = f"{pair_key}_{col_key}"
-                    _plot_ratio_vs_energy(ax, sdata, ratio_key, sids, scols)
-                    ax.set_ylabel(f"{pair_label}  Δ% ({col_label})")
+                    _plot_ratio(ax, sdata, ratio_key, sids, scols)
+                    ax.set_ylabel(f"{pair_label}  {col_label}")
                     pct_axes.append(ax)
                 else:
                     ax.set_visible(False)
@@ -472,7 +514,6 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
         for ax in pct_axes:
             ax.set_ylim(y_lo, y_hi)
 
-    # Put session legend on the first ratio column
     legend_ax = next((ax for ax in pct_axes if ax.get_visible()), axes[0, 0])
     make_session_legend(legend_ax, loaded_ids, colors)
 

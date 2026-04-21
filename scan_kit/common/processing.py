@@ -442,6 +442,8 @@ def sliding_background(
 _IC_CURRENT_CONCEPTS = [
     "ic1_current",
     "ic2_current",
+    "ic1_strip_sum",
+    "ic2_strip_sum",
     "ic3_current_a",
     "ic3_current_b",
     "ic3_current_c",
@@ -449,16 +451,28 @@ _IC_CURRENT_CONCEPTS = [
 ]
 
 
-def _detect_beam_off_mask(df) -> np.ndarray | None:
+def _detect_beam_off_mask(df, *, strict: bool = False) -> np.ndarray | None:
     """Build a boolean mask that is True only when the beam is confirmed off.
 
-    G3 systems: ``rci_in_trigger == 0``
-    G2 systems: ``r_beamOk == 0``
+    With ``strict=False`` (default) only the spill-level gate is used:
+        G3: ``rci_in_trigger == 0``
+        G2: ``r_beamOk == 0``
+
+    With ``strict=True`` the extraction/enable signal is AND-ed in, giving
+    interspill (spot-level) masking:
+        G3: ``rci_in_trigger == 0  OR  rci_out_kicker == 0``
+        G2: ``r_beamOk == 0  OR  r_beamEnabled == 0``
     """
     if "rci_in_trigger" in df.columns:
-        return df["rci_in_trigger"].values == 0
+        off = df["rci_in_trigger"].values == 0
+        if strict and "rci_out_kicker" in df.columns:
+            off = off | (df["rci_out_kicker"].values == 0)
+        return off
     if "r_beamOk" in df.columns:
-        return df["r_beamOk"].values == 0
+        off = df["r_beamOk"].values == 0
+        if strict and "r_beamEnabled" in df.columns:
+            off = off | (df["r_beamEnabled"].values == 0)
+        return off
     return None
 
 

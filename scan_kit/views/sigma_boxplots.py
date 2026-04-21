@@ -8,8 +8,10 @@ from matplotlib.patches import Patch
 from ..common import (
     load_session_raw,
     create_valid_mask,
+    resolve_concept_column,
+    C_ENERGY,
     DEFAULT_SESSION_COLORS,
-    FIG_SIZE_SINGLE,
+    FIG_SIZE_2x2,
     SUPTITLE_KW,
     GRID_KW,
 )
@@ -18,49 +20,71 @@ import logging
 
 _log = logging.getLogger(__name__)
 
-POS_KEY = "spot_position_raw"
-SIG_KEY = "spot_sigma_raw"
+_SIG_KEY_VARIANTS = ("spot_sigma_raw", "spot_sigma")
+
+_IC_SIGMA_DEFS = [
+    ("ic1_sig_x", "ic1", "x"),
+    ("ic1_sig_y", "ic1", "y"),
+    ("ic2_sig_x", "ic2", "x"),
+    ("ic2_sig_y", "ic2", "y"),
+]
+
+
+def _resolve_sigma_col(columns, ic: str, axis: str) -> str | None:
+    """Find a sigma column for a given IC and axis, trying known key variants."""
+    for key in _SIG_KEY_VARIANTS:
+        for prefix in (f"r_{ic}_{axis}_{key}", f"{ic}_{axis}_{key}"):
+            if prefix in columns:
+                return prefix
+    return None
 
 
 def _process_session_data(session_id: str, base_dir: str):
-    """Process data for a single session with position and sigma columns."""
+    """Process data for a single session, dynamically resolving sigma columns."""
     input_map, spot_data = load_session_raw(session_id, base_dir=base_dir)
     if input_map is None or spot_data is None:
         return None
 
-    spot_data_columns = [
-        f"r_ic1_x_{POS_KEY}",
-        f"r_ic1_y_{POS_KEY}",
-        f"r_ic2_x_{POS_KEY}",
-        f"r_ic2_y_{POS_KEY}",
-        f"r_ic1_x_{SIG_KEY}",
-        f"r_ic1_y_{SIG_KEY}",
-        f"r_ic2_x_{SIG_KEY}",
-        f"r_ic2_y_{SIG_KEY}",
-    ]
-    for col in spot_data_columns:
-        if col not in spot_data.columns:
-            return None
+    energy_col = resolve_concept_column(input_map.columns, C_ENERGY)
+    if energy_col is None:
+        _log.debug("Session %s: no energy column found", session_id)
+        return None
 
-    spot_data = spot_data[spot_data_columns].copy().join(input_map["ENERGY"])
+    found: dict[str, str] = {}
+    for label, ic, axis in _IC_SIGMA_DEFS:
+        col = _resolve_sigma_col(spot_data.columns, ic, axis)
+        if col is not None:
+            found[label] = col
+
+    if not found:
+        _log.debug("Session %s: no sigma columns found", session_id)
+        return None
+
+    keep_cols = list(found.values())
+    spot_data = spot_data[keep_cols].copy().join(input_map[energy_col])
     spot_data = spot_data.apply(pd.to_numeric, errors="coerce")
 
     valid_mask = create_valid_mask(spot_data)
     spot_data_clean = spot_data[valid_mask]
 
-    ic1_sig_x = spot_data_clean[f"r_ic1_x_{SIG_KEY}"] * 2
-    ic1_sig_y = spot_data_clean[f"r_ic1_y_{SIG_KEY}"] * 2
-    ic2_sig_x = spot_data_clean[f"r_ic2_x_{SIG_KEY}"] * 2
-    ic2_sig_y = spot_data_clean[f"r_ic2_y_{SIG_KEY}"] * 2
-
-    return {
+    result: dict = {
         "session_id": session_id,
-        "energy": spot_data_clean["ENERGY"],
-        "ic1_sig_x": ic1_sig_x,
-        "ic1_sig_y": ic1_sig_y,
-        "ic2_sig_x": ic2_sig_x,
-        "ic2_sig_y": ic2_sig_y,
+        "energy": spot_data_clean[energy_col],
+        "sigma_types": [],
     }
+    for label, raw_col in found.items():
+        result[label] = spot_data_clean[raw_col] * 2
+        result["sigma_types"].append(label)
+
+    return result
+
+
+_SUBPLOT_LAYOUT = [
+    ("ic1_sig_x", "IC1 Sigma X"),
+    ("ic1_sig_y", "IC1 Sigma Y"),
+    ("ic2_sig_x", "IC2 Sigma X"),
+    ("ic2_sig_y", "IC2 Sigma Y"),
+]
 
 
 def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -> None:
@@ -79,74 +103,77 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
         _log.debug("No valid data found for any session")
         return
 
-    combined_data = []
-    for session_id, data in session_data.items():
-        for i in range(len(data["energy"])):
-            for sigma_type, sigma_key in [
-                ("ic1_sig_x", "ic1_sig_x"),
-                ("ic1_sig_y", "ic1_sig_y"),
-                ("ic2_sig_x", "ic2_sig_x"),
-                ("ic2_sig_y", "ic2_sig_y"),
-            ]:
-                combined_data.append({
-                    "energy": data["energy"].iloc[i],
-                    "sigma_value": data[sigma_key].iloc[i],
-                    "sigma_type": sigma_type,
-                    "session_id": session_id,
-                })
+    ordered_sids = list(session_data.keys())
+    n_sessions = len(ordered_sids)
+    colors = DEFAULT_SESSION_COLORS[:n_sessions]
 
-    plot_df = pd.DataFrame(combined_data)
-
-    fig, ax = plt.subplots(figsize=FIG_SIZE_SINGLE)
-    fig.suptitle("Sigma X and Y by Energy", **SUPTITLE_KW)
-
-    unique_energies = sorted(plot_df["energy"].unique())
-    unique_sigma_types = ["ic1_sig_x", "ic1_sig_y", "ic2_sig_x", "ic2_sig_y"]
-
-    box_data_by_energy = {}
-    for energy in unique_energies:
-        box_data_by_energy[energy] = {}
-        for sigma_type in unique_sigma_types:
-            subset = plot_df[
-                (plot_df["energy"] == energy) & (plot_df["sigma_type"] == sigma_type)
-            ]
-            if not subset.empty:
-                box_data_by_energy[energy][sigma_type] = subset["sigma_value"].values
-
-    width = 0.2
+    all_energies: set[float] = set()
+    for data in session_data.values():
+        all_energies.update(data["energy"].dropna().unique())
+    unique_energies = sorted(all_energies)
     x_positions = np.arange(len(unique_energies))
-    colors = DEFAULT_SESSION_COLORS[:len(unique_sigma_types)]
 
-    for i, sigma_type in enumerate(unique_sigma_types):
-        data_for_type = []
-        positions = []
-        for j, energy in enumerate(unique_energies):
-            if energy in box_data_by_energy and sigma_type in box_data_by_energy[energy]:
-                data_for_type.append(box_data_by_energy[energy][sigma_type])
-                positions.append(x_positions[j] + (i - 1.5) * width)
+    fig, axes = plt.subplots(2, 2, figsize=FIG_SIZE_2x2, sharex=True)
+    fig.suptitle("Sigma X / Y by Energy", **SUPTITLE_KW)
 
-        if data_for_type:
-            ax.boxplot(
-                data_for_type,
-                positions=positions,
-                widths=width * 0.8,
-                patch_artist=True,
-                showfliers=False,
-                boxprops=dict(facecolor=colors[i], alpha=0.7),
-                medianprops=dict(color="black", linewidth=1.5),
+    width = 0.8 / max(n_sessions, 1)
+
+    for ax, (sig_key, title) in zip(axes.flat, _SUBPLOT_LAYOUT):
+        has_data = False
+        for s_idx, sid in enumerate(ordered_sids):
+            data = session_data[sid]
+            if sig_key not in data["sigma_types"]:
+                continue
+
+            energy_vals = data["energy"].values
+            sigma_vals = data[sig_key].values
+
+            box_data = []
+            positions = []
+            for j, energy in enumerate(unique_energies):
+                mask = energy_vals == energy
+                vals = sigma_vals[mask]
+                vals = vals[np.isfinite(vals)]
+                if len(vals) > 0:
+                    box_data.append(vals)
+                    positions.append(
+                        x_positions[j] + (s_idx - (n_sessions - 1) / 2) * width
+                    )
+
+            if box_data:
+                has_data = True
+                bp = ax.boxplot(
+                    box_data,
+                    positions=positions,
+                    widths=width * 0.8,
+                    patch_artist=True,
+                    showfliers=False,
+                    boxprops=dict(facecolor=colors[s_idx], alpha=0.7),
+                    medianprops=dict(color="black", linewidth=1.5),
+                )
+
+        ax.set_title(title)
+        ax.set_ylabel("Sigma (mm)")
+        ax.grid(**GRID_KW)
+        if not has_data:
+            ax.text(
+                0.5, 0.5, "No data", transform=ax.transAxes,
+                ha="center", va="center", fontsize=12, color="gray",
             )
 
-    ax.set_xticks(x_positions)
-    ax.set_xticklabels([f"{e:g}" for e in unique_energies], rotation=90)
-    ax.set_xlabel("Energy (MeV)")
-    ax.set_ylabel("Sigma (mm)")
-    ax.grid(**GRID_KW)
+    for ax in axes[1]:
+        ax.set_xticks(x_positions)
+        ax.set_xticklabels([f"{e:g}" for e in unique_energies], rotation=90)
+        ax.set_xlabel("Energy (MeV)")
 
     legend_elements = [
-        Patch(facecolor=colors[i], alpha=0.7, label=unique_sigma_types[i])
-        for i in range(len(unique_sigma_types))
+        Patch(facecolor=colors[i], alpha=0.7, label=ordered_sids[i])
+        for i in range(n_sessions)
     ]
-    ax.legend(handles=legend_elements, loc="upper right")
+    fig.legend(
+        handles=legend_elements, loc="upper right",
+        bbox_to_anchor=(0.99, 0.98), fontsize="small",
+    )
 
     plt.tight_layout()
     plt.show()
