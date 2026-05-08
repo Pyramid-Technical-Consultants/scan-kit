@@ -56,6 +56,7 @@ hiddenimports = [
     "scan_kit.views.dose_ratios_position",
     "scan_kit.views.dose_ratios_time",
     "scan_kit.views.dose_error_vs_target",
+    "scan_kit.views.dose_error_vs_target_mean_scatter",
     "scan_kit.views.spot_delivery_time",
     "scan_kit.views.sigma_boxplots",
     "scan_kit.views.beam_off_rampdown",
