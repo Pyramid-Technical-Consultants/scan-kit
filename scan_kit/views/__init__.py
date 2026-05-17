@@ -17,6 +17,7 @@ from . import (
     beam_off_rampdown,
     beam_on_off_current,
     ic_timeslice_replay,
+    ic_timeslice_replay_derived,
     dose_accumulation,
     ic_fft_analysis,
 )
@@ -46,6 +47,11 @@ VIEWS: list[tuple[str, str, Callable[[list[str], str], None]]] = [
     ("Beam-Off Ramp-Down", "beam_off_rampdown", beam_off_rampdown.run),
     ("Beam-On vs Beam-Off Current", "beam_on_off_current", beam_on_off_current.run),
     ("IC Timeslice Replay", "ic_timeslice_replay", ic_timeslice_replay.run),
+    (
+        "IC Timeslice Replay (dDose/dt)",
+        "ic_timeslice_replay_derived",
+        ic_timeslice_replay_derived.run,
+    ),
     ("Dose Accumulation", "dose_accumulation", dose_accumulation.run),
     ("IC Current FFT Analysis", "ic_fft_analysis", ic_fft_analysis.run),
 ]

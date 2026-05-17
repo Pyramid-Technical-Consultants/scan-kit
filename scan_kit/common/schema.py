@@ -56,6 +56,12 @@ C_BEAM_CURRENT = "beam_current"
 C_IC1_TOTAL_DOSE = "ic1_total_dose"
 C_IC2_TOTAL_DOSE = "ic2_total_dose"
 C_IC3_TOTAL_DOSE = "ic3_total_dose"
+# Timeslice scan-total dose: monotonically accumulating dose across the
+# entire scan (does not reset per spot/layer).  Differentiating this column
+# yields the IC current.
+C_IC1_SCAN_TOTAL_DOSE = "ic1_scan_total_dose"
+C_IC2_SCAN_TOTAL_DOSE = "ic2_scan_total_dose"
+C_IC3_SCAN_TOTAL_DOSE = "ic3_scan_total_dose"
 C_CHARGE_REQ = "charge_req"
 
 # Raw position concepts (register-level, need coordinate remap)
@@ -102,6 +108,22 @@ _CONCEPT_ALIASES_STATIC: dict[str, tuple[str, ...]] = {
         "ic3_total_dose_spot_raw",
         "ic3_total_dose",
         "r_ic3_total_dose",
+    ),
+    C_IC1_SCAN_TOTAL_DOSE: (
+        "r_ic1_scan_total_dose",
+        "ic1_scan_total_dose",
+        "ic1_dose_total",
+    ),
+    C_IC2_SCAN_TOTAL_DOSE: (
+        "r_ic2_scan_total_dose",
+        "ic2_scan_total_dose",
+        "ic2_dose_total",
+    ),
+    C_IC3_SCAN_TOTAL_DOSE: (
+        "ic3_dose_total",
+        "ic3_scan_total_dose",
+        "r_ic3_scan_total_dose",
+        "r_ic3_dose_total",
     ),
     C_CHARGE_REQ: ("CHARGE_REQ", "charge_req", "dose_req", "prescribed_dose"),
     C_X_POSITION: ("X_POSITION", "x_position", "xposition", "x_pos", "planned_x"),
