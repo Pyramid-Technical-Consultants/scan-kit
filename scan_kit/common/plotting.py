@@ -5,20 +5,11 @@ from matplotlib.widgets import SpanSelector
 import numpy as np
 import pandas as pd
 
+from .plot_colors import DEFAULT_SESSION_COLORS
+
 # ---------------------------------------------------------------------------
 # Shared style constants — import these in views for a consistent look
 # ---------------------------------------------------------------------------
-
-DEFAULT_SESSION_COLORS = [
-    "skyblue",
-    "lightcoral",
-    "limegreen",
-    "orange",
-    "purple",
-    "brown",
-    "pink",
-    "gray",
-]
 
 FIG_SIZE_2x2 = (15, 8)
 FIG_SIZE_1x2 = (15, 6)

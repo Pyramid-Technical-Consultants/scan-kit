@@ -1,7 +1,7 @@
 # scan-kit
 
 Open-source proton pencil beam scanning session analysis toolkit with a
-Textual terminal UI and Matplotlib analysis views.
+Qt desktop launcher and Matplotlib analysis views.
 
 ## Quick Start
 
@@ -39,40 +39,42 @@ Check version:
 scan-kit --version
 ```
 
-## TUI Workflow
+## GUI workflow
 
 ### 1) Set data source
 
-- In `DATA SOURCE`, enter the folder that contains session data
-- Press `Enter` to refresh discovery
-- Default source is the current working directory (or `test_data` in dev)
+- In **DATA SOURCE**, enter the folder that contains session data
+- Leave the field (or use Enter) to refresh discovery
+- Default source is the current working directory when frozen, or `test_data` in a dev install
 
 ### 2) Sort and select sessions
 
 - Sessions can be sorted by:
-  - `Date` (default, newest first)
-  - `ID`
-  - `MU`
-- Select up to **3 sessions** at a time from the list
-- Use the `X` button to clear selection
-- Status line shows selected IDs and loading state while metadata is being read
+  - **Date** (default, newest first)
+  - **ID**
+  - **MU**
+- Select up to **3 sessions** by ticking **Use** in the table (no Ctrl key needed)
+- Click a row (Session ID or other columns) to choose which session’s note you edit
+- Use the **✕** control to clear all **Use** checks
+- The table lists **Session ID**, **Date**, **MU**, **Time (s)**, and a **Note** preview (full note in tooltip when trimmed)
+- Status shows how many sessions are checked and whether metadata is still loading
 
 ### 3) Add session notes (optional)
 
-- Highlight a session in the list to edit its note
+- Click a row in the session table to edit that session’s note
 - Notes are auto-saved while typing
 - Notes are stored in `<data_source>/session_notes.json`
-- A short note preview is shown inline in the session list
+- A short note preview is shown in the **Note** column
 
 ### 4) Run analysis views
 
-- Click any analysis button in `RUN ANALYSIS`
+- Click any analysis button in **RUN ANALYSIS**
 - Each view runs in its own Python process and opens Matplotlib window(s)
-- Close the plot window(s) to return to the launcher
+- Close the plot window(s) when done; the launcher stays open
 
 ### 5) Quit
 
-- `Esc`, `Ctrl+Q`, or `Ctrl+C`
+- Close the window, or **Esc** / **Ctrl+Q**
 
 ## Available Views
 
@@ -150,6 +152,8 @@ python build.py --clean     # build single executable → dist/
 ```
 
 The output lands in `dist/scan-kit` (Linux) or `dist\scan-kit.exe` (Windows).
+The Windows build uses a windowed executable (no console) for the main GUI; use
+`python -m scan_kit --version` in development, or see the window title for the version.
 
 ## Releasing
 
@@ -171,7 +175,7 @@ Release with the binaries attached automatically.
 
 The project follows [Semantic Versioning](https://semver.org/). The single
 source of truth for the version is `scan_kit/__init__.py` (`__version__`),
-which is read by `pyproject.toml` and displayed in the TUI.
+which is read by `pyproject.toml` and shown in the launcher window title (`scan-kit v…`).
 
 ## License
 

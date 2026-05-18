@@ -3,5 +3,5 @@ matplotlib
 numpy
 scipy
 sounddevice
-textual>=0.27.0
+PySide6>=6.6.0
 pyinstaller>=6.0

@@ -2,7 +2,7 @@
 
 Wraps a view's ``run()`` function so that the matplotlib figure window
 stays open and redraws in-place whenever ``settings.json`` changes on
-disk.  The TUI simply saves settings; the subprocess picks up the
+disk.  The launcher saves settings; the subprocess picks up the
 change via a 1-second polling timer on the matplotlib event loop.
 """
 
