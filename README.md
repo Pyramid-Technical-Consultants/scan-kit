@@ -53,18 +53,16 @@ scan-kit --version
   - **Date** (default, newest first)
   - **ID**
   - **MU**
-- Select up to **3 sessions** by ticking **Use** in the table (no Ctrl key needed)
-- Click a row (Session ID or other columns) to choose which session’s note you edit
+- Select up to **5 sessions** by ticking **Use** in the table (no Ctrl key needed)
 - Use the **✕** control to clear all **Use** checks
-- The table lists **Session ID**, **Date**, **MU**, **Time (s)**, and a **Note** preview (full note in tooltip when trimmed)
+- The table lists **Session ID**, **Date**, **MU**, **Time (s)**, and **Note** (edit in the cell; long text also appears in the tooltip)
 - Status shows how many sessions are checked and whether metadata is still loading
 
 ### 3) Add session notes (optional)
 
-- Click a row in the session table to edit that session’s note
-- Notes are auto-saved while typing
+- Edit the **Note** column directly (double-click or F2 on the cell)
+- Notes are saved when you finish editing the cell
 - Notes are stored in `<data_source>/session_notes.json`
-- A short note preview is shown in the **Note** column
 
 ### 4) Run analysis views
 

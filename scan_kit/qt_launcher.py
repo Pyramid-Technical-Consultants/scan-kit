@@ -58,7 +58,7 @@ from .common.settings import ViewSettings, CALIBRATION_MODES
 from .common.plot_colors import DEFAULT_SESSION_COLORS
 from .views import VIEW_GROUPS, VIEWS
 
-MAX_SESSIONS = 3
+MAX_SESSIONS = 5
 FROZEN = getattr(sys, "frozen", False)
 
 if FROZEN:
@@ -77,7 +77,7 @@ _SORT_LABELS = {
 _VIEW_GRID_COLS = 2
 
 # Batched session rows emitted from discovery thread (keep small so each UI slot stays short).
-_SESSION_ROW_BATCH = 12
+_SESSION_ROW_BATCH = 24
 
 _CAL_MODE_LABELS = {
     "off": "Off",
@@ -89,6 +89,7 @@ _EPOCH = datetime(1970, 1, 1)
 _SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 _READY_SENTINEL = "__SCAN_KIT_PLOT_READY__"
 _SESSION_ROLE = Qt.ItemDataRole.UserRole
+_SWATCH_STATE_ROLE = Qt.ItemDataRole.UserRole + 1
 
 # session_table column indices
 _COL_USE = 0
@@ -126,6 +127,25 @@ def _session_plot_swatch_icon(*, active: bool, plot_index: int | None) -> QIcon:
     p.end()
     return QIcon(pix)
 
+
+_SWATCH_ICON_CACHE: dict[tuple[str, int | None], QIcon] = {}
+
+
+def _cached_swatch_icon(*, active: bool, plot_index: int | None) -> QIcon:
+    """Reuse icons; painting swatches for every row on each click is expensive."""
+    if active and plot_index is not None:
+        key = ("on", plot_index % len(DEFAULT_SESSION_COLORS))
+    else:
+        key = ("off", None)
+    icon = _SWATCH_ICON_CACHE.get(key)
+    if icon is None:
+        icon = _session_plot_swatch_icon(
+            active=bool(active and plot_index is not None),
+            plot_index=plot_index,
+        )
+        _SWATCH_ICON_CACHE[key] = icon
+    return icon
+
 _CAL_FACTOR_LABELS = {
     # Canonical calibration keys; must match scan_kit.common.schema dose columns.
     "ic1_total_dose": "IC1",
@@ -139,9 +159,11 @@ def _sort_key(
 ) -> tuple:
     sid, _zp, meta = item
     if mode == "date":
-        return (meta.date if meta and meta.date else _EPOCH,)
+        d = meta.date if meta and meta.date else _EPOCH
+        return (d, sid)
     if mode == "mu":
-        return (meta.primary_mu if meta and meta.primary_mu is not None else 0.0,)
+        mu = meta.primary_mu if meta and meta.primary_mu is not None else 0.0
+        return (mu, sid)
     return (sid,)
 
 
@@ -199,8 +221,36 @@ class ScanKitMainWindow(QMainWindow):
         self._repopulating = False
         self._view_buttons: dict[str, QPushButton] = {}
         self._bootstrap_generation: int = 0
+        self._meta_col_resize_timer: QTimer | None = None
+        self._status_refresh_timer: QTimer | None = None
+        self._session_resort_timer: QTimer | None = None
+        self._row_by_sid: dict[str, int] = {}
 
+        boot = QWidget()
+        boot_l = QVBoxLayout(boot)
+        _boot_msg = QLabel("Loading…")
+        _boot_msg.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        boot_l.addWidget(_boot_msg, stretch=1)
+        self.setCentralWidget(boot)
+
+        QTimer.singleShot(0, self._deferred_finish_init)
+
+    def _deferred_finish_init(self) -> None:
+        """Build the full UI on the next event-loop pass so the window can paint first."""
         self._build_ui()
+        self._meta_col_resize_timer = QTimer(self)
+        self._meta_col_resize_timer.setSingleShot(True)
+        self._meta_col_resize_timer.timeout.connect(self._resize_session_meta_columns)
+        self._status_refresh_timer = QTimer(self)
+        self._status_refresh_timer.setSingleShot(True)
+        self._status_refresh_timer.timeout.connect(self._update_status)
+        self._session_resort_timer = QTimer(self)
+        self._session_resort_timer.setSingleShot(True)
+        self._session_resort_timer.timeout.connect(self._apply_session_resort)
+        self._connect_thread_signals()
+        QTimer.singleShot(0, self._request_settings_then_scan)
+
+    def _connect_thread_signals(self) -> None:
         self._sig_session_extracting.connect(
             self._show_extracting_status, Qt.ConnectionType.QueuedConnection
         )
@@ -222,7 +272,40 @@ class ScanKitMainWindow(QMainWindow):
         self._sig_settings_ready.connect(
             self._on_settings_ready, Qt.ConnectionType.QueuedConnection
         )
-        QTimer.singleShot(0, self._request_settings_then_scan)
+
+    def _schedule_meta_column_resize(self) -> None:
+        if self._meta_col_resize_timer is not None:
+            self._meta_col_resize_timer.start(60)
+
+    def _schedule_status_refresh(self) -> None:
+        if self._status_refresh_timer is not None:
+            self._status_refresh_timer.start(0)
+        else:
+            self._update_status()
+
+    def _schedule_session_resort(self) -> None:
+        """Coalesce Date/MU re-sorts while metadata streams in from the thread pool."""
+        if self._sort_mode not in ("date", "mu"):
+            return
+        if self._session_resort_timer is not None:
+            self._session_resort_timer.start(50)
+
+    @Slot()
+    def _apply_session_resort(self) -> None:
+        if self._sort_mode not in ("date", "mu"):
+            return
+        ordered = self._sorted_session_rows()
+        if self._reorder_session_table(ordered):
+            self._schedule_status_refresh()
+            return
+        self._repopulate_list()
+
+    def _rebuild_session_row_index(self) -> None:
+        self._row_by_sid.clear()
+        for r in range(self.session_table.rowCount()):
+            sid = self._session_row_sid(r)
+            if sid is not None:
+                self._row_by_sid[sid] = r
 
     def _build_ui(self) -> None:
         central = QWidget()
@@ -314,11 +397,6 @@ class ScanKitMainWindow(QMainWindow):
         status_row.addWidget(clear_btn)
         left_l.addLayout(status_row)
 
-        self.note_input = QLineEdit()
-        self.note_input.setPlaceholderText("Select a session to edit its note…")
-        self.note_input.textEdited.connect(self._on_note_edited)
-        left_l.addWidget(self.note_input)
-
         # --- Right panel ---
         right_scroll = QScrollArea()
         right_scroll.setWidgetResizable(True)
@@ -356,20 +434,9 @@ class ScanKitMainWindow(QMainWindow):
         right_l.addWidget(self.cal_factors_label)
 
         right_l.addWidget(QLabel("RUN ANALYSIS"))
-        for gi, (group_title, entries) in enumerate(VIEW_GROUPS):
-            if gi > 0:
-                sep = QFrame()
-                sep.setFrameShape(QFrame.Shape.HLine)
-                sep.setFrameShadow(QFrame.Shadow.Sunken)
-                right_l.addWidget(sep)
-
-            gh = QLabel(group_title)
-            gfont = gh.font()
-            gfont.setBold(True)
-            gh.setFont(gfont)
-            gh.setContentsMargins(0, 8 if gi > 0 else 0, 0, 2)
-            right_l.addWidget(gh)
-
+        for group_title, entries in VIEW_GROUPS:
+            view_box = QGroupBox(group_title)
+            view_inner = QVBoxLayout(view_box)
             grid = QGridLayout()
             grid.setHorizontalSpacing(8)
             grid.setVerticalSpacing(6)
@@ -386,7 +453,8 @@ class ScanKitMainWindow(QMainWindow):
                 self._view_buttons[module_name] = btn
                 row, col = divmod(i, _VIEW_GRID_COLS)
                 grid.addWidget(btn, row, col)
-            right_l.addLayout(grid)
+            view_inner.addLayout(grid)
+            right_l.addWidget(view_box)
         right_l.addStretch(1)
 
         right_scroll.setWidget(right_inner)
@@ -580,6 +648,7 @@ class ScanKitMainWindow(QMainWindow):
             if r >= 0:
                 self.session_table.setCurrentCell(r, _COL_SESSION_ID)
         self.session_table.verticalScrollBar().setValue(scroll)
+        self._rebuild_session_row_index()
         return True
 
     def _set_sort(self, mode: str) -> None:
@@ -603,20 +672,22 @@ class ScanKitMainWindow(QMainWindow):
         self._hydrate_generation += 1
         gen = self._hydrate_generation
         self._shutdown_meta_pool()
-        workers = max(4, min(24, (os.cpu_count() or 4) * 3))
+        # Cap concurrency: many parallel archive/FS reads slow down on typical disks.
+        workers = max(4, min(12, (os.cpu_count() or 4) * 2))
         self._meta_pool = ThreadPoolExecutor(max_workers=workers)
         self._discovered = []
         self._sessions = []
         self._hydrate_received = 0
         self._scan_complete = False
         self.session_table.setRowCount(0)
+        self._row_by_sid.clear()
         self._check_order.clear()
         threading.Thread(
             target=self._discover_sessions_worker,
             args=(gen, self._base_dir),
             daemon=True,
         ).start()
-        self._update_status()
+        self._schedule_status_refresh()
 
     def _discover_sessions_worker(self, gen: int, base_dir: str) -> None:
         from .common.sessions import discover_sessions
@@ -722,8 +793,9 @@ class ScanKitMainWindow(QMainWindow):
                 self._schedule_meta_hydrate(gen, sid, path_str)
         finally:
             self.session_table.blockSignals(False)
+        self._rebuild_session_row_index()
         self._sessions = [s for s, _, _ in self._discovered]
-        self._update_status()
+        self._schedule_status_refresh()
 
     @Slot(int)
     def _on_scan_finished(self, gen: int) -> None:
@@ -741,8 +813,8 @@ class ScanKitMainWindow(QMainWindow):
         if not self._reorder_session_table(ordered):
             self._repopulate_list()
         if self._hydrate_received >= len(self._discovered):
-            self._resize_session_meta_columns()
-        self._update_status()
+            self._schedule_meta_column_resize()
+        self._schedule_status_refresh()
 
     def _resize_session_meta_columns(self) -> None:
         for c in (_COL_USE, _COL_SESSION_ID, _COL_DATE, _COL_MU, _COL_TIME):
@@ -790,12 +862,16 @@ class ScanKitMainWindow(QMainWindow):
         self._fill_meta_columns(row, meta)
 
         note = self._notes.get(sid, "")
-        preview = ""
-        if note:
-            preview = note if len(note) <= 48 else note[:46] + "…"
-        note_cell = QTableWidgetItem(preview)
-        note_cell.setFlags(note_cell.flags() & ~Qt.ItemFlag.ItemIsEditable)
-        note_cell.setToolTip(note if len(note) > 48 else "")
+        note_cell = QTableWidgetItem(note)
+        note_cell.setFlags(
+            (note_cell.flags() | Qt.ItemFlag.ItemIsEditable | Qt.ItemFlag.ItemIsSelectable)
+            & ~Qt.ItemFlag.ItemIsUserCheckable
+        )
+        note_cell.setTextAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
+        if len(note) > 120:
+            note_cell.setToolTip(note)
+        else:
+            note_cell.setToolTip("")
         self.session_table.setItem(row, _COL_NOTE, note_cell)
 
     @Slot(int, str, str, object)
@@ -820,9 +896,11 @@ class ScanKitMainWindow(QMainWindow):
                 break
         self._hydrate_received += 1
         self._patch_session_metadata_cells(sid, meta_obj)
+        self._schedule_session_resort()
         if self._scan_complete and self._hydrate_received >= len(self._discovered):
-            self._resize_session_meta_columns()
-        self._update_status()
+            self._schedule_meta_column_resize()
+            self._schedule_session_resort()
+        self._schedule_status_refresh()
 
     def _patch_session_metadata_cells(self, sid: str, meta: SessionMeta | None) -> None:
         """Update Date/MU/Time cells for one row (cheap vs rebuilding the whole table)."""
@@ -847,9 +925,13 @@ class ScanKitMainWindow(QMainWindow):
         return str(sid) if sid is not None else None
 
     def _find_row_for_sid(self, sid: str) -> int:
-        for r in range(self.session_table.rowCount()):
-            if self._session_row_sid(r) == sid:
-                return r
+        r = self._row_by_sid.get(sid, -1)
+        if 0 <= r < self.session_table.rowCount() and self._session_row_sid(r) == sid:
+            return r
+        for r2 in range(self.session_table.rowCount()):
+            if self._session_row_sid(r2) == sid:
+                self._row_by_sid[sid] = r2
+                return r2
         return -1
 
     def _set_row_checked(self, sid: str, checked: bool) -> None:
@@ -882,22 +964,49 @@ class ScanKitMainWindow(QMainWindow):
         return out
 
     def _on_session_table_item_changed(self, item: QTableWidgetItem) -> None:
-        if self._repopulating or item.column() != _COL_USE:
+        if self._repopulating:
             return
-        sid_raw = item.data(_SESSION_ROLE)
-        if sid_raw is None:
+        col = item.column()
+        if col == _COL_USE:
+            sid_raw = item.data(_SESSION_ROLE)
+            if sid_raw is None:
+                return
+            sid = str(sid_raw)
+            if item.checkState() == Qt.CheckState.Checked:
+                if sid not in self._check_order:
+                    self._check_order.append(sid)
+                while len(self._check_order) > MAX_SESSIONS:
+                    drop = self._check_order.pop(0)
+                    self._set_row_checked(drop, False)
+            else:
+                self._check_order = [s for s in self._check_order if s != sid]
+            selected_set = set(self._checked_sids_ordered())
+            self._check_order = [s for s in self._check_order if s in selected_set]
+            self._schedule_status_refresh()
             return
-        sid = str(sid_raw)
-        if item.checkState() == Qt.CheckState.Checked:
-            if sid not in self._check_order:
-                self._check_order.append(sid)
-            while len(self._check_order) > MAX_SESSIONS:
-                drop = self._check_order.pop(0)
-                self._set_row_checked(drop, False)
+        if col == _COL_NOTE:
+            self._persist_note_from_cell(item)
+
+    def _persist_note_from_cell(self, item: QTableWidgetItem) -> None:
+        row = item.row()
+        sid = self._session_row_sid(row)
+        if sid is None:
+            return
+        text = item.text()
+        current = self._notes.get(sid, "")
+        if text == current:
+            return
+        if text.strip():
+            self._notes[sid] = text
         else:
-            self._check_order = [s for s in self._check_order if s != sid]
-        self._check_order = [s for s in self._check_order if s in self._checked_sids_ordered()]
-        self._update_status()
+            self._notes.pop(sid, None)
+        save_note(self._base_dir, sid, text)
+        tip = text if len(text) > 120 else ""
+        self.session_table.blockSignals(True)
+        try:
+            item.setToolTip(tip)
+        finally:
+            self.session_table.blockSignals(False)
 
     def _on_session_current_cell_changed(
         self,
@@ -908,33 +1017,11 @@ class ScanKitMainWindow(QMainWindow):
     ) -> None:
         if current_row < 0:
             self._highlighted_sid = None
-            self.note_input.blockSignals(True)
-            self.note_input.clear()
-            self.note_input.setPlaceholderText("Select a session row to edit its note…")
-            self.note_input.blockSignals(False)
             return
         sid = self._session_row_sid(current_row)
         if sid is None:
             return
         self._highlighted_sid = sid
-        self.note_input.blockSignals(True)
-        self.note_input.setText(self._notes.get(sid, ""))
-        self.note_input.setPlaceholderText(f"Note for {sid}…")
-        self.note_input.blockSignals(False)
-
-    def _on_note_edited(self, text: str) -> None:
-        sid = self._highlighted_sid
-        if sid is None:
-            return
-        current = self._notes.get(sid, "")
-        if text == current:
-            return
-        if text.strip():
-            self._notes[sid] = text
-        else:
-            self._notes.pop(sid, None)
-        save_note(self._base_dir, sid, text)
-        self._repopulate_list()
 
     def _repopulate_list(self) -> None:
         self._repopulating = True
@@ -968,14 +1055,17 @@ class ScanKitMainWindow(QMainWindow):
                 if r >= 0:
                     self.session_table.setCurrentCell(r, _COL_SESSION_ID)
             self.session_table.verticalScrollBar().setValue(scroll)
+            self._rebuild_session_row_index()
         finally:
             self._repopulating = False
-        self._resize_session_meta_columns()
+        self._schedule_meta_column_resize()
         self._update_status()
 
-    def _refresh_use_column_swatches(self) -> None:
+    def _refresh_use_column_swatches(self, selected: list[str] | None = None) -> None:
         """Set Use-column icons to match visualization colors for checked sessions."""
-        selected = self._checked_sids_ordered()
+        if selected is None:
+            selected = self._checked_sids_ordered()
+        n_selected = len(selected)
         idx_by_sid = {sid: i for i, sid in enumerate(selected)}
         self.session_table.blockSignals(True)
         try:
@@ -989,13 +1079,22 @@ class ScanKitMainWindow(QMainWindow):
                 sid = str(sid_raw)
                 active = it.checkState() == Qt.CheckState.Checked
                 plot_i = idx_by_sid.get(sid) if active else None
-                it.setIcon(_session_plot_swatch_icon(active=active, plot_index=plot_i))
+                if active and plot_i is not None:
+                    state_key = (True, plot_i, n_selected)
+                elif active:
+                    state_key = (True, -1, n_selected)
+                else:
+                    state_key = (False, -1, 0)
+                if it.data(_SWATCH_STATE_ROLE) == state_key:
+                    continue
+                it.setData(_SWATCH_STATE_ROLE, state_key)
+                it.setIcon(_cached_swatch_icon(active=active, plot_index=plot_i))
                 if active and plot_i is not None:
                     cname = DEFAULT_SESSION_COLORS[
                         plot_i % len(DEFAULT_SESSION_COLORS)
                     ]
                     it.setToolTip(
-                        f"Session color in plots: {cname} ({plot_i + 1} of {len(selected)})"
+                        f"Session color in plots: {cname} ({plot_i + 1} of {n_selected})"
                     )
                 elif active:
                     it.setToolTip("Selected for analysis")
@@ -1007,8 +1106,8 @@ class ScanKitMainWindow(QMainWindow):
             self.session_table.blockSignals(False)
 
     def _update_status(self) -> None:
-        self._refresh_use_column_swatches()
         selected = self._checked_sids_ordered()
+        self._refresh_use_column_swatches(selected)
         msg_bits: list[str] = []
         if not self._scan_complete:
             msg_bits.append("scanning sessions")
@@ -1016,7 +1115,9 @@ class ScanKitMainWindow(QMainWindow):
             msg_bits.append("loading session details")
         extra = f"  ({'; '.join(msg_bits)})" if msg_bits else ""
         if len(selected) == 0:
-            self.status_label.setText(f"> SELECT 1-3 SESSIONS (check Use){extra}")
+            self.status_label.setText(
+                f"> SELECT 1-{MAX_SESSIONS} SESSIONS (check Use){extra}"
+            )
         else:
             self.status_label.setText(f"> READY: {len(selected)} | {', '.join(selected)}{extra}")
 
@@ -1030,7 +1131,7 @@ class ScanKitMainWindow(QMainWindow):
         finally:
             self.session_table.blockSignals(False)
         self._check_order.clear()
-        self._update_status()
+        self._schedule_status_refresh()
 
     def _notify(self, message: str, *, error: bool = False) -> None:
         box = QMessageBox(self)
@@ -1045,7 +1146,9 @@ class ScanKitMainWindow(QMainWindow):
 
         selected = self._checked_sids_ordered()
         if not selected:
-            self._notify("Select 1-3 sessions first (use the checkboxes)")
+            self._notify(
+                f"Select 1-{MAX_SESSIONS} sessions first (use the checkboxes)"
+            )
             return
 
         session_ids = selected[:MAX_SESSIONS]
@@ -1223,6 +1326,12 @@ class ScanKitMainWindow(QMainWindow):
     def _shutdown_children(self) -> None:
         self._hydrate_generation += 1
         self._shutdown_meta_pool()
+        if self._meta_col_resize_timer is not None:
+            self._meta_col_resize_timer.stop()
+        if self._session_resort_timer is not None:
+            self._session_resort_timer.stop()
+        if self._status_refresh_timer is not None:
+            self._status_refresh_timer.stop()
         if self._poll_timer is not None:
             self._poll_timer.stop()
             self._poll_timer = None
@@ -1295,6 +1404,7 @@ def main() -> None:
         _sig_timer.timeout.connect(lambda: None)
 
     win.show()
+    QApplication.processEvents()
     sys.exit(app.exec())
 
 

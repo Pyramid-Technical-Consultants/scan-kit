@@ -14,7 +14,15 @@ import importlib.util
 
 ViewEntry = tuple[str, str]
 
+_HAS_AUDIO = importlib.util.find_spec("scan_kit.views.ic_audio_export") is not None
+
 # Workflow-oriented groups for the launcher (flat VIEWS is derived below).
+_VIEW_NOISE: list[ViewEntry] = [
+    ("IC Current FFT Analysis", "ic_fft_analysis"),
+]
+if _HAS_AUDIO:
+    _VIEW_NOISE.append(("IC Audio Export (WAV)", "ic_audio_export"))
+
 VIEW_GROUPS: list[tuple[str, list[ViewEntry]]] = [
     (
         "Spot & position QA",
@@ -56,21 +64,10 @@ VIEW_GROUPS: list[tuple[str, list[ViewEntry]]] = [
                 "IC Timeslice Replay (dDose/dt)",
                 "ic_timeslice_replay_derived",
             ),
-            ("IC Current FFT Analysis", "ic_fft_analysis"),
         ],
     ),
+    ("Noise measurement", _VIEW_NOISE),
 ]
-
-_HAS_AUDIO = importlib.util.find_spec("scan_kit.views.ic_audio_export") is not None
-
-if _HAS_AUDIO:
-    VIEW_GROUPS = [
-        *VIEW_GROUPS,
-        (
-            "Export",
-            [("IC Audio Export (WAV)", "ic_audio_export")],
-        ),
-    ]
 
 VIEWS: list[ViewEntry] = [
     entry for _title, entries in VIEW_GROUPS for entry in entries
