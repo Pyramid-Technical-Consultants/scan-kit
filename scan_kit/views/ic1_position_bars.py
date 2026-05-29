@@ -20,6 +20,7 @@ from ..common import (
     DEFAULT_SESSION_COLORS,
     FIG_SIZE_1x2,
     SUPTITLE_KW,
+    apply_tight_layout,
     REFLINE_KW,
 )
 
@@ -116,6 +117,5 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
     for ax in axes[1]:
         make_session_legend(ax, loaded_ids, colors)
 
-    plt.tight_layout()
-    fig.subplots_adjust(top=0.92, hspace=0.35)
+    apply_tight_layout()
     plt.show()

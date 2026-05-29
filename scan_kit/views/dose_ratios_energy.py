@@ -22,6 +22,7 @@ from ..common import (
     DEFAULT_SESSION_COLORS,
     FIG_SIZE_2x2,
     SUPTITLE_KW,
+    apply_tight_layout,
 )
 
 import logging
@@ -149,5 +150,5 @@ def run(session_ids: list[str], base_dir: str = "test_data",
 
     make_session_legend(box_axes[0], loaded_ids, colors)
 
-    plt.tight_layout()
+    apply_tight_layout()
     plt.show()

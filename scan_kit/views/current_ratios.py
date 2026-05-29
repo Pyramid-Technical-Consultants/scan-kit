@@ -22,6 +22,7 @@ from ..common import (
     make_session_legend,
     DEFAULT_SESSION_COLORS,
     SUPTITLE_KW,
+    apply_tight_layout,
 )
 from ..common import subtract_background_frames
 from ..common.processing import _detect_beam_off_mask
@@ -473,5 +474,5 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
     legend_ax = next((ax for ax in pct_axes if ax.get_visible()), axes[0, 0])
     make_session_legend(legend_ax, loaded_ids, colors)
 
-    plt.tight_layout()
+    apply_tight_layout()
     plt.show()

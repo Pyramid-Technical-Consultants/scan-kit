@@ -27,6 +27,7 @@ from ..common import (
     subtract_background_frames,
     DEFAULT_SESSION_COLORS,
     SUPTITLE_KW,
+    apply_tight_layout,
     GRID_KW,
 )
 from ..common.session_source import (
@@ -300,6 +301,5 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
     if has_current:
         axes[2, 0].legend(loc="upper left", fontsize=8)
 
-    plt.tight_layout()
-    fig.subplots_adjust(top=0.93, hspace=0.25)
+    apply_tight_layout()
     plt.show()

@@ -18,6 +18,7 @@ from ..common import (
     C_LAYER_ID,
     DEFAULT_SESSION_COLORS,
     SUPTITLE_KW,
+    apply_tight_layout,
     GRID_KW,
     REFLINE_KW,
 )
@@ -715,8 +716,7 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
         cbar_strip.set_label("Strip Current (%)")
         cbar_axes.append(cbar_ax_strip)
 
-    plt.tight_layout()
-    fig.subplots_adjust(top=0.93)
+    apply_tight_layout()
     for cbar_ax in cbar_axes:
         pos = cbar_ax.get_position()
         cbar_ax.set_position([pos.x0 - 0.006, pos.y0, pos.width, pos.height])

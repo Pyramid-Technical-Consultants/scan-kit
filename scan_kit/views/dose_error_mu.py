@@ -24,6 +24,7 @@ from ..common import (
     DEFAULT_SESSION_COLORS,
     FIG_SIZE_2x2,
     SUPTITLE_KW,
+    apply_tight_layout,
     REFLINE_KW,
     GRID_KW,
     DELIVERED_DOSE_COLS,
@@ -51,23 +52,17 @@ def _gate_threshold_pct(mu):
 
 
 def _draw_gate_curves(ax, mu_lo, mu_hi):
-    """Draw the ±gate-threshold curves vs target MU, keeping the data y-limits.
+    """Draw the ±gate-threshold curves vs target MU on *ax*.
 
     Returns the upper-curve line handle (for a legend), or ``None``.
     """
     if mu_lo is None or not (mu_hi > mu_lo > 0):
         return None
 
-    data_ylim = ax.get_ylim()
     xs = np.geomspace(mu_lo, mu_hi, 400)
     thr = _gate_threshold_pct(xs)
     (gate_line,) = ax.plot(xs, thr, label="Gate \u00b1(0.002 MU + 2%)", **GATE_LINE_KW)
     ax.plot(xs, -thr, **GATE_LINE_KW)
-
-    # Frame on the data, but make sure the ~2% asymptote is visible; let the
-    # small-MU flare clip rather than dictate the scale.
-    gate_ref = float(_gate_threshold_pct(mu_hi)) * 1.3
-    ax.set_ylim(min(data_ylim[0], -gate_ref), max(data_ylim[1], gate_ref))
     return gate_line
 
 
@@ -138,11 +133,13 @@ def run(session_ids: list[str], base_dir: str = "test_data",
 
     n_cols = len(err_cols)
     fig, axes = plt.subplots(
-        1, n_cols, figsize=(max(6, 5 * n_cols), FIG_SIZE_2x2[1]), squeeze=False,
+        1, n_cols, figsize=(max(6, 5 * n_cols), FIG_SIZE_2x2[1]),
+        squeeze=False, sharey=True,
     )
     axes = axes[0]
     fig.suptitle("Dose Error vs Target MU (% of prescribed dose)", **SUPTITLE_KW)
 
+    # Pass 1: scatter + trend so the (shared) y-axis autoscales to the data.
     for col_idx, col in enumerate(err_cols):
         ax = axes[col_idx]
         ic = col.split("_", 1)[0]
@@ -170,15 +167,29 @@ def run(session_ids: list[str], base_dir: str = "test_data",
 
         ax.set_title(IC_TITLES.get(ic, ic.upper()))
         ax.set_xlabel("Target (MU)")
-        ax.set_ylabel(f"{IC_TITLES.get(ic, ic.upper())} Error (% of target)")
         ax.axhline(y=0, **REFLINE_KW)
         ax.grid(**GRID_KW)
+        # Shared y-axis still shows tick labels on every panel for readability.
+        ax.tick_params(labelleft=True)
 
+    axes[0].set_ylabel("Error (% of target)")
+
+    # Common y-limits across all ICs: data range (shared via sharey), expanded
+    # just enough to keep the ~2% gate asymptote visible without letting the
+    # small-MU flare dictate the scale.
+    data_lo, data_hi = axes[0].get_ylim()
+    if mu_hi is not None:
+        gate_ref = float(_gate_threshold_pct(mu_hi)) * 1.3
+        data_lo, data_hi = min(data_lo, -gate_ref), max(data_hi, gate_ref)
+
+    # Pass 2: gate curves (shared limits applied after, so the flare clips).
+    for ax in axes:
         gate_line = _draw_gate_curves(ax, mu_lo, mu_hi)
         if gate_line is not None:
             ax.add_artist(ax.legend(handles=[gate_line], loc="lower right", fontsize=8))
+    axes[0].set_ylim(data_lo, data_hi)
 
     make_session_legend(axes[0], loaded_ids, colors)
 
-    plt.tight_layout()
+    apply_tight_layout()
     plt.show()

@@ -28,6 +28,8 @@ HIST_PERCENTILE_CLIP = 100  # percentile for histogram outlier filtering (e.g. 9
 SCATTER_ALPHA = 0.45
 SCATTER_SIZE = 18
 
+TIGHT_LAYOUT_PAD = 0.5  # project-wide tight-layout padding (smaller = tighter)
+
 SLOPE_LABEL_KW = dict(
     fontsize=10,
     color="black",
@@ -98,26 +100,46 @@ def plot_boxplots_for_column(
         )
 
 
-def annotate_slopes(ax, labels_and_colors, *, x_anchor=0.03, y_top=0.97):
+def annotate_slopes(ax, labels_and_colors, *, x_anchor=0.03, y_top=0.97,
+                    line_pitch=None):
     """Stack slope annotations inside the axes with a consistent project style.
+
+    Lines are spaced by a font-relative pitch (in points) so they sit as a
+    tight column regardless of the axes size.
 
     Args:
         ax: Matplotlib axes.
         labels_and_colors: List of (text, color) tuples.
         x_anchor: Horizontal position in axes fraction.
         y_top: Top of the first label in axes fraction.
+        line_pitch: Vertical step between lines, in points. Defaults to a tight
+            multiple of the label font size.
     """
-    dy = min(0.09, 0.88 / max(len(labels_and_colors), 1))
+    pitch = line_pitch if line_pitch is not None else SLOPE_LABEL_KW["fontsize"] * 1.6
     for k, (txt, _color) in enumerate(labels_and_colors):
-        ax.text(
-            x_anchor,
-            y_top - k * dy,
+        ax.annotate(
             txt,
-            transform=ax.transAxes,
+            xy=(x_anchor, y_top),
+            xycoords="axes fraction",
+            xytext=(0, -k * pitch),
+            textcoords="offset points",
             zorder=6,
             bbox=SLOPE_LABEL_BOX,
             **SLOPE_LABEL_KW,
         )
+
+
+def apply_tight_layout(fig=None, *, pad=TIGHT_LAYOUT_PAD, h_pad=None, w_pad=None,
+                       rect=None):
+    """Apply the project's standard tight layout to *fig*.
+
+    Use everywhere instead of bare ``plt.tight_layout()`` so every view shares
+    one tightness setting. ``fig`` defaults to the current figure. On modern
+    matplotlib this also reserves room for a ``suptitle``, so no extra
+    ``subplots_adjust`` slack is needed.
+    """
+    fig = fig if fig is not None else plt.gcf()
+    fig.tight_layout(pad=pad, h_pad=h_pad, w_pad=w_pad, rect=rect)
 
 
 def make_session_legend(ax, session_ids, colors, **kwargs):

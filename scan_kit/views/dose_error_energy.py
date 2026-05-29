@@ -22,6 +22,7 @@ from ..common import (
     DEFAULT_SESSION_COLORS,
     FIG_SIZE_2x2,
     SUPTITLE_KW,
+    apply_tight_layout,
     REFLINE_KW,
 )
 
@@ -168,5 +169,5 @@ def run(session_ids: list[str], base_dir: str = "test_data",
     for row in range(n_corr_rows, n_rows):
         corr_axes[row].set_visible(False)
 
-    plt.tight_layout()
+    apply_tight_layout()
     plt.show()

@@ -21,6 +21,7 @@ from ..common import (
     DEFAULT_SESSION_COLORS,
     FIG_SIZE_2x2,
     SUPTITLE_KW,
+    apply_tight_layout,
     GRID_KW,
 )
 
@@ -135,5 +136,5 @@ def run(session_ids: list[str], base_dir: str = "test_data",
     ax4.axis("off")
     make_session_legend(ax1, loaded_ids, colors)
 
-    plt.tight_layout()
+    apply_tight_layout()
     plt.show()

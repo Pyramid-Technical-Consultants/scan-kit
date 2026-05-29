@@ -18,6 +18,7 @@ from ..common import (
     style_energy_axes,
     DEFAULT_SESSION_COLORS,
     SUPTITLE_KW,
+    apply_tight_layout,
 )
 from ..common.session_source import (
     load_session_csv,
@@ -234,5 +235,5 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
 
     make_session_legend(axes[0, 0], loaded_ids, colors)
 
-    plt.tight_layout()
+    apply_tight_layout()
     plt.show()

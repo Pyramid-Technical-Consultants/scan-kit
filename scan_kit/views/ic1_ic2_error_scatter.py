@@ -7,6 +7,7 @@ from ..common import (
     process_position_data,
     FIG_SIZE_1x2,
     SUPTITLE_KW,
+    apply_tight_layout,
     GRID_KW,
     REFLINE_KW,
     SCATTER_ALPHA,
@@ -114,5 +115,5 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
     cbar.set_label("Energy (MeV)")
 
     fig.suptitle("Position Difference Between IC1 and IC2", **SUPTITLE_KW)
-    plt.tight_layout()
+    apply_tight_layout()
     plt.show()
