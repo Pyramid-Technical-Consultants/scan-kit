@@ -37,14 +37,12 @@ VIEW_GROUPS: list[tuple[str, list[ViewEntry]]] = [
     (
         "Dose vs prescription",
         [
-            ("Dose Ratios vs Energy", "dose_ratios"),
+            ("Dose Ratios vs Energy", "dose_ratios_energy"),
             ("Dose Ratios vs Position", "dose_ratios_position"),
-            ("Dose Ratios vs Spot Time", "dose_ratios_time"),
-            ("Dose Error vs Target (%)", "dose_error_vs_target"),
-            (
-                "Dose Error vs Target (mean scatter)",
-                "dose_error_vs_target_mean_scatter",
-            ),
+            ("Dose Ratios vs Spot Time", "dose_ratios_spot_time"),
+            ("Dose Error vs Energy", "dose_error_energy"),
+            ("Dose Error vs Energy (mean)", "dose_error_energy_mean"),
+            ("Dose Error vs Target MU", "dose_error_mu"),
             ("Dose Accumulation", "dose_accumulation"),
         ],
     ),

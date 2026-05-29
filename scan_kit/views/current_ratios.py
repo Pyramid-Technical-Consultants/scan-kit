@@ -2,7 +2,6 @@
 
 import logging
 
-import matplotlib.colors as mcolors
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -18,6 +17,7 @@ from ..common import (
     C_IC3_CURRENT_D,
     C_LAYER_ID,
     resolve_concept_column,
+    add_scatter_trend,
     annotate_slopes,
     make_session_legend,
     DEFAULT_SESSION_COLORS,
@@ -42,8 +42,6 @@ HEATMAP_BINS = 100  # Y-axis histogram bins for beam-on current heatmap
 DISPLAY_P95_FRAC = 0.75  # per-IC floor = p95 * frac, for heatmap/curve display only
 MIN_BEAM_SAMPLES = 10  # min beam-on samples per layer for a valid estimate
 # ─────────────────────────────────────────────────────────────────────────
-
-_MAD_SCALE = 1.4826  # median(|x-m|) * factor matches std for normal distribution
 
 _IC_CURRENT_COLS = {
     "ic1": [C_IC1_CURRENT],
@@ -222,14 +220,6 @@ def _load_current_ratios(
 # ── Plotting helpers ─────────────────────────────────────────────────────
 
 
-def _trend_line_color(face_color):
-    try:
-        rgb = mcolors.to_rgb(face_color)
-    except ValueError:
-        rgb = mcolors.to_rgb("C0")
-    return tuple(max(0.0, c * 0.55) for c in rgb)
-
-
 _RATIO_PAIRS = [
     ("ic21", "IC2 / IC1", "ic1", "ic2"),
     ("ic31", "IC3 / IC1", "ic1", "ic3"),
@@ -360,58 +350,24 @@ def _plot_ratio(ax, session_data, ratio_key, loaded_ids, colors):
         data = session_data[sid]
         if ratio_key not in data:
             continue
-        e = np.asarray(data["energy"], dtype=float)
-        r = np.asarray(data[ratio_key], dtype=float)
-        ok = np.isfinite(e) & np.isfinite(r)
-        e, r = e[ok], r[ok]
-        if e.size == 0:
-            continue
-
-        ax.scatter(e, r, c=colors[si], s=18, alpha=0.85, edgecolors="none", zorder=3)
-
-        if e.size >= 2:
-            keep = np.ones(e.size, dtype=bool)
-            for _ in range(OUTLIER_ITERATIONS):
-                if keep.sum() < 3:
-                    break
-                slope, intercept = np.polyfit(e[keep], r[keep], 1)
-                resid = r - (slope * e + intercept)
-                med = np.median(resid[keep])
-                sigma = np.median(np.abs(resid[keep] - med)) * _MAD_SCALE
-                if sigma < 1e-12:
-                    break
-                keep = np.abs(resid - med) <= OUTLIER_SIGMA * sigma
-
-            slope, intercept = np.polyfit(e[keep], r[keep], 1)
-
-            rejected = ~keep
-            if rejected.any():
-                ax.scatter(
-                    e[rejected],
-                    r[rejected],
-                    c=colors[si],
-                    s=18,
-                    alpha=0.25,
-                    edgecolors="red",
-                    linewidths=0.8,
-                    zorder=2,
-                )
-
-            e_range = np.array([e.min(), e.max()])
-            line_color = _trend_line_color(colors[si])
-            ax.plot(
-                e_range,
-                slope * e_range + intercept,
-                color=line_color,
-                linewidth=2.0,
-                linestyle="-",
-                zorder=4,
-            )
-            fit_delta = slope * (e.max() - e.min())
-            prefix = f"{sid}: " if n_sessions > 1 else ""
-            slope_labels.append(
-                (f"{prefix}{slope:+.4g} %/MeV  (\u0394 {fit_delta:+.3g}%)", line_color)
-            )
+        prefix = f"{sid}: " if n_sessions > 1 else ""
+        res = add_scatter_trend(
+            ax,
+            data["energy"],
+            data[ratio_key],
+            color=colors[si],
+            unit="%/MeV",
+            prefix=prefix,
+            alpha=0.85,
+            size=18,
+            robust=True,
+            outlier_sigma=OUTLIER_SIGMA,
+            outlier_iterations=OUTLIER_ITERATIONS,
+            highlight_rejected=True,
+            show_delta=True,
+        )
+        if res is not None:
+            slope_labels.append(res)
 
     if slope_labels:
         annotate_slopes(ax, slope_labels)

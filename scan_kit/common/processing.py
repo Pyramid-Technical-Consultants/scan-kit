@@ -9,6 +9,7 @@ from . import validation
 
 _log = logging.getLogger(__name__)
 from .schema import (
+    C_CHARGE_REQ,
     C_ENERGY,
     C_IC1_TOTAL_DOSE,
     C_IC1_X_POS,
@@ -199,6 +200,44 @@ def add_dose_ratio_columns(data: dict, *, include_ic3: bool) -> dict | None:
             result["ic31_ratio"] = ((ic3 / ic1) - 1.0) * 100.0
             result["ic32_ratio"] = ((ic3 / ic2) - 1.0) * 100.0
 
+    return result
+
+
+DELIVERED_DOSE_COLS = {
+    "ic1": C_IC1_TOTAL_DOSE,
+    "ic2": C_IC2_TOTAL_DOSE,
+    "ic3": C_IC3_TOTAL_DOSE,
+}
+
+
+def pct_error_vs_target(delivered, target) -> np.ndarray:
+    """``(delivered - target) / target * 100`` where ``|target| > 0``; else NaN."""
+    d = np.asarray(delivered, dtype=float)
+    t = np.asarray(target, dtype=float)
+    out = np.full_like(d, np.nan, dtype=float)
+    ok = np.isfinite(d) & np.isfinite(t) & (np.abs(t) > 1e-15)
+    out[ok] = (d[ok] - t[ok]) / t[ok] * 100.0
+    return out
+
+
+def add_dose_error_columns(data: dict, *, target_col: str = C_CHARGE_REQ,
+                           delivered_cols: dict | None = None) -> dict | None:
+    """Add per-spot ``{ic}_dose_err_pct`` (% of target) columns for each IC present.
+
+    Shared by the dose-error views. Returns a new dict, or ``None`` when the
+    target column or every delivered-dose column is missing.
+    """
+    delivered_cols = delivered_cols or DELIVERED_DOSE_COLS
+    if target_col not in data:
+        return None
+    if not any(col in data for col in delivered_cols.values()):
+        return None
+
+    result = dict(data)
+    target = result[target_col]
+    for ic, col in delivered_cols.items():
+        if col in result:
+            result[f"{ic}_dose_err_pct"] = pct_error_vs_target(result[col], target)
     return result
 
 

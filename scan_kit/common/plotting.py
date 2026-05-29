@@ -1,9 +1,13 @@
 """Plotting utilities for scan-kit analysis scripts."""
 
+from dataclasses import dataclass
+
 import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
 from matplotlib.widgets import SpanSelector
 import numpy as np
 import pandas as pd
+from scipy import stats
 
 from .plot_colors import DEFAULT_SESSION_COLORS
 
@@ -211,6 +215,338 @@ def scatter_with_trend(
         zorder=zorder,
     )
     return slope
+
+
+# ---------------------------------------------------------------------------
+# Unified trend lines
+#
+# A single core for every trend line drawn across the views. ``fit_trend``
+# does the math (with optional robust MAD outlier rejection), ``trend_line_color``
+# / ``TREND_LINE_KW`` give a consistent look, and ``format_trend_label`` produces
+# consistent annotation text. The high-level helpers (``add_scatter_trend``,
+# ``add_energy_trend``, ``add_correlation_scatter``) cover the three shapes the
+# views actually need.
+# ---------------------------------------------------------------------------
+
+_MAD_SCALE = 1.4826  # median(|x - m|) * factor matches std for a normal dist
+TREND_DARKEN = 0.55  # multiply a face color by this for its trend-line color
+
+TREND_LINE_KW = dict(linewidth=2.0, linestyle="-", solid_capstyle="round")
+REJECTED_KW = dict(edgecolors="red", linewidths=0.8, alpha=0.25, zorder=2)
+
+
+def trend_line_color(face_color):
+    """Darker variant of *face_color* used for trend lines.
+
+    Keeps trend lines visually tied to their session/series color while staying
+    readable on top of the lighter scatter/box markers.
+    """
+    try:
+        rgb = mcolors.to_rgb(face_color)
+    except (ValueError, TypeError):
+        rgb = mcolors.to_rgb("C0")
+    return tuple(max(0.0, c * TREND_DARKEN) for c in rgb)
+
+
+@dataclass
+class TrendFit:
+    """Result of a linear trend fit (see :func:`fit_trend`)."""
+
+    slope: float
+    intercept: float
+    x: np.ndarray  # finite x values used for the fit
+    y: np.ndarray  # finite y values used for the fit
+    keep: np.ndarray  # bool mask over x/y of inliers kept by robust rejection
+    r2: float
+    n: int  # number of inliers
+
+    def eval(self, xs):
+        """Fitted ``y`` at the given ``xs``."""
+        return self.slope * np.asarray(xs, dtype=float) + self.intercept
+
+    @property
+    def x_span(self) -> float:
+        return float(self.x.max() - self.x.min()) if self.x.size else float("nan")
+
+    @property
+    def delta(self) -> float:
+        """Change in fitted ``y`` across the observed x-range."""
+        return self.slope * self.x_span
+
+
+def fit_trend(x, y, *, robust=False, outlier_sigma=2.0, outlier_iterations=3):
+    """Least-squares linear fit with optional iterative MAD outlier rejection.
+
+    Args:
+        x, y: Data arrays (non-finite pairs are dropped before fitting).
+        robust: When True, iteratively reject points more than ``outlier_sigma``
+            robust standard deviations (MAD-based) from the fit.
+        outlier_sigma: Rejection threshold in robust sigmas.
+        outlier_iterations: Maximum re-weighting passes.
+
+    Returns:
+        A :class:`TrendFit` (``keep`` flags robust inliers), or ``None`` when
+        fewer than two finite points are available.
+    """
+    xf = np.asarray(x, dtype=float)
+    yf = np.asarray(y, dtype=float)
+    finite = np.isfinite(xf) & np.isfinite(yf)
+    xf, yf = xf[finite], yf[finite]
+    if xf.size < 2:
+        return None
+
+    keep = np.ones(xf.size, dtype=bool)
+    if robust:
+        for _ in range(outlier_iterations):
+            if keep.sum() < 3:
+                break
+            s, b = np.polyfit(xf[keep], yf[keep], 1)
+            resid = yf - (s * xf + b)
+            med = np.median(resid[keep])
+            sigma = np.median(np.abs(resid[keep] - med)) * _MAD_SCALE
+            if sigma < 1e-12:
+                break
+            keep = np.abs(resid - med) <= outlier_sigma * sigma
+
+    slope, intercept = np.polyfit(xf[keep], yf[keep], 1)
+    fitted = slope * xf[keep] + intercept
+    ss_res = float(np.sum((yf[keep] - fitted) ** 2))
+    ss_tot = float(np.sum((yf[keep] - yf[keep].mean()) ** 2))
+    r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan")
+    return TrendFit(
+        slope=float(slope), intercept=float(intercept),
+        x=xf, y=yf, keep=keep, r2=r2, n=int(keep.sum()),
+    )
+
+
+def _value_unit(unit):
+    """The quantity's own unit, derived from a slope unit (``"%/MeV"`` -> ``"%"``)."""
+    return unit.split("/")[0].strip() if unit else ""
+
+
+def _fmt_value(value, fmt, value_unit):
+    """Format a value with its unit (``%`` attaches directly, others get a space)."""
+    if value_unit == "%":
+        return f"{value:{fmt}}%"
+    if value_unit:
+        return f"{value:{fmt}} {value_unit}"
+    return f"{value:{fmt}}"
+
+
+def format_trend_label(*, prefix="", slope=None, unit=None, mean=None,
+                       delta=None, r2=None, ccc=None):
+    """Build a consistent trend annotation string.
+
+    Pieces appear in a fixed order (slope, mean, Δ, R², CCC); pass only what
+    applies. ``mean`` and ``\u0394`` are shown in the quantity's own unit, derived
+    from ``unit`` (e.g. ``"%/MeV"`` -> ``"%"``, ``"ms/MeV"`` -> ``"ms"``).
+    Example: ``"S1: +0.12 %/MeV   \u03bc+0.34%   \u0394+1.2%"``.
+    """
+    value_unit = _value_unit(unit)
+    parts = []
+    if slope is not None and unit is not None:
+        parts.append(f"{slope:+.4g} {unit}")
+    if mean is not None:
+        parts.append("\u03bc" + _fmt_value(mean, "+.2f", value_unit))
+    if delta is not None:
+        parts.append("\u0394" + _fmt_value(delta, "+.3g", value_unit))
+    if r2 is not None:
+        parts.append(f"R\u00b2={r2:.4f}")
+    if ccc is not None:
+        parts.append(f"CCC={ccc:.4f}")
+    return prefix + "   ".join(parts)
+
+
+def add_scatter_trend(
+    ax, x, y, *, color, unit, prefix="",
+    scatter=True, label=None,
+    alpha=SCATTER_ALPHA, size=SCATTER_SIZE, scatter_zorder=3,
+    robust=False, outlier_sigma=2.0, outlier_iterations=3,
+    highlight_rejected=False, show_mean=True, show_delta=True, show_r2=False,
+    line_zorder=5,
+):
+    """Scatter ``y`` vs a continuous ``x`` and overlay a linear trend line.
+
+    Combines the simple and robust scatter-trend variants used across the views.
+    When ``robust`` is set, outliers are rejected (MAD-based) and optionally
+    re-drawn with a red edge via ``highlight_rejected``. The annotation shows
+    slope, mean and Δ-over-range by default (``show_mean`` / ``show_delta``).
+
+    Returns:
+        ``(label_text, line_color)`` suitable for :func:`annotate_slopes`, or
+        ``None`` when fewer than two finite points exist.
+    """
+    if scatter:
+        ax.scatter(x, y, c=color, alpha=alpha, s=size, edgecolors="none",
+                   zorder=scatter_zorder, label=label)
+
+    fit = fit_trend(x, y, robust=robust, outlier_sigma=outlier_sigma,
+                    outlier_iterations=outlier_iterations)
+    if fit is None:
+        return None
+
+    if highlight_rejected and robust:
+        rejected = ~fit.keep
+        if rejected.any():
+            ax.scatter(fit.x[rejected], fit.y[rejected], c=color, s=size,
+                       **REJECTED_KW)
+
+    line_color = trend_line_color(color)
+    x_range = np.array([fit.x.min(), fit.x.max()])
+    ax.plot(x_range, fit.eval(x_range), color=line_color, zorder=line_zorder,
+            **TREND_LINE_KW)
+
+    mean_val = float(np.mean(fit.y)) if fit.y.size else float("nan")
+    label_text = format_trend_label(
+        prefix=prefix, slope=fit.slope, unit=unit,
+        mean=mean_val if show_mean else None,
+        delta=fit.delta if show_delta else None,
+        r2=fit.r2 if show_r2 else None,
+    )
+    return label_text, line_color
+
+
+def add_energy_trend(
+    ax, session_data, column, energies, colors, *,
+    agg="median", unit="%/MeV", position_offset=0.0,
+    show_mean=True, show_delta=True, prefix_with_session=True, line_zorder=5,
+):
+    """Per-session trend through per-energy aggregates on a categorical x-axis.
+
+    For box-plot / per-energy-scatter panels where the x-axis is energy index
+    (0..N-1). Each session's ``column`` is aggregated per energy (``"median"``
+    or ``"mean"``), a line is fit vs energy in MeV, and drawn across the
+    categorical positions (offset per session by ``position_offset``). The
+    annotation shows slope, mean and Δ-over-range by default. Stacked labels are
+    added via :func:`annotate_slopes`.
+
+    Returns the list of ``(label, color)`` tuples that were annotated.
+    """
+    agg_fn = np.median if agg == "median" else np.mean
+    n_sessions = len(session_data)
+    energies_f = np.asarray(energies, dtype=float)
+    labels: list[tuple[str, tuple]] = []
+
+    for i, (sid, data) in enumerate(session_data.items()):
+        if column not in data:
+            continue
+        col = np.asarray(data[column], dtype=float)
+        e_all = np.asarray(data["energy"], dtype=float)
+
+        mean_err = None
+        if show_mean:
+            finite = col[np.isfinite(col)]
+            mean_err = float(np.mean(finite)) if finite.size else float("nan")
+
+        e_mev, y_agg = [], []
+        for energy in energies:
+            vals = col[e_all == energy]
+            vals = vals[np.isfinite(vals)]
+            if vals.size:
+                e_mev.append(float(energy))
+                y_agg.append(float(agg_fn(vals)))
+        if len(e_mev) < 2:
+            continue
+
+        slope, intercept = np.polyfit(np.array(e_mev), np.array(y_agg), 1)
+        line_color = trend_line_color(colors[i])
+        xs = [j + (i - 0.5) * position_offset for j in range(len(energies))]
+        ys = slope * energies_f + intercept
+        ax.plot(xs, ys, color=line_color, zorder=line_zorder, clip_on=True,
+                **TREND_LINE_KW)
+
+        delta = slope * (max(e_mev) - min(e_mev)) if show_delta else None
+        prefix = f"{sid}: " if (prefix_with_session and n_sessions > 1) else ""
+        labels.append((
+            format_trend_label(prefix=prefix, slope=slope, unit=unit,
+                               mean=mean_err, delta=delta),
+            line_color,
+        ))
+
+    if labels:
+        annotate_slopes(ax, labels)
+    return labels
+
+
+def add_correlation_scatter(
+    ax, session_data, col_x, col_y, loaded_ids, colors, *,
+    xlabel=None, ylabel=None, percentile_clip=None, equal_aspect=False,
+    alpha=SCATTER_ALPHA, size=SCATTER_SIZE,
+):
+    """Scatter ``col_x`` vs ``col_y`` per session with fit, R\u00b2/CCC and a y=x line.
+
+    Each session gets a linear fit; the annotation reports Pearson R\u00b2 and the
+    concordance correlation coefficient (CCC). ``percentile_clip`` (e.g. 99.9)
+    trims shared outliers before fitting. The axis is hidden when no session has
+    both columns.
+
+    Returns the list of ``(label, color)`` tuples that were annotated.
+    """
+    raw_pairs = []
+    for sid in loaded_ids:
+        data = session_data[sid]
+        if col_x not in data or col_y not in data:
+            continue
+        x = np.asarray(data[col_x], dtype=float)
+        y = np.asarray(data[col_y], dtype=float)
+        m = np.isfinite(x) & np.isfinite(y)
+        if m.any():
+            raw_pairs.append((sid, x[m], y[m]))
+
+    if not raw_pairs:
+        ax.set_visible(False)
+        return []
+
+    if percentile_clip is not None and percentile_clip < 100:
+        allv = np.concatenate([np.concatenate([p[1], p[2]]) for p in raw_pairs])
+        lo, hi = np.percentile(allv, [100 - percentile_clip, percentile_clip])
+    else:
+        lo, hi = -np.inf, np.inf
+
+    sid_index = {sid: i for i, sid in enumerate(loaded_ids)}
+    labels: list[tuple[str, tuple]] = []
+    plotted = False
+
+    for sid, x_raw, y_raw in raw_pairs:
+        keep = (x_raw >= lo) & (x_raw <= hi) & (y_raw >= lo) & (y_raw <= hi)
+        x, y = x_raw[keep], y_raw[keep]
+        if x.size < 2:
+            continue
+        i = sid_index[sid]
+        ax.scatter(x, y, c=colors[i], alpha=alpha, s=size, edgecolors="none")
+        plotted = True
+
+        r, _ = stats.pearsonr(x, y)
+        sx, sy, mx, my = x.std(), y.std(), x.mean(), y.mean()
+        ccc = (2 * r * sx * sy) / (sx**2 + sy**2 + (mx - my) ** 2)
+
+        line_color = trend_line_color(colors[i])
+        fit = fit_trend(x, y)
+        x_range = np.array([x.min(), x.max()])
+        ax.plot(x_range, fit.eval(x_range), color=line_color, linewidth=1.8,
+                linestyle="-", zorder=5)
+
+        prefix = f"{sid}: " if len(loaded_ids) > 1 else ""
+        labels.append((format_trend_label(prefix=prefix, r2=r**2, ccc=ccc),
+                       line_color))
+
+    if plotted:
+        ax.autoscale_view()
+        xlim, ylim = ax.get_xlim(), ax.get_ylim()
+        ref_lo, ref_hi = max(xlim[0], ylim[0]), min(xlim[1], ylim[1])
+        if ref_lo < ref_hi:
+            ax.plot([ref_lo, ref_hi], [ref_lo, ref_hi], **REFLINE_KW)
+        if equal_aspect:
+            ax.set_aspect("equal", adjustable="datalim")
+
+    if labels:
+        annotate_slopes(ax, labels)
+    if xlabel:
+        ax.set_xlabel(xlabel)
+    if ylabel:
+        ax.set_ylabel(ylabel)
+    ax.grid(visible=True, alpha=0.3)
+    return labels
 
 
 def add_energy_colorbar(fig_or_ax, energies=None, vmin=None, vmax=None):

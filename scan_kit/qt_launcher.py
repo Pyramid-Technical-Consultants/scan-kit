@@ -27,7 +27,6 @@ from PySide6.QtGui import (
     QShortcut,
 )
 from PySide6.QtWidgets import (
-    QAbstractButton,
     QApplication,
     QButtonGroup,
     QFileDialog,
@@ -41,7 +40,6 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
-    QRadioButton,
     QScrollArea,
     QSizePolicy,
     QSplitter,
@@ -66,13 +64,6 @@ if FROZEN:
 else:
     PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
-_SORT_MODES = ["date", "id", "mu"]
-_SORT_LABELS = {
-    "date": "Date",
-    "id": "ID",
-    "mu": "MU",
-}
-
 # Analysis launcher button grid (see VIEW_GROUPS for workflow sections).
 _VIEW_GRID_COLS = 2
 
@@ -85,11 +76,12 @@ _CAL_MODE_LABELS = {
     "constrained": "Constrained",
 }
 
-_EPOCH = datetime(1970, 1, 1)
 _SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 _READY_SENTINEL = "__SCAN_KIT_PLOT_READY__"
 _SESSION_ROLE = Qt.ItemDataRole.UserRole
 _SWATCH_STATE_ROLE = Qt.ItemDataRole.UserRole + 1
+#: Real (datetime/float/int) value used for chronological/numeric column sorting.
+_SORT_VALUE_ROLE = Qt.ItemDataRole.UserRole + 2
 
 # session_table column indices
 _COL_USE = 0
@@ -154,17 +146,24 @@ _CAL_FACTOR_LABELS = {
 }
 
 
-def _sort_key(
-    item: tuple[str, str, SessionMeta | None], mode: str
-) -> tuple:
-    sid, _zp, meta = item
-    if mode == "date":
-        d = meta.date if meta and meta.date else _EPOCH
-        return (d, sid)
-    if mode == "mu":
-        mu = meta.primary_mu if meta and meta.primary_mu is not None else 0.0
-        return (mu, sid)
-    return (sid,)
+class _SortableItem(QTableWidgetItem):
+    """Table item that sorts on the value stored in :data:`_SORT_VALUE_ROLE`.
+
+    Lets the Date / MU / Time columns sort chronologically/numerically while the
+    cell still displays a formatted string (and a ``—``/``?`` placeholder when the
+    metadata is missing). Missing values (``None``) always sort as the smallest, so
+    they land at the bottom under the default descending-by-date order.
+    """
+
+    def __lt__(self, other: QTableWidgetItem) -> bool:
+        a = self.data(_SORT_VALUE_ROLE)
+        b = other.data(_SORT_VALUE_ROLE) if isinstance(other, QTableWidgetItem) else None
+        if a is None or b is None:
+            return a is None and b is not None
+        try:
+            return a < b
+        except TypeError:
+            return str(a) < str(b)
 
 
 def _meta_column_texts(meta: SessionMeta | None) -> tuple[str, str, str]:
@@ -172,6 +171,109 @@ def _meta_column_texts(meta: SessionMeta | None) -> tuple[str, str, str]:
     if meta is None:
         return "—", "—", "—"
     return meta.short_date, meta.short_mu, meta.short_time
+
+
+def _meta_sort_values(
+    meta: SessionMeta | None,
+) -> tuple[datetime | None, float | None, int | None]:
+    """Real sort values for the Date / MU / Time columns (``None`` when unknown)."""
+    if meta is None:
+        return (None, None, None)
+    return (meta.date, meta.primary_mu, meta.treatment_time_s)
+
+
+# Segmented control look: connected checkable buttons, accent-filled when selected.
+# Uses palette() roles so it follows the active light/dark theme.
+_SEGMENTED_QSS = """
+_SegmentedControl QPushButton {
+    border: 1px solid palette(mid);
+    padding: 5px 14px;
+    background: palette(button);
+    color: palette(button-text);
+}
+_SegmentedControl QPushButton[seg="mid"],
+_SegmentedControl QPushButton[seg="right"] {
+    border-left: none;
+}
+_SegmentedControl QPushButton[seg="left"] {
+    border-top-left-radius: 6px;
+    border-bottom-left-radius: 6px;
+}
+_SegmentedControl QPushButton[seg="right"] {
+    border-top-right-radius: 6px;
+    border-bottom-right-radius: 6px;
+}
+_SegmentedControl QPushButton[seg="only"] {
+    border-radius: 6px;
+}
+_SegmentedControl QPushButton:hover:!checked {
+    background: palette(midlight);
+}
+_SegmentedControl QPushButton:checked {
+    background: palette(highlight);
+    color: palette(highlighted-text);
+    border-color: palette(highlight);
+}
+"""
+
+
+class _SegmentedControl(QWidget):
+    """Compact horizontal selector: connected checkable buttons that act as one radio set.
+
+    Build with ``[(key, label), …]``; emits :attr:`selectionChanged` with the chosen
+    key on user interaction only. Use :meth:`set_current` to reflect external state
+    without re-emitting.
+    """
+
+    selectionChanged = Signal(str)
+
+    def __init__(
+        self,
+        options: list[tuple[str, str]],
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._buttons: dict[str, QPushButton] = {}
+        self._group = QButtonGroup(self)
+        self._group.setExclusive(True)
+
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+
+        n = len(options)
+        for i, (key, label) in enumerate(options):
+            btn = QPushButton(label)
+            btn.setCheckable(True)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            if n == 1:
+                seg = "only"
+            elif i == 0:
+                seg = "left"
+            elif i == n - 1:
+                seg = "right"
+            else:
+                seg = "mid"
+            btn.setProperty("seg", seg)
+            self._group.addButton(btn)
+            self._buttons[key] = btn
+            lay.addWidget(btn)
+
+        self.setStyleSheet(_SEGMENTED_QSS)
+        # buttonClicked fires only on user interaction, not programmatic setChecked.
+        self._group.buttonClicked.connect(self._on_clicked)
+
+    def _on_clicked(self, button: QPushButton) -> None:
+        for key, btn in self._buttons.items():
+            if btn is button:
+                self.selectionChanged.emit(key)
+                return
+
+    def set_current(self, key: str) -> None:
+        btn = self._buttons.get(key)
+        if btn is not None:
+            btn.setChecked(True)
 
 
 class ScanKitMainWindow(QMainWindow):
@@ -203,11 +305,11 @@ class ScanKitMainWindow(QMainWindow):
             self._base_dir = str(PROJECT_ROOT / "test_data")
         self._sessions: list[str] = []
         self._discovered: list[tuple[str, str, SessionMeta | None]] = []
-        self._sort_mode: str = "date"
         self._hydrate_generation: int = 0
         self._hydrate_received: int = 0
         self._scan_complete: bool = False
         self._meta_pool: ThreadPoolExecutor | None = None
+        self._worker_threads: list[threading.Thread] = []
         self._child_procs: list[subprocess.Popen] = []
         self._running_views: dict[str, tuple[subprocess.Popen, str]] = {}
         self._open_views: dict[str, subprocess.Popen] = {}
@@ -218,12 +320,10 @@ class ScanKitMainWindow(QMainWindow):
         self._highlighted_sid: str | None = None
         self._settings = ViewSettings()
         self._check_order: list[str] = []
-        self._repopulating = False
         self._view_buttons: dict[str, QPushButton] = {}
         self._bootstrap_generation: int = 0
         self._meta_col_resize_timer: QTimer | None = None
         self._status_refresh_timer: QTimer | None = None
-        self._session_resort_timer: QTimer | None = None
         self._row_by_sid: dict[str, int] = {}
 
         boot = QWidget()
@@ -244,9 +344,6 @@ class ScanKitMainWindow(QMainWindow):
         self._status_refresh_timer = QTimer(self)
         self._status_refresh_timer.setSingleShot(True)
         self._status_refresh_timer.timeout.connect(self._update_status)
-        self._session_resort_timer = QTimer(self)
-        self._session_resort_timer.setSingleShot(True)
-        self._session_resort_timer.timeout.connect(self._apply_session_resort)
         self._connect_thread_signals()
         QTimer.singleShot(0, self._request_settings_then_scan)
 
@@ -282,23 +379,6 @@ class ScanKitMainWindow(QMainWindow):
             self._status_refresh_timer.start(0)
         else:
             self._update_status()
-
-    def _schedule_session_resort(self) -> None:
-        """Coalesce Date/MU re-sorts while metadata streams in from the thread pool."""
-        if self._sort_mode not in ("date", "mu"):
-            return
-        if self._session_resort_timer is not None:
-            self._session_resort_timer.start(50)
-
-    @Slot()
-    def _apply_session_resort(self) -> None:
-        if self._sort_mode not in ("date", "mu"):
-            return
-        ordered = self._sorted_session_rows()
-        if self._reorder_session_table(ordered):
-            self._schedule_status_refresh()
-            return
-        self._repopulate_list()
 
     def _rebuild_session_row_index(self) -> None:
         self._row_by_sid.clear()
@@ -341,21 +421,6 @@ class ScanKitMainWindow(QMainWindow):
         data_dir_row.addWidget(browse_dir_btn)
         left_l.addLayout(data_dir_row)
 
-        sort_row = QHBoxLayout()
-        self._sort_group = QButtonGroup(self)
-        self._sort_group.setExclusive(True)
-        self._sort_buttons: dict[str, QPushButton] = {}
-        for mode in _SORT_MODES:
-            b = QPushButton(_SORT_LABELS[mode])
-            b.setCheckable(True)
-            if mode == self._sort_mode:
-                b.setChecked(True)
-            self._sort_group.addButton(b)
-            self._sort_buttons[mode] = b
-            b.clicked.connect(partial(self._set_sort, mode))
-            sort_row.addWidget(b)
-        left_l.addLayout(sort_row)
-
         self.session_table = QTableWidget()
         self.session_table.setColumnCount(6)
         self.session_table.setHorizontalHeaderLabels(
@@ -365,7 +430,10 @@ class ScanKitMainWindow(QMainWindow):
             QTableWidget.SelectionBehavior.SelectRows
         )
         self.session_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
-        self.session_table.setSortingEnabled(False)
+        # Native column sorting: click a header to sort; rows stay intact because every
+        # cell is a QTableWidgetItem (no setCellWidget). Date/MU/Time use _SortableItem
+        # so they order by real value rather than the formatted display string.
+        self.session_table.setSortingEnabled(True)
         self.session_table.setAlternatingRowColors(True)
         # Avoid "..." clipping in cells; use horizontal scroll when row is wider than the view.
         self.session_table.setTextElideMode(Qt.TextElideMode.ElideNone)
@@ -381,6 +449,9 @@ class ScanKitMainWindow(QMainWindow):
         hh.setSectionResizeMode(_COL_TIME, QHeaderView.ResizeMode.ResizeToContents)
         hh.setSectionResizeMode(_COL_NOTE, QHeaderView.ResizeMode.Stretch)
         hh.resizeSection(_COL_SESSION_ID, 220)
+        hh.setSortIndicatorShown(True)
+        # Default ordering: newest session first.
+        self.session_table.sortByColumn(_COL_DATE, Qt.SortOrder.DescendingOrder)
         self.session_table.verticalHeader().setVisible(False)
         self.session_table.setIconSize(QSize(_SWATCH_PX, _SWATCH_PX))
         self.session_table.itemChanged.connect(self._on_session_table_item_changed)
@@ -406,28 +477,20 @@ class ScanKitMainWindow(QMainWindow):
 
         right_l.addWidget(QLabel("SETTINGS"))
 
-        bg_box = QGroupBox("BG Subtraction")
-        bg_inner = QVBoxLayout(bg_box)
-        self._bg_group = QButtonGroup(self)
-        self.bg_off_radio = QRadioButton("Off")
-        self.bg_on_radio = QRadioButton("On")
-        for rb in (self.bg_off_radio, self.bg_on_radio):
-            self._bg_group.addButton(rb)
-            bg_inner.addWidget(rb)
-        self._bg_group.buttonClicked.connect(self._on_bg_group_clicked)
-        right_l.addWidget(bg_box)
+        self._bg_segmented = _SegmentedControl([("off", "Off"), ("on", "On")])
+        self._bg_segmented.selectionChanged.connect(self._on_bg_segment_changed)
+        self._cal_segmented = _SegmentedControl(
+            [(mode, _CAL_MODE_LABELS[mode]) for mode in CALIBRATION_MODES]
+        )
+        self._cal_segmented.selectionChanged.connect(self._on_cal_segment_changed)
 
-        cal_box = QGroupBox("Calibration")
-        cal_inner = QVBoxLayout(cal_box)
-        self._cal_group = QButtonGroup(self)
-        self._cal_radios: dict[str, QRadioButton] = {}
-        for mode in CALIBRATION_MODES:
-            rb = QRadioButton(_CAL_MODE_LABELS[mode])
-            self._cal_group.addButton(rb)
-            self._cal_radios[mode] = rb
-            cal_inner.addWidget(rb)
-        self._cal_group.buttonClicked.connect(self._on_cal_group_clicked)
-        right_l.addWidget(cal_box)
+        settings_row = QHBoxLayout()
+        settings_row.addWidget(QLabel("BG Subtraction"))
+        settings_row.addWidget(self._bg_segmented)
+        settings_row.addSpacing(16)
+        settings_row.addWidget(QLabel("Calibration"))
+        settings_row.addWidget(self._cal_segmented, stretch=1)
+        right_l.addLayout(settings_row)
 
         self.cal_factors_label = QLabel("")
         self.cal_factors_label.setWordWrap(True)
@@ -472,11 +535,13 @@ class ScanKitMainWindow(QMainWindow):
         self._bootstrap_generation += 1
         gen = self._bootstrap_generation
         base_dir = self._base_dir
-        threading.Thread(
-            target=self._settings_io_worker,
-            args=(gen, base_dir),
-            daemon=True,
-        ).start()
+        self._track_worker(
+            threading.Thread(
+                target=self._settings_io_worker,
+                args=(gen, base_dir),
+                daemon=True,
+            )
+        )
 
     def _settings_io_worker(self, bootstrap_gen: int, base_dir: str) -> None:
         try:
@@ -517,26 +582,14 @@ class ScanKitMainWindow(QMainWindow):
         self.base_dir_input.setText(chosen)
         self._on_base_dir_finished()
 
-    def _on_bg_group_clicked(self, button: QAbstractButton) -> None:
-        self._set_bg_subtract(button is self.bg_on_radio)
+    def _on_bg_segment_changed(self, key: str) -> None:
+        self._set_bg_subtract(key == "on")
 
-    def _on_cal_group_clicked(self, button: QAbstractButton) -> None:
-        for mode, rb in self._cal_radios.items():
-            if rb is button:
-                self._set_calibration_mode(mode)
-                return
+    def _on_cal_segment_changed(self, key: str) -> None:
+        self._set_calibration_mode(key)
 
     def _sync_bg_buttons(self) -> None:
-        self.bg_off_radio.blockSignals(True)
-        self.bg_on_radio.blockSignals(True)
-        try:
-            if self._settings.bg_subtract:
-                self.bg_on_radio.setChecked(True)
-            else:
-                self.bg_off_radio.setChecked(True)
-        finally:
-            self.bg_off_radio.blockSignals(False)
-            self.bg_on_radio.blockSignals(False)
+        self._bg_segmented.set_current("on" if self._settings.bg_subtract else "off")
 
     def _set_bg_subtract(self, on: bool) -> None:
         self._settings.bg_subtract = on
@@ -544,13 +597,7 @@ class ScanKitMainWindow(QMainWindow):
         self._sync_bg_buttons()
 
     def _sync_cal_buttons(self) -> None:
-        mode = self._settings.calibration_mode
-        for m, rb in self._cal_radios.items():
-            rb.blockSignals(True)
-            try:
-                rb.setChecked(m == mode)
-            finally:
-                rb.blockSignals(False)
+        self._cal_segmented.set_current(self._settings.calibration_mode)
 
     def _set_calibration_mode(self, mode: str) -> None:
         self._settings.calibration_mode = mode
@@ -570,104 +617,6 @@ class ScanKitMainWindow(QMainWindow):
                 parts.append(f"{label}: {factors[col]:.4f}")
         self.cal_factors_label.setText("  ".join(parts) if parts else "")
 
-    def _sorted_session_rows(self) -> list[tuple[str, str, SessionMeta | None]]:
-        reverse = self._sort_mode == "date"
-        return sorted(
-            self._discovered,
-            key=lambda t: _sort_key(t, self._sort_mode),
-            reverse=reverse,
-        )
-
-    def _current_table_session_order(self) -> list[str] | None:
-        """Session ID per visual row, or None if the table is missing data."""
-        n = self.session_table.rowCount()
-        if n == 0:
-            return []
-        out: list[str] = []
-        seen: set[str] = set()
-        for r in range(n):
-            sid = self._session_row_sid(r)
-            if sid is None or sid in seen:
-                return None
-            seen.add(sid)
-            out.append(sid)
-        return out
-
-    def _reorder_session_table(
-        self,
-        ordered: list[tuple[str, str, SessionMeta | None]],
-    ) -> bool:
-        """Reorder existing rows without recreating widgets (cheap vs full repopulate)."""
-        n = len(ordered)
-        col_count = self.session_table.columnCount()
-        if n == 0 or n != self.session_table.rowCount():
-            return False
-
-        table_sids = self._current_table_session_order()
-        if table_sids is None:
-            return False
-        want_sids = [s for s, _, _ in ordered]
-        if table_sids == want_sids:
-            return True
-        if set(table_sids) != set(want_sids):
-            return False
-
-        prev_checked = set(self._checked_sids_ordered())
-        prev_focus = self._highlighted_sid
-        scroll = self.session_table.verticalScrollBar().value()
-
-        by_sid: dict[str, list[QTableWidgetItem | None]] = {}
-        self.session_table.blockSignals(True)
-        self._repopulating = True
-        try:
-            for r in range(n):
-                sid = table_sids[r]
-                row_items: list[QTableWidgetItem | None] = []
-                for c in range(col_count):
-                    row_items.append(self.session_table.takeItem(r, c))
-                by_sid[sid] = row_items
-
-            for row_idx, (sid, _zp, _meta) in enumerate(ordered):
-                for c, it in enumerate(by_sid[sid]):
-                    self.session_table.setItem(row_idx, c, it)
-        finally:
-            self._repopulating = False
-            self.session_table.blockSignals(False)
-
-        self._sessions = want_sids
-        prev_list = [sid for sid, _, _ in ordered if sid in prev_checked]
-        self._check_order = prev_list[:MAX_SESSIONS]
-        checked_set = set(self._check_order)
-        for sid in prev_checked - checked_set:
-            self._set_row_checked(sid, False)
-        self._check_order = [
-            s for s in self._check_order if s in self._checked_sids_ordered()
-        ]
-        if prev_focus:
-            r = self._find_row_for_sid(prev_focus)
-            if r >= 0:
-                self.session_table.setCurrentCell(r, _COL_SESSION_ID)
-        self.session_table.verticalScrollBar().setValue(scroll)
-        self._rebuild_session_row_index()
-        return True
-
-    def _set_sort(self, mode: str) -> None:
-        if mode == self._sort_mode:
-            return
-        self._sort_mode = mode
-        for m, btn in self._sort_buttons.items():
-            btn.setChecked(m == mode)
-        ordered = self._sorted_session_rows()
-        cur = self._current_table_session_order()
-        want = [s for s, _, _ in ordered]
-        if cur == want:
-            self._update_status()
-            return
-        if cur is not None and self._reorder_session_table(ordered):
-            self._update_status()
-            return
-        self._repopulate_list()
-
     def _refresh_sessions(self) -> None:
         self._hydrate_generation += 1
         gen = self._hydrate_generation
@@ -682,11 +631,13 @@ class ScanKitMainWindow(QMainWindow):
         self.session_table.setRowCount(0)
         self._row_by_sid.clear()
         self._check_order.clear()
-        threading.Thread(
-            target=self._discover_sessions_worker,
-            args=(gen, self._base_dir),
-            daemon=True,
-        ).start()
+        self._track_worker(
+            threading.Thread(
+                target=self._discover_sessions_worker,
+                args=(gen, self._base_dir),
+                daemon=True,
+            )
+        )
         self._schedule_status_refresh()
 
     def _discover_sessions_worker(self, gen: int, base_dir: str) -> None:
@@ -723,11 +674,22 @@ class ScanKitMainWindow(QMainWindow):
             if gen == self._hydrate_generation:
                 self._sig_scan_finished.emit(gen)
 
-    def _shutdown_meta_pool(self) -> None:
+    def _track_worker(self, thread: threading.Thread) -> None:
+        """Start *thread* and keep a handle so it can be joined on shutdown.
+
+        Worker threads emit Qt signals, so Qt allocates thread-local storage for
+        each one. They must finish before QApplication is destroyed, otherwise Qt
+        prints "QThreadStorage: entry N destroyed before end of thread" on exit.
+        """
+        self._worker_threads = [t for t in self._worker_threads if t.is_alive()]
+        self._worker_threads.append(thread)
+        thread.start()
+
+    def _shutdown_meta_pool(self, *, wait: bool = False) -> None:
         pool = self._meta_pool
         if pool is not None:
             self._meta_pool = None
-            pool.shutdown(wait=False, cancel_futures=True)
+            pool.shutdown(wait=wait, cancel_futures=True)
 
     def _schedule_meta_hydrate(self, gen: int, sid: str, path_str: str) -> None:
         pool = self._meta_pool
@@ -782,7 +744,10 @@ class ScanKitMainWindow(QMainWindow):
                 clean.append((str(item[0]), str(item[1])))
         if not clean:
             return
+        # Disable sorting while inserting: with sorting on, each setItem would
+        # re-sort and shift row indices mid-build. Re-enabling re-sorts once.
         self.session_table.blockSignals(True)
+        self.session_table.setSortingEnabled(False)
         try:
             first_row = self.session_table.rowCount()
             self.session_table.setRowCount(first_row + len(clean))
@@ -792,6 +757,7 @@ class ScanKitMainWindow(QMainWindow):
                 self._set_session_row_widgets(row, sid, None, use_checked=False)
                 self._schedule_meta_hydrate(gen, sid, path_str)
         finally:
+            self.session_table.setSortingEnabled(True)
             self.session_table.blockSignals(False)
         self._rebuild_session_row_index()
         self._sessions = [s for s, _, _ in self._discovered]
@@ -803,15 +769,6 @@ class ScanKitMainWindow(QMainWindow):
             return
         self._scan_complete = True
         self._sessions = [s for s, _, _ in self._discovered]
-        QTimer.singleShot(0, partial(self._apply_scan_finished_layout, gen))
-
-    @Slot(int)
-    def _apply_scan_finished_layout(self, gen: int) -> None:
-        if gen != self._hydrate_generation:
-            return
-        ordered = self._sorted_session_rows()
-        if not self._reorder_session_table(ordered):
-            self._repopulate_list()
         if self._hydrate_received >= len(self._discovered):
             self._schedule_meta_column_resize()
         self._schedule_status_refresh()
@@ -821,19 +778,22 @@ class ScanKitMainWindow(QMainWindow):
             self.session_table.resizeColumnToContents(c)
 
     def _fill_meta_columns(self, row: int, meta: SessionMeta | None) -> None:
-        """Set Date / MU / Time cells for one row."""
-        date_s, mu_s, time_s = _meta_column_texts(meta)
+        """Set Date / MU / Time cells for one row (display text + real sort value)."""
+        texts = _meta_column_texts(meta)
+        sort_vals = _meta_sort_values(meta)
         align = Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft
-        for col_offset, text in enumerate((date_s, mu_s, time_s)):
+        for col_offset, (text, sval) in enumerate(zip(texts, sort_vals)):
             col = _COL_DATE + col_offset
             it = self.session_table.item(row, col)
             if it is None:
-                cell = QTableWidgetItem(text)
+                cell = _SortableItem(text)
                 cell.setFlags(cell.flags() & ~Qt.ItemFlag.ItemIsEditable)
                 cell.setTextAlignment(align)
+                cell.setData(_SORT_VALUE_ROLE, sval)
                 self.session_table.setItem(row, col, cell)
             else:
                 it.setText(text)
+                it.setData(_SORT_VALUE_ROLE, sval)
 
     def _set_session_row_widgets(
         self,
@@ -895,19 +855,28 @@ class ScanKitMainWindow(QMainWindow):
                 self._discovered[i] = (sid, path_str, meta_obj)
                 break
         self._hydrate_received += 1
+        # Patch this row's Date/MU/Time values; native sorting reorders the row as the
+        # data arrives (fine — rows are expected to settle as metadata streams in).
         self._patch_session_metadata_cells(sid, meta_obj)
-        self._schedule_session_resort()
         if self._scan_complete and self._hydrate_received >= len(self._discovered):
             self._schedule_meta_column_resize()
-            self._schedule_session_resort()
         self._schedule_status_refresh()
 
     def _patch_session_metadata_cells(self, sid: str, meta: SessionMeta | None) -> None:
-        """Update Date/MU/Time cells for one row (cheap vs rebuilding the whole table)."""
+        """Update Date/MU/Time cells for one row, then let the table re-sort once."""
         r = self._find_row_for_sid(sid)
         if r < 0:
             return
-        self._fill_meta_columns(r, meta)
+        # Toggle sorting off so all three cells update before a single re-sort; a row
+        # whose values change may move, so refresh the sid→row index afterwards.
+        self.session_table.blockSignals(True)
+        self.session_table.setSortingEnabled(False)
+        try:
+            self._fill_meta_columns(r, meta)
+        finally:
+            self.session_table.setSortingEnabled(True)
+            self.session_table.blockSignals(False)
+        self._rebuild_session_row_index()
 
     @Slot(int, str)
     def _show_extracting_status(self, gen: int, session_id: str) -> None:
@@ -964,8 +933,6 @@ class ScanKitMainWindow(QMainWindow):
         return out
 
     def _on_session_table_item_changed(self, item: QTableWidgetItem) -> None:
-        if self._repopulating:
-            return
         col = item.column()
         if col == _COL_USE:
             sid_raw = item.data(_SESSION_ROLE)
@@ -1022,44 +989,6 @@ class ScanKitMainWindow(QMainWindow):
         if sid is None:
             return
         self._highlighted_sid = sid
-
-    def _repopulate_list(self) -> None:
-        self._repopulating = True
-        try:
-            prev_checked = set(self._checked_sids_ordered())
-            prev_focus_sid = self._highlighted_sid
-            scroll = self.session_table.verticalScrollBar().value()
-
-            ordered = self._sorted_session_rows()
-            self._sessions = [sid for sid, _zp, _meta in ordered]
-
-            self.session_table.setRowCount(len(ordered))
-
-            prev_list = [sid for sid, _, _ in ordered if sid in prev_checked]
-            self._check_order = prev_list[:MAX_SESSIONS]
-            checked_set = set(self._check_order)
-
-            for row_idx, (sid, _zp, meta) in enumerate(ordered):
-                self._set_session_row_widgets(
-                    row_idx,
-                    sid,
-                    meta,
-                    use_checked=sid in checked_set,
-                )
-
-            self._check_order = [
-                s for s in self._check_order if s in self._checked_sids_ordered()
-            ]
-            if prev_focus_sid:
-                r = self._find_row_for_sid(prev_focus_sid)
-                if r >= 0:
-                    self.session_table.setCurrentCell(r, _COL_SESSION_ID)
-            self.session_table.verticalScrollBar().setValue(scroll)
-            self._rebuild_session_row_index()
-        finally:
-            self._repopulating = False
-        self._schedule_meta_column_resize()
-        self._update_status()
 
     def _refresh_use_column_swatches(self, selected: list[str] | None = None) -> None:
         """Set Use-column icons to match visualization colors for checked sessions."""
@@ -1324,12 +1253,17 @@ class ScanKitMainWindow(QMainWindow):
         super().closeEvent(event)
 
     def _shutdown_children(self) -> None:
+        # Bump generation first so in-flight workers bail at their next check, then
+        # wait for the metadata pool and worker threads to finish. Letting these
+        # signal-emitting threads outlive QApplication causes QThreadStorage warnings.
         self._hydrate_generation += 1
-        self._shutdown_meta_pool()
+        self._shutdown_meta_pool(wait=True)
+        for t in self._worker_threads:
+            if t.is_alive():
+                t.join(timeout=2.0)
+        self._worker_threads.clear()
         if self._meta_col_resize_timer is not None:
             self._meta_col_resize_timer.stop()
-        if self._session_resort_timer is not None:
-            self._session_resort_timer.stop()
         if self._status_refresh_timer is not None:
             self._status_refresh_timer.stop()
         if self._poll_timer is not None:
@@ -1393,6 +1327,10 @@ def main() -> None:
         if inst is not None:
             inst.quit()
         os._exit(0)
+
+    # Ensure worker threads are joined before QApplication is destroyed (avoids
+    # QThreadStorage warnings on quit paths that don't go through closeEvent).
+    app.aboutToQuit.connect(win._shutdown_children)
 
     signal.signal(signal.SIGINT, _force_exit)
     atexit.register(_force_exit)

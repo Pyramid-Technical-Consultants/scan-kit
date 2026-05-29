@@ -2,15 +2,8 @@
 
 import numpy as np
 import matplotlib.pyplot as plt
-from scipy import stats
-
-import pandas as pd
-import matplotlib.colors as mcolors
 
 from ..common import (
-    C_IC1_TOTAL_DOSE,
-    C_IC2_TOTAL_DOSE,
-    C_IC3_TOTAL_DOSE,
     C_CHARGE_REQ,
     POSITION_KEY_G2_RAW,
     POSITION_KEY_G3_RAW,
@@ -18,163 +11,26 @@ from ..common import (
     apply_auto_calibration,
     apply_calibration_factors,
     process_position_data,
+    add_dose_error_columns,
+    DELIVERED_DOSE_COLS,
     plot_boxplots_for_column,
     make_session_legend,
     style_energy_axes,
-    annotate_slopes,
+    add_energy_trend,
+    add_correlation_scatter,
     link_boxplot_to_histogram,
     DEFAULT_SESSION_COLORS,
     FIG_SIZE_2x2,
     SUPTITLE_KW,
     REFLINE_KW,
-    SCATTER_ALPHA,
-    SCATTER_SIZE,
 )
 
 import logging
 
 _log = logging.getLogger(__name__)
 
-DELIVERED_COLS = {
-    "ic1": C_IC1_TOTAL_DOSE,
-    "ic2": C_IC2_TOTAL_DOSE,
-    "ic3": C_IC3_TOTAL_DOSE,
-}
+DELIVERED_COLS = DELIVERED_DOSE_COLS
 TARGET_COL = C_CHARGE_REQ
-
-
-def _trend_line_color(face_color):
-    """Slightly darker line color from a patch face color."""
-    try:
-        rgb = mcolors.to_rgb(face_color)
-    except ValueError:
-        rgb = mcolors.to_rgb("C0")
-    return tuple(max(0.0, c * 0.55) for c in rgb)
-
-
-def _add_trend_and_mean(ax, session_data, column_name, energies, colors,
-                        *, position_offset=0.35, zorder=5):
-    """Linear trend through per-energy medians, annotated with slope *and* mean error."""
-    n_sessions = len(session_data)
-    labels: list[tuple[str, tuple[float, float, float]]] = []
-
-    for i, (sid, data) in enumerate(session_data.items()):
-        if column_name not in data:
-            continue
-        all_vals = np.asarray(data[column_name], dtype=float)
-        finite = all_vals[np.isfinite(all_vals)]
-        mean_err = float(np.mean(finite)) if finite.size else float("nan")
-
-        df = pd.DataFrame({column_name: data[column_name], "energy": data["energy"]})
-        e_mev, y_med = [], []
-        for energy in energies:
-            vals = df.loc[df["energy"] == energy, column_name].values
-            if vals.size:
-                e_mev.append(float(energy))
-                y_med.append(float(np.median(vals)))
-
-        line_color = _trend_line_color(colors[i])
-        if len(e_mev) >= 2:
-            slope, intercept = np.polyfit(np.array(e_mev), np.array(y_med), 1)
-            xs = [j + (i - 0.5) * position_offset for j in range(len(energies))]
-            ys = [slope * float(energies[j]) + intercept for j in range(len(energies))]
-            ax.plot(xs, ys, color=line_color, linewidth=2.0, linestyle="-",
-                    solid_capstyle="round", zorder=zorder, clip_on=True)
-            prefix = f"{sid}: " if n_sessions > 1 else ""
-            labels.append((
-                f"{prefix}{slope:+.4g} %/MeV, mean {mean_err:+.2f}%",
-                line_color,
-            ))
-
-    if labels:
-        annotate_slopes(ax, labels)
-
-
-def _pct_err_vs_target(delivered, target) -> np.ndarray:
-    """``(delivered - target) / target * 100`` where target > 0; else NaN."""
-    d = np.asarray(delivered, dtype=float)
-    t = np.asarray(target, dtype=float)
-    out = np.full_like(d, np.nan, dtype=float)
-    ok = np.isfinite(d) & np.isfinite(t) & (np.abs(t) > 1e-15)
-    out[ok] = (d[ok] - t[ok]) / t[ok] * 100.0
-    return out
-
-
-CORR_PERCENTILE_CLIP = 100
-
-
-def _plot_error_correlation(ax, session_data, col_x, col_y, loaded_ids, colors,
-                            *, xlabel=None, ylabel=None, percentile_clip=None):
-    """Scatter *col_x* vs *col_y* error and annotate with R² and CCC."""
-    pclip = percentile_clip if percentile_clip is not None else CORR_PERCENTILE_CLIP
-
-    raw_pairs = []
-    for sid in loaded_ids:
-        data = session_data[sid]
-        if col_x not in data or col_y not in data:
-            continue
-        x = np.asarray(data[col_x], dtype=float)
-        y = np.asarray(data[col_y], dtype=float)
-        mask = np.isfinite(x) & np.isfinite(y)
-        if mask.any():
-            raw_pairs.append((sid, x[mask], y[mask]))
-
-    if not raw_pairs:
-        ax.set_visible(False)
-        return
-
-    if pclip < 100:
-        all_vals = np.concatenate([np.concatenate([p[1], p[2]]) for p in raw_pairs])
-        lo, hi = np.percentile(all_vals, [100 - pclip, pclip])
-    else:
-        lo, hi = -np.inf, np.inf
-
-    labels: list[tuple[str, tuple[float, float, float]]] = []
-    n_sessions = len(loaded_ids)
-    all_xy = []
-    sid_index = {sid: i for i, sid in enumerate(loaded_ids)}
-
-    for sid, x_raw, y_raw in raw_pairs:
-        keep = (x_raw >= lo) & (x_raw <= hi) & (y_raw >= lo) & (y_raw <= hi)
-        x, y = x_raw[keep], y_raw[keep]
-        if x.size < 2:
-            continue
-
-        i = sid_index[sid]
-        all_xy.append((x, y))
-        ax.scatter(x, y, c=colors[i], alpha=SCATTER_ALPHA, s=SCATTER_SIZE,
-                   edgecolors="none")
-
-        r, _ = stats.pearsonr(x, y)
-        sx, sy = x.std(), y.std()
-        mx, my = x.mean(), y.mean()
-        ccc = (2 * r * sx * sy) / (sx**2 + sy**2 + (mx - my)**2)
-
-        line_color = _trend_line_color(colors[i])
-        slope, intercept = np.polyfit(x, y, 1)
-        x_range = np.array([x.min(), x.max()])
-        ax.plot(x_range, slope * x_range + intercept, color=line_color,
-                linewidth=1.8, linestyle="-", zorder=5)
-
-        prefix = f"{sid}: " if n_sessions > 1 else ""
-        labels.append((f"{prefix}R\u00b2={r**2:.5f}  CCC={ccc:.5f}", line_color))
-
-    if all_xy:
-        # Let matplotlib autoscale freely, then draw y=x across the visible overlap
-        ax.autoscale_view()
-        xlim, ylim = ax.get_xlim(), ax.get_ylim()
-        ref_lo = max(xlim[0], ylim[0])
-        ref_hi = min(xlim[1], ylim[1])
-        if ref_lo < ref_hi:
-            ax.plot([ref_lo, ref_hi], [ref_lo, ref_hi], **REFLINE_KW)
-
-    if labels:
-        annotate_slopes(ax, labels)
-    if xlabel:
-        ax.set_xlabel(xlabel)
-    if ylabel:
-        ax.set_ylabel(ylabel)
-    ax.grid(visible=True, alpha=0.3)
 
 
 def _process_session(session_id: str, position_key: str, base_dir: str,
@@ -186,11 +42,7 @@ def _process_session(session_id: str, position_key: str, base_dir: str,
         extra_input_columns=[TARGET_COL],
         base_dir=base_dir,
     )
-    if data is None:
-        return None
-    if TARGET_COL not in data:
-        return None
-    if not any(col in data for col in DELIVERED_COLS.values()):
+    if data is None or TARGET_COL not in data:
         return None
 
     data = dict(data)
@@ -199,11 +51,7 @@ def _process_session(session_id: str, position_key: str, base_dir: str,
             data = apply_calibration_factors(data, list(DELIVERED_COLS.values()), settings.cal_factors)
         else:
             data = apply_auto_calibration(data, TARGET_COL, list(DELIVERED_COLS.values()))
-    target = data[TARGET_COL]
-    for ic, col in DELIVERED_COLS.items():
-        if col in data:
-            data[f"{ic}_dose_err_pct"] = _pct_err_vs_target(data[col], target)
-    return data
+    return add_dose_error_columns(data, target_col=TARGET_COL, delivered_cols=DELIVERED_COLS)
 
 
 def run(session_ids: list[str], base_dir: str = "test_data",
@@ -268,7 +116,7 @@ def run(session_ids: list[str], base_dir: str = "test_data",
         axes = axes.reshape(1, 3)
 
     fig.suptitle(
-        "Dose Error vs Scan Target (% of prescribed dose)",
+        "Dose Error vs Energy (% of prescribed dose)",
         **SUPTITLE_KW,
     )
 
@@ -283,8 +131,9 @@ def run(session_ids: list[str], base_dir: str = "test_data",
 
     for row, col in enumerate(err_cols):
         plot_boxplots_for_column(box_axes[row], session_data, col, energies, colors, width=0.3)
-        _add_trend_and_mean(
-            box_axes[row], session_data, col, energies, colors, position_offset=0.35
+        add_energy_trend(
+            box_axes[row], session_data, col, energies, colors,
+            agg="median", position_offset=0.35, show_mean=True,
         )
         style_energy_axes(box_axes[row], energies, ylabel=f"{titles[col]} Error (% of target)")
         box_axes[row].axhline(y=0, **REFLINE_KW)
@@ -309,7 +158,7 @@ def run(session_ids: list[str], base_dir: str = "test_data",
 
     # Error correlation scatter plots (right column)
     for row, (col_x, col_y) in enumerate(corr_pairs):
-        _plot_error_correlation(
+        add_correlation_scatter(
             corr_axes[row], session_data, col_x, col_y, loaded_ids, colors,
             xlabel=f"{titles[col_x]} Error (%)",
             ylabel=f"{titles[col_y]} Error (%)",

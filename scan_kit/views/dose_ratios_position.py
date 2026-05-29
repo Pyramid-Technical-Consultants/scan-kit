@@ -14,7 +14,7 @@ from ..common import (
     apply_calibration_factors,
     add_dose_ratio_columns,
     process_position_data,
-    scatter_with_trend,
+    add_scatter_trend,
     try_load_position_data,
     annotate_slopes,
     make_session_legend,
@@ -22,8 +22,6 @@ from ..common import (
     FIG_SIZE_2x2,
     SUPTITLE_KW,
     GRID_KW,
-    SCATTER_ALPHA,
-    SCATTER_SIZE,
 )
 
 import logging
@@ -65,18 +63,18 @@ def _plot_ratio_vs_distance(ax, session_data, ratio_col, colors, title):
     for i, (sid, data) in enumerate(session_data.items()):
         if ratio_col not in data:
             continue
-        slope = scatter_with_trend(
+        prefix = f"{sid}: " if len(session_data) > 1 else ""
+        res = add_scatter_trend(
             ax,
             data["ic1_dist"],
             data[ratio_col],
             color=colors[i],
+            unit="%/mm",
+            prefix=prefix,
             label=f"Session {sid}",
-            alpha=SCATTER_ALPHA,
-            size=SCATTER_SIZE,
         )
-        if slope is not None:
-            prefix = f"{sid}: " if len(session_data) > 1 else ""
-            slope_labels.append((f"{prefix}{slope:+.4g} % per mm", colors[i]))
+        if res is not None:
+            slope_labels.append(res)
 
     ax.set_title(title)
     ax.set_xlabel("IC1 Radial Distance (mm)")

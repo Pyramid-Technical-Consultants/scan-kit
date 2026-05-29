@@ -17,6 +17,7 @@ from ..common import (
     plot_boxplots_for_column,
     make_session_legend,
     style_energy_axes,
+    add_energy_trend,
     link_boxplot_to_histogram,
     DEFAULT_SESSION_COLORS,
     FIG_SIZE_2x2,
@@ -27,7 +28,6 @@ from ..common.session_source import (
     load_session_timeslice_device_units,
     resolve_session_source,
 )
-from .dose_ratios import _add_median_trend_lines
 
 import logging
 
@@ -244,9 +244,9 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
             plot_boxplots_for_column(
                 ax_box, col_data, col_key, energies, col_colors, width=0.3,
             )
-            _add_median_trend_lines(
+            add_energy_trend(
                 ax_box, col_data, col_key, energies, col_colors,
-                position_offset=0.35,
+                unit="ms/MeV", position_offset=0.35,
             )
 
         ax_box.set_title(f"{title} vs Energy")
