@@ -919,7 +919,7 @@ class ScanKitMainWindow(QMainWindow):
             self.session_table.blockSignals(False)
 
     def _checked_sids_ordered(self) -> list[str]:
-        """Top-to-bottom list of session IDs with Use checked."""
+        """Top-to-bottom list of session IDs with Use checked (visual row order)."""
         out: list[str] = []
         for r in range(self.session_table.rowCount()):
             it0 = self.session_table.item(r, _COL_USE)
@@ -931,6 +931,22 @@ class ScanKitMainWindow(QMainWindow):
                 if sid is not None:
                     out.append(str(sid))
         return out
+
+    def _selected_sids_in_order(self) -> list[str]:
+        """Checked sessions in the order the user selected them.
+
+        This — not the visual row order — drives plot color assignment: color
+        index = position in this list. Using selection order keeps each session's
+        color fixed when the table is re-sorted or rows stream in, and assigns
+        colors in the sequence the user checked boxes (``_check_order``).
+        """
+        checked = set(self._checked_sids_ordered())
+        ordered = [s for s in self._check_order if s in checked]
+        # Safety net: include any checked sid not tracked in _check_order.
+        for s in self._checked_sids_ordered():
+            if s not in ordered:
+                ordered.append(s)
+        return ordered[:MAX_SESSIONS]
 
     def _on_session_table_item_changed(self, item: QTableWidgetItem) -> None:
         col = item.column()
@@ -993,7 +1009,7 @@ class ScanKitMainWindow(QMainWindow):
     def _refresh_use_column_swatches(self, selected: list[str] | None = None) -> None:
         """Set Use-column icons to match visualization colors for checked sessions."""
         if selected is None:
-            selected = self._checked_sids_ordered()
+            selected = self._selected_sids_in_order()
         n_selected = len(selected)
         idx_by_sid = {sid: i for i, sid in enumerate(selected)}
         self.session_table.blockSignals(True)
@@ -1035,7 +1051,7 @@ class ScanKitMainWindow(QMainWindow):
             self.session_table.blockSignals(False)
 
     def _update_status(self) -> None:
-        selected = self._checked_sids_ordered()
+        selected = self._selected_sids_in_order()
         self._refresh_use_column_swatches(selected)
         msg_bits: list[str] = []
         if not self._scan_complete:
@@ -1073,14 +1089,13 @@ class ScanKitMainWindow(QMainWindow):
             self._notify("Already running")
             return
 
-        selected = self._checked_sids_ordered()
-        if not selected:
+        session_ids = self._selected_sids_in_order()
+        if not session_ids:
             self._notify(
                 f"Select 1-{MAX_SESSIONS} sessions first (use the checkboxes)"
             )
             return
 
-        session_ids = selected[:MAX_SESSIONS]
         self._launch_view(module_name, session_ids, self._base_dir)
 
     def _launch_view(
