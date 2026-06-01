@@ -3,7 +3,6 @@
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-from matplotlib.patches import Patch
 
 from ..common import (
     load_session_raw,
@@ -12,7 +11,7 @@ from ..common import (
     C_ENERGY,
     DEFAULT_SESSION_COLORS,
     FIG_SIZE_2x2,
-    SUPTITLE_KW,
+    set_view_header,
     apply_tight_layout,
     GRID_KW,
 )
@@ -115,7 +114,6 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
     x_positions = np.arange(len(unique_energies))
 
     fig, axes = plt.subplots(2, 2, figsize=FIG_SIZE_2x2, sharex=True)
-    fig.suptitle("Sigma X / Y by Energy", **SUPTITLE_KW)
 
     width = 0.8 / max(n_sessions, 1)
 
@@ -167,14 +165,7 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
         ax.set_xticklabels([f"{e:g}" for e in unique_energies], rotation=90)
         ax.set_xlabel("Energy (MeV)")
 
-    legend_elements = [
-        Patch(facecolor=colors[i], alpha=0.7, label=ordered_sids[i])
-        for i in range(n_sessions)
-    ]
-    fig.legend(
-        handles=legend_elements, loc="upper right",
-        bbox_to_anchor=(0.99, 0.98), fontsize="small",
-    )
+    set_view_header(fig, "Sigma X / Y by Energy", ordered_sids, colors, base_dir=base_dir)
 
     apply_tight_layout()
     plt.show()

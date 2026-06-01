@@ -18,7 +18,8 @@ from ..common import (
     C_LAYER_ID,
     resolve_concept_column,
     DEFAULT_SESSION_COLORS,
-    SUPTITLE_KW,
+    set_view_header,
+    VIEW_HEADER_SUBPLOT_TOP,
     GRID_KW,
 )
 from ..common.processing import _detect_beam_off_mask
@@ -415,7 +416,7 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
         n_rows, n_cols,
         height_ratios=height_ratios,
         width_ratios=width_ratios,
-        left=0.05, right=0.97, top=0.93, bottom=0.04,
+        left=0.05, right=0.97, top=VIEW_HEADER_SUBPLOT_TOP, bottom=0.04,
         hspace=0.25, wspace=0.18,
     )
 
@@ -427,8 +428,6 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
     for ic_idx in range(1, n_ics):
         line_axes[ic_idx].sharex(line_axes[0])
         line_axes[ic_idx].sharey(line_axes[0])
-
-    fig.suptitle("IC Current FFT Analysis", **SUPTITLE_KW)
 
     for ic_idx, (ic_key, ic_label) in enumerate(zip(ic_keys, ic_labels)):
         ax = line_axes[ic_idx]
@@ -552,5 +551,13 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
             cbar_ax = fig.add_subplot(gs[row, n_ics])
             cbar = fig.colorbar(im, cax=cbar_ax)
             cbar.set_label(f"{state_lbl} PSD (nA²/Hz)", fontsize=8)
+
+    set_view_header(
+        fig,
+        "IC Current FFT Analysis",
+        loaded_ids,
+        sess_colors,
+        base_dir=base_dir,
+    )
 
     plt.show()

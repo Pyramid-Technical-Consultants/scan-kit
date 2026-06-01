@@ -14,12 +14,11 @@ from ..common import (
     process_position_data,
     try_load_position_data,
     plot_boxplots_for_column,
-    make_session_legend,
+    set_view_header,
     style_energy_axes,
     link_boxplot_to_histogram,
     DEFAULT_SESSION_COLORS,
     FIG_SIZE_1x2,
-    SUPTITLE_KW,
     apply_tight_layout,
     REFLINE_KW,
 )
@@ -88,7 +87,6 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
     labels = {"ic1_x_err": "IC1 X", "ic1_y_err": "IC1 Y"}
 
     fig, axes = plt.subplots(2, 2, figsize=(FIG_SIZE_1x2[0], FIG_SIZE_1x2[1] * 2))
-    fig.suptitle("IC1 X/Y Position Error by Energy", **SUPTITLE_KW)
 
     # Row 1: boxplots by energy
     ax_bx, ax_by = axes[0]
@@ -104,8 +102,6 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
         ax.set_ylim(box_y_lo, box_y_hi)
         ax.axhline(y=0, **REFLINE_KW)
 
-    make_session_legend(ax_bx, loaded_ids, colors)
-
     # Row 2: interactive histograms linked to boxplots via SpanSelector
     _selectors = link_boxplot_to_histogram(
         list(axes[0]), list(axes[1]),
@@ -114,8 +110,14 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
         hist_titles=[f"{labels[c]} error distribution" for c in err_cols],
         hist_refs=[0, 0],
     )
-    for ax in axes[1]:
-        make_session_legend(ax, loaded_ids, colors)
+
+    set_view_header(
+        fig,
+        "IC1 X/Y Position Error by Energy",
+        loaded_ids,
+        colors,
+        base_dir=base_dir,
+    )
 
     apply_tight_layout()
     plt.show()

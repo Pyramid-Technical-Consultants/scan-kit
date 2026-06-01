@@ -5,8 +5,9 @@ import matplotlib.pyplot as plt
 
 from ..common import (
     process_position_data,
+    DEFAULT_SESSION_COLORS,
+    set_view_header,
     FIG_SIZE_1x2,
-    SUPTITLE_KW,
     apply_tight_layout,
     GRID_KW,
     REFLINE_KW,
@@ -93,17 +94,7 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
         ax.axvline(x=0, **REFLINE_KW)
 
     loaded_ids = list(session_data.keys())
-    session_legend_elements = [
-        plt.Line2D(
-            [0], [0],
-            marker="o" if i == 0 else "s",
-            color="gray",
-            markersize=8,
-            label=f"Session {loaded_ids[i]}",
-        )
-        for i in range(len(loaded_ids))
-    ]
-    ax2.legend(handles=session_legend_elements, loc="upper right", title="Session")
+    colors = DEFAULT_SESSION_COLORS[: len(loaded_ids)]
 
     energy_min = min(all_energies)
     energy_max = max(all_energies)
@@ -114,6 +105,12 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
     cbar = plt.colorbar(sm, ax=ax2, location="right")
     cbar.set_label("Energy (MeV)")
 
-    fig.suptitle("Position Difference Between IC1 and IC2", **SUPTITLE_KW)
+    set_view_header(
+        fig,
+        "Position Difference Between IC1 and IC2",
+        loaded_ids,
+        colors,
+        base_dir=base_dir,
+    )
     apply_tight_layout()
     plt.show()

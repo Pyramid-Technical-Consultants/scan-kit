@@ -4,12 +4,16 @@ from dataclasses import dataclass
 
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
+from matplotlib.lines import Line2D
+from matplotlib.patches import FancyBboxPatch
+from matplotlib.legend_handler import HandlerPatch
 from matplotlib.widgets import SpanSelector
 import numpy as np
 import pandas as pd
 from scipy import stats
 
 from .plot_colors import DEFAULT_SESSION_COLORS
+from .session_notes import load_notes
 
 # ---------------------------------------------------------------------------
 # Shared style constants — import these in views for a consistent look
@@ -20,6 +24,44 @@ FIG_SIZE_1x2 = (15, 6)
 FIG_SIZE_SINGLE = (14, 8)
 
 SUPTITLE_KW = dict(fontsize=13, fontweight="bold")
+
+# Shared view header — title and session legend centered as one group.
+VIEW_HEADER_HEIGHT = 0.055
+VIEW_HEADER_TOP = 0.985
+VIEW_HEADER_SUBPLOT_TOP = 1.0 - VIEW_HEADER_HEIGHT
+VIEW_HEADER_PAD_PT = 4.0  # gap between header content and subplot area
+VIEW_HEADER_TITLE_LEGEND_GAP_PT = 14.0  # gap between title and legend in the group
+VIEW_HEADER_LEGEND_KW = dict(frameon=False, borderaxespad=0, handlelength=1.2, handleheight=0.9)
+SESSION_LEGEND_HANDLE_KW = dict(
+    boxstyle="round,pad=0.05,rounding_size=0.35",
+    edgecolor="0.30",
+    linewidth=1.0,
+    alpha=0.88,
+)
+
+
+class _HandlerRoundedPatch(HandlerPatch):
+    """Preserve rounded, bordered swatches when drawn in a legend."""
+
+    def create_artists(
+        self, legend, orig_handle, xdescent, ydescent, width, height, fontsize, trans,
+    ):
+        return [
+            FancyBboxPatch(
+                (xdescent, ydescent),
+                width,
+                height,
+                boxstyle=SESSION_LEGEND_HANDLE_KW["boxstyle"],
+                facecolor=orig_handle.get_facecolor(),
+                edgecolor=SESSION_LEGEND_HANDLE_KW["edgecolor"],
+                linewidth=SESSION_LEGEND_HANDLE_KW["linewidth"],
+                alpha=SESSION_LEGEND_HANDLE_KW["alpha"],
+                transform=trans,
+            )
+        ]
+
+
+SESSION_LEGEND_HANDLER_MAP = {FancyBboxPatch: _HandlerRoundedPatch()}
 GRID_KW = dict(visible=True, alpha=0.3)
 REFLINE_KW = dict(color="gray", linestyle="--", linewidth=1, alpha=0.6)
 
@@ -28,7 +70,7 @@ HIST_PERCENTILE_CLIP = 100  # percentile for histogram outlier filtering (e.g. 9
 SCATTER_ALPHA = 0.45
 SCATTER_SIZE = 18
 
-TIGHT_LAYOUT_PAD = 0.5  # project-wide tight-layout padding (smaller = tighter)
+TIGHT_LAYOUT_PAD = 1.08  # matplotlib default; matches the figure-window "Tight layout" button
 
 SLOPE_LABEL_KW = dict(
     fontsize=10,
@@ -129,36 +171,264 @@ def annotate_slopes(ax, labels_and_colors, *, x_anchor=0.03, y_top=0.97,
         )
 
 
-def apply_tight_layout(fig=None, *, pad=TIGHT_LAYOUT_PAD, h_pad=None, w_pad=None,
-                       rect=None):
-    """Apply the project's standard tight layout to *fig*.
+def view_header_layout_rect() -> list[float]:
+    """Fallback ``rect`` for ``tight_layout`` before the header has been measured."""
+    return [0.0, 0.0, 1.0, VIEW_HEADER_SUBPLOT_TOP]
 
-    Use everywhere instead of bare ``plt.tight_layout()`` so every view shares
-    one tightness setting. ``fig`` defaults to the current figure. On modern
-    matplotlib this also reserves room for a ``suptitle``, so no extra
-    ``subplots_adjust`` slack is needed.
+
+def _figure_pad_fraction(fig, pts: float) -> float:
+    height_in = fig.get_figheight()
+    if height_in <= 0:
+        return 0.01
+    return (pts / 72.0) / height_in
+
+
+def measure_view_header_rect(fig, renderer) -> list[float] | None:
+    """Return a ``tight_layout`` *rect* sized to the actual header content."""
+    title = getattr(fig, "_scan_kit_title", None)
+    if title is None:
+        return None
+
+    bboxes = [title.get_window_extent(renderer)]
+    legend = getattr(fig, "_scan_kit_legend", None)
+    if legend is not None:
+        bboxes.append(legend.get_window_extent(renderer))
+
+    header_bottom = min(bb.y0 for bb in bboxes)
+    _, y_fig = fig.transFigure.inverted().transform((0.0, header_bottom))
+    pad = _figure_pad_fraction(fig, VIEW_HEADER_PAD_PT)
+    top = max(y_fig - pad, 0.1)
+    return [0.0, 0.0, 1.0, top]
+
+
+def refresh_view_header_rect(fig, *, renderer=None) -> list[float] | None:
+    """Re-center the header group, measure its extent, and cache the layout *rect*."""
+    if getattr(fig, "_scan_kit_title", None) is None:
+        return None
+    if renderer is None:
+        fig.draw_without_rendering()
+        renderer = fig.canvas.get_renderer()
+    _layout_view_header_group(fig, renderer)
+    fig.draw_without_rendering()
+    renderer = fig.canvas.get_renderer()
+    rect = measure_view_header_rect(fig, renderer)
+    if rect is not None:
+        fig._scan_kit_header_rect = rect
+    return rect
+
+
+def _header_layout_rect(fig) -> list[float] | None:
+    return getattr(fig, "_scan_kit_header_rect", None)
+
+
+def format_session_legend_label(session_id: str, notes: dict[str, str] | None = None) -> str:
+    """Build a session legend label, appending the note when present."""
+    note = (notes or {}).get(session_id, "").strip()
+    if note:
+        return f"{session_id} — {note}"
+    return session_id
+
+
+def session_legend_handles(session_ids, colors):
+    """Rounded, bordered patch handles for a session color legend."""
+    return [
+        FancyBboxPatch(
+            (0, 0),
+            1,
+            1,
+            facecolor=colors[i],
+            **SESSION_LEGEND_HANDLE_KW,
+        )
+        for i in range(len(session_ids))
+    ]
+
+
+def _clear_view_header(fig) -> None:
+    for attr in ("_scan_kit_title", "_scan_kit_legend"):
+        artist = getattr(fig, attr, None)
+        if artist is not None:
+            try:
+                artist.remove()
+            except Exception:
+                pass
+            setattr(fig, attr, None)
+
+
+def _layout_view_header_group(fig, renderer) -> None:
+    """Center the title and session legend as one inline group (title on the left)."""
+    title = getattr(fig, "_scan_kit_title", None)
+    if title is None:
+        return
+
+    legend = getattr(fig, "_scan_kit_legend", None)
+    fig_bb = fig.get_window_extent(renderer)
+    inv = fig.transFigure.inverted()
+
+    title_bb = title.get_window_extent(renderer)
+    title_h_fig = title_bb.height / fig_bb.height
+
+    if legend is None:
+        row_cy_fig = VIEW_HEADER_TOP - title_h_fig / 2.0
+        title.set_ha("center")
+        title.set_va("center")
+        title.set_position((0.5, row_cy_fig))
+        return
+
+    legend_bb = legend.get_window_extent(renderer)
+    legend_h_fig = legend_bb.height / fig_bb.height
+    row_h_fig = max(title_h_fig, legend_h_fig)
+    row_cy_fig = VIEW_HEADER_TOP - row_h_fig / 2.0
+
+    gap = VIEW_HEADER_TITLE_LEGEND_GAP_PT * fig.dpi / 72.0
+    total_w = title_bb.width + gap + legend_bb.width
+    group_left = fig_bb.x0 + (fig_bb.width - total_w) / 2.0
+
+    title_x_fig, _ = inv.transform((group_left, 0.0))
+    title.set_ha("left")
+    title.set_va("center")
+    title.set_position((title_x_fig, row_cy_fig))
+
+    legend_left = group_left + title_bb.width + gap
+    legend_x_fig, _ = inv.transform((legend_left, 0.0))
+    legend.set_loc("center left")
+    legend.set_bbox_to_anchor((legend_x_fig, row_cy_fig), transform=fig.transFigure)
+
+
+def set_view_header(
+    fig,
+    title: str,
+    session_ids,
+    colors,
+    *,
+    base_dir: str | None = None,
+    notes: dict[str, str] | None = None,
+) -> None:
+    """Place the view title and session legend centered as one inline group.
+
+    The title sits immediately to the left of the session legend.  The legend
+    shows session color, ID, and optional note from ``session_notes.json`` when
+    *base_dir* is provided.
+    """
+    _clear_view_header(fig)
+
+    if notes is None and base_dir:
+        notes = load_notes(base_dir)
+    else:
+        notes = notes or {}
+
+    fig._scan_kit_header_rect = None
+    fig._scan_kit_title = fig.text(
+        0.0,
+        VIEW_HEADER_TOP,
+        title,
+        ha="left",
+        va="center",
+        transform=fig.transFigure,
+        **SUPTITLE_KW,
+    )
+
+    if not session_ids:
+        fig._scan_kit_legend = None
+    else:
+        labels = [format_session_legend_label(sid, notes) for sid in session_ids]
+        n = len(session_ids)
+        fontsize = 9 if n <= 3 else (8 if n <= 5 else 7)
+        ncol = n if n <= 4 else min(n, 3)
+
+        fig._scan_kit_legend = fig.legend(
+            handles=session_legend_handles(session_ids, colors),
+            labels=labels,
+            loc="center left",
+            bbox_to_anchor=(0.0, VIEW_HEADER_TOP),
+            bbox_transform=fig.transFigure,
+            fontsize=fontsize,
+            ncol=ncol,
+            handler_map=SESSION_LEGEND_HANDLER_MAP,
+            **VIEW_HEADER_LEGEND_KW,
+        )
+
+    fig.draw_without_rendering()
+    _layout_view_header_group(fig, fig.canvas.get_renderer())
+
+
+def apply_tight_layout(fig=None, *, pad=TIGHT_LAYOUT_PAD, h_pad=None, w_pad=None,
+                       rect=None, measure=True):
+    """Apply tight layout to *fig*, matching the matplotlib window button.
+
+    When *measure* is True (default), runs a draw pass first so label/legend/
+    suptitle bboxes are measured before ``tight_layout``. Set *measure* to False
+    to match the interactive toolbar button exactly (used after the window is
+    shown at its final size).
     """
     fig = fig if fig is not None else plt.gcf()
+    if rect is None:
+        if measure:
+            fig.draw_without_rendering()
+            renderer = fig.canvas.get_renderer()
+            rect = refresh_view_header_rect(fig, renderer=renderer)
+        if rect is None:
+            rect = _header_layout_rect(fig)
+        if rect is None and getattr(fig, "_scan_kit_title", None) is not None:
+            rect = view_header_layout_rect()
+    elif measure:
+        fig.draw_without_rendering()
     fig.tight_layout(pad=pad, h_pad=h_pad, w_pad=w_pad, rect=rect)
 
 
-def make_session_legend(ax, session_ids, colors, **kwargs):
+def apply_toolbar_tight_layout(fig=None) -> None:
+    """Re-run tight layout, reserving measured space for the view header."""
+    fig = fig if fig is not None else plt.gcf()
+    fig.draw_without_rendering()
+    renderer = fig.canvas.get_renderer()
+    rect = refresh_view_header_rect(fig, renderer=renderer)
+    if rect is None:
+        rect = _header_layout_rect(fig)
+    if rect is None and getattr(fig, "_scan_kit_title", None) is not None:
+        rect = view_header_layout_rect()
+    if rect is not None:
+        fig.tight_layout(rect=rect)
+    else:
+        fig.tight_layout()
+    fig.canvas.draw_idle()
+
+
+def make_session_legend(
+    ax,
+    session_ids,
+    colors,
+    *,
+    base_dir: str | None = None,
+    notes: dict[str, str] | None = None,
+    **kwargs,
+):
     """Add a rectangle-patch legend for sessions on *ax*.
+
+    Prefer :func:`set_view_header` for new views so title and legend share one
+    header row. This helper remains for axes-local legends (e.g. dynamic
+    histogram refresh) and includes session notes when *base_dir* is set.
 
     Args:
         ax: Matplotlib axes.
         session_ids: List of session ID strings.
         colors: Matching list of face colors.
+        base_dir: Data directory for ``session_notes.json``.
+        notes: Pre-loaded notes dict; overrides *base_dir* when given.
         **kwargs: Forwarded to ``ax.legend()``.
     """
-    handles = [
-        plt.Rectangle((0, 0), 1, 1, facecolor=colors[i], alpha=0.7,
-                       label=f"Session {sid}")
-        for i, sid in enumerate(session_ids)
-    ]
+    if notes is None and base_dir:
+        notes = load_notes(base_dir)
+    else:
+        notes = notes or {}
+
+    labels = [format_session_legend_label(sid, notes) for sid in session_ids]
     defaults = dict(loc="upper right")
     defaults.update(kwargs)
-    ax.legend(handles=handles, **defaults)
+    ax.legend(
+        handles=session_legend_handles(session_ids, colors),
+        labels=labels,
+        handler_map=SESSION_LEGEND_HANDLER_MAP,
+        **defaults,
+    )
 
 
 def style_energy_axes(ax, energies, ylabel=None):
@@ -270,6 +540,37 @@ def trend_line_color(face_color):
     return tuple(max(0.0, c * TREND_DARKEN) for c in rgb)
 
 
+def make_trend_legend(ax, trend_entries, *, loc="upper right", fontsize=9, **kwargs):
+    """Add a line-style legend for trend fits on *ax*.
+
+    Uses ``add_artist`` so the legend coexists with other legends on the same
+    axes (session scatter patches, gate lines, etc.).
+
+    Args:
+        ax: Matplotlib axes.
+        trend_entries: List of ``(label_text, line_color)`` tuples as returned
+            by :func:`add_scatter_trend`, :func:`add_energy_trend`, or
+            :func:`add_correlation_scatter`.
+        loc: Legend location. Default ``"upper right"``.
+        fontsize: Legend font size.
+        **kwargs: Forwarded to ``ax.legend()``.
+
+    Returns:
+        The legend artist, or ``None`` when *trend_entries* is empty.
+    """
+    if not trend_entries:
+        return None
+    handles = [
+        Line2D([0], [0], color=color, label=text, **TREND_LINE_KW)
+        for text, color in trend_entries
+    ]
+    defaults = dict(loc=loc, fontsize=fontsize, framealpha=0.9)
+    defaults.update(kwargs)
+    legend = ax.legend(handles=handles, **defaults)
+    ax.add_artist(legend)
+    return legend
+
+
 @dataclass
 class TrendFit:
     """Result of a linear trend fit (see :func:`fit_trend`)."""
@@ -355,6 +656,13 @@ def _fmt_value(value, fmt, value_unit):
     return f"{value:{fmt}}"
 
 
+def trend_session_prefix(session_id, *, n_sessions=1) -> str:
+    """Short session tag for trend legend labels (first 3 ID characters)."""
+    if n_sessions <= 1:
+        return ""
+    return f"{str(session_id)[:3]}: "
+
+
 def format_trend_label(*, prefix="", slope=None, unit=None, mean=None,
                        delta=None, r2=None, ccc=None):
     """Build a consistent trend annotation string.
@@ -362,20 +670,20 @@ def format_trend_label(*, prefix="", slope=None, unit=None, mean=None,
     Pieces appear in a fixed order (slope, mean, Δ, R², CCC); pass only what
     applies. ``mean`` and ``\u0394`` are shown in the quantity's own unit, derived
     from ``unit`` (e.g. ``"%/MeV"`` -> ``"%"``, ``"ms/MeV"`` -> ``"ms"``).
-    Example: ``"S1: +0.12 %/MeV   \u03bc+0.34%   \u0394+1.2%"``.
+    Example: ``"S1: +0.12 %/MeV   \u03bc+0.34%   \u0394+1.2%"`` (all values 2 s.f.).
     """
     value_unit = _value_unit(unit)
     parts = []
     if slope is not None and unit is not None:
-        parts.append(f"{slope:+.4g} {unit}")
+        parts.append(f"{slope:+.2g} {unit}")
     if mean is not None:
-        parts.append("\u03bc" + _fmt_value(mean, "+.2f", value_unit))
+        parts.append("\u03bc" + _fmt_value(mean, "+.2g", value_unit))
     if delta is not None:
-        parts.append("\u0394" + _fmt_value(delta, "+.3g", value_unit))
+        parts.append("\u0394" + _fmt_value(delta, "+.2g", value_unit))
     if r2 is not None:
-        parts.append(f"R\u00b2={r2:.4f}")
+        parts.append(f"R\u00b2={r2:.2g}")
     if ccc is not None:
-        parts.append(f"CCC={ccc:.4f}")
+        parts.append(f"CCC={ccc:.2g}")
     return prefix + "   ".join(parts)
 
 
@@ -395,7 +703,7 @@ def add_scatter_trend(
     slope, mean and Δ-over-range by default (``show_mean`` / ``show_delta``).
 
     Returns:
-        ``(label_text, line_color)`` suitable for :func:`annotate_slopes`, or
+        ``(label_text, line_color)`` suitable for :func:`make_trend_legend`, or
         ``None`` when fewer than two finite points exist.
     """
     if scatter:
@@ -439,8 +747,8 @@ def add_energy_trend(
     (0..N-1). Each session's ``column`` is aggregated per energy (``"median"``
     or ``"mean"``), a line is fit vs energy in MeV, and drawn across the
     categorical positions (offset per session by ``position_offset``). The
-    annotation shows slope, mean and Δ-over-range by default. Stacked labels are
-    added via :func:`annotate_slopes`.
+    annotation shows slope, mean and Δ-over-range by default. A trend legend is
+    added via :func:`make_trend_legend`.
 
     Returns the list of ``(label, color)`` tuples that were annotated.
     """
@@ -478,7 +786,7 @@ def add_energy_trend(
                 **TREND_LINE_KW)
 
         delta = slope * (max(e_mev) - min(e_mev)) if show_delta else None
-        prefix = f"{sid}: " if (prefix_with_session and n_sessions > 1) else ""
+        prefix = trend_session_prefix(sid, n_sessions=n_sessions) if prefix_with_session else ""
         labels.append((
             format_trend_label(prefix=prefix, slope=slope, unit=unit,
                                mean=mean_err, delta=delta),
@@ -486,7 +794,7 @@ def add_energy_trend(
         ))
 
     if labels:
-        annotate_slopes(ax, labels)
+        make_trend_legend(ax, labels)
     return labels
 
 
@@ -548,7 +856,7 @@ def add_correlation_scatter(
         ax.plot(x_range, fit.eval(x_range), color=line_color, linewidth=1.8,
                 linestyle="-", zorder=5)
 
-        prefix = f"{sid}: " if len(loaded_ids) > 1 else ""
+        prefix = trend_session_prefix(sid, n_sessions=len(loaded_ids))
         labels.append((format_trend_label(prefix=prefix, r2=r**2, ccc=ccc),
                        line_color))
 
@@ -562,7 +870,7 @@ def add_correlation_scatter(
             ax.set_aspect("equal", adjustable="datalim")
 
     if labels:
-        annotate_slopes(ax, labels)
+        make_trend_legend(ax, labels)
     if xlabel:
         ax.set_xlabel(xlabel)
     if ylabel:
@@ -769,8 +1077,6 @@ def link_boxplot_to_histogram(
                     xlabel=_xlabel, title=_title, ref_val=_ref,
                     bin_range=_bin_range,
                 )
-                make_session_legend(_hist_ax, loaded_ids, colors)
-
                 _hl.set_x(idx_lo - 0.5)
                 _hl.set_width(idx_hi - idx_lo + 1)
                 _hl.set_visible(True)
@@ -785,7 +1091,6 @@ def link_boxplot_to_histogram(
                     xlabel=_xlabel, title=_title, ref_val=_ref,
                     bin_range=_bin_range,
                 )
-                make_session_legend(_hist_ax, loaded_ids, colors)
                 _hl.set_visible(False)
                 if _span_ref:
                     _span_ref[0].clear()

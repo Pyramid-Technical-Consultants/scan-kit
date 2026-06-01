@@ -14,8 +14,9 @@ from ..common import (
     POSITION_KEY_G3,
     process_position_data,
     try_load_position_data,
+    DEFAULT_SESSION_COLORS,
+    set_view_header,
     FIG_SIZE_SINGLE,
-    SUPTITLE_KW,
     GRID_KW,
     REFLINE_KW,
     SCATTER_ALPHA,
@@ -66,9 +67,14 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
     mode_label = (
         "G3" if n_g3 == len(all_session_data) else ("G2" if n_g3 == 0 else "mixed G3/G2")
     )
-    sids = ", ".join(d["session_id"] for d in all_session_data)
-    fig.suptitle(
-        f"IC1/IC2 Spot Positions ({mode_label}) — {sids}", **SUPTITLE_KW
+    loaded_ids = [d["session_id"] for d in all_session_data]
+    colors = DEFAULT_SESSION_COLORS[: len(loaded_ids)]
+    set_view_header(
+        fig,
+        f"IC1/IC2 Spot Positions ({mode_label})",
+        loaded_ids,
+        colors,
+        base_dir=base_dir,
     )
 
     for row, session_data in enumerate(all_session_data):

@@ -18,10 +18,10 @@ from ..common import (
     C_LAYER_ID,
     resolve_concept_column,
     add_scatter_trend,
-    annotate_slopes,
-    make_session_legend,
+    make_trend_legend,
+    trend_session_prefix,
+    set_view_header,
     DEFAULT_SESSION_COLORS,
-    SUPTITLE_KW,
     apply_tight_layout,
 )
 from ..common import subtract_background_frames
@@ -351,7 +351,7 @@ def _plot_ratio(ax, session_data, ratio_key, loaded_ids, colors):
         data = session_data[sid]
         if ratio_key not in data:
             continue
-        prefix = f"{sid}: " if n_sessions > 1 else ""
+        prefix = trend_session_prefix(sid, n_sessions=n_sessions)
         res = add_scatter_trend(
             ax,
             data["energy"],
@@ -371,7 +371,7 @@ def _plot_ratio(ax, session_data, ratio_key, loaded_ids, colors):
             slope_labels.append(res)
 
     if slope_labels:
-        annotate_slopes(ax, slope_labels)
+        make_trend_legend(ax, slope_labels)
     ax.axhline(0, color="black", linewidth=0.5, alpha=0.3)
     ax.grid(visible=True, alpha=0.3)
 
@@ -419,7 +419,6 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
         squeeze=False,
         width_ratios=[w for _, _, w in _COL_DEFS],
     )
-    fig.suptitle("Current Ratios vs Energy  (plateau mean)", **SUPTITLE_KW)
 
     session_data_g3 = {k: v for k, v in session_data.items() if "ic31_raw" in v}
     colors_g3 = [colors[loaded_ids.index(sid)] for sid in session_data_g3]
@@ -471,8 +470,13 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
         for ax in pct_axes:
             ax.set_ylim(y_lo, y_hi)
 
-    legend_ax = next((ax for ax in pct_axes if ax.get_visible()), axes[0, 0])
-    make_session_legend(legend_ax, loaded_ids, colors)
+    set_view_header(
+        fig,
+        "Current Ratios vs Energy  (plateau mean)",
+        loaded_ids,
+        colors,
+        base_dir=base_dir,
+    )
 
     apply_tight_layout()
     plt.show()

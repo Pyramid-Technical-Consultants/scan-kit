@@ -15,13 +15,12 @@ from ..common import (
     filter_data_rows,
     process_position_data,
     plot_boxplots_for_column,
-    make_session_legend,
+    set_view_header,
     style_energy_axes,
     add_energy_trend,
     link_boxplot_to_histogram,
     DEFAULT_SESSION_COLORS,
     FIG_SIZE_2x2,
-    SUPTITLE_KW,
     apply_tight_layout,
     try_load_position_data,
 )
@@ -227,7 +226,6 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
         figsize=(max(12, 6 * n_cols), FIG_SIZE_2x2[1] * 2),
         squeeze=False,
     )
-    fig.suptitle("Spot Delivery Time Analysis", **SUPTITLE_KW)
 
     all_selectors = []
     for col_idx, (col_key, title, xlabel) in enumerate(columns):
@@ -253,9 +251,6 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
         ax_box.set_title(f"{title} vs Energy")
         style_energy_axes(ax_box, energies, ylabel=xlabel)
 
-        if col_idx == 0:
-            make_session_legend(ax_box, loaded_ids, colors)
-
         if col_data:
             sels = link_boxplot_to_histogram(
                 ax_box, ax_hist,
@@ -264,7 +259,8 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
                 hist_titles=f"{title} distribution (all energies)",
             )
             all_selectors.extend(sels)
-            make_session_legend(ax_hist, col_ids, col_colors)
+
+    set_view_header(fig, "Spot Delivery Time Analysis", loaded_ids, colors, base_dir=base_dir)
 
     apply_tight_layout()
     plt.show()

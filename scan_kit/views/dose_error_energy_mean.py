@@ -15,14 +15,13 @@ from ..common import (
     process_position_data,
     add_dose_error_columns,
     DELIVERED_DOSE_COLS,
-    make_session_legend,
+    set_view_header,
     style_energy_axes,
     add_energy_trend,
     add_correlation_scatter,
     link_boxplot_to_histogram,
     DEFAULT_SESSION_COLORS,
     FIG_SIZE_2x2,
-    SUPTITLE_KW,
     apply_tight_layout,
     REFLINE_KW,
     SCATTER_ALPHA,
@@ -146,11 +145,6 @@ def run(session_ids: list[str], base_dir: str = "test_data",
     if n_rows == 1:
         axes = axes.reshape(1, 3)
 
-    fig.suptitle(
-        "Mean Dose Error vs Energy (% of prescribed dose)",
-        **SUPTITLE_KW,
-    )
-
     main_axes = [axes[r, 0] for r in range(n_rows)]
     hist_axes = [axes[r, 1] for r in range(n_rows)]
     corr_axes = [axes[r, 2] for r in range(n_rows)]
@@ -173,8 +167,6 @@ def run(session_ids: list[str], base_dir: str = "test_data",
         main_axes[row].set_visible(False)
         hist_axes[row].set_visible(False)
 
-    make_session_legend(main_axes[0], loaded_ids, colors)
-
     _selectors = link_boxplot_to_histogram(
         main_axes[:n_err_rows], hist_axes[:n_err_rows],
         session_data, energies, err_cols, colors, loaded_ids,
@@ -196,6 +188,14 @@ def run(session_ids: list[str], base_dir: str = "test_data",
 
     for row in range(n_corr_rows, n_rows):
         corr_axes[row].set_visible(False)
+
+    set_view_header(
+        fig,
+        "Mean Dose Error vs Energy (% of prescribed dose)",
+        loaded_ids,
+        colors,
+        base_dir=base_dir,
+    )
 
     apply_tight_layout()
     plt.show()

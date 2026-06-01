@@ -17,11 +17,10 @@ from ..common import (
     plot_boxplots_for_column,
     add_energy_trend,
     add_correlation_scatter,
-    make_session_legend,
+    set_view_header,
     style_energy_axes,
     DEFAULT_SESSION_COLORS,
     FIG_SIZE_2x2,
-    SUPTITLE_KW,
     apply_tight_layout,
 )
 
@@ -83,8 +82,6 @@ def run(session_ids: list[str], base_dir: str = "test_data",
         3, 2, figsize=(FIG_SIZE_2x2[0] + 4, FIG_SIZE_2x2[1] * 1.4),
         gridspec_kw={"width_ratios": [4, 1]},
     )
-    fig.suptitle("Dose Ratios vs Energy", **SUPTITLE_KW)
-
     box_axes = [axes[0, 0], axes[1, 0], axes[2, 0]]
     corr_axes = [axes[0, 1], axes[1, 1], axes[2, 1]]
 
@@ -148,7 +145,7 @@ def run(session_ids: list[str], base_dir: str = "test_data",
         else:
             corr_axes[row].set_visible(False)
 
-    make_session_legend(box_axes[0], loaded_ids, colors)
+    set_view_header(fig, "Dose Ratios vs Energy", loaded_ids, colors, base_dir=base_dir)
 
     apply_tight_layout()
     plt.show()

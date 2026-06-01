@@ -14,6 +14,7 @@ from typing import Callable
 
 import matplotlib.pyplot as plt
 
+from .plotting import apply_toolbar_tight_layout
 from .settings import ViewSettings
 
 _READY_SENTINEL = "__SCAN_KIT_PLOT_READY__"
@@ -22,6 +23,10 @@ _FIG_ONLY_KW = frozenset({
     "figsize", "dpi", "facecolor", "edgecolor", "frameon",
     "FigureClass", "clear", "layout", "num",
 })
+
+# Delays (ms) after show / resize before re-running toolbar tight layout.
+_LAYOUT_DELAYS_MS = (0, 100, 300, 600)
+_LAYOUT_HOOK = "_scan_kit_layout_hook"
 
 
 def run_with_live_settings(
@@ -65,6 +70,69 @@ def run_with_live_settings(
             return fig, axes
         return _orig_subplots(*args, **kwargs)
 
+    # -- Figure layout after maximize / resize ------------------------------
+
+    def _maximize_figure_window(fig) -> None:
+        try:
+            fig.canvas.manager.window.state("zoomed")
+        except Exception:
+            try:
+                fig.canvas.manager.window.showMaximized()
+            except Exception:
+                pass
+
+    def _apply_toolbar_layout(fig) -> None:
+        try:
+            apply_toolbar_tight_layout(fig)
+        except Exception:
+            pass
+
+    def _queue_delayed_layout(fig, delays_ms) -> None:
+        try:
+            from matplotlib.backends.qt_compat import QtCore
+
+            for delay_ms in delays_ms:
+                QtCore.QTimer.singleShot(
+                    delay_ms, lambda f=fig: _apply_toolbar_layout(f),
+                )
+            return
+        except Exception:
+            pass
+
+        for delay_ms in delays_ms:
+            if delay_ms <= 0:
+                continue
+            try:
+                timer = fig.canvas.new_timer(interval=delay_ms)
+                timer.add_callback(lambda f=fig: _apply_toolbar_layout(f))
+                timer.start()
+            except Exception:
+                pass
+
+    def _schedule_toolbar_tight_layout(
+        fig, *, delays_ms=_LAYOUT_DELAYS_MS, immediate=False,
+    ) -> None:
+        """Re-run toolbar tight layout once the canvas has its final size."""
+        if immediate:
+            _apply_toolbar_layout(fig)
+
+        if getattr(fig, _LAYOUT_HOOK, False):
+            _queue_delayed_layout(fig, (100, 300) if immediate else delays_ms)
+            return
+
+        setattr(fig, _LAYOUT_HOOK, True)
+        fig.canvas.mpl_connect(
+            "resize_event", lambda _event, f=fig: _apply_toolbar_layout(f),
+        )
+        _queue_delayed_layout(fig, delays_ms)
+
+    def _refresh_figure_layout(fig) -> None:
+        _schedule_toolbar_tight_layout(fig, immediate=True)
+
+    def _finalize_figure_layout(fig) -> None:
+        _maximize_figure_window(fig)
+        _schedule_toolbar_tight_layout(fig)
+
     # -- Re-run logic ------------------------------------------------------
 
     def _do_rerun() -> None:
@@ -86,11 +154,9 @@ def run_with_live_settings(
             _state["existing_figs"] = []
         for num in plt.get_fignums():
             try:
-                _orig_figure(num).canvas.draw_idle()
+                _refresh_figure_layout(_orig_figure(num))
             except Exception:
                 pass
-
-    # -- Timer callback: poll settings.json --------------------------------
 
     def _check_settings() -> None:
         try:
@@ -113,12 +179,9 @@ def run_with_live_settings(
 
         for num in plt.get_fignums():
             try:
-                _orig_figure(num).canvas.manager.window.state("zoomed")
+                _finalize_figure_layout(_orig_figure(num))
             except Exception:
-                try:
-                    _orig_figure(num).canvas.manager.window.showMaximized()
-                except Exception:
-                    pass
+                pass
 
         print(_READY_SENTINEL, flush=True)
 

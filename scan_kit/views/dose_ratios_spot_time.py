@@ -16,11 +16,11 @@ from ..common import (
     process_position_data,
     add_scatter_trend,
     try_load_position_data,
-    annotate_slopes,
-    make_session_legend,
+    make_trend_legend,
+    trend_session_prefix,
+    set_view_header,
     DEFAULT_SESSION_COLORS,
     FIG_SIZE_2x2,
-    SUPTITLE_KW,
     apply_tight_layout,
     GRID_KW,
 )
@@ -63,7 +63,7 @@ def _plot_ratio_vs_time(ax, session_data, ratio_col, colors, title):
     for i, (sid, data) in enumerate(session_data.items()):
         if ratio_col not in data:
             continue
-        prefix = f"{sid}: " if len(session_data) > 1 else ""
+        prefix = trend_session_prefix(sid, n_sessions=len(session_data))
         res = add_scatter_trend(
             ax,
             data["spot_time"],
@@ -82,7 +82,7 @@ def _plot_ratio_vs_time(ax, session_data, ratio_col, colors, title):
     ax.grid(**GRID_KW)
 
     if slope_labels:
-        annotate_slopes(ax, slope_labels)
+        make_trend_legend(ax, slope_labels)
 
 
 def run(session_ids: list[str], base_dir: str = "test_data",
@@ -114,7 +114,7 @@ def run(session_ids: list[str], base_dir: str = "test_data",
     fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(
         2, 2, figsize=FIG_SIZE_2x2, sharex=False, sharey=False
     )
-    fig.suptitle("Dose Ratios vs Spot Delivery Time", **SUPTITLE_KW)
+    set_view_header(fig, "Dose Ratios vs Spot Delivery Time", loaded_ids, colors, base_dir=base_dir)
 
     if session_data_g3:
         _plot_ratio_vs_time(
@@ -134,7 +134,6 @@ def run(session_ids: list[str], base_dir: str = "test_data",
         )
 
     ax4.axis("off")
-    make_session_legend(ax1, loaded_ids, colors)
 
     apply_tight_layout()
     plt.show()

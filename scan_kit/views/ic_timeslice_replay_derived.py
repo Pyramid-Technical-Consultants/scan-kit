@@ -33,7 +33,8 @@ from ..common import (
     C_LAYER_ID,
     resolve_concept_column,
     DEFAULT_SESSION_COLORS,
-    SUPTITLE_KW,
+    set_view_header,
+    VIEW_HEADER_SUBPLOT_TOP,
     GRID_KW,
     REFLINE_KW,
     SCATTER_ALPHA,
@@ -323,14 +324,20 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
     heights.append(0.30)
 
     fig = plt.figure(figsize=(22 if show_pos else 18, 10))
-    fig.suptitle("IC Timeslice Replay — Current Derived from Scan-Total Dose", **SUPTITLE_KW)
+    set_view_header(
+        fig,
+        "IC Timeslice Replay — Current Derived from Scan-Total Dose",
+        loaded_ids,
+        sess_colors,
+        base_dir=base_dir,
+    )
 
     gs = gridspec.GridSpec(
         n_rows, n_cols,
         height_ratios=heights,
         width_ratios=width_ratios,
         hspace=0.18, wspace=0.04,
-        top=0.94, bottom=0.06, left=0.03, right=0.99,
+        top=VIEW_HEADER_SUBPLOT_TOP, bottom=0.06, left=0.03, right=0.99,
     )
 
     ax_detail = [fig.add_subplot(gs[0, 0])]
@@ -370,8 +377,6 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
     ax_timeline.grid(**GRID_KW, which="major")
     ax_timeline.grid(which="minor", color="#e0e0e0", linewidth=0.3)
     ax_timeline.tick_params(labelsize=8)
-    if multi:
-        ax_timeline.legend(loc="upper right", fontsize=7, ncol=len(loaded_ids))
 
     for sid_data in session_data.values():
         for offset, _energy in sid_data["layer_boundaries"]:
@@ -429,9 +434,7 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
                 plot_x, plot_y = xy
 
                 line_color = sess_colors[si] if multi else ic_detail_colors[ic_idx]
-                primary_label: str | None = None
-                if ic_idx == 0:
-                    primary_label = sid if multi else ic_labels[ic_idx]
+                primary_label: str | None = ic_labels[ic_idx] if (ic_idx == 0 and not multi) else None
                 ax.plot(
                     plot_x, plot_y,
                     color=line_color, linewidth=0.6,

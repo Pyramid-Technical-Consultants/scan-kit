@@ -17,7 +17,7 @@ from ..common import (
     C_IC3_CURRENT_D,
     C_LAYER_ID,
     DEFAULT_SESSION_COLORS,
-    SUPTITLE_KW,
+    set_view_header,
     apply_tight_layout,
     GRID_KW,
     REFLINE_KW,
@@ -521,7 +521,6 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
         squeeze=False,
         gridspec_kw={"height_ratios": height_ratios, "width_ratios": width_ratios},
     )
-    fig.suptitle("Beam-Off Ramp-Down Curves  (normalised to beam-on)", **SUPTITLE_KW)
 
     for row_idx in range(n_rows):
         if middle_cbar_col is not None:
@@ -715,6 +714,14 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
         )
         cbar_strip.set_label("Strip Current (%)")
         cbar_axes.append(cbar_ax_strip)
+
+    set_view_header(
+        fig,
+        "Beam-Off Ramp-Down Curves  (normalised to beam-on)",
+        loaded_ids,
+        colors,
+        base_dir=base_dir,
+    )
 
     apply_tight_layout()
     for cbar_ax in cbar_axes:

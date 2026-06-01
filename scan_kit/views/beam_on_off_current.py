@@ -14,10 +14,9 @@ from ..common import (
     C_IC3_CURRENT_D,
     C_LAYER_ID,
     plot_boxplots_for_column,
-    make_session_legend,
+    set_view_header,
     style_energy_axes,
     DEFAULT_SESSION_COLORS,
-    SUPTITLE_KW,
     apply_tight_layout,
 )
 from ..common.session_source import (
@@ -193,7 +192,6 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
     colors = DEFAULT_SESSION_COLORS[: len(loaded_ids)]
 
     fig = plt.figure(figsize=(6 * n_cols, 10))
-    fig.suptitle("Beam-On / Beam-Off Current by Energy", **SUPTITLE_KW)
     axes = np.empty((2, n_cols), dtype=object)
     axes[0, 0] = fig.add_subplot(2, n_cols, 1)
     for c in range(1, n_cols):
@@ -233,7 +231,13 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
     for ax in axes.flat:
         ax.label_outer()
 
-    make_session_legend(axes[0, 0], loaded_ids, colors)
+    set_view_header(
+        fig,
+        "Beam-On / Beam-Off Current by Energy",
+        loaded_ids,
+        colors,
+        base_dir=base_dir,
+    )
 
     apply_tight_layout()
     plt.show()
