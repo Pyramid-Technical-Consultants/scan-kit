@@ -18,6 +18,7 @@ class ViewSettings:
     bg_subtract: bool = False
     calibration_mode: str = "off"
     cal_factors: dict[str, float] | None = None
+    selected_sessions: list[str] = field(default_factory=list)
 
     @property
     def auto_calibrate(self) -> bool:
@@ -60,4 +61,9 @@ class ViewSettings:
             out.pop("auto_calibrate", None)
         if out.get("calibration_mode") not in CALIBRATION_MODES:
             out["calibration_mode"] = "off"
+        sel = out.get("selected_sessions")
+        if isinstance(sel, list):
+            out["selected_sessions"] = [str(s) for s in sel]
+        else:
+            out.pop("selected_sessions", None)
         return out

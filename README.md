@@ -78,15 +78,15 @@ scan-kit --version
 
 | View | What it shows |
 |------|---------------|
-| **IC1 X/Y Position Error** | IC1 X and Y position error by energy (box plots) |
-| **IC1 vs IC2 Error Scatter** | IC1/IC2 position differences in X and Y (scatter) |
-| **IC1/IC2 Spot Scatter** | IC1 and IC2 spot positions for gantry-specific sessions |
+| **Position Error vs Energy** | IC1/IC2 X and Y position error vs energy (scatter) |
+| **IC Beam Trajectory** | Per-spot raw IC X/Y lines through IC2→IC1, extended upstream/downstream |
+| **Position Scatter** | Planned, IC1, and IC2 spot positions overlaid by session color |
 | **Dose Ratios vs Energy** | IC2/IC1, IC3/IC1, IC3/IC2 ratio differences vs energy |
 | **Dose Ratios vs Position** | Dose-ratio behavior against beam position |
 | **Dose Ratios vs Spot Time** | Dose-ratio behavior against spot delivery time |
 | **Dose Error vs Target (%)** | Percent error versus prescribed target by energy (IC1/IC2/IC3) |
 | **Spot Delivery Time** | Total, beam-on, and overhead spot timing analysis |
-| **Sigma X/Y Box Plots** | Sigma X and Y distributions by energy |
+| **Sigma vs Energy** | IC1/IC2 X and Y sigma vs energy (violin plots) |
 | **Beam-Off Ramp-Down** | Beam-off current ramp-down curves (IC1/IC2/IC3) |
 | **Beam-On vs Beam-Off Current** | Beam-on and beam-off current distributions by energy |
 | **IC Timeslice Replay** | Interactive media-player style viewer for raw IC1/IC2/IC3 timeslice current |

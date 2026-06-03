@@ -25,17 +25,16 @@ if _HAS_AUDIO:
 
 VIEW_GROUPS: list[tuple[str, list[ViewEntry]]] = [
     (
-        "Spot & position QA",
+        "Beam Distribution Quality",
         [
-            ("IC1 X/Y Position Error", "ic1_position_bars"),
-            ("IC1 vs IC2 Error Scatter", "ic1_ic2_error_scatter"),
-            ("IC1/IC2 Spot Scatter", "ic1_ic2_spot_scatter"),
-            ("Sigma X/Y Box Plots", "sigma_boxplots"),
-            ("Spot Delivery Time", "spot_delivery_time"),
+            ("Position Error vs Energy", "position_error_energy"),
+            ("Sigma vs Energy", "sigma_energy"),
+            ("Position Scatter", "position_scatter"),
+            ("IC Beam Trajectory", "ic_beam_trajectory"),
         ],
     ),
     (
-        "Dose vs prescription",
+        "Dosimetry Quality",
         [
             ("Dose Ratios vs Energy", "dose_ratios_energy"),
             ("Dose Ratios vs Position", "dose_ratios_position"),
@@ -47,14 +46,15 @@ VIEW_GROUPS: list[tuple[str, list[ViewEntry]]] = [
         ],
     ),
     (
-        "IC currents & beam state",
+        "Beam Current Quality",
         [
             ("Current Ratios vs Energy", "current_ratios"),
             ("Beam-On vs Beam-Off Current", "beam_on_off_current"),
+            ("Spot Delivery Time", "spot_delivery_time"),
         ],
     ),
     (
-        "Timeseries & transients",
+        "Timeseries & Transients Quality",
         [
             ("Beam-Off Ramp-Down", "beam_off_rampdown"),
             ("IC Timeslice Replay", "ic_timeslice_replay"),
@@ -67,6 +67,4 @@ VIEW_GROUPS: list[tuple[str, list[ViewEntry]]] = [
     ("Noise measurement", _VIEW_NOISE),
 ]
 
-VIEWS: list[ViewEntry] = [
-    entry for _title, entries in VIEW_GROUPS for entry in entries
-]
+VIEWS: list[ViewEntry] = [entry for _title, entries in VIEW_GROUPS for entry in entries]

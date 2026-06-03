@@ -30,7 +30,6 @@ from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
     QFileDialog,
-    QFrame,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
@@ -291,6 +290,8 @@ class ScanKitMainWindow(QMainWindow):
     _sig_session_rows_batch = Signal(int, object)
     #: Folder scan and row batch emits are done for this generation.
     _sig_scan_finished = Signal(int)
+    #: Full folder listing for an incremental rescan (hydrate_generation, rows).
+    _sig_incremental_rescan = Signal(int, object)
     #: settings.json loaded off the GUI thread (bootstrap_generation, ViewSettings).
     _sig_settings_ready = Signal(int, object)
 
@@ -366,6 +367,9 @@ class ScanKitMainWindow(QMainWindow):
         self._sig_scan_finished.connect(
             self._on_scan_finished, Qt.ConnectionType.QueuedConnection
         )
+        self._sig_incremental_rescan.connect(
+            self._on_incremental_rescan, Qt.ConnectionType.QueuedConnection
+        )
         self._sig_settings_ready.connect(
             self._on_settings_ready, Qt.ConnectionType.QueuedConnection
         )
@@ -400,14 +404,12 @@ class ScanKitMainWindow(QMainWindow):
         left_l = QVBoxLayout(left)
         left_l.setContentsMargins(4, 4, 4, 4)
 
-        header = QHBoxLayout()
-        header.addWidget(QLabel("DATA SOURCE"))
-        ver = QLabel(f"v{__version__}")
-        ver.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        header.addWidget(ver)
-        left_l.addLayout(header)
-
         data_dir_row = QHBoxLayout()
+        clear_btn = QPushButton("✕")
+        clear_btn.setFixedWidth(28)
+        clear_btn.setToolTip("Clear session selection")
+        clear_btn.clicked.connect(self._clear_selection)
+        data_dir_row.addWidget(clear_btn)
         self.base_dir_input = QLineEdit()
         self.base_dir_input.setPlaceholderText("Path to session ZIPs…")
         self.base_dir_input.setText(self._base_dir)
@@ -419,6 +421,11 @@ class ScanKitMainWindow(QMainWindow):
         browse_dir_btn.setFixedWidth(96)
         browse_dir_btn.clicked.connect(self._on_browse_data_dir)
         data_dir_row.addWidget(browse_dir_btn)
+        refresh_btn = QPushButton("↻")
+        refresh_btn.setFixedWidth(28)
+        refresh_btn.setToolTip("Refresh session list from folder")
+        refresh_btn.clicked.connect(self._incremental_refresh_sessions)
+        data_dir_row.addWidget(refresh_btn)
         left_l.addLayout(data_dir_row)
 
         self.session_table = QTableWidget()
@@ -457,16 +464,6 @@ class ScanKitMainWindow(QMainWindow):
         self.session_table.itemChanged.connect(self._on_session_table_item_changed)
         self.session_table.currentCellChanged.connect(self._on_session_current_cell_changed)
         left_l.addWidget(self.session_table, stretch=1)
-
-        status_row = QHBoxLayout()
-        self.status_label = QLabel("")
-        self.status_label.setFrameShape(QFrame.Shape.StyledPanel)
-        status_row.addWidget(self.status_label, stretch=1)
-        clear_btn = QPushButton("✕")
-        clear_btn.setFixedWidth(28)
-        clear_btn.clicked.connect(self._clear_selection)
-        status_row.addWidget(clear_btn)
-        left_l.addLayout(status_row)
 
         # --- Right panel ---
         right_scroll = QScrollArea()
@@ -526,6 +523,9 @@ class ScanKitMainWindow(QMainWindow):
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
         splitter.setSizes([640, 760])
+
+        version_label = QLabel(f"scan-kit v{__version__}")
+        self.statusBar().addPermanentWidget(version_label)
 
         for seq in ("Esc", "Ctrl+Q"):
             QShortcut(QKeySequence(seq), self, activated=self.close)
@@ -630,7 +630,9 @@ class ScanKitMainWindow(QMainWindow):
         self._scan_complete = False
         self.session_table.setRowCount(0)
         self._row_by_sid.clear()
-        self._check_order.clear()
+        # Restore the previously persisted selection so rows get re-checked as
+        # they stream in (reconciled against actually-present sessions on finish).
+        self._check_order = list(self._settings.selected_sessions or [])[:MAX_SESSIONS]
         self._track_worker(
             threading.Thread(
                 target=self._discover_sessions_worker,
@@ -639,6 +641,135 @@ class ScanKitMainWindow(QMainWindow):
             )
         )
         self._schedule_status_refresh()
+
+    def _incremental_refresh_sessions(self) -> None:
+        """Rescan the data folder and merge new/removed sessions without clearing the table."""
+        if not self._scan_complete:
+            return
+        self._hydrate_generation += 1
+        gen = self._hydrate_generation
+        self._shutdown_meta_pool()
+        workers = max(4, min(12, (os.cpu_count() or 4) * 2))
+        self._meta_pool = ThreadPoolExecutor(max_workers=workers)
+        self._track_worker(
+            threading.Thread(
+                target=self._incremental_rescan_worker,
+                args=(gen, self._base_dir),
+                daemon=True,
+            )
+        )
+
+    def _incremental_rescan_worker(self, gen: int, base_dir: str) -> None:
+        from .common.sessions import discover_sessions
+
+        found: list[tuple[str, str]] = []
+        try:
+            try:
+                notes = load_notes(base_dir)
+            except Exception:
+                notes = {}
+            if gen != self._hydrate_generation:
+                return
+            self._sig_notes_loaded.emit(gen, notes)
+            try:
+                rows = discover_sessions(
+                    base_dirs=(base_dir,),
+                    project_root=PROJECT_ROOT,
+                )
+            except Exception:
+                rows = []
+            for sid, path_str, _ in rows:
+                if gen != self._hydrate_generation:
+                    return
+                found.append((sid, path_str))
+        finally:
+            if gen == self._hydrate_generation:
+                self._sig_incremental_rescan.emit(gen, found)
+
+    @Slot(int, object)
+    def _on_incremental_rescan(self, gen: int, rows_obj: object) -> None:
+        if gen != self._hydrate_generation:
+            return
+        if not isinstance(rows_obj, list):
+            return
+        found: list[tuple[str, str]] = []
+        for item in rows_obj:
+            if isinstance(item, tuple) and len(item) >= 2:
+                found.append((str(item[0]), str(item[1])))
+        found_map = dict(found)
+        found_sids = set(found_map.keys())
+        present_sids = set(self._row_by_sid.keys())
+
+        removed = present_sids - found_sids
+        if removed:
+            self.session_table.blockSignals(True)
+            self.session_table.setSortingEnabled(False)
+            try:
+                for row in sorted(
+                    (self._find_row_for_sid(sid) for sid in removed),
+                    reverse=True,
+                ):
+                    if row >= 0:
+                        self.session_table.removeRow(row)
+                self._discovered = [
+                    entry for entry in self._discovered if entry[0] in found_sids
+                ]
+                if any(s in removed for s in self._check_order):
+                    self._check_order = [s for s in self._check_order if s in found_sids]
+                    self._persist_selected_sessions()
+            finally:
+                self.session_table.setSortingEnabled(True)
+                self.session_table.blockSignals(False)
+            self._rebuild_session_row_index()
+
+        for i, (sid, path_str, meta) in enumerate(self._discovered):
+            updated_path = found_map.get(sid)
+            if updated_path is not None and updated_path != path_str:
+                self._discovered[i] = (sid, updated_path, meta)
+
+        new_sids = found_sids - present_sids
+        if new_sids:
+            to_add = [(sid, found_map[sid]) for sid in sorted(new_sids)]
+            self.session_table.blockSignals(True)
+            self.session_table.setSortingEnabled(False)
+            try:
+                first_row = self.session_table.rowCount()
+                self.session_table.setRowCount(first_row + len(to_add))
+                restored = set(self._check_order)
+                for i, (sid, path_str) in enumerate(to_add):
+                    row = first_row + i
+                    self._discovered.append((sid, path_str, None))
+                    self._set_session_row_widgets(
+                        row, sid, None, use_checked=sid in restored
+                    )
+                    self._schedule_meta_hydrate(gen, sid, path_str)
+            finally:
+                self.session_table.setSortingEnabled(True)
+                self.session_table.blockSignals(False)
+            self._rebuild_session_row_index()
+
+        self._sync_note_cells_from_store(found_sids)
+        self._sessions = [s for s, _, _ in self._discovered]
+        self._schedule_status_refresh()
+
+    def _sync_note_cells_from_store(self, sids: set[str] | None = None) -> None:
+        """Apply in-memory notes to table cells (e.g. after reloading notes.json)."""
+        target = sids if sids is not None else set(self._row_by_sid.keys())
+        self.session_table.blockSignals(True)
+        try:
+            for sid in target:
+                row = self._find_row_for_sid(sid)
+                if row < 0:
+                    continue
+                note_cell = self.session_table.item(row, _COL_NOTE)
+                if note_cell is None:
+                    continue
+                note = self._notes.get(sid, "")
+                if note_cell.text() != note:
+                    note_cell.setText(note)
+                note_cell.setToolTip(note if len(note) > 120 else "")
+        finally:
+            self.session_table.blockSignals(False)
 
     def _discover_sessions_worker(self, gen: int, base_dir: str) -> None:
         from .common.sessions import discover_sessions
@@ -751,10 +882,13 @@ class ScanKitMainWindow(QMainWindow):
         try:
             first_row = self.session_table.rowCount()
             self.session_table.setRowCount(first_row + len(clean))
+            restored = set(self._check_order)
             for i, (sid, path_str) in enumerate(clean):
                 row = first_row + i
                 self._discovered.append((sid, path_str, None))
-                self._set_session_row_widgets(row, sid, None, use_checked=False)
+                self._set_session_row_widgets(
+                    row, sid, None, use_checked=sid in restored
+                )
                 self._schedule_meta_hydrate(gen, sid, path_str)
         finally:
             self.session_table.setSortingEnabled(True)
@@ -769,6 +903,12 @@ class ScanKitMainWindow(QMainWindow):
             return
         self._scan_complete = True
         self._sessions = [s for s, _, _ in self._discovered]
+        # Drop any persisted selection that no longer maps to a present session.
+        present = set(self._sessions)
+        reconciled = [s for s in self._check_order if s in present]
+        if reconciled != self._check_order:
+            self._check_order = reconciled
+            self._persist_selected_sessions()
         if self._hydrate_received >= len(self._discovered):
             self._schedule_meta_column_resize()
         self._schedule_status_refresh()
@@ -880,9 +1020,7 @@ class ScanKitMainWindow(QMainWindow):
 
     @Slot(int, str)
     def _show_extracting_status(self, gen: int, session_id: str) -> None:
-        if gen != self._hydrate_generation:
-            return
-        self.status_label.setText(f"> Extracting {session_id}… (one-time)")
+        pass
 
     def _session_row_sid(self, row: int) -> str | None:
         if row < 0 or row >= self.session_table.rowCount():
@@ -965,6 +1103,7 @@ class ScanKitMainWindow(QMainWindow):
                 self._check_order = [s for s in self._check_order if s != sid]
             selected_set = set(self._checked_sids_ordered())
             self._check_order = [s for s in self._check_order if s in selected_set]
+            self._persist_selected_sessions()
             self._schedule_status_refresh()
             return
         if col == _COL_NOTE:
@@ -1053,18 +1192,6 @@ class ScanKitMainWindow(QMainWindow):
     def _update_status(self) -> None:
         selected = self._selected_sids_in_order()
         self._refresh_use_column_swatches(selected)
-        msg_bits: list[str] = []
-        if not self._scan_complete:
-            msg_bits.append("scanning sessions")
-        elif self._hydrate_received < len(self._discovered):
-            msg_bits.append("loading session details")
-        extra = f"  ({'; '.join(msg_bits)})" if msg_bits else ""
-        if len(selected) == 0:
-            self.status_label.setText(
-                f"> SELECT 1-{MAX_SESSIONS} SESSIONS (check Use){extra}"
-            )
-        else:
-            self.status_label.setText(f"> READY: {len(selected)} | {', '.join(selected)}{extra}")
 
     def _clear_selection(self) -> None:
         self.session_table.blockSignals(True)
@@ -1076,7 +1203,16 @@ class ScanKitMainWindow(QMainWindow):
         finally:
             self.session_table.blockSignals(False)
         self._check_order.clear()
+        self._persist_selected_sessions()
         self._schedule_status_refresh()
+
+    def _persist_selected_sessions(self) -> None:
+        """Save the current session selection into the persistent settings file."""
+        self._settings.selected_sessions = self._selected_sids_in_order()
+        try:
+            self._settings.save(self._base_dir)
+        except Exception:
+            pass
 
     def _notify(self, message: str, *, error: bool = False) -> None:
         box = QMessageBox(self)

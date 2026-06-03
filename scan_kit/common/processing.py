@@ -385,18 +385,28 @@ def process_position_data(
         return None
 
     if is_raw:
-        ic1_x = transform.remap(
-            data_clean[resolved_position[C_IC1_X_POS_RAW]], *transform.IC1_X_MAP
-        )
-        ic1_y = transform.remap(
-            data_clean[resolved_position[C_IC1_Y_POS_RAW]], *transform.IC1_Y_MAP
-        )
-        ic2_x = transform.remap(
-            data_clean[resolved_position[C_IC2_X_POS_RAW]], *transform.IC2_X_MAP
-        )
-        ic2_y = transform.remap(
-            data_clean[resolved_position[C_IC2_Y_POS_RAW]], *transform.IC2_Y_MAP
-        )
+        if position_key in (POSITION_KEY_G2, POSITION_KEY_G2_RAW):
+            raw_ic1_x = data_clean[resolved_position[C_IC1_X_POS_RAW]]
+            raw_ic1_y = data_clean[resolved_position[C_IC1_Y_POS_RAW]]
+            raw_ic2_x = data_clean[resolved_position[C_IC2_X_POS_RAW]]
+            raw_ic2_y = data_clean[resolved_position[C_IC2_Y_POS_RAW]]
+            ic1_x = transform.remap_g2_raw(raw_ic1_x)
+            ic1_y = transform.remap_g2_raw(raw_ic1_y)
+            ic2_x = transform.g2_ic2_mm(ic1_x, raw_ic2_x)
+            ic2_y = transform.g2_ic2_mm(ic1_y, raw_ic2_y)
+        else:
+            ic1_x = transform.remap(
+                data_clean[resolved_position[C_IC1_X_POS_RAW]], *transform.IC1_X_MAP
+            )
+            ic1_y = transform.remap(
+                data_clean[resolved_position[C_IC1_Y_POS_RAW]], *transform.IC1_Y_MAP
+            )
+            ic2_x = transform.remap(
+                data_clean[resolved_position[C_IC2_X_POS_RAW]], *transform.IC2_X_MAP
+            )
+            ic2_y = transform.remap(
+                data_clean[resolved_position[C_IC2_Y_POS_RAW]], *transform.IC2_Y_MAP
+            )
     else:
         ic1_x = pd.to_numeric(data_clean[resolved_position[C_IC1_X_POS]], errors="coerce")
         ic1_y = pd.to_numeric(data_clean[resolved_position[C_IC1_Y_POS]], errors="coerce")

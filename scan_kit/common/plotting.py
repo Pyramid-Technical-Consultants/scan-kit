@@ -65,6 +65,14 @@ SESSION_LEGEND_HANDLER_MAP = {FancyBboxPatch: _HandlerRoundedPatch()}
 GRID_KW = dict(visible=True, alpha=0.3)
 REFLINE_KW = dict(color="gray", linestyle="--", linewidth=1, alpha=0.6)
 
+# Symmetric ± limit lines — shared styling for violin/scatter and histogram panels.
+POSITION_MM_TOLERANCE_LEVELS = (
+    (1.0, "green", "\u00b11 mm"),
+    (2.0, "orange", "\u00b12 mm"),
+    (3.0, "red", "\u00b13 mm"),
+)
+LIMIT_LINE_KW = dict(linestyle="--", linewidth=1.3, alpha=0.3, zorder=6)
+
 HIST_PERCENTILE_CLIP = 100  # percentile for histogram outlier filtering (e.g. 99 → 1st–99th)
 
 SCATTER_ALPHA = 0.45
@@ -140,6 +148,70 @@ def plot_boxplots_for_column(
             whiskerprops=dict(color="black"),
             capprops=dict(color="black"),
         )
+
+
+def plot_violins_for_column(
+    ax,
+    session_data,
+    column_name,
+    energies,
+    colors=None,
+    position_offset=0.0,
+    width=0.65,
+    alpha=0.35,
+):
+    """Plot overlapping violin plots for a column across sessions, grouped by energy.
+
+    Sessions share the same x position at each energy so violins stack; use
+    *alpha* to keep overlapping distributions readable.
+    """
+    if colors is None:
+        colors = DEFAULT_SESSION_COLORS[: len(session_data)]
+
+    for i, (_session_id, data) in enumerate(session_data.items()):
+        if column_name not in data:
+            continue
+
+        df = pd.DataFrame(
+            {column_name: data[column_name], "energy": data["energy"]}
+        )
+
+        column_data = []
+        positions = []
+        for j, energy in enumerate(energies):
+            energy_data = df[df["energy"] == energy][column_name].values
+            energy_data = energy_data[np.isfinite(energy_data)]
+            if energy_data.size == 0:
+                continue
+            column_data.append(energy_data)
+            positions.append(j + (i - 0.5) * position_offset)
+
+        if not column_data:
+            continue
+
+        vp = ax.violinplot(
+            column_data,
+            positions=positions,
+            widths=width,
+            showmeans=False,
+            showmedians=True,
+            showextrema=True,
+        )
+        color = colors[i]
+        for body in vp["bodies"]:
+            body.set_facecolor(color)
+            body.set_edgecolor(color)
+            body.set_alpha(alpha)
+            body.set_linewidth(0.8)
+        if "cmedians" in vp:
+            vp["cmedians"].set_color(color)
+            vp["cmedians"].set_linewidth(1.2)
+            vp["cmedians"].set_alpha(min(1.0, alpha + 0.45))
+        for key in ("cbars", "cmins", "cmaxes"):
+            if key in vp:
+                vp[key].set_color(color)
+                vp[key].set_linewidth(0.8)
+                vp[key].set_alpha(min(1.0, alpha + 0.25))
 
 
 def annotate_slopes(ax, labels_and_colors, *, x_anchor=0.03, y_top=0.97,
@@ -906,6 +978,85 @@ def add_energy_colorbar(fig_or_ax, energies=None, vmin=None, vmax=None):
 
 
 # ---------------------------------------------------------------------------
+# Symmetric ± limit lines
+# ---------------------------------------------------------------------------
+
+
+def draw_symmetric_limit_lines(
+    ax,
+    levels,
+    *,
+    orientation="horizontal",
+    line_kw=None,
+    legend=False,
+):
+    """Draw fixed ±limit lines on *ax*.
+
+    Args:
+        ax: Matplotlib axes.
+        levels: Sequence of ``(value, color, label)`` tuples.
+        orientation: ``"horizontal"`` (``axhline``) or ``"vertical"`` (``axvline``).
+        line_kw: Line style kwargs; defaults to :data:`LIMIT_LINE_KW`.
+        legend: When True, label only the positive line at each level for legends.
+
+    Returns:
+        List of positive-side line artists (one per level), or empty when
+        *levels* is empty.
+    """
+    if not levels:
+        return []
+
+    kw = dict(line_kw or LIMIT_LINE_KW)
+    draw = ax.axhline if orientation == "horizontal" else ax.axvline
+    handles = []
+    for val, color, label in levels:
+        label_kw = {"label": label} if legend else {}
+        line = draw(val, color=color, **label_kw, **kw)
+        draw(-val, color=color, **kw)
+        handles.append(line)
+    return handles
+
+
+def pad_limits_for_symmetric_limits(lo, hi, levels):
+    """Expand numeric *lo* / *hi* to include every symmetric limit magnitude."""
+    for val, _, _ in levels:
+        lo = min(lo, -val)
+        hi = max(hi, val)
+    return lo, hi
+
+
+def apply_shared_block_labels(
+    axes,
+    *,
+    column_titles=None,
+    row_ylabels,
+    xlabel,
+    bottom_row=-1,
+    ylabel_col=0,
+):
+    """Apply shared column titles and per-row y-axis labels to a 2-D axes block."""
+    grid = np.asarray(axes)
+    n_rows, n_cols = grid.shape
+
+    if column_titles is not None:
+        for col_idx, title in enumerate(column_titles):
+            grid[0, col_idx].set_title(title)
+
+    for row_idx in range(n_rows):
+        grid[row_idx, ylabel_col].set_ylabel(row_ylabels[row_idx])
+        for col_idx in range(n_cols):
+            if col_idx != ylabel_col:
+                grid[row_idx, col_idx].set_ylabel("")
+            if row_idx != bottom_row:
+                grid[row_idx, col_idx].set_xlabel("")
+
+    for col_idx in range(n_cols):
+        grid[bottom_row, col_idx].set_xlabel(xlabel)
+
+    return grid
+
+
+# ---------------------------------------------------------------------------
 # Interactive energy filtering: SpanSelector linking boxplots to histograms
 # ---------------------------------------------------------------------------
 
@@ -973,7 +1124,8 @@ def _plot_histogram(ax, session_data, col, loaded_ids, colors, *,
         ax.set_title(title)
     if xlabel:
         ax.set_xlabel(xlabel)
-    ax.set_ylabel(ylabel)
+    if ylabel is not None:
+        ax.set_ylabel(ylabel)
     if ref_val is not None:
         ax.axvline(x=ref_val, **REFLINE_KW)
     ax.set_visible(True)
@@ -994,6 +1146,9 @@ def link_boxplot_to_histogram(
     hist_titles=None,
     hist_refs=None,
     hist_percentile_clip=None,
+    tolerance_levels=None,
+    tolerance_line_kw=None,
+    n_columns=None,
 ):
     """Install SpanSelectors on boxplot axes that interactively filter histograms.
 
@@ -1006,10 +1161,17 @@ def link_boxplot_to_histogram(
         colors: Session color list.
         loaded_ids: Ordered session id list.
         n_bins: Number of histogram bins.
-        hist_ylabel: Y-axis label for histograms.
+        hist_ylabel: Y-axis label(s) for histograms — a string, or one label per
+            row when *n_columns* is set.
         hist_xlabels: Single or list of x-axis labels for histograms.
         hist_titles: Single or list of titles for histograms.
         hist_refs: Single or list of reference-line values (vertical) for histograms.
+        tolerance_levels: Optional sequence of ``(value, color, label)`` tuples;
+            draws vertical ``±value`` lines on each histogram after every redraw.
+        tolerance_line_kw: Matplotlib kwargs for tolerance lines; defaults to
+            :data:`LIMIT_LINE_KW`.
+        n_columns: When set, only the first column in each row receives the
+            row's *hist_ylabel* entry.
 
     Returns:
         List of SpanSelector objects. **The caller must keep a reference** to
@@ -1029,9 +1191,41 @@ def link_boxplot_to_histogram(
     if hist_refs is None:
         hist_refs = [None] * len(columns)
 
+    if isinstance(hist_ylabel, (list, tuple)):
+        hist_ylabels = list(hist_ylabel)
+    else:
+        hist_ylabels = [hist_ylabel] * len(columns)
+
+    tol_kw = tolerance_line_kw or LIMIT_LINE_KW
     energy_arr = np.array(energies, dtype=float)
     selectors = []
     pclip = hist_percentile_clip if hist_percentile_clip is not None else HIST_PERCENTILE_CLIP
+
+    def _after_histogram(ax):
+        if tolerance_levels:
+            draw_symmetric_limit_lines(
+                ax,
+                tolerance_levels,
+                orientation="vertical",
+                line_kw=tol_kw,
+            )
+
+    def _ylabel_for_index(idx, *, show_ylabel):
+        if not show_ylabel:
+            return None
+        row = idx // n_columns if n_columns else idx
+        if row >= len(hist_ylabels):
+            return hist_ylabels[0]
+        return hist_ylabels[row]
+
+    def _redraw_histogram(hist_ax, col, xlabel, title, ref, energy_mask, *, show_ylabel, axis_idx):
+        _plot_histogram(
+            hist_ax, session_data, col, loaded_ids, colors,
+            energy_mask=energy_mask, n_bins=n_bins,
+            ylabel=_ylabel_for_index(axis_idx, show_ylabel=show_ylabel),
+            xlabel=xlabel, title=title, ref_val=ref, bin_range=shared_bin_range,
+        )
+        _after_histogram(hist_ax)
 
     # Compute a shared bin range across all columns
     all_hist_vals = []
@@ -1048,19 +1242,19 @@ def link_boxplot_to_histogram(
     else:
         shared_bin_range = None
 
-    for box_ax, hist_ax, col, xlabel, title, ref in zip(
+    for idx, (box_ax, hist_ax, col, xlabel, title, ref) in enumerate(zip(
         box_axes, hist_axes, columns, hist_xlabels, hist_titles, hist_refs
-    ):
-        _plot_histogram(
-            hist_ax, session_data, col, loaded_ids, colors,
-            n_bins=n_bins, ylabel=hist_ylabel, xlabel=xlabel,
-            title=title, ref_val=ref, bin_range=shared_bin_range,
+    )):
+        show_ylabel = n_columns is None or idx % n_columns == 0
+        _redraw_histogram(
+            hist_ax, col, xlabel, title, ref, energy_mask=None,
+            show_ylabel=show_ylabel, axis_idx=idx,
         )
 
         highlight = box_ax.axvspan(0, 0, alpha=0.15, color="gold", visible=False, zorder=0)
 
         def _make_callback(_hist_ax, _col, _xlabel, _title, _ref, _hl, _span_ref,
-                           _bin_range=shared_bin_range):
+                           _show_ylabel, _axis_idx, _bin_range=shared_bin_range):
             def _on_select(xmin, xmax):
                 idx_lo = max(0, int(np.floor(xmin + 0.5)))
                 idx_hi = min(len(energy_arr) - 1, int(np.floor(xmax + 0.5)))
@@ -1071,11 +1265,9 @@ def link_boxplot_to_histogram(
                     e = np.asarray(session_data[sid]["energy"], dtype=float)
                     mask[sid] = np.isin(e, list(sel_energies))
 
-                _plot_histogram(
-                    _hist_ax, session_data, _col, loaded_ids, colors,
-                    energy_mask=mask, n_bins=n_bins, ylabel=hist_ylabel,
-                    xlabel=_xlabel, title=_title, ref_val=_ref,
-                    bin_range=_bin_range,
+                _redraw_histogram(
+                    _hist_ax, _col, _xlabel, _title, _ref, energy_mask=mask,
+                    show_ylabel=_show_ylabel, axis_idx=_axis_idx,
                 )
                 _hl.set_x(idx_lo - 0.5)
                 _hl.set_width(idx_hi - idx_lo + 1)
@@ -1085,11 +1277,9 @@ def link_boxplot_to_histogram(
             def _on_dblclick(event, _box_ax=box_ax):
                 if not event.dblclick or event.inaxes is not _box_ax:
                     return
-                _plot_histogram(
-                    _hist_ax, session_data, _col, loaded_ids, colors,
-                    n_bins=n_bins, ylabel=hist_ylabel,
-                    xlabel=_xlabel, title=_title, ref_val=_ref,
-                    bin_range=_bin_range,
+                _redraw_histogram(
+                    _hist_ax, _col, _xlabel, _title, _ref, energy_mask=None,
+                    show_ylabel=_show_ylabel, axis_idx=_axis_idx,
                 )
                 _hl.set_visible(False)
                 if _span_ref:
@@ -1100,7 +1290,7 @@ def link_boxplot_to_histogram(
 
         span_ref = []
         on_select, on_dblclick = _make_callback(
-            hist_ax, col, xlabel, title, ref, highlight, span_ref,
+            hist_ax, col, xlabel, title, ref, highlight, span_ref, show_ylabel, idx,
         )
 
         span = SpanSelector(
@@ -1113,6 +1303,155 @@ def link_boxplot_to_histogram(
         selectors.append(span)
 
     # Match initial y-limits across histogram axes
+    visible_axes = [ax for ax in hist_axes if ax.get_visible()]
+    if visible_axes:
+        y_max = max(ax.get_ylim()[1] for ax in visible_axes)
+        for ax in visible_axes:
+            ax.set_ylim(0, y_max)
+
+    return selectors
+
+
+def link_scatter_to_histogram(
+    scatter_axes,
+    hist_axes,
+    session_data,
+    columns,
+    colors,
+    loaded_ids,
+    *,
+    n_bins=101,
+    hist_ylabel="Probability (%)",
+    hist_xlabels=None,
+    hist_titles=None,
+    hist_refs=None,
+    hist_percentile_clip=None,
+    tolerance_levels=None,
+    tolerance_line_kw=None,
+):
+    """Install SpanSelectors on scatter axes that filter linked histograms by energy.
+
+    Drag horizontally on a scatter panel (x = energy in MeV) to restrict the
+    matching histogram to spots in that energy range.  Double-click the scatter
+    panel to reset.
+
+    Args:
+        scatter_axes: Single axis or list of scatter axes (x = energy).
+        hist_axes: Matching single axis or list of histogram axes.
+        session_data: Dict mapping session_id -> data dict with ``"energy"`` key.
+        columns: Single column name or list of column names (one per axis pair).
+        colors: Session color list.
+        loaded_ids: Ordered session id list.
+        n_bins: Number of histogram bins.
+        hist_ylabel: Y-axis label for histograms.
+        hist_xlabels: Single or list of x-axis labels for histograms.
+        hist_titles: Single or list of titles for histograms.
+        hist_refs: Single or list of reference-line values (vertical) for histograms.
+        hist_percentile_clip: Percentile clip for shared bin edges.
+        tolerance_levels: Optional sequence of ``(value, color, label)`` tuples;
+            draws vertical ``±value`` lines on each histogram after every redraw.
+        tolerance_line_kw: Matplotlib kwargs for tolerance lines; defaults to
+            :data:`LIMIT_LINE_KW`.
+
+    Returns:
+        List of SpanSelector objects. **The caller must keep a reference** to
+        prevent garbage collection.
+    """
+    if not isinstance(scatter_axes, (list, np.ndarray)):
+        scatter_axes = [scatter_axes]
+        hist_axes = [hist_axes]
+    if isinstance(columns, str):
+        columns = [columns]
+    if isinstance(hist_xlabels, str) or hist_xlabels is None:
+        hist_xlabels = [hist_xlabels] * len(columns)
+    if isinstance(hist_titles, str) or hist_titles is None:
+        hist_titles = [hist_titles] * len(columns)
+    if not isinstance(hist_refs, (list, np.ndarray, type(None))):
+        hist_refs = [hist_refs] * len(columns)
+    if hist_refs is None:
+        hist_refs = [None] * len(columns)
+
+    tol_kw = tolerance_line_kw or LIMIT_LINE_KW
+    selectors = []
+    pclip = hist_percentile_clip if hist_percentile_clip is not None else HIST_PERCENTILE_CLIP
+
+    all_hist_vals = []
+    for col in columns:
+        for sid in loaded_ids:
+            if col in session_data[sid]:
+                v = np.asarray(session_data[sid][col], dtype=float)
+                v = v[np.isfinite(v)]
+                if v.size:
+                    all_hist_vals.append(v)
+    if all_hist_vals:
+        combined = np.concatenate(all_hist_vals)
+        shared_bin_range = tuple(np.percentile(combined, [100 - pclip, pclip]))
+    else:
+        shared_bin_range = None
+
+    def _after_histogram(ax):
+        if tolerance_levels:
+            draw_symmetric_limit_lines(
+                ax,
+                tolerance_levels,
+                orientation="vertical",
+                line_kw=tol_kw,
+            )
+
+    def _redraw_histogram(hist_ax, col, xlabel, title, ref, energy_mask):
+        _plot_histogram(
+            hist_ax, session_data, col, loaded_ids, colors,
+            energy_mask=energy_mask, n_bins=n_bins, ylabel=hist_ylabel,
+            xlabel=xlabel, title=title, ref_val=ref, bin_range=shared_bin_range,
+        )
+        _after_histogram(hist_ax)
+
+    for scatter_ax, hist_ax, col, xlabel, title, ref in zip(
+        scatter_axes, hist_axes, columns, hist_xlabels, hist_titles, hist_refs
+    ):
+        _redraw_histogram(hist_ax, col, xlabel, title, ref, energy_mask=None)
+
+        highlight = scatter_ax.axvspan(0, 0, alpha=0.15, color="gold", visible=False, zorder=0)
+
+        def _make_callback(_scatter_ax, _hist_ax, _col, _xlabel, _title, _ref, _hl, _span_ref):
+            def _on_select(xmin, xmax):
+                lo, hi = float(min(xmin, xmax)), float(max(xmin, xmax))
+                mask = {}
+                for sid in loaded_ids:
+                    e = np.asarray(session_data[sid]["energy"], dtype=float)
+                    mask[sid] = (e >= lo) & (e <= hi)
+
+                _redraw_histogram(_hist_ax, _col, _xlabel, _title, _ref, energy_mask=mask)
+                _hl.set_x(lo)
+                _hl.set_width(hi - lo)
+                _hl.set_visible(True)
+                _hist_ax.figure.canvas.draw_idle()
+
+            def _on_dblclick(event, _sax=_scatter_ax):
+                if not event.dblclick or event.inaxes is not _sax:
+                    return
+                _redraw_histogram(_hist_ax, _col, _xlabel, _title, _ref, energy_mask=None)
+                _hl.set_visible(False)
+                if _span_ref:
+                    _span_ref[0].clear()
+                _hist_ax.figure.canvas.draw_idle()
+
+            return _on_select, _on_dblclick
+
+        span_ref = []
+        on_select, on_dblclick = _make_callback(
+            scatter_ax, hist_ax, col, xlabel, title, ref, highlight, span_ref,
+        )
+
+        span = SpanSelector(
+            scatter_ax, on_select, "horizontal",
+            useblit=True, interactive=True,
+            props=dict(alpha=0.2, facecolor="gold", zorder=0),
+        )
+        span_ref.append(span)
+        scatter_ax.figure.canvas.mpl_connect("button_press_event", on_dblclick)
+        selectors.append(span)
+
     visible_axes = [ax for ax in hist_axes if ax.get_visible()]
     if visible_axes:
         y_max = max(ax.get_ylim()[1] for ax in visible_axes)

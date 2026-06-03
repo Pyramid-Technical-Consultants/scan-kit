@@ -53,7 +53,7 @@ from .session_source import (
     hydrate_session_metadata,
     discover_session_entries,
 )
-from .transform import remap, IC1_X_MAP, IC1_Y_MAP, IC2_X_MAP, IC2_Y_MAP
+from .transform import remap, remap_g2_raw, remap_g2_raw_reversed, g2_ic2_mm, IC1_X_MAP, IC1_Y_MAP, IC2_X_MAP, IC2_Y_MAP
 from .validation import create_valid_mask, apply_validation
 from .processing import (
     load_session_raw,
@@ -73,6 +73,7 @@ from .processing import (
 )
 from .plotting import (
     plot_boxplots_for_column,
+    plot_violins_for_column,
     plot_scatter_energy,
     scatter_with_trend,
     add_energy_colorbar,
@@ -85,6 +86,7 @@ from .plotting import (
     style_energy_axes,
     apply_tight_layout,
     link_boxplot_to_histogram,
+    link_scatter_to_histogram,
     trend_line_color,
     fit_trend,
     format_trend_label,
@@ -102,6 +104,11 @@ from .plotting import (
     VIEW_HEADER_SUBPLOT_TOP,
     GRID_KW,
     REFLINE_KW,
+    LIMIT_LINE_KW,
+    POSITION_MM_TOLERANCE_LEVELS,
+    draw_symmetric_limit_lines,
+    pad_limits_for_symmetric_limits,
+    apply_shared_block_labels,
     SCATTER_ALPHA,
     SCATTER_SIZE,
     SLOPE_LABEL_KW,
@@ -156,6 +163,9 @@ __all__ = [
     "hydrate_session_metadata",
     "discover_session_entries",
     "remap",
+    "remap_g2_raw",
+    "remap_g2_raw_reversed",
+    "g2_ic2_mm",
     "IC1_X_MAP",
     "IC1_Y_MAP",
     "IC2_X_MAP",
@@ -168,6 +178,7 @@ __all__ = [
     "apply_calibration_factors",
     "compute_calibration_factors",
     "plot_boxplots_for_column",
+    "plot_violins_for_column",
     "plot_scatter_energy",
     "scatter_with_trend",
     "add_energy_colorbar",
@@ -180,6 +191,7 @@ __all__ = [
     "style_energy_axes",
     "apply_tight_layout",
     "link_boxplot_to_histogram",
+    "link_scatter_to_histogram",
     "trend_line_color",
     "fit_trend",
     "format_trend_label",
@@ -197,6 +209,11 @@ __all__ = [
     "VIEW_HEADER_SUBPLOT_TOP",
     "GRID_KW",
     "REFLINE_KW",
+    "LIMIT_LINE_KW",
+    "POSITION_MM_TOLERANCE_LEVELS",
+    "draw_symmetric_limit_lines",
+    "pad_limits_for_symmetric_limits",
+    "apply_shared_block_labels",
     "SCATTER_ALPHA",
     "SCATTER_SIZE",
     "SLOPE_LABEL_KW",
