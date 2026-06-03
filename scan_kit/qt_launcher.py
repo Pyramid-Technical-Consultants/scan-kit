@@ -22,6 +22,7 @@ from PySide6.QtGui import (
     QIcon,
     QKeySequence,
     QPainter,
+    QPalette,
     QPen,
     QPixmap,
     QShortcut,
@@ -30,6 +31,7 @@ from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
     QFileDialog,
+    QFrame,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
@@ -42,6 +44,7 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSizePolicy,
     QSplitter,
+    QTabWidget,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -54,6 +57,7 @@ from .common.session_notes import load_notes, save_note
 from .common.settings import ViewSettings, CALIBRATION_MODES
 from .common.plot_colors import DEFAULT_SESSION_COLORS
 from .views import VIEW_GROUPS, VIEWS
+from .workflows.plan_synthesis_panel import PlanSynthesisPanel
 
 MAX_SESSIONS = 5
 FROZEN = getattr(sys, "frozen", False)
@@ -181,6 +185,17 @@ def _meta_sort_values(
     return (meta.date, meta.primary_mu, meta.treatment_time_s)
 
 
+def _side_panel_scroll_area() -> QScrollArea:
+    """Scroll area styled like a plain splitter pane (no sunken frame)."""
+    scroll = QScrollArea()
+    scroll.setWidgetResizable(True)
+    scroll.setFrameShape(QFrame.Shape.NoFrame)
+    pal = scroll.viewport().palette()
+    pal.setColor(QPalette.ColorRole.Base, pal.color(QPalette.ColorRole.Window))
+    scroll.viewport().setPalette(pal)
+    return scroll
+
+
 # Segmented control look: connected checkable buttons, accent-filled when selected.
 # Uses palette() roles so it follows the active light/dark theme.
 _SEGMENTED_QSS = """
@@ -297,7 +312,7 @@ class ScanKitMainWindow(QMainWindow):
 
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle(f"scan-kit v{__version__}")
+        self.setWindowTitle(f"Scan Kit v{__version__}")
         self.resize(1400, 880)
         self.setMinimumSize(1050, 650)
         if FROZEN:
@@ -392,9 +407,18 @@ class ScanKitMainWindow(QMainWindow):
                 self._row_by_sid[sid] = r
 
     def _build_ui(self) -> None:
-        central = QWidget()
-        self.setCentralWidget(central)
-        outer = QHBoxLayout(central)
+        tabs = QTabWidget()
+        tabs.addTab(self._build_data_analysis_tab(), "Data Analysis")
+        tabs.addTab(self._build_plan_synthesis_tab(), "Plan Synthesis")
+        self.setCentralWidget(tabs)
+
+        for seq in ("Esc", "Ctrl+Q"):
+            QShortcut(QKeySequence(seq), self, activated=self.close)
+
+    def _build_data_analysis_tab(self) -> QWidget:
+        tab = QWidget()
+        outer = QHBoxLayout(tab)
+        outer.setContentsMargins(0, 0, 0, 0)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
         outer.addWidget(splitter)
@@ -431,7 +455,7 @@ class ScanKitMainWindow(QMainWindow):
         self.session_table = QTableWidget()
         self.session_table.setColumnCount(6)
         self.session_table.setHorizontalHeaderLabels(
-            ["Use", "Session ID", "Date", "MU", "Time (s)", "Note"]
+            ["Use", "Session ID", "Date", "MU", "Time", "Note"]
         )
         self.session_table.setSelectionBehavior(
             QTableWidget.SelectionBehavior.SelectRows
@@ -466,13 +490,10 @@ class ScanKitMainWindow(QMainWindow):
         left_l.addWidget(self.session_table, stretch=1)
 
         # --- Right panel ---
-        right_scroll = QScrollArea()
-        right_scroll.setWidgetResizable(True)
+        right_scroll = _side_panel_scroll_area()
         right_inner = QWidget()
         right_l = QVBoxLayout(right_inner)
         right_l.setContentsMargins(4, 4, 4, 4)
-
-        right_l.addWidget(QLabel("SETTINGS"))
 
         self._bg_segmented = _SegmentedControl([("off", "Off"), ("on", "On")])
         self._bg_segmented.selectionChanged.connect(self._on_bg_segment_changed)
@@ -493,7 +514,7 @@ class ScanKitMainWindow(QMainWindow):
         self.cal_factors_label.setWordWrap(True)
         right_l.addWidget(self.cal_factors_label)
 
-        right_l.addWidget(QLabel("RUN ANALYSIS"))
+        right_l.addSpacing(12)
         for group_title, entries in VIEW_GROUPS:
             view_box = QGroupBox(group_title)
             view_inner = QVBoxLayout(view_box)
@@ -523,12 +544,10 @@ class ScanKitMainWindow(QMainWindow):
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
         splitter.setSizes([640, 760])
+        return tab
 
-        version_label = QLabel(f"scan-kit v{__version__}")
-        self.statusBar().addPermanentWidget(version_label)
-
-        for seq in ("Esc", "Ctrl+Q"):
-            QShortcut(QKeySequence(seq), self, activated=self.close)
+    def _build_plan_synthesis_tab(self) -> QWidget:
+        return PlanSynthesisPanel()
 
     def _request_settings_then_scan(self) -> None:
         """Load settings.json on a worker thread, then start session discovery."""

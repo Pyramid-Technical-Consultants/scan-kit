@@ -31,7 +31,8 @@ class SessionMeta:
     def short_time(self) -> str:
         if self.treatment_time_s is None:
             return "?"
-        return str(self.treatment_time_s)
+        minutes, seconds = divmod(self.treatment_time_s, 60)
+        return f"{minutes}:{seconds:02d}"
 
 
 _DATE_FMT = "%a %b %d %H:%M:%S %Y"  # e.g. "Thu Dec 11 21:36:55 2025"

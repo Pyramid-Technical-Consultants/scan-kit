@@ -304,6 +304,36 @@ def _timeslices_from_tar(
     return frames
 
 
+def load_session_text(source: SessionSource, filename: str) -> str | None:
+    """Read a text file from the session (directory, zip, or tar)."""
+    sid = source.session_id
+    try:
+        if source.kind == "directory":
+            p = source.path / filename
+            if not p.is_file():
+                return None
+            return p.read_text(encoding="utf-8", errors="replace")
+
+        if source.kind == "zip":
+            with zipfile.ZipFile(source.path, "r") as zf:
+                with zf.open(f"{sid}/{filename}") as f:
+                    return f.read().decode("utf-8", errors="replace")
+
+        if source.kind == "tar":
+            target = f"{sid}/{filename}"
+            with tarfile.open(source.path, "r:*") as tf:
+                for info in tf:
+                    if info.name == target:
+                        raw = tf.extractfile(info)
+                        if raw is None:
+                            return None
+                        return raw.read().decode("utf-8", errors="replace")
+            return None
+    except Exception as e:
+        _log.debug("Error loading %s from session %s: %s", filename, sid, e)
+        return None
+
+
 def load_session_termination_summary(source: SessionSource) -> SessionMeta | None:
     """Parse ``termination_summary.txt`` for TUI metadata."""
     sid = source.session_id

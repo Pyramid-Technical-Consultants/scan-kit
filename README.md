@@ -66,7 +66,7 @@ scan-kit --version
 
 ### 4) Run analysis views
 
-- Click any analysis button in **RUN ANALYSIS**
+- Click any analysis button in the right-hand panel
 - Each view runs in its own Python process and opens Matplotlib window(s)
 - Close the plot window(s) when done; the launcher stays open
 
@@ -90,9 +90,11 @@ scan-kit --version
 | **Beam-Off Ramp-Down** | Beam-off current ramp-down curves (IC1/IC2/IC3) |
 | **Beam-On vs Beam-Off Current** | Beam-on and beam-off current distributions by energy |
 | **IC Timeslice Replay** | Interactive media-player style viewer for raw IC1/IC2/IC3 timeslice current |
+| **Magnetic Field Timeslice Replay** | Interactive Bx/By scan-magnet field viewer (gauss) with timeline brush |
 | **Dose Accumulation** | Cumulative dose delivery analysis |
 | **IC Current FFT Analysis** | Frequency-domain analysis of IC current signals |
 | **IC Audio Export (WAV)** | Export IC current data as audible WAV files (requires PortAudio) |
+| **Session Log Compare** | Parse `SessionLogFile.log`: layer timings, errors, filterable event browser; compare two sessions |
 
 ### IC Timeslice Replay
 
@@ -117,6 +119,30 @@ When multiple sessions are selected, traces are overlaid with distinct colors.
 The detail panel auto-decimates when the selected window is very large, so
 interaction stays responsive.
 
+### Magnetic Field Timeslice Replay
+
+Same media-player layout as IC Timeslice Replay, but plots scan-magnet field
+probes in **gauss**:
+
+- **G3** sessions: `r_tx2_probe_x` / `r_tx2_probe_y` (TX2 hall probes)
+- **G2** sessions: `field_c_x` / `field_c_y` (correcting-coil readback)
+
+The bottom timeline shows |B|; drag a span to zoom Bx and By detail panels.
+The right panel scatters Bx vs By for the selected window, colored by energy.
+
+### Session Log Compare
+
+DCS writes a verbose `SessionLogFile.log` beside each session. This view parses
+that file and surfaces the useful signal:
+
+1. Select **one** session to explore, or **two** to compare side by side.
+2. Click **Session Log Compare** under **Session Log Analysis**.
+3. Use **Layer timeline** for per-layer `START MAP` / `SCAN EXECUTING` durations.
+4. Use **Issues** for grouped `ERROR` templates and watchdog mismatches.
+5. Use **Event browser** with *Hide noise* to skip ACK/command spam; search for
+   keywords (e.g. `TIMELINE`, `interlock`, `fail`).
+6. With two sessions, **Message diff** lists templates whose counts differ most.
+
 ## Supported Session Data Layout
 
 Session discovery supports all of the following in the selected data source:
@@ -124,6 +150,7 @@ Session discovery supports all of the following in the selected data source:
 - Unpacked session directories:
   - `<base>/<session_id>/input_map.csv`
   - `<base>/<session_id>/<session_id>/input_map.csv`
+  - `<base>/<session_id>/SessionLogFile.log` (session log analysis)
 - Archive files:
   - `<session_id>.zip`
   - `<session_id>.tgz`

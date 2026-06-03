@@ -62,9 +62,16 @@ VIEW_GROUPS: list[tuple[str, list[ViewEntry]]] = [
                 "IC Timeslice Replay (dDose/dt)",
                 "ic_timeslice_replay_derived",
             ),
+            ("Magnetic Field Timeslice Replay", "field_timeslice_replay"),
         ],
     ),
     ("Noise measurement", _VIEW_NOISE),
+    (
+        "Session Log Analysis",
+        [
+            ("Session Log Compare", "session_log_compare"),
+        ],
+    ),
 ]
 
 VIEWS: list[ViewEntry] = [entry for _title, entries in VIEW_GROUPS for entry in entries]

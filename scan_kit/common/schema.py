@@ -64,6 +64,12 @@ C_IC2_SCAN_TOTAL_DOSE = "ic2_scan_total_dose"
 C_IC3_SCAN_TOTAL_DOSE = "ic3_scan_total_dose"
 C_CHARGE_REQ = "charge_req"
 
+# Scan-magnet field probes (gauss) in timeslice_data_device_units.
+# G3: r_tx2_probe_x / r_tx2_probe_y (TX2 hall probes).
+# G2: field_c_x / field_c_y (correcting-coil field readback).
+C_MAG_FIELD_X = "mag_field_x"
+C_MAG_FIELD_Y = "mag_field_y"
+
 # Raw position concepts (register-level, need coordinate remap)
 C_IC1_X_POS_RAW = "ic1_x_pos_raw"
 C_IC1_Y_POS_RAW = "ic1_y_pos_raw"
@@ -126,6 +132,20 @@ _CONCEPT_ALIASES_STATIC: dict[str, tuple[str, ...]] = {
         "r_ic3_dose_total",
     ),
     C_CHARGE_REQ: ("CHARGE_REQ", "charge_req", "dose_req", "prescribed_dose"),
+    C_MAG_FIELD_X: (
+        "r_tx2_probe_x",
+        "field_c_x",
+        "mag_field_x",
+        "field_x",
+        "b_field_x",
+    ),
+    C_MAG_FIELD_Y: (
+        "r_tx2_probe_y",
+        "field_c_y",
+        "mag_field_y",
+        "field_y",
+        "b_field_y",
+    ),
     C_X_POSITION: ("X_POSITION", "x_position", "xposition", "x_pos", "planned_x"),
     C_Y_POSITION: ("Y_POSITION", "y_position", "yposition", "y_pos", "planned_y"),
 }
