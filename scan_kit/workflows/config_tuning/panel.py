@@ -7,6 +7,7 @@ from pathlib import Path
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
+    QCheckBox,
     QFileDialog,
     QHBoxLayout,
     QLabel,
@@ -31,8 +32,16 @@ from .integrity_view import (
     build_sidecar_only_report,
     integrity_badge_markup,
 )
+from .config_folder_io import save_config_folder
+from .save_folder_dialog import SaveConfigFolderDialog
+from .map2map_attr_registry import is_map2map_config_path
 from .xml_document import XmlDocument, XmlParseError
 from .xml_form import XmlFormWidget
+
+_UNSAVED_MARKUP = (
+    '<span style="color:#e6a700; font-weight:700; font-size:110%;">●</span>'
+)
+_UNSAVED_TOOLTIP = "Unsaved changes in this configuration"
 
 
 class ConfigTuningPanel(QWidget):
@@ -45,6 +54,7 @@ class ConfigTuningPanel(QWidget):
         self._document: XmlDocument | None = None
         self._current_path: Path | None = None
         self._form: XmlFormWidget | None = None
+        self._open_documents: dict[Path, XmlDocument] = {}
 
         root_layout = QVBoxLayout(self)
         root_layout.setContentsMargins(4, 4, 4, 4)
@@ -71,6 +81,15 @@ class ConfigTuningPanel(QWidget):
         path_row.addWidget(browse_btn)
         left_layout.addLayout(path_row)
 
+        self._hide_unused_cb = QCheckBox("Hide unused map2map XML")
+        self._hide_unused_cb.setToolTip(
+            "Hides attributes and elements that the Pyramid map2map library never reads "
+            "(e.g. e0, m2, zero_offset_mm)."
+        )
+        self._hide_unused_cb.setChecked(self._settings.hide_unused_map2map_xml)
+        self._hide_unused_cb.toggled.connect(self._on_hide_unused_toggled)
+        left_layout.addWidget(self._hide_unused_cb)
+
         self._file_tree = XmlFileTreeWidget()
         self._file_tree.file_selected.connect(self._on_file_selected)
         left_layout.addWidget(self._file_tree, stretch=1)
@@ -91,15 +110,27 @@ class ConfigTuningPanel(QWidget):
         )
         header_row.addWidget(self._header_label, 1)
 
+        self._unsaved_indicator = QLabel()
+        self._unsaved_indicator.setTextFormat(Qt.TextFormat.RichText)
+        self._unsaved_indicator.setToolTip(_UNSAVED_TOOLTIP)
+        self._unsaved_indicator.hide()
+        header_row.addWidget(self._unsaved_indicator, 0, Qt.AlignmentFlag.AlignRight)
+
         self._revert_btn = QPushButton("Revert")
         self._revert_btn.setEnabled(False)
+        self._revert_btn.setToolTip("Discard all unsaved edits and reload from disk")
         self._revert_btn.clicked.connect(self._on_revert)
         header_row.addWidget(self._revert_btn, 0, Qt.AlignmentFlag.AlignRight)
 
-        self._save_btn = QPushButton("Save")
-        self._save_btn.setEnabled(False)
-        self._save_btn.clicked.connect(self._on_save)
-        header_row.addWidget(self._save_btn, 0, Qt.AlignmentFlag.AlignRight)
+        self._save_as_btn = QPushButton("Save As…")
+        self._save_as_btn.setEnabled(False)
+        self._save_as_btn.setToolTip(
+            "Save the whole configuration folder to a new or existing folder. "
+            "Type a new folder name or use New folder in the dialog. "
+            "Select the same folder as the open config to overwrite on disk."
+        )
+        self._save_as_btn.clicked.connect(self._on_save_as)
+        header_row.addWidget(self._save_as_btn, 0, Qt.AlignmentFlag.AlignRight)
 
         right_layout.addLayout(header_row)
 
@@ -124,13 +155,13 @@ class ConfigTuningPanel(QWidget):
             self._apply_config_root(Path(self._settings.config_dir))
 
     def confirm_discard_if_dirty(self) -> bool:
-        """Return True if it is safe to proceed (no dirty doc or user discards)."""
-        if self._document is None or not self._document.dirty:
+        """Return True if it is safe to proceed (no unsaved config edits or user discards)."""
+        if not self._has_unsaved_changes():
             return True
         answer = QMessageBox.question(
             self,
             "Unsaved changes",
-            "Discard unsaved changes?",
+            "Discard unsaved changes to this configuration?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
@@ -165,6 +196,7 @@ class ConfigTuningPanel(QWidget):
 
     def _apply_config_root(self, path: Path) -> None:
         self._config_root = path
+        self._open_documents.clear()
         self._path_input.setText(str(path))
         self._file_tree.set_root(path)
         self._settings.config_dir = str(path)
@@ -182,12 +214,7 @@ class ConfigTuningPanel(QWidget):
         target = Path(file_path).resolve()
         if self._current_path == target:
             return
-        if not self.confirm_discard_if_dirty():
-            if self._current_path is not None:
-                rel = self._relative_path(self._current_path)
-                if rel is not None:
-                    self._file_tree.select_relative_path(rel)
-            return
+        self._flush_current_editor()
         if is_sidecar_path(target):
             self._open_sidecar(target)
         else:
@@ -198,8 +225,7 @@ class ConfigTuningPanel(QWidget):
         self._document = None
         self._current_path = path.resolve()
         self._clear_form_widget()
-        self._save_btn.setEnabled(False)
-        self._revert_btn.setEnabled(False)
+        self._update_action_state()
 
         rel = self._relative_path(self._current_path)
         self._set_header_title(f"{rel or path.name}")
@@ -212,11 +238,15 @@ class ConfigTuningPanel(QWidget):
             self._settings.save()
 
     def _open_file(self, path: Path) -> None:
-        try:
-            document = XmlDocument.load(path)
-        except XmlParseError as exc:
-            QMessageBox.critical(self, "Parse error", f"Could not parse XML:\n{exc}")
-            return
+        resolved = path.resolve()
+        document = self._open_documents.get(resolved)
+        if document is None:
+            try:
+                document = XmlDocument.load(path)
+            except XmlParseError as exc:
+                QMessageBox.critical(self, "Parse error", f"Could not parse XML:\n{exc}")
+                return
+            self._open_documents[resolved] = document
 
         self._document = document
         self._current_path = path.resolve()
@@ -253,17 +283,34 @@ class ConfigTuningPanel(QWidget):
         )
         self._header_label.setToolTip(tooltip)
 
+    def _hide_unused_map2map_enabled(self) -> bool:
+        if not self._hide_unused_cb.isChecked():
+            return False
+        if self._current_path is None:
+            return True
+        return is_map2map_config_path(str(self._current_path))
+
+    def _on_hide_unused_toggled(self, checked: bool) -> None:
+        self._settings.hide_unused_map2map_xml = checked
+        self._settings.save()
+        if self._document is not None and self._current_path is not None:
+            self._set_form(self._document)
+
     def _set_form(self, document: XmlDocument) -> None:
         self._clear_form_widget()
         self._remove_sidecar_tail_spacer()
         self._integrity_details.hide()
-        self._form = XmlFormWidget(document.root, on_change=self._on_form_changed)
+        hide_unused = self._hide_unused_map2map_enabled()
+        self._form = XmlFormWidget(
+            document.root,
+            on_change=self._on_form_changed,
+            hide_unused_map2map=hide_unused,
+        )
         self._form.setSizePolicy(
             QSizePolicy.Policy.Expanding,
             QSizePolicy.Policy.Expanding,
         )
         self._form_layout.addWidget(self._form, stretch=1)
-        document.mark_clean()
         self._update_action_state()
 
     def _clear_form_widget(self) -> None:
@@ -304,47 +351,141 @@ class ConfigTuningPanel(QWidget):
         except ValueError:
             return None
 
+    def _flush_current_editor(self) -> None:
+        if self._form is None or self._document is None:
+            return
+        self._form.apply_to_dom()
+
+    def _has_unsaved_changes(self) -> bool:
+        return any(doc.dirty for doc in self._open_documents.values())
+
     def _on_form_changed(self) -> None:
         if self._document is not None:
             self._document.mark_dirty()
         self._update_action_state()
 
+    def _update_unsaved_indicator(self) -> None:
+        if self._has_unsaved_changes():
+            self._unsaved_indicator.setText(_UNSAVED_MARKUP)
+            self._unsaved_indicator.show()
+        else:
+            self._unsaved_indicator.hide()
+
     def _update_action_state(self) -> None:
-        dirty = bool(self._document and self._document.dirty)
-        has_file = self._document is not None
-        self._save_btn.setEnabled(has_file and dirty)
-        self._revert_btn.setEnabled(has_file)
+        has_config = self._config_root is not None
+        has_xml = self._document is not None
+        self._save_as_btn.setEnabled(has_config)
+        self._revert_btn.setEnabled(has_config and (has_xml or self._has_unsaved_changes()))
+        self._update_unsaved_indicator()
 
     def _on_revert(self) -> None:
-        if self._document is None:
+        if self._config_root is None:
             return
-        if self._document.dirty:
+        if not self._has_unsaved_changes():
+            if self._document is None:
+                return
+            self._document.revert()
+            self._set_form(self._document)
+            self._update_integrity_badge()
+            return
+        answer = QMessageBox.question(
+            self,
+            "Revert changes",
+            "Discard all unsaved changes in this configuration and reload from disk?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        for doc in self._open_documents.values():
+            if doc.dirty:
+                doc.revert()
+        if self._document is not None:
+            self._set_form(self._document)
+            self._update_integrity_badge()
+
+    def _on_save_as(self) -> None:
+        if self._config_root is None:
+            return
+        self._flush_current_editor()
+
+        dest = self._pick_save_config_directory()
+        if dest is None:
+            return
+        source = self._config_root.resolve()
+        if dest != source and dest.exists() and any(dest.iterdir()):
             answer = QMessageBox.question(
                 self,
-                "Revert changes",
-                "Reload this file from disk and discard edits?",
+                "Save configuration",
+                f"Folder already exists:\n{dest}\n\n"
+                "Merge your edits into this folder?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No,
             )
             if answer != QMessageBox.StandardButton.Yes:
                 return
-        path = self._document.path
-        self._document.revert()
-        self._set_form(self._document)
-        self._current_path = path
-        self._update_integrity_badge()
 
-    def _on_save(self) -> None:
-        if self._document is None or self._form is None:
-            return
         try:
-            self._form.apply_to_dom()
-            self._document.save()
+            save_config_folder(
+                source,
+                dest,
+                dirty_by_path=self._open_documents,
+            )
         except OSError as exc:
             QMessageBox.critical(self, "Save failed", str(exc))
             return
+
+        if dest != source:
+            self._remap_open_documents(source, dest)
+            self._config_root = dest
+            self._path_input.setText(str(dest))
+            self._file_tree.set_root(dest)
+            self._settings.config_dir = str(dest)
+            self._settings.save()
+
         self._update_action_state()
         self._update_integrity_badge()
-        self._set_header_title(
-            f"{self._relative_path(self._document.path) or self._document.path.name}  (saved)"
+        if self._document is not None:
+            rel = self._relative_path(self._document.path)
+            self._set_header_title(f"{rel or self._document.path.name}  (saved)")
+
+    def _pick_save_config_directory(self) -> Path | None:
+        """Let the user name a new config folder or choose an existing one."""
+        assert self._config_root is not None
+        source = self._config_root.resolve()
+        parent_dir = source.parent
+        suggested = f"{source.name}_copy"
+
+        dialog = SaveConfigFolderDialog(
+            self,
+            caption="Save configuration folder as…",
+            start_dir=parent_dir,
+            suggested_name=suggested,
         )
+        if dialog.exec() != QFileDialog.DialogCode.Accepted:
+            return None
+        dest = dialog.selected_directory()
+        if dest is None:
+            return None
+        if not dest.exists():
+            dest.mkdir(parents=True, exist_ok=True)
+        return dest
+
+    def _remap_open_documents(self, old_root: Path, new_root: Path) -> None:
+        remapped: dict[Path, XmlDocument] = {}
+        for path, doc in self._open_documents.items():
+            try:
+                rel = path.relative_to(old_root)
+            except ValueError:
+                continue
+            new_path = (new_root / rel).resolve()
+            doc.path = new_path
+            remapped[new_path] = doc
+        self._open_documents = remapped
+        if self._current_path is not None:
+            try:
+                rel = self._current_path.relative_to(old_root)
+                self._current_path = (new_root / rel).resolve()
+                self._document = self._open_documents.get(self._current_path)
+            except ValueError:
+                pass

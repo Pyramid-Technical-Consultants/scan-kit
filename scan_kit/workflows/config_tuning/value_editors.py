@@ -146,7 +146,10 @@ def editor_minimum_width(kind: ValueKind, raw: str) -> int:
     display_len = max(len(text), 6)
     if "e" in text.lower():
         display_len = max(display_len, 10)
-    return min(220, max(104, display_len * 8 + 32))
+    text_width = display_len * 8 + 32
+    # Match ``QSpinBox`` / ``QDoubleSpinBox`` stepper chrome so floats are not narrower than ints.
+    spin_chrome = 28
+    return min(240, max(130, text_width + spin_chrome))
 
 
 def _apply_editor_width(editor: QWidget, kind: ValueKind, raw: str) -> None:

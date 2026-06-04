@@ -5,6 +5,7 @@ from __future__ import annotations
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QFrame,
+    QGroupBox,
     QHBoxLayout,
     QLabel,
     QSizePolicy,
@@ -122,5 +123,77 @@ def make_collapsible_fieldset(
     """Return a collapsible fieldset and its content layout."""
     box = CollapsibleGroupBox(title, expanded=expanded)
     box.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
+    box.setMinimumWidth(0)
     layout = box.content_layout(margins=margins, spacing=spacing)
     return box, layout
+
+
+class PlainFieldset(QGroupBox):
+    """Non-collapsible titled section for leafish form groups."""
+
+    def content_layout(
+        self,
+        *,
+        margins: tuple[int, int, int, int] = (8, 8, 8, 8),
+        spacing: int = 8,
+    ) -> QVBoxLayout:
+        layout = self.layout()
+        if layout is None:
+            layout = QVBoxLayout(self)
+            layout.setContentsMargins(*margins)
+            layout.setSpacing(spacing)
+        return layout
+
+
+def make_plain_fieldset(
+    title: str,
+    *,
+    margins: tuple[int, int, int, int] = (8, 8, 8, 8),
+    spacing: int = 8,
+) -> tuple[PlainFieldset, QVBoxLayout]:
+    """Return a static ``QGroupBox`` fieldset and its content layout."""
+    box = PlainFieldset(title)
+    box.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
+    box.setMinimumWidth(0)
+    layout = box.content_layout(margins=margins, spacing=spacing)
+    return box, layout
+
+
+def make_form_section(
+    title: str,
+    *,
+    collapsible: bool,
+    expanded: bool = True,
+    margins: tuple[int, int, int, int] = (8, 8, 8, 8),
+    spacing: int = 8,
+) -> tuple[CollapsibleGroupBox | PlainFieldset, QVBoxLayout]:
+    """Return a collapsible or plain fieldset depending on *collapsible*."""
+    if collapsible:
+        return make_collapsible_fieldset(
+            title,
+            expanded=expanded,
+            margins=margins,
+            spacing=spacing,
+        )
+    return make_plain_fieldset(title, margins=margins, spacing=spacing)
+
+
+def section_title(section: CollapsibleGroupBox | PlainFieldset) -> str:
+    if isinstance(section, CollapsibleGroupBox):
+        return section.title()
+    return section.title()
+
+
+def iter_form_sections(root: QWidget) -> list[CollapsibleGroupBox | PlainFieldset]:
+    """Return all form section widgets under *root* in construction order."""
+    sections: list[CollapsibleGroupBox | PlainFieldset] = []
+
+    def walk(widget: QWidget) -> None:
+        if isinstance(widget, (CollapsibleGroupBox, PlainFieldset)):
+            sections.append(widget)
+        for child in widget.children():
+            if isinstance(child, QWidget):
+                walk(child)
+
+    walk(root)
+    return sections

@@ -21,6 +21,7 @@ class FlowWidget(QWidget):
         self._v_spacing = v_spacing
         self._chips: list[QWidget] = []
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
+        self.setMinimumWidth(0)
 
     def addWidget(self, widget: QWidget) -> None:
         widget.setParent(self)
@@ -38,9 +39,37 @@ class FlowWidget(QWidget):
     def sizeHint(self) -> QSize:
         return self.minimumSizeHint()
 
+    def _single_row_width(self) -> int:
+        if not self._chips:
+            return 0
+        total = 0
+        visible = 0
+        for chip in self._chips:
+            if not chip.isVisible():
+                continue
+            if visible:
+                total += self._h_spacing
+            total += self._chip_width(chip)
+            visible += 1
+        return total
+
+    def _available_width(self) -> int:
+        width = self.width()
+        if width > 0:
+            return width
+        parent = self.parentWidget()
+        while parent is not None:
+            parent_width = parent.width()
+            if parent_width > 0:
+                return parent_width
+            parent = parent.parentWidget()
+        return 0
+
     def minimumSizeHint(self) -> QSize:
-        width = self._effective_width()
-        height = self._layout_height(width)
+        layout_width = self._available_width()
+        if layout_width <= 0:
+            layout_width = self._single_row_width()
+        height = self._layout_height(layout_width)
         return QSize(0, max(height, 0))
 
     def heightForWidth(self, width: int) -> int:
@@ -49,16 +78,11 @@ class FlowWidget(QWidget):
     def hasHeightForWidth(self) -> bool:
         return True
 
-    def _effective_width(self) -> int:
-        if self.width() > 0:
-            return self.width()
-        parent = self.parentWidget()
-        if parent is not None and parent.width() > 0:
-            return parent.width()
-        return 640
-
     def _update_height(self) -> None:
-        needed_height = self._layout_height(self._effective_width())
+        layout_width = self._available_width()
+        if layout_width <= 0:
+            layout_width = self._single_row_width()
+        needed_height = self._layout_height(layout_width)
         if needed_height > 0 and self.minimumHeight() != needed_height:
             self.setMinimumHeight(needed_height)
             self.updateGeometry()
@@ -98,7 +122,7 @@ class FlowWidget(QWidget):
         return y + line_height
 
     def _relayout(self) -> None:
-        width = self.width()
+        width = self._available_width()
         if width <= 0:
             return
 

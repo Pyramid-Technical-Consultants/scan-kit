@@ -16,6 +16,7 @@ class AppSettings:
 
     config_dir: str | None = None
     last_opened_xml: str | None = None
+    hide_unused_map2map_xml: bool = False
 
     @classmethod
     def settings_path(cls) -> Path:
@@ -40,6 +41,7 @@ class AppSettings:
         return cls(
             config_dir=_optional_str(raw.get("config_dir")),
             last_opened_xml=_optional_str(raw.get("last_opened_xml")),
+            hide_unused_map2map_xml=bool(raw.get("hide_unused_map2map_xml", False)),
         )
 
 
