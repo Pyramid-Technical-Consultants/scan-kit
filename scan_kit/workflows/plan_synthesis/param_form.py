@@ -6,14 +6,13 @@ from typing import Any, Callable
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
-    QAbstractItemView,
     QCheckBox,
+    QComboBox,
     QDoubleSpinBox,
     QFormLayout,
+    QGroupBox,
     QHBoxLayout,
     QLabel,
-    QListWidget,
-    QListWidgetItem,
     QPushButton,
     QSpinBox,
     QSizePolicy,
@@ -21,22 +20,10 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .energies import STANDARD_ENERGIES_MEV
-from .params import ParamSpec
+from .energy_picker import EnergyPickerWidget
+from .params import PARAM_FIELD_SET_LABELS, PARAM_FIELD_SET_ORDER, ParamSpec
 
 ReadParamsFn = Callable[[], dict[str, Any]]
-
-_ENERGY_LIST_VISIBLE_ROWS = 8
-
-
-def _list_height_for_rows(list_widget: QListWidget, rows: int) -> int:
-    """Pixel height to show ``rows`` list entries (scroll for the rest)."""
-    if list_widget.count() == 0:
-        return 0
-    row_h = list_widget.sizeHintForRow(0)
-    if row_h <= 0:
-        row_h = list_widget.fontMetrics().height() + 4
-    return row_h * rows + 2 * list_widget.frameWidth()
 
 
 class ParamFormWidget(QWidget):
@@ -51,16 +38,53 @@ class ParamFormWidget(QWidget):
         super().__init__(parent)
         self._specs = specs
         self._editors: dict[str, QWidget] = {}
-        self._energy_list: QListWidget | None = None
+        self._energy_picker: EnergyPickerWidget | None = None
+        self._form_rows: list[dict[str, Any]] = []
+        self._field_set_boxes: dict[str, QGroupBox] = {}
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        outer.setSpacing(8)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
 
-        form = QFormLayout()
-        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
-
+        label_width = self._label_column_width(specs)
         initial = values or {}
+        grouped = self._group_specs(specs)
+        for field_set in PARAM_FIELD_SET_ORDER:
+            group_specs = grouped.get(field_set, [])
+            if not group_specs:
+                continue
+            box = QGroupBox(PARAM_FIELD_SET_LABELS[field_set])
+            box.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
+            form = QFormLayout(box)
+            form.setContentsMargins(8, 8, 8, 8)
+            form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+            form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.DontWrapRows)
+            form.setFormAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+            form.setVerticalSpacing(4)
+            form.setHorizontalSpacing(0)
+            self._populate_form(form, group_specs, initial, label_width, field_set)
+            self._field_set_boxes[field_set] = box
+            outer.addWidget(box)
+
+        self._connect_visibility_watchers()
+        self._refresh_visibility()
+
+    @staticmethod
+    def _group_specs(specs: list[ParamSpec]) -> dict[str, list[ParamSpec]]:
+        grouped: dict[str, list[ParamSpec]] = {}
+        for spec in specs:
+            grouped.setdefault(spec.field_set, []).append(spec)
+        return grouped
+
+    def _populate_form(
+        self,
+        form: QFormLayout,
+        specs: list[ParamSpec],
+        initial: dict[str, Any],
+        label_width: int,
+        field_set: str,
+    ) -> None:
         i = 0
         while i < len(specs):
             spec = specs[i]
@@ -76,25 +100,152 @@ class ParamFormWidget(QWidget):
                 )
                 self._editors[spec.key] = left_w
                 self._editors[partner.key] = right_w
-                form.addRow(spec.label, self._make_inline_pair(spec, partner, left_w, right_w))
+                self._add_form_row(
+                    form,
+                    spec.label,
+                    self._make_inline_pair(spec, partner, left_w, right_w),
+                    [spec, partner],
+                    label_width=label_width,
+                    field_set=field_set,
+                )
                 i += 2
                 continue
 
             widget = self._make_editor(spec, initial.get(spec.key, spec.default))
             self._editors[spec.key] = widget
             if spec.kind == "energy_multiselect":
-                form.addRow(spec.label, widget)
+                form.addRow(widget)
+                self._register_form_row([spec], None, widget, widget, field_set)
             else:
-                form.addRow(self._field_label(spec), widget)
+                self._add_form_row(
+                    form,
+                    self._field_label(spec),
+                    widget,
+                    [spec],
+                    label_width=label_width,
+                    field_set=field_set,
+                )
             i += 1
-
-        outer.addLayout(form)
 
     @staticmethod
     def _field_label(spec: ParamSpec) -> str:
         if spec.suffix:
             return f"{spec.label} ({spec.suffix})"
         return spec.label
+
+    @staticmethod
+    def _row_label(text: str) -> QLabel:
+        """Left-column label that stays vertically centered in the form row."""
+        label = QLabel(text)
+        label.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        )
+        label.setSizePolicy(
+            QSizePolicy.Policy.Fixed,
+            QSizePolicy.Policy.Preferred,
+        )
+        return label
+
+    def _label_column_width(self, specs: list[ParamSpec]) -> int:
+        texts: list[str] = []
+        i = 0
+        while i < len(specs):
+            spec = specs[i]
+            if spec.row_partner:
+                i += 1
+                continue
+            partner = specs[i + 1] if i + 1 < len(specs) else None
+            if partner is not None and partner.row_partner == spec.key:
+                texts.append(spec.label)
+                i += 2
+                continue
+            if spec.kind == "energy_multiselect":
+                i += 1
+                continue
+            texts.append(self._field_label(spec))
+            i += 1
+        if not texts:
+            return 0
+        fm = self.fontMetrics()
+        return max(fm.horizontalAdvance(text) for text in texts) + 8
+
+    def _add_form_row(
+        self,
+        form: QFormLayout,
+        label_text: str,
+        field: QWidget,
+        specs: list[ParamSpec],
+        *,
+        label_width: int,
+        field_set: str,
+    ) -> None:
+        _vc = Qt.AlignmentFlag.AlignVCenter
+        row = QWidget()
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(12)
+        label = self._row_label(label_text)
+        label.setFixedWidth(label_width)
+        layout.addWidget(label, alignment=_vc | Qt.AlignmentFlag.AlignRight)
+        layout.addWidget(field, stretch=1, alignment=_vc | Qt.AlignmentFlag.AlignLeft)
+        form.addRow(row)
+        self._register_form_row(specs, label, field, row, field_set)
+
+    def _register_form_row(
+        self,
+        specs: list[ParamSpec],
+        label: QLabel | None,
+        field: QWidget,
+        row: QWidget,
+        field_set: str,
+    ) -> None:
+        self._form_rows.append(
+            {
+                "specs": specs,
+                "label": label,
+                "field": field,
+                "row": row,
+                "field_set": field_set,
+            }
+        )
+
+    def _connect_visibility_watchers(self) -> None:
+        watch_keys = {
+            key
+            for spec in self._specs
+            if spec.visible_when
+            for key in spec.visible_when
+        }
+        for key in watch_keys:
+            editor = self._editors.get(key)
+            if editor is None:
+                continue
+            if isinstance(editor, QComboBox):
+                editor.currentIndexChanged.connect(self._refresh_visibility)
+
+    def _refresh_visibility(self) -> None:
+        current = self.read_params()
+        field_set_visible = {field_set: False for field_set in self._field_set_boxes}
+
+        for row in self._form_rows:
+            visible = all(
+                self._spec_visible(spec, current) for spec in row["specs"]
+            )
+            row["row"].setVisible(visible)
+            if visible:
+                field_set_visible[row["field_set"]] = True
+
+        for field_set, box in self._field_set_boxes.items():
+            box.setVisible(field_set_visible[field_set])
+
+    @staticmethod
+    def _spec_visible(spec: ParamSpec, current: dict[str, Any]) -> bool:
+        if not spec.visible_when:
+            return True
+        for key, allowed in spec.visible_when.items():
+            if current.get(key) not in allowed:
+                return False
+        return True
 
     def _make_inline_pair(
         self,
@@ -103,21 +254,26 @@ class ParamFormWidget(QWidget):
         left_widget: QWidget,
         right_widget: QWidget,
     ) -> QWidget:
+        _vc = Qt.AlignmentFlag.AlignVCenter
         row = QHBoxLayout()
         row.setSpacing(16)
+        row.setAlignment(_vc)
         for spec, widget in ((left_spec, left_widget), (right_spec, right_widget)):
             group = QHBoxLayout()
             group.setSpacing(6)
+            group.setAlignment(_vc)
             if spec.sub_label:
                 sub = QLabel(f"{spec.sub_label}:")
+                sub.setAlignment(_vc | Qt.AlignmentFlag.AlignRight)
                 sub.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Preferred)
-                group.addWidget(sub)
-            group.addWidget(widget, stretch=1)
+                group.addWidget(sub, alignment=_vc)
+            group.addWidget(widget, stretch=1, alignment=_vc)
             if spec.suffix:
                 unit = QLabel(spec.suffix)
                 unit.setStyleSheet("color: palette(mid);")
+                unit.setAlignment(_vc | Qt.AlignmentFlag.AlignLeft)
                 unit.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Preferred)
-                group.addWidget(unit)
+                group.addWidget(unit, alignment=_vc)
             row.addLayout(group, stretch=1)
         row.addStretch(1)
         box = QWidget()
@@ -136,6 +292,7 @@ class ParamFormWidget(QWidget):
             if spec.step is not None:
                 spin.setSingleStep(float(spec.step))
             spin.setValue(float(value))
+            spin.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
             return spin
 
         if spec.kind == "int":
@@ -147,54 +304,34 @@ class ParamFormWidget(QWidget):
             if spec.step is not None:
                 spin.setSingleStep(int(spec.step))
             spin.setValue(int(value))
+            spin.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
             return spin
 
         if spec.kind == "bool":
             box = QCheckBox()
             box.setChecked(bool(value))
+            box.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
             return box
+
+        if spec.kind == "choice":
+            combo = QComboBox()
+            for choice_value, choice_label in spec.choices:
+                combo.addItem(choice_label, choice_value)
+            index = combo.findData(value)
+            combo.setCurrentIndex(index if index >= 0 else 0)
+            combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            return combo
 
         if spec.kind == "energy_multiselect":
             return self._make_energy_picker(value)
 
         raise ValueError(f"Unsupported param kind: {spec.kind}")
 
-    def _make_energy_picker(self, value: Any) -> QWidget:
-        selected = {float(e) for e in value} if isinstance(value, list) else set()
-
-        box = QWidget()
-        box.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        lay = QVBoxLayout(box)
-        lay.setContentsMargins(0, 0, 0, 0)
-
-        btn_row = QHBoxLayout()
-        select_all = QPushButton("Select all")
-        clear_all = QPushButton("Clear all")
-        btn_row.addWidget(select_all)
-        btn_row.addWidget(clear_all)
-        btn_row.addStretch(1)
-        lay.addLayout(btn_row)
-
-        energy_list = QListWidget()
-        energy_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
-        for energy in reversed(STANDARD_ENERGIES_MEV):
-            item = QListWidgetItem(f"{energy:g} MeV")
-            item.setData(Qt.ItemDataRole.UserRole, float(energy))
-            energy_list.addItem(item)
-            if float(energy) in selected:
-                item.setSelected(True)
-        energy_list.setFixedHeight(
-            _list_height_for_rows(energy_list, _ENERGY_LIST_VISIBLE_ROWS)
-        )
-        energy_list.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        lay.addWidget(energy_list)
-        box.setFixedHeight(box.sizeHint().height())
-
-        select_all.clicked.connect(energy_list.selectAll)
-        clear_all.clicked.connect(energy_list.clearSelection)
-
-        self._energy_list = energy_list
-        return box
+    def _make_energy_picker(self, value: Any) -> EnergyPickerWidget:
+        selected = value if isinstance(value, list) else None
+        picker = EnergyPickerWidget(selected=selected)
+        self._energy_picker = picker
+        return picker
 
     def read_params(self) -> dict[str, Any]:
         out: dict[str, Any] = {}
@@ -206,21 +343,16 @@ class ParamFormWidget(QWidget):
                 out[spec.key] = int(widget.value())  # type: ignore[attr-defined]
             elif spec.kind == "bool":
                 out[spec.key] = bool(widget.isChecked())  # type: ignore[attr-defined]
+            elif spec.kind == "choice":
+                out[spec.key] = widget.currentData()  # type: ignore[attr-defined]
             elif spec.kind == "energy_multiselect":
                 out[spec.key] = self._selected_energies()
         return out
 
     def _selected_energies(self) -> list[float]:
-        if self._energy_list is None:
+        if self._energy_picker is None:
             return []
-        energies: list[float] = []
-        for i in range(self._energy_list.count()):
-            item = self._energy_list.item(i)
-            if item is not None and item.isSelected():
-                val = item.data(Qt.ItemDataRole.UserRole)
-                if val is not None:
-                    energies.append(float(val))
-        return energies
+        return self._energy_picker.selected_energies()
 
 
 def build_param_form(

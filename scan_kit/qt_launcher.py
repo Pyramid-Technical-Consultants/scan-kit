@@ -58,6 +58,7 @@ from .common.settings import ViewSettings, CALIBRATION_MODES
 from .common.plot_colors import DEFAULT_SESSION_COLORS
 from .views import VIEW_GROUPS, VIEWS
 from .workflows.plan_synthesis_panel import PlanSynthesisPanel
+from .workflows.config_tuning_panel import ConfigTuningPanel
 
 MAX_SESSIONS = 5
 FROZEN = getattr(sys, "frozen", False)
@@ -410,6 +411,8 @@ class ScanKitMainWindow(QMainWindow):
         tabs = QTabWidget()
         tabs.addTab(self._build_data_analysis_tab(), "Data Analysis")
         tabs.addTab(self._build_plan_synthesis_tab(), "Plan Synthesis")
+        self._config_tuning_panel = ConfigTuningPanel()
+        tabs.addTab(self._config_tuning_panel, "Configuration Tuning")
         self.setCentralWidget(tabs)
 
         for seq in ("Esc", "Ctrl+Q"):
@@ -1419,6 +1422,10 @@ class ScanKitMainWindow(QMainWindow):
         self._child_procs = [p for p in self._child_procs if p.poll() is None]
 
     def closeEvent(self, event: QCloseEvent) -> None:
+        panel = getattr(self, "_config_tuning_panel", None)
+        if panel is not None and not panel.confirm_discard_if_dirty():
+            event.ignore()
+            return
         self._shutdown_children()
         super().closeEvent(event)
 

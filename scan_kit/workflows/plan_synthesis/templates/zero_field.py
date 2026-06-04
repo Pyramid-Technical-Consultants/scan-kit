@@ -25,10 +25,7 @@ class ZeroFieldTemplate(PlanTemplate):
 
     @property
     def description(self) -> str:
-        return (
-            "Generate a zero-field plan with every spot at command position (0, 0). "
-            "Choose energy layers, MU per spot, and how many spots to deliver per layer."
-        )
+        return "Every spot at (0, 0) for each energy layer."
 
     @property
     def layout(self) -> SpotLayoutGenerator:

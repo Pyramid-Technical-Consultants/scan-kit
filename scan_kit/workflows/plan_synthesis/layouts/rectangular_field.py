@@ -46,10 +46,10 @@ class RectangularFieldLayout(SpotLayoutGenerator):
 
     def param_specs(self) -> list[ParamSpec]:
         return [
-            shared_energy_spec(default=list(STANDARD_ENERGIES_MEV)),
+            shared_energy_spec(),
             ParamSpec(
                 key="center_x_mm",
-                label="Field Center",
+                label="Field Center (mm)",
                 sub_label="X",
                 kind="float",
                 default=0.0,
@@ -57,11 +57,11 @@ class RectangularFieldLayout(SpotLayoutGenerator):
                 maximum=500.0,
                 decimals=3,
                 step=0.1,
-                suffix="mm",
+                field_set="geometry",
             ),
             ParamSpec(
                 key="center_y_mm",
-                label="Field Center Y",
+                label="Field Center Y (mm)",
                 row_partner="center_x_mm",
                 sub_label="Y",
                 kind="float",
@@ -70,39 +70,43 @@ class RectangularFieldLayout(SpotLayoutGenerator):
                 maximum=500.0,
                 decimals=3,
                 step=0.1,
-                suffix="mm",
+                field_set="geometry",
             ),
             ParamSpec(
                 key="field_width_mm",
-                label="Field Width",
+                label="Field Size (mm)",
+                sub_label="W",
                 kind="float",
-                default=20.0,
+                default=100.0,
                 minimum=0.001,
                 maximum=1000.0,
                 decimals=3,
                 step=0.1,
-                suffix="mm",
+                field_set="geometry",
             ),
             ParamSpec(
                 key="field_height_mm",
-                label="Field Height",
+                label="Field Size H (mm)",
+                row_partner="field_width_mm",
+                sub_label="H",
                 kind="float",
-                default=20.0,
+                default=100.0,
                 minimum=0.001,
                 maximum=1000.0,
                 decimals=3,
                 step=0.1,
-                suffix="mm",
+                field_set="geometry",
             ),
             ParamSpec(
                 key="spots_x",
-                label="Spot Grid",
+                label="Spot Grid (spots)",
                 sub_label="X",
                 kind="int",
-                default=10,
+                default=33,
                 minimum=1,
                 maximum=1000,
                 step=1,
+                field_set="geometry",
             ),
             ParamSpec(
                 key="spots_y",
@@ -110,10 +114,11 @@ class RectangularFieldLayout(SpotLayoutGenerator):
                 row_partner="spots_x",
                 sub_label="Y",
                 kind="int",
-                default=10,
+                default=33,
                 minimum=1,
                 maximum=1000,
                 step=1,
+                field_set="geometry",
             ),
         ]
 
@@ -121,13 +126,21 @@ class RectangularFieldLayout(SpotLayoutGenerator):
         errors: list[str] = []
         errors.extend(validate_selected_energies(params.get("selected_energies")))
         errors.extend(
-            validate_positive_float(params.get("field_width_mm"), label="Field Width")
+            validate_positive_float(
+                params.get("field_width_mm"), label="Field Size (mm) W"
+            )
         )
         errors.extend(
-            validate_positive_float(params.get("field_height_mm"), label="Field Height")
+            validate_positive_float(
+                params.get("field_height_mm"), label="Field Size (mm) H"
+            )
         )
-        errors.extend(validate_positive_int(params.get("spots_x"), label="Spot Grid X"))
-        errors.extend(validate_positive_int(params.get("spots_y"), label="Spot Grid Y"))
+        errors.extend(
+            validate_positive_int(params.get("spots_x"), label="Spot Grid (spots) X")
+        )
+        errors.extend(
+            validate_positive_int(params.get("spots_y"), label="Spot Grid (spots) Y")
+        )
         return errors
 
     def generate_rows(self, params: dict[str, Any]) -> list[SpotRow]:

@@ -27,10 +27,7 @@ class RectangularFieldTemplate(PlanTemplate):
 
     @property
     def description(self) -> str:
-        return (
-            "Generate a rectangular spot grid for each selected energy layer. "
-            "Define field center, width/height, and spot counts along X and Y."
-        )
+        return "Even spot grid per layer with configurable field size."
 
     @property
     def layout(self) -> SpotLayoutGenerator:

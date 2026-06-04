@@ -55,6 +55,26 @@ from .session_source import (
     hydrate_session_metadata,
     discover_session_entries,
 )
+from .file_integrity import (
+    IntegrityStatus,
+    IntegrityCheckResult,
+    FileIntegritySidecar,
+    commit_file_integrity,
+    compute_hex_digest,
+    parse_sidecar,
+    sidecar_path,
+    verify_file_integrity,
+)
+from .devices_xml import (
+    BeamSigmaConversion,
+    DevicesConfig,
+    DEVICES_XML_REL_PATH,
+    IC_DEVICE_TO_SIG_KEY,
+    IC_SIGMA_DEVICES,
+    load_devices_config,
+    load_session_devices_config,
+    parse_devices_xml,
+)
 from .transform import remap, remap_g2_raw, remap_g2_raw_reversed, g2_ic2_mm, IC1_X_MAP, IC1_Y_MAP, IC2_X_MAP, IC2_Y_MAP
 from .validation import create_valid_mask, apply_validation
 from .processing import (
@@ -166,6 +186,22 @@ __all__ = [
     "load_session_termination_summary",
     "hydrate_session_metadata",
     "discover_session_entries",
+    "BeamSigmaConversion",
+    "DevicesConfig",
+    "DEVICES_XML_REL_PATH",
+    "IC_DEVICE_TO_SIG_KEY",
+    "IC_SIGMA_DEVICES",
+    "load_devices_config",
+    "load_session_devices_config",
+    "parse_devices_xml",
+    "IntegrityStatus",
+    "IntegrityCheckResult",
+    "FileIntegritySidecar",
+    "commit_file_integrity",
+    "compute_hex_digest",
+    "parse_sidecar",
+    "sidecar_path",
+    "verify_file_integrity",
     "remap",
     "remap_g2_raw",
     "remap_g2_raw_reversed",

@@ -25,15 +25,16 @@ class ZeroFieldLayout(SpotLayoutGenerator):
 
     def param_specs(self) -> list[ParamSpec]:
         return [
-            shared_energy_spec(default=list(STANDARD_ENERGIES_MEV)),
+            shared_energy_spec(),
             ParamSpec(
                 key="spots_per_layer",
-                label="Spots per Layer",
+                label="Spots per Layer (spots)",
                 kind="int",
                 default=100,
                 minimum=1,
                 maximum=100_000,
                 step=1,
+                field_set="geometry",
             ),
         ]
 
@@ -41,7 +42,9 @@ class ZeroFieldLayout(SpotLayoutGenerator):
         errors: list[str] = []
         errors.extend(validate_selected_energies(params.get("selected_energies")))
         errors.extend(
-            validate_positive_int(params.get("spots_per_layer"), label="Spots per Layer")
+            validate_positive_int(
+                params.get("spots_per_layer"), label="Spots per Layer (spots)"
+            )
         )
         return errors
 

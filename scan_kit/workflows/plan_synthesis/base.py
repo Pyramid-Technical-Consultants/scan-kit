@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from typing import Any
 
 import pandas as pd
@@ -49,5 +50,15 @@ class PlanTemplate(ABC):
     def validate(self, params: dict[str, Any]) -> list[str]:
         return validate_params(self.layout, self.column_generators, params)
 
-    def generate(self, params: dict[str, Any]) -> pd.DataFrame:
-        return generate_input_map(self.layout, self.column_generators, params)
+    def generate(
+        self,
+        params: dict[str, Any],
+        *,
+        progress: Callable[[int], None] | None = None,
+    ) -> pd.DataFrame:
+        return generate_input_map(
+            self.layout,
+            self.column_generators,
+            params,
+            progress=progress,
+        )

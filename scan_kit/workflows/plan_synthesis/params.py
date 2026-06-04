@@ -5,7 +5,17 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Literal
 
-ParamKind = Literal["energy_multiselect", "float", "int", "bool"]
+from .energies import STANDARD_ENERGIES_MEV
+
+ParamKind = Literal["energy_multiselect", "float", "int", "bool", "choice"]
+ParamFieldSet = Literal["energy", "geometry", "weight"]
+
+PARAM_FIELD_SET_ORDER: tuple[ParamFieldSet, ...] = ("energy", "geometry", "weight")
+PARAM_FIELD_SET_LABELS: dict[ParamFieldSet, str] = {
+    "energy": "Energy",
+    "geometry": "Geometry",
+    "weight": "Weight",
+}
 
 
 @dataclass(frozen=True)
@@ -23,6 +33,9 @@ class ParamSpec:
     suffix: str = ""
     row_partner: str | None = None
     sub_label: str = ""
+    choices: tuple[tuple[str, str], ...] = ()
+    visible_when: dict[str, tuple[Any, ...]] | None = None
+    field_set: ParamFieldSet = "geometry"
 
 
 def shared_energy_spec(*, default: list[float] | None = None) -> ParamSpec:
@@ -30,23 +43,25 @@ def shared_energy_spec(*, default: list[float] | None = None) -> ParamSpec:
         key="selected_energies",
         label="Energy Layers (MeV)",
         kind="energy_multiselect",
-        default=list(default or []),
+        default=list(default if default is not None else STANDARD_ENERGIES_MEV),
+        field_set="energy",
     )
 
 
-def shared_charge_spec(*, default: float = 0.02) -> ParamSpec:
-    return ParamSpec(
-        key="charge_req_mu",
-        label="Spot Charge Request",
-        kind="float",
-        default=default,
-        minimum=0.0001,
-        maximum=1000.0,
-        decimals=4,
-        step=0.01,
-        suffix="MU",
-    )
+SPOT_WEIGHT_LABEL = "Spot Weight (MU)"
 
+
+def validate_weight_range(min_value: Any, max_value: Any) -> list[str]:
+    errors: list[str] = []
+    errors.extend(validate_positive_float(min_value, label="Minimum Weight (MU)"))
+    errors.extend(validate_positive_float(max_value, label="Maximum Weight (MU)"))
+    if errors:
+        return errors
+    if float(max_value) < float(min_value):
+        return [
+            "Maximum Weight (MU) must be greater than or equal to Minimum Weight (MU)."
+        ]
+    return []
 
 def validate_selected_energies(energies: Any) -> list[str]:
     if not isinstance(energies, list) or not energies:
@@ -79,7 +94,7 @@ def normalize_selected_energies(
     *,
     catalog: tuple[float, ...],
 ) -> list[float]:
-    """Return catalog energies in descending order, filtered to user selection."""
+    """Return selected energies in descending MeV order (highest layer first)."""
     if not isinstance(energies, list):
         return []
     selected = {float(e) for e in energies}

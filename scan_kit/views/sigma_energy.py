@@ -14,6 +14,7 @@ import matplotlib.pyplot as plt
 
 from ..common import (
     load_session_raw,
+    load_session_devices_config,
     create_valid_mask,
     resolve_concept_column,
     C_ENERGY,
@@ -102,8 +103,46 @@ def _process_session(session_id: str, base_dir: str):
     return result
 
 
-def _shared_panel_ylim(session_data, value_cols, *, pad_frac=0.05):
-    """Y limits spanning every finite sigma value across violin panels."""
+def _plot_expected_sigma_lines(
+    ax,
+    expected_by_energy: dict[float, float],
+    energies,
+    color,
+    *,
+    width=0.65,
+):
+    """Draw session-specific expected sigma as dashed segments at each energy."""
+    half = width / 2.0
+    for j, energy in enumerate(energies):
+        sigma = expected_by_energy.get(float(energy))
+        if sigma is None or not np.isfinite(sigma):
+            continue
+        ax.plot(
+            [j - half, j + half],
+            [sigma, sigma],
+            color=color,
+            linestyle="--",
+            linewidth=1.3,
+            alpha=0.85,
+            zorder=7,
+        )
+
+
+def _load_expected_sigmas(session_ids, energies, base_dir: str) -> dict[str, dict[str, dict[float, float]]]:
+    """Per-session expected sigma (mm) keyed by view column name and energy."""
+    expected: dict[str, dict[str, dict[float, float]]] = {}
+    for sid in session_ids:
+        config = load_session_devices_config(sid, base_dir)
+        if config is None:
+            continue
+        by_key = config.expected_sigmas_by_key(energies)
+        if by_key:
+            expected[sid] = by_key
+    return expected
+
+
+def _shared_panel_ylim(session_data, value_cols, expected_sigmas=None, *, pad_frac=0.05):
+    """Y limits spanning measured and expected sigma values across violin panels."""
     parts = []
     for col in value_cols:
         for data in session_data.values():
@@ -113,6 +152,15 @@ def _shared_panel_ylim(session_data, value_cols, *, pad_frac=0.05):
             finite = vals[np.isfinite(vals)]
             if finite.size:
                 parts.append(finite)
+        if expected_sigmas:
+            for by_key in expected_sigmas.values():
+                per_energy = by_key.get(col)
+                if not per_energy:
+                    continue
+                vals = np.asarray(list(per_energy.values()), dtype=float)
+                finite = vals[np.isfinite(vals)]
+                if finite.size:
+                    parts.append(finite)
     if not parts:
         return None
     cat = np.concatenate(parts)
@@ -147,6 +195,7 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
 
     loaded_ids = list(session_data.keys())
     colors = DEFAULT_SESSION_COLORS[: len(loaded_ids)]
+    expected_sigmas = _load_expected_sigmas(loaded_ids, energies, base_dir)
 
     fig, axes = plt.subplots(
         2, 2,
@@ -164,12 +213,21 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
         for row_idx, (value_col, _axis_label) in enumerate(zip((x_col, y_col), AXIS_LABELS)):
             ax = axes[row_idx, col_idx]
             plot_violins_for_column(ax, session_data, value_col, energies, colors)
+            for session_idx, sid in enumerate(loaded_ids):
+                session_expected = expected_sigmas.get(sid, {}).get(value_col)
+                if session_expected:
+                    _plot_expected_sigma_lines(
+                        ax,
+                        session_expected,
+                        energies,
+                        colors[session_idx],
+                    )
 
             style_energy_axes(ax, energies, ylabel=None)
             ax.set_xlabel("")
             value_cols.append(value_col)
 
-    ylim = _shared_panel_ylim(session_data, value_cols)
+    ylim = _shared_panel_ylim(session_data, value_cols, expected_sigmas)
     if ylim is not None:
         master.set_ylim(ylim)
 

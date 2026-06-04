@@ -1,7 +1,7 @@
 """Built-in column generators for input_map.csv."""
 
 from .base import ColumnGenerator, SpotLayoutGenerator, SpotRow
-from .charge import UniformChargeGenerator
+from .charge import SpotWeightGenerator, UniformChargeGenerator
 from .constant import ConstantColumnGenerator
 from .empty import EmptyTrailingColumnGenerator
 from .pass_through import FromRowColumnGenerator
@@ -14,6 +14,7 @@ __all__ = [
     "ConstantColumnGenerator",
     "FromRowColumnGenerator",
     "UniformChargeGenerator",
+    "SpotWeightGenerator",
     "SequentialSpotNoGenerator",
     "EmptyTrailingColumnGenerator",
 ]

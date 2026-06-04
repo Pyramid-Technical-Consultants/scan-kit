@@ -7,9 +7,28 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-from scan_kit.workflows.plan_synthesis.input_map import INPUT_MAP_COLUMNS, write_input_map_csv
+from scan_kit.workflows.plan_synthesis.input_map import (
+    INPUT_MAP_COLUMNS,
+    order_input_map_by_energy,
+    write_input_map_csv,
+)
+from scan_kit.workflows.plan_synthesis.energies import (
+    STANDARD_ENERGIES_MEV,
+    TEN_MEV_STEP_ENERGIES_MEV,
+    WHOLE_MEV_STEP_ENERGIES_MEV,
+)
 from scan_kit.workflows.plan_synthesis.layouts.rectangular_field import rectangular_grid_positions
 from scan_kit.workflows.plan_synthesis.registry import get_template
+from scan_kit.workflows.plan_synthesis.spot_weight import (
+    SPOT_WEIGHT_METHOD_EVEN_TOTAL,
+    SPOT_WEIGHT_METHOD_FIXED,
+    SPOT_WEIGHT_METHOD_LAYER_EVEN,
+    SPOT_WEIGHT_METHOD_RANDOM,
+    SPOT_WEIGHT_METHOD_RANDOM_TOTAL,
+    compute_spot_weights,
+    validate_spot_weight_params,
+)
+from scan_kit.workflows.plan_synthesis.generators.base import SpotRow
 
 
 @pytest.fixture
@@ -26,18 +45,49 @@ def rectangular_field():
     return template
 
 
-def test_zero_field_generates_origin_spots(zero_field) -> None:
+def _fixed_weight_params(**overrides) -> dict:
     params = {
-        "selected_energies": [250.0, 247.5, 245.0],
-        "charge_req_mu": 0.02,
-        "spots_per_layer": 10,
+        "spot_weight_method": SPOT_WEIGHT_METHOD_FIXED,
+        "spot_weight_mu": 0.02,
+        "spot_weight_total_mu": 1.0,
+        "spot_weight_variance_pct": 10.0,
+        "spot_weight_min_mu": 0.002,
+        "spot_weight_max_mu": 0.1,
+        "spot_weight_layer_shuffle": False,
     }
+    params.update(overrides)
+    return params
+
+
+def test_ten_mev_step_energies_are_catalog_subset() -> None:
+    assert TEN_MEV_STEP_ENERGIES_MEV[0] == 70.0
+    assert TEN_MEV_STEP_ENERGIES_MEV[-1] == 250.0
+    assert all(energy % 10 == 0 for energy in TEN_MEV_STEP_ENERGIES_MEV)
+    assert set(TEN_MEV_STEP_ENERGIES_MEV).issubset(set(STANDARD_ENERGIES_MEV))
+
+
+def test_whole_mev_step_energies_are_catalog_subset() -> None:
+    assert WHOLE_MEV_STEP_ENERGIES_MEV[0] == 70.0
+    assert WHOLE_MEV_STEP_ENERGIES_MEV[-1] == 250.0
+    assert all(energy % 1 == 0 for energy in WHOLE_MEV_STEP_ENERGIES_MEV)
+    assert set(WHOLE_MEV_STEP_ENERGIES_MEV).issubset(set(STANDARD_ENERGIES_MEV))
+    assert 102.5 not in WHOLE_MEV_STEP_ENERGIES_MEV
+    assert 105.0 in WHOLE_MEV_STEP_ENERGIES_MEV
+    assert set(TEN_MEV_STEP_ENERGIES_MEV).issubset(set(WHOLE_MEV_STEP_ENERGIES_MEV))
+
+
+def test_zero_field_generates_origin_spots(zero_field) -> None:
+    params = _fixed_weight_params(
+        selected_energies=[250.0, 247.5, 245.0],
+        spots_per_layer=10,
+    )
     assert zero_field.validate(params) == []
     df = zero_field.generate(params)
     assert len(df) == 30
     assert list(df.columns) == list(INPUT_MAP_COLUMNS)
     assert (df["X_POSITION"] == 0.0).all()
     assert (df["Y_POSITION"] == 0.0).all()
+    assert (df["CHARGE_REQ"] == 0.02).all()
     assert (df["CURRENT"] == 0.0).all()
     assert (df["VELOCITY"] == 0.0).all()
     assert (df["beam_off"] == 1.0).all()
@@ -81,21 +131,22 @@ def test_rectangular_field_grid_positions() -> None:
 
 
 def test_rectangular_field_generates_grid(rectangular_field) -> None:
-    params = {
-        "selected_energies": [200.0],
-        "charge_req_mu": 0.05,
-        "center_x_mm": 0.0,
-        "center_y_mm": 0.0,
-        "field_width_mm": 20.0,
-        "field_height_mm": 20.0,
-        "spots_x": 3,
-        "spots_y": 3,
-    }
+    params = _fixed_weight_params(
+        selected_energies=[200.0],
+        spot_weight_mu=0.05,
+        center_x_mm=0.0,
+        center_y_mm=0.0,
+        field_width_mm=20.0,
+        field_height_mm=20.0,
+        spots_x=3,
+        spots_y=3,
+    )
     assert rectangular_field.validate(params) == []
     df = rectangular_field.generate(params)
     assert len(df) == 9
     assert df["ENERGY"].nunique() == 1
     assert len(df[["X_POSITION", "Y_POSITION"]].drop_duplicates()) == 9
+    assert (df["CHARGE_REQ"] == 0.05).all()
 
 
 def test_rectangular_field_validation_rejects_zero_grid(rectangular_field) -> None:
@@ -106,15 +157,523 @@ def test_rectangular_field_validation_rejects_zero_grid(rectangular_field) -> No
     assert errors
 
 
+def test_zero_field_layers_ordered_high_to_low(zero_field) -> None:
+    params = _fixed_weight_params(
+        selected_energies=[70.0, 250.0, 100.0, 200.0],
+        spots_per_layer=2,
+    )
+    df = zero_field.generate(params)
+    assert df["ENERGY"].tolist() == [
+        250.0,
+        250.0,
+        200.0,
+        200.0,
+        100.0,
+        100.0,
+        70.0,
+        70.0,
+    ]
+    assert df["spot_no"].tolist() == list(range(len(df)))
+
+
+def test_rectangular_field_preserves_grid_within_layer(rectangular_field) -> None:
+    params = _fixed_weight_params(
+        selected_energies=[200.0, 250.0],
+        center_x_mm=0.0,
+        center_y_mm=0.0,
+        field_width_mm=20.0,
+        field_height_mm=20.0,
+        spots_x=2,
+        spots_y=2,
+    )
+    df = rectangular_field.generate(params)
+    high_layer = df[df["ENERGY"] == 250.0]
+    low_layer = df[df["ENERGY"] == 200.0]
+    assert len(high_layer) == 4
+    assert len(low_layer) == 4
+    assert high_layer.index.tolist()[0] < low_layer.index.tolist()[0]
+    expected_positions = rectangular_grid_positions(
+        center_x_mm=0.0,
+        center_y_mm=0.0,
+        field_width_mm=20.0,
+        field_height_mm=20.0,
+        spots_x=2,
+        spots_y=2,
+    )
+    actual_positions = [
+        (float(x), float(y))
+        for x, y in high_layer[["X_POSITION", "Y_POSITION"]].itertuples(index=False)
+    ]
+    assert actual_positions == pytest.approx(expected_positions)
+
+
+def test_write_input_map_csv_reorders_layers(tmp_path: Path, zero_field) -> None:
+    params = _fixed_weight_params(
+        selected_energies=[250.0, 70.0],
+        spots_per_layer=1,
+    )
+    df = zero_field.generate(params)
+    shuffled = pd.concat([df[df["ENERGY"] == 70.0], df[df["ENERGY"] == 250.0]])
+    shuffled = shuffled.copy()
+    shuffled["spot_no"] = [9, 0]
+
+    out = tmp_path / "input_map.csv"
+    write_input_map_csv(shuffled, out)
+    loaded = pd.read_csv(out)
+
+    assert loaded["ENERGY"].tolist() == [250.0, 70.0]
+    assert loaded["spot_no"].tolist() == [0, 1]
+
+
+def test_order_input_map_by_energy_is_stable() -> None:
+    df = pd.DataFrame(
+        {
+            "ENERGY": [100.0, 100.0, 200.0, 200.0],
+            "CURRENT": [0.0] * 4,
+            "BEAM_SIZE_X": [3.61] * 4,
+            "BEAM_SIZE_Y": [3.61] * 4,
+            "X_POSITION": [1.0, 2.0, 3.0, 4.0],
+            "Y_POSITION": [0.0] * 4,
+            "CHARGE_REQ": [0.01] * 4,
+            "VELOCITY": [0.0] * 4,
+            "spot_no": [0, 1, 2, 3],
+            "layer_id": [1, 1, 2, 2],
+            "beam_off": [1.0] * 4,
+            "map_checksum": [0] * 4,
+            "": [""] * 4,
+        }
+    )
+    ordered = order_input_map_by_energy(df)
+    assert ordered["ENERGY"].tolist() == [200.0, 200.0, 100.0, 100.0]
+    assert ordered["X_POSITION"].tolist() == pytest.approx([3.0, 4.0, 1.0, 2.0])
+    assert ordered["spot_no"].tolist() == [0, 1, 2, 3]
+
+
 def test_write_input_map_csv_round_trip(tmp_path: Path, zero_field) -> None:
-    params = {
-        "selected_energies": [250.0, 247.5],
-        "charge_req_mu": 0.02,
-        "spots_per_layer": 2,
-    }
+    params = _fixed_weight_params(
+        selected_energies=[250.0, 247.5],
+        spots_per_layer=2,
+    )
     df = zero_field.generate(params)
     out = tmp_path / "input_map.csv"
     write_input_map_csv(df, out)
     loaded = pd.read_csv(out)
     assert len(loaded) == 4
     assert list(loaded.columns[: len(INPUT_MAP_COLUMNS) - 1]) == list(INPUT_MAP_COLUMNS[:-1])
+
+
+def test_spot_weight_fixed() -> None:
+    rows = [
+        SpotRow(energy=200.0, layer_id=1, x_position=0.0, y_position=0.0),
+        SpotRow(energy=200.0, layer_id=1, x_position=1.0, y_position=0.0),
+    ]
+    weights = compute_spot_weights(
+        rows,
+        _fixed_weight_params(spot_weight_mu=0.03),
+    )
+    assert weights == [0.03, 0.03]
+
+
+def test_spot_weight_random_range() -> None:
+    rows = [SpotRow(energy=200.0, layer_id=1, x_position=0.0, y_position=0.0)] * 20
+    params = _fixed_weight_params(
+        spot_weight_method=SPOT_WEIGHT_METHOD_RANDOM,
+        spot_weight_min_mu=0.01,
+        spot_weight_max_mu=0.02,
+    )
+    weights = compute_spot_weights(rows, params)
+    assert len(weights) == 20
+    assert all(0.01 <= weight <= 0.02 for weight in weights)
+
+
+def test_spot_weight_layer_even_range() -> None:
+    rows = [
+        SpotRow(energy=250.0, layer_id=10, x_position=0.0, y_position=0.0),
+        SpotRow(energy=250.0, layer_id=10, x_position=1.0, y_position=0.0),
+        SpotRow(energy=250.0, layer_id=10, x_position=2.0, y_position=0.0),
+        SpotRow(energy=247.5, layer_id=11, x_position=0.0, y_position=0.0),
+        SpotRow(energy=247.5, layer_id=11, x_position=1.0, y_position=0.0),
+    ]
+    params = _fixed_weight_params(
+        spot_weight_method=SPOT_WEIGHT_METHOD_LAYER_EVEN,
+        spot_weight_min_mu=0.01,
+        spot_weight_max_mu=0.03,
+        spot_weight_layer_shuffle=False,
+    )
+    weights = compute_spot_weights(rows, params)
+    assert weights[:3] == pytest.approx([0.01, 0.02, 0.03])
+    assert weights[3:] == pytest.approx([0.01, 0.03])
+
+
+def test_spot_weight_layer_even_shuffle_per_layer() -> None:
+    import random
+
+    rows = [
+        SpotRow(energy=250.0, layer_id=10, x_position=0.0, y_position=0.0),
+        SpotRow(energy=250.0, layer_id=10, x_position=1.0, y_position=0.0),
+        SpotRow(energy=250.0, layer_id=10, x_position=2.0, y_position=0.0),
+        SpotRow(energy=247.5, layer_id=11, x_position=0.0, y_position=0.0),
+        SpotRow(energy=247.5, layer_id=11, x_position=1.0, y_position=0.0),
+        SpotRow(energy=247.5, layer_id=11, x_position=2.0, y_position=0.0),
+    ]
+    params = _fixed_weight_params(
+        spot_weight_method=SPOT_WEIGHT_METHOD_LAYER_EVEN,
+        spot_weight_min_mu=0.01,
+        spot_weight_max_mu=0.03,
+        spot_weight_layer_shuffle=True,
+    )
+
+    random.seed(7)
+    weights = compute_spot_weights(rows, params)
+    assert sorted(weights[:3]) == pytest.approx([0.01, 0.02, 0.03])
+    assert sorted(weights[3:]) == pytest.approx([0.01, 0.02, 0.03])
+    assert weights[:3] != pytest.approx([0.01, 0.02, 0.03])
+    assert weights[3:] != pytest.approx([0.01, 0.02, 0.03])
+
+    random.seed(7)
+    again = compute_spot_weights(rows, params)
+    assert again == weights
+
+
+def test_spot_weight_even_total() -> None:
+    rows = [SpotRow(energy=200.0, layer_id=1, x_position=0.0, y_position=0.0)] * 4
+    params = _fixed_weight_params(
+        spot_weight_method=SPOT_WEIGHT_METHOD_EVEN_TOTAL,
+        spot_weight_total_mu=1.0,
+    )
+    weights = compute_spot_weights(rows, params)
+    assert len(weights) == 4
+    assert weights == pytest.approx([0.25, 0.25, 0.25, 0.25])
+    assert sum(weights) == pytest.approx(1.0)
+
+
+def test_spot_weight_even_total_absorbs_rounding_remainder() -> None:
+    rows = [SpotRow(energy=200.0, layer_id=1, x_position=0.0, y_position=0.0)] * 3
+    params = _fixed_weight_params(
+        spot_weight_method=SPOT_WEIGHT_METHOD_EVEN_TOTAL,
+        spot_weight_total_mu=1.0,
+    )
+    weights = compute_spot_weights(rows, params)
+    assert sum(weights) == pytest.approx(1.0)
+    assert all(weight > 0 for weight in weights)
+
+
+def test_zero_field_even_total_integration(zero_field) -> None:
+    params = _fixed_weight_params(
+        selected_energies=[250.0, 247.5],
+        spots_per_layer=2,
+        spot_weight_method=SPOT_WEIGHT_METHOD_EVEN_TOTAL,
+        spot_weight_total_mu=2.0,
+    )
+    assert zero_field.validate(params) == []
+    df = zero_field.generate(params)
+    assert len(df) == 4
+    assert df["CHARGE_REQ"].sum() == pytest.approx(2.0)
+
+
+def test_spot_weight_random_total_with_zero_variance_matches_even_total() -> None:
+    rows = [SpotRow(energy=200.0, layer_id=1, x_position=0.0, y_position=0.0)] * 4
+    params = _fixed_weight_params(
+        spot_weight_method=SPOT_WEIGHT_METHOD_RANDOM_TOTAL,
+        spot_weight_total_mu=1.0,
+        spot_weight_variance_pct=0.0,
+    )
+    weights = compute_spot_weights(rows, params)
+    assert weights == pytest.approx([0.25, 0.25, 0.25, 0.25])
+    assert sum(weights) == pytest.approx(1.0)
+
+
+def test_spot_weight_random_total_respects_target_and_variance() -> None:
+    rows = [SpotRow(energy=200.0, layer_id=1, x_position=0.0, y_position=0.0)] * 50
+    params = _fixed_weight_params(
+        spot_weight_method=SPOT_WEIGHT_METHOD_RANDOM_TOTAL,
+        spot_weight_total_mu=5.0,
+        spot_weight_variance_pct=20.0,
+    )
+    weights = compute_spot_weights(rows, params)
+    assert len(weights) == 50
+    assert sum(weights) == pytest.approx(5.0)
+    assert all(weight > 0 for weight in weights)
+    assert len(set(weights)) > 1
+    mean = 5.0 / 50
+    assert min(weights) < mean
+    assert max(weights) > mean
+
+
+def test_spot_weight_validation_rejects_excessive_variance() -> None:
+    params = _fixed_weight_params(
+        spot_weight_method=SPOT_WEIGHT_METHOD_RANDOM_TOTAL,
+        spot_weight_variance_pct=150.0,
+    )
+    errors = validate_spot_weight_params(params)
+    assert any("Spot Variance" in error for error in errors)
+
+
+def test_spot_weight_validation_rejects_inverted_range() -> None:
+    params = _fixed_weight_params(
+        spot_weight_method=SPOT_WEIGHT_METHOD_RANDOM,
+        spot_weight_min_mu=0.05,
+        spot_weight_max_mu=0.01,
+    )
+    errors = validate_spot_weight_params(params)
+    assert any("Maximum Weight (MU)" in error for error in errors)
+
+
+def test_both_templates_expose_spot_weight_method(zero_field, rectangular_field) -> None:
+    for template in (zero_field, rectangular_field):
+        keys = {spec.key for spec in template.param_specs()}
+        assert "spot_weight_method" in keys
+        assert "spot_weight_mu" in keys
+        assert "spot_weight_total_mu" in keys
+        assert "spot_weight_variance_pct" in keys
+        assert "spot_weight_min_mu" in keys
+        assert "spot_weight_max_mu" in keys
+        assert "spot_weight_layer_shuffle" in keys
+
+
+def test_param_form_field_sets_visible_before_show(zero_field) -> None:
+    import sys
+
+    from PySide6.QtWidgets import QApplication, QVBoxLayout, QWidget
+
+    from scan_kit.workflows.plan_synthesis.param_form import ParamFormWidget
+
+    app = QApplication.instance() or QApplication(sys.argv)
+    host = QWidget()
+    layout = QVBoxLayout(host)
+    form = ParamFormWidget(zero_field.param_specs(), zero_field.default_params())
+    layout.addWidget(form)
+    host.show()
+    app.processEvents()
+
+    assert form._field_set_boxes["energy"].isVisible()
+    assert form._field_set_boxes["geometry"].isVisible()
+    assert form._field_set_boxes["weight"].isVisible()
+    assert not form._field_set_boxes["energy"].isHidden()
+
+
+def _preview_table_df(n_rows: int) -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "ENERGY": [200.0] * n_rows,
+            "X_POSITION": [0.0] * n_rows,
+            "Y_POSITION": [0.0] * n_rows,
+            "CHARGE_REQ": [0.01] * n_rows,
+            "spot_no": list(range(n_rows)),
+        }
+    )
+
+
+def test_format_layer_selection_status() -> None:
+    from scan_kit.workflows.plan_synthesis.energy_picker import (
+        _format_layer_selection_status,
+    )
+
+    assert _format_layer_selection_status(0) == "No layers selected"
+    assert _format_layer_selection_status(1) == "1 layer selected"
+    assert _format_layer_selection_status(3) == "3 layers selected"
+
+
+def test_energy_picker_status_label_updates() -> None:
+    import sys
+
+    from PySide6.QtWidgets import QApplication
+
+    from scan_kit.workflows.plan_synthesis.energy_picker import EnergyPickerWidget
+
+    app = QApplication.instance() or QApplication(sys.argv)
+    picker = EnergyPickerWidget(selected=[250.0, 247.5])
+    app.processEvents()
+
+    assert picker._status_label.text() == "2 layers selected"
+
+    picker._energy_list.clearSelection()
+    app.processEvents()
+    assert picker._status_label.text() == "No layers selected"
+
+    picker._energy_list.selectAll()
+    app.processEvents()
+    assert picker._status_label.text().endswith(" layers selected")
+
+
+def test_energy_picker_whole_mev_steps_button() -> None:
+    import sys
+
+    from PySide6.QtWidgets import QApplication
+
+    from scan_kit.workflows.plan_synthesis.energy_picker import EnergyPickerWidget
+
+    app = QApplication.instance() or QApplication(sys.argv)
+    picker = EnergyPickerWidget(selected=[250.0])
+    app.processEvents()
+
+    picker._select_whole_mev_steps()
+    app.processEvents()
+
+    assert picker.selected_energies() == list(WHOLE_MEV_STEP_ENERGIES_MEV)[::-1]
+    assert picker._status_label.text() == f"{len(WHOLE_MEV_STEP_ENERGIES_MEV)} layers selected"
+
+
+def test_suggest_input_map_filename_zero_field(zero_field) -> None:
+    from scan_kit.workflows.plan_synthesis.export_filename import (
+        suggest_input_map_filename,
+    )
+
+    params = _fixed_weight_params(
+        selected_energies=[250.0, 247.5, 245.0],
+        spots_per_layer=100,
+    )
+    name = suggest_input_map_filename(zero_field, params)
+    assert name.endswith(".csv")
+    assert len(name) <= 128
+    assert name.startswith("ZeroField_")
+    assert "E250-245" in name
+    assert "Sp100" in name
+    assert "Wfix0.02" in name
+
+
+def test_suggest_input_map_filename_rectangular_field(rectangular_field) -> None:
+    from scan_kit.workflows.plan_synthesis.export_filename import (
+        suggest_input_map_filename,
+    )
+
+    params = _fixed_weight_params(
+        selected_energies=[200.0],
+        center_x_mm=10.0,
+        center_y_mm=-5.0,
+        field_width_mm=100.0,
+        field_height_mm=80.0,
+        spots_x=33,
+        spots_y=33,
+        spot_weight_method=SPOT_WEIGHT_METHOD_EVEN_TOTAL,
+        spot_weight_total_mu=2.0,
+    )
+    name = suggest_input_map_filename(rectangular_field, params)
+    assert len(name) <= 128
+    assert name.startswith("RectField_")
+    assert "E200" in name
+    assert "C10x-5" in name
+    assert "100x80mm" in name
+    assert "G33x33" in name
+    assert "Wtot2" in name
+
+
+def test_suggest_input_map_filename_all_catalog_energies(zero_field) -> None:
+    from scan_kit.workflows.plan_synthesis.export_filename import (
+        suggest_input_map_filename,
+    )
+
+    params = zero_field.default_params()
+    params["selected_energies"] = list(STANDARD_ENERGIES_MEV)
+    name = suggest_input_map_filename(zero_field, params)
+    assert "E250-70" in name
+    assert "76L" not in name
+
+
+def test_suggest_input_map_filename_many_noncontiguous_energies(zero_field) -> None:
+    from scan_kit.workflows.plan_synthesis.export_filename import (
+        suggest_input_map_filename,
+    )
+
+    params = zero_field.default_params()
+    params["selected_energies"] = [250.0, 240.0, 230.0, 220.0, 210.0]
+    name = suggest_input_map_filename(zero_field, params)
+    assert "E5L_250-210" in name
+
+
+def test_suggest_input_map_filename_respects_max_length(zero_field) -> None:
+    from scan_kit.workflows.plan_synthesis.export_filename import (
+        suggest_input_map_filename,
+    )
+
+    params = zero_field.default_params()
+    params["selected_energies"] = list(STANDARD_ENERGIES_MEV)
+    params["spots_per_layer"] = 100_000
+    name = suggest_input_map_filename(zero_field, params, max_length=40)
+    assert len(name) <= 40
+    assert name.endswith(".csv")
+
+
+def test_fill_preview_table_caps_rows() -> None:
+    import sys
+
+    from PySide6.QtWidgets import QApplication, QTableWidget
+
+    from scan_kit.workflows.plan_synthesis.preview import (
+        PREVIEW_ROW_CAP,
+        fill_preview_table,
+    )
+
+    app = QApplication.instance() or QApplication(sys.argv)
+    table = QTableWidget()
+    df = _preview_table_df(PREVIEW_ROW_CAP + 500)
+
+    shown = fill_preview_table(table, df)
+    app.processEvents()
+
+    assert shown == PREVIEW_ROW_CAP
+    assert table.rowCount() == PREVIEW_ROW_CAP
+
+
+def test_start_preview_table_fill_cancels_stale_fill() -> None:
+    import sys
+
+    from PySide6.QtWidgets import QApplication, QTableWidget
+
+    from scan_kit.workflows.plan_synthesis.preview import (
+        _count_filled_preview_cells,
+        start_preview_table_fill,
+    )
+
+    app = QApplication.instance() or QApplication(sys.argv)
+    table = QTableWidget()
+    df = _preview_table_df(1_000)
+    current = {"ok": True}
+
+    start_preview_table_fill(table, df, is_current=lambda: current["ok"])
+    app.processEvents()
+
+    filled_before_cancel = _count_filled_preview_cells(table)
+    assert 0 < filled_before_cancel < 1_000 * 5
+
+    current["ok"] = False
+    for _ in range(20):
+        app.processEvents()
+
+    assert _count_filled_preview_cells(table) == filled_before_cancel
+
+
+def test_clear_preview_table_releases_rows() -> None:
+    import sys
+
+    from PySide6.QtWidgets import QApplication, QTableWidget
+
+    from scan_kit.workflows.plan_synthesis.preview import (
+        _count_filled_preview_cells,
+        clear_preview_table,
+        fill_preview_table,
+    )
+
+    app = QApplication.instance() or QApplication(sys.argv)
+    table = QTableWidget()
+    fill_preview_table(table, _preview_table_df(50))
+    app.processEvents()
+    assert _count_filled_preview_cells(table) > 0
+
+    clear_preview_table(table)
+    app.processEvents()
+
+    assert table.rowCount() == 0
+    assert _count_filled_preview_cells(table) == 0
+
+
+def test_generate_input_map_reports_progress(zero_field) -> None:
+    params = _fixed_weight_params(
+        selected_energies=[250.0, 247.5],
+        spots_per_layer=2,
+    )
+    seen: list[int] = []
+    zero_field.generate(params, progress=seen.append)
+    assert seen[0] == 0
+    assert seen[-1] == 100
+    assert max(seen) == 100

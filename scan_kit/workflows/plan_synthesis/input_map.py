@@ -43,15 +43,31 @@ def new_layer_ids(n: int) -> list[int]:
 def assemble_input_map(data: dict[str, list[Any]]) -> pd.DataFrame:
     """Build a DataFrame with all required columns in reference order."""
     frame = {col: data[col] for col in INPUT_MAP_COLUMNS}
-    return pd.DataFrame(frame)[list(INPUT_MAP_COLUMNS)]
+    df = pd.DataFrame(frame)[list(INPUT_MAP_COLUMNS)]
+    return order_input_map_by_energy(df)
+
+
+def order_input_map_by_energy(df: pd.DataFrame) -> pd.DataFrame:
+    """Sort rows by ENERGY descending (highest MeV first) and renumber spot_no."""
+    if df.empty or "ENERGY" not in df.columns:
+        return df
+
+    ordered = df.sort_values("ENERGY", ascending=False, kind="stable").reset_index(
+        drop=True
+    )
+    ordered = ordered.copy()
+    ordered["spot_no"] = range(len(ordered))
+    return ordered[list(INPUT_MAP_COLUMNS)]
 
 
 def write_input_map_csv(df: pd.DataFrame, path: str | Path) -> None:
     """Write *df* as input_map.csv with reference column order."""
     out_path = Path(path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    ordered = df[list(INPUT_MAP_COLUMNS)]
-    ordered.to_csv(out_path, index=False, lineterminator="\n")
+    ordered = order_input_map_by_energy(df)
+    ordered[list(INPUT_MAP_COLUMNS)].to_csv(
+        out_path, index=False, lineterminator="\n"
+    )
 
 
 def plan_summary(df: pd.DataFrame) -> tuple[int, int, float]:

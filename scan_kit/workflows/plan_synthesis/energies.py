@@ -81,3 +81,13 @@ STANDARD_ENERGIES_MEV: tuple[float, ...] = (
     247.5,
     250.0,
 )
+
+# Catalog subset: 70, 80, 90, … 250 MeV (10 MeV steps only).
+TEN_MEV_STEP_ENERGIES_MEV: tuple[float, ...] = tuple(
+    energy for energy in STANDARD_ENERGIES_MEV if energy % 10 == 0
+)
+
+# Catalog subset: whole-MeV layers only (excludes 2.5 MeV half-step layers).
+WHOLE_MEV_STEP_ENERGIES_MEV: tuple[float, ...] = tuple(
+    energy for energy in STANDARD_ENERGIES_MEV if energy % 1 == 0
+)
