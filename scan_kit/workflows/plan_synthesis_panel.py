@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import QEvent, Qt, QThread
+import json
+import time
+from pathlib import Path
+
+from PySide6.QtCore import Qt, QThread, QTimer
 from PySide6.QtGui import QPalette
 from PySide6.QtWidgets import (
     QFileDialog,
@@ -36,6 +40,132 @@ from .plan_synthesis.preview import (
     start_preview_table_fill,
 )
 from .plan_synthesis.registry import TEMPLATE_REGISTRY
+
+_DEBUG_LOG_PATH = Path(__file__).resolve().parents[2] / "debug-70ba5d.log"
+
+
+def _debug_log(
+    hypothesis_id: str,
+    location: str,
+    message: str,
+    data: dict,
+    *,
+    run_id: str = "pre-fix",
+) -> None:
+    # region agent log
+    try:
+        payload = {
+            "sessionId": "70ba5d",
+            "hypothesisId": hypothesis_id,
+            "location": location,
+            "message": message,
+            "data": data,
+            "timestamp": int(time.time() * 1000),
+            "runId": run_id,
+        }
+        with _DEBUG_LOG_PATH.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(payload) + "\n")
+    except OSError:
+        pass
+    # endregion
+
+
+def _widget_bg_snapshot(name: str, widget: QWidget) -> dict[str, object]:
+    pal = widget.palette()
+    return {
+        "name": name,
+        "class": widget.metaObject().className(),
+        "autoFillBackground": widget.autoFillBackground(),
+        "base": pal.color(QPalette.ColorRole.Base).name(),
+        "window": pal.color(QPalette.ColorRole.Window).name(),
+        "size": [widget.width(), widget.height()],
+        "sizeHint": [widget.sizeHint().width(), widget.sizeHint().height()],
+    }
+
+
+def _log_param_scroll_background(
+    panel: PlanSynthesisPanel,
+    *,
+    stage: str,
+    hypothesis_id: str = "H-multi",
+) -> None:
+    scroll = panel._param_scroll
+    form = panel._param_form
+    params_host = scroll.parentWidget()
+    left_splitter = params_host.parentWidget() if params_host is not None else None
+    widgets: list[tuple[str, QWidget | None]] = [
+        ("left_splitter", left_splitter),
+        ("params_host", params_host),
+        ("param_scroll", scroll),
+        ("param_viewport", scroll.viewport()),
+        ("param_form", form),
+    ]
+    snapshots = [
+        _widget_bg_snapshot(name, widget)
+        for name, widget in widgets
+        if widget is not None
+    ]
+    viewport_h = scroll.viewport().height()
+    form_h = form.height() if form is not None else 0
+    form_hint_h = form.sizeHint().height() if form is not None else 0
+    _debug_log(
+        hypothesis_id,
+        "plan_synthesis_panel.py:_log_param_scroll_background",
+        f"param scroll background snapshot ({stage})",
+        {
+            "stage": stage,
+            "widgets": snapshots,
+            "viewportHeight": viewport_h,
+            "formHeight": form_h,
+            "formSizeHintHeight": form_hint_h,
+            "emptyRegionHeight": max(0, viewport_h - form_hint_h),
+            "baseMatchesWindow": all(
+                s["base"] == s["window"] for s in snapshots
+            ),
+            "parentChildBaseMismatch": [
+                {
+                    "parent": snapshots[i]["name"],
+                    "child": snapshots[i + 1]["name"],
+                    "parentWindow": snapshots[i]["window"],
+                    "childBase": snapshots[i + 1]["base"],
+                }
+                for i in range(len(snapshots) - 1)
+                if snapshots[i]["window"] != snapshots[i + 1]["base"]
+            ],
+        },
+    )
+
+
+def _configure_transparent_scroll_area(scroll: QScrollArea) -> None:
+    """Blend the scroll area with its parent pane (no sunken Base fill)."""
+    window_color = scroll.palette().color(QPalette.ColorRole.Window)
+    before = [
+        _widget_bg_snapshot("scroll_before", scroll),
+        _widget_bg_snapshot("viewport_before", scroll.viewport()),
+    ]
+    for widget in (scroll, scroll.viewport()):
+        widget.setAutoFillBackground(False)
+        pal = widget.palette()
+        pal.setColor(QPalette.ColorRole.Base, window_color)
+        widget.setPalette(pal)
+    after = [
+        _widget_bg_snapshot("scroll_after", scroll),
+        _widget_bg_snapshot("viewport_after", scroll.viewport()),
+    ]
+    _debug_log(
+        "H1-H2",
+        "plan_synthesis_panel.py:_configure_transparent_scroll_area",
+        "configured scroll area palette",
+        {
+            "targetWindow": window_color.name(),
+            "before": before,
+            "after": after,
+            "autoFillDisabled": not scroll.autoFillBackground()
+            and not scroll.viewport().autoFillBackground(),
+            "baseEqualsWindowAfter": after[0]["base"] == after[0]["window"]
+            and after[1]["base"] == after[1]["window"],
+        },
+    )
 
 
 class _TemplateListRow(QWidget):
@@ -141,22 +271,13 @@ class PlanSynthesisPanel(QWidget):
         left_splitter.addWidget(template_host)
 
         params_host = QWidget()
+        params_host.setAutoFillBackground(False)
         params_l = QVBoxLayout(params_host)
         params_l.setContentsMargins(4, 4, 4, 4)
         params_l.setSpacing(6)
 
-        self._param_host = QWidget()
-        self._param_host_l = QVBoxLayout(self._param_host)
-        self._param_host_l.setContentsMargins(0, 0, 0, 0)
-        self._param_host_l.setSpacing(0)
-        self._param_host.setSizePolicy(
-            QSizePolicy.Policy.Preferred,
-            QSizePolicy.Policy.Minimum,
-        )
-
         self._param_scroll = QScrollArea()
-        self._param_scroll.setWidget(self._param_host)
-        self._param_scroll.setWidgetResizable(False)
+        self._param_scroll.setWidgetResizable(True)
         self._param_scroll.setVerticalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAsNeeded
         )
@@ -168,6 +289,7 @@ class PlanSynthesisPanel(QWidget):
             QSizePolicy.Policy.Expanding,
             QSizePolicy.Policy.Expanding,
         )
+        _configure_transparent_scroll_area(self._param_scroll)
         params_l.addWidget(self._param_scroll, stretch=1)
 
         left_splitter.addWidget(params_host)
@@ -210,17 +332,14 @@ class PlanSynthesisPanel(QWidget):
         if self._templates:
             self._template_list.setCurrentRow(0)
 
-        self._param_scroll.viewport().installEventFilter(self)
-
-    def eventFilter(self, watched, event) -> bool:  # type: ignore[no-untyped-def]
-        if watched is self._param_scroll.viewport() and event.type() == QEvent.Type.Resize:
-            self._sync_param_host_width()
-        return super().eventFilter(watched, event)
-
-    def _sync_param_host_width(self) -> None:
-        viewport_width = self._param_scroll.viewport().width()
-        if viewport_width > 0:
-            self._param_host.setFixedWidth(viewport_width)
+        QTimer.singleShot(
+            0,
+            lambda: _log_param_scroll_background(self, stage="init_immediate"),
+        )
+        QTimer.singleShot(
+            500,
+            lambda: _log_param_scroll_background(self, stage="init_settled"),
+        )
 
     def _on_template_changed(self, row: int) -> None:
         if row < 0 or row >= len(self._templates):
@@ -236,10 +355,9 @@ class PlanSynthesisPanel(QWidget):
         self._rebuild_param_form()
 
     def _rebuild_param_form(self) -> None:
-        while self._param_host_l.count():
-            item = self._param_host_l.takeAt(0)
-            if item.widget() is not None:
-                item.widget().deleteLater()
+        old_widget = self._param_scroll.takeWidget()
+        if old_widget is not None:
+            old_widget.deleteLater()
         self._param_form = None
         if self._current is None:
             return
@@ -248,11 +366,13 @@ class PlanSynthesisPanel(QWidget):
             self._current.default_params(),
         )
         self._param_form = form
-        self._param_host_l.addWidget(
-            form, alignment=Qt.AlignmentFlag.AlignTop,
+        self._param_scroll.setWidget(form)
+        _configure_transparent_scroll_area(self._param_scroll)
+        _log_param_scroll_background(self, stage="rebuild_immediate")
+        QTimer.singleShot(
+            0,
+            lambda: _log_param_scroll_background(self, stage="rebuild_deferred"),
         )
-        self._sync_param_host_width()
-        self._param_host.adjustSize()
 
     def _read_params(self) -> dict:
         if self._param_form is None or self._current is None:

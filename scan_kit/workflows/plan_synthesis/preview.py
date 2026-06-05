@@ -13,7 +13,34 @@ from .input_map import INPUT_MAP_EXPORT_COLUMNS, input_map_export_frame, plan_su
 
 PREVIEW_ROW_CAP = 5_000
 _PREVIEW_BATCH_SIZE = 200
-_RESIZE_TO_CONTENTS_MAX_ROWS = 1_000
+_HEADER_COLUMN_PADDING_PX = 20
+DEFAULT_DELIVERY_RATE_MU_PER_S = 0.4
+
+
+def estimate_delivery_seconds(
+    total_mu: float,
+    *,
+    rate_mu_per_s: float = DEFAULT_DELIVERY_RATE_MU_PER_S,
+) -> float:
+    if rate_mu_per_s <= 0:
+        return 0.0
+    return total_mu / rate_mu_per_s
+
+
+def format_delivery_duration(seconds: float) -> str:
+    if seconds < 60:
+        return f"{seconds:.1f} s"
+    total_minutes = int(seconds // 60)
+    if total_minutes < 60:
+        rem_s = int(round(seconds % 60))
+        if rem_s == 0:
+            return f"{total_minutes} min"
+        return f"{total_minutes} min {rem_s} s"
+    hours = total_minutes // 60
+    minutes = total_minutes % 60
+    if minutes == 0:
+        return f"{hours} h"
+    return f"{hours} h {minutes} min"
 
 
 def format_plan_summary(
@@ -26,7 +53,11 @@ def format_plan_summary(
         return "No plan generated yet."
     layer_word = "layer" if n_layers == 1 else "layers"
     spot_word = "spot" if n_spots == 1 else "spots"
-    msg = f"{n_layers} {layer_word} · {n_spots} {spot_word} · {total_mu:.4f} MU total"
+    delivery = format_delivery_duration(estimate_delivery_seconds(total_mu))
+    msg = (
+        f"{n_layers} {layer_word} · {n_spots} {spot_word} · "
+        f"{total_mu:.3g} MU total · est. {delivery} delivery"
+    )
     if n_spots > preview_row_cap:
         msg += f" · preview shows first {preview_row_cap:,} rows"
     return msg
@@ -56,17 +87,18 @@ def clear_preview_table(table: QTableWidget) -> None:
     table.setRowCount(0)
     table.setColumnCount(len(INPUT_MAP_EXPORT_COLUMNS))
     table.setHorizontalHeaderLabels(list(INPUT_MAP_EXPORT_COLUMNS))
+    _resize_preview_columns_to_headers(table)
 
 
-def _apply_preview_header_modes(table: QTableWidget, *, n_rows: int) -> None:
+def _resize_preview_columns_to_headers(table: QTableWidget) -> None:
+    """Size each preview column to fit its header label."""
     hh = table.horizontalHeader()
-    if n_rows <= _RESIZE_TO_CONTENTS_MAX_ROWS:
-        for col in range(len(INPUT_MAP_EXPORT_COLUMNS)):
-            hh.setSectionResizeMode(col, QHeaderView.ResizeMode.ResizeToContents)
-        return
-    for col in range(len(INPUT_MAP_EXPORT_COLUMNS)):
-        hh.setSectionResizeMode(col, QHeaderView.ResizeMode.Interactive)
-    hh.setStretchLastSection(True)
+    hh.setStretchLastSection(False)
+    fm = hh.fontMetrics()
+    for col_idx, label in enumerate(INPUT_MAP_EXPORT_COLUMNS):
+        width = fm.horizontalAdvance(label) + _HEADER_COLUMN_PADDING_PX
+        hh.setSectionResizeMode(col_idx, QHeaderView.ResizeMode.Fixed)
+        table.setColumnWidth(col_idx, width)
 
 
 def fill_preview_table(table: QTableWidget, df: pd.DataFrame | None) -> int:
@@ -96,7 +128,7 @@ def fill_preview_table(table: QTableWidget, df: pd.DataFrame | None) -> int:
     finally:
         table.setUpdatesEnabled(True)
 
-    _apply_preview_header_modes(table, n_rows=n_show)
+    _resize_preview_columns_to_headers(table)
     table.setSortingEnabled(False)
     return n_show
 
@@ -163,7 +195,7 @@ def start_preview_table_fill(
         state["next_row"] = end
         if end >= n_show:
             finish_updates()
-            _apply_preview_header_modes(table, n_rows=n_show)
+            _resize_preview_columns_to_headers(table)
             table.setSortingEnabled(False)
             return
 

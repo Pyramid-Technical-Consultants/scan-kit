@@ -118,6 +118,36 @@ def test_format_plan_summary_notes_preview_cap() -> None:
     assert "preview shows first 3 rows" in format_plan_summary(df, preview_row_cap=3)
 
 
+def test_format_plan_summary_total_mu_uses_three_sig_figs() -> None:
+    from scan_kit.workflows.plan_synthesis.preview import format_plan_summary
+
+    df = pd.DataFrame({"ENERGY": [1.0] * 3, "CHARGE_REQ": [0.12345] * 3})
+    assert "0.37 MU total" in format_plan_summary(df)
+
+    df_large = pd.DataFrame({"ENERGY": [1.0] * 2, "CHARGE_REQ": [1234.567] * 2})
+    assert "2.47e+03 MU total" in format_plan_summary(df_large)
+
+
+def test_format_plan_summary_includes_estimated_delivery_time() -> None:
+    import pytest
+
+    from scan_kit.workflows.plan_synthesis.preview import (
+        estimate_delivery_seconds,
+        format_delivery_duration,
+        format_plan_summary,
+    )
+
+    assert estimate_delivery_seconds(0.8) == pytest.approx(2.0)
+    assert format_delivery_duration(2.0) == "2.0 s"
+    assert format_delivery_duration(125.0) == "2 min 5 s"
+    assert format_delivery_duration(3660.0) == "1 h 1 min"
+
+    df = pd.DataFrame({"ENERGY": [200.0, 200.0], "CHARGE_REQ": [0.4, 0.4]})
+    summary = format_plan_summary(df)
+    assert "0.8 MU total" in summary
+    assert "est. 2.0 s delivery" in summary
+
+
 def test_zero_field_validation_rejects_empty_energies(zero_field) -> None:
     params = zero_field.default_params()
     params["selected_energies"] = []
@@ -796,6 +826,47 @@ def test_rectangular_field_geometry_quick_set_buttons(rectangular_field) -> None
     assert updated["center_y_mm"] == 0.0
 
 
+def test_plan_synthesis_panel_rebuilds_form_on_template_switch() -> None:
+    import sys
+
+    from PySide6.QtWidgets import QApplication, QGroupBox
+
+    from scan_kit.workflows.plan_synthesis.param_form import ParamFormWidget
+    from scan_kit.workflows.plan_synthesis_panel import PlanSynthesisPanel
+
+    app = QApplication.instance() or QApplication(sys.argv)
+    panel = PlanSynthesisPanel()
+    panel.show()
+    app.processEvents()
+
+    first_form = panel._param_scroll.widget()
+    assert isinstance(first_form, ParamFormWidget)
+    assert panel._param_form is first_form
+    assert first_form.isVisible()
+    assert first_form.height() > 0
+    assert first_form.findChildren(QGroupBox)
+
+    panel._template_list.setCurrentRow(1)
+    app.processEvents()
+
+    second_form = panel._param_scroll.widget()
+    assert isinstance(second_form, ParamFormWidget)
+    assert second_form is not first_form
+    assert panel._param_form is second_form
+    assert second_form.isVisible()
+    assert second_form.height() > 0
+    assert second_form.findChildren(QGroupBox)
+
+    panel._template_list.setCurrentRow(0)
+    app.processEvents()
+
+    third_form = panel._param_scroll.widget()
+    assert isinstance(third_form, ParamFormWidget)
+    assert third_form is not second_form
+    assert third_form.isVisible()
+    assert third_form.height() > 0
+
+
 def test_param_form_field_sets_visible_before_show(zero_field) -> None:
     import sys
 
@@ -983,6 +1054,31 @@ def test_fill_preview_table_uses_export_column_order() -> None:
     ] == list(INPUT_MAP_EXPORT_COLUMNS)
     assert table.item(0, 0).text() == "1"
     assert table.item(1, 0).text() == "2"
+
+
+def test_fill_preview_table_sizes_columns_to_header_text() -> None:
+    import sys
+
+    from PySide6.QtWidgets import QApplication, QHeaderView, QTableWidget
+
+    from scan_kit.workflows.plan_synthesis.input_map import INPUT_MAP_EXPORT_COLUMNS
+    from scan_kit.workflows.plan_synthesis.preview import (
+        _HEADER_COLUMN_PADDING_PX,
+        fill_preview_table,
+    )
+
+    app = QApplication.instance() or QApplication(sys.argv)
+    table = QTableWidget()
+    fill_preview_table(table, _preview_table_df(2))
+    app.processEvents()
+
+    hh = table.horizontalHeader()
+    fm = hh.fontMetrics()
+    for col_idx, label in enumerate(INPUT_MAP_EXPORT_COLUMNS):
+        assert hh.sectionResizeMode(col_idx) == QHeaderView.ResizeMode.Fixed
+        assert table.columnWidth(col_idx) == (
+            fm.horizontalAdvance(label) + _HEADER_COLUMN_PADDING_PX
+        )
 
 
 def test_fill_preview_table_caps_rows() -> None:

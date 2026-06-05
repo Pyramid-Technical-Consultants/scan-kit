@@ -194,11 +194,16 @@ def test_app_settings_round_trip(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
         "scan_kit.common.app_settings._SETTINGS_DIR",
         tmp_path,
     )
-    settings = AppSettings(config_dir="/tmp/config", last_opened_xml="map2map/devices.xml")
+    settings = AppSettings(
+        config_dir="/tmp/config",
+        last_opened_xml="map2map/devices.xml",
+        last_main_tab="Plan Synthesis",
+    )
     settings.save()
     loaded = AppSettings.load()
     assert loaded.config_dir == "/tmp/config"
     assert loaded.last_opened_xml == "map2map/devices.xml"
+    assert loaded.last_main_tab == "Plan Synthesis"
 
 
 def test_save_config_folder_copies_tree_and_writes_dirty(tmp_path: Path) -> None:

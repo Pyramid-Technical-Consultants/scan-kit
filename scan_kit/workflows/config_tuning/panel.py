@@ -54,9 +54,14 @@ _VIEW_WORKFLOW = 1
 class ConfigTuningPanel(QWidget):
     """Browse a config folder and edit XML files with an auto-generated form."""
 
-    def __init__(self, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        parent: QWidget | None = None,
+        *,
+        app_settings: AppSettings | None = None,
+    ) -> None:
         super().__init__(parent)
-        self._settings = AppSettings.load()
+        self._settings = app_settings if app_settings is not None else AppSettings.load()
         self._config_root: Path | None = None
         self._document: XmlDocument | None = None
         self._current_path: Path | None = None

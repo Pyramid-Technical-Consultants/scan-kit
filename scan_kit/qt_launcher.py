@@ -15,7 +15,7 @@ from functools import partial
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import QRectF, Qt, QTimer, Signal, Slot, QSize
+from PySide6.QtCore import QRectF, Qt, QThread, QTimer, Signal, Slot, QSize
 from PySide6.QtGui import (
     QCloseEvent,
     QColor,
@@ -30,6 +30,7 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
+    QDialog,
     QFileDialog,
     QFrame,
     QGridLayout,
@@ -40,6 +41,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMainWindow,
     QMessageBox,
+    QProgressDialog,
     QPushButton,
     QScrollArea,
     QSizePolicy,
@@ -52,6 +54,7 @@ from PySide6.QtWidgets import (
 )
 
 from . import __version__
+from .common.app_settings import AppSettings
 from .common.session_meta import SessionMeta
 from .common.session_notes import load_notes, save_note
 from .common.settings import ViewSettings, CALIBRATION_MODES
@@ -59,6 +62,8 @@ from .common.plot_colors import DEFAULT_SESSION_COLORS
 from .views import VIEW_GROUPS, VIEWS
 from .workflows.plan_synthesis_panel import PlanSynthesisPanel
 from .workflows.config_tuning_panel import ConfigTuningPanel
+from .workflows.report.generation_worker import ReportGenerationWorker
+from .workflows.report.wizard import ReportWizardDialog
 
 MAX_SESSIONS = 5
 FROZEN = getattr(sys, "frozen", False)
@@ -70,6 +75,10 @@ else:
 
 # Analysis launcher button grid (see VIEW_GROUPS for workflow sections).
 _VIEW_GRID_COLS = 2
+
+_MAIN_TAB_DATA_ANALYSIS = "Data Analysis"
+_MAIN_TAB_PLAN_SYNTHESIS = "Plan Synthesis"
+_MAIN_TAB_CONFIG_TUNING = "Configuration Tuning"
 
 # Batched session rows emitted from discovery thread (keep small so each UI slot stays short).
 _SESSION_ROW_BATCH = 24
@@ -342,6 +351,12 @@ class ScanKitMainWindow(QMainWindow):
         self._meta_col_resize_timer: QTimer | None = None
         self._status_refresh_timer: QTimer | None = None
         self._row_by_sid: dict[str, int] = {}
+        self._report_generating = False
+        self._report_thread: QThread | None = None
+        self._report_worker: ReportGenerationWorker | None = None
+        self._report_progress: QProgressDialog | None = None
+        self._app_settings = AppSettings.load()
+        self._main_tabs: QTabWidget | None = None
 
         boot = QWidget()
         boot_l = QVBoxLayout(boot)
@@ -409,15 +424,44 @@ class ScanKitMainWindow(QMainWindow):
 
     def _build_ui(self) -> None:
         tabs = QTabWidget()
-        tabs.addTab(self._build_data_analysis_tab(), "Data Analysis")
-        tabs.addTab(self._build_plan_synthesis_tab(), "Plan Synthesis")
-        self._config_tuning_panel = ConfigTuningPanel()
+        tabs.addTab(self._build_data_analysis_tab(), _MAIN_TAB_DATA_ANALYSIS)
+        tabs.addTab(self._build_plan_synthesis_tab(), _MAIN_TAB_PLAN_SYNTHESIS)
+        self._config_tuning_panel = ConfigTuningPanel(app_settings=self._app_settings)
         self._config_tuning_panel.set_session_data_dir(self._base_dir)
-        tabs.addTab(self._config_tuning_panel, "Configuration Tuning")
+        tabs.addTab(self._config_tuning_panel, _MAIN_TAB_CONFIG_TUNING)
+        self._main_tabs = tabs
+        self._restore_main_tab()
+        tabs.currentChanged.connect(self._on_main_tab_changed)
         self.setCentralWidget(tabs)
 
         for seq in ("Esc", "Ctrl+Q"):
             QShortcut(QKeySequence(seq), self, activated=self.close)
+
+    def _restore_main_tab(self) -> None:
+        tabs = self._main_tabs
+        saved = self._app_settings.last_main_tab
+        if tabs is None or not saved:
+            return
+        for i in range(tabs.count()):
+            if tabs.tabText(i) == saved:
+                tabs.setCurrentIndex(i)
+                return
+
+    def _persist_main_tab(self) -> None:
+        tabs = self._main_tabs
+        if tabs is None:
+            return
+        index = tabs.currentIndex()
+        if index < 0:
+            return
+        self._app_settings.last_main_tab = tabs.tabText(index)
+        try:
+            self._app_settings.save()
+        except Exception:
+            pass
+
+    def _on_main_tab_changed(self, _index: int) -> None:
+        self._persist_main_tab()
 
     def _build_data_analysis_tab(self) -> QWidget:
         tab = QWidget()
@@ -455,6 +499,16 @@ class ScanKitMainWindow(QMainWindow):
         refresh_btn.clicked.connect(self._incremental_refresh_sessions)
         data_dir_row.addWidget(refresh_btn)
         left_l.addLayout(data_dir_row)
+
+        report_row = QHBoxLayout()
+        self._report_btn = QPushButton("Generate Report…")
+        self._report_btn.setToolTip(
+            "Build a PDF report from selected sessions and analysis views"
+        )
+        self._report_btn.clicked.connect(self._on_generate_report)
+        report_row.addWidget(self._report_btn)
+        report_row.addStretch(1)
+        left_l.addLayout(report_row)
 
         self.session_table = QTableWidget()
         self.session_table.setColumnCount(6)
@@ -1246,6 +1300,100 @@ class ScanKitMainWindow(QMainWindow):
         box.setIcon(QMessageBox.Icon.Critical if error else QMessageBox.Icon.Warning)
         box.exec()
 
+    def _session_meta_by_sid(self) -> dict[str, SessionMeta | None]:
+        return {sid: meta for sid, _, meta in self._discovered}
+
+    def _on_generate_report(self) -> None:
+        if self._report_generating:
+            self._notify("Report generation already in progress")
+            return
+
+        session_ids = self._selected_sids_in_order()
+        if not session_ids:
+            self._notify(
+                f"Select 1-{MAX_SESSIONS} sessions first (use the checkboxes)"
+            )
+            return
+
+        wizard = ReportWizardDialog(
+            session_ids=session_ids,
+            base_dir=self._base_dir,
+            settings=self._settings,
+            session_meta=self._session_meta_by_sid(),
+            notes=dict(self._notes),
+            last_report_dir=self._app_settings.last_report_dir,
+            parent=self,
+        )
+        if wizard.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        config = wizard.config
+        if config is None:
+            return
+
+        self._report_generating = True
+        self._report_btn.setEnabled(False)
+
+        progress = QProgressDialog("Preparing report…", None, 0, 100, self)
+        progress.setWindowTitle("Generate Report")
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(True)
+        progress.setAutoReset(True)
+        progress.setCancelButton(None)
+        progress.setValue(0)
+        self._report_progress = progress
+
+        thread = QThread(self)
+        worker = ReportGenerationWorker(config)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.progress.connect(self._on_report_progress)
+        worker.finished.connect(self._on_report_finished)
+        worker.failed.connect(self._on_report_failed)
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        worker.finished.connect(progress.close)
+        worker.failed.connect(progress.close)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._clear_report_thread)
+        self._report_thread = thread
+        self._report_worker = worker
+        thread.start()
+        progress.show()
+
+    def _on_report_progress(self, value: int, message: str) -> None:
+        if self._report_progress is not None:
+            self._report_progress.setLabelText(message)
+            self._report_progress.setValue(value)
+
+    def _release_report_state(self) -> None:
+        self._report_generating = False
+        self._report_btn.setEnabled(True)
+        self._report_progress = None
+
+    def _on_report_finished(self, output_path: str) -> None:
+        self._release_report_state()
+        try:
+            self._app_settings.last_report_dir = str(Path(output_path).parent)
+            self._app_settings.save()
+        except Exception:
+            pass
+        QMessageBox.information(
+            self,
+            "Report complete",
+            f"PDF report saved to:\n{output_path}",
+        )
+
+    def _on_report_failed(self, message: str) -> None:
+        self._release_report_state()
+        QMessageBox.critical(self, "Report failed", message)
+
+    def _clear_report_thread(self) -> None:
+        self._report_thread = None
+        self._report_worker = None
+
     def _on_view_clicked(self, module_name: str) -> None:
         if module_name in self._running_views:
             self._notify("Already running")
@@ -1430,6 +1578,7 @@ class ScanKitMainWindow(QMainWindow):
         if panel is not None and not panel.confirm_discard_if_dirty():
             event.ignore()
             return
+        self._persist_main_tab()
         self._shutdown_children()
         super().closeEvent(event)
 

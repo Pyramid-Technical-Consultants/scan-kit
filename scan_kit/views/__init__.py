@@ -44,6 +44,7 @@ VIEW_GROUPS: list[tuple[str, list[ViewEntry]]] = [
             ("Dose Error vs Energy (mean)", "dose_error_energy_mean"),
             ("Dose Error vs Target MU", "dose_error_mu"),
             ("Dose Accumulation", "dose_accumulation"),
+            ("MU Delivery Rate vs Energy", "mu_delivery_rate_energy"),
         ],
     ),
     (

@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import json
+import time
+from pathlib import Path
 from typing import Any, Callable
 
 from PySide6.QtCore import Qt
+from PySide6.QtGui import QPalette
 from PySide6.QtWidgets import (
     QButtonGroup,
     QCheckBox,
@@ -93,7 +97,37 @@ class ParamFormWidget(QWidget):
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(8)
+        outer.setAlignment(Qt.AlignmentFlag.AlignTop)
+        self.setAutoFillBackground(False)
+        pal = self.palette()
+        window_color = pal.color(QPalette.ColorRole.Window)
+        pal.setColor(QPalette.ColorRole.Base, window_color)
+        self.setPalette(pal)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
+
+        # region agent log
+        try:
+            log_path = Path(__file__).resolve().parents[2] / "debug-70ba5d.log"
+            payload = {
+                "sessionId": "70ba5d",
+                "hypothesisId": "H3",
+                "location": "param_form.py:ParamFormWidget.__init__",
+                "message": "param form background init",
+                "data": {
+                    "autoFillBackground": self.autoFillBackground(),
+                    "base": self.palette().color(QPalette.ColorRole.Base).name(),
+                    "window": window_color.name(),
+                    "sizeHint": [self.sizeHint().width(), self.sizeHint().height()],
+                    "fieldSetCount": len(PARAM_FIELD_SET_ORDER),
+                },
+                "timestamp": int(time.time() * 1000),
+                "runId": "pre-fix",
+            }
+            with log_path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(payload) + "\n")
+        except OSError:
+            pass
+        # endregion
 
         label_width = self._label_column_width(specs)
         initial = values or {}
@@ -113,7 +147,9 @@ class ParamFormWidget(QWidget):
             form.setHorizontalSpacing(0)
             self._populate_form(form, group_specs, initial, label_width, field_set)
             self._field_set_boxes[field_set] = box
-            outer.addWidget(box)
+            outer.addWidget(box, alignment=Qt.AlignmentFlag.AlignTop)
+
+        outer.addStretch(1)
 
         self._connect_visibility_watchers()
         self._refresh_visibility()
