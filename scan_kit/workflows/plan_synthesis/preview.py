@@ -9,9 +9,8 @@ import pandas as pd
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import QHeaderView, QLabel, QTableWidget, QTableWidgetItem
 
-from .input_map import plan_summary
+from .input_map import INPUT_MAP_EXPORT_COLUMNS, input_map_export_frame, plan_summary
 
-_PREVIEW_COLUMNS = ("ENERGY", "X_POSITION", "Y_POSITION", "CHARGE_REQ", "spot_no")
 PREVIEW_ROW_CAP = 5_000
 _PREVIEW_BATCH_SIZE = 200
 _RESIZE_TO_CONTENTS_MAX_ROWS = 1_000
@@ -34,11 +33,20 @@ def format_plan_summary(
 
 
 def _format_cell(col: str, val: object) -> str:
-    if col == "CHARGE_REQ":
+    if col == "CHARGE_REQ(MU)":
         return f"{float(val):.4f}"
-    if col in ("ENERGY", "X_POSITION", "Y_POSITION"):
+    if col in (
+        "ENERGY(MeV)",
+        "CURRENT(A)",
+        "BEAM_SIZE(mm)",
+        "X_POSITION(mm)",
+        "Y_POSITION(mm)",
+        "VELOCITY(mm/s)",
+    ):
         return f"{float(val):g}"
-    return str(int(val))  # spot_no
+    if col == "#NO":
+        return str(int(val))
+    return str(val)
 
 
 def clear_preview_table(table: QTableWidget) -> None:
@@ -46,17 +54,17 @@ def clear_preview_table(table: QTableWidget) -> None:
     table.setSortingEnabled(False)
     table.clearContents()
     table.setRowCount(0)
-    table.setColumnCount(len(_PREVIEW_COLUMNS))
-    table.setHorizontalHeaderLabels(list(_PREVIEW_COLUMNS))
+    table.setColumnCount(len(INPUT_MAP_EXPORT_COLUMNS))
+    table.setHorizontalHeaderLabels(list(INPUT_MAP_EXPORT_COLUMNS))
 
 
 def _apply_preview_header_modes(table: QTableWidget, *, n_rows: int) -> None:
     hh = table.horizontalHeader()
     if n_rows <= _RESIZE_TO_CONTENTS_MAX_ROWS:
-        for col in range(len(_PREVIEW_COLUMNS)):
+        for col in range(len(INPUT_MAP_EXPORT_COLUMNS)):
             hh.setSectionResizeMode(col, QHeaderView.ResizeMode.ResizeToContents)
         return
-    for col in range(len(_PREVIEW_COLUMNS)):
+    for col in range(len(INPUT_MAP_EXPORT_COLUMNS)):
         hh.setSectionResizeMode(col, QHeaderView.ResizeMode.Interactive)
     hh.setStretchLastSection(True)
 
@@ -68,18 +76,18 @@ def fill_preview_table(table: QTableWidget, df: pd.DataFrame | None) -> int:
         return 0
 
     n_show = min(len(df), PREVIEW_ROW_CAP)
-    preview = df.iloc[:n_show]
+    preview = input_map_export_frame(df).iloc[:n_show]
 
     table.setSortingEnabled(False)
     table.clearContents()
-    table.setColumnCount(len(_PREVIEW_COLUMNS))
-    table.setHorizontalHeaderLabels(list(_PREVIEW_COLUMNS))
+    table.setColumnCount(len(INPUT_MAP_EXPORT_COLUMNS))
+    table.setHorizontalHeaderLabels(list(INPUT_MAP_EXPORT_COLUMNS))
     table.setRowCount(n_show)
 
     flags = Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
     table.setUpdatesEnabled(False)
     try:
-        for col_idx, col in enumerate(_PREVIEW_COLUMNS):
+        for col_idx, col in enumerate(INPUT_MAP_EXPORT_COLUMNS):
             column = preview[col].values
             for row_idx in range(n_show):
                 item = QTableWidgetItem(_format_cell(col, column[row_idx]))
@@ -118,13 +126,13 @@ def start_preview_table_fill(
         return
 
     n_show = min(len(df), PREVIEW_ROW_CAP)
-    preview = df.iloc[:n_show]
-    columns = {col: preview[col].values for col in _PREVIEW_COLUMNS}
+    preview = input_map_export_frame(df).iloc[:n_show]
+    columns = {col: preview[col].values for col in INPUT_MAP_EXPORT_COLUMNS}
 
     table.setSortingEnabled(False)
     table.clearContents()
-    table.setColumnCount(len(_PREVIEW_COLUMNS))
-    table.setHorizontalHeaderLabels(list(_PREVIEW_COLUMNS))
+    table.setColumnCount(len(INPUT_MAP_EXPORT_COLUMNS))
+    table.setHorizontalHeaderLabels(list(INPUT_MAP_EXPORT_COLUMNS))
     table.setRowCount(n_show)
     table.setUpdatesEnabled(False)
 
@@ -147,7 +155,7 @@ def start_preview_table_fill(
             if not is_current():
                 finish_updates()
                 return
-            for col_idx, col in enumerate(_PREVIEW_COLUMNS):
+            for col_idx, col in enumerate(INPUT_MAP_EXPORT_COLUMNS):
                 item = QTableWidgetItem(_format_cell(col, columns[col][row_idx]))
                 item.setFlags(flags)
                 table.setItem(row_idx, col_idx, item)

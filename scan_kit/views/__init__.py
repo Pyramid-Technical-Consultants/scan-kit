@@ -19,6 +19,7 @@ _HAS_AUDIO = importlib.util.find_spec("scan_kit.views.ic_audio_export") is not N
 # Workflow-oriented groups for the launcher (flat VIEWS is derived below).
 _VIEW_NOISE: list[ViewEntry] = [
     ("IC Current FFT Analysis", "ic_fft_analysis"),
+    ("IC Peak Amplitude — Beam-Off (G3)", "ic_peak_amplitude_beam_off"),
 ]
 if _HAS_AUDIO:
     _VIEW_NOISE.append(("IC Audio Export (WAV)", "ic_audio_export"))

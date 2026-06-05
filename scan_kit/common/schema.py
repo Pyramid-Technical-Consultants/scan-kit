@@ -82,6 +82,19 @@ C_IC1_Y_POS = "ic1_y_pos"
 C_IC2_X_POS = "ic2_x_pos"
 C_IC2_Y_POS = "ic2_y_pos"
 
+# G3 timeslice only: pre-filter strip peak (nA). G2 uses post-filter amplitude.
+C_IC1_X_PEAK_AMPLITUDE = "ic1_x_peak_amplitude"
+C_IC1_Y_PEAK_AMPLITUDE = "ic1_y_peak_amplitude"
+C_IC2_X_PEAK_AMPLITUDE = "ic2_x_peak_amplitude"
+C_IC2_Y_PEAK_AMPLITUDE = "ic2_y_peak_amplitude"
+
+IC_PEAK_AMPLITUDE_COLUMNS = (
+    C_IC1_X_PEAK_AMPLITUDE,
+    C_IC1_Y_PEAK_AMPLITUDE,
+    C_IC2_X_PEAK_AMPLITUDE,
+    C_IC2_Y_PEAK_AMPLITUDE,
+)
+
 # Prescribed plan positions from input_map
 C_X_POSITION = "x_position"
 C_Y_POSITION = "y_position"
@@ -148,6 +161,10 @@ _CONCEPT_ALIASES_STATIC: dict[str, tuple[str, ...]] = {
     ),
     C_X_POSITION: ("X_POSITION", "x_position", "xposition", "x_pos", "planned_x"),
     C_Y_POSITION: ("Y_POSITION", "y_position", "yposition", "y_pos", "planned_y"),
+    C_IC1_X_PEAK_AMPLITUDE: ("r_ic1_x_peak_amplitude", "ic1_x_peak_amplitude"),
+    C_IC1_Y_PEAK_AMPLITUDE: ("r_ic1_y_peak_amplitude", "ic1_y_peak_amplitude"),
+    C_IC2_X_PEAK_AMPLITUDE: ("r_ic2_x_peak_amplitude", "ic2_x_peak_amplitude"),
+    C_IC2_Y_PEAK_AMPLITUDE: ("r_ic2_y_peak_amplitude", "ic2_y_peak_amplitude"),
 }
 
 

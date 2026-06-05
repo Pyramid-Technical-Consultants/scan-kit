@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, QThread
+from PySide6.QtCore import QEvent, Qt, QThread
 from PySide6.QtGui import QPalette
 from PySide6.QtWidgets import (
     QFileDialog,
@@ -12,6 +12,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QProgressDialog,
     QPushButton,
+    QScrollArea,
     QSizePolicy,
     QSplitter,
     QTableWidget,
@@ -148,8 +149,26 @@ class PlanSynthesisPanel(QWidget):
         self._param_host_l = QVBoxLayout(self._param_host)
         self._param_host_l.setContentsMargins(0, 0, 0, 0)
         self._param_host_l.setSpacing(0)
-        params_l.addWidget(self._param_host, alignment=Qt.AlignmentFlag.AlignTop)
-        params_l.addStretch(1)
+        self._param_host.setSizePolicy(
+            QSizePolicy.Policy.Preferred,
+            QSizePolicy.Policy.Minimum,
+        )
+
+        self._param_scroll = QScrollArea()
+        self._param_scroll.setWidget(self._param_host)
+        self._param_scroll.setWidgetResizable(False)
+        self._param_scroll.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
+        self._param_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self._param_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        self._param_scroll.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Expanding,
+        )
+        params_l.addWidget(self._param_scroll, stretch=1)
 
         left_splitter.addWidget(params_host)
 
@@ -191,6 +210,18 @@ class PlanSynthesisPanel(QWidget):
         if self._templates:
             self._template_list.setCurrentRow(0)
 
+        self._param_scroll.viewport().installEventFilter(self)
+
+    def eventFilter(self, watched, event) -> bool:  # type: ignore[no-untyped-def]
+        if watched is self._param_scroll.viewport() and event.type() == QEvent.Type.Resize:
+            self._sync_param_host_width()
+        return super().eventFilter(watched, event)
+
+    def _sync_param_host_width(self) -> None:
+        viewport_width = self._param_scroll.viewport().width()
+        if viewport_width > 0:
+            self._param_host.setFixedWidth(viewport_width)
+
     def _on_template_changed(self, row: int) -> None:
         if row < 0 or row >= len(self._templates):
             self._current = None
@@ -220,6 +251,8 @@ class PlanSynthesisPanel(QWidget):
         self._param_host_l.addWidget(
             form, alignment=Qt.AlignmentFlag.AlignTop,
         )
+        self._sync_param_host_width()
+        self._param_host.adjustSize()
 
     def _read_params(self) -> dict:
         if self._param_form is None or self._current is None:

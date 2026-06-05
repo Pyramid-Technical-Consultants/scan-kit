@@ -8,7 +8,9 @@ import pandas as pd
 import pytest
 
 from scan_kit.workflows.plan_synthesis.input_map import (
+    DEFAULT_CURRENT_A,
     INPUT_MAP_COLUMNS,
+    INPUT_MAP_EXPORT_COLUMNS,
     order_input_map_by_energy,
     write_input_map_csv,
 )
@@ -17,7 +19,18 @@ from scan_kit.workflows.plan_synthesis.energies import (
     TEN_MEV_STEP_ENERGIES_MEV,
     WHOLE_MEV_STEP_ENERGIES_MEV,
 )
-from scan_kit.workflows.plan_synthesis.layouts.rectangular_field import rectangular_grid_positions
+from scan_kit.workflows.plan_synthesis.layouts.rectangular_field import (
+    FAST_AXIS_X,
+    FAST_AXIS_Y,
+    LAYER_TRANSITION_CONTINUE,
+    LAYER_TRANSITION_RESET,
+    START_CORNER_BOTTOM_LEFT,
+    START_CORNER_BOTTOM_RIGHT,
+    START_CORNER_TOP_LEFT,
+    START_CORNER_TOP_RIGHT,
+    positions_for_layer,
+    rectangular_grid_positions,
+)
 from scan_kit.workflows.plan_synthesis.registry import get_template
 from scan_kit.workflows.plan_synthesis.spot_weight import (
     SPOT_WEIGHT_METHOD_EVEN_TOTAL,
@@ -88,11 +101,9 @@ def test_zero_field_generates_origin_spots(zero_field) -> None:
     assert (df["X_POSITION"] == 0.0).all()
     assert (df["Y_POSITION"] == 0.0).all()
     assert (df["CHARGE_REQ"] == 0.02).all()
-    assert (df["CURRENT"] == 0.0).all()
+    assert (df["CURRENT"] == DEFAULT_CURRENT_A).all()
+    assert (df["BEAM_SIZE"] == 3.61).all()
     assert (df["VELOCITY"] == 0.0).all()
-    assert (df["beam_off"] == 1.0).all()
-    assert (df["map_checksum"] == 0).all()
-    assert (df[""] == "").all()
     assert df["spot_no"].tolist() == list(range(30))
     assert df["layer_id"].nunique() == 3
     assert df["ENERGY"].tolist()[0] == 250.0
@@ -128,6 +139,166 @@ def test_rectangular_field_grid_positions() -> None:
     ys = sorted({p[1] for p in positions})
     assert xs == pytest.approx([-10.0, 0.0, 10.0])
     assert ys == pytest.approx([-10.0, 0.0, 10.0])
+
+
+def test_rectangular_field_serpentine_fast_x() -> None:
+    positions = rectangular_grid_positions(
+        center_x_mm=0.0,
+        center_y_mm=0.0,
+        field_width_mm=20.0,
+        field_height_mm=20.0,
+        spots_x=3,
+        spots_y=3,
+        fast_axis=FAST_AXIS_X,
+    )
+    assert positions == pytest.approx(
+        [
+            (-10.0, 10.0),
+            (0.0, 10.0),
+            (10.0, 10.0),
+            (10.0, 0.0),
+            (0.0, 0.0),
+            (-10.0, 0.0),
+            (-10.0, -10.0),
+            (0.0, -10.0),
+            (10.0, -10.0),
+        ]
+    )
+
+
+def test_rectangular_field_serpentine_start_corners_fast_x() -> None:
+    kwargs = dict(
+        center_x_mm=0.0,
+        center_y_mm=0.0,
+        field_width_mm=20.0,
+        field_height_mm=20.0,
+        spots_x=3,
+        spots_y=2,
+        fast_axis=FAST_AXIS_X,
+    )
+    assert rectangular_grid_positions(
+        **kwargs, start_corner=START_CORNER_BOTTOM_RIGHT
+    ) == pytest.approx(
+        [
+            (10.0, -10.0),
+            (0.0, -10.0),
+            (-10.0, -10.0),
+            (-10.0, 10.0),
+            (0.0, 10.0),
+            (10.0, 10.0),
+        ]
+    )
+    assert rectangular_grid_positions(
+        **kwargs, start_corner=START_CORNER_TOP_LEFT
+    ) == pytest.approx(
+        [
+            (-10.0, 10.0),
+            (0.0, 10.0),
+            (10.0, 10.0),
+            (10.0, -10.0),
+            (0.0, -10.0),
+            (-10.0, -10.0),
+        ]
+    )
+    assert rectangular_grid_positions(
+        **kwargs, start_corner=START_CORNER_TOP_RIGHT
+    ) == pytest.approx(
+        [
+            (10.0, 10.0),
+            (0.0, 10.0),
+            (-10.0, 10.0),
+            (-10.0, -10.0),
+            (0.0, -10.0),
+            (10.0, -10.0),
+        ]
+    )
+
+
+def test_rectangular_field_serpentine_start_corners_fast_y() -> None:
+    kwargs = dict(
+        center_x_mm=0.0,
+        center_y_mm=0.0,
+        field_width_mm=20.0,
+        field_height_mm=20.0,
+        spots_x=2,
+        spots_y=3,
+        fast_axis=FAST_AXIS_Y,
+    )
+    assert rectangular_grid_positions(
+        **kwargs, start_corner=START_CORNER_TOP_LEFT
+    ) == pytest.approx(
+        [
+            (-10.0, 10.0),
+            (-10.0, 0.0),
+            (-10.0, -10.0),
+            (10.0, -10.0),
+            (10.0, 0.0),
+            (10.0, 10.0),
+        ]
+    )
+    assert rectangular_grid_positions(
+        **kwargs, start_corner=START_CORNER_BOTTOM_RIGHT
+    ) == pytest.approx(
+        [
+            (10.0, -10.0),
+            (10.0, 0.0),
+            (10.0, 10.0),
+            (-10.0, 10.0),
+            (-10.0, 0.0),
+            (-10.0, -10.0),
+        ]
+    )
+
+
+def test_rectangular_field_serpentine_fast_y() -> None:
+    positions = rectangular_grid_positions(
+        center_x_mm=0.0,
+        center_y_mm=0.0,
+        field_width_mm=20.0,
+        field_height_mm=20.0,
+        spots_x=3,
+        spots_y=3,
+        fast_axis=FAST_AXIS_Y,
+    )
+    assert positions == pytest.approx(
+        [
+            (-10.0, 10.0),
+            (-10.0, 0.0),
+            (-10.0, -10.0),
+            (0.0, -10.0),
+            (0.0, 0.0),
+            (0.0, 10.0),
+            (10.0, 10.0),
+            (10.0, 0.0),
+            (10.0, -10.0),
+        ]
+    )
+
+
+def _manhattan_path_length(positions: list[tuple[float, float]]) -> float:
+    total = 0.0
+    for (x0, y0), (x1, y1) in zip(positions, positions[1:]):
+        total += abs(x1 - x0) + abs(y1 - y0)
+    return total
+
+
+def test_rectangular_field_serpentine_reduces_travel() -> None:
+    kwargs = dict(
+        center_x_mm=0.0,
+        center_y_mm=0.0,
+        field_width_mm=100.0,
+        field_height_mm=100.0,
+        spots_x=11,
+        spots_y=11,
+    )
+    serpentine = rectangular_grid_positions(**kwargs, fast_axis=FAST_AXIS_X)
+    row_major = []
+    xs = sorted({p[0] for p in serpentine})
+    ys = sorted({p[1] for p in serpentine})
+    for y in ys:
+        for x in xs:
+            row_major.append((x, y))
+    assert _manhattan_path_length(serpentine) < _manhattan_path_length(row_major)
 
 
 def test_rectangular_field_generates_grid(rectangular_field) -> None:
@@ -176,6 +347,58 @@ def test_zero_field_layers_ordered_high_to_low(zero_field) -> None:
     assert df["spot_no"].tolist() == list(range(len(df)))
 
 
+def test_positions_for_layer_continue_alternates_direction() -> None:
+    base = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0)]
+    assert positions_for_layer(
+        base, 0, layer_transition=LAYER_TRANSITION_CONTINUE
+    ) == base
+    assert positions_for_layer(
+        base, 1, layer_transition=LAYER_TRANSITION_CONTINUE
+    ) == list(reversed(base))
+    assert positions_for_layer(
+        base, 2, layer_transition=LAYER_TRANSITION_CONTINUE
+    ) == base
+    assert positions_for_layer(
+        base, 1, layer_transition=LAYER_TRANSITION_RESET
+    ) == base
+
+
+def test_rectangular_field_layer_transition_continue(rectangular_field) -> None:
+    params = _fixed_weight_params(
+        selected_energies=[250.0, 200.0],
+        center_x_mm=0.0,
+        center_y_mm=0.0,
+        field_width_mm=20.0,
+        field_height_mm=20.0,
+        spots_x=2,
+        spots_y=2,
+        layer_transition=LAYER_TRANSITION_CONTINUE,
+    )
+    df = rectangular_field.generate(params)
+    base = rectangular_grid_positions(
+        center_x_mm=0.0,
+        center_y_mm=0.0,
+        field_width_mm=20.0,
+        field_height_mm=20.0,
+        spots_x=2,
+        spots_y=2,
+        fast_axis=FAST_AXIS_X,
+    )
+    high_layer = df[df["ENERGY"] == 250.0]
+    low_layer = df[df["ENERGY"] == 200.0]
+    high_positions = [
+        (float(x), float(y))
+        for x, y in high_layer[["X_POSITION", "Y_POSITION"]].itertuples(index=False)
+    ]
+    low_positions = [
+        (float(x), float(y))
+        for x, y in low_layer[["X_POSITION", "Y_POSITION"]].itertuples(index=False)
+    ]
+    assert high_positions == pytest.approx(base)
+    assert low_positions == pytest.approx(list(reversed(base)))
+    assert high_positions[-1] == low_positions[0]
+
+
 def test_rectangular_field_preserves_grid_within_layer(rectangular_field) -> None:
     params = _fixed_weight_params(
         selected_energies=[200.0, 250.0],
@@ -199,6 +422,7 @@ def test_rectangular_field_preserves_grid_within_layer(rectangular_field) -> Non
         field_height_mm=20.0,
         spots_x=2,
         spots_y=2,
+        fast_axis=FAST_AXIS_X,
     )
     actual_positions = [
         (float(x), float(y))
@@ -221,8 +445,9 @@ def test_write_input_map_csv_reorders_layers(tmp_path: Path, zero_field) -> None
     write_input_map_csv(shuffled, out)
     loaded = pd.read_csv(out)
 
-    assert loaded["ENERGY"].tolist() == [250.0, 70.0]
-    assert loaded["spot_no"].tolist() == [0, 1]
+    assert list(loaded.columns) == list(INPUT_MAP_EXPORT_COLUMNS)
+    assert loaded["ENERGY(MeV)"].tolist() == [250.0, 70.0]
+    assert loaded["#NO"].tolist() == [1, 2]
 
 
 def test_order_input_map_by_energy_is_stable() -> None:
@@ -230,23 +455,31 @@ def test_order_input_map_by_energy_is_stable() -> None:
         {
             "ENERGY": [100.0, 100.0, 200.0, 200.0],
             "CURRENT": [0.0] * 4,
-            "BEAM_SIZE_X": [3.61] * 4,
-            "BEAM_SIZE_Y": [3.61] * 4,
+            "BEAM_SIZE": [3.61] * 4,
             "X_POSITION": [1.0, 2.0, 3.0, 4.0],
             "Y_POSITION": [0.0] * 4,
             "CHARGE_REQ": [0.01] * 4,
             "VELOCITY": [0.0] * 4,
             "spot_no": [0, 1, 2, 3],
             "layer_id": [1, 1, 2, 2],
-            "beam_off": [1.0] * 4,
-            "map_checksum": [0] * 4,
-            "": [""] * 4,
         }
     )
     ordered = order_input_map_by_energy(df)
     assert ordered["ENERGY"].tolist() == [200.0, 200.0, 100.0, 100.0]
     assert ordered["X_POSITION"].tolist() == pytest.approx([3.0, 4.0, 1.0, 2.0])
     assert ordered["spot_no"].tolist() == [0, 1, 2, 3]
+
+
+def test_write_input_map_csv_header_order(tmp_path: Path, zero_field) -> None:
+    params = _fixed_weight_params(
+        selected_energies=[250.0],
+        spots_per_layer=1,
+    )
+    df = zero_field.generate(params)
+    out = tmp_path / "input_map.csv"
+    write_input_map_csv(df, out)
+    header = out.read_text(encoding="utf-8").splitlines()[0]
+    assert header == ",".join(INPUT_MAP_EXPORT_COLUMNS)
 
 
 def test_write_input_map_csv_round_trip(tmp_path: Path, zero_field) -> None:
@@ -259,7 +492,8 @@ def test_write_input_map_csv_round_trip(tmp_path: Path, zero_field) -> None:
     write_input_map_csv(df, out)
     loaded = pd.read_csv(out)
     assert len(loaded) == 4
-    assert list(loaded.columns[: len(INPUT_MAP_COLUMNS) - 1]) == list(INPUT_MAP_COLUMNS[:-1])
+    assert list(loaded.columns) == list(INPUT_MAP_EXPORT_COLUMNS)
+    assert loaded["#NO"].tolist() == [1, 2, 3, 4]
 
 
 def test_spot_weight_fixed() -> None:
@@ -431,6 +665,137 @@ def test_both_templates_expose_spot_weight_method(zero_field, rectangular_field)
         assert "spot_weight_layer_shuffle" in keys
 
 
+def test_rectangular_field_layer_transition_button_group(rectangular_field) -> None:
+    import sys
+
+    from PySide6.QtWidgets import QApplication, QRadioButton
+
+    from scan_kit.workflows.plan_synthesis.param_form import ParamFormWidget
+
+    app = QApplication.instance() or QApplication(sys.argv)
+    form = ParamFormWidget(rectangular_field.param_specs(), rectangular_field.default_params())
+    app.processEvents()
+
+    transition_buttons = {
+        button.text(): button
+        for button in form.findChildren(QRadioButton)
+        if button.text() in {"Reset to Corner", "Continue from End"}
+    }
+    assert set(transition_buttons) == {"Reset to Corner", "Continue from End"}
+    assert transition_buttons["Reset to Corner"].isChecked()
+
+    transition_buttons["Continue from End"].click()
+    app.processEvents()
+    assert form.read_params()["layer_transition"] == LAYER_TRANSITION_CONTINUE
+
+
+def test_rectangular_field_start_corner_button_group(rectangular_field) -> None:
+    import sys
+
+    from PySide6.QtWidgets import QApplication, QRadioButton
+
+    from scan_kit.workflows.plan_synthesis.param_form import ParamFormWidget
+
+    app = QApplication.instance() or QApplication(sys.argv)
+    form = ParamFormWidget(rectangular_field.param_specs(), rectangular_field.default_params())
+    app.processEvents()
+
+    corner_buttons = {
+        button.text(): button
+        for button in form.findChildren(QRadioButton)
+        if button.text() in {"Top Left", "Top Right", "Bottom Left", "Bottom Right"}
+    }
+    assert set(corner_buttons) == {
+        "Top Left",
+        "Top Right",
+        "Bottom Left",
+        "Bottom Right",
+    }
+    assert corner_buttons["Top Left"].isChecked()
+
+    corner_buttons["Top Right"].click()
+    app.processEvents()
+    assert form.read_params()["start_corner"] == START_CORNER_TOP_RIGHT
+
+
+def test_rectangular_field_fast_axis_button_group(rectangular_field) -> None:
+    import sys
+
+    from PySide6.QtWidgets import QApplication, QRadioButton
+
+    from scan_kit.workflows.plan_synthesis.param_form import ParamFormWidget
+
+    app = QApplication.instance() or QApplication(sys.argv)
+    params = rectangular_field.default_params()
+    params["fast_axis"] = FAST_AXIS_X
+    form = ParamFormWidget(rectangular_field.param_specs(), params)
+    app.processEvents()
+
+    axis_buttons = {
+        button.text(): button
+        for button in form.findChildren(QRadioButton)
+        if button.text() in {"X", "Y"}
+    }
+    assert set(axis_buttons) == {"X", "Y"}
+    assert axis_buttons["X"].isChecked()
+    assert not axis_buttons["Y"].isChecked()
+
+    axis_buttons["Y"].click()
+    app.processEvents()
+    assert form.read_params()["fast_axis"] == FAST_AXIS_Y
+
+
+def test_rectangular_field_geometry_quick_set_buttons(rectangular_field) -> None:
+    import sys
+
+    from PySide6.QtWidgets import QApplication, QPushButton
+
+    from scan_kit.workflows.plan_synthesis.param_form import ParamFormWidget
+
+    app = QApplication.instance() or QApplication(sys.argv)
+    params = rectangular_field.default_params()
+    params["field_width_mm"] = 50.0
+    params["field_height_mm"] = 60.0
+    params["spots_x"] = 5
+    params["spots_y"] = 6
+    params["center_x_mm"] = 10.0
+    params["center_y_mm"] = -5.0
+    form = ParamFormWidget(rectangular_field.param_specs(), params)
+    app.processEvents()
+
+    button_labels = {button.text() for button in form.findChildren(QPushButton)}
+    assert {"100", "200", "250", "300"}.issubset(button_labels)
+    assert {"3", "7", "11", "33"}.issubset(button_labels)
+    assert "0,0" in button_labels
+
+    for button in form.findChildren(QPushButton):
+        if button.text() == "250":
+            button.click()
+            break
+    app.processEvents()
+    updated = form.read_params()
+    assert updated["field_width_mm"] == 250.0
+    assert updated["field_height_mm"] == 250.0
+
+    for button in form.findChildren(QPushButton):
+        if button.text() == "11":
+            button.click()
+            break
+    app.processEvents()
+    updated = form.read_params()
+    assert updated["spots_x"] == 11
+    assert updated["spots_y"] == 11
+
+    for button in form.findChildren(QPushButton):
+        if button.text() == "0,0":
+            button.click()
+            break
+    app.processEvents()
+    updated = form.read_params()
+    assert updated["center_x_mm"] == 0.0
+    assert updated["center_y_mm"] == 0.0
+
+
 def test_param_form_field_sets_visible_before_show(zero_field) -> None:
     import sys
 
@@ -456,10 +821,14 @@ def _preview_table_df(n_rows: int) -> pd.DataFrame:
     return pd.DataFrame(
         {
             "ENERGY": [200.0] * n_rows,
+            "CURRENT": [DEFAULT_CURRENT_A] * n_rows,
+            "BEAM_SIZE": [3.61] * n_rows,
             "X_POSITION": [0.0] * n_rows,
             "Y_POSITION": [0.0] * n_rows,
             "CHARGE_REQ": [0.01] * n_rows,
+            "VELOCITY": [0.0] * n_rows,
             "spot_no": list(range(n_rows)),
+            "layer_id": [1] * n_rows,
         }
     )
 
@@ -594,6 +963,28 @@ def test_suggest_input_map_filename_respects_max_length(zero_field) -> None:
     assert name.endswith(".csv")
 
 
+def test_fill_preview_table_uses_export_column_order() -> None:
+    import sys
+
+    from PySide6.QtWidgets import QApplication, QTableWidget
+
+    from scan_kit.workflows.plan_synthesis.preview import fill_preview_table
+
+    app = QApplication.instance() or QApplication(sys.argv)
+    table = QTableWidget()
+    df = _preview_table_df(2)
+
+    fill_preview_table(table, df)
+    app.processEvents()
+
+    assert [
+        table.horizontalHeaderItem(col).text()
+        for col in range(table.columnCount())
+    ] == list(INPUT_MAP_EXPORT_COLUMNS)
+    assert table.item(0, 0).text() == "1"
+    assert table.item(1, 0).text() == "2"
+
+
 def test_fill_preview_table_caps_rows() -> None:
     import sys
 
@@ -634,7 +1025,7 @@ def test_start_preview_table_fill_cancels_stale_fill() -> None:
     app.processEvents()
 
     filled_before_cancel = _count_filled_preview_cells(table)
-    assert 0 < filled_before_cancel < 1_000 * 5
+    assert 0 < filled_before_cancel < 1_000 * len(INPUT_MAP_EXPORT_COLUMNS)
 
     current["ok"] = False
     for _ in range(20):

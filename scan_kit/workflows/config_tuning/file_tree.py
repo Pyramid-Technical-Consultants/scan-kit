@@ -45,6 +45,10 @@ class ConfigFileTreeWidget(QWidget):
         self._tree.setRootIndex(index)
         self._tree.expandToDepth(1)
 
+    def clear_selection(self) -> None:
+        self._tree.clearSelection()
+        self._tree.setCurrentIndex(QModelIndex())
+
     def select_relative_path(self, rel_path: str) -> None:
         if self._root is None:
             return

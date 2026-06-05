@@ -412,6 +412,7 @@ class ScanKitMainWindow(QMainWindow):
         tabs.addTab(self._build_data_analysis_tab(), "Data Analysis")
         tabs.addTab(self._build_plan_synthesis_tab(), "Plan Synthesis")
         self._config_tuning_panel = ConfigTuningPanel()
+        self._config_tuning_panel.set_session_data_dir(self._base_dir)
         tabs.addTab(self._config_tuning_panel, "Configuration Tuning")
         self.setCentralWidget(tabs)
 
@@ -587,6 +588,9 @@ class ScanKitMainWindow(QMainWindow):
         path = self.base_dir_input.text().strip()
         if path:
             self._base_dir = path
+            panel = getattr(self, "_config_tuning_panel", None)
+            if panel is not None:
+                panel.set_session_data_dir(self._base_dir)
             self._request_settings_then_scan()
 
     def _on_browse_data_dir(self) -> None:

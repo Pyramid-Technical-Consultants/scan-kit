@@ -8,24 +8,33 @@ from typing import Any
 
 import pandas as pd
 
-# Column order matches reference session input_map.csv (including trailing comma column).
+# Internal column order used while composing plans (layer_id is not exported).
 INPUT_MAP_COLUMNS: tuple[str, ...] = (
     "ENERGY",
     "CURRENT",
-    "BEAM_SIZE_X",
-    "BEAM_SIZE_Y",
+    "BEAM_SIZE",
     "X_POSITION",
     "Y_POSITION",
     "CHARGE_REQ",
     "VELOCITY",
     "spot_no",
     "layer_id",
-    "beam_off",
-    "map_checksum",
-    "",
+)
+
+# Headers written to exported input map CSV files (benchmark / treatment-plan format).
+INPUT_MAP_EXPORT_COLUMNS: tuple[str, ...] = (
+    "#NO",
+    "ENERGY(MeV)",
+    "CURRENT(A)",
+    "BEAM_SIZE(mm)",
+    "X_POSITION(mm)",
+    "Y_POSITION(mm)",
+    "CHARGE_REQ(MU)",
+    "VELOCITY(mm/s)",
 )
 
 DEFAULT_BEAM_SIZE = 3.61
+DEFAULT_CURRENT_A = 1e-9
 
 
 def new_layer_ids(n: int) -> list[int]:
@@ -60,12 +69,30 @@ def order_input_map_by_energy(df: pd.DataFrame) -> pd.DataFrame:
     return ordered[list(INPUT_MAP_COLUMNS)]
 
 
+def input_map_export_frame(df: pd.DataFrame) -> pd.DataFrame:
+    """Map the internal plan frame to the benchmark input map column layout."""
+    ordered = order_input_map_by_energy(df)
+    return pd.DataFrame(
+        {
+            "#NO": ordered["spot_no"] + 1,
+            "ENERGY(MeV)": ordered["ENERGY"],
+            "CURRENT(A)": ordered["CURRENT"],
+            "BEAM_SIZE(mm)": ordered["BEAM_SIZE"],
+            "X_POSITION(mm)": ordered["X_POSITION"],
+            "Y_POSITION(mm)": ordered["Y_POSITION"],
+            "CHARGE_REQ(MU)": ordered["CHARGE_REQ"],
+            "VELOCITY(mm/s)": ordered["VELOCITY"],
+        },
+        columns=list(INPUT_MAP_EXPORT_COLUMNS),
+    )
+
+
 def write_input_map_csv(df: pd.DataFrame, path: str | Path) -> None:
-    """Write *df* as input_map.csv with reference column order."""
+    """Write *df* as an input map CSV in benchmark treatment-plan format."""
     out_path = Path(path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    ordered = order_input_map_by_energy(df)
-    ordered[list(INPUT_MAP_COLUMNS)].to_csv(
+    export = input_map_export_frame(df)
+    export[list(INPUT_MAP_EXPORT_COLUMNS)].to_csv(
         out_path, index=False, lineterminator="\n"
     )
 

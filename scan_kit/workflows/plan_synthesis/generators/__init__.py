@@ -3,7 +3,6 @@
 from .base import ColumnGenerator, SpotLayoutGenerator, SpotRow
 from .charge import SpotWeightGenerator, UniformChargeGenerator
 from .constant import ConstantColumnGenerator
-from .empty import EmptyTrailingColumnGenerator
 from .pass_through import FromRowColumnGenerator
 from .spot_no import SequentialSpotNoGenerator
 
@@ -16,5 +15,4 @@ __all__ = [
     "UniformChargeGenerator",
     "SpotWeightGenerator",
     "SequentialSpotNoGenerator",
-    "EmptyTrailingColumnGenerator",
 ]

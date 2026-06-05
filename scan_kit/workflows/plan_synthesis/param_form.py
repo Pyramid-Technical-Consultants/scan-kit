@@ -6,6 +6,7 @@ from typing import Any, Callable
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
+    QButtonGroup,
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
@@ -14,6 +15,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QPushButton,
+    QRadioButton,
     QSpinBox,
     QSizePolicy,
     QVBoxLayout,
@@ -21,9 +23,55 @@ from PySide6.QtWidgets import (
 )
 
 from .energy_picker import EnergyPickerWidget
-from .params import PARAM_FIELD_SET_LABELS, PARAM_FIELD_SET_ORDER, ParamSpec
+from .params import (
+    PARAM_FIELD_SET_LABELS,
+    PARAM_FIELD_SET_ORDER,
+    ParamSpec,
+    QuickSet,
+)
 
 ReadParamsFn = Callable[[], dict[str, Any]]
+
+
+class _RadioButtonGroupField(QWidget):
+    """Horizontal :class:`QRadioButton` group backed by :class:`QButtonGroup`."""
+
+    def __init__(
+        self,
+        choices: tuple[tuple[Any, str], ...],
+        value: Any,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._value_by_id: dict[int, Any] = {}
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+
+        group = QButtonGroup(self)
+        for index, (choice_value, choice_label) in enumerate(choices):
+            radio = QRadioButton(choice_label)
+            group.addButton(radio, index)
+            self._value_by_id[index] = choice_value
+            layout.addWidget(radio)
+            if choice_value == value:
+                radio.setChecked(True)
+
+        if group.checkedId() < 0 and self._value_by_id:
+            group.button(0).setChecked(True)
+
+        self._group = group
+
+    @property
+    def button_group(self) -> QButtonGroup:
+        return self._group
+
+    def value(self) -> Any:
+        checked_id = self._group.checkedId()
+        if checked_id < 0:
+            return next(iter(self._value_by_id.values()))
+        return self._value_by_id[checked_id]
 
 
 class ParamFormWidget(QWidget):
@@ -100,10 +148,12 @@ class ParamFormWidget(QWidget):
                 )
                 self._editors[spec.key] = left_w
                 self._editors[partner.key] = right_w
+                inline = self._make_inline_pair(spec, partner, left_w, right_w)
+                field = self._wrap_field_with_quick_sets(inline, spec.quick_sets)
                 self._add_form_row(
                     form,
                     spec.label,
-                    self._make_inline_pair(spec, partner, left_w, right_w),
+                    field,
                     [spec, partner],
                     label_width=label_width,
                     field_set=field_set,
@@ -222,6 +272,8 @@ class ParamFormWidget(QWidget):
                 continue
             if isinstance(editor, QComboBox):
                 editor.currentIndexChanged.connect(self._refresh_visibility)
+            elif isinstance(editor, _RadioButtonGroupField):
+                editor.button_group.idClicked.connect(self._refresh_visibility)
 
     def _refresh_visibility(self) -> None:
         current = self.read_params()
@@ -246,6 +298,61 @@ class ParamFormWidget(QWidget):
             if current.get(key) not in allowed:
                 return False
         return True
+
+    def _wrap_field_with_quick_sets(
+        self,
+        field: QWidget,
+        quick_sets: tuple[QuickSet, ...],
+    ) -> QWidget:
+        if not quick_sets:
+            return field
+        row = QWidget()
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+        layout.addWidget(field, stretch=1)
+        layout.addWidget(self._make_quick_button_bar(quick_sets))
+        row.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        return row
+
+    @staticmethod
+    def _make_compact_button(label: str) -> QPushButton:
+        button = QPushButton(label)
+        button.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
+        button.setMinimumWidth(0)
+        button.setStyleSheet("QPushButton { padding: 2px 6px; min-width: 0px; }")
+        return button
+
+    def _make_quick_button_bar(self, quick_sets: tuple[QuickSet, ...]) -> QWidget:
+        _vc = Qt.AlignmentFlag.AlignVCenter
+        box = QWidget()
+        layout = QHBoxLayout(box)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+        for quick_set in quick_sets:
+            button = self._make_compact_button(quick_set.label)
+            button.clicked.connect(
+                lambda _checked=False, preset=quick_set: self._apply_quick_set(preset)
+            )
+            layout.addWidget(button, alignment=_vc)
+        box.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
+        return box
+
+    def _apply_quick_set(self, quick_set: QuickSet) -> None:
+        for key, value in quick_set.values.items():
+            editor = self._editors.get(key)
+            if editor is None:
+                continue
+            if isinstance(editor, QDoubleSpinBox):
+                editor.setValue(float(value))
+            elif isinstance(editor, QSpinBox):
+                editor.setValue(int(value))
+            elif isinstance(editor, QCheckBox):
+                editor.setChecked(bool(value))
+            elif isinstance(editor, QComboBox):
+                index = editor.findData(value)
+                if index >= 0:
+                    editor.setCurrentIndex(index)
 
     def _make_inline_pair(
         self,
@@ -322,6 +429,11 @@ class ParamFormWidget(QWidget):
             combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
             return combo
 
+        if spec.kind == "button_group":
+            field = _RadioButtonGroupField(spec.choices, value)
+            field.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+            return field
+
         if spec.kind == "energy_multiselect":
             return self._make_energy_picker(value)
 
@@ -345,6 +457,8 @@ class ParamFormWidget(QWidget):
                 out[spec.key] = bool(widget.isChecked())  # type: ignore[attr-defined]
             elif spec.kind == "choice":
                 out[spec.key] = widget.currentData()  # type: ignore[attr-defined]
+            elif spec.kind == "button_group":
+                out[spec.key] = widget.value()  # type: ignore[attr-defined]
             elif spec.kind == "energy_multiselect":
                 out[spec.key] = self._selected_energies()
         return out
