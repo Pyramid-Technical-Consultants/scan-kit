@@ -6,6 +6,8 @@ import xml.etree.ElementTree as ET
 from typing import Callable
 
 from PySide6.QtCore import Qt
+from scan_kit.common.qt_widgets import configure_pane_scroll_area
+
 from PySide6.QtWidgets import (
     QHBoxLayout,
     QHeaderView,
@@ -100,12 +102,13 @@ class XmlFormWidget(QScrollArea):
         self._build_element(root, layout, title=root.tag, is_root=True)
         layout.addStretch(1)
 
-        self.setWidget(host)
         self.setWidgetResizable(True)
         self.setFrameShape(QScrollArea.Shape.NoFrame)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.setWidget(host)
+        configure_pane_scroll_area(self, content=host)
 
     @property
     def bindings(self) -> BindingSet:

@@ -2,11 +2,9 @@
 
 from __future__ import annotations
 
-import json
-import time
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QThread, QTimer
+from PySide6.QtCore import Qt, QThread
 from PySide6.QtGui import QPalette
 from PySide6.QtWidgets import (
     QFileDialog,
@@ -16,7 +14,6 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QProgressDialog,
     QPushButton,
-    QScrollArea,
     QSizePolicy,
     QSplitter,
     QTableWidget,
@@ -27,11 +24,18 @@ from PySide6.QtWidgets import (
 
 import pandas as pd
 
+from ..common.app_settings import AppSettings
+from ..common.qt_widgets import (
+    configure_pane_scroll_area,
+    make_pane_scroll_area,
+    set_pane_scroll_widget,
+)
 from .plan_synthesis.base import PlanTemplate
 from .plan_synthesis.export_filename import suggest_input_map_filename
 from .plan_synthesis.generation_worker import PlanGenerationWorker
 from .plan_synthesis.input_map import write_input_map_csv
 from .plan_synthesis.param_form import ParamFormWidget
+from .plan_synthesis.paths import resolve_plan_synthesis_save_dir
 from .plan_synthesis.preview import (
     clear_preview_table,
     fill_preview_table,
@@ -40,132 +44,6 @@ from .plan_synthesis.preview import (
     start_preview_table_fill,
 )
 from .plan_synthesis.registry import TEMPLATE_REGISTRY
-
-_DEBUG_LOG_PATH = Path(__file__).resolve().parents[2] / "debug-70ba5d.log"
-
-
-def _debug_log(
-    hypothesis_id: str,
-    location: str,
-    message: str,
-    data: dict,
-    *,
-    run_id: str = "pre-fix",
-) -> None:
-    # region agent log
-    try:
-        payload = {
-            "sessionId": "70ba5d",
-            "hypothesisId": hypothesis_id,
-            "location": location,
-            "message": message,
-            "data": data,
-            "timestamp": int(time.time() * 1000),
-            "runId": run_id,
-        }
-        with _DEBUG_LOG_PATH.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(payload) + "\n")
-    except OSError:
-        pass
-    # endregion
-
-
-def _widget_bg_snapshot(name: str, widget: QWidget) -> dict[str, object]:
-    pal = widget.palette()
-    return {
-        "name": name,
-        "class": widget.metaObject().className(),
-        "autoFillBackground": widget.autoFillBackground(),
-        "base": pal.color(QPalette.ColorRole.Base).name(),
-        "window": pal.color(QPalette.ColorRole.Window).name(),
-        "size": [widget.width(), widget.height()],
-        "sizeHint": [widget.sizeHint().width(), widget.sizeHint().height()],
-    }
-
-
-def _log_param_scroll_background(
-    panel: PlanSynthesisPanel,
-    *,
-    stage: str,
-    hypothesis_id: str = "H-multi",
-) -> None:
-    scroll = panel._param_scroll
-    form = panel._param_form
-    params_host = scroll.parentWidget()
-    left_splitter = params_host.parentWidget() if params_host is not None else None
-    widgets: list[tuple[str, QWidget | None]] = [
-        ("left_splitter", left_splitter),
-        ("params_host", params_host),
-        ("param_scroll", scroll),
-        ("param_viewport", scroll.viewport()),
-        ("param_form", form),
-    ]
-    snapshots = [
-        _widget_bg_snapshot(name, widget)
-        for name, widget in widgets
-        if widget is not None
-    ]
-    viewport_h = scroll.viewport().height()
-    form_h = form.height() if form is not None else 0
-    form_hint_h = form.sizeHint().height() if form is not None else 0
-    _debug_log(
-        hypothesis_id,
-        "plan_synthesis_panel.py:_log_param_scroll_background",
-        f"param scroll background snapshot ({stage})",
-        {
-            "stage": stage,
-            "widgets": snapshots,
-            "viewportHeight": viewport_h,
-            "formHeight": form_h,
-            "formSizeHintHeight": form_hint_h,
-            "emptyRegionHeight": max(0, viewport_h - form_hint_h),
-            "baseMatchesWindow": all(
-                s["base"] == s["window"] for s in snapshots
-            ),
-            "parentChildBaseMismatch": [
-                {
-                    "parent": snapshots[i]["name"],
-                    "child": snapshots[i + 1]["name"],
-                    "parentWindow": snapshots[i]["window"],
-                    "childBase": snapshots[i + 1]["base"],
-                }
-                for i in range(len(snapshots) - 1)
-                if snapshots[i]["window"] != snapshots[i + 1]["base"]
-            ],
-        },
-    )
-
-
-def _configure_transparent_scroll_area(scroll: QScrollArea) -> None:
-    """Blend the scroll area with its parent pane (no sunken Base fill)."""
-    window_color = scroll.palette().color(QPalette.ColorRole.Window)
-    before = [
-        _widget_bg_snapshot("scroll_before", scroll),
-        _widget_bg_snapshot("viewport_before", scroll.viewport()),
-    ]
-    for widget in (scroll, scroll.viewport()):
-        widget.setAutoFillBackground(False)
-        pal = widget.palette()
-        pal.setColor(QPalette.ColorRole.Base, window_color)
-        widget.setPalette(pal)
-    after = [
-        _widget_bg_snapshot("scroll_after", scroll),
-        _widget_bg_snapshot("viewport_after", scroll.viewport()),
-    ]
-    _debug_log(
-        "H1-H2",
-        "plan_synthesis_panel.py:_configure_transparent_scroll_area",
-        "configured scroll area palette",
-        {
-            "targetWindow": window_color.name(),
-            "before": before,
-            "after": after,
-            "autoFillDisabled": not scroll.autoFillBackground()
-            and not scroll.viewport().autoFillBackground(),
-            "baseEqualsWindowAfter": after[0]["base"] == after[0]["window"]
-            and after[1]["base"] == after[1]["window"],
-        },
-    )
 
 
 class _TemplateListRow(QWidget):
@@ -232,8 +110,16 @@ class _TemplateListRow(QWidget):
 class PlanSynthesisPanel(QWidget):
     """Plan synthesis UI: templates + parameters (left) | preview (right)."""
 
-    def __init__(self, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        parent: QWidget | None = None,
+        *,
+        app_settings: AppSettings | None = None,
+    ) -> None:
         super().__init__(parent)
+        self._app_settings = (
+            app_settings if app_settings is not None else AppSettings.load()
+        )
         self._templates = list(TEMPLATE_REGISTRY)
         self._current: PlanTemplate | None = None
         self._param_form: ParamFormWidget | None = None
@@ -270,29 +156,27 @@ class PlanSynthesisPanel(QWidget):
         template_l.addWidget(self._template_list)
         left_splitter.addWidget(template_host)
 
-        params_host = QWidget()
-        params_host.setAutoFillBackground(False)
+        self._params_host = QWidget()
+        params_host = self._params_host
         params_l = QVBoxLayout(params_host)
         params_l.setContentsMargins(4, 4, 4, 4)
         params_l.setSpacing(6)
 
-        self._param_scroll = QScrollArea()
-        self._param_scroll.setWidgetResizable(True)
+        self._param_scroll = make_pane_scroll_area()
         self._param_scroll.setVerticalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAsNeeded
         )
         self._param_scroll.setHorizontalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff
         )
-        self._param_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
         self._param_scroll.setSizePolicy(
             QSizePolicy.Policy.Expanding,
             QSizePolicy.Policy.Expanding,
         )
-        _configure_transparent_scroll_area(self._param_scroll)
         params_l.addWidget(self._param_scroll, stretch=1)
 
         left_splitter.addWidget(params_host)
+        configure_pane_scroll_area(self._param_scroll, host=self._params_host)
 
         left_splitter.setStretchFactor(0, 0)
         left_splitter.setStretchFactor(1, 1)
@@ -332,15 +216,6 @@ class PlanSynthesisPanel(QWidget):
         if self._templates:
             self._template_list.setCurrentRow(0)
 
-        QTimer.singleShot(
-            0,
-            lambda: _log_param_scroll_background(self, stage="init_immediate"),
-        )
-        QTimer.singleShot(
-            500,
-            lambda: _log_param_scroll_background(self, stage="init_settled"),
-        )
-
     def _on_template_changed(self, row: int) -> None:
         if row < 0 or row >= len(self._templates):
             self._current = None
@@ -366,12 +241,10 @@ class PlanSynthesisPanel(QWidget):
             self._current.default_params(),
         )
         self._param_form = form
-        self._param_scroll.setWidget(form)
-        _configure_transparent_scroll_area(self._param_scroll)
-        _log_param_scroll_background(self, stage="rebuild_immediate")
-        QTimer.singleShot(
-            0,
-            lambda: _log_param_scroll_background(self, stage="rebuild_deferred"),
+        set_pane_scroll_widget(
+            self._param_scroll,
+            form,
+            host=self._params_host,
         )
 
     def _read_params(self) -> dict:
@@ -465,13 +338,26 @@ class PlanSynthesisPanel(QWidget):
         params = self._last_generate_params or self._read_params()
         return suggest_input_map_filename(self._current, params)
 
+    def _default_save_path(self) -> str:
+        directory = resolve_plan_synthesis_save_dir(
+            self._app_settings.last_plan_synthesis_save_dir
+        )
+        return str(directory / self._default_save_filename())
+
+    def _remember_save_dir(self, path: str | Path) -> None:
+        try:
+            self._app_settings.last_plan_synthesis_save_dir = str(Path(path).parent)
+            self._app_settings.save()
+        except Exception:
+            pass
+
     def _on_save(self) -> None:
         if self._generated is None or self._generated.empty:
             return
         path, _ = QFileDialog.getSaveFileName(
             self,
             "Save input map CSV",
-            self._default_save_filename(),
+            self._default_save_path(),
             "CSV files (*.csv)",
         )
         if not path:
@@ -481,4 +367,5 @@ class PlanSynthesisPanel(QWidget):
         except OSError as exc:
             QMessageBox.critical(self, "Save failed", str(exc))
             return
+        self._remember_save_dir(path)
         QMessageBox.information(self, "Saved", f"Wrote {path}")

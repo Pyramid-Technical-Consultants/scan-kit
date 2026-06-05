@@ -8,12 +8,24 @@ from typing import Any, Literal
 from .energies import STANDARD_ENERGIES_MEV
 
 ParamKind = Literal[
-    "energy_multiselect", "float", "int", "bool", "choice", "button_group"
+    "energy_multiselect",
+    "float",
+    "int",
+    "bool",
+    "choice",
+    "button_group",
+    "file_path",
 ]
-ParamFieldSet = Literal["energy", "geometry", "weight"]
+ParamFieldSet = Literal["source", "energy", "geometry", "weight"]
 
-PARAM_FIELD_SET_ORDER: tuple[ParamFieldSet, ...] = ("energy", "geometry", "weight")
+PARAM_FIELD_SET_ORDER: tuple[ParamFieldSet, ...] = (
+    "source",
+    "energy",
+    "geometry",
+    "weight",
+)
 PARAM_FIELD_SET_LABELS: dict[ParamFieldSet, str] = {
+    "source": "Source",
     "energy": "Energy",
     "geometry": "Geometry",
     "weight": "Weight",
@@ -47,6 +59,7 @@ class ParamSpec:
     visible_when: dict[str, tuple[Any, ...]] | None = None
     field_set: ParamFieldSet = "geometry"
     quick_sets: tuple[QuickSet, ...] = ()
+    file_filter: str = ""
 
 
 def shared_energy_spec(*, default: list[float] | None = None) -> ParamSpec:

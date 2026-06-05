@@ -20,6 +20,8 @@ DEFAULT_FILENAME_MAX_LENGTH = 128
 _CSV_SUFFIX = ".csv"
 
 _TEMPLATE_SLUGS: dict[str, str] = {
+    "dicom_rt_plan": "DicomPlan",
+    "iba_pld_plan": "IbaPld",
     "zero_field": "ZeroField",
     "rectangular_field": "RectField",
 }
@@ -36,9 +38,9 @@ def suggest_input_map_filename(
     """Build a descriptive default CSV filename from template + parameters."""
     parts = [
         _template_slug(template),
-        _energy_part(params),
+        _energy_part(template.id, params),
         _geometry_part(template.id, params),
-        _weight_part(params),
+        _weight_part(template.id, params),
     ]
     return _join_and_limit(parts, max_length=max_length)
 
@@ -50,7 +52,10 @@ def _template_slug(template: PlanTemplate) -> str:
     return _sanitize("_".join(template.name.split()))
 
 
-def _energy_part(params: dict[str, Any]) -> str:
+def _energy_part(template_id: str, params: dict[str, Any]) -> str:
+    if template_id in {"dicom_rt_plan", "iba_pld_plan"}:
+        return ""
+
     energies = normalize_selected_energies(
         params.get("selected_energies"),
         catalog=STANDARD_ENERGIES_MEV,
@@ -83,7 +88,41 @@ def _energy_part(params: dict[str, Any]) -> str:
     return f"E{len(energies)}L_{energies[0]:g}-{energies[-1]:g}"
 
 
+def _import_plan_label_from_path(path_text: str, *, label_reader: str) -> str:
+    if not path_text:
+        return ""
+    from pathlib import Path
+
+    path = Path(path_text)
+    try:
+        if label_reader == "dicom":
+            from .dicom_rt_plan import rt_plan_label_from_path
+
+            label = rt_plan_label_from_path(path)
+        elif label_reader == "pld":
+            from .iba_pld_plan import pld_plan_label_from_path
+
+            label = pld_plan_label_from_path(path)
+        else:
+            label = path.stem
+    except Exception:
+        label = path.stem
+    return _sanitize(label)
+
+
 def _geometry_part(template_id: str, params: dict[str, Any]) -> str:
+    if template_id == "dicom_rt_plan":
+        return _import_plan_label_from_path(
+            str(params.get("dicom_path", "") or "").strip(),
+            label_reader="dicom",
+        )
+
+    if template_id == "iba_pld_plan":
+        return _import_plan_label_from_path(
+            str(params.get("pld_path", "") or "").strip(),
+            label_reader="pld",
+        )
+
     if template_id == "zero_field":
         spots = int(params.get("spots_per_layer", 0))
         return f"Sp{spots}"
@@ -107,7 +146,10 @@ def _geometry_part(template_id: str, params: dict[str, Any]) -> str:
     return ""
 
 
-def _weight_part(params: dict[str, Any]) -> str:
+def _weight_part(template_id: str, params: dict[str, Any]) -> str:
+    if template_id in {"dicom_rt_plan", "iba_pld_plan"}:
+        return ""
+
     method = params.get("spot_weight_method", SPOT_WEIGHT_METHOD_FIXED)
     if method == SPOT_WEIGHT_METHOD_FIXED:
         return f"Wfix{_num(float(params.get('spot_weight_mu', 0.0)), decimals=4)}"
@@ -149,7 +191,7 @@ def _join_and_limit(parts: list[str], *, max_length: int) -> str:
         return f"{stem}{_CSV_SUFFIX}"
 
     compact_parts = parts[:]
-    compact_parts[1] = _energy_part_compact(parts[1])
+    compact_parts[1] = _energy_part_compact(compact_parts[1])
     stem = _sanitize("_".join(part for part in compact_parts if part))
     if len(stem) <= max_stem:
         return f"{stem}{_CSV_SUFFIX}"

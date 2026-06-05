@@ -21,29 +21,40 @@ from scan_kit.common.report_runner import capture_view_figure
 from .pages import render_conclusion_page, render_title_page
 from .types import ReportConfig, ViewRenderResult
 
-_VIEW_DPI = 300
-_PORTRAIT_PAGE = (8.5, 11.0)
-_LANDSCAPE_PAGE = (11.0, 8.5)
-_PAGE_MARGIN = 0.02
+_VIEW_WIDTH_PX = 1920
+_VIEW_HEIGHT_PX = 1080
+_VIEW_DPI = 100
+_VIEW_FIGSIZE = (_VIEW_WIDTH_PX / _VIEW_DPI, _VIEW_HEIGHT_PX / _VIEW_DPI)
+_LANDSCAPE_PAGE = (16.0, 9.0)
 _SKIP_NO_DATA = "No data available for selected sessions"
 
 
-def _rasterize_figure(fig: plt.Figure) -> np.ndarray:
-    """Render *fig* to a high-resolution PNG array for PDF embedding."""
+def _prepare_view_figure(fig: plt.Figure) -> None:
+    """Resize to a 1920×1080 (16:9) canvas and apply tight layout."""
+    fig.set_size_inches(*_VIEW_FIGSIZE, forward=True)
     apply_tight_layout(fig)
+
+
+def _rasterize_figure(fig: plt.Figure) -> np.ndarray:
+    """Render *fig* to a 1920×1080 PNG array for PDF embedding."""
+    _prepare_view_figure(fig)
     buf = BytesIO()
     fig.savefig(
         buf,
         format="png",
         dpi=_VIEW_DPI,
-        bbox_inches="tight",
         facecolor=fig.get_facecolor(),
         edgecolor="none",
-        pad_inches=0.08,
         pil_kwargs={"compress_level": 3},
     )
     buf.seek(0)
-    return plt.imread(buf)
+    image = plt.imread(buf)
+    if image.shape[1] != _VIEW_WIDTH_PX or image.shape[0] != _VIEW_HEIGHT_PX:
+        raise RuntimeError(
+            f"Expected {_VIEW_WIDTH_PX}×{_VIEW_HEIGHT_PX} plot image, "
+            f"got {image.shape[1]}×{image.shape[0]}"
+        )
+    return image
 
 
 def _save_raster_page(
@@ -56,11 +67,9 @@ def _save_raster_page(
     page_size = _LANDSCAPE_PAGE if landscape else _PORTRAIT_PAGE
     page_fig = plt.figure(figsize=page_size, dpi=150)
     page_fig.patch.set_facecolor("white")
-    margin = _PAGE_MARGIN
-    ax = page_fig.add_axes([margin, margin, 1 - 2 * margin, 1 - 2 * margin])
+    ax = page_fig.add_axes([0, 0, 1, 1])
     ax.set_axis_off()
-    ax.imshow(image, interpolation="lanczos", resample=True)
-    ax.set_aspect("equal", adjustable="box")
+    ax.imshow(image, interpolation="lanczos", resample=True, aspect="auto")
     ax.set_xlim(0, image.shape[1])
     ax.set_ylim(image.shape[0], 0)
     page_fig.savefig(
@@ -74,15 +83,13 @@ def _save_raster_page(
 
 
 def _save_figure_to_pdf(fig: plt.Figure, pdf: PdfPages, *, landscape: bool) -> None:
-    if landscape:
-        w, h = fig.get_size_inches()
-        if w < h:
-            fig.set_size_inches(h, w, forward=True)
     image = _rasterize_figure(fig)
     _save_raster_page(image, pdf, landscape=landscape)
 
 
-def _save_portrait_page(fig: plt.Figure, pdf: PdfPages) -> None:
+def _save_landscape_page(fig: plt.Figure, pdf: PdfPages) -> None:
+    """Save a landscape document page (title, conclusion) directly to the PDF."""
+    fig.set_size_inches(*_LANDSCAPE_PAGE, forward=True)
     fig.savefig(
         pdf,
         format="pdf",
@@ -114,7 +121,12 @@ def build_report_pdf(
     with PdfPages(output_path) as pdf:
         info = pdf.infodict()
         info["Title"] = config.title
-        info["Author"] = config.author or "Scan Kit"
+        author_parts = [
+            part.strip()
+            for part in (config.author, config.organization)
+            if part.strip()
+        ]
+        info["Author"] = ", ".join(author_parts) or "Scan Kit"
         info["Creator"] = f"Scan Kit {__version__}"
         info["Subject"] = config.subtitle
 
@@ -123,6 +135,7 @@ def build_report_pdf(
             title=config.title,
             subtitle=config.subtitle,
             author=config.author,
+            organization=config.organization,
             generated_at=config.generated_at,
             base_dir=config.base_dir,
             session_ids=config.session_ids,
@@ -130,7 +143,7 @@ def build_report_pdf(
             notes=config.notes,
             settings=config.settings,
         )
-        _save_portrait_page(title_fig, pdf)
+        _save_landscape_page(title_fig, pdf)
         plt.close(title_fig)
         step += 1
 
@@ -175,6 +188,8 @@ def build_report_pdf(
         _emit("Rendering conclusion page…")
         conclusion_fig = render_conclusion_page(
             title=config.title,
+            author=config.author,
+            organization=config.organization,
             generated_at=config.generated_at,
             base_dir=config.base_dir,
             session_ids=config.session_ids,
@@ -182,7 +197,7 @@ def build_report_pdf(
             rendered=rendered,
             view_display_names=[name for name, _ in config.views],
         )
-        _save_portrait_page(conclusion_fig, pdf)
+        _save_landscape_page(conclusion_fig, pdf)
         plt.close(conclusion_fig)
         step += 1
 

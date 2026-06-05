@@ -19,21 +19,20 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMessageBox,
     QPushButton,
-    QScrollArea,
     QStackedWidget,
     QVBoxLayout,
     QWidget,
 )
 
+from scan_kit.common.qt_widgets import make_pane_scroll_area, set_pane_scroll_widget
 from scan_kit.common.session_meta import SessionMeta
 from scan_kit.common.settings import ViewSettings
 
 from . import (
     default_report_subtitle,
-    default_report_title,
     report_view_groups,
 )
-from .naming import suggest_report_filename
+from .naming import suggest_report_filename, suggest_report_title
 from .paths import resolve_report_save_dir
 from .types import ReportConfig
 
@@ -64,6 +63,9 @@ class ReportWizardDialog(QDialog):
         session_meta: dict[str, SessionMeta | None],
         notes: dict[str, str],
         last_report_dir: str | None = None,
+        last_report_author: str | None = None,
+        last_report_organization: str | None = None,
+        last_report_views: list[str] | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -73,9 +75,14 @@ class ReportWizardDialog(QDialog):
         self._session_meta = session_meta
         self._notes = notes
         self._last_report_dir = last_report_dir
+        self._last_report_author = last_report_author or ""
+        self._last_report_organization = last_report_organization or ""
+        self._last_report_views = set(last_report_views or [])
         self._config: ReportConfig | None = None
         self._view_checks: dict[str, QCheckBox] = {}
         self._path_input: QLineEdit | None = None
+        self._title_input: QLineEdit | None = None
+        self._last_auto_title = ""
 
         self.setWindowTitle("Generate Report")
         self.setModal(True)
@@ -118,7 +125,21 @@ class ReportWizardDialog(QDialog):
         nav.addWidget(self._button_box)
         root.addLayout(nav)
 
+        self._refresh_default_title()
         self._update_step_ui()
+
+    def _refresh_default_title(self) -> None:
+        if self._title_input is None:
+            return
+        auto_title = suggest_report_title(
+            self._session_ids,
+            self._notes,
+            self._selected_views(),
+        )
+        current = self._title_input.text().strip()
+        if not current or current == self._last_auto_title:
+            self._title_input.setText(auto_title)
+        self._last_auto_title = auto_title
 
     def _build_details_page(self) -> QWidget:
         page = QWidget()
@@ -154,15 +175,18 @@ class ReportWizardDialog(QDialog):
 
         form_box = QGroupBox("Report information")
         form = QFormLayout(form_box)
-        self._title_input = QLineEdit(default_report_title())
+        self._title_input = QLineEdit()
         self._subtitle_input = QLineEdit(
             default_report_subtitle(self._session_ids),
         )
-        self._author_input = QLineEdit()
-        self._author_input.setPlaceholderText("Optional author or organization")
+        self._author_input = QLineEdit(self._last_report_author)
+        self._author_input.setPlaceholderText("Optional author name")
+        self._organization_input = QLineEdit(self._last_report_organization)
+        self._organization_input.setPlaceholderText("Optional organization")
         form.addRow("Title", self._title_input)
         form.addRow("Subtitle", self._subtitle_input)
-        form.addRow("Author / Organization", self._author_input)
+        form.addRow("Author", self._author_input)
+        form.addRow("Organization", self._organization_input)
         layout.addWidget(form_box)
         layout.addStretch(1)
         return page
@@ -171,9 +195,7 @@ class ReportWizardDialog(QDialog):
         page = QWidget()
         outer = QVBoxLayout(page)
 
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll = make_pane_scroll_area()
         inner = QWidget()
         inner_layout = QVBoxLayout(inner)
 
@@ -207,7 +229,7 @@ class ReportWizardDialog(QDialog):
 
             for display_name, module_name in entries:
                 cb = QCheckBox(display_name)
-                cb.setChecked(True)
+                cb.setChecked(module_name in self._last_report_views)
                 checks.append(cb)
                 self._view_checks[module_name] = cb
                 box_layout.addWidget(cb)
@@ -215,7 +237,7 @@ class ReportWizardDialog(QDialog):
             inner_layout.addWidget(box)
 
         inner_layout.addStretch(1)
-        scroll.setWidget(inner)
+        set_pane_scroll_widget(scroll, inner)
         outer.addWidget(scroll)
         return page
 
@@ -282,7 +304,7 @@ class ReportWizardDialog(QDialog):
         views = self._selected_views()
         self._summary_label.setText(
             f"{len(self._session_ids)} session(s), {len(views)} view(s)\n"
-            f"Title: {self._title_input.text().strip() or default_report_title()}\n"
+            f"Title: {self._title_input.text().strip()}\n"
             f"Output: {self._path_input.text().strip()}"
         )
 
@@ -292,10 +314,13 @@ class ReportWizardDialog(QDialog):
             f"Step {index + 1} of {len(_STEP_LABELS)} — {_STEP_LABELS[index]}"
         )
         self._back_btn.setEnabled(index > 0)
+        if index == 0:
+            self._refresh_default_title()
         if index < len(_STEP_LABELS) - 1:
             self._next_btn.setText("Next")
         else:
             self._next_btn.setText("Generate")
+            self._refresh_default_title()
             self._refresh_default_output_path()
             self._refresh_output_summary()
 
@@ -348,9 +373,15 @@ class ReportWizardDialog(QDialog):
             return
 
         self._config = ReportConfig(
-            title=self._title_input.text().strip() or default_report_title(),
+            title=self._title_input.text().strip()
+            or suggest_report_title(
+                self._session_ids,
+                self._notes,
+                self._selected_views(),
+            ),
             subtitle=self._subtitle_input.text().strip(),
             author=self._author_input.text().strip(),
+            organization=self._organization_input.text().strip(),
             output_path=Path(self._path_input.text().strip()),
             session_ids=list(self._session_ids),
             base_dir=self._base_dir,

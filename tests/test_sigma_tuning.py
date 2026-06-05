@@ -44,6 +44,17 @@ def test_resolve_devices_xml_under_config_root() -> None:
     assert "map2map" in path.parts
 
 
+def test_resolve_session_config_dir_uses_session_config_folder() -> None:
+    from scan_kit.workflows.config_tuning.auto_tuning.paths import (
+        resolve_session_config_dir,
+    )
+
+    config_dir = resolve_session_config_dir(_SESSION, _TEST_DATA)
+    assert config_dir is not None
+    assert config_dir.name == "config"
+    assert resolve_devices_xml_path(config_dir) is not None
+
+
 def test_apply_measured_sigmas_updates_k0() -> None:
     devices_path = _TEST_DATA / _SESSION / _SESSION / "config" / "map2map" / "devices.xml"
     text = devices_path.read_text(encoding="utf-8")

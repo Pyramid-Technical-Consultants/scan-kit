@@ -40,6 +40,10 @@ class AutoTuneWorkflow(ABC):
     def description(self) -> str:
         """Short description shown beside the workflow name."""
 
+    def uses_session_browser(self) -> bool:
+        """When true, workflow parameters come from :class:`SessionBrowserWidget`."""
+        return False
+
     def param_specs(self) -> list[AutoTuneParamSpec]:
         return []
 

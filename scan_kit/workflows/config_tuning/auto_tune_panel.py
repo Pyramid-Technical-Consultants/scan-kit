@@ -22,6 +22,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from scan_kit.common.session_browser import SessionBrowserWidget, default_project_root
+
 from .auto_tuning.base import AutoTuneRunResult, AutoTuneWorkflow
 from .auto_tuning.params import AutoTuneParamSpec
 from .auto_tuning.registry import AUTO_TUNE_REGISTRY
@@ -144,6 +146,7 @@ class AutoTuneDetailWidget(QWidget):
         self._editors: dict[str, QLineEdit] = {}
         self._default_data_dir = ""
         self._apply_fn: ApplyFn | None = None
+        self._session_browser: SessionBrowserWidget | None = None
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -175,6 +178,10 @@ class AutoTuneDetailWidget(QWidget):
         layout.addWidget(self._param_host, alignment=Qt.AlignmentFlag.AlignTop)
         layout.addStretch(1)
 
+    def shutdown(self) -> None:
+        if self._session_browser is not None:
+            self._session_browser.shutdown()
+
     def set_apply_handler(self, handler: ApplyFn | None) -> None:
         self._apply_fn = handler
 
@@ -182,17 +189,52 @@ class AutoTuneDetailWidget(QWidget):
         self._default_data_dir = path.strip()
         if "data_dir" in self._editors and not self._editors["data_dir"].text().strip():
             self._editors["data_dir"].setText(self._default_data_dir)
+        if self._session_browser is not None and self._default_data_dir:
+            self._session_browser.set_base_dir(self._default_data_dir, refresh=False)
 
     def set_workflow(self, workflow: AutoTuneWorkflow | None) -> None:
         self._current = workflow
         if workflow is None:
             self._description_label.clear()
             self._clear_param_form()
+            self._hide_session_browser()
             self._apply_btn.setEnabled(False)
             return
         self._description_label.setText(workflow.description)
         self._apply_btn.setEnabled(True)
-        self._rebuild_param_form()
+        if workflow.uses_session_browser():
+            self._show_session_browser()
+        else:
+            self._hide_session_browser()
+            self._rebuild_param_form()
+
+    def _ensure_session_browser(self) -> SessionBrowserWidget:
+        if self._session_browser is None:
+            initial = self._default_data_dir or str(default_project_root() / "test_data")
+            self._session_browser = SessionBrowserWidget(
+                project_root=default_project_root(),
+                initial_base_dir=initial,
+                max_selections=1,
+                editable_notes=False,
+                show_plot_swatches=False,
+                parent=self,
+            )
+            self.layout().insertWidget(2, self._session_browser, stretch=1)
+            if self._default_data_dir:
+                self._session_browser.refresh()
+        return self._session_browser
+
+    def _show_session_browser(self) -> None:
+        browser = self._ensure_session_browser()
+        browser.setVisible(True)
+        self._param_host.setVisible(False)
+        if self._default_data_dir:
+            browser.set_base_dir(self._default_data_dir, refresh=True)
+
+    def _hide_session_browser(self) -> None:
+        if self._session_browser is not None:
+            self._session_browser.setVisible(False)
+        self._param_host.setVisible(True)
 
     def _clear_param_form(self) -> None:
         while self._param_form.rowCount():
@@ -249,7 +291,16 @@ class AutoTuneDetailWidget(QWidget):
             target.setText(chosen)
 
     def read_params(self) -> dict[str, Any]:
-        return {key: editor.text().strip() for key, editor in self._editors.items()}
+        params = {key: editor.text().strip() for key, editor in self._editors.items()}
+        if (
+            self._current is not None
+            and self._current.uses_session_browser()
+            and self._session_browser is not None
+        ):
+            selected = self._session_browser.selected_session_ids()
+            params["session_id"] = selected[0] if selected else ""
+            params["data_dir"] = self._session_browser.base_dir()
+        return params
 
     def _on_apply(self) -> None:
         if self._current is None:

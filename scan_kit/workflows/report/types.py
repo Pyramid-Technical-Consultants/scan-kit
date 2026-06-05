@@ -24,6 +24,7 @@ class ReportConfig:
     title: str
     subtitle: str
     author: str
+    organization: str
     output_path: Path
     session_ids: list[str]
     base_dir: str

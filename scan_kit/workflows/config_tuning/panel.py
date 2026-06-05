@@ -205,6 +205,36 @@ class ConfigTuningPanel(QWidget):
         """Default folder for session-based auto-tuning workflows."""
         self._auto_tune_detail.set_default_data_dir(path)
 
+    def shutdown(self) -> None:
+        self._auto_tune_detail.shutdown()
+
+    def open_config_root(
+        self,
+        path: Path,
+        *,
+        select_devices_xml: bool = False,
+    ) -> bool:
+        """Open *path* as the configuration folder."""
+        resolved = path.expanduser().resolve()
+        if not resolved.is_dir():
+            return False
+        if self._config_root == resolved and not select_devices_xml:
+            return True
+        if not self.confirm_discard_if_dirty():
+            return False
+        self._auto_tune_list.clear_selection()
+        self._current_workflow = None
+        self._auto_tune_detail.set_workflow(None)
+        self._apply_config_root(resolved)
+        if select_devices_xml:
+            devices_path = resolve_devices_xml_path(resolved)
+            if devices_path is not None:
+                rel = self._relative_path(devices_path)
+                if rel is not None:
+                    self._file_tree.select_relative_path(rel)
+                self._open_file(devices_path)
+        return True
+
     def _show_xml_view(self) -> None:
         self._right_stack.setCurrentIndex(_VIEW_XML)
         self._hide_unused_cb.setEnabled(True)

@@ -10,7 +10,6 @@ import xml.etree.ElementTree as ET
 from scan_kit.common.session_source import resolve_session_source
 
 from ..base import AutoTuneRunResult, AutoTuneWorkflow
-from ..params import AutoTuneParamSpec
 from ..sigma_tune import tune_sigmas_from_session
 
 
@@ -29,20 +28,8 @@ class SigmaTuningWorkflow(AutoTuneWorkflow):
     def description(self) -> str:
         return "IC1/IC2 σ K0 from session"
 
-    def param_specs(self) -> list[AutoTuneParamSpec]:
-        return [
-            AutoTuneParamSpec(
-                key="session_id",
-                label="Session ID",
-                placeholder="e.g. 1943968267",
-            ),
-            AutoTuneParamSpec(
-                key="data_dir",
-                label="Session data folder",
-                kind="directory",
-                placeholder="Folder with session ZIPs or folders",
-            ),
-        ]
+    def uses_session_browser(self) -> bool:
+        return True
 
     def validate(self, params: dict[str, Any]) -> list[str]:
         errors: list[str] = []

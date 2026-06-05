@@ -1164,3 +1164,440 @@ def test_generate_input_map_reports_progress(zero_field) -> None:
     assert seen[0] == 0
     assert seen[-1] == 100
     assert max(seen) == 100
+
+
+@pytest.fixture
+def dicom_rt_plan():
+    template = get_template("dicom_rt_plan")
+    assert template is not None
+    return template
+
+
+_T0G10_DCM = Path(r"c:\Users\MattNichols\Projects\spot-check\test_data\RN.15186535.T0G10.dcm")
+
+
+def _make_minimal_rt_ion_dataset() -> object:
+    import pydicom
+    from pydicom.dataset import Dataset
+    from pydicom.sequence import Sequence
+    from pydicom.uid import generate_uid
+
+    ds = Dataset()
+    ds.SOPClassUID = "1.2.840.10008.5.1.4.1.1.481.8"
+    ds.SOPInstanceUID = generate_uid()
+    ds.RTPlanLabel = "TESTPLAN"
+
+    cp = Dataset()
+    cp.NominalBeamEnergy = 100.0
+    cp.NumberOfScanSpotPositions = 2
+    cp.ScanSpotPositionMap = [1.0, 2.0, 3.0, 4.0]
+    cp.ScanSpotMetersetWeights = [0.5, 0.25]
+    cp.ScanningSpotSize = [4.0, 6.0]
+
+    beam = Dataset()
+    beam.IonControlPointSequence = Sequence([cp])
+    ds.IonBeamSequence = Sequence([beam])
+    return ds
+
+
+def test_dicom_rt_plan_validate_requires_file(dicom_rt_plan) -> None:
+    assert dicom_rt_plan.validate({"dicom_path": ""}) != []
+    assert dicom_rt_plan.validate({"dicom_path": "missing.dcm"}) != []
+
+
+def test_serpentine_order_matches_rectangular_fast_x_grid() -> None:
+    from scan_kit.workflows.plan_synthesis.spot_order import serpentine_order_indices
+
+    positions = rectangular_grid_positions(
+        center_x_mm=0.0,
+        center_y_mm=0.0,
+        field_width_mm=20.0,
+        field_height_mm=20.0,
+        spots_x=3,
+        spots_y=3,
+        fast_axis=FAST_AXIS_X,
+        start_corner=START_CORNER_BOTTOM_LEFT,
+    )
+    xs = [pos[0] for pos in positions]
+    ys = [pos[1] for pos in positions]
+    ordered = [
+        (xs[index], ys[index])
+        for index in serpentine_order_indices(xs, ys, fast_axis=FAST_AXIS_X)
+    ]
+    assert ordered == positions
+
+
+def test_dicom_rt_plan_minimize_travel_reorders_layer(
+    dicom_rt_plan,
+    tmp_path: Path,
+) -> None:
+    import pydicom
+    from pydicom.dataset import Dataset
+    from pydicom.sequence import Sequence
+    from pydicom.uid import generate_uid
+
+    from scan_kit.workflows.plan_synthesis.spot_order import SPOT_ORDER_MINIMIZE_TRAVEL
+
+    cp = Dataset()
+    cp.NominalBeamEnergy = 100.0
+    cp.NumberOfScanSpotPositions = 4
+    cp.ScanSpotPositionMap = [20.0, 0.0, 0.0, 0.0, 20.0, 10.0, 0.0, 10.0]
+    cp.ScanSpotMetersetWeights = [0.5, 0.5, 0.5, 0.5]
+
+    ds = Dataset()
+    ds.SOPClassUID = "1.2.840.10008.5.1.4.1.1.481.8"
+    ds.SOPInstanceUID = generate_uid()
+    beam = Dataset()
+    beam.IonControlPointSequence = Sequence([cp])
+    ds.IonBeamSequence = Sequence([beam])
+
+    dcm_path = tmp_path / "scrambled.dcm"
+    pydicom.dcmwrite(dcm_path, ds, implicit_vr=True, little_endian=True)
+
+    plan_params = {
+        "dicom_path": str(dcm_path),
+        "use_dicom_beam_size": False,
+        "beam_size_override_mm": 3.61,
+        "spot_order": SPOT_ORDER_MINIMIZE_TRAVEL,
+        "fast_axis": FAST_AXIS_X,
+    }
+    df = dicom_rt_plan.generate(plan_params)
+    assert list(zip(df["X_POSITION"], df["Y_POSITION"])) == [
+        (0.0, 0.0),
+        (20.0, 0.0),
+        (20.0, 10.0),
+        (0.0, 10.0),
+    ]
+
+
+def test_dicom_rt_plan_plan_order_preserves_dicom_sequence(
+    dicom_rt_plan,
+    tmp_path: Path,
+) -> None:
+    import pydicom
+    from pydicom.dataset import Dataset
+    from pydicom.sequence import Sequence
+    from pydicom.uid import generate_uid
+
+    from scan_kit.workflows.plan_synthesis.spot_order import SPOT_ORDER_PLAN
+
+    cp = Dataset()
+    cp.NominalBeamEnergy = 100.0
+    cp.NumberOfScanSpotPositions = 3
+    cp.ScanSpotPositionMap = [30.0, 0.0, 10.0, 0.0, 20.0, 0.0]
+    cp.ScanSpotMetersetWeights = [0.5, 0.5, 0.5]
+
+    ds = Dataset()
+    ds.SOPClassUID = "1.2.840.10008.5.1.4.1.1.481.8"
+    ds.SOPInstanceUID = generate_uid()
+    beam = Dataset()
+    beam.IonControlPointSequence = Sequence([cp])
+    ds.IonBeamSequence = Sequence([beam])
+
+    dcm_path = tmp_path / "ordered.dcm"
+    pydicom.dcmwrite(dcm_path, ds, implicit_vr=True, little_endian=True)
+
+    plan_params = {
+        "dicom_path": str(dcm_path),
+        "use_dicom_beam_size": False,
+        "beam_size_override_mm": 3.61,
+        "spot_order": SPOT_ORDER_PLAN,
+        "fast_axis": FAST_AXIS_X,
+    }
+    df = dicom_rt_plan.generate(plan_params)
+    assert df["X_POSITION"].tolist() == [30.0, 10.0, 20.0]
+
+
+def test_dicom_rt_plan_generate_uses_beam_size_override(
+    dicom_rt_plan,
+    tmp_path: Path,
+) -> None:
+    import pydicom
+
+    dcm_path = tmp_path / "plan.dcm"
+    pydicom.dcmwrite(
+        dcm_path,
+        _make_minimal_rt_ion_dataset(),
+        implicit_vr=True,
+        little_endian=True,
+    )
+
+    params = {
+        "dicom_path": str(dcm_path),
+        "use_dicom_beam_size": False,
+        "beam_size_override_mm": 7.5,
+    }
+    assert dicom_rt_plan.validate(params) == []
+    df = dicom_rt_plan.generate(params)
+    assert (df["BEAM_SIZE"] == 7.5).all()
+
+
+def test_dicom_rt_plan_generate_from_synthetic_dataset(
+    dicom_rt_plan,
+    tmp_path: Path,
+) -> None:
+    import pydicom
+
+    dcm_path = tmp_path / "plan.dcm"
+    pydicom.dcmwrite(
+        dcm_path,
+        _make_minimal_rt_ion_dataset(),
+        implicit_vr=True,
+        little_endian=True,
+    )
+
+    params = {
+        "dicom_path": str(dcm_path),
+        "use_dicom_beam_size": True,
+    }
+    assert dicom_rt_plan.validate(params) == []
+    df = dicom_rt_plan.generate(params)
+    assert list(df.columns) == list(INPUT_MAP_COLUMNS)
+    assert len(df) == 2
+    assert df["ENERGY"].tolist() == [100.0, 100.0]
+    assert df["X_POSITION"].tolist() == [1.0, 3.0]
+    assert df["Y_POSITION"].tolist() == [2.0, 4.0]
+    assert df["CHARGE_REQ"].tolist() == [0.5, 0.25]
+    assert (df["BEAM_SIZE"] == 5.0).all()
+    assert df["ENERGY"].is_monotonic_decreasing
+
+
+@pytest.mark.skipif(not _T0G10_DCM.is_file(), reason="T0G10 DICOM fixture not available")
+def test_dicom_rt_plan_generate_from_t0g10_example(dicom_rt_plan) -> None:
+    params = {
+        "dicom_path": str(_T0G10_DCM),
+        "use_dicom_beam_size": True,
+    }
+    assert dicom_rt_plan.validate(params) == []
+    df = dicom_rt_plan.generate(params)
+    assert len(df) == 12_779
+    assert df["ENERGY"].nunique() == 41
+    assert df["CHARGE_REQ"].sum() == pytest.approx(98.27907323255204)
+    assert df["BEAM_SIZE"].iloc[0] == pytest.approx(15.96453381, rel=1e-6)
+
+
+def test_suggest_input_map_filename_dicom_rt_plan(dicom_rt_plan, tmp_path: Path) -> None:
+    import pydicom
+
+    from scan_kit.workflows.plan_synthesis.export_filename import (
+        suggest_input_map_filename,
+    )
+
+    dcm_path = tmp_path / "RN.15186535.T0G10.dcm"
+    pydicom.dcmwrite(
+        dcm_path,
+        _make_minimal_rt_ion_dataset(),
+        implicit_vr=True,
+        little_endian=True,
+    )
+
+    params = {
+        "dicom_path": str(dcm_path),
+        "use_dicom_beam_size": True,
+    }
+    name = suggest_input_map_filename(dicom_rt_plan, params)
+    assert name == "DicomPlan_TESTPLAN.csv"
+
+
+def test_param_form_beam_size_override_visible_when_dicom_size_off(
+    dicom_rt_plan,
+) -> None:
+    import sys
+
+    from PySide6.QtWidgets import QApplication
+
+    from scan_kit.workflows.plan_synthesis.param_form import ParamFormWidget
+
+    app = QApplication.instance() or QApplication(sys.argv)
+    form = ParamFormWidget(dicom_rt_plan.param_specs(), dicom_rt_plan.default_params())
+    form.show()
+    app.processEvents()
+
+    def _override_row_visible() -> bool:
+        row = next(
+            r
+            for r in form._form_rows
+            if any(spec.key == "beam_size_override_mm" for spec in r["specs"])
+        )
+        return row["row"].isVisible()
+
+    assert _override_row_visible() is False
+
+    form._editors["use_dicom_beam_size"].setChecked(False)
+    app.processEvents()
+    assert _override_row_visible() is True
+    assert form.read_params()["beam_size_override_mm"] == pytest.approx(3.61)
+
+
+def test_param_form_file_path_reads_value(dicom_rt_plan) -> None:
+    import sys
+
+    from PySide6.QtWidgets import QApplication
+
+    from scan_kit.workflows.plan_synthesis.param_form import ParamFormWidget
+
+    app = QApplication.instance() or QApplication(sys.argv)
+    params = dicom_rt_plan.default_params()
+    params["dicom_path"] = r"C:\plans\example.dcm"
+    form = ParamFormWidget(dicom_rt_plan.param_specs(), params)
+    assert form.read_params()["dicom_path"] == r"C:\plans\example.dcm"
+
+
+def test_resolve_plan_synthesis_save_dir_prefers_last_saved(tmp_path: Path) -> None:
+    from scan_kit.workflows.plan_synthesis.paths import resolve_plan_synthesis_save_dir
+
+    last = tmp_path / "saved-plans"
+    last.mkdir()
+    assert resolve_plan_synthesis_save_dir(str(last)) == last
+
+
+def test_app_settings_persists_last_plan_synthesis_save_dir(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from scan_kit.common.app_settings import AppSettings
+
+    monkeypatch.setattr("scan_kit.common.app_settings._SETTINGS_DIR", tmp_path)
+    settings = AppSettings(last_plan_synthesis_save_dir=r"C:\plans\exports")
+    settings.save()
+    loaded = AppSettings.load()
+    assert loaded.last_plan_synthesis_save_dir == r"C:\plans\exports"
+
+
+@pytest.fixture
+def iba_pld_plan():
+    template = get_template("iba_pld_plan")
+    assert template is not None
+    return template
+
+
+_MINIMAL_PLD = """\
+Beam,Patient ID,Patient Name,Patient Initial,Patient Firstname,TestPlan,Beam1,10,10,1
+Layer,Spot1,100,10,4
+Element,0,0,0,0.0
+Element,0,0,5,0.0
+Element,10,0,0,0.0
+Element,10,0,5,0.0
+"""
+
+
+def test_iba_pld_plan_generate_from_minimal_fixture(iba_pld_plan, tmp_path: Path) -> None:
+    pld_path = tmp_path / "minimal.pld"
+    pld_path.write_text(_MINIMAL_PLD, encoding="utf-8")
+
+    params = {
+        "pld_path": str(pld_path),
+        "beam_size_mm": 4.0,
+        "spot_order": "plan_order",
+        "fast_axis": FAST_AXIS_X,
+    }
+    assert iba_pld_plan.validate(params) == []
+    df = iba_pld_plan.generate(params)
+    assert len(df) == 2
+    assert df["ENERGY"].tolist() == [100.0, 100.0]
+    assert df["X_POSITION"].tolist() == [0.0, 10.0]
+    assert df["CHARGE_REQ"].tolist() == [5.0, 5.0]
+    assert (df["BEAM_SIZE"] == 4.0).all()
+
+
+def test_iba_pld_plan_minimize_travel_reorders_layer(
+    iba_pld_plan,
+    tmp_path: Path,
+) -> None:
+    from scan_kit.workflows.plan_synthesis.spot_order import SPOT_ORDER_MINIMIZE_TRAVEL
+
+    pld_path = tmp_path / "scrambled.pld"
+    pld_path.write_text(
+        "\n".join(
+            [
+                "Beam,Patient ID,Patient Name,Patient Initial,Patient Firstname,TestPlan,Beam1,20,20,1",
+                "Layer,Spot1,100,20,8",
+                "Element,20,0,0,0.0",
+                "Element,20,0,10,0.0",
+                "Element,0,0,0,0.0",
+                "Element,0,0,10,0.0",
+                "Element,20,10,0,0.0",
+                "Element,20,10,10,0.0",
+                "Element,0,10,0,0.0",
+                "Element,0,10,10,0.0",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    params = {
+        "pld_path": str(pld_path),
+        "beam_size_mm": 3.61,
+        "spot_order": SPOT_ORDER_MINIMIZE_TRAVEL,
+        "fast_axis": FAST_AXIS_X,
+    }
+    df = iba_pld_plan.generate(params)
+    assert list(zip(df["X_POSITION"], df["Y_POSITION"])) == [
+        (0.0, 0.0),
+        (20.0, 0.0),
+        (20.0, 10.0),
+        (0.0, 10.0),
+    ]
+
+
+_OOC_PLD = Path(r"c:\Users\MattNichols\Downloads\OOC_Right_scaledMU_new.pld")
+
+
+@pytest.mark.skipif(not _OOC_PLD.is_file(), reason="OOC PLD fixture not available")
+def test_iba_pld_plan_generate_from_ooc_example(iba_pld_plan) -> None:
+    params = {
+        "pld_path": str(_OOC_PLD),
+        "beam_size_mm": 3.61,
+        "spot_order": "plan_order",
+        "fast_axis": FAST_AXIS_X,
+    }
+    assert iba_pld_plan.validate(params) == []
+    df = iba_pld_plan.generate(params)
+    assert len(df) == 118
+    assert df["ENERGY"].nunique() == 1
+    assert df["ENERGY"].iloc[0] == pytest.approx(228.0)
+    assert df["CHARGE_REQ"].sum() == pytest.approx(11490.25, rel=1e-6)
+
+
+def test_suggest_input_map_filename_iba_pld_plan(iba_pld_plan, tmp_path: Path) -> None:
+    from scan_kit.workflows.plan_synthesis.export_filename import (
+        suggest_input_map_filename,
+    )
+
+    pld_path = tmp_path / "OOC_Right.pld"
+    pld_path.write_text(_MINIMAL_PLD.replace("TestPlan", "OOC_Right"), encoding="utf-8")
+    params = {
+        "pld_path": str(pld_path),
+        "beam_size_mm": 3.61,
+        "spot_order": "plan_order",
+        "fast_axis": FAST_AXIS_X,
+    }
+    name = suggest_input_map_filename(iba_pld_plan, params)
+    assert name == "IbaPld_OOC_Right.csv"
+
+
+def test_plan_synthesis_default_save_path_uses_last_dir(
+    zero_field,
+    tmp_path: Path,
+) -> None:
+    import sys
+
+    from PySide6.QtWidgets import QApplication
+
+    from scan_kit.common.app_settings import AppSettings
+    from scan_kit.workflows.plan_synthesis_panel import PlanSynthesisPanel
+
+    app = QApplication.instance() or QApplication(sys.argv)
+    save_dir = tmp_path / "plans"
+    save_dir.mkdir()
+    settings = AppSettings(last_plan_synthesis_save_dir=str(save_dir))
+    panel = PlanSynthesisPanel(app_settings=settings)
+    panel._current = zero_field
+    panel._last_generate_params = _fixed_weight_params(
+        selected_energies=[250.0],
+        spots_per_layer=1,
+    )
+
+    default_path = Path(panel._default_save_path())
+    assert default_path.parent == save_dir
+    assert default_path.name.endswith(".csv")

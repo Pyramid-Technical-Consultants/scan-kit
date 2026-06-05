@@ -8,6 +8,7 @@ from datetime import datetime
 from scan_kit.views import ViewEntry
 
 _MAX_STEM_LEN = 96
+_MAX_TITLE_LEN = 120
 _SLUG_RE = re.compile(r"[^\w\s-]+", re.UNICODE)
 
 
@@ -27,30 +28,80 @@ def _module_slug(module_name: str, *, max_len: int = 24) -> str:
     return _slug(module_name.replace("_", "-"), max_len=max_len)
 
 
-def _session_slug(session_ids: list[str], notes: dict[str, str]) -> str:
-    if len(session_ids) == 1:
-        sid = session_ids[0]
-        note = notes.get(sid, "").strip()
-        if note:
-            return _slug(note, max_len=28)
-        return _slug(sid, max_len=20)
-
-    note_slugs: list[str] = []
+def _unique_session_notes(session_ids: list[str], notes: dict[str, str]) -> list[str]:
+    seen: list[str] = []
     for sid in session_ids:
         note = notes.get(sid, "").strip()
-        if not note:
-            continue
-        slug = _slug(note, max_len=18)
-        if slug not in note_slugs:
-            note_slugs.append(slug)
+        if note and note not in seen:
+            seen.append(note)
+    return seen
 
-    if len(note_slugs) == 1 and len(session_ids) == 2:
-        return f"{note_slugs[0]}-2-sessions"
-    if len(note_slugs) == 1:
-        return f"{note_slugs[0]}-{len(session_ids)}-sessions"
-    if note_slugs:
-        return f"{note_slugs[0]}-{len(session_ids)}-sessions"
 
+def _session_notes_summary(session_ids: list[str], notes: dict[str, str]) -> str:
+    """Readable combined summary of session notes (falls back to session ids/count)."""
+    unique_notes = _unique_session_notes(session_ids, notes)
+    if len(unique_notes) == 1:
+        note = unique_notes[0]
+        if len(session_ids) > 1:
+            return f"{note} ({len(session_ids)} sessions)"
+        return note
+    if len(unique_notes) == 2:
+        return f"{unique_notes[0]} and {unique_notes[1]}"
+    if len(unique_notes) > 2:
+        head = "; ".join(unique_notes[:-1])
+        return f"{head}; and {unique_notes[-1]}"
+
+    if len(session_ids) == 1:
+        return session_ids[0]
+    if len(session_ids) == 2:
+        return f"{session_ids[0]} and 1 other session"
+    return f"{len(session_ids)} sessions"
+
+
+def _views_label(views: list[ViewEntry]) -> str:
+    if not views:
+        return "Analysis Report"
+    if len(views) == 1:
+        return views[0][0]
+    if len(views) == 2:
+        return f"{views[0][0]} and {views[1][0]}"
+    return f"{len(views)} analysis views"
+
+
+def _truncate_text(text: str, *, max_len: int) -> str:
+    if len(text) <= max_len:
+        return text
+    return text[: max_len - 3].rstrip() + "..."
+
+
+def suggest_report_title(
+    session_ids: list[str],
+    notes: dict[str, str],
+    views: list[ViewEntry],
+) -> str:
+    """Build a readable default report title from selected views and session notes."""
+    views_part = _views_label(views)
+    session_part = _session_notes_summary(session_ids, notes)
+    return _truncate_text(f"{views_part} — {session_part}", max_len=_MAX_TITLE_LEN)
+
+
+def _session_notes_slug(session_ids: list[str], notes: dict[str, str]) -> str:
+    unique_notes = _unique_session_notes(session_ids, notes)
+    if len(unique_notes) == 1:
+        note_slug = _slug(unique_notes[0], max_len=28)
+        if len(session_ids) > 1:
+            return f"{note_slug}-{len(session_ids)}-sessions"
+        return note_slug
+    if len(unique_notes) == 2:
+        left = _slug(unique_notes[0], max_len=16)
+        right = _slug(unique_notes[1], max_len=16)
+        combined = f"{left}-and-{right}"
+        return combined if len(combined) <= 40 else f"{len(unique_notes)}-notes"
+    if len(unique_notes) > 2:
+        return f"{len(unique_notes)}-notes"
+
+    if len(session_ids) == 1:
+        return _slug(session_ids[0], max_len=20)
     if len(session_ids) == 2:
         return f"{_slug(session_ids[0], max_len=12)}-and-1-more"
     return f"{len(session_ids)}-sessions"
@@ -79,17 +130,17 @@ def suggest_report_filename(
     """Build a readable, filesystem-safe default report filename."""
     when = generated_at or datetime.now()
     date_part = when.strftime("%Y-%m-%d")
-    session_part = _session_slug(session_ids, notes)
     views_part = _views_slug(views)
+    session_part = _session_notes_slug(session_ids, notes)
 
-    stem = f"scan-kit-{date_part}_{session_part}_{views_part}"
+    stem = f"{date_part}_{views_part}_{session_part}"
     if len(stem) <= _MAX_STEM_LEN:
         return f"{stem}.pdf"
 
-    # Drop the longest segment first (usually the views part).
-    stem = f"scan-kit-{date_part}_{session_part}_{_views_slug(views[:1])}"
+    # Shorten the views segment first, then drop the session summary.
+    stem = f"{date_part}_{_views_slug(views[:1])}_{session_part}"
     if len(stem) > _MAX_STEM_LEN:
-        stem = f"scan-kit-{date_part}_{session_part}_report"
+        stem = f"{date_part}_{_views_slug(views[:1])}_report"
     if len(stem) > _MAX_STEM_LEN:
-        stem = f"scan-kit-{date_part}-report"
+        stem = f"{date_part}-report"
     return f"{stem}.pdf"

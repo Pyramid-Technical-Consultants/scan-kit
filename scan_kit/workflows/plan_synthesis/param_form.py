@@ -2,22 +2,20 @@
 
 from __future__ import annotations
 
-import json
-import time
-from pathlib import Path
 from typing import Any, Callable
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QPalette
 from PySide6.QtWidgets import (
     QButtonGroup,
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
+    QFileDialog,
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QPushButton,
     QRadioButton,
     QSpinBox,
@@ -35,6 +33,50 @@ from .params import (
 )
 
 ReadParamsFn = Callable[[], dict[str, Any]]
+
+
+class _FilePathField(QWidget):
+    """Line edit with a browse button for selecting a file."""
+
+    def __init__(
+        self,
+        value: str,
+        *,
+        file_filter: str = "All files (*)",
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._file_filter = file_filter
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+
+        self._line = QLineEdit(str(value or ""))
+        self._line.setMinimumWidth(0)
+        self._line.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        layout.addWidget(self._line, stretch=1)
+
+        browse = QPushButton("…")
+        browse.setFixedWidth(28)
+        browse.setToolTip("Browse for file")
+        browse.clicked.connect(self._browse)
+        layout.addWidget(browse)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+
+    def _browse(self) -> None:
+        start = self._line.text().strip()
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select file",
+            start,
+            self._file_filter,
+        )
+        if path:
+            self._line.setText(path)
+
+    def value(self) -> str:
+        return self._line.text().strip()
 
 
 class _RadioButtonGroupField(QWidget):
@@ -99,35 +141,7 @@ class ParamFormWidget(QWidget):
         outer.setSpacing(8)
         outer.setAlignment(Qt.AlignmentFlag.AlignTop)
         self.setAutoFillBackground(False)
-        pal = self.palette()
-        window_color = pal.color(QPalette.ColorRole.Window)
-        pal.setColor(QPalette.ColorRole.Base, window_color)
-        self.setPalette(pal)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
-
-        # region agent log
-        try:
-            log_path = Path(__file__).resolve().parents[2] / "debug-70ba5d.log"
-            payload = {
-                "sessionId": "70ba5d",
-                "hypothesisId": "H3",
-                "location": "param_form.py:ParamFormWidget.__init__",
-                "message": "param form background init",
-                "data": {
-                    "autoFillBackground": self.autoFillBackground(),
-                    "base": self.palette().color(QPalette.ColorRole.Base).name(),
-                    "window": window_color.name(),
-                    "sizeHint": [self.sizeHint().width(), self.sizeHint().height()],
-                    "fieldSetCount": len(PARAM_FIELD_SET_ORDER),
-                },
-                "timestamp": int(time.time() * 1000),
-                "runId": "pre-fix",
-            }
-            with log_path.open("a", encoding="utf-8") as fh:
-                fh.write(json.dumps(payload) + "\n")
-        except OSError:
-            pass
-        # endregion
 
         label_width = self._label_column_width(specs)
         initial = values or {}
@@ -199,7 +213,15 @@ class ParamFormWidget(QWidget):
 
             widget = self._make_editor(spec, initial.get(spec.key, spec.default))
             self._editors[spec.key] = widget
-            if spec.kind == "energy_multiselect":
+            if spec.kind == "file_path":
+                self._add_full_width_form_row(
+                    form,
+                    self._field_label(spec),
+                    widget,
+                    [spec],
+                    field_set=field_set,
+                )
+            elif spec.kind == "energy_multiselect":
                 form.addRow(widget)
                 self._register_form_row([spec], None, widget, widget, field_set)
             else:
@@ -255,6 +277,31 @@ class ParamFormWidget(QWidget):
         fm = self.fontMetrics()
         return max(fm.horizontalAdvance(text) for text in texts) + 8
 
+    def _add_full_width_form_row(
+        self,
+        form: QFormLayout,
+        label_text: str,
+        field: QWidget,
+        specs: list[ParamSpec],
+        *,
+        field_set: str,
+    ) -> None:
+        row = QWidget()
+        row.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
+        layout = QVBoxLayout(row)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+
+        label = QLabel(label_text)
+        label.setAlignment(
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+        )
+        layout.addWidget(label)
+        layout.addWidget(field)
+
+        form.addRow(row)
+        self._register_form_row(specs, label, field, row, field_set)
+
     def _add_form_row(
         self,
         form: QFormLayout,
@@ -267,13 +314,14 @@ class ParamFormWidget(QWidget):
     ) -> None:
         _vc = Qt.AlignmentFlag.AlignVCenter
         row = QWidget()
+        row.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         layout = QHBoxLayout(row)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(12)
         label = self._row_label(label_text)
         label.setFixedWidth(label_width)
         layout.addWidget(label, alignment=_vc | Qt.AlignmentFlag.AlignRight)
-        layout.addWidget(field, stretch=1, alignment=_vc | Qt.AlignmentFlag.AlignLeft)
+        layout.addWidget(field, stretch=1, alignment=_vc)
         form.addRow(row)
         self._register_form_row(specs, label, field, row, field_set)
 
@@ -308,6 +356,8 @@ class ParamFormWidget(QWidget):
                 continue
             if isinstance(editor, QComboBox):
                 editor.currentIndexChanged.connect(self._refresh_visibility)
+            elif isinstance(editor, QCheckBox):
+                editor.toggled.connect(self._refresh_visibility)
             elif isinstance(editor, _RadioButtonGroupField):
                 editor.button_group.idClicked.connect(self._refresh_visibility)
 
@@ -473,6 +523,14 @@ class ParamFormWidget(QWidget):
         if spec.kind == "energy_multiselect":
             return self._make_energy_picker(value)
 
+        if spec.kind == "file_path":
+            field = _FilePathField(
+                str(value or ""),
+                file_filter=spec.file_filter or "All files (*)",
+            )
+            field.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            return field
+
         raise ValueError(f"Unsupported param kind: {spec.kind}")
 
     def _make_energy_picker(self, value: Any) -> EnergyPickerWidget:
@@ -497,6 +555,8 @@ class ParamFormWidget(QWidget):
                 out[spec.key] = widget.value()  # type: ignore[attr-defined]
             elif spec.kind == "energy_multiselect":
                 out[spec.key] = self._selected_energies()
+            elif spec.kind == "file_path":
+                out[spec.key] = widget.value()  # type: ignore[attr-defined]
         return out
 
     def _selected_energies(self) -> list[float]:

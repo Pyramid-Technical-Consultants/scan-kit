@@ -16,6 +16,16 @@ REPORT_EXCLUDED_MODULES: frozenset[str] = frozenset({
 GITHUB_URL = "https://github.com/Pyramid-Technical-Consultants/scan-kit"
 
 
+def reportable_module_names() -> set[str]:
+    """Module names that can be included in a PDF report."""
+    return {
+        module_name
+        for _title, entries in VIEW_GROUPS
+        for _display_name, module_name in entries
+        if module_name not in REPORT_EXCLUDED_MODULES
+    }
+
+
 def report_view_groups() -> list[tuple[str, list[ViewEntry]]]:
     """Return VIEW_GROUPS entries that can be rendered as static matplotlib plots."""
     groups: list[tuple[str, list[ViewEntry]]] = []
@@ -30,7 +40,15 @@ def report_view_groups() -> list[tuple[str, list[ViewEntry]]]:
     return groups
 
 
-def default_report_title() -> str:
+def default_report_title(
+    session_ids: list[str] | None = None,
+    notes: dict[str, str] | None = None,
+    views: list[ViewEntry] | None = None,
+) -> str:
+    if session_ids and views is not None:
+        from .naming import suggest_report_title
+
+        return suggest_report_title(session_ids, notes or {}, views)
     return "Scan Kit Analysis Report"
 
 
