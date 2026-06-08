@@ -227,9 +227,10 @@ class ReportWizardDialog(QDialog):
             action_row.addStretch(1)
             box_layout.addLayout(action_row)
 
-            for display_name, module_name in entries:
+            for display_name, module_name, _description in entries:
                 cb = QCheckBox(display_name)
                 cb.setChecked(module_name in self._last_report_views)
+                cb.setToolTip(_description)
                 checks.append(cb)
                 self._view_checks[module_name] = cb
                 box_layout.addWidget(cb)
@@ -290,14 +291,14 @@ class ReportWizardDialog(QDialog):
                 path += ".pdf"
             self._path_input.setText(path)
 
-    def _selected_views(self) -> list[tuple[str, str]]:
-        selected: list[tuple[str, str]] = []
+    def _selected_views(self) -> list[tuple[str, str, str]]:
+        selected: list[tuple[str, str, str]] = []
         for group_title, entries in report_view_groups():
             del group_title
-            for display_name, module_name in entries:
+            for display_name, module_name, description in entries:
                 cb = self._view_checks.get(module_name)
                 if cb is not None and cb.isChecked():
-                    selected.append((display_name, module_name))
+                    selected.append((display_name, module_name, description))
         return selected
 
     def _refresh_output_summary(self) -> None:

@@ -442,8 +442,9 @@ class ScanKitMainWindow(QMainWindow):
             grid.setVerticalSpacing(8)
             for col in range(_VIEW_GRID_COLS):
                 grid.setColumnStretch(col, 1)
-            for i, (display_name, module_name) in enumerate(entries):
+            for i, (display_name, module_name, description) in enumerate(entries):
                 btn = QPushButton(display_name)
+                btn.setToolTip(description)
                 btn.setMinimumHeight(30)
                 btn.setSizePolicy(
                     QSizePolicy.Policy.Expanding,
@@ -470,8 +471,8 @@ class ScanKitMainWindow(QMainWindow):
             "Build a PDF report from selected sessions and analysis views"
         )
         self._report_btn.clicked.connect(self._on_generate_report)
-        report_row.addWidget(self._report_btn)
         report_row.addStretch(1)
+        report_row.addWidget(self._report_btn)
         right_outer.addLayout(report_row)
 
         splitter.addWidget(left)
@@ -639,7 +640,7 @@ class ScanKitMainWindow(QMainWindow):
             return
 
         self._app_settings.last_report_views = [
-            module_name for _display_name, module_name in config.views
+            entry[1] for entry in config.views
         ]
         self._app_settings.last_report_author = config.author or None
         self._app_settings.last_report_organization = config.organization or None
@@ -802,7 +803,7 @@ class ScanKitMainWindow(QMainWindow):
             return
 
         original_label = next(
-            (name for name, mod in VIEWS if mod == module_name),
+            (name for name, mod, _desc in VIEWS if mod == module_name),
             module_name,
         )
         self._running_views[module_name] = (proc, original_label)

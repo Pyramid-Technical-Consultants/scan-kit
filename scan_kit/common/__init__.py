@@ -82,6 +82,11 @@ from .devices_xml import (
 )
 from .transform import remap, remap_g2_raw, remap_g2_raw_reversed, g2_ic2_mm, IC1_X_MAP, IC1_Y_MAP, IC2_X_MAP, IC2_Y_MAP
 from .validation import create_valid_mask, apply_validation
+from .beam_spills import (
+    MIN_SPILL_GAP_MS,
+    detect_beam_on_mask,
+    detect_spill_segments,
+)
 from .processing import (
     load_session_raw,
     process_position_data,
@@ -281,4 +286,7 @@ __all__ = [
     "add_spot_delivery_time",
     "sliding_background",
     "subtract_background_frames",
+    "MIN_SPILL_GAP_MS",
+    "detect_beam_on_mask",
+    "detect_spill_segments",
 ]

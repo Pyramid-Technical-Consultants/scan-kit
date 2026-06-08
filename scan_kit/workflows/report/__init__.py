@@ -2,8 +2,7 @@
 
 from __future__ import annotations
 
-from scan_kit.views import VIEW_GROUPS
-from scan_kit.views import ViewEntry
+from scan_kit.views import VIEW_GROUPS, ViewEntry, view_module_name
 
 REPORT_EXCLUDED_MODULES: frozenset[str] = frozenset({
     "ic_timeslice_replay",
@@ -19,10 +18,10 @@ GITHUB_URL = "https://github.com/Pyramid-Technical-Consultants/scan-kit"
 def reportable_module_names() -> set[str]:
     """Module names that can be included in a PDF report."""
     return {
-        module_name
+        view_module_name(entry)
         for _title, entries in VIEW_GROUPS
-        for _display_name, module_name in entries
-        if module_name not in REPORT_EXCLUDED_MODULES
+        for entry in entries
+        if view_module_name(entry) not in REPORT_EXCLUDED_MODULES
     }
 
 
@@ -31,9 +30,9 @@ def report_view_groups() -> list[tuple[str, list[ViewEntry]]]:
     groups: list[tuple[str, list[ViewEntry]]] = []
     for title, entries in VIEW_GROUPS:
         filtered = [
-            (display_name, module_name)
-            for display_name, module_name in entries
-            if module_name not in REPORT_EXCLUDED_MODULES
+            entry
+            for entry in entries
+            if view_module_name(entry) not in REPORT_EXCLUDED_MODULES
         ]
         if filtered:
             groups.append((title, filtered))

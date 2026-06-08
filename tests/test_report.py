@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from scan_kit.common.settings import ViewSettings
-from scan_kit.views import VIEWS
+from scan_kit.views import VIEWS, view_description_for_module, view_module_name
 from scan_kit.common.app_settings import AppSettings
 from scan_kit.workflows.report import (
     REPORT_EXCLUDED_MODULES,
@@ -33,6 +33,13 @@ def _pdf_page_count(path: Path) -> int:
     return len(re.findall(r"/Type\s*/Page\b", data))
 
 
+def _view(module_name: str) -> tuple[str, str, str]:
+    for entry in VIEWS:
+        if view_module_name(entry) == module_name:
+            return entry
+    raise KeyError(module_name)
+
+
 def _first_session_id() -> str | None:
     if not _TEST_DATA.is_dir():
         return None
@@ -46,16 +53,16 @@ def test_suggest_report_title_uses_notes_and_views() -> None:
     title = suggest_report_title(
         ["1943968267"],
         {"1943968267": "Calibration Check"},
-        [("Dose Ratios vs Energy", "dose_ratios_energy")],
+        [_view("dose_ratios_energy")],
     )
     assert title == "Dose Ratios vs Energy — Calibration Check"
 
 
 def test_suggest_report_title_collapses_many_views() -> None:
     views = [
-        ("Dose Ratios vs Energy", "dose_ratios_energy"),
-        ("Position Error vs Energy", "position_error_energy"),
-        ("Sigma vs Energy", "sigma_energy"),
+        _view("dose_ratios_energy"),
+        _view("position_error_energy"),
+        _view("sigma_energy"),
     ]
     title = suggest_report_title(
         ["s1", "s2"],
@@ -69,7 +76,7 @@ def test_suggest_report_title_combines_multiple_session_notes() -> None:
     title = suggest_report_title(
         ["s1", "s2", "s3"],
         {"s1": "Morning run", "s2": "Afternoon run", "s3": "Morning run"},
-        [("Sigma vs Energy", "sigma_energy")],
+        [_view("sigma_energy")],
     )
     assert title == "Sigma vs Energy — Morning run and Afternoon run"
 
@@ -78,7 +85,7 @@ def test_suggest_report_filename_uses_notes_and_views() -> None:
     name = suggest_report_filename(
         ["1943968267"],
         {"1943968267": "Calibration Check"},
-        [("Dose Ratios vs Energy", "dose_ratios_energy")],
+        [_view("dose_ratios_energy")],
         generated_at=datetime(2026, 6, 5, 14, 30, 0),
     )
     assert name.endswith(".pdf")
@@ -91,10 +98,10 @@ def test_suggest_report_filename_uses_notes_and_views() -> None:
 
 def test_suggest_report_filename_collapses_many_views() -> None:
     views = [
-        ("A", "dose_ratios_energy"),
-        ("B", "position_error_energy"),
-        ("C", "sigma_energy"),
-        ("D", "current_ratios"),
+        _view("dose_ratios_energy"),
+        _view("position_error_energy"),
+        _view("sigma_energy"),
+        _view("current_ratios"),
     ]
     name = suggest_report_filename(["s1", "s2"], {}, views)
     assert name.endswith(".pdf")
@@ -131,11 +138,20 @@ def test_resolve_report_save_dir_prefers_last_saved() -> None:
     assert resolve_report_save_dir(last) == _PROJECT_ROOT
 
 
+def test_view_entries_include_descriptions() -> None:
+    for entry in VIEWS:
+        display_name, module_name, description = entry
+        assert display_name.strip()
+        assert module_name.strip()
+        assert description.strip()
+    assert "dose ratio" in view_description_for_module("dose_ratios_energy").lower()
+
+
 def test_report_view_groups_excludes_non_static_modules() -> None:
     reportable_modules = {
-        module_name for _title, entries in report_view_groups() for _name, module_name in entries
+        view_module_name(entry) for _title, entries in report_view_groups() for entry in entries
     }
-    all_modules = {module_name for _name, module_name in VIEWS}
+    all_modules = {view_module_name(entry) for entry in VIEWS}
     assert REPORT_EXCLUDED_MODULES.issubset(all_modules - reportable_modules)
     assert "ic_timeslice_replay" not in reportable_modules
     assert "session_log_compare" not in reportable_modules
@@ -159,8 +175,8 @@ def test_build_report_pdf_smoke(tmp_path: Path) -> None:
         base_dir=str(_TEST_DATA),
         settings=ViewSettings(),
         views=[
-            ("Dose Ratios vs Energy", "dose_ratios_energy"),
-            ("Position Error vs Energy", "position_error_energy"),
+            _view("dose_ratios_energy"),
+            _view("position_error_energy"),
         ],
         generated_at=datetime(2026, 6, 5, 12, 0, 0),
     )

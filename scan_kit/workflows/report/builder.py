@@ -137,7 +137,6 @@ def build_report_pdf(
             author=config.author,
             organization=config.organization,
             generated_at=config.generated_at,
-            base_dir=config.base_dir,
             session_ids=config.session_ids,
             session_meta=config.session_meta,
             notes=config.notes,
@@ -147,7 +146,7 @@ def build_report_pdf(
         plt.close(title_fig)
         step += 1
 
-        for display_name, module_name in config.views:
+        for display_name, module_name, _description in config.views:
             _emit(f"Rendering {display_name}…")
             result = ViewRenderResult(
                 display_name=display_name,
@@ -191,11 +190,10 @@ def build_report_pdf(
             author=config.author,
             organization=config.organization,
             generated_at=config.generated_at,
-            base_dir=config.base_dir,
             session_ids=config.session_ids,
             settings=config.settings,
             rendered=rendered,
-            view_display_names=[name for name, _ in config.views],
+            views=config.views,
         )
         _save_landscape_page(conclusion_fig, pdf)
         plt.close(conclusion_fig)

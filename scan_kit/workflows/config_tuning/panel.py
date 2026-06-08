@@ -28,6 +28,12 @@ from scan_kit.common.file_integrity import is_sidecar_path
 from .auto_tune_panel import AutoTuneDetailWidget, AutoTuneListWidget
 from .auto_tuning.base import AutoTuneRunResult, AutoTuneWorkflow
 from .auto_tuning.paths import resolve_devices_xml_path
+from .auto_tuning.sigma_tune import (
+    SigmaTunePreviewRow,
+    compute_sigma_tune_preview,
+    normalize_sigma_optimize_mode,
+)
+from .auto_tuning.workflows.sigma_tuning import parse_sigma_session_ids
 from .file_tree import XmlFileTreeWidget
 from scan_kit.common.file_integrity import verify_file_integrity
 
@@ -133,8 +139,10 @@ class ConfigTuningPanel(QWidget):
         right_layout = QVBoxLayout(right)
         right_layout.setContentsMargins(4, 4, 4, 4)
 
-        header_row = QHBoxLayout()
-        self._header_base_title = "Select a configuration file or auto-tuning workflow"
+        self._xml_header_host = QWidget()
+        header_row = QHBoxLayout(self._xml_header_host)
+        header_row.setContentsMargins(0, 0, 0, 0)
+        self._header_base_title = "Select an XML file"
         self._header_label = QLabel(self._header_base_title)
         self._header_label.setWordWrap(True)
         self._header_label.setSizePolicy(
@@ -165,7 +173,8 @@ class ConfigTuningPanel(QWidget):
         self._save_as_btn.clicked.connect(self._on_save_as)
         header_row.addWidget(self._save_as_btn, 0, Qt.AlignmentFlag.AlignRight)
 
-        right_layout.addLayout(header_row)
+        self._xml_header_host.hide()
+        right_layout.addWidget(self._xml_header_host)
 
         self._right_stack = QStackedWidget()
 
@@ -186,6 +195,7 @@ class ConfigTuningPanel(QWidget):
 
         self._auto_tune_detail = AutoTuneDetailWidget()
         self._auto_tune_detail.set_apply_handler(self._on_auto_tune_apply)
+        self._auto_tune_detail.set_preview_handler(self._on_auto_tune_preview)
         self._right_stack.addWidget(self._auto_tune_detail)
 
         right_layout.addWidget(self._right_stack, stretch=1)
@@ -195,8 +205,6 @@ class ConfigTuningPanel(QWidget):
         splitter.setStretchFactor(1, 65)
         splitter.setSizes([320, 680])
         root_layout.addWidget(splitter, stretch=1)
-
-        self._auto_tune_list.select_first()
 
         if self._settings.config_dir:
             self._apply_config_root(Path(self._settings.config_dir))
@@ -238,27 +246,68 @@ class ConfigTuningPanel(QWidget):
     def _show_xml_view(self) -> None:
         self._right_stack.setCurrentIndex(_VIEW_XML)
         self._hide_unused_cb.setEnabled(True)
+        self._update_xml_header_visibility()
 
     def _show_workflow_view(self, workflow: AutoTuneWorkflow) -> None:
         self._current_workflow = workflow
         self._auto_tune_detail.set_workflow(workflow)
         self._right_stack.setCurrentIndex(_VIEW_WORKFLOW)
         self._hide_unused_cb.setEnabled(False)
-        self._set_header_title(workflow.name)
-        self._header_label.setTextFormat(Qt.TextFormat.PlainText)
-        self._header_label.setToolTip(workflow.description)
+        self._update_xml_header_visibility()
         self._update_action_state()
+
+    def _update_xml_header_visibility(self) -> None:
+        show_header = (
+            self._right_stack.currentIndex() == _VIEW_XML
+            and self._current_path is not None
+        )
+        self._xml_header_host.setVisible(show_header)
 
     def _on_workflow_selected(self, workflow: object) -> None:
         if not isinstance(workflow, AutoTuneWorkflow):
             self._current_workflow = None
             self._auto_tune_detail.set_workflow(None)
             if self._current_path is None:
-                self._set_header_title("Select a configuration file or auto-tuning workflow")
+                self._show_xml_view()
             return
         self._flush_current_editor()
         self._file_tree.clear_selection()
         self._show_workflow_view(workflow)
+
+    def _load_devices_document(self) -> XmlDocument | None:
+        if self._config_root is None:
+            return None
+        devices_path = resolve_devices_xml_path(self._config_root)
+        if devices_path is None:
+            return None
+        resolved = devices_path.resolve()
+        document = self._open_documents.get(resolved)
+        if document is not None:
+            return document
+        try:
+            document = XmlDocument.load(resolved)
+        except XmlParseError:
+            return None
+        self._open_documents[resolved] = document
+        return document
+
+    def _on_auto_tune_preview(
+        self,
+        workflow: AutoTuneWorkflow,
+        params: dict,
+    ) -> tuple[list[SigmaTunePreviewRow], list[str]] | None:
+        if workflow.id != "sigma_tuning":
+            return [], []
+        document = self._load_devices_document()
+        if document is None:
+            return [], ["Open a configuration folder containing map2map/devices.xml."]
+        optimize_mode = normalize_sigma_optimize_mode(params.get("optimize_method"))
+        return compute_sigma_tune_preview(
+            document.root,
+            parse_sigma_session_ids(params),
+            str(params["data_dir"]).strip(),
+            optimize_mode=optimize_mode,
+        )
 
     def _on_auto_tune_apply(
         self,
@@ -268,40 +317,26 @@ class ConfigTuningPanel(QWidget):
         if self._config_root is None:
             QMessageBox.warning(
                 self,
-                "Auto tuning",
+                "Auto Tuning",
                 "Open a configuration folder first.",
             )
             return None
 
-        devices_path = resolve_devices_xml_path(self._config_root)
-        if devices_path is None:
+        self._flush_current_editor()
+        document = self._load_devices_document()
+        if document is None:
             QMessageBox.warning(
                 self,
-                "Auto tuning",
+                "Auto Tuning",
                 "Could not find map2map/devices.xml in this configuration folder.",
             )
             return None
-
-        resolved = devices_path.resolve()
-        self._flush_current_editor()
-        document = self._open_documents.get(resolved)
-        if document is None:
-            try:
-                document = XmlDocument.load(resolved)
-            except XmlParseError as exc:
-                QMessageBox.critical(
-                    self,
-                    "Parse error",
-                    f"Could not parse devices.xml:\n{exc}",
-                )
-                return None
-            self._open_documents[resolved] = document
 
         result = workflow.apply_to_root(document.root, params)
         if result.success:
             document.mark_dirty()
             self._auto_tune_list.clear_selection()
-            self._open_file(resolved)
+            self._open_file(document.path)
             self._update_action_state()
         return result
 
@@ -353,6 +388,8 @@ class ConfigTuningPanel(QWidget):
         self._settings.config_dir = str(path)
         self._settings.save()
         self._clear_editor()
+        if self._current_workflow is not None:
+            self._auto_tune_detail.refresh_preview()
 
         if self._settings.last_opened_xml:
             rel = self._settings.last_opened_xml
@@ -360,10 +397,6 @@ class ConfigTuningPanel(QWidget):
             if candidate.is_file():
                 self._file_tree.select_relative_path(rel)
                 self._open_file(candidate)
-                return
-
-        if self._current_workflow is None:
-            self._auto_tune_list.select_first()
 
     def _on_file_selected(self, file_path: str) -> None:
         target = Path(file_path).resolve()
@@ -388,6 +421,7 @@ class ConfigTuningPanel(QWidget):
 
         rel = self._relative_path(self._current_path)
         self._set_header_title(f"{rel or path.name}")
+        self._update_xml_header_visibility()
         report = build_sidecar_only_report(path)
         self._integrity_details.set_report(report)
         self._ensure_sidecar_tail_spacer()
@@ -418,6 +452,7 @@ class ConfigTuningPanel(QWidget):
             self._settings.save()
 
         self._set_header_title(str(rel or self._current_path.name))
+        self._update_xml_header_visibility()
         self._set_form(document)
         self._update_integrity_badge()
 
@@ -429,7 +464,7 @@ class ConfigTuningPanel(QWidget):
         self._render_header_label()
 
     def _render_header_label(self) -> None:
-        if self._right_stack.currentIndex() == _VIEW_WORKFLOW:
+        if not self._xml_header_host.isVisible():
             return
         title = self._header_base_title
         if self._current_path is None or is_sidecar_path(self._current_path):
@@ -505,7 +540,7 @@ class ConfigTuningPanel(QWidget):
         self._auto_tune_detail.set_workflow(None)
         self._clear_form_widget()
         self._remove_sidecar_tail_spacer()
-        self._set_header_title("Select a configuration file or auto-tuning workflow")
+        self._set_header_title("Select an XML file")
         self._integrity_details.set_report(None)
         self._show_xml_view()
         self._update_action_state()

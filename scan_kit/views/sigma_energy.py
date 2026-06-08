@@ -1,9 +1,11 @@
 """IC1/IC2 sigma X/Y (mm) vs beam energy — violin plots.
 
 Sigma spot columns are resolved from ``spot_sigma`` / ``spot_sigma_raw`` and
-scaled ×2 to mm (same convention as the former box-plot view).
+scaled ×2 to mm (same convention as the former box-plot view). Tolerance bands
+are drawn symmetrically around the expected sigma from ``devices.xml`` (±20%
+and ±40%).
 
-Layout: two columns (IC1, IC2); X and Y share a column (top/bottom rows).
+Layout: two rows (IC1, IC2) with row labels on the left; X and Y in columns.
 """
 
 import logging
@@ -11,6 +13,7 @@ import logging
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
 
 from ..common import (
     load_session_raw,
@@ -30,7 +33,8 @@ from ..common import (
 _log = logging.getLogger(__name__)
 
 ENERGY_XLABEL = "Energy (MeV)"
-ROW_YLABELS = ("X Sigma (mm)", "Y Sigma (mm)")
+COLUMN_TITLES = ("X Sigma (mm)", "Y Sigma (mm)")
+ROW_LABELS = ("IC1", "IC2")
 
 _SIG_KEY_VARIANTS = ("spot_sigma_raw", "spot_sigma")
 
@@ -38,7 +42,12 @@ IC_PANELS = (
     ("ic1", "IC1", ("ic1_sig_x", "ic1_sig_y")),
     ("ic2", "IC2", ("ic2_sig_x", "ic2_sig_y")),
 )
-AXIS_LABELS = ("X", "Y")
+
+# Symmetric ± bands around devices.xml expected sigma (mm).
+SIGMA_TOLERANCE_FRACTIONS = (
+    (0.20, ":", 0.55, "±20% of expected"),
+    (0.40, "--", 0.65, "±40% of expected"),
+)
 
 
 def _link_axes_keep_tick_labels(axes, master):
@@ -103,29 +112,67 @@ def _process_session(session_id: str, base_dir: str):
     return result
 
 
-def _plot_expected_sigma_lines(
+def _sigma_tolerance_band(expected: float, frac: float) -> tuple[float, float]:
+    """Return lower/upper sigma (mm) for a symmetric ±*frac* band around *expected*."""
+    center = float(expected)
+    return max(0.0, center * (1.0 - frac)), center * (1.0 + frac)
+
+
+def _plot_sigma_tolerance_lines(
     ax,
     expected_by_energy: dict[float, float],
     energies,
     color,
-    *,
-    width=0.65,
 ):
-    """Draw session-specific expected sigma as dashed segments at each energy."""
-    half = width / 2.0
-    for j, energy in enumerate(energies):
-        sigma = expected_by_energy.get(float(energy))
-        if sigma is None or not np.isfinite(sigma):
-            continue
-        ax.plot(
-            [j - half, j + half],
-            [sigma, sigma],
-            color=color,
-            linestyle="--",
+    """Draw ±20% and ±40% limits as continuous curves across energies."""
+    xs = np.arange(len(energies), dtype=float)
+    for frac, linestyle, alpha, _label in SIGMA_TOLERANCE_FRACTIONS:
+        lower_pts: list[float] = []
+        upper_pts: list[float] = []
+        for energy in energies:
+            sigma = expected_by_energy.get(float(energy))
+            if sigma is None or not np.isfinite(sigma):
+                lower_pts.append(np.nan)
+                upper_pts.append(np.nan)
+                continue
+            lower, upper = _sigma_tolerance_band(sigma, frac)
+            lower_pts.append(lower)
+            upper_pts.append(upper)
+        for ys in (lower_pts, upper_pts):
+            ax.plot(
+                xs,
+                ys,
+                color=color,
+                linestyle=linestyle,
+                linewidth=1.3,
+                alpha=alpha,
+                zorder=7,
+            )
+
+
+def _add_sigma_tolerance_legend(ax) -> None:
+    """Legend for tolerance line styles (first panel only)."""
+    handles = [
+        Line2D(
+            [0],
+            [0],
+            color="0.35",
+            linestyle=linestyle,
             linewidth=1.3,
-            alpha=0.85,
-            zorder=7,
+            alpha=alpha,
         )
+        for _frac, linestyle, alpha, _label in SIGMA_TOLERANCE_FRACTIONS
+    ]
+    labels = [label for *_rest, label in SIGMA_TOLERANCE_FRACTIONS]
+    ax.legend(
+        handles,
+        labels,
+        loc="upper right",
+        fontsize=8,
+        framealpha=0.9,
+        title="Sigma tolerance",
+        title_fontsize=8,
+    )
 
 
 def _load_expected_sigmas(session_ids, energies, base_dir: str) -> dict[str, dict[str, dict[float, float]]]:
@@ -157,10 +204,15 @@ def _shared_panel_ylim(session_data, value_cols, expected_sigmas=None, *, pad_fr
                 per_energy = by_key.get(col)
                 if not per_energy:
                     continue
-                vals = np.asarray(list(per_energy.values()), dtype=float)
-                finite = vals[np.isfinite(vals)]
-                if finite.size:
-                    parts.append(finite)
+                expected_vals = np.asarray(list(per_energy.values()), dtype=float)
+                finite = expected_vals[np.isfinite(expected_vals)]
+                if not finite.size:
+                    continue
+                for frac, *_rest in SIGMA_TOLERANCE_FRACTIONS:
+                    lower = np.maximum(0.0, finite * (1.0 - frac))
+                    upper = finite * (1.0 + frac)
+                    parts.append(lower)
+                    parts.append(upper)
     if not parts:
         return None
     cat = np.concatenate(parts)
@@ -207,16 +259,16 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
     _link_axes_keep_tick_labels(axes.flat, master)
 
     value_cols: list[str] = []
-    ic_titles = [title for _ic, title, _cols in IC_PANELS]
+    tolerance_legend_added = False
 
-    for col_idx, (_ic, _ic_title, (x_col, y_col)) in enumerate(IC_PANELS):
-        for row_idx, (value_col, _axis_label) in enumerate(zip((x_col, y_col), AXIS_LABELS)):
+    for row_idx, (_ic, _ic_title, (x_col, y_col)) in enumerate(IC_PANELS):
+        for col_idx, value_col in enumerate((x_col, y_col)):
             ax = axes[row_idx, col_idx]
             plot_violins_for_column(ax, session_data, value_col, energies, colors)
             for session_idx, sid in enumerate(loaded_ids):
                 session_expected = expected_sigmas.get(sid, {}).get(value_col)
                 if session_expected:
-                    _plot_expected_sigma_lines(
+                    _plot_sigma_tolerance_lines(
                         ax,
                         session_expected,
                         energies,
@@ -227,14 +279,18 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
             ax.set_xlabel("")
             value_cols.append(value_col)
 
+            if not tolerance_legend_added and expected_sigmas:
+                _add_sigma_tolerance_legend(ax)
+                tolerance_legend_added = True
+
     ylim = _shared_panel_ylim(session_data, value_cols, expected_sigmas)
     if ylim is not None:
         master.set_ylim(ylim)
 
     apply_shared_block_labels(
         axes,
-        column_titles=ic_titles,
-        row_ylabels=ROW_YLABELS,
+        column_titles=COLUMN_TITLES,
+        row_ylabels=ROW_LABELS,
         xlabel=ENERGY_XLABEL,
         bottom_row=1,
     )
