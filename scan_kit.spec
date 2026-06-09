@@ -45,8 +45,12 @@ _pyside6_datas, _pyside6_binaries, _pyside6_hiddenimports = collect_all("PySide6
 hiddenimports = [
     "scan_kit.qt_launcher",
     "scan_kit.common.plot_colors",
-    # view modules (dynamically imported via importlib in --run-view mode)
+    # view modules (dynamically imported via importlib in --run-view / warm-worker mode)
     "scan_kit.views.position_error_energy",
+    "scan_kit.views.position_error_distribution_timeslice",
+    "scan_kit.views.position_error_distribution_spot",
+    "scan_kit.views.beam_motion_energy",
+    "scan_kit.views.session_log_compare",
     "scan_kit.views.ic_beam_trajectory",
     "scan_kit.views.position_scatter",
     "scan_kit.views.dose_ratios_energy",
@@ -78,6 +82,8 @@ hiddenimports = [
     "scan_kit.common.validation",
     "scan_kit.common.processing",
     "scan_kit.common.plotting",
+    "scan_kit.common.position_error_distribution",
+    "scan_kit.common.view_runner",
     # third-party modules that PyInstaller sometimes misses
     "scipy.signal",
     "scipy.fft",

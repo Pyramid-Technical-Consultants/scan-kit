@@ -1,15 +1,19 @@
-"""Position Error Distribution — beam-on timeslice IC1/IC2 position-error density contours and X/Y histograms."""
+"""Shared rendering for position-error density contours and X/Y histograms.
+
+Both the timeslice view (dense beam-on samples) and the spot view (one sample
+per delivered spot) load IC1/IC2 X/Y position errors into
+:class:`SessionPositionErrors` and hand them to
+:func:`render_position_error_distribution`.
+"""
 
 from __future__ import annotations
-
-import logging
 
 import matplotlib.colors as mcolors
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.patches import Circle
 
-from ..common import (
+from . import (
     CELL_SQUARE,
     DEFAULT_SESSION_COLORS,
     GRID_KW,
@@ -19,12 +23,7 @@ from ..common import (
     finish_view,
     view_grid,
 )
-from ..common.timeslice_position_error import (
-    SessionPositionErrors,
-    load_session_beam_on_position_errors,
-)
-
-_log = logging.getLogger(__name__)
+from .timeslice_position_error import SessionPositionErrors
 
 REF_CIRCLE_RADIUS_MM = 1.0
 HIST_BINS = 101
@@ -35,8 +34,12 @@ HIST_PERCENTILE = 99.95
 # Contour row is ~2.4x taller than each histogram row (3 rows, 2 columns).
 HEIGHT_RATIOS = (2.4, 1, 1)
 HIST_TITLE_PAD = 6.0
-CONTOUR_FILL_ALPHA = (0.05, 0.20)
-CONTOUR_LINE_ALPHA = 0.72
+# Constant alpha applied to each nested fill band. Bands are drawn one per
+# contour level (each covering everything denser than that level), so they
+# composite additively: a point inside N levels reaches 1-(1-a)**N opacity,
+# making the shading terrace up toward the dense center.
+CONTOUR_FILL_ALPHA_PER_LAYER = 0.13
+CONTOUR_LINE_ALPHA = 0.85
 CONTOUR_LINE_WIDTH = 0.65
 
 IC_PANELS = (
@@ -126,19 +129,18 @@ def _plot_density_contours(
         return
 
     z = density.T
-    if levels.size >= 2:
-        rgba = mcolors.to_rgba(color)
-        fill_alphas = np.linspace(CONTOUR_FILL_ALPHA[0], CONTOUR_FILL_ALPHA[1], levels.size - 1)
-        fill_cmap = mcolors.LinearSegmentedColormap.from_list(
-            "",
-            [(rgba[0], rgba[1], rgba[2], a) for a in fill_alphas],
-        )
+    z_max = float(z.max())
+    rgba = mcolors.to_rgba(color)
+    # Draw one translucent fill per level, each covering everything denser
+    # than that level (up past the peak). Nested layers composite additively,
+    # so the opacity terraces up toward the center instead of leaving a hole.
+    for level in levels:
         ax.contourf(
             grid_x,
             grid_y,
             z,
-            levels=levels,
-            cmap=fill_cmap,
+            levels=[level, z_max + 1.0],
+            colors=[(rgba[0], rgba[1], rgba[2], CONTOUR_FILL_ALPHA_PER_LAYER)],
             antialiased=True,
             zorder=1,
         )
@@ -194,26 +196,18 @@ def _plot_error_histogram(
     ax.grid(**GRID_KW)
 
 
-def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -> None:
-    """Plot beam-on timeslice position error density contours and X/Y histograms by IC."""
-    if not session_ids:
-        print("No sessions selected")
-        return
+def render_position_error_distribution(
+    session_data: dict[str, SessionPositionErrors],
+    loaded_ids: list[str],
+    *,
+    title: str,
+    base_dir: str,
+) -> None:
+    """Render IC1/IC2 position error density contours and X/Y histograms.
 
-    bg_subtract = settings.bg_subtract if settings else False
-    session_data: dict[str, SessionPositionErrors] = {}
-    for sid in session_ids:
-        errors = load_session_beam_on_position_errors(
-            sid, base_dir, bg_subtract=bg_subtract
-        )
-        if errors is not None:
-            session_data[sid] = errors
-
-    if not session_data:
-        print("No valid timeslice position error data found for any session")
-        return
-
-    loaded_ids = list(session_data.keys())
+    Each ``session_data`` value carries the IC1/IC2 X/Y position errors (mm)
+    for one session; ``loaded_ids`` fixes the plotting and legend order.
+    """
     colors = DEFAULT_SESSION_COLORS[: len(loaded_ids)]
 
     all_arrays: list[np.ndarray] = []
@@ -233,7 +227,6 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
         gridspec_kw={"height_ratios": HEIGHT_RATIOS},
     )
 
-    density_axes = [axes[0, 0], axes[0, 1]]
     hist_axes = [axes[1, 0], axes[1, 1], axes[2, 0], axes[2, 1]]
 
     for col_idx, (ic_title, x_attr, y_attr) in enumerate(IC_PANELS):
@@ -267,11 +260,5 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
     for ax in hist_axes:
         ax.set_xlim(shared_lim)
 
-    finish_view(
-        fig,
-        "Position Error Distribution (timeslice, beam-on)",
-        loaded_ids,
-        colors,
-        base_dir=base_dir,
-    )
+    finish_view(fig, title, loaded_ids, colors, base_dir=base_dir)
     plt.show()

@@ -9,6 +9,7 @@ change via a 1-second polling timer on the matplotlib event loop.
 from __future__ import annotations
 
 import os
+import sys
 import traceback
 from typing import Callable
 
@@ -18,6 +19,8 @@ from .plotting import apply_toolbar_tight_layout
 from .settings import ViewSettings
 
 _READY_SENTINEL = "__SCAN_KIT_PLOT_READY__"
+#: Printed once a warm worker has imported the heavy stack and is ready for a command.
+WARM_WORKER_SENTINEL = "__SCAN_KIT_WORKER_WARM__"
 
 _FIG_ONLY_KW = frozenset({
     "figsize", "dpi", "facecolor", "edgecolor", "frameon",
@@ -27,6 +30,46 @@ _FIG_ONLY_KW = frozenset({
 # Delays (ms) after show / resize before re-running toolbar tight layout.
 _LAYOUT_DELAYS_MS = (0, 100, 300, 600)
 _LAYOUT_HOOK = "_scan_kit_layout_hook"
+
+
+def warm_worker_main() -> None:
+    """Pre-warmed view worker entry point.
+
+    Spawned idle by the launcher's worker pool so the expensive imports
+    (matplotlib/scipy/pandas) are already paid for before the user clicks a
+    view. After printing :data:`WARM_WORKER_SENTINEL`, it blocks reading a
+    single JSON render command from stdin:
+    ``{"module", "sessions", "base_dir", "settings"}``.
+
+    Importing this module already imports matplotlib.pyplot; scipy/pandas are
+    nudged in here so the first render does not pay for them.
+    """
+    import importlib
+    import json
+
+    for _mod in ("scipy.signal", "scipy.fft", "pandas"):
+        try:
+            importlib.import_module(_mod)
+        except Exception:
+            pass
+
+    print(WARM_WORKER_SENTINEL, flush=True)
+
+    line = sys.stdin.readline()
+    if not line:
+        return
+    try:
+        command = json.loads(line)
+    except Exception:
+        return
+
+    mod = importlib.import_module(f"scan_kit.views.{command['module']}")
+    run_with_live_settings(
+        mod.run,
+        command["sessions"],
+        command["base_dir"],
+        command["settings"],
+    )
 
 
 def run_with_live_settings(

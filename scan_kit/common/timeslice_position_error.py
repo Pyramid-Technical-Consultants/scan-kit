@@ -1,7 +1,8 @@
-"""Timeslice IC position error loading (G2 direct errors, G3 measured minus target)."""
+"""Timeslice IC position error loading (G2 direct errors, G3 isocentric plan)."""
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Literal
 
@@ -9,12 +10,21 @@ import numpy as np
 
 from . import detect_beam_on_mask, subtract_background_frames
 from .g3_timeslice_position import (
+    G3IsoErrorContext,
     G3PositionTargetColumns,
-    g3_position_error_frame_arrays,
+    build_g3_iso_error_context,
+    g3_iso_position_error_frame_arrays,
     resolve_g3_position_target_columns,
 )
-from .schema import C_LAYER_ID, resolve_column_name
-from .session_source import load_session_timeslice_device_units, resolve_session_source
+from .schema import C_LAYER_ID, C_SPOT_NO, resolve_column_name
+from .session_source import (
+    SessionSource,
+    load_session_csv,
+    load_session_timeslice_device_units,
+    resolve_session_source,
+)
+
+_log = logging.getLogger(__name__)
 
 _G2_DIRECT_ERROR = (
     ("ic1_x_err", "position_err_X"),
@@ -23,8 +33,26 @@ _G2_DIRECT_ERROR = (
     ("ic2_y_err", "position_err_Y2"),
 )
 
+_G3_QUALITY_COLS = (
+    "ic1_x_fit_ok",
+    "ic1_y_fit_ok",
+    "ic2_x_fit_ok",
+    "ic2_y_fit_ok",
+    "r_ic1_x_confidence",
+    "r_ic1_y_confidence",
+    "r_ic2_x_confidence",
+    "r_ic2_y_confidence",
+    "r_ic1_x_spot_error_code",
+    "r_ic1_y_spot_error_code",
+    "r_ic2_x_spot_error_code",
+    "r_ic2_y_spot_error_code",
+)
+
 TIMESLICE_POSITION_ERROR_COLS = [
     C_LAYER_ID,
+    C_SPOT_NO,
+    "spot_no.1",
+    "spot_no.2",
     "rci_in_trigger",
     "r_beamOk",
     *(name for _, name in _G2_DIRECT_ERROR),
@@ -36,6 +64,7 @@ TIMESLICE_POSITION_ERROR_COLS = [
     "ic2_position_x_target",
     "r_ic2_y_position",
     "ic2_position_y_target",
+    *_G3_QUALITY_COLS,
 ]
 
 
@@ -59,7 +88,13 @@ class _G3PositionTargetSource:
     columns: G3PositionTargetColumns
 
 
-TimesliceErrorSource = _DirectErrorSource | _G3PositionTargetSource
+@dataclass(frozen=True)
+class _G3IsoPositionSource:
+    mode: Literal["g3_iso"]
+    context: G3IsoErrorContext
+
+
+TimesliceErrorSource = _DirectErrorSource | _G3PositionTargetSource | _G3IsoPositionSource
 
 
 def _resolve_named_columns(columns, pairs: tuple[tuple[str, str], ...]) -> dict[str, str] | None:
@@ -73,6 +108,7 @@ def _resolve_named_columns(columns, pairs: tuple[tuple[str, str], ...]) -> dict[
 
 
 def resolve_timeslice_error_source(columns) -> TimesliceErrorSource | None:
+    """Resolve error columns from one timeslice frame header (no session I/O)."""
     direct = _resolve_named_columns(columns, _G2_DIRECT_ERROR)
     if direct is not None:
         return _DirectErrorSource("direct", direct)
@@ -82,6 +118,38 @@ def resolve_timeslice_error_source(columns) -> TimesliceErrorSource | None:
         return _G3PositionTargetSource("g3_position_target", g3_cols)
 
     return None
+
+
+def resolve_session_timeslice_error_source(
+    src: SessionSource,
+    frames: list,
+) -> TimesliceErrorSource | None:
+    """Resolve the error source for one session (G2 direct or G3 isocentric only)."""
+    if not frames:
+        return None
+
+    base = resolve_timeslice_error_source(frames[0].columns)
+    if base is None:
+        return None
+    if base.mode != "g3_position_target":
+        return base
+
+    input_map = load_session_csv(src, "input_map.csv")
+    if input_map is None:
+        _log.debug("Session %s: missing input_map for G3 iso errors", src.session_id)
+        return None
+
+    spot_data = load_session_csv(src, "spot_data.csv")
+    iso_ctx = build_g3_iso_error_context(
+        input_map, frames, base.columns, spot_data=spot_data
+    )
+    if iso_ctx is None:
+        _log.debug(
+            "Session %s: could not build G3 isocentric error context",
+            src.session_id,
+        )
+        return None
+    return _G3IsoPositionSource("g3_iso", iso_ctx)
 
 
 def _sanitize_error(arr: np.ndarray) -> np.ndarray:
@@ -103,7 +171,15 @@ def frame_timeslice_error_arrays(
             _sanitize_error(df[source.columns["ic2_y_err"]].values),
         )
 
-    return g3_position_error_frame_arrays(df, source.columns)
+    if source.mode == "g3_iso":
+        arrays = g3_iso_position_error_frame_arrays(df, source.context)
+    else:
+        _log.warning("Unexpected G3 device-frame error source; skipping frame")
+        return None
+
+    if arrays is None:
+        return None
+    return tuple(_sanitize_error(arr) for arr in arrays)
 
 
 def _beam_on_slices(
@@ -133,7 +209,7 @@ def load_session_beam_on_position_errors(
     if bg_subtract:
         subtract_background_frames(frames)
 
-    error_source = resolve_timeslice_error_source(frames[0].columns)
+    error_source = resolve_session_timeslice_error_source(src, frames)
     if error_source is None:
         return None
 

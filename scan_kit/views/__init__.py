@@ -64,9 +64,14 @@ VIEW_GROUPS: list[tuple[str, list[ViewEntry]]] = [
                 "IC1 and IC2 position error in X and Y versus beam energy.",
             ),
             (
-                "Position Error Distribution",
-                "position_error_distribution",
+                "Position Error Distribution (Timeslice)",
+                "position_error_distribution_timeslice",
                 "Beam-on timeslice IC1/IC2 position error density contours and X/Y histograms.",
+            ),
+            (
+                "Position Error Distribution (Spot)",
+                "position_error_distribution_spot",
+                "Per-spot IC1/IC2 position error density contours and X/Y histograms.",
             ),
             (
                 "Sigma vs Energy",

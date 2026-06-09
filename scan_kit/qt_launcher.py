@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import atexit
+import json
 import multiprocessing
 import os
 import signal
@@ -85,6 +86,25 @@ _CAL_MODE_LABELS = {
 
 _SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 _READY_SENTINEL = "__SCAN_KIT_PLOT_READY__"
+#: Printed by a warm worker once the heavy scientific/plotting stack is imported.
+_WORKER_WARM_SENTINEL = "__SCAN_KIT_WORKER_WARM__"
+#: Number of pre-warmed view worker processes kept idle and ready to render.
+_WARM_POOL_SIZE = 2
+
+
+class _WarmWorker:
+    """A pre-spawned subprocess that has imported the heavy stack and awaits a view command.
+
+    ``module_name`` stays ``None`` while the worker is idle in the pool and is
+    set to the view module once the worker is handed a render command.
+    """
+
+    __slots__ = ("proc", "module_name", "warm")
+
+    def __init__(self, proc: subprocess.Popen) -> None:
+        self.proc = proc
+        self.module_name: str | None = None
+        self.warm = threading.Event()
 _CAL_FACTOR_LABELS = {
     # Canonical calibration keys; must match scan_kit.common.schema dose columns.
     "ic1_total_dose": "IC1",
@@ -211,6 +231,7 @@ class ScanKitMainWindow(QMainWindow):
         self._running_views: dict[str, tuple[subprocess.Popen, str]] = {}
         self._open_views: dict[str, subprocess.Popen] = {}
         self._launch_args: dict[str, tuple[list[str], str]] = {}
+        self._warm_idle: list[_WarmWorker] = []
         self._spinner_frame: int = 0
         self._poll_timer: QTimer | None = None
         self._settings = ViewSettings()
@@ -236,6 +257,8 @@ class ScanKitMainWindow(QMainWindow):
         self._build_ui()
         self._connect_thread_signals()
         QTimer.singleShot(0, self._request_settings_then_scan)
+        # Pre-warm view workers in the background so the first click is instant.
+        QTimer.singleShot(0, self._refill_warm_pool)
 
     def _connect_thread_signals(self) -> None:
         self._sig_plot_window_ready.connect(
@@ -764,8 +787,138 @@ class ScanKitMainWindow(QMainWindow):
             self._settings.cal_factors = None
 
         settings_json = self._settings.to_json()
-        env = os.environ.copy()
 
+        # Fast path: hand the command to an already-warm pooled worker. If none
+        # is ready (or the handoff fails), fall back to the proven direct launch
+        # so behavior is never worse than spawning a fresh process per click.
+        proc: subprocess.Popen | None = None
+        worker = self._take_ready_worker(module_name)
+        if worker is not None and worker.proc.stdin is not None:
+            command = json.dumps(
+                {
+                    "module": module_name,
+                    "sessions": session_ids,
+                    "base_dir": base_dir,
+                    "settings": settings_json,
+                }
+            )
+            try:
+                worker.proc.stdin.write((command + "\n").encode())
+                worker.proc.stdin.flush()
+                proc = worker.proc
+            except Exception:
+                proc = None
+
+        if proc is None:
+            proc = self._spawn_direct_view(
+                module_name, session_ids, base_dir, settings_json
+            )
+            if proc is None:
+                self._notify("Failed to run analysis", error=True)
+                return
+            threading.Thread(
+                target=self._watch_subprocess_ready,
+                args=(proc, module_name),
+                daemon=True,
+            ).start()
+
+        self._child_procs.append(proc)
+        self._reap_children()
+
+        original_label = next(
+            (name for name, mod, _desc in VIEWS if mod == module_name),
+            module_name,
+        )
+        self._running_views[module_name] = (proc, original_label)
+        btn = self._view_buttons.get(module_name)
+        if btn is not None:
+            btn.setText(original_label)
+        self._update_spinner()
+        if self._poll_timer is None:
+            self._poll_timer = QTimer(self)
+            self._poll_timer.timeout.connect(self._poll_running_views)
+            self._poll_timer.start(120)
+
+    def _update_spinner(self) -> None:
+        frame = _SPINNER[self._spinner_frame % len(_SPINNER)]
+        for module_name, (_proc, original_label) in self._running_views.items():
+            btn = self._view_buttons.get(module_name)
+            if btn is not None:
+                btn.setText(f"{frame} {original_label}")
+
+    def _warm_worker_popen(self) -> subprocess.Popen:
+        """Spawn a worker process that preloads the heavy stack and waits on stdin."""
+        env = os.environ.copy()
+        if FROZEN:
+            cmd = [sys.executable, "--warm-worker"]
+        else:
+            code = (
+                "from scan_kit.common.view_runner import warm_worker_main;"
+                " warm_worker_main()"
+            )
+            env["PYTHONPATH"] = str(PROJECT_ROOT) + (
+                os.pathsep + env.get("PYTHONPATH", "") if env.get("PYTHONPATH") else ""
+            )
+            cmd = [sys.executable, "-c", code]
+
+        popen_kwargs: dict[str, Any] = dict(
+            cwd=PROJECT_ROOT,
+            env=env,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        if sys.platform == "win32":
+            popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+        return subprocess.Popen(cmd, **popen_kwargs)
+
+    def _spawn_warm_worker(self) -> _WarmWorker | None:
+        try:
+            proc = self._warm_worker_popen()
+        except Exception as e:
+            self._notify(f"Failed to start view worker: {e}", error=True)
+            return None
+        worker = _WarmWorker(proc)
+        self._warm_idle.append(worker)
+        threading.Thread(
+            target=self._watch_worker, args=(worker,), daemon=True
+        ).start()
+        return worker
+
+    def _refill_warm_pool(self) -> None:
+        """Top up the idle pool to ``_WARM_POOL_SIZE``, pruning any dead workers."""
+        self._warm_idle = [w for w in self._warm_idle if w.proc.poll() is None]
+        while len(self._warm_idle) < _WARM_POOL_SIZE:
+            if self._spawn_warm_worker() is None:
+                break
+
+    def _take_ready_worker(self, module_name: str) -> _WarmWorker | None:
+        """Claim an already-warm idle worker, or ``None`` if none is ready yet.
+
+        Only fully-warmed workers are returned so the click is genuinely instant;
+        callers fall back to a direct launch otherwise. The pool is topped up
+        regardless so subsequent clicks find a warm worker.
+        """
+        self._warm_idle = [w for w in self._warm_idle if w.proc.poll() is None]
+        worker: _WarmWorker | None = None
+        for i, candidate in enumerate(self._warm_idle):
+            if candidate.warm.is_set():
+                worker = self._warm_idle.pop(i)
+                break
+        if worker is not None:
+            worker.module_name = module_name
+        self._refill_warm_pool()
+        return worker
+
+    def _spawn_direct_view(
+        self,
+        module_name: str,
+        session_ids: list[str],
+        base_dir: str,
+        settings_json: str,
+    ) -> subprocess.Popen | None:
+        """Original per-click launch: spawn a fresh process to run a single view."""
+        env = os.environ.copy()
         if FROZEN:
             cmd = [
                 sys.executable,
@@ -793,41 +946,11 @@ class ScanKitMainWindow(QMainWindow):
         )
         if sys.platform == "win32":
             popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
-
         try:
-            proc = subprocess.Popen(cmd, **popen_kwargs)
-            self._child_procs.append(proc)
-            self._reap_children()
+            return subprocess.Popen(cmd, **popen_kwargs)
         except Exception as e:
             self._notify(f"Failed to run analysis: {e}", error=True)
-            return
-
-        original_label = next(
-            (name for name, mod, _desc in VIEWS if mod == module_name),
-            module_name,
-        )
-        self._running_views[module_name] = (proc, original_label)
-        btn = self._view_buttons.get(module_name)
-        if btn is not None:
-            btn.setText(original_label)
-        self._update_spinner()
-        if self._poll_timer is None:
-            self._poll_timer = QTimer(self)
-            self._poll_timer.timeout.connect(self._poll_running_views)
-            self._poll_timer.start(120)
-
-        threading.Thread(
-            target=self._watch_subprocess_ready,
-            args=(proc, module_name),
-            daemon=True,
-        ).start()
-
-    def _update_spinner(self) -> None:
-        frame = _SPINNER[self._spinner_frame % len(_SPINNER)]
-        for module_name, (_proc, original_label) in self._running_views.items():
-            btn = self._view_buttons.get(module_name)
-            if btn is not None:
-                btn.setText(f"{frame} {original_label}")
+            return None
 
     def _watch_subprocess_ready(
         self, proc: subprocess.Popen, module_name: str
@@ -842,6 +965,21 @@ class ScanKitMainWindow(QMainWindow):
         try:
             for _ in proc.stdout:
                 pass
+        except Exception:
+            pass
+
+    def _watch_worker(self, worker: _WarmWorker) -> None:
+        """Read a worker's stdout for the warm and plot-ready sentinels (and drain)."""
+        stdout = worker.proc.stdout
+        if stdout is None:
+            return
+        try:
+            for line in stdout:
+                if _WORKER_WARM_SENTINEL.encode() in line:
+                    worker.warm.set()
+                    continue
+                if worker.module_name and _READY_SENTINEL.encode() in line:
+                    self._sig_plot_window_ready.emit(worker.module_name, worker.proc)
         except Exception:
             pass
 
@@ -930,6 +1068,12 @@ class ScanKitMainWindow(QMainWindow):
         self._running_views.clear()
         self._open_views.clear()
         self._launch_args.clear()
+        for worker in self._warm_idle:
+            try:
+                worker.proc.kill()
+            except Exception:
+                pass
+        self._warm_idle.clear()
         for proc in self._child_procs:
             try:
                 proc.kill()
@@ -960,6 +1104,11 @@ def main() -> None:
 
     if "--version" in sys.argv or "-V" in sys.argv:
         print(f"scan-kit {__version__}")
+        return
+
+    if "--warm-worker" in sys.argv:
+        from .common.view_runner import warm_worker_main
+        warm_worker_main()
         return
 
     if "--run-view" in sys.argv:

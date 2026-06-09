@@ -27,7 +27,7 @@ from ..common.session_source import load_session_timeslice_device_units
 from ..common.timeslice_position_error import (
     TIMESLICE_POSITION_ERROR_COLS,
     frame_timeslice_error_arrays,
-    resolve_timeslice_error_source,
+    resolve_session_timeslice_error_source,
 )
 from .timeslice_replay_common import load_energy_lookups, resolve_col, resolve_frame_energy
 
@@ -91,7 +91,7 @@ def _load_session_spill_paths(
 
     df0 = frames[0]
     ts_layer = resolve_col(df0.columns, C_LAYER_ID)
-    error_source = resolve_timeslice_error_source(df0.columns)
+    error_source = resolve_session_timeslice_error_source(src, frames)
     if ts_layer is None or error_source is None:
         return None
 
