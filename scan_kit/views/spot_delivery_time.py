@@ -15,13 +15,12 @@ from ..common import (
     filter_data_rows,
     process_position_data,
     plot_boxplots_for_column,
-    set_view_header,
+    finish_view,
     style_energy_axes,
     add_energy_trend,
     link_boxplot_to_histogram,
     DEFAULT_SESSION_COLORS,
-    FIG_SIZE_2x2,
-    apply_tight_layout,
+    view_grid,
     try_load_position_data,
 )
 from ..common.session_source import (
@@ -221,10 +220,8 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
         columns = columns[:1]
 
     n_cols = len(columns)
-    fig, axes = plt.subplots(
-        2, n_cols,
-        figsize=(max(12, 6 * n_cols), FIG_SIZE_2x2[1] * 2),
-        squeeze=False,
+    fig, axes = view_grid(
+        2, n_cols, cell_w=max(6.0, 12.0 / n_cols), cell_h=7.0,
     )
 
     all_selectors = []
@@ -260,7 +257,5 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
             )
             all_selectors.extend(sels)
 
-    set_view_header(fig, "Spot Delivery Time Analysis", loaded_ids, colors, base_dir=base_dir)
-
-    apply_tight_layout()
+    finish_view(fig, "Spot Delivery Time Analysis", loaded_ids, colors, base_dir=base_dir)
     plt.show()

@@ -26,8 +26,8 @@ from ..common import (
     resolve_concept_column,
     subtract_background_frames,
     DEFAULT_SESSION_COLORS,
-    set_view_header,
-    apply_tight_layout,
+    finish_view,
+    view_grid,
     GRID_KW,
 )
 from ..common.session_source import (
@@ -193,9 +193,7 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
     loaded_ids = list(session_data.keys())
     colors = DEFAULT_SESSION_COLORS[: len(loaded_ids)]
 
-    fig, axes = plt.subplots(
-        n_rows, n_cols, figsize=(6 * n_cols, 5 * n_rows), squeeze=False,
-    )
+    fig, axes = view_grid(n_rows, n_cols, cell_h=5.0)
 
     for col_idx, ic in enumerate(ic_keys):
         ax_cum = axes[0, col_idx]
@@ -300,13 +298,11 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
     if has_current:
         axes[2, 0].legend(loc="upper left", fontsize=8)
 
-    set_view_header(
+    finish_view(
         fig,
         "Dose Accumulation: Expected vs Measured",
         loaded_ids,
         colors,
         base_dir=base_dir,
     )
-
-    apply_tight_layout()
     plt.show()

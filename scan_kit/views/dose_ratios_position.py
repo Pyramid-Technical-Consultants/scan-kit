@@ -18,10 +18,9 @@ from ..common import (
     try_load_position_data,
     make_trend_legend,
     trend_session_prefix,
-    set_view_header,
+    finish_view,
+    view_grid,
     DEFAULT_SESSION_COLORS,
-    FIG_SIZE_2x2,
-    apply_tight_layout,
     GRID_KW,
 )
 
@@ -112,10 +111,7 @@ def run(session_ids: list[str], base_dir: str = "test_data",
     session_data_g3 = {k: v for k, v in session_data.items() if "ic31_ratio" in v}
     colors_g3 = [colors[loaded_ids.index(sid)] for sid in session_data_g3]
 
-    fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(
-        2, 2, figsize=FIG_SIZE_2x2, sharex=False, sharey=False
-    )
-    set_view_header(fig, "Dose Ratios vs Beam Position", loaded_ids, colors, base_dir=base_dir)
+    fig, ((ax1, ax2), (ax3, ax4)) = view_grid(2, 2, sharex=False, sharey=False)
 
     if session_data_g3:
         _plot_ratio_vs_distance(
@@ -136,5 +132,5 @@ def run(session_ids: list[str], base_dir: str = "test_data",
 
     ax4.axis("off")
 
-    apply_tight_layout()
+    finish_view(fig, "Dose Ratios vs Beam Position", loaded_ids, colors, base_dir=base_dir)
     plt.show()

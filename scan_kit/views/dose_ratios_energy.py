@@ -17,11 +17,10 @@ from ..common import (
     plot_boxplots_for_column,
     add_energy_trend,
     add_correlation_scatter,
-    set_view_header,
+    finish_view,
     style_energy_axes,
     DEFAULT_SESSION_COLORS,
-    FIG_SIZE_2x2,
-    apply_tight_layout,
+    view_grid,
 )
 
 import logging
@@ -78,8 +77,8 @@ def run(session_ids: list[str], base_dir: str = "test_data",
         _log.debug("No valid data found for any session")
         return
 
-    fig, axes = plt.subplots(
-        3, 2, figsize=(FIG_SIZE_2x2[0] + 4, FIG_SIZE_2x2[1] * 1.4),
+    fig, axes = view_grid(
+        3, 2, cell_w=8.0, cell_h=3.6,
         gridspec_kw={"width_ratios": [4, 1]},
     )
     box_axes = [axes[0, 0], axes[1, 0], axes[2, 0]]
@@ -145,7 +144,5 @@ def run(session_ids: list[str], base_dir: str = "test_data",
         else:
             corr_axes[row].set_visible(False)
 
-    set_view_header(fig, "Dose Ratios vs Energy", loaded_ids, colors, base_dir=base_dir)
-
-    apply_tight_layout()
+    finish_view(fig, "Dose Ratios vs Energy", loaded_ids, colors, base_dir=base_dir)
     plt.show()

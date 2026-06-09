@@ -6,7 +6,6 @@ import logging
 import math
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Literal
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -18,54 +17,31 @@ from ..common import (
     DEFAULT_SESSION_COLORS,
     GRID_KW,
     REFLINE_KW,
-    apply_tight_layout,
     detect_beam_on_mask,
     detect_spill_segments,
-    set_view_header,
+    finish_view,
     subtract_background_frames,
+    view_grid,
 )
-from ..common.g3_timeslice_position import (
-    G3PositionTargetColumns,
-    g3_position_error_frame_arrays,
-    resolve_g3_position_target_columns,
-)
-from ..common.schema import resolve_column_name
 from ..common.session_source import load_session_timeslice_device_units
+from ..common.timeslice_position_error import (
+    TIMESLICE_POSITION_ERROR_COLS,
+    frame_timeslice_error_arrays,
+    resolve_timeslice_error_source,
+)
 from .timeslice_replay_common import load_energy_lookups, resolve_col, resolve_frame_energy
 
 _log = logging.getLogger(__name__)
 
 MAX_GRID_COLS = 10
 MAX_GRID_ROWS = 8
+# Dense small-multiples grid: tiny per-energy cells (overrides the standard size).
 CELL_WIDTH_IN = 1.3
 CELL_HEIGHT_IN = 1.1
-HEADER_HEIGHT_IN = 0.8
 
 LINE_LW = 0.7
 LINE_ALPHA = 0.75
 REF_CIRCLE_RADIUS_MM = 1.0
-
-_G2_DIRECT_ERROR = (
-    ("ic1_x_err", "position_err_X"),
-    ("ic1_y_err", "position_err_Y"),
-    ("ic2_x_err", "position_err_X2"),
-    ("ic2_y_err", "position_err_Y2"),
-)
-
-_TIMESLICE_COLS = [
-    C_LAYER_ID,
-    "rci_in_trigger",
-    "r_beamOk",
-    *(name for _, name in _G2_DIRECT_ERROR),
-    "r_ic1_x_position",
-    "ic1_position_x_target",
-    "r_ic1_y_position",
-    "ic1_position_y_target",
-    "r_ic2_x_position",
-    "ic2_position_x_target",
-    "r_ic2_y_position",
-    "ic2_position_y_target",
-]
 
 
 @dataclass(frozen=True)
@@ -74,65 +50,6 @@ class SpillPath:
     ic1_y_err: np.ndarray
     ic2_x_err: np.ndarray
     ic2_y_err: np.ndarray
-
-
-@dataclass(frozen=True)
-class _DirectErrorSource:
-    mode: Literal["direct"]
-    columns: dict[str, str]
-
-
-@dataclass(frozen=True)
-class _G3PositionTargetSource:
-    mode: Literal["g3_position_target"]
-    columns: G3PositionTargetColumns
-
-
-_ErrorSource = _DirectErrorSource | _G3PositionTargetSource
-
-
-def _resolve_named_columns(columns, pairs: tuple[tuple[str, str], ...]) -> dict[str, str] | None:
-    resolved: dict[str, str] = {}
-    for label, name in pairs:
-        col = resolve_column_name(columns, name)
-        if col is None:
-            return None
-        resolved[label] = col
-    return resolved
-
-
-def _resolve_error_source(columns) -> _ErrorSource | None:
-    direct = _resolve_named_columns(columns, _G2_DIRECT_ERROR)
-    if direct is not None:
-        return _DirectErrorSource("direct", direct)
-
-    g3_cols = resolve_g3_position_target_columns(columns)
-    if g3_cols is not None:
-        return _G3PositionTargetSource("g3_position_target", g3_cols)
-
-    return None
-
-
-def _sanitize_error(arr: np.ndarray) -> np.ndarray:
-    out = arr.astype(float, copy=True)
-    out[~np.isfinite(out)] = np.nan
-    out[np.abs(out) > 128] = np.nan
-    return out
-
-
-def _frame_error_arrays(
-    df,
-    source: _ErrorSource,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None:
-    if source.mode == "direct":
-        return (
-            _sanitize_error(df[source.columns["ic1_x_err"]].values),
-            _sanitize_error(df[source.columns["ic1_y_err"]].values),
-            _sanitize_error(df[source.columns["ic2_x_err"]].values),
-            _sanitize_error(df[source.columns["ic2_y_err"]].values),
-        )
-
-    return g3_position_error_frame_arrays(df, source.columns)
 
 
 def _spill_path_from_arrays(
@@ -164,7 +81,9 @@ def _load_session_spill_paths(
         return None
     src, energy_by_layer, energy_by_idx = loaded
 
-    frames = load_session_timeslice_device_units(src, usecols=_TIMESLICE_COLS)
+    frames = load_session_timeslice_device_units(
+        src, usecols=TIMESLICE_POSITION_ERROR_COLS
+    )
     if not frames:
         return None
     if bg_subtract:
@@ -172,7 +91,7 @@ def _load_session_spill_paths(
 
     df0 = frames[0]
     ts_layer = resolve_col(df0.columns, C_LAYER_ID)
-    error_source = _resolve_error_source(df0.columns)
+    error_source = resolve_timeslice_error_source(df0.columns)
     if ts_layer is None or error_source is None:
         return None
 
@@ -193,7 +112,7 @@ def _load_session_spill_paths(
         if beam_on is None:
             continue
 
-        frame_errors = _frame_error_arrays(df, error_source)
+        frame_errors = frame_timeslice_error_arrays(df, error_source)
         if frame_errors is None:
             continue
 
@@ -290,8 +209,9 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
     energies = sorted(all_energies)
 
     nrows, ncols = _grid_shape(len(energies))
-    figsize = (CELL_WIDTH_IN * ncols, CELL_HEIGHT_IN * nrows + HEADER_HEIGHT_IN)
-    fig, axes = plt.subplots(nrows, ncols, figsize=figsize, squeeze=False)
+    fig, axes = view_grid(
+        nrows, ncols, cell_w=CELL_WIDTH_IN, cell_h=CELL_HEIGHT_IN
+    )
 
     for idx, energy in enumerate(energies):
         ax = axes[idx // ncols][idx % ncols]
@@ -314,13 +234,11 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
         framealpha=0.9,
     )
 
-    set_view_header(
+    finish_view(
         fig,
         "Beam Error Motion vs Energy (spill paths)",
         loaded_ids,
         colors,
         base_dir=base_dir,
     )
-
-    apply_tight_layout()
     plt.show()

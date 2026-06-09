@@ -23,11 +23,10 @@ from ..common import (
     C_ENERGY,
     plot_violins_for_column,
     apply_shared_block_labels,
-    set_view_header,
+    finish_view,
     style_energy_axes,
     DEFAULT_SESSION_COLORS,
-    FIG_SIZE_1x2,
-    apply_tight_layout,
+    view_grid,
 )
 
 _log = logging.getLogger(__name__)
@@ -249,11 +248,7 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
     colors = DEFAULT_SESSION_COLORS[: len(loaded_ids)]
     expected_sigmas = _load_expected_sigmas(loaded_ids, energies, base_dir)
 
-    fig, axes = plt.subplots(
-        2, 2,
-        figsize=(FIG_SIZE_1x2[0], FIG_SIZE_1x2[1] * 2),
-        squeeze=False,
-    )
+    fig, axes = view_grid(2, 2)
 
     master = axes[0, 0]
     _link_axes_keep_tick_labels(axes.flat, master)
@@ -295,14 +290,12 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
         bottom_row=1,
     )
 
-    set_view_header(
+    fig.align_ylabels(axes[:, 0])
+    finish_view(
         fig,
         "Sigma vs Energy (mm)",
         loaded_ids,
         colors,
         base_dir=base_dir,
     )
-
-    fig.align_ylabels(axes[:, 0])
-    apply_tight_layout()
     plt.show()

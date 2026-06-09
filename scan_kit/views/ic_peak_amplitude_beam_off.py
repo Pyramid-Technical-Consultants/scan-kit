@@ -10,12 +10,11 @@ import numpy as np
 
 from ..common import (
     DEFAULT_SESSION_COLORS,
-    FIG_SIZE_2x2,
     GRID_KW,
     IC_PEAK_AMPLITUDE_COLUMNS,
-    apply_tight_layout,
+    finish_view,
     resolve_concept_column,
-    set_view_header,
+    view_grid,
 )
 from ..common.processing import _detect_beam_off_mask
 from ..common.session_source import (
@@ -182,11 +181,10 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
     loaded_ids = list(data.keys())
     colors = DEFAULT_SESSION_COLORS[: len(loaded_ids)]
 
-    fig, axes = plt.subplots(2, 2, figsize=FIG_SIZE_2x2)
+    fig, axes = view_grid(2, 2)
     for ax, (col, title) in zip(axes.flat, _PANELS):
         x_lo, x_hi = _panel_x_limits(data, col)
         _plot_panel(ax, data, col, loaded_ids, colors, x_lo=x_lo, x_hi=x_hi, title=title)
 
-    set_view_header(fig, VIEW_TITLE, loaded_ids, colors, base_dir=base_dir)
-    apply_tight_layout()
+    finish_view(fig, VIEW_TITLE, loaded_ids, colors, base_dir=base_dir)
     plt.show()

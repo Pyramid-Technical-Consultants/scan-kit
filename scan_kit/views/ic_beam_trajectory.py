@@ -46,11 +46,10 @@ from ..common import (
     C_Y_POSITION,
     process_position_data,
     try_load_position_data,
-    set_view_header,
+    finish_view,
     format_session_legend_label,
     DEFAULT_SESSION_COLORS,
-    FIG_SIZE_1x2,
-    apply_tight_layout,
+    view_grid,
     GRID_KW,
     REFLINE_KW,
 )
@@ -397,7 +396,7 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
     colors = DEFAULT_SESSION_COLORS[: len(loaded_ids)]
     notes = load_notes(base_dir)
 
-    fig, (ax_x, ax_y) = plt.subplots(1, 2, figsize=FIG_SIZE_1x2)
+    fig, (ax_x, ax_y) = view_grid(1, 2, squeeze=True)
 
     axis_defs = (
         (ax_x, "X", "ic2_x", "ic1_x", C_X_POSITION),
@@ -528,7 +527,7 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
                 framealpha=0.92,
             )
 
-    set_view_header(
+    finish_view(
         fig,
         (
             f"IC Beam Trajectory (raw IC; "
@@ -539,6 +538,4 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
         colors,
         base_dir=base_dir,
     )
-
-    apply_tight_layout()
     plt.show()

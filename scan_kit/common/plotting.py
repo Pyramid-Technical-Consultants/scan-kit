@@ -23,6 +23,16 @@ FIG_SIZE_2x2 = (15, 8)
 FIG_SIZE_1x2 = (15, 6)
 FIG_SIZE_SINGLE = (14, 8)
 
+# Standard per-cell figure sizing for analytic grid views. Figure size is
+# derived as (ncols * CELL_W, nrows * CELL_H + HEADER_H) so every view shares
+# consistent panel proportions and header spacing. Use :func:`view_grid`.
+# Views that need square panels (scatter / position space) can pass
+# ``cell_w == cell_h`` (see :data:`CELL_SQUARE`).
+CELL_W = 7.0
+CELL_H = 4.2
+CELL_SQUARE = 4.6
+HEADER_H = 0.9  # vertical inches reserved for the view header (title + legend)
+
 SUPTITLE_KW = dict(fontsize=13, fontweight="bold")
 
 # Shared view header — title and session legend centered as one group.
@@ -445,6 +455,52 @@ def apply_tight_layout(fig=None, *, pad=TIGHT_LAYOUT_PAD, h_pad=None, w_pad=None
     elif measure:
         fig.draw_without_rendering()
     fig.tight_layout(pad=pad, h_pad=h_pad, w_pad=w_pad, rect=rect)
+
+
+def view_grid(
+    nrows: int = 1,
+    ncols: int = 1,
+    *,
+    cell_w: float = CELL_W,
+    cell_h: float = CELL_H,
+    header: bool = True,
+    squeeze: bool = False,
+    **subplots_kwargs,
+):
+    """Create a standard analytic-view subplot grid sized by per-cell dimensions.
+
+    Figure size is ``(ncols * cell_w, nrows * cell_h + header_height)`` so panel
+    proportions and header spacing stay consistent across views. Pass
+    ``header=False`` to omit the reserved header band (views without a header).
+
+    Returns the ``(fig, axes)`` tuple from :func:`matplotlib.pyplot.subplots`.
+    With the default ``squeeze=False``, *axes* is always a 2-D array.
+    """
+    fig_w = ncols * cell_w
+    fig_h = nrows * cell_h + (HEADER_H if header else 0.0)
+    return plt.subplots(
+        nrows, ncols, figsize=(fig_w, fig_h), squeeze=squeeze, **subplots_kwargs
+    )
+
+
+def finish_view(
+    fig,
+    title: str,
+    session_ids,
+    colors,
+    *,
+    base_dir: str | None = None,
+    notes: dict | None = None,
+    **layout_kwargs,
+) -> None:
+    """Apply the standard view header then tight layout.
+
+    Wraps the ``set_view_header(...)`` + ``apply_tight_layout(...)`` tail shared
+    by analytic views. Extra keyword args are forwarded to
+    :func:`apply_tight_layout`.
+    """
+    set_view_header(fig, title, session_ids, colors, base_dir=base_dir, notes=notes)
+    apply_tight_layout(fig, **layout_kwargs)
 
 
 def apply_toolbar_tight_layout(fig=None) -> None:

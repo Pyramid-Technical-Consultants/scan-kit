@@ -14,9 +14,10 @@ from ..common import (
     POSITION_KEY_G3,
     process_position_data,
     try_load_position_data,
+    CELL_SQUARE,
     DEFAULT_SESSION_COLORS,
-    set_view_header,
-    FIG_SIZE_SINGLE,
+    finish_view,
+    view_grid,
     GRID_KW,
     REFLINE_KW,
     SCATTER_ALPHA,
@@ -64,19 +65,11 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
     colors = DEFAULT_SESSION_COLORS[: len(loaded_ids)]
     color_by_sid = dict(zip(loaded_ids, colors))
 
-    h = FIG_SIZE_SINGLE[1]
-    fig, (ax_plan, ax_ic1, ax_ic2) = plt.subplots(
-        1, 3, figsize=(h * 3.2, h), sharex=True, sharey=True,
+    fig, (ax_plan, ax_ic1, ax_ic2) = view_grid(
+        1, 3, cell_w=CELL_SQUARE, cell_h=CELL_SQUARE, squeeze=True,
+        sharex=True, sharey=True,
     )
     row_axes = [ax_plan, ax_ic1, ax_ic2]
-
-    set_view_header(
-        fig,
-        f"Spot Positions ({mode_label})",
-        loaded_ids,
-        colors,
-        base_dir=base_dir,
-    )
 
     for ax in row_axes:
         ax.axhline(y=0, **REFLINE_KW)
@@ -118,4 +111,5 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
     ax_plan.set_xlim(lo, hi)
     ax_plan.set_ylim(lo, hi)
 
+    finish_view(fig, f"Spot Positions ({mode_label})", loaded_ids, colors, base_dir=base_dir)
     plt.show()

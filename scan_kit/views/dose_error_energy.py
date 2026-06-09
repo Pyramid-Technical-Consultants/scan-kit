@@ -14,14 +14,13 @@ from ..common import (
     add_dose_error_columns,
     DELIVERED_DOSE_COLS,
     plot_boxplots_for_column,
-    set_view_header,
+    finish_view,
     style_energy_axes,
     add_energy_trend,
     add_correlation_scatter,
     link_boxplot_to_histogram,
     DEFAULT_SESSION_COLORS,
-    FIG_SIZE_2x2,
-    apply_tight_layout,
+    view_grid,
     REFLINE_KW,
 )
 
@@ -108,12 +107,10 @@ def run(session_ids: list[str], base_dir: str = "test_data",
     n_corr_rows = len(corr_pairs)
     n_rows = max(n_err_rows, n_corr_rows)
 
-    fig, axes = plt.subplots(
-        n_rows, 3, figsize=(FIG_SIZE_2x2[0] + 5, 3.5 * n_rows),
+    fig, axes = view_grid(
+        n_rows, 3, cell_h=3.5,
         gridspec_kw={"width_ratios": [4, 1, 1]},
     )
-    if n_rows == 1:
-        axes = axes.reshape(1, 3)
 
     box_axes = [axes[r, 0] for r in range(n_rows)]
     hist_axes = [axes[r, 1] for r in range(n_rows)]
@@ -161,13 +158,11 @@ def run(session_ids: list[str], base_dir: str = "test_data",
     for row in range(n_corr_rows, n_rows):
         corr_axes[row].set_visible(False)
 
-    set_view_header(
+    finish_view(
         fig,
         "Dose Error vs Energy (% of prescribed dose)",
         loaded_ids,
         colors,
         base_dir=base_dir,
     )
-
-    apply_tight_layout()
     plt.show()

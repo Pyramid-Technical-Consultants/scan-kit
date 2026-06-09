@@ -17,14 +17,13 @@ from ..common import (
     C_TIME_S,
     C_TIMESTAMP,
     DEFAULT_SESSION_COLORS,
-    FIG_SIZE_2x2,
     GRID_KW,
     SCATTER_SIZE,
-    apply_tight_layout,
+    finish_view,
     resolve_concept_column,
-    set_view_header,
     style_energy_axes,
     trend_session_prefix,
+    view_grid,
 )
 from ..common.session_source import (
     load_session_csv,
@@ -213,7 +212,8 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
     loaded_ids = list(session_data.keys())
     colors = DEFAULT_SESSION_COLORS[: len(loaded_ids)]
 
-    fig, ax = plt.subplots(figsize=FIG_SIZE_2x2)
+    # Single wide energy axis (many energy categories on x).
+    fig, ax = view_grid(1, 1, squeeze=True, cell_w=13.0, cell_h=6.5)
     avg_entries = _plot_sessions(ax, session_data, energies, loaded_ids, colors)
 
     ax.set_title("Wall-clock delivery rate by energy")
@@ -221,6 +221,5 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
     ax.grid(**GRID_KW)
     _make_avg_rate_legend(ax, avg_entries)
 
-    set_view_header(fig, VIEW_TITLE, loaded_ids, colors, base_dir=base_dir)
-    apply_tight_layout()
+    finish_view(fig, VIEW_TITLE, loaded_ids, colors, base_dir=base_dir)
     plt.show()

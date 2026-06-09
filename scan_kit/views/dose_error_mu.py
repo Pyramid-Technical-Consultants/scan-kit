@@ -21,10 +21,9 @@ from ..common import (
     add_scatter_trend,
     make_trend_legend,
     trend_session_prefix,
-    set_view_header,
+    finish_view,
     DEFAULT_SESSION_COLORS,
     FIG_SIZE_2x2,
-    apply_tight_layout,
     REFLINE_KW,
     GRID_KW,
     DELIVERED_DOSE_COLS,
@@ -428,14 +427,12 @@ def run(session_ids: list[str], base_dir: str = "test_data",
                 if bin_idx == n_mu - 1:
                     ax.set_xlabel(HIST_XLABEL)
 
-    set_view_header(
+    fig.align_ylabels(axes[:, 0])
+    finish_view(
         fig,
         "Dose Error vs Target MU (% of prescribed dose)",
         loaded_ids,
         colors,
         base_dir=base_dir,
     )
-
-    fig.align_ylabels(axes[:, 0])
-    apply_tight_layout()
     plt.show()

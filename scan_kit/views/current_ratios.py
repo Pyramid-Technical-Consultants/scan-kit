@@ -20,9 +20,9 @@ from ..common import (
     add_scatter_trend,
     make_trend_legend,
     trend_session_prefix,
-    set_view_header,
+    finish_view,
     DEFAULT_SESSION_COLORS,
-    apply_tight_layout,
+    view_grid,
 )
 from ..common import subtract_background_frames
 from ..common.processing import _detect_beam_off_mask
@@ -412,11 +412,11 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
     n_rows = max(n_ratio_rows, n_heatmap_rows)
     n_cols = len(_COL_DEFS)
 
-    fig, axes = plt.subplots(
+    fig, axes = view_grid(
         n_rows,
         n_cols,
-        figsize=(5.0 * n_cols, 3.5 * n_rows + 1.0),
-        squeeze=False,
+        cell_w=5.0,
+        cell_h=3.5,
         width_ratios=[w for _, _, w in _COL_DEFS],
     )
 
@@ -470,13 +470,11 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
         for ax in pct_axes:
             ax.set_ylim(y_lo, y_hi)
 
-    set_view_header(
+    finish_view(
         fig,
         "Current Ratios vs Energy  (plateau mean)",
         loaded_ids,
         colors,
         base_dir=base_dir,
     )
-
-    apply_tight_layout()
     plt.show()

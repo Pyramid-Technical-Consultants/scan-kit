@@ -12,7 +12,7 @@ from scan_kit.common.session_source import (
     load_session_timeslice_device_units,
     resolve_session_source,
 )
-from scan_kit.views.beam_motion_energy import _TIMESLICE_COLS
+from scan_kit.common.timeslice_position_error import TIMESLICE_POSITION_ERROR_COLS
 
 TEST_DATA = Path(__file__).resolve().parents[1] / "test_data"
 
@@ -50,7 +50,7 @@ def test_cached_raw_usecols_loads_all_layers() -> None:
     if src is None:
         return
 
-    frames = load_session_timeslice_device_units(src, usecols=_TIMESLICE_COLS)
+    frames = load_session_timeslice_device_units(src, usecols=TIMESLICE_POSITION_ERROR_COLS)
     assert len(frames) == 76
     for df in frames:
         assert "rci_in_trigger" in df.columns or "r_beamOk" in df.columns

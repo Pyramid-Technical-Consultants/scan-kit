@@ -14,10 +14,10 @@ from ..common import (
     C_IC3_CURRENT_D,
     C_LAYER_ID,
     plot_boxplots_for_column,
-    set_view_header,
+    finish_view,
     style_energy_axes,
     DEFAULT_SESSION_COLORS,
-    apply_tight_layout,
+    view_grid,
 )
 from ..common.session_source import (
     load_session_csv,
@@ -191,14 +191,10 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
     loaded_ids = list(session_data.keys())
     colors = DEFAULT_SESSION_COLORS[: len(loaded_ids)]
 
-    fig = plt.figure(figsize=(6 * n_cols, 10))
-    axes = np.empty((2, n_cols), dtype=object)
-    axes[0, 0] = fig.add_subplot(2, n_cols, 1)
-    for c in range(1, n_cols):
-        axes[0, c] = fig.add_subplot(2, n_cols, c + 1, sharex=axes[0, 0], sharey=axes[0, 0])
-    axes[1, 0] = fig.add_subplot(2, n_cols, n_cols + 1, sharex=axes[0, 0])
-    for c in range(1, n_cols):
-        axes[1, c] = fig.add_subplot(2, n_cols, n_cols + c + 1, sharex=axes[0, 0], sharey=axes[1, 0])
+    # All panels share the energy x-axis; current y-axis is shared within each row.
+    fig, axes = view_grid(
+        2, n_cols, cell_w=6.0, cell_h=4.5, sharex=True, sharey="row",
+    )
 
     for col, (ic, title) in enumerate(zip(ic_keys, ic_titles)):
         ax_on = axes[0, col]
@@ -231,13 +227,11 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
     for ax in axes.flat:
         ax.label_outer()
 
-    set_view_header(
+    finish_view(
         fig,
         "Beam-On / Beam-Off Current by Energy",
         loaded_ids,
         colors,
         base_dir=base_dir,
     )
-
-    apply_tight_layout()
     plt.show()
