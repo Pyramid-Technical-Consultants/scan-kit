@@ -11,29 +11,27 @@ from typing import Literal
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.lines import Line2D
+from matplotlib.patches import Circle
 
 from ..common import (
-    C_IC1_X_POS,
-    C_IC1_Y_POS,
-    C_IC2_X_POS,
-    C_IC2_Y_POS,
     C_LAYER_ID,
-    C_SPOT_NO,
-    C_X_POSITION,
-    C_Y_POSITION,
     DEFAULT_SESSION_COLORS,
     GRID_KW,
     REFLINE_KW,
     apply_tight_layout,
     detect_beam_on_mask,
     detect_spill_segments,
-    resolve_concept_column,
     set_view_header,
     subtract_background_frames,
 )
-from ..common.schema import POSITION_KEY_G2, POSITION_KEY_G3, resolve_column_name
-from ..common.session_source import load_session_csv, load_session_timeslice_device_units
-from .timeslice_replay_common import load_energy_by_layer, resolve_col
+from ..common.g3_timeslice_position import (
+    G3PositionTargetColumns,
+    g3_position_error_frame_arrays,
+    resolve_g3_position_target_columns,
+)
+from ..common.schema import resolve_column_name
+from ..common.session_source import load_session_timeslice_device_units
+from .timeslice_replay_common import load_energy_lookups, resolve_col, resolve_frame_energy
 
 _log = logging.getLogger(__name__)
 
@@ -45,8 +43,8 @@ HEADER_HEIGHT_IN = 0.8
 
 LINE_LW = 0.7
 LINE_ALPHA = 0.75
+REF_CIRCLE_RADIUS_MM = 1.0
 
-# G2 timeslice exports precomputed position error (mm).
 _G2_DIRECT_ERROR = (
     ("ic1_x_err", "position_err_X"),
     ("ic1_y_err", "position_err_Y"),
@@ -54,13 +52,20 @@ _G2_DIRECT_ERROR = (
     ("ic2_y_err", "position_err_Y2"),
 )
 
-# G3 timeslice: processed position minus per-IC target (both mm, same frame).
-_G3_MEASURED_TARGET = (
-    ("ic1_x", "r_ic1_x_position", "ic1_position_x_target"),
-    ("ic1_y", "r_ic1_y_position", "ic1_position_y_target"),
-    ("ic2_x", "r_ic2_x_position", "ic2_position_x_target"),
-    ("ic2_y", "r_ic2_y_position", "ic2_position_y_target"),
-)
+_TIMESLICE_COLS = [
+    C_LAYER_ID,
+    "rci_in_trigger",
+    "r_beamOk",
+    *(name for _, name in _G2_DIRECT_ERROR),
+    "r_ic1_x_position",
+    "ic1_position_x_target",
+    "r_ic1_y_position",
+    "ic1_position_y_target",
+    "r_ic2_x_position",
+    "ic2_position_x_target",
+    "r_ic2_y_position",
+    "ic2_position_y_target",
+]
 
 
 @dataclass(frozen=True)
@@ -78,13 +83,12 @@ class _DirectErrorSource:
 
 
 @dataclass(frozen=True)
-class _DeltaErrorSource:
-    mode: Literal["delta"]
-    measured: dict[str, str]
-    nominal: dict[str, str]
+class _G3PositionTargetSource:
+    mode: Literal["g3_position_target"]
+    columns: G3PositionTargetColumns
 
 
-_ErrorSource = _DirectErrorSource | _DeltaErrorSource
+_ErrorSource = _DirectErrorSource | _G3PositionTargetSource
 
 
 def _resolve_named_columns(columns, pairs: tuple[tuple[str, str], ...]) -> dict[str, str] | None:
@@ -97,146 +101,48 @@ def _resolve_named_columns(columns, pairs: tuple[tuple[str, str], ...]) -> dict[
     return resolved
 
 
-def _resolve_concept_positions(columns) -> dict[str, str] | None:
-    pos_cols: dict[str, str] = {}
-    for pos_key in (POSITION_KEY_G3, POSITION_KEY_G2):
-        for concept, label in [
-            (C_IC1_X_POS, "ic1_x"),
-            (C_IC1_Y_POS, "ic1_y"),
-            (C_IC2_X_POS, "ic2_x"),
-            (C_IC2_Y_POS, "ic2_y"),
-        ]:
-            resolved = resolve_concept_column(columns, concept, position_key=pos_key)
-            if resolved and label not in pos_cols:
-                pos_cols[label] = resolved
-        if len(pos_cols) == 4:
-            return pos_cols
-    return None
-
-
-def _resolve_plan_columns(columns) -> dict[str, str] | None:
-    col_x = resolve_col(columns, C_X_POSITION)
-    col_y = resolve_col(columns, C_Y_POSITION)
-    if col_x is None or col_y is None:
-        return None
-    return {"x": col_x, "y": col_y}
-
-
 def _resolve_error_source(columns) -> _ErrorSource | None:
     direct = _resolve_named_columns(columns, _G2_DIRECT_ERROR)
     if direct is not None:
         return _DirectErrorSource("direct", direct)
 
-    pairs = _G3_MEASURED_TARGET
-    measured: dict[str, str] = {}
-    nominal: dict[str, str] = {}
-    for label, meas_name, nom_name in pairs:
-        meas_col = resolve_column_name(columns, meas_name)
-        nom_col = resolve_column_name(columns, nom_name)
-        if meas_col is None or nom_col is None:
-            measured.clear()
-            break
-        measured[label] = meas_col
-        nominal[label] = nom_col
-    if len(measured) == 4:
-        return _DeltaErrorSource("delta", measured, nominal)
-
-    pos_cols = _resolve_concept_positions(columns)
-    plan_cols = _resolve_plan_columns(columns)
-    if pos_cols is not None and plan_cols is not None:
-        return _DeltaErrorSource("delta", pos_cols, plan_cols)
-
-    if pos_cols is not None:
-        return _DeltaErrorSource("delta", pos_cols, {})
+    g3_cols = resolve_g3_position_target_columns(columns)
+    if g3_cols is not None:
+        return _G3PositionTargetSource("g3_position_target", g3_cols)
 
     return None
-
-
-def _load_plan_by_spot(src) -> dict[int, tuple[float, float]] | None:
-    input_map = load_session_csv(src, "input_map.csv")
-    if input_map is None:
-        return None
-    col_spot = resolve_col(input_map.columns, C_SPOT_NO)
-    col_x = resolve_col(input_map.columns, C_X_POSITION)
-    col_y = resolve_col(input_map.columns, C_Y_POSITION)
-    if col_spot is None or col_x is None or col_y is None:
-        return None
-    spot_nos = input_map[col_spot].values.astype(int)
-    plan_x = input_map[col_x].values.astype(float)
-    plan_y = input_map[col_y].values.astype(float)
-    return {
-        int(sno): (float(x), float(y))
-        for sno, x, y in zip(spot_nos, plan_x, plan_y, strict=True)
-    }
-
-
-def _lookup_plan_by_spot(
-    plan_by_spot: dict[int, tuple[float, float]],
-    spot_nos: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]:
-    plan_x = np.empty(len(spot_nos), dtype=float)
-    plan_y = np.empty(len(spot_nos), dtype=float)
-    for i, sno in enumerate(spot_nos.astype(int)):
-        entry = plan_by_spot.get(int(sno))
-        if entry is None:
-            plan_x[i] = np.nan
-            plan_y[i] = np.nan
-        else:
-            plan_x[i], plan_y[i] = entry
-    return plan_x, plan_y
 
 
 def _sanitize_error(arr: np.ndarray) -> np.ndarray:
     out = arr.astype(float, copy=True)
     out[~np.isfinite(out)] = np.nan
-    # G3 invalid register / G2 off-scale sentinels.
     out[np.abs(out) > 128] = np.nan
     return out
 
 
-def _slice_errors(
+def _frame_error_arrays(
     df,
     source: _ErrorSource,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None:
+    if source.mode == "direct":
+        return (
+            _sanitize_error(df[source.columns["ic1_x_err"]].values),
+            _sanitize_error(df[source.columns["ic1_y_err"]].values),
+            _sanitize_error(df[source.columns["ic2_x_err"]].values),
+            _sanitize_error(df[source.columns["ic2_y_err"]].values),
+        )
+
+    return g3_position_error_frame_arrays(df, source.columns)
+
+
+def _spill_path_from_arrays(
+    arrays: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray],
     start: int,
     end: int,
-    *,
-    spot_col: str | None,
-    plan_by_spot: dict[int, tuple[float, float]] | None,
 ) -> SpillPath | None:
-    if source.mode == "direct":
-        ic1_x_err = _sanitize_error(df[source.columns["ic1_x_err"]].values[start:end])
-        ic1_y_err = _sanitize_error(df[source.columns["ic1_y_err"]].values[start:end])
-        ic2_x_err = _sanitize_error(df[source.columns["ic2_x_err"]].values[start:end])
-        ic2_y_err = _sanitize_error(df[source.columns["ic2_y_err"]].values[start:end])
-    else:
-        measured = source.measured
-        nominal = source.nominal
-        if {"x", "y"} <= nominal.keys():
-            plan_x = df[nominal["x"]].values[start:end].astype(float)
-            plan_y = df[nominal["y"]].values[start:end].astype(float)
-        elif spot_col is not None and plan_by_spot is not None:
-            plan_x, plan_y = _lookup_plan_by_spot(plan_by_spot, df[spot_col].values[start:end])
-        elif all(k in nominal for k in ("ic1_x", "ic1_y", "ic2_x", "ic2_y")):
-            plan_x = plan_y = None
-        else:
-            return None
-
-        ic1_x = df[measured["ic1_x"]].values[start:end].astype(float)
-        ic1_y = df[measured["ic1_y"]].values[start:end].astype(float)
-        ic2_x = df[measured["ic2_x"]].values[start:end].astype(float)
-        ic2_y = df[measured["ic2_y"]].values[start:end].astype(float)
-
-        if plan_x is not None:
-            ic1_x_err = _sanitize_error(ic1_x - plan_x)
-            ic1_y_err = _sanitize_error(ic1_y - plan_y)
-            ic2_x_err = _sanitize_error(ic2_x - plan_x)
-            ic2_y_err = _sanitize_error(ic2_y - plan_y)
-        else:
-            ic1_x_err = _sanitize_error(ic1_x - df[nominal["ic1_x"]].values[start:end].astype(float))
-            ic1_y_err = _sanitize_error(ic1_y - df[nominal["ic1_y"]].values[start:end].astype(float))
-            ic2_x_err = _sanitize_error(ic2_x - df[nominal["ic2_x"]].values[start:end].astype(float))
-            ic2_y_err = _sanitize_error(ic2_y - df[nominal["ic2_y"]].values[start:end].astype(float))
-
+    ic1_x_err, ic1_y_err, ic2_x_err, ic2_y_err = (
+        arr[start:end] for arr in arrays
+    )
     if not any(np.isfinite(v).any() for v in (ic1_x_err, ic1_y_err, ic2_x_err, ic2_y_err)):
         return None
     return SpillPath(
@@ -253,12 +159,12 @@ def _load_session_spill_paths(
     *,
     bg_subtract: bool = False,
 ) -> dict[float, list[SpillPath]] | None:
-    loaded = load_energy_by_layer(session_id, base_dir)
+    loaded = load_energy_lookups(session_id, base_dir)
     if loaded is None:
         return None
-    src, energy_by_layer = loaded
+    src, energy_by_layer, energy_by_idx = loaded
 
-    frames = load_session_timeslice_device_units(src)
+    frames = load_session_timeslice_device_units(src, usecols=_TIMESLICE_COLS)
     if not frames:
         return None
     if bg_subtract:
@@ -270,25 +176,16 @@ def _load_session_spill_paths(
     if ts_layer is None or error_source is None:
         return None
 
-    spot_col = resolve_col(df0.columns, C_SPOT_NO)
-    plan_by_spot = None
-    if (
-        error_source.mode == "delta"
-        and {"x", "y"} <= error_source.nominal.keys()
-    ):
-        plan_by_spot = None
-    elif error_source.mode == "delta" and not (
-        {"ic1_x", "ic1_y", "ic2_x", "ic2_y"} <= error_source.nominal.keys()
-    ):
-        plan_by_spot = _load_plan_by_spot(src)
-        if spot_col is None or plan_by_spot is None:
-            return None
-
     by_energy: dict[float, list[SpillPath]] = defaultdict(list)
 
-    for df in frames:
-        layer_id = df[ts_layer].iloc[0]
-        energy = energy_by_layer.get(layer_id)
+    for frame_idx, df in enumerate(frames):
+        energy = resolve_frame_energy(
+            df,
+            frame_idx,
+            energy_by_layer=energy_by_layer,
+            energy_by_idx=energy_by_idx,
+            layer_col=ts_layer,
+        )
         if energy is None:
             continue
 
@@ -296,18 +193,12 @@ def _load_session_spill_paths(
         if beam_on is None:
             continue
 
-        layer_source = _resolve_error_source(df.columns) or error_source
-        layer_spot_col = resolve_col(df.columns, C_SPOT_NO) or spot_col
+        frame_errors = _frame_error_arrays(df, error_source)
+        if frame_errors is None:
+            continue
 
         for start, end in detect_spill_segments(beam_on):
-            path = _slice_errors(
-                df,
-                layer_source,
-                start,
-                end,
-                spot_col=layer_spot_col,
-                plan_by_spot=plan_by_spot,
-            )
+            path = _spill_path_from_arrays(frame_errors, start, end)
             if path is not None:
                 by_energy[float(energy)].append(path)
 
@@ -348,7 +239,23 @@ def _plot_spill_path(ax, path: SpillPath, color: str) -> None:
     )
 
 
+def _draw_reference_circle(ax) -> None:
+    ax.add_patch(
+        Circle(
+            (0, 0),
+            REF_CIRCLE_RADIUS_MM,
+            fill=False,
+            edgecolor="gray",
+            linestyle="--",
+            linewidth=1,
+            alpha=0.6,
+            zorder=0,
+        )
+    )
+
+
 def _style_energy_axis(ax, energy: float) -> None:
+    _draw_reference_circle(ax)
     ax.axhline(0, **REFLINE_KW)
     ax.axvline(0, **REFLINE_KW)
     ax.set_aspect("equal", adjustable="datalim")
@@ -388,10 +295,10 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
 
     for idx, energy in enumerate(energies):
         ax = axes[idx // ncols][idx % ncols]
+        _style_energy_axis(ax, energy)
         for sid, color in zip(loaded_ids, colors):
             for path in session_data[sid].get(energy, []):
                 _plot_spill_path(ax, path, color)
-        _style_energy_axis(ax, energy)
 
     for idx in range(len(energies), nrows * ncols):
         axes[idx // ncols][idx % ncols].set_visible(False)
@@ -406,10 +313,6 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
         fontsize=7,
         framealpha=0.9,
     )
-
-    if nrows > 0 and ncols > 0:
-        fig.supxlabel("X Error (mm)", fontsize=9)
-        fig.supylabel("Y Error (mm)", fontsize=9)
 
     set_view_header(
         fig,

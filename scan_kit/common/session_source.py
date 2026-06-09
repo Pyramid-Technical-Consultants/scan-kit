@@ -17,7 +17,13 @@ import logging
 import pandas as pd
 
 from .session_meta import SessionMeta, parse_termination_summary_text
-from .schema import canonical_column_aliases, canonicalize_dataframe_columns
+from .schema import (
+    canonical_column_aliases,
+    canonicalize_dataframe_columns,
+    resolve_column_name,
+    resolve_concept_column,
+    resolve_requested_column,
+)
 
 _log = logging.getLogger(__name__)
 
@@ -36,21 +42,98 @@ _ARCHIVE_SUFFIXES: tuple[str, ...] = (
 )
 _DEFAULT_CANONICAL_ALIASES = canonical_column_aliases()
 
+
+def _resolve_raw_csv_usecols(
+    header_columns: list[str],
+    canonical_usecols: list[str],
+) -> list[str]:
+    """Map requested post-canonical column names to raw CSV header names."""
+    raw: list[str] = []
+    seen: set[str] = set()
+    header_list = [str(c).strip() for c in header_columns]
+
+    for requested in canonical_usecols:
+        resolved = None
+        if requested in header_list:
+            resolved = requested
+        else:
+            resolved = resolve_concept_column(header_list, requested)
+        if resolved is None:
+            resolved = resolve_requested_column(header_list, requested)
+        if resolved is None:
+            resolved = resolve_column_name(header_list, requested)
+        if resolved is None or resolved in seen:
+            continue
+        seen.add(resolved)
+        raw.append(resolved)
+    return raw
+
+
+def _read_csv_header_columns(source) -> list[str] | None:
+    """Read CSV column names without loading row data."""
+    try:
+        if isinstance(source, (str, Path, os.PathLike)):
+            return pd.read_csv(
+                source, nrows=0, index_col=False, skipinitialspace=True
+            ).columns.tolist()
+        if hasattr(source, "seekable") and source.seekable():
+            pos = source.tell()
+            header = pd.read_csv(
+                source, nrows=0, index_col=False, skipinitialspace=True
+            ).columns.tolist()
+            source.seek(pos)
+            return header
+    except Exception:
+        return None
+    return None
+
+
 def _read_csv_robust(
     source,
     *,
     usecols: list[str] | None = None,
+    raw_usecols: list[str] | None = None,
     aliases: dict[str, tuple[str, ...]] | None = None,
 ) -> pd.DataFrame:
-    """Read a CSV and tolerate schema drift in column naming."""
-    df = pd.read_csv(source, index_col=False, skipinitialspace=True)
-    df = canonicalize_dataframe_columns(df, aliases=aliases or _DEFAULT_CANONICAL_ALIASES)
+    """Read a CSV and tolerate schema drift in column naming.
+
+    When *raw_usecols* is supplied (typically resolved once per session from the
+    first layer header), header re-read and column resolution are skipped.
+    """
+    alias_map = aliases or _DEFAULT_CANONICAL_ALIASES
+    read_usecols = raw_usecols
+    if usecols is not None and read_usecols is None:
+        header = _read_csv_header_columns(source)
+        if header is not None:
+            read_usecols = _resolve_raw_csv_usecols(header, usecols)
+            if not read_usecols:
+                read_usecols = None
+
+    df = pd.read_csv(
+        source,
+        index_col=False,
+        skipinitialspace=True,
+        usecols=read_usecols,
+    )
+    df = canonicalize_dataframe_columns(df, aliases=alias_map)
     if usecols is None:
         return df
     keep = [c for c in usecols if c in df.columns]
     if not keep:
         return df.iloc[:, 0:0]
     return df[keep]
+
+
+def _resolve_timeslice_raw_usecols(
+    source,
+    usecols: list[str],
+) -> list[str] | None:
+    """Resolve raw CSV column names for *usecols* from one timeslice file."""
+    header = _read_csv_header_columns(source)
+    if header is None:
+        return None
+    raw = _resolve_raw_csv_usecols(header, usecols)
+    return raw or None
 
 
 def _strip_archive_suffix(filename: str) -> str | None:
@@ -243,9 +326,12 @@ def load_session_timeslice_device_units(
                         matches.append((layer_idx, p))
                         break
             matches.sort(key=lambda t: t[0])
+            raw_usecols: list[str] | None = None
             frames = []
             for layer_idx, p in matches:
-                df = _read_csv_robust(p, usecols=usecols)
+                if usecols is not None and raw_usecols is None:
+                    raw_usecols = _resolve_timeslice_raw_usecols(p, usecols)
+                df = _read_csv_robust(p, usecols=usecols, raw_usecols=raw_usecols)
                 df["_layer_idx"] = layer_idx
                 frames.append(df)
             return frames
@@ -273,10 +359,13 @@ def _timeslices_from_zip(
         if m:
             matches.append((int(m.group(1)), entry))
     matches.sort(key=lambda t: t[0])
+    raw_usecols: list[str] | None = None
     frames = []
     for layer_idx, path in matches:
         with zf.open(path) as f:
-            df = _read_csv_robust(f, usecols=usecols)
+            if usecols is not None and raw_usecols is None:
+                raw_usecols = _resolve_timeslice_raw_usecols(f, usecols)
+            df = _read_csv_robust(f, usecols=usecols, raw_usecols=raw_usecols)
         df["_layer_idx"] = layer_idx
         frames.append(df)
     return frames
@@ -293,12 +382,15 @@ def _timeslices_from_tar(
         if m:
             matches.append((int(m.group(1)), info))
     matches.sort(key=lambda t: t[0])
+    raw_usecols: list[str] | None = None
     frames = []
     for layer_idx, info in matches:
         raw = tf.extractfile(info)
         if raw is None:
             continue
-        df = _read_csv_robust(raw, usecols=usecols)
+        if usecols is not None and raw_usecols is None:
+            raw_usecols = _resolve_timeslice_raw_usecols(raw, usecols)
+        df = _read_csv_robust(raw, usecols=usecols, raw_usecols=raw_usecols)
         df["_layer_idx"] = layer_idx
         frames.append(df)
     return frames

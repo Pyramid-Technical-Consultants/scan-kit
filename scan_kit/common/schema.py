@@ -226,7 +226,9 @@ def concept_column_candidates(concept: str, *, position_key: str | None = None) 
     is_raw = concept in _RAW_POS_CONCEPTS
 
     if is_raw:
-        keys = _position_key_variants(position_key)
+        # Raw concepts must not pick up non-raw key variants (e.g. spot_position)
+        # or canonicalization renames processed iso columns into *_raw names.
+        keys = (position_key,)
     else:
         base = position_key[:-4] if position_key.endswith("_raw") else position_key
         keys = (base,)
