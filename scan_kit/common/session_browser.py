@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from PySide6.QtCore import QRectF, Qt, QTimer, Signal, QSize, Slot
-from PySide6.QtGui import QColor, QIcon, QPainter, QPen, QPixmap
+from PySide6.QtGui import QColor, QGuiApplication, QIcon, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QFileDialog,
     QHBoxLayout,
@@ -379,10 +379,17 @@ class SessionBrowserWidget(QWidget):
         if sid is None:
             return
         menu = QMenu(self)
+        menu.addAction(
+            "Copy Session ID",
+            lambda checked=False, session_id=sid: self._copy_session_id(session_id),
+        )
         self.populate_context_menu.emit(sid, menu)
         if menu.isEmpty():
             return
         menu.exec(self._table.viewport().mapToGlobal(pos))
+
+    def _copy_session_id(self, sid: str) -> None:
+        QGuiApplication.clipboard().setText(sid)
 
     def _schedule_status_refresh(self) -> None:
         self._status_refresh_timer.start(0)

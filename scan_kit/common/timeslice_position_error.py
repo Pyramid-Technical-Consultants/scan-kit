@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 import numpy as np
+import pandas as pd
 
 from . import detect_beam_on_mask, subtract_background_frames
 from .g3_timeslice_position import (
@@ -26,12 +27,22 @@ from .session_source import (
 
 _log = logging.getLogger(__name__)
 
-_G2_DIRECT_ERROR = (
-    ("ic1_x_err", "position_err_X"),
-    ("ic1_y_err", "position_err_Y"),
-    ("ic2_x_err", "position_err_X2"),
-    ("ic2_y_err", "position_err_Y2"),
+_G2_IC1_X_ERROR_ALIASES = ("x_err_filtered", "position_err_X", "pos_err_x")
+_G2_IC1_Y_ERROR_ALIASES = ("y_err_filtered", "position_err_Y", "pos_err_y")
+_G2_IC2_X_ERROR_ALIASES = ("position_err_X2", "pos_err_x2")
+_G2_IC2_Y_ERROR_ALIASES = ("position_err_Y2", "pos_err_y2")
+_G2_IC2_X_OK_ALIASES = ("r_x_position_ok.1", "r_x_position_ok")
+_G2_IC2_Y_OK_ALIASES = ("r_y_position_ok.1", "r_y_position_ok")
+
+_G2_ERROR_SPECS = (
+    ("ic1_x_err", _G2_IC1_X_ERROR_ALIASES),
+    ("ic1_y_err", _G2_IC1_Y_ERROR_ALIASES),
+    ("ic2_x_err", _G2_IC2_X_ERROR_ALIASES),
+    ("ic2_y_err", _G2_IC2_Y_ERROR_ALIASES),
 )
+
+_G2_ERROR_SENTINELS = (1000.0, -1000.0, 10000.0, -10000.0)
+_G2_MAX_ABS_ERROR_MM = 10.0
 
 _G3_QUALITY_COLS = (
     "ic1_x_fit_ok",
@@ -55,7 +66,20 @@ TIMESLICE_POSITION_ERROR_COLS = [
     "spot_no.2",
     "rci_in_trigger",
     "r_beamOk",
-    *(name for _, name in _G2_DIRECT_ERROR),
+    *(
+        name
+        for aliases in (
+            _G2_IC1_X_ERROR_ALIASES,
+            _G2_IC1_Y_ERROR_ALIASES,
+            _G2_IC2_X_ERROR_ALIASES,
+            _G2_IC2_Y_ERROR_ALIASES,
+        )
+        for name in aliases
+    ),
+    *_G2_IC2_X_OK_ALIASES,
+    *_G2_IC2_Y_OK_ALIASES,
+    "x_err_filtered",
+    "y_err_filtered",
     "r_ic1_x_position",
     "ic1_position_x_target",
     "r_ic1_y_position",
@@ -80,6 +104,8 @@ class SessionPositionErrors:
 class _DirectErrorSource:
     mode: Literal["direct"]
     columns: dict[str, str]
+    ic2_x_ok: str | None = None
+    ic2_y_ok: str | None = None
 
 
 @dataclass(frozen=True)
@@ -97,21 +123,34 @@ class _G3IsoPositionSource:
 TimesliceErrorSource = _DirectErrorSource | _G3PositionTargetSource | _G3IsoPositionSource
 
 
-def _resolve_named_columns(columns, pairs: tuple[tuple[str, str], ...]) -> dict[str, str] | None:
-    resolved: dict[str, str] = {}
-    for label, name in pairs:
+def _resolve_first_column(columns, aliases: tuple[str, ...]) -> str | None:
+    for name in aliases:
         col = resolve_column_name(columns, name)
+        if col is not None:
+            return col
+    return None
+
+
+def _resolve_g2_direct_source(columns) -> _DirectErrorSource | None:
+    resolved: dict[str, str] = {}
+    for label, aliases in _G2_ERROR_SPECS:
+        col = _resolve_first_column(columns, aliases)
         if col is None:
             return None
         resolved[label] = col
-    return resolved
+    return _DirectErrorSource(
+        "direct",
+        resolved,
+        ic2_x_ok=_resolve_first_column(columns, _G2_IC2_X_OK_ALIASES),
+        ic2_y_ok=_resolve_first_column(columns, _G2_IC2_Y_OK_ALIASES),
+    )
 
 
 def resolve_timeslice_error_source(columns) -> TimesliceErrorSource | None:
     """Resolve error columns from one timeslice frame header (no session I/O)."""
-    direct = _resolve_named_columns(columns, _G2_DIRECT_ERROR)
+    direct = _resolve_g2_direct_source(columns)
     if direct is not None:
-        return _DirectErrorSource("direct", direct)
+        return direct
 
     g3_cols = resolve_g3_position_target_columns(columns)
     if g3_cols is not None:
@@ -152,11 +191,31 @@ def resolve_session_timeslice_error_source(
     return _G3IsoPositionSource("g3_iso", iso_ctx)
 
 
-def _sanitize_error(arr: np.ndarray) -> np.ndarray:
+def _sanitize_error(arr: np.ndarray, *, max_abs: float = 128.0) -> np.ndarray:
     out = arr.astype(float, copy=True)
     out[~np.isfinite(out)] = np.nan
-    out[np.abs(out) > 128] = np.nan
+    out[np.abs(out) > max_abs] = np.nan
     return out
+
+
+def _sanitize_g2_error(arr: np.ndarray) -> np.ndarray:
+    out = _sanitize_error(arr, max_abs=_G2_MAX_ABS_ERROR_MM)
+    for sentinel in _G2_ERROR_SENTINELS:
+        out[out == sentinel] = np.nan
+    return out
+
+
+def _apply_ic2_position_ok_gate(
+    errors: np.ndarray,
+    df,
+    ok_col: str | None,
+) -> np.ndarray:
+    if ok_col is None:
+        return errors
+    ok = pd.to_numeric(df[ok_col], errors="coerce").values
+    gated = errors.copy()
+    gated[ok != 1] = np.nan
+    return gated
 
 
 def frame_timeslice_error_arrays(
@@ -164,11 +223,15 @@ def frame_timeslice_error_arrays(
     source: TimesliceErrorSource,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None:
     if source.mode == "direct":
+        ic2_x = _sanitize_g2_error(df[source.columns["ic2_x_err"]].values)
+        ic2_y = _sanitize_g2_error(df[source.columns["ic2_y_err"]].values)
+        ic2_x = _apply_ic2_position_ok_gate(ic2_x, df, source.ic2_x_ok)
+        ic2_y = _apply_ic2_position_ok_gate(ic2_y, df, source.ic2_y_ok)
         return (
-            _sanitize_error(df[source.columns["ic1_x_err"]].values),
-            _sanitize_error(df[source.columns["ic1_y_err"]].values),
-            _sanitize_error(df[source.columns["ic2_x_err"]].values),
-            _sanitize_error(df[source.columns["ic2_y_err"]].values),
+            _sanitize_g2_error(df[source.columns["ic1_x_err"]].values),
+            _sanitize_g2_error(df[source.columns["ic1_y_err"]].values),
+            ic2_x,
+            ic2_y,
         )
 
     if source.mode == "g3_iso":

@@ -24,3 +24,8 @@ def test_g2_session_loads_beam_on_errors() -> None:
     assert errors is not None
     assert errors.ic1_x.size > 0
     assert np.isfinite(errors.ic1_x).any()
+    assert np.isfinite(errors.ic2_y).any()
+    ic1_cov = np.isfinite(errors.ic1_x).mean()
+    assert ic1_cov > 0.9
+    assert np.nanmedian(np.abs(errors.ic1_x)) < 0.1
+    assert np.nanpercentile(np.abs(errors.ic2_x[np.isfinite(errors.ic2_x)]), 95) < 1.0

@@ -74,6 +74,11 @@ VIEW_GROUPS: list[tuple[str, list[ViewEntry]]] = [
                 "Per-spot IC1/IC2 position error density contours and X/Y histograms.",
             ),
             (
+                "Position Error Outliers (Spot)",
+                "position_error_outliers_spot",
+                "Spots whose X/Y deviation from target is a clear statistical outlier (median/MAD).",
+            ),
+            (
                 "Sigma vs Energy",
                 "sigma_energy",
                 "IC1 and IC2 spot size (sigma) in X and Y versus beam energy.",

@@ -49,6 +49,7 @@ hiddenimports = [
     "scan_kit.views.position_error_energy",
     "scan_kit.views.position_error_distribution_timeslice",
     "scan_kit.views.position_error_distribution_spot",
+    "scan_kit.views.position_error_outliers_spot",
     "scan_kit.views.beam_motion_energy",
     "scan_kit.views.session_log_compare",
     "scan_kit.views.ic_beam_trajectory",
