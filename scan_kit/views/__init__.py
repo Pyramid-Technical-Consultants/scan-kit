@@ -84,6 +84,11 @@ VIEW_GROUPS: list[tuple[str, list[ViewEntry]]] = [
                 "IC1 and IC2 spot size (sigma) in X and Y versus beam energy.",
             ),
             (
+                "Sigma Distribution (Timeslice)",
+                "sigma_distribution_timeslice",
+                "Beam-on timeslice IC1/IC2 sigma density contours and X/Y histograms.",
+            ),
+            (
                 "Position Scatter",
                 "position_scatter",
                 "Planned, IC1, and IC2 spot positions overlaid by session.",

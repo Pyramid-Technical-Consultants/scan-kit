@@ -63,6 +63,7 @@ hiddenimports = [
     "scan_kit.views.dose_error_mu",
     "scan_kit.views.spot_delivery_time",
     "scan_kit.views.sigma_energy",
+    "scan_kit.views.sigma_distribution_timeslice",
     "scan_kit.views.beam_off_rampdown",
     "scan_kit.views.beam_on_off_current",
     "scan_kit.views.ic_timeslice_replay",
@@ -84,6 +85,8 @@ hiddenimports = [
     "scan_kit.common.processing",
     "scan_kit.common.plotting",
     "scan_kit.common.position_error_distribution",
+    "scan_kit.common.sigma_distribution",
+    "scan_kit.common.timeslice_sigma",
     "scan_kit.common.view_runner",
     # third-party modules that PyInstaller sometimes misses
     "scipy.signal",

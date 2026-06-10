@@ -1,10 +1,4 @@
-"""Shared rendering for position-error density contours and X/Y histograms.
-
-Both the timeslice view (dense beam-on samples) and the spot view (one sample
-per delivered spot) load IC1/IC2 X/Y position errors into
-:class:`SessionPositionErrors` and hand them to
-:func:`render_position_error_distribution`.
-"""
+"""Shared rendering for IC sigma density contours and X/Y histograms."""
 
 from __future__ import annotations
 
@@ -12,33 +6,24 @@ import matplotlib
 import matplotlib.colors as mcolors
 import matplotlib.pyplot as plt
 import numpy as np
-from matplotlib.patches import Circle
 
 from . import (
     CELL_SQUARE,
     DEFAULT_SESSION_COLORS,
     GRID_KW,
-    LIMIT_LINE_KW,
-    POSITION_MM_TOLERANCE_LEVELS,
     REFLINE_KW,
     finish_view,
     view_grid,
 )
-from .timeslice_position_error import SessionPositionErrors
+from .timeslice_sigma import SessionIcSigmas
 
-REF_CIRCLE_RADIUS_MM = 1.0
 HIST_BINS = 101
 DENSITY_BINS = 80
 CONTOUR_LEVEL_PERCENTILES = (40, 55, 68, 80, 90, 97)
 HIST_PERCENTILE = 99.95
 
-# Contour row is ~2.4x taller than each histogram row (3 rows, 2 columns).
 HEIGHT_RATIOS = (2.4, 1, 1)
 HIST_TITLE_PAD = 6.0
-# Constant alpha applied to each nested fill band. Bands are drawn one per
-# contour level (each covering everything denser than that level), so they
-# composite additively: a point inside N levels reaches 1-(1-a)**N opacity,
-# making the shading terrace up toward the dense center.
 CONTOUR_FILL_ALPHA_PER_LAYER = 0.13
 CONTOUR_LINE_ALPHA = 0.85
 CONTOUR_LINE_WIDTH = 0.65
@@ -50,46 +35,31 @@ IC_PANELS = (
 
 
 def _finite_xy(x: np.ndarray, y: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    mask = np.isfinite(x) & np.isfinite(y)
+    mask = np.isfinite(x) & np.isfinite(y) & (x > 0) & (y > 0)
     return x[mask], y[mask]
 
 
 def _finite_values(arr: np.ndarray) -> np.ndarray:
-    return arr[np.isfinite(arr)]
+    vals = arr[np.isfinite(arr)]
+    return vals[vals > 0]
 
 
-def _shared_symmetric_limits(*arrays: np.ndarray) -> tuple[float, float]:
-    """Symmetric limits from the *HIST_PERCENTILE* of |error| across all inputs."""
+def _shared_positive_limits(*arrays: np.ndarray) -> tuple[float, float]:
+    """Shared [0, hi] limits from the *HIST_PERCENTILE* of sigma values."""
     parts = [_finite_values(a) for a in arrays if a.size]
     parts = [p for p in parts if p.size]
     if not parts:
-        return -1.0, 1.0
+        return 0.0, 5.0
     cat = np.concatenate(parts)
-    bound = float(np.percentile(np.abs(cat), HIST_PERCENTILE))
-    if bound <= 0:
-        bound = 1.0
-    return -bound, bound
+    hi = float(np.percentile(cat, HIST_PERCENTILE))
+    if hi <= 0:
+        hi = 5.0
+    return 0.0, hi
 
 
-def _draw_reference_circle(ax) -> None:
-    ax.add_patch(
-        Circle(
-            (0, 0),
-            REF_CIRCLE_RADIUS_MM,
-            fill=False,
-            edgecolor="gray",
-            linestyle="--",
-            linewidth=1,
-            alpha=0.6,
-            zorder=0,
-        )
-    )
-
-
-def _style_density_axis(ax, title: str) -> None:
-    _draw_reference_circle(ax)
-    ax.axhline(0, **REFLINE_KW)
-    ax.axvline(0, **REFLINE_KW)
+def _style_density_axis(ax, title: str, *, lim: tuple[float, float]) -> None:
+    lo, hi = lim
+    ax.plot([lo, hi], [lo, hi], color="gray", linestyle=":", alpha=0.35, zorder=0)
     ax.set_aspect("equal", adjustable="box")
     ax.set_title(title)
     ax.grid(**GRID_KW)
@@ -132,9 +102,6 @@ def _plot_density_contours(
     z = density.T
     z_max = float(z.max())
     rgba = mcolors.to_rgba(color)
-    # Draw one translucent fill per level, each covering everything denser
-    # than that level (up past the peak). Nested layers composite additively,
-    # so the opacity terraces up toward the center instead of leaving a hole.
     for level in levels:
         ax.contourf(
             grid_x,
@@ -158,9 +125,9 @@ def _plot_density_contours(
     )
 
 
-def _plot_error_histogram(
+def _plot_sigma_histogram(
     ax,
-    session_data: dict[str, SessionPositionErrors],
+    session_data: dict[str, SessionIcSigmas],
     attr: str,
     loaded_ids: list[str],
     colors: list,
@@ -187,38 +154,29 @@ def _plot_error_histogram(
         )
 
     ax.axvline(0, **REFLINE_KW)
-    for value, color, _label in POSITION_MM_TOLERANCE_LEVELS:
-        ax.axvline(value, color=color, **LIMIT_LINE_KW)
-        ax.axvline(-value, color=color, **LIMIT_LINE_KW)
-
     ax.set_title(title, fontsize=9, pad=HIST_TITLE_PAD)
     if show_ylabel:
         ax.set_ylabel("Probability (%)")
     ax.grid(**GRID_KW)
 
 
-def render_position_error_distribution(
-    session_data: dict[str, SessionPositionErrors],
+def render_sigma_distribution(
+    session_data: dict[str, SessionIcSigmas],
     loaded_ids: list[str],
     *,
     title: str,
     base_dir: str,
 ) -> None:
-    """Render IC1/IC2 position error density contours and X/Y histograms.
-
-    Each ``session_data`` value carries the IC1/IC2 X/Y position errors (mm)
-    for one session; ``loaded_ids`` fixes the plotting and legend order.
-    """
+    """Render IC1/IC2 sigma density contours and X/Y histograms."""
     colors = DEFAULT_SESSION_COLORS[: len(loaded_ids)]
 
     all_arrays: list[np.ndarray] = []
     for data in session_data.values():
         all_arrays.extend((data.ic1_x, data.ic1_y, data.ic2_x, data.ic2_y))
 
-    shared_lim = _shared_symmetric_limits(*all_arrays)
+    shared_lim = _shared_positive_limits(*all_arrays)
     bin_edges = np.linspace(shared_lim[0], shared_lim[1], HIST_BINS)
 
-    # Size rows so the (taller) contour panel comes out roughly square.
     cell_h = CELL_SQUARE * sum(HEIGHT_RATIOS) / (HEIGHT_RATIOS[0] * 3)
     fig, axes = view_grid(
         3,
@@ -235,7 +193,7 @@ def render_position_error_distribution(
         ax_x = axes[1, col_idx]
         ax_y = axes[2, col_idx]
 
-        _style_density_axis(ax_density, ic_title)
+        _style_density_axis(ax_density, ic_title, lim=shared_lim)
         ax_density.set_xlim(shared_lim)
         ax_density.set_ylim(shared_lim)
 
@@ -249,13 +207,25 @@ def render_position_error_distribution(
                 lim=shared_lim,
             )
 
-        _plot_error_histogram(
-            ax_x, session_data, x_attr, loaded_ids, colors,
-            bin_edges=bin_edges, title="X Error (mm)", show_ylabel=(col_idx == 0),
+        _plot_sigma_histogram(
+            ax_x,
+            session_data,
+            x_attr,
+            loaded_ids,
+            colors,
+            bin_edges=bin_edges,
+            title="X Sigma (mm)",
+            show_ylabel=(col_idx == 0),
         )
-        _plot_error_histogram(
-            ax_y, session_data, y_attr, loaded_ids, colors,
-            bin_edges=bin_edges, title="Y Error (mm)", show_ylabel=(col_idx == 0),
+        _plot_sigma_histogram(
+            ax_y,
+            session_data,
+            y_attr,
+            loaded_ids,
+            colors,
+            bin_edges=bin_edges,
+            title="Y Sigma (mm)",
+            show_ylabel=(col_idx == 0),
         )
 
     for ax in hist_axes:

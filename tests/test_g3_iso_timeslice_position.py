@@ -33,6 +33,7 @@ from scan_kit.common.timeslice_position_error import (
 TEST_DATA = Path(__file__).resolve().parents[1] / "test_data"
 G3_ISO_SESSION = "1943968267"
 G3_FLAT_PLAN_SESSION = "1091134775"
+G3_FLAT_PLAN_OFFBYONE_SESSION = "1549915852"
 
 
 def _require_session(sid: str):
@@ -218,6 +219,27 @@ def test_flat_plan_session_uses_spot_data_anchor() -> None:
     assert source.mode == "g3_iso"
 
     errors = load_session_beam_on_position_errors(G3_FLAT_PLAN_SESSION, str(TEST_DATA))
+    assert errors is not None
+    assert np.isfinite(errors.ic1_x).any()
+    assert float(np.nanmedian(np.abs(errors.ic1_x[np.isfinite(errors.ic1_x)]))) < 5.0
+
+
+def test_flat_plan_offbyone_session_loads_iso_errors() -> None:
+    src = _require_session(G3_FLAT_PLAN_OFFBYONE_SESSION)
+    if src is None:
+        return
+
+    frames = load_session_timeslice_device_units(
+        src, usecols=TIMESLICE_POSITION_ERROR_COLS
+    )
+    source = resolve_session_timeslice_error_source(src, frames)
+    assert source is not None
+    assert source.mode == "g3_iso"
+    assert source.context.transform.spot_no_shift == -1
+
+    errors = load_session_beam_on_position_errors(
+        G3_FLAT_PLAN_OFFBYONE_SESSION, str(TEST_DATA)
+    )
     assert errors is not None
     assert np.isfinite(errors.ic1_x).any()
     assert float(np.nanmedian(np.abs(errors.ic1_x[np.isfinite(errors.ic1_x)]))) < 5.0

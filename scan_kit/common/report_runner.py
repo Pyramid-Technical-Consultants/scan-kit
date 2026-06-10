@@ -32,6 +32,10 @@ def capture_view_figure(
     settings: ViewSettings | None,
 ) -> plt.Figure | None:
     """Run *view_func* headlessly and return the figure shown via ``plt.show()``."""
+    import matplotlib
+
+    matplotlib.use("Agg", force=True)
+
     captured: list[plt.Figure] = []
     real_show = plt.show
 

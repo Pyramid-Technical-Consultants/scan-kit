@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 import pandas as pd
@@ -481,6 +481,13 @@ def build_g3_iso_error_context(
     transform = derive_g3_iso_transform(device_targets, plan, spot_anchor)
     if transform is None:
         return None
+
+    plan_ref = pd.DataFrame(
+        {"layer_id": plan.layer_id, "spot_no": plan.spot_no}
+    )
+    plan_shift = detect_spot_no_shift(device_targets, plan_ref)
+    if plan_shift is not None:
+        transform = replace(transform, spot_no_shift=plan_shift)
 
     columns = frames[0].columns
     ic1_spot = resolve_ic_spot_no_column(columns, "ic1")
