@@ -12,11 +12,16 @@ import pandas as pd
 from . import detect_beam_on_mask, subtract_background_frames
 from .g3_timeslice_position import (
     G3IsoErrorContext,
+    G3IsoPlanLookup,
     G3PositionTargetColumns,
     build_g3_iso_error_context,
+    build_g3_iso_plan_lookup,
     g3_iso_position_error_frame_arrays,
+    g3_iso_position_frame_arrays,
     resolve_g3_position_target_columns,
+    valid_g3_fit_values,
 )
+from .transform import remap_g2_raw, remap_g2_raw_reversed
 from .schema import C_LAYER_ID, C_SPOT_NO, resolve_column_name
 from .session_source import (
     SessionSource,
@@ -59,6 +64,11 @@ _G3_QUALITY_COLS = (
     "r_ic2_y_spot_error_code",
 )
 
+_G2_IC1_X_SPOT_ALIASES = ("r_ic1_x_spot", "r_ic1_x")
+_G2_IC1_Y_SPOT_ALIASES = ("r_ic1_y_spot", "r_ic1_y")
+_G2_IC2_X_SPOT_ALIASES = ("r_ic2_x_spot", "r_ic2_x")
+_G2_IC2_Y_SPOT_ALIASES = ("r_ic2_y_spot", "r_ic2_y")
+
 TIMESLICE_POSITION_ERROR_COLS = [
     C_LAYER_ID,
     C_SPOT_NO,
@@ -80,6 +90,16 @@ TIMESLICE_POSITION_ERROR_COLS = [
     *_G2_IC2_Y_OK_ALIASES,
     "x_err_filtered",
     "y_err_filtered",
+    *(
+        name
+        for aliases in (
+            _G2_IC1_X_SPOT_ALIASES,
+            _G2_IC1_Y_SPOT_ALIASES,
+            _G2_IC2_X_SPOT_ALIASES,
+            _G2_IC2_Y_SPOT_ALIASES,
+        )
+        for name in aliases
+    ),
     "r_ic1_x_position",
     "ic1_position_x_target",
     "r_ic1_y_position",
@@ -121,6 +141,40 @@ class _G3IsoPositionSource:
 
 
 TimesliceErrorSource = _DirectErrorSource | _G3PositionTargetSource | _G3IsoPositionSource
+
+
+@dataclass(frozen=True)
+class _G2PlanIsoSource:
+    mode: Literal["g2_plan"]
+    error_source: _DirectErrorSource
+    plan: G3IsoPlanLookup
+    layer_col: str
+    spot_col: str
+
+
+TimesliceIsoPositionSource = _G2PlanIsoSource | _G3IsoPositionSource
+
+
+@dataclass(frozen=True)
+class _G2ChamberSource:
+    mode: Literal["g2_chamber"]
+    ic1_x_spot: str
+    ic1_y_spot: str
+    ic2_x_spot: str
+    ic2_y_spot: str
+    ic2_x_ok: str | None = None
+    ic2_y_ok: str | None = None
+    ic2_x_reversed: bool = False
+    ic2_y_reversed: bool = False
+
+
+@dataclass(frozen=True)
+class _G3ChamberSource:
+    mode: Literal["g3_chamber"]
+    context: G3IsoErrorContext
+
+
+TimesliceChamberPositionSource = _G2ChamberSource | _G3ChamberSource
 
 
 def _resolve_first_column(columns, aliases: tuple[str, ...]) -> str | None:
@@ -191,6 +245,109 @@ def resolve_session_timeslice_error_source(
     return _G3IsoPositionSource("g3_iso", iso_ctx)
 
 
+def resolve_session_timeslice_iso_position_source(
+    src: SessionSource,
+    frames: list,
+) -> TimesliceIsoPositionSource | None:
+    """Resolve isocentric IC position source for one session."""
+    error_source = resolve_session_timeslice_error_source(src, frames)
+    if error_source is None:
+        return None
+    if error_source.mode == "g3_iso":
+        return error_source
+
+    if error_source.mode != "direct":
+        return None
+
+    input_map = load_session_csv(src, "input_map.csv")
+    if input_map is None:
+        return None
+    plan = build_g3_iso_plan_lookup(input_map)
+    if plan is None:
+        return None
+
+    columns = frames[0].columns
+    layer_col = resolve_column_name(columns, C_LAYER_ID)
+    spot_col = _resolve_first_column(columns, (C_SPOT_NO, "spot_no.1", "spot_no"))
+    if layer_col is None or spot_col is None:
+        return None
+
+    return _G2PlanIsoSource(
+        "g2_plan",
+        error_source,
+        plan,
+        layer_col,
+        spot_col,
+    )
+
+
+def resolve_session_timeslice_chamber_position_source(
+    src: SessionSource,
+    frames: list,
+) -> TimesliceChamberPositionSource | None:
+    """Resolve raw IC chamber-plane position source for one session."""
+    if not frames:
+        return None
+
+    columns = frames[0].columns
+    error_source = resolve_session_timeslice_error_source(src, frames)
+    if error_source is None:
+        return None
+    if error_source.mode == "g3_iso":
+        return _G3ChamberSource("g3_chamber", error_source.context)
+
+    if error_source.mode != "direct":
+        return None
+
+    ic1_x = _resolve_first_column(columns, _G2_IC1_X_SPOT_ALIASES)
+    ic1_y = _resolve_first_column(columns, _G2_IC1_Y_SPOT_ALIASES)
+    ic2_x = _resolve_first_column(columns, _G2_IC2_X_SPOT_ALIASES)
+    ic2_y = _resolve_first_column(columns, _G2_IC2_Y_SPOT_ALIASES)
+    if not all([ic1_x, ic1_y, ic2_x, ic2_y]):
+        return None
+
+    # Decide IC2 strip direction once for the whole session (as the per-spot
+    # trajectory view does), so it cannot flip frame-to-frame.
+    ic2_x_reversed = _g2_session_ic2_reversed(frames, ic1_x, ic2_x)
+    ic2_y_reversed = _g2_session_ic2_reversed(frames, ic1_y, ic2_y)
+
+    return _G2ChamberSource(
+        "g2_chamber",
+        ic1_x_spot=ic1_x,
+        ic1_y_spot=ic1_y,
+        ic2_x_spot=ic2_x,
+        ic2_y_spot=ic2_y,
+        ic2_x_ok=error_source.ic2_x_ok,
+        ic2_y_ok=error_source.ic2_y_ok,
+        ic2_x_reversed=ic2_x_reversed,
+        ic2_y_reversed=ic2_y_reversed,
+    )
+
+
+def _g2_session_ic2_reversed(frames: list, ic1_spot: str, ic2_spot: str) -> bool:
+    """Pick forward vs reversed IC2 strip sense from the whole session.
+
+    Mirrors :func:`scan_kit.common.transform.g2_ic2_mm` but decides once over
+    every frame's spots instead of per frame, so the IC2 sign is consistent.
+    """
+    ic1_parts: list[np.ndarray] = []
+    ic2_fwd_parts: list[np.ndarray] = []
+    for df in frames:
+        if ic1_spot not in df.columns or ic2_spot not in df.columns:
+            continue
+        ic1_parts.append(_g2_spot_chamber_mm(df[ic1_spot].values))
+        ic2_fwd_parts.append(_g2_ic2_chamber_mm(df[ic2_spot].values, reversed_strip=False))
+    if not ic1_parts:
+        return False
+    ic1 = np.concatenate(ic1_parts)
+    ic2_fwd = np.concatenate(ic2_fwd_parts)
+    err_fwd = float(np.nanmedian(np.abs(ic1 - ic2_fwd)))
+    err_rev = float(np.nanmedian(np.abs(ic1 + ic2_fwd)))
+    if not np.isfinite(err_fwd) or not np.isfinite(err_rev):
+        return False
+    return err_rev < err_fwd
+
+
 def _sanitize_error(arr: np.ndarray, *, max_abs: float = 128.0) -> np.ndarray:
     out = arr.astype(float, copy=True)
     out[~np.isfinite(out)] = np.nan
@@ -243,6 +400,99 @@ def frame_timeslice_error_arrays(
     if arrays is None:
         return None
     return tuple(_sanitize_error(arr) for arr in arrays)
+
+
+def frame_timeslice_iso_position_arrays(
+    df,
+    source: TimesliceIsoPositionSource,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None:
+    """Isocentric IC position (mm) for one timeslice frame."""
+    if source.mode == "g3_iso":
+        arrays = g3_iso_position_frame_arrays(df, source.context)
+        if arrays is None:
+            return None
+        return tuple(_sanitize_error(arr) for arr in arrays)
+
+    frame_errors = frame_timeslice_error_arrays(df, source.error_source)
+    if frame_errors is None:
+        return None
+
+    layer = pd.to_numeric(df[source.layer_col], errors="coerce").to_numpy(dtype=float)
+    spot = pd.to_numeric(df[source.spot_col], errors="coerce").to_numpy(dtype=float)
+    plan_x, plan_y = source.plan.lookup(layer, spot)
+    ic1_x_err, ic1_y_err, ic2_x_err, ic2_y_err = frame_errors
+    return (
+        _sanitize_error(plan_x + ic1_x_err),
+        _sanitize_error(plan_y + ic1_y_err),
+        _sanitize_error(plan_x + ic2_x_err),
+        _sanitize_error(plan_y + ic2_y_err),
+    )
+
+
+def _g2_spot_chamber_mm(raw: np.ndarray) -> np.ndarray:
+    values = raw.astype(float, copy=True)
+    values[~np.isfinite(values)] = np.nan
+    valid = (values >= 1.0) & (values <= 128.0)
+    out = np.full(values.shape, np.nan, dtype=float)
+    out[valid] = remap_g2_raw(values[valid])
+    return out
+
+
+def _g2_ic2_chamber_mm(raw: np.ndarray, *, reversed_strip: bool) -> np.ndarray:
+    """IC2 raw strip → mm using a fixed (session-wide) strip direction."""
+    values = raw.astype(float, copy=True)
+    values[~np.isfinite(values)] = np.nan
+    valid = (values >= 1.0) & (values <= 128.0)
+    out = np.full(values.shape, np.nan, dtype=float)
+    remap = remap_g2_raw_reversed if reversed_strip else remap_g2_raw
+    out[valid] = remap(values[valid])
+    return out
+
+
+def _g3_chamber_position_for_axis(
+    df,
+    meas_col: str,
+    quality,
+    axis_key: str,
+) -> np.ndarray:
+    from .g3_timeslice_position import _apply_quality, _quality_mask
+
+    meas = valid_g3_fit_values(df[meas_col].values)
+    mask = _quality_mask(df, quality, axis_key)
+    return _apply_quality(meas, mask)
+
+
+def frame_timeslice_chamber_position_arrays(
+    df,
+    source: TimesliceChamberPositionSource,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None:
+    """Raw IC chamber-plane position (mm) for one timeslice frame."""
+    if source.mode == "g3_chamber":
+        cols = source.context.columns
+        quality = source.context.quality
+        positions = (
+            _g3_chamber_position_for_axis(df, cols.ic1_x, quality, "ic1_x"),
+            _g3_chamber_position_for_axis(df, cols.ic1_y, quality, "ic1_y"),
+            _g3_chamber_position_for_axis(df, cols.ic2_x, quality, "ic2_x"),
+            _g3_chamber_position_for_axis(df, cols.ic2_y, quality, "ic2_y"),
+        )
+        if not any(np.isfinite(arr).any() for arr in positions):
+            return None
+        return positions
+
+    ic1_x = _g2_spot_chamber_mm(df[source.ic1_x_spot].values)
+    ic1_y = _g2_spot_chamber_mm(df[source.ic1_y_spot].values)
+    ic2_x = _g2_ic2_chamber_mm(
+        df[source.ic2_x_spot].values, reversed_strip=source.ic2_x_reversed
+    )
+    ic2_y = _g2_ic2_chamber_mm(
+        df[source.ic2_y_spot].values, reversed_strip=source.ic2_y_reversed
+    )
+    ic2_x = _apply_ic2_position_ok_gate(ic2_x, df, source.ic2_x_ok)
+    ic2_y = _apply_ic2_position_ok_gate(ic2_y, df, source.ic2_y_ok)
+    if not any(np.isfinite(arr).any() for arr in (ic1_x, ic1_y, ic2_x, ic2_y)):
+        return None
+    return ic1_x, ic1_y, ic2_x, ic2_y
 
 
 def _beam_on_slices(

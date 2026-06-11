@@ -47,6 +47,7 @@ from PySide6.QtWidgets import (
 )
 
 from . import __version__
+from .common.app_icon import apply_windows_window_icons, load_app_icon
 from .common.app_settings import AppSettings
 from .common.session_browser import SessionBrowserWidget
 from .common.session_meta import SessionMeta
@@ -176,7 +177,7 @@ class _SegmentedControl(QWidget):
             btn = QPushButton(label)
             btn.setCheckable(True)
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            btn.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
             if n == 1:
                 seg = "only"
             elif i == 0:
@@ -425,7 +426,7 @@ class ScanKitMainWindow(QMainWindow):
 
         settings_host = QWidget()
         settings_host.setSizePolicy(
-            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Minimum,
             QSizePolicy.Policy.Minimum,
         )
         settings_row = QHBoxLayout(settings_host)
@@ -439,7 +440,8 @@ class ScanKitMainWindow(QMainWindow):
         settings_row.addWidget(self._bg_segmented)
         settings_row.addSpacing(24)
         settings_row.addWidget(cal_label)
-        settings_row.addWidget(self._cal_segmented, stretch=1)
+        settings_row.addWidget(self._cal_segmented)
+        settings_row.addStretch(1)
         right_l.addWidget(settings_host)
 
         self.cal_factors_label = QLabel("")
@@ -1126,7 +1128,12 @@ def main() -> None:
         return
 
     app = QApplication(sys.argv)
+    app_icon = load_app_icon()
+    if not app_icon.isNull():
+        app.setWindowIcon(app_icon)
     win = ScanKitMainWindow()
+    if not app_icon.isNull():
+        win.setWindowIcon(app_icon)
 
     def _force_exit(*_args) -> None:
         win._shutdown_children()
@@ -1150,6 +1157,7 @@ def main() -> None:
 
     win.show()
     QApplication.processEvents()
+    apply_windows_window_icons(win, app_icon)
     sys.exit(app.exec())
 
 

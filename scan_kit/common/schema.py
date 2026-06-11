@@ -18,6 +18,14 @@ After canonicalization all IC current columns are in **nanoamperes (nA)**.
 The ``_COLUMN_SCALE_FACTORS`` dict below lists every G2 column that needs
 scaling.  ``canonicalize_dataframe_columns`` applies these factors
 automatically whenever it renames a column.
+
+Scan-magnet timeslice columns use mixed native units:
+
+* **Field probes** (``C_MAG_FIELD_X`` / ``C_MAG_FIELD_Y``) are in **gauss**.
+* **Amplifier command/readback** (``C_AMPLIFIER_CMD_*`` / ``C_AMPLIFIER_READBACK_*``)
+  are in **volts**.  Load from ``timeslice_data_device_units.csv`` for both G2
+  and G3 (G2 ``r_xI``/``r_yI`` readbacks are only in volts in that file).
+  No gain conversion is applied.
 """
 
 from __future__ import annotations
@@ -66,9 +74,30 @@ C_CHARGE_REQ = "charge_req"
 
 # Scan-magnet field probes (gauss) in timeslice_data_device_units.
 # G3: r_tx2_probe_x / r_tx2_probe_y (TX2 hall probes).
-# G2: field_c_x / field_c_y (correcting-coil field readback).
+# G2: field_c_x / field_c_y (correcting-coil setpoint gauss).  In device_units
+# the values track amplifier command volts ~1:1; amplifier_correlation rescales
+# to physical gauss using G2_AMPLIFIER_A_PER_V and the raw→device cmd ratio.
 C_MAG_FIELD_X = "mag_field_x"
 C_MAG_FIELD_Y = "mag_field_y"
+
+# Correcting-coil amplifier command/readback (volts) from timeslice_data_device_units.
+# Use load_session_timeslice_device_units — not raw timeslice_data.csv.
+# G3: amplifier_x_target / amplifier_y_target (command),
+#     amplifier_x_readback / amplifier_y_readback (readback).
+# G2: c_x / c_y (command), r_xI / r_yI (readback; register names use I but
+#     device_units values are volts).  Raw timeslice r_xI/r_yI are not volts.
+# Values are the voltage sent to the current source; coil current and field
+# depend on a separate gain (see G2_AMPLIFIER_A_PER_V).
+C_AMPLIFIER_CMD_X = "amplifier_cmd_x"
+C_AMPLIFIER_CMD_Y = "amplifier_cmd_y"
+C_AMPLIFIER_READBACK_X = "amplifier_readback_x"
+C_AMPLIFIER_READBACK_Y = "amplifier_readback_y"
+
+# Typical correcting-coil amplifier transconductance (A/V).
+G2_AMPLIFIER_A_PER_V = 50.0
+
+AMPLIFIER_CMD_COLUMNS = (C_AMPLIFIER_CMD_X, C_AMPLIFIER_CMD_Y)
+AMPLIFIER_READBACK_COLUMNS = (C_AMPLIFIER_READBACK_X, C_AMPLIFIER_READBACK_Y)
 
 # Raw position concepts (register-level, need coordinate remap)
 C_IC1_X_POS_RAW = "ic1_x_pos_raw"
@@ -159,6 +188,10 @@ _CONCEPT_ALIASES_STATIC: dict[str, tuple[str, ...]] = {
         "field_y",
         "b_field_y",
     ),
+    C_AMPLIFIER_CMD_X: ("amplifier_x_target", "c_x", "amplifier_cmd_x"),
+    C_AMPLIFIER_CMD_Y: ("amplifier_y_target", "c_y", "amplifier_cmd_y"),
+    C_AMPLIFIER_READBACK_X: ("amplifier_x_readback", "r_xI", "amplifier_readback_x"),
+    C_AMPLIFIER_READBACK_Y: ("amplifier_y_readback", "r_yI", "amplifier_readback_y"),
     C_X_POSITION: ("X_POSITION", "x_position", "xposition", "x_pos", "planned_x"),
     C_Y_POSITION: ("Y_POSITION", "y_position", "yposition", "y_pos", "planned_y"),
     C_IC1_X_PEAK_AMPLITUDE: ("r_ic1_x_peak_amplitude", "ic1_x_peak_amplitude"),
@@ -166,6 +199,19 @@ _CONCEPT_ALIASES_STATIC: dict[str, tuple[str, ...]] = {
     C_IC2_X_PEAK_AMPLITUDE: ("r_ic2_x_peak_amplitude", "ic2_x_peak_amplitude"),
     C_IC2_Y_PEAK_AMPLITUDE: ("r_ic2_y_peak_amplitude", "ic2_y_peak_amplitude"),
 }
+
+# Physical column names to request when loading field + amplifier timeslice data
+# from timeslice_data_device_units.csv (G2 and G3).
+TIMESLICE_AMPLIFIER_FIELD_COLS = [
+    C_LAYER_ID,
+    C_TIMESTAMP,
+    *_CONCEPT_ALIASES_STATIC[C_MAG_FIELD_X],
+    *_CONCEPT_ALIASES_STATIC[C_MAG_FIELD_Y],
+    *_CONCEPT_ALIASES_STATIC[C_AMPLIFIER_CMD_X],
+    *_CONCEPT_ALIASES_STATIC[C_AMPLIFIER_CMD_Y],
+    *_CONCEPT_ALIASES_STATIC[C_AMPLIFIER_READBACK_X],
+    *_CONCEPT_ALIASES_STATIC[C_AMPLIFIER_READBACK_Y],
+]
 
 
 # G2 IC current columns store charge (coulombs) accumulated over a 1 ms

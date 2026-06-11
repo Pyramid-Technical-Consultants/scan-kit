@@ -559,6 +559,19 @@ def _iso_errors_for_axis(
     return iso_meas - plan_values
 
 
+def _iso_position_for_axis(
+    df,
+    meas_col: str,
+    axis: IsoAxisTransform,
+    quality: G3QualityColumns,
+    axis_key: str,
+) -> np.ndarray:
+    meas = valid_g3_fit_values(df[meas_col].values)
+    mask = _quality_mask(df, quality, axis_key)
+    meas = _apply_quality(meas, mask)
+    return _project(meas, axis)
+
+
 def g3_position_error_frame_arrays(
     df,
     cols: G3PositionTargetColumns,
@@ -619,6 +632,37 @@ def g3_iso_position_error_frame_arrays(
     if not any(np.isfinite(v).any() for v in errors.values()):
         return None
     return errors["ic1_x"], errors["ic1_y"], errors["ic2_x"], errors["ic2_y"]
+
+
+def g3_iso_position_frame_arrays(
+    df,
+    ctx: G3IsoErrorContext,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None:
+    """Isocentric IC position (mm) for one timeslice frame."""
+    cols = ctx.columns
+    transform = ctx.transform
+    positions = {
+        "ic1_x": _iso_position_for_axis(
+            df, cols.ic1_x, transform.ic1_x, ctx.quality, "ic1_x"
+        ),
+        "ic1_y": _iso_position_for_axis(
+            df, cols.ic1_y, transform.ic1_y, ctx.quality, "ic1_y"
+        ),
+        "ic2_x": _iso_position_for_axis(
+            df, cols.ic2_x, transform.ic2_x, ctx.quality, "ic2_x"
+        ),
+        "ic2_y": _iso_position_for_axis(
+            df, cols.ic2_y, transform.ic2_y, ctx.quality, "ic2_y"
+        ),
+    }
+    if not any(np.isfinite(v).any() for v in positions.values()):
+        return None
+    return (
+        positions["ic1_x"],
+        positions["ic1_y"],
+        positions["ic2_x"],
+        positions["ic2_y"],
+    )
 
 
 def g3_position_error_arrays(

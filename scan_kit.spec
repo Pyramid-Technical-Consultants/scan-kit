@@ -38,6 +38,9 @@ if sys.platform.startswith("linux"):
 # ---------------------------------------------------------------------------
 _pyside6_datas, _pyside6_binaries, _pyside6_hiddenimports = collect_all("PySide6")
 
+_assets_dir = ROOT / "scan_kit" / "assets"
+_app_datas = [(str(_assets_dir), "scan_kit/assets")]
+
 # ---------------------------------------------------------------------------
 # Collect all scan_kit submodules so PyInstaller bundles them even though
 # some are only imported dynamically (e.g. via --run-view).
@@ -69,6 +72,7 @@ hiddenimports = [
     "scan_kit.views.ic_timeslice_replay",
     "scan_kit.views.ic_timeslice_replay_derived",
     "scan_kit.views.field_timeslice_replay",
+    "scan_kit.views.amplifier_correlation",
     "scan_kit.views.timeslice_replay_common",
     "scan_kit.views.timeslice_replay_ui",
     "scan_kit.views.dose_accumulation",
@@ -95,6 +99,7 @@ hiddenimports = [
     "sounddevice",
     "matplotlib.backends.backend_tkagg",
     "tkinter",
+    "PySide6.QtSvg",
     *_pyside6_hiddenimports,
 ]
 
@@ -102,7 +107,7 @@ a = Analysis(
     [str(ROOT / "scan_kit" / "__main__.py")],
     pathex=[str(ROOT)],
     binaries=_extra_binaries + _pyside6_binaries,
-    datas=_pyside6_datas,
+    datas=_pyside6_datas + _app_datas,
     hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},
@@ -140,4 +145,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon=str(_assets_dir / "icon.ico") if sys.platform == "win32" else None,
 )

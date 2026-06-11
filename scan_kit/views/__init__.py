@@ -188,10 +188,20 @@ VIEW_GROUPS: list[tuple[str, list[ViewEntry]]] = [
                 "ic_timeslice_replay_derived",
                 "Interactive viewer for IC current derived from scan-total dose rate.",
             ),
+        ],
+    ),
+    (
+        "Magnetic Analysis",
+        [
             (
                 "Magnetic Field Timeslice Replay",
                 "field_timeslice_replay",
                 "Interactive Bx and By scan-magnet field viewer with timeline brush.",
+            ),
+            (
+                "Amplifier Command Correlations",
+                "amplifier_correlation",
+                "Beam-on scatter plots of settled amplifier command vs readback, field, and IC iso position.",
             ),
         ],
     ),

@@ -53,14 +53,15 @@ from ..common import (
     GRID_KW,
     REFLINE_KW,
 )
+from ..common.ic_trajectory import (
+    IC1_Z_MM,
+    IC2_Z_MM,
+    IC_SEP_MM,
+    ic_alignment_offsets,
+)
 from ..common.session_notes import load_notes
 
 _log = logging.getLogger(__name__)
-
-# Plot origin at IC2 (first chamber along the downstream beam).
-IC2_Z_MM = 0.0
-IC1_Z_MM = 100.0
-IC_SEP_MM = IC1_Z_MM - IC2_Z_MM
 
 # Show magnet/air region upstream of IC2 and beam path downstream of IC1.
 EXTEND_UPSTREAM_MM = 2000.0
@@ -223,16 +224,6 @@ def _fit_iso_plane(
         z_iso - IC2_Z_MM,
         float(sigma) if np.isfinite(sigma) else float("nan"),
     )
-
-
-def _ic_alignment_offsets(p2: np.ndarray, p1: np.ndarray) -> tuple[float, float]:
-    """Rigid per-IC offset (median raw mm) = chamber alignment vs the beam axis.
-
-    Subtracting these centres each chamber's cloud so the per-spot frustum pivots
-    on-axis.  Slope differences (hence the per-spot angle and the pivot distance)
-    are unchanged; only the fake common tilt from misalignment is removed.
-    """
-    return float(np.median(p2)), float(np.median(p1))
 
 
 def _format_magnet_legend_label(
@@ -419,7 +410,7 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
 
             # Rigid per-IC alignment correction: centre each chamber so the
             # frustum pivots on-axis (keeps slope, hence angle and distance).
-            off2, off1 = _ic_alignment_offsets(p2, p1)
+            off2, off1 = ic_alignment_offsets(p2, p1)
             p2 -= off2
             p1 -= off1
 
