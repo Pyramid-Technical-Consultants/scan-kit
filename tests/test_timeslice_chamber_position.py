@@ -47,6 +47,52 @@ def test_g2_chamber_positions_have_finite_samples() -> None:
     assert np.isfinite(arrays[0]).any()
 
 
+def test_g3_ic2_is_cooriented_with_ic1_after_180deg_unrotate() -> None:
+    """G3 IC2 is mounted 180° from IC1; the loader must un-rotate it.
+
+    Raw G3 channels are anti-correlated between IC1/IC2, which (if left as-is)
+    makes |IC1 − IC2| span the *sum* of both clouds and fakes huge deflection
+    angles.  After the per-session reversal + 2 mm strip→mm map, IC2 tracks IC1
+    to within a few mm and the deflection slope stays physical (tens of mrad).
+    """
+    from scan_kit.common import detect_beam_on_mask
+    from scan_kit.common.ic_trajectory import beam_angles_mrad
+
+    src = resolve_session_source("1943968267", str(TEST_DATA))
+    assert src is not None
+    frames = load_session_timeslice_device_units(
+        src, usecols=TIMESLICE_POSITION_ERROR_COLS
+    )
+    source = resolve_session_timeslice_chamber_position_source(src, frames)
+    assert source is not None and source.mode == "g3_chamber"
+
+    ic1_parts: list[np.ndarray] = []
+    ic2_parts: list[np.ndarray] = []
+    for df in frames:
+        beam = detect_beam_on_mask(df)
+        if beam is None:
+            continue
+        arrays = frame_timeslice_chamber_position_arrays(df, source)
+        if arrays is None:
+            continue
+        ic1_x, _, ic2_x, _ = arrays
+        ic1_parts.append(ic1_x[beam])
+        ic2_parts.append(ic2_x[beam])
+
+    ic1 = np.concatenate(ic1_parts)
+    ic2 = np.concatenate(ic2_parts)
+    finite = np.isfinite(ic1) & np.isfinite(ic2)
+    ic1, ic2 = ic1[finite], ic2[finite]
+
+    # Co-oriented: IC2 tracks IC1 (a flipped sense would push |IC1-IC2| huge).
+    assert np.median(np.abs(ic1 - ic2)) < 10.0
+    # Positions are in mm (2 mm pitch), so the cloud spans tens of mm, not ~128.
+    assert 10.0 < float(np.nanmax(ic1) - np.nanmin(ic1)) < 256.0
+    # Deflection angle stays physical: tens of mrad, never hundreds.
+    angle = beam_angles_mrad(ic2, ic1)
+    assert float(np.nanmax(np.abs(angle))) < 150.0
+
+
 def test_g2_ic2_strip_direction_is_consistent_across_frames() -> None:
     """IC2 strip sense is decided once per session, so |IC1-IC2| stays small.
 

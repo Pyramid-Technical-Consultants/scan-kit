@@ -23,6 +23,25 @@ def remap(x, in_min, in_max, out_min, out_max):
     return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min
 
 
+# G3 strip detector: 2 mm pitch, 128 channels (~256 mm wide), central strip 64.5.
+G3_STRIP_CENTER = 64.5
+G3_STRIP_PITCH_MM = 2.0
+
+
+def remap_g3_raw(x):
+    """G3 raw strip channel → mm (2 mm pitch, channel 64.5 → 0 mm).
+
+    IC1 uses this forward sense; IC2 is mounted rotated 180° so it uses
+    :func:`remap_g3_raw_reversed` (decided once per session).
+    """
+    return (np.asarray(x, dtype=float) - G3_STRIP_CENTER) * G3_STRIP_PITCH_MM
+
+
+def remap_g3_raw_reversed(x):
+    """G3 strip channel → mm for the reversed (180°-rotated) chamber sense."""
+    return (G3_STRIP_CENTER - np.asarray(x, dtype=float)) * G3_STRIP_PITCH_MM
+
+
 def remap_g2_raw(x):
     """G2 raw strip index → mm (register 64.5 → 0, 0→127 increasing).
 

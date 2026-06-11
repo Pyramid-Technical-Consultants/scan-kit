@@ -21,7 +21,12 @@ from .g3_timeslice_position import (
     resolve_g3_position_target_columns,
     valid_g3_fit_values,
 )
-from .transform import remap_g2_raw, remap_g2_raw_reversed
+from .transform import (
+    remap_g2_raw,
+    remap_g2_raw_reversed,
+    remap_g3_raw,
+    remap_g3_raw_reversed,
+)
 from .schema import C_LAYER_ID, C_SPOT_NO, resolve_column_name
 from .session_source import (
     SessionSource,
@@ -172,6 +177,8 @@ class _G2ChamberSource:
 class _G3ChamberSource:
     mode: Literal["g3_chamber"]
     context: G3IsoErrorContext
+    ic2_x_reversed: bool = False
+    ic2_y_reversed: bool = False
 
 
 TimesliceChamberPositionSource = _G2ChamberSource | _G3ChamberSource
@@ -294,7 +301,16 @@ def resolve_session_timeslice_chamber_position_source(
     if error_source is None:
         return None
     if error_source.mode == "g3_iso":
-        return _G3ChamberSource("g3_chamber", error_source.context)
+        ctx = error_source.context
+        # IC1 and IC2 are mounted rotated 180° from each other, so the IC2 strip
+        # runs opposite IC1.  Decide the IC2 sense once per session (as the G2
+        # path does) so |IC1 − IC2| is minimised and the fan stays clean.
+        return _G3ChamberSource(
+            "g3_chamber",
+            ctx,
+            ic2_x_reversed=_g3_session_ic2_reversed(frames, ctx, "ic1_x", "ic2_x"),
+            ic2_y_reversed=_g3_session_ic2_reversed(frames, ctx, "ic1_y", "ic2_y"),
+        )
 
     if error_source.mode != "direct":
         return None
@@ -462,19 +478,62 @@ def _g3_chamber_position_for_axis(
     return _apply_quality(meas, mask)
 
 
+def _g3_chamber_axis_mm(
+    df,
+    ctx: G3IsoErrorContext,
+    axis_key: str,
+    *,
+    reversed_strip: bool = False,
+) -> np.ndarray:
+    """G3 raw strip channel → mm (2 mm pitch, central strip 64.5), with sign."""
+    meas_col = getattr(ctx.columns, axis_key)
+    raw = _g3_chamber_position_for_axis(df, meas_col, ctx.quality, axis_key)
+    remap = remap_g3_raw_reversed if reversed_strip else remap_g3_raw
+    return remap(raw)
+
+
+def _g3_session_ic2_reversed(
+    frames: list,
+    ctx: G3IsoErrorContext,
+    ic1_key: str,
+    ic2_key: str,
+) -> bool:
+    """Pick forward vs reversed IC2 strip sense over the whole G3 session.
+
+    IC1 is the forward anchor; IC2 is reversed when that makes the per-sample
+    |IC1 − IC2| smaller (the 180° chamber rotation), decided once so the sign
+    cannot flip frame-to-frame.
+    """
+    ic1_parts: list[np.ndarray] = []
+    ic2_fwd_parts: list[np.ndarray] = []
+    for df in frames:
+        ic1_parts.append(_g3_chamber_axis_mm(df, ctx, ic1_key))
+        ic2_fwd_parts.append(_g3_chamber_axis_mm(df, ctx, ic2_key))
+    if not ic1_parts:
+        return False
+    ic1 = np.concatenate(ic1_parts)
+    ic2_fwd = np.concatenate(ic2_fwd_parts)
+    err_fwd = float(np.nanmedian(np.abs(ic1 - ic2_fwd)))
+    err_rev = float(np.nanmedian(np.abs(ic1 + ic2_fwd)))
+    if not np.isfinite(err_fwd) or not np.isfinite(err_rev):
+        return False
+    return err_rev < err_fwd
+
+
 def frame_timeslice_chamber_position_arrays(
     df,
     source: TimesliceChamberPositionSource,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None:
     """Raw IC chamber-plane position (mm) for one timeslice frame."""
     if source.mode == "g3_chamber":
-        cols = source.context.columns
-        quality = source.context.quality
+        ctx = source.context
+        # Strip channel → mm (2 mm pitch, central strip 64.5); IC1 forward, IC2
+        # reversed for the 180° chamber rotation (sense fixed per session).
         positions = (
-            _g3_chamber_position_for_axis(df, cols.ic1_x, quality, "ic1_x"),
-            _g3_chamber_position_for_axis(df, cols.ic1_y, quality, "ic1_y"),
-            _g3_chamber_position_for_axis(df, cols.ic2_x, quality, "ic2_x"),
-            _g3_chamber_position_for_axis(df, cols.ic2_y, quality, "ic2_y"),
+            _g3_chamber_axis_mm(df, ctx, "ic1_x"),
+            _g3_chamber_axis_mm(df, ctx, "ic1_y"),
+            _g3_chamber_axis_mm(df, ctx, "ic2_x", reversed_strip=source.ic2_x_reversed),
+            _g3_chamber_axis_mm(df, ctx, "ic2_y", reversed_strip=source.ic2_y_reversed),
         )
         if not any(np.isfinite(arr).any() for arr in positions):
             return None
