@@ -416,14 +416,20 @@ def _cubic_fit(x: np.ndarray, y: np.ndarray) -> _CubicFit | None:
     return _CubicFit(c[0], c[1], c[2], c[3], residual, poly)
 
 
-def _format_legend_number(value: float, *, sig_figs: int = 3) -> str:
-    """Fixed-point legend value with about *sig_figs* significant figures."""
+def _format_legend_number(
+    value: float, *, sig_figs: int = 3, signed: bool = True
+) -> str:
+    """Fixed-point legend value with about *sig_figs* significant figures.
+
+    *signed* prefixes a leading ``+``/``-``; set it ``False`` for magnitudes
+    such as a median absolute residual where a sign would be misleading.
+    """
     if not np.isfinite(value):
         return "nan"
-    sign = "+" if value >= 0 else "-"
+    sign = ("+" if value >= 0 else "-") if signed else ("-" if value < 0 else "")
     magnitude = abs(value)
     if magnitude == 0:
-        return "+0"
+        return "+0" if signed else "0"
     exp = int(np.floor(np.log10(magnitude)))
     decimals = max(0, sig_figs - 1 - exp)
     text = f"{magnitude:.{decimals}f}"
@@ -581,7 +587,7 @@ class _PooledRow:
 
 
 def _format_residual_median_label(prefix: str, median_abs: float, unit: str) -> str:
-    return f"{prefix}\u03bc|res| {_format_legend_number(median_abs)} {unit}"
+    return f"{prefix}med|res| {_format_legend_number(median_abs, signed=False)} {unit}"
 
 
 def _plot_residual_about(

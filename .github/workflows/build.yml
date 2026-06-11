@@ -61,11 +61,27 @@ jobs:
         run: ls -la dist/
         shell: bash
 
+      - name: Prepare artifact filename
+        id: asset
+        shell: bash
+        run: |
+          VERSION=$(python -c "from scan_kit import __version__; print(__version__)")
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            echo "path=${{ matrix.exe }}" >> "$GITHUB_OUTPUT"
+          elif [[ "${{ runner.os }}" == "Windows" ]]; then
+            mv dist/scan-kit.exe "dist/scan-kit-windows-${VERSION}-rc.exe"
+            echo "path=dist/scan-kit-windows-${VERSION}-rc.exe" >> "$GITHUB_OUTPUT"
+          else
+            mv dist/scan-kit "dist/scan-kit-linux-amd64-${VERSION}-rc"
+            chmod +x "dist/scan-kit-linux-amd64-${VERSION}-rc"
+            echo "path=dist/scan-kit-linux-amd64-${VERSION}-rc" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.artifact }}
-          path: ${{ matrix.exe }}
+          path: ${{ steps.asset.outputs.path }}
           if-no-files-found: error
           retention-days: 30
 
@@ -76,20 +92,32 @@ jobs:
     name: Create Release
 
     steps:
+      - uses: actions/checkout@v6
+
       - uses: actions/download-artifact@v7
         with:
           path: artifacts
 
+      - name: Verify tag matches __version__
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          PACKAGE_VERSION=$(grep '^__version__' scan_kit/__init__.py | sed 's/.*"\(.*\)".*/\1/')
+          if [ "$TAG_VERSION" != "$PACKAGE_VERSION" ]; then
+            echo "Tag version ($TAG_VERSION) does not match __version__ ($PACKAGE_VERSION)"
+            exit 1
+          fi
+
       - name: Prepare release assets
         run: |
-          mv artifacts/scan-kit-windows/scan-kit.exe artifacts/scan-kit-windows.exe
-          mv artifacts/scan-kit-linux/scan-kit       artifacts/scan-kit-linux-amd64
-          chmod +x artifacts/scan-kit-linux-amd64
+          VERSION="${GITHUB_REF_NAME#v}"
+          mv artifacts/scan-kit-windows/scan-kit.exe "artifacts/scan-kit-windows-${VERSION}.exe"
+          mv artifacts/scan-kit-linux/scan-kit       "artifacts/scan-kit-linux-amd64-${VERSION}"
+          chmod +x "artifacts/scan-kit-linux-amd64-${VERSION}"
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3
         with:
           generate_release_notes: true
           files: |
-            artifacts/scan-kit-windows.exe
-            artifacts/scan-kit-linux-amd64
+            artifacts/scan-kit-windows-*.exe
+            artifacts/scan-kit-linux-amd64-*

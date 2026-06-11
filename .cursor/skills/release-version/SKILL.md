@@ -75,9 +75,9 @@ Requirements for the trigger to fire correctly:
 
 1. **Tag name starts with `v`** and matches the version, e.g. `v1.3.0`. The glob is `v*`, so `v1.3.0` matches; `1.3.0` does not.
 2. **The tag is pushed to the remote.** `git push` does *not* push tags by default — you must push the tag explicitly (`git push origin v1.3.0`) or use `git push --follow-tags`.
-3. **The tagged commit already bumped `__version__`.** CI builds the code *at the tag*, so the binary's version comes from whatever the tag points at. Bump first, then tag that commit.
+3. **The tagged commit already bumped `__version__`.** CI builds the code *at the tag*, so the binary's version comes from whatever the tag points at. Bump first, then tag that commit. The release job fails if the tag and `__version__` disagree.
 
-Result: Windows (`scan-kit-windows.exe`) and Linux (`scan-kit-linux-amd64`) executables are built and attached to a new GitHub Release with auto-generated notes. No changelog file is maintained.
+Result: Windows (`scan-kit-windows-X.Y.Z.exe`) and Linux (`scan-kit-linux-amd64-X.Y.Z`) executables are built and attached to a new GitHub Release with auto-generated notes. Non-tagged CI builds (PRs, pushes to `main`) upload release-candidate artifacts named `scan-kit-windows-X.Y.Z-rc.exe` and `scan-kit-linux-amd64-X.Y.Z-rc`. No changelog file is maintained.
 
 ## Fixing or re-doing a release
 

@@ -12,8 +12,10 @@ Download the latest release for your platform from
 
 | Platform | Asset |
 |----------|-------|
-| Windows  | `scan-kit-windows.exe` |
-| Linux (x86-64) | `scan-kit-linux-amd64` |
+| Windows  | `scan-kit-windows-{version}.exe` |
+| Linux (x86-64) | `scan-kit-linux-amd64-{version}` |
+
+The `{version}` in each filename matches the release tag (e.g. `1.4.0` for tag `v1.4.0`).
 
 No Python installation required — just run the executable.
 
