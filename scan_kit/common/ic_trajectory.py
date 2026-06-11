@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import numpy as np
 
 # Plot origin at IC2 (first chamber along the downstream beam).
@@ -20,6 +22,61 @@ def ic_alignment_offsets(p2: np.ndarray, p1: np.ndarray) -> tuple[float, float]:
     each chamber's cloud on-axis without changing slope (hence angle).
     """
     return float(np.nanmedian(p2)), float(np.nanmedian(p1))
+
+
+@dataclass(frozen=True)
+class IcFanConvergence:
+    """Least-squares crossing point of the back-projected IC2→IC1 ray fan.
+
+    Each spot's IC2→IC1 line, extended upstream, should cross the beam axis at
+    the scan-magnet pivot.  ``position_mm`` is the lateral position of that best
+    common crossing; once each chamber's alignment offset is removed it should
+    sit on-axis (≈ 0), which is the sanity check that the fan converges at the
+    origin.
+    """
+
+    z_pivot_mm: float  # mm downstream of IC2 (negative = upstream toward magnet)
+    position_mm: float  # lateral crossing position (≈ 0 after alignment)
+
+    @property
+    def upstream_mm(self) -> float:
+        """Distance upstream of IC2 to the pivot (positive = toward magnet)."""
+        return IC2_Z_MM - self.z_pivot_mm
+
+    @property
+    def is_valid(self) -> bool:
+        return np.isfinite(self.z_pivot_mm) and np.isfinite(self.position_mm)
+
+
+def ic_fan_convergence(
+    p2: np.ndarray,
+    p1: np.ndarray,
+    *,
+    ic_sep_mm: float = IC_SEP_MM,
+) -> IcFanConvergence:
+    """Where the back-projected per-spot lines best converge (least squares).
+
+    Pass **alignment-corrected** positions (offsets already subtracted).  The
+    crossing *z* minimises the spread of lateral positions across spots; the
+    crossing position is reported so callers can confirm the fan converges on
+    the beam axis (≈ 0 mm).
+    """
+    p2 = np.asarray(p2, dtype=float)
+    p1 = np.asarray(p1, dtype=float)
+    ok = np.isfinite(p2) & np.isfinite(p1)
+    p2 = p2[ok]
+    p1 = p1[ok]
+    if p2.size < 2:
+        return IcFanConvergence(float("nan"), float("nan"))
+
+    slopes = (p1 - p2) / ic_sep_mm
+    var_s = float(np.var(slopes))
+    if var_s <= 0.0:
+        return IcFanConvergence(float("nan"), float("nan"))
+
+    z_pivot = -float(np.cov(p2, slopes, bias=True)[0, 1]) / var_s
+    position = float(np.mean(p2) + z_pivot * float(np.mean(slopes)))
+    return IcFanConvergence(z_pivot, position)
 
 
 def beam_slopes(

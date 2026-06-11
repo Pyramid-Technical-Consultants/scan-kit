@@ -15,12 +15,21 @@
   <img src="https://img.shields.io/badge/python-3.10%2B-blue.svg" alt="Python 3.10+">
 </p>
 
+<p align="center">
+  <a href="#the-launcher">
+    <img src="docs/images/launcher-data-analysis.png" alt="Scan Kit Data Analysis launcher showing session browser and analysis views" width="920">
+  </a>
+  <br>
+  <sub><em>Session browser, calibration controls, and one-click access to every analysis view.</em></sub>
+</p>
+
 ---
 
 ## Contents
 
 - [What Scan Kit does](#what-scan-kit-does)
 - [Get started](#get-started)
+- [Screenshots](#screenshots)
 - [The launcher](#the-launcher)
 - [Data Analysis](#data-analysis)
 - [Analysis views](#analysis-views)
@@ -84,18 +93,38 @@ scan-kit --version     # print installed version
 
 On a dev install, the default data source is the bundled `test_data/` folder.
 
+## Screenshots
+
+| Data Analysis | Plan Synthesis | Configuration Tuning |
+|:---:|:---:|:---:|
+| [![](docs/images/launcher-data-analysis.png)](docs/images/launcher-data-analysis.png) | [![](docs/images/launcher-plan-synthesis.png)](docs/images/launcher-plan-synthesis.png) | [![](docs/images/launcher-config-tuning.png)](docs/images/launcher-config-tuning.png) |
+| Browse sessions and launch views | Build and export `input_map.csv` | Edit `devices.xml` and run auto-tuning |
+
+<p align="center">
+  <img src="docs/images/view-position-scatter.png" alt="Position scatter plot comparing planned and measured spot positions" width="780">
+  &nbsp;&nbsp;
+  <img src="docs/images/view-sigma-energy.png" alt="Sigma vs energy violin plots for IC1 and IC2" width="780">
+  <br>
+  <sub><em>Spot position scatter (multi-session overlay) and sigma-vs-energy QA plots.</em></sub>
+</p>
+
+<p align="center">
+  <img src="docs/images/view-ic-timeslice-replay.png" alt="IC timeslice replay viewer with timeline brush" width="920">
+  <br>
+  <sub><em>IC Timeslice Replay — scrub through beam-on current with a timeline brush.</em></sub>
+</p>
+
+<p align="center">
+  <img src="docs/images/view-magnetic-field-replay.png" alt="Magnetic field timeslice replay with Bx and By traces" width="460">
+  &nbsp;
+  <img src="docs/images/view-amplifier-correlation.png" alt="Amplifier command correlation scatter matrix" width="460">
+  <br>
+  <sub><em>Magnetic field replay (G3 hall probes) and amplifier command correlations (G2 steering chain).</em></sub>
+</p>
+
 ## The launcher
 
 Scan Kit opens a single window with three tabs:
-
-```mermaid
-flowchart LR
-  DA["Data Analysis\nSelect sessions · plot · report"]
-  PS["Plan Synthesis\nBuild input_map.csv"]
-  CT["Configuration Tuning\nEdit XML · auto-tune"]
-
-  DA --- PS --- CT
-```
 
 | Tab | Use it to… |
 |-----|------------|
@@ -219,16 +248,7 @@ Are chambers consistent, and is delivered dose on target?
 
 ### Interactive replay views
 
-**IC Timeslice Replay** and **Magnetic Field Timeslice Replay** share a media-player layout:
-
-```
-┌─────────────────────────────────────────────┐
-│  Detail panel — full-resolution traces      │
-│  (IC1 / IC2 / IC3  or  Bx / By)            │
-├─────────────────────────────────────────────┤
-│  Timeline brush — drag to select window  ◀▶ │
-└─────────────────────────────────────────────┘
-```
+**IC Timeslice Replay** and **Magnetic Field Timeslice Replay** share a media-player layout — detail traces on top, a compressed timeline brush below. See the [screenshots](#screenshots) for examples.
 
 1. Select session(s) and open the replay view.
 2. The bottom timeline shows a compressed envelope of the full session.
@@ -270,6 +290,10 @@ Switch to the **Plan Synthesis** tab to build `input_map.csv` files for PBS test
 
 Pick a template, set parameters, preview the spot table, and export. Suggested filenames are generated from the template and energy settings.
 
+<p align="center">
+  <img src="docs/images/launcher-plan-synthesis.png" alt="Plan Synthesis tab with Zero Field template selected" width="720">
+</p>
+
 ## Configuration Tuning
 
 The **Configuration Tuning** tab is a structured editor for map2map XML configuration:
@@ -281,6 +305,10 @@ The **Configuration Tuning** tab is a structured editor for map2map XML configur
 - **Auto-tuning workflows** — e.g. **Sigma Tuning** derives updated IC σ K0 values from measured sessions, with preview before apply
 
 Jump here directly from a session's context menu in Data Analysis when an on-disk config folder exists.
+
+<p align="center">
+  <img src="docs/images/launcher-config-tuning.png" alt="Configuration Tuning tab editing devices.xml" width="720">
+</p>
 
 ## Session data layout
 
@@ -306,6 +334,19 @@ A nested layout (`<session_id>/<session_id>/input_map.csv`) is also recognized.
 ---
 
 ## For developers
+
+<details>
+<summary><strong>Regenerating README screenshots</strong></summary>
+
+Screenshots in `docs/images/` are captured from real session data with:
+
+```bash
+python scripts/capture_doc_screenshots.py
+```
+
+Requires a local `test_data/` folder (not shipped with the repo). The script grabs launcher tabs off-screen and renders analysis views headlessly.
+
+</details>
 
 <details>
 <summary><strong>Running tests</strong></summary>

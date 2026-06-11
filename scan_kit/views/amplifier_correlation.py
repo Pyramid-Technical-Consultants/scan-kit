@@ -37,7 +37,12 @@ from ..common.amplifier_settling import (
     amplifier_readback_tracks_command_axis,
     amplifier_settled_mask,
 )
-from ..common.ic_trajectory import aligned_beam_angles_mrad, ic_alignment_offsets
+from ..common.ic_trajectory import (
+    IcFanConvergence,
+    aligned_beam_angles_mrad,
+    ic_alignment_offsets,
+    ic_fan_convergence,
+)
 from ..common.session_source import (
     SessionSource,
     load_session_csv,
@@ -136,13 +141,48 @@ class AmplifierCorrelationSamples:
     angle_x_mrad: np.ndarray
     angle_y_mrad: np.ndarray
     momentum: np.ndarray
+    align_x: "_AxisAlignment" = field(default_factory=lambda: _AxisAlignment())
+    align_y: "_AxisAlignment" = field(default_factory=lambda: _AxisAlignment())
+
+
+@dataclass(frozen=True)
+class _AxisAlignment:
+    """Per-axis IC alignment: robust per-IC offsets plus the fan convergence.
+
+    The offsets are the measured chamber alignment errors (subtracting them
+    centres each IC's cloud on-axis without changing slope/angle).  The
+    *difference* IC2−IC1 is the relative IC-to-IC misalignment; removing each
+    independently cancels the fake common tilt it would otherwise inject.
+    ``convergence`` reports where the alignment-corrected back-projected ray fan
+    crosses the axis (≈ 0 mm) as a sanity check.
+    """
+
+    ic2_offset: float = 0.0
+    ic1_offset: float = 0.0
+    convergence: IcFanConvergence = field(
+        default_factory=lambda: IcFanConvergence(float("nan"), float("nan"))
+    )
+
+    @property
+    def offset_difference(self) -> float:
+        """IC2 − IC1 offset (mm) = relative chamber misalignment."""
+        return self.ic2_offset - self.ic1_offset
+
+
+def _axis_alignment(ic2: np.ndarray, ic1: np.ndarray) -> _AxisAlignment:
+    off2, off1 = ic_alignment_offsets(ic2, ic1)
+    convergence = ic_fan_convergence(
+        np.asarray(ic2, dtype=float) - off2,
+        np.asarray(ic1, dtype=float) - off1,
+    )
+    return _AxisAlignment(off2, off1, convergence)
 
 
 def _session_alignment_offsets(
     frames: list,
     chamber_source,
-) -> tuple[tuple[float, float], tuple[float, float]]:
-    """Median IC2/IC1 chamber offsets for X and Y (session-level alignment)."""
+) -> tuple[_AxisAlignment, _AxisAlignment]:
+    """Session-level IC alignment for X and Y (robust per-IC median offsets)."""
     ic2_x_parts: list[np.ndarray] = []
     ic1_x_parts: list[np.ndarray] = []
     ic2_y_parts: list[np.ndarray] = []
@@ -162,11 +202,11 @@ def _session_alignment_offsets(
         ic1_y_parts.append(ic1_y[beam_on])
 
     if not ic2_x_parts:
-        return (0.0, 0.0), (0.0, 0.0)
+        return _AxisAlignment(), _AxisAlignment()
 
     return (
-        ic_alignment_offsets(np.concatenate(ic2_x_parts), np.concatenate(ic1_x_parts)),
-        ic_alignment_offsets(np.concatenate(ic2_y_parts), np.concatenate(ic1_y_parts)),
+        _axis_alignment(np.concatenate(ic2_x_parts), np.concatenate(ic1_x_parts)),
+        _axis_alignment(np.concatenate(ic2_y_parts), np.concatenate(ic1_y_parts)),
     )
 
 
@@ -235,9 +275,9 @@ def _load_session_samples(
     if chamber_source is None:
         return None
 
-    (off2_x, off1_x), (off2_y, off1_y) = _session_alignment_offsets(
-        frames, chamber_source
-    )
+    align_x, align_y = _session_alignment_offsets(frames, chamber_source)
+    off2_x, off1_x = align_x.ic2_offset, align_x.ic1_offset
+    off2_y, off1_y = align_y.ic2_offset, align_y.ic1_offset
 
     readback_field_drive = _session_readback_field_drive(
         frames,
@@ -337,6 +377,8 @@ def _load_session_samples(
         angle_x_mrad=np.concatenate(angle_x_parts),
         angle_y_mrad=np.concatenate(angle_y_parts),
         momentum=np.concatenate(momentum_parts),
+        align_x=align_x,
+        align_y=align_y,
     )
 
 
@@ -491,6 +533,27 @@ def _format_angle_fit_label(fit: _CubicFit, *, prefix: str = "") -> str:
     )
 
 
+def _format_alignment_label(align: "_AxisAlignment") -> str:
+    """Per-IC alignment offsets, their difference, and the fan convergence.
+
+    IC1/IC2 are the subtracted chamber offsets (mm); ``\u0394`` is the relative
+    IC-to-IC misalignment; ``converge`` is where the alignment-corrected
+    back-projected ray fan crosses the axis (≈ 0 mm sanity check).
+    """
+    conv = align.convergence
+    conv_txt = (
+        f"{_format_legend_number(conv.position_mm)} mm"
+        if conv.is_valid
+        else "n/a"
+    )
+    return (
+        f"   align IC1 {_format_legend_number(align.ic1_offset)} "
+        f"IC2 {_format_legend_number(align.ic2_offset)} "
+        f"(\u0394 {_format_legend_number(align.offset_difference)}) mm   "
+        f"converge {conv_txt}"
+    )
+
+
 def _plot_ecfield_angle(
     ax,
     samples: AmplifierCorrelationSamples,
@@ -500,6 +563,7 @@ def _plot_ecfield_angle(
     color: str,
     session_id: str,
     n_sessions: int,
+    align: "_AxisAlignment | None" = None,
     use_hexbin: bool = True,
     draw_fit: bool = True,
 ) -> tuple[str, tuple] | None:
@@ -507,7 +571,8 @@ def _plot_ecfield_angle(
 
     Companion to the residual panel.  When *draw_fit* is set the per-session
     cubic curve is drawn; otherwise only the scatter is shown (e.g. when the
-    pooled super-fit curve is overlaid instead).
+    pooled super-fit curve is overlaid instead).  *align* appends the per-IC
+    alignment offsets and fan-convergence sanity check to the legend.
     """
     ecfield = _energy_corrected_field(getattr(samples, field_key), samples.momentum)
     angle = getattr(samples, angle_key)
@@ -524,6 +589,8 @@ def _plot_ecfield_angle(
         ax.plot(xs, fit.poly(xs), color=line_color, linewidth=1.2, zorder=6)
     prefix = trend_session_prefix(session_id, n_sessions=n_sessions)
     label = _format_angle_fit_label(fit, prefix=prefix)
+    if align is not None:
+        label = f"{label}\n{_format_alignment_label(align)}"
     return label, line_color
 
 
@@ -735,6 +802,7 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
                 color=color,
                 session_id=sid,
                 n_sessions=len(loaded_ids),
+                align=samples.align_x if angle_k == "angle_x_mrad" else samples.align_y,
                 draw_fit=False,
             )
             if angle_raw_trend is not None:
