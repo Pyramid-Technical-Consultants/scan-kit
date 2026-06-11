@@ -1,0 +1,15 @@
+---
+description: Where to put throwaway diagnostic/analysis scripts
+alwaysApply: true
+---
+
+# Scratch / diagnostic scripts
+
+When you need a throwaway script to investigate something (compare fits, probe
+data shapes, sanity-check a calculation, etc.), put it in the **`ai-scratch/`**
+folder — never the repository root.
+
+- `ai-scratch/` is git-ignored (except its `README.md`), so scratch files never
+  clutter the project root or show up in `git status`.
+- Use clear names like `ai-scratch/diag_model.py`.
+- These files are disposable; clean them up when you're done with them.

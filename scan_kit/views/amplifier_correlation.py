@@ -616,14 +616,14 @@ _ANGLE_MODEL_EQUATION = (
 
 
 def _annotate_angle_model(ax) -> None:
-    """Annotate the beam-angle model equation in the upper-left of *ax*."""
+    """Annotate the beam-angle model equation in the lower-left of *ax*."""
     ax.text(
         0.03,
-        0.97,
+        0.03,
         _ANGLE_MODEL_EQUATION,
         transform=ax.transAxes,
         ha="left",
-        va="top",
+        va="bottom",
         fontsize=8,
         zorder=8,
         bbox=dict(

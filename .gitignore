@@ -215,3 +215,8 @@ test_data/
 /debug-*.log
 /importtime.txt
 /_*.png
+
+# AI scratch: throwaway diagnostic/analysis scripts the assistant writes while
+# reasoning. Everything here is ignored except the README that documents it.
+/ai-scratch/*
+!/ai-scratch/README.md
