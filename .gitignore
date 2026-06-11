@@ -208,3 +208,10 @@ __marimo__/
 
 # Scan-kit test data
 test_data/
+
+# Ad-hoc debugging / scratch (not part of test or release code)
+/diag_*.py
+/_patch_*.py
+/debug-*.log
+/importtime.txt
+/_*.png

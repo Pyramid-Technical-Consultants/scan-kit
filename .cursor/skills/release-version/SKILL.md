@@ -10,10 +10,10 @@ description: Bump the scan-kit version and cut a release. Covers updating __vers
 The version lives in **one** place — `scan_kit/__init__.py`:
 
 ```python
-__version__ = "1.3.0"
+__version__ = "1.4.0"
 ```
 
-`pyproject.toml` reads it dynamically (`version = {attr = "scan_kit.__version__"}`), and the launcher window title (`scan-kit v{__version__}`) picks it up automatically. **Never** hard-code the version anywhere else.
+`pyproject.toml` reads it dynamically (`version = {attr = "scan_kit.__version__"}`), and the launcher window title (`Scan Kit v{__version__}`) picks it up automatically. **Never** hard-code the version anywhere else.
 
 ## Choosing the bump (semver)
 
@@ -33,7 +33,7 @@ git add scan_kit/__init__.py
 git commit -m "Release vX.Y.Z"
 ```
 
-3. **Tag** the commit (the tag name must be `v` + the version, e.g. `v1.3.0`):
+3. **Tag** the commit (the tag name must be `v` + the version, e.g. `v1.4.0`):
 
 ```bash
 git tag vX.Y.Z
@@ -69,15 +69,22 @@ What this means in practice:
 
 - The `build` job runs on every push to `main`, every PR, and every `v*` tag — but it only **builds** artifacts, it does **not** release.
 - The `release` job runs **only** when the pushed ref is a tag starting with `v` (`refs/tags/v*`). This is the single gate that publishes the GitHub Release and attaches the Windows/Linux binaries.
-- Therefore a release happens **only** when you push a tag whose name starts with `v`. Pushing the commit alone, or a tag named without the `v` prefix (e.g. `1.3.0`), will build but **never release**.
+- Therefore a release happens **only** when you push a tag whose name starts with `v`. Pushing the commit alone, or a tag named without the `v` prefix (e.g. `1.4.0`), will build but **never release**.
 
 Requirements for the trigger to fire correctly:
 
-1. **Tag name starts with `v`** and matches the version, e.g. `v1.3.0`. The glob is `v*`, so `v1.3.0` matches; `1.3.0` does not.
-2. **The tag is pushed to the remote.** `git push` does *not* push tags by default — you must push the tag explicitly (`git push origin v1.3.0`) or use `git push --follow-tags`.
+1. **Tag name starts with `v`** and matches the version, e.g. `v1.4.0`. The glob is `v*`, so `v1.4.0` matches; `1.4.0` does not.
+2. **The tag is pushed to the remote.** `git push` does *not* push tags by default — you must push the tag explicitly (`git push origin v1.4.0`) or use `git push --follow-tags`.
 3. **The tagged commit already bumped `__version__`.** CI builds the code *at the tag*, so the binary's version comes from whatever the tag points at. Bump first, then tag that commit. The release job fails if the tag and `__version__` disagree.
 
-Result: Windows (`scan-kit-windows-X.Y.Z.exe`) and Linux (`scan-kit-linux-amd64-X.Y.Z`) executables are built and attached to a new GitHub Release with auto-generated notes. Non-tagged CI builds (PRs, pushes to `main`) upload release-candidate artifacts named `scan-kit-windows-X.Y.Z-rc.exe` and `scan-kit-linux-amd64-X.Y.Z-rc`. No changelog file is maintained.
+### Release asset filenames
+
+| Build type | Windows | Linux |
+|------------|---------|-------|
+| Tagged release | `scan-kit-windows-X.Y.Z.exe` | `scan-kit-linux-amd64-X.Y.Z` |
+| Non-tagged CI (PR / `main`) | `scan-kit-windows-X.Y.Z-rc.exe` | `scan-kit-linux-amd64-X.Y.Z-rc` |
+
+`X.Y.Z` comes from `__version__` for `-rc` builds and from the git tag (without `v`) for releases. No changelog file is maintained; GitHub auto-generates release notes.
 
 ## Fixing or re-doing a release
 
@@ -98,8 +105,10 @@ Deleting a tag does not delete an already-published GitHub Release — remove th
 - [ ] Commit message is `Release vX.Y.Z`.
 - [ ] Tag name exactly matches `vX.Y.Z` (same as `__version__`, prefixed with `v`).
 - [ ] Tag points at the release commit and was pushed.
+- [ ] CI release job passes the tag/`__version__` sanity check and publishes both platform binaries.
 
 ## Notes
 
 - Only create the tag/push when the user explicitly wants to release. If they just want the number bumped (e.g. inside an in-progress PR), do step 1 only and skip tagging.
 - If this is part of a PR that isn't merged yet, prefer bumping on the PR branch; the tag is usually created after merge to `main`.
+- PR and `main` pushes produce `-rc` artifacts in the Actions run for pre-release testing; they do not create a GitHub Release.

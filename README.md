@@ -1,209 +1,362 @@
-# scan-kit
+<p align="center">
+  <img src="scan_kit/assets/icon.png" alt="Scan Kit" width="96">
+</p>
 
-Open-source proton pencil beam scanning session analysis toolkit with a
-Qt desktop launcher and Matplotlib analysis views.
+<h1 align="center">Scan Kit</h1>
 
-## Quick Start
+<p align="center">
+  <strong>Open-source analysis for proton pencil beam scanning sessions.</strong><br>
+  Explore beam quality, dosimetry, magnetics, and delivery logs — from a single desktop launcher.
+</p>
 
-### Pre-built Executables (recommended)
+<p align="center">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License"></a>
+  <a href="https://github.com/Pyramid-Technical-Consultants/scan-kit/releases/latest"><img src="https://img.shields.io/github/v/release/Pyramid-Technical-Consultants/scan-kit?label=release" alt="Latest release"></a>
+  <img src="https://img.shields.io/badge/python-3.10%2B-blue.svg" alt="Python 3.10+">
+</p>
 
-Download the latest release for your platform from
-[**Releases**](https://github.com/Pyramid-Technical-Consultants/scan-kit/releases/latest):
+---
 
-| Platform | Asset |
-|----------|-------|
-| Windows  | `scan-kit-windows-{version}.exe` |
-| Linux (x86-64) | `scan-kit-linux-amd64-{version}` |
+## Contents
 
-The `{version}` in each filename matches the release tag (e.g. `1.4.0` for tag `v1.4.0`).
+- [What Scan Kit does](#what-scan-kit-does)
+- [Get started](#get-started)
+- [The launcher](#the-launcher)
+- [Data Analysis](#data-analysis)
+- [Analysis views](#analysis-views)
+- [Plan Synthesis](#plan-synthesis)
+- [Configuration Tuning](#configuration-tuning)
+- [Session data layout](#session-data-layout)
+- [For developers](#for-developers)
+- [License](#license)
 
-No Python installation required — just run the executable.
+## What Scan Kit does
 
-### From Source
+Scan Kit is a desktop toolkit for reviewing PBS treatment and QA sessions. Point it at a folder of session data, select up to five sessions, and launch Matplotlib analysis views — each in its own process so the launcher stays responsive.
 
-Requires Python 3.10+.
+Beyond plotting, Scan Kit helps you:
+
+| Capability | What you get |
+|------------|--------------|
+| **Session comparison** | Overlay multiple sessions in the same view with distinct colors |
+| **Interactive replay** | Scrub through IC current and magnetic-field timeslices like a media player |
+| **PDF reports** | Bundle static plots into a shareable analysis report |
+| **Plan authoring** | Generate `input_map.csv` from templates, DICOM RT Ion plans, or IBA PLD files |
+| **Config editing** | Browse and edit map2map XML with forms, integrity checks, and sigma auto-tuning |
+
+Scan Kit reads standard DCS session exports — unpacked directories or common archive formats — and works with both G2 and G3 data layouts.
+
+## Get started
+
+### Download a release (recommended)
+
+Pre-built executables are published on [**GitHub Releases**](https://github.com/Pyramid-Technical-Consultants/scan-kit/releases/latest). No Python install required.
+
+| Platform | Download |
+|----------|----------|
+| **Windows** | `scan-kit-windows-{version}.exe` |
+| **Linux** (x86-64) | `scan-kit-linux-amd64-{version}` |
+
+The `{version}` in the filename matches the release tag — e.g. `1.4.0` for tag `v1.4.0`. Run the executable and set your data source folder in the launcher.
+
+> **Trying the latest `main` branch?** CI builds release-candidate artifacts on every push and pull request:
+> `scan-kit-windows-{version}-rc.exe` and `scan-kit-linux-amd64-{version}-rc`.
+> Download them from the **Artifacts** section of the corresponding [GitHub Actions](https://github.com/Pyramid-Technical-Consultants/scan-kit/actions) workflow run.
+
+### Install from source
+
+Requires **Python 3.10+**.
 
 ```bash
+git clone https://github.com/Pyramid-Technical-Consultants/scan-kit.git
+cd scan-kit
 pip install .          # standard install
-pip install -e .       # editable install for development
+# pip install -e .     # editable install for development
 ```
 
-Run the app:
+Launch:
 
 ```bash
-scan-kit               # via console entry point
-python -m scan_kit     # as a module
+scan-kit
+# or: python -m scan_kit
+scan-kit --version     # print installed version
 ```
 
-Check version:
+On a dev install, the default data source is the bundled `test_data/` folder.
+
+## The launcher
+
+Scan Kit opens a single window with three tabs:
+
+```mermaid
+flowchart LR
+  DA["Data Analysis\nSelect sessions · plot · report"]
+  PS["Plan Synthesis\nBuild input_map.csv"]
+  CT["Configuration Tuning\nEdit XML · auto-tune"]
+
+  DA --- PS --- CT
+```
+
+| Tab | Use it to… |
+|-----|------------|
+| **Data Analysis** | Browse sessions, adjust global plot settings, open analysis views, generate PDF reports |
+| **Plan Synthesis** | Create PBS test plans and export `input_map.csv` |
+| **Configuration Tuning** | Open a facility or session config folder, edit XML, run tuning workflows |
+
+Plot windows open separately. Close them when you are done — the launcher keeps running. Press **Esc** or **Ctrl+Q** to quit.
+
+## Data Analysis
+
+### 1. Choose your data source
+
+Enter the folder that contains session data in **DATA SOURCE**, then press **Enter** or click away to refresh discovery. When running a frozen executable, the default is the current working directory.
+
+### 2. Select sessions
+
+The session table shows **Session ID**, **Date**, **MU**, **Time (s)**, and **Note**.
+
+- Sort by **Date** (newest first), **ID**, or **MU**
+- Tick **Use** on up to **five** sessions — no modifier key needed
+- Click **✕** to clear all selections
+- **Right-click** a session → **Open in Config Tuning…** when a config folder is available
+
+### 3. Annotate sessions (optional)
+
+Double-click (or press **F2** on) the **Note** column to add free-text notes. Notes save automatically and are stored in `<data_source>/session_notes.json`.
+
+### 4. Tune global settings
+
+Two controls affect most dose-related views:
+
+| Setting | Options |
+|---------|---------|
+| **Background subtract** | On / Off |
+| **Calibration** | Off · Per-Session · Constrained |
+
+Settings persist in `<data_source>/settings.json` and propagate to views that are already open.
+
+### 5. Open analysis views
+
+Click any button in the right-hand panel. Views are grouped by analysis category (see [Analysis views](#analysis-views)). Each view runs in a background subprocess; a warm worker pool makes the first click feel snappy.
+
+### 6. Generate a PDF report (optional)
+
+With sessions selected, click **Generate Report…** to open the report wizard. Pick which views to include, set author metadata, and choose an output path.
+
+Interactive tools — timeslice replay, session log browser, and audio export — are excluded from reports because they cannot be rendered as static pages.
+
+## Analysis views
+
+Views are organized in the launcher to match clinical QA workflows. Select one or more sessions, then click a view to open it.
+
+### Beam distribution
+
+How well does the beam land where the plan says it should?
+
+| View | Summary |
+|------|---------|
+| Position Error vs Energy | IC1/IC2 X and Y position error vs beam energy |
+| Position Error Distribution (Timeslice) | Beam-on timeslice error density contours and histograms |
+| Position Error Distribution (Spot) | Per-spot error density contours and histograms |
+| Position Error Outliers (Spot) | Spots that are statistical outliers (median/MAD) |
+| Sigma vs Energy | IC1/IC2 spot size (σ) in X and Y vs energy |
+| Sigma Distribution (Timeslice) | Beam-on timeslice σ density contours and histograms |
+| Position Scatter | Planned, IC1, and IC2 positions overlaid by session |
+| IC Beam Trajectory | Per-spot IC beam path in X and Y along the beam axis |
+| Beam Error Motion vs Energy | Per-energy position-error spill paths (IC1 solid, IC2 dotted) |
+
+### Dosimetry
+
+Are chambers consistent, and is delivered dose on target?
+
+| View | Summary |
+|------|---------|
+| Dose Ratios vs Energy | IC2/IC1, IC3/IC1, IC3/IC2 ratios vs energy |
+| Dose Ratios vs Position | Inter-chamber ratio consistency vs beam position |
+| Dose Ratios vs Spot Time | Inter-chamber ratios vs spot delivery time |
+| Dose Error vs Energy | Percent dose error vs prescribed target by energy |
+| Dose Error vs Energy (mean) | Mean percent dose error per energy layer |
+| Dose Error vs Target MU | Per-spot percent dose error vs target MU |
+| Dose Accumulation | Expected vs measured cumulative dose per chamber |
+| MU Delivery Rate vs Energy | Effective MU/s vs energy (wall-clock per layer) |
+
+### Beam current & timing
+
+| View | Summary |
+|------|---------|
+| Current Ratios vs Energy | Beam-on mean IC current ratios vs energy |
+| Beam-On vs Beam-Off Current | Beam-on and beam-off current distributions by energy |
+| Spot Delivery Time | Total, beam-on, and overhead time per spot |
+
+### Timeseries & transients
+
+| View | Summary |
+|------|---------|
+| Beam-Off Ramp-Down | Beam-off current ramp-down curves (IC1/IC2/IC3) |
+| IC Timeslice Replay | Interactive IC1/IC2/IC3 current viewer — [details](#interactive-replay-views) |
+| IC Timeslice Replay (dDose/dt) | IC current derived from scan-total dose rate |
+
+### Magnetic analysis
+
+| View | Summary |
+|------|---------|
+| Magnetic Field Timeslice Replay | Interactive Bx/By field viewer — [details](#interactive-replay-views) |
+| Amplifier Command Correlations | Settled amplifier command vs readback, field, and IC position — [details](#amplifier-command-correlations) |
+
+### Noise measurement
+
+| View | Summary |
+|------|---------|
+| IC Current FFT Analysis | Frequency-domain view of IC1/IC2/IC3 current |
+| IC Peak Amplitude — Beam-Off (G3) | G3 beam-off peak amplitude distributions |
+| IC Audio Export (WAV) | Listen to and export IC waveforms as WAV *(requires PortAudio)* |
+
+### Session log
+
+| View | Summary |
+|------|---------|
+| Session Log Compare | Layer timings, grouped errors, event browser, two-session diff — [details](#session-log-compare) |
+
+### Interactive replay views
+
+**IC Timeslice Replay** and **Magnetic Field Timeslice Replay** share a media-player layout:
+
+```
+┌─────────────────────────────────────────────┐
+│  Detail panel — full-resolution traces      │
+│  (IC1 / IC2 / IC3  or  Bx / By)            │
+├─────────────────────────────────────────────┤
+│  Timeline brush — drag to select window  ◀▶ │
+└─────────────────────────────────────────────┘
+```
+
+1. Select session(s) and open the replay view.
+2. The bottom timeline shows a compressed envelope of the full session.
+3. Click and drag to define the window displayed in the detail panel above.
+
+Layer boundaries appear as annotated vertical lines. Multiple sessions overlay with distinct colors. Large windows are auto-decimated so scrubbing stays smooth.
+
+**Magnetic field** replay plots scan-magnet probes in gauss:
+
+- **G3:** `r_tx2_probe_x` / `r_tx2_probe_y` (TX2 hall probes)
+- **G2:** `field_c_x` / `field_c_y` (correcting-coil readback)
+
+A Bx-vs-By scatter panel (colored by energy) accompanies the timeline view.
+
+### Amplifier command correlations
+
+For G2 correcting-coil sessions, this view plots beam-on samples where amplifier commands have reached a settled plateau. Scatter panels relate command to readback, magnetic field, and IC iso position — useful for diagnosing steering-chain consistency end to end.
+
+### Session log compare
+
+Every session ships a verbose `SessionLogFile.log` from DCS. This view distills it:
+
+1. Select **one** session to explore, or **two** to compare.
+2. **Layer timeline** — `START MAP` and `SCAN EXECUTING` durations per layer.
+3. **Issues** — grouped `ERROR` templates and watchdog mismatches.
+4. **Event browser** — filterable log with *Hide noise* to skip ACK/command chatter.
+5. **Message diff** *(two sessions)* — templates whose occurrence counts differ most.
+
+## Plan Synthesis
+
+Switch to the **Plan Synthesis** tab to build `input_map.csv` files for PBS test plans.
+
+| Template | Description |
+|----------|-------------|
+| **Zero Field** | Every spot at (0, 0) for each energy layer |
+| **Rectangular Field** | Even spot grid per layer with configurable field size |
+| **DICOM RT Plan** | Import an RT Ion therapy plan (`.dcm`) |
+| **IBA PLD Plan** | Import an IBA PBS plan (`.pld`) |
+
+Pick a template, set parameters, preview the spot table, and export. Suggested filenames are generated from the template and energy settings.
+
+## Configuration Tuning
+
+The **Configuration Tuning** tab is a structured editor for map2map XML configuration:
+
+- **File tree** — browse `devices.xml` and related config files
+- **Auto-generated forms** — edit XML values without raw markup
+- **Hide unused map2map XML** — collapse attributes the map2map library never reads
+- **Integrity badges** — SHA-256 sidecar verification at a glance
+- **Auto-tuning workflows** — e.g. **Sigma Tuning** derives updated IC σ K0 values from measured sessions, with preview before apply
+
+Jump here directly from a session's context menu in Data Analysis when an on-disk config folder exists.
+
+## Session data layout
+
+Scan Kit discovers sessions from a single data-source folder. Supported layouts:
+
+**Unpacked directories**
+
+```
+<data_source>/
+  <session_id>/
+    input_map.csv
+    SessionLogFile.log          # optional — session log views
+    layer-<n>/run-<m>/
+      timeslice_data_device_units.csv   # timeslice views
+```
+
+A nested layout (`<session_id>/<session_id>/input_map.csv`) is also recognized.
+
+**Archive files** — each archive should contain a top-level `<session_id>/` folder:
+
+`.zip` · `.tgz` · `.tar.gz` · `.tar.bz2` · `.tar.xz` · `.tar`
+
+---
+
+## For developers
+
+<details>
+<summary><strong>Running tests</strong></summary>
 
 ```bash
-scan-kit --version
+pip install -e ".[build]"
+pytest
 ```
 
-## GUI workflow
+Tests live in `tests/` and use fixtures from `test_data/` (included in dev installs, excluded from the published package). The suite runs headless — Agg matplotlib backend, no Qt windows.
 
-### 1) Set data source
+App preferences (last data directory, report paths, window geometry) persist in `app_settings.json` under the user config directory.
 
-- In **DATA SOURCE**, enter the folder that contains session data
-- Leave the field (or use Enter) to refresh discovery
-- Default source is the current working directory when frozen, or `test_data` in a dev install
+</details>
 
-### 2) Sort and select sessions
-
-- Sessions can be sorted by:
-  - **Date** (default, newest first)
-  - **ID**
-  - **MU**
-- Select up to **5 sessions** by ticking **Use** in the table (no Ctrl key needed)
-- Use the **✕** control to clear all **Use** checks
-- The table lists **Session ID**, **Date**, **MU**, **Time (s)**, and **Note** (edit in the cell; long text also appears in the tooltip)
-- Status shows how many sessions are checked and whether metadata is still loading
-
-### 3) Add session notes (optional)
-
-- Edit the **Note** column directly (double-click or F2 on the cell)
-- Notes are saved when you finish editing the cell
-- Notes are stored in `<data_source>/session_notes.json`
-
-### 4) Run analysis views
-
-- Click any analysis button in the right-hand panel
-- Each view runs in its own Python process and opens Matplotlib window(s)
-- Close the plot window(s) when done; the launcher stays open
-
-### 5) Quit
-
-- Close the window, or **Esc** / **Ctrl+Q**
-
-## Available Views
-
-| View | What it shows |
-|------|---------------|
-| **Position Error vs Energy** | IC1/IC2 X and Y position error vs energy (scatter) |
-| **IC Beam Trajectory** | Per-spot raw IC X/Y lines through IC2→IC1, extended upstream/downstream |
-| **Position Scatter** | Planned, IC1, and IC2 spot positions overlaid by session color |
-| **Dose Ratios vs Energy** | IC2/IC1, IC3/IC1, IC3/IC2 ratio differences vs energy |
-| **Dose Ratios vs Position** | Dose-ratio behavior against beam position |
-| **Dose Ratios vs Spot Time** | Dose-ratio behavior against spot delivery time |
-| **Dose Error vs Target (%)** | Percent error versus prescribed target by energy (IC1/IC2/IC3) |
-| **Spot Delivery Time** | Total, beam-on, and overhead spot timing analysis |
-| **Sigma vs Energy** | IC1/IC2 X and Y sigma vs energy (violin plots) |
-| **Beam-Off Ramp-Down** | Beam-off current ramp-down curves (IC1/IC2/IC3) |
-| **Beam-On vs Beam-Off Current** | Beam-on and beam-off current distributions by energy |
-| **IC Timeslice Replay** | Interactive media-player style viewer for raw IC1/IC2/IC3 timeslice current |
-| **Magnetic Field Timeslice Replay** | Interactive Bx/By scan-magnet field viewer (gauss) with timeline brush |
-| **Dose Accumulation** | Cumulative dose delivery analysis |
-| **IC Current FFT Analysis** | Frequency-domain analysis of IC current signals |
-| **IC Audio Export (WAV)** | Export IC current data as audible WAV files (requires PortAudio) |
-| **Session Log Compare** | Parse `SessionLogFile.log`: layer timings, errors, filterable event browser; compare two sessions |
-
-### IC Timeslice Replay
-
-The replay view uses a media-player layout for browsing raw IC current data:
-
-- **Top panel** (three rows): full-resolution IC1, IC2, and IC3 traces for the
-  currently selected window. Layer boundaries appear as vertical lines with
-  energy annotations.
-- **Bottom panel** (short timeline): a compressed min/max envelope of IC1
-  across the entire session. Click and drag on this timeline to select the
-  window shown in the top panel.
-
-Usage:
-
-1. Select one or more sessions and click **IC Timeslice Replay**.
-2. The bottom timeline shows the full session waveform. Drag a span to zoom
-   the top panel into that region.
-3. Resize or reposition the span to scrub through different parts of the
-   session.
-
-When multiple sessions are selected, traces are overlaid with distinct colors.
-The detail panel auto-decimates when the selected window is very large, so
-interaction stays responsive.
-
-### Magnetic Field Timeslice Replay
-
-Same media-player layout as IC Timeslice Replay, but plots scan-magnet field
-probes in **gauss**:
-
-- **G3** sessions: `r_tx2_probe_x` / `r_tx2_probe_y` (TX2 hall probes)
-- **G2** sessions: `field_c_x` / `field_c_y` (correcting-coil readback)
-
-The bottom timeline shows |B|; drag a span to zoom Bx and By detail panels.
-The right panel scatters Bx vs By for the selected window, colored by energy.
-
-### Session Log Compare
-
-DCS writes a verbose `SessionLogFile.log` beside each session. This view parses
-that file and surfaces the useful signal:
-
-1. Select **one** session to explore, or **two** to compare side by side.
-2. Click **Session Log Compare** under **Session Log Analysis**.
-3. Use **Layer timeline** for per-layer `START MAP` / `SCAN EXECUTING` durations.
-4. Use **Issues** for grouped `ERROR` templates and watchdog mismatches.
-5. Use **Event browser** with *Hide noise* to skip ACK/command spam; search for
-   keywords (e.g. `TIMELINE`, `interlock`, `fail`).
-6. With two sessions, **Message diff** lists templates whose counts differ most.
-
-## Supported Session Data Layout
-
-Session discovery supports all of the following in the selected data source:
-
-- Unpacked session directories:
-  - `<base>/<session_id>/input_map.csv`
-  - `<base>/<session_id>/<session_id>/input_map.csv`
-  - `<base>/<session_id>/SessionLogFile.log` (session log analysis)
-- Archive files:
-  - `<session_id>.zip`
-  - `<session_id>.tgz`
-  - `<session_id>.tar.gz`
-  - `<session_id>.tar.bz2`
-  - `<session_id>.tar.xz`
-  - `<session_id>.tar`
-
-For archive-based sessions, `scan-kit` expects files under a top-level
-`<session_id>/` folder inside the archive.
-
-Timeslice-based analyses (for example beam-on/beam-off and ramp-down views)
-read per-layer files from:
-
-`<session_id>/layer-<n>/run-<m>/timeslice_data_device_units.csv`
-
-## Building from Source
-
-To build a standalone executable for your platform:
+<details>
+<summary><strong>Building an executable locally</strong></summary>
 
 ```bash
-pip install -e ".[build]"   # install with PyInstaller
-python build.py --clean     # build single executable → dist/
+pip install -e ".[build]"
+python build.py --clean      # single-file executable → dist/
+python build.py --onedir     # faster one-directory bundle for iteration
 ```
 
-The output lands in `dist/scan-kit` (Linux) or `dist\scan-kit.exe` (Windows).
-The Windows build uses a windowed executable (no console) for the main GUI; use
-`python -m scan_kit --version` in development, or see the window title for the version.
+Output: `dist/scan-kit` (Linux) or `dist/scan-kit.exe` (Windows). Local builds keep these generic names; CI release assets include the version suffix.
 
-## Releasing
+</details>
 
-Releases are automated via GitHub Actions. To cut a new release:
+<details>
+<summary><strong>Cutting a release</strong></summary>
 
-1. Update the version in `scan_kit/__init__.py`
-2. Commit and push to `main`
+Releases are automated via [`.github/workflows/build.yml`](.github/workflows/build.yml).
+
+1. Bump `__version__` in `scan_kit/__init__.py` — the single source of truth, also read by `pyproject.toml` and the window title.
+2. Commit: `Release vX.Y.Z`, push to `main`.
 3. Tag and push:
 
 ```bash
-git tag v<version>
-git push origin v<version>
+git tag vX.Y.Z
+git push origin vX.Y.Z
 ```
 
-The CI workflow builds executables for Windows and Linux, then creates a GitHub
-Release with the binaries attached automatically.
+| Trigger | CI output |
+|---------|-----------|
+| Push to `main`, PR, manual dispatch | `-rc` artifacts (`scan-kit-windows-X.Y.Z-rc.exe`, etc.) |
+| `v*` tag push | GitHub Release with `scan-kit-windows-X.Y.Z.exe` and `scan-kit-linux-amd64-X.Y.Z` |
 
-## Versioning
+CI verifies the tag matches `__version__` before publishing. The project follows [Semantic Versioning](https://semver.org/).
 
-The project follows [Semantic Versioning](https://semver.org/). The single
-source of truth for the version is `scan_kit/__init__.py` (`__version__`),
-which is read by `pyproject.toml` and shown in the launcher window title (`scan-kit v…`).
+</details>
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+[MIT](LICENSE) — Copyright (c) 2026 Pyramid Technical Consultants
