@@ -115,7 +115,7 @@ def test_pooled_super_fit_produces_combined_entries() -> None:
     assert angle_fit.c3 < 0.0
     label = _format_angle_fit_label(angle_fit, prefix="All: ")
     assert label.startswith("All: ")
-    assert "cubic" in label and "mrad/kG" in label
+    assert "cubic" in label and "mrad/kG" in label and "\u00b5rad/kG" in label
 
 
 def test_energy_correction_reduces_g3_angle_residual() -> None:

@@ -428,9 +428,9 @@ class _CubicFit:
     """Cubic fit y ≈ c3·x³ + c2·x² + c1·x + c0 (coefficients in the data domain)."""
 
     c0: float  # offset (mrad)
-    c1: float  # near-zero-field slope / gain (mrad/G)
-    c2: float  # quadratic (mrad/G²)
-    c3: float  # cubic (mrad/G³)
+    c1: float  # near-zero-field slope / gain (mrad per field unit)
+    c2: float  # quadratic (mrad per field unit²)
+    c3: float  # cubic (mrad per field unit³)
     residual: np.ndarray
     poly: "np.polynomial.Polynomial"
 
@@ -456,6 +456,81 @@ def _cubic_fit(x: np.ndarray, y: np.ndarray) -> _CubicFit | None:
     residual = np.full(x_f.shape, np.nan, dtype=float)
     residual[finite] = y_f[finite] - poly(x_f[finite])
     return _CubicFit(c[0], c[1], c[2], c[3], residual, poly)
+
+
+@dataclass(frozen=True)
+class _ArcFit:
+    """Circular-arc beam-angle model: ``sin θ`` (not ``θ``) is linear in field.
+
+    Our deflection dipoles are straight rectangular magnets with no pole-face
+    rotation, so a beam entering on-axis follows a circular arc of radius
+    ``ρ = p/(qB)`` and exits the (axial) field length ``L_eff`` at the angle
+
+        ``sin θ = L_eff / ρ = (q·L_eff / p)·B``.
+
+    The field-linear quantity is therefore ``sin θ``, and the deflection curve is
+    ``θ = arcsin(k·B)``.  We fit a cubic of ``1000·sin θ`` (≈ ``θ`` in mrad for
+    small angles, so the coefficients keep their mrad / mrad-per-kG meaning) vs
+    energy-corrected field, then evaluate the model through ``arcsin``.  ``c1`` is
+    the small-signal magnetic gain; ``c3`` absorbs any residual (non-geometric)
+    field nonlinearity that the arc itself does not explain.
+    """
+
+    sin_fit: _CubicFit
+    residual: np.ndarray
+
+    @property
+    def c0(self) -> float:
+        return self.sin_fit.c0
+
+    @property
+    def c1(self) -> float:
+        return self.sin_fit.c1
+
+    @property
+    def c3(self) -> float:
+        return self.sin_fit.c3
+
+    def predict(self, x: np.ndarray) -> np.ndarray:
+        """Beam angle (mrad) for energy-corrected field *x* via the arc model."""
+        sin_theta = np.clip(self.sin_fit.poly(np.asarray(x, dtype=float)) / 1000.0, -1.0, 1.0)
+        return np.arcsin(sin_theta) * 1000.0
+
+
+def _arc_fit(field: np.ndarray, angle_mrad: np.ndarray) -> _ArcFit | None:
+    """Circular-arc fit of beam angle vs field (``θ = arcsin(c₁·B + c₃·B³ + c₀)``).
+
+    A straight deflection dipole is antisymmetric in field (reversing ``B``
+    reverses ``θ``), so the field response carries only *odd* powers; we fit the
+    physical odd form ``sin θ = c₁·B + c₃·B³`` plus a constant ``c₀`` for the
+    zero-field alignment/remnant offset.  No quadratic term is included because
+    it has no physical basis (it just fits noise).  The sin values are scaled by
+    1000 so the coefficients stay in mrad-like units (matching the small-angle
+    limit and the rest of the view).
+    """
+    field_f = np.asarray(field, dtype=float)
+    angle_f = np.asarray(angle_mrad, dtype=float)
+    sin_scaled = np.sin(angle_f / 1000.0) * 1000.0
+    finite = np.isfinite(field_f) & np.isfinite(sin_scaled)
+    if int(finite.sum()) < _MIN_CUBIC_FIT_SAMPLES:
+        return None
+    b = field_f[finite]
+    if float(np.ptp(b)) <= 0.0:
+        return None
+
+    basis = np.vstack([np.ones_like(b), b, b**3]).T  # [1, B, B³] — odd + offset
+    coef, *_ = np.linalg.lstsq(basis, sin_scaled[finite], rcond=None)
+    c0, c1, c3 = float(coef[0]), float(coef[1]), float(coef[2])
+    poly = np.polynomial.Polynomial([c0, c1, 0.0, c3])
+
+    residual_sin = np.full(angle_f.shape, np.nan, dtype=float)
+    residual_sin[finite] = sin_scaled[finite] - poly(b)
+    sin_fit = _CubicFit(c0, c1, 0.0, c3, residual_sin, poly)
+
+    residual = np.full(angle_f.shape, np.nan, dtype=float)
+    predicted = np.arcsin(np.clip(poly(b) / 1000.0, -1.0, 1.0)) * 1000.0
+    residual[finite] = angle_f[finite] - predicted
+    return _ArcFit(sin_fit, residual)
 
 
 def _format_legend_number(
@@ -519,16 +594,52 @@ def _energy_corrected_field(
     return np.asarray(field, dtype=float) * scale
 
 
-# 1 kG = 1000 G, so a cubic coefficient in mrad/G³ scales by 1e9 to mrad/kG³,
-# keeping the legend value in a human-readable fixed-point range.
-_G3_TO_KG3 = 1.0e9
+# Energy-corrected field is reported in kilogauss (1 kG = 1000 G) so the gain
+# reads as mrad/kG; the much smaller cubic is reported in µrad/kG³.
+_GAUSS_PER_KILOGAUSS = 1.0e3
+_CUBIC_MRAD_TO_MICRORAD = 1.0e3  # mrad/kG³ → µrad/kG³
 
 
-def _format_angle_fit_label(fit: _CubicFit, *, prefix: str = "") -> str:
-    cubic_per_kg3 = fit.c3 * _G3_TO_KG3
+def _energy_corrected_field_kg(
+    field: np.ndarray,
+    momentum: np.ndarray,
+) -> np.ndarray:
+    """Energy-corrected field in kilogauss, the x-domain for the beam-angle fits."""
+    return _energy_corrected_field(field, momentum) / _GAUSS_PER_KILOGAUSS
+
+
+# Full deflection model shown on the angle panels: straight-dipole circular arc,
+# antisymmetric in field (only odd powers) plus a zero-field alignment offset.
+_ANGLE_MODEL_EQUATION = (
+    "\u03b8 = arcsin(gain\u00b7B + cubic\u00b7B\u00b3 + offset)\nstraight-dipole circular arc"
+)
+
+
+def _annotate_angle_model(ax) -> None:
+    """Annotate the beam-angle model equation in the upper-left of *ax*."""
+    ax.text(
+        0.03,
+        0.97,
+        _ANGLE_MODEL_EQUATION,
+        transform=ax.transAxes,
+        ha="left",
+        va="top",
+        fontsize=8,
+        zorder=8,
+        bbox=dict(
+            boxstyle="round", facecolor="white", alpha=0.8, edgecolor="0.7"
+        ),
+    )
+
+
+def _format_angle_fit_label(fit: "_ArcFit", *, prefix: str = "") -> str:
+    # Circular-arc model θ = arcsin(cubic(B)) fitted in the kilogauss domain:
+    # gain (small-signal dθ/dB) reads as mrad/kG; the residual cubic is tiny, so
+    # report it in µrad/kG\u00b3.
+    cubic_microrad = fit.c3 * _CUBIC_MRAD_TO_MICRORAD
     return (
-        f"{prefix}gain {_format_legend_number(fit.c1)} mrad/G   "
-        f"cubic {_format_legend_number(cubic_per_kg3)} mrad/kG\u00b3   "
+        f"{prefix}gain {_format_legend_number(fit.c1)} mrad/kG   "
+        f"cubic {_format_legend_number(cubic_microrad)} \u00b5rad/kG\u00b3   "
         f"offset {_format_legend_number(fit.c0)} mrad"
     )
 
@@ -567,26 +678,29 @@ def _plot_ecfield_angle(
     use_hexbin: bool = True,
     draw_fit: bool = True,
 ) -> tuple[str, tuple] | None:
-    """Straight beam angle vs energy-corrected field.
+    """Beam deflection angle vs energy-corrected field (circular-arc model).
 
     Companion to the residual panel.  When *draw_fit* is set the per-session
-    cubic curve is drawn; otherwise only the scatter is shown (e.g. when the
-    pooled super-fit curve is overlaid instead).  *align* appends the per-IC
-    alignment offsets and fan-convergence sanity check to the legend.
+    arc curve (θ = arcsin(cubic(B))) is drawn; otherwise only the scatter is
+    shown (e.g. when the pooled super-fit curve is overlaid instead).  *align*
+    appends the per-IC alignment offsets and fan-convergence sanity check to the
+    legend.
     """
-    ecfield = _energy_corrected_field(getattr(samples, field_key), samples.momentum)
+    ecfield = _energy_corrected_field_kg(
+        getattr(samples, field_key), samples.momentum
+    )
     angle = getattr(samples, angle_key)
     x, _ = _finite_pair(ecfield, angle)
     if x.size == 0:
         return None
-    fit = _cubic_fit(ecfield, angle)
+    fit = _arc_fit(ecfield, angle)
     if fit is None:
         return None
     _scatter_or_hexbin(ax, ecfield, angle, color=color, use_hexbin=use_hexbin)
     line_color = trend_line_color(color)
     if draw_fit:
         xs = np.linspace(float(np.min(x)), float(np.max(x)), 200)
-        ax.plot(xs, fit.poly(xs), color=line_color, linewidth=1.2, zorder=6)
+        ax.plot(xs, fit.predict(xs), color=line_color, linewidth=1.2, zorder=6)
     prefix = trend_session_prefix(session_id, n_sessions=n_sessions)
     label = _format_angle_fit_label(fit, prefix=prefix)
     if align is not None:
@@ -628,7 +742,7 @@ class _PooledRow:
         self.readback.append(rb)
         self.drive.append(rb if amplifier_readback_tracks_command_axis(cmd, rb) else cmd)
         self.field_g.append(field_g)
-        self.ecfield.append(_energy_corrected_field(field_g, samples.momentum))
+        self.ecfield.append(_energy_corrected_field_kg(field_g, samples.momentum))
         self.angle.append(getattr(samples, angle_key))
 
     def _cat(self, parts: list[np.ndarray]) -> np.ndarray | None:
@@ -646,11 +760,11 @@ class _PooledRow:
         field_g = self._cat(self.field_g)
         return fit_trend(drive, field_g) if drive is not None else None
 
-    def angle_fit(self) -> "_CubicFit | None":
-        """Pooled cubic e-corr-field→angle fit (the super fit for columns 3/4)."""
+    def angle_fit(self) -> "_ArcFit | None":
+        """Pooled circular-arc e-corr-field→angle fit (super fit for cols 3/4)."""
         ec = self._cat(self.ecfield)
         ang = self._cat(self.angle)
-        return _cubic_fit(ec, ang) if ec is not None else None
+        return _arc_fit(ec, ang) if ec is not None else None
 
 
 def _format_residual_median_label(prefix: str, median_abs: float, unit: str) -> str:
@@ -759,7 +873,7 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
             cmd = getattr(samples, cmd_k)
             rb = getattr(samples, rb_k)
             field_g = getattr(samples, field_k)
-            ecfield = _energy_corrected_field(field_g, samples.momentum)
+            ecfield = _energy_corrected_field_kg(field_g, samples.momentum)
             angle = getattr(samples, angle_k)
 
             if rb_fit is not None:
@@ -787,7 +901,7 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
 
             if angle_super_fit is not None:
                 trend = _plot_residual_about(
-                    axes[row, 2], ecfield, angle, angle_super_fit.poly(ecfield),
+                    axes[row, 2], ecfield, angle, angle_super_fit.predict(ecfield),
                     color=color, session_id=sid, n_sessions=len(loaded_ids),
                     unit="mrad",
                 )
@@ -808,7 +922,7 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
             if angle_raw_trend is not None:
                 angle_raw_trends.append(angle_raw_trend)
 
-        # Draw the super-fit cubic curve over the raw-angle panel (col 4).
+        # Draw the super-fit arc curve over the raw-angle panel (col 4).
         if angle_super_fit is not None:
             ec_all = pooled._cat(pooled.ecfield)
             ang_all = pooled._cat(pooled.angle)
@@ -816,7 +930,7 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
             if x_all.size:
                 xs = np.linspace(float(np.min(x_all)), float(np.max(x_all)), 200)
                 axes[row, 3].plot(
-                    xs, angle_super_fit.poly(xs),
+                    xs, angle_super_fit.predict(xs),
                     color=_COMBINED_COLOR, linestyle="--", linewidth=1.6, zorder=7,
                 )
 
@@ -827,6 +941,7 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
         axes[row, 2].axhline(0, **REFLINE_KW)
         make_trend_legend(axes[row, 2], angle_trends)
         make_trend_legend(axes[row, 3], angle_raw_trends)
+        _annotate_angle_model(axes[row, 3])
 
         _style_axis(
             axes[row, 0],
@@ -840,12 +955,12 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
         )
         _style_axis(
             axes[row, 2],
-            f"B{axis_label.lower()} energy-corr (G @ {ref_e})",
+            f"B{axis_label.lower()} energy-corr (kG @ {ref_e})",
             f"Beam {axis_label} angle − super fit (mrad)",
         )
         _style_axis(
             axes[row, 3],
-            f"B{axis_label.lower()} energy-corr (G @ {ref_e})",
+            f"B{axis_label.lower()} energy-corr (kG @ {ref_e})",
             f"Beam {axis_label} angle (mrad)",
         )
 
