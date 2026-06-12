@@ -97,6 +97,8 @@ hiddenimports = [
     "scipy.fft",
     "scipy.fft._pocketfft",
     "sounddevice",
+    "matplotlib.backends.backend_qtagg",
+    "matplotlib.backends.backend_qt",
     "matplotlib.backends.backend_tkagg",
     "tkinter",
     "PySide6.QtSvg",
@@ -110,8 +112,12 @@ a = Analysis(
     datas=_pyside6_datas + _app_datas,
     hiddenimports=hiddenimports,
     hookspath=[],
-    hooksconfig={},
-    runtime_hooks=[str(ROOT / "scan_kit" / "pyi_rth_linux_env.py")],
+    hooksconfig={
+        "matplotlib": {
+            "backends": ["QtAgg", "TkAgg"],
+        },
+    },
+    runtime_hooks=[str(ROOT / "scan_kit" / "pyi_rth_frozen.py")],
     excludes=[
         "test_data",
         "pytest",

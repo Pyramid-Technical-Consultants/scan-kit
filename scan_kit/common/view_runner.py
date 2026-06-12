@@ -13,6 +13,11 @@ import sys
 import traceback
 from typing import Callable
 
+import matplotlib
+
+if getattr(sys, "frozen", False):
+    matplotlib.use(os.environ.get("MPLBACKEND", "QtAgg"))
+
 import matplotlib.pyplot as plt
 
 from .plotting import apply_toolbar_tight_layout
