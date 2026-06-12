@@ -111,7 +111,7 @@ a = Analysis(
     hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},
-    runtime_hooks=[],
+    runtime_hooks=[str(ROOT / "scan_kit" / "pyi_rth_linux_env.py")],
     excludes=[
         "test_data",
         "pytest",

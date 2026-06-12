@@ -13,8 +13,10 @@ def main() -> None:
         print(f"scan-kit {__version__}")
         return
 
+    from scan_kit.common.linux_frozen_env import prepare_linux_frozen_env
     from scan_kit.common.win_identity import prepare_windows_app_identity
 
+    prepare_linux_frozen_env()
     prepare_windows_app_identity()
 
     from scan_kit.qt_launcher import main as _gui_main
