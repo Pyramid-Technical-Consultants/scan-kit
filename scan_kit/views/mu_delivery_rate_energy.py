@@ -222,4 +222,3 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
     _make_avg_rate_legend(ax, avg_entries)
 
     finish_view(fig, VIEW_TITLE, loaded_ids, colors, base_dir=base_dir)
-    plt.show()

@@ -18,7 +18,7 @@ from ..common import (
     C_LAYER_ID,
     resolve_concept_column,
     DEFAULT_SESSION_COLORS,
-    set_view_header,
+    finish_view,
     VIEW_HEADER_SUBPLOT_TOP,
     GRID_KW,
 )
@@ -552,12 +552,10 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
             cbar = fig.colorbar(im, cax=cbar_ax)
             cbar.set_label(f"{state_lbl} PSD (nA²/Hz)", fontsize=8)
 
-    set_view_header(
+    finish_view(
         fig,
         "IC Current FFT Analysis",
         loaded_ids,
         sess_colors,
         base_dir=base_dir,
     )
-
-    plt.show()

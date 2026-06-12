@@ -8,7 +8,6 @@ per delivered spot) load IC1/IC2 X/Y position errors into
 
 from __future__ import annotations
 
-import matplotlib
 import matplotlib.colors as mcolors
 import matplotlib.pyplot as plt
 import numpy as np
@@ -262,5 +261,3 @@ def render_position_error_distribution(
         ax.set_xlim(shared_lim)
 
     finish_view(fig, title, loaded_ids, colors, base_dir=base_dir)
-    if matplotlib.get_backend().lower() != "agg":
-        plt.show()

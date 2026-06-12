@@ -133,4 +133,3 @@ def run(session_ids: list[str], base_dir: str = "test_data",
     ax4.axis("off")
 
     finish_view(fig, "Dose Ratios vs Beam Position", loaded_ids, colors, base_dir=base_dir)
-    plt.show()

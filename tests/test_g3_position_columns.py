@@ -10,6 +10,7 @@ import pandas as pd
 from scan_kit.common.g3_timeslice_position import (
     g3_position_error_arrays,
     resolve_g3_fit_ok_column,
+    resolve_g3_measured_position_column,
     resolve_g3_position_target_columns,
     resolve_g3_quality_columns,
     valid_g3_fit_values,
@@ -45,6 +46,28 @@ def test_valid_g3_fit_values_rejects_negative() -> None:
     assert np.isnan(clean[0])
     assert clean[1] == 0.0
     assert clean[2] == 1.5
+
+
+def test_resolve_g3_measured_position_prefers_spot_position_alias() -> None:
+    columns = (
+        "ic1_position_x_target",
+        "r_ic1_x_spot_position",
+    )
+    assert resolve_g3_measured_position_column(columns, "ic1_x") == "r_ic1_x_spot_position"
+    cols = resolve_g3_position_target_columns(
+        (
+            "r_ic1_x_spot_position",
+            "r_ic1_y_spot_position",
+            "r_ic2_x_spot_position",
+            "r_ic2_y_spot_position",
+            "ic1_position_x_target",
+            "ic1_position_y_target",
+            "ic2_position_x_target",
+            "ic2_position_y_target",
+        )
+    )
+    assert cols is not None
+    assert cols.ic1_x == "r_ic1_x_spot_position"
 
 
 def test_resolve_g3_fit_ok_prefers_spot_position_ok_alias() -> None:

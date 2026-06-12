@@ -187,4 +187,3 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
         _plot_panel(ax, data, col, loaded_ids, colors, x_lo=x_lo, x_hi=x_hi, title=title)
 
     finish_view(fig, VIEW_TITLE, loaded_ids, colors, base_dir=base_dir)
-    plt.show()

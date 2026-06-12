@@ -12,7 +12,7 @@ class ReportGenerationWorker(QObject):
     """Build a PDF report on a worker thread."""
 
     progress = Signal(int, str)
-    finished = Signal(str)
+    finished = Signal(str, str)
     failed = Signal(str)
 
     def __init__(self, config: ReportConfig) -> None:
@@ -22,11 +22,16 @@ class ReportGenerationWorker(QObject):
     @Slot()
     def run(self) -> None:
         try:
-            output_path, _results = build_report_pdf(
+            output_path, results = build_report_pdf(
                 self._config,
                 progress=self.progress.emit,
             )
         except Exception as exc:
             self.failed.emit(str(exc))
             return
-        self.finished.emit(str(output_path))
+        skipped = [r for r in results if not r.success]
+        summary = "\n".join(
+            f"{result.display_name}: {result.skip_reason or 'skipped'}"
+            for result in skipped
+        )
+        self.finished.emit(str(output_path), summary)

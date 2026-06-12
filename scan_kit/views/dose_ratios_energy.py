@@ -145,4 +145,3 @@ def run(session_ids: list[str], base_dir: str = "test_data",
             corr_axes[row].set_visible(False)
 
     finish_view(fig, "Dose Ratios vs Energy", loaded_ids, colors, base_dir=base_dir)
-    plt.show()

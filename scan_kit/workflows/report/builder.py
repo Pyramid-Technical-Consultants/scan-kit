@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import logging
 from collections.abc import Callable
 from io import BytesIO
 from pathlib import Path
@@ -27,6 +28,17 @@ _VIEW_DPI = 100
 _VIEW_FIGSIZE = (_VIEW_WIDTH_PX / _VIEW_DPI, _VIEW_HEIGHT_PX / _VIEW_DPI)
 _LANDSCAPE_PAGE = (16.0, 9.0)
 _SKIP_NO_DATA = "No data available for selected sessions"
+_log = logging.getLogger(__name__)
+
+
+def _log_skipped_view(result: ViewRenderResult) -> None:
+    reason = result.skip_reason or "skipped"
+    _log.warning(
+        "Report skipped view %s (%s): %s",
+        result.display_name,
+        result.module_name,
+        reason,
+    )
 
 
 def _prepare_view_figure(fig: plt.Figure) -> None:
@@ -159,18 +171,20 @@ def build_report_pdf(
             except Exception as exc:
                 result.skip_reason = f"Failed to load view: {exc}"
                 rendered.append(result)
+                _log_skipped_view(result)
                 step += 1
                 continue
 
-            fig = capture_view_figure(
+            fig, capture_skip = capture_view_figure(
                 view_func,
                 config.session_ids,
                 config.base_dir,
                 config.settings,
             )
             if fig is None:
-                result.skip_reason = _SKIP_NO_DATA
+                result.skip_reason = capture_skip or _SKIP_NO_DATA
                 rendered.append(result)
+                _log_skipped_view(result)
                 step += 1
                 continue
 
@@ -179,9 +193,16 @@ def build_report_pdf(
                 result.success = True
             except Exception as exc:
                 result.skip_reason = f"Failed to save figure: {exc}"
+                _log.exception(
+                    "Report failed saving view %s (%s)",
+                    display_name,
+                    module_name,
+                )
             finally:
                 plt.close(fig)
             rendered.append(result)
+            if not result.success:
+                _log_skipped_view(result)
             step += 1
 
         _emit("Rendering conclusion page…")

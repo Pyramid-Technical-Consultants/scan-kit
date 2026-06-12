@@ -11,33 +11,23 @@ from pathlib import Path
 
 
 import numpy as np
-
-
+import pytest
 
 from scan_kit.common.timeslice_gaussian_fit_filter_coverage import (
-
     PLOTTED_ERROR_CONFIDENCE_ISSUE_CODES,
-
     SPOT_ERROR_CODE_NAMES,
-
     SPOT_ERROR_CODES,
-
     _build_orphan_spot_errors,
-
+    _build_weighted_position_rms_sweep,
     _combine_ic_error_confidence_counts,
-
     _combined_ic_spots_and_metrics,
-
     _confidence_invalid,
-
+    _confidence_peak_weight,
     _orphan_ic_spot_set,
-
+    _weighted_axis_position_error,
     compute_session_gaussian_fit_filter_coverage,
-
     resolve_timeslice_gaussian_fit_filter_coverage_source,
-
     spot_error_code_name,
-
 )
 
 
@@ -63,6 +53,8 @@ def test_g3_session_computes_confidence_and_peak_coverage() -> None:
     assert set(coverage.error_confidence_issues.ics) == {"ic1", "ic2"}
 
     assert set(coverage.orphan_spot_errors.ics) == {"ic1", "ic2"}
+    assert coverage.weighted_position_rms is not None
+    assert set(coverage.weighted_position_rms.ics) == {"ic1", "ic2"}
 
     assert len(coverage.error_confidence_issues.codes) == len(SPOT_ERROR_CODES)
 
@@ -150,8 +142,24 @@ def test_session_with_spot_position_ok_alias_computes_coverage() -> None:
 
     assert orphans.counts_by_code[1] > 0
 
+    assert coverage.weighted_position_rms is not None
+    assert coverage.weighted_position_rms.ics["ic2"].total_spots > 0
 
+    peak_series = coverage.orphan_spot_peaks.ics["ic2"]
 
+    assert len(peak_series) == 1
+
+    spot = peak_series[0]
+
+    assert spot.spot_no == 3282.0
+
+    assert len(spot.peak_x) == 8
+
+    assert np.all(spot.error_x == 1)
+
+    assert spot.error_y.tolist().count(0) == 1
+
+    assert float(np.nanmax(spot.peak_x)) == pytest.approx(0.908348, rel=1e-5)
 
 
 def test_plotted_error_confidence_issue_codes_skip_routine_codes() -> None:
@@ -177,12 +185,47 @@ def test_spot_error_code_names_match_g3_enum() -> None:
 
 
 def test_confidence_invalid_flags_negative_and_nan() -> None:
-
     vals = np.array([-1.0, 0.0, np.nan, 80.0])
-
     invalid = _confidence_invalid(vals)
-
     assert invalid.tolist() == [True, False, True, False]
+
+
+def test_confidence_peak_weight_uses_peak_when_available() -> None:
+    assert _confidence_peak_weight(80.0, 2.0) == 160.0
+    assert _confidence_peak_weight(80.0, np.nan) == 80.0
+
+
+def test_weighted_axis_position_error_respects_threshold() -> None:
+    samples = [
+        (1.0, 0.0, 50.0, 1.0),
+        (3.0, 0.0, 90.0, 2.0),
+    ]
+    assert _weighted_axis_position_error(samples, 0.0) == pytest.approx(590.0 / 230.0)
+    assert _weighted_axis_position_error(samples, 80.0) == pytest.approx(3.0)
+    assert _weighted_axis_position_error(samples, 95.0) is None
+
+
+def test_build_weighted_position_rms_decreases_with_higher_threshold() -> None:
+    spot_samples = {
+        "ic1_x": {
+            (1.0, 10.0): [(0.0, 0.0, 90.0, 1.0), (0.2, 0.0, 60.0, 1.0)],
+            (2.0, 20.0): [(0.0, 0.0, 90.0, 1.0), (1.0, 0.0, 60.0, 1.0)],
+        },
+        "ic1_y": {
+            (1.0, 10.0): [(0.0, 0.0, 90.0, 1.0), (0.0, 0.0, 60.0, 1.0)],
+            (2.0, 20.0): [(0.0, 0.0, 90.0, 1.0), (0.0, 0.0, 60.0, 1.0)],
+        },
+        "ic2_x": {},
+        "ic2_y": {},
+    }
+    sweep = _build_weighted_position_rms_sweep(
+        spot_samples, np.array([0.0, 80.0], dtype=float)
+    )
+    assert sweep is not None
+    ic1 = sweep.ics["ic1"]
+    assert ic1.spots_used[0] == 2
+    assert ic1.spots_used[1] == 2
+    assert ic1.rms_xy_mm[0] > ic1.rms_xy_mm[1]
 
 
 

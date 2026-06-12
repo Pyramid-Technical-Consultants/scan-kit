@@ -729,18 +729,38 @@ class ScanKitMainWindow(QMainWindow):
         self._report_btn.setEnabled(True)
         self._report_progress = None
 
-    def _on_report_finished(self, output_path: str) -> None:
+    def _on_report_finished(self, output_path: str, skip_summary: str) -> None:
         self._release_report_state()
+        panel = getattr(self, "_debug_log_panel", None)
+        if panel is not None:
+            if skip_summary:
+                panel.append(
+                    "WARNING",
+                    "report",
+                    f"Report saved with skipped views: {output_path}",
+                )
+                for line in skip_summary.splitlines():
+                    panel.append("WARNING", "report", line)
+            else:
+                panel.append("INFO", "report", f"Report saved: {output_path}")
         try:
             self._app_settings.last_report_dir = str(Path(output_path).parent)
             self._app_settings.save()
         except Exception:
             pass
         box = QMessageBox(self)
-        box.setWindowTitle("Report complete")
-        box.setIcon(QMessageBox.Icon.Information)
-        box.setText("PDF report saved successfully.")
-        box.setInformativeText(output_path)
+        if skip_summary:
+            box.setWindowTitle("Report complete with skipped views")
+            box.setIcon(QMessageBox.Icon.Warning)
+            box.setText(
+                f"PDF report saved, but some views were skipped.\n\n{output_path}"
+            )
+            box.setInformativeText(skip_summary)
+        else:
+            box.setWindowTitle("Report complete")
+            box.setIcon(QMessageBox.Icon.Information)
+            box.setText("PDF report saved successfully.")
+            box.setInformativeText(output_path)
         open_btn = box.addButton("Open Report", QMessageBox.ButtonRole.ActionRole)
         box.addButton(QMessageBox.StandardButton.Ok)
         box.exec()
@@ -757,6 +777,9 @@ class ScanKitMainWindow(QMainWindow):
 
     def _on_report_failed(self, message: str) -> None:
         self._release_report_state()
+        panel = getattr(self, "_debug_log_panel", None)
+        if panel is not None:
+            panel.append("ERROR", "report", message)
         QMessageBox.critical(self, "Report failed", message)
 
     def _clear_report_thread(self) -> None:

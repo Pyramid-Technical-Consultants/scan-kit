@@ -109,20 +109,48 @@ def _prepared_by(author: str, organization: str) -> str | None:
     return author or organization or None
 
 
-def _session_rows(
+def _sessions_have_room(
+    session_ids: list[str],
+    session_meta: dict[str, SessionMeta | None],
+) -> bool:
+    for sid in session_ids:
+        meta = session_meta.get(sid)
+        if meta is not None and meta.room_number is not None:
+            return True
+    return False
+
+
+def _session_table(
     session_ids: list[str],
     session_meta: dict[str, SessionMeta | None],
     notes: dict[str, str],
-) -> list[list[str]]:
+) -> tuple[list[str], list[list[str]], list[float]]:
+    include_room = _sessions_have_room(session_ids, session_meta)
     rows: list[list[str]] = []
     for sid in session_ids:
         meta = session_meta.get(sid)
         note = notes.get(sid, "").strip() or "—"
         if meta is None:
-            rows.append([sid, "—", "—", "—", note])
+            base = [sid, "—", "—", "—"]
         else:
-            rows.append([sid, meta.short_date, meta.short_mu, meta.short_time, note])
-    return rows
+            base = [sid, meta.short_date, meta.short_mu, meta.short_time]
+        if include_room:
+            room = "—" if meta is None else meta.short_room
+            rows.append([*base, room, note])
+        else:
+            rows.append([*base, note])
+
+    if include_room:
+        return (
+            ["Session ID", "Date", "MU", "Time", "RM", "Note"],
+            rows,
+            [0.24, 0.10, 0.08, 0.08, 0.06, 0.34],
+        )
+    return (
+        ["Session ID", "Date", "MU", "Time", "Note"],
+        rows,
+        [0.28, 0.10, 0.08, 0.08, 0.36],
+    )
 
 
 def render_title_page(
@@ -166,14 +194,14 @@ def render_title_page(
     ax.text(0.95, 0.92, stamp, transform=ax.transAxes, ha="right", va="top", fontsize=9, color=_MUTED)
 
     y = _section_heading(ax, 0.72, "Selected sessions")
-    session_rows = _session_rows(session_ids, session_meta, notes)
+    col_labels, session_rows, col_widths = _session_table(session_ids, session_meta, notes)
     table_height = min(0.42, 0.06 + 0.045 * max(len(session_rows), 1))
     _add_table(
         ax,
         (0.05, 0.72 - table_height - 0.04, 0.90, table_height),
-        col_labels=["Session ID", "Date", "MU", "Time", "Note"],
+        col_labels=col_labels,
         rows=session_rows,
-        col_widths=[0.28, 0.10, 0.08, 0.08, 0.36],
+        col_widths=col_widths,
     )
 
     y = 0.72 - table_height - 0.10

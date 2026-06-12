@@ -491,6 +491,7 @@ def finish_view(
     *,
     base_dir: str | None = None,
     notes: dict | None = None,
+    show: bool = True,
     **layout_kwargs,
 ) -> None:
     """Apply the standard view header then tight layout.
@@ -498,9 +499,14 @@ def finish_view(
     Wraps the ``set_view_header(...)`` + ``apply_tight_layout(...)`` tail shared
     by analytic views. Extra keyword args are forwarded to
     :func:`apply_tight_layout`.
+
+    When *show* is true (default), calls ``plt.show()`` so views render in the
+    interactive launcher and during PDF report capture (Agg or patched show).
     """
     set_view_header(fig, title, session_ids, colors, base_dir=base_dir, notes=notes)
     apply_tight_layout(fig, **layout_kwargs)
+    if show:
+        plt.show()
 
 
 def apply_toolbar_tight_layout(fig=None) -> None:

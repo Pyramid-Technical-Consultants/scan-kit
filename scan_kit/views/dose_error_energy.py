@@ -165,4 +165,3 @@ def run(session_ids: list[str], base_dir: str = "test_data",
         colors,
         base_dir=base_dir,
     )
-    plt.show()

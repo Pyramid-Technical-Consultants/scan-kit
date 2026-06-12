@@ -8,9 +8,9 @@ from pathlib import Path
 
 import pytest
 
-from scan_kit.common.settings import ViewSettings
-from scan_kit.views import VIEWS, view_description_for_module, view_module_name
 from scan_kit.common.app_settings import AppSettings
+from scan_kit.common.session_meta import SessionMeta
+from scan_kit.common.report_runner import capture_view_figure
 from scan_kit.workflows.report import (
     REPORT_EXCLUDED_MODULES,
     report_view_groups,
@@ -22,7 +22,10 @@ from scan_kit.workflows.report.naming import (
     suggest_report_title,
 )
 from scan_kit.workflows.report.paths import resolve_report_save_dir
+from scan_kit.workflows.report.pages import _session_table
 from scan_kit.workflows.report.types import ReportConfig
+from scan_kit.common.settings import ViewSettings
+from scan_kit.views import VIEWS, view_description_for_module, view_module_name
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _TEST_DATA = _PROJECT_ROOT / "test_data"
@@ -47,6 +50,44 @@ def _first_session_id() -> str | None:
         if child.is_dir() and not child.name.startswith("."):
             return child.name
     return None
+
+
+def test_session_table_omits_room_without_metadata() -> None:
+    labels, rows, _widths = _session_table(
+        ["s1", "s2"],
+        {
+            "s1": SessionMeta(date=None, primary_mu=None, treatment_time_s=None, room_number=None),
+            "s2": None,
+        },
+        {"s1": "Note one"},
+    )
+    assert "RM" not in labels
+    assert rows[0] == ["s1", "?", "?", "?", "Note one"]
+    assert rows[1] == ["s2", "—", "—", "—", "—"]
+
+
+def test_session_table_includes_room_when_available() -> None:
+    labels, rows, _widths = _session_table(
+        ["s1", "s2"],
+        {
+            "s1": SessionMeta(
+                date=datetime(2026, 1, 15, 12, 0),
+                primary_mu=120.5,
+                treatment_time_s=95,
+                room_number=3,
+            ),
+            "s2": SessionMeta(
+                date=datetime(2026, 1, 16, 8, 30),
+                primary_mu=88.0,
+                treatment_time_s=60,
+                room_number=None,
+            ),
+        },
+        {},
+    )
+    assert labels == ["Session ID", "Date", "MU", "Time", "RM", "Note"]
+    assert rows[0] == ["s1", "01/15/26", "120.5", "1:35", "3", "—"]
+    assert rows[1] == ["s2", "01/16/26", "88.0", "1:00", "?", "—"]
 
 
 def test_suggest_report_title_uses_notes_and_views() -> None:
@@ -189,3 +230,97 @@ def test_build_report_pdf_smoke(tmp_path: Path) -> None:
     assert output_path.read_bytes()[:4] == b"%PDF"
     assert _pdf_page_count(output_path) >= 3
     assert any(result.success for result in results)
+
+
+def test_capture_view_figure_collects_figure_without_show(tmp_path: Path) -> None:
+    import matplotlib.pyplot as plt
+
+    def _view_without_show(
+        session_ids: list[str],
+        base_dir: str,
+        *,
+        settings=None,
+    ) -> None:
+        del session_ids, base_dir, settings
+        _fig, ax = plt.subplots()
+        ax.plot([1, 2, 3], [1, 4, 9])
+
+    fig, skip = capture_view_figure(
+        _view_without_show,
+        ["s1"],
+        str(tmp_path),
+        ViewSettings(),
+    )
+    assert skip is None
+    assert fig is not None
+    plt.close(fig)
+
+
+def test_codebase_does_not_gate_plt_show_on_backend() -> None:
+    roots = [
+        _PROJECT_ROOT / "scan_kit" / "common",
+        _PROJECT_ROOT / "scan_kit" / "views",
+    ]
+    offenders: list[str] = []
+    for root in roots:
+        for path in root.rglob("*.py"):
+            text = path.read_text(encoding="utf-8")
+            if "get_backend()" in text and "plt.show()" in text:
+                offenders.append(str(path.relative_to(_PROJECT_ROOT)))
+    assert offenders == []
+
+
+@pytest.mark.parametrize(
+    "module_name",
+    [
+        "position_error_distribution_timeslice",
+        "position_error_distribution_spot",
+        "sigma_distribution_timeslice",
+        "confidence_correlation_timeslice",
+    ],
+)
+def test_shared_renderer_views_capture_for_report(module_name: str) -> None:
+    import importlib
+
+    import matplotlib.pyplot as plt
+
+    session_id = _first_session_id()
+    if session_id is None:
+        pytest.skip("test_data session folder not available")
+
+    mod = importlib.import_module(f"scan_kit.views.{module_name}")
+    fig, skip = capture_view_figure(
+        mod.run,
+        [session_id],
+        str(_TEST_DATA),
+        ViewSettings(),
+    )
+    assert fig is not None, skip
+    plt.close(fig)
+
+
+def test_finish_view_triggers_report_capture(tmp_path: Path) -> None:
+    import matplotlib.pyplot as plt
+
+    from scan_kit.common.plotting import finish_view
+
+    def _view_with_finish_view(
+        session_ids: list[str],
+        base_dir: str,
+        *,
+        settings=None,
+    ) -> None:
+        del base_dir, settings
+        fig, ax = plt.subplots()
+        ax.plot([0, 1], [0, 1])
+        finish_view(fig, "Test View", session_ids, ["#1f77b4"])
+
+    fig, skip = capture_view_figure(
+        _view_with_finish_view,
+        ["s1"],
+        str(tmp_path),
+        ViewSettings(),
+    )
+    assert skip is None
+    assert fig is not None
+    plt.close(fig)

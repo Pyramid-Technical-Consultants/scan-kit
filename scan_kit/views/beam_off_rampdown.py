@@ -720,6 +720,7 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
         loaded_ids,
         colors,
         base_dir=base_dir,
+        show=False,
     )
     for cbar_ax in cbar_axes:
         pos = cbar_ax.get_position()

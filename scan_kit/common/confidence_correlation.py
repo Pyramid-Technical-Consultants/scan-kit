@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import matplotlib
 import matplotlib.colors as mcolors
 import matplotlib.pyplot as plt
 import numpy as np
@@ -244,5 +243,3 @@ def render_confidence_correlations(
                 )
 
     finish_view(fig, title, loaded_ids, colors, base_dir=base_dir)
-    if matplotlib.get_backend().lower() != "agg":
-        plt.show()

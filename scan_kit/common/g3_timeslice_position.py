@@ -138,11 +138,20 @@ class G3IsoErrorContext:
     layer_id: str
 
 
+def resolve_g3_measured_position_column(columns, axis: str) -> str | None:
+    """Resolve fitted strip position (``r_ic*_position`` or ``r_ic*_spot_position``)."""
+    for candidate in (f"r_{axis}_position", f"r_{axis}_spot_position"):
+        resolved = resolve_column_name(columns, candidate)
+        if resolved is not None:
+            return resolved
+    return None
+
+
 def resolve_g3_position_target_columns(columns) -> G3PositionTargetColumns | None:
     """Resolve G3 timeslice measured/target position column pairs."""
     resolved: dict[str, str] = {}
-    for label, meas_name, tgt_name in _G3_POSITION_TARGET:
-        meas_col = resolve_column_name(columns, meas_name)
+    for label, _meas_name, tgt_name in _G3_POSITION_TARGET:
+        meas_col = resolve_g3_measured_position_column(columns, label)
         tgt_col = resolve_column_name(columns, tgt_name)
         if meas_col is None or tgt_col is None:
             return None
