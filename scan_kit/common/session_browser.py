@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from PySide6.QtCore import QRectF, Qt, QTimer, Signal, QSize, Slot
-from PySide6.QtGui import QColor, QGuiApplication, QIcon, QPainter, QPen, QPixmap
+from PySide6.QtGui import QColor, QFontMetrics, QGuiApplication, QIcon, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QFileDialog,
     QHBoxLayout,
@@ -38,7 +38,10 @@ _COL_SESSION_ID = 1
 _COL_DATE = 2
 _COL_MU = 3
 _COL_TIME = 4
-_COL_NOTE = 5
+_COL_ROOM = 5
+_COL_NOTE = 6
+
+_COMPACT_META_COLS = (_COL_MU, _COL_TIME, _COL_ROOM)
 
 _SWATCH_PX = 14
 _UNCHECKED_SWATCH = QColor("#d0d0d0")
@@ -98,18 +101,28 @@ class _SortableItem(QTableWidgetItem):
             return str(a) < str(b)
 
 
-def _meta_column_texts(meta: SessionMeta | None) -> tuple[str, str, str]:
+def _meta_column_texts(meta: SessionMeta | None) -> tuple[str, str, str, str]:
     if meta is None:
-        return "—", "—", "—"
-    return meta.short_date, meta.short_mu, meta.short_time
+        return "—", "—", "—", "?"
+    return meta.short_date, meta.short_mu, meta.short_time, meta.short_room
 
 
 def _meta_sort_values(
     meta: SessionMeta | None,
-) -> tuple[datetime | None, float | None, int | None]:
+) -> tuple[datetime | None, float | None, int | None, int | None]:
     if meta is None:
-        return (None, None, None)
-    return (meta.date, meta.primary_mu, meta.treatment_time_s)
+        return (None, None, None, None)
+    return (meta.date, meta.primary_mu, meta.treatment_time_s, meta.room_number)
+
+
+def _compact_meta_column_widths(fm: QFontMetrics) -> dict[int, int]:
+    """Tight fixed widths for MU / Time / RM; global header min size would otherwise clamp them."""
+    pad = 10  # cell padding + sort indicator slack
+    return {
+        _COL_MU: fm.horizontalAdvance("999.9") + pad,
+        _COL_TIME: fm.horizontalAdvance("99:59") + pad,
+        _COL_ROOM: max(fm.horizontalAdvance("RM"), fm.horizontalAdvance("99")) + pad,
+    }
 
 
 class SessionBrowserWidget(QWidget):
@@ -219,9 +232,9 @@ class SessionBrowserWidget(QWidget):
         root.addLayout(data_dir_row)
 
         self._table = QTableWidget()
-        self._table.setColumnCount(6)
+        self._table.setColumnCount(7)
         self._table.setHorizontalHeaderLabels(
-            ["Use", "Session ID", "Date", "MU", "Time", "Note"]
+            ["Use", "Session ID", "Date", "MU", "Time", "RM", "Note"]
         )
         self._table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self._table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
@@ -230,12 +243,14 @@ class SessionBrowserWidget(QWidget):
         self._table.setTextElideMode(Qt.TextElideMode.ElideNone)
         self._table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         hh = self._table.horizontalHeader()
-        hh.setMinimumSectionSize(72)
+        hh.setMinimumSectionSize(16)
         hh.setSectionResizeMode(_COL_USE, QHeaderView.ResizeMode.ResizeToContents)
         hh.setSectionResizeMode(_COL_SESSION_ID, QHeaderView.ResizeMode.ResizeToContents)
         hh.setSectionResizeMode(_COL_DATE, QHeaderView.ResizeMode.ResizeToContents)
-        hh.setSectionResizeMode(_COL_MU, QHeaderView.ResizeMode.ResizeToContents)
-        hh.setSectionResizeMode(_COL_TIME, QHeaderView.ResizeMode.ResizeToContents)
+        compact_widths = _compact_meta_column_widths(QFontMetrics(self._table.font()))
+        for col in _COMPACT_META_COLS:
+            hh.setSectionResizeMode(col, QHeaderView.ResizeMode.Fixed)
+            hh.resizeSection(col, compact_widths[col])
         hh.setSectionResizeMode(_COL_NOTE, QHeaderView.ResizeMode.Stretch)
         hh.resizeSection(_COL_SESSION_ID, 220)
         hh.setSortIndicatorShown(True)
@@ -683,7 +698,7 @@ class SessionBrowserWidget(QWidget):
         self._rebuild_session_row_index()
 
     def _resize_session_meta_columns(self) -> None:
-        for col in (_COL_USE, _COL_SESSION_ID, _COL_DATE, _COL_MU, _COL_TIME):
+        for col in (_COL_USE, _COL_SESSION_ID, _COL_DATE):
             self._table.resizeColumnToContents(col)
 
     def _fill_meta_columns(self, row: int, meta: SessionMeta | None) -> None:

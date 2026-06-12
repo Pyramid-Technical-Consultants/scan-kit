@@ -509,7 +509,7 @@ class ScanKitMainWindow(QMainWindow):
         splitter.addWidget(right)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
-        splitter.setSizes([640, 760])
+        splitter.setSizes([720, 680])
         return tab
 
     def _build_plan_synthesis_tab(self) -> QWidget:

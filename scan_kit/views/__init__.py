@@ -89,6 +89,16 @@ VIEW_GROUPS: list[tuple[str, list[ViewEntry]]] = [
                 "Beam-on timeslice IC1/IC2 sigma density contours and X/Y histograms.",
             ),
             (
+                "Confidence Correlations (Timeslice)",
+                "confidence_correlation_timeslice",
+                "Beam-on G3 fit confidence vs peak IC current and primary channel (density contours).",
+            ),
+            (
+                "Gaussian Fit Filter Coverage",
+                "gaussian_fit_filter_coverage",
+                "Spot retention versus Gaussian fit confidence and peak-current thresholds (IC1/IC2, combined X/Y).",
+            ),
+            (
                 "Position Scatter",
                 "position_scatter",
                 "Planned, IC1, and IC2 spot positions overlaid by session.",
