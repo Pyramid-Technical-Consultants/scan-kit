@@ -86,6 +86,44 @@ CONFIDENCE_THRESHOLDS = np.arange(
 )
 PEAK_THRESHOLD_POINTS = len(CONFIDENCE_THRESHOLDS)
 PEAK_THRESHOLD_PERCENTILE = 99.95
+SPOT_ERROR_CODE_MAX = 5
+SPOT_ERROR_CODES = np.arange(0, SPOT_ERROR_CODE_MAX + 1, dtype=int)
+# Error-confidence issue bars omit routine codes 0/1 (none / peak below threshold).
+PLOTTED_ERROR_CONFIDENCE_ISSUE_CODES = np.array([2, 3, 4, 5], dtype=int)
+# Backward-compatible alias for axis tick positions.
+ERROR_CODE_THRESHOLDS = SPOT_ERROR_CODES.astype(float)
+
+# G3 Gaussian-fit spot_error_code values (ion_chamber / strip fit).
+SPOT_ERROR_CODE_NONE = 0
+SPOT_ERROR_CODE_PEAK_BELOW_THRESHOLD = 1
+SPOT_ERROR_CODE_PEAK_EDGE = 2
+SPOT_ERROR_CODE_NOT_ENOUGH_PEAK_DATA = 3
+SPOT_ERROR_CODE_MATRIX_NON_INVERTIBLE = 4
+SPOT_ERROR_CODE_SOLUTION_INVALID = 5
+
+SPOT_ERROR_CODE_NAMES: dict[int, str] = {
+    SPOT_ERROR_CODE_NONE: "No error",
+    SPOT_ERROR_CODE_PEAK_BELOW_THRESHOLD: "Peak below threshold",
+    SPOT_ERROR_CODE_PEAK_EDGE: "Peak at edge",
+    SPOT_ERROR_CODE_NOT_ENOUGH_PEAK_DATA: "Not enough peak data",
+    SPOT_ERROR_CODE_MATRIX_NON_INVERTIBLE: "Matrix non-invertible",
+    SPOT_ERROR_CODE_SOLUTION_INVALID: "Solution invalid",
+}
+
+SPOT_ERROR_CODE_AXIS_LABELS: dict[int, str] = {
+    SPOT_ERROR_CODE_NONE: "0 None",
+    SPOT_ERROR_CODE_PEAK_BELOW_THRESHOLD: "1 Peak<th",
+    SPOT_ERROR_CODE_PEAK_EDGE: "2 Edge",
+    SPOT_ERROR_CODE_NOT_ENOUGH_PEAK_DATA: "3 Few peaks",
+    SPOT_ERROR_CODE_MATRIX_NON_INVERTIBLE: "4 Singular",
+    SPOT_ERROR_CODE_SOLUTION_INVALID: "5 Bad sol.",
+}
+
+
+def spot_error_code_name(code: float | int) -> str:
+    """Return the documented Gaussian-fit error label for integer *code*."""
+    key = int(round(float(code)))
+    return SPOT_ERROR_CODE_NAMES.get(key, f"Code {key}")
 
 
 @dataclass(frozen=True)
@@ -110,9 +148,42 @@ class GaussianFitFilterSweep:
 
 
 @dataclass(frozen=True)
+class IcErrorConfidenceIssueCounts:
+    """Beam-on row counts with invalid confidence, grouped by spot error code."""
+
+    counts_by_code: np.ndarray
+
+
+@dataclass(frozen=True)
+class ErrorConfidenceIssueSummary:
+    """Per-IC counts of beam-on rows with a spot error code and invalid confidence."""
+
+    codes: np.ndarray
+    ics: dict[str, IcErrorConfidenceIssueCounts]
+
+
+@dataclass(frozen=True)
+class IcOrphanSpotErrorCounts:
+    """Beam-on row counts of spot error codes on orphan spots (combined X/Y)."""
+
+    orphan_spots: int
+    counts_by_code: np.ndarray
+
+
+@dataclass(frozen=True)
+class OrphanSpotErrorSummary:
+    """Per-IC orphan spots that lack good fit data even at zero confidence threshold."""
+
+    codes: np.ndarray
+    ics: dict[str, IcOrphanSpotErrorCounts]
+
+
+@dataclass(frozen=True)
 class SessionGaussianFitFilterCoverage:
     confidence: GaussianFitFilterSweep
     peak: GaussianFitFilterSweep | None
+    error_confidence_issues: ErrorConfidenceIssueSummary
+    orphan_spot_errors: OrphanSpotErrorSummary
 
 
 @dataclass(frozen=True)
@@ -164,17 +235,22 @@ def resolve_timeslice_gaussian_fit_filter_coverage_source(columns) -> _CoverageS
     )
 
 
+def _row_passes_fit_ok(df, quality: G3QualityColumns, axis: str) -> np.ndarray:
+    """Apply fit_ok when present; otherwise leave rows eligible (matches G3 quality mask)."""
+    fit_ok = getattr(quality, f"{axis}_fit_ok")
+    n = len(df)
+    if fit_ok is None or fit_ok not in df.columns:
+        return np.ones(n, dtype=bool)
+    return pd.to_numeric(df[fit_ok], errors="coerce").fillna(0).to_numpy() != 0
+
+
 def _row_passes_base_gates(
     df,
     quality: G3QualityColumns,
     axis: str,
 ) -> np.ndarray:
-    fit_ok = getattr(quality, f"{axis}_fit_ok")
+    mask = _row_passes_fit_ok(df, quality, axis)
     error_code = getattr(quality, f"{axis}_error_code")
-    n = len(df)
-    mask = np.ones(n, dtype=bool)
-    if fit_ok is not None and fit_ok in df.columns:
-        mask &= pd.to_numeric(df[fit_ok], errors="coerce").fillna(0).to_numpy() != 0
     if error_code is not None and error_code in df.columns:
         codes = pd.to_numeric(df[error_code], errors="coerce").fillna(1).to_numpy()
         mask &= codes == 0
@@ -183,6 +259,18 @@ def _row_passes_base_gates(
 
 def _confidence_values(df, quality: G3QualityColumns, axis: str) -> np.ndarray:
     col = getattr(quality, f"{axis}_confidence")
+    if col is None or col not in df.columns:
+        return np.full(len(df), np.nan)
+    return pd.to_numeric(df[col], errors="coerce").to_numpy(dtype=float)
+
+
+def _confidence_invalid(values: np.ndarray) -> np.ndarray:
+    """True when confidence is missing or uses the G3 invalid sentinel (< 0)."""
+    return ~np.isfinite(values) | (values < 0)
+
+
+def _error_code_values(df, quality: G3QualityColumns, axis: str) -> np.ndarray:
+    col = getattr(quality, f"{axis}_error_code")
     if col is None or col not in df.columns:
         return np.full(len(df), np.nan)
     return pd.to_numeric(df[col], errors="coerce").to_numpy(dtype=float)
@@ -239,6 +327,77 @@ def _accumulate_axis_spots(
                 axis_max[key] = float(value)
 
 
+def _accumulate_invalid_confidence_by_error_code(
+    counts: dict[str, np.ndarray],
+    df,
+    source: _CoverageSource,
+) -> None:
+    """Count beam-on rows with a spot error code and invalid confidence."""
+    for axis in _IC_AXES:
+        codes = _error_code_values(df, source.quality, axis)
+        confidence = _confidence_values(df, source.quality, axis)
+        code_ok = np.isfinite(codes) & (codes >= 0) & (codes <= SPOT_ERROR_CODE_MAX)
+        issue = code_ok & _confidence_invalid(confidence)
+        if not np.any(issue):
+            continue
+        for code in codes[issue]:
+            counts[axis][int(round(code))] += 1
+
+
+def _orphan_ic_spot_set(
+    all_spots: dict[str, set[tuple[float, float]]],
+    max_metric: dict[str, dict[tuple[float, float], float]],
+    ic: str,
+) -> set[tuple[float, float]]:
+    """Spots with beam-on data but no good combined X/Y fit at confidence threshold 0."""
+    _spots, combined = _combined_ic_spots_and_metrics(all_spots, max_metric, ic)
+    return {spot for spot in _spots if combined.get(spot, -np.inf) < 0.0}
+
+
+def _accumulate_orphan_row_error_codes(
+    counts: dict[str, np.ndarray],
+    df,
+    source: _CoverageSource,
+    orphan_spots: dict[str, set[tuple[float, float]]],
+) -> None:
+    """Count every spot error code on beam-on rows belonging to orphan spots."""
+    layer = pd.to_numeric(df[source.layer_id], errors="coerce").to_numpy(dtype=float)
+
+    for axis in _IC_AXES:
+        ic = _AXIS_IC[axis]
+        orphans = orphan_spots.get(ic)
+        if not orphans:
+            continue
+
+        spot_col = source.spot_cols.get(ic)
+        if spot_col is None or spot_col not in df.columns:
+            continue
+
+        spot = pd.to_numeric(df[spot_col], errors="coerce").to_numpy(dtype=float)
+        spot_ok = np.isfinite(layer) & np.isfinite(spot)
+        if not np.any(spot_ok):
+            continue
+
+        codes = _error_code_values(df, source.quality, axis)
+        code_ok = (
+            spot_ok
+            & np.isfinite(codes)
+            & (codes >= 0)
+            & (codes <= SPOT_ERROR_CODE_MAX)
+        )
+        if not np.any(code_ok):
+            continue
+
+        ic_counts = counts[ic]
+        for key, code in zip(
+            zip(layer[code_ok], spot[code_ok]),
+            codes[code_ok],
+        ):
+            if key not in orphans:
+                continue
+            ic_counts[int(round(code))] += 1
+
+
 def _coverage_curve(
     all_spots: set[tuple[float, float]],
     max_metric: dict[tuple[float, float], float],
@@ -290,6 +449,15 @@ def _combined_ic_spots_and_metrics(
     return spots, combined
 
 
+def _combine_ic_error_confidence_counts(
+    axis_counts: dict[str, np.ndarray],
+    ic: str,
+) -> np.ndarray:
+    """Sum X/Y beam-on row counts for one IC."""
+    x_axis, y_axis = _IC_AXIS_PAIRS[ic]
+    return axis_counts[x_axis] + axis_counts[y_axis]
+
+
 def _build_filter_coverage(
     kind: FilterKind,
     thresholds: np.ndarray,
@@ -306,6 +474,32 @@ def _build_filter_coverage(
     if not ics:
         return None
     return GaussianFitFilterSweep(kind=kind, thresholds=thresholds, ics=ics)
+
+
+def _build_error_confidence_issues(
+    axis_counts: dict[str, np.ndarray],
+) -> ErrorConfidenceIssueSummary:
+    ics = {
+        ic: IcErrorConfidenceIssueCounts(
+            counts_by_code=_combine_ic_error_confidence_counts(axis_counts, ic).copy()
+        )
+        for ic in _ICS
+    }
+    return ErrorConfidenceIssueSummary(codes=SPOT_ERROR_CODES.copy(), ics=ics)
+
+
+def _build_orphan_spot_errors(
+    orphan_spots: dict[str, set[tuple[float, float]]],
+    counts: dict[str, np.ndarray],
+) -> OrphanSpotErrorSummary:
+    ics = {
+        ic: IcOrphanSpotErrorCounts(
+            orphan_spots=len(orphan_spots.get(ic, ())),
+            counts_by_code=counts[ic].copy(),
+        )
+        for ic in _ICS
+    }
+    return OrphanSpotErrorSummary(codes=SPOT_ERROR_CODES.copy(), ics=ics)
 
 
 def compute_session_gaussian_fit_filter_coverage(
@@ -339,6 +533,9 @@ def compute_session_gaussian_fit_filter_coverage(
     peak_max: dict[str, dict[tuple[float, float], float]] = {
         axis: {} for axis in _IC_AXES
     }
+    issue_counts: dict[str, np.ndarray] = {
+        axis: np.zeros(len(SPOT_ERROR_CODES), dtype=int) for axis in _IC_AXES
+    }
 
     has_peak_cols = any(col is not None for col in source.peak_cols.values())
 
@@ -350,6 +547,7 @@ def compute_session_gaussian_fit_filter_coverage(
         _accumulate_axis_spots(
             conf_max, conf_spots, frame, source, kind="confidence"
         )
+        _accumulate_invalid_confidence_by_error_code(issue_counts, frame, source)
         if has_peak_cols:
             _accumulate_axis_spots(
                 peak_max, peak_spots, frame, source, kind="peak"
@@ -361,6 +559,23 @@ def compute_session_gaussian_fit_filter_coverage(
     if confidence is None:
         return None
 
+    error_confidence_issues = _build_error_confidence_issues(issue_counts)
+
+    orphan_spot_sets = {
+        ic: _orphan_ic_spot_set(conf_spots, conf_max, ic) for ic in _ICS
+    }
+    orphan_row_counts = {
+        ic: np.zeros(len(SPOT_ERROR_CODES), dtype=int) for ic in _ICS
+    }
+    for df in frames:
+        beam_on = detect_beam_on_mask(df)
+        if beam_on is None:
+            continue
+        _accumulate_orphan_row_error_codes(
+            orphan_row_counts, df.loc[beam_on], source, orphan_spot_sets
+        )
+    orphan_spot_errors = _build_orphan_spot_errors(orphan_spot_sets, orphan_row_counts)
+
     peak = None
     if has_peak_cols:
         peak_thresholds = _peak_thresholds(peak_max)
@@ -369,7 +584,12 @@ def compute_session_gaussian_fit_filter_coverage(
                 "peak", peak_thresholds, peak_spots, peak_max
             )
 
-    return SessionGaussianFitFilterCoverage(confidence=confidence, peak=peak)
+    return SessionGaussianFitFilterCoverage(
+        confidence=confidence,
+        peak=peak,
+        error_confidence_issues=error_confidence_issues,
+        orphan_spot_errors=orphan_spot_errors,
+    )
 
 
 # Backward-compatible aliases.

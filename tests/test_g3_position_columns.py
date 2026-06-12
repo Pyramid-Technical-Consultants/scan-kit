@@ -9,7 +9,9 @@ import pandas as pd
 
 from scan_kit.common.g3_timeslice_position import (
     g3_position_error_arrays,
+    resolve_g3_fit_ok_column,
     resolve_g3_position_target_columns,
+    resolve_g3_quality_columns,
     valid_g3_fit_values,
 )
 from scan_kit.common.schema import (
@@ -43,6 +45,18 @@ def test_valid_g3_fit_values_rejects_negative() -> None:
     assert np.isnan(clean[0])
     assert clean[1] == 0.0
     assert clean[2] == 1.5
+
+
+def test_resolve_g3_fit_ok_prefers_spot_position_ok_alias() -> None:
+    columns = (
+        "r_ic1_x_confidence",
+        "r_ic1_x_spot_error_code",
+        "r_ic1_x_position_ok",
+        "r_ic1_x_spot_position_ok",
+    )
+    assert resolve_g3_fit_ok_column(columns, "ic1_x") == "r_ic1_x_spot_position_ok"
+    quality = resolve_g3_quality_columns(columns)
+    assert quality.ic1_x_fit_ok == "r_ic1_x_spot_position_ok"
 
 
 def test_g3_position_minus_target_from_timeslice() -> None:

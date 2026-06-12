@@ -96,7 +96,7 @@ VIEW_GROUPS: list[tuple[str, list[ViewEntry]]] = [
             (
                 "Gaussian Fit Filter Coverage",
                 "gaussian_fit_filter_coverage",
-                "Spot retention versus Gaussian fit confidence and peak-current thresholds (IC1/IC2, combined X/Y).",
+                "Spot retention versus Gaussian fit confidence, peak current, and spot error code (IC1/IC2, combined X/Y).",
             ),
             (
                 "Position Scatter",

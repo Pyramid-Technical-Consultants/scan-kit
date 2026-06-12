@@ -191,6 +191,63 @@ def _safe_extractall(tf: tarfile.TarFile, dest: Path) -> None:
         tf.extractall(path=dest)
 
 
+def _existing_session_root(base: Path, session_id: str) -> Path | None:
+    dest = base / session_id
+    for candidate in (dest / session_id, dest):
+        if (candidate / "input_map.csv").is_file():
+            return candidate
+    return None
+
+
+def _finalize_staged_extraction(
+    base: Path,
+    session_id: str,
+    staging: Path,
+) -> Path | None:
+    dest = base / session_id
+    try:
+        if not dest.exists():
+            staging.rename(dest)
+        else:
+            shutil.rmtree(staging, ignore_errors=True)
+    except OSError:
+        shutil.rmtree(staging, ignore_errors=True)
+    return _existing_session_root(base, session_id)
+
+
+def _ensure_zip_extracted(
+    archive_path: Path,
+    session_id: str,
+    on_extracting: Callable[[str], None] | None = None,
+) -> Path | None:
+    """Extract a ZIP archive alongside it, returning the session root.
+
+    Uses a staging directory for atomicity.  Skips extraction if the session
+    directory already contains the expected files.  Returns ``None`` when
+    extraction fails (the caller should fall back to streaming ZIP I/O).
+    """
+    base = archive_path.parent
+    existing = _existing_session_root(base, session_id)
+    if existing is not None:
+        return existing
+
+    staging = base / f"{session_id}{_EXTRACTING_SUFFIX}"
+    if staging.exists():
+        shutil.rmtree(staging, ignore_errors=True)
+
+    if on_extracting:
+        on_extracting(session_id)
+
+    try:
+        with zipfile.ZipFile(archive_path, "r") as zf:
+            zf.extractall(staging)
+    except Exception:
+        shutil.rmtree(staging, ignore_errors=True)
+        return None
+
+    return _finalize_staged_extraction(base, session_id, staging)
+
+
 def _ensure_tar_extracted(
     archive_path: Path,
     session_id: str,
@@ -203,11 +260,9 @@ def _ensure_tar_extracted(
     extraction fails (the caller should fall back to streaming tar I/O).
     """
     base = archive_path.parent
-    dest = base / session_id
-
-    for candidate in (dest / session_id, dest):
-        if (candidate / "input_map.csv").is_file():
-            return candidate
+    existing = _existing_session_root(base, session_id)
+    if existing is not None:
+        return existing
 
     staging = base / f"{session_id}{_EXTRACTING_SUFFIX}"
     if staging.exists():
@@ -219,20 +274,29 @@ def _ensure_tar_extracted(
     try:
         with tarfile.open(archive_path, "r:*") as tf:
             _safe_extractall(tf, staging)
-        try:
-            if not dest.exists():
-                staging.rename(dest)
-            else:
-                shutil.rmtree(staging, ignore_errors=True)
-        except OSError:
-            shutil.rmtree(staging, ignore_errors=True)
     except Exception:
         shutil.rmtree(staging, ignore_errors=True)
         return None
 
-    for candidate in (dest / session_id, dest):
-        if (candidate / "input_map.csv").is_file():
-            return candidate
+    return _finalize_staged_extraction(base, session_id, staging)
+
+
+def ensure_session_on_disk(
+    session_id: str,
+    base_dir: str | Path,
+    *,
+    on_extracting: Callable[[str], None] | None = None,
+) -> Path | None:
+    """Return an on-disk session root, extracting archives when needed."""
+    source = resolve_session_source(session_id, base_dir, on_extracting=on_extracting)
+    if source is None:
+        return None
+    if source.kind == "directory":
+        return source.path
+    if source.kind == "zip":
+        return _ensure_zip_extracted(source.path, session_id, on_extracting)
+    if source.kind == "tar":
+        return _ensure_tar_extracted(source.path, session_id, on_extracting)
     return None
 
 
@@ -256,6 +320,9 @@ def resolve_session_source(
 
     zp = base / f"{session_id}.zip"
     if zp.is_file():
+        extracted = _ensure_zip_extracted(zp, session_id, on_extracting)
+        if extracted is not None:
+            return SessionSource("directory", extracted, session_id)
         return SessionSource("zip", zp, session_id)
 
     for suf in (".tgz", ".tar.gz", ".tar.bz2", ".tar.xz", ".tar"):

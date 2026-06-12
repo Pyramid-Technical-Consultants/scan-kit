@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from scan_kit.common.session_source import resolve_session_source
+from scan_kit.common.session_source import ensure_session_on_disk
 
 _DEVICES_REL_CANDIDATES = (
     "map2map/devices.xml",
@@ -28,10 +28,10 @@ def resolve_devices_xml_path(config_root: Path) -> Path | None:
 
 def resolve_session_config_dir(session_id: str, base_dir: str | Path) -> Path | None:
     """Return the on-disk configuration folder for a session, if available."""
-    source = resolve_session_source(session_id, base_dir)
-    if source is None or source.kind != "directory":
+    session_path = ensure_session_on_disk(session_id, base_dir)
+    if session_path is None:
         return None
-    for candidate in (source.path / "config", source.path):
+    for candidate in (session_path / "config", session_path):
         if candidate.is_dir() and resolve_devices_xml_path(candidate) is not None:
             return candidate.resolve()
     return None

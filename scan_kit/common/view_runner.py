@@ -8,6 +8,7 @@ change via a 1-second polling timer on the matplotlib event loop.
 
 from __future__ import annotations
 
+import logging
 import os
 import sys
 import traceback
@@ -29,6 +30,12 @@ _FIG_ONLY_KW = frozenset({
 # Delays (ms) after show / resize before re-running toolbar tight layout.
 _LAYOUT_DELAYS_MS = (0, 100, 300, 600)
 _LAYOUT_HOOK = "_scan_kit_layout_hook"
+_VIEW_LOG_FORMAT = "%(levelname)s [%(name)s] %(message)s"
+
+
+def _configure_view_logging() -> None:
+    """Send view-process log records to stderr so the launcher can capture them."""
+    logging.basicConfig(level=logging.INFO, format=_VIEW_LOG_FORMAT, force=True)
 
 
 def _get_pyplot():
@@ -51,6 +58,7 @@ def warm_worker_main() -> None:
     import importlib
     import json
 
+    _configure_view_logging()
     init_matplotlib_for_views()
     _get_pyplot()
 
@@ -86,6 +94,7 @@ def run_with_live_settings(
     initial_settings_json: str,
 ) -> None:
     """Run *view_func* and silently refresh whenever settings change."""
+    _configure_view_logging()
     plt = _get_pyplot()
     from .plotting import apply_toolbar_tight_layout
 

@@ -54,6 +54,7 @@ from .common.app_icon import (
     prepare_qt_app_identity,
 )
 from .common.app_settings import AppSettings
+from .common.debug_log_panel import DebugLogPanel
 from .common.session_browser import SessionBrowserWidget
 from .common.session_meta import SessionMeta
 from .common.settings import ViewSettings, CALIBRATION_MODES
@@ -80,6 +81,7 @@ _VIEW_GRID_COLS = 2
 _MAIN_TAB_DATA_ANALYSIS = "Data Analysis"
 _MAIN_TAB_PLAN_SYNTHESIS = "Plan Synthesis"
 _MAIN_TAB_CONFIG_TUNING = "Configuration Tuning"
+_MAIN_TAB_DEBUG = "Debug"
 
 _DEFAULT_WINDOW_WIDTH = 1400
 _DEFAULT_WINDOW_HEIGHT = 880
@@ -287,10 +289,13 @@ class ScanKitMainWindow(QMainWindow):
         self._config_tuning_panel = ConfigTuningPanel(app_settings=self._app_settings)
         self._config_tuning_panel.set_session_data_dir(self._base_dir)
         tabs.addTab(self._config_tuning_panel, _MAIN_TAB_CONFIG_TUNING)
+        self._debug_log_panel = DebugLogPanel()
+        tabs.addTab(self._debug_log_panel, _MAIN_TAB_DEBUG)
         self._main_tabs = tabs
         self._restore_main_tab()
         tabs.currentChanged.connect(self._on_main_tab_changed)
         self.setCentralWidget(tabs)
+        self._debug_log_panel.install_logging()
 
         for seq in ("Esc", "Ctrl+Q"):
             QShortcut(QKeySequence(seq), self, activated=self.close)
@@ -377,7 +382,7 @@ class ScanKitMainWindow(QMainWindow):
         config_dir = resolve_session_config_dir(sid, self._base_dir)
         if config_dir is None:
             self._notify(
-                f"No on-disk configuration folder found for session {sid}.",
+                f"No configuration folder with map2map/devices.xml found for session {sid}.",
                 error=True,
             )
             return
@@ -626,6 +631,9 @@ class ScanKitMainWindow(QMainWindow):
         return self._session_browser.session_meta_by_id()
 
     def _notify(self, message: str, *, error: bool = False) -> None:
+        panel = getattr(self, "_debug_log_panel", None)
+        if panel is not None:
+            panel.append("ERROR" if error else "WARNING", "launcher", message)
         box = QMessageBox(self)
         box.setText(message)
         box.setIcon(QMessageBox.Icon.Critical if error else QMessageBox.Icon.Warning)
@@ -823,6 +831,7 @@ class ScanKitMainWindow(QMainWindow):
             if proc is None:
                 self._notify("Failed to run analysis", error=True)
                 return
+            self._debug_log_panel.attach_subprocess_stderr(proc, module_name)
             threading.Thread(
                 target=self._watch_subprocess_ready,
                 args=(proc, module_name),
@@ -887,6 +896,7 @@ class ScanKitMainWindow(QMainWindow):
             return None
         worker = _WarmWorker(proc)
         self._warm_idle.append(worker)
+        self._debug_log_panel.attach_subprocess_stderr(proc, "view-worker")
         threading.Thread(
             target=self._watch_worker, args=(worker,), daemon=True
         ).start()
@@ -959,19 +969,25 @@ class ScanKitMainWindow(QMainWindow):
             self._notify(f"Failed to run analysis: {e}", error=True)
             return None
 
+    def _forward_subprocess_stdout_line(self, source: str, raw: bytes) -> bool:
+        """Return True when *raw* contains the plot-ready sentinel."""
+        if _READY_SENTINEL.encode() in raw:
+            return True
+        text = raw.decode(errors="replace").rstrip("\r\n")
+        if text:
+            self._debug_log_panel.append("STDOUT", source, text)
+        return False
+
     def _watch_subprocess_ready(
         self, proc: subprocess.Popen, module_name: str
     ) -> None:
         try:
             for line in proc.stdout:
-                if _READY_SENTINEL.encode() in line:
+                if self._forward_subprocess_stdout_line(module_name, line):
                     self._sig_plot_window_ready.emit(module_name, proc)
                     break
-        except Exception:
-            pass
-        try:
-            for _ in proc.stdout:
-                pass
+            for line in proc.stdout:
+                self._forward_subprocess_stdout_line(module_name, line)
         except Exception:
             pass
 
@@ -985,8 +1001,13 @@ class ScanKitMainWindow(QMainWindow):
                 if _WORKER_WARM_SENTINEL.encode() in line:
                     worker.warm.set()
                     continue
-                if worker.module_name and _READY_SENTINEL.encode() in line:
-                    self._sig_plot_window_ready.emit(worker.module_name, worker.proc)
+                if self._forward_subprocess_stdout_line(
+                    worker.module_name or "view-worker", line
+                ):
+                    if worker.module_name:
+                        self._sig_plot_window_ready.emit(
+                            worker.module_name, worker.proc
+                        )
         except Exception:
             pass
 

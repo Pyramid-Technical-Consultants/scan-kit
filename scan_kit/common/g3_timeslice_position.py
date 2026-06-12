@@ -160,11 +160,24 @@ def resolve_g3_position_target_columns(columns) -> G3PositionTargetColumns | Non
     )
 
 
+def resolve_g3_fit_ok_column(columns, axis: str) -> str | None:
+    """Resolve per-axis Gaussian fit OK (``ic*_fit_ok`` or older ``r_ic*_spot_position_ok``)."""
+    for candidate in (
+        f"{axis}_fit_ok",
+        f"r_{axis}_spot_position_ok",
+        f"r_{axis}_position_ok",
+    ):
+        resolved = resolve_column_name(columns, candidate)
+        if resolved is not None:
+            return resolved
+    return None
+
+
 def resolve_g3_quality_columns(columns) -> G3QualityColumns:
     """Resolve optional G3 fit-quality columns (all may be ``None``)."""
     resolved: dict[str, str | None] = {}
-    for label, fit_ok, confidence, error_code in _G3_QUALITY:
-        resolved[f"{label}_fit_ok"] = resolve_column_name(columns, fit_ok)
+    for label, _fit_ok, confidence, error_code in _G3_QUALITY:
+        resolved[f"{label}_fit_ok"] = resolve_g3_fit_ok_column(columns, label)
         resolved[f"{label}_confidence"] = resolve_column_name(columns, confidence)
         resolved[f"{label}_error_code"] = resolve_column_name(columns, error_code)
     return G3QualityColumns(**resolved)
