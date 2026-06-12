@@ -3,7 +3,13 @@ from pathlib import Path
 import pytest
 from PySide6.QtGui import QGuiApplication
 
-from scan_kit.common.app_icon import asset_path, load_app_icon
+from scan_kit.common.app_icon import (
+    apply_qt_application_branding,
+    asset_path,
+    desktop_file_name,
+    load_app_icon,
+    prepare_qt_app_identity,
+)
 from scan_kit.common.linux_frozen_env import prepare_linux_frozen_env
 from scan_kit.common.win_identity import prepare_windows_app_identity
 
@@ -29,6 +35,28 @@ def test_asset_path_resolves_bundled_icon_files() -> None:
 def test_load_app_icon_finds_png(qapp) -> None:
     icon = load_app_icon()
     assert not icon.isNull()
+
+
+def test_prepare_qt_app_identity_sets_stable_names(qapp) -> None:
+    from PySide6.QtCore import QCoreApplication
+
+    prepare_qt_app_identity()
+    assert QCoreApplication.organizationName() == "ProtonCare"
+    assert QCoreApplication.applicationName() == "scan-kit"
+
+
+def test_desktop_file_name_matches_wm_class() -> None:
+    assert desktop_file_name() == "scan-kit"
+
+
+def test_apply_qt_application_branding_sets_icon(qapp) -> None:
+    from PySide6.QtWidgets import QApplication
+
+    app = QApplication.instance()
+    assert app is not None
+    icon = apply_qt_application_branding(app)
+    assert not icon.isNull()
+    assert not app.windowIcon().isNull()
 
 
 def test_prepare_windows_app_identity_does_not_raise() -> None:

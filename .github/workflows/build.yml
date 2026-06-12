@@ -66,15 +66,25 @@ jobs:
         shell: bash
         run: |
           VERSION=$(python -c "from scan_kit import __version__; print(__version__)")
-          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
-            echo "path=${{ matrix.exe }}" >> "$GITHUB_OUTPUT"
-          elif [[ "${{ runner.os }}" == "Windows" ]]; then
-            mv dist/scan-kit.exe "dist/scan-kit-windows-${VERSION}-rc.exe"
-            echo "path=dist/scan-kit-windows-${VERSION}-rc.exe" >> "$GITHUB_OUTPUT"
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+              echo "path=dist/scan-kit.exe" >> "$GITHUB_OUTPUT"
+            else
+              mv dist/scan-kit.exe "dist/scan-kit-windows-${VERSION}-rc.exe"
+              echo "path=dist/scan-kit-windows-${VERSION}-rc.exe" >> "$GITHUB_OUTPUT"
+            fi
           else
-            mv dist/scan-kit "dist/scan-kit-linux-amd64-${VERSION}-rc"
-            chmod +x "dist/scan-kit-linux-amd64-${VERSION}-rc"
-            echo "path=dist/scan-kit-linux-amd64-${VERSION}-rc" >> "$GITHUB_OUTPUT"
+            if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+              BUNDLE="scan-kit-linux-amd64-${VERSION}"
+            else
+              BUNDLE="scan-kit-linux-amd64-${VERSION}-rc"
+            fi
+            mkdir -p "dist/${BUNDLE}"
+            mv dist/scan-kit "dist/${BUNDLE}/scan-kit"
+            chmod +x "dist/${BUNDLE}/scan-kit"
+            cp packaging/linux/README-Linux.txt "dist/${BUNDLE}/README.txt"
+            tar -czf "dist/${BUNDLE}.tar.gz" -C dist "${BUNDLE}"
+            echo "path=dist/${BUNDLE}.tar.gz" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Upload artifact
@@ -111,8 +121,8 @@ jobs:
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
           mv artifacts/scan-kit-windows/scan-kit.exe "artifacts/scan-kit-windows-${VERSION}.exe"
-          mv artifacts/scan-kit-linux/scan-kit       "artifacts/scan-kit-linux-amd64-${VERSION}"
-          chmod +x "artifacts/scan-kit-linux-amd64-${VERSION}"
+          mv "artifacts/scan-kit-linux/scan-kit-linux-amd64-${VERSION}.tar.gz" \
+            "artifacts/scan-kit-linux-amd64-${VERSION}.tar.gz"
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3
@@ -120,4 +130,4 @@ jobs:
           generate_release_notes: true
           files: |
             artifacts/scan-kit-windows-*.exe
-            artifacts/scan-kit-linux-amd64-*
+            artifacts/scan-kit-linux-amd64-*.tar.gz

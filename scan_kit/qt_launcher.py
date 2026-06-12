@@ -47,7 +47,12 @@ from PySide6.QtWidgets import (
 )
 
 from . import __version__
-from .common.app_icon import apply_windows_window_icons, load_app_icon
+from .common.app_icon import (
+    apply_qt_application_branding,
+    apply_windows_window_icons,
+    load_app_icon,
+    prepare_qt_app_identity,
+)
 from .common.app_settings import AppSettings
 from .common.session_browser import SessionBrowserWidget
 from .common.session_meta import SessionMeta
@@ -1092,8 +1097,11 @@ def _run_view_subprocess(
 ) -> None:
     """Execute a single analysis view (used by frozen exe in --run-view mode)."""
     import importlib
+
+    from .common.matplotlib_backend import init_matplotlib_for_views
     from .common.view_runner import run_with_live_settings
 
+    init_matplotlib_for_views()
     mod = importlib.import_module(f"scan_kit.views.{module_name}")
     if settings is None:
         settings = ViewSettings()
@@ -1127,10 +1135,9 @@ def main() -> None:
         _run_view_subprocess(module_name, session_ids, base_dir, settings=settings)
         return
 
+    prepare_qt_app_identity()
     app = QApplication(sys.argv)
-    app_icon = load_app_icon()
-    if not app_icon.isNull():
-        app.setWindowIcon(app_icon)
+    app_icon = apply_qt_application_branding(app)
     win = ScanKitMainWindow()
     if not app_icon.isNull():
         win.setWindowIcon(app_icon)

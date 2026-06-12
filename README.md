@@ -64,12 +64,12 @@ Pre-built executables are published on [**GitHub Releases**](https://github.com/
 | Platform | Download |
 |----------|----------|
 | **Windows** | `scan-kit-windows-{version}.exe` |
-| **Linux** (x86-64) | `scan-kit-linux-amd64-{version}` |
+| **Linux** (x86-64) | `scan-kit-linux-amd64-{version}.tar.gz` |
 
-The `{version}` in the filename matches the release tag — e.g. `1.4.0` for tag `v1.4.0`. Run the executable and set your data source folder in the launcher.
+Extract the archive, then run `./scan-kit`. On first launch it registers itself in your applications menu with the correct icon.
 
 > **Trying the latest `main` branch?** CI builds release-candidate artifacts on every push and pull request:
-> `scan-kit-windows-{version}-rc.exe` and `scan-kit-linux-amd64-{version}-rc`.
+> `scan-kit-windows-{version}-rc.exe` and `scan-kit-linux-amd64-{version}-rc.tar.gz`.
 > Download them from the **Artifacts** section of the corresponding [GitHub Actions](https://github.com/Pyramid-Technical-Consultants/scan-kit/actions) workflow run.
 
 ### Install from source

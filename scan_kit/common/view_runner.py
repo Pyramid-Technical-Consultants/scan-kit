@@ -11,16 +11,10 @@ from __future__ import annotations
 import os
 import sys
 import traceback
-from typing import Callable
+from typing import Any, Callable
 
-import matplotlib
-
-if getattr(sys, "frozen", False):
-    matplotlib.use(os.environ.get("MPLBACKEND", "QtAgg"))
-
-import matplotlib.pyplot as plt
-
-from .plotting import apply_toolbar_tight_layout
+from .app_icon import load_app_icon, prepare_qt_app_identity
+from .matplotlib_backend import init_matplotlib_for_views
 from .settings import ViewSettings
 
 _READY_SENTINEL = "__SCAN_KIT_PLOT_READY__"
@@ -37,6 +31,14 @@ _LAYOUT_DELAYS_MS = (0, 100, 300, 600)
 _LAYOUT_HOOK = "_scan_kit_layout_hook"
 
 
+def _get_pyplot():
+    """Import pyplot after the GUI backend is configured in frozen builds."""
+    init_matplotlib_for_views()
+    import matplotlib.pyplot as plt
+
+    return plt
+
+
 def warm_worker_main() -> None:
     """Pre-warmed view worker entry point.
 
@@ -45,12 +47,12 @@ def warm_worker_main() -> None:
     view. After printing :data:`WARM_WORKER_SENTINEL`, it blocks reading a
     single JSON render command from stdin:
     ``{"module", "sessions", "base_dir", "settings"}``.
-
-    Importing this module already imports matplotlib.pyplot; scipy/pandas are
-    nudged in here so the first render does not pay for them.
     """
     import importlib
     import json
+
+    init_matplotlib_for_views()
+    _get_pyplot()
 
     for _mod in ("scipy.signal", "scipy.fft", "pandas"):
         try:
@@ -84,10 +86,12 @@ def run_with_live_settings(
     initial_settings_json: str,
 ) -> None:
     """Run *view_func* and silently refresh whenever settings change."""
+    plt = _get_pyplot()
+    from .plotting import apply_toolbar_tight_layout
 
     settings_path = os.path.join(base_dir, "settings.json")
 
-    _state: dict = {
+    _state: dict[str, Any] = {
         "rerun": False,
         "existing_figs": [],
         "last_mtime": 0.0,
@@ -119,6 +123,15 @@ def run_with_live_settings(
         return _orig_subplots(*args, **kwargs)
 
     # -- Figure layout after maximize / resize ------------------------------
+
+    def _set_figure_window_icon(fig) -> None:
+        try:
+            window = fig.canvas.manager.window
+            icon = load_app_icon()
+            if not icon.isNull() and hasattr(window, "setWindowIcon"):
+                window.setWindowIcon(icon)
+        except Exception:
+            pass
 
     def _maximize_figure_window(fig) -> None:
         try:
@@ -179,6 +192,7 @@ def run_with_live_settings(
 
     def _finalize_figure_layout(fig) -> None:
         _maximize_figure_window(fig)
+        _set_figure_window_icon(fig)
         _schedule_toolbar_tight_layout(fig)
 
     # -- Re-run logic ------------------------------------------------------
@@ -249,6 +263,8 @@ def run_with_live_settings(
         _real_show(*args, **kwargs)
 
     # -- Run ---------------------------------------------------------------
+
+    prepare_qt_app_identity()
 
     plt.figure = _patched_figure
     plt.subplots = _patched_subplots

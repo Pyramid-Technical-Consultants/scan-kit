@@ -32,6 +32,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from ..common.app_icon import apply_qt_application_branding, prepare_qt_app_identity
 from ..common.plot_colors import DEFAULT_SESSION_COLORS
 from ..common.session_log import (
     SessionLogData,
@@ -489,12 +490,16 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
         print("No session logs could be loaded")
         return
 
+    prepare_qt_app_identity()
     app = QApplication.instance()
     if app is None:
         app = QApplication(sys.argv)
+    app_icon = apply_qt_application_branding(app)
 
     colors = [DEFAULT_SESSION_COLORS[i % len(DEFAULT_SESSION_COLORS)] for i in range(len(logs))]
     window = SessionLogCompareWindow(logs, colors)
+    if not app_icon.isNull():
+        window.setWindowIcon(app_icon)
     window.show()
     print(_READY_SENTINEL, flush=True)
     app.exec()
