@@ -186,7 +186,7 @@ VIEW_GROUPS: list[tuple[str, list[ViewEntry]]] = [
             (
                 "Beam-Off Ramp-Down",
                 "beam_off_rampdown",
-                "Beam-off current ramp-down curves for IC1, IC2, and IC3.",
+                "Beam-off ramp-down curves for IC1, IC2, and IC3 from scan-total dose.",
             ),
             (
                 "IC Timeslice Replay",

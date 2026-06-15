@@ -5,6 +5,7 @@ from __future__ import annotations
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
+from matplotlib.lines import Line2D
 from scipy.signal import find_peaks
 
 from ..common import (
@@ -292,13 +293,13 @@ def _annotate_peaks(ax, freqs: np.ndarray, psd: np.ndarray, color: str) -> None:
         placed.append((x_disp, y_off))
 
 
-def _style_fft_ax(ax: plt.Axes, ic_label: str, is_bottom: bool) -> None:
+def _style_fft_ax(ax: plt.Axes, is_bottom: bool) -> None:
     """Apply shared axis styling to an FFT subplot."""
     ax.set_xlim(FREQ_MIN_HZ, FREQ_MAX_HZ)
     ax.xaxis.set_major_locator(mticker.MultipleLocator(50))
     ax.xaxis.set_minor_locator(mticker.MultipleLocator(10))
     ax.tick_params(which="minor", length=3)
-    ax.set_ylabel(f"{ic_label}\nPSD (nA²/Hz)", fontsize=9)
+    ax.set_ylabel("PSD (nA²/Hz)", fontsize=9)
     ax.grid(**GRID_KW)
     ax.grid(which="minor", color="#e0e0e0", linewidth=0.3, alpha=0.5)
     if is_bottom:
@@ -396,6 +397,10 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
         ic_labels.append("IC3 (A+B+C+D)")
 
     n_ics = len(ic_keys)
+    session_energy_data = {
+        sid: edata for sid, edata in session_energy_data.items()
+        if len(edata["energies"]) > 1
+    }
     has_heatmaps = len(session_energy_data) > 0
     n_sess_hm = len(session_energy_data)
 
@@ -433,7 +438,7 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
         ax = line_axes[ic_idx]
         for si, (sid, data) in enumerate(session_data.items()):
             color = sess_colors[si] if multi else IC_COLORS[ic_idx]
-            for suffix, ls, state_lbl in (("_on", "-", "Beam"), ("_off", "--", "BG")):
+            for suffix, ls in (("_on", "-"), ("_off", "--")):
                 signal = data.get(f"{ic_key}{suffix}")
                 if signal is None or len(signal) == 0:
                     continue
@@ -443,30 +448,34 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
                 if freqs_hz is None:
                     continue
                 band = (freqs_hz >= FREQ_MIN_HZ) & (freqs_hz <= FREQ_MAX_HZ)
-                label = f"{sid} {state_lbl}" if multi else f"{state_lbl}"
                 ax.semilogy(
                     freqs_hz[band], psd[band],
-                    linewidth=0.6, alpha=0.85, label=label,
+                    linewidth=0.6, alpha=0.85,
                     color=color, linestyle=ls,
                 )
                 if ls == "-":
                     _annotate_peaks(ax, freqs_hz[band], psd[band], color)
 
-        _style_fft_ax(ax, ic_label, is_bottom=not has_heatmaps)
+        _style_fft_ax(ax, is_bottom=not has_heatmaps)
         ax.set_title(ic_label, fontsize=11, fontweight="bold")
         if has_heatmaps:
             plt.setp(ax.get_xticklabels(), visible=False)
 
-    # Shared legend in the colorbar column, aligned with the line-plot row
-    handles, labels = line_axes[0].get_legend_handles_labels()
-    if handles:
-        if has_heatmaps:
-            leg_ax = fig.add_subplot(gs[0, n_ics])
-            leg_ax.axis("off")
-            leg_ax.legend(handles, labels, loc="center", fontsize=8,
-                          frameon=True, framealpha=0.9)
-        else:
-            line_axes[-1].legend(handles, labels, loc="upper right", fontsize=8)
+    linestyle_handles = [
+        Line2D([0], [0], color="0.35", linestyle="-", linewidth=0.9, label="Beam on"),
+        Line2D([0], [0], color="0.35", linestyle="--", linewidth=0.9, label="Beam off"),
+    ]
+    if has_heatmaps:
+        leg_ax = fig.add_subplot(gs[0, n_ics])
+        leg_ax.axis("off")
+        leg_ax.legend(
+            linestyle_handles, loc="center", fontsize=8,
+            frameon=True, framealpha=0.9,
+        )
+    else:
+        line_axes[-1].legend(
+            linestyle_handles, loc="upper right", fontsize=8,
+        )
 
     # --- Heatmap rows ---
     if has_heatmaps:

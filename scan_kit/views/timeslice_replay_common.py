@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Callable, Iterable
 
 import numpy as np
@@ -11,6 +12,15 @@ from matplotlib.widgets import SpanSelector
 
 from ..common import (
     C_ENERGY,
+    C_IC1_CURRENT,
+    C_IC1_SCAN_TOTAL_DOSE,
+    C_IC2_CURRENT,
+    C_IC2_SCAN_TOTAL_DOSE,
+    C_IC3_CURRENT_A,
+    C_IC3_CURRENT_B,
+    C_IC3_CURRENT_C,
+    C_IC3_CURRENT_D,
+    C_IC3_SCAN_TOTAL_DOSE,
     C_LAYER_ID,
     GRID_KW,
     resolve_concept_column,
@@ -108,6 +118,96 @@ def resolve_col(columns: Iterable[str], concept: str) -> str | None:
     return resolve_concept_column(columns, concept)
 
 
+def derive_current_from_dose(
+    dose: np.ndarray, *, ms_per_slice: float = MS_PER_SLICE,
+) -> np.ndarray:
+    """Per-slice derivative of a monotonically-accumulating scan-total dose column."""
+    if len(dose) == 0:
+        return np.empty(0, dtype=float)
+    arr = np.asarray(dose, dtype=float)
+    deriv = np.empty_like(arr)
+    deriv[0] = 0.0
+    if len(arr) > 1:
+        deriv[1:] = (arr[1:] - arr[:-1]) / ms_per_slice
+    deriv[~np.isfinite(deriv)] = 0.0
+    deriv[deriv < 0] = 0.0
+    return deriv
+
+
+def resolve_ic_scan_total_dose_columns(
+    columns: Iterable[str],
+) -> dict[str, str | None]:
+    """Resolve IC1/IC2/IC3 scan-total dose column names from *columns*."""
+    return {
+        "ic1": resolve_col(columns, C_IC1_SCAN_TOTAL_DOSE),
+        "ic2": resolve_col(columns, C_IC2_SCAN_TOTAL_DOSE),
+        "ic3": resolve_col(columns, C_IC3_SCAN_TOTAL_DOSE),
+    }
+
+
+@dataclass(frozen=True)
+class IcRampdownSource:
+    """Resolved per-IC timeslice columns for ramp-down / derived replay analysis."""
+
+    mode: str  # "dose" or "current"
+    ic1: str
+    ic2: str
+    ic3: str | None = None
+    ic3_parts: tuple[str, ...] = ()
+
+
+def resolve_ic_rampdown_source(columns: Iterable[str]) -> IcRampdownSource | None:
+    """Prefer scan-total dose columns; fall back to IC current when dose is absent."""
+    dose = resolve_ic_scan_total_dose_columns(columns)
+    if dose["ic1"] and dose["ic2"]:
+        return IcRampdownSource("dose", dose["ic1"], dose["ic2"], dose["ic3"])
+
+    ic1 = resolve_col(columns, C_IC1_CURRENT)
+    ic2 = resolve_col(columns, C_IC2_CURRENT)
+    if not (ic1 and ic2):
+        return None
+
+    ic3_parts = tuple(
+        c for c in (
+            resolve_col(columns, C_IC3_CURRENT_A),
+            resolve_col(columns, C_IC3_CURRENT_B),
+            resolve_col(columns, C_IC3_CURRENT_C),
+            resolve_col(columns, C_IC3_CURRENT_D),
+        )
+        if c
+    )
+    ic3 = ic3_parts[0] if len(ic3_parts) == 1 else None
+    ic3_quad = ic3_parts if len(ic3_parts) == 4 else ()
+    return IcRampdownSource("current", ic1, ic2, ic3, ic3_quad)
+
+
+def ic_rampdown_signal(df, source: IcRampdownSource, ic: str) -> np.ndarray | None:
+    """Return one IC's per-slice ramp-down signal (dDose/dt or current)."""
+    if ic == "ic1":
+        col = source.ic1
+    elif ic == "ic2":
+        col = source.ic2
+    elif ic == "ic3":
+        if source.ic3_parts:
+            if not all(c in df.columns for c in source.ic3_parts):
+                return None
+            raw = sum(df[c].values.astype(float) for c in source.ic3_parts)
+        elif source.ic3 and source.ic3 in df.columns:
+            raw = df[source.ic3].values.astype(float)
+        else:
+            return None
+        if source.mode == "dose":
+            return derive_current_from_dose(raw)
+        return raw
+
+    if col not in df.columns:
+        return None
+    raw = df[col].values.astype(float)
+    if source.mode == "dose":
+        return derive_current_from_dose(raw)
+    return raw
+
+
 def build_energy_lookups(input_map) -> tuple[dict | None, dict[int, float]] | None:
     """Return (layer_id → energy, layer_idx → energy) lookups from input_map.
 
@@ -123,8 +223,10 @@ def build_energy_lookups(input_map) -> tuple[dict | None, dict[int, float]] | No
     energy_by_idx = {i: float(e) for i, e in enumerate(ordered_energies)}
 
     energy_by_layer: dict | None = None
-    if col_layer is not None and input_map[col_layer].nunique() >= 2:
+    if col_layer is not None:
         energy_by_layer = input_map.groupby(col_layer)[col_energy].first().to_dict()
+        if len(energy_by_layer) <= 1:
+            energy_by_layer = None
 
     return energy_by_layer, energy_by_idx
 
@@ -139,12 +241,12 @@ def resolve_frame_energy(
 ) -> float | None:
     """Resolve the beam energy for one timeslice frame."""
     energy = None
-    if energy_by_layer is not None and layer_col in df.columns:
-        lid = df[layer_col].iloc[0]
-        energy = energy_by_layer.get(lid)
-    if energy is None and "_layer_idx" in df.columns:
+    if "_layer_idx" in df.columns:
         idx = int(df["_layer_idx"].iloc[0])
         energy = energy_by_idx.get(idx)
+    if energy is None and energy_by_layer is not None and layer_col in df.columns:
+        lid = df[layer_col].iloc[0]
+        energy = energy_by_layer.get(lid)
     if energy is None:
         energy = energy_by_idx.get(frame_idx)
     if energy is None:

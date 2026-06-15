@@ -5,28 +5,24 @@ from __future__ import annotations
 import importlib
 import logging
 from collections.abc import Callable
-from io import BytesIO
 from pathlib import Path
 
 import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import numpy as np
 from matplotlib.backends.backend_pdf import PdfPages
 
 from scan_kit import __version__
-from scan_kit.common.plotting import apply_tight_layout
+from scan_kit.common.plotting import relayout_view_for_pdf_export
 from scan_kit.common.report_runner import capture_view_figure
 
 from .pages import render_conclusion_page, render_title_page
 from .types import ReportConfig, ViewRenderResult
 
-_VIEW_WIDTH_PX = 1920
-_VIEW_HEIGHT_PX = 1080
-_VIEW_DPI = 100
-_VIEW_FIGSIZE = (_VIEW_WIDTH_PX / _VIEW_DPI, _VIEW_HEIGHT_PX / _VIEW_DPI)
 _LANDSCAPE_PAGE = (16.0, 9.0)
+# Vector PDF at print resolution.
+_OUTPUT_DPI = 300
 _SKIP_NO_DATA = "No data available for selected sessions"
 _log = logging.getLogger(__name__)
 
@@ -42,72 +38,38 @@ def _log_skipped_view(result: ViewRenderResult) -> None:
 
 
 def _prepare_view_figure(fig: plt.Figure) -> None:
-    """Resize to a 1920×1080 (16:9) canvas and apply tight layout."""
-    fig.set_size_inches(*_VIEW_FIGSIZE, forward=True)
-    apply_tight_layout(fig)
+    """Resize for the PDF page and re-layout the view header at the new size."""
+    relayout_view_for_pdf_export(fig, dpi=_OUTPUT_DPI, page_inches=_LANDSCAPE_PAGE)
 
 
-def _rasterize_figure(fig: plt.Figure) -> np.ndarray:
-    """Render *fig* to a 1920×1080 PNG array for PDF embedding."""
-    _prepare_view_figure(fig)
-    buf = BytesIO()
+def _save_figure_page(fig: plt.Figure, pdf: PdfPages) -> None:
+    """Append a matplotlib figure to the PDF as vector artwork."""
     fig.savefig(
-        buf,
-        format="png",
-        dpi=_VIEW_DPI,
-        facecolor=fig.get_facecolor(),
-        edgecolor="none",
-        pil_kwargs={"compress_level": 3},
-    )
-    buf.seek(0)
-    image = plt.imread(buf)
-    if image.shape[1] != _VIEW_WIDTH_PX or image.shape[0] != _VIEW_HEIGHT_PX:
-        raise RuntimeError(
-            f"Expected {_VIEW_WIDTH_PX}×{_VIEW_HEIGHT_PX} plot image, "
-            f"got {image.shape[1]}×{image.shape[0]}"
-        )
-    return image
-
-
-def _save_raster_page(
-    image: np.ndarray,
-    pdf: PdfPages,
-    *,
-    landscape: bool,
-) -> None:
-    """Place a raster image on a PDF page (avoids vectorizing dense plots)."""
-    page_size = _LANDSCAPE_PAGE if landscape else _PORTRAIT_PAGE
-    page_fig = plt.figure(figsize=page_size, dpi=150)
-    page_fig.patch.set_facecolor("white")
-    ax = page_fig.add_axes([0, 0, 1, 1])
-    ax.set_axis_off()
-    ax.imshow(image, interpolation="lanczos", resample=True, aspect="auto")
-    ax.set_xlim(0, image.shape[1])
-    ax.set_ylim(image.shape[0], 0)
-    page_fig.savefig(
         pdf,
         format="pdf",
-        dpi=150,
-        bbox_inches="tight",
-        facecolor="white",
+        dpi=_OUTPUT_DPI,
+        facecolor=fig.get_facecolor(),
+        edgecolor="none",
     )
-    plt.close(page_fig)
 
 
 def _save_figure_to_pdf(fig: plt.Figure, pdf: PdfPages, *, landscape: bool) -> None:
-    image = _rasterize_figure(fig)
-    _save_raster_page(image, pdf, landscape=landscape)
+    if not landscape:
+        raise ValueError("Report view pages are landscape only")
+    _prepare_view_figure(fig)
+    _save_figure_page(fig, pdf)
 
 
 def _save_landscape_page(fig: plt.Figure, pdf: PdfPages) -> None:
     """Save a landscape document page (title, conclusion) directly to the PDF."""
     fig.set_size_inches(*_LANDSCAPE_PAGE, forward=True)
+    fig.set_dpi(_OUTPUT_DPI)
     fig.savefig(
         pdf,
         format="pdf",
-        dpi=150,
-        bbox_inches="tight",
+        dpi=_OUTPUT_DPI,
         facecolor=fig.get_facecolor(),
+        edgecolor="none",
     )
 
 

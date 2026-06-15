@@ -1,25 +1,19 @@
-"""Beam-off ramp-down curve analysis (IC1, IC2, IC3) from timeslice data."""
+"""Beam-off ramp-down curve analysis (IC1, IC2, IC3) from scan-total dose."""
 
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
-from matplotlib.ticker import MultipleLocator
+from matplotlib.ticker import FuncFormatter, MultipleLocator, NullFormatter
 
 from ..common import (
-    C_ENERGY,
-    C_IC1_CURRENT,
-    C_IC2_CURRENT,
-    C_IC1_STRIP_SUM,
-    C_IC2_STRIP_SUM,
-    C_IC3_CURRENT_A,
-    C_IC3_CURRENT_B,
-    C_IC3_CURRENT_C,
-    C_IC3_CURRENT_D,
     C_LAYER_ID,
     DEFAULT_SESSION_COLORS,
     finish_view,
     GRID_KW,
+    make_trend_legend,
     REFLINE_KW,
+    trend_line_color,
+    trend_session_prefix,
 )
 from ..common import sliding_background
 from ..common.session_source import (
@@ -27,10 +21,39 @@ from ..common.session_source import (
     load_session_timeslice_device_units,
     resolve_session_source,
 )
+from .timeslice_replay_common import (
+    MS_PER_SLICE,
+    build_energy_lookups,
+    ic_rampdown_signal,
+    resolve_col,
+    resolve_frame_energy,
+    resolve_ic_rampdown_source,
+)
 
 import logging
 
 _log = logging.getLogger(__name__)
+
+
+def _symlog_pct_tick(value: float, _pos: int) -> str:
+    """Format symlog axis values as plain percent labels (1%, 10%, 100%, …)."""
+    if not np.isfinite(value) or abs(value) < 1e-12:
+        return "0%"
+    if abs(value - round(value)) < 1e-6:
+        return f"{int(round(value))}%"
+    if abs(value) >= 1:
+        return f"{value:.1f}%"
+    return f"{value:g}%"
+
+
+def _heatmap_energy_extent(energies: list[float] | np.ndarray) -> tuple[float, float]:
+    """Return imshow Y extent with padding when energy span is zero."""
+    y_lo = float(energies[0])
+    y_hi = float(energies[-1])
+    if y_hi > y_lo:
+        return y_lo, y_hi
+    return y_lo - 0.5, y_hi + 0.5
+
 
 # ---- Tweakable window parameters ------------------------------------------
 PRE_OFF_SLICES = 2  # timeslices shown before the falling edge
@@ -38,29 +61,11 @@ POST_OFF_SLICES = 9  # timeslices shown after the falling edge
 MIN_ON_SLICES = 2  # minimum consecutive above-threshold slices right
 # before the falling edge (filters brief spikes)
 THRESHOLD_FRAC = 0.10  # fraction of (peak − background) used to define the
-# beam-on / beam-off boundary on IC1 current
+# beam-on / beam-off boundary on dose-derived IC signal
+MIN_SIGNAL_SPAN = 1e-4  # minimum peak−background (nA or dose-derived rate)
+SYMLOG_LINTHRESH = 1.0  # row-0 symlog linear region around 0 (%)
+FIT_LINE_KW = dict(linewidth=1.5, linestyle=":", solid_capstyle="round")
 # ---------------------------------------------------------------------------
-
-_CONFIDENCE_COLS = {
-    "ic1": ("r_ic1_x_confidence", "r_ic1_y_confidence"),
-    "ic2": ("r_ic2_x_confidence", "r_ic2_y_confidence"),
-    "ic3": ("r_px3_1_confidence",),
-}
-_CONFIDENCE_THRESHOLD = 0.0
-
-_TIMESLICE_COLS = [
-    C_LAYER_ID,
-    C_IC1_CURRENT,
-    C_IC2_CURRENT,
-    C_IC1_STRIP_SUM,
-    C_IC2_STRIP_SUM,
-    C_IC3_CURRENT_A,
-    C_IC3_CURRENT_B,
-    C_IC3_CURRENT_C,
-    C_IC3_CURRENT_D,
-    *[c for cols in _CONFIDENCE_COLS.values() for c in cols],
-]
-
 
 _sliding_background = sliding_background  # local alias for existing call sites
 
@@ -87,7 +92,7 @@ def detect_beam_off_edges(
         clean[np.isnan(clean)] = np.nanmedian(clean)
 
     bg_array, bg_global, peak = _sliding_background(clean, threshold_frac)
-    if peak - bg_global < 1.0:
+    if peak - bg_global < MIN_SIGNAL_SPAN:
         return np.array([], dtype=int)
 
     sig = clean - bg_array
@@ -126,15 +131,14 @@ def _extract_windows(
     beam_on_hint : optional bool array
         External beam-on mask (e.g. from a confidence column).  When
         provided, edge detection uses this instead of thresholding the
-        signal itself — much more reliable for noisy channels like
-        strip sums.
+        signal itself — more reliable for noisy combined channels.
     """
     if np.isnan(signal).any():
         signal = signal.copy()
         signal[np.isnan(signal)] = np.nanmedian(signal)
 
     bg_array, bg_global, peak = _sliding_background(signal)
-    if peak - bg_global < 1.0:
+    if peak - bg_global < MIN_SIGNAL_SPAN:
         return []
 
     sig = signal - bg_array
@@ -183,7 +187,7 @@ def _normalise_windows(windows: list[np.ndarray]) -> np.ndarray | None:
     with np.errstate(all="ignore"):
         avg = np.nanmean(windows, axis=0)
     pk = np.nanmax(np.abs(avg))
-    if pk < 1.0:
+    if not np.isfinite(pk) or pk < MIN_SIGNAL_SPAN:
         return None
     return (avg / pk) * 100.0
 
@@ -293,46 +297,14 @@ def _fit_decay(curve: np.ndarray, t_start_idx: int) -> dict | None:
     return None
 
 
-MS_PER_SLICE = 1.0
-
-
-def _fit_per_energy_taus(
-    per_energy: dict[float, dict],
-    ic_key: str,
-    t_start_idx: int,
-) -> list[float]:
-    """Collect dominant tau values across all energies for one IC.
-
-    For single-exp fits returns tau; for double-exp returns the
-    amplitude-weighted effective tau.
-    """
-    taus: list[float] = []
-    for energy in sorted(per_energy):
-        curve = per_energy[energy].get(ic_key)
-        if curve is None:
-            continue
-        result = _fit_decay(curve, t_start_idx)
-        if result is None:
-            continue
-        if result["model"] == "single":
-            taus.append(result["tau"])
-        else:
-            A1, tau1 = result["A1"], result["tau1"]
-            A2, tau2 = result["A2"], result["tau2"]
-            taus.append((A1 * tau1 + A2 * tau2) / (A1 + A2))
-    return taus
-
-
-def _confidence_beam_on(df, ic_key: str) -> np.ndarray | None:
-    """Return a boolean beam-on mask by OR-ing all confidence axes for an IC."""
-    cols = _CONFIDENCE_COLS.get(ic_key, ())
-    present = [c for c in cols if c in df.columns]
-    if not present:
-        return None
-    mask = df[present[0]].values.astype(float) > _CONFIDENCE_THRESHOLD
-    for c in present[1:]:
-        mask = mask | (df[c].values.astype(float) > _CONFIDENCE_THRESHOLD)
-    return mask
+def _format_decay_fit_label(fit: dict, *, prefix: str = "") -> str:
+    """Compact decay-fit legend text: time constant(s) and R² only."""
+    if fit["model"] == "single":
+        tau_part = f"\u03C4={fit['tau']:.2f} ms"
+    else:
+        tau_part = f"\u03C4={fit['tau1']:.2f}/{fit['tau2']:.2f} ms"
+    label = f"{tau_part}  R\u00B2={fit['r_squared']:.2f}"
+    return f"{prefix}{label}" if prefix else label
 
 
 def _extract_rampdown_curves(session_id: str, base_dir: str):
@@ -358,75 +330,44 @@ def _extract_rampdown_curves(session_id: str, base_dir: str):
     if input_map is None:
         return None
 
-    if C_ENERGY not in input_map.columns:
+    lookups = build_energy_lookups(input_map)
+    if lookups is None:
         return None
+    energy_by_layer_id, energy_by_idx = lookups
 
-    energy_by_layer_id: dict | None = None
-    energy_by_idx: dict[int, float] | None = None
-
-    if C_LAYER_ID in input_map.columns:
-        energy_by_layer_id = input_map.groupby(C_LAYER_ID)[C_ENERGY].first().to_dict()
-
-    if energy_by_layer_id is None or len(energy_by_layer_id) <= 1:
-        ordered_energies = list(dict.fromkeys(input_map[C_ENERGY].values))
-        energy_by_idx = {i: e for i, e in enumerate(ordered_energies)}
-
-    frames = load_session_timeslice_device_units(src, usecols=_TIMESLICE_COLS)
+    frames = load_session_timeslice_device_units(src)
     if not frames:
         return None
 
-    ic3_cols = [C_IC3_CURRENT_A, C_IC3_CURRENT_B, C_IC3_CURRENT_C, C_IC3_CURRENT_D]
+    signal_source = resolve_ic_rampdown_source(frames[0].columns)
+    if signal_source is None:
+        return None
+
+    layer_col = resolve_col(frames[0].columns, C_LAYER_ID) or C_LAYER_ID
 
     windows_by_energy: dict[float, dict[str, list[np.ndarray]]] = {}
 
-    for df in frames:
-        energy = None
-        if energy_by_idx is not None and "_layer_idx" in df.columns:
-            idx = int(df["_layer_idx"].iloc[0])
-            energy = energy_by_idx.get(idx)
-        if energy is None and energy_by_layer_id is not None and C_LAYER_ID in df.columns:
-            layer_id = df[C_LAYER_ID].iloc[0]
-            energy = energy_by_layer_id.get(layer_id)
+    for frame_idx, df in enumerate(frames):
+        energy = resolve_frame_energy(
+            df,
+            frame_idx,
+            energy_by_layer=energy_by_layer_id,
+            energy_by_idx=energy_by_idx,
+            layer_col=layer_col,
+        )
         if energy is None:
             continue
 
-        if C_IC1_CURRENT not in df.columns and C_IC2_CURRENT not in df.columns:
-            continue
-
         if energy not in windows_by_energy:
-            windows_by_energy[energy] = {
-                "ic1": [], "ic2": [], "ic1_ss": [], "ic2_ss": [], "ic3": [],
-            }
+            windows_by_energy[energy] = {"ic1": [], "ic2": [], "ic3": []}
         bucket = windows_by_energy[energy]
 
-        ic1_hint = _confidence_beam_on(df, "ic1")
-        ic2_hint = _confidence_beam_on(df, "ic2")
+        for ic_key in ("ic1", "ic2", "ic3"):
+            sig = ic_rampdown_signal(df, signal_source, ic_key)
+            if sig is not None:
+                bucket[ic_key].extend(_extract_windows(sig))
 
-        if C_IC1_CURRENT in df.columns:
-            bucket["ic1"].extend(_extract_windows(df[C_IC1_CURRENT].values))
-        if C_IC2_CURRENT in df.columns:
-            bucket["ic2"].extend(_extract_windows(df[C_IC2_CURRENT].values))
-        if C_IC1_STRIP_SUM in df.columns:
-            bucket["ic1_ss"].extend(
-                _extract_windows(df[C_IC1_STRIP_SUM].values, beam_on_hint=ic1_hint)
-            )
-        if C_IC2_STRIP_SUM in df.columns:
-            bucket["ic2_ss"].extend(
-                _extract_windows(df[C_IC2_STRIP_SUM].values, beam_on_hint=ic2_hint)
-            )
-
-        has_ic3 = all(col in df.columns for col in ic3_cols)
-        if has_ic3:
-            ic3_sig = (
-                df[C_IC3_CURRENT_A].values
-                + df[C_IC3_CURRENT_B].values
-                + df[C_IC3_CURRENT_C].values
-                + df[C_IC3_CURRENT_D].values
-            )
-            ic3_hint = _confidence_beam_on(df, "ic3")
-            bucket["ic3"].extend(_extract_windows(ic3_sig, beam_on_hint=ic3_hint))
-
-    _IC_KEYS = ("ic1", "ic2", "ic1_ss", "ic2_ss", "ic3")
+    _IC_KEYS = ("ic1", "ic2", "ic3")
 
     per_energy: dict[float, dict[str, np.ndarray | None]] = {}
     all_windows: dict[str, list[np.ndarray]] = {k: [] for k in _IC_KEYS}
@@ -443,6 +384,7 @@ def _extract_rampdown_curves(session_id: str, base_dir: str):
         return None
 
     return {
+        "signal_mode": signal_source.mode,
         "per_energy": per_energy,
         "avg": {f"{k}_curve": _normalise_windows(all_windows[k]) for k in _IC_KEYS},
     }
@@ -450,8 +392,10 @@ def _extract_rampdown_curves(session_id: str, base_dir: str):
 
 def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -> None:
     """Run beam-off ramp-down analysis and show matplotlib window."""
+    del settings
+
     if not session_ids:
-        _log.debug("No sessions selected")
+        print("No sessions selected")
         return
 
     session_results: dict[str, dict] = {}
@@ -459,73 +403,71 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
         result = _extract_rampdown_curves(sid, base_dir)
         if result is not None:
             session_results[sid] = result
+        else:
+            print(
+                f"  {sid}: no ramp-down data "
+                "(missing IC dose/current columns or no beam-off edges)",
+            )
 
     if not session_results:
-        _log.debug("No valid ramp-down data found for any session")
+        print("No valid ramp-down data found for any session")
+        return
+
+    if not any(
+        session_results[sid]["avg"].get(f"{ic}_curve") is not None
+        for sid in session_results
+        for ic in ("ic1", "ic2", "ic3")
+    ):
+        print("No valid ramp-down curves found for any session")
         return
 
     loaded_ids = list(session_results.keys())
     colors = DEFAULT_SESSION_COLORS[: len(loaded_ids)]
 
+    use_dose = all(
+        session_results[sid].get("signal_mode") == "dose" for sid in loaded_ids
+    )
+    ic_unit = "dDose/dt" if use_dose else "current"
     ic_defs_full = [
-        ("ic1_curve", "IC1"),
-        ("ic2_curve", "IC2"),
-        ("ic3_curve", "IC3 (A+B+C+D)"),
-        ("ic1_ss_curve", "IC1 Strip Sum"),
-        ("ic2_ss_curve", "IC2 Strip Sum"),
+        ("ic1_curve", f"IC1 {ic_unit}"),
+        ("ic2_curve", f"IC2 {ic_unit}"),
+        ("ic3_curve", f"IC3 {ic_unit}"),
     ]
     ic_defs = [
         (key, label) for key, label in ic_defs_full
         if any(r["avg"].get(key) is not None for r in session_results.values())
     ]
-    ic_defs_regular = [
-        (key, label) for (key, label) in ic_defs if not key.endswith("_ss_curve")
-    ]
-    ic_defs_strip = [
-        (key, label) for (key, label) in ic_defs if key.endswith("_ss_curve")
-    ]
-    ic_defs = ic_defs_regular + ic_defs_strip
     n_ic = len(ic_defs)
 
     t_axis = np.arange(-PRE_OFF_SLICES, POST_OFF_SLICES, dtype=float)
 
-    all_energies: set[float] = set()
-    for r in session_results.values():
-        all_energies.update(r["per_energy"].keys())
-    
+    heatmap_session_ids = [
+        sid for sid in loaded_ids
+        if len(session_results[sid]["per_energy"]) > 1
+    ]
+    n_heatmap_rows = len(heatmap_session_ids)
 
-    n_sessions = len(loaded_ids)
-    n_rows = 1 + n_sessions  # row 0 = averages, rows 1..N = heatmaps
-    height_ratios = [1] + [1.3] * n_sessions
-    has_middle_regular_cbar = bool(ic_defs_regular and ic_defs_strip)
-    has_strip_cbar = bool(ic_defs_strip)
-    n_color_cols = int(has_middle_regular_cbar) + int(has_strip_cbar)
-    n_cols_grid = n_ic + n_color_cols
-    width_ratios = [1] * len(ic_defs_regular)
-    if has_middle_regular_cbar:
-        width_ratios.append(0.035)
-    width_ratios += [1] * len(ic_defs_strip)
-    if has_strip_cbar:
+    n_rows = 1 + n_heatmap_rows  # row 0 = averages, rows 1..N = heatmaps
+    height_ratios = [1] + [1.3] * n_heatmap_rows
+    has_heatmap_cbar = n_heatmap_rows > 0
+    n_cols_grid = n_ic + (1 if has_heatmap_cbar else 0)
+    width_ratios = [1] * n_ic
+    if has_heatmap_cbar:
         width_ratios.append(0.035)
 
-    plot_cols = list(range(len(ic_defs_regular)))
-    strip_start = len(ic_defs_regular) + (1 if has_middle_regular_cbar else 0)
-    plot_cols += list(range(strip_start, strip_start + len(ic_defs_strip)))
-    middle_cbar_col = len(ic_defs_regular) if has_middle_regular_cbar else None
-    strip_cbar_col = (n_cols_grid - 1) if has_strip_cbar else None
+    plot_cols = list(range(n_ic))
+    cbar_col = n_ic if has_heatmap_cbar else None
 
     fig, axes = plt.subplots(
         n_rows, n_cols_grid,
-        figsize=(6 * n_ic + 0.6, 4 + 4 * n_sessions),
+        figsize=(6 * n_ic + 0.6, 4 + 4 * n_heatmap_rows),
         squeeze=False,
         gridspec_kw={"height_ratios": height_ratios, "width_ratios": width_ratios},
     )
 
     for row_idx in range(n_rows):
-        if middle_cbar_col is not None:
-            axes[row_idx, middle_cbar_col].set_visible(False)
-        if strip_cbar_col is not None:
-            axes[row_idx, strip_cbar_col].set_visible(False)
+        if cbar_col is not None:
+            axes[row_idx, cbar_col].set_visible(False)
 
     # --- Row 0: grand-average per session ---
     for (key, label), col in zip(ic_defs, plot_cols):
@@ -537,25 +479,27 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
             ax.plot(
                 t_axis, curve,
                 color=colors[si], linewidth=1.5,
-                label=sid,
             )
         ax.axvline(x=0.5, **REFLINE_KW)
         ax.axhline(y=100, color="gray", linestyle=":", linewidth=0.8, alpha=0.4)
         ax.axhline(y=0, color="gray", linestyle=":", linewidth=0.8, alpha=0.4)
+        ax.set_yscale("symlog", linthresh=SYMLOG_LINTHRESH)
+        ax.yaxis.set_major_formatter(FuncFormatter(_symlog_pct_tick))
+        ax.yaxis.set_minor_formatter(NullFormatter())
         ax.set_title(label)
         if col == 0:
-            ax.set_ylabel("Current (%)")
-        ax.set_ylim(-15, 115)
+            ax.set_ylabel(f"{ic_unit} (%)")
+        ax.set_ylim(-15, 110)
         ax.grid(**GRID_KW)
         ax.xaxis.set_major_locator(MultipleLocator(1))
 
-    # --- Fit decay and annotate Row 0 ---
+    # --- Fit decay and legend Row 0 ---
     fit_start = PRE_OFF_SLICES + 1  # index into curve; skip t=0 transition
     t_offset = -PRE_OFF_SLICES  # t_axis[0] value
 
     for (key, label), col in zip(ic_defs, plot_cols):
         ax = axes[0, col]
-        annotations: list[str] = []
+        fit_legend_entries: list[tuple[str, str]] = []
 
         for si, sid in enumerate(loaded_ids):
             curve = session_results[sid]["avg"][key]
@@ -566,157 +510,95 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
                 continue
 
             plot_t = fit["fit_t"] + t_offset
+            line_color = trend_line_color(colors[si])
             ax.plot(
                 plot_t, fit["fit_y"],
-                color=colors[si], linewidth=1.2, linestyle="--", alpha=0.85,
+                color=line_color, alpha=0.85, **FIT_LINE_KW,
+            )
+            prefix = trend_session_prefix(sid, n_sessions=len(loaded_ids))
+            fit_legend_entries.append(
+                (_format_decay_fit_label(fit, prefix=prefix), line_color),
             )
 
-            if fit["model"] == "single":
-                tau_str = f"\u03C4 = {fit['tau']:.2f} ms"
-                bw_str = f"f_3dB = {fit['f_3dB']:.0f} Hz"
-            else:
-                tau_str = (
-                    f"\u03C4\u2081 = {fit['tau1']:.2f} ms  "
-                    f"\u03C4\u2082 = {fit['tau2']:.2f} ms"
-                )
-                bw_str = (
-                    f"f_3dB = {fit['f_3dB_fast']:.0f} / "
-                    f"{fit['f_3dB_slow']:.0f} Hz"
-                )
-
-            pe_taus = _fit_per_energy_taus(
-                session_results[sid]["per_energy"], key, fit_start,
-            )
-            if pe_taus:
-                spread = (
-                    f"Per-energy \u03C4: {np.mean(pe_taus):.2f} "
-                    f"\u00B1 {np.std(pe_taus):.2f} ms  "
-                    f"(n={len(pe_taus)})"
-                )
-            else:
-                spread = ""
-
-            prefix = f"{sid}: " if len(loaded_ids) > 1 else ""
-            line = f"{prefix}{tau_str}   {bw_str}   R\u00B2={fit['r_squared']:.3f}"
-            if spread:
-                line += f"\n{' ' * len(prefix)}{spread}"
-            annotations.append(line)
-
-        if annotations:
-            ax.text(
-                0.97, 0.55, "\n".join(annotations),
-                transform=ax.transAxes, fontsize=7,
-                va="top", ha="right",
-                bbox=dict(facecolor="white", alpha=0.8, edgecolor="none", pad=2),
+        if fit_legend_entries:
+            make_trend_legend(
+                ax, fit_legend_entries, fontsize=7,
+                line_kw=FIT_LINE_KW,
             )
 
-    axes[0, 0].legend(loc="upper right", fontsize=8)
-
-    # --- Rows 1..N: one heatmap row per session (ramp-down only: t >= 1) ---
-    heatmap_cmap = "turbo"
-    ramp_start = PRE_OFF_SLICES + 1
-    ramp_t = t_axis[ramp_start:]
-    ramp_len = len(ramp_t)
-
-    regular_keys = {k for k, _ in ic_defs_regular}
-    strip_keys = {k for k, _ in ic_defs_strip}
-
-    heatmap_vals_regular: list[float] = []
-    heatmap_vals_strip: list[float] = []
-    for r in session_results.values():
-        for pe_data in r["per_energy"].values():
-            for key, _ in ic_defs:
-                c = pe_data[key]
-                if c is not None:
-                    ramp = c[ramp_start:]
-                    vals = ramp[np.isfinite(ramp)]
-                    if key in strip_keys:
-                        heatmap_vals_strip.extend(vals)
-                    else:
-                        heatmap_vals_regular.extend(vals)
-    heat_vmin_regular = 0.0
-    heat_vmax_regular = (
-        float(np.max(heatmap_vals_regular))
-        if heatmap_vals_regular else 100.0
-    )
-    heat_vmin_strip = 0.0
-    heat_vmax_strip = (
-        float(np.max(heatmap_vals_strip))
-        if heatmap_vals_strip else 100.0
-    )
-
-    for si, sid in enumerate(loaded_ids):
-        row = 1 + si
-        pe = session_results[sid]["per_energy"]
-        energies = sorted(pe.keys())
-
-        _UPSAMPLE_X = 8
-        x_orig = np.arange(ramp_len, dtype=float)
-        x_fine = np.linspace(0, ramp_len - 1, ramp_len * _UPSAMPLE_X)
-
-        for (key, label), col in zip(ic_defs, plot_cols):
-            ax = axes[row, col]
-            img = np.full((len(energies), ramp_len), np.nan)
-            for ei, e in enumerate(energies):
-                c = pe[e][key]
-                if c is not None:
-                    img[ei, :] = c[ramp_start:]
-
-            img_smooth = np.full((len(energies), len(x_fine)), np.nan)
-            for ri in range(len(energies)):
-                if np.any(np.isfinite(img[ri])):
-                    img_smooth[ri] = np.interp(x_fine, x_orig, img[ri])
-
-            extent = [ramp_t[0] - 0.5, ramp_t[-1] + 0.5,
-                      energies[0], energies[-1]]
-            ax.imshow(
-                img_smooth, aspect="auto", origin="lower",
-                extent=extent, cmap=heatmap_cmap,
-                vmin=(heat_vmin_strip if key in strip_keys else heat_vmin_regular),
-                vmax=(heat_vmax_strip if key in strip_keys else heat_vmax_regular),
-                interpolation="nearest",
-            )
-            if col == 0:
-                ax.set_ylabel(f"{sid}\nEnergy (MeV)", fontsize=8)
-            if row == n_rows - 1:
-                ax.set_xlabel("Time after beam-off (ms)")
-            ax.xaxis.set_major_locator(MultipleLocator(1))
-
+    # --- Rows 1..N: one heatmap row per multi-energy session (ramp-down only: t >= 1) ---
     cbar_axes: list = []
+    if n_heatmap_rows:
+        heatmap_cmap = "turbo"
+        ramp_start = PRE_OFF_SLICES + 1
+        ramp_t = t_axis[ramp_start:]
+        ramp_len = len(ramp_t)
 
-    if regular_keys and middle_cbar_col is not None:
-        cbar_ax_regular = fig.add_subplot(
-            axes[1, middle_cbar_col].get_gridspec()[1:, middle_cbar_col],
-        )
-        cbar_ax_regular.set_visible(True)
-        cbar_regular = fig.colorbar(
-            plt.cm.ScalarMappable(
-                cmap=heatmap_cmap,
-                norm=mcolors.Normalize(heat_vmin_regular, heat_vmax_regular),
-            ),
-            cax=cbar_ax_regular,
-        )
-        cbar_regular.set_label("Current (%)")
-        cbar_axes.append(cbar_ax_regular)
+        heatmap_vals: list[float] = []
+        for sid in heatmap_session_ids:
+            for pe_data in session_results[sid]["per_energy"].values():
+                for key, _ in ic_defs:
+                    c = pe_data[key]
+                    if c is not None:
+                        ramp = c[ramp_start:]
+                        heatmap_vals.extend(ramp[np.isfinite(ramp)])
+        heat_vmin = 0.0
+        heat_vmax = float(np.max(heatmap_vals)) if heatmap_vals else 100.0
 
-    if strip_keys and strip_cbar_col is not None:
-        cbar_ax_strip = fig.add_subplot(
-            axes[1, strip_cbar_col].get_gridspec()[1:, strip_cbar_col],
-        )
-        cbar_ax_strip.set_visible(True)
-        cbar_strip = fig.colorbar(
-            plt.cm.ScalarMappable(
-                cmap=heatmap_cmap,
-                norm=mcolors.Normalize(heat_vmin_strip, heat_vmax_strip),
-            ),
-            cax=cbar_ax_strip,
-        )
-        cbar_strip.set_label("Strip Current (%)")
-        cbar_axes.append(cbar_ax_strip)
+        for si, sid in enumerate(heatmap_session_ids):
+            row = 1 + si
+            pe = session_results[sid]["per_energy"]
+            energies = sorted(pe.keys())
+
+            _UPSAMPLE_X = 8
+            x_orig = np.arange(ramp_len, dtype=float)
+            x_fine = np.linspace(0, ramp_len - 1, ramp_len * _UPSAMPLE_X)
+
+            for (key, label), col in zip(ic_defs, plot_cols):
+                ax = axes[row, col]
+                img = np.full((len(energies), ramp_len), np.nan)
+                for ei, e in enumerate(energies):
+                    c = pe[e][key]
+                    if c is not None:
+                        img[ei, :] = c[ramp_start:]
+
+                img_smooth = np.full((len(energies), len(x_fine)), np.nan)
+                for ri in range(len(energies)):
+                    if np.any(np.isfinite(img[ri])):
+                        img_smooth[ri] = np.interp(x_fine, x_orig, img[ri])
+
+                y_lo, y_hi = _heatmap_energy_extent(energies)
+                extent = [ramp_t[0] - 0.5, ramp_t[-1] + 0.5, y_lo, y_hi]
+                ax.imshow(
+                    img_smooth, aspect="auto", origin="lower",
+                    extent=extent, cmap=heatmap_cmap,
+                    vmin=heat_vmin, vmax=heat_vmax,
+                    interpolation="nearest",
+                )
+                if col == 0:
+                    ax.set_ylabel(f"{sid}\nEnergy (MeV)", fontsize=8)
+                if row == n_rows - 1:
+                    ax.set_xlabel("Time after beam-off (ms)")
+                ax.xaxis.set_major_locator(MultipleLocator(1))
+
+        if cbar_col is not None:
+            cbar_ax = fig.add_subplot(
+                axes[1, cbar_col].get_gridspec()[1:, cbar_col],
+            )
+            cbar_ax.set_visible(True)
+            cbar = fig.colorbar(
+                plt.cm.ScalarMappable(
+                    cmap=heatmap_cmap,
+                    norm=mcolors.Normalize(heat_vmin, heat_vmax),
+                ),
+                cax=cbar_ax,
+            )
+            cbar.set_label(f"{ic_unit} (%)")
+            cbar_axes.append(cbar_ax)
 
     finish_view(
         fig,
-        "Beam-Off Ramp-Down Curves  (normalised to beam-on)",
+        f"Beam-Off Ramp-Down Curves  ({ic_unit}, normalised to beam-on)",
         loaded_ids,
         colors,
         base_dir=base_dir,

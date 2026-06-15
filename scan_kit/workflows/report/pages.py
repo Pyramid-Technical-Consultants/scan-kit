@@ -16,7 +16,7 @@ from . import GITHUB_URL
 from .types import ViewRenderResult
 
 _LANDSCAPE_FIGSIZE = (16.0, 9.0)
-_DPI = 100
+_DPI = 300
 
 _INK = "#1B2838"
 _BODY = "#2D3748"

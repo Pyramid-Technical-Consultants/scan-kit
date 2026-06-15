@@ -303,6 +303,29 @@ def _header_layout_rect(fig) -> list[float] | None:
     return getattr(fig, "_scan_kit_header_rect", None)
 
 
+def _gridspec_layout_is_manual(fig) -> bool:
+    """True when subplot positions were set explicitly on the figure GridSpec."""
+    seen: set[int] = set()
+    for ax in fig.get_axes():
+        spec = ax.get_subplotspec()
+        if spec is None:
+            continue
+        gs = spec.get_gridspec()
+        gs_id = id(gs)
+        if gs_id in seen:
+            continue
+        seen.add(gs_id)
+        if gs.locally_modified_subplot_params():
+            return True
+    return False
+
+
+def _refresh_view_header_only(fig) -> None:
+    """Reposition the view header without changing subplot layout."""
+    fig.draw_without_rendering()
+    refresh_view_header_rect(fig, renderer=fig.canvas.get_renderer())
+
+
 def format_session_legend_label(session_id: str, notes: dict[str, str] | None = None) -> str:
     """Build a session legend label, appending the note when present."""
     note = (notes or {}).get(session_id, "").strip()
@@ -443,6 +466,10 @@ def apply_tight_layout(fig=None, *, pad=TIGHT_LAYOUT_PAD, h_pad=None, w_pad=None
     shown at its final size).
     """
     fig = fig if fig is not None else plt.gcf()
+    if _gridspec_layout_is_manual(fig):
+        if measure:
+            _refresh_view_header_only(fig)
+        return
     if rect is None:
         if measure:
             fig.draw_without_rendering()
@@ -509,9 +536,25 @@ def finish_view(
         plt.show()
 
 
+def relayout_view_for_pdf_export(
+    fig,
+    *,
+    dpi: int,
+    page_inches: tuple[float, float],
+) -> None:
+    """Re-measure headers and tight layout after resizing for PDF export."""
+    fig.set_size_inches(*page_inches, forward=True)
+    fig.set_dpi(dpi)
+    apply_toolbar_tight_layout(fig)
+
+
 def apply_toolbar_tight_layout(fig=None) -> None:
     """Re-run tight layout, reserving measured space for the view header."""
     fig = fig if fig is not None else plt.gcf()
+    if _gridspec_layout_is_manual(fig):
+        _refresh_view_header_only(fig)
+        fig.canvas.draw_idle()
+        return
     fig.draw_without_rendering()
     renderer = fig.canvas.get_renderer()
     rect = refresh_view_header_rect(fig, renderer=renderer)
@@ -674,7 +717,9 @@ def trend_line_color(face_color):
     return tuple(max(0.0, c * TREND_DARKEN) for c in rgb)
 
 
-def make_trend_legend(ax, trend_entries, *, loc="upper right", fontsize=9, **kwargs):
+def make_trend_legend(
+    ax, trend_entries, *, loc="upper right", fontsize=9, line_kw=None, **kwargs,
+):
     """Add a line-style legend for trend fits on *ax*.
 
     Uses ``add_artist`` so the legend coexists with other legends on the same
@@ -687,6 +732,8 @@ def make_trend_legend(ax, trend_entries, *, loc="upper right", fontsize=9, **kwa
             :func:`add_correlation_scatter`.
         loc: Legend location. Default ``"upper right"``.
         fontsize: Legend font size.
+        line_kw: Line style dict for legend handles. Defaults to
+            :data:`TREND_LINE_KW`.
         **kwargs: Forwarded to ``ax.legend()``.
 
     Returns:
@@ -694,8 +741,9 @@ def make_trend_legend(ax, trend_entries, *, loc="upper right", fontsize=9, **kwa
     """
     if not trend_entries:
         return None
+    style = TREND_LINE_KW if line_kw is None else line_kw
     handles = [
-        Line2D([0], [0], color=color, label=text, **TREND_LINE_KW)
+        Line2D([0], [0], color=color, label=text, **style)
         for text, color in trend_entries
     ]
     defaults = dict(loc=loc, fontsize=fontsize, framealpha=0.9)

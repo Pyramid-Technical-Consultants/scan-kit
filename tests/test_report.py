@@ -16,7 +16,7 @@ from scan_kit.workflows.report import (
     report_view_groups,
     reportable_module_names,
 )
-from scan_kit.workflows.report.builder import build_report_pdf
+from scan_kit.workflows.report.builder import _OUTPUT_DPI, build_report_pdf
 from scan_kit.workflows.report.naming import (
     suggest_report_filename,
     suggest_report_title,
@@ -200,6 +200,31 @@ def test_report_view_groups_excludes_non_static_modules() -> None:
     assert "dose_ratios_energy" in reportable_modules
 
 
+def test_report_view_pages_use_vector_pdf(tmp_path: Path) -> None:
+    session_id = _first_session_id()
+    if session_id is None:
+        pytest.skip("test_data session folder not available")
+
+    output_path = tmp_path / "vector-view-report.pdf"
+    config = ReportConfig(
+        title="Vector Test",
+        subtitle=f"Sessions: {session_id}",
+        author="pytest",
+        organization="",
+        output_path=output_path,
+        session_ids=[session_id],
+        base_dir=str(_TEST_DATA),
+        settings=ViewSettings(),
+        views=[_view("dose_ratios_energy")],
+        generated_at=datetime(2026, 6, 5, 12, 0, 0),
+    )
+
+    build_report_pdf(config)
+    data = output_path.read_bytes()
+    assert b"/Subtype /Image" not in data
+    assert _OUTPUT_DPI == 300
+
+
 def test_build_report_pdf_smoke(tmp_path: Path) -> None:
     session_id = _first_session_id()
     if session_id is None:
@@ -253,6 +278,21 @@ def test_capture_view_figure_collects_figure_without_show(tmp_path: Path) -> Non
     )
     assert skip is None
     assert fig is not None
+    plt.close(fig)
+
+
+def test_relayout_view_for_pdf_export_refreshes_header(tmp_path: Path) -> None:
+    import matplotlib.pyplot as plt
+
+    from scan_kit.common.plotting import relayout_view_for_pdf_export, set_view_header
+
+    fig, ax = plt.subplots(figsize=(9, 5))
+    ax.plot([0, 1], [0, 1])
+    set_view_header(fig, "Header Test", ["s1"], ["#1f77b4"])
+    relayout_view_for_pdf_export(fig, dpi=300, page_inches=(16.0, 9.0))
+    assert getattr(fig, "_scan_kit_header_rect", None) is not None
+    assert fig.get_figwidth() == 16.0
+    assert fig.get_figheight() == 9.0
     plt.close(fig)
 
 

@@ -10,9 +10,6 @@ import numpy as np
 
 from ..common import (
     C_BEAM_CURRENT,
-    C_IC1_SCAN_TOTAL_DOSE,
-    C_IC2_SCAN_TOTAL_DOSE,
-    C_IC3_SCAN_TOTAL_DOSE,
     C_IC1_X_POS_RAW,
     C_IC1_Y_POS_RAW,
     C_IC2_X_POS_RAW,
@@ -25,11 +22,12 @@ from ..common.schema import POSITION_KEY_G2_RAW, POSITION_KEY_G3_RAW
 from ..common import transform
 from .beam_off_rampdown import detect_beam_off_edges
 from .timeslice_replay_common import (
-    MS_PER_SLICE,
     build_digital_signals,
+    derive_current_from_dose,
     detect_digital_columns,
     load_energy_by_layer,
     resolve_col,
+    resolve_ic_scan_total_dose_columns,
 )
 from .timeslice_replay_ui import (
     ScatterSpec,
@@ -37,20 +35,6 @@ from .timeslice_replay_ui import (
     TraceSpec,
     launch_timeslice_replay,
 )
-
-
-def _derive_current_from_dose(dose: np.ndarray) -> np.ndarray:
-    """Per-slice derivative of a monotonically-accumulating dose column."""
-    if len(dose) == 0:
-        return np.empty(0, dtype=float)
-    arr = np.asarray(dose, dtype=float)
-    deriv = np.empty_like(arr)
-    deriv[0] = 0.0
-    if len(arr) > 1:
-        deriv[1:] = (arr[1:] - arr[:-1]) / MS_PER_SLICE
-    deriv[~np.isfinite(deriv)] = 0.0
-    deriv[deriv < 0] = 0.0
-    return deriv
 
 
 def _load_session_timeline(session_id: str, base_dir: str) -> dict | None:
@@ -66,12 +50,13 @@ def _load_session_timeline(session_id: str, base_dir: str) -> dict | None:
 
     df0 = frames[0]
     ts_layer = resolve_col(df0.columns, C_LAYER_ID)
-    ts_dose1 = resolve_col(df0.columns, C_IC1_SCAN_TOTAL_DOSE)
-    ts_dose2 = resolve_col(df0.columns, C_IC2_SCAN_TOTAL_DOSE)
+    dose_cols = resolve_ic_scan_total_dose_columns(df0.columns)
+    ts_dose1 = dose_cols["ic1"]
+    ts_dose2 = dose_cols["ic2"]
     if not all([ts_layer, ts_dose1, ts_dose2]):
         return None
 
-    ts_dose3 = resolve_col(df0.columns, C_IC3_SCAN_TOTAL_DOSE)
+    ts_dose3 = dose_cols["ic3"]
     has_ic3 = ts_dose3 is not None
 
     ts_beam = resolve_col(df0.columns, C_BEAM_CURRENT)
@@ -108,8 +93,8 @@ def _load_session_timeline(session_id: str, base_dir: str) -> dict | None:
         layer_id = df[ts_layer].iloc[0]
         energy = energy_by_layer.get(layer_id, 0.0)
 
-        ic1_vals = _derive_current_from_dose(df[ts_dose1].values.astype(float))
-        ic2_vals = _derive_current_from_dose(df[ts_dose2].values.astype(float))
+        ic1_vals = derive_current_from_dose(df[ts_dose1].values.astype(float))
+        ic2_vals = derive_current_from_dose(df[ts_dose2].values.astype(float))
         ic1_parts.append(ic1_vals)
         ic2_parts.append(ic2_vals)
 
@@ -118,7 +103,7 @@ def _load_session_timeline(session_id: str, base_dir: str) -> dict | None:
             edge_indices[key].extend((edges + offset).tolist())
 
         if has_ic3:
-            ic3_vals = _derive_current_from_dose(df[ts_dose3].values.astype(float))
+            ic3_vals = derive_current_from_dose(df[ts_dose3].values.astype(float))
             ic3_parts.append(ic3_vals)
             edges = detect_beam_off_edges(ic3_vals)
             edge_indices["ic3"].extend((edges + offset).tolist())
