@@ -7,6 +7,7 @@ from scan_kit.views import VIEW_GROUPS, ViewEntry, view_module_name
 REPORT_EXCLUDED_MODULES: frozenset[str] = frozenset({
     "ic_timeslice_replay",
     "ic_timeslice_replay_derived",
+    "sigma_timeslice_replay",
     "field_timeslice_replay",
     "session_log_compare",
     "ic_audio_export",

@@ -198,6 +198,11 @@ VIEW_GROUPS: list[tuple[str, list[ViewEntry]]] = [
                 "ic_timeslice_replay_derived",
                 "Interactive viewer for IC current derived from scan-total dose rate.",
             ),
+            (
+                "Sigma Timeslice Replay",
+                "sigma_timeslice_replay",
+                "Interactive viewer for IC1/IC2 spot size (σx/σy) over the full timeslice timeline.",
+            ),
         ],
     ),
     (

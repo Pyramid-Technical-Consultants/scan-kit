@@ -71,6 +71,7 @@ hiddenimports = [
     "scan_kit.views.beam_on_off_current",
     "scan_kit.views.ic_timeslice_replay",
     "scan_kit.views.ic_timeslice_replay_derived",
+    "scan_kit.views.sigma_timeslice_replay",
     "scan_kit.views.field_timeslice_replay",
     "scan_kit.views.amplifier_correlation",
     "scan_kit.views.timeslice_replay_common",
