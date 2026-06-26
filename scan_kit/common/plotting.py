@@ -1,6 +1,7 @@
 """Plotting utilities for scan-kit analysis scripts."""
 
 from dataclasses import dataclass
+import warnings
 
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
@@ -11,6 +12,11 @@ from matplotlib.widgets import SpanSelector
 import numpy as np
 import pandas as pd
 from scipy import stats
+
+try:
+    from numpy.exceptions import RankWarning as _RankWarning
+except ImportError:  # NumPy < 2.0
+    _RankWarning = np.RankWarning  # type: ignore[attr-defined]
 
 from .plot_colors import DEFAULT_SESSION_COLORS
 from .session_notes import load_notes
@@ -698,6 +704,29 @@ def scatter_with_trend(
 # ---------------------------------------------------------------------------
 
 _MAD_SCALE = 1.4826  # median(|x - m|) * factor matches std for a normal dist
+
+
+def _linear_fit_slope_intercept(x, y) -> tuple[float, float] | None:
+    """Least-squares line fit, returning ``None`` when ill-conditioned."""
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    if x.size < 2:
+        return None
+    if float(np.ptp(x)) == 0.0:
+        if float(np.ptp(y)) == 0.0:
+            return 0.0, float(y[0])
+        return None
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", _RankWarning)
+            slope, intercept = np.polyfit(x, y, 1)
+    except np.linalg.LinAlgError:
+        basis = np.vstack([x, np.ones_like(x)]).T
+        coef, *_ = np.linalg.lstsq(basis, y, rcond=None)
+        slope, intercept = float(coef[0]), float(coef[1])
+    if not np.isfinite(slope) or not np.isfinite(intercept):
+        return None
+    return float(slope), float(intercept)
 TREND_DARKEN = 0.55  # multiply a face color by this for its trend-line color
 
 TREND_LINE_KW = dict(linewidth=2.0, linestyle="-", solid_capstyle="round")
@@ -805,7 +834,10 @@ def fit_trend(x, y, *, robust=False, outlier_sigma=2.0, outlier_iterations=3):
         for _ in range(outlier_iterations):
             if keep.sum() < 3:
                 break
-            s, b = np.polyfit(xf[keep], yf[keep], 1)
+            fit = _linear_fit_slope_intercept(xf[keep], yf[keep])
+            if fit is None:
+                break
+            s, b = fit
             resid = yf - (s * xf + b)
             med = np.median(resid[keep])
             sigma = np.median(np.abs(resid[keep] - med)) * _MAD_SCALE
@@ -813,7 +845,10 @@ def fit_trend(x, y, *, robust=False, outlier_sigma=2.0, outlier_iterations=3):
                 break
             keep = np.abs(resid - med) <= outlier_sigma * sigma
 
-    slope, intercept = np.polyfit(xf[keep], yf[keep], 1)
+    fit = _linear_fit_slope_intercept(xf[keep], yf[keep])
+    if fit is None:
+        return None
+    slope, intercept = fit
     fitted = slope * xf[keep] + intercept
     ss_res = float(np.sum((yf[keep] - fitted) ** 2))
     ss_tot = float(np.sum((yf[keep] - yf[keep].mean()) ** 2))

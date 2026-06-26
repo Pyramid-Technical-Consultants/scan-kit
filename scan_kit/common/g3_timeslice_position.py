@@ -254,6 +254,14 @@ def build_g3_iso_plan_lookup(input_map: pd.DataFrame) -> G3IsoPlanLookup | None:
     )
 
 
+def _first_column_numeric(df: pd.DataFrame, col_name: str) -> pd.Series:
+    """Return one numeric series even when *col_name* is duplicated in *df*."""
+    data = df[col_name]
+    if isinstance(data, pd.DataFrame):
+        data = data.iloc[:, 0]
+    return pd.to_numeric(data, errors="coerce")
+
+
 def aggregate_g3_device_targets(
     frames: list[pd.DataFrame],
     cols: G3PositionTargetColumns,
@@ -265,27 +273,21 @@ def aggregate_g3_device_targets(
         return None
 
     pick = [
-        spot_col,
-        layer_col,
-        cols.ic1_x_target,
-        cols.ic1_y_target,
-        cols.ic2_x_target,
-        cols.ic2_y_target,
+        ("spot_no", spot_col),
+        ("layer_id", layer_col),
+        ("ic1_x_target", cols.ic1_x_target),
+        ("ic1_y_target", cols.ic1_y_target),
+        ("ic2_x_target", cols.ic2_x_target),
+        ("ic2_y_target", cols.ic2_y_target),
     ]
     parts: list[pd.DataFrame] = []
     for df in frames:
-        missing = [c for c in pick if c not in df.columns]
+        missing = [name for _, name in pick if name not in df.columns]
         if missing:
             continue
-        sub = df[pick].apply(pd.to_numeric, errors="coerce")
-        sub.columns = [
-            "spot_no",
-            "layer_id",
-            "ic1_x_target",
-            "ic1_y_target",
-            "ic2_x_target",
-            "ic2_y_target",
-        ]
+        sub = pd.DataFrame(
+            {label: _first_column_numeric(df, name) for label, name in pick}
+        )
         parts.append(sub)
     if not parts:
         return None

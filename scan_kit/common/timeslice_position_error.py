@@ -74,6 +74,28 @@ _G2_IC1_Y_SPOT_ALIASES = ("r_ic1_y_spot", "r_ic1_y")
 _G2_IC2_X_SPOT_ALIASES = ("r_ic2_x_spot", "r_ic2_x")
 _G2_IC2_Y_SPOT_ALIASES = ("r_ic2_y_spot", "r_ic2_y")
 
+# G3 fitted strip positions (and older spot_position_ok aliases) needed when
+# loading a column subset — without these, resolve_g3_position_target_columns
+# fails even though full timeslice frames would resolve.
+_G3_POSITION_TARGET_COLS = (
+    "r_ic1_x_position",
+    "r_ic1_x_spot_position",
+    "ic1_position_x_target",
+    "r_ic1_y_position",
+    "r_ic1_y_spot_position",
+    "ic1_position_y_target",
+    "r_ic2_x_position",
+    "r_ic2_x_spot_position",
+    "ic2_position_x_target",
+    "r_ic2_y_position",
+    "r_ic2_y_spot_position",
+    "ic2_position_y_target",
+    "r_ic1_x_spot_position_ok",
+    "r_ic1_y_spot_position_ok",
+    "r_ic2_x_spot_position_ok",
+    "r_ic2_y_spot_position_ok",
+)
+
 TIMESLICE_POSITION_ERROR_COLS = [
     C_LAYER_ID,
     C_SPOT_NO,
@@ -105,14 +127,7 @@ TIMESLICE_POSITION_ERROR_COLS = [
         )
         for name in aliases
     ),
-    "r_ic1_x_position",
-    "ic1_position_x_target",
-    "r_ic1_y_position",
-    "ic1_position_y_target",
-    "r_ic2_x_position",
-    "ic2_position_x_target",
-    "r_ic2_y_position",
-    "ic2_position_y_target",
+    *_G3_POSITION_TARGET_COLS,
     *_G3_QUALITY_COLS,
 ]
 

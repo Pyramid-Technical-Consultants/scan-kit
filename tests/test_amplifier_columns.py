@@ -76,3 +76,20 @@ def test_timeslice_amplifier_field_cols_cover_g2_and_g3_device_units() -> None:
     assert "amplifier_x_target" in TIMESLICE_AMPLIFIER_FIELD_COLS
     assert "r_xI" in TIMESLICE_AMPLIFIER_FIELD_COLS
     assert "amplifier_x_readback" in TIMESLICE_AMPLIFIER_FIELD_COLS
+    assert "r_xV" in TIMESLICE_AMPLIFIER_FIELD_COLS
+    assert "r_xB" in TIMESLICE_AMPLIFIER_FIELD_COLS
+
+
+def test_older_g3_tx2_column_aliases() -> None:
+    cols = pd.read_csv(
+        TEST_DATA / "1262268206" / "1262268206" / "layer-0" / "run-0"
+        / "timeslice_data_device_units.csv",
+        nrows=0,
+    ).columns
+    assert resolve_concept_column(cols, C_AMPLIFIER_CMD_X) == "c_x"
+    assert resolve_concept_column(cols, C_AMPLIFIER_READBACK_X) == "r_xV"
+    assert resolve_concept_column(cols, C_AMPLIFIER_READBACK_Y) == "r_yV"
+    from scan_kit.common.schema import C_MAG_FIELD_X, C_MAG_FIELD_Y
+
+    assert resolve_concept_column(cols, C_MAG_FIELD_X) == "r_xB"
+    assert resolve_concept_column(cols, C_MAG_FIELD_Y) == "r_yB"

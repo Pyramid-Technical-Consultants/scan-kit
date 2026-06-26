@@ -30,6 +30,16 @@ def test_load_g2_amplifier_correlation_samples() -> None:
     assert np.isfinite(samples.angle_x_mrad).any()
 
 
+def test_load_older_g3_amplifier_correlation_samples() -> None:
+    """Older G3 exports use r_xV/r_xB and r_ic*_spot_position column names."""
+    samples = _load_session_samples("1262268206", str(TEST_DATA))
+    assert samples is not None
+    assert samples.cmd_x.size > 0
+    assert np.isfinite(samples.readback_y).any()
+    assert np.isfinite(samples.field_x).any()
+    assert np.isfinite(samples.angle_x_mrad).any()
+
+
 def test_g2_readback_linear_fit_is_near_unity() -> None:
     from scan_kit.views.amplifier_correlation import _linear_residuals
 
@@ -78,6 +88,59 @@ def test_cubic_fit_recovers_curved_angle_field_relationship() -> None:
     assert cub.c3 < 0.0
 
 
+def test_energy_mev_momentum_roundtrip() -> None:
+    from scan_kit.views.amplifier_correlation import (
+        _energy_mev_from_momentum,
+        _momentum_mev,
+    )
+
+    energies = np.array([250.0, 400.0, 600.0])
+    recovered = _energy_mev_from_momentum(_momentum_mev(energies))
+    np.testing.assert_allclose(recovered, energies, rtol=1e-9)
+
+
+def test_rigidity_correction_flattens_residual_energy_slope() -> None:
+    from scan_kit.views.amplifier_correlation import (
+        _REFERENCE_MOMENTUM_MEV,
+        _cmd_arc_fit,
+        _momentum_mev,
+        _residual_energy_slope,
+    )
+
+    cmd = np.linspace(-3.0, 3.0, 1200)
+    energies = np.repeat([300.0, 500.0, 700.0], 400)
+    momentum = _momentum_mev(energies)
+    eccmd = cmd * _REFERENCE_MOMENTUM_MEV / momentum
+    angle = np.arcsin(0.05 * eccmd / 1000.0) * 1000.0
+
+    raw_fit = _cmd_arc_fit(cmd, angle)
+    ec_fit = _cmd_arc_fit(eccmd, angle)
+    assert raw_fit is not None and ec_fit is not None
+
+    raw_slope = _residual_energy_slope(
+        energies, angle - raw_fit.predict(cmd)
+    )
+    ec_slope = _residual_energy_slope(
+        energies, angle - ec_fit.predict(eccmd)
+    )
+    assert raw_slope is not None and ec_slope is not None
+    assert abs(raw_slope) > 5 * abs(ec_slope)
+    assert abs(ec_slope) < 0.01
+
+
+def test_cmd_arc_fit_recovers_linear_sin_theta_gain() -> None:
+    from scan_kit.views.amplifier_correlation import _cmd_arc_fit
+
+    cmd = np.linspace(-3.0, 3.0, 500)
+    angle = np.arcsin(0.05 * cmd) * 1000.0
+    fit = _cmd_arc_fit(cmd, angle)
+    assert fit is not None
+    assert abs(fit.c1 - 50.0) < 1.0
+    assert abs(fit.c0) < 0.5
+    med = float(np.median(np.abs(fit.residual[np.isfinite(fit.residual)])))
+    assert med < 0.05
+
+
 def test_pooled_super_fit_produces_combined_entries() -> None:
     from scan_kit.views.amplifier_correlation import (
         AmplifierCorrelationSamples,
@@ -108,14 +171,33 @@ def test_pooled_super_fit_produces_combined_entries() -> None:
     rb_fit = pooled.readback_fit()
     field_fit = pooled.field_fit()
     angle_fit = pooled.angle_fit()
+    cmd_arc_fit = pooled.cmd_arc_fit()
     assert rb_fit is not None and field_fit is not None and angle_fit is not None
+    assert cmd_arc_fit is not None
 
     # Pooled cmd→readback gain ~1, field gain order kG/V, cubic recovered.
     assert abs(rb_fit.slope - 1.0) < 0.1
     assert angle_fit.c3 < 0.0
+    assert cmd_arc_fit.c1 > 0.0
     label = _format_angle_fit_label(angle_fit, prefix="All: ")
     assert label.startswith("All: ")
     assert "cubic" in label and "mrad/kG" in label and "\u00b5rad/kG" in label
+
+
+def test_readback_fit_handles_constant_cmd_and_readback() -> None:
+    """G3 sessions can hold the beam at fixed amplifier setpoints."""
+    from scan_kit.views.amplifier_correlation import _PooledRow
+
+    samples = _load_session_samples("845596095", str(TEST_DATA))
+    if samples is None:
+        return
+
+    pooled = _PooledRow()
+    pooled.add(samples, "cmd_x", "readback_x", "field_x", "angle_x_mrad")
+    fit = pooled.readback_fit()
+    assert fit is not None
+    assert fit.slope == 0.0
+    assert np.isfinite(fit.intercept)
 
 
 def test_energy_correction_reduces_g3_angle_residual() -> None:

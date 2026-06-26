@@ -89,6 +89,27 @@ def test_g3_iso_affine_is_exact_on_1943968267() -> None:
         assert float(np.std(resid)) < 1e-4, dev_col
 
 
+def test_aggregate_g3_device_targets_ignores_duplicate_column_labels() -> None:
+    src = _require_session(G3_ISO_SESSION)
+    if src is None:
+        return
+
+    frames = load_session_timeslice_device_units(
+        src, usecols=TIMESLICE_POSITION_ERROR_COLS
+    )
+    cols = resolve_g3_position_target_columns(frames[0].columns)
+    assert cols is not None
+
+    dup = frames[0].copy()
+    target = cols.ic1_x_target
+    dup = pd.concat([dup, dup[[target]]], axis=1)
+    assert dup.columns.duplicated().any()
+
+    device_targets = aggregate_g3_device_targets([dup, *frames[1:]], cols)
+    assert device_targets is not None
+    assert not device_targets.empty
+
+
 def test_g3_iso_context_builds_for_1943968267() -> None:
     src = _require_session(G3_ISO_SESSION)
     if src is None:

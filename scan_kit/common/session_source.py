@@ -118,10 +118,18 @@ def _read_csv_robust(
     df = canonicalize_dataframe_columns(df, aliases=alias_map)
     if usecols is None:
         return df
-    keep = [c for c in usecols if c in df.columns]
+    seen: set[str] = set()
+    keep: list[str] = []
+    for col in usecols:
+        if col in df.columns and col not in seen:
+            seen.add(col)
+            keep.append(col)
     if not keep:
         return df.iloc[:, 0:0]
-    return df[keep]
+    out = df[keep]
+    if out.columns.duplicated().any():
+        out = out.loc[:, ~out.columns.duplicated()]
+    return out
 
 
 def _resolve_timeslice_raw_usecols(

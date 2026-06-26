@@ -56,3 +56,4 @@ def test_cached_raw_usecols_loads_all_layers() -> None:
         assert "rci_in_trigger" in df.columns or "r_beamOk" in df.columns
         assert C_LAYER_ID in df.columns
         assert "_layer_idx" in df.columns
+        assert len(df.columns) == len(set(df.columns))

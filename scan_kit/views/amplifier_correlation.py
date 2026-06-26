@@ -80,6 +80,13 @@ def _momentum_mev(energy_mev: np.ndarray | float) -> np.ndarray:
     return np.sqrt(energy * energy + 2.0 * energy * _PROTON_REST_ENERGY_MEV)
 
 
+def _energy_mev_from_momentum(momentum_mev: np.ndarray) -> np.ndarray:
+    """Kinetic energy (MeV) from proton momentum (MeV/c)."""
+    p = np.asarray(momentum_mev, dtype=float)
+    m0 = _PROTON_REST_ENERGY_MEV
+    return np.sqrt(p * p + m0 * m0) - m0
+
+
 _REFERENCE_MOMENTUM_MEV = float(_momentum_mev(_REFERENCE_ENERGY_MEV))
 
 _AMPLIFIER_VIEW_USECOLS = list(
@@ -533,6 +540,50 @@ def _arc_fit(field: np.ndarray, angle_mrad: np.ndarray) -> _ArcFit | None:
     return _ArcFit(sin_fit, residual)
 
 
+@dataclass(frozen=True)
+class _LinearArcFit:
+    """Circular-arc model on energy-corrected command: ``θ = arcsin(c₀ + c₁·V)``.
+
+    Same straight-dipole geometry as :class:`_ArcFit`, but the drive is amplifier
+    command (volts) rather than a hall-probe field readout, and only the linear
+    ``sin θ`` term is kept — no cubic — so fringe-probe distortion of the field
+    axis cannot masquerade as beam nonlinearity.
+    """
+
+    c0: float
+    c1: float
+    residual: np.ndarray
+
+    def predict(self, x: np.ndarray) -> np.ndarray:
+        """Beam angle (mrad) for energy-corrected command *x* (V)."""
+        sin_theta = np.clip(
+            (self.c0 + self.c1 * np.asarray(x, dtype=float)) / 1000.0, -1.0, 1.0
+        )
+        return np.arcsin(sin_theta) * 1000.0
+
+
+def _cmd_arc_fit(ec_cmd: np.ndarray, angle_mrad: np.ndarray) -> _LinearArcFit | None:
+    """Circular-arc fit ``θ = arcsin(c₀ + c₁·V)`` on energy-corrected command."""
+    cmd_f = np.asarray(ec_cmd, dtype=float)
+    angle_f = np.asarray(angle_mrad, dtype=float)
+    sin_scaled = np.sin(angle_f / 1000.0) * 1000.0
+    finite = np.isfinite(cmd_f) & np.isfinite(sin_scaled)
+    if int(finite.sum()) < _MIN_CUBIC_FIT_SAMPLES:
+        return None
+    v = cmd_f[finite]
+    if float(np.ptp(v)) <= 0.0:
+        return None
+
+    basis = np.vstack([np.ones_like(v), v]).T
+    coef, *_ = np.linalg.lstsq(basis, sin_scaled[finite], rcond=None)
+    c0, c1 = float(coef[0]), float(coef[1])
+
+    residual = np.full(angle_f.shape, np.nan, dtype=float)
+    predicted = np.arcsin(np.clip((c0 + c1 * v) / 1000.0, -1.0, 1.0)) * 1000.0
+    residual[finite] = angle_f[finite] - predicted
+    return _LinearArcFit(c0, c1, residual)
+
+
 def _format_legend_number(
     value: float, *, sig_figs: int = 3, signed: bool = True
 ) -> str:
@@ -594,6 +645,14 @@ def _energy_corrected_field(
     return np.asarray(field, dtype=float) * scale
 
 
+def _energy_corrected_command(
+    cmd: np.ndarray,
+    momentum: np.ndarray,
+) -> np.ndarray:
+    """Amplifier command (V) normalised to the reference momentum."""
+    return _energy_corrected_field(cmd, momentum)
+
+
 # Energy-corrected field is reported in kilogauss (1 kG = 1000 G) so the gain
 # reads as mrad/kG; the much smaller cubic is reported in µrad/kG³.
 _GAUSS_PER_KILOGAUSS = 1.0e3
@@ -608,104 +667,23 @@ def _energy_corrected_field_kg(
     return _energy_corrected_field(field, momentum) / _GAUSS_PER_KILOGAUSS
 
 
-# Full deflection model shown on the angle panels: straight-dipole circular arc,
-# antisymmetric in field (only odd powers) plus a zero-field alignment offset.
-_ANGLE_MODEL_EQUATION = (
-    "\u03b8 = arcsin(gain\u00b7B + cubic\u00b7B\u00b3 + offset)\nstraight-dipole circular arc"
-)
-
-
-def _annotate_angle_model(ax) -> None:
-    """Annotate the beam-angle model equation in the lower-left of *ax*."""
-    ax.text(
-        0.03,
-        0.03,
-        _ANGLE_MODEL_EQUATION,
-        transform=ax.transAxes,
-        ha="left",
-        va="bottom",
-        fontsize=8,
-        zorder=8,
-        bbox=dict(
-            boxstyle="round", facecolor="white", alpha=0.8, edgecolor="0.7"
-        ),
+def _format_cmd_arc_fit_label(fit: "_LinearArcFit", *, prefix: str = "") -> str:
+    return (
+        f"{prefix}gain {_format_legend_number(fit.c1)} mrad/V   "
+        f"offset {_format_legend_number(fit.c0)} mrad"
     )
 
 
 def _format_angle_fit_label(fit: "_ArcFit", *, prefix: str = "") -> str:
     # Circular-arc model θ = arcsin(cubic(B)) fitted in the kilogauss domain:
     # gain (small-signal dθ/dB) reads as mrad/kG; the residual cubic is tiny, so
-    # report it in µrad/kG\u00b3.
+    # report it in µrad/kG³.
     cubic_microrad = fit.c3 * _CUBIC_MRAD_TO_MICRORAD
     return (
         f"{prefix}gain {_format_legend_number(fit.c1)} mrad/kG   "
         f"cubic {_format_legend_number(cubic_microrad)} \u00b5rad/kG\u00b3   "
         f"offset {_format_legend_number(fit.c0)} mrad"
     )
-
-
-def _format_alignment_label(align: "_AxisAlignment") -> str:
-    """Per-IC alignment offsets, their difference, and the fan convergence.
-
-    IC1/IC2 are the subtracted chamber offsets (mm); ``\u0394`` is the relative
-    IC-to-IC misalignment; ``converge`` is where the alignment-corrected
-    back-projected ray fan crosses the axis (≈ 0 mm sanity check).
-    """
-    conv = align.convergence
-    conv_txt = (
-        f"{_format_legend_number(conv.position_mm)} mm"
-        if conv.is_valid
-        else "n/a"
-    )
-    return (
-        f"   align IC1 {_format_legend_number(align.ic1_offset)} "
-        f"IC2 {_format_legend_number(align.ic2_offset)} "
-        f"(\u0394 {_format_legend_number(align.offset_difference)}) mm   "
-        f"converge {conv_txt}"
-    )
-
-
-def _plot_ecfield_angle(
-    ax,
-    samples: AmplifierCorrelationSamples,
-    field_key: str,
-    angle_key: str,
-    *,
-    color: str,
-    session_id: str,
-    n_sessions: int,
-    align: "_AxisAlignment | None" = None,
-    use_hexbin: bool = True,
-    draw_fit: bool = True,
-) -> tuple[str, tuple] | None:
-    """Beam deflection angle vs energy-corrected field (circular-arc model).
-
-    Companion to the residual panel.  When *draw_fit* is set the per-session
-    arc curve (θ = arcsin(cubic(B))) is drawn; otherwise only the scatter is
-    shown (e.g. when the pooled super-fit curve is overlaid instead).  *align*
-    appends the per-IC alignment offsets and fan-convergence sanity check to the
-    legend.
-    """
-    ecfield = _energy_corrected_field_kg(
-        getattr(samples, field_key), samples.momentum
-    )
-    angle = getattr(samples, angle_key)
-    x, _ = _finite_pair(ecfield, angle)
-    if x.size == 0:
-        return None
-    fit = _arc_fit(ecfield, angle)
-    if fit is None:
-        return None
-    _scatter_or_hexbin(ax, ecfield, angle, color=color, use_hexbin=use_hexbin)
-    line_color = trend_line_color(color)
-    if draw_fit:
-        xs = np.linspace(float(np.min(x)), float(np.max(x)), 200)
-        ax.plot(xs, fit.predict(xs), color=line_color, linewidth=1.2, zorder=6)
-    prefix = trend_session_prefix(session_id, n_sessions=n_sessions)
-    label = _format_angle_fit_label(fit, prefix=prefix)
-    if align is not None:
-        label = f"{label}\n{_format_alignment_label(align)}"
-    return label, line_color
 
 
 def _style_axis(ax, xlabel: str, ylabel: str, *, title: str | None = None) -> None:
@@ -724,7 +702,9 @@ class _PooledRow:
     readback: list[np.ndarray] = field(default_factory=list)
     drive: list[np.ndarray] = field(default_factory=list)
     field_g: list[np.ndarray] = field(default_factory=list)
+    field_kg: list[np.ndarray] = field(default_factory=list)
     ecfield: list[np.ndarray] = field(default_factory=list)
+    eccmd: list[np.ndarray] = field(default_factory=list)
     angle: list[np.ndarray] = field(default_factory=list)
 
     def add(
@@ -742,7 +722,9 @@ class _PooledRow:
         self.readback.append(rb)
         self.drive.append(rb if amplifier_readback_tracks_command_axis(cmd, rb) else cmd)
         self.field_g.append(field_g)
+        self.field_kg.append(np.asarray(field_g, dtype=float) / _GAUSS_PER_KILOGAUSS)
         self.ecfield.append(_energy_corrected_field_kg(field_g, samples.momentum))
+        self.eccmd.append(_energy_corrected_command(cmd, samples.momentum))
         self.angle.append(getattr(samples, angle_key))
 
     def _cat(self, parts: list[np.ndarray]) -> np.ndarray | None:
@@ -761,14 +743,85 @@ class _PooledRow:
         return fit_trend(drive, field_g) if drive is not None else None
 
     def angle_fit(self) -> "_ArcFit | None":
-        """Pooled circular-arc e-corr-field→angle fit (super fit for cols 3/4)."""
+        """Pooled circular-arc e-corr-field→angle fit (super fit for column 3)."""
         ec = self._cat(self.ecfield)
         ang = self._cat(self.angle)
         return _arc_fit(ec, ang) if ec is not None else None
 
+    def raw_angle_fit(self) -> "_ArcFit | None":
+        """Pooled circular-arc raw-field→angle fit (uncorrected rigidity)."""
+        field = self._cat(self.field_kg)
+        ang = self._cat(self.angle)
+        return _arc_fit(field, ang) if field is not None else None
+
+    def cmd_arc_fit(self) -> "_LinearArcFit | None":
+        """Pooled circular-arc e-corr-cmd→angle fit (super fit for column 4)."""
+        ec = self._cat(self.eccmd)
+        ang = self._cat(self.angle)
+        return _cmd_arc_fit(ec, ang) if ec is not None else None
+
+    def raw_cmd_arc_fit(self) -> "_LinearArcFit | None":
+        """Pooled circular-arc raw-cmd→angle fit (uncorrected rigidity)."""
+        cmd = self._cat(self.cmd)
+        ang = self._cat(self.angle)
+        return _cmd_arc_fit(cmd, ang) if cmd is not None else None
+
 
 def _format_residual_median_label(prefix: str, median_abs: float, unit: str) -> str:
     return f"{prefix}med|res| {_format_legend_number(median_abs, signed=False)} {unit}"
+
+
+def _residual_energy_slope(energy_mev: np.ndarray, residual: np.ndarray) -> float | None:
+    """Linear slope of model residual (mrad) vs beam energy (MeV)."""
+    fit = fit_trend(energy_mev, residual)
+    return float(fit.slope) if fit is not None else None
+
+
+def _format_energy_residual_label(
+    prefix: str,
+    median_abs: float,
+    slope: float | None,
+) -> str:
+    label = _format_residual_median_label(prefix, median_abs, "mrad")
+    if slope is None or not np.isfinite(slope):
+        return label
+    return (
+        f"{label}   d(res)/dE {_format_legend_number(slope)} mrad/MeV"
+    )
+
+
+def _predict_angle(
+    fit: "_ArcFit | _LinearArcFit",
+    drive: np.ndarray,
+) -> np.ndarray:
+    return fit.predict(drive)
+
+
+def _plot_residual_vs_energy(
+    ax,
+    energy_mev: np.ndarray,
+    angle_mrad: np.ndarray,
+    predicted: np.ndarray,
+    *,
+    color: str,
+    session_id: str,
+    n_sessions: int,
+    use_hexbin: bool = True,
+) -> tuple[str, tuple] | None:
+    """Scatter model residual vs beam energy; legend reports |res| and d(res)/dE."""
+    energy = np.asarray(energy_mev, dtype=float)
+    residual = np.asarray(angle_mrad, dtype=float) - np.asarray(predicted, dtype=float)
+    e_f, res_f = _finite_pair(energy, residual)
+    if e_f.size == 0:
+        return None
+    _scatter_or_hexbin(ax, energy, residual, color=color, use_hexbin=use_hexbin)
+    prefix = trend_session_prefix(session_id, n_sessions=n_sessions)
+    median_abs = float(np.median(np.abs(res_f)))
+    slope = _residual_energy_slope(e_f, res_f)
+    return (
+        _format_energy_residual_label(prefix, median_abs, slope),
+        trend_line_color(color),
+    )
 
 
 def _plot_residual_about(
@@ -797,6 +850,117 @@ def _plot_residual_about(
     )
 
 
+def _pooled_energy_residual_trend(
+    energy_mev: np.ndarray,
+    angle_mrad: np.ndarray,
+    predicted: np.ndarray,
+    *,
+    prefix: str,
+) -> tuple[str, tuple] | None:
+    """Combined-session residual-vs-energy legend (median |res| and slope)."""
+    energy = np.asarray(energy_mev, dtype=float)
+    residual = np.asarray(angle_mrad, dtype=float) - np.asarray(predicted, dtype=float)
+    e_f, res_f = _finite_pair(energy, residual)
+    if e_f.size == 0:
+        return None
+    median_abs = float(np.median(np.abs(res_f)))
+    slope = _residual_energy_slope(e_f, res_f)
+    return (
+        _format_energy_residual_label(prefix, median_abs, slope),
+        _COMBINED_COLOR,
+    )
+
+
+def _plot_energy_dependence_row(
+    axes_row,
+    *,
+    axis_label: str,
+    cmd_k: str,
+    rb_k: str,
+    field_k: str,
+    angle_k: str,
+    session_data: dict[str, AmplifierCorrelationSamples],
+    loaded_ids: list[str],
+    colors: list[str],
+) -> None:
+    """Third/fourth grid rows: model residual vs energy (raw vs rigidity-corrected)."""
+    pooled = _PooledRow()
+    for sid in loaded_ids:
+        pooled.add(session_data[sid], cmd_k, rb_k, field_k, angle_k)
+
+    fit_specs: tuple[tuple[str, str], ...] = (
+        ("raw_field", "raw_angle_fit"),
+        ("ec_field", "angle_fit"),
+        ("raw_cmd", "raw_cmd_arc_fit"),
+        ("ec_cmd", "cmd_arc_fit"),
+    )
+    combined_prefix = _COMBINED_PREFIX if len(loaded_ids) > 1 else ""
+
+    for col, (drive_key, fit_method) in enumerate(fit_specs):
+        trends: list[tuple[str, tuple]] = []
+        fit = getattr(pooled, fit_method)()
+        if fit is None:
+            axes_row[col].set_visible(False)
+            continue
+
+        angle_all = pooled._cat(pooled.angle)
+        if drive_key == "raw_field":
+            drive_all = pooled._cat(pooled.field_kg)
+        elif drive_key == "ec_field":
+            drive_all = pooled._cat(pooled.ecfield)
+        elif drive_key == "raw_cmd":
+            drive_all = pooled._cat(pooled.cmd)
+        else:
+            drive_all = pooled._cat(pooled.eccmd)
+        energy_all = np.concatenate([
+            _energy_mev_from_momentum(session_data[sid].momentum)
+            for sid in loaded_ids
+        ])
+        combined = _pooled_energy_residual_trend(
+            energy_all,
+            angle_all,
+            _predict_angle(fit, drive_all),
+            prefix=combined_prefix,
+        )
+        if combined is not None:
+            trends.append(combined)
+
+        for sid, color in zip(loaded_ids, colors):
+            samples = session_data[sid]
+            angle = getattr(samples, angle_k)
+            energy = _energy_mev_from_momentum(samples.momentum)
+            field_g = getattr(samples, field_k)
+            cmd = getattr(samples, cmd_k)
+            if drive_key == "raw_field":
+                drive = field_g / _GAUSS_PER_KILOGAUSS
+            elif drive_key == "ec_field":
+                drive = _energy_corrected_field_kg(field_g, samples.momentum)
+            elif drive_key == "raw_cmd":
+                drive = cmd
+            else:
+                drive = _energy_corrected_command(cmd, samples.momentum)
+
+            trend = _plot_residual_vs_energy(
+                axes_row[col],
+                energy,
+                angle,
+                _predict_angle(fit, drive),
+                color=color,
+                session_id=sid,
+                n_sessions=len(loaded_ids),
+            )
+            if trend is not None:
+                trends.append(trend)
+
+        axes_row[col].axhline(0, **REFLINE_KW)
+        make_trend_legend(axes_row[col], trends)
+        _style_axis(
+            axes_row[col],
+            "Energy (MeV)",
+            f"Beam {axis_label} angle − super fit (mrad)",
+        )
+
+
 def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -> None:
     """Plot amplifier command relationships with readback, field, and beam angle."""
     if not session_ids:
@@ -817,7 +981,7 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
     loaded_ids = list(session_data.keys())
     colors = DEFAULT_SESSION_COLORS[: len(loaded_ids)]
 
-    fig, axes = view_grid(2, 4, sharex=False, sharey=False)
+    fig, axes = view_grid(4, 4, sharex=False, sharey=False)
     row_specs = (
         ("X", "cmd_x", "readback_x", "field_x", "angle_x_mrad"),
         ("Y", "cmd_y", "readback_y", "field_y", "angle_y_mrad"),
@@ -827,14 +991,20 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
         "Readback Residual vs Cmd (super fit)",
         "Field Residual vs Drive (super fit)",
         "Beam Angle Residual vs E-corr Field (super fit)",
-        "Beam Angle vs E-corr Field",
+        "Beam Angle Residual vs E-corr Cmd (super fit)",
+    )
+    energy_col_titles = (
+        "Angle Residual vs Energy (raw field fit)",
+        "Angle Residual vs Energy (e-corr field fit)",
+        "Angle Residual vs Energy (raw cmd fit)",
+        "Angle Residual vs Energy (e-corr cmd fit)",
     )
 
     for row, (axis_label, cmd_k, rb_k, field_k, angle_k) in enumerate(row_specs):
         readback_trends: list[tuple[str, tuple]] = []
         field_trends: list[tuple[str, tuple]] = []
         angle_trends: list[tuple[str, tuple]] = []
-        angle_raw_trends: list[tuple[str, tuple]] = []
+        cmd_arc_trends: list[tuple[str, tuple]] = []
         field_xlabels: list[str] = []
 
         # Build the super fit first; residuals are then measured against it.
@@ -844,6 +1014,7 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
         rb_fit = pooled.readback_fit()
         field_super_fit = pooled.field_fit()
         angle_super_fit = pooled.angle_fit()
+        cmd_arc_super_fit = pooled.cmd_arc_fit()
 
         combined_prefix = _COMBINED_PREFIX if len(loaded_ids) > 1 else ""
         if rb_fit is not None:
@@ -862,11 +1033,15 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
                 _COMBINED_COLOR,
             ))
         if angle_super_fit is not None:
-            angle_label = _format_angle_fit_label(
-                angle_super_fit, prefix=combined_prefix
-            )
-            angle_trends.append((angle_label, _COMBINED_COLOR))
-            angle_raw_trends.append((angle_label, _COMBINED_COLOR))
+            angle_trends.append((
+                _format_angle_fit_label(angle_super_fit, prefix=combined_prefix),
+                _COMBINED_COLOR,
+            ))
+        if cmd_arc_super_fit is not None:
+            cmd_arc_trends.append((
+                _format_cmd_arc_fit_label(cmd_arc_super_fit, prefix=combined_prefix),
+                _COMBINED_COLOR,
+            ))
 
         for sid, color in zip(loaded_ids, colors):
             samples = session_data[sid]
@@ -874,6 +1049,7 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
             rb = getattr(samples, rb_k)
             field_g = getattr(samples, field_k)
             ecfield = _energy_corrected_field_kg(field_g, samples.momentum)
+            eccmd = _energy_corrected_command(cmd, samples.momentum)
             angle = getattr(samples, angle_k)
 
             if rb_fit is not None:
@@ -908,31 +1084,14 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
                 if trend is not None:
                     angle_trends.append(trend)
 
-            angle_raw_trend = _plot_ecfield_angle(
-                axes[row, 3],
-                samples,
-                field_k,
-                angle_k,
-                color=color,
-                session_id=sid,
-                n_sessions=len(loaded_ids),
-                align=samples.align_x if angle_k == "angle_x_mrad" else samples.align_y,
-                draw_fit=False,
-            )
-            if angle_raw_trend is not None:
-                angle_raw_trends.append(angle_raw_trend)
-
-        # Draw the super-fit arc curve over the raw-angle panel (col 4).
-        if angle_super_fit is not None:
-            ec_all = pooled._cat(pooled.ecfield)
-            ang_all = pooled._cat(pooled.angle)
-            x_all, _ = _finite_pair(ec_all, ang_all)
-            if x_all.size:
-                xs = np.linspace(float(np.min(x_all)), float(np.max(x_all)), 200)
-                axes[row, 3].plot(
-                    xs, angle_super_fit.predict(xs),
-                    color=_COMBINED_COLOR, linestyle="--", linewidth=1.6, zorder=7,
+            if cmd_arc_super_fit is not None:
+                trend = _plot_residual_about(
+                    axes[row, 3], eccmd, angle, cmd_arc_super_fit.predict(eccmd),
+                    color=color, session_id=sid, n_sessions=len(loaded_ids),
+                    unit="mrad",
                 )
+                if trend is not None:
+                    cmd_arc_trends.append(trend)
 
         axes[row, 0].axhline(0, **REFLINE_KW)
         make_trend_legend(axes[row, 0], readback_trends)
@@ -940,8 +1099,8 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
         make_trend_legend(axes[row, 1], field_trends)
         axes[row, 2].axhline(0, **REFLINE_KW)
         make_trend_legend(axes[row, 2], angle_trends)
-        make_trend_legend(axes[row, 3], angle_raw_trends)
-        _annotate_angle_model(axes[row, 3])
+        axes[row, 3].axhline(0, **REFLINE_KW)
+        make_trend_legend(axes[row, 3], cmd_arc_trends)
 
         _style_axis(
             axes[row, 0],
@@ -960,12 +1119,27 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
         )
         _style_axis(
             axes[row, 3],
-            f"B{axis_label.lower()} energy-corr (kG @ {ref_e})",
-            f"Beam {axis_label} angle (mrad)",
+            f"Cmd {axis_label} energy-corr (V @ {ref_e})",
+            f"Beam {axis_label} angle − super fit (mrad)",
         )
 
     for col, title in enumerate(col_titles):
         axes[0, col].set_title(title)
+    for col, title in enumerate(energy_col_titles):
+        axes[2, col].set_title(title)
+
+    for row_offset, (axis_label, cmd_k, rb_k, field_k, angle_k) in enumerate(row_specs):
+        _plot_energy_dependence_row(
+            axes[row_offset + 2],
+            axis_label=axis_label,
+            cmd_k=cmd_k,
+            rb_k=rb_k,
+            field_k=field_k,
+            angle_k=angle_k,
+            session_data=session_data,
+            loaded_ids=loaded_ids,
+            colors=colors,
+        )
 
     finish_view(
         fig,

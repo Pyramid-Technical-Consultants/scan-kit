@@ -74,6 +74,7 @@ C_CHARGE_REQ = "charge_req"
 
 # Scan-magnet field probes (gauss) in timeslice_data_device_units.
 # G3: r_tx2_probe_x / r_tx2_probe_y (TX2 hall probes).
+# Older G3 exports: r_xB / r_yB (correcting-coil field gauss, already physical).
 # G2: field_c_x / field_c_y (correcting-coil setpoint gauss).  In device_units
 # the values track amplifier command volts ~1:1; amplifier_correlation rescales
 # to physical gauss using G2_AMPLIFIER_A_PER_V and the raw→device cmd ratio.
@@ -84,6 +85,7 @@ C_MAG_FIELD_Y = "mag_field_y"
 # Use load_session_timeslice_device_units — not raw timeslice_data.csv.
 # G3: amplifier_x_target / amplifier_y_target (command),
 #     amplifier_x_readback / amplifier_y_readback (readback).
+# Older G3 exports: r_xV / r_yV (amplifier readback volts).
 # G2: c_x / c_y (command), r_xI / r_yI (readback; register names use I but
 #     device_units values are volts).  Raw timeslice r_xI/r_yI are not volts.
 # Values are the voltage sent to the current source; coil current and field
@@ -177,6 +179,7 @@ _CONCEPT_ALIASES_STATIC: dict[str, tuple[str, ...]] = {
     C_MAG_FIELD_X: (
         "r_tx2_probe_x",
         "field_c_x",
+        "r_xB",
         "mag_field_x",
         "field_x",
         "b_field_x",
@@ -184,14 +187,25 @@ _CONCEPT_ALIASES_STATIC: dict[str, tuple[str, ...]] = {
     C_MAG_FIELD_Y: (
         "r_tx2_probe_y",
         "field_c_y",
+        "r_yB",
         "mag_field_y",
         "field_y",
         "b_field_y",
     ),
     C_AMPLIFIER_CMD_X: ("amplifier_x_target", "c_x", "amplifier_cmd_x"),
     C_AMPLIFIER_CMD_Y: ("amplifier_y_target", "c_y", "amplifier_cmd_y"),
-    C_AMPLIFIER_READBACK_X: ("amplifier_x_readback", "r_xI", "amplifier_readback_x"),
-    C_AMPLIFIER_READBACK_Y: ("amplifier_y_readback", "r_yI", "amplifier_readback_y"),
+    C_AMPLIFIER_READBACK_X: (
+        "amplifier_x_readback",
+        "r_xI",
+        "r_xV",
+        "amplifier_readback_x",
+    ),
+    C_AMPLIFIER_READBACK_Y: (
+        "amplifier_y_readback",
+        "r_yI",
+        "r_yV",
+        "amplifier_readback_y",
+    ),
     C_X_POSITION: ("X_POSITION", "x_position", "xposition", "x_pos", "planned_x"),
     C_Y_POSITION: ("Y_POSITION", "y_position", "yposition", "y_pos", "planned_y"),
     C_IC1_X_PEAK_AMPLITUDE: ("r_ic1_x_peak_amplitude", "ic1_x_peak_amplitude"),
