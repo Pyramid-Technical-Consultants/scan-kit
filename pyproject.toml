@@ -1,12 +1,18 @@
 [build-system]
-requires = ["setuptools>=61.0"]
+requires = ["setuptools>=77.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "scan-kit"
 dynamic = ["version"]
 description = "Proton pencil beam scanning analysis toolkit"
+readme = "README.md"
 requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+    { name = "Pyramid Technical Consultants, Inc.", email = "support@ptcusa.com" },
+]
 dependencies = [
     "pandas",
     "matplotlib",
@@ -19,6 +25,11 @@ dependencies = [
 
 [project.optional-dependencies]
 build = ["pyinstaller>=6.0"]
+
+[project.urls]
+Homepage = "https://www.pyramid.tech"
+Repository = "https://github.com/Pyramid-Technical-Consultants/scan-kit"
+Issues = "https://github.com/Pyramid-Technical-Consultants/scan-kit/issues"
 
 [project.scripts]
 scan-kit = "scan_kit.app:main"

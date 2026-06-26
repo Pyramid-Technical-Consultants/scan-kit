@@ -10,7 +10,19 @@ from pathlib import Path
 from typing import Any, Callable
 
 from PySide6.QtCore import QRectF, Qt, QTimer, Signal, QSize, Slot
-from PySide6.QtGui import QColor, QFontMetrics, QGuiApplication, QIcon, QPainter, QPen, QPixmap
+from PySide6.QtGui import (
+    QAction,
+    QColor,
+    QFontMetrics,
+    QGuiApplication,
+    QIcon,
+    QKeySequence,
+    QPainter,
+    QPen,
+    QPixmap,
+    QUndoCommand,
+    QUndoStack,
+)
 from PySide6.QtWidgets import (
     QFileDialog,
     QHBoxLayout,
@@ -125,6 +137,35 @@ def _compact_meta_column_widths(fm: QFontMetrics) -> dict[int, int]:
     }
 
 
+class _NoteEditCommand(QUndoCommand):
+    """Undoable change to a single session's note.
+
+    Each committed cell edit is its own command; we deliberately do not merge
+    consecutive edits (``id()`` stays the default ``-1``) because a table cell
+    commits one discrete value per edit, so per-edit granularity is what users
+    expect from undo here.
+    """
+
+    def __init__(
+        self,
+        browser: "SessionBrowserWidget",
+        sid: str,
+        old_text: str,
+        new_text: str,
+    ) -> None:
+        super().__init__(f"edit note for {sid}")
+        self._browser = browser
+        self._sid = sid
+        self._old_text = old_text
+        self._new_text = new_text
+
+    def redo(self) -> None:  # also runs once when first pushed
+        self._browser._apply_note(self._sid, self._new_text)
+
+    def undo(self) -> None:
+        self._browser._apply_note(self._sid, self._old_text)
+
+
 class SessionBrowserWidget(QWidget):
     """Browse session archives/folders, inspect metadata, and select sessions."""
 
@@ -164,6 +205,9 @@ class SessionBrowserWidget(QWidget):
         self._meta_pool: ThreadPoolExecutor | None = None
         self._worker_threads: list[threading.Thread] = []
         self._notes: dict[str, str] = {}
+        self._undo_stack = QUndoStack(self)
+        self._undo_action: QAction | None = None
+        self._redo_action: QAction | None = None
         self._highlighted_sid: str | None = None
         self._check_order: list[str] = []
         self._row_by_sid: dict[str, int] = {}
@@ -263,8 +307,45 @@ class SessionBrowserWidget(QWidget):
         self._table.customContextMenuRequested.connect(self._on_context_menu)
         root.addWidget(self._table, stretch=1)
 
+        if self._editable_notes:
+            self._install_undo_actions()
+
+    def _install_undo_actions(self) -> None:
+        """Create Qt-managed undo/redo actions (auto text + enabled state).
+
+        These are exposed via :meth:`undo_action`/:meth:`redo_action` so a host
+        window can drop them straight into an Edit menu; in the meantime they
+        carry the standard shortcuts scoped to this widget and its children.
+        """
+        undo = self._undo_stack.createUndoAction(self, "Undo")
+        undo.setShortcuts(QKeySequence.StandardKey.Undo)
+        undo.setShortcutContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+
+        redo = self._undo_stack.createRedoAction(self, "Redo")
+        redo.setShortcuts(
+            [QKeySequence(QKeySequence.StandardKey.Redo), QKeySequence("Ctrl+Shift+Z")]
+        )
+        redo.setShortcutContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+
+        self.addAction(undo)
+        self.addAction(redo)
+        self._undo_action = undo
+        self._redo_action = redo
+
+    def undo_action(self) -> QAction | None:
+        """The Qt undo action (for embedding in a menu/toolbar), if notes are editable."""
+        return self._undo_action
+
+    def redo_action(self) -> QAction | None:
+        """The Qt redo action (for embedding in a menu/toolbar), if notes are editable."""
+        return self._redo_action
+
     def base_dir(self) -> str:
         return self._base_dir
+
+    def browse_for_base_dir(self) -> None:
+        """Open the folder picker to choose a new session data directory."""
+        self._on_browse_data_dir()
 
     def set_base_dir(self, path: str, *, refresh: bool = True) -> None:
         text = path.strip()
@@ -304,6 +385,7 @@ class SessionBrowserWidget(QWidget):
     def refresh(self, *, restored_selection: list[str] | None = None) -> None:
         self._hydrate_generation += 1
         gen = self._hydrate_generation
+        self._undo_stack.clear()
         self._shutdown_meta_pool()
         workers = max(4, min(12, (os.cpu_count() or 4) * 2))
         self._meta_pool = ThreadPoolExecutor(max_workers=workers)
@@ -830,19 +912,49 @@ class SessionBrowserWidget(QWidget):
         if sid is None:
             return
         text = item.text()
-        current = self._notes.get(sid, "")
-        if text == current:
+        old = self._notes.get(sid, "")
+        if text == old:
             return
+        # push() runs the command's redo(), which performs the actual edit.
+        self._undo_stack.push(_NoteEditCommand(self, sid, old, text))
+
+    def _apply_note(self, sid: str, text: str) -> None:
+        """Set a note in the store, on disk, and in its table cell."""
         if text.strip():
             self._notes[sid] = text
         else:
             self._notes.pop(sid, None)
         save_note(self._base_dir, sid, text)
+        self._set_note_cell_text(sid, text)
+
+    def _set_note_cell_text(self, sid: str, text: str) -> None:
+        row = self._find_row_for_sid(sid)
+        if row < 0:
+            return
+        item = self._table.item(row, _COL_NOTE)
+        if item is None:
+            return
         self._table.blockSignals(True)
         try:
+            if item.text() != text:
+                item.setText(text)
             item.setToolTip(text if len(text) > 120 else "")
         finally:
             self._table.blockSignals(False)
+
+    def undo(self) -> bool:
+        """Reverse the most recent note edit. Returns ``False`` if none remain."""
+        if not self._undo_stack.canUndo():
+            return False
+        self._undo_stack.undo()
+        return True
+
+    def redo(self) -> bool:
+        """Reapply the most recently undone note edit."""
+        if not self._undo_stack.canRedo():
+            return False
+        self._undo_stack.redo()
+        return True
 
     def _on_current_cell_changed(
         self,

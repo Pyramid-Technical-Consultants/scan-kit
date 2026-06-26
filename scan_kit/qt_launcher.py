@@ -16,6 +16,8 @@ from typing import Any
 
 from PySide6.QtCore import Qt, QThread, QTimer, QUrl, Signal, Slot
 from PySide6.QtGui import (
+    QAction,
+    QActionGroup,
     QCloseEvent,
     QDesktopServices,
     QIcon,
@@ -297,8 +299,165 @@ class ScanKitMainWindow(QMainWindow):
         self.setCentralWidget(tabs)
         self._debug_log_panel.install_logging()
 
-        for seq in ("Esc", "Ctrl+Q"):
-            QShortcut(QKeySequence(seq), self, activated=self.close)
+        self._build_menu_bar()
+        self._sync_tab_menu()
+
+        QShortcut(QKeySequence("Esc"), self, activated=self.close)
+
+    def _build_menu_bar(self) -> None:
+        menu_bar = self.menuBar()
+        menu_bar.clear()
+        # Hold strong references so the QMenu wrappers/objects are not collected.
+        self._menus: list[QMenu] = []
+        for title, builder in (
+            ("&File", self._build_file_menu),
+            ("&Edit", self._build_edit_menu),
+            ("&View", self._build_view_menu),
+            ("&Analysis", self._build_analysis_menu),
+            ("&Help", self._build_help_menu),
+        ):
+            menu = menu_bar.addMenu(title)
+            self._menus.append(menu)
+            builder(menu)
+
+    def _build_file_menu(self, menu: QMenu) -> None:
+        open_action = QAction("Open Data Folder…", self)
+        open_action.setShortcut(QKeySequence.StandardKey.Open)
+        open_action.setStatusTip("Choose the folder containing session archives or folders")
+        open_action.triggered.connect(self._on_open_data_folder)
+        menu.addAction(open_action)
+
+        refresh_action = QAction("Refresh Sessions", self)
+        refresh_action.setShortcut(QKeySequence.StandardKey.Refresh)
+        refresh_action.setStatusTip("Re-scan the data folder for sessions")
+        refresh_action.triggered.connect(self._refresh_sessions)
+        menu.addAction(refresh_action)
+
+        menu.addSeparator()
+
+        report_action = QAction("Generate Report…", self)
+        report_action.setShortcut("Ctrl+R")
+        report_action.setStatusTip("Build a PDF report from selected sessions and views")
+        report_action.triggered.connect(self._on_generate_report)
+        menu.addAction(report_action)
+
+        menu.addSeparator()
+
+        quit_action = QAction("E&xit", self)
+        quit_action.setShortcut("Ctrl+Q")
+        quit_action.setMenuRole(QAction.MenuRole.QuitRole)
+        quit_action.setStatusTip("Close Scan Kit")
+        quit_action.triggered.connect(self.close)
+        menu.addAction(quit_action)
+
+    def _build_edit_menu(self, menu: QMenu) -> None:
+        browser = self._session_browser
+        undo_action = browser.undo_action() if browser is not None else None
+        redo_action = browser.redo_action() if browser is not None else None
+        if undo_action is not None:
+            menu.addAction(undo_action)
+        if redo_action is not None:
+            menu.addAction(redo_action)
+        if menu.isEmpty():
+            placeholder = QAction("Nothing to Undo", self)
+            placeholder.setEnabled(False)
+            menu.addAction(placeholder)
+
+    def _build_view_menu(self, menu: QMenu) -> None:
+        self._tab_menu_actions = {}
+        group = QActionGroup(self)
+        group.setExclusive(True)
+        tab_shortcuts = {
+            _MAIN_TAB_DATA_ANALYSIS: "Ctrl+1",
+            _MAIN_TAB_PLAN_SYNTHESIS: "Ctrl+2",
+            _MAIN_TAB_CONFIG_TUNING: "Ctrl+3",
+            _MAIN_TAB_DEBUG: "Ctrl+4",
+        }
+        for name, shortcut in tab_shortcuts.items():
+            action = QAction(name, self)
+            action.setCheckable(True)
+            action.setShortcut(shortcut)
+            action.setStatusTip(f"Show the {name} tab")
+            action.triggered.connect(partial(self._switch_to_main_tab, name))
+            group.addAction(action)
+            menu.addAction(action)
+            self._tab_menu_actions[name] = action
+
+    def _build_analysis_menu(self, menu: QMenu) -> None:
+        self._submenus: list[QMenu] = []
+        for group_title, entries in VIEW_GROUPS:
+            submenu = menu.addMenu(group_title)
+            self._submenus.append(submenu)
+            for display_name, module_name, description in entries:
+                action = QAction(display_name, self)
+                action.setStatusTip(description)
+                action.triggered.connect(partial(self._on_view_clicked, module_name))
+                submenu.addAction(action)
+
+        menu.addSeparator()
+
+        self._bg_menu_action = QAction("Background Subtraction", self)
+        self._bg_menu_action.setCheckable(True)
+        self._bg_menu_action.setChecked(bool(self._settings.bg_subtract))
+        self._bg_menu_action.setStatusTip("Toggle beam-off background subtraction")
+        self._bg_menu_action.toggled.connect(self._set_bg_subtract)
+        menu.addAction(self._bg_menu_action)
+
+        cal_menu = menu.addMenu("Calibration")
+        self._submenus.append(cal_menu)
+        cal_group = QActionGroup(self)
+        cal_group.setExclusive(True)
+        self._cal_menu_actions = {}
+        for mode in CALIBRATION_MODES:
+            action = QAction(_CAL_MODE_LABELS.get(mode, mode), self)
+            action.setCheckable(True)
+            action.setChecked(mode == self._settings.calibration_mode)
+            action.triggered.connect(partial(self._set_calibration_mode, mode))
+            cal_group.addAction(action)
+            cal_menu.addAction(action)
+            self._cal_menu_actions[mode] = action
+
+    def _build_help_menu(self, menu: QMenu) -> None:
+        about_action = QAction("About Scan Kit", self)
+        about_action.setMenuRole(QAction.MenuRole.AboutRole)
+        about_action.triggered.connect(self._show_about_dialog)
+        menu.addAction(about_action)
+
+    def _on_open_data_folder(self) -> None:
+        if self._session_browser is not None:
+            self._session_browser.browse_for_base_dir()
+
+    def _show_about_dialog(self) -> None:
+        QMessageBox.about(
+            self,
+            "About Scan Kit",
+            f"<b>Scan Kit</b> v{__version__}"
+            "<p>Analysis, plan synthesis, and configuration tuning for "
+            "pencil-beam scanning session data.</p>"
+            "<p>Free and open-source software — "
+            "<a href='https://github.com/Pyramid-Technical-Consultants/scan-kit'>"
+            "view it on GitHub</a>.</p>"
+            "<p>Maintained by Pyramid Technical Consultants, Inc.<br>"
+            "<a href='https://www.pyramid.tech'>www.pyramid.tech</a></p>"
+            "<p>Questions or support: "
+            "<a href='mailto:support@ptcusa.com'>support@ptcusa.com</a></p>"
+            "<p>Copyright &copy; 2026 Pyramid Technical Consultants.<br>"
+            "Released under the "
+            "<a href='https://github.com/Pyramid-Technical-Consultants/scan-kit/blob/main/LICENSE'>"
+            "MIT License</a>.</p>",
+        )
+
+    def _sync_tab_menu(self) -> None:
+        tabs = self._main_tabs
+        actions = getattr(self, "_tab_menu_actions", None)
+        if tabs is None or not actions:
+            return
+        index = tabs.currentIndex()
+        current = tabs.tabText(index) if index >= 0 else ""
+        for name, action in actions.items():
+            action.blockSignals(True)
+            action.setChecked(name == current)
+            action.blockSignals(False)
 
     def _restore_window_geometry(self) -> None:
         width = self._app_settings.window_width
@@ -360,6 +519,7 @@ class ScanKitMainWindow(QMainWindow):
 
     def _on_main_tab_changed(self, _index: int) -> None:
         self._persist_main_tab()
+        self._sync_tab_menu()
 
     def _switch_to_main_tab(self, tab_name: str) -> None:
         tabs = self._main_tabs
@@ -569,7 +729,13 @@ class ScanKitMainWindow(QMainWindow):
         self._set_calibration_mode(key)
 
     def _sync_bg_buttons(self) -> None:
-        self._bg_segmented.set_current("on" if self._settings.bg_subtract else "off")
+        on = bool(self._settings.bg_subtract)
+        self._bg_segmented.set_current("on" if on else "off")
+        action = getattr(self, "_bg_menu_action", None)
+        if action is not None:
+            action.blockSignals(True)
+            action.setChecked(on)
+            action.blockSignals(False)
 
     def _set_bg_subtract(self, on: bool) -> None:
         self._settings.bg_subtract = on
@@ -578,6 +744,12 @@ class ScanKitMainWindow(QMainWindow):
 
     def _sync_cal_buttons(self) -> None:
         self._cal_segmented.set_current(self._settings.calibration_mode)
+        actions = getattr(self, "_cal_menu_actions", None)
+        if actions:
+            for mode, action in actions.items():
+                action.blockSignals(True)
+                action.setChecked(mode == self._settings.calibration_mode)
+                action.blockSignals(False)
 
     def _set_calibration_mode(self, mode: str) -> None:
         self._settings.calibration_mode = mode

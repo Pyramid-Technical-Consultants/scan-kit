@@ -203,6 +203,11 @@ VIEW_GROUPS: list[tuple[str, list[ViewEntry]]] = [
                 "sigma_timeslice_replay",
                 "Interactive viewer for IC1/IC2 spot size (σx/σy) over the full timeslice timeline.",
             ),
+            (
+                "IC HV Transient Test",
+                "ic_hv_transient",
+                "IC high-voltage toggle transients with capacitance re-derived from the nA waveforms (HCC + strips), compared to the firmware result.",
+            ),
         ],
     ),
     (
