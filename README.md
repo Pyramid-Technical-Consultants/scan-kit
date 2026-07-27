@@ -48,7 +48,7 @@ Beyond plotting, Scan Kit helps you:
 | Capability | What you get |
 |------------|--------------|
 | **Session comparison** | Overlay multiple sessions in the same view with distinct colors |
-| **Interactive replay** | Scrub through IC current and magnetic-field timeslices like a media player |
+| **Interactive replay** | Scrub timeslice channels (IC, dDose/dt, sigma, field) in one Qt viewer |
 | **PDF reports** | Bundle static plots into a shareable analysis report |
 | **Plan authoring** | Generate `input_map.csv` from templates, DICOM RT Ion plans, or IBA PLD files |
 | **Config editing** | Browse and edit map2map XML with forms, integrity checks, and sigma auto-tuning |
@@ -109,9 +109,9 @@ On a dev install, the default data source is the bundled `test_data/` folder.
 </p>
 
 <p align="center">
-  <img src="docs/images/view-ic-timeslice-replay.png" alt="IC timeslice replay viewer with timeline brush" width="920">
+  <img src="docs/images/view-ic-timeslice-replay.png" alt="Timeslice Replay viewer with timeline brush" width="920">
   <br>
-  <sub><em>IC Timeslice Replay — scrub through beam-on current with a timeline brush.</em></sub>
+  <sub><em>Timeslice Replay — scrub through beam-on current with a timeline brush.</em></sub>
 </p>
 
 <p align="center">
@@ -172,11 +172,17 @@ Click any button in the right-hand panel. Views are grouped by analysis category
 
 With sessions selected, click **Generate Report…** to open the report wizard. Pick which views to include, set author metadata, and choose an output path.
 
-Interactive tools — timeslice replay, session log browser, and audio export — are excluded from reports because they cannot be rendered as static pages.
+Interactive tools — binned summary, timeslice replay, session log browser, and audio export — are excluded from reports because they cannot be rendered as static pages.
 
 ## Analysis views
 
 Views are organized in the launcher to match clinical QA workflows. Select one or more sessions, then click a view to open it.
+
+### Summary plots
+
+| View | Summary |
+|------|---------|
+| Binned Summary | Universal box/violin/mean summary — pick **Y metric** (dose error, dose ratios, position error, sigma, spot time) and **X parameter** (energy, target MU, spot time, radius). Presets recreate the everyday vs-Energy workflows. |
 
 ### Beam distribution
 
@@ -222,14 +228,12 @@ Are chambers consistent, and is delivered dose on target?
 | View | Summary |
 |------|---------|
 | Beam-Off Ramp-Down | Beam-off current ramp-down curves (IC1/IC2/IC3) |
-| IC Timeslice Replay | Interactive IC1/IC2/IC3 current viewer — [details](#interactive-replay-views) |
-| IC Timeslice Replay (dDose/dt) | IC current derived from scan-total dose rate |
+| Timeslice Replay | Interactive multi-channel timeslice viewer — [details](#interactive-replay-views) |
 
 ### Magnetic analysis
 
 | View | Summary |
 |------|---------|
-| Magnetic Field Timeslice Replay | Interactive Bx/By field viewer — [details](#interactive-replay-views) |
 | Amplifier Command Correlations | Settled amplifier command vs readback, field, and IC position — [details](#amplifier-command-correlations) |
 
 ### Noise measurement
@@ -248,20 +252,22 @@ Are chambers consistent, and is delivered dose on target?
 
 ### Interactive replay views
 
-**IC Timeslice Replay** and **Magnetic Field Timeslice Replay** share a media-player layout — detail traces on top, a compressed timeline brush below. See the [screenshots](#screenshots) for examples.
+**Timeslice Replay** opens a Qt window with an embedded Matplotlib plot and a channel panel. Presets jump to common sets (**IC current**, **dDose/dt**, **Sigma**, **Field**); you can also mix any available channels. Detail traces sit above a compressed timeline brush. See the [screenshots](#screenshots) for examples.
 
-1. Select session(s) and open the replay view.
-2. The bottom timeline shows a compressed envelope of the full session.
-3. Click and drag to define the window displayed in the detail panel above.
+1. Select session(s) and open **Timeslice Replay**.
+2. Choose a preset or tick channels in the side panel.
+3. Drag the bottom timeline brush to set the detail window (scroll to zoom).
 
 Layer boundaries appear as annotated vertical lines. Multiple sessions overlay with distinct colors. Large windows are auto-decimated so scrubbing stays smooth.
 
-**Magnetic field** replay plots scan-magnet probes in gauss:
+Optional toggles: background subtract, peer overlay (single-session), beam-off edges, digital lanes, and beam-current twin axis.
+
+**Magnetic field** channels plot scan-magnet probes in gauss:
 
 - **G3:** `r_tx2_probe_x` / `r_tx2_probe_y` (TX2 hall probes)
 - **G2:** `field_c_x` / `field_c_y` (correcting-coil readback)
 
-A Bx-vs-By scatter panel (colored by energy) accompanies the timeline view.
+Selecting field channels shows a Bx-vs-By scatter panel (colored by energy) beside the timeline.
 
 ### Amplifier command correlations
 

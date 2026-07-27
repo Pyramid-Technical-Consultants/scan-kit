@@ -1,4 +1,4 @@
-"""Tests for magnetic-field timeslice column resolution and loading."""
+"""Compatibility tests for magnetic-field channel loading (unified catalog)."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 
 from scan_kit.common.schema import C_MAG_FIELD_X, C_MAG_FIELD_Y, resolve_concept_column
-from scan_kit.views.field_timeslice_replay import _load_session_timeline
+from scan_kit.views.timeslice_replay_channels import load_session_timeline_catalog
 
 TEST_DATA = Path(__file__).resolve().parents[1] / "test_data"
 
@@ -34,7 +34,7 @@ def test_g2_field_column_aliases() -> None:
 
 
 def test_load_g3_session_timeline() -> None:
-    data = _load_session_timeline("1091134775", str(TEST_DATA))
+    data = load_session_timeline_catalog("1091134775", str(TEST_DATA))
     assert data is not None
     assert data["n_samples"] > 0
     assert len(data["bx"]) == data["n_samples"]
@@ -42,6 +42,6 @@ def test_load_g3_session_timeline() -> None:
 
 
 def test_load_g2_session_timeline() -> None:
-    data = _load_session_timeline("590658542", str(TEST_DATA))
+    data = load_session_timeline_catalog("590658542", str(TEST_DATA))
     assert data is not None
     assert np.nanmax(np.abs(data["bx"])) > 0

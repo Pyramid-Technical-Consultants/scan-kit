@@ -81,26 +81,45 @@ class TimesliceReplayConfig:
     peer_overlay_linestyle: tuple[int, tuple[int, ...]] = (0, (1, 1))
     peer_overlay_alpha: float = 0.55
     peer_overlay_linewidth: float = 0.5
+    show_digital: bool = True
+    show_beam_twin: bool = True
 
 
-def launch_timeslice_replay(
+def render_timeslice_replay(
+    fig: plt.Figure,
     config: TimesliceReplayConfig,
     session_data: dict[str, dict],
     base_dir: str,
 ) -> None:
-    """Build and show the interactive timeslice replay figure."""
+    """Clear *fig* and render the interactive timeslice replay layout into it."""
     if not session_data:
-        print(config.no_data_message)
+        fig.clear()
+        fig.text(0.5, 0.5, config.no_data_message, ha="center", va="center")
+        fig.canvas.draw_idle()
+        return
+
+    if not config.traces:
+        fig.clear()
+        fig.text(
+            0.5, 0.5, "Select one or more channels to plot",
+            ha="center", va="center",
+        )
+        fig.canvas.draw_idle()
         return
 
     loaded_ids = list(session_data.keys())
     sess_colors = DEFAULT_SESSION_COLORS[: len(loaded_ids)]
     multi = len(loaded_ids) > 1
     max_n = max(d["n_samples"] for d in session_data.values())
-    show_beam = any(d.get("has_beam", False) for d in session_data.values())
-    has_digital = any(d.get("digital") for d in session_data.values())
+    show_beam = (
+        config.show_beam_twin
+        and any(d.get("has_beam", False) for d in session_data.values())
+    )
+    has_digital = (
+        config.show_digital
+        and any(d.get("digital") for d in session_data.values())
+    )
 
-    trace_keys = [t.key for t in config.traces]
     trace_labels = [t.label for t in config.traces]
     trace_colors = [t.color for t in config.traces]
     n_detail = len(config.traces)
@@ -116,11 +135,12 @@ def launch_timeslice_replay(
         heights.append(0.25)
     heights.append(0.30)
 
-    fig = plt.figure(figsize=config.figsize)
+    fig.clear()
     set_view_header(fig, config.title, loaded_ids, sess_colors, base_dir=base_dir)
 
     gs = gridspec.GridSpec(
         n_rows, n_cols,
+        figure=fig,
         height_ratios=heights,
         width_ratios=width_ratios,
         hspace=0.18, wspace=0.04,
@@ -308,6 +328,8 @@ def launch_timeslice_replay(
                 a_hi = min(hi, n)
                 if a_hi <= a_lo:
                     continue
+                if scatter.x_key not in data or scatter.y_key not in data:
+                    continue
                 w_energy = data["energy"][a_lo:a_hi]
                 wx = data[scatter.x_key][a_lo:a_hi]
                 wy = data[scatter.y_key][a_lo:a_hi]
@@ -349,7 +371,7 @@ def launch_timeslice_replay(
                 else:
                     xk, yk = xy_keys
                     for si, (sid, data) in enumerate(session_data.items()):
-                        if not data.get("has_positions", True):
+                        if xk not in data or yk not in data:
                             continue
                         n = data["n_samples"]
                         a_lo = min(lo, n)
@@ -386,4 +408,18 @@ def launch_timeslice_replay(
         fig.canvas.draw_idle()
 
     connect_timeline_interaction(fig, ax_timeline, _draw_detail, max_t)
+
+
+def launch_timeslice_replay(
+    config: TimesliceReplayConfig,
+    session_data: dict[str, dict],
+    base_dir: str,
+) -> None:
+    """Build and show the interactive timeslice replay figure."""
+    if not session_data:
+        print(config.no_data_message)
+        return
+
+    fig = plt.figure(figsize=config.figsize)
+    render_timeslice_replay(fig, config, session_data, base_dir)
     plt.show()

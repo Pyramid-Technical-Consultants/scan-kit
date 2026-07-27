@@ -112,6 +112,101 @@ SLOPE_LABEL_BOX = dict(
 )
 
 
+def build_bin_edges(
+    values,
+    *,
+    mode: str = "quantile",
+    n_bins: int = 8,
+) -> np.ndarray:
+    """Return bin edges for continuous X parameters.
+
+    ``mode="quantile"`` builds approximately equal-count bins.
+    """
+    arr = np.asarray(values, dtype=float)
+    arr = arr[np.isfinite(arr)]
+    if arr.size == 0:
+        return np.asarray([0.0, 1.0], dtype=float)
+    n_bins = max(1, int(n_bins))
+    if mode != "quantile":
+        raise ValueError(f"Unsupported bin mode for edges: {mode!r}")
+    if np.unique(arr).size <= 1:
+        lo = float(arr.min())
+        return np.asarray([lo - 0.5, lo + 0.5], dtype=float)
+    quantiles = np.linspace(0.0, 1.0, n_bins + 1)
+    edges = np.unique(np.quantile(arr, quantiles))
+    if edges.size < 2:
+        lo = float(arr.min())
+        return np.asarray([lo - 0.5, lo + 0.5], dtype=float)
+    return edges.astype(float)
+
+
+def collect_unique_bins(session_data, bin_key: str = "energy") -> list:
+    """Sorted unique finite values of *bin_key* across sessions."""
+    values: set = set()
+    for data in session_data.values():
+        if bin_key not in data:
+            continue
+        arr = np.asarray(data[bin_key], dtype=float)
+        for val in np.unique(arr[np.isfinite(arr)]):
+            values.add(float(val))
+    return sorted(values)
+
+
+def assign_bin_centers(values, edges: np.ndarray) -> np.ndarray:
+    """Map each value to its bin center; non-finite / out-of-range → NaN."""
+    arr = np.asarray(values, dtype=float)
+    out = np.full(arr.shape, np.nan, dtype=float)
+    if edges.size < 2:
+        return out
+    idx = np.digitize(arr, edges[1:-1], right=False)
+    centers = 0.5 * (edges[:-1] + edges[1:])
+    ok = np.isfinite(arr) & (arr >= edges[0]) & (arr <= edges[-1])
+    out[ok] = centers[idx[ok]]
+    return out
+
+
+def prepare_binned_column(
+    session_data: dict,
+    bin_key: str,
+    *,
+    mode: str = "unique",
+    n_bins: int = 8,
+    out_key: str = "_bin",
+) -> tuple[dict, list]:
+    """Return sessions with a discrete *out_key* and the sorted category list.
+
+    For ``mode="unique"``, categories are the unique values of *bin_key*.
+    For ``mode="quantile"``, values are assigned to quantile-bin centers.
+    """
+    if mode == "unique":
+        categories = collect_unique_bins(session_data, bin_key)
+        prepared = {}
+        for sid, data in session_data.items():
+            row = dict(data)
+            if bin_key in row:
+                row[out_key] = np.asarray(row[bin_key], dtype=float)
+            prepared[sid] = row
+        return prepared, categories
+
+    all_vals = []
+    for data in session_data.values():
+        if bin_key in data:
+            all_vals.append(np.asarray(data[bin_key], dtype=float))
+    edges = build_bin_edges(
+        np.concatenate(all_vals) if all_vals else np.asarray([]),
+        mode="quantile",
+        n_bins=n_bins,
+    )
+    prepared = {}
+    for sid, data in session_data.items():
+        row = dict(data)
+        if bin_key in row:
+            row[out_key] = assign_bin_centers(row[bin_key], edges)
+        prepared[sid] = row
+    categories = collect_unique_bins(prepared, out_key)
+    return prepared, categories
+
+
 def plot_boxplots_for_column(
     ax,
     session_data,
@@ -121,34 +216,28 @@ def plot_boxplots_for_column(
     showfliers=False,
     position_offset=0.35,
     width=0.5,
+    bin_key: str = "energy",
 ):
-    """Plot box plots for a specific column across all sessions, grouped by energy.
+    """Plot box plots for a column grouped by a categorical bin axis.
 
-    Args:
-        ax: Matplotlib axes to plot on.
-        session_data: Dict mapping session_id -> data dict (must have column_name and energy).
-        column_name: Name of the column to plot.
-        energies: Sorted list of energy values for x-axis.
-        colors: List of colors for each session. Defaults to DEFAULT_SESSION_COLORS.
-        showfliers: Whether to show outliers. Default False.
-        position_offset: Horizontal offset between sessions at same energy. Default 0.35.
-        width: Width of each box. Default 0.5.
+    *energies* is the sorted category list (historically energy values).
+    Pass *bin_key* to group by a different column (default ``"energy"``).
     """
     if colors is None:
         colors = DEFAULT_SESSION_COLORS[: len(session_data)]
 
     for i, (session_id, data) in enumerate(session_data.items()):
-        if column_name not in data:
+        if column_name not in data or bin_key not in data:
             continue
 
         df = pd.DataFrame(
-            {column_name: data[column_name], "energy": data["energy"]}
+            {column_name: data[column_name], bin_key: data[bin_key]}
         )
 
         column_data = []
         positions = []
         for j, energy in enumerate(energies):
-            energy_data = df[df["energy"] == energy][column_name].values
+            energy_data = df[df[bin_key] == energy][column_name].values
             column_data.append(energy_data)
             positions.append(j + (i - 0.5) * position_offset)
 
@@ -175,27 +264,28 @@ def plot_violins_for_column(
     position_offset=0.0,
     width=0.65,
     alpha=0.35,
+    bin_key: str = "energy",
 ):
-    """Plot overlapping violin plots for a column across sessions, grouped by energy.
+    """Plot overlapping violin plots grouped by a categorical bin axis.
 
-    Sessions share the same x position at each energy so violins stack; use
+    Sessions share the same x position at each category so violins stack; use
     *alpha* to keep overlapping distributions readable.
     """
     if colors is None:
         colors = DEFAULT_SESSION_COLORS[: len(session_data)]
 
     for i, (_session_id, data) in enumerate(session_data.items()):
-        if column_name not in data:
+        if column_name not in data or bin_key not in data:
             continue
 
         df = pd.DataFrame(
-            {column_name: data[column_name], "energy": data["energy"]}
+            {column_name: data[column_name], bin_key: data[bin_key]}
         )
 
         column_data = []
         positions = []
         for j, energy in enumerate(energies):
-            energy_data = df[df["energy"] == energy][column_name].values
+            energy_data = df[df[bin_key] == energy][column_name].values
             energy_data = energy_data[np.isfinite(energy_data)]
             if energy_data.size == 0:
                 continue
@@ -229,6 +319,37 @@ def plot_violins_for_column(
                 vp[key].set_linewidth(0.8)
                 vp[key].set_alpha(min(1.0, alpha + 0.25))
 
+
+def plot_means_for_column(
+    ax,
+    session_data,
+    column_name,
+    categories,
+    colors=None,
+    position_offset=0.35,
+    bin_key: str = "energy",
+    marker_size: float = 45,
+):
+    """Plot per-bin means as markers across sessions."""
+    if colors is None:
+        colors = DEFAULT_SESSION_COLORS[: len(session_data)]
+
+    for i, (_sid, data) in enumerate(session_data.items()):
+        if column_name not in data or bin_key not in data:
+            continue
+        y_vals = np.asarray(data[column_name], dtype=float)
+        bins = np.asarray(data[bin_key], dtype=float)
+        xs, ys = [], []
+        for j, cat in enumerate(categories):
+            mask = np.isfinite(y_vals) & np.isfinite(bins) & (bins == cat)
+            if not mask.any():
+                continue
+            xs.append(j + (i - 0.5) * position_offset)
+            ys.append(float(np.mean(y_vals[mask])))
+        if xs:
+            ax.scatter(
+                xs, ys, c=colors[i], s=marker_size, zorder=3, edgecolors="none",
+            )
 
 def annotate_slopes(ax, labels_and_colors, *, x_anchor=0.03, y_top=0.97,
                     line_pitch=None):
@@ -614,6 +735,17 @@ def make_session_legend(
     )
 
 
+def style_binned_axes(ax, categories, *, xlabel: str, ylabel=None):
+    """Apply categorical bin x-axis ticks and grid to *ax*."""
+    ax.set_xlabel(xlabel)
+    if ylabel:
+        ax.set_ylabel(ylabel)
+    ax.grid(**GRID_KW)
+    ax.set_xticks(np.arange(len(categories)))
+    ax.set_xticklabels([f"{c:g}" if isinstance(c, (int, float)) else str(c)
+                        for c in categories], rotation=90)
+
+
 def style_energy_axes(ax, energies, ylabel=None):
     """Apply the standard energy x-axis and grid to *ax*.
 
@@ -622,12 +754,7 @@ def style_energy_axes(ax, energies, ylabel=None):
         energies: Sorted energy list for the x-ticks.
         ylabel: Optional y-axis label.
     """
-    ax.set_xlabel("Energy (MeV)")
-    if ylabel:
-        ax.set_ylabel(ylabel)
-    ax.grid(**GRID_KW)
-    ax.set_xticks(np.arange(len(energies)))
-    ax.set_xticklabels([f"{e:g}" for e in energies], rotation=90)
+    style_binned_axes(ax, energies, xlabel="Energy (MeV)", ylabel=ylabel)
 
 
 def plot_scatter_energy(ax, x, y, energy, **kwargs):
@@ -953,56 +1080,51 @@ def add_scatter_trend(
     return label_text, line_color
 
 
-def add_energy_trend(
-    ax, session_data, column, energies, colors, *,
-    agg="median", unit="%/MeV", position_offset=0.0,
+def add_binned_trend(
+    ax, session_data, column, categories, colors, *,
+    bin_key="energy", agg="median", unit="/bin", position_offset=0.0,
     show_mean=True, show_delta=True, prefix_with_session=True, line_zorder=5,
 ):
-    """Per-session trend through per-energy aggregates on a categorical x-axis.
+    """Per-session trend through per-bin aggregates on a categorical x-axis.
 
-    For box-plot / per-energy-scatter panels where the x-axis is energy index
-    (0..N-1). Each session's ``column`` is aggregated per energy (``"median"``
-    or ``"mean"``), a line is fit vs energy in MeV, and drawn across the
-    categorical positions (offset per session by ``position_offset``). The
-    annotation shows slope, mean and Δ-over-range by default. A trend legend is
-    added via :func:`make_trend_legend`.
-
-    Returns the list of ``(label, color)`` tuples that were annotated.
+    Each session's ``column`` is aggregated per category (``"median"`` or
+    ``"mean"``), a line is fit vs the physical category values, and drawn
+    across categorical positions. Returns ``(label, color)`` tuples annotated.
     """
     agg_fn = np.median if agg == "median" else np.mean
     n_sessions = len(session_data)
-    energies_f = np.asarray(energies, dtype=float)
+    categories_f = np.asarray(categories, dtype=float)
     labels: list[tuple[str, tuple]] = []
 
     for i, (sid, data) in enumerate(session_data.items()):
-        if column not in data:
+        if column not in data or bin_key not in data:
             continue
         col = np.asarray(data[column], dtype=float)
-        e_all = np.asarray(data["energy"], dtype=float)
+        bins_all = np.asarray(data[bin_key], dtype=float)
 
         mean_err = None
         if show_mean:
             finite = col[np.isfinite(col)]
             mean_err = float(np.mean(finite)) if finite.size else float("nan")
 
-        e_mev, y_agg = [], []
-        for energy in energies:
-            vals = col[e_all == energy]
+        x_phys, y_agg = [], []
+        for cat in categories:
+            vals = col[bins_all == cat]
             vals = vals[np.isfinite(vals)]
             if vals.size:
-                e_mev.append(float(energy))
+                x_phys.append(float(cat))
                 y_agg.append(float(agg_fn(vals)))
-        if len(e_mev) < 2:
+        if len(x_phys) < 2:
             continue
 
-        slope, intercept = np.polyfit(np.array(e_mev), np.array(y_agg), 1)
+        slope, intercept = np.polyfit(np.array(x_phys), np.array(y_agg), 1)
         line_color = trend_line_color(colors[i])
-        xs = [j + (i - 0.5) * position_offset for j in range(len(energies))]
-        ys = slope * energies_f + intercept
+        xs = [j + (i - 0.5) * position_offset for j in range(len(categories))]
+        ys = slope * categories_f + intercept
         ax.plot(xs, ys, color=line_color, zorder=line_zorder, clip_on=True,
                 **TREND_LINE_KW)
 
-        delta = slope * (max(e_mev) - min(e_mev)) if show_delta else None
+        delta = slope * (max(x_phys) - min(x_phys)) if show_delta else None
         prefix = trend_session_prefix(sid, n_sessions=n_sessions) if prefix_with_session else ""
         labels.append((
             format_trend_label(prefix=prefix, slope=slope, unit=unit,
@@ -1013,6 +1135,20 @@ def add_energy_trend(
     if labels:
         make_trend_legend(ax, labels)
     return labels
+
+
+def add_energy_trend(
+    ax, session_data, column, energies, colors, *,
+    agg="median", unit="%/MeV", position_offset=0.0,
+    show_mean=True, show_delta=True, prefix_with_session=True, line_zorder=5,
+):
+    """Per-session trend through per-energy aggregates on a categorical x-axis."""
+    return add_binned_trend(
+        ax, session_data, column, energies, colors,
+        bin_key="energy", agg=agg, unit=unit, position_offset=position_offset,
+        show_mean=show_mean, show_delta=show_delta,
+        prefix_with_session=prefix_with_session, line_zorder=line_zorder,
+    )
 
 
 def add_correlation_scatter(
@@ -1294,14 +1430,15 @@ def link_boxplot_to_histogram(
     tolerance_levels=None,
     tolerance_line_kw=None,
     n_columns=None,
+    bin_key: str = "energy",
 ):
     """Install SpanSelectors on boxplot axes that interactively filter histograms.
 
     Args:
         box_axes: Single axis or list of boxplot axes.
         hist_axes: Matching single axis or list of histogram axes.
-        session_data: Dict mapping session_id -> data dict with ``"energy"`` key.
-        energies: Sorted list of energy values used for boxplot x-ticks.
+        session_data: Dict mapping session_id -> data dict with *bin_key*.
+        energies: Sorted category list used for boxplot x-ticks.
         columns: Single column name or list of column names (one per axis pair).
         colors: Session color list.
         loaded_ids: Ordered session id list.
@@ -1317,6 +1454,7 @@ def link_boxplot_to_histogram(
             :data:`LIMIT_LINE_KW`.
         n_columns: When set, only the first column in each row receives the
             row's *hist_ylabel* entry.
+        bin_key: Session-data column used for categorical filtering (default energy).
 
     Returns:
         List of SpanSelector objects. **The caller must keep a reference** to
@@ -1407,7 +1545,7 @@ def link_boxplot_to_histogram(
 
                 mask = {}
                 for sid in loaded_ids:
-                    e = np.asarray(session_data[sid]["energy"], dtype=float)
+                    e = np.asarray(session_data[sid][bin_key], dtype=float)
                     mask[sid] = np.isin(e, list(sel_energies))
 
                 _redraw_histogram(

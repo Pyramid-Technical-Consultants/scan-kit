@@ -5,6 +5,8 @@ from __future__ import annotations
 from scan_kit.views import VIEW_GROUPS, ViewEntry, view_module_name
 
 REPORT_EXCLUDED_MODULES: frozenset[str] = frozenset({
+    "binned_summary",
+    "timeslice_replay",
     "ic_timeslice_replay",
     "ic_timeslice_replay_derived",
     "sigma_timeslice_replay",

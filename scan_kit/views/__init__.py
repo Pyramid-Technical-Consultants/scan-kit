@@ -56,6 +56,16 @@ if _HAS_AUDIO:
 
 VIEW_GROUPS: list[tuple[str, list[ViewEntry]]] = [
     (
+        "Summary Plots",
+        [
+            (
+                "Binned Summary",
+                "binned_summary",
+                "Universal binned summary: choose Y metric, X parameter, and box/violin/mean glyph.",
+            ),
+        ],
+    ),
+    (
         "Beam Distribution Quality",
         [
             (
@@ -189,19 +199,9 @@ VIEW_GROUPS: list[tuple[str, list[ViewEntry]]] = [
                 "Beam-off ramp-down curves for IC1, IC2, and IC3 from scan-total dose.",
             ),
             (
-                "IC Timeslice Replay",
-                "ic_timeslice_replay",
-                "Interactive viewer for IC1, IC2, and IC3 timeslice current.",
-            ),
-            (
-                "IC Timeslice Replay (dDose/dt)",
-                "ic_timeslice_replay_derived",
-                "Interactive viewer for IC current derived from scan-total dose rate.",
-            ),
-            (
-                "Sigma Timeslice Replay",
-                "sigma_timeslice_replay",
-                "Interactive viewer for IC1/IC2 spot size (σx/σy) over the full timeslice timeline.",
+                "Timeslice Replay",
+                "timeslice_replay",
+                "Interactive timeslice viewer with selectable IC, dDose/dt, sigma, and magnetic-field channels.",
             ),
             (
                 "IC HV Transient Test",
@@ -213,11 +213,6 @@ VIEW_GROUPS: list[tuple[str, list[ViewEntry]]] = [
     (
         "Magnetic Analysis",
         [
-            (
-                "Magnetic Field Timeslice Replay",
-                "field_timeslice_replay",
-                "Interactive Bx and By scan-magnet field viewer with timeline brush.",
-            ),
             (
                 "Amplifier Command Correlations",
                 "amplifier_correlation",

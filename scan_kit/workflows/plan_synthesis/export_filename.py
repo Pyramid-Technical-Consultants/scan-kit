@@ -21,7 +21,6 @@ _CSV_SUFFIX = ".csv"
 
 _TEMPLATE_SLUGS: dict[str, str] = {
     "dicom_rt_plan": "DicomPlan",
-    "iba_pld_plan": "IbaPld",
     "zero_field": "ZeroField",
     "rectangular_field": "RectField",
 }
@@ -36,6 +35,10 @@ def suggest_input_map_filename(
     max_length: int = DEFAULT_FILENAME_MAX_LENGTH,
 ) -> str:
     """Build a descriptive default CSV filename from template + parameters."""
+    if template.id == "iba_pld_plan":
+        # Match the source PLD basename so the export tracks the imported file.
+        return _join_and_limit([_pld_source_stem(params)], max_length=max_length)
+
     parts = [
         _template_slug(template),
         _energy_part(template.id, params),
@@ -43,6 +46,15 @@ def suggest_input_map_filename(
         _weight_part(template.id, params),
     ]
     return _join_and_limit(parts, max_length=max_length)
+
+
+def _pld_source_stem(params: dict[str, Any]) -> str:
+    path_text = str(params.get("pld_path", "") or "").strip()
+    if not path_text:
+        return ""
+    from pathlib import Path
+
+    return _sanitize(Path(path_text).stem)
 
 
 def _template_slug(template: PlanTemplate) -> str:
@@ -88,23 +100,16 @@ def _energy_part(template_id: str, params: dict[str, Any]) -> str:
     return f"E{len(energies)}L_{energies[0]:g}-{energies[-1]:g}"
 
 
-def _import_plan_label_from_path(path_text: str, *, label_reader: str) -> str:
+def _dicom_plan_label_from_path(path_text: str) -> str:
     if not path_text:
         return ""
     from pathlib import Path
 
     path = Path(path_text)
     try:
-        if label_reader == "dicom":
-            from .dicom_rt_plan import rt_plan_label_from_path
+        from .dicom_rt_plan import rt_plan_label_from_path
 
-            label = rt_plan_label_from_path(path)
-        elif label_reader == "pld":
-            from .iba_pld_plan import pld_plan_label_from_path
-
-            label = pld_plan_label_from_path(path)
-        else:
-            label = path.stem
+        label = rt_plan_label_from_path(path)
     except Exception:
         label = path.stem
     return _sanitize(label)
@@ -112,15 +117,8 @@ def _import_plan_label_from_path(path_text: str, *, label_reader: str) -> str:
 
 def _geometry_part(template_id: str, params: dict[str, Any]) -> str:
     if template_id == "dicom_rt_plan":
-        return _import_plan_label_from_path(
+        return _dicom_plan_label_from_path(
             str(params.get("dicom_path", "") or "").strip(),
-            label_reader="dicom",
-        )
-
-    if template_id == "iba_pld_plan":
-        return _import_plan_label_from_path(
-            str(params.get("pld_path", "") or "").strip(),
-            label_reader="pld",
         )
 
     if template_id == "zero_field":

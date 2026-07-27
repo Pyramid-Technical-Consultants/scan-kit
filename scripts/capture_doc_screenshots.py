@@ -34,6 +34,47 @@ def _ensure_paths() -> None:
         raise SystemExit(f"test_data not found at {TEST_DATA}")
 
 
+def _save_figure(fig, output: Path) -> None:
+    import matplotlib.pyplot as plt
+
+    fig.canvas.draw()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(
+        output,
+        dpi=VIEW_DPI,
+        bbox_inches="tight",
+        facecolor=fig.get_facecolor(),
+    )
+    plt.close(fig)
+
+
+def _capture_timeslice_replay_view(
+    session_ids: list[str],
+    output: Path,
+    *,
+    base_dir: str,
+    preset: str,
+) -> None:
+    import matplotlib.pyplot as plt
+
+    from scan_kit.views.timeslice_replay_channels import (
+        PRESET_CHANNELS,
+        available_channel_keys,
+        build_replay_config,
+        filter_available_keys,
+        load_sessions_catalog,
+    )
+    from scan_kit.views.timeslice_replay_ui import render_timeslice_replay
+
+    session_data = load_sessions_catalog(session_ids, base_dir)
+    available = available_channel_keys(session_data)
+    keys = filter_available_keys(PRESET_CHANNELS[preset], available)
+    config = build_replay_config(keys, session_data, title="Timeslice Replay")
+    fig = plt.figure(figsize=config.figsize)
+    render_timeslice_replay(fig, config, session_data, base_dir)
+    _save_figure(fig, output)
+
+
 def _capture_matplotlib_view(
     module_name: str,
     session_ids: list[str],
@@ -46,16 +87,7 @@ def _capture_matplotlib_view(
     real_show = plt.show
 
     def _save_show(*_args, **_kwargs) -> None:
-        fig = plt.gcf()
-        fig.canvas.draw()
-        output.parent.mkdir(parents=True, exist_ok=True)
-        fig.savefig(
-            output,
-            dpi=VIEW_DPI,
-            bbox_inches="tight",
-            facecolor=fig.get_facecolor(),
-        )
-        plt.close(fig)
+        _save_figure(plt.gcf(), output)
 
     plt.show = _save_show
     try:
@@ -192,9 +224,11 @@ def main() -> None:
         ("position_scatter", [SESSION_G3_A, SESSION_G3_B], "view-position-scatter.png"),
         ("sigma_energy", [SESSION_G3_A], "view-sigma-energy.png"),
         ("dose_ratios_energy", [SESSION_G3_A, SESSION_G3_B], "view-dose-ratios-energy.png"),
-        ("ic_timeslice_replay", [SESSION_G3_A], "view-ic-timeslice-replay.png"),
-        ("field_timeslice_replay", [SESSION_G3_B], "view-magnetic-field-replay.png"),
         ("amplifier_correlation", [SESSION_G2], "view-amplifier-correlation.png"),
+    ]
+    timeslice_views = [
+        ("ic_current", [SESSION_G3_A], "view-ic-timeslice-replay.png"),
+        ("field", [SESSION_G3_B], "view-magnetic-field-replay.png"),
     ]
 
     print("Capturing analysis view screenshots…")
@@ -202,6 +236,13 @@ def main() -> None:
         out = OUT_DIR / filename
         print(f"  {module_name} -> {out.name}")
         _capture_matplotlib_view(module_name, sessions, out, base_dir=base_dir)
+
+    for preset, sessions, filename in timeslice_views:
+        out = OUT_DIR / filename
+        print(f"  timeslice_replay/{preset} -> {out.name}")
+        _capture_timeslice_replay_view(
+            sessions, out, base_dir=base_dir, preset=preset,
+        )
 
     print(f"\nDone — {len(list(OUT_DIR.glob('*.png')))} images in {OUT_DIR}")
 

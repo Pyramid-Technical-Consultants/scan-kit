@@ -171,6 +171,8 @@ def test_app_settings_persists_last_report_views(tmp_path, monkeypatch) -> None:
 def test_reportable_module_names_excludes_interactive_views() -> None:
     names = reportable_module_names()
     assert "dose_ratios_energy" in names
+    assert "binned_summary" not in names
+    assert "timeslice_replay" not in names
     assert "ic_timeslice_replay" not in names
 
 
@@ -193,11 +195,14 @@ def test_report_view_groups_excludes_non_static_modules() -> None:
         view_module_name(entry) for _title, entries in report_view_groups() for entry in entries
     }
     all_modules = {view_module_name(entry) for entry in VIEWS}
-    assert REPORT_EXCLUDED_MODULES.issubset(all_modules - reportable_modules)
+    # Interactive shells remain excluded even if not listed in VIEW_GROUPS.
+    assert "binned_summary" not in reportable_modules
+    assert "timeslice_replay" not in reportable_modules
     assert "ic_timeslice_replay" not in reportable_modules
     assert "session_log_compare" not in reportable_modules
     assert "ic_audio_export" not in reportable_modules
     assert "dose_ratios_energy" in reportable_modules
+    assert REPORT_EXCLUDED_MODULES & reportable_modules == set()
 
 
 def test_report_view_pages_use_vector_pdf(tmp_path: Path) -> None:

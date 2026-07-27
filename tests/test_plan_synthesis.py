@@ -1564,8 +1564,9 @@ def test_suggest_input_map_filename_iba_pld_plan(iba_pld_plan, tmp_path: Path) -
         suggest_input_map_filename,
     )
 
+    # Filename should follow the PLD basename even when the plan label differs.
     pld_path = tmp_path / "OOC_Right.pld"
-    pld_path.write_text(_MINIMAL_PLD.replace("TestPlan", "OOC_Right"), encoding="utf-8")
+    pld_path.write_text(_MINIMAL_PLD.replace("TestPlan", "DifferentLabel"), encoding="utf-8")
     params = {
         "pld_path": str(pld_path),
         "beam_size_mm": 3.61,
@@ -1573,7 +1574,7 @@ def test_suggest_input_map_filename_iba_pld_plan(iba_pld_plan, tmp_path: Path) -
         "fast_axis": FAST_AXIS_X,
     }
     name = suggest_input_map_filename(iba_pld_plan, params)
-    assert name == "IbaPld_OOC_Right.csv"
+    assert name == "OOC_Right.csv"
 
 
 def test_plan_synthesis_default_save_path_uses_last_dir(

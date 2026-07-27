@@ -6,14 +6,12 @@ highlights timeline differences, error templates, and message-count deltas.
 
 from __future__ import annotations
 
-import sys
 from collections import Counter
 from datetime import datetime
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QFont
 from PySide6.QtWidgets import (
-    QApplication,
     QCheckBox,
     QComboBox,
     QGridLayout,
@@ -32,7 +30,6 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ..common.app_icon import apply_qt_application_branding, prepare_qt_app_identity
 from ..common.plot_colors import DEFAULT_SESSION_COLORS
 from ..common.session_log import (
     SessionLogData,
@@ -41,7 +38,7 @@ from ..common.session_log import (
     load_session_log,
     merged_layer_ids,
 )
-from ..common.view_runner import _READY_SENTINEL
+from .plot_view_shell import run_view_window
 
 _LEVEL_ORDER = ("ERROR", "WARNING", "WARN", "INFO", "DEBUG")
 _LEVEL_FILTER = ("All levels", "ERROR", "WARNING+ (no DEBUG)", "Notable (no DEBUG, no noise)")
@@ -490,16 +487,8 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
         print("No session logs could be loaded")
         return
 
-    prepare_qt_app_identity()
-    app = QApplication.instance()
-    if app is None:
-        app = QApplication(sys.argv)
-    app_icon = apply_qt_application_branding(app)
-
     colors = [DEFAULT_SESSION_COLORS[i % len(DEFAULT_SESSION_COLORS)] for i in range(len(logs))]
-    window = SessionLogCompareWindow(logs, colors)
-    if not app_icon.isNull():
-        window.setWindowIcon(app_icon)
-    window.show()
-    print(_READY_SENTINEL, flush=True)
-    app.exec()
+    run_view_window(
+        lambda: SessionLogCompareWindow(logs, colors),
+        maximize=False,
+    )

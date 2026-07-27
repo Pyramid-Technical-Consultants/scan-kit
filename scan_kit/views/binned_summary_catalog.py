@@ -1,0 +1,187 @@
+"""Y-metric and X-parameter catalogs for the universal binned summary viewer."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Literal
+
+Glyph = Literal["box", "violin", "mean"]
+BinMode = Literal["unique", "quantile"]
+
+Y_DOSE_ERROR = "dose_error"
+Y_DOSE_RATIO = "dose_ratio"
+Y_POSITION_ERROR = "position_error"
+Y_SIGMA = "sigma"
+Y_SPOT_TIME = "spot_time"
+
+X_ENERGY = "energy"
+X_TARGET_MU = "target_mu"
+X_SPOT_TIME = "spot_time"
+X_RADIUS = "radius"
+
+GLYPH_BOX = "box"
+GLYPH_VIOLIN = "violin"
+GLYPH_MEAN = "mean"
+
+PRESET_DOSE_ERROR_ENERGY = "dose_error_energy"
+PRESET_DOSE_ERROR_ENERGY_MEAN = "dose_error_energy_mean"
+PRESET_DOSE_RATIO_ENERGY = "dose_ratio_energy"
+PRESET_POSITION_ERROR_ENERGY = "position_error_energy"
+PRESET_SIGMA_ENERGY = "sigma_energy"
+PRESET_SPOT_TIME_ENERGY = "spot_time_energy"
+
+
+@dataclass(frozen=True)
+class SeriesDef:
+    key: str
+    label: str
+
+
+@dataclass(frozen=True)
+class YGroupDef:
+    id: str
+    label: str
+    series: tuple[SeriesDef, ...]
+    default_glyph: Glyph
+    trend_unit: str
+
+
+@dataclass(frozen=True)
+class XParamDef:
+    id: str
+    label: str
+    column: str
+    bin_mode: BinMode
+    xlabel: str
+    n_bins: int = 8
+
+
+@dataclass(frozen=True)
+class PresetDef:
+    id: str
+    label: str
+    y_group: str
+    x_param: str
+    glyph: Glyph
+    show_trend: bool = True
+    show_hist: bool = False
+    show_corr: bool = False
+
+
+Y_GROUPS: tuple[YGroupDef, ...] = (
+    YGroupDef(
+        Y_DOSE_ERROR,
+        "Dose error (%)",
+        (
+            SeriesDef("ic1_dose_err_pct", "IC1"),
+            SeriesDef("ic2_dose_err_pct", "IC2"),
+            SeriesDef("ic3_dose_err_pct", "IC3"),
+        ),
+        GLYPH_BOX,
+        "%/unit",
+    ),
+    YGroupDef(
+        Y_DOSE_RATIO,
+        "Dose ratios",
+        (
+            SeriesDef("ic21_ratio", "IC2/IC1 (%)"),
+            SeriesDef("ic31_ratio", "IC3/IC1 (%)"),
+            SeriesDef("ic32_ratio", "IC3/IC2 (%)"),
+        ),
+        GLYPH_BOX,
+        "%/unit",
+    ),
+    YGroupDef(
+        Y_POSITION_ERROR,
+        "Position error (mm)",
+        (
+            SeriesDef("ic1_x_err", "IC1 X"),
+            SeriesDef("ic1_y_err", "IC1 Y"),
+            SeriesDef("ic2_x_err", "IC2 X"),
+            SeriesDef("ic2_y_err", "IC2 Y"),
+        ),
+        GLYPH_VIOLIN,
+        "mm/unit",
+    ),
+    YGroupDef(
+        Y_SIGMA,
+        "Sigma (mm)",
+        (
+            SeriesDef("ic1_sig_x", "IC1 σx"),
+            SeriesDef("ic1_sig_y", "IC1 σy"),
+            SeriesDef("ic2_sig_x", "IC2 σx"),
+            SeriesDef("ic2_sig_y", "IC2 σy"),
+        ),
+        GLYPH_VIOLIN,
+        "mm/unit",
+    ),
+    YGroupDef(
+        Y_SPOT_TIME,
+        "Spot delivery time",
+        (
+            SeriesDef("spot_time", "Total (ms)"),
+            SeriesDef("beam_on_time", "Beam-on (ms)"),
+            SeriesDef("overhead_time", "Overhead (ms)"),
+        ),
+        GLYPH_BOX,
+        "ms/unit",
+    ),
+)
+
+X_PARAMS: tuple[XParamDef, ...] = (
+    XParamDef(X_ENERGY, "Energy", "energy", "unique", "Energy (MeV)"),
+    XParamDef(X_TARGET_MU, "Target MU", "target_mu", "quantile", "Target MU", n_bins=8),
+    XParamDef(X_SPOT_TIME, "Spot time", "spot_time", "quantile", "Spot time (ms)", n_bins=8),
+    XParamDef(X_RADIUS, "Beam radius", "radius", "quantile", "Radius (mm)", n_bins=8),
+)
+
+PRESETS: tuple[PresetDef, ...] = (
+    PresetDef(
+        PRESET_DOSE_ERROR_ENERGY, "Dose error vs Energy",
+        Y_DOSE_ERROR, X_ENERGY, GLYPH_BOX, show_hist=True, show_corr=True,
+    ),
+    PresetDef(
+        PRESET_DOSE_ERROR_ENERGY_MEAN, "Dose error mean vs Energy",
+        Y_DOSE_ERROR, X_ENERGY, GLYPH_MEAN, show_hist=True, show_corr=True,
+    ),
+    PresetDef(
+        PRESET_DOSE_RATIO_ENERGY, "Dose ratios vs Energy",
+        Y_DOSE_RATIO, X_ENERGY, GLYPH_BOX, show_corr=True,
+    ),
+    PresetDef(
+        PRESET_POSITION_ERROR_ENERGY, "Position error vs Energy",
+        Y_POSITION_ERROR, X_ENERGY, GLYPH_VIOLIN, show_trend=False,
+    ),
+    PresetDef(
+        PRESET_SIGMA_ENERGY, "Sigma vs Energy",
+        Y_SIGMA, X_ENERGY, GLYPH_VIOLIN, show_trend=False,
+    ),
+    PresetDef(
+        PRESET_SPOT_TIME_ENERGY, "Spot time vs Energy",
+        Y_SPOT_TIME, X_ENERGY, GLYPH_BOX,
+    ),
+)
+
+Y_GROUP_BY_ID = {g.id: g for g in Y_GROUPS}
+X_PARAM_BY_ID = {x.id: x for x in X_PARAMS}
+PRESET_BY_ID = {p.id: p for p in PRESETS}
+
+
+@dataclass
+class BinnedSummaryConfig:
+    y_group: str = Y_DOSE_RATIO
+    x_param: str = X_ENERGY
+    glyph: Glyph = GLYPH_BOX
+    show_trend: bool = True
+    show_hist: bool = False
+    show_corr: bool = False
+    show_fliers: bool = False
+    n_bins: int | None = None
+
+    @property
+    def title(self) -> str:
+        y = Y_GROUP_BY_ID.get(self.y_group)
+        x = X_PARAM_BY_ID.get(self.x_param)
+        y_label = y.label if y else self.y_group
+        x_label = x.label if x else self.x_param
+        return f"{y_label} vs {x_label}"
