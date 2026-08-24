@@ -107,6 +107,8 @@ def _extract_on_off_distributions(session_id: str, base_dir: str, *, bg_subtract
 
     for df in frames:
         df = df.loc[:, ~df.columns.duplicated()]
+        if df.empty:
+            continue
 
         energy = None
         if energy_by_idx is not None and "_layer_idx" in df.columns:

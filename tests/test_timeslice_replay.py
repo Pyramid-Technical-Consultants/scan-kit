@@ -170,3 +170,16 @@ def test_plot_view_shell_side_panel_resizable() -> None:
     assert window._splitter.sizes()[1] >= 300
     window.close()
     del app
+
+
+def test_resolve_frame_energy_empty_frame_uses_frame_index() -> None:
+    from scan_kit.views.timeslice_replay_common import resolve_frame_energy
+
+    empty = pd.DataFrame({"_layer_idx": pd.Series([], dtype=int)})
+    assert resolve_frame_energy(
+        empty,
+        3,
+        energy_by_layer=None,
+        energy_by_idx={3: 150.0},
+        layer_col="layer_id",
+    ) == 150.0

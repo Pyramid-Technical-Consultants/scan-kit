@@ -99,7 +99,7 @@ def _load_current_ratios(
     if bg_subtract:
         subtract_background_frames(frames)
 
-    df0 = frames[0]
+    df0 = next((frame for frame in frames if not frame.empty), frames[0])
     has_ic1 = any(c in df0.columns for c in _IC_CURRENT_COLS["ic1"])
     has_ic2 = any(c in df0.columns for c in _IC_CURRENT_COLS["ic2"])
     has_ic3 = all(c in df0.columns for c in _IC_CURRENT_COLS["ic3"])
@@ -127,6 +127,9 @@ def _load_current_ratios(
     ic_beam_samples: dict[str, list[np.ndarray]] = {ic: [] for ic in ic_keys}
 
     for frame_i, df in enumerate(frames):
+        if df.empty:
+            continue
+
         energy = None
         if energy_by_layer is not None and C_LAYER_ID in df.columns:
             lid = df[C_LAYER_ID].iloc[0]
