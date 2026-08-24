@@ -1,4 +1,4 @@
-"""Sigma tuning: rewrite IC beam_sigma K0 from session measurements."""
+"""Position offset tuning: rewrite IC zero_offset_at_iso_mm from session measurements."""
 
 from __future__ import annotations
 
@@ -7,27 +7,29 @@ from typing import Any
 
 import xml.etree.ElementTree as ET
 
+from scan_kit.common.session_position import normalize_position_data_source
 from scan_kit.common.session_source import resolve_session_source
 
 from ..base import AutoTuneRunResult, AutoTuneWorkflow
+from ..position_offset_tune import tune_position_offsets_from_sessions
+from ..sigma_tune import normalize_sigma_optimize_mode
 from ..session_params import parse_session_ids
-from ..sigma_tune import normalize_sigma_optimize_mode, tune_sigmas_from_sessions
 
 
-class SigmaTuningWorkflow(AutoTuneWorkflow):
-    """Set constant per-band K0 from measured IC spot sigmas in one or more sessions."""
+class PositionOffsetTuningWorkflow(AutoTuneWorkflow):
+    """Set zero_offset_at_iso_mm from measured IC position errors in one or more sessions."""
 
     @property
     def id(self) -> str:
-        return "sigma_tuning"
+        return "position_offset_tuning"
 
     @property
     def name(self) -> str:
-        return "Sigma Tuning"
+        return "Position Offset Tuning"
 
     @property
     def description(self) -> str:
-        return "IC1/IC2 σ K0 from session(s)"
+        return "IC1/IC2 zero offset at iso mm from session(s)"
 
     def uses_session_browser(self) -> bool:
         return True
@@ -62,19 +64,21 @@ class SigmaTuningWorkflow(AutoTuneWorkflow):
     ) -> AutoTuneRunResult:
         session_ids = parse_session_ids(params)
         data_dir = Path(str(params["data_dir"]).strip()).expanduser().resolve()
-
+        data_source = normalize_position_data_source(params.get("data_source"))
         optimize_mode = normalize_sigma_optimize_mode(params.get("optimize_method"))
-        tune_result = tune_sigmas_from_sessions(
+
+        tune_result = tune_position_offsets_from_sessions(
             root,
             session_ids,
             str(data_dir),
+            data_source=data_source,
             optimize_mode=optimize_mode,
         )
         if not tune_result.ok:
             return AutoTuneRunResult(
                 success=False,
-                message="No sigma bands were updated.",
-                sigma=tune_result,
+                message="No position offsets were updated.",
+                position_offset=tune_result,
                 warnings=list(tune_result.warnings),
             )
 
@@ -83,12 +87,12 @@ class SigmaTuningWorkflow(AutoTuneWorkflow):
         else:
             session_label = f"{len(session_ids)} sessions"
         msg = (
-            f"Updated {tune_result.bands_updated} beam_sigma band(s) from "
+            f"Updated {tune_result.offsets_updated} zero_offset_at_iso_mm value(s) from "
             f"{session_label}. Save the configuration to write devices.xml."
         )
         return AutoTuneRunResult(
             success=True,
             message=msg,
-            sigma=tune_result,
+            position_offset=tune_result,
             warnings=list(tune_result.warnings),
         )

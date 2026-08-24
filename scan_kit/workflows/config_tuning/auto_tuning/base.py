@@ -9,6 +9,7 @@ from typing import Any
 import xml.etree.ElementTree as ET
 
 from .params import AutoTuneParamSpec
+from .position_offset_tune import PositionOffsetTuneResult
 from .sigma_tune import SigmaTuneResult
 
 
@@ -19,6 +20,7 @@ class AutoTuneRunResult:
     success: bool
     message: str
     sigma: SigmaTuneResult | None = None
+    position_offset: PositionOffsetTuneResult | None = None
     warnings: list[str] = field(default_factory=list)
 
 
