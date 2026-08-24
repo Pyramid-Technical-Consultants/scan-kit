@@ -4,9 +4,31 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from scan_kit.workflows.report.paths import resolve_report_save_dir
+
+def _downloads_directory() -> Path:
+    try:
+        from PySide6.QtCore import QStandardPaths
+
+        location = QStandardPaths.writableLocation(
+            QStandardPaths.StandardLocation.DownloadLocation,
+        )
+        if location:
+            path = Path(location)
+            if path.is_dir():
+                return path
+    except Exception:
+        pass
+
+    return Path.home() / "Downloads"
 
 
 def resolve_plan_synthesis_save_dir(last_save_dir: str | None = None) -> Path:
     """Return the last-used plan synthesis folder, else Downloads."""
-    return resolve_report_save_dir(last_save_dir)
+    if last_save_dir:
+        path = Path(last_save_dir)
+        if path.is_dir():
+            return path
+        parent = path.parent
+        if parent.is_dir():
+            return parent
+    return _downloads_directory()

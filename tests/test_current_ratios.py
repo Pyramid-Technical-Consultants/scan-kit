@@ -13,7 +13,6 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from scan_kit.common.report_runner import capture_view_figure
 from scan_kit.common.settings import ViewSettings
 from scan_kit.views import current_ratios
 
@@ -112,14 +111,9 @@ def test_run_renders_finish_view_with_heatmaps(with_ic3: bool, monkeypatch) -> N
 
     monkeypatch.setattr(current_ratios, "_load_current_ratios", _fake_load)
 
-    fig, skip = capture_view_figure(
-        current_ratios.run,
-        ["synthetic"],
-        str(_TEST_DATA),
-        ViewSettings(),
-    )
-    assert skip is None, skip
-    assert fig is not None
+    current_ratios.run(["synthetic"], str(_TEST_DATA), settings=ViewSettings())
+    assert plt.get_fignums()
+    fig = plt.figure(plt.get_fignums()[-1])
     assert len(fig.get_axes()) > 0
     plt.close(fig)
 
@@ -129,12 +123,8 @@ def test_run_captures_figure_from_test_data() -> None:
     if session_id is None:
         pytest.skip("test_data session folder not available")
 
-    fig, skip = capture_view_figure(
-        current_ratios.run,
-        [session_id],
-        str(_TEST_DATA),
-        ViewSettings(),
-    )
-    assert skip is None, skip
+    current_ratios.run([session_id], str(_TEST_DATA), settings=ViewSettings())
+    assert plt.get_fignums()
+    fig = plt.figure(plt.get_fignums()[-1])
     assert fig is not None
     plt.close(fig)

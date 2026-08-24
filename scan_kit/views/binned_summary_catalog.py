@@ -25,7 +25,10 @@ GLYPH_MEAN = "mean"
 
 PRESET_DOSE_ERROR_ENERGY = "dose_error_energy"
 PRESET_DOSE_ERROR_ENERGY_MEAN = "dose_error_energy_mean"
+PRESET_DOSE_ERROR_MU = "dose_error_mu"
 PRESET_DOSE_RATIO_ENERGY = "dose_ratio_energy"
+PRESET_DOSE_RATIO_SPOT_TIME = "dose_ratio_spot_time"
+PRESET_DOSE_RATIO_RADIUS = "dose_ratio_radius"
 PRESET_POSITION_ERROR_ENERGY = "position_error_energy"
 PRESET_SIGMA_ENERGY = "sigma_energy"
 PRESET_SPOT_TIME_ENERGY = "spot_time_energy"
@@ -159,6 +162,18 @@ PRESETS: tuple[PresetDef, ...] = (
     PresetDef(
         PRESET_SPOT_TIME_ENERGY, "Spot time vs Energy",
         Y_SPOT_TIME, X_ENERGY, GLYPH_BOX,
+    ),
+    PresetDef(
+        PRESET_DOSE_ERROR_MU, "Dose error vs Target MU",
+        Y_DOSE_ERROR, X_TARGET_MU, GLYPH_BOX, show_hist=True, show_corr=True,
+    ),
+    PresetDef(
+        PRESET_DOSE_RATIO_SPOT_TIME, "Dose ratios vs Spot time",
+        Y_DOSE_RATIO, X_SPOT_TIME, GLYPH_BOX, show_corr=True,
+    ),
+    PresetDef(
+        PRESET_DOSE_RATIO_RADIUS, "Dose ratios vs Beam radius",
+        Y_DOSE_RATIO, X_RADIUS, GLYPH_BOX, show_corr=True,
     ),
 )
 

@@ -49,7 +49,6 @@ Beyond plotting, Scan Kit helps you:
 |------------|--------------|
 | **Session comparison** | Overlay multiple sessions in the same view with distinct colors |
 | **Interactive replay** | Scrub timeslice channels (IC, dDose/dt, sigma, field) in one Qt viewer |
-| **PDF reports** | Bundle static plots into a shareable analysis report |
 | **Plan authoring** | Generate `input_map.csv` from templates, DICOM RT Ion plans, or IBA PLD files |
 | **Config editing** | Browse and edit map2map XML with forms, integrity checks, and sigma auto-tuning |
 
@@ -128,7 +127,7 @@ Scan Kit opens a single window with three tabs:
 
 | Tab | Use it to… |
 |-----|------------|
-| **Data Analysis** | Browse sessions, adjust global plot settings, open analysis views, generate PDF reports |
+| **Data Analysis** | Browse sessions, adjust global plot settings, and open analysis views |
 | **Plan Synthesis** | Create PBS test plans and export `input_map.csv` |
 | **Configuration Tuning** | Open a facility or session config folder, edit XML, run tuning workflows |
 
@@ -168,12 +167,6 @@ Settings persist in `<data_source>/settings.json` and propagate to views that ar
 
 Click any button in the right-hand panel. Views are grouped by analysis category (see [Analysis views](#analysis-views)). Each view runs in a background subprocess; a warm worker pool makes the first click feel snappy.
 
-### 6. Generate a PDF report (optional)
-
-With sessions selected, click **Generate Report…** to open the report wizard. Pick which views to include, set author metadata, and choose an output path.
-
-Interactive tools — binned summary, timeslice replay, session log browser, and audio export — are excluded from reports because they cannot be rendered as static pages.
-
 ## Analysis views
 
 Views are organized in the launcher to match clinical QA workflows. Select one or more sessions, then click a view to open it.
@@ -182,7 +175,7 @@ Views are organized in the launcher to match clinical QA workflows. Select one o
 
 | View | Summary |
 |------|---------|
-| Binned Summary | Universal box/violin/mean summary — pick **Y metric** (dose error, dose ratios, position error, sigma, spot time) and **X parameter** (energy, target MU, spot time, radius). Presets recreate the everyday vs-Energy workflows. |
+| Binned Summary | Universal box/violin/mean summary — pick **Y metric** (dose error, dose ratios, position error, sigma, spot time) and **X parameter** (energy, target MU, spot time, beam radius). **Presets** cover the former standalone vs-Energy / vs-MU / vs-time plots. |
 
 ### Beam distribution
 
@@ -190,12 +183,12 @@ How well does the beam land where the plan says it should?
 
 | View | Summary |
 |------|---------|
-| Position Error vs Energy | IC1/IC2 X and Y position error vs beam energy |
 | Position Error Distribution (Timeslice) | Beam-on timeslice error density contours and histograms |
 | Position Error Distribution (Spot) | Per-spot error density contours and histograms |
 | Position Error Outliers (Spot) | Spots that are statistical outliers (median/MAD) |
-| Sigma vs Energy | IC1/IC2 spot size (σ) in X and Y vs energy |
 | Sigma Distribution (Timeslice) | Beam-on timeslice σ density contours and histograms |
+| Confidence Correlations (Timeslice) | G3 fit confidence vs peak current and primary channel |
+| Gaussian Fit Filter Coverage | Spot retention vs fit confidence, peak current, and error code |
 | Position Scatter | Planned, IC1, and IC2 positions overlaid by session |
 | IC Beam Trajectory | Per-spot IC beam path in X and Y along the beam axis |
 | Beam Error Motion vs Energy | Per-energy position-error spill paths (IC1 solid, IC2 dotted) |
@@ -206,14 +199,10 @@ Are chambers consistent, and is delivered dose on target?
 
 | View | Summary |
 |------|---------|
-| Dose Ratios vs Energy | IC2/IC1, IC3/IC1, IC3/IC2 ratios vs energy |
-| Dose Ratios vs Position | Inter-chamber ratio consistency vs beam position |
-| Dose Ratios vs Spot Time | Inter-chamber ratios vs spot delivery time |
-| Dose Error vs Energy | Percent dose error vs prescribed target by energy |
-| Dose Error vs Energy (mean) | Mean percent dose error per energy layer |
-| Dose Error vs Target MU | Per-spot percent dose error vs target MU |
 | Dose Accumulation | Expected vs measured cumulative dose per chamber |
 | MU Delivery Rate vs Energy | Effective MU/s vs energy (wall-clock per layer) |
+
+Use **Binned Summary** presets for dose error, dose ratios, position error, sigma, and spot-time vs energy / MU / spot time / radius.
 
 ### Beam current & timing
 
@@ -221,7 +210,6 @@ Are chambers consistent, and is delivered dose on target?
 |------|---------|
 | Current Ratios vs Energy | Beam-on mean IC current ratios vs energy |
 | Beam-On vs Beam-Off Current | Beam-on and beam-off current distributions by energy |
-| Spot Delivery Time | Total, beam-on, and overhead time per spot |
 
 ### Timeseries & transients
 
@@ -364,7 +352,7 @@ pytest
 
 Tests live in `tests/` and use fixtures from `test_data/` (included in dev installs, excluded from the published package). The suite runs headless — Agg matplotlib backend, no Qt windows.
 
-App preferences (last data directory, report paths, window geometry) persist in `app_settings.json` under the user config directory.
+App preferences (last data directory, window geometry) persist in `app_settings.json` under the user config directory.
 
 </details>
 

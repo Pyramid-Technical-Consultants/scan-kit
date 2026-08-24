@@ -75,6 +75,47 @@ def _capture_timeslice_replay_view(
     _save_figure(fig, output)
 
 
+def _capture_binned_summary_preset(
+    session_ids: list[str],
+    output: Path,
+    *,
+    base_dir: str,
+    preset_id: str,
+) -> None:
+    import matplotlib.pyplot as plt
+
+    from scan_kit.common import DEFAULT_SESSION_COLORS
+    from scan_kit.common.plotting import finish_view
+    from scan_kit.views.binned_summary_catalog import PRESET_BY_ID, BinnedSummaryConfig
+    from scan_kit.views.binned_summary_data import load_sessions_summary
+    from scan_kit.views.binned_summary_ui import render_binned_summary
+
+    preset = PRESET_BY_ID[preset_id]
+    session_data = load_sessions_summary(session_ids, base_dir)
+    if not session_data:
+        raise RuntimeError(f"No data for binned summary preset {preset_id!r}")
+
+    config = BinnedSummaryConfig(
+        y_group=preset.y_group,
+        x_param=preset.x_param,
+        glyph=preset.glyph,
+        show_trend=preset.show_trend,
+        show_hist=preset.show_hist,
+        show_corr=preset.show_corr,
+    )
+    fig = plt.figure(figsize=(16, 9))
+    render_binned_summary(fig, config, session_data, base_dir)
+    loaded_ids = list(session_data.keys())
+    finish_view(
+        fig,
+        config.title,
+        loaded_ids,
+        DEFAULT_SESSION_COLORS[: len(loaded_ids)],
+        base_dir=base_dir,
+    )
+    _save_figure(fig, output)
+
+
 def _capture_matplotlib_view(
     module_name: str,
     session_ids: list[str],
@@ -222,9 +263,11 @@ def main() -> None:
 
     views = [
         ("position_scatter", [SESSION_G3_A, SESSION_G3_B], "view-position-scatter.png"),
-        ("sigma_energy", [SESSION_G3_A], "view-sigma-energy.png"),
-        ("dose_ratios_energy", [SESSION_G3_A, SESSION_G3_B], "view-dose-ratios-energy.png"),
         ("amplifier_correlation", [SESSION_G2], "view-amplifier-correlation.png"),
+    ]
+    binned_presets = [
+        ("dose_ratio_energy", [SESSION_G3_A, SESSION_G3_B], "view-dose-ratios-energy.png"),
+        ("sigma_energy", [SESSION_G3_A], "view-sigma-energy.png"),
     ]
     timeslice_views = [
         ("ic_current", [SESSION_G3_A], "view-ic-timeslice-replay.png"),
@@ -236,6 +279,13 @@ def main() -> None:
         out = OUT_DIR / filename
         print(f"  {module_name} -> {out.name}")
         _capture_matplotlib_view(module_name, sessions, out, base_dir=base_dir)
+
+    for preset_id, sessions, filename in binned_presets:
+        out = OUT_DIR / filename
+        print(f"  binned_summary/{preset_id} -> {out.name}")
+        _capture_binned_summary_preset(
+            sessions, out, base_dir=base_dir, preset_id=preset_id,
+        )
 
     for preset, sessions, filename in timeslice_views:
         out = OUT_DIR / filename
