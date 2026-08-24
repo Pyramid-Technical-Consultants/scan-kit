@@ -31,6 +31,7 @@ from scan_kit.workflows.plan_synthesis.layouts.rectangular_field import (
     positions_for_layer,
     rectangular_grid_positions,
 )
+from scan_kit.workflows.plan_synthesis.params import validate_positive_float
 from scan_kit.workflows.plan_synthesis.registry import get_template
 from scan_kit.workflows.plan_synthesis.spot_weight import (
     SPOT_WEIGHT_METHOD_EVEN_TOTAL,
@@ -39,6 +40,7 @@ from scan_kit.workflows.plan_synthesis.spot_weight import (
     SPOT_WEIGHT_METHOD_RANDOM,
     SPOT_WEIGHT_METHOD_RANDOM_TOTAL,
     compute_spot_weights,
+    spot_weight_param_specs,
     validate_spot_weight_params,
 )
 from scan_kit.workflows.plan_synthesis.generators.base import SpotRow
@@ -681,6 +683,30 @@ def test_spot_weight_validation_rejects_inverted_range() -> None:
     )
     errors = validate_spot_weight_params(params)
     assert any("Maximum Weight (MU)" in error for error in errors)
+
+
+def test_spot_weight_param_specs_have_no_mu_maximum() -> None:
+    mu_specs = {
+        spec.key: spec
+        for spec in spot_weight_param_specs()
+        if spec.key.endswith("_mu")
+    }
+    for key in ("spot_weight_mu", "spot_weight_total_mu", "spot_weight_min_mu", "spot_weight_max_mu"):
+        assert mu_specs[key].maximum is None
+
+
+def test_spot_weight_accepts_large_mu_values() -> None:
+    large_mu = 1e12
+    params = _fixed_weight_params(spot_weight_mu=large_mu)
+    assert not validate_spot_weight_params(params)
+    rows = [SpotRow(energy=200.0, layer_id=1, x_position=0.0, y_position=0.0)] * 3
+    weights = compute_spot_weights(rows, params)
+    assert weights == [large_mu, large_mu, large_mu]
+
+
+def test_validate_positive_float_rejects_non_finite() -> None:
+    assert validate_positive_float(float("inf"), label="Spot Weight (MU)")
+    assert validate_positive_float(float("nan"), label="Spot Weight (MU)")
 
 
 def test_both_templates_expose_spot_weight_method(zero_field, rectangular_field) -> None:
