@@ -172,6 +172,9 @@ def _load_per_energy_signals(
     per_energy: dict[str, dict[float, tuple]] = {k: {} for k in ic_keys}
 
     for df in frames:
+        if df.empty:
+            continue
+
         energy = None
         if energy_by_idx is not None and "_layer_idx" in df.columns:
             idx = int(df["_layer_idx"].iloc[0])

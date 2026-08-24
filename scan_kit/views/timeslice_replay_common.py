@@ -240,6 +240,10 @@ def resolve_frame_energy(
     layer_col: str,
 ) -> float | None:
     """Resolve the beam energy for one timeslice frame."""
+    if df.empty:
+        fallback = energy_by_idx.get(frame_idx)
+        return float(fallback) if fallback is not None else None
+
     energy = None
     if "_layer_idx" in df.columns:
         idx = int(df["_layer_idx"].iloc[0])

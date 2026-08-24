@@ -442,7 +442,8 @@ def _gridspec_layout_is_manual(fig) -> bool:
         if gs_id in seen:
             continue
         seen.add(gs_id)
-        if gs.locally_modified_subplot_params():
+        checker = getattr(gs, "locally_modified_subplot_params", None)
+        if callable(checker) and checker():
             return True
     return False
 

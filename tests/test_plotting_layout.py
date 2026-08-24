@@ -31,3 +31,15 @@ def test_apply_tight_layout_skips_manual_gridspec() -> None:
     assert _gridspec_layout_is_manual(fig)
     apply_tight_layout(fig)
     plt.close(fig)
+
+
+def test_apply_tight_layout_with_colorbar_nested_gridspec() -> None:
+    from scan_kit.common.plotting import view_grid
+
+    fig, axes = view_grid(2, 2, width_ratios=[1, 1])
+    ax = axes[0, 0]
+    im = ax.pcolormesh([1, 2, 3], [1, 2], np.array([[0, 1, 2], [2, 1, 0]]))
+    fig.colorbar(im, ax=ax)
+    set_view_header(fig, "Colorbar Grid", ["s1"], ["#1f77b4"])
+    apply_tight_layout(fig)
+    plt.close(fig)
