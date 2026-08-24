@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass
+from math import isfinite
 from typing import Any, Literal
 
 from .energies import STANDARD_ENERGIES_MEV
@@ -74,6 +76,9 @@ def shared_energy_spec(*, default: list[float] | None = None) -> ParamSpec:
 
 SPOT_WEIGHT_LABEL = "Spot Weight (MU)"
 
+# Qt double spin boxes default to 99.99 when no maximum is set; use float64 max instead.
+FLOAT_SPIN_MAX = sys.float_info.max
+
 
 def validate_weight_range(min_value: Any, max_value: Any) -> list[str]:
     errors: list[str] = []
@@ -98,6 +103,8 @@ def validate_positive_float(value: Any, *, label: str) -> list[str]:
         v = float(value)
     except (TypeError, ValueError):
         return [f"{label} must be a number."]
+    if not isfinite(v):
+        return [f"{label} must be a finite number."]
     if v <= 0:
         return [f"{label} must be greater than zero."]
     return []

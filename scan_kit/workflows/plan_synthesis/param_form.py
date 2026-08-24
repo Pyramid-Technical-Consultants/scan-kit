@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
 
 from .energy_picker import EnergyPickerWidget
 from .params import (
+    FLOAT_SPIN_MAX,
     PARAM_FIELD_SET_LABELS,
     PARAM_FIELD_SET_ORDER,
     ParamSpec,
@@ -480,8 +481,7 @@ class ParamFormWidget(QWidget):
             spin.setDecimals(spec.decimals)
             if spec.minimum is not None:
                 spin.setMinimum(float(spec.minimum))
-            if spec.maximum is not None:
-                spin.setMaximum(float(spec.maximum))
+            spin.setMaximum(float(spec.maximum if spec.maximum is not None else FLOAT_SPIN_MAX))
             if spec.step is not None:
                 spin.setSingleStep(float(spec.step))
             spin.setValue(float(value))
