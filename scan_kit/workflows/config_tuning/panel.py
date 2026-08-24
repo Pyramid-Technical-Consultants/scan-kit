@@ -22,20 +22,23 @@ from PySide6.QtWidgets import (
 )
 
 from scan_kit.common.app_settings import AppSettings
-
-from scan_kit.common.file_integrity import is_sidecar_path
+from scan_kit.common.file_integrity import is_sidecar_path, verify_file_integrity
+from scan_kit.common.session_position import normalize_position_data_source
 
 from .auto_tune_panel import AutoTuneDetailWidget, AutoTuneListWidget
 from .auto_tuning.base import AutoTuneRunResult, AutoTuneWorkflow
 from .auto_tuning.paths import resolve_devices_xml_path
+from .auto_tuning.position_offset_tune import (
+    PositionOffsetTunePreviewRow,
+    compute_position_offset_tune_preview,
+)
+from .auto_tuning.session_params import parse_session_ids
 from .auto_tuning.sigma_tune import (
     SigmaTunePreviewRow,
     compute_sigma_tune_preview,
     normalize_sigma_optimize_mode,
 )
-from .auto_tuning.workflows.sigma_tuning import parse_sigma_session_ids
 from .file_tree import XmlFileTreeWidget
-from scan_kit.common.file_integrity import verify_file_integrity
 
 from .integrity_view import (
     FileIntegrityWidget,
@@ -295,19 +298,30 @@ class ConfigTuningPanel(QWidget):
         self,
         workflow: AutoTuneWorkflow,
         params: dict,
-    ) -> tuple[list[SigmaTunePreviewRow], list[str]] | None:
-        if workflow.id != "sigma_tuning":
-            return [], []
+    ) -> tuple[list[SigmaTunePreviewRow] | list[PositionOffsetTunePreviewRow], list[str]] | None:
         document = self._load_devices_document()
         if document is None:
             return [], ["Open a configuration folder containing map2map/devices.xml."]
-        optimize_mode = normalize_sigma_optimize_mode(params.get("optimize_method"))
-        return compute_sigma_tune_preview(
-            document.root,
-            parse_sigma_session_ids(params),
-            str(params["data_dir"]).strip(),
-            optimize_mode=optimize_mode,
-        )
+
+        if workflow.id == "sigma_tuning":
+            optimize_mode = normalize_sigma_optimize_mode(params.get("optimize_method"))
+            return compute_sigma_tune_preview(
+                document.root,
+                parse_session_ids(params),
+                str(params["data_dir"]).strip(),
+                optimize_mode=optimize_mode,
+            )
+        if workflow.id == "position_offset_tuning":
+            data_source = normalize_position_data_source(params.get("data_source"))
+            optimize_mode = normalize_sigma_optimize_mode(params.get("optimize_method"))
+            return compute_position_offset_tune_preview(
+                document.root,
+                parse_session_ids(params),
+                str(params["data_dir"]).strip(),
+                data_source=data_source,
+                optimize_mode=optimize_mode,
+            )
+        return [], []
 
     def _on_auto_tune_apply(
         self,

@@ -30,19 +30,27 @@ from scan_kit.common.session_browser import SessionBrowserWidget, default_projec
 from .auto_tuning.base import AutoTuneRunResult, AutoTuneWorkflow
 from .auto_tuning.params import AutoTuneParamSpec
 from .auto_tuning.registry import AUTO_TUNE_REGISTRY
+from .auto_tuning.position_offset_preview_table import (
+    fill_position_offset_preview_table,
+    max_preview_residual_mm,
+    preview_energy_band_count as position_preview_energy_band_count,
+)
+from .auto_tuning.position_offset_tune import PositionOffsetTunePreviewRow
 from .auto_tuning.sigma_preview_table import (
     clear_sigma_preview_table,
     fill_sigma_preview_table,
     max_preview_extreme_pct_deviation,
-    preview_energy_band_count,
+    preview_energy_band_count as sigma_preview_energy_band_count,
 )
 from .auto_tuning.sigma_tune import SigmaTunePreviewRow
 
 ApplyFn = Callable[[AutoTuneWorkflow, dict[str, Any]], AutoTuneRunResult | None]
 PreviewFn = Callable[
     [AutoTuneWorkflow, dict[str, Any]],
-    tuple[list[SigmaTunePreviewRow], list[str]] | None,
+    tuple[list[SigmaTunePreviewRow] | list[PositionOffsetTunePreviewRow], list[str]] | None,
 ]
+
+_PREVIEW_WORKFLOW_IDS = frozenset({"sigma_tuning", "position_offset_tuning"})
 
 
 class _WorkflowListRow(QWidget):
@@ -177,23 +185,44 @@ class AutoTuneDetailWidget(QWidget):
         method_layout.addWidget(method_label)
         self._sigma_method_group = QButtonGroup(self)
         self._method_median = QRadioButton("Median")
-        self._method_median.setToolTip("Robust median of spot sigmas in each energy band")
+        self._method_median.setToolTip("Robust median of position errors across all samples")
         self._method_weighted = QRadioButton("Weighted average")
         self._method_weighted.setToolTip(
             "Mean weighted by charge_req per spot (falls back to unweighted mean)"
         )
         self._method_midpoint = QRadioButton("Min–max midpoint")
         self._method_midpoint.setToolTip(
-            "Midpoint between the smallest and largest observed sigma in each band"
+            "Midpoint between the smallest and largest observed error"
         )
         self._method_median.setChecked(True)
         for button in (self._method_median, self._method_weighted, self._method_midpoint):
             self._sigma_method_group.addButton(button)
             method_layout.addWidget(button)
         method_layout.addStretch(1)
-        self._sigma_method_group.buttonToggled.connect(self._on_sigma_method_changed)
+        self._sigma_method_group.buttonToggled.connect(self._on_optimize_method_changed)
         self._sigma_method_host.setVisible(False)
         layout.addWidget(self._sigma_method_host)
+
+        self._position_source_host = QWidget()
+        source_layout = QHBoxLayout(self._position_source_host)
+        source_layout.setContentsMargins(0, 0, 0, 0)
+        source_layout.setSpacing(12)
+        source_layout.addWidget(QLabel("Data source"))
+        self._position_source_group = QButtonGroup(self)
+        self._source_spot = QRadioButton("Spot")
+        self._source_spot.setToolTip("One sample per delivered spot from spot_data.csv")
+        self._source_timeslice = QRadioButton("Timeslice")
+        self._source_timeslice.setToolTip(
+            "Beam-on timeslice samples from timeslice_data_device_units.csv"
+        )
+        self._source_spot.setChecked(True)
+        for button in (self._source_spot, self._source_timeslice):
+            self._position_source_group.addButton(button)
+            source_layout.addWidget(button)
+        source_layout.addStretch(1)
+        self._position_source_group.buttonToggled.connect(self._on_position_source_changed)
+        self._position_source_host.setVisible(False)
+        layout.addWidget(self._position_source_host)
 
         self._param_host = QWidget()
         self._param_form = QFormLayout(self._param_host)
@@ -217,7 +246,7 @@ class AutoTuneDetailWidget(QWidget):
         self._session_browser.selection_changed.connect(self._refresh_preview)
         layout.addWidget(self._session_browser, stretch=2)
 
-        self._preview_status = QLabel("Select a session to preview proposed sigma values.")
+        self._preview_status = QLabel("Select a session to preview proposed values.")
         self._preview_status.setWordWrap(True)
         self._preview_status.setForegroundRole(QPalette.ColorRole.PlaceholderText)
         layout.addWidget(self._preview_status)
@@ -232,8 +261,8 @@ class AutoTuneDetailWidget(QWidget):
         bottom_row.addStretch(1)
         self._apply_btn = QPushButton("Apply to devices.xml")
         self._apply_btn.setToolTip(
-            "Rewrite beam_sigma K0 values in the open configuration's devices.xml "
-            "from the selected session (marks the file dirty until you save)."
+            "Apply the selected auto-tuning workflow to the open configuration's "
+            "devices.xml (marks the file dirty until you save)."
         )
         self._apply_btn.clicked.connect(self._on_apply)
         bottom_row.addWidget(self._apply_btn)
@@ -268,14 +297,18 @@ class AutoTuneDetailWidget(QWidget):
             self._hide_session_browser()
             self._set_preview_visible(False)
             self._sigma_method_host.setVisible(False)
+            self._position_source_host.setVisible(False)
             self._clear_preview()
             self._apply_btn.setEnabled(False)
             return
         self._description_label.setText(workflow.description)
         self._apply_btn.setEnabled(True)
-        is_sigma = workflow.id == "sigma_tuning"
-        self._set_preview_visible(is_sigma)
-        self._sigma_method_host.setVisible(is_sigma)
+        has_preview = workflow.id in _PREVIEW_WORKFLOW_IDS
+        self._set_preview_visible(has_preview)
+        self._sigma_method_host.setVisible(
+            workflow.id in {"sigma_tuning", "position_offset_tuning"}
+        )
+        self._position_source_host.setVisible(workflow.id == "position_offset_tuning")
         if workflow.uses_session_browser():
             self._show_session_browser()
         else:
@@ -354,14 +387,22 @@ class AutoTuneDetailWidget(QWidget):
         if chosen:
             target.setText(chosen)
 
-    def _selected_sigma_optimize_method(self) -> str:
+    def _selected_optimize_method(self) -> str:
         if self._method_weighted.isChecked():
             return "weighted_average"
         if self._method_midpoint.isChecked():
             return "min_max_midpoint"
         return "median"
 
-    def _on_sigma_method_changed(self) -> None:
+    def _selected_position_data_source(self) -> str:
+        if self._source_timeslice.isChecked():
+            return "timeslice"
+        return "spot"
+
+    def _on_optimize_method_changed(self) -> None:
+        self._refresh_preview()
+
+    def _on_position_source_changed(self) -> None:
         self._refresh_preview()
 
     def read_params(self) -> dict[str, Any]:
@@ -373,14 +414,19 @@ class AutoTuneDetailWidget(QWidget):
         ):
             params["session_ids"] = self._session_browser.selected_session_ids()
             params["data_dir"] = self._session_browser.base_dir()
-        if self._current is not None and self._current.id == "sigma_tuning":
-            params["optimize_method"] = self._selected_sigma_optimize_method()
+        if self._current is not None and self._current.id in {
+            "sigma_tuning",
+            "position_offset_tuning",
+        }:
+            params["optimize_method"] = self._selected_optimize_method()
+        if self._current is not None and self._current.id == "position_offset_tuning":
+            params["data_source"] = self._selected_position_data_source()
         return params
 
     def _clear_preview(self) -> None:
         clear_sigma_preview_table(self._preview_table)
         self._preview_status.setText(
-            "Select one or more sessions to preview proposed sigma values."
+            "Select one or more sessions to preview proposed values."
         )
 
     def _refresh_preview(self) -> None:
@@ -396,7 +442,22 @@ class AutoTuneDetailWidget(QWidget):
             self._clear_preview()
             return
         rows, warnings = preview
-        fill_sigma_preview_table(self._preview_table, rows)
+        if self._current.id == "sigma_tuning":
+            fill_sigma_preview_table(self._preview_table, rows)
+            self._update_sigma_preview_status(rows, warnings, params)
+        elif self._current.id == "position_offset_tuning":
+            fill_position_offset_preview_table(self._preview_table, rows)
+            self._update_position_preview_status(rows, warnings, params)
+        if warnings and rows:
+            extra = "; ".join(warnings)
+            self._preview_status.setText(f"{self._preview_status.text()} {extra}")
+
+    def _update_sigma_preview_status(
+        self,
+        rows: list[SigmaTunePreviewRow],
+        warnings: list[str],
+        params: dict[str, Any],
+    ) -> None:
         if rows:
             session_ids = params.get("session_ids") or []
             session_note = (
@@ -404,7 +465,7 @@ class AutoTuneDetailWidget(QWidget):
                 if len(session_ids) > 1
                 else ""
             )
-            band_count = preview_energy_band_count(rows)
+            band_count = sigma_preview_energy_band_count(rows)
             status = f"{band_count} energy band(s) will be updated{session_note}."
             max_extreme_pct = max_preview_extreme_pct_deviation(rows)
             if max_extreme_pct is not None:
@@ -414,9 +475,35 @@ class AutoTuneDetailWidget(QWidget):
             self._preview_status.setText(warnings[0])
         else:
             self._preview_status.setText("No matching sigma bands for this session.")
-        if warnings and rows:
-            extra = "; ".join(warnings)
-            self._preview_status.setText(f"{self._preview_status.text()} {extra}")
+
+    def _update_position_preview_status(
+        self,
+        rows: list[PositionOffsetTunePreviewRow],
+        warnings: list[str],
+        params: dict[str, Any],
+    ) -> None:
+        if rows:
+            session_ids = params.get("session_ids") or []
+            session_note = (
+                f" from {len(session_ids)} sessions"
+                if len(session_ids) > 1
+                else ""
+            )
+            band_count = position_preview_energy_band_count(rows)
+            status = (
+                f"{band_count} energy band(s); 4 zero offsets will be updated"
+                f"{session_note}."
+            )
+            max_residual = max_preview_residual_mm(rows)
+            if max_residual is not None:
+                status += f" Max residual: {max_residual:.3f} mm."
+            self._preview_status.setText(status)
+        elif warnings:
+            self._preview_status.setText(warnings[0])
+        else:
+            self._preview_status.setText(
+                "No matching position offset bands for this session."
+            )
 
     def _confirm_apply(self, params: dict[str, Any]) -> bool:
         if self._current is None:
@@ -432,6 +519,20 @@ class AutoTuneDetailWidget(QWidget):
             detail = (
                 f"Rewrite beam_sigma K0 values in devices.xml using data from "
                 f"{source}?\n\n"
+                "The configuration will be marked dirty until you save."
+            )
+        elif self._current.id == "position_offset_tuning":
+            session_ids = params.get("session_ids") or []
+            if len(session_ids) == 1:
+                source = f"session {session_ids[0]}"
+            elif session_ids:
+                source = f"{len(session_ids)} sessions"
+            else:
+                source = "the selected session(s)"
+            data_source = params.get("data_source", "spot")
+            detail = (
+                f"Rewrite zero_offset_at_iso_mm values in devices.xml using "
+                f"{data_source} data from {source}?\n\n"
                 "The configuration will be marked dirty until you save."
             )
         else:
