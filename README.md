@@ -49,7 +49,6 @@ Beyond plotting, Scan Kit helps you:
 |------------|--------------|
 | **Session comparison** | Overlay multiple sessions in the same view with distinct colors |
 | **Interactive replay** | Scrub timeslice channels (IC, dDose/dt, sigma, field) in one Qt viewer |
-| **PDF reports** | Bundle static plots into a shareable analysis report |
 | **Plan authoring** | Generate `input_map.csv` from templates, DICOM RT Ion plans, or IBA PLD files |
 | **Config editing** | Browse and edit map2map XML with forms, integrity checks, and sigma auto-tuning |
 
@@ -128,7 +127,7 @@ Scan Kit opens a single window with three tabs:
 
 | Tab | Use it to… |
 |-----|------------|
-| **Data Analysis** | Browse sessions, adjust global plot settings, open analysis views, generate PDF reports |
+| **Data Analysis** | Browse sessions, adjust global plot settings, and open analysis views |
 | **Plan Synthesis** | Create PBS test plans and export `input_map.csv` |
 | **Configuration Tuning** | Open a facility or session config folder, edit XML, run tuning workflows |
 
@@ -167,12 +166,6 @@ Settings persist in `<data_source>/settings.json` and propagate to views that ar
 ### 5. Open analysis views
 
 Click any button in the right-hand panel. Views are grouped by analysis category (see [Analysis views](#analysis-views)). Each view runs in a background subprocess; a warm worker pool makes the first click feel snappy.
-
-### 6. Generate a PDF report (optional)
-
-With sessions selected, click **Generate Report…** to open the report wizard. Pick which views to include, set author metadata, and choose an output path.
-
-Interactive tools — binned summary, timeslice replay, session log browser, and audio export — are excluded from reports because they cannot be rendered as static pages.
 
 ## Analysis views
 
@@ -359,7 +352,7 @@ pytest
 
 Tests live in `tests/` and use fixtures from `test_data/` (included in dev installs, excluded from the published package). The suite runs headless — Agg matplotlib backend, no Qt windows.
 
-App preferences (last data directory, report paths, window geometry) persist in `app_settings.json` under the user config directory.
+App preferences (last data directory, window geometry) persist in `app_settings.json` under the user config directory.
 
 </details>
 

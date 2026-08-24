@@ -656,7 +656,7 @@ def finish_view(
     :func:`apply_tight_layout`.
 
     When *show* is true (default), calls ``plt.show()`` so views render in the
-    interactive launcher and during PDF report capture (Agg or patched show).
+    interactive launcher and headless Agg tests (patched show).
     """
     set_view_header(fig, title, session_ids, colors, base_dir=base_dir, notes=notes)
     apply_tight_layout(fig, **layout_kwargs)

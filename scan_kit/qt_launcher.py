@@ -14,12 +14,11 @@ from functools import partial
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import Qt, QThread, QTimer, QUrl, Signal, Slot
+from PySide6.QtCore import Qt, QTimer, Signal, Slot
 from PySide6.QtGui import (
     QAction,
     QActionGroup,
     QCloseEvent,
-    QDesktopServices,
     QIcon,
     QKeySequence,
     QMoveEvent,
@@ -29,7 +28,6 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
-    QDialog,
     QFrame,
     QGridLayout,
     QGroupBox,
@@ -39,7 +37,6 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMenu,
     QMessageBox,
-    QProgressDialog,
     QPushButton,
     QSizePolicy,
     QSplitter,
@@ -65,9 +62,6 @@ from .views import VIEW_GROUPS, VIEWS
 from .workflows.plan_synthesis_panel import PlanSynthesisPanel
 from .workflows.config_tuning.auto_tuning.paths import resolve_session_config_dir
 from .workflows.config_tuning_panel import ConfigTuningPanel
-from .workflows.report import reportable_module_names
-from .workflows.report.generation_worker import ReportGenerationWorker
-from .workflows.report.wizard import ReportWizardDialog
 
 MAX_SESSIONS = 5
 FROZEN = getattr(sys, "frozen", False)
@@ -247,10 +241,6 @@ class ScanKitMainWindow(QMainWindow):
         self._settings = ViewSettings()
         self._view_buttons: dict[str, QPushButton] = {}
         self._bootstrap_generation: int = 0
-        self._report_generating = False
-        self._report_thread: QThread | None = None
-        self._report_worker: ReportGenerationWorker | None = None
-        self._report_progress: QProgressDialog | None = None
         self._main_tabs: QTabWidget | None = None
 
         boot = QWidget()
@@ -332,14 +322,6 @@ class ScanKitMainWindow(QMainWindow):
         refresh_action.setStatusTip("Re-scan the data folder for sessions")
         refresh_action.triggered.connect(self._refresh_sessions)
         menu.addAction(refresh_action)
-
-        menu.addSeparator()
-
-        report_action = QAction("Generate Report…", self)
-        report_action.setShortcut("Ctrl+R")
-        report_action.setStatusTip("Build a PDF report from selected sessions and views")
-        report_action.triggered.connect(self._on_generate_report)
-        menu.addAction(report_action)
 
         menu.addSeparator()
 
@@ -657,19 +639,6 @@ class ScanKitMainWindow(QMainWindow):
         set_pane_scroll_widget(right_scroll, right_inner)
         right_outer.addWidget(right_scroll, stretch=1)
 
-        report_row = QHBoxLayout()
-        report_row.setContentsMargins(4, 4, 4, 4)
-        self._report_btn = QPushButton("Generate Report…")
-        self._report_btn.setAutoDefault(True)
-        self._report_btn.setDefault(True)
-        self._report_btn.setToolTip(
-            "Build a PDF report from selected sessions and analysis views"
-        )
-        self._report_btn.clicked.connect(self._on_generate_report)
-        report_row.addStretch(1)
-        report_row.addWidget(self._report_btn)
-        right_outer.addLayout(report_row)
-
         splitter.addWidget(left)
         splitter.addWidget(right)
         splitter.setStretchFactor(0, 0)
@@ -810,153 +779,6 @@ class ScanKitMainWindow(QMainWindow):
         box.setText(message)
         box.setIcon(QMessageBox.Icon.Critical if error else QMessageBox.Icon.Warning)
         box.exec()
-
-    def _on_generate_report(self) -> None:
-        if self._report_generating:
-            self._notify("Report generation already in progress")
-            return
-
-        session_ids = self._selected_sids_in_order()
-        if not session_ids:
-            self._notify(
-                f"Select 1-{MAX_SESSIONS} sessions first (use the checkboxes)"
-            )
-            return
-
-        reportable = reportable_module_names()
-        saved_views = [
-            module_name
-            for module_name in self._app_settings.last_report_views
-            if module_name in reportable
-        ]
-
-        wizard = ReportWizardDialog(
-            session_ids=session_ids,
-            base_dir=self._base_dir,
-            settings=self._settings,
-            session_meta=self._session_meta_by_sid(),
-            notes=self._session_browser.notes() if self._session_browser else {},
-            last_report_dir=self._app_settings.last_report_dir,
-            last_report_author=self._app_settings.last_report_author,
-            last_report_organization=self._app_settings.last_report_organization,
-            last_report_views=saved_views,
-            parent=self,
-        )
-        if wizard.exec() != QDialog.DialogCode.Accepted:
-            return
-
-        config = wizard.config
-        if config is None:
-            return
-
-        self._app_settings.last_report_views = [
-            entry[1] for entry in config.views
-        ]
-        self._app_settings.last_report_author = config.author or None
-        self._app_settings.last_report_organization = config.organization or None
-        try:
-            self._app_settings.save()
-        except Exception:
-            pass
-
-        self._report_generating = True
-        self._report_btn.setEnabled(False)
-
-        progress = QProgressDialog("Preparing report…", None, 0, 100, self)
-        progress.setWindowTitle("Generate Report")
-        progress.setWindowModality(Qt.WindowModality.WindowModal)
-        progress.setMinimumDuration(0)
-        progress.setAutoClose(True)
-        progress.setAutoReset(True)
-        progress.setCancelButton(None)
-        progress.setValue(0)
-        self._report_progress = progress
-
-        thread = QThread(self)
-        worker = ReportGenerationWorker(config)
-        worker.moveToThread(thread)
-        thread.started.connect(worker.run)
-        worker.progress.connect(self._on_report_progress)
-        worker.finished.connect(self._on_report_finished)
-        worker.failed.connect(self._on_report_failed)
-        worker.finished.connect(thread.quit)
-        worker.failed.connect(thread.quit)
-        worker.finished.connect(progress.close)
-        worker.failed.connect(progress.close)
-        thread.finished.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
-        thread.finished.connect(self._clear_report_thread)
-        self._report_thread = thread
-        self._report_worker = worker
-        thread.start()
-        progress.show()
-
-    def _on_report_progress(self, value: int, message: str) -> None:
-        if self._report_progress is not None:
-            self._report_progress.setLabelText(message)
-            self._report_progress.setValue(value)
-
-    def _release_report_state(self) -> None:
-        self._report_generating = False
-        self._report_btn.setEnabled(True)
-        self._report_progress = None
-
-    def _on_report_finished(self, output_path: str, skip_summary: str) -> None:
-        self._release_report_state()
-        panel = getattr(self, "_debug_log_panel", None)
-        if panel is not None:
-            if skip_summary:
-                panel.append(
-                    "WARNING",
-                    "report",
-                    f"Report saved with skipped views: {output_path}",
-                )
-                for line in skip_summary.splitlines():
-                    panel.append("WARNING", "report", line)
-            else:
-                panel.append("INFO", "report", f"Report saved: {output_path}")
-        try:
-            self._app_settings.last_report_dir = str(Path(output_path).parent)
-            self._app_settings.save()
-        except Exception:
-            pass
-        box = QMessageBox(self)
-        if skip_summary:
-            box.setWindowTitle("Report complete with skipped views")
-            box.setIcon(QMessageBox.Icon.Warning)
-            box.setText(
-                f"PDF report saved, but some views were skipped.\n\n{output_path}"
-            )
-            box.setInformativeText(skip_summary)
-        else:
-            box.setWindowTitle("Report complete")
-            box.setIcon(QMessageBox.Icon.Information)
-            box.setText("PDF report saved successfully.")
-            box.setInformativeText(output_path)
-        open_btn = box.addButton("Open Report", QMessageBox.ButtonRole.ActionRole)
-        box.addButton(QMessageBox.StandardButton.Ok)
-        box.exec()
-        if box.clickedButton() is open_btn:
-            opened = QDesktopServices.openUrl(
-                QUrl.fromLocalFile(str(Path(output_path).resolve()))
-            )
-            if not opened:
-                QMessageBox.warning(
-                    self,
-                    "Could not open report",
-                    f"No application is available to open:\n{output_path}",
-                )
-
-    def _on_report_failed(self, message: str) -> None:
-        self._release_report_state()
-        panel = getattr(self, "_debug_log_panel", None)
-        if panel is not None:
-            panel.append("ERROR", "report", message)
-        QMessageBox.critical(self, "Report failed", message)
-
-    def _clear_report_thread(self) -> None:
-        self._report_thread = None
-        self._report_worker = None
 
     def _on_view_clicked(self, module_name: str) -> None:
         if module_name in self._running_views:

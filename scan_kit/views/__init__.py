@@ -23,21 +23,6 @@ def view_description(entry: ViewEntry) -> str:
     return entry[2]
 
 
-def view_description_for_module(module_name: str) -> str:
-    for entry in VIEWS:
-        if view_module_name(entry) == module_name:
-            return view_description(entry)
-    from .binned_summary_preset import LEGACY_PRESET_VIEW_MODULES
-    from .binned_summary_catalog import PRESET_BY_ID
-
-    preset_id = LEGACY_PRESET_VIEW_MODULES.get(module_name)
-    if preset_id is not None:
-        preset = PRESET_BY_ID.get(preset_id)
-        if preset is not None:
-            return f"Binned summary preset: {preset.label}."
-    return ""
-
-
 _HAS_AUDIO = importlib.util.find_spec("scan_kit.views.ic_audio_export") is not None
 
 # Workflow-oriented groups for the launcher (flat VIEWS is derived below).
