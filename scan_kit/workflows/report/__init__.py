@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from scan_kit.views import VIEW_GROUPS, ViewEntry, view_module_name
+from scan_kit.views.binned_summary_preset import LEGACY_PRESET_VIEW_MODULES
 
 REPORT_EXCLUDED_MODULES: frozenset[str] = frozenset({
     "binned_summary",
@@ -20,12 +21,14 @@ GITHUB_URL = "https://github.com/Pyramid-Technical-Consultants/scan-kit"
 
 def reportable_module_names() -> set[str]:
     """Module names that can be included in a PDF report."""
-    return {
+    names = {
         view_module_name(entry)
         for _title, entries in VIEW_GROUPS
         for entry in entries
         if view_module_name(entry) not in REPORT_EXCLUDED_MODULES
     }
+    names.update(LEGACY_PRESET_VIEW_MODULES)
+    return names
 
 
 def report_view_groups() -> list[tuple[str, list[ViewEntry]]]:

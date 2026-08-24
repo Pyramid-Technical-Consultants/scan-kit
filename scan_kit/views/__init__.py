@@ -27,6 +27,14 @@ def view_description_for_module(module_name: str) -> str:
     for entry in VIEWS:
         if view_module_name(entry) == module_name:
             return view_description(entry)
+    from .binned_summary_preset import LEGACY_PRESET_VIEW_MODULES
+    from .binned_summary_catalog import PRESET_BY_ID
+
+    preset_id = LEGACY_PRESET_VIEW_MODULES.get(module_name)
+    if preset_id is not None:
+        preset = PRESET_BY_ID.get(preset_id)
+        if preset is not None:
+            return f"Binned summary preset: {preset.label}."
     return ""
 
 
@@ -61,18 +69,14 @@ VIEW_GROUPS: list[tuple[str, list[ViewEntry]]] = [
             (
                 "Binned Summary",
                 "binned_summary",
-                "Universal binned summary: choose Y metric, X parameter, and box/violin/mean glyph.",
+                "Universal binned summary: dose error, dose ratios, position error, "
+                "sigma, and spot time vs energy, target MU, spot time, or beam radius.",
             ),
         ],
     ),
     (
         "Beam Distribution Quality",
         [
-            (
-                "Position Error vs Energy",
-                "position_error_energy",
-                "IC1 and IC2 position error in X and Y versus beam energy.",
-            ),
             (
                 "Position Error Distribution (Timeslice)",
                 "position_error_distribution_timeslice",
@@ -87,11 +91,6 @@ VIEW_GROUPS: list[tuple[str, list[ViewEntry]]] = [
                 "Position Error Outliers (Spot)",
                 "position_error_outliers_spot",
                 "Spots whose X/Y deviation from target is a clear statistical outlier (median/MAD).",
-            ),
-            (
-                "Sigma vs Energy",
-                "sigma_energy",
-                "IC1 and IC2 spot size (sigma) in X and Y versus beam energy.",
             ),
             (
                 "Sigma Distribution (Timeslice)",
@@ -129,36 +128,6 @@ VIEW_GROUPS: list[tuple[str, list[ViewEntry]]] = [
         "Dosimetry Quality",
         [
             (
-                "Dose Ratios vs Energy",
-                "dose_ratios_energy",
-                "IC2/IC1, IC3/IC1, and IC3/IC2 dose ratios versus beam energy.",
-            ),
-            (
-                "Dose Ratios vs Position",
-                "dose_ratios_position",
-                "Inter-IC dose ratio consistency versus beam position.",
-            ),
-            (
-                "Dose Ratios vs Spot Time",
-                "dose_ratios_spot_time",
-                "Inter-IC dose ratio behavior versus spot delivery time.",
-            ),
-            (
-                "Dose Error vs Energy",
-                "dose_error_energy",
-                "Percent dose error versus prescribed target by energy (IC1/IC2/IC3).",
-            ),
-            (
-                "Dose Error vs Energy (mean)",
-                "dose_error_energy_mean",
-                "Mean percent dose error per energy layer (IC1/IC2/IC3).",
-            ),
-            (
-                "Dose Error vs Target MU",
-                "dose_error_mu",
-                "Per-spot percent dose error versus prescribed target MU.",
-            ),
-            (
                 "Dose Accumulation",
                 "dose_accumulation",
                 "Expected versus measured cumulative dose for each ion chamber.",
@@ -182,11 +151,6 @@ VIEW_GROUPS: list[tuple[str, list[ViewEntry]]] = [
                 "Beam-On vs Beam-Off Current",
                 "beam_on_off_current",
                 "Beam-on and beam-off current distributions by energy.",
-            ),
-            (
-                "Spot Delivery Time",
-                "spot_delivery_time",
-                "Total, beam-on, and overhead time per delivered spot.",
             ),
         ],
     ),

@@ -19,6 +19,7 @@ from scan_kit.common.plotting import (
 from scan_kit.views.binned_summary_catalog import (
     PRESET_DOSE_RATIO_ENERGY,
     PRESET_SIGMA_ENERGY,
+    PRESETS,
     X_ENERGY,
     X_TARGET_MU,
     Y_DOSE_RATIO,
@@ -26,6 +27,7 @@ from scan_kit.views.binned_summary_catalog import (
     Y_SIGMA,
     BinnedSummaryConfig,
 )
+from scan_kit.views.binned_summary_preset import run_preset_matplotlib
 from scan_kit.views.binned_summary_data import (
     available_series_keys,
     available_x_params,
@@ -169,3 +171,37 @@ def test_position_error_series_when_available() -> None:
         pytest.skip("position error unavailable")
     keys = available_series_keys(session_data, Y_POSITION_ERROR)
     assert "ic1_x_err" in keys
+
+
+@pytest.mark.parametrize("preset_id", [preset.id for preset in PRESETS])
+def test_run_preset_matplotlib_all_presets(preset_id: str) -> None:
+    run_preset_matplotlib([G3_SESSION], str(TEST_DATA), preset_id)
+    assert plt.get_fignums()
+    plt.close("all")
+
+
+@pytest.mark.parametrize(
+    ("module_name", "preset_id"),
+    [
+        ("dose_ratios_energy", PRESET_DOSE_RATIO_ENERGY),
+        ("sigma_energy", PRESET_SIGMA_ENERGY),
+        ("dose_error_energy", "dose_error_energy"),
+        ("spot_delivery_time", "spot_time_energy"),
+    ],
+)
+def test_legacy_view_wrappers_render_headless(module_name: str, preset_id: str) -> None:
+    import importlib
+
+    from scan_kit.common.report_runner import capture_view_figure
+    from scan_kit.common.settings import ViewSettings
+
+    mod = importlib.import_module(f"scan_kit.views.{module_name}")
+    fig, skip = capture_view_figure(
+        mod.run,
+        [G3_SESSION],
+        str(TEST_DATA),
+        ViewSettings(),
+    )
+    assert skip is None, skip
+    assert fig is not None
+    plt.close(fig)

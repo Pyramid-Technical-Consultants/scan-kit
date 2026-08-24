@@ -40,6 +40,13 @@ def _view(module_name: str) -> tuple[str, str, str]:
     for entry in VIEWS:
         if view_module_name(entry) == module_name:
             return entry
+    from scan_kit.views.binned_summary_catalog import PRESET_BY_ID
+    from scan_kit.views.binned_summary_preset import LEGACY_PRESET_VIEW_MODULES
+
+    preset_id = LEGACY_PRESET_VIEW_MODULES.get(module_name)
+    if preset_id is not None:
+        preset = PRESET_BY_ID[preset_id]
+        return (preset.label, module_name, f"Binned summary preset: {preset.label}.")
     raise KeyError(module_name)
 
 
@@ -96,7 +103,7 @@ def test_suggest_report_title_uses_notes_and_views() -> None:
         {"1943968267": "Calibration Check"},
         [_view("dose_ratios_energy")],
     )
-    assert title == "Dose Ratios vs Energy — Calibration Check"
+    assert title == "Dose ratios vs Energy — Calibration Check"
 
 
 def test_suggest_report_title_collapses_many_views() -> None:
@@ -194,15 +201,15 @@ def test_report_view_groups_excludes_non_static_modules() -> None:
     reportable_modules = {
         view_module_name(entry) for _title, entries in report_view_groups() for entry in entries
     }
-    all_modules = {view_module_name(entry) for entry in VIEWS}
+    all_reportable = reportable_module_names()
     # Interactive shells remain excluded even if not listed in VIEW_GROUPS.
     assert "binned_summary" not in reportable_modules
     assert "timeslice_replay" not in reportable_modules
     assert "ic_timeslice_replay" not in reportable_modules
     assert "session_log_compare" not in reportable_modules
     assert "ic_audio_export" not in reportable_modules
-    assert "dose_ratios_energy" in reportable_modules
-    assert REPORT_EXCLUDED_MODULES & reportable_modules == set()
+    assert "dose_ratios_energy" in all_reportable
+    assert REPORT_EXCLUDED_MODULES & all_reportable == set()
 
 
 def test_report_view_pages_use_vector_pdf(tmp_path: Path) -> None:
