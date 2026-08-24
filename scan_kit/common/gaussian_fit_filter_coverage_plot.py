@@ -1,33 +1,24 @@
-"""Gaussian fit filter coverage — spot retention vs confidence and peak-current thresholds."""
+"""Matplotlib renderer for Gaussian fit filter coverage sweeps."""
 
 from __future__ import annotations
 
-import logging
-
-import matplotlib
-import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.lines import Line2D
 
-from ..common import (
+from . import (
     CELL_SQUARE,
     DEFAULT_SESSION_COLORS,
     GRID_KW,
     finish_view,
     view_grid,
 )
-from ..common.g3_timeslice_position import G3_FIT_CONFIDENCE_MIN
-from ..common.timeslice_gaussian_fit_filter_coverage import (
+from .g3_timeslice_position import G3_FIT_CONFIDENCE_MIN
+from .timeslice_gaussian_fit_filter_coverage import (
     GaussianFitFilterSweep,
     OrphanSpotPeakSeries,
     SessionGaussianFitFilterCoverage,
-    compute_session_gaussian_fit_filter_coverage,
     spot_error_code_name,
 )
-
-_log = logging.getLogger(__name__)
-
-VIEW_TITLE = "Gaussian Fit Filter Coverage"
 
 _ERROR_MARKER_COLORS = {
     0: "#2ca02c",
@@ -511,12 +502,14 @@ def _plot_orphan_peak_rows(
     )
 
 
-def _plot_coverage(
+def render_gaussian_fit_filter_coverage(
     filter_data: dict[str, SessionGaussianFitFilterCoverage],
     loaded_ids: list[str],
     *,
     title: str,
     base_dir: str,
+    fig=None,
+    show: bool = True,
 ) -> None:
     colors = DEFAULT_SESSION_COLORS[: len(loaded_ids)]
     entries = _orphan_peak_plot_entries(filter_data, loaded_ids)
@@ -530,6 +523,7 @@ def _plot_coverage(
         len(_PANELS),
         cell_w=CELL_SQUARE,
         cell_h=cell_h,
+        fig=fig,
     )
 
     row_idx = 0
@@ -563,31 +557,4 @@ def _plot_coverage(
             start_row=row_idx,
         )
 
-    finish_view(fig, title, loaded_ids, colors, base_dir=base_dir)
-
-
-def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -> None:
-    """Plot spot coverage versus Gaussian fit filter thresholds."""
-    if not session_ids:
-        print("No sessions selected")
-        return
-
-    bg_subtract = settings.bg_subtract if settings else False
-    filter_data: dict[str, SessionGaussianFitFilterCoverage] = {}
-    for sid in session_ids:
-        coverage = compute_session_gaussian_fit_filter_coverage(
-            sid, base_dir, bg_subtract=bg_subtract
-        )
-        if coverage is not None:
-            filter_data[sid] = coverage
-
-    if not filter_data:
-        print("No valid Gaussian fit filter coverage data found for any session")
-        return
-
-    _plot_coverage(
-        filter_data,
-        list(filter_data.keys()),
-        title=VIEW_TITLE,
-        base_dir=base_dir,
-    )
+    finish_view(fig, title, loaded_ids, colors, base_dir=base_dir, show=show)

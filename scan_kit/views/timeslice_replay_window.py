@@ -102,27 +102,27 @@ class TimesliceReplayWindow(PlotViewWindow):
 
         options = QGroupBox("Options")
         opt_layout = QVBoxLayout(options)
-        self._bg_check = QCheckBox("Background subtract")
+        self._bg_check = QCheckBox("Background Subtract")
         self._bg_check.setChecked(self._bg_subtract)
         self._bg_check.toggled.connect(self._on_bg_subtract_toggled)
         opt_layout.addWidget(self._bg_check)
 
-        self._peer_check = QCheckBox("Peer overlay (single session)")
+        self._peer_check = QCheckBox("Peer Overlay (Single Session)")
         self._peer_check.setChecked(False)
         self._peer_check.toggled.connect(self._on_controls_changed)
         opt_layout.addWidget(self._peer_check)
 
-        self._edges_check = QCheckBox("Beam-off edges")
+        self._edges_check = QCheckBox("Beam-Off Edges")
         self._edges_check.setChecked(True)
         self._edges_check.toggled.connect(self._on_controls_changed)
         opt_layout.addWidget(self._edges_check)
 
-        self._digital_check = QCheckBox("Digital lanes")
+        self._digital_check = QCheckBox("Digital Lanes")
         self._digital_check.setChecked(True)
         self._digital_check.toggled.connect(self._on_controls_changed)
         opt_layout.addWidget(self._digital_check)
 
-        self._beam_check = QCheckBox("Beam current twin axis")
+        self._beam_check = QCheckBox("Beam Current Twin Axis")
         self._beam_check.setChecked(True)
         self._beam_check.toggled.connect(self._on_controls_changed)
         opt_layout.addWidget(self._beam_check)

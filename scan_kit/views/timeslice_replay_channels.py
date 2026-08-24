@@ -53,7 +53,7 @@ PRESET_SIGMA = "sigma"
 PRESET_FIELD = "field"
 
 PRESET_LABELS: dict[str, str] = {
-    PRESET_IC_CURRENT: "IC current",
+    PRESET_IC_CURRENT: "IC Current",
     PRESET_DDOSE: "dDose/dt",
     PRESET_SIGMA: "Sigma",
     PRESET_FIELD: "Field",

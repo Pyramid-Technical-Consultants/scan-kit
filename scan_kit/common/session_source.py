@@ -374,14 +374,54 @@ def load_session_csv(source: SessionSource, csv_name: str) -> pd.DataFrame | Non
         return None
 
 
+def read_session_csv_columns(source: SessionSource, csv_name: str) -> list[str] | None:
+    """Return column names from a session CSV without reading row data."""
+    sid = source.session_id
+    try:
+        if source.kind == "directory":
+            p = source.path / csv_name
+            if not p.is_file():
+                return None
+            return _read_csv_header_columns(p)
+
+        if source.kind == "zip":
+            with zipfile.ZipFile(source.path, "r") as zf:
+                with zf.open(f"{sid}/{csv_name}") as f:
+                    return _read_csv_header_columns(f)
+
+        if source.kind == "tar":
+            with tarfile.open(source.path, "r:*") as tf:
+                member = f"{sid}/{csv_name}"
+                try:
+                    info = tf.getmember(member)
+                except KeyError:
+                    return None
+                raw = tf.extractfile(info)
+                if raw is None:
+                    return None
+                return _read_csv_header_columns(raw)
+    except Exception as e:
+        _log.debug(
+            "Error reading header for %s from session %s: %s",
+            csv_name,
+            sid,
+            e,
+        )
+        return None
+
+
 def load_session_timeslice_device_units(
     source: SessionSource,
     usecols: list[str] | None = None,
+    *,
+    max_frames: int | None = None,
 ) -> list[pd.DataFrame]:
-    """Load all per-layer timeslice_data_device_units CSVs.
+    """Load per-layer timeslice_data_device_units CSVs.
 
     G2 IC current columns are automatically converted from coulombs to nA
     by the canonicalization step inside ``_read_csv_robust``.
+
+    When *max_frames* is set, stop after that many layer files (for cheap probes).
     """
     sid = source.session_id
     try:
@@ -409,22 +449,28 @@ def load_session_timeslice_device_units(
                 df = _read_csv_robust(p, usecols=usecols, raw_usecols=raw_usecols)
                 df["_layer_idx"] = layer_idx
                 frames.append(df)
+                if max_frames is not None and len(frames) >= max_frames:
+                    break
             return frames
 
         if source.kind == "zip":
             with zipfile.ZipFile(source.path, "r") as zf:
-                return _timeslices_from_zip(zf, sid, usecols)
+                return _timeslices_from_zip(zf, sid, usecols, max_frames=max_frames)
 
         if source.kind == "tar":
             with tarfile.open(source.path, "r:*") as tf:
-                return _timeslices_from_tar(tf, sid, usecols)
+                return _timeslices_from_tar(tf, sid, usecols, max_frames=max_frames)
     except Exception as e:
         _log.debug("Error loading timeslice data from session %s: %s", sid, e)
         return []
 
 
 def _timeslices_from_zip(
-    zf: zipfile.ZipFile, session_id: str, usecols: list[str] | None
+    zf: zipfile.ZipFile,
+    session_id: str,
+    usecols: list[str] | None,
+    *,
+    max_frames: int | None = None,
 ) -> list[pd.DataFrame]:
     matches: list[tuple[int, str]] = []
     for entry in zf.namelist():
@@ -443,11 +489,17 @@ def _timeslices_from_zip(
             df = _read_csv_robust(f, usecols=usecols, raw_usecols=raw_usecols)
         df["_layer_idx"] = layer_idx
         frames.append(df)
+        if max_frames is not None and len(frames) >= max_frames:
+            break
     return frames
 
 
 def _timeslices_from_tar(
-    tf: tarfile.TarFile, session_id: str, usecols: list[str] | None
+    tf: tarfile.TarFile,
+    session_id: str,
+    usecols: list[str] | None,
+    *,
+    max_frames: int | None = None,
 ) -> list[pd.DataFrame]:
     matches: list[tuple[int, tarfile.TarInfo]] = []
     for info in tf.getmembers():
@@ -468,6 +520,8 @@ def _timeslices_from_tar(
         df = _read_csv_robust(raw, usecols=usecols, raw_usecols=raw_usecols)
         df["_layer_idx"] = layer_idx
         frames.append(df)
+        if max_frames is not None and len(frames) >= max_frames:
+            break
     return frames
 
 

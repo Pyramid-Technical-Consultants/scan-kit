@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Sequence
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QStandardItem, QStandardItemModel
 from PySide6.QtWidgets import (
     QButtonGroup,
@@ -19,20 +19,22 @@ from PySide6.QtWidgets import (
 
 from ..common import ViewSettings
 from .binned_summary_catalog import (
+    DATA_SOURCE_SPOT,
     GLYPH_BOX,
     GLYPH_MEAN,
     GLYPH_VIOLIN,
     PRESETS,
     PRESET_BY_ID,
+    VIEW_OPTIONS,
+    X_ENERGY,
     X_PARAMS,
-    Y_GROUPS,
     BinnedSummaryConfig,
 )
 from .binned_summary_data import (
-    available_x_params,
-    available_y_groups,
+    available_x_params_for_source,
     default_config,
-    load_sessions_summary,
+    load_sessions_for_source,
+    probe_view_option_availability,
 )
 from .binned_summary_ui import render_binned_summary
 from .plot_view_shell import (
@@ -41,6 +43,8 @@ from .plot_view_shell import (
     make_side_panel_column,
     run_view_window,
 )
+from .unified_catalog import option_key
+from .unified_view_controls import DataSourceOptionPanel
 
 
 class BinnedSummaryWindow(PlotViewWindow):
@@ -65,18 +69,35 @@ class BinnedSummaryWindow(PlotViewWindow):
         self._session_ids = list(session_ids)
         self._base_dir = base_dir
         self._settings = settings
-        self._session_data = load_sessions_summary(
-            self._session_ids, self._base_dir, settings=settings,
+        self._session_data_cache: dict[str, dict[str, dict]] = {}
+        self._spot_data = load_sessions_for_source(
+            self._session_ids, self._base_dir, DATA_SOURCE_SPOT, settings=settings,
         )
-        self._y_avail = available_y_groups(self._session_data)
-        self._x_avail = available_x_params(self._session_data)
+        self._session_data_cache[DATA_SOURCE_SPOT] = self._spot_data
+        self._option_availability = probe_view_option_availability(
+            self._session_ids,
+            self._base_dir,
+            spot_data=self._spot_data,
+        )
+        self._x_avail = available_x_params_for_source(
+            self._spot_data, DATA_SOURCE_SPOT,
+        )
         self._updating = False
+        self._metric_panel: DataSourceOptionPanel | None = None
+        self._refresh_timer = QTimer(self)
+        self._refresh_timer.setSingleShot(True)
+        self._refresh_timer.setInterval(60)
+        self._refresh_timer.timeout.connect(self._refresh_plot)
 
         self.set_side_panel(self._build_controls())
         if initial_preset and initial_preset in PRESET_BY_ID:
             self._apply_preset(initial_preset)
         else:
-            cfg = default_config(self._session_data)
+            cfg = default_config(
+                self._spot_data,
+                source=DATA_SOURCE_SPOT,
+                option_availability=self._option_availability,
+            )
             self._set_controls_from_config(cfg)
             self._refresh_plot()
 
@@ -89,7 +110,10 @@ class BinnedSummaryWindow(PlotViewWindow):
                     (
                         preset.id,
                         preset.label,
-                        preset.y_group in self._y_avail
+                        self._option_availability.get(
+                            option_key(DATA_SOURCE_SPOT, preset.y_group),
+                            False,
+                        )
                         and preset.x_param in self._x_avail,
                     )
                     for preset in PRESETS
@@ -98,30 +122,23 @@ class BinnedSummaryWindow(PlotViewWindow):
             )
         )
 
-        y_group = QGroupBox("Y metric")
-        y_layout = QVBoxLayout(y_group)
-        self._y_combo = QComboBox()
-        y_model = QStandardItemModel(self._y_combo)
-        for group in Y_GROUPS:
-            item = QStandardItem(group.label)
-            item.setData(group.id, Qt.ItemDataRole.UserRole)
-            item.setEnabled(group.id in self._y_avail)
-            y_model.appendRow(item)
-        self._y_combo.setModel(y_model)
-        self._y_combo.currentIndexChanged.connect(self._on_controls_changed)
-        y_layout.addWidget(self._y_combo)
-        layout.addWidget(y_group)
+        self._metric_panel = DataSourceOptionPanel(
+            on_selection_changed=self._on_metric_selection_changed,
+        )
+        self._metric_panel.configure(
+            VIEW_OPTIONS,
+            self._option_availability,
+            group_title="Y Metric",
+            preferred_source=DATA_SOURCE_SPOT,
+        )
+        layout.addWidget(self._metric_panel)
 
-        x_group = QGroupBox("X parameter")
+        x_group = QGroupBox("X Parameter")
         x_layout = QVBoxLayout(x_group)
         self._x_combo = QComboBox()
-        x_model = QStandardItemModel(self._x_combo)
-        for param in X_PARAMS:
-            item = QStandardItem(param.label)
-            item.setData(param.id, Qt.ItemDataRole.UserRole)
-            item.setEnabled(param.id in self._x_avail)
-            x_model.appendRow(item)
-        self._x_combo.setModel(x_model)
+        self._x_model = QStandardItemModel(self._x_combo)
+        self._x_combo.setModel(self._x_model)
+        self._refresh_x_combo()
         self._x_combo.currentIndexChanged.connect(self._on_controls_changed)
         x_layout.addWidget(self._x_combo)
         layout.addWidget(x_group)
@@ -146,31 +163,74 @@ class BinnedSummaryWindow(PlotViewWindow):
 
         opts = QGroupBox("Options")
         opt_layout = QVBoxLayout(opts)
-        self._trend_check = QCheckBox("Trend line")
+        self._trend_check = QCheckBox("Trend Line")
         self._trend_check.setChecked(True)
         self._trend_check.toggled.connect(self._on_controls_changed)
         opt_layout.addWidget(self._trend_check)
 
-        self._hist_check = QCheckBox("Histogram panel")
+        self._hist_check = QCheckBox("Histogram Panel")
         self._hist_check.toggled.connect(self._on_controls_changed)
         opt_layout.addWidget(self._hist_check)
 
-        self._corr_check = QCheckBox("Correlation panel")
+        self._corr_check = QCheckBox("Correlation Panel")
         self._corr_check.toggled.connect(self._on_controls_changed)
         opt_layout.addWidget(self._corr_check)
 
-        self._fliers_check = QCheckBox("Show box outliers")
+        self._fliers_check = QCheckBox("Show Box Outliers")
         self._fliers_check.toggled.connect(self._on_controls_changed)
         opt_layout.addWidget(self._fliers_check)
         layout.addWidget(opts)
 
-        if not self._session_data:
+        if not self._spot_data:
             note = QLabel("No summary data found for the selected sessions.")
             note.setWordWrap(True)
             layout.addWidget(note)
 
         layout.addStretch(1)
         return panel
+
+    def _current_source(self) -> str:
+        if self._metric_panel is None:
+            return DATA_SOURCE_SPOT
+        return self._metric_panel.selected_source()
+
+    def _session_data(self) -> dict[str, dict]:
+        source = self._current_source()
+        cached = self._session_data_cache.get(source)
+        if cached is not None:
+            return cached
+        loaded = load_sessions_for_source(
+            self._session_ids,
+            self._base_dir,
+            source,  # type: ignore[arg-type]
+            settings=self._settings,
+        )
+        self._session_data_cache[source] = loaded
+        return loaded
+
+    def _refresh_x_combo(self) -> None:
+        source = self._current_source()
+        session_data = self._session_data()
+        self._x_avail = available_x_params_for_source(session_data, source)  # type: ignore[arg-type]
+        current = self._x_combo.currentData()
+        self._updating = True
+        try:
+            self._x_model.clear()
+            for param in X_PARAMS:
+                item = QStandardItem(param.label)
+                item.setData(param.id, Qt.ItemDataRole.UserRole)
+                item.setEnabled(param.id in self._x_avail)
+                self._x_model.appendRow(item)
+            if current in self._x_avail:
+                idx = self._x_combo.findData(current)
+            elif X_ENERGY in self._x_avail:
+                idx = self._x_combo.findData(X_ENERGY)
+            else:
+                idx = 0 if self._x_model.rowCount() else -1
+            if idx >= 0:
+                self._x_combo.setCurrentIndex(idx)
+        finally:
+            self._updating = False
 
     def _selected_glyph(self) -> str:
         for btn in (self._glyph_box, self._glyph_violin, self._glyph_mean):
@@ -179,8 +239,14 @@ class BinnedSummaryWindow(PlotViewWindow):
         return GLYPH_BOX
 
     def _read_config(self) -> BinnedSummaryConfig:
+        y_group = (
+            self._metric_panel.selected_id()
+            if self._metric_panel is not None
+            else None
+        )
         return BinnedSummaryConfig(
-            y_group=self._y_combo.currentData(),
+            y_group=y_group or PRESETS[0].y_group,
+            source=self._current_source(),
             x_param=self._x_combo.currentData(),
             glyph=self._selected_glyph(),  # type: ignore[arg-type]
             show_trend=self._trend_check.isChecked(),
@@ -192,9 +258,12 @@ class BinnedSummaryWindow(PlotViewWindow):
     def _set_controls_from_config(self, config: BinnedSummaryConfig) -> None:
         self._updating = True
         try:
-            y_idx = self._y_combo.findData(config.y_group)
-            if y_idx >= 0:
-                self._y_combo.setCurrentIndex(y_idx)
+            if self._metric_panel is not None:
+                self._metric_panel.select_id(
+                    config.y_group,
+                    source=config.source,  # type: ignore[arg-type]
+                )
+            self._refresh_x_combo()
             x_idx = self._x_combo.findData(config.x_param)
             if x_idx >= 0:
                 self._x_combo.setCurrentIndex(x_idx)
@@ -215,6 +284,7 @@ class BinnedSummaryWindow(PlotViewWindow):
         self._set_controls_from_config(
             BinnedSummaryConfig(
                 y_group=preset.y_group,
+                source=DATA_SOURCE_SPOT,
                 x_param=preset.x_param,
                 glyph=preset.glyph,
                 show_trend=preset.show_trend,
@@ -224,16 +294,23 @@ class BinnedSummaryWindow(PlotViewWindow):
         )
         self._refresh_plot()
 
+    def _on_metric_selection_changed(self) -> None:
+        if self._updating:
+            return
+        self._refresh_x_combo()
+        self._on_controls_changed()
+
     def _on_controls_changed(self, *_args) -> None:
         if self._updating:
             return
-        self._refresh_plot()
+        self._refresh_timer.start()
 
     def _refresh_plot(self) -> None:
         config = self._read_config()
+        session_data = self._session_data()
         self.setWindowTitle(config.title)
         render_binned_summary(
-            self.figure, config, self._session_data, self._base_dir,
+            self.figure, config, session_data, self._base_dir,
         )
         self.draw_idle()
 

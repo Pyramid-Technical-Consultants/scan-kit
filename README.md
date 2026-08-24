@@ -165,17 +165,22 @@ Settings persist in `<data_source>/settings.json` and propagate to views that ar
 
 ### 5. Open analysis views
 
-Click any button in the right-hand panel. Views are grouped by analysis category (see [Analysis views](#analysis-views)). Each view runs in a background subprocess; a warm worker pool makes the first click feel snappy.
+Click any button in the right-hand panel. **Unified views** appear first; specialized plots follow (see [Analysis views](#analysis-views)). Each view runs in a background subprocess; a warm worker pool makes the first click feel snappy.
 
 ## Analysis views
 
-Views are organized in the launcher to match clinical QA workflows. Select one or more sessions, then click a view to open it.
+Views are organized in the launcher with **unified reusable views first**; the specialized plots below are the remaining single-purpose modules still to consolidate.
 
-### Summary plots
+### Unified views
+
+Configurable Qt shells that replace many former standalone plots.
 
 | View | Summary |
 |------|---------|
 | Binned Summary | Universal box/violin/mean summary — pick **Y metric** (dose error, dose ratios, position error, sigma, spot time) and **X parameter** (energy, target MU, spot time, beam radius). **Presets** cover the former standalone vs-Energy / vs-MU / vs-time plots. |
+| Distribution Explorer | Density contours and fit-quality plots — position error (timeslice/spot), sigma, confidence correlations, and Gaussian filter coverage. |
+| Timeslice Replay | Interactive multi-channel timeslice viewer — [details](#interactive-replay-views) |
+| Session Log Compare | Layer timings, grouped errors, event browser, two-session diff — [details](#session-log-compare) |
 
 ### Beam distribution
 
@@ -183,15 +188,12 @@ How well does the beam land where the plan says it should?
 
 | View | Summary |
 |------|---------|
-| Position Error Distribution (Timeslice) | Beam-on timeslice error density contours and histograms |
-| Position Error Distribution (Spot) | Per-spot error density contours and histograms |
 | Position Error Outliers (Spot) | Spots that are statistical outliers (median/MAD) |
-| Sigma Distribution (Timeslice) | Beam-on timeslice σ density contours and histograms |
-| Confidence Correlations (Timeslice) | G3 fit confidence vs peak current and primary channel |
-| Gaussian Fit Filter Coverage | Spot retention vs fit confidence, peak current, and error code |
 | Position Scatter | Planned, IC1, and IC2 positions overlaid by session |
 | IC Beam Trajectory | Per-spot IC beam path in X and Y along the beam axis |
 | Beam Error Motion vs Energy | Per-energy position-error spill paths (IC1 solid, IC2 dotted) |
+
+Use **Distribution Explorer** for position-error and sigma density contours, confidence correlations, and Gaussian filter coverage. Use **Binned Summary** for the same metrics binned vs energy, MU, spot time, or radius.
 
 ### Dosimetry
 
@@ -216,7 +218,7 @@ Use **Binned Summary** presets for dose error, dose ratios, position error, sigm
 | View | Summary |
 |------|---------|
 | Beam-Off Ramp-Down | Beam-off current ramp-down curves (IC1/IC2/IC3) |
-| Timeslice Replay | Interactive multi-channel timeslice viewer — [details](#interactive-replay-views) |
+| IC HV Transient Test | IC high-voltage toggle transients with capacitance re-derived from waveforms |
 
 ### Magnetic analysis
 
@@ -231,12 +233,6 @@ Use **Binned Summary** presets for dose error, dose ratios, position error, sigm
 | IC Current FFT Analysis | Frequency-domain view of IC1/IC2/IC3 current |
 | IC Peak Amplitude — Beam-Off (G3) | G3 beam-off peak amplitude distributions |
 | IC Audio Export (WAV) | Listen to and export IC waveforms as WAV *(requires PortAudio)* |
-
-### Session log
-
-| View | Summary |
-|------|---------|
-| Session Log Compare | Layer timings, grouped errors, event browser, two-session diff — [details](#session-log-compare) |
 
 ### Interactive replay views
 

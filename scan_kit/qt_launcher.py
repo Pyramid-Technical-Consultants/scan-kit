@@ -53,6 +53,7 @@ from .common.app_icon import (
     prepare_qt_app_identity,
 )
 from .common.app_settings import AppSettings
+from .common.segmented_control import SegmentedControl as _SegmentedControl
 from .common.debug_log_panel import DebugLogPanel
 from .common.session_browser import SessionBrowserWidget
 from .common.session_meta import SessionMeta
@@ -115,100 +116,6 @@ _CAL_FACTOR_LABELS = {
     "ic2_total_dose": "IC2",
     "ic3_total_dose": "IC3",
 }
-
-
-# Segmented control look: connected checkable buttons, accent-filled when selected.
-# Uses palette() roles so it follows the active light/dark theme.
-_SEGMENTED_QSS = """
-_SegmentedControl QPushButton {
-    border: 1px solid palette(mid);
-    padding: 5px 14px;
-    background: palette(button);
-    color: palette(button-text);
-}
-_SegmentedControl QPushButton[seg="mid"],
-_SegmentedControl QPushButton[seg="right"] {
-    border-left: none;
-}
-_SegmentedControl QPushButton[seg="left"] {
-    border-top-left-radius: 6px;
-    border-bottom-left-radius: 6px;
-}
-_SegmentedControl QPushButton[seg="right"] {
-    border-top-right-radius: 6px;
-    border-bottom-right-radius: 6px;
-}
-_SegmentedControl QPushButton[seg="only"] {
-    border-radius: 6px;
-}
-_SegmentedControl QPushButton:hover:!checked {
-    background: palette(midlight);
-}
-_SegmentedControl QPushButton:checked {
-    background: palette(highlight);
-    color: palette(highlighted-text);
-    border-color: palette(highlight);
-}
-"""
-
-class _SegmentedControl(QWidget):
-    """Compact horizontal selector: connected checkable buttons that act as one radio set.
-
-    Build with ``[(key, label), …]``; emits :attr:`selectionChanged` with the chosen
-    key on user interaction only. Use :meth:`set_current` to reflect external state
-    without re-emitting.
-    """
-
-    selectionChanged = Signal(str)
-
-    def __init__(
-        self,
-        options: list[tuple[str, str]],
-        parent: QWidget | None = None,
-    ) -> None:
-        super().__init__(parent)
-        self._buttons: dict[str, QPushButton] = {}
-        self._group = QButtonGroup(self)
-        self._group.setExclusive(True)
-
-        lay = QHBoxLayout(self)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(0)
-
-        n = len(options)
-        for i, (key, label) in enumerate(options):
-            btn = QPushButton(label)
-            btn.setCheckable(True)
-            btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            btn.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
-            if n == 1:
-                seg = "only"
-            elif i == 0:
-                seg = "left"
-            elif i == n - 1:
-                seg = "right"
-            else:
-                seg = "mid"
-            btn.setProperty("seg", seg)
-            self._group.addButton(btn)
-            self._buttons[key] = btn
-            lay.addWidget(btn)
-
-        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
-        self.setStyleSheet(_SEGMENTED_QSS)
-        # buttonClicked fires only on user interaction, not programmatic setChecked.
-        self._group.buttonClicked.connect(self._on_clicked)
-
-    def _on_clicked(self, button: QPushButton) -> None:
-        for key, btn in self._buttons.items():
-            if btn is button:
-                self.selectionChanged.emit(key)
-                return
-
-    def set_current(self, key: str) -> None:
-        btn = self._buttons.get(key)
-        if btn is not None:
-            btn.setChecked(True)
 
 
 class ScanKitMainWindow(QMainWindow):

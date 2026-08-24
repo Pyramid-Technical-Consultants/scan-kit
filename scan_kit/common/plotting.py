@@ -620,6 +620,7 @@ def view_grid(
     cell_h: float = CELL_H,
     header: bool = True,
     squeeze: bool = False,
+    fig=None,
     **subplots_kwargs,
 ):
     """Create a standard analytic-view subplot grid sized by per-cell dimensions.
@@ -628,14 +629,28 @@ def view_grid(
     proportions and header spacing stay consistent across views. Pass
     ``header=False`` to omit the reserved header band (views without a header).
 
+    When *fig* is provided, subplots are created on that figure (for embedded Qt
+    canvases) instead of ``pyplot.subplots``.
+
     Returns the ``(fig, axes)`` tuple from :func:`matplotlib.pyplot.subplots`.
     With the default ``squeeze=False``, *axes* is always a 2-D array.
     """
     fig_w = ncols * cell_w
     fig_h = nrows * cell_h + (HEADER_H if header else 0.0)
-    return plt.subplots(
-        nrows, ncols, figsize=(fig_w, fig_h), squeeze=squeeze, **subplots_kwargs
-    )
+    if fig is None:
+        return plt.subplots(
+            nrows,
+            ncols,
+            figsize=(fig_w, fig_h),
+            squeeze=squeeze,
+            **subplots_kwargs,
+        )
+
+    fig.clear()
+    # Embedded Qt canvases own the physical size; resizing here leaves letterboxing
+    # when switching between distribution modes with different grid shapes.
+    axes = fig.subplots(nrows, ncols, squeeze=squeeze, **subplots_kwargs)
+    return fig, axes
 
 
 def finish_view(
@@ -659,9 +674,11 @@ def finish_view(
     interactive launcher and headless Agg tests (patched show).
     """
     set_view_header(fig, title, session_ids, colors, base_dir=base_dir, notes=notes)
-    apply_tight_layout(fig, **layout_kwargs)
     if show:
+        apply_tight_layout(fig, **layout_kwargs)
         plt.show()
+    else:
+        apply_toolbar_tight_layout(fig)
 
 
 def relayout_view_for_pdf_export(

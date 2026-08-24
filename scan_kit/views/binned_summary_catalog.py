@@ -5,6 +5,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
+from .unified_catalog import (
+    DATA_SOURCE_SPOT,
+    DATA_SOURCE_TIMESLICE,
+    UnifiedViewOption,
+    option_key,
+)
+
 Glyph = Literal["box", "violin", "mean"]
 BinMode = Literal["unique", "quantile"]
 
@@ -47,6 +54,7 @@ class YGroupDef:
     series: tuple[SeriesDef, ...]
     default_glyph: Glyph
     trend_unit: str
+    sources: tuple[str, ...] = (DATA_SOURCE_SPOT,)
 
 
 @dataclass(frozen=True)
@@ -74,7 +82,7 @@ class PresetDef:
 Y_GROUPS: tuple[YGroupDef, ...] = (
     YGroupDef(
         Y_DOSE_ERROR,
-        "Dose error (%)",
+        "Dose Error (%)",
         (
             SeriesDef("ic1_dose_err_pct", "IC1"),
             SeriesDef("ic2_dose_err_pct", "IC2"),
@@ -85,7 +93,7 @@ Y_GROUPS: tuple[YGroupDef, ...] = (
     ),
     YGroupDef(
         Y_DOSE_RATIO,
-        "Dose ratios",
+        "Dose Ratios",
         (
             SeriesDef("ic21_ratio", "IC2/IC1 (%)"),
             SeriesDef("ic31_ratio", "IC3/IC1 (%)"),
@@ -96,7 +104,7 @@ Y_GROUPS: tuple[YGroupDef, ...] = (
     ),
     YGroupDef(
         Y_POSITION_ERROR,
-        "Position error (mm)",
+        "Position Error (mm)",
         (
             SeriesDef("ic1_x_err", "IC1 X"),
             SeriesDef("ic1_y_err", "IC1 Y"),
@@ -105,6 +113,7 @@ Y_GROUPS: tuple[YGroupDef, ...] = (
         ),
         GLYPH_VIOLIN,
         "mm/unit",
+        (DATA_SOURCE_SPOT, DATA_SOURCE_TIMESLICE),
     ),
     YGroupDef(
         Y_SIGMA,
@@ -117,13 +126,14 @@ Y_GROUPS: tuple[YGroupDef, ...] = (
         ),
         GLYPH_VIOLIN,
         "mm/unit",
+        (DATA_SOURCE_SPOT, DATA_SOURCE_TIMESLICE),
     ),
     YGroupDef(
         Y_SPOT_TIME,
-        "Spot delivery time",
+        "Spot Delivery Time",
         (
             SeriesDef("spot_time", "Total (ms)"),
-            SeriesDef("beam_on_time", "Beam-on (ms)"),
+            SeriesDef("beam_on_time", "Beam-On (ms)"),
             SeriesDef("overhead_time", "Overhead (ms)"),
         ),
         GLYPH_BOX,
@@ -134,8 +144,8 @@ Y_GROUPS: tuple[YGroupDef, ...] = (
 X_PARAMS: tuple[XParamDef, ...] = (
     XParamDef(X_ENERGY, "Energy", "energy", "unique", "Energy (MeV)"),
     XParamDef(X_TARGET_MU, "Target MU", "target_mu", "quantile", "Target MU", n_bins=8),
-    XParamDef(X_SPOT_TIME, "Spot time", "spot_time", "quantile", "Spot time (ms)", n_bins=8),
-    XParamDef(X_RADIUS, "Beam radius", "radius", "quantile", "Radius (mm)", n_bins=8),
+    XParamDef(X_SPOT_TIME, "Spot Time", "spot_time", "quantile", "Spot time (ms)", n_bins=8),
+    XParamDef(X_RADIUS, "Beam Radius", "radius", "quantile", "Radius (mm)", n_bins=8),
 )
 
 PRESETS: tuple[PresetDef, ...] = (
@@ -181,10 +191,17 @@ Y_GROUP_BY_ID = {g.id: g for g in Y_GROUPS}
 X_PARAM_BY_ID = {x.id: x for x in X_PARAMS}
 PRESET_BY_ID = {p.id: p for p in PRESETS}
 
+VIEW_OPTIONS: tuple[UnifiedViewOption, ...] = tuple(
+    UnifiedViewOption(group.id, group.label, source)  # type: ignore[arg-type]
+    for group in Y_GROUPS
+    for source in group.sources
+)
+
 
 @dataclass
 class BinnedSummaryConfig:
     y_group: str = Y_DOSE_RATIO
+    source: str = DATA_SOURCE_SPOT
     x_param: str = X_ENERGY
     glyph: Glyph = GLYPH_BOX
     show_trend: bool = True
