@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 import threading
 from collections.abc import Callable
 from typing import Any
 
 from PySide6.QtCore import QObject, QTimer, Signal
+
+_log = logging.getLogger(__name__)
 
 
 class DebouncedBackgroundTask(QObject):
@@ -49,6 +52,7 @@ class DebouncedBackgroundTask(QObject):
             try:
                 result = fn()
             except Exception:
+                _log.exception("Background task failed")
                 result = None
             self.finished.emit(gen, result)
 

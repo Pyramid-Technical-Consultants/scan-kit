@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import sys
-
 import pytest
 from PySide6.QtWidgets import QApplication
 
@@ -16,7 +14,11 @@ from scan_kit.views.unified_catalog import (
     options_for_source,
     source_has_available_options,
 )
-from scan_kit.views.unified_view_controls import DataSourceOptionPanel
+from scan_kit.views.unified_view_controls import (
+    DataSourceOptionPanel,
+    PlotStylePanel,
+)
+from scan_kit.views.unified_catalog import BINNED_PLOT_STYLES, PLOT_STYLE_BOX
 
 OPTIONS = (
     UnifiedViewOption("spot_a", "Spot A", DATA_SOURCE_SPOT),
@@ -63,13 +65,7 @@ def test_source_has_available_options() -> None:
     assert not source_has_available_options(OPTIONS, availability, DATA_SOURCE_TIMESLICE)
 
 
-@pytest.fixture(scope="module")
-def qt_app() -> QApplication:
-    app = QApplication.instance() or QApplication(sys.argv)
-    yield app
-
-
-def test_data_source_option_panel_spot_only_hides_source_group(qt_app: QApplication) -> None:
+def test_data_source_option_panel_spot_only_hides_source_group(qapp) -> None:
     panel = DataSourceOptionPanel()
     availability = {
         "spot:spot_a": True,
@@ -82,7 +78,7 @@ def test_data_source_option_panel_spot_only_hides_source_group(qt_app: QApplicat
     assert panel.selected_id() == "spot_a"
 
 
-def test_data_source_option_panel_switch_source_filters_list(qt_app: QApplication) -> None:
+def test_data_source_option_panel_switch_source_filters_list(qapp: QApplication) -> None:
     panel = DataSourceOptionPanel()
     availability = {
         "spot:spot_a": False,
@@ -98,7 +94,7 @@ def test_data_source_option_panel_switch_source_filters_list(qt_app: QApplicatio
 
 
 def test_data_source_option_panel_preserves_metric_on_source_switch(
-    qt_app: QApplication,
+    qapp: QApplication,
 ) -> None:
     panel = DataSourceOptionPanel()
     options = (
@@ -120,7 +116,7 @@ def test_data_source_option_panel_preserves_metric_on_source_switch(
 
 
 def test_data_source_option_panel_source_switch_falls_back_when_unavailable(
-    qt_app: QApplication,
+    qapp: QApplication,
 ) -> None:
     panel = DataSourceOptionPanel()
     options = (
@@ -139,7 +135,7 @@ def test_data_source_option_panel_source_switch_falls_back_when_unavailable(
 
 
 def test_data_source_option_panel_composite_and_legacy_availability(
-    qt_app: QApplication,
+    qapp: QApplication,
 ) -> None:
     panel = DataSourceOptionPanel()
     availability = {"position_error_timeslice": True}
@@ -148,3 +144,35 @@ def test_data_source_option_panel_composite_and_legacy_availability(
     )
     panel.configure(options, availability, group_title="Distribution")
     assert panel.selected_id() == "position_error_timeslice"
+
+
+def test_plot_style_panel_selects_glyph(qapp: QApplication) -> None:
+    panel = PlotStylePanel(BINNED_PLOT_STYLES, current=PLOT_STYLE_BOX)
+    assert panel.selected_key() == PLOT_STYLE_BOX
+    panel.set_current("violin")
+    assert panel.selected_key() == "violin"
+
+
+def test_plot_style_panel_style_options(qapp: QApplication) -> None:
+    panel = PlotStylePanel(BINNED_PLOT_STYLES, current=PLOT_STYLE_BOX)
+    panel.add_checkbox("trend", "Trend Line", checked=True)
+    panel.add_percent_spinbox("cutoff", "Contour Cutoff", value=30)
+    assert panel.is_checked("trend")
+    panel.set_checked("trend", False)
+    assert not panel.is_checked("trend")
+    assert panel.spin_value("cutoff") == 30
+    panel.set_spin_value("cutoff", 20)
+    assert panel.spin_value("cutoff") == 20
+
+
+def test_data_filter_panel_selects_filters(qapp: QApplication) -> None:
+    from scan_kit.common.data_filter import FILTER_ALL, FILTER_BEAM_ON, FILTER_MAD_OUTLIERS
+    from scan_kit.views.unified_view_controls import DataFilterPanel
+
+    panel = DataFilterPanel(domain_current=FILTER_ALL, beam_current=FILTER_BEAM_ON)
+    assert panel.selected_domain() == FILTER_ALL
+    assert panel.selected_beam_state() == FILTER_BEAM_ON
+    panel.set_domain(FILTER_MAD_OUTLIERS)
+    panel.set_beam_state(FILTER_BEAM_ON)
+    assert panel.selected_domain() == FILTER_MAD_OUTLIERS
+    assert panel.selection().beam_state_filter == FILTER_BEAM_ON

@@ -43,6 +43,7 @@ from ..common.session_source import (
     read_session_csv_columns,
     resolve_session_source,
 )
+from ..common.session_sigma import resolve_spot_sigma_column
 from ..common.settings import ViewSettings
 from ..common.timeslice_confidence import (
     TIMESLICE_CONFIDENCE_COLS,
@@ -96,7 +97,6 @@ def _cache_key(
     return (mode, tuple(session_ids), base_dir, bg)
 
 
-_SIG_KEY_VARIANTS = ("spot_sigma_raw", "spot_sigma")
 _SPOT_SIGMA_ATTRS = (
     ("ic1_x", "ic1", "x"),
     ("ic1_y", "ic1", "y"),
@@ -105,20 +105,12 @@ _SPOT_SIGMA_ATTRS = (
 )
 
 
-def _resolve_sigma_col(columns, ic: str, axis: str) -> str | None:
-    for key in _SIG_KEY_VARIANTS:
-        for prefix in (f"r_{ic}_{axis}_{key}", f"{ic}_{axis}_{key}"):
-            if prefix in columns:
-                return prefix
-    return None
-
-
 def _probe_spot_sigmas(src) -> bool:
     spot_cols = read_session_csv_columns(src, "spot_data.csv")
     if not spot_cols:
         return False
     return all(
-        _resolve_sigma_col(spot_cols, ic, axis) is not None
+        resolve_spot_sigma_column(spot_cols, ic, axis) is not None
         for _attr, ic, axis in _SPOT_SIGMA_ATTRS
     )
 
@@ -130,7 +122,7 @@ def _load_spot_sigmas(session_id: str, base_dir: str) -> SessionIcSigmas | None:
 
     cols: dict[str, str] = {}
     for attr, ic, axis in _SPOT_SIGMA_ATTRS:
-        col = _resolve_sigma_col(spot_data.columns, ic, axis)
+        col = resolve_spot_sigma_column(spot_data.columns, ic, axis)
         if col is None:
             return None
         cols[attr] = col

@@ -139,6 +139,7 @@ class SessionPositionErrors:
     ic1_y: np.ndarray
     ic2_x: np.ndarray
     ic2_y: np.ndarray
+    beam_on: np.ndarray | None = None
 
 
 @dataclass(frozen=True)
@@ -570,14 +571,6 @@ def frame_timeslice_chamber_position_arrays(
     return ic1_x, ic1_y, ic2_x, ic2_y
 
 
-def _beam_on_slices(
-    arrays: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray],
-    beam_on: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    ic1_x, ic1_y, ic2_x, ic2_y = arrays
-    return ic1_x[beam_on], ic1_y[beam_on], ic2_x[beam_on], ic2_y[beam_on]
-
-
 def load_session_beam_on_position_errors(
     session_id: str,
     base_dir: str,
@@ -605,6 +598,7 @@ def load_session_beam_on_position_errors(
     ic1_y_parts: list[np.ndarray] = []
     ic2_x_parts: list[np.ndarray] = []
     ic2_y_parts: list[np.ndarray] = []
+    beam_on_parts: list[np.ndarray] = []
 
     for df in frames:
         beam_on = detect_beam_on_mask(df)
@@ -615,7 +609,7 @@ def load_session_beam_on_position_errors(
         if frame_errors is None:
             continue
 
-        ic1_x, ic1_y, ic2_x, ic2_y = _beam_on_slices(frame_errors, beam_on)
+        ic1_x, ic1_y, ic2_x, ic2_y = frame_errors
         if not np.isfinite(ic1_x).any() and not np.isfinite(ic2_x).any():
             continue
 
@@ -623,6 +617,7 @@ def load_session_beam_on_position_errors(
         ic1_y_parts.append(ic1_y)
         ic2_x_parts.append(ic2_x)
         ic2_y_parts.append(ic2_y)
+        beam_on_parts.append(beam_on.astype(bool))
 
     if not ic1_x_parts:
         return None
@@ -632,6 +627,7 @@ def load_session_beam_on_position_errors(
         ic1_y=np.concatenate(ic1_y_parts),
         ic2_x=np.concatenate(ic2_x_parts),
         ic2_y=np.concatenate(ic2_y_parts),
+        beam_on=np.concatenate(beam_on_parts),
     )
 
 
@@ -685,6 +681,7 @@ def load_session_beam_on_iso_positions(
     ic2_y_parts: list[np.ndarray] = []
     plan_x_parts: list[np.ndarray] = []
     plan_y_parts: list[np.ndarray] = []
+    beam_on_parts: list[np.ndarray] = []
 
     for df in frames:
         beam_on = detect_beam_on_mask(df)
@@ -696,7 +693,7 @@ def load_session_beam_on_iso_positions(
             continue
 
         plan_arrays = frame_timeslice_iso_plan_arrays(df, iso_source)
-        ic1_x, ic1_y, ic2_x, ic2_y = _beam_on_slices(frame_positions, beam_on)
+        ic1_x, ic1_y, ic2_x, ic2_y = frame_positions
         if not np.isfinite(ic1_x).any() and not np.isfinite(ic2_x).any():
             continue
 
@@ -704,10 +701,11 @@ def load_session_beam_on_iso_positions(
         ic1_y_parts.append(ic1_y)
         ic2_x_parts.append(ic2_x)
         ic2_y_parts.append(ic2_y)
+        beam_on_parts.append(beam_on.astype(bool))
         if plan_arrays is not None:
             plan_x, plan_y = plan_arrays
-            plan_x_parts.append(plan_x[beam_on])
-            plan_y_parts.append(plan_y[beam_on])
+            plan_x_parts.append(plan_x)
+            plan_y_parts.append(plan_y)
 
     if not ic1_x_parts:
         return None
@@ -721,4 +719,5 @@ def load_session_beam_on_iso_positions(
         ic2_y=np.concatenate(ic2_y_parts),
         plan_x=plan_x,
         plan_y=plan_y,
+        beam_on=np.concatenate(beam_on_parts),
     )

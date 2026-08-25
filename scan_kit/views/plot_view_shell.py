@@ -32,6 +32,15 @@ _DEFAULT_SIDE_MIN = 220
 _DEFAULT_SIDE_WIDTH = 280
 
 
+def new_headless_figure(figsize: tuple[float, float]) -> Figure:
+    """Matplotlib figure with an Agg canvas for off-thread rendering."""
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+
+    fig = Figure(figsize=figsize, layout="none")
+    FigureCanvasAgg(fig)
+    return fig
+
+
 class PlotViewWindow(QMainWindow):
     """Matplotlib canvas + toolbar with an optional draggable side panel."""
 

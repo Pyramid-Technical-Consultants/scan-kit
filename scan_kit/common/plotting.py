@@ -12,6 +12,7 @@ from matplotlib.widgets import SpanSelector
 import numpy as np
 import pandas as pd
 from scipy import stats
+from scipy.interpolate import PchipInterpolator
 
 try:
     from numpy.exceptions import RankWarning as _RankWarning
@@ -329,6 +330,9 @@ def plot_means_for_column(
     position_offset=0.35,
     bin_key: str = "energy",
     marker_size: float = 45,
+    *,
+    connect_lines: bool = False,
+    curve_samples: int = 200,
 ):
     """Plot per-bin means as markers across sessions."""
     if colors is None:
@@ -346,10 +350,34 @@ def plot_means_for_column(
                 continue
             xs.append(j + (i - 0.5) * position_offset)
             ys.append(float(np.mean(y_vals[mask])))
-        if xs:
-            ax.scatter(
-                xs, ys, c=colors[i], s=marker_size, zorder=3, edgecolors="none",
+        if not xs:
+            continue
+        xs_arr = np.asarray(xs, dtype=float)
+        ys_arr = np.asarray(ys, dtype=float)
+        color = colors[i]
+        if connect_lines and xs_arr.size >= 2:
+            order = np.argsort(xs_arr)
+            xs_sorted = xs_arr[order]
+            ys_sorted = ys_arr[order]
+            x_fine = np.linspace(float(xs_sorted[0]), float(xs_sorted[-1]), curve_samples)
+            y_fine = PchipInterpolator(xs_sorted, ys_sorted)(x_fine)
+            ax.plot(
+                x_fine,
+                y_fine,
+                color=color,
+                linewidth=2.0,
+                solid_capstyle="round",
+                zorder=2,
             )
+        ax.scatter(
+            xs_arr,
+            ys_arr,
+            c=color,
+            s=marker_size,
+            zorder=4,
+            edgecolors="white",
+            linewidths=0.6,
+        )
 
 def annotate_slopes(ax, labels_and_colors, *, x_anchor=0.03, y_top=0.97,
                     line_pitch=None):

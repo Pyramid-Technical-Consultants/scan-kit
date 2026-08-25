@@ -4,15 +4,30 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
+    QCheckBox,
+    QComboBox,
     QGroupBox,
+    QHBoxLayout,
+    QLabel,
     QListWidget,
     QListWidgetItem,
+    QSizePolicy,
+    QSpinBox,
     QVBoxLayout,
     QWidget,
 )
 
+from ..common.data_filter import (
+    BEAM_STATE_FILTERS,
+    DOMAIN_FILTERS,
+    FILTER_ALL,
+    FILTER_BEAM_BOTH,
+    FILTER_BEAM_ON,
+    DataFilterSelection,
+    default_data_filter_selection,
+)
 from ..common.segmented_control import SegmentedControl
 from .unified_catalog import (
     DATA_SOURCE_SPOT,
@@ -31,6 +46,261 @@ _SOURCE_OPTIONS = [
     (DATA_SOURCE_SPOT, "Spot"),
     (DATA_SOURCE_TIMESLICE, "Timeslice"),
 ]
+
+PlotStyleChoice = tuple[str, str]
+
+
+class PlotStylePanel(QWidget):
+    """Plot-style segmented control with style-specific options in one fieldset."""
+
+    def __init__(
+        self,
+        styles: Sequence[PlotStyleChoice],
+        parent: QWidget | None = None,
+        *,
+        current: str | None = None,
+        on_selection_changed: Callable[[], None] | None = None,
+        group_title: str = "Plot Style",
+    ) -> None:
+        super().__init__(parent)
+        self._on_selection_changed = on_selection_changed
+        self._styles = tuple(styles)
+        self._checkboxes: dict[str, QCheckBox] = {}
+        self._spin_rows: dict[str, tuple[QWidget, QSpinBox]] = {}
+        self._spin_debounce_timers: dict[str, QTimer] = {}
+        self._spin_debounce_ms = 250
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        self._group_box = QGroupBox(group_title)
+        self._layout = QVBoxLayout(self._group_box)
+        self._segmented = SegmentedControl(list(self._styles))
+        self._segmented.selectionChanged.connect(self._on_segment_changed)
+        self._layout.addWidget(self._segmented)
+        root.addWidget(self._group_box)
+
+        keys = [key for key, _label in self._styles]
+        pick = current if current in keys else (keys[0] if keys else None)
+        if pick is not None:
+            self._segmented.set_current(pick)
+
+    def selected_key(self) -> str | None:
+        key = self._segmented.current_key()
+        return key or None
+
+    def set_current(self, key: str) -> None:
+        self._segmented.set_current(key)
+
+    def set_enabled(self, enabled: bool) -> None:
+        self._group_box.setEnabled(enabled)
+
+    def add_checkbox(
+        self,
+        option_id: str,
+        label: str,
+        *,
+        checked: bool = False,
+    ) -> QCheckBox:
+        box = QCheckBox(label)
+        box.setChecked(checked)
+        box.toggled.connect(self._emit_changed)
+        self._layout.addWidget(box)
+        self._checkboxes[option_id] = box
+        return box
+
+    def add_percent_spinbox(
+        self,
+        option_id: str,
+        label: str,
+        *,
+        value: int = 5,
+        minimum: int = 0,
+        maximum: int = 90,
+    ) -> QSpinBox:
+        row = QWidget()
+        row_layout = QHBoxLayout(row)
+        row_layout.setContentsMargins(0, 0, 0, 0)
+        label_widget = QLabel(label)
+        label_widget.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Preferred,
+        )
+        row_layout.addWidget(label_widget, stretch=1)
+        spin = QSpinBox()
+        spin.setRange(minimum, maximum)
+        spin.setSuffix("%")
+        spin.setValue(value)
+        timer = QTimer(self)
+        timer.setSingleShot(True)
+        timer.setInterval(self._spin_debounce_ms)
+        timer.timeout.connect(self._emit_changed)
+        spin.valueChanged.connect(lambda _value, t=timer: t.start())
+        row_layout.addWidget(spin)
+        self._layout.addWidget(row)
+        self._spin_rows[option_id] = (row, spin)
+        self._spin_debounce_timers[option_id] = timer
+        return spin
+
+    def is_checked(self, option_id: str) -> bool:
+        box = self._checkboxes.get(option_id)
+        return box.isChecked() if box is not None else False
+
+    def set_checked(self, option_id: str, checked: bool) -> None:
+        box = self._checkboxes.get(option_id)
+        if box is not None:
+            box.setChecked(checked)
+
+    def spin_value(self, option_id: str) -> int | None:
+        row = self._spin_rows.get(option_id)
+        return row[1].value() if row is not None else None
+
+    def set_spin_value(self, option_id: str, value: int) -> None:
+        row = self._spin_rows.get(option_id)
+        if row is not None:
+            spin = row[1]
+            spin.blockSignals(True)
+            try:
+                spin.setValue(value)
+            finally:
+                spin.blockSignals(False)
+            timer = self._spin_debounce_timers.get(option_id)
+            if timer is not None:
+                timer.stop()
+
+    def set_option_visible(self, option_id: str, visible: bool) -> None:
+        box = self._checkboxes.get(option_id)
+        if box is not None:
+            box.setVisible(visible)
+        row = self._spin_rows.get(option_id)
+        if row is not None:
+            row[0].setVisible(visible)
+
+    def _on_segment_changed(self, _key: str) -> None:
+        self._emit_changed()
+
+    def _emit_changed(self, *_args) -> None:
+        if self._on_selection_changed is not None:
+            self._on_selection_changed()
+
+
+class DataFilterPanel(QWidget):
+    """Domain and beam-state filter selectors that combine independently."""
+
+    def __init__(
+        self,
+        parent: QWidget | None = None,
+        *,
+        domain_current: str | None = None,
+        beam_current: str | None = None,
+        on_selection_changed: Callable[[], None] | None = None,
+        group_title: str = "Filter Data",
+    ) -> None:
+        super().__init__(parent)
+        self._on_selection_changed = on_selection_changed
+        self._domain_keys = {key for key, _label in DOMAIN_FILTERS}
+        self._beam_keys = {key for key, _label in BEAM_STATE_FILTERS}
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        self._group_box = QGroupBox(group_title)
+        group_layout = QVBoxLayout(self._group_box)
+
+        domain_row = QHBoxLayout()
+        domain_row.addWidget(QLabel("Domain"))
+        self._domain_combo = QComboBox()
+        for key, label in DOMAIN_FILTERS:
+            self._domain_combo.addItem(label, key)
+        self._domain_combo.currentIndexChanged.connect(self._on_index_changed)
+        domain_row.addWidget(self._domain_combo, 1)
+        group_layout.addLayout(domain_row)
+
+        beam_row = QHBoxLayout()
+        self._beam_label = QLabel("Beam")
+        beam_row.addWidget(self._beam_label)
+        self._beam_combo = QComboBox()
+        for key, label in BEAM_STATE_FILTERS:
+            self._beam_combo.addItem(label, key)
+        self._beam_combo.currentIndexChanged.connect(self._on_index_changed)
+        beam_row.addWidget(self._beam_combo, 1)
+        group_layout.addLayout(beam_row)
+
+        root.addWidget(self._group_box)
+
+        domain_pick = (
+            domain_current
+            if domain_current in self._domain_keys
+            else DOMAIN_FILTERS[0][0]
+        )
+        beam_pick = (
+            beam_current
+            if beam_current in self._beam_keys
+            else BEAM_STATE_FILTERS[0][0]
+        )
+        self.set_domain(domain_pick)
+        self.set_beam_state(beam_pick)
+
+    def selection(self) -> DataFilterSelection:
+        return DataFilterSelection(
+            domain_filter=self.selected_domain() or FILTER_ALL,
+            beam_state_filter=self.selected_beam_state() or FILTER_BEAM_BOTH,
+        )
+
+    def selected_domain(self) -> str | None:
+        data = self._domain_combo.currentData()
+        return str(data) if data is not None else None
+
+    def selected_beam_state(self) -> str | None:
+        data = self._beam_combo.currentData()
+        return str(data) if data is not None else None
+
+    def selected_key(self) -> str | None:
+        """Legacy alias: returns domain filter only."""
+        return self.selected_domain()
+
+    def set_domain(self, key: str) -> None:
+        idx = self._domain_combo.findData(key)
+        if idx >= 0:
+            self._domain_combo.setCurrentIndex(idx)
+
+    def set_beam_state(self, key: str) -> None:
+        idx = self._beam_combo.findData(key)
+        if idx >= 0:
+            self._beam_combo.setCurrentIndex(idx)
+
+    def set_current(self, key: str) -> None:
+        """Legacy alias: sets domain filter only."""
+        self.set_domain(key)
+
+    def set_enabled(self, enabled: bool) -> None:
+        self._group_box.setEnabled(enabled)
+
+    def set_beam_enabled(self, enabled: bool) -> None:
+        self._beam_label.setEnabled(enabled)
+        self._beam_combo.setEnabled(enabled)
+
+    def _on_index_changed(self, _index: int) -> None:
+        if self._on_selection_changed is not None:
+            self._on_selection_changed()
+
+
+def sync_data_filter_panel(
+    panel: DataFilterPanel | None,
+    *,
+    supports_filter: bool,
+    has_beam_state: bool,
+) -> None:
+    """Enable filter controls and set defaults for domain and beam state."""
+    if panel is None:
+        return
+    defaults = default_data_filter_selection(has_beam_state=has_beam_state)
+    panel.set_enabled(supports_filter)
+    panel.set_domain(defaults.domain_filter)
+    panel.set_beam_state(defaults.beam_state_filter)
+    panel.set_beam_enabled(supports_filter and has_beam_state)
 
 
 class DataSourceOptionPanel(QWidget):

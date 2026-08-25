@@ -13,7 +13,7 @@ from . import C_CHARGE_REQ, C_ENERGY, create_valid_mask, load_session_raw, resol
 
 _log = logging.getLogger(__name__)
 
-_SIG_KEY_VARIANTS = ("spot_sigma_raw", "spot_sigma")
+SPOT_SIGMA_KEY_VARIANTS = ("spot_sigma_raw", "spot_sigma")
 
 IC_SIGMA_LABELS = (
     ("ic1_sig_x", "ic1", "x"),
@@ -31,8 +31,9 @@ class MeasuredSigmaSpots:
     weights: np.ndarray | None = None
 
 
-def _resolve_sigma_col(columns, ic: str, axis: str) -> str | None:
-    for key in _SIG_KEY_VARIANTS:
+def resolve_spot_sigma_column(columns, ic: str, axis: str) -> str | None:
+    """Return the spot-data column name for one IC axis sigma, if present."""
+    for key in SPOT_SIGMA_KEY_VARIANTS:
         for prefix in (f"r_{ic}_{axis}_{key}", f"{ic}_{axis}_{key}"):
             if prefix in columns:
                 return prefix
@@ -65,7 +66,7 @@ def load_measured_sigma_spots(
     label_to_device = {sig_key: device for device, sig_key in IC_DEVICE_TO_SIG_KEY.items()}
     cols: dict[str, str] = {}
     for label, ic, axis in IC_SIGMA_LABELS:
-        col = _resolve_sigma_col(spot_data.columns, ic, axis)
+        col = resolve_spot_sigma_column(spot_data.columns, ic, axis)
         if col is not None:
             cols[label_to_device[label]] = col
 

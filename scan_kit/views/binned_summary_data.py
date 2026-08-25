@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Sequence
+from typing import Callable, Sequence
 
 import numpy as np
 import pandas as pd
@@ -28,7 +28,7 @@ from ..common import (
     resolve_concept_column,
     try_load_position_data,
 )
-from ..common.schema import C_LAYER_ID
+from ..common.timeslice_table import load_energy_tagged_table
 from ..common.timeslice_position_error import (
     TIMESLICE_POSITION_ERROR_COLS,
     frame_timeslice_error_arrays,
@@ -39,26 +39,29 @@ from ..common.timeslice_sigma import (
     frame_timeslice_sigma_arrays,
     resolve_timeslice_sigma_source,
 )
-from ..common import detect_beam_on_mask, subtract_background_frames
-from ..common.session_source import load_session_timeslice_device_units
+from ..common.current_ratios import load_session_current_ratios
+from ..common.ic_current_timeslice import load_session_ic_current_timeslice
+from ..common.mu_delivery_rate import load_session_mu_delivery_rates
 from .binned_summary_catalog import (
     DATA_SOURCE_SPOT,
     DATA_SOURCE_TIMESLICE,
+    GLYPH_VIOLIN,
     X_ENERGY,
     X_PARAMS,
     VIEW_OPTIONS,
-    X_ENERGY,
-    X_PARAMS,
+    Y_DOSE_RATE,
+    Y_CURRENT_RATIO,
+    Y_IC_CURRENT,
     Y_GROUP_BY_ID,
     Y_GROUPS,
     BinnedSummaryConfig,
 )
+from ..common.session_sigma import IC_SIGMA_LABELS, resolve_spot_sigma_column
 from .distribution_data import probe_session_for_mode
 from .distribution_catalog import (
     MODE_POSITION_ERROR_TIMESLICE,
     MODE_SIGMA_TIMESLICE,
 )
-from .timeslice_replay_common import load_energy_by_layer
 from .unified_catalog import DataSourceKind, is_option_available, option_key
 
 _log = logging.getLogger(__name__)
@@ -73,7 +76,6 @@ _EXTRA_SPOT = [
     "time_s",
     "time_ns",
 ]
-_SIG_KEY_VARIANTS = ("spot_sigma_raw", "spot_sigma")
 
 
 def _ensure_timestamp(data: dict) -> dict:
@@ -89,14 +91,6 @@ def _ensure_timestamp(data: dict) -> dict:
     return result
 
 
-def _resolve_sigma_col(columns, ic: str, axis: str) -> str | None:
-    for key in _SIG_KEY_VARIANTS:
-        for prefix in (f"r_{ic}_{axis}_{key}", f"{ic}_{axis}_{key}"):
-            if prefix in columns:
-                return prefix
-    return None
-
-
 def _load_sigma_columns(session_id: str, base_dir: str) -> dict | None:
     input_map, spot_data = load_session_raw(session_id, base_dir=base_dir)
     if input_map is None or spot_data is None:
@@ -106,13 +100,8 @@ def _load_sigma_columns(session_id: str, base_dir: str) -> dict | None:
         return None
 
     found: dict[str, str] = {}
-    for label, ic, axis in (
-        ("ic1_sig_x", "ic1", "x"),
-        ("ic1_sig_y", "ic1", "y"),
-        ("ic2_sig_x", "ic2", "x"),
-        ("ic2_sig_y", "ic2", "y"),
-    ):
-        col = _resolve_sigma_col(spot_data.columns, ic, axis)
+    for label, ic, axis in IC_SIGMA_LABELS:
+        col = resolve_spot_sigma_column(spot_data.columns, ic, axis)
         if col is not None:
             found[label] = col
     if not found:
@@ -277,42 +266,77 @@ def load_session_summary_table(
     return result
 
 
+def load_session_dose_rate_table(session_id: str, base_dir: str) -> dict | None:
+    """Load one session as layer-level dose rate vs energy rows."""
+    rates = load_session_mu_delivery_rates(session_id, base_dir)
+    if rates is None:
+        return None
+    return {
+        "session_id": session_id,
+        "energy": rates["energy"],
+        "mu_rate": rates["mu_rate"],
+        "session_avg_rate": rates["session_avg_rate"],
+    }
+
+
+def _load_sessions_map(
+    session_ids: Sequence[str],
+    loader: Callable[[str], dict | None],
+) -> dict[str, dict]:
+    out: dict[str, dict] = {}
+    for sid in session_ids:
+        data = loader(sid)
+        if data is not None:
+            out[sid] = data
+    return out
+
+
+def load_sessions_dose_rate(
+    session_ids: Sequence[str],
+    base_dir: str,
+) -> dict[str, dict]:
+    return _load_sessions_map(
+        session_ids,
+        lambda sid: load_session_dose_rate_table(sid, base_dir),
+    )
+
+
+def load_sessions_current_ratios(
+    session_ids: Sequence[str],
+    base_dir: str,
+    *,
+    settings: ViewSettings | None = None,
+) -> dict[str, dict]:
+    bg = settings.bg_subtract if settings else False
+    return _load_sessions_map(
+        session_ids,
+        lambda sid: load_session_current_ratios(sid, base_dir, bg_subtract=bg),
+    )
+
+
+def load_sessions_ic_current(
+    session_ids: Sequence[str],
+    base_dir: str,
+    *,
+    settings: ViewSettings | None = None,
+) -> dict[str, dict]:
+    bg = settings.bg_subtract if settings else False
+    return _load_sessions_map(
+        session_ids,
+        lambda sid: load_session_ic_current_timeslice(sid, base_dir, bg_subtract=bg),
+    )
+
+
 def load_sessions_summary(
     session_ids: Sequence[str],
     base_dir: str,
     *,
     settings: ViewSettings | None = None,
 ) -> dict[str, dict]:
-    out: dict[str, dict] = {}
-    for sid in session_ids:
-        data = load_session_summary_table(sid, base_dir, settings=settings)
-        if data is not None:
-            out[sid] = data
-    return out
-
-
-def _resolve_layer_col(columns) -> str | None:
-    if C_LAYER_ID in columns:
-        return C_LAYER_ID
-    return None
-
-
-def _layer_energy(
-    df,
-    layer_col: str,
-    energy_by_layer: dict,
-) -> float | None:
-    if layer_col not in df.columns or df.empty:
-        return None
-    layer_id = df[layer_col].iloc[0]
-    energy = energy_by_layer.get(layer_id)
-    if energy is None:
-        return None
-    try:
-        value = float(energy)
-    except (TypeError, ValueError):
-        return None
-    return value if np.isfinite(value) else None
+    return _load_sessions_map(
+        session_ids,
+        lambda sid: load_session_summary_table(sid, base_dir, settings=settings),
+    )
 
 
 def _load_timeslice_position_errors(
@@ -321,68 +345,22 @@ def _load_timeslice_position_errors(
     *,
     bg_subtract: bool = False,
 ) -> dict | None:
-    lookup = load_energy_by_layer(session_id, base_dir)
-    if lookup is None:
-        return None
-    src, energy_by_layer = lookup
+    def prepare(src, frames):
+        return resolve_session_timeslice_error_source(src, frames)
 
-    frames = load_session_timeslice_device_units(
-        src, usecols=TIMESLICE_POSITION_ERROR_COLS,
+    def extract(df, error_source):
+        return frame_timeslice_error_arrays(df, error_source)
+
+    table = load_energy_tagged_table(
+        session_id,
+        base_dir,
+        usecols=TIMESLICE_POSITION_ERROR_COLS,
+        bg_subtract=bg_subtract,
+        prepare=prepare,
+        extract=extract,
+        keys=("ic1_x_err", "ic1_y_err", "ic2_x_err", "ic2_y_err"),
     )
-    if not frames:
-        return None
-    if bg_subtract:
-        subtract_background_frames(frames)
-
-    error_source = resolve_session_timeslice_error_source(src, frames)
-    if error_source is None:
-        return None
-
-    layer_col = _resolve_layer_col(frames[0].columns)
-    if layer_col is None:
-        return None
-
-    energy_parts: list[np.ndarray] = []
-    ic1_x_parts: list[np.ndarray] = []
-    ic1_y_parts: list[np.ndarray] = []
-    ic2_x_parts: list[np.ndarray] = []
-    ic2_y_parts: list[np.ndarray] = []
-
-    for df in frames:
-        energy = _layer_energy(df, layer_col, energy_by_layer)
-        if energy is None:
-            continue
-        beam_on = detect_beam_on_mask(df)
-        if beam_on is None:
-            continue
-        frame_errors = frame_timeslice_error_arrays(df, error_source)
-        if frame_errors is None:
-            continue
-        ic1_x, ic1_y, ic2_x, ic2_y = frame_errors
-        ic1_x = ic1_x[beam_on]
-        ic1_y = ic1_y[beam_on]
-        ic2_x = ic2_x[beam_on]
-        ic2_y = ic2_y[beam_on]
-        n = len(ic1_x)
-        if n == 0:
-            continue
-        energy_parts.append(np.full(n, energy, dtype=float))
-        ic1_x_parts.append(ic1_x)
-        ic1_y_parts.append(ic1_y)
-        ic2_x_parts.append(ic2_x)
-        ic2_y_parts.append(ic2_y)
-
-    if not energy_parts:
-        return None
-
-    return {
-        "session_id": session_id,
-        "energy": np.concatenate(energy_parts),
-        "ic1_x_err": np.concatenate(ic1_x_parts),
-        "ic1_y_err": np.concatenate(ic1_y_parts),
-        "ic2_x_err": np.concatenate(ic2_x_parts),
-        "ic2_y_err": np.concatenate(ic2_y_parts),
-    }
+    return table
 
 
 def _load_timeslice_sigmas(
@@ -391,66 +369,21 @@ def _load_timeslice_sigmas(
     *,
     bg_subtract: bool = False,
 ) -> dict | None:
-    lookup = load_energy_by_layer(session_id, base_dir)
-    if lookup is None:
-        return None
-    src, energy_by_layer = lookup
+    def prepare(_src, frames):
+        return resolve_timeslice_sigma_source(frames[0].columns)
 
-    frames = load_session_timeslice_device_units(src, usecols=TIMESLICE_SIGMA_COLS)
-    if not frames:
-        return None
-    if bg_subtract:
-        subtract_background_frames(frames)
+    def extract(df, source):
+        return frame_timeslice_sigma_arrays(df, source)
 
-    source = resolve_timeslice_sigma_source(frames[0].columns)
-    if source is None:
-        return None
-
-    layer_col = _resolve_layer_col(frames[0].columns)
-    if layer_col is None:
-        return None
-
-    energy_parts: list[np.ndarray] = []
-    ic1_x_parts: list[np.ndarray] = []
-    ic1_y_parts: list[np.ndarray] = []
-    ic2_x_parts: list[np.ndarray] = []
-    ic2_y_parts: list[np.ndarray] = []
-
-    for df in frames:
-        energy = _layer_energy(df, layer_col, energy_by_layer)
-        if energy is None:
-            continue
-        beam_on = detect_beam_on_mask(df)
-        if beam_on is None:
-            continue
-        frame_sigmas = frame_timeslice_sigma_arrays(df, source)
-        if frame_sigmas is None:
-            continue
-        ic1_x, ic1_y, ic2_x, ic2_y = frame_sigmas
-        ic1_x = ic1_x[beam_on]
-        ic1_y = ic1_y[beam_on]
-        ic2_x = ic2_x[beam_on]
-        ic2_y = ic2_y[beam_on]
-        n = len(ic1_x)
-        if n == 0:
-            continue
-        energy_parts.append(np.full(n, energy, dtype=float))
-        ic1_x_parts.append(ic1_x)
-        ic1_y_parts.append(ic1_y)
-        ic2_x_parts.append(ic2_x)
-        ic2_y_parts.append(ic2_y)
-
-    if not energy_parts:
-        return None
-
-    return {
-        "session_id": session_id,
-        "energy": np.concatenate(energy_parts),
-        "ic1_sig_x": np.concatenate(ic1_x_parts),
-        "ic1_sig_y": np.concatenate(ic1_y_parts),
-        "ic2_sig_x": np.concatenate(ic2_x_parts),
-        "ic2_sig_y": np.concatenate(ic2_y_parts),
-    }
+    return load_energy_tagged_table(
+        session_id,
+        base_dir,
+        usecols=TIMESLICE_SIGMA_COLS,
+        bg_subtract=bg_subtract,
+        prepare=prepare,
+        extract=extract,
+        keys=("ic1_sig_x", "ic1_sig_y", "ic2_sig_x", "ic2_sig_y"),
+    )
 
 
 def load_session_timeslice_summary_table(
@@ -492,14 +425,12 @@ def load_sessions_timeslice_summary(
     *,
     settings: ViewSettings | None = None,
 ) -> dict[str, dict]:
-    out: dict[str, dict] = {}
-    for sid in session_ids:
-        data = load_session_timeslice_summary_table(
+    return _load_sessions_map(
+        session_ids,
+        lambda sid: load_session_timeslice_summary_table(
             sid, base_dir, settings=settings,
-        )
-        if data is not None:
-            out[sid] = data
-    return out
+        ),
+    )
 
 
 def load_sessions_for_source(
@@ -516,8 +447,19 @@ def load_sessions_for_source(
     return load_sessions_summary(session_ids, base_dir, settings=settings)
 
 
-def _probe_timeslice_y_group(session_ids: Sequence[str], base_dir: str, y_group: str) -> bool:
-    from .binned_summary_catalog import Y_POSITION_ERROR, Y_SIGMA
+def _probe_timeslice_y_group(
+    session_ids: Sequence[str],
+    base_dir: str,
+    y_group: str,
+    *,
+    settings: ViewSettings | None = None,
+) -> bool:
+    from .binned_summary_catalog import Y_CURRENT_RATIO, Y_IC_CURRENT, Y_POSITION_ERROR, Y_SIGMA
+
+    if y_group == Y_CURRENT_RATIO:
+        return bool(load_sessions_current_ratios(session_ids, base_dir, settings=settings))
+    if y_group == Y_IC_CURRENT:
+        return bool(load_sessions_ic_current(session_ids, base_dir, settings=settings))
 
     mode_map = {
         Y_POSITION_ERROR: MODE_POSITION_ERROR_TIMESLICE,
@@ -536,19 +478,45 @@ def probe_view_option_availability(
     base_dir: str,
     *,
     spot_data: dict[str, dict] | None = None,
+    dose_rate_data: dict[str, dict] | None = None,
+    current_ratio_data: dict[str, dict] | None = None,
+    ic_current_data: dict[str, dict] | None = None,
+    settings: ViewSettings | None = None,
 ) -> dict[str, bool]:
     """Return availability for every unified binned-summary option."""
     spot = spot_data if spot_data is not None else load_sessions_summary(
         session_ids, base_dir,
     )
+    dose_rate = dose_rate_data if dose_rate_data is not None else load_sessions_dose_rate(
+        session_ids, base_dir,
+    )
+    current_ratio = (
+        current_ratio_data
+        if current_ratio_data is not None
+        else load_sessions_current_ratios(session_ids, base_dir, settings=settings)
+    )
+    ic_current = (
+        ic_current_data
+        if ic_current_data is not None
+        else load_sessions_ic_current(session_ids, base_dir, settings=settings)
+    )
     spot_y = available_y_groups(spot)
+    if Y_DOSE_RATE in available_y_groups(dose_rate):
+        spot_y.add(Y_DOSE_RATE)
     availability: dict[str, bool] = {}
     for opt in VIEW_OPTIONS:
         key = option_key(opt.source, opt.id)
         if opt.source == DATA_SOURCE_SPOT:
             availability[key] = opt.id in spot_y
         else:
-            availability[key] = _probe_timeslice_y_group(session_ids, base_dir, opt.id)
+            if opt.id == Y_CURRENT_RATIO and current_ratio_data is not None:
+                availability[key] = opt.id in available_y_groups(current_ratio_data)
+            elif opt.id == Y_IC_CURRENT and ic_current_data is not None:
+                availability[key] = opt.id in available_y_groups(ic_current_data)
+            else:
+                availability[key] = _probe_timeslice_y_group(
+                    session_ids, base_dir, opt.id, settings=settings,
+                )
     return availability
 
 
@@ -587,8 +555,11 @@ def default_config(
         y_avail = available_y_groups(session_data)
         y_group = next((g.id for g in Y_GROUPS if g.id in y_avail), Y_GROUPS[0].id)
     x_avail = available_x_params_for_source(session_data, source)
-    x_param = next((x.id for x in X_PARAMS if x.id in x_avail), X_PARAMS[0].id)
-    glyph = Y_GROUP_BY_ID[y_group].default_glyph
+    if x_avail:
+        x_param = next((x.id for x in X_PARAMS if x.id in x_avail), next(iter(x_avail)))
+    else:
+        x_param = X_ENERGY
+    glyph = GLYPH_VIOLIN
     return BinnedSummaryConfig(y_group=y_group, source=source, x_param=x_param, glyph=glyph)
 
 

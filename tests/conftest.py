@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import sys
 
 # Must be set before matplotlib is imported anywhere in the test process.
 os.environ.setdefault("MPLBACKEND", "Agg")
@@ -13,6 +14,17 @@ matplotlib.use("Agg", force=True)
 
 import matplotlib.pyplot as plt
 import pytest
+
+
+@pytest.fixture(scope="session")
+def qapp():
+    """One ``QApplication`` for the whole test process (widgets need it, not ``QGuiApplication``)."""
+    from PySide6.QtWidgets import QApplication
+
+    app = QApplication.instance()
+    if app is None:
+        app = QApplication(sys.argv)
+    yield app
 
 
 @pytest.fixture(autouse=True)

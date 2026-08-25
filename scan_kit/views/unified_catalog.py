@@ -100,3 +100,21 @@ def option_by_id(
         if opt.id == option_id:
             return opt
     return None
+
+
+PLOT_STYLE_BOX = "box"
+PLOT_STYLE_VIOLIN = "violin"
+PLOT_STYLE_MEAN = "mean"
+PLOT_STYLE_CONTOUR = "contour"
+PLOT_STYLE_SCATTER = "scatter"
+
+BINNED_PLOT_STYLES: tuple[tuple[str, str], ...] = (
+    (PLOT_STYLE_VIOLIN, "Violin"),
+    (PLOT_STYLE_BOX, "Box"),
+    (PLOT_STYLE_MEAN, "Mean"),
+)
+
+DISTRIBUTION_PLOT_STYLES: tuple[tuple[str, str], ...] = (
+    (PLOT_STYLE_CONTOUR, "Contour"),
+    (PLOT_STYLE_SCATTER, "Scatter"),
+)

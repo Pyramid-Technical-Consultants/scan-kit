@@ -135,10 +135,9 @@ def test_render_timeslice_replay_headless() -> None:
     plt.close(fig)
 
 
-def test_timeslice_replay_window_smoke() -> None:
-    from PySide6.QtWidgets import QApplication, QSplitter
+def test_timeslice_replay_window_smoke(qapp) -> None:
+    from PySide6.QtWidgets import QSplitter
 
-    app = QApplication.instance() or QApplication(sys.argv)
     window = TimesliceReplayWindow([G3_SESSION], str(TEST_DATA))
     assert window._session_data
     assert isinstance(window.centralWidget(), QSplitter)
@@ -150,15 +149,13 @@ def test_timeslice_replay_window_smoke() -> None:
     assert set(field_keys) <= {"bx", "by"}
     window._apply_preset(PRESET_IC_CURRENT)
     window.close()
-    del app
 
 
-def test_plot_view_shell_side_panel_resizable() -> None:
-    from PySide6.QtWidgets import QApplication, QLabel
+def test_plot_view_shell_side_panel_resizable(qapp) -> None:
+    from PySide6.QtWidgets import QLabel
 
     from scan_kit.views.plot_view_shell import PlotViewWindow, make_side_panel_column
 
-    app = QApplication.instance() or QApplication(sys.argv)
     window = PlotViewWindow(title="Shell Test")
     panel, layout = make_side_panel_column()
     layout.addWidget(QLabel("Controls"))
@@ -169,7 +166,6 @@ def test_plot_view_shell_side_panel_resizable() -> None:
     window._splitter.setSizes([800, 400])
     assert window._splitter.sizes()[1] >= 300
     window.close()
-    del app
 
 
 def test_resolve_frame_energy_empty_frame_uses_frame_index() -> None:

@@ -8,7 +8,7 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 import pytest
-from PySide6.QtWidgets import QApplication, QSplitter
+from PySide6.QtWidgets import QSplitter
 
 from scan_kit.common import DEFAULT_SESSION_COLORS
 from scan_kit.common.plotting import (
@@ -27,6 +27,8 @@ from scan_kit.views.binned_summary_catalog import (
     X_ENERGY,
     X_TARGET_MU,
     Y_DOSE_RATIO,
+    Y_DOSE_RATE,
+    Y_CURRENT_RATIO,
     Y_POSITION_ERROR,
     Y_SIGMA,
     BinnedSummaryConfig,
@@ -38,6 +40,8 @@ from scan_kit.views.binned_summary_data import (
     available_y_groups,
     default_config,
     load_session_summary_table,
+    load_sessions_dose_rate,
+    load_sessions_current_ratios,
     load_session_timeslice_summary_table,
     load_sessions_summary,
     probe_view_option_availability,
@@ -162,6 +166,7 @@ def test_load_summary_availability() -> None:
     cfg = default_config(session_data)
     assert cfg.y_group in y_avail
     assert cfg.x_param in x_avail
+    assert cfg.glyph == "violin"
     series = available_series_keys(session_data, cfg.y_group)
     assert series
 
@@ -183,6 +188,38 @@ def test_render_binned_summary_headless() -> None:
     plt.close(fig)
 
 
+def test_render_binned_summary_dose_rate_headless() -> None:
+    session_data = load_sessions_dose_rate([G3_SESSION], str(TEST_DATA))
+    if not session_data:
+        pytest.skip("dose rate unavailable in fixture")
+    config = BinnedSummaryConfig(
+        y_group=Y_DOSE_RATE,
+        x_param=X_ENERGY,
+        glyph="mean",
+        show_trend=True,
+    )
+    fig = plt.figure()
+    render_binned_summary(fig, config, session_data, str(TEST_DATA))
+    assert fig.axes
+    plt.close(fig)
+
+
+def test_render_binned_summary_current_ratio_headless() -> None:
+    session_data = load_sessions_current_ratios([G3_SESSION], str(TEST_DATA))
+    if not session_data:
+        pytest.skip("current ratio data unavailable in fixture")
+    config = BinnedSummaryConfig(
+        y_group=Y_CURRENT_RATIO,
+        x_param=X_ENERGY,
+        glyph="mean",
+        show_trend=True,
+    )
+    fig = plt.figure()
+    render_binned_summary(fig, config, session_data, str(TEST_DATA))
+    assert fig.axes
+    plt.close(fig)
+
+
 def test_render_binned_summary_quantile_x() -> None:
     session_data = load_sessions_summary([G3_SESSION], str(TEST_DATA))
     if X_TARGET_MU not in available_x_params(session_data):
@@ -197,8 +234,7 @@ def test_render_binned_summary_quantile_x() -> None:
     plt.close(fig)
 
 
-def test_binned_summary_window_smoke() -> None:
-    app = QApplication.instance() or QApplication(sys.argv)
+def test_binned_summary_window_smoke(qapp) -> None:
     window = BinnedSummaryWindow([G3_SESSION], str(TEST_DATA))
     assert window._spot_data
     assert window._session_data()
@@ -209,7 +245,6 @@ def test_binned_summary_window_smoke() -> None:
         idx = window._x_combo.findData(X_TARGET_MU)
         window._x_combo.setCurrentIndex(idx)
     window.close()
-    del app
 
 
 def test_timeslice_summary_table_when_available() -> None:

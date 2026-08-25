@@ -15,6 +15,7 @@ class SessionIcXYData:
     ic2_y: np.ndarray
     plan_x: np.ndarray | None = None
     plan_y: np.ndarray | None = None
+    beam_on: np.ndarray | None = None
 
 
 def session_has_plan(data: SessionIcXYData) -> bool:

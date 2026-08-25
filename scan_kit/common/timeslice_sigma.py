@@ -76,6 +76,7 @@ class SessionIcSigmas:
     ic1_y: np.ndarray
     ic2_x: np.ndarray
     ic2_y: np.ndarray
+    beam_on: np.ndarray | None = None
 
 
 @dataclass(frozen=True)
@@ -262,6 +263,7 @@ def load_session_beam_on_sigmas(
     parts: dict[str, list[np.ndarray]] = {
         key: [] for key in ("ic1_x", "ic1_y", "ic2_x", "ic2_y")
     }
+    beam_on_parts: list[np.ndarray] = []
 
     for df in frames:
         beam_on = detect_beam_on_mask(df)
@@ -273,12 +275,6 @@ def load_session_beam_on_sigmas(
             continue
 
         ic1_x, ic1_y, ic2_x, ic2_y = frame_sigmas
-        ic1_x, ic1_y, ic2_x, ic2_y = (
-            ic1_x[beam_on],
-            ic1_y[beam_on],
-            ic2_x[beam_on],
-            ic2_y[beam_on],
-        )
         if not np.isfinite(ic1_x).any() and not np.isfinite(ic2_x).any():
             continue
 
@@ -286,6 +282,7 @@ def load_session_beam_on_sigmas(
         parts["ic1_y"].append(ic1_y)
         parts["ic2_x"].append(ic2_x)
         parts["ic2_y"].append(ic2_y)
+        beam_on_parts.append(beam_on.astype(bool))
 
     if not parts["ic1_x"]:
         return None
@@ -295,6 +292,7 @@ def load_session_beam_on_sigmas(
         ic1_y=np.concatenate(parts["ic1_y"]),
         ic2_x=np.concatenate(parts["ic2_x"]),
         ic2_y=np.concatenate(parts["ic2_y"]),
+        beam_on=np.concatenate(beam_on_parts),
     )
 
 
@@ -360,6 +358,7 @@ def load_session_beam_on_sigma_errors(
     parts: dict[str, list[np.ndarray]] = {
         key: [] for key in ("ic1_x", "ic1_y", "ic2_x", "ic2_y")
     }
+    beam_on_parts: list[np.ndarray] = []
 
     for df in frames:
         beam_on = detect_beam_on_mask(df)
@@ -371,12 +370,6 @@ def load_session_beam_on_sigma_errors(
             continue
 
         ic1_x, ic1_y, ic2_x, ic2_y = frame_errors
-        ic1_x, ic1_y, ic2_x, ic2_y = (
-            ic1_x[beam_on],
-            ic1_y[beam_on],
-            ic2_x[beam_on],
-            ic2_y[beam_on],
-        )
         if not np.isfinite(ic1_x).any() and not np.isfinite(ic2_x).any():
             continue
 
@@ -384,6 +377,7 @@ def load_session_beam_on_sigma_errors(
         parts["ic1_y"].append(ic1_y)
         parts["ic2_x"].append(ic2_x)
         parts["ic2_y"].append(ic2_y)
+        beam_on_parts.append(beam_on.astype(bool))
 
     if not parts["ic1_x"]:
         return None
@@ -393,4 +387,5 @@ def load_session_beam_on_sigma_errors(
         ic1_y=np.concatenate(parts["ic1_y"]),
         ic2_x=np.concatenate(parts["ic2_x"]),
         ic2_y=np.concatenate(parts["ic2_y"]),
+        beam_on=np.concatenate(beam_on_parts),
     )

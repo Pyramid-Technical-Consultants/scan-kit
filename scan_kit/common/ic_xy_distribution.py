@@ -31,7 +31,9 @@ PlotStyle = Literal["contour", "scatter"]
 REF_CIRCLE_RADIUS_MM = 1.0
 HIST_BINS = 101
 DENSITY_BINS = 80
-CONTOUR_LEVEL_PERCENTILES = (40, 55, 68, 80, 90, 97)
+CONTOUR_LEVEL_COUNT = 6
+CONTOUR_LEVEL_MAX_PERCENTILE = 97.0
+DEFAULT_CONTOUR_CUTOFF_PERCENTILE = 5.0
 HIST_PERCENTILE = 99.95
 HEIGHT_RATIOS = (2.4, 1, 1)
 HIST_TITLE_PAD = 6.0
@@ -45,6 +47,24 @@ IC_PANELS = (
     ("IC2", "ic2_x", "ic2_y"),
 )
 PLAN_PANEL = ("Planned", "plan_x", "plan_y")
+
+
+def normalize_contour_cutoff_percentile(cutoff: float) -> float:
+    """Clamp contour cutoff to the supported 0–90 percentile range."""
+    return min(90.0, max(0.0, float(cutoff)))
+
+
+def contour_level_percentiles(min_percentile: float) -> tuple[float, ...]:
+    """Density percentiles for nested contour bands."""
+    lo = normalize_contour_cutoff_percentile(min_percentile)
+    lo = min(lo, 90.0)
+    hi = CONTOUR_LEVEL_MAX_PERCENTILE
+    if lo >= hi:
+        return (hi,)
+    return tuple(
+        float(v)
+        for v in np.linspace(lo, hi, CONTOUR_LEVEL_COUNT)
+    )
 
 
 def _finite_xy(
@@ -171,6 +191,7 @@ def _plot_density_contours(
     *,
     lim: tuple[float, float],
     positive_only: bool,
+    contour_cutoff_percentile: float,
 ) -> None:
     lo, hi = lim
     x, y = _finite_xy(x, y, positive_only=positive_only)
@@ -198,12 +219,20 @@ def _plot_density_contours(
     grid_x, grid_y = np.meshgrid(xc, yc)
 
     positive = density[density > 0]
-    levels = np.unique(np.percentile(positive, CONTOUR_LEVEL_PERCENTILES))
-    if levels.size == 0:
-        return
+    pct_levels = contour_level_percentiles(contour_cutoff_percentile)
+    levels = np.unique(np.percentile(positive, pct_levels))
+    levels = levels[np.isfinite(levels)]
 
     z = density.T
     z_max = float(z.max())
+    if z_max <= 0 or levels.size == 0:
+        return
+
+    # Matplotlib contour bands need strictly increasing levels below the peak.
+    levels = levels[(levels > 0) & (levels < z_max)]
+    if levels.size == 0:
+        return
+
     rgba = mcolors.to_rgba(color)
     for level in levels:
         ax.contourf(
@@ -255,6 +284,7 @@ def _plot_xy_panel(
     lim: tuple[float, float],
     plot_style: PlotStyle,
     positive_only: bool,
+    contour_cutoff_percentile: float,
 ) -> None:
     for sid, color in zip(loaded_ids, colors):
         data = session_data[sid]
@@ -269,6 +299,7 @@ def _plot_xy_panel(
         else:
             _plot_density_contours(
                 ax, x, y, color, lim=lim, positive_only=positive_only,
+                contour_cutoff_percentile=contour_cutoff_percentile,
             )
 
 
@@ -327,6 +358,7 @@ def render_ic_xy_distribution(
     base_dir: str,
     limit_mode: LimitMode,
     plot_style: PlotStyle = "contour",
+    contour_cutoff_percentile: float = DEFAULT_CONTOUR_CUTOFF_PERCENTILE,
     show_plan: bool | None = None,
     reference_circle: bool = False,
     tolerance_lines: bool = False,
@@ -396,6 +428,7 @@ def render_ic_xy_distribution(
             lim=shared_lim,
             plot_style=plot_style,
             positive_only=positive_only,
+            contour_cutoff_percentile=contour_cutoff_percentile,
         )
 
         _plot_histogram(

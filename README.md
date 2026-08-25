@@ -177,8 +177,8 @@ Configurable Qt shells that replace many former standalone plots.
 
 | View | Summary |
 |------|---------|
-| Binned Summary | Universal box/violin/mean summary — pick **Y metric** (dose error, dose ratios, position error, sigma, spot time) and **X parameter** (energy, target MU, spot time, beam radius). **Presets** cover the former standalone vs-Energy / vs-MU / vs-time plots. |
-| Distribution Explorer | Density contours and fit-quality plots — position error (timeslice/spot), sigma, confidence correlations, and Gaussian filter coverage. |
+| Binned Summary | Universal box/violin/mean summary — pick **Y metric** (dose error, dose ratios, dose rate, current ratios, IC current, position error, sigma, spot time) and **X parameter** (energy, target MU, spot time, beam radius). **Filter Data** includes beam on/off/both plus severity filters. |
+| Distribution Explorer | Density contours and fit-quality plots — position error (timeslice/spot), sigma, confidence correlations, and Gaussian filter coverage. **Filter Data** selects beam on/off/both for timeslice metrics. |
 | Timeslice Replay | Interactive multi-channel timeslice viewer — [details](#interactive-replay-views) |
 | Session Log Compare | Layer timings, grouped errors, event browser, two-session diff — [details](#session-log-compare) |
 
@@ -202,16 +202,12 @@ Are chambers consistent, and is delivered dose on target?
 | View | Summary |
 |------|---------|
 | Dose Accumulation | Expected vs measured cumulative dose per chamber |
-| MU Delivery Rate vs Energy | Effective MU/s vs energy (wall-clock per layer) |
 
-Use **Binned Summary** presets for dose error, dose ratios, position error, sigma, and spot-time vs energy / MU / spot time / radius.
+Use **Binned Summary** presets for dose error, dose ratios, dose rate, current ratios, IC current, position error, sigma, and spot-time vs energy / MU / spot time / radius. Use **Filter Data → Beam On / Beam Off / Beam On + Off** for timeslice IC current (replaces the old beam-on/off current view).
 
 ### Beam current & timing
 
-| View | Summary |
-|------|---------|
-| Current Ratios vs Energy | Beam-on mean IC current ratios vs energy |
-| Beam-On vs Beam-Off Current | Beam-on and beam-off current distributions by energy |
+Use **Binned Summary → IC Current (nA)** with **Filter Data** for beam-on vs beam-off current distributions by energy.
 
 ### Timeseries & transients
 

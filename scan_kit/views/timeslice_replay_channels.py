@@ -9,16 +9,10 @@ import numpy as np
 
 from ..common import (
     C_BEAM_CURRENT,
-    C_IC1_CURRENT,
     C_IC1_X_POS_RAW,
     C_IC1_Y_POS_RAW,
-    C_IC2_CURRENT,
     C_IC2_X_POS_RAW,
     C_IC2_Y_POS_RAW,
-    C_IC3_CURRENT_A,
-    C_IC3_CURRENT_B,
-    C_IC3_CURRENT_C,
-    C_IC3_CURRENT_D,
     C_LAYER_ID,
     C_MAG_FIELD_X,
     C_MAG_FIELD_Y,
@@ -27,6 +21,8 @@ from ..common import (
 )
 from ..common.schema import POSITION_KEY_G2_RAW, POSITION_KEY_G3_RAW
 from ..common.session_source import load_session_timeslice_device_units
+from ..common.timeslice_energy import load_energy_lookups
+from ..common.timeslice_ic_current import resolve_ic_current_columns, sum_ic3_current
 from ..common.timeslice_sigma import (
     frame_timeslice_sigma_arrays,
     resolve_timeslice_sigma_source,
@@ -36,8 +32,8 @@ from .timeslice_replay_common import (
     build_digital_signals,
     derive_current_from_dose,
     detect_digital_columns,
-    load_energy_by_layer,
     resolve_col,
+    resolve_frame_energy,
     resolve_ic_scan_total_dose_columns,
 )
 from .timeslice_replay_ui import ScatterSpec, TimesliceReplayConfig, TraceSpec
@@ -158,10 +154,10 @@ def load_session_timeline_catalog(
     bg_subtract: bool = False,
 ) -> dict | None:
     """Load all available timeslice channel families into one session dict."""
-    loaded = load_energy_by_layer(session_id, base_dir)
+    loaded = load_energy_lookups(session_id, base_dir)
     if loaded is None:
         return None
-    src, energy_by_layer = loaded
+    src, energy_by_layer, energy_by_idx = loaded
 
     frames = load_session_timeslice_device_units(src)
     if not frames:
@@ -176,15 +172,9 @@ def load_session_timeline_catalog(
     if ts_layer is None:
         return None
 
-    ts_ic1 = resolve_col(df0.columns, C_IC1_CURRENT)
-    ts_ic2 = resolve_col(df0.columns, C_IC2_CURRENT)
-    has_ic = bool(ts_ic1 and ts_ic2)
-
-    ts_ic3a = resolve_col(df0.columns, C_IC3_CURRENT_A)
-    ts_ic3b = resolve_col(df0.columns, C_IC3_CURRENT_B)
-    ts_ic3c = resolve_col(df0.columns, C_IC3_CURRENT_C)
-    ts_ic3d = resolve_col(df0.columns, C_IC3_CURRENT_D)
-    has_ic3 = bool(ts_ic3a and ts_ic3b and ts_ic3c and ts_ic3d)
+    ic_cols = resolve_ic_current_columns(df0.columns)
+    has_ic = ic_cols is not None
+    has_ic3 = bool(ic_cols and ic_cols.ic3_parts)
 
     dose_cols = resolve_ic_scan_total_dose_columns(df0.columns)
     ts_dose1 = dose_cols["ic1"]
@@ -252,26 +242,28 @@ def load_session_timeline_catalog(
     }
     offset = 0
 
-    for df in frames:
+    for frame_i, df in enumerate(frames):
         n = len(df)
-        layer_id = df[ts_layer].iloc[0]
-        energy = energy_by_layer.get(layer_id, 0.0)
+        energy = resolve_frame_energy(
+            df,
+            frame_i,
+            energy_by_layer=energy_by_layer,
+            energy_by_idx=energy_by_idx,
+            layer_col=ts_layer,
+        )
+        if energy is None:
+            energy = 0.0
 
         if has_ic:
-            ic1_vals = df[ts_ic1].values.astype(float)
-            ic2_vals = df[ts_ic2].values.astype(float)
+            ic1_vals = df[ic_cols.ic1].values.astype(float)
+            ic2_vals = df[ic_cols.ic2].values.astype(float)
             parts["ic1"].append(ic1_vals)
             parts["ic2"].append(ic2_vals)
             for key, vals in (("ic1", ic1_vals), ("ic2", ic2_vals)):
                 edges = detect_beam_off_edges(vals)
                 edge_indices[key].extend((edges + offset).tolist())
             if has_ic3:
-                ic3_vals = (
-                    df[ts_ic3a].values.astype(float)
-                    + df[ts_ic3b].values.astype(float)
-                    + df[ts_ic3c].values.astype(float)
-                    + df[ts_ic3d].values.astype(float)
-                )
+                ic3_vals = sum_ic3_current(df, ic_cols.ic3_parts)
                 parts["ic3"].append(ic3_vals)
                 edges = detect_beam_off_edges(ic3_vals)
                 edge_indices["ic3"].extend((edges + offset).tolist())
@@ -303,7 +295,7 @@ def load_session_timeline_catalog(
                 parts["sigma_ic2_x"].append(s_ic2_x)
                 parts["sigma_ic2_y"].append(s_ic2_y)
             if has_ic:
-                edges = detect_beam_off_edges(df[ts_ic1].values.astype(float))
+                edges = detect_beam_off_edges(df[ic_cols.ic1].values.astype(float))
                 edge_indices["sigma_ic1_x"].extend((edges + offset).tolist())
 
         if has_field:

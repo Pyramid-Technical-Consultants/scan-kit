@@ -19,6 +19,7 @@ class ViewSettings:
     calibration_mode: str = "off"
     cal_factors: dict[str, float] | None = None
     selected_sessions: list[str] = field(default_factory=list)
+    contour_cutoff_percentile: float = 5.0
 
     @property
     def auto_calibrate(self) -> bool:
@@ -61,6 +62,14 @@ class ViewSettings:
             out.pop("auto_calibrate", None)
         if out.get("calibration_mode") not in CALIBRATION_MODES:
             out["calibration_mode"] = "off"
+        cutoff = out.get("contour_cutoff_percentile")
+        if cutoff is not None:
+            try:
+                out["contour_cutoff_percentile"] = min(
+                    90.0, max(0.0, float(cutoff)),
+                )
+            except (TypeError, ValueError):
+                out.pop("contour_cutoff_percentile", None)
         sel = out.get("selected_sessions")
         if isinstance(sel, list):
             out["selected_sessions"] = [str(s) for s in sel]

@@ -22,25 +22,13 @@ matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
-from ..common import (
-    C_IC1_CURRENT,
-    C_IC2_CURRENT,
-    C_IC3_CURRENT_A,
-    C_IC3_CURRENT_B,
-    C_IC3_CURRENT_C,
-    C_IC3_CURRENT_D,
-    resolve_concept_column,
-)
+from ..common.timeslice_ic_current import resolve_ic_current_columns, sum_ic3_current
 from ..common.session_source import (
     load_session_timeslice_device_units,
     resolve_session_source,
 )
 
 FS_HZ = 1000  # timeslice period is 1 ms → 1 kHz sample rate
-
-
-def _resolve_col(columns, concept: str) -> str | None:
-    return resolve_concept_column(columns, concept)
 
 
 def _load_ic_signals(session_id: str, base_dir: str) -> dict | None:
@@ -53,32 +41,20 @@ def _load_ic_signals(session_id: str, base_dir: str) -> dict | None:
     if not frames:
         return None
 
-    df0 = frames[0]
-    ts_ic1 = _resolve_col(df0.columns, C_IC1_CURRENT)
-    ts_ic2 = _resolve_col(df0.columns, C_IC2_CURRENT)
-    if not all([ts_ic1, ts_ic2]):
+    cols = resolve_ic_current_columns(frames[0].columns)
+    if cols is None:
         return None
-
-    ts_ic3a = _resolve_col(df0.columns, C_IC3_CURRENT_A)
-    ts_ic3b = _resolve_col(df0.columns, C_IC3_CURRENT_B)
-    ts_ic3c = _resolve_col(df0.columns, C_IC3_CURRENT_C)
-    ts_ic3d = _resolve_col(df0.columns, C_IC3_CURRENT_D)
-    has_ic3 = all([ts_ic3a, ts_ic3b, ts_ic3c, ts_ic3d])
+    has_ic3 = bool(cols.ic3_parts)
 
     ic1_parts: list[np.ndarray] = []
     ic2_parts: list[np.ndarray] = []
     ic3_parts: list[np.ndarray] = []
 
     for df in frames:
-        ic1_parts.append(df[ts_ic1].values)
-        ic2_parts.append(df[ts_ic2].values)
+        ic1_parts.append(df[cols.ic1].values)
+        ic2_parts.append(df[cols.ic2].values)
         if has_ic3:
-            ic3_parts.append(
-                df[ts_ic3a].values
-                + df[ts_ic3b].values
-                + df[ts_ic3c].values
-                + df[ts_ic3d].values
-            )
+            ic3_parts.append(sum_ic3_current(df, cols.ic3_parts))
 
     n = sum(len(p) for p in ic1_parts)
     if n == 0:

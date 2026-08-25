@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
+from ..common.data_filter import FILTER_ALL, FILTER_BEAM_BOTH, DataFilterSelection
 from .unified_catalog import (
     DATA_SOURCE_SPOT,
     DATA_SOURCE_TIMESLICE,
@@ -17,6 +18,9 @@ BinMode = Literal["unique", "quantile"]
 
 Y_DOSE_ERROR = "dose_error"
 Y_DOSE_RATIO = "dose_ratio"
+Y_DOSE_RATE = "dose_rate"
+Y_CURRENT_RATIO = "current_ratio"
+Y_IC_CURRENT = "ic_current"
 Y_POSITION_ERROR = "position_error"
 Y_SIGMA = "sigma"
 Y_SPOT_TIME = "spot_time"
@@ -36,6 +40,9 @@ PRESET_DOSE_ERROR_MU = "dose_error_mu"
 PRESET_DOSE_RATIO_ENERGY = "dose_ratio_energy"
 PRESET_DOSE_RATIO_SPOT_TIME = "dose_ratio_spot_time"
 PRESET_DOSE_RATIO_RADIUS = "dose_ratio_radius"
+PRESET_DOSE_RATE_ENERGY = "dose_rate_energy"
+PRESET_CURRENT_RATIO_ENERGY = "current_ratio_energy"
+PRESET_IC_CURRENT_ENERGY = "ic_current_energy"
 PRESET_POSITION_ERROR_ENERGY = "position_error_energy"
 PRESET_SIGMA_ENERGY = "sigma_energy"
 PRESET_SPOT_TIME_ENERGY = "spot_time_energy"
@@ -55,6 +62,7 @@ class YGroupDef:
     default_glyph: Glyph
     trend_unit: str
     sources: tuple[str, ...] = (DATA_SOURCE_SPOT,)
+    supports_data_filter: bool = True
 
 
 @dataclass(frozen=True)
@@ -101,6 +109,39 @@ Y_GROUPS: tuple[YGroupDef, ...] = (
         ),
         GLYPH_BOX,
         "%/unit",
+    ),
+    YGroupDef(
+        Y_DOSE_RATE,
+        "Dose Rate (MU/s)",
+        (SeriesDef("mu_rate", "Delivery Rate (MU/s)"),),
+        GLYPH_MEAN,
+        "MU/s/unit",
+        supports_data_filter=False,
+    ),
+    YGroupDef(
+        Y_CURRENT_RATIO,
+        "Current Ratios (%)",
+        (
+            SeriesDef("ic21_ratio", "IC2/IC1 (%)"),
+            SeriesDef("ic31_ratio", "IC3/IC1 (%)"),
+            SeriesDef("ic32_ratio", "IC3/IC2 (%)"),
+        ),
+        GLYPH_MEAN,
+        "%/unit",
+        (DATA_SOURCE_TIMESLICE,),
+        supports_data_filter=False,
+    ),
+    YGroupDef(
+        Y_IC_CURRENT,
+        "IC Current (nA)",
+        (
+            SeriesDef("ic1_current", "IC1"),
+            SeriesDef("ic2_current", "IC2"),
+            SeriesDef("ic3_current", "IC3 (sum A+B+C+D)"),
+        ),
+        GLYPH_BOX,
+        "nA/unit",
+        (DATA_SOURCE_TIMESLICE,),
     ),
     YGroupDef(
         Y_POSITION_ERROR,
@@ -162,6 +203,18 @@ PRESETS: tuple[PresetDef, ...] = (
         Y_DOSE_RATIO, X_ENERGY, GLYPH_BOX, show_corr=True,
     ),
     PresetDef(
+        PRESET_DOSE_RATE_ENERGY, "Dose rate vs Energy",
+        Y_DOSE_RATE, X_ENERGY, GLYPH_MEAN,
+    ),
+    PresetDef(
+        PRESET_CURRENT_RATIO_ENERGY, "Current ratios vs Energy",
+        Y_CURRENT_RATIO, X_ENERGY, GLYPH_MEAN,
+    ),
+    PresetDef(
+        PRESET_IC_CURRENT_ENERGY, "IC current vs Energy",
+        Y_IC_CURRENT, X_ENERGY, GLYPH_BOX,
+    ),
+    PresetDef(
         PRESET_POSITION_ERROR_ENERGY, "Position error vs Energy",
         Y_POSITION_ERROR, X_ENERGY, GLYPH_VIOLIN, show_trend=False,
     ),
@@ -203,12 +256,21 @@ class BinnedSummaryConfig:
     y_group: str = Y_DOSE_RATIO
     source: str = DATA_SOURCE_SPOT
     x_param: str = X_ENERGY
-    glyph: Glyph = GLYPH_BOX
+    glyph: Glyph = GLYPH_VIOLIN
     show_trend: bool = True
     show_hist: bool = False
     show_corr: bool = False
     show_fliers: bool = False
     n_bins: int | None = None
+    domain_filter: str = FILTER_ALL
+    beam_state_filter: str = FILTER_BEAM_BOTH
+
+    @property
+    def data_filter(self) -> DataFilterSelection:
+        return DataFilterSelection(
+            domain_filter=self.domain_filter,
+            beam_state_filter=self.beam_state_filter,
+        )
 
     @property
     def title(self) -> str:
