@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import warnings
+
 import numpy as np
 from numpy.lib.stride_tricks import sliding_window_view
 
@@ -215,9 +217,10 @@ def _variance_settled_mask(
         if not signal_ranges:
             return np.zeros(n, dtype=bool)
         stacked = np.stack(signal_ranges, axis=0)
-        signal_range = np.full(n, np.nan)
-        with np.errstate(all="ignore"):
-            signal_range = np.nanmax(stacked, axis=0)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            with np.errstate(invalid="ignore"):
+                signal_range = np.nanmax(stacked, axis=0)
         range_max = residual_max
         if gain_x is None and gain_y is None:
             range_max = _FIELD_CHANGE_TOL_G

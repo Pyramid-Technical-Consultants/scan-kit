@@ -73,8 +73,8 @@ class _SummaryPanel(QGroupBox):
             ("Span", "span"),
             ("Duration", "duration"),
             ("Errors", "errors"),
-            ("Layers scanned", "layers"),
-            ("WDT mismatches", "wdt"),
+            ("Layers Scanned", "layers"),
+            ("WDT Mismatches", "wdt"),
         )
         for row, (label, key) in enumerate(fields):
             name = QLabel(label + ":")
@@ -167,11 +167,11 @@ class SessionLogCompareWindow(QMainWindow):
         root.addWidget(tabs, stretch=1)
 
         tabs.addTab(self._build_overview_tab(), "Overview")
-        tabs.addTab(self._build_layer_tab(), "Layer timeline")
+        tabs.addTab(self._build_layer_tab(), "Layer Timeline")
         tabs.addTab(self._build_issues_tab(), "Issues")
-        tabs.addTab(self._build_explorer_tab(), "Event browser")
+        tabs.addTab(self._build_explorer_tab(), "Event Browser")
         if compare:
-            tabs.addTab(self._build_diff_tab(), "Message diff")
+            tabs.addTab(self._build_diff_tab(), "Message Diff")
 
         hint = QLabel(
             "Tip: hide noise to focus on map loads, layer timings, and errors. "
@@ -185,7 +185,7 @@ class SessionLogCompareWindow(QMainWindow):
         page = QWidget()
         layout = QVBoxLayout(page)
         self._level_table = _make_table(["Level"] + [log.session_id for log in self._logs])
-        layout.addWidget(QLabel("Log level counts"))
+        layout.addWidget(QLabel("Log Level Counts"))
         layout.addWidget(self._level_table)
 
         if len(self._logs) == 2:
@@ -368,10 +368,10 @@ class SessionLogCompareWindow(QMainWindow):
         self._search.setPlaceholderText("Filter messages (substring match)…")
         self._level_filter = QComboBox()
         self._level_filter.addItems(_LEVEL_FILTER)
-        self._hide_noise = QCheckBox("Hide noise (ACK / command polling)")
+        self._hide_noise = QCheckBox("Hide Noise (ACK / Command Polling)")
         self._hide_noise.setChecked(True)
         self._session_filter = QComboBox()
-        self._session_filter.addItem("All sessions")
+        self._session_filter.addItem("All Sessions")
         for log in self._logs:
             self._session_filter.addItem(log.session_id)
         controls.addWidget(QLabel("Search:"))

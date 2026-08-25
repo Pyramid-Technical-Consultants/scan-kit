@@ -38,6 +38,7 @@ TEST_DATA = Path(__file__).resolve().parents[1] / "test_data"
 
 
 
+@pytest.mark.slow
 def test_g3_session_computes_confidence_and_peak_coverage() -> None:
 
     coverage = compute_session_gaussian_fit_filter_coverage("1091134775", str(TEST_DATA))

@@ -12,6 +12,7 @@ from matplotlib.widgets import SpanSelector
 import numpy as np
 import pandas as pd
 from scipy import stats
+from scipy.interpolate import PchipInterpolator
 
 try:
     from numpy.exceptions import RankWarning as _RankWarning
@@ -329,6 +330,9 @@ def plot_means_for_column(
     position_offset=0.35,
     bin_key: str = "energy",
     marker_size: float = 45,
+    *,
+    connect_lines: bool = False,
+    curve_samples: int = 200,
 ):
     """Plot per-bin means as markers across sessions."""
     if colors is None:
@@ -346,10 +350,34 @@ def plot_means_for_column(
                 continue
             xs.append(j + (i - 0.5) * position_offset)
             ys.append(float(np.mean(y_vals[mask])))
-        if xs:
-            ax.scatter(
-                xs, ys, c=colors[i], s=marker_size, zorder=3, edgecolors="none",
+        if not xs:
+            continue
+        xs_arr = np.asarray(xs, dtype=float)
+        ys_arr = np.asarray(ys, dtype=float)
+        color = colors[i]
+        if connect_lines and xs_arr.size >= 2:
+            order = np.argsort(xs_arr)
+            xs_sorted = xs_arr[order]
+            ys_sorted = ys_arr[order]
+            x_fine = np.linspace(float(xs_sorted[0]), float(xs_sorted[-1]), curve_samples)
+            y_fine = PchipInterpolator(xs_sorted, ys_sorted)(x_fine)
+            ax.plot(
+                x_fine,
+                y_fine,
+                color=color,
+                linewidth=2.0,
+                solid_capstyle="round",
+                zorder=2,
             )
+        ax.scatter(
+            xs_arr,
+            ys_arr,
+            c=color,
+            s=marker_size,
+            zorder=4,
+            edgecolors="white",
+            linewidths=0.6,
+        )
 
 def annotate_slopes(ax, labels_and_colors, *, x_anchor=0.03, y_top=0.97,
                     line_pitch=None):
@@ -620,6 +648,7 @@ def view_grid(
     cell_h: float = CELL_H,
     header: bool = True,
     squeeze: bool = False,
+    fig=None,
     **subplots_kwargs,
 ):
     """Create a standard analytic-view subplot grid sized by per-cell dimensions.
@@ -628,14 +657,28 @@ def view_grid(
     proportions and header spacing stay consistent across views. Pass
     ``header=False`` to omit the reserved header band (views without a header).
 
+    When *fig* is provided, subplots are created on that figure (for embedded Qt
+    canvases) instead of ``pyplot.subplots``.
+
     Returns the ``(fig, axes)`` tuple from :func:`matplotlib.pyplot.subplots`.
     With the default ``squeeze=False``, *axes* is always a 2-D array.
     """
     fig_w = ncols * cell_w
     fig_h = nrows * cell_h + (HEADER_H if header else 0.0)
-    return plt.subplots(
-        nrows, ncols, figsize=(fig_w, fig_h), squeeze=squeeze, **subplots_kwargs
-    )
+    if fig is None:
+        return plt.subplots(
+            nrows,
+            ncols,
+            figsize=(fig_w, fig_h),
+            squeeze=squeeze,
+            **subplots_kwargs,
+        )
+
+    fig.clear()
+    # Embedded Qt canvases own the physical size; resizing here leaves letterboxing
+    # when switching between distribution modes with different grid shapes.
+    axes = fig.subplots(nrows, ncols, squeeze=squeeze, **subplots_kwargs)
+    return fig, axes
 
 
 def finish_view(
@@ -659,9 +702,11 @@ def finish_view(
     interactive launcher and headless Agg tests (patched show).
     """
     set_view_header(fig, title, session_ids, colors, base_dir=base_dir, notes=notes)
-    apply_tight_layout(fig, **layout_kwargs)
     if show:
+        apply_tight_layout(fig, **layout_kwargs)
         plt.show()
+    else:
+        apply_toolbar_tight_layout(fig)
 
 
 def relayout_view_for_pdf_export(

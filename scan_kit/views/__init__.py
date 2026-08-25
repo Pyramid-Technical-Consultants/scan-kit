@@ -25,13 +25,8 @@ def view_description(entry: ViewEntry) -> str:
 
 _HAS_AUDIO = importlib.util.find_spec("scan_kit.views.ic_audio_export") is not None
 
-# Workflow-oriented groups for the launcher (flat VIEWS is derived below).
+# Unified reusable views first, then specialized single-purpose plots (candidates for consolidation).
 _VIEW_NOISE: list[ViewEntry] = [
-    (
-        "IC Current FFT Analysis",
-        "ic_fft_analysis",
-        "Frequency-domain view of IC1, IC2, and IC3 timeslice current.",
-    ),
     (
         "IC Peak Amplitude — Beam-Off (G3)",
         "ic_peak_amplitude_beam_off",
@@ -49,54 +44,40 @@ if _HAS_AUDIO:
 
 VIEW_GROUPS: list[tuple[str, list[ViewEntry]]] = [
     (
-        "Summary Plots",
+        "Unified Views",
         [
             (
                 "Binned Summary",
                 "binned_summary",
-                "Universal binned summary: dose error, dose ratios, position error, "
-                "sigma, and spot time vs energy, target MU, spot time, or beam radius.",
+                "Universal binned summary: dose error, dose ratios, dose rate, current ratios, "
+                "IC current, position error, sigma, and spot time vs energy, target MU, spot time, or beam radius.",
+            ),
+            (
+                "Distribution Explorer",
+                "distribution",
+                "Density or scatter plots for position, position error, sigma, sigma error, "
+                "confidence correlations, and Gaussian filter coverage.",
+            ),
+            (
+                "FFT Explorer",
+                "ic_fft_analysis",
+                "Frequency-domain FFT line spectra for selectable timeslice IC currents.",
+            ),
+            (
+                "Timeslice Replay",
+                "timeslice_replay",
+                "Interactive timeslice viewer with selectable IC, dDose/dt, sigma, and magnetic-field channels.",
+            ),
+            (
+                "Session Log Compare",
+                "session_log_compare",
+                "Session log layer timings, errors, and side-by-side event comparison.",
             ),
         ],
     ),
     (
         "Beam Distribution Quality",
         [
-            (
-                "Position Error Distribution (Timeslice)",
-                "position_error_distribution_timeslice",
-                "Beam-on timeslice IC1/IC2 position error density contours and X/Y histograms.",
-            ),
-            (
-                "Position Error Distribution (Spot)",
-                "position_error_distribution_spot",
-                "Per-spot IC1/IC2 position error density contours and X/Y histograms.",
-            ),
-            (
-                "Position Error Outliers (Spot)",
-                "position_error_outliers_spot",
-                "Spots whose X/Y deviation from target is a clear statistical outlier (median/MAD).",
-            ),
-            (
-                "Sigma Distribution (Timeslice)",
-                "sigma_distribution_timeslice",
-                "Beam-on timeslice IC1/IC2 sigma density contours and X/Y histograms.",
-            ),
-            (
-                "Confidence Correlations (Timeslice)",
-                "confidence_correlation_timeslice",
-                "Beam-on G3 fit confidence vs peak IC current and primary channel (density contours).",
-            ),
-            (
-                "Gaussian Fit Filter Coverage",
-                "gaussian_fit_filter_coverage",
-                "Spot retention versus Gaussian fit confidence, peak current, and spot error code (IC1/IC2, combined X/Y).",
-            ),
-            (
-                "Position Scatter",
-                "position_scatter",
-                "Planned, IC1, and IC2 spot positions overlaid by session.",
-            ),
             (
                 "IC Beam Trajectory",
                 "ic_beam_trajectory",
@@ -117,41 +98,21 @@ VIEW_GROUPS: list[tuple[str, list[ViewEntry]]] = [
                 "dose_accumulation",
                 "Expected versus measured cumulative dose for each ion chamber.",
             ),
-            (
-                "MU Delivery Rate vs Energy",
-                "mu_delivery_rate_energy",
-                "Effective MU delivery rate versus beam energy (wall-clock time per layer).",
-            ),
         ],
     ),
     (
         "Beam Current Quality",
         [
             (
-                "Current Ratios vs Energy",
-                "current_ratios",
-                "Beam-on mean IC current ratios versus beam energy.",
-            ),
-            (
-                "Beam-On vs Beam-Off Current",
-                "beam_on_off_current",
-                "Beam-on and beam-off current distributions by energy.",
+                "Beam-Off Ramp-Down",
+                "beam_off_rampdown",
+                "Beam-off ramp-down curves for IC1, IC2, and IC3 from scan-total dose.",
             ),
         ],
     ),
     (
         "Timeseries & Transients Quality",
         [
-            (
-                "Beam-Off Ramp-Down",
-                "beam_off_rampdown",
-                "Beam-off ramp-down curves for IC1, IC2, and IC3 from scan-total dose.",
-            ),
-            (
-                "Timeslice Replay",
-                "timeslice_replay",
-                "Interactive timeslice viewer with selectable IC, dDose/dt, sigma, and magnetic-field channels.",
-            ),
             (
                 "IC HV Transient Test",
                 "ic_hv_transient",
@@ -170,16 +131,6 @@ VIEW_GROUPS: list[tuple[str, list[ViewEntry]]] = [
         ],
     ),
     ("Noise measurement", _VIEW_NOISE),
-    (
-        "Session Log Analysis",
-        [
-            (
-                "Session Log Compare",
-                "session_log_compare",
-                "Session log layer timings, errors, and side-by-side event comparison.",
-            ),
-        ],
-    ),
 ]
 
 VIEWS: list[ViewEntry] = [entry for _title, entries in VIEW_GROUPS for entry in entries]

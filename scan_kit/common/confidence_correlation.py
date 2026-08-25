@@ -24,6 +24,7 @@ CONFIDENCE_PERCENTILE_HI = 99.95
 CONTOUR_FILL_ALPHA_PER_LAYER = 0.13
 CONTOUR_LINE_ALPHA = 0.85
 CONTOUR_LINE_WIDTH = 0.65
+_MAX_DENSITY_SAMPLES = 8000
 
 _PANELS = (
     ("ic1_x", "IC1 X"),
@@ -121,6 +122,10 @@ def _plot_density_contours(
     x_lo, x_hi = xlim
     y_lo, y_hi = ylim
     x, y = _finite_xy(x, y)
+    if x.size > _MAX_DENSITY_SAMPLES:
+        step = max(1, x.size // _MAX_DENSITY_SAMPLES)
+        x = x[::step]
+        y = y[::step]
     in_range = (
         (x >= x_lo)
         & (x <= x_hi)
@@ -182,6 +187,8 @@ def render_confidence_correlations(
     *,
     title: str,
     base_dir: str,
+    fig=None,
+    show: bool = True,
 ) -> None:
     """Render confidence vs peak-current and primary-channel density contours."""
     colors = DEFAULT_SESSION_COLORS[: len(loaded_ids)]
@@ -197,6 +204,7 @@ def render_confidence_correlations(
         len(_PANELS),
         cell_w=CELL_SQUARE,
         cell_h=CELL_SQUARE * 0.85,
+        fig=fig,
     )
 
     for row_idx, (row_key, ylabel) in enumerate(_ROWS):
@@ -242,4 +250,4 @@ def render_confidence_correlations(
                     ylim=ylim,
                 )
 
-    finish_view(fig, title, loaded_ids, colors, base_dir=base_dir)
+    finish_view(fig, title, loaded_ids, colors, base_dir=base_dir, show=show)

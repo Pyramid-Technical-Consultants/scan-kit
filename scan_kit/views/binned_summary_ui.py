@@ -6,7 +6,9 @@ from dataclasses import dataclass
 
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
+import numpy as np
 
+from ..common.data_filter import filter_binned_session_data
 from ..common import (
     DEFAULT_SESSION_COLORS,
     REFLINE_KW,
@@ -26,6 +28,7 @@ from .binned_summary_catalog import (
     GLYPH_MEAN,
     GLYPH_VIOLIN,
     X_PARAM_BY_ID,
+    Y_DOSE_RATE,
     Y_GROUP_BY_ID,
     BinnedSummaryConfig,
 )
@@ -69,6 +72,11 @@ def render_binned_summary(
         fig.canvas.draw_idle()
         return
 
+    series_keys = available_series_keys(session_data, config.y_group)
+    column_keys = [s.key for s in y_group.series]
+    session_data = filter_binned_session_data(
+        session_data, column_keys, config.data_filter,
+    )
     series_keys = available_series_keys(session_data, config.y_group)
     labels = {s.key: s.label for s in y_group.series}
     if not series_keys:
@@ -147,14 +155,30 @@ def render_binned_summary(
         elif config.glyph == GLYPH_MEAN:
             plot_means_for_column(
                 ax, col_data, key, categories, col_colors, bin_key="_bin",
+                connect_lines=True,
             )
+            if config.y_group == Y_DOSE_RATE and config.show_trend:
+                for (_sid, data), color in zip(col_data.items(), col_colors):
+                    avg = data.get("session_avg_rate")
+                    if avg is None:
+                        continue
+                    avg_val = float(np.asarray(avg).flat[0])
+                    if np.isfinite(avg_val):
+                        ax.axhline(
+                            avg_val,
+                            color=color,
+                            linestyle="--",
+                            linewidth=1.4,
+                            alpha=0.9,
+                            zorder=1,
+                        )
         else:
             plot_boxplots_for_column(
                 ax, col_data, key, categories, col_colors,
                 showfliers=config.show_fliers, width=0.3, bin_key="_bin",
             )
 
-        if config.show_trend:
+        if config.show_trend and config.y_group != Y_DOSE_RATE:
             unit = y_group.trend_unit.replace("unit", x_param.id)
             add_binned_trend(
                 ax, col_data, key, categories, col_colors,
@@ -167,7 +191,8 @@ def render_binned_summary(
         )
         if row < n_rows - 1:
             ax.set_xlabel("")
-        ax.axhline(0, **REFLINE_KW)
+        if config.y_group != Y_DOSE_RATE:
+            ax.axhline(0, **REFLINE_KW)
 
         if config.show_hist and hist_axes:
             sels = link_boxplot_to_histogram(

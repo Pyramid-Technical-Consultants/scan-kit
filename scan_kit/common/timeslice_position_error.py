@@ -28,6 +28,7 @@ from .transform import (
     remap_g3_raw_reversed,
 )
 from .schema import C_LAYER_ID, C_SPOT_NO, resolve_column_name
+from .session_ic_xy import SessionIcXYData
 from .session_source import (
     SessionSource,
     load_session_csv,
@@ -138,6 +139,7 @@ class SessionPositionErrors:
     ic1_y: np.ndarray
     ic2_x: np.ndarray
     ic2_y: np.ndarray
+    beam_on: np.ndarray | None = None
 
 
 @dataclass(frozen=True)
@@ -569,14 +571,6 @@ def frame_timeslice_chamber_position_arrays(
     return ic1_x, ic1_y, ic2_x, ic2_y
 
 
-def _beam_on_slices(
-    arrays: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray],
-    beam_on: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    ic1_x, ic1_y, ic2_x, ic2_y = arrays
-    return ic1_x[beam_on], ic1_y[beam_on], ic2_x[beam_on], ic2_y[beam_on]
-
-
 def load_session_beam_on_position_errors(
     session_id: str,
     base_dir: str,
@@ -604,6 +598,7 @@ def load_session_beam_on_position_errors(
     ic1_y_parts: list[np.ndarray] = []
     ic2_x_parts: list[np.ndarray] = []
     ic2_y_parts: list[np.ndarray] = []
+    beam_on_parts: list[np.ndarray] = []
 
     for df in frames:
         beam_on = detect_beam_on_mask(df)
@@ -614,7 +609,7 @@ def load_session_beam_on_position_errors(
         if frame_errors is None:
             continue
 
-        ic1_x, ic1_y, ic2_x, ic2_y = _beam_on_slices(frame_errors, beam_on)
+        ic1_x, ic1_y, ic2_x, ic2_y = frame_errors
         if not np.isfinite(ic1_x).any() and not np.isfinite(ic2_x).any():
             continue
 
@@ -622,6 +617,7 @@ def load_session_beam_on_position_errors(
         ic1_y_parts.append(ic1_y)
         ic2_x_parts.append(ic2_x)
         ic2_y_parts.append(ic2_y)
+        beam_on_parts.append(beam_on.astype(bool))
 
     if not ic1_x_parts:
         return None
@@ -631,4 +627,157 @@ def load_session_beam_on_position_errors(
         ic1_y=np.concatenate(ic1_y_parts),
         ic2_x=np.concatenate(ic2_x_parts),
         ic2_y=np.concatenate(ic2_y_parts),
+        beam_on=np.concatenate(beam_on_parts),
+    )
+
+
+def frame_timeslice_iso_plan_arrays(
+    df,
+    source: TimesliceIsoPositionSource,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """Isocentric plan X/Y (mm) aligned with one timeslice frame."""
+    if source.mode == "g3_iso":
+        ctx = source.context
+        layer = pd.to_numeric(df[ctx.layer_id], errors="coerce").to_numpy(dtype=float)
+        spot = pd.to_numeric(df[ctx.ic1_spot_no], errors="coerce").to_numpy(dtype=float)
+        plan_x, plan_y = ctx.plan.lookup(layer, spot)
+        return _sanitize_error(plan_x), _sanitize_error(plan_y)
+
+    if source.mode == "g2_plan":
+        layer = pd.to_numeric(df[source.layer_col], errors="coerce").to_numpy(dtype=float)
+        spot = pd.to_numeric(df[source.spot_col], errors="coerce").to_numpy(dtype=float)
+        plan_x, plan_y = source.plan.lookup(layer, spot)
+        return _sanitize_error(plan_x), _sanitize_error(plan_y)
+
+    return None
+
+
+def load_session_beam_on_iso_positions(
+    session_id: str,
+    base_dir: str,
+    *,
+    bg_subtract: bool = False,
+) -> SessionIcXYData | None:
+    """Load beam-on isocentric IC positions and plan targets for one session."""
+    src = resolve_session_source(session_id, base_dir)
+    if src is None:
+        return None
+
+    frames = load_session_timeslice_device_units(
+        src, usecols=TIMESLICE_POSITION_ERROR_COLS,
+    )
+    if not frames:
+        return None
+    if bg_subtract:
+        subtract_background_frames(frames)
+
+    iso_source = resolve_session_timeslice_iso_position_source(src, frames)
+    if iso_source is None:
+        return None
+
+    ic1_x_parts: list[np.ndarray] = []
+    ic1_y_parts: list[np.ndarray] = []
+    ic2_x_parts: list[np.ndarray] = []
+    ic2_y_parts: list[np.ndarray] = []
+    plan_x_parts: list[np.ndarray] = []
+    plan_y_parts: list[np.ndarray] = []
+    beam_on_parts: list[np.ndarray] = []
+
+    for df in frames:
+        beam_on = detect_beam_on_mask(df)
+        if beam_on is None:
+            continue
+
+        frame_positions = frame_timeslice_iso_position_arrays(df, iso_source)
+        if frame_positions is None:
+            continue
+
+        plan_arrays = frame_timeslice_iso_plan_arrays(df, iso_source)
+        ic1_x, ic1_y, ic2_x, ic2_y = frame_positions
+        if not np.isfinite(ic1_x).any() and not np.isfinite(ic2_x).any():
+            continue
+
+        ic1_x_parts.append(ic1_x)
+        ic1_y_parts.append(ic1_y)
+        ic2_x_parts.append(ic2_x)
+        ic2_y_parts.append(ic2_y)
+        beam_on_parts.append(beam_on.astype(bool))
+        if plan_arrays is not None:
+            plan_x, plan_y = plan_arrays
+            plan_x_parts.append(plan_x)
+            plan_y_parts.append(plan_y)
+
+    if not ic1_x_parts:
+        return None
+
+    plan_x = np.concatenate(plan_x_parts) if plan_x_parts else None
+    plan_y = np.concatenate(plan_y_parts) if plan_y_parts else None
+    return SessionIcXYData(
+        ic1_x=np.concatenate(ic1_x_parts),
+        ic1_y=np.concatenate(ic1_y_parts),
+        ic2_x=np.concatenate(ic2_x_parts),
+        ic2_y=np.concatenate(ic2_y_parts),
+        plan_x=plan_x,
+        plan_y=plan_y,
+        beam_on=np.concatenate(beam_on_parts),
+    )
+
+
+def load_session_beam_on_chamber_positions(
+    session_id: str,
+    base_dir: str,
+    *,
+    bg_subtract: bool = False,
+) -> SessionIcXYData | None:
+    """Load beam-on raw IC chamber-plane positions for one session."""
+    src = resolve_session_source(session_id, base_dir)
+    if src is None:
+        return None
+
+    frames = load_session_timeslice_device_units(
+        src, usecols=TIMESLICE_POSITION_ERROR_COLS,
+    )
+    if not frames:
+        return None
+    if bg_subtract:
+        subtract_background_frames(frames)
+
+    chamber_source = resolve_session_timeslice_chamber_position_source(src, frames)
+    if chamber_source is None:
+        return None
+
+    ic1_x_parts: list[np.ndarray] = []
+    ic1_y_parts: list[np.ndarray] = []
+    ic2_x_parts: list[np.ndarray] = []
+    ic2_y_parts: list[np.ndarray] = []
+    beam_on_parts: list[np.ndarray] = []
+
+    for df in frames:
+        beam_on = detect_beam_on_mask(df)
+        if beam_on is None:
+            continue
+
+        frame_positions = frame_timeslice_chamber_position_arrays(df, chamber_source)
+        if frame_positions is None:
+            continue
+
+        ic1_x, ic1_y, ic2_x, ic2_y = frame_positions
+        if not np.isfinite(ic1_x).any() and not np.isfinite(ic2_x).any():
+            continue
+
+        ic1_x_parts.append(ic1_x)
+        ic1_y_parts.append(ic1_y)
+        ic2_x_parts.append(ic2_x)
+        ic2_y_parts.append(ic2_y)
+        beam_on_parts.append(beam_on.astype(bool))
+
+    if not ic1_x_parts:
+        return None
+
+    return SessionIcXYData(
+        ic1_x=np.concatenate(ic1_x_parts),
+        ic1_y=np.concatenate(ic1_y_parts),
+        ic2_x=np.concatenate(ic2_x_parts),
+        ic2_y=np.concatenate(ic2_y_parts),
+        beam_on=np.concatenate(beam_on_parts),
     )

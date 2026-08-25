@@ -1,7 +1,7 @@
 from pathlib import Path
 
 import pytest
-from PySide6.QtGui import QGuiApplication
+from PySide6.QtWidgets import QApplication
 
 from scan_kit.common.app_icon import (
     apply_qt_application_branding,
@@ -12,14 +12,6 @@ from scan_kit.common.app_icon import (
 )
 from scan_kit.common.linux_frozen_env import prepare_linux_frozen_env
 from scan_kit.common.win_identity import prepare_windows_app_identity
-
-
-@pytest.fixture(scope="module")
-def qapp():
-    app = QGuiApplication.instance()
-    if app is None:
-        app = QGuiApplication([])
-    return app
 
 
 def test_asset_path_resolves_bundled_icon_files() -> None:
@@ -50,13 +42,9 @@ def test_desktop_file_name_matches_wm_class() -> None:
 
 
 def test_apply_qt_application_branding_sets_icon(qapp) -> None:
-    from PySide6.QtWidgets import QApplication
-
-    app = QApplication.instance()
-    assert app is not None
-    icon = apply_qt_application_branding(app)
+    icon = apply_qt_application_branding(qapp)
     assert not icon.isNull()
-    assert not app.windowIcon().isNull()
+    assert not qapp.windowIcon().isNull()
 
 
 def test_prepare_windows_app_identity_does_not_raise() -> None:

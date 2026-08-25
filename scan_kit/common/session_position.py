@@ -11,7 +11,6 @@ import numpy as np
 
 from . import (
     C_CHARGE_REQ,
-    C_ENERGY,
     C_LAYER_ID,
     C_X_POSITION,
     C_Y_POSITION,
@@ -22,6 +21,7 @@ from . import (
 )
 from .devices_xml import IC_SIGMA_DEVICES
 from .session_source import load_session_csv, load_session_timeslice_device_units, resolve_session_source
+from .timeslice_energy import build_energy_lookups, resolve_frame_energy
 from .timeslice_position_error import (
     TIMESLICE_POSITION_ERROR_COLS,
     frame_timeslice_error_arrays,
@@ -53,50 +53,6 @@ def normalize_position_data_source(value: str | None) -> PositionDataSource:
     if value == "timeslice":
         return "timeslice"
     return DEFAULT_POSITION_DATA_SOURCE
-
-
-def _build_energy_lookups(input_map) -> tuple[dict | None, dict[int, float]] | None:
-    col_layer = resolve_concept_column(input_map.columns, C_LAYER_ID)
-    col_energy = resolve_concept_column(input_map.columns, C_ENERGY)
-    if col_energy is None:
-        return None
-
-    ordered_energies = list(dict.fromkeys(input_map[col_energy].values))
-    energy_by_idx = {i: float(e) for i, e in enumerate(ordered_energies)}
-
-    energy_by_layer: dict | None = None
-    if col_layer is not None:
-        energy_by_layer = input_map.groupby(col_layer)[col_energy].first().to_dict()
-        if len(energy_by_layer) <= 1:
-            energy_by_layer = None
-
-    return energy_by_layer, energy_by_idx
-
-
-def _resolve_frame_energy(
-    df,
-    frame_idx: int,
-    *,
-    energy_by_layer: dict | None,
-    energy_by_idx: dict[int, float],
-    layer_col: str | None,
-) -> float | None:
-    if df.empty:
-        fallback = energy_by_idx.get(frame_idx)
-        return float(fallback) if fallback is not None else None
-
-    energy = None
-    if "_layer_idx" in df.columns:
-        idx = int(df["_layer_idx"].iloc[0])
-        energy = energy_by_idx.get(idx)
-    if energy is None and energy_by_layer is not None and layer_col and layer_col in df.columns:
-        lid = df[layer_col].iloc[0]
-        energy = energy_by_layer.get(lid)
-    if energy is None:
-        energy = energy_by_idx.get(frame_idx)
-    if energy is None:
-        return None
-    return float(energy)
 
 
 def _spot_position_loader(session_id: str, position_key: str, base_dir: str):
@@ -171,7 +127,7 @@ def load_measured_position_errors_timeslice(
     if input_map is None:
         return None
 
-    lookups = _build_energy_lookups(input_map)
+    lookups = build_energy_lookups(input_map)
     if lookups is None:
         return None
     energy_by_layer, energy_by_idx = lookups
@@ -199,12 +155,12 @@ def load_measured_position_errors_timeslice(
         if beam_on is None:
             continue
 
-        energy = _resolve_frame_energy(
+        energy = resolve_frame_energy(
             df,
             frame_idx,
             energy_by_layer=energy_by_layer,
             energy_by_idx=energy_by_idx,
-            layer_col=layer_col,
+            layer_col=layer_col or "",
         )
         if energy is None:
             continue

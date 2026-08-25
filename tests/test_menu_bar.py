@@ -2,10 +2,8 @@
 
 from __future__ import annotations
 
-import sys
-
 import pytest
-from PySide6.QtWidgets import QApplication, QMenu
+from PySide6.QtWidgets import QMenu
 
 from scan_kit.qt_launcher import (
     _MAIN_TAB_CONFIG_TUNING,
@@ -14,14 +12,6 @@ from scan_kit.qt_launcher import (
     ScanKitMainWindow,
 )
 from scan_kit.views import VIEW_GROUPS
-
-
-@pytest.fixture(scope="module")
-def qapp():
-    app = QApplication.instance()
-    if app is None:
-        app = QApplication(sys.argv)
-    return app
 
 
 @pytest.fixture

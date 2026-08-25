@@ -8,7 +8,6 @@ import numpy as np
 import pandas as pd
 
 from scan_kit.common.schema import C_MAG_FIELD_X, C_MAG_FIELD_Y, resolve_concept_column
-from scan_kit.views.timeslice_replay_channels import load_session_timeline_catalog
 
 TEST_DATA = Path(__file__).resolve().parents[1] / "test_data"
 
@@ -33,15 +32,15 @@ def test_g2_field_column_aliases() -> None:
     assert resolve_concept_column(cols, C_MAG_FIELD_Y) == "field_c_y"
 
 
-def test_load_g3_session_timeline() -> None:
-    data = load_session_timeline_catalog("1091134775", str(TEST_DATA))
+def test_load_g3_session_timeline(g3_timeline_catalog) -> None:
+    data = g3_timeline_catalog
     assert data is not None
     assert data["n_samples"] > 0
     assert len(data["bx"]) == data["n_samples"]
     assert np.nanmax(np.abs(data["bx"])) > 0
 
 
-def test_load_g2_session_timeline() -> None:
-    data = load_session_timeline_catalog("590658542", str(TEST_DATA))
+def test_load_g2_session_timeline(g2_timeline_catalog) -> None:
+    data = g2_timeline_catalog
     assert data is not None
     assert np.nanmax(np.abs(data["bx"])) > 0

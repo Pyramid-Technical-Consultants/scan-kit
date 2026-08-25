@@ -16,6 +16,7 @@ from .session_source import (
     load_session_timeslice_device_units,
     resolve_session_source,
 )
+from .timeslice_position_error import SessionPositionErrors
 
 _log = logging.getLogger(__name__)
 
@@ -24,6 +25,13 @@ _SIGMA_SPECS = (
     ("ic1_y", ("r_ic1_y_sigma",)),
     ("ic2_x", ("r_ic2_x_sigma",)),
     ("ic2_y", ("r_ic2_y_sigma",)),
+)
+
+_SIGMA_TARGET_SPECS = (
+    ("ic1_x", ("ic1_sigma_x_target",)),
+    ("ic1_y", ("ic1_sigma_y_target",)),
+    ("ic2_x", ("ic2_sigma_x_target",)),
+    ("ic2_y", ("ic2_sigma_y_target",)),
 )
 
 _G2_IC2_X_SIGMA_OK_ALIASES = ("r_x_sigma_ok.1", "r_x_sigma_ok")
@@ -56,6 +64,11 @@ TIMESLICE_SIGMA_COLS = [
     *_G3_QUALITY_COLS,
 ]
 
+TIMESLICE_SIGMA_ERROR_COLS = [
+    *TIMESLICE_SIGMA_COLS,
+    *(name for _, aliases in _SIGMA_TARGET_SPECS for name in aliases),
+]
+
 
 @dataclass(frozen=True)
 class SessionIcSigmas:
@@ -63,6 +76,7 @@ class SessionIcSigmas:
     ic1_y: np.ndarray
     ic2_x: np.ndarray
     ic2_y: np.ndarray
+    beam_on: np.ndarray | None = None
 
 
 @dataclass(frozen=True)
@@ -99,6 +113,24 @@ def _resolve_sigma_columns(columns) -> dict[str, str] | None:
             return None
         resolved[label] = col
     return resolved
+
+
+def _resolve_sigma_target_columns(columns) -> dict[str, str] | None:
+    resolved: dict[str, str] = {}
+    for label, aliases in _SIGMA_TARGET_SPECS:
+        col = _resolve_first_column(columns, aliases)
+        if col is None:
+            return None
+        resolved[label] = col
+    return resolved
+
+
+def timeslice_sigma_error_available(columns) -> bool:
+    """True when measured sigma and per-IC sigma targets are present."""
+    return (
+        resolve_timeslice_sigma_source(columns) is not None
+        and _resolve_sigma_target_columns(columns) is not None
+    )
 
 
 def _is_g3_sigma_session(columns) -> bool:
@@ -231,6 +263,7 @@ def load_session_beam_on_sigmas(
     parts: dict[str, list[np.ndarray]] = {
         key: [] for key in ("ic1_x", "ic1_y", "ic2_x", "ic2_y")
     }
+    beam_on_parts: list[np.ndarray] = []
 
     for df in frames:
         beam_on = detect_beam_on_mask(df)
@@ -242,12 +275,6 @@ def load_session_beam_on_sigmas(
             continue
 
         ic1_x, ic1_y, ic2_x, ic2_y = frame_sigmas
-        ic1_x, ic1_y, ic2_x, ic2_y = (
-            ic1_x[beam_on],
-            ic1_y[beam_on],
-            ic2_x[beam_on],
-            ic2_y[beam_on],
-        )
         if not np.isfinite(ic1_x).any() and not np.isfinite(ic2_x).any():
             continue
 
@@ -255,6 +282,7 @@ def load_session_beam_on_sigmas(
         parts["ic1_y"].append(ic1_y)
         parts["ic2_x"].append(ic2_x)
         parts["ic2_y"].append(ic2_y)
+        beam_on_parts.append(beam_on.astype(bool))
 
     if not parts["ic1_x"]:
         return None
@@ -264,4 +292,100 @@ def load_session_beam_on_sigmas(
         ic1_y=np.concatenate(parts["ic1_y"]),
         ic2_x=np.concatenate(parts["ic2_x"]),
         ic2_y=np.concatenate(parts["ic2_y"]),
+        beam_on=np.concatenate(beam_on_parts),
+    )
+
+
+def _sanitize_sigma_target(arr: np.ndarray) -> np.ndarray:
+    out = arr.astype(float, copy=True)
+    out[~np.isfinite(out)] = np.nan
+    out[out <= 0] = np.nan
+    return out
+
+
+def frame_timeslice_sigma_target_arrays(
+    df,
+    target_cols: dict[str, str],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    return (
+        _sanitize_sigma_target(df[target_cols["ic1_x"]].values),
+        _sanitize_sigma_target(df[target_cols["ic1_y"]].values),
+        _sanitize_sigma_target(df[target_cols["ic2_x"]].values),
+        _sanitize_sigma_target(df[target_cols["ic2_y"]].values),
+    )
+
+
+def frame_timeslice_sigma_error_arrays(
+    df,
+    source: TimesliceSigmaSource,
+    target_cols: dict[str, str],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None:
+    measured = frame_timeslice_sigma_arrays(df, source)
+    if measured is None:
+        return None
+    targets = frame_timeslice_sigma_target_arrays(df, target_cols)
+    errors = tuple(m - t for m, t in zip(measured, targets))
+    if not any(np.isfinite(arr).any() for arr in errors):
+        return None
+    return errors  # type: ignore[return-value]
+
+
+def load_session_beam_on_sigma_errors(
+    session_id: str,
+    base_dir: str,
+    *,
+    bg_subtract: bool = False,
+) -> SessionPositionErrors | None:
+    """Load beam-on sigma error (measured minus target) samples for one session."""
+    src = resolve_session_source(session_id, base_dir)
+    if src is None:
+        return None
+
+    frames = load_session_timeslice_device_units(
+        src, usecols=TIMESLICE_SIGMA_ERROR_COLS,
+    )
+    if not frames:
+        return None
+    if bg_subtract:
+        subtract_background_frames(frames)
+
+    columns = frames[0].columns
+    source = resolve_timeslice_sigma_source(columns)
+    target_cols = _resolve_sigma_target_columns(columns)
+    if source is None or target_cols is None:
+        return None
+
+    parts: dict[str, list[np.ndarray]] = {
+        key: [] for key in ("ic1_x", "ic1_y", "ic2_x", "ic2_y")
+    }
+    beam_on_parts: list[np.ndarray] = []
+
+    for df in frames:
+        beam_on = detect_beam_on_mask(df)
+        if beam_on is None:
+            continue
+
+        frame_errors = frame_timeslice_sigma_error_arrays(df, source, target_cols)
+        if frame_errors is None:
+            continue
+
+        ic1_x, ic1_y, ic2_x, ic2_y = frame_errors
+        if not np.isfinite(ic1_x).any() and not np.isfinite(ic2_x).any():
+            continue
+
+        parts["ic1_x"].append(ic1_x)
+        parts["ic1_y"].append(ic1_y)
+        parts["ic2_x"].append(ic2_x)
+        parts["ic2_y"].append(ic2_y)
+        beam_on_parts.append(beam_on.astype(bool))
+
+    if not parts["ic1_x"]:
+        return None
+
+    return SessionPositionErrors(
+        ic1_x=np.concatenate(parts["ic1_x"]),
+        ic1_y=np.concatenate(parts["ic1_y"]),
+        ic2_x=np.concatenate(parts["ic2_x"]),
+        ic2_y=np.concatenate(parts["ic2_y"]),
+        beam_on=np.concatenate(beam_on_parts),
     )
