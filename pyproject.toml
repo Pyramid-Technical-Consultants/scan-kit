@@ -25,6 +25,7 @@ dependencies = [
 
 [project.optional-dependencies]
 build = ["pyinstaller>=6.0"]
+dev = ["pytest-xdist>=3.5"]
 
 [project.urls]
 Homepage = "https://www.pyramid.tech"
@@ -43,3 +44,13 @@ exclude = ["test_data*"]
 
 [tool.setuptools.package-data]
 scan_kit = ["assets/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "slow: loads full session fixtures or spins up heavy Qt windows",
+]
+addopts = "-ra -m 'not slow' -n auto --dist loadscope"
+filterwarnings = [
+    "ignore:Mean of empty slice:RuntimeWarning",
+]

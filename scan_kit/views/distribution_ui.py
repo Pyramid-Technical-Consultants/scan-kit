@@ -14,15 +14,26 @@ from .distribution_catalog import (
     MODE_BY_ID,
     MODE_CONFIDENCE_TIMESLICE,
     MODE_GAUSSIAN_FILTER,
+    MODE_IC12_POS_DIFF_SPOT,
+    MODE_IC12_POS_DIFF_TIMESLICE,
     MODE_POSITION_ERROR_SPOT,
     MODE_POSITION_ERROR_TIMESLICE,
     MODE_POSITION_SPOT,
     MODE_POSITION_TIMESLICE,
+    MODE_SIGMA_ERROR_SPOT,
     MODE_SIGMA_ERROR_TIMESLICE,
     MODE_SIGMA_SPOT,
     MODE_SIGMA_TIMESLICE,
     DistributionConfig,
 )
+
+
+def _panel_kwargs(config: DistributionConfig) -> dict:
+    return {
+        "show_plan": config.show_plan,
+        "show_ic1": config.show_ic1,
+        "show_ic2": config.show_ic2,
+    }
 
 
 def render_distribution(
@@ -57,6 +68,8 @@ def render_distribution(
         fig.canvas.draw_idle()
         return
 
+    panels = _panel_kwargs(config)
+
     if config.mode in (MODE_POSITION_ERROR_TIMESLICE, MODE_POSITION_ERROR_SPOT):
         render_position_error_distribution(
             session_data,
@@ -67,6 +80,7 @@ def render_distribution(
             contour_cutoff_percentile=contour_cutoff,
             fig=fig,
             show=False,
+            **panels,
         )
         return
 
@@ -83,10 +97,11 @@ def render_distribution(
             y_hist_label="Y Position (mm)",
             fig=fig,
             show=False,
+            **panels,
         )
         return
 
-    if config.mode == MODE_SIGMA_ERROR_TIMESLICE:
+    if config.mode in (MODE_IC12_POS_DIFF_TIMESLICE, MODE_IC12_POS_DIFF_SPOT):
         render_ic_xy_distribution(
             session_data,
             loaded_ids,
@@ -95,12 +110,31 @@ def render_distribution(
             limit_mode="symmetric",
             plot_style=plot_style,
             contour_cutoff_percentile=contour_cutoff,
+            x_hist_label="IC2−IC1 X (mm)",
+            y_hist_label="IC2−IC1 Y (mm)",
+            fig=fig,
+            show=False,
             show_plan=False,
+            show_ic1=True,
+            show_ic2=False,
+        )
+        return
+
+    if config.mode in (MODE_SIGMA_ERROR_TIMESLICE, MODE_SIGMA_ERROR_SPOT):
+        render_ic_xy_distribution(
+            session_data,
+            loaded_ids,
+            title=title,
+            base_dir=base_dir,
+            limit_mode="symmetric",
+            plot_style=plot_style,
+            contour_cutoff_percentile=contour_cutoff,
             reference_circle=True,
             x_hist_label="X Sigma Error (mm)",
             y_hist_label="Y Sigma Error (mm)",
             fig=fig,
             show=False,
+            **panels,
         )
         return
 
@@ -114,6 +148,7 @@ def render_distribution(
             contour_cutoff_percentile=contour_cutoff,
             fig=fig,
             show=False,
+            **panels,
         )
         return
 

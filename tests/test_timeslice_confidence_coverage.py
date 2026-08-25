@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from scan_kit.common.timeslice_confidence_coverage import (
     compute_session_confidence_coverage,
@@ -14,6 +15,7 @@ from scan_kit.common.timeslice_confidence_coverage import (
 TEST_DATA = Path(__file__).resolve().parents[1] / "test_data"
 
 
+@pytest.mark.slow
 def test_g3_session_computes_coverage_curves() -> None:
     coverage = compute_session_confidence_coverage("1091134775", str(TEST_DATA))
     assert coverage is not None
@@ -27,6 +29,7 @@ def test_g3_session_computes_coverage_curves() -> None:
         assert 0 <= axis_cov.full_coverage_breakpoint <= 100
 
 
+@pytest.mark.slow
 def test_g2_session_with_confidence_computes_coverage() -> None:
     coverage = compute_session_confidence_coverage("590658542", str(TEST_DATA))
     assert coverage is not None

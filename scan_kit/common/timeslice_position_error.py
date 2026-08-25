@@ -721,3 +721,63 @@ def load_session_beam_on_iso_positions(
         plan_y=plan_y,
         beam_on=np.concatenate(beam_on_parts),
     )
+
+
+def load_session_beam_on_chamber_positions(
+    session_id: str,
+    base_dir: str,
+    *,
+    bg_subtract: bool = False,
+) -> SessionIcXYData | None:
+    """Load beam-on raw IC chamber-plane positions for one session."""
+    src = resolve_session_source(session_id, base_dir)
+    if src is None:
+        return None
+
+    frames = load_session_timeslice_device_units(
+        src, usecols=TIMESLICE_POSITION_ERROR_COLS,
+    )
+    if not frames:
+        return None
+    if bg_subtract:
+        subtract_background_frames(frames)
+
+    chamber_source = resolve_session_timeslice_chamber_position_source(src, frames)
+    if chamber_source is None:
+        return None
+
+    ic1_x_parts: list[np.ndarray] = []
+    ic1_y_parts: list[np.ndarray] = []
+    ic2_x_parts: list[np.ndarray] = []
+    ic2_y_parts: list[np.ndarray] = []
+    beam_on_parts: list[np.ndarray] = []
+
+    for df in frames:
+        beam_on = detect_beam_on_mask(df)
+        if beam_on is None:
+            continue
+
+        frame_positions = frame_timeslice_chamber_position_arrays(df, chamber_source)
+        if frame_positions is None:
+            continue
+
+        ic1_x, ic1_y, ic2_x, ic2_y = frame_positions
+        if not np.isfinite(ic1_x).any() and not np.isfinite(ic2_x).any():
+            continue
+
+        ic1_x_parts.append(ic1_x)
+        ic1_y_parts.append(ic1_y)
+        ic2_x_parts.append(ic2_x)
+        ic2_y_parts.append(ic2_y)
+        beam_on_parts.append(beam_on.astype(bool))
+
+    if not ic1_x_parts:
+        return None
+
+    return SessionIcXYData(
+        ic1_x=np.concatenate(ic1_x_parts),
+        ic1_y=np.concatenate(ic1_y_parts),
+        ic2_x=np.concatenate(ic2_x_parts),
+        ic2_y=np.concatenate(ic2_y_parts),
+        beam_on=np.concatenate(beam_on_parts),
+    )

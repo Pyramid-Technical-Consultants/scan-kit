@@ -20,10 +20,10 @@ from .distribution_catalog import (
     VIEW_OPTIONS,
     DistributionConfig,
     metric_source_for_mode,
+    metric_supports_reference_frame,
     resolve_mode_id,
 )
 from .distribution_data import (
-    clear_load_cache,
     default_mode,
     load_sessions_for_mode,
     probe_mode_availability,
@@ -41,16 +41,21 @@ from .unified_catalog import (
     DATA_SOURCE_TIMESLICE,
     DISTRIBUTION_PLOT_STYLES,
     PLOT_STYLE_CONTOUR,
+    REFERENCE_ISO,
 )
 from .unified_view_controls import (
     DataFilterPanel,
     DataSourceOptionPanel,
     PlotStylePanel,
+    ReferenceFramePanel,
     sync_data_filter_panel,
 )
 
 
 _CONTOUR_CUTOFF_OPTION = "contour_cutoff"
+_PANEL_PLAN = "show_plan"
+_PANEL_IC1 = "show_ic1"
+_PANEL_IC2 = "show_ic2"
 _log = logging.getLogger(__name__)
 
 
@@ -80,6 +85,7 @@ class DistributionExplorerWindow(PlotViewWindow):
         self._mode_available = probe_mode_availability(self._session_ids, self._base_dir)
         self._option_panel: DataSourceOptionPanel | None = None
         self._plot_style_panel: PlotStylePanel | None = None
+        self._reference_panel: ReferenceFramePanel | None = None
         self._filter_panel: DataFilterPanel | None = None
         self._refresh_generation = 0
 
@@ -145,7 +151,16 @@ class DistributionExplorerWindow(PlotViewWindow):
             "Contour Cutoff",
             value=int(round(self._settings.contour_cutoff_percentile)),
         )
+        self._plot_style_panel.add_checkbox(_PANEL_PLAN, "Plan", checked=False)
+        self._plot_style_panel.add_checkbox(_PANEL_IC1, "IC1", checked=True)
+        self._plot_style_panel.add_checkbox(_PANEL_IC2, "IC2", checked=True)
         layout.addWidget(self._plot_style_panel)
+
+        self._reference_panel = ReferenceFramePanel(
+            on_selection_changed=self._schedule_refresh,
+            current=REFERENCE_ISO,
+        )
+        layout.addWidget(self._reference_panel)
 
         self._filter_panel = DataFilterPanel(
             on_selection_changed=self._schedule_refresh,
@@ -178,10 +193,15 @@ class DistributionExplorerWindow(PlotViewWindow):
             if spin_val is not None:
                 cutoff = float(spin_val)
         cutoff = normalize_contour_cutoff_percentile(cutoff)
+        panel = self._plot_style_panel
+        ref_panel = self._reference_panel
         return DistributionConfig(
             mode=mode,
             plot_style=plot_style or PLOT_STYLE_CONTOUR,  # type: ignore[arg-type]
             contour_cutoff_percentile=cutoff,
+            reference_frame=(
+                ref_panel.selected_key() if ref_panel is not None else REFERENCE_ISO
+            ),
             domain_filter=(
                 self._filter_panel.selected_domain()
                 if self._filter_panel is not None
@@ -192,6 +212,9 @@ class DistributionExplorerWindow(PlotViewWindow):
                 if self._filter_panel is not None
                 else FILTER_BEAM_BOTH
             ) or FILTER_BEAM_BOTH,
+            show_plan=panel.is_checked(_PANEL_PLAN) if panel else False,
+            show_ic1=panel.is_checked(_PANEL_IC1) if panel else True,
+            show_ic2=panel.is_checked(_PANEL_IC2) if panel else True,
         )
 
     def _mode_filter_state(self) -> tuple[bool, bool]:
@@ -209,6 +232,7 @@ class DistributionExplorerWindow(PlotViewWindow):
             self._filter_panel,
             supports_filter=supports_filter,
             has_beam_state=has_beam_state,
+            reset_defaults=True,
         )
 
     def _on_metric_changed(self) -> None:
@@ -235,6 +259,37 @@ class DistributionExplorerWindow(PlotViewWindow):
             self._plot_style_panel.set_option_visible(
                 _CONTOUR_CUTOFF_OPTION, contour_mode,
             )
+            metric_id = (
+                self._option_panel.selected_id()
+                if self._option_panel is not None
+                else None
+            )
+            show_ic_panels = supports_style and metric_id != "ic12_pos_diff"
+            for option_id in (_PANEL_PLAN, _PANEL_IC1, _PANEL_IC2):
+                self._plot_style_panel.set_option_visible(option_id, show_ic_panels)
+        if self._reference_panel is not None:
+            metric_id = (
+                self._option_panel.selected_id()
+                if self._option_panel is not None
+                else None
+            )
+            source = (
+                self._option_panel.selected_source()
+                if self._option_panel is not None
+                else DATA_SOURCE_SPOT
+            )
+            supports_ref = (
+                metric_id is not None
+                and metric_supports_reference_frame(metric_id, source)  # type: ignore[arg-type]
+            )
+            self._reference_panel.set_enabled(supports_ref)
+
+    def _cache_key_for_config(self, config: DistributionConfig) -> tuple:
+        return (
+            config.mode,
+            config.reference_frame,
+            self._settings.bg_subtract if self._settings else False,
+        )
 
     def _schedule_render(self, config: DistributionConfig, session_data: dict) -> None:
         gen = self._refresh_generation
@@ -284,26 +339,29 @@ class DistributionExplorerWindow(PlotViewWindow):
         gen = self._refresh_generation
         config = self._read_config()
         mode = config.mode
+        cache_key = self._cache_key_for_config(config)
         self._sync_display_controls()
         self._persist_contour_cutoff(config.contour_cutoff_percentile)
         self.setWindowTitle(config.title)
 
-        if mode in self._cache:
-            self._schedule_render(config, self._cache[mode])
+        if cache_key in self._cache:
+            self._schedule_render(config, self._cache[cache_key])
             return
 
         session_ids = list(self._session_ids)
         base_dir = self._base_dir
         settings = self._settings
+        reference_frame = config.reference_frame
 
-        def loader() -> tuple[int, str, dict[str, Any]]:
+        def loader() -> tuple[int, tuple, dict[str, Any]]:
             data = load_sessions_for_mode(
                 mode,
                 session_ids,
                 base_dir,
                 settings=settings,
+                reference_frame=reference_frame,
             )
-            return gen, mode, data
+            return gen, cache_key, data
 
         self._load_task.schedule(loader)
 
@@ -311,12 +369,12 @@ class DistributionExplorerWindow(PlotViewWindow):
     def _on_load_finished(self, _task_generation: int, result: object) -> None:
         if not isinstance(result, tuple) or len(result) != 3:
             return
-        gen, mode, session_data = result
+        gen, cache_key, session_data = result
         if gen != self._refresh_generation:
             return
-        if self._current_mode() != mode:
+        if self._cache_key_for_config(self._read_config()) != cache_key:
             return
-        self._cache[mode] = session_data
+        self._cache[cache_key] = session_data
         self._schedule_render(self._read_config(), session_data)
 
     @Slot(int, object)

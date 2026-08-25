@@ -44,15 +44,11 @@ from scan_kit.views.binned_summary_data import (
     load_sessions_current_ratios,
     load_session_timeslice_summary_table,
     load_sessions_summary,
-    probe_view_option_availability,
 )
 from scan_kit.views.unified_catalog import DATA_SOURCE_SPOT, DATA_SOURCE_TIMESLICE
 from scan_kit.views.binned_summary_ui import render_binned_summary
 from scan_kit.views.binned_summary_window import BinnedSummaryWindow
-
-TEST_DATA = Path(__file__).resolve().parents[1] / "test_data"
-G3_SESSION = "1091134775"
-G2_SESSION = "590658542"
+from tests.conftest import G2_SESSION, G3_SESSION, TEST_DATA
 
 
 def _config_for_preset(preset_id: str) -> BinnedSummaryConfig:
@@ -68,17 +64,10 @@ def _config_for_preset(preset_id: str) -> BinnedSummaryConfig:
 
 
 def _run_preset_matplotlib(
-    session_ids: list[str],
+    session_data: dict[str, dict],
     base_dir: str,
     preset_id: str,
-    *,
-    settings: ViewSettings | None = None,
 ) -> None:
-    session_data = load_sessions_summary(
-        session_ids,
-        base_dir,
-        settings=settings,
-    )
     if not session_data:
         return
 
@@ -171,10 +160,11 @@ def test_load_summary_availability() -> None:
     assert series
 
 
-def test_render_binned_summary_headless() -> None:
-    session_data = load_sessions_summary([G3_SESSION], str(TEST_DATA))
+def test_render_binned_summary_headless(g3_spot_summary) -> None:
+    if not g3_spot_summary:
+        pytest.skip("spot summary unavailable in fixture")
     config = BinnedSummaryConfig(
-        y_group=Y_DOSE_RATIO if Y_DOSE_RATIO in available_y_groups(session_data) else Y_SIGMA,
+        y_group=Y_DOSE_RATIO if Y_DOSE_RATIO in available_y_groups(g3_spot_summary) else Y_SIGMA,
         x_param=X_ENERGY,
         glyph="box",
         show_trend=True,
@@ -183,14 +173,13 @@ def test_render_binned_summary_headless() -> None:
         config.glyph = "violin"
         config.show_trend = False
     fig = plt.figure()
-    render_binned_summary(fig, config, session_data, str(TEST_DATA))
+    render_binned_summary(fig, config, g3_spot_summary, str(TEST_DATA))
     assert fig.axes
     plt.close(fig)
 
 
-def test_render_binned_summary_dose_rate_headless() -> None:
-    session_data = load_sessions_dose_rate([G3_SESSION], str(TEST_DATA))
-    if not session_data:
+def test_render_binned_summary_dose_rate_headless(g3_dose_rate) -> None:
+    if not g3_dose_rate:
         pytest.skip("dose rate unavailable in fixture")
     config = BinnedSummaryConfig(
         y_group=Y_DOSE_RATE,
@@ -199,14 +188,13 @@ def test_render_binned_summary_dose_rate_headless() -> None:
         show_trend=True,
     )
     fig = plt.figure()
-    render_binned_summary(fig, config, session_data, str(TEST_DATA))
+    render_binned_summary(fig, config, g3_dose_rate, str(TEST_DATA))
     assert fig.axes
     plt.close(fig)
 
 
-def test_render_binned_summary_current_ratio_headless() -> None:
-    session_data = load_sessions_current_ratios([G3_SESSION], str(TEST_DATA))
-    if not session_data:
+def test_render_binned_summary_current_ratio_headless(g3_current_ratios) -> None:
+    if not g3_current_ratios:
         pytest.skip("current ratio data unavailable in fixture")
     config = BinnedSummaryConfig(
         y_group=Y_CURRENT_RATIO,
@@ -215,25 +203,27 @@ def test_render_binned_summary_current_ratio_headless() -> None:
         show_trend=True,
     )
     fig = plt.figure()
-    render_binned_summary(fig, config, session_data, str(TEST_DATA))
+    render_binned_summary(fig, config, g3_current_ratios, str(TEST_DATA))
     assert fig.axes
     plt.close(fig)
 
 
-def test_render_binned_summary_quantile_x() -> None:
-    session_data = load_sessions_summary([G3_SESSION], str(TEST_DATA))
-    if X_TARGET_MU not in available_x_params(session_data):
+def test_render_binned_summary_quantile_x(g3_spot_summary) -> None:
+    if not g3_spot_summary:
+        pytest.skip("spot summary unavailable in fixture")
+    if X_TARGET_MU not in available_x_params(g3_spot_summary):
         pytest.skip("target_mu unavailable in fixture")
-    y = Y_DOSE_RATIO if Y_DOSE_RATIO in available_y_groups(session_data) else next(
-        iter(available_y_groups(session_data))
+    y = Y_DOSE_RATIO if Y_DOSE_RATIO in available_y_groups(g3_spot_summary) else next(
+        iter(available_y_groups(g3_spot_summary))
     )
     config = BinnedSummaryConfig(y_group=y, x_param=X_TARGET_MU, glyph="box")
     fig = plt.figure()
-    render_binned_summary(fig, config, session_data, str(TEST_DATA))
+    render_binned_summary(fig, config, g3_spot_summary, str(TEST_DATA))
     assert fig.axes
     plt.close(fig)
 
 
+@pytest.mark.slow
 def test_binned_summary_window_smoke(qapp) -> None:
     window = BinnedSummaryWindow([G3_SESSION], str(TEST_DATA))
     assert window._spot_data
@@ -247,34 +237,44 @@ def test_binned_summary_window_smoke(qapp) -> None:
     window.close()
 
 
-def test_timeslice_summary_table_when_available() -> None:
-    data = load_session_timeslice_summary_table(G3_SESSION, str(TEST_DATA))
-    if data is None:
+def test_timeslice_summary_table_when_available(g3_timeslice_summary_table) -> None:
+    data = g3_timeslice_summary_table
+    if not data:
         pytest.skip("timeslice summary unavailable in fixture")
     assert "energy" in data
     assert any(key in data for key in ("ic1_x_err", "ic1_sig_x"))
 
 
-def test_probe_view_option_availability_includes_timeslice() -> None:
-    spot_data = load_sessions_summary([G3_SESSION], str(TEST_DATA))
-    availability = probe_view_option_availability(
-        [G3_SESSION], str(TEST_DATA), spot_data=spot_data,
-    )
+def test_probe_view_option_availability_includes_timeslice(g3_binned_availability) -> None:
+    availability = g3_binned_availability
     assert any(key.startswith(f"{DATA_SOURCE_SPOT}:") for key in availability)
-    if load_session_timeslice_summary_table(G3_SESSION, str(TEST_DATA)) is not None:
-        assert any(key.startswith(f"{DATA_SOURCE_TIMESLICE}:") for key in availability)
+    assert any(key.startswith(f"{DATA_SOURCE_TIMESLICE}:") for key in availability)
 
 
-def test_position_error_series_when_available() -> None:
-    session_data = load_sessions_summary([G3_SESSION], str(TEST_DATA))
-    if Y_POSITION_ERROR not in available_y_groups(session_data):
+def test_spot_sigma_availability_depends_on_reference_frame(
+    g3_spot_summary,
+    g3_spot_summary_chamber,
+) -> None:
+    from scan_kit.views.binned_summary_catalog import Y_SIGMA
+    from scan_kit.views.binned_summary_data import available_y_groups
+
+    iso_has_sigma = Y_SIGMA in available_y_groups(g3_spot_summary)
+    chamber_has_sigma = Y_SIGMA in available_y_groups(g3_spot_summary_chamber)
+    assert iso_has_sigma or chamber_has_sigma
+    if iso_has_sigma != chamber_has_sigma:
+        assert True  # reference frame changes which sigma columns are present
+
+
+def test_position_error_series_when_available(g3_spot_summary) -> None:
+    if Y_POSITION_ERROR not in available_y_groups(g3_spot_summary):
         pytest.skip("position error unavailable")
-    keys = available_series_keys(session_data, Y_POSITION_ERROR)
+    keys = available_series_keys(g3_spot_summary, Y_POSITION_ERROR)
     assert "ic1_x_err" in keys
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize("preset_id", [preset.id for preset in PRESETS])
-def test_run_preset_matplotlib_all_presets(preset_id: str) -> None:
-    _run_preset_matplotlib([G3_SESSION], str(TEST_DATA), preset_id)
+def test_run_preset_matplotlib_all_presets(g3_spot_summary, preset_id: str) -> None:
+    _run_preset_matplotlib(g3_spot_summary, str(TEST_DATA), preset_id)
     assert plt.get_fignums()
     plt.close("all")

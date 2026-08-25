@@ -6,10 +6,12 @@ import logging
 from typing import Sequence
 
 from matplotlib.figure import Figure
-from PySide6.QtCore import QTimer, Slot
+from PySide6.QtCore import Qt, QTimer, Slot
 from PySide6.QtWidgets import (
     QCheckBox,
     QGroupBox,
+    QListWidget,
+    QListWidgetItem,
     QVBoxLayout,
     QWidget,
 )
@@ -17,8 +19,19 @@ from PySide6.QtWidgets import (
 from ..common.data_filter import FILTER_ALL, FILTER_BEAM_BOTH, FILTER_BEAM_ON
 from ..common.settings import ViewSettings
 from .async_refresh import DebouncedBackgroundTask
-from .fft_catalog import FFT_SIGNALS, PRESET_BY_ID, PRESETS, FftConfig
-from .fft_data import default_config, load_sessions_fft, probe_signal_availability
+from .fft_catalog import (
+    FFT_METRICS,
+    METRIC_BY_ID,
+    PRESET_BY_ID,
+    PRESETS,
+    FftConfig,
+)
+from .fft_data import (
+    default_config,
+    load_sessions_fft,
+    probe_channel_availability,
+    probe_metric_availability,
+)
 from .fft_ui import render_fft
 from .plot_view_shell import (
     PlotViewWindow,
@@ -55,8 +68,12 @@ class FftExplorerWindow(PlotViewWindow):
         self._base_dir = base_dir
         self._settings = settings
         self._session_data: dict[str, dict] = {}
-        self._signal_availability: dict[str, bool] = {}
-        self._signal_checks: dict[str, QCheckBox] = {}
+        self._metric_availability: dict[str, bool] = {}
+        self._channel_availability: dict[str, bool] = {}
+        self._metric_list: QListWidget | None = None
+        self._channel_checks: dict[str, QCheckBox] = {}
+        self._channel_group: QGroupBox | None = None
+        self._channel_layout: QVBoxLayout | None = None
         self._filter_panel: DataFilterPanel | None = None
         self._peaks_box: QCheckBox | None = None
         self._refresh_generation = 0
@@ -93,14 +110,21 @@ class FftExplorerWindow(PlotViewWindow):
             )
         )
 
-        signal_group = QGroupBox("Signals")
-        signal_layout = QVBoxLayout(signal_group)
-        for signal in FFT_SIGNALS:
-            box = QCheckBox(signal.label)
-            box.toggled.connect(self._schedule_refresh)
-            signal_layout.addWidget(box)
-            self._signal_checks[signal.id] = box
-        layout.addWidget(signal_group)
+        metric_group = QGroupBox("Signal Source")
+        metric_layout = QVBoxLayout(metric_group)
+        self._metric_list = QListWidget()
+        self._metric_list.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
+        for metric in FFT_METRICS:
+            item = QListWidgetItem(metric.label)
+            item.setData(256, metric.id)
+            self._metric_list.addItem(item)
+        self._metric_list.currentItemChanged.connect(self._on_metric_changed)
+        metric_layout.addWidget(self._metric_list)
+        layout.addWidget(metric_group)
+
+        self._channel_group = QGroupBox("Channels")
+        self._channel_layout = QVBoxLayout(self._channel_group)
+        layout.addWidget(self._channel_group)
 
         self._filter_panel = DataFilterPanel(
             on_selection_changed=self._schedule_refresh,
@@ -120,6 +144,67 @@ class FftExplorerWindow(PlotViewWindow):
         layout.addStretch(1)
         return panel
 
+    def _current_metric_id(self) -> str | None:
+        if self._metric_list is None:
+            return None
+        item = self._metric_list.currentItem()
+        if item is None:
+            return None
+        metric_id = item.data(256)
+        return str(metric_id) if metric_id is not None else None
+
+    def _rebuild_channel_checks(self) -> None:
+        if self._channel_layout is None or self._channel_group is None:
+            return
+        while self._channel_layout.count():
+            child = self._channel_layout.takeAt(0)
+            if child.widget() is not None:
+                child.widget().deleteLater()
+        self._channel_checks.clear()
+
+        metric_id = self._current_metric_id()
+        metric = METRIC_BY_ID.get(metric_id) if metric_id else None
+        if metric is None:
+            self._channel_group.setEnabled(False)
+            return
+        self._channel_group.setEnabled(True)
+        self._channel_group.setTitle(f"Channels — {metric.label}")
+
+        for channel in metric.channels:
+            box = QCheckBox(channel.label)
+            available = self._channel_availability.get(channel.id, False)
+            box.setEnabled(available)
+            box.setChecked(available)
+            box.toggled.connect(self._schedule_refresh)
+            self._channel_layout.addWidget(box)
+            self._channel_checks[channel.id] = box
+
+    def _sync_metric_list(self) -> None:
+        if self._metric_list is None:
+            return
+        self._updating = True
+        try:
+            current = self._current_metric_id()
+            for row in range(self._metric_list.count()):
+                item = self._metric_list.item(row)
+                metric_id = str(item.data(256))
+                available = self._metric_availability.get(metric_id, False)
+                item.setFlags(
+                    item.flags() | Qt.ItemFlag.ItemIsEnabled
+                    if available
+                    else item.flags() & ~Qt.ItemFlag.ItemIsEnabled
+                )
+            if current and self._metric_availability.get(current, False):
+                return
+            for row in range(self._metric_list.count()):
+                item = self._metric_list.item(row)
+                metric_id = str(item.data(256))
+                if self._metric_availability.get(metric_id, False):
+                    self._metric_list.setCurrentRow(row)
+                    break
+        finally:
+            self._updating = False
+
     def _start_initial_load(self) -> None:
         session_ids = list(self._session_ids)
         base_dir = self._base_dir
@@ -127,9 +212,7 @@ class FftExplorerWindow(PlotViewWindow):
 
         def loader() -> tuple[dict[str, dict], dict[str, bool]]:
             session_data = load_sessions_fft(session_ids, base_dir, settings=settings)
-            availability = probe_signal_availability(
-                session_ids, base_dir, session_data=session_data,
-            )
+            availability = probe_metric_availability(session_data)
             return session_data, availability
 
         self._load_task.schedule(loader)
@@ -138,7 +221,8 @@ class FftExplorerWindow(PlotViewWindow):
         preset = PRESET_BY_ID[preset_id]
         self._set_config(
             FftConfig(
-                signals=preset.signals,
+                metric_id=preset.metric_id,
+                channels=preset.channels,
                 domain_filter=preset.domain_filter,
                 beam_state_filter=preset.beam_state_filter,
                 annotate_peaks=preset.annotate_peaks,
@@ -149,19 +233,25 @@ class FftExplorerWindow(PlotViewWindow):
     def _set_config(self, config: FftConfig) -> None:
         self._updating = True
         try:
-            for signal in FFT_SIGNALS:
-                box = self._signal_checks.get(signal.id)
-                if box is None:
-                    continue
-                enabled = self._signal_availability.get(signal.id, False)
-                if not enabled and self._session_data:
-                    col = signal.column_key
-                    enabled = any(
-                        len(data.get(col, ())) > 0
+            if self._metric_list is not None:
+                for row in range(self._metric_list.count()):
+                    item = self._metric_list.item(row)
+                    if str(item.data(256)) == config.metric_id:
+                        self._metric_list.setCurrentRow(row)
+                        break
+            self._channel_availability = probe_channel_availability(
+                self._session_data, config.metric_id,
+            )
+            self._rebuild_channel_checks()
+            for channel_id, box in self._channel_checks.items():
+                available = self._channel_availability.get(channel_id, False)
+                if not available and self._session_data:
+                    available = any(
+                        len(data.get(channel_id, ())) > 0
                         for data in self._session_data.values()
                     )
-                box.setEnabled(enabled)
-                box.setChecked(enabled and signal.id in config.signals)
+                    box.setEnabled(available)
+                box.setChecked(available and channel_id in config.channels)
             if self._filter_panel is not None:
                 self._filter_panel.set_domain(config.domain_filter)
                 self._filter_panel.set_beam_state(config.beam_state_filter)
@@ -171,14 +261,15 @@ class FftExplorerWindow(PlotViewWindow):
             self._updating = False
 
     def _read_config(self) -> FftConfig:
-        signals = tuple(
-            signal.id
-            for signal in FFT_SIGNALS
-            if self._signal_checks.get(signal.id) is not None
-            and self._signal_checks[signal.id].isChecked()
+        metric_id = self._current_metric_id() or FFT_METRICS[0].id
+        channels = tuple(
+            channel_id
+            for channel_id, box in self._channel_checks.items()
+            if box.isChecked()
         )
         return FftConfig(
-            signals=signals,
+            metric_id=metric_id,
+            channels=channels,
             domain_filter=(
                 self._filter_panel.selected_domain()
                 if self._filter_panel is not None
@@ -193,6 +284,27 @@ class FftExplorerWindow(PlotViewWindow):
                 self._peaks_box.isChecked() if self._peaks_box is not None else True
             ),
         )
+
+    def _on_metric_changed(self, _current, _previous) -> None:
+        if self._updating:
+            return
+        metric_id = self._current_metric_id()
+        if metric_id is None:
+            return
+        self._channel_availability = probe_channel_availability(
+            self._session_data, metric_id,
+        )
+        metric = METRIC_BY_ID[metric_id]
+        self._updating = True
+        try:
+            self._rebuild_channel_checks()
+            for channel in metric.channels:
+                box = self._channel_checks.get(channel.id)
+                if box is not None and box.isEnabled():
+                    box.setChecked(channel.id in metric.default_channel_ids)
+        finally:
+            self._updating = False
+        self._schedule_refresh()
 
     def _schedule_refresh(self) -> None:
         if self._updating:
@@ -230,25 +342,27 @@ class FftExplorerWindow(PlotViewWindow):
             return
         session_data, availability = result
         self._session_data = session_data
-        self._signal_availability = availability
+        self._metric_availability = availability
 
         if not session_data:
-            self._show_status_message("No timeslice IC current data for selected sessions")
-            self._set_config(FftConfig(signals=()))
+            self._show_status_message("No timeslice signal data for selected sessions")
+            self._set_config(FftConfig(channels=()))
             return
 
         sync_data_filter_panel(
             self._filter_panel,
             supports_filter=True,
             has_beam_state=True,
+            reset_defaults=True,
         )
+        self._sync_metric_list()
 
         if self._pending_preset and self._pending_preset in PRESET_BY_ID:
             preset_id = self._pending_preset
             self._pending_preset = None
             self._apply_preset(preset_id)
         else:
-            self._set_config(default_config(availability))
+            self._set_config(default_config(availability, session_data))
             self._schedule_refresh()
 
     @Slot(int, object)

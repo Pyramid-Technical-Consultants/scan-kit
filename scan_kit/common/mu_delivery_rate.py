@@ -6,9 +6,34 @@ import numpy as np
 import pandas as pd
 
 from . import C_CHARGE_REQ, C_ENERGY, C_TIME_NS, C_TIME_S, C_TIMESTAMP, resolve_concept_column
-from .session_source import load_session_csv, resolve_session_source
+from .session_source import load_session_csv, read_session_csv_columns, resolve_session_source
 
 MIN_LAYER_DURATION_S = 0.05
+
+
+def _spot_time_columns_available(columns: tuple[str, ...] | list[str]) -> bool:
+    if "datetime" in columns:
+        return True
+    if resolve_concept_column(columns, C_TIME_S) is not None:
+        if resolve_concept_column(columns, C_TIME_NS) is not None:
+            return True
+    return resolve_concept_column(columns, C_TIMESTAMP) is not None
+
+
+def probe_session_mu_delivery_rates(session_id: str, base_dir: str) -> bool:
+    """Cheap header-only check for layer MU delivery rate data."""
+    src = resolve_session_source(session_id, base_dir)
+    if src is None:
+        return False
+    input_cols = read_session_csv_columns(src, "input_map.csv")
+    spot_cols = read_session_csv_columns(src, "spot_data.csv")
+    if not input_cols or not spot_cols:
+        return False
+    if resolve_concept_column(input_cols, C_ENERGY) is None:
+        return False
+    if resolve_concept_column(input_cols, C_CHARGE_REQ) is None:
+        return False
+    return _spot_time_columns_available(spot_cols)
 
 
 def _spot_wall_time_s(spot_df: pd.DataFrame) -> np.ndarray | None:

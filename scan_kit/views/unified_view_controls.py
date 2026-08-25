@@ -32,7 +32,11 @@ from ..common.segmented_control import SegmentedControl
 from .unified_catalog import (
     DATA_SOURCE_SPOT,
     DATA_SOURCE_TIMESLICE,
+    REFERENCE_CHAMBER,
+    REFERENCE_ISO,
+    REFERENCE_OPTIONS,
     DataSourceKind,
+    ReferenceFrameKind,
     UnifiedViewOption,
     default_option_id,
     default_source,
@@ -287,20 +291,64 @@ class DataFilterPanel(QWidget):
             self._on_selection_changed()
 
 
+class ReferenceFramePanel(QWidget):
+    """Isocenter vs raw chamber-plane reference for position and sigma metrics."""
+
+    def __init__(
+        self,
+        parent: QWidget | None = None,
+        *,
+        current: ReferenceFrameKind = REFERENCE_ISO,
+        on_selection_changed: Callable[[], None] | None = None,
+        group_title: str = "Reference Frame",
+    ) -> None:
+        super().__init__(parent)
+        self._on_selection_changed = on_selection_changed
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        self._group_box = QGroupBox(group_title)
+        layout = QVBoxLayout(self._group_box)
+        self._segmented = SegmentedControl(list(REFERENCE_OPTIONS))
+        self._segmented.selectionChanged.connect(self._on_segment_changed)
+        layout.addWidget(self._segmented)
+        root.addWidget(self._group_box)
+
+        self.set_current(current)
+
+    def selected_key(self) -> ReferenceFrameKind:
+        key = self._segmented.current_key()
+        return key if key in (REFERENCE_ISO, REFERENCE_CHAMBER) else REFERENCE_ISO  # type: ignore[return-value]
+
+    def set_current(self, key: ReferenceFrameKind) -> None:
+        self._segmented.set_current(key)
+
+    def set_enabled(self, enabled: bool) -> None:
+        self._group_box.setEnabled(enabled)
+
+    def _on_segment_changed(self, _key: str) -> None:
+        if self._on_selection_changed is not None:
+            self._on_selection_changed()
+
+
 def sync_data_filter_panel(
     panel: DataFilterPanel | None,
     *,
     supports_filter: bool,
     has_beam_state: bool,
+    reset_defaults: bool = False,
 ) -> None:
-    """Enable filter controls and set defaults for domain and beam state."""
+    """Update filter panel enabled state; optionally reset domain/beam to defaults."""
     if panel is None:
         return
-    defaults = default_data_filter_selection(has_beam_state=has_beam_state)
     panel.set_enabled(supports_filter)
-    panel.set_domain(defaults.domain_filter)
-    panel.set_beam_state(defaults.beam_state_filter)
     panel.set_beam_enabled(supports_filter and has_beam_state)
+    if reset_defaults:
+        defaults = default_data_filter_selection(has_beam_state=has_beam_state)
+        panel.set_domain(defaults.domain_filter)
+        panel.set_beam_state(defaults.beam_state_filter)
 
 
 class DataSourceOptionPanel(QWidget):
@@ -372,6 +420,21 @@ class DataSourceOptionPanel(QWidget):
             source=source,
         )
         self._refresh_option_list(select_id=first_id)
+
+    def update_availability(self, availability: dict[str, bool]) -> None:
+        """Refresh enabled options without changing the current source/selection."""
+        self._availability = dict(availability)
+        spot_ok = source_has_available_options(
+            self._options, self._availability, DATA_SOURCE_SPOT,
+        )
+        timeslice_ok = source_has_available_options(
+            self._options, self._availability, DATA_SOURCE_TIMESLICE,
+        )
+        self._source_segmented.set_option_enabled(DATA_SOURCE_SPOT, spot_ok)
+        self._source_segmented.set_option_enabled(DATA_SOURCE_TIMESLICE, timeslice_ok)
+        self._source_segmented.setVisible(spot_ok and timeslice_ok)
+        current = self._selected_id()
+        self._refresh_option_list(select_id=current)
 
     def selected_source(self) -> DataSourceKind:
         key = self._source_segmented.current_key()

@@ -26,7 +26,7 @@ from .fft_data import (
     welch_psd,
 )
 
-IC_COLORS = ["#1f77b4", "#d62728", "#2ca02c"]
+CHANNEL_COLORS = ["#1f77b4", "#d62728", "#2ca02c", "#ff7f0e", "#9467bd", "#8c564b"]
 
 _LABEL_MIN_X_GAP_PX = 50
 _LABEL_OFFSET_LOW = 8
@@ -71,12 +71,12 @@ def _annotate_peaks(ax, freqs: np.ndarray, psd: np.ndarray, color: str) -> None:
         placed.append((x_disp, y_off))
 
 
-def _style_fft_ax(ax: plt.Axes) -> None:
+def _style_fft_ax(ax: plt.Axes, *, psd_unit: str) -> None:
     ax.set_xlim(FREQ_MIN_HZ, FREQ_MAX_HZ)
     ax.xaxis.set_major_locator(mticker.MultipleLocator(50))
     ax.xaxis.set_minor_locator(mticker.MultipleLocator(10))
     ax.tick_params(which="minor", length=3)
-    ax.set_ylabel("PSD (nA²/Hz)", fontsize=9)
+    ax.set_ylabel(f"PSD ({psd_unit}²/Hz)", fontsize=9)
     ax.set_xlabel("Frequency (Hz)", fontsize=10)
     ax.grid(**GRID_KW)
     ax.grid(which="minor", color="#e0e0e0", linewidth=0.3, alpha=0.5)
@@ -112,10 +112,11 @@ def render_fft(
         fig.canvas.draw_idle()
         return
 
-    ic_keys = list(config.ic_keys)
-    ic_labels = list(config.ic_labels)
+    channel_defs = list(config.channel_defs)
     filter_column_keys = list(config.column_keys)
-    if not ic_keys:
+    metric = config.metric
+    quiet_threshold = metric.beam_off_quiet_threshold if metric is not None else None
+    if not channel_defs:
         fig.text(0.5, 0.5, "No signals selected", ha="center", va="center")
         fig.canvas.draw_idle()
         return
@@ -123,12 +124,12 @@ def render_fft(
     loaded_ids = list(session_data.keys())
     sess_colors = DEFAULT_SESSION_COLORS[: len(loaded_ids)]
     multi = len(loaded_ids) > 1
-    n_ics = len(ic_keys)
+    n_channels = len(channel_defs)
 
     set_view_header(fig, config.title, loaded_ids, sess_colors, base_dir=base_dir)
     gs = fig.add_gridspec(
         1,
-        n_ics,
+        n_channels,
         left=0.05,
         right=0.97,
         top=VIEW_HEADER_SUBPLOT_TOP,
@@ -137,23 +138,24 @@ def render_fft(
     )
 
     line_axes: list[plt.Axes] = []
-    for ic_idx in range(n_ics):
-        ax = fig.add_subplot(gs[0, ic_idx])
+    for idx in range(n_channels):
+        ax = fig.add_subplot(gs[0, idx])
         line_axes.append(ax)
-    for ic_idx in range(1, n_ics):
-        line_axes[ic_idx].sharex(line_axes[0])
-        line_axes[ic_idx].sharey(line_axes[0])
+    for idx in range(1, n_channels):
+        line_axes[idx].sharex(line_axes[0])
+        line_axes[idx].sharey(line_axes[0])
 
-    for ic_idx, (ic_key, ic_label) in enumerate(zip(ic_keys, ic_labels)):
-        ax = line_axes[ic_idx]
+    for ch_idx, channel in enumerate(channel_defs):
+        ax = line_axes[ch_idx]
         for si, (sid, data) in enumerate(session_data.items()):
-            color = sess_colors[si] if multi else IC_COLORS[ic_idx % len(IC_COLORS)]
+            color = sess_colors[si] if multi else CHANNEL_COLORS[ch_idx % len(CHANNEL_COLORS)]
             traces = extract_fft_traces(
                 data,
-                ic_key,
+                channel.id,
                 domain_filter=config.domain_filter,
                 beam_state_filter=config.beam_state_filter,
                 filter_column_keys=filter_column_keys,
+                beam_off_quiet_threshold=quiet_threshold,
             )
             for signal, ls in traces:
                 if signal.size == 0:
@@ -175,8 +177,8 @@ def render_fft(
                 if ls == "-" and config.annotate_peaks:
                     _annotate_peaks(ax, freqs_hz[band], psd[band], color)
 
-        _style_fft_ax(ax)
-        ax.set_title(ic_label, fontsize=11, fontweight="bold")
+        _style_fft_ax(ax, psd_unit=channel.psd_unit)
+        ax.set_title(channel.label, fontsize=11, fontweight="bold")
 
     _linestyle_legend(line_axes[-1], beam_state_filter=config.beam_state_filter)
     fig.canvas.draw_idle()

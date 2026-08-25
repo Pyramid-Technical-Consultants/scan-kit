@@ -31,9 +31,18 @@ class MeasuredSigmaSpots:
     weights: np.ndarray | None = None
 
 
-def resolve_spot_sigma_column(columns, ic: str, axis: str) -> str | None:
+def resolve_spot_sigma_column(
+    columns,
+    ic: str,
+    axis: str,
+    *,
+    prefer_raw: bool | None = None,
+) -> str | None:
     """Return the spot-data column name for one IC axis sigma, if present."""
-    for key in SPOT_SIGMA_KEY_VARIANTS:
+    keys = SPOT_SIGMA_KEY_VARIANTS
+    if prefer_raw is False:
+        keys = tuple(reversed(keys))
+    for key in keys:
         for prefix in (f"r_{ic}_{axis}_{key}", f"{ic}_{axis}_{key}"):
             if prefix in columns:
                 return prefix

@@ -360,6 +360,8 @@ def render_ic_xy_distribution(
     plot_style: PlotStyle = "contour",
     contour_cutoff_percentile: float = DEFAULT_CONTOUR_CUTOFF_PERCENTILE,
     show_plan: bool | None = None,
+    show_ic1: bool = True,
+    show_ic2: bool = True,
     reference_circle: bool = False,
     tolerance_lines: bool = False,
     x_hist_label: str = "X (mm)",
@@ -379,7 +381,18 @@ def render_ic_xy_distribution(
     panels: list[tuple[str, str, str]] = []
     if include_plan:
         panels.append(PLAN_PANEL)
-    panels.extend(IC_PANELS)
+    if show_ic1:
+        panels.append(IC_PANELS[0])
+    if show_ic2:
+        panels.append(IC_PANELS[1])
+    if not panels:
+        if fig is None:
+            fig = plt.figure()
+        fig.clear()
+        fig.text(0.5, 0.5, "No panels selected", ha="center", va="center")
+        if show:
+            plt.show()
+        return
 
     attrs = tuple({attr for _title, x_attr, y_attr in panels for attr in (x_attr, y_attr)})
     all_arrays = _collect_arrays(session_data, attrs)

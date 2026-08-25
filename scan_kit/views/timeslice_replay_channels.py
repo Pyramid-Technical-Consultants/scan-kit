@@ -28,6 +28,15 @@ from ..common.timeslice_sigma import (
     resolve_timeslice_sigma_source,
 )
 from .beam_off_rampdown import detect_beam_off_edges
+from ..data.timeline_channels import (
+    FAMILY_DDOSE,
+    FAMILY_FIELD,
+    FAMILY_IC,
+    FAMILY_SIGMA,
+    REPLAY_CHANNEL_SPECS,
+    TIMELINE_CHANNEL_BY_KEY,
+    available_channel_keys as _shared_available_channel_keys,
+)
 from .timeslice_replay_common import (
     build_digital_signals,
     derive_current_from_dose,
@@ -37,11 +46,6 @@ from .timeslice_replay_common import (
     resolve_ic_scan_total_dose_columns,
 )
 from .timeslice_replay_ui import ScatterSpec, TimesliceReplayConfig, TraceSpec
-
-FAMILY_IC = "IC Current"
-FAMILY_DDOSE = "dDose/dt"
-FAMILY_SIGMA = "Sigma"
-FAMILY_FIELD = "Magnetic Field"
 
 PRESET_IC_CURRENT = "ic_current"
 PRESET_DDOSE = "ddose"
@@ -68,30 +72,16 @@ class ChannelDef:
     beam_off_edges: bool = False
 
 
-CHANNEL_DEFS: tuple[ChannelDef, ...] = (
-    ChannelDef("ic1", "IC1", "#1f77b4", FAMILY_IC, beam_off_edges=True),
-    ChannelDef("ic2", "IC2", "#d62728", FAMILY_IC, beam_off_edges=True),
-    ChannelDef("ic3", "IC3 (A+B+C+D)", "#2ca02c", FAMILY_IC, beam_off_edges=True),
+CHANNEL_DEFS: tuple[ChannelDef, ...] = tuple(
     ChannelDef(
-        "ic1_ddose", "IC1 dDose/dt", "#1f77b4", FAMILY_DDOSE,
-        linewidth=0.6, beam_off_edges=True,
-    ),
-    ChannelDef(
-        "ic2_ddose", "IC2 dDose/dt", "#d62728", FAMILY_DDOSE,
-        linewidth=0.6, beam_off_edges=True,
-    ),
-    ChannelDef(
-        "ic3_ddose", "IC3 dDose/dt", "#2ca02c", FAMILY_DDOSE,
-        linewidth=0.6, beam_off_edges=True,
-    ),
-    ChannelDef(
-        "sigma_ic1_x", "IC1 σx (mm)", "#1f77b4", FAMILY_SIGMA, beam_off_edges=True,
-    ),
-    ChannelDef("sigma_ic1_y", "IC1 σy (mm)", "#aec7e8", FAMILY_SIGMA),
-    ChannelDef("sigma_ic2_x", "IC2 σx (mm)", "#d62728", FAMILY_SIGMA),
-    ChannelDef("sigma_ic2_y", "IC2 σy (mm)", "#ff9896", FAMILY_SIGMA),
-    ChannelDef("bx", "Bx (G)", "#1f77b4", FAMILY_FIELD),
-    ChannelDef("by", "By (G)", "#d62728", FAMILY_FIELD),
+        key=spec.key,
+        label=spec.label,
+        color=spec.replay_color or "#1f77b4",
+        family=spec.family,
+        linewidth=spec.replay_linewidth,
+        beam_off_edges=spec.beam_off_edges,
+    )
+    for spec in REPLAY_CHANNEL_SPECS
 )
 
 CHANNEL_BY_KEY: dict[str, ChannelDef] = {c.key: c for c in CHANNEL_DEFS}
@@ -103,7 +93,7 @@ PRESET_CHANNELS: dict[str, tuple[str, ...]] = {
     PRESET_FIELD: ("bx", "by"),
 }
 
-_ANALOG_SIGNAL_KEYS = frozenset(CHANNEL_BY_KEY)
+_ANALOG_SIGNAL_KEYS = frozenset(TIMELINE_CHANNEL_BY_KEY)
 _SIGMA_KEYS = ("sigma_ic1_x", "sigma_ic1_y", "sigma_ic2_x", "sigma_ic2_y")
 _POS_KEYS = ("ic1_x", "ic1_y", "ic2_x", "ic2_y")
 
@@ -119,13 +109,7 @@ def channel_defs_by_family() -> list[tuple[str, list[ChannelDef]]]:
 
 def available_channel_keys(session_data: dict[str, dict]) -> set[str]:
     """Keys present with data in at least one loaded session."""
-    available: set[str] = set()
-    for data in session_data.values():
-        for key in _ANALOG_SIGNAL_KEYS:
-            arr = data.get(key)
-            if arr is not None and len(arr):
-                available.add(key)
-    return available
+    return _shared_available_channel_keys(session_data)
 
 
 def filter_available_keys(
@@ -152,25 +136,37 @@ def load_session_timeline_catalog(
     base_dir: str,
     *,
     bg_subtract: bool = False,
+    opened: tuple | None = None,
 ) -> dict | None:
-    """Load all available timeslice channel families into one session dict."""
-    loaded = load_energy_lookups(session_id, base_dir)
-    if loaded is None:
-        return None
-    src, energy_by_layer, energy_by_idx = loaded
+    """Load all available timeslice channel families into one session dict.
 
-    frames = load_session_timeslice_device_units(src)
-    if not frames:
-        return None
-    if bg_subtract:
-        from ..common import subtract_background_frames
+    When *opened* is provided (from :func:`load_session_timeslice_frames`),
+    skip re-reading timeslice CSVs.
+    """
+    if opened is not None:
+        _src, frames, energy_by_layer, energy_by_idx, ts_layer = opened
+        if not frames:
+            return None
+    else:
+        loaded = load_energy_lookups(session_id, base_dir)
+        if loaded is None:
+            return None
+        _src, energy_by_layer, energy_by_idx = loaded
 
-        subtract_background_frames(frames)
+        frames = load_session_timeslice_device_units(_src)
+        if not frames:
+            return None
+        if bg_subtract:
+            from ..common import subtract_background_frames
+
+            subtract_background_frames(frames)
+
+        df0 = frames[0]
+        ts_layer = resolve_col(df0.columns, C_LAYER_ID)
+        if ts_layer is None:
+            return None
 
     df0 = frames[0]
-    ts_layer = resolve_col(df0.columns, C_LAYER_ID)
-    if ts_layer is None:
-        return None
 
     ic_cols = resolve_ic_current_columns(df0.columns)
     has_ic = ic_cols is not None

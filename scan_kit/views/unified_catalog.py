@@ -3,12 +3,21 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal
 
-DATA_SOURCE_SPOT = "spot"
-DATA_SOURCE_TIMESLICE = "timeslice"
+from ..data.types import (
+    DATA_SOURCE_SPOT,
+    DATA_SOURCE_TIMESLICE,
+    REFERENCE_CHAMBER,
+    REFERENCE_ISO,
+    DataSourceKind,
+    ReferenceFrameKind,
+    option_key,
+)
 
-DataSourceKind = Literal["spot", "timeslice"]
+REFERENCE_OPTIONS: tuple[tuple[str, str], ...] = (
+    (REFERENCE_ISO, "Isocenter"),
+    (REFERENCE_CHAMBER, "Chamber"),
+)
 
 DATA_SOURCES: tuple[tuple[str, str], ...] = (
     (DATA_SOURCE_SPOT, "Spot"),
@@ -74,10 +83,6 @@ def default_option_id(
         if is_option_available(availability, opt):
             return opt.id
     return None
-
-
-def option_key(source: DataSourceKind, option_id: str) -> str:
-    return f"{source}:{option_id}"
 
 
 def option_for(

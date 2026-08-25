@@ -9,7 +9,9 @@ from .unified_catalog import (
     DATA_SOURCE_SPOT,
     DATA_SOURCE_TIMESLICE,
     DATA_SOURCES,
+    REFERENCE_ISO,
     DataSourceKind,
+    ReferenceFrameKind,
     UnifiedViewOption,
 )
 
@@ -17,6 +19,7 @@ METRIC_POSITION = "position"
 METRIC_POSITION_ERROR = "position_error"
 METRIC_SIGMA = "sigma"
 METRIC_SIGMA_ERROR = "sigma_error"
+METRIC_IC12_POS_DIFF = "ic12_pos_diff"
 METRIC_CONFIDENCE = "confidence"
 METRIC_GAUSSIAN_FILTER = "gaussian_fit_filter"
 
@@ -26,7 +29,10 @@ MODE_POSITION_ERROR_SPOT = "position_error_spot"
 MODE_POSITION_ERROR_TIMESLICE = "position_error_timeslice"
 MODE_SIGMA_SPOT = "sigma_spot"
 MODE_SIGMA_TIMESLICE = "sigma_timeslice"
+MODE_SIGMA_ERROR_SPOT = "sigma_error_spot"
 MODE_SIGMA_ERROR_TIMESLICE = "sigma_error_timeslice"
+MODE_IC12_POS_DIFF_SPOT = "ic12_pos_diff_spot"
+MODE_IC12_POS_DIFF_TIMESLICE = "ic12_pos_diff_timeslice"
 MODE_CONFIDENCE_TIMESLICE = "confidence_timeslice"
 MODE_GAUSSIAN_FILTER = "gaussian_fit_filter"
 
@@ -97,6 +103,14 @@ MODES: tuple[DistributionModeDef, ...] = (
         uses_bg_subtract=False,
     ),
     DistributionModeDef(
+        MODE_SIGMA_ERROR_SPOT,
+        METRIC_SIGMA_ERROR,
+        "Sigma Error",
+        "Sigma error distribution (spot)",
+        DATA_SOURCE_SPOT,
+        uses_bg_subtract=False,
+    ),
+    DistributionModeDef(
         MODE_POSITION_ERROR_TIMESLICE,
         METRIC_POSITION_ERROR,
         "Position Error",
@@ -115,6 +129,21 @@ MODES: tuple[DistributionModeDef, ...] = (
         METRIC_SIGMA_ERROR,
         "Sigma Error",
         "Sigma error distribution (timeslice)",
+        DATA_SOURCE_TIMESLICE,
+    ),
+    DistributionModeDef(
+        MODE_IC12_POS_DIFF_SPOT,
+        METRIC_IC12_POS_DIFF,
+        "IC2−IC1 Position",
+        "IC2−IC1 position difference (spot)",
+        DATA_SOURCE_SPOT,
+        uses_bg_subtract=False,
+    ),
+    DistributionModeDef(
+        MODE_IC12_POS_DIFF_TIMESLICE,
+        METRIC_IC12_POS_DIFF,
+        "IC2−IC1 Position",
+        "IC2−IC1 position difference (timeslice)",
         DATA_SOURCE_TIMESLICE,
     ),
     DistributionModeDef(
@@ -160,6 +189,20 @@ METRIC_MODE_BY_SOURCE: dict[tuple[str, DataSourceKind], str] = {
     for mode in MODES
 }
 
+METRICS_WITH_REFERENCE_FRAME: frozenset[str] = frozenset({
+    METRIC_POSITION,
+    METRIC_SIGMA,
+    METRIC_IC12_POS_DIFF,
+})
+
+
+def metric_supports_reference_frame(metric_id: str, source: DataSourceKind) -> bool:
+    if metric_id not in METRICS_WITH_REFERENCE_FRAME:
+        return False
+    if metric_id == METRIC_SIGMA and source == DATA_SOURCE_TIMESLICE:
+        return False
+    return True
+
 
 def resolve_mode_id(metric_id: str, source: DataSourceKind) -> str | None:
     return METRIC_MODE_BY_SOURCE.get((metric_id, source))
@@ -179,6 +222,10 @@ class DistributionConfig:
     contour_cutoff_percentile: float = 5.0
     domain_filter: str = FILTER_ALL
     beam_state_filter: str = FILTER_BEAM_BOTH
+    reference_frame: ReferenceFrameKind = REFERENCE_ISO
+    show_plan: bool = False
+    show_ic1: bool = True
+    show_ic2: bool = True
 
     @property
     def data_filter(self) -> DataFilterSelection:
@@ -201,3 +248,11 @@ class DistributionConfig:
     def supports_data_filter(self) -> bool:
         mode = MODE_BY_ID.get(self.mode)
         return mode.supports_data_filter if mode else False
+
+    @property
+    def supports_reference_frame(self) -> bool:
+        mapping = metric_source_for_mode(self.mode)
+        if mapping is None:
+            return False
+        metric_id, source = mapping
+        return metric_supports_reference_frame(metric_id, source)

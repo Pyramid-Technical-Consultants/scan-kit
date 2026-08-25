@@ -2,9 +2,6 @@
 
 from __future__ import annotations
 
-import sys
-from pathlib import Path
-
 import numpy as np
 import pandas as pd
 import pytest
@@ -19,15 +16,10 @@ from scan_kit.views.timeslice_replay_channels import (
     build_replay_config,
     default_selected_keys,
     filter_available_keys,
-    load_session_timeline_catalog,
-    load_sessions_catalog,
 )
 from scan_kit.views.timeslice_replay_ui import render_timeslice_replay
 from scan_kit.views.timeslice_replay_window import TimesliceReplayWindow
-
-TEST_DATA = Path(__file__).resolve().parents[1] / "test_data"
-G2_SESSION = "590658542"
-G3_SESSION = "1091134775"
+from tests.conftest import G2_SESSION, G3_SESSION, TEST_DATA
 
 
 def test_g3_field_column_aliases() -> None:
@@ -50,9 +42,9 @@ def test_g2_field_column_aliases() -> None:
     assert resolve_concept_column(cols, C_MAG_FIELD_Y) == "field_c_y"
 
 
-def test_load_catalog_includes_ic_and_field_g3() -> None:
-    data = load_session_timeline_catalog(G3_SESSION, str(TEST_DATA))
-    assert data is not None
+def test_load_catalog_includes_ic_and_field_g3(g3_timeline_catalog) -> None:
+    data = g3_timeline_catalog
+    assert data
     assert data["n_samples"] > 0
     assert "ic1" in data
     assert "bx" in data
@@ -60,81 +52,77 @@ def test_load_catalog_includes_ic_and_field_g3() -> None:
     assert np.nanmax(np.abs(data["bx"])) > 0
 
 
-def test_load_catalog_includes_sigma_g2() -> None:
-    data = load_session_timeline_catalog(G2_SESSION, str(TEST_DATA))
-    assert data is not None
+def test_load_catalog_includes_sigma_g2(g2_timeline_catalog) -> None:
+    data = g2_timeline_catalog
+    assert data
     assert "sigma_ic1_x" in data
     assert np.isfinite(data["sigma_ic1_x"]).any()
     assert np.nanmedian(data["sigma_ic1_x"]) > 0.5
 
 
-def test_load_catalog_includes_sigma_g3() -> None:
-    data = load_session_timeline_catalog(G3_SESSION, str(TEST_DATA))
-    assert data is not None
+def test_load_catalog_includes_sigma_g3(g3_timeline_catalog) -> None:
+    data = g3_timeline_catalog
+    assert data
     assert np.isfinite(data["sigma_ic1_x"]).any()
     assert np.all(data["sigma_ic1_x"][np.isfinite(data["sigma_ic1_x"])] > 0)
 
 
-def test_load_catalog_includes_ddose_when_dose_present() -> None:
-    data = load_session_timeline_catalog(G3_SESSION, str(TEST_DATA))
-    assert data is not None
+def test_load_catalog_includes_ddose_when_dose_present(g3_timeline_catalog) -> None:
+    data = g3_timeline_catalog
+    assert data
     if data.get("has_ddose"):
         assert "ic1_ddose" in data
         assert len(data["ic1_ddose"]) == data["n_samples"]
 
 
-def test_available_and_default_selection() -> None:
-    session_data = load_sessions_catalog([G3_SESSION], str(TEST_DATA))
-    available = available_channel_keys(session_data)
+def test_available_and_default_selection(g3_timeslice_catalog) -> None:
+    available = available_channel_keys(g3_timeslice_catalog)
     assert "ic1" in available or "bx" in available
     selected = default_selected_keys(available)
     assert selected
     assert set(selected) <= available
 
 
-def test_build_replay_config_field_preset() -> None:
-    session_data = load_sessions_catalog([G3_SESSION], str(TEST_DATA))
-    available = available_channel_keys(session_data)
+def test_build_replay_config_field_preset(g3_timeslice_catalog) -> None:
+    available = available_channel_keys(g3_timeslice_catalog)
     keys = filter_available_keys(("bx", "by"), available)
     assert keys == ["bx", "by"]
-    config = build_replay_config(keys, session_data)
+    config = build_replay_config(keys, g3_timeslice_catalog)
     assert [t.key for t in config.traces] == ["bx", "by"]
     assert config.timeline_key == "b_mag"
     assert config.scatter.mode == "single"
 
 
-def test_build_replay_config_sigma_preset() -> None:
-    session_data = load_sessions_catalog([G2_SESSION], str(TEST_DATA))
-    available = available_channel_keys(session_data)
+def test_build_replay_config_sigma_preset(g2_timeslice_catalog) -> None:
+    available = available_channel_keys(g2_timeslice_catalog)
     keys = filter_available_keys(PRESET_CHANNELS[PRESET_SIGMA], available)
-    config = build_replay_config(keys, session_data)
+    config = build_replay_config(keys, g2_timeslice_catalog)
     assert config.scatter.mode == "per_trace"
     assert config.timeline_key == "sigma_ic1_x"
 
 
-def test_build_replay_config_mixed_hides_scatter() -> None:
-    session_data = load_sessions_catalog([G3_SESSION], str(TEST_DATA))
-    available = available_channel_keys(session_data)
+def test_build_replay_config_mixed_hides_scatter(g3_timeslice_catalog) -> None:
+    available = available_channel_keys(g3_timeslice_catalog)
     keys = filter_available_keys(("ic1", "bx"), available)
     if len(keys) < 2:
         pytest.skip("session missing mixed channel families")
-    config = build_replay_config(keys, session_data)
+    config = build_replay_config(keys, g3_timeslice_catalog)
     assert config.scatter.mode == "none"
 
 
-def test_render_timeslice_replay_headless() -> None:
+def test_render_timeslice_replay_headless(g3_timeslice_catalog) -> None:
     import matplotlib.pyplot as plt
 
-    session_data = load_sessions_catalog([G3_SESSION], str(TEST_DATA))
-    available = available_channel_keys(session_data)
+    available = available_channel_keys(g3_timeslice_catalog)
     keys = default_selected_keys(available)
-    config = build_replay_config(keys, session_data)
+    config = build_replay_config(keys, g3_timeslice_catalog)
     fig = plt.figure()
-    render_timeslice_replay(fig, config, session_data, str(TEST_DATA))
+    render_timeslice_replay(fig, config, g3_timeslice_catalog, str(TEST_DATA))
     assert fig.axes
     plt.close(fig)
 
 
+@pytest.mark.slow
 def test_timeslice_replay_window_smoke(qapp) -> None:
     from PySide6.QtWidgets import QSplitter
 

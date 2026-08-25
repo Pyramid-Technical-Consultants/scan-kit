@@ -2,18 +2,15 @@
 
 from __future__ import annotations
 
-from pathlib import Path
-
 import numpy as np
+import pytest
 
 from scan_kit.common.session_source import resolve_session_source
-from scan_kit.views.amplifier_correlation import _load_session_samples
-
-TEST_DATA = Path(__file__).resolve().parents[1] / "test_data"
+from tests.conftest import G2_SESSION, TEST_DATA
 
 
-def test_load_g3_amplifier_correlation_samples() -> None:
-    samples = _load_session_samples("1943968267", str(TEST_DATA))
+def test_load_g3_amplifier_correlation_samples(amp_samples_g3) -> None:
+    samples = amp_samples_g3
     assert samples is not None
     assert samples.cmd_x.size > 0
     assert np.isfinite(samples.readback_x).any()
@@ -21,8 +18,8 @@ def test_load_g3_amplifier_correlation_samples() -> None:
     assert np.isfinite(samples.angle_x_mrad).any()
 
 
-def test_load_g2_amplifier_correlation_samples() -> None:
-    samples = _load_session_samples("590658542", str(TEST_DATA))
+def test_load_g2_amplifier_correlation_samples(amp_samples_g2) -> None:
+    samples = amp_samples_g2
     assert samples is not None
     assert samples.cmd_x.size > 0
     assert np.isfinite(samples.readback_x).any()
@@ -30,9 +27,9 @@ def test_load_g2_amplifier_correlation_samples() -> None:
     assert np.isfinite(samples.angle_x_mrad).any()
 
 
-def test_load_older_g3_amplifier_correlation_samples() -> None:
+def test_load_older_g3_amplifier_correlation_samples(amp_samples_g3_old) -> None:
     """Older G3 exports use r_xV/r_xB and r_ic*_spot_position column names."""
-    samples = _load_session_samples("1262268206", str(TEST_DATA))
+    samples = amp_samples_g3_old
     assert samples is not None
     assert samples.cmd_x.size > 0
     assert np.isfinite(samples.readback_y).any()
@@ -40,10 +37,10 @@ def test_load_older_g3_amplifier_correlation_samples() -> None:
     assert np.isfinite(samples.angle_x_mrad).any()
 
 
-def test_g2_readback_linear_fit_is_near_unity() -> None:
+def test_g2_readback_linear_fit_is_near_unity(amp_samples_g2) -> None:
     from scan_kit.views.amplifier_correlation import _linear_residuals
 
-    samples = _load_session_samples("590658542", str(TEST_DATA))
+    samples = amp_samples_g2
     assert samples is not None
     for cmd, rb in (
         (samples.cmd_x, samples.readback_x),
@@ -58,9 +55,8 @@ def test_g2_readback_linear_fit_is_near_unity() -> None:
         assert np.median(np.abs(residual[finite])) < 0.01
 
 
-def test_samples_have_finite_momentum() -> None:
-    for sid in ("590658542", "1943968267"):
-        samples = _load_session_samples(sid, str(TEST_DATA))
+def test_samples_have_finite_momentum(amp_samples_g2, amp_samples_g3) -> None:
+    for samples in (amp_samples_g2, amp_samples_g3):
         assert samples is not None
         assert samples.momentum.shape == samples.field_x.shape
         assert np.isfinite(samples.momentum).any()
@@ -184,11 +180,11 @@ def test_pooled_super_fit_produces_combined_entries() -> None:
     assert "cubic" in label and "mrad/kG" in label and "\u00b5rad/kG" in label
 
 
-def test_readback_fit_handles_constant_cmd_and_readback() -> None:
+def test_readback_fit_handles_constant_cmd_and_readback(amp_samples_g3_const) -> None:
     """G3 sessions can hold the beam at fixed amplifier setpoints."""
     from scan_kit.views.amplifier_correlation import _PooledRow
 
-    samples = _load_session_samples("845596095", str(TEST_DATA))
+    samples = amp_samples_g3_const
     if samples is None:
         return
 
@@ -200,14 +196,14 @@ def test_readback_fit_handles_constant_cmd_and_readback() -> None:
     assert np.isfinite(fit.intercept)
 
 
-def test_energy_correction_reduces_g3_angle_residual() -> None:
+def test_energy_correction_reduces_g3_angle_residual(amp_samples_g3) -> None:
     from scan_kit.common import fit_trend
     from scan_kit.views.amplifier_correlation import (
         _energy_corrected_field,
         _linear_residuals,
     )
 
-    samples = _load_session_samples("1943968267", str(TEST_DATA))
+    samples = amp_samples_g3
     assert samples is not None
 
     raw_fit = fit_trend(samples.field_x, samples.angle_x_mrad)
@@ -227,16 +223,18 @@ def test_energy_correction_reduces_g3_angle_residual() -> None:
 def test_g2_field_physical_scale_is_order_kilogauss_per_volt() -> None:
     from scan_kit.views.amplifier_correlation import _g2_field_physical_scale
 
-    src = resolve_session_source("590658542", str(TEST_DATA))
+    src = resolve_session_source(G2_SESSION, str(TEST_DATA))
     assert src is not None
     scale = _g2_field_physical_scale(src)
     assert 500 <= scale <= 5000
 
 
-def test_g2_field_vs_readback_linear_fit_is_order_kilogauss_per_volt() -> None:
+def test_g2_field_vs_readback_linear_fit_is_order_kilogauss_per_volt(
+    amp_samples_g2,
+) -> None:
     from scan_kit.views.amplifier_correlation import _linear_residuals
 
-    samples = _load_session_samples("590658542", str(TEST_DATA))
+    samples = amp_samples_g2
     assert samples is not None
     for rb, field in (
         (samples.readback_x, samples.field_x),
@@ -251,11 +249,11 @@ def test_g2_field_vs_readback_linear_fit_is_order_kilogauss_per_volt() -> None:
         assert np.median(np.abs(residual[finite])) < 500
 
 
-def test_g3_old_session_readback_tracks_and_field_gain() -> None:
+def test_g3_old_session_readback_tracks_and_field_gain(amp_samples_g3_stuck) -> None:
     from scan_kit.common.amplifier_settling import amplifier_readback_tracks_command_axis
     from scan_kit.views.amplifier_correlation import _linear_residuals
 
-    samples = _load_session_samples("863788396", str(TEST_DATA))
+    samples = amp_samples_g3_stuck
     assert samples is not None
     assert amplifier_readback_tracks_command_axis(samples.cmd_x, samples.readback_x)
     result = _linear_residuals(samples.readback_x, samples.field_x)
@@ -266,14 +264,15 @@ def test_g3_old_session_readback_tracks_and_field_gain() -> None:
     assert np.median(np.abs(residual[np.isfinite(residual)])) < 150
 
 
-def test_g3_stuck_readback_falls_back_to_cmd_for_field() -> None:
+def test_g3_stuck_readback_falls_back_to_cmd_for_field(amp_samples_g3) -> None:
     from scan_kit.common.amplifier_settling import amplifier_readback_tracks_command_axis
 
-    samples = _load_session_samples("1943968267", str(TEST_DATA))
+    samples = amp_samples_g3
     assert samples is not None
     assert not amplifier_readback_tracks_command_axis(samples.cmd_x, samples.readback_x)
 
 
+@pytest.mark.slow
 def test_settled_samples_are_subset_of_beam_on() -> None:
     from scan_kit.common import detect_beam_on_mask
     from scan_kit.common.amplifier_settling import amplifier_settled_mask
@@ -289,7 +288,7 @@ def test_settled_samples_are_subset_of_beam_on() -> None:
     from scan_kit.views.amplifier_correlation import _g2_field_physical_scale
     from scan_kit.views.timeslice_replay_common import resolve_col
 
-    src = resolve_session_source("590658542", str(TEST_DATA))
+    src = resolve_session_source(G2_SESSION, str(TEST_DATA))
     assert src is not None
     frames = load_session_timeslice_device_units(src)
     df = frames[0]

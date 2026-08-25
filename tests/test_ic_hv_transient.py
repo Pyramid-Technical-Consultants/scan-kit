@@ -10,25 +10,24 @@ from scan_kit.views import ic_hv_transient
 from scan_kit.views.ic_hv_transient import _load_session_hv, _parse_result, run
 
 TEST_DATA = Path(__file__).resolve().parents[1] / "test_data"
-SESSION = "447945951"
 
 
-def test_load_session_hv_devices() -> None:
-    data = _load_session_hv(SESSION, str(TEST_DATA))
+def test_load_session_hv_devices(hv_session_data) -> None:
+    data = hv_session_data
     assert data is not None
     assert set(data) == {"FX4", "IX256_1", "IX256_2"}
 
 
-def test_delta_v_read_from_config() -> None:
-    data = _load_session_hv(SESSION, str(TEST_DATA))
+def test_delta_v_read_from_config(hv_session_data) -> None:
+    data = hv_session_data
     assert data is not None
     # config: starting 1900, ending 1980 -> 80 V step, for every device.
     for dev in data.values():
         assert dev.delta_v == 80.0
 
 
-def test_quad_capacitance_in_pf_range() -> None:
-    data = _load_session_hv(SESSION, str(TEST_DATA))
+def test_quad_capacitance_in_pf_range(hv_session_data) -> None:
+    data = hv_session_data
     assert data is not None
     fx4 = data["FX4"]
     assert not fx4.has_strips
@@ -39,8 +38,8 @@ def test_quad_capacitance_in_pf_range() -> None:
     assert fx4.overall == "pass"
 
 
-def test_strip_capacitance_and_cross_check() -> None:
-    data = _load_session_hv(SESSION, str(TEST_DATA))
+def test_strip_capacitance_and_cross_check(hv_session_data) -> None:
+    data = hv_session_data
     assert data is not None
     ix = data["IX256_2"]
     assert ix.has_strips
@@ -73,13 +72,15 @@ def test_missing_hv_data_returns_none() -> None:
 
 
 def test_run_smoke(monkeypatch) -> None:
+    from tests.conftest import HV_SESSION
+
     shown = {"n": 0}
 
     def _fake_finish(fig, *args, **kwargs):
         shown["n"] += 1
 
     monkeypatch.setattr(ic_hv_transient, "finish_view", _fake_finish)
-    run([SESSION], str(TEST_DATA))
+    run([HV_SESSION], str(TEST_DATA))
     assert shown["n"] == 1
 
     run(["590658542"], str(TEST_DATA))  # no HV data: must not raise

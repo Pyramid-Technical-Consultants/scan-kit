@@ -9,8 +9,11 @@ from ..common.data_filter import FILTER_ALL, FILTER_BEAM_BOTH, DataFilterSelecti
 from .unified_catalog import (
     DATA_SOURCE_SPOT,
     DATA_SOURCE_TIMESLICE,
+    REFERENCE_CHAMBER,
+    REFERENCE_ISO,
     UnifiedViewOption,
     option_key,
+    ReferenceFrameKind,
 )
 
 Glyph = Literal["box", "violin", "mean"]
@@ -23,6 +26,7 @@ Y_CURRENT_RATIO = "current_ratio"
 Y_IC_CURRENT = "ic_current"
 Y_POSITION_ERROR = "position_error"
 Y_SIGMA = "sigma"
+Y_IC12_POS_DIFF = "ic12_pos_diff"
 Y_SPOT_TIME = "spot_time"
 
 X_ENERGY = "energy"
@@ -45,6 +49,7 @@ PRESET_CURRENT_RATIO_ENERGY = "current_ratio_energy"
 PRESET_IC_CURRENT_ENERGY = "ic_current_energy"
 PRESET_POSITION_ERROR_ENERGY = "position_error_energy"
 PRESET_SIGMA_ENERGY = "sigma_energy"
+PRESET_IC12_POS_DIFF_ENERGY = "ic12_pos_diff_energy"
 PRESET_SPOT_TIME_ENERGY = "spot_time_energy"
 
 
@@ -170,6 +175,17 @@ Y_GROUPS: tuple[YGroupDef, ...] = (
         (DATA_SOURCE_SPOT, DATA_SOURCE_TIMESLICE),
     ),
     YGroupDef(
+        Y_IC12_POS_DIFF,
+        "IC2−IC1 Position (mm)",
+        (
+            SeriesDef("ic12_x_diff", "ΔX"),
+            SeriesDef("ic12_y_diff", "ΔY"),
+        ),
+        GLYPH_VIOLIN,
+        "mm/unit",
+        (DATA_SOURCE_SPOT, DATA_SOURCE_TIMESLICE),
+    ),
+    YGroupDef(
         Y_SPOT_TIME,
         "Spot Delivery Time",
         (
@@ -223,6 +239,10 @@ PRESETS: tuple[PresetDef, ...] = (
         Y_SIGMA, X_ENERGY, GLYPH_VIOLIN, show_trend=False,
     ),
     PresetDef(
+        PRESET_IC12_POS_DIFF_ENERGY, "IC2−IC1 position vs Energy",
+        Y_IC12_POS_DIFF, X_ENERGY, GLYPH_VIOLIN, show_trend=False,
+    ),
+    PresetDef(
         PRESET_SPOT_TIME_ENERGY, "Spot time vs Energy",
         Y_SPOT_TIME, X_ENERGY, GLYPH_BOX,
     ),
@@ -264,6 +284,7 @@ class BinnedSummaryConfig:
     n_bins: int | None = None
     domain_filter: str = FILTER_ALL
     beam_state_filter: str = FILTER_BEAM_BOTH
+    reference_frame: ReferenceFrameKind = REFERENCE_ISO
 
     @property
     def data_filter(self) -> DataFilterSelection:

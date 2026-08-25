@@ -28,43 +28,55 @@ from ..common import (
     resolve_concept_column,
     try_load_position_data,
 )
-from ..common.timeslice_table import load_energy_tagged_table
-from ..common.timeslice_position_error import (
-    TIMESLICE_POSITION_ERROR_COLS,
-    frame_timeslice_error_arrays,
-    resolve_session_timeslice_error_source,
-)
-from ..common.timeslice_sigma import (
-    TIMESLICE_SIGMA_COLS,
-    frame_timeslice_sigma_arrays,
-    resolve_timeslice_sigma_source,
-)
-from ..common.current_ratios import load_session_current_ratios
-from ..common.ic_current_timeslice import load_session_ic_current_timeslice
-from ..common.mu_delivery_rate import load_session_mu_delivery_rates
 from .binned_summary_catalog import (
     DATA_SOURCE_SPOT,
     DATA_SOURCE_TIMESLICE,
     GLYPH_VIOLIN,
+    REFERENCE_ISO,
     X_ENERGY,
     X_PARAMS,
     VIEW_OPTIONS,
     Y_DOSE_RATE,
     Y_CURRENT_RATIO,
     Y_IC_CURRENT,
+    Y_IC12_POS_DIFF,
+    Y_POSITION_ERROR,
+    Y_SIGMA,
     Y_GROUP_BY_ID,
     Y_GROUPS,
     BinnedSummaryConfig,
 )
-from ..common.session_sigma import IC_SIGMA_LABELS, resolve_spot_sigma_column
-from .distribution_data import probe_session_for_mode
-from .distribution_catalog import (
-    MODE_POSITION_ERROR_TIMESLICE,
-    MODE_SIGMA_TIMESLICE,
+from ..data.adapters.binned import (
+    ic12_to_binned_columns,
+    position_error_to_binned_columns,
+    sigma_to_binned_columns,
 )
-from .unified_catalog import DataSourceKind, is_option_available, option_key
+from ..data.context import LoadOptions, SessionContext
+from ..data.registry import load as load_source
+from ..data.sources.current_ratio import SOURCE_CURRENT_RATIO
+from ..data.sources.dose_rate import SOURCE_DOSE_RATE
+from ..data.sources.ic12_pos_diff import SOURCE_IC12_POS_DIFF
+from ..data.sources.ic_current import SOURCE_IC_CURRENT
+from ..data.sources.position_error import SOURCE_POSITION_ERROR
+from ..data.sources.sigma import SOURCE_SIGMA
+from ..data.types import (
+    GRANULARITY_ENERGY_BINNED,
+    GRANULARITY_LAYER,
+    GRANULARITY_SPOT,
+    GRANULARITY_TIMESLICE_SAMPLE,
+)
+from .unified_catalog import DataSourceKind, ReferenceFrameKind, is_option_available, option_key
 
 _log = logging.getLogger(__name__)
+
+_REGISTRY_Y_GROUPS = frozenset({
+    Y_POSITION_ERROR,
+    Y_SIGMA,
+    Y_IC12_POS_DIFF,
+    Y_DOSE_RATE,
+    Y_CURRENT_RATIO,
+    Y_IC_CURRENT,
+})
 
 _EXTRA_SPOT = [
     C_IC1_TOTAL_DOSE,
@@ -91,72 +103,75 @@ def _ensure_timestamp(data: dict) -> dict:
     return result
 
 
-def _load_sigma_columns(session_id: str, base_dir: str) -> dict | None:
-    input_map, spot_data = load_session_raw(session_id, base_dir=base_dir)
-    if input_map is None or spot_data is None:
-        return None
-    energy_col = resolve_concept_column(input_map.columns, C_ENERGY)
-    if energy_col is None:
-        return None
+def _load_registry_columns(
+    source_id: str,
+    session_id: str,
+    base_dir: str,
+    opts: LoadOptions,
+    adapter: Callable[[dict | None], dict | None],
+) -> dict | None:
+    payload = load_source(
+        source_id,
+        SessionContext(session_id, base_dir),
+        opts,
+    )
+    return adapter(payload)
 
-    found: dict[str, str] = {}
-    for label, ic, axis in IC_SIGMA_LABELS:
-        col = resolve_spot_sigma_column(spot_data.columns, ic, axis)
-        if col is not None:
-            found[label] = col
-    if not found:
-        return None
 
-    merged = spot_data[list(found.values())].copy().join(input_map[energy_col])
-    merged = merged.apply(pd.to_numeric, errors="coerce")
-    clean = merged[create_valid_mask(merged)]
-    if clean.empty:
-        return None
-    out = {"energy": clean[energy_col].values.astype(float)}
-    for label, raw_col in found.items():
-        out[label] = clean[raw_col].values.astype(float) * 2.0
-    return out
+def _load_sigma_columns(
+    session_id: str,
+    base_dir: str,
+    *,
+    prefer_raw: bool | None = None,
+    reference_frame: ReferenceFrameKind = REFERENCE_ISO,
+) -> dict | None:
+    del prefer_raw  # reference_frame selects column preference in registry
+    return _load_registry_columns(
+        SOURCE_SIGMA,
+        session_id,
+        base_dir,
+        LoadOptions(granularity=GRANULARITY_SPOT, reference_frame=reference_frame),
+        sigma_to_binned_columns,
+    )
+
+
+def _load_spot_ic12_diff_columns(
+    session_id: str,
+    base_dir: str,
+    *,
+    reference_frame: ReferenceFrameKind,
+) -> dict | None:
+    return _load_registry_columns(
+        SOURCE_IC12_POS_DIFF,
+        session_id,
+        base_dir,
+        LoadOptions(granularity=GRANULARITY_SPOT, reference_frame=reference_frame),
+        ic12_to_binned_columns,
+    )
 
 
 def _load_position_errors(session_id: str, base_dir: str) -> dict | None:
-    def _loader(sid, position_key, bdir):
-        return process_position_data(
-            sid,
-            position_key,
-            extra_input_columns=[C_X_POSITION, C_Y_POSITION],
-            base_dir=bdir,
-        )
-
-    data = try_load_position_data(session_id, base_dir, _loader, raw=False)
-    if data is None:
-        return None
-    if C_X_POSITION not in data or C_Y_POSITION not in data:
-        return None
-    plan_x = np.asarray(data[C_X_POSITION], dtype=float)
-    plan_y = np.asarray(data[C_Y_POSITION], dtype=float)
-    out = {
-        "energy": np.asarray(data["energy"], dtype=float),
-        "ic1_x_err": np.asarray(data["ic1_x"], dtype=float) - plan_x,
-        "ic1_y_err": np.asarray(data["ic1_y"], dtype=float) - plan_y,
-        "ic2_x_err": np.asarray(data["ic2_x"], dtype=float) - plan_x,
-        "ic2_y_err": np.asarray(data["ic2_y"], dtype=float) - plan_y,
-        "plan_x": plan_x,
-        "plan_y": plan_y,
-    }
-    return out
+    return _load_registry_columns(
+        SOURCE_POSITION_ERROR,
+        session_id,
+        base_dir,
+        LoadOptions(granularity=GRANULARITY_SPOT),
+        position_error_to_binned_columns,
+    )
 
 
-def _align_by_length(base: dict, extra: dict, keys: Sequence[str]) -> None:
+def _align_by_length(base: dict, extra: dict, keys: Sequence[str]) -> bool:
     """Copy *keys* from *extra* into *base* when row counts match."""
     n = len(np.asarray(base.get("energy", [])))
     if n == 0:
-        return
+        return False
     e_extra = np.asarray(extra.get("energy", []), dtype=float)
     if len(e_extra) != n:
-        return
+        return False
     for key in keys:
         if key in extra and key != "energy":
             base[key] = np.asarray(extra[key], dtype=float)
+    return True
 
 
 def load_session_summary_table(
@@ -164,6 +179,7 @@ def load_session_summary_table(
     base_dir: str,
     *,
     settings: ViewSettings | None = None,
+    reference_frame: ReferenceFrameKind = REFERENCE_ISO,
 ) -> dict | None:
     """Load one session into a fat per-spot column bag."""
 
@@ -246,7 +262,11 @@ def load_session_summary_table(
         if "radius" not in result and "plan_x" in pos_err:
             result["radius"] = np.hypot(pos_err["plan_x"], pos_err["plan_y"])
 
-    sigma = _load_sigma_columns(session_id, base_dir)
+    sigma = _load_sigma_columns(
+        session_id,
+        base_dir,
+        reference_frame=reference_frame,
+    )
     if sigma is not None:
         if "energy" not in result:
             result.update(sigma)
@@ -255,6 +275,23 @@ def load_session_summary_table(
             _align_by_length(
                 result, sigma,
                 ("ic1_sig_x", "ic1_sig_y", "ic2_sig_x", "ic2_sig_y"),
+            )
+
+    ic12 = _load_spot_ic12_diff_columns(
+        session_id, base_dir, reference_frame=reference_frame,
+    )
+    if ic12 is not None:
+        if "energy" not in result:
+            result.update(ic12)
+            result["session_id"] = session_id
+        elif not _align_by_length(result, ic12, ("ic12_x_diff", "ic12_y_diff")):
+            _log.debug(
+                "Session %s: ic12 diff row count (%d) differs from spot table (%d); "
+                "reference=%s",
+                session_id,
+                len(np.asarray(ic12.get("energy", []))),
+                len(np.asarray(result.get("energy", []))),
+                reference_frame,
             )
 
     if "energy" not in result:
@@ -268,15 +305,30 @@ def load_session_summary_table(
 
 def load_session_dose_rate_table(session_id: str, base_dir: str) -> dict | None:
     """Load one session as layer-level dose rate vs energy rows."""
-    rates = load_session_mu_delivery_rates(session_id, base_dir)
-    if rates is None:
-        return None
-    return {
-        "session_id": session_id,
-        "energy": rates["energy"],
-        "mu_rate": rates["mu_rate"],
-        "session_avg_rate": rates["session_avg_rate"],
-    }
+    return load_source(
+        SOURCE_DOSE_RATE,
+        SessionContext(session_id, base_dir),
+        LoadOptions(granularity=GRANULARITY_LAYER),
+    )
+
+
+def _load_sessions_registry(
+    source_id: str,
+    granularity: str,
+    session_ids: Sequence[str],
+    base_dir: str,
+    *,
+    settings: ViewSettings | None = None,
+) -> dict[str, dict]:
+    bg = settings.bg_subtract if settings else False
+    return _load_sessions_map(
+        session_ids,
+        lambda sid: load_source(
+            source_id,
+            SessionContext(sid, base_dir, settings),
+            LoadOptions(granularity=granularity, bg_subtract=bg),
+        ),
+    )
 
 
 def _load_sessions_map(
@@ -295,10 +347,7 @@ def load_sessions_dose_rate(
     session_ids: Sequence[str],
     base_dir: str,
 ) -> dict[str, dict]:
-    return _load_sessions_map(
-        session_ids,
-        lambda sid: load_session_dose_rate_table(sid, base_dir),
-    )
+    return _load_sessions_map(session_ids, lambda sid: load_session_dose_rate_table(sid, base_dir))
 
 
 def load_sessions_current_ratios(
@@ -307,10 +356,12 @@ def load_sessions_current_ratios(
     *,
     settings: ViewSettings | None = None,
 ) -> dict[str, dict]:
-    bg = settings.bg_subtract if settings else False
-    return _load_sessions_map(
+    return _load_sessions_registry(
+        SOURCE_CURRENT_RATIO,
+        GRANULARITY_ENERGY_BINNED,
         session_ids,
-        lambda sid: load_session_current_ratios(sid, base_dir, bg_subtract=bg),
+        base_dir,
+        settings=settings,
     )
 
 
@@ -320,10 +371,12 @@ def load_sessions_ic_current(
     *,
     settings: ViewSettings | None = None,
 ) -> dict[str, dict]:
-    bg = settings.bg_subtract if settings else False
-    return _load_sessions_map(
+    return _load_sessions_registry(
+        SOURCE_IC_CURRENT,
+        GRANULARITY_ENERGY_BINNED,
         session_ids,
-        lambda sid: load_session_ic_current_timeslice(sid, base_dir, bg_subtract=bg),
+        base_dir,
+        settings=settings,
     )
 
 
@@ -332,10 +385,13 @@ def load_sessions_summary(
     base_dir: str,
     *,
     settings: ViewSettings | None = None,
+    reference_frame: ReferenceFrameKind = REFERENCE_ISO,
 ) -> dict[str, dict]:
     return _load_sessions_map(
         session_ids,
-        lambda sid: load_session_summary_table(sid, base_dir, settings=settings),
+        lambda sid: load_session_summary_table(
+            sid, base_dir, settings=settings, reference_frame=reference_frame,
+        ),
     )
 
 
@@ -345,22 +401,13 @@ def _load_timeslice_position_errors(
     *,
     bg_subtract: bool = False,
 ) -> dict | None:
-    def prepare(src, frames):
-        return resolve_session_timeslice_error_source(src, frames)
-
-    def extract(df, error_source):
-        return frame_timeslice_error_arrays(df, error_source)
-
-    table = load_energy_tagged_table(
+    return _load_registry_columns(
+        SOURCE_POSITION_ERROR,
         session_id,
         base_dir,
-        usecols=TIMESLICE_POSITION_ERROR_COLS,
-        bg_subtract=bg_subtract,
-        prepare=prepare,
-        extract=extract,
-        keys=("ic1_x_err", "ic1_y_err", "ic2_x_err", "ic2_y_err"),
+        LoadOptions(granularity=GRANULARITY_TIMESLICE_SAMPLE, bg_subtract=bg_subtract),
+        position_error_to_binned_columns,
     )
-    return table
 
 
 def _load_timeslice_sigmas(
@@ -369,20 +416,32 @@ def _load_timeslice_sigmas(
     *,
     bg_subtract: bool = False,
 ) -> dict | None:
-    def prepare(_src, frames):
-        return resolve_timeslice_sigma_source(frames[0].columns)
-
-    def extract(df, source):
-        return frame_timeslice_sigma_arrays(df, source)
-
-    return load_energy_tagged_table(
+    return _load_registry_columns(
+        SOURCE_SIGMA,
         session_id,
         base_dir,
-        usecols=TIMESLICE_SIGMA_COLS,
-        bg_subtract=bg_subtract,
-        prepare=prepare,
-        extract=extract,
-        keys=("ic1_sig_x", "ic1_sig_y", "ic2_sig_x", "ic2_sig_y"),
+        LoadOptions(granularity=GRANULARITY_TIMESLICE_SAMPLE, bg_subtract=bg_subtract),
+        sigma_to_binned_columns,
+    )
+
+
+def _load_timeslice_ic12_diff(
+    session_id: str,
+    base_dir: str,
+    *,
+    reference_frame: ReferenceFrameKind,
+    bg_subtract: bool = False,
+) -> dict | None:
+    return _load_registry_columns(
+        SOURCE_IC12_POS_DIFF,
+        session_id,
+        base_dir,
+        LoadOptions(
+            granularity=GRANULARITY_TIMESLICE_SAMPLE,
+            reference_frame=reference_frame,
+            bg_subtract=bg_subtract,
+        ),
+        ic12_to_binned_columns,
     )
 
 
@@ -391,6 +450,7 @@ def load_session_timeslice_summary_table(
     base_dir: str,
     *,
     settings: ViewSettings | None = None,
+    reference_frame: ReferenceFrameKind = REFERENCE_ISO,
 ) -> dict | None:
     """Load beam-on timeslice samples binned by energy for summary plots."""
     bg_subtract = settings.bg_subtract if settings else False
@@ -414,6 +474,16 @@ def load_session_timeslice_summary_table(
                 sigma,
                 ("ic1_sig_x", "ic1_sig_y", "ic2_sig_x", "ic2_sig_y"),
             )
+
+    ic12 = _load_timeslice_ic12_diff(
+        session_id, base_dir, reference_frame=reference_frame, bg_subtract=bg_subtract,
+    )
+    if ic12 is not None:
+        if "energy" not in result:
+            result.update(ic12)
+        else:
+            _align_by_length(result, ic12, ("ic12_x_diff", "ic12_y_diff"))
+
     if "energy" not in result:
         return None
     return result
@@ -424,11 +494,12 @@ def load_sessions_timeslice_summary(
     base_dir: str,
     *,
     settings: ViewSettings | None = None,
+    reference_frame: ReferenceFrameKind = REFERENCE_ISO,
 ) -> dict[str, dict]:
     return _load_sessions_map(
         session_ids,
         lambda sid: load_session_timeslice_summary_table(
-            sid, base_dir, settings=settings,
+            sid, base_dir, settings=settings, reference_frame=reference_frame,
         ),
     )
 
@@ -439,37 +510,14 @@ def load_sessions_for_source(
     source: DataSourceKind,
     *,
     settings: ViewSettings | None = None,
+    reference_frame: ReferenceFrameKind = REFERENCE_ISO,
 ) -> dict[str, dict]:
     if source == DATA_SOURCE_TIMESLICE:
         return load_sessions_timeslice_summary(
-            session_ids, base_dir, settings=settings,
+            session_ids, base_dir, settings=settings, reference_frame=reference_frame,
         )
-    return load_sessions_summary(session_ids, base_dir, settings=settings)
-
-
-def _probe_timeslice_y_group(
-    session_ids: Sequence[str],
-    base_dir: str,
-    y_group: str,
-    *,
-    settings: ViewSettings | None = None,
-) -> bool:
-    from .binned_summary_catalog import Y_CURRENT_RATIO, Y_IC_CURRENT, Y_POSITION_ERROR, Y_SIGMA
-
-    if y_group == Y_CURRENT_RATIO:
-        return bool(load_sessions_current_ratios(session_ids, base_dir, settings=settings))
-    if y_group == Y_IC_CURRENT:
-        return bool(load_sessions_ic_current(session_ids, base_dir, settings=settings))
-
-    mode_map = {
-        Y_POSITION_ERROR: MODE_POSITION_ERROR_TIMESLICE,
-        Y_SIGMA: MODE_SIGMA_TIMESLICE,
-    }
-    mode = mode_map.get(y_group)
-    if mode is None:
-        return False
-    return any(
-        probe_session_for_mode(sid, mode, base_dir) for sid in session_ids
+    return load_sessions_summary(
+        session_ids, base_dir, settings=settings, reference_frame=reference_frame,
     )
 
 
@@ -478,45 +526,29 @@ def probe_view_option_availability(
     base_dir: str,
     *,
     spot_data: dict[str, dict] | None = None,
-    dose_rate_data: dict[str, dict] | None = None,
-    current_ratio_data: dict[str, dict] | None = None,
-    ic_current_data: dict[str, dict] | None = None,
+    registry_availability: dict[str, bool] | None = None,
     settings: ViewSettings | None = None,
 ) -> dict[str, bool]:
     """Return availability for every unified binned-summary option."""
+    from ..data.availability import probe_sessions
+
+    del settings  # registry probes ignore view settings
     spot = spot_data if spot_data is not None else load_sessions_summary(
         session_ids, base_dir,
     )
-    dose_rate = dose_rate_data if dose_rate_data is not None else load_sessions_dose_rate(
-        session_ids, base_dir,
-    )
-    current_ratio = (
-        current_ratio_data
-        if current_ratio_data is not None
-        else load_sessions_current_ratios(session_ids, base_dir, settings=settings)
-    )
-    ic_current = (
-        ic_current_data
-        if ic_current_data is not None
-        else load_sessions_ic_current(session_ids, base_dir, settings=settings)
-    )
     spot_y = available_y_groups(spot)
-    if Y_DOSE_RATE in available_y_groups(dose_rate):
-        spot_y.add(Y_DOSE_RATE)
+    registry_avail = (
+        registry_availability
+        if registry_availability is not None
+        else probe_sessions(session_ids, base_dir)
+    )
     availability: dict[str, bool] = {}
     for opt in VIEW_OPTIONS:
         key = option_key(opt.source, opt.id)
-        if opt.source == DATA_SOURCE_SPOT:
-            availability[key] = opt.id in spot_y
+        if opt.id in _REGISTRY_Y_GROUPS:
+            availability[key] = registry_avail.get(key, False)
         else:
-            if opt.id == Y_CURRENT_RATIO and current_ratio_data is not None:
-                availability[key] = opt.id in available_y_groups(current_ratio_data)
-            elif opt.id == Y_IC_CURRENT and ic_current_data is not None:
-                availability[key] = opt.id in available_y_groups(ic_current_data)
-            else:
-                availability[key] = _probe_timeslice_y_group(
-                    session_ids, base_dir, opt.id, settings=settings,
-                )
+            availability[key] = opt.id in spot_y
     return availability
 
 

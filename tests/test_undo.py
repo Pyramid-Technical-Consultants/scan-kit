@@ -2,21 +2,11 @@
 
 from __future__ import annotations
 
-import sys
-
 import pytest
 from PySide6.QtWidgets import QApplication
 
 from scan_kit.common.session_browser import _COL_NOTE, SessionBrowserWidget
 from scan_kit.common.session_notes import load_notes
-
-
-@pytest.fixture(scope="module")
-def qapp():
-    app = QApplication.instance()
-    if app is None:
-        app = QApplication(sys.argv)
-    return app
 
 
 def _make_widget(tmp_path) -> SessionBrowserWidget:

@@ -8,6 +8,8 @@ from PySide6.QtWidgets import QApplication
 from scan_kit.views.unified_catalog import (
     DATA_SOURCE_SPOT,
     DATA_SOURCE_TIMESLICE,
+    REFERENCE_CHAMBER,
+    REFERENCE_ISO,
     UnifiedViewOption,
     default_option_id,
     default_source,
@@ -176,3 +178,41 @@ def test_data_filter_panel_selects_filters(qapp: QApplication) -> None:
     panel.set_beam_state(FILTER_BEAM_ON)
     assert panel.selected_domain() == FILTER_MAD_OUTLIERS
     assert panel.selection().beam_state_filter == FILTER_BEAM_ON
+
+
+def test_sync_data_filter_panel_preserves_selection(qapp: QApplication) -> None:
+    from scan_kit.common.data_filter import FILTER_ALL, FILTER_BEAM_ON, FILTER_MAD_OUTLIERS
+    from scan_kit.views.unified_view_controls import DataFilterPanel, sync_data_filter_panel
+
+    panel = DataFilterPanel(domain_current=FILTER_ALL, beam_current=FILTER_BEAM_ON)
+    panel.set_domain(FILTER_MAD_OUTLIERS)
+    sync_data_filter_panel(
+        panel,
+        supports_filter=True,
+        has_beam_state=True,
+    )
+    assert panel.selected_domain() == FILTER_MAD_OUTLIERS
+
+
+def test_sync_data_filter_panel_resets_when_requested(qapp: QApplication) -> None:
+    from scan_kit.common.data_filter import FILTER_ALL, FILTER_BEAM_ON, FILTER_MAD_OUTLIERS
+    from scan_kit.views.unified_view_controls import DataFilterPanel, sync_data_filter_panel
+
+    panel = DataFilterPanel(domain_current=FILTER_ALL, beam_current=FILTER_BEAM_ON)
+    panel.set_domain(FILTER_MAD_OUTLIERS)
+    sync_data_filter_panel(
+        panel,
+        supports_filter=True,
+        has_beam_state=True,
+        reset_defaults=True,
+    )
+    assert panel.selected_domain() == FILTER_ALL
+
+
+def test_reference_frame_panel_selects_frame(qapp: QApplication) -> None:
+    from scan_kit.views.unified_view_controls import ReferenceFramePanel
+
+    panel = ReferenceFramePanel(current=REFERENCE_ISO)
+    assert panel.selected_key() == REFERENCE_ISO
+    panel.set_current(REFERENCE_CHAMBER)
+    assert panel.selected_key() == REFERENCE_CHAMBER

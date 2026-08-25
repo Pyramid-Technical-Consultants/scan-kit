@@ -410,6 +410,61 @@ def read_session_csv_columns(source: SessionSource, csv_name: str) -> list[str] 
         return None
 
 
+def read_first_timeslice_columns(source: SessionSource) -> list[str] | None:
+    """Return column names from the first timeslice frame without reading rows."""
+    sid = source.session_id
+    try:
+        if source.kind == "directory":
+            root = source.path
+            for layer_dir in sorted(root.glob("layer-*")):
+                if not layer_dir.is_dir():
+                    continue
+                for run_dir in layer_dir.glob("run-*"):
+                    path = run_dir / "timeslice_data_device_units.csv"
+                    if path.is_file():
+                        return _read_csv_header_columns(path)
+            return None
+
+        if source.kind == "zip":
+            with zipfile.ZipFile(source.path, "r") as zf:
+                matches: list[tuple[int, str]] = []
+                for entry in zf.namelist():
+                    if not entry.startswith(f"{sid}/"):
+                        continue
+                    m = _TIMESLICE_RE.match(entry)
+                    if m:
+                        matches.append((int(m.group(1)), entry))
+                if not matches:
+                    return None
+                matches.sort(key=lambda t: t[0])
+                with zf.open(matches[0][1]) as f:
+                    return _read_csv_header_columns(f)
+
+        if source.kind == "tar":
+            with tarfile.open(source.path, "r:*") as tf:
+                matches: list[tuple[int, tarfile.TarInfo]] = []
+                for info in tf.getmembers():
+                    if not info.isfile():
+                        continue
+                    m = _TIMESLICE_RE.match(info.name)
+                    if m:
+                        matches.append((int(m.group(1)), info))
+                if not matches:
+                    return None
+                matches.sort(key=lambda t: t[0])
+                raw = tf.extractfile(matches[0][1])
+                if raw is None:
+                    return None
+                return _read_csv_header_columns(raw)
+    except Exception as e:
+        _log.debug(
+            "Error reading first timeslice header for session %s: %s",
+            sid,
+            e,
+        )
+        return None
+
+
 def load_session_timeslice_device_units(
     source: SessionSource,
     usecols: list[str] | None = None,
