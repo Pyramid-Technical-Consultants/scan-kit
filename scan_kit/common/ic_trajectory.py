@@ -11,8 +11,51 @@ IC2_Z_MM = 0.0
 IC1_Z_MM = 100.0
 IC_SEP_MM = IC1_Z_MM - IC2_Z_MM
 
+# IC128-25 active area: 25 cm × 25 cm (Pyramid IC128-25 ionization chamber).
+IC128_25_ACTIVE_SIZE_MM = 250.0
+IC128_25_HALF_SPAN_MM = IC128_25_ACTIVE_SIZE_MM / 2.0
+
+# IC128-25LC strip-plane geometry (datasheet IC128-25LC_DS_170607).
+# Beam enters the upstream window: integral plane first, then Y(B) strip gap,
+# then X(A) strip gap. Mid-gap depths from upstream beam-entry window (mm).
+IC128_25_WINDOW_TO_WINDOW_MM = 44.0
+_IC128_25_Y_STRIP_FROM_ENTRANCE_MM = 25.0
+_IC128_25_X_STRIP_FROM_ENTRANCE_MM = 32.0
+# ``IC2_Z_MM`` / ``IC1_Z_MM`` are chamber reference planes (mid insertion length).
+IC128_25_REF_FROM_ENTRANCE_MM = IC128_25_WINDOW_TO_WINDOW_MM / 2.0
+IC128_25_Y_STRIP_OFFSET_MM = _IC128_25_Y_STRIP_FROM_ENTRANCE_MM - IC128_25_REF_FROM_ENTRANCE_MM
+IC128_25_X_STRIP_OFFSET_MM = _IC128_25_X_STRIP_FROM_ENTRANCE_MM - IC128_25_REF_FROM_ENTRANCE_MM
+IC128_25_STRIP_MID_OFFSET_MM = (
+    IC128_25_Y_STRIP_OFFSET_MM + IC128_25_X_STRIP_OFFSET_MM
+) / 2.0
+
 # G2 raw strip register range (see transform.py).
 _G2_STRIP_VALID = (1.0, 128.0)
+
+
+@dataclass(frozen=True)
+class IcStripPlane:
+    """One strip-readout gap plane inside an IC128-25 chamber."""
+
+    chamber: str  # "IC1" or "IC2"
+    axis: str  # "x" or "y"
+    label: str
+    z_mm: float
+
+
+def ic_strip_planes() -> tuple[IcStripPlane, ...]:
+    """Four strip planes: Y and X gaps in each IC (upstream IC2, downstream IC1)."""
+    return (
+        IcStripPlane("IC2", "y", "IC2 Y", IC2_Z_MM + IC128_25_Y_STRIP_OFFSET_MM),
+        IcStripPlane("IC2", "x", "IC2 X", IC2_Z_MM + IC128_25_X_STRIP_OFFSET_MM),
+        IcStripPlane("IC1", "y", "IC1 Y", IC1_Z_MM + IC128_25_Y_STRIP_OFFSET_MM),
+        IcStripPlane("IC1", "x", "IC1 X", IC1_Z_MM + IC128_25_X_STRIP_OFFSET_MM),
+    )
+
+
+def ic_strip_midplane_z(chamber_reference_z_mm: float) -> float:
+    """Mid-gap depth between the Y and X strip planes inside one IC128-25 chamber."""
+    return chamber_reference_z_mm + IC128_25_STRIP_MID_OFFSET_MM
 
 
 def ic_alignment_offsets(p2: np.ndarray, p1: np.ndarray) -> tuple[float, float]:

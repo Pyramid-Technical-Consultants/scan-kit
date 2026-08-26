@@ -17,15 +17,19 @@ from ..common import (
 from ..common.ic_trajectory import ic_alignment_offsets
 from ..common.scan_magnet_model import (
     beam_lateral_mm,
-    plan_lateral_at_z,
+    build_dual_dipole_geometry,
+    combined_isocenter_z,
+    DualDipoleGeometry,
+    plan_lateral_xy,
+    reference_on_axis_trace,
     segment_z_bounds,
+    spot_traces_3d_arrays,
+    trace_knots_z,
 )
 from ..common.session_notes import load_notes
 from ..common.trajectory_fits import (
     IsoFit,
     MagnetFit,
-    combined_iso_z,
-    combined_pivot_z,
     fit_iso_plane,
     fit_magnet_pivot,
 )
@@ -57,14 +61,35 @@ class TrajectorySession:
         return int(self.ic2_x.size)
 
     @property
-    def pivot_z(self) -> float:
-        """Median X/Y dipole pivot depth (use per-axis fits for physics)."""
-        return combined_pivot_z(self.magnet_x, self.magnet_y)
+    def isocenter_z(self) -> float:
+        """Shared treatment isocenter plane (median of per-axis IC/plan fits)."""
+        return combined_isocenter_z(self.iso_x, self.iso_y)
 
     @property
     def iso_z(self) -> float:
-        """Median X/Y iso depth (use per-axis iso fits for physics)."""
-        return combined_iso_z(self.iso_x, self.iso_y)
+        """Alias for :pyattr:`isocenter_z`."""
+        return self.isocenter_z
+
+    @property
+    def dipole_geometry(self) -> DualDipoleGeometry | None:
+        return build_dual_dipole_geometry(
+            self.magnet_x,
+            self.magnet_y,
+            self.iso_x,
+            self.iso_y,
+        )
+
+    @property
+    def pivot_z(self) -> float:
+        """Furthest-upstream virtual pivot (typically X scan dipole)."""
+        ok: list[float] = []
+        if self.magnet_x.is_valid:
+            ok.append(self.magnet_x.z_pivot)
+        if self.magnet_y.is_valid:
+            ok.append(self.magnet_y.z_pivot)
+        if not ok:
+            return float("nan")
+        return float(min(ok))
 
 
 def _process_session(session_id: str, position_key: str, base_dir: str):
@@ -174,13 +199,44 @@ def probe_trajectory_availability(session_ids: Sequence[str], base_dir: str) -> 
     return bool(load_trajectory_sessions(session_ids, base_dir))
 
 
+def _sequential_spot_trace_arrays(
+    session: TrajectorySession,
+    knots_z: np.ndarray,
+) -> np.ndarray:
+    """Measured spot polylines using sequential pivots (no full dipole geometry)."""
+    z_px = (
+        session.magnet_x.z_pivot
+        if session.magnet_x.is_valid
+        else float("nan")
+    )
+    z_py = (
+        session.magnet_y.z_pivot
+        if session.magnet_y.is_valid
+        else float("nan")
+    )
+    return spot_traces_3d_arrays(
+        session.ic2_x,
+        session.ic1_x,
+        session.ic2_y,
+        session.ic1_y,
+        DualDipoleGeometry(
+            z_px,
+            z_py,
+            session.isocenter_z,
+            z_px,
+            z_py,
+        ),
+        knots_z,
+    )
+
+
 def segment_z_extent(
     session: TrajectorySession,
     *,
     extend_upstream_mm: float,
     extend_downstream_mm: float,
 ) -> tuple[float, float]:
-    """Clip range from furthest upstream dipole pivot to furthest iso plane."""
+    """Clip range from furthest upstream dipole pivot to the shared isocenter."""
     return segment_z_bounds(
         session.magnet_x,
         session.magnet_y,
@@ -191,66 +247,86 @@ def segment_z_extent(
     )
 
 
-def spot_segments_3d(
+def spot_traces_3d(
     session: TrajectorySession,
     *,
     extend_upstream_mm: float,
     extend_downstream_mm: float,
 ) -> np.ndarray:
-    """Return ``(n_spots, 2, 3)`` line endpoints in mm (x, y, z downstream from IC2).
-
-    When magnet and iso fits are available, rays run from the furthest upstream
-    dipole pivot to the furthest iso plane.  Lateral position uses independent X/Y
-    IC extrapolation (separate virtual pivots per scan dipole).
-    """
+    """Return ``(n_spots, n_knots, 3)`` sequential dual-dipole polylines in beam mm."""
     n = session.n_spots
     if n == 0:
-        return np.empty((0, 2, 3), dtype=float)
+        return np.empty((0, 0, 3), dtype=float)
 
+    geom = session.dipole_geometry
     z_start, z_end = segment_z_extent(
         session,
         extend_upstream_mm=extend_upstream_mm,
         extend_downstream_mm=extend_downstream_mm,
     )
 
-    x_start = beam_lateral_mm(session.ic2_x, session.ic1_x, z_start)
-    y_start = beam_lateral_mm(session.ic2_y, session.ic1_y, z_start)
-    x_end = beam_lateral_mm(session.ic2_x, session.ic1_x, z_end)
-    y_end = beam_lateral_mm(session.ic2_y, session.ic1_y, z_end)
+    if geom is None or not geom.is_valid:
+        knots_z = np.array([z_start, z_end], dtype=float)
+        if session.magnet_x.is_valid or session.magnet_y.is_valid:
+            return _sequential_spot_trace_arrays(session, knots_z)
+        x0 = beam_lateral_mm(session.ic2_x, session.ic1_x, z_start)
+        y0 = beam_lateral_mm(session.ic2_y, session.ic1_y, z_start)
+        x1 = beam_lateral_mm(session.ic2_x, session.ic1_x, z_end)
+        y1 = beam_lateral_mm(session.ic2_y, session.ic1_y, z_end)
+        out = np.empty((n, 2, 3), dtype=float)
+        out[:, 0, 0] = x0
+        out[:, 0, 1] = y0
+        out[:, 0, 2] = z_start
+        out[:, 1, 0] = x1
+        out[:, 1, 1] = y1
+        out[:, 1, 2] = z_end
+        return out
 
-    segments = np.empty((n, 2, 3), dtype=float)
-    segments[:, 0, 0] = x_start
-    segments[:, 0, 1] = y_start
-    segments[:, 0, 2] = z_start
-    segments[:, 1, 0] = x_end
-    segments[:, 1, 1] = y_end
-    segments[:, 1, 2] = z_end
-    return segments
+    knots_z = trace_knots_z(z_start, z_end, geom)
+    return spot_traces_3d_arrays(
+        session.ic2_x,
+        session.ic1_x,
+        session.ic2_y,
+        session.ic1_y,
+        geom,
+        knots_z,
+    )
 
 
-def plan_segments_3d(
+def spot_segments_3d(
+    session: TrajectorySession,
+    *,
+    extend_upstream_mm: float,
+    extend_downstream_mm: float,
+) -> np.ndarray:
+    """Return ``(n_spots, 2, 3)`` endpoints of :func:`spot_traces_3d`."""
+    traces = spot_traces_3d(
+        session,
+        extend_upstream_mm=extend_upstream_mm,
+        extend_downstream_mm=extend_downstream_mm,
+    )
+    if traces.size == 0:
+        return np.empty((0, 2, 3), dtype=float)
+    return traces[:, [0, -1], :]
+
+
+def plan_traces_3d(
     session: TrajectorySession,
     *,
     extend_upstream_mm: float,
     extend_downstream_mm: float,
 ) -> np.ndarray | None:
-    """Per-spot plan rays in 3D using separate X/Y dipole pivots and iso planes."""
+    """Per-spot sequential plan polylines to the shared isocenter plane."""
     if session.plan_x is None or session.plan_y is None:
         return None
 
-    z_px = session.magnet_x.z_pivot
-    z_py = session.magnet_y.z_pivot
-    z_ix = session.iso_x.z_iso if session.iso_x is not None else float("nan")
-    z_iy = session.iso_y.z_iso if session.iso_y is not None else float("nan")
+    z_iso = session.isocenter_z
+    if not np.isfinite(z_iso):
+        return None
 
-    if not (
-        session.magnet_x.is_valid
-        and session.magnet_y.is_valid
-        and session.iso_x is not None
-        and session.iso_x.is_valid
-        and session.iso_y is not None
-        and session.iso_y.is_valid
-    ):
+    z_px = session.magnet_x.z_pivot if session.magnet_x.is_valid else float("nan")
+    z_py = session.magnet_y.z_pivot if session.magnet_y.is_valid else float("nan")
+    if not (session.magnet_x.is_valid or session.magnet_y.is_valid):
         return None
 
     plan_x = session.plan_x
@@ -269,14 +345,83 @@ def plan_segments_3d(
         extend_downstream_mm=extend_downstream_mm,
     )
 
-    segments = np.empty((n, 2, 3), dtype=float)
-    segments[:, 0, 0] = plan_lateral_at_z(plan_x, z_px, z_ix, z_start)
-    segments[:, 0, 1] = plan_lateral_at_z(plan_y, z_py, z_iy, z_start)
-    segments[:, 0, 2] = z_start
-    segments[:, 1, 0] = plan_x
-    segments[:, 1, 1] = plan_y
-    segments[:, 1, 2] = z_end
+    geom = session.dipole_geometry
+    if geom is None or not geom.is_valid:
+        knots_z = np.array([z_start, z_end], dtype=float)
+    else:
+        knots_z = trace_knots_z(z_start, z_end, geom)
+
+    k = knots_z.size
+    segments = np.empty((n, k, 3), dtype=float)
+    for i in range(n):
+        x, y = plan_lateral_xy(
+            knots_z,
+            float(plan_x[i]),
+            float(plan_y[i]),
+            z_px,
+            z_py,
+            z_iso,
+        )
+        segments[i, :, 0] = x
+        segments[i, :, 1] = y
+        segments[i, :, 2] = knots_z
     return segments
+
+
+def plan_lateral_on_plane(
+    session: TrajectorySession,
+    z_beam: float,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """Plan nominal lateral positions for each spot at beam depth *z_beam*."""
+    if session.plan_x is None or session.plan_y is None:
+        return None
+    z_iso = session.isocenter_z
+    if not np.isfinite(z_iso):
+        return None
+    z_px = session.magnet_x.z_pivot if session.magnet_x.is_valid else float("nan")
+    z_py = session.magnet_y.z_pivot if session.magnet_y.is_valid else float("nan")
+    if not (session.magnet_x.is_valid or session.magnet_y.is_valid):
+        return None
+    plan_x = np.asarray(session.plan_x, dtype=float)
+    plan_y = np.asarray(session.plan_y, dtype=float)
+    ok = np.isfinite(plan_x) & np.isfinite(plan_y)
+    if not np.any(ok):
+        return None
+    plan_x = plan_x[ok]
+    plan_y = plan_y[ok]
+    n = plan_x.size
+    out_x = np.empty(n, dtype=float)
+    out_y = np.empty(n, dtype=float)
+    z_arr = np.array([z_beam], dtype=float)
+    for i in range(n):
+        x, y = plan_lateral_xy(
+            z_arr,
+            float(plan_x[i]),
+            float(plan_y[i]),
+            z_px,
+            z_py,
+            z_iso,
+        )
+        out_x[i] = x[0]
+        out_y[i] = y[0]
+    return out_x, out_y
+
+
+def plan_segments_3d(
+    session: TrajectorySession,
+    *,
+    extend_upstream_mm: float,
+    extend_downstream_mm: float,
+) -> np.ndarray | None:
+    """Return ``(n_spots, 2, 3)`` endpoints of :func:`plan_traces_3d`."""
+    traces = plan_traces_3d(
+        session,
+        extend_upstream_mm=extend_upstream_mm,
+        extend_downstream_mm=extend_downstream_mm,
+    )
+    if traces is None:
+        return None
+    return traces[:, [0, -1], :]
 
 
 def format_session_summary(
@@ -302,24 +447,24 @@ def format_session_summary(
     _pivot_line("X scan", session.magnet_x)
     _pivot_line("Y scan", session.magnet_y)
 
+    geom = session.dipole_geometry
+    if geom is not None and geom.is_valid:
+        lines.append(
+            f"  isocenter z = {geom.z_isocenter:.0f} mm downstream",
+        )
+        lines.append(
+            f"  SAD X = {geom.sad_x_mm:.0f} mm, Y = {geom.sad_y_mm:.0f} mm",
+        )
+        lines.append(
+            f"  magnet separation = {geom.magnet_separation_mm:.0f} mm",
+        )
+        if not geom.x_magnet_upstream_of_y:
+            lines.append("  note: fitted Y pivot upstream of X (check alignment)")
+
     lines.append(
         f"  align IC1 ({session.align_ic1_x:+.1f}, {session.align_ic1_y:+.1f}) mm",
     )
     lines.append(
         f"  align IC2 ({session.align_ic2_x:+.1f}, {session.align_ic2_y:+.1f}) mm",
     )
-
-    def _iso_line(label: str, iso: IsoFit | None) -> None:
-        if iso is None or not iso.is_valid:
-            return
-        sig = iso.downstream_sigma_mm
-        if np.isfinite(sig) and sig > 0:
-            lines.append(
-                f"  {label} iso {iso.downstream_mm:.0f} ± {sig:.0f} mm down",
-            )
-        else:
-            lines.append(f"  {label} iso {iso.downstream_mm:.0f} mm down")
-
-    _iso_line("X", session.iso_x)
-    _iso_line("Y", session.iso_y)
     return "\n".join(lines)

@@ -36,7 +36,7 @@ class MagnetFit:
 
 @dataclass(frozen=True)
 class IsoFit:
-    """Downstream iso plane where measured trajectories match plan nominals."""
+    """Per-axis estimate of depth where measured rays cross plan (one physical isocenter)."""
 
     z_iso: float
     downstream_mm: float

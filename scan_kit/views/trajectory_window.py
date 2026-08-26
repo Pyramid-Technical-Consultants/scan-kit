@@ -9,12 +9,15 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QDoubleSpinBox,
     QGroupBox,
+    QHBoxLayout,
     QLabel,
     QMainWindow,
     QSplitter,
     QVBoxLayout,
     QWidget,
 )
+
+from ..common.plotting import format_session_legend_label
 
 from ..common import ViewSettings
 from ..common.session_notes import load_notes
@@ -83,7 +86,6 @@ class TrajectoryWindow(QMainWindow):
 
         self._session_ids = list(session_ids)
         self._base_dir = base_dir
-        self._settings = settings
         self._sessions: dict[str, object] = {}
         self._notes = load_notes(base_dir)
         self._pending_preset = initial_preset
@@ -111,22 +113,35 @@ class TrajectoryWindow(QMainWindow):
             )
         )
 
+        self._legend_group = QGroupBox("Sessions")
+        self._legend_layout = QVBoxLayout(self._legend_group)
+        layout.addWidget(self._legend_group)
+
         display_group = QGroupBox("Display")
         display_layout = QVBoxLayout(display_group)
-        self._show_spots = QCheckBox("Measured spot trajectories")
-        self._show_spots.setChecked(True)
-        self._show_plan = QCheckBox("Plan rays (iso ↔ pivot)")
-        self._show_plan.setChecked(True)
-        self._show_pivot = QCheckBox("X/Y scan dipole pivots")
+        self._show_spot_lines = QCheckBox("Measured trajectory lines")
+        self._show_spot_lines.setChecked(True)
+        self._show_spot_markers = QCheckBox("Measured spot markers (IC / iso)")
+        self._show_spot_markers.setChecked(True)
+        self._show_plan_lines = QCheckBox("Plan rays (iso ↔ pivot)")
+        self._show_plan_lines.setChecked(False)
+        self._show_plan_markers = QCheckBox("Plan spot markers (IC / iso)")
+        self._show_plan_markers.setChecked(False)
+        self._show_pivot = QCheckBox("X/Y scan dipole (gap center)")
         self._show_pivot.setChecked(True)
-        self._show_iso = QCheckBox("Fitted iso planes (per axis)")
+        self._show_magnet_gaps = QCheckBox("Dipole pole gaps (D2-650)")
+        self._show_magnet_gaps.setChecked(True)
+        self._show_iso = QCheckBox("Isocenter plane (SAD)")
         self._show_iso.setChecked(True)
         self._show_ic = QCheckBox("IC chamber planes")
         self._show_ic.setChecked(True)
         for box in (
-            self._show_spots,
-            self._show_plan,
+            self._show_spot_lines,
+            self._show_spot_markers,
+            self._show_plan_lines,
+            self._show_plan_markers,
             self._show_pivot,
+            self._show_magnet_gaps,
             self._show_iso,
             self._show_ic,
         ):
@@ -138,7 +153,7 @@ class TrajectoryWindow(QMainWindow):
         extend_layout = QVBoxLayout(extend_group)
         extend_layout.addWidget(
             QLabel(
-                "Rays span furthest upstream dipole pivot to furthest iso plane. "
+                "Rays span furthest upstream dipole pivot to the shared isocenter. "
                 "Fallback when fits are missing.",
             ),
         )
@@ -176,10 +191,13 @@ class TrajectoryWindow(QMainWindow):
 
     def _read_config(self) -> TrajectoryConfig:
         return TrajectoryConfig(
-            show_spots=self._show_spots.isChecked(),
-            show_plan=self._show_plan.isChecked(),
+            show_spot_lines=self._show_spot_lines.isChecked(),
+            show_spot_markers=self._show_spot_markers.isChecked(),
+            show_plan_lines=self._show_plan_lines.isChecked(),
+            show_plan_markers=self._show_plan_markers.isChecked(),
             show_pivot_markers=self._show_pivot.isChecked(),
             show_iso_planes=self._show_iso.isChecked(),
+            show_magnet_gaps=self._show_magnet_gaps.isChecked(),
             show_ic_planes=self._show_ic.isChecked(),
             extend_upstream_mm=self._extend_up_spin.value(),
             extend_downstream_mm=self._extend_down_spin.value(),
@@ -188,9 +206,12 @@ class TrajectoryWindow(QMainWindow):
     def _set_config(self, config: TrajectoryConfig) -> None:
         self._updating = True
         try:
-            self._show_spots.setChecked(config.show_spots)
-            self._show_plan.setChecked(config.show_plan)
+            self._show_spot_lines.setChecked(config.show_spot_lines)
+            self._show_spot_markers.setChecked(config.show_spot_markers)
+            self._show_plan_lines.setChecked(config.show_plan_lines)
+            self._show_plan_markers.setChecked(config.show_plan_markers)
             self._show_pivot.setChecked(config.show_pivot_markers)
+            self._show_magnet_gaps.setChecked(config.show_magnet_gaps)
             self._show_iso.setChecked(config.show_iso_planes)
             self._show_ic.setChecked(config.show_ic_planes)
             self._extend_up_spin.setValue(config.extend_upstream_mm)
@@ -204,10 +225,13 @@ class TrajectoryWindow(QMainWindow):
             return
         self._set_config(
             TrajectoryConfig(
-                show_spots=preset.show_spots,
-                show_plan=preset.show_plan,
+                show_spot_lines=preset.show_spot_lines,
+                show_spot_markers=preset.show_spot_markers,
+                show_plan_lines=preset.show_plan_lines,
+                show_plan_markers=preset.show_plan_markers,
                 show_pivot_markers=preset.show_pivot_markers,
                 show_iso_planes=preset.show_iso_planes,
+                show_magnet_gaps=preset.show_magnet_gaps,
                 show_ic_planes=preset.show_ic_planes,
                 extend_upstream_mm=preset.extend_upstream_mm,
                 extend_downstream_mm=preset.extend_downstream_mm,
@@ -219,6 +243,34 @@ class TrajectoryWindow(QMainWindow):
         if self._updating:
             return
         self._schedule_refresh()
+
+    def _update_session_legend(self, loaded_ids: list[str], colors: list[str]) -> None:
+        while self._legend_layout.count():
+            item = self._legend_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        if not loaded_ids:
+            self._legend_group.setVisible(False)
+            return
+        self._legend_group.setVisible(len(loaded_ids) > 1)
+        for sid, color in zip(loaded_ids, colors):
+            row = QWidget()
+            row_layout = QHBoxLayout(row)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+            swatch = QLabel()
+            swatch.setFixedSize(12, 12)
+            swatch.setStyleSheet(
+                f"background-color: {color}; border: 1px solid #666;",
+            )
+            label = QLabel(format_session_legend_label(sid, self._notes))
+            row_layout.addWidget(swatch)
+            row_layout.addWidget(label, stretch=1)
+            self._legend_layout.addWidget(row)
+        if len(loaded_ids) > 1:
+            hint = QLabel("○ X magnet gap   □ Y magnet gap")
+            hint.setStyleSheet("color: #aaa; font-size: 11px;")
+            self._legend_layout.addWidget(hint)
 
     def _show_status(self, message: str) -> None:
         self._scene.clear()
@@ -244,7 +296,9 @@ class TrajectoryWindow(QMainWindow):
         self._load_task.schedule(loader)
 
     @Slot(int, object)
-    def _on_load_finished(self, _gen: int, result: object) -> None:
+    def _on_load_finished(self, gen: int, result: object) -> None:
+        if gen != self._load_task.generation:
+            return
         if not isinstance(result, dict):
             self._show_status("Failed to load trajectory data")
             return
@@ -265,10 +319,14 @@ class TrajectoryWindow(QMainWindow):
         self._refresh_timer.start()
 
     def _start_refresh(self) -> None:
+        gen = self._refresh_generation
         config = self._read_config()
+        if gen != self._refresh_generation:
+            return
         self.setWindowTitle(config.title)
         loaded_ids = [sid for sid in self._session_ids if sid in self._sessions]
         colors = default_session_colors(len(loaded_ids))
+        self._update_session_legend(loaded_ids, colors)
 
         summaries = [
             format_session_summary(self._sessions[sid], notes=self._notes)
@@ -276,6 +334,8 @@ class TrajectoryWindow(QMainWindow):
         ]
         self._info_label.setText("\n\n".join(summaries) if summaries else "—")
 
+        if gen != self._refresh_generation:
+            return
         self._scene.render(
             self._sessions,
             config,
