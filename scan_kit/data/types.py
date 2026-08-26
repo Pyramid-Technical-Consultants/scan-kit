@@ -73,6 +73,24 @@ def data_source_reference_frame(source: DataSourceKind) -> ReferenceFrameKind:
     return REFERENCE_CHAMBER if source.endswith("_chamber") else REFERENCE_ISO
 
 
+def combine_data_source(
+    coarse: CoarseDataSourceKind,
+    reference_frame: ReferenceFrameKind,
+) -> DataSourceKind:
+    """Build a concrete data source from spot/timeslice and iso/chamber."""
+    if coarse == COARSE_SOURCE_SPOT:
+        if reference_frame == REFERENCE_CHAMBER:
+            return DATA_SOURCE_SPOT_CHAMBER
+        return DATA_SOURCE_SPOT_ISO
+    if reference_frame == REFERENCE_CHAMBER:
+        return DATA_SOURCE_TIMESLICE_CHAMBER
+    return DATA_SOURCE_TIMESLICE_ISO
+
+
+def split_data_source(source: DataSourceKind) -> tuple[CoarseDataSourceKind, ReferenceFrameKind]:
+    return coarse_data_source(source), data_source_reference_frame(source)
+
+
 def data_source_label(source: DataSourceKind) -> str:
     labels: dict[DataSourceKind, str] = {
         DATA_SOURCE_SPOT_ISO: "Spot — Isocenter",

@@ -122,23 +122,64 @@ def g3_distribution_availability(g3_source_availability: dict[str, bool]) -> dic
 
 @pytest.fixture(scope="session")
 def g3_fft_data(test_data_dir: str) -> dict[str, dict]:
-    from scan_kit.views.fft_data import load_sessions_fft
+    from scan_kit.views.fft_data import (
+        channel_keys_for_metric,
+        load_sessions_fft,
+        probe_fft_metric_availability_headers,
+    )
+    from scan_kit.views.fft_catalog import FFT_METRICS
 
-    return load_sessions_fft([G3_SESSION], test_data_dir)
+    header_avail = probe_fft_metric_availability_headers([G3_SESSION], test_data_dir)
+    metric_id = next(
+        (metric.id for metric in FFT_METRICS if header_avail.get(metric.id, False)),
+        FFT_METRICS[0].id,
+    )
+    return load_sessions_fft(
+        [G3_SESSION],
+        test_data_dir,
+        channel_keys=channel_keys_for_metric(metric_id),
+    )
 
 
 @pytest.fixture(scope="session")
 def g3_large_fft_data(test_data_dir: str) -> dict[str, dict]:
-    from scan_kit.views.fft_data import load_sessions_fft
+    from scan_kit.views.fft_data import (
+        channel_keys_for_metric,
+        load_sessions_fft,
+        probe_fft_metric_availability_headers,
+    )
+    from scan_kit.views.fft_catalog import FFT_METRICS
 
-    return load_sessions_fft([G3_LARGE_SESSION], test_data_dir)
+    header_avail = probe_fft_metric_availability_headers(
+        [G3_LARGE_SESSION], test_data_dir,
+    )
+    metric_id = next(
+        (metric.id for metric in FFT_METRICS if header_avail.get(metric.id, False)),
+        FFT_METRICS[0].id,
+    )
+    return load_sessions_fft(
+        [G3_LARGE_SESSION],
+        test_data_dir,
+        channel_keys=channel_keys_for_metric(metric_id),
+    )
 
 
 @pytest.fixture(scope="session")
 def g3_source_availability(test_data_dir: str) -> dict[str, bool]:
     from scan_kit.data.availability import probe_sessions
+    from scan_kit.views.binned_summary_data import BINNED_REGISTRY_SOURCE_IDS
+    from scan_kit.views.distribution_data import DISTRIBUTION_REGISTRY_SOURCE_IDS
 
-    return probe_sessions([G3_SESSION], test_data_dir)
+    source_ids = tuple(
+        dict.fromkeys(
+            DISTRIBUTION_REGISTRY_SOURCE_IDS + BINNED_REGISTRY_SOURCE_IDS,
+        )
+    )
+    return probe_sessions(
+        [G3_SESSION],
+        test_data_dir,
+        source_ids=source_ids,
+    )
 
 
 @pytest.fixture(scope="session")

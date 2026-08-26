@@ -101,6 +101,15 @@ def test_assign_bin_centers_covers_range() -> None:
     assert np.isnan(centers[3])
 
 
+def test_format_axis_sig3() -> None:
+    from scan_kit.common.plotting import _format_axis_sig3
+
+    assert _format_axis_sig3(70.0) == "70"
+    assert _format_axis_sig3(1.2345) == "1.23"
+    assert _format_axis_sig3(1234.0) == "1.23e+03"
+    assert _format_axis_sig3(np.nan) == ""
+
+
 def test_prepare_binned_column_unique_and_quantile() -> None:
     session_data = {
         "a": {"energy": np.array([70.0, 100.0, 70.0]), "y": np.array([1.0, 2.0, 3.0])},
@@ -125,6 +134,65 @@ def test_collect_unique_bins() -> None:
         "b": {"energy": np.array([2.0, 3.0])},
     }
     assert collect_unique_bins(session_data, "energy") == [1.0, 2.0, 3.0]
+
+
+def test_compute_spot_delivery_time_ms_sorts_within_layer() -> None:
+    from scan_kit.common.processing import compute_spot_delivery_time_ms
+
+    # Unsorted rows in one layer: diff without sorting would be negative.
+    ts = np.array([100.0, 50.0, 150.0, 120.0])
+    layer = np.array([1, 1, 1, 1])
+    st = compute_spot_delivery_time_ms(ts, layer)
+    assert np.all(st >= 0)
+    assert st[1] == 50.0  # 100 - 50
+    assert st[0] == 50.0  # first spot in layer
+
+
+def test_add_spot_time_breakdown() -> None:
+    from scan_kit.common.processing import add_spot_time_breakdown
+
+    data = {
+        "spot_time": np.array([50.0, 30.0, 20.0]),
+        "point_time(ms)": np.array([40.0, 25.0, np.nan]),
+    }
+    out = add_spot_time_breakdown(data)
+    assert np.allclose(out["beam_on_time"], [40.0, 25.0, np.nan], equal_nan=True)
+    assert np.allclose(out["overhead_time"], [10.0, 5.0, np.nan], equal_nan=True)
+
+
+def test_sigma_error_to_binned_columns_maps_keys() -> None:
+    from scan_kit.data.adapters.binned import sigma_error_to_binned_columns
+
+    payload = {
+        "energy": np.array([180.0, 180.0]),
+        "ic1_x_err": np.array([0.1, 0.2]),
+        "ic1_y_err": np.array([0.3, 0.4]),
+        "ic2_x_err": np.array([0.5, 0.6]),
+        "ic2_y_err": np.array([0.7, 0.8]),
+    }
+    out = sigma_error_to_binned_columns(payload)
+    assert out is not None
+    assert "ic1_sig_x_err" in out
+    assert np.allclose(out["ic1_sig_x_err"], [0.1, 0.2])
+
+
+def test_load_summary_table_1093436476_non_negative_spot_time() -> None:
+    sid = "1093436476"
+    data = load_session_summary_table(sid, str(TEST_DATA))
+    if data is None:
+        pytest.skip("session not available in test_data")
+    st = np.asarray(data["spot_time"], dtype=float)
+    assert np.all(st[np.isfinite(st)] >= 0)
+
+
+def test_load_summary_table_g3_has_beam_on_breakdown() -> None:
+    data = load_session_summary_table(G3_SESSION, str(TEST_DATA))
+    assert data is not None
+    assert "beam_on_time" in data
+    assert "overhead_time" in data
+    beam = np.asarray(data["beam_on_time"], dtype=float)
+    assert np.isfinite(beam).any()
+    assert np.all(beam[np.isfinite(beam)] >= 0)
 
 
 def test_load_summary_table_g3() -> None:
@@ -223,9 +291,58 @@ def test_render_binned_summary_quantile_x(g3_spot_summary) -> None:
     plt.close(fig)
 
 
+def test_render_binned_summary_scatter_headless(g3_spot_summary) -> None:
+    if not g3_spot_summary:
+        pytest.skip("spot summary unavailable in fixture")
+    y = next(iter(available_y_groups(g3_spot_summary)))
+    config = BinnedSummaryConfig(y_group=y, x_param=X_ENERGY, glyph="scatter")
+    fig = plt.figure()
+    render_binned_summary(fig, config, g3_spot_summary, str(TEST_DATA))
+    assert fig.axes
+    plt.close(fig)
+
+
+def test_render_binned_summary_histogram_headless(g3_spot_summary) -> None:
+    if not g3_spot_summary:
+        pytest.skip("spot summary unavailable in fixture")
+    y = next(iter(available_y_groups(g3_spot_summary)))
+    config = BinnedSummaryConfig(
+        y_group=y,
+        x_param=X_ENERGY,
+        glyph="box",
+        show_hist=True,
+        hist_bin_count=20,
+        hist_shared_bins=True,
+    )
+    fig = plt.figure()
+    render_binned_summary(fig, config, g3_spot_summary, str(TEST_DATA))
+    assert len(fig.axes) > 1
+    plt.close(fig)
+
+
+def test_render_binned_summary_contour_headless(g3_spot_summary) -> None:
+    if not g3_spot_summary:
+        pytest.skip("spot summary unavailable in fixture")
+    y = next(iter(available_y_groups(g3_spot_summary)))
+    config = BinnedSummaryConfig(
+        y_group=y,
+        x_param=X_ENERGY,
+        glyph="contour",
+        contour_cutoff_percentile=5.0,
+    )
+    fig = plt.figure()
+    render_binned_summary(fig, config, g3_spot_summary, str(TEST_DATA))
+    assert fig.axes
+    plt.close(fig)
+
+
 @pytest.mark.slow
-def test_binned_summary_window_smoke(qapp) -> None:
+def test_binned_summary_window_smoke(qt_wait) -> None:
     window = BinnedSummaryWindow([G3_SESSION], str(TEST_DATA))
+    qt_wait(
+        lambda: window._initial_load_done and bool(window.figure.axes),
+        timeout_ms=20000,
+    )
     assert window._spot_data
     assert window._session_data()
     assert isinstance(window.centralWidget(), QSplitter)

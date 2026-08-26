@@ -65,5 +65,5 @@ def probe_sessions(
             source_ids=source_ids,
         )
         for key, available in session_avail.items():
-            merged[key] = merged.get(key, False) or available
+            merged[key] = bool(merged.get(key, False) or available)
     return merged

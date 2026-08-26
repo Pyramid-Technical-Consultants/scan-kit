@@ -69,6 +69,12 @@ VIEW_GROUPS: list[tuple[str, list[ViewEntry]]] = [
                 "Interactive timeslice viewer with selectable IC, dDose/dt, sigma, and magnetic-field channels.",
             ),
             (
+                "IC Beam Trajectory (3D)",
+                "trajectory",
+                "Interactive 3D per-spot IC beam paths with plan overlay, pivot fit, "
+                "and iso plane (visPy).",
+            ),
+            (
                 "Session Log Compare",
                 "session_log_compare",
                 "Session log layer timings, errors, and side-by-side event comparison.",

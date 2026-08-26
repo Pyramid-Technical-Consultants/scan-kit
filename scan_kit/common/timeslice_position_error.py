@@ -38,6 +38,21 @@ from .session_source import (
 
 _log = logging.getLogger(__name__)
 
+
+def _median_pair_alignment_errors(
+    ic1: np.ndarray,
+    ic2_fwd: np.ndarray,
+) -> tuple[float, float]:
+    """Median |IC1 ± IC2| over finite samples (avoids All-NaN nanmedian warnings)."""
+    abs_fwd = np.abs(ic1 - ic2_fwd)
+    abs_rev = np.abs(ic1 + ic2_fwd)
+    finite_fwd = abs_fwd[np.isfinite(abs_fwd)]
+    finite_rev = abs_rev[np.isfinite(abs_rev)]
+    if finite_fwd.size == 0 or finite_rev.size == 0:
+        return float("nan"), float("nan")
+    return float(np.median(finite_fwd)), float(np.median(finite_rev))
+
+
 _G2_IC1_X_ERROR_ALIASES = ("x_err_filtered", "position_err_X", "pos_err_x")
 _G2_IC1_Y_ERROR_ALIASES = ("y_err_filtered", "position_err_Y", "pos_err_y")
 _G2_IC2_X_ERROR_ALIASES = ("position_err_X2", "pos_err_x2")
@@ -374,8 +389,7 @@ def _g2_session_ic2_reversed(frames: list, ic1_spot: str, ic2_spot: str) -> bool
         return False
     ic1 = np.concatenate(ic1_parts)
     ic2_fwd = np.concatenate(ic2_fwd_parts)
-    err_fwd = float(np.nanmedian(np.abs(ic1 - ic2_fwd)))
-    err_rev = float(np.nanmedian(np.abs(ic1 + ic2_fwd)))
+    err_fwd, err_rev = _median_pair_alignment_errors(ic1, ic2_fwd)
     if not np.isfinite(err_fwd) or not np.isfinite(err_rev):
         return False
     return err_rev < err_fwd
@@ -530,8 +544,7 @@ def _g3_session_ic2_reversed(
         return False
     ic1 = np.concatenate(ic1_parts)
     ic2_fwd = np.concatenate(ic2_fwd_parts)
-    err_fwd = float(np.nanmedian(np.abs(ic1 - ic2_fwd)))
-    err_rev = float(np.nanmedian(np.abs(ic1 + ic2_fwd)))
+    err_fwd, err_rev = _median_pair_alignment_errors(ic1, ic2_fwd)
     if not np.isfinite(err_fwd) or not np.isfinite(err_rev):
         return False
     return err_rev < err_fwd

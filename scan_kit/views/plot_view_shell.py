@@ -152,14 +152,15 @@ def make_presets_menu_button(
     )
     menu = QMenu(button)
     for preset_id, label, enabled in presets:
-        action = QAction(label, menu)
-        action.setEnabled(enabled)
+        enabled_bool = bool(enabled)
+        action = QAction(str(label), menu)
+        action.setEnabled(enabled_bool)
         action.triggered.connect(
-            lambda _checked=False, pid=preset_id: on_selected(pid)
+            lambda _checked=False, pid=str(preset_id): on_selected(pid)
         )
         menu.addAction(action)
     button.setMenu(menu)
-    button.setEnabled(any(enabled for _pid, _label, enabled in presets))
+    button.setEnabled(any(bool(e) for _pid, _label, e in presets))
     return button
 
 

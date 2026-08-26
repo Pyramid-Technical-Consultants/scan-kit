@@ -56,6 +56,12 @@ hiddenimports = [
     "scan_kit.views.beam_motion_energy",
     "scan_kit.views.session_log_compare",
     "scan_kit.views.ic_beam_trajectory",
+    "scan_kit.views.trajectory",
+    "scan_kit.views.trajectory_catalog",
+    "scan_kit.views.trajectory_data",
+    "scan_kit.views.trajectory_vispy",
+    "scan_kit.views.trajectory_window",
+    "scan_kit.common.trajectory_fits",
     "scan_kit.views.position_scatter",
     "scan_kit.views.binned_summary",
     "scan_kit.views.binned_summary_catalog",
@@ -114,6 +120,8 @@ hiddenimports = [
     "matplotlib.backends.backend_tkagg",
     "tkinter",
     "PySide6.QtSvg",
+    "vispy",
+    "vispy.app.backends._pyside6",
     *_pyside6_hiddenimports,
 ]
 

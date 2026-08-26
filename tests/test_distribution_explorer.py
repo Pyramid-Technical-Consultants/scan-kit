@@ -139,6 +139,7 @@ def test_render_distribution_plot_styles(
 @pytest.mark.slow
 def test_distribution_explorer_window_smoke(qapp, qt_wait) -> None:
     window = DistributionExplorerWindow([G3_SESSION], str(TEST_DATA))
+    qt_wait(lambda: bool(window._mode_available), timeout_ms=10000)
     window._apply_preset(MODE_SIGMA_TIMESLICE)
     window._start_refresh()
     qt_wait(lambda: bool(window.figure.axes), timeout_ms=8000)

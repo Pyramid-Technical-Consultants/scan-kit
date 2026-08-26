@@ -30,16 +30,19 @@ from ..common.data_filter import (
 )
 from ..common.segmented_control import SegmentedControl
 from .unified_catalog import (
-    DATA_SOURCES,
+    CoarseDataSourceKind,
     DATA_SOURCE_SPOT_ISO,
     DataSourceKind,
+    GRANULARITY_SOURCES,
     UnifiedViewOption,
-    default_option_id,
-    default_source,
+    coarse_data_source,
+    coarse_has_available_options,
+    default_coarse_source,
     is_option_available,
     option_for,
-    options_for_source,
-    source_has_available_options,
+    option_from_list_key,
+    option_list_key,
+    options_for_coarse,
 )
 
 PlotStyleChoice = tuple[str, str]
@@ -180,6 +183,106 @@ class PlotStylePanel(QWidget):
             self._on_selection_changed()
 
 
+class HistogramPanel(QWidget):
+    """Side-panel controls for optional histogram panels."""
+
+    def __init__(
+        self,
+        parent: QWidget | None = None,
+        *,
+        on_selection_changed: Callable[[], None] | None = None,
+        group_title: str = "Histogram",
+        default_bin_count: int = 30,
+        min_bin_count: int = 5,
+        max_bin_count: int = 200,
+    ) -> None:
+        super().__init__(parent)
+        self._on_selection_changed = on_selection_changed
+        self._bin_debounce = QTimer(self)
+        self._bin_debounce.setSingleShot(True)
+        self._bin_debounce.setInterval(250)
+        self._bin_debounce.timeout.connect(self._emit_changed)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        self._group_box = QGroupBox(group_title)
+        group_layout = QVBoxLayout(self._group_box)
+
+        self._enabled = QCheckBox("Show panel")
+        self._enabled.toggled.connect(self._on_enabled_changed)
+        group_layout.addWidget(self._enabled)
+
+        self._bins_row = QWidget()
+        bins_layout = QHBoxLayout(self._bins_row)
+        bins_layout.setContentsMargins(0, 0, 0, 0)
+        bins_layout.addWidget(QLabel("Bins"))
+        self._bins_spin = QSpinBox()
+        self._bins_spin.setRange(min_bin_count, max_bin_count)
+        self._bins_spin.setValue(default_bin_count)
+        self._bins_spin.valueChanged.connect(
+            lambda _value: self._bin_debounce.start(),
+        )
+        bins_layout.addWidget(self._bins_spin, stretch=1)
+        group_layout.addWidget(self._bins_row)
+
+        self._shared_bins = QCheckBox("Share bin edges across rows")
+        self._shared_bins.toggled.connect(self._emit_changed)
+        group_layout.addWidget(self._shared_bins)
+
+        root.addWidget(self._group_box)
+        self._sync_suboptions()
+
+    def is_enabled(self) -> bool:
+        return self._enabled.isChecked()
+
+    def set_enabled(self, enabled: bool) -> None:
+        self._enabled.setChecked(enabled)
+
+    def bin_count(self) -> int:
+        return self._bins_spin.value()
+
+    def set_bin_count(self, value: int) -> None:
+        self._bins_spin.blockSignals(True)
+        try:
+            self._bins_spin.setValue(value)
+        finally:
+            self._bins_spin.blockSignals(False)
+        self._bin_debounce.stop()
+
+    def shared_bins(self) -> bool:
+        return self._shared_bins.isChecked()
+
+    def set_shared_bins(self, shared: bool) -> None:
+        self._shared_bins.setChecked(shared)
+
+    def set_from_config(
+        self,
+        *,
+        show_hist: bool,
+        hist_bin_count: int,
+        hist_shared_bins: bool,
+    ) -> None:
+        self._enabled.setChecked(show_hist)
+        self.set_bin_count(hist_bin_count)
+        self.set_shared_bins(hist_shared_bins)
+        self._sync_suboptions()
+
+    def _on_enabled_changed(self, _checked: bool) -> None:
+        self._sync_suboptions()
+        self._emit_changed()
+
+    def _sync_suboptions(self) -> None:
+        enabled = self._enabled.isChecked()
+        self._bins_row.setEnabled(enabled)
+        self._shared_bins.setEnabled(enabled)
+
+    def _emit_changed(self, *_args) -> None:
+        if self._on_selection_changed is not None:
+            self._on_selection_changed()
+
+
 class DataFilterPanel(QWidget):
     """Domain and beam-state filter selectors that combine independently."""
 
@@ -301,7 +404,7 @@ def sync_data_filter_panel(
 
 
 class DataSourceOptionPanel(QWidget):
-    """Spot/timeslice source toggle and option list in one fieldset."""
+    """Spot/timeslice toggle with a metric list (iso/chamber variants are separate rows)."""
 
     def __init__(
         self,
@@ -323,9 +426,11 @@ class DataSourceOptionPanel(QWidget):
         group_layout = QVBoxLayout(self._group_box)
         group_layout.setSpacing(8)
 
-        self._source_segmented = SegmentedControl(list(DATA_SOURCES))
-        self._source_segmented.selectionChanged.connect(self._on_source_segment_changed)
-        group_layout.addWidget(self._source_segmented)
+        self._granularity_segmented = SegmentedControl(list(GRANULARITY_SOURCES))
+        self._granularity_segmented.selectionChanged.connect(
+            self._on_granularity_segment_changed,
+        )
+        group_layout.addWidget(self._granularity_segmented)
 
         self._option_list = QListWidget()
         self._option_list.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
@@ -346,97 +451,143 @@ class DataSourceOptionPanel(QWidget):
         self._availability = dict(availability)
         self._group_box.setTitle(group_title)
 
-        enabled_count = 0
-        for source_key, _label in DATA_SOURCES:
-            ok = source_has_available_options(
-                self._options, self._availability, source_key,  # type: ignore[arg-type]
-            )
-            self._source_segmented.set_option_enabled(source_key, ok)
-            if ok:
-                enabled_count += 1
-        self._source_segmented.setVisible(enabled_count > 1)
-
-        if source_has_available_options(
-            self._options, self._availability, preferred_source,
+        self._update_granularity_enabled()
+        preferred_coarse = coarse_data_source(preferred_source)
+        if not coarse_has_available_options(
+            self._options, self._availability, preferred_coarse,
         ):
-            source = preferred_source
-        else:
-            source = default_source(self._options, self._availability)
-        self._set_source(source, refresh_list=False)
-        first_id = default_option_id(
-            self._options,
-            self._availability,
-            source=source,
-        )
-        self._refresh_option_list(select_id=first_id)
+            preferred_coarse = default_coarse_source(self._options, self._availability)
+        self._set_granularity(preferred_coarse, refresh_list=False)
+
+        first_key = self._default_list_key(coarse=preferred_coarse)
+        self._refresh_option_list(select_key=first_key)
 
     def update_availability(self, availability: dict[str, bool]) -> None:
         """Refresh enabled options without changing the current source/selection."""
         self._availability = dict(availability)
-        enabled_count = 0
-        for source_key, _label in DATA_SOURCES:
-            ok = source_has_available_options(
-                self._options, self._availability, source_key,  # type: ignore[arg-type]
-            )
-            self._source_segmented.set_option_enabled(source_key, ok)
-            if ok:
-                enabled_count += 1
-        self._source_segmented.setVisible(enabled_count > 1)
-        current = self._selected_id()
-        self._refresh_option_list(select_id=current)
+        self._update_granularity_enabled()
+        current_key = self._selected_list_key()
+        self._refresh_option_list(select_key=current_key)
 
     def selected_source(self) -> DataSourceKind:
-        key = self._source_segmented.current_key()
-        if key in dict(DATA_SOURCES):
-            return key  # type: ignore[return-value]
+        opt = self._selected_option()
+        if opt is not None:
+            return opt.source
+        coarse = self._selected_granularity()
+        for opt in options_for_coarse(self._options, coarse):
+            if is_option_available(self._availability, opt):
+                return opt.source
         return DATA_SOURCE_SPOT_ISO
 
     def selected_id(self) -> str | None:
-        item = self._option_list.currentItem()
-        if item is None:
-            return None
-        return str(item.data(Qt.ItemDataRole.UserRole))
+        opt = self._selected_option()
+        return opt.id if opt is not None else None
 
     def select_id(self, option_id: str, *, source: DataSourceKind | None = None) -> None:
-        src = source
-        if src is None:
-            match = option_for(self._options, option_id, source=self.selected_source())
+        if source is not None:
+            match = option_for(self._options, option_id, source=source)
+        else:
+            match = option_for(
+                self._options,
+                option_id,
+                source=self.selected_source(),
+            )
             if match is None:
                 match = next(
                     (opt for opt in self._options if opt.id == option_id),
                     None,
                 )
-            if match is None:
-                return
-            src = match.source
-        elif option_for(self._options, option_id, source=src) is None:
+        if match is None:
             return
-        self._set_source(src, refresh_list=False)
-        self._refresh_option_list(select_id=option_id)
+        self._set_granularity(coarse_data_source(match.source), refresh_list=False)
+        self._refresh_option_list(select_key=option_list_key(match))
+
+    def _selected_granularity(self) -> CoarseDataSourceKind:
+        key = self._granularity_segmented.current_key()
+        if key in dict(GRANULARITY_SOURCES):
+            return key  # type: ignore[return-value]
+        return GRANULARITY_SOURCES[0][0]
 
     def _set_source(self, source: DataSourceKind, *, refresh_list: bool) -> None:
+        coarse = coarse_data_source(source)
+        self._set_granularity(coarse, refresh_list=False)
+        if refresh_list:
+            preserve_id = self.selected_id()
+            self._refresh_option_list(
+                select_id=preserve_id,
+                select_source=source,
+            )
+
+    def _set_granularity(
+        self,
+        coarse: CoarseDataSourceKind,
+        *,
+        refresh_list: bool,
+    ) -> None:
         self._updating = True
         try:
-            self._source_segmented.set_current(source)
+            self._granularity_segmented.set_current(coarse)
         finally:
             self._updating = False
         if refresh_list:
-            current = self._selected_id()
-            self._refresh_option_list(select_id=current)
+            preserve_id = self.selected_id()
+            self._refresh_option_list(select_id=preserve_id)
 
-    def _selected_id(self) -> str | None:
-        return self.selected_id()
+    def _update_granularity_enabled(self) -> None:
+        enabled_count = 0
+        for coarse_key, _label in GRANULARITY_SOURCES:
+            ok = coarse_has_available_options(
+                self._options, self._availability, coarse_key,
+            )
+            self._granularity_segmented.set_option_enabled(coarse_key, ok)
+            if ok:
+                enabled_count += 1
+        self._granularity_segmented.setVisible(enabled_count > 1)
 
-    def _refresh_option_list(self, *, select_id: str | None) -> None:
+        current = self._selected_granularity()
+        if not coarse_has_available_options(
+            self._options, self._availability, current,
+        ):
+            self._set_granularity(
+                default_coarse_source(self._options, self._availability),
+                refresh_list=False,
+            )
+
+    def _selected_list_key(self) -> str | None:
+        item = self._option_list.currentItem()
+        if item is None:
+            return None
+        data = item.data(Qt.ItemDataRole.UserRole)
+        return str(data) if data is not None else None
+
+    def _selected_option(self) -> UnifiedViewOption | None:
+        key = self._selected_list_key()
+        if key is None:
+            return None
+        return option_from_list_key(self._options, key)
+
+    def _default_list_key(self, *, coarse: CoarseDataSourceKind) -> str | None:
+        for opt in options_for_coarse(self._options, coarse):
+            if is_option_available(self._availability, opt):
+                return option_list_key(opt)
+        return None
+
+    def _refresh_option_list(
+        self,
+        *,
+        select_key: str | None = None,
+        select_id: str | None = None,
+        select_source: DataSourceKind | None = None,
+    ) -> None:
         self._updating = True
         try:
             self._option_list.clear()
-            source = self.selected_source()
-            visible = options_for_source(self._options, source)
+            coarse = self._selected_granularity()
+            visible = options_for_coarse(self._options, coarse)
             selected_row = -1
             for row, opt in enumerate(visible):
                 item = QListWidgetItem(opt.label)
-                item.setData(Qt.ItemDataRole.UserRole, opt.id)
+                item.setData(Qt.ItemDataRole.UserRole, option_list_key(opt))
                 enabled = is_option_available(self._availability, opt)
                 if enabled:
                     item.setFlags(
@@ -445,8 +596,25 @@ class DataSourceOptionPanel(QWidget):
                 else:
                     item.setFlags(Qt.ItemFlag.NoItemFlags)
                 self._option_list.addItem(item)
-                if select_id is not None and opt.id == select_id and enabled:
+                if select_key is not None and option_list_key(opt) == select_key and enabled:
                     selected_row = row
+                elif (
+                    select_key is None
+                    and select_id is not None
+                    and opt.id == select_id
+                    and enabled
+                    and (
+                        select_source is None
+                        or opt.source == select_source
+                    )
+                ):
+                    selected_row = row
+
+            if selected_row < 0 and select_id is not None:
+                for row, opt in enumerate(visible):
+                    if opt.id == select_id and is_option_available(self._availability, opt):
+                        selected_row = row
+                        break
 
             if selected_row < 0:
                 for row, opt in enumerate(visible):
@@ -460,7 +628,7 @@ class DataSourceOptionPanel(QWidget):
         finally:
             self._updating = False
 
-    def _on_source_segment_changed(self, _key: str) -> None:
+    def _on_granularity_segment_changed(self, _key: str) -> None:
         if self._updating:
             return
         preserve_id = self.selected_id()

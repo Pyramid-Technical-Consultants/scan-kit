@@ -43,6 +43,11 @@ def test_probe_sessions_matches_single_session() -> None:
     assert merged == single
 
 
+def test_probe_sessions_values_are_python_bool() -> None:
+    merged = probe_sessions([G3_SESSION], str(TEST_DATA))
+    assert all(type(value) is bool for value in merged.values())
+
+
 def test_dose_rate_availability_key() -> None:
     avail = probe_session(G3_SESSION, str(TEST_DATA))
     key = option_key(DATA_SOURCE_SPOT_ISO, SOURCE_DOSE_RATE)

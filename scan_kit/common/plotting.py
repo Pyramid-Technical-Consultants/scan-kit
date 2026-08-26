@@ -781,6 +781,14 @@ def make_session_legend(
     )
 
 
+def style_linear_binned_axes(ax, *, xlabel: str, ylabel=None) -> None:
+    """Apply grid and labels for continuous (non-binned) x-axes."""
+    ax.set_xlabel(xlabel)
+    if ylabel:
+        ax.set_ylabel(ylabel)
+    ax.grid(**GRID_KW)
+
+
 def style_binned_axes(ax, categories, *, xlabel: str, ylabel=None):
     """Apply categorical bin x-axis ticks and grid to *ax*."""
     ax.set_xlabel(xlabel)
@@ -788,8 +796,17 @@ def style_binned_axes(ax, categories, *, xlabel: str, ylabel=None):
         ax.set_ylabel(ylabel)
     ax.grid(**GRID_KW)
     ax.set_xticks(np.arange(len(categories)))
-    ax.set_xticklabels([f"{c:g}" if isinstance(c, (int, float)) else str(c)
-                        for c in categories], rotation=90)
+    ax.set_xticklabels([_format_axis_sig3(c) for c in categories], rotation=90)
+
+
+def _format_axis_sig3(value) -> str:
+    """Format a numeric tick value with three significant figures."""
+    if isinstance(value, (int, float, np.floating)):
+        val = float(value)
+        if not np.isfinite(val):
+            return ""
+        return f"{val:.3g}"
+    return str(value)
 
 
 def style_energy_axes(ax, energies, ylabel=None):
@@ -863,6 +880,110 @@ def scatter_with_trend(
         zorder=zorder,
     )
     return slope
+
+
+DENSITY_HISTOGRAM_BINS = 80
+DENSITY_PERCENTILE_CLIP = 99.95
+_MAX_DENSITY_SAMPLES = 8000
+_CONTOUR_FILL_ALPHA_PER_LAYER = 0.13
+_CONTOUR_LINE_ALPHA = 0.85
+_CONTOUR_LINE_WIDTH = 0.65
+
+
+def _density_axis_range(values: np.ndarray) -> tuple[float, float]:
+    vals = np.asarray(values, dtype=float)
+    vals = vals[np.isfinite(vals)]
+    if vals.size == 0:
+        return 0.0, 1.0
+    lo, hi = np.percentile(vals, [100 - DENSITY_PERCENTILE_CLIP, DENSITY_PERCENTILE_CLIP])
+    if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+        spread = float(np.ptp(vals)) if vals.size else 1.0
+        mid = float(np.median(vals)) if vals.size else 0.0
+        half = spread / 2 if spread > 0 else 0.5
+        return mid - half, mid + half
+    return float(lo), float(hi)
+
+
+def plot_density_contours(
+    ax,
+    x: np.ndarray,
+    y: np.ndarray,
+    color: str,
+    *,
+    contour_cutoff_percentile: float = 5.0,
+    x_range: tuple[float, float] | None = None,
+    y_range: tuple[float, float] | None = None,
+) -> None:
+    """Nested filled density contours for continuous (x, y) spot data."""
+    from .ic_xy_distribution import contour_level_percentiles, normalize_contour_cutoff_percentile
+
+    cutoff = normalize_contour_cutoff_percentile(contour_cutoff_percentile)
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    mask = np.isfinite(x) & np.isfinite(y)
+    x, y = x[mask], y[mask]
+    if x.size > _MAX_DENSITY_SAMPLES:
+        step = max(1, x.size // _MAX_DENSITY_SAMPLES)
+        x, y = x[::step], y[::step]
+    if x.size < 20:
+        return
+
+    x_lo, x_hi = x_range if x_range is not None else _density_axis_range(x)
+    y_lo, y_hi = y_range if y_range is not None else _density_axis_range(y)
+    in_range = (x >= x_lo) & (x <= x_hi) & (y >= y_lo) & (y <= y_hi)
+    x, y = x[in_range], y[in_range]
+    if x.size < 20:
+        return
+
+    density, x_edges, y_edges = np.histogram2d(
+        x,
+        y,
+        bins=DENSITY_HISTOGRAM_BINS,
+        range=((x_lo, x_hi), (y_lo, y_hi)),
+    )
+    if not np.any(density > 0):
+        return
+
+    xc = (x_edges[:-1] + x_edges[1:]) * 0.5
+    yc = (y_edges[:-1] + y_edges[1:]) * 0.5
+    grid_x, grid_y = np.meshgrid(xc, yc)
+
+    positive = density[density > 0]
+    pct_levels = contour_level_percentiles(cutoff)
+    levels = np.unique(np.percentile(positive, pct_levels))
+    levels = levels[np.isfinite(levels)]
+
+    z = density.T
+    z_max = float(z.max())
+    if z_max <= 0 or levels.size == 0:
+        return
+
+    levels = levels[(levels > 0) & (levels < z_max)]
+    if levels.size == 0:
+        return
+
+    rgba = mcolors.to_rgba(color)
+    for level in levels:
+        ax.contourf(
+            grid_x,
+            grid_y,
+            z,
+            levels=[level, z_max + 1.0],
+            colors=[(rgba[0], rgba[1], rgba[2], _CONTOUR_FILL_ALPHA_PER_LAYER)],
+            antialiased=True,
+            zorder=1,
+        )
+
+    ax.contour(
+        grid_x,
+        grid_y,
+        z,
+        levels=levels,
+        colors=[color],
+        linewidths=_CONTOUR_LINE_WIDTH,
+        alpha=_CONTOUR_LINE_ALPHA,
+        zorder=2,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1389,7 +1510,7 @@ def apply_shared_block_labels(
 
 
 def _plot_histogram(ax, session_data, col, loaded_ids, colors, *,
-                    energy_mask=None, n_bins=101, ylabel="Probability (%)",
+                    energy_mask=None, bin_count=30, ylabel="Probability (%)",
                     xlabel=None, title=None, ref_val=None,
                     bin_range=None):
     """Draw a probability-weighted histogram on *ax*.
@@ -1401,7 +1522,7 @@ def _plot_histogram(ax, session_data, col, loaded_ids, colors, *,
         loaded_ids: Ordered session id list.
         colors: Matching color list.
         energy_mask: Optional dict[sid -> bool array] to filter spots.
-        n_bins: Number of bins (edges = n_bins).
+        bin_count: Number of histogram bins (bar count).
         ylabel: Y-axis label.
         xlabel: X-axis label.
         title: Axes title.
@@ -1431,7 +1552,7 @@ def _plot_histogram(ax, session_data, col, loaded_ids, colors, *,
         all_finite = np.concatenate(all_chunks)
         pclip = HIST_PERCENTILE_CLIP
         lo, hi = np.percentile(all_finite, [100 - pclip, pclip])
-    bin_edges = np.linspace(lo, hi, n_bins)
+    bin_edges = np.linspace(lo, hi, bin_count + 1)
 
     for sid, color in zip(loaded_ids, colors):
         if col not in session_data[sid]:
@@ -1458,6 +1579,57 @@ def _plot_histogram(ax, session_data, col, loaded_ids, colors, *,
     ax.set_visible(True)
 
 
+def compute_hist_bin_range(
+    session_data,
+    columns,
+    loaded_ids,
+    *,
+    hist_percentile_clip=None,
+) -> tuple[float, float] | None:
+    """Percentile clip range pooled across sessions and columns for shared histogram bins."""
+    pclip = hist_percentile_clip if hist_percentile_clip is not None else HIST_PERCENTILE_CLIP
+    all_hist_vals = []
+    for col in columns:
+        for sid in loaded_ids:
+            if col in session_data[sid]:
+                v = np.asarray(session_data[sid][col], dtype=float)
+                v = v[np.isfinite(v)]
+                if v.size:
+                    all_hist_vals.append(v)
+    if not all_hist_vals:
+        return None
+    combined = np.concatenate(all_hist_vals)
+    lo, hi = np.percentile(combined, [100 - pclip, pclip])
+    return float(lo), float(hi)
+
+
+def draw_probability_histogram(
+    ax,
+    session_data,
+    col,
+    loaded_ids,
+    colors,
+    *,
+    bin_count: int = 30,
+    bin_range: tuple[float, float] | None = None,
+    xlabel: str | None = None,
+    ylabel: str | None = "Probability (%)",
+) -> None:
+    """Draw a side-panel probability histogram without a title."""
+    _plot_histogram(
+        ax,
+        session_data,
+        col,
+        loaded_ids,
+        colors,
+        bin_count=bin_count,
+        ylabel=ylabel,
+        xlabel=xlabel,
+        title=None,
+        bin_range=bin_range,
+    )
+
+
 def link_boxplot_to_histogram(
     box_axes,
     hist_axes,
@@ -1467,7 +1639,8 @@ def link_boxplot_to_histogram(
     colors,
     loaded_ids,
     *,
-    n_bins=101,
+    hist_bin_count=30,
+    hist_shared_bins=False,
     hist_ylabel="Probability (%)",
     hist_xlabels=None,
     hist_titles=None,
@@ -1488,7 +1661,8 @@ def link_boxplot_to_histogram(
         columns: Single column name or list of column names (one per axis pair).
         colors: Session color list.
         loaded_ids: Ordered session id list.
-        n_bins: Number of histogram bins.
+        hist_bin_count: Number of histogram bins (bar count).
+        hist_shared_bins: When true, all linked histograms share bin edges.
         hist_ylabel: Y-axis label(s) for histograms — a string, or one label per
             row when *n_columns* is set.
         hist_xlabels: Single or list of x-axis labels for histograms.
@@ -1547,43 +1721,38 @@ def link_boxplot_to_histogram(
             return hist_ylabels[0]
         return hist_ylabels[row]
 
-    def _redraw_histogram(hist_ax, col, xlabel, title, ref, energy_mask, *, show_ylabel, axis_idx):
+    def _redraw_histogram(hist_ax, col, xlabel, title, ref, energy_mask, *, show_ylabel, axis_idx, bin_range):
         _plot_histogram(
             hist_ax, session_data, col, loaded_ids, colors,
-            energy_mask=energy_mask, n_bins=n_bins,
+            energy_mask=energy_mask, bin_count=hist_bin_count,
             ylabel=_ylabel_for_index(axis_idx, show_ylabel=show_ylabel),
-            xlabel=xlabel, title=title, ref_val=ref, bin_range=shared_bin_range,
+            xlabel=xlabel, title=title, ref_val=ref, bin_range=bin_range,
         )
         _after_histogram(hist_ax)
 
-    # Compute a shared bin range across all columns
-    all_hist_vals = []
-    for col in columns:
-        for sid in loaded_ids:
-            if col in session_data[sid]:
-                v = np.asarray(session_data[sid][col], dtype=float)
-                v = v[np.isfinite(v)]
-                if v.size:
-                    all_hist_vals.append(v)
-    if all_hist_vals:
-        combined = np.concatenate(all_hist_vals)
-        shared_bin_range = tuple(np.percentile(combined, [100 - pclip, pclip]))
-    else:
-        shared_bin_range = None
+    shared_bin_range = None
+    if hist_shared_bins:
+        shared_bin_range = compute_hist_bin_range(
+            session_data,
+            columns,
+            loaded_ids,
+            hist_percentile_clip=pclip,
+        )
 
     for idx, (box_ax, hist_ax, col, xlabel, title, ref) in enumerate(zip(
         box_axes, hist_axes, columns, hist_xlabels, hist_titles, hist_refs
     )):
         show_ylabel = n_columns is None or idx % n_columns == 0
+        row_bin_range = shared_bin_range
         _redraw_histogram(
             hist_ax, col, xlabel, title, ref, energy_mask=None,
-            show_ylabel=show_ylabel, axis_idx=idx,
+            show_ylabel=show_ylabel, axis_idx=idx, bin_range=row_bin_range,
         )
 
         highlight = box_ax.axvspan(0, 0, alpha=0.15, color="gold", visible=False, zorder=0)
 
         def _make_callback(_hist_ax, _col, _xlabel, _title, _ref, _hl, _span_ref,
-                           _show_ylabel, _axis_idx, _bin_range=shared_bin_range):
+                           _show_ylabel, _axis_idx, _bin_range=row_bin_range):
             def _on_select(xmin, xmax):
                 idx_lo = max(0, int(np.floor(xmin + 0.5)))
                 idx_hi = min(len(energy_arr) - 1, int(np.floor(xmax + 0.5)))
@@ -1596,7 +1765,7 @@ def link_boxplot_to_histogram(
 
                 _redraw_histogram(
                     _hist_ax, _col, _xlabel, _title, _ref, energy_mask=mask,
-                    show_ylabel=_show_ylabel, axis_idx=_axis_idx,
+                    show_ylabel=_show_ylabel, axis_idx=_axis_idx, bin_range=_bin_range,
                 )
                 _hl.set_x(idx_lo - 0.5)
                 _hl.set_width(idx_hi - idx_lo + 1)
@@ -1608,7 +1777,7 @@ def link_boxplot_to_histogram(
                     return
                 _redraw_histogram(
                     _hist_ax, _col, _xlabel, _title, _ref, energy_mask=None,
-                    show_ylabel=_show_ylabel, axis_idx=_axis_idx,
+                    show_ylabel=_show_ylabel, axis_idx=_axis_idx, bin_range=_bin_range,
                 )
                 _hl.set_visible(False)
                 if _span_ref:
@@ -1649,7 +1818,7 @@ def link_scatter_to_histogram(
     colors,
     loaded_ids,
     *,
-    n_bins=101,
+    hist_bin_count=30,
     hist_ylabel="Probability (%)",
     hist_xlabels=None,
     hist_titles=None,
@@ -1671,7 +1840,7 @@ def link_scatter_to_histogram(
         columns: Single column name or list of column names (one per axis pair).
         colors: Session color list.
         loaded_ids: Ordered session id list.
-        n_bins: Number of histogram bins.
+        hist_bin_count: Number of histogram bins.
         hist_ylabel: Y-axis label for histograms.
         hist_xlabels: Single or list of x-axis labels for histograms.
         hist_titles: Single or list of titles for histograms.
@@ -1730,7 +1899,7 @@ def link_scatter_to_histogram(
     def _redraw_histogram(hist_ax, col, xlabel, title, ref, energy_mask):
         _plot_histogram(
             hist_ax, session_data, col, loaded_ids, colors,
-            energy_mask=energy_mask, n_bins=n_bins, ylabel=hist_ylabel,
+            energy_mask=energy_mask, bin_count=hist_bin_count, ylabel=hist_ylabel,
             xlabel=xlabel, title=title, ref_val=ref, bin_range=shared_bin_range,
         )
         _after_histogram(hist_ax)

@@ -78,6 +78,12 @@ MODE_ADAPTERS: dict[str, Callable[[Any], Any]] = {
     MODE_IC12_POS_DIFF_TIMESLICE: ic12_to_session_xy,
 }
 
+DISTRIBUTION_REGISTRY_SOURCE_IDS: tuple[str, ...] = tuple(
+    dict.fromkeys(MODE_REGISTRY.values())
+)
+
+_MODE_LOAD_CACHE: dict[tuple, dict[str, Any]] = {}
+
 
 def probe_mode_availability(
     session_ids: list[str],
@@ -91,7 +97,11 @@ def probe_mode_availability(
     avail = dict(
         source_availability
         if source_availability is not None
-        else probe_sessions(session_ids, base_dir)
+        else probe_sessions(
+            session_ids,
+            base_dir,
+            source_ids=DISTRIBUTION_REGISTRY_SOURCE_IDS,
+        )
     )
     return _extend_mode_availability(avail)
 
@@ -100,7 +110,7 @@ def _extend_mode_availability(avail: dict[str, bool]) -> dict[str, bool]:
     for opt in VIEW_OPTIONS:
         mode_id = resolve_mode_id(opt.id, opt.source)
         if mode_id is not None:
-            avail[mode_id] = avail.get(option_key(opt.source, opt.id), False)
+            avail[mode_id] = bool(avail.get(option_key(opt.source, opt.id), False))
     return avail
 
 
@@ -169,6 +179,12 @@ def load_sessions_for_mode(
 
     resolved_source = data_source or _default_data_source_for_mode(mode)
 
+    bg = settings.bg_subtract if settings else False
+    cache_key = (mode, tuple(session_ids), base_dir, resolved_source, bg)
+    cached = _MODE_LOAD_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
     session_data: dict[str, Any] = {}
     for sid in session_ids:
         data = _load_session_for_mode(
@@ -177,20 +193,26 @@ def load_sessions_for_mode(
         if data is not None:
             session_data[sid] = data
 
+    _MODE_LOAD_CACHE[cache_key] = session_data
     return session_data
 
 
 def clear_summary_table_cache() -> None:
     """Clear assembled summary-table caches (e.g. after calibration change)."""
-    _SUMMARY_TABLE_CACHE.clear()
-    _TIMESLICE_SUMMARY_CACHE.clear()
+    from .binned_summary_data import clear_summary_table_cache as clear_binned
+
+    clear_binned()
 
 
 def clear_load_cache() -> None:
+    from ..common.processing import clear_position_table_cache, clear_session_raw_cache
     from ..data.cache import clear_cache
 
     clear_cache()
+    clear_session_raw_cache()
+    clear_position_table_cache()
     clear_summary_table_cache()
+    _MODE_LOAD_CACHE.clear()
 
 
 def mode_has_data(

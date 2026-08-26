@@ -20,6 +20,10 @@ _SPOT_PLAN_PROBE_CACHE: dict[tuple[str, str], bool] = {}
 _TIMESLICE_PEEK_CACHE: dict[tuple[str, str, tuple[str, ...]], list] = {}
 
 
+def beam_on_has_samples(beam_on: np.ndarray | None) -> bool:
+    return bool(beam_on is not None and np.any(beam_on))
+
+
 def probe_spot_positions_with_plan(ctx: SessionContext) -> bool:
     key = (ctx.session_id, ctx.base_dir)
     cached = _SPOT_PLAN_PROBE_CACHE.get(key)
@@ -79,7 +83,7 @@ def probe_timeslice_frame(
     if source is None:
         return False
     beam_on = detect_beam_on_mask(frame)
-    if beam_on is None or not np.any(beam_on):
+    if not beam_on_has_samples(beam_on):
         return False
     return frame_arrays(frame, source) is not None
 
@@ -105,6 +109,6 @@ def probe_timeslice_session_arrays(
     if source is None:
         return False
     beam_on = detect_beam_on_mask(frame)
-    if beam_on is None or not np.any(beam_on):
+    if not beam_on_has_samples(beam_on):
         return False
     return frame_arrays_fn(frame, source) is not None

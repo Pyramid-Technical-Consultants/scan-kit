@@ -34,7 +34,6 @@ alignment-corrected measured line crosses its plan nominal; MAD uncertainty).
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -58,6 +57,13 @@ from ..common.ic_trajectory import (
     IC2_Z_MM,
     IC_SEP_MM,
     ic_alignment_offsets,
+)
+from ..common.trajectory_fits import (
+    IsoFit,
+    MagnetFit,
+    fit_iso_plane,
+    fit_magnet_pivot,
+    project_plan_to_z,
 )
 from ..common.session_notes import load_notes
 
@@ -83,153 +89,11 @@ MAGNET_LINE_KW = dict(linestyle="--", linewidth=1.4, alpha=0.95, zorder=4)
 ISO_LINE_KW = dict(linestyle="-.", linewidth=1.1, alpha=0.85, zorder=3)
 PLAN_LINE_KW = dict(linestyle=":", linewidth=PLAN_LINE_LW, alpha=PLAN_LINE_ALPHA, zorder=0)
 
-# Cap spots used for pairwise crossover (n^2 pairs); fixed seed for reproducibility.
-_PAIRWISE_MAX_SPOTS = 400
-_PAIRWISE_MIN_INTERSECTIONS = 20
-_PAIRWISE_RNG_SEED = 0
-_ISO_MIN_ESTIMATES = 20
-_SLOPE_EPS = 1e-9
-
-
-@dataclass(frozen=True)
-class _MagnetFit:
-    """Upstream crossover of per-spot IC2–IC1 lines for one session axis."""
-
-    z_pivot: float
-    upstream_mm: float
-    upstream_sigma_mm: float
-
-    @property
-    def is_valid(self) -> bool:
-        return (
-            np.isfinite(self.z_pivot)
-            and np.isfinite(self.upstream_mm)
-            and self.z_pivot < IC2_Z_MM
-        )
-
-
-@dataclass(frozen=True)
-class _IsoFit:
-    """Downstream iso plane where measured trajectories match plan nominals."""
-
-    z_iso: float
-    downstream_mm: float
-    downstream_sigma_mm: float
-
-    @property
-    def is_valid(self) -> bool:
-        return np.isfinite(self.z_iso) and self.z_iso > IC2_Z_MM
-
-
-def _pairwise_upstream_crossings(p2: np.ndarray, slopes: np.ndarray) -> np.ndarray:
-    """Z downstream from IC2 where pairs of spot lines intersect, upstream only."""
-    n = p2.size
-    z_vals: list[np.ndarray] = []
-    for i in range(n - 1):
-        dm = slopes[i] - slopes[i + 1 :]
-        valid = np.abs(dm) > _SLOPE_EPS
-        if not np.any(valid):
-            continue
-        z_ij = IC2_Z_MM + (p2[i + 1 :] - p2[i])[valid] / dm[valid]
-        z_vals.append(z_ij[z_ij < IC2_Z_MM])
-    if not z_vals:
-        return np.array([], dtype=float)
-    return np.concatenate(z_vals)
-
-
-def _fit_magnet_pivot(p2: np.ndarray, p1: np.ndarray) -> _MagnetFit:
-    """Median upstream crossover z from pairwise intersections of spot lines."""
-    nan = _MagnetFit(float("nan"), float("nan"), float("nan"))
-    if p2.size < 2:
-        return nan
-
-    slopes = (p1 - p2) / IC_SEP_MM
-    n = p2.size
-    if n > _PAIRWISE_MAX_SPOTS:
-        rng = np.random.default_rng(_PAIRWISE_RNG_SEED)
-        pick = np.sort(rng.choice(n, size=_PAIRWISE_MAX_SPOTS, replace=False))
-        p2 = p2[pick]
-        slopes = slopes[pick]
-
-    z_cross = _pairwise_upstream_crossings(p2, slopes)
-    if z_cross.size < _PAIRWISE_MIN_INTERSECTIONS:
-        return nan
-
-    z_pivot = float(np.median(z_cross))
-    mad = float(np.median(np.abs(z_cross - z_pivot)))
-    sigma = 1.4826 * mad if mad > 0 else float(np.std(z_cross, ddof=1))
-
-    return _MagnetFit(
-        z_pivot,
-        IC2_Z_MM - z_pivot,
-        float(sigma) if np.isfinite(sigma) else float("nan"),
-    )
-
-
-def _per_spot_iso_estimates(
-    p2: np.ndarray,
-    p1: np.ndarray,
-    plan_p: np.ndarray,
-) -> np.ndarray:
-    """Z downstream from IC2 where each measured line crosses its plan nominal."""
-    slopes = (p1 - p2) / IC_SEP_MM
-    valid = (
-        np.isfinite(p2)
-        & np.isfinite(plan_p)
-        & np.isfinite(slopes)
-        & (np.abs(slopes) > _SLOPE_EPS)
-    )
-    z_iso = IC2_Z_MM + (plan_p[valid] - p2[valid]) / slopes[valid]
-    return z_iso[np.isfinite(z_iso) & (z_iso > IC2_Z_MM)]
-
-
-def _fit_iso_plane(
-    p2: np.ndarray,
-    p1: np.ndarray,
-    plan_p: np.ndarray,
-    z_pivot: float,
-) -> _IsoFit:
-    """Median downstream *z* where each measured line crosses its plan nominal.
-
-    Analogous to the upstream pivot fit: each spot contributes one crossing
-    estimate; the median is robust to outliers.  (A global IC2/IC1 residual
-    search is flat in *z_iso* because plan rays share one scale factor.)
-    """
-    nan = _IsoFit(float("nan"), float("nan"), float("nan"))
-    if p2.size < 2 or not np.isfinite(z_pivot):
-        return nan
-
-    ok = np.isfinite(p2) & np.isfinite(p1) & np.isfinite(plan_p)
-    p2 = p2[ok]
-    p1 = p1[ok]
-    plan_p = plan_p[ok]
-    if p2.size < 2:
-        return nan
-
-    z_spot = _per_spot_iso_estimates(p2, p1, plan_p)
-    if z_spot.size < _ISO_MIN_ESTIMATES:
-        return nan
-
-    n = z_spot.size
-    if n > _PAIRWISE_MAX_SPOTS:
-        rng = np.random.default_rng(_PAIRWISE_RNG_SEED)
-        z_spot = np.sort(rng.choice(z_spot, size=_PAIRWISE_MAX_SPOTS, replace=False))
-
-    z_iso = float(np.median(z_spot))
-    mad = float(np.median(np.abs(z_spot - z_iso)))
-    sigma = 1.4826 * mad if mad > 0 else float(np.std(z_spot, ddof=1))
-
-    return _IsoFit(
-        z_iso,
-        z_iso - IC2_Z_MM,
-        float(sigma) if np.isfinite(sigma) else float("nan"),
-    )
-
 
 def _format_magnet_legend_label(
     session_id: str,
-    fit: _MagnetFit,
-    iso: _IsoFit | None,
+    fit: MagnetFit,
+    iso: IsoFit | None,
     off2: float,
     off1: float,
     *,
@@ -289,13 +153,6 @@ def _spot_segments(p2: np.ndarray, p1: np.ndarray) -> np.ndarray:
     )
 
 
-def _project_plan_to_z(
-    plan_p: np.ndarray, z_pivot: float, z_iso: float, z: float,
-) -> np.ndarray:
-    """Project iso-center plan position to *z* via ray from pivot through iso."""
-    return plan_p * (z - z_pivot) / (z_iso - z_pivot)
-
-
 def _plan_segments(plan_p: np.ndarray, z_pivot: float, z_iso: float) -> np.ndarray:
     """Per-spot plan rays from iso through the pivot, extended along +z."""
     z_upstream = IC2_Z_MM - EXTEND_UPSTREAM_MM
@@ -304,11 +161,11 @@ def _plan_segments(plan_p: np.ndarray, z_pivot: float, z_iso: float) -> np.ndarr
         [
             np.column_stack([
                 np.full(plan_p.shape, z_upstream),
-                _project_plan_to_z(plan_p, z_pivot, z_iso, z_upstream),
+                project_plan_to_z(plan_p, z_pivot, z_iso, z_upstream),
             ]),
             np.column_stack([
                 np.full(plan_p.shape, z_downstream),
-                _project_plan_to_z(plan_p, z_pivot, z_iso, z_downstream),
+                project_plan_to_z(plan_p, z_pivot, z_iso, z_downstream),
             ]),
         ],
         axis=1,
@@ -418,8 +275,8 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
             if n == 0:
                 continue
 
-            fit = _fit_magnet_pivot(p2, p1)
-            iso_fit: _IsoFit | None = None
+            fit = fit_magnet_pivot(p2, p1)
+            iso_fit: IsoFit | None = None
             if fit.is_valid:
                 pivot_z_by_axis[ax_idx].append(fit.z_pivot)
                 ax.axvline(fit.z_pivot, color=color, **MAGNET_LINE_KW)
@@ -428,7 +285,7 @@ def run(session_ids: list[str], base_dir: str = "test_data", *, settings=None) -
                     plan_p = np.asarray(data[plan_key], dtype=float)[keep]
                     plan_ok = np.isfinite(plan_p)
                     if plan_ok.any():
-                        iso_fit = _fit_iso_plane(
+                        iso_fit = fit_iso_plane(
                             p2[plan_ok], p1[plan_ok], plan_p[plan_ok], fit.z_pivot,
                         )
                         if iso_fit.is_valid:

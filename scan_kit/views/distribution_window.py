@@ -7,7 +7,7 @@ from typing import Any, Sequence
 
 from matplotlib.figure import Figure
 from PySide6.QtCore import QTimer, Slot
-from PySide6.QtWidgets import QVBoxLayout, QWidget
+from PySide6.QtWidgets import QToolButton, QVBoxLayout, QWidget
 
 from ..common.ic_xy_distribution import normalize_contour_cutoff_percentile
 from ..common.data_filter import FILTER_ALL, FILTER_BEAM_BOTH, FILTER_BEAM_ON
@@ -80,16 +80,21 @@ class DistributionExplorerWindow(PlotViewWindow):
         self._base_dir = base_dir
         self._settings = settings or ViewSettings()
         self._cache: dict[str, dict[str, Any]] = {}
-        self._mode_available = probe_mode_availability(self._session_ids, self._base_dir)
+        self._mode_available: dict[str, bool] = {}
+        self._pending_preset = initial_preset
         self._option_panel: DataSourceOptionPanel | None = None
         self._plot_style_panel: PlotStylePanel | None = None
         self._filter_panel: DataFilterPanel | None = None
+        self._presets_button: QToolButton | None = None
         self._refresh_generation = 0
 
         self._refresh_timer = QTimer(self)
         self._refresh_timer.setSingleShot(True)
         self._refresh_timer.setInterval(80)
         self._refresh_timer.timeout.connect(self._start_refresh)
+
+        self._probe_task = DebouncedBackgroundTask(debounce_ms=0, parent=self)
+        self._probe_task.finished.connect(self._on_probe_finished)
 
         self._load_task = DebouncedBackgroundTask(debounce_ms=0, parent=self)
         self._load_task.finished.connect(self._on_load_finished)
@@ -98,8 +103,37 @@ class DistributionExplorerWindow(PlotViewWindow):
         self._render_task.finished.connect(self._on_render_finished)
 
         self.set_side_panel(self._build_controls())
-        if initial_preset and initial_preset in PRESET_BY_ID:
-            self._apply_preset(initial_preset)
+        self._show_status_message("Loading distribution options…")
+        self._start_initial_probe()
+
+    def _show_status_message(self, message: str) -> None:
+        self.figure.clear()
+        self.figure.text(0.5, 0.5, message, ha="center", va="center")
+        self.draw_idle()
+
+    def _start_initial_probe(self) -> None:
+        session_ids = list(self._session_ids)
+        base_dir = self._base_dir
+
+        def loader() -> dict[str, bool]:
+            return probe_mode_availability(session_ids, base_dir)
+
+        self._probe_task.schedule(loader)
+
+    @Slot(int, object)
+    def _on_probe_finished(self, _task_generation: int, result: object) -> None:
+        if not isinstance(result, dict):
+            self._show_status_message("Failed to load distribution options")
+            return
+        self._mode_available = result
+        self._refresh_presets_menu()
+        if self._option_panel is not None:
+            self._option_panel.update_availability(self._mode_available)
+
+        preset = self._pending_preset
+        self._pending_preset = None
+        if preset and preset in PRESET_BY_ID:
+            self._apply_preset(preset)
         else:
             mode = default_mode(
                 self._session_ids,
@@ -114,18 +148,35 @@ class DistributionExplorerWindow(PlotViewWindow):
             self._sync_data_filter_for_mode()
             self._schedule_refresh()
 
+    def _refresh_presets_menu(self) -> None:
+        button = self._presets_button
+        if button is None:
+            return
+        menu = button.menu()
+        if menu is None:
+            return
+        actions = menu.actions()
+        for action, preset in zip(actions, PRESETS, strict=False):
+            action.setEnabled(bool(self._mode_available.get(preset.mode, False)))
+        button.setEnabled(
+            any(bool(self._mode_available.get(p.mode, False)) for p in PRESETS)
+        )
+
     def _build_controls(self) -> QWidget:
         panel, layout = make_side_panel_column()
 
-        layout.addWidget(
-            make_presets_menu_button(
-                [
-                    (preset.id, preset.label, self._mode_available.get(preset.mode, False))
-                    for preset in PRESETS
-                ],
-                self._apply_preset,
-            )
+        self._presets_button = make_presets_menu_button(
+            [
+                (
+                    preset.id,
+                    preset.label,
+                    bool(self._mode_available.get(preset.mode, False)),
+                )
+                for preset in PRESETS
+            ],
+            self._apply_preset,
         )
+        layout.addWidget(self._presets_button)
 
         self._option_panel = DataSourceOptionPanel(
             on_selection_changed=self._on_metric_changed,
