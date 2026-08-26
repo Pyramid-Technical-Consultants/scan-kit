@@ -6,6 +6,7 @@ from typing import Any
 
 from .context import LoadOptions, SessionContext
 
+
 _PROBE_CACHE: dict[tuple, bool] = {}
 _LOAD_CACHE: dict[tuple, Any] = {}
 
@@ -20,8 +21,8 @@ def probe_cache_key(
         source_id,
         ctx.session_id,
         ctx.base_dir,
+        opts.data_source,
         opts.granularity,
-        opts.reference_frame,
     )
 
 
@@ -35,9 +36,10 @@ def load_cache_key(
         source_id,
         ctx.session_id,
         ctx.base_dir,
+        opts.data_source,
         opts.granularity,
-        opts.reference_frame,
         opts.resolved_bg_subtract(ctx),
+        ctx.settings_cache_key(),
     )
 
 

@@ -21,10 +21,12 @@ from ..reference_frame import (
 from ..registry import DataSourceSpec, register
 from ..spot import spot_has_ic_positions
 from ..types import (
+    DATA_SOURCE_SPOT_ISO,
+    DATA_SOURCE_SPOT_CHAMBER,
+    DATA_SOURCE_TIMESLICE_ISO,
+    DATA_SOURCE_TIMESLICE_CHAMBER,
     GRANULARITY_SPOT,
     GRANULARITY_TIMESLICE_SAMPLE,
-    REFERENCE_CHAMBER,
-    REFERENCE_ISO,
 )
 
 SOURCE_IC12_POS_DIFF = "ic12_pos_diff"
@@ -137,8 +139,12 @@ SPEC = register(
     DataSourceSpec(
         id=SOURCE_IC12_POS_DIFF,
         label="IC2−IC1 Position",
-        granularities=frozenset({GRANULARITY_SPOT, GRANULARITY_TIMESLICE_SAMPLE}),
-        reference_frames=frozenset({REFERENCE_ISO, REFERENCE_CHAMBER}),
+        data_sources=frozenset({
+            DATA_SOURCE_SPOT_ISO,
+            DATA_SOURCE_SPOT_CHAMBER,
+            DATA_SOURCE_TIMESLICE_ISO,
+            DATA_SOURCE_TIMESLICE_CHAMBER,
+        }),
         supports_bg_subtract=True,
         supports_beam_filter=True,
         probe=probe_ic12,

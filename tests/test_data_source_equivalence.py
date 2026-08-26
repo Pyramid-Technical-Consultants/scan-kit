@@ -6,8 +6,8 @@ import numpy as np
 import pytest
 
 from scan_kit.data import (
-    GRANULARITY_SPOT,
-    GRANULARITY_TIMESLICE_SAMPLE,
+    DATA_SOURCE_SPOT_ISO,
+    DATA_SOURCE_TIMESLICE_ISO,
     LoadOptions,
     REFERENCE_ISO,
     SessionContext,
@@ -38,7 +38,7 @@ def test_ic12_spot_distribution_matches_binned(session_id: str) -> None:
         MODE_IC12_POS_DIFF_SPOT, [session_id], str(TEST_DATA),
     )
     binned = load_session_summary_table(
-        session_id, str(TEST_DATA), reference_frame=REFERENCE_ISO,
+        session_id, str(TEST_DATA), data_source=DATA_SOURCE_SPOT_ISO,
     )
     if session_id not in dist or binned is None or "ic12_x_diff" not in binned:
         pytest.skip("IC12 spot data unavailable")
@@ -54,7 +54,7 @@ def test_ic12_timeslice_distribution_matches_binned(session_id: str) -> None:
         MODE_IC12_POS_DIFF_TIMESLICE, [session_id], str(TEST_DATA),
     )
     binned = load_session_timeslice_summary_table(
-        session_id, str(TEST_DATA), reference_frame=REFERENCE_ISO,
+        session_id, str(TEST_DATA), data_source=DATA_SOURCE_SPOT_ISO,
     )
     if session_id not in dist or binned is None or "ic12_x_diff" not in binned:
         pytest.skip("IC12 timeslice data unavailable")
@@ -69,7 +69,7 @@ def test_ic12_adapters_agree_on_registry_payload(session_id: str) -> None:
     payload = load(
         SOURCE_IC12_POS_DIFF,
         ctx,
-        LoadOptions(granularity=GRANULARITY_SPOT, reference_frame=REFERENCE_ISO),
+        LoadOptions(data_source=DATA_SOURCE_SPOT_ISO),
     )
     if payload is None:
         pytest.skip("IC12 spot payload unavailable")
@@ -89,7 +89,7 @@ def test_ic12_timeslice_adapters_agree_on_registry_payload(session_id: str) -> N
         ctx,
         LoadOptions(
             granularity=GRANULARITY_TIMESLICE_SAMPLE,
-            reference_frame=REFERENCE_ISO,
+            data_source=DATA_SOURCE_TIMESLICE_ISO,
         ),
     )
     if payload is None:

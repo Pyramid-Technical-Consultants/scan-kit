@@ -7,7 +7,10 @@ from ...common.session_source import read_first_timeslice_columns, resolve_sessi
 from ...common.timeslice_ic_current import resolve_ic_current_columns
 from ..context import LoadOptions, SessionContext
 from ..registry import DataSourceSpec, register
-from ..types import GRANULARITY_ENERGY_BINNED, REFERENCE_ISO
+from ..types import (
+    DATA_SOURCE_TIMESLICE_ISO,
+    GRANULARITY_ENERGY_BINNED,
+)
 
 SOURCE_IC_CURRENT = "ic_current"
 
@@ -38,8 +41,8 @@ SPEC = register(
     DataSourceSpec(
         id=SOURCE_IC_CURRENT,
         label="IC Current",
-        granularities=frozenset({GRANULARITY_ENERGY_BINNED}),
-        reference_frames=frozenset({REFERENCE_ISO}),
+        data_sources=frozenset({DATA_SOURCE_TIMESLICE_ISO}),
+        granularity_for={DATA_SOURCE_TIMESLICE_ISO: GRANULARITY_ENERGY_BINNED},
         supports_bg_subtract=True,
         supports_beam_filter=False,
         probe=probe_ic_current,

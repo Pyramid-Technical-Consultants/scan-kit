@@ -6,11 +6,9 @@ import numpy as np
 import pytest
 
 from scan_kit.data import (
-    GRANULARITY_SPOT,
-    GRANULARITY_TIMESLICE_SAMPLE,
+    DATA_SOURCE_SPOT_CHAMBER,
+    DATA_SOURCE_SPOT_ISO,
     LoadOptions,
-    REFERENCE_CHAMBER,
-    REFERENCE_ISO,
     REGISTRY,
     SessionContext,
     get_spec,
@@ -24,14 +22,12 @@ FAST_SESSION = G3_SESSION
 SLOW_SESSION = G2_SESSION
 
 
-def _probe_load_cases(session_id: str) -> tuple[tuple[str, str, str, str], ...]:
-    cases: list[tuple[str, str, str, str]] = []
+def _probe_load_cases(session_id: str) -> tuple[tuple[str, str, str], ...]:
+    cases: list[tuple[str, str, str]] = []
     for source_id in sorted(REGISTRY.keys()):
         spec = get_spec(source_id)
-        ref_frames = sorted(spec.reference_frames) if spec.reference_frames else (REFERENCE_ISO,)
-        for granularity in sorted(spec.granularities):
-            for reference_frame in ref_frames:
-                cases.append((session_id, source_id, granularity, reference_frame))
+        for data_source in sorted(spec.data_sources):
+            cases.append((session_id, source_id, data_source))
     return tuple(cases)
 
 
@@ -40,17 +36,16 @@ SLOW_PROBE_LOAD_CASES = _probe_load_cases(SLOW_SESSION)
 
 
 @pytest.mark.parametrize(
-    ("session_id", "source_id", "granularity", "reference_frame"),
+    ("session_id", "source_id", "data_source"),
     FAST_PROBE_LOAD_CASES,
 )
 def test_probe_matches_load_g3(
     session_id: str,
     source_id: str,
-    granularity: str,
-    reference_frame: str,
+    data_source: str,
 ) -> None:
     ctx = SessionContext(session_id, str(TEST_DATA))
-    opts = LoadOptions(granularity=granularity, reference_frame=reference_frame)
+    opts = LoadOptions(data_source=data_source)  # type: ignore[arg-type]
     available = probe(source_id, ctx, opts)
     payload = load(source_id, ctx, opts)
     assert available == (payload is not None)
@@ -58,17 +53,16 @@ def test_probe_matches_load_g3(
 
 @pytest.mark.slow
 @pytest.mark.parametrize(
-    ("session_id", "source_id", "granularity", "reference_frame"),
+    ("session_id", "source_id", "data_source"),
     SLOW_PROBE_LOAD_CASES,
 )
 def test_probe_matches_load_g2(
     session_id: str,
     source_id: str,
-    granularity: str,
-    reference_frame: str,
+    data_source: str,
 ) -> None:
     ctx = SessionContext(session_id, str(TEST_DATA))
-    opts = LoadOptions(granularity=granularity, reference_frame=reference_frame)
+    opts = LoadOptions(data_source=data_source)  # type: ignore[arg-type]
     available = probe(source_id, ctx, opts)
     payload = load(source_id, ctx, opts)
     assert available == (payload is not None)
@@ -76,15 +70,15 @@ def test_probe_matches_load_g2(
 
 @pytest.mark.parametrize("session_id", (FAST_SESSION,))
 @pytest.mark.parametrize(
-    "granularity",
-    [GRANULARITY_SPOT, GRANULARITY_TIMESLICE_SAMPLE],
+    "data_source",
+    [DATA_SOURCE_SPOT_ISO, DATA_SOURCE_SPOT_CHAMBER],
 )
 def test_ic12_load_shape_when_available(
     session_id: str,
-    granularity: str,
+    data_source: str,
 ) -> None:
     ctx = SessionContext(session_id, str(TEST_DATA))
-    opts = LoadOptions(granularity=granularity, reference_frame=REFERENCE_ISO)
+    opts = LoadOptions(data_source=data_source)  # type: ignore[arg-type]
     payload = load(SOURCE_IC12_POS_DIFF, ctx, opts)
     if payload is None:
         pytest.skip("IC12 data unavailable")
@@ -94,18 +88,18 @@ def test_ic12_load_shape_when_available(
 
 
 @pytest.mark.parametrize("session_id", (FAST_SESSION,))
-def test_ic12_spot_reference_frame_is_applied(session_id: str) -> None:
+def test_ic12_spot_iso_vs_chamber_data_sources_differ(session_id: str) -> None:
     ctx = SessionContext(session_id, str(TEST_DATA))
     iso = load(
         SOURCE_IC12_POS_DIFF,
         ctx,
-        LoadOptions(granularity=GRANULARITY_SPOT, reference_frame=REFERENCE_ISO),
+        LoadOptions(data_source=DATA_SOURCE_SPOT_ISO),
     )
     chamber = load(
         SOURCE_IC12_POS_DIFF,
         ctx,
-        LoadOptions(granularity=GRANULARITY_SPOT, reference_frame=REFERENCE_CHAMBER),
+        LoadOptions(data_source=DATA_SOURCE_SPOT_CHAMBER),
     )
     if iso is None or chamber is None:
-        pytest.skip("IC12 spot data unavailable for both reference frames")
+        pytest.skip("IC12 spot data unavailable for both data sources")
     assert iso["ic1_x"].shape == chamber["ic1_x"].shape

@@ -9,10 +9,30 @@ REFERENCE_CHAMBER = "chamber"
 
 ReferenceFrameKind = Literal["iso", "chamber"]
 
-DATA_SOURCE_SPOT = "spot"
-DATA_SOURCE_TIMESLICE = "timeslice"
+DATA_SOURCE_SPOT_ISO = "spot_iso"
+DATA_SOURCE_SPOT_CHAMBER = "spot_chamber"
+DATA_SOURCE_TIMESLICE_ISO = "timeslice_iso"
+DATA_SOURCE_TIMESLICE_CHAMBER = "timeslice_chamber"
 
-DataSourceKind = Literal["spot", "timeslice"]
+DataSourceKind = Literal[
+    "spot_iso",
+    "spot_chamber",
+    "timeslice_iso",
+    "timeslice_chamber",
+]
+
+ALL_DATA_SOURCES: tuple[DataSourceKind, ...] = (
+    DATA_SOURCE_SPOT_ISO,
+    DATA_SOURCE_SPOT_CHAMBER,
+    DATA_SOURCE_TIMESLICE_ISO,
+    DATA_SOURCE_TIMESLICE_CHAMBER,
+)
+
+# Coarse buckets for distribution modes (spot vs timeslice, any reference frame).
+COARSE_SOURCE_SPOT = "spot"
+COARSE_SOURCE_TIMESLICE = "timeslice"
+
+CoarseDataSourceKind = Literal["spot", "timeslice"]
 
 GRANULARITY_SPOT = "spot"
 GRANULARITY_TIMESLICE_SAMPLE = "timeslice_sample"
@@ -33,3 +53,31 @@ GranularityKind = Literal[
 
 def option_key(source: DataSourceKind, option_id: str) -> str:
     return f"{source}:{option_id}"
+
+
+def data_source_is_timeslice(source: DataSourceKind) -> bool:
+    return source.startswith("timeslice")
+
+
+def coarse_data_source(source: DataSourceKind) -> CoarseDataSourceKind:
+    return COARSE_SOURCE_TIMESLICE if data_source_is_timeslice(source) else COARSE_SOURCE_SPOT
+
+
+def data_source_granularity(source: DataSourceKind) -> GranularityKind:
+    if source.startswith("spot"):
+        return GRANULARITY_SPOT
+    return GRANULARITY_TIMESLICE_SAMPLE
+
+
+def data_source_reference_frame(source: DataSourceKind) -> ReferenceFrameKind:
+    return REFERENCE_CHAMBER if source.endswith("_chamber") else REFERENCE_ISO
+
+
+def data_source_label(source: DataSourceKind) -> str:
+    labels: dict[DataSourceKind, str] = {
+        DATA_SOURCE_SPOT_ISO: "Spot — Isocenter",
+        DATA_SOURCE_SPOT_CHAMBER: "Spot — Chamber",
+        DATA_SOURCE_TIMESLICE_ISO: "Timeslice — Isocenter",
+        DATA_SOURCE_TIMESLICE_CHAMBER: "Timeslice — Chamber",
+    }
+    return labels[source]

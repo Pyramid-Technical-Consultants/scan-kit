@@ -15,10 +15,12 @@ from ..reference_frame import (
 )
 from ..registry import DataSourceSpec, register
 from ..types import (
+    DATA_SOURCE_SPOT_ISO,
+    DATA_SOURCE_SPOT_CHAMBER,
+    DATA_SOURCE_TIMESLICE_ISO,
+    DATA_SOURCE_TIMESLICE_CHAMBER,
     GRANULARITY_SPOT,
     GRANULARITY_TIMESLICE_SAMPLE,
-    REFERENCE_CHAMBER,
-    REFERENCE_ISO,
 )
 from ._common import probe_spot_positions_with_plan
 
@@ -115,8 +117,12 @@ SPEC = register(
     DataSourceSpec(
         id=SOURCE_POSITION,
         label="Position",
-        granularities=frozenset({GRANULARITY_SPOT, GRANULARITY_TIMESLICE_SAMPLE}),
-        reference_frames=frozenset({REFERENCE_ISO, REFERENCE_CHAMBER}),
+        data_sources=frozenset({
+            DATA_SOURCE_SPOT_ISO,
+            DATA_SOURCE_SPOT_CHAMBER,
+            DATA_SOURCE_TIMESLICE_ISO,
+            DATA_SOURCE_TIMESLICE_CHAMBER,
+        }),
         supports_bg_subtract=True,
         supports_beam_filter=True,
         probe=probe_position,

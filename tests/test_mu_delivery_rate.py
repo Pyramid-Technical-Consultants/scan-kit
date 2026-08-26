@@ -16,7 +16,7 @@ from scan_kit.views.binned_summary_data import (
     load_sessions_dose_rate,
     probe_view_option_availability,
 )
-from scan_kit.views.unified_catalog import DATA_SOURCE_SPOT, option_key
+from scan_kit.data import DATA_SOURCE_SPOT_ISO, option_key
 from tests.conftest import G3_SESSION, TEST_DATA
 
 
@@ -36,6 +36,7 @@ def test_load_session_mu_delivery_rates_g3() -> None:
 def test_dose_rate_available_in_binned_summary_probe(
     g3_dose_rate,
     g3_spot_summary,
+    g3_source_availability,
 ) -> None:
     if not g3_dose_rate:
         return
@@ -44,8 +45,9 @@ def test_dose_rate_available_in_binned_summary_probe(
         [G3_SESSION],
         str(TEST_DATA),
         spot_data=g3_spot_summary,
+        registry_availability=g3_source_availability,
     )
-    assert availability.get(option_key(DATA_SOURCE_SPOT, Y_DOSE_RATE))
+    assert availability.get(option_key(DATA_SOURCE_SPOT_ISO, Y_DOSE_RATE))
 
 
 def test_dose_rate_preset_exists() -> None:

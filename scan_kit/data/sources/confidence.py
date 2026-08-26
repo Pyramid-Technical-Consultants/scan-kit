@@ -13,7 +13,7 @@ from ...common.timeslice_confidence import (
 )
 from ..context import LoadOptions, SessionContext
 from ..registry import DataSourceSpec, register
-from ..types import GRANULARITY_TIMESLICE_SAMPLE, REFERENCE_ISO
+from ..types import DATA_SOURCE_TIMESLICE_ISO, GRANULARITY_TIMESLICE_SAMPLE
 
 SOURCE_CONFIDENCE = "confidence"
 
@@ -49,8 +49,7 @@ SPEC = register(
     DataSourceSpec(
         id=SOURCE_CONFIDENCE,
         label="Confidence Correlations",
-        granularities=frozenset({GRANULARITY_TIMESLICE_SAMPLE}),
-        reference_frames=frozenset({REFERENCE_ISO}),
+        data_sources=frozenset({DATA_SOURCE_TIMESLICE_ISO}),
         supports_bg_subtract=True,
         supports_beam_filter=False,
         probe=probe_confidence,

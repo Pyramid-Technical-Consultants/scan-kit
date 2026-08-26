@@ -7,13 +7,12 @@ from typing import Literal
 
 from ..common.data_filter import FILTER_ALL, FILTER_BEAM_BOTH, DataFilterSelection
 from .unified_catalog import (
-    DATA_SOURCE_SPOT,
-    DATA_SOURCE_TIMESLICE,
-    REFERENCE_CHAMBER,
-    REFERENCE_ISO,
+    DATA_SOURCE_SPOT_ISO,
+    DATA_SOURCE_SPOT_CHAMBER,
+    DATA_SOURCE_TIMESLICE_ISO,
+    DATA_SOURCE_TIMESLICE_CHAMBER,
     UnifiedViewOption,
     option_key,
-    ReferenceFrameKind,
 )
 
 Glyph = Literal["box", "violin", "mean"]
@@ -66,7 +65,7 @@ class YGroupDef:
     series: tuple[SeriesDef, ...]
     default_glyph: Glyph
     trend_unit: str
-    sources: tuple[str, ...] = (DATA_SOURCE_SPOT,)
+    sources: tuple[str, ...] = (DATA_SOURCE_SPOT_ISO,)
     supports_data_filter: bool = True
 
 
@@ -133,7 +132,7 @@ Y_GROUPS: tuple[YGroupDef, ...] = (
         ),
         GLYPH_MEAN,
         "%/unit",
-        (DATA_SOURCE_TIMESLICE,),
+        (DATA_SOURCE_TIMESLICE_ISO,),
         supports_data_filter=False,
     ),
     YGroupDef(
@@ -146,7 +145,7 @@ Y_GROUPS: tuple[YGroupDef, ...] = (
         ),
         GLYPH_BOX,
         "nA/unit",
-        (DATA_SOURCE_TIMESLICE,),
+        (DATA_SOURCE_TIMESLICE_ISO,),
     ),
     YGroupDef(
         Y_POSITION_ERROR,
@@ -159,7 +158,7 @@ Y_GROUPS: tuple[YGroupDef, ...] = (
         ),
         GLYPH_VIOLIN,
         "mm/unit",
-        (DATA_SOURCE_SPOT, DATA_SOURCE_TIMESLICE),
+        (DATA_SOURCE_SPOT_ISO, DATA_SOURCE_TIMESLICE_ISO),
     ),
     YGroupDef(
         Y_SIGMA,
@@ -172,7 +171,7 @@ Y_GROUPS: tuple[YGroupDef, ...] = (
         ),
         GLYPH_VIOLIN,
         "mm/unit",
-        (DATA_SOURCE_SPOT, DATA_SOURCE_TIMESLICE),
+        (DATA_SOURCE_SPOT_ISO, DATA_SOURCE_SPOT_CHAMBER, DATA_SOURCE_TIMESLICE_ISO),
     ),
     YGroupDef(
         Y_IC12_POS_DIFF,
@@ -183,7 +182,12 @@ Y_GROUPS: tuple[YGroupDef, ...] = (
         ),
         GLYPH_VIOLIN,
         "mm/unit",
-        (DATA_SOURCE_SPOT, DATA_SOURCE_TIMESLICE),
+        (
+            DATA_SOURCE_SPOT_ISO,
+            DATA_SOURCE_SPOT_CHAMBER,
+            DATA_SOURCE_TIMESLICE_ISO,
+            DATA_SOURCE_TIMESLICE_CHAMBER,
+        ),
     ),
     YGroupDef(
         Y_SPOT_TIME,
@@ -274,7 +278,7 @@ VIEW_OPTIONS: tuple[UnifiedViewOption, ...] = tuple(
 @dataclass
 class BinnedSummaryConfig:
     y_group: str = Y_DOSE_RATIO
-    source: str = DATA_SOURCE_SPOT
+    source: str = DATA_SOURCE_SPOT_ISO
     x_param: str = X_ENERGY
     glyph: Glyph = GLYPH_VIOLIN
     show_trend: bool = True
@@ -284,9 +288,6 @@ class BinnedSummaryConfig:
     n_bins: int | None = None
     domain_filter: str = FILTER_ALL
     beam_state_filter: str = FILTER_BEAM_BOTH
-    reference_frame: ReferenceFrameKind = REFERENCE_ISO
-
-    @property
     def data_filter(self) -> DataFilterSelection:
         return DataFilterSelection(
             domain_filter=self.domain_filter,

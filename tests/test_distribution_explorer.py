@@ -5,7 +5,7 @@ from __future__ import annotations
 import matplotlib.pyplot as plt
 import pytest
 
-from scan_kit.views.unified_catalog import REFERENCE_CHAMBER, REFERENCE_ISO
+from scan_kit.data.types import DATA_SOURCE_SPOT_CHAMBER, DATA_SOURCE_SPOT_ISO
 from scan_kit.common.settings import ViewSettings
 from scan_kit.common.session_ic_xy import SessionIcXYData, ic12_position_diff
 from scan_kit.views.distribution_catalog import (
@@ -259,20 +259,20 @@ def test_ic12_pos_diff_timeslice_loads_for_g3(g3_distribution_availability) -> N
     assert data
 
 
-def test_reference_frame_affects_spot_sigma_cache(g3_distribution_availability) -> None:
+def test_spot_sigma_data_sources_differ_in_cache(g3_distribution_availability) -> None:
     if not g3_distribution_availability.get(MODE_SIGMA_SPOT, False):
         pytest.skip("spot sigma unavailable in fixture")
     iso = load_sessions_for_mode(
         MODE_SIGMA_SPOT,
         [G3_SESSION],
         str(TEST_DATA),
-        reference_frame=REFERENCE_ISO,
+        data_source=DATA_SOURCE_SPOT_ISO,
     )
     chamber = load_sessions_for_mode(
         MODE_SIGMA_SPOT,
         [G3_SESSION],
         str(TEST_DATA),
-        reference_frame=REFERENCE_CHAMBER,
+        data_source=DATA_SOURCE_SPOT_CHAMBER,
     )
     assert iso and chamber
 

@@ -10,7 +10,7 @@ from ...common.timeslice_gaussian_fit_filter_coverage import (
 )
 from ..context import LoadOptions, SessionContext
 from ..registry import DataSourceSpec, register
-from ..types import GRANULARITY_SESSION_COMPUTE, REFERENCE_ISO
+from ..types import DATA_SOURCE_TIMESLICE_ISO, GRANULARITY_SESSION_COMPUTE
 
 SOURCE_GAUSSIAN_FIT_FILTER = "gaussian_fit_filter"
 
@@ -48,8 +48,8 @@ SPEC = register(
     DataSourceSpec(
         id=SOURCE_GAUSSIAN_FIT_FILTER,
         label="Gaussian Fit Filter Coverage",
-        granularities=frozenset({GRANULARITY_SESSION_COMPUTE}),
-        reference_frames=frozenset({REFERENCE_ISO}),
+        data_sources=frozenset({DATA_SOURCE_TIMESLICE_ISO}),
+        granularity_for={DATA_SOURCE_TIMESLICE_ISO: GRANULARITY_SESSION_COMPUTE},
         supports_bg_subtract=True,
         supports_beam_filter=False,
         probe=probe_gaussian_fit_filter,

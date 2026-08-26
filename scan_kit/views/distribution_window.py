@@ -19,8 +19,8 @@ from .distribution_catalog import (
     PRESET_BY_ID,
     VIEW_OPTIONS,
     DistributionConfig,
+    default_data_source_for_mode,
     metric_source_for_mode,
-    metric_supports_reference_frame,
     resolve_mode_id,
 )
 from .distribution_data import (
@@ -36,18 +36,16 @@ from .plot_view_shell import (
     new_headless_figure,
     run_view_window,
 )
+from ..data.types import data_source_is_timeslice
 from .unified_catalog import (
-    DATA_SOURCE_SPOT,
-    DATA_SOURCE_TIMESLICE,
+    DATA_SOURCE_SPOT_ISO,
     DISTRIBUTION_PLOT_STYLES,
     PLOT_STYLE_CONTOUR,
-    REFERENCE_ISO,
 )
 from .unified_view_controls import (
     DataFilterPanel,
     DataSourceOptionPanel,
     PlotStylePanel,
-    ReferenceFramePanel,
     sync_data_filter_panel,
 )
 
@@ -85,7 +83,6 @@ class DistributionExplorerWindow(PlotViewWindow):
         self._mode_available = probe_mode_availability(self._session_ids, self._base_dir)
         self._option_panel: DataSourceOptionPanel | None = None
         self._plot_style_panel: PlotStylePanel | None = None
-        self._reference_panel: ReferenceFramePanel | None = None
         self._filter_panel: DataFilterPanel | None = None
         self._refresh_generation = 0
 
@@ -137,7 +134,7 @@ class DistributionExplorerWindow(PlotViewWindow):
             VIEW_OPTIONS,
             self._mode_available,
             group_title="Distribution",
-            preferred_source=DATA_SOURCE_SPOT,
+            preferred_source=DATA_SOURCE_SPOT_ISO,
         )
         layout.addWidget(self._option_panel)
 
@@ -155,12 +152,6 @@ class DistributionExplorerWindow(PlotViewWindow):
         self._plot_style_panel.add_checkbox(_PANEL_IC1, "IC1", checked=True)
         self._plot_style_panel.add_checkbox(_PANEL_IC2, "IC2", checked=True)
         layout.addWidget(self._plot_style_panel)
-
-        self._reference_panel = ReferenceFramePanel(
-            on_selection_changed=self._schedule_refresh,
-            current=REFERENCE_ISO,
-        )
-        layout.addWidget(self._reference_panel)
 
         self._filter_panel = DataFilterPanel(
             on_selection_changed=self._schedule_refresh,
@@ -194,14 +185,10 @@ class DistributionExplorerWindow(PlotViewWindow):
                 cutoff = float(spin_val)
         cutoff = normalize_contour_cutoff_percentile(cutoff)
         panel = self._plot_style_panel
-        ref_panel = self._reference_panel
         return DistributionConfig(
             mode=mode,
             plot_style=plot_style or PLOT_STYLE_CONTOUR,  # type: ignore[arg-type]
             contour_cutoff_percentile=cutoff,
-            reference_frame=(
-                ref_panel.selected_key() if ref_panel is not None else REFERENCE_ISO
-            ),
             domain_filter=(
                 self._filter_panel.selected_domain()
                 if self._filter_panel is not None
@@ -223,7 +210,12 @@ class DistributionExplorerWindow(PlotViewWindow):
         if mode is None:
             return True, False
         supports_filter = mode.supports_data_filter
-        has_beam_state = supports_filter and mode.source == DATA_SOURCE_TIMESLICE
+        data_source = (
+            self._option_panel.selected_source()
+            if self._option_panel is not None
+            else DATA_SOURCE_SPOT_ISO
+        )
+        has_beam_state = supports_filter and data_source_is_timeslice(data_source)
         return supports_filter, has_beam_state
 
     def _sync_data_filter_for_mode(self) -> None:
@@ -267,27 +259,16 @@ class DistributionExplorerWindow(PlotViewWindow):
             show_ic_panels = supports_style and metric_id != "ic12_pos_diff"
             for option_id in (_PANEL_PLAN, _PANEL_IC1, _PANEL_IC2):
                 self._plot_style_panel.set_option_visible(option_id, show_ic_panels)
-        if self._reference_panel is not None:
-            metric_id = (
-                self._option_panel.selected_id()
-                if self._option_panel is not None
-                else None
-            )
-            source = (
-                self._option_panel.selected_source()
-                if self._option_panel is not None
-                else DATA_SOURCE_SPOT
-            )
-            supports_ref = (
-                metric_id is not None
-                and metric_supports_reference_frame(metric_id, source)  # type: ignore[arg-type]
-            )
-            self._reference_panel.set_enabled(supports_ref)
+
+    def _selected_data_source(self):
+        if self._option_panel is None:
+            return DATA_SOURCE_SPOT_ISO
+        return self._option_panel.selected_source()
 
     def _cache_key_for_config(self, config: DistributionConfig) -> tuple:
         return (
             config.mode,
-            config.reference_frame,
+            self._selected_data_source(),
             self._settings.bg_subtract if self._settings else False,
         )
 
@@ -311,8 +292,12 @@ class DistributionExplorerWindow(PlotViewWindow):
         preset = PRESET_BY_ID[preset_id]
         mapping = metric_source_for_mode(preset.mode)
         if self._option_panel is not None and mapping is not None:
-            metric_id, source = mapping
-            self._option_panel.select_id(metric_id, source=source)
+            metric_id, _coarse = mapping
+            data_source = default_data_source_for_mode(
+                preset.mode, self._mode_available,
+            )
+            if data_source is not None:
+                self._option_panel.select_id(metric_id, source=data_source)
         self._schedule_refresh()
 
     def _persist_contour_cutoff(self, cutoff: float) -> None:
@@ -351,7 +336,7 @@ class DistributionExplorerWindow(PlotViewWindow):
         session_ids = list(self._session_ids)
         base_dir = self._base_dir
         settings = self._settings
-        reference_frame = config.reference_frame
+        data_source = self._selected_data_source()
 
         def loader() -> tuple[int, tuple, dict[str, Any]]:
             data = load_sessions_for_mode(
@@ -359,7 +344,7 @@ class DistributionExplorerWindow(PlotViewWindow):
                 session_ids,
                 base_dir,
                 settings=settings,
-                reference_frame=reference_frame,
+                data_source=data_source,
             )
             return gen, cache_key, data
 

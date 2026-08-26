@@ -165,11 +165,11 @@ def g2_timeline_catalog(test_data_dir: str) -> dict:
 
 @pytest.fixture(scope="session")
 def g3_spot_summary_chamber(test_data_dir: str) -> dict[str, dict]:
+    from scan_kit.data.types import DATA_SOURCE_SPOT_CHAMBER
     from scan_kit.views.binned_summary_data import load_sessions_summary
-    from scan_kit.views.unified_catalog import REFERENCE_CHAMBER
 
     return load_sessions_summary(
-        [G3_SESSION], test_data_dir, reference_frame=REFERENCE_CHAMBER,
+        [G3_SESSION], test_data_dir, data_source=DATA_SOURCE_SPOT_CHAMBER,
     )
 
 

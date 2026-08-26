@@ -21,9 +21,10 @@ from ...common.timeslice_table import load_energy_tagged_table
 from ..context import LoadOptions, SessionContext
 from ..registry import DataSourceSpec, register
 from ..types import (
+    DATA_SOURCE_SPOT_ISO,
+    DATA_SOURCE_TIMESLICE_ISO,
     GRANULARITY_SPOT,
     GRANULARITY_TIMESLICE_SAMPLE,
-    REFERENCE_ISO,
 )
 from ._common import probe_spot_positions_with_plan, probe_timeslice_session_arrays
 
@@ -123,8 +124,10 @@ SPEC = register(
     DataSourceSpec(
         id=SOURCE_POSITION_ERROR,
         label="Position Error",
-        granularities=frozenset({GRANULARITY_SPOT, GRANULARITY_TIMESLICE_SAMPLE}),
-        reference_frames=frozenset({REFERENCE_ISO}),
+        data_sources=frozenset({
+            DATA_SOURCE_SPOT_ISO,
+            DATA_SOURCE_TIMESLICE_ISO,
+        }),
         supports_bg_subtract=True,
         supports_beam_filter=True,
         probe=probe_position_error,
