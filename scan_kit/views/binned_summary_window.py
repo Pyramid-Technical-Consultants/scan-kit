@@ -17,8 +17,8 @@ from PySide6.QtWidgets import (
 from ..common import ViewSettings
 from ..common.data_filter import FILTER_ALL, FILTER_BEAM_BOTH, FILTER_BEAM_ON
 from .binned_summary_catalog import (
-    DATA_SOURCE_SPOT,
-    DATA_SOURCE_TIMESLICE,
+    DATA_SOURCE_SPOT_ISO,
+    DATA_SOURCE_TIMESLICE_ISO,
     GLYPH_VIOLIN,
     PRESETS,
     PRESET_BY_ID,
@@ -33,7 +33,7 @@ from .binned_summary_catalog import (
     Y_GROUP_BY_ID,
     BinnedSummaryConfig,
 )
-from .distribution_catalog import metric_supports_reference_frame
+from ..data.types import data_source_is_timeslice
 from .binned_summary_data import (
     available_x_params_for_source,
     default_config,
@@ -51,12 +51,11 @@ from .plot_view_shell import (
     make_side_panel_column,
     run_view_window,
 )
-from .unified_catalog import BINNED_PLOT_STYLES, REFERENCE_ISO, option_key
+from .unified_catalog import BINNED_PLOT_STYLES, option_key
 from .unified_view_controls import (
     DataFilterPanel,
     DataSourceOptionPanel,
     PlotStylePanel,
-    ReferenceFramePanel,
     sync_data_filter_panel,
 )
 
@@ -91,11 +90,10 @@ class BinnedSummaryWindow(PlotViewWindow):
         self._session_data_cache: dict[tuple, dict[str, dict]] = {}
         self._registry_y_cache: dict[str, dict[str, dict]] = {}
         self._spot_data = load_sessions_for_source(
-            self._session_ids, self._base_dir, DATA_SOURCE_SPOT, settings=settings,
+            self._session_ids, self._base_dir, DATA_SOURCE_SPOT_ISO, settings=settings,
         )
-        self._session_data_cache[
-            (DATA_SOURCE_SPOT, REFERENCE_ISO, False)
-        ] = self._spot_data
+        bg = settings.bg_subtract if settings else False
+        self._session_data_cache[(DATA_SOURCE_SPOT_ISO, bg)] = self._spot_data
         self._registry_availability = probe_sessions(self._session_ids, self._base_dir)
         self._option_availability = probe_view_option_availability(
             self._session_ids,
@@ -108,7 +106,6 @@ class BinnedSummaryWindow(PlotViewWindow):
         self._updating = False
         self._metric_panel: DataSourceOptionPanel | None = None
         self._plot_style_panel: PlotStylePanel | None = None
-        self._reference_panel: ReferenceFramePanel | None = None
         self._filter_panel: DataFilterPanel | None = None
         self._refresh_timer = QTimer(self)
         self._refresh_timer.setSingleShot(True)
@@ -121,7 +118,7 @@ class BinnedSummaryWindow(PlotViewWindow):
         else:
             cfg = default_config(
                 self._spot_data,
-                source=DATA_SOURCE_SPOT,
+                source=DATA_SOURCE_SPOT_ISO,
                 option_availability=self._option_availability,
             )
             self._set_controls_from_config(cfg)
@@ -152,7 +149,7 @@ class BinnedSummaryWindow(PlotViewWindow):
             VIEW_OPTIONS,
             self._option_availability,
             group_title="Y Metric",
-            preferred_source=DATA_SOURCE_SPOT,
+            preferred_source=DATA_SOURCE_SPOT_ISO,
         )
         layout.addWidget(self._metric_panel)
 
@@ -177,12 +174,6 @@ class BinnedSummaryWindow(PlotViewWindow):
         self._plot_style_panel.add_checkbox(_OPT_FLIERS, "Show Box Outliers")
         layout.addWidget(self._plot_style_panel)
 
-        self._reference_panel = ReferenceFramePanel(
-            on_selection_changed=self._on_reference_frame_changed,
-            current=REFERENCE_ISO,
-        )
-        layout.addWidget(self._reference_panel)
-
         self._filter_panel = DataFilterPanel(
             on_selection_changed=self._on_controls_changed,
             domain_current=FILTER_ALL,
@@ -190,12 +181,7 @@ class BinnedSummaryWindow(PlotViewWindow):
         )
         layout.addWidget(self._filter_panel)
 
-        if not (
-            self._spot_data
-            or self._dose_rate_data
-            or self._current_ratio_data
-            or self._ic_current_data
-        ):
+        if not self._spot_data and not self._option_availability:
             note = QLabel("No summary data found for the selected sessions.")
             note.setWordWrap(True)
             layout.addWidget(note)
@@ -203,32 +189,9 @@ class BinnedSummaryWindow(PlotViewWindow):
         layout.addStretch(1)
         return panel
 
-    def _reference_frame(self):
-        if self._reference_panel is None:
-            return REFERENCE_ISO
-        return self._reference_panel.selected_key()
-
     def _session_cache_key(self, source: str) -> tuple:
         bg = self._settings.bg_subtract if self._settings else False
-        return (source, self._reference_frame(), bg)
-
-    def _on_reference_frame_changed(self) -> None:
-        if self._updating:
-            return
-        self._session_data_cache.pop(self._session_cache_key(DATA_SOURCE_SPOT), None)
-        spot = self._session_data()
-        self._spot_data = spot
-        self._option_availability = probe_view_option_availability(
-            self._session_ids,
-            self._base_dir,
-            spot_data=spot,
-            registry_availability=self._registry_availability,
-            settings=self._settings,
-        )
-        if self._metric_panel is not None:
-            self._metric_panel.update_availability(self._option_availability)
-        self._refresh_x_combo()
-        self._on_controls_changed()
+        return (source, bg)
 
     def _load_registry_y_group(self, y_group: str) -> dict[str, dict]:
         cached = self._registry_y_cache.get(y_group)
@@ -252,34 +215,32 @@ class BinnedSummaryWindow(PlotViewWindow):
     def _session_data_for_y_group(self, y_group: str) -> dict[str, dict]:
         if y_group in {Y_DOSE_RATE, Y_CURRENT_RATIO, Y_IC_CURRENT}:
             return self._load_registry_y_group(y_group)
-        group = Y_GROUP_BY_ID.get(y_group)
-        if group is not None and group.sources[0] == DATA_SOURCE_TIMESLICE:
-            cache_key = self._session_cache_key(DATA_SOURCE_TIMESLICE)
-            cached = self._session_data_cache.get(cache_key)
-            if cached is not None:
-                return cached
-            loaded = load_sessions_for_source(
-                self._session_ids,
-                self._base_dir,
-                DATA_SOURCE_TIMESLICE,
-                settings=self._settings,
-                reference_frame=self._reference_frame(),
-            )
-            self._session_data_cache[cache_key] = loaded
-            return loaded
-        return self._spot_session_data()
-
-    def _spot_session_data(self) -> dict[str, dict]:
-        cache_key = self._session_cache_key(DATA_SOURCE_SPOT)
+        source = self._current_source()
+        cache_key = self._session_cache_key(source)
         cached = self._session_data_cache.get(cache_key)
         if cached is not None:
             return cached
         loaded = load_sessions_for_source(
             self._session_ids,
             self._base_dir,
-            DATA_SOURCE_SPOT,
+            source,  # type: ignore[arg-type]
             settings=self._settings,
-            reference_frame=self._reference_frame(),
+        )
+        self._session_data_cache[cache_key] = loaded
+        if not data_source_is_timeslice(source):  # type: ignore[arg-type]
+            self._spot_data = loaded
+        return loaded
+
+    def _spot_session_data(self) -> dict[str, dict]:
+        cache_key = self._session_cache_key(DATA_SOURCE_SPOT_ISO)
+        cached = self._session_data_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        loaded = load_sessions_for_source(
+            self._session_ids,
+            self._base_dir,
+            DATA_SOURCE_SPOT_ISO,
+            settings=self._settings,
         )
         self._session_data_cache[cache_key] = loaded
         self._spot_data = loaded
@@ -304,7 +265,7 @@ class BinnedSummaryWindow(PlotViewWindow):
 
     def _current_source(self) -> str:
         if self._metric_panel is None:
-            return DATA_SOURCE_SPOT
+            return DATA_SOURCE_SPOT_ISO
         return self._metric_panel.selected_source()
 
     def _session_data(self) -> dict[str, dict]:
@@ -349,7 +310,6 @@ class BinnedSummaryWindow(PlotViewWindow):
             else None
         )
         panel = self._plot_style_panel
-        ref_panel = self._reference_panel
         return BinnedSummaryConfig(
             y_group=y_group or PRESETS[0].y_group,
             source=self._current_source(),
@@ -359,9 +319,6 @@ class BinnedSummaryWindow(PlotViewWindow):
             show_hist=panel.is_checked(_OPT_HIST) if panel else False,
             show_corr=panel.is_checked(_OPT_CORR) if panel else False,
             show_fliers=panel.is_checked(_OPT_FLIERS) if panel else False,
-            reference_frame=(
-                ref_panel.selected_key() if ref_panel is not None else REFERENCE_ISO
-            ),
             domain_filter=(
                 self._filter_panel.selected_domain()
                 if self._filter_panel is not None
@@ -424,7 +381,7 @@ class BinnedSummaryWindow(PlotViewWindow):
         supports_filter = group.supports_data_filter
         has_beam_state = (
             supports_filter
-            and self._current_source() == DATA_SOURCE_TIMESLICE
+            and data_source_is_timeslice(self._current_source())  # type: ignore[arg-type]
         )
         return supports_filter, has_beam_state
 
@@ -451,18 +408,6 @@ class BinnedSummaryWindow(PlotViewWindow):
 
     def _refresh_plot(self) -> None:
         config = self._read_config()
-        if self._reference_panel is not None:
-            metric_id = (
-                self._metric_panel.selected_id()
-                if self._metric_panel is not None
-                else None
-            )
-            source = self._current_source()
-            supports_ref = (
-                metric_id is not None
-                and metric_supports_reference_frame(metric_id, source)  # type: ignore[arg-type]
-            )
-            self._reference_panel.set_enabled(supports_ref)
         session_data = self._session_data()
         self.setWindowTitle(config.title)
         render_binned_summary(

@@ -45,7 +45,7 @@ from scan_kit.views.binned_summary_data import (
     load_session_timeslice_summary_table,
     load_sessions_summary,
 )
-from scan_kit.views.unified_catalog import DATA_SOURCE_SPOT, DATA_SOURCE_TIMESLICE
+from scan_kit.data import DATA_SOURCE_SPOT_ISO, DATA_SOURCE_TIMESLICE_ISO
 from scan_kit.views.binned_summary_ui import render_binned_summary
 from scan_kit.views.binned_summary_window import BinnedSummaryWindow
 from tests.conftest import G2_SESSION, G3_SESSION, TEST_DATA
@@ -247,11 +247,11 @@ def test_timeslice_summary_table_when_available(g3_timeslice_summary_table) -> N
 
 def test_probe_view_option_availability_includes_timeslice(g3_binned_availability) -> None:
     availability = g3_binned_availability
-    assert any(key.startswith(f"{DATA_SOURCE_SPOT}:") for key in availability)
-    assert any(key.startswith(f"{DATA_SOURCE_TIMESLICE}:") for key in availability)
+    assert any(key.startswith(f"{DATA_SOURCE_SPOT_ISO}:") for key in availability)
+    assert any(key.startswith(f"{DATA_SOURCE_TIMESLICE_ISO}:") for key in availability)
 
 
-def test_spot_sigma_availability_depends_on_reference_frame(
+def test_spot_sigma_availability_depends_on_data_source(
     g3_spot_summary,
     g3_spot_summary_chamber,
 ) -> None:
@@ -262,7 +262,7 @@ def test_spot_sigma_availability_depends_on_reference_frame(
     chamber_has_sigma = Y_SIGMA in available_y_groups(g3_spot_summary_chamber)
     assert iso_has_sigma or chamber_has_sigma
     if iso_has_sigma != chamber_has_sigma:
-        assert True  # reference frame changes which sigma columns are present
+        assert True  # iso vs chamber data sources may differ in sigma column availability
 
 
 def test_position_error_series_when_available(g3_spot_summary) -> None:

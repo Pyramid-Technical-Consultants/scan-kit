@@ -18,10 +18,11 @@ from ..context import LoadOptions, SessionContext
 from ..reference_frame import spot_sigma_prefer_raw
 from ..registry import DataSourceSpec, register
 from ..types import (
+    DATA_SOURCE_SPOT_ISO,
+    DATA_SOURCE_SPOT_CHAMBER,
+    DATA_SOURCE_TIMESLICE_ISO,
     GRANULARITY_SPOT,
     GRANULARITY_TIMESLICE_SAMPLE,
-    REFERENCE_CHAMBER,
-    REFERENCE_ISO,
 )
 from ._common import probe_timeslice_frame
 from ...common.session_source import read_session_csv_columns, resolve_session_source
@@ -138,8 +139,11 @@ SPEC = register(
     DataSourceSpec(
         id=SOURCE_SIGMA,
         label="Sigma",
-        granularities=frozenset({GRANULARITY_SPOT, GRANULARITY_TIMESLICE_SAMPLE}),
-        reference_frames=frozenset({REFERENCE_ISO, REFERENCE_CHAMBER}),
+        data_sources=frozenset({
+            DATA_SOURCE_SPOT_ISO,
+            DATA_SOURCE_SPOT_CHAMBER,
+            DATA_SOURCE_TIMESLICE_ISO,
+        }),
         supports_bg_subtract=True,
         supports_beam_filter=True,
         probe=probe_sigma,

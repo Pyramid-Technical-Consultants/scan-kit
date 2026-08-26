@@ -12,7 +12,10 @@ from ...common.session_source import (
 from ...common.timeslice_ic_current import resolve_ic_current_columns
 from ..context import LoadOptions, SessionContext
 from ..registry import DataSourceSpec, register
-from ..types import GRANULARITY_ENERGY_BINNED, REFERENCE_ISO
+from ..types import (
+    DATA_SOURCE_TIMESLICE_ISO,
+    GRANULARITY_ENERGY_BINNED,
+)
 
 SOURCE_CURRENT_RATIO = "current_ratio"
 
@@ -46,8 +49,8 @@ SPEC = register(
     DataSourceSpec(
         id=SOURCE_CURRENT_RATIO,
         label="Current Ratio",
-        granularities=frozenset({GRANULARITY_ENERGY_BINNED}),
-        reference_frames=frozenset({REFERENCE_ISO}),
+        data_sources=frozenset({DATA_SOURCE_TIMESLICE_ISO}),
+        granularity_for={DATA_SOURCE_TIMESLICE_ISO: GRANULARITY_ENERGY_BINNED},
         supports_bg_subtract=True,
         supports_beam_filter=False,
         probe=probe_current_ratio,

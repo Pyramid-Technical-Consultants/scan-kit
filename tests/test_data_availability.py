@@ -2,10 +2,16 @@
 
 from __future__ import annotations
 
-from scan_kit.data import option_key, REGISTRY, probe_session, probe_sessions
+from scan_kit.data import (
+    DATA_SOURCE_SPOT_ISO,
+    DATA_SOURCE_TIMESLICE_ISO,
+    option_key,
+    REGISTRY,
+    probe_session,
+    probe_sessions,
+)
 from scan_kit.data.sources.dose_rate import SOURCE_DOSE_RATE
 from scan_kit.data.sources.position_error import SOURCE_POSITION_ERROR
-from scan_kit.views.unified_catalog import DATA_SOURCE_SPOT, DATA_SOURCE_TIMESLICE
 from tests.conftest import G3_SESSION, TEST_DATA
 
 
@@ -27,8 +33,8 @@ def test_registry_lists_all_core_sources() -> None:
 
 def test_probe_session_returns_option_keys() -> None:
     avail = probe_session(G3_SESSION, str(TEST_DATA))
-    assert option_key(DATA_SOURCE_SPOT, SOURCE_POSITION_ERROR) in avail
-    assert option_key(DATA_SOURCE_TIMESLICE, SOURCE_POSITION_ERROR) in avail
+    assert option_key(DATA_SOURCE_SPOT_ISO, SOURCE_POSITION_ERROR) in avail
+    assert option_key(DATA_SOURCE_TIMESLICE_ISO, SOURCE_POSITION_ERROR) in avail
 
 
 def test_probe_sessions_matches_single_session() -> None:
@@ -39,6 +45,6 @@ def test_probe_sessions_matches_single_session() -> None:
 
 def test_dose_rate_availability_key() -> None:
     avail = probe_session(G3_SESSION, str(TEST_DATA))
-    key = option_key(DATA_SOURCE_SPOT, SOURCE_DOSE_RATE)
+    key = option_key(DATA_SOURCE_SPOT_ISO, SOURCE_DOSE_RATE)
     assert key in avail
     assert avail[key]

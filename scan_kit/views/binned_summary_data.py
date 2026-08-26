@@ -29,10 +29,9 @@ from ..common import (
     try_load_position_data,
 )
 from .binned_summary_catalog import (
-    DATA_SOURCE_SPOT,
-    DATA_SOURCE_TIMESLICE,
+    DATA_SOURCE_SPOT_ISO,
+    DATA_SOURCE_TIMESLICE_ISO,
     GLYPH_VIOLIN,
-    REFERENCE_ISO,
     X_ENERGY,
     X_PARAMS,
     VIEW_OPTIONS,
@@ -60,14 +59,26 @@ from ..data.sources.ic_current import SOURCE_IC_CURRENT
 from ..data.sources.position_error import SOURCE_POSITION_ERROR
 from ..data.sources.sigma import SOURCE_SIGMA
 from ..data.types import (
+    DATA_SOURCE_SPOT_ISO,
+    DATA_SOURCE_TIMESLICE_ISO,
     GRANULARITY_ENERGY_BINNED,
     GRANULARITY_LAYER,
     GRANULARITY_SPOT,
     GRANULARITY_TIMESLICE_SAMPLE,
+    data_source_is_timeslice,
 )
-from .unified_catalog import DataSourceKind, ReferenceFrameKind, is_option_available, option_key
+from .unified_catalog import DataSourceKind, is_option_available, option_key
 
 _log = logging.getLogger(__name__)
+
+_SUMMARY_TABLE_CACHE: dict[tuple, dict | None] = {}
+_TIMESLICE_SUMMARY_CACHE: dict[tuple, dict | None] = {}
+
+
+def _summary_settings_key(settings: ViewSettings | None) -> tuple:
+    if settings is None:
+        return SessionContext("", "").settings_cache_key()
+    return SessionContext("", "", settings=settings).settings_cache_key()
 
 _REGISTRY_Y_GROUPS = frozenset({
     Y_POSITION_ERROR,
@@ -122,15 +133,13 @@ def _load_sigma_columns(
     session_id: str,
     base_dir: str,
     *,
-    prefer_raw: bool | None = None,
-    reference_frame: ReferenceFrameKind = REFERENCE_ISO,
+    data_source: DataSourceKind,
 ) -> dict | None:
-    del prefer_raw  # reference_frame selects column preference in registry
     return _load_registry_columns(
         SOURCE_SIGMA,
         session_id,
         base_dir,
-        LoadOptions(granularity=GRANULARITY_SPOT, reference_frame=reference_frame),
+        LoadOptions(data_source=data_source),
         sigma_to_binned_columns,
     )
 
@@ -139,13 +148,13 @@ def _load_spot_ic12_diff_columns(
     session_id: str,
     base_dir: str,
     *,
-    reference_frame: ReferenceFrameKind,
+    data_source: DataSourceKind,
 ) -> dict | None:
     return _load_registry_columns(
         SOURCE_IC12_POS_DIFF,
         session_id,
         base_dir,
-        LoadOptions(granularity=GRANULARITY_SPOT, reference_frame=reference_frame),
+        LoadOptions(data_source=data_source),
         ic12_to_binned_columns,
     )
 
@@ -155,7 +164,7 @@ def _load_position_errors(session_id: str, base_dir: str) -> dict | None:
         SOURCE_POSITION_ERROR,
         session_id,
         base_dir,
-        LoadOptions(granularity=GRANULARITY_SPOT),
+        LoadOptions(data_source=DATA_SOURCE_SPOT_ISO),
         position_error_to_binned_columns,
     )
 
@@ -179,9 +188,18 @@ def load_session_summary_table(
     base_dir: str,
     *,
     settings: ViewSettings | None = None,
-    reference_frame: ReferenceFrameKind = REFERENCE_ISO,
+    data_source: DataSourceKind = DATA_SOURCE_SPOT_ISO,
 ) -> dict | None:
     """Load one session into a fat per-spot column bag."""
+    cache_key = (
+        session_id,
+        base_dir,
+        data_source,
+        _summary_settings_key(settings),
+    )
+    if cache_key in _SUMMARY_TABLE_CACHE:
+        cached = _SUMMARY_TABLE_CACHE[cache_key]
+        return dict(cached) if cached is not None else None
 
     def _loader(sid, position_key, bdir):
         data = process_position_data(
@@ -265,7 +283,7 @@ def load_session_summary_table(
     sigma = _load_sigma_columns(
         session_id,
         base_dir,
-        reference_frame=reference_frame,
+        data_source=data_source,
     )
     if sigma is not None:
         if "energy" not in result:
@@ -278,7 +296,7 @@ def load_session_summary_table(
             )
 
     ic12 = _load_spot_ic12_diff_columns(
-        session_id, base_dir, reference_frame=reference_frame,
+        session_id, base_dir, data_source=data_source,
     )
     if ic12 is not None:
         if "energy" not in result:
@@ -291,15 +309,18 @@ def load_session_summary_table(
                 session_id,
                 len(np.asarray(ic12.get("energy", []))),
                 len(np.asarray(result.get("energy", []))),
-                reference_frame,
+                data_source,
             )
 
     if "energy" not in result:
+        _SUMMARY_TABLE_CACHE[cache_key] = None
         return None
     n = len(np.asarray(result["energy"]))
     if n == 0:
+        _SUMMARY_TABLE_CACHE[cache_key] = None
         return None
     result["session_id"] = session_id
+    _SUMMARY_TABLE_CACHE[cache_key] = result
     return result
 
 
@@ -308,13 +329,13 @@ def load_session_dose_rate_table(session_id: str, base_dir: str) -> dict | None:
     return load_source(
         SOURCE_DOSE_RATE,
         SessionContext(session_id, base_dir),
-        LoadOptions(granularity=GRANULARITY_LAYER),
+        LoadOptions(data_source=DATA_SOURCE_SPOT_ISO),
     )
 
 
 def _load_sessions_registry(
     source_id: str,
-    granularity: str,
+    data_source: DataSourceKind,
     session_ids: Sequence[str],
     base_dir: str,
     *,
@@ -326,7 +347,7 @@ def _load_sessions_registry(
         lambda sid: load_source(
             source_id,
             SessionContext(sid, base_dir, settings),
-            LoadOptions(granularity=granularity, bg_subtract=bg),
+            LoadOptions(data_source=data_source, bg_subtract=bg),
         ),
     )
 
@@ -358,7 +379,7 @@ def load_sessions_current_ratios(
 ) -> dict[str, dict]:
     return _load_sessions_registry(
         SOURCE_CURRENT_RATIO,
-        GRANULARITY_ENERGY_BINNED,
+        DATA_SOURCE_TIMESLICE_ISO,
         session_ids,
         base_dir,
         settings=settings,
@@ -373,7 +394,7 @@ def load_sessions_ic_current(
 ) -> dict[str, dict]:
     return _load_sessions_registry(
         SOURCE_IC_CURRENT,
-        GRANULARITY_ENERGY_BINNED,
+        DATA_SOURCE_TIMESLICE_ISO,
         session_ids,
         base_dir,
         settings=settings,
@@ -385,12 +406,12 @@ def load_sessions_summary(
     base_dir: str,
     *,
     settings: ViewSettings | None = None,
-    reference_frame: ReferenceFrameKind = REFERENCE_ISO,
+    data_source: DataSourceKind = DATA_SOURCE_SPOT_ISO,
 ) -> dict[str, dict]:
     return _load_sessions_map(
         session_ids,
         lambda sid: load_session_summary_table(
-            sid, base_dir, settings=settings, reference_frame=reference_frame,
+            sid, base_dir, settings=settings, data_source=data_source,
         ),
     )
 
@@ -405,7 +426,7 @@ def _load_timeslice_position_errors(
         SOURCE_POSITION_ERROR,
         session_id,
         base_dir,
-        LoadOptions(granularity=GRANULARITY_TIMESLICE_SAMPLE, bg_subtract=bg_subtract),
+        LoadOptions(data_source=DATA_SOURCE_TIMESLICE_ISO, bg_subtract=bg_subtract),
         position_error_to_binned_columns,
     )
 
@@ -420,7 +441,7 @@ def _load_timeslice_sigmas(
         SOURCE_SIGMA,
         session_id,
         base_dir,
-        LoadOptions(granularity=GRANULARITY_TIMESLICE_SAMPLE, bg_subtract=bg_subtract),
+        LoadOptions(data_source=DATA_SOURCE_TIMESLICE_ISO, bg_subtract=bg_subtract),
         sigma_to_binned_columns,
     )
 
@@ -429,18 +450,14 @@ def _load_timeslice_ic12_diff(
     session_id: str,
     base_dir: str,
     *,
-    reference_frame: ReferenceFrameKind,
+    data_source: DataSourceKind,
     bg_subtract: bool = False,
 ) -> dict | None:
     return _load_registry_columns(
         SOURCE_IC12_POS_DIFF,
         session_id,
         base_dir,
-        LoadOptions(
-            granularity=GRANULARITY_TIMESLICE_SAMPLE,
-            reference_frame=reference_frame,
-            bg_subtract=bg_subtract,
-        ),
+        LoadOptions(data_source=data_source, bg_subtract=bg_subtract),
         ic12_to_binned_columns,
     )
 
@@ -450,9 +467,19 @@ def load_session_timeslice_summary_table(
     base_dir: str,
     *,
     settings: ViewSettings | None = None,
-    reference_frame: ReferenceFrameKind = REFERENCE_ISO,
+    data_source: DataSourceKind = DATA_SOURCE_TIMESLICE_ISO,
 ) -> dict | None:
     """Load beam-on timeslice samples binned by energy for summary plots."""
+    cache_key = (
+        session_id,
+        base_dir,
+        data_source,
+        settings.bg_subtract if settings else False,
+    )
+    if cache_key in _TIMESLICE_SUMMARY_CACHE:
+        cached = _TIMESLICE_SUMMARY_CACHE[cache_key]
+        return dict(cached) if cached is not None else None
+
     bg_subtract = settings.bg_subtract if settings else False
     pos_err = _load_timeslice_position_errors(
         session_id, base_dir, bg_subtract=bg_subtract,
@@ -476,7 +503,7 @@ def load_session_timeslice_summary_table(
             )
 
     ic12 = _load_timeslice_ic12_diff(
-        session_id, base_dir, reference_frame=reference_frame, bg_subtract=bg_subtract,
+        session_id, base_dir, data_source=data_source, bg_subtract=bg_subtract,
     )
     if ic12 is not None:
         if "energy" not in result:
@@ -485,7 +512,9 @@ def load_session_timeslice_summary_table(
             _align_by_length(result, ic12, ("ic12_x_diff", "ic12_y_diff"))
 
     if "energy" not in result:
+        _TIMESLICE_SUMMARY_CACHE[cache_key] = None
         return None
+    _TIMESLICE_SUMMARY_CACHE[cache_key] = result
     return result
 
 
@@ -494,12 +523,12 @@ def load_sessions_timeslice_summary(
     base_dir: str,
     *,
     settings: ViewSettings | None = None,
-    reference_frame: ReferenceFrameKind = REFERENCE_ISO,
+    data_source: DataSourceKind = DATA_SOURCE_TIMESLICE_ISO,
 ) -> dict[str, dict]:
     return _load_sessions_map(
         session_ids,
         lambda sid: load_session_timeslice_summary_table(
-            sid, base_dir, settings=settings, reference_frame=reference_frame,
+            sid, base_dir, settings=settings, data_source=data_source,
         ),
     )
 
@@ -510,14 +539,13 @@ def load_sessions_for_source(
     source: DataSourceKind,
     *,
     settings: ViewSettings | None = None,
-    reference_frame: ReferenceFrameKind = REFERENCE_ISO,
 ) -> dict[str, dict]:
-    if source == DATA_SOURCE_TIMESLICE:
+    if data_source_is_timeslice(source):
         return load_sessions_timeslice_summary(
-            session_ids, base_dir, settings=settings, reference_frame=reference_frame,
+            session_ids, base_dir, settings=settings, data_source=source,
         )
     return load_sessions_summary(
-        session_ids, base_dir, settings=settings, reference_frame=reference_frame,
+        session_ids, base_dir, settings=settings, data_source=source,
     )
 
 
@@ -556,7 +584,7 @@ def available_x_params_for_source(
     session_data: dict[str, dict],
     source: DataSourceKind,
 ) -> set[str]:
-    if source == DATA_SOURCE_TIMESLICE:
+    if data_source_is_timeslice(source):
         if any(
             "energy" in data
             and np.isfinite(np.asarray(data["energy"], dtype=float)).any()
@@ -570,7 +598,7 @@ def available_x_params_for_source(
 def default_config(
     session_data: dict[str, dict],
     *,
-    source: DataSourceKind = DATA_SOURCE_SPOT,
+    source: DataSourceKind = DATA_SOURCE_SPOT_ISO,
     option_availability: dict[str, bool] | None = None,
 ) -> BinnedSummaryConfig:
     if option_availability is not None:

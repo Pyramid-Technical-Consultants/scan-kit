@@ -8,7 +8,13 @@ from ...common.mu_delivery_rate import (
 )
 from ..context import LoadOptions, SessionContext
 from ..registry import DataSourceSpec, register
-from ..types import GRANULARITY_LAYER, REFERENCE_ISO
+from ..types import (
+    DATA_SOURCE_SPOT_ISO,
+    DATA_SOURCE_SPOT_CHAMBER,
+    DATA_SOURCE_TIMESLICE_ISO,
+    DATA_SOURCE_TIMESLICE_CHAMBER,
+    GRANULARITY_LAYER,
+)
 
 SOURCE_DOSE_RATE = "dose_rate"
 
@@ -37,8 +43,8 @@ SPEC = register(
     DataSourceSpec(
         id=SOURCE_DOSE_RATE,
         label="Dose Rate",
-        granularities=frozenset({GRANULARITY_LAYER}),
-        reference_frames=frozenset({REFERENCE_ISO}),
+        data_sources=frozenset({DATA_SOURCE_SPOT_ISO}),
+        granularity_for={DATA_SOURCE_SPOT_ISO: GRANULARITY_LAYER},
         supports_bg_subtract=False,
         supports_beam_filter=False,
         probe=probe_dose_rate,

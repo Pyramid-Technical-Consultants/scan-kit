@@ -30,13 +30,9 @@ from ..common.data_filter import (
 )
 from ..common.segmented_control import SegmentedControl
 from .unified_catalog import (
-    DATA_SOURCE_SPOT,
-    DATA_SOURCE_TIMESLICE,
-    REFERENCE_CHAMBER,
-    REFERENCE_ISO,
-    REFERENCE_OPTIONS,
+    DATA_SOURCES,
+    DATA_SOURCE_SPOT_ISO,
     DataSourceKind,
-    ReferenceFrameKind,
     UnifiedViewOption,
     default_option_id,
     default_source,
@@ -45,11 +41,6 @@ from .unified_catalog import (
     options_for_source,
     source_has_available_options,
 )
-
-_SOURCE_OPTIONS = [
-    (DATA_SOURCE_SPOT, "Spot"),
-    (DATA_SOURCE_TIMESLICE, "Timeslice"),
-]
 
 PlotStyleChoice = tuple[str, str]
 
@@ -291,48 +282,6 @@ class DataFilterPanel(QWidget):
             self._on_selection_changed()
 
 
-class ReferenceFramePanel(QWidget):
-    """Isocenter vs raw chamber-plane reference for position and sigma metrics."""
-
-    def __init__(
-        self,
-        parent: QWidget | None = None,
-        *,
-        current: ReferenceFrameKind = REFERENCE_ISO,
-        on_selection_changed: Callable[[], None] | None = None,
-        group_title: str = "Reference Frame",
-    ) -> None:
-        super().__init__(parent)
-        self._on_selection_changed = on_selection_changed
-
-        root = QVBoxLayout(self)
-        root.setContentsMargins(0, 0, 0, 0)
-        root.setSpacing(0)
-
-        self._group_box = QGroupBox(group_title)
-        layout = QVBoxLayout(self._group_box)
-        self._segmented = SegmentedControl(list(REFERENCE_OPTIONS))
-        self._segmented.selectionChanged.connect(self._on_segment_changed)
-        layout.addWidget(self._segmented)
-        root.addWidget(self._group_box)
-
-        self.set_current(current)
-
-    def selected_key(self) -> ReferenceFrameKind:
-        key = self._segmented.current_key()
-        return key if key in (REFERENCE_ISO, REFERENCE_CHAMBER) else REFERENCE_ISO  # type: ignore[return-value]
-
-    def set_current(self, key: ReferenceFrameKind) -> None:
-        self._segmented.set_current(key)
-
-    def set_enabled(self, enabled: bool) -> None:
-        self._group_box.setEnabled(enabled)
-
-    def _on_segment_changed(self, _key: str) -> None:
-        if self._on_selection_changed is not None:
-            self._on_selection_changed()
-
-
 def sync_data_filter_panel(
     panel: DataFilterPanel | None,
     *,
@@ -374,7 +323,7 @@ class DataSourceOptionPanel(QWidget):
         group_layout = QVBoxLayout(self._group_box)
         group_layout.setSpacing(8)
 
-        self._source_segmented = SegmentedControl(_SOURCE_OPTIONS)
+        self._source_segmented = SegmentedControl(list(DATA_SOURCES))
         self._source_segmented.selectionChanged.connect(self._on_source_segment_changed)
         group_layout.addWidget(self._source_segmented)
 
@@ -391,21 +340,21 @@ class DataSourceOptionPanel(QWidget):
         availability: dict[str, bool],
         *,
         group_title: str = "Analysis",
-        preferred_source: DataSourceKind = DATA_SOURCE_SPOT,
+        preferred_source: DataSourceKind = DATA_SOURCE_SPOT_ISO,
     ) -> None:
         self._options = tuple(options)
         self._availability = dict(availability)
         self._group_box.setTitle(group_title)
 
-        spot_ok = source_has_available_options(
-            self._options, self._availability, DATA_SOURCE_SPOT,
-        )
-        timeslice_ok = source_has_available_options(
-            self._options, self._availability, DATA_SOURCE_TIMESLICE,
-        )
-        self._source_segmented.set_option_enabled(DATA_SOURCE_SPOT, spot_ok)
-        self._source_segmented.set_option_enabled(DATA_SOURCE_TIMESLICE, timeslice_ok)
-        self._source_segmented.setVisible(spot_ok and timeslice_ok)
+        enabled_count = 0
+        for source_key, _label in DATA_SOURCES:
+            ok = source_has_available_options(
+                self._options, self._availability, source_key,  # type: ignore[arg-type]
+            )
+            self._source_segmented.set_option_enabled(source_key, ok)
+            if ok:
+                enabled_count += 1
+        self._source_segmented.setVisible(enabled_count > 1)
 
         if source_has_available_options(
             self._options, self._availability, preferred_source,
@@ -424,23 +373,23 @@ class DataSourceOptionPanel(QWidget):
     def update_availability(self, availability: dict[str, bool]) -> None:
         """Refresh enabled options without changing the current source/selection."""
         self._availability = dict(availability)
-        spot_ok = source_has_available_options(
-            self._options, self._availability, DATA_SOURCE_SPOT,
-        )
-        timeslice_ok = source_has_available_options(
-            self._options, self._availability, DATA_SOURCE_TIMESLICE,
-        )
-        self._source_segmented.set_option_enabled(DATA_SOURCE_SPOT, spot_ok)
-        self._source_segmented.set_option_enabled(DATA_SOURCE_TIMESLICE, timeslice_ok)
-        self._source_segmented.setVisible(spot_ok and timeslice_ok)
+        enabled_count = 0
+        for source_key, _label in DATA_SOURCES:
+            ok = source_has_available_options(
+                self._options, self._availability, source_key,  # type: ignore[arg-type]
+            )
+            self._source_segmented.set_option_enabled(source_key, ok)
+            if ok:
+                enabled_count += 1
+        self._source_segmented.setVisible(enabled_count > 1)
         current = self._selected_id()
         self._refresh_option_list(select_id=current)
 
     def selected_source(self) -> DataSourceKind:
         key = self._source_segmented.current_key()
-        if key == DATA_SOURCE_TIMESLICE:
-            return DATA_SOURCE_TIMESLICE
-        return DATA_SOURCE_SPOT
+        if key in dict(DATA_SOURCES):
+            return key  # type: ignore[return-value]
+        return DATA_SOURCE_SPOT_ISO
 
     def selected_id(self) -> str | None:
         item = self._option_list.currentItem()

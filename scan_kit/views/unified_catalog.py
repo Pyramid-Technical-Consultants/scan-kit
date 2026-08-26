@@ -5,23 +5,21 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from ..data.types import (
-    DATA_SOURCE_SPOT,
-    DATA_SOURCE_TIMESLICE,
-    REFERENCE_CHAMBER,
-    REFERENCE_ISO,
+    ALL_DATA_SOURCES,
+    COARSE_SOURCE_SPOT,
+    COARSE_SOURCE_TIMESLICE,
+    CoarseDataSourceKind,
+    DATA_SOURCE_SPOT_CHAMBER,
+    DATA_SOURCE_SPOT_ISO,
+    DATA_SOURCE_TIMESLICE_CHAMBER,
+    DATA_SOURCE_TIMESLICE_ISO,
     DataSourceKind,
-    ReferenceFrameKind,
+    data_source_label,
     option_key,
 )
 
-REFERENCE_OPTIONS: tuple[tuple[str, str], ...] = (
-    (REFERENCE_ISO, "Isocenter"),
-    (REFERENCE_CHAMBER, "Chamber"),
-)
-
-DATA_SOURCES: tuple[tuple[str, str], ...] = (
-    (DATA_SOURCE_SPOT, "Spot"),
-    (DATA_SOURCE_TIMESLICE, "Timeslice"),
+DATA_SOURCES: tuple[tuple[str, str], ...] = tuple(
+    (source, data_source_label(source)) for source in ALL_DATA_SOURCES
 )
 
 
@@ -67,9 +65,9 @@ def default_source(
     availability: dict[str, bool],
 ) -> DataSourceKind:
     for source, _label in DATA_SOURCES:
-        if source_has_available_options(options, availability, source):
+        if source_has_available_options(options, availability, source):  # type: ignore[arg-type]
             return source  # type: ignore[return-value]
-    return DATA_SOURCE_SPOT
+    return DATA_SOURCE_SPOT_ISO
 
 
 def default_option_id(

@@ -17,7 +17,12 @@ from ...common.timeslice_sigma import (
 )
 from ..context import LoadOptions, SessionContext
 from ..registry import DataSourceSpec, register
-from ..types import GRANULARITY_SPOT, GRANULARITY_TIMESLICE_SAMPLE, REFERENCE_ISO
+from ..types import (
+    DATA_SOURCE_SPOT_ISO,
+    DATA_SOURCE_TIMESLICE_ISO,
+    GRANULARITY_SPOT,
+    GRANULARITY_TIMESLICE_SAMPLE,
+)
 from ...common.session_source import read_session_csv_columns, resolve_session_source
 from ...common import detect_beam_on_mask, load_session_timeslice_device_units
 
@@ -149,8 +154,10 @@ SPEC = register(
     DataSourceSpec(
         id=SOURCE_SIGMA_ERROR,
         label="Sigma Error",
-        granularities=frozenset({GRANULARITY_SPOT, GRANULARITY_TIMESLICE_SAMPLE}),
-        reference_frames=frozenset({REFERENCE_ISO}),
+        data_sources=frozenset({
+            DATA_SOURCE_SPOT_ISO,
+            DATA_SOURCE_TIMESLICE_ISO,
+        }),
         supports_bg_subtract=True,
         supports_beam_filter=True,
         probe=probe_sigma_error,

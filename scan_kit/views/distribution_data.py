@@ -40,28 +40,29 @@ from ..data.sources.position_error import SOURCE_POSITION_ERROR
 from ..data.sources.sigma import SOURCE_SIGMA
 from ..data.sources.sigma_error import SOURCE_SIGMA_ERROR
 from ..data.types import (
-    GRANULARITY_SESSION_COMPUTE,
-    GRANULARITY_SPOT,
-    GRANULARITY_TIMESLICE_SAMPLE,
-    GranularityKind,
+    COARSE_SOURCE_TIMESLICE,
+    DATA_SOURCE_SPOT_ISO,
+    DATA_SOURCE_TIMESLICE_ISO,
+    coarse_data_source,
 )
-from .unified_catalog import REFERENCE_ISO, ReferenceFrameKind, option_key
+from .unified_catalog import DataSourceKind, option_key
+from ..data.registry import get_spec
 
 _log = logging.getLogger(__name__)
 
-MODE_REGISTRY: dict[str, tuple[str, GranularityKind]] = {
-    MODE_POSITION_ERROR_SPOT: (SOURCE_POSITION_ERROR, GRANULARITY_SPOT),
-    MODE_POSITION_ERROR_TIMESLICE: (SOURCE_POSITION_ERROR, GRANULARITY_TIMESLICE_SAMPLE),
-    MODE_POSITION_SPOT: (SOURCE_POSITION, GRANULARITY_SPOT),
-    MODE_POSITION_TIMESLICE: (SOURCE_POSITION, GRANULARITY_TIMESLICE_SAMPLE),
-    MODE_SIGMA_SPOT: (SOURCE_SIGMA, GRANULARITY_SPOT),
-    MODE_SIGMA_TIMESLICE: (SOURCE_SIGMA, GRANULARITY_TIMESLICE_SAMPLE),
-    MODE_SIGMA_ERROR_SPOT: (SOURCE_SIGMA_ERROR, GRANULARITY_SPOT),
-    MODE_SIGMA_ERROR_TIMESLICE: (SOURCE_SIGMA_ERROR, GRANULARITY_TIMESLICE_SAMPLE),
-    MODE_IC12_POS_DIFF_SPOT: (SOURCE_IC12_POS_DIFF, GRANULARITY_SPOT),
-    MODE_IC12_POS_DIFF_TIMESLICE: (SOURCE_IC12_POS_DIFF, GRANULARITY_TIMESLICE_SAMPLE),
-    MODE_CONFIDENCE_TIMESLICE: (SOURCE_CONFIDENCE, GRANULARITY_TIMESLICE_SAMPLE),
-    MODE_GAUSSIAN_FILTER: (SOURCE_GAUSSIAN_FIT_FILTER, GRANULARITY_SESSION_COMPUTE),
+MODE_REGISTRY: dict[str, str] = {
+    MODE_POSITION_ERROR_SPOT: SOURCE_POSITION_ERROR,
+    MODE_POSITION_ERROR_TIMESLICE: SOURCE_POSITION_ERROR,
+    MODE_POSITION_SPOT: SOURCE_POSITION,
+    MODE_POSITION_TIMESLICE: SOURCE_POSITION,
+    MODE_SIGMA_SPOT: SOURCE_SIGMA,
+    MODE_SIGMA_TIMESLICE: SOURCE_SIGMA,
+    MODE_SIGMA_ERROR_SPOT: SOURCE_SIGMA_ERROR,
+    MODE_SIGMA_ERROR_TIMESLICE: SOURCE_SIGMA_ERROR,
+    MODE_IC12_POS_DIFF_SPOT: SOURCE_IC12_POS_DIFF,
+    MODE_IC12_POS_DIFF_TIMESLICE: SOURCE_IC12_POS_DIFF,
+    MODE_CONFIDENCE_TIMESLICE: SOURCE_CONFIDENCE,
+    MODE_GAUSSIAN_FILTER: SOURCE_GAUSSIAN_FIT_FILTER,
 }
 
 MODE_ADAPTERS: dict[str, Callable[[Any], Any]] = {
@@ -109,8 +110,15 @@ def probe_session_for_mode(session_id: str, mode: str, base_dir: str) -> bool:
         return False
     from ..data.availability import probe_source_option
 
-    source_id, granularity = MODE_REGISTRY[mode]
-    return probe_source_option(session_id, base_dir, source_id, granularity)
+    source_id = MODE_REGISTRY[mode]
+    mode_def = MODE_BY_ID[mode]
+    spec = get_spec(source_id)
+    for data_source in spec.data_sources:
+        if coarse_data_source(data_source) != mode_def.source:
+            continue
+        if probe_source_option(session_id, base_dir, source_id, data_source):
+            return True
+    return False
 
 
 def _load_session_for_mode(
@@ -119,15 +127,14 @@ def _load_session_for_mode(
     mode: str,
     *,
     settings: ViewSettings | None,
-    reference_frame: ReferenceFrameKind,
+    data_source: DataSourceKind,
 ) -> Any | None:
-    source_id, granularity = MODE_REGISTRY[mode]
+    source_id = MODE_REGISTRY[mode]
     payload = load_source(
         source_id,
         SessionContext(session_id, base_dir, settings),
         LoadOptions(
-            granularity=granularity,
-            reference_frame=reference_frame,
+            data_source=data_source,
             bg_subtract=settings.bg_subtract if settings else False,
         ),
     )
@@ -137,13 +144,22 @@ def _load_session_for_mode(
     return payload
 
 
+def _default_data_source_for_mode(mode: str) -> DataSourceKind:
+    mode_def = MODE_BY_ID.get(mode)
+    if mode_def is None:
+        return DATA_SOURCE_SPOT_ISO
+    if mode_def.source == COARSE_SOURCE_TIMESLICE:
+        return DATA_SOURCE_TIMESLICE_ISO
+    return DATA_SOURCE_SPOT_ISO
+
+
 def load_sessions_for_mode(
     mode: str,
     session_ids: list[str],
     base_dir: str,
     *,
     settings: ViewSettings | None = None,
-    reference_frame: ReferenceFrameKind = REFERENCE_ISO,
+    data_source: DataSourceKind | None = None,
 ) -> dict[str, Any]:
     """Load per-session data for one distribution mode."""
     if mode not in MODE_BY_ID:
@@ -151,10 +167,12 @@ def load_sessions_for_mode(
     if mode not in MODE_REGISTRY:
         raise ValueError(f"Mode not registered in data layer: {mode!r}")
 
+    resolved_source = data_source or _default_data_source_for_mode(mode)
+
     session_data: dict[str, Any] = {}
     for sid in session_ids:
         data = _load_session_for_mode(
-            sid, base_dir, mode, settings=settings, reference_frame=reference_frame,
+            sid, base_dir, mode, settings=settings, data_source=resolved_source,
         )
         if data is not None:
             session_data[sid] = data
@@ -162,10 +180,17 @@ def load_sessions_for_mode(
     return session_data
 
 
+def clear_summary_table_cache() -> None:
+    """Clear assembled summary-table caches (e.g. after calibration change)."""
+    _SUMMARY_TABLE_CACHE.clear()
+    _TIMESLICE_SUMMARY_CACHE.clear()
+
+
 def clear_load_cache() -> None:
     from ..data.cache import clear_cache
 
     clear_cache()
+    clear_summary_table_cache()
 
 
 def mode_has_data(
