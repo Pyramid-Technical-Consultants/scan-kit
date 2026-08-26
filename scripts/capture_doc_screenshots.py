@@ -262,7 +262,7 @@ def main() -> None:
     _capture_launcher_screenshots(base_dir)
 
     views = [
-        ("position_scatter", [SESSION_G3_A, SESSION_G3_B], "view-position-scatter.png"),
+        ("distribution", [SESSION_G3_A, SESSION_G3_B], "view-position-scatter.png"),
         ("amplifier_correlation", [SESSION_G2], "view-amplifier-correlation.png"),
     ]
     binned_presets = [

@@ -19,7 +19,7 @@ def test_should_install_linux_desktop_only_for_main_frozen_process(monkeypatch) 
     monkeypatch.setattr(sys, "argv", ["scan-kit"])
     assert should_install_linux_desktop() is True
 
-    monkeypatch.setattr(sys, "argv", ["scan-kit", "--run-view", "position_scatter"])
+    monkeypatch.setattr(sys, "argv", ["scan-kit", "--run-view", "distribution"])
     assert should_install_linux_desktop() is False
 
 
