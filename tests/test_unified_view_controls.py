@@ -5,12 +5,24 @@ from __future__ import annotations
 import pytest
 from PySide6.QtWidgets import QApplication
 
-from scan_kit.views.unified_catalog import (
+from scan_kit.data.types import (
+    COARSE_SOURCE_SPOT,
+    COARSE_SOURCE_TIMESLICE,
+    DATA_SOURCE_SPOT_CHAMBER,
     DATA_SOURCE_SPOT_ISO,
+    DATA_SOURCE_TIMESLICE_CHAMBER,
+    DATA_SOURCE_TIMESLICE_ISO,
+    REFERENCE_CHAMBER,
+    REFERENCE_ISO,
+    combine_data_source,
+    split_data_source,
+)
+from scan_kit.views.unified_catalog import (
     DATA_SOURCE_TIMESLICE_ISO,
     UnifiedViewOption,
     default_option_id,
     default_source,
+    options_for_coarse,
     options_for_source,
     source_has_available_options,
 )
@@ -26,6 +38,31 @@ OPTIONS = (
     UnifiedViewOption("ts_a", "Timeslice A", DATA_SOURCE_TIMESLICE_ISO),
     UnifiedViewOption("ts_b", "Timeslice B", DATA_SOURCE_TIMESLICE_ISO),
 )
+
+
+def test_combine_data_source_round_trip() -> None:
+    for coarse in (COARSE_SOURCE_SPOT, COARSE_SOURCE_TIMESLICE):
+        for ref in (REFERENCE_ISO, REFERENCE_CHAMBER):
+            source = combine_data_source(coarse, ref)
+            assert split_data_source(source) == (coarse, ref)
+
+
+def test_data_source_option_panel_iso_chamber_list_entries(qapp: QApplication) -> None:
+    panel = DataSourceOptionPanel()
+    options = (
+        UnifiedViewOption("sigma", "Sigma (Isocenter)", DATA_SOURCE_SPOT_ISO),
+        UnifiedViewOption("sigma", "Sigma (Chamber)", DATA_SOURCE_SPOT_CHAMBER),
+    )
+    availability = {
+        "spot_iso:sigma": True,
+        "spot_chamber:sigma": True,
+    }
+    panel.configure(options, availability, group_title="Metric")
+    assert panel._granularity_segmented.isHidden()
+    assert panel._option_list.count() == 2
+    panel.select_id("sigma", source=DATA_SOURCE_SPOT_CHAMBER)
+    assert panel.selected_source() == DATA_SOURCE_SPOT_CHAMBER
+    assert panel.selected_id() == "sigma"
 
 
 def test_options_for_source_filters_by_kind() -> None:
@@ -74,7 +111,7 @@ def test_data_source_option_panel_spot_only_hides_source_group(qapp) -> None:
         "timeslice_iso:ts_b": False,
     }
     panel.configure(OPTIONS, availability, group_title="Metric")
-    assert not panel._source_segmented.isVisible()
+    assert panel._granularity_segmented.isHidden()
     assert panel.selected_id() == "spot_a"
 
 
@@ -109,8 +146,7 @@ def test_data_source_option_panel_preserves_metric_on_source_switch(
     }
     panel.configure(options, availability, group_title="Y Metric")
     panel.select_id("sigma", source=DATA_SOURCE_SPOT_ISO)
-    panel._source_segmented.set_current(DATA_SOURCE_TIMESLICE_ISO)
-    panel._on_source_segment_changed(DATA_SOURCE_TIMESLICE_ISO)
+    panel._set_source(DATA_SOURCE_TIMESLICE_ISO, refresh_list=True)
     assert panel.selected_source() == DATA_SOURCE_TIMESLICE_ISO
     assert panel.selected_id() == "sigma"
 
@@ -129,8 +165,7 @@ def test_data_source_option_panel_source_switch_falls_back_when_unavailable(
     }
     panel.configure(options, availability, group_title="Y Metric")
     panel.select_id("dose_error", source=DATA_SOURCE_SPOT_ISO)
-    panel._source_segmented.set_current(DATA_SOURCE_TIMESLICE_ISO)
-    panel._on_source_segment_changed(DATA_SOURCE_TIMESLICE_ISO)
+    panel._set_source(DATA_SOURCE_TIMESLICE_ISO, refresh_list=True)
     assert panel.selected_id() == "sigma"
 
 
@@ -163,6 +198,28 @@ def test_plot_style_panel_style_options(qapp: QApplication) -> None:
     assert panel.spin_value("cutoff") == 30
     panel.set_spin_value("cutoff", 20)
     assert panel.spin_value("cutoff") == 20
+
+
+def test_histogram_panel_options(qapp: QApplication) -> None:
+    from scan_kit.views.unified_view_controls import HistogramPanel
+
+    panel = HistogramPanel()
+    assert not panel.is_enabled()
+    assert panel.bin_count() == 30
+    assert not panel.shared_bins()
+    panel.set_enabled(True)
+    panel.set_bin_count(45)
+    panel.set_shared_bins(True)
+    assert panel.is_enabled()
+    assert panel.bin_count() == 45
+    assert panel.shared_bins()
+    panel.set_from_config(
+        show_hist=False,
+        hist_bin_count=20,
+        hist_shared_bins=False,
+    )
+    assert not panel.is_enabled()
+    assert panel.bin_count() == 20
 
 
 def test_data_filter_panel_selects_filters(qapp: QApplication) -> None:

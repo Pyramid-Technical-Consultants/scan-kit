@@ -6,16 +6,25 @@ from dataclasses import dataclass
 from typing import Literal
 
 from ..common.data_filter import FILTER_ALL, FILTER_BEAM_BOTH, DataFilterSelection
+from ..data.sources.current_ratio import SOURCE_CURRENT_RATIO
+from ..data.sources.dose_rate import SOURCE_DOSE_RATE
+from ..data.sources.ic12_pos_diff import SOURCE_IC12_POS_DIFF
+from ..data.sources.ic_current import SOURCE_IC_CURRENT
+from ..data.sources.position_error import SOURCE_POSITION_ERROR
+from ..data.sources.sigma import SOURCE_SIGMA
+from ..data.sources.sigma_error import SOURCE_SIGMA_ERROR
 from .unified_catalog import (
     DATA_SOURCE_SPOT_ISO,
     DATA_SOURCE_SPOT_CHAMBER,
     DATA_SOURCE_TIMESLICE_ISO,
     DATA_SOURCE_TIMESLICE_CHAMBER,
     UnifiedViewOption,
+    format_view_option_label,
     option_key,
+    registry_data_sources,
 )
 
-Glyph = Literal["box", "violin", "mean"]
+Glyph = Literal["box", "violin", "mean", "scatter", "contour"]
 BinMode = Literal["unique", "quantile"]
 
 Y_DOSE_ERROR = "dose_error"
@@ -25,6 +34,7 @@ Y_CURRENT_RATIO = "current_ratio"
 Y_IC_CURRENT = "ic_current"
 Y_POSITION_ERROR = "position_error"
 Y_SIGMA = "sigma"
+Y_SIGMA_ERROR = "sigma_error"
 Y_IC12_POS_DIFF = "ic12_pos_diff"
 Y_SPOT_TIME = "spot_time"
 
@@ -36,6 +46,8 @@ X_RADIUS = "radius"
 GLYPH_BOX = "box"
 GLYPH_VIOLIN = "violin"
 GLYPH_MEAN = "mean"
+GLYPH_SCATTER = "scatter"
+GLYPH_CONTOUR = "contour"
 
 PRESET_DOSE_ERROR_ENERGY = "dose_error_energy"
 PRESET_DOSE_ERROR_ENERGY_MEAN = "dose_error_energy_mean"
@@ -120,6 +132,7 @@ Y_GROUPS: tuple[YGroupDef, ...] = (
         (SeriesDef("mu_rate", "Delivery Rate (MU/s)"),),
         GLYPH_MEAN,
         "MU/s/unit",
+        registry_data_sources(SOURCE_DOSE_RATE),
         supports_data_filter=False,
     ),
     YGroupDef(
@@ -132,7 +145,7 @@ Y_GROUPS: tuple[YGroupDef, ...] = (
         ),
         GLYPH_MEAN,
         "%/unit",
-        (DATA_SOURCE_TIMESLICE_ISO,),
+        registry_data_sources(SOURCE_CURRENT_RATIO),
         supports_data_filter=False,
     ),
     YGroupDef(
@@ -145,7 +158,7 @@ Y_GROUPS: tuple[YGroupDef, ...] = (
         ),
         GLYPH_BOX,
         "nA/unit",
-        (DATA_SOURCE_TIMESLICE_ISO,),
+        registry_data_sources(SOURCE_IC_CURRENT),
     ),
     YGroupDef(
         Y_POSITION_ERROR,
@@ -158,7 +171,7 @@ Y_GROUPS: tuple[YGroupDef, ...] = (
         ),
         GLYPH_VIOLIN,
         "mm/unit",
-        (DATA_SOURCE_SPOT_ISO, DATA_SOURCE_TIMESLICE_ISO),
+        registry_data_sources(SOURCE_POSITION_ERROR),
     ),
     YGroupDef(
         Y_SIGMA,
@@ -171,7 +184,20 @@ Y_GROUPS: tuple[YGroupDef, ...] = (
         ),
         GLYPH_VIOLIN,
         "mm/unit",
-        (DATA_SOURCE_SPOT_ISO, DATA_SOURCE_SPOT_CHAMBER, DATA_SOURCE_TIMESLICE_ISO),
+        registry_data_sources(SOURCE_SIGMA),
+    ),
+    YGroupDef(
+        Y_SIGMA_ERROR,
+        "Sigma Error (mm)",
+        (
+            SeriesDef("ic1_sig_x_err", "IC1 σx"),
+            SeriesDef("ic1_sig_y_err", "IC1 σy"),
+            SeriesDef("ic2_sig_x_err", "IC2 σx"),
+            SeriesDef("ic2_sig_y_err", "IC2 σy"),
+        ),
+        GLYPH_VIOLIN,
+        "mm/unit",
+        registry_data_sources(SOURCE_SIGMA_ERROR),
     ),
     YGroupDef(
         Y_IC12_POS_DIFF,
@@ -182,12 +208,7 @@ Y_GROUPS: tuple[YGroupDef, ...] = (
         ),
         GLYPH_VIOLIN,
         "mm/unit",
-        (
-            DATA_SOURCE_SPOT_ISO,
-            DATA_SOURCE_SPOT_CHAMBER,
-            DATA_SOURCE_TIMESLICE_ISO,
-            DATA_SOURCE_TIMESLICE_CHAMBER,
-        ),
+        registry_data_sources(SOURCE_IC12_POS_DIFF),
     ),
     YGroupDef(
         Y_SPOT_TIME,
@@ -199,6 +220,7 @@ Y_GROUPS: tuple[YGroupDef, ...] = (
         ),
         GLYPH_BOX,
         "ms/unit",
+        supports_data_filter=False,
     ),
 )
 
@@ -269,7 +291,15 @@ X_PARAM_BY_ID = {x.id: x for x in X_PARAMS}
 PRESET_BY_ID = {p.id: p for p in PRESETS}
 
 VIEW_OPTIONS: tuple[UnifiedViewOption, ...] = tuple(
-    UnifiedViewOption(group.id, group.label, source)  # type: ignore[arg-type]
+    UnifiedViewOption(
+        group.id,
+        format_view_option_label(
+            group.label,
+            source,  # type: ignore[arg-type]
+            sibling_sources=tuple(group.sources),  # type: ignore[arg-type]
+        ),
+        source,  # type: ignore[arg-type]
+    )
     for group in Y_GROUPS
     for source in group.sources
 )
@@ -283,8 +313,11 @@ class BinnedSummaryConfig:
     glyph: Glyph = GLYPH_VIOLIN
     show_trend: bool = True
     show_hist: bool = False
+    hist_bin_count: int = 30
+    hist_shared_bins: bool = False
     show_corr: bool = False
     show_fliers: bool = False
+    contour_cutoff_percentile: float = 5.0
     n_bins: int | None = None
     domain_filter: str = FILTER_ALL
     beam_state_filter: str = FILTER_BEAM_BOTH

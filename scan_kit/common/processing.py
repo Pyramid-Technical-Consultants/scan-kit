@@ -31,6 +31,19 @@ from .schema import (
 )
 from .session_source import load_session_csv, resolve_session_source
 
+def clear_session_raw_cache() -> None:
+    """Clear the module-level ``load_session_raw`` cache (mainly for tests)."""
+    _SESSION_RAW_CACHE.clear()
+
+
+def clear_position_table_cache() -> None:
+    """Clear processed spot position tables (mainly for tests)."""
+    _POSITION_TABLE_CACHE.clear()
+
+
+_SESSION_RAW_CACHE: dict[tuple[str, str], tuple | None] = {}
+_POSITION_TABLE_CACHE: dict[tuple, dict | None] = {}
+
 
 def load_session_raw(session_id, base_dir="scan_kit"):
     """Load raw input_map and spot_data for a session.
@@ -42,15 +55,26 @@ def load_session_raw(session_id, base_dir="scan_kit"):
     Returns:
         Tuple of (input_map, spot_data) DataFrames, or (None, None) if loading fails.
     """
+    cache_key = (session_id, base_dir)
+    if cache_key in _SESSION_RAW_CACHE:
+        cached = _SESSION_RAW_CACHE[cache_key]
+        if cached is None:
+            return None, None
+        input_map, spot_data = cached
+        return input_map, spot_data
+
     src = resolve_session_source(session_id, base_dir)
     if src is None:
         _log.debug("No session data found for %s", session_id)
+        _SESSION_RAW_CACHE[cache_key] = None
         return None, None
     input_map = load_session_csv(src, "input_map.csv")
     spot_data = load_session_csv(src, "spot_data.csv")
     if input_map is None or spot_data is None:
         _log.debug("Failed to load CSV data for session %s", session_id)
+        _SESSION_RAW_CACHE[cache_key] = None
         return None, None
+    _SESSION_RAW_CACHE[cache_key] = (input_map, spot_data)
     return input_map, spot_data
 
 
@@ -258,22 +282,101 @@ def filter_data_rows(data: dict, keep_mask, *, skip_keys=("session_id",)) -> dic
     return filtered
 
 
+def compute_spot_delivery_time_ms(
+    timestamp: np.ndarray,
+    layer_id: np.ndarray,
+) -> np.ndarray:
+    """Per-spot delivery interval (ms) from timestamp deltas within each layer.
+
+    Rows are sorted by timestamp inside each layer before differencing so
+  delivery intervals are non-negative even when the source table row order
+    is not chronological.
+    """
+    ts = np.asarray(timestamp, dtype=float)
+    lid = np.asarray(layer_id)
+    n = len(ts)
+    out = np.full(n, np.nan, dtype=float)
+    if n == 0:
+        return out
+
+    df = pd.DataFrame({"timestamp": ts, "layer_id": lid, "_idx": np.arange(n)})
+    for _, group in df.groupby("layer_id", sort=False):
+        ordered = group.sort_values("timestamp", kind="mergesort")
+        intervals = ordered["timestamp"].diff()
+        if intervals.size:
+            intervals.iloc[0] = ordered["timestamp"].iloc[0]
+        out[ordered["_idx"].to_numpy()] = intervals.to_numpy(dtype=float)
+    return out
+
+
+_POINT_TIME_KEYS = ("point_time(ms)", "point_time_ms", "point_time")
+
+
+def add_spot_time_breakdown(data: dict) -> dict:
+    """Add ``beam_on_time`` and ``overhead_time`` when point beam-on time is present."""
+    point_key = next((key for key in _POINT_TIME_KEYS if key in data), None)
+    if point_key is None or "spot_time" not in data:
+        return data
+
+    result = dict(data)
+    beam = np.asarray(result[point_key], dtype=float)
+    total = np.asarray(result["spot_time"], dtype=float)
+    valid = np.isfinite(total) & np.isfinite(beam)
+    overhead = np.where(valid, np.maximum(total - beam, 0.0), np.nan)
+    result["beam_on_time"] = beam
+    result["overhead_time"] = overhead
+    return result
+
+
+def attach_layer_run_point_time(
+    data: dict,
+    session_id: str,
+    base_dir: str,
+) -> dict:
+    """Merge per-spot ``point_time(ms)`` from layer run spot_data when missing."""
+    if any(key in data for key in _POINT_TIME_KEYS):
+        return data
+    if "spot_no" not in data or "layer_id" not in data:
+        return data
+
+    from .session_source import load_session_point_time_table, resolve_session_source
+
+    src = resolve_session_source(session_id, base_dir)
+    if src is None:
+        return data
+    table = load_session_point_time_table(src)
+    if table is None or table.empty:
+        return data
+
+    lookup = table.set_index(["spot_no", "layer_id"])["point_time_ms"]
+    spot_no = np.asarray(data["spot_no"], dtype=float)
+    layer_id = np.asarray(data["layer_id"], dtype=float)
+    point_time = np.full(spot_no.shape, np.nan, dtype=float)
+    for i, (spot, layer) in enumerate(zip(spot_no, layer_id, strict=False)):
+        if not np.isfinite(spot) or not np.isfinite(layer):
+            continue
+        key = (float(spot), float(layer))
+        if key in lookup.index:
+            point_time[i] = float(lookup.loc[key])
+
+    if not np.isfinite(point_time).any():
+        return data
+
+    result = dict(data)
+    result["point_time(ms)"] = point_time
+    return result
+
+
 def add_spot_delivery_time(data: dict, *, max_spot_time_ms: float = 100.0) -> dict | None:
     """Add ``spot_time`` and filter rows above ``max_spot_time_ms``."""
     if "timestamp" not in data or "layer_id" not in data:
         return None
 
     result = dict(data)
-    df = pd.DataFrame(
-        {
-            "timestamp": np.asarray(result["timestamp"], dtype=float),
-            "layer_id": np.asarray(result["layer_id"]),
-        }
+    st = compute_spot_delivery_time_ms(
+        np.asarray(result["timestamp"], dtype=float),
+        np.asarray(result["layer_id"]),
     )
-    spot_time = df.groupby("layer_id")["timestamp"].diff()
-    first_mask = spot_time.isna()
-    spot_time.loc[first_mask] = df.loc[first_mask, "timestamp"]
-    st = spot_time.to_numpy()
 
     keep = np.isfinite(st) & (st <= max_spot_time_ms)
     result = filter_data_rows(result, keep)
@@ -306,6 +409,15 @@ def process_position_data(
         Dict with session_id, ic1_x, ic1_y, ic2_x, ic2_y, energy, and any extra columns.
         Returns None if loading or validation fails.
     """
+    extra_spot = tuple(extra_spot_columns or ())
+    extra_input = tuple(extra_input_columns or ())
+    cache_key = (session_id, base_dir, position_key, extra_spot, extra_input)
+    if cache_key in _POSITION_TABLE_CACHE:
+        cached = _POSITION_TABLE_CACHE[cache_key]
+        if cached is None:
+            return None
+        return dict(cached)
+
     input_map, spot_data = load_session_raw(session_id, base_dir)
     if input_map is None or spot_data is None:
         return None
@@ -432,6 +544,7 @@ def process_position_data(
         if resolved in data_clean.columns:
             result[col] = data_clean[resolved].values
 
+    _POSITION_TABLE_CACHE[cache_key] = result
     return result
 
 

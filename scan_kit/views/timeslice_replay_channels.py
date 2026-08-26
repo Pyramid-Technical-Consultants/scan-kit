@@ -96,6 +96,83 @@ PRESET_CHANNELS: dict[str, tuple[str, ...]] = {
 _ANALOG_SIGNAL_KEYS = frozenset(TIMELINE_CHANNEL_BY_KEY)
 _SIGMA_KEYS = ("sigma_ic1_x", "sigma_ic1_y", "sigma_ic2_x", "sigma_ic2_y")
 _POS_KEYS = ("ic1_x", "ic1_y", "ic2_x", "ic2_y")
+_CATALOG_IC_KEYS = frozenset({"ic1", "ic2", "ic3"})
+_CATALOG_DDOSE_KEYS = frozenset({"ic1_ddose", "ic2_ddose", "ic3_ddose"})
+_CATALOG_SIGMA_KEYS = frozenset(_SIGMA_KEYS)
+_CATALOG_FIELD_KEYS = frozenset({"bx", "by", "b_mag"})
+_CATALOG_BEAM_KEYS = frozenset({"beam"})
+_CATALOG_POS_KEYS = frozenset(_POS_KEYS)
+
+
+def _catalog_wants_family(
+    channel_keys: frozenset[str] | None,
+    family_keys: frozenset[str],
+) -> bool:
+    if channel_keys is None:
+        return True
+    return bool(family_keys & channel_keys)
+
+
+def probe_session_timeline_flags(session_id: str, base_dir: str) -> dict[str, bool] | None:
+    """Return file-level timeslice channel flags from the first frame (no array load)."""
+    from ..common.session_source import resolve_session_source
+
+    src = resolve_session_source(session_id, base_dir)
+    if src is None:
+        return None
+    frames = load_session_timeslice_device_units(src, max_frames=1)
+    if not frames:
+        return None
+    df0 = frames[0]
+
+    ic_cols = resolve_ic_current_columns(df0.columns)
+    has_ic = ic_cols is not None
+    file_has_ic3 = bool(ic_cols and ic_cols.ic3_parts)
+
+    dose_cols = resolve_ic_scan_total_dose_columns(df0.columns)
+    ts_dose1 = dose_cols["ic1"]
+    ts_dose2 = dose_cols["ic2"]
+    ts_dose3 = dose_cols["ic3"]
+    file_has_ddose = bool(ts_dose1 and ts_dose2)
+    file_has_ddose3 = file_has_ddose and ts_dose3 is not None
+
+    sigma_source = resolve_timeslice_sigma_source(df0.columns)
+    file_has_sigma = sigma_source is not None
+
+    ts_bx = resolve_col(df0.columns, C_MAG_FIELD_X)
+    ts_by = resolve_col(df0.columns, C_MAG_FIELD_Y)
+    file_has_field = bool(ts_bx and ts_by)
+
+    ts_beam = resolve_col(df0.columns, C_BEAM_CURRENT)
+    file_has_beam = ts_beam is not None
+
+    pos_cols: dict[str, str] = {}
+    for pos_key in (POSITION_KEY_G3_RAW, POSITION_KEY_G2_RAW):
+        for concept, label in (
+            (C_IC1_X_POS_RAW, "ic1_x"),
+            (C_IC1_Y_POS_RAW, "ic1_y"),
+            (C_IC2_X_POS_RAW, "ic2_x"),
+            (C_IC2_Y_POS_RAW, "ic2_y"),
+        ):
+            resolved = resolve_concept_column(
+                df0.columns, concept, position_key=pos_key,
+            )
+            if resolved and label not in pos_cols:
+                pos_cols[label] = resolved
+        if len(pos_cols) == 4:
+            break
+    file_has_positions = len(pos_cols) == 4
+
+    return {
+        "has_ic": has_ic,
+        "has_ic3": file_has_ic3,
+        "has_ddose": file_has_ddose,
+        "has_ddose3": file_has_ddose3,
+        "has_sigma": file_has_sigma,
+        "has_field": file_has_field,
+        "has_beam": file_has_beam,
+        "has_positions": file_has_positions,
+    }
 
 
 def channel_defs_by_family() -> list[tuple[str, list[ChannelDef]]]:
@@ -137,11 +214,15 @@ def load_session_timeline_catalog(
     *,
     bg_subtract: bool = False,
     opened: tuple | None = None,
+    channel_keys: frozenset[str] | None = None,
 ) -> dict | None:
-    """Load all available timeslice channel families into one session dict.
+    """Load timeslice channel families into one session dict.
 
     When *opened* is provided (from :func:`load_session_timeslice_frames`),
     skip re-reading timeslice CSVs.
+
+    When *channel_keys* is set, only extract those catalog keys (frames are
+    still read, but unused families are not concatenated).
     """
     if opened is not None:
         _src, frames, energy_by_layer, energy_by_idx, ts_layer = opened
@@ -169,28 +250,28 @@ def load_session_timeline_catalog(
     df0 = frames[0]
 
     ic_cols = resolve_ic_current_columns(df0.columns)
-    has_ic = ic_cols is not None
-    has_ic3 = bool(ic_cols and ic_cols.ic3_parts)
+    file_has_ic = ic_cols is not None
+    file_has_ic3 = bool(ic_cols and ic_cols.ic3_parts)
 
     dose_cols = resolve_ic_scan_total_dose_columns(df0.columns)
     ts_dose1 = dose_cols["ic1"]
     ts_dose2 = dose_cols["ic2"]
     ts_dose3 = dose_cols["ic3"]
-    has_ddose = bool(ts_dose1 and ts_dose2)
-    has_ddose3 = has_ddose and ts_dose3 is not None
+    file_has_ddose = bool(ts_dose1 and ts_dose2)
+    file_has_ddose3 = file_has_ddose and ts_dose3 is not None
 
     sigma_source = resolve_timeslice_sigma_source(df0.columns)
-    has_sigma = sigma_source is not None
+    file_has_sigma = sigma_source is not None
 
     ts_bx = resolve_col(df0.columns, C_MAG_FIELD_X)
     ts_by = resolve_col(df0.columns, C_MAG_FIELD_Y)
-    has_field = bool(ts_bx and ts_by)
+    file_has_field = bool(ts_bx and ts_by)
 
-    if not any((has_ic, has_ddose, has_sigma, has_field)):
+    if not any((file_has_ic, file_has_ddose, file_has_sigma, file_has_field)):
         return None
 
     ts_beam = resolve_col(df0.columns, C_BEAM_CURRENT)
-    has_beam = ts_beam is not None
+    file_has_beam = ts_beam is not None
 
     pos_cols: dict[str, str] = {}
     for pos_key in (POSITION_KEY_G3_RAW, POSITION_KEY_G2_RAW):
@@ -207,7 +288,27 @@ def load_session_timeline_catalog(
                 pos_cols[label] = resolved
         if len(pos_cols) == 4:
             break
-    has_positions = len(pos_cols) == 4
+    file_has_positions = len(pos_cols) == 4
+
+    wants_ic = _catalog_wants_family(channel_keys, _CATALOG_IC_KEYS)
+    wants_ddose = _catalog_wants_family(channel_keys, _CATALOG_DDOSE_KEYS)
+    wants_sigma = _catalog_wants_family(channel_keys, _CATALOG_SIGMA_KEYS)
+    wants_field = _catalog_wants_family(channel_keys, _CATALOG_FIELD_KEYS)
+    wants_beam = _catalog_wants_family(channel_keys, _CATALOG_BEAM_KEYS)
+    wants_positions = _catalog_wants_family(channel_keys, _CATALOG_POS_KEYS)
+
+    has_ic = file_has_ic and wants_ic
+    has_ic3 = file_has_ic3 and (
+        channel_keys is None or "ic3" in channel_keys
+    )
+    has_ddose = file_has_ddose and wants_ddose
+    has_ddose3 = file_has_ddose3 and (
+        channel_keys is None or "ic3_ddose" in channel_keys
+    )
+    has_sigma = file_has_sigma and wants_sigma
+    has_field = file_has_field and wants_field
+    has_beam = file_has_beam and wants_beam
+    has_positions = file_has_positions and wants_positions
 
     digital_cols = detect_digital_columns(df0.columns)
     digital_parts: dict[str, list[np.ndarray]] = {col: [] for col, _ in digital_cols}
@@ -319,12 +420,12 @@ def load_session_timeline_catalog(
     result: dict = {
         "layer_boundaries": layer_boundaries,
         "n_samples": offset,
-        "has_ic3": has_ic3,
-        "has_beam": has_beam,
-        "has_positions": has_positions,
-        "has_sigma": has_sigma,
-        "has_field": has_field,
-        "has_ddose": has_ddose,
+        "has_ic3": file_has_ic3,
+        "has_beam": file_has_beam,
+        "has_positions": file_has_positions,
+        "has_sigma": file_has_sigma,
+        "has_field": file_has_field,
+        "has_ddose": file_has_ddose,
         "energy": np.concatenate(energy_parts),
         "beam_off_edges": {
             k: np.asarray(v, dtype=int) for k, v in edge_indices.items() if v

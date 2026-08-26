@@ -19,8 +19,10 @@ from ...common.timeslice_position_error import (
 )
 from ...common.timeslice_table import load_energy_tagged_table
 from ..context import LoadOptions, SessionContext
+from ..reference_frame import spot_positions_raw
 from ..registry import DataSourceSpec, register
 from ..types import (
+    DATA_SOURCE_SPOT_CHAMBER,
     DATA_SOURCE_SPOT_ISO,
     DATA_SOURCE_TIMESLICE_ISO,
     GRANULARITY_SPOT,
@@ -46,7 +48,7 @@ def probe_position_error(ctx: SessionContext, opts: LoadOptions) -> bool:
     return False
 
 
-def _load_spot(ctx: SessionContext, _opts: LoadOptions) -> dict | None:
+def _load_spot(ctx: SessionContext, opts: LoadOptions) -> dict | None:
     def _loader(sid, position_key, bdir):
         return process_position_data(
             sid,
@@ -55,7 +57,12 @@ def _load_spot(ctx: SessionContext, _opts: LoadOptions) -> dict | None:
             base_dir=bdir,
         )
 
-    data = try_load_position_data(ctx.session_id, ctx.base_dir, _loader, raw=False)
+    data = try_load_position_data(
+        ctx.session_id,
+        ctx.base_dir,
+        _loader,
+        raw=spot_positions_raw(opts.reference_frame),
+    )
     if data is None:
         return None
     if C_X_POSITION not in data or C_Y_POSITION not in data:
@@ -126,6 +133,7 @@ SPEC = register(
         label="Position Error",
         data_sources=frozenset({
             DATA_SOURCE_SPOT_ISO,
+            DATA_SOURCE_SPOT_CHAMBER,
             DATA_SOURCE_TIMESLICE_ISO,
         }),
         supports_bg_subtract=True,

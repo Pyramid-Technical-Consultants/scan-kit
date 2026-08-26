@@ -28,6 +28,7 @@ from ..types import (
     GRANULARITY_SPOT,
     GRANULARITY_TIMESLICE_SAMPLE,
 )
+from ._common import beam_on_has_samples
 
 SOURCE_IC12_POS_DIFF = "ic12_pos_diff"
 
@@ -56,7 +57,7 @@ def _probe_timeslice_frame(ctx: SessionContext, reference_frame: str) -> bool:
     if source is None:
         return False
     beam_on = detect_beam_on_mask(frames[0])
-    if beam_on is None or not np.any(beam_on):
+    if not beam_on_has_samples(beam_on):
         return False
     return extract(frames[0], source) is not None
 

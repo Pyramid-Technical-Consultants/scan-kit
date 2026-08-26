@@ -27,10 +27,12 @@ from .fft_catalog import (
     FftConfig,
 )
 from .fft_data import (
+    channel_keys_for_metric,
     default_config,
     load_sessions_fft,
+    merge_fft_session_channels,
     probe_channel_availability,
-    probe_metric_availability,
+    probe_fft_metric_availability_headers,
 )
 from .fft_ui import render_fft
 from .plot_view_shell import (
@@ -87,6 +89,9 @@ class FftExplorerWindow(PlotViewWindow):
 
         self._load_task = DebouncedBackgroundTask(debounce_ms=0, parent=self)
         self._load_task.finished.connect(self._on_load_finished)
+
+        self._metric_load_task = DebouncedBackgroundTask(debounce_ms=0, parent=self)
+        self._metric_load_task.finished.connect(self._on_metric_channels_loaded)
 
         self._render_task = DebouncedBackgroundTask(debounce_ms=50, parent=self)
         self._render_task.finished.connect(self._on_render_finished)
@@ -172,7 +177,7 @@ class FftExplorerWindow(PlotViewWindow):
 
         for channel in metric.channels:
             box = QCheckBox(channel.label)
-            available = self._channel_availability.get(channel.id, False)
+            available = bool(self._channel_availability.get(channel.id, False))
             box.setEnabled(available)
             box.setChecked(available)
             box.toggled.connect(self._schedule_refresh)
@@ -209,11 +214,31 @@ class FftExplorerWindow(PlotViewWindow):
         session_ids = list(self._session_ids)
         base_dir = self._base_dir
         settings = self._settings
+        pending_preset = self._pending_preset
 
         def loader() -> tuple[dict[str, dict], dict[str, bool]]:
-            session_data = load_sessions_fft(session_ids, base_dir, settings=settings)
-            availability = probe_metric_availability(session_data)
-            return session_data, availability
+            header_avail = probe_fft_metric_availability_headers(
+                session_ids, base_dir,
+            )
+            if pending_preset and pending_preset in PRESET_BY_ID:
+                metric_id = PRESET_BY_ID[pending_preset].metric_id
+            else:
+                metric_id = next(
+                    (
+                        metric.id
+                        for metric in FFT_METRICS
+                        if header_avail.get(metric.id, False)
+                    ),
+                    FFT_METRICS[0].id,
+                )
+            channel_keys = channel_keys_for_metric(metric_id)
+            session_data = load_sessions_fft(
+                session_ids,
+                base_dir,
+                settings=settings,
+                channel_keys=channel_keys,
+            )
+            return session_data, header_avail
 
         self._load_task.schedule(loader)
 
@@ -244,13 +269,13 @@ class FftExplorerWindow(PlotViewWindow):
             )
             self._rebuild_channel_checks()
             for channel_id, box in self._channel_checks.items():
-                available = self._channel_availability.get(channel_id, False)
+                available = bool(self._channel_availability.get(channel_id, False))
                 if not available and self._session_data:
                     available = any(
                         len(data.get(channel_id, ())) > 0
                         for data in self._session_data.values()
                     )
-                    box.setEnabled(available)
+                    box.setEnabled(bool(available))
                 box.setChecked(available and channel_id in config.channels)
             if self._filter_panel is not None:
                 self._filter_panel.set_domain(config.domain_filter)
@@ -291,6 +316,57 @@ class FftExplorerWindow(PlotViewWindow):
         metric_id = self._current_metric_id()
         if metric_id is None:
             return
+        needed_keys = channel_keys_for_metric(metric_id)
+        missing = frozenset(
+            key
+            for key in needed_keys
+            if not any(
+                data.get(key) is not None and len(data[key]) > 0
+                for data in self._session_data.values()
+            )
+        )
+        if missing and self._metric_availability.get(metric_id, False):
+            self._load_metric_channels(metric_id, missing)
+            return
+        self._finish_metric_change(metric_id)
+
+    def _load_metric_channels(
+        self,
+        metric_id: str,
+        channel_keys: frozenset[str],
+    ) -> None:
+        session_ids = list(self._session_ids)
+        base_dir = self._base_dir
+        bg = self._settings.bg_subtract if self._settings else False
+        existing = dict(self._session_data)
+
+        def loader() -> tuple[str, dict[str, dict]]:
+            updated = dict(existing)
+            for sid in session_ids:
+                merged = merge_fft_session_channels(
+                    updated.get(sid),
+                    sid,
+                    base_dir,
+                    channel_keys,
+                    bg_subtract=bg,
+                )
+                if merged is not None:
+                    updated[sid] = merged
+            return metric_id, updated
+
+        self._show_status_message("Loading signal data…")
+        self._metric_load_task.schedule(loader)
+
+    @Slot(int, object)
+    def _on_metric_channels_loaded(self, _task_generation: int, result: object) -> None:
+        if not isinstance(result, tuple) or len(result) != 2:
+            return
+        metric_id, session_data = result
+        self._session_data = session_data
+        if metric_id == self._current_metric_id():
+            self._finish_metric_change(metric_id)
+
+    def _finish_metric_change(self, metric_id: str) -> None:
         self._channel_availability = probe_channel_availability(
             self._session_data, metric_id,
         )

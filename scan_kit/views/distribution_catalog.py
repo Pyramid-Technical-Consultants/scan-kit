@@ -19,6 +19,7 @@ from .unified_catalog import (
     COARSE_SOURCE_TIMESLICE,
     CoarseDataSourceKind,
     UnifiedViewOption,
+    format_view_option_label,
 )
 
 METRIC_POSITION = "position"
@@ -195,7 +196,15 @@ def _data_sources_for_mode(mode: DistributionModeDef) -> tuple[DataSourceKind, .
 
 
 VIEW_OPTIONS: tuple[UnifiedViewOption, ...] = tuple(
-    UnifiedViewOption(mode.metric_id, mode.label, data_source)
+    UnifiedViewOption(
+        mode.metric_id,
+        format_view_option_label(
+            mode.label,
+            data_source,
+            sibling_sources=_data_sources_for_mode(mode),
+        ),
+        data_source,
+    )
     for mode in MODES
     for data_source in _data_sources_for_mode(mode)
 )

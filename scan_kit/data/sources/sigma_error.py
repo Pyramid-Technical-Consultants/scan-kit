@@ -15,9 +15,12 @@ from ...common.timeslice_sigma import (
     resolve_timeslice_sigma_source,
     timeslice_sigma_error_available,
 )
+from ...common.timeslice_table import load_energy_tagged_table
 from ..context import LoadOptions, SessionContext
+from ..reference_frame import spot_sigma_prefer_raw
 from ..registry import DataSourceSpec, register
 from ..types import (
+    DATA_SOURCE_SPOT_CHAMBER,
     DATA_SOURCE_SPOT_ISO,
     DATA_SOURCE_TIMESLICE_ISO,
     GRANULARITY_SPOT,
@@ -25,8 +28,11 @@ from ..types import (
 )
 from ...common.session_source import read_session_csv_columns, resolve_session_source
 from ...common import detect_beam_on_mask, load_session_timeslice_device_units
+from ._common import beam_on_has_samples
 
 SOURCE_SIGMA_ERROR = "sigma_error"
+
+_TIMESLICE_SIGMA_ERROR_KEYS = ("ic1_x_err", "ic1_y_err", "ic2_x_err", "ic2_y_err")
 
 _SPOT_SIGMA_ATTRS = (
     ("ic1_x", "ic1", "x"),
@@ -40,15 +46,18 @@ def _spot_sigma_target_columns(spot_cols: list[str], input_cols: list[str]) -> d
     return _resolve_sigma_target_columns(spot_cols) or _resolve_sigma_target_columns(input_cols)
 
 
-def _probe_spot(ctx: SessionContext) -> bool:
+def _probe_spot(ctx: SessionContext, opts: LoadOptions) -> bool:
     src = resolve_session_source(ctx.session_id, ctx.base_dir)
     if src is None:
         return False
     spot_cols = read_session_csv_columns(src, "spot_data.csv")
     if not spot_cols:
         return False
+    prefer_raw = spot_sigma_prefer_raw(opts.reference_frame)
     if not all(
-        resolve_spot_sigma_column(spot_cols, ic, axis) is not None
+        resolve_spot_sigma_column(
+            spot_cols, ic, axis, prefer_raw=prefer_raw,
+        ) is not None
         for _attr, ic, axis in _SPOT_SIGMA_ATTRS
     ):
         return False
@@ -68,7 +77,7 @@ def _probe_sigma_error_timeslice(ctx: SessionContext) -> bool:
     if not timeslice_sigma_error_available(frames[0].columns):
         return False
     beam_on = detect_beam_on_mask(frames[0])
-    if beam_on is None or not np.any(beam_on):
+    if not beam_on_has_samples(beam_on):
         return False
     source = resolve_timeslice_sigma_source(frames[0].columns)
     if source is None:
@@ -81,20 +90,23 @@ def _probe_sigma_error_timeslice(ctx: SessionContext) -> bool:
 
 def probe_sigma_error(ctx: SessionContext, opts: LoadOptions) -> bool:
     if opts.granularity == GRANULARITY_SPOT:
-        return _probe_spot(ctx)
+        return _probe_spot(ctx, opts)
     if opts.granularity == GRANULARITY_TIMESLICE_SAMPLE:
         return _probe_sigma_error_timeslice(ctx)
     return False
 
 
-def _load_spot(ctx: SessionContext, _opts: LoadOptions) -> dict | None:
+def _load_spot(ctx: SessionContext, opts: LoadOptions) -> dict | None:
     input_map, spot_data = load_session_raw(ctx.session_id, base_dir=ctx.base_dir)
     if spot_data is None:
         return None
 
+    prefer_raw = spot_sigma_prefer_raw(opts.reference_frame)
     measured_cols: dict[str, str] = {}
     for attr, ic, axis in _SPOT_SIGMA_ATTRS:
-        col = resolve_spot_sigma_column(spot_data.columns, ic, axis)
+        col = resolve_spot_sigma_column(
+            spot_data.columns, ic, axis, prefer_raw=prefer_raw,
+        )
         if col is None:
             return None
         measured_cols[attr] = col
@@ -127,6 +139,28 @@ def _load_spot(ctx: SessionContext, _opts: LoadOptions) -> dict | None:
 
 def _load_timeslice(ctx: SessionContext, opts: LoadOptions) -> dict | None:
     bg_subtract = opts.resolved_bg_subtract(ctx)
+
+    def prepare(_src, frames):
+        return resolve_timeslice_sigma_source(frames[0].columns)
+
+    def extract(df, source):
+        target_cols = _resolve_sigma_target_columns(df.columns)
+        if target_cols is None:
+            return None
+        return frame_timeslice_sigma_error_arrays(df, source, target_cols)
+
+    table = load_energy_tagged_table(
+        ctx.session_id,
+        ctx.base_dir,
+        usecols=TIMESLICE_SIGMA_ERROR_COLS,
+        bg_subtract=bg_subtract,
+        prepare=prepare,
+        extract=extract,
+        keys=_TIMESLICE_SIGMA_ERROR_KEYS,
+    )
+    if table is not None:
+        return table
+
     errors = load_session_beam_on_sigma_errors(
         ctx.session_id, ctx.base_dir, bg_subtract=bg_subtract,
     )
@@ -156,6 +190,7 @@ SPEC = register(
         label="Sigma Error",
         data_sources=frozenset({
             DATA_SOURCE_SPOT_ISO,
+            DATA_SOURCE_SPOT_CHAMBER,
             DATA_SOURCE_TIMESLICE_ISO,
         }),
         supports_bg_subtract=True,

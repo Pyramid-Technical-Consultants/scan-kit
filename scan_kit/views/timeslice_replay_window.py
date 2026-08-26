@@ -92,7 +92,7 @@ class TimesliceReplayWindow(PlotViewWindow):
             for channel in channels:
                 check = QCheckBox(channel.label)
                 enabled = channel.key in self._available
-                check.setEnabled(enabled)
+                check.setEnabled(bool(enabled))
                 if not enabled:
                     check.setToolTip("Not available in the selected session(s)")
                 check.stateChanged.connect(self._on_controls_changed)
@@ -193,7 +193,7 @@ class TimesliceReplayWindow(PlotViewWindow):
         try:
             for key, check in self._channel_checks.items():
                 enabled = key in self._available
-                check.setEnabled(enabled)
+                check.setEnabled(bool(enabled))
                 if not enabled:
                     check.setChecked(False)
             for key in selected:

@@ -105,7 +105,7 @@ def load_session_current_ratios(
                 ic_plateau[ic].append(np.nan)
                 continue
 
-            sig = np.asarray(sig, dtype=np.float64)
+            sig = np.array(sig, dtype=np.float64, copy=True)
             sig[~np.isfinite(sig)] = 0.0
             on_samples = sig[beam_on]
             p95 = float(np.nanpercentile(on_samples, 95))

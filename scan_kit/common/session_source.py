@@ -30,6 +30,16 @@ _log = logging.getLogger(__name__)
 _TIMESLICE_RE = re.compile(
     r"^[^/]+/layer-(\d+)/run-(\d+)/timeslice_data_device_units\.csv$"
 )
+_SPOT_LAYER_RE = re.compile(
+    r"^[^/]+/layer-(\d+)/run-(\d+)/([^/]+_spot_data\.csv)$"
+)
+_POINT_TIME_COLUMN_ALIASES = ("point_time(ms)", "point_time_ms", "point_time")
+_PREFERRED_POINT_TIME_SPOT_FILES = (
+    "FX4_spot_data.csv",
+    "IX256_1_spot_data.csv",
+    "IX256_2_spot_data.csv",
+    "RCI_spot_data.csv",
+)
 
 # Longest suffix first so e.g. .tar.gz wins over .gz
 _ARCHIVE_SUFFIXES: tuple[str, ...] = (
@@ -463,6 +473,183 @@ def read_first_timeslice_columns(source: SessionSource) -> list[str] | None:
             e,
         )
         return None
+
+
+def _point_time_column_name(columns: list[str]) -> str | None:
+    for alias in _POINT_TIME_COLUMN_ALIASES:
+        resolved = resolve_requested_column(columns, alias)
+        if resolved is not None:
+            return resolved
+    for col in columns:
+        if str(col).strip().lower() in _POINT_TIME_COLUMN_ALIASES:
+            return str(col).strip()
+    return None
+
+
+def _pick_point_time_spot_member(run_members: list[str]) -> str | None:
+    for preferred in _PREFERRED_POINT_TIME_SPOT_FILES:
+        if preferred in run_members:
+            return preferred
+    for name in sorted(run_members):
+        if name == "TX2_spot_data.csv":
+            continue
+        return name
+    return None
+
+
+def _read_point_time_spot_frame(
+    source,
+    *,
+    sid: str | None = None,
+    member: str | None = None,
+) -> pd.DataFrame | None:
+    try:
+        if isinstance(source, (str, Path, os.PathLike)):
+            df = _read_csv_robust(source)
+        elif member is None:
+            return None
+        else:
+            sid = sid or source.session_id
+            if source.kind == "directory":
+                df = _read_csv_robust(source.path / member)
+            elif source.kind == "zip":
+                with zipfile.ZipFile(source.path, "r") as zf:
+                    with zf.open(f"{sid}/{member}") as handle:
+                        df = _read_csv_robust(handle)
+            elif source.kind == "tar":
+                with tarfile.open(source.path, "r:*") as tf:
+                    info = tf.getmember(f"{sid}/{member}")
+                    raw = tf.extractfile(info)
+                    if raw is None:
+                        return None
+                    df = _read_csv_robust(raw)
+            else:
+                return None
+    except Exception:
+        return None
+    if df is None or df.empty:
+        return None
+
+    point_col = _point_time_column_name(df.columns.tolist())
+    spot_col = resolve_requested_column(df.columns, "spot_no") or resolve_concept_column(
+        df.columns, "spot_no",
+    )
+    layer_col = resolve_requested_column(df.columns, "layer_id") or resolve_concept_column(
+        df.columns, "layer_id",
+    )
+    if point_col is None or spot_col is None or layer_col is None:
+        return None
+
+    out = pd.DataFrame(
+        {
+            "spot_no": pd.to_numeric(df[spot_col], errors="coerce"),
+            "layer_id": pd.to_numeric(df[layer_col], errors="coerce"),
+            "point_time_ms": pd.to_numeric(df[point_col], errors="coerce"),
+        }
+    )
+    out = out.dropna(subset=["spot_no", "layer_id"])
+    if out.empty:
+        return None
+    return out
+
+
+def _pick_point_time_spot_path(run_dir: Path) -> Path | None:
+    for name in _PREFERRED_POINT_TIME_SPOT_FILES:
+        path = run_dir / name
+        if path.is_file():
+            cols = _read_csv_header_columns(path)
+            if cols and _point_time_column_name(cols):
+                return path
+    for path in sorted(run_dir.glob("*_spot_data.csv")):
+        if path.name == "TX2_spot_data.csv":
+            continue
+        cols = _read_csv_header_columns(path)
+        if cols and _point_time_column_name(cols):
+            return path
+    return None
+
+
+def load_session_point_time_table(source: SessionSource) -> pd.DataFrame | None:
+    """Per-spot beam-on interval (ms) from layer run spot_data when absent from merged spot_data.csv."""
+    sid = source.session_id
+    parts: list[pd.DataFrame] = []
+    try:
+        if source.kind == "directory":
+            root = source.path
+            for layer_dir in sorted(root.glob("layer-*")):
+                if not layer_dir.is_dir():
+                    continue
+                try:
+                    layer_idx = int(layer_dir.name.split("-", 1)[1])
+                except (IndexError, ValueError):
+                    continue
+                for run_dir in sorted(layer_dir.glob("run-*")):
+                    spot_path = _pick_point_time_spot_path(run_dir)
+                    if spot_path is None:
+                        continue
+                    frame = _read_point_time_spot_frame(spot_path)
+                    if frame is not None:
+                        parts.append(frame)
+                    break
+
+        elif source.kind == "zip":
+            with zipfile.ZipFile(source.path, "r") as zf:
+                by_layer: dict[int, dict[int, list[str]]] = {}
+                for entry in zf.namelist():
+                    if not entry.startswith(f"{sid}/"):
+                        continue
+                    m = _SPOT_LAYER_RE.match(entry)
+                    if not m:
+                        continue
+                    layer_idx = int(m.group(1))
+                    run_idx = int(m.group(2))
+                    by_layer.setdefault(layer_idx, {}).setdefault(run_idx, []).append(
+                        m.group(3),
+                    )
+                for layer_idx in sorted(by_layer):
+                    run_members = by_layer[layer_idx].get(0, [])
+                    member_name = _pick_point_time_spot_member(run_members)
+                    if member_name is None:
+                        continue
+                    member = f"layer-{layer_idx}/run-0/{member_name}"
+                    frame = _read_point_time_spot_frame(
+                        source, sid=sid, member=member,
+                    )
+                    if frame is not None:
+                        parts.append(frame)
+
+        elif source.kind == "tar":
+            with tarfile.open(source.path, "r:*") as tf:
+                by_layer: dict[int, dict[int, list[str]]] = {}
+                for info in tf.getmembers():
+                    if not info.isfile():
+                        continue
+                    m = _SPOT_LAYER_RE.match(info.name)
+                    if not m:
+                        continue
+                    layer_idx = int(m.group(1))
+                    run_idx = int(m.group(2))
+                    by_layer.setdefault(layer_idx, {}).setdefault(run_idx, []).append(
+                        m.group(3),
+                    )
+                for layer_idx in sorted(by_layer):
+                    run_members = by_layer[layer_idx].get(0, [])
+                    member_name = _pick_point_time_spot_member(run_members)
+                    if member_name is None:
+                        continue
+                    member = f"layer-{layer_idx}/run-0/{member_name}"
+                    frame = _read_point_time_spot_frame(
+                        source, sid=sid, member=member,
+                    )
+                    if frame is not None:
+                        parts.append(frame)
+    except Exception as e:
+        _log.debug("Error loading point_time for session %s: %s", sid, e)
+        return None
+
+    if not parts:
+        return None
+    return pd.concat(parts, ignore_index=True)
 
 
 def load_session_timeslice_device_units(

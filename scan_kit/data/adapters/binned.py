@@ -67,3 +67,28 @@ def sigma_to_binned_columns(payload: dict | None) -> dict | None:
     if "beam_on" in payload:
         out["beam_on"] = payload["beam_on"]
     return out
+
+
+def sigma_error_to_binned_columns(payload: dict | None) -> dict | None:
+    """Map sigma-error payloads to binned columns (distinct from position-error keys)."""
+    if payload is None:
+        return None
+    if "energy" not in payload:
+        return None
+    mapping = {
+        "ic1_sig_x_err": "ic1_x_err",
+        "ic1_sig_y_err": "ic1_y_err",
+        "ic2_sig_x_err": "ic2_x_err",
+        "ic2_sig_y_err": "ic2_y_err",
+    }
+    if not any(src in payload for src in mapping.values()):
+        return None
+    out = {"energy": np.asarray(payload["energy"], dtype=float)}
+    for dest, src in mapping.items():
+        if src in payload:
+            out[dest] = np.asarray(payload[src], dtype=float)
+    if "session_id" in payload:
+        out["session_id"] = payload["session_id"]
+    if "beam_on" in payload:
+        out["beam_on"] = payload["beam_on"]
+    return out

@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import numpy as np
-
 from ...common import detect_beam_on_mask
 from ...common.session_source import load_session_timeslice_device_units, resolve_session_source
 from ...common.timeslice_confidence import (
@@ -14,6 +12,7 @@ from ...common.timeslice_confidence import (
 from ..context import LoadOptions, SessionContext
 from ..registry import DataSourceSpec, register
 from ..types import DATA_SOURCE_TIMESLICE_ISO, GRANULARITY_TIMESLICE_SAMPLE
+from ._common import beam_on_has_samples
 
 SOURCE_CONFIDENCE = "confidence"
 
@@ -32,7 +31,7 @@ def probe_confidence(ctx: SessionContext, opts: LoadOptions) -> bool:
     if resolve_timeslice_confidence_source(frames[0].columns) is None:
         return False
     beam_on = detect_beam_on_mask(frames[0])
-    return beam_on is not None and np.any(beam_on)
+    return beam_on_has_samples(beam_on)
 
 
 def load_confidence(ctx: SessionContext, opts: LoadOptions) -> object | None:

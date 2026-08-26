@@ -165,68 +165,38 @@ Settings persist in `<data_source>/settings.json` and propagate to views that ar
 
 ### 5. Open analysis views
 
-Click any button in the right-hand panel. **Unified views** appear first; specialized plots follow (see [Analysis views](#analysis-views)). Each view runs in a background subprocess; a warm worker pool makes the first click feel snappy.
+Click any button in the right-hand panel. **Unified Views** and **Specialized Analysis** are the two launcher groups. Each view runs in a background subprocess; a warm worker pool makes the first click feel snappy.
 
 ## Analysis views
 
-Views are organized in the launcher with **unified reusable views first**; the specialized plots below are the remaining single-purpose modules still to consolidate.
+Views are organized in the launcher as **Unified Views** (configurable Qt explorers that replaced many former one-off plots) and **Specialized Analysis** (remaining focused matplotlib tools not yet folded into a unified shell).
 
 ### Unified views
 
-Configurable Qt shells that replace many former standalone plots.
+Configurable Qt shells for the metrics most sessions need day to day.
 
 | View | Summary |
 |------|---------|
-| Binned Summary | Universal box/violin/mean summary — pick **Y metric** (dose error, dose ratios, dose rate, current ratios, IC current, position error, sigma, spot time) and **X parameter** (energy, target MU, spot time, beam radius). **Filter Data** includes beam on/off/both plus severity filters. |
-| Distribution Explorer | Density contours and fit-quality plots — position error (timeslice/spot), sigma, confidence correlations, and Gaussian filter coverage. **Filter Data** selects beam on/off/both for timeslice metrics. |
+| Binned Summary | Box/violin/mean summary — pick **Y metric** (dose error, dose ratios, dose rate, current ratios, IC current, position error, sigma, spot time) and **X parameter** (energy, target MU, spot time, beam radius). **Filter Data** includes beam on/off/both plus severity filters. |
+| Distribution Explorer | Density contours and fit-quality plots — position, position error (timeslice/spot), sigma, confidence correlations, and Gaussian filter coverage. **Filter Data** selects beam on/off/both for timeslice metrics. |
+| FFT Explorer | Frequency-domain line spectra for selectable timeslice IC currents (replaces the standalone IC FFT view). |
 | Timeslice Replay | Interactive multi-channel timeslice viewer — [details](#interactive-replay-views) |
+| IC Beam Trajectory (3D) | Per-spot IC beam paths in 3D with plan overlay, dipole pivots, and iso/IC planes (visPy) |
 | Session Log Compare | Layer timings, grouped errors, event browser, two-session diff — [details](#session-log-compare) |
 
-### Beam distribution
+For position scatter, position-error outliers, beam-on/off IC current histograms, and most dose/position/sigma summaries, start with **Binned Summary** or **Distribution Explorer** instead of opening a dedicated legacy plot.
 
-How well does the beam land where the plan says it should?
+### Specialized analysis
+
+Focused plots that still use standalone matplotlib windows:
 
 | View | Summary |
 |------|---------|
-| Position Error Outliers (Spot) | Spots that are statistical outliers (median/MAD) |
-| Position Scatter | Planned, IC1, and IC2 positions overlaid by session |
-| IC Beam Trajectory | Per-spot IC beam path in X and Y along the beam axis |
 | Beam Error Motion vs Energy | Per-energy position-error spill paths (IC1 solid, IC2 dotted) |
-
-Use **Distribution Explorer** for position-error and sigma density contours, confidence correlations, and Gaussian filter coverage. Use **Binned Summary** for the same metrics binned vs energy, MU, spot time, or radius.
-
-### Dosimetry
-
-Are chambers consistent, and is delivered dose on target?
-
-| View | Summary |
-|------|---------|
 | Dose Accumulation | Expected vs measured cumulative dose per chamber |
-
-Use **Binned Summary** presets for dose error, dose ratios, dose rate, current ratios, IC current, position error, sigma, and spot-time vs energy / MU / spot time / radius. Use **Filter Data → Beam On / Beam Off / Beam On + Off** for timeslice IC current (replaces the old beam-on/off current view).
-
-### Beam current & timing
-
-Use **Binned Summary → IC Current (nA)** with **Filter Data** for beam-on vs beam-off current distributions by energy.
-
-### Timeseries & transients
-
-| View | Summary |
-|------|---------|
 | Beam-Off Ramp-Down | Beam-off current ramp-down curves (IC1/IC2/IC3) |
 | IC HV Transient Test | IC high-voltage toggle transients with capacitance re-derived from waveforms |
-
-### Magnetic analysis
-
-| View | Summary |
-|------|---------|
-| Amplifier Command Correlations | Settled amplifier command vs readback, field, and IC position — [details](#amplifier-command-correlations) |
-
-### Noise measurement
-
-| View | Summary |
-|------|---------|
-| IC Current FFT Analysis | Frequency-domain view of IC1/IC2/IC3 current |
+| Amplifier Command Correlations | Settled amplifier command vs readback, field, and IC iso position — [details](#amplifier-command-correlations) |
 | IC Peak Amplitude — Beam-Off (G3) | G3 beam-off peak amplitude distributions |
 | IC Audio Export (WAV) | Listen to and export IC waveforms as WAV *(requires PortAudio)* |
 
