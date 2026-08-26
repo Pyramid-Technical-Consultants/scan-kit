@@ -148,11 +148,11 @@ def _make_opaque_disc_marker(
         edge_width=0,
         edge_color=(0.0, 0.0, 0.0, 0.0),
         spherical=False,
-        method="instanced",
         antialias=0,
         alpha=1.0,
         parent=parent,
     )
+    # GL2 backends (common in frozen Windows builds) lack instanced marker drawing.
     # Default Markers use src_alpha blending + soft edges, which moirés on dense grids.
     marker.set_gl_state(preset="opaque")
     return marker

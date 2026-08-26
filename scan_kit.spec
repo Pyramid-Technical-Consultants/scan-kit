@@ -10,10 +10,19 @@ import ctypes.util
 import sys
 from pathlib import Path
 
-from PyInstaller.utils.hooks import collect_all
+from PyInstaller.utils.hooks import collect_all, collect_data_files, collect_submodules
 
 block_cipher = None
 ROOT = Path(SPECPATH)
+
+
+def _drop_test_tree_datas(datas: list) -> list:
+    return [
+        (src, dest)
+        for src, dest in datas
+        if "/tests/" not in src.replace("\\", "/")
+    ]
+
 
 # ---------------------------------------------------------------------------
 # On Linux, sounddevice depends on the system libportaudio which PyInstaller
@@ -34,116 +43,56 @@ if sys.platform.startswith("linux"):
                 break
 
 # ---------------------------------------------------------------------------
-# PySide6: plugins and Qt resource files
+# Third-party packages with non-Python runtime assets
 # ---------------------------------------------------------------------------
 _pyside6_datas, _pyside6_binaries, _pyside6_hiddenimports = collect_all("PySide6")
 
 # vispy loads GLSL shaders from disk at import time; hiddenimports alone are not enough.
 _vispy_datas, _vispy_binaries, _vispy_hiddenimports = collect_all("vispy")
-_vispy_datas = [
-    (src, dest)
-    for src, dest in _vispy_datas
-    if "/tests/" not in src.replace("\\", "/")
-]
+_vispy_datas = _drop_test_tree_datas(_vispy_datas)
+
+_mpl_datas = collect_data_files("matplotlib", includes=["**/mpl-data/**"])
 
 _assets_dir = ROOT / "scan_kit" / "assets"
 _app_datas = [(str(_assets_dir), "scan_kit/assets")]
 
 # ---------------------------------------------------------------------------
-# Collect all scan_kit submodules so PyInstaller bundles them even though
-# some are only imported dynamically (e.g. via --run-view).
+# scan_kit submodules imported dynamically (--run-view, warm worker, registry).
 # ---------------------------------------------------------------------------
-hiddenimports = [
-    "scan_kit.qt_launcher",
-    "scan_kit.common.plot_colors",
-    # view modules (dynamically imported via importlib in --run-view / warm-worker mode)
-    "scan_kit.views.plot_view_shell",
-    "scan_kit.views.async_refresh",
-    "scan_kit.views.unified_catalog",
-    "scan_kit.views.unified_view_controls",
-    "scan_kit.common.segmented_control",
-    "scan_kit.common.data_filter",
-    "scan_kit.common.ic_trajectory",
-    "scan_kit.common.scan_magnet_model",
-    "scan_kit.common.trajectory_fits",
-    "scan_kit.common.current_ratios",
-    "scan_kit.common.ic_current_timeslice",
-    "scan_kit.common.timeslice_ic_current",
-    "scan_kit.common.mu_delivery_rate",
-    "scan_kit.views.binned_summary",
-    "scan_kit.views.binned_summary_catalog",
-    "scan_kit.views.binned_summary_data",
-    "scan_kit.views.binned_summary_ui",
-    "scan_kit.views.binned_summary_window",
-    "scan_kit.views.distribution",
-    "scan_kit.views.distribution_catalog",
-    "scan_kit.views.distribution_data",
-    "scan_kit.views.distribution_ui",
-    "scan_kit.views.distribution_window",
-    "scan_kit.views.ic_fft_analysis",
-    "scan_kit.views.fft_catalog",
-    "scan_kit.views.fft_data",
-    "scan_kit.views.fft_ui",
-    "scan_kit.views.fft_window",
-    "scan_kit.views.timeslice_replay",
-    "scan_kit.views.timeslice_replay_common",
-    "scan_kit.views.timeslice_replay_channels",
-    "scan_kit.views.timeslice_replay_ui",
-    "scan_kit.views.timeslice_replay_window",
-    "scan_kit.views.ic_timeslice_replay",
-    "scan_kit.views.ic_timeslice_replay_derived",
-    "scan_kit.views.sigma_timeslice_replay",
-    "scan_kit.views.field_timeslice_replay",
-    "scan_kit.views.trajectory",
-    "scan_kit.views.trajectory_catalog",
-    "scan_kit.views.trajectory_data",
-    "scan_kit.views.trajectory_vispy",
-    "scan_kit.views.trajectory_window",
-    "scan_kit.views.session_log_compare",
-    "scan_kit.views.position_scatter",
-    "scan_kit.views.beam_motion_energy",
-    "scan_kit.views.dose_accumulation",
-    "scan_kit.views.beam_off_rampdown",
-    "scan_kit.views.ic_hv_transient",
-    "scan_kit.views.amplifier_correlation",
-    "scan_kit.views.ic_peak_amplitude_beam_off",
-    "scan_kit.views.ic_audio_export",
-    # common submodules
-    "scan_kit.common.session_meta",
-    "scan_kit.common.session_notes",
-    "scan_kit.common.session_source",
-    "scan_kit.common.sessions",
-    "scan_kit.common.schema",
-    "scan_kit.common.transform",
-    "scan_kit.common.validation",
-    "scan_kit.common.processing",
-    "scan_kit.common.plotting",
-    "scan_kit.common.position_error_distribution",
-    "scan_kit.common.ic_xy_distribution",
-    "scan_kit.common.session_ic_xy",
-    "scan_kit.common.gaussian_fit_filter_coverage_plot",
-    "scan_kit.common.sigma_distribution",
-    "scan_kit.common.timeslice_sigma",
-    "scan_kit.common.view_runner",
-    # third-party modules that PyInstaller sometimes misses
-    "scipy.signal",
-    "scipy.fft",
-    "scipy.fft._pocketfft",
-    "sounddevice",
-    "matplotlib.backends.backend_qtagg",
-    "matplotlib.backends.backend_qt",
-    "matplotlib.backends.backend_tkagg",
-    "tkinter",
-    "PySide6.QtSvg",
-    *_pyside6_hiddenimports,
-    *_vispy_hiddenimports,
-]
+_scan_kit_hiddenimports = collect_submodules("scan_kit.data")
+_scan_kit_hiddenimports += collect_submodules("scan_kit.views")
+_scan_kit_hiddenimports += collect_submodules("scan_kit.workflows")
+_scan_kit_hiddenimports += collect_submodules("scan_kit.common")
+
+hiddenimports = list(
+    dict.fromkeys(
+        [
+            "scan_kit.app",
+            "scan_kit.qt_launcher",
+            "scan_kit.common.view_runner",
+            "scan_kit.common.matplotlib_backend",
+            # third-party modules that PyInstaller sometimes misses
+            "scipy.signal",
+            "scipy.fft",
+            "scipy.fft._pocketfft",
+            "sounddevice",
+            "matplotlib.backends.backend_qtagg",
+            "matplotlib.backends.backend_qt",
+            "matplotlib.backends.backend_tkagg",
+            "tkinter",
+            "PySide6.QtSvg",
+            *_scan_kit_hiddenimports,
+            *_pyside6_hiddenimports,
+            *_vispy_hiddenimports,
+        ],
+    ),
+)
 
 a = Analysis(
     [str(ROOT / "scan_kit" / "__main__.py")],
     pathex=[str(ROOT)],
     binaries=_extra_binaries + _pyside6_binaries + _vispy_binaries,
-    datas=_pyside6_datas + _app_datas + _vispy_datas,
+    datas=_pyside6_datas + _app_datas + _vispy_datas + _mpl_datas,
     hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={
