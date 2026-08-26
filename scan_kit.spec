@@ -38,6 +38,14 @@ if sys.platform.startswith("linux"):
 # ---------------------------------------------------------------------------
 _pyside6_datas, _pyside6_binaries, _pyside6_hiddenimports = collect_all("PySide6")
 
+# vispy loads GLSL shaders from disk at import time; hiddenimports alone are not enough.
+_vispy_datas, _vispy_binaries, _vispy_hiddenimports = collect_all("vispy")
+_vispy_datas = [
+    (src, dest)
+    for src, dest in _vispy_datas
+    if "/tests/" not in src.replace("\\", "/")
+]
+
 _assets_dir = ROOT / "scan_kit" / "assets"
 _app_datas = [(str(_assets_dir), "scan_kit/assets")]
 
@@ -127,16 +135,15 @@ hiddenimports = [
     "matplotlib.backends.backend_tkagg",
     "tkinter",
     "PySide6.QtSvg",
-    "vispy",
-    "vispy.app.backends._pyside6",
     *_pyside6_hiddenimports,
+    *_vispy_hiddenimports,
 ]
 
 a = Analysis(
     [str(ROOT / "scan_kit" / "__main__.py")],
     pathex=[str(ROOT)],
-    binaries=_extra_binaries + _pyside6_binaries,
-    datas=_pyside6_datas + _app_datas,
+    binaries=_extra_binaries + _pyside6_binaries + _vispy_binaries,
+    datas=_pyside6_datas + _app_datas + _vispy_datas,
     hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={
