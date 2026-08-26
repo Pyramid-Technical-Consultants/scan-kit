@@ -14,7 +14,12 @@ from ..common import (
     process_position_data,
     try_load_position_data,
 )
-from ..common.ic_trajectory import IC1_Z_MM, IC2_Z_MM, IC_SEP_MM, ic_alignment_offsets
+from ..common.ic_trajectory import ic_alignment_offsets
+from ..common.scan_magnet_model import (
+    beam_lateral_mm,
+    plan_lateral_at_z,
+    segment_z_bounds,
+)
 from ..common.session_notes import load_notes
 from ..common.trajectory_fits import (
     IsoFit,
@@ -53,10 +58,12 @@ class TrajectorySession:
 
     @property
     def pivot_z(self) -> float:
+        """Median X/Y dipole pivot depth (use per-axis fits for physics)."""
         return combined_pivot_z(self.magnet_x, self.magnet_y)
 
     @property
     def iso_z(self) -> float:
+        """Median X/Y iso depth (use per-axis iso fits for physics)."""
         return combined_iso_z(self.iso_x, self.iso_y)
 
 
@@ -167,35 +174,57 @@ def probe_trajectory_availability(session_ids: Sequence[str], base_dir: str) -> 
     return bool(load_trajectory_sessions(session_ids, base_dir))
 
 
+def segment_z_extent(
+    session: TrajectorySession,
+    *,
+    extend_upstream_mm: float,
+    extend_downstream_mm: float,
+) -> tuple[float, float]:
+    """Clip range from furthest upstream dipole pivot to furthest iso plane."""
+    return segment_z_bounds(
+        session.magnet_x,
+        session.magnet_y,
+        session.iso_x,
+        session.iso_y,
+        extend_upstream_mm=extend_upstream_mm,
+        extend_downstream_mm=extend_downstream_mm,
+    )
+
+
 def spot_segments_3d(
     session: TrajectorySession,
     *,
     extend_upstream_mm: float,
     extend_downstream_mm: float,
 ) -> np.ndarray:
-    """Return ``(n_spots, 2, 3)`` line endpoints in mm (x, y, z downstream from IC2)."""
+    """Return ``(n_spots, 2, 3)`` line endpoints in mm (x, y, z downstream from IC2).
+
+    When magnet and iso fits are available, rays run from the furthest upstream
+    dipole pivot to the furthest iso plane.  Lateral position uses independent X/Y
+    IC extrapolation (separate virtual pivots per scan dipole).
+    """
     n = session.n_spots
     if n == 0:
         return np.empty((0, 2, 3), dtype=float)
 
-    z_up = IC2_Z_MM - extend_upstream_mm
-    z_dn = IC1_Z_MM + extend_downstream_mm
+    z_start, z_end = segment_z_extent(
+        session,
+        extend_upstream_mm=extend_upstream_mm,
+        extend_downstream_mm=extend_downstream_mm,
+    )
 
-    sx = (session.ic1_x - session.ic2_x) / IC_SEP_MM
-    sy = (session.ic1_y - session.ic2_y) / IC_SEP_MM
-
-    x_up = session.ic2_x + sx * (z_up - IC2_Z_MM)
-    y_up = session.ic2_y + sy * (z_up - IC2_Z_MM)
-    x_dn = session.ic1_x + sx * (z_dn - IC1_Z_MM)
-    y_dn = session.ic1_y + sy * (z_dn - IC1_Z_MM)
+    x_start = beam_lateral_mm(session.ic2_x, session.ic1_x, z_start)
+    y_start = beam_lateral_mm(session.ic2_y, session.ic1_y, z_start)
+    x_end = beam_lateral_mm(session.ic2_x, session.ic1_x, z_end)
+    y_end = beam_lateral_mm(session.ic2_y, session.ic1_y, z_end)
 
     segments = np.empty((n, 2, 3), dtype=float)
-    segments[:, 0, 0] = x_up
-    segments[:, 0, 1] = y_up
-    segments[:, 0, 2] = z_up
-    segments[:, 1, 0] = x_dn
-    segments[:, 1, 1] = y_dn
-    segments[:, 1, 2] = z_dn
+    segments[:, 0, 0] = x_start
+    segments[:, 0, 1] = y_start
+    segments[:, 0, 2] = z_start
+    segments[:, 1, 0] = x_end
+    segments[:, 1, 1] = y_end
+    segments[:, 1, 2] = z_end
     return segments
 
 
@@ -205,12 +234,23 @@ def plan_segments_3d(
     extend_upstream_mm: float,
     extend_downstream_mm: float,
 ) -> np.ndarray | None:
-    """Per-spot plan rays in 3D, or None when plan or fits are unavailable."""
+    """Per-spot plan rays in 3D using separate X/Y dipole pivots and iso planes."""
     if session.plan_x is None or session.plan_y is None:
         return None
-    z_pivot = session.pivot_z
-    z_iso = session.iso_z
-    if not np.isfinite(z_pivot) or not np.isfinite(z_iso) or abs(z_iso - z_pivot) < 1e-3:
+
+    z_px = session.magnet_x.z_pivot
+    z_py = session.magnet_y.z_pivot
+    z_ix = session.iso_x.z_iso if session.iso_x is not None else float("nan")
+    z_iy = session.iso_y.z_iso if session.iso_y is not None else float("nan")
+
+    if not (
+        session.magnet_x.is_valid
+        and session.magnet_y.is_valid
+        and session.iso_x is not None
+        and session.iso_x.is_valid
+        and session.iso_y is not None
+        and session.iso_y.is_valid
+    ):
         return None
 
     plan_x = session.plan_x
@@ -223,18 +263,19 @@ def plan_segments_3d(
     plan_y = plan_y[ok]
     n = plan_x.size
 
-    z_up = IC2_Z_MM - extend_upstream_mm
-    z_dn = IC1_Z_MM + extend_downstream_mm
-    scale_up = (z_up - z_pivot) / (z_iso - z_pivot)
-    scale_dn = (z_dn - z_pivot) / (z_iso - z_pivot)
+    z_start, z_end = segment_z_extent(
+        session,
+        extend_upstream_mm=extend_upstream_mm,
+        extend_downstream_mm=extend_downstream_mm,
+    )
 
     segments = np.empty((n, 2, 3), dtype=float)
-    segments[:, 0, 0] = plan_x * scale_up
-    segments[:, 0, 1] = plan_y * scale_up
-    segments[:, 0, 2] = z_up
-    segments[:, 1, 0] = plan_x * scale_dn
-    segments[:, 1, 1] = plan_y * scale_dn
-    segments[:, 1, 2] = z_dn
+    segments[:, 0, 0] = plan_lateral_at_z(plan_x, z_px, z_ix, z_start)
+    segments[:, 0, 1] = plan_lateral_at_z(plan_y, z_py, z_iy, z_start)
+    segments[:, 0, 2] = z_start
+    segments[:, 1, 0] = plan_x
+    segments[:, 1, 1] = plan_y
+    segments[:, 1, 2] = z_end
     return segments
 
 
@@ -247,20 +288,38 @@ def format_session_summary(
 
     sid = format_session_legend_label(session.session_id, notes)
     lines = [sid]
-    if session.magnet_x.is_valid:
-        sig = session.magnet_x.upstream_sigma_mm
-        dist = session.magnet_x.upstream_mm
+
+    def _pivot_line(label: str, fit: MagnetFit) -> None:
+        if not fit.is_valid:
+            return
+        sig = fit.upstream_sigma_mm
+        dist = fit.upstream_mm
         if np.isfinite(sig) and sig > 0:
-            lines.append(f"  pivot {dist:.0f} ± {sig:.0f} mm upstream")
+            lines.append(f"  {label} pivot {dist:.0f} ± {sig:.0f} mm upstream")
         else:
-            lines.append(f"  pivot {dist:.0f} mm upstream")
+            lines.append(f"  {label} pivot {dist:.0f} mm upstream")
+
+    _pivot_line("X scan", session.magnet_x)
+    _pivot_line("Y scan", session.magnet_y)
+
     lines.append(
         f"  align IC1 ({session.align_ic1_x:+.1f}, {session.align_ic1_y:+.1f}) mm",
     )
     lines.append(
         f"  align IC2 ({session.align_ic2_x:+.1f}, {session.align_ic2_y:+.1f}) mm",
     )
-    z_iso = session.iso_z
-    if np.isfinite(z_iso):
-        lines.append(f"  iso plane z = {z_iso:.0f} mm downstream")
+
+    def _iso_line(label: str, iso: IsoFit | None) -> None:
+        if iso is None or not iso.is_valid:
+            return
+        sig = iso.downstream_sigma_mm
+        if np.isfinite(sig) and sig > 0:
+            lines.append(
+                f"  {label} iso {iso.downstream_mm:.0f} ± {sig:.0f} mm down",
+            )
+        else:
+            lines.append(f"  {label} iso {iso.downstream_mm:.0f} mm down")
+
+    _iso_line("X", session.iso_x)
+    _iso_line("Y", session.iso_y)
     return "\n".join(lines)

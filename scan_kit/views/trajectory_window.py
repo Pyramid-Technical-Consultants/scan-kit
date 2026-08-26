@@ -117,9 +117,9 @@ class TrajectoryWindow(QMainWindow):
         self._show_spots.setChecked(True)
         self._show_plan = QCheckBox("Plan rays (iso ↔ pivot)")
         self._show_plan.setChecked(True)
-        self._show_pivot = QCheckBox("Magnet pivot markers")
+        self._show_pivot = QCheckBox("X/Y scan dipole pivots")
         self._show_pivot.setChecked(True)
-        self._show_iso = QCheckBox("Fitted iso planes")
+        self._show_iso = QCheckBox("Fitted iso planes (per axis)")
         self._show_iso.setChecked(True)
         self._show_ic = QCheckBox("IC chamber planes")
         self._show_ic.setChecked(True)
@@ -134,8 +134,14 @@ class TrajectoryWindow(QMainWindow):
             display_layout.addWidget(box)
         layout.addWidget(display_group)
 
-        extend_group = QGroupBox("Beam extent (mm)")
+        extend_group = QGroupBox("Fallback extent (mm)")
         extend_layout = QVBoxLayout(extend_group)
+        extend_layout.addWidget(
+            QLabel(
+                "Rays span furthest upstream dipole pivot to furthest iso plane. "
+                "Fallback when fits are missing.",
+            ),
+        )
         up_row, self._extend_up_spin = self._make_extend_spin("Upstream of IC2", 2000.0)
         down_row, self._extend_down_spin = self._make_extend_spin("Downstream of IC1", 2000.0)
         extend_layout.addWidget(up_row)

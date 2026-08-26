@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from .ic_trajectory import IC1_Z_MM, IC2_Z_MM, IC_SEP_MM
+from .ic_trajectory import IC1_Z_MM, IC2_Z_MM, IC_SEP_MM, ic_fan_convergence
 
 # Cap spots used for pairwise crossover (n^2 pairs); fixed seed for reproducibility.
 _PAIRWISE_MAX_SPOTS = 400
@@ -18,11 +18,12 @@ _SLOPE_EPS = 1e-9
 
 @dataclass(frozen=True)
 class MagnetFit:
-    """Upstream crossover of per-spot IC2–IC1 lines for one session axis."""
+    """Upstream crossover of per-spot IC2–IC1 lines for one scan dipole axis."""
 
     z_pivot: float
     upstream_mm: float
     upstream_sigma_mm: float
+    lateral_mm: float = float("nan")
 
     @property
     def is_valid(self) -> bool:
@@ -74,6 +75,7 @@ def fit_magnet_pivot(p2: np.ndarray, p1: np.ndarray) -> MagnetFit:
         rng = np.random.default_rng(_PAIRWISE_RNG_SEED)
         pick = np.sort(rng.choice(n, size=_PAIRWISE_MAX_SPOTS, replace=False))
         p2 = p2[pick]
+        p1 = p1[pick]
         slopes = slopes[pick]
 
     z_cross = pairwise_upstream_crossings(p2, slopes)
@@ -84,10 +86,14 @@ def fit_magnet_pivot(p2: np.ndarray, p1: np.ndarray) -> MagnetFit:
     mad = float(np.median(np.abs(z_cross - z_pivot)))
     sigma = 1.4826 * mad if mad > 0 else float(np.std(z_cross, ddof=1))
 
+    conv = ic_fan_convergence(p2, p1)
+    lateral = conv.position_mm if conv.is_valid else float("nan")
+
     return MagnetFit(
         z_pivot,
         IC2_Z_MM - z_pivot,
         float(sigma) if np.isfinite(sigma) else float("nan"),
+        lateral_mm=lateral,
     )
 
 
@@ -157,7 +163,7 @@ def project_plan_to_z(
 
 
 def combined_pivot_z(magnet_x: MagnetFit, magnet_y: MagnetFit) -> float:
-    """Best single pivot depth for 3D overlays (median of axis fits)."""
+    """Median pivot depth when a single z is needed (3D summaries only)."""
     vals = [
         magnet_x.z_pivot,
         magnet_y.z_pivot,
