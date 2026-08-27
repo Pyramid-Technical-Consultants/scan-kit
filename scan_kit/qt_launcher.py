@@ -61,6 +61,7 @@ from .common.settings import ViewSettings, CALIBRATION_MODES
 from .common.qt_widgets import make_pane_scroll_area, set_pane_scroll_widget
 from .views import TK_ONLY_VIEW_MODULES, VIEW_GROUPS, VIEWS
 from .workflows.plan_synthesis_panel import PlanSynthesisPanel
+from .workflows.plan_runner_panel import PlanRunnerPanel
 from .workflows.config_tuning.auto_tuning.paths import resolve_session_config_dir
 from .workflows.config_tuning_panel import ConfigTuningPanel
 
@@ -77,6 +78,7 @@ _VIEW_GRID_COLS = 2
 
 _MAIN_TAB_DATA_ANALYSIS = "Data Analysis"
 _MAIN_TAB_PLAN_SYNTHESIS = "Plan Synthesis"
+_MAIN_TAB_PLAN_RUNNER = "Plan Runner"
 _MAIN_TAB_CONFIG_TUNING = "Configuration Tuning"
 _MAIN_TAB_DEBUG = "Debug"
 
@@ -185,6 +187,7 @@ class ScanKitMainWindow(QMainWindow):
         tabs = QTabWidget()
         tabs.addTab(self._build_data_analysis_tab(), _MAIN_TAB_DATA_ANALYSIS)
         tabs.addTab(self._build_plan_synthesis_tab(), _MAIN_TAB_PLAN_SYNTHESIS)
+        tabs.addTab(self._build_plan_runner_tab(), _MAIN_TAB_PLAN_RUNNER)
         self._config_tuning_panel = ConfigTuningPanel(app_settings=self._app_settings)
         self._config_tuning_panel.set_session_data_dir(self._base_dir)
         tabs.addTab(self._config_tuning_panel, _MAIN_TAB_CONFIG_TUNING)
@@ -259,8 +262,9 @@ class ScanKitMainWindow(QMainWindow):
         tab_shortcuts = {
             _MAIN_TAB_DATA_ANALYSIS: "Ctrl+1",
             _MAIN_TAB_PLAN_SYNTHESIS: "Ctrl+2",
-            _MAIN_TAB_CONFIG_TUNING: "Ctrl+3",
-            _MAIN_TAB_DEBUG: "Ctrl+4",
+            _MAIN_TAB_PLAN_RUNNER: "Ctrl+3",
+            _MAIN_TAB_CONFIG_TUNING: "Ctrl+4",
+            _MAIN_TAB_DEBUG: "Ctrl+5",
         }
         for name, shortcut in tab_shortcuts.items():
             action = QAction(name, self)
@@ -555,6 +559,9 @@ class ScanKitMainWindow(QMainWindow):
 
     def _build_plan_synthesis_tab(self) -> QWidget:
         return PlanSynthesisPanel(app_settings=self._app_settings)
+
+    def _build_plan_runner_tab(self) -> QWidget:
+        return PlanRunnerPanel(app_settings=self._app_settings)
 
     def _track_worker(self, thread: threading.Thread) -> None:
         self._worker_threads = [t for t in self._worker_threads if t.is_alive()]

@@ -63,6 +63,7 @@ _scan_kit_hiddenimports = collect_submodules("scan_kit.data")
 _scan_kit_hiddenimports += collect_submodules("scan_kit.views")
 _scan_kit_hiddenimports += collect_submodules("scan_kit.workflows")
 _scan_kit_hiddenimports += collect_submodules("scan_kit.common")
+_scan_kit_hiddenimports += collect_submodules("scan_kit.igx")
 
 hiddenimports = list(
     dict.fromkeys(
@@ -81,6 +82,9 @@ hiddenimports = list(
             "matplotlib.backends.backend_tkagg",
             "tkinter",
             "PySide6.QtSvg",
+            "websocket",
+            "msgpack",
+            "requests",
             *_scan_kit_hiddenimports,
             *_pyside6_hiddenimports,
             *_vispy_hiddenimports,
