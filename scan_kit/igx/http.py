@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from typing import Any
+from urllib.parse import urlparse
 
 import requests
 
@@ -10,8 +11,24 @@ DEFAULT_PORT = 80
 REQUEST_TIMEOUT = (3.05, 30)
 
 
+def parse_host(host: str) -> str:
+    """Accept IP, host:port, or http(s) URL; return host or host:port."""
+    text = host.strip()
+    if not text:
+        raise ValueError("host is required")
+    if "://" in text:
+        parsed = urlparse(text)
+        if not parsed.hostname:
+            raise ValueError(f"invalid host: {host}")
+        if parsed.port:
+            return f"{parsed.hostname}:{parsed.port}"
+        return parsed.hostname
+    return text.split("/", 1)[0]
+
+
 def normalize_host(host: str) -> str:
     """Return host with port; use DEFAULT_PORT if no port in host."""
+    host = parse_host(host)
     return f"{host}:{DEFAULT_PORT}" if ":" not in host else host
 
 

@@ -30,6 +30,12 @@ def test_live_rci_connect_and_upload(tmp_path: Path) -> None:
     svc = PlanRunnerService()
     info = svc.connect(host)
     assert info.get("host") == host
+    snapshot = info.get("status") or {}
+    assert snapshot.get("rci/rci_controller/state")
+
+    status = svc.read_status()
+    assert status.get("rci/rci_controller/state")
+    assert "rci/rci_controller/progress" in status
 
     target = svc.upload_plan(csv_path, timeout_s=45.0)
     assert target.startswith("/")

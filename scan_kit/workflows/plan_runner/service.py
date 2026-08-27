@@ -6,6 +6,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from ...igx.http import get_json, parse_host
 from ...igx.keys import field_subscribe_key
 from ...igx.mpack import MpackSession, MpackSessionError
 from ...igx.rci_paths import (
@@ -27,6 +28,7 @@ class PlanRunnerService:
         self._session: MpackSession | None = None
         self._host: str = ""
         self._status_keys: dict[str, str] = {}
+        self._status_cache: dict[str, Any] = {}
 
     @property
     def connected(self) -> bool:
@@ -38,41 +40,31 @@ class PlanRunnerService:
 
     def connect(self, host: str) -> dict[str, Any]:
         """Open mpack session and subscribe to status fields."""
-        host = host.strip()
-        if not host:
-            raise ValueError("host is required")
+        host = parse_host(host)
 
         self.disconnect()
         session = MpackSession(host)
         session.connect()
 
-        version = session.read_field("admin/version", timeout_s=8.0)
-        device_type = None
-        try:
-            device_type = session.read_field("admin/device_type", timeout_s=4.0)
-        except MpackSessionError:
-            pass
-
         key_for_path = {
             field_subscribe_key(p, "value"): p for p in STATUS_IO_PATHS
         }
-        session.subscribe_fields({k: False for k in key_for_path})
+        values, _errors = session.read_fields(list(STATUS_IO_PATHS), timeout_s=8.0)
 
         self._session = session
         self._host = host
         self._status_keys = key_for_path
-
-        session_dir = "/root/reports/session"
-        try:
-            session_dir = str(session.read_field(SESSION_DIRECTORY, timeout_s=4.0))
-        except MpackSessionError:
-            pass
+        self._status_cache = dict(values)
+        self._resubscribe_status()
 
         return {
             "host": host,
-            "version": version,
-            "device_type": device_type,
-            "session_directory": session_dir,
+            "version": _http_io_value(host, "admin/version"),
+            "device_type": _http_io_value(host, "admin/device_type"),
+            "session_directory": _http_io_value(
+                host, SESSION_DIRECTORY, "/root/reports/session"
+            ),
+            "status": dict(self._status_cache),
         }
 
     def disconnect(self) -> None:
@@ -81,6 +73,7 @@ class PlanRunnerService:
         self._session = None
         self._host = ""
         self._status_keys = {}
+        self._status_cache = {}
 
     def upload_plan(self, csv_path: Path, timeout_s: float = 30.0) -> str:
         """Upload input_map CSV and wait until points load succeeds."""
@@ -95,8 +88,10 @@ class PlanRunnerService:
             timeout_s=timeout_s,
         )
         valid = session.read_field(POINTS_VALID, timeout_s=8.0)
+        self._resubscribe_status()
         if not valid:
             raise MpackSessionError("points_valid is false after upload")
+        self._status_cache[POINTS_VALID] = valid
         return target
 
     def start(self) -> None:
@@ -112,14 +107,23 @@ class PlanRunnerService:
         self._press(RESET_BUTTON)
 
     def read_status(self) -> dict[str, Any]:
-        """Poll subscribed status fields once."""
+        """Re-subscribe, poll, and merge into the last complete snapshot."""
         session = self._require_session()
-        raw = session.recv_subscribed_updates(timeout_s=0.5)
-        out: dict[str, Any] = {"host": self._host}
+        self._resubscribe_status()
+        raw = session.poll_field_updates(
+            set(self._status_keys),
+            timeout_s=0.8,
+            poll_interval_s=0.0,
+        )
         for key, path in self._status_keys.items():
             if key in raw:
-                out[path] = raw[key]
-        return out
+                self._status_cache[path] = raw[key]
+        return {"host": self._host, **self._status_cache}
+
+    def _resubscribe_status(self) -> None:
+        if self._session is None or not self._status_keys:
+            return
+        self._session.subscribe_fields({k: False for k in self._status_keys})
 
     def wait_for_state(
         self,
@@ -148,3 +152,10 @@ class PlanRunnerService:
         if self._session is None or self._session.ws is None:
             raise MpackSessionError("not connected")
         return self._session
+
+
+def _http_io_value(host: str, path: str, default: Any = None) -> Any:
+    try:
+        return get_json(host, path, "value.json")
+    except Exception:
+        return default

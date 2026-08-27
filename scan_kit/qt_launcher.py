@@ -187,7 +187,8 @@ class ScanKitMainWindow(QMainWindow):
         tabs = QTabWidget()
         tabs.addTab(self._build_data_analysis_tab(), _MAIN_TAB_DATA_ANALYSIS)
         tabs.addTab(self._build_plan_synthesis_tab(), _MAIN_TAB_PLAN_SYNTHESIS)
-        tabs.addTab(self._build_plan_runner_tab(), _MAIN_TAB_PLAN_RUNNER)
+        self._plan_runner_panel = PlanRunnerPanel(app_settings=self._app_settings)
+        tabs.addTab(self._plan_runner_panel, _MAIN_TAB_PLAN_RUNNER)
         self._config_tuning_panel = ConfigTuningPanel(app_settings=self._app_settings)
         self._config_tuning_panel.set_session_data_dir(self._base_dir)
         tabs.addTab(self._config_tuning_panel, _MAIN_TAB_CONFIG_TUNING)
@@ -559,9 +560,6 @@ class ScanKitMainWindow(QMainWindow):
 
     def _build_plan_synthesis_tab(self) -> QWidget:
         return PlanSynthesisPanel(app_settings=self._app_settings)
-
-    def _build_plan_runner_tab(self) -> QWidget:
-        return PlanRunnerPanel(app_settings=self._app_settings)
 
     def _track_worker(self, thread: threading.Thread) -> None:
         self._worker_threads = [t for t in self._worker_threads if t.is_alive()]
@@ -1029,6 +1027,9 @@ class ScanKitMainWindow(QMainWindow):
         panel = getattr(self, "_config_tuning_panel", None)
         if panel is not None:
             panel.shutdown()
+        runner = getattr(self, "_plan_runner_panel", None)
+        if runner is not None:
+            runner.shutdown()
         for t in self._worker_threads:
             if t.is_alive():
                 t.join(timeout=2.0)

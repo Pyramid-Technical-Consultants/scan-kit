@@ -180,16 +180,16 @@ class MpackSession:
         """Press a button IO (set value True)."""
         self.set_field(io_path, True)
 
-    def recv_subscribed_updates(self, timeout_s: float = 0.2) -> dict[str, Any]:
-        """Send get and return unwrapped field updates for subscribed keys."""
+    def recv_subscribed_updates(self, timeout_s: float = 0.35) -> dict[str, Any]:
+        """Poll get and return unwrapped field updates (ignore non-update frames)."""
         got: dict[str, Any] = {}
-        self._send("get")
         deadline = time.time() + timeout_s
         while time.time() < deadline:
-            msg = self._recv(timeout=min(0.05, max(0.001, deadline - time.time())))
+            self._send("get")
+            msg = self._recv(timeout=min(0.25, max(0.02, deadline - time.time())))
             if msg and msg.get("event") == "update" and isinstance(msg.get("data"), dict):
                 for key, value in msg["data"].items():
                     got[key] = unwrap_field_update(value)
-            elif msg is not None:
-                break
+                if got:
+                    break
         return got

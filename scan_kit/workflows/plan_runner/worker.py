@@ -20,28 +20,37 @@ class PlanRunnerWorker(QObject):
     upload_failed = Signal(str)
     operation_failed = Signal(str)
     status_updated = Signal(object)
+    status_error = Signal(str)
     download_done = Signal(str)
     download_failed = Signal(str)
 
     def __init__(self) -> None:
         super().__init__()
         self._service = PlanRunnerService()
-        self._poll_timer = QTimer(self)
-        self._poll_timer.setInterval(500)
-        self._poll_timer.timeout.connect(self._poll_status)
+        self._poll_timer: QTimer | None = None
+
+    def _ensure_timer(self) -> QTimer:
+        if self._poll_timer is None:
+            timer = QTimer(self)
+            timer.setInterval(250)
+            timer.timeout.connect(self._poll_status)
+            self._poll_timer = timer
+        return self._poll_timer
 
     @Slot(str)
     def connect_host(self, host: str) -> None:
         try:
             info = self._service.connect(host)
-            self._poll_timer.start()
+            self._ensure_timer().start()
             self.connected.emit(info)
+            self.status_updated.emit(info.get("status") or self._service.read_status())
         except Exception as exc:
             self.connection_failed.emit(str(exc))
 
     @Slot()
     def disconnect_host(self) -> None:
-        self._poll_timer.stop()
+        if self._poll_timer is not None:
+            self._poll_timer.stop()
         self._service.disconnect()
         self.disconnected.emit()
 
@@ -50,6 +59,7 @@ class PlanRunnerWorker(QObject):
         try:
             target = self._service.upload_plan(Path(csv_path))
             self.upload_done.emit(target)
+            self.status_updated.emit(self._service.read_status())
         except Exception as exc:
             self.upload_failed.emit(str(exc))
 
@@ -83,6 +93,7 @@ class PlanRunnerWorker(QObject):
     def _run_control(self, fn) -> None:  # type: ignore[no-untyped-def]
         try:
             fn()
+            self.status_updated.emit(self._service.read_status())
         except Exception as exc:
             self.operation_failed.emit(str(exc))
 
@@ -92,4 +103,4 @@ class PlanRunnerWorker(QObject):
         try:
             self.status_updated.emit(self._service.read_status())
         except Exception as exc:
-            self.operation_failed.emit(str(exc))
+            self.status_error.emit(str(exc))

@@ -24,6 +24,10 @@ CONTROL_POINT_INDEX = "rci/rci_controller/control_point_index"
 CONTROL_POINT_COUNT = "rci/rci_controller/control_point_count"
 POINT_ENERGY = "rci/rci_controller/point_energy"
 POINT_LAYER_ID = "rci/rci_controller/point_layer_id"
+TIME_ELAPSED = "rci/rci_controller/time_elapsed"
+TREATMENT_ACTIVE = "rci/rci_controller/treatment_active"
+READY_PERMIT = "rci/rci_controller/ready_permit"
+READY_PERMIT_REASON = "rci/rci_controller/ready_permit/revoke_reason"
 
 # Map manager permits
 COMBINED_START_PERMIT = "rci/map_manager/combined_start_permit"
@@ -45,6 +49,10 @@ STATUS_IO_PATHS: tuple[str, ...] = (
     CONTROL_POINT_COUNT,
     POINT_ENERGY,
     POINT_LAYER_ID,
+    TIME_ELAPSED,
+    TREATMENT_ACTIVE,
+    READY_PERMIT,
+    READY_PERMIT_REASON,
     POINTS_VALID,
     POINTS_LOAD_STATE,
     COMBINED_START_PERMIT,
