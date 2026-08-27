@@ -2,8 +2,10 @@ name: Build Executables
 
 on:
   push:
-    branches: [main]
+    branches: [main, develop]
     tags: ["v*"]
+  pull_request:
+    branches: [main, develop]
   workflow_dispatch:
 
 permissions:
