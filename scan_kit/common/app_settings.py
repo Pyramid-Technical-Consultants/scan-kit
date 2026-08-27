@@ -23,6 +23,8 @@ class AppSettings:
     window_x: int | None = None
     window_y: int | None = None
     last_plan_synthesis_save_dir: str | None = None
+    last_rci_host: str | None = None
+    last_plan_runner_file_dir: str | None = None
 
     @classmethod
     def settings_path(cls) -> Path:
@@ -55,6 +57,10 @@ class AppSettings:
             window_y=_optional_int(raw.get("window_y")),
             last_plan_synthesis_save_dir=_optional_str(
                 raw.get("last_plan_synthesis_save_dir")
+            ),
+            last_rci_host=_optional_str(raw.get("last_rci_host")),
+            last_plan_runner_file_dir=_optional_str(
+                raw.get("last_plan_runner_file_dir")
             ),
         )
 

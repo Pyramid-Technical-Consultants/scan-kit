@@ -22,6 +22,9 @@ dependencies = [
     "PySide6>=6.6.0",
     "pydicom",
     "vispy>=0.14.0",
+    "msgpack",
+    "requests",
+    "websocket-client",
 ]
 
 [project.optional-dependencies]
