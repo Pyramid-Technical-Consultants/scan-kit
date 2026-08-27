@@ -31,6 +31,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 import pandas as pd
+from scipy.integrate import trapezoid as _trapz
 
 from ..common import (
     DEFAULT_SESSION_COLORS,
@@ -41,8 +42,6 @@ from ..common import (
 from ..common.session_source import ensure_session_on_disk
 
 _log = logging.getLogger(__name__)
-
-_trapz = getattr(np, "trapezoid", np.trapz)
 
 VIEW_TITLE = "IC HV Transient Test"
 

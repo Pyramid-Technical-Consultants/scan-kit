@@ -109,3 +109,6 @@ VIEW_GROUPS: list[tuple[str, list[ViewEntry]]] = [
 ]
 
 VIEWS: list[ViewEntry] = [entry for _title, entries in VIEW_GROUPS for entry in entries]
+
+# Tkinter views cannot share a process with the Qt warm-worker (matplotlib backend clash).
+TK_ONLY_VIEW_MODULES: frozenset[str] = frozenset({"ic_audio_export"})

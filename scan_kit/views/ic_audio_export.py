@@ -17,10 +17,6 @@ from pathlib import Path
 
 import numpy as np
 import sounddevice as sd
-import matplotlib
-matplotlib.use("TkAgg")
-import matplotlib.pyplot as plt
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
 from ..common.timeslice_ic_current import resolve_ic_current_columns, sum_ic3_current
 from ..common.session_source import (
@@ -29,6 +25,17 @@ from ..common.session_source import (
 )
 
 FS_HZ = 1000  # timeslice period is 1 ms → 1 kHz sample rate
+
+
+def _tk_matplotlib() -> tuple:
+    """Lazy TkAgg setup — must not run after Qt init in the same process."""
+    import matplotlib
+    import matplotlib.pyplot as plt
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+
+    if matplotlib.get_backend().lower() != "tkagg":
+        matplotlib.use("TkAgg", force=True)
+    return plt, FigureCanvasTkAgg
 
 
 def _load_ic_signals(session_id: str, base_dir: str) -> dict | None:
@@ -211,6 +218,9 @@ class _AudioPlayerWindow:
     """Tk toplevel with interactive waveform timeline and per-IC playback."""
 
     def __init__(self, title: str, channels: list[tuple[str, np.ndarray]]):
+        plt, FigureCanvasTkAgg = _tk_matplotlib()
+        self._plt = plt
+
         self._channels = channels
         self._channel_map: dict[str, np.ndarray] = dict(channels)
         self._duration = max(len(s) for _, s in channels) / FS_HZ
@@ -231,7 +241,7 @@ class _AudioPlayerWindow:
 
         # -- waveform plots ----------------------------------------------------
         n = len(channels)
-        self._fig, self._axes = plt.subplots(
+        self._fig, self._axes = self._plt.subplots(
             n, 1, figsize=(14, 2.2 * n), facecolor=_BG,
             squeeze=False, sharex=True,
         )
@@ -457,7 +467,7 @@ class _AudioPlayerWindow:
 
     def _on_close(self) -> None:
         self._stop_all()
-        plt.close(self._fig)
+        self._plt.close(self._fig)
         self._root.destroy()
         self._root.quit()
 

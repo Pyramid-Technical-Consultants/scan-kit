@@ -11,16 +11,26 @@ import importlib
 import pytest
 
 from scan_kit.data.registry import REGISTRY
-from scan_kit.views import VIEWS, view_module_name
+from scan_kit.views import TK_ONLY_VIEW_MODULES, VIEWS, view_module_name
 
 
 @pytest.mark.parametrize(
     "module_name",
-    [view_module_name(entry) for entry in VIEWS],
+    [
+        view_module_name(entry)
+        for entry in VIEWS
+        if view_module_name(entry) not in TK_ONLY_VIEW_MODULES
+    ],
 )
 def test_launcher_view_module_imports(module_name: str) -> None:
     mod = importlib.import_module(f"scan_kit.views.{module_name}")
     assert callable(mod.run)
+
+
+def test_tk_only_view_module_imports() -> None:
+    for module_name in TK_ONLY_VIEW_MODULES:
+        mod = importlib.import_module(f"scan_kit.views.{module_name}")
+        assert callable(mod.run)
 
 
 def test_data_registry_registers_all_builtin_sources() -> None:

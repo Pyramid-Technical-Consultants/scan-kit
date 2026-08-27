@@ -59,7 +59,7 @@ from .common.session_browser import SessionBrowserWidget
 from .common.session_meta import SessionMeta
 from .common.settings import ViewSettings, CALIBRATION_MODES
 from .common.qt_widgets import make_pane_scroll_area, set_pane_scroll_widget
-from .views import VIEW_GROUPS, VIEWS
+from .views import TK_ONLY_VIEW_MODULES, VIEW_GROUPS, VIEWS
 from .workflows.plan_synthesis_panel import PlanSynthesisPanel
 from .workflows.config_tuning.auto_tuning.paths import resolve_session_config_dir
 from .workflows.config_tuning_panel import ConfigTuningPanel
@@ -731,7 +731,11 @@ class ScanKitMainWindow(QMainWindow):
         # is ready (or the handoff fails), fall back to the proven direct launch
         # so behavior is never worse than spawning a fresh process per click.
         proc: subprocess.Popen | None = None
-        worker = self._take_ready_worker(module_name)
+        worker = (
+            None
+            if module_name in TK_ONLY_VIEW_MODULES
+            else self._take_ready_worker(module_name)
+        )
         if worker is not None and worker.proc.stdin is not None:
             command = json.dumps(
                 {
@@ -869,11 +873,19 @@ class ScanKitMainWindow(QMainWindow):
                 "--settings", settings_json,
             ]
         else:
-            code = (
-                "from scan_kit.common.view_runner import run_with_live_settings;"
-                f"from scan_kit.views.{module_name} import run;"
-                f"run_with_live_settings(run, {session_ids!r}, {base_dir!r}, {settings_json!r})"
-            )
+            if module_name in TK_ONLY_VIEW_MODULES:
+                code = (
+                    f"from scan_kit.views.{module_name} import run;"
+                    f"from scan_kit.common.settings import ViewSettings;"
+                    f"run({session_ids!r}, {base_dir!r}, "
+                    f"settings=ViewSettings.from_json({settings_json!r}))"
+                )
+            else:
+                code = (
+                    "from scan_kit.common.view_runner import run_with_live_settings;"
+                    f"from scan_kit.views.{module_name} import run;"
+                    f"run_with_live_settings(run, {session_ids!r}, {base_dir!r}, {settings_json!r})"
+                )
             env["PYTHONPATH"] = str(PROJECT_ROOT) + (
                 os.pathsep + env.get("PYTHONPATH", "") if env.get("PYTHONPATH") else ""
             )
@@ -1046,10 +1058,13 @@ def _run_view_subprocess(
     from .common.matplotlib_backend import init_matplotlib_for_views
     from .common.view_runner import run_with_live_settings
 
-    init_matplotlib_for_views()
     mod = importlib.import_module(f"scan_kit.views.{module_name}")
     if settings is None:
         settings = ViewSettings()
+    if module_name in TK_ONLY_VIEW_MODULES:
+        mod.run(session_ids, base_dir, settings=settings)
+        return
+    init_matplotlib_for_views()
     run_with_live_settings(mod.run, session_ids, base_dir, settings.to_json())
 
 
