@@ -69,16 +69,40 @@ _SKIP_NO_TEST_DATA = pytest.mark.skip(
     reason="test_data/ is not available (gitignored; run integration tests locally)",
 )
 
+_HELPERS_USING_TEST_DATA: dict[str, frozenset[str]] = {}
+
+
+def _module_helpers_using_test_data(module) -> frozenset[str]:
+    module_file = getattr(module, "__file__", None)
+    if module_file is None:
+        return frozenset()
+    cached = _HELPERS_USING_TEST_DATA.get(module_file)
+    if cached is not None:
+        return cached
+    names: set[str] = set()
+    for name, obj in vars(module).items():
+        if not name.startswith("_") or not callable(obj):
+            continue
+        try:
+            helper_source = inspect.getsource(obj)
+        except (OSError, TypeError):
+            continue
+        if "_TEST_DATA" in helper_source or "TEST_DATA" in helper_source:
+            names.add(name)
+    cached = frozenset(names)
+    _HELPERS_USING_TEST_DATA[module_file] = cached
+    return cached
+
 
 def _test_function_uses_test_data(item: pytest.Item) -> bool:
-    """Skip only tests whose function body references the fixture tree."""
+    """Skip tests that load the gitignored fixture tree (directly or via helpers)."""
     try:
         source = inspect.getsource(item.obj)
     except (OSError, TypeError):
         return False
-    return "_TEST_DATA" in source or (
-        "TEST_DATA" in source and "test_data" in source
-    )
+    if "_TEST_DATA" in source or "TEST_DATA" in source:
+        return True
+    return any(f"{name}(" in source for name in _module_helpers_using_test_data(item.module))
 
 
 def wait_for_qt(
