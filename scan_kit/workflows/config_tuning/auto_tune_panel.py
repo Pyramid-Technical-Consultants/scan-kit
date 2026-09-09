@@ -512,7 +512,7 @@ class AutoTuneDetailWidget(QWidget):
             status = f"{band_count} energy band(s) will be updated{session_note}."
             max_extreme_pct = max_preview_extreme_pct_deviation(rows)
             if max_extreme_pct is not None:
-                status += f" Max ext. Δ: {max_extreme_pct:.1f}%."
+                status += f" Max OOB: {max_extreme_pct:.1f}%."
             self._preview_status.setText(status)
         elif warnings:
             self._preview_status.setText(warnings[0])

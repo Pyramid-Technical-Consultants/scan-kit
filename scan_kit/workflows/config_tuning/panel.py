@@ -37,6 +37,7 @@ from .auto_tuning.sigma_tune import (
     SigmaTunePreviewRow,
     compute_sigma_tune_preview,
     normalize_sigma_lower_headroom_percent,
+    normalize_sigma_optimize_mode,
     normalize_sigma_tolerance_percent,
 )
 from .file_tree import XmlFileTreeWidget

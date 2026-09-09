@@ -27,6 +27,9 @@ def clear_position_offset_preview_table(table: QTableWidget) -> None:
     table.setColumnCount(len(_TABLE_COLUMNS))
     table.setHorizontalHeaderLabels(list(_TABLE_COLUMNS))
     header = table.horizontalHeader()
+    header.setDefaultAlignment(
+        Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+    )
     header.setStretchLastSection(False)
     header.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
 

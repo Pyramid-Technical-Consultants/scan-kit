@@ -18,14 +18,16 @@ from scan_kit.workflows.config_tuning.auto_tuning.paths import resolve_devices_x
 from scan_kit.workflows.config_tuning.auto_tuning.sigma_preview_table import (
     max_preview_extreme_pct_deviation,
 )
+from scan_kit.common.session_sigma import MeasuredSigmaSpots
 from scan_kit.workflows.config_tuning.auto_tuning.sigma_tune import (
     apply_measured_sigmas_to_tree,
-    band_furthest_extreme_pct_deviation,
+    band_max_tolerance_excursion_pct,
     band_sigma_variance,
     collect_sigma_band_updates,
     compute_band_sigma,
     compute_band_sigma_k0,
     compute_sigma_tune_preview,
+    format_sigma_k0,
     sigma_tolerance_lower_mm,
     sigma_tolerance_upper_mm,
     tune_sigmas_from_session,
@@ -55,22 +57,66 @@ def test_measured_sigma_by_energy_fixture() -> None:
     assert max(by_energy["IC_1_X"]) > 100.0
 
 
-def test_band_furthest_extreme_pct_deviation_uses_furthest_min_or_max() -> None:
-    pct, observed, kind = band_furthest_extreme_pct_deviation(
-        np.array([2.0, 4.0, 10.0]),
-        5.0,
+def test_band_max_tolerance_excursion_pct_detects_out_of_band_spots() -> None:
+    k0 = 5.0
+    tol = 20.0
+    pct_in_band, observed_in_band, kind_in_band = band_max_tolerance_excursion_pct(
+        np.array([4.0, 5.0, 6.0]),
+        k0,
+        tol,
     )
-    assert kind == "max"
-    assert observed == pytest.approx(10.0)
-    assert pct == pytest.approx(100.0)
+    assert pct_in_band == 0.0
+    assert kind_in_band == ""
+    assert not np.isfinite(observed_in_band)
 
-    pct_min, observed_min, kind_min = band_furthest_extreme_pct_deviation(
-        np.array([1.0, 4.0, 10.0]),
-        8.0,
+    pct, observed, kind = band_max_tolerance_excursion_pct(
+        np.array([3.0, 5.0, 6.0]),
+        k0,
+        tol,
     )
-    assert kind_min == "min"
-    assert observed_min == pytest.approx(1.0)
-    assert pct_min == pytest.approx(87.5)
+    assert kind == "below"
+    assert observed == pytest.approx(3.0)
+    assert pct == pytest.approx(20.0)
+
+    pct_above, observed_above, kind_above = band_max_tolerance_excursion_pct(
+        np.array([4.0, 6.5, 6.0]),
+        k0,
+        tol,
+    )
+    assert kind_above == "above"
+    assert observed_above == pytest.approx(6.5)
+    assert pct_above == pytest.approx(10.0)
+
+
+def test_band_oob_differs_from_legacy_center_deviation() -> None:
+    sigmas = np.array([4.0, 5.0, 6.0])
+    k0 = compute_band_sigma_k0(sigmas, tolerance_percent=20.0, lower_headroom_percent=1.0)
+    legacy = float(np.max(np.abs(sigmas - k0)) / abs(k0) * 100.0)
+    oob_pct, _, _ = band_max_tolerance_excursion_pct(sigmas, k0, 20.0)
+    assert legacy == pytest.approx(20.792, abs=0.01)
+    assert oob_pct == pytest.approx(0.792, abs=0.01)
+
+
+def test_collect_sigma_band_updates_oob_not_flat_tolerance_pct() -> None:
+    devices_path = _TEST_DATA / _SESSION / _SESSION / "config" / "map2map" / "devices.xml"
+    root = ET.fromstring(devices_path.read_text(encoding="utf-8"))
+    spots = load_measured_sigma_spots(_SESSION, _TEST_DATA)
+    assert spots is not None
+
+    updates, _ = collect_sigma_band_updates(root, spots, tolerance_percent=20.0)
+    oob_values = [u.extreme_pct_deviation for u in updates]
+    assert oob_values
+    assert max(oob_values) < 5.0
+    assert max(oob_values) == pytest.approx(0.792, abs=0.01)
+
+    wide_updates, _ = collect_sigma_band_updates(
+        root,
+        spots,
+        tolerance_percent=20.0,
+        lower_headroom_percent=0.0,
+    )
+    wide_oob = max(u.extreme_pct_deviation for u in wide_updates)
+    assert wide_oob == 0.0
 
 
 def test_band_sigma_variance_uses_sample_variance() -> None:
@@ -200,7 +246,7 @@ def test_compute_sigma_tune_preview_matches_apply_count() -> None:
     assert rows[0].n_spots > 0
     assert rows[0].sigma_variance >= 0.0
     assert rows[0].extreme_pct_deviation >= 0.0
-    assert rows[0].extreme_kind in {"min", "max"}
+    assert rows[0].extreme_kind in {"below", "above", ""}
     max_pct = max_preview_extreme_pct_deviation(rows)
     assert max_pct is not None
     assert max_pct >= rows[0].extreme_pct_deviation
@@ -227,3 +273,67 @@ def test_tune_sigmas_from_session_integration() -> None:
     result = tune_sigmas_from_session(root, _SESSION, str(_TEST_DATA))
     assert result.ok
     assert result.bands_updated > 0
+
+
+def test_collect_sigma_band_updates_skips_non_constant_k_bands() -> None:
+    xml = """
+    <devices>
+      <ion_chamber>
+        <device name="IC_1_X"/>
+        <beam_sigma_conversions in_units="MEV" out_units="mm"
+            min_energy="100" max_energy="100" K0="5.0" K1="0.5" K2="0" K3="0"/>
+        <beam_sigma_conversions in_units="MEV" out_units="mm"
+            min_energy="200" max_energy="200" K0="5.0" K1="0" K2="0" K3="0"/>
+      </ion_chamber>
+    </devices>
+    """
+    root = ET.fromstring(xml)
+    measured = MeasuredSigmaSpots(
+        by_device={"IC_1_X": (np.array([100.0, 200.0]), np.array([4.0, 5.0]))},
+    )
+    updates, _ = collect_sigma_band_updates(root, measured, lower_headroom_percent=0.0)
+    assert len(updates) == 1
+    assert updates[0].min_energy == pytest.approx(200.0)
+    assert updates[0].element.get("K1") == "0"
+
+
+def _find_band_element(
+    root: ET.Element,
+    device: str,
+    min_energy: float,
+    max_energy: float,
+) -> ET.Element | None:
+    for chamber in root.iter("ion_chamber"):
+        device_el = chamber.find("device")
+        if device_el is None or device_el.get("name") != device:
+            continue
+        for el in chamber.findall("beam_sigma_conversions"):
+            try:
+                min_e = float(el.get("min_energy", "nan"))
+                max_e = float(el.get("max_energy", "nan"))
+            except (TypeError, ValueError):
+                continue
+            if min_e == min_energy and max_e == max_energy:
+                return el
+    return None
+
+
+def test_sigma_preview_k0_values_match_apply() -> None:
+    devices_path = _TEST_DATA / _SESSION / _SESSION / "config" / "map2map" / "devices.xml"
+    root = ET.fromstring(devices_path.read_text(encoding="utf-8"))
+    preview_rows, _ = compute_sigma_tune_preview(root, [_SESSION], str(_TEST_DATA))
+    assert preview_rows
+
+    apply_root = ET.fromstring(devices_path.read_text(encoding="utf-8"))
+    result = tune_sigmas_from_session(apply_root, _SESSION, str(_TEST_DATA))
+    assert result.ok
+
+    for row in preview_rows[:10]:
+        element = _find_band_element(
+            apply_root,
+            row.device,
+            row.min_energy,
+            row.max_energy,
+        )
+        assert element is not None
+        assert element.get("K0") == format_sigma_k0(row.new_k0)

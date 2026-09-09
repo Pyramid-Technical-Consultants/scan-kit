@@ -11,7 +11,7 @@ from .sigma_tune import SigmaTunePreviewRow
 
 _ENERGY_COLUMN = "Energy (MeV)"
 _VARIANCE_COLUMN = "Max σ² (mm²)"
-_EXTREME_PCT_COLUMN = "Max ext. Δ (%)"
+_EXTREME_PCT_COLUMN = "Max OOB (%)"
 _IC_COLUMNS = IC_SIGMA_DEVICES
 _TABLE_COLUMNS = (
     _ENERGY_COLUMN,
@@ -27,6 +27,9 @@ def clear_sigma_preview_table(table: QTableWidget) -> None:
     table.setColumnCount(len(_TABLE_COLUMNS))
     table.setHorizontalHeaderLabels(list(_TABLE_COLUMNS))
     header = table.horizontalHeader()
+    header.setDefaultAlignment(
+        Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+    )
     header.setStretchLastSection(False)
     header.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
 
@@ -59,8 +62,8 @@ def fill_sigma_preview_table(
                 item.setToolTip(
                     f"{device}: {entry.old_k0:.3f} mm → {entry.new_k0:.3f} mm "
                     f"(Δ {entry.delta_k0:+.3f} mm, σ² {entry.sigma_variance:.4f} mm², "
-                    f"{entry.extreme_kind or 'extreme'} σ {entry.extreme_observed_mm:.3f} mm "
-                    f"is {entry.extreme_pct_deviation:.1f}% from new, "
+                    f"{entry.extreme_kind or 'in-band'} σ {entry.extreme_observed_mm:.3f} mm "
+                    f"is {entry.extreme_pct_deviation:.1f}% outside band, "
                     f"{entry.n_spots} spots)"
                 )
             item.setTextAlignment(
@@ -114,7 +117,7 @@ def preview_energy_band_count(rows: list[SigmaTunePreviewRow]) -> int:
 
 
 def max_preview_extreme_pct_deviation(rows: list[SigmaTunePreviewRow]) -> float | None:
-    """Largest per-energy ``Max ext. Δ (%)`` value across the preview table."""
+    """Largest per-energy ``Max OOB (%)`` value across the preview table."""
     if not rows:
         return None
     grouped = _group_rows_by_energy(rows)
@@ -150,15 +153,16 @@ def _extreme_pct_tooltip(
     lines = [
         (
             f"{device}: {entry.extreme_kind} σ = {entry.extreme_observed_mm:.3f} mm, "
-            f"{entry.extreme_pct_deviation:.1f}% from new {entry.new_k0:.3f} mm"
+            f"{entry.extreme_pct_deviation:.1f}% outside ±band around "
+            f"{entry.new_k0:.3f} mm"
         )
         for device, entry in by_device.items()
     ]
-    header = "Furthest min/max observed σ from new assignment by IC:"
-    if worst is not None:
+    header = "Largest out-of-band excursion by IC (% of K0):"
+    if worst is not None and worst.extreme_kind:
         header += (
-            f"\n(worst: {worst.extreme_kind} σ {worst.extreme_observed_mm:.3f} mm "
-            f"→ {worst.extreme_pct_deviation:.1f}%)"
+            f"\n(worst: {worst.extreme_kind} band edge by "
+            f"{worst.extreme_observed_mm:.3f} mm → {worst.extreme_pct_deviation:.1f}%)"
         )
     return header + "\n" + "\n".join(lines)
 

@@ -110,26 +110,40 @@ def band_sigma_variance(sigmas: np.ndarray) -> float:
     return float(np.var(sigmas, ddof=1))
 
 
-def band_furthest_extreme_pct_deviation(
+def band_max_tolerance_excursion_pct(
     sigmas: np.ndarray,
-    new_k0: float,
+    k0: float,
+    tolerance_percent: float,
 ) -> tuple[float, float, str]:
-    """Percent deviation of the min/max extreme furthest from *new_k0*.
+    """Largest observation excursion outside the ±tolerance band, as % of *k0*.
 
-    Returns ``(abs_pct, observed_mm, kind)`` where *kind* is ``"min"`` or ``"max"``.
+    Returns ``(pct, observed_mm, kind)`` where *kind* is ``"below"``, ``"above"``,
+    or ``""`` when every sample is inside the band.
     """
-    if sigmas.size == 0 or not np.isfinite(new_k0) or abs(new_k0) < 1e-12:
+    if sigmas.size == 0 or not np.isfinite(k0) or abs(k0) < 1e-12:
         return float("nan"), float("nan"), ""
-    min_sigma = float(np.min(sigmas))
-    max_sigma = float(np.max(sigmas))
-    if abs(min_sigma - new_k0) >= abs(max_sigma - new_k0):
-        observed = min_sigma
-        kind = "min"
-    else:
-        observed = max_sigma
-        kind = "max"
-    pct = abs(observed - new_k0) / abs(new_k0) * 100.0
-    return pct, observed, kind
+    lower = sigma_tolerance_lower_mm(k0, tolerance_percent)
+    upper = sigma_tolerance_upper_mm(k0, tolerance_percent)
+    scale = abs(k0)
+    worst_pct = 0.0
+    worst_observed = float("nan")
+    worst_kind = ""
+    for sigma in sigmas:
+        if not np.isfinite(sigma):
+            continue
+        if sigma < lower:
+            pct = (lower - float(sigma)) / scale * 100.0
+            kind = "below"
+        elif sigma > upper:
+            pct = (float(sigma) - upper) / scale * 100.0
+            kind = "above"
+        else:
+            continue
+        if pct > worst_pct:
+            worst_pct = pct
+            worst_observed = float(sigma)
+            worst_kind = kind
+    return worst_pct, worst_observed, worst_kind
 
 
 def compute_band_sigma(
@@ -257,9 +271,10 @@ def collect_sigma_band_updates(
             )
             if not np.isfinite(new_k0):
                 continue
-            extreme_pct, extreme_mm, extreme_kind = band_furthest_extreme_pct_deviation(
+            extreme_pct, extreme_mm, extreme_kind = band_max_tolerance_excursion_pct(
                 band_sigmas,
                 new_k0,
+                tolerance_percent,
             )
             updates.append(
                 _BandUpdate(
