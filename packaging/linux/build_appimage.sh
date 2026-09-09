@@ -6,7 +6,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 ONEDIR="${ROOT}/dist/scan-kit"
 APPDIR="${ROOT}/dist/ScanKit.AppDir"
 APPIMAGETOOL="${APPIMAGETOOL:-/tmp/appimagetool}"
-APPIMAGETOOL_URL="${APPIMAGETOOL_URL:-https://github.com/AppImage/AppImageKit/releases/download/13/appimagetool-x86_64.AppImage}"
+APPIMAGETOOL_URL="${APPIMAGETOOL_URL:-https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage}"
 
 if [[ ! -x "${ONEDIR}/scan-kit" ]]; then
   echo "Missing PyInstaller onedir build at ${ONEDIR}/scan-kit" >&2
