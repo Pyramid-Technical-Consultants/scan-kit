@@ -13,7 +13,9 @@ import pytest
 from scan_kit.common.processing import clear_session_raw_cache, load_session_raw
 from scan_kit.common.session_source import resolve_session_source
 from scan_kit.data.spot import spot_has_ic_positions
+from scan_kit.common.devices_xml import IC_SIGMA_DEVICES, load_map2map_geometry
 from scan_kit.workflows.plan_runner.g3_session import (
+    apply_iso_columns,
     build_g3_spot_data,
     merge_run_spot_files,
     reconstruct_spot_dataframe,
@@ -24,8 +26,16 @@ from scan_kit.workflows.plan_runner.session_packager import package_session_zip
 _ROOT = Path(__file__).resolve().parents[1]
 _G3 = _ROOT / "test_data" / "1091134775" / "1091134775"
 _G3_SPOT = _G3 / "spot_data.csv"
-_G3_DEVICES = _G3 / "config" / "map2map" / "devices.xml"
+_G3_CONFIG = _G3 / "config" / "map2map"
+_G3_DEVICES = _G3_CONFIG / "devices.xml"
+_G3_SYSTEM = _G3_CONFIG / "scan_dose_system.xml"
 _G3_RUN = _G3 / "layer-0" / "run-0"
+
+# Second room: virtual SAD 2015.36 while every per-IC source_to_axis_distance_mm
+# says 1900 / 1520, so only the virtual SAD reproduces the delivered columns.
+_ROOM_B = _ROOT / "test_data" / "1307573499" / "1307573499"
+_ROOM_B_SPOT = _ROOM_B / "spot_data.csv"
+_ROOM_B_SYSTEM = _ROOM_B / "config" / "map2map" / "scan_dose_system.xml"
 
 _MAX_ISO_RESID_MM = 0.05
 
@@ -72,6 +82,28 @@ def _mini_devices_xml() -> str:
 """
 
 
+def _mini_system_xml() -> str:
+    """``source_to_isocenter_distance`` is the numerator of every IC mag factor."""
+    return """<?xml version="1.0"?>
+<MapToMap>
+  <geometry>
+    <source_to_isocenter_distance>2500.0</source_to_isocenter_distance>
+    <source_to_x_axis_distance>2500.0</source_to_x_axis_distance>
+    <source_to_y_axis_distance>2000.0</source_to_y_axis_distance>
+  </geometry>
+</MapToMap>
+"""
+
+
+def _write_map2map_config(session_dir: Path) -> Path:
+    """Write both files the iso conversion needs: devices + system geometry."""
+    cfg = session_dir / "config" / "map2map"
+    cfg.mkdir(parents=True, exist_ok=True)
+    (cfg / "devices.xml").write_text(_mini_devices_xml(), encoding="utf-8")
+    (cfg / "scan_dose_system.xml").write_text(_mini_system_xml(), encoding="utf-8")
+    return cfg
+
+
 def _write_device_run(run_dir: Path) -> None:
     run_dir.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(
@@ -105,7 +137,10 @@ def _write_device_run(run_dir: Path) -> None:
     ).to_csv(run_dir / "RCI_spot_data.csv", index=False)
 
 
-@pytest.mark.skipif(not _G3_SPOT.is_file() or not _G3_DEVICES.is_file(), reason="G3 fixture missing")
+@pytest.mark.skipif(
+    not (_G3_SPOT.is_file() and _G3_DEVICES.is_file() and _G3_SYSTEM.is_file()),
+    reason="G3 fixture missing",
+)
 def test_reconstruct_fixture_matches_official_iso() -> None:
     built = reconstruct_spot_dataframe(_G3)
     assert built is not None
@@ -139,6 +174,40 @@ def test_reconstruct_fixture_matches_official_iso() -> None:
         assert both.sum() > 100
         resid = float(np.max(np.abs(b[both] - g[both])))
         assert resid < _MAX_ISO_RESID_MM, f"{col} max resid {resid}"
+
+
+@pytest.mark.skipif(
+    not (_ROOM_B_SPOT.is_file() and _ROOM_B_SYSTEM.is_file()),
+    reason="second-room fixture missing",
+)
+def test_iso_columns_match_in_room_with_disagreeing_per_ic_sad() -> None:
+    """Only ``source_to_isocenter_distance`` reproduces this room's delivered columns.
+
+    Every chamber here has ``source_to_axis_distance_mm`` well below the room's
+    ``source_to_isocenter_distance``, so a per-IC SAD magnification misses by
+    millimetres.  This is the regression the 2500 mm fixture cannot catch, because
+    there the two happen to agree on the X chambers.
+    """
+    geometry = load_map2map_geometry(_ROOM_B / "config" / "map2map")
+    assert geometry is not None
+    for device in IC_SIGMA_DEVICES:
+        chamber = geometry.chambers[device]
+        assert abs(chamber.xml_sad_mm - geometry.system.virtual_sad_mm) > 100.0
+
+    official = pd.read_csv(_ROOM_B_SPOT, index_col=False, skipinitialspace=True)
+    axes = ("ic1_x", "ic1_y", "ic2_x", "ic2_y")
+    raw_cols = [f"r_{axis}_spot_position_raw" for axis in axes]
+    raw_cols += [f"r_{axis}_spot_sigma_raw" for axis in axes]
+    frame = official[raw_cols].copy()
+    assert apply_iso_columns(frame, _ROOM_B)
+
+    for axis in axes:
+        for col in (f"r_{axis}_spot_position", f"r_{axis}_spot_sigma"):
+            got = frame[col].to_numpy(dtype=float)
+            expected = official[col].to_numpy(dtype=float)
+            both = np.isfinite(got) & np.isfinite(expected)
+            assert both.any()
+            assert float(np.max(np.abs(got[both] - expected[both]))) < 1e-6, col
 
 
 @pytest.mark.skipif(not _G3_RUN.is_dir(), reason="G3 fixture missing")
@@ -212,9 +281,7 @@ def test_omit_processed_without_devices_or_plan_span(tmp_path: Path) -> None:
 def test_devices_xml_writes_iso_not_raw_copy(tmp_path: Path) -> None:
     session_dir = tmp_path / "geom"
     _write_device_run(session_dir / "layer-0" / "run-0")
-    cfg = session_dir / "config" / "map2map"
-    cfg.mkdir(parents=True)
-    (cfg / "devices.xml").write_text(_mini_devices_xml(), encoding="utf-8")
+    _write_map2map_config(session_dir)
     (session_dir / "input_map.csv").write_text(
         "ENERGY,X_POSITION,Y_POSITION,spot_no,layer_id\n100,0,0,1,10\n",
         encoding="utf-8",
@@ -235,9 +302,7 @@ def test_rebuilt_zip_loads_like_g3_session(tmp_path: Path) -> None:
     session_dir = tmp_path / session_id
     session_dir.mkdir()
     _write_device_run(session_dir / "layer-0" / "run-0")
-    cfg = session_dir / "config" / "map2map"
-    cfg.mkdir(parents=True)
-    (cfg / "devices.xml").write_text(_mini_devices_xml(), encoding="utf-8")
+    _write_map2map_config(session_dir)
     (session_dir / "input_map.csv").write_text(
         "ENERGY,CURRENT,X_POSITION,Y_POSITION,spot_no,layer_id\n"
         "100,1e-9,0,0,1,10\n100,1e-9,1,0,2,10\n",
@@ -281,6 +346,7 @@ def test_fixture_tree_zip_analysis_load(tmp_path: Path) -> None:
     cfg = session_dir / "config" / "map2map"
     cfg.mkdir(parents=True)
     shutil.copy2(_G3_DEVICES, cfg / "devices.xml")
+    shutil.copy2(_G3_SYSTEM, cfg / "scan_dose_system.xml")
     run_src = _G3 / "layer-0" / "run-0"
     run_dst = session_dir / "layer-0" / "run-0"
     run_dst.mkdir(parents=True)

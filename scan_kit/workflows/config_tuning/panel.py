@@ -27,6 +27,10 @@ from scan_kit.common.session_position import normalize_position_data_source
 
 from .auto_tune_panel import AutoTuneDetailWidget, AutoTuneListWidget
 from .auto_tuning.base import AutoTuneRunResult, AutoTuneWorkflow
+from .auto_tuning.ic_distance_tune import (
+    IcDistanceTunePreviewRow,
+    compute_ic_distance_tune_preview,
+)
 from .auto_tuning.paths import resolve_devices_xml_path
 from .auto_tuning.position_offset_tune import (
     PositionOffsetTunePreviewRow,
@@ -300,7 +304,15 @@ class ConfigTuningPanel(QWidget):
         self,
         workflow: AutoTuneWorkflow,
         params: dict,
-    ) -> tuple[list[SigmaTunePreviewRow] | list[PositionOffsetTunePreviewRow], list[str]] | None:
+    ) -> (
+        tuple[
+            list[SigmaTunePreviewRow]
+            | list[PositionOffsetTunePreviewRow]
+            | list[IcDistanceTunePreviewRow],
+            list[str],
+        ]
+        | None
+    ):
         document = self._load_devices_document()
         if document is None:
             return [], ["Open a configuration folder containing map2map/devices.xml."]
@@ -328,6 +340,12 @@ class ConfigTuningPanel(QWidget):
                 str(params["data_dir"]).strip(),
                 data_source=data_source,
                 optimize_mode=optimize_mode,
+            )
+        if workflow.id == "ic_distance_tuning":
+            return compute_ic_distance_tune_preview(
+                document.root,
+                parse_session_ids(params),
+                str(params["data_dir"]).strip(),
             )
         return [], []
 

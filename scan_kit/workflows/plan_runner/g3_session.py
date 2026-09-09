@@ -4,13 +4,11 @@ from __future__ import annotations
 
 import json
 import math
-import xml.etree.ElementTree as ET
-from dataclasses import dataclass
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 
+from ...common.devices_xml import load_map2map_geometry
 from ...common.g3_timeslice_position import (
     IsoAxisTransform,
     build_g3_iso_plan_lookup,
@@ -107,38 +105,6 @@ _HELPER_COLS = (
 )
 
 
-@dataclass(frozen=True)
-class ChamberGeometry:
-    """Ion-chamber strip→iso geometry from ``devices.xml``."""
-
-    name: str
-    strip_count: float
-    strip_to_mm: float
-    zero_offset_at_iso_mm: float
-    reverse_strips: bool
-    sdd_mm: float
-    sad_mm: float
-
-    @property
-    def center_strip(self) -> float:
-        # ponytail: zero_offset_mm is NOT folded into center for G3 fixture match.
-        return (self.strip_count - 1.0) / 2.0
-
-    @property
-    def scale(self) -> float:
-        """Strip→iso mm slope (includes reverse sign)."""
-        sign = -1.0 if self.reverse_strips else 1.0
-        return sign * self.strip_to_mm * (self.sad_mm / self.sdd_mm)
-
-    def strip_to_iso(self, strip: np.ndarray) -> np.ndarray:
-        return self.scale * (np.asarray(strip, dtype=float) - self.center_strip) + (
-            self.zero_offset_at_iso_mm
-        )
-
-    def sigma_to_iso(self, sigma_raw: np.ndarray) -> np.ndarray:
-        return abs(self.scale) * np.asarray(sigma_raw, dtype=float)
-
-
 def _read_spot_csv(path: Path) -> pd.DataFrame | None:
     if not path.is_file() or path.stat().st_size == 0:
         return None
@@ -233,81 +199,38 @@ def apply_iso_columns(frame: pd.DataFrame, session_dir: Path) -> bool:
     Returns True when any processed position column was written. Does **not**
     copy raw→processed when iso cannot be derived.
     """
-    if _apply_iso_from_devices_xml(frame, Path(session_dir) / "config" / "map2map" / "devices.xml"):
+    if _apply_iso_from_map2map_config(frame, Path(session_dir) / "config" / "map2map"):
         return True
     return _apply_iso_from_plan_affine(frame, Path(session_dir))
 
 
-def parse_chamber_geometry(devices_xml: Path | str) -> dict[str, ChamberGeometry]:
-    """Parse ion-chamber strip→iso parameters from ``devices.xml``."""
-    root = ET.parse(devices_xml).getroot()
-    raw: dict[str, dict[str, float | bool | str]] = {}
-    for chamber in root.iter("ion_chamber"):
-        device_el = chamber.find("device")
-        if device_el is None:
-            continue
-        name = device_el.get("name")
-        if not name or name not in {"IC_1_X", "IC_1_Y", "IC_2_X", "IC_2_Y"}:
-            continue
+def _apply_iso_from_map2map_config(frame: pd.DataFrame, config_dir: Path) -> bool:
+    """Convert raw strips using map2map's own magnification rule.
 
-        def _text(tag: str, default: str) -> str:
-            el = chamber.find(tag)
-            return (el.text or default).strip() if el is not None else default
-
-        rev_txt = _text("reverse_strips", "0").lower()
-        raw[name] = {
-            "strip_count": float(_text("strip_count", "128")),
-            "strip_to_mm": float(_text("strip_to_mm", "2")),
-            "zero_offset_at_iso_mm": float(_text("zero_offset_at_iso_mm", "0")),
-            "reverse_strips": rev_txt in {"1", "true", "yes"},
-            "sdd_mm": float(_text("source_to_device_distance_mm", "1")),
-            "sad_mm": float(_text("source_to_axis_distance_mm", "1")),
-        }
-
-    out: dict[str, ChamberGeometry] = {}
-    for name, vals in raw.items():
-        # ponytail: G3 fixture uses X-chamber SAD for Y magnification (XML Y SAD=2000
-        # does not match processed columns; upgrade if scan_dose C++ is available).
-        sad = float(vals["sad_mm"])
-        if name.endswith("_Y"):
-            sibling = name[:-1] + "X"
-            if sibling in raw:
-                sad = float(raw[sibling]["sad_mm"])
-        out[name] = ChamberGeometry(
-            name=name,
-            strip_count=float(vals["strip_count"]),
-            strip_to_mm=float(vals["strip_to_mm"]),
-            zero_offset_at_iso_mm=float(vals["zero_offset_at_iso_mm"]),
-            reverse_strips=bool(vals["reverse_strips"]),
-            sdd_mm=float(vals["sdd_mm"]),
-            sad_mm=sad,
-        )
-    return out
-
-
-def _apply_iso_from_devices_xml(frame: pd.DataFrame, devices_xml: Path) -> bool:
-    if not devices_xml.is_file():
-        return False
-    try:
-        chambers = parse_chamber_geometry(devices_xml)
-    except (ET.ParseError, OSError, TypeError, ValueError):
-        return False
-    if not chambers:
+    Needs both ``devices.xml`` and ``scan_dose_system.xml``: magnification is
+    ``source_to_isocenter_distance / source_to_device_distance_mm``, and the
+    per-chamber ``source_to_axis_distance_mm`` is dead at runtime.
+    """
+    geometry = load_map2map_geometry(config_dir)
+    if geometry is None:
         return False
 
     wrote = False
-    for raw_col, iso_col, chamber_name in _POSITION_RAW_TO_ISO:
-        geom = chambers.get(chamber_name)
-        if geom is None or raw_col not in frame.columns:
+    for raw_col, iso_col, device in _POSITION_RAW_TO_ISO:
+        if raw_col not in frame.columns:
             continue
-        frame[iso_col] = geom.strip_to_iso(frame[raw_col].to_numpy(dtype=float))
+        iso = geometry.strip_to_iso(device, frame[raw_col].to_numpy(dtype=float))
+        if iso is None:
+            continue
+        frame[iso_col] = iso
         wrote = True
 
-    for raw_col, iso_col, chamber_name in _SIGMA_RAW_TO_ISO:
-        geom = chambers.get(chamber_name)
-        if geom is None or raw_col not in frame.columns:
+    for raw_col, iso_col, device in _SIGMA_RAW_TO_ISO:
+        if raw_col not in frame.columns:
             continue
-        frame[iso_col] = geom.sigma_to_iso(frame[raw_col].to_numpy(dtype=float))
+        sigma = geometry.sigma_to_iso(device, frame[raw_col].to_numpy(dtype=float))
+        if sigma is not None:
+            frame[iso_col] = sigma
 
     return wrote
 

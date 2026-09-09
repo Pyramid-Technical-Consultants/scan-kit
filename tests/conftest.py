@@ -318,6 +318,21 @@ def qapp():
 
 
 @pytest.fixture(autouse=True)
+def _restore_cwd():
+    """Undo working-directory changes so relative ``test_data`` lookups keep resolving.
+
+    ``prepare_linux_frozen_env`` chdirs by design, so the tests covering it leak the
+    process cwd into whichever test the xdist worker picks up next.
+    """
+    original = os.getcwd()
+    try:
+        yield
+    finally:
+        if os.getcwd() != original:
+            os.chdir(original)
+
+
+@pytest.fixture(autouse=True)
 def _headless_matplotlib():
     """Prevent ``plt.show()`` from opening a blocking GUI window during tests."""
     captured: list[plt.Figure] = []

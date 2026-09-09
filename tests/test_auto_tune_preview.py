@@ -10,6 +10,13 @@ import pytest
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QTableWidget
 
+from scan_kit.workflows.config_tuning.auto_tuning.ic_distance_preview_table import (
+    clear_ic_distance_preview_table,
+    fill_ic_distance_preview_table,
+)
+from scan_kit.workflows.config_tuning.auto_tuning.ic_distance_tune import (
+    compute_ic_distance_tune_preview,
+)
 from scan_kit.workflows.config_tuning.auto_tuning.position_offset_preview_table import (
     clear_position_offset_preview_table,
     fill_position_offset_preview_table,
@@ -294,6 +301,100 @@ def test_config_tuning_panel_position_offset_apply_marks_devices_dirty(qapp) -> 
     document = panel._open_documents.get(devices_path.resolve())
     assert document is not None
     assert document.dirty
+
+
+def _ic_distance_preview_rows() -> list:
+    root = _load_devices_root()
+    rows, _ = compute_ic_distance_tune_preview(root, [_SESSION], str(_TEST_DATA))
+    assert rows
+    return rows
+
+
+def test_ic_distance_preview_table_header_matches_cell_alignment(qapp) -> None:
+    table = QTableWidget()
+    clear_ic_distance_preview_table(table)
+    assert table.horizontalHeader().defaultAlignment() == _RIGHT_ALIGN
+
+    fill_ic_distance_preview_table(table, _ic_distance_preview_rows())
+    assert table.rowCount() > 0
+    for row in range(table.rowCount()):
+        for col in range(table.columnCount()):
+            item = table.item(row, col)
+            if item is not None:
+                assert item.textAlignment() == _RIGHT_ALIGN
+
+
+def test_ic_distance_preview_shows_change_against_its_uncertainty(qapp) -> None:
+    """A distance is only worth moving if the change clears its own error bar."""
+    table = QTableWidget()
+    rows = _ic_distance_preview_rows()
+    fill_ic_distance_preview_table(table, rows)
+
+    delta_texts = [table.item(row, 2).text() for row in range(table.rowCount())]
+    assert all("±" in text for text in delta_texts)
+    assert all(row.sdd_stderr_mm > 0.0 for row in rows)
+
+
+def test_ic_distance_preview_surfaces_rejected_spots(qapp) -> None:
+    """Session 1943968267 sheds a few percent of its spots; that must not be silent."""
+    table = QTableWidget()
+    rows = _ic_distance_preview_rows()
+    fill_ic_distance_preview_table(table, rows)
+
+    samples_col = table.columnCount() - 1
+    sample_texts = [table.item(row, samples_col).text() for row in range(table.rowCount())]
+    assert any(row.n_rejected > 0 for row in rows)
+    assert any("−" in text for text in sample_texts)
+    # Rejected spots stay in the residuals, so the worst spot is still reported.
+    assert all(row.max_abs_before_mm > 0.0 for row in rows)
+
+
+def test_config_tuning_panel_ic_distance_preview_returns_rows(qapp) -> None:
+    panel = ConfigTuningPanel()
+    config_root = _TEST_DATA / _SESSION / _SESSION / "config"
+    assert panel.open_config_root(config_root)
+
+    workflow = get_auto_tune_workflow("ic_distance_tuning")
+    assert workflow is not None
+
+    result = panel._on_auto_tune_preview(
+        workflow,
+        {"session_ids": [_SESSION], "data_dir": str(_TEST_DATA)},
+    )
+    assert result is not None
+    rows, warnings = result
+    assert len(rows) == 4
+    assert any("Sigma Tuning" in w for w in warnings)
+
+
+def test_config_tuning_panel_ic_distance_apply_marks_devices_dirty(qapp) -> None:
+    panel = ConfigTuningPanel()
+    config_root = _TEST_DATA / _SESSION / _SESSION / "config"
+    assert panel.open_config_root(config_root)
+
+    workflow = get_auto_tune_workflow("ic_distance_tuning")
+    assert workflow is not None
+    result = panel._on_auto_tune_apply(
+        workflow,
+        {"session_ids": [_SESSION], "data_dir": str(_TEST_DATA)},
+    )
+    assert result is not None
+    assert result.success
+    assert result.ic_distance is not None
+    assert result.ic_distance.distances_updated == 4
+
+    devices_path = resolve_devices_xml_path(config_root)
+    assert devices_path is not None
+    document = panel._open_documents.get(devices_path.resolve())
+    assert document is not None
+    assert document.dirty
+    # Both halves of the fit must land, or the chamber is left worse than before.
+    for chamber in document.root.iter("ion_chamber"):
+        name_el = chamber.find("device")
+        if name_el is None or name_el.get("name") not in ("IC_1_Y", "IC_2_Y"):
+            continue
+        assert chamber.findtext("source_to_device_distance_mm")
+        assert chamber.findtext("zero_offset_at_iso_mm")
 
 
 def test_config_tuning_panel_apply_failure_does_not_mark_dirty(qapp) -> None:
