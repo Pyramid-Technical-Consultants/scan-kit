@@ -24,7 +24,10 @@ from scan_kit.workflows.config_tuning.auto_tuning.sigma_tune import (
     band_sigma_variance,
     collect_sigma_band_updates,
     compute_band_sigma,
+    compute_band_sigma_k0,
     compute_sigma_tune_preview,
+    sigma_tolerance_lower_mm,
+    sigma_tolerance_upper_mm,
     tune_sigmas_from_session,
 )
 
@@ -83,6 +86,64 @@ def test_compute_band_sigma_modes() -> None:
     assert compute_band_sigma(sigmas, weights, "weighted_average") == pytest.approx(8.6)
 
 
+def test_compute_band_sigma_k0_pins_minimum_with_headroom_to_lower_edge() -> None:
+    k0 = compute_band_sigma_k0(
+        np.array([4.0, 5.0, 6.0]),
+        tolerance_percent=20.0,
+        lower_headroom_percent=0.0,
+    )
+    assert k0 == pytest.approx(5.0)
+    assert sigma_tolerance_lower_mm(k0, 20.0) == pytest.approx(4.0)
+
+
+def test_compute_band_sigma_k0_lower_headroom_adds_margin() -> None:
+    sigmas = np.array([4.0, 5.0])
+    bare = compute_band_sigma_k0(sigmas, tolerance_percent=20.0, lower_headroom_percent=0.0)
+    with_headroom = compute_band_sigma_k0(sigmas, tolerance_percent=20.0, lower_headroom_percent=1.0)
+    assert with_headroom > bare
+    assert sigma_tolerance_lower_mm(with_headroom, 20.0) > float(np.min(sigmas))
+
+
+def test_compute_band_sigma_k0_covers_max_when_spread_fits() -> None:
+    sigmas = np.array([4.0, 5.0])
+    k0 = compute_band_sigma_k0(sigmas, tolerance_percent=20.0, lower_headroom_percent=0.0)
+    assert sigma_tolerance_lower_mm(k0, 20.0) <= float(np.min(sigmas))
+    assert sigma_tolerance_upper_mm(k0, 20.0) >= float(np.max(sigmas))
+
+
+def test_compute_band_sigma_k0_prioritizes_min_when_spread_too_wide() -> None:
+    sigmas = np.array([4.0, 7.0])
+    k0 = compute_band_sigma_k0(sigmas, tolerance_percent=20.0, lower_headroom_percent=0.0)
+    assert sigma_tolerance_lower_mm(k0, 20.0) == pytest.approx(4.0)
+    assert sigma_tolerance_upper_mm(k0, 20.0) < float(np.max(sigmas))
+
+
+def test_collect_sigma_band_updates_respects_tolerance() -> None:
+    devices_path = _TEST_DATA / _SESSION / _SESSION / "config" / "map2map" / "devices.xml"
+    root = ET.fromstring(devices_path.read_text(encoding="utf-8"))
+    spots = load_measured_sigma_spots(_SESSION, _TEST_DATA)
+    assert spots is not None
+
+    updates, _ = collect_sigma_band_updates(
+        root,
+        spots,
+        tolerance_percent=20.0,
+        lower_headroom_percent=1.0,
+    )
+    assert updates
+    for update in updates:
+        lower = sigma_tolerance_lower_mm(update.new_k0, 20.0)
+        upper = sigma_tolerance_upper_mm(update.new_k0, 20.0)
+        energies, sigmas = spots.by_device[update.device]
+        mask = (energies >= update.min_energy) & (energies <= update.max_energy)
+        band = sigmas[mask]
+        min_with_headroom = float(np.min(band)) * 1.01
+        assert lower >= min_with_headroom - 1e-9
+        assert lower > float(np.min(band))
+        if float(np.max(band)) <= upper:
+            assert upper >= float(np.max(band))
+
+
 def test_resolve_devices_xml_under_config_root() -> None:
     config_root = _TEST_DATA / _SESSION / _SESSION / "config"
     path = resolve_devices_xml_path(config_root)
@@ -122,21 +183,11 @@ def test_apply_measured_sigmas_updates_k0() -> None:
     assert before != after
 
 
-def test_optimize_modes_can_differ_for_same_band() -> None:
-    devices_path = _TEST_DATA / _SESSION / _SESSION / "config" / "map2map" / "devices.xml"
-    root = ET.fromstring(devices_path.read_text(encoding="utf-8"))
-    spots = load_measured_sigma_spots(_SESSION, _TEST_DATA)
-    assert spots is not None
-
-    median_updates, _ = collect_sigma_band_updates(root, spots, optimize_mode="median")
-    weighted_updates, _ = collect_sigma_band_updates(
-        root, spots, optimize_mode="weighted_average"
-    )
-    midpoint_updates, _ = collect_sigma_band_updates(
-        root, spots, optimize_mode="min_max_midpoint"
-    )
-    assert len(median_updates) > 0
-    assert {u.new_k0 for u in weighted_updates} != {u.new_k0 for u in midpoint_updates}
+def test_tolerance_percent_changes_k0_assignment() -> None:
+    sigmas = np.array([4.0, 5.0])
+    loose = compute_band_sigma_k0(sigmas, tolerance_percent=20.0, lower_headroom_percent=0.0)
+    tight = compute_band_sigma_k0(sigmas, tolerance_percent=10.0, lower_headroom_percent=0.0)
+    assert loose > tight
 
 
 def test_compute_sigma_tune_preview_matches_apply_count() -> None:

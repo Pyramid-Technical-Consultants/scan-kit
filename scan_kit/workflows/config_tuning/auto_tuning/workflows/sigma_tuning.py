@@ -11,7 +11,11 @@ from scan_kit.common.session_source import resolve_session_source
 
 from ..base import AutoTuneRunResult, AutoTuneWorkflow
 from ..session_params import parse_session_ids
-from ..sigma_tune import normalize_sigma_optimize_mode, tune_sigmas_from_sessions
+from ..sigma_tune import (
+    normalize_sigma_lower_headroom_percent,
+    normalize_sigma_tolerance_percent,
+    tune_sigmas_from_sessions,
+)
 
 
 class SigmaTuningWorkflow(AutoTuneWorkflow):
@@ -27,7 +31,7 @@ class SigmaTuningWorkflow(AutoTuneWorkflow):
 
     @property
     def description(self) -> str:
-        return "IC1/IC2 σ K0 from session(s)"
+        return "IC1/IC2 σ K0 to fit ±tolerance band"
 
     def uses_session_browser(self) -> bool:
         return True
@@ -63,12 +67,18 @@ class SigmaTuningWorkflow(AutoTuneWorkflow):
         session_ids = parse_session_ids(params)
         data_dir = Path(str(params["data_dir"]).strip()).expanduser().resolve()
 
-        optimize_mode = normalize_sigma_optimize_mode(params.get("optimize_method"))
+        tolerance_percent = normalize_sigma_tolerance_percent(
+            params.get("sigma_tolerance_percent")
+        )
+        lower_headroom_percent = normalize_sigma_lower_headroom_percent(
+            params.get("sigma_lower_headroom_percent")
+        )
         tune_result = tune_sigmas_from_sessions(
             root,
             session_ids,
             str(data_dir),
-            optimize_mode=optimize_mode,
+            tolerance_percent=tolerance_percent,
+            lower_headroom_percent=lower_headroom_percent,
         )
         if not tune_result.ok:
             return AutoTuneRunResult(
