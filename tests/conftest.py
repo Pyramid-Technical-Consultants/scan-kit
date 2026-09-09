@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import inspect
 import os
+import re
 import sys
 from collections.abc import Callable
 from pathlib import Path
@@ -70,6 +71,7 @@ _SKIP_NO_TEST_DATA = pytest.mark.skip(
 )
 
 _HELPERS_USING_TEST_DATA: dict[str, frozenset[str]] = {}
+_PATH_CONSTANTS_USING_TEST_DATA: dict[str, frozenset[str]] = {}
 
 
 def _module_helpers_using_test_data(module) -> frozenset[str]:
@@ -94,6 +96,24 @@ def _module_helpers_using_test_data(module) -> frozenset[str]:
     return cached
 
 
+def _module_path_constants_using_test_data(module) -> frozenset[str]:
+    module_file = getattr(module, "__file__", None)
+    if module_file is None:
+        return frozenset()
+    cached = _PATH_CONSTANTS_USING_TEST_DATA.get(module_file)
+    if cached is not None:
+        return cached
+    names: set[str] = set()
+    for name, value in vars(module).items():
+        if name in ("TEST_DATA", "_TEST_DATA"):
+            continue
+        if isinstance(value, Path) and "test_data" in value.parts:
+            names.add(name)
+    cached = frozenset(names)
+    _PATH_CONSTANTS_USING_TEST_DATA[module_file] = cached
+    return cached
+
+
 def _test_function_uses_test_data(item: pytest.Item) -> bool:
     """Skip tests that load the gitignored fixture tree (directly or via helpers)."""
     try:
@@ -102,6 +122,9 @@ def _test_function_uses_test_data(item: pytest.Item) -> bool:
         return False
     if "_TEST_DATA" in source or "TEST_DATA" in source:
         return True
+    for name in _module_path_constants_using_test_data(item.module):
+        if re.search(rf"\b{name}\b", source):
+            return True
     return any(f"{name}(" in source for name in _module_helpers_using_test_data(item.module))
 
 
