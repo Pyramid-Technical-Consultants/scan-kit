@@ -2,11 +2,12 @@
 """PyInstaller spec for building scan-kit as a single executable.
 
 Usage:
-    pyinstaller scan_kit.spec          # one-dir (faster builds, for testing)
-    pyinstaller scan_kit.spec --onefile # single exe (for distribution)
+    pyinstaller scan_kit.spec                    # single exe (default)
+    SCAN_KIT_ONEDIR=1 pyinstaller scan_kit.spec  # one-dir (AppImage input)
 """
 
 import ctypes.util
+import os
 import sys
 from pathlib import Path
 
@@ -118,13 +119,7 @@ a = Analysis(
 
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
-# --onefile build (default: produces a single executable)
-exe = EXE(
-    pyz,
-    a.scripts,
-    a.binaries,
-    a.datas,
-    [],
+_exe_kw = dict(
     name="scan-kit",
     debug=False,
     bootloader_ignore_signals=False,
@@ -140,3 +135,17 @@ exe = EXE(
     entitlements_file=None,
     icon=str(_assets_dir / "icon.ico") if sys.platform == "win32" else None,
 )
+
+if os.environ.get("SCAN_KIT_ONEDIR") == "1":
+    exe = EXE(pyz, a.scripts, [], exclude_binaries=True, **_exe_kw)
+    coll = COLLECT(
+        exe,
+        a.binaries,
+        a.datas,
+        strip=False,
+        upx=True,
+        upx_exclude=[],
+        name="scan-kit",
+    )
+else:
+    exe = EXE(pyz, a.scripts, a.binaries, a.datas, [], **_exe_kw)

@@ -10,6 +10,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import os
 import platform
 import shutil
 import subprocess
@@ -75,12 +76,15 @@ def build(*, onedir: bool = False) -> Path:
         "--clean",
     ]
 
+    env = os.environ.copy()
     if onedir:
-        cmd.append("--onedir")
+        env["SCAN_KIT_ONEDIR"] = "1"
+    else:
+        env.pop("SCAN_KIT_ONEDIR", None)
 
     print(f"Building scan-kit ({platform.system()} {platform.machine()})…")
     print(f"  Command: {' '.join(cmd)}\n")
-    subprocess.check_call(cmd, cwd=ROOT)
+    subprocess.check_call(cmd, cwd=ROOT, env=env)
 
     if onedir:
         out = ROOT / "dist" / "scan-kit"
