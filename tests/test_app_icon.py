@@ -65,9 +65,15 @@ def test_prepare_linux_frozen_env_sets_isolation_vars(monkeypatch) -> None:
     monkeypatch.setattr(sys, "frozen", True, raising=False)
     monkeypatch.delenv("GIO_MODULE_DIR", raising=False)
     monkeypatch.delenv("QT_IM_MODULE", raising=False)
+    monkeypatch.delenv("GTK_IM_MODULE", raising=False)
+    monkeypatch.delenv("XMODIFIERS", raising=False)
+    monkeypatch.delenv("GSETTINGS_BACKEND", raising=False)
 
     prepare_linux_frozen_env()
 
     assert os.environ["GIO_MODULE_DIR"] == ""
     assert os.environ["QT_IM_MODULE"] == "simple"
+    assert os.environ["GTK_IM_MODULE"] == "xim"
+    assert os.environ["XMODIFIERS"] == "@im=none"
+    assert os.environ["GSETTINGS_BACKEND"] == "memory"
     assert os.environ["NO_AT_BRIDGE"] == "1"

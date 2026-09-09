@@ -151,6 +151,10 @@ class ScanKitMainWindow(QMainWindow):
         self._view_buttons: dict[str, QPushButton] = {}
         self._bootstrap_generation: int = 0
         self._main_tabs: QTabWidget | None = None
+        self._plan_runner_panel: PlanRunnerPanel | None = None
+        self._config_tuning_panel: ConfigTuningPanel | None = None
+        self._debug_log_panel: DebugLogPanel | None = None
+        self._deferred_tab_steps: list = []
 
         boot = QWidget()
         boot_l = QVBoxLayout(boot)
@@ -162,12 +166,27 @@ class ScanKitMainWindow(QMainWindow):
         QTimer.singleShot(0, self._deferred_finish_init)
 
     def _deferred_finish_init(self) -> None:
-        """Build the full UI on the next event-loop pass so the window can paint first."""
-        self._build_ui()
+        """Build UI in event-loop chunks so GNOME does not mark us unresponsive."""
+        self._init_main_tabs_shell()
         self._connect_thread_signals()
         QTimer.singleShot(0, self._request_settings_then_scan)
-        # Pre-warm view workers in the background so the first click is instant.
-        QTimer.singleShot(0, self._refill_warm_pool)
+        self._deferred_tab_steps = [
+            self._add_plan_synthesis_tab,
+            self._add_plan_runner_tab,
+            self._add_config_tuning_tab,
+            self._add_debug_tab,
+            self._finalize_main_tabs,
+        ]
+        QTimer.singleShot(0, self._pump_deferred_tab_steps)
+
+    def _pump_deferred_tab_steps(self) -> None:
+        if not self._deferred_tab_steps:
+            # Warm workers re-exec the frozen binary; delay until the shell is idle.
+            QTimer.singleShot(2500, self._refill_warm_pool)
+            return
+        step = self._deferred_tab_steps.pop(0)
+        step()
+        QTimer.singleShot(0, self._pump_deferred_tab_steps)
 
     def _connect_thread_signals(self) -> None:
         self._sig_plot_window_ready.connect(
@@ -184,26 +203,60 @@ class ScanKitMainWindow(QMainWindow):
         return self._initial_base_dir
 
     def _build_ui(self) -> None:
+        """Synchronously build the full UI (tests / callers that need everything now)."""
+        self._init_main_tabs_shell()
+        self._add_plan_synthesis_tab()
+        self._add_plan_runner_tab()
+        self._add_config_tuning_tab()
+        self._add_debug_tab()
+        self._finalize_main_tabs()
+
+    def _init_main_tabs_shell(self) -> None:
+        """Show Data Analysis first so the window stays interactive while other tabs load."""
         tabs = QTabWidget()
         tabs.addTab(self._build_data_analysis_tab(), _MAIN_TAB_DATA_ANALYSIS)
+        self._main_tabs = tabs
+        self.setCentralWidget(tabs)
+        self._build_menu_bar()
+        self._sync_tab_menu()
+        QShortcut(QKeySequence("Esc"), self, activated=self.close)
+
+    def _add_plan_synthesis_tab(self) -> None:
+        tabs = self._main_tabs
+        if tabs is None:
+            return
         tabs.addTab(self._build_plan_synthesis_tab(), _MAIN_TAB_PLAN_SYNTHESIS)
+
+    def _add_plan_runner_tab(self) -> None:
+        tabs = self._main_tabs
+        if tabs is None:
+            return
         self._plan_runner_panel = PlanRunnerPanel(app_settings=self._app_settings)
         tabs.addTab(self._plan_runner_panel, _MAIN_TAB_PLAN_RUNNER)
+
+    def _add_config_tuning_tab(self) -> None:
+        tabs = self._main_tabs
+        if tabs is None:
+            return
         self._config_tuning_panel = ConfigTuningPanel(app_settings=self._app_settings)
         self._config_tuning_panel.set_session_data_dir(self._base_dir)
         tabs.addTab(self._config_tuning_panel, _MAIN_TAB_CONFIG_TUNING)
+
+    def _add_debug_tab(self) -> None:
+        tabs = self._main_tabs
+        if tabs is None:
+            return
         self._debug_log_panel = DebugLogPanel()
         tabs.addTab(self._debug_log_panel, _MAIN_TAB_DEBUG)
-        self._main_tabs = tabs
-        self._restore_main_tab()
-        tabs.currentChanged.connect(self._on_main_tab_changed)
-        self.setCentralWidget(tabs)
         self._debug_log_panel.install_logging()
 
-        self._build_menu_bar()
+    def _finalize_main_tabs(self) -> None:
+        tabs = self._main_tabs
+        if tabs is None:
+            return
+        self._restore_main_tab()
+        tabs.currentChanged.connect(self._on_main_tab_changed)
         self._sync_tab_menu()
-
-        QShortcut(QKeySequence("Esc"), self, activated=self.close)
 
     def _build_menu_bar(self) -> None:
         menu_bar = self.menuBar()
@@ -764,7 +817,8 @@ class ScanKitMainWindow(QMainWindow):
             if proc is None:
                 self._notify("Failed to run analysis", error=True)
                 return
-            self._debug_log_panel.attach_subprocess_stderr(proc, module_name)
+            if self._debug_log_panel is not None:
+                self._debug_log_panel.attach_subprocess_stderr(proc, module_name)
             threading.Thread(
                 target=self._watch_subprocess_ready,
                 args=(proc, module_name),
@@ -829,7 +883,8 @@ class ScanKitMainWindow(QMainWindow):
             return None
         worker = _WarmWorker(proc)
         self._warm_idle.append(worker)
-        self._debug_log_panel.attach_subprocess_stderr(proc, "view-worker")
+        if self._debug_log_panel is not None:
+            self._debug_log_panel.attach_subprocess_stderr(proc, "view-worker")
         threading.Thread(
             target=self._watch_worker, args=(worker,), daemon=True
         ).start()
@@ -915,7 +970,7 @@ class ScanKitMainWindow(QMainWindow):
         if _READY_SENTINEL.encode() in raw:
             return True
         text = raw.decode(errors="replace").rstrip("\r\n")
-        if text:
+        if text and self._debug_log_panel is not None:
             self._debug_log_panel.append("STDOUT", source, text)
         return False
 
@@ -1131,7 +1186,8 @@ def main() -> None:
         _sig_timer.timeout.connect(lambda: None)
 
     win.show()
-    QApplication.processEvents()
+    # Do not processEvents() here: it would run deferred UI build synchronously
+    # before app.exec() and trip GNOME's "Force Quit or Wait" dialog.
     apply_windows_window_icons(win, app_icon)
     sys.exit(app.exec())
 

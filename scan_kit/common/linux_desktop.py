@@ -91,8 +91,7 @@ def ensure_linux_desktop_integration() -> None:
             os.chmod(desktop_dest, 0o755)
         except OSError:
             return
-
-    _refresh_desktop_database()
+        _refresh_desktop_database()
 
 
 def _refresh_desktop_database() -> None:
@@ -107,6 +106,7 @@ def _refresh_desktop_database() -> None:
             subprocess.run(
                 [updater, str(apps_dir)],
                 check=False,
+                timeout=2,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )

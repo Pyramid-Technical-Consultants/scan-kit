@@ -26,9 +26,14 @@ def prepare_linux_frozen_env() -> None:
     ):
         os.environ[key] = ""
 
-    # IBus/GTK IM modules link against system GLib and fail with bundled GLib.
+    # Empty GTK_IM_MODULE lets GTK fall back to gsettings → often "ibus", which
+    # then fails with g_task_set_static_name against bundled GLib. Force a
+    # non-ibus module instead.
     os.environ["QT_IM_MODULE"] = "simple"
-    os.environ["GTK_IM_MODULE"] = ""
+    os.environ["GTK_IM_MODULE"] = "xim"
+    os.environ["XMODIFIERS"] = "@im=none"
 
     # Avoid atk-bridge signature mismatch noise from accessibility probing.
     os.environ.setdefault("NO_AT_BRIDGE", "1")
+    # Don't consult host dconf for gtk-im-module / theme plugins.
+    os.environ.setdefault("GSETTINGS_BACKEND", "memory")
