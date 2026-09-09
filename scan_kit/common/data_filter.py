@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import warnings
 from typing import Any, Sequence
 
 import numpy as np
@@ -116,6 +117,13 @@ def _valid_severity(severity: np.ndarray) -> np.ndarray:
     return np.isfinite(severity)
 
 
+def _nanmax(values: np.ndarray, axis: int | None = None) -> np.ndarray:
+    """``nanmax`` without RuntimeWarning on all-NaN slices."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        return np.nanmax(values, axis=axis)
+
+
 def filter_mask_from_severity(severity: np.ndarray, filter_id: str) -> np.ndarray:
     """Return a boolean keep-mask from a per-sample severity scalar."""
     if filter_id == FILTER_ALL:
@@ -174,7 +182,7 @@ def _domain_mask_from_columns(
             else _mad_outlier_mask_four_axis(*arrays)
         )
 
-    severity = np.nanmax(np.abs(np.stack(arrays, axis=0)), axis=0)
+    severity = _nanmax(np.abs(np.stack(arrays, axis=0)), axis=0)
     return filter_mask_from_severity(severity, domain_filter)
 
 
@@ -259,7 +267,7 @@ def _position_error_mask(
     elif domain_filter == FILTER_ALL:
         domain_mask = np.ones(n, dtype=bool)
     else:
-        severity = np.nanmax(
+        severity = _nanmax(
             np.abs(np.stack([data.ic1_x, data.ic1_y, data.ic2_x, data.ic2_y], axis=0)),
             axis=0,
         )
@@ -294,7 +302,7 @@ def filter_session_ic_xy(
     filters = _coerce_filter_selection(selection, beam_state_filter)
     n = len(data.ic1_x)
     if data.plan_x is not None and data.plan_y is not None:
-        dev = np.nanmax(
+        dev = _nanmax(
             np.abs(
                 np.stack(
                     [
@@ -327,7 +335,7 @@ def filter_session_ic_xy(
         elif filters.domain_filter == FILTER_ALL:
             domain_mask = np.ones(n, dtype=bool)
         else:
-            severity = np.nanmax(
+            severity = _nanmax(
                 np.abs(np.stack([data.ic1_x, data.ic1_y, data.ic2_x, data.ic2_y], axis=0)),
                 axis=0,
             )
@@ -363,7 +371,7 @@ def filter_session_ic_sigmas(
     elif filters.domain_filter == FILTER_ALL:
         domain_mask = np.ones(n, dtype=bool)
     else:
-        severity = np.nanmax(
+        severity = _nanmax(
             np.stack([data.ic1_x, data.ic1_y, data.ic2_x, data.ic2_y], axis=0),
             axis=0,
         )

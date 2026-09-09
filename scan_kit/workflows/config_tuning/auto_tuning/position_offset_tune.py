@@ -1,4 +1,11 @@
-"""Apply measured session position errors to ``devices.xml`` zero offsets."""
+"""Apply measured session position errors to ``devices.xml`` zero offsets.
+
+This is the offset-only half of the position model: it shifts
+``zero_offset_at_iso_mm`` and leaves the strip-to-isocenter scale alone, which is the
+``slope = 1`` special case of the joint fit in :mod:`ic_distance_tune`.  Use this when
+the chamber scale is trusted; use IC distance tuning when a residual grows with
+distance from isocenter, since an offset fitted against a wrong scale is biased.
+"""
 
 from __future__ import annotations
 

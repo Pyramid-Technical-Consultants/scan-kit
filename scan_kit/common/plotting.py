@@ -864,10 +864,11 @@ def scatter_with_trend(
     mask = np.isfinite(x_arr) & np.isfinite(y_arr)
     xf = x_arr[mask]
     yf = y_arr[mask]
-    if xf.size < 2:
+    fit = _linear_fit_slope_intercept(xf, yf)
+    if fit is None:
         return None
 
-    slope, intercept = np.polyfit(xf, yf, 1)
+    slope, intercept = fit
     x_range = np.array([xf.min(), xf.max()])
     ax.plot(
         x_range,
@@ -1282,7 +1283,10 @@ def add_binned_trend(
         if len(x_phys) < 2:
             continue
 
-        slope, intercept = np.polyfit(np.array(x_phys), np.array(y_agg), 1)
+        fit = _linear_fit_slope_intercept(np.array(x_phys), np.array(y_agg))
+        if fit is None:
+            continue
+        slope, intercept = fit
         line_color = trend_line_color(colors[i])
         xs = [j + (i - 0.5) * position_offset for j in range(len(categories))]
         ys = slope * categories_f + intercept

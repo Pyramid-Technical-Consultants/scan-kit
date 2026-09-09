@@ -147,7 +147,7 @@ def test_connected_info_sets_session_root_and_enables(qapp) -> None:
 def test_session_hint_follows_zip_name(qapp) -> None:
     panel = _panel()
     try:
-        panel._session_path_edit.setText(r"C:\out\abc.zip")
+        panel._session_path_edit.setText("abc.zip")
         assert "abc" in panel._session_hint._full
         assert "/root/reports/session/abc" in panel._session_hint._full
     finally:

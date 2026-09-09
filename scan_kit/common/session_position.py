@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
@@ -43,10 +43,18 @@ _DEVICE_ERROR_FIELDS = {
 
 @dataclass(frozen=True)
 class MeasuredPositionErrors:
-    """Aligned position-error samples for each IC device."""
+    """Aligned position-error samples for each IC device.
+
+    ``plan_by_device`` holds the commanded position at isocenter per sample, aligned
+    with ``by_device``.  An offset-only fit needs the errors alone, but fitting a
+    *slope* (IC distance) needs to know where each spot was asked to go, so this is
+    only populated by the spot loader — the timeslice source carries errors without
+    the plan position behind them.
+    """
 
     by_device: dict[str, tuple[np.ndarray, np.ndarray]]
     weights: np.ndarray | None = None
+    plan_by_device: dict[str, np.ndarray] = field(default_factory=dict)
 
 
 def normalize_position_data_source(value: str | None) -> PositionDataSource:
@@ -89,12 +97,18 @@ def _errors_from_spot_data(data: dict) -> MeasuredPositionErrors | None:
         if np.any(np.isfinite(raw_weights) & (raw_weights > 0)):
             weights = raw_weights
 
+    plan_by_axis = {"x": plan_x, "y": plan_y}
     by_device: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    plan_by_device: dict[str, np.ndarray] = {}
     for device in IC_SIGMA_DEVICES:
-        field = _DEVICE_ERROR_FIELDS[device]
-        by_device[device] = (energies, errors_by_field[field])
+        by_device[device] = (energies, errors_by_field[_DEVICE_ERROR_FIELDS[device]])
+        plan_by_device[device] = plan_by_axis[device[-1].lower()]
 
-    return MeasuredPositionErrors(by_device=by_device, weights=weights)
+    return MeasuredPositionErrors(
+        by_device=by_device,
+        weights=weights,
+        plan_by_device=plan_by_device,
+    )
 
 
 def load_measured_position_errors_spot(
@@ -205,7 +219,9 @@ def merge_measured_position_errors(
         return None
 
     by_device_lists: dict[str, list[tuple[np.ndarray, np.ndarray]]] = {}
+    plan_lists: dict[str, list[np.ndarray]] = {}
     weight_parts: list[np.ndarray] = []
+    plan_complete = True
 
     for measured in parts:
         if not measured.by_device:
@@ -218,6 +234,11 @@ def merge_measured_position_errors(
             weight_parts.append(np.ones(n_samples, dtype=float))
         for device, arrays in measured.by_device.items():
             by_device_lists.setdefault(device, []).append(arrays)
+            plan = measured.plan_by_device.get(device)
+            if plan is None or len(plan) != len(arrays[1]):
+                plan_complete = False
+            else:
+                plan_lists.setdefault(device, []).append(plan)
 
     if not by_device_lists:
         return None
@@ -229,8 +250,20 @@ def merge_measured_position_errors(
             np.concatenate([chunk[1] for chunk in chunks]),
         )
 
+    # Partial plan positions would silently misalign with the errors, so keep them
+    # only when every part supplied them.
+    merged_plan: dict[str, np.ndarray] = {}
+    if plan_complete:
+        merged_plan = {
+            device: np.concatenate(chunks) for device, chunks in plan_lists.items()
+        }
+
     weights = np.concatenate(weight_parts) if weight_parts else None
-    return MeasuredPositionErrors(by_device=merged_by_device, weights=weights)
+    return MeasuredPositionErrors(
+        by_device=merged_by_device,
+        weights=weights,
+        plan_by_device=merged_plan,
+    )
 
 
 def load_measured_position_errors_for_sessions(

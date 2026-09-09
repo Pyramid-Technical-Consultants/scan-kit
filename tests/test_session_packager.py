@@ -25,9 +25,9 @@ from scan_kit.workflows.plan_runner.session_packager import (
 )
 
 _ROOT = Path(__file__).resolve().parents[1]
-_G3_DEVICES = (
-    _ROOT / "test_data" / "1091134775" / "1091134775" / "config" / "map2map" / "devices.xml"
-)
+_G3_CONFIG = _ROOT / "test_data" / "1091134775" / "1091134775" / "config" / "map2map"
+_G3_DEVICES = _G3_CONFIG / "devices.xml"
+_G3_SYSTEM = _G3_CONFIG / "scan_dose_system.xml"
 
 
 def _mini_devices_xml() -> str:
@@ -61,6 +61,26 @@ def _mini_devices_xml() -> str:
         "</ion_chamber>"
         "</devices>"
     )
+
+
+def _mini_system_xml() -> str:
+    """``source_to_isocenter_distance`` is the numerator of every IC mag factor."""
+    return _G3_SYSTEM.read_text(encoding="utf-8") if _G3_SYSTEM.is_file() else (
+        '<?xml version="1.0"?><MapToMap><geometry>'
+        "<source_to_isocenter_distance>2500.0</source_to_isocenter_distance>"
+        "<source_to_x_axis_distance>2500.0</source_to_x_axis_distance>"
+        "<source_to_y_axis_distance>2000.0</source_to_y_axis_distance>"
+        "</geometry></MapToMap>"
+    )
+
+
+def _write_map2map_config(session_dir: Path) -> Path:
+    """Write both files the iso conversion needs: devices + system geometry."""
+    cfg = session_dir / "config" / "map2map"
+    cfg.mkdir(parents=True, exist_ok=True)
+    (cfg / "devices.xml").write_text(_mini_devices_xml(), encoding="utf-8")
+    (cfg / "scan_dose_system.xml").write_text(_mini_system_xml(), encoding="utf-8")
+    return cfg
 
 
 def _write_device_run(run_dir: Path) -> None:
@@ -124,9 +144,7 @@ def test_package_session_zip_layout(tmp_path: Path) -> None:
 def test_build_g3_spot_data_from_device_files(tmp_path: Path) -> None:
     session_dir = tmp_path / "12345"
     _write_device_run(session_dir / "layer-0" / "run-0")
-    cfg = session_dir / "config" / "map2map"
-    cfg.mkdir(parents=True)
-    (cfg / "devices.xml").write_text(_mini_devices_xml(), encoding="utf-8")
+    _write_map2map_config(session_dir)
     (session_dir / "input_map.csv").write_text(
         "ENERGY,X_POSITION,Y_POSITION,spot_no,layer_id\n100,0,0,1,10\n",
         encoding="utf-8",
@@ -160,9 +178,7 @@ def test_synthesized_zip_opens_in_session_tools(tmp_path: Path) -> None:
     )
     run = session_dir / "layer-0" / "run-0"
     _write_device_run(run)
-    cfg = session_dir / "config" / "map2map"
-    cfg.mkdir(parents=True)
-    (cfg / "devices.xml").write_text(_mini_devices_xml(), encoding="utf-8")
+    _write_map2map_config(session_dir)
     (run / "timeslice_data_device_units.csv").write_text(
         "timestamp,ic1_primary_channel\n0,1\n",
         encoding="utf-8",
@@ -191,6 +207,9 @@ def test_download_session_zip_uses_session_id_prefix(tmp_path: Path, monkeypatch
         "/root/reports/session/abc/input_map.csv": b"ENERGY,spot_no,layer_id\n100,1,1\n",
         "/root/reports/session/abc/config/map2map/devices.xml": _mini_devices_xml().encode(
             "utf-8"
+        ),
+        "/root/reports/session/abc/config/map2map/scan_dose_system.xml": (
+            _mini_system_xml().encode("utf-8")
         ),
         "/root/reports/session/abc/layer-0/run-0/IX256_1_spot_data.csv": (
             b"spot_no,layer_id,ic1_position_measured_a,ic1_position_measured_b\n"

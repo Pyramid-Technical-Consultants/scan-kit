@@ -2,10 +2,18 @@
 
 from __future__ import annotations
 
+import inspect
 import os
+import re
 import sys
 from collections.abc import Callable
 from pathlib import Path
+
+_ROOT = Path(__file__).resolve().parents[1]
+# xdist workers do not always inherit the repo root on sys.path; several tests import
+# shared constants via ``from tests.conftest import ...``.
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
 
 # Must be set before matplotlib is imported anywhere in the test process.
 os.environ.setdefault("MPLBACKEND", "Agg")
@@ -17,7 +25,8 @@ matplotlib.use("Agg", force=True)
 import matplotlib.pyplot as plt
 import pytest
 
-TEST_DATA = Path(__file__).resolve().parents[1] / "test_data"
+TEST_DATA = _ROOT / "test_data"
+HAS_TEST_DATA = TEST_DATA.is_dir() and os.environ.get("SCAN_KIT_SKIP_TEST_DATA") != "1"
 G3_SESSION = "1091134775"
 G2_SESSION = "590658542"
 G3_LARGE_SESSION = "1242721320"
@@ -30,6 +39,93 @@ AMP_G3_STUCK_SESSION = "863788396"
 # First line of Qt-heavy tests in large modules (auto-marked slow below).
 _PLAN_SYNTHESIS_UI_START_LINE = 724
 _CONFIG_TUNING_UI_START_LINE = 459
+
+_SESSION_FIXTURES = frozenset({
+    "test_data_dir",
+    "g3_session_id",
+    "g3_spot_summary",
+    "g3_dose_rate",
+    "g3_current_ratios",
+    "g3_binned_availability",
+    "g3_distribution_availability",
+    "g3_fft_data",
+    "g3_large_fft_data",
+    "g3_source_availability",
+    "g3_timeslice_catalog",
+    "g3_timeline_catalog",
+    "g2_timeslice_catalog",
+    "g2_timeline_catalog",
+    "g3_spot_summary_chamber",
+    "g3_timeslice_summary_table",
+    "hv_session_data",
+    "amp_samples_g2",
+    "amp_samples_g3",
+    "amp_samples_g3_old",
+    "amp_samples_g3_const",
+    "amp_samples_g3_stuck",
+    "g2_position_errors",
+})
+
+_SKIP_NO_TEST_DATA = pytest.mark.skip(
+    reason="test_data/ is not available (gitignored; run integration tests locally)",
+)
+
+_HELPERS_USING_TEST_DATA: dict[str, frozenset[str]] = {}
+_PATH_CONSTANTS_USING_TEST_DATA: dict[str, frozenset[str]] = {}
+
+
+def _module_helpers_using_test_data(module) -> frozenset[str]:
+    module_file = getattr(module, "__file__", None)
+    if module_file is None:
+        return frozenset()
+    cached = _HELPERS_USING_TEST_DATA.get(module_file)
+    if cached is not None:
+        return cached
+    names: set[str] = set()
+    for name, obj in vars(module).items():
+        if not name.startswith("_") or not callable(obj):
+            continue
+        try:
+            helper_source = inspect.getsource(obj)
+        except (OSError, TypeError):
+            continue
+        if "_TEST_DATA" in helper_source or "TEST_DATA" in helper_source:
+            names.add(name)
+    cached = frozenset(names)
+    _HELPERS_USING_TEST_DATA[module_file] = cached
+    return cached
+
+
+def _module_path_constants_using_test_data(module) -> frozenset[str]:
+    module_file = getattr(module, "__file__", None)
+    if module_file is None:
+        return frozenset()
+    cached = _PATH_CONSTANTS_USING_TEST_DATA.get(module_file)
+    if cached is not None:
+        return cached
+    names: set[str] = set()
+    for name, value in vars(module).items():
+        if name in ("TEST_DATA", "_TEST_DATA"):
+            continue
+        if isinstance(value, Path) and "test_data" in value.parts:
+            names.add(name)
+    cached = frozenset(names)
+    _PATH_CONSTANTS_USING_TEST_DATA[module_file] = cached
+    return cached
+
+
+def _test_function_uses_test_data(item: pytest.Item) -> bool:
+    """Skip tests that load the gitignored fixture tree (directly or via helpers)."""
+    try:
+        source = inspect.getsource(item.obj)
+    except (OSError, TypeError):
+        return False
+    if "_TEST_DATA" in source or "TEST_DATA" in source:
+        return True
+    for name in _module_path_constants_using_test_data(item.module):
+        if re.search(rf"\b{name}\b", source):
+            return True
+    return any(f"{name}(" in source for name in _module_helpers_using_test_data(item.module))
 
 
 def wait_for_qt(
@@ -52,6 +148,8 @@ def wait_for_qt(
 
 @pytest.fixture(scope="session")
 def test_data_dir() -> str:
+    if not HAS_TEST_DATA:
+        pytest.skip("test_data/ is not available")
     return str(TEST_DATA)
 
 
@@ -284,6 +382,12 @@ def pytest_collection_modifyitems(config, items) -> None:
         "test_timeslice_chamber_position.py",
     })
     for item in items:
+        if not HAS_TEST_DATA:
+            if _SESSION_FIXTURES.intersection(item.fixturenames):
+                item.add_marker(_SKIP_NO_TEST_DATA)
+            elif _test_function_uses_test_data(item):
+                item.add_marker(_SKIP_NO_TEST_DATA)
+
         path_name = item.path.name
         if path_name in slow_modules:
             item.add_marker(slow_marker)
@@ -315,6 +419,21 @@ def qapp():
     if app is None:
         app = QApplication(sys.argv)
     yield app
+
+
+@pytest.fixture(autouse=True)
+def _restore_cwd():
+    """Undo working-directory changes so relative ``test_data`` lookups keep resolving.
+
+    ``prepare_linux_frozen_env`` chdirs by design, so the tests covering it leak the
+    process cwd into whichever test the xdist worker picks up next.
+    """
+    original = os.getcwd()
+    try:
+        yield
+    finally:
+        if os.getcwd() != original:
+            os.chdir(original)
 
 
 @pytest.fixture(autouse=True)

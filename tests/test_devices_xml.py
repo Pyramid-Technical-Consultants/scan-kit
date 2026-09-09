@@ -11,6 +11,7 @@ from scan_kit.common.devices_xml import (
     parse_devices_xml,
     load_session_devices_config,
 )
+from tests.conftest import HAS_TEST_DATA
 
 _SAMPLE = """\
 <?xml version="1.0" encoding="utf-8"?>
@@ -67,6 +68,7 @@ def test_ic_device_mapping_covers_sigma_view_keys() -> None:
     }
 
 
+@pytest.mark.skipif(not HAS_TEST_DATA, reason="test_data/ is not available")
 def test_load_fixture_session_devices_xml() -> None:
     root = Path(__file__).resolve().parent.parent
     config = load_session_devices_config("1943968267", root / "test_data")

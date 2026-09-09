@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 from scan_kit.common.amplifier_settling import (
     amplifier_command_settled_mask,
     amplifier_readback_settled_mask,
     amplifier_settled_mask,
 )
+from tests.conftest import HAS_TEST_DATA
 
 
 def test_command_settled_mask_excludes_post_step_transient() -> None:
@@ -89,6 +91,7 @@ def test_variance_mask_rejects_readback_step() -> None:
     assert mask[17]
 
 
+@pytest.mark.skipif(not HAS_TEST_DATA, reason="test_data/ is not available")
 def test_readback_field_drive_keeps_more_g3_beam_on_samples() -> None:
     """Relaxed readback-driven gates retain more G3 samples when readback tracks."""
     from scan_kit.common import detect_beam_on_mask

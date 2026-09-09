@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import warnings
+
 import numpy as np
 
 from scan_kit.common.data_filter import (
@@ -9,15 +11,18 @@ from scan_kit.common.data_filter import (
     FILTER_BEAM_OFF,
     FILTER_BEAM_ON,
     FILTER_BEAM_BOTH,
+    FILTER_LOWER_95,
     FILTER_MAD_OUTLIERS,
     FILTER_UPPER_95,
     DataFilterSelection,
     beam_state_mask,
     filter_binned_session_data,
     filter_mask_from_columns,
+    filter_session_ic_xy,
     filter_session_position_errors,
     modified_z,
 )
+from scan_kit.common.session_ic_xy import SessionIcXYData
 from scan_kit.common.timeslice_position_error import SessionPositionErrors
 
 
@@ -141,3 +146,20 @@ def test_filter_session_position_errors_beam_off() -> None:
         data, DataFilterSelection(FILTER_ALL, FILTER_BEAM_OFF),
     )
     assert np.isfinite(filtered.ic1_x).tolist() == [False, True, False, True]
+
+
+def test_filter_session_ic_xy_all_nan_severity_is_silent() -> None:
+    n = 4
+    data = SessionIcXYData(
+        ic1_x=np.full(n, np.nan),
+        ic1_y=np.full(n, np.nan),
+        ic2_x=np.full(n, np.nan),
+        ic2_y=np.full(n, np.nan),
+        plan_x=np.zeros(n),
+        plan_y=np.zeros(n),
+    )
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        filtered = filter_session_ic_xy(data, FILTER_LOWER_95)
+    assert not any("All-NaN slice" in str(w.message) for w in caught)
+    assert not np.isfinite(filtered.ic1_x).any()

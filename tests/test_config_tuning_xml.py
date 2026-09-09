@@ -456,6 +456,35 @@ def test_devices_xml_uses_device_names_and_covers_leaves() -> None:
     assert app is not None
 
 
+def test_overwritten_sad_field_is_explained_in_the_form() -> None:
+    """The editor tells you per-IC SAD does nothing, instead of hiding it."""
+    import sys
+    from pathlib import Path
+
+    from PySide6.QtWidgets import QApplication, QLabel
+
+    from scan_kit.workflows.config_tuning.xml_document import XmlDocument
+    from scan_kit.workflows.config_tuning.xml_form import XmlFormWidget
+
+    path = (
+        Path(__file__).resolve().parent.parent
+        / "test_data/1943968267/1943968267/config/map2map/devices.xml"
+    )
+    if not path.is_file():
+        pytest.skip("fixture not available")
+
+    app = QApplication.instance() or QApplication(sys.argv)
+    form = XmlFormWidget(XmlDocument.load(path).root)
+    tooltips = {
+        label.toolTip()
+        for label in form.findChildren(QLabel)
+        if "Source to Axis Distance" in label.text()
+    }
+    assert tooltips
+    assert all("source_to_isocenter_distance" in tip for tip in tooltips)
+    assert app is not None
+
+
 def test_all_ion_chamber_device_names_are_editable() -> None:
     import sys
     from pathlib import Path

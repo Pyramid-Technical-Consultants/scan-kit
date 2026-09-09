@@ -1,11 +1,17 @@
-"""Tests for map2map dead-field registry used by the config editor."""
+"""Tests for the map2map field-role catalog used by the config editor."""
 
 import xml.etree.ElementTree as ET
 
 from scan_kit.workflows.config_tuning.map2map_attr_registry import (
     GAIN_CONVERSION_DEAD_ATTRS,
+    ROLE_EFFECTIVE,
+    ROLE_MAGNET_EFFECTIVE,
+    ROLE_OVERWRITTEN,
+    ROLE_VALIDATED_ONLY,
     filter_attribute_names,
     is_map2map_config_path,
+    map2map_field,
+    map2map_field_tooltip,
     should_hide_map2map_attribute,
     should_hide_map2map_child,
 )
@@ -59,3 +65,26 @@ def test_filter_preserves_live_attrs() -> None:
 def test_is_map2map_config_path() -> None:
     assert is_map2map_config_path("C:/sess/config/map2map/devices.xml")
     assert not is_map2map_config_path("C:/sess/config/map2map/../Input.xml")
+
+
+def test_geometry_field_roles() -> None:
+    """The whole point of the catalog: which distance actually drives magnification."""
+    assert map2map_field("source_to_isocenter_distance").role == ROLE_EFFECTIVE
+    assert map2map_field("source_to_device_distance_mm").role == ROLE_EFFECTIVE
+    assert map2map_field("source_to_axis_distance_mm").role == ROLE_OVERWRITTEN
+    assert map2map_field("source_to_x_axis_distance").role == ROLE_VALIDATED_ONLY
+    assert map2map_field("source_to_y_axis_distance").role == ROLE_VALIDATED_ONLY
+    assert map2map_field("magnet_axis_to_iso_distance_mm").role == ROLE_MAGNET_EFFECTIVE
+
+
+def test_overwritten_fields_stay_visible_with_an_explanation() -> None:
+    ic = ET.Element("ion_chamber")
+    assert not should_hide_map2map_child(ic, "source_to_axis_distance_mm")
+    tooltip = map2map_field_tooltip("source_to_axis_distance_mm", scope="ion_chamber")
+    assert "source_to_isocenter_distance" in tooltip
+    assert "no runtime effect" in tooltip
+
+
+def test_unknown_field_has_no_tooltip() -> None:
+    assert map2map_field("strip_to_mm") is None
+    assert map2map_field_tooltip("strip_to_mm") == ""

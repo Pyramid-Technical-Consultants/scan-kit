@@ -67,7 +67,7 @@ Pre-built executables are published on [**GitHub Releases**](https://github.com/
 
 **Linux:** download the `.AppImage`, mark it executable (`chmod +x`), then double-click it (Ubuntu may ask you to trust/launch it once). On first launch it registers itself in your applications menu with the correct icon.
 
-> **Trying the latest `main` branch?** CI builds release-candidate artifacts on every push and pull request:
+> **Trying the latest `main` or `develop` branch?** CI builds release-candidate artifacts on every merge to those branches (not on open pull requests):
 > `scan-kit-windows-{version}-rc.exe` and `scan-kit-linux-amd64-{version}-rc.AppImage`.
 > Download them from the **Artifacts** section of the corresponding [GitHub Actions](https://github.com/Pyramid-Technical-Consultants/scan-kit/actions) workflow run.
 
@@ -258,9 +258,42 @@ The **Configuration Tuning** tab is a structured editor for map2map XML configur
 - **Auto-generated forms** — edit XML values without raw markup
 - **Hide unused map2map XML** — collapse attributes the map2map library never reads
 - **Integrity badges** — SHA-256 sidecar verification at a glance
-- **Auto-tuning workflows** — e.g. **Sigma Tuning** derives updated IC σ K0 values from measured sessions, with preview before apply
+- **Auto-tuning workflows** — **Sigma Tuning**, **Position Offset Tuning**, and **IC Distance Tuning** derive updated `devices.xml` values from measured sessions, with preview before apply
 
 Jump here directly from a session's context menu in Data Analysis when an on-disk config folder exists.
+
+### Ion chamber magnification
+
+Strip readings become millimetres at isocenter through a magnification factor that map2map computes as:
+
+```
+source_to_isocenter_distance (scan_dose_system.xml)  /  source_to_device_distance_mm (devices.xml)
+```
+
+The per-chamber `source_to_axis_distance_mm` looks like it should be the numerator, but map2map parses it only to seed that factor and then overwrites it for every chamber with the single system-wide `source_to_isocenter_distance`. Room configs often disagree between the two (or carry placeholder values), which has no effect on delivery. Field tooltips in the editor spell out which fields are live, which are overwritten, and which are only range-checked at load.
+
+### Position tuning: offset vs distance
+
+Two workflows correct IC positions, and they are the same model with one parameter freed:
+
+| Workflow | Writes | Corrects |
+| --- | --- | --- |
+| **Position Offset Tuning** | `zero_offset_at_iso_mm` | a constant shift, whatever the distance from isocenter |
+| **IC Distance Tuning** | `source_to_device_distance_mm` and `zero_offset_at_iso_mm` | a shift *plus* an error that grows with distance from isocenter |
+
+IC Distance Tuning assumes delivery at isocenter is correct and the chamber is mis-scaled, then fits both together — since `source_to_device_distance_mm` is the only per-chamber scale knob map2map honours. Fitting them jointly matters because an offset fitted against a wrong scale absorbs part of the scale error, so use Position Offset Tuning only when the scale is trusted.
+
+Because it moves a *surveyed* distance, the workflow needs spot data from a plan that actually spans the field, reports each proposed change against its own fit uncertainty, and refuses changes the data cannot support. Per-spot scatter alone will fit a small scale error on any real session, so a change smaller than a few sigma is flagged rather than trusted. Changing the distance also rescales isocenter sigma by the same factor, so re-run Sigma Tuning afterwards.
+
+Gross outliers are rejected before fitting: a dropped spot pulls the fitted scale in proportion to both its error and its distance from the field centre, so one bad spot at a field edge is the worst case. The rejected count appears in the preview and is called out when it exceeds a stray few, since a session shedding many spots is a data problem rather than a calibration one. Rejected spots stay in the reported residuals so they remain visible.
+
+Read the preview by these columns:
+
+| Column | Means |
+| --- | --- |
+| **Systematic** | position error at the worst field edge that the change removes — the reason to apply it |
+| **RMS err** | what the fit minimises, so the honest before/after |
+| **Max \|err\|** | a single worst spot; it can *rise* when correcting a systematic of opposite sign stops masking an outlier |
 
 <p align="center">
   <img src="docs/images/launcher-config-tuning.png" alt="Configuration Tuning tab editing devices.xml" width="720">
@@ -337,7 +370,7 @@ Output: `dist/scan-kit` (Linux) or `dist/scan-kit.exe` (Windows). Local builds k
 Releases are automated via [`.github/workflows/build.yml`](.github/workflows/build.yml).
 
 1. Bump `__version__` in `scan_kit/__init__.py` — the single source of truth, also read by `pyproject.toml` and the window title.
-2. Commit: `Release vX.Y.Z`, push to `main`.
+2. Commit: `Release vX.Y.Z`, merge to `develop`, then promote `develop` → `main` (or release directly from `main` once aligned).
 3. Tag and push:
 
 ```bash
@@ -347,8 +380,11 @@ git push origin vX.Y.Z
 
 | Trigger | CI output |
 |---------|-----------|
-| Push to `main`, PR, manual dispatch | `-rc` artifacts (`scan-kit-windows-X.Y.Z-rc.exe`, etc.) |
-| `v*` tag push | GitHub Release with `scan-kit-windows-X.Y.Z.exe` and `scan-kit-linux-amd64-X.Y.Z` |
+| Pull request to `main` or `develop` | Tests only (no executable build) |
+| Push to `main` or `develop`, manual dispatch | Tests, then `-rc` artifacts (`scan-kit-windows-X.Y.Z-rc.exe`, etc.) |
+| `v*` tag push | Tests, build, and GitHub Release with `scan-kit-windows-X.Y.Z.exe` and `scan-kit-linux-amd64-X.Y.Z` |
+
+Day-to-day work merges feature branches into **`develop`** first; `main` tracks released (or release-ready) history. Open a pull request against `develop`, not `main`, unless you are promoting a release.
 
 CI verifies the tag matches `__version__` before publishing. The project follows [Semantic Versioning](https://semver.org/).
 

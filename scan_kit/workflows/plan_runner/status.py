@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any
 
 from ...igx.rci_paths import (
@@ -154,6 +154,13 @@ def coach_message(*, connected: bool, has_plan: bool, status: dict[str, Any]) ->
     return "Plan is on the controller. Waiting for the RCI ready permit."
 
 
+def _zip_path_stem(path: str) -> str:
+    """Zip basename without extension; parse Windows paths on any host."""
+    if "\\" in path or (len(path) > 1 and path[1] == ":"):
+        return PureWindowsPath(path).stem
+    return Path(path).stem
+
+
 def resolve_session_download(
     dest: str, remote_root: str
 ) -> tuple[str, str] | None:
@@ -162,7 +169,7 @@ def resolve_session_download(
     if not dest or dest.startswith("/root/") or not dest.lower().endswith(".zip"):
         return None
     root = remote_root.rstrip("/")
-    return f"{root}/{Path(dest).stem}", dest
+    return f"{root}/{_zip_path_stem(dest)}", dest
 
 
 def default_session_zip_path(current: str, last_folder: str) -> str:
@@ -186,7 +193,7 @@ def session_download_hint(dest: str, remote_root: str) -> str:
     dest = dest.strip()
     root = remote_root.rstrip("/")
     if dest.lower().endswith(".zip"):
-        return f"Downloads {root}/{Path(dest).stem}"
+        return f"Downloads {root}/{_zip_path_stem(dest)}"
     if dest.startswith("/root/"):
         return f"Remote folder {dest.rstrip('/')}"
     return f"Zip name is the folder under {root}/"

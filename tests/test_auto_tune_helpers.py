@@ -101,14 +101,15 @@ def test_format_sigma_k0(value: float, expected: str) -> None:
     assert format_sigma_k0(value) == expected
 
 
-def test_auto_tune_registry_contains_both_workflows() -> None:
+def test_auto_tune_registry_contains_every_workflow() -> None:
     ids = {workflow.id for workflow in AUTO_TUNE_REGISTRY}
-    assert ids == {"sigma_tuning", "position_offset_tuning"}
+    assert ids == {"sigma_tuning", "position_offset_tuning", "ic_distance_tuning"}
 
 
 def test_get_auto_tune_workflow_known_and_unknown() -> None:
     assert get_auto_tune_workflow("sigma_tuning") is not None
     assert get_auto_tune_workflow("position_offset_tuning") is not None
+    assert get_auto_tune_workflow("ic_distance_tuning") is not None
     assert get_auto_tune_workflow("not_a_workflow") is None
 
 

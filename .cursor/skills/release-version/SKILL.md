@@ -57,8 +57,10 @@ The release is driven entirely by the **pushed git tag**, via `.github/workflows
 ```yaml
 on:
   push:
-    branches: [main]
+    branches: [main, develop]
     tags: ["v*"]
+  pull_request:
+    branches: [main, develop]
 ...
   release:
     needs: build
@@ -67,7 +69,8 @@ on:
 
 What this means in practice:
 
-- The `build` job runs on every push to `main`, every PR, and every `v*` tag — but it only **builds** artifacts, it does **not** release.
+- Pull requests run **tests only**; executable builds run on pushes to `main` or `develop`, manual dispatch, and `v*` tags.
+- The `build` job only **builds** artifacts; it does **not** release unless the ref is a `v*` tag.
 - The `release` job runs **only** when the pushed ref is a tag starting with `v` (`refs/tags/v*`). This is the single gate that publishes the GitHub Release and attaches the Windows/Linux binaries.
 - Therefore a release happens **only** when you push a tag whose name starts with `v`. Pushing the commit alone, or a tag named without the `v` prefix (e.g. `1.4.0`), will build but **never release**.
 
@@ -82,7 +85,7 @@ Requirements for the trigger to fire correctly:
 | Build type | Windows | Linux |
 |------------|---------|-------|
 | Tagged release | `scan-kit-windows-X.Y.Z.exe` | `scan-kit-linux-amd64-X.Y.Z.AppImage` |
-| Non-tagged CI (PR / `main`) | `scan-kit-windows-X.Y.Z-rc.exe` | `scan-kit-linux-amd64-X.Y.Z-rc.AppImage` |
+| Non-tagged CI (`main` / `develop` push) | `scan-kit-windows-X.Y.Z-rc.exe` | `scan-kit-linux-amd64-X.Y.Z-rc.AppImage` |
 
 `X.Y.Z` comes from `__version__` for `-rc` builds and from the git tag (without `v`) for releases. No changelog file is maintained; GitHub auto-generates release notes.
 
@@ -110,5 +113,5 @@ Deleting a tag does not delete an already-published GitHub Release — remove th
 ## Notes
 
 - Only create the tag/push when the user explicitly wants to release. If they just want the number bumped (e.g. inside an in-progress PR), do step 1 only and skip tagging.
-- If this is part of a PR that isn't merged yet, prefer bumping on the PR branch; the tag is usually created after merge to `main`.
-- PR and `main` pushes produce `-rc` artifacts in the Actions run for pre-release testing; they do not create a GitHub Release.
+- If this is part of a PR that isn't merged yet, prefer bumping on the PR branch; the tag is usually created after merge to `develop` and promotion to `main`.
+- Merges to `develop` or `main` produce `-rc` artifacts in the Actions run for pre-release testing; they do not create a GitHub Release. Pull requests run tests only.

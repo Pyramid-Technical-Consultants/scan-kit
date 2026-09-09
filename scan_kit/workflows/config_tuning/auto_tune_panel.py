@@ -31,6 +31,13 @@ from scan_kit.common.session_browser import SessionBrowserWidget, default_projec
 from .auto_tuning.base import AutoTuneRunResult, AutoTuneWorkflow
 from .auto_tuning.params import AutoTuneParamSpec
 from .auto_tuning.registry import AUTO_TUNE_REGISTRY
+from .auto_tuning.ic_distance_preview_table import (
+    fill_ic_distance_preview_table,
+    max_preview_sdd_percent,
+    max_preview_systematic_mm,
+    preview_chamber_count,
+)
+from .auto_tuning.ic_distance_tune import IcDistanceTunePreviewRow
 from .auto_tuning.position_offset_preview_table import (
     fill_position_offset_preview_table,
     max_preview_residual_mm,
@@ -50,12 +57,19 @@ from .auto_tuning.sigma_tune import (
 )
 
 ApplyFn = Callable[[AutoTuneWorkflow, dict[str, Any]], AutoTuneRunResult | None]
+PreviewRows = (
+    list[SigmaTunePreviewRow]
+    | list[PositionOffsetTunePreviewRow]
+    | list[IcDistanceTunePreviewRow]
+)
 PreviewFn = Callable[
     [AutoTuneWorkflow, dict[str, Any]],
-    tuple[list[SigmaTunePreviewRow] | list[PositionOffsetTunePreviewRow], list[str]] | None,
+    tuple[PreviewRows, list[str]] | None,
 ]
 
-_PREVIEW_WORKFLOW_IDS = frozenset({"sigma_tuning", "position_offset_tuning"})
+_PREVIEW_WORKFLOW_IDS = frozenset(
+    {"sigma_tuning", "position_offset_tuning", "ic_distance_tuning"}
+)
 
 
 class _WorkflowListRow(QWidget):
@@ -491,6 +505,9 @@ class AutoTuneDetailWidget(QWidget):
         elif self._current.id == "position_offset_tuning":
             fill_position_offset_preview_table(self._preview_table, rows)
             self._update_position_preview_status(rows, warnings, params)
+        elif self._current.id == "ic_distance_tuning":
+            fill_ic_distance_preview_table(self._preview_table, rows)
+            self._update_ic_distance_preview_status(rows, warnings, params)
         if warnings and rows:
             extra = "; ".join(warnings)
             self._preview_status.setText(f"{self._preview_status.text()} {extra}")
@@ -548,6 +565,35 @@ class AutoTuneDetailWidget(QWidget):
                 "No matching position offset bands for this session."
             )
 
+    def _update_ic_distance_preview_status(
+        self,
+        rows: list[IcDistanceTunePreviewRow],
+        warnings: list[str],
+        params: dict[str, Any],
+    ) -> None:
+        if rows:
+            session_ids = params.get("session_ids") or []
+            session_note = (
+                f" from {len(session_ids)} sessions" if len(session_ids) > 1 else ""
+            )
+            status = (
+                f"{preview_chamber_count(rows)} chamber(s): distance and zero offset "
+                f"will be updated{session_note}."
+            )
+            max_systematic = max_preview_systematic_mm(rows)
+            if max_systematic is not None:
+                status += f" Removes up to {max_systematic:.3f} mm at the field edge."
+            max_percent = max_preview_sdd_percent(rows)
+            if max_percent is not None:
+                status += f" Max distance change: {max_percent:.2f}%."
+            self._preview_status.setText(status)
+        elif warnings:
+            self._preview_status.setText(warnings[0])
+        else:
+            self._preview_status.setText(
+                "No chamber had enough plan spread to fit a distance."
+            )
+
     def _confirm_apply(self, params: dict[str, Any]) -> bool:
         if self._current is None:
             return False
@@ -583,6 +629,23 @@ class AutoTuneDetailWidget(QWidget):
             detail = (
                 f"Rewrite zero_offset_at_iso_mm values in devices.xml using "
                 f"{data_source} data from {source}?\n\n"
+                "The configuration will be marked dirty until you save."
+            )
+        elif self._current.id == "ic_distance_tuning":
+            session_ids = params.get("session_ids") or []
+            if len(session_ids) == 1:
+                source = f"session {session_ids[0]}"
+            elif session_ids:
+                source = f"{len(session_ids)} sessions"
+            else:
+                source = "the selected session(s)"
+            detail = (
+                f"Rewrite source_to_device_distance_mm and zero_offset_at_iso_mm in "
+                f"devices.xml using spot data from {source}?\n\n"
+                "This assumes delivery at isocenter is correct and the chambers are "
+                "mis-scaled. source_to_device_distance_mm is a surveyed distance, so "
+                "review the proposed changes before applying, and re-run Sigma Tuning "
+                "afterwards.\n\n"
                 "The configuration will be marked dirty until you save."
             )
         else:

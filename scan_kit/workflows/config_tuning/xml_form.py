@@ -37,6 +37,7 @@ from .value_editors import (
 )
 from .map2map_attr_registry import (
     filter_attribute_names,
+    map2map_field_tooltip,
     should_hide_map2map_child,
 )
 from .xml_bindings import (
@@ -56,6 +57,14 @@ _ATTRIBUTE_TABLE_MAX_VISIBLE_ROWS = 6
 # Leaf elements with up to this many attributes use wrapping inline chips (e.g. precision).
 _INLINE_ATTRIBUTE_FIELD_THRESHOLD = 2
 _SCALAR_LABEL_WIDTH = 240
+
+
+def _apply_tooltip(tooltip: str, *widgets: QWidget) -> None:
+    """Explain a map2map field on its label and its editor, when we have something to say."""
+    if not tooltip:
+        return
+    for widget in widgets:
+        widget.setToolTip(tooltip)
 
 
 def _attribute_table_height(table: QTableWidget, row_count: int) -> int:
@@ -186,6 +195,14 @@ class XmlFormWidget(QScrollArea):
         row.setSpacing(4)
         label_widget = QLabel(humanize_xml_label(label))
         label_widget.setAlignment(Qt.AlignmentFlag.AlignVCenter)
+        _apply_tooltip(
+            map2map_field_tooltip(
+                attr or element.tag,
+                scope=element.tag if attr else None,
+            ),
+            label_widget,
+            editor,
+        )
         row.addWidget(label_widget)
         row.addWidget(editor)
 
@@ -233,7 +250,13 @@ class XmlFormWidget(QScrollArea):
         """True when *element* has no attributes or child elements, only text."""
         return not element.attrib and not list(element)
 
-    def _wrap_labeled_editor_row(self, label: str, editor: QWidget) -> QWidget:
+    def _wrap_labeled_editor_row(
+        self,
+        label: str,
+        editor: QWidget,
+        *,
+        tooltip: str = "",
+    ) -> QWidget:
         """Left-aligned label + editor row for stacked scalar fields."""
         row_widget = QWidget()
         row_widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
@@ -243,6 +266,7 @@ class XmlFormWidget(QScrollArea):
         label_widget = QLabel(humanize_xml_label(label))
         label_widget.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         label_widget.setFixedWidth(_SCALAR_LABEL_WIDTH)
+        _apply_tooltip(tooltip, label_widget, editor)
         row.addWidget(label_widget)
         row.addWidget(editor)
         row.addStretch(1)
@@ -255,7 +279,11 @@ class XmlFormWidget(QScrollArea):
         editor = make_value_editor(kind, raw, tag=element.tag, attr=attr)
         self._connect_change(editor)
         self._register_field(element, editor, kind, attr=attr)
-        return self._wrap_labeled_editor_row(attr, editor)
+        return self._wrap_labeled_editor_row(
+            attr,
+            editor,
+            tooltip=map2map_field_tooltip(attr, scope=element.tag),
+        )
 
     def _attribute_edit_count(self, element: ET.Element, *, include_value: bool = False) -> int:
         count = len(element.attrib)
@@ -321,7 +349,11 @@ class XmlFormWidget(QScrollArea):
         editor = make_value_editor(kind, raw, tag=element.tag)
         self._connect_change(editor)
         self._register_field(element, editor, kind)
-        return self._wrap_labeled_editor_row(label, editor)
+        return self._wrap_labeled_editor_row(
+            label,
+            editor,
+            tooltip=map2map_field_tooltip(element.tag),
+        )
 
     def _build_scalar_widget(self, element: ET.Element, title: str) -> QWidget:
         include_value = bool((element.text or "").strip())
@@ -363,6 +395,12 @@ class XmlFormWidget(QScrollArea):
 
         table = QTableWidget(len(elements), len(columns))
         table.setHorizontalHeaderLabels([humanize_xml_label(col) for col in columns])
+        scope = elements[0].tag if elements else None
+        for col_idx, column in enumerate(columns):
+            header_item = table.horizontalHeaderItem(col_idx)
+            tooltip = map2map_field_tooltip(column, scope=scope)
+            if header_item is not None and tooltip:
+                header_item.setToolTip(tooltip)
         header = table.horizontalHeader()
         header.setMinimumSectionSize(48)
         header.setDefaultSectionSize(96)
