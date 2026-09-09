@@ -86,20 +86,48 @@ def load_expected_sigmas_by_session(
     series_key: str,
 ) -> dict[str, dict[float, float]]:
     """Per-session expected sigma (mm) keyed by energy category."""
-    device = _SIGMA_SERIES_TO_DEVICE.get(series_key)
-    if device is None:
+    batch = load_expected_sigmas_for_series_keys(
+        session_ids,
+        energies,
+        base_dir,
+        (series_key,),
+    )
+    return batch.get(series_key, {})
+
+
+def load_expected_sigmas_for_series_keys(
+    session_ids: Sequence[str],
+    energies: Sequence[float],
+    base_dir: str,
+    series_keys: Sequence[str],
+) -> dict[str, dict[str, dict[float, float]]]:
+    """Map each series key to per-session expected sigma curves."""
+    series_to_sig: dict[str, str] = {}
+    for series_key in series_keys:
+        device = _SIGMA_SERIES_TO_DEVICE.get(series_key)
+        if device is None:
+            continue
+        series_to_sig[series_key] = IC_DEVICE_TO_SIG_KEY[device]
+    if not series_to_sig:
         return {}
-    expected: dict[str, dict[float, float]] = {}
+
+    sig_keys = tuple(dict.fromkeys(series_to_sig.values()))
+    by_sig_key: dict[str, dict[str, dict[float, float]]] = {
+        sig_key: {} for sig_key in sig_keys
+    }
     for sid in session_ids:
         config = load_session_devices_config(sid, base_dir)
         if config is None:
             continue
-        sig_key = IC_DEVICE_TO_SIG_KEY[device]
-        by_key = config.expected_sigmas_by_key(energies, keys=(sig_key,))
-        per_energy = by_key.get(sig_key)
-        if per_energy:
-            expected[sid] = per_energy
-    return expected
+        per_key = config.expected_sigmas_by_key(energies, keys=sig_keys)
+        for sig_key, per_energy in per_key.items():
+            if per_energy:
+                by_sig_key[sig_key][sid] = per_energy
+
+    return {
+        series_key: by_sig_key.get(sig_key, {})
+        for series_key, sig_key in series_to_sig.items()
+    }
 
 
 def sigma_tolerance_band(expected: float, frac: float) -> tuple[float, float]:
@@ -274,6 +302,7 @@ def apply_binned_interlock_overlays(
     colors: Sequence,
     base_dir: str,
     add_sigma_legend: bool = False,
+    expected_by_session: dict[str, dict[float, float]] | None = None,
 ) -> None:
     """Draw interlock overlays on one binned-summary main axis."""
     if y_group == Y_POSITION_ERROR:
@@ -287,12 +316,13 @@ def apply_binned_interlock_overlays(
     if y_group not in (Y_SIGMA, Y_SIGMA_ERROR):
         return
 
-    expected_by_session = load_expected_sigmas_by_session(
-        session_ids,
-        categories,
-        base_dir,
-        series_key=series_key,
-    )
+    if expected_by_session is None:
+        expected_by_session = load_expected_sigmas_by_session(
+            session_ids,
+            categories,
+            base_dir,
+            series_key=series_key,
+        )
     if not expected_by_session:
         return
 

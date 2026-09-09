@@ -7,5 +7,6 @@ Comment=Proton pencil beam scanning analysis toolkit
 Exec=scan-kit
 Icon=scan-kit
 Terminal=false
+StartupNotify=true
 Categories=Science;Utility;
 StartupWMClass=scan-kit

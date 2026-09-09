@@ -31,6 +31,20 @@ cp "${ROOT}/scan_kit/assets/icon.png" "${APPDIR}/scan-kit.png"
 ln -sf scan-kit.png "${APPDIR}/.DirIcon"
 ln -sf "usr/scan-kit/scan-kit" "${APPDIR}/scan-kit"
 
+# Freedesktop icon theme paths so Icon=scan-kit resolves before first-run install.
+ICON_PNG="${ROOT}/scan_kit/assets/icon.png"
+ICON_SVG="${ROOT}/scan_kit/assets/scan-kit-icon.svg"
+for size in 16 24 32 48 64 128 256; do
+  dest="${APPDIR}/usr/share/icons/hicolor/${size}x${size}/apps"
+  mkdir -p "${dest}"
+  cp "${ICON_PNG}" "${dest}/scan-kit.png"
+done
+if [[ -f "${ICON_SVG}" ]]; then
+  svg_dest="${APPDIR}/usr/share/icons/hicolor/scalable/apps"
+  mkdir -p "${svg_dest}"
+  cp "${ICON_SVG}" "${svg_dest}/scan-kit.svg"
+fi
+
 if [[ ! -x "${APPIMAGETOOL}" ]]; then
   echo "Downloading appimagetool…"
   wget -q "${APPIMAGETOOL_URL}" -O "${APPIMAGETOOL}"

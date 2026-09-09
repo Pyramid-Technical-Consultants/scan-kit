@@ -25,6 +25,7 @@ from scan_kit.views.binned_summary_catalog import (
     PRESET_SIGMA_ENERGY,
     PRESETS,
     X_ENERGY,
+    X_PARAM_BY_ID,
     X_TARGET_MU,
     Y_DOSE_RATIO,
     Y_DOSE_RATE,
@@ -38,12 +39,14 @@ from scan_kit.views.binned_summary_data import (
     available_x_params,
     available_x_params_for_source,
     available_y_groups,
+    binned_render_prep_key,
     default_config,
     load_session_summary_table,
     load_sessions_dose_rate,
     load_sessions_current_ratios,
     load_session_timeslice_summary_table,
     load_sessions_summary,
+    prepare_binned_render_data,
 )
 from scan_kit.data import DATA_SOURCE_SPOT_ISO, DATA_SOURCE_TIMESLICE_ISO
 from scan_kit.views.binned_summary_ui import render_binned_summary
@@ -299,6 +302,55 @@ def test_render_binned_summary_quantile_x(g3_spot_summary) -> None:
     render_binned_summary(fig, config, g3_spot_summary, str(TEST_DATA))
     assert fig.axes
     plt.close(fig)
+
+
+def test_prepare_binned_render_data_matches_direct_binning(g3_spot_summary) -> None:
+    if not g3_spot_summary:
+        pytest.skip("spot summary unavailable in fixture")
+    y = next(iter(available_y_groups(g3_spot_summary)))
+    config = BinnedSummaryConfig(y_group=y, x_param=X_ENERGY, glyph="box")
+    prep = prepare_binned_render_data(g3_spot_summary, config)
+    assert prep.prepared is not None
+    assert prep.categories
+    x_param = X_PARAM_BY_ID[X_ENERGY]
+    direct, categories = prepare_binned_column(
+        session_data=prep.filtered_data,
+        bin_key=x_param.column,
+        mode=x_param.bin_mode,
+        n_bins=x_param.n_bins,
+        out_key="_bin",
+    )
+    assert tuple(categories) == prep.categories
+    assert set(direct) == set(prep.prepared)
+
+
+def test_binned_render_prep_key_ignores_display_toggles(g3_spot_summary) -> None:
+    if not g3_spot_summary:
+        pytest.skip("spot summary unavailable in fixture")
+    y = next(iter(available_y_groups(g3_spot_summary)))
+    base = BinnedSummaryConfig(y_group=y, x_param=X_ENERGY, glyph="box")
+    display = BinnedSummaryConfig(
+        y_group=y,
+        x_param=X_ENERGY,
+        glyph="box",
+        show_hist=True,
+        show_corr=True,
+        show_interlock_thresholds=True,
+        show_trend=True,
+        show_fliers=True,
+    )
+    session_ids = tuple(g3_spot_summary)
+    assert binned_render_prep_key(base, session_ids) == binned_render_prep_key(
+        display, session_ids,
+    )
+    assert binned_render_prep_key(base, session_ids) == binned_render_prep_key(
+        BinnedSummaryConfig(y_group=y, x_param=X_ENERGY, glyph="violin"),
+        session_ids,
+    )
+    assert binned_render_prep_key(base, session_ids) != binned_render_prep_key(
+        BinnedSummaryConfig(y_group=y, x_param=X_ENERGY, glyph="scatter"),
+        session_ids,
+    )
 
 
 def test_render_binned_summary_scatter_headless(g3_spot_summary) -> None:

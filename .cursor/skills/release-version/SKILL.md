@@ -81,8 +81,8 @@ Requirements for the trigger to fire correctly:
 
 | Build type | Windows | Linux |
 |------------|---------|-------|
-| Tagged release | `scan-kit-windows-X.Y.Z.exe` | `scan-kit-linux-amd64-X.Y.Z` |
-| Non-tagged CI (PR / `main`) | `scan-kit-windows-X.Y.Z-rc.exe` | `scan-kit-linux-amd64-X.Y.Z-rc` |
+| Tagged release | `scan-kit-windows-X.Y.Z.exe` | `scan-kit-linux-amd64-X.Y.Z.AppImage` |
+| Non-tagged CI (PR / `main`) | `scan-kit-windows-X.Y.Z-rc.exe` | `scan-kit-linux-amd64-X.Y.Z-rc.AppImage` |
 
 `X.Y.Z` comes from `__version__` for `-rc` builds and from the git tag (without `v`) for releases. No changelog file is maintained; GitHub auto-generates release notes.
 

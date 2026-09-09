@@ -58,33 +58,19 @@ jobs:
         if: runner.os == 'Windows'
         run: python build.py --clean
 
-      - name: Build Linux release artifacts
+      - name: Build Linux AppImage
         if: runner.os == 'Linux'
         shell: bash
         run: |
           VERSION=$(python -c "from scan_kit import __version__; print(__version__)")
           if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
-            BUNDLE="scan-kit-linux-amd64-${VERSION}"
             APPIMAGE="scan-kit-linux-amd64-${VERSION}.AppImage"
           else
-            BUNDLE="scan-kit-linux-amd64-${VERSION}-rc"
             APPIMAGE="scan-kit-linux-amd64-${VERSION}-rc.AppImage"
           fi
 
           python build.py --clean --onedir
           python build.py --appimage "${APPIMAGE}"
-
-          python build.py --clean
-          mkdir -p "dist/${BUNDLE}"
-          mv dist/scan-kit "dist/${BUNDLE}/scan-kit"
-          chmod +x "dist/${BUNDLE}/scan-kit"
-          cp packaging/linux/run-scan-kit.sh "dist/${BUNDLE}/run-scan-kit.sh"
-          chmod +x "dist/${BUNDLE}/run-scan-kit.sh"
-          cp packaging/linux/scan-kit.desktop "dist/${BUNDLE}/Scan Kit.desktop"
-          chmod +x "dist/${BUNDLE}/Scan Kit.desktop"
-          cp scan_kit/assets/icon.png "dist/${BUNDLE}/icon.png"
-          cp packaging/linux/README-Linux.txt "dist/${BUNDLE}/README.txt"
-          tar -czf "dist/${BUNDLE}.tar.gz" -C dist "${BUNDLE}"
 
           chmod +x "dist/${APPIMAGE}"
           "dist/${APPIMAGE}" --appimage-extract-and-run --version
@@ -116,9 +102,7 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.artifact }}
-          path: |
-            dist/scan-kit-linux-amd64-*.tar.gz
-            dist/scan-kit-linux-amd64-*.AppImage
+          path: dist/scan-kit-linux-amd64-*.AppImage
           if-no-files-found: error
           retention-days: 30
 
@@ -148,8 +132,6 @@ jobs:
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
           mv artifacts/scan-kit-windows/scan-kit.exe "artifacts/scan-kit-windows-${VERSION}.exe"
-          mv "artifacts/scan-kit-linux/scan-kit-linux-amd64-${VERSION}.tar.gz" \
-            "artifacts/scan-kit-linux-amd64-${VERSION}.tar.gz"
           mv "artifacts/scan-kit-linux/scan-kit-linux-amd64-${VERSION}.AppImage" \
             "artifacts/scan-kit-linux-amd64-${VERSION}.AppImage"
 
@@ -165,5 +147,4 @@ jobs:
             --title "$GITHUB_REF_NAME" \
             --force \
             "artifacts/scan-kit-windows-${VERSION}.exe" \
-            "artifacts/scan-kit-linux-amd64-${VERSION}.AppImage" \
-            "artifacts/scan-kit-linux-amd64-${VERSION}.tar.gz"
+            "artifacts/scan-kit-linux-amd64-${VERSION}.AppImage"

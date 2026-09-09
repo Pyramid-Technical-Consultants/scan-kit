@@ -8,12 +8,14 @@ import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 import numpy as np
 
-from ..common.data_filter import filter_binned_session_data
 from ..common.interlock_thresholds import (
+    Y_SIGMA,
+    Y_SIGMA_ERROR,
     apply_binned_interlock_overlays,
     apply_linear_interlock_overlays,
     histogram_tolerance_levels,
     interlock_overlay_available,
+    load_expected_sigmas_for_series_keys,
 )
 from ..common import (
     DEFAULT_SESSION_COLORS,
@@ -30,7 +32,6 @@ from ..common import (
     plot_density_contours,
     plot_means_for_column,
     plot_violins_for_column,
-    prepare_binned_column,
     scatter_with_trend,
     set_view_header,
     style_binned_axes,
@@ -49,7 +50,7 @@ from .binned_summary_catalog import (
     BinnedSummaryConfig,
     format_series_ylabel,
 )
-from .binned_summary_data import available_series_keys
+from .binned_summary_data import BinnedRenderPrep, available_series_keys
 
 # Side panels (hist / correlation) are marginals beside the main column.
 _MAIN_COL_WIDTH = 8.0
@@ -152,26 +153,27 @@ def render_binned_summary(
     config: BinnedSummaryConfig,
     session_data: dict[str, dict],
     base_dir: str,
+    *,
+    prep: BinnedRenderPrep | None = None,
 ) -> None:
     """Clear *fig* and draw the binned summary layout."""
     fig.clear()
     if not session_data:
         fig.text(0.5, 0.5, "No session data loaded", ha="center", va="center")
-        fig.canvas.draw_idle()
         return
 
     y_group = Y_GROUP_BY_ID.get(config.y_group)
     x_param = X_PARAM_BY_ID.get(config.x_param)
     if y_group is None or x_param is None:
         fig.text(0.5, 0.5, "Invalid Y/X selection", ha="center", va="center")
-        fig.canvas.draw_idle()
         return
 
-    series_keys = available_series_keys(session_data, config.y_group)
-    column_keys = [s.key for s in y_group.series]
-    session_data = filter_binned_session_data(
-        session_data, column_keys, config.data_filter,
-    )
+    if prep is None:
+        from .binned_summary_data import prepare_binned_render_data
+
+        prep = prepare_binned_render_data(session_data, config)
+
+    session_data = prep.filtered_data
     series_keys = available_series_keys(session_data, config.y_group)
     labels = {s.key: s.label for s in y_group.series}
     if not series_keys:
@@ -179,7 +181,6 @@ def render_binned_summary(
             0.5, 0.5, f"No {y_group.label} columns available",
             ha="center", va="center",
         )
-        fig.canvas.draw_idle()
         return
 
     if config.glyph in (GLYPH_SCATTER, GLYPH_CONTOUR):
@@ -189,24 +190,13 @@ def render_binned_summary(
         )
         return
 
-    if x_param.column not in next(iter(session_data.values()), {}):
-        # Still try — prepare_binned_column will yield empty categories.
-        pass
-
-    n_bins = config.n_bins if config.n_bins is not None else x_param.n_bins
-    prepared, categories = prepare_binned_column(
-        session_data,
-        x_param.column,
-        mode=x_param.bin_mode,
-        n_bins=n_bins,
-        out_key="_bin",
-    )
-    if not categories:
+    prepared = prep.prepared
+    categories = list(prep.categories or ())
+    if not prepared or not categories:
         fig.text(
             0.5, 0.5, f"No finite values for X parameter: {x_param.label}",
             ha="center", va="center",
         )
-        fig.canvas.draw_idle()
         return
 
     loaded_ids = list(prepared.keys())
@@ -233,6 +223,22 @@ def render_binned_summary(
 
     corr_pairs = _corr_pairs_for_series(series_keys)
     selectors = []
+    sigma_expected_by_series = None
+    if (
+        config.show_interlock_thresholds
+        and interlock_overlay_available(
+            config.y_group,
+            config.x_param,
+            glyph=config.glyph,
+        )
+        and config.y_group in (Y_SIGMA, Y_SIGMA_ERROR)
+    ):
+        sigma_expected_by_series = load_expected_sigmas_for_series_keys(
+            loaded_ids,
+            categories,
+            base_dir,
+            series_keys,
+        )
 
     for row, key in enumerate(series_keys):
         ax = main_axes[row]
@@ -293,6 +299,11 @@ def render_binned_summary(
             config.x_param,
             glyph=config.glyph,
         ):
+            expected = (
+                sigma_expected_by_series.get(key)
+                if sigma_expected_by_series is not None
+                else None
+            )
             apply_binned_interlock_overlays(
                 ax,
                 y_group=config.y_group,
@@ -302,6 +313,7 @@ def render_binned_summary(
                 colors=colors,
                 base_dir=base_dir,
                 add_sigma_legend=(row == 0 and key == series_keys[0]),
+                expected_by_session=expected,
             )
 
         hist_tolerance = (
@@ -341,8 +353,6 @@ def render_binned_summary(
     if selectors:
         fig._scan_kit_bin_selectors = selectors  # type: ignore[attr-defined]
 
-    fig.canvas.draw_idle()
-
 
 def _render_linear_summary(
     fig: plt.Figure,
@@ -360,7 +370,6 @@ def _render_linear_summary(
             0.5, 0.5, f"No data for X parameter: {x_param.label}",
             ha="center", va="center",
         )
-        fig.canvas.draw_idle()
         return
 
     loaded_ids = [
@@ -373,7 +382,6 @@ def _render_linear_summary(
             0.5, 0.5, f"No finite values for X parameter: {x_param.label}",
             ha="center", va="center",
         )
-        fig.canvas.draw_idle()
         return
 
     scatter_data = {sid: session_data[sid] for sid in loaded_ids}
@@ -520,5 +528,3 @@ def _render_linear_summary(
                 row=row,
                 n_rows=n_rows,
             )
-
-    fig.canvas.draw_idle()

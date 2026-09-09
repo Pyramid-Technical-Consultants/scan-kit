@@ -72,12 +72,14 @@ def test_ensure_linux_desktop_integration_installs_files(
         lambda name: assets / name,
     )
     monkeypatch.setattr("scan_kit.common.linux_desktop._refresh_desktop_database", lambda: None)
+    monkeypatch.setattr("scan_kit.common.linux_desktop._refresh_icon_cache", lambda _root: None)
 
     ensure_linux_desktop_integration()
 
-    icon_dest = home / ".local/share/icons/hicolor/256x256/apps/scan-kit.png"
+    icon_root = home / ".local/share/icons/hicolor"
     desktop_dest = home / ".local/share/applications/scan-kit.desktop"
-    assert icon_dest.is_file()
+    assert (icon_root / "48x48/apps/scan-kit.png").is_file()
+    assert (icon_root / "256x256/apps/scan-kit.png").is_file()
     assert desktop_dest.is_file()
     assert (
         f"Exec={Path(sys.executable).resolve().as_posix()}"

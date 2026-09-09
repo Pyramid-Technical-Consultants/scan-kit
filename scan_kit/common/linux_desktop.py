@@ -10,6 +10,7 @@ from pathlib import Path
 from .app_icon import asset_path, desktop_file_name
 
 _ICON_THEME_NAME = desktop_file_name()
+_ICON_SIZES = (16, 24, 32, 48, 64, 128, 256)
 _SUBPROCESS_FLAGS = frozenset({"--run-view", "--warm-worker", "--version", "-V"})
 
 
@@ -24,17 +25,27 @@ def _desktop_entry_path() -> Path:
     return Path.home() / ".local" / "share" / "applications" / f"{_ICON_THEME_NAME}.desktop"
 
 
-def _icon_path() -> Path:
-    return (
-        Path.home()
-        / ".local"
-        / "share"
-        / "icons"
-        / "hicolor"
-        / "256x256"
-        / "apps"
-        / f"{_ICON_THEME_NAME}.png"
-    )
+def _hicolor_icons_root() -> Path:
+    return Path.home() / ".local" / "share" / "icons" / "hicolor"
+
+
+def _install_hicolor_icons(icon_src: Path) -> bool:
+    """Install PNG/SVG icons so ``Icon=scan-kit`` resolves in menus and the dock."""
+    root = _hicolor_icons_root()
+    try:
+        for size in _ICON_SIZES:
+            dest = root / f"{size}x{size}" / "apps" / f"{_ICON_THEME_NAME}.png"
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(icon_src, dest)
+        svg_src = asset_path("scan-kit-icon.svg")
+        if svg_src.is_file():
+            svg_dest = root / "scalable" / "apps" / f"{_ICON_THEME_NAME}.svg"
+            svg_dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(svg_src, svg_dest)
+    except OSError:
+        return False
+    _refresh_icon_cache(root)
+    return True
 
 
 def _frozen_launcher_path() -> Path:
@@ -59,6 +70,7 @@ def _render_desktop_entry(exe: Path) -> str:
             f"Path={app_dir.as_posix()}",
             f"Icon={_ICON_THEME_NAME}",
             "Terminal=false",
+            "StartupNotify=true",
             "Categories=Science;Utility;",
             f"StartupWMClass={_ICON_THEME_NAME}",
             "",
@@ -88,14 +100,13 @@ def ensure_linux_desktop_integration() -> None:
         return
 
     exe = _frozen_launcher_path()
-    icon_dest = _icon_path()
     desktop_dest = _desktop_entry_path()
 
     try:
-        icon_dest.parent.mkdir(parents=True, exist_ok=True)
         desktop_dest.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(icon_src, icon_dest)
     except OSError:
+        return
+    if not _install_hicolor_icons(icon_src):
         return
 
     if _needs_desktop_refresh(exe):
@@ -105,6 +116,25 @@ def ensure_linux_desktop_integration() -> None:
         except OSError:
             return
         _refresh_desktop_database()
+
+
+def _refresh_icon_cache(hicolor_dir: Path) -> None:
+    try:
+        from shutil import which
+
+        updater = which("gtk-update-icon-cache")
+        if updater:
+            import subprocess
+
+            subprocess.run(
+                [updater, "-f", "-t", str(hicolor_dir)],
+                check=False,
+                timeout=2,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+    except Exception:
+        pass
 
 
 def _refresh_desktop_database() -> None:
