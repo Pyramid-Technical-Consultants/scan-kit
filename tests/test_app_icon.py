@@ -10,7 +10,7 @@ from scan_kit.common.app_icon import (
     load_app_icon,
     prepare_qt_app_identity,
 )
-from scan_kit.common.linux_frozen_env import prepare_linux_frozen_env
+from scan_kit.common.linux_frozen_env import frozen_app_dir, prepare_linux_frozen_env
 from scan_kit.common.win_identity import prepare_windows_app_identity
 
 
@@ -77,3 +77,29 @@ def test_prepare_linux_frozen_env_sets_isolation_vars(monkeypatch) -> None:
     assert os.environ["XMODIFIERS"] == "@im=none"
     assert os.environ["GSETTINGS_BACKEND"] == "memory"
     assert os.environ["NO_AT_BRIDGE"] == "1"
+
+
+def test_prepare_linux_frozen_env_sets_app_dir_and_chdir(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    import os
+    import sys
+
+    app_dir = tmp_path / "bundle"
+    app_dir.mkdir()
+    exe = app_dir / "scan-kit"
+    exe.write_text("", encoding="utf-8")
+    other = tmp_path / "elsewhere"
+    other.mkdir()
+    os.chdir(other)
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "executable", str(exe), raising=False)
+    monkeypatch.delenv("SCAN_KIT_APP_DIR", raising=False)
+
+    prepare_linux_frozen_env()
+
+    assert os.getcwd() == str(app_dir)
+    assert os.environ["SCAN_KIT_APP_DIR"] == str(app_dir)
+    assert frozen_app_dir() == app_dir

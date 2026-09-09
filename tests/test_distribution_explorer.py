@@ -39,7 +39,7 @@ def test_mode_availability_g3(g3_distribution_availability) -> None:
     assert any(availability.values())
     assert availability[MODE_POSITION_ERROR_SPOT]
     assert availability[MODE_SIGMA_SPOT]
-    assert not availability.get(MODE_SIGMA_ERROR_SPOT, False)
+    assert availability[MODE_SIGMA_ERROR_SPOT]
 
 
 def test_default_mode_picks_first_available(g3_distribution_availability) -> None:
@@ -91,8 +91,6 @@ def test_render_distribution_headless_core(
 @pytest.mark.slow
 @pytest.mark.parametrize("mode", [preset.mode for preset in PRESETS])
 def test_render_distribution_headless(mode: str, g3_distribution_availability) -> None:
-    if mode == MODE_SIGMA_ERROR_SPOT:
-        pytest.skip("spot sigma error requires per-spot sigma targets in fixture")
     if not g3_distribution_availability.get(mode, False):
         pytest.skip(f"{mode} unavailable in fixture")
     session_data = load_sessions_for_mode(mode, [G3_SESSION], str(TEST_DATA))

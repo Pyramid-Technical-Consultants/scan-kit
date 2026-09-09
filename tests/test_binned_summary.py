@@ -51,6 +51,16 @@ from scan_kit.views.binned_summary_window import BinnedSummaryWindow
 from tests.conftest import G2_SESSION, G3_SESSION, TEST_DATA
 
 
+def test_format_series_ylabel_appends_unit_when_missing() -> None:
+    from scan_kit.views.binned_summary_catalog import format_series_ylabel
+
+    assert format_series_ylabel("IC1", "%") == "IC1 (%)"
+    assert format_series_ylabel("IC2/IC1 (%)", "%") == "IC2/IC1 (%)"
+    assert format_series_ylabel("Delivery Rate (MU/s)", "MU/s") == (
+        "Delivery Rate (MU/s)"
+    )
+
+
 def _config_for_preset(preset_id: str) -> BinnedSummaryConfig:
     preset = PRESET_BY_ID[preset_id]
     return BinnedSummaryConfig(

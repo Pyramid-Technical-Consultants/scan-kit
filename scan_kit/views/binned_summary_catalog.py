@@ -77,8 +77,18 @@ class YGroupDef:
     series: tuple[SeriesDef, ...]
     default_glyph: Glyph
     trend_unit: str
+    value_unit: str
     sources: tuple[str, ...] = (DATA_SOURCE_SPOT_ISO,)
     supports_data_filter: bool = True
+
+
+def format_series_ylabel(label: str, value_unit: str) -> str:
+    """Append ``(unit)`` when the series label does not already include units."""
+    if not value_unit:
+        return label
+    if "(" in label and ")" in label:
+        return label
+    return f"{label} ({value_unit})"
 
 
 @dataclass(frozen=True)
@@ -114,6 +124,7 @@ Y_GROUPS: tuple[YGroupDef, ...] = (
         ),
         GLYPH_BOX,
         "%/unit",
+        "%",
     ),
     YGroupDef(
         Y_DOSE_RATIO,
@@ -125,6 +136,7 @@ Y_GROUPS: tuple[YGroupDef, ...] = (
         ),
         GLYPH_BOX,
         "%/unit",
+        "%",
     ),
     YGroupDef(
         Y_DOSE_RATE,
@@ -132,6 +144,7 @@ Y_GROUPS: tuple[YGroupDef, ...] = (
         (SeriesDef("mu_rate", "Delivery Rate (MU/s)"),),
         GLYPH_MEAN,
         "MU/s/unit",
+        "MU/s",
         registry_data_sources(SOURCE_DOSE_RATE),
         supports_data_filter=False,
     ),
@@ -145,6 +158,7 @@ Y_GROUPS: tuple[YGroupDef, ...] = (
         ),
         GLYPH_MEAN,
         "%/unit",
+        "%",
         registry_data_sources(SOURCE_CURRENT_RATIO),
         supports_data_filter=False,
     ),
@@ -158,6 +172,7 @@ Y_GROUPS: tuple[YGroupDef, ...] = (
         ),
         GLYPH_BOX,
         "nA/unit",
+        "nA",
         registry_data_sources(SOURCE_IC_CURRENT),
     ),
     YGroupDef(
@@ -171,6 +186,7 @@ Y_GROUPS: tuple[YGroupDef, ...] = (
         ),
         GLYPH_VIOLIN,
         "mm/unit",
+        "mm",
         registry_data_sources(SOURCE_POSITION_ERROR),
     ),
     YGroupDef(
@@ -184,6 +200,7 @@ Y_GROUPS: tuple[YGroupDef, ...] = (
         ),
         GLYPH_VIOLIN,
         "mm/unit",
+        "mm",
         registry_data_sources(SOURCE_SIGMA),
     ),
     YGroupDef(
@@ -197,6 +214,7 @@ Y_GROUPS: tuple[YGroupDef, ...] = (
         ),
         GLYPH_VIOLIN,
         "mm/unit",
+        "mm",
         registry_data_sources(SOURCE_SIGMA_ERROR),
     ),
     YGroupDef(
@@ -208,6 +226,7 @@ Y_GROUPS: tuple[YGroupDef, ...] = (
         ),
         GLYPH_VIOLIN,
         "mm/unit",
+        "mm",
         registry_data_sources(SOURCE_IC12_POS_DIFF),
     ),
     YGroupDef(
@@ -220,6 +239,7 @@ Y_GROUPS: tuple[YGroupDef, ...] = (
         ),
         GLYPH_BOX,
         "ms/unit",
+        "ms",
         supports_data_filter=False,
     ),
 )
@@ -319,6 +339,7 @@ class BinnedSummaryConfig:
     show_fliers: bool = False
     contour_cutoff_percentile: float = 5.0
     n_bins: int | None = None
+    show_interlock_thresholds: bool = False
     domain_filter: str = FILTER_ALL
     beam_state_filter: str = FILTER_BEAM_BOTH
     def data_filter(self) -> DataFilterSelection:

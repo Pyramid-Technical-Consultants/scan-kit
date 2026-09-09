@@ -200,6 +200,17 @@ def test_plot_style_panel_style_options(qapp: QApplication) -> None:
     assert panel.spin_value("cutoff") == 20
 
 
+def test_correlation_panel_options(qapp: QApplication) -> None:
+    from scan_kit.views.unified_view_controls import CorrelationPanel
+
+    panel = CorrelationPanel()
+    assert not panel.is_enabled()
+    panel.set_enabled(True)
+    assert panel.is_enabled()
+    panel.set_from_config(show_corr=False)
+    assert not panel.is_enabled()
+
+
 def test_histogram_panel_options(qapp: QApplication) -> None:
     from scan_kit.views.unified_view_controls import HistogramPanel
 

@@ -37,7 +37,17 @@ def _icon_path() -> Path:
     )
 
 
+def _frozen_launcher_path() -> Path:
+    """Path users should launch (AppImage file when running from an AppImage)."""
+    appimage = os.environ.get("APPIMAGE", "").strip()
+    if appimage:
+        return Path(appimage)
+    return Path(sys.executable).resolve()
+
+
 def _render_desktop_entry(exe: Path) -> str:
+    exe_path = exe.resolve()
+    app_dir = exe_path.parent
     return "\n".join(
         (
             "[Desktop Entry]",
@@ -45,7 +55,8 @@ def _render_desktop_entry(exe: Path) -> str:
             "Name=Scan Kit",
             "GenericName=Scan Kit",
             "Comment=Proton pencil beam scanning analysis toolkit",
-            f"Exec={exe.as_posix()}",
+            f"Exec={exe_path.as_posix()}",
+            f"Path={app_dir.as_posix()}",
             f"Icon={_ICON_THEME_NAME}",
             "Terminal=false",
             "Categories=Science;Utility;",
@@ -60,7 +71,9 @@ def _needs_desktop_refresh(exe: Path) -> bool:
     if not desktop_path.is_file():
         return True
     try:
-        return f"Exec={exe}" not in desktop_path.read_text(encoding="utf-8")
+        return f"Exec={exe.resolve().as_posix()}" not in desktop_path.read_text(
+            encoding="utf-8",
+        )
     except OSError:
         return True
 
@@ -74,7 +87,7 @@ def ensure_linux_desktop_integration() -> None:
     if not icon_src.is_file():
         return
 
-    exe = Path(sys.executable).resolve()
+    exe = _frozen_launcher_path()
     icon_dest = _icon_path()
     desktop_dest = _desktop_entry_path()
 

@@ -5,7 +5,8 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from ...common import create_valid_mask, load_session_raw
+from ...common import C_ENERGY, create_valid_mask, load_session_raw, resolve_concept_column
+from ...common.devices_xml import IC_SIGMA_DEVICES, load_session_devices_config
 from ...common.session_sigma import resolve_spot_sigma_column
 from ...common.timeslice_sigma import (
     TIMESLICE_SIGMA_ERROR_COLS,
@@ -41,9 +42,59 @@ _SPOT_SIGMA_ATTRS = (
     ("ic2_y", "ic2", "y"),
 )
 
+_SPOT_ATTR_TO_DEVICE = {
+    "ic1_x": "IC_1_X",
+    "ic1_y": "IC_1_Y",
+    "ic2_x": "IC_2_X",
+    "ic2_y": "IC_2_Y",
+}
+
 
 def _spot_sigma_target_columns(spot_cols: list[str], input_cols: list[str]) -> dict[str, str] | None:
     return _resolve_sigma_target_columns(spot_cols) or _resolve_sigma_target_columns(input_cols)
+
+
+def _resolve_spot_measured_columns(
+    spot_cols: list[str],
+    *,
+    prefer_raw: bool,
+) -> dict[str, str] | None:
+    measured_cols: dict[str, str] = {}
+    for attr, ic, axis in _SPOT_SIGMA_ATTRS:
+        col = resolve_spot_sigma_column(
+            spot_cols, ic, axis, prefer_raw=prefer_raw,
+        )
+        if col is None:
+            return None
+        measured_cols[attr] = col
+    return measured_cols
+
+
+def _spot_can_use_devices_xml_targets(
+    ctx: SessionContext,
+    input_cols: list[str],
+) -> bool:
+    if resolve_concept_column(input_cols, C_ENERGY) is None:
+        return False
+    config = load_session_devices_config(ctx.session_id, ctx.base_dir)
+    if config is None:
+        return False
+    return any(config.beam_sigmas.get(device) for device in IC_SIGMA_DEVICES)
+
+
+def _expected_sigma_targets(
+    config,
+    device: str,
+    energies: np.ndarray,
+) -> np.ndarray:
+    targets = np.empty(len(energies), dtype=float)
+    for i, energy in enumerate(energies):
+        if not np.isfinite(energy):
+            targets[i] = np.nan
+            continue
+        expected = config.expected_sigma_mm(device, float(energy))
+        targets[i] = float(expected) if expected is not None else np.nan
+    return targets
 
 
 def _probe_spot(ctx: SessionContext, opts: LoadOptions) -> bool:
@@ -54,15 +105,12 @@ def _probe_spot(ctx: SessionContext, opts: LoadOptions) -> bool:
     if not spot_cols:
         return False
     prefer_raw = spot_sigma_prefer_raw(opts.reference_frame)
-    if not all(
-        resolve_spot_sigma_column(
-            spot_cols, ic, axis, prefer_raw=prefer_raw,
-        ) is not None
-        for _attr, ic, axis in _SPOT_SIGMA_ATTRS
-    ):
+    if _resolve_spot_measured_columns(spot_cols, prefer_raw=prefer_raw) is None:
         return False
     input_cols = read_session_csv_columns(src, "input_map.csv") or []
-    return _spot_sigma_target_columns(spot_cols, input_cols) is not None
+    if _spot_sigma_target_columns(spot_cols, input_cols) is not None:
+        return True
+    return _spot_can_use_devices_xml_targets(ctx, input_cols)
 
 
 def _probe_sigma_error_timeslice(ctx: SessionContext) -> bool:
@@ -102,38 +150,68 @@ def _load_spot(ctx: SessionContext, opts: LoadOptions) -> dict | None:
         return None
 
     prefer_raw = spot_sigma_prefer_raw(opts.reference_frame)
-    measured_cols: dict[str, str] = {}
-    for attr, ic, axis in _SPOT_SIGMA_ATTRS:
-        col = resolve_spot_sigma_column(
-            spot_data.columns, ic, axis, prefer_raw=prefer_raw,
-        )
-        if col is None:
-            return None
-        measured_cols[attr] = col
+    measured_cols = _resolve_spot_measured_columns(
+        list(spot_data.columns),
+        prefer_raw=prefer_raw,
+    )
+    if measured_cols is None:
+        return None
 
     input_cols = list(input_map.columns) if input_map is not None else []
     target_cols = _spot_sigma_target_columns(list(spot_data.columns), input_cols)
-    if target_cols is None:
-        return None
+    use_devices_xml = target_cols is None
+    devices_config = None
+    energy_col = None
 
-    if _resolve_sigma_target_columns(spot_data.columns) is not None:
-        target_frame = spot_data[list(target_cols.values())]
-    elif input_map is not None:
-        target_frame = input_map[list(target_cols.values())]
+    if use_devices_xml:
+        if input_map is None:
+            return None
+        energy_col = resolve_concept_column(input_map.columns, C_ENERGY)
+        if energy_col is None:
+            return None
+        devices_config = load_session_devices_config(ctx.session_id, ctx.base_dir)
+        if devices_config is None:
+            return None
+        frame = spot_data[list(measured_cols.values())].copy().join(input_map[energy_col])
     else:
-        return None
+        if _resolve_sigma_target_columns(spot_data.columns) is not None:
+            target_frame = spot_data[list(target_cols.values())]
+        elif input_map is not None:
+            target_frame = input_map[list(target_cols.values())]
+        else:
+            return None
+        frame = spot_data[list(measured_cols.values())].copy().join(target_frame)
+        if input_map is not None:
+            energy_col = resolve_concept_column(input_map.columns, C_ENERGY)
+            if energy_col is not None:
+                frame = frame.join(input_map[energy_col])
 
-    frame = spot_data[list(measured_cols.values())].copy().join(target_frame)
     frame = frame.apply(pd.to_numeric, errors="coerce")
     clean = frame[create_valid_mask(frame)]
     if clean.empty:
         return None
 
     out: dict = {"session_id": ctx.session_id}
+    if energy_col is not None:
+        out["energy"] = clean[energy_col].to_numpy(dtype=float)
+
+    energies = out.get("energy")
+    err_keys: list[str] = []
     for attr, _ic, _axis in _SPOT_SIGMA_ATTRS:
         meas = clean[measured_cols[attr]].to_numpy(dtype=float) * 2.0
-        target = clean[target_cols[attr]].to_numpy(dtype=float)
-        out[f"{attr}_err"] = meas - target
+        if use_devices_xml:
+            if energies is None:
+                return None
+            device = _SPOT_ATTR_TO_DEVICE[attr]
+            target = _expected_sigma_targets(devices_config, device, energies)
+        else:
+            target = clean[target_cols[attr]].to_numpy(dtype=float)
+        key = f"{attr}_err"
+        out[key] = meas - target
+        err_keys.append(key)
+
+    if not any(np.any(np.isfinite(out[key])) for key in err_keys):
+        return None
     return out
 
 

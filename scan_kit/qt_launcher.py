@@ -135,7 +135,7 @@ class ScanKitMainWindow(QMainWindow):
         self._app_settings = AppSettings.load()
         self._restore_window_geometry()
         if FROZEN:
-            self._initial_base_dir = str(Path.cwd())
+            self._initial_base_dir = str(PROJECT_ROOT)
         else:
             self._initial_base_dir = str(PROJECT_ROOT / "test_data")
         self._session_browser: SessionBrowserWidget | None = None

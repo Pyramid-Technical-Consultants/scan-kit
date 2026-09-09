@@ -49,7 +49,7 @@ PlotStyleChoice = tuple[str, str]
 
 
 class PlotStylePanel(QWidget):
-    """Plot-style segmented control with style-specific options in one fieldset."""
+    """Plot-style dropdown with style-specific options in one fieldset."""
 
     def __init__(
         self,
@@ -74,22 +74,26 @@ class PlotStylePanel(QWidget):
 
         self._group_box = QGroupBox(group_title)
         self._layout = QVBoxLayout(self._group_box)
-        self._segmented = SegmentedControl(list(self._styles))
-        self._segmented.selectionChanged.connect(self._on_segment_changed)
-        self._layout.addWidget(self._segmented)
+        self._style_combo = QComboBox()
+        for key, label in self._styles:
+            self._style_combo.addItem(label, key)
+        self._style_combo.currentIndexChanged.connect(self._on_style_changed)
+        self._layout.addWidget(self._style_combo)
         root.addWidget(self._group_box)
 
         keys = [key for key, _label in self._styles]
         pick = current if current in keys else (keys[0] if keys else None)
         if pick is not None:
-            self._segmented.set_current(pick)
+            self.set_current(pick)
 
     def selected_key(self) -> str | None:
-        key = self._segmented.current_key()
-        return key or None
+        data = self._style_combo.currentData()
+        return str(data) if data is not None else None
 
     def set_current(self, key: str) -> None:
-        self._segmented.set_current(key)
+        idx = self._style_combo.findData(key)
+        if idx >= 0:
+            self._style_combo.setCurrentIndex(idx)
 
     def set_enabled(self, enabled: bool) -> None:
         self._group_box.setEnabled(enabled)
@@ -175,8 +179,48 @@ class PlotStylePanel(QWidget):
         if row is not None:
             row[0].setVisible(visible)
 
-    def _on_segment_changed(self, _key: str) -> None:
+    def _on_style_changed(self, _index: int) -> None:
         self._emit_changed()
+
+    def _emit_changed(self, *_args) -> None:
+        if self._on_selection_changed is not None:
+            self._on_selection_changed()
+
+
+class CorrelationPanel(QWidget):
+    """Side-panel controls for optional correlation panels."""
+
+    def __init__(
+        self,
+        parent: QWidget | None = None,
+        *,
+        on_selection_changed: Callable[[], None] | None = None,
+        group_title: str = "Correlation",
+    ) -> None:
+        super().__init__(parent)
+        self._on_selection_changed = on_selection_changed
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        self._group_box = QGroupBox(group_title)
+        group_layout = QVBoxLayout(self._group_box)
+
+        self._enabled = QCheckBox("Show panel")
+        self._enabled.toggled.connect(self._emit_changed)
+        group_layout.addWidget(self._enabled)
+
+        root.addWidget(self._group_box)
+
+    def is_enabled(self) -> bool:
+        return self._enabled.isChecked()
+
+    def set_enabled(self, enabled: bool) -> None:
+        self._enabled.setChecked(enabled)
+
+    def set_from_config(self, *, show_corr: bool) -> None:
+        self._enabled.setChecked(show_corr)
 
     def _emit_changed(self, *_args) -> None:
         if self._on_selection_changed is not None:

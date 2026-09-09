@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
 
 from ..common import ViewSettings
 from ..common.ic_xy_distribution import normalize_contour_cutoff_percentile
+from ..common.interlock_thresholds import interlock_overlay_available
 from ..common.data_filter import FILTER_ALL, FILTER_BEAM_BOTH, FILTER_BEAM_ON
 from .binned_summary_catalog import (
     DATA_SOURCE_SPOT_ISO,
@@ -68,6 +69,7 @@ from .plot_view_shell import (
 )
 from .unified_catalog import BINNED_PLOT_STYLES, option_key
 from .unified_view_controls import (
+    CorrelationPanel,
     DataFilterPanel,
     DataSourceOptionPanel,
     HistogramPanel,
@@ -76,9 +78,9 @@ from .unified_view_controls import (
 )
 
 _OPT_TREND = "trend"
-_OPT_CORR = "corr"
 _OPT_FLIERS = "fliers"
 _OPT_CONTOUR_CUTOFF = "contour_cutoff"
+_OPT_INTERLOCK = "interlock"
 
 
 class BinnedSummaryWindow(PlotViewWindow):
@@ -114,6 +116,7 @@ class BinnedSummaryWindow(PlotViewWindow):
         self._metric_panel: DataSourceOptionPanel | None = None
         self._plot_style_panel: PlotStylePanel | None = None
         self._histogram_panel: HistogramPanel | None = None
+        self._correlation_panel: CorrelationPanel | None = None
         self._filter_panel: DataFilterPanel | None = None
         self._pending_preset = initial_preset
         self._refresh_generation = 0
@@ -274,8 +277,19 @@ class BinnedSummaryWindow(PlotViewWindow):
             "Contour Cutoff",
             value=cutoff_default,
         )
-        self._plot_style_panel.add_checkbox(_OPT_CORR, "Correlation Panel")
         self._plot_style_panel.add_checkbox(_OPT_FLIERS, "Show Box Outliers")
+        self._plot_style_panel.add_checkbox(
+            _OPT_INTERLOCK,
+            "Interlock thresholds",
+            checked=False,
+        )
+        interlock_cb = self._plot_style_panel._checkboxes.get(_OPT_INTERLOCK)
+        if interlock_cb is not None:
+            interlock_cb.setToolTip(
+                "Overlay delivery interlock limits: dose gates vs target MU "
+                "(0.002 MU + 1/2/3%), devices.xml sigma bands vs energy, fixed ±mm "
+                "position bands, or sigma-error bands vs energy."
+            )
         layout.addWidget(self._plot_style_panel)
         self._sync_plot_style_controls()
 
@@ -283,6 +297,11 @@ class BinnedSummaryWindow(PlotViewWindow):
             on_selection_changed=self._on_controls_changed,
         )
         layout.addWidget(self._histogram_panel)
+
+        self._correlation_panel = CorrelationPanel(
+            on_selection_changed=self._on_controls_changed,
+        )
+        layout.addWidget(self._correlation_panel)
 
         self._filter_panel = DataFilterPanel(
             on_selection_changed=self._on_controls_changed,
@@ -458,6 +477,33 @@ class BinnedSummaryWindow(PlotViewWindow):
             _OPT_FLIERS,
             glyph in (GLYPH_BOX, GLYPH_VIOLIN, GLYPH_MEAN),
         )
+        self._sync_interlock_control()
+
+    def _sync_interlock_control(self) -> None:
+        panel = self._plot_style_panel
+        if panel is None:
+            return
+        y_group = (
+            self._metric_panel.selected_id()
+            if self._metric_panel is not None
+            else None
+        )
+        x_param = self._x_combo.currentData()
+        x_param_id = str(x_param) if x_param is not None else X_ENERGY
+        available = (
+            interlock_overlay_available(
+                y_group or "",
+                x_param_id,
+                glyph=self._selected_glyph(),
+            )
+            if y_group
+            else False
+        )
+        interlock_cb = panel._checkboxes.get(_OPT_INTERLOCK)
+        if interlock_cb is not None:
+            interlock_cb.setEnabled(available)
+            if not available:
+                panel.set_checked(_OPT_INTERLOCK, False)
 
     def _on_x_param_changed(self, *_args) -> None:
         if self._updating:
@@ -466,6 +512,7 @@ class BinnedSummaryWindow(PlotViewWindow):
         if x_param is not None and x_param.bin_mode == "quantile":
             self._x_bins_spin.setValue(x_param.n_bins)
         self._sync_x_bins_control()
+        self._sync_interlock_control()
         self._on_controls_changed()
 
     def _selected_glyph(self) -> str:
@@ -481,6 +528,7 @@ class BinnedSummaryWindow(PlotViewWindow):
         )
         panel = self._plot_style_panel
         hist_panel = self._histogram_panel
+        corr_panel = self._correlation_panel
         x_param = self._current_x_param()
         n_bins = None
         if x_param is not None and x_param.bin_mode == "quantile":
@@ -506,8 +554,11 @@ class BinnedSummaryWindow(PlotViewWindow):
             show_hist=hist_panel.is_enabled() if hist_panel else False,
             hist_bin_count=hist_panel.bin_count() if hist_panel else 30,
             hist_shared_bins=hist_panel.shared_bins() if hist_panel else False,
-            show_corr=panel.is_checked(_OPT_CORR) if panel else False,
+            show_corr=corr_panel.is_enabled() if corr_panel else False,
             show_fliers=panel.is_checked(_OPT_FLIERS) if panel else False,
+            show_interlock_thresholds=(
+                panel.is_checked(_OPT_INTERLOCK) if panel else False
+            ),
             contour_cutoff_percentile=cutoff,
             n_bins=n_bins,
             domain_filter=(
@@ -544,7 +595,6 @@ class BinnedSummaryWindow(PlotViewWindow):
             if self._plot_style_panel is not None:
                 self._plot_style_panel.set_current(config.glyph)
                 self._plot_style_panel.set_checked(_OPT_TREND, config.show_trend)
-                self._plot_style_panel.set_checked(_OPT_CORR, config.show_corr)
                 self._plot_style_panel.set_checked(_OPT_FLIERS, config.show_fliers)
                 self._plot_style_panel.set_spin_value(
                     _OPT_CONTOUR_CUTOFF,
@@ -557,6 +607,8 @@ class BinnedSummaryWindow(PlotViewWindow):
                     hist_bin_count=config.hist_bin_count,
                     hist_shared_bins=config.hist_shared_bins,
                 )
+            if self._correlation_panel is not None:
+                self._correlation_panel.set_from_config(show_corr=config.show_corr)
         finally:
             self._updating = False
 

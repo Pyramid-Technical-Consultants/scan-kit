@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from scan_kit.common.linux_desktop import (
+    _frozen_launcher_path,
     _render_desktop_entry,
     ensure_linux_desktop_integration,
     should_install_linux_desktop,
@@ -30,9 +31,20 @@ def test_should_install_linux_desktop_skips_non_linux(monkeypatch) -> None:
     assert should_install_linux_desktop() is False
 
 
+def test_frozen_launcher_path_prefers_appimage_env(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    appimage = tmp_path / "Scan-Kit.AppImage"
+    appimage.write_text("", encoding="utf-8")
+    monkeypatch.setenv("APPIMAGE", str(appimage))
+    assert _frozen_launcher_path() == appimage
+
+
 def test_render_desktop_entry_uses_absolute_exec() -> None:
-    entry = _render_desktop_entry(Path("/opt/scan-kit/scan-kit"))
-    assert "Exec=/opt/scan-kit/scan-kit" in entry
+    exe = Path("/opt/scan-kit/scan-kit")
+    entry = _render_desktop_entry(exe)
+    assert f"Exec={exe.resolve().as_posix()}" in entry
+    assert f"Path={exe.resolve().parent.as_posix()}" in entry
     assert "StartupWMClass=scan-kit" in entry
     assert "Icon=scan-kit" in entry
 
@@ -67,6 +79,9 @@ def test_ensure_linux_desktop_integration_installs_files(
     desktop_dest = home / ".local/share/applications/scan-kit.desktop"
     assert icon_dest.is_file()
     assert desktop_dest.is_file()
-    assert f"Exec={Path(sys.executable).resolve().as_posix()}" in desktop_dest.read_text(encoding="utf-8")
+    assert (
+        f"Exec={Path(sys.executable).resolve().as_posix()}"
+        in desktop_dest.read_text(encoding="utf-8")
+    )
     if os.name == "posix":
         assert oct(desktop_dest.stat().st_mode & 0o777) == oct(0o755)

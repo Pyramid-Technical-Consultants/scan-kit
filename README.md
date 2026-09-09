@@ -63,12 +63,13 @@ Pre-built executables are published on [**GitHub Releases**](https://github.com/
 | Platform | Download |
 |----------|----------|
 | **Windows** | `scan-kit-windows-{version}.exe` |
-| **Linux** (x86-64) | `scan-kit-linux-amd64-{version}.tar.gz` |
+| **Linux** (x86-64) | `scan-kit-linux-amd64-{version}.AppImage` (recommended) |
+| **Linux** (alt.) | `scan-kit-linux-amd64-{version}.tar.gz` |
 
-Extract the archive, then run `./scan-kit`. On first launch it registers itself in your applications menu with the correct icon.
+**Linux:** download the `.AppImage`, mark it executable (`chmod +x`), then double-click it (Ubuntu may ask you to trust/launch it once). On first launch it registers itself in your applications menu with the correct icon. The `.tar.gz` archive remains available for scripted installs; see `README.txt` inside.
 
 > **Trying the latest `main` branch?** CI builds release-candidate artifacts on every push and pull request:
-> `scan-kit-windows-{version}-rc.exe` and `scan-kit-linux-amd64-{version}-rc.tar.gz`.
+> `scan-kit-windows-{version}-rc.exe`, `scan-kit-linux-amd64-{version}-rc.AppImage`, and `scan-kit-linux-amd64-{version}-rc.tar.gz`.
 > Download them from the **Artifacts** section of the corresponding [GitHub Actions](https://github.com/Pyramid-Technical-Consultants/scan-kit/actions) workflow run.
 
 ### Install from source
