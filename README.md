@@ -67,7 +67,7 @@ Pre-built executables are published on [**GitHub Releases**](https://github.com/
 
 **Linux:** download the `.AppImage`, mark it executable (`chmod +x`), then double-click it (Ubuntu may ask you to trust/launch it once). On first launch it registers itself in your applications menu with the correct icon.
 
-> **Trying the latest `main` branch?** CI builds release-candidate artifacts on every push and pull request:
+> **Trying the latest `main` or `develop` branch?** CI builds release-candidate artifacts on every merge to those branches (not on open pull requests):
 > `scan-kit-windows-{version}-rc.exe` and `scan-kit-linux-amd64-{version}-rc.AppImage`.
 > Download them from the **Artifacts** section of the corresponding [GitHub Actions](https://github.com/Pyramid-Technical-Consultants/scan-kit/actions) workflow run.
 
@@ -370,7 +370,7 @@ Output: `dist/scan-kit` (Linux) or `dist/scan-kit.exe` (Windows). Local builds k
 Releases are automated via [`.github/workflows/build.yml`](.github/workflows/build.yml).
 
 1. Bump `__version__` in `scan_kit/__init__.py` — the single source of truth, also read by `pyproject.toml` and the window title.
-2. Commit: `Release vX.Y.Z`, push to `main`.
+2. Commit: `Release vX.Y.Z`, merge to `develop`, then promote `develop` → `main` (or release directly from `main` once aligned).
 3. Tag and push:
 
 ```bash
@@ -380,8 +380,11 @@ git push origin vX.Y.Z
 
 | Trigger | CI output |
 |---------|-----------|
-| Push to `main`, PR, manual dispatch | `-rc` artifacts (`scan-kit-windows-X.Y.Z-rc.exe`, etc.) |
-| `v*` tag push | GitHub Release with `scan-kit-windows-X.Y.Z.exe` and `scan-kit-linux-amd64-X.Y.Z` |
+| Pull request to `main` or `develop` | Tests only (no executable build) |
+| Push to `main` or `develop`, manual dispatch | Tests, then `-rc` artifacts (`scan-kit-windows-X.Y.Z-rc.exe`, etc.) |
+| `v*` tag push | Tests, build, and GitHub Release with `scan-kit-windows-X.Y.Z.exe` and `scan-kit-linux-amd64-X.Y.Z` |
+
+Day-to-day work merges feature branches into **`develop`** first; `main` tracks released (or release-ready) history. Open a pull request against `develop`, not `main`, unless you are promoting a release.
 
 CI verifies the tag matches `__version__` before publishing. The project follows [Semantic Versioning](https://semver.org/).
 
