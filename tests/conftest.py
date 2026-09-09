@@ -2,10 +2,17 @@
 
 from __future__ import annotations
 
+import inspect
 import os
 import sys
 from collections.abc import Callable
 from pathlib import Path
+
+_ROOT = Path(__file__).resolve().parents[1]
+# xdist workers do not always inherit the repo root on sys.path; several tests import
+# shared constants via ``from tests.conftest import ...``.
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
 
 # Must be set before matplotlib is imported anywhere in the test process.
 os.environ.setdefault("MPLBACKEND", "Agg")
@@ -17,7 +24,8 @@ matplotlib.use("Agg", force=True)
 import matplotlib.pyplot as plt
 import pytest
 
-TEST_DATA = Path(__file__).resolve().parents[1] / "test_data"
+TEST_DATA = _ROOT / "test_data"
+HAS_TEST_DATA = TEST_DATA.is_dir() and os.environ.get("SCAN_KIT_SKIP_TEST_DATA") != "1"
 G3_SESSION = "1091134775"
 G2_SESSION = "590658542"
 G3_LARGE_SESSION = "1242721320"
@@ -30,6 +38,47 @@ AMP_G3_STUCK_SESSION = "863788396"
 # First line of Qt-heavy tests in large modules (auto-marked slow below).
 _PLAN_SYNTHESIS_UI_START_LINE = 724
 _CONFIG_TUNING_UI_START_LINE = 459
+
+_SESSION_FIXTURES = frozenset({
+    "test_data_dir",
+    "g3_session_id",
+    "g3_spot_summary",
+    "g3_dose_rate",
+    "g3_current_ratios",
+    "g3_binned_availability",
+    "g3_distribution_availability",
+    "g3_fft_data",
+    "g3_large_fft_data",
+    "g3_source_availability",
+    "g3_timeslice_catalog",
+    "g3_timeline_catalog",
+    "g2_timeslice_catalog",
+    "g2_timeline_catalog",
+    "g3_spot_summary_chamber",
+    "g3_timeslice_summary_table",
+    "hv_session_data",
+    "amp_samples_g2",
+    "amp_samples_g3",
+    "amp_samples_g3_old",
+    "amp_samples_g3_const",
+    "amp_samples_g3_stuck",
+    "g2_position_errors",
+})
+
+_SKIP_NO_TEST_DATA = pytest.mark.skip(
+    reason="test_data/ is not available (gitignored; run integration tests locally)",
+)
+
+
+def _test_function_uses_test_data(item: pytest.Item) -> bool:
+    """Skip only tests whose function body references the fixture tree."""
+    try:
+        source = inspect.getsource(item.obj)
+    except (OSError, TypeError):
+        return False
+    return "_TEST_DATA" in source or (
+        "TEST_DATA" in source and "test_data" in source
+    )
 
 
 def wait_for_qt(
@@ -52,6 +101,8 @@ def wait_for_qt(
 
 @pytest.fixture(scope="session")
 def test_data_dir() -> str:
+    if not HAS_TEST_DATA:
+        pytest.skip("test_data/ is not available")
     return str(TEST_DATA)
 
 
@@ -284,6 +335,12 @@ def pytest_collection_modifyitems(config, items) -> None:
         "test_timeslice_chamber_position.py",
     })
     for item in items:
+        if not HAS_TEST_DATA:
+            if _SESSION_FIXTURES.intersection(item.fixturenames):
+                item.add_marker(_SKIP_NO_TEST_DATA)
+            elif _test_function_uses_test_data(item):
+                item.add_marker(_SKIP_NO_TEST_DATA)
+
         path_name = item.path.name
         if path_name in slow_modules:
             item.add_marker(slow_marker)

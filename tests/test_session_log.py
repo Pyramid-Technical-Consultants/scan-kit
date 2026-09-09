@@ -4,12 +4,15 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from scan_kit.common.session_log import (
     is_noise_message,
     load_session_log,
     message_template,
     parse_session_log_text,
 )
+from tests.conftest import HAS_TEST_DATA
 
 _SAMPLE = """\
 2026-04-09 20:39:04,214 DEBUG [dcs_log] START MAP FOR LAYER: 0 - TIMELINE(Start Map -> map Started from RoomController): T=1.42104s
@@ -40,6 +43,7 @@ def test_parse_timeline_and_wdt() -> None:
     assert is_noise_message(data.entries[-1].message)
 
 
+@pytest.mark.skipif(not HAS_TEST_DATA, reason="test_data/ is not available")
 def test_load_fixture_session_log() -> None:
     root = Path(__file__).resolve().parent.parent
     base = root / "test_data"

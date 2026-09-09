@@ -46,6 +46,7 @@ jobs:
         env:
           MPLBACKEND: Agg
           QT_QPA_PLATFORM: offscreen
+          PYTHONPATH: ${{ github.workspace }}
         run: pytest
 
   build:
