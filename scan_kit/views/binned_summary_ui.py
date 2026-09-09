@@ -8,7 +8,15 @@ import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 import numpy as np
 
-from ..common.data_filter import filter_binned_session_data
+from ..common.interlock_thresholds import (
+    Y_SIGMA,
+    Y_SIGMA_ERROR,
+    apply_binned_interlock_overlays,
+    apply_linear_interlock_overlays,
+    histogram_tolerance_levels,
+    interlock_overlay_available,
+    load_expected_sigmas_for_series_keys,
+)
 from ..common import (
     DEFAULT_SESSION_COLORS,
     GRID_KW,
@@ -24,7 +32,6 @@ from ..common import (
     plot_density_contours,
     plot_means_for_column,
     plot_violins_for_column,
-    prepare_binned_column,
     scatter_with_trend,
     set_view_header,
     style_binned_axes,
@@ -39,14 +46,15 @@ from .binned_summary_catalog import (
     X_PARAM_BY_ID,
     Y_DOSE_RATE,
     Y_GROUP_BY_ID,
+    YGroupDef,
     BinnedSummaryConfig,
+    format_series_ylabel,
 )
-from .binned_summary_data import available_series_keys
+from .binned_summary_data import BinnedRenderPrep, available_series_keys
 
-# Side panels (hist / correlation) are narrow marginals; keep wspace small so they
-# sit close to the main column without eating horizontal space.
+# Side panels (hist / correlation) are marginals beside the main column.
 _MAIN_COL_WIDTH = 8.0
-_SIDE_COL_WIDTH = 0.55
+_SIDE_COL_WIDTH = 1.1
 _SUMMARY_GRID_WSPACE = 0.04
 _SUMMARY_GRID_HSPACE = 0.22
 
@@ -95,6 +103,10 @@ def _style_side_panel_axis(ax, *, row: int, keep_ylabel: bool = False) -> None:
         ax.set_ylabel("")
 
 
+def _series_ylabel(y_group: YGroupDef, labels: dict[str, str], key: str) -> str:
+    return format_series_ylabel(labels.get(key, key), y_group.value_unit)
+
+
 def _corr_pairs_for_series(series_keys: list[str]) -> list[_CorrPair]:
     if len(series_keys) < 2:
         return []
@@ -112,6 +124,7 @@ def _render_correlation_panel(
     loaded_ids: list[str],
     colors: list,
     labels: dict[str, str],
+    y_group: YGroupDef,
     *,
     row: int,
     n_rows: int,
@@ -123,8 +136,12 @@ def _render_correlation_panel(
         pair.y_key,
         loaded_ids,
         colors,
-        xlabel=labels.get(pair.x_key, pair.x_key) if row == n_rows - 1 else None,
-        ylabel=labels.get(pair.y_key, pair.y_key),
+        xlabel=(
+            _series_ylabel(y_group, labels, pair.x_key)
+            if row == n_rows - 1
+            else None
+        ),
+        ylabel=_series_ylabel(y_group, labels, pair.y_key),
     )
     _style_side_panel_axis(ax, row=row, keep_ylabel=True)
     if row < n_rows - 1:
@@ -136,26 +153,27 @@ def render_binned_summary(
     config: BinnedSummaryConfig,
     session_data: dict[str, dict],
     base_dir: str,
+    *,
+    prep: BinnedRenderPrep | None = None,
 ) -> None:
     """Clear *fig* and draw the binned summary layout."""
     fig.clear()
     if not session_data:
         fig.text(0.5, 0.5, "No session data loaded", ha="center", va="center")
-        fig.canvas.draw_idle()
         return
 
     y_group = Y_GROUP_BY_ID.get(config.y_group)
     x_param = X_PARAM_BY_ID.get(config.x_param)
     if y_group is None or x_param is None:
         fig.text(0.5, 0.5, "Invalid Y/X selection", ha="center", va="center")
-        fig.canvas.draw_idle()
         return
 
-    series_keys = available_series_keys(session_data, config.y_group)
-    column_keys = [s.key for s in y_group.series]
-    session_data = filter_binned_session_data(
-        session_data, column_keys, config.data_filter,
-    )
+    if prep is None:
+        from .binned_summary_data import prepare_binned_render_data
+
+        prep = prepare_binned_render_data(session_data, config)
+
+    session_data = prep.filtered_data
     series_keys = available_series_keys(session_data, config.y_group)
     labels = {s.key: s.label for s in y_group.series}
     if not series_keys:
@@ -163,7 +181,6 @@ def render_binned_summary(
             0.5, 0.5, f"No {y_group.label} columns available",
             ha="center", va="center",
         )
-        fig.canvas.draw_idle()
         return
 
     if config.glyph in (GLYPH_SCATTER, GLYPH_CONTOUR):
@@ -173,24 +190,13 @@ def render_binned_summary(
         )
         return
 
-    if x_param.column not in next(iter(session_data.values()), {}):
-        # Still try — prepare_binned_column will yield empty categories.
-        pass
-
-    n_bins = config.n_bins if config.n_bins is not None else x_param.n_bins
-    prepared, categories = prepare_binned_column(
-        session_data,
-        x_param.column,
-        mode=x_param.bin_mode,
-        n_bins=n_bins,
-        out_key="_bin",
-    )
-    if not categories:
+    prepared = prep.prepared
+    categories = list(prep.categories or ())
+    if not prepared or not categories:
         fig.text(
             0.5, 0.5, f"No finite values for X parameter: {x_param.label}",
             ha="center", va="center",
         )
-        fig.canvas.draw_idle()
         return
 
     loaded_ids = list(prepared.keys())
@@ -217,6 +223,22 @@ def render_binned_summary(
 
     corr_pairs = _corr_pairs_for_series(series_keys)
     selectors = []
+    sigma_expected_by_series = None
+    if (
+        config.show_interlock_thresholds
+        and interlock_overlay_available(
+            config.y_group,
+            config.x_param,
+            glyph=config.glyph,
+        )
+        and config.y_group in (Y_SIGMA, Y_SIGMA_ERROR)
+    ):
+        sigma_expected_by_series = load_expected_sigmas_for_series_keys(
+            loaded_ids,
+            categories,
+            base_dir,
+            series_keys,
+        )
 
     for row, key in enumerate(series_keys):
         ax = main_axes[row]
@@ -265,21 +287,49 @@ def render_binned_summary(
 
         style_binned_axes(
             ax, categories, xlabel=x_param.xlabel if row == n_rows - 1 else "",
-            ylabel=labels.get(key, key),
+            ylabel=_series_ylabel(y_group, labels, key),
         )
         if row < n_rows - 1:
             ax.set_xlabel("")
         if config.y_group != Y_DOSE_RATE:
             ax.axhline(0, **REFLINE_KW)
 
+        if config.show_interlock_thresholds and interlock_overlay_available(
+            config.y_group,
+            config.x_param,
+            glyph=config.glyph,
+        ):
+            expected = (
+                sigma_expected_by_series.get(key)
+                if sigma_expected_by_series is not None
+                else None
+            )
+            apply_binned_interlock_overlays(
+                ax,
+                y_group=config.y_group,
+                series_key=key,
+                categories=categories,
+                session_ids=loaded_ids,
+                colors=colors,
+                base_dir=base_dir,
+                add_sigma_legend=(row == 0 and key == series_keys[0]),
+                expected_by_session=expected,
+            )
+
+        hist_tolerance = (
+            histogram_tolerance_levels(config.y_group)
+            if config.show_interlock_thresholds
+            else None
+        )
         if config.show_hist and hist_axes:
             sels = link_boxplot_to_histogram(
                 ax, hist_axes[row],
                 col_data, categories, key, col_colors, list(col_data.keys()),
-                hist_xlabels=labels.get(key, key),
+                hist_xlabels=_series_ylabel(y_group, labels, key),
                 hist_bin_count=config.hist_bin_count,
                 hist_shared_bins=config.hist_shared_bins,
                 hist_ylabel="Probability (%)" if row == 0 else None,
+                tolerance_levels=hist_tolerance,
                 bin_key="_bin",
             )
             _style_side_panel_axis(hist_axes[row], row=row)
@@ -294,6 +344,7 @@ def render_binned_summary(
                 loaded_ids,
                 colors,
                 labels,
+                y_group,
                 row=row,
                 n_rows=n_rows,
             )
@@ -301,8 +352,6 @@ def render_binned_summary(
     # Keep span selectors alive on the figure.
     if selectors:
         fig._scan_kit_bin_selectors = selectors  # type: ignore[attr-defined]
-
-    fig.canvas.draw_idle()
 
 
 def _render_linear_summary(
@@ -321,7 +370,6 @@ def _render_linear_summary(
             0.5, 0.5, f"No data for X parameter: {x_param.label}",
             ha="center", va="center",
         )
-        fig.canvas.draw_idle()
         return
 
     loaded_ids = [
@@ -334,7 +382,6 @@ def _render_linear_summary(
             0.5, 0.5, f"No finite values for X parameter: {x_param.label}",
             ha="center", va="center",
         )
-        fig.canvas.draw_idle()
         return
 
     scatter_data = {sid: session_data[sid] for sid in loaded_ids}
@@ -426,12 +473,31 @@ def _render_linear_summary(
         style_linear_binned_axes(
             ax,
             xlabel=x_param.xlabel if row == n_rows - 1 else "",
-            ylabel=labels.get(key, key),
+            ylabel=_series_ylabel(y_group, labels, key),
         )
         if row < n_rows - 1:
             ax.set_xlabel("")
         if config.y_group != Y_DOSE_RATE:
             ax.axhline(0, **REFLINE_KW)
+
+        if config.show_interlock_thresholds and interlock_overlay_available(
+            config.y_group,
+            config.x_param,
+            glyph=config.glyph,
+        ):
+            x_parts = [
+                np.asarray(data[x_param.column], dtype=float)
+                for data in col_data.values()
+                if x_param.column in data
+            ]
+            x_values = np.concatenate(x_parts) if x_parts else np.array([])
+            apply_linear_interlock_overlays(
+                ax,
+                y_group=config.y_group,
+                x_param=config.x_param,
+                x_values=x_values,
+                add_legend=(row == 0 and key == series_keys[0]),
+            )
 
         if config.show_hist and hist_axes:
             hist_ax = hist_axes[row]
@@ -444,7 +510,7 @@ def _render_linear_summary(
                 colors,
                 bin_count=config.hist_bin_count,
                 bin_range=row_range,
-                xlabel=labels.get(key, key),
+                xlabel=_series_ylabel(y_group, labels, key),
                 ylabel="Probability (%)" if row == 0 else None,
             )
             hist_ax.grid(**GRID_KW)
@@ -458,8 +524,7 @@ def _render_linear_summary(
                 loaded_ids,
                 colors,
                 labels,
+                y_group,
                 row=row,
                 n_rows=n_rows,
             )
-
-    fig.canvas.draw_idle()

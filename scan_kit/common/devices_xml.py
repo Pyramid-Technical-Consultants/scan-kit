@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import logging
 import math
 import xml.etree.ElementTree as ET
@@ -135,12 +136,13 @@ def load_devices_config(source: SessionSource) -> DevicesConfig | None:
         return None
 
 
+@functools.lru_cache(maxsize=64)
 def load_session_devices_config(
     session_id: str,
-    base_dir: str | Path,
+    base_dir: str,
 ) -> DevicesConfig | None:
     """Resolve *session_id* under *base_dir* and load its devices.xml."""
-    src = resolve_session_source(session_id, base_dir)
+    src = resolve_session_source(session_id, str(base_dir))
     if src is None:
         return None
     return load_devices_config(src)

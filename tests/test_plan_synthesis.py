@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pandas as pd
@@ -1199,7 +1200,8 @@ def dicom_rt_plan():
     return template
 
 
-_T0G10_DCM = Path(r"c:\Users\MattNichols\Projects\spot-check\test_data\RN.15186535.T0G10.dcm")
+# Optional local clinical fixtures (set env to a real file to enable these tests).
+_T0G10_DCM = Path(os.environ.get("SCAN_KIT_TEST_DICOM_RT_PLAN") or "")
 
 
 def _make_minimal_rt_ion_dataset() -> object:
@@ -1388,7 +1390,10 @@ def test_dicom_rt_plan_generate_from_synthetic_dataset(
     assert df["ENERGY"].is_monotonic_decreasing
 
 
-@pytest.mark.skipif(not _T0G10_DCM.is_file(), reason="T0G10 DICOM fixture not available")
+@pytest.mark.skipif(
+    not _T0G10_DCM.is_file(),
+    reason="set SCAN_KIT_TEST_DICOM_RT_PLAN to a local .dcm to run",
+)
 def test_dicom_rt_plan_generate_from_t0g10_example(dicom_rt_plan) -> None:
     params = {
         "dicom_path": str(_T0G10_DCM),
@@ -1566,10 +1571,13 @@ def test_iba_pld_plan_minimize_travel_reorders_layer(
     ]
 
 
-_OOC_PLD = Path(r"c:\Users\MattNichols\Downloads\OOC_Right_scaledMU_new.pld")
+_OOC_PLD = Path(os.environ.get("SCAN_KIT_TEST_IBA_PLD") or "")
 
 
-@pytest.mark.skipif(not _OOC_PLD.is_file(), reason="OOC PLD fixture not available")
+@pytest.mark.skipif(
+    not _OOC_PLD.is_file(),
+    reason="set SCAN_KIT_TEST_IBA_PLD to a local .pld to run",
+)
 def test_iba_pld_plan_generate_from_ooc_example(iba_pld_plan) -> None:
     params = {
         "pld_path": str(_OOC_PLD),

@@ -36,7 +36,9 @@ from .auto_tuning.session_params import parse_session_ids
 from .auto_tuning.sigma_tune import (
     SigmaTunePreviewRow,
     compute_sigma_tune_preview,
+    normalize_sigma_lower_headroom_percent,
     normalize_sigma_optimize_mode,
+    normalize_sigma_tolerance_percent,
 )
 from .file_tree import XmlFileTreeWidget
 
@@ -304,12 +306,18 @@ class ConfigTuningPanel(QWidget):
             return [], ["Open a configuration folder containing map2map/devices.xml."]
 
         if workflow.id == "sigma_tuning":
-            optimize_mode = normalize_sigma_optimize_mode(params.get("optimize_method"))
+            tolerance_percent = normalize_sigma_tolerance_percent(
+                params.get("sigma_tolerance_percent")
+            )
+            lower_headroom_percent = normalize_sigma_lower_headroom_percent(
+                params.get("sigma_lower_headroom_percent")
+            )
             return compute_sigma_tune_preview(
                 document.root,
                 parse_session_ids(params),
                 str(params["data_dir"]).strip(),
-                optimize_mode=optimize_mode,
+                tolerance_percent=tolerance_percent,
+                lower_headroom_percent=lower_headroom_percent,
             )
         if workflow.id == "position_offset_tuning":
             data_source = normalize_position_data_source(params.get("data_source"))

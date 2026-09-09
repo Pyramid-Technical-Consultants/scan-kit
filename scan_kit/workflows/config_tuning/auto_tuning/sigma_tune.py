@@ -18,6 +18,8 @@ from scan_kit.common.session_sigma import (
 SigmaOptimizeMode = Literal["median", "weighted_average", "min_max_midpoint"]
 
 DEFAULT_SIGMA_OPTIMIZE_MODE: SigmaOptimizeMode = "median"
+DEFAULT_SIGMA_TOLERANCE_PERCENT = 20.0
+DEFAULT_SIGMA_LOWER_HEADROOM_PERCENT = 1.0
 
 
 def format_sigma_k0(value: float) -> str:
@@ -37,6 +39,70 @@ def normalize_sigma_optimize_mode(value: str | None) -> SigmaOptimizeMode:
     return DEFAULT_SIGMA_OPTIMIZE_MODE
 
 
+def normalize_sigma_tolerance_percent(value: str | float | int | None) -> float:
+    """Return a finite tolerance percent ``>= 0``, else the default."""
+    if value is None:
+        return DEFAULT_SIGMA_TOLERANCE_PERCENT
+    try:
+        pct = float(value)
+    except (TypeError, ValueError):
+        return DEFAULT_SIGMA_TOLERANCE_PERCENT
+    if not np.isfinite(pct) or pct < 0.0:
+        return DEFAULT_SIGMA_TOLERANCE_PERCENT
+    return pct
+
+
+def normalize_sigma_lower_headroom_percent(value: str | float | int | None) -> float:
+    """Return a finite lower-headroom percent ``>= 0``, else the default."""
+    if value is None:
+        return DEFAULT_SIGMA_LOWER_HEADROOM_PERCENT
+    try:
+        pct = float(value)
+    except (TypeError, ValueError):
+        return DEFAULT_SIGMA_LOWER_HEADROOM_PERCENT
+    if not np.isfinite(pct) or pct < 0.0:
+        return DEFAULT_SIGMA_LOWER_HEADROOM_PERCENT
+    return pct
+
+
+def sigma_tolerance_lower_mm(k0: float, tolerance_percent: float) -> float:
+    """Lower edge of the symmetric ±tolerance band around *k0* (mm)."""
+    frac = tolerance_percent / 100.0
+    return max(0.0, float(k0) * (1.0 - frac))
+
+
+def sigma_tolerance_upper_mm(k0: float, tolerance_percent: float) -> float:
+    """Upper edge of the symmetric ±tolerance band around *k0* (mm)."""
+    frac = tolerance_percent / 100.0
+    return max(0.0, float(k0) * (1.0 + frac))
+
+
+def compute_band_sigma_k0(
+    sigmas: np.ndarray,
+    *,
+    tolerance_percent: float = DEFAULT_SIGMA_TOLERANCE_PERCENT,
+    lower_headroom_percent: float = DEFAULT_SIGMA_LOWER_HEADROOM_PERCENT,
+) -> float:
+    """Pick K0 so the ±tolerance band fits observed sigmas with lower headroom.
+
+    Delivery checks sigma against a symmetric band ``[K0(1−t), K0(1+t)]``. Inflate the
+    smallest observed sigma by *lower_headroom_percent* before fitting, then use the
+    highest K0 that places that adjusted value on the lower edge.
+    """
+    if sigmas.size == 0:
+        return float("nan")
+    min_sigma = float(np.min(sigmas))
+    if not np.isfinite(min_sigma):
+        return float("nan")
+    min_with_headroom = min_sigma * (1.0 + lower_headroom_percent / 100.0)
+    tol_frac = tolerance_percent / 100.0
+    if tol_frac <= 0.0:
+        return min_with_headroom
+    if tol_frac >= 1.0:
+        return min_with_headroom
+    return min_with_headroom / (1.0 - tol_frac)
+
+
 def band_sigma_variance(sigmas: np.ndarray) -> float:
     """Sample variance (mm²) of observed spot sigmas in one energy band."""
     if sigmas.size < 2:
@@ -44,26 +110,40 @@ def band_sigma_variance(sigmas: np.ndarray) -> float:
     return float(np.var(sigmas, ddof=1))
 
 
-def band_furthest_extreme_pct_deviation(
+def band_max_tolerance_excursion_pct(
     sigmas: np.ndarray,
-    new_k0: float,
+    k0: float,
+    tolerance_percent: float,
 ) -> tuple[float, float, str]:
-    """Percent deviation of the min/max extreme furthest from *new_k0*.
+    """Largest observation excursion outside the ±tolerance band, as % of *k0*.
 
-    Returns ``(abs_pct, observed_mm, kind)`` where *kind* is ``"min"`` or ``"max"``.
+    Returns ``(pct, observed_mm, kind)`` where *kind* is ``"below"``, ``"above"``,
+    or ``""`` when every sample is inside the band.
     """
-    if sigmas.size == 0 or not np.isfinite(new_k0) or abs(new_k0) < 1e-12:
+    if sigmas.size == 0 or not np.isfinite(k0) or abs(k0) < 1e-12:
         return float("nan"), float("nan"), ""
-    min_sigma = float(np.min(sigmas))
-    max_sigma = float(np.max(sigmas))
-    if abs(min_sigma - new_k0) >= abs(max_sigma - new_k0):
-        observed = min_sigma
-        kind = "min"
-    else:
-        observed = max_sigma
-        kind = "max"
-    pct = abs(observed - new_k0) / abs(new_k0) * 100.0
-    return pct, observed, kind
+    lower = sigma_tolerance_lower_mm(k0, tolerance_percent)
+    upper = sigma_tolerance_upper_mm(k0, tolerance_percent)
+    scale = abs(k0)
+    worst_pct = 0.0
+    worst_observed = float("nan")
+    worst_kind = ""
+    for sigma in sigmas:
+        if not np.isfinite(sigma):
+            continue
+        if sigma < lower:
+            pct = (lower - float(sigma)) / scale * 100.0
+            kind = "below"
+        elif sigma > upper:
+            pct = (float(sigma) - upper) / scale * 100.0
+            kind = "above"
+        else:
+            continue
+        if pct > worst_pct:
+            worst_pct = pct
+            worst_observed = float(sigma)
+            worst_kind = kind
+    return worst_pct, worst_observed, worst_kind
 
 
 def compute_band_sigma(
@@ -140,7 +220,8 @@ def collect_sigma_band_updates(
     measured: MeasuredSigmaSpots,
     *,
     devices: tuple[str, ...] = IC_SIGMA_DEVICES,
-    optimize_mode: SigmaOptimizeMode = DEFAULT_SIGMA_OPTIMIZE_MODE,
+    tolerance_percent: float = DEFAULT_SIGMA_TOLERANCE_PERCENT,
+    lower_headroom_percent: float = DEFAULT_SIGMA_LOWER_HEADROOM_PERCENT,
 ) -> tuple[list[_BandUpdate], list[str]]:
     """Collect per-band K0 updates without mutating *root*."""
     updates: list[_BandUpdate] = []
@@ -183,13 +264,17 @@ def collect_sigma_band_updates(
             if not np.any(mask):
                 continue
             band_sigmas = sigmas[mask]
-            band_weights = measured.weights[mask] if measured.weights is not None else None
-            new_k0 = compute_band_sigma(band_sigmas, band_weights, optimize_mode)
+            new_k0 = compute_band_sigma_k0(
+                band_sigmas,
+                tolerance_percent=tolerance_percent,
+                lower_headroom_percent=lower_headroom_percent,
+            )
             if not np.isfinite(new_k0):
                 continue
-            extreme_pct, extreme_mm, extreme_kind = band_furthest_extreme_pct_deviation(
+            extreme_pct, extreme_mm, extreme_kind = band_max_tolerance_excursion_pct(
                 band_sigmas,
                 new_k0,
+                tolerance_percent,
             )
             updates.append(
                 _BandUpdate(
@@ -242,7 +327,8 @@ def compute_sigma_tune_preview(
     session_ids: list[str],
     base_dir: str,
     *,
-    optimize_mode: SigmaOptimizeMode = DEFAULT_SIGMA_OPTIMIZE_MODE,
+    tolerance_percent: float = DEFAULT_SIGMA_TOLERANCE_PERCENT,
+    lower_headroom_percent: float = DEFAULT_SIGMA_LOWER_HEADROOM_PERCENT,
 ) -> tuple[list[SigmaTunePreviewRow], list[str]]:
     """Return proposed K0 values for every matching band in *root*."""
     measured, load_warnings = load_measured_sigma_spots_for_sessions(session_ids, base_dir)
@@ -251,7 +337,8 @@ def compute_sigma_tune_preview(
     updates, warnings = collect_sigma_band_updates(
         root,
         measured,
-        optimize_mode=optimize_mode,
+        tolerance_percent=tolerance_percent,
+        lower_headroom_percent=lower_headroom_percent,
     )
     return preview_rows_from_updates(updates), load_warnings + warnings
 
@@ -261,14 +348,16 @@ def apply_measured_sigmas_to_tree(
     measured: MeasuredSigmaSpots,
     *,
     devices: tuple[str, ...] = IC_SIGMA_DEVICES,
-    optimize_mode: SigmaOptimizeMode = DEFAULT_SIGMA_OPTIMIZE_MODE,
+    tolerance_percent: float = DEFAULT_SIGMA_TOLERANCE_PERCENT,
+    lower_headroom_percent: float = DEFAULT_SIGMA_LOWER_HEADROOM_PERCENT,
 ) -> SigmaTuneResult:
     """Set ``K0`` on constant (K1–K3 ≈ 0) bands from spot data in each energy band."""
     updates, warnings = collect_sigma_band_updates(
         root,
         measured,
         devices=devices,
-        optimize_mode=optimize_mode,
+        tolerance_percent=tolerance_percent,
+        lower_headroom_percent=lower_headroom_percent,
     )
     for update in updates:
         update.element.set("K0", format_sigma_k0(update.new_k0))
@@ -280,13 +369,19 @@ def tune_sigmas_from_sessions(
     session_ids: list[str],
     base_dir: str,
     *,
-    optimize_mode: SigmaOptimizeMode = DEFAULT_SIGMA_OPTIMIZE_MODE,
+    tolerance_percent: float = DEFAULT_SIGMA_TOLERANCE_PERCENT,
+    lower_headroom_percent: float = DEFAULT_SIGMA_LOWER_HEADROOM_PERCENT,
 ) -> SigmaTuneResult:
     """Load spot sigmas from all sessions and apply them to *root*."""
     measured, load_warnings = load_measured_sigma_spots_for_sessions(session_ids, base_dir)
     if measured is None:
         return SigmaTuneResult(warnings=load_warnings)
-    result = apply_measured_sigmas_to_tree(root, measured, optimize_mode=optimize_mode)
+    result = apply_measured_sigmas_to_tree(
+        root,
+        measured,
+        tolerance_percent=tolerance_percent,
+        lower_headroom_percent=lower_headroom_percent,
+    )
     if load_warnings:
         result.warnings = load_warnings + result.warnings
     return result
@@ -297,12 +392,14 @@ def tune_sigmas_from_session(
     session_id: str,
     base_dir: str,
     *,
-    optimize_mode: SigmaOptimizeMode = DEFAULT_SIGMA_OPTIMIZE_MODE,
+    tolerance_percent: float = DEFAULT_SIGMA_TOLERANCE_PERCENT,
+    lower_headroom_percent: float = DEFAULT_SIGMA_LOWER_HEADROOM_PERCENT,
 ) -> SigmaTuneResult:
     """Load one session's spot sigmas and apply them to *root*."""
     return tune_sigmas_from_sessions(
         root,
         [session_id],
         base_dir,
-        optimize_mode=optimize_mode,
+        tolerance_percent=tolerance_percent,
+        lower_headroom_percent=lower_headroom_percent,
     )

@@ -9,6 +9,7 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QPalette
 from PySide6.QtWidgets import (
     QButtonGroup,
+    QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
     QHBoxLayout,
@@ -42,7 +43,11 @@ from .auto_tuning.sigma_preview_table import (
     max_preview_extreme_pct_deviation,
     preview_energy_band_count as sigma_preview_energy_band_count,
 )
-from .auto_tuning.sigma_tune import SigmaTunePreviewRow
+from .auto_tuning.sigma_tune import (
+    DEFAULT_SIGMA_LOWER_HEADROOM_PERCENT,
+    DEFAULT_SIGMA_TOLERANCE_PERCENT,
+    SigmaTunePreviewRow,
+)
 
 ApplyFn = Callable[[AutoTuneWorkflow, dict[str, Any]], AutoTuneRunResult | None]
 PreviewFn = Callable[
@@ -203,6 +208,41 @@ class AutoTuneDetailWidget(QWidget):
         self._sigma_method_host.setVisible(False)
         layout.addWidget(self._sigma_method_host)
 
+        self._sigma_tolerance_host = QWidget()
+        tolerance_layout = QHBoxLayout(self._sigma_tolerance_host)
+        tolerance_layout.setContentsMargins(0, 0, 0, 0)
+        tolerance_layout.setSpacing(12)
+        tolerance_layout.addWidget(QLabel("Sigma tolerance"))
+        self._sigma_tolerance_spin = QDoubleSpinBox()
+        self._sigma_tolerance_spin.setRange(0.0, 1_000_000.0)
+        self._sigma_tolerance_spin.setDecimals(1)
+        self._sigma_tolerance_spin.setSuffix(" %")
+        self._sigma_tolerance_spin.setSingleStep(1.0)
+        self._sigma_tolerance_spin.setValue(DEFAULT_SIGMA_TOLERANCE_PERCENT)
+        self._sigma_tolerance_spin.setToolTip(
+            "Symmetric ±% band around each proposed K0."
+        )
+        self._sigma_tolerance_spin.valueChanged.connect(self._on_sigma_tune_option_changed)
+        tolerance_layout.addWidget(self._sigma_tolerance_spin)
+        tolerance_layout.addSpacing(16)
+        tolerance_layout.addWidget(QLabel("Lower headroom"))
+        self._sigma_lower_headroom_spin = QDoubleSpinBox()
+        self._sigma_lower_headroom_spin.setRange(0.0, 1_000_000.0)
+        self._sigma_lower_headroom_spin.setDecimals(2)
+        self._sigma_lower_headroom_spin.setSuffix(" %")
+        self._sigma_lower_headroom_spin.setSingleStep(0.1)
+        self._sigma_lower_headroom_spin.setValue(DEFAULT_SIGMA_LOWER_HEADROOM_PERCENT)
+        self._sigma_lower_headroom_spin.setToolTip(
+            "Extra margin added above the smallest observed sigma before "
+            "fitting the tolerance band, so K0 does not sit flush against "
+            "the measured minimum."
+        )
+        self._sigma_lower_headroom_spin.valueChanged.connect(self._on_sigma_tune_option_changed)
+        tolerance_layout.addWidget(self._sigma_lower_headroom_spin)
+        tolerance_layout.addStretch(1)
+        self._sigma_tolerance_host.setVisible(False)
+        layout.addWidget(self._sigma_tolerance_host)
+
         self._position_source_host = QWidget()
         source_layout = QHBoxLayout(self._position_source_host)
         source_layout.setContentsMargins(0, 0, 0, 0)
@@ -297,6 +337,7 @@ class AutoTuneDetailWidget(QWidget):
             self._hide_session_browser()
             self._set_preview_visible(False)
             self._sigma_method_host.setVisible(False)
+            self._sigma_tolerance_host.setVisible(False)
             self._position_source_host.setVisible(False)
             self._clear_preview()
             self._apply_btn.setEnabled(False)
@@ -305,9 +346,8 @@ class AutoTuneDetailWidget(QWidget):
         self._apply_btn.setEnabled(True)
         has_preview = workflow.id in _PREVIEW_WORKFLOW_IDS
         self._set_preview_visible(has_preview)
-        self._sigma_method_host.setVisible(
-            workflow.id in {"sigma_tuning", "position_offset_tuning"}
-        )
+        self._sigma_method_host.setVisible(workflow.id == "position_offset_tuning")
+        self._sigma_tolerance_host.setVisible(workflow.id == "sigma_tuning")
         self._position_source_host.setVisible(workflow.id == "position_offset_tuning")
         if workflow.uses_session_browser():
             self._show_session_browser()
@@ -402,6 +442,9 @@ class AutoTuneDetailWidget(QWidget):
     def _on_optimize_method_changed(self) -> None:
         self._refresh_preview()
 
+    def _on_sigma_tune_option_changed(self) -> None:
+        self._refresh_preview()
+
     def _on_position_source_changed(self) -> None:
         self._refresh_preview()
 
@@ -414,10 +457,10 @@ class AutoTuneDetailWidget(QWidget):
         ):
             params["session_ids"] = self._session_browser.selected_session_ids()
             params["data_dir"] = self._session_browser.base_dir()
-        if self._current is not None and self._current.id in {
-            "sigma_tuning",
-            "position_offset_tuning",
-        }:
+        if self._current is not None and self._current.id == "sigma_tuning":
+            params["sigma_tolerance_percent"] = self._sigma_tolerance_spin.value()
+            params["sigma_lower_headroom_percent"] = self._sigma_lower_headroom_spin.value()
+        if self._current is not None and self._current.id == "position_offset_tuning":
             params["optimize_method"] = self._selected_optimize_method()
         if self._current is not None and self._current.id == "position_offset_tuning":
             params["data_source"] = self._selected_position_data_source()
@@ -469,7 +512,7 @@ class AutoTuneDetailWidget(QWidget):
             status = f"{band_count} energy band(s) will be updated{session_note}."
             max_extreme_pct = max_preview_extreme_pct_deviation(rows)
             if max_extreme_pct is not None:
-                status += f" Max ext. Δ: {max_extreme_pct:.1f}%."
+                status += f" Max OOB: {max_extreme_pct:.1f}%."
             self._preview_status.setText(status)
         elif warnings:
             self._preview_status.setText(warnings[0])
@@ -516,9 +559,16 @@ class AutoTuneDetailWidget(QWidget):
                 source = f"{len(session_ids)} sessions"
             else:
                 source = "the selected session(s)"
+            tolerance = params.get("sigma_tolerance_percent", DEFAULT_SIGMA_TOLERANCE_PERCENT)
+            headroom = params.get(
+                "sigma_lower_headroom_percent",
+                DEFAULT_SIGMA_LOWER_HEADROOM_PERCENT,
+            )
             detail = (
                 f"Rewrite beam_sigma K0 values in devices.xml using data from "
                 f"{source}?\n\n"
+                f"Each band is tuned to the ±{tolerance:g}% tolerance window with "
+                f"{headroom:g}% lower headroom above the smallest observed sigma.\n\n"
                 "The configuration will be marked dirty until you save."
             )
         elif self._current.id == "position_offset_tuning":

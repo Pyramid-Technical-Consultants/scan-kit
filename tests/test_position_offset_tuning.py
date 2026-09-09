@@ -24,6 +24,7 @@ from scan_kit.workflows.config_tuning.auto_tuning.position_offset_tune import (
     collect_offset_updates,
     compute_global_offset_correction,
     compute_position_offset_tune_preview,
+    format_offset_mm,
     read_zero_offsets_from_tree,
     tune_position_offsets_from_sessions,
 )
@@ -117,6 +118,15 @@ def test_compute_position_offset_tune_preview_matches_apply_count() -> None:
     assert max_residual >= rows[0].max_residual_mm
 
 
+def test_position_offset_preview_rows_include_nontrivial_deltas() -> None:
+    root = _load_devices_root()
+    rows, _ = compute_position_offset_tune_preview(root, [_SESSION], str(_TEST_DATA))
+    assert rows
+    changed = [row for row in rows if abs(row.delta_offset) > 1e-9]
+    assert len(changed) == len(rows)
+    assert any(abs(row.old_offset - row.new_offset) > 0.01 for row in rows)
+
+
 def test_band_error_variance_and_residual_helpers() -> None:
     assert band_error_variance(np.array([0.1])) == 0.0
     assert band_error_variance(np.array([0.0, 2.0, 4.0])) == pytest.approx(4.0)
@@ -154,3 +164,43 @@ def test_load_measured_position_errors_timeslice_fixture() -> None:
     energies, errors = measured.by_device["IC_1_X"]
     assert len(energies) == len(errors)
     assert len(energies) > 0
+
+
+def test_optimize_method_changes_global_correction() -> None:
+    measured = load_measured_position_errors_spot(_SESSION, _TEST_DATA)
+    assert measured is not None
+    _, errors = measured.by_device["IC_1_X"]
+    median = compute_global_offset_correction(errors, measured.weights, "median")
+    weighted = compute_global_offset_correction(
+        errors,
+        measured.weights,
+        "weighted_average",
+    )
+    midpoint = compute_global_offset_correction(
+        errors,
+        measured.weights,
+        "min_max_midpoint",
+    )
+    assert median != weighted or median != midpoint
+
+
+def test_position_offset_preview_matches_apply_offsets() -> None:
+    root = _load_devices_root()
+    preview_rows, _ = compute_position_offset_tune_preview(
+        root,
+        [_SESSION],
+        str(_TEST_DATA),
+    )
+    assert preview_rows
+
+    apply_root = _load_devices_root()
+    measured = load_measured_position_errors_spot(_SESSION, _TEST_DATA)
+    assert measured is not None
+    result = apply_position_offsets_to_tree(apply_root, measured)
+    assert result.ok
+
+    offsets = read_zero_offsets_from_tree(apply_root)
+    preview_by_device = {row.device: row for row in preview_rows}
+    for device, (element, _) in offsets.items():
+        preview_row = preview_by_device[device]
+        assert element.text == format_offset_mm(preview_row.new_offset)

@@ -1,0 +1,5 @@
+#!/bin/sh
+# AppImage entry point — launch the PyInstaller onedir bundle inside this AppDir.
+set -e
+APPDIR="$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")"
+exec "${APPDIR}/usr/scan-kit/scan-kit" "$@"

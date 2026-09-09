@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from typing import Callable, Sequence
 
 import numpy as np
@@ -31,11 +32,16 @@ from ..common import (
     resolve_concept_column,
     try_load_position_data,
 )
+from ..common.data_filter import filter_binned_session_data
+from ..common.plotting import prepare_binned_column
 from .binned_summary_catalog import (
     DATA_SOURCE_SPOT_ISO,
     DATA_SOURCE_TIMESLICE_ISO,
+    GLYPH_CONTOUR,
+    GLYPH_SCATTER,
     GLYPH_VIOLIN,
     X_ENERGY,
+    X_PARAM_BY_ID,
     X_PARAMS,
     VIEW_OPTIONS,
     Y_DOSE_RATE,
@@ -748,3 +754,63 @@ def available_series_keys(session_data: dict[str, dict], y_group: str) -> list[s
         if any(series.key in data for data in session_data.values()):
             keys.append(series.key)
     return keys
+
+
+@dataclass(frozen=True)
+class BinnedRenderPrep:
+    """Filtered (and optionally binned) session tables reused across redraws."""
+
+    filtered_data: dict[str, dict]
+    prepared: dict[str, dict] | None
+    categories: tuple[float, ...] | None
+
+
+def binned_render_prep_key(
+    config: BinnedSummaryConfig,
+    session_ids: Sequence[str],
+) -> tuple:
+    """Cache key for data that depends on Y/X selection and filters, not glyph styling."""
+    return (
+        config.y_group,
+        config.source,
+        config.x_param,
+        config.n_bins,
+        config.domain_filter,
+        config.beam_state_filter,
+        tuple(sorted(session_ids)),
+        config.glyph in (GLYPH_SCATTER, GLYPH_CONTOUR),
+    )
+
+
+def prepare_binned_render_data(
+    session_data: dict[str, dict],
+    config: BinnedSummaryConfig,
+) -> BinnedRenderPrep:
+    """Filter sessions and assign X bins once per stable control selection."""
+    y_group = Y_GROUP_BY_ID.get(config.y_group)
+    x_param = X_PARAM_BY_ID.get(config.x_param)
+    if y_group is None or x_param is None:
+        return BinnedRenderPrep(session_data, None, None)
+
+    column_keys = [series.key for series in y_group.series]
+    filtered = filter_binned_session_data(
+        session_data,
+        column_keys,
+        config.data_filter,
+    )
+    if config.glyph in (GLYPH_SCATTER, GLYPH_CONTOUR):
+        return BinnedRenderPrep(filtered, None, None)
+
+    n_bins = config.n_bins if config.n_bins is not None else x_param.n_bins
+    prepared, categories = prepare_binned_column(
+        session_data=filtered,
+        bin_key=x_param.column,
+        mode=x_param.bin_mode,
+        n_bins=n_bins,
+        out_key="_bin",
+    )
+    return BinnedRenderPrep(
+        filtered,
+        prepared,
+        tuple(categories) if categories else None,
+    )

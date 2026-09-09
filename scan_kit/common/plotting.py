@@ -231,14 +231,13 @@ def plot_boxplots_for_column(
         if column_name not in data or bin_key not in data:
             continue
 
-        df = pd.DataFrame(
-            {column_name: data[column_name], bin_key: data[bin_key]}
-        )
+        values = np.asarray(data[column_name], dtype=float)
+        bins = np.asarray(data[bin_key], dtype=float)
 
         column_data = []
         positions = []
         for j, energy in enumerate(energies):
-            energy_data = df[df[bin_key] == energy][column_name].values
+            energy_data = values[bins == energy]
             column_data.append(energy_data)
             positions.append(j + (i - 0.5) * position_offset)
 
@@ -279,14 +278,13 @@ def plot_violins_for_column(
         if column_name not in data or bin_key not in data:
             continue
 
-        df = pd.DataFrame(
-            {column_name: data[column_name], bin_key: data[bin_key]}
-        )
+        values = np.asarray(data[column_name], dtype=float)
+        bins = np.asarray(data[bin_key], dtype=float)
 
         column_data = []
         positions = []
         for j, energy in enumerate(energies):
-            energy_data = df[df[bin_key] == energy][column_name].values
+            energy_data = values[bins == energy]
             energy_data = energy_data[np.isfinite(energy_data)]
             if energy_data.size == 0:
                 continue

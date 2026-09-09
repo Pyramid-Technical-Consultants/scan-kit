@@ -2,8 +2,10 @@ name: Build Executables
 
 on:
   push:
-    branches: [main]
+    branches: [main, develop]
     tags: ["v*"]
+  pull_request:
+    branches: [main, develop]
   workflow_dispatch:
 
 permissions:
@@ -52,44 +54,55 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[build]"
 
-      - name: Build executable
+      - name: Build Windows executable
+        if: runner.os == 'Windows'
         run: python build.py --clean
 
-      - name: Smoke test
-        run: ls -la dist/
+      - name: Build Linux AppImage
+        if: runner.os == 'Linux'
         shell: bash
+        run: |
+          VERSION=$(python -c "from scan_kit import __version__; print(__version__)")
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            APPIMAGE="scan-kit-linux-amd64-${VERSION}.AppImage"
+          else
+            APPIMAGE="scan-kit-linux-amd64-${VERSION}-rc.AppImage"
+          fi
 
-      - name: Prepare artifact filename
+          python build.py --clean --onedir
+          python build.py --appimage "${APPIMAGE}"
+
+          chmod +x "dist/${APPIMAGE}"
+          "dist/${APPIMAGE}" --appimage-extract-and-run --version
+
+      - name: Prepare Windows artifact filename
+        if: runner.os == 'Windows'
         id: asset
         shell: bash
         run: |
           VERSION=$(python -c "from scan_kit import __version__; print(__version__)")
-          if [[ "${{ runner.os }}" == "Windows" ]]; then
-            if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
-              echo "path=dist/scan-kit.exe" >> "$GITHUB_OUTPUT"
-            else
-              mv dist/scan-kit.exe "dist/scan-kit-windows-${VERSION}-rc.exe"
-              echo "path=dist/scan-kit-windows-${VERSION}-rc.exe" >> "$GITHUB_OUTPUT"
-            fi
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            echo "path=dist/scan-kit.exe" >> "$GITHUB_OUTPUT"
           else
-            if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
-              BUNDLE="scan-kit-linux-amd64-${VERSION}"
-            else
-              BUNDLE="scan-kit-linux-amd64-${VERSION}-rc"
-            fi
-            mkdir -p "dist/${BUNDLE}"
-            mv dist/scan-kit "dist/${BUNDLE}/scan-kit"
-            chmod +x "dist/${BUNDLE}/scan-kit"
-            cp packaging/linux/README-Linux.txt "dist/${BUNDLE}/README.txt"
-            tar -czf "dist/${BUNDLE}.tar.gz" -C dist "${BUNDLE}"
-            echo "path=dist/${BUNDLE}.tar.gz" >> "$GITHUB_OUTPUT"
+            mv dist/scan-kit.exe "dist/scan-kit-windows-${VERSION}-rc.exe"
+            echo "path=dist/scan-kit-windows-${VERSION}-rc.exe" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Upload artifact
+      - name: Upload Windows artifact
+        if: runner.os == 'Windows'
         uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.artifact }}
           path: ${{ steps.asset.outputs.path }}
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload Linux artifacts
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/scan-kit-linux-amd64-*.AppImage
           if-no-files-found: error
           retention-days: 30
 
@@ -119,8 +132,8 @@ jobs:
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
           mv artifacts/scan-kit-windows/scan-kit.exe "artifacts/scan-kit-windows-${VERSION}.exe"
-          mv "artifacts/scan-kit-linux/scan-kit-linux-amd64-${VERSION}.tar.gz" \
-            "artifacts/scan-kit-linux-amd64-${VERSION}.tar.gz"
+          mv "artifacts/scan-kit-linux/scan-kit-linux-amd64-${VERSION}.AppImage" \
+            "artifacts/scan-kit-linux-amd64-${VERSION}.AppImage"
 
       - name: Create GitHub Release
         env:
@@ -134,4 +147,4 @@ jobs:
             --title "$GITHUB_REF_NAME" \
             --force \
             "artifacts/scan-kit-windows-${VERSION}.exe" \
-            "artifacts/scan-kit-linux-amd64-${VERSION}.tar.gz"
+            "artifacts/scan-kit-linux-amd64-${VERSION}.AppImage"

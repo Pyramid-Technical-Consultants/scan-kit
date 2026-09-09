@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
 
 from ..common import ViewSettings
 from ..common.ic_xy_distribution import normalize_contour_cutoff_percentile
+from ..common.interlock_thresholds import interlock_overlay_available
 from ..common.data_filter import FILTER_ALL, FILTER_BEAM_BOTH, FILTER_BEAM_ON
 from .binned_summary_catalog import (
     DATA_SOURCE_SPOT_ISO,
@@ -47,13 +48,16 @@ from .binned_summary_catalog import (
 from ..data.types import data_source_is_timeslice
 from .binned_summary_data import (
     BINNED_REGISTRY_SOURCE_IDS,
+    BinnedRenderPrep,
     available_x_params_for_source,
+    binned_render_prep_key,
     default_config,
     load_sessions_current_ratios,
     load_sessions_dose_rate,
     load_sessions_ic_current,
     load_sessions_for_source,
     load_sessions_sigma_error,
+    prepare_binned_render_data,
     probe_view_option_availability,
 )
 from ..data.availability import probe_sessions
@@ -68,6 +72,7 @@ from .plot_view_shell import (
 )
 from .unified_catalog import BINNED_PLOT_STYLES, option_key
 from .unified_view_controls import (
+    CorrelationPanel,
     DataFilterPanel,
     DataSourceOptionPanel,
     HistogramPanel,
@@ -76,9 +81,9 @@ from .unified_view_controls import (
 )
 
 _OPT_TREND = "trend"
-_OPT_CORR = "corr"
 _OPT_FLIERS = "fliers"
 _OPT_CONTOUR_CUTOFF = "contour_cutoff"
+_OPT_INTERLOCK = "interlock"
 
 
 class BinnedSummaryWindow(PlotViewWindow):
@@ -110,23 +115,27 @@ class BinnedSummaryWindow(PlotViewWindow):
         self._option_availability: dict[str, bool] = {}
         self._initial_load_done = False
         self._x_avail: set[str] = set()
+        self._x_avail_cache: dict[str, set[str]] = {}
+        self._render_prep: BinnedRenderPrep | None = None
+        self._render_prep_key: tuple | None = None
         self._updating = False
         self._metric_panel: DataSourceOptionPanel | None = None
         self._plot_style_panel: PlotStylePanel | None = None
         self._histogram_panel: HistogramPanel | None = None
+        self._correlation_panel: CorrelationPanel | None = None
         self._filter_panel: DataFilterPanel | None = None
         self._pending_preset = initial_preset
         self._refresh_generation = 0
         self._presets_button: QToolButton | None = None
         self._refresh_timer = QTimer(self)
         self._refresh_timer.setSingleShot(True)
-        self._refresh_timer.setInterval(60)
+        self._refresh_timer.setInterval(30)
         self._refresh_timer.timeout.connect(self._start_refresh)
 
         self._load_task = DebouncedBackgroundTask(debounce_ms=0, parent=self)
         self._load_task.finished.connect(self._on_initial_load_finished)
 
-        self._render_task = DebouncedBackgroundTask(debounce_ms=50, parent=self)
+        self._render_task = DebouncedBackgroundTask(debounce_ms=25, parent=self)
         self._render_task.finished.connect(self._on_render_finished)
 
         self.set_side_panel(self._build_controls())
@@ -179,6 +188,7 @@ class BinnedSummaryWindow(PlotViewWindow):
         self._spot_data = spot_data
         bg = self._settings.bg_subtract if self._settings else False
         self._session_data_cache[(DATA_SOURCE_SPOT_ISO, bg)] = spot_data
+        self._invalidate_derived_caches()
         self._registry_availability = registry_availability
         self._option_availability = option_availability
         self._initial_load_done = True
@@ -274,8 +284,19 @@ class BinnedSummaryWindow(PlotViewWindow):
             "Contour Cutoff",
             value=cutoff_default,
         )
-        self._plot_style_panel.add_checkbox(_OPT_CORR, "Correlation Panel")
         self._plot_style_panel.add_checkbox(_OPT_FLIERS, "Show Box Outliers")
+        self._plot_style_panel.add_checkbox(
+            _OPT_INTERLOCK,
+            "Interlock thresholds",
+            checked=False,
+        )
+        interlock_cb = self._plot_style_panel._checkboxes.get(_OPT_INTERLOCK)
+        if interlock_cb is not None:
+            interlock_cb.setToolTip(
+                "Overlay delivery interlock limits: dose gates vs target MU "
+                "(0.002 MU + 1/2/3%), devices.xml sigma bands vs energy, fixed ±mm "
+                "position bands, or sigma-error bands vs energy."
+            )
         layout.addWidget(self._plot_style_panel)
         self._sync_plot_style_controls()
 
@@ -283,6 +304,11 @@ class BinnedSummaryWindow(PlotViewWindow):
             on_selection_changed=self._on_controls_changed,
         )
         layout.addWidget(self._histogram_panel)
+
+        self._correlation_panel = CorrelationPanel(
+            on_selection_changed=self._on_controls_changed,
+        )
+        layout.addWidget(self._correlation_panel)
 
         self._filter_panel = DataFilterPanel(
             on_selection_changed=self._on_controls_changed,
@@ -320,6 +346,7 @@ class BinnedSummaryWindow(PlotViewWindow):
         else:
             loaded = {}
         self._registry_y_cache[y_group] = loaded
+        self._invalidate_derived_caches()
         return loaded
 
     def _session_data_for_y_group(self, y_group: str) -> dict[str, dict]:
@@ -338,6 +365,7 @@ class BinnedSummaryWindow(PlotViewWindow):
                 settings=self._settings,
             )
             self._session_data_cache[cache_key] = loaded
+            self._invalidate_derived_caches()
             return loaded
         source = self._current_source()
         cache_key = self._session_cache_key(source)
@@ -351,6 +379,7 @@ class BinnedSummaryWindow(PlotViewWindow):
             settings=self._settings,
         )
         self._session_data_cache[cache_key] = loaded
+        self._invalidate_derived_caches()
         if not data_source_is_timeslice(source):  # type: ignore[arg-type]
             self._spot_data = loaded
         return loaded
@@ -367,16 +396,27 @@ class BinnedSummaryWindow(PlotViewWindow):
             settings=self._settings,
         )
         self._session_data_cache[cache_key] = loaded
+        self._invalidate_derived_caches()
         self._spot_data = loaded
         return loaded
 
+    def _invalidate_derived_caches(self) -> None:
+        self._render_prep_key = None
+        self._render_prep = None
+        self._x_avail_cache.clear()
+
     def _x_avail_for_y_group(self, y_group: str) -> set[str]:
+        cached = self._x_avail_cache.get(y_group)
+        if cached is not None:
+            return cached
         group = Y_GROUP_BY_ID.get(y_group)
         if group is None:
             return set()
         source = group.sources[0]
         session_data = self._session_data_for_y_group(y_group)
-        return available_x_params_for_source(session_data, source)  # type: ignore[arg-type]
+        avail = available_x_params_for_source(session_data, source)  # type: ignore[arg-type]
+        self._x_avail_cache[y_group] = avail
+        return avail
 
     def _preset_is_available(self, preset) -> bool:
         group = Y_GROUP_BY_ID[preset.y_group]
@@ -395,9 +435,10 @@ class BinnedSummaryWindow(PlotViewWindow):
         if menu is None:
             return
         actions = menu.actions()
-        for action, preset in zip(actions, PRESETS, strict=False):
-            action.setEnabled(bool(self._preset_is_available(preset)))
-        button.setEnabled(any(bool(self._preset_is_available(p)) for p in PRESETS))
+        avail = [bool(self._preset_is_available(preset)) for preset in PRESETS]
+        for action, enabled in zip(actions, avail, strict=False):
+            action.setEnabled(enabled)
+        button.setEnabled(any(avail))
 
     def _current_source(self) -> str:
         if self._metric_panel is None:
@@ -411,9 +452,13 @@ class BinnedSummaryWindow(PlotViewWindow):
         return self._session_data_for_y_group(y_group)
 
     def _refresh_x_combo(self) -> None:
-        source = self._current_source()
-        session_data = self._session_data()
-        self._x_avail = available_x_params_for_source(session_data, source)  # type: ignore[arg-type]
+        y_group = self._metric_panel.selected_id() if self._metric_panel is not None else None
+        if y_group is not None:
+            self._x_avail = self._x_avail_for_y_group(y_group)
+        else:
+            source = self._current_source()
+            session_data = self._session_data()
+            self._x_avail = available_x_params_for_source(session_data, source)  # type: ignore[arg-type]
         current = self._x_combo.currentData()
         self._updating = True
         try:
@@ -458,6 +503,33 @@ class BinnedSummaryWindow(PlotViewWindow):
             _OPT_FLIERS,
             glyph in (GLYPH_BOX, GLYPH_VIOLIN, GLYPH_MEAN),
         )
+        self._sync_interlock_control()
+
+    def _sync_interlock_control(self) -> None:
+        panel = self._plot_style_panel
+        if panel is None:
+            return
+        y_group = (
+            self._metric_panel.selected_id()
+            if self._metric_panel is not None
+            else None
+        )
+        x_param = self._x_combo.currentData()
+        x_param_id = str(x_param) if x_param is not None else X_ENERGY
+        available = (
+            interlock_overlay_available(
+                y_group or "",
+                x_param_id,
+                glyph=self._selected_glyph(),
+            )
+            if y_group
+            else False
+        )
+        interlock_cb = panel._checkboxes.get(_OPT_INTERLOCK)
+        if interlock_cb is not None:
+            interlock_cb.setEnabled(available)
+            if not available:
+                panel.set_checked(_OPT_INTERLOCK, False)
 
     def _on_x_param_changed(self, *_args) -> None:
         if self._updating:
@@ -466,6 +538,7 @@ class BinnedSummaryWindow(PlotViewWindow):
         if x_param is not None and x_param.bin_mode == "quantile":
             self._x_bins_spin.setValue(x_param.n_bins)
         self._sync_x_bins_control()
+        self._sync_interlock_control()
         self._on_controls_changed()
 
     def _selected_glyph(self) -> str:
@@ -481,6 +554,7 @@ class BinnedSummaryWindow(PlotViewWindow):
         )
         panel = self._plot_style_panel
         hist_panel = self._histogram_panel
+        corr_panel = self._correlation_panel
         x_param = self._current_x_param()
         n_bins = None
         if x_param is not None and x_param.bin_mode == "quantile":
@@ -506,8 +580,11 @@ class BinnedSummaryWindow(PlotViewWindow):
             show_hist=hist_panel.is_enabled() if hist_panel else False,
             hist_bin_count=hist_panel.bin_count() if hist_panel else 30,
             hist_shared_bins=hist_panel.shared_bins() if hist_panel else False,
-            show_corr=panel.is_checked(_OPT_CORR) if panel else False,
+            show_corr=corr_panel.is_enabled() if corr_panel else False,
             show_fliers=panel.is_checked(_OPT_FLIERS) if panel else False,
+            show_interlock_thresholds=(
+                panel.is_checked(_OPT_INTERLOCK) if panel else False
+            ),
             contour_cutoff_percentile=cutoff,
             n_bins=n_bins,
             domain_filter=(
@@ -544,7 +621,6 @@ class BinnedSummaryWindow(PlotViewWindow):
             if self._plot_style_panel is not None:
                 self._plot_style_panel.set_current(config.glyph)
                 self._plot_style_panel.set_checked(_OPT_TREND, config.show_trend)
-                self._plot_style_panel.set_checked(_OPT_CORR, config.show_corr)
                 self._plot_style_panel.set_checked(_OPT_FLIERS, config.show_fliers)
                 self._plot_style_panel.set_spin_value(
                     _OPT_CONTOUR_CUTOFF,
@@ -557,6 +633,8 @@ class BinnedSummaryWindow(PlotViewWindow):
                     hist_bin_count=config.hist_bin_count,
                     hist_shared_bins=config.hist_shared_bins,
                 )
+            if self._correlation_panel is not None:
+                self._correlation_panel.set_from_config(show_corr=config.show_corr)
         finally:
             self._updating = False
 
@@ -581,18 +659,31 @@ class BinnedSummaryWindow(PlotViewWindow):
         self._refresh_generation += 1
         self._refresh_timer.start()
 
+    def _cached_render_prep(
+        self,
+        config: BinnedSummaryConfig,
+        session_data: dict[str, dict],
+    ) -> BinnedRenderPrep:
+        prep_key = binned_render_prep_key(config, tuple(session_data.keys()))
+        if prep_key != self._render_prep_key or self._render_prep is None:
+            self._render_prep = prepare_binned_render_data(session_data, config)
+            self._render_prep_key = prep_key
+        return self._render_prep
+
     def _start_refresh(self) -> None:
         gen = self._refresh_generation
         config = self._read_config()
         session_data = self._session_data()
+        prep = self._cached_render_prep(config, session_data)
         self.setWindowTitle(config.title)
-        self._schedule_render(gen, config, session_data)
+        self._schedule_render(gen, config, session_data, prep)
 
     def _schedule_render(
         self,
         gen: int,
         config: BinnedSummaryConfig,
         session_data: dict[str, dict],
+        prep: BinnedRenderPrep,
     ) -> None:
         figsize = tuple(float(v) for v in self.figure.get_size_inches())
         base_dir = self._base_dir
@@ -600,7 +691,9 @@ class BinnedSummaryWindow(PlotViewWindow):
         def render_fn() -> tuple[int, Figure | None]:
             fig = new_headless_figure(figsize)
             try:
-                render_binned_summary(fig, config, session_data, base_dir)
+                render_binned_summary(
+                    fig, config, session_data, base_dir, prep=prep,
+                )
             except Exception:
                 import logging
                 logging.getLogger(__name__).exception("Binned summary render failed")
