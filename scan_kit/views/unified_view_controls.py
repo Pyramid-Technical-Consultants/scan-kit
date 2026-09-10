@@ -30,6 +30,7 @@ from ..common.data_filter import (
 )
 from ..common.segmented_control import SegmentedControl
 from .unified_catalog import (
+    COARSE_SOURCE_TIMESLICE,
     CoarseDataSourceKind,
     DATA_SOURCE_SPOT_ISO,
     DataSourceKind,
@@ -455,9 +456,11 @@ class DataSourceOptionPanel(QWidget):
         parent: QWidget | None = None,
         *,
         on_selection_changed: Callable[[], None] | None = None,
+        show_granularity: bool = True,
     ) -> None:
         super().__init__(parent)
         self._on_selection_changed = on_selection_changed
+        self._show_granularity = show_granularity
         self._options: tuple[UnifiedViewOption, ...] = ()
         self._availability: dict[str, bool] = {}
         self._updating = False
@@ -474,6 +477,8 @@ class DataSourceOptionPanel(QWidget):
         self._granularity_segmented.selectionChanged.connect(
             self._on_granularity_segment_changed,
         )
+        if not self._show_granularity:
+            self._granularity_segmented.hide()
         group_layout.addWidget(self._granularity_segmented)
 
         self._option_list = QListWidget()
@@ -547,6 +552,8 @@ class DataSourceOptionPanel(QWidget):
         self._refresh_option_list(select_key=option_list_key(match))
 
     def _selected_granularity(self) -> CoarseDataSourceKind:
+        if not self._show_granularity:
+            return COARSE_SOURCE_TIMESLICE
         key = self._granularity_segmented.current_key()
         if key in dict(GRANULARITY_SOURCES):
             return key  # type: ignore[return-value]
@@ -578,6 +585,9 @@ class DataSourceOptionPanel(QWidget):
             self._refresh_option_list(select_id=preserve_id)
 
     def _update_granularity_enabled(self) -> None:
+        if not self._show_granularity:
+            self._granularity_segmented.hide()
+            return
         enabled_count = 0
         for coarse_key, _label in GRANULARITY_SOURCES:
             ok = coarse_has_available_options(

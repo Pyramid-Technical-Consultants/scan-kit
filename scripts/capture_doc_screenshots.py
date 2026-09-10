@@ -57,8 +57,9 @@ def _capture_timeslice_replay_view(
 ) -> None:
     import matplotlib.pyplot as plt
 
+    from scan_kit.data.types import DATA_SOURCE_TIMESLICE_ISO
+    from scan_kit.views.timeslice_replay_catalog import PRESET_BY_ID
     from scan_kit.views.timeslice_replay_channels import (
-        PRESET_CHANNELS,
         available_channel_keys,
         build_replay_config,
         filter_available_keys,
@@ -66,9 +67,15 @@ def _capture_timeslice_replay_view(
     )
     from scan_kit.views.timeslice_replay_ui import render_timeslice_replay
 
-    session_data = load_sessions_catalog(session_ids, base_dir)
+    preset_def = PRESET_BY_ID[preset]
+    session_data = load_sessions_catalog(
+        session_ids,
+        base_dir,
+        metric_id=preset_def.metric_id,
+        data_source=DATA_SOURCE_TIMESLICE_ISO,
+    )
     available = available_channel_keys(session_data)
-    keys = filter_available_keys(PRESET_CHANNELS[preset], available)
+    keys = filter_available_keys(preset_def.channels, available)
     config = build_replay_config(keys, session_data, title="Timeslice Replay")
     fig = plt.figure(figsize=config.figsize)
     render_timeslice_replay(fig, config, session_data, base_dir)
