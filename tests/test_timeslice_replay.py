@@ -7,15 +7,24 @@ import pandas as pd
 import pytest
 
 from scan_kit.common.schema import C_MAG_FIELD_X, C_MAG_FIELD_Y, resolve_concept_column
+from scan_kit.data.types import DATA_SOURCE_TIMESLICE_ISO
+from scan_kit.views.timeslice_replay_catalog import (
+    METRIC_IC_CURRENT,
+    METRIC_MAG_FIELD,
+    PRESET_FIELD,
+    VIEW_OPTIONS,
+)
 from scan_kit.views.timeslice_replay_channels import (
     PRESET_CHANNELS,
-    PRESET_FIELD,
     PRESET_IC_CURRENT,
     PRESET_SIGMA,
     available_channel_keys,
     build_replay_config,
+    default_metric_selection,
     default_selected_keys,
     filter_available_keys,
+    load_sessions_catalog,
+    probe_replay_option_availability,
 )
 from scan_kit.views.timeslice_replay_ui import render_timeslice_replay
 from scan_kit.views.timeslice_replay_window import TimesliceReplayWindow
@@ -84,10 +93,16 @@ def test_available_and_default_selection(g3_timeslice_catalog) -> None:
 
 
 def test_build_replay_config_field_preset(g3_timeslice_catalog) -> None:
-    available = available_channel_keys(g3_timeslice_catalog)
+    data = load_sessions_catalog(
+        [G3_SESSION],
+        str(TEST_DATA),
+        metric_id=METRIC_MAG_FIELD,
+        data_source=DATA_SOURCE_TIMESLICE_ISO,
+    )
+    available = available_channel_keys(data)
     keys = filter_available_keys(("bx", "by"), available)
     assert keys == ["bx", "by"]
-    config = build_replay_config(keys, g3_timeslice_catalog)
+    config = build_replay_config(keys, data)
     assert [t.key for t in config.traces] == ["bx", "by"]
     assert config.timeline_key == "b_mag"
     assert config.scatter.mode == "single"
@@ -122,18 +137,47 @@ def test_render_timeslice_replay_headless(g3_timeslice_catalog) -> None:
     plt.close(fig)
 
 
+def test_probe_replay_option_availability(g3_source_availability) -> None:
+    availability = probe_replay_option_availability([G3_SESSION], str(TEST_DATA))
+    assert availability[f"timeslice_iso:{METRIC_IC_CURRENT}"]
+    assert any(opt.id == METRIC_IC_CURRENT for opt in VIEW_OPTIONS)
+
+
+def test_default_metric_selection(g3_source_availability) -> None:
+    availability = probe_replay_option_availability([G3_SESSION], str(TEST_DATA))
+    metric_id, source, channels = default_metric_selection(availability)
+    assert metric_id
+    assert source == DATA_SOURCE_TIMESLICE_ISO
+    assert channels
+
+
 @pytest.mark.slow
 def test_timeslice_replay_window_smoke(qapp) -> None:
     from PySide6.QtWidgets import QSplitter
 
     window = TimesliceReplayWindow([G3_SESSION], str(TEST_DATA))
+    window._on_probe_finished(0, probe_replay_option_availability(
+        [G3_SESSION], str(TEST_DATA),
+    ))
+    window._on_load_finished(0, load_sessions_catalog(
+        [G3_SESSION],
+        str(TEST_DATA),
+        metric_id=METRIC_IC_CURRENT,
+        data_source=DATA_SOURCE_TIMESLICE_ISO,
+    ))
     assert window._session_data
     assert isinstance(window.centralWidget(), QSplitter)
     assert window.side_panel is not None
-    keys = window._selected_keys()
+    keys = window._selected_channel_keys()
     assert keys
     window._apply_preset(PRESET_FIELD)
-    field_keys = window._selected_keys()
+    window._on_load_finished(0, load_sessions_catalog(
+        [G3_SESSION],
+        str(TEST_DATA),
+        metric_id=METRIC_MAG_FIELD,
+        data_source=DATA_SOURCE_TIMESLICE_ISO,
+    ))
+    field_keys = window._selected_channel_keys()
     assert set(field_keys) <= {"bx", "by"}
     window._apply_preset(PRESET_IC_CURRENT)
     window.close()

@@ -47,6 +47,19 @@ def test_combine_data_source_round_trip() -> None:
             assert split_data_source(source) == (coarse, ref)
 
 
+def test_data_source_option_panel_timeslice_only_hides_granularity(
+    qapp: QApplication,
+) -> None:
+    panel = DataSourceOptionPanel(show_granularity=False)
+    options = (
+        UnifiedViewOption("ic_current", "IC Current", DATA_SOURCE_TIMESLICE_ISO),
+        UnifiedViewOption("sigma", "Sigma (Isocenter)", DATA_SOURCE_TIMESLICE_ISO),
+    )
+    panel.configure(options, {"timeslice_iso:ic_current": True})
+    assert panel._granularity_segmented.isHidden()
+    assert panel.selected_id() == "ic_current"
+
+
 def test_data_source_option_panel_iso_chamber_list_entries(qapp: QApplication) -> None:
     panel = DataSourceOptionPanel()
     options = (

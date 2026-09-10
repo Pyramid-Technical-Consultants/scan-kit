@@ -32,10 +32,37 @@ from ..data.timeline_channels import (
     FAMILY_DDOSE,
     FAMILY_FIELD,
     FAMILY_IC,
+    FAMILY_IC12_POS_DIFF,
+    FAMILY_POSITION,
+    FAMILY_POSITION_ERROR,
     FAMILY_SIGMA,
+    FAMILY_SIGMA_ERROR,
     REPLAY_CHANNEL_SPECS,
     TIMELINE_CHANNEL_BY_KEY,
     available_channel_keys as _shared_available_channel_keys,
+)
+from ..data.types import (
+    DATA_SOURCE_TIMESLICE_ISO,
+    DataSourceKind,
+    data_source_is_timeslice,
+    option_key,
+)
+from .timeslice_replay_catalog import (
+    METRIC_BY_ID,
+    METRIC_DDOSE,
+    METRIC_MAG_FIELD,
+    PRESET_CHANNELS,
+    PRESET_DDOSE,
+    PRESET_FIELD,
+    PRESET_IC_CURRENT,
+    PRESET_LABELS,
+    PRESET_SIGMA,
+    REPLAY_REGISTRY_SOURCE_IDS,
+    VIEW_OPTIONS,
+    channel_keys_for_metric,
+    custom_option_keys,
+    metric_for_option,
+    reference_frame_for_source,
 )
 from .timeslice_replay_common import (
     build_digital_signals,
@@ -46,18 +73,7 @@ from .timeslice_replay_common import (
     resolve_ic_scan_total_dose_columns,
 )
 from .timeslice_replay_ui import ScatterSpec, TimesliceReplayConfig, TraceSpec
-
-PRESET_IC_CURRENT = "ic_current"
-PRESET_DDOSE = "ddose"
-PRESET_SIGMA = "sigma"
-PRESET_FIELD = "field"
-
-PRESET_LABELS: dict[str, str] = {
-    PRESET_IC_CURRENT: "IC Current",
-    PRESET_DDOSE: "dDose/dt",
-    PRESET_SIGMA: "Sigma",
-    PRESET_FIELD: "Field",
-}
+from .unified_catalog import is_option_available
 
 
 @dataclass(frozen=True)
@@ -86,22 +102,26 @@ CHANNEL_DEFS: tuple[ChannelDef, ...] = tuple(
 
 CHANNEL_BY_KEY: dict[str, ChannelDef] = {c.key: c for c in CHANNEL_DEFS}
 
-PRESET_CHANNELS: dict[str, tuple[str, ...]] = {
-    PRESET_IC_CURRENT: ("ic1", "ic2", "ic3"),
-    PRESET_DDOSE: ("ic1_ddose", "ic2_ddose", "ic3_ddose"),
-    PRESET_SIGMA: ("sigma_ic1_x", "sigma_ic1_y", "sigma_ic2_x", "sigma_ic2_y"),
-    PRESET_FIELD: ("bx", "by"),
-}
-
 _ANALOG_SIGNAL_KEYS = frozenset(TIMELINE_CHANNEL_BY_KEY)
 _SIGMA_KEYS = ("sigma_ic1_x", "sigma_ic1_y", "sigma_ic2_x", "sigma_ic2_y")
+_SIGMA_ERR_KEYS = (
+    "sigma_ic1_x_err",
+    "sigma_ic1_y_err",
+    "sigma_ic2_x_err",
+    "sigma_ic2_y_err",
+)
 _POS_KEYS = ("ic1_x", "ic1_y", "ic2_x", "ic2_y")
+_POS_ERR_KEYS = ("ic1_x_err", "ic1_y_err", "ic2_x_err", "ic2_y_err")
+_IC12_DIFF_KEYS = ("ic12_x_diff", "ic12_y_diff")
 _CATALOG_IC_KEYS = frozenset({"ic1", "ic2", "ic3"})
 _CATALOG_DDOSE_KEYS = frozenset({"ic1_ddose", "ic2_ddose", "ic3_ddose"})
 _CATALOG_SIGMA_KEYS = frozenset(_SIGMA_KEYS)
+_CATALOG_SIGMA_ERR_KEYS = frozenset(_SIGMA_ERR_KEYS)
 _CATALOG_FIELD_KEYS = frozenset({"bx", "by", "b_mag"})
 _CATALOG_BEAM_KEYS = frozenset({"beam"})
 _CATALOG_POS_KEYS = frozenset(_POS_KEYS)
+_CATALOG_POS_ERR_KEYS = frozenset(_POS_ERR_KEYS)
+_CATALOG_IC12_DIFF_KEYS = frozenset(_IC12_DIFF_KEYS)
 
 
 def _catalog_wants_family(
@@ -208,6 +228,53 @@ def default_selected_keys(available: set[str]) -> list[str]:
     return []
 
 
+def probe_replay_option_availability(
+    session_ids: Sequence[str],
+    base_dir: str,
+) -> dict[str, bool]:
+    """Return availability for every unified timeslice-replay option."""
+    from ..data.availability import probe_sessions
+
+    availability = {
+        key: value
+        for key, value in probe_sessions(
+            session_ids,
+            base_dir,
+            source_ids=REPLAY_REGISTRY_SOURCE_IDS,
+        ).items()
+        if data_source_is_timeslice(key.split(":", 1)[0])
+    }
+    for key in custom_option_keys():
+        availability.setdefault(key, False)
+
+    for session_id in session_ids:
+        flags = probe_session_timeline_flags(session_id, base_dir)
+        if not flags:
+            continue
+        if flags.get("has_ddose"):
+            availability[option_key(DATA_SOURCE_TIMESLICE_ISO, METRIC_DDOSE)] = True
+        if flags.get("has_field"):
+            availability[option_key(DATA_SOURCE_TIMESLICE_ISO, METRIC_MAG_FIELD)] = True
+
+    for opt in VIEW_OPTIONS:
+        availability.setdefault(option_key(opt.source, opt.id), False)
+    return availability
+
+
+def default_metric_selection(
+    availability: dict[str, bool],
+) -> tuple[str, DataSourceKind, tuple[str, ...]]:
+    """Pick the first available metric/source and its default channels."""
+    for opt in VIEW_OPTIONS:
+        if not is_option_available(availability, opt):
+            continue
+        metric = METRIC_BY_ID.get(opt.id)
+        if metric is None:
+            continue
+        return opt.id, opt.source, metric.default_channel_keys
+    return PRESET_IC_CURRENT, DATA_SOURCE_TIMESLICE_ISO, ("ic1", "ic2")
+
+
 def load_session_timeline_catalog(
     session_id: str,
     base_dir: str,
@@ -215,6 +282,7 @@ def load_session_timeline_catalog(
     bg_subtract: bool = False,
     opened: tuple | None = None,
     channel_keys: frozenset[str] | None = None,
+    position_reference_frame: str | None = None,
 ) -> dict | None:
     """Load timeslice channel families into one session dict.
 
@@ -224,17 +292,18 @@ def load_session_timeline_catalog(
     When *channel_keys* is set, only extract those catalog keys (frames are
     still read, but unused families are not concatenated).
     """
+    session_src = None
     if opened is not None:
-        _src, frames, energy_by_layer, energy_by_idx, ts_layer = opened
+        session_src, frames, energy_by_layer, energy_by_idx, ts_layer = opened
         if not frames:
             return None
     else:
         loaded = load_energy_lookups(session_id, base_dir)
         if loaded is None:
             return None
-        _src, energy_by_layer, energy_by_idx = loaded
+        session_src, energy_by_layer, energy_by_idx = loaded
 
-        frames = load_session_timeslice_device_units(_src)
+        frames = load_session_timeslice_device_units(session_src)
         if not frames:
             return None
         if bg_subtract:
@@ -267,12 +336,6 @@ def load_session_timeline_catalog(
     ts_by = resolve_col(df0.columns, C_MAG_FIELD_Y)
     file_has_field = bool(ts_bx and ts_by)
 
-    if not any((file_has_ic, file_has_ddose, file_has_sigma, file_has_field)):
-        return None
-
-    ts_beam = resolve_col(df0.columns, C_BEAM_CURRENT)
-    file_has_beam = ts_beam is not None
-
     pos_cols: dict[str, str] = {}
     for pos_key in (POSITION_KEY_G3_RAW, POSITION_KEY_G2_RAW):
         for concept, label in (
@@ -290,12 +353,77 @@ def load_session_timeline_catalog(
             break
     file_has_positions = len(pos_cols) == 4
 
+    from ..data.types import REFERENCE_CHAMBER, REFERENCE_ISO
+
+    ts_beam = resolve_col(df0.columns, C_BEAM_CURRENT)
+    file_has_beam = ts_beam is not None
+
+    error_source = None
+    from ..common.timeslice_position_error import (
+        frame_timeslice_chamber_position_arrays,
+        frame_timeslice_error_arrays,
+        frame_timeslice_iso_position_arrays,
+        resolve_session_timeslice_chamber_position_source,
+        resolve_session_timeslice_error_source,
+        resolve_session_timeslice_iso_position_source,
+    )
+
+    if session_src is not None:
+        error_source = resolve_session_timeslice_error_source(session_src, frames)
+        iso_position_source = resolve_session_timeslice_iso_position_source(
+            session_src, frames,
+        )
+        chamber_position_source = resolve_session_timeslice_chamber_position_source(
+            session_src, frames,
+        )
+    else:
+        iso_position_source = None
+        chamber_position_source = None
+
+    file_has_position_error = error_source is not None
+    file_has_iso_positions = iso_position_source is not None
+    file_has_chamber_positions = chamber_position_source is not None or file_has_positions
+
+    sigma_target_cols = None
+    file_has_sigma_error = False
+    if file_has_sigma:
+        from ..common.timeslice_sigma import _resolve_sigma_target_columns
+
+        sigma_target_cols = _resolve_sigma_target_columns(df0.columns)
+        file_has_sigma_error = sigma_target_cols is not None
+
+    file_has_ic12_diff = file_has_iso_positions or file_has_chamber_positions
+
+    if channel_keys is None:
+        if not any((file_has_ic, file_has_ddose, file_has_sigma, file_has_field)):
+            return None
+    else:
+        wanted = channel_keys
+        has_wanted = (
+            (file_has_ic and bool(_CATALOG_IC_KEYS & wanted))
+            or (file_has_ddose and bool(_CATALOG_DDOSE_KEYS & wanted))
+            or (file_has_sigma and bool(_CATALOG_SIGMA_KEYS & wanted))
+            or (file_has_field and bool(_CATALOG_FIELD_KEYS & wanted))
+            or (
+                (file_has_iso_positions or file_has_chamber_positions or file_has_positions)
+                and bool(_CATALOG_POS_KEYS & wanted)
+            )
+            or (file_has_position_error and bool(_CATALOG_POS_ERR_KEYS & wanted))
+            or (file_has_sigma_error and bool(_CATALOG_SIGMA_ERR_KEYS & wanted))
+            or (file_has_ic12_diff and bool(_CATALOG_IC12_DIFF_KEYS & wanted))
+        )
+        if not has_wanted:
+            return None
+
     wants_ic = _catalog_wants_family(channel_keys, _CATALOG_IC_KEYS)
     wants_ddose = _catalog_wants_family(channel_keys, _CATALOG_DDOSE_KEYS)
     wants_sigma = _catalog_wants_family(channel_keys, _CATALOG_SIGMA_KEYS)
     wants_field = _catalog_wants_family(channel_keys, _CATALOG_FIELD_KEYS)
     wants_beam = _catalog_wants_family(channel_keys, _CATALOG_BEAM_KEYS)
     wants_positions = _catalog_wants_family(channel_keys, _CATALOG_POS_KEYS)
+    wants_position_error = _catalog_wants_family(channel_keys, _CATALOG_POS_ERR_KEYS)
+    wants_sigma_error = _catalog_wants_family(channel_keys, _CATALOG_SIGMA_ERR_KEYS)
+    wants_ic12_diff = _catalog_wants_family(channel_keys, _CATALOG_IC12_DIFF_KEYS)
 
     has_ic = file_has_ic and wants_ic
     has_ic3 = file_has_ic3 and (
@@ -308,7 +436,17 @@ def load_session_timeline_catalog(
     has_sigma = file_has_sigma and wants_sigma
     has_field = file_has_field and wants_field
     has_beam = file_has_beam and wants_beam
-    has_positions = file_has_positions and wants_positions
+    has_positions = wants_positions and (
+        (position_reference_frame == REFERENCE_ISO and file_has_iso_positions)
+        or (position_reference_frame == REFERENCE_CHAMBER and file_has_chamber_positions)
+        or (
+            position_reference_frame is None
+            and (file_has_positions or file_has_iso_positions)
+        )
+    )
+    has_position_error = file_has_position_error and wants_position_error
+    has_sigma_error = file_has_sigma_error and wants_sigma_error and has_sigma
+    has_ic12_diff = file_has_ic12_diff and wants_ic12_diff
 
     digital_cols = detect_digital_columns(df0.columns)
     digital_parts: dict[str, list[np.ndarray]] = {col: [] for col, _ in digital_cols}
@@ -325,6 +463,9 @@ def load_session_timeline_catalog(
         "by": [],
         "beam": [],
         **{k: [] for k in _POS_KEYS},
+        **{k: [] for k in _POS_ERR_KEYS},
+        **{k: [] for k in _SIGMA_ERR_KEYS},
+        **{k: [] for k in _IC12_DIFF_KEYS},
     }
     energy_parts: list[np.ndarray] = []
     layer_boundaries: list[tuple[int, float]] = []
@@ -406,9 +547,57 @@ def load_session_timeline_catalog(
                 digital_parts[col].append(df[col].values.astype(float))
             else:
                 digital_parts[col].append(np.zeros(n))
-        if has_positions:
-            for label, col in pos_cols.items():
-                parts[label].append(df[col].values.astype(float))
+        frame_positions = None
+        if has_positions or has_ic12_diff:
+            if position_reference_frame == REFERENCE_ISO and iso_position_source is not None:
+                frame_positions = frame_timeslice_iso_position_arrays(
+                    df, iso_position_source,
+                )
+            elif (
+                position_reference_frame == REFERENCE_CHAMBER
+                and chamber_position_source is not None
+            ):
+                frame_positions = frame_timeslice_chamber_position_arrays(
+                    df, chamber_position_source,
+                )
+            elif file_has_positions:
+                frame_positions = tuple(
+                    df[pos_cols[label]].values.astype(float) for label in _POS_KEYS
+                )
+            if frame_positions is None:
+                nan = np.full(n, np.nan)
+                frame_positions = (nan, nan, nan, nan)
+            if has_positions:
+                for key, arr in zip(_POS_KEYS, frame_positions):
+                    parts[key].append(arr)
+            if has_ic12_diff:
+                ic1_x, ic1_y, ic2_x, ic2_y = frame_positions
+                parts["ic12_x_diff"].append(ic2_x - ic1_x)
+                parts["ic12_y_diff"].append(ic2_y - ic1_y)
+
+        if has_position_error and error_source is not None:
+            frame_errors = frame_timeslice_error_arrays(df, error_source)
+            if frame_errors is None:
+                nan = np.full(n, np.nan)
+                for key in _POS_ERR_KEYS:
+                    parts[key].append(nan)
+            else:
+                for key, arr in zip(_POS_ERR_KEYS, frame_errors):
+                    parts[key].append(arr)
+
+        if has_sigma_error and sigma_target_cols is not None:
+            from ..common.timeslice_sigma import frame_timeslice_sigma_error_arrays
+
+            frame_errors = frame_timeslice_sigma_error_arrays(
+                df, sigma_source, sigma_target_cols,
+            )
+            if frame_errors is None:
+                nan = np.full(n, np.nan)
+                for key in _SIGMA_ERR_KEYS:
+                    parts[key].append(nan)
+            else:
+                for key, arr in zip(_SIGMA_ERR_KEYS, frame_errors):
+                    parts[key].append(arr)
 
         energy_parts.append(np.full(n, energy))
         layer_boundaries.append((offset, energy))
@@ -422,10 +611,10 @@ def load_session_timeline_catalog(
         "n_samples": offset,
         "has_ic3": file_has_ic3,
         "has_beam": file_has_beam,
-        "has_positions": file_has_positions,
-        "has_sigma": file_has_sigma,
-        "has_field": file_has_field,
-        "has_ddose": file_has_ddose,
+        "has_positions": has_positions or has_ic12_diff,
+        "has_sigma": has_sigma,
+        "has_field": has_field,
+        "has_ddose": has_ddose,
         "energy": np.concatenate(energy_parts),
         "beam_off_edges": {
             k: np.asarray(v, dtype=int) for k, v in edge_indices.items() if v
@@ -457,22 +646,43 @@ def load_session_timeline_catalog(
     if has_beam:
         _store("beam")
     if has_positions:
-        result["ic1_x"] = transform.remap(
-            np.concatenate(parts["ic1_x"]), *transform.IC1_X_MAP,
+        use_chamber_remap = (
+            position_reference_frame == REFERENCE_CHAMBER
+            or (
+                position_reference_frame is None
+                and file_has_positions
+                and not file_has_iso_positions
+            )
         )
-        result["ic1_y"] = transform.remap(
-            np.concatenate(parts["ic1_y"]), *transform.IC1_Y_MAP,
-        )
-        result["ic2_x"] = transform.remap(
-            np.concatenate(parts["ic2_x"]), *transform.IC2_X_MAP,
-        )
-        result["ic2_y"] = transform.remap(
-            np.concatenate(parts["ic2_y"]), *transform.IC2_Y_MAP,
-        )
+        if use_chamber_remap:
+            result["ic1_x"] = transform.remap(
+                np.concatenate(parts["ic1_x"]), *transform.IC1_X_MAP,
+            )
+            result["ic1_y"] = transform.remap(
+                np.concatenate(parts["ic1_y"]), *transform.IC1_Y_MAP,
+            )
+            result["ic2_x"] = transform.remap(
+                np.concatenate(parts["ic2_x"]), *transform.IC2_X_MAP,
+            )
+            result["ic2_y"] = transform.remap(
+                np.concatenate(parts["ic2_y"]), *transform.IC2_Y_MAP,
+            )
+        else:
+            for key in _POS_KEYS:
+                _store(key)
         pos_limit = transform.IC_MM_MAX
         for key in _POS_KEYS:
             arr = result[key]
             arr[np.abs(arr) > pos_limit] = np.nan
+    if has_position_error:
+        for key in _POS_ERR_KEYS:
+            _store(key)
+    if has_sigma_error:
+        for key in _SIGMA_ERR_KEYS:
+            _store(key)
+    if has_ic12_diff:
+        for key in _IC12_DIFF_KEYS:
+            _store(key)
 
     return result
 
@@ -482,12 +692,26 @@ def load_sessions_catalog(
     base_dir: str,
     *,
     bg_subtract: bool = False,
+    metric_id: str | None = None,
+    data_source: DataSourceKind | None = None,
 ) -> dict[str, dict]:
     """Load catalog data for each session that has usable timeslice channels."""
+    channel_keys: frozenset[str] | None = None
+    position_reference_frame = None
+    if metric_id is not None and data_source is not None:
+        if metric_for_option(metric_id, data_source) is None:
+            return {}
+        channel_keys = channel_keys_for_metric(metric_id)
+        position_reference_frame = reference_frame_for_source(data_source)
+
     session_data: dict[str, dict] = {}
     for sid in session_ids:
         data = load_session_timeline_catalog(
-            sid, base_dir, bg_subtract=bg_subtract,
+            sid,
+            base_dir,
+            bg_subtract=bg_subtract,
+            channel_keys=channel_keys,
+            position_reference_frame=position_reference_frame,
         )
         if data is not None:
             session_data[sid] = data
@@ -563,6 +787,32 @@ def _scatter_for_selection(
         if not per_trace:
             return ScatterSpec(mode="none")
         return ScatterSpec(mode="per_trace", per_trace_xy=per_trace)
+
+    if family == FAMILY_POSITION:
+        return ScatterSpec(
+            mode="per_trace",
+            per_trace_xy={
+                "ic1_x": ("ic1_x", "ic1_y"),
+                "ic1_y": ("ic1_x", "ic1_y"),
+                "ic2_x": ("ic2_x", "ic2_y"),
+                "ic2_y": ("ic2_x", "ic2_y"),
+            },
+            per_trace_title_suffix=" position (mm)",
+            missing_label="No position data",
+        )
+
+    if family == FAMILY_SIGMA_ERROR:
+        return ScatterSpec(
+            mode="per_trace",
+            per_trace_xy={
+                "sigma_ic1_x_err": ("sigma_ic1_x_err", "sigma_ic1_y_err"),
+                "sigma_ic1_y_err": ("sigma_ic1_x_err", "sigma_ic1_y_err"),
+                "sigma_ic2_x_err": ("sigma_ic2_x_err", "sigma_ic2_y_err"),
+                "sigma_ic2_y_err": ("sigma_ic2_x_err", "sigma_ic2_y_err"),
+            },
+            per_trace_title_suffix=" σ error (mm)",
+            missing_label="No sigma error data",
+        )
 
     return ScatterSpec(mode="none")
 

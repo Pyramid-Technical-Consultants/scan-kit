@@ -10,6 +10,7 @@ from scan_kit.data.types import (
 )
 from scan_kit.views.binned_summary_catalog import VIEW_OPTIONS as BINNED_OPTIONS
 from scan_kit.views.distribution_catalog import VIEW_OPTIONS as DISTRIBUTION_OPTIONS
+from scan_kit.views.timeslice_replay_catalog import VIEW_OPTIONS as REPLAY_OPTIONS
 from scan_kit.views.unified_catalog import format_view_option_label
 
 
@@ -83,6 +84,20 @@ def test_distribution_position_spot_has_iso_and_chamber_rows() -> None:
         if opt.id == "position" and opt.source in (
             DATA_SOURCE_SPOT_ISO,
             DATA_SOURCE_SPOT_CHAMBER,
+        )
+    }
+    assert any("Isocenter" in label for label in labels)
+    assert any("Chamber" in label for label in labels)
+
+
+def test_replay_position_timeslice_has_iso_and_chamber_rows() -> None:
+    labels = {
+        opt.label
+        for opt in REPLAY_OPTIONS
+        if opt.id == "position"
+        and opt.source in (
+            DATA_SOURCE_TIMESLICE_ISO,
+            DATA_SOURCE_TIMESLICE_CHAMBER,
         )
     }
     assert any("Isocenter" in label for label in labels)

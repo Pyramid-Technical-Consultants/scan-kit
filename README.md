@@ -202,10 +202,10 @@ Focused plots that still use standalone matplotlib windows:
 
 ### Interactive replay views
 
-**Timeslice Replay** opens a Qt window with an embedded Matplotlib plot and a channel panel. Presets jump to common sets (**IC current**, **dDose/dt**, **Sigma**, **Field**); you can also mix any available channels. Detail traces sit above a compressed timeline brush. See the [screenshots](#screenshots) for examples.
+**Timeslice Replay** opens a Qt window with an embedded Matplotlib plot and a unified **Signal Source** list (same metric names and isocenter/chamber variants as Binned Summary and Distribution Explorer where applicable). Presets jump to common sets (**IC current**, **dDose/dt**, **Sigma**, **Field**, **Position**). Pick channels within the selected source from the checklist below. Detail traces sit above a compressed timeline brush. See the [screenshots](#screenshots) for examples.
 
 1. Select session(s) and open **Timeslice Replay**.
-2. Choose a preset or tick channels in the side panel.
+2. Choose a signal source from the list (or use a preset), then tick the channels to plot.
 3. Drag the bottom timeline brush to set the detail window (scroll to zoom).
 
 Layer boundaries appear as annotated vertical lines. Multiple sessions overlay with distinct colors. Large windows are auto-decimated so scrubbing stays smooth.
