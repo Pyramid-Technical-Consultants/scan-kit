@@ -380,6 +380,25 @@ def _derive_axes_from_pairs(
     return axes
 
 
+def _plan_affine_verify_error(
+    device_targets: pd.DataFrame,
+    plan_df: pd.DataFrame,
+    axes: dict[str, IsoAxisTransform],
+    axis_specs: tuple[tuple[str, str, str], ...],
+) -> float:
+    """RMS strip→iso error at native ``spot_no`` (how affines are applied)."""
+    merged = device_targets.merge(plan_df, on=["layer_id", "spot_no"], how="inner")
+    if merged.empty:
+        return np.inf
+    sq: list[np.ndarray] = []
+    for _key, strip_col, iso_col in axis_specs:
+        aff = axes[_key]
+        pred = aff.slope * merged[strip_col].to_numpy(dtype=float) + aff.intercept
+        err = merged[iso_col].to_numpy(dtype=float) - pred
+        sq.append(err * err)
+    return float(np.sqrt(np.mean(np.concatenate(sq))))
+
+
 def _derive_g3_iso_transform_from_plan(
     device_targets: pd.DataFrame,
     plan: G3IsoPlanLookup,
@@ -396,7 +415,7 @@ def _derive_g3_iso_transform_from_plan(
         }
     )
     best_shift: int | None = None
-    best_score = np.inf
+    best_key: tuple[float, int, int] | None = None
     best_axes: dict[str, IsoAxisTransform] | None = None
 
     axis_specs = (
@@ -416,12 +435,12 @@ def _derive_g3_iso_transform_from_plan(
         axes = _derive_axes_from_pairs(merged, axis_specs)
         if axes is None:
             continue
-        score = sum(
-            _fit_affine(merged[dev_col].to_numpy(), merged[iso_col].to_numpy())[2]
-            for _, dev_col, iso_col in axis_specs
-        )
-        if score < best_score:
-            best_score = score
+        verify = _plan_affine_verify_error(device_targets, plan_df, axes, axis_specs)
+        if not np.isfinite(verify):
+            continue
+        key = (verify, -len(merged), abs(shift))
+        if best_key is None or key < best_key:
+            best_key = key
             best_shift = shift
             best_axes = axes
 
