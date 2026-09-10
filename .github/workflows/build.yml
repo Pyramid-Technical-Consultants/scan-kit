@@ -171,7 +171,7 @@ jobs:
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
           mv artifacts/scan-kit-windows/scan-kit.exe "artifacts/scan-kit-windows-${VERSION}.exe"
-          mv "artifacts/scan-kit-linux-amd64-${VERSION}.AppImage" \
+          mv "artifacts/scan-kit-linux/scan-kit-linux-amd64-${VERSION}.AppImage" \
             "artifacts/scan-kit-linux-amd64-${VERSION}.AppImage"
 
       - name: Create GitHub Release

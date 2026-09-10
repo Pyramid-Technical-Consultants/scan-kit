@@ -4,11 +4,10 @@ from __future__ import annotations
 
 from typing import Sequence
 
-from PySide6.QtCore import Qt, QTimer, Slot
+from PySide6.QtCore import QTimer, Slot
 from PySide6.QtWidgets import (
     QCheckBox,
     QGroupBox,
-    QLabel,
     QVBoxLayout,
     QWidget,
 )
@@ -150,12 +149,6 @@ class TimesliceReplayWindow(PlotViewWindow):
         opt_layout.addWidget(self._beam_check)
         layout.addWidget(options)
 
-        note = QLabel("No timeslice data found for the selected sessions.")
-        note.setWordWrap(True)
-        note.setObjectName("replay_empty_note")
-        note.hide()
-        layout.addWidget(note)
-
         layout.addStretch(1)
         return panel
 
@@ -245,25 +238,42 @@ class TimesliceReplayWindow(PlotViewWindow):
         session_ids = list(self._session_ids)
         base_dir = self._base_dir
         bg_subtract = self._bg_subtract
+        load_metric = metric_id
+        load_source = source
 
-        def loader() -> dict[str, dict]:
-            return load_sessions_catalog(
-                session_ids,
-                base_dir,
-                bg_subtract=bg_subtract,
-                metric_id=metric_id,
-                data_source=source,
+        def loader() -> tuple[str, DataSourceKind, dict[str, dict]]:
+            return (
+                load_metric,
+                load_source,
+                load_sessions_catalog(
+                    session_ids,
+                    base_dir,
+                    bg_subtract=bg_subtract,
+                    metric_id=load_metric,
+                    data_source=load_source,
+                ),
             )
 
         self._show_status_message("Loading timeslice data…")
         self._load_task.schedule(loader)
 
     @Slot(int, object)
-    def _on_load_finished(self, _task_generation: int, result: object) -> None:
-        if not isinstance(result, dict):
+    def _on_load_finished(self, task_generation: int, result: object) -> None:
+        if task_generation != self._load_task.generation:
+            return
+        if not isinstance(result, tuple) or len(result) != 3:
             self._show_status_message("Failed to load timeslice data")
             return
-        self._session_data = result
+        metric_id, source, session_data = result
+        if (
+            metric_id != self._current_metric_id()
+            or source != self._current_source()
+        ):
+            return
+        if not isinstance(session_data, dict):
+            self._show_status_message("Failed to load timeslice data")
+            return
+        self._session_data = session_data
         self._rebuild_channel_checks()
         self._refresh_plot()
 

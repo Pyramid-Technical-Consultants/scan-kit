@@ -272,7 +272,8 @@ def default_metric_selection(
         if metric is None:
             continue
         return opt.id, opt.source, metric.default_channel_keys
-    return PRESET_IC_CURRENT, DATA_SOURCE_TIMESLICE_ISO, ("ic1", "ic2")
+    metric = METRIC_BY_ID[PRESET_IC_CURRENT]
+    return PRESET_IC_CURRENT, DATA_SOURCE_TIMESLICE_ISO, metric.default_channel_keys
 
 
 def load_session_timeline_catalog(
@@ -445,7 +446,7 @@ def load_session_timeline_catalog(
         )
     )
     has_position_error = file_has_position_error and wants_position_error
-    has_sigma_error = file_has_sigma_error and wants_sigma_error and has_sigma
+    has_sigma_error = file_has_sigma_error and wants_sigma_error and file_has_sigma
     has_ic12_diff = file_has_ic12_diff and wants_ic12_diff
 
     digital_cols = detect_digital_columns(df0.columns)

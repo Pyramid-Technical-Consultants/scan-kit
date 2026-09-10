@@ -46,7 +46,7 @@ _UNIFIED_VIEWS: list[ViewEntry] = [
     (
         "Timeslice Replay",
         "timeslice_replay",
-        "Interactive timeslice viewer with selectable IC, dDose/dt, sigma, and magnetic-field channels.",
+        "Interactive timeslice viewer with unified signal sources (IC current, dDose/dt, sigma, position, and more).",
     ),
     (
         "IC Beam Trajectory (3D)",
