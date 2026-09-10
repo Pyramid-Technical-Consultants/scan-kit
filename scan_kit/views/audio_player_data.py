@@ -49,8 +49,7 @@ class PlaybackChannel:
 class WaveformRenderChannel(PlaybackChannel):
     """Playback channel with precomputed vispy envelope geometry."""
 
-    mesh_pos: np.ndarray
-    mesh_faces: np.ndarray
+    envelope_poly: np.ndarray
     y_lo: float
     y_hi: float
 
@@ -219,34 +218,23 @@ def _sanitize_envelope(
     return lo, hi
 
 
-def _envelope_mesh(
+def _envelope_polygon(
     t: np.ndarray,
     y_min: np.ndarray,
     y_max: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> np.ndarray:
+    """Closed polygon tracing max forward then min backward."""
     n = len(t)
     if n == 0:
-        return np.zeros((0, 2), dtype=np.float32), np.zeros((0, 3), dtype=np.uint32)
-
-    verts = np.empty((n * 2, 2), dtype=np.float32)
-    verts[0::2, 0] = t
-    verts[0::2, 1] = y_min
-    verts[1::2, 0] = t
-    verts[1::2, 1] = y_max
-
-    faces = np.empty((max(0, n - 1) * 2, 3), dtype=np.uint32)
-    for i in range(n - 1):
-        lo = i * 2
-        hi = lo + 2
-        row = i * 2
-        faces[row] = (lo, lo + 1, hi + 1)
-        faces[row + 1] = (lo, hi + 1, hi)
-    return verts, faces
+        return np.zeros((0, 2), dtype=np.float32)
+    upper = np.column_stack([t, y_max])
+    lower = np.column_stack([t[::-1], y_min[::-1]])
+    return np.vstack([upper, lower]).astype(np.float32)
 
 
 def _envelope_from_signal(
     signal: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray, float, float]:
+) -> tuple[np.ndarray, float, float]:
     x_ms, y_min, y_max = compress_minmax(signal, _ENVELOPE_BINS)
     t = x_ms / 1000.0
     y_min, y_max = _sanitize_envelope(y_min, y_max)
@@ -257,8 +245,8 @@ def _envelope_from_signal(
     pad = max((row_max - row_min) * 0.08, 0.05)
     y_lo = row_min - pad
     y_hi = row_max + pad
-    mesh_pos, mesh_faces = _envelope_mesh(t, y_min, y_max)
-    return mesh_pos, mesh_faces, y_lo, y_hi
+    envelope_poly = _envelope_polygon(t, y_min, y_max)
+    return envelope_poly, y_lo, y_hi
 
 
 def _build_render_channel(
@@ -302,15 +290,14 @@ def _build_render_channel(
         processed = raw
 
     signal = normalize(processed)
-    mesh_pos, mesh_faces, y_lo, y_hi = _envelope_from_signal(signal)
+    envelope_poly, y_lo, y_hi = _envelope_from_signal(signal)
     label = _channel_label(channel_id, beam_subtracted=subtract)
     return WaveformRenderChannel(
         label=label,
         channel_id=channel_id,
         signal=signal,
         color=channel_color(channel_id, beam_subtracted=subtract),
-        mesh_pos=mesh_pos,
-        mesh_faces=mesh_faces,
+        envelope_poly=envelope_poly,
         y_lo=y_lo,
         y_hi=y_hi,
     )

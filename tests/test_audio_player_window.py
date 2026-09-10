@@ -12,7 +12,7 @@ from tests.conftest import G3_SESSION, TEST_DATA
 def test_audio_player_window_smoke(qt_wait) -> None:
     window = AudioPlayerWindow([G3_SESSION], str(TEST_DATA))
     qt_wait(
-        lambda: bool(window._session_data) and bool(window._channel_checks),
+        lambda: bool(window._session_data) and bool(window._channel_radios),
         timeout_ms=20000,
     )
     qt_wait(lambda: bool(window._playback_channels), timeout_ms=20000)

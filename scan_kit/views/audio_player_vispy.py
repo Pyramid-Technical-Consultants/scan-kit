@@ -12,7 +12,6 @@ _BG = "#1a1a1a"
 _FG = "#c9d1d9"
 _ACCENT = (0.0, 212 / 255, 170 / 255, 0.9)
 _CURSOR_INACTIVE = (58 / 255, 63 / 255, 71 / 255, 0.5)
-_LABEL_MARGIN_FRAC = 0.10
 
 
 @dataclass
@@ -90,7 +89,6 @@ class AudioWaveformScene:
         self._selected_index = max(0, min(selected_index, len(channels) - 1))
         max_samples = max(len(ch.signal) for ch in channels)
         self._duration = max_samples / FS_HZ
-        x_margin = _label_margin(self._duration)
 
         for i, channel in enumerate(channels):
             view = self._grid.add_view(row=i, col=0, row_span=1, col_span=1)
@@ -98,15 +96,13 @@ class AudioWaveformScene:
             _lock_view_camera(view, camera)
 
             rgba = _hex_to_rgba(channel.color, alpha=0.75)
-            envelope = scene.visuals.Mesh(
-                pos=channel.mesh_pos,
-                faces=channel.mesh_faces,
+            envelope = scene.visuals.Polygon(
+                pos=channel.envelope_poly,
                 color=rgba,
                 parent=view.scene,
             )
-            envelope.set_gl_state("translucent", depth_test=False, cull_face=False)
+            envelope.set_gl_state("translucent", depth_test=False)
 
-            y_mid = (channel.y_lo + channel.y_hi) * 0.5
             cursor = scene.visuals.Line(
                 pos=_cursor_segment(0.0, channel.y_lo, channel.y_hi),
                 color=_CURSOR_INACTIVE,
@@ -115,21 +111,11 @@ class AudioWaveformScene:
                 parent=view.scene,
             )
 
-            scene.Text(
-                channel.label,
-                color=_FG,
-                font_size=10,
-                pos=(-x_margin * 0.98, y_mid),
-                anchor_x="right",
-                anchor_y="center",
-                parent=view.scene,
-            )
-
             if i == len(channels) - 1:
                 _add_time_axis(view, self._duration, channel.y_lo)
 
             view.camera.set_range(
-                x=(-x_margin, self._duration),
+                x=(0.0, self._duration),
                 y=(channel.y_lo, channel.y_hi),
             )
             self._rows.append(
@@ -237,10 +223,6 @@ def _cursor_segment(time_s: float, y_lo: float, y_hi: float) -> np.ndarray:
     return np.array([[time_s, y_lo], [time_s, y_hi]], dtype=np.float32)
 
 
-def _label_margin(duration: float) -> float:
-    return max(duration * _LABEL_MARGIN_FRAC, 0.25)
-
-
 def _hex_to_rgba(hex_color: str, *, alpha: float) -> tuple[float, float, float, float]:
     color = hex_color.lstrip("#")
     if len(color) != 6:
@@ -257,20 +239,6 @@ def _envelope_polygon(
     y_max: np.ndarray,
 ) -> np.ndarray:
     """Closed polygon tracing max forward then min backward (tests)."""
-    n = len(t)
-    if n == 0:
-        return np.zeros((0, 2), dtype=np.float32)
-    upper = np.column_stack([t, y_max])
-    lower = np.column_stack([t[::-1], y_min[::-1]])
-    return np.vstack([upper, lower]).astype(np.float32)
+    from .audio_player_data import _envelope_polygon as polygon_from_data
 
-
-def _envelope_mesh(
-    t: np.ndarray,
-    y_min: np.ndarray,
-    y_max: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Triangle mesh for envelope fill (tests)."""
-    from .audio_player_data import _envelope_mesh as mesh_from_data
-
-    return mesh_from_data(t, y_min, y_max)
+    return polygon_from_data(t, y_min, y_max)

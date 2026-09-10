@@ -11,6 +11,7 @@ import numpy as np
 import sounddevice as sd
 from PySide6.QtCore import Qt, QTimer, Slot
 from PySide6.QtWidgets import (
+    QButtonGroup,
     QCheckBox,
     QFileDialog,
     QGroupBox,
@@ -20,6 +21,9 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QMainWindow,
     QPushButton,
+    QRadioButton,
+    QScrollArea,
+    QSizePolicy,
     QSplitter,
     QVBoxLayout,
     QWidget,
@@ -69,19 +73,19 @@ AUDIO_PRESET_IC_BEAM_SUB = "ic_current_beam_sub"
 _AUDIO_PRESETS: tuple[tuple[str, str, AudioPlayerConfig], ...] = (
     (
         AUDIO_PRESET_IC_CURRENT_ALL,
-        "All IC currents",
+        "IC1 current",
         AudioPlayerConfig(
             metric_id=METRIC_IC_CURRENT,
-            channels=("ic1", "ic2", "ic3"),
+            channels=("ic1",),
             beam_state_filter=FILTER_BEAM_BOTH,
         ),
     ),
     (
         AUDIO_PRESET_IC_BEAM_SUB,
-        "IC1/IC2 beam subtracted",
+        "IC1 beam subtracted",
         AudioPlayerConfig(
             metric_id=METRIC_IC_CURRENT,
-            channels=("ic1", "ic2"),
+            channels=("ic1",),
             beam_state_filter=FILTER_BEAM_BOTH,
             beam_subtract=True,
         ),
@@ -129,12 +133,28 @@ class AudioPlayerWindow(QMainWindow):
         plot_layout.setContentsMargins(6, 6, 0, 6)
         plot_layout.addWidget(self._vispy_canvas.native)
 
-        self._splitter = QSplitter(Qt.Orientation.Horizontal)
-        self._splitter.addWidget(plot_host)
-
-        self._channel_checks: dict[str, QCheckBox] = {}
+        self._channel_radios: dict[str, QRadioButton] = {}
+        self._channel_button_group: QButtonGroup | None = None
         side_panel = self._build_controls()
-        self._splitter.addWidget(side_panel)
+        side_panel.setMinimumWidth(240)
+
+        side_scroll = QScrollArea()
+        side_scroll.setWidgetResizable(True)
+        side_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff,
+        )
+        side_scroll.setMinimumWidth(240)
+        side_scroll.setSizePolicy(
+            QSizePolicy.Policy.Preferred,
+            QSizePolicy.Policy.Expanding,
+        )
+        side_scroll.setWidget(side_panel)
+
+        self._splitter = QSplitter(Qt.Orientation.Horizontal)
+        self._splitter.setChildrenCollapsible(False)
+        self._splitter.setHandleWidth(6)
+        self._splitter.addWidget(plot_host)
+        self._splitter.addWidget(side_scroll)
         self._splitter.setStretchFactor(0, 1)
         self._splitter.setStretchFactor(1, 0)
         self._splitter.setSizes([1100, 300])
@@ -285,14 +305,16 @@ class AudioPlayerWindow(QMainWindow):
         metric_id = item.data(256)
         return str(metric_id) if metric_id is not None else None
 
-    def _rebuild_channel_checks(self, metric_id: str | None = None) -> None:
+    def _rebuild_channel_radios(self, metric_id: str | None = None) -> None:
         if self._channel_layout is None or self._channel_group is None:
             return
         while self._channel_layout.count():
             child = self._channel_layout.takeAt(0)
             if child.widget() is not None:
                 child.widget().deleteLater()
-        self._channel_checks.clear()
+        self._channel_radios.clear()
+        self._channel_button_group = QButtonGroup(self)
+        self._channel_button_group.setExclusive(True)
 
         metric_id = metric_id or self._current_metric_id()
         metric = METRIC_BY_ID.get(metric_id) if metric_id else None
@@ -300,16 +322,48 @@ class AudioPlayerWindow(QMainWindow):
             self._channel_group.setEnabled(False)
             return
         self._channel_group.setEnabled(True)
-        self._channel_group.setTitle(f"Channels — {metric.label}")
+        self._channel_group.setTitle(f"Channel — {metric.label}")
 
         for channel in metric.channels:
-            box = QCheckBox(channel.label)
+            radio = QRadioButton(channel.label)
             available = bool(self._channel_availability.get(channel.id, False))
-            box.setEnabled(available)
-            box.setChecked(available)
-            box.toggled.connect(self._schedule_refresh)
-            self._channel_layout.addWidget(box)
-            self._channel_checks[channel.id] = box
+            radio.setEnabled(available)
+            radio.toggled.connect(self._on_channel_radio_toggled)
+            self._channel_button_group.addButton(radio)
+            self._channel_layout.addWidget(radio)
+            self._channel_radios[channel.id] = radio
+
+    def _on_channel_radio_toggled(self, checked: bool) -> None:
+        if not checked or self._updating:
+            return
+        self._selected_index = 0
+        self._schedule_refresh()
+
+    def _selected_channel_id(self) -> str | None:
+        for channel_id, radio in self._channel_radios.items():
+            if radio.isChecked():
+                return channel_id
+        return None
+
+    def _pick_channel_id(
+        self,
+        preferred: Sequence[str],
+    ) -> str | None:
+        for channel_id in preferred:
+            radio = self._channel_radios.get(channel_id)
+            if radio is not None and radio.isEnabled():
+                return channel_id
+        for channel_id, radio in self._channel_radios.items():
+            if radio.isEnabled():
+                return channel_id
+        return None
+
+    def _select_channel_radio(self, channel_id: str | None) -> None:
+        if channel_id is None:
+            return
+        radio = self._channel_radios.get(channel_id)
+        if radio is not None and radio.isEnabled():
+            radio.setChecked(True)
 
     def _sync_metric_list(self) -> None:
         if self._metric_list is None:
@@ -357,11 +411,8 @@ class AudioPlayerWindow(QMainWindow):
 
     def _read_config(self) -> AudioPlayerConfig:
         metric_id = self._current_metric_id() or FFT_METRICS[0].id
-        channels = tuple(
-            channel_id
-            for channel_id, box in self._channel_checks.items()
-            if box.isChecked()
-        )
+        selected = self._selected_channel_id()
+        channels = (selected,) if selected is not None else ()
         return AudioPlayerConfig(
             metric_id=metric_id,
             channels=channels,
@@ -399,16 +450,16 @@ class AudioPlayerWindow(QMainWindow):
             self._channel_availability = probe_channel_availability(
                 self._session_data, config.metric_id,
             )
-            self._rebuild_channel_checks(config.metric_id)
-            for channel_id, box in self._channel_checks.items():
+            self._rebuild_channel_radios(config.metric_id)
+            for channel_id, radio in self._channel_radios.items():
                 available = bool(self._channel_availability.get(channel_id, False))
                 if not available and self._session_data:
                     available = any(
                         len(data.get(channel_id, ())) > 0
                         for data in self._session_data.values()
                     )
-                    box.setEnabled(bool(available))
-                box.setChecked(available and channel_id in config.channels)
+                    radio.setEnabled(bool(available))
+            self._select_channel_radio(self._pick_channel_id(config.channels))
             if self._filter_panel is not None:
                 self._filter_panel.set_domain(config.domain_filter)
                 self._filter_panel.set_beam_state(config.beam_state_filter)
@@ -587,11 +638,13 @@ class AudioPlayerWindow(QMainWindow):
         metric = METRIC_BY_ID[metric_id]
         self._updating = True
         try:
-            self._rebuild_channel_checks()
-            for channel in metric.channels:
-                box = self._channel_checks.get(channel.id)
-                if box is not None and box.isEnabled():
-                    box.setChecked(channel.id in metric.default_channel_ids)
+            self._rebuild_channel_radios()
+            preferred = tuple(
+                channel.id
+                for channel in metric.channels
+                if channel.id in metric.default_channel_ids
+            )
+            self._select_channel_radio(self._pick_channel_id(preferred))
             self._update_beam_subtract_box()
         finally:
             self._updating = False
@@ -613,13 +666,13 @@ class AudioPlayerWindow(QMainWindow):
         if not config.channels or not session:
             self._playback_channels = []
             self._channel_map = {}
-            self._scene.show_status("No channels selected")
+            self._scene.show_status("No channel selected")
             if self._status_label is not None:
-                self._status_label.setText("Select at least one available channel")
+                self._status_label.setText("Select an available channel")
             return
 
         if self._status_label is not None:
-            self._status_label.setText("Preparing waveforms…")
+            self._status_label.setText("Preparing waveform…")
 
         cache = self._waveform_cache
 
@@ -659,21 +712,27 @@ class AudioPlayerWindow(QMainWindow):
         self._channel_map = {ch.label: ch.signal for ch in channels}
 
         if not channels:
-            self._scene.show_status("No channels selected")
+            self._scene.show_status("No channel selected")
             if self._status_label is not None:
-                self._status_label.setText("Select at least one available channel")
+                self._status_label.setText("Select an available channel")
             return
 
-        if self._selected_index >= len(channels):
-            self._selected_index = 0
+        self._selected_index = 0
         duration = max(len(ch.signal) for ch in channels) / FS_HZ
         self._cursor_pos = min(self._cursor_pos, duration)
 
-        self._scene.set_render_channels(
-            channels,
-            selected_index=self._selected_index,
-            cursor_time=self._cursor_pos,
-        )
+        try:
+            self._scene.set_render_channels(
+                channels,
+                selected_index=self._selected_index,
+                cursor_time=self._cursor_pos,
+            )
+        except Exception:
+            _log.exception("Audio Explorer waveform display failed")
+            self._scene.show_status("Waveform display failed — see log for details")
+            if self._status_label is not None:
+                self._status_label.setText("Display failed")
+            return
         self._update_time_label()
         if self._status_label is not None:
             self._status_label.setText(
