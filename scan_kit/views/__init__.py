@@ -4,7 +4,7 @@ Launcher metadata avoids importing view modules (heavy matplotlib/pandas stack)
 until a view is actually run. Use :data:`VIEW_GROUPS` / :data:`VIEWS` for
 (display name, module name, description) tuples.
 
-Optional **IC Audio Export** is detected via :func:`importlib.util.find_spec`
+Optional **Audio Explorer** is detected via :func:`importlib.util.find_spec`
 without importing :mod:`sounddevice`.
 """
 
@@ -23,7 +23,7 @@ def view_description(entry: ViewEntry) -> str:
     return entry[2]
 
 
-_HAS_AUDIO = importlib.util.find_spec("scan_kit.views.ic_audio_export") is not None
+_HAS_AUDIO = importlib.util.find_spec("sounddevice") is not None
 
 _UNIFIED_VIEWS: list[ViewEntry] = [
     (
@@ -39,15 +39,26 @@ _UNIFIED_VIEWS: list[ViewEntry] = [
         "confidence correlations, and Gaussian filter coverage.",
     ),
     (
-        "FFT Explorer",
-        "ic_fft_analysis",
-        "Frequency-domain FFT line spectra for selectable timeslice IC currents.",
-    ),
-    (
         "Timeslice Replay",
         "timeslice_replay",
         "Interactive timeslice viewer with unified signal sources (IC current, dDose/dt, sigma, position, and more).",
     ),
+    (
+        "FFT Explorer",
+        "ic_fft_analysis",
+        "Frequency-domain FFT line spectra for selectable timeslice IC currents.",
+    ),
+]
+if _HAS_AUDIO:
+    _UNIFIED_VIEWS.append(
+        (
+            "Audio Explorer",
+            "ic_audio_player",
+            "Listen to selectable timeslice signals and export WAV audio files (visPy).",
+        ),
+    )
+_UNIFIED_VIEWS.extend(
+    [
     (
         "IC Beam Trajectory (3D)",
         "trajectory",
@@ -59,7 +70,8 @@ _UNIFIED_VIEWS: list[ViewEntry] = [
         "session_log_compare",
         "Session log layer timings, errors, and side-by-side event comparison.",
     ),
-]
+    ]
+)
 
 _SPECIALIZED_VIEWS: list[ViewEntry] = [
     (
@@ -94,14 +106,6 @@ _SPECIALIZED_VIEWS: list[ViewEntry] = [
         "G3 beam-off peak current amplitude distributions for IC1/IC2 X and Y.",
     ),
 ]
-if _HAS_AUDIO:
-    _SPECIALIZED_VIEWS.append(
-        (
-            "IC Audio Export (WAV)",
-            "ic_audio_export",
-            "Listen to IC current waveforms and export them as WAV audio files.",
-        ),
-    )
 
 VIEW_GROUPS: list[tuple[str, list[ViewEntry]]] = [
     ("Unified Views", _UNIFIED_VIEWS),
@@ -111,4 +115,4 @@ VIEW_GROUPS: list[tuple[str, list[ViewEntry]]] = [
 VIEWS: list[ViewEntry] = [entry for _title, entries in VIEW_GROUPS for entry in entries]
 
 # Tkinter views cannot share a process with the Qt warm-worker (matplotlib backend clash).
-TK_ONLY_VIEW_MODULES: frozenset[str] = frozenset({"ic_audio_export"})
+TK_ONLY_VIEW_MODULES: frozenset[str] = frozenset()
