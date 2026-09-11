@@ -22,13 +22,10 @@ from PySide6.QtWidgets import (
     QLabel,
     QListWidget,
     QListWidgetItem,
-    QMainWindow,
     QPushButton,
     QRadioButton,
-    QScrollArea,
     QSizePolicy,
     QSlider,
-    QSplitter,
     QStyle,
     QVBoxLayout,
     QWidget,
@@ -46,6 +43,7 @@ from .audio_player_data import (
     WaveformRenderChannel,
     format_play_time,
     live_spectrum,
+    spectrum_peak_freqs,
     prepare_waveform_render,
     session_has_ic3,
     write_wav,
@@ -66,6 +64,7 @@ from .fft_data import (
     probe_fft_metric_availability_headers,
 )
 from .plot_view_shell import (
+    VispyViewWindow,
     make_presets_menu_button,
     make_side_panel_column,
     run_view_window,
@@ -103,7 +102,7 @@ _AUDIO_PRESETS: tuple[tuple[str, str, AudioPlayerConfig], ...] = (
 _AUDIO_PRESET_BY_ID = {preset_id: config for preset_id, _label, config in _AUDIO_PRESETS}
 
 
-class AudioPlayerWindow(QMainWindow):
+class AudioPlayerWindow(VispyViewWindow):
     """Interactive IC timeslice audio player with FFT-style signal selection."""
 
     def __init__(
@@ -115,9 +114,12 @@ class AudioPlayerWindow(QMainWindow):
         initial_preset: str | None = None,
         parent: QWidget | None = None,
     ) -> None:
-        super().__init__(parent)
-        self.setWindowTitle("Audio Explorer")
-        self.resize(1400, 900)
+        super().__init__(
+            title="Audio Explorer",
+            side_panel_min_width=240,
+            side_panel_default_width=300,
+            parent=parent,
+        )
 
         self._session_ids = list(session_ids)
         self._base_dir = base_dir
@@ -141,6 +143,8 @@ class AudioPlayerWindow(QMainWindow):
         self._refresh_generation = 0
         self._updating = False
         self._fft_window_combo: QComboBox | None = None
+        self._beam_subtract_box: QCheckBox | None = None
+        self._ac_couple_box: QCheckBox | None = None
         self._play_pause_btn: QPushButton | None = None
         self._rewind_btn: QPushButton | None = None
         self._play_icon = None
@@ -149,68 +153,29 @@ class AudioPlayerWindow(QMainWindow):
         self._time_label: QLabel | None = None
         self._duration_label: QLabel | None = None
         self._status_label: QLabel | None = None
+        self._volume_slider: QSlider | None = None
+        self._volume_icon: QLabel | None = None
+        self._volume = 1.0
+        self._play_buffer: np.ndarray | None = None
+        self._closed = False
 
-        from vispy import scene
-        from vispy.app import use_app
-
-        use_app("pyside6")
-        self._vispy_canvas = scene.SceneCanvas(
-            keys=None,
-            bgcolor="#1a1a1a",
-            size=(1200, 620),
-            show=False,
+        self._vispy_canvas = self.add_vispy_canvas(
+            size=(1200, 620), stretch=3, block_wheel=True,
         )
         self._scene = AudioWaveformScene(self._vispy_canvas)
-        self._spectrum_canvas = scene.SceneCanvas(
-            keys=None,
-            bgcolor="#1a1a1a",
+        self._spectrum_canvas = self.add_vispy_canvas(
             size=(1200, 180),
-            show=False,
+            stretch=1,
+            min_height=180,
+            max_height=280,
+            block_wheel=True,
         )
         self._spectrum = AudioSpectrumScene(self._spectrum_canvas)
 
-        plot_host = QWidget()
-        plot_layout = QVBoxLayout(plot_host)
-        plot_layout.setContentsMargins(6, 6, 0, 0)
-        plot_layout.setSpacing(4)
-        plot_layout.addWidget(self._vispy_canvas.native, 3)
-        plot_layout.addWidget(self._spectrum_canvas.native, 1)
-        self._spectrum_canvas.native.setMinimumHeight(180)
-        self._spectrum_canvas.native.setMaximumHeight(280)
-
         self._channel_radios: dict[str, QRadioButton] = {}
         self._channel_button_group: QButtonGroup | None = None
-        side_panel = self._build_controls()
-        side_panel.setMinimumWidth(240)
-
-        side_scroll = QScrollArea()
-        side_scroll.setWidgetResizable(True)
-        side_scroll.setHorizontalScrollBarPolicy(
-            Qt.ScrollBarPolicy.ScrollBarAlwaysOff,
-        )
-        side_scroll.setMinimumWidth(240)
-        side_scroll.setSizePolicy(
-            QSizePolicy.Policy.Preferred,
-            QSizePolicy.Policy.Expanding,
-        )
-        side_scroll.setWidget(side_panel)
-
-        self._splitter = QSplitter(Qt.Orientation.Horizontal)
-        self._splitter.setChildrenCollapsible(False)
-        self._splitter.setHandleWidth(6)
-        self._splitter.addWidget(plot_host)
-        self._splitter.addWidget(side_scroll)
-        self._splitter.setStretchFactor(0, 1)
-        self._splitter.setStretchFactor(1, 0)
-        self._splitter.setSizes([1100, 300])
-
-        root = QWidget()
-        root_layout = QVBoxLayout(root)
-        root_layout.setContentsMargins(0, 0, 0, 0)
-        root_layout.setSpacing(0)
-        root_layout.addWidget(self._splitter, 1)
-        root_layout.addWidget(self._build_transport())
-        self.setCentralWidget(root)
+        self.set_side_panel(self._build_controls())
+        self.set_footer(self._build_transport())
         self._build_menu_bar()
 
         self._refresh_timer = QTimer(self)
@@ -234,21 +199,20 @@ class AudioPlayerWindow(QMainWindow):
         self._vispy_canvas.events.mouse_press.connect(self._on_mouse_press)
         self._vispy_canvas.events.mouse_move.connect(self._on_mouse_move)
         self._vispy_canvas.events.mouse_release.connect(self._on_mouse_release)
-        self._vispy_canvas.events.mouse_wheel.connect(self._block_vispy_navigation)
-        self._spectrum_canvas.events.mouse_wheel.connect(self._block_vispy_navigation)
         native = self._vispy_canvas.native
         native.setMouseTracking(True)
         native.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
 
-        play_shortcut = QShortcut(QKeySequence(Qt.Key.Key_Space), self)
-        play_shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
-        play_shortcut.setAutoRepeat(False)
-        play_shortcut.activated.connect(self._toggle_play_pause)
+        self._play_shortcut = QShortcut(QKeySequence(Qt.Key.Key_Space), self)
+        self._play_shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
+        self._play_shortcut.setAutoRepeat(False)
+        self._play_shortcut.activated.connect(self._toggle_play_pause)
 
         self._scene.show_status("Loading timeslice data…")
         self._start_initial_load()
 
     def closeEvent(self, event) -> None:
+        self._closed = True
         self._stop_all()
         super().closeEvent(event)
 
@@ -273,7 +237,22 @@ class AudioPlayerWindow(QMainWindow):
                 self, QStyle.StandardPixmap.SP_MediaSkipBackward,
             )
         )
+        self._set_volume_icon()
         self._sync_transport()
+
+    def _set_volume_icon(self) -> None:
+        if self._volume_icon is None:
+            return
+        from ..common.qt_theme import tinted_standard_icon
+
+        vol = (
+            QStyle.StandardPixmap.SP_MediaVolumeMuted
+            if self._volume <= 0.0
+            else QStyle.StandardPixmap.SP_MediaVolume
+        )
+        self._volume_icon.setPixmap(
+            tinted_standard_icon(self, vol).pixmap(18, 18)
+        )
 
     def _clear_waveform_cache(self) -> None:
         self._waveform_cache.clear()
@@ -330,9 +309,16 @@ class AudioPlayerWindow(QMainWindow):
         options_group = QGroupBox("Audio Options")
         options_layout = QVBoxLayout(options_group)
         self._beam_subtract_box = QCheckBox("Beam subtract IC1/IC2")
-        self._beam_subtract_box.setChecked(True)
+        self._beam_subtract_box.setChecked(False)
         self._beam_subtract_box.toggled.connect(self._schedule_refresh)
         options_layout.addWidget(self._beam_subtract_box)
+        self._ac_couple_box = QCheckBox("AC couple")
+        self._ac_couple_box.setChecked(True)
+        self._ac_couple_box.setToolTip(
+            "Remove DC offset so the audible variation uses the full volume range"
+        )
+        self._ac_couple_box.toggled.connect(self._schedule_refresh)
+        options_layout.addWidget(self._ac_couple_box)
         fft_row = QHBoxLayout()
         fft_row.addWidget(QLabel("FFT window"))
         self._fft_window_combo = QComboBox()
@@ -384,7 +370,6 @@ class AudioPlayerWindow(QMainWindow):
         self._rewind_btn.setFixedSize(36, 28)
         self._rewind_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self._rewind_btn.clicked.connect(self._stop_reset)
-        self._refresh_transport_icons()
 
         self._time_label = QLabel(format_play_time(0.0))
         self._time_label.setMinimumWidth(52)
@@ -393,23 +378,44 @@ class AudioPlayerWindow(QMainWindow):
         self._seek_slider.setRange(0, 10000)
         self._seek_slider.setValue(0)
         self._seek_slider.setToolTip("Seek")
+        self._seek_slider.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed,
+        )
         self._slider_dragging = False
         self._seek_slider.sliderPressed.connect(self._on_slider_pressed)
-        self._seek_slider.sliderMoved.connect(self._on_slider_moved)
+        self._seek_slider.valueChanged.connect(self._on_slider_moved)
         self._seek_slider.sliderReleased.connect(self._on_slider_released)
 
         self._duration_label = QLabel(format_play_time(0.0))
         self._duration_label.setMinimumWidth(52)
 
         self._status_label = QLabel("Click waveform to seek")
-        self._status_label.setMinimumWidth(180)
+        self._status_label.setSizePolicy(
+            QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed,
+        )
+
+        self._volume_icon = QLabel()
+        self._volume_icon.setFixedSize(18, 18)
+        self._volume_icon.setToolTip("Volume")
+
+        self._volume_slider = QSlider(Qt.Orientation.Horizontal)
+        self._volume_slider.setRange(0, 100)
+        self._volume_slider.setValue(100)
+        self._volume_slider.setFixedWidth(100)
+        self._volume_slider.setToolTip("Volume")
+        self._volume_slider.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._volume_slider.valueChanged.connect(self._on_volume_changed)
+        self._volume_slider.sliderReleased.connect(self._on_volume_released)
 
         layout.addWidget(self._play_pause_btn)
         layout.addWidget(self._rewind_btn)
         layout.addWidget(self._time_label)
         layout.addWidget(self._seek_slider, 1)
         layout.addWidget(self._duration_label)
-        layout.addWidget(self._status_label, 1)
+        layout.addWidget(self._status_label)
+        layout.addWidget(self._volume_icon)
+        layout.addWidget(self._volume_slider)
+        self._refresh_transport_icons()
         return bar
 
     def _current_session_id(self) -> str | None:
@@ -528,8 +534,6 @@ class AudioPlayerWindow(QMainWindow):
             and session_has_ic3(session)
         )
         self._beam_subtract_box.setEnabled(enabled)
-        if not enabled:
-            self._beam_subtract_box.setChecked(False)
 
     def _read_config(self) -> AudioPlayerConfig:
         metric_id = self._current_metric_id() or FFT_METRICS[0].id
@@ -549,10 +553,15 @@ class AudioPlayerWindow(QMainWindow):
                 else FILTER_BEAM_ON
             ) or FILTER_BEAM_ON,
             annotate_peaks=False,
-            beam_subtract=(
-                self._beam_subtract_box.isChecked()
-                if self._beam_subtract_box is not None
-                else False
+            beam_subtract=bool(
+                self._beam_subtract_box is not None
+                and self._beam_subtract_box.isEnabled()
+                and self._beam_subtract_box.isChecked()
+            ),
+            ac_couple=(
+                self._ac_couple_box.isChecked()
+                if self._ac_couple_box is not None
+                else True
             ),
         )
 
@@ -587,6 +596,8 @@ class AudioPlayerWindow(QMainWindow):
                 self._filter_panel.set_beam_state(config.beam_state_filter)
             if self._beam_subtract_box is not None:
                 self._beam_subtract_box.setChecked(config.beam_subtract)
+            if self._ac_couple_box is not None:
+                self._ac_couple_box.setChecked(config.ac_couple)
             self._update_beam_subtract_box()
         finally:
             self._updating = False
@@ -642,7 +653,9 @@ class AudioPlayerWindow(QMainWindow):
         self._load_task.schedule(loader)
 
     @Slot(int, object)
-    def _on_load_finished(self, _task_generation: int, result: object) -> None:
+    def _on_load_finished(self, task_generation: int, result: object) -> None:
+        if self._closed or task_generation != self._load_task.generation:
+            return
         if not isinstance(result, tuple) or len(result) != 2:
             self._scene.show_status("Failed to load timeslice data")
             _log.error("Audio player load returned invalid result: %r", result)
@@ -742,7 +755,9 @@ class AudioPlayerWindow(QMainWindow):
         self._metric_load_task.schedule(loader)
 
     @Slot(int, object)
-    def _on_metric_channels_loaded(self, _task_generation: int, result: object) -> None:
+    def _on_metric_channels_loaded(self, task_generation: int, result: object) -> None:
+        if self._closed or task_generation != self._metric_load_task.generation:
+            return
         if not isinstance(result, tuple) or len(result) != 2:
             return
         metric_id, session_data = result
@@ -819,6 +834,13 @@ class AudioPlayerWindow(QMainWindow):
 
     @Slot(int, object)
     def _on_render_finished(self, _task_generation: int, result: object) -> None:
+        if self._closed:
+            return
+        if result is None:
+            self._scene.show_status("Waveform render failed — see log for details")
+            if self._status_label is not None:
+                self._status_label.setText("Render failed")
+            return
         if not isinstance(result, tuple) or len(result) != 3:
             return
         gen, channels, snapshot = result
@@ -829,6 +851,11 @@ class AudioPlayerWindow(QMainWindow):
             if self._status_label is not None:
                 self._status_label.setText("Render failed")
             return
+
+        resume_playback = self._playing_label is not None
+        if resume_playback:
+            self._stop_all(silent=True)
+
         self._waveform_cache.update(snapshot)
 
         self._playback_channels = channels
@@ -842,7 +869,6 @@ class AudioPlayerWindow(QMainWindow):
                 self._status_label.setText("Select an available channel")
             return
 
-        resume_playback = self._playing_label is not None
         self._selected_index = 0
         duration = max(len(ch.signal) for ch in channels) / FS_HZ
         self._cursor_pos = min(self._cursor_pos, duration)
@@ -879,7 +905,11 @@ class AudioPlayerWindow(QMainWindow):
         if self._fft_window_combo is None:
             return DEFAULT_LIVE_FFT_WINDOW_MS
         data = self._fft_window_combo.currentData()
-        return int(data) if data is not None else DEFAULT_LIVE_FFT_WINDOW_MS
+        try:
+            value = int(data)
+        except (TypeError, ValueError):
+            return DEFAULT_LIVE_FFT_WINDOW_MS
+        return value if value in LIVE_FFT_WINDOW_MS else DEFAULT_LIVE_FFT_WINDOW_MS
 
     def _selected_signal(self) -> np.ndarray | None:
         label = self._selected_label()
@@ -890,14 +920,15 @@ class AudioPlayerWindow(QMainWindow):
     def _update_live_spectrum(self, *_unused) -> None:
         sig = self._selected_signal()
         if sig is None or len(sig) == 0:
-            empty_f, empty_db = live_spectrum(np.array([]), 0.0, self._fft_window_ms())
-            self._spectrum.set_spectrum(empty_f, empty_db)
+            self._spectrum.set_spectrum(np.zeros(0), np.zeros(0), peaks=np.zeros(0))
             return
         color = "#c9d1d9"
         if self._playback_channels:
             color = self._playback_channels[0].color
         freqs, db = live_spectrum(sig, self._cursor_pos, self._fft_window_ms())
-        self._spectrum.set_spectrum(freqs, db, color=color)
+        self._spectrum.set_spectrum(
+            freqs, db, color=color, peaks=spectrum_peak_freqs(freqs, db),
+        )
 
     def _update_time_label(self) -> None:
         duration = self._scene.duration
@@ -905,15 +936,14 @@ class AudioPlayerWindow(QMainWindow):
             self._time_label.setText(format_play_time(self._cursor_pos))
         if self._duration_label is not None:
             self._duration_label.setText(format_play_time(duration))
-        if (
-            self._seek_slider is not None
-            and not self._slider_dragging
-            and duration > 0.0
-        ):
+        if self._seek_slider is not None and not self._slider_dragging:
             self._seek_slider.blockSignals(True)
-            self._seek_slider.setValue(
-                int(round(10000.0 * self._cursor_pos / duration))
-            )
+            if duration > 0.0:
+                self._seek_slider.setValue(
+                    int(round(10000.0 * self._cursor_pos / duration))
+                )
+            else:
+                self._seek_slider.setValue(0)
             self._seek_slider.blockSignals(False)
 
     def _sync_transport(self) -> None:
@@ -938,6 +968,20 @@ class AudioPlayerWindow(QMainWindow):
             return 0.0
         return duration * max(0, min(int(value), 10000)) / 10000.0
 
+    def _apply_volume(self, signal: np.ndarray) -> np.ndarray:
+        gain = max(0.0, min(float(self._volume), 1.0))
+        if gain >= 1.0 - 1e-9:
+            return signal
+        return np.clip(signal * gain, -1.0, 1.0).astype(np.float32, copy=False)
+
+    def _on_volume_changed(self, value: int) -> None:
+        self._volume = max(0, min(int(value), 100)) / 100.0
+        self._set_volume_icon()
+
+    def _on_volume_released(self) -> None:
+        if self._playing_label is not None:
+            self._play_selected()
+
     def _on_slider_pressed(self) -> None:
         self._slider_dragging = True
         self._was_playing = self._playing_label
@@ -946,6 +990,8 @@ class AudioPlayerWindow(QMainWindow):
 
     def _on_slider_moved(self, value: int) -> None:
         self._set_cursor(self._time_from_slider(value))
+        if self._playing_label is not None and not self._slider_dragging:
+            self._play_selected()
 
     def _on_slider_released(self) -> None:
         self._slider_dragging = False
@@ -954,9 +1000,6 @@ class AudioPlayerWindow(QMainWindow):
         if self._was_playing:
             self._play_selected()
         self._was_playing = None
-
-    def _block_vispy_navigation(self, event) -> None:
-        event.handled = True
 
     def _time_from_mouse(self, event) -> float | None:
         pos = getattr(event, "pos", None)
@@ -1031,18 +1074,30 @@ class AudioPlayerWindow(QMainWindow):
         duration = len(sig) / FS_HZ
         if start_time >= duration - 1e-6:
             start_time = 0.0
-            self._cursor_pos = 0.0
+            self._set_cursor(0.0)
 
-        start_sample = int(start_time * FS_HZ)
+        start_sample = int(round(start_time * FS_HZ))
         start_sample = max(0, min(start_sample, len(sig) - 1))
         remaining = sig[start_sample:]
         if len(remaining) == 0:
             return
+        remaining = self._apply_volume(remaining)
+
+        try:
+            sd.play(remaining, samplerate=int(FS_HZ))
+        except Exception:
+            self._play_buffer = None
+            _log.exception("Audio Explorer playback failed")
+            if self._status_label is not None:
+                self._status_label.setText("Playback failed")
+            self._sync_transport()
+            return
+
+        self._play_buffer = remaining
 
         self._playing_label = label
         self._play_start_time = start_time
         self._play_n_samples = len(remaining)
-        sd.play(remaining, samplerate=int(FS_HZ))
         self._wall_origin = time.monotonic()
         if self._status_label is not None:
             self._status_label.setText(f"Playing {label}")
@@ -1062,16 +1117,20 @@ class AudioPlayerWindow(QMainWindow):
         self._set_cursor(self._play_start_time + elapsed)
 
     def _on_playback_done(self) -> None:
-        self._playing_label = None
-        self._cursor_timer.stop()
-        self._sync_transport()
+        self._stop_all(silent=True)
         if self._status_label is not None:
             self._status_label.setText("Stopped")
 
     def _stop_all(self, *, silent: bool = False) -> None:
         self._playing_label = None
-        self._cursor_timer.stop()
-        sd.stop()
+        timer = getattr(self, "_cursor_timer", None)
+        if timer is not None:
+            timer.stop()
+        try:
+            sd.stop()
+        except Exception:
+            _log.debug("sounddevice stop failed", exc_info=True)
+        self._play_buffer = None
         self._sync_transport()
         if not silent and self._status_label is not None and not self._dragging:
             self._status_label.setText("Stopped")

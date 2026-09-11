@@ -21,7 +21,7 @@ from .timeslice_replay_common import compress_minmax
 
 _ENVELOPE_BINS = 2000
 LIVE_FFT_WINDOW_MS = (50, 100, 250, 500, 1000)
-DEFAULT_LIVE_FFT_WINDOW_MS = 250
+DEFAULT_LIVE_FFT_WINDOW_MS = 1000
 SPECTRUM_DB_FLOOR = -80.0
 SPECTRUM_FMAX_HZ = FS_HZ / 2.0
 
@@ -39,6 +39,7 @@ _BEAM_SUBTRACT_CHANNELS = frozenset({"ic1", "ic2"})
 @dataclass
 class AudioPlayerConfig(FftConfig):
     beam_subtract: bool = False
+    ac_couple: bool = True
 
 
 @dataclass(frozen=True)
@@ -59,7 +60,8 @@ class WaveformRenderChannel(PlaybackChannel):
     y_hi: float
 
 
-CacheKey = tuple[str, str, str, str, str, bool, tuple[str, ...]]
+CacheKey = tuple[str, str, str, str, str, bool, bool, tuple[str, ...]]
+AC_COUPLE_CUTOFF_HZ = 5.0
 
 
 def normalize(signal: np.ndarray) -> np.ndarray:
@@ -69,6 +71,28 @@ def normalize(signal: np.ndarray) -> np.ndarray:
     if peak > 0:
         sig = sig / peak
     return sig.astype(np.float32)
+
+
+def ac_couple(
+    signal: np.ndarray,
+    *,
+    fs: float = FS_HZ,
+    cutoff_hz: float = AC_COUPLE_CUTOFF_HZ,
+) -> np.ndarray:
+    """Remove DC and slow drift so playback uses the audible variation.
+
+    Mean-subtract, then a 1-pole high-pass (the digital version of AC coupling).
+    """
+    x = np.nan_to_num(np.asarray(signal, dtype=np.float64))
+    if x.size == 0:
+        return x
+    x -= np.mean(x)
+    if x.size < 2 or cutoff_hz <= 0.0 or fs <= 0.0:
+        return x
+    rc = float(np.exp(-2.0 * np.pi * float(cutoff_hz) / float(fs)))
+    from scipy.signal import lfilter
+
+    return lfilter([1.0, -1.0], [1.0, -rc], x)
 
 
 def _effective_stft_params(n: int, nperseg: int, noverlap: int) -> tuple[int, int]:
@@ -291,6 +315,7 @@ def processing_cache_key(
         config.domain_filter,
         config.beam_state_filter,
         config.beam_subtract,
+        config.ac_couple,
         _filter_cache_component(config),
     )
 
@@ -390,6 +415,8 @@ def _build_render_channel(
             return None
         processed = raw
 
+    if config.ac_couple:
+        processed = ac_couple(processed)
     signal = normalize(processed)
     envelope_poly, line_pos, y_lo, y_hi = _envelope_from_signal(signal)
     label = _channel_label(channel_id, beam_subtracted=subtract)
@@ -447,10 +474,17 @@ def session_has_ic3(session: dict) -> bool:
 
 
 def format_play_time(seconds: float) -> str:
-    """Format a playback position as ``m:ss.t``."""
-    seconds = max(0.0, float(seconds))
-    minutes, sec = divmod(seconds, 60.0)
-    return f"{int(minutes)}:{sec:04.1f}"
+    """Format a playback position as ``m:ss.t`` (never ``m:60.x``)."""
+    try:
+        seconds = float(seconds)
+    except (TypeError, ValueError):
+        seconds = 0.0
+    if not np.isfinite(seconds) or seconds < 0.0:
+        seconds = 0.0
+    tenths = int(round(seconds * 10.0))
+    minutes, tenths = divmod(tenths, 600)
+    sec, tenth = divmod(tenths, 10)
+    return f"{minutes}:{sec:02d}.{tenth}"
 
 
 def live_spectrum(
@@ -460,26 +494,77 @@ def live_spectrum(
     *,
     fs: float = FS_HZ,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Hann-windowed magnitude spectrum around *time_s*, in dB relative to peak."""
-    nwin = max(16, int(round(float(window_ms) * 0.001 * fs)))
-    freqs = np.fft.rfftfreq(nwin, d=1.0 / fs)
-    sig = np.asarray(signal, dtype=np.float64)
+    """Hann-windowed magnitude spectrum around *time_s*, in dB relative to peak.
+
+    Copies only the windowed slice (zero-padded at the ends), not the full signal.
+    """
+    rate = float(fs) if float(fs) > 0.0 else float(FS_HZ)
+    nwin = max(16, int(round(max(0.0, float(window_ms)) * 0.001 * rate)))
+    freqs = np.fft.rfftfreq(nwin, d=1.0 / rate)
+    sig = np.asarray(signal)
+    n = int(sig.size)
     chunk = np.zeros(nwin, dtype=np.float64)
-    n = len(sig)
     if n > 0:
-        center = int(round(float(time_s) * fs))
+        center = int(round(float(time_s) * rate))
         lo = center - nwin // 2
         src_lo = max(0, lo)
         src_hi = min(n, lo + nwin)
         dst_lo = src_lo - lo
-        if src_hi > src_lo:
-            chunk[dst_lo : dst_lo + (src_hi - src_lo)] = sig[src_lo:src_hi]
+        take = src_hi - src_lo
+        if take > 0 and 0 <= dst_lo < nwin:
+            take = min(take, nwin - dst_lo)
+            piece = np.asarray(sig[src_lo : src_lo + take], dtype=np.float64)
+            np.nan_to_num(piece, copy=False)
+            chunk[dst_lo : dst_lo + take] = piece
     chunk *= np.hanning(nwin)
     mag = np.abs(np.fft.rfft(chunk))
     peak = float(np.max(mag)) if mag.size else 0.0
     floor_lin = 10.0 ** (SPECTRUM_DB_FLOOR / 20.0)
-    if peak <= 1e-20:
+    if not np.isfinite(peak) or peak <= 1e-20:
         db = np.full(mag.shape, SPECTRUM_DB_FLOOR, dtype=np.float64)
     else:
         db = 20.0 * np.log10(np.maximum(mag / peak, floor_lin))
     return freqs, db
+
+
+def spectrum_peak_freqs(
+    freqs: np.ndarray,
+    db: np.ndarray,
+    *,
+    min_db: float = -18.0,
+    max_peaks: int = 6,
+    min_hz: float = 2.0,
+    min_sep_hz: float = 8.0,
+) -> np.ndarray:
+    """Strongest local maxima, skipping DC, for marker lines on the live FFT."""
+    n = min(int(np.asarray(freqs).size), int(np.asarray(db).size))
+    if n < 3:
+        return np.zeros(0, dtype=np.float64)
+    f = np.asarray(freqs[:n], dtype=np.float64)
+    y = np.asarray(db[:n], dtype=np.float64)
+    interior = y[1:-1]
+    is_peak = (
+        (interior >= y[:-2])
+        & (interior >= y[2:])
+        & (interior >= min_db)
+        & (f[1:-1] >= min_hz)
+    )
+    idx = np.nonzero(is_peak)[0] + 1
+    if idx.size == 0:
+        k = int(np.argmax(y))
+        if f[k] >= min_hz and y[k] >= min_db:
+            return f[k : k + 1]
+        return np.zeros(0, dtype=np.float64)
+    order = idx[np.argsort(y[idx])[::-1]]
+    chosen: list[int] = []
+    sep = max(0.0, float(min_sep_hz))
+    for i in order:
+        fi = float(f[i])
+        if any(abs(fi - float(f[j])) < sep for j in chosen):
+            continue
+        chosen.append(int(i))
+        if len(chosen) >= max_peaks:
+            break
+    if not chosen:
+        return np.zeros(0, dtype=np.float64)
+    return np.sort(f[np.asarray(chosen, dtype=np.intp)])

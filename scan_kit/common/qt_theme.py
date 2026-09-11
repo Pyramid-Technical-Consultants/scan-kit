@@ -42,8 +42,10 @@ def persist_ui_theme(theme: str, *, settings: AppSettings | None = None) -> None
     loaded = settings
     if loaded is None:
         loaded = AppSettings.load()
+    changed = loaded.ui_theme != theme
     loaded.ui_theme = theme
-    loaded.save()
+    if changed:
+        loaded.save()
     apply_ui_theme(theme)
 
 
@@ -63,15 +65,18 @@ def add_theme_menu(
     for key, label in UI_THEME_LABELS:
         action = QAction(label, window)
         action.setCheckable(True)
+        action.setData(key)
         action.setChecked(key == current)
         action.setStatusTip(f"Use the {label.lower()} color scheme")
-        action.triggered.connect(
-            lambda _checked=False, theme=key: _choose_theme(
-                theme, settings=settings, on_applied=on_applied,
-            )
-        )
         group.addAction(action)
         menu.addAction(action)
+    # QActionGroup.triggered fires once for the clicked action. Connecting each
+    # QAction.triggered would also run for the action that was unchecked.
+    group.triggered.connect(
+        lambda action: _choose_theme(
+            str(action.data()), settings=settings, on_applied=on_applied,
+        )
+    )
     return group
 
 
@@ -84,12 +89,15 @@ def tinted_standard_icon(
     size = style.pixelMetric(QStyle.PixelMetric.PM_ButtonIconSize, None, widget)
     if size < 8:
         size = 16
-    src = style.standardIcon(pixmap, None, widget).pixmap(QSize(size, size))
+    ratio = max(1.0, float(widget.devicePixelRatioF()))
+    pixel = max(1, int(round(size * ratio)))
+    src = style.standardIcon(pixmap, None, widget).pixmap(QSize(pixel, pixel))
     if src.isNull():
         return style.standardIcon(pixmap, None, widget)
+    src.setDevicePixelRatio(ratio)
     color = widget.palette().color(QPalette.ColorRole.ButtonText)
     tinted = QPixmap(src.size())
-    tinted.setDevicePixelRatio(src.devicePixelRatio())
+    tinted.setDevicePixelRatio(ratio)
     tinted.fill(Qt.GlobalColor.transparent)
     painter = QPainter(tinted)
     painter.drawPixmap(0, 0, src)

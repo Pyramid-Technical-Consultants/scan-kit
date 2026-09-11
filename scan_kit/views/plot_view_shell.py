@@ -1,7 +1,8 @@
-"""Reusable Qt shell for Matplotlib analysis views with optional side controls.
+"""Reusable Qt shells for analysis views with optional side controls.
 
-Other parameterised views should subclass :class:`PlotViewWindow` (or compose
-it) instead of rebuilding canvas / toolbar / lifecycle plumbing.
+Matplotlib views subclass :class:`PlotViewWindow`. visPy views subclass
+:class:`VispyViewWindow` and add canvases with :meth:`VispyViewWindow.add_vispy_canvas`.
+2D visPy drawing primitives live in :mod:`scan_kit.views.vispy_plot`.
 """
 
 from __future__ import annotations
@@ -42,42 +43,33 @@ def new_headless_figure(figsize: tuple[float, float]) -> Figure:
     return fig
 
 
-class PlotViewWindow(QMainWindow):
-    """Matplotlib canvas + toolbar with an optional draggable side panel."""
+class SidePanelWindow(QMainWindow):
+    """Plot host + optional right-hand controls (and optional footer bar)."""
 
     def __init__(
         self,
         *,
         title: str,
-        figsize: tuple[float, float] = (16, 9),
+        plot_host: QWidget,
         side_panel_min_width: int = _DEFAULT_SIDE_MIN,
         side_panel_default_width: int = _DEFAULT_SIDE_WIDTH,
         parent: QWidget | None = None,
+        with_footer: bool = False,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle(title)
         self.resize(1400, 900)
-
         self._side_min_width = side_panel_min_width
         self._side_default_width = side_panel_default_width
+        self._mount_side_shell(plot_host, with_footer=with_footer)
 
-        self.figure = Figure(figsize=figsize, layout="none")
-        self.canvas = FigureCanvasQTAgg(self.figure)
-        self.toolbar = NavigationToolbar2QT(self.canvas, self)
-
-        plot_host = QWidget()
-        plot_layout = QVBoxLayout(plot_host)
-        plot_layout.setContentsMargins(6, 6, 0, 6)
-        plot_layout.setSpacing(2)
-        plot_layout.addWidget(self.toolbar)
-        plot_layout.addWidget(self.canvas, stretch=1)
-
+    def _mount_side_shell(self, plot_host: QWidget, *, with_footer: bool) -> None:
         self._side_scroll = QScrollArea()
         self._side_scroll.setWidgetResizable(True)
         self._side_scroll.setHorizontalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff,
         )
-        self._side_scroll.setMinimumWidth(side_panel_min_width)
+        self._side_scroll.setMinimumWidth(self._side_min_width)
         self._side_scroll.setSizePolicy(
             QSizePolicy.Policy.Preferred,
             QSizePolicy.Policy.Expanding,
@@ -92,7 +84,23 @@ class PlotViewWindow(QMainWindow):
         self._splitter.setStretchFactor(0, 1)
         self._splitter.setStretchFactor(1, 0)
 
-        self.setCentralWidget(self._splitter)
+        if not with_footer:
+            self._footer_host = None
+            self.setCentralWidget(self._splitter)
+            return
+
+        self._footer_host = QWidget()
+        footer_layout = QVBoxLayout(self._footer_host)
+        footer_layout.setContentsMargins(0, 0, 0, 0)
+        footer_layout.setSpacing(0)
+        self._footer_host.hide()
+        root = QWidget()
+        root_layout = QVBoxLayout(root)
+        root_layout.setContentsMargins(0, 0, 0, 0)
+        root_layout.setSpacing(0)
+        root_layout.addWidget(self._splitter, 1)
+        root_layout.addWidget(self._footer_host)
+        self.setCentralWidget(root)
 
     @property
     def side_panel(self) -> QWidget | None:
@@ -119,8 +127,112 @@ class PlotViewWindow(QMainWindow):
         )
         self._splitter.setSizes([max(total - side, 400), side])
 
+    def set_footer(self, widget: QWidget | None) -> None:
+        """Attach or clear a full-width bar under the plot (transport, status)."""
+        if self._footer_host is None:
+            raise RuntimeError("this window was created without a footer slot")
+        layout = self._footer_host.layout()
+        while layout.count():
+            item = layout.takeAt(0)
+            child = item.widget()
+            if child is not None:
+                child.setParent(None)
+        if widget is None:
+            self._footer_host.hide()
+            return
+        layout.addWidget(widget)
+        self._footer_host.show()
+
+
+class PlotViewWindow(SidePanelWindow):
+    """Matplotlib canvas + toolbar with an optional draggable side panel."""
+
+    def __init__(
+        self,
+        *,
+        title: str,
+        figsize: tuple[float, float] = (16, 9),
+        side_panel_min_width: int = _DEFAULT_SIDE_MIN,
+        side_panel_default_width: int = _DEFAULT_SIDE_WIDTH,
+        parent: QWidget | None = None,
+    ) -> None:
+        self.figure = Figure(figsize=figsize, layout="none")
+        self.canvas = FigureCanvasQTAgg(self.figure)
+        # QMainWindow is not ready yet; toolbar parent is set after super().
+        plot_host = QWidget()
+        plot_layout = QVBoxLayout(plot_host)
+        plot_layout.setContentsMargins(6, 6, 0, 6)
+        plot_layout.setSpacing(2)
+        super().__init__(
+            title=title,
+            plot_host=plot_host,
+            side_panel_min_width=side_panel_min_width,
+            side_panel_default_width=side_panel_default_width,
+            parent=parent,
+        )
+        self.toolbar = NavigationToolbar2QT(self.canvas, self)
+        plot_layout.addWidget(self.toolbar)
+        plot_layout.addWidget(self.canvas, stretch=1)
+
     def draw_idle(self) -> None:
         self.canvas.draw_idle()
+
+
+class VispyViewWindow(SidePanelWindow):
+    """visPy canvas host with the same side-panel splitter as PlotViewWindow.
+
+    Subclass, then :meth:`add_vispy_canvas` for each plot (stacked 2D panes or
+    a single 3D view). Attach controls with :meth:`set_side_panel`.
+    """
+
+    def __init__(
+        self,
+        *,
+        title: str,
+        side_panel_min_width: int = _DEFAULT_SIDE_MIN,
+        side_panel_default_width: int = _DEFAULT_SIDE_WIDTH,
+        parent: QWidget | None = None,
+    ) -> None:
+        self._plot_host = QWidget()
+        self._plot_layout = QVBoxLayout(self._plot_host)
+        self._plot_layout.setContentsMargins(6, 6, 0, 0)
+        self._plot_layout.setSpacing(4)
+        super().__init__(
+            title=title,
+            plot_host=self._plot_host,
+            side_panel_min_width=side_panel_min_width,
+            side_panel_default_width=side_panel_default_width,
+            parent=parent,
+            with_footer=True,
+        )
+
+    def add_vispy_canvas(
+        self,
+        *,
+        keys=None,
+        size: tuple[int, int] = (1200, 800),
+        bgcolor: str | None = None,
+        stretch: int = 1,
+        min_height: int | None = None,
+        max_height: int | None = None,
+        block_wheel: bool = False,
+    ):
+        from .vispy_plot import BG, block_canvas_navigation, make_scene_canvas
+
+        canvas = make_scene_canvas(
+            keys=keys,
+            bgcolor=BG if bgcolor is None else bgcolor,
+            size=size,
+        )
+        native = canvas.native
+        if min_height is not None:
+            native.setMinimumHeight(min_height)
+        if max_height is not None:
+            native.setMaximumHeight(max_height)
+        self._plot_layout.addWidget(native, stretch)
+        if block_wheel:
+            block_canvas_navigation(canvas)
+        return canvas
 
 
 def make_side_panel_column(*, margins: tuple[int, int, int, int] = (8, 8, 8, 8)) -> tuple[QWidget, QVBoxLayout]:

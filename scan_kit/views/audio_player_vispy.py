@@ -1,4 +1,4 @@
-"""visPy renderer for stacked IC audio waveforms."""
+"""Audio Explorer visPy scenes (waveform stack + live FFT)."""
 
 from __future__ import annotations
 
@@ -12,11 +12,24 @@ from .audio_player_data import (
     SPECTRUM_FMAX_HZ,
     WaveformRenderChannel,
 )
+from .vispy_plot import (
+    ACCENT_RGBA,
+    FG,
+    add_fill_mesh,
+    add_line,
+    add_locked_xy_plot,
+    add_shared_x_axis,
+    add_status_text,
+    envelope_mesh_geometry,
+    hex_to_rgba,
+    lock_panzoom,
+    map_canvas_x_to_data,
+    vertical_segments,
+)
 
-_BG = "#1a1a1a"
-_FG = "#c9d1d9"
-_ACCENT = (0.0, 212 / 255, 170 / 255, 0.9)
 _CURSOR_INACTIVE = (58 / 255, 63 / 255, 71 / 255, 0.5)
+_PEAK_MARK = (0.72, 0.76, 0.80, 0.35)
+_SPECTRUM_Y = (SPECTRUM_DB_FLOOR, 5.0)
 
 
 @dataclass
@@ -60,22 +73,11 @@ class AudioWaveformScene:
         self._duration = 0.0
 
     def show_status(self, message: str) -> None:
-        from vispy import scene
-
         self.clear()
         view = self._grid.add_view(row=0, col=0, row_span=1, col_span=1)
-        _lock_view_camera(view, scene.PanZoomCamera(aspect=None))
+        lock_panzoom(view)
         view.camera.set_range(x=(-1.0, 1.0), y=(-1.0, 1.0))
-        text = scene.Text(
-            message,
-            color=_FG,
-            font_size=14,
-            pos=(0, 0),
-            anchor_x="center",
-            anchor_y="center",
-            parent=view.scene,
-        )
-        self._status_node = text
+        self._status_node = add_status_text(view, message)
         self._canvas.update()
 
     def set_render_channels(
@@ -85,8 +87,6 @@ class AudioWaveformScene:
         selected_index: int = 0,
         cursor_time: float = 0.0,
     ) -> None:
-        from vispy import scene
-
         self.clear()
         if not channels:
             self.show_status("No channels selected")
@@ -97,42 +97,29 @@ class AudioWaveformScene:
         self._duration = max_samples / FS_HZ
 
         for i, channel in enumerate(channels):
-            view = self._grid.add_view(row=i, col=0, row_span=1, col_span=1)
-            camera = scene.PanZoomCamera(aspect=None)
-            _lock_view_camera(view, camera)
-
-            fill_rgba = _hex_to_rgba(channel.color, alpha=0.28)
-            line_rgba = _hex_to_rgba(channel.color, alpha=0.95)
-            mesh_pos, mesh_faces = _mesh_from_envelope_poly(channel.envelope_poly)
-            fill = scene.visuals.Mesh(
-                vertices=mesh_pos,
-                faces=mesh_faces,
-                color=fill_rgba,
-                parent=view.scene,
+            plot = add_locked_xy_plot(
+                self._grid,
+                row=i,
+                x_range=(0.0, self._duration),
+                y_range=(channel.y_lo, channel.y_hi),
             )
-            fill.set_gl_state("translucent", depth_test=False)
-            wave = scene.visuals.Line(
-                pos=channel.line_pos,
-                color=line_rgba,
+            view = plot.view
+            verts, faces = envelope_mesh_geometry(channel.envelope_poly)
+            fill = add_fill_mesh(
+                view.scene, verts, faces, hex_to_rgba(channel.color, alpha=0.28),
+            )
+            wave = add_line(
+                view.scene,
+                channel.line_pos,
+                color=hex_to_rgba(channel.color, alpha=0.95),
                 width=1.2,
-                antialias=True,
-                parent=view.scene,
             )
-
-            cursor = scene.visuals.Line(
-                pos=_cursor_segment(0.0, channel.y_lo, channel.y_hi),
-                color=_ACCENT,
+            cursor = add_line(
+                view.scene,
+                vertical_segments(0.0, channel.y_lo, channel.y_hi),
+                color=ACCENT_RGBA,
                 width=2.0,
-                antialias=True,
-                parent=view.scene,
-            )
-
-            if i == len(channels) - 1:
-                _add_time_axis(view, self._duration, channel.y_lo)
-
-            view.camera.set_range(
-                x=(0.0, self._duration),
-                y=(channel.y_lo, channel.y_hi),
+                order=1,
             )
             self._rows.append(
                 _WaveformRow(
@@ -145,6 +132,9 @@ class AudioWaveformScene:
                 )
             )
 
+        add_shared_x_axis(
+            self._grid, row=len(channels), view=self._rows[-1].viewbox,
+        )
         self.set_cursor(cursor_time)
         self._canvas.update()
 
@@ -159,21 +149,25 @@ class AudioWaveformScene:
             return
         time_s = max(0.0, min(float(time_s), self._duration))
         for row in self._rows:
-            row.cursor.set_data(pos=_cursor_segment(time_s, row.y_lo, row.y_hi))
+            row.cursor.set_data(
+                pos=vertical_segments(time_s, row.y_lo, row.y_hi),
+            )
         self._canvas.update()
 
     def time_at_canvas_pos(self, pos: tuple[float, float]) -> float | None:
-        """Map canvas pixel x to time. Camera is locked to [0, duration]."""
         if not self._rows or self._duration <= 0.0:
             return None
-        width = float(getattr(self._canvas, "size", (0, 0))[0])
-        if width <= 0.0:
-            return None
-        return max(0.0, min(self._duration * float(pos[0]) / width, self._duration))
+        return map_canvas_x_to_data(
+            self._rows[0].viewbox,
+            pos[0],
+            0.0,
+            self._duration,
+            canvas_width=float(getattr(self._canvas, "size", (0, 0))[0]),
+        )
 
     def _update_cursor_colors(self) -> None:
         for i, row in enumerate(self._rows):
-            color = _ACCENT if i == self._selected_index else _CURSOR_INACTIVE
+            color = ACCENT_RGBA if i == self._selected_index else _CURSOR_INACTIVE
             width = 2.0 if i == self._selected_index else 1.0
             row.cursor.set_data(color=color, width=width)
 
@@ -185,38 +179,34 @@ class AudioSpectrumScene:
         self._canvas = canvas
         self._view = None
         self._line = None
+        self._peak_marks = None
         self._ensure_view()
 
     def _ensure_view(self) -> None:
-        from vispy import scene
-
         if self._view is not None:
             return
-        grid = self._canvas.central_widget.add_grid(spacing=0, margin=8)
-        view = grid.add_view(row=0, col=0)
-        camera = scene.PanZoomCamera(aspect=None)
-        _lock_view_camera(view, camera)
-        view.camera.set_range(x=(0.0, SPECTRUM_FMAX_HZ), y=(SPECTRUM_DB_FLOOR, 5.0))
-        self._line = scene.visuals.Line(
-            pos=np.zeros((2, 2), dtype=np.float32),
-            color=_FG,
-            width=1.4,
-            antialias=True,
-            parent=view.scene,
+        grid = self._canvas.central_widget.add_grid(spacing=0)
+        plot = add_locked_xy_plot(
+            grid,
+            x_range=(0.0, SPECTRUM_FMAX_HZ),
+            y_range=_SPECTRUM_Y,
+            x_axis=True,
+            right_gutter=True,
         )
-        xaxis = scene.AxisWidget(
-            orientation="bottom",
-            axis_color=(0.45, 0.48, 0.52, 1.0),
-            tick_color=(0.45, 0.48, 0.52, 1.0),
-            text_color=_FG,
-            font_size=8,
+        self._line = add_line(
+            plot.view.scene, color=FG, width=1.4, visible=False,
         )
-        xaxis.height_min = 40
-        xaxis.height_max = 48
-        grid.add_widget(xaxis, row=1, col=0)
-        xaxis.link_view(view)
-        self._view = view
-        self._xaxis = xaxis
+        self._peak_marks = add_line(
+            plot.view.scene,
+            color=_PEAK_MARK,
+            width=1.0,
+            connect="segments",
+            order=1,
+            visible=False,
+        )
+        self._view = plot.view
+        self._xaxis = plot.xaxis
+        self._yaxis = plot.yaxis
 
     def set_spectrum(
         self,
@@ -224,79 +214,37 @@ class AudioSpectrumScene:
         db: np.ndarray,
         *,
         color: str = "#c9d1d9",
+        peaks: np.ndarray | None = None,
     ) -> None:
         self._ensure_view()
-        if freqs.size == 0:
-            pos = np.zeros((2, 2), dtype=np.float32)
+        n = min(int(np.asarray(freqs).size), int(np.asarray(db).size))
+        if n == 0:
+            self._line.visible = False
         else:
+            freqs = np.asarray(freqs)[:n]
+            db = np.asarray(db)[:n]
             mask = freqs <= SPECTRUM_FMAX_HZ + 1e-9
             pos = np.column_stack((freqs[mask], db[mask])).astype(np.float32)
             if len(pos) == 0:
-                pos = np.zeros((2, 2), dtype=np.float32)
-        rgba = _hex_to_rgba(color, alpha=0.95)
-        self._line.set_data(pos=pos, color=rgba)
-        self._view.camera.set_range(x=(0.0, SPECTRUM_FMAX_HZ), y=(SPECTRUM_DB_FLOOR, 5.0))
+                self._line.visible = False
+            else:
+                self._line.visible = True
+                self._line.set_data(
+                    pos=pos, color=hex_to_rgba(color, alpha=0.95),
+                )
+        marks = _peak_marker_segments(peaks)
+        self._peak_marks.visible = len(marks) >= 2
+        if self._peak_marks.visible:
+            self._peak_marks.set_data(pos=marks)
         self._canvas.update()
 
 
-def _lock_view_camera(view, camera) -> None:
-    view.bgcolor = _BG
-    camera.interactive = False
-    view.camera = camera
-
-
-def _add_time_axis(view, duration: float, y_lo: float) -> None:
-    from vispy import scene
-
-    scene.Axis(
-        pos=np.array([[0.0, y_lo], [duration, y_lo]], dtype=np.float32),
-        domain=(0.0, duration),
-        tick_direction=(0.0, -1.0),
-        axis_color=(0.45, 0.48, 0.52, 1.0),
-        tick_color=(0.45, 0.48, 0.52, 1.0),
-        text_color=_FG,
-        font_size=8,
-        parent=view.scene,
-    )
-
-
-def _cursor_segment(time_s: float, y_lo: float, y_hi: float) -> np.ndarray:
-    return np.array([[time_s, y_lo], [time_s, y_hi]], dtype=np.float32)
-
-
-def _hex_to_rgba(hex_color: str, *, alpha: float) -> tuple[float, float, float, float]:
-    color = hex_color.lstrip("#")
-    if len(color) != 6:
-        return (0.7, 0.7, 0.7, alpha)
-    r = int(color[0:2], 16) / 255.0
-    g = int(color[2:4], 16) / 255.0
-    b = int(color[4:6], 16) / 255.0
-    return (r, g, b, alpha)
-
-
-def _mesh_from_envelope_poly(poly: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Triangle strip covering the min/max envelope (no concave triangulation)."""
-    if len(poly) < 4:
-        return np.zeros((0, 3), dtype=np.float32), np.zeros((0, 3), dtype=np.uint32)
-    n = len(poly) // 2
-    t = poly[:n, 0]
-    y_max = poly[:n, 1]
-    y_min = poly[n:, 1][::-1]
-    pos = np.zeros((n * 2, 3), dtype=np.float32)
-    pos[0::2, 0] = t
-    pos[0::2, 1] = y_min
-    pos[1::2, 0] = t
-    pos[1::2, 1] = y_max
-    faces = np.empty((2 * max(n - 1, 0), 3), dtype=np.uint32)
-    if n > 1:
-        idx = np.arange(n - 1, dtype=np.uint32)
-        faces[0::2, 0] = idx * 2
-        faces[0::2, 1] = idx * 2 + 1
-        faces[0::2, 2] = idx * 2 + 2
-        faces[1::2, 0] = idx * 2 + 1
-        faces[1::2, 1] = idx * 2 + 3
-        faces[1::2, 2] = idx * 2 + 2
-    return pos, faces
+def _peak_marker_segments(peaks: np.ndarray | None) -> np.ndarray:
+    if peaks is None or len(peaks) == 0:
+        return np.zeros((0, 2), dtype=np.float32)
+    hz = np.asarray(peaks, dtype=np.float32)
+    hz = hz[(hz >= 0.0) & (hz <= SPECTRUM_FMAX_HZ + 1e-9)]
+    return vertical_segments(hz, SPECTRUM_DB_FLOOR, _SPECTRUM_Y[1])
 
 
 def _envelope_polygon(

@@ -12,6 +12,7 @@ import wave
 from scan_kit.common.data_filter import FILTER_BEAM_ON
 from scan_kit.views.audio_player_data import (
     AudioPlayerConfig,
+    ac_couple,
     beam_subtract,
     build_playback_channels,
     extract_audio_signal,
@@ -19,6 +20,8 @@ from scan_kit.views.audio_player_data import (
     live_spectrum,
     normalize,
     prepare_waveform_render,
+    processing_cache_key,
+    spectrum_peak_freqs,
     write_wav,
 )
 from scan_kit.views.fft_catalog import METRIC_IC_CURRENT
@@ -43,7 +46,9 @@ def test_unipolar_pulse_line_tracks_peaks_not_floor() -> None:
     channels = prepare_waveform_render(
         "ddose",
         session,
-        AudioPlayerConfig(metric_id=METRIC_DDOSE, channels=("ic1_ddose",)),
+        AudioPlayerConfig(
+            metric_id=METRIC_DDOSE, channels=("ic1_ddose",), ac_couple=False,
+        ),
         cache={},
     )
     assert len(channels) == 1
@@ -159,6 +164,7 @@ def test_beam_subtract_uses_filtered_ic3() -> None:
         channels=("ic1",),
         beam_subtract=True,
         beam_state_filter=FILTER_BEAM_ON,
+        ac_couple=False,
     )
     channels = build_playback_channels(session, config)
     assert len(channels) == 1
@@ -195,6 +201,7 @@ def test_build_playback_channels_beam_subtract() -> None:
         metric_id=METRIC_IC_CURRENT,
         channels=("ic1", "ic2"),
         beam_subtract=True,
+        ac_couple=False,
     )
     channels = build_playback_channels(session, config)
     labels = [ch.label for ch in channels]
@@ -259,6 +266,10 @@ def test_write_wav_round_trip() -> None:
 def test_format_play_time() -> None:
     assert format_play_time(0.0) == "0:00.0"
     assert format_play_time(65.2) == "1:05.2"
+    assert format_play_time(59.96) == "1:00.0"
+    assert format_play_time(-3.0) == "0:00.0"
+    assert format_play_time(float("nan")) == "0:00.0"
+    assert format_play_time(float("inf")) == "0:00.0"
 
 
 def test_live_spectrum_peaks_at_tone() -> None:
@@ -270,9 +281,109 @@ def test_live_spectrum_peaks_at_tone() -> None:
     assert peak_hz == pytest.approx(100.0, abs=8.0)
     assert float(np.max(db)) == pytest.approx(0.0, abs=1e-6)
     assert float(np.min(db)) >= -80.0 - 1e-6
+    marks = spectrum_peak_freqs(freqs, db)
+    assert marks.size >= 1
+    assert float(marks[0]) == pytest.approx(100.0, abs=8.0)
+
+
+def test_spectrum_peak_freqs_skips_dc_and_noise() -> None:
+    freqs = np.array([0.0, 10.0, 20.0, 30.0, 40.0, 50.0])
+    db = np.array([0.0, -40.0, -8.0, -40.0, -50.0, -50.0])
+    marks = spectrum_peak_freqs(freqs, db, min_db=-12.0)
+    assert marks.tolist() == [20.0]
+
+
+def test_spectrum_peak_freqs_collapses_plateau() -> None:
+    freqs = np.arange(0.0, 50.0, 1.0)
+    db = np.full(freqs.shape, -40.0)
+    db[20:25] = 0.0
+    marks = spectrum_peak_freqs(freqs, db, min_sep_hz=8.0)
+    assert marks.size == 1
+    assert 20.0 <= float(marks[0]) <= 24.0
+
+
+def test_spectrum_peak_freqs_keeps_separated_tones() -> None:
+    freqs = np.arange(0.0, 200.0, 1.0)
+    db = np.full(freqs.shape, -40.0)
+    db[40] = 0.0
+    db[39] = db[41] = -6.0
+    db[120] = -1.0
+    db[119] = db[121] = -8.0
+    marks = spectrum_peak_freqs(freqs, db, min_sep_hz=8.0)
+    assert marks.size == 2
+    assert float(marks[0]) == pytest.approx(40.0)
+    assert float(marks[1]) == pytest.approx(120.0)
+
+
+def test_spectrum_peak_freqs_empty() -> None:
+    assert spectrum_peak_freqs(np.array([]), np.array([])).size == 0
 
 
 def test_live_spectrum_empty_is_floor() -> None:
     freqs, db = live_spectrum(np.array([], dtype=float), 0.0, 250.0, fs=1000.0)
     assert len(freqs) == len(db)
     assert np.all(db == -80.0)
+
+
+def test_live_spectrum_window_length_matches_ms() -> None:
+    freqs, _db = live_spectrum(np.ones(10_000), 2.0, 100.0, fs=1000.0)
+    assert len(freqs) == 51  # rfft of 100 samples
+
+
+def test_live_spectrum_nan_is_finite() -> None:
+    sig = np.ones(1000, dtype=float)
+    sig[400:600] = np.nan
+    freqs, db = live_spectrum(sig, 0.5, 250.0, fs=1000.0)
+    assert np.all(np.isfinite(freqs))
+    assert np.all(np.isfinite(db))
+
+
+def test_live_spectrum_is_cheap_on_long_signal() -> None:
+    import time as time_mod
+
+    fs = 1000.0
+    sig = np.zeros(2_000_000, dtype=np.float32)
+    sig[1_000_000] = 1.0
+    t0 = time_mod.perf_counter()
+    for _ in range(40):
+        live_spectrum(sig, 1000.0, 250.0, fs=fs)
+    elapsed = time_mod.perf_counter() - t0
+    assert elapsed < 0.5
+
+
+def test_processing_cache_key_includes_beam_subtract() -> None:
+    shared = dict(metric_id=METRIC_IC_CURRENT, channels=("ic1",))
+    raw = processing_cache_key("s", AudioPlayerConfig(**shared, beam_subtract=False), "ic1")
+    sub = processing_cache_key("s", AudioPlayerConfig(**shared, beam_subtract=True), "ic1")
+    assert raw != sub
+
+
+def test_processing_cache_key_includes_ac_couple() -> None:
+    shared = dict(metric_id=METRIC_IC_CURRENT, channels=("ic1",))
+    coupled = processing_cache_key("s", AudioPlayerConfig(**shared, ac_couple=True), "ic1")
+    raw = processing_cache_key("s", AudioPlayerConfig(**shared, ac_couple=False), "ic1")
+    assert coupled != raw
+
+
+def test_ac_couple_removes_dc() -> None:
+    fs = 1000.0
+    t = np.arange(4000) / fs
+    x = 4.0 + 0.2 * np.sin(2.0 * np.pi * 40.0 * t)
+    y = ac_couple(x, fs=fs, cutoff_hz=5.0)
+    assert abs(float(np.mean(y))) < 0.05
+    assert float(np.max(np.abs(y))) < 0.5
+
+
+def test_ac_couple_empty() -> None:
+    assert ac_couple(np.array([])).size == 0
+
+
+def test_extract_audio_signal_missing_channel_is_empty() -> None:
+    out = extract_audio_signal(
+        {"ic1": np.array([1.0])},
+        "ic2",
+        domain_filter="all",
+        beam_state_filter=FILTER_BEAM_ON,
+        filter_column_keys=["ic1"],
+    )
+    assert out.size == 0

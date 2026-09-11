@@ -21,7 +21,9 @@ def test_audio_player_window_smoke(qt_wait) -> None:
     assert window._play_pause_btn is not None
     assert window._seek_slider is not None
     assert window._fft_window_combo is not None
-    assert window._fft_window_combo.currentData() == 250
+    assert window._fft_window_combo.currentData() == 1000
     assert window._rewind_btn is not None
     assert "start" in window._rewind_btn.toolTip().lower()
+    assert window._volume_slider is not None
+    assert window._volume_slider.value() == 100
     window.close()
