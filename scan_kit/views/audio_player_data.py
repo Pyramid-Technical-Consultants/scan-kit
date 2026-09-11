@@ -11,12 +11,12 @@ import numpy as np
 
 from ..common.data_filter import (
     FILTER_ALL,
-    FILTER_BEAM_BOTH,
+    FILTER_BEAM_OFF,
     filter_mask_from_columns,
 )
 from ..data.timeline_channels import TIMELINE_CHANNEL_BY_KEY
 from .fft_catalog import CHANNEL_BY_ID, FftConfig, METRIC_IC_CURRENT
-from .fft_data import FS_HZ, extract_fft_traces
+from .fft_data import FS_HZ
 from .timeslice_replay_common import compress_minmax
 
 _ENVELOPE_BINS = 2000
@@ -47,9 +47,10 @@ class PlaybackChannel:
 
 @dataclass(frozen=True)
 class WaveformRenderChannel(PlaybackChannel):
-    """Playback channel with precomputed vispy envelope geometry."""
+    """Playback channel with precomputed vispy envelope and line geometry."""
 
     envelope_poly: np.ndarray
+    line_pos: np.ndarray
     y_lo: float
     y_hi: float
 
@@ -66,17 +67,73 @@ def normalize(signal: np.ndarray) -> np.ndarray:
     return sig.astype(np.float32)
 
 
+def _effective_stft_params(n: int, nperseg: int, noverlap: int) -> tuple[int, int]:
+    nperseg = min(nperseg, max(n, 1))
+    noverlap = min(noverlap, max(nperseg - 1, 0))
+    return nperseg, noverlap
+
+
+def _hann_periodic(nperseg: int) -> np.ndarray:
+    return 0.5 - 0.5 * np.cos(2.0 * np.pi * np.arange(nperseg, dtype=np.float64) / nperseg)
+
+
+def _overlap_add(frames: np.ndarray, hop: int) -> np.ndarray:
+    nframes, nperseg = frames.shape
+    out_len = nperseg + (nframes - 1) * hop
+    if nperseg % hop == 0:
+        nstep = nperseg // hop
+        pad = (-nframes) % nstep
+        if pad:
+            frames = np.vstack((frames, np.zeros((pad, nperseg), dtype=frames.dtype)))
+        nblocks = frames.shape[0] // nstep
+        folded = frames.reshape(nblocks, nstep, nperseg)
+        y = np.zeros(nblocks * nperseg + nperseg, dtype=np.float64)
+        for k in range(nstep):
+            y[k * hop : k * hop + nblocks * nperseg] += folded[:, k, :].reshape(-1)
+        return y[:out_len]
+    y = np.zeros(out_len, dtype=np.float64)
+    idx = np.arange(nperseg) + np.arange(nframes)[:, None] * hop
+    np.add.at(y, idx, frames)
+    return y
+
+
+def _stft_spectrum(x: np.ndarray, nperseg: int, noverlap: int) -> np.ndarray:
+    """One-sided STFT matching ``scipy.signal.stft(..., scaling='spectrum')``."""
+    hop = nperseg - noverlap
+    win = _hann_periodic(nperseg)
+    pad = nperseg // 2
+    x_ext = np.pad(x, pad, mode="constant")
+    nadd = (-(len(x_ext) - nperseg) % hop) % hop
+    if nadd:
+        x_ext = np.pad(x_ext, (0, nadd), mode="constant")
+    frames = np.lib.stride_tricks.sliding_window_view(x_ext, nperseg)[::hop]
+    return np.fft.rfft(frames * win, axis=-1).T / win.sum()
+
+
+def _istft_spectrum(
+    z: np.ndarray, nperseg: int, noverlap: int, nout: int,
+) -> np.ndarray:
+    """Invert :func:`_stft_spectrum` (matches ``scipy.signal.istft``)."""
+    hop = nperseg - noverlap
+    win = _hann_periodic(nperseg)
+    frames = np.fft.irfft(z.T * win.sum(), n=nperseg, axis=-1) * win
+    y = _overlap_add(frames, hop)
+    wnorm = _overlap_add(np.tile(win * win, (frames.shape[0], 1)), hop)
+    nz = wnorm > 1e-10
+    y[nz] /= wnorm[nz]
+    pad = nperseg // 2
+    return y[pad : pad + nout]
+
+
 def _specsub_pass(
     signal: np.ndarray,
-    ref_ac: np.ndarray,
+    zr: np.ndarray,
     nperseg: int,
     noverlap: int,
 ) -> np.ndarray:
-    from scipy.signal import istft, stft
-
     n = len(signal)
-    _, _, zt = stft(signal, fs=FS_HZ, nperseg=nperseg, noverlap=noverlap)
-    _, _, zr = stft(ref_ac, fs=FS_HZ, nperseg=nperseg, noverlap=noverlap)
+    nperseg, noverlap = _effective_stft_params(n, nperseg, noverlap)
+    zt = _stft_spectrum(signal, nperseg, noverlap)
 
     mag_t = np.abs(zt)
     mag_r = np.abs(zr)
@@ -87,8 +144,7 @@ def _specsub_pass(
     beam_estimate = _SPECSUB_ALPHA * alpha_frame * mag_r
     clean_mag = np.maximum(mag_t - beam_estimate, _SPECSUB_BETA * mag_t)
     z_clean = clean_mag * np.exp(1j * np.angle(zt))
-    _, out = istft(z_clean, fs=FS_HZ, nperseg=nperseg, noverlap=noverlap)
-    return out[:n]
+    return _istft_spectrum(z_clean, nperseg, noverlap, n)
 
 
 def beam_subtract(target: np.ndarray, reference: np.ndarray) -> np.ndarray:
@@ -97,13 +153,21 @@ def beam_subtract(target: np.ndarray, reference: np.ndarray) -> np.ndarray:
     r = np.nan_to_num(reference).astype(np.float64)
     n = min(len(t), len(r))
     t, r = t[:n], r[:n]
+    if n < 2:
+        return t
 
     t_mean = np.mean(t)
     cur = t - t_mean
     r_ac = r - np.mean(r)
 
+    ref_spectra: dict[tuple[int, int], np.ndarray] = {}
     for nperseg, noverlap in _SPECSUB_PASSES:
-        cur = _specsub_pass(cur, r_ac, nperseg, noverlap)
+        nperseg, noverlap = _effective_stft_params(n, nperseg, noverlap)
+        zr = ref_spectra.get((nperseg, noverlap))
+        if zr is None:
+            zr = _stft_spectrum(r_ac, nperseg, noverlap)
+            ref_spectra[(nperseg, noverlap)] = zr
+        cur = _specsub_pass(cur, zr, nperseg, noverlap)
 
     return cur + t_mean
 
@@ -149,44 +213,64 @@ def extract_audio_signal(
     """Return a continuous filtered time-domain array suitable for playback."""
     if channel_id not in session:
         return np.array([], dtype=float)
-
-    if beam_state_filter == FILTER_BEAM_BOTH:
-        sig = np.asarray(session[channel_id], dtype=float)
-        domain_mask = filter_mask_from_columns(
-            session,
-            filter_column_keys,
-            domain_filter,
-            FILTER_BEAM_BOTH,
-        )
-        if domain_mask is None:
-            return sig
-        mask = np.asarray(domain_mask, dtype=bool)
-        return sig[mask] if np.any(mask) else np.array([], dtype=float)
-
-    traces = extract_fft_traces(
+    arrays = _mask_session_arrays(
         session,
-        channel_id,
+        (channel_id,),
         domain_filter=domain_filter,
         beam_state_filter=beam_state_filter,
         filter_column_keys=filter_column_keys,
-        beam_off_quiet_threshold=beam_off_quiet_threshold,
+        quiet_threshold=beam_off_quiet_threshold,
     )
-    if not traces:
-        return np.array([], dtype=float)
-    if len(traces) == 1:
-        return traces[0][0]
-    parts = [trace[0] for trace in traces if trace[0].size]
-    if not parts:
-        return np.array([], dtype=float)
-    return np.concatenate(parts)
+    return arrays[0] if arrays else np.array([], dtype=float)
+
+
+def _mask_session_arrays(
+    session: dict,
+    keys: Sequence[str],
+    *,
+    domain_filter: str,
+    beam_state_filter: str,
+    filter_column_keys: Sequence[str],
+    quiet_threshold: float | None = None,
+) -> list[np.ndarray]:
+    """Apply the same sample mask to each *keys* column so they stay aligned."""
+    missing = [key for key in keys if key not in session]
+    if missing:
+        return []
+    first = np.asarray(session[keys[0]], dtype=float)
+    if first.size == 0:
+        return [np.array([], dtype=float) for _ in keys]
+    mask = filter_mask_from_columns(
+        session,
+        filter_column_keys,
+        domain_filter,
+        beam_state_filter,
+    )
+    mask = np.asarray(mask, dtype=bool)
+    if mask.size != first.size:
+        aligned = np.ones(first.size, dtype=bool)
+        n = min(mask.size, first.size)
+        aligned[:n] = mask[:n]
+        mask = aligned
+    if beam_state_filter == FILTER_BEAM_OFF:
+        from .fft_data import _current_quiet_mask
+
+        thresh = 10.0 if quiet_threshold is None else quiet_threshold
+        mask = mask & _current_quiet_mask(first, thresh)
+    out: list[np.ndarray] = []
+    for key in keys:
+        arr = np.asarray(session[key], dtype=float)
+        if arr.size == mask.size:
+            out.append(arr[mask])
+            continue
+        n = min(arr.size, mask.size)
+        out.append(arr[:n][mask[:n]])
+    return out
 
 
 def _filter_cache_component(config: AudioPlayerConfig) -> tuple[str, ...]:
-    """Columns that affect extraction; omit when filters ignore channel selection."""
-    if (
-        config.domain_filter == FILTER_ALL
-        and config.beam_state_filter == FILTER_BEAM_BOTH
-    ):
+    """Columns that affect extraction; omit when domain filter ignores them."""
+    if config.domain_filter == FILTER_ALL:
         return ()
     return tuple(sorted(config.column_keys))
 
@@ -232,9 +316,15 @@ def _envelope_polygon(
     return np.vstack([upper, lower]).astype(np.float32)
 
 
+def _peak_hold_line(t: np.ndarray, y_min: np.ndarray, y_max: np.ndarray) -> np.ndarray:
+    """Polyline through the larger-magnitude envelope edge of each bin."""
+    y = np.where(np.abs(y_max) >= np.abs(y_min), y_max, y_min)
+    return np.column_stack((t, y)).astype(np.float32)
+
+
 def _envelope_from_signal(
     signal: np.ndarray,
-) -> tuple[np.ndarray, float, float]:
+) -> tuple[np.ndarray, np.ndarray, float, float]:
     x_ms, y_min, y_max = compress_minmax(signal, _ENVELOPE_BINS)
     t = x_ms / 1000.0
     y_min, y_max = _sanitize_envelope(y_min, y_max)
@@ -246,7 +336,7 @@ def _envelope_from_signal(
     y_lo = row_min - pad
     y_hi = row_max + pad
     envelope_poly = _envelope_polygon(t, y_min, y_max)
-    return envelope_poly, y_lo, y_hi
+    return envelope_poly, _peak_hold_line(t, y_min, y_max), y_lo, y_hi
 
 
 def _build_render_channel(
@@ -265,32 +355,39 @@ def _build_render_channel(
         and config.metric_id == METRIC_IC_CURRENT
         and has_ic3
     )
-    ic3_raw = np.asarray(session["ic3"], dtype=float) if has_ic3 else None
-
-    raw = extract_audio_signal(
-        session,
-        channel_id,
-        domain_filter=config.domain_filter,
-        beam_state_filter=config.beam_state_filter,
-        filter_column_keys=filter_keys,
-        beam_off_quiet_threshold=metric.beam_off_quiet_threshold,
-    )
-    if raw.size == 0:
-        return None
 
     subtract = (
         beam_subtract_enabled
         and channel_id in _BEAM_SUBTRACT_CHANNELS
-        and ic3_raw is not None
+        and "ic3" in session
     )
     if subtract:
-        n = min(len(raw), len(ic3_raw))
-        processed = beam_subtract(raw[:n], ic3_raw[:n])
+        pair = _mask_session_arrays(
+            session,
+            (channel_id, "ic3"),
+            domain_filter=config.domain_filter,
+            beam_state_filter=config.beam_state_filter,
+            filter_column_keys=filter_keys,
+            quiet_threshold=metric.beam_off_quiet_threshold,
+        )
+        if not pair or pair[0].size == 0:
+            return None
+        processed = beam_subtract(pair[0], pair[1])
     else:
+        raw = extract_audio_signal(
+            session,
+            channel_id,
+            domain_filter=config.domain_filter,
+            beam_state_filter=config.beam_state_filter,
+            filter_column_keys=filter_keys,
+            beam_off_quiet_threshold=metric.beam_off_quiet_threshold,
+        )
+        if raw.size == 0:
+            return None
         processed = raw
 
     signal = normalize(processed)
-    envelope_poly, y_lo, y_hi = _envelope_from_signal(signal)
+    envelope_poly, line_pos, y_lo, y_hi = _envelope_from_signal(signal)
     label = _channel_label(channel_id, beam_subtracted=subtract)
     return WaveformRenderChannel(
         label=label,
@@ -298,6 +395,7 @@ def _build_render_channel(
         signal=signal,
         color=channel_color(channel_id, beam_subtracted=subtract),
         envelope_poly=envelope_poly,
+        line_pos=line_pos,
         y_lo=y_lo,
         y_hi=y_hi,
     )

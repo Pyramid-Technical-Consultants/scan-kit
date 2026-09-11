@@ -29,7 +29,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ..common.data_filter import FILTER_ALL, FILTER_BEAM_BOTH, FILTER_BEAM_ON
+from ..common.data_filter import FILTER_ALL, FILTER_BEAM_ON
 from ..common.settings import ViewSettings
 from .async_refresh import DebouncedBackgroundTask
 from .audio_player_data import (
@@ -77,7 +77,7 @@ _AUDIO_PRESETS: tuple[tuple[str, str, AudioPlayerConfig], ...] = (
         AudioPlayerConfig(
             metric_id=METRIC_IC_CURRENT,
             channels=("ic1",),
-            beam_state_filter=FILTER_BEAM_BOTH,
+            beam_state_filter=FILTER_BEAM_ON,
         ),
     ),
     (
@@ -86,7 +86,7 @@ _AUDIO_PRESETS: tuple[tuple[str, str, AudioPlayerConfig], ...] = (
         AudioPlayerConfig(
             metric_id=METRIC_IC_CURRENT,
             channels=("ic1",),
-            beam_state_filter=FILTER_BEAM_BOTH,
+            beam_state_filter=FILTER_BEAM_ON,
             beam_subtract=True,
         ),
     ),
@@ -199,6 +199,8 @@ class AudioPlayerWindow(QMainWindow):
         self._vispy_canvas.events.mouse_move.connect(self._on_mouse_move)
         self._vispy_canvas.events.mouse_release.connect(self._on_mouse_release)
         self._vispy_canvas.events.mouse_wheel.connect(self._block_vispy_navigation)
+        native = self._vispy_canvas.native
+        native.setMouseTracking(True)
 
         self._scene.show_status("Loading timeslice data…")
         self._start_initial_load()
@@ -424,8 +426,8 @@ class AudioPlayerWindow(QMainWindow):
             beam_state_filter=(
                 self._filter_panel.selected_beam_state()
                 if self._filter_panel is not None
-                else FILTER_BEAM_BOTH
-            ) or FILTER_BEAM_BOTH,
+                else FILTER_BEAM_ON
+            ) or FILTER_BEAM_ON,
             annotate_peaks=False,
             beam_subtract=(
                 self._beam_subtract_box.isChecked()
@@ -566,8 +568,6 @@ class AudioPlayerWindow(QMainWindow):
     def _on_session_changed(self, _current, _previous) -> None:
         if self._updating:
             return
-        self._stop_all()
-        self._cursor_pos = 0.0
         self._selected_index = 0
         self._clear_waveform_cache()
         self._update_beam_subtract_box()
@@ -664,6 +664,7 @@ class AudioPlayerWindow(QMainWindow):
         self.setWindowTitle(f"Audio Explorer — {session_id or '—'}")
 
         if not config.channels or not session:
+            self._stop_all()
             self._playback_channels = []
             self._channel_map = {}
             self._scene.show_status("No channel selected")
@@ -674,17 +675,17 @@ class AudioPlayerWindow(QMainWindow):
         if self._status_label is not None:
             self._status_label.setText("Preparing waveform…")
 
-        cache = self._waveform_cache
+        snapshot = dict(self._waveform_cache)
 
-        def render_fn() -> tuple[int, list[WaveformRenderChannel] | None]:
+        def render_fn() -> tuple[int, list[WaveformRenderChannel] | None, dict]:
             try:
                 channels = prepare_waveform_render(
-                    session_id, session, config, cache,
+                    session_id, session, config, snapshot,
                 )
             except Exception:
                 _log.exception("Audio Explorer waveform prepare failed")
-                return gen, None
-            return gen, channels
+                return gen, None, {}
+            return gen, channels, snapshot
 
         self._schedule_render(gen, render_fn)
 
@@ -697,9 +698,9 @@ class AudioPlayerWindow(QMainWindow):
 
     @Slot(int, object)
     def _on_render_finished(self, _task_generation: int, result: object) -> None:
-        if not isinstance(result, tuple) or len(result) != 2:
+        if not isinstance(result, tuple) or len(result) != 3:
             return
-        gen, channels = result
+        gen, channels, snapshot = result
         if gen != self._refresh_generation:
             return
         if channels is None:
@@ -707,16 +708,19 @@ class AudioPlayerWindow(QMainWindow):
             if self._status_label is not None:
                 self._status_label.setText("Render failed")
             return
+        self._waveform_cache.update(snapshot)
 
         self._playback_channels = channels
         self._channel_map = {ch.label: ch.signal for ch in channels}
 
         if not channels:
+            self._stop_all()
             self._scene.show_status("No channel selected")
             if self._status_label is not None:
                 self._status_label.setText("Select an available channel")
             return
 
+        resume_playback = self._playing_label is not None
         self._selected_index = 0
         duration = max(len(ch.signal) for ch in channels) / FS_HZ
         self._cursor_pos = min(self._cursor_pos, duration)
@@ -734,6 +738,9 @@ class AudioPlayerWindow(QMainWindow):
                 self._status_label.setText("Display failed")
             return
         self._update_time_label()
+        if resume_playback:
+            self._play_selected()
+            return
         if self._status_label is not None:
             self._status_label.setText(
                 f"{duration:.2f} s @ {int(FS_HZ)} Hz — click or drag to seek"
@@ -757,16 +764,19 @@ class AudioPlayerWindow(QMainWindow):
     def _block_vispy_navigation(self, event) -> None:
         event.handled = True
 
+    def _time_from_mouse(self, event) -> float | None:
+        pos = getattr(event, "pos", None)
+        if pos is None:
+            return None
+        return self._scene.time_at_canvas_pos((float(pos[0]), float(pos[1])))
+
     def _on_mouse_press(self, event) -> None:
-        if event.button != 1:
+        if getattr(event, "button", None) != 1:
             return
-        picked = self._scene.pick_at_canvas_pos(tuple(event.pos))
-        if picked is None:
+        time_s = self._time_from_mouse(event)
+        if time_s is None:
             return
         event.handled = True
-        row, time_s = picked
-        self._selected_index = row
-        self._scene.set_selected_index(row)
         self._dragging = True
         self._was_playing = self._playing_label
         if self._was_playing:
@@ -776,26 +786,19 @@ class AudioPlayerWindow(QMainWindow):
     def _on_mouse_move(self, event) -> None:
         if not self._dragging:
             return
-        picked = self._scene.pick_at_canvas_pos(tuple(event.pos))
-        if picked is None:
+        time_s = self._time_from_mouse(event)
+        if time_s is None:
             return
         event.handled = True
-        row, time_s = picked
-        if row != self._selected_index:
-            self._selected_index = row
-            self._scene.set_selected_index(row)
         self._set_cursor(time_s)
 
     def _on_mouse_release(self, event) -> None:
         if not self._dragging:
             return
         self._dragging = False
-        picked = self._scene.pick_at_canvas_pos(tuple(event.pos))
-        if picked is not None:
+        time_s = self._time_from_mouse(event)
+        if time_s is not None:
             event.handled = True
-            row, time_s = picked
-            self._selected_index = row
-            self._scene.set_selected_index(row)
             self._set_cursor(time_s)
         if self._was_playing:
             label = self._selected_label()
@@ -809,7 +812,7 @@ class AudioPlayerWindow(QMainWindow):
             self._play(label, self._cursor_pos)
 
     def _play(self, label: str, start_time: float) -> None:
-        self._stop_all()
+        self._stop_all(silent=True)
         sig = self._channel_map.get(label)
         if sig is None or len(sig) == 0:
             return
@@ -847,11 +850,11 @@ class AudioPlayerWindow(QMainWindow):
         if self._status_label is not None:
             self._status_label.setText("Click waveform to seek")
 
-    def _stop_all(self) -> None:
+    def _stop_all(self, *, silent: bool = False) -> None:
         self._playing_label = None
         self._cursor_timer.stop()
         sd.stop()
-        if self._status_label is not None and not self._dragging:
+        if not silent and self._status_label is not None and not self._dragging:
             self._status_label.setText("Stopped")
 
     def _save_selected(self) -> None:

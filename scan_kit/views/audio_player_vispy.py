@@ -17,7 +17,8 @@ _CURSOR_INACTIVE = (58 / 255, 63 / 255, 71 / 255, 0.5)
 @dataclass
 class _WaveformRow:
     viewbox: object
-    envelope: object
+    fill: object
+    wave: object
     cursor: object
     y_lo: float
     y_hi: float
@@ -95,18 +96,28 @@ class AudioWaveformScene:
             camera = scene.PanZoomCamera(aspect=None)
             _lock_view_camera(view, camera)
 
-            rgba = _hex_to_rgba(channel.color, alpha=0.75)
-            envelope = scene.visuals.Polygon(
-                pos=channel.envelope_poly,
-                color=rgba,
+            fill_rgba = _hex_to_rgba(channel.color, alpha=0.28)
+            line_rgba = _hex_to_rgba(channel.color, alpha=0.95)
+            mesh_pos, mesh_faces = _mesh_from_envelope_poly(channel.envelope_poly)
+            fill = scene.visuals.Mesh(
+                vertices=mesh_pos,
+                faces=mesh_faces,
+                color=fill_rgba,
                 parent=view.scene,
             )
-            envelope.set_gl_state("translucent", depth_test=False)
+            fill.set_gl_state("translucent", depth_test=False)
+            wave = scene.visuals.Line(
+                pos=channel.line_pos,
+                color=line_rgba,
+                width=1.2,
+                antialias=True,
+                parent=view.scene,
+            )
 
             cursor = scene.visuals.Line(
                 pos=_cursor_segment(0.0, channel.y_lo, channel.y_hi),
-                color=_CURSOR_INACTIVE,
-                width=1.5,
+                color=_ACCENT,
+                width=2.0,
                 antialias=True,
                 parent=view.scene,
             )
@@ -121,7 +132,8 @@ class AudioWaveformScene:
             self._rows.append(
                 _WaveformRow(
                     viewbox=view,
-                    envelope=envelope,
+                    fill=fill,
+                    wave=wave,
                     cursor=cursor,
                     y_lo=channel.y_lo,
                     y_hi=channel.y_hi,
@@ -142,54 +154,17 @@ class AudioWaveformScene:
             return
         time_s = max(0.0, min(float(time_s), self._duration))
         for row in self._rows:
-            row.cursor.set_data(
-                pos=_cursor_segment(time_s, row.y_lo, row.y_hi),
-            )
-        self._update_cursor_colors()
+            row.cursor.set_data(pos=_cursor_segment(time_s, row.y_lo, row.y_hi))
         self._canvas.update()
 
-    def pick_at_canvas_pos(
-        self,
-        pos: tuple[float, float],
-    ) -> tuple[int, float] | None:
-        row_index = self.row_index_at_canvas_pos(pos)
-        if row_index is None:
+    def time_at_canvas_pos(self, pos: tuple[float, float]) -> float | None:
+        """Map canvas pixel x to time. Camera is locked to [0, duration]."""
+        if not self._rows or self._duration <= 0.0:
             return None
-        time_s = self.time_at_canvas_pos(pos, row_index)
-        if time_s is None:
+        width = float(getattr(self._canvas, "size", (0, 0))[0])
+        if width <= 0.0:
             return None
-        return row_index, time_s
-
-    def row_index_at_canvas_pos(self, pos: tuple[float, float]) -> int | None:
-        if not self._rows:
-            return None
-        y = float(pos[1])
-        for i, row in enumerate(self._rows):
-            vb = row.viewbox
-            geom = vb.geometry
-            if geom is None:
-                continue
-            top = geom[1]
-            bottom = geom[1] + geom[3]
-            if top <= y <= bottom:
-                return i
-        return None
-
-    def time_at_canvas_pos(
-        self,
-        pos: tuple[float, float],
-        row_index: int,
-    ) -> float | None:
-        if not self._rows:
-            return None
-        if row_index < 0 or row_index >= len(self._rows):
-            return None
-        row = self._rows[row_index]
-        tr = row.viewbox.scene.node_transform(row.viewbox.scene)
-        mapped = tr.imap(pos)
-        if mapped is None:
-            return None
-        return max(0.0, min(float(mapped[0]), self._duration))
+        return max(0.0, min(self._duration * float(pos[0]) / width, self._duration))
 
     def _update_cursor_colors(self) -> None:
         for i, row in enumerate(self._rows):
@@ -231,6 +206,31 @@ def _hex_to_rgba(hex_color: str, *, alpha: float) -> tuple[float, float, float, 
     g = int(color[2:4], 16) / 255.0
     b = int(color[4:6], 16) / 255.0
     return (r, g, b, alpha)
+
+
+def _mesh_from_envelope_poly(poly: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Triangle strip covering the min/max envelope (no concave triangulation)."""
+    if len(poly) < 4:
+        return np.zeros((0, 3), dtype=np.float32), np.zeros((0, 3), dtype=np.uint32)
+    n = len(poly) // 2
+    t = poly[:n, 0]
+    y_max = poly[:n, 1]
+    y_min = poly[n:, 1][::-1]
+    pos = np.zeros((n * 2, 3), dtype=np.float32)
+    pos[0::2, 0] = t
+    pos[0::2, 1] = y_min
+    pos[1::2, 0] = t
+    pos[1::2, 1] = y_max
+    faces = np.empty((2 * max(n - 1, 0), 3), dtype=np.uint32)
+    if n > 1:
+        idx = np.arange(n - 1, dtype=np.uint32)
+        faces[0::2, 0] = idx * 2
+        faces[0::2, 1] = idx * 2 + 1
+        faces[0::2, 2] = idx * 2 + 2
+        faces[1::2, 0] = idx * 2 + 1
+        faces[1::2, 1] = idx * 2 + 3
+        faces[1::2, 2] = idx * 2 + 2
+    return pos, faces
 
 
 def _envelope_polygon(

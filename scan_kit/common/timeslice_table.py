@@ -19,6 +19,7 @@ def load_session_timeslice_frames(
     *,
     usecols: list[str] | None = None,
     bg_subtract: bool = False,
+    max_frames: int | None = None,
 ) -> tuple[SessionSource, list[pd.DataFrame], dict | None, dict[int, float], str] | None:
     """Open a session and return frames plus energy lookups."""
     opened = load_energy_lookups(session_id, base_dir)
@@ -26,7 +27,9 @@ def load_session_timeslice_frames(
         return None
     src, energy_by_layer, energy_by_idx = opened
 
-    frames = load_session_timeslice_device_units(src, usecols=usecols)
+    frames = load_session_timeslice_device_units(
+        src, usecols=usecols, max_frames=max_frames,
+    )
     if not frames:
         return None
     if bg_subtract:
@@ -86,8 +89,14 @@ def load_energy_tagged_table(
         n = len(arrays[0])
         if n == 0:
             continue
+        beam = np.asarray(beam_on, dtype=bool).reshape(-1)
+        if beam.size != n:
+            aligned = np.ones(n, dtype=bool)
+            m = min(beam.size, n)
+            aligned[:m] = beam[:m]
+            beam = aligned
         energy_parts.append(np.full(n, energy, dtype=float))
-        beam_on_parts.append(beam_on.astype(bool))
+        beam_on_parts.append(beam)
         for key, arr in zip(keys, arrays):
             value_parts[key].append(arr)
 

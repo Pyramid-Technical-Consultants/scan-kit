@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
-from ..common.data_filter import FILTER_ALL, FILTER_BEAM_BOTH, DataFilterSelection
+from ..common.data_filter import FILTER_ALL, FILTER_BEAM_BOTH, FILTER_BEAM_ON, DataFilterSelection
 from ..data.sources.current_ratio import SOURCE_CURRENT_RATIO
 from ..data.sources.dose_rate import SOURCE_DOSE_RATE
 from ..data.sources.ic12_pos_diff import SOURCE_IC12_POS_DIFF
@@ -341,7 +341,7 @@ class BinnedSummaryConfig:
     n_bins: int | None = None
     show_interlock_thresholds: bool = False
     domain_filter: str = FILTER_ALL
-    beam_state_filter: str = FILTER_BEAM_BOTH
+    beam_state_filter: str = FILTER_BEAM_ON
     def data_filter(self) -> DataFilterSelection:
         return DataFilterSelection(
             domain_filter=self.domain_filter,

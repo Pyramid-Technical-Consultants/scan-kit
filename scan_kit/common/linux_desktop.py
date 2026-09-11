@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import struct
 import sys
 from pathlib import Path
 
@@ -11,6 +12,7 @@ from .app_icon import asset_path, desktop_file_name
 
 _ICON_THEME_NAME = desktop_file_name()
 _ICON_SIZES = (16, 24, 32, 48, 64, 128, 256)
+_FALLBACK_ICON_SIZE = 256
 _SUBPROCESS_FLAGS = frozenset({"--run-view", "--warm-worker", "--version", "-V"})
 
 
@@ -29,19 +31,113 @@ def _hicolor_icons_root() -> Path:
     return Path.home() / ".local" / "share" / "icons" / "hicolor"
 
 
+def png_pixel_size(path: Path) -> tuple[int, int] | None:
+    """Return ``(width, height)`` for a PNG, or ``None`` if it is not a PNG."""
+    try:
+        with path.open("rb") as fh:
+            header = fh.read(24)
+    except OSError:
+        return None
+    if len(header) < 24 or header[:8] != b"\x89PNG\r\n\x1a\n" or header[12:16] != b"IHDR":
+        return None
+    width, height = struct.unpack(">II", header[16:24])
+    if width <= 0 or height <= 0:
+        return None
+    return width, height
+
+
+def _hicolor_png_path(root: Path, size: int, name: str) -> Path:
+    return root / f"{size}x{size}" / "apps" / f"{name}.png"
+
+
+def _copy_png(src: Path, dest: Path) -> None:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src, dest)
+
+
+def _write_resized_hicolor_pngs(root: Path, icon_src: Path, name: str, native: int) -> None:
+    """Write extra hicolor sizes. Best-effort; skipped when Qt cannot load the PNG."""
+    try:
+        from PySide6.QtCore import Qt
+        from PySide6.QtGui import QImage
+
+        image = QImage(str(icon_src))
+        if image.isNull():
+            return
+        for size in _ICON_SIZES:
+            if size == native:
+                continue
+            dest = _hicolor_png_path(root, size, name)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            scaled = image.scaled(
+                size,
+                size,
+                Qt.AspectRatioMode.IgnoreAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+            scaled.save(str(dest), "PNG")
+    except Exception:
+        return
+
+
+def install_hicolor_png(
+    root: Path,
+    icon_src: Path,
+    *,
+    name: str = _ICON_THEME_NAME,
+    extra_sizes: bool = False,
+) -> int:
+    """Install *icon_src* into a hicolor tree at its native pixel size.
+
+    Returns the native size used. Stale copies in other size slots (and an
+    Inkscape scalable SVG, which many theme loaders fail to rasterize) are
+    removed so ``Icon=scan-kit`` resolves to a real PNG.
+    """
+    size_info = png_pixel_size(icon_src)
+    native = size_info[0] if size_info and size_info[0] == size_info[1] else _FALLBACK_ICON_SIZE
+    _copy_png(icon_src, _hicolor_png_path(root, native, name))
+    scalable = root / "scalable" / "apps" / f"{name}.svg"
+    if scalable.is_file() or scalable.is_symlink():
+        scalable.unlink()
+    if extra_sizes:
+        _write_resized_hicolor_pngs(root, icon_src, name, native)
+    else:
+        for size in _ICON_SIZES:
+            if size == native:
+                continue
+            stale = _hicolor_png_path(root, size, name)
+            if stale.is_file() or stale.is_symlink():
+                stale.unlink()
+    return native
+
+
+def install_appdir_icons(appdir: Path, icon_src: Path) -> None:
+    """Install AppDir root icon, a real ``.DirIcon``, and hicolor theme icons.
+
+    ``.DirIcon`` must be a regular file: AppImage thumbnailers extract it
+    alone, so a symlink to ``scan-kit.png`` becomes a dangling shortcut.
+    """
+    if not icon_src.is_file():
+        raise FileNotFoundError(icon_src)
+    appdir.mkdir(parents=True, exist_ok=True)
+    root_png = appdir / f"{_ICON_THEME_NAME}.png"
+    shutil.copy2(icon_src, root_png)
+    diricon = appdir / ".DirIcon"
+    if diricon.exists() or diricon.is_symlink():
+        diricon.unlink()
+    shutil.copy2(icon_src, diricon)
+    install_hicolor_png(
+        appdir / "usr" / "share" / "icons" / "hicolor",
+        icon_src,
+        extra_sizes=True,
+    )
+
+
 def _install_hicolor_icons(icon_src: Path) -> bool:
-    """Install PNG/SVG icons so ``Icon=scan-kit`` resolves in menus and the dock."""
+    """Install the user-theme PNG so ``Icon=scan-kit`` resolves after first launch."""
     root = _hicolor_icons_root()
     try:
-        for size in _ICON_SIZES:
-            dest = root / f"{size}x{size}" / "apps" / f"{_ICON_THEME_NAME}.png"
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(icon_src, dest)
-        svg_src = asset_path("scan-kit-icon.svg")
-        if svg_src.is_file():
-            svg_dest = root / "scalable" / "apps" / f"{_ICON_THEME_NAME}.svg"
-            svg_dest.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(svg_src, svg_dest)
+        install_hicolor_png(root, icon_src, extra_sizes=False)
     except OSError:
         return False
     _refresh_icon_cache(root)
@@ -72,6 +168,7 @@ def _render_desktop_entry(exe: Path) -> str:
             "Terminal=false",
             "StartupNotify=true",
             "Categories=Science;Utility;",
+            "Keywords=proton;beam;scanning;dosimetry;IC;",
             f"StartupWMClass={_ICON_THEME_NAME}",
             "",
         )

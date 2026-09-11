@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>scan-kit.desktop</id>
+  <metadata_license>MIT</metadata_license>
+  <project_license>MIT</project_license>
+  <name>Scan Kit</name>
+  <summary>Proton pencil beam scanning analysis toolkit</summary>
+  <description>
+    <p>
+      Scan Kit analyzes proton pencil beam scanning session data: timeslice
+      currents, dose, position, and related diagnostics.
+    </p>
+  </description>
+  <launchable type="desktop-id">scan-kit.desktop</launchable>
+  <icon type="stock">scan-kit</icon>
+  <categories>
+    <category>Science</category>
+    <category>Utility</category>
+  </categories>
+</component>

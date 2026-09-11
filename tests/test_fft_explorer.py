@@ -10,14 +10,17 @@ import pytest
 
 from scan_kit.views.fft_catalog import (
     FftConfig,
+    METRIC_AMPLIFIER,
     METRIC_IC_CURRENT,
     METRIC_MAG_FIELD,
     PRESET_ALL_ICS,
     PRESET_BY_ID,
 )
 from scan_kit.views.fft_data import (
+    channel_keys_for_metric,
     extract_fft_traces,
     load_sessions_fft,
+    merge_fft_session_channels,
     probe_channel_availability,
     probe_metric_availability,
     welch_psd,
@@ -37,11 +40,16 @@ def test_welch_psd_returns_band_limited_frequencies() -> None:
 
 
 def test_load_sessions_fft_g3(g3_fft_data) -> None:
+    import numpy as np
+
     session_data = g3_fft_data
     if not session_data:
         pytest.skip("timeslice FFT data unavailable in fixture")
     assert G3_SESSION in session_data
     assert "beam_on" in session_data[G3_SESSION]
+    ic1 = np.asarray(session_data[G3_SESSION]["ic1"])
+    beam_on = np.asarray(session_data[G3_SESSION]["beam_on"])
+    assert ic1.size == beam_on.size
     metrics = probe_metric_availability(session_data)
     assert metrics[METRIC_IC_CURRENT]
     channels = probe_channel_availability(session_data, METRIC_IC_CURRENT)
@@ -87,7 +95,7 @@ def test_load_sessions_fft_g3_large(g3_large_fft_data) -> None:
 def test_extract_fft_traces_respects_beam_filter() -> None:
     import numpy as np
 
-    from scan_kit.common.data_filter import FILTER_BEAM_OFF, FILTER_BEAM_ON
+    from scan_kit.common.data_filter import FILTER_BEAM_BOTH, FILTER_BEAM_OFF, FILTER_BEAM_ON
 
     session = {
         "ic1": np.array([1.0, 2.0, 3.0, 4.0]),
@@ -115,6 +123,20 @@ def test_extract_fft_traces_respects_beam_filter() -> None:
     assert len(off_traces) == 1
     assert off_traces[0][0].tolist() == [3.0, 4.0]
 
+    mismatch = dict(session)
+    mismatch["beam_on"] = np.array([True, False, True])
+    both = extract_fft_traces(
+        mismatch,
+        "ic1",
+        domain_filter="all",
+        beam_state_filter=FILTER_BEAM_BOTH,
+        filter_column_keys=["ic1", "ic2"],
+        beam_off_quiet_threshold=100.0,
+    )
+    assert [trace[1] for trace in both] == ["-", "--"]
+    assert both[0][0].tolist() == [1.0, 3.0, 4.0]
+    assert both[1][0].tolist() == [2.0]
+
 
 def test_probe_metric_availability_includes_field(g3_fft_data) -> None:
     session_data = g3_fft_data
@@ -122,6 +144,27 @@ def test_probe_metric_availability_includes_field(g3_fft_data) -> None:
         pytest.skip("timeslice FFT data unavailable in fixture")
     metrics = probe_metric_availability(session_data)
     assert METRIC_MAG_FIELD in metrics
+
+
+def test_merge_fft_amplifier_into_loaded_ic_session(g3_fft_data) -> None:
+    import numpy as np
+
+    session_data = g3_fft_data
+    if not session_data:
+        pytest.skip("timeslice FFT data unavailable in fixture")
+    existing = session_data[G3_SESSION]
+    assert "ic1" in existing
+    merged = merge_fft_session_channels(
+        existing,
+        G3_SESSION,
+        str(TEST_DATA),
+        channel_keys_for_metric(METRIC_AMPLIFIER),
+    )
+    assert merged is not None
+    assert "ic1" in merged
+    for key in channel_keys_for_metric(METRIC_AMPLIFIER):
+        assert key in merged
+        assert np.isfinite(np.asarray(merged[key])).any()
 
 
 @pytest.mark.slow

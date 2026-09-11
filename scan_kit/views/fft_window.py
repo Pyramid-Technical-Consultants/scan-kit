@@ -16,7 +16,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ..common.data_filter import FILTER_ALL, FILTER_BEAM_BOTH, FILTER_BEAM_ON
+from ..common.data_filter import FILTER_ALL, FILTER_BEAM_ON
 from ..common.settings import ViewSettings
 from .async_refresh import DebouncedBackgroundTask
 from .fft_catalog import (
@@ -303,8 +303,8 @@ class FftExplorerWindow(PlotViewWindow):
             beam_state_filter=(
                 self._filter_panel.selected_beam_state()
                 if self._filter_panel is not None
-                else FILTER_BEAM_BOTH
-            ) or FILTER_BEAM_BOTH,
+                else FILTER_BEAM_ON
+            ) or FILTER_BEAM_ON,
             annotate_peaks=(
                 self._peaks_box.isChecked() if self._peaks_box is not None else True
             ),

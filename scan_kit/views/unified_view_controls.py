@@ -23,7 +23,6 @@ from ..common.data_filter import (
     BEAM_STATE_FILTERS,
     DOMAIN_FILTERS,
     FILTER_ALL,
-    FILTER_BEAM_BOTH,
     FILTER_BEAM_ON,
     DataFilterSelection,
     default_data_filter_selection,
@@ -357,7 +356,8 @@ class DataFilterPanel(QWidget):
         self._domain_combo = QComboBox()
         for key, label in DOMAIN_FILTERS:
             self._domain_combo.addItem(label, key)
-        self._domain_combo.currentIndexChanged.connect(self._on_index_changed)
+        self._domain_combo.activated.connect(self._on_user_changed)
+        self._domain_combo.currentIndexChanged.connect(self._on_user_changed)
         domain_row.addWidget(self._domain_combo, 1)
         group_layout.addLayout(domain_row)
 
@@ -367,7 +367,8 @@ class DataFilterPanel(QWidget):
         self._beam_combo = QComboBox()
         for key, label in BEAM_STATE_FILTERS:
             self._beam_combo.addItem(label, key)
-        self._beam_combo.currentIndexChanged.connect(self._on_index_changed)
+        self._beam_combo.activated.connect(self._on_user_changed)
+        self._beam_combo.currentIndexChanged.connect(self._on_user_changed)
         beam_row.addWidget(self._beam_combo, 1)
         group_layout.addLayout(beam_row)
 
@@ -389,7 +390,7 @@ class DataFilterPanel(QWidget):
     def selection(self) -> DataFilterSelection:
         return DataFilterSelection(
             domain_filter=self.selected_domain() or FILTER_ALL,
-            beam_state_filter=self.selected_beam_state() or FILTER_BEAM_BOTH,
+            beam_state_filter=self.selected_beam_state() or FILTER_BEAM_ON,
         )
 
     def selected_domain(self) -> str | None:
@@ -407,12 +408,20 @@ class DataFilterPanel(QWidget):
     def set_domain(self, key: str) -> None:
         idx = self._domain_combo.findData(key)
         if idx >= 0:
-            self._domain_combo.setCurrentIndex(idx)
+            self._domain_combo.blockSignals(True)
+            try:
+                self._domain_combo.setCurrentIndex(idx)
+            finally:
+                self._domain_combo.blockSignals(False)
 
     def set_beam_state(self, key: str) -> None:
         idx = self._beam_combo.findData(key)
         if idx >= 0:
-            self._beam_combo.setCurrentIndex(idx)
+            self._beam_combo.blockSignals(True)
+            try:
+                self._beam_combo.setCurrentIndex(idx)
+            finally:
+                self._beam_combo.blockSignals(False)
 
     def set_current(self, key: str) -> None:
         """Legacy alias: sets domain filter only."""
@@ -425,7 +434,7 @@ class DataFilterPanel(QWidget):
         self._beam_label.setEnabled(enabled)
         self._beam_combo.setEnabled(enabled)
 
-    def _on_index_changed(self, _index: int) -> None:
+    def _on_user_changed(self, *_args) -> None:
         if self._on_selection_changed is not None:
             self._on_selection_changed()
 

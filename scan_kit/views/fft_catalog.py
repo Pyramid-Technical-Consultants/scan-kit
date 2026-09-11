@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from ..common.data_filter import FILTER_ALL, FILTER_BEAM_BOTH, DataFilterSelection
+from ..common.data_filter import FILTER_ALL, FILTER_BEAM_BOTH, FILTER_BEAM_ON, DataFilterSelection
 from ..data.timeline_channels import (
     FAMILY_AMPLIFIER,
     FAMILY_BEAM,
@@ -58,7 +58,7 @@ class PresetDef:
     metric_id: str
     channels: tuple[str, ...]
     domain_filter: str = FILTER_ALL
-    beam_state_filter: str = FILTER_BEAM_BOTH
+    beam_state_filter: str = FILTER_BEAM_ON
     annotate_peaks: bool = True
 
 
@@ -103,8 +103,21 @@ FFT_METRICS: tuple[FftMetricDef, ...] = (
         ("ic1_ddose", "ic2_ddose", "ic3_ddose"), beam_off_quiet_threshold=10.0,
     ),
     _fft_metric(
+        METRIC_BEAM, "Source Beam Current", FAMILY_BEAM,
+        ("beam",), beam_off_quiet_threshold=10.0,
+    ),
+    _fft_metric(
+        METRIC_POSITION, "Chamber Position", FAMILY_POSITION,
+        ("ic1_x", "ic1_y", "ic2_x", "ic2_y"),
+    ),
+    _fft_metric(
         METRIC_SIGMA, "Sigma", FAMILY_SIGMA,
         ("sigma_ic1_x", "sigma_ic1_y", "sigma_ic2_x", "sigma_ic2_y"),
+    ),
+    _fft_metric(
+        METRIC_PEAK_AMPLITUDE, "Gaussian Peak (G3)", FAMILY_PEAK,
+        ("ic1_x_peak", "ic1_y_peak", "ic2_x_peak", "ic2_y_peak"),
+        beam_off_quiet_threshold=10.0,
     ),
     _fft_metric(
         METRIC_MAG_FIELD, "Magnetic Field", FAMILY_FIELD,
@@ -113,19 +126,6 @@ FFT_METRICS: tuple[FftMetricDef, ...] = (
     _fft_metric(
         METRIC_AMPLIFIER, "Amplifier", FAMILY_AMPLIFIER,
         ("amp_cmd_x", "amp_cmd_y", "amp_rb_x", "amp_rb_y"),
-    ),
-    _fft_metric(
-        METRIC_BEAM, "Beam Current", FAMILY_BEAM,
-        ("beam",), beam_off_quiet_threshold=10.0,
-    ),
-    _fft_metric(
-        METRIC_POSITION, "Chamber Position", FAMILY_POSITION,
-        ("ic1_x", "ic1_y", "ic2_x", "ic2_y"),
-    ),
-    _fft_metric(
-        METRIC_PEAK_AMPLITUDE, "Peak Amplitude (G3)", FAMILY_PEAK,
-        ("ic1_x_peak", "ic1_y_peak", "ic2_x_peak", "ic2_y_peak"),
-        beam_off_quiet_threshold=10.0,
     ),
 )
 
@@ -172,7 +172,7 @@ class FftConfig:
     metric_id: str = METRIC_IC_CURRENT
     channels: tuple[str, ...] = ("ic1", "ic2")
     domain_filter: str = FILTER_ALL
-    beam_state_filter: str = FILTER_BEAM_BOTH
+    beam_state_filter: str = FILTER_BEAM_ON
     annotate_peaks: bool = True
 
     @property

@@ -11,22 +11,25 @@ from scipy.ndimage import binary_dilation
 from scipy.signal import find_peaks
 
 from ..common import (
-    C_AMPLIFIER_CMD_X,
-    C_AMPLIFIER_CMD_Y,
-    C_AMPLIFIER_READBACK_X,
-    C_AMPLIFIER_READBACK_Y,
-    IC_PEAK_AMPLITUDE_COLUMNS,
     detect_beam_on_mask,
-    resolve_concept_column,
 )
 from ..common.data_filter import (
     FILTER_BEAM_BOTH,
     FILTER_BEAM_OFF,
+    FILTER_BEAM_ON,
+    beam_state_mask,
     filter_mask_from_columns,
 )
 from ..common.settings import ViewSettings
 from ..common.timeslice_table import load_session_timeslice_frames
-from ..data.timeline_channels import TIMELINE_CHANNEL_BY_KEY, channel_available
+from ..data.timeline_channels import (
+    AMPLIFIER_CHANNEL_CONCEPTS,
+    PEAK_CHANNEL_CONCEPTS,
+    TIMELINE_CHANNEL_BY_KEY,
+    channel_available,
+    resolve_amplifier_columns,
+    resolve_peak_columns,
+)
 from .fft_catalog import (
     FFT_METRICS,
     FftConfig,
@@ -36,6 +39,7 @@ from .fft_catalog import (
 from .timeslice_replay_channels import (
     load_session_timeline_catalog,
     probe_session_timeline_flags,
+    timeslice_usecols_for_channel_keys,
 )
 
 _log = logging.getLogger(__name__)
@@ -50,17 +54,8 @@ MAX_PEAKS_PER_IC = 8
 
 _BG_GUARD_SAMPLES = 3
 
-_PEAK_COLUMN_KEYS = {
-    "ic1_x_peak": IC_PEAK_AMPLITUDE_COLUMNS[0],
-    "ic1_y_peak": IC_PEAK_AMPLITUDE_COLUMNS[1],
-    "ic2_x_peak": IC_PEAK_AMPLITUDE_COLUMNS[2],
-    "ic2_y_peak": IC_PEAK_AMPLITUDE_COLUMNS[3],
-}
-
-_AMP_CHANNEL_KEYS = frozenset({
-    "amp_cmd_x", "amp_cmd_y", "amp_rb_x", "amp_rb_y",
-})
-_PEAK_CHANNEL_KEYS = frozenset(_PEAK_COLUMN_KEYS.keys())
+_AMP_CHANNEL_KEYS = frozenset(AMPLIFIER_CHANNEL_CONCEPTS)
+_PEAK_CHANNEL_KEYS = frozenset(PEAK_CHANNEL_CONCEPTS)
 _CATALOG_CHANNEL_KEYS = frozenset(TIMELINE_CHANNEL_BY_KEY.keys())
 
 
@@ -72,39 +67,7 @@ def channel_keys_for_metric(metric_id: str) -> frozenset[str]:
 
 
 def _session_fft_header_flags(session_id: str, base_dir: str) -> dict[str, bool] | None:
-    flags = probe_session_timeline_flags(session_id, base_dir)
-    if flags is None:
-        return None
-    from ..common.session_source import (
-        load_session_timeslice_device_units,
-        resolve_session_source,
-    )
-
-    src = resolve_session_source(session_id, base_dir)
-    if src is None:
-        return flags
-    frames = load_session_timeslice_device_units(src, max_frames=1)
-    if not frames:
-        return flags
-    df0 = frames[0]
-    flags = dict(flags)
-    flags["has_amp_cmd_x"] = (
-        resolve_concept_column(df0.columns, C_AMPLIFIER_CMD_X) is not None
-    )
-    flags["has_amp_cmd_y"] = (
-        resolve_concept_column(df0.columns, C_AMPLIFIER_CMD_Y) is not None
-    )
-    flags["has_amp_rb_x"] = (
-        resolve_concept_column(df0.columns, C_AMPLIFIER_READBACK_X) is not None
-    )
-    flags["has_amp_rb_y"] = (
-        resolve_concept_column(df0.columns, C_AMPLIFIER_READBACK_Y) is not None
-    )
-    for key, concept in _PEAK_COLUMN_KEYS.items():
-        flags[f"has_{key}"] = (
-            resolve_concept_column(df0.columns, concept) is not None
-        )
-    return flags
+    return probe_session_timeline_flags(session_id, base_dir)
 
 
 def _channel_available_from_flags(channel_id: str, flags: dict[str, bool]) -> bool:
@@ -179,25 +142,25 @@ def _append_frame_channels(
     df0 = frames[0]
     amp_cols: dict[str, str | None] = {}
     if want_amp:
-        amp_cols = {
-            "amp_cmd_x": resolve_concept_column(df0.columns, C_AMPLIFIER_CMD_X),
-            "amp_cmd_y": resolve_concept_column(df0.columns, C_AMPLIFIER_CMD_Y),
-            "amp_rb_x": resolve_concept_column(df0.columns, C_AMPLIFIER_READBACK_X),
-            "amp_rb_y": resolve_concept_column(df0.columns, C_AMPLIFIER_READBACK_Y),
-        }
+        amp_cols = resolve_amplifier_columns(df0.columns)
     peak_cols: dict[str, str | None] = {}
     if want_peak:
-        peak_cols = {
-            key: resolve_concept_column(df0.columns, concept)
-            for key, concept in _PEAK_COLUMN_KEYS.items()
-        }
+        peak_cols = resolve_peak_columns(df0.columns)
 
     parts: dict[str, list[np.ndarray]] = {"beam_on": []}
     for key, col in amp_cols.items():
-        if col is not None and (channel_keys is None or key in channel_keys):
+        if (
+            col is not None
+            and (channel_keys is None or key in channel_keys)
+            and key not in data
+        ):
             parts[key] = []
     for key, col in peak_cols.items():
-        if col is not None and (channel_keys is None or key in channel_keys):
+        if (
+            col is not None
+            and (channel_keys is None or key in channel_keys)
+            and key not in data
+        ):
             parts[key] = []
 
     for df in frames:
@@ -241,7 +204,12 @@ def load_session_fft_signals(
         )
 
     opened = load_session_timeslice_frames(
-        session_id, base_dir, bg_subtract=bg_subtract,
+        session_id,
+        base_dir,
+        bg_subtract=bg_subtract,
+        usecols=timeslice_usecols_for_channel_keys(
+            catalog_keys if channel_keys is not None else None
+        ),
     )
     if opened is None:
         return None
@@ -254,11 +222,10 @@ def load_session_fft_signals(
             bg_subtract=bg_subtract,
             opened=opened,
             channel_keys=catalog_keys if channel_keys is not None else None,
+            include_beam_off_edges=False,
         )
-    elif channel_keys is not None:
-        flags = probe_session_timeline_flags(session_id, base_dir)
-        if flags is None:
-            return None
+    if data is None:
+        flags = probe_session_timeline_flags(session_id, base_dir) or {}
         data = {
             "has_ic3": flags.get("has_ic3", False),
             "has_beam": flags.get("has_beam", False),
@@ -267,9 +234,6 @@ def load_session_fft_signals(
             "has_field": flags.get("has_field", False),
             "has_ddose": flags.get("has_ddose", False),
         }
-
-    if data is None:
-        return None
     data = dict(data)
     data["session_id"] = session_id
     _, frames, *_rest = opened
@@ -394,7 +358,7 @@ def extract_fft_traces(
         return []
 
     sig = np.asarray(session[channel_id], dtype=float)
-    beam_on = session.get("beam_on")
+    n = len(sig)
     domain_mask = filter_mask_from_columns(
         session,
         filter_column_keys,
@@ -404,16 +368,11 @@ def extract_fft_traces(
     quiet_threshold = beam_off_quiet_threshold if beam_off_quiet_threshold is not None else 10.0
 
     if beam_state_filter == FILTER_BEAM_BOTH:
-        if beam_on is None:
-            if domain_mask is None:
-                return [(sig, "-")] if sig.size else []
-            masked = sig[np.asarray(domain_mask, dtype=bool)]
-            return [(masked, "-")] if masked.size else []
-        on = np.asarray(beam_on, dtype=bool)
         if domain_mask is None:
-            domain_mask_arr = np.ones(len(sig), dtype=bool)
+            domain_mask_arr = np.ones(n, dtype=bool)
         else:
             domain_mask_arr = np.asarray(domain_mask, dtype=bool)
+        on = beam_state_mask(session.get("beam_on"), FILTER_BEAM_ON, n)
         traces: list[tuple[np.ndarray, str]] = []
         on_mask = domain_mask_arr & on
         if np.any(on_mask):
