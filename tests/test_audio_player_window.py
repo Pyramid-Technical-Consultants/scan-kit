@@ -18,4 +18,10 @@ def test_audio_player_window_smoke(qt_wait) -> None:
     qt_wait(lambda: bool(window._playback_channels), timeout_ms=20000)
     assert window._read_config().channels
     assert window._read_config().beam_state_filter == "beam_on"
+    assert window._play_pause_btn is not None
+    assert window._seek_slider is not None
+    assert window._fft_window_combo is not None
+    assert window._fft_window_combo.currentData() == 250
+    assert window._rewind_btn is not None
+    assert "start" in window._rewind_btn.toolTip().lower()
     window.close()

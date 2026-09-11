@@ -20,6 +20,10 @@ from .fft_data import FS_HZ
 from .timeslice_replay_common import compress_minmax
 
 _ENVELOPE_BINS = 2000
+LIVE_FFT_WINDOW_MS = (50, 100, 250, 500, 1000)
+DEFAULT_LIVE_FFT_WINDOW_MS = 250
+SPECTRUM_DB_FLOOR = -80.0
+SPECTRUM_FMAX_HZ = FS_HZ / 2.0
 
 _SPECSUB_ALPHA = 3.0
 _SPECSUB_BETA = 0.02
@@ -440,3 +444,42 @@ def build_playback_channels(
 def session_has_ic3(session: dict) -> bool:
     ic3 = session.get("ic3")
     return ic3 is not None and len(ic3) > 0
+
+
+def format_play_time(seconds: float) -> str:
+    """Format a playback position as ``m:ss.t``."""
+    seconds = max(0.0, float(seconds))
+    minutes, sec = divmod(seconds, 60.0)
+    return f"{int(minutes)}:{sec:04.1f}"
+
+
+def live_spectrum(
+    signal: np.ndarray,
+    time_s: float,
+    window_ms: float,
+    *,
+    fs: float = FS_HZ,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Hann-windowed magnitude spectrum around *time_s*, in dB relative to peak."""
+    nwin = max(16, int(round(float(window_ms) * 0.001 * fs)))
+    freqs = np.fft.rfftfreq(nwin, d=1.0 / fs)
+    sig = np.asarray(signal, dtype=np.float64)
+    chunk = np.zeros(nwin, dtype=np.float64)
+    n = len(sig)
+    if n > 0:
+        center = int(round(float(time_s) * fs))
+        lo = center - nwin // 2
+        src_lo = max(0, lo)
+        src_hi = min(n, lo + nwin)
+        dst_lo = src_lo - lo
+        if src_hi > src_lo:
+            chunk[dst_lo : dst_lo + (src_hi - src_lo)] = sig[src_lo:src_hi]
+    chunk *= np.hanning(nwin)
+    mag = np.abs(np.fft.rfft(chunk))
+    peak = float(np.max(mag)) if mag.size else 0.0
+    floor_lin = 10.0 ** (SPECTRUM_DB_FLOOR / 20.0)
+    if peak <= 1e-20:
+        db = np.full(mag.shape, SPECTRUM_DB_FLOOR, dtype=np.float64)
+    else:
+        db = 20.0 * np.log10(np.maximum(mag / peak, floor_lin))
+    return freqs, db

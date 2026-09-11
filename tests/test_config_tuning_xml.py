@@ -202,6 +202,7 @@ def test_app_settings_round_trip(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
         window_height=720,
         window_x=40,
         window_y=60,
+        ui_theme="dark",
     )
     settings.save()
     loaded = AppSettings.load()
@@ -212,6 +213,21 @@ def test_app_settings_round_trip(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     assert loaded.window_height == 720
     assert loaded.window_x == 40
     assert loaded.window_y == 60
+    assert loaded.ui_theme == "dark"
+
+
+def test_app_settings_invalid_theme_defaults_to_system(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "scan_kit.common.app_settings._SETTINGS_DIR",
+        tmp_path,
+    )
+    (tmp_path / "app_settings.json").write_text(
+        '{"ui_theme": "neon"}\n', encoding="utf-8",
+    )
+    loaded = AppSettings.load()
+    assert loaded.ui_theme == "system"
 
 
 def test_save_config_folder_copies_tree_and_writes_dirty(tmp_path: Path) -> None:

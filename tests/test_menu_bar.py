@@ -57,6 +57,17 @@ def test_analysis_menu_has_submenu_per_view_group(window) -> None:
     assert "Calibration" in submenu_titles
 
 
+def test_view_menu_has_theme_picker(window) -> None:
+    view = _menu(window, "View")
+    theme_action = next(
+        action
+        for action in view.actions()
+        if action.menu() is not None and action.text().replace("&", "") == "Theme"
+    )
+    labels = [action.text() for action in theme_action.menu().actions()]
+    assert labels == ["System", "Light", "Dark"]
+
+
 def test_view_menu_switches_tab_and_syncs(window) -> None:
     window._switch_to_main_tab(_MAIN_TAB_DATA_ANALYSIS)
     window._sync_tab_menu()

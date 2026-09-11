@@ -6,7 +6,12 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from .audio_player_data import FS_HZ, WaveformRenderChannel
+from .audio_player_data import (
+    FS_HZ,
+    SPECTRUM_DB_FLOOR,
+    SPECTRUM_FMAX_HZ,
+    WaveformRenderChannel,
+)
 
 _BG = "#1a1a1a"
 _FG = "#c9d1d9"
@@ -171,6 +176,67 @@ class AudioWaveformScene:
             color = _ACCENT if i == self._selected_index else _CURSOR_INACTIVE
             width = 2.0 if i == self._selected_index else 1.0
             row.cursor.set_data(color=color, width=width)
+
+
+class AudioSpectrumScene:
+    """Live frequency-magnitude plot for the sample window at the playhead."""
+
+    def __init__(self, canvas) -> None:
+        self._canvas = canvas
+        self._view = None
+        self._line = None
+        self._ensure_view()
+
+    def _ensure_view(self) -> None:
+        from vispy import scene
+
+        if self._view is not None:
+            return
+        grid = self._canvas.central_widget.add_grid(spacing=0, margin=8)
+        view = grid.add_view(row=0, col=0)
+        camera = scene.PanZoomCamera(aspect=None)
+        _lock_view_camera(view, camera)
+        view.camera.set_range(x=(0.0, SPECTRUM_FMAX_HZ), y=(SPECTRUM_DB_FLOOR, 5.0))
+        self._line = scene.visuals.Line(
+            pos=np.zeros((2, 2), dtype=np.float32),
+            color=_FG,
+            width=1.4,
+            antialias=True,
+            parent=view.scene,
+        )
+        xaxis = scene.AxisWidget(
+            orientation="bottom",
+            axis_color=(0.45, 0.48, 0.52, 1.0),
+            tick_color=(0.45, 0.48, 0.52, 1.0),
+            text_color=_FG,
+            font_size=8,
+        )
+        xaxis.height_min = 40
+        xaxis.height_max = 48
+        grid.add_widget(xaxis, row=1, col=0)
+        xaxis.link_view(view)
+        self._view = view
+        self._xaxis = xaxis
+
+    def set_spectrum(
+        self,
+        freqs: np.ndarray,
+        db: np.ndarray,
+        *,
+        color: str = "#c9d1d9",
+    ) -> None:
+        self._ensure_view()
+        if freqs.size == 0:
+            pos = np.zeros((2, 2), dtype=np.float32)
+        else:
+            mask = freqs <= SPECTRUM_FMAX_HZ + 1e-9
+            pos = np.column_stack((freqs[mask], db[mask])).astype(np.float32)
+            if len(pos) == 0:
+                pos = np.zeros((2, 2), dtype=np.float32)
+        rgba = _hex_to_rgba(color, alpha=0.95)
+        self._line.set_data(pos=pos, color=rgba)
+        self._view.camera.set_range(x=(0.0, SPECTRUM_FMAX_HZ), y=(SPECTRUM_DB_FLOOR, 5.0))
+        self._canvas.update()
 
 
 def _lock_view_camera(view, camera) -> None:

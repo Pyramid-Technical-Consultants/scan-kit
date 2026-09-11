@@ -9,6 +9,7 @@ import pytest
 
 from scan_kit.views.audio_player_data import WaveformRenderChannel
 from scan_kit.views.audio_player_vispy import (
+    AudioSpectrumScene,
     AudioWaveformScene,
     _envelope_polygon,
     _mesh_from_envelope_poly,
@@ -138,3 +139,34 @@ def test_time_at_canvas_pos_maps_x_linearly() -> None:
         assert scene.time_at_canvas_pos((1000.0, 10.0)) == pytest.approx(scene.duration)
         assert scene.time_at_canvas_pos((-50.0, 10.0)) == 0.0
         assert scene.time_at_canvas_pos((2000.0, 10.0)) == pytest.approx(scene.duration)
+
+
+def test_audio_spectrum_scene_set_spectrum() -> None:
+    canvas = MagicMock()
+    grid = MagicMock()
+    canvas.central_widget.add_grid.return_value = grid
+    view = MagicMock()
+    view.scene = MagicMock()
+    grid.add_view.return_value = view
+    line_mock = MagicMock()
+    axis_widget = MagicMock()
+
+    import vispy.scene
+
+    with (
+        patch.object(vispy.scene, "PanZoomCamera", MagicMock),
+        patch.object(vispy.scene.cameras, "PanZoomCamera", MagicMock),
+        patch.object(vispy.scene.visuals, "Line", MagicMock(return_value=line_mock)),
+        patch.object(vispy.scene, "AxisWidget", MagicMock(return_value=axis_widget)),
+    ):
+        scene = AudioSpectrumScene(canvas)
+        freqs = np.array([0.0, 100.0, 200.0])
+        db = np.array([-80.0, 0.0, -20.0])
+        scene.set_spectrum(freqs, db, color="#1f77b4")
+        line_mock.set_data.assert_called()
+        axis_widget.link_view.assert_called()
+        pos = line_mock.set_data.call_args.kwargs.get("pos")
+        if pos is None:
+            pos = line_mock.set_data.call_args[1].get("pos")
+        assert pos is not None
+        assert pos.shape[1] == 2

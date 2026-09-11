@@ -15,6 +15,8 @@ from scan_kit.views.audio_player_data import (
     beam_subtract,
     build_playback_channels,
     extract_audio_signal,
+    format_play_time,
+    live_spectrum,
     normalize,
     prepare_waveform_render,
     write_wav,
@@ -252,3 +254,25 @@ def test_write_wav_round_trip() -> None:
             assert wf.getsampwidth() == 2
             assert wf.getframerate() == 1000
             assert wf.getnframes() == len(sig)
+
+
+def test_format_play_time() -> None:
+    assert format_play_time(0.0) == "0:00.0"
+    assert format_play_time(65.2) == "1:05.2"
+
+
+def test_live_spectrum_peaks_at_tone() -> None:
+    fs = 1000.0
+    t = np.arange(2000) / fs
+    sig = np.sin(2.0 * np.pi * 100.0 * t)
+    freqs, db = live_spectrum(sig, 1.0, 250.0, fs=fs)
+    peak_hz = float(freqs[np.argmax(db)])
+    assert peak_hz == pytest.approx(100.0, abs=8.0)
+    assert float(np.max(db)) == pytest.approx(0.0, abs=1e-6)
+    assert float(np.min(db)) >= -80.0 - 1e-6
+
+
+def test_live_spectrum_empty_is_floor() -> None:
+    freqs, db = live_spectrum(np.array([], dtype=float), 0.0, 250.0, fs=1000.0)
+    assert len(freqs) == len(db)
+    assert np.all(db == -80.0)
