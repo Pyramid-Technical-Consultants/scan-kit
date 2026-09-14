@@ -81,4 +81,4 @@ def test_ic_hv_transient_trapz_imports_on_numpy2() -> None:
 
 
 def test_tk_only_views_excluded_from_warm_worker_pool() -> None:
-    assert TK_ONLY_VIEW_MODULES == frozenset({"ic_audio_export"})
+    assert TK_ONLY_VIEW_MODULES == frozenset()

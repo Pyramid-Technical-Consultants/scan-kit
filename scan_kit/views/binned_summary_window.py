@@ -21,7 +21,7 @@ from PySide6.QtWidgets import (
 from ..common import ViewSettings
 from ..common.ic_xy_distribution import normalize_contour_cutoff_percentile
 from ..common.interlock_thresholds import interlock_overlay_available
-from ..common.data_filter import FILTER_ALL, FILTER_BEAM_BOTH, FILTER_BEAM_ON
+from ..common.data_filter import FILTER_ALL, FILTER_BEAM_ON
 from .binned_summary_catalog import (
     DATA_SOURCE_SPOT_ISO,
     DATA_SOURCE_TIMESLICE_ISO,
@@ -595,8 +595,8 @@ class BinnedSummaryWindow(PlotViewWindow):
             beam_state_filter=(
                 self._filter_panel.selected_beam_state()
                 if self._filter_panel is not None
-                else FILTER_BEAM_BOTH
-            ) or FILTER_BEAM_BOTH,
+                else FILTER_BEAM_ON
+            ) or FILTER_BEAM_ON,
         )
 
     def _set_controls_from_config(self, config: BinnedSummaryConfig) -> None:

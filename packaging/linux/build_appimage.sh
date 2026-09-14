@@ -27,23 +27,20 @@ cp "${ROOT}/packaging/linux/AppRun" "${APPDIR}/AppRun"
 chmod +x "${APPDIR}/AppRun"
 
 cp "${ROOT}/packaging/linux/appimage.desktop" "${APPDIR}/scan-kit.desktop"
-cp "${ROOT}/scan_kit/assets/icon.png" "${APPDIR}/scan-kit.png"
-ln -sf scan-kit.png "${APPDIR}/.DirIcon"
+mkdir -p "${APPDIR}/usr/share/applications" "${APPDIR}/usr/share/metainfo"
+cp "${ROOT}/packaging/linux/appimage.desktop" "${APPDIR}/usr/share/applications/scan-kit.desktop"
+cp "${ROOT}/packaging/linux/scan-kit.appdata.xml" "${APPDIR}/usr/share/metainfo/scan-kit.appdata.xml"
 ln -sf "usr/scan-kit/scan-kit" "${APPDIR}/scan-kit"
 
-# Freedesktop icon theme paths so Icon=scan-kit resolves before first-run install.
 ICON_PNG="${ROOT}/scan_kit/assets/icon.png"
-ICON_SVG="${ROOT}/scan_kit/assets/scan-kit-icon.svg"
-for size in 16 24 32 48 64 128 256; do
-  dest="${APPDIR}/usr/share/icons/hicolor/${size}x${size}/apps"
-  mkdir -p "${dest}"
-  cp "${ICON_PNG}" "${dest}/scan-kit.png"
-done
-if [[ -f "${ICON_SVG}" ]]; then
-  svg_dest="${APPDIR}/usr/share/icons/hicolor/scalable/apps"
-  mkdir -p "${svg_dest}"
-  cp "${ICON_SVG}" "${svg_dest}/scan-kit.svg"
-fi
+SCAN_KIT_APPDIR="${APPDIR}" SCAN_KIT_ICON="${ICON_PNG}" python - <<'PY'
+import os
+from pathlib import Path
+
+from scan_kit.common.linux_desktop import install_appdir_icons
+
+install_appdir_icons(Path(os.environ["SCAN_KIT_APPDIR"]), Path(os.environ["SCAN_KIT_ICON"]))
+PY
 
 if [[ ! -x "${APPIMAGETOOL}" ]]; then
   echo "Downloading appimagetool…"
