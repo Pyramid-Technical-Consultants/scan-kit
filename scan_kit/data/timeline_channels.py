@@ -6,11 +6,23 @@ metadata (colors, PSD units, presets) via thin adapters.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
+
+from ..common.schema import (
+    C_AMPLIFIER_CMD_X,
+    C_AMPLIFIER_CMD_Y,
+    C_AMPLIFIER_READBACK_X,
+    C_AMPLIFIER_READBACK_Y,
+    C_IC1_X_PEAK_AMPLITUDE,
+    C_IC1_Y_PEAK_AMPLITUDE,
+    C_IC2_X_PEAK_AMPLITUDE,
+    C_IC2_Y_PEAK_AMPLITUDE,
+    resolve_concept_column,
+)
 
 SOURCE_IC_CURRENT = "ic_current"
 SOURCE_SIGMA = "sigma"
@@ -20,12 +32,12 @@ FAMILY_DDOSE = "dDose/dt"
 FAMILY_SIGMA = "Sigma"
 FAMILY_FIELD = "Magnetic Field"
 FAMILY_AMPLIFIER = "Amplifier"
-FAMILY_BEAM = "Beam Current"
+FAMILY_BEAM = "Source Beam Current"
 FAMILY_POSITION = "Chamber Position"
 FAMILY_POSITION_ERROR = "Position Error"
 FAMILY_SIGMA_ERROR = "Sigma Error"
 FAMILY_IC12_POS_DIFF = "IC2−IC1 Position"
-FAMILY_PEAK = "Peak Amplitude (G3)"
+FAMILY_PEAK = "Gaussian Peak (G3)"
 
 TimelineBundle = dict[str, Any]
 ChannelExtract = Callable[[TimelineBundle], np.ndarray | None]
@@ -189,7 +201,7 @@ TIMELINE_CHANNEL_SPECS: tuple[TimelineChannelSpec, ...] = (
     _spec("amp_rb_x", "Readback X", FAMILY_AMPLIFIER, psd_unit="V", replay_visible=False),
     _spec("amp_rb_y", "Readback Y", FAMILY_AMPLIFIER, psd_unit="V", replay_visible=False),
     _spec(
-        "beam", "Beam Current", FAMILY_BEAM,
+        "beam", "Source Beam I", FAMILY_BEAM,
         psd_unit="nA",
         replay_visible=False,
         beam_off_quiet_threshold=10.0,
@@ -239,25 +251,25 @@ TIMELINE_CHANNEL_SPECS: tuple[TimelineChannelSpec, ...] = (
         psd_unit="mm", replay_color="#d62728", fft_visible=False,
     ),
     _spec(
-        "ic1_x_peak", "IC1 X Peak", FAMILY_PEAK,
+        "ic1_x_peak", "IC1 X Fit Peak", FAMILY_PEAK,
         psd_unit="nA",
         replay_visible=False,
         beam_off_quiet_threshold=10.0,
     ),
     _spec(
-        "ic1_y_peak", "IC1 Y Peak", FAMILY_PEAK,
+        "ic1_y_peak", "IC1 Y Fit Peak", FAMILY_PEAK,
         psd_unit="nA",
         replay_visible=False,
         beam_off_quiet_threshold=10.0,
     ),
     _spec(
-        "ic2_x_peak", "IC2 X Peak", FAMILY_PEAK,
+        "ic2_x_peak", "IC2 X Fit Peak", FAMILY_PEAK,
         psd_unit="nA",
         replay_visible=False,
         beam_off_quiet_threshold=10.0,
     ),
     _spec(
-        "ic2_y_peak", "IC2 Y Peak", FAMILY_PEAK,
+        "ic2_y_peak", "IC2 Y Fit Peak", FAMILY_PEAK,
         psd_unit="nA",
         replay_visible=False,
         beam_off_quiet_threshold=10.0,
@@ -275,6 +287,39 @@ REPLAY_CHANNEL_SPECS: tuple[TimelineChannelSpec, ...] = tuple(
 FFT_CHANNEL_SPECS: tuple[TimelineChannelSpec, ...] = tuple(
     spec for spec in TIMELINE_CHANNEL_SPECS if spec.fft_visible
 )
+
+AMPLIFIER_CHANNEL_CONCEPTS: dict[str, str] = {
+    "amp_cmd_x": C_AMPLIFIER_CMD_X,
+    "amp_cmd_y": C_AMPLIFIER_CMD_Y,
+    "amp_rb_x": C_AMPLIFIER_READBACK_X,
+    "amp_rb_y": C_AMPLIFIER_READBACK_Y,
+}
+
+PEAK_CHANNEL_CONCEPTS: dict[str, str] = {
+    "ic1_x_peak": C_IC1_X_PEAK_AMPLITUDE,
+    "ic1_y_peak": C_IC1_Y_PEAK_AMPLITUDE,
+    "ic2_x_peak": C_IC2_X_PEAK_AMPLITUDE,
+    "ic2_y_peak": C_IC2_Y_PEAK_AMPLITUDE,
+}
+
+
+def resolve_timeline_concept_columns(
+    columns: Iterable[str],
+    mapping: dict[str, str],
+) -> dict[str, str | None]:
+    """Map timeline channel keys to physical/canonical CSV column names."""
+    return {
+        key: resolve_concept_column(columns, concept)
+        for key, concept in mapping.items()
+    }
+
+
+def resolve_amplifier_columns(columns: Iterable[str]) -> dict[str, str | None]:
+    return resolve_timeline_concept_columns(columns, AMPLIFIER_CHANNEL_CONCEPTS)
+
+
+def resolve_peak_columns(columns: Iterable[str]) -> dict[str, str | None]:
+    return resolve_timeline_concept_columns(columns, PEAK_CHANNEL_CONCEPTS)
 
 
 def channel_available(session: TimelineBundle, spec: TimelineChannelSpec) -> bool:

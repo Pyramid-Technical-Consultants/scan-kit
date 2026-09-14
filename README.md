@@ -258,7 +258,7 @@ The **Configuration Tuning** tab is a structured editor for map2map XML configur
 - **Auto-generated forms** — edit XML values without raw markup
 - **Hide unused map2map XML** — collapse attributes the map2map library never reads
 - **Integrity badges** — SHA-256 sidecar verification at a glance
-- **Auto-tuning workflows** — **Sigma Tuning**, **Position Offset Tuning**, and **IC Distance Tuning** derive updated `devices.xml` values from measured sessions, with preview before apply
+- **Auto-tuning workflows** — **Sigma Tuning**, **Position Offset Tuning**, **IC Distance Tuning**, and **Dose Calibration** derive updated `devices.xml` values from measured sessions, with preview before apply
 
 Jump here directly from a session's context menu in Data Analysis when an on-disk config folder exists.
 
@@ -294,6 +294,20 @@ Read the preview by these columns:
 | **Systematic** | position error at the worst field edge that the change removes — the reason to apply it |
 | **RMS err** | what the fit minimises, so the honest before/after |
 | **Max \|err\|** | a single worst spot; it can *rise* when correcting a systematic of opposite sign stops masking an outlier |
+
+### Dose calibration: kMU
+
+`K_MU` on each ion chamber (`gain_conversion` with `in_units="MU"`) is coulombs per monitor unit. map2map converts `MU = Q / K_MU`; session `ic*_total_dose_spot` columns are already in MU.
+
+If the primary IC is the beam terminator, its reported MU already matches `CHARGE_REQ` by construction. Matching primary `K_MU` to the plan would be circular and would not change dose at isocenter. **Dose Calibration** therefore:
+
+- leaves primary `K_MU` unchanged by default
+- scales every secondary IC family so it would have reported the same total MU as the primary on the selected deliveries
+- optionally rescales the primary first, either to a known MU delivered at isocenter (Faraday / iso chamber, total for the selected sessions combined) or by a percentage of reported MU
+
+Positive percent means more reported MU / more delivered charge for the same prescription, so `K_MU` decreases (`+2%` → scale `1/1.02`). Changing primary `K_MU` changes future delivered charge for the same `CHARGE_REQ`; secondary-only applies align reporting and interlocks, not absolute dose.
+
+HCC and strip devices in one IC family keep their relative `K_MU` and all move by the same factor. Large commissioning corrections are allowed; the preview warns above 5% rather than blocking the write. This is not Data Analysis plot calibration (`per_session` / `constrained`), which never writes `devices.xml`.
 
 <p align="center">
   <img src="docs/images/launcher-config-tuning.png" alt="Configuration Tuning tab editing devices.xml" width="720">
