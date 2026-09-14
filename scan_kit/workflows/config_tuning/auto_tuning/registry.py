@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from .base import AutoTuneWorkflow
 from .workflows.ic_distance_tuning import IcDistanceTuningWorkflow
-from .workflows.kmu_tuning import KmuTuningWorkflow
 from .workflows.position_offset_tuning import PositionOffsetTuningWorkflow
 from .workflows.sigma_tuning import SigmaTuningWorkflow
 
@@ -12,7 +11,6 @@ AUTO_TUNE_REGISTRY: list[AutoTuneWorkflow] = [
     SigmaTuningWorkflow(),
     PositionOffsetTuningWorkflow(),
     IcDistanceTuningWorkflow(),
-    KmuTuningWorkflow(),
 ]
 
 _WORKFLOWS_BY_ID: dict[str, AutoTuneWorkflow] = {w.id: w for w in AUTO_TUNE_REGISTRY}

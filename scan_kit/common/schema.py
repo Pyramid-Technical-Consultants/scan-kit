@@ -363,10 +363,9 @@ def canonicalize_dataframe_columns(
     df: pd.DataFrame,
     *,
     aliases: dict[str, tuple[str, ...]] | None = None,
-    copy: bool = True,
 ) -> pd.DataFrame:
     """Strip/normalize columns and rename known aliases to canonical names."""
-    out = df.copy() if copy else df
+    out = df.copy()
     out.columns = [str(c).strip() for c in out.columns]
     alias_map = aliases or canonical_column_aliases()
 

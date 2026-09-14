@@ -38,18 +38,6 @@ from .auto_tuning.ic_distance_preview_table import (
     preview_chamber_count,
 )
 from .auto_tuning.ic_distance_tune import IcDistanceTunePreviewRow
-from .auto_tuning.kmu_preview_table import (
-    clear_kmu_preview_table,
-    fill_kmu_preview_table,
-    max_preview_kmu_delta_pct,
-    preview_write_count,
-    primary_measured_mu,
-)
-from .auto_tuning.kmu_tune import (
-    DEFAULT_KMU_PRIMARY_IC,
-    DEFAULT_KMU_PRIMARY_MODE,
-    KmuTunePreviewRow,
-)
 from .auto_tuning.position_offset_preview_table import (
     fill_position_offset_preview_table,
     max_preview_residual_mm,
@@ -73,7 +61,6 @@ PreviewRows = (
     list[SigmaTunePreviewRow]
     | list[PositionOffsetTunePreviewRow]
     | list[IcDistanceTunePreviewRow]
-    | list[KmuTunePreviewRow]
 )
 PreviewFn = Callable[
     [AutoTuneWorkflow, dict[str, Any]],
@@ -81,7 +68,7 @@ PreviewFn = Callable[
 ]
 
 _PREVIEW_WORKFLOW_IDS = frozenset(
-    {"sigma_tuning", "position_offset_tuning", "ic_distance_tuning", "kmu_tuning"}
+    {"sigma_tuning", "position_offset_tuning", "ic_distance_tuning"}
 )
 
 
@@ -291,102 +278,6 @@ class AutoTuneDetailWidget(QWidget):
         self._position_source_host.setVisible(False)
         layout.addWidget(self._position_source_host)
 
-        self._kmu_host = QWidget()
-        kmu_layout = QVBoxLayout(self._kmu_host)
-        kmu_layout.setContentsMargins(0, 0, 0, 0)
-        kmu_layout.setSpacing(6)
-
-        primary_row = QHBoxLayout()
-        primary_row.setContentsMargins(0, 0, 0, 0)
-        primary_row.setSpacing(12)
-        primary_row.addWidget(QLabel("Primary IC"))
-        self._kmu_primary_group = QButtonGroup(self)
-        self._kmu_primary_ic1 = QRadioButton("IC1")
-        self._kmu_primary_ic2 = QRadioButton("IC2")
-        self._kmu_primary_ic3 = QRadioButton("IC3")
-        self._kmu_primary_ic1.setToolTip(
-            "Beam-terminator chamber. Left unchanged unless you rescale it below."
-        )
-        self._kmu_primary_ic2.setToolTip("Use IC2 as the primary / reference chamber.")
-        self._kmu_primary_ic3.setToolTip("Use IC3 as the primary / reference chamber.")
-        self._kmu_primary_ic1.setChecked(DEFAULT_KMU_PRIMARY_IC == "ic1")
-        for button in (
-            self._kmu_primary_ic1,
-            self._kmu_primary_ic2,
-            self._kmu_primary_ic3,
-        ):
-            self._kmu_primary_group.addButton(button)
-            primary_row.addWidget(button)
-        primary_row.addStretch(1)
-        self._kmu_primary_group.buttonToggled.connect(self._on_kmu_option_changed)
-        kmu_layout.addLayout(primary_row)
-
-        kmu_layout.addWidget(QLabel("Primary K_MU"))
-        self._kmu_mode_group = QButtonGroup(self)
-
-        unchanged_row = QHBoxLayout()
-        unchanged_row.setContentsMargins(0, 0, 0, 0)
-        self._kmu_mode_unchanged = QRadioButton("Leave unchanged")
-        self._kmu_mode_unchanged.setToolTip(
-            "Do not write primary K_MU. Secondaries are scaled to agree with it."
-        )
-        self._kmu_mode_unchanged.setChecked(DEFAULT_KMU_PRIMARY_MODE == "unchanged")
-        self._kmu_mode_group.addButton(self._kmu_mode_unchanged)
-        unchanged_row.addWidget(self._kmu_mode_unchanged)
-        unchanged_row.addStretch(1)
-        kmu_layout.addLayout(unchanged_row)
-
-        known_row = QHBoxLayout()
-        known_row.setContentsMargins(0, 0, 0, 0)
-        self._kmu_mode_known = QRadioButton("Rescale to known MU at isocenter")
-        self._kmu_mode_known.setToolTip(
-            "Independent Faraday / iso-chamber total for the selected sessions "
-            "combined. Changing primary K_MU changes future delivered charge "
-            "for the same CHARGE_REQ."
-        )
-        self._kmu_mode_group.addButton(self._kmu_mode_known)
-        known_row.addWidget(self._kmu_mode_known)
-        self._kmu_known_mu_spin = QDoubleSpinBox()
-        self._kmu_known_mu_spin.setRange(0.0, 1_000_000_000.0)
-        self._kmu_known_mu_spin.setDecimals(4)
-        self._kmu_known_mu_spin.setSuffix(" MU")
-        self._kmu_known_mu_spin.setSingleStep(0.1)
-        self._kmu_known_mu_spin.setSpecialValueText("enter MU")
-        self._kmu_known_mu_spin.setToolTip(
-            "Total MU at isocenter for the selected sessions combined."
-        )
-        self._kmu_known_mu_spin.valueChanged.connect(self._on_kmu_option_changed)
-        known_row.addWidget(self._kmu_known_mu_spin)
-        self._kmu_primary_sum_label = QLabel("Primary reports — MU")
-        self._kmu_primary_sum_label.setForegroundRole(QPalette.ColorRole.PlaceholderText)
-        known_row.addWidget(self._kmu_primary_sum_label)
-        known_row.addStretch(1)
-        kmu_layout.addLayout(known_row)
-
-        percent_row = QHBoxLayout()
-        percent_row.setContentsMargins(0, 0, 0, 0)
-        self._kmu_mode_percent = QRadioButton("Adjust reported MU by")
-        self._kmu_mode_percent.setToolTip(
-            "Positive means more reported MU / more delivered charge for the "
-            "same prescription, so K_MU decreases. +2% → scale 1/1.02."
-        )
-        self._kmu_mode_group.addButton(self._kmu_mode_percent)
-        percent_row.addWidget(self._kmu_mode_percent)
-        self._kmu_percent_spin = QDoubleSpinBox()
-        self._kmu_percent_spin.setRange(-50.0, 50.0)
-        self._kmu_percent_spin.setDecimals(2)
-        self._kmu_percent_spin.setSuffix(" %")
-        self._kmu_percent_spin.setSingleStep(0.1)
-        self._kmu_percent_spin.valueChanged.connect(self._on_kmu_option_changed)
-        percent_row.addWidget(self._kmu_percent_spin)
-        percent_row.addStretch(1)
-        kmu_layout.addLayout(percent_row)
-
-        self._kmu_mode_group.buttonToggled.connect(self._on_kmu_mode_changed)
-        self._kmu_host.setVisible(False)
-        layout.addWidget(self._kmu_host)
-        self._sync_kmu_mode_editors()
-
         self._param_host = QWidget()
         self._param_form = QFormLayout(self._param_host)
         self._param_form.setContentsMargins(0, 0, 0, 0)
@@ -462,7 +353,6 @@ class AutoTuneDetailWidget(QWidget):
             self._sigma_method_host.setVisible(False)
             self._sigma_tolerance_host.setVisible(False)
             self._position_source_host.setVisible(False)
-            self._kmu_host.setVisible(False)
             self._clear_preview()
             self._apply_btn.setEnabled(False)
             return
@@ -473,7 +363,6 @@ class AutoTuneDetailWidget(QWidget):
         self._sigma_method_host.setVisible(workflow.id == "position_offset_tuning")
         self._sigma_tolerance_host.setVisible(workflow.id == "sigma_tuning")
         self._position_source_host.setVisible(workflow.id == "position_offset_tuning")
-        self._kmu_host.setVisible(workflow.id == "kmu_tuning")
         if workflow.uses_session_browser():
             self._show_session_browser()
         else:
@@ -573,32 +462,6 @@ class AutoTuneDetailWidget(QWidget):
     def _on_position_source_changed(self) -> None:
         self._refresh_preview()
 
-    def _selected_kmu_primary_ic(self) -> str:
-        if self._kmu_primary_ic2.isChecked():
-            return "ic2"
-        if self._kmu_primary_ic3.isChecked():
-            return "ic3"
-        return "ic1"
-
-    def _selected_kmu_primary_mode(self) -> str:
-        if self._kmu_mode_known.isChecked():
-            return "known_mu"
-        if self._kmu_mode_percent.isChecked():
-            return "percent"
-        return "unchanged"
-
-    def _sync_kmu_mode_editors(self) -> None:
-        mode = self._selected_kmu_primary_mode()
-        self._kmu_known_mu_spin.setEnabled(mode == "known_mu")
-        self._kmu_percent_spin.setEnabled(mode == "percent")
-
-    def _on_kmu_mode_changed(self) -> None:
-        self._sync_kmu_mode_editors()
-        self._refresh_preview()
-
-    def _on_kmu_option_changed(self) -> None:
-        self._refresh_preview()
-
     def read_params(self) -> dict[str, Any]:
         params = {key: editor.text().strip() for key, editor in self._editors.items()}
         if (
@@ -615,19 +478,10 @@ class AutoTuneDetailWidget(QWidget):
             params["optimize_method"] = self._selected_optimize_method()
         if self._current is not None and self._current.id == "position_offset_tuning":
             params["data_source"] = self._selected_position_data_source()
-        if self._current is not None and self._current.id == "kmu_tuning":
-            params["primary_ic"] = self._selected_kmu_primary_ic()
-            params["primary_mode"] = self._selected_kmu_primary_mode()
-            params["known_mu"] = self._kmu_known_mu_spin.value()
-            params["percent"] = self._kmu_percent_spin.value()
         return params
 
     def _clear_preview(self) -> None:
-        if self._current is not None and self._current.id == "kmu_tuning":
-            clear_kmu_preview_table(self._preview_table)
-            self._kmu_primary_sum_label.setText("Primary reports — MU")
-        else:
-            clear_sigma_preview_table(self._preview_table)
+        clear_sigma_preview_table(self._preview_table)
         self._preview_status.setText(
             "Select one or more sessions to preview proposed values."
         )
@@ -654,9 +508,6 @@ class AutoTuneDetailWidget(QWidget):
         elif self._current.id == "ic_distance_tuning":
             fill_ic_distance_preview_table(self._preview_table, rows)
             self._update_ic_distance_preview_status(rows, warnings, params)
-        elif self._current.id == "kmu_tuning":
-            fill_kmu_preview_table(self._preview_table, rows)
-            self._update_kmu_preview_status(rows, warnings, params)
         if warnings and rows:
             extra = "; ".join(warnings)
             self._preview_status.setText(f"{self._preview_status.text()} {extra}")
@@ -743,38 +594,6 @@ class AutoTuneDetailWidget(QWidget):
                 "No chamber had enough plan spread to fit a distance."
             )
 
-    def _update_kmu_preview_status(
-        self,
-        rows: list[KmuTunePreviewRow],
-        warnings: list[str],
-        params: dict[str, Any],
-    ) -> None:
-        primary_mu = primary_measured_mu(rows)
-        if primary_mu is not None:
-            self._kmu_primary_sum_label.setText(f"Primary reports {primary_mu:.4g} MU")
-        else:
-            self._kmu_primary_sum_label.setText("Primary reports — MU")
-        if rows:
-            session_ids = params.get("session_ids") or []
-            session_note = (
-                f" from {len(session_ids)} sessions" if len(session_ids) > 1 else ""
-            )
-            n_write = preview_write_count(rows)
-            status = f"{n_write} K_MU value(s) will be updated{session_note}."
-            max_delta = max_preview_kmu_delta_pct(rows)
-            if max_delta is not None:
-                status += f" Max |Δ K_MU|: {max_delta:.2f}%."
-            if primary_mu is not None:
-                status += f" Σ primary {primary_mu:.4g} MU."
-            plan_mu = next((row.plan_mu for row in rows if row.role == "primary"), float("nan"))
-            if plan_mu == plan_mu and plan_mu > 0.0:
-                status += f" Σ plan {plan_mu:.4g} MU."
-            self._preview_status.setText(status)
-        elif warnings:
-            self._preview_status.setText(warnings[0])
-        else:
-            self._preview_status.setText("No matching K_MU rows for this session.")
-
     def _confirm_apply(self, params: dict[str, Any]) -> bool:
         if self._current is None:
             return False
@@ -829,32 +648,6 @@ class AutoTuneDetailWidget(QWidget):
                 "afterwards.\n\n"
                 "The configuration will be marked dirty until you save."
             )
-        elif self._current.id == "kmu_tuning":
-            session_ids = params.get("session_ids") or []
-            if len(session_ids) == 1:
-                source = f"session {session_ids[0]}"
-            elif session_ids:
-                source = f"{len(session_ids)} sessions"
-            else:
-                source = "the selected session(s)"
-            primary = str(params.get("primary_ic") or "ic1").upper()
-            mode = params.get("primary_mode") or "unchanged"
-            if mode == "unchanged":
-                detail = (
-                    f"Rewrite secondary IC K_MU values in devices.xml so they agree "
-                    f"with {primary} using data from {source}?\n\n"
-                    f"Primary {primary} K_MU is left unchanged. This aligns secondary "
-                    f"reporting and interlocks, not absolute dose at isocenter.\n\n"
-                    "The configuration will be marked dirty until you save."
-                )
-            else:
-                detail = (
-                    f"Rewrite K_MU values in devices.xml using data from {source}?\n\n"
-                    f"This will change the primary ({primary}) K_MU, which changes "
-                    f"future delivered charge for the same CHARGE_REQ. Secondaries "
-                    f"are scaled to agree with the adjusted primary.\n\n"
-                    "The configuration will be marked dirty until you save."
-                )
         else:
             detail = (
                 f"Apply {self._current.name} to this configuration?\n\n"

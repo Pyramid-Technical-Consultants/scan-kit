@@ -82,13 +82,9 @@ def beam_state_mask(
         return np.ones(n, dtype=bool)
     if beam_on is None:
         return np.ones(n, dtype=bool)
-    on = np.asarray(beam_on, dtype=bool).reshape(-1)
-    if on.size != n:
-        # ponytail: align rather than drop the filter when loaders disagree on length
-        aligned = np.ones(n, dtype=bool)
-        m = min(on.size, n)
-        aligned[:m] = on[:m]
-        on = aligned
+    on = np.asarray(beam_on, dtype=bool)
+    if len(on) != n:
+        return np.ones(n, dtype=bool)
     if filter_id == FILTER_BEAM_ON:
         return on
     if filter_id == FILTER_BEAM_OFF:
@@ -245,8 +241,10 @@ def filter_session_dict(session: dict, mask: np.ndarray) -> dict:
             continue
         arr = np.asarray(value)
         if arr.ndim == 1 and len(arr) == len(mask):
-            kept = arr[mask]
-            out[key] = kept.astype(bool) if key == "beam_on" else kept
+            if key == "beam_on":
+                out[key] = arr[mask].astype(bool)
+            else:
+                out[key] = _mask_array(arr, mask)
     return out
 
 
