@@ -141,7 +141,7 @@ Enter the folder that contains session data in **DATA SOURCE**, then press **Ent
 
 ### 2. Select sessions
 
-The session table shows **Session ID**, **Config**, **Date**, **MU**, **Time**, **RM**, and **Note**.
+The session table shows **Session ID**, **Date**, **MU**, **Time**, **RM**, **Config**, and **Note**.
 
 - Sort by **Date** (newest first), **ID**, **Config**, or **MU**
 - Tick **Use** on up to **five** sessions — no modifier key needed

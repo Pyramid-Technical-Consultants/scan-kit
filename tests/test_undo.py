@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import pytest
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication
 
-from scan_kit.common.session_browser import _COL_NOTE, SessionBrowserWidget
+from scan_kit.common.session_browser import _COL_CONFIG, _COL_NOTE, SessionBrowserWidget
+from scan_kit.common.session_meta import SessionMeta
 from scan_kit.common.user_store import notes_for_library
 
 
@@ -115,5 +117,34 @@ def test_actions_absent_when_notes_readonly(qapp, tmp_path) -> None:
     try:
         assert widget.undo_action() is None
         assert widget.redo_action() is None
+    finally:
+        widget.shutdown()
+
+
+def test_config_column_after_room_elides_with_tooltip(qapp, tmp_path) -> None:
+    widget = _make_widget(tmp_path)
+    try:
+        headers = [
+            widget._table.horizontalHeaderItem(i).text()
+            for i in range(widget._table.columnCount())
+        ]
+        assert headers == [
+            "Use", "Session ID", "Date", "MU", "Time", "RM", "Config", "Note",
+        ]
+        assert widget._table.textElideMode() == Qt.TextElideMode.ElideRight
+
+        name = "working_hvtt_new_cal_gates_tuned"
+        meta = SessionMeta(
+            date=None,
+            primary_mu=None,
+            treatment_time_s=None,
+            room_number=1,
+            config_name=name,
+        )
+        widget._set_session_row_widgets(0, "S1", meta, use_checked=False)
+        cell = widget._table.item(0, _COL_CONFIG)
+        assert cell is not None
+        assert cell.text() == name
+        assert cell.toolTip() == name
     finally:
         widget.shutdown()
