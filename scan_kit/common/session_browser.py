@@ -31,6 +31,7 @@ from PySide6.QtWidgets import (
     QMenu,
     QMessageBox,
     QPushButton,
+    QStyle,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -153,6 +154,16 @@ def _compact_meta_column_widths(fm: QFontMetrics) -> dict[int, int]:
         _COL_TIME: fm.horizontalAdvance("99:59") + pad,
         _COL_ROOM: max(fm.horizontalAdvance("RM"), fm.horizontalAdvance("99")) + pad,
     }
+
+
+def _use_column_width(table: QTableWidget) -> int:
+    """Checkbox + plot swatch + header; fixed so refresh does not twitch the column."""
+    fm = QFontMetrics(table.font())
+    check = table.style().pixelMetric(
+        QStyle.PixelMetric.PM_IndicatorWidth, None, table
+    )
+    header = fm.horizontalAdvance("Use") + 16
+    return max(header, check + table.iconSize().width() + 16)
 
 
 def _config_column_width(fm: QFontMetrics) -> int:
@@ -319,9 +330,11 @@ class SessionBrowserWidget(QWidget):
         self._table.setAlternatingRowColors(True)
         self._table.setTextElideMode(Qt.TextElideMode.ElideRight)
         self._table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self._table.setIconSize(QSize(_SWATCH_PX, _SWATCH_PX))
         hh = self._table.horizontalHeader()
         hh.setMinimumSectionSize(16)
-        hh.setSectionResizeMode(_COL_USE, QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(_COL_USE, QHeaderView.ResizeMode.Fixed)
+        hh.resizeSection(_COL_USE, _use_column_width(self._table))
         hh.setSectionResizeMode(_COL_SESSION_ID, QHeaderView.ResizeMode.ResizeToContents)
         hh.setSectionResizeMode(_COL_DATE, QHeaderView.ResizeMode.ResizeToContents)
         fm = QFontMetrics(self._table.font())
@@ -336,7 +349,6 @@ class SessionBrowserWidget(QWidget):
         hh.setSortIndicatorShown(True)
         self._table.sortByColumn(_COL_DATE, Qt.SortOrder.DescendingOrder)
         self._table.verticalHeader().setVisible(False)
-        self._table.setIconSize(QSize(_SWATCH_PX, _SWATCH_PX))
         self._table.itemChanged.connect(self._on_table_item_changed)
         self._table.currentCellChanged.connect(self._on_current_cell_changed)
         self._table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
@@ -919,7 +931,7 @@ class SessionBrowserWidget(QWidget):
             self._table.blockSignals(False)
 
     def _resize_session_meta_columns(self) -> None:
-        for col in (_COL_USE, _COL_SESSION_ID, _COL_DATE):
+        for col in (_COL_SESSION_ID, _COL_DATE):
             self._table.resizeColumnToContents(col)
 
     def _fill_meta_columns(self, row: int, meta: SessionMeta | None) -> None:
