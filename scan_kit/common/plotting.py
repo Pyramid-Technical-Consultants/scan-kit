@@ -565,7 +565,7 @@ def set_view_header(
     """Place the view title and session legend centered as one inline group.
 
     The title sits immediately to the left of the session legend.  The legend
-    shows session color, ID, and optional note from ``session_notes.json`` when
+    shows session color, ID, and optional note from the session store when
     *base_dir* is provided.
     """
     _clear_view_header(fig)
@@ -759,7 +759,7 @@ def make_session_legend(
         ax: Matplotlib axes.
         session_ids: List of session ID strings.
         colors: Matching list of face colors.
-        base_dir: Data directory for ``session_notes.json``.
+        base_dir: Data directory for session notes.
         notes: Pre-loaded notes dict; overrides *base_dir* when given.
         **kwargs: Forwarded to ``ax.legend()``.
     """
