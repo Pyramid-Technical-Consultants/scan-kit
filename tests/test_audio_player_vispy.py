@@ -86,7 +86,8 @@ def test_audio_waveform_scene_set_render_channels() -> None:
 
     polygon_mock = MagicMock()
     mesh_mock = MagicMock()
-    line_mock = MagicMock()
+    wave_mock = MagicMock()
+    cursor_mock = MagicMock()
     with (
         patch.object(vispy.scene.cameras, "PanZoomCamera", MagicMock),
         patch.object(
@@ -95,7 +96,10 @@ def test_audio_waveform_scene_set_render_channels() -> None:
         patch.object(
             vispy.scene.visuals, "Mesh", MagicMock(return_value=mesh_mock),
         ),
-        patch.object(vispy.scene.visuals, "Line", MagicMock(return_value=line_mock)),
+        patch.object(
+            vispy.scene.visuals, "Line",
+            MagicMock(side_effect=[wave_mock, cursor_mock]),
+        ),
         patch.object(vispy.scene, "Text", MagicMock),
         patch.object(vispy.scene, "AxisWidget", MagicMock),
     ):
@@ -108,9 +112,17 @@ def test_audio_waveform_scene_set_render_channels() -> None:
         assert len(scene._rows) == 1
         assert scene.duration > 0.0
         mesh_mock.set_gl_state.assert_called_once_with(
-            "translucent", depth_test=False, depth_mask=False,
+            "translucent",
+            depth_test=True,
+            depth_mask=True,
+            cull_face=False,
+            polygon_offset_fill=True,
+            polygon_offset=(2.0, 2.0),
         )
-        assert line_mock.order == 1
+        assert mesh_mock.order == 0
+        assert wave_mock.parent is view.scene
+        assert cursor_mock.parent is view.scene
+        assert cursor_mock.order == 2
 
 
 def test_time_at_canvas_pos_maps_x_linearly() -> None:
@@ -160,7 +172,7 @@ def test_audio_spectrum_scene_set_spectrum() -> None:
     view.scene = MagicMock()
     grid.add_view.return_value = view
     spec_line = MagicMock()
-    peak_line = MagicMock()
+    peak_lines = [MagicMock() for _ in range(6)]
     axis_widget = MagicMock()
 
     import vispy.scene
@@ -170,13 +182,13 @@ def test_audio_spectrum_scene_set_spectrum() -> None:
         patch.object(vispy.scene.cameras, "PanZoomCamera", MagicMock),
         patch.object(
             vispy.scene.visuals, "Line",
-            MagicMock(side_effect=[spec_line, peak_line]),
+            MagicMock(side_effect=[spec_line, *peak_lines]),
         ),
         patch.object(vispy.scene, "AxisWidget", MagicMock(return_value=axis_widget)),
     ):
         scene = AudioSpectrumScene(canvas)
         assert spec_line.visible is False
-        assert peak_line.visible is False
+        assert all(line.visible is False for line in peak_lines)
         freqs = np.array([0.0, 100.0, 200.0])
         db = np.array([-80.0, 0.0, -20.0])
         scene.set_spectrum(
@@ -184,21 +196,22 @@ def test_audio_spectrum_scene_set_spectrum() -> None:
         )
         spec_line.set_data.assert_called()
         assert spec_line.visible is True
-        assert peak_line.visible is True
+        assert peak_lines[0].visible is True
+        assert all(line.visible is False for line in peak_lines[1:])
         assert axis_widget.link_view.call_count == 2
-        peak_pos = peak_line.set_data.call_args.kwargs.get("pos")
+        peak_pos = peak_lines[0].set_data.call_args.kwargs.get("pos")
         if peak_pos is None:
-            peak_pos = peak_line.set_data.call_args[1].get("pos")
+            peak_pos = peak_lines[0].set_data.call_args[1].get("pos")
         assert peak_pos is not None
         assert peak_pos.shape == (2, 2)
         assert float(peak_pos[0, 0]) == pytest.approx(100.0)
         scene.set_spectrum(np.zeros(0), np.zeros(0), peaks=np.zeros(0))
         assert spec_line.visible is False
-        assert peak_line.visible is False
+        assert all(line.visible is False for line in peak_lines)
         scene.set_spectrum(
             np.array([0.0, 100.0, 200.0]),
             np.array([-80.0, 0.0]),
             peaks=None,
         )
         assert spec_line.visible is True
-        assert peak_line.visible is False
+        assert all(line.visible is False for line in peak_lines)

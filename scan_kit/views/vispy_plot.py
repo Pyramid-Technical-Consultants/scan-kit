@@ -9,8 +9,10 @@ their data modules. This file is the reusable layer those scenes should call:
   :func:`vertical_segments`, :func:`map_canvas_x_to_data`
 
 Lock cameras with :func:`set_data_range` (vispy's default 5% margin is wrong
-for aligned axes). Overlay markers (cursors, peak ticks) should use
-``order=1`` and not write depth.
+for aligned axes). Fill / data line / cursor are siblings; the shaded fill is
+pushed back with ``polygon_offset`` so the agg trace (also triangles) stays in
+front. :func:`add_line` uses agg tessellation; axis ticks are a triangle mesh
+— GL lines vanish after some framebuffer resizes.
 """
 
 from __future__ import annotations
@@ -25,6 +27,10 @@ AXIS_RGBA = (0.45, 0.48, 0.52, 1.0)
 ACCENT_RGBA = (0.0, 212 / 255, 170 / 255, 0.9)
 
 _GUTTER_PX = (8, 12)
+# vispy SceneCanvas sorts siblings by Node.order and draws higher later.
+ORDER_FILL = 0
+ORDER_DATA = 1
+ORDER_OVERLAY = 2
 
 
 def hex_to_rgba(
@@ -77,6 +83,25 @@ def lock_panzoom(view, camera=None, *, interactive: bool = False, bgcolor: str =
     view.bgcolor = bgcolor
     camera.interactive = interactive
     view.camera = camera
+    # PanZoomCamera.viewbox_resize_event is a no-op, so the data→pixel
+    # mapping goes stale on splitter/window resize (and a 0-size layout
+    # pass can bake NaNs into it). Remap whenever the view has a real size.
+    def _relock(_event=None) -> None:
+        size = getattr(view, "size", (0, 0))
+        try:
+            width, height = float(size[0]), float(size[1])
+        except (TypeError, ValueError, IndexError):
+            return
+        if width <= 0.0 or height <= 0.0:
+            return
+        camera.view_changed()
+        updater = getattr(view, "_update_scene_clipper", None)
+        if callable(updater):
+            updater()
+
+    resize = getattr(getattr(view, "events", None), "resize", None)
+    if resize is not None and hasattr(resize, "connect"):
+        resize.connect(_relock)
     return camera
 
 
@@ -104,21 +129,75 @@ def axis_widget(orientation: str, *, font_size: float = 8):
     if orientation == "left":
         widget.width_min = 48
         widget.width_max = 56
+        widget.stretch = (0.1, 1)
     else:
         widget.height_min = 36
         widget.height_max = 44
+        widget.stretch = (1, 0.1)
+    _use_agg_axis_lines(widget)
     return widget
+
+
+def _use_agg_axis_lines(widget) -> None:
+    """Replace GL axis strokes with geometry that survives a resize.
+
+    The spine is a 2-point agg strip. Ticks are a triangle mesh — vispy's
+    tick LineVisual uses ``connect='segments'``, which agg cannot draw.
+    """
+    from vispy.visuals.mesh import MeshVisual
+
+    visual = getattr(widget, "axis", None)
+    if visual is None:
+        return
+    spine = getattr(visual, "_line", None)
+    if spine is not None and hasattr(spine, "method"):
+        spine.method = "agg"
+        if hasattr(spine, "set_gl_state"):
+            spine.set_gl_state("translucent", depth_test=False, depth_mask=False)
+    ticks = getattr(visual, "_ticks", None)
+    if ticks is not None:
+        ticks.visible = False
+    orig = getattr(visual, "_update_subvisuals", None)
+    if not callable(orig):
+        return
+    mesh = MeshVisual(color=AXIS_RGBA)
+    mesh.set_gl_state("translucent", depth_test=False, depth_mask=False)
+    adder = getattr(visual, "add_subvisual", None)
+    if callable(adder):
+        adder(mesh)
+
+    def _update() -> None:
+        orig()
+        pos = getattr(ticks, "pos", None) if ticks is not None else None
+        if pos is None or len(np.asarray(pos).reshape(-1, 2)) < 2:
+            mesh.visible = False
+            return
+        width = float(getattr(visual, "tick_width", 1.5) or 1.5)
+        verts, faces = line_segments_mesh(pos, width=width)
+        if len(faces) == 0:
+            mesh.visible = False
+            return
+        mesh.set_data(vertices=verts, faces=faces, color=AXIS_RGBA)
+        mesh.visible = True
+
+    visual._update_subvisuals = _update
 
 
 def _empty_grid_cell(
     *,
     width_min: int | None = None,
     width_max: int | None = None,
+    stretch: tuple[float, float] = (0.1, 0.1),
 ):
-    """Blank grid cell. vispy Widget does not take width_min in its constructor."""
+    """Blank grid cell. vispy Widget does not take width_min in its constructor.
+
+    Default stretch is small so a corner/gutter cannot inflate an axis row
+    (vispy Grid assigns stretch (1, 1) when it is left as None).
+    """
     from vispy.scene.widgets import Widget
 
     widget = Widget()
+    widget.stretch = stretch
     if width_min is not None:
         widget.width_min = width_min
     if width_max is not None:
@@ -165,10 +244,12 @@ def add_locked_xy_plot(
         grid.add_widget(yaxis, row=row, col=col)
 
     view = grid.add_view(row=row, col=view_col)
+    view.stretch = (1, 1)
     lock_panzoom(view, scene.PanZoomCamera(aspect=None), interactive=interactive)
     set_data_range(view, x_range, y_range)
     if yaxis is not None:
         yaxis.link_view(view)
+        _pin_axis_domain(yaxis, y_range)
 
     xaxis = None
     if x_axis:
@@ -178,18 +259,19 @@ def add_locked_xy_plot(
         xaxis = axis_widget("bottom")
         grid.add_widget(xaxis, row=axis_row, col=view_col)
         xaxis.link_view(view)
+        _pin_axis_domain(xaxis, x_range)
 
     if right_gutter:
         gutter_col = view_col + 1
         lo, hi = _GUTTER_PX
         grid.add_widget(
-            _empty_grid_cell(width_min=lo, width_max=hi),
+            _empty_grid_cell(width_min=lo, width_max=hi, stretch=(0.1, 1)),
             row=row,
             col=gutter_col,
         )
         if x_axis:
             grid.add_widget(
-                _empty_grid_cell(width_min=lo, width_max=hi),
+                _empty_grid_cell(width_min=lo, width_max=hi, stretch=(0.1, 0.1)),
                 row=row + 1,
                 col=gutter_col,
             )
@@ -199,13 +281,55 @@ def add_locked_xy_plot(
     )
 
 
-def add_shared_x_axis(grid, *, row: int, view, col: int = 0, view_col: int = 1):
+def add_shared_x_axis(
+    grid,
+    *,
+    row: int,
+    view,
+    col: int = 0,
+    view_col: int = 1,
+    x_range: tuple[float, float] | None = None,
+):
     """X axis under a stack of :func:`add_locked_xy_plot` rows."""
     grid.add_widget(_empty_grid_cell(), row=row, col=col)
     xaxis = axis_widget("bottom")
     grid.add_widget(xaxis, row=row, col=view_col)
     xaxis.link_view(view)
+    if x_range is not None:
+        _pin_axis_domain(xaxis, x_range)
     return xaxis
+
+
+def _pin_axis_domain(axis_w, domain: tuple[float, float]) -> None:
+    """Keep locked-plot ticks on the data range.
+
+    vispy AxisWidget infers domain by mapping its pixel ends into the view.
+    Before layout (and if the widget does not stretch) that mapping is ~0 to
+    widget-width in pixels, so an FFT axis can read as ~230 Hz instead of 500.
+    """
+    lo, hi = float(domain[0]), float(domain[1])
+
+    def _apply(_event=None) -> None:
+        axis_w.axis.domain = (lo, hi)
+
+    view = getattr(axis_w, "_linked_view", None)
+    if view is not None:
+        view.scene.transform.changed.connect(_apply)
+    axis_w.events.resize.connect(_apply)
+    _apply()
+
+
+def _set_plot_gl_state(visual, *, offset: float = 0.0) -> None:
+    """2D plot GL state. *offset* > 0 pushes a mesh/trace behind later overlays."""
+    kwargs: dict = {
+        "depth_test": True,
+        "depth_mask": True,
+        "cull_face": False,
+    }
+    if offset:
+        kwargs["polygon_offset_fill"] = True
+        kwargs["polygon_offset"] = (float(offset), float(offset))
+    visual.set_gl_state("translucent", **kwargs)
 
 
 def add_line(
@@ -216,35 +340,43 @@ def add_line(
     width: float = 1.2,
     connect: str = "strip",
     antialias: bool = True,
-    order: int = 0,
+    order: int = ORDER_DATA,
     visible: bool = True,
+    offset: float = 1.0,
 ):
     from vispy import scene
 
+    # method='agg' draws a triangle strip. GL lines (the vispy default) are
+    # not reliably rasterized after a framebuffer resize — they just vanish.
     line = scene.visuals.Line(
         pos=np.zeros((2, 2), dtype=np.float32) if pos is None else pos,
         color=color,
         width=width,
-        connect=connect,
+        connect="strip",
         antialias=antialias,
-        parent=parent,
+        method="agg",
     )
+    _set_plot_gl_state(line, offset=offset)
     line.order = order
     line.visible = visible
+    line.parent = parent
     return line
 
 
-def add_fill_mesh(parent, vertices, faces, color) -> object:
-    """Translucent mesh that does not occlude later overlays."""
+def add_fill_mesh(
+    parent, vertices, faces, color, *, order: int = ORDER_FILL,
+) -> object:
+    """Translucent mesh drawn behind data lines and overlays."""
     from vispy import scene
 
     mesh = scene.visuals.Mesh(
         vertices=vertices,
         faces=faces,
         color=color,
-        parent=parent,
     )
-    mesh.set_gl_state("translucent", depth_test=False, depth_mask=False)
+    _set_plot_gl_state(mesh, offset=2.0)
+    mesh.order = order
+    mesh.parent = parent
     return mesh
 
 
@@ -309,6 +441,42 @@ def vertical_segments(
     pos[1::2, 0] = hz
     pos[1::2, 1] = y_hi
     return pos
+
+
+def line_segments_mesh(
+    pos, width: float = 1.5,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Triangle quads covering disconnected line segments (axis ticks)."""
+    pts = np.asarray(pos, dtype=np.float32).reshape(-1, 2)
+    n = pts.shape[0] // 2
+    if n == 0:
+        return (
+            np.zeros((0, 3), dtype=np.float32),
+            np.zeros((0, 3), dtype=np.uint32),
+        )
+    half = max(float(width), 1.0) * 0.5
+    verts = np.zeros((n * 4, 3), dtype=np.float32)
+    faces = np.empty((n * 2, 3), dtype=np.uint32)
+    for i in range(n):
+        a = pts[2 * i]
+        b = pts[2 * i + 1]
+        delta = b - a
+        length = float(np.hypot(delta[0], delta[1]))
+        if length < 1e-6:
+            nrm = np.array([1.0, 0.0], dtype=np.float32)
+        else:
+            nrm = np.array(
+                [-delta[1] / length, delta[0] / length], dtype=np.float32,
+            )
+        offset = nrm * half
+        base = i * 4
+        verts[base, :2] = a + offset
+        verts[base + 1, :2] = a - offset
+        verts[base + 2, :2] = b - offset
+        verts[base + 3, :2] = b + offset
+        faces[i * 2] = (base, base + 1, base + 2)
+        faces[i * 2 + 1] = (base, base + 2, base + 3)
+    return verts, faces
 
 
 def envelope_mesh_geometry(poly: np.ndarray) -> tuple[np.ndarray, np.ndarray]:

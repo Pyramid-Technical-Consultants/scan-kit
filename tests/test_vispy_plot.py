@@ -58,7 +58,89 @@ def test_envelope_mesh_geometry_covers_bins() -> None:
     assert faces.max() < len(pos)
 
 
-def test_add_locked_xy_plot_gutter_does_not_pass_width_kwargs() -> None:
+def test_add_line_uses_agg_without_depth() -> None:
+    import vispy.scene
+
+    line = MagicMock()
+    with patch.object(
+        vispy.scene.visuals, "Line", MagicMock(return_value=line),
+    ) as ctor:
+        from scan_kit.views.vispy_plot import add_line
+
+        add_line(MagicMock(), width=2.0, order=1)
+    assert ctor.call_args.kwargs.get("parent") is None
+    assert ctor.call_args.kwargs["method"] == "agg"
+    line.set_gl_state.assert_called_once_with(
+        "translucent",
+        depth_test=True,
+        depth_mask=True,
+        cull_face=False,
+        polygon_offset_fill=True,
+        polygon_offset=(1.0, 1.0),
+    )
+    assert line.order == 1
+    assert line.parent is not None
+
+
+def test_lock_panzoom_relocks_camera_on_resize() -> None:
+    from scan_kit.views.vispy_plot import lock_panzoom
+
+    view = MagicMock()
+    view.size = (800, 200)
+    camera = MagicMock()
+    lock_panzoom(view, camera)
+    view.events.resize.connect.assert_called()
+    relock = view.events.resize.connect.call_args[0][0]
+    relock()
+    camera.view_changed.assert_called()
+    view._update_scene_clipper.assert_called()
+    camera.view_changed.reset_mock()
+    view.size = (0, 200)
+    relock()
+    camera.view_changed.assert_not_called()
+
+
+def test_line_segments_mesh_makes_quads() -> None:
+    from scan_kit.views.vispy_plot import line_segments_mesh
+
+    pos = np.array([[10.0, 0.0], [10.0, 8.0]], dtype=np.float32)
+    verts, faces = line_segments_mesh(pos, width=2.0)
+    assert verts.shape == (4, 3)
+    assert faces.shape == (2, 3)
+    assert faces.max() < len(verts)
+    # Vertical tick: offset is along X.
+    xs = verts[:, 0]
+    assert xs.max() > 10.0
+    assert xs.min() < 10.0
+
+
+def test_empty_grid_cell_does_not_steal_axis_row() -> None:
+    from scan_kit.views.vispy_plot import _empty_grid_cell
+
+    spacer = _empty_grid_cell()
+    assert tuple(spacer.stretch) == (0.1, 0.1)
+    gutter = _empty_grid_cell(width_min=8, width_max=12, stretch=(0.1, 1))
+    assert tuple(gutter.stretch) == (0.1, 1)
+    assert gutter.width_min == 8
+    from scan_kit.views.vispy_plot import axis_widget
+
+    import vispy.scene
+
+    widget = MagicMock()
+    with patch.object(vispy.scene, "AxisWidget", MagicMock(return_value=widget)):
+        axis_widget("bottom")
+        assert widget.stretch == (1, 0.1)
+        axis_widget("left")
+        assert widget.stretch == (0.1, 1)
+
+
+def test_pin_axis_domain_keeps_fft_range() -> None:
+    from scan_kit.views.vispy_plot import _pin_axis_domain
+
+    axis_w = MagicMock()
+    axis_w._linked_view = None
+    _pin_axis_domain(axis_w, (0.0, 500.0))
+    assert axis_w.axis.domain == (0.0, 500.0)
     from scan_kit.views.vispy_plot import add_locked_xy_plot
 
     grid = MagicMock()

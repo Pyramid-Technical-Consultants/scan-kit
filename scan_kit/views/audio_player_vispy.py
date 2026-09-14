@@ -15,6 +15,8 @@ from .audio_player_data import (
 from .vispy_plot import (
     ACCENT_RGBA,
     FG,
+    ORDER_DATA,
+    ORDER_OVERLAY,
     add_fill_mesh,
     add_line,
     add_locked_xy_plot,
@@ -30,6 +32,7 @@ from .vispy_plot import (
 _CURSOR_INACTIVE = (58 / 255, 63 / 255, 71 / 255, 0.5)
 _PEAK_MARK = (0.72, 0.76, 0.80, 0.35)
 _SPECTRUM_Y = (SPECTRUM_DB_FLOOR, 5.0)
+_PEAK_LINE_COUNT = 6
 
 
 @dataclass
@@ -113,13 +116,16 @@ class AudioWaveformScene:
                 channel.line_pos,
                 color=hex_to_rgba(channel.color, alpha=0.95),
                 width=1.2,
+                order=ORDER_DATA,
+                offset=1.0,
             )
             cursor = add_line(
                 view.scene,
                 vertical_segments(0.0, channel.y_lo, channel.y_hi),
                 color=ACCENT_RGBA,
                 width=2.0,
-                order=1,
+                order=ORDER_OVERLAY,
+                offset=0.0,
             )
             self._rows.append(
                 _WaveformRow(
@@ -133,7 +139,10 @@ class AudioWaveformScene:
             )
 
         add_shared_x_axis(
-            self._grid, row=len(channels), view=self._rows[-1].viewbox,
+            self._grid,
+            row=len(channels),
+            view=self._rows[-1].viewbox,
+            x_range=(0.0, self._duration),
         )
         self.set_cursor(cursor_time)
         self._canvas.update()
@@ -179,7 +188,7 @@ class AudioSpectrumScene:
         self._canvas = canvas
         self._view = None
         self._line = None
-        self._peak_marks = None
+        self._peak_lines: list = []
         self._ensure_view()
 
     def _ensure_view(self) -> None:
@@ -195,15 +204,19 @@ class AudioSpectrumScene:
         )
         self._line = add_line(
             plot.view.scene, color=FG, width=1.4, visible=False,
+            order=ORDER_DATA,
         )
-        self._peak_marks = add_line(
-            plot.view.scene,
-            color=_PEAK_MARK,
-            width=1.0,
-            connect="segments",
-            order=1,
-            visible=False,
-        )
+        self._peak_lines = [
+            add_line(
+                plot.view.scene,
+                color=_PEAK_MARK,
+                width=1.0,
+                order=ORDER_OVERLAY,
+                visible=False,
+                offset=0.0,
+            )
+            for _ in range(_PEAK_LINE_COUNT)
+        ]
         self._view = plot.view
         self._xaxis = plot.xaxis
         self._yaxis = plot.yaxis
@@ -233,9 +246,13 @@ class AudioSpectrumScene:
                     pos=pos, color=hex_to_rgba(color, alpha=0.95),
                 )
         marks = _peak_marker_segments(peaks)
-        self._peak_marks.visible = len(marks) >= 2
-        if self._peak_marks.visible:
-            self._peak_marks.set_data(pos=marks)
+        n = len(marks) // 2
+        for i, line in enumerate(self._peak_lines):
+            if i < n:
+                line.visible = True
+                line.set_data(pos=marks[2 * i : 2 * i + 2])
+            else:
+                line.visible = False
         self._canvas.update()
 
 
