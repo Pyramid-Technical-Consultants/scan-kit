@@ -6,7 +6,7 @@ import pytest
 from PySide6.QtWidgets import QApplication
 
 from scan_kit.common.session_browser import _COL_NOTE, SessionBrowserWidget
-from scan_kit.common.session_notes import load_notes
+from scan_kit.common.user_store import notes_for_library
 
 
 def _make_widget(tmp_path) -> SessionBrowserWidget:
@@ -24,7 +24,7 @@ def test_session_note_edit_is_undoable(qapp, tmp_path) -> None:
 
         note_cell.setText("important note")
         assert widget.notes()["S1"] == "important note"
-        assert load_notes(tmp_path)["S1"] == "important note"
+        assert notes_for_library(tmp_path)["S1"] == "important note"
 
         note_cell.setText("clobbered")
         assert widget.notes()["S1"] == "clobbered"
@@ -32,7 +32,7 @@ def test_session_note_edit_is_undoable(qapp, tmp_path) -> None:
         assert widget.undo() is True
         assert widget.notes()["S1"] == "important note"
         assert note_cell.text() == "important note"
-        assert load_notes(tmp_path)["S1"] == "important note"
+        assert notes_for_library(tmp_path)["S1"] == "important note"
 
         assert widget.redo() is True
         assert widget.notes()["S1"] == "clobbered"
@@ -52,7 +52,7 @@ def test_session_note_undo_restores_empty(qapp, tmp_path) -> None:
         assert widget.undo() is True
         assert "S1" not in widget.notes()
         assert note_cell.text() == ""
-        assert "S1" not in load_notes(tmp_path)
+        assert "S1" not in notes_for_library(tmp_path)
     finally:
         widget.shutdown()
 

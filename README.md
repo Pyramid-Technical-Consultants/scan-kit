@@ -137,20 +137,20 @@ Plot windows open separately. Close them when you are done — the launcher keep
 
 ### 1. Choose your data source
 
-Enter the folder that contains session data in **DATA SOURCE**, then press **Enter** or click away to refresh discovery. When running a frozen executable, the default is the current working directory.
+Enter the folder that contains session data in **DATA SOURCE**, then press **Enter** or click away to refresh discovery. The last folder is remembered in `~/.scan-kit`. When running a frozen executable with no remembered folder, the default is the current working directory.
 
 ### 2. Select sessions
 
-The session table shows **Session ID**, **Date**, **MU**, **Time (s)**, and **Note**.
+The session table shows **Session ID**, **Config**, **Date**, **MU**, **Time**, **RM**, and **Note**.
 
-- Sort by **Date** (newest first), **ID**, or **MU**
+- Sort by **Date** (newest first), **ID**, **Config**, or **MU**
 - Tick **Use** on up to **five** sessions — no modifier key needed
 - Click **✕** to clear all selections
-- **Right-click** a session → **Open in Config Tuning…** when a config folder is available
+- **Right-click** a session → **Copy Session ID**, **Move to Recycle Bin…**, or **Open in Config Tuning…** when a config folder is available
 
 ### 3. Annotate sessions (optional)
 
-Double-click (or press **F2** on) the **Note** column to add free-text notes. Notes save automatically and are stored in `<data_source>/session_notes.json`.
+Double-click (or press **F2** on) the **Note** column to add free-text notes. Notes and the last data folder are stored in `~/.scan-kit/scan-kit.sqlite` (the same directory as `app_settings.json`) so they survive app updates and do not depend on where Scan Kit is installed. Older `session_notes.json` / `selected_sessions` files in a data folder are imported once, then left as a snapshot.
 
 ### 4. Tune global settings
 
@@ -347,7 +347,7 @@ pytest
 
 Tests live in `tests/` and use fixtures from `test_data/` (included in dev installs, excluded from the published package). The suite runs headless — Agg matplotlib backend, no Qt windows.
 
-App preferences (last data directory, window geometry) persist in `app_settings.json` under the user config directory.
+App preferences (window geometry, last data directory, session notes) persist under the user config directory `~/.scan-kit` (`app_settings.json` plus `scan-kit.sqlite`).
 
 </details>
 
