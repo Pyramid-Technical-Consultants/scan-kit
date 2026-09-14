@@ -14,6 +14,7 @@ from scan_kit.common.schema import (
     TIMESLICE_AMPLIFIER_FIELD_COLS,
     resolve_concept_column,
 )
+from scan_kit.data.timeline_channels import resolve_amplifier_columns
 
 TEST_DATA = Path(__file__).resolve().parents[1] / "test_data"
 G2_LAYER = TEST_DATA / "590658542" / "layer-9" / "run-0"
@@ -93,3 +94,20 @@ def test_older_g3_tx2_column_aliases() -> None:
 
     assert resolve_concept_column(cols, C_MAG_FIELD_X) == "r_xB"
     assert resolve_concept_column(cols, C_MAG_FIELD_Y) == "r_yB"
+
+
+def test_resolve_amplifier_columns_g2_and_g3_device_units() -> None:
+    g2_cols = pd.read_csv(G2_LAYER / "timeslice_data_device_units.csv", nrows=0).columns
+    g3_cols = pd.read_csv(
+        TEST_DATA / "1943968267" / "1943968267" / "layer-0" / "run-0"
+        / "timeslice_data_device_units.csv",
+        nrows=0,
+    ).columns
+    g3_user = pd.read_csv(
+        TEST_DATA / "1091134775" / "1091134775" / "layer-71" / "run-0"
+        / "timeslice_data_device_units.csv",
+        nrows=0,
+    ).columns
+    for cols in (g2_cols, g3_cols, g3_user):
+        resolved = resolve_amplifier_columns(cols)
+        assert all(name is not None for name in resolved.values()), resolved

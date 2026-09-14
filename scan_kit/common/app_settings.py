@@ -9,6 +9,13 @@ from pathlib import Path
 _SETTINGS_DIR = Path.home() / ".scan-kit"
 _FILENAME = "app_settings.json"
 
+UI_THEMES = ("system", "light", "dark")
+
+
+def normalize_ui_theme(value: object) -> str:
+    text = str(value or "system").strip().lower()
+    return text if text in UI_THEMES else "system"
+
 
 @dataclass
 class AppSettings:
@@ -25,6 +32,7 @@ class AppSettings:
     last_plan_synthesis_save_dir: str | None = None
     last_rci_host: str | None = None
     last_plan_runner_file_dir: str | None = None
+    ui_theme: str = "system"
 
     @classmethod
     def settings_path(cls) -> Path:
@@ -62,6 +70,7 @@ class AppSettings:
             last_plan_runner_file_dir=_optional_str(
                 raw.get("last_plan_runner_file_dir")
             ),
+            ui_theme=normalize_ui_theme(raw.get("ui_theme")),
         )
 
 

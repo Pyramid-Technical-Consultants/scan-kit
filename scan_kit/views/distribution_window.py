@@ -10,7 +10,7 @@ from PySide6.QtCore import QTimer, Slot
 from PySide6.QtWidgets import QToolButton, QVBoxLayout, QWidget
 
 from ..common.ic_xy_distribution import normalize_contour_cutoff_percentile
-from ..common.data_filter import FILTER_ALL, FILTER_BEAM_BOTH, FILTER_BEAM_ON
+from ..common.data_filter import FILTER_ALL, FILTER_BEAM_ON
 from ..common.settings import ViewSettings
 from .async_refresh import DebouncedBackgroundTask
 from .distribution_catalog import (
@@ -248,8 +248,8 @@ class DistributionExplorerWindow(PlotViewWindow):
             beam_state_filter=(
                 self._filter_panel.selected_beam_state()
                 if self._filter_panel is not None
-                else FILTER_BEAM_BOTH
-            ) or FILTER_BEAM_BOTH,
+                else FILTER_BEAM_ON
+            ) or FILTER_BEAM_ON,
             show_plan=panel.is_checked(_PANEL_PLAN) if panel else False,
             show_ic1=panel.is_checked(_PANEL_IC1) if panel else True,
             show_ic2=panel.is_checked(_PANEL_IC2) if panel else True,

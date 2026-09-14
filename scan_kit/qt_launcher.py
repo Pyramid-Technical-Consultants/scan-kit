@@ -53,6 +53,7 @@ from .common.app_icon import (
     prepare_qt_app_identity,
 )
 from .common.app_settings import AppSettings
+from .common.qt_theme import add_theme_menu, apply_saved_ui_theme
 from .common.segmented_control import SegmentedControl as _SegmentedControl
 from .common.debug_log_panel import DebugLogPanel
 from .common.session_browser import SessionBrowserWidget
@@ -329,6 +330,12 @@ class ScanKitMainWindow(QMainWindow):
             group.addAction(action)
             menu.addAction(action)
             self._tab_menu_actions[name] = action
+
+        menu.addSeparator()
+        self._theme_menu = menu.addMenu("Theme")
+        self._theme_menu_group = add_theme_menu(
+            self, self._theme_menu, settings=self._app_settings,
+        )
 
     def _build_analysis_menu(self, menu: QMenu) -> None:
         self._submenus: list[QMenu] = []
@@ -1161,6 +1168,7 @@ def main() -> None:
     prepare_qt_app_identity()
     app = QApplication(sys.argv)
     app_icon = apply_qt_application_branding(app)
+    apply_saved_ui_theme(app=app)
     win = ScanKitMainWindow()
     if not app_icon.isNull():
         win.setWindowIcon(app_icon)
