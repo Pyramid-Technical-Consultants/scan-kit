@@ -1,8 +1,9 @@
-"""Machine-local SQLite store for session index, notes, selection, and prefs.
+"""Machine-local SQLite store for app prefs, view settings, session index, and notes.
 
 The database lives under :func:`user_data_dir` so it is independent of the
 install path and of any particular data folder. Filesystem remains the source
-of truth for session archives; this file caches metadata and holds notes.
+of truth for session archives. JSON files that used to hold app/view/note
+state are imported once and then left unread.
 """
 
 from __future__ import annotations
@@ -10,12 +11,13 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from .session_meta import SessionMeta
-from .session_notes import load_notes
+from .session_notes import load_notes_json
 from .session_source import (
     peek_session_source_from_path,
     storage_fingerprint,
@@ -23,9 +25,12 @@ from .session_source import (
 from .sessions import discover_sessions
 from .settings import ViewSettings
 
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
 _DB_NAME = "scan-kit.sqlite"
 PREF_LAST_DATA_DIR = "session.last_data_dir"
+PREF_APP_SETTINGS = "app.settings"
+PREF_APP_SETTINGS_IMPORTED = "app.settings_imported"
+_LEGACY_APP_SETTINGS = "app_settings.json"
 
 _lock = threading.RLock()
 _conn: sqlite3.Connection | None = None
@@ -91,8 +96,7 @@ def snapshot_library(
     conn = _connection()
     with _lock:
         lib_id = _ensure_library(conn, root)
-        if not _imported(conn, lib_id):
-            _import_json(conn, lib_id, base_dir)
+        _import_if_needed(conn, lib_id, base_dir)
         found: dict[str, str] = {sid: path for sid, path, _ in discovered}
         if Path(root).is_dir():
             _delete_missing(conn, lib_id, set(found))
@@ -162,6 +166,7 @@ def set_session_note(base_dir: str | Path, session_id: str, text: str) -> None:
     conn = _connection()
     with _lock:
         lib_id = _ensure_library(conn, root)
+        _import_if_needed(conn, lib_id, base_dir)
         conn.execute(
             """
             INSERT INTO sessions(library_id, session_id, note)
@@ -178,6 +183,7 @@ def set_selected_sessions(base_dir: str | Path, session_ids: list[str]) -> None:
     conn = _connection()
     with _lock:
         lib_id = _ensure_library(conn, root)
+        _import_if_needed(conn, lib_id, base_dir)
         conn.execute(
             "UPDATE libraries SET selected_sessions = ? WHERE id = ?",
             (json.dumps(list(session_ids)), lib_id),
@@ -190,6 +196,7 @@ def selected_sessions(base_dir: str | Path) -> list[str]:
     conn = _connection()
     with _lock:
         lib_id = _ensure_library(conn, root)
+        _import_if_needed(conn, lib_id, base_dir)
         selected = _selected_list(conn, lib_id)
         conn.commit()
     return selected
@@ -200,9 +207,97 @@ def notes_for_library(base_dir: str | Path) -> dict[str, str]:
     conn = _connection()
     with _lock:
         lib_id = _ensure_library(conn, root)
+        _import_if_needed(conn, lib_id, base_dir)
         notes = _notes_map(conn, lib_id)
         conn.commit()
     return notes
+
+
+def load_view_settings(base_dir: str | Path) -> ViewSettings:
+    root = _canonical_library_path(base_dir)
+    conn = _connection()
+    with _lock:
+        lib_id = _ensure_library(conn, root)
+        _import_if_needed(conn, lib_id, base_dir)
+        row = conn.execute(
+            """
+            SELECT bg_subtract, calibration_mode, contour_cutoff_percentile,
+                   selected_sessions
+            FROM libraries WHERE id = ?
+            """,
+            (lib_id,),
+        ).fetchone()
+        conn.commit()
+    if row is None:
+        return ViewSettings()
+    cleaned = ViewSettings._clean(
+        {
+            "bg_subtract": bool(row["bg_subtract"]),
+            "calibration_mode": row["calibration_mode"],
+            "contour_cutoff_percentile": row["contour_cutoff_percentile"],
+            "selected_sessions": _parse_selected(row["selected_sessions"]),
+        }
+    )
+    return ViewSettings(**cleaned)
+
+
+def save_view_settings(base_dir: str | Path, settings: ViewSettings) -> None:
+    cleaned = ViewSettings._clean(
+        {
+            "bg_subtract": settings.bg_subtract,
+            "calibration_mode": settings.calibration_mode,
+            "contour_cutoff_percentile": settings.contour_cutoff_percentile,
+        }
+    )
+    root = _canonical_library_path(base_dir)
+    conn = _connection()
+    with _lock:
+        lib_id = _ensure_library(conn, root)
+        conn.execute(
+            """
+            UPDATE libraries SET
+                bg_subtract = ?,
+                calibration_mode = ?,
+                contour_cutoff_percentile = ?,
+                view_settings_imported = 1,
+                view_settings_rev = view_settings_rev + 1
+            WHERE id = ?
+            """,
+            (
+                1 if cleaned.get("bg_subtract") else 0,
+                cleaned.get("calibration_mode", "off"),
+                cleaned.get("contour_cutoff_percentile", 5.0),
+                lib_id,
+            ),
+        )
+        conn.commit()
+
+
+def view_settings_rev(base_dir: str | Path) -> int:
+    """Revision counter for live view refresh (WAL file mtime is not a signal)."""
+    root = _canonical_library_path(base_dir)
+    conn = _connection()
+    with _lock:
+        row = conn.execute(
+            "SELECT view_settings_rev FROM libraries WHERE root_path = ?",
+            (root,),
+        ).fetchone()
+    return int(row[0]) if row else 0
+
+
+def load_app_settings():
+    from .app_settings import AppSettings
+
+    _import_app_settings_json_once()
+    raw = prefs_get(PREF_APP_SETTINGS)
+    if not isinstance(raw, dict):
+        return AppSettings()
+    return AppSettings.from_mapping(raw)
+
+
+def save_app_settings(settings) -> None:
+    prefs_set(PREF_APP_SETTINGS, asdict(settings))
+    prefs_set(PREF_APP_SETTINGS_IMPORTED, True)
 
 
 def delete_session(base_dir: str | Path, session_id: str) -> None:
@@ -228,7 +323,11 @@ def _connection() -> sqlite3.Connection:
         if _conn is None:
             folder = user_data_dir()
             folder.mkdir(parents=True, exist_ok=True)
-            conn = sqlite3.connect(str(db_path()), check_same_thread=False)
+            conn = sqlite3.connect(
+                str(db_path()),
+                check_same_thread=False,
+                isolation_level=None,
+            )
             conn.row_factory = sqlite3.Row
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA busy_timeout=5000")
@@ -252,7 +351,12 @@ def _migrate(conn: sqlite3.Connection) -> None:
                 root_path TEXT NOT NULL UNIQUE,
                 selected_sessions TEXT NOT NULL DEFAULT '[]',
                 notes_imported INTEGER NOT NULL DEFAULT 0,
-                last_scan_at REAL
+                last_scan_at REAL,
+                bg_subtract INTEGER NOT NULL DEFAULT 0,
+                calibration_mode TEXT NOT NULL DEFAULT 'off',
+                contour_cutoff_percentile REAL NOT NULL DEFAULT 5.0,
+                view_settings_imported INTEGER NOT NULL DEFAULT 0,
+                view_settings_rev INTEGER NOT NULL DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS sessions (
                 id INTEGER PRIMARY KEY,
@@ -274,6 +378,19 @@ def _migrate(conn: sqlite3.Connection) -> None:
         )
         conn.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
         conn.commit()
+        return
+    if version < 2:
+        conn.executescript(
+            """
+            ALTER TABLE libraries ADD COLUMN bg_subtract INTEGER NOT NULL DEFAULT 0;
+            ALTER TABLE libraries ADD COLUMN calibration_mode TEXT NOT NULL DEFAULT 'off';
+            ALTER TABLE libraries ADD COLUMN contour_cutoff_percentile REAL NOT NULL DEFAULT 5.0;
+            ALTER TABLE libraries ADD COLUMN view_settings_imported INTEGER NOT NULL DEFAULT 0;
+            ALTER TABLE libraries ADD COLUMN view_settings_rev INTEGER NOT NULL DEFAULT 0;
+            """
+        )
+        conn.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
+        conn.commit()
 
 
 def _canonical_library_path(base_dir: str | Path) -> str:
@@ -291,32 +408,73 @@ def _ensure_library(conn: sqlite3.Connection, root: str) -> int:
     return int(row[0])
 
 
-def _imported(conn: sqlite3.Connection, lib_id: int) -> bool:
+def _import_if_needed(
+    conn: sqlite3.Connection, lib_id: int, base_dir: str | Path
+) -> None:
     row = conn.execute(
-        "SELECT notes_imported FROM libraries WHERE id = ?", (lib_id,)
+        "SELECT notes_imported, view_settings_imported FROM libraries WHERE id = ?",
+        (lib_id,),
     ).fetchone()
-    return bool(row and row[0])
-
-
-def _import_json(conn: sqlite3.Connection, lib_id: int, base_dir: str | Path) -> None:
-    notes = load_notes(base_dir)
-    settings = ViewSettings.load(base_dir)
-    for sid, text in notes.items():
-        if not str(text).strip():
-            continue
+    notes_done = bool(row and row[0])
+    views_done = bool(row and row[1])
+    if notes_done and views_done:
+        return
+    legacy = ViewSettings.load_legacy_json(base_dir)
+    if not notes_done:
+        notes = load_notes_json(base_dir)
+        for sid, text in notes.items():
+            if not str(text).strip():
+                continue
+            conn.execute(
+                """
+                INSERT INTO sessions(library_id, session_id, note)
+                VALUES (?, ?, ?)
+                ON CONFLICT(library_id, session_id) DO UPDATE SET note = excluded.note
+                """,
+                (lib_id, str(sid), str(text)),
+            )
+        selected = [str(s) for s in (legacy.selected_sessions or [])]
+        conn.execute(
+            "UPDATE libraries SET selected_sessions = ?, notes_imported = 1 WHERE id = ?",
+            (json.dumps(selected), lib_id),
+        )
+    if not views_done:
+        cleaned = ViewSettings._clean(
+            {
+                "bg_subtract": legacy.bg_subtract,
+                "calibration_mode": legacy.calibration_mode,
+                "contour_cutoff_percentile": legacy.contour_cutoff_percentile,
+            }
+        )
         conn.execute(
             """
-            INSERT INTO sessions(library_id, session_id, note)
-            VALUES (?, ?, ?)
-            ON CONFLICT(library_id, session_id) DO UPDATE SET note = excluded.note
+            UPDATE libraries SET
+                bg_subtract = ?,
+                calibration_mode = ?,
+                contour_cutoff_percentile = ?,
+                view_settings_imported = 1
+            WHERE id = ?
             """,
-            (lib_id, str(sid), str(text)),
+            (
+                1 if cleaned.get("bg_subtract") else 0,
+                cleaned.get("calibration_mode", "off"),
+                cleaned.get("contour_cutoff_percentile", 5.0),
+                lib_id,
+            ),
         )
-    selected = [str(s) for s in (settings.selected_sessions or [])]
-    conn.execute(
-        "UPDATE libraries SET selected_sessions = ?, notes_imported = 1 WHERE id = ?",
-        (json.dumps(selected), lib_id),
-    )
+
+
+def _import_app_settings_json_once() -> None:
+    if prefs_get(PREF_APP_SETTINGS_IMPORTED):
+        return
+    path = user_data_dir() / _LEGACY_APP_SETTINGS
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, ValueError, TypeError):
+        data = None
+    if isinstance(data, dict):
+        prefs_set(PREF_APP_SETTINGS, data)
+    prefs_set(PREF_APP_SETTINGS_IMPORTED, True)
 
 
 def _delete_missing(
@@ -419,13 +577,17 @@ def _selected_list(conn: sqlite3.Connection, lib_id: int) -> list[str]:
     ).fetchone()
     if row is None:
         return []
+    return _parse_selected(row[0])
+
+
+def _parse_selected(raw: Any) -> list[str]:
     try:
-        raw = json.loads(row[0])
+        parsed = json.loads(raw) if not isinstance(raw, list) else raw
     except (TypeError, json.JSONDecodeError):
         return []
-    if not isinstance(raw, list):
+    if not isinstance(parsed, list):
         return []
-    return [str(s) for s in raw]
+    return [str(s) for s in parsed]
 
 
 def _date_to_iso(meta: SessionMeta | None) -> str | None:

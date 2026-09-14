@@ -31,6 +31,7 @@ from PySide6.QtWidgets import (
     QMenu,
     QMessageBox,
     QPushButton,
+    QStyle,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -56,14 +57,15 @@ _SORT_VALUE_ROLE = Qt.ItemDataRole.UserRole + 2
 
 _COL_USE = 0
 _COL_SESSION_ID = 1
-_COL_CONFIG = 2
-_COL_DATE = 3
-_COL_MU = 4
-_COL_TIME = 5
-_COL_ROOM = 6
+_COL_DATE = 2
+_COL_MU = 3
+_COL_TIME = 4
+_COL_ROOM = 5
+_COL_CONFIG = 6
 _COL_NOTE = 7
 
 _COMPACT_META_COLS = (_COL_MU, _COL_TIME, _COL_ROOM)
+_META_COLS = (_COL_DATE, _COL_MU, _COL_TIME, _COL_ROOM, _COL_CONFIG)
 
 _SWATCH_PX = 14
 _UNCHECKED_SWATCH = QColor("#d0d0d0")
@@ -125,23 +127,23 @@ class _SortableItem(QTableWidgetItem):
 
 def _meta_column_texts(meta: SessionMeta | None) -> tuple[str, str, str, str, str]:
     if meta is None:
-        return "—", "—", "—", "—", "?"
+        return "—", "—", "—", "?", "—"
     return (
-        meta.short_config,
         meta.short_date,
         meta.short_mu,
         meta.short_time,
         meta.short_room,
+        meta.short_config,
     )
 
 
 def _meta_sort_values(
     meta: SessionMeta | None,
-) -> tuple[str | None, datetime | None, float | None, int | None, int | None]:
+) -> tuple[datetime | None, float | None, int | None, int | None, str | None]:
     if meta is None:
         return (None, None, None, None, None)
     config = (meta.config_name or "").strip() or None
-    return (config, meta.date, meta.primary_mu, meta.treatment_time_s, meta.room_number)
+    return (meta.date, meta.primary_mu, meta.treatment_time_s, meta.room_number, config)
 
 
 def _compact_meta_column_widths(fm: QFontMetrics) -> dict[int, int]:
@@ -152,6 +154,21 @@ def _compact_meta_column_widths(fm: QFontMetrics) -> dict[int, int]:
         _COL_TIME: fm.horizontalAdvance("99:59") + pad,
         _COL_ROOM: max(fm.horizontalAdvance("RM"), fm.horizontalAdvance("99")) + pad,
     }
+
+
+def _use_column_width(table: QTableWidget) -> int:
+    """Checkbox + plot swatch + header; fixed so refresh does not twitch the column."""
+    fm = QFontMetrics(table.font())
+    check = table.style().pixelMetric(
+        QStyle.PixelMetric.PM_IndicatorWidth, None, table
+    )
+    header = fm.horizontalAdvance("Use") + 16
+    return max(header, check + table.iconSize().width() + 16)
+
+
+def _config_column_width(fm: QFontMetrics) -> int:
+    """About half a typical configuration name; leftover pane width is shared with Note."""
+    return fm.horizontalAdvance("working_hvtt_new_") + 10
 
 
 class _NoteEditCommand(QUndoCommand):
@@ -305,30 +322,33 @@ class SessionBrowserWidget(QWidget):
         self._table = QTableWidget()
         self._table.setColumnCount(8)
         self._table.setHorizontalHeaderLabels(
-            ["Use", "Session ID", "Config", "Date", "MU", "Time", "RM", "Note"]
+            ["Use", "Session ID", "Date", "MU", "Time", "RM", "Config", "Note"]
         )
         self._table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self._table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
         self._table.setSortingEnabled(True)
         self._table.setAlternatingRowColors(True)
-        self._table.setTextElideMode(Qt.TextElideMode.ElideNone)
+        self._table.setTextElideMode(Qt.TextElideMode.ElideRight)
         self._table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self._table.setIconSize(QSize(_SWATCH_PX, _SWATCH_PX))
         hh = self._table.horizontalHeader()
         hh.setMinimumSectionSize(16)
-        hh.setSectionResizeMode(_COL_USE, QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(_COL_USE, QHeaderView.ResizeMode.Fixed)
+        hh.resizeSection(_COL_USE, _use_column_width(self._table))
         hh.setSectionResizeMode(_COL_SESSION_ID, QHeaderView.ResizeMode.ResizeToContents)
-        hh.setSectionResizeMode(_COL_CONFIG, QHeaderView.ResizeMode.ResizeToContents)
         hh.setSectionResizeMode(_COL_DATE, QHeaderView.ResizeMode.ResizeToContents)
-        compact_widths = _compact_meta_column_widths(QFontMetrics(self._table.font()))
+        fm = QFontMetrics(self._table.font())
+        compact_widths = _compact_meta_column_widths(fm)
         for col in _COMPACT_META_COLS:
             hh.setSectionResizeMode(col, QHeaderView.ResizeMode.Fixed)
             hh.resizeSection(col, compact_widths[col])
+        hh.setSectionResizeMode(_COL_CONFIG, QHeaderView.ResizeMode.Stretch)
         hh.setSectionResizeMode(_COL_NOTE, QHeaderView.ResizeMode.Stretch)
         hh.resizeSection(_COL_SESSION_ID, 220)
+        hh.resizeSection(_COL_CONFIG, _config_column_width(fm))
         hh.setSortIndicatorShown(True)
         self._table.sortByColumn(_COL_DATE, Qt.SortOrder.DescendingOrder)
         self._table.verticalHeader().setVisible(False)
-        self._table.setIconSize(QSize(_SWATCH_PX, _SWATCH_PX))
         self._table.itemChanged.connect(self._on_table_item_changed)
         self._table.currentCellChanged.connect(self._on_current_cell_changed)
         self._table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
@@ -911,25 +931,28 @@ class SessionBrowserWidget(QWidget):
             self._table.blockSignals(False)
 
     def _resize_session_meta_columns(self) -> None:
-        for col in (_COL_USE, _COL_SESSION_ID, _COL_CONFIG, _COL_DATE):
+        for col in (_COL_SESSION_ID, _COL_DATE):
             self._table.resizeColumnToContents(col)
 
     def _fill_meta_columns(self, row: int, meta: SessionMeta | None) -> None:
         texts = _meta_column_texts(meta)
         sort_vals = _meta_sort_values(meta)
+        full_config = (meta.config_name or "").strip() if meta is not None else ""
         align = Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft
-        for col_offset, (text, sval) in enumerate(zip(texts, sort_vals)):
-            col = _COL_CONFIG + col_offset
+        for col, text, sval in zip(_META_COLS, texts, sort_vals):
             item = self._table.item(row, col)
+            tip = full_config if col == _COL_CONFIG and full_config else ""
             if item is None:
                 cell = _SortableItem(text)
                 cell.setFlags(cell.flags() & ~Qt.ItemFlag.ItemIsEditable)
                 cell.setTextAlignment(align)
                 cell.setData(_SORT_VALUE_ROLE, sval)
+                cell.setToolTip(tip)
                 self._table.setItem(row, col, cell)
             else:
                 item.setText(text)
                 item.setData(_SORT_VALUE_ROLE, sval)
+                item.setToolTip(tip)
 
     def _set_session_row_widgets(
         self,

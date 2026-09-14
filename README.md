@@ -141,7 +141,7 @@ Enter the folder that contains session data in **DATA SOURCE**, then press **Ent
 
 ### 2. Select sessions
 
-The session table shows **Session ID**, **Config**, **Date**, **MU**, **Time**, **RM**, and **Note**.
+The session table shows **Session ID**, **Date**, **MU**, **Time**, **RM**, **Config**, and **Note**.
 
 - Sort by **Date** (newest first), **ID**, **Config**, or **MU**
 - Tick **Use** on up to **five** sessions — no modifier key needed
@@ -150,7 +150,7 @@ The session table shows **Session ID**, **Config**, **Date**, **MU**, **Time**, 
 
 ### 3. Annotate sessions (optional)
 
-Double-click (or press **F2** on) the **Note** column to add free-text notes. Notes and the last data folder are stored in `~/.scan-kit/scan-kit.sqlite` (the same directory as `app_settings.json`) so they survive app updates and do not depend on where Scan Kit is installed. Older `session_notes.json` / `selected_sessions` files in a data folder are imported once, then left as a snapshot.
+Double-click (or press **F2** on) the **Note** column to add free-text notes. Notes, plot settings, window geometry, and the last data folder are stored in `~/.scan-kit/scan-kit.sqlite` so they survive app updates and do not depend on where Scan Kit is installed. Older `app_settings.json`, `session_notes.json`, and `<data_source>/settings.json` files are imported once, then left as a snapshot.
 
 ### 4. Tune global settings
 
@@ -161,7 +161,7 @@ Two controls affect most dose-related views:
 | **Background subtract** | On / Off |
 | **Calibration** | Off · Per-Session · Constrained |
 
-Settings persist in `<data_source>/settings.json` and propagate to views that are already open.
+Settings persist in `~/.scan-kit/scan-kit.sqlite` and propagate to views that are already open.
 
 ### 5. Open analysis views
 
@@ -347,7 +347,7 @@ pytest
 
 Tests live in `tests/` and use fixtures from `test_data/` (included in dev installs, excluded from the published package). The suite runs headless — Agg matplotlib backend, no Qt windows.
 
-App preferences (window geometry, last data directory, session notes) persist under the user config directory `~/.scan-kit` (`app_settings.json` plus `scan-kit.sqlite`).
+App preferences (window geometry, last data directory, plot settings, session notes) persist in `~/.scan-kit/scan-kit.sqlite`.
 
 </details>
 

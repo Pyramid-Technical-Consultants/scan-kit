@@ -126,7 +126,7 @@ class ScanKitMainWindow(QMainWindow):
 
     #: subprocess reported plot window ready (module_name, Popen instance for identity check)
     _sig_plot_window_ready = Signal(str, object)
-    #: settings.json loaded off the GUI thread (bootstrap_generation, ViewSettings).
+    #: view settings loaded off the GUI thread (bootstrap_generation, ViewSettings).
     _sig_settings_ready = Signal(int, object)
 
     def __init__(self) -> None:
@@ -624,7 +624,7 @@ class ScanKitMainWindow(QMainWindow):
         thread.start()
 
     def _request_settings_then_scan(self) -> None:
-        """Load settings.json on a worker thread, then start session discovery."""
+        """Load view settings on a worker thread, then start session discovery."""
         self._bootstrap_generation += 1
         gen = self._bootstrap_generation
         base_dir = self._base_dir
