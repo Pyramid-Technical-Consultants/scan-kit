@@ -338,6 +338,10 @@ A nested layout (`<session_id>/<session_id>/input_map.csv`) is also recognized.
 
 ## For developers
 
+Day-to-day work merges into **`develop`**. `main` is the release line. Open pull requests against `develop` (`gh pr create --base develop`). The only PR that should target `main` is promoting `develop` for a release.
+
+CI fails feature PRs that target `main`.
+
 <details>
 <summary><strong>Regenerating README screenshots</strong></summary>
 
