@@ -22,11 +22,14 @@ def test_hex_to_rgba_parses_hex_and_alpha() -> None:
 
 
 def test_set_data_range_uses_zero_margin() -> None:
+    from scan_kit.views.vispy_plot import _LOCKED_RANGES
+
     view = MagicMock()
     set_data_range(view, (0.0, 500.0), (-80.0, 5.0))
     view.camera.set_range.assert_called_once_with(
         x=(0.0, 500.0), y=(-80.0, 5.0), margin=0.0,
     )
+    assert _LOCKED_RANGES[view] == ((0.0, 500.0), (-80.0, 5.0), 0.0)
 
 
 def test_vertical_segments_pairs_floor_and_top() -> None:
@@ -72,14 +75,33 @@ def test_add_line_uses_agg_without_depth() -> None:
     assert ctor.call_args.kwargs["method"] == "agg"
     line.set_gl_state.assert_called_once_with(
         "translucent",
-        depth_test=True,
-        depth_mask=True,
+        depth_test=False,
+        depth_mask=False,
         cull_face=False,
-        polygon_offset_fill=True,
-        polygon_offset=(1.0, 1.0),
+        blend=True,
     )
     assert line.order == 1
     assert line.parent is not None
+
+
+def test_add_fill_mesh_uses_same_2d_gl_state() -> None:
+    import vispy.scene
+
+    mesh = MagicMock()
+    verts = np.zeros((4, 3), dtype=np.float32)
+    faces = np.array([[0, 1, 2], [0, 2, 3]], dtype=np.uint32)
+    with patch.object(vispy.scene.visuals, "Mesh", MagicMock(return_value=mesh)):
+        from scan_kit.views.vispy_plot import add_fill_mesh
+
+        add_fill_mesh(MagicMock(), verts, faces, (1.0, 0.0, 0.0, 1.0))
+    mesh.set_gl_state.assert_called_once_with(
+        "translucent",
+        depth_test=False,
+        depth_mask=False,
+        cull_face=False,
+        blend=True,
+    )
+    assert mesh.order == 0
 
 
 def test_lock_panzoom_relocks_camera_on_resize() -> None:
@@ -98,6 +120,65 @@ def test_lock_panzoom_relocks_camera_on_resize() -> None:
     view.size = (0, 200)
     relock()
     camera.view_changed.assert_not_called()
+
+
+def test_lock_panzoom_reapplies_stored_range_after_zero_size() -> None:
+    from scan_kit.views.vispy_plot import lock_panzoom, set_data_range
+
+    view = MagicMock()
+    view.size = (0, 200)
+    camera = MagicMock()
+    lock_panzoom(view, camera)
+    set_data_range(view, (0.0, 10.0), (-1.0, 1.0))
+    relock = view.events.resize.connect.call_args[0][0]
+    camera.set_range.reset_mock()
+    relock()
+    camera.set_range.assert_not_called()
+    view.size = (400, 120)
+    relock()
+    camera.set_range.assert_called_with(x=(0.0, 10.0), y=(-1.0, 1.0), margin=0.0)
+
+
+def test_canvas_resize_relocks_locked_views() -> None:
+    from scan_kit.views.vispy_plot import relock_canvas_2d_views, set_data_range
+
+    class _Node:
+        def __init__(self) -> None:
+            self.children: list = []
+
+    canvas = _Node()
+    camera = MagicMock()
+    camera.interactive = False
+    view = _Node()
+    view.size = (320, 160)
+    view.camera = camera
+    view.canvas = canvas
+    view._update_scene_clipper = MagicMock()
+    set_data_range(view, (0.0, 70.0), (-0.2, 1.1))
+    camera.set_range.reset_mock()
+
+    canvas.central_widget = _Node()
+    canvas.update = MagicMock()
+    relock_canvas_2d_views(canvas)
+    camera.set_range.assert_called_with(x=(0.0, 70.0), y=(-0.2, 1.1), margin=0.0)
+    canvas.update.assert_called()
+
+
+def test_make_scene_canvas_hooks_canvas_resize() -> None:
+    import vispy.scene
+
+    canvas = MagicMock()
+    with (
+        patch.object(vispy.scene, "SceneCanvas", MagicMock(return_value=canvas)),
+        patch("vispy.app.use_app"),
+    ):
+        from scan_kit.views.vispy_plot import make_scene_canvas
+
+        result = make_scene_canvas(size=(100, 80))
+    assert result is canvas
+    canvas.events.resize.connect.assert_called()
+    handler = canvas.events.resize.connect.call_args[0][0]
+    assert callable(handler)
 
 
 def test_line_segments_mesh_makes_quads() -> None:
@@ -195,3 +276,72 @@ def test_vispy_view_window_side_panel_and_footer(qapp) -> None:
     assert window._footer_host is not None
     assert not window._footer_host.isHidden()
     window.close()
+
+
+def _render_rgba_or_skip(canvas) -> np.ndarray:
+    try:
+        img = np.asarray(canvas.render())
+    except Exception as exc:
+        pytest.skip(f"visPy cannot render offscreen: {exc}")
+    if img.ndim != 3 or img.size == 0:
+        pytest.skip("visPy render returned an empty image")
+    return img
+
+
+def _trace_pixel_count(img: np.ndarray) -> int:
+    # Fill is opaque red (G=0). The agg trace is white; AA edges still have green.
+    green = np.asarray(img)[..., 1]
+    return int(np.count_nonzero(green > 80))
+
+
+def test_2d_trace_stays_on_top_after_resize(qapp) -> None:
+    """Pin the Audio Explorer failure: traces vanish (or sit behind fill) on resize."""
+    from scan_kit.views.vispy_plot import (
+        add_fill_mesh,
+        add_line,
+        add_locked_xy_plot,
+        make_scene_canvas,
+        relock_canvas_2d_views,
+    )
+
+    canvas = make_scene_canvas(size=(240, 160), show=False)
+    try:
+        grid = canvas.central_widget.add_grid(spacing=0)
+        plot = add_locked_xy_plot(
+            grid,
+            x_range=(0.0, 1.0),
+            y_range=(0.0, 1.0),
+            y_axis=False,
+            x_axis=False,
+        )
+        verts = np.array(
+            [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 1.0, 0.0], [0.0, 1.0, 0.0]],
+            dtype=np.float32,
+        )
+        faces = np.array([[0, 1, 2], [0, 2, 3]], dtype=np.uint32)
+        add_fill_mesh(plot.view.scene, verts, faces, (1.0, 0.0, 0.0, 1.0))
+        add_line(
+            plot.view.scene,
+            np.array([[0.05, 0.5], [0.95, 0.5]], dtype=np.float32),
+            color=(1.0, 1.0, 1.0, 1.0),
+            width=10.0,
+        )
+        native = canvas.native
+        native.resize(240, 160)
+        qapp.processEvents()
+        relock_canvas_2d_views(canvas)
+        before = _render_rgba_or_skip(canvas)
+        assert _trace_pixel_count(before) > 0
+
+        native.resize(2, 2)
+        qapp.processEvents()
+        native.resize(480, 280)
+        qapp.processEvents()
+        relock_canvas_2d_views(canvas)
+        after = _render_rgba_or_skip(canvas)
+        assert _trace_pixel_count(after) > 0
+    finally:
+        close = getattr(canvas, "close", None)
+        if callable(close):
+            close()
+

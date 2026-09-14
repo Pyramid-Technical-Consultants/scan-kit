@@ -113,11 +113,10 @@ def test_audio_waveform_scene_set_render_channels() -> None:
         assert scene.duration > 0.0
         mesh_mock.set_gl_state.assert_called_once_with(
             "translucent",
-            depth_test=True,
-            depth_mask=True,
+            depth_test=False,
+            depth_mask=False,
             cull_face=False,
-            polygon_offset_fill=True,
-            polygon_offset=(2.0, 2.0),
+            blend=True,
         )
         assert mesh_mock.order == 0
         assert wave_mock.parent is view.scene
