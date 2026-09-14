@@ -9,7 +9,6 @@ from typing import Any
 import xml.etree.ElementTree as ET
 
 from .ic_distance_tune import IcDistanceTuneResult
-from .kmu_tune import KmuTuneResult
 from .params import AutoTuneParamSpec
 from .position_offset_tune import PositionOffsetTuneResult
 from .sigma_tune import SigmaTuneResult
@@ -24,7 +23,6 @@ class AutoTuneRunResult:
     sigma: SigmaTuneResult | None = None
     position_offset: PositionOffsetTuneResult | None = None
     ic_distance: IcDistanceTuneResult | None = None
-    kmu: KmuTuneResult | None = None
     warnings: list[str] = field(default_factory=list)
 
 

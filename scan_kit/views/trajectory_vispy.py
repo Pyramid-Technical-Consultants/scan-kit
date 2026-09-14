@@ -45,7 +45,6 @@ from .trajectory_data import (
     segment_z_extent,
     spot_traces_3d,
 )
-from .vispy_plot import hex_to_rgba
 
 
 def _beam_to_scene(segments: np.ndarray) -> np.ndarray:
@@ -108,6 +107,14 @@ def _trace_vertex_colors(energy: np.ndarray, knots_per_trace: int) -> np.ndarray
     """Per-vertex RGBA for polylines: one energy color repeated per knot."""
     line_colors = _energy_colors(energy)
     return np.repeat(line_colors, knots_per_trace, axis=0)
+
+
+def _session_color_rgba(hex_color: str, alpha: float) -> tuple[float, float, float, float]:
+    hex_color = hex_color.lstrip("#")
+    r = int(hex_color[0:2], 16) / 255.0
+    g = int(hex_color[2:4], 16) / 255.0
+    b = int(hex_color[4:6], 16) / 255.0
+    return (r, g, b, alpha)
 
 
 def _marker_face_rgba(line_rgba: tuple[float, float, float, float]) -> tuple[float, float, float, float]:
@@ -300,7 +307,7 @@ class TrajectoryScene:
             marker = _make_opaque_disc_marker(
                 self._view.scene,
                 np.array([_scene_point(0.0, 0.0, z_beam)], dtype=float),
-                hex_to_rgba(color, 1.0),
+                _session_color_rgba(color, 1.0),
                 size=10,
                 symbol=symbol,
             )
@@ -311,8 +318,8 @@ class TrajectoryScene:
             if session is None:
                 continue
 
-            rgba = hex_to_rgba(color, SPOT_RAY_ALPHA)
-            plan_rgba = hex_to_rgba(color, PLAN_RAY_ALPHA)
+            rgba = _session_color_rgba(color, SPOT_RAY_ALPHA)
+            plan_rgba = _session_color_rgba(color, PLAN_RAY_ALPHA)
 
             if config.show_spot_lines or config.show_spot_markers:
                 _track_upstream_extent(session)
@@ -426,7 +433,7 @@ class TrajectoryScene:
                             label = scene.Text(
                                 "X magnet",
                                 pos=_scene_point(0.0, 0.0, z_x),
-                                color=hex_to_rgba(color, 0.9),
+                                color=_session_color_rgba(color, 0.9),
                                 font_size=9,
                                 parent=self._view.scene,
                             )
@@ -443,7 +450,7 @@ class TrajectoryScene:
                             label = scene.Text(
                                 "Y magnet",
                                 pos=_scene_point(0.0, 0.0, z_y),
-                                color=hex_to_rgba(color, 0.9),
+                                color=_session_color_rgba(color, 0.9),
                                 font_size=9,
                                 parent=self._view.scene,
                             )
@@ -452,7 +459,7 @@ class TrajectoryScene:
             if config.show_magnet_gaps:
                 geom = session.dipole_geometry
                 if geom is not None and geom.is_valid:
-                    gap_rgba = hex_to_rgba(color, 0.22)
+                    gap_rgba = _session_color_rgba(color, 0.22)
                     for spec in dual_dipole_pole_boxes(geom):
                         box = _pole_box_visual(spec, gap_rgba)
                         box.parent = self._view.scene
@@ -488,7 +495,7 @@ class TrajectoryScene:
                     z_iso,
                     ISO_PLANE_HALF_WIDTH_MM,
                     ISO_PLANE_HALF_HEIGHT_MM,
-                    hex_to_rgba(color, 0.15),
+                    _session_color_rgba(color, 0.15),
                 ):
                     vis.parent = self._view.scene
                     self._nodes.append(vis)
