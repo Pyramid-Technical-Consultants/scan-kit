@@ -23,18 +23,25 @@ def test_normalize_ui_theme() -> None:
     assert normalize_ui_theme(None) == "system"
 
 
-def test_apply_ui_theme_sets_color_scheme(qapp) -> None:
+def test_apply_ui_theme_sets_color_scheme(qapp, monkeypatch: pytest.MonkeyPatch) -> None:
+    # Offscreen Qt (CI) often leaves colorScheme() as Unknown; assert the request.
+    hints = qapp.styleHints()
+    seen: list[Qt.ColorScheme] = []
+    real = hints.setColorScheme
+
+    def _capture(scheme: Qt.ColorScheme) -> None:
+        seen.append(scheme)
+        return real(scheme)
+
+    monkeypatch.setattr(hints, "setColorScheme", _capture)
     apply_ui_theme("dark", app=qapp)
-    assert qapp.styleHints().colorScheme() == Qt.ColorScheme.Dark
     apply_ui_theme("light", app=qapp)
-    assert qapp.styleHints().colorScheme() == Qt.ColorScheme.Light
     apply_ui_theme("system", app=qapp)
-    # Qt reports the resolved OS scheme, not ColorScheme.Unknown.
-    assert qapp.styleHints().colorScheme() in (
-        Qt.ColorScheme.Light,
+    assert seen == [
         Qt.ColorScheme.Dark,
+        Qt.ColorScheme.Light,
         Qt.ColorScheme.Unknown,
-    )
+    ]
 
 
 def test_tinted_standard_icon_is_usable(qapp) -> None:
