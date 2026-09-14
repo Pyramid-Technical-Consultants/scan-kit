@@ -53,6 +53,7 @@ from .common.app_icon import (
     prepare_qt_app_identity,
 )
 from .common.app_settings import AppSettings
+from .common.user_store import PREF_LAST_DATA_DIR, prefs_get, prefs_set
 from .common.segmented_control import SegmentedControl as _SegmentedControl
 from .common.debug_log_panel import DebugLogPanel
 from .common.session_browser import SessionBrowserWidget
@@ -134,7 +135,10 @@ class ScanKitMainWindow(QMainWindow):
         self.setMinimumSize(1050, 650)
         self._app_settings = AppSettings.load()
         self._restore_window_geometry()
-        if FROZEN:
+        last_data = prefs_get(PREF_LAST_DATA_DIR)
+        if isinstance(last_data, str) and Path(last_data).is_dir():
+            self._initial_base_dir = last_data
+        elif FROZEN:
             self._initial_base_dir = str(PROJECT_ROOT)
         else:
             self._initial_base_dir = str(PROJECT_ROOT / "test_data")
@@ -651,6 +655,10 @@ class ScanKitMainWindow(QMainWindow):
         self._refresh_sessions()
 
     def _on_session_base_dir_changed(self, path: str) -> None:
+        try:
+            prefs_set(PREF_LAST_DATA_DIR, path)
+        except Exception:
+            pass
         panel = getattr(self, "_config_tuning_panel", None)
         if panel is not None:
             panel.set_session_data_dir(path)
@@ -712,9 +720,7 @@ class ScanKitMainWindow(QMainWindow):
     def _refresh_sessions(self) -> None:
         if self._session_browser is None:
             return
-        self._session_browser.refresh(
-            restored_selection=list(self._settings.selected_sessions or [])[:MAX_SESSIONS],
-        )
+        self._session_browser.refresh()
 
     def _selected_sids_in_order(self) -> list[str]:
         if self._session_browser is None:
@@ -722,14 +728,10 @@ class ScanKitMainWindow(QMainWindow):
         return self._session_browser.selected_session_ids()
 
     def _persist_selected_sessions(self, session_ids: list[str] | None = None) -> None:
-        """Save the current session selection into the persistent settings file."""
+        """Keep in-memory view settings in sync; the SQLite store is the restore source."""
         if session_ids is None:
             session_ids = self._selected_sids_in_order()
         self._settings.selected_sessions = session_ids
-        try:
-            self._settings.save(self._base_dir)
-        except Exception:
-            pass
 
     def _session_meta_by_sid(self) -> dict[str, SessionMeta | None]:
         if self._session_browser is None:
