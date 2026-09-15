@@ -53,7 +53,7 @@ PRESET_SIGMA_ERROR_TIMESLICE = MODE_SIGMA_ERROR_TIMESLICE
 PRESET_CONFIDENCE_TIMESLICE = MODE_CONFIDENCE_TIMESLICE
 PRESET_GAUSSIAN_FILTER = MODE_GAUSSIAN_FILTER
 
-from ..common.data_filter import FILTER_ALL, FILTER_BEAM_BOTH, DataFilterSelection
+from ..common.data_filter import FILTER_ALL, FILTER_BEAM_BOTH, FILTER_BEAM_ON, DataFilterSelection
 
 PlotStyle = Literal["contour", "scatter"]
 
@@ -102,6 +102,13 @@ MODES: tuple[DistributionModeDef, ...] = (
         uses_bg_subtract=False,
     ),
     DistributionModeDef(
+        MODE_POSITION_ERROR_TIMESLICE,
+        METRIC_POSITION_ERROR,
+        "Position Error",
+        "Position error distribution (timeslice)",
+        COARSE_SOURCE_TIMESLICE,
+    ),
+    DistributionModeDef(
         MODE_SIGMA_SPOT,
         METRIC_SIGMA,
         "Sigma",
@@ -110,26 +117,19 @@ MODES: tuple[DistributionModeDef, ...] = (
         uses_bg_subtract=False,
     ),
     DistributionModeDef(
+        MODE_SIGMA_TIMESLICE,
+        METRIC_SIGMA,
+        "Sigma",
+        "Sigma distribution (timeslice)",
+        COARSE_SOURCE_TIMESLICE,
+    ),
+    DistributionModeDef(
         MODE_SIGMA_ERROR_SPOT,
         METRIC_SIGMA_ERROR,
         "Sigma Error",
         "Sigma error distribution (spot)",
         COARSE_SOURCE_SPOT,
         uses_bg_subtract=False,
-    ),
-    DistributionModeDef(
-        MODE_POSITION_ERROR_TIMESLICE,
-        METRIC_POSITION_ERROR,
-        "Position Error",
-        "Position error distribution (timeslice)",
-        COARSE_SOURCE_TIMESLICE,
-    ),
-    DistributionModeDef(
-        MODE_SIGMA_TIMESLICE,
-        METRIC_SIGMA,
-        "Sigma",
-        "Sigma distribution (timeslice)",
-        COARSE_SOURCE_TIMESLICE,
     ),
     DistributionModeDef(
         MODE_SIGMA_ERROR_TIMESLICE,
@@ -266,7 +266,7 @@ class DistributionConfig:
     plot_style: PlotStyle = "contour"
     contour_cutoff_percentile: float = 5.0
     domain_filter: str = FILTER_ALL
-    beam_state_filter: str = FILTER_BEAM_BOTH
+    beam_state_filter: str = FILTER_BEAM_ON
     show_plan: bool = False
     show_ic1: bool = True
     show_ic2: bool = True

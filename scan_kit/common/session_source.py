@@ -6,6 +6,7 @@ import os
 import re
 import shutil
 import tarfile
+import threading
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 import zipfile
@@ -104,6 +105,7 @@ def _read_csv_robust(
     usecols: list[str] | None = None,
     raw_usecols: list[str] | None = None,
     aliases: dict[str, tuple[str, ...]] | None = None,
+    nrows: int | None = None,
 ) -> pd.DataFrame:
     """Read a CSV and tolerate schema drift in column naming.
 
@@ -119,13 +121,15 @@ def _read_csv_robust(
             if not read_usecols:
                 read_usecols = None
 
-    df = pd.read_csv(
-        source,
-        index_col=False,
-        skipinitialspace=True,
-        usecols=read_usecols,
-    )
-    df = canonicalize_dataframe_columns(df, aliases=alias_map)
+    read_kwargs: dict = {
+        "index_col": False,
+        "skipinitialspace": True,
+        "usecols": read_usecols,
+    }
+    if nrows is not None:
+        read_kwargs["nrows"] = nrows
+    df = pd.read_csv(source, **read_kwargs)
+    df = canonicalize_dataframe_columns(df, aliases=alias_map, copy=False)
     if usecols is None:
         return df
     seen: set[str] = set()
@@ -175,6 +179,127 @@ def session_source_from_archive(path: Path) -> SessionSource | None:
     if lower.endswith((".tgz", ".tar.gz", ".tar.bz2", ".tar.xz", ".tar")):
         return SessionSource("tar", path, sid)
     return None
+
+
+def _directory_session_root(folder: Path, session_id: str) -> Path | None:
+    inner = folder / session_id
+    if (inner / "input_map.csv").is_file():
+        return inner
+    if (folder / "input_map.csv").is_file():
+        return folder
+    return None
+
+
+def peek_session_source_from_path(
+    storage_path: str | Path,
+    session_id: str,
+) -> SessionSource | None:
+    """Build a source from a discovered path without extracting archives."""
+    path = Path(storage_path)
+    if path.is_dir():
+        root = _directory_session_root(path, session_id)
+        if root is None:
+            return None
+        return SessionSource("directory", root, session_id)
+    if path.is_file():
+        src = session_source_from_archive(path)
+        if src is not None and src.session_id == session_id:
+            return src
+    return None
+
+
+def peek_session_source(
+    session_id: str,
+    base_dir: str | Path,
+) -> SessionSource | None:
+    """Find a session under *base_dir* without extracting archives.
+
+    Preference matches discovery: unpacked directory, then zip, then tar.
+    """
+    base = Path(base_dir)
+    folder = base / session_id
+    if folder.is_dir():
+        src = peek_session_source_from_path(folder, session_id)
+        if src is not None:
+            return src
+    zp = base / f"{session_id}.zip"
+    if zp.is_file():
+        return SessionSource("zip", zp, session_id)
+    for suf in _ARCHIVE_SUFFIXES:
+        if suf == ".zip":
+            continue
+        ap = base / f"{session_id}{suf}"
+        if ap.is_file():
+            return SessionSource("tar", ap, session_id)
+    return None
+
+
+def list_session_storage_paths(base_dir: str | Path, session_id: str) -> list[Path]:
+    """Folder and leftover archives for *session_id* under *base_dir*."""
+    base = Path(base_dir)
+    found: list[Path] = []
+    folder = base / session_id
+    if folder.exists():
+        found.append(folder)
+    for suf in _ARCHIVE_SUFFIXES:
+        archive = base / f"{session_id}{suf}"
+        if archive.is_file():
+            found.append(archive)
+    return found
+
+
+def storage_fingerprint(
+    storage_path: str | Path,
+    session_id: str,
+) -> tuple[str, int, int] | None:
+    """``(resolved_path, mtime_ns, size)`` for cache keys.
+
+    Directories fingerprint ``termination_summary.txt`` when present so a
+    metadata edit is visible; archives use the archive file itself.
+    """
+    path = Path(storage_path)
+    target = path
+    if path.is_dir():
+        for candidate in (
+            path / "termination_summary.txt",
+            path / session_id / "termination_summary.txt",
+        ):
+            if candidate.is_file():
+                target = candidate
+                break
+    try:
+        st = target.stat()
+        return (str(target.resolve()), st.st_mtime_ns, st.st_size)
+    except OSError:
+        return None
+
+
+_META_CACHE: dict[tuple[str, int, int], SessionMeta] = {}
+_META_CACHE_LOCK = threading.Lock()
+
+
+def clear_termination_summary_cache() -> None:
+    with _META_CACHE_LOCK:
+        _META_CACHE.clear()
+
+
+def load_termination_summary_cached(
+    session_id: str,
+    storage_path: str | Path,
+) -> SessionMeta | None:
+    """Parse ``termination_summary.txt`` without extracting; cache by fingerprint."""
+    fp = storage_fingerprint(storage_path, session_id)
+    if fp is not None:
+        with _META_CACHE_LOCK:
+            hit = _META_CACHE.get(fp)
+        if hit is not None:
+            return hit
+    src = peek_session_source_from_path(storage_path, session_id)
+    meta = load_session_termination_summary(src) if src else None
+    if meta is not None and fp is not None:
+        with _META_CACHE_LOCK:
+            _META_CACHE[fp] = meta
+    return meta
 
 
 @dataclass(frozen=True)
@@ -652,11 +777,16 @@ def load_session_point_time_table(source: SessionSource) -> pd.DataFrame | None:
     return pd.concat(parts, ignore_index=True)
 
 
+def _timeslice_io_workers(n_files: int) -> int:
+    return max(1, min(24, n_files, (os.cpu_count() or 4) * 3))
+
+
 def load_session_timeslice_device_units(
     source: SessionSource,
     usecols: list[str] | None = None,
     *,
     max_frames: int | None = None,
+    nrows: int | None = None,
 ) -> list[pd.DataFrame]:
     """Load per-layer timeslice_data_device_units CSVs.
 
@@ -664,44 +794,66 @@ def load_session_timeslice_device_units(
     by the canonicalization step inside ``_read_csv_robust``.
 
     When *max_frames* is set, stop after that many layer files (for cheap probes).
+    When *nrows* is set, only that many data rows are read from each file
+    (``0`` is a header-only probe).
     """
     sid = source.session_id
     try:
         if source.kind == "directory":
             root = source.path
             matches: list[tuple[int, Path]] = []
-            for layer_dir in sorted(root.glob("layer-*")):
-                if not layer_dir.is_dir():
-                    continue
-                try:
-                    layer_idx = int(layer_dir.name.split("-", 1)[1])
-                except (IndexError, ValueError):
-                    continue
-                for run_dir in layer_dir.glob("run-*"):
-                    p = run_dir / "timeslice_data_device_units.csv"
-                    if p.is_file():
-                        matches.append((layer_idx, p))
-                        break
+            if max_frames == 1:
+                first = root / "layer-0" / "run-0" / "timeslice_data_device_units.csv"
+                if first.is_file():
+                    matches = [(0, first)]
+            if not matches:
+                for layer_dir in sorted(root.glob("layer-*")):
+                    if not layer_dir.is_dir():
+                        continue
+                    try:
+                        layer_idx = int(layer_dir.name.split("-", 1)[1])
+                    except (IndexError, ValueError):
+                        continue
+                    for run_dir in layer_dir.glob("run-*"):
+                        p = run_dir / "timeslice_data_device_units.csv"
+                        if p.is_file():
+                            matches.append((layer_idx, p))
+                            break
             matches.sort(key=lambda t: t[0])
+            if max_frames is not None:
+                matches = matches[:max_frames]
+            if not matches:
+                return []
             raw_usecols: list[str] | None = None
-            frames = []
-            for layer_idx, p in matches:
-                if usecols is not None and raw_usecols is None:
-                    raw_usecols = _resolve_timeslice_raw_usecols(p, usecols)
-                df = _read_csv_robust(p, usecols=usecols, raw_usecols=raw_usecols)
+            if usecols is not None:
+                raw_usecols = _resolve_timeslice_raw_usecols(matches[0][1], usecols)
+
+            def _load_one(item: tuple[int, Path]) -> tuple[int, pd.DataFrame]:
+                layer_idx, p = item
+                df = _read_csv_robust(
+                    p, usecols=usecols, raw_usecols=raw_usecols, nrows=nrows,
+                )
                 df["_layer_idx"] = layer_idx
-                frames.append(df)
-                if max_frames is not None and len(frames) >= max_frames:
-                    break
-            return frames
+                return layer_idx, df
+
+            if len(matches) == 1:
+                return [_load_one(matches[0])[1]]
+            with ThreadPoolExecutor(max_workers=_timeslice_io_workers(len(matches))) as pool:
+                loaded = list(pool.map(_load_one, matches))
+            loaded.sort(key=lambda t: t[0])
+            return [df for _, df in loaded]
 
         if source.kind == "zip":
             with zipfile.ZipFile(source.path, "r") as zf:
-                return _timeslices_from_zip(zf, sid, usecols, max_frames=max_frames)
+                return _timeslices_from_zip(
+                    zf, sid, usecols, max_frames=max_frames, nrows=nrows,
+                )
 
         if source.kind == "tar":
             with tarfile.open(source.path, "r:*") as tf:
-                return _timeslices_from_tar(tf, sid, usecols, max_frames=max_frames)
+                return _timeslices_from_tar(
+                    tf, sid, usecols, max_frames=max_frames, nrows=nrows,
+                )
     except Exception as e:
         _log.debug("Error loading timeslice data from session %s: %s", sid, e)
         return []
@@ -713,6 +865,7 @@ def _timeslices_from_zip(
     usecols: list[str] | None,
     *,
     max_frames: int | None = None,
+    nrows: int | None = None,
 ) -> list[pd.DataFrame]:
     matches: list[tuple[int, str]] = []
     for entry in zf.namelist():
@@ -728,7 +881,9 @@ def _timeslices_from_zip(
         with zf.open(path) as f:
             if usecols is not None and raw_usecols is None:
                 raw_usecols = _resolve_timeslice_raw_usecols(f, usecols)
-            df = _read_csv_robust(f, usecols=usecols, raw_usecols=raw_usecols)
+            df = _read_csv_robust(
+                f, usecols=usecols, raw_usecols=raw_usecols, nrows=nrows,
+            )
         df["_layer_idx"] = layer_idx
         frames.append(df)
         if max_frames is not None and len(frames) >= max_frames:
@@ -742,6 +897,7 @@ def _timeslices_from_tar(
     usecols: list[str] | None,
     *,
     max_frames: int | None = None,
+    nrows: int | None = None,
 ) -> list[pd.DataFrame]:
     matches: list[tuple[int, tarfile.TarInfo]] = []
     for info in tf.getmembers():
@@ -759,12 +915,26 @@ def _timeslices_from_tar(
             continue
         if usecols is not None and raw_usecols is None:
             raw_usecols = _resolve_timeslice_raw_usecols(raw, usecols)
-        df = _read_csv_robust(raw, usecols=usecols, raw_usecols=raw_usecols)
+        df = _read_csv_robust(
+            raw, usecols=usecols, raw_usecols=raw_usecols, nrows=nrows,
+        )
         df["_layer_idx"] = layer_idx
         frames.append(df)
         if max_frames is not None and len(frames) >= max_frames:
             break
     return frames
+
+
+def _tar_read_text(archive: Path, member: str) -> str | None:
+    with tarfile.open(archive, "r:*") as tf:
+        try:
+            info = tf.getmember(member)
+        except KeyError:
+            return None
+        raw = tf.extractfile(info)
+        if raw is None:
+            return None
+        return raw.read().decode("utf-8", errors="replace")
 
 
 def load_session_text(source: SessionSource, filename: str) -> str | None:
@@ -783,50 +953,19 @@ def load_session_text(source: SessionSource, filename: str) -> str | None:
                     return f.read().decode("utf-8", errors="replace")
 
         if source.kind == "tar":
-            target = f"{sid}/{filename}"
-            with tarfile.open(source.path, "r:*") as tf:
-                for info in tf:
-                    if info.name == target:
-                        raw = tf.extractfile(info)
-                        if raw is None:
-                            return None
-                        return raw.read().decode("utf-8", errors="replace")
-            return None
+            return _tar_read_text(source.path, f"{sid}/{filename}")
     except Exception as e:
         _log.debug("Error loading %s from session %s: %s", filename, sid, e)
         return None
+    return None
 
 
 def load_session_termination_summary(source: SessionSource) -> SessionMeta | None:
     """Parse ``termination_summary.txt`` for TUI metadata."""
-    sid = source.session_id
-    try:
-        if source.kind == "directory":
-            p = source.path / "termination_summary.txt"
-            if not p.is_file():
-                return None
-            text = p.read_text(encoding="utf-8", errors="replace")
-            return parse_termination_summary_text(text)
-
-        if source.kind == "zip":
-            with zipfile.ZipFile(source.path, "r") as zf:
-                with zf.open(f"{sid}/termination_summary.txt") as f:
-                    text = f.read().decode("utf-8", errors="replace")
-            return parse_termination_summary_text(text)
-
-        if source.kind == "tar":
-            target = f"{sid}/termination_summary.txt"
-            with tarfile.open(source.path, "r:*") as tf:
-                for info in tf:
-                    if info.name == target:
-                        raw = tf.extractfile(info)
-                        if raw is None:
-                            return None
-                        text = raw.read().decode("utf-8", errors="replace")
-                        return parse_termination_summary_text(text)
-            return None
-    except Exception:
+    text = load_session_text(source, "termination_summary.txt")
+    if text is None:
         return None
+    return parse_termination_summary_text(text)
 
 
 def hydrate_session_metadata(
@@ -849,8 +988,10 @@ def hydrate_session_metadata(
 
     def _one(row: tuple[str, str, SessionMeta | None]) -> tuple[str, str, SessionMeta | None]:
         sid, path_str, _ = row
-        src = resolve_session_source(sid, base)
-        meta = load_session_termination_summary(src) if src else None
+        storage = Path(path_str)
+        if not storage.is_absolute():
+            storage = base / path_str
+        meta = load_termination_summary_cached(sid, storage)
         return (sid, path_str, meta)
 
     with ThreadPoolExecutor(max_workers=max_workers) as pool:

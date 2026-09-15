@@ -9,4 +9,6 @@ Icon=scan-kit
 Terminal=false
 StartupNotify=true
 Categories=Science;Utility;
+Keywords=proton;beam;scanning;dosimetry;IC;
 StartupWMClass=scan-kit
+X-AppImage-Name=Scan Kit

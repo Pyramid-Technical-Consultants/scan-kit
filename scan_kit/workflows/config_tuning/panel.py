@@ -31,6 +31,14 @@ from .auto_tuning.ic_distance_tune import (
     IcDistanceTunePreviewRow,
     compute_ic_distance_tune_preview,
 )
+from .auto_tuning.kmu_tune import (
+    KmuTunePreviewRow,
+    compute_kmu_tune_preview,
+    normalize_kmu_known_mu,
+    normalize_kmu_percent,
+    normalize_kmu_primary_ic,
+    normalize_kmu_primary_mode,
+)
 from .auto_tuning.paths import resolve_devices_xml_path
 from .auto_tuning.position_offset_tune import (
     PositionOffsetTunePreviewRow,
@@ -308,7 +316,8 @@ class ConfigTuningPanel(QWidget):
         tuple[
             list[SigmaTunePreviewRow]
             | list[PositionOffsetTunePreviewRow]
-            | list[IcDistanceTunePreviewRow],
+            | list[IcDistanceTunePreviewRow]
+            | list[KmuTunePreviewRow],
             list[str],
         ]
         | None
@@ -346,6 +355,16 @@ class ConfigTuningPanel(QWidget):
                 document.root,
                 parse_session_ids(params),
                 str(params["data_dir"]).strip(),
+            )
+        if workflow.id == "kmu_tuning":
+            return compute_kmu_tune_preview(
+                document.root,
+                parse_session_ids(params),
+                str(params["data_dir"]).strip(),
+                primary=normalize_kmu_primary_ic(params.get("primary_ic")),
+                mode=normalize_kmu_primary_mode(params.get("primary_mode")),
+                known_mu=normalize_kmu_known_mu(params.get("known_mu")),
+                percent=normalize_kmu_percent(params.get("percent")),
             )
         return [], []
 

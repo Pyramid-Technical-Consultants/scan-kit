@@ -1,13 +1,19 @@
-"""Application-level settings persisted outside the session data directory."""
+"""Application-level settings persisted in the machine-local SQLite store."""
 
 from __future__ import annotations
 
-import json
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
 
 _SETTINGS_DIR = Path.home() / ".scan-kit"
 _FILENAME = "app_settings.json"
+
+UI_THEMES = ("system", "light", "dark")
+
+
+def normalize_ui_theme(value: object) -> str:
+    text = str(value or "system").strip().lower()
+    return text if text in UI_THEMES else "system"
 
 
 @dataclass
@@ -25,25 +31,15 @@ class AppSettings:
     last_plan_synthesis_save_dir: str | None = None
     last_rci_host: str | None = None
     last_plan_runner_file_dir: str | None = None
+    ui_theme: str = "system"
 
     @classmethod
     def settings_path(cls) -> Path:
+        """Legacy JSON path under ``~/.scan-kit`` (imported once, then unused)."""
         return _SETTINGS_DIR / _FILENAME
 
-    def save(self) -> None:
-        _SETTINGS_DIR.mkdir(parents=True, exist_ok=True)
-        self.settings_path().write_text(
-            json.dumps(asdict(self), indent=2, ensure_ascii=False) + "\n",
-            encoding="utf-8",
-        )
-
     @classmethod
-    def load(cls) -> AppSettings:
-        path = cls.settings_path()
-        try:
-            raw = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError, ValueError):
-            return cls()
+    def from_mapping(cls, raw: dict) -> AppSettings:
         if not isinstance(raw, dict):
             return cls()
         return cls(
@@ -62,7 +58,19 @@ class AppSettings:
             last_plan_runner_file_dir=_optional_str(
                 raw.get("last_plan_runner_file_dir")
             ),
+            ui_theme=normalize_ui_theme(raw.get("ui_theme")),
         )
+
+    def save(self) -> None:
+        from .user_store import save_app_settings
+
+        save_app_settings(self)
+
+    @classmethod
+    def load(cls) -> AppSettings:
+        from .user_store import load_app_settings
+
+        return load_app_settings()
 
 
 def _optional_int(value) -> int | None:

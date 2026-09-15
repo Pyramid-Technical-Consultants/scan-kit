@@ -137,20 +137,20 @@ Plot windows open separately. Close them when you are done — the launcher keep
 
 ### 1. Choose your data source
 
-Enter the folder that contains session data in **DATA SOURCE**, then press **Enter** or click away to refresh discovery. When running a frozen executable, the default is the current working directory.
+Enter the folder that contains session data in **DATA SOURCE**, then press **Enter** or click away to refresh discovery. The last folder is remembered in `~/.scan-kit`. When running a frozen executable with no remembered folder, the default is the current working directory.
 
 ### 2. Select sessions
 
-The session table shows **Session ID**, **Date**, **MU**, **Time (s)**, and **Note**.
+The session table shows **Session ID**, **Date**, **MU**, **Time**, **RM**, **Config**, and **Note**.
 
-- Sort by **Date** (newest first), **ID**, or **MU**
+- Sort by **Date** (newest first), **ID**, **Config**, or **MU**
 - Tick **Use** on up to **five** sessions — no modifier key needed
 - Click **✕** to clear all selections
-- **Right-click** a session → **Open in Config Tuning…** when a config folder is available
+- **Right-click** a session → **Copy Session ID**, **Move to Recycle Bin…**, or **Open in Config Tuning…** when a config folder is available
 
 ### 3. Annotate sessions (optional)
 
-Double-click (or press **F2** on) the **Note** column to add free-text notes. Notes save automatically and are stored in `<data_source>/session_notes.json`.
+Double-click (or press **F2** on) the **Note** column to add free-text notes. Notes, plot settings, window geometry, and the last data folder are stored in `~/.scan-kit/scan-kit.sqlite` so they survive app updates and do not depend on where Scan Kit is installed. Older `app_settings.json`, `session_notes.json`, and `<data_source>/settings.json` files are imported once, then left as a snapshot.
 
 ### 4. Tune global settings
 
@@ -161,7 +161,7 @@ Two controls affect most dose-related views:
 | **Background subtract** | On / Off |
 | **Calibration** | Off · Per-Session · Constrained |
 
-Settings persist in `<data_source>/settings.json` and propagate to views that are already open.
+Settings persist in `~/.scan-kit/scan-kit.sqlite` and propagate to views that are already open.
 
 ### 5. Open analysis views
 
@@ -258,7 +258,7 @@ The **Configuration Tuning** tab is a structured editor for map2map XML configur
 - **Auto-generated forms** — edit XML values without raw markup
 - **Hide unused map2map XML** — collapse attributes the map2map library never reads
 - **Integrity badges** — SHA-256 sidecar verification at a glance
-- **Auto-tuning workflows** — **Sigma Tuning**, **Position Offset Tuning**, and **IC Distance Tuning** derive updated `devices.xml` values from measured sessions, with preview before apply
+- **Auto-tuning workflows** — **Sigma Tuning**, **Position Offset Tuning**, **IC Distance Tuning**, and **Dose Calibration** derive updated `devices.xml` values from measured sessions, with preview before apply
 
 Jump here directly from a session's context menu in Data Analysis when an on-disk config folder exists.
 
@@ -295,6 +295,20 @@ Read the preview by these columns:
 | **RMS err** | what the fit minimises, so the honest before/after |
 | **Max \|err\|** | a single worst spot; it can *rise* when correcting a systematic of opposite sign stops masking an outlier |
 
+### Dose calibration: kMU
+
+`K_MU` on each ion chamber (`gain_conversion` with `in_units="MU"`) is coulombs per monitor unit. map2map converts `MU = Q / K_MU`; session `ic*_total_dose_spot` columns are already in MU.
+
+If the primary IC is the beam terminator, its reported MU already matches `CHARGE_REQ` by construction. Matching primary `K_MU` to the plan would be circular and would not change dose at isocenter. **Dose Calibration** therefore:
+
+- leaves primary `K_MU` unchanged by default
+- scales every secondary IC family so it would have reported the same total MU as the primary on the selected deliveries
+- optionally rescales the primary first, either to a known MU delivered at isocenter (Faraday / iso chamber, total for the selected sessions combined) or by a percentage of reported MU
+
+Positive percent means more reported MU / more delivered charge for the same prescription, so `K_MU` decreases (`+2%` → scale `1/1.02`). Changing primary `K_MU` changes future delivered charge for the same `CHARGE_REQ`; secondary-only applies align reporting and interlocks, not absolute dose.
+
+HCC and strip devices in one IC family keep their relative `K_MU` and all move by the same factor. Large commissioning corrections are allowed; the preview warns above 5% rather than blocking the write. This is not Data Analysis plot calibration (`per_session` / `constrained`), which never writes `devices.xml`.
+
 <p align="center">
   <img src="docs/images/launcher-config-tuning.png" alt="Configuration Tuning tab editing devices.xml" width="720">
 </p>
@@ -324,6 +338,10 @@ A nested layout (`<session_id>/<session_id>/input_map.csv`) is also recognized.
 
 ## For developers
 
+Day-to-day work merges into **`develop`**. `main` is the release line. Open pull requests against `develop` (`gh pr create --base develop`). The only PR that should target `main` is promoting `develop` for a release.
+
+CI fails feature PRs that target `main`.
+
 <details>
 <summary><strong>Regenerating README screenshots</strong></summary>
 
@@ -347,7 +365,7 @@ pytest
 
 Tests live in `tests/` and use fixtures from `test_data/` (included in dev installs, excluded from the published package). The suite runs headless — Agg matplotlib backend, no Qt windows.
 
-App preferences (last data directory, window geometry) persist in `app_settings.json` under the user config directory.
+App preferences (window geometry, last data directory, plot settings, session notes) persist in `~/.scan-kit/scan-kit.sqlite`.
 
 </details>
 
