@@ -1,4 +1,4 @@
-"""Global view settings, persisted as ``settings.json`` in the data directory."""
+"""Global view settings, persisted per data folder in the machine-local store."""
 
 from __future__ import annotations
 
@@ -34,22 +34,27 @@ class ViewSettings:
         return cls(**cls._clean(raw))
 
     def save(self, base_dir: str | Path) -> None:
-        path = Path(base_dir) / _FILENAME
-        d = asdict(self)
-        d.pop("cal_factors", None)  # runtime-only, not persisted
-        path.write_text(
-            json.dumps(d, indent=2, ensure_ascii=False) + "\n",
-            encoding="utf-8",
-        )
+        from .user_store import save_view_settings
+
+        save_view_settings(base_dir, self)
 
     @classmethod
-    def load(cls, base_dir: str | Path) -> ViewSettings:
+    def load_legacy_json(cls, base_dir: str | Path) -> ViewSettings:
+        """Read ``<data_source>/settings.json`` for one-shot import."""
         path = Path(base_dir) / _FILENAME
         try:
             raw = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError, ValueError):
             return cls()
+        if not isinstance(raw, dict):
+            return cls()
         return cls(**cls._clean(raw))
+
+    @classmethod
+    def load(cls, base_dir: str | Path) -> ViewSettings:
+        from .user_store import load_view_settings
+
+        return load_view_settings(base_dir)
 
     @classmethod
     def _clean(cls, raw: dict) -> dict:

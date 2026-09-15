@@ -137,20 +137,20 @@ Plot windows open separately. Close them when you are done — the launcher keep
 
 ### 1. Choose your data source
 
-Enter the folder that contains session data in **DATA SOURCE**, then press **Enter** or click away to refresh discovery. When running a frozen executable, the default is the current working directory.
+Enter the folder that contains session data in **DATA SOURCE**, then press **Enter** or click away to refresh discovery. The last folder is remembered in `~/.scan-kit`. When running a frozen executable with no remembered folder, the default is the current working directory.
 
 ### 2. Select sessions
 
-The session table shows **Session ID**, **Date**, **MU**, **Time (s)**, and **Note**.
+The session table shows **Session ID**, **Date**, **MU**, **Time**, **RM**, **Config**, and **Note**.
 
-- Sort by **Date** (newest first), **ID**, or **MU**
+- Sort by **Date** (newest first), **ID**, **Config**, or **MU**
 - Tick **Use** on up to **five** sessions — no modifier key needed
 - Click **✕** to clear all selections
-- **Right-click** a session → **Open in Config Tuning…** when a config folder is available
+- **Right-click** a session → **Copy Session ID**, **Move to Recycle Bin…**, or **Open in Config Tuning…** when a config folder is available
 
 ### 3. Annotate sessions (optional)
 
-Double-click (or press **F2** on) the **Note** column to add free-text notes. Notes save automatically and are stored in `<data_source>/session_notes.json`.
+Double-click (or press **F2** on) the **Note** column to add free-text notes. Notes, plot settings, window geometry, and the last data folder are stored in `~/.scan-kit/scan-kit.sqlite` so they survive app updates and do not depend on where Scan Kit is installed. Older `app_settings.json`, `session_notes.json`, and `<data_source>/settings.json` files are imported once, then left as a snapshot.
 
 ### 4. Tune global settings
 
@@ -161,7 +161,7 @@ Two controls affect most dose-related views:
 | **Background subtract** | On / Off |
 | **Calibration** | Off · Per-Session · Constrained |
 
-Settings persist in `<data_source>/settings.json` and propagate to views that are already open.
+Settings persist in `~/.scan-kit/scan-kit.sqlite` and propagate to views that are already open.
 
 ### 5. Open analysis views
 
@@ -338,6 +338,10 @@ A nested layout (`<session_id>/<session_id>/input_map.csv`) is also recognized.
 
 ## For developers
 
+Day-to-day work merges into **`develop`**. `main` is the release line. Open pull requests against `develop` (`gh pr create --base develop`). The only PR that should target `main` is promoting `develop` for a release.
+
+CI fails feature PRs that target `main`.
+
 <details>
 <summary><strong>Regenerating README screenshots</strong></summary>
 
@@ -361,7 +365,7 @@ pytest
 
 Tests live in `tests/` and use fixtures from `test_data/` (included in dev installs, excluded from the published package). The suite runs headless — Agg matplotlib backend, no Qt windows.
 
-App preferences (last data directory, window geometry) persist in `app_settings.json` under the user config directory.
+App preferences (window geometry, last data directory, plot settings, session notes) persist in `~/.scan-kit/scan-kit.sqlite`.
 
 </details>
 

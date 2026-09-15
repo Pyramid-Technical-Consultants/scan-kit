@@ -9,7 +9,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
-from PySide6.QtCore import QRectF, Qt, QTimer, Signal, QSize, Slot
+from PySide6.QtCore import QFileSystemWatcher, QRectF, Qt, QTimer, Signal, QSize, Slot
 from PySide6.QtGui import (
     QAction,
     QColor,
@@ -29,7 +29,9 @@ from PySide6.QtWidgets import (
     QHeaderView,
     QLineEdit,
     QMenu,
+    QMessageBox,
     QPushButton,
+    QStyle,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -37,8 +39,16 @@ from PySide6.QtWidgets import (
 )
 
 from scan_kit.common.plot_colors import DEFAULT_SESSION_COLORS
+from scan_kit.common.recycle import move_to_trash
 from scan_kit.common.session_meta import SessionMeta
-from scan_kit.common.session_notes import load_notes, save_note
+from scan_kit.common.session_source import list_session_storage_paths
+from scan_kit.common.user_store import (
+    delete_session,
+    record_session_meta,
+    set_selected_sessions,
+    set_session_note,
+    snapshot_library,
+)
 
 _SESSION_ROW_BATCH = 24
 _SESSION_ROLE = Qt.ItemDataRole.UserRole
@@ -51,9 +61,11 @@ _COL_DATE = 2
 _COL_MU = 3
 _COL_TIME = 4
 _COL_ROOM = 5
-_COL_NOTE = 6
+_COL_CONFIG = 6
+_COL_NOTE = 7
 
 _COMPACT_META_COLS = (_COL_MU, _COL_TIME, _COL_ROOM)
+_META_COLS = (_COL_DATE, _COL_MU, _COL_TIME, _COL_ROOM, _COL_CONFIG)
 
 _SWATCH_PX = 14
 _UNCHECKED_SWATCH = QColor("#d0d0d0")
@@ -113,18 +125,25 @@ class _SortableItem(QTableWidgetItem):
             return str(a) < str(b)
 
 
-def _meta_column_texts(meta: SessionMeta | None) -> tuple[str, str, str, str]:
+def _meta_column_texts(meta: SessionMeta | None) -> tuple[str, str, str, str, str]:
     if meta is None:
-        return "—", "—", "—", "?"
-    return meta.short_date, meta.short_mu, meta.short_time, meta.short_room
+        return "—", "—", "—", "?", "—"
+    return (
+        meta.short_date,
+        meta.short_mu,
+        meta.short_time,
+        meta.short_room,
+        meta.short_config,
+    )
 
 
 def _meta_sort_values(
     meta: SessionMeta | None,
-) -> tuple[datetime | None, float | None, int | None, int | None]:
+) -> tuple[datetime | None, float | None, int | None, int | None, str | None]:
     if meta is None:
-        return (None, None, None, None)
-    return (meta.date, meta.primary_mu, meta.treatment_time_s, meta.room_number)
+        return (None, None, None, None, None)
+    config = (meta.config_name or "").strip() or None
+    return (meta.date, meta.primary_mu, meta.treatment_time_s, meta.room_number, config)
 
 
 def _compact_meta_column_widths(fm: QFontMetrics) -> dict[int, int]:
@@ -135,6 +154,21 @@ def _compact_meta_column_widths(fm: QFontMetrics) -> dict[int, int]:
         _COL_TIME: fm.horizontalAdvance("99:59") + pad,
         _COL_ROOM: max(fm.horizontalAdvance("RM"), fm.horizontalAdvance("99")) + pad,
     }
+
+
+def _use_column_width(table: QTableWidget) -> int:
+    """Checkbox + plot swatch + header; fixed so refresh does not twitch the column."""
+    fm = QFontMetrics(table.font())
+    check = table.style().pixelMetric(
+        QStyle.PixelMetric.PM_IndicatorWidth, None, table
+    )
+    header = fm.horizontalAdvance("Use") + 16
+    return max(header, check + table.iconSize().width() + 16)
+
+
+def _config_column_width(fm: QFontMetrics) -> int:
+    """About half a typical configuration name; leftover pane width is shared with Note."""
+    return fm.horizontalAdvance("working_hvtt_new_") + 10
 
 
 class _NoteEditCommand(QUndoCommand):
@@ -211,6 +245,10 @@ class SessionBrowserWidget(QWidget):
         self._highlighted_sid: str | None = None
         self._check_order: list[str] = []
         self._row_by_sid: dict[str, int] = {}
+        self._restored_selection_override: list[str] | None = None
+        self._sorting_held = False
+        self._trash = move_to_trash
+        self._confirm_recycle = self._confirm_recycle_dialog
 
         self._meta_col_resize_timer = QTimer(self)
         self._meta_col_resize_timer.setSingleShot(True)
@@ -218,9 +256,15 @@ class SessionBrowserWidget(QWidget):
         self._status_refresh_timer = QTimer(self)
         self._status_refresh_timer.setSingleShot(True)
         self._status_refresh_timer.timeout.connect(self._update_status)
+        self._fs_debounce = QTimer(self)
+        self._fs_debounce.setSingleShot(True)
+        self._fs_debounce.timeout.connect(self.incremental_refresh)
+        self._fs_watcher = QFileSystemWatcher(self)
+        self._fs_watcher.directoryChanged.connect(self._on_data_dir_changed)
 
         self._connect_worker_signals()
         self._build_ui()
+        self._watch_base_dir()
 
     def _connect_worker_signals(self) -> None:
         self._sig_session_metadata.connect(
@@ -276,31 +320,35 @@ class SessionBrowserWidget(QWidget):
         root.addLayout(data_dir_row)
 
         self._table = QTableWidget()
-        self._table.setColumnCount(7)
+        self._table.setColumnCount(8)
         self._table.setHorizontalHeaderLabels(
-            ["Use", "Session ID", "Date", "MU", "Time", "RM", "Note"]
+            ["Use", "Session ID", "Date", "MU", "Time", "RM", "Config", "Note"]
         )
         self._table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self._table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
         self._table.setSortingEnabled(True)
         self._table.setAlternatingRowColors(True)
-        self._table.setTextElideMode(Qt.TextElideMode.ElideNone)
+        self._table.setTextElideMode(Qt.TextElideMode.ElideRight)
         self._table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self._table.setIconSize(QSize(_SWATCH_PX, _SWATCH_PX))
         hh = self._table.horizontalHeader()
         hh.setMinimumSectionSize(16)
-        hh.setSectionResizeMode(_COL_USE, QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(_COL_USE, QHeaderView.ResizeMode.Fixed)
+        hh.resizeSection(_COL_USE, _use_column_width(self._table))
         hh.setSectionResizeMode(_COL_SESSION_ID, QHeaderView.ResizeMode.ResizeToContents)
         hh.setSectionResizeMode(_COL_DATE, QHeaderView.ResizeMode.ResizeToContents)
-        compact_widths = _compact_meta_column_widths(QFontMetrics(self._table.font()))
+        fm = QFontMetrics(self._table.font())
+        compact_widths = _compact_meta_column_widths(fm)
         for col in _COMPACT_META_COLS:
             hh.setSectionResizeMode(col, QHeaderView.ResizeMode.Fixed)
             hh.resizeSection(col, compact_widths[col])
+        hh.setSectionResizeMode(_COL_CONFIG, QHeaderView.ResizeMode.Stretch)
         hh.setSectionResizeMode(_COL_NOTE, QHeaderView.ResizeMode.Stretch)
         hh.resizeSection(_COL_SESSION_ID, 220)
+        hh.resizeSection(_COL_CONFIG, _config_column_width(fm))
         hh.setSortIndicatorShown(True)
         self._table.sortByColumn(_COL_DATE, Qt.SortOrder.DescendingOrder)
         self._table.verticalHeader().setVisible(False)
-        self._table.setIconSize(QSize(_SWATCH_PX, _SWATCH_PX))
         self._table.itemChanged.connect(self._on_table_item_changed)
         self._table.currentCellChanged.connect(self._on_current_cell_changed)
         self._table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
@@ -396,6 +444,9 @@ class SessionBrowserWidget(QWidget):
         self._row_by_sid.clear()
         if restored_selection is not None:
             self._check_order = list(restored_selection)[: self._max_selections]
+        self._restored_selection_override = restored_selection
+        self._hold_sorting()
+        self._watch_base_dir()
         self._track_worker(
             threading.Thread(
                 target=self._discover_sessions_worker,
@@ -413,6 +464,7 @@ class SessionBrowserWidget(QWidget):
         self._shutdown_meta_pool()
         workers = max(4, min(12, (os.cpu_count() or 4) * 2))
         self._meta_pool = ThreadPoolExecutor(max_workers=workers)
+        self._hold_sorting()
         self._track_worker(
             threading.Thread(
                 target=self._incremental_rescan_worker,
@@ -445,6 +497,8 @@ class SessionBrowserWidget(QWidget):
             self._meta_col_resize_timer.stop()
         if self._status_refresh_timer is not None:
             self._status_refresh_timer.stop()
+        if self._fs_debounce is not None:
+            self._fs_debounce.stop()
 
     def _on_base_dir_finished(self) -> None:
         path = self._base_dir_input.text().strip()
@@ -480,6 +534,10 @@ class SessionBrowserWidget(QWidget):
             "Copy Session ID",
             lambda checked=False, session_id=sid: self._copy_session_id(session_id),
         )
+        menu.addAction(
+            "Move to Recycle Bin…",
+            lambda checked=False, session_id=sid: self._recycle_session(session_id),
+        )
         self.populate_context_menu.emit(sid, menu)
         if menu.isEmpty():
             return
@@ -487,6 +545,86 @@ class SessionBrowserWidget(QWidget):
 
     def _copy_session_id(self, sid: str) -> None:
         QGuiApplication.clipboard().setText(sid)
+
+    def _watch_base_dir(self) -> None:
+        for current in list(self._fs_watcher.directories()):
+            self._fs_watcher.removePath(current)
+        folder = Path(self._base_dir)
+        if folder.is_dir():
+            self._fs_watcher.addPath(str(folder))
+
+    def _on_data_dir_changed(self, _path: str) -> None:
+        self._fs_debounce.start(500)
+
+    def _hold_sorting(self) -> None:
+        if not self._sorting_held:
+            self._table.setSortingEnabled(False)
+            self._sorting_held = True
+
+    def _release_sorting(self) -> None:
+        if not self._sorting_held:
+            return
+        self._table.setSortingEnabled(True)
+        self._sorting_held = False
+        self._rebuild_session_row_index()
+
+    def _confirm_recycle_dialog(self, sid: str, paths: list[Path]) -> bool:
+        lines = "\n".join(f"  {p}" for p in paths)
+        selected = sid in set(self.selected_session_ids())
+        extra = ""
+        if selected:
+            extra = (
+                "\n\nThis session is currently selected for analysis. "
+                "Open plot windows may fail after the files are removed."
+            )
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("Move session to Recycle Bin")
+        box.setText(
+            f"Move session {sid} to the Recycle Bin?\n\n"
+            f"These items will be removed:\n{lines}\n\n"
+            "You can restore them from the Recycle Bin if needed."
+            f"{extra}"
+        )
+        box.setStandardButtons(
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel
+        )
+        box.setDefaultButton(QMessageBox.StandardButton.Cancel)
+        return box.exec() == QMessageBox.StandardButton.Yes
+
+    def _recycle_session(self, sid: str) -> None:
+        paths = list_session_storage_paths(self._base_dir, sid)
+        if not paths:
+            return
+        if not self._confirm_recycle(sid, paths):
+            return
+        if sid in set(self.selected_session_ids()):
+            self._set_row_checked(sid, False)
+            self._check_order = [s for s in self._check_order if s != sid]
+            self._persist_selection()
+        self._fs_debounce.stop()
+        errors: list[str] = []
+        for path in paths:
+            try:
+                self._trash(path)
+            except OSError as exc:
+                errors.append(f"{path}: {exc}")
+        try:
+            delete_session(self._base_dir, sid)
+        except Exception:
+            pass
+        self._notes.pop(sid, None)
+        row = self._find_row_for_sid(sid)
+        if row >= 0:
+            self._table.removeRow(row)
+            self._rebuild_session_row_index()
+        self._discovered = [entry for entry in self._discovered if entry[0] != sid]
+        self._schedule_status_refresh()
+        if errors:
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Icon.Critical)
+            box.setText("Could not move some session files to the Recycle Bin:\n" + "\n".join(errors))
+            box.exec()
 
     def _schedule_status_refresh(self) -> None:
         self._status_refresh_timer.start(0)
@@ -513,28 +651,21 @@ class SessionBrowserWidget(QWidget):
             pool.shutdown(wait=wait, cancel_futures=True)
 
     def _discover_sessions_worker(self, gen: int, base_dir: str) -> None:
-        from scan_kit.common.sessions import discover_sessions
-
         try:
             try:
-                notes = load_notes(base_dir)
-            except Exception:
-                notes = {}
-            if gen != self._hydrate_generation:
-                return
-            self._sig_notes_loaded.emit(gen, notes)
-            try:
-                rows = discover_sessions(
-                    base_dirs=(base_dir,),
-                    project_root=self._project_root,
+                notes, selected, rows = snapshot_library(
+                    base_dir, project_root=self._project_root
                 )
             except Exception:
-                rows = []
-            batch: list[tuple[str, str]] = []
-            for sid, path_str, _ in rows:
+                notes, selected, rows = {}, [], []
+            if gen != self._hydrate_generation:
+                return
+            self._sig_notes_loaded.emit(gen, {"notes": notes, "selected": selected})
+            batch: list[tuple[str, str, SessionMeta | None]] = []
+            for sid, path_str, meta in rows:
                 if gen != self._hydrate_generation:
                     return
-                batch.append((sid, path_str))
+                batch.append((sid, path_str, meta))
                 if len(batch) >= _SESSION_ROW_BATCH:
                     self._sig_session_rows_batch.emit(gen, batch)
                     batch = []
@@ -547,28 +678,21 @@ class SessionBrowserWidget(QWidget):
                 self._sig_scan_finished.emit(gen)
 
     def _incremental_rescan_worker(self, gen: int, base_dir: str) -> None:
-        from scan_kit.common.sessions import discover_sessions
-
-        found: list[tuple[str, str]] = []
+        found: list[tuple[str, str, SessionMeta | None]] = []
         try:
             try:
-                notes = load_notes(base_dir)
-            except Exception:
-                notes = {}
-            if gen != self._hydrate_generation:
-                return
-            self._sig_notes_loaded.emit(gen, notes)
-            try:
-                rows = discover_sessions(
-                    base_dirs=(base_dir,),
-                    project_root=self._project_root,
+                notes, selected, rows = snapshot_library(
+                    base_dir, project_root=self._project_root
                 )
             except Exception:
-                rows = []
-            for sid, path_str, _ in rows:
+                notes, selected, rows = {}, [], []
+            if gen != self._hydrate_generation:
+                return
+            self._sig_notes_loaded.emit(gen, {"notes": notes, "selected": selected})
+            for sid, path_str, meta in rows:
                 if gen != self._hydrate_generation:
                     return
-                found.append((sid, path_str))
+                found.append((sid, path_str, meta))
         finally:
             if gen == self._hydrate_generation:
                 self._sig_incremental_rescan.emit(gen, found)
@@ -577,10 +701,23 @@ class SessionBrowserWidget(QWidget):
     def _on_notes_loaded(self, gen: int, notes: object) -> None:
         if gen != self._hydrate_generation:
             return
-        if isinstance(notes, dict):
-            self._notes = {str(k): str(v) for k, v in notes.items()}
+        selected: list[str] = []
+        payload = notes
+        if isinstance(notes, dict) and "notes" in notes:
+            payload = notes.get("notes")
+            raw_sel = notes.get("selected")
+            if isinstance(raw_sel, list):
+                selected = [str(s) for s in raw_sel]
+        if isinstance(payload, dict):
+            self._notes = {str(k): str(v) for k, v in payload.items()}
         else:
             self._notes = {}
+        if self._restored_selection_override is not None:
+            self._check_order = list(self._restored_selection_override)[
+                : self._max_selections
+            ]
+        elif isinstance(notes, dict) and "selected" in notes:
+            self._check_order = selected[: self._max_selections]
 
     @Slot(int, object)
     def _on_session_rows_batch(self, gen: int, batch: object) -> None:
@@ -588,32 +725,36 @@ class SessionBrowserWidget(QWidget):
             return
         if not isinstance(batch, list):
             return
-        clean: list[tuple[str, str]] = []
+        clean: list[tuple[str, str, SessionMeta | None]] = []
         for item in batch:
             if isinstance(item, tuple) and len(item) >= 2:
-                clean.append((str(item[0]), str(item[1])))
+                meta = item[2] if len(item) >= 3 and isinstance(item[2], SessionMeta) else None
+                clean.append((str(item[0]), str(item[1]), meta))
         if not clean:
             return
         self._table.blockSignals(True)
-        self._table.setSortingEnabled(False)
+        self._hold_sorting()
         try:
             first_row = self._table.rowCount()
             self._table.setRowCount(first_row + len(clean))
             restored = set(self._check_order)
-            for i, (sid, path_str) in enumerate(clean):
+            for i, (sid, path_str, meta) in enumerate(clean):
                 row = first_row + i
-                self._discovered.append((sid, path_str, None))
+                self._discovered.append((sid, path_str, meta))
                 self._set_session_row_widgets(
                     row,
                     sid,
-                    None,
+                    meta,
                     use_checked=sid in restored,
                 )
-                self._schedule_meta_hydrate(gen, sid, path_str)
+                if meta is None:
+                    self._schedule_meta_hydrate(gen, sid, path_str)
+                else:
+                    self._hydrate_received += 1
         finally:
-            self._table.setSortingEnabled(True)
             self._table.blockSignals(False)
         self._rebuild_session_row_index()
+        self._maybe_finish_hydrate()
         self._schedule_status_refresh()
 
     @Slot(int)
@@ -627,7 +768,7 @@ class SessionBrowserWidget(QWidget):
             self._check_order = reconciled
             self._persist_selection()
         if self._hydrate_received >= len(self._discovered):
-            self._schedule_meta_column_resize()
+            self._maybe_finish_hydrate()
         self._schedule_status_refresh()
 
     @Slot(int, object)
@@ -636,18 +777,19 @@ class SessionBrowserWidget(QWidget):
             return
         if not isinstance(rows_obj, list):
             return
-        found: list[tuple[str, str]] = []
+        found: list[tuple[str, str, SessionMeta | None]] = []
         for item in rows_obj:
             if isinstance(item, tuple) and len(item) >= 2:
-                found.append((str(item[0]), str(item[1])))
-        found_map = dict(found)
+                meta = item[2] if len(item) >= 3 and isinstance(item[2], SessionMeta) else None
+                found.append((str(item[0]), str(item[1]), meta))
+        found_map = {sid: (path_str, meta) for sid, path_str, meta in found}
         found_sids = set(found_map.keys())
         present_sids = set(self._row_by_sid.keys())
 
         removed = present_sids - found_sids
         if removed:
             self._table.blockSignals(True)
-            self._table.setSortingEnabled(False)
+            self._hold_sorting()
             try:
                 for row in sorted(
                     (self._find_row_for_sid(sid) for sid in removed),
@@ -662,40 +804,49 @@ class SessionBrowserWidget(QWidget):
                     self._check_order = [s for s in self._check_order if s in found_sids]
                     self._persist_selection()
             finally:
-                self._table.setSortingEnabled(True)
                 self._table.blockSignals(False)
             self._rebuild_session_row_index()
 
         for i, (sid, path_str, meta) in enumerate(self._discovered):
-            updated_path = found_map.get(sid)
-            if updated_path is not None and updated_path != path_str:
-                self._discovered[i] = (sid, updated_path, meta)
+            updated = found_map.get(sid)
+            if updated is None:
+                continue
+            updated_path, found_meta = updated
+            if updated_path != path_str or found_meta is not None:
+                self._discovered[i] = (sid, updated_path, found_meta or meta)
+            if found_meta is not None:
+                self._patch_session_metadata_cells(sid, found_meta)
+            elif updated_path != path_str:
+                self._schedule_meta_hydrate(gen, sid, updated_path)
 
         new_sids = found_sids - present_sids
         if new_sids:
-            to_add = [(sid, found_map[sid]) for sid in sorted(new_sids)]
+            to_add = [(sid, found_map[sid][0], found_map[sid][1]) for sid in sorted(new_sids)]
             self._table.blockSignals(True)
-            self._table.setSortingEnabled(False)
+            self._hold_sorting()
             try:
                 first_row = self._table.rowCount()
                 self._table.setRowCount(first_row + len(to_add))
                 restored = set(self._check_order)
-                for i, (sid, path_str) in enumerate(to_add):
+                for i, (sid, path_str, meta) in enumerate(to_add):
                     row = first_row + i
-                    self._discovered.append((sid, path_str, None))
+                    self._discovered.append((sid, path_str, meta))
                     self._set_session_row_widgets(
                         row,
                         sid,
-                        None,
+                        meta,
                         use_checked=sid in restored,
                     )
-                    self._schedule_meta_hydrate(gen, sid, path_str)
+                    if meta is None:
+                        self._schedule_meta_hydrate(gen, sid, path_str)
+                    else:
+                        self._hydrate_received += 1
             finally:
-                self._table.setSortingEnabled(True)
                 self._table.blockSignals(False)
             self._rebuild_session_row_index()
 
         self._sync_note_cells_from_store(found_sids)
+        self._maybe_finish_hydrate()
         self._schedule_status_refresh()
 
     def _sync_note_cells_from_store(self, sids: set[str] | None = None) -> None:
@@ -723,14 +874,13 @@ class SessionBrowserWidget(QWidget):
         base_dir = self._base_dir
 
         def job() -> tuple[str, str, SessionMeta | None]:
-            from scan_kit.common.session_source import (
-                load_session_termination_summary,
-                resolve_session_source,
-            )
+            from scan_kit.common.session_source import load_termination_summary_cached
 
-            base = Path(base_dir)
-            src = resolve_session_source(sid, base)
-            meta = load_session_termination_summary(src) if src else None
+            meta = load_termination_summary_cached(sid, path_str)
+            try:
+                record_session_meta(base_dir, sid, path_str, meta)
+            except Exception:
+                pass
             return sid, path_str, meta
 
         def _done(fut: Any) -> None:
@@ -762,43 +912,47 @@ class SessionBrowserWidget(QWidget):
                 break
         self._hydrate_received += 1
         self._patch_session_metadata_cells(sid, meta_obj)
-        if self._scan_complete and self._hydrate_received >= len(self._discovered):
-            self._schedule_meta_column_resize()
+        self._maybe_finish_hydrate()
         self._schedule_status_refresh()
+
+    def _maybe_finish_hydrate(self) -> None:
+        if self._scan_complete and self._hydrate_received >= len(self._discovered):
+            self._release_sorting()
+            self._schedule_meta_column_resize()
 
     def _patch_session_metadata_cells(self, sid: str, meta: SessionMeta | None) -> None:
         row = self._find_row_for_sid(sid)
         if row < 0:
             return
         self._table.blockSignals(True)
-        self._table.setSortingEnabled(False)
         try:
             self._fill_meta_columns(row, meta)
         finally:
-            self._table.setSortingEnabled(True)
             self._table.blockSignals(False)
-        self._rebuild_session_row_index()
 
     def _resize_session_meta_columns(self) -> None:
-        for col in (_COL_USE, _COL_SESSION_ID, _COL_DATE):
+        for col in (_COL_SESSION_ID, _COL_DATE):
             self._table.resizeColumnToContents(col)
 
     def _fill_meta_columns(self, row: int, meta: SessionMeta | None) -> None:
         texts = _meta_column_texts(meta)
         sort_vals = _meta_sort_values(meta)
+        full_config = (meta.config_name or "").strip() if meta is not None else ""
         align = Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft
-        for col_offset, (text, sval) in enumerate(zip(texts, sort_vals)):
-            col = _COL_DATE + col_offset
+        for col, text, sval in zip(_META_COLS, texts, sort_vals):
             item = self._table.item(row, col)
+            tip = full_config if col == _COL_CONFIG and full_config else ""
             if item is None:
                 cell = _SortableItem(text)
                 cell.setFlags(cell.flags() & ~Qt.ItemFlag.ItemIsEditable)
                 cell.setTextAlignment(align)
                 cell.setData(_SORT_VALUE_ROLE, sval)
+                cell.setToolTip(tip)
                 self._table.setItem(row, col, cell)
             else:
                 item.setText(text)
                 item.setData(_SORT_VALUE_ROLE, sval)
+                item.setToolTip(tip)
 
     def _set_session_row_widgets(
         self,
@@ -924,7 +1078,10 @@ class SessionBrowserWidget(QWidget):
             self._notes[sid] = text
         else:
             self._notes.pop(sid, None)
-        save_note(self._base_dir, sid, text)
+        try:
+            set_session_note(self._base_dir, sid, text)
+        except Exception:
+            pass
         self._set_note_cell_text(sid, text)
 
     def _set_note_cell_text(self, sid: str, text: str) -> None:
@@ -1024,5 +1181,10 @@ class SessionBrowserWidget(QWidget):
         self.selection_changed.emit(selected)
 
     def _persist_selection(self) -> None:
+        ids = self.selected_session_ids()
+        try:
+            set_selected_sessions(self._base_dir, ids)
+        except Exception:
+            pass
         if self._selection_persist is not None:
-            self._selection_persist(self.selected_session_ids())
+            self._selection_persist(ids)

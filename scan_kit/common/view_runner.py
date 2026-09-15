@@ -1,15 +1,14 @@
 """Live-updating view runner for scan-kit analysis views.
 
 Wraps a view's ``run()`` function so that the matplotlib figure window
-stays open and redraws in-place whenever ``settings.json`` changes on
-disk.  The launcher saves settings; the subprocess picks up the
-change via a 1-second polling timer on the matplotlib event loop.
+stays open and redraws in-place whenever view settings change in the
+machine-local store.  The launcher saves settings; the subprocess picks
+up the change via a 1-second polling timer on the matplotlib event loop.
 """
 
 from __future__ import annotations
 
 import logging
-import os
 import sys
 import traceback
 from typing import Any, Callable
@@ -98,12 +97,12 @@ def run_with_live_settings(
     plt = _get_pyplot()
     from .plotting import apply_toolbar_tight_layout
 
-    settings_path = os.path.join(base_dir, "settings.json")
+    from .user_store import view_settings_rev
 
     _state: dict[str, Any] = {
         "rerun": False,
         "existing_figs": [],
-        "last_mtime": 0.0,
+        "last_rev": view_settings_rev(base_dir),
         "timer": None,
     }
 
@@ -231,12 +230,12 @@ def run_with_live_settings(
 
     def _check_settings() -> None:
         try:
-            mt = os.path.getmtime(settings_path)
-        except OSError:
+            rev = view_settings_rev(base_dir)
+        except Exception:
             return
-        if mt == _state["last_mtime"]:
+        if rev == _state["last_rev"]:
             return
-        _state["last_mtime"] = mt
+        _state["last_rev"] = rev
         try:
             _do_rerun()
         except Exception:
@@ -264,10 +263,7 @@ def run_with_live_settings(
             timer.start()
             _state["timer"] = timer
 
-        try:
-            _state["last_mtime"] = os.path.getmtime(settings_path)
-        except OSError:
-            pass
+        _state["last_rev"] = view_settings_rev(base_dir)
 
         _real_show(*args, **kwargs)
 

@@ -1,0 +1,11 @@
+---
+description: Feature work PRs target develop; main is for releases only
+alwaysApply: true
+---
+
+# Pull request target
+
+- Open every day-to-day / feature / bugfix PR against **`develop`**.
+- **`main` is the release branch.** The only PR that may target `main` is promoting `develop` → `main` for a release.
+- `gh pr create` must pass `--base develop` unless this is that release promotion.
+- Never merge Audio Explorer, auto-tune, session-list, or other product work straight to `main`.

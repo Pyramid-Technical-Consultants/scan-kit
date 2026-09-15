@@ -422,6 +422,20 @@ def qapp():
 
 
 @pytest.fixture(autouse=True)
+def _isolate_user_store(tmp_path_factory, monkeypatch):
+    """Keep the app SQLite DB out of the developer's ``~/.scan-kit``."""
+    root = tmp_path_factory.mktemp("scan-kit-user")
+    monkeypatch.setattr("scan_kit.common.user_store.user_data_dir", lambda: root)
+    from scan_kit.common.user_store import reset_connection
+
+    reset_connection()
+    try:
+        yield
+    finally:
+        reset_connection()
+
+
+@pytest.fixture(autouse=True)
 def _restore_cwd():
     """Undo working-directory changes so relative ``test_data`` lookups keep resolving.
 

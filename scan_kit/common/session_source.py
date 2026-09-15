@@ -6,6 +6,7 @@ import os
 import re
 import shutil
 import tarfile
+import threading
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 import zipfile
@@ -178,6 +179,127 @@ def session_source_from_archive(path: Path) -> SessionSource | None:
     if lower.endswith((".tgz", ".tar.gz", ".tar.bz2", ".tar.xz", ".tar")):
         return SessionSource("tar", path, sid)
     return None
+
+
+def _directory_session_root(folder: Path, session_id: str) -> Path | None:
+    inner = folder / session_id
+    if (inner / "input_map.csv").is_file():
+        return inner
+    if (folder / "input_map.csv").is_file():
+        return folder
+    return None
+
+
+def peek_session_source_from_path(
+    storage_path: str | Path,
+    session_id: str,
+) -> SessionSource | None:
+    """Build a source from a discovered path without extracting archives."""
+    path = Path(storage_path)
+    if path.is_dir():
+        root = _directory_session_root(path, session_id)
+        if root is None:
+            return None
+        return SessionSource("directory", root, session_id)
+    if path.is_file():
+        src = session_source_from_archive(path)
+        if src is not None and src.session_id == session_id:
+            return src
+    return None
+
+
+def peek_session_source(
+    session_id: str,
+    base_dir: str | Path,
+) -> SessionSource | None:
+    """Find a session under *base_dir* without extracting archives.
+
+    Preference matches discovery: unpacked directory, then zip, then tar.
+    """
+    base = Path(base_dir)
+    folder = base / session_id
+    if folder.is_dir():
+        src = peek_session_source_from_path(folder, session_id)
+        if src is not None:
+            return src
+    zp = base / f"{session_id}.zip"
+    if zp.is_file():
+        return SessionSource("zip", zp, session_id)
+    for suf in _ARCHIVE_SUFFIXES:
+        if suf == ".zip":
+            continue
+        ap = base / f"{session_id}{suf}"
+        if ap.is_file():
+            return SessionSource("tar", ap, session_id)
+    return None
+
+
+def list_session_storage_paths(base_dir: str | Path, session_id: str) -> list[Path]:
+    """Folder and leftover archives for *session_id* under *base_dir*."""
+    base = Path(base_dir)
+    found: list[Path] = []
+    folder = base / session_id
+    if folder.exists():
+        found.append(folder)
+    for suf in _ARCHIVE_SUFFIXES:
+        archive = base / f"{session_id}{suf}"
+        if archive.is_file():
+            found.append(archive)
+    return found
+
+
+def storage_fingerprint(
+    storage_path: str | Path,
+    session_id: str,
+) -> tuple[str, int, int] | None:
+    """``(resolved_path, mtime_ns, size)`` for cache keys.
+
+    Directories fingerprint ``termination_summary.txt`` when present so a
+    metadata edit is visible; archives use the archive file itself.
+    """
+    path = Path(storage_path)
+    target = path
+    if path.is_dir():
+        for candidate in (
+            path / "termination_summary.txt",
+            path / session_id / "termination_summary.txt",
+        ):
+            if candidate.is_file():
+                target = candidate
+                break
+    try:
+        st = target.stat()
+        return (str(target.resolve()), st.st_mtime_ns, st.st_size)
+    except OSError:
+        return None
+
+
+_META_CACHE: dict[tuple[str, int, int], SessionMeta] = {}
+_META_CACHE_LOCK = threading.Lock()
+
+
+def clear_termination_summary_cache() -> None:
+    with _META_CACHE_LOCK:
+        _META_CACHE.clear()
+
+
+def load_termination_summary_cached(
+    session_id: str,
+    storage_path: str | Path,
+) -> SessionMeta | None:
+    """Parse ``termination_summary.txt`` without extracting; cache by fingerprint."""
+    fp = storage_fingerprint(storage_path, session_id)
+    if fp is not None:
+        with _META_CACHE_LOCK:
+            hit = _META_CACHE.get(fp)
+        if hit is not None:
+            return hit
+    src = peek_session_source_from_path(storage_path, session_id)
+    meta = load_session_termination_summary(src) if src else None
+    if meta is not None and fp is not None:
+        with _META_CACHE_LOCK:
+            _META_CACHE[fp] = meta
+    return meta
 
 
 @dataclass(frozen=True)
@@ -803,6 +925,18 @@ def _timeslices_from_tar(
     return frames
 
 
+def _tar_read_text(archive: Path, member: str) -> str | None:
+    with tarfile.open(archive, "r:*") as tf:
+        try:
+            info = tf.getmember(member)
+        except KeyError:
+            return None
+        raw = tf.extractfile(info)
+        if raw is None:
+            return None
+        return raw.read().decode("utf-8", errors="replace")
+
+
 def load_session_text(source: SessionSource, filename: str) -> str | None:
     """Read a text file from the session (directory, zip, or tar)."""
     sid = source.session_id
@@ -819,50 +953,19 @@ def load_session_text(source: SessionSource, filename: str) -> str | None:
                     return f.read().decode("utf-8", errors="replace")
 
         if source.kind == "tar":
-            target = f"{sid}/{filename}"
-            with tarfile.open(source.path, "r:*") as tf:
-                for info in tf:
-                    if info.name == target:
-                        raw = tf.extractfile(info)
-                        if raw is None:
-                            return None
-                        return raw.read().decode("utf-8", errors="replace")
-            return None
+            return _tar_read_text(source.path, f"{sid}/{filename}")
     except Exception as e:
         _log.debug("Error loading %s from session %s: %s", filename, sid, e)
         return None
+    return None
 
 
 def load_session_termination_summary(source: SessionSource) -> SessionMeta | None:
     """Parse ``termination_summary.txt`` for TUI metadata."""
-    sid = source.session_id
-    try:
-        if source.kind == "directory":
-            p = source.path / "termination_summary.txt"
-            if not p.is_file():
-                return None
-            text = p.read_text(encoding="utf-8", errors="replace")
-            return parse_termination_summary_text(text)
-
-        if source.kind == "zip":
-            with zipfile.ZipFile(source.path, "r") as zf:
-                with zf.open(f"{sid}/termination_summary.txt") as f:
-                    text = f.read().decode("utf-8", errors="replace")
-            return parse_termination_summary_text(text)
-
-        if source.kind == "tar":
-            target = f"{sid}/termination_summary.txt"
-            with tarfile.open(source.path, "r:*") as tf:
-                for info in tf:
-                    if info.name == target:
-                        raw = tf.extractfile(info)
-                        if raw is None:
-                            return None
-                        text = raw.read().decode("utf-8", errors="replace")
-                        return parse_termination_summary_text(text)
-            return None
-    except Exception:
+    text = load_session_text(source, "termination_summary.txt")
+    if text is None:
         return None
+    return parse_termination_summary_text(text)
 
 
 def hydrate_session_metadata(
@@ -885,8 +988,10 @@ def hydrate_session_metadata(
 
     def _one(row: tuple[str, str, SessionMeta | None]) -> tuple[str, str, SessionMeta | None]:
         sid, path_str, _ = row
-        src = resolve_session_source(sid, base)
-        meta = load_session_termination_summary(src) if src else None
+        storage = Path(path_str)
+        if not storage.is_absolute():
+            storage = base / path_str
+        meta = load_termination_summary_cached(sid, storage)
         return (sid, path_str, meta)
 
     with ThreadPoolExecutor(max_workers=max_workers) as pool:

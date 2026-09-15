@@ -115,3 +115,4 @@ Deleting a tag does not delete an already-published GitHub Release — remove th
 - Only create the tag/push when the user explicitly wants to release. If they just want the number bumped (e.g. inside an in-progress PR), do step 1 only and skip tagging.
 - If this is part of a PR that isn't merged yet, prefer bumping on the PR branch; the tag is usually created after merge to `develop` and promotion to `main`.
 - Merges to `develop` or `main` produce `-rc` artifacts in the Actions run for pre-release testing; they do not create a GitHub Release. Pull requests run tests only.
+- **Never open a feature PR against `main`.** `gh pr create` needs `--base develop`. The only `main` PR is promoting `develop` for a release.

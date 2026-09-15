@@ -15,6 +15,7 @@ class SessionMeta:
     primary_mu: float | None
     treatment_time_s: int | None
     room_number: int | None
+    config_name: str | None = None
 
     @property
     def short_date(self) -> str:
@@ -40,6 +41,11 @@ class SessionMeta:
         if self.room_number is None:
             return "?"
         return str(self.room_number)
+
+    @property
+    def short_config(self) -> str:
+        name = (self.config_name or "").strip()
+        return name if name else "?"
 
 
 _DATE_FMT = "%a %b %d %H:%M:%S %Y"  # e.g. "Thu Dec 11 21:36:55 2025"
@@ -70,6 +76,7 @@ def parse_termination_summary_text(text: str) -> SessionMeta:
     primary_mu: float | None = None
     treatment_s: int | None = None
     room_number: int | None = None
+    config_name: str | None = None
 
     for line in text.splitlines():
         line = line.strip()
@@ -90,10 +97,14 @@ def parse_termination_summary_text(text: str) -> SessionMeta:
             parsed = _parse_labeled_numeric(line, "Room number")
             if parsed is not None:
                 room_number = int(parsed)
+        elif line.startswith("Configuration name:"):
+            name = line.split(":", 1)[1].strip()
+            config_name = name or None
 
     return SessionMeta(
         date=date,
         primary_mu=primary_mu,
         treatment_time_s=treatment_s,
         room_number=room_number,
+        config_name=config_name,
     )

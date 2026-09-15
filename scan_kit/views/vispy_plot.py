@@ -5,19 +5,26 @@ their data modules. This file is the reusable layer those scenes should call:
 
 * :func:`make_scene_canvas` — Qt-backed canvas (used by :class:`VispyViewWindow`)
 * :func:`add_locked_xy_plot` — pan/zoom-locked view with optional axes
+* :func:`set_data_range` — store and apply the camera window (no 5% pad)
 * :func:`hex_to_rgba`, :func:`add_line`, :func:`add_fill_mesh`,
   :func:`vertical_segments`, :func:`map_canvas_x_to_data`
 
-Lock cameras with :func:`set_data_range` (vispy's default 5% margin is wrong
-for aligned axes). Fill / data line / cursor are siblings; the shaded fill is
-pushed back with ``polygon_offset`` so the agg trace (also triangles) stays in
-front. :func:`add_line` uses agg tessellation; axis ticks are a triangle mesh
-— GL lines vanish after some framebuffer resizes.
+2D plots never use the depth buffer. vispy's ``translucent`` preset turns
+depth testing on; agg lines then lose to the fill mesh or vanish after a
+framebuffer resize. Layer with :data:`ORDER_FILL` / :data:`ORDER_DATA` /
+:data:`ORDER_OVERLAY` only. :func:`add_line` uses agg tessellation; axis ticks
+are a triangle mesh — GL lines vanish after some framebuffer resizes.
+
+:class:`~vispy.scene.cameras.PanZoomCamera` does not recover from a 0-size
+layout pass. :func:`set_data_range` stores the window for the view;
+:func:`relock_2d_view` re-applies it once the view has a real size (hooked from
+both view and canvas resize).
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from weakref import WeakKeyDictionary
 
 import numpy as np
 
@@ -31,6 +38,8 @@ _GUTTER_PX = (8, 12)
 ORDER_FILL = 0
 ORDER_DATA = 1
 ORDER_OVERLAY = 2
+# vispy ViewBox is frozen; stored ranges live here so resize can re-apply them.
+_LOCKED_RANGES: WeakKeyDictionary = WeakKeyDictionary()
 
 
 def hex_to_rgba(
@@ -58,12 +67,16 @@ def make_scene_canvas(
     from vispy.app import use_app
 
     use_app("pyside6")
-    return scene.SceneCanvas(
+    canvas = scene.SceneCanvas(
         keys=keys,
         bgcolor=bgcolor,
         size=size,
         show=show,
     )
+    resize = getattr(getattr(canvas, "events", None), "resize", None)
+    if resize is not None and hasattr(resize, "connect"):
+        resize.connect(lambda _event=None: relock_canvas_2d_views(canvas))
+    return canvas
 
 
 def block_canvas_navigation(canvas) -> None:
@@ -75,6 +88,61 @@ def block_canvas_navigation(canvas) -> None:
     canvas.events.mouse_wheel.connect(_block)
 
 
+def _view_pixel_size(view) -> tuple[float, float] | None:
+    size = getattr(view, "size", None)
+    if size is None:
+        return None
+    try:
+        width, height = float(size[0]), float(size[1])
+    except (TypeError, ValueError, IndexError):
+        return None
+    if width <= 0.0 or height <= 0.0:
+        return None
+    return width, height
+
+
+def relock_2d_view(view) -> bool:
+    """Re-apply a stored 2D camera window once *view* has a real pixel size.
+
+    A 0-size layout pass can bake NaNs into ``PanZoomCamera``; ``view_changed``
+    does not recover. Skip until width/height are positive, then call
+    ``set_range`` from the limits :func:`set_data_range` stored for the view.
+    Returns True if the camera was remapped.
+    """
+    if _view_pixel_size(view) is None:
+        return False
+    camera = getattr(view, "camera", None)
+    if camera is None:
+        return False
+    stored = _LOCKED_RANGES.get(view)
+    if stored is not None and getattr(camera, "interactive", False) is not True:
+        xlim, ylim, margin = stored
+        camera.set_range(x=xlim, y=ylim, margin=margin)
+    else:
+        view_changed = getattr(camera, "view_changed", None)
+        if not callable(view_changed):
+            return False
+        view_changed()
+    updater = getattr(view, "_update_scene_clipper", None)
+    if callable(updater):
+        updater()
+    return True
+
+
+def relock_canvas_2d_views(canvas) -> None:
+    """Re-apply stored 2D ranges after a canvas/framebuffer resize."""
+    n = 0
+    for view in list(_LOCKED_RANGES):
+        if getattr(view, "canvas", None) is not canvas:
+            continue
+        if relock_2d_view(view):
+            n += 1
+    if n:
+        update = getattr(canvas, "update", None)
+        if callable(update):
+            update()
+
+
 def lock_panzoom(view, camera=None, *, interactive: bool = False, bgcolor: str = BG):
     from vispy import scene
 
@@ -83,25 +151,11 @@ def lock_panzoom(view, camera=None, *, interactive: bool = False, bgcolor: str =
     view.bgcolor = bgcolor
     camera.interactive = interactive
     view.camera = camera
-    # PanZoomCamera.viewbox_resize_event is a no-op, so the data→pixel
-    # mapping goes stale on splitter/window resize (and a 0-size layout
-    # pass can bake NaNs into it). Remap whenever the view has a real size.
-    def _relock(_event=None) -> None:
-        size = getattr(view, "size", (0, 0))
-        try:
-            width, height = float(size[0]), float(size[1])
-        except (TypeError, ValueError, IndexError):
-            return
-        if width <= 0.0 or height <= 0.0:
-            return
-        camera.view_changed()
-        updater = getattr(view, "_update_scene_clipper", None)
-        if callable(updater):
-            updater()
-
+    # ViewBox layout can change without a canvas resize (stacked rows).
+    # Canvas resize is hooked in :func:`make_scene_canvas`.
     resize = getattr(getattr(view, "events", None), "resize", None)
     if resize is not None and hasattr(resize, "connect"):
-        resize.connect(_relock)
+        resize.connect(lambda _event=None: relock_2d_view(view))
     return camera
 
 
@@ -112,8 +166,22 @@ def set_data_range(
     *,
     margin: float = 0.0,
 ) -> None:
-    """Lock the camera to *x*/*y* (vispy defaults to a 5% pad)."""
-    view.camera.set_range(x=x, y=y, margin=margin)
+    """Lock the camera to *x*/*y* (vispy defaults to a 5% pad).
+
+    Limits are stored so :func:`relock_2d_view` can re-apply them after a
+    0-size layout pass or framebuffer resize. vispy ViewBox is frozen, so
+    the window is kept in a weak map keyed by the view, not as node attrs.
+    """
+    xlim = (float(x[0]), float(x[1]))
+    ylim = (float(y[0]), float(y[1]))
+    margin_v = float(margin)
+    try:
+        _LOCKED_RANGES[view] = (xlim, ylim, margin_v)
+    except TypeError:
+        pass
+    camera = getattr(view, "camera", None)
+    if camera is not None:
+        camera.set_range(x=xlim, y=ylim, margin=margin_v)
 
 
 def axis_widget(orientation: str, *, font_size: float = 8):
@@ -319,17 +387,15 @@ def _pin_axis_domain(axis_w, domain: tuple[float, float]) -> None:
     _apply()
 
 
-def _set_plot_gl_state(visual, *, offset: float = 0.0) -> None:
-    """2D plot GL state. *offset* > 0 pushes a mesh/trace behind later overlays."""
-    kwargs: dict = {
-        "depth_test": True,
-        "depth_mask": True,
-        "cull_face": False,
-    }
-    if offset:
-        kwargs["polygon_offset_fill"] = True
-        kwargs["polygon_offset"] = (float(offset), float(offset))
-    visual.set_gl_state("translucent", **kwargs)
+def _set_plot_gl_state(visual) -> None:
+    """2D plot GL state. Depth testing is off; stacking is Node.order."""
+    visual.set_gl_state(
+        "translucent",
+        depth_test=False,
+        depth_mask=False,
+        cull_face=False,
+        blend=True,
+    )
 
 
 def add_line(
@@ -342,7 +408,6 @@ def add_line(
     antialias: bool = True,
     order: int = ORDER_DATA,
     visible: bool = True,
-    offset: float = 1.0,
 ):
     from vispy import scene
 
@@ -356,7 +421,7 @@ def add_line(
         antialias=antialias,
         method="agg",
     )
-    _set_plot_gl_state(line, offset=offset)
+    _set_plot_gl_state(line)
     line.order = order
     line.visible = visible
     line.parent = parent
@@ -374,7 +439,7 @@ def add_fill_mesh(
         faces=faces,
         color=color,
     )
-    _set_plot_gl_state(mesh, offset=2.0)
+    _set_plot_gl_state(mesh)
     mesh.order = order
     mesh.parent = parent
     return mesh
