@@ -25,6 +25,19 @@ from .schema import (
     resolve_concept_column,
     resolve_requested_column,
 )
+from .data_location import (
+    canonical_location,
+    is_remote_location,
+    join_location,
+    list_location_entries,
+    location_exists,
+    location_is_dir,
+    location_is_file,
+    location_stat,
+    materialize_session,
+    open_location_binary,
+    read_location_bytes,
+)
 
 _log = logging.getLogger(__name__)
 
@@ -195,6 +208,9 @@ def peek_session_source_from_path(
     session_id: str,
 ) -> SessionSource | None:
     """Build a source from a discovered path without extracting archives."""
+    spec = str(storage_path)
+    if is_remote_location(spec):
+        return None
     path = Path(storage_path)
     if path.is_dir():
         root = _directory_session_root(path, session_id)
@@ -216,6 +232,9 @@ def peek_session_source(
 
     Preference matches discovery: unpacked directory, then zip, then tar.
     """
+    spec = str(base_dir)
+    if is_remote_location(spec):
+        return None
     base = Path(base_dir)
     folder = base / session_id
     if folder.is_dir():
@@ -234,17 +253,26 @@ def peek_session_source(
     return None
 
 
-def list_session_storage_paths(base_dir: str | Path, session_id: str) -> list[Path]:
+def list_session_storage_paths(base_dir: str | Path, session_id: str) -> list[str]:
     """Folder and leftover archives for *session_id* under *base_dir*."""
+    spec = str(base_dir)
+    names = [session_id]
+    names.extend(f"{session_id}{suf}" for suf in _ARCHIVE_SUFFIXES)
+    found: list[str] = []
+    if is_remote_location(spec):
+        for name in names:
+            child = join_location(spec, name)
+            if location_exists(child):
+                found.append(child)
+        return found
     base = Path(base_dir)
-    found: list[Path] = []
-    folder = base / session_id
-    if folder.exists():
-        found.append(folder)
-    for suf in _ARCHIVE_SUFFIXES:
-        archive = base / f"{session_id}{suf}"
-        if archive.is_file():
-            found.append(archive)
+    for name in names:
+        path = base / name
+        if name == session_id:
+            if path.exists():
+                found.append(str(path))
+        elif path.is_file():
+            found.append(str(path))
     return found
 
 
@@ -257,6 +285,22 @@ def storage_fingerprint(
     Directories fingerprint ``termination_summary.txt`` when present so a
     metadata edit is visible; archives use the archive file itself.
     """
+    spec = str(storage_path)
+    if is_remote_location(spec):
+        target = spec
+        if location_is_dir(spec):
+            for rel in (
+                "termination_summary.txt",
+                f"{session_id}/termination_summary.txt",
+            ):
+                child = join_location(spec, rel)
+                if location_is_file(child):
+                    target = child
+                    break
+        st = location_stat(target)
+        if st is None:
+            return None
+        return (canonical_location(target), st[0], st[1])
     path = Path(storage_path)
     target = path
     if path.is_dir():
@@ -294,8 +338,13 @@ def load_termination_summary_cached(
             hit = _META_CACHE.get(fp)
         if hit is not None:
             return hit
-    src = peek_session_source_from_path(storage_path, session_id)
-    meta = load_session_termination_summary(src) if src else None
+    spec = str(storage_path)
+    if is_remote_location(spec):
+        text = _remote_termination_summary_text(spec, session_id)
+        meta = parse_termination_summary_text(text) if text else None
+    else:
+        src = peek_session_source_from_path(storage_path, session_id)
+        meta = load_session_termination_summary(src) if src else None
     if meta is not None and fp is not None:
         with _META_CACHE_LOCK:
             _META_CACHE[fp] = meta
@@ -452,7 +501,16 @@ def resolve_session_source(
     """Find session data under *base_dir* (folder, zip, or tar archive).
 
     Preference: extracted directory over any archive with the same id.
+    Remote URLs are copied into ``~/.scan-kit/remote-cache`` first.
     """
+    spec = str(base_dir)
+    if is_remote_location(spec):
+        local = materialize_session(spec, session_id)
+        if local is None:
+            return None
+        return resolve_session_source(
+            session_id, local, on_extracting=on_extracting
+        )
     base = Path(base_dir)
     inner = base / session_id / session_id
     if (inner / "input_map.csv").is_file():
@@ -980,7 +1038,6 @@ def hydrate_session_metadata(
     """
     if not snapshot:
         return []
-    base = Path(base_dir)
     n = len(snapshot)
     if max_workers is None:
         # I/O-bound: oversubscribe modestly
@@ -988,9 +1045,13 @@ def hydrate_session_metadata(
 
     def _one(row: tuple[str, str, SessionMeta | None]) -> tuple[str, str, SessionMeta | None]:
         sid, path_str, _ = row
-        storage = Path(path_str)
-        if not storage.is_absolute():
-            storage = base / path_str
+        storage: str | Path
+        if is_remote_location(path_str):
+            storage = path_str
+        else:
+            storage = Path(path_str)
+            if not storage.is_absolute():
+                storage = Path(base_dir) / path_str
         meta = load_termination_summary_cached(sid, storage)
         return (sid, path_str, meta)
 
@@ -998,7 +1059,9 @@ def hydrate_session_metadata(
         return list(pool.map(_one, snapshot))
 
 
-def discover_session_entries(base_path: Path) -> list[tuple[str, str, SessionMeta | None]]:
+def discover_session_entries(
+    base_path: str | Path,
+) -> list[tuple[str, str, SessionMeta | None]]:
     """List sessions under *base_path*: folders first, then archives not overridden.
 
     Returns ``(session_id, storage_path_for_display, meta)`` with *meta* always
@@ -1006,11 +1069,15 @@ def discover_session_entries(base_path: Path) -> list[tuple[str, str, SessionMet
     :func:`load_session_termination_summary` after :func:`resolve_session_source`
     to fill metadata for the TUI or scripts.
     """
+    spec = str(base_path)
+    if is_remote_location(spec):
+        return _discover_remote_entries(spec)
+    path = Path(base_path)
     seen: dict[str, tuple[Path, SessionMeta | None]] = {}
 
     # Single ``iterdir`` pass: unpacked dirs first (same sort order as before)
     try:
-        children = sorted(base_path.iterdir(), key=lambda p: p.name)
+        children = sorted(path.iterdir(), key=lambda p: p.name)
     except OSError:
         return []
 
@@ -1032,3 +1099,81 @@ def discover_session_entries(base_path: Path) -> list[tuple[str, str, SessionMet
         ((sid, str(path_obj), meta) for sid, (path_obj, meta) in seen.items()),
         key=lambda t: t[0],
     )
+
+
+def _discover_remote_entries(
+    spec: str,
+) -> list[tuple[str, str, SessionMeta | None]]:
+    children = list_location_entries(spec)
+    seen: dict[str, str] = {}
+    for name, is_dir in children:
+        if not is_dir:
+            continue
+        folder = join_location(spec, name)
+        if _remote_is_unpacked_session(folder, name):
+            seen[name] = folder
+    for name, is_dir in children:
+        if is_dir:
+            continue
+        stem = _strip_archive_suffix(name)
+        if stem is None or stem in seen:
+            continue
+        seen[stem] = join_location(spec, name)
+    return sorted(((sid, path, None) for sid, path in seen.items()), key=lambda t: t[0])
+
+
+def _remote_is_unpacked_session(folder: str, session_id: str) -> bool:
+    if location_is_file(join_location(folder, "input_map.csv")):
+        return True
+    return location_is_file(join_location(folder, f"{session_id}/input_map.csv"))
+
+
+def _tar_open_mode(filename: str) -> str:
+    lower = filename.lower()
+    if lower.endswith((".tgz", ".tar.gz")):
+        return "r:gz"
+    if lower.endswith(".tar.bz2"):
+        return "r:bz2"
+    if lower.endswith(".tar.xz"):
+        return "r:xz"
+    return "r:"
+
+
+def _remote_termination_summary_text(spec: str, session_id: str) -> str | None:
+    if location_is_dir(spec):
+        for rel in (
+            f"{session_id}/termination_summary.txt",
+            "termination_summary.txt",
+        ):
+            child = join_location(spec, rel)
+            if location_is_file(child):
+                return read_location_bytes(child).decode("utf-8", errors="replace")
+        return None
+    name = spec.rstrip("/").rsplit("/", 1)[-1].lower()
+    member = f"{session_id}/termination_summary.txt"
+    try:
+        fh = open_location_binary(spec)
+    except Exception:
+        _log.debug("Could not open %s", spec, exc_info=True)
+        return None
+    try:
+        if name.endswith(".zip"):
+            with zipfile.ZipFile(fh) as zf:
+                with zf.open(member) as raw:
+                    return raw.read().decode("utf-8", errors="replace")
+        if any(name.endswith(suf) for suf in _ARCHIVE_SUFFIXES):
+            with tarfile.open(fileobj=fh, mode=_tar_open_mode(name)) as tf:
+                try:
+                    info = tf.getmember(member)
+                except KeyError:
+                    return None
+                raw = tf.extractfile(info)
+                if raw is None:
+                    return None
+                return raw.read().decode("utf-8", errors="replace")
+    except Exception:
+        _log.debug("Could not read termination_summary from %s", spec, exc_info=True)
+        return None
+    finally:
+        fh.close()
+    return None
