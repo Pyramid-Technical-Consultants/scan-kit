@@ -137,7 +137,7 @@ Plot windows open separately. Close them when you are done — the launcher keep
 
 ### 1. Choose your data source
 
-Enter the folder that contains session data in **DATA SOURCE**, then press **Enter** or click away to refresh discovery. The last folder is remembered in `~/.scan-kit`. When running a frozen executable with no remembered folder, the default is the current working directory.
+Enter the folder that contains session data in **DATA SOURCE** — a local path, a Windows UNC share (`\\server\share\...`), or a URL such as `sftp://user@host/var/log/ptc_ex`. Press **Enter** or click away to refresh discovery. SFTP uses SSH keys or the agent; a password in the URL works for that session but is not stored. Opening a remote session copies it into `~/.scan-kit/remote-cache`. The last location is remembered in `~/.scan-kit`. When running a frozen executable with no remembered folder, the default is the current working directory.
 
 ### 2. Select sessions
 
@@ -146,7 +146,7 @@ The session table shows **Session ID**, **Date**, **MU**, **Time**, **RM**, **Co
 - Sort by **Date** (newest first), **ID**, **Config**, or **MU**
 - Tick **Use** on up to **five** sessions — no modifier key needed
 - Click **✕** to clear all selections
-- **Right-click** a session → **Copy Session ID**, **Move to Recycle Bin…**, or **Open in Config Tuning…** when a config folder is available
+- **Right-click** a session → **Copy Session ID**, **Move to Recycle Bin…** (or **Delete from remote host…**), or **Open in Config Tuning…** when a config folder is available
 
 ### 3. Annotate sessions (optional)
 
@@ -315,7 +315,7 @@ HCC and strip devices in one IC family keep their relative `K_MU` and all move b
 
 ## Session data layout
 
-Scan Kit discovers sessions from a single data-source folder. Supported layouts:
+Scan Kit discovers sessions from a single data-source folder. That can be a local directory, a UNC share, or an fsspec URL (`sftp://`, `smb://`, `ftp://`, …). Supported layouts:
 
 **Unpacked directories**
 

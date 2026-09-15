@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from .data_location import is_remote_location, local_path
 from .session_meta import SessionMeta
 from .session_source import discover_session_entries
 
@@ -15,7 +16,7 @@ def discover_sessions(
     """Discover sessions (folders, ZIP, tgz, tar.gz, …) and load metadata.
 
     Args:
-        base_dirs: Directories to scan for session data.
+        base_dirs: Directories or fsspec URLs to scan for session data.
         project_root: Root path for the project. Defaults to parent of scan_kit.
 
     Returns:
@@ -28,11 +29,18 @@ def discover_sessions(
 
     seen: dict[str, tuple[str, SessionMeta | None]] = {}
     for base in base_dirs:
-        base_path = Path(base)
-        dir_path = base_path if base_path.is_absolute() else project_root / base
-        if not dir_path.is_dir():
-            continue
-        for sid, path_str, meta in discover_session_entries(dir_path):
+        if is_remote_location(base):
+            entries = discover_session_entries(base)
+        else:
+            dir_path = local_path(base)
+            if dir_path is None:
+                continue
+            if not dir_path.is_absolute():
+                dir_path = project_root / dir_path
+            if not dir_path.is_dir():
+                continue
+            entries = discover_session_entries(dir_path)
+        for sid, path_str, meta in entries:
             if sid in seen:
                 continue
             seen[sid] = (path_str, meta)
