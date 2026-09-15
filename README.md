@@ -137,7 +137,7 @@ Plot windows open separately. Close them when you are done — the launcher keep
 
 ### 1. Choose your data source
 
-Enter the folder that contains session data in **DATA SOURCE** — a local path, a Windows UNC share (`\\server\share\...`), or a URL such as `sftp://user@host/var/log/ptc_ex`. Press **Enter** or click away to refresh discovery. SFTP uses SSH keys or the agent; a password in the URL works for that session but is not stored. Opening a remote session copies it into `~/.scan-kit/remote-cache`. The last location is remembered in `~/.scan-kit`. When running a frozen executable with no remembered folder, the default is the current working directory.
+Enter the folder that contains session data in **DATA SOURCE** — a local path, a Windows UNC share (`\\server\share\...`), or a URL such as `sftp://user@host/var/log/ptc_ex`. **Browse…** can pick UNC/Network shares, and on Linux file dialogs that speak GVfs/KIO it can pick `sftp://` and `smb://` too. Windows Explorer does not speak SFTP, so those URLs are still pasted. Press **Enter** or click away to refresh discovery. SFTP uses SSH keys or the agent; a password in the URL works for that session but is not stored. Opening a remote session copies it into `~/.scan-kit/remote-cache`. The last location is remembered in `~/.scan-kit`. When running a frozen executable with no remembered folder, the default is the current working directory.
 
 ### 2. Select sessions
 

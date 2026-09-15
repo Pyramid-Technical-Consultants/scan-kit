@@ -9,7 +9,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
-from PySide6.QtCore import QFileSystemWatcher, QRectF, Qt, QTimer, Signal, QSize, Slot
+from PySide6.QtCore import QFileSystemWatcher, QRectF, QUrl, Qt, QTimer, Signal, QSize, Slot
 from PySide6.QtGui import (
     QAction,
     QColor,
@@ -71,6 +71,40 @@ _META_COLS = (_COL_DATE, _COL_MU, _COL_TIME, _COL_ROOM, _COL_CONFIG)
 _SWATCH_PX = 14
 _UNCHECKED_SWATCH = QColor("#d0d0d0")
 _SWATCH_LINE = QColor("#6a6a6a")
+
+# Declared so native/portal dialogs can offer URI locations (GTK GVfs, KDE
+# KIO, xdg-desktop-portal). Windows still browses UNC via Network.
+_DATA_DIR_SCHEMES = (
+    "sftp",
+    "ssh",
+    "scp",
+    "smb",
+    "ftp",
+    "ftps",
+    "http",
+    "https",
+)
+
+
+def directory_url_for_dialog(spec: str) -> QUrl:
+    """Starting URL for the session-folder picker."""
+    text = spec.strip()
+    if not text:
+        return QUrl.fromLocalFile(str(Path.home()))
+    if is_remote_location(text):
+        return QUrl(text)
+    return QUrl.fromLocalFile(str(Path(text).expanduser()))
+
+
+def location_from_dialog_url(url: QUrl) -> str:
+    """Turn a picker result into a data-source string (local path or URL)."""
+    if url.isEmpty() or not url.isValid():
+        return ""
+    if url.scheme().lower() in {"clsid", "shell"}:
+        return ""
+    if url.isLocalFile():
+        return url.toLocalFile()
+    return url.toString()
 
 
 def default_project_root() -> Path:
@@ -311,7 +345,7 @@ class SessionBrowserWidget(QWidget):
 
         browse_dir_btn = QPushButton("Browse…")
         browse_dir_btn.setToolTip(
-            "Choose a local folder. Network URLs can be pasted in the field."
+            "Choose a local, UNC, or network folder. SFTP URLs can also be pasted."
         )
         browse_dir_btn.setFixedWidth(96)
         browse_dir_btn.clicked.connect(self._on_browse_data_dir)
@@ -515,19 +549,17 @@ class SessionBrowserWidget(QWidget):
 
     def _on_browse_data_dir(self) -> None:
         start = self._base_dir_input.text().strip() or self._base_dir
-        if is_remote_location(start):
-            initial = str(Path.home())
-        else:
-            path = Path(start).expanduser()
-            initial = str(path.resolve()) if path.is_dir() else str(Path.home())
-        chosen = QFileDialog.getExistingDirectory(
+        chosen = QFileDialog.getExistingDirectoryUrl(
             self,
             "Select session data folder",
-            initial,
+            directory_url_for_dialog(start),
+            QFileDialog.Option.ShowDirsOnly,
+            list(_DATA_DIR_SCHEMES),
         )
-        if not chosen:
+        location = location_from_dialog_url(chosen)
+        if not location:
             return
-        self._base_dir_input.setText(chosen)
+        self._base_dir_input.setText(location)
         self._on_base_dir_finished()
 
     def _on_context_menu(self, pos) -> None:

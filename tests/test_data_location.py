@@ -193,3 +193,30 @@ def test_snapshot_library_indexes_memory_url() -> None:
     assert len(rows) == 1
     assert rows[0][0] == "333"
     assert rows[0][1].startswith("memory://")
+
+
+def test_dialog_url_round_trips_local_and_sftp(tmp_path: Path) -> None:
+    from PySide6.QtCore import QUrl
+
+    from scan_kit.common.session_browser import (
+        directory_url_for_dialog,
+        location_from_dialog_url,
+    )
+
+    start = directory_url_for_dialog(str(tmp_path))
+    assert start.isLocalFile()
+    assert Path(location_from_dialog_url(start)).resolve() == tmp_path.resolve()
+
+    sftp = "sftp://pyramid@192.168.101.206/var/log/ptc_ex"
+    remote = directory_url_for_dialog(sftp)
+    assert remote.scheme() == "sftp"
+    assert location_from_dialog_url(remote) == sftp
+
+    unc = location_from_dialog_url(
+        QUrl("file://192.168.101.206/share/ptc_ex")
+    )
+    assert unc.replace("\\", "/") == "//192.168.101.206/share/ptc_ex"
+    assert location_from_dialog_url(QUrl()) == ""
+    assert location_from_dialog_url(
+        QUrl("clsid:D20BEEC4-5CA8-4905-AE3B-BF251EA09B53")
+    ) == ""
