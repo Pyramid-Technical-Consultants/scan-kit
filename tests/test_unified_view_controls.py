@@ -246,6 +246,17 @@ def test_histogram_panel_options(qapp: QApplication) -> None:
     assert panel.bin_count() == 20
 
 
+def test_unified_view_configs_default_to_beam_on() -> None:
+    from scan_kit.common.data_filter import FILTER_BEAM_ON
+    from scan_kit.views.binned_summary_catalog import BinnedSummaryConfig
+    from scan_kit.views.distribution_catalog import DistributionConfig
+    from scan_kit.views.fft_catalog import FftConfig
+
+    assert FftConfig().beam_state_filter == FILTER_BEAM_ON
+    assert DistributionConfig().beam_state_filter == FILTER_BEAM_ON
+    assert BinnedSummaryConfig().beam_state_filter == FILTER_BEAM_ON
+
+
 def test_data_filter_panel_selects_filters(qapp: QApplication) -> None:
     from scan_kit.common.data_filter import FILTER_ALL, FILTER_BEAM_ON, FILTER_MAD_OUTLIERS
     from scan_kit.views.unified_view_controls import DataFilterPanel
@@ -257,6 +268,23 @@ def test_data_filter_panel_selects_filters(qapp: QApplication) -> None:
     panel.set_beam_state(FILTER_BEAM_ON)
     assert panel.selected_domain() == FILTER_MAD_OUTLIERS
     assert panel.selection().beam_state_filter == FILTER_BEAM_ON
+
+
+def test_data_filter_panel_combo_change_emits(qapp: QApplication) -> None:
+    from scan_kit.common.data_filter import FILTER_ALL, FILTER_BEAM_ON, FILTER_MAD_OUTLIERS
+    from scan_kit.views.unified_view_controls import DataFilterPanel
+
+    hits: list[str] = []
+    panel = DataFilterPanel(
+        domain_current=FILTER_ALL,
+        beam_current=FILTER_BEAM_ON,
+        on_selection_changed=lambda: hits.append(panel.selected_domain() or ""),
+    )
+    panel._domain_combo.setCurrentIndex(panel._domain_combo.findData(FILTER_MAD_OUTLIERS))
+    assert FILTER_MAD_OUTLIERS in hits
+    hits.clear()
+    panel.set_domain(FILTER_ALL)
+    assert hits == []
 
 
 def test_sync_data_filter_panel_preserves_selection(qapp: QApplication) -> None:

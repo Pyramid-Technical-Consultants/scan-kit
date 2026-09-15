@@ -11,8 +11,6 @@ from PySide6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QLabel,
-    QMainWindow,
-    QSplitter,
     QVBoxLayout,
     QWidget,
 )
@@ -23,6 +21,7 @@ from ..common import ViewSettings
 from ..common.session_notes import load_notes
 from .async_refresh import DebouncedBackgroundTask
 from .plot_view_shell import (
+    VispyViewWindow,
     make_presets_menu_button,
     make_side_panel_column,
     run_view_window,
@@ -40,7 +39,7 @@ from .trajectory_data import (
 from .trajectory_vispy import TrajectoryScene, default_session_colors
 
 
-class TrajectoryWindow(QMainWindow):
+class TrajectoryWindow(VispyViewWindow):
     """3D IC beam trajectory viewer with unified side controls."""
 
     def __init__(
@@ -52,37 +51,15 @@ class TrajectoryWindow(QMainWindow):
         initial_preset: str | None = None,
         parent: QWidget | None = None,
     ) -> None:
-        super().__init__(parent)
-        self.setWindowTitle("IC Beam Trajectory (3D)")
-        self.resize(1400, 900)
-
-        from vispy import scene
-        from vispy.app import use_app
-
-        use_app("pyside6")
-        self._vispy_canvas = scene.SceneCanvas(
-            keys="interactive",
-            bgcolor="#1a1a1a",
-            size=(1200, 800),
-            show=False,
+        super().__init__(
+            title="IC Beam Trajectory (3D)",
+            parent=parent,
+        )
+        self._vispy_canvas = self.add_vispy_canvas(
+            keys="interactive", size=(1200, 800),
         )
         self._scene = TrajectoryScene(self._vispy_canvas)
-
-        plot_host = QWidget()
-        plot_layout = QVBoxLayout(plot_host)
-        plot_layout.setContentsMargins(6, 6, 0, 6)
-        plot_layout.addWidget(self._vispy_canvas.native)
-
-        self._splitter = QSplitter(Qt.Orientation.Horizontal)
-        self._splitter.addWidget(plot_host)
-
-        side_panel = self._build_controls()
-        self._splitter.addWidget(side_panel)
-        self._splitter.setStretchFactor(0, 1)
-        self._splitter.setStretchFactor(1, 0)
-        self._splitter.setSizes([1100, 300])
-
-        self.setCentralWidget(self._splitter)
+        self.set_side_panel(self._build_controls())
 
         self._session_ids = list(session_ids)
         self._base_dir = base_dir

@@ -143,7 +143,7 @@ class TimesliceReplayWindow(PlotViewWindow):
         self._digital_check.toggled.connect(self._schedule_refresh)
         opt_layout.addWidget(self._digital_check)
 
-        self._beam_check = QCheckBox("Beam Current Twin Axis")
+        self._beam_check = QCheckBox("Source Beam Current Twin Axis")
         self._beam_check.setChecked(True)
         self._beam_check.toggled.connect(self._schedule_refresh)
         opt_layout.addWidget(self._beam_check)

@@ -104,6 +104,7 @@ def _read_csv_robust(
     usecols: list[str] | None = None,
     raw_usecols: list[str] | None = None,
     aliases: dict[str, tuple[str, ...]] | None = None,
+    nrows: int | None = None,
 ) -> pd.DataFrame:
     """Read a CSV and tolerate schema drift in column naming.
 
@@ -119,13 +120,15 @@ def _read_csv_robust(
             if not read_usecols:
                 read_usecols = None
 
-    df = pd.read_csv(
-        source,
-        index_col=False,
-        skipinitialspace=True,
-        usecols=read_usecols,
-    )
-    df = canonicalize_dataframe_columns(df, aliases=alias_map)
+    read_kwargs: dict = {
+        "index_col": False,
+        "skipinitialspace": True,
+        "usecols": read_usecols,
+    }
+    if nrows is not None:
+        read_kwargs["nrows"] = nrows
+    df = pd.read_csv(source, **read_kwargs)
+    df = canonicalize_dataframe_columns(df, aliases=alias_map, copy=False)
     if usecols is None:
         return df
     seen: set[str] = set()
@@ -652,11 +655,16 @@ def load_session_point_time_table(source: SessionSource) -> pd.DataFrame | None:
     return pd.concat(parts, ignore_index=True)
 
 
+def _timeslice_io_workers(n_files: int) -> int:
+    return max(1, min(24, n_files, (os.cpu_count() or 4) * 3))
+
+
 def load_session_timeslice_device_units(
     source: SessionSource,
     usecols: list[str] | None = None,
     *,
     max_frames: int | None = None,
+    nrows: int | None = None,
 ) -> list[pd.DataFrame]:
     """Load per-layer timeslice_data_device_units CSVs.
 
@@ -664,44 +672,66 @@ def load_session_timeslice_device_units(
     by the canonicalization step inside ``_read_csv_robust``.
 
     When *max_frames* is set, stop after that many layer files (for cheap probes).
+    When *nrows* is set, only that many data rows are read from each file
+    (``0`` is a header-only probe).
     """
     sid = source.session_id
     try:
         if source.kind == "directory":
             root = source.path
             matches: list[tuple[int, Path]] = []
-            for layer_dir in sorted(root.glob("layer-*")):
-                if not layer_dir.is_dir():
-                    continue
-                try:
-                    layer_idx = int(layer_dir.name.split("-", 1)[1])
-                except (IndexError, ValueError):
-                    continue
-                for run_dir in layer_dir.glob("run-*"):
-                    p = run_dir / "timeslice_data_device_units.csv"
-                    if p.is_file():
-                        matches.append((layer_idx, p))
-                        break
+            if max_frames == 1:
+                first = root / "layer-0" / "run-0" / "timeslice_data_device_units.csv"
+                if first.is_file():
+                    matches = [(0, first)]
+            if not matches:
+                for layer_dir in sorted(root.glob("layer-*")):
+                    if not layer_dir.is_dir():
+                        continue
+                    try:
+                        layer_idx = int(layer_dir.name.split("-", 1)[1])
+                    except (IndexError, ValueError):
+                        continue
+                    for run_dir in layer_dir.glob("run-*"):
+                        p = run_dir / "timeslice_data_device_units.csv"
+                        if p.is_file():
+                            matches.append((layer_idx, p))
+                            break
             matches.sort(key=lambda t: t[0])
+            if max_frames is not None:
+                matches = matches[:max_frames]
+            if not matches:
+                return []
             raw_usecols: list[str] | None = None
-            frames = []
-            for layer_idx, p in matches:
-                if usecols is not None and raw_usecols is None:
-                    raw_usecols = _resolve_timeslice_raw_usecols(p, usecols)
-                df = _read_csv_robust(p, usecols=usecols, raw_usecols=raw_usecols)
+            if usecols is not None:
+                raw_usecols = _resolve_timeslice_raw_usecols(matches[0][1], usecols)
+
+            def _load_one(item: tuple[int, Path]) -> tuple[int, pd.DataFrame]:
+                layer_idx, p = item
+                df = _read_csv_robust(
+                    p, usecols=usecols, raw_usecols=raw_usecols, nrows=nrows,
+                )
                 df["_layer_idx"] = layer_idx
-                frames.append(df)
-                if max_frames is not None and len(frames) >= max_frames:
-                    break
-            return frames
+                return layer_idx, df
+
+            if len(matches) == 1:
+                return [_load_one(matches[0])[1]]
+            with ThreadPoolExecutor(max_workers=_timeslice_io_workers(len(matches))) as pool:
+                loaded = list(pool.map(_load_one, matches))
+            loaded.sort(key=lambda t: t[0])
+            return [df for _, df in loaded]
 
         if source.kind == "zip":
             with zipfile.ZipFile(source.path, "r") as zf:
-                return _timeslices_from_zip(zf, sid, usecols, max_frames=max_frames)
+                return _timeslices_from_zip(
+                    zf, sid, usecols, max_frames=max_frames, nrows=nrows,
+                )
 
         if source.kind == "tar":
             with tarfile.open(source.path, "r:*") as tf:
-                return _timeslices_from_tar(tf, sid, usecols, max_frames=max_frames)
+                return _timeslices_from_tar(
+                    tf, sid, usecols, max_frames=max_frames, nrows=nrows,
+                )
     except Exception as e:
         _log.debug("Error loading timeslice data from session %s: %s", sid, e)
         return []
@@ -713,6 +743,7 @@ def _timeslices_from_zip(
     usecols: list[str] | None,
     *,
     max_frames: int | None = None,
+    nrows: int | None = None,
 ) -> list[pd.DataFrame]:
     matches: list[tuple[int, str]] = []
     for entry in zf.namelist():
@@ -728,7 +759,9 @@ def _timeslices_from_zip(
         with zf.open(path) as f:
             if usecols is not None and raw_usecols is None:
                 raw_usecols = _resolve_timeslice_raw_usecols(f, usecols)
-            df = _read_csv_robust(f, usecols=usecols, raw_usecols=raw_usecols)
+            df = _read_csv_robust(
+                f, usecols=usecols, raw_usecols=raw_usecols, nrows=nrows,
+            )
         df["_layer_idx"] = layer_idx
         frames.append(df)
         if max_frames is not None and len(frames) >= max_frames:
@@ -742,6 +775,7 @@ def _timeslices_from_tar(
     usecols: list[str] | None,
     *,
     max_frames: int | None = None,
+    nrows: int | None = None,
 ) -> list[pd.DataFrame]:
     matches: list[tuple[int, tarfile.TarInfo]] = []
     for info in tf.getmembers():
@@ -759,7 +793,9 @@ def _timeslices_from_tar(
             continue
         if usecols is not None and raw_usecols is None:
             raw_usecols = _resolve_timeslice_raw_usecols(raw, usecols)
-        df = _read_csv_robust(raw, usecols=usecols, raw_usecols=raw_usecols)
+        df = _read_csv_robust(
+            raw, usecols=usecols, raw_usecols=raw_usecols, nrows=nrows,
+        )
         df["_layer_idx"] = layer_idx
         frames.append(df)
         if max_frames is not None and len(frames) >= max_frames:
