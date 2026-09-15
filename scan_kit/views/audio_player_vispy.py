@@ -26,6 +26,7 @@ from .vispy_plot import (
     hex_to_rgba,
     lock_panzoom,
     map_canvas_x_to_data,
+    set_data_range,
     vertical_segments,
 )
 
@@ -79,7 +80,7 @@ class AudioWaveformScene:
         self.clear()
         view = self._grid.add_view(row=0, col=0, row_span=1, col_span=1)
         lock_panzoom(view)
-        view.camera.set_range(x=(-1.0, 1.0), y=(-1.0, 1.0))
+        set_data_range(view, (-1.0, 1.0), (-1.0, 1.0))
         self._status_node = add_status_text(view, message)
         self._canvas.update()
 
@@ -117,7 +118,6 @@ class AudioWaveformScene:
                 color=hex_to_rgba(channel.color, alpha=0.95),
                 width=1.2,
                 order=ORDER_DATA,
-                offset=1.0,
             )
             cursor = add_line(
                 view.scene,
@@ -125,7 +125,6 @@ class AudioWaveformScene:
                 color=ACCENT_RGBA,
                 width=2.0,
                 order=ORDER_OVERLAY,
-                offset=0.0,
             )
             self._rows.append(
                 _WaveformRow(
@@ -213,7 +212,6 @@ class AudioSpectrumScene:
                 width=1.0,
                 order=ORDER_OVERLAY,
                 visible=False,
-                offset=0.0,
             )
             for _ in range(_PEAK_LINE_COUNT)
         ]
