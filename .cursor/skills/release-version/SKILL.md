@@ -104,6 +104,7 @@ Deleting a tag does not delete an already-published GitHub Release — remove th
 
 ## Verification checklist
 
+- [ ] README / `docs/images/` regenerated if the UI changed (`python scripts/capture_doc_screenshots.py`).
 - [ ] `__version__` updated and is the only changed line for the bump.
 - [ ] Commit message is `Release vX.Y.Z`.
 - [ ] Tag name exactly matches `vX.Y.Z` (same as `__version__`, prefixed with `v`).
