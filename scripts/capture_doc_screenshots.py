@@ -26,7 +26,7 @@ SESSION_G2 = "590658542"
 # Adjacent in the date-sorted table so both Use swatches show in the launcher shot.
 LAUNCHER_SESSIONS = ["656350661", "1943968267"]
 
-LAUNCHER_SIZE = (1200, 760)
+LAUNCHER_SIZE = (1400, 760)
 VIEW_SIZE = (1400, 860)
 PUBLIC_DATA_DIR = "test_data"
 PUBLIC_RCI_HOST = "192.168.100.184"
@@ -194,7 +194,7 @@ def _generate_zero_field_preview(panel) -> None:
 
 
 def _capture_launcher_screenshots(base_dir: str) -> None:
-    from PySide6.QtWidgets import QApplication
+    from PySide6.QtWidgets import QApplication, QSplitter
 
     from scan_kit.qt_launcher import (
         ScanKitMainWindow,
@@ -236,6 +236,16 @@ def _capture_launcher_screenshots(base_dir: str) -> None:
     assert tabs is not None
 
     _switch_tab(window, _MAIN_TAB_DATA_ANALYSIS)
+    data_page = None
+    for i in range(tabs.count()):
+        if tabs.tabText(i) == _MAIN_TAB_DATA_ANALYSIS:
+            data_page = tabs.widget(i)
+            break
+    if data_page is not None:
+        for splitter in data_page.findChildren(QSplitter):
+            splitter.setSizes([720, 680])
+            break
+    app.processEvents()
     _grab_widget(window, OUT_DIR / "launcher-data-analysis.png")
 
     _switch_tab(window, _MAIN_TAB_PLAN_SYNTHESIS)
