@@ -12,8 +12,16 @@ from pathlib import Path
 def move_to_trash(path: str | Path) -> None:
     """Move *path* to the Recycle Bin (Windows) or trash (POSIX).
 
-    Missing paths are ignored. Raises ``OSError`` if the OS refuse the move.
+    Remote URLs are deleted in place (no recycle bin). Missing paths are
+    ignored. Raises ``OSError`` if the OS refuse the move.
     """
+    from .data_location import is_remote_location, location_exists, remove_location
+
+    if is_remote_location(path):
+        if not location_exists(path):
+            return
+        remove_location(path)
+        return
     target = Path(path)
     if not target.exists():
         return

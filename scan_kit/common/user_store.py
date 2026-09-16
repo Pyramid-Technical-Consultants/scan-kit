@@ -16,6 +16,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from .data_location import canonical_location, is_remote_location
 from .session_meta import SessionMeta
 from .session_notes import load_notes_json
 from .session_source import (
@@ -98,7 +99,7 @@ def snapshot_library(
         lib_id = _ensure_library(conn, root)
         _import_if_needed(conn, lib_id, base_dir)
         found: dict[str, str] = {sid: path for sid, path, _ in discovered}
-        if Path(root).is_dir():
+        if is_remote_location(base_dir) or Path(root).is_dir():
             _delete_missing(conn, lib_id, set(found))
         out: list[tuple[str, str, SessionMeta | None]] = []
         for sid, path_str, _ in discovered:
@@ -394,11 +395,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
 
 
 def _canonical_library_path(base_dir: str | Path) -> str:
-    path = Path(base_dir).expanduser()
-    try:
-        return str(path.resolve())
-    except OSError:
-        return str(path)
+    return canonical_location(base_dir)
 
 
 def _ensure_library(conn: sqlite3.Connection, root: str) -> int:
@@ -418,6 +415,13 @@ def _import_if_needed(
     notes_done = bool(row and row[0])
     views_done = bool(row and row[1])
     if notes_done and views_done:
+        return
+    if is_remote_location(base_dir):
+        conn.execute(
+            "UPDATE libraries SET notes_imported = 1, view_settings_imported = 1 "
+            "WHERE id = ?",
+            (lib_id,),
+        )
         return
     legacy = ViewSettings.load_legacy_json(base_dir)
     if not notes_done:

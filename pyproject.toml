@@ -25,6 +25,7 @@ dependencies = [
     "msgpack",
     "requests",
     "websocket-client",
+    "fsspec[ssh,smb]>=2024.2.0",
 ]
 
 [project.optional-dependencies]

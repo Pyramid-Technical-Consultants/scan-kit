@@ -9,7 +9,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
-from PySide6.QtCore import QFileSystemWatcher, QRectF, Qt, QTimer, Signal, QSize, Slot
+from PySide6.QtCore import QFileSystemWatcher, QRectF, QUrl, Qt, QTimer, Signal, QSize, Slot
 from PySide6.QtGui import (
     QAction,
     QColor,
@@ -38,6 +38,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from scan_kit.common.data_location import is_remote_location
 from scan_kit.common.plot_colors import DEFAULT_SESSION_COLORS
 from scan_kit.common.recycle import move_to_trash
 from scan_kit.common.session_meta import SessionMeta
@@ -70,6 +71,40 @@ _META_COLS = (_COL_DATE, _COL_MU, _COL_TIME, _COL_ROOM, _COL_CONFIG)
 _SWATCH_PX = 14
 _UNCHECKED_SWATCH = QColor("#d0d0d0")
 _SWATCH_LINE = QColor("#6a6a6a")
+
+# Declared so native/portal dialogs can offer URI locations (GTK GVfs, KDE
+# KIO, xdg-desktop-portal). Windows still browses UNC via Network.
+_DATA_DIR_SCHEMES = (
+    "sftp",
+    "ssh",
+    "scp",
+    "smb",
+    "ftp",
+    "ftps",
+    "http",
+    "https",
+)
+
+
+def directory_url_for_dialog(spec: str) -> QUrl:
+    """Starting URL for the session-folder picker."""
+    text = spec.strip()
+    if not text:
+        return QUrl.fromLocalFile(str(Path.home()))
+    if is_remote_location(text):
+        return QUrl(text)
+    return QUrl.fromLocalFile(str(Path(text).expanduser()))
+
+
+def location_from_dialog_url(url: QUrl) -> str:
+    """Turn a picker result into a data-source string (local path or URL)."""
+    if url.isEmpty() or not url.isValid():
+        return ""
+    if url.scheme().lower() in {"clsid", "shell"}:
+        return ""
+    if url.isLocalFile():
+        return url.toLocalFile()
+    return url.toString()
 
 
 def default_project_root() -> Path:
@@ -300,21 +335,25 @@ class SessionBrowserWidget(QWidget):
         data_dir_row.addWidget(clear_btn)
 
         self._base_dir_input = QLineEdit()
-        self._base_dir_input.setPlaceholderText("Path to session ZIPs…")
+        self._base_dir_input.setPlaceholderText(
+            "Folder, UNC, or sftp://user@host/path"
+        )
         self._base_dir_input.setText(self._base_dir)
         self._base_dir_input.editingFinished.connect(self._on_base_dir_finished)
         self._base_dir_input.returnPressed.connect(self._on_base_dir_finished)
         data_dir_row.addWidget(self._base_dir_input, stretch=1)
 
         browse_dir_btn = QPushButton("Browse…")
-        browse_dir_btn.setToolTip("Choose folder containing session archives or folders")
+        browse_dir_btn.setToolTip(
+            "Choose a local, UNC, or network folder. SFTP URLs can also be pasted."
+        )
         browse_dir_btn.setFixedWidth(96)
         browse_dir_btn.clicked.connect(self._on_browse_data_dir)
         data_dir_row.addWidget(browse_dir_btn)
 
         refresh_btn = QPushButton("↻")
         refresh_btn.setFixedWidth(28)
-        refresh_btn.setToolTip("Refresh session list from folder")
+        refresh_btn.setToolTip("Refresh session list")
         refresh_btn.clicked.connect(self.incremental_refresh)
         data_dir_row.addWidget(refresh_btn)
         root.addLayout(data_dir_row)
@@ -510,16 +549,17 @@ class SessionBrowserWidget(QWidget):
 
     def _on_browse_data_dir(self) -> None:
         start = self._base_dir_input.text().strip() or self._base_dir
-        path = Path(start).expanduser()
-        initial = str(path.resolve()) if path.is_dir() else str(Path.home())
-        chosen = QFileDialog.getExistingDirectory(
+        chosen = QFileDialog.getExistingDirectoryUrl(
             self,
             "Select session data folder",
-            initial,
+            directory_url_for_dialog(start),
+            QFileDialog.Option.ShowDirsOnly,
+            list(_DATA_DIR_SCHEMES),
         )
-        if not chosen:
+        location = location_from_dialog_url(chosen)
+        if not location:
             return
-        self._base_dir_input.setText(chosen)
+        self._base_dir_input.setText(location)
         self._on_base_dir_finished()
 
     def _on_context_menu(self, pos) -> None:
@@ -534,8 +574,12 @@ class SessionBrowserWidget(QWidget):
             "Copy Session ID",
             lambda checked=False, session_id=sid: self._copy_session_id(session_id),
         )
+        if is_remote_location(self._base_dir):
+            recycle_label = "Delete from remote host…"
+        else:
+            recycle_label = "Move to Recycle Bin…"
         menu.addAction(
-            "Move to Recycle Bin…",
+            recycle_label,
             lambda checked=False, session_id=sid: self._recycle_session(session_id),
         )
         self.populate_context_menu.emit(sid, menu)
@@ -549,6 +593,8 @@ class SessionBrowserWidget(QWidget):
     def _watch_base_dir(self) -> None:
         for current in list(self._fs_watcher.directories()):
             self._fs_watcher.removePath(current)
+        if is_remote_location(self._base_dir):
+            return
         folder = Path(self._base_dir)
         if folder.is_dir():
             self._fs_watcher.addPath(str(folder))
@@ -568,7 +614,7 @@ class SessionBrowserWidget(QWidget):
         self._sorting_held = False
         self._rebuild_session_row_index()
 
-    def _confirm_recycle_dialog(self, sid: str, paths: list[Path]) -> bool:
+    def _confirm_recycle_dialog(self, sid: str, paths: list[str]) -> bool:
         lines = "\n".join(f"  {p}" for p in paths)
         selected = sid in set(self.selected_session_ids())
         extra = ""
@@ -579,13 +625,22 @@ class SessionBrowserWidget(QWidget):
             )
         box = QMessageBox(self)
         box.setIcon(QMessageBox.Icon.Warning)
-        box.setWindowTitle("Move session to Recycle Bin")
-        box.setText(
-            f"Move session {sid} to the Recycle Bin?\n\n"
-            f"These items will be removed:\n{lines}\n\n"
-            "You can restore them from the Recycle Bin if needed."
-            f"{extra}"
-        )
+        if is_remote_location(self._base_dir):
+            box.setWindowTitle("Delete remote session")
+            box.setText(
+                f"Permanently delete session {sid} from the remote host?\n\n"
+                f"These items will be removed:\n{lines}\n\n"
+                "They are not sent to the Recycle Bin."
+                f"{extra}"
+            )
+        else:
+            box.setWindowTitle("Move session to Recycle Bin")
+            box.setText(
+                f"Move session {sid} to the Recycle Bin?\n\n"
+                f"These items will be removed:\n{lines}\n\n"
+                "You can restore them from the Recycle Bin if needed."
+                f"{extra}"
+            )
         box.setStandardButtons(
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel
         )

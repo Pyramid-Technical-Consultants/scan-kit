@@ -1,0 +1,372 @@
+"""Session-library locations: local folders, UNC shares, and fsspec URLs.
+
+Local paths (including Windows ``\\\\server\\share`` UNC) stay ``pathlib.Path``.
+URLs such as ``sftp://user@host/var/log/ptc_ex`` go through fsspec so SFTP,
+SMB, FTP, HTTP, and similar protocols work without a custom client. Analysis
+still reads local files: a session is copied into ``~/.scan-kit/remote-cache``
+the first time it is opened.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import logging
+import posixpath
+import re
+import shutil
+from pathlib import Path
+from urllib.parse import unquote, urlparse, urlunparse
+
+_log = logging.getLogger(__name__)
+
+_URI_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*://")
+_SCHEME_ALIASES = {"ssh": "sftp", "scp": "sftp"}
+_ARCHIVE_SUFFIXES: tuple[str, ...] = (
+    ".tar.gz",
+    ".tar.bz2",
+    ".tar.xz",
+    ".tgz",
+    ".tar",
+    ".zip",
+)
+
+
+def strip_location(spec: str | Path) -> str:
+    return str(spec).strip()
+
+
+def is_uri(spec: str | Path) -> bool:
+    return bool(_URI_RE.match(strip_location(spec)))
+
+
+def is_remote_location(spec: str | Path) -> bool:
+    """True for fsspec URLs. UNC, drive letters, and ``file://`` stay local."""
+    text = strip_location(spec)
+    if not is_uri(text):
+        return False
+    scheme = urlparse(text).scheme.lower()
+    # ``C://...`` would match the URI regex; a one-letter scheme is a drive.
+    return scheme != "file" and len(scheme) > 1
+
+
+def local_path(spec: str | Path) -> Path | None:
+    """``Path`` for a local spec, or None when *spec* is a remote URL."""
+    text = strip_location(spec)
+    if not text or is_remote_location(text):
+        return None
+    if is_uri(text) and urlparse(text).scheme.lower() == "file":
+        return _file_uri_to_path(text)
+    return Path(text).expanduser()
+
+
+def is_usable_data_location(spec: str | Path) -> bool:
+    """Whether *spec* can be restored as the last session library.
+
+    Remote URLs are accepted without a network round-trip. Local paths must
+    already be directories.
+    """
+    text = strip_location(spec)
+    if not text:
+        return False
+    if is_remote_location(text):
+        return True
+    path = local_path(text)
+    if path is None:
+        return False
+    try:
+        return path.is_dir()
+    except OSError:
+        return False
+
+
+def canonical_location(spec: str | Path) -> str:
+    """Stable identity for prefs/sqlite. Passwords are stripped from URLs."""
+    text = strip_location(spec)
+    if not text:
+        return text
+    if is_uri(text):
+        parsed = urlparse(text)
+        scheme = parsed.scheme.lower()
+        if scheme == "file" or len(scheme) == 1:
+            local = local_path(text)
+            if local is not None:
+                return _canonical_local(local)
+            return text
+        scheme = _SCHEME_ALIASES.get(scheme, scheme)
+        host = parsed.hostname or ""
+        if host.count(":") and not host.startswith("["):
+            host = f"[{host}]"
+        if parsed.port:
+            host = f"{host}:{parsed.port}"
+        netloc = host
+        if parsed.username:
+            netloc = f"{unquote(parsed.username)}@{host}"
+        path = parsed.path or "/"
+        if path != "/":
+            path = path.rstrip("/")
+        return urlunparse((scheme, netloc, path, "", parsed.query, ""))
+    return _canonical_local(Path(text).expanduser())
+
+
+def join_location(base: str | Path, name: str) -> str:
+    """Join a child name onto a local path or URL."""
+    child = str(name).lstrip("/").replace("\\", "/")
+    text = strip_location(base)
+    if is_remote_location(text):
+        return text.rstrip("/") + "/" + child
+    path = local_path(text)
+    if path is None:
+        return text.rstrip("/") + "/" + child
+    return str(path / name)
+
+
+def open_fs(spec: str | Path):
+    """Return ``(fs, path)`` for *spec* via fsspec."""
+    from fsspec.core import url_to_fs
+
+    return url_to_fs(_fsspec_url(spec))
+
+
+def list_location_entries(spec: str | Path) -> list[tuple[str, bool]]:
+    """``(name, is_dir)`` children of *spec*. Empty on local errors; remote errors raise."""
+    text = strip_location(spec)
+    if not is_remote_location(text):
+        folder = local_path(text)
+        if folder is None:
+            return []
+        try:
+            children = sorted(folder.iterdir(), key=lambda p: p.name)
+        except OSError:
+            return []
+        return [(child.name, child.is_dir()) for child in children]
+    try:
+        fs, path = open_fs(text)
+        listing = fs.ls(path, detail=True)
+    except Exception:
+        _log.exception("Could not list %s", text)
+        raise
+    out: list[tuple[str, bool]] = []
+    for item in listing:
+        if isinstance(item, str):
+            name = posixpath.basename(item.rstrip("/"))
+            is_dir = False
+        else:
+            raw_name = str(item.get("name") or "")
+            name = posixpath.basename(raw_name.rstrip("/"))
+            kind = str(item.get("type") or "file").lower()
+            is_dir = kind in {"directory", "dir"}
+        if name in {"", ".", ".."}:
+            continue
+        out.append((name, is_dir))
+    out.sort(key=lambda row: row[0])
+    return out
+
+
+def location_exists(spec: str | Path) -> bool:
+    text = strip_location(spec)
+    if not is_remote_location(text):
+        path = local_path(text)
+        if path is None:
+            return False
+        try:
+            return path.exists()
+        except OSError:
+            return False
+    try:
+        fs, path = open_fs(text)
+        return bool(fs.exists(path))
+    except Exception:
+        return False
+
+
+def location_is_dir(spec: str | Path) -> bool:
+    text = strip_location(spec)
+    if not is_remote_location(text):
+        path = local_path(text)
+        if path is None:
+            return False
+        try:
+            return path.is_dir()
+        except OSError:
+            return False
+    try:
+        fs, path = open_fs(text)
+        return bool(fs.isdir(path))
+    except Exception:
+        return False
+
+
+def location_is_file(spec: str | Path) -> bool:
+    text = strip_location(spec)
+    if not is_remote_location(text):
+        path = local_path(text)
+        if path is None:
+            return False
+        try:
+            return path.is_file()
+        except OSError:
+            return False
+    try:
+        fs, path = open_fs(text)
+        return bool(fs.isfile(path))
+    except Exception:
+        return False
+
+
+def read_location_bytes(spec: str | Path) -> bytes:
+    text = strip_location(spec)
+    if not is_remote_location(text):
+        path = local_path(text)
+        if path is None:
+            raise FileNotFoundError(text)
+        return path.read_bytes()
+    fs, path = open_fs(text)
+    data = fs.cat_file(path)
+    return data if isinstance(data, bytes) else bytes(data)
+
+
+def open_location_binary(spec: str | Path):
+    """Readable binary file object (caller closes)."""
+    text = strip_location(spec)
+    if not is_remote_location(text):
+        path = local_path(text)
+        if path is None:
+            raise FileNotFoundError(text)
+        return path.open("rb")
+    fs, path = open_fs(text)
+    return fs.open(path, "rb")
+
+
+def location_stat(spec: str | Path) -> tuple[int, int] | None:
+    """``(mtime_ns, size)`` or None."""
+    text = strip_location(spec)
+    if not is_remote_location(text):
+        path = local_path(text)
+        if path is None:
+            return None
+        try:
+            st = path.stat()
+            return (int(st.st_mtime_ns), int(st.st_size))
+        except OSError:
+            return None
+    try:
+        fs, path = open_fs(text)
+        info = fs.info(path)
+    except Exception:
+        return None
+    size = int(info.get("size") or 0)
+    mtime = info.get("mtime") or info.get("updated") or 0
+    try:
+        mtime_ns = int(float(mtime) * 1_000_000_000)
+    except (TypeError, ValueError):
+        mtime_ns = 0
+    return mtime_ns, size
+
+
+def remove_location(spec: str | Path) -> None:
+    """Delete a remote object via fsspec."""
+    text = strip_location(spec)
+    if not is_remote_location(text):
+        raise ValueError(f"remove_location is for remote URLs, got {text!r}")
+    fs, path = open_fs(text)
+    fs.rm(path, recursive=True)
+
+
+def materialize_session(base_spec: str | Path, session_id: str) -> Path | None:
+    """Copy one session into the local cache and return the cache library folder."""
+    spec = strip_location(base_spec)
+    if not is_remote_location(spec):
+        path = local_path(spec)
+        return path if path is not None and path.is_dir() else None
+    local_lib = cache_root_for(spec)
+    local_lib.mkdir(parents=True, exist_ok=True)
+    names = [session_id, *(f"{session_id}{suf}" for suf in _ARCHIVE_SUFFIXES)]
+    fs, rpath = open_fs(spec)
+    root = (rpath or "").rstrip("/")
+    for name in names:
+        remote = posixpath.join(root, name) if root else name
+        try:
+            exists = fs.exists(remote)
+        except Exception:
+            exists = False
+        if not exists:
+            continue
+        dest = local_lib / name
+        stamp = local_lib / f".{name}.stamp"
+        stamp_text = _remote_stamp(fs, remote)
+        if (
+            dest.exists()
+            and stamp.is_file()
+            and stamp.read_text(encoding="utf-8") == stamp_text
+        ):
+            return local_lib
+        if dest.exists():
+            if dest.is_dir():
+                shutil.rmtree(dest)
+            else:
+                dest.unlink()
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        recursive = bool(fs.isdir(remote))
+        fs.get(remote, str(dest), recursive=recursive)
+        stamp.write_text(stamp_text, encoding="utf-8")
+        return local_lib
+    return None
+
+
+def cache_root_for(spec: str | Path) -> Path:
+    key = canonical_location(spec)
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
+    return _remote_cache_home() / digest
+
+
+def _remote_cache_home() -> Path:
+    from .user_store import user_data_dir
+
+    return user_data_dir() / "remote-cache"
+
+
+def _remote_stamp(fs, remote: str) -> str:
+    try:
+        info = fs.info(remote)
+    except Exception:
+        return "0\n0"
+    mtime = info.get("mtime") or info.get("updated") or 0
+    size = info.get("size") or 0
+    return f"{mtime}\n{size}"
+
+
+def _canonical_local(path: Path) -> str:
+    try:
+        return str(path.resolve())
+    except OSError:
+        return str(path)
+
+
+def _file_uri_to_path(spec: str) -> Path | None:
+    parsed = urlparse(spec)
+    if parsed.scheme.lower() != "file":
+        return None
+    path = unquote(parsed.path or "")
+    if parsed.netloc and parsed.netloc not in {"localhost", "127.0.0.1"}:
+        return Path(f"//{parsed.netloc}{path}")
+    if os_name_is_windows() and re.match(r"^/[A-Za-z]:", path):
+        path = path[1:]
+    return Path(path) if path else None
+
+
+def os_name_is_windows() -> bool:
+    import sys
+
+    return sys.platform == "win32"
+
+
+def _fsspec_url(spec: str | Path) -> str:
+    text = strip_location(spec)
+    parsed = urlparse(text)
+    scheme = parsed.scheme.lower()
+    alias = _SCHEME_ALIASES.get(scheme)
+    if alias is None:
+        return text
+    return urlunparse(
+        (alias, parsed.netloc, parsed.path, parsed.params, parsed.query, parsed.fragment)
+    )

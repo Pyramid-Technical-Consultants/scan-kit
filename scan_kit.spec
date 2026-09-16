@@ -65,6 +65,9 @@ _scan_kit_hiddenimports += collect_submodules("scan_kit.views")
 _scan_kit_hiddenimports += collect_submodules("scan_kit.workflows")
 _scan_kit_hiddenimports += collect_submodules("scan_kit.common")
 _scan_kit_hiddenimports += collect_submodules("scan_kit.igx")
+_fsspec_hiddenimports = collect_submodules("fsspec")
+_paramiko_hiddenimports = collect_submodules("paramiko")
+_smb_hiddenimports = collect_submodules("smbprotocol")
 
 hiddenimports = list(
     dict.fromkeys(
@@ -89,6 +92,9 @@ hiddenimports = list(
             *_scan_kit_hiddenimports,
             *_pyside6_hiddenimports,
             *_vispy_hiddenimports,
+            *_fsspec_hiddenimports,
+            *_paramiko_hiddenimports,
+            *_smb_hiddenimports,
         ],
     ),
 )

@@ -54,6 +54,7 @@ from .common.app_icon import (
 )
 from .common.app_settings import AppSettings
 from .common.qt_theme import add_theme_menu, apply_saved_ui_theme
+from .common.data_location import canonical_location, is_usable_data_location
 from .common.user_store import PREF_LAST_DATA_DIR, prefs_get, prefs_set
 from .common.segmented_control import SegmentedControl as _SegmentedControl
 from .common.debug_log_panel import DebugLogPanel
@@ -137,7 +138,7 @@ class ScanKitMainWindow(QMainWindow):
         self._app_settings = AppSettings.load()
         self._restore_window_geometry()
         last_data = prefs_get(PREF_LAST_DATA_DIR)
-        if isinstance(last_data, str) and Path(last_data).is_dir():
+        if isinstance(last_data, str) and is_usable_data_location(last_data):
             self._initial_base_dir = last_data
         elif FROZEN:
             self._initial_base_dir = str(PROJECT_ROOT)
@@ -663,7 +664,7 @@ class ScanKitMainWindow(QMainWindow):
 
     def _on_session_base_dir_changed(self, path: str) -> None:
         try:
-            prefs_set(PREF_LAST_DATA_DIR, path)
+            prefs_set(PREF_LAST_DATA_DIR, canonical_location(path))
         except Exception:
             pass
         panel = getattr(self, "_config_tuning_panel", None)
