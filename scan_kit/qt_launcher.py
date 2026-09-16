@@ -37,6 +37,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMenu,
     QMessageBox,
+    QProgressDialog,
     QPushButton,
     QSizePolicy,
     QSplitter,
@@ -54,11 +55,15 @@ from .common.app_icon import (
 )
 from .common.app_settings import AppSettings
 from .common.qt_theme import add_theme_menu, apply_saved_ui_theme
-from .common.data_location import canonical_location, is_usable_data_location
+from .common.data_location import (
+    canonical_location,
+    is_remote_location,
+    is_usable_data_location,
+)
 from .common.user_store import PREF_LAST_DATA_DIR, prefs_get, prefs_set
 from .common.segmented_control import SegmentedControl as _SegmentedControl
 from .common.debug_log_panel import DebugLogPanel
-from .common.session_browser import SessionBrowserWidget
+from .common.session_browser import SessionBrowserWidget, prompt_remote_password
 from .common.session_meta import SessionMeta
 from .common.settings import ViewSettings, CALIBRATION_MODES
 from .common.qt_widgets import make_pane_scroll_area, set_pane_scroll_widget
@@ -130,6 +135,9 @@ class ScanKitMainWindow(QMainWindow):
     _sig_plot_window_ready = Signal(str, object)
     #: view settings loaded off the GUI thread (bootstrap_generation, ViewSettings).
     _sig_settings_ready = Signal(int, object)
+    #: remote session copy finished (ok, err, needs_password, module, sids, base_dir)
+    _sig_remote_copy_finished = Signal(bool, str, bool, str, list, str)
+    _sig_remote_copy_progress = Signal(str, int, int)
 
     def __init__(self) -> None:
         super().__init__()
@@ -161,6 +169,10 @@ class ScanKitMainWindow(QMainWindow):
         self._config_tuning_panel: ConfigTuningPanel | None = None
         self._debug_log_panel: DebugLogPanel | None = None
         self._deferred_tab_steps: list = []
+        self._remote_copy_busy = False
+        self._remote_progress: QProgressDialog | None = None
+        self._copy_auth_tried: set[str] = set()
+        self._remote_copy_cancel = threading.Event()
 
         boot = QWidget()
         boot_l = QVBoxLayout(boot)
@@ -200,6 +212,12 @@ class ScanKitMainWindow(QMainWindow):
         )
         self._sig_settings_ready.connect(
             self._on_settings_ready, Qt.ConnectionType.QueuedConnection
+        )
+        self._sig_remote_copy_progress.connect(
+            self._on_remote_copy_progress, Qt.ConnectionType.QueuedConnection
+        )
+        self._sig_remote_copy_finished.connect(
+            self._on_remote_copy_finished, Qt.ConnectionType.QueuedConnection
         )
 
     @property
@@ -255,6 +273,7 @@ class ScanKitMainWindow(QMainWindow):
         self._debug_log_panel = DebugLogPanel()
         tabs.addTab(self._debug_log_panel, _MAIN_TAB_DEBUG)
         self._debug_log_panel.install_logging()
+        self._debug_log_panel.clear_cache_requested.connect(self._on_clear_remote_cache)
 
     def _finalize_main_tabs(self) -> None:
         tabs = self._main_tabs
@@ -292,6 +311,15 @@ class ScanKitMainWindow(QMainWindow):
         refresh_action.setStatusTip("Re-scan the data folder for sessions")
         refresh_action.triggered.connect(self._refresh_sessions)
         menu.addAction(refresh_action)
+
+        menu.addSeparator()
+
+        clear_cache_action = QAction("Clear Remote Cache…", self)
+        clear_cache_action.setStatusTip(
+            "Delete locally cached copies of remote sessions"
+        )
+        clear_cache_action.triggered.connect(self._on_clear_remote_cache)
+        menu.addAction(clear_cache_action)
 
         menu.addSeparator()
 
@@ -386,6 +414,34 @@ class ScanKitMainWindow(QMainWindow):
         if self._session_browser is not None:
             self._session_browser.browse_for_base_dir()
 
+    def _on_clear_remote_cache(self) -> None:
+        from .common.data_location import (
+            clear_remote_cache,
+            format_byte_size,
+            remote_cache_size_bytes,
+        )
+
+        size = remote_cache_size_bytes()
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("Clear remote cache")
+        box.setText(
+            f"Delete locally cached remote sessions ({format_byte_size(size)})?\n\n"
+            "The next time you open a remote session it will be copied again."
+        )
+        box.setStandardButtons(
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel
+        )
+        box.setDefaultButton(QMessageBox.StandardButton.Cancel)
+        if box.exec() != QMessageBox.StandardButton.Yes:
+            return
+        clear_remote_cache()
+        if self._debug_log_panel is not None:
+            self._debug_log_panel.refresh_cache_label()
+            self._debug_log_panel.append(
+                "INFO", "launcher", "Cleared remote session cache"
+            )
+
     def _show_about_dialog(self) -> None:
         QMessageBox.about(
             self,
@@ -479,6 +535,14 @@ class ScanKitMainWindow(QMainWindow):
     def _on_main_tab_changed(self, _index: int) -> None:
         self._persist_main_tab()
         self._sync_tab_menu()
+        tabs = self._main_tabs
+        if (
+            tabs is not None
+            and 0 <= _index < tabs.count()
+            and tabs.tabText(_index) == _MAIN_TAB_DEBUG
+            and self._debug_log_panel is not None
+        ):
+            self._debug_log_panel.refresh_cache_label()
 
     def _switch_to_main_tab(self, tab_name: str) -> None:
         tabs = self._main_tabs
@@ -667,6 +731,7 @@ class ScanKitMainWindow(QMainWindow):
             prefs_set(PREF_LAST_DATA_DIR, canonical_location(path))
         except Exception:
             pass
+        self._copy_auth_tried.clear()
         panel = getattr(self, "_config_tuning_panel", None)
         if panel is not None:
             panel.set_session_data_dir(path)
@@ -770,6 +835,125 @@ class ScanKitMainWindow(QMainWindow):
         self._launch_view(module_name, session_ids, self._base_dir)
 
     def _launch_view(
+        self, module_name: str, session_ids: list[str], base_dir: str,
+    ) -> None:
+        if is_remote_location(base_dir):
+            self._copy_remote_then_launch(module_name, session_ids, base_dir)
+            return
+        self._launch_view_after_copy(module_name, session_ids, base_dir)
+
+    def _copy_remote_then_launch(
+        self,
+        module_name: str,
+        session_ids: list[str],
+        base_dir: str,
+        *,
+        retrying_auth: bool = False,
+    ) -> None:
+        if self._remote_copy_busy:
+            self._notify("Still copying remote sessions…")
+            return
+        if not retrying_auth:
+            self._copy_auth_tried.discard(canonical_location(base_dir))
+        self._remote_copy_busy = True
+        self._remote_copy_cancel.clear()
+        progress = QProgressDialog(
+            "Copying session from remote host…",
+            "Cancel",
+            0,
+            max(1, len(session_ids)),
+            self,
+        )
+        progress.setWindowTitle("Remote session")
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(400)
+        progress.setValue(0)
+        progress.canceled.connect(self._remote_copy_cancel.set)
+        self._remote_progress = progress
+
+        def work() -> None:
+            from .common.data_location import (
+                drop_cached_fs,
+                is_auth_error,
+                location_uses_password,
+                materialize_session,
+            )
+
+            try:
+                n = len(session_ids)
+                for i, sid in enumerate(session_ids):
+                    if self._remote_copy_cancel.is_set():
+                        self._sig_remote_copy_finished.emit(
+                            False, "Cancelled", False, module_name, session_ids, base_dir
+                        )
+                        return
+                    self._sig_remote_copy_progress.emit(
+                        f"Copying session {sid}…", i, n
+                    )
+                    local = materialize_session(base_dir, sid)
+                    if local is None:
+                        raise RuntimeError(f"Could not copy session {sid}")
+                self._sig_remote_copy_progress.emit("Remote copy complete", n, n)
+                self._sig_remote_copy_finished.emit(
+                    True, "", False, module_name, session_ids, base_dir
+                )
+            except Exception as exc:
+                if is_auth_error(exc):
+                    drop_cached_fs(base_dir)
+                self._sig_remote_copy_finished.emit(
+                    False,
+                    str(exc).strip() or type(exc).__name__,
+                    is_auth_error(exc) and location_uses_password(base_dir),
+                    module_name,
+                    session_ids,
+                    base_dir,
+                )
+
+        threading.Thread(target=work, daemon=True).start()
+
+    @Slot(str, int, int)
+    def _on_remote_copy_progress(self, message: str, value: int, maximum: int) -> None:
+        progress = self._remote_progress
+        if progress is None:
+            return
+        progress.setLabelText(message)
+        progress.setMaximum(max(1, maximum))
+        progress.setValue(value)
+
+    @Slot(bool, str, bool, str, list, str)
+    def _on_remote_copy_finished(
+        self,
+        ok: bool,
+        err: str,
+        needs_password: bool,
+        module_name: str,
+        session_ids: list,
+        base_dir: str,
+    ) -> None:
+        self._remote_copy_busy = False
+        progress = self._remote_progress
+        self._remote_progress = None
+        if progress is not None:
+            progress.blockSignals(True)
+            progress.close()
+        if self._debug_log_panel is not None:
+            self._debug_log_panel.refresh_cache_label()
+        if not ok:
+            key = canonical_location(base_dir)
+            if needs_password and key not in self._copy_auth_tried:
+                self._copy_auth_tried.add(key)
+                if prompt_remote_password(self, base_dir):
+                    self._copy_remote_then_launch(
+                        module_name, session_ids, base_dir, retrying_auth=True
+                    )
+                    return
+            if err and err != "Cancelled":
+                self._notify(f"Could not copy remote session: {err}", error=True)
+            return
+        self._copy_auth_tried.discard(canonical_location(base_dir))
+        self._launch_view_after_copy(module_name, session_ids, base_dir)
+
+    def _launch_view_after_copy(
         self, module_name: str, session_ids: list[str], base_dir: str,
     ) -> None:
         if module_name in self._open_views:

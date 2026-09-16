@@ -10,6 +10,12 @@ import pytest
 
 from scan_kit.common.data_location import (
     canonical_location,
+    clear_remote_cache,
+    drop_cached_fs,
+    forget_passwords,
+    format_byte_size,
+    format_location_error,
+    is_auth_error,
     is_remote_location,
     is_uri,
     is_usable_data_location,
@@ -17,7 +23,10 @@ from scan_kit.common.data_location import (
     list_location_entries,
     local_path,
     location_exists,
+    location_uses_password,
     materialize_session,
+    remember_password,
+    remote_cache_size_bytes,
     remove_location,
 )
 from scan_kit.common.recycle import move_to_trash
@@ -38,6 +47,15 @@ Treatment time: 10 seconds
 Room number: 2
 Configuration name: facility_map2map
 """
+
+
+@pytest.fixture(autouse=True)
+def _reset_remote_clients() -> None:
+    drop_cached_fs()
+    forget_passwords()
+    yield
+    drop_cached_fs()
+    forget_passwords()
 
 
 def test_drive_letter_is_not_a_url() -> None:
@@ -220,3 +238,87 @@ def test_dialog_url_round_trips_local_and_sftp(tmp_path: Path) -> None:
     assert location_from_dialog_url(
         QUrl("clsid:D20BEEC4-5CA8-4905-AE3B-BF251EA09B53")
     ) == ""
+
+
+def test_auth_error_and_password_schemes() -> None:
+    assert is_auth_error(Exception("Authentication failed."))
+    assert is_auth_error(PermissionError("Permission denied"))
+    wrapped = RuntimeError("connect failed")
+    wrapped.__cause__ = Exception("Password required")
+    assert is_auth_error(wrapped)
+    assert not is_auth_error(TimeoutError("timed out"))
+    assert not is_auth_error(FileNotFoundError("No such file"))
+    assert location_uses_password("sftp://pyramid@host/var/log/ptc_ex")
+    assert location_uses_password("smb://user@filer/share")
+    assert not location_uses_password("memory:///ptc_ex")
+    assert not location_uses_password(r"C:\data")
+
+
+def test_format_location_error_strips_password() -> None:
+    msg = format_location_error(
+        "sftp://pyramid:secret@192.168.101.206/var/log/ptc_ex",
+        Exception("Authentication failed."),
+    )
+    assert "secret" not in msg
+    assert "sftp://pyramid@192.168.101.206/var/log/ptc_ex" in msg
+    assert "Authentication failed" in msg
+
+
+def test_open_fs_reuses_one_client(monkeypatch: pytest.MonkeyPatch) -> None:
+    pytest.importorskip("fsspec")
+    import fsspec.core
+
+    calls: list[str] = []
+    real = fsspec.core.url_to_fs
+
+    def wrapper(url, **kwargs):
+        calls.append(url)
+        return real(url, **kwargs)
+
+    monkeypatch.setattr(fsspec.core, "url_to_fs", wrapper)
+    url = _memory_lib("1")
+    list_location_entries(url)
+    assert location_exists(join_location(url, "1"))
+    assert len(calls) == 1
+
+
+def test_remembered_password_passed_to_fsspec(monkeypatch: pytest.MonkeyPatch) -> None:
+    pytest.importorskip("fsspec")
+    seen: dict = {}
+
+    def fake_url_to_fs(url, **kwargs):
+        seen["url"] = url
+        seen["kwargs"] = kwargs
+        raise RuntimeError("stop")
+
+    monkeypatch.setattr("fsspec.core.url_to_fs", fake_url_to_fs)
+    remember_password("sftp://user@host/data", "hunter2")
+    with pytest.raises(RuntimeError, match="stop"):
+        list_location_entries("sftp://user@host/data")
+    assert seen["kwargs"].get("password") == "hunter2"
+    assert seen["kwargs"].get("timeout") == 20
+    assert seen["kwargs"].get("banner_timeout") == 20
+
+
+def test_materialize_reports_progress_once() -> None:
+    pytest.importorskip("fsspec")
+    url = _memory_lib("77")
+    seen: list[str] = []
+    first = materialize_session(url, "77", on_extracting=seen.append)
+    assert first is not None
+    assert seen == ["77"]
+    seen.clear()
+    again = materialize_session(url, "77", on_extracting=seen.append)
+    assert again == first
+    assert seen == []
+
+
+def test_remote_cache_size_and_clear() -> None:
+    pytest.importorskip("fsspec")
+    url = _memory_lib("77")
+    assert materialize_session(url, "77") is not None
+    assert remote_cache_size_bytes() > 0
+    assert format_byte_size(0) == "0 B"
+    assert format_byte_size(1024).endswith("KB")
+    clear_remote_cache()
+    assert remote_cache_size_bytes() == 0
