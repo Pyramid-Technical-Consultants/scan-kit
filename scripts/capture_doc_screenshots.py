@@ -5,7 +5,7 @@ Usage:
     python scripts/capture_doc_screenshots.py
 
 Requires a local test_data/ folder (not shipped with the repo). Forces the dark
-theme for the grab only — it does not persist View > Theme.
+theme for the grab only; it does not persist View > Theme.
 """
 
 from __future__ import annotations
@@ -23,9 +23,11 @@ OUT_DIR = ROOT / "docs" / "images"
 SESSION_G3_A = "1943968267"
 SESSION_G3_B = "1091134775"
 SESSION_G2 = "590658542"
+# Adjacent in the date-sorted table so both Use swatches show in the launcher shot.
+LAUNCHER_SESSIONS = ["656350661", "1943968267"]
 
-LAUNCHER_SIZE = (1440, 900)
-VIEW_SIZE = (1600, 920)
+LAUNCHER_SIZE = (1200, 760)
+VIEW_SIZE = (1400, 860)
 PUBLIC_DATA_DIR = "test_data"
 PUBLIC_RCI_HOST = "192.168.100.184"
 
@@ -220,9 +222,9 @@ def _capture_launcher_screenshots(base_dir: str) -> None:
     browser.set_base_dir(base_dir)
     _wait_until(lambda: browser._scan_complete and browser._table.rowCount() >= 2)
 
-    _select_sessions(browser, [SESSION_G3_A, SESSION_G3_B])
+    _select_sessions(browser, LAUNCHER_SESSIONS)
     _wait_until(lambda: browser._scan_complete)
-    _select_sessions(browser, [SESSION_G3_A, SESSION_G3_B])
+    _select_sessions(browser, LAUNCHER_SESSIONS)
     browser._base_dir_input.setText(PUBLIC_DATA_DIR)
     app.processEvents()
 
@@ -433,7 +435,7 @@ def main() -> None:
         stale.unlink()
         print(f"Removed stale {stale.name}")
 
-    print(f"\nDone — {len(list(OUT_DIR.glob('*.png')))} images in {OUT_DIR}")
+    print(f"\nDone: {len(list(OUT_DIR.glob('*.png')))} images in {OUT_DIR}")
 
 
 if __name__ == "__main__":
