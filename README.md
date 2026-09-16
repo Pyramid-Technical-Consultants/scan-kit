@@ -17,10 +17,10 @@
 
 <p align="center">
   <a href="#the-launcher">
-    <img src="docs/images/launcher-data-analysis.png" alt="Scan Kit Data Analysis launcher showing session browser and analysis views" width="920">
+    <img src="docs/images/launcher-data-analysis.png" alt="Scan Kit Data Analysis launcher showing session browser and unified analysis views" width="920">
   </a>
   <br>
-  <sub><em>Session browser, calibration controls, and one-click access to every analysis view.</em></sub>
+  <sub><em>Session browser, plot calibration, and one-click access to every analysis view.</em></sub>
 </p>
 
 ---
@@ -34,6 +34,7 @@
 - [Data Analysis](#data-analysis)
 - [Analysis views](#analysis-views)
 - [Plan Synthesis](#plan-synthesis)
+- [Plan Runner](#plan-runner)
 - [Configuration Tuning](#configuration-tuning)
 - [Session data layout](#session-data-layout)
 - [For developers](#for-developers)
@@ -41,7 +42,7 @@
 
 ## What Scan Kit does
 
-Scan Kit is a desktop toolkit for reviewing PBS treatment and QA sessions. Point it at a folder of session data, select up to five sessions, and launch Matplotlib analysis views — each in its own process so the launcher stays responsive.
+Scan Kit is a desktop toolkit for reviewing PBS treatment and QA sessions. Point it at a folder of session data, select up to five sessions, and launch analysis views — each in its own process so the launcher stays responsive.
 
 Beyond plotting, Scan Kit helps you:
 
@@ -50,7 +51,8 @@ Beyond plotting, Scan Kit helps you:
 | **Session comparison** | Overlay multiple sessions in the same view with distinct colors |
 | **Interactive replay** | Scrub timeslice channels (IC, dDose/dt, sigma, field) in one Qt viewer |
 | **Plan authoring** | Generate `input_map.csv` from templates, DICOM RT Ion plans, or IBA PLD files |
-| **Config editing** | Browse and edit map2map XML with forms, integrity checks, and sigma auto-tuning |
+| **Plan delivery** | Upload a plan to an RCI, run it, and download the session as a G3 zip |
+| **Config editing** | Browse and edit map2map XML with forms, integrity checks, and auto-tuning |
 
 Scan Kit reads standard DCS session exports — unpacked directories or common archive formats — and works with both G2 and G3 data layouts.
 
@@ -94,63 +96,88 @@ On a dev install, the default data source is the bundled `test_data/` folder.
 
 ## Screenshots
 
-| Data Analysis | Plan Synthesis | Configuration Tuning |
-|:---:|:---:|:---:|
-| [![](docs/images/launcher-data-analysis.png)](docs/images/launcher-data-analysis.png) | [![](docs/images/launcher-plan-synthesis.png)](docs/images/launcher-plan-synthesis.png) | [![](docs/images/launcher-config-tuning.png)](docs/images/launcher-config-tuning.png) |
-| Browse sessions and launch views | Build and export `input_map.csv` | Edit `devices.xml` and run auto-tuning |
+| Data Analysis | Plan Synthesis |
+|:---:|:---:|
+| [![](docs/images/launcher-data-analysis.png)](docs/images/launcher-data-analysis.png) | [![](docs/images/launcher-plan-synthesis.png)](docs/images/launcher-plan-synthesis.png) |
+| Browse sessions and launch views | Build and export `input_map.csv` |
+
+| Plan Runner | Configuration Tuning |
+|:---:|:---:|
+| [![](docs/images/launcher-plan-runner.png)](docs/images/launcher-plan-runner.png) | [![](docs/images/launcher-config-tuning.png)](docs/images/launcher-config-tuning.png) |
+| Upload a plan to an RCI and download the session | Edit `devices.xml` and run auto-tuning |
 
 <p align="center">
-  <img src="docs/images/view-position-scatter.png" alt="Position scatter plot comparing planned and measured spot positions" width="780">
+  <img src="docs/images/view-distribution-explorer.png" alt="Distribution Explorer showing planned and measured spot positions" width="780">
   &nbsp;&nbsp;
-  <img src="docs/images/view-sigma-energy.png" alt="Sigma vs energy violin plots for IC1 and IC2" width="780">
+  <img src="docs/images/view-sigma-energy.png" alt="Binned Summary sigma vs energy violins for IC1 and IC2" width="780">
   <br>
-  <sub><em>Spot position scatter (multi-session overlay) and sigma-vs-energy QA plots.</em></sub>
+  <sub><em>Distribution Explorer (spot positions) and Binned Summary (sigma vs energy), each with a live side panel.</em></sub>
 </p>
 
 <p align="center">
-  <img src="docs/images/view-ic-timeslice-replay.png" alt="Timeslice Replay viewer with timeline brush" width="920">
+  <img src="docs/images/view-dose-ratios-energy.png" alt="Binned Summary dose ratios vs energy with correlation panels" width="920">
   <br>
-  <sub><em>Timeslice Replay — scrub through beam-on current with a timeline brush.</em></sub>
+  <sub><em>Binned Summary — dose ratios vs energy, with optional correlation panels for multi-session overlay.</em></sub>
+</p>
+
+<p align="center">
+  <img src="docs/images/view-ic-timeslice-replay.png" alt="Timeslice Replay viewer with signal-source controls and timeline brush" width="920">
+  <br>
+  <sub><em>Timeslice Replay — pick a signal source, tick channels, and scrub the timeline brush.</em></sub>
 </p>
 
 <p align="center">
   <img src="docs/images/view-magnetic-field-replay.png" alt="Magnetic field timeslice replay with Bx and By traces" width="460">
   &nbsp;
-  <img src="docs/images/view-amplifier-correlation.png" alt="Amplifier command correlation scatter matrix" width="460">
+  <img src="docs/images/view-fft-explorer.png" alt="FFT Explorer line spectra for IC currents" width="460">
   <br>
-  <sub><em>Magnetic field replay (G3 hall probes) and amplifier command correlations (G2 steering chain).</em></sub>
+  <sub><em>Magnetic field replay (G3 hall probes) and FFT Explorer spectra.</em></sub>
+</p>
+
+<p align="center">
+  <img src="docs/images/view-amplifier-correlation.png" alt="Amplifier command correlation scatter matrix" width="460">
+  &nbsp;
+  <img src="docs/images/view-session-log-compare.png" alt="Session Log Compare overview of two sessions" width="460">
+  <br>
+  <sub><em>Amplifier command correlations (G2 steering chain) and Session Log Compare.</em></sub>
 </p>
 
 ## The launcher
 
-Scan Kit opens a single window with three tabs:
+Scan Kit opens a single window with five tabs. **View** switches tabs (`Ctrl+1`–`Ctrl+5`) and sets **Theme** (System / Light / Dark). **Analysis** opens the same views as the Data Analysis buttons. **File** opens or refreshes the session folder. **Esc** or **Ctrl+Q** quits.
 
-| Tab | Use it to… |
-|-----|------------|
-| **Data Analysis** | Browse sessions, adjust global plot settings, and open analysis views |
-| **Plan Synthesis** | Create PBS test plans and export `input_map.csv` |
-| **Configuration Tuning** | Open a facility or session config folder, edit XML, run tuning workflows |
+| Tab | Shortcut | Use it to… |
+|-----|----------|------------|
+| **Data Analysis** | `Ctrl+1` | Browse sessions, adjust global plot settings, and open analysis views |
+| **Plan Synthesis** | `Ctrl+2` | Create PBS test plans and export `input_map.csv` |
+| **Plan Runner** | `Ctrl+3` | Connect to an RCI, upload a plan, run it, and download the session |
+| **Configuration Tuning** | `Ctrl+4` | Open a facility or session config folder, edit XML, run tuning workflows |
+| **Debug** | `Ctrl+5` | Live launcher and view-process logs — Copy / Clear for support |
 
-Plot windows open separately. Close them when you are done — the launcher keeps running. Press **Esc** or **Ctrl+Q** to quit.
+Plot windows open separately. Close them when you are done — the launcher keeps running.
 
 ## Data Analysis
 
 ### 1. Choose your data source
 
-Enter the folder that contains session data in **DATA SOURCE**, then press **Enter** or click away to refresh discovery. The last folder is remembered in `~/.scan-kit`. When running a frozen executable with no remembered folder, the default is the current working directory.
+Paste a folder, Windows UNC share (`\\server\share\...`), or URL such as `sftp://user@host/var/log/ptc_ex` into the path field (placeholder: *Folder, UNC, or sftp://user@host/path*). **Browse…** can pick local and UNC/Network folders; on Linux desktops whose file dialogs speak GVfs/KIO it can pick `sftp://` and `smb://` too. Windows Explorer does not speak SFTP, so those URLs are still pasted. Press **Enter**, click away, or hit **↻** / **File → Refresh Sessions** to rediscover.
+
+SFTP uses SSH keys or the agent; a password in the URL works for that session but is not stored. Opening a remote session copies it into `~/.scan-kit/remote-cache`. The last location is remembered in `~/.scan-kit`. When running a frozen executable with no remembered folder, the default is the folder that contains the executable.
 
 ### 2. Select sessions
 
-The session table shows **Session ID**, **Date**, **MU**, **Time**, **RM**, **Config**, and **Note**.
+The session table shows **Use**, **Session ID**, **Date**, **MU**, **Time**, **RM**, **Config**, and **Note**. Selected rows get a plot-color swatch so overlays match the views.
 
 - Sort by **Date** (newest first), **ID**, **Config**, or **MU**
 - Tick **Use** on up to **five** sessions — no modifier key needed
 - Click **✕** to clear all selections
-- **Right-click** a session → **Copy Session ID**, **Move to Recycle Bin…**, or **Open in Config Tuning…** when a config folder is available
+- **Right-click** a session → **Copy Session ID**, **Move to Recycle Bin…** (or **Delete from remote host…**), or **Open in Config Tuning…** when a config folder is available
+
+Remote deletes are permanent (no recycle bin on the host). Local sessions go to the OS Recycle Bin / trash and can be restored from there.
 
 ### 3. Annotate sessions (optional)
 
-Double-click (or press **F2** on) the **Note** column to add free-text notes. Notes, plot settings, window geometry, and the last data folder are stored in `~/.scan-kit/scan-kit.sqlite` so they survive app updates and do not depend on where Scan Kit is installed. Older `app_settings.json`, `session_notes.json`, and `<data_source>/settings.json` files are imported once, then left as a snapshot.
+Double-click (or press **F2** on) the **Note** column to add free-text notes. **Edit → Undo / Redo** covers note edits. Notes, plot settings, window geometry, theme, and the last data folder are stored in `~/.scan-kit/scan-kit.sqlite` so they survive app updates and do not depend on where Scan Kit is installed. Older `app_settings.json`, `session_notes.json`, and `<data_source>/settings.json` files are imported once, then left as a snapshot.
 
 ### 4. Tune global settings
 
@@ -158,18 +185,18 @@ Two controls affect most dose-related views:
 
 | Setting | Options |
 |---------|---------|
-| **Background subtract** | On / Off |
+| **BG Subtraction** | Off / On |
 | **Calibration** | Off · Per-Session · Constrained |
 
-Settings persist in `~/.scan-kit/scan-kit.sqlite` and propagate to views that are already open.
+Settings persist in `~/.scan-kit/scan-kit.sqlite` and propagate to views that are already open. These plot-calibration modes never write `devices.xml` — that is **Dose Calibration** on the Configuration Tuning tab.
 
 ### 5. Open analysis views
 
-Click any button in the right-hand panel. **Unified Views** and **Specialized Analysis** are the two launcher groups. Each view runs in a background subprocess; a warm worker pool makes the first click feel snappy.
+Click any button in the right-hand panel, or use **Analysis** in the menu bar. **Unified Views** and **Specialized Analysis** are the two launcher groups. Each view runs in a background subprocess; a warm worker pool makes the first click feel snappy.
 
 ## Analysis views
 
-Views are organized in the launcher as **Unified Views** (configurable Qt explorers that replaced many former one-off plots) and **Specialized Analysis** (remaining focused matplotlib tools not yet folded into a unified shell).
+Views are organized in the launcher as **Unified Views** (configurable Qt explorers with a side panel of metrics, presets, and filters) and **Specialized Analysis** (focused matplotlib tools not yet folded into a unified shell).
 
 ### Unified views
 
@@ -177,10 +204,11 @@ Configurable Qt shells for the metrics most sessions need day to day.
 
 | View | Summary |
 |------|---------|
-| Binned Summary | Box/violin/mean summary — pick **Y metric** (dose error, dose ratios, dose rate, current ratios, IC current, position error, sigma, spot time) and **X parameter** (energy, target MU, spot time, beam radius). **Filter Data** includes beam on/off/both plus severity filters. |
-| Distribution Explorer | Density contours and fit-quality plots — position, position error (timeslice/spot), sigma, confidence correlations, and Gaussian filter coverage. **Filter Data** selects beam on/off/both for timeslice metrics. |
-| FFT Explorer | Frequency-domain line spectra for selectable timeslice IC currents (replaces the standalone IC FFT view). |
+| Binned Summary | Box / violin / mean / scatter / contour summary — pick **Y metric** (dose error, dose ratios, dose rate, current ratios, IC current, position error, sigma, sigma error, IC2−IC1 position, spot time) and **X parameter** (energy, target MU, spot time, beam radius). **Filter Data** includes beam on/off/both plus All Data / Within Lower 95% / Upper 5% Only / MAD Outliers. Optional interlock-threshold overlay on dose-vs-MU plots. |
+| Distribution Explorer | Density contours or scatter — position, position error, sigma, sigma error, IC2−IC1 position, confidence correlations, and Gaussian filter coverage, at spot or timeslice grain. |
 | Timeslice Replay | Interactive multi-channel timeslice viewer — [details](#interactive-replay-views) |
+| FFT Explorer | Frequency-domain line spectra for timeslice IC current, dDose/dt, source beam current, chamber position, sigma, G3 Gaussian peak, magnetic field, and amplifier command/readback. |
+| Audio Explorer | Listen to the same timeslice families, with transport, a live playhead FFT, and **Save WAV** *(needs a working audio device / PortAudio)* |
 | IC Beam Trajectory (3D) | Per-spot IC beam paths in 3D with plan overlay, dipole pivots, and iso/IC planes (visPy) |
 | Session Log Compare | Layer timings, grouped errors, event browser, two-session diff — [details](#session-log-compare) |
 
@@ -198,7 +226,6 @@ Focused plots that still use standalone matplotlib windows:
 | IC HV Transient Test | IC high-voltage toggle transients with capacitance re-derived from waveforms |
 | Amplifier Command Correlations | Settled amplifier command vs readback, field, and IC iso position — [details](#amplifier-command-correlations) |
 | IC Peak Amplitude — Beam-Off (G3) | G3 beam-off peak amplitude distributions |
-| IC Audio Export (WAV) | Listen to and export IC waveforms as WAV *(requires PortAudio)* |
 
 ### Interactive replay views
 
@@ -235,7 +262,7 @@ Every session ships a verbose `SessionLogFile.log` from DCS. This view distills 
 
 ## Plan Synthesis
 
-Switch to the **Plan Synthesis** tab to build `input_map.csv` files for PBS test plans.
+Switch to the **Plan Synthesis** tab (`Ctrl+2`) to build `input_map.csv` files for PBS test plans.
 
 | Template | Description |
 |----------|-------------|
@@ -244,15 +271,30 @@ Switch to the **Plan Synthesis** tab to build `input_map.csv` files for PBS test
 | **DICOM RT Plan** | Import an RT Ion therapy plan (`.dcm`) |
 | **IBA PLD Plan** | Import an IBA PBS plan (`.pld`) |
 
-Pick a template, set parameters, preview the spot table, and export. Suggested filenames are generated from the template and energy settings.
+Pick a template, set parameters, preview the spot table, and export. Suggested filenames are generated from the template and energy settings. **Plan Runner** can upload the saved CSV to an RCI.
 
 <p align="center">
-  <img src="docs/images/launcher-plan-synthesis.png" alt="Plan Synthesis tab with Zero Field template selected" width="720">
+  <img src="docs/images/launcher-plan-synthesis.png" alt="Plan Synthesis tab with Zero Field template and generated preview" width="720">
+</p>
+
+## Plan Runner
+
+The **Plan Runner** tab (`Ctrl+3`) is the operator console for an RCI:
+
+1. Enter the RCI IP (or a browser URL such as `http://192.168.100.184/io/`) and **Connect**. The last host is remembered.
+2. **Browse…** to an `input_map.csv` from Plan Synthesis and **Upload to RCI**.
+3. **Start** / **Pause** / **Stop** / **Reset** follow the controller ready-permit. Start enables when the RCI grants permit.
+4. After the run, **Download** saves a G3-layout session zip under `/root/reports/session/` on the RCI so Data Analysis can open it like any other session.
+
+Live tiles show control point, energy, layer, elapsed time, start permit, and whether the uploaded points were accepted.
+
+<p align="center">
+  <img src="docs/images/launcher-plan-runner.png" alt="Plan Runner tab before connecting to an RCI" width="720">
 </p>
 
 ## Configuration Tuning
 
-The **Configuration Tuning** tab is a structured editor for map2map XML configuration:
+The **Configuration Tuning** tab (`Ctrl+4`) is a structured editor for map2map XML configuration:
 
 - **File tree** — browse `devices.xml` and related config files
 - **Auto-generated forms** — edit XML values without raw markup
@@ -315,7 +357,7 @@ HCC and strip devices in one IC family keep their relative `K_MU` and all move b
 
 ## Session data layout
 
-Scan Kit discovers sessions from a single data-source folder. Supported layouts:
+Scan Kit discovers sessions from a single data-source folder. That can be a local directory, a UNC share, or an fsspec URL (`sftp://`, `smb://`, `ftp://`, `ssh://`/`scp://` as SFTP aliases, …). Supported layouts:
 
 **Unpacked directories**
 
@@ -334,6 +376,8 @@ A nested layout (`<session_id>/<session_id>/input_map.csv`) is also recognized.
 
 `.zip` · `.tgz` · `.tar.gz` · `.tar.bz2` · `.tar.xz` · `.tar`
 
+Session-list metadata is cached in `~/.scan-kit` so the table can fill without extracting every archive. Opening a view still unpacks (or copies a remote session into `~/.scan-kit/remote-cache`) as needed.
+
 ---
 
 ## For developers
@@ -351,7 +395,7 @@ Screenshots in `docs/images/` are captured from real session data with:
 python scripts/capture_doc_screenshots.py
 ```
 
-Requires a local `test_data/` folder (not shipped with the repo). The script grabs launcher tabs off-screen and renders analysis views headlessly.
+Requires a local `test_data/` folder (not shipped with the repo). The script grabs launcher tabs and unified view windows off-screen (dark theme for the grab only; it does not persist **View → Theme**), generates a compact Zero Field preview for Plan Synthesis, and renders the remaining specialized matplotlib view headlessly.
 
 </details>
 
@@ -359,13 +403,13 @@ Requires a local `test_data/` folder (not shipped with the repo). The script gra
 <summary><strong>Running tests</strong></summary>
 
 ```bash
-pip install -e ".[build]"
+pip install -e ".[build,dev]"
 pytest
 ```
 
-Tests live in `tests/` and use fixtures from `test_data/` (included in dev installs, excluded from the published package). The suite runs headless — Agg matplotlib backend, no Qt windows.
+Tests live in `tests/` and use fixtures from `test_data/` (included in dev installs, excluded from the published package). The suite runs headless — Agg matplotlib backend, no Qt windows. Default `pytest` skips `@pytest.mark.slow` tests; `pytest -m slow` runs the heavy session/Qt cases.
 
-App preferences (window geometry, last data directory, plot settings, session notes) persist in `~/.scan-kit/scan-kit.sqlite`.
+App preferences (window geometry, last data directory, plot settings, session notes, theme) persist in `~/.scan-kit/scan-kit.sqlite`.
 
 </details>
 
@@ -400,7 +444,7 @@ git push origin vX.Y.Z
 |---------|-----------|
 | Pull request to `main` or `develop` | Tests only (no executable build) |
 | Push to `main` or `develop`, manual dispatch | Tests, then `-rc` artifacts (`scan-kit-windows-X.Y.Z-rc.exe`, etc.) |
-| `v*` tag push | Tests, build, and GitHub Release with `scan-kit-windows-X.Y.Z.exe` and `scan-kit-linux-amd64-X.Y.Z` |
+| `v*` tag push | Tests, build, and GitHub Release with `scan-kit-windows-X.Y.Z.exe` and `scan-kit-linux-amd64-X.Y.Z.AppImage` |
 
 Day-to-day work merges feature branches into **`develop`** first; `main` tracks released (or release-ready) history. Open a pull request against `develop`, not `main`, unless you are promoting a release.
 
