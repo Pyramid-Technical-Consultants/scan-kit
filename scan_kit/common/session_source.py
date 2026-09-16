@@ -505,7 +505,9 @@ def resolve_session_source(
     """
     spec = str(base_dir)
     if is_remote_location(spec):
-        local = materialize_session(spec, session_id)
+        local = materialize_session(
+            spec, session_id, on_extracting=on_extracting
+        )
         if local is None:
             return None
         return resolve_session_source(

@@ -162,7 +162,7 @@ Plot windows open separately. Close them when you are done — the launcher keep
 
 Paste a folder, Windows UNC share (`\\server\share\...`), or URL such as `sftp://user@host/var/log/ptc_ex` into the path field (placeholder: *Folder, UNC, or sftp://user@host/path*). **Browse…** can pick local and UNC/Network folders; on Linux desktops whose file dialogs speak GVfs/KIO it can pick `sftp://` and `smb://` too. Windows Explorer does not speak SFTP, so those URLs are still pasted. Press **Enter**, click away, or hit **↻** / **File → Refresh Sessions** to rediscover.
 
-SFTP uses SSH keys or the agent; a password in the URL works for that session but is not stored. Opening a remote session copies it into `~/.scan-kit/remote-cache`. The last location is remembered in `~/.scan-kit`. When running a frozen executable with no remembered folder, the default is the folder that contains the executable.
+SFTP uses SSH keys or the agent first. If those fail, Scan Kit prompts for a password and keeps it in memory until the app exits (never sqlite). Opening a remote session copies it into `~/.scan-kit/remote-cache`; **File → Clear Remote Cache…** (and Debug) shows the size and deletes that folder. List/open failures show under the path field and in Debug. The last location is remembered in `~/.scan-kit`. When running a frozen executable with no remembered folder, the default is the folder that contains the executable.
 
 ### 2. Select sessions
 
@@ -376,7 +376,7 @@ A nested layout (`<session_id>/<session_id>/input_map.csv`) is also recognized.
 
 `.zip` · `.tgz` · `.tar.gz` · `.tar.bz2` · `.tar.xz` · `.tar`
 
-Session-list metadata is cached in `~/.scan-kit` so the table can fill without extracting every archive. Opening a view still unpacks (or copies a remote session into `~/.scan-kit/remote-cache`) as needed.
+Session-list metadata is cached in `~/.scan-kit` so the table can fill without extracting every archive. Opening a view still unpacks (or copies a remote session into `~/.scan-kit/remote-cache`, with a progress dialog) as needed.
 
 ---
 
