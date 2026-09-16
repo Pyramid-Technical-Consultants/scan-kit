@@ -6,7 +6,7 @@
 
 <p align="center">
   <strong>Open-source analysis for proton pencil beam scanning sessions.</strong><br>
-  Explore beam quality, dosimetry, magnetics, and delivery logs — from a single desktop launcher.
+  Explore beam quality, dosimetry, magnetics, and delivery logs from a single desktop launcher.
 </p>
 
 <p align="center">
@@ -42,7 +42,7 @@
 
 ## What Scan Kit does
 
-Scan Kit is a desktop toolkit for reviewing PBS treatment and QA sessions. Point it at a folder of session data, select up to five sessions, and launch analysis views — each in its own process so the launcher stays responsive.
+Scan Kit is a desktop toolkit for reviewing PBS treatment and QA sessions. Point it at a folder of session data, select up to five sessions, and launch analysis views, each in its own process so the launcher stays responsive.
 
 Beyond plotting, Scan Kit helps you:
 
@@ -54,7 +54,7 @@ Beyond plotting, Scan Kit helps you:
 | **Plan delivery** | Upload a plan to an RCI, run it, and download the session as a G3 zip |
 | **Config editing** | Browse and edit map2map XML with forms, integrity checks, and auto-tuning |
 
-Scan Kit reads standard DCS session exports — unpacked directories or common archive formats — and works with both G2 and G3 data layouts.
+Scan Kit reads standard DCS session exports (unpacked directories or common archive formats) and works with both G2 and G3 data layouts.
 
 ## Get started
 
@@ -117,13 +117,13 @@ On a dev install, the default data source is the bundled `test_data/` folder.
 <p align="center">
   <img src="docs/images/view-dose-ratios-energy.png" alt="Binned Summary dose ratios vs energy with correlation panels" width="920">
   <br>
-  <sub><em>Binned Summary — dose ratios vs energy, with optional correlation panels for multi-session overlay.</em></sub>
+  <sub><em>Binned Summary: dose ratios vs energy, with optional correlation panels for multi-session overlay.</em></sub>
 </p>
 
 <p align="center">
   <img src="docs/images/view-ic-timeslice-replay.png" alt="Timeslice Replay viewer with signal-source controls and timeline brush" width="920">
   <br>
-  <sub><em>Timeslice Replay — pick a signal source, tick channels, and scrub the timeline brush.</em></sub>
+  <sub><em>Timeslice Replay: pick a signal source, tick channels, and scrub the timeline brush.</em></sub>
 </p>
 
 <p align="center">
@@ -144,34 +144,34 @@ On a dev install, the default data source is the bundled `test_data/` folder.
 
 ## The launcher
 
-Scan Kit opens a single window with five tabs. **View** switches tabs (`Ctrl+1`–`Ctrl+5`) and sets **Theme** (System / Light / Dark). **Analysis** opens the same views as the Data Analysis buttons. **File** opens or refreshes the session folder. **Esc** or **Ctrl+Q** quits.
+Scan Kit opens a single window with five tabs. **View** switches tabs (`Ctrl+1` to `Ctrl+5`) and sets **Theme** (System / Light / Dark). **Analysis** opens the same views as the Data Analysis buttons. **File** opens or refreshes the session folder. **Esc** or **Ctrl+Q** quits.
 
-| Tab | Shortcut | Use it to… |
-|-----|----------|------------|
+| Tab | Shortcut | Use it to |
+|-----|----------|-----------|
 | **Data Analysis** | `Ctrl+1` | Browse sessions, adjust global plot settings, and open analysis views |
 | **Plan Synthesis** | `Ctrl+2` | Create PBS test plans and export `input_map.csv` |
 | **Plan Runner** | `Ctrl+3` | Connect to an RCI, upload a plan, run it, and download the session |
 | **Configuration Tuning** | `Ctrl+4` | Open a facility or session config folder, edit XML, run tuning workflows |
-| **Debug** | `Ctrl+5` | Live launcher and view-process logs — Copy / Clear for support |
+| **Debug** | `Ctrl+5` | Live launcher and view-process logs, with Copy / Clear for support |
 
-Plot windows open separately. Close them when you are done — the launcher keeps running.
+Plot windows open separately. Close them when you are done. The launcher keeps running.
 
 ## Data Analysis
 
 ### 1. Choose your data source
 
-Paste a folder, Windows UNC share (`\\server\share\...`), or URL such as `sftp://user@host/var/log/ptc_ex` into the path field (placeholder: *Folder, UNC, or sftp://user@host/path*). **Browse…** can pick local and UNC/Network folders; on Linux desktops whose file dialogs speak GVfs/KIO it can pick `sftp://` and `smb://` too. Windows Explorer does not speak SFTP, so those URLs are still pasted. Press **Enter**, click away, or hit **↻** / **File → Refresh Sessions** to rediscover.
+Paste a folder, Windows UNC share (`\\server\share\...`), or URL such as `sftp://user@host/var/log/ptc_ex` into the path field (placeholder: *Folder, UNC, or sftp://user@host/path*). **Browse...** can pick local and UNC/Network folders; on Linux desktops whose file dialogs speak GVfs/KIO it can pick `sftp://` and `smb://` too. Windows Explorer does not speak SFTP, so those URLs are still pasted. Press **Enter**, click away, or hit **↻** / **File → Refresh Sessions** to rediscover.
 
-SFTP uses SSH keys or the agent; a password in the URL works for that session but is not stored. Opening a remote session copies it into `~/.scan-kit/remote-cache`. The last location is remembered in `~/.scan-kit`. When running a frozen executable with no remembered folder, the default is the folder that contains the executable.
+SFTP uses SSH keys or the agent first. If those fail, Scan Kit prompts for a password and keeps it in memory until the app exits (never sqlite). Opening a remote session copies it into `~/.scan-kit/remote-cache`; **File → Clear Remote Cache…** (and Debug) shows the size and deletes that folder. List/open failures show under the path field and in Debug. The last location is remembered in `~/.scan-kit`. When running a frozen executable with no remembered folder, the default is the folder that contains the executable.
 
 ### 2. Select sessions
 
 The session table shows **Use**, **Session ID**, **Date**, **MU**, **Time**, **RM**, **Config**, and **Note**. Selected rows get a plot-color swatch so overlays match the views.
 
 - Sort by **Date** (newest first), **ID**, **Config**, or **MU**
-- Tick **Use** on up to **five** sessions — no modifier key needed
+- Tick **Use** on up to **five** sessions; no modifier key needed
 - Click **✕** to clear all selections
-- **Right-click** a session → **Copy Session ID**, **Move to Recycle Bin…** (or **Delete from remote host…**), or **Open in Config Tuning…** when a config folder is available
+- **Right-click** a session → **Copy Session ID**, **Move to Recycle Bin...** (or **Delete from remote host...**), or **Open in Config Tuning...** when a config folder is available
 
 Remote deletes are permanent (no recycle bin on the host). Local sessions go to the OS Recycle Bin / trash and can be restored from there.
 
@@ -188,7 +188,7 @@ Two controls affect most dose-related views:
 | **BG Subtraction** | Off / On |
 | **Calibration** | Off · Per-Session · Constrained |
 
-Settings persist in `~/.scan-kit/scan-kit.sqlite` and propagate to views that are already open. These plot-calibration modes never write `devices.xml` — that is **Dose Calibration** on the Configuration Tuning tab.
+Settings persist in `~/.scan-kit/scan-kit.sqlite` and propagate to views that are already open. These plot-calibration modes never write `devices.xml`. That is **Dose Calibration** on the Configuration Tuning tab.
 
 ### 5. Open analysis views
 
@@ -204,13 +204,13 @@ Configurable Qt shells for the metrics most sessions need day to day.
 
 | View | Summary |
 |------|---------|
-| Binned Summary | Box / violin / mean / scatter / contour summary — pick **Y metric** (dose error, dose ratios, dose rate, current ratios, IC current, position error, sigma, sigma error, IC2−IC1 position, spot time) and **X parameter** (energy, target MU, spot time, beam radius). **Filter Data** includes beam on/off/both plus All Data / Within Lower 95% / Upper 5% Only / MAD Outliers. Optional interlock-threshold overlay on dose-vs-MU plots. |
-| Distribution Explorer | Density contours or scatter — position, position error, sigma, sigma error, IC2−IC1 position, confidence correlations, and Gaussian filter coverage, at spot or timeslice grain. |
-| Timeslice Replay | Interactive multi-channel timeslice viewer — [details](#interactive-replay-views) |
+| Binned Summary | Box / violin / mean / scatter / contour summary. Pick **Y metric** (dose error, dose ratios, dose rate, current ratios, IC current, position error, sigma, sigma error, IC2-IC1 position, spot time) and **X parameter** (energy, target MU, spot time, beam radius). **Filter Data** includes beam on/off/both plus All Data / Within Lower 95% / Upper 5% Only / MAD Outliers. Optional interlock-threshold overlay on dose-vs-MU plots. |
+| Distribution Explorer | Density contours or scatter of position, position error, sigma, sigma error, IC2-IC1 position, confidence correlations, and Gaussian filter coverage, at spot or timeslice grain. |
+| Timeslice Replay | Interactive multi-channel timeslice viewer. See [details](#interactive-replay-views) |
 | FFT Explorer | Frequency-domain line spectra for timeslice IC current, dDose/dt, source beam current, chamber position, sigma, G3 Gaussian peak, magnetic field, and amplifier command/readback. |
 | Audio Explorer | Listen to the same timeslice families, with transport, a live playhead FFT, and **Save WAV** *(needs a working audio device / PortAudio)* |
 | IC Beam Trajectory (3D) | Per-spot IC beam paths in 3D with plan overlay, dipole pivots, and iso/IC planes (visPy) |
-| Session Log Compare | Layer timings, grouped errors, event browser, two-session diff — [details](#session-log-compare) |
+| Session Log Compare | Layer timings, grouped errors, event browser, two-session diff. See [details](#session-log-compare) |
 
 For position scatter, position-error outliers, beam-on/off IC current histograms, and most dose/position/sigma summaries, start with **Binned Summary** or **Distribution Explorer** instead of opening a dedicated legacy plot.
 
@@ -224,12 +224,12 @@ Focused plots that still use standalone matplotlib windows:
 | Dose Accumulation | Expected vs measured cumulative dose per chamber |
 | Beam-Off Ramp-Down | Beam-off current ramp-down curves (IC1/IC2/IC3) |
 | IC HV Transient Test | IC high-voltage toggle transients with capacitance re-derived from waveforms |
-| Amplifier Command Correlations | Settled amplifier command vs readback, field, and IC iso position — [details](#amplifier-command-correlations) |
-| IC Peak Amplitude — Beam-Off (G3) | G3 beam-off peak amplitude distributions |
+| Amplifier Command Correlations | Settled amplifier command vs readback, field, and IC iso position. See [details](#amplifier-command-correlations) |
+| IC Peak Amplitude - Beam-Off (G3) | G3 beam-off peak amplitude distributions |
 
 ### Interactive replay views
 
-**Timeslice Replay** opens a Qt window with an embedded Matplotlib plot and a unified **Signal Source** list (same metric names and isocenter/chamber variants as Binned Summary and Distribution Explorer where applicable). Sources include **IC current**, **dDose/dt**, **sigma**, **sigma error**, **position**, **position error**, **IC2−IC1 position**, and **magnetic field**. Presets jump to common sets; pick channels within the selected source from the checklist below. Detail traces sit above a compressed timeline brush. See the [screenshots](#screenshots) for examples.
+**Timeslice Replay** opens a Qt window with an embedded Matplotlib plot and a unified **Signal Source** list (same metric names and isocenter/chamber variants as Binned Summary and Distribution Explorer where applicable). Sources include **IC current**, **dDose/dt**, **sigma**, **sigma error**, **position**, **position error**, **IC2-IC1 position**, and **magnetic field**. Presets jump to common sets; pick channels within the selected source from the checklist below. Detail traces sit above a compressed timeline brush. See the [screenshots](#screenshots) for examples.
 
 1. Select session(s) and open **Timeslice Replay**.
 2. Choose a signal source from the list (or use a preset), then tick the channels to plot.
@@ -248,17 +248,17 @@ Selecting field channels shows a Bx-vs-By scatter panel (colored by energy) besi
 
 ### Amplifier command correlations
 
-For G2 correcting-coil sessions, this view plots beam-on samples where amplifier commands have reached a settled plateau. Scatter panels relate command to readback, magnetic field, and IC iso position — useful for diagnosing steering-chain consistency end to end.
+For G2 correcting-coil sessions, this view plots beam-on samples where amplifier commands have reached a settled plateau. Scatter panels relate command to readback, magnetic field, and IC iso position, useful for diagnosing steering-chain consistency end to end.
 
 ### Session log compare
 
 Every session ships a verbose `SessionLogFile.log` from DCS. This view distills it:
 
 1. Select **one** session to explore, or **two** to compare.
-2. **Layer timeline** — `START MAP` and `SCAN EXECUTING` durations per layer.
-3. **Issues** — grouped `ERROR` templates and watchdog mismatches.
-4. **Event browser** — filterable log with *Hide noise* to skip ACK/command chatter.
-5. **Message diff** *(two sessions)* — templates whose occurrence counts differ most.
+2. **Layer timeline:** `START MAP` and `SCAN EXECUTING` durations per layer.
+3. **Issues:** grouped `ERROR` templates and watchdog mismatches.
+4. **Event browser:** filterable log with *Hide noise* to skip ACK/command chatter.
+5. **Message diff** *(two sessions):* templates whose occurrence counts differ most.
 
 ## Plan Synthesis
 
@@ -282,7 +282,7 @@ Pick a template, set parameters, preview the spot table, and export. Suggested f
 The **Plan Runner** tab (`Ctrl+3`) is the operator console for an RCI:
 
 1. Enter the RCI IP (or a browser URL such as `http://192.168.100.184/io/`) and **Connect**. The last host is remembered.
-2. **Browse…** to an `input_map.csv` from Plan Synthesis and **Upload to RCI**.
+2. **Browse...** to an `input_map.csv` from Plan Synthesis and **Upload to RCI**.
 3. **Start** / **Pause** / **Stop** / **Reset** follow the controller ready-permit. Start enables when the RCI grants permit.
 4. After the run, **Download** saves a G3-layout session zip under `/root/reports/session/` on the RCI so Data Analysis can open it like any other session.
 
@@ -296,11 +296,11 @@ Live tiles show control point, energy, layer, elapsed time, start permit, and wh
 
 The **Configuration Tuning** tab (`Ctrl+4`) is a structured editor for map2map XML configuration:
 
-- **File tree** — browse `devices.xml` and related config files
-- **Auto-generated forms** — edit XML values without raw markup
-- **Hide unused map2map XML** — collapse attributes the map2map library never reads
-- **Integrity badges** — SHA-256 sidecar verification at a glance
-- **Auto-tuning workflows** — **Sigma Tuning**, **Position Offset Tuning**, **IC Distance Tuning**, and **Dose Calibration** derive updated `devices.xml` values from measured sessions, with preview before apply
+- **File tree:** browse `devices.xml` and related config files
+- **Auto-generated forms:** edit XML values without raw markup
+- **Hide unused map2map XML:** collapse attributes the map2map library never reads
+- **Integrity badges:** SHA-256 sidecar verification at a glance
+- **Auto-tuning workflows:** **Sigma Tuning**, **Position Offset Tuning**, **IC Distance Tuning**, and **Dose Calibration** derive updated `devices.xml` values from measured sessions, with preview before apply
 
 Jump here directly from a session's context menu in Data Analysis when an on-disk config folder exists.
 
@@ -323,7 +323,7 @@ Two workflows correct IC positions, and they are the same model with one paramet
 | **Position Offset Tuning** | `zero_offset_at_iso_mm` | a constant shift, whatever the distance from isocenter |
 | **IC Distance Tuning** | `source_to_device_distance_mm` and `zero_offset_at_iso_mm` | a shift *plus* an error that grows with distance from isocenter |
 
-IC Distance Tuning assumes delivery at isocenter is correct and the chamber is mis-scaled, then fits both together — since `source_to_device_distance_mm` is the only per-chamber scale knob map2map honours. Fitting them jointly matters because an offset fitted against a wrong scale absorbs part of the scale error, so use Position Offset Tuning only when the scale is trusted.
+IC Distance Tuning assumes delivery at isocenter is correct and the chamber is mis-scaled, then fits both together, since `source_to_device_distance_mm` is the only per-chamber scale knob map2map honours. Fitting them jointly matters because an offset fitted against a wrong scale absorbs part of the scale error, so use Position Offset Tuning only when the scale is trusted.
 
 Because it moves a *surveyed* distance, the workflow needs spot data from a plan that actually spans the field, reports each proposed change against its own fit uncertainty, and refuses changes the data cannot support. Per-spot scatter alone will fit a small scale error on any real session, so a change smaller than a few sigma is flagged rather than trusted. Changing the distance also rescales isocenter sigma by the same factor, so re-run Sigma Tuning afterwards.
 
@@ -333,7 +333,7 @@ Read the preview by these columns:
 
 | Column | Means |
 | --- | --- |
-| **Systematic** | position error at the worst field edge that the change removes — the reason to apply it |
+| **Systematic** | position error at the worst field edge that the change removes, which is the reason to apply it |
 | **RMS err** | what the fit minimises, so the honest before/after |
 | **Max \|err\|** | a single worst spot; it can *rise* when correcting a systematic of opposite sign stops masking an outlier |
 
@@ -357,7 +357,7 @@ HCC and strip devices in one IC family keep their relative `K_MU` and all move b
 
 ## Session data layout
 
-Scan Kit discovers sessions from a single data-source folder. That can be a local directory, a UNC share, or an fsspec URL (`sftp://`, `smb://`, `ftp://`, `ssh://`/`scp://` as SFTP aliases, …). Supported layouts:
+Scan Kit discovers sessions from a single data-source folder. That can be a local directory, a UNC share, or an fsspec URL (`sftp://`, `smb://`, `ftp://`, `ssh://`/`scp://` as SFTP aliases, ...). Supported layouts:
 
 **Unpacked directories**
 
@@ -365,18 +365,18 @@ Scan Kit discovers sessions from a single data-source folder. That can be a loca
 <data_source>/
   <session_id>/
     input_map.csv
-    SessionLogFile.log          # optional — session log views
+    SessionLogFile.log          # optional: session log views
     layer-<n>/run-<m>/
       timeslice_data_device_units.csv   # timeslice views
 ```
 
 A nested layout (`<session_id>/<session_id>/input_map.csv`) is also recognized.
 
-**Archive files** — each archive should contain a top-level `<session_id>/` folder:
+**Archive files:** each archive should contain a top-level `<session_id>/` folder:
 
 `.zip` · `.tgz` · `.tar.gz` · `.tar.bz2` · `.tar.xz` · `.tar`
 
-Session-list metadata is cached in `~/.scan-kit` so the table can fill without extracting every archive. Opening a view still unpacks (or copies a remote session into `~/.scan-kit/remote-cache`) as needed.
+Session-list metadata is cached in `~/.scan-kit` so the table can fill without extracting every archive. Opening a view still unpacks (or copies a remote session into `~/.scan-kit/remote-cache`, with a progress dialog) as needed.
 
 ---
 
@@ -407,7 +407,7 @@ pip install -e ".[build,dev]"
 pytest
 ```
 
-Tests live in `tests/` and use fixtures from `test_data/` (included in dev installs, excluded from the published package). The suite runs headless — Agg matplotlib backend, no Qt windows. Default `pytest` skips `@pytest.mark.slow` tests; `pytest -m slow` runs the heavy session/Qt cases.
+Tests live in `tests/` and use fixtures from `test_data/` (included in dev installs, excluded from the published package). The suite runs headless (Agg matplotlib backend, no Qt windows). Default `pytest` skips `@pytest.mark.slow` tests; `pytest -m slow` runs the heavy session/Qt cases.
 
 App preferences (window geometry, last data directory, plot settings, session notes, theme) persist in `~/.scan-kit/scan-kit.sqlite`.
 
@@ -431,7 +431,7 @@ Output: `dist/scan-kit` (Linux) or `dist/scan-kit.exe` (Windows). Local builds k
 
 Releases are automated via [`.github/workflows/build.yml`](.github/workflows/build.yml).
 
-1. Bump `__version__` in `scan_kit/__init__.py` — the single source of truth, also read by `pyproject.toml` and the window title.
+1. Bump `__version__` in `scan_kit/__init__.py`, the single source of truth, also read by `pyproject.toml` and the window title.
 2. Commit: `Release vX.Y.Z`, merge to `develop`, then promote `develop` → `main` (or release directly from `main` once aligned).
 3. Tag and push:
 
@@ -454,4 +454,4 @@ CI verifies the tag matches `__version__` before publishing. The project follows
 
 ## License
 
-[MIT](LICENSE) — Copyright (c) 2026 Pyramid Technical Consultants
+[MIT](LICENSE). Copyright (c) 2026 Pyramid Technical Consultants
