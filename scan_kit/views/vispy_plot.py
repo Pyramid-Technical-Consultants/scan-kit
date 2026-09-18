@@ -55,14 +55,40 @@ def hex_to_rgba(
     return (r, g, b, alpha)
 
 
+def ensure_gl_plus() -> bool:
+    """Select vispy ``gl+`` (PyOpenGL) before any canvas exists.
+
+    Instanced draws need this backend. Returns True when
+    ``glDrawArraysInstanced`` is available afterwards.
+    """
+    try:
+        from vispy import use
+
+        use(gl="gl+")
+        from vispy.gloo import gl
+
+        return hasattr(gl, "glDrawArraysInstanced")
+    except Exception:
+        return False
+
+
 def make_scene_canvas(
     *,
     keys=None,
     bgcolor: str = BG,
     size: tuple[int, int] = (1200, 800),
     show: bool = False,
+    gl: str | None = None,
 ):
-    """SceneCanvas on the PySide6 vispy app (safe to call more than once)."""
+    """SceneCanvas on the PySide6 vispy app (safe to call more than once).
+
+    *gl* is forwarded to ``vispy.use`` before the canvas is created. Instanced
+    draws need ``gl="gl+"``; leave unset for the default GL2 backend.
+    """
+    if gl is not None:
+        from vispy import use
+
+        use(gl=gl)
     from vispy import scene
     from vispy.app import use_app
 

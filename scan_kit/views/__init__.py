@@ -66,6 +66,12 @@ _UNIFIED_VIEWS.extend(
         "and optional plan overlay (visPy).",
     ),
     (
+        "Gaussian Splats (3D)",
+        "gaussian_splat",
+        "Interactive 3D Gaussian splat volume of IC / ISO-ray / plan beam "
+        "fits versus water or air range (visPy).",
+    ),
+    (
         "Session Log Compare",
         "session_log_compare",
         "Session log layer timings, errors, and side-by-side event comparison.",
