@@ -181,6 +181,7 @@ class GaussianSplatWindow(VispyViewWindow):
         self._pending_preset = initial_preset
         self._loaded_grain: str | None = None
         self._refresh_generation = 0
+        self._residual_active = False
         self._updating = False
 
         self._refresh_timer = QTimer(self)
@@ -365,7 +366,7 @@ class GaussianSplatWindow(VispyViewWindow):
             return
         mode = self._agree_combo.currentData()
         self._scene.set_agreement(mode)
-        if self._overlay_plan.isChecked():
+        if self._residual_active:
             self._energy_legend.set_residual(mode)
 
     def _on_controls_changed(self, *_args) -> None:
@@ -459,6 +460,7 @@ class GaussianSplatWindow(VispyViewWindow):
             f"{axis.axis_label}"
         )
         residual = bool(config.overlay_plan and plan_batch is not None and plan_batch.center.size)
+        self._residual_active = residual
         if residual:
             self._energy_legend.set_residual(config.agreement)
         elif measured_batch is not None and measured_batch.energy_mev.size:

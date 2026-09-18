@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+
 import numpy as np
 
 from .gaussian_splat_catalog import AGREE_TRANSPARENT, AGREE_WHITE
@@ -13,6 +15,8 @@ from .gaussian_splat_visual import (
     make_gaussian_splat_node,
 )
 from .vispy_plot import FG
+
+_log = logging.getLogger(__name__)
 
 _COMPOSITE_VERT = """
 attribute vec2 a_position;
@@ -303,6 +307,8 @@ class SplatScene:
         try:
             self._composite_residual()
         except Exception:
+            if not self._residual_broken:
+                _log.exception("Gaussian splat residual composite failed")
             self._residual_broken = True
             self._measured.visible = True
             self._plan.visible = True

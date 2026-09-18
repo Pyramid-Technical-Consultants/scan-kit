@@ -174,6 +174,7 @@ class SessionSplatSource:
     chamber: PositionSigmaFrame | None
     plan: SplatCloud | None
     n_raw: int
+    geom: Map2MapGeometry | None = None
 
 
 def iso_xy_from_ic_ray(
@@ -201,6 +202,22 @@ def default_mm_per_mev(energy: np.ndarray, xy_span: float) -> float:
     if e_span <= 0.0 or not np.isfinite(xy_span) or xy_span <= 0.0:
         return 1.0
     return xy_span / e_span
+
+
+def concat_clouds(clouds: Sequence[SplatCloud]) -> SplatCloud | None:
+    parts = [c for c in clouds if c.x.size]
+    if not parts:
+        return None
+    if len(parts) == 1:
+        return parts[0]
+    return SplatCloud(
+        x=np.concatenate([c.x for c in parts]),
+        y=np.concatenate([c.y for c in parts]),
+        sx=np.concatenate([c.sx for c in parts]),
+        sy=np.concatenate([c.sy for c in parts]),
+        energy=np.concatenate([c.energy for c in parts]),
+        weight=np.concatenate([c.weight for c in parts]),
+    )
 
 
 def apply_splat_cap(cloud: SplatCloud, cap: int) -> SplatCloud:
@@ -491,7 +508,8 @@ def _load_spot_source(session_id: str, base_dir: str) -> SessionSplatSource | No
         return None
     plan = _plan_from_input_map(session_id, base_dir)
     n_raw = int((iso or chamber).energy.size)
-    return SessionSplatSource(session_id, iso, chamber, plan, n_raw)
+    geom = load_session_map2map_geometry(session_id, base_dir)
+    return SessionSplatSource(session_id, iso, chamber, plan, n_raw, geom)
 
 
 def _load_timeslice_source(session_id: str, base_dir: str) -> SessionSplatSource | None:
@@ -585,6 +603,7 @@ def _load_timeslice_source(session_id: str, base_dir: str) -> SessionSplatSource
         chamber,
         _plan_from_input_map(session_id, base_dir),
         n,
+        load_session_map2map_geometry(session_id, base_dir),
     )
 
 
@@ -628,10 +647,25 @@ def _axis_cloud(
     )
 
 
+def _lerp_sigma(near: np.ndarray, far: np.ndarray, t: float) -> np.ndarray:
+    """Interpolate IC2→IC1 sigma; if one side is missing, use the other."""
+    a = np.asarray(near, dtype=float)
+    b = np.asarray(far, dtype=float)
+    out = (1.0 - t) * a + t * b
+    miss = ~np.isfinite(out)
+    if not miss.any():
+        return out
+    out = out.copy()
+    use_a = miss & np.isfinite(a)
+    use_b = miss & np.isfinite(b) & ~use_a
+    out[use_a] = a[use_a]
+    out[use_b] = b[use_b]
+    return out
+
+
 def _iso_ray_cloud(
     frame: PositionSigmaFrame,
-    session_id: str,
-    base_dir: str,
+    geom: Map2MapGeometry | None,
 ) -> SplatCloud:
     off2x, off1x = ic_alignment_offsets(frame.ic2_x, frame.ic1_x)
     off2y, off1y = ic_alignment_offsets(frame.ic2_y, frame.ic1_y)
@@ -647,14 +681,13 @@ def _iso_ray_cloud(
         weight=frame.weight,
         plan_x=frame.plan_x, plan_y=frame.plan_y,
     )
-    geom = load_session_map2map_geometry(session_id, base_dir)
     z_iso = resolve_iso_z_mm(aligned, geom)
     x = iso_xy_from_ic_ray(p2x, p1x, z_iso)
     y = iso_xy_from_ic_ray(p2y, p1y, z_iso)
     t = (z_iso - IC2_Z_MM) / IC_SEP_MM if IC_SEP_MM else 1.0
     scale = iso_sigma_scale(geom, t)
-    sx = ((1.0 - t) * frame.ic2_sx + t * frame.ic1_sx) * scale
-    sy = ((1.0 - t) * frame.ic2_sy + t * frame.ic1_sy) * scale
+    sx = _lerp_sigma(frame.ic2_sx, frame.ic1_sx, t) * scale
+    sy = _lerp_sigma(frame.ic2_sy, frame.ic1_sy, t) * scale
     return SplatCloud(
         x=x, y=y, sx=sx, sy=sy, energy=frame.energy, weight=frame.weight,
     )
@@ -663,14 +696,15 @@ def _iso_ray_cloud(
 def measured_cloud(
     source: SessionSplatSource,
     xy_mode: str,
-    base_dir: str,
+    base_dir: str = "",
 ) -> SplatCloud | None:
     if xy_mode == XY_PLAN:
         return source.plan
     if xy_mode == XY_ISO_RAY:
-        if source.chamber is None:
+        frame = source.chamber if source.chamber is not None else source.iso
+        if frame is None:
             return None
-        return _iso_ray_cloud(source.chamber, source.session_id, base_dir)
+        return _iso_ray_cloud(frame, source.geom)
     frame = source.iso if source.iso is not None else source.chamber
     if frame is None:
         return None
@@ -699,17 +733,24 @@ def build_view_batches(
         n_raw += source.n_raw
         measured = measured_cloud(source, config.xy_mode, base_dir)
         if measured is not None:
-            measured_clouds.append(apply_splat_cap(measured, config.splat_cap))
+            measured_clouds.append(measured)
         if config.overlay_plan and config.xy_mode != XY_PLAN and source.plan is not None:
-            plan_clouds.append(apply_splat_cap(source.plan, config.splat_cap))
+            plan_clouds.append(source.plan)
+    measured_one = concat_clouds(measured_clouds)
+    if measured_one is not None:
+        measured_one = apply_splat_cap(measured_one, config.splat_cap)
+    plan_one = concat_clouds(plan_clouds)
+    if plan_one is not None:
+        plan_one = apply_splat_cap(plan_one, config.splat_cap)
+    measured_clouds = [measured_one] if measured_one is not None else []
+    plan_clouds = [plan_one] if plan_one is not None else []
     clouds = [*measured_clouds, *plan_clouds]
     axis = range_axis_for_medium(config.medium)
     if not clouds:
         return None, None, axis, n_raw, 0
     e_lo, e_hi = 0.0, 1.0
-    if measured_clouds:
-        e_all = np.concatenate([c.energy for c in measured_clouds])
-        finite = e_all[np.isfinite(e_all)]
+    if measured_one is not None:
+        finite = measured_one.energy[np.isfinite(measured_one.energy)]
         if finite.size:
             e_lo = float(np.min(finite))
             e_hi = float(np.max(finite))

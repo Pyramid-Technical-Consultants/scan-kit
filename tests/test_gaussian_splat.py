@@ -23,6 +23,7 @@ from scan_kit.views.gaussian_splat_data import (
     SplatCloud,
     apply_splat_cap,
     cloud_to_batch,
+    concat_clouds,
     default_mm_per_mev,
     energy_rgb,
     iso_xy_from_ic_ray,
@@ -105,6 +106,24 @@ def test_cloud_to_batch_drops_nan_rows() -> None:
     )
     assert batch.center.shape == (2, 3)
     np.testing.assert_allclose(batch.center[:, 0], [1.0, 3.0])
+
+
+def test_concat_clouds_then_cap_is_global() -> None:
+    def _cloud(x0: int, n: int) -> SplatCloud:
+        return SplatCloud(
+            x=np.arange(x0, x0 + n, dtype=float),
+            y=np.zeros(n),
+            sx=np.ones(n),
+            sy=np.ones(n),
+            energy=np.full(n, 70.0),
+            weight=np.ones(n),
+        )
+
+    stacked = concat_clouds([_cloud(0, 6), _cloud(6, 6)])
+    assert stacked is not None
+    assert stacked.x.size == 12
+    capped = apply_splat_cap(stacked, 4)
+    assert capped.x.size <= 4
 
 
 def test_apply_splat_cap_uses_stride() -> None:
@@ -205,6 +224,35 @@ def test_measured_cloud_iso_ray_uses_chamber() -> None:
     # Fallback iso z is IC1, so the ray lands on aligned IC1 (medians removed).
     assert cloud.x.size == 2
     assert np.isfinite(cloud.x).all()
+
+
+def test_measured_cloud_iso_ray_falls_back_to_iso_frame() -> None:
+    source = SessionSplatSource("s", iso=_frame(), chamber=None, plan=None, n_raw=2)
+    cloud = measured_cloud(source, XY_ISO_RAY, "unused")
+    assert cloud is not None
+    assert cloud.x.size == 2
+    assert np.isfinite(cloud.x).all()
+
+
+def test_iso_ray_uses_other_ic_sigma_when_one_is_nan() -> None:
+    iso = _frame()
+    chamber = PositionSigmaFrame(
+        energy=iso.energy,
+        ic1_x=np.array([0.0, 0.0]),
+        ic1_y=np.array([0.0, 0.0]),
+        ic2_x=np.array([0.0, 10.0]),
+        ic2_y=np.array([0.0, 0.0]),
+        ic1_sx=np.array([3.0, 3.0]),
+        ic1_sy=np.array([4.0, 4.0]),
+        ic2_sx=np.array([np.nan, np.nan]),
+        ic2_sy=np.array([np.nan, np.nan]),
+        weight=np.ones(2),
+    )
+    source = SessionSplatSource("s", iso=iso, chamber=chamber, plan=None, n_raw=2)
+    cloud = measured_cloud(source, XY_ISO_RAY, "unused")
+    assert cloud is not None
+    np.testing.assert_allclose(cloud.sx, [3.0, 3.0])
+    np.testing.assert_allclose(cloud.sy, [4.0, 4.0])
 
 
 def test_measured_cloud_plan_mode() -> None:
