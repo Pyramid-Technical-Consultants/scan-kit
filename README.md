@@ -210,6 +210,7 @@ Configurable Qt shells for the metrics most sessions need day to day.
 | FFT Explorer | Frequency-domain line spectra for timeslice IC current, dDose/dt, source beam current, chamber position, sigma, G3 Gaussian peak, magnetic field, and amplifier command/readback. |
 | Audio Explorer | Listen to the same timeslice families, with transport, a live playhead FFT, and **Save WAV** *(needs a working audio device / PortAudio)* |
 | IC Beam Trajectory (3D) | Per-spot IC beam paths in 3D with plan overlay, dipole pivots, and iso/IC planes (visPy) |
+| Gaussian Splats (3D) | Anisotropic Gaussian splats of IC1 / IC2 / ISO-ray / plan beam fits in (X, Y, energy) (visPy) |
 | Session Log Compare | Layer timings, grouped errors, event browser, two-session diff. See [details](#session-log-compare) |
 
 For position scatter, position-error outliers, beam-on/off IC current histograms, and most dose/position/sigma summaries, start with **Binned Summary** or **Distribution Explorer** instead of opening a dedicated legacy plot.

@@ -216,6 +216,7 @@ class VispyViewWindow(SidePanelWindow):
         min_height: int | None = None,
         max_height: int | None = None,
         block_wheel: bool = False,
+        gl: str | None = None,
     ):
         from .vispy_plot import BG, block_canvas_navigation, make_scene_canvas
 
@@ -223,6 +224,7 @@ class VispyViewWindow(SidePanelWindow):
             keys=keys,
             bgcolor=BG if bgcolor is None else bgcolor,
             size=size,
+            gl=gl,
         )
         native = canvas.native
         if min_height is not None:

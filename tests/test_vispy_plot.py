@@ -181,6 +181,28 @@ def test_make_scene_canvas_hooks_canvas_resize() -> None:
     assert callable(handler)
 
 
+def test_make_scene_canvas_requests_gl_plus() -> None:
+    import vispy.scene
+
+    canvas = MagicMock()
+    with (
+        patch.object(vispy.scene, "SceneCanvas", MagicMock(return_value=canvas)),
+        patch("vispy.app.use_app"),
+        patch("vispy.use") as use_gl,
+    ):
+        from scan_kit.views.vispy_plot import make_scene_canvas
+
+        make_scene_canvas(size=(80, 60), gl="gl+")
+    use_gl.assert_called_once_with(gl="gl+")
+
+
+def test_ensure_gl_plus_returns_false_when_backend_missing() -> None:
+    with patch("vispy.use", side_effect=RuntimeError("no OpenGL")):
+        from scan_kit.views.vispy_plot import ensure_gl_plus
+
+        assert ensure_gl_plus() is False
+
+
 def test_line_segments_mesh_makes_quads() -> None:
     from scan_kit.views.vispy_plot import line_segments_mesh
 
