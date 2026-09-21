@@ -26,7 +26,7 @@ from .session_source import (
 from .sessions import discover_sessions
 from .settings import ViewSettings
 
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 3
 _DB_NAME = "scan-kit.sqlite"
 PREF_LAST_DATA_DIR = "session.last_data_dir"
 PREF_APP_SETTINGS = "app.settings"
@@ -131,8 +131,9 @@ def record_session_meta(
             """
             INSERT INTO sessions(
                 library_id, session_id, storage_path, kind, size, mtime_ns,
-                date, primary_mu, treatment_time_s, room_number, config_name, note
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '')
+                date, primary_mu, treatment_time_s, room_number, config_name,
+                map_extent_mm, layer_count, map_geom_checked, note
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, '')
             ON CONFLICT(library_id, session_id) DO UPDATE SET
                 storage_path = excluded.storage_path,
                 kind = excluded.kind,
@@ -142,7 +143,10 @@ def record_session_meta(
                 primary_mu = excluded.primary_mu,
                 treatment_time_s = excluded.treatment_time_s,
                 room_number = excluded.room_number,
-                config_name = excluded.config_name
+                config_name = excluded.config_name,
+                map_extent_mm = excluded.map_extent_mm,
+                layer_count = excluded.layer_count,
+                map_geom_checked = 1
             """,
             (
                 lib_id,
@@ -156,6 +160,8 @@ def record_session_meta(
                 meta.treatment_time_s if meta else None,
                 meta.room_number if meta else None,
                 meta.config_name if meta else None,
+                meta.map_extent_mm if meta else None,
+                meta.layer_count if meta else None,
             ),
         )
         conn.commit()
@@ -372,6 +378,9 @@ def _migrate(conn: sqlite3.Connection) -> None:
                 treatment_time_s INTEGER,
                 room_number INTEGER,
                 config_name TEXT,
+                map_extent_mm REAL,
+                layer_count INTEGER,
+                map_geom_checked INTEGER NOT NULL DEFAULT 0,
                 note TEXT NOT NULL DEFAULT '',
                 UNIQUE(library_id, session_id)
             );
@@ -390,6 +399,15 @@ def _migrate(conn: sqlite3.Connection) -> None:
             ALTER TABLE libraries ADD COLUMN view_settings_rev INTEGER NOT NULL DEFAULT 0;
             """
         )
+    if version < 3:
+        conn.executescript(
+            """
+            ALTER TABLE sessions ADD COLUMN map_extent_mm REAL;
+            ALTER TABLE sessions ADD COLUMN layer_count INTEGER;
+            ALTER TABLE sessions ADD COLUMN map_geom_checked INTEGER NOT NULL DEFAULT 0;
+            """
+        )
+    if version < _SCHEMA_VERSION:
         conn.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
         conn.commit()
 
@@ -515,7 +533,7 @@ def _upsert_discovered(
     existing = conn.execute(
         """
         SELECT size, mtime_ns, date, primary_mu, treatment_time_s, room_number,
-               config_name
+               config_name, map_extent_mm, layer_count, map_geom_checked
         FROM sessions WHERE library_id = ? AND session_id = ?
         """,
         (lib_id, sid),
@@ -526,16 +544,6 @@ def _upsert_discovered(
         and existing["size"] == size
         and existing["mtime_ns"] == mtime_ns
     ):
-        has_meta = any(
-            existing[col] is not None
-            for col in (
-                "date",
-                "primary_mu",
-                "treatment_time_s",
-                "room_number",
-                "config_name",
-            )
-        )
         conn.execute(
             """
             UPDATE sessions SET storage_path = ?, kind = ?
@@ -543,14 +551,17 @@ def _upsert_discovered(
             """,
             (path_str, kind, lib_id, sid),
         )
-        return _meta_from_row(existing) if has_meta else None
+        if existing["map_geom_checked"]:
+            return _meta_from_row(existing)
+        return None
 
     conn.execute(
         """
         INSERT INTO sessions(
             library_id, session_id, storage_path, kind, size, mtime_ns,
-            date, primary_mu, treatment_time_s, room_number, config_name
-        ) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL)
+            date, primary_mu, treatment_time_s, room_number, config_name,
+            map_extent_mm, layer_count, map_geom_checked
+        ) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, NULL, NULL, 0)
         ON CONFLICT(library_id, session_id) DO UPDATE SET
             storage_path = excluded.storage_path,
             kind = excluded.kind,
@@ -560,7 +571,10 @@ def _upsert_discovered(
             primary_mu = NULL,
             treatment_time_s = NULL,
             room_number = NULL,
-            config_name = NULL
+            config_name = NULL,
+            map_extent_mm = NULL,
+            layer_count = NULL,
+            map_geom_checked = 0
         """,
         (lib_id, sid, path_str, kind, size, mtime_ns),
     )
@@ -608,10 +622,13 @@ def _meta_from_row(row: sqlite3.Row) -> SessionMeta:
             date = datetime.fromisoformat(str(raw))
         except ValueError:
             date = None
+    layer_count = row["layer_count"]
     return SessionMeta(
         date=date,
         primary_mu=row["primary_mu"],
         treatment_time_s=row["treatment_time_s"],
         room_number=row["room_number"],
         config_name=row["config_name"],
+        map_extent_mm=row["map_extent_mm"],
+        layer_count=int(layer_count) if layer_count is not None else None,
     )
