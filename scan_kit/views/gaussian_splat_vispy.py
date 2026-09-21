@@ -6,15 +6,23 @@ import logging
 
 import numpy as np
 
-from .gaussian_splat_catalog import AGREE_TRANSPARENT, AGREE_WHITE
+from .gaussian_splat_catalog import (
+    AGREE_TRANSPARENT,
+    AGREE_WHITE,
+    DEFAULT_ERROR_SCALE,
+    DEFAULT_GAIN,
+    ERROR_ABSOLUTE,
+    ERROR_PERCENT,
+)
 from .gaussian_splat_data import DepthAxis, SplatBatch
 from .gaussian_splat_visual import (
     COLD_RGB,
     HOT_RGB,
     auto_amp_scale,
     make_gaussian_splat_node,
+    residual_abs_fbo_scale,
 )
-from .vispy_plot import FG
+from .vispy_plot import FG, bind_blender_view_keys
 
 _log = logging.getLogger(__name__)
 
@@ -30,6 +38,8 @@ void main() {
 _COMPOSITE_FRAG = """
 uniform sampler2D u_tex;
 uniform float u_white;
+uniform float u_percent;
+uniform float u_scale;
 varying vec2 v_uv;
 
 void main() {
@@ -41,15 +51,25 @@ void main() {
         discard;
     }
     float d = meas - plan;
-    float t = abs(d) / tot;
-    vec3 col = d >= 0.0 ? vec3(%f, %f, %f) : vec3(%f, %f, %f);
-    if (u_white > 0.5) {
-        gl_FragColor = vec4(mix(vec3(1.0), col, t), 1.0);
-    } else {
-        if (t < 1e-3) {
+    float mag;
+    if (u_percent > 0.5) {
+        if (meas < 0.08 && plan < 0.08) {
             discard;
         }
-        gl_FragColor = vec4(col, t);
+        mag = abs(d) / max(plan, 0.08);
+    } else {
+        mag = abs(d);
+    }
+    vec3 col = d >= 0.0 ? vec3(%f, %f, %f) : vec3(%f, %f, %f);
+    float lo = u_scale * 0.02 / 0.30;
+    float a = smoothstep(lo, max(u_scale, 1e-6), mag);
+    if (u_white > 0.5) {
+        gl_FragColor = vec4(mix(vec3(1.0), col, a), 1.0);
+    } else {
+        if (a < 1e-3) {
+            discard;
+        }
+        gl_FragColor = vec4(col * a, a);
     }
 }
 """ % (HOT_RGB + COLD_RGB)
@@ -86,6 +106,31 @@ def apply_gantry(points, degrees: float) -> np.ndarray:
     return pts @ gantry_rx_matrix(degrees).T
 
 
+def axis_guide_points(extent, *, depth_sign: int = 1) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Axis start / tip / label positions past the data AABB.
+
+    X and Y point +axis. Z points toward increasing depth (high energy):
+    ``depth_sign=-1`` sends that guide down so it matches ``z = −R``.
+    """
+    lo = np.asarray(extent[0], dtype=np.float64).reshape(3)
+    hi = np.asarray(extent[1], dtype=np.float64).reshape(3)
+    span = np.maximum(hi - lo, 1.0)
+    origin = (lo + hi) / 2.0
+    starts = np.tile(origin, (3, 1))
+    ends = np.tile(origin, (3, 1))
+    labels = np.tile(origin, (3, 1))
+    for i in (0, 1):
+        starts[i, i] = origin[i] - 0.10 * span[i]
+        ends[i, i] = hi[i] + 0.35 * span[i]
+        labels[i, i] = ends[i, i] + 0.22 * span[i]
+    z_dir = 1.0 if depth_sign >= 0 else -1.0
+    z_tip = hi[2] if z_dir > 0 else lo[2]
+    starts[2, 2] = origin[2] - z_dir * 0.10 * span[2]
+    ends[2, 2] = z_tip + z_dir * 0.35 * span[2]
+    labels[2, 2] = ends[2, 2] + z_dir * 0.22 * span[2]
+    return starts, ends, labels
+
+
 class SplatScene:
     """Turntable view: X/Y lateral mm, Z from :class:`DepthAxis`, then gantry Rx."""
 
@@ -100,6 +145,7 @@ class SplatScene:
             center=(0.0, 0.0, 0.0),
             elevation=25,
         )
+        bind_blender_view_keys(canvas, lambda: self._view.camera)
         self._gantry = scene.Node(parent=self._view.scene)
         self._gantry.transform = scene.transforms.MatrixTransform()
         self._nodes: list = []
@@ -109,6 +155,10 @@ class SplatScene:
         self._axis_label = "Energy (MeV)"
         self._residual = False
         self._agreement = AGREE_TRANSPARENT
+        self._gain = DEFAULT_GAIN
+        self._error_mode = ERROR_PERCENT
+        self._error_scale = DEFAULT_ERROR_SCALE
+        self._plan_weights = np.empty((0,), dtype=np.float32)
         self._fbo = None
         self._tex = None
         self._fbo_size = (0, 0)
@@ -140,33 +190,27 @@ class SplatScene:
     def _add_axes(self, axis: DepthAxis, extent: np.ndarray) -> None:
         from vispy import scene
 
-        lo = extent[0]
-        hi = extent[1]
-        span = np.maximum(hi - lo, 1.0)
-        origin = (lo + hi) / 2.0
-        length = span * 0.6
+        starts, ends, label_pos = axis_guide_points(
+            extent, depth_sign=int(getattr(axis, "depth_sign", 1)),
+        )
         colors = (
             (0.85, 0.35, 0.35, 1.0),
             (0.35, 0.75, 0.40, 1.0),
             (0.40, 0.55, 0.95, 1.0),
         )
-        labels = ("X (mm)", "Y (mm)", axis.axis_label)
-        for i, (color, label) in enumerate(zip(colors, labels)):
-            start = origin.copy()
-            end = origin.copy()
-            start[i] -= length[i] * 0.15
-            end[i] += length[i] * 0.5
+        names = ("X (mm)", "Y (mm)", axis.axis_label)
+        for i, (color, name) in enumerate(zip(colors, names)):
             line = scene.visuals.Line(
-                pos=np.vstack([start, end]),
+                pos=np.vstack([starts[i], ends[i]]),
                 color=color,
                 width=2,
                 parent=self._gantry,
             )
             text = scene.Text(
-                label,
+                name,
                 color=color,
                 font_size=10,
-                pos=tuple(end),
+                pos=tuple(label_pos[i]),
                 parent=self._gantry,
             )
             self._nodes.extend((line, text))
@@ -181,6 +225,8 @@ class SplatScene:
         gantry_deg: float = 90.0,
         residual: bool = False,
         agreement: str = AGREE_TRANSPARENT,
+        error_mode: str = ERROR_PERCENT,
+        error_scale: float = DEFAULT_ERROR_SCALE,
         status: str | None = None,
     ) -> None:
         from vispy import scene
@@ -210,6 +256,13 @@ class SplatScene:
         residual = bool(residual) and has_meas and has_plan
         self._residual = residual
         self._agreement = AGREE_WHITE if agreement == AGREE_WHITE else AGREE_TRANSPARENT
+        self._gain = float(gain)
+        self._error_mode = ERROR_PERCENT if error_mode == ERROR_PERCENT else ERROR_ABSOLUTE
+        self._error_scale = float(error_scale)
+        self._plan_weights = (
+            np.asarray(plan.weight, dtype=np.float32).reshape(-1)
+            if residual else np.empty((0,), dtype=np.float32)
+        )
         dummy_rgb = np.ones((1, 3), dtype=np.float32)
         shared_scale = None
         if residual:
@@ -269,7 +322,11 @@ class SplatScene:
         pts = np.vstack(parts)
         lo = pts.min(axis=0)
         hi = pts.max(axis=0)
-        self._add_axes(axis, np.vstack([lo, hi]))
+        extent = np.vstack([lo, hi])
+        self._add_axes(axis, extent)
+        _starts, _ends, label_pts = axis_guide_points(
+            extent, depth_sign=int(getattr(axis, "depth_sign", 1)),
+        )
         corners = np.array(
             [
                 [x, y, z]
@@ -279,7 +336,7 @@ class SplatScene:
             ],
             dtype=np.float64,
         )
-        world = apply_gantry(corners, gantry_deg)
+        world = apply_gantry(np.vstack([corners, label_pts]), gantry_deg)
         wlo = world.min(axis=0)
         whi = world.max(axis=0)
         pad = np.maximum((whi - wlo) * 0.08, 1.0)
@@ -294,6 +351,22 @@ class SplatScene:
     def set_agreement(self, zero: str) -> None:
         self._agreement = AGREE_WHITE if zero == AGREE_WHITE else AGREE_TRANSPARENT
         self._canvas.update()
+
+    def set_gain(self, gain: float) -> None:
+        self._gain = float(gain)
+        self._measured.set_gain(gain)
+        self._plan.set_gain(gain)
+        self._canvas.update()
+
+    def set_error_metric(self, mode: str, scale: float) -> None:
+        self._error_mode = ERROR_PERCENT if mode == ERROR_PERCENT else ERROR_ABSOLUTE
+        self._error_scale = float(scale)
+        self._canvas.update()
+
+    def _composite_u_scale(self) -> float:
+        if self._error_mode == ERROR_PERCENT:
+            return max(self._error_scale, 1e-6)
+        return residual_abs_fbo_scale(self._plan_weights, self._error_scale, self._gain)
 
     def _on_draw_with_residual(self, event) -> None:
         from vispy.scene import SceneCanvas
@@ -370,9 +443,13 @@ class SplatScene:
             self._plan.visible = False
         self._comp["u_tex"] = self._tex
         self._comp["u_white"] = 1.0 if self._agreement == AGREE_WHITE else 0.0
+        self._comp["u_percent"] = 1.0 if self._error_mode == ERROR_PERCENT else 0.0
+        self._comp["u_scale"] = self._composite_u_scale()
+        # Premul overlay: ONE, 1-SRC_ALPHA. SRC_ALPHA + unassociated rgb
+        # painted full-strength color onto the dark scene (no transparency).
         gloo.set_state(
             depth_test=False,
             blend=True,
-            blend_func=("src_alpha", "one_minus_src_alpha"),
+            blend_func=("one", "one_minus_src_alpha"),
         )
         self._comp.draw("triangle_strip")

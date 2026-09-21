@@ -114,6 +114,92 @@ def block_canvas_navigation(canvas) -> None:
     canvas.events.mouse_wheel.connect(_block)
 
 
+# vispy TurntableCamera: azimuth=0, elevation=0 looks along +Y.
+# Blender (Z-up): 1 front (−Y), 3 right (−X), 7 top (−Z), Ctrl for the opposite.
+_BLENDER_NUMPAD_ALIASES = {
+    "End": "1",
+    "PageDown": "3",
+    "Home": "7",
+    "PageUp": "9",
+}
+_BLENDER_TURNTABLE_SNAPS = {
+    ("1", False): (180.0, 0.0),
+    ("1", True): (0.0, 0.0),
+    ("3", False): (90.0, 0.0),
+    ("3", True): (-90.0, 0.0),
+    ("7", False): (0.0, 90.0),
+    ("7", True): (0.0, -90.0),
+}
+
+
+def blender_numpad_action(key: str, *, ctrl: bool = False) -> str:
+    """Map a vispy key name to ``snap:az:el``, ``opposite``, ``ortho``, or ``""``."""
+    digit = _BLENDER_NUMPAD_ALIASES.get(key, key)
+    if digit == "5":
+        return "ortho"
+    if digit == "9":
+        return "opposite"
+    pose = _BLENDER_TURNTABLE_SNAPS.get((digit, bool(ctrl)))
+    if pose is None:
+        return ""
+    return f"snap:{pose[0]:g}:{pose[1]:g}"
+
+
+def apply_blender_view_action(camera, action: str) -> bool:
+    """Apply :func:`blender_numpad_action` to a vispy TurntableCamera."""
+    if not action or camera is None:
+        return False
+    if action == "ortho":
+        fov = float(getattr(camera, "fov", 45.0) or 0.0)
+        if fov <= 0.0:
+            camera.fov = float(getattr(camera, "_persp_fov", 45.0) or 45.0)
+        else:
+            camera._persp_fov = fov
+            camera.fov = 0.0
+        return True
+    if action == "opposite":
+        elev = float(getattr(camera, "elevation", 0.0))
+        if abs(elev) >= 80.0:
+            camera.elevation = -elev
+        else:
+            camera.azimuth = (float(getattr(camera, "azimuth", 0.0)) + 180.0) % 360.0
+        camera.roll = 0.0
+        return True
+    if action.startswith("snap:"):
+        _, az, el = action.split(":")
+        camera.azimuth = float(az)
+        camera.elevation = float(el)
+        camera.roll = 0.0
+        return True
+    return False
+
+
+def bind_blender_view_keys(canvas, get_camera) -> None:
+    """Numpad 1/3/7/9/5 (+ Ctrl) snap a 3D turntable like Blender.
+
+    Click the canvas first so it has focus. Number-row keys work too
+    (Blender's emulate-numpad), and End/PgDn/Home/PgUp cover NumLock off.
+    """
+    native = getattr(canvas, "native", None)
+    if native is not None:
+        from PySide6.QtCore import Qt
+
+        native.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+    def _on_key(event) -> None:
+        key = getattr(event, "key", None)
+        if key is None:
+            return
+        name = getattr(key, "name", str(key))
+        mods = getattr(event, "modifiers", ()) or ()
+        ctrl = any(getattr(m, "name", m) == "Control" for m in mods)
+        if apply_blender_view_action(get_camera(), blender_numpad_action(name, ctrl=ctrl)):
+            event.handled = True
+            canvas.update()
+
+    canvas.events.key_press.connect(_on_key)
+
+
 def _view_pixel_size(view) -> tuple[float, float] | None:
     size = getattr(view, "size", None)
     if size is None:

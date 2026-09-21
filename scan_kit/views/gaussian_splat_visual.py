@@ -4,6 +4,12 @@ from __future__ import annotations
 
 import numpy as np
 
+from .gaussian_splat_catalog import (
+    DEFAULT_ERROR_PCT,
+    ERROR_ABSOLUTE,
+    ERROR_PERCENT,
+)
+
 _VERT = """
 attribute vec2 a_corner;
 attribute vec3 a_center;
@@ -138,29 +144,84 @@ def expand_splat_vertices(centers, sigmas, weights, rgb):
 
 HOT_RGB = (0.90, 0.16, 0.14)
 COLD_RGB = (0.16, 0.40, 0.90)
+# Must match the residual composite shader's smoothstep.
+_RESIDUAL_ALPHA_LO = 0.02
+_RESIDUAL_ALPHA_HI = 0.30
+# Peak-normalized floor so percent-of-plan does not divide by empty tails.
+_PLAN_FLOOR = 0.08
 
 
-def residual_agreement_rgba(meas, plan, *, zero: str = "transparent"):
+def residual_error_mag(meas, plan, *, mode: str = ERROR_ABSOLUTE):
+    """Unsigned residual in display units (fraction of plan, or FBO |Δ|)."""
+    meas = np.asarray(meas, dtype=np.float64)
+    plan = np.asarray(plan, dtype=np.float64)
+    delta = meas - plan
+    if mode == ERROR_PERCENT:
+        return np.abs(delta) / np.maximum(plan, _PLAN_FLOOR)
+    return np.abs(delta)
+
+
+def residual_error_alpha(mag, scale: float = _RESIDUAL_ALPHA_HI):
+    """Hermite smoothstep of error magnitude — same as the composite GLSL."""
+    lo = float(scale) * (_RESIDUAL_ALPHA_LO / _RESIDUAL_ALPHA_HI)
+    hi = max(float(scale), 1e-12)
+    x = np.clip((np.asarray(mag, dtype=np.float64) - lo) / (hi - lo), 0.0, 1.0)
+    return x * x * (3.0 - 2.0 * x)
+
+
+def residual_typical_mu(weights) -> float:
+    w = np.abs(np.asarray(weights, dtype=float).reshape(-1))
+    w = w[np.isfinite(w) & (w > 0.0)]
+    return float(np.median(w)) if w.size else 1.0
+
+
+def residual_abs_fbo_scale(weights, error_scale_mu: float, gain: float) -> float:
+    """FBO |meas−plan| that saturates the color axis at ``error_scale_mu``.
+
+    Auto-amp maps a typical peak to ~1 at gain=1, so the MU scale is
+    ``gain * error_scale_mu / typical_mu``.
+    """
+    typical = residual_typical_mu(weights)
+    return max(float(gain), 1e-6) * float(error_scale_mu) / max(typical, 1e-6)
+
+
+def residual_agreement_rgba(
+    meas,
+    plan,
+    *,
+    zero: str = "transparent",
+    mode: str = ERROR_ABSOLUTE,
+    scale: float | None = None,
+):
     """Colormap accumulated measured (R) vs plan (B) fields.
 
-    ``t = |m−p| / (m+p)`` is 0 where the fields agree and 1 where only one
-    is present. Agreement is transparent or white; empty pixels stay clear.
+    Default alpha follows absolute ``|m−p|``, not ``|m−p|/(m+p)``. Relative
+    error lights up every Gaussian tail (one field only) as a hollow shell.
+    Percent-of-plan ignores faint pairs below :data:`_PLAN_FLOOR`.
+    Agreement is transparent or white; empty pixels stay clear.
     """
     meas = np.asarray(meas, dtype=np.float64)
     plan = np.asarray(plan, dtype=np.float64)
+    if scale is None:
+        scale = (
+            DEFAULT_ERROR_PCT / 100.0 if mode == ERROR_PERCENT
+            else _RESIDUAL_ALPHA_HI
+        )
     tot = meas + plan
     empty = tot <= 1e-6
-    t = np.zeros_like(tot)
-    np.divide(np.abs(meas - plan), tot, out=t, where=~empty)
+    if mode == ERROR_PERCENT:
+        empty = empty | ((meas < _PLAN_FLOOR) & (plan < _PLAN_FLOOR))
+    mag = residual_error_mag(meas, plan, mode=mode)
     rgb = np.empty(meas.shape + (3,), dtype=np.float64)
     hot = meas >= plan
     rgb[hot] = HOT_RGB
     rgb[~hot] = COLD_RGB
+    w = residual_error_alpha(mag, scale)
     if zero == "white":
-        rgb = (1.0 - t[..., None]) + t[..., None] * rgb
+        rgb = (1.0 - w[..., None]) + w[..., None] * rgb
         alpha = np.where(empty, 0.0, 1.0)
     else:
-        alpha = np.where(empty, 0.0, t)
+        alpha = np.where(empty, 0.0, w)
     return np.concatenate([rgb, alpha[..., None]], axis=-1)
 
 

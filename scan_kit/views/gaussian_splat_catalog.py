@@ -20,18 +20,35 @@ DEFAULT_GAIN = 1.0
 DEFAULT_SMEAR_MEV = 0.5
 # 0 means autoscale so the energy span matches the XY span.
 DEFAULT_MM_PER_MEV = 0.0
-# vispy Z is up; 90° about X puts energy along Y (gantry 90 / Y↔Z).
+# vispy +Z is up; range is −R so gantry 0° puts high energy at the bottom.
+# 90° about X then lays that depth along Y.
 DEFAULT_GANTRY_DEG = 90.0
 
 MEDIUM_WATER = "water"
-MEDIUM_AIR = "air"
-MediumKind = Literal["water", "air"]
+MEDIUM_COPPER = "copper"
+MediumKind = Literal["water", "copper"]
 DEFAULT_MEDIUM = MEDIUM_WATER
 
 AGREE_TRANSPARENT = "transparent"
 AGREE_WHITE = "white"
 AgreementKind = Literal["transparent", "white"]
 DEFAULT_AGREEMENT = AGREE_TRANSPARENT
+
+ERROR_PERCENT = "percent"
+ERROR_ABSOLUTE = "absolute"
+ErrorKind = Literal["percent", "absolute"]
+DEFAULT_ERROR_MODE = ERROR_PERCENT
+DEFAULT_ERROR_PCT = 10.0
+DEFAULT_ERROR_MU = 0.2
+# Native units for the default (percent) mode: 10% of plan.
+DEFAULT_ERROR_SCALE = DEFAULT_ERROR_PCT / 100.0
+
+COLOR_ENERGY = "energy"
+COLOR_MU = "mu"
+COLOR_PROTONS = "protons"
+ColorKind = Literal["energy", "mu", "protons"]
+DEFAULT_COLOR = COLOR_ENERGY
+DEFAULT_IC_GAP_MM = 10.0
 
 PLAN_RGB = (1.0, 0.55, 0.15)
 
@@ -76,6 +93,10 @@ class SplatConfig:
     gantry_deg: float = DEFAULT_GANTRY_DEG
     medium: MediumKind = DEFAULT_MEDIUM
     agreement: AgreementKind = DEFAULT_AGREEMENT
+    error_mode: ErrorKind = DEFAULT_ERROR_MODE
+    error_scale: float = DEFAULT_ERROR_SCALE
+    color_mode: ColorKind = DEFAULT_COLOR
+    ic_gap_mm: float = DEFAULT_IC_GAP_MM
 
     @property
     def title(self) -> str:

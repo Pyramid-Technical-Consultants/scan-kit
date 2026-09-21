@@ -10,6 +10,10 @@ import pytest
 from scan_kit.common.ic_trajectory import IC1_Z_MM, IC2_Z_MM, IC_SEP_MM
 from scan_kit.views.gaussian_splat_catalog import (
     AGREE_TRANSPARENT,
+    COLOR_MU,
+    COLOR_PROTONS,
+    ERROR_ABSOLUTE,
+    ERROR_PERCENT,
     SplatConfig,
     XY_IC1,
     XY_IC2,
@@ -21,16 +25,21 @@ from scan_kit.views.gaussian_splat_data import (
     PositionSigmaFrame,
     SessionSplatSource,
     SplatCloud,
+    air_mass_stopping_mev_cm2_g,
     apply_splat_cap,
     cloud_to_batch,
+    color_scalar,
     concat_clouds,
     default_mm_per_mev,
     energy_rgb,
     iso_xy_from_ic_ray,
     measured_cloud,
+    parse_kmu_c_per_mu,
+    protons_from_charge_c,
+    protons_from_mu,
     range_axis_for_medium,
 )
-from scan_kit.views.gaussian_splat_vispy import apply_gantry
+from scan_kit.views.gaussian_splat_vispy import apply_gantry, axis_guide_points
 from scan_kit.views.gaussian_splat_visual import (
     COLD_RGB,
     HOT_RGB,
@@ -38,7 +47,10 @@ from scan_kit.views.gaussian_splat_visual import (
     expand_splat_vertices,
     finite_diff_jacobian,
     project_covariance,
+    residual_abs_fbo_scale,
     residual_agreement_rgba,
+    residual_error_alpha,
+    residual_error_mag,
 )
 
 
@@ -144,16 +156,18 @@ def test_apply_splat_cap_uses_stride() -> None:
 def test_range_axis_deeper_for_higher_energy() -> None:
     water = range_axis_for_medium("water")
     z = water.z_scene_mm(np.array([70.0, 100.0, 230.0]))
-    assert z[0] < z[1] < z[2]
-    np.testing.assert_allclose(z[1], 76.3, atol=1.5)
-    air = range_axis_for_medium("air")
-    z_air = air.z_scene_mm(np.array([100.0]))
-    np.testing.assert_allclose(z_air[0] / z[1], 1.0 / 0.001204, rtol=1e-3)
+    # Beam from +Z (sky): higher energy is more negative (bottom at gantry 0°).
+    assert z[0] > z[1] > z[2]
+    np.testing.assert_allclose(z[1], -76.3, atol=1.5)
+    copper = range_axis_for_medium("copper")
+    z_cu = copper.z_scene_mm(np.array([100.0]))
+    np.testing.assert_allclose(z_cu[0] / z[1], 1.0 / 8.96, rtol=1e-3)
     smear = water.sigma_z_scene_mm(np.array([100.0]), 1.0)
     # dR/dE = p R / E at 100 MeV ≈ 1.77 * 76.3 / 100 mm per MeV.
-    np.testing.assert_allclose(smear[0], 1.77 * z[1] / 100.0, rtol=1e-5)
+    np.testing.assert_allclose(smear[0], 1.77 * abs(z[1]) / 100.0, rtol=1e-5)
+    assert water.depth_sign == -1
     assert "water" in water.axis_label.lower()
-    assert "air" in air.axis_label.lower()
+    assert "copper" in copper.axis_label.lower()
 
 
 def test_default_mm_per_mev_matches_xy_span() -> None:
@@ -304,6 +318,53 @@ def test_residual_agreement_zero_is_transparent_or_white() -> None:
     np.testing.assert_allclose(white[0, :3], 1.0)
     np.testing.assert_allclose(white[0, 3], 1.0)
     np.testing.assert_allclose(white[3, 3], 0.0)
+    # Relative |m−p|/(m+p) is 1 on a faint tail; absolute |m−p| stays dim.
+    tail = residual_agreement_rgba(np.array([0.03]), np.array([0.0]), zero="transparent")
+    assert tail[0, 3] < 0.15
+    core = residual_agreement_rgba(np.array([1.0]), np.array([0.3]), zero="transparent")
+    assert core[0, 3] > 0.5
+    mid = residual_error_alpha(0.15)
+    assert 0.2 < mid < 0.9
+    assert residual_error_alpha(0.0) == 0.0
+    assert residual_error_alpha(1.0) == 1.0
+
+
+def test_residual_error_percent_vs_absolute() -> None:
+    assert SplatConfig().error_mode == ERROR_PERCENT
+    np.testing.assert_allclose(SplatConfig().error_scale, 0.10)
+    np.testing.assert_allclose(
+        residual_error_mag(np.array([1.1]), np.array([1.0]), mode=ERROR_PERCENT),
+        [0.1],
+    )
+    np.testing.assert_allclose(
+        residual_error_mag(np.array([1.1]), np.array([1.0]), mode=ERROR_ABSOLUTE),
+        [0.1],
+    )
+    sat = residual_agreement_rgba(
+        np.array([1.1]), np.array([1.0]),
+        zero="transparent", mode=ERROR_PERCENT, scale=0.10,
+    )
+    assert sat[0, 3] > 0.9
+    faint = residual_agreement_rgba(
+        np.array([1.01]), np.array([1.0]),
+        zero="transparent", mode=ERROR_PERCENT, scale=0.10,
+    )
+    assert faint[0, 3] < 0.3
+    # Faint unmatched tails would be infinite %; hide them (no hollow shell).
+    tail = residual_agreement_rgba(
+        np.array([0.03]), np.array([0.0]),
+        zero="transparent", mode=ERROR_PERCENT, scale=0.10,
+    )
+    assert tail[0, 3] == 0.0
+    np.testing.assert_allclose(
+        residual_abs_fbo_scale(np.array([1.0, 1.0]), 0.2, 1.0), 0.2,
+    )
+    np.testing.assert_allclose(
+        residual_abs_fbo_scale(np.array([0.5]), 0.2, 1.0), 0.4,
+    )
+    np.testing.assert_allclose(
+        residual_abs_fbo_scale(np.array([1.0]), 0.2, 0.5), 0.1,
+    )
 
 
 def test_auto_amp_scale_makes_typical_peak_unity() -> None:
@@ -317,10 +378,55 @@ def test_auto_amp_scale_makes_typical_peak_unity() -> None:
     assert auto_amp_scale(np.array([]), np.empty((0, 3))) == 1.0
 
 
+def test_axis_guides_point_depth_toward_high_energy() -> None:
+    extent = np.array([[-10.0, -20.0, -330.0], [10.0, 20.0, -40.0]])
+    _starts, ends, labels = axis_guide_points(extent, depth_sign=-1)
+    assert ends[2, 2] < -330.0
+    assert labels[2, 2] < ends[2, 2]
+    assert ends[0, 0] > 10.0
+    assert labels[0, 0] > ends[0, 0]
+    _s2, e2, l2 = axis_guide_points(extent, depth_sign=1)
+    assert e2[2, 2] > -40.0
+    assert l2[2, 2] > e2[2, 2]
+
+
 def test_gantry_90_swaps_y_and_energy_axis() -> None:
     pts = np.array([[1.0, 2.0, 3.0]])
     np.testing.assert_allclose(apply_gantry(pts, 0.0), pts, atol=1e-9)
     np.testing.assert_allclose(apply_gantry(pts, 90.0), [[1.0, -3.0, 2.0]], atol=1e-6)
+
+
+def test_protons_from_ideal_air_ic() -> None:
+    s70 = float(np.asarray(air_mass_stopping_mev_cm2_g(70.0)))
+    s230 = float(np.asarray(air_mass_stopping_mev_cm2_g(230.0)))
+    assert 8.5 < s70 < 10.0
+    assert 4.0 < s230 < 4.6
+    n10 = protons_from_charge_c(1e-8, 150.0, 10.0)
+    n20 = protons_from_charge_c(1e-8, 150.0, 20.0)
+    np.testing.assert_allclose(n10, 2.0 * n20, rtol=1e-6)
+    assert protons_from_charge_c(1e-8, 230.0, 10.0) > protons_from_charge_c(
+        1e-8, 70.0, 10.0,
+    )
+    k_mu = 2.0e-8
+    np.testing.assert_allclose(
+        protons_from_mu(1.0, 150.0, 10.0, k_mu),
+        protons_from_charge_c(k_mu, 150.0, 10.0),
+    )
+    cloud = SplatCloud(
+        x=np.array([0.0]), y=np.array([0.0]),
+        sx=np.array([1.0]), sy=np.array([1.0]),
+        energy=np.array([150.0]), weight=np.array([0.5]),
+        k_mu=k_mu,
+    )
+    np.testing.assert_allclose(color_scalar(cloud, SplatConfig(color_mode=COLOR_MU)), [0.5])
+    ten = color_scalar(cloud, SplatConfig(color_mode=COLOR_PROTONS, ic_gap_mm=10.0))
+    five = color_scalar(cloud, SplatConfig(color_mode=COLOR_PROTONS, ic_gap_mm=5.0))
+    np.testing.assert_allclose(five, 2.0 * ten)
+    assert parse_kmu_c_per_mu(
+        '<MapToMap><devices><ion_chamber><device name="IC_1_X"/>'
+        '<gain_conversion in_units="MU" K_MU="2.5e-08"/></ion_chamber></devices></MapToMap>'
+    ) == 2.5e-8
+    assert parse_kmu_c_per_mu("<nope/>") is None
 
 
 def test_energy_rgb_yellow_is_high() -> None:

@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QSlider,
     QSpinBox,
     QVBoxLayout,
     QWidget,
@@ -26,14 +27,25 @@ from .async_refresh import DebouncedBackgroundTask
 from .gaussian_splat_catalog import (
     AGREE_TRANSPARENT,
     AGREE_WHITE,
+    COLOR_ENERGY,
+    COLOR_MU,
+    COLOR_PROTONS,
     DEFAULT_AGREEMENT,
+    DEFAULT_COLOR,
+    DEFAULT_ERROR_MODE,
+    DEFAULT_ERROR_MU,
+    DEFAULT_ERROR_PCT,
+    DEFAULT_ERROR_SCALE,
     DEFAULT_GAIN,
     DEFAULT_GANTRY_DEG,
+    DEFAULT_IC_GAP_MM,
     DEFAULT_SMEAR_MEV,
     DEFAULT_SPLAT_CAP,
+    ERROR_ABSOLUTE,
+    ERROR_PERCENT,
     GRAIN_SPOT,
     GRAIN_TIMESLICE,
-    MEDIUM_AIR,
+    MEDIUM_COPPER,
     MEDIUM_WATER,
     PLAN_RGB,
     PRESET_BY_ID,
@@ -46,6 +58,7 @@ from .gaussian_splat_catalog import (
 )
 from .gaussian_splat_data import (
     build_view_batches,
+    color_legend_spec,
     load_splat_sessions,
     range_axis_for_medium,
 )
@@ -71,12 +84,22 @@ _XY_ITEMS = (
 )
 _MEDIUM_ITEMS = (
     (MEDIUM_WATER, "Water"),
-    (MEDIUM_AIR, "Air"),
+    (MEDIUM_COPPER, "Copper"),
 )
 _AGREE_ITEMS = (
     (AGREE_TRANSPARENT, "Transparent"),
     (AGREE_WHITE, "White"),
 )
+_ERROR_ITEMS = (
+    (ERROR_PERCENT, "Percent of plan"),
+    (ERROR_ABSOLUTE, "Absolute MU"),
+)
+_COLOR_ITEMS = (
+    (COLOR_ENERGY, "Energy"),
+    (COLOR_MU, "Dose (MU)"),
+    (COLOR_PROTONS, "Protons"),
+)
+_GAIN_SLIDER_MAX = 100
 
 
 def _viridis_bar_pixmap(width: int = 16, height: int = 120) -> QPixmap:
@@ -134,23 +157,45 @@ class _ColorLegend(QWidget):
         layout.addWidget(self._bar)
         layout.addLayout(labels, stretch=1)
 
-    def set_energy_range(self, vmin: float | None, vmax: float | None) -> None:
+    def set_scalar_range(
+        self,
+        vmin: float | None,
+        vmax: float | None,
+        *,
+        label: str = "Energy (MeV)\nyellow = high",
+        fmt: str = ".1f",
+    ) -> None:
         self._bar.setPixmap(self._energy_pm)
-        self._mid.setText("Energy (MeV)\nyellow = high")
+        self._mid.setText(label)
         if vmin is None or vmax is None:
             self._hi.setText("—")
             self._lo.setText("—")
             return
-        self._hi.setText(f"{vmax:.1f}  high")
-        self._lo.setText(f"{vmin:.1f}  low")
+        self._hi.setText(format(vmax, fmt))
+        self._lo.setText(format(vmin, fmt))
 
-    def set_residual(self, zero: str = AGREE_TRANSPARENT) -> None:
+    def set_energy_range(self, vmin: float | None, vmax: float | None) -> None:
+        self.set_scalar_range(vmin, vmax)
+
+    def set_residual(
+        self,
+        zero: str = AGREE_TRANSPARENT,
+        mode: str = DEFAULT_ERROR_MODE,
+        scale: float = DEFAULT_ERROR_SCALE,
+    ) -> None:
         key = AGREE_WHITE if zero == AGREE_WHITE else AGREE_TRANSPARENT
         self._bar.setPixmap(self._resid_pm[key])
-        mid = "agree = white" if key == AGREE_WHITE else "agree = transparent"
-        self._mid.setText(f"meas − plan\n{mid}")
-        self._hi.setText("hot  measured > plan")
-        self._lo.setText("cold  plan > measured")
+        agree = "agree = white" if key == AGREE_WHITE else "agree = transparent"
+        if mode == ERROR_PERCENT:
+            pct = max(float(scale), 0.0) * 100.0
+            self._hi.setText(f"+{pct:.0f}%")
+            self._lo.setText(f"−{pct:.0f}%")
+            self._mid.setText(f"meas − plan\n% of plan\n{agree}")
+        else:
+            mu = max(float(scale), 0.0)
+            self._hi.setText(f"+{mu:.2f} MU")
+            self._lo.setText(f"−{mu:.2f} MU")
+            self._mid.setText(f"meas − plan\nabsolute MU\n{agree}")
 
 
 class GaussianSplatWindow(VispyViewWindow):
@@ -204,56 +249,79 @@ class GaussianSplatWindow(VispyViewWindow):
             )
         )
 
-        self._legend_group = QGroupBox("Sessions")
-        self._legend_layout = QVBoxLayout(self._legend_group)
-        layout.addWidget(self._legend_group)
-
-        source_group = QGroupBox("Source")
-        source_layout = QVBoxLayout(source_group)
-        source_layout.addWidget(QLabel("Grain"))
-        self._grain_combo = QComboBox()
-        for value, label in _GRAIN_ITEMS:
-            self._grain_combo.addItem(label, value)
-        self._grain_combo.currentIndexChanged.connect(self._on_grain_changed)
-        source_layout.addWidget(self._grain_combo)
-        source_layout.addWidget(QLabel("XY"))
-        self._xy_combo = QComboBox()
-        for value, label in _XY_ITEMS:
-            self._xy_combo.addItem(label, value)
-        self._xy_combo.currentIndexChanged.connect(self._on_controls_changed)
-        source_layout.addWidget(self._xy_combo)
-        self._overlay_plan = QCheckBox("Difference vs plan (hot / cold)")
-        self._overlay_plan.toggled.connect(self._on_overlay_toggled)
-        source_layout.addWidget(self._overlay_plan)
-        source_layout.addWidget(QLabel("Agreement"))
-        self._agree_combo = QComboBox()
-        for value, label in _AGREE_ITEMS:
-            self._agree_combo.addItem(label, value)
-        self._set_combo(self._agree_combo, DEFAULT_AGREEMENT)
-        self._agree_combo.currentIndexChanged.connect(self._on_agreement_changed)
-        self._agree_combo.setEnabled(False)
-        source_layout.addWidget(self._agree_combo)
-        source_layout.addWidget(QLabel("Depth medium"))
-        self._medium_combo = QComboBox()
-        for value, label in _MEDIUM_ITEMS:
-            self._medium_combo.addItem(label, value)
-        self._medium_combo.currentIndexChanged.connect(self._on_controls_changed)
-        source_layout.addWidget(self._medium_combo)
-        layout.addWidget(source_group)
-
-        display_group = QGroupBox("Display")
-        display_layout = QVBoxLayout(display_group)
+        beam_group = QGroupBox("Beam")
+        beam_layout = QVBoxLayout(beam_group)
+        self._grain_combo = self._add_combo(
+            beam_layout, "Grain", _GRAIN_ITEMS, self._on_grain_changed,
+        )
+        self._xy_combo = self._add_combo(
+            beam_layout, "XY", _XY_ITEMS, self._on_controls_changed,
+        )
+        self._medium_combo = self._add_combo(
+            beam_layout, "Depth medium", _MEDIUM_ITEMS, self._on_controls_changed,
+        )
         self._gantry_spin = self._add_spin(
-            display_layout, "Gantry (deg)", 0.0, 360.0, 5.0, DEFAULT_GANTRY_DEG,
+            beam_layout, "Gantry", 0.0, 360.0, 5.0, DEFAULT_GANTRY_DEG,
             decimals=1,
         )
         self._gantry_spin.setWrapping(True)
         self._gantry_spin.setSuffix(" °")
-        self._gain_spin = self._add_spin(
-            display_layout, "Gain", 0.01, 100.0, 0.1, DEFAULT_GAIN, decimals=2,
+        layout.addWidget(beam_group)
+
+        compare_group = QGroupBox("vs Plan")
+        compare_layout = QVBoxLayout(compare_group)
+        self._overlay_plan = QCheckBox("Show difference (hot / cold)")
+        self._overlay_plan.toggled.connect(self._on_overlay_toggled)
+        compare_layout.addWidget(self._overlay_plan)
+        self._agree_combo = self._add_combo(
+            compare_layout, "Where they agree", _AGREE_ITEMS, self._on_agreement_changed,
         )
+        self._set_combo(self._agree_combo, DEFAULT_AGREEMENT)
+        self._error_combo = self._add_combo(
+            compare_layout, "Error", _ERROR_ITEMS, self._on_error_mode_changed,
+        )
+        self._set_combo(self._error_combo, DEFAULT_ERROR_MODE)
+        compare_layout.addWidget(QLabel("Color range"))
+        self._error_scale_spin = QDoubleSpinBox()
+        self._error_scale_spin.valueChanged.connect(self._on_error_scale_changed)
+        self._configure_error_scale_spin(DEFAULT_ERROR_MODE, DEFAULT_ERROR_SCALE)
+        compare_layout.addWidget(self._error_scale_spin)
+        self._set_compare_enabled(False)
+        layout.addWidget(compare_group)
+
+        display_group = QGroupBox("Display")
+        display_layout = QVBoxLayout(display_group)
+        self._color_combo = self._add_combo(
+            display_layout, "Color", _COLOR_ITEMS, self._on_color_mode_changed,
+        )
+        self._set_combo(self._color_combo, DEFAULT_COLOR)
+        self._gap_spin = self._add_spin(
+            display_layout, "IC gap", 0.1, 100.0, 0.5, DEFAULT_IC_GAP_MM,
+            decimals=1,
+        )
+        self._gap_spin.setSuffix(" mm")
+        self._gap_spin.setEnabled(False)
+        self._energy_legend = _ColorLegend()
+        display_layout.addWidget(self._energy_legend)
+        gain_row = QHBoxLayout()
+        gain_row.setContentsMargins(0, 0, 0, 0)
+        gain_row.addWidget(QLabel("Gain"))
+        self._gain_slider = QSlider(Qt.Orientation.Horizontal)
+        self._gain_slider.setRange(0, _GAIN_SLIDER_MAX)
+        self._gain_slider.setValue(int(round(DEFAULT_GAIN * _GAIN_SLIDER_MAX)))
+        self._gain_slider.setToolTip("Display brightness")
+        self._gain_slider.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._gain_label = QLabel(f"{DEFAULT_GAIN:.2f}")
+        self._gain_label.setMinimumWidth(32)
+        self._gain_label.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+        )
+        self._gain_slider.valueChanged.connect(self._on_gain_changed)
+        gain_row.addWidget(self._gain_slider, stretch=1)
+        gain_row.addWidget(self._gain_label)
+        display_layout.addLayout(gain_row)
         self._smear_spin = self._add_spin(
-            display_layout, "σz smear (MeV)", 0.01, 50.0, 0.1, DEFAULT_SMEAR_MEV,
+            display_layout, "σz smear", 0.01, 50.0, 0.1, DEFAULT_SMEAR_MEV,
             decimals=2,
         )
         display_layout.addWidget(QLabel("Splat cap"))
@@ -263,10 +331,11 @@ class GaussianSplatWindow(VispyViewWindow):
         self._cap_spin.setValue(DEFAULT_SPLAT_CAP)
         self._cap_spin.valueChanged.connect(self._on_controls_changed)
         display_layout.addWidget(self._cap_spin)
-        display_layout.addWidget(QLabel("Color"))
-        self._energy_legend = _ColorLegend()
-        display_layout.addWidget(self._energy_legend)
         layout.addWidget(display_group)
+
+        self._legend_group = QGroupBox("Sessions")
+        self._legend_layout = QVBoxLayout(self._legend_group)
+        layout.addWidget(self._legend_group)
 
         info_group = QGroupBox("Loaded")
         info_layout = QVBoxLayout(info_group)
@@ -279,6 +348,21 @@ class GaussianSplatWindow(VispyViewWindow):
         layout.addWidget(info_group)
         layout.addStretch(1)
         return panel
+
+    def _add_combo(
+        self,
+        layout: QVBoxLayout,
+        label: str,
+        items: tuple[tuple[str, str], ...],
+        handler,
+    ) -> QComboBox:
+        layout.addWidget(QLabel(label))
+        combo = QComboBox()
+        for value, text in items:
+            combo.addItem(text, value)
+        combo.currentIndexChanged.connect(handler)
+        layout.addWidget(combo)
+        return combo
 
     def _add_spin(
         self,
@@ -301,13 +385,45 @@ class GaussianSplatWindow(VispyViewWindow):
         layout.addWidget(spin)
         return spin
 
+    def _gain_value(self) -> float:
+        return self._gain_slider.value() / float(_GAIN_SLIDER_MAX)
+
+    def _error_scale_value(self) -> float:
+        raw = float(self._error_scale_spin.value())
+        if self._error_combo.currentData() == ERROR_PERCENT:
+            return raw / 100.0
+        return raw
+
+    def _configure_error_scale_spin(self, mode: str, scale: float) -> None:
+        if mode == ERROR_PERCENT:
+            self._error_scale_spin.setDecimals(0)
+            self._error_scale_spin.setRange(1.0, 100.0)
+            self._error_scale_spin.setSingleStep(1.0)
+            self._error_scale_spin.setSuffix(" %")
+            self._error_scale_spin.setValue(max(1.0, min(100.0, float(scale) * 100.0)))
+        else:
+            self._error_scale_spin.setDecimals(2)
+            self._error_scale_spin.setRange(0.01, 10.0)
+            self._error_scale_spin.setSingleStep(0.05)
+            self._error_scale_spin.setSuffix(" MU")
+            self._error_scale_spin.setValue(max(0.01, min(10.0, float(scale))))
+
+    def _set_compare_enabled(self, on: bool) -> None:
+        self._agree_combo.setEnabled(on)
+        self._error_combo.setEnabled(on)
+        self._error_scale_spin.setEnabled(on)
+
     def _read_config(self) -> SplatConfig:
         return SplatConfig(
             grain=self._grain_combo.currentData(),
             xy_mode=self._xy_combo.currentData(),
             overlay_plan=self._overlay_plan.isChecked(),
             agreement=self._agree_combo.currentData(),
-            gain=self._gain_spin.value(),
+            error_mode=self._error_combo.currentData(),
+            error_scale=self._error_scale_value(),
+            color_mode=self._color_combo.currentData(),
+            ic_gap_mm=self._gap_spin.value(),
+            gain=self._gain_value(),
             smear_axis_units=self._smear_spin.value(),
             splat_cap=self._cap_spin.value(),
             gantry_deg=self._gantry_spin.value(),
@@ -326,9 +442,16 @@ class GaussianSplatWindow(VispyViewWindow):
             self._set_combo(self._xy_combo, config.xy_mode)
             self._overlay_plan.setChecked(config.overlay_plan)
             self._set_combo(self._agree_combo, config.agreement)
-            self._agree_combo.setEnabled(config.overlay_plan)
+            self._set_combo(self._error_combo, config.error_mode)
+            self._configure_error_scale_spin(config.error_mode, config.error_scale)
+            self._set_compare_enabled(config.overlay_plan)
             self._set_combo(self._medium_combo, config.medium)
-            self._gain_spin.setValue(config.gain)
+            self._set_combo(self._color_combo, config.color_mode)
+            self._gap_spin.setValue(config.ic_gap_mm)
+            self._gap_spin.setEnabled(config.color_mode == COLOR_PROTONS)
+            self._gain_slider.setValue(
+                int(round(max(0.0, min(1.0, config.gain)) * _GAIN_SLIDER_MAX)),
+            )
             self._smear_spin.setValue(config.smear_axis_units)
             self._cap_spin.setValue(config.splat_cap)
             self._gantry_spin.setValue(config.gantry_deg)
@@ -358,16 +481,59 @@ class GaussianSplatWindow(VispyViewWindow):
     def _on_overlay_toggled(self, *_args) -> None:
         if self._updating:
             return
-        self._agree_combo.setEnabled(self._overlay_plan.isChecked())
+        self._set_compare_enabled(self._overlay_plan.isChecked())
         self._schedule_refresh()
 
     def _on_agreement_changed(self, *_args) -> None:
         if self._updating:
             return
-        mode = self._agree_combo.currentData()
-        self._scene.set_agreement(mode)
-        if self._residual_active:
-            self._energy_legend.set_residual(mode)
+        self._scene.set_agreement(self._agree_combo.currentData())
+        self._update_residual_legend()
+
+    def _on_error_mode_changed(self, *_args) -> None:
+        if self._updating:
+            return
+        mode = self._error_combo.currentData()
+        default = DEFAULT_ERROR_PCT / 100.0 if mode == ERROR_PERCENT else DEFAULT_ERROR_MU
+        self._updating = True
+        try:
+            self._configure_error_scale_spin(mode, default)
+        finally:
+            self._updating = False
+        self._apply_error_metric()
+
+    def _on_error_scale_changed(self, *_args) -> None:
+        if self._updating:
+            return
+        self._apply_error_metric()
+
+    def _apply_error_metric(self) -> None:
+        mode = self._error_combo.currentData()
+        scale = self._error_scale_value()
+        self._scene.set_error_metric(mode, scale)
+        self._update_residual_legend()
+
+    def _update_residual_legend(self) -> None:
+        if not self._residual_active:
+            return
+        self._energy_legend.set_residual(
+            self._agree_combo.currentData(),
+            self._error_combo.currentData(),
+            self._error_scale_value(),
+        )
+
+    def _on_color_mode_changed(self, *_args) -> None:
+        if self._updating:
+            return
+        self._gap_spin.setEnabled(self._color_combo.currentData() == COLOR_PROTONS)
+        self._schedule_refresh()
+
+    def _on_gain_changed(self, *_args) -> None:
+        gain = self._gain_value()
+        self._gain_label.setText(f"{gain:.2f}")
+        if self._updating:
+            return
+        self._scene.set_gain(gain)
 
     def _on_controls_changed(self, *_args) -> None:
         if self._updating:
@@ -462,24 +628,23 @@ class GaussianSplatWindow(VispyViewWindow):
         residual = bool(config.overlay_plan and plan_batch is not None and plan_batch.center.size)
         self._residual_active = residual
         if residual:
-            self._energy_legend.set_residual(config.agreement)
-        elif measured_batch is not None and measured_batch.energy_mev.size:
-            e = measured_batch.energy_mev
-            finite = e[np.isfinite(e)]
-            if finite.size:
-                self._energy_legend.set_energy_range(
-                    float(np.min(finite)), float(np.max(finite)),
-                )
-            else:
-                self._energy_legend.set_energy_range(None, None)
+            self._energy_legend.set_residual(
+                config.agreement, config.error_mode, config.error_scale,
+            )
+        elif measured_batch is not None:
+            label, fmt = color_legend_spec(config.color_mode)
+            self._energy_legend.set_scalar_range(
+                measured_batch.color_lo, measured_batch.color_hi, label=label, fmt=fmt,
+            )
         else:
-            self._energy_legend.set_energy_range(None, None)
+            self._energy_legend.set_scalar_range(None, None)
         if gen != self._refresh_generation:
             return
         self._scene.render(
             measured_batch, plan_batch, axis,
             gain=config.gain, gantry_deg=config.gantry_deg,
             residual=residual, agreement=config.agreement,
+            error_mode=config.error_mode, error_scale=config.error_scale,
         )
 
 

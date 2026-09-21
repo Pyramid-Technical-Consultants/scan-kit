@@ -69,7 +69,7 @@ _UNIFIED_VIEWS.extend(
         "Gaussian Splats (3D)",
         "gaussian_splat",
         "Interactive 3D Gaussian splat volume of IC / ISO-ray / plan beam "
-        "fits versus water or air range (visPy).",
+        "fits versus water or copper range (visPy).",
     ),
     (
         "Session Log Compare",

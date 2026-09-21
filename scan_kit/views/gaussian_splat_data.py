@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import xml.etree.ElementTree as ET
+from dataclasses import dataclass, replace
 from typing import Protocol, Sequence
 
 import numpy as np
@@ -42,9 +43,11 @@ from ..common.trajectory_fits import fit_iso_plane, fit_magnet_pivot
 from ..data.reference_frame import timeslice_position_table_hooks
 from ..data.types import REFERENCE_CHAMBER, REFERENCE_ISO
 from .gaussian_splat_catalog import (
+    COLOR_MU,
+    COLOR_PROTONS,
     GRAIN_SPOT,
     GRAIN_TIMESLICE,
-    MEDIUM_AIR,
+    MEDIUM_COPPER,
     MEDIUM_WATER,
     XY_IC1,
     XY_IC2,
@@ -55,13 +58,25 @@ from .gaussian_splat_catalog import (
 
 _FALLBACK_SIGMA_MM = 4.0
 _ABS_INVALID_MM = abs(INVALID_POSITION_MM) * 0.9
+# ponytail: typical PBS IC when devices.xml has no K_MU. Read the session value first.
+_FALLBACK_KMU_C_PER_MU = 2.0e-8
+# Ideal air IC, no recombination (ICRU 90 W, 20 °C dry air).
+_W_AIR_EV = 33.97
+_E_CHARGE_C = 1.602176634e-19
+_RHO_AIR_G_CM3 = 1.205e-3
+# ponytail: power-law fit to PSTAR air at 70 and 230 MeV; ICRU table if counts look off.
+_PSTAR_S70 = 9.20
+_PSTAR_E_REF = 70.0
+_PSTAR_S_EXP = -0.643
 
 
 class DepthAxis(Protocol):
-    """Maps energy (MeV) to scene-mm depth (range in a medium)."""
+    """Maps energy (MeV) to scene-mm depth (range; +Z is up, beam from the sky)."""
 
     axis_label: str
     smear_label: str
+    # +1 if +Z is deeper / higher energy; −1 if depth grows downward (beam from sky).
+    depth_sign: int
 
     def z_scene_mm(self, energy_mev: np.ndarray) -> np.ndarray: ...
 
@@ -70,11 +85,11 @@ class DepthAxis(Protocol):
     ) -> np.ndarray: ...
 
 
-# Bortfeld 1997: R_cm = 0.0022 E^{1.77}. Air uses water range / ρ_air.
-# ponytail: density scale only; I-value CSDA tables if a third medium shows up.
+# Bortfeld 1997: R_cm = 0.0022 E^{1.77}. Copper uses water range / ρ_Cu.
+# ponytail: density scale only; I-value CSDA tables if the range looks off.
 _BORTFELD_P = 1.77
 _BORTFELD_ALPHA_WATER_MM = 0.022
-_RHO_AIR_G_CM3 = 0.001204
+_RHO_COPPER_G_CM3 = 8.96
 
 
 @dataclass(frozen=True)
@@ -85,6 +100,7 @@ class LinearEnergyAxis:
     e_min: float = 0.0
     axis_label: str = "Energy (MeV)"
     smear_label: str = "MeV"
+    depth_sign: int = 1
 
     def z_scene_mm(self, energy_mev: np.ndarray) -> np.ndarray:
         return (np.asarray(energy_mev, dtype=float) - self.e_min) * self.mm_per_mev
@@ -98,17 +114,23 @@ class LinearEnergyAxis:
 
 @dataclass(frozen=True)
 class RangeAxis:
-    """CSDA-like proton range: ``R = α E^p`` (mm, MeV). Higher E → deeper."""
+    """CSDA-like proton range: ``R = α E^p`` (mm, MeV).
+
+    Scene +Z is up. Depth is ``−R`` so higher energy is deeper *and* sits at
+    the bottom of the stack at gantry 0° (beam from the sky). The guide axis
+    points the same way (``depth_sign = −1``).
+    """
 
     medium: str
     alpha_mm: float
     p: float = _BORTFELD_P
-    axis_label: str = "Range in water (mm)"
+    axis_label: str = "Depth in water (mm)"
     smear_label: str = "MeV"
+    depth_sign: int = -1
 
     def z_scene_mm(self, energy_mev: np.ndarray) -> np.ndarray:
         e = np.maximum(np.asarray(energy_mev, dtype=float), 0.0)
-        return self.alpha_mm * np.power(e, self.p)
+        return -(self.alpha_mm * np.power(e, self.p))
 
     def sigma_z_scene_mm(
         self, energy_mev: np.ndarray, smear_axis_units: float,
@@ -119,16 +141,16 @@ class RangeAxis:
 
 
 def range_axis_for_medium(medium: str) -> RangeAxis:
-    if medium == MEDIUM_AIR:
+    if medium == MEDIUM_COPPER:
         return RangeAxis(
-            medium=MEDIUM_AIR,
-            alpha_mm=_BORTFELD_ALPHA_WATER_MM / _RHO_AIR_G_CM3,
-            axis_label="Range in air (mm)",
+            medium=MEDIUM_COPPER,
+            alpha_mm=_BORTFELD_ALPHA_WATER_MM / _RHO_COPPER_G_CM3,
+            axis_label="Depth in copper (mm)",
         )
     return RangeAxis(
         medium=MEDIUM_WATER,
         alpha_mm=_BORTFELD_ALPHA_WATER_MM,
-        axis_label="Range in water (mm)",
+        axis_label="Depth in water (mm)",
     )
 
 
@@ -140,6 +162,7 @@ class SplatCloud:
     sy: np.ndarray
     energy: np.ndarray
     weight: np.ndarray
+    k_mu: float | None = None
 
 
 @dataclass(frozen=True)
@@ -149,6 +172,9 @@ class SplatBatch:
     weight: np.ndarray
     rgb: np.ndarray
     energy_mev: np.ndarray
+    color_lo: float | None = None
+    color_hi: float | None = None
+    color_label: str = "Energy (MeV)"
 
 
 @dataclass(frozen=True)
@@ -175,6 +201,7 @@ class SessionSplatSource:
     plan: SplatCloud | None
     n_raw: int
     geom: Map2MapGeometry | None = None
+    k_mu: float | None = None
 
 
 def iso_xy_from_ic_ray(
@@ -217,6 +244,7 @@ def concat_clouds(clouds: Sequence[SplatCloud]) -> SplatCloud | None:
         sy=np.concatenate([c.sy for c in parts]),
         energy=np.concatenate([c.energy for c in parts]),
         weight=np.concatenate([c.weight for c in parts]),
+        k_mu=parts[0].k_mu if len({c.k_mu for c in parts}) == 1 else None,
     )
 
 
@@ -233,6 +261,7 @@ def apply_splat_cap(cloud: SplatCloud, cap: int) -> SplatCloud:
         sy=cloud.sy[sl],
         energy=cloud.energy[sl],
         weight=cloud.weight[sl],
+        k_mu=cloud.k_mu,
     )
 
 
@@ -269,6 +298,88 @@ def _finite_mask(*arrays: np.ndarray) -> np.ndarray:
     for arr in arrays:
         mask &= np.isfinite(arr)
     return mask
+
+
+def air_mass_stopping_mev_cm2_g(energy_mev) -> np.ndarray:
+    """Proton mass stopping power in dry air (MeV cm²/g)."""
+    e = np.maximum(np.asarray(energy_mev, dtype=float), 1.0)
+    return _PSTAR_S70 * np.power(e / _PSTAR_E_REF, _PSTAR_S_EXP)
+
+
+def protons_from_charge_c(charge_c, energy_mev, gap_mm: float) -> np.ndarray:
+    """Ideal parallel-plate air IC, collection efficiency 1: ``N = Q W / (e S L)``."""
+    gap_cm = max(float(gap_mm), 1e-6) / 10.0
+    de_mev = air_mass_stopping_mev_cm2_g(energy_mev) * _RHO_AIR_G_CM3 * gap_cm
+    w_mev = _W_AIR_EV * 1e-6
+    q_per_proton = (de_mev / w_mev) * _E_CHARGE_C
+    return np.asarray(charge_c, dtype=float) / np.maximum(q_per_proton, 1e-40)
+
+
+def protons_from_mu(mu, energy_mev, gap_mm: float, k_mu_c_per_mu: float | None) -> np.ndarray:
+    k_mu = float(k_mu_c_per_mu) if k_mu_c_per_mu else _FALLBACK_KMU_C_PER_MU
+    return protons_from_charge_c(
+        np.asarray(mu, dtype=float) * k_mu, energy_mev, gap_mm,
+    )
+
+
+def parse_kmu_c_per_mu(devices_xml: str) -> float | None:
+    """First IC1 (else any) ``K_MU`` in C/MU from ``devices.xml`` text."""
+    try:
+        root = ET.fromstring(devices_xml)
+    except ET.ParseError:
+        return None
+    preferred: list[float] = []
+    others: list[float] = []
+    for chamber in root.iter("ion_chamber"):
+        device_el = chamber.find("device")
+        name = (device_el.get("name") or "").strip() if device_el is not None else ""
+        for conv in chamber.iter("gain_conversion"):
+            if (conv.get("in_units") or "").upper() != "MU":
+                continue
+            raw = conv.get("K_MU") or conv.get("k_mu")
+            if raw is None:
+                continue
+            try:
+                val = float(raw)
+            except (TypeError, ValueError):
+                continue
+            if not np.isfinite(val) or val == 0.0:
+                continue
+            (preferred if name.upper().startswith("IC_1") else others).append(val)
+            break
+    if preferred:
+        return float(preferred[0])
+    if others:
+        return float(others[0])
+    return None
+
+
+def session_kmu_c_per_mu(session_id: str, base_dir: str) -> float | None:
+    src = resolve_session_source(session_id, base_dir)
+    if src is None:
+        return None
+    text = load_session_text(src, DEVICES_XML_REL_PATH)
+    if not text:
+        return None
+    return parse_kmu_c_per_mu(text)
+
+
+def color_scalar(cloud: SplatCloud, config: SplatConfig) -> np.ndarray:
+    if config.color_mode == COLOR_MU:
+        return np.asarray(cloud.weight, dtype=float)
+    if config.color_mode == COLOR_PROTONS:
+        return protons_from_mu(
+            cloud.weight, cloud.energy, config.ic_gap_mm, cloud.k_mu,
+        )
+    return np.asarray(cloud.energy, dtype=float)  # COLOR_ENERGY
+
+
+def color_legend_spec(mode: str) -> tuple[str, str]:
+    if mode == COLOR_MU:
+        return "Dose (MU)", ".3g"
+    if mode == COLOR_PROTONS:
+        return "Protons", ".2e"
+    return "Energy (MeV)\nyellow = high", ".1f"
 
 
 def energy_rgb(
@@ -432,7 +543,10 @@ def _plan_from_input_map(session_id: str, base_dir: str) -> SplatCloud | None:
     weight = _as_weight(input_map[w_col] if w_col is not None else None, energy.size)
     devices = load_session_devices_config(session_id, base_dir)
     sx, sy = expected_plan_sigmas(devices, energy)
-    return SplatCloud(x=x, y=y, sx=sx, sy=sy, energy=energy, weight=weight)
+    return SplatCloud(
+        x=x, y=y, sx=sx, sy=sy, energy=energy, weight=weight,
+        k_mu=session_kmu_c_per_mu(session_id, base_dir),
+    )
 
 
 def _sigma_columns(spot_columns) -> dict[str, str]:
@@ -509,7 +623,8 @@ def _load_spot_source(session_id: str, base_dir: str) -> SessionSplatSource | No
     plan = _plan_from_input_map(session_id, base_dir)
     n_raw = int((iso or chamber).energy.size)
     geom = load_session_map2map_geometry(session_id, base_dir)
-    return SessionSplatSource(session_id, iso, chamber, plan, n_raw, geom)
+    k_mu = plan.k_mu if plan is not None else session_kmu_c_per_mu(session_id, base_dir)
+    return SessionSplatSource(session_id, iso, chamber, plan, n_raw, geom, k_mu)
 
 
 def _load_timeslice_source(session_id: str, base_dir: str) -> SessionSplatSource | None:
@@ -597,13 +712,16 @@ def _load_timeslice_source(session_id: str, base_dir: str) -> SessionSplatSource
         chamber = None
     if iso is None and chamber is None:
         return None
+    plan = _plan_from_input_map(session_id, base_dir)
+    k_mu = plan.k_mu if plan is not None else session_kmu_c_per_mu(session_id, base_dir)
     return SessionSplatSource(
         session_id,
         iso,
         chamber,
-        _plan_from_input_map(session_id, base_dir),
+        plan,
         n,
         load_session_map2map_geometry(session_id, base_dir),
+        k_mu,
     )
 
 
@@ -699,20 +817,23 @@ def measured_cloud(
     base_dir: str = "",
 ) -> SplatCloud | None:
     if xy_mode == XY_PLAN:
-        return source.plan
-    if xy_mode == XY_ISO_RAY:
+        cloud = source.plan
+    elif xy_mode == XY_ISO_RAY:
         frame = source.chamber if source.chamber is not None else source.iso
+        cloud = None if frame is None else _iso_ray_cloud(frame, source.geom)
+    else:
+        frame = source.iso if source.iso is not None else source.chamber
         if frame is None:
-            return None
-        return _iso_ray_cloud(frame, source.geom)
-    frame = source.iso if source.iso is not None else source.chamber
-    if frame is None:
-        return None
-    if xy_mode == XY_IC1:
-        return _axis_cloud(frame, "ic1")
-    if xy_mode == XY_IC2:
-        return _axis_cloud(frame, "ic2")
-    return None
+            cloud = None
+        elif xy_mode == XY_IC1:
+            cloud = _axis_cloud(frame, "ic1")
+        elif xy_mode == XY_IC2:
+            cloud = _axis_cloud(frame, "ic2")
+        else:
+            cloud = None
+    if cloud is None or source.k_mu is None or cloud.k_mu == source.k_mu:
+        return cloud
+    return replace(cloud, k_mu=source.k_mu)
 
 
 def build_view_batches(
@@ -748,12 +869,14 @@ def build_view_batches(
     axis = range_axis_for_medium(config.medium)
     if not clouds:
         return None, None, axis, n_raw, 0
-    e_lo, e_hi = 0.0, 1.0
+    color_label, _fmt = color_legend_spec(config.color_mode)
+    c_lo, c_hi = 0.0, 1.0
     if measured_one is not None:
-        finite = measured_one.energy[np.isfinite(measured_one.energy)]
+        scalar = color_scalar(measured_one, config)
+        finite = scalar[np.isfinite(scalar)]
         if finite.size:
-            e_lo = float(np.min(finite))
-            e_hi = float(np.max(finite))
+            c_lo = float(np.min(finite))
+            c_hi = float(np.max(finite))
 
     def _merge(parts: list[SplatCloud], rgb_fn) -> SplatBatch | None:
         batches = [
@@ -769,11 +892,14 @@ def build_view_batches(
             weight=np.concatenate([b.weight for b in batches], axis=0),
             rgb=np.concatenate([b.rgb for b in batches], axis=0),
             energy_mev=np.concatenate([b.energy_mev for b in batches], axis=0),
+            color_lo=c_lo,
+            color_hi=c_hi,
+            color_label=color_label,
         )
 
     measured_batch = _merge(
         measured_clouds,
-        lambda c: energy_rgb(c.energy, vmin=e_lo, vmax=e_hi),
+        lambda c: energy_rgb(color_scalar(c, config), vmin=c_lo, vmax=c_hi),
     )
     plan_batch = _merge(
         plan_clouds,

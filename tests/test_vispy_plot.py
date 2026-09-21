@@ -196,6 +196,41 @@ def test_make_scene_canvas_requests_gl_plus() -> None:
     use_gl.assert_called_once_with(gl="gl+")
 
 
+def test_blender_numpad_snaps_turntable_like_blender() -> None:
+    from scan_kit.views.vispy_plot import (
+        apply_blender_view_action,
+        blender_numpad_action,
+    )
+
+    assert blender_numpad_action("1") == "snap:180:0"
+    assert blender_numpad_action("1", ctrl=True) == "snap:0:0"
+    assert blender_numpad_action("3") == "snap:90:0"
+    assert blender_numpad_action("3", ctrl=True) == "snap:-90:0"
+    assert blender_numpad_action("7") == "snap:0:90"
+    assert blender_numpad_action("Home") == "snap:0:90"
+    assert blender_numpad_action("7", ctrl=True) == "snap:0:-90"
+    assert blender_numpad_action("9") == "opposite"
+    assert blender_numpad_action("5") == "ortho"
+    assert blender_numpad_action("2") == ""
+
+    cam = MagicMock(azimuth=30.0, elevation=25.0, fov=45.0, roll=10.0)
+    assert apply_blender_view_action(cam, "snap:180:0")
+    assert cam.azimuth == 180.0
+    assert cam.elevation == 0.0
+    assert cam.roll == 0.0
+    cam.elevation = 90.0
+    assert apply_blender_view_action(cam, "opposite")
+    assert cam.elevation == -90.0
+    cam.elevation = 20.0
+    cam.azimuth = 10.0
+    assert apply_blender_view_action(cam, "opposite")
+    assert cam.azimuth == 190.0
+    assert apply_blender_view_action(cam, "ortho")
+    assert cam.fov == 0.0
+    assert apply_blender_view_action(cam, "ortho")
+    assert cam.fov == 45.0
+
+
 def test_ensure_gl_plus_returns_false_when_backend_missing() -> None:
     with patch("vispy.use", side_effect=RuntimeError("no OpenGL")):
         from scan_kit.views.vispy_plot import ensure_gl_plus
