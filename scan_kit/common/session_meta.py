@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 
 
@@ -16,6 +16,8 @@ class SessionMeta:
     treatment_time_s: int | None
     room_number: int | None
     config_name: str | None = None
+    map_extent_mm: float | None = None
+    layer_count: int | None = None
 
     @property
     def short_date(self) -> str:
@@ -28,6 +30,18 @@ class SessionMeta:
         if self.primary_mu is None:
             return "?"
         return f"{self.primary_mu:.1f}"
+
+    @property
+    def short_extent(self) -> str:
+        if self.map_extent_mm is None:
+            return "?"
+        return str(int(round(self.map_extent_mm)))
+
+    @property
+    def short_layers(self) -> str:
+        if self.layer_count is None:
+            return "?"
+        return str(self.layer_count)
 
     @property
     def short_time(self) -> str:
@@ -70,6 +84,51 @@ def _parse_labeled_numeric(line: str, label: str) -> float | None:
         return None
 
 
+def _parse_layer_delivery(line: str) -> int | None:
+    """``Layer delivery: 56/76`` → planned 76; a lone number is used as-is."""
+    prefix = "Layer delivery:"
+    if not line.startswith(prefix):
+        return None
+    rest = line[len(prefix) :].strip()
+    if not rest:
+        return None
+    if "/" in rest:
+        rest = rest.split("/", 1)[1].strip()
+    match = _NUMERIC_VALUE_RE.match(rest)
+    if match is None:
+        return None
+    try:
+        return int(float(match.group(1)))
+    except ValueError:
+        return None
+
+
+def merge_session_geom(
+    meta: SessionMeta | None,
+    *,
+    map_extent_mm: float | None = None,
+    layer_count: int | None = None,
+) -> SessionMeta | None:
+    """Fill missing extent/layer fields; do not overwrite values already set."""
+    if map_extent_mm is None and layer_count is None:
+        return meta
+    base = meta or SessionMeta(
+        date=None,
+        primary_mu=None,
+        treatment_time_s=None,
+        room_number=None,
+    )
+    return replace(
+        base,
+        map_extent_mm=(
+            base.map_extent_mm if base.map_extent_mm is not None else map_extent_mm
+        ),
+        layer_count=(
+            base.layer_count if base.layer_count is not None else layer_count
+        ),
+    )
+
+
 def parse_termination_summary_text(text: str) -> SessionMeta:
     """Parse ``termination_summary.txt`` body into :class:`SessionMeta`."""
     date: datetime | None = None
@@ -77,6 +136,9 @@ def parse_termination_summary_text(text: str) -> SessionMeta:
     treatment_s: int | None = None
     room_number: int | None = None
     config_name: str | None = None
+    extent_w: float | None = None
+    extent_h: float | None = None
+    layer_count: int | None = None
 
     for line in text.splitlines():
         line = line.strip()
@@ -100,6 +162,22 @@ def parse_termination_summary_text(text: str) -> SessionMeta:
         elif line.startswith("Configuration name:"):
             name = line.split(":", 1)[1].strip()
             config_name = name or None
+        elif line.startswith("Spot extent width:"):
+            parsed = _parse_labeled_numeric(line, "Spot extent width")
+            if parsed is not None:
+                extent_w = parsed
+        elif line.startswith("Spot extent height:"):
+            parsed = _parse_labeled_numeric(line, "Spot extent height")
+            if parsed is not None:
+                extent_h = parsed
+        elif line.startswith("Layer delivery:"):
+            parsed = _parse_layer_delivery(line)
+            if parsed is not None:
+                layer_count = parsed
+
+    map_extent_mm = None
+    if extent_w is not None or extent_h is not None:
+        map_extent_mm = max(v for v in (extent_w, extent_h) if v is not None)
 
     return SessionMeta(
         date=date,
@@ -107,4 +185,6 @@ def parse_termination_summary_text(text: str) -> SessionMeta:
         treatment_time_s=treatment_s,
         room_number=room_number,
         config_name=config_name,
+        map_extent_mm=map_extent_mm,
+        layer_count=layer_count,
     )

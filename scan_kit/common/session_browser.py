@@ -60,13 +60,23 @@ _COL_USE = 0
 _COL_SESSION_ID = 1
 _COL_DATE = 2
 _COL_MU = 3
-_COL_TIME = 4
-_COL_ROOM = 5
-_COL_CONFIG = 6
-_COL_NOTE = 7
+_COL_EXTENT = 4
+_COL_LAYERS = 5
+_COL_TIME = 6
+_COL_ROOM = 7
+_COL_CONFIG = 8
+_COL_NOTE = 9
 
-_COMPACT_META_COLS = (_COL_MU, _COL_TIME, _COL_ROOM)
-_META_COLS = (_COL_DATE, _COL_MU, _COL_TIME, _COL_ROOM, _COL_CONFIG)
+_COMPACT_META_COLS = (_COL_MU, _COL_EXTENT, _COL_LAYERS, _COL_TIME, _COL_ROOM)
+_META_COLS = (
+    _COL_DATE,
+    _COL_MU,
+    _COL_EXTENT,
+    _COL_LAYERS,
+    _COL_TIME,
+    _COL_ROOM,
+    _COL_CONFIG,
+)
 
 _SWATCH_PX = 14
 _UNCHECKED_SWATCH = QColor("#d0d0d0")
@@ -160,12 +170,14 @@ class _SortableItem(QTableWidgetItem):
             return str(a) < str(b)
 
 
-def _meta_column_texts(meta: SessionMeta | None) -> tuple[str, str, str, str, str]:
+def _meta_column_texts(meta: SessionMeta | None) -> tuple[str, str, str, str, str, str, str]:
     if meta is None:
-        return "—", "—", "—", "?", "—"
+        return "—", "—", "—", "—", "—", "?", "—"
     return (
         meta.short_date,
         meta.short_mu,
+        meta.short_extent,
+        meta.short_layers,
         meta.short_time,
         meta.short_room,
         meta.short_config,
@@ -174,18 +186,38 @@ def _meta_column_texts(meta: SessionMeta | None) -> tuple[str, str, str, str, st
 
 def _meta_sort_values(
     meta: SessionMeta | None,
-) -> tuple[datetime | None, float | None, int | None, int | None, str | None]:
+) -> tuple[
+    datetime | None,
+    float | None,
+    float | None,
+    int | None,
+    int | None,
+    int | None,
+    str | None,
+]:
     if meta is None:
-        return (None, None, None, None, None)
+        return (None, None, None, None, None, None, None)
     config = (meta.config_name or "").strip() or None
-    return (meta.date, meta.primary_mu, meta.treatment_time_s, meta.room_number, config)
+    return (
+        meta.date,
+        meta.primary_mu,
+        meta.map_extent_mm,
+        meta.layer_count,
+        meta.treatment_time_s,
+        meta.room_number,
+        config,
+    )
 
 
 def _compact_meta_column_widths(fm: QFontMetrics) -> dict[int, int]:
-    """Tight fixed widths for MU / Time / RM; global header min size would otherwise clamp them."""
+    """Tight fixed widths for MU / Ext. / Lyr. / Time / RM."""
     pad = 10  # cell padding + sort indicator slack
     return {
         _COL_MU: fm.horizontalAdvance("999.9") + pad,
+        _COL_EXTENT: max(fm.horizontalAdvance("Ext."), fm.horizontalAdvance("999"))
+        + pad,
+        _COL_LAYERS: max(fm.horizontalAdvance("Lyr."), fm.horizontalAdvance("999"))
+        + pad,
         _COL_TIME: fm.horizontalAdvance("99:59") + pad,
         _COL_ROOM: max(fm.horizontalAdvance("RM"), fm.horizontalAdvance("99")) + pad,
     }
@@ -359,9 +391,9 @@ class SessionBrowserWidget(QWidget):
         root.addLayout(data_dir_row)
 
         self._table = QTableWidget()
-        self._table.setColumnCount(8)
+        self._table.setColumnCount(10)
         self._table.setHorizontalHeaderLabels(
-            ["Use", "Session ID", "Date", "MU", "Time", "RM", "Config", "Note"]
+            ["Use", "Session ID", "Date", "MU", "Ext.", "Lyr.", "Time", "RM", "Config", "Note"]
         )
         self._table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self._table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
@@ -929,9 +961,9 @@ class SessionBrowserWidget(QWidget):
         base_dir = self._base_dir
 
         def job() -> tuple[str, str, SessionMeta | None]:
-            from scan_kit.common.session_source import load_termination_summary_cached
+            from scan_kit.common.session_source import load_session_list_meta
 
-            meta = load_termination_summary_cached(sid, path_str)
+            meta = load_session_list_meta(sid, path_str)
             try:
                 record_session_meta(base_dir, sid, path_str, meta)
             except Exception:
@@ -996,7 +1028,22 @@ class SessionBrowserWidget(QWidget):
         align = Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft
         for col, text, sval in zip(_META_COLS, texts, sort_vals):
             item = self._table.item(row, col)
-            tip = full_config if col == _COL_CONFIG and full_config else ""
+            if col == _COL_CONFIG and full_config:
+                tip = full_config
+            elif (
+                col == _COL_EXTENT
+                and meta is not None
+                and meta.map_extent_mm is not None
+            ):
+                tip = f"{meta.map_extent_mm:g} mm"
+            elif (
+                col == _COL_LAYERS
+                and meta is not None
+                and meta.layer_count is not None
+            ):
+                tip = f"{meta.layer_count} layers"
+            else:
+                tip = ""
             if item is None:
                 cell = _SortableItem(text)
                 cell.setFlags(cell.flags() & ~Qt.ItemFlag.ItemIsEditable)
