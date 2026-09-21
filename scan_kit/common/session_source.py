@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import re
 import shutil
@@ -17,8 +18,15 @@ import logging
 
 import pandas as pd
 
-from .session_meta import SessionMeta, parse_termination_summary_text
+from .session_meta import (
+    SessionMeta,
+    merge_session_geom,
+    parse_termination_summary_text,
+)
 from .schema import (
+    C_ENERGY,
+    C_X_POSITION,
+    C_Y_POSITION,
     canonical_column_aliases,
     canonicalize_dataframe_columns,
     resolve_column_name,
@@ -65,6 +73,7 @@ _ARCHIVE_SUFFIXES: tuple[str, ...] = (
     ".zip",
 )
 _DEFAULT_CANONICAL_ALIASES = canonical_column_aliases()
+_MAP_GEOM_USECOLS = [C_ENERGY, C_X_POSITION, C_Y_POSITION]
 
 
 def _resolve_raw_csv_usecols(
@@ -536,20 +545,36 @@ def resolve_session_source(
     return None
 
 
-def load_session_csv(source: SessionSource, csv_name: str) -> pd.DataFrame | None:
+def load_session_csv(
+    source: SessionSource,
+    csv_name: str,
+    *,
+    usecols: list[str] | None = None,
+) -> pd.DataFrame | None:
     """Load ``csv_name`` from the session (paths inside archives use ``session_id/``)."""
     sid = source.session_id
+    raw_usecols = None
+    if usecols is not None:
+        header = read_session_csv_columns(source, csv_name)
+        if header is None:
+            return None
+        raw = _resolve_raw_csv_usecols(header, usecols)
+        if not raw:
+            return pd.DataFrame()
+        raw_usecols = raw
     try:
         if source.kind == "directory":
             p = source.path / csv_name
             if not p.is_file():
                 return None
-            return _read_csv_robust(p)
+            return _read_csv_robust(p, usecols=usecols, raw_usecols=raw_usecols)
 
         if source.kind == "zip":
             with zipfile.ZipFile(source.path, "r") as zf:
                 with zf.open(f"{sid}/{csv_name}") as f:
-                    return _read_csv_robust(f)
+                    return _read_csv_robust(
+                        f, usecols=usecols, raw_usecols=raw_usecols
+                    )
 
         if source.kind == "tar":
             with tarfile.open(source.path, "r:*") as tf:
@@ -561,7 +586,9 @@ def load_session_csv(source: SessionSource, csv_name: str) -> pd.DataFrame | Non
                 raw = tf.extractfile(info)
                 if raw is None:
                     return None
-                return _read_csv_robust(raw)
+                return _read_csv_robust(
+                    raw, usecols=usecols, raw_usecols=raw_usecols
+                )
     except Exception as e:
         _log.debug("Error loading %s from session %s: %s", csv_name, sid, e)
         return None
@@ -1026,13 +1053,66 @@ def load_session_termination_summary(source: SessionSource) -> SessionMeta | Non
     return parse_termination_summary_text(text)
 
 
+def _map_geom_from_frame(df: pd.DataFrame) -> tuple[float | None, int | None]:
+    """``(max X/Y span mm, ENERGY nunique)``; ignore ``layer_id`` (often session id)."""
+    if df is None or df.empty:
+        return None, None
+    extent: float | None = None
+    layers: int | None = None
+    energy_col = resolve_concept_column(df.columns, C_ENERGY)
+    if energy_col is not None:
+        n = int(pd.to_numeric(df[energy_col], errors="coerce").nunique(dropna=True))
+        if n:
+            layers = n
+    spans: list[float] = []
+    for concept in (C_X_POSITION, C_Y_POSITION):
+        col = resolve_concept_column(df.columns, concept)
+        if col is None:
+            continue
+        series = pd.to_numeric(df[col], errors="coerce")
+        if not series.notna().any():
+            continue
+        span = float(series.max() - series.min())
+        if math.isfinite(span):
+            spans.append(span)
+    if spans:
+        extent = max(spans)
+    return extent, layers
+
+
+def _session_geom_incomplete(meta: SessionMeta | None) -> bool:
+    return meta is None or meta.map_extent_mm is None or meta.layer_count is None
+
+
+def load_session_list_meta(
+    session_id: str,
+    storage_path: str | Path,
+) -> SessionMeta | None:
+    """Session-list metadata: term summary first, then input_map, then spot_data."""
+    meta = load_termination_summary_cached(session_id, storage_path)
+    if not _session_geom_incomplete(meta):
+        return meta
+    src = peek_session_source_from_path(storage_path, session_id)
+    if src is None:
+        return meta
+    for csv_name in ("input_map.csv", "spot_data.csv"):
+        if not _session_geom_incomplete(meta):
+            break
+        df = load_session_csv(src, csv_name, usecols=_MAP_GEOM_USECOLS)
+        if df is None:
+            continue
+        extent, layers = _map_geom_from_frame(df)
+        meta = merge_session_geom(meta, map_extent_mm=extent, layer_count=layers)
+    return meta
+
+
 def hydrate_session_metadata(
     snapshot: list[tuple[str, str, SessionMeta | None]],
     base_dir: str | Path,
     *,
     max_workers: int | None = None,
 ) -> list[tuple[str, str, SessionMeta | None]]:
-    """Load ``termination_summary`` metadata for each row in *snapshot* (parallel I/O).
+    """Load session-list metadata for each row in *snapshot* (parallel I/O).
 
     Preserves order. Safe for large trees: uses a thread pool so zip/tar opens overlap.
     """
@@ -1052,7 +1132,7 @@ def hydrate_session_metadata(
             storage = Path(path_str)
             if not storage.is_absolute():
                 storage = Path(base_dir) / path_str
-        meta = load_termination_summary_cached(sid, storage)
+        meta = load_session_list_meta(sid, storage)
         return (sid, path_str, meta)
 
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
