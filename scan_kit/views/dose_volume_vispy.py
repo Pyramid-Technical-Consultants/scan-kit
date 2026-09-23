@@ -9,7 +9,6 @@ import math
 import numpy as np
 
 from .dose_volume_catalog import (
-    AGREE_TRANSPARENT,
     DEFAULT_ERROR_SCALE,
     DEFAULT_GAIN,
     DEFAULT_RAY,
@@ -19,6 +18,7 @@ from .dose_volume_catalog import (
     RAY_MAXIMUM,
     RAY_TRANSPARENT,
     WEIGHT_DOSE,
+    WEIGHT_MU,
     WEIGHT_PROTONS,
     active_scale,
 )
@@ -220,9 +220,10 @@ def make_dose_camera():
                 self._gesture = None
             return super().viewbox_mouse_event(event)
 
+    # No fixed distance: vispy then backs off with the fitted scale, so a deep
+    # volume's near end is not blown past the view by perspective.
     return DoseTurntable(
         fov=45,
-        distance=400,
         center=(0.0, 0.0, 0.0),
         elevation=25,
     )
@@ -459,10 +460,9 @@ class DoseScene:
         gain: float,
         gantry_deg: float = 90.0,
         difference: bool = False,
-        agreement: str = AGREE_TRANSPARENT,
         error_mode: str = ERROR_ABSOLUTE,
         error_scale: float = DEFAULT_ERROR_SCALE,
-        weight_mode: str = "mu",
+        weight_mode: str = WEIGHT_MU,
         ic_gap_mm: float = 10.0,
         smear: float = 0.5,
         ray_mode: str = DEFAULT_RAY,

@@ -259,7 +259,8 @@ void main() {
     ivec3 v = ivec3(gl_GlobalInvocationID);
     if (any(greaterThanEqual(v, u_shape))) return;
     float ref = texelFetch(u_ref, v, 0).r;
-    if (ref < u_cut) {
+    // Empty voxels are never scored, or a 0 % cutoff would pass all the air.
+    if (ref <= 0.0 || ref < u_cut) {
         imageStore(u_img, v, vec4(0.0));
         return;
     }
@@ -763,6 +764,7 @@ class _ComputeLib:
 
 
 _GPU_FILL_FAILED = False
+_GPU_GAMMA_FAILED = False
 
 
 def _lib(canvas) -> _ComputeLib:
@@ -1084,7 +1086,7 @@ def gamma_texture(canvas, ref_tex, evl_tex, out_tex, grid: DoseGrid, criteria: G
     Global normalization to the evaluated maximum (read back once).
     Returns ``(passed, evaluated)``.
     """
-    global _GPU_FILL_FAILED
+    global _GPU_GAMMA_FAILED
     canvas.set_current()
     nx, ny, nz = grid.shape
     evl = read_texture(canvas, evl_tex, (nz, ny, nx))
@@ -1093,11 +1095,11 @@ def gamma_texture(canvas, ref_tex, evl_tex, out_tex, grid: DoseGrid, criteria: G
         out_tex.set_data(np.zeros((nz, ny, nx), dtype=np.float32))
         canvas.context.flush_commands()
         return 0, 0
-    if not _GPU_FILL_FAILED:
+    if not _GPU_GAMMA_FAILED:
         try:
             return _gpu_gamma(canvas, ref_tex, evl_tex, out_tex, (nx, ny, nz), grid.voxel, criteria, norm)
         except Exception as exc:
-            _GPU_FILL_FAILED = True
+            _GPU_GAMMA_FAILED = True
             _log.warning("GPU gamma unavailable (%s); using the Python search", exc)
     ref = read_texture(canvas, ref_tex, (nz, ny, nx))
     vol, passed, evaluated = gamma_index(ref, evl, grid.voxel, criteria)

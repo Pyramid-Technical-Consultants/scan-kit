@@ -22,10 +22,8 @@ MAX_CELLS = 512
 SIGMA_CUT = 4.0
 # A run of this many millimetres at the typical cell peak is optical depth ~1 at gain 1.
 VIEW_DEPTH_MM = 8.0
-DOSE_FLOOR = 0.02
 # Values under this fraction of the color reach fade into the view background.
-HOT_RGB = (0.90, 0.16, 0.14)
-COLD_RGB = (0.16, 0.40, 0.90)
+DOSE_FLOOR = 0.02
 
 _SQRT2 = math.sqrt(2.0)
 
@@ -38,7 +36,7 @@ class DepthKernel(Protocol):
 
 @dataclass(frozen=True)
 class GaussianSmearKernel:
-    """Z mass is the range-axis energy smear. Today's only depth kernel."""
+    """Z mass is a normal at the stopping depth: where protons come to rest, not dose."""
 
     axis: object
     smear: float
@@ -314,26 +312,3 @@ def ink_rgb(bg) -> tuple[float, float, float]:
     """Light text on a dark background, dark text on a light one."""
     r, g, b = (float(c) for c in bg[:3])
     return (0.79, 0.82, 0.85) if 0.2126 * r + 0.7152 * g + 0.0722 * b < 0.5 else (0.13, 0.14, 0.16)
-
-
-def residual_error_alpha(mag, scale: float = 1.0):
-    """Hermite smoothstep from 0 at no error to 1 at ``scale``."""
-    hi = max(float(scale), 1e-12)
-    x = np.clip(np.asarray(mag, dtype=np.float64) / hi, 0.0, 1.0)
-    return x * x * (3.0 - 2.0 * x)
-
-
-def residual_signed_rgba(signed, *, scale: float = 1.0, zero: str = "transparent"):
-    """Hot/cold legend ramp. Agreement is transparent or white."""
-    signed = np.asarray(signed, dtype=np.float64)
-    w = residual_error_alpha(np.abs(signed), scale)
-    hot = signed >= 0.0
-    rgb = np.empty(signed.shape + (3,), dtype=np.float64)
-    rgb[hot] = HOT_RGB
-    rgb[~hot] = COLD_RGB
-    if zero == "white":
-        rgb = (1.0 - w[..., None]) + w[..., None] * rgb
-        alpha = np.ones(signed.shape, dtype=np.float64)
-    else:
-        alpha = w
-    return np.concatenate([rgb, alpha[..., None]], axis=-1)

@@ -48,7 +48,6 @@ from .dose_volume_catalog import (
     GRAIN_TIMESLICE,
     MEDIUM_COPPER,
     MEDIUM_WATER,
-    WEIGHT_PROTONS,
     XY_IC1,
     XY_IC2,
     XY_ISO_RAY,
@@ -153,11 +152,7 @@ class SplatBatch:
     center: np.ndarray
     sigma: np.ndarray
     weight: np.ndarray
-    rgb: np.ndarray
     energy_mev: np.ndarray
-    color_lo: float | None = None
-    color_hi: float | None = None
-    color_label: str = "Dose (MU)"
     dose_mu: np.ndarray | None = None
     k_mu: float | None = None
 
@@ -205,17 +200,6 @@ def iso_xy_from_ic_ray(
     denom = z_ic1 - z_ic2
     t = (float(z_iso) - z_ic2) / denom if denom != 0.0 else 1.0
     return p2 + t * (p1 - p2)
-
-
-def default_mm_per_mev(energy: np.ndarray, xy_span: float) -> float:
-    e = np.asarray(energy, dtype=float)
-    e = e[np.isfinite(e)]
-    if e.size == 0:
-        return 1.0
-    e_span = float(np.ptp(e))
-    if e_span <= 0.0 or not np.isfinite(xy_span) or xy_span <= 0.0:
-        return 1.0
-    return xy_span / e_span
 
 
 def concat_clouds(clouds: Sequence[SplatCloud]) -> SplatCloud | None:
@@ -356,85 +340,21 @@ def session_kmu_c_per_mu(session_id: str, base_dir: str) -> float | None:
     return parse_kmu_c_per_mu(text)
 
 
-def color_scalar(cloud: SplatCloud, config: SplatConfig) -> np.ndarray:
-    """Spot weight deposited into the volume: MU, or protons from that MU."""
-    if config.weight_mode == WEIGHT_PROTONS:
-        return protons_from_mu(
-            cloud.weight, cloud.energy, config.ic_gap_mm, cloud.k_mu,
-        )
-    return np.asarray(cloud.weight, dtype=float)
-
-
-def color_legend_spec(mode: str) -> tuple[str, str]:
-    if mode == WEIGHT_PROTONS:
-        return "Protons", ".2e"
-    return "Dose (MU)", ".3g"
-
-
-def energy_rgb(
-    energy: np.ndarray,
-    *,
-    vmin: float | None = None,
-    vmax: float | None = None,
-) -> np.ndarray:
-    from matplotlib import cm
-
-    e = np.asarray(energy, dtype=float)
-    finite = np.isfinite(e)
-    norm = np.full(e.shape, 0.5, dtype=float)
-    if finite.any():
-        lo = float(np.min(e[finite])) if vmin is None else float(vmin)
-        hi = float(np.max(e[finite])) if vmax is None else float(vmax)
-        if hi > lo:
-            norm[finite] = np.clip((e[finite] - lo) / (hi - lo), 0.0, 1.0)
-    rgba = np.asarray(cm.viridis(norm), dtype=np.float32)
-    rgb = rgba[:, :3].copy()
-    rgb[~finite] = 0.0
-    return rgb
-
-
-def cloud_to_batch(
-    cloud: SplatCloud,
-    axis: DepthAxis,
-    smear_axis_units: float,
-    rgb: np.ndarray,
-) -> SplatBatch:
+def cloud_to_batch(cloud: SplatCloud, axis: DepthAxis, smear_axis_units: float) -> SplatBatch:
     z = axis.z_scene_mm(cloud.energy)
     sz = axis.sigma_z_scene_mm(cloud.energy, smear_axis_units)
     mask = _finite_mask(cloud.x, cloud.y, cloud.sx, cloud.sy, cloud.energy, z, sz)
     center = np.column_stack([cloud.x[mask], cloud.y[mask], z[mask]]).astype(np.float32)
     sigma = np.column_stack([cloud.sx[mask], cloud.sy[mask], sz[mask]]).astype(np.float32)
-    weight = np.asarray(cloud.weight[mask], dtype=np.float32)
-    color = np.asarray(rgb[mask], dtype=np.float32)
     dose = None if cloud.dose is None else np.asarray(cloud.dose[mask], dtype=np.float32)
     return SplatBatch(
         center=center,
         sigma=sigma,
-        weight=weight,
-        rgb=color,
+        weight=np.asarray(cloud.weight[mask], dtype=np.float32),
         energy_mev=np.asarray(cloud.energy[mask], dtype=np.float32),
         dose_mu=dose,
         k_mu=cloud.k_mu,
     )
-
-
-def autoscale_axis(clouds: Sequence[SplatCloud], mm_per_mev: float) -> LinearEnergyAxis:
-    energies = [c.energy for c in clouds if c.energy.size]
-    if not energies:
-        return LinearEnergyAxis(mm_per_mev=1.0)
-    energy = np.concatenate(energies)
-    finite_e = energy[np.isfinite(energy)]
-    e_min = float(np.min(finite_e)) if finite_e.size else 0.0
-    if mm_per_mev > 0.0:
-        return LinearEnergyAxis(mm_per_mev=mm_per_mev, e_min=e_min)
-    xs = np.concatenate([c.x for c in clouds])
-    ys = np.concatenate([c.y for c in clouds])
-    ok = np.isfinite(xs) & np.isfinite(ys)
-    if not ok.any():
-        span = 100.0
-    else:
-        span = float(max(np.ptp(xs[ok]), np.ptp(ys[ok]), 1.0))
-    return LinearEnergyAxis(mm_per_mev=default_mm_per_mev(energy, span), e_min=e_min)
 
 
 def load_session_map2map_geometry(session_id: str, base_dir: str) -> Map2MapGeometry | None:
@@ -884,9 +804,8 @@ def build_view_batches(
     session_ids: Sequence[str],
     config: SplatConfig,
     base_dir: str,
-    *,
-    plan_rgb: tuple[float, float, float],
-) -> tuple[SplatBatch | None, SplatBatch | None, DepthAxis, int, int]:
+) -> tuple[SplatBatch | None, SplatBatch | None, DepthAxis, int]:
+    """Measured and plan spots of *session_ids*, each capped at ``config.splat_cap``, and the raw count."""
     measured_clouds: list[SplatCloud] = []
     plan_clouds: list[SplatCloud] = []
     n_raw = 0
@@ -900,62 +819,13 @@ def build_view_batches(
             measured_clouds.append(measured)
         if config.overlay_plan and config.xy_mode != XY_PLAN and source.plan is not None:
             plan_clouds.append(source.plan)
-    measured_one = concat_clouds(measured_clouds)
-    if measured_one is not None:
-        measured_one = apply_splat_cap(measured_one, config.splat_cap)
-    plan_one = concat_clouds(plan_clouds)
-    if plan_one is not None:
-        plan_one = apply_splat_cap(plan_one, config.splat_cap)
-    measured_clouds = [measured_one] if measured_one is not None else []
-    plan_clouds = [plan_one] if plan_one is not None else []
-    clouds = [*measured_clouds, *plan_clouds]
     axis = range_axis_for_medium(config.medium)
-    if not clouds:
-        return None, None, axis, n_raw, 0
-    color_label, _fmt = color_legend_spec(config.weight_mode)
-    c_lo, c_hi = 0.0, 1.0
-    if measured_one is not None:
-        scalar = color_scalar(measured_one, config)
-        finite = scalar[np.isfinite(scalar)]
-        if finite.size:
-            c_lo = float(np.min(finite))
-            c_hi = float(np.max(finite))
 
-    def _merge(parts: list[SplatCloud], rgb_fn) -> SplatBatch | None:
-        batches = [
-            cloud_to_batch(cloud, axis, config.smear_axis_units, rgb_fn(cloud))
-            for cloud in parts
-        ]
-        batches = [b for b in batches if b.center.size]
-        if not batches:
+    def batch(clouds: list[SplatCloud]) -> SplatBatch | None:
+        cloud = concat_clouds(clouds)
+        if cloud is None:
             return None
-        return SplatBatch(
-            center=np.concatenate([b.center for b in batches], axis=0),
-            sigma=np.concatenate([b.sigma for b in batches], axis=0),
-            weight=np.concatenate([b.weight for b in batches], axis=0),
-            rgb=np.concatenate([b.rgb for b in batches], axis=0),
-            energy_mev=np.concatenate([b.energy_mev for b in batches], axis=0),
-        color_lo=c_lo,
-        color_hi=c_hi,
-        color_label=color_label,
-        dose_mu=(
-            np.concatenate([b.dose_mu for b in batches], axis=0)
-            if all(b.dose_mu is not None for b in batches) else None
-        ),
-        k_mu=batches[0].k_mu if len({b.k_mu for b in batches}) == 1 else None,
-    )
+        out = cloud_to_batch(apply_splat_cap(cloud, config.splat_cap), axis, config.smear_axis_units)
+        return out if out.center.size else None
 
-    measured_batch = _merge(
-        measured_clouds,
-        lambda c: energy_rgb(color_scalar(c, config), vmin=c_lo, vmax=c_hi),
-    )
-    plan_batch = _merge(
-        plan_clouds,
-        lambda c: np.tile(np.asarray(plan_rgb, dtype=np.float32), (c.x.size, 1)),
-    )
-    n_used = 0
-    if measured_batch is not None:
-        n_used += int(measured_batch.center.shape[0])
-    if plan_batch is not None:
-        n_used += int(plan_batch.center.shape[0])
-    return measured_batch, plan_batch, axis, n_raw, n_used
+    return batch(measured_clouds), batch(plan_clouds), axis, n_raw

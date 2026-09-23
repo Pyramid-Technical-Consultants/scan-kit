@@ -19,8 +19,6 @@ DEFAULT_SPOT_CAP = 1_000_000
 DEFAULT_GAIN = 1.0
 # Beam energy spread σE in % of E; range straggling is added on top.
 DEFAULT_ENERGY_SPREAD_PCT = 1.0
-# 0 means autoscale so the energy span matches the XY span.
-DEFAULT_MM_PER_MEV = 0.0
 # vispy +Z is up; range is −R so gantry 0° puts high energy at the bottom.
 # 90° about X then lays that depth along Y.
 DEFAULT_GANTRY_DEG = 90.0
@@ -36,11 +34,6 @@ DEFAULT_PHANTOM_MM = 0.0
 DEFAULT_AUTO_MARGIN_SIGMA = 5.0
 # Water-equivalent material between nozzle and phantom surface (tank wall, buildup, range shifter).
 DEFAULT_ENTRANCE_WET_MM = 0.0
-
-AGREE_TRANSPARENT = "transparent"
-AGREE_WHITE = "white"
-AgreementKind = Literal["transparent", "white"]
-DEFAULT_AGREEMENT = AGREE_TRANSPARENT
 
 ERROR_PERCENT = "percent"
 ERROR_ABSOLUTE = "absolute"
@@ -163,14 +156,12 @@ class DoseVolumeConfig:
     overlay_plan: bool = False
     gain: float = DEFAULT_GAIN
     smear_axis_units: float = DEFAULT_ENERGY_SPREAD_PCT
-    mm_per_mev: float = DEFAULT_MM_PER_MEV
     splat_cap: int = DEFAULT_SPOT_CAP
     gantry_deg: float = DEFAULT_GANTRY_DEG
     medium: MediumKind = DEFAULT_MEDIUM
     phantom_mm: float = DEFAULT_PHANTOM_MM
     auto_margin_sigma: float = DEFAULT_AUTO_MARGIN_SIGMA
     entrance_wet_mm: float = DEFAULT_ENTRANCE_WET_MM
-    agreement: AgreementKind = DEFAULT_AGREEMENT
     error_mode: ErrorKind = DEFAULT_ERROR_MODE
     error_scale: float = DEFAULT_ERROR_SCALE
     weight_mode: WeightKind = DEFAULT_WEIGHT

@@ -1054,6 +1054,8 @@ class DoseVolumeWindow(VispyViewWindow):
         if self._updating:
             return
         self._gap_spin.setEnabled(self._weight_combo.currentData() != WEIGHT_MU)
+        # New units: an absolute window typed for the old ones means nothing now.
+        self._abs_edited = False
         if self._error_combo.currentData() == ERROR_ABSOLUTE:
             self._updating = True
             try:
@@ -1066,6 +1068,7 @@ class DoseVolumeWindow(VispyViewWindow):
         if self._updating:
             return
         self._scene.set_ray(self._ray_combo.currentData())
+        self._abs_edited = False
         if self._error_combo.currentData() == ERROR_ABSOLUTE:
             self._updating = True
             try:
@@ -1180,7 +1183,7 @@ class DoseVolumeWindow(VispyViewWindow):
 
     def _show_gamma_verdict(self) -> None:
         if not self._scene.gamma:
-            self._gamma_label.setText("Needs a plan to compare against" if self._gamma_mode() else "—")
+            self._gamma_label.setText(self._no_plan_reason() if self._gamma_mode() else "—")
             self._gamma_label.setStyleSheet("")
             return
         tally = self._scene.gamma_pass
@@ -1262,12 +1265,11 @@ class DoseVolumeWindow(VispyViewWindow):
             return
         self.setWindowTitle(config.title)
         self._update_session_list([sid for sid in self._session_ids if sid in self._sources])
-        measured_batch, plan_batch, axis, n_raw, n_used = build_view_batches(
+        measured_batch, plan_batch, axis, n_raw = build_view_batches(
             self._sources,
             [self._active_session] if self._active_session else [],
             config,
             self._base_dir,
-            plan_rgb=(1.0, 1.0, 1.0),
         )
 
         self._smear_spin.setSuffix(f" {axis.smear_label}")
@@ -1289,7 +1291,7 @@ class DoseVolumeWindow(VispyViewWindow):
         self._scene.render(
             measured_batch, plan_batch, axis,
             gain=config.gain, gantry_deg=config.gantry_deg,
-            difference=residual, agreement=config.agreement,
+            difference=residual,
             error_mode=config.error_mode, error_scale=config.error_scale,
             weight_mode=config.weight_mode, ic_gap_mm=config.ic_gap_mm,
             smear=config.smear_axis_units, ray_mode=config.ray_mode,
@@ -1302,18 +1304,27 @@ class DoseVolumeWindow(VispyViewWindow):
         self._maybe_seed_absolute_window()
         self._update_legend()
         self._show_gamma_verdict()
-        info = (
-            f"{n_used:,} spots\n"
-            f"{n_raw:,} raw samples\n"
-            f"{axis.axis_label}"
-        )
+        n_meas = 0 if measured_batch is None else int(measured_batch.center.shape[0])
+        spots = f"{n_meas:,} spots"
+        if residual:
+            spots += f", plan {int(plan_batch.center.shape[0]):,}"
+        info = f"{spots}\n{n_raw:,} raw samples\n{axis.axis_label}"
         if self._scene.volume_note:
             info += f"\n{self._scene.volume_note}"
         if config.overlay_plan and not residual:
-            info += "\nNo plan to compare against; showing measured"
-        elif config.overlay_plan and plan_batch is not None and not has_dose:
-            info += "\nMeasured volume uses plan MU (no spot dose)"
+            info += f"\n{self._no_plan_reason()}; showing measured"
+        if measured_batch is not None and not has_dose:
+            info += (
+                "\nTimeslices carry no MU: each counts as 1, so values are relative"
+                if config.grain == GRAIN_TIMESLICE
+                else "\nNo delivered spot MU: measured uses plan MU"
+            )
         self._info_label.setText(info)
+
+    def _no_plan_reason(self) -> str:
+        if self._xy_combo.currentData() == XY_PLAN:
+            return "XY is Plan, so there is no separate plan to compare"
+        return "No plan to compare against"
 
 
 def run_dose_volume_window(

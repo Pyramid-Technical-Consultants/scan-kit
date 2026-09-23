@@ -409,7 +409,7 @@ def gamma_index(ref, evl, voxel_mm: float, criteria: GammaCriteria) -> tuple[np.
     if norm <= 0.0:
         return out, 0, 0
     dd = criteria.dose_pct / 100.0 * norm
-    mask = ref >= criteria.cutoff_pct / 100.0 * norm
+    mask = (ref > 0.0) & (ref >= criteria.cutoff_pct / 100.0 * norm)
     best = np.full(ref.shape, criteria.cap**2)
     # ponytail: one shifted copy per offset; fine for tests and the no-compute fallback.
     for ox, oy, oz, w in gamma_offsets(voxel_mm, criteria):

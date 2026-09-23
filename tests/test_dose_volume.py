@@ -9,7 +9,6 @@ import pytest
 
 from scan_kit.common.ic_trajectory import IC1_Z_MM, IC2_Z_MM, IC_SEP_MM
 from scan_kit.views.dose_volume_catalog import (
-    AGREE_TRANSPARENT,
     ERROR_ABSOLUTE,
     SplatConfig,
     WEIGHT_DOSE,
@@ -28,10 +27,7 @@ from scan_kit.views.dose_volume_data import (
     air_mass_stopping_mev_cm2_g,
     apply_splat_cap,
     cloud_to_batch,
-    color_scalar,
     concat_clouds,
-    default_mm_per_mev,
-    energy_rgb,
     iso_xy_from_ic_ray,
     measured_cloud,
     measured_dose_columns,
@@ -41,15 +37,11 @@ from scan_kit.views.dose_volume_data import (
     range_axis_for_medium,
 )
 from scan_kit.views.dose_volume_fill import (
-    COLD_RGB,
-    HOT_RGB,
     DoseGrid,
     dose_field_weights,
     dose_grid,
     deposit_gaussians,
     normal_mass,
-    residual_error_alpha,
-    residual_signed_rgba,
 )
 from scan_kit.views.dose_volume_vispy import apply_gantry, axis_guide_points
 
@@ -97,9 +89,7 @@ def test_depth_axis_protocol_accepts_wet_stub() -> None:
         energy=np.array([100.0]),
         weight=np.array([1.0]),
     )
-    batch = cloud_to_batch(
-        cloud, WetStub(), smear_axis_units=2.0, rgb=np.array([[1.0, 0.0, 0.0]]),
-    )
+    batch = cloud_to_batch(cloud, WetStub(), smear_axis_units=2.0)
     np.testing.assert_allclose(batch.center[0], [1.0, 2.0, 30.0])
     np.testing.assert_allclose(batch.sigma[0], [3.0, 4.0, 2.0])
 
@@ -113,9 +103,7 @@ def test_cloud_to_batch_drops_nan_rows() -> None:
         energy=np.array([70.0, 80.0, 90.0]),
         weight=np.array([1.0, 1.0, 1.0]),
     )
-    batch = cloud_to_batch(
-        cloud, LinearEnergyAxis(1.0), 0.5, np.ones((3, 3)),
-    )
+    batch = cloud_to_batch(cloud, LinearEnergyAxis(1.0), 0.5)
     assert batch.center.shape == (2, 3)
     np.testing.assert_allclose(batch.center[:, 0], [1.0, 3.0])
 
@@ -171,11 +159,6 @@ def test_range_axis_deeper_for_higher_energy() -> None:
     assert water.depth_sign == -1
     assert "water" in water.axis_label.lower()
     assert "copper" in copper.axis_label.lower()
-
-
-def test_default_mm_per_mev_matches_xy_span() -> None:
-    energy = np.array([70.0, 90.0])
-    assert default_mm_per_mev(energy, 40.0) == pytest.approx(2.0)
 
 
 class _ZAtEnergy:
@@ -411,23 +394,6 @@ def test_difference_scale_cannot_stay_sequential() -> None:
     assert float(rgb[0, 2]) > float(rgb[-1, 2])
 
 
-def test_residual_agreement_zero_is_transparent_or_white() -> None:
-    assert SplatConfig().agreement == AGREE_TRANSPARENT
-    clear = residual_signed_rgba(np.array([0.0, 1.0, -1.0]), scale=1.0, zero="transparent")
-    np.testing.assert_allclose(clear[0, 3], 0.0, atol=1e-12)
-    np.testing.assert_allclose(clear[1, :3], HOT_RGB)
-    np.testing.assert_allclose(clear[1, 3], 1.0)
-    np.testing.assert_allclose(clear[2, :3], COLD_RGB)
-    np.testing.assert_allclose(clear[2, 3], 1.0)
-    white = residual_signed_rgba(np.array([0.0]), scale=1.0, zero="white")
-    np.testing.assert_allclose(white[0, :3], 1.0)
-    np.testing.assert_allclose(white[0, 3], 1.0)
-    # 2% on a ±10% scale is a light tint, not a saturated shell.
-    assert residual_error_alpha(0.02, 0.10) < 0.25
-    assert residual_error_alpha(0.10, 0.10) == 1.0
-    assert residual_error_alpha(0.0, 0.10) == 0.0
-
-
 def test_delivered_mu_falls_back_when_dose_is_missing() -> None:
     assert SplatConfig().error_mode == ERROR_ABSOLUTE
     np.testing.assert_allclose(
@@ -473,31 +439,23 @@ def test_protons_from_ideal_air_ic() -> None:
         protons_from_mu(1.0, 150.0, 10.0, k_mu),
         protons_from_charge_c(k_mu, 150.0, 10.0),
     )
-    cloud = SplatCloud(
-        x=np.array([0.0]), y=np.array([0.0]),
-        sx=np.array([1.0]), sy=np.array([1.0]),
-        energy=np.array([150.0]), weight=np.array([0.5]),
-        k_mu=k_mu,
+    from scan_kit.views.dose_volume_data import SplatBatch
+    from scan_kit.views.dose_volume_vispy import deposit_amounts
+
+    # Delivered MU wins over the plan weight; dose starts from the same protons as stops.
+    batch = SplatBatch(
+        center=np.zeros((2, 3)), sigma=np.ones((2, 3)), weight=np.array([1.0, 1.0]),
+        energy_mev=np.array([150.0, 150.0]), dose_mu=np.array([0.5, np.nan]), k_mu=k_mu,
     )
-    np.testing.assert_allclose(color_scalar(cloud, SplatConfig(weight_mode=WEIGHT_MU)), [0.5])
-    ten = color_scalar(cloud, SplatConfig(weight_mode=WEIGHT_PROTONS, ic_gap_mm=10.0))
-    five = color_scalar(cloud, SplatConfig(weight_mode=WEIGHT_PROTONS, ic_gap_mm=5.0))
-    np.testing.assert_allclose(five, 2.0 * ten)
+    np.testing.assert_allclose(deposit_amounts(batch, WEIGHT_MU, 10.0), [0.5, 1.0])
+    protons = deposit_amounts(batch, WEIGHT_PROTONS, 10.0)
+    np.testing.assert_allclose(deposit_amounts(batch, WEIGHT_DOSE, 10.0), protons)
+    np.testing.assert_allclose(deposit_amounts(batch, WEIGHT_PROTONS, 5.0), 2.0 * protons, rtol=1e-6)
     assert parse_kmu_c_per_mu(
         '<MapToMap><devices><ion_chamber><device name="IC_1_X"/>'
         '<gain_conversion in_units="MU" K_MU="2.5e-08"/></ion_chamber></devices></MapToMap>'
     ) == 2.5e-8
     assert parse_kmu_c_per_mu("<nope/>") is None
-
-
-def test_energy_rgb_yellow_is_high() -> None:
-    from matplotlib import cm
-
-    rgb = energy_rgb(np.array([70.0, 230.0]), vmin=70.0, vmax=230.0)
-    np.testing.assert_allclose(rgb[0], cm.viridis(0.0)[:3], atol=1e-5)
-    np.testing.assert_allclose(rgb[1], cm.viridis(1.0)[:3], atol=1e-5)
-    assert rgb[1, 0] > rgb[0, 0]
-    assert rgb[0, 2] > rgb[1, 2]
 
 
 def test_dose_volume_module_has_run() -> None:
@@ -747,7 +705,6 @@ def test_offscreen_dose_volume_render(qapp) -> None:
             center=np.zeros((1, 3), dtype=np.float32),
             sigma=np.full((1, 3), 4.0, dtype=np.float32),
             weight=np.array([8.0], dtype=np.float32),
-            rgb=np.ones((1, 3), dtype=np.float32),
             energy_mev=np.zeros(1, dtype=np.float32),
         )
         scene = DoseScene(canvas)
@@ -929,6 +886,10 @@ def test_gamma_passes_identical_and_fails_scaled() -> None:
     assert passed == n
     _g, passed, n = gamma_index(ref * 1.1, ref, 1.0, crit)
     assert passed < n
+    # A 0 % cutoff still skips empty voxels, or air would inflate the pass rate.
+    sparse = np.where(ref > 0.05, ref, 0.0)
+    _g, _passed, n = gamma_index(sparse, sparse, 1.0, GammaCriteria(cutoff_pct=0.0))
+    assert n == int((sparse > 0.0).sum())
 
 
 def test_sequential_scales_start_dark_and_brighten() -> None:
