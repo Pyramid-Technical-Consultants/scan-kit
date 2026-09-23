@@ -1,4 +1,4 @@
-"""Presets and display options for the 3D Gaussian splat viewer."""
+"""Presets and display options for the 3D dose-volume viewer."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ XY_ISO_RAY = "iso_ray"
 XY_PLAN = "plan"
 XyMode = Literal["ic1", "ic2", "iso_ray", "plan"]
 
-DEFAULT_SPLAT_CAP = 1_000_000
+DEFAULT_SPOT_CAP = 1_000_000
 DEFAULT_GAIN = 1.0
 DEFAULT_SMEAR_MEV = 0.5
 # 0 means autoscale so the energy span matches the XY span.
@@ -37,20 +37,57 @@ DEFAULT_AGREEMENT = AGREE_TRANSPARENT
 ERROR_PERCENT = "percent"
 ERROR_ABSOLUTE = "absolute"
 ErrorKind = Literal["percent", "absolute"]
-DEFAULT_ERROR_MODE = ERROR_PERCENT
+DEFAULT_ERROR_MODE = ERROR_ABSOLUTE
 DEFAULT_ERROR_PCT = 10.0
 DEFAULT_ERROR_MU = 0.2
-# Native units for the default (percent) mode: 10% of plan.
-DEFAULT_ERROR_SCALE = DEFAULT_ERROR_PCT / 100.0
+# Native units for the default (absolute) mode.
+DEFAULT_ERROR_SCALE = DEFAULT_ERROR_MU
 
-COLOR_ENERGY = "energy"
-COLOR_MU = "mu"
-COLOR_PROTONS = "protons"
-ColorKind = Literal["energy", "mu", "protons"]
-DEFAULT_COLOR = COLOR_ENERGY
+WEIGHT_MU = "mu"
+WEIGHT_PROTONS = "protons"
+WeightKind = Literal["mu", "protons"]
+DEFAULT_WEIGHT = WEIGHT_MU
+
+# How a viewing ray combines the voxels it crosses.
+RAY_INTEGRAL = "integral"
+RAY_MAXIMUM = "maximum"
+RAY_TRANSPARENT = "transparent"
+RayKind = Literal["integral", "maximum", "transparent"]
+DEFAULT_RAY = RAY_INTEGRAL
 DEFAULT_IC_GAP_MM = 10.0
 
-PLAN_RGB = (1.0, 0.55, 0.15)
+# One color scale paints the number the ray produced.
+# Dose uses a sequential map. A difference uses a divergent map.
+SCALE_VIRIDIS = "viridis"
+SCALE_MAGMA = "magma"
+SCALE_TURBO = "turbo"
+SCALE_COOLWARM = "coolwarm"
+SCALE_SEISMIC = "seismic"
+SCALE_BWR = "bwr"
+SEQUENTIAL_SCALES = (
+    (SCALE_VIRIDIS, "Viridis"),
+    (SCALE_MAGMA, "Magma"),
+    (SCALE_TURBO, "Turbo"),
+)
+DIVERGENT_SCALES = (
+    (SCALE_COOLWARM, "Coolwarm"),
+    (SCALE_SEISMIC, "Seismic"),
+    (SCALE_BWR, "Blue–white–red"),
+)
+DEFAULT_SCALE = SCALE_VIRIDIS
+DEFAULT_DIVERGENT_SCALE = SCALE_COOLWARM
+
+
+def scales_for(compare: bool) -> tuple[tuple[str, str], ...]:
+    return DIVERGENT_SCALES if compare else SEQUENTIAL_SCALES
+
+
+def active_scale(compare: bool, scale: str) -> str:
+    """The scale to use. A difference cannot keep a sequential map."""
+    allowed = {name for name, _label in scales_for(compare)}
+    if scale in allowed:
+        return scale
+    return DEFAULT_DIVERGENT_SCALE if compare else DEFAULT_SCALE
 
 PRESET_SPOT_IC1 = "spot_ic1"
 PRESET_SPOT_ISO_RAY = "spot_iso_ray"
@@ -82,22 +119,29 @@ PRESET_BY_ID = {p.id: p for p in PRESETS}
 
 
 @dataclass
-class SplatConfig:
+class DoseVolumeConfig:
     grain: GrainKind = GRAIN_SPOT
     xy_mode: XyMode = XY_IC1
     overlay_plan: bool = False
     gain: float = DEFAULT_GAIN
     smear_axis_units: float = DEFAULT_SMEAR_MEV
     mm_per_mev: float = DEFAULT_MM_PER_MEV
-    splat_cap: int = DEFAULT_SPLAT_CAP
+    splat_cap: int = DEFAULT_SPOT_CAP
     gantry_deg: float = DEFAULT_GANTRY_DEG
     medium: MediumKind = DEFAULT_MEDIUM
     agreement: AgreementKind = DEFAULT_AGREEMENT
     error_mode: ErrorKind = DEFAULT_ERROR_MODE
     error_scale: float = DEFAULT_ERROR_SCALE
-    color_mode: ColorKind = DEFAULT_COLOR
+    weight_mode: WeightKind = DEFAULT_WEIGHT
     ic_gap_mm: float = DEFAULT_IC_GAP_MM
+    ray_mode: RayKind = DEFAULT_RAY
+    scale: str = DEFAULT_SCALE
+    auto_scale: bool = True
 
     @property
     def title(self) -> str:
-        return "Gaussian Splats (3D)"
+        return "Dose Volume (3D)"
+
+
+# Loader still speaks this name.
+SplatConfig = DoseVolumeConfig

@@ -42,13 +42,12 @@ from ..common.timeslice_table import load_energy_tagged_table
 from ..common.trajectory_fits import fit_iso_plane, fit_magnet_pivot
 from ..data.reference_frame import timeslice_position_table_hooks
 from ..data.types import REFERENCE_CHAMBER, REFERENCE_ISO
-from .gaussian_splat_catalog import (
-    COLOR_MU,
-    COLOR_PROTONS,
+from .dose_volume_catalog import (
     GRAIN_SPOT,
     GRAIN_TIMESLICE,
     MEDIUM_COPPER,
     MEDIUM_WATER,
+    WEIGHT_PROTONS,
     XY_IC1,
     XY_IC2,
     XY_ISO_RAY,
@@ -163,6 +162,7 @@ class SplatCloud:
     energy: np.ndarray
     weight: np.ndarray
     k_mu: float | None = None
+    dose: np.ndarray | None = None
 
 
 @dataclass(frozen=True)
@@ -174,7 +174,9 @@ class SplatBatch:
     energy_mev: np.ndarray
     color_lo: float | None = None
     color_hi: float | None = None
-    color_label: str = "Energy (MeV)"
+    color_label: str = "Dose (MU)"
+    dose_mu: np.ndarray | None = None
+    k_mu: float | None = None
 
 
 @dataclass(frozen=True)
@@ -191,6 +193,8 @@ class PositionSigmaFrame:
     weight: np.ndarray
     plan_x: np.ndarray | None = None
     plan_y: np.ndarray | None = None
+    dose_ic1: np.ndarray | None = None
+    dose_ic2: np.ndarray | None = None
 
 
 @dataclass(frozen=True)
@@ -245,6 +249,10 @@ def concat_clouds(clouds: Sequence[SplatCloud]) -> SplatCloud | None:
         energy=np.concatenate([c.energy for c in parts]),
         weight=np.concatenate([c.weight for c in parts]),
         k_mu=parts[0].k_mu if len({c.k_mu for c in parts}) == 1 else None,
+        dose=(
+            np.concatenate([c.dose for c in parts])
+            if all(c.dose is not None for c in parts) else None
+        ),
     )
 
 
@@ -262,6 +270,7 @@ def apply_splat_cap(cloud: SplatCloud, cap: int) -> SplatCloud:
         energy=cloud.energy[sl],
         weight=cloud.weight[sl],
         k_mu=cloud.k_mu,
+        dose=None if cloud.dose is None else cloud.dose[sl],
     )
 
 
@@ -365,21 +374,18 @@ def session_kmu_c_per_mu(session_id: str, base_dir: str) -> float | None:
 
 
 def color_scalar(cloud: SplatCloud, config: SplatConfig) -> np.ndarray:
-    if config.color_mode == COLOR_MU:
-        return np.asarray(cloud.weight, dtype=float)
-    if config.color_mode == COLOR_PROTONS:
+    """Spot weight deposited into the volume: MU, or protons from that MU."""
+    if config.weight_mode == WEIGHT_PROTONS:
         return protons_from_mu(
             cloud.weight, cloud.energy, config.ic_gap_mm, cloud.k_mu,
         )
-    return np.asarray(cloud.energy, dtype=float)  # COLOR_ENERGY
+    return np.asarray(cloud.weight, dtype=float)
 
 
 def color_legend_spec(mode: str) -> tuple[str, str]:
-    if mode == COLOR_MU:
-        return "Dose (MU)", ".3g"
-    if mode == COLOR_PROTONS:
+    if mode == WEIGHT_PROTONS:
         return "Protons", ".2e"
-    return "Energy (MeV)\nyellow = high", ".1f"
+    return "Dose (MU)", ".3g"
 
 
 def energy_rgb(
@@ -417,12 +423,15 @@ def cloud_to_batch(
     sigma = np.column_stack([cloud.sx[mask], cloud.sy[mask], sz[mask]]).astype(np.float32)
     weight = np.asarray(cloud.weight[mask], dtype=np.float32)
     color = np.asarray(rgb[mask], dtype=np.float32)
+    dose = None if cloud.dose is None else np.asarray(cloud.dose[mask], dtype=np.float32)
     return SplatBatch(
         center=center,
         sigma=sigma,
         weight=weight,
         rgb=color,
         energy_mev=np.asarray(cloud.energy[mask], dtype=np.float32),
+        dose_mu=dose,
+        k_mu=cloud.k_mu,
     )
 
 
@@ -549,6 +558,26 @@ def _plan_from_input_map(session_id: str, base_dir: str) -> SplatCloud | None:
     )
 
 
+_DOSE_CANDIDATES = (
+    ("ic1", ("ic1_total_dose_spot", "ic1_total_dose")),
+    ("ic2", ("ic2_total_dose_spot", "ic2_total_dose")),
+)
+
+
+def measured_dose_columns(columns) -> dict[str, str]:
+    """Processed MU columns only. ``*_raw`` is nanocoulombs and would fake a huge error."""
+    from ..common.schema import resolve_column_name
+
+    found: dict[str, str] = {}
+    for ic, names in _DOSE_CANDIDATES:
+        for name in names:
+            col = resolve_column_name(columns, name)
+            if col is not None and "_raw" not in col.lower():
+                found[ic] = col
+                break
+    return found
+
+
 def _sigma_columns(spot_columns) -> dict[str, str]:
     found: dict[str, str] = {}
     for label, ic, axis in IC_SIGMA_LABELS:
@@ -558,11 +587,31 @@ def _sigma_columns(spot_columns) -> dict[str, str]:
     return found
 
 
+def _as_dose(data: dict, col: str | None, n: int) -> np.ndarray | None:
+    if not col or col not in data:
+        return None
+    out = np.asarray(data[col], dtype=float).reshape(-1)
+    if out.size != n:
+        return None
+    return out
+
+
+def _frame_dose(frame: PositionSigmaFrame, ic: str) -> np.ndarray | None:
+    if ic == "ic2":
+        return frame.dose_ic2
+    if ic == "ic1":
+        return frame.dose_ic1
+    if frame.dose_ic1 is not None and np.isfinite(frame.dose_ic1).any():
+        return frame.dose_ic1
+    return frame.dose_ic2
+
+
 def _frame_from_position_data(
     data: dict,
     sigma_cols: dict[str, str],
     *,
     sigma_scale: float,
+    dose_cols: dict[str, str] | None = None,
 ) -> PositionSigmaFrame:
     energy = np.asarray(data["energy"], dtype=float)
     n = energy.size
@@ -584,6 +633,8 @@ def _frame_from_position_data(
         weight=_as_weight(data.get(C_CHARGE_REQ), n),
         plan_x=plan_x,
         plan_y=plan_y,
+        dose_ic1=_as_dose(data, (dose_cols or {}).get("ic1"), n),
+        dose_ic2=_as_dose(data, (dose_cols or {}).get("ic2"), n),
     )
 
 
@@ -593,8 +644,9 @@ def _load_spot_frame(
     *,
     raw: bool,
     sigma_cols: dict[str, str],
+    dose_cols: dict[str, str] | None = None,
 ) -> PositionSigmaFrame | None:
-    extra_spot = list(sigma_cols.values())
+    extra_spot = list(sigma_cols.values()) + list((dose_cols or {}).values())
 
     def _loader(sid, position_key, bdir):
         return process_position_data(
@@ -608,7 +660,9 @@ def _load_spot_frame(
     data = try_load_position_data(session_id, base_dir, _loader, raw=raw)
     if data is None:
         return None
-    return _frame_from_position_data(data, sigma_cols, sigma_scale=2.0)
+    return _frame_from_position_data(
+        data, sigma_cols, sigma_scale=2.0, dose_cols=dose_cols,
+    )
 
 
 def _load_spot_source(session_id: str, base_dir: str) -> SessionSplatSource | None:
@@ -616,8 +670,13 @@ def _load_spot_source(session_id: str, base_dir: str) -> SessionSplatSource | No
     if spot_data is None:
         return None
     sigma_cols = _sigma_columns(spot_data.columns)
-    iso = _load_spot_frame(session_id, base_dir, raw=False, sigma_cols=sigma_cols)
-    chamber = _load_spot_frame(session_id, base_dir, raw=True, sigma_cols=sigma_cols)
+    dose_cols = measured_dose_columns(spot_data.columns)
+    iso = _load_spot_frame(
+        session_id, base_dir, raw=False, sigma_cols=sigma_cols, dose_cols=dose_cols,
+    )
+    chamber = _load_spot_frame(
+        session_id, base_dir, raw=True, sigma_cols=sigma_cols, dose_cols=dose_cols,
+    )
     if iso is None and chamber is None:
         return None
     plan = _plan_from_input_map(session_id, base_dir)
@@ -757,11 +816,11 @@ def _axis_cloud(
     if ic == "ic1":
         return SplatCloud(
             x=frame.ic1_x, y=frame.ic1_y, sx=frame.ic1_sx, sy=frame.ic1_sy,
-            energy=frame.energy, weight=frame.weight,
+            energy=frame.energy, weight=frame.weight, dose=_frame_dose(frame, "ic1"),
         )
     return SplatCloud(
         x=frame.ic2_x, y=frame.ic2_y, sx=frame.ic2_sx, sy=frame.ic2_sy,
-        energy=frame.energy, weight=frame.weight,
+        energy=frame.energy, weight=frame.weight, dose=_frame_dose(frame, "ic2"),
     )
 
 
@@ -808,6 +867,7 @@ def _iso_ray_cloud(
     sy = _lerp_sigma(frame.ic2_sy, frame.ic1_sy, t) * scale
     return SplatCloud(
         x=x, y=y, sx=sx, sy=sy, energy=frame.energy, weight=frame.weight,
+        dose=_frame_dose(frame, "iso"),
     )
 
 
@@ -869,7 +929,7 @@ def build_view_batches(
     axis = range_axis_for_medium(config.medium)
     if not clouds:
         return None, None, axis, n_raw, 0
-    color_label, _fmt = color_legend_spec(config.color_mode)
+    color_label, _fmt = color_legend_spec(config.weight_mode)
     c_lo, c_hi = 0.0, 1.0
     if measured_one is not None:
         scalar = color_scalar(measured_one, config)
@@ -892,10 +952,15 @@ def build_view_batches(
             weight=np.concatenate([b.weight for b in batches], axis=0),
             rgb=np.concatenate([b.rgb for b in batches], axis=0),
             energy_mev=np.concatenate([b.energy_mev for b in batches], axis=0),
-            color_lo=c_lo,
-            color_hi=c_hi,
-            color_label=color_label,
-        )
+        color_lo=c_lo,
+        color_hi=c_hi,
+        color_label=color_label,
+        dose_mu=(
+            np.concatenate([b.dose_mu for b in batches], axis=0)
+            if all(b.dose_mu is not None for b in batches) else None
+        ),
+        k_mu=batches[0].k_mu if len({b.k_mu for b in batches}) == 1 else None,
+    )
 
     measured_batch = _merge(
         measured_clouds,

@@ -66,10 +66,10 @@ _UNIFIED_VIEWS.extend(
         "and optional plan overlay (visPy).",
     ),
     (
-        "Gaussian Splats (3D)",
-        "gaussian_splat",
-        "Interactive 3D Gaussian splat volume of IC / ISO-ray / plan beam "
-        "fits versus water or copper range (visPy).",
+        "Dose Volume (3D)",
+        "dose_volume",
+        "1 mm dose volume of IC / ISO-ray / plan Gaussians versus water or "
+        "copper range, ray marched in visPy.",
     ),
     (
         "Session Log Compare",
