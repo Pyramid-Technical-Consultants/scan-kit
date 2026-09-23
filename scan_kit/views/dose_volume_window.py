@@ -7,14 +7,16 @@ from typing import Sequence
 
 import numpy as np
 from PySide6.QtCore import QRectF, QSize, Qt, QTimer, Slot
-from PySide6.QtGui import QImage, QPainter, QPalette, QPen
+from PySide6.QtGui import QColor, QImage, QPainter, QPen
 from PySide6.QtWidgets import (
+    QButtonGroup,
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QRadioButton,
     QSizePolicy,
     QSlider,
     QSpinBox,
@@ -36,12 +38,20 @@ from .dose_volume_catalog import (
     DEFAULT_GANTRY_DEG,
     DEFAULT_RAY,
     DEFAULT_SCALE,
+    DEFAULT_AUTO_MARGIN_SIGMA,
+    DEFAULT_ENERGY_SPREAD_PCT,
+    DEFAULT_ENTRANCE_WET_MM,
+    DEFAULT_GAMMA_CUTOFF_PCT,
+    DEFAULT_GAMMA_DOSE_PCT,
+    DEFAULT_GAMMA_DTA_MM,
     DEFAULT_IC_GAP_MM,
-    DEFAULT_SMEAR_MEV,
+    DEFAULT_PHANTOM_MM,
     DEFAULT_SPOT_CAP,
     DEFAULT_WEIGHT,
     ERROR_ABSOLUTE,
     ERROR_PERCENT,
+    GAMMA_ACTION_PCT,
+    GAMMA_TOLERANCE_PCT,
     GRAIN_SPOT,
     GRAIN_TIMESLICE,
     MEDIUM_COPPER,
@@ -51,6 +61,7 @@ from .dose_volume_catalog import (
     RAY_INTEGRAL,
     RAY_MAXIMUM,
     RAY_TRANSPARENT,
+    WEIGHT_DOSE,
     WEIGHT_MU,
     WEIGHT_PROTONS,
     XY_IC1,
@@ -66,16 +77,25 @@ from .dose_volume_data import (
     load_splat_sessions,
     range_axis_for_medium,
 )
-from .dose_volume_fill import colormap_samples
+from .dose_volume_fill import (
+    GAMMA_CMAP,
+    MAX_VOXEL_MM,
+    MIN_VOXEL_MM,
+    VOXEL_MM,
+    colormap_samples,
+    ink_rgb,
+    zero_rgb,
+)
+from .dose_volume_physics import GammaCriteria
 from .dose_volume_raycast import manual_color_limits, suggest_abs_window
-from .dose_volume_vispy import DoseScene, default_session_colors
+from .dose_volume_vispy import DoseScene
 from .plot_view_shell import (
     VispyViewWindow,
     make_presets_menu_button,
     make_side_panel_column,
     run_view_window,
 )
-from .vispy_plot import ensure_gl_plus
+from .vispy_plot import BG, ensure_gl_plus
 
 _GRAIN_ITEMS = (
     (GRAIN_SPOT, "Spot"),
@@ -92,16 +112,18 @@ _MEDIUM_ITEMS = (
     (MEDIUM_COPPER, "Copper"),
 )
 _SHOW_ITEMS = (
-    ("dose", "Dose"),
-    ("difference", "Difference"),
+    ("dose", "Measured"),
+    ("difference", "Measured − plan"),
+    ("gamma", "Gamma (γ)"),
 )
 _ERROR_ITEMS = (
     (ERROR_PERCENT, "Percent of peak"),
     (ERROR_ABSOLUTE, "Absolute"),
 )
 _WEIGHT_ITEMS = (
-    (WEIGHT_MU, "Dose (MU)"),
-    (WEIGHT_PROTONS, "Protons"),
+    (WEIGHT_DOSE, "Dose (Gy)"),
+    (WEIGHT_MU, "Stops (MU)"),
+    (WEIGHT_PROTONS, "Stops (protons)"),
 )
 _RAY_ITEMS = (
     (RAY_INTEGRAL, "Integrate"),
@@ -111,6 +133,24 @@ _RAY_ITEMS = (
 _GAIN_SLIDER_MAX = 100
 _SCALE_SLIDER_MAX = 1000
 _LABEL_WIDTH = 100
+
+
+def gamma_pass_rate(tally: tuple[int, int] | None) -> float | None:
+    """Percent of scored voxels with γ ≤ 1, or None when nothing was scored."""
+    if not tally or tally[1] <= 0:
+        return None
+    return 100.0 * tally[0] / tally[1]
+
+
+def gamma_verdict(rate: float | None) -> tuple[str, str]:
+    """TG-218 reading of a pass rate and the color to show it in."""
+    if rate is None:
+        return "No voxels above the cutoff", "#9aa4b2"
+    if rate >= GAMMA_TOLERANCE_PCT:
+        return "Within tolerance", "#46a758"
+    if rate >= GAMMA_ACTION_PCT:
+        return "Below tolerance: investigate", "#f5a524"
+    return "Below action limit", "#e5484d"
 
 
 def _log_slider_pos(value: float, lo: float, hi: float) -> int:
@@ -130,11 +170,10 @@ def _log_slider_value(pos: int, lo: float, hi: float) -> float:
 
 
 _AXIS_PAD_X = 8
-_AXIS_BAR_W = 18
-# Fixed so tick text and the ×10 offset never shove the controls sideways.
-_AXIS_WIDTH = 176
+_AXIS_BAR_W = 16
+# Fixed so tick text never shoves the view sideways; the ×10 offset rides in the title.
+_AXIS_WIDTH = 124
 _EXP_DIGITS = str.maketrans("-0123456789", "⁻⁰¹²³⁴⁵⁶⁷⁸⁹")
-
 
 def _tick_labels(values: np.ndarray) -> tuple[list[str], str]:
     """Short tick text plus a shared power-of-ten offset when the span is tiny or huge."""
@@ -197,7 +236,10 @@ def _minor_ticks(majors: np.ndarray, lo: float, hi: float) -> np.ndarray:
 def color_axis_ticks(
     lo: float, hi: float, *, nbins: int = 6,
 ) -> tuple[np.ndarray, np.ndarray, list[str], str]:
-    """Major ticks, minor ticks, major labels, and the scientific offset."""
+    """Major ticks, minor ticks, major labels, and the scientific offset.
+
+    ``majors[0]`` and ``majors[-1]`` are always the exact ends of the bar.
+    """
     lo_f = float(lo)
     hi_f = float(hi)
     empty = np.array([], dtype=float)
@@ -215,15 +257,16 @@ def color_axis_ticks(
         steps=[1, 2, 2.5, 5, 10],
         min_n_ticks=2,
     )
-    majors = np.asarray(locator.tick_values(lo_f, hi_f), dtype=float)
+    nice = np.asarray(locator.tick_values(lo_f, hi_f), dtype=float)
     pad = span * 1e-6
-    majors = majors[(majors >= lo_f - pad) & (majors <= hi_f + pad)]
-    if lo_f < 0.0 < hi_f and not np.any(np.abs(majors) <= pad):
-        majors = np.sort(np.append(majors, 0.0))
-    if majors.size == 0:
-        majors = np.array([lo_f, hi_f])
+    nice = nice[(nice >= lo_f - pad) & (nice <= hi_f + pad)]
+    if lo_f < 0.0 < hi_f and not np.any(np.abs(nice) <= pad):
+        nice = np.sort(np.append(nice, 0.0))
+    minors = _minor_ticks(nice, lo_f, hi_f) if nice.size >= 2 else np.array([], dtype=float)
+    inner = nice[(nice > lo_f + pad) & (nice < hi_f - pad)]
+    majors = np.concatenate([[lo_f], inner, [hi_f]])
     labels, offset = _tick_labels(majors)
-    return majors, _minor_ticks(majors, lo_f, hi_f), labels, offset
+    return majors, minors, labels, offset
 
 
 class _ColorAxis(QWidget):
@@ -286,16 +329,25 @@ class _ColorAxis(QWidget):
     def paintEvent(self, _event) -> None:
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
-        painter.fillRect(self.rect(), self.palette().color(QPalette.ColorRole.Window))
-        color = self.palette().color(QPalette.ColorRole.WindowText)
         fm = painter.fontMetrics()
         lo, hi = self._lo, self._hi
-        if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+        if not self._name or not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+            painter.fillRect(self.rect(), QColor(BG))
             painter.end()
             return
+        # Painted as part of the view, so it shares the canvas zero color,
+        # with a dark glass panel so the ticks read on any background.
+        painter.fillRect(self.rect(), QColor.fromRgbF(*zero_rgb(self._name, lo, hi)))
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(12, 14, 18, 170))
+        painter.drawRoundedRect(QRectF(self.rect()).adjusted(2, 2, -2, -2), 6, 6)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        color = QColor.fromRgbF(*ink_rgb((0.0, 0.0, 0.0)))
         nbins = max(2, min(8, int(self.height() / 52)))
         majors, minors, labels, offset = color_axis_ticks(lo, hi, nbins=nbins)
-        top = fm.height() + 2 if offset else fm.height() // 2 + 4
+        top = fm.height() // 2 + 4
         bottom = self.height() - (fm.height() // 2 + 4)
         if bottom - top < 8:
             painter.end()
@@ -317,30 +369,32 @@ class _ColorAxis(QWidget):
             y = y_of(float(value))
             painter.drawLine(int(spine), int(round(y)), int(spine) + 4, int(round(y)))
         shown_y: list[float] = []
-        for value, label in zip(majors, labels):
-            y = y_of(float(value))
+        # Ends first so the top and bottom labels always win a collision.
+        order = [0, len(majors) - 1, *range(1, len(majors) - 1)]
+        for idx in order:
+            value = float(majors[idx])
+            y = y_of(value)
             if any(abs(y - prev) < fm.height() for prev in shown_y):
                 painter.drawLine(int(spine), int(round(y)), int(spine) + 5, int(round(y)))
                 continue
-            length = 9 if abs(float(value)) <= (hi - lo) * 1e-6 else 7
+            length = 9 if abs(value) <= (hi - lo) * 1e-6 else 7
             painter.drawLine(int(spine), int(round(y)), int(spine) + length, int(round(y)))
             painter.drawText(
                 int(spine) + length + 4,
                 int(round(y + fm.ascent() / 2 - 1)),
-                label,
+                labels[idx],
             )
             shown_y.append(y)
-        if offset:
-            painter.drawText(int(spine) + 11, fm.ascent() + 1, offset)
-        if self._title:
-            title_x = self.width() - 6 - fm.height()
+        title = f"{self._title}  {offset}".strip() if offset else self._title
+        if title:
+            title_x = self.width() - 4 - fm.height()
             painter.save()
             painter.translate(title_x + fm.height() / 2, (top + bottom) / 2)
             painter.rotate(-90)
             painter.drawText(
                 QRectF(-bar.height() / 2, -fm.height() / 2, bar.height(), fm.height()),
                 Qt.AlignmentFlag.AlignCenter,
-                self._title,
+                title,
             )
             painter.restore()
         painter.end()
@@ -360,17 +414,19 @@ class DoseVolumeWindow(VispyViewWindow):
     ) -> None:
         super().__init__(title="Dose Volume (3D)", parent=parent)
         self._updating = True
+        # Before the canvas exists: moving a live GL widget can drop its context.
+        self._mount_color_axis()
         gl = "gl+" if ensure_gl_plus() else None
         self._vispy_canvas = self.add_vispy_canvas(
             keys="interactive", size=(1200, 800), gl=gl,
         )
         self._scene = DoseScene(self._vispy_canvas)
         self.set_side_panel(self._build_controls())
-        self._mount_color_axis()
         self._update_legend()
         self._scene.range_listener = self._on_gpu_range
 
         self._session_ids = list(session_ids)
+        self._active_session: str | None = None
         self._base_dir = base_dir
         self._sources: dict[str, object] = {}
         self._notes = load_notes(base_dir)
@@ -400,17 +456,23 @@ class DoseVolumeWindow(VispyViewWindow):
             )
         )
 
-        beam_group = QGroupBox("Beam")
-        beam_layout = QVBoxLayout(beam_group)
-        beam_layout.setSpacing(4)
+        # Session: which log. Beam: the logged spots and what the machine did.
+        # Phantom: what they hit. Volume: what the voxels hold. Color: how it is painted.
+        self._session_group = QGroupBox("Session")
+        self._session_layout = QVBoxLayout(self._session_group)
+        self._session_layout.setSpacing(2)
+        self._session_buttons = QButtonGroup(self)
+        self._session_buttons.idClicked.connect(self._on_session_picked)
+        self._listed_ids: list[str] = []
+        self._session_group.setVisible(False)
+        layout.addWidget(self._session_group)
+
+        beam_layout = self._add_group(layout, "Beam")
         self._grain_combo = self._add_combo(
             beam_layout, "Grain", _GRAIN_ITEMS, self._on_grain_changed,
         )
         self._xy_combo = self._add_combo(
             beam_layout, "XY", _XY_ITEMS, self._on_controls_changed,
-        )
-        self._medium_combo = self._add_combo(
-            beam_layout, "Depth medium", _MEDIUM_ITEMS, self._on_controls_changed,
         )
         self._gantry_spin = self._add_spin(
             beam_layout, "Gantry", 0.0, 360.0, 5.0, DEFAULT_GANTRY_DEG,
@@ -418,7 +480,88 @@ class DoseVolumeWindow(VispyViewWindow):
         )
         self._gantry_spin.setWrapping(True)
         self._gantry_spin.setSuffix(" °")
-        layout.addWidget(beam_group)
+        self._smear_spin = self._add_spin(
+            beam_layout, "Energy spread", 0.0, 10.0, 0.1, DEFAULT_ENERGY_SPREAD_PCT,
+            decimals=2,
+        )
+        self._smear_spin.setSuffix(" %")
+        self._smear_spin.setToolTip(
+            "Beam energy spread σE as % of energy. Range straggling in the "
+            "medium is added on top, so 0 still gives a physical Bragg peak."
+        )
+        self._gap_spin = self._add_spin(
+            beam_layout, "IC gap", 0.1, 100.0, 0.5, DEFAULT_IC_GAP_MM,
+            decimals=1,
+        )
+        self._gap_spin.setSuffix(" mm")
+        self._gap_spin.setToolTip("Ion chamber gap used to turn logged charge into protons.")
+        self._gap_spin.setEnabled(DEFAULT_WEIGHT != WEIGHT_MU)
+        self._cap_spin = QSpinBox()
+        self._cap_spin.setRange(1_000, 5_000_000)
+        self._cap_spin.setSingleStep(50_000)
+        self._cap_spin.setValue(DEFAULT_SPOT_CAP)
+        self._cap_spin.setToolTip("Most spots drawn; longer sessions are thinned evenly.")
+        self._cap_spin.valueChanged.connect(self._on_controls_changed)
+        self._add_row(beam_layout, "Spot cap", self._cap_spin)
+
+        phantom_layout = self._add_group(layout, "Phantom")
+        self._medium_combo = self._add_combo(
+            phantom_layout, "Medium", _MEDIUM_ITEMS, self._on_controls_changed,
+        )
+        self._phantom_spin = self._add_spin(
+            phantom_layout, "Thickness", 0.0, 1000.0, 10.0, DEFAULT_PHANTOM_MM, decimals=0,
+        )
+        self._phantom_spin.setSuffix(" mm")
+        self._phantom_spin.setSpecialValueText("Auto")
+        self._phantom_spin.setToolTip(
+            "Phantom depth along the beam. Auto makes it deep enough that no dose "
+            "exits. A fixed depth stops the dose at the back face; protons with "
+            "more range exit and leave only what they deposited inside."
+        )
+        self._margin_spin = self._add_spin(
+            phantom_layout, "Auto margin", 1.0, 5.0, 0.5, DEFAULT_AUTO_MARGIN_SIGMA, decimals=1,
+        )
+        self._margin_spin.setSuffix(" σ")
+        self._margin_spin.setToolTip(
+            "How far past the deepest range Auto reaches, in range-spread σ. "
+            "3σ drops below 0.1 % of the peak; 5σ holds the whole modeled tail."
+        )
+        self._phantom_spin.valueChanged.connect(self._sync_phantom_controls)
+        self._wet_spin = self._add_spin(
+            phantom_layout, "Entrance WET", 0.0, 300.0, 1.0, DEFAULT_ENTRANCE_WET_MM, decimals=1,
+        )
+        self._wet_spin.setSuffix(" mm")
+        self._wet_spin.setToolTip(
+            "Water-equivalent material between the nozzle and the phantom surface: "
+            "tank wall, buildup slabs, range shifter. IC readings are unaffected; "
+            "the beam loses range and a little fluence before it enters."
+        )
+
+        volume_layout = self._add_group(layout, "Volume")
+        self._weight_combo = self._add_combo(
+            volume_layout, "Quantity", _WEIGHT_ITEMS, self._on_weight_mode_changed,
+        )
+        self._weight_combo.setToolTip(
+            "Dose: Bragg curve with nuclear losses and scatter that grows with "
+            "depth, in Gy. Stops: where the protons come to rest."
+        )
+        self._set_combo(self._weight_combo, DEFAULT_WEIGHT)
+        self._voxel_spin = self._add_spin(
+            volume_layout, "Voxel", MIN_VOXEL_MM, MAX_VOXEL_MM, 0.25, VOXEL_MM,
+            decimals=2,
+        )
+        self._voxel_spin.setSuffix(" mm")
+        self._voxel_spin.setToolTip(
+            "Edge of one dose voxel. Smaller shows finer detail but fills slower "
+            "and may crop large fields."
+        )
+        self._smooth_check = QCheckBox("Smooth voxels")
+        self._smooth_check.setChecked(True)
+        self._smooth_check.setToolTip(
+            "Blend between voxel centers along each ray. Off shows each voxel as a flat block."
+        )
+        self._smooth_check.toggled.connect(self._scene.set_smooth)
+        volume_layout.addWidget(self._smooth_check)
 
         self._seq_scale = DEFAULT_SCALE
         self._div_scale = DEFAULT_DIVERGENT_SCALE
@@ -429,7 +572,9 @@ class DoseVolumeWindow(VispyViewWindow):
             color_layout, "Show", _SHOW_ITEMS, self._on_show_changed,
         )
         self._show_combo.setToolTip(
-            "Dose paints the measured field. Difference paints measured minus plan."
+            "Measured paints the delivered field. Measured − plan paints the "
+            "signed difference. Gamma paints the 3D γ index of measured against "
+            "plan, worst voxel along each ray."
         )
         self._ray_combo = self._add_combo(
             color_layout, "Ray", _RAY_ITEMS, self._on_ray_changed,
@@ -483,34 +628,33 @@ class DoseVolumeWindow(VispyViewWindow):
         self._auto_check.setChecked(True)
         layout.addWidget(color_group)
 
-        display_group = QGroupBox("Display")
-        display_layout = QVBoxLayout(display_group)
-        display_layout.setSpacing(4)
-        self._weight_combo = self._add_combo(
-            display_layout, "Deposit", _WEIGHT_ITEMS, self._on_weight_mode_changed,
+        self._gamma_group = QGroupBox("Gamma")
+        gamma_layout = QVBoxLayout(self._gamma_group)
+        gamma_layout.setSpacing(4)
+        self._gamma_dd_spin = self._add_spin(
+            gamma_layout, "Dose diff.", 0.5, 20.0, 0.5, DEFAULT_GAMMA_DOSE_PCT, decimals=1,
         )
-        self._set_combo(self._weight_combo, DEFAULT_WEIGHT)
-        self._gap_spin = self._add_spin(
-            display_layout, "IC gap", 0.1, 100.0, 0.5, DEFAULT_IC_GAP_MM,
-            decimals=1,
+        self._gamma_dd_spin.setSuffix(" %")
+        self._gamma_dd_spin.setToolTip("Global: percent of the plan's maximum dose.")
+        self._gamma_dta_spin = self._add_spin(
+            gamma_layout, "DTA", 0.5, 10.0, 0.5, DEFAULT_GAMMA_DTA_MM, decimals=1,
         )
-        self._gap_spin.setSuffix(" mm")
-        self._gap_spin.setEnabled(False)
-        self._smear_spin = self._add_spin(
-            display_layout, "σz smear", 0.01, 50.0, 0.1, DEFAULT_SMEAR_MEV,
-            decimals=2,
+        self._gamma_dta_spin.setSuffix(" mm")
+        self._gamma_dta_spin.setToolTip("Distance to agreement, searched in 3D.")
+        self._gamma_cut_spin = self._add_spin(
+            gamma_layout, "Low cutoff", 0.0, 50.0, 1.0, DEFAULT_GAMMA_CUTOFF_PCT, decimals=0,
         )
-        self._cap_spin = QSpinBox()
-        self._cap_spin.setRange(1_000, 5_000_000)
-        self._cap_spin.setSingleStep(50_000)
-        self._cap_spin.setValue(DEFAULT_SPOT_CAP)
-        self._cap_spin.valueChanged.connect(self._on_controls_changed)
-        self._add_row(display_layout, "Spot cap", self._cap_spin)
-        layout.addWidget(display_group)
-
-        self._legend_group = QGroupBox("Sessions")
-        self._legend_layout = QVBoxLayout(self._legend_group)
-        layout.addWidget(self._legend_group)
+        self._gamma_cut_spin.setSuffix(" %")
+        self._gamma_cut_spin.setToolTip("Measured voxels below this share of the plan maximum are not scored.")
+        self._gamma_label = QLabel("—")
+        self._gamma_label.setWordWrap(True)
+        self._gamma_label.setToolTip(
+            f"AAPM TG-218: ≥ {GAMMA_TOLERANCE_PCT:g} % passing is within tolerance; "
+            f"below {GAMMA_ACTION_PCT:g} % calls for action."
+        )
+        gamma_layout.addWidget(self._gamma_label)
+        self._gamma_group.setVisible(False)
+        layout.addWidget(self._gamma_group)
 
         info_group = QGroupBox("Loaded")
         info_layout = QVBoxLayout(info_group)
@@ -525,20 +669,31 @@ class DoseVolumeWindow(VispyViewWindow):
         return panel
 
     def _mount_color_axis(self) -> None:
-        """Park the scale beside the controls so it can use the full height."""
+        """Glue the full-height scale to the right edge of the view, left of the splitter handle."""
         self._color_axis = _ColorAxis()
         wrap = QWidget()
         row = QHBoxLayout(wrap)
         row.setContentsMargins(0, 0, 0, 0)
-        row.setSpacing(2)
+        row.setSpacing(0)
+        # The zero-colored background runs edge to edge, so no gutter around the canvas.
+        self._plot_layout.setContentsMargins(0, 0, 0, 0)
+        self._splitter.insertWidget(0, wrap)
+        # Reparent the plot host straight into the row so Qt never drops it on a null parent.
+        row.addWidget(self._plot_host, stretch=1)
         row.addWidget(self._color_axis)
-        # Reparent the controls directly so Qt never drops them on a null parent.
-        row.addWidget(self._side_scroll, stretch=1)
-        self._splitter.addWidget(wrap)
-        bar = self._color_axis.sizeHint().width()
-        side = max(self._side_default_width, self._side_min_width)
-        total = max(self.width(), side + bar + 640)
-        self._splitter.setSizes([max(total - side - bar, 400), side + bar])
+        self._splitter.setStretchFactor(0, 1)
+        self._splitter.setStretchFactor(1, 0)
+
+    def _add_group(self, layout: QVBoxLayout, title: str) -> QVBoxLayout:
+        group = QGroupBox(title)
+        inner = QVBoxLayout(group)
+        inner.setSpacing(4)
+        layout.addWidget(group)
+        return inner
+
+    def _sync_phantom_controls(self, *_args) -> None:
+        """The margin only shapes an Auto phantom."""
+        self._margin_spin.setEnabled(self._phantom_spin.value() <= 0.0)
 
     def _add_row(self, layout: QVBoxLayout, label: str, widget: QWidget) -> None:
         host = QWidget()
@@ -597,14 +752,19 @@ class DoseVolumeWindow(VispyViewWindow):
     def _deposit_weight(self) -> str:
         combo = getattr(self, "_weight_combo", None)
         if combo is None:
-            return WEIGHT_MU
+            return DEFAULT_WEIGHT
         return combo.currentData()
 
-    def _abs_suffix(self) -> str:
-        protons = self._deposit_weight() == WEIGHT_PROTONS
+    def _density_unit(self) -> str:
         per_area = self._ray_combo.currentData() == RAY_INTEGRAL
-        unit = "" if protons else " MU"
-        return f"{unit}/mm²" if per_area else f"{unit}/mm³"
+        weight = self._deposit_weight()
+        if weight == WEIGHT_DOSE:
+            return "Gy·mm" if per_area else "Gy"
+        unit = "protons" if weight == WEIGHT_PROTONS else "MU"
+        return f"{unit} / mm²" if per_area else f"{unit} / mm³"
+
+    def _abs_suffix(self) -> str:
+        return " " + self._density_unit().replace(" ", "")
 
     def _configure_error_scale_spin(self, mode: str, scale: float) -> None:
         if mode == ERROR_PERCENT:
@@ -632,6 +792,16 @@ class DoseVolumeWindow(VispyViewWindow):
 
     def _comparing(self) -> bool:
         return self._show_combo.currentData() == "difference"
+
+    def _gamma_mode(self) -> bool:
+        return self._show_combo.currentData() == "gamma"
+
+    def _gamma_criteria(self) -> GammaCriteria:
+        return GammaCriteria(
+            dose_pct=self._gamma_dd_spin.value(),
+            dta_mm=self._gamma_dta_spin.value(),
+            cutoff_pct=self._gamma_cut_spin.value(),
+        )
 
     def _fill_scale_combo(self, compare: bool) -> None:
         chosen = self._div_scale if compare else self._seq_scale
@@ -707,6 +877,13 @@ class DoseVolumeWindow(VispyViewWindow):
         transparent = self._ray_combo.currentData() == RAY_TRANSPARENT
         auto = self._auto_check.isChecked()
         linked = self._slider_is_window()
+        # γ has fixed limits, its own map, and always shows the worst voxel per ray.
+        gamma = self._gamma_mode()
+        if hasattr(self, "_gamma_group"):  # the Auto box syncs while the panel is still building
+            self._gamma_group.setVisible(gamma)
+        self._gain_box.setVisible(not gamma)
+        self._scale_combo.setEnabled(not gamma)
+        self._ray_combo.setEnabled(not gamma)
         self._scale_mode_row.setVisible(diff)
         self._error_scale_spin.setVisible(diff)
         self._gain_label.setVisible(not linked)
@@ -727,10 +904,16 @@ class DoseVolumeWindow(VispyViewWindow):
 
     def _read_config(self) -> DoseVolumeConfig:
         compare = self._comparing()
+        gamma = self._gamma_mode()
+        crit = self._gamma_criteria()
         return DoseVolumeConfig(
             grain=self._grain_combo.currentData(),
             xy_mode=self._xy_combo.currentData(),
-            overlay_plan=compare,
+            overlay_plan=compare or gamma,
+            gamma=gamma,
+            gamma_dose_pct=crit.dose_pct,
+            gamma_dta_mm=crit.dta_mm,
+            gamma_cutoff_pct=crit.cutoff_pct,
             error_mode=self._error_combo.currentData(),
             error_scale=self._error_scale_value(),
             weight_mode=self._weight_combo.currentData(),
@@ -740,9 +923,14 @@ class DoseVolumeWindow(VispyViewWindow):
             splat_cap=self._cap_spin.value(),
             gantry_deg=self._gantry_spin.value(),
             medium=self._medium_combo.currentData(),
+            phantom_mm=self._phantom_spin.value(),
+            auto_margin_sigma=self._margin_spin.value(),
+            entrance_wet_mm=self._wet_spin.value(),
             ray_mode=self._ray_combo.currentData(),
             scale=active_scale(compare, self._scale_combo.currentData() or DEFAULT_SCALE),
             auto_scale=self._auto_check.isChecked(),
+            voxel_mm=self._voxel_spin.value(),
+            smooth=self._smooth_check.isChecked(),
         )
 
     def _set_combo(self, combo: QComboBox, value: str) -> None:
@@ -755,26 +943,37 @@ class DoseVolumeWindow(VispyViewWindow):
         try:
             self._set_combo(self._grain_combo, config.grain)
             self._set_combo(self._xy_combo, config.xy_mode)
-            self._set_combo(self._show_combo, "difference" if config.overlay_plan else "dose")
-            allowed = {name for name, _label in scales_for(config.overlay_plan)}
+            show = "gamma" if config.gamma else "difference" if config.overlay_plan else "dose"
+            self._set_combo(self._show_combo, show)
+            compare = show == "difference"
+            allowed = {name for name, _label in scales_for(compare)}
             if config.scale in allowed:
-                if config.overlay_plan:
+                if compare:
                     self._div_scale = config.scale
                 else:
                     self._seq_scale = config.scale
-            self._fill_scale_combo(config.overlay_plan)
+            self._fill_scale_combo(compare)
+            self._gamma_dd_spin.setValue(config.gamma_dose_pct)
+            self._gamma_dta_spin.setValue(config.gamma_dta_mm)
+            self._gamma_cut_spin.setValue(config.gamma_cutoff_pct)
             self._set_combo(self._error_combo, config.error_mode)
             self._configure_error_scale_spin(config.error_mode, config.error_scale)
             self._set_combo(self._medium_combo, config.medium)
+            self._phantom_spin.setValue(config.phantom_mm)
+            self._margin_spin.setValue(config.auto_margin_sigma)
+            self._sync_phantom_controls()
+            self._wet_spin.setValue(config.entrance_wet_mm)
             self._set_combo(self._weight_combo, config.weight_mode)
             self._set_combo(self._ray_combo, config.ray_mode)
             self._auto_check.setChecked(config.auto_scale)
             self._gain = max(0.0, min(1.0, float(config.gain)))
             self._sync_color_controls()
             self._gap_spin.setValue(config.ic_gap_mm)
-            self._gap_spin.setEnabled(config.weight_mode == WEIGHT_PROTONS)
+            self._gap_spin.setEnabled(config.weight_mode != WEIGHT_MU)
             self._smear_spin.setValue(config.smear_axis_units)
             self._cap_spin.setValue(config.splat_cap)
+            self._voxel_spin.setValue(config.voxel_mm)
+            self._smooth_check.setChecked(config.smooth)
             self._gantry_spin.setValue(config.gantry_deg)
         finally:
             self._updating = False
@@ -787,6 +986,7 @@ class DoseVolumeWindow(VispyViewWindow):
         config.grain = preset.grain
         config.xy_mode = preset.xy_mode
         config.overlay_plan = preset.overlay_plan
+        config.gamma = False
         grain_changed = config.grain != self._loaded_grain
         self._set_config(config)
         if grain_changed:
@@ -853,7 +1053,7 @@ class DoseVolumeWindow(VispyViewWindow):
     def _on_weight_mode_changed(self, *_args) -> None:
         if self._updating:
             return
-        self._gap_spin.setEnabled(self._weight_combo.currentData() == WEIGHT_PROTONS)
+        self._gap_spin.setEnabled(self._weight_combo.currentData() != WEIGHT_MU)
         if self._error_combo.currentData() == ERROR_ABSOLUTE:
             self._updating = True
             try:
@@ -917,10 +1117,16 @@ class DoseVolumeWindow(VispyViewWindow):
         self._scene.set_gain(self._gain)
         self._update_legend()
 
+    def _drawn_difference(self) -> bool:
+        """What the volume actually shows; Difference falls back to dose without a plan."""
+        return self._comparing() and self._scene.difference
+
     def _legend_numbers(self) -> tuple[float, float]:
+        if self._scene.gamma:
+            return 0.0, float(self._gamma_criteria().cap)
         auto = self._auto_check.isChecked()
         percent = (
-            self._comparing()
+            self._drawn_difference()
             and self._error_combo.currentData() == ERROR_PERCENT
         )
         if auto and self._scene.auto_lo is not None and self._scene.auto_hi is not None:
@@ -935,7 +1141,7 @@ class DoseVolumeWindow(VispyViewWindow):
         mode = self._ray_combo.currentData()
         integral = mode == RAY_INTEGRAL
         return manual_color_limits(
-            difference=self._comparing(),
+            difference=self._drawn_difference(),
             transparent=mode == RAY_TRANSPARENT,
             integral=integral,
             gain=self._gain_value(),
@@ -946,20 +1152,23 @@ class DoseVolumeWindow(VispyViewWindow):
         )
 
     def _legend_title(self, *, percent: bool) -> str:
-        if self._comparing():
+        if self._scene.gamma:
+            crit = self._gamma_criteria()
+            title = f"γ {crit.dose_pct:g} % / {crit.dta_mm:g} mm"
+            rate = gamma_pass_rate(self._scene.gamma_pass)
+            return title if rate is None else f"{title} · {rate:.1f} % pass"
+        density = self._density_unit()
+        if self._drawn_difference():
             if percent:
-                return "meas − plan (%)"
-            if self._weight_combo.currentData() == WEIGHT_PROTONS:
-                return "meas − plan"
-            return "meas − plan (MU)"
-        protons = self._weight_combo.currentData() == WEIGHT_PROTONS
-        unit = "protons" if protons else "MU"
-        per_area = self._ray_combo.currentData() == RAY_INTEGRAL
-        return f"{unit} / mm²" if per_area else f"{unit} / mm³"
+                return "meas − plan (% of peak)"
+            return f"meas − plan ({density})"
+        return density
 
     def _update_legend(self) -> None:
-        compare = self._comparing()
+        compare = self._drawn_difference()
         name = active_scale(compare, self._scale_combo.currentData() or DEFAULT_SCALE)
+        if self._scene.gamma:
+            name = GAMMA_CMAP
         percent = compare and self._error_combo.currentData() == ERROR_PERCENT
         lo, hi = self._legend_numbers()
         self._color_axis.set_scale(name, lo, hi, self._legend_title(percent=percent))
@@ -969,27 +1178,42 @@ class DoseVolumeWindow(VispyViewWindow):
             return
         self._schedule_refresh()
 
-    def _update_session_legend(self, loaded_ids: list[str], colors: list[str]) -> None:
-        while self._legend_layout.count():
-            item = self._legend_layout.takeAt(0)
-            widget = item.widget()
-            if widget is not None:
-                widget.deleteLater()
-        if not loaded_ids:
-            self._legend_group.setVisible(False)
+    def _show_gamma_verdict(self) -> None:
+        if not self._scene.gamma:
+            self._gamma_label.setText("Needs a plan to compare against" if self._gamma_mode() else "—")
+            self._gamma_label.setStyleSheet("")
             return
-        self._legend_group.setVisible(len(loaded_ids) > 1)
-        for sid, color in zip(loaded_ids, colors):
-            row = QWidget()
-            row_layout = QHBoxLayout(row)
-            row_layout.setContentsMargins(0, 0, 0, 0)
-            swatch = QLabel()
-            swatch.setFixedSize(12, 12)
-            swatch.setStyleSheet(f"background-color: {color}; border: 1px solid #666;")
-            label = QLabel(format_session_legend_label(sid, self._notes))
-            row_layout.addWidget(swatch)
-            row_layout.addWidget(label, stretch=1)
-            self._legend_layout.addWidget(row)
+        tally = self._scene.gamma_pass
+        rate = gamma_pass_rate(tally)
+        verdict, color = gamma_verdict(rate)
+        head = "—" if rate is None else f"{rate:.1f} % pass ({tally[0]:,} of {tally[1]:,} voxels)"
+        self._gamma_label.setText(f"{head}\n{verdict}")
+        self._gamma_label.setStyleSheet(f"color: {color}; font-weight: 600;")
+
+    def _update_session_list(self, loaded_ids: list[str]) -> None:
+        """One radio per loaded session; rebuilt only when the set changes, so the pick holds."""
+        if self._active_session not in loaded_ids:
+            self._active_session = loaded_ids[0] if loaded_ids else None
+        if loaded_ids == self._listed_ids:
+            return
+        self._listed_ids = list(loaded_ids)
+        for button in self._session_buttons.buttons():
+            self._session_buttons.removeButton(button)
+            button.deleteLater()
+        for i, sid in enumerate(loaded_ids):
+            text = format_session_legend_label(sid, self._notes)
+            radio = QRadioButton(text)
+            radio.setToolTip(text)
+            radio.setChecked(sid == self._active_session)
+            self._session_buttons.addButton(radio, i)
+            self._session_layout.addWidget(radio)
+        self._session_group.setVisible(len(loaded_ids) > 1)
+
+    def _on_session_picked(self, index: int) -> None:
+        if 0 <= index < len(self._listed_ids) and self._listed_ids[index] != self._active_session:
+            self._active_session = self._listed_ids[index]
+            self._scene.reframe()
+            self._schedule_refresh()
 
     def _show_status(self, message: str) -> None:
         self._scene.render(
@@ -1037,12 +1261,10 @@ class DoseVolumeWindow(VispyViewWindow):
         if gen != self._refresh_generation:
             return
         self.setWindowTitle(config.title)
-        loaded_ids = [sid for sid in self._session_ids if sid in self._sources]
-        colors = default_session_colors(len(loaded_ids))
-        self._update_session_legend(loaded_ids, colors)
+        self._update_session_list([sid for sid in self._session_ids if sid in self._sources])
         measured_batch, plan_batch, axis, n_raw, n_used = build_view_batches(
             self._sources,
-            loaded_ids,
+            [self._active_session] if self._active_session else [],
             config,
             self._base_dir,
             plan_rgb=(1.0, 1.0, 1.0),
@@ -1072,9 +1294,14 @@ class DoseVolumeWindow(VispyViewWindow):
             weight_mode=config.weight_mode, ic_gap_mm=config.ic_gap_mm,
             smear=config.smear_axis_units, ray_mode=config.ray_mode,
             scale=config.scale, auto_scale=config.auto_scale,
+            voxel_mm=config.voxel_mm, smooth=config.smooth,
+            gamma=config.gamma and residual, gamma_criteria=self._gamma_criteria(),
+            phantom_mm=config.phantom_mm, entrance_wet_mm=config.entrance_wet_mm,
+            auto_margin_sigma=config.auto_margin_sigma,
         )
         self._maybe_seed_absolute_window()
         self._update_legend()
+        self._show_gamma_verdict()
         info = (
             f"{n_used:,} spots\n"
             f"{n_raw:,} raw samples\n"
@@ -1082,7 +1309,9 @@ class DoseVolumeWindow(VispyViewWindow):
         )
         if self._scene.volume_note:
             info += f"\n{self._scene.volume_note}"
-        if config.overlay_plan and plan_batch is not None and not has_dose:
+        if config.overlay_plan and not residual:
+            info += "\nNo plan to compare against; showing measured"
+        elif config.overlay_plan and plan_batch is not None and not has_dose:
             info += "\nMeasured volume uses plan MU (no spot dose)"
         self._info_label.setText(info)
 

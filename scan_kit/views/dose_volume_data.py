@@ -42,6 +42,7 @@ from ..common.timeslice_table import load_energy_tagged_table
 from ..common.trajectory_fits import fit_iso_plane, fit_magnet_pivot
 from ..data.reference_frame import timeslice_position_table_hooks
 from ..data.types import REFERENCE_CHAMBER, REFERENCE_ISO
+from .dose_volume_physics import csda_range_mm, depth_sigma_mm, medium_for
 from .dose_volume_catalog import (
     GRAIN_SPOT,
     GRAIN_TIMESLICE,
@@ -84,13 +85,6 @@ class DepthAxis(Protocol):
     ) -> np.ndarray: ...
 
 
-# Bortfeld 1997: R_cm = 0.0022 E^{1.77}. Copper uses water range / ρ_Cu.
-# ponytail: density scale only; I-value CSDA tables if the range looks off.
-_BORTFELD_P = 1.77
-_BORTFELD_ALPHA_WATER_MM = 0.022
-_RHO_COPPER_G_CM3 = 8.96
-
-
 @dataclass(frozen=True)
 class LinearEnergyAxis:
     """Linear MeV→mm (tests / protocol). Live view uses :class:`RangeAxis`."""
@@ -113,44 +107,33 @@ class LinearEnergyAxis:
 
 @dataclass(frozen=True)
 class RangeAxis:
-    """CSDA-like proton range: ``R = α E^p`` (mm, MeV).
+    """CSDA proton range from Bethe stopping-power tables (mm, MeV).
 
     Scene +Z is up. Depth is ``−R`` so higher energy is deeper *and* sits at
     the bottom of the stack at gantry 0° (beam from the sky). The guide axis
-    points the same way (``depth_sign = −1``).
+    points the same way (``depth_sign = −1``). The smear argument is the
+    beam's energy spread σE in %; σz adds range straggling in quadrature.
     """
 
     medium: str
-    alpha_mm: float
-    p: float = _BORTFELD_P
     axis_label: str = "Depth in water (mm)"
-    smear_label: str = "MeV"
+    smear_label: str = "%"
     depth_sign: int = -1
 
     def z_scene_mm(self, energy_mev: np.ndarray) -> np.ndarray:
-        e = np.maximum(np.asarray(energy_mev, dtype=float), 0.0)
-        return -(self.alpha_mm * np.power(e, self.p))
+        e = np.maximum(np.asarray(energy_mev, dtype=float), 1.0)
+        return -csda_range_mm(medium_for(self.medium), e)
 
     def sigma_z_scene_mm(
         self, energy_mev: np.ndarray, smear_axis_units: float,
     ) -> np.ndarray:
         e = np.maximum(np.asarray(energy_mev, dtype=float), 1.0)
-        dr_de = self.alpha_mm * self.p * np.power(e, self.p - 1.0)
-        return np.maximum(np.abs(dr_de * float(smear_axis_units)), 1e-6)
+        return np.maximum(depth_sigma_mm(medium_for(self.medium), e, float(smear_axis_units)), 1e-6)
 
 
 def range_axis_for_medium(medium: str) -> RangeAxis:
-    if medium == MEDIUM_COPPER:
-        return RangeAxis(
-            medium=MEDIUM_COPPER,
-            alpha_mm=_BORTFELD_ALPHA_WATER_MM / _RHO_COPPER_G_CM3,
-            axis_label="Depth in copper (mm)",
-        )
-    return RangeAxis(
-        medium=MEDIUM_WATER,
-        alpha_mm=_BORTFELD_ALPHA_WATER_MM,
-        axis_label="Depth in water (mm)",
-    )
+    key = MEDIUM_COPPER if medium == MEDIUM_COPPER else MEDIUM_WATER
+    return RangeAxis(medium=key, axis_label=f"Depth in {key} (mm)")
 
 
 @dataclass(frozen=True)

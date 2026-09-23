@@ -12,6 +12,7 @@ from scan_kit.views.dose_volume_catalog import (
     AGREE_TRANSPARENT,
     ERROR_ABSOLUTE,
     SplatConfig,
+    WEIGHT_DOSE,
     WEIGHT_MU,
     WEIGHT_PROTONS,
     XY_IC1,
@@ -157,13 +158,16 @@ def test_range_axis_deeper_for_higher_energy() -> None:
     z = water.z_scene_mm(np.array([70.0, 100.0, 230.0]))
     # Beam from +Z (sky): higher energy is more negative (bottom at gantry 0°).
     assert z[0] > z[1] > z[2]
-    np.testing.assert_allclose(z[1], -76.3, atol=1.5)
+    np.testing.assert_allclose(z[1], -77.2, atol=0.5)
     copper = range_axis_for_medium("copper")
     z_cu = copper.z_scene_mm(np.array([100.0]))
-    np.testing.assert_allclose(z_cu[0] / z[1], 1.0 / 8.96, rtol=1e-3)
-    smear = water.sigma_z_scene_mm(np.array([100.0]), 1.0)
-    # dR/dE = p R / E at 100 MeV ≈ 1.77 * 76.3 / 100 mm per MeV.
-    np.testing.assert_allclose(smear[0], 1.77 * abs(z[1]) / 100.0, rtol=1e-5)
+    assert 1.0 / 8.96 < z_cu[0] / z[1] < 1.6 / 8.96
+    # Straggling alone is ~1.1 % of range; 1 % energy spread adds ~1.7 %.
+    bare = water.sigma_z_scene_mm(np.array([100.0]), 0.0)[0]
+    spread = water.sigma_z_scene_mm(np.array([100.0]), 1.0)[0]
+    assert 0.009 < bare / abs(z[1]) < 0.014
+    assert spread > 1.5 * bare
+    assert water.smear_label == "%"
     assert water.depth_sign == -1
     assert "water" in water.axis_label.lower()
     assert "copper" in copper.axis_label.lower()
@@ -233,6 +237,35 @@ def test_volume_frame_centers_the_grid() -> None:
 def test_one_spot_integrates_to_its_mu() -> None:
     vol = _spot_volume((0.0, 0.0, 0.0), 2.0, 3.0, origin=(-8.0, -8.0, -8.0), shape=(16, 16, 16))
     assert vol.sum() == pytest.approx(3.0, rel=1e-3)
+
+
+def test_coarse_voxels_still_conserve_mu() -> None:
+    from scan_kit.views.dose_volume_vispy import box_edge_segments
+
+    grid = DoseGrid(np.array([-8.0, -8.0, -8.0]), (8, 8, 8), False, voxel=2.0)
+    vol = deposit_gaussians(
+        np.zeros((1, 3)), np.full((1, 3), 2.0), np.array([3.0]), np.zeros(1),
+        _ZAtEnergy(2.0), grid,
+    )
+    assert vol.shape == (8, 8, 8)
+    assert vol.sum() == pytest.approx(3.0, rel=1e-3)
+    edges = box_edge_segments(grid.origin, grid.extent_mm)
+    assert edges.shape == (24, 3)
+    lengths = np.linalg.norm(edges[1::2] - edges[::2], axis=1)
+    np.testing.assert_allclose(lengths, 16.0)
+
+
+def test_background_is_the_scale_zero_color() -> None:
+    from matplotlib import colormaps
+
+    from scan_kit.views.dose_volume_fill import ink_rgb, zero_rgb
+
+    np.testing.assert_allclose(zero_rgb("viridis", 0.0, 5.0), colormaps["viridis"](0.0)[:3])
+    np.testing.assert_allclose(zero_rgb("PuOr_r", -2.0, 2.0), colormaps["PuOr_r"](0.5)[:3])
+    np.testing.assert_allclose(zero_rgb("berlin", -1.0, 3.0), colormaps["berlin"](0.25)[:3])
+    np.testing.assert_allclose(zero_rgb("viridis", 1.0, 5.0), colormaps["viridis"](0.0)[:3])
+    assert sum(ink_rgb((1.0, 1.0, 1.0))) < 1.0
+    assert sum(ink_rgb((0.0, 0.0, 0.0))) > 2.0
 
 
 def test_equal_volumes_cancel() -> None:
@@ -370,8 +403,8 @@ def test_difference_scale_cannot_stay_sequential() -> None:
     from scan_kit.views.dose_volume_fill import colormap_samples
 
     assert active_scale(False, "coolwarm") == "viridis"
-    assert active_scale(True, "viridis") == "coolwarm"
-    assert active_scale(True, "seismic") == "seismic"
+    assert active_scale(True, "viridis") == "managua_r"
+    assert active_scale(True, "berlin") == "berlin"
     assert active_scale(False, "magma") == "magma"
     rgb = colormap_samples("turbo", 3)
     assert rgb.shape == (3, 3)
@@ -502,9 +535,10 @@ def test_auto_color_range_dose_keeps_zero() -> None:
     assert auto_color_range(False, -2.0, -1.0) is None
     assert auto_color_range(False, 0.0, 0.0) is None
     assert auto_color_range(False, np.nan, 1.0) is None
-    assert auto_color_range(True, -0.2, 0.5) == (-0.2, 0.5)
-    flat = auto_color_range(True, 0.25, 0.25)
-    assert flat is not None and flat[0] < 0.25 < flat[1]
+    assert auto_color_range(True, -0.2, 0.5) == (-0.5, 0.5)
+    assert auto_color_range(True, -0.7, 0.1) == (-0.7, 0.7)
+    flat = auto_color_range(True, 0.0, 0.0)
+    assert flat is not None and flat[0] < 0.0 < flat[1]
     lo, hi = manual_color_limits(
         difference=False, transparent=False, integral=True,
         gain=0.5, typical=0.1, ray_scale=2.0, error_scale=0.2, absolute=True,
@@ -529,8 +563,11 @@ def test_color_axis_ticks_cover_the_span_and_zero() -> None:
     from scan_kit.views.dose_volume_window import color_axis_ticks
 
     majors, minors, labels, _offset = color_axis_ticks(-0.2, 0.5)
-    assert majors[0] >= -0.2 - 1e-6
-    assert majors[-1] <= 0.5 + 1e-6
+    assert majors[0] == -0.2 and majors[-1] == 0.5
+    ends, _, end_labels, _ = color_axis_ticks(0.013, 0.587)
+    assert (ends[0], ends[-1]) == (0.013, 0.587)
+    assert end_labels[0] == "0.013" and end_labels[-1] == "0.587"
+    assert np.all(np.diff(ends) > 0)
     assert any(abs(float(v)) < 1e-9 for v in majors)
     assert len(labels) == len(majors)
     assert len(minors) >= 4
@@ -569,17 +606,50 @@ def test_dose_volume_window_opens_with_absolute_scale(qapp, tmp_path) -> None:
 
     window = DoseVolumeWindow([], str(tmp_path))
     try:
-        assert window._weight_combo.currentData() == WEIGHT_MU
+        assert window._weight_combo.currentData() == WEIGHT_DOSE
         assert window._error_combo.currentData() == ERROR_ABSOLUTE
         assert window._error_scale_spin.value() == pytest.approx(DEFAULT_ERROR_MU)
-        assert window._error_scale_spin.suffix() == " MU/mm²"
+        assert window._error_scale_spin.suffix() == " Gy·mm"
+        assert window._smear_spin.suffix() == " %"
+        assert window._gap_spin.isEnabled()
+        assert window._gamma_group.isHidden()
+        def group_of(widget):
+            return widget.parentWidget().parentWidget().title()
+
+        assert [group_of(w) for w in (window._grain_combo, window._gap_spin, window._cap_spin)] == ["Beam"] * 3
+        assert [group_of(w) for w in (window._medium_combo, window._margin_spin, window._wet_spin)] == ["Phantom"] * 3
+        assert [group_of(w) for w in (window._weight_combo, window._voxel_spin)] == ["Volume"] * 2
+        # Session radios sit above Beam, show only for 2+, and the pick survives a rebuild.
+        assert window._session_group.isHidden()
+        window._update_session_list(["s1", "s2"])
+        column = window._session_group.parentWidget().layout()
+        beam = window._grain_combo.parentWidget().parentWidget()
+        assert column.indexOf(window._session_group) < column.indexOf(beam)
+        assert not window._session_group.isHidden()
+        radios = window._session_buttons.buttons()
+        assert radios[0].isChecked() and window._active_session == "s1"
+        radios[1].click()
+        window._update_session_list(["s1", "s2"])
+        assert window._active_session == "s2" and radios[1].isChecked()
+        window._update_session_list(["s1"])
+        assert window._active_session == "s1" and window._session_group.isHidden()
+        assert window._phantom_spin.text() == "Auto"
+        assert window._margin_spin.value() == 5.0 and window._margin_spin.isEnabled()
+        window._phantom_spin.setValue(200.0)
+        assert not window._margin_spin.isEnabled()
+        window._phantom_spin.setValue(0.0)
+        assert window._wet_spin.value() == 0.0
         assert window._scale_mode_row.isHidden()
         assert window._grain_combo.parentWidget().findChild(QLabel).text() == "Grain"
         assert window._cap_spin.parentWidget().findChild(QLabel).text() == "Spot cap"
-        gutter = window._color_axis.parentWidget()
-        assert gutter.layout().indexOf(window._color_axis) == 0
-        assert gutter.layout().indexOf(window._side_scroll) == 1
-        assert window._splitter.widget(1) is gutter
+        # The splitter handle sits between the axis and the controls.
+        view = window._color_axis.parentWidget()
+        assert view.layout().indexOf(window._plot_host) == 0
+        assert view.layout().indexOf(window._color_axis) == 1
+        assert window._splitter.widget(0) is view
+        assert window._splitter.widget(1) is window._side_scroll
+        assert window._voxel_spin.value() == 1.0
+        assert window._smooth_check.isChecked()
         assert window._color_axis.minimumWidth() == window._color_axis.maximumWidth()
         assert window._auto_check.isChecked()
         assert not window._gain_box.isHidden()
@@ -588,6 +658,9 @@ def test_dose_volume_window_opens_with_absolute_scale(qapp, tmp_path) -> None:
         window._set_combo(window._show_combo, "difference")
         window._updating = False
         window._sync_color_controls()
+        # No plan loaded, so the volume is still dose and the axis must say so.
+        window._update_legend()
+        assert window._color_axis._title == "Gy·mm"
         assert not window._gain_box.isHidden()
         assert not window._scale_mode_row.isHidden()
         assert not window._error_scale_spin.isHidden()
@@ -613,6 +686,16 @@ def test_dose_volume_window_opens_with_absolute_scale(qapp, tmp_path) -> None:
         assert not window._scale_mode_row.isHidden()
         assert window._error_scale_spin.isEnabled()
         assert window._window_label.text() == "Opacity"
+        window._updating = True
+        window._set_combo(window._show_combo, "gamma")
+        window._updating = False
+        window._sync_color_controls()
+        assert not window._gamma_group.isHidden()
+        assert window._gain_box.isHidden()
+        assert not window._ray_combo.isEnabled()
+        config = window._read_config()
+        assert config.gamma and config.overlay_plan
+        assert (config.gamma_dose_pct, config.gamma_dta_mm, config.gamma_cutoff_pct) == (3.0, 2.0, 10.0)
     finally:
         window.close()
         window.deleteLater()
@@ -679,19 +762,235 @@ def test_offscreen_dose_volume_render(qapp) -> None:
             color=gloo.RenderBuffer((height, width)),
             depth=gloo.RenderBuffer((height, width)),
         )
+        from OpenGL.GL import GL_CURRENT_PROGRAM, glGetIntegerv
+
         canvas.push_fbo(fbo, (0, 0), (width, height))
         try:
             canvas.on_draw(None)
-            img = np.asarray(fbo.read())
-        finally:
+        except Exception as exc:
             canvas.pop_fbo()
-        broken = scene._broken
-        auto_hi = scene.auto_hi
+            pytest.skip(f"visPy cannot ray march offscreen: {exc}")
     except Exception as exc:
         pytest.skip(f"visPy cannot ray march offscreen: {exc}")
+    try:
+        first = np.asarray(fbo.read())
+        env = canvas.context.shared.parser.env.get("current_program")
+        real = int(np.asarray(glGetIntegerv(GL_CURRENT_PROGRAM)).reshape(-1)[0])
+        # A uniform queued after the march must land on the box program.
+        scene.set_gain(0.5)
+        canvas.on_draw(None)
+        img = np.asarray(fbo.read())
+    finally:
+        canvas.pop_fbo()
+    broken = scene._broken
+    auto_hi = scene.auto_hi
+    # Three axes plus the box; each must depth test against the march, not inherit its "always".
+    assert len(scene._late) == 4
+    assert all(
+        line._line_visual._vshare.gl_state.get("depth_func") == "lequal" for line in scene._late
+    )
+    assert env == real
     assert not broken
+    assert first[..., :3].max() > 0
     assert auto_hi is not None and auto_hi > 0.0
     if img.ndim != 3 or img.size == 0:
         pytest.skip("visPy render returned an empty image")
     assert img.shape[0] >= 80
     assert img[..., :3].max() > 0
+
+
+def test_water_range_matches_pstar() -> None:
+    from scan_kit.views.dose_volume_physics import WATER, csda_range_mm
+
+    # NIST PSTAR CSDA ranges in water, g/cm² (= cm).
+    for energy, pstar_cm in ((70.0, 4.080), (100.0, 7.718), (150.0, 15.77), (200.0, 25.96)):
+        assert float(csda_range_mm(WATER, energy)) == pytest.approx(pstar_cm * 10.0, rel=0.005)
+
+
+def test_copper_stops_in_less_mass_than_density_scaling_assumes() -> None:
+    from scan_kit.views.dose_volume_physics import COPPER, WATER, csda_range_mm
+
+    # Higher I and lower Z/A: copper needs ~1.5x the areal mass of water.
+    ratio = float(csda_range_mm(COPPER, 150.0)) * COPPER.rho / float(csda_range_mm(WATER, 150.0))
+    assert 1.4 < ratio < 1.6
+
+
+def test_bragg_curve_conserves_energy_and_r80_is_range() -> None:
+    from scan_kit.views.dose_volume_physics import (
+        WATER, bragg_idd, csda_range_mm, local_energy_fraction,
+    )
+
+    e0 = 150.0
+    r0 = float(csda_range_mm(WATER, e0))
+    z = np.linspace(0.0, r0 + 30.0, 20001)
+    idd = bragg_idd(WATER, e0, 1.0, z)
+    total = float(np.sum(0.5 * (idd[1:] + idd[:-1]) * np.diff(z)))
+    assert total / e0 == pytest.approx(local_energy_fraction(WATER, e0), rel=2e-3)
+    peak = int(np.argmax(idd))
+    distal = z[peak:][idd[peak:] <= 0.8 * idd[peak]][0]
+    assert distal == pytest.approx(r0, abs=0.5)
+    assert 0.2 < idd[0] / idd[peak] < 0.35
+
+
+def test_scatter_at_end_of_range_near_preston_koehler() -> None:
+    from scan_kit.views.dose_volume_physics import WATER, csda_range_mm, mcs_sigma_mm
+
+    for energy in (100.0, 160.0, 230.0):
+        r0 = float(csda_range_mm(WATER, energy))
+        pk_mm = 0.0294 * (r0 / 10.0) ** 0.896 * 10.0
+        assert float(mcs_sigma_mm(WATER, energy, r0)) == pytest.approx(pk_mm, rel=0.08)
+
+
+def test_layer_kernel_conserves_mass_and_widens_with_depth() -> None:
+    from scan_kit.views.dose_volume_physics import WATER, LayerDoseKernel, build_layer_tables
+
+    kernel = LayerDoseKernel(build_layer_tables(WATER, [120.0], 1.0, nodes=512))
+    center = np.array([[0.0, 0.0, 0.0]])
+    sigma = np.array([[3.0, 3.0, 1.0]])
+    c, s = kernel.span(center, sigma, [120.0])
+    grid = dose_grid(c, s, voxel_mm=1.0)
+    vol = deposit_gaussians(center, sigma, np.array([2.0]), np.array([120.0]), kernel, grid)
+    assert float(vol.sum()) == pytest.approx(2.0, rel=1e-3)
+    # Rows are z; the deepest dose is wider than at the surface.
+    rows = vol.sum(axis=1)
+    width = lambda row: float(np.sum(row > 0.5 * row.max()))  # noqa: E731
+    live = [i for i in range(rows.shape[0]) if rows[i].max() > 0.2 * rows.max()]
+    assert width(rows[live[0]]) > width(rows[live[-1]])
+
+
+def test_finite_phantom_keeps_only_the_dose_inside() -> None:
+    from scan_kit.views.dose_volume_physics import WATER, LayerDoseKernel, build_layer_tables
+
+    # 150 MeV ranges out at ~158 mm, so a 100 mm phantom holds the plateau only.
+    kernel = LayerDoseKernel(build_layer_tables(WATER, [150.0], 1.0, nodes=512))
+    center, sigma, energy = np.zeros((1, 3)), np.full((1, 3), 3.0), np.array([150.0])
+    c, s = kernel.span(center, sigma, energy)
+    grid = dose_grid(c, s, voxel_mm=1.0, z_floor=-100.0)
+    assert grid.origin[2] == pytest.approx(-100.0)
+    vol = deposit_gaussians(center, sigma, np.array([1.0]), energy, kernel, grid)
+    inside = float(kernel.mass_fraction(150.0, -100.0, 0.0))
+    assert 0.2 < inside < 0.6
+    assert float(vol.sum()) == pytest.approx(inside, rel=1e-3)
+
+
+def test_entrance_wet_takes_range_and_a_little_fluence() -> None:
+    from scan_kit.views.dose_volume_physics import WATER, csda_range_mm, through_wet
+
+    e = np.array([100.0, 150.0, 60.0])
+    e_in, kept = through_wet(e, 30.0)
+    np.testing.assert_allclose(csda_range_mm(WATER, e_in[:2]), csda_range_mm(WATER, e[:2]) - 30.0, atol=0.05)
+    # ~1.2 % of primaries per cm of water go to nuclear interactions.
+    assert 0.95 < kept[1] < 0.975
+    # 60 MeV ranges out at ~31 mm, just past 30 mm; far less makes it with 40 mm.
+    assert through_wet([60.0], 40.0)[1][0] == 0.0
+
+
+def test_auto_depth_for_250_mev_in_water() -> None:
+    from scan_kit.views.dose_volume_physics import WATER
+    from scan_kit.views.dose_volume_vispy import auto_depth_mm
+
+    # R ≈ 379 mm, σ ≈ 7.5 mm at 1 % spread.
+    assert auto_depth_mm(WATER, [70.0, 250.0], 1.0, 5.0) == pytest.approx(417.0, abs=2.0)
+    assert auto_depth_mm(WATER, [70.0, 250.0], 1.0, 3.0) == pytest.approx(402.0, abs=2.0)
+    assert auto_depth_mm(WATER, [], 1.0, 5.0) == 0.0
+
+
+def test_phantom_box_spans_surface_to_back_face() -> None:
+    from scan_kit.views.dose_volume_vispy import phantom_box
+
+    # Stops mode: the grid starts below the surface, the phantom still starts at 0.
+    o, e = phantom_box([-30.0, -20.0, -200.0], [60.0, 40.0, 163.0], 200.0, pad_mm=10.0)
+    np.testing.assert_allclose(o, [-40.0, -30.0, -200.0])
+    np.testing.assert_allclose(o + e, [40.0, 30.0, 0.0])
+
+
+def test_phantom_note_reports_depth_and_losses() -> None:
+    from scan_kit.views.dose_volume_physics import WATER
+    from scan_kit.views.dose_volume_vispy import phantom_note
+
+    auto = phantom_note(WATER, 169.2, 0.0, auto=True, n_nozzle=2, entry_energy=[100.0, 150.0])
+    assert auto == "Phantom auto 170 mm water"
+    fixed = phantom_note(WATER, 100.0, 20.0, auto=False, n_nozzle=4, entry_energy=[100.0, 150.0])
+    assert "Phantom 100 mm water" in fixed
+    assert "50 % of spots stop in it" in fixed
+    assert "50 % of spots range out past the back" in fixed
+
+
+def test_gamma_passes_identical_and_fails_scaled() -> None:
+    from scan_kit.views.dose_volume_physics import GammaCriteria, gamma_index
+
+    z, y, x = np.mgrid[0:12, 0:12, 0:12].astype(float)
+    ref = np.exp(-((x - 6) ** 2 + (y - 6) ** 2 + (z - 6) ** 2) / 8.0)
+    crit = GammaCriteria()
+    gam, passed, n = gamma_index(ref, ref, 1.0, crit)
+    assert n > 0 and passed == n and float(gam.max()) == 0.0
+    # 1 mm shift is inside 2 mm DTA; a 10 % hot plan is outside 3 %.
+    _g, passed, n = gamma_index(np.roll(ref, 1, axis=2), ref, 1.0, crit)
+    assert passed == n
+    _g, passed, n = gamma_index(ref * 1.1, ref, 1.0, crit)
+    assert passed < n
+
+
+def test_sequential_scales_start_dark_and_brighten() -> None:
+    from scan_kit.views.dose_volume_catalog import DIVERGENT_SCALES, SEQUENTIAL_SCALES
+    from scan_kit.views.dose_volume_fill import colormap_samples
+
+    luma = np.array([0.2126, 0.7152, 0.0722])
+    for name, _label in SEQUENTIAL_SCALES:
+        y = colormap_samples(name, 64) @ luma
+        assert y[0] < 0.25, name
+        # Turbo is a rainbow and ends on dark red by design.
+        assert name == "turbo" or y[-1] > y[0] + 0.5, name
+    assert DIVERGENT_SCALES[0][0] == "managua_r"
+
+
+def test_gamma_verdict_follows_tg218_limits() -> None:
+    from scan_kit.views.dose_volume_window import gamma_pass_rate, gamma_verdict
+
+    assert gamma_pass_rate(None) is None
+    assert gamma_pass_rate((0, 0)) is None
+    assert gamma_pass_rate((95, 100)) == pytest.approx(95.0)
+    assert gamma_verdict(95.0)[0] == "Within tolerance"
+    assert gamma_verdict(92.0)[0].startswith("Below tolerance")
+    assert gamma_verdict(89.9)[0] == "Below action limit"
+
+
+def test_gpu_layer_fill_and_gamma_match_python(qapp) -> None:
+    from scan_kit.views.dose_volume_physics import (
+        WATER, GammaCriteria, LayerDoseKernel, build_layer_tables, gamma_index,
+    )
+    from scan_kit.views.dose_volume_raycast import (
+        _alloc_texture, _gl_at_least, _spot_array, gamma_texture, gpu_fill_texture, read_texture,
+    )
+    from scan_kit.views.vispy_plot import make_scene_canvas
+
+    try:
+        canvas = make_scene_canvas(size=(64, 64), show=False, gl="gl+")
+        canvas.set_current()
+    except Exception as exc:
+        pytest.skip(f"visPy canvas unavailable: {exc}")
+    if not _gl_at_least(4, 3):
+        pytest.skip("OpenGL 4.3 compute unavailable")
+    energy = np.array([90.0, 110.0, 110.0])
+    kernel = LayerDoseKernel(build_layer_tables(WATER, energy, 1.0, nodes=512))
+    center = np.array([[0.0, 0.0, 0.0], [6.0, -4.0, 0.0], [-5.0, 3.0, 0.0]])
+    sigma = np.full((3, 3), 3.0)
+    weight = np.array([1.0, 2.0, 1.5])
+    c, s = kernel.span(center, sigma, energy)
+    grid = dose_grid(c, s, voxel_mm=2.0)
+    nx, ny, nz = grid.shape
+    want = deposit_gaussians(center, sigma, weight, energy, kernel, grid) / grid.voxel**3
+    tex = [_alloc_texture((nz, ny, nx)) for _ in range(3)]
+    gpu_fill_texture(canvas, tex[0], _spot_array(center, sigma, weight, energy, kernel), grid, kernel.tables)
+    got = read_texture(canvas, tex[0], (nz, ny, nx))
+    assert np.abs(got - want).max() <= 1e-3 * want.max()
+
+    # Plan is 5 % hotter: GPU pass count and γ must match the Python search.
+    tex[1].set_data(np.ascontiguousarray(want * 1.05, dtype=np.float32))
+    crit = GammaCriteria()
+    passed, n = gamma_texture(canvas, tex[0], tex[1], tex[2], grid, crit)
+    gam = read_texture(canvas, tex[2], (nz, ny, nx))
+    ref_gam, ref_pass, ref_n = gamma_index(got, want * 1.05, grid.voxel, crit)
+    assert n == ref_n and abs(passed - ref_pass) <= max(2, ref_n // 500)
+    assert np.abs(gam - ref_gam).max() < 0.02
+

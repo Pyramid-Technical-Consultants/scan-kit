@@ -1,8 +1,8 @@
-"""GPU tile fill and box ray march for a 1 mm dose volume.
+"""GPU tile fill and box ray march for a voxel dose volume.
 
-Compute builds the 2D beam-plane tile lists, then writes 8 mm bricks into an
-``r32ui`` image. A second dispatch unpacks that into the float texture the
-ray marcher samples. Below OpenGL 4.3 the same integral runs in Python.
+Compute builds the 2D beam-plane tile lists, then writes 8-cell bricks of
+MU / mm³ straight into the float texture the ray marcher samples. Below
+OpenGL 4.3 the same integral runs in Python.
 """
 
 from __future__ import annotations
@@ -21,8 +21,19 @@ from .dose_volume_fill import (
     tile_shape,
     tile_slot_capacity,
 )
+from .dose_volume_physics import GammaCriteria, LayerDoseKernel, gamma_index, gamma_offsets
 
 _log = logging.getLogger(__name__)
+
+
+class _BoundImageFilter(logging.Filter):
+    """``ray_image`` is bound by unit in raw GL, so vispy's unset warning is noise."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return "ray_image" not in record.getMessage()
+
+
+logging.getLogger("vispy").addFilter(_BoundImageFilter())
 
 _ERF = """
 float erf_as(float x) {
@@ -43,17 +54,19 @@ float gmass(float mu, float sigma, float lo, float hi) {
 _COUNT = """
 #version 430
 layout(local_size_x = 64) in;
-struct Spot { vec4 c; vec4 s; };
+struct Spot { vec4 c; vec4 s; vec4 k; };
 layout(std430, binding = 0) readonly buffer Spots { Spot spots[]; };
 layout(std430, binding = 1) buffer Counts { uint counts[]; };
 uniform vec3 u_origin;
 uniform ivec2 u_ntiles;
 uniform int u_nspots;
+uniform float u_voxel;
 
 ivec2 span(float coord, float sigma, float origin, int ntiles) {
     float sig = max(sigma, 1e-6);
-    int t0 = int(floor((coord - 4.0 * sig - origin) / 16.0));
-    int t1 = int(floor((coord + 4.0 * sig - origin) / 16.0));
+    float tile = 16.0 * u_voxel;
+    int t0 = int(floor((coord - 4.0 * sig - origin) / tile));
+    int t1 = int(floor((coord + 4.0 * sig - origin) / tile));
     t0 = clamp(t0, 0, ntiles - 1);
     t1 = clamp(t1, 0, ntiles - 1);
     return ivec2(min(t0, t1), max(t0, t1));
@@ -106,7 +119,7 @@ void main() {
 _FILL = """
 #version 430
 layout(local_size_x = 64) in;
-struct Spot { vec4 c; vec4 s; };
+struct Spot { vec4 c; vec4 s; vec4 k; };
 layout(std430, binding = 0) readonly buffer Spots { Spot spots[]; };
 layout(std430, binding = 3) writeonly buffer Ids { uint ids[]; };
 layout(std430, binding = 4) buffer Cursors { uint cursors[]; };
@@ -114,11 +127,13 @@ uniform vec3 u_origin;
 uniform ivec2 u_ntiles;
 uniform int u_nspots;
 uniform int u_capacity;
+uniform float u_voxel;
 
 ivec2 span(float coord, float sigma, float origin, int ntiles) {
     float sig = max(sigma, 1e-6);
-    int t0 = int(floor((coord - 4.0 * sig - origin) / 16.0));
-    int t1 = int(floor((coord + 4.0 * sig - origin) / 16.0));
+    float tile = 16.0 * u_voxel;
+    int t0 = int(floor((coord - 4.0 * sig - origin) / tile));
+    int t1 = int(floor((coord + 4.0 * sig - origin) / tile));
     t0 = clamp(t0, 0, ntiles - 1);
     t1 = clamp(t1, 0, ntiles - 1);
     return ivec2(min(t0, t1), max(t0, t1));
@@ -144,16 +159,31 @@ void main() {
 _BRICK = """
 #version 430
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 8) in;
-struct Spot { vec4 c; vec4 s; };
+struct Spot { vec4 c; vec4 s; vec4 k; };
 layout(std430, binding = 0) readonly buffer Spots { Spot spots[]; };
 layout(std430, binding = 1) readonly buffer Counts { uint counts[]; };
 layout(std430, binding = 2) readonly buffer Offsets { uint offsets[]; };
 layout(std430, binding = 3) readonly buffer Ids { uint ids[]; };
-layout(binding = 0, r32ui) uniform uimage3D u_img;
+layout(binding = 1, r32f) writeonly uniform image3D u_img;
 uniform vec3 u_origin;
 uniform ivec3 u_shape;
 uniform ivec2 u_ntiles;
+uniform float u_voxel;
+// Depth-dose tables: row per energy layer, (cdf, scatter width) per node.
+uniform sampler2D u_layers;
+uniform int u_nodes;
+uniform int u_table;
 """ + _ERF + """
+// Spot: c = (x, y, z, weight), s = (span σx, span σy, σz, layer), k = (σx, σy, zmin, zmax).
+vec2 layer_at(int layer, float z, float zmin, float zmax) {
+    float t = clamp((z - zmin) / max(zmax - zmin, 1e-6), 0.0, 1.0) * float(u_nodes - 1);
+    int i0 = int(floor(t));
+    int i1 = min(i0 + 1, u_nodes - 1);
+    vec2 a = texelFetch(u_layers, ivec2(i0, layer), 0).rg;
+    vec2 b = texelFetch(u_layers, ivec2(i1, layer), 0).rg;
+    return mix(a, b, t - float(i0));
+}
+
 void main() {
     ivec3 vox = ivec3(gl_GlobalInvocationID);
     if (any(greaterThanEqual(vox, u_shape))) return;
@@ -162,11 +192,24 @@ void main() {
     uint tile = uint(ty * u_ntiles.x + tx);
     uint begin = offsets[tile];
     uint end = begin + counts[tile];
-    vec3 lo = u_origin + vec3(vox);
-    vec3 hi = lo + vec3(1.0);
+    vec3 lo = u_origin + vec3(vox) * u_voxel;
+    vec3 hi = lo + vec3(u_voxel);
     float acc = 0.0;
     for (uint k = begin; k < end; ++k) {
         Spot sp = spots[ids[k]];
+        if (u_table == 1) {
+            if (hi.z < sp.k.z || lo.z > sp.k.w) continue;
+            int layer = int(sp.s.w + 0.5);
+            float fz = layer_at(layer, hi.z, sp.k.z, sp.k.w).x
+                - layer_at(layer, lo.z, sp.k.z, sp.k.w).x;
+            float mcs = layer_at(layer, 0.5 * (lo.z + hi.z), sp.k.z, sp.k.w).y;
+            float sx = sqrt(sp.k.x * sp.k.x + mcs * mcs);
+            float sy = sqrt(sp.k.y * sp.k.y + mcs * mcs);
+            acc += sp.c.w * fz
+                * gmass(sp.c.x, sx, lo.x, hi.x)
+                * gmass(sp.c.y, sy, lo.y, hi.y);
+            continue;
+        }
         float sigz = max(sp.s.z, 1e-6);
         if (hi.z < sp.c.z - 4.0 * sigz || lo.z > sp.c.z + 4.0 * sigz) continue;
         acc += sp.c.w
@@ -174,23 +217,64 @@ void main() {
             * gmass(sp.c.y, sp.s.y, lo.y, hi.y)
             * gmass(sp.c.z, sp.s.z, lo.z, hi.z);
     }
-    uint bits = uint(clamp(round(acc * 1000000.0), 0.0, 4294967000.0));
-    imageStore(u_img, vox, uvec4(bits, 0u, 0u, 0u));
+    // One invocation owns each voxel, so the float sum is written directly.
+    imageStore(u_img, vox, vec4(acc / (u_voxel * u_voxel * u_voxel), 0.0, 0.0, 0.0));
 }
 """
 
-_UNPACK = """
+_GAMMA = """
 #version 430
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 8) in;
-layout(binding = 0, r32ui) readonly uniform uimage3D u_src;
-layout(binding = 1, r32f) writeonly uniform image3D u_dst;
+layout(std430, binding = 0) readonly buffer Offsets { vec4 offs[]; };
+layout(std430, binding = 1) buffer Tally { uint tally[2]; };
+layout(binding = 1, r32f) writeonly uniform image3D u_img;
+uniform sampler3D u_ref;
+uniform sampler3D u_evl;
 uniform ivec3 u_shape;
+uniform int u_noffs;
+uniform float u_dd;
+uniform float u_cut;
+uniform float u_cap2;
+
+float evl_at(vec3 p) {
+    vec3 b = floor(p);
+    vec3 f = p - b;
+    ivec3 i = ivec3(b);
+    float acc = 0.0;
+    for (int dz = 0; dz < 2; ++dz) {
+        for (int dy = 0; dy < 2; ++dy) {
+            for (int dx = 0; dx < 2; ++dx) {
+                ivec3 q = i + ivec3(dx, dy, dz);
+                if (any(lessThan(q, ivec3(0))) || any(greaterThanEqual(q, u_shape))) continue;
+                float w = (dx == 1 ? f.x : 1.0 - f.x) * (dy == 1 ? f.y : 1.0 - f.y)
+                    * (dz == 1 ? f.z : 1.0 - f.z);
+                acc += w * texelFetch(u_evl, q, 0).r;
+            }
+        }
+    }
+    return acc;
+}
 
 void main() {
-    ivec3 vox = ivec3(gl_GlobalInvocationID);
-    if (any(greaterThanEqual(vox, u_shape))) return;
-    float mu = float(imageLoad(u_src, vox).r) / 1000000.0;
-    imageStore(u_dst, vox, vec4(mu, 0.0, 0.0, 0.0));
+    ivec3 v = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(v, u_shape))) return;
+    float ref = texelFetch(u_ref, v, 0).r;
+    if (ref < u_cut) {
+        imageStore(u_img, v, vec4(0.0));
+        return;
+    }
+    // Offsets are sorted by distance, so once distance alone loses, stop.
+    float best = u_cap2;
+    for (int k = 0; k < u_noffs; ++k) {
+        vec4 o = offs[k];
+        if (o.w >= best) break;
+        float d = (evl_at(vec3(v) + o.xyz) - ref) / u_dd;
+        best = min(best, o.w + d * d);
+    }
+    float g = sqrt(best);
+    imageStore(u_img, v, vec4(g, 0.0, 0.0, 0.0));
+    atomicAdd(tally[1], 1u);
+    if (g <= 1.0) atomicAdd(tally[0], 1u);
 }
 """
 
@@ -213,6 +297,8 @@ uniform sampler3D u_meas;
 uniform sampler3D u_plan;
 uniform vec3 u_origin;
 uniform vec3 u_shape;
+uniform float u_voxel;
+uniform float u_smooth;
 uniform vec2 u_viewport;
 uniform float u_gain;
 uniform float u_typical;
@@ -242,14 +328,14 @@ vec3 cmap(float t) {
     return texture2D(u_cmap, vec2(clamp(t, 0.0, 1.0), 0.5)).rgb;
 }
 
-vec3 diverging(float signed_v, float window) {
-    float n = signed_v / max(window, 1e-6);
-    return cmap(clamp(0.5 + 0.5 * n, 0.0, 1.0));
+vec3 color_span(float v) {
+    float span = max(u_hi - u_lo, 1e-12);
+    return cmap(clamp((v - u_lo) / span, 0.0, 1.0));
 }
 
-vec3 color_span(float v) {
-    float span = max(u_hi - u_lo, 1e-8);
-    return cmap(clamp((v - u_lo) / span, 0.0, 1.0));
+float depth_of(vec3 pos) {
+    vec4 c = $visual_to_render(vec4(pos, 1.0));
+    return clamp(0.5 * c.z / c.w + 0.5, 0.0, 1.0);
 }
 
 void store_ray(float lo, float hi) {
@@ -258,7 +344,12 @@ void store_ray(float lo, float hi) {
 }
 
 float sample_vol(sampler3D tex, vec3 p) {
-    vec3 q = p - u_origin - vec3(0.5);
+    vec3 cell = (p - u_origin) / u_voxel;
+    if (u_smooth < 0.5) {
+        vec3 c = floor(cell);
+        return voxel(tex, int(c.x), int(c.y), int(c.z));
+    }
+    vec3 q = cell - vec3(0.5);
     vec3 base = floor(q);
     vec3 f = q - base;
     float acc = 0.0;
@@ -280,6 +371,7 @@ float sample_vol(sampler3D tex, vec3 p) {
 void main() {
     if (u_pass == 0) {
         gl_FragColor = vec4(v_pos, 1.0);
+        gl_FragDepth = gl_FragCoord.z;
         return;
     }
     vec2 uv = gl_FragCoord.xy / max(u_viewport, vec2(1.0));
@@ -289,9 +381,11 @@ void main() {
     vec3 exitp = far.xyz;
     vec3 delta = exitp - entry;
     float dist = length(delta);
-    if (dist < 0.5) discard;
-    vec3 stepv = delta / dist;
-    int nstep = int(min(dist, 1024.0));
+    if (dist < 1e-3) discard;
+    // One sample per voxel edge; the integral is in mm, so each adds meas * step.
+    float step_mm = u_voxel;
+    vec3 stepv = delta / dist * step_mm;
+    int nstep = int(min(ceil(dist / step_mm), 1024.0));
     vec3 p = entry + 0.5 * stepv;
     float trans = 1.0;
     vec3 col = vec3(0.0);
@@ -305,9 +399,14 @@ void main() {
     float ray_lo = 1.0 / 0.0;
     float ray_hi = -1.0 / 0.0;
     bool saw = false;
+    // Where the dose sits along the ray, so the guide lines can depth test against it.
+    vec3 wpos = vec3(0.0);
+    float wsum = 0.0;
+    vec3 hit = entry;
+    bool half_seen = false;
     float typical = max(u_typical, 1e-8);
     float ray_scale = max(u_ray_scale, 1e-8);
-    float floor_rel = %.5f;
+    float floor_rel = %(floor).5f;
     // u_ray: 0 integrate the whole ray, 1 maximum, 2 transparent fog.
     for (int i = 0; i < 1024; ++i) {
         if (i >= nstep) break;
@@ -316,14 +415,19 @@ void main() {
         if (u_ray < 1.5) {
             float plan = u_diff > 0.5 ? sample_vol(u_plan, p) : 0.0;
             if (u_ray < 0.5) {
-                integ += meas;
-                integ_signed += meas - plan;
-                integ_tot += meas + plan;
+                integ += meas * step_mm;
+                integ_signed += (meas - plan) * step_mm;
+                integ_tot += (meas + plan) * step_mm;
+                float wgt = u_diff > 0.5 ? abs(meas - plan) : meas;
+                wsum += wgt;
+                wpos += wgt * p;
             } else {
+                if (u_diff < 0.5 && meas > peak) hit = p;
                 peak = max(peak, meas);
                 float s = meas - plan;
                 float am = abs(s);
                 if (am >= peak_abs) {
+                    if (u_diff > 0.5) hit = p;
                     peak_abs = am;
                     peak_signed = s;
                 }
@@ -340,21 +444,27 @@ void main() {
                     ray_lo = min(ray_lo, s);
                     ray_hi = max(ray_hi, s);
                     saw = true;
+                    // Opacity stays on the manual window so it never chases u_lo/u_hi.
                     float window = u_absolute > 0.5 ? u_error_scale : u_error_scale * typical;
-                    rgb = u_auto > 0.5 ? color_span(s) : diverging(s, window);
-                    float n = s / max(window, 1e-6);
-                    a = clamp(abs(n), 0.0, 1.0) * clamp(u_gain, 0.0, 1.0) / %.5f;
+                    rgb = color_span(s);
+                    float n = s / max(window, 1e-12);
+                    a = clamp(abs(n), 0.0, 1.0) * clamp(u_gain, 0.0, 1.0)
+                        * step_mm / %(depth).5f;
                 }
             } else {
                 ray_hi = max(ray_hi, meas);
                 if (meas > 0.0) saw = true;
-                rgb = u_auto > 0.5 ? color_span(meas) : cmap(clamp(meas / typical, 0.0, 1.0));
-                float tau = clamp(u_gain, 0.0, 1.0) * meas / typical / %.5f;
+                rgb = color_span(meas);
+                float tau = clamp(u_gain, 0.0, 1.0) * meas / typical * step_mm / %(depth).5f;
                 a = 1.0 - exp(-tau);
             }
             a = clamp(a, 0.0, 1.0);
             col += trans * rgb * a;
             trans *= 1.0 - a;
+            if (!half_seen && trans < 0.5) {
+                half_seen = true;
+                hit = p;
+            }
         }
         p += stepv;
     }
@@ -363,22 +473,15 @@ void main() {
         float shown_signed = u_ray < 0.5 ? integ_signed : peak_signed;
         float shown_tot = u_ray < 0.5 ? integ_tot : peak_tot;
         float scale = u_ray < 0.5 ? ray_scale : typical;
-        if (u_diff > 0.5) {
-            if (shown_tot >= scale * floor_rel) {
-                store_ray(shown_signed, shown_signed);
-                float window = u_absolute > 0.5 ? u_error_scale : u_error_scale * scale;
-                vec3 rgb = u_auto > 0.5
-                    ? color_span(shown_signed)
-                    : diverging(shown_signed, window);
-                gl_FragColor = vec4(rgb, 1.0);
-            } else discard;
-        } else if (shown >= scale * floor_rel) {
-            store_ray(shown, shown);
-            vec3 rgb = u_auto > 0.5
-                ? color_span(shown)
-                : cmap(clamp(u_gain * shown / scale, 0.0, 1.0));
-            gl_FragColor = vec4(rgb, 1.0);
-        } else discard;
+        float value = u_diff > 0.5 ? shown_signed : shown;
+        float support = u_diff > 0.5 ? shown_tot : shown;
+        if (support < scale * floor_rel) discard;
+        store_ray(value, value);
+        gl_FragColor = vec4(color_span(value), 1.0);
+        // A ray that looks like background must not hide the lines behind it.
+        float reach = max(max(abs(u_lo), abs(u_hi)), 1e-12);
+        if (u_ray < 0.5 && wsum > 0.0) hit = wpos / wsum;
+        gl_FragDepth = abs(value) >= 0.1 * reach ? depth_of(hit) : 1.0;
     } else {
         float alpha = 1.0 - trans;
         if (alpha >= 0.02) {
@@ -387,6 +490,8 @@ void main() {
                 else store_ray(ray_hi, ray_hi);
             }
             gl_FragColor = vec4(col, alpha);
+            // Lines behind half opacity are hidden; thinner fog lets them draw on top.
+            gl_FragDepth = half_seen ? depth_of(hit) : 1.0;
         } else discard;
     }
 }
@@ -394,7 +499,7 @@ void main() {
 
 
 def _box_frag() -> str:
-    return _BOX_FRAG % (DOSE_FLOOR, VIEW_DEPTH_MM, VIEW_DEPTH_MM)
+    return _BOX_FRAG % {"floor": DOSE_FLOOR, "depth": VIEW_DEPTH_MM}
 
 
 def box_triangles(origin, shape) -> np.ndarray:
@@ -460,7 +565,10 @@ def float_from_ordered(ordered: int) -> float:
 
 
 def auto_color_range(difference: bool, lo: float, hi: float) -> tuple[float, float] | None:
-    """Map a GPU min/max to the color endpoints. Dose keeps zero at the bottom."""
+    """Map a GPU min/max to the color endpoints.
+
+    Dose keeps zero at the bottom. Difference is symmetric so 0 is the map's center.
+    """
     lo_f = float(lo)
     hi_f = float(hi)
     if not np.isfinite(lo_f) or not np.isfinite(hi_f):
@@ -471,11 +579,8 @@ def auto_color_range(difference: bool, lo: float, hi: float) -> tuple[float, flo
         if hi_f <= 0.0:
             return None
         return 0.0, hi_f
-    if hi_f - lo_f < 1e-12:
-        mid = 0.5 * (lo_f + hi_f)
-        pad = max(abs(mid) * 1e-3, 1e-6)
-        return mid - pad, mid + pad
-    return lo_f, hi_f
+    reach = max(abs(lo_f), abs(hi_f), 1e-9)
+    return -reach, reach
 
 
 def manual_color_limits(
@@ -628,11 +733,12 @@ class _ComputeLib:
         self.scan = _link_compute(_SCAN)
         self.fill = _link_compute(_FILL)
         self.brick = _link_compute(_BRICK)
-        self.unpack = _link_compute(_UNPACK)
+        self.gamma = _link_compute(_GAMMA)
 
     def _u(self, prog, name, kind, *vals) -> None:
         from OpenGL.GL import (
             glGetUniformLocation,
+            glUniform1f,
             glUniform1i,
             glUniform2i,
             glUniform3f,
@@ -646,6 +752,8 @@ class _ComputeLib:
             return
         if kind == "1i":
             glUniform1i(loc, int(vals[0]))
+        elif kind == "1f":
+            glUniform1f(loc, float(vals[0]))
         elif kind == "2i":
             glUniform2i(loc, int(vals[0]), int(vals[1]))
         elif kind == "3i":
@@ -654,27 +762,91 @@ class _ComputeLib:
             glUniform3f(loc, float(vals[0]), float(vals[1]), float(vals[2]))
 
 
-_LIB: _ComputeLib | None = None
 _GPU_FILL_FAILED = False
 
 
-def _lib() -> _ComputeLib:
-    global _LIB
-    if _LIB is None:
-        _LIB = _ComputeLib()
-    return _LIB
+def _lib(canvas) -> _ComputeLib:
+    """Compute programs for *canvas*'s GL context; program names do not cross contexts."""
+    shared = canvas.context.shared
+    lib = getattr(shared, "_scan_compute", None)
+    if lib is None:
+        lib = shared._scan_compute = _ComputeLib()
+    return lib
 
 
-def _spot_array(centers, sigmas, weights) -> np.ndarray:
+def _spot_array(centers, sigmas, weights, energy=None, kernel=None) -> np.ndarray:
+    """Spots as ``(n, 12)``: c, s, k vec4s (see ``_BRICK``). A layer kernel replaces the z Gaussian."""
     c = np.asarray(centers, dtype=np.float32).reshape(-1, 3)
     s = np.maximum(np.asarray(sigmas, dtype=np.float32).reshape(-1, 3), 1e-6)
     w = np.asarray(weights, dtype=np.float32).reshape(-1)
     n = min(c.shape[0], s.shape[0], w.shape[0])
-    out = np.zeros((n, 8), dtype=np.float32)
+    out = np.zeros((n, 12), dtype=np.float32)
     out[:, 0:3] = c[:n]
     out[:, 3] = w[:n]
     out[:, 4:7] = s[:n]
+    out[:, 8:10] = s[:n, 0:2]
+    if kernel is None:
+        out[:, 10] = c[:n, 2] - 4.0 * s[:n, 2]
+        out[:, 11] = c[:n, 2] + 4.0 * s[:n, 2]
+        return out
+    e = np.asarray(energy, dtype=float).reshape(-1)[:n]
+    sc, ss = kernel.span(c[:n], s[:n], e)
+    out[:, 0:3] = sc
+    out[:, 4:7] = ss
+    layer = kernel.tables.layer_of(e)
+    out[:, 7] = layer
+    out[:, 10] = kernel.tables.zmin[layer]
+    out[:, 11] = kernel.tables.zmax[layer]
     return out
+
+
+def _layer_texture(tables) -> int:
+    """Upload ``(cdf, mcs)`` as an RG32F 2D texture, one row per layer."""
+    from OpenGL.GL import (
+        GL_CLAMP_TO_EDGE,
+        GL_FLOAT,
+        GL_NEAREST,
+        GL_RG,
+        GL_RG32F,
+        GL_TEXTURE_2D,
+        GL_TEXTURE_MAG_FILTER,
+        GL_TEXTURE_MIN_FILTER,
+        GL_TEXTURE_WRAP_S,
+        GL_TEXTURE_WRAP_T,
+        GL_UNPACK_ALIGNMENT,
+        glBindTexture,
+        glGenTextures,
+        glPixelStorei,
+        glTexImage2D,
+        glTexParameteri,
+    )
+
+    data = np.ascontiguousarray(np.stack([tables.cdf, tables.mcs], axis=-1), dtype=np.float32)
+    layers, nodes = tables.cdf.shape
+    tex = int(glGenTextures(1))
+    glBindTexture(GL_TEXTURE_2D, tex)
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 4)
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RG32F, nodes, layers, 0, GL_RG, GL_FLOAT, data)
+    for pname, val in (
+        (GL_TEXTURE_MIN_FILTER, GL_NEAREST),
+        (GL_TEXTURE_MAG_FILTER, GL_NEAREST),
+        (GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE),
+        (GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE),
+    ):
+        glTexParameteri(GL_TEXTURE_2D, pname, val)
+    return tex
+
+
+def _release_program(canvas) -> None:
+    """Unbind a raw GL program and tell vispy, which caches the current one.
+
+    vispy skips ``glUseProgram`` when its cache matches, so a stale cache sends
+    the next uniform to the wrong program and the GL error aborts the frame.
+    """
+    from OpenGL.GL import glUseProgram
+
+    glUseProgram(0)
+    canvas.context.shared.parser.env["current_program"] = 0
 
 
 def _gloo_handle(canvas, tex) -> int:
@@ -702,26 +874,20 @@ def _alloc_texture(shape_zyx):
     return tex
 
 
-def gpu_fill_texture(canvas, texture, centers, sigmas, weights, grid: DoseGrid) -> None:
-    """Write *texture* from the spot list. Raises if compute cannot run."""
+def gpu_fill_texture(canvas, texture, spots: np.ndarray, grid: DoseGrid, tables=None) -> None:
+    """Write *texture* from :func:`_spot_array` rows. Raises if compute cannot run."""
     from OpenGL.GL import (
         GL_ALL_BARRIER_BITS,
-        GL_READ_ONLY,
         GL_R32F,
-        GL_R32UI,
         GL_RED,
-        GL_RED_INTEGER,
         GL_SHADER_STORAGE_BUFFER,
         GL_TEXTURE_3D,
         GL_TRUE,
-        GL_UNSIGNED_INT,
         GL_WRITE_ONLY,
         glBindBuffer,
         glBindImageTexture,
         glBindTexture,
         glDispatchCompute,
-        glGenTextures,
-        glDeleteTextures,
         glGetBufferSubData,
         glMemoryBarrier,
         glTexImage3D,
@@ -738,33 +904,26 @@ def gpu_fill_texture(canvas, texture, centers, sigmas, weights, grid: DoseGrid) 
 
     if not _gl_at_least(4, 3):
         raise RuntimeError("OpenGL 4.3 compute is unavailable")
-    spots = _spot_array(centers, sigmas, weights)
+    from OpenGL.GL import GL_TEXTURE0, GL_TEXTURE2, GL_TEXTURE_2D, glActiveTexture, glDeleteTextures
+
     nspots = int(spots.shape[0])
+    capacity = tile_slot_capacity(spots[:, 0:3], spots[:, 4:7], grid) + nspots
     if nspots == 0:
-        spots = np.zeros((1, 8), dtype=np.float32)
+        spots = np.zeros((1, 12), dtype=np.float32)
     nx, ny, nz = grid.shape
     ntx, nty = tile_shape(grid)
     ntiles = ntx * nty
     if ntiles > 1024:
         raise RuntimeError("tile scan is one workgroup (1024)")
-    capacity = tile_slot_capacity(centers, sigmas, grid) + nspots
     handle = _gloo_handle(canvas, texture)
-    scratch = int(glGenTextures(1))
+    voxel = float(grid.voxel)
     bufs: list[int] = []
+    layer_tex = 0
     try:
-        glBindTexture(GL_TEXTURE_3D, scratch)
-        glTexImage3D(
-            GL_TEXTURE_3D, 0, GL_R32UI, nx, ny, nz, 0,
-            GL_RED_INTEGER, GL_UNSIGNED_INT, None,
-        )
-        for pname, val in (
-            (GL_TEXTURE_MIN_FILTER, GL_NEAREST),
-            (GL_TEXTURE_MAG_FILTER, GL_NEAREST),
-            (GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE),
-            (GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE),
-            (GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE),
-        ):
-            glTexParameteri(GL_TEXTURE_3D, pname, val)
+        if tables is not None:
+            glActiveTexture(GL_TEXTURE2)
+            layer_tex = _layer_texture(tables)
+            glActiveTexture(GL_TEXTURE0)
         # vispy may have allocated the float texture as the wrong type.
         glBindTexture(GL_TEXTURE_3D, handle)
         glTexImage3D(GL_TEXTURE_3D, 0, GL_R32F, nx, ny, nz, 0, GL_RED, GL_FLOAT, None)
@@ -777,7 +936,7 @@ def gpu_fill_texture(canvas, texture, centers, sigmas, weights, grid: DoseGrid) 
         ):
             glTexParameteri(GL_TEXTURE_3D, pname, val)
 
-        lib = _lib()
+        lib = _lib(canvas)
         origin = np.asarray(grid.origin, dtype=np.float32).reshape(3)
         counts = np.zeros(ntiles, dtype=np.uint32)
         bufs = [
@@ -791,6 +950,7 @@ def gpu_fill_texture(canvas, texture, centers, sigmas, weights, grid: DoseGrid) 
             lib._u(lib.count, "u_origin", "3f", origin[0], origin[1], origin[2])
             lib._u(lib.count, "u_ntiles", "2i", ntx, nty)
             lib._u(lib.count, "u_nspots", "1i", nspots)
+            lib._u(lib.count, "u_voxel", "1f", voxel)
             glDispatchCompute((nspots + 63) // 64, 1, 1)
             glMemoryBarrier(GL_ALL_BARRIER_BITS)
             lib._u(lib.scan, "u_n", "1i", ntiles)
@@ -809,29 +969,146 @@ def gpu_fill_texture(canvas, texture, centers, sigmas, weights, grid: DoseGrid) 
             lib._u(lib.fill, "u_ntiles", "2i", ntx, nty)
             lib._u(lib.fill, "u_nspots", "1i", nspots)
             lib._u(lib.fill, "u_capacity", "1i", capacity)
+            lib._u(lib.fill, "u_voxel", "1f", voxel)
             glDispatchCompute((nspots + 63) // 64, 1, 1)
             glMemoryBarrier(GL_ALL_BARRIER_BITS)
-        glBindImageTexture(0, scratch, 0, GL_TRUE, 0, GL_WRITE_ONLY, GL_R32UI)
+        glBindImageTexture(1, handle, 0, GL_TRUE, 0, GL_WRITE_ONLY, GL_R32F)
         lib._u(lib.brick, "u_origin", "3f", origin[0], origin[1], origin[2])
         lib._u(lib.brick, "u_shape", "3i", nx, ny, nz)
         lib._u(lib.brick, "u_ntiles", "2i", ntx, nty)
-        glDispatchCompute((nx + 7) // 8, (ny + 7) // 8, (nz + 7) // 8)
-        glMemoryBarrier(GL_ALL_BARRIER_BITS)
-        glBindImageTexture(0, scratch, 0, GL_TRUE, 0, GL_READ_ONLY, GL_R32UI)
-        glBindImageTexture(1, handle, 0, GL_TRUE, 0, GL_WRITE_ONLY, GL_R32F)
-        lib._u(lib.unpack, "u_shape", "3i", nx, ny, nz)
+        lib._u(lib.brick, "u_voxel", "1f", voxel)
+        lib._u(lib.brick, "u_table", "1i", 1 if layer_tex else 0)
+        lib._u(lib.brick, "u_layers", "1i", 2)
+        lib._u(lib.brick, "u_nodes", "1i", tables.cdf.shape[1] if layer_tex else 1)
         glDispatchCompute((nx + 7) // 8, (ny + 7) // 8, (nz + 7) // 8)
         glMemoryBarrier(GL_ALL_BARRIER_BITS)
     finally:
+        glBindImageTexture(1, 0, 0, GL_TRUE, 0, GL_WRITE_ONLY, GL_R32F)
         glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0)
         glBindTexture(GL_TEXTURE_3D, 0)
-        glDeleteTextures(1, [scratch])
+        if layer_tex:
+            glActiveTexture(GL_TEXTURE2)
+            glBindTexture(GL_TEXTURE_2D, 0)
+            glDeleteTextures(1, [layer_tex])
+            glActiveTexture(GL_TEXTURE0)
         _delete_buffers(bufs)
+        _release_program(canvas)
 
 
-def upload_volume(canvas, texture, volume: np.ndarray) -> None:
-    """CPU fallback. *volume* is ``(nz, ny, nx)`` float MU per cell."""
-    data = np.ascontiguousarray(volume, dtype=np.float32)
+def read_texture(canvas, texture, shape_zyx) -> np.ndarray:
+    """Read an R32F 3D texture back as ``(nz, ny, nx)``."""
+    from OpenGL.GL import GL_FLOAT, GL_PACK_ALIGNMENT, GL_RED, GL_TEXTURE_3D
+    from OpenGL.GL import glBindTexture, glGetTexImage, glPixelStorei
+
+    handle = _gloo_handle(canvas, texture)
+    glBindTexture(GL_TEXTURE_3D, handle)
+    try:
+        glPixelStorei(GL_PACK_ALIGNMENT, 4)
+        raw = glGetTexImage(GL_TEXTURE_3D, 0, GL_RED, GL_FLOAT)
+    finally:
+        glBindTexture(GL_TEXTURE_3D, 0)
+    return np.asarray(raw, dtype=np.float32).reshape(tuple(int(v) for v in shape_zyx))
+
+
+def _gpu_gamma(canvas, ref_tex, evl_tex, out_tex, shape_xyz, voxel, criteria, norm) -> tuple[int, int]:
+    from OpenGL.GL import (
+        GL_ALL_BARRIER_BITS,
+        GL_FLOAT,
+        GL_R32F,
+        GL_RED,
+        GL_SHADER_STORAGE_BUFFER,
+        GL_TEXTURE0,
+        GL_TEXTURE2,
+        GL_TEXTURE3,
+        GL_TEXTURE_3D,
+        GL_TRUE,
+        GL_WRITE_ONLY,
+        glActiveTexture,
+        glBindBuffer,
+        glBindImageTexture,
+        glBindTexture,
+        glDispatchCompute,
+        glGetBufferSubData,
+        glMemoryBarrier,
+        glTexImage3D,
+    )
+
+    nx, ny, nz = shape_xyz
+    lib = _lib(canvas)
+    prog = lib.gamma
+    out = _gloo_handle(canvas, out_tex)
+    ref = _gloo_handle(canvas, ref_tex)
+    evl = _gloo_handle(canvas, evl_tex)
+    offs = gamma_offsets(voxel, criteria)
+    bufs: list[int] = []
+    try:
+        glBindTexture(GL_TEXTURE_3D, out)
+        glTexImage3D(GL_TEXTURE_3D, 0, GL_R32F, nx, ny, nz, 0, GL_RED, GL_FLOAT, None)
+        glBindTexture(GL_TEXTURE_3D, 0)
+        glActiveTexture(GL_TEXTURE2)
+        glBindTexture(GL_TEXTURE_3D, ref)
+        glActiveTexture(GL_TEXTURE3)
+        glBindTexture(GL_TEXTURE_3D, evl)
+        glActiveTexture(GL_TEXTURE0)
+        bufs = [
+            _ssbo(np.ascontiguousarray(offs), 0),
+            _ssbo(np.zeros(2, dtype=np.uint32), 1),
+        ]
+        glBindImageTexture(1, out, 0, GL_TRUE, 0, GL_WRITE_ONLY, GL_R32F)
+        lib._u(prog, "u_ref", "1i", 2)
+        lib._u(prog, "u_evl", "1i", 3)
+        lib._u(prog, "u_shape", "3i", nx, ny, nz)
+        lib._u(prog, "u_noffs", "1i", offs.shape[0])
+        lib._u(prog, "u_dd", "1f", criteria.dose_pct / 100.0 * norm)
+        lib._u(prog, "u_cut", "1f", criteria.cutoff_pct / 100.0 * norm)
+        lib._u(prog, "u_cap2", "1f", criteria.cap**2)
+        glDispatchCompute((nx + 7) // 8, (ny + 7) // 8, (nz + 7) // 8)
+        glMemoryBarrier(GL_ALL_BARRIER_BITS)
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, bufs[1])
+        tally = np.frombuffer(bytes(glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, 8)), dtype=np.uint32)
+        return int(tally[0]), int(tally[1])
+    finally:
+        glBindImageTexture(1, 0, 0, GL_TRUE, 0, GL_WRITE_ONLY, GL_R32F)
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0)
+        for unit in (GL_TEXTURE2, GL_TEXTURE3):
+            glActiveTexture(unit)
+            glBindTexture(GL_TEXTURE_3D, 0)
+        glActiveTexture(GL_TEXTURE0)
+        _delete_buffers(bufs)
+        _release_program(canvas)
+
+
+def gamma_texture(canvas, ref_tex, evl_tex, out_tex, grid: DoseGrid, criteria: GammaCriteria):
+    """Write the γ map of *ref_tex* against *evl_tex* into *out_tex*.
+
+    Global normalization to the evaluated maximum (read back once).
+    Returns ``(passed, evaluated)``.
+    """
+    global _GPU_FILL_FAILED
+    canvas.set_current()
+    nx, ny, nz = grid.shape
+    evl = read_texture(canvas, evl_tex, (nz, ny, nx))
+    norm = float(evl.max()) if evl.size else 0.0
+    if norm <= 0.0:
+        out_tex.set_data(np.zeros((nz, ny, nx), dtype=np.float32))
+        canvas.context.flush_commands()
+        return 0, 0
+    if not _GPU_FILL_FAILED:
+        try:
+            return _gpu_gamma(canvas, ref_tex, evl_tex, out_tex, (nx, ny, nz), grid.voxel, criteria, norm)
+        except Exception as exc:
+            _GPU_FILL_FAILED = True
+            _log.warning("GPU gamma unavailable (%s); using the Python search", exc)
+    ref = read_texture(canvas, ref_tex, (nz, ny, nx))
+    vol, passed, evaluated = gamma_index(ref, evl, grid.voxel, criteria)
+    out_tex.set_data(np.ascontiguousarray(vol))
+    canvas.context.flush_commands()
+    return passed, evaluated
+
+
+def upload_volume(canvas, texture, volume: np.ndarray, voxel: float = 1.0) -> None:
+    """CPU fallback. *volume* is ``(nz, ny, nx)`` MU per cell; the texture holds MU / mm³."""
+    data = np.ascontiguousarray(volume / float(voxel) ** 3, dtype=np.float32)
     texture.set_data(data)
     canvas.context.flush_commands()
 
@@ -849,15 +1126,17 @@ def fill_texture(
     """Fill *texture*. Returns True when the compute path did the write."""
     global _GPU_FILL_FAILED
     canvas.set_current()
-    if isinstance(kernel, GaussianSmearKernel) and not _GPU_FILL_FAILED:
+    layered = isinstance(kernel, LayerDoseKernel)
+    if (layered or isinstance(kernel, GaussianSmearKernel)) and not _GPU_FILL_FAILED:
         try:
-            gpu_fill_texture(canvas, texture, centers, sigmas, weights, grid)
+            spots = _spot_array(centers, sigmas, weights, energy, kernel if layered else None)
+            gpu_fill_texture(canvas, texture, spots, grid, kernel.tables if layered else None)
             return True
         except Exception as exc:
             _GPU_FILL_FAILED = True
             _log.warning("GPU dose fill unavailable (%s); using the Python integral", exc)
     volume = deposit_gaussians(centers, sigmas, weights, energy, kernel, grid)
-    upload_volume(canvas, texture, volume)
+    upload_volume(canvas, texture, volume, grid.voxel)
     return False
 
 
@@ -885,6 +1164,8 @@ def make_dose_box_node():
             self.shared_program["u_lo"] = 0.0
             self.shared_program["u_hi"] = 1.0
             self._auto = False
+            self._marching = False
+            self._cmap_name = "viridis"
             self._reduce_failed = False
             self._reduce_prog = 0
             self._ray_tex = 0
@@ -902,6 +1183,8 @@ def make_dose_box_node():
             self.shared_program["u_cmap"] = self._cmap
             self.shared_program["u_origin"] = (0.0, 0.0, 0.0)
             self.shared_program["u_shape"] = (1.0, 1.0, 1.0)
+            self.shared_program["u_voxel"] = 1.0
+            self.shared_program["u_smooth"] = 1.0
             self.shared_program["u_viewport"] = (1.0, 1.0)
             self._exit = None
             self._fbo = None
@@ -909,6 +1192,12 @@ def make_dose_box_node():
             self._lo = np.zeros(3)
             self._hi = np.ones(3)
             self.set_gl_state(depth_test=False, blend=False, cull_face=False)
+
+        def draw(self):
+            # The scene pass must skip the box; draw_volume marches it after.
+            # Toggling ``visible`` instead would queue a redraw every frame.
+            if self._marching:
+                Visual.draw(self)
 
         @staticmethod
         def _prepare_transforms(view):
@@ -919,19 +1208,24 @@ def make_dose_box_node():
             view.view_program.vert["framebuffer_to_render"] = tr.get_transform(
                 "framebuffer", "render",
             )
+            view.view_program.frag["visual_to_render"] = tr.get_transform("visual", "render")
 
         def _compute_bounds(self, axis, view):
             return float(self._lo[axis]), float(self._hi[axis])
 
-        def set_box(self, origin, shape) -> None:
-            self._verts.set_data(box_triangles(origin, shape))
+        def set_box(self, origin, shape, voxel: float = 1.0) -> None:
+            sh = np.asarray(shape, dtype=np.float32).reshape(3)
+            extent = sh * np.float32(voxel)
+            self._verts.set_data(box_triangles(origin, extent))
             o = np.asarray(origin, dtype=np.float32).reshape(3)
             self._lo = o
-            self._hi = o + np.asarray(shape, dtype=np.float32).reshape(3)
+            self._hi = o + extent
             self.shared_program["u_origin"] = (float(o[0]), float(o[1]), float(o[2]))
-            sh = np.asarray(shape, dtype=np.float32).reshape(3)
             self.shared_program["u_shape"] = (float(sh[0]), float(sh[1]), float(sh[2]))
-            self.update()
+            self.shared_program["u_voxel"] = float(voxel)
+
+        def set_smooth(self, smooth: bool) -> None:
+            self.shared_program["u_smooth"] = 1.0 if smooth else 0.0
 
         def set_volumes(self, measured, plan) -> None:
             self.shared_program["u_meas"] = measured
@@ -965,9 +1259,12 @@ def make_dose_box_node():
             self.shared_program["u_auto"] = 1.0 if auto else 0.0
             self.shared_program["u_lo"] = float(lo)
             self.shared_program["u_hi"] = float(hi)
-            rgb = colormap_samples(scale_name)
-            self._cmap.set_data(np.ascontiguousarray(rgb.reshape(1, -1, 3), dtype=np.float32))
-            self.shared_program["u_cmap"] = self._cmap
+            if scale_name != self._cmap_name:
+                rgb = colormap_samples(scale_name)
+                self._cmap.set_data(
+                    np.ascontiguousarray(rgb.reshape(1, -1, 3), dtype=np.float32),
+                )
+                self._cmap_name = scale_name
 
         def _ensure_exit(self, canvas, width: int, height: int) -> None:
             if self._fbo is not None and self._fbo_size == (width, height):
@@ -987,7 +1284,7 @@ def make_dose_box_node():
                 _log.warning("GPU ray range unavailable (%s); using the manual window", exc)
             self._reduce_failed = True
 
-        def _prepare_ray_image(self, width: int, height: int) -> None:
+        def _prepare_ray_image(self, canvas, width: int, height: int) -> None:
             import ctypes
 
             from OpenGL.GL import (
@@ -1020,6 +1317,8 @@ def make_dose_box_node():
                 glTexStorage2D,
             )
 
+            # The exit-pass pop_fbo is still queued; flush so the saved binding is real.
+            canvas.context.flush_commands()
             prev = int(np.asarray(glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING)).reshape(-1)[0])
             try:
                 if self._reduce_prog == 0:
@@ -1061,7 +1360,7 @@ def make_dose_box_node():
                 4, int(self._ray_tex), 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RG32F,
             )
 
-        def _reduce_ray_image(self, width: int, height: int) -> tuple[float, float]:
+        def _reduce_ray_image(self, canvas, width: int, height: int) -> tuple[float, float]:
             from OpenGL.GL import (
                 GL_BUFFER_UPDATE_BARRIER_BIT,
                 GL_FALSE,
@@ -1079,23 +1378,30 @@ def make_dose_box_node():
                 glUseProgram,
             )
 
+            # The march draw may still sit in vispy's queue.
+            canvas.context.flush_commands()
             init = np.array([ORDERED_POS_INF, ORDERED_NEG_INF], dtype=np.uint32)
-            glBindBuffer(GL_SHADER_STORAGE_BUFFER, int(self._ext_buf))
-            glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, init.nbytes, init)
-            glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 6, int(self._ext_buf))
-            glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT)
-            glBindImageTexture(
-                4, int(self._ray_tex), 0, GL_FALSE, 0, GL_READ_ONLY, GL_RG32F,
-            )
-            glUseProgram(int(self._reduce_prog))
-            glDispatchCompute((int(width) + 15) // 16, (int(height) + 15) // 16, 1)
-            glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT)
-            glBindBuffer(GL_SHADER_STORAGE_BUFFER, int(self._ext_buf))
-            raw = glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, 8)
-            vals = np.frombuffer(bytes(raw), dtype=np.uint32)
-            glUseProgram(0)
-            glBindImageTexture(4, 0, 0, GL_FALSE, 0, GL_READ_ONLY, GL_RG32F)
-            glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 6, 0)
+            try:
+                glBindBuffer(GL_SHADER_STORAGE_BUFFER, int(self._ext_buf))
+                glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, init.nbytes, init)
+                glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 6, int(self._ext_buf))
+                glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT)
+                glBindImageTexture(
+                    4, int(self._ray_tex), 0, GL_FALSE, 0, GL_READ_ONLY, GL_RG32F,
+                )
+                glUseProgram(int(self._reduce_prog))
+                glDispatchCompute((int(width) + 15) // 16, (int(height) + 15) // 16, 1)
+                glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT)
+                glBindBuffer(GL_SHADER_STORAGE_BUFFER, int(self._ext_buf))
+                # ponytail: synchronous 8-byte readback stalls one frame of GPU work;
+                # a fenced PBO ring would hide it if drags ever stutter.
+                raw = glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, 8)
+                vals = np.frombuffer(bytes(raw), dtype=np.uint32)
+            finally:
+                glBindImageTexture(4, 0, 0, GL_FALSE, 0, GL_READ_ONLY, GL_RG32F)
+                glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 6, 0)
+                glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0)
+                _release_program(canvas)
             return float_from_ordered(int(vals[0])), float_from_ordered(int(vals[1]))
 
         def draw_volume(self, canvas) -> tuple[float, float] | None:
@@ -1105,40 +1411,44 @@ def make_dose_box_node():
                 return None
             self._ensure_exit(canvas, width, height)
             self.shared_program["u_viewport"] = (float(width), float(height))
-            self.visible = True
-            self.set_gl_state(depth_test=False, blend=False, cull_face="front")
-            self.shared_program["u_pass"] = 0
-            canvas.push_fbo(self._fbo, (0, 0), (width, height))
+            self._marching = True
             try:
-                canvas.context.clear(color=(0.0, 0.0, 0.0, 0.0), depth=True)
+                self.set_gl_state(depth_test=False, blend=False, cull_face="front")
+                self.shared_program["u_pass"] = 0
+                canvas.push_fbo(self._fbo, (0, 0), (width, height))
+                try:
+                    canvas.context.clear(color=(0.0, 0.0, 0.0, 0.0), depth=True)
+                    self.draw()
+                finally:
+                    canvas.pop_fbo()
+                ready = False
+                if self._auto and not self._reduce_failed:
+                    try:
+                        self._prepare_ray_image(canvas, width, height)
+                        ready = True
+                    except Exception as exc:
+                        self._mark_reduce_failed(exc)
+                if self._auto and self._reduce_failed:
+                    self.shared_program["u_auto"] = 0.0
+                # Always pass, but write the dose depth for the lines drawn next.
+                self.set_gl_state(
+                    depth_test=True,
+                    depth_func="always",
+                    blend=True,
+                    blend_equation="func_add",
+                    blend_func=("one", "one_minus_src_alpha"),
+                    cull_face="back",
+                )
+                self.shared_program["u_pass"] = 1
                 self.draw()
             finally:
-                canvas.pop_fbo()
-            ready = False
-            if self._auto and not self._reduce_failed:
-                try:
-                    self._prepare_ray_image(width, height)
-                    ready = True
-                except Exception as exc:
-                    self._mark_reduce_failed(exc)
-            if self._auto and self._reduce_failed:
-                self.shared_program["u_auto"] = 0.0
-            self.set_gl_state(
-                depth_test=False,
-                blend=True,
-                blend_equation="func_add",
-                blend_func=("one", "one_minus_src_alpha"),
-                cull_face="back",
-            )
-            self.shared_program["u_pass"] = 1
-            self.draw()
+                self._marching = False
             span = None
             if ready:
                 try:
-                    span = self._reduce_ray_image(width, height)
+                    span = self._reduce_ray_image(canvas, width, height)
                 except Exception as exc:
                     self._mark_reduce_failed(exc)
-            self.visible = False
             return span
 
     return create_visual_node(DoseBoxVisual)
