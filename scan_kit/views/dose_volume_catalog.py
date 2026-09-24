@@ -15,6 +15,22 @@ XY_ISO_RAY = "iso_ray"
 XY_PLAN = "plan"
 XyMode = Literal["ic1", "ic2", "iso_ray", "plan"]
 
+# Plane the logged spot σ is drawn at. The volume sits at isocenter; projecting
+# scales σ by SAD / SDD like a position, exact only for a point-like virtual source.
+SIGMA_PLANE_CHAMBER = "chamber"
+SIGMA_PLANE_ISO = "iso"
+SigmaPlaneKind = Literal["chamber", "iso"]
+DEFAULT_SIGMA_PLANE = SIGMA_PLANE_CHAMBER
+
+# Where the plan's spot σ comes from. devices.xml holds the σ interlock's center,
+# not a beam model, so it is a last resort. Beam models from the SQL database are
+# meant to join this list.
+PLAN_SIGMA_MEASURED = "measured"
+PLAN_SIGMA_REFERENCE = "reference"
+PLAN_SIGMA_INTERLOCK = "interlock"
+PlanSigmaKind = Literal["measured", "reference", "interlock"]
+DEFAULT_PLAN_SIGMA = PLAN_SIGMA_MEASURED
+
 DEFAULT_SPOT_CAP = 1_000_000
 DEFAULT_GAIN = 1.0
 # Beam energy spread σE in % of E; range straggling is added on top.
@@ -83,9 +99,11 @@ SCALE_SPECTRAL = "Spectral_r"
 SCALE_BERLIN = "berlin"
 SCALE_MANAGUA = "managua_r"
 SCALE_PUOR = "PuOr_r"
-# Every sequential map starts dark at 0 (the view background) and brightens with
-# dose; all but Turbo and Heat are perceptually uniform, and Cividis is color-vision safe.
+# Every sequential map starts dark at 0 (the view background). Turbo is a rainbow
+# for telling dose levels apart; the rest brighten with dose and all but Heat are
+# perceptually uniform, with Cividis color-vision safe.
 SEQUENTIAL_SCALES = (
+    (SCALE_TURBO, "Turbo"),
     (SCALE_VIRIDIS, "Viridis"),
     (SCALE_MAGMA, "Magma"),
     (SCALE_INFERNO, "Inferno"),
@@ -94,7 +112,6 @@ SEQUENTIAL_SCALES = (
     (SCALE_DEEP, "Deep"),
     (SCALE_CUBEHELIX, "Cubehelix"),
     (SCALE_HEAT, "Heat"),
-    (SCALE_TURBO, "Turbo"),
 )
 # Every divergent map runs cool (plan extra) to warm (measured extra).
 DIVERGENT_SCALES = (
@@ -105,7 +122,7 @@ DIVERGENT_SCALES = (
     (SCALE_SPECTRAL, "Spectral"),
     (SCALE_PUOR, "Purple–orange"),
 )
-DEFAULT_SCALE = SCALE_VIRIDIS
+DEFAULT_SCALE = SCALE_TURBO
 DEFAULT_DIVERGENT_SCALE = SCALE_MANAGUA
 
 
@@ -154,6 +171,11 @@ class DoseVolumeConfig:
     grain: GrainKind = GRAIN_SPOT
     xy_mode: XyMode = XY_IC1
     overlay_plan: bool = False
+    sigma_plane: SigmaPlaneKind = DEFAULT_SIGMA_PLANE
+    plan_sigma: PlanSigmaKind = DEFAULT_PLAN_SIGMA
+    plan_sigma_ref: str = ""
+    # Multiple Coulomb scattering in the phantom, applied to measured and plan alike.
+    scatter: bool = True
     gain: float = DEFAULT_GAIN
     smear_axis_units: float = DEFAULT_ENERGY_SPREAD_PCT
     splat_cap: int = DEFAULT_SPOT_CAP

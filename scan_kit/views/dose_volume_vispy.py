@@ -5,6 +5,7 @@ from __future__ import annotations
 import functools
 import logging
 import math
+from dataclasses import dataclass
 
 import numpy as np
 
@@ -60,11 +61,11 @@ _log = logging.getLogger(__name__)
 
 
 @functools.cache
-def _late_line_class():
+def _late_class(name: str = "Line"):
     from vispy import scene
 
-    class LateLine(scene.visuals.Line):
-        """Line the scene pass skips while ``held``, so it can draw after the march."""
+    class Late(getattr(scene.visuals, name)):
+        """Visual the scene pass skips while ``held``, so it can draw after the march."""
 
         held = False
 
@@ -72,7 +73,8 @@ def _late_line_class():
             if not self.held:
                 super().draw()
 
-    return LateLine
+    Late.__name__ = f"Late{name}"
+    return Late
 
 
 def _limits_moved(old_lo, old_hi, new: tuple[float, float]) -> bool:
@@ -108,29 +110,110 @@ def apply_gantry(points, degrees: float) -> np.ndarray:
     return pts @ gantry_rx_matrix(degrees).T
 
 
-def axis_guide_points(extent, *, depth_sign: int = 1) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Axis start / tip / label positions past the data AABB.
+TICK_MM = 10.0
+# Numbered ticks are every 1, 2, 5, … cm, whichever keeps an edge to MAX_AXIS_LABELS numbers.
+_LABEL_EVERY = (1, 2, 5, 10, 20, 50, 100)
+MAX_AXIS_LABELS = 8
 
-    X and Y point +axis. Z points toward increasing depth (high energy):
-    ``depth_sign=-1`` sends that guide down so it matches ``z = −R``.
+
+def axis_ticks(lo: float, hi: float, step: float = TICK_MM) -> tuple[np.ndarray, np.ndarray]:
+    """Tick positions every *step* mm inside [lo, hi], and which of them carry a number.
+
+    The end ticks always carry one so the extent reads; round ones crowding an end drop out.
     """
-    lo = np.asarray(extent[0], dtype=np.float64).reshape(3)
-    hi = np.asarray(extent[1], dtype=np.float64).reshape(3)
-    span = np.maximum(hi - lo, 1.0)
-    origin = (lo + hi) / 2.0
-    starts = np.tile(origin, (3, 1))
-    ends = np.tile(origin, (3, 1))
-    labels = np.tile(origin, (3, 1))
-    for i in (0, 1):
-        starts[i, i] = origin[i] - 0.10 * span[i]
-        ends[i, i] = hi[i] + 0.35 * span[i]
-        labels[i, i] = ends[i, i] + 0.22 * span[i]
-    z_dir = 1.0 if depth_sign >= 0 else -1.0
-    z_tip = hi[2] if z_dir > 0 else lo[2]
-    starts[2, 2] = origin[2] - z_dir * 0.10 * span[2]
-    ends[2, 2] = z_tip + z_dir * 0.35 * span[2]
-    labels[2, 2] = ends[2, 2] + z_dir * 0.22 * span[2]
-    return starts, ends, labels
+    k = np.arange(math.ceil(lo / step - 1e-9), math.floor(hi / step + 1e-9) + 1)
+    every = next((n for n in _LABEL_EVERY if k.size <= n * MAX_AXIS_LABELS), _LABEL_EVERY[-1])
+    labeled = k % every == 0
+    if k.size:
+        labeled &= np.minimum(k - k[0], k[-1] - k) >= 0.6 * every
+        labeled[[0, -1]] = True
+    return k * step, labeled
+
+
+@dataclass(frozen=True)
+class AxisText:
+    """One edge's labels: numbers hang off the tick tips, the title off the midpoint."""
+
+    axis: int  # 0, 1, 2 for the X, Y, Z edge
+    tips: np.ndarray  # (n, 3) tips of the numbered ticks
+    numbers: list[str]
+    mid: np.ndarray  # tick-length out from the edge midpoint
+    out: np.ndarray  # unit vector away from the box
+    title: str
+    length: float  # edge length, mm
+
+
+@dataclass(frozen=True)
+class BoxAxes:
+    """Tick marks and text for three box edges that meet at the shallow (−x, −y) corner."""
+
+    ticks: np.ndarray  # segment pairs for ``connect="segments"``
+    axes: list[AxisText]
+
+
+def box_axes(origin, extent_mm, names, *, depth_sign: int = 1, step: float = TICK_MM) -> BoxAxes:
+    """X and Y run along the surface face, Z down the corner edge; ticks point away from the box.
+
+    Z numbers read as depth: ``depth_sign=-1`` shows ``z = −R`` as positive R.
+    """
+    o = np.asarray(origin, dtype=float).reshape(3)
+    h = o + np.asarray(extent_mm, dtype=float).reshape(3)
+    tick = float(np.clip(0.02 * float(np.max(h - o)), 1.5, 6.0))
+    edges = (
+        (np.array([0.0, o[1], h[2]]), np.array([0.0, -1.0, 0.0]), 1),
+        (np.array([o[0], 0.0, h[2]]), np.array([-1.0, 0.0, 0.0]), 1),
+        (np.array([o[0], o[1], 0.0]), np.array([-1.0, -1.0, 0.0]) / math.sqrt(2.0), depth_sign),
+    )
+    ticks, axes = [], []
+    for i, ((base, out, sign), name) in enumerate(zip(edges, names)):
+        vals, labeled = axis_ticks(o[i], h[i], step)
+        tips, numbers = [], []
+        for v, major in zip(vals, labeled):
+            p = base.copy()
+            p[i] = v
+            ticks += [p, p + out * tick * (1.0 if major else 0.55)]
+            if major:
+                tips.append(p + out * tick)
+                numbers.append(f"{v * sign + 0.0:g}")
+        mid = base.copy()
+        mid[i] = 0.5 * (o[i] + h[i])
+        tips = np.array(tips, dtype=float).reshape(-1, 3)
+        axes.append(AxisText(i, tips, numbers, mid + out * tick, out, name, float(h[i] - o[i])))
+    return BoxAxes(np.array(ticks, dtype=float).reshape(-1, 3), axes)
+
+
+NUMBER_PT = 7
+TITLE_PT = 9
+LABEL_GAP_PX = 9.0
+
+
+def label_direction(edge, out) -> np.ndarray:
+    """Screen unit vector perpendicular to *edge*, on the side *out* points to.
+
+    Falls back to *out* when the edge is seen end-on.
+    """
+    edge, out = np.asarray(edge, dtype=float), np.asarray(out, dtype=float)
+    n = float(np.hypot(*edge))
+    d = np.array([-edge[1], edge[0]]) / n if n > 1e-6 else out
+    if n > 1e-6 and float(d @ out) < 0.0:
+        d = -d
+    return d / max(float(np.hypot(*d)), 1e-9)
+
+
+def spaced_labels(tips_px, need_px: float) -> list[int]:
+    """Indices of numbers to show: all if they fit, else just the two ends, else none."""
+    tips = np.asarray(tips_px, dtype=float).reshape(-1, 2)
+    n = len(tips)
+    if n < 2 or float(np.hypot(*np.diff(tips, axis=0).T).min()) >= need_px:
+        return list(range(n))
+    return [0, n - 1] if float(np.hypot(*(tips[-1] - tips[0]))) >= need_px else []
+
+
+def label_anchors(d) -> tuple[str, str]:
+    """Text anchor for a label hanging off along screen direction *d* (view pixels, y down)."""
+    ax = "right" if d[0] < -0.38 else "left" if d[0] > 0.38 else "center"
+    ay = "top" if d[1] > 0.38 else "bottom" if d[1] < -0.38 else "center"
+    return ax, ay
 
 
 def volume_corners(origin, extent_mm) -> np.ndarray:
@@ -152,7 +235,13 @@ def box_edge_segments(origin, extent_mm) -> np.ndarray:
 
 
 PHANTOM_PAD_MM = 10.0
-PHANTOM_RGBA = (0.30, 0.80, 0.90, 0.75)
+# Box edges and ticks share one muted ink; text needs a little more to stay legible.
+BOX_ALPHA = 0.3
+NUMBER_ALPHA = 0.6
+TITLE_ALPHA = 0.75
+# Auto difference never spans less than ±1 % of the dose scale.
+AUTO_DIFF_FLOOR = 0.01
+PHANTOM_RGBA = (0.30, 0.80, 0.90, 0.35)
 
 
 def phantom_box(grid_origin, grid_extent_mm, depth_mm: float, pad_mm: float = PHANTOM_PAD_MM):
@@ -318,6 +407,11 @@ class DoseScene:
         self._ink = ink_rgb((0.1, 0.1, 0.1))
         self._bounds = None
         self._late: list = []
+        # (node, alpha) drawn in the background's ink; recolored when the background changes.
+        self._inked: list = []
+        # (2D Text, gantry-space anchors) reprojected every draw.
+        self._labels: list = []
+        self._axes_center = np.zeros(3)
         self._canvas.on_draw = self._on_draw
 
     @property
@@ -343,36 +437,97 @@ class DoseScene:
             node.parent = None
         self._nodes.clear()
         self._late.clear()
+        self._inked.clear()
+        self._labels.clear()
 
-    def _add_axes(self, axis: DepthAxis, extent: np.ndarray) -> None:
-        from vispy import scene
+    def _add_axes(self, axis: DepthAxis, origin, extent_mm) -> None:
+        """Ticks every cm on the voxel box's edges, in the box's own muted ink."""
+        self._axes_center = np.asarray(origin, dtype=float) + 0.5 * np.asarray(extent_mm, dtype=float)
+        guides = box_axes(
+            origin, extent_mm, ("X (mm)", "Y (mm)", axis.axis_label),
+            depth_sign=int(getattr(axis, "depth_sign", 1)),
+        )
+        if guides.ticks.size:
+            ticks = self._late_line(
+                pos=guides.ticks, connect="segments", color=(*self._ink, BOX_ALPHA), width=1,
+            )
+            self._nodes.append(ticks)
+            self._inked.append((ticks, BOX_ALPHA))
+        # 3D Text shrinks by the perspective w, so labels are 2D text on the view, placed each draw.
+        late_text = _late_class("Text")
+        for ax in guides.axes:
+            texts = []
+            for strings, size, alpha in ((ax.numbers, NUMBER_PT, NUMBER_ALPHA), ([ax.title], TITLE_PT, TITLE_ALPHA)):
+                text = late_text(
+                    strings, color=(*self._ink, alpha), font_size=size,
+                    pos=np.zeros((len(strings), 2)), parent=self._view,
+                ) if strings else None
+                if text is not None:
+                    self._late.append(text)
+                    self._nodes.append(text)
+                    self._inked.append((text, alpha))
+                texts.append(text)
+            self._labels.append((*texts, ax))
 
-        starts, ends, label_pos = axis_guide_points(
-            extent, depth_sign=int(getattr(axis, "depth_sign", 1)),
-        )
-        colors = (
-            (0.85, 0.35, 0.35, 1.0),
-            (0.35, 0.75, 0.40, 1.0),
-            (0.40, 0.55, 0.95, 1.0),
-        )
-        names = ("X (mm)", "Y (mm)", axis.axis_label)
-        for i, (color, name) in enumerate(zip(colors, names)):
-            line = self._late_line(
-                pos=np.vstack([starts[i], ends[i]]),
-                color=color,
-                width=2,
-            )
-            text = scene.Text(
-                name,
-                color=color,
-                font_size=10,
-                pos=tuple(label_pos[i]),
-                parent=self._gantry,
-            )
-            self._nodes.extend((line, text))
+    def _place_labels(self) -> None:
+        """Hang each edge's numbers and title a fixed pixel gap off its projected outward side."""
+        if not self._labels:
+            return
+        to_view = self._gantry.node_transform(self._view)
+        px_per_pt = float(self._canvas.dpi) / 72.0
+
+        def screen(points):
+            q = to_view.map(np.atleast_2d(points))
+            return q[:, :2] / q[:, 3:4]
+
+        center = screen(self._axes_center)[0]
+        em = NUMBER_PT * px_per_pt
+        projected = []
+        for _numbers, _title, ax in self._labels:
+            along = np.zeros(3)
+            along[ax.axis] = 1.0
+            a, b, c = screen(np.stack([ax.mid, ax.mid + ax.out, ax.mid + along]))
+            projected.append((a, b, c, float(np.hypot(*(c - a)))))
+        widest = max(p[3] for p in projected)
+        for (numbers, title, ax), (a, b, c, per_mm) in zip(self._labels, projected):
+            # Edge seen (nearly) end-on: its labels would pile onto the corner.
+            shown = per_mm * ax.length >= 3.0 * em and per_mm >= 0.3 * widest
+            title.visible = shown
+            if numbers is not None:
+                numbers.visible = shown
+            if not shown:
+                continue
+            # Outward toward the camera picks no side; step away from the box instead.
+            side = b - a if np.hypot(*(b - a)) >= 0.25 * per_mm else a - center
+            d = label_direction(c - a, side)
+            anchors = label_anchors(d)
+            gap = LABEL_GAP_PX
+            if numbers is not None:
+                wide = 0.6 * em * max(len(s) for s in ax.numbers)
+                edge = (c - a) / per_mm
+                tips = screen(ax.tips)
+                keep = spaced_labels(tips, abs(edge[0]) * wide + abs(edge[1]) * em + 4.0)
+                strings = [ax.numbers[i] for i in keep]
+                numbers.visible = bool(keep)
+                if strings and strings != numbers.text:
+                    numbers.text = strings
+                if keep:
+                    numbers.pos = tips[keep] + d * gap
+                    if numbers.anchors != anchors:
+                        numbers.anchors = anchors
+                    gap += abs(d[0]) * wide + abs(d[1]) * em + LABEL_GAP_PX
+            # Keep the title inside the view even when the box fills it.
+            half = 0.3 * TITLE_PT * px_per_pt * len(ax.title)
+            lo_x = {"right": 2 * half, "center": half}.get(anchors[0], 0.0) + 2.0
+            hi_x = float(self._view.size[0]) - {"left": 2 * half, "center": half}.get(anchors[0], 0.0) - 2.0
+            pos = screen(ax.mid)[0] + d * gap
+            pos[0] = min(max(pos[0], lo_x), max(hi_x, lo_x))
+            title.pos = pos
+            if title.anchors != anchors:
+                title.anchors = anchors
 
     def _late_line(self, **kwargs):
-        line = _late_line_class()(parent=self._gantry, **kwargs)
+        line = _late_class()(parent=self._gantry, **kwargs)
         # Line sets no GL state of its own and would inherit the march's "always".
         line.set_gl_state("translucent", depth_test=True, depth_func="lequal")
         self._late.append(line)
@@ -382,10 +537,11 @@ class DoseScene:
         self._bounds = self._late_line(
             pos=box_edge_segments(origin, extent_mm),
             connect="segments",
-            color=(*self._ink, 0.3),
+            color=(*self._ink, BOX_ALPHA),
             width=1,
         )
         self._nodes.append(self._bounds)
+        self._inked.append((self._bounds, BOX_ALPHA))
 
     def _set_background(self, rgb) -> None:
         """The view background is the scale's zero color, so empty space reads as 0."""
@@ -394,8 +550,13 @@ class DoseScene:
         self._bg = rgb
         self._ink = ink_rgb(rgb)
         self._canvas.bgcolor = rgb
-        if self._bounds is not None and self._bounds.parent is not None:
-            self._bounds.set_data(color=(*self._ink, 0.3))
+        for node, alpha in self._inked:
+            if node.parent is None:
+                continue
+            if hasattr(node, "set_data"):
+                node.set_data(color=(*self._ink, alpha))
+            else:
+                node.color = (*self._ink, alpha)
 
     def _ensure_textures(self, shape_zyx) -> None:
         key = tuple(int(v) for v in shape_zyx)
@@ -475,6 +636,7 @@ class DoseScene:
         phantom_mm: float = 0.0,
         entrance_wet_mm: float = 0.0,
         auto_margin_sigma: float = 5.0,
+        scatter: bool = True,
         status: str | None = None,
     ) -> None:
         from vispy import scene
@@ -539,7 +701,7 @@ class DoseScene:
         plan_in = entering(plan) if plan is not None and plan.center.size else None
         live = [s for s in (meas_in, plan_in) if s is not None]
         if dose:
-            kernel = layer_kernel(medium.key, np.concatenate([s[3] for s in live]), smear)
+            kernel = layer_kernel(medium.key, np.concatenate([s[3] for s in live]), smear, scatter)
         else:
             kernel = GaussianSmearKernel(axis, smear)
 
@@ -549,7 +711,7 @@ class DoseScene:
             if dose:
                 c, s = kernel.span(center, sigma, e)
                 return center, sigma, dose_weights(kernel, amounts, e, medium), e, c, s
-            if medium_key:
+            if medium_key and scatter:
                 # Stops land wider than the IC saw the beam: scatter over the full range.
                 sigma = sigma.copy()
                 sigma[:, 0:2] = np.hypot(sigma[:, 0:2], end_scatter_mm(medium, e)[:, None])
@@ -617,21 +779,15 @@ class DoseScene:
         self._push_display()
         self._has_volume = True
 
-        o = np.asarray(grid.origin, dtype=float).reshape(3)
-        hi_g = o + grid.extent_mm
         corners = volume_corners(grid.origin, grid.extent_mm)
         self._add_bounds(grid.origin, grid.extent_mm)
+        self._add_axes(axis, grid.origin, grid.extent_mm)
         if depth:
             p_o, p_e = phantom_box(grid.origin, grid.extent_mm, depth)
             self._nodes.append(self._late_line(
-                pos=box_edge_segments(p_o, p_e), connect="segments", color=PHANTOM_RGBA, width=1.5,
+                pos=box_edge_segments(p_o, p_e), connect="segments", color=PHANTOM_RGBA, width=1,
             ))
             corners = np.vstack([corners, volume_corners(p_o, p_e)])
-        pts = np.vstack([np.vstack([p[4] for p in spans]), o, hi_g])
-        lo = pts.min(axis=0)
-        hi = pts.max(axis=0)
-        extent = np.vstack([lo, hi])
-        self._add_axes(axis, extent)
         # Frame the grid and phantom through the same transform that draws them.
         # Axis labels are not part of this box, or they pull the volume off center.
         world = self._gantry.transform.map(corners)
@@ -710,6 +866,7 @@ class DoseScene:
         marching = self._has_volume and not self._broken
         for line in self._late:
             line.held = marching
+        self._place_labels()
         SceneCanvas.on_draw(self._canvas, event)
         if not marching:
             return
@@ -724,13 +881,15 @@ class DoseScene:
         # After the march, so each line depth tests against where the dose sits.
         for line in self._late:
             line.held = False
-            line.draw()
+            if line.visible:
+                line.draw()
         self._consume_auto_span(span)
 
     def _consume_auto_span(self, span) -> None:
         if not self._auto or self._gamma or span is None:
             return
-        got = auto_color_range(self._difference, span[0], span[1])
+        scale = self.ray_peak if self._ray_mode == RAY_INTEGRAL else self.dose_peak
+        got = auto_color_range(self._difference, span[0], span[1], AUTO_DIFF_FLOOR * scale)
         if got is None or not _limits_moved(self.auto_lo, self.auto_hi, got):
             return
         self.auto_lo, self.auto_hi = got

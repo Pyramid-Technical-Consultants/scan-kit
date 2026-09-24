@@ -43,7 +43,9 @@ from scan_kit.views.dose_volume_fill import (
     deposit_gaussians,
     normal_mass,
 )
-from scan_kit.views.dose_volume_vispy import apply_gantry, axis_guide_points
+from scan_kit.views.dose_volume_vispy import (
+    apply_gantry, axis_ticks, box_axes, label_anchors, label_direction, spaced_labels,
+)
 
 
 def test_iso_xy_from_ic_ray_matches_slope() -> None:
@@ -381,11 +383,51 @@ def test_measured_cloud_plan_mode() -> None:
     assert cloud is plan
 
 
+def test_plan_sigma_sources_and_iso_plane() -> None:
+    from dataclasses import replace
+
+    from scan_kit.views.dose_volume_catalog import (
+        PLAN_SIGMA_INTERLOCK, PLAN_SIGMA_REFERENCE, SIGMA_PLANE_ISO,
+    )
+    from scan_kit.views.dose_volume_data import plan_cloud
+
+    class _Geom:
+        def mag_factor(self, device):
+            return {"IC_1_X": 2.0, "IC_1_Y": 3.0, "IC_2_X": 1.5, "IC_2_Y": 1.5}[device]
+
+    plan = SplatCloud(
+        x=np.zeros(3), y=np.zeros(3), sx=np.full(3, 5.0), sy=np.full(3, 5.0),
+        energy=np.array([70.0, 80.0, 75.0]), weight=np.ones(3),
+    )
+    source = SessionSplatSource("s", iso=_frame(), chamber=None, plan=plan, n_raw=2, geom=_Geom())
+    iso = measured_cloud(source, XY_IC1, plane=SIGMA_PLANE_ISO)
+    np.testing.assert_allclose(iso.sx, [3.0, 3.2])
+    np.testing.assert_allclose(iso.sy, [5.1, 5.4])
+
+    config = SplatConfig()
+    got = plan_cloud(source, config)
+    np.testing.assert_allclose(got.sx, [1.5, 1.6, 1.55])
+    np.testing.assert_allclose(got.sy, [1.7, 1.8, 1.75])
+    got = plan_cloud(source, replace(config, sigma_plane=SIGMA_PLANE_ISO))
+    np.testing.assert_allclose(got.sx, [3.0, 3.2, 3.1])
+
+    wide = replace(_frame(), ic1_sx=np.array([4.0, 6.0]), ic1_sy=np.array([4.0, 6.0]))
+    ref = SessionSplatSource("r", iso=wide, chamber=None, plan=None, n_raw=2)
+    got = plan_cloud(source, replace(config, plan_sigma=PLAN_SIGMA_REFERENCE), ref)
+    np.testing.assert_allclose(got.sx, [4.0, 6.0, 5.0])
+
+    interlock = replace(config, plan_sigma=PLAN_SIGMA_INTERLOCK)
+    np.testing.assert_allclose(plan_cloud(source, interlock).sx, 5.0)
+    got = plan_cloud(source, replace(interlock, sigma_plane=SIGMA_PLANE_ISO))
+    np.testing.assert_allclose(got.sx, 10.0)
+    np.testing.assert_allclose(got.sy, 15.0)
+
+
 def test_difference_scale_cannot_stay_sequential() -> None:
     from scan_kit.views.dose_volume_catalog import active_scale
     from scan_kit.views.dose_volume_fill import colormap_samples
 
-    assert active_scale(False, "coolwarm") == "viridis"
+    assert active_scale(False, "coolwarm") == "turbo"
     assert active_scale(True, "viridis") == "managua_r"
     assert active_scale(True, "berlin") == "berlin"
     assert active_scale(False, "magma") == "magma"
@@ -405,16 +447,39 @@ def test_delivered_mu_falls_back_when_dose_is_missing() -> None:
     ) == {"ic1": "ic1_total_dose_spot"}
 
 
-def test_axis_guides_point_depth_toward_high_energy() -> None:
-    extent = np.array([[-10.0, -20.0, -330.0], [10.0, 20.0, -40.0]])
-    _starts, ends, labels = axis_guide_points(extent, depth_sign=-1)
-    assert ends[2, 2] < -330.0
-    assert labels[2, 2] < ends[2, 2]
-    assert ends[0, 0] > 10.0
-    assert labels[0, 0] > ends[0, 0]
-    _s2, e2, l2 = axis_guide_points(extent, depth_sign=1)
-    assert e2[2, 2] > -40.0
-    assert l2[2, 2] > e2[2, 2]
+def test_box_axes_tick_every_cm_on_the_box_edges() -> None:
+    vals, labeled = axis_ticks(-25.0, 31.0)
+    np.testing.assert_allclose(vals, [-20.0, -10.0, 0.0, 10.0, 20.0, 30.0])
+    assert labeled.all()
+    vals, labeled = axis_ticks(-330.0, 0.0)
+    assert vals.size == 34 and labeled.sum() <= 8 and labeled[[0, -1]].all()
+    # The end always reads; a round number crowding it gives way.
+    vals, labeled = axis_ticks(-320.0, 0.0)
+    assert labeled[0] and not labeled[vals == -300.0].any()
+    assert spaced_labels([[0, 0], [10, 0], [20, 0]], 8.0) == [0, 1, 2]
+    assert spaced_labels([[0, 0], [5, 0], [10, 0]], 8.0) == [0, 2]
+    assert spaced_labels([[0, 0], [2, 0], [4, 0]], 8.0) == []
+
+    origin, extent = np.array([-15.0, -20.0, -330.0]), np.array([30.0, 40.0, 332.0])
+    guides = box_axes(origin, extent, ("X", "Y", "Depth"), depth_sign=-1)
+    starts = guides.ticks[0::2]
+    ends = guides.ticks[1::2]
+    assert starts.shape[0] == 3 + 5 + 34
+    # X ticks sit on the surface edge (y = lo, z = hi) and point out of the box along −y.
+    x = starts[:3]
+    np.testing.assert_allclose(x[:, 1:], [[-20.0, 2.0]] * 3)
+    assert (ends[:3, 1] < -20.0).all()
+    # Depth numbers read positive and hang off tick tips outside the box.
+    x_ax, _y_ax, z_ax = guides.axes
+    assert z_ax.numbers == ["330", "300", "250", "200", "150", "100", "50", "0"]
+    assert (z_ax.tips[:, 0] < -15.0).all() and (z_ax.tips[:, 1] < -20.0).all()
+    np.testing.assert_allclose(x_ax.out, [0.0, -1.0, 0.0])
+    assert [a.title for a in guides.axes] == ["X", "Y", "Depth"]
+    assert label_anchors((-1.0, 0.1)) == ("right", "center")
+    assert label_anchors((0.0, 1.0)) == ("center", "top")
+    # A nearly-parallel outward still hangs labels square off the edge, on its side.
+    np.testing.assert_allclose(label_direction((1.0, 0.0), (-0.9, 0.1)), [0.0, 1.0])
+    np.testing.assert_allclose(label_direction((0.0, 0.0), (0.0, -2.0)), [0.0, -1.0])
 
 
 def test_gantry_90_swaps_y_and_energy_axis() -> None:
@@ -456,6 +521,33 @@ def test_protons_from_ideal_air_ic() -> None:
         '<gain_conversion in_units="MU" K_MU="2.5e-08"/></ion_chamber></devices></MapToMap>'
     ) == 2.5e-8
     assert parse_kmu_c_per_mu("<nope/>") is None
+    chambers = "".join(
+        f'<ion_chamber><device name="{name}"/><gain_conversion in_units="MU" K_MU="{k}"/></ion_chamber>'
+        for name, k in (("IC_1_X", "2.5e-08"), ("IC_1_HCC", "2.6e-08"), ("IC_2_HCC", "2.7e-08"))
+    )
+    xml = f"<MapToMap><devices>{chambers}</devices></MapToMap>"
+    assert parse_kmu_c_per_mu(xml) == 2.6e-8
+    assert parse_kmu_c_per_mu(xml, "IC_2") == 2.7e-8
+
+
+def test_timeslice_mu_from_scan_dose_counter() -> None:
+    from scan_kit.views.dose_volume_data import nonnegative_layer_mu, timeslice_charge_nc
+
+    got = timeslice_charge_nc([np.nan, 0.0, 1.0, np.nan, 3.0, 2.9, 6.0])
+    np.testing.assert_allclose(got, [0.0, 0.0, 1.0, 0.0, 2.0, -0.1, 3.1])
+    assert got.sum() == pytest.approx(6.0)
+    energy = np.array([70.0, 70.0, 70.0, 80.0, 80.0])
+    mu = nonnegative_layer_mu(np.array([1.0, -0.2, 1.2, 0.5, np.nan]), energy)
+    assert (mu >= 0.0).all()
+    assert mu[:3].sum() == pytest.approx(2.0) and mu[3:].sum() == pytest.approx(0.5)
+
+    from scan_kit.views.dose_volume_data import fill_from_spot
+
+    # Spot 1 ramps up unfitted; spot 2 never fits and takes the next sample; layer 80 stands alone.
+    x = np.array([np.nan, 1.0, 3.0, np.nan, np.nan, 7.0, np.nan, 9.0])
+    spot = np.array([1, 1, 1, 2, 2, 3, 4, 4])
+    energy = np.array([70.0] * 6 + [80.0] * 2)
+    np.testing.assert_allclose(fill_from_spot(x, spot, energy), [2.0, 1.0, 3.0, 7.0, 7.0, 7.0, 9.0, 9.0])
 
 
 def test_dose_volume_module_has_run() -> None:
@@ -497,6 +589,7 @@ def test_auto_color_range_dose_keeps_zero() -> None:
     assert auto_color_range(True, -0.7, 0.1) == (-0.7, 0.7)
     flat = auto_color_range(True, 0.0, 0.0)
     assert flat is not None and flat[0] < 0.0 < flat[1]
+    assert auto_color_range(True, -1e-8, 2e-8, 0.01) == (-0.01, 0.01)
     lo, hi = manual_color_limits(
         difference=False, transparent=False, integral=True,
         gain=0.5, typical=0.1, ray_scale=2.0, error_scale=0.2, absolute=True,
@@ -688,6 +781,54 @@ def test_shift_fov_drag_ignores_leftover_zoom_tuple() -> None:
     assert camera.fov == pytest.approx(45.0 - 10.0 / 5.0)
 
 
+def test_plan_vs_plan_reports_zero_error(qapp) -> None:
+    from scan_kit.views.dose_volume_data import SplatBatch
+    from scan_kit.views.dose_volume_raycast import read_texture
+    from scan_kit.views.dose_volume_vispy import DoseScene
+    from scan_kit.views.vispy_plot import make_scene_canvas
+
+    try:
+        canvas = make_scene_canvas(size=(64, 64), show=False, gl="gl+")
+        canvas.set_current()
+    except Exception as exc:
+        pytest.skip(f"visPy canvas unavailable: {exc}")
+    rng = np.random.default_rng(3)
+    n = 40
+    energy = rng.choice([80.0, 120.0, 180.0], n).astype(np.float32)
+    plan = SplatBatch(
+        center=np.column_stack([rng.uniform(-20, 20, (n, 2)), np.zeros(n)]).astype(np.float32),
+        sigma=np.full((n, 3), 3.5, dtype=np.float32),
+        weight=rng.uniform(0.5, 2.0, n).astype(np.float32),
+        energy_mev=energy,
+        dose_mu=rng.uniform(0.5, 2.0, n).astype(np.float32),
+        k_mu=2.6e-8,
+    )
+    scene = DoseScene(canvas)
+    for mode in (WEIGHT_MU, WEIGHT_PROTONS, WEIGHT_DOSE):
+        scene.render(
+            plan, plan, range_axis_for_medium("water"), gain=1.0, gantry_deg=0.0,
+            weight_mode=mode, voxel_mm=2.0, gamma=True,
+        )
+        shape = tuple(scene._meas_tex.shape[:3])
+        meas = read_texture(canvas, scene._meas_tex, shape)
+        ref = read_texture(canvas, scene._plan_tex, shape)
+        # The GPU tile lists fill in any order, so sums differ only by float rounding.
+        assert meas.max() > 0.0 and np.abs(meas - ref).max() <= 1e-6 * meas.max(), mode
+        passed, total = scene.gamma_pass
+        assert total > 0 and passed == total, mode
+    # Last mode was Gy with scatter; without it the same spots stay narrower and peak higher.
+    scene.render(
+        plan, plan, range_axis_for_medium("water"), gain=1.0, gantry_deg=0.0,
+        weight_mode=WEIGHT_DOSE, voxel_mm=2.0, gamma=True, scatter=False,
+    )
+    passed, total = scene.gamma_pass
+    shape = tuple(scene._meas_tex.shape[:3])
+    assert passed == total and read_texture(canvas, scene._meas_tex, shape).max() > meas.max()
+    scene.render(plan, plan, range_axis_for_medium("water"), gain=1.0, difference=True)
+    scene._consume_auto_span((-1e-7, 1e-7))
+    assert scene.auto_hi == pytest.approx(0.01 * scene.ray_peak)
+
+
 def test_offscreen_dose_volume_render(qapp) -> None:
     from scan_kit.views.dose_volume_data import LinearEnergyAxis, SplatBatch
     from scan_kit.views.dose_volume_vispy import DoseScene
@@ -741,11 +882,13 @@ def test_offscreen_dose_volume_render(qapp) -> None:
         canvas.pop_fbo()
     broken = scene._broken
     auto_hi = scene.auto_hi
-    # Three axes plus the box; each must depth test against the march, not inherit its "always".
-    assert len(scene._late) == 4
-    assert all(
-        line._line_visual._vshare.gl_state.get("depth_func") == "lequal" for line in scene._late
-    )
+    # The box and its ticks; each must depth test against the march, not inherit its "always".
+    lines = [node for node in scene._late if hasattr(node, "_line_visual")]
+    assert len(lines) == 2
+    # Labels land on the canvas, not collapsed to a point by the perspective divide.
+    numbers = next(n for n, _title, _ax in scene._labels if n is not None)
+    assert np.ptp(np.asarray(numbers.pos)[:, :2], axis=0).max() > 5.0
+    assert all(line._line_visual._vshare.gl_state.get("depth_func") == "lequal" for line in lines)
     assert env == real
     assert not broken
     assert first[..., :3].max() > 0

@@ -56,11 +56,18 @@ from .dose_volume_catalog import (
     GRAIN_TIMESLICE,
     MEDIUM_COPPER,
     MEDIUM_WATER,
+    DEFAULT_PLAN_SIGMA,
+    DEFAULT_SIGMA_PLANE,
+    PLAN_SIGMA_INTERLOCK,
+    PLAN_SIGMA_MEASURED,
+    PLAN_SIGMA_REFERENCE,
     PRESET_BY_ID,
     PRESETS,
     RAY_INTEGRAL,
     RAY_MAXIMUM,
     RAY_TRANSPARENT,
+    SIGMA_PLANE_CHAMBER,
+    SIGMA_PLANE_ISO,
     WEIGHT_DOSE,
     WEIGHT_MU,
     WEIGHT_PROTONS,
@@ -106,6 +113,15 @@ _XY_ITEMS = (
     (XY_IC2, "IC2"),
     (XY_ISO_RAY, "ISO ray (IC1–IC2)"),
     (XY_PLAN, "Plan"),
+)
+_SIGMA_PLANE_ITEMS = (
+    (SIGMA_PLANE_CHAMBER, "Chamber"),
+    (SIGMA_PLANE_ISO, "Isocenter (projected)"),
+)
+_PLAN_SIGMA_ITEMS = (
+    (PLAN_SIGMA_MEASURED, "Measured, per layer"),
+    (PLAN_SIGMA_REFERENCE, "Reference session"),
+    (PLAN_SIGMA_INTERLOCK, "Interlock center"),
 )
 _MEDIUM_ITEMS = (
     (MEDIUM_WATER, "Water"),
@@ -474,6 +490,14 @@ class DoseVolumeWindow(VispyViewWindow):
         self._xy_combo = self._add_combo(
             beam_layout, "XY", _XY_ITEMS, self._on_controls_changed,
         )
+        self._plane_combo = self._add_combo(
+            beam_layout, "σ plane", _SIGMA_PLANE_ITEMS, self._on_controls_changed,
+        )
+        self._plane_combo.setToolTip(
+            "Chamber draws the spot σ the IC measured. Isocenter scales it by "
+            "SAD / SDD like a position, which is exact only for a point-like source."
+        )
+        self._set_combo(self._plane_combo, DEFAULT_SIGMA_PLANE)
         self._gantry_spin = self._add_spin(
             beam_layout, "Gantry", 0.0, 360.0, 5.0, DEFAULT_GANTRY_DEG,
             decimals=1,
@@ -503,6 +527,33 @@ class DoseVolumeWindow(VispyViewWindow):
         self._cap_spin.setToolTip("Most spots drawn; longer sessions are thinned evenly.")
         self._cap_spin.valueChanged.connect(self._on_controls_changed)
         self._add_row(beam_layout, "Spot cap", self._cap_spin)
+
+        plan_layout = self._add_group(layout, "Plan")
+        self._plan_sigma_combo = self._add_combo(
+            plan_layout, "Spot size", _PLAN_SIGMA_ITEMS, self._on_plan_sigma_changed,
+        )
+        self._plan_sigma_combo.setToolTip(
+            "The plan's spot σ. Measured uses this session's median per energy "
+            "layer, so only position and MU differ. Reference uses another loaded "
+            "session. Interlock center is the devices.xml σ interlock target, "
+            "not a beam model."
+        )
+        self._set_combo(self._plan_sigma_combo, DEFAULT_PLAN_SIGMA)
+        self._ref_combo = QComboBox()
+        self._ref_combo.setToolTip("Loaded session whose per-layer σ the plan uses.")
+        self._ref_combo.currentIndexChanged.connect(self._on_controls_changed)
+        self._add_row(plan_layout, "Reference", self._ref_combo)
+        self._ref_row = self._ref_combo.parentWidget()
+        self._ref_row.setVisible(DEFAULT_PLAN_SIGMA == PLAN_SIGMA_REFERENCE)
+        self._scatter_check = QCheckBox("Scatter in medium")
+        self._scatter_check.setChecked(True)
+        self._scatter_check.setToolTip(
+            "Multiple Coulomb scattering in the phantom, applied to measured and plan "
+            "alike. Dose widens with depth; stops widen by the scatter where they end. "
+            "Off shows the spots at the σ they entered with."
+        )
+        self._scatter_check.toggled.connect(self._on_controls_changed)
+        plan_layout.addWidget(self._scatter_check)
 
         phantom_layout = self._add_group(layout, "Phantom")
         self._medium_combo = self._add_combo(
@@ -910,6 +961,10 @@ class DoseVolumeWindow(VispyViewWindow):
             grain=self._grain_combo.currentData(),
             xy_mode=self._xy_combo.currentData(),
             overlay_plan=compare or gamma,
+            sigma_plane=self._plane_combo.currentData(),
+            plan_sigma=self._plan_sigma_combo.currentData(),
+            plan_sigma_ref=self._ref_combo.currentData() or "",
+            scatter=self._scatter_check.isChecked(),
             gamma=gamma,
             gamma_dose_pct=crit.dose_pct,
             gamma_dta_mm=crit.dta_mm,
@@ -943,6 +998,11 @@ class DoseVolumeWindow(VispyViewWindow):
         try:
             self._set_combo(self._grain_combo, config.grain)
             self._set_combo(self._xy_combo, config.xy_mode)
+            self._set_combo(self._plane_combo, config.sigma_plane)
+            self._set_combo(self._plan_sigma_combo, config.plan_sigma)
+            self._ref_row.setVisible(config.plan_sigma == PLAN_SIGMA_REFERENCE)
+            self._set_combo(self._ref_combo, config.plan_sigma_ref)
+            self._scatter_check.setChecked(config.scatter)
             show = "gamma" if config.gamma else "difference" if config.overlay_plan else "dose"
             self._set_combo(self._show_combo, show)
             compare = show == "difference"
@@ -1181,6 +1241,10 @@ class DoseVolumeWindow(VispyViewWindow):
             return
         self._schedule_refresh()
 
+    def _on_plan_sigma_changed(self, *_args) -> None:
+        self._ref_row.setVisible(self._plan_sigma_combo.currentData() == PLAN_SIGMA_REFERENCE)
+        self._on_controls_changed()
+
     def _show_gamma_verdict(self) -> None:
         if not self._scene.gamma:
             self._gamma_label.setText(self._no_plan_reason() if self._gamma_mode() else "—")
@@ -1211,6 +1275,15 @@ class DoseVolumeWindow(VispyViewWindow):
             self._session_buttons.addButton(radio, i)
             self._session_layout.addWidget(radio)
         self._session_group.setVisible(len(loaded_ids) > 1)
+        kept = self._ref_combo.currentData()
+        others = [sid for sid in loaded_ids if sid != self._active_session]
+        self._ref_combo.blockSignals(True)
+        self._ref_combo.clear()
+        for sid in loaded_ids:
+            self._ref_combo.addItem(format_session_legend_label(sid, self._notes), sid)
+        if loaded_ids:
+            self._set_combo(self._ref_combo, kept if kept in loaded_ids else (others or loaded_ids)[0])
+        self._ref_combo.blockSignals(False)
 
     def _on_session_picked(self, index: int) -> None:
         if 0 <= index < len(self._listed_ids) and self._listed_ids[index] != self._active_session:
@@ -1260,11 +1333,11 @@ class DoseVolumeWindow(VispyViewWindow):
 
     def _start_refresh(self) -> None:
         gen = self._refresh_generation
+        self._update_session_list([sid for sid in self._session_ids if sid in self._sources])
         config = self._read_config()
         if gen != self._refresh_generation:
             return
         self.setWindowTitle(config.title)
-        self._update_session_list([sid for sid in self._session_ids if sid in self._sources])
         measured_batch, plan_batch, axis, n_raw = build_view_batches(
             self._sources,
             [self._active_session] if self._active_session else [],
@@ -1300,6 +1373,7 @@ class DoseVolumeWindow(VispyViewWindow):
             gamma=config.gamma and residual, gamma_criteria=self._gamma_criteria(),
             phantom_mm=config.phantom_mm, entrance_wet_mm=config.entrance_wet_mm,
             auto_margin_sigma=config.auto_margin_sigma,
+            scatter=config.scatter,
         )
         self._maybe_seed_absolute_window()
         self._update_legend()
@@ -1308,6 +1382,9 @@ class DoseVolumeWindow(VispyViewWindow):
         spots = f"{n_meas:,} spots"
         if residual:
             spots += f", plan {int(plan_batch.center.shape[0]):,}"
+            spots += f"\nPlan σ: {self._plan_sigma_combo.currentText()}"
+            if config.plan_sigma == PLAN_SIGMA_REFERENCE:
+                spots += f" ({self._ref_combo.currentText()})"
         info = f"{spots}\n{n_raw:,} raw samples\n{axis.axis_label}"
         if self._scene.volume_note:
             info += f"\n{self._scene.volume_note}"

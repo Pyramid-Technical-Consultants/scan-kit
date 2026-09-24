@@ -565,10 +565,13 @@ def float_from_ordered(ordered: int) -> float:
     return float(np.array(raw, dtype=np.uint32).view(np.float32))
 
 
-def auto_color_range(difference: bool, lo: float, hi: float) -> tuple[float, float] | None:
+def auto_color_range(
+    difference: bool, lo: float, hi: float, floor: float = 1e-9,
+) -> tuple[float, float] | None:
     """Map a GPU min/max to the color endpoints.
 
-    Dose keeps zero at the bottom. Difference is symmetric so 0 is the map's center.
+    Dose keeps zero at the bottom. Difference is symmetric so 0 is the map's center,
+    and never narrower than ``floor`` so float noise does not fill the scale.
     """
     lo_f = float(lo)
     hi_f = float(hi)
@@ -580,7 +583,7 @@ def auto_color_range(difference: bool, lo: float, hi: float) -> tuple[float, flo
         if hi_f <= 0.0:
             return None
         return 0.0, hi_f
-    reach = max(abs(lo_f), abs(hi_f), 1e-9)
+    reach = max(abs(lo_f), abs(hi_f), float(floor), 1e-9)
     return -reach, reach
 
 
