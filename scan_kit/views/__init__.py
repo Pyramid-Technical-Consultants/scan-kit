@@ -68,8 +68,8 @@ _UNIFIED_VIEWS.extend(
     (
         "Dose Volume (3D)",
         "dose_volume",
-        "1 mm dose volume of IC / ISO-ray / plan Gaussians in water, plastic, "
-        "or metal, ray marched in visPy.",
+        "Ray-marched dose volume from IC, ISO-ray, or plan spots: measured, "
+        "plan difference, or 3D gamma, in water, plastic, or metal (visPy).",
     ),
     (
         "Session Log Compare",
