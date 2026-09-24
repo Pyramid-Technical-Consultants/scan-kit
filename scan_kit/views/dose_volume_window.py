@@ -488,15 +488,21 @@ class DoseVolumeWindow(VispyViewWindow):
             (("dose", "Measured"), ("difference", "− Plan"), ("gamma", "Gamma")),
             self._on_show_changed,
         )
-        self._show_combo.setToolTip(
-            "Measured, measured minus plan, or 3D gamma of measured against plan."
-        )
+        self._show_combo.set_button_tooltips({
+            "dose": "The measured volume.",
+            "difference": "Measured minus plan.",
+            "gamma": "3D gamma of measured against plan.",
+        })
         self._weight_combo = self._add_segment(
             compare_layout, "Quantity",
             ((WEIGHT_DOSE, "Dose"), (WEIGHT_MU, "MU"), (WEIGHT_PROTONS, "Protons")),
             self._on_weight_mode_changed,
         )
-        self._weight_combo.setToolTip("Dose in Gy along the Bragg curve, or where the protons stop.")
+        self._weight_combo.set_button_tooltips({
+            WEIGHT_DOSE: "Dose in Gy along the Bragg curve.",
+            WEIGHT_MU: "Where the logged monitor units stop.",
+            WEIGHT_PROTONS: "Where the protons stop.",
+        })
         self._weight_combo.set_current(DEFAULT_WEIGHT)
         self._gap_spin = self._add_spin(
             compare_layout, "IC gap", 0.1, 100.0, 0.5, DEFAULT_IC_GAP_MM,
@@ -504,10 +510,12 @@ class DoseVolumeWindow(VispyViewWindow):
         )
         self._gap_spin.setSuffix(" mm")
         self._gap_spin.setToolTip("Chamber gap used to turn logged charge into protons.")
-        self._gap_spin.setEnabled(DEFAULT_WEIGHT != WEIGHT_MU)
+        self._gap_row = self._gap_spin.parentWidget()
+        self._gap_row.setVisible(DEFAULT_WEIGHT != WEIGHT_MU)
         self._gamma_group = QGroupBox("Gamma")
         gamma_layout = QVBoxLayout(self._gamma_group)
-        gamma_layout.setSpacing(4)
+        gamma_layout.setContentsMargins(8, 12, 8, 8)
+        gamma_layout.setSpacing(6)
         self._gamma_dd_spin = self._add_spin(
             gamma_layout, "Dose diff.", 0.5, 20.0, 0.5, DEFAULT_GAMMA_DOSE_PCT, decimals=1,
         )
@@ -537,6 +545,10 @@ class DoseVolumeWindow(VispyViewWindow):
         self._grain_combo = self._add_segment(
             beam_layout, "Data", _GRAIN_ITEMS, self._on_grain_changed,
         )
+        self._grain_combo.set_button_tooltips({
+            GRAIN_SPOT: "One row per spot.",
+            GRAIN_TIMESLICE: "One row per timeslice.",
+        })
         self._xy_combo = self._add_combo(
             beam_layout, "Position", _XY_ITEMS, self._on_controls_changed,
         )
@@ -553,22 +565,25 @@ class DoseVolumeWindow(VispyViewWindow):
             ((SIGMA_PLANE_CHAMBER, "Chamber"), (SIGMA_PLANE_ISO, "Isocenter")),
             self._on_controls_changed,
         )
-        self._plane_combo.setToolTip(
-            "Chamber keeps the measured spot σ. Isocenter projects it by SAD / SDD."
-        )
+        self._plane_combo.set_button_tooltips({
+            SIGMA_PLANE_CHAMBER: "Keep the measured spot σ at the chamber.",
+            SIGMA_PLANE_ISO: "Project spot σ to isocenter by SAD / SDD.",
+        })
         self._plane_combo.set_current(DEFAULT_SIGMA_PLANE)
         self._plan_sigma_combo = self._add_segment(
             beam_layout, "Plan σ",
             (
                 (PLAN_SIGMA_MEASURED, "Layer"),
                 (PLAN_SIGMA_REFERENCE, "Session"),
-                (PLAN_SIGMA_INTERLOCK, "Center"),
+                (PLAN_SIGMA_INTERLOCK, "Interlock"),
             ),
             self._on_plan_sigma_changed,
         )
-        self._plan_sigma_combo.setToolTip(
-            "Plan spot σ: this session per layer, another session, or the interlock center."
-        )
+        self._plan_sigma_combo.set_button_tooltips({
+            PLAN_SIGMA_MEASURED: "This session's σ, one value per energy layer.",
+            PLAN_SIGMA_REFERENCE: "Per-layer σ from another loaded session.",
+            PLAN_SIGMA_INTERLOCK: "The interlock σ.",
+        })
         self._plan_sigma_combo.set_current(DEFAULT_PLAN_SIGMA)
         self._ref_combo = QComboBox()
         self._ref_combo.setToolTip("Loaded session whose per-layer σ the plan uses.")
@@ -576,13 +591,13 @@ class DoseVolumeWindow(VispyViewWindow):
         self._add_row(beam_layout, "Reference", self._ref_combo)
         self._ref_row = self._ref_combo.parentWidget()
         self._ref_row.setVisible(DEFAULT_PLAN_SIGMA == PLAN_SIGMA_REFERENCE)
-        self._scatter_check = QCheckBox("Scatter in medium")
+        self._scatter_check = QCheckBox("In medium")
         self._scatter_check.setChecked(True)
         self._scatter_check.setToolTip(
             "Widen measured and plan alike as the beam scatters. Off keeps the entrance σ."
         )
         self._scatter_check.toggled.connect(self._on_controls_changed)
-        beam_layout.addWidget(self._scatter_check)
+        self._add_row(beam_layout, "Scatter", self._scatter_check)
 
         phantom_layout = self._add_group(layout, "Phantom")
         self._medium_combo = self._add_combo(
@@ -601,6 +616,7 @@ class DoseVolumeWindow(VispyViewWindow):
         )
         self._margin_spin.setSuffix(" σ")
         self._margin_spin.setToolTip("How many range-spread σ Auto adds past the deepest spot. 5σ keeps the tail.")
+        self._margin_row = self._margin_spin.parentWidget()
         self._phantom_spin.valueChanged.connect(self._sync_phantom_controls)
         self._wet_spin = self._add_spin(
             phantom_layout, "Entrance WET", 0.0, 300.0, 1.0, DEFAULT_ENTRANCE_WET_MM, decimals=1,
@@ -638,10 +654,11 @@ class DoseVolumeWindow(VispyViewWindow):
             ("cubic", "Cubic"),
         ])
         self._interp.set_current("linear")
-        self._interp.setToolTip(
-            "Nearest shows each voxel. Linear blends the neighbors. "
-            "Cubic is smoother and can overshoot a little."
-        )
+        self._interp.set_button_tooltips({
+            "nearest": "Show each voxel as stored.",
+            "linear": "Blend the neighboring voxels.",
+            "cubic": "Smoother, and can overshoot a little.",
+        })
         self._interp.selectionChanged.connect(self._scene.set_interp)
         self._add_row(view_layout, "Sample", self._interp)
         self._cap_spin = QSpinBox()
@@ -653,16 +670,19 @@ class DoseVolumeWindow(VispyViewWindow):
         self._add_row(view_layout, "Spot cap", self._cap_spin)
         self._grid_label = QLabel("—")
         self._grid_label.setToolTip("Voxels along X, Y, and depth.")
+        self._grid_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self._add_row(view_layout, "Grid", self._grid_label)
         self._spots_label = QLabel("—")
         self._spots_label.setToolTip("Spots in the volume. A plan count appears while comparing.")
+        self._spots_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self._add_row(view_layout, "Spots", self._spots_label)
 
         self._seq_scale = DEFAULT_SCALE
         self._div_scale = DEFAULT_DIVERGENT_SCALE
         color_group = QGroupBox("Color")
         color_layout = QVBoxLayout(color_group)
-        color_layout.setSpacing(4)
+        color_layout.setContentsMargins(8, 12, 8, 8)
+        color_layout.setSpacing(6)
         self._scale_combo = self._add_combo(
             color_layout, "Scale", scales_for(False), self._on_scale_changed,
         )
@@ -741,27 +761,34 @@ class DoseVolumeWindow(VispyViewWindow):
         self._splitter.setStretchFactor(1, 0)
 
     def _add_check_line(self, layout: QVBoxLayout, check: QCheckBox, readout: QLabel) -> None:
-        """Checkbox and its readback on one line. The readout wraps in the leftover width."""
+        """Checkbox and its readback, aligned with the labeled controls above."""
         host = QWidget()
         row = QHBoxLayout(host)
         row.setContentsMargins(0, 0, 0, 0)
         row.setSpacing(6)
+        gutter = QWidget()
+        gutter.setFixedWidth(_LABEL_WIDTH)
         readout.setWordWrap(True)
+        readout.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         readout.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
-        row.addWidget(check, 0, Qt.AlignmentFlag.AlignTop)
+        row.addWidget(gutter)
+        row.addWidget(check, 0, Qt.AlignmentFlag.AlignVCenter)
         row.addWidget(readout, 1)
         layout.addWidget(host)
 
     def _add_group(self, layout: QVBoxLayout, title: str) -> QVBoxLayout:
         group = QGroupBox(title)
         inner = QVBoxLayout(group)
-        inner.setSpacing(4)
+        inner.setContentsMargins(8, 12, 8, 8)
+        inner.setSpacing(6)
         layout.addWidget(group)
         return inner
 
     def _sync_phantom_controls(self, *_args) -> None:
-        """The margin only shapes an Auto phantom."""
-        self._margin_spin.setEnabled(self._phantom_spin.value() <= 0.0)
+        """The margin only shapes an Auto phantom, so it leaves the panel otherwise."""
+        auto = self._phantom_spin.value() <= 0.0
+        self._margin_spin.setEnabled(auto)
+        self._margin_row.setVisible(auto)
 
     def _add_row(self, layout: QVBoxLayout, label: str, widget: QWidget) -> None:
         host = QWidget()
@@ -1152,7 +1179,9 @@ class DoseVolumeWindow(VispyViewWindow):
     def _on_weight_mode_changed(self, *_args) -> None:
         if self._updating:
             return
-        self._gap_spin.setEnabled(self._choice(self._weight_combo) != WEIGHT_MU)
+        show_gap = self._choice(self._weight_combo) != WEIGHT_MU
+        self._gap_spin.setEnabled(show_gap)
+        self._gap_row.setVisible(show_gap)
         # New units: an absolute window typed for the old ones means nothing now.
         self._abs_edited = False
         if self._error_combo.currentData() == ERROR_ABSOLUTE:

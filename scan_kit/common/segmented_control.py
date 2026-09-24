@@ -15,7 +15,7 @@ from PySide6.QtWidgets import (
 _SEGMENTED_QSS = """
 SegmentedControl QPushButton {
     border: 1px solid palette(mid);
-    padding: 5px 14px;
+    padding: 3px 6px;
     background: palette(button);
     color: palette(button-text);
 }
@@ -78,7 +78,8 @@ class SegmentedControl(QWidget):
             btn = QPushButton(label)
             btn.setCheckable(True)
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            btn.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
+            btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            btn.setMinimumWidth(0)
             if n == 1:
                 seg = "only"
             elif i == 0:
@@ -90,7 +91,7 @@ class SegmentedControl(QWidget):
             btn.setProperty("seg", seg)
             self._group.addButton(btn)
             self._buttons[key] = btn
-            lay.addWidget(btn)
+            lay.addWidget(btn, 1)
 
         self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
         self.setStyleSheet(_SEGMENTED_QSS)
@@ -106,6 +107,12 @@ class SegmentedControl(QWidget):
         btn = self._buttons.get(key)
         if btn is not None:
             btn.setChecked(True)
+
+    def set_button_tooltips(self, tips: dict[str, str]) -> None:
+        for key, tip in tips.items():
+            btn = self._buttons.get(key)
+            if btn is not None:
+                btn.setToolTip(tip)
 
     def set_option_enabled(self, key: str, enabled: bool) -> None:
         btn = self._buttons.get(key)

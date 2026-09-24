@@ -690,7 +690,8 @@ def test_dose_volume_window_opens_with_absolute_scale(qapp, tmp_path) -> None:
         assert [group_of(w) for w in (window._weight_combo, window._voxel_spin)] == ["Compare", "View"]
         assert [group_of(w) for w in (window._plane_combo, window._plan_sigma_combo)] == ["Beam"] * 2
         assert [group_of(w) for w in (window._grid_label, window._spots_label)] == ["View"] * 2
-        assert window._scatter_check.parentWidget().title() == "Beam"
+        assert group_of(window._scatter_check) == "Beam"
+        assert not window._margin_row.isHidden() and not window._gap_row.isHidden()
         assert not window._phantom_box_check.isChecked() and window._field_box_check.isChecked()
         assert window._phantom_box_check.parentWidget() is window._phantom_note.parentWidget()
         assert window._field_box_check.parentWidget() is window._field_size.parentWidget()
@@ -711,7 +712,7 @@ def test_dose_volume_window_opens_with_absolute_scale(qapp, tmp_path) -> None:
         assert window._phantom_spin.text() == "Auto"
         assert window._margin_spin.value() == 5.0 and window._margin_spin.isEnabled()
         window._phantom_spin.setValue(200.0)
-        assert not window._margin_spin.isEnabled()
+        assert not window._margin_spin.isEnabled() and window._margin_row.isHidden()
         window._phantom_spin.setValue(0.0)
         assert window._wet_spin.value() == 0.0
         assert window._scale_mode_row.isHidden()
