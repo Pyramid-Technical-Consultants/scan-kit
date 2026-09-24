@@ -348,7 +348,7 @@ def _composite_vispy(window, pix):
     frame = _dose_frame(window)
     if frame.ndim != 3 or frame.shape[2] < 3:
         return pix
-    frame = np.ascontiguousarray(np.flipud(frame[:, :, :3]), dtype=np.uint8)
+    frame = np.ascontiguousarray(frame[:, :, :3], dtype=np.uint8)
     height, width, _ = frame.shape
     image = QImage(frame.tobytes(), width, height, 3 * width, QImage.Format.Format_RGB888).copy()
     canvas = window._vispy_canvas
@@ -381,6 +381,10 @@ def _capture_dose_volume(session_ids: list[str], output: Path, *, base_dir: str,
         lambda: window._scene._has_volume and "×" in window._grid_label.text(),
         timeout_ms=180_000,
     )
+    camera = window._scene._view.camera
+    camera.azimuth = 40.0
+    camera.elevation = -28.0
+    camera.roll = 0.0
     for _ in range(20):
         window._vispy_canvas.update()
         app.processEvents()
@@ -518,7 +522,7 @@ def main(only: list[str] | None = None) -> None:
         (
             "dose_volume/spot_ic1",
             lambda: _capture_dose_volume(
-                [SESSION_G3_A],
+                ["1093436476"],
                 OUT_DIR / "view-dose-volume.png",
                 base_dir=base_dir,
                 preset_id="spot_ic1",
