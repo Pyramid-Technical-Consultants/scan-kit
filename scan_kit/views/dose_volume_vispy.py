@@ -27,7 +27,6 @@ from .dose_volume_catalog import (
 from .dose_volume_data import DepthAxis, SplatBatch, protons_from_mu
 from .dose_volume_fill import (
     GAMMA_CMAP,
-    MAX_CELLS,
     VOXEL_MM,
     GaussianSmearKernel,
     dose_field_weights,
@@ -129,7 +128,15 @@ def axis_ticks(lo: float, hi: float, step: float = TICK_MM) -> tuple[np.ndarray,
     if k.size:
         labeled &= np.minimum(k - k[0], k[-1] - k) >= 0.6 * every
         labeled[[0, -1]] = True
-    return k * step, labeled
+    vals = k * step
+    # The box corner is the extent, even when it falls between centimeter ticks.
+    if vals.size == 0 or float(vals[0] - lo) > 1e-6:
+        vals = np.r_[lo, vals]
+        labeled = np.r_[True, labeled]
+    if vals.size == 0 or float(hi - vals[-1]) > 1e-6:
+        vals = np.r_[vals, hi]
+        labeled = np.r_[labeled, True]
+    return vals, labeled
 
 
 @dataclass(frozen=True)
@@ -233,12 +240,19 @@ def label_direction(edge, out) -> np.ndarray:
 
 
 def spaced_labels(tips_px, need_px: float) -> list[int]:
-    """Indices of numbers to show: all if they fit, else just the two ends, else none."""
+    """Indices of numbers that clear their neighbors. Both ends always stay."""
     tips = np.asarray(tips_px, dtype=float).reshape(-1, 2)
     n = len(tips)
-    if n < 2 or float(np.hypot(*np.diff(tips, axis=0).T).min()) >= need_px:
+    if n < 2:
         return list(range(n))
-    return [0, n - 1] if float(np.hypot(*(tips[-1] - tips[0]))) >= need_px else []
+    keep = [0]
+    for i in range(1, n - 1):
+        if float(np.hypot(*(tips[i] - tips[keep[-1]]))) >= need_px:
+            keep.append(i)
+    while len(keep) > 1 and float(np.hypot(*(tips[-1] - tips[keep[-1]]))) < need_px:
+        keep.pop()
+    keep.append(n - 1)
+    return keep
 
 
 def readable_angle(edge) -> float:
@@ -621,8 +635,11 @@ class DoseScene:
                         numbers.anchors = anchors
                     if abs(float(np.reshape(numbers.rotation, -1)[0]) - angle) > 0.5:
                         numbers.rotation = angle
-            half = 0.5 * TITLE_PT * px_per_pt
-            pos = screen(ax.edge_mid)[0] + d * (gap + half)
+            # Numbers are centered `gap` past the tick tip. The title clears their
+            # outer edge by another gap, including however far the tick projects.
+            tick_px = abs(float(np.dot(side, d))) * ax.tick_mm
+            title_em = TITLE_PT * px_per_pt
+            pos = screen(ax.edge_mid)[0] + d * (tick_px + gap + em + LABEL_GAP_PX + 0.6 * title_em)
             pos[0] = min(max(pos[0], 4.0), max(float(self._view.size[0]) - 4.0, 4.0))
             title.pos = pos
             if title.anchors != anchors:
@@ -734,7 +751,7 @@ class DoseScene:
         scale: str = DEFAULT_SCALE,
         auto_scale: bool = True,
         voxel_mm: float = VOXEL_MM,
-        smooth: bool = True,
+        interp: str = "linear",
         gamma: bool = False,
         gamma_criteria: GammaCriteria | None = None,
         phantom_mm: float = 0.0,
@@ -742,6 +759,8 @@ class DoseScene:
         auto_margin_sigma: float = 5.0,
         scatter: bool = True,
         field_edge: str = "slice50",
+        show_phantom: bool = False,
+        show_field: bool = True,
         status: str | None = None,
     ) -> None:
         from vispy import scene
@@ -762,7 +781,7 @@ class DoseScene:
         self._auto = bool(auto_scale)
         self.auto_lo = None
         self.auto_hi = None
-        self._box.set_smooth(smooth)
+        self._box.set_interp(interp)
         self._bounds = None
 
         if status:
@@ -843,9 +862,9 @@ class DoseScene:
             z_floor=-depth if depth else None,
         )
         nx, ny, nz = grid.shape
-        self.volume_note = f"Grid {nx} × {ny} × {nz} at {grid.voxel:g} mm"
+        self.volume_note = f"{nx} × {ny} × {nz}"
         if grid.cropped:
-            self.volume_note += f" (cropped to {MAX_CELLS} cells)"
+            self.volume_note += " · cropped"
         if medium_key:
             self.phantom_note = phantom_note(
                 medium, depth or 0.0, wet,
@@ -867,7 +886,7 @@ class DoseScene:
         if planned is None:
             self._difference = False
         if not gpu:
-            self.volume_note += "\nCPU fill"
+            self.volume_note += " · CPU fill"
         if dose and peak_w.size:
             peak_s[:, 2] = effective_sigma_z(kernel, peak_e)
         self._typical = typical_cell(peak_w, peak_s)
@@ -904,15 +923,17 @@ class DoseScene:
         if boxed is not None:
             f_o, f_e = boxed
             self.field_extent = (float(f_e[0]), float(f_e[1]), float(f_e[2]))
-            self._nodes.append(self._late_line(
-                pos=box_edge_segments(f_o, f_e), connect="segments", color=FIELD_RGBA, width=1,
-            ))
+            if show_field:
+                self._nodes.append(self._late_line(
+                    pos=box_edge_segments(f_o, f_e), connect="segments", color=FIELD_RGBA, width=1,
+                ))
         if depth:
             p_o, p_e = phantom_box(grid.origin, grid.extent_mm, depth)
-            self._nodes.append(self._late_line(
-                pos=box_edge_segments(p_o, p_e), connect="segments", color=PHANTOM_RGBA, width=1,
-            ))
-            corners = np.vstack([corners, volume_corners(p_o, p_e)])
+            if show_phantom:
+                self._nodes.append(self._late_line(
+                    pos=box_edge_segments(p_o, p_e), connect="segments", color=PHANTOM_RGBA, width=1,
+                ))
+                corners = np.vstack([corners, volume_corners(p_o, p_e)])
         # Frame the grid and phantom through the same transform that draws them.
         # Axis labels are not part of this box, or they pull the volume off center.
         world = self._gantry.transform.map(corners)
@@ -965,8 +986,8 @@ class DoseScene:
         self._push_display()
         self._canvas.update()
 
-    def set_smooth(self, smooth: bool) -> None:
-        self._box.set_smooth(smooth)
+    def set_interp(self, mode: str) -> None:
+        self._box.set_interp(mode)
         self._canvas.update()
 
     def set_scale(self, name: str) -> None:

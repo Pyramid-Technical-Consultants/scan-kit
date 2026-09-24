@@ -162,6 +162,12 @@ def test_range_axis_deeper_for_higher_energy() -> None:
     assert water.depth_sign == -1
     assert "water" in water.axis_label.lower()
     assert "copper" in copper.axis_label.lower()
+    pmma = range_axis_for_medium("pmma")
+    aluminum = range_axis_for_medium("aluminum")
+    assert "PMMA" in pmma.axis_label and "aluminum" in aluminum.axis_label
+    # Plastics stop in about the same mass as water; aluminum is much shorter in mm.
+    assert abs(pmma.z_scene_mm(np.array([100.0]))[0]) < abs(z[1])
+    assert abs(aluminum.z_scene_mm(np.array([100.0]))[0]) < abs(pmma.z_scene_mm(np.array([100.0]))[0])
 
 
 class _ZAtEnergy:
@@ -450,8 +456,8 @@ def test_delivered_mu_falls_back_when_dose_is_missing() -> None:
 
 def test_box_axes_tick_every_cm_on_the_box_edges() -> None:
     vals, labeled = axis_ticks(-25.0, 31.0)
-    np.testing.assert_allclose(vals, [-20.0, -10.0, 0.0, 10.0, 20.0, 30.0])
-    assert labeled.all()
+    np.testing.assert_allclose(vals, [-25.0, -20.0, -10.0, 0.0, 10.0, 20.0, 30.0, 31.0])
+    assert labeled[0] and labeled[-1]
     vals, labeled = axis_ticks(-330.0, 0.0)
     assert vals.size == 34 and labeled.sum() <= 8 and labeled[[0, -1]].all()
     # The end always reads; a round number crowding it gives way.
@@ -459,20 +465,22 @@ def test_box_axes_tick_every_cm_on_the_box_edges() -> None:
     assert labeled[0] and not labeled[vals == -300.0].any()
     assert spaced_labels([[0, 0], [10, 0], [20, 0]], 8.0) == [0, 1, 2]
     assert spaced_labels([[0, 0], [5, 0], [10, 0]], 8.0) == [0, 2]
-    assert spaced_labels([[0, 0], [2, 0], [4, 0]], 8.0) == []
+    assert spaced_labels([[0, 0], [2, 0], [4, 0]], 8.0) == [0, 2]
+    # A tick jammed against the end drops only itself, not the labels that still fit.
+    assert spaced_labels([[0, 0], [20, 0], [40, 0], [42, 0]], 8.0) == [0, 1, 3]
 
     origin, extent = np.array([-15.0, -20.0, -330.0]), np.array([30.0, 40.0, 332.0])
     guides = box_axes(origin, extent, ("X", "Y", "Depth"), depth_sign=-1)
     starts = guides.ticks[0::2]
     ends = guides.ticks[1::2]
-    assert starts.shape[0] == 3 + 5 + 34
+    assert starts.shape[0] == 5 + 5 + 35
     # X ticks sit on the surface edge (y = lo, z = hi) and point out of the box along −y.
-    x = starts[:3]
-    np.testing.assert_allclose(x[:, 1:], [[-20.0, 2.0]] * 3)
-    assert (ends[:3, 1] < -20.0).all()
+    x = starts[:5]
+    np.testing.assert_allclose(x[:, 1:], [[-20.0, 2.0]] * 5)
+    assert (ends[:5, 1] < -20.0).all()
     # Depth numbers read positive and hang off tick tips outside the box.
     x_ax, _y_ax, z_ax = guides.axes
-    assert z_ax.numbers == ["330", "300", "250", "200", "150", "100", "50", "0"]
+    assert z_ax.numbers[0] == "330" and z_ax.numbers[-2:] == ["0", "-2"]
     assert (z_ax.tips[:, 0] < -15.0).all() and np.allclose(z_ax.tips[:, 1], -20.0)
     np.testing.assert_allclose(x_ax.out, [0.0, -1.0, 0.0])
     assert [a.title for a in guides.axes] == ["X", "Y", "Depth"]
@@ -665,7 +673,7 @@ def test_dose_volume_window_opens_with_absolute_scale(qapp, tmp_path) -> None:
 
     window = DoseVolumeWindow([], str(tmp_path))
     try:
-        assert window._weight_combo.currentData() == WEIGHT_DOSE
+        assert window._weight_combo.current_key() == WEIGHT_DOSE
         assert window._error_combo.currentData() == ERROR_ABSOLUTE
         assert window._error_scale_spin.value() == pytest.approx(DEFAULT_ERROR_MU)
         assert window._error_scale_spin.suffix() == " Gy·mm"
@@ -676,10 +684,16 @@ def test_dose_volume_window_opens_with_absolute_scale(qapp, tmp_path) -> None:
             return widget.parentWidget().parentWidget().title()
 
         assert [group_of(w) for w in (window._grain_combo, window._gap_spin, window._cap_spin)] == [
-            "Beam", "Dose", "View",
+            "Beam", "Compare", "View",
         ]
         assert [group_of(w) for w in (window._medium_combo, window._margin_spin, window._wet_spin)] == ["Phantom"] * 3
-        assert [group_of(w) for w in (window._weight_combo, window._voxel_spin)] == ["Dose", "View"]
+        assert [group_of(w) for w in (window._weight_combo, window._voxel_spin)] == ["Compare", "View"]
+        assert [group_of(w) for w in (window._plane_combo, window._plan_sigma_combo)] == ["Beam"] * 2
+        assert [group_of(w) for w in (window._grid_label, window._spots_label)] == ["View"] * 2
+        assert window._scatter_check.parentWidget().title() == "Beam"
+        assert not window._phantom_box_check.isChecked() and window._field_box_check.isChecked()
+        assert window._phantom_box_check.parentWidget() is window._phantom_note.parentWidget()
+        assert window._field_box_check.parentWidget() is window._field_size.parentWidget()
         # Session radios sit above Beam, show only for 2+, and the pick survives a rebuild.
         assert window._session_group.isHidden()
         window._update_session_list(["s1", "s2"])
@@ -710,7 +724,7 @@ def test_dose_volume_window_opens_with_absolute_scale(qapp, tmp_path) -> None:
         assert window._splitter.widget(0) is view
         assert window._splitter.widget(1) is window._side_scroll
         assert window._voxel_spin.value() == 1.0
-        assert window._smooth_check.isChecked()
+        assert window._interp.current_key() == "linear"
         assert window._color_axis.minimumWidth() == window._color_axis.maximumWidth()
         assert window._auto_check.isChecked()
         assert not window._gain_box.isHidden()

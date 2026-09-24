@@ -68,8 +68,8 @@ _UNIFIED_VIEWS.extend(
     (
         "Dose Volume (3D)",
         "dose_volume",
-        "1 mm dose volume of IC / ISO-ray / plan Gaussians versus water or "
-        "copper range, ray marched in visPy.",
+        "1 mm dose volume of IC / ISO-ray / plan Gaussians in water, plastic, "
+        "or metal, ray marched in visPy.",
     ),
     (
         "Session Log Compare",

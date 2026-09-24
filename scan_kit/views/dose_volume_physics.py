@@ -52,9 +52,18 @@ class Medium:
     nuclear_cm2_g: float
 
 
+# I, density, and Z/A follow ICRU 49. Radiation lengths are the PDG values.
+# A-150's radiation length is the mixture rule; it is not a tabulated PDG entry.
+# ponytail: plastics share water's flat nuclear removal; aluminum sits between
+# water and copper. ICRU 63 if a depth dose looks off.
 WATER = Medium("water", "water", 0.55509, 75.0, 1.0, 36.08, 0.012)
+PMMA = Medium("pmma", "PMMA", 0.53937, 74.0, 1.190, 40.55, 0.012)
+POLYSTYRENE = Medium("polystyrene", "polystyrene", 0.53768, 68.7, 1.060, 43.79, 0.012)
+POLYETHYLENE = Medium("polyethylene", "polyethylene", 0.57034, 57.4, 0.940, 44.64, 0.012)
+A150 = Medium("a150", "A-150 plastic", 0.54915, 65.1, 1.127, 41.9, 0.012)
+ALUMINUM = Medium("aluminum", "aluminum", 0.48181, 166.0, 2.699, 24.01, 0.008)
 COPPER = Medium("copper", "copper", 0.45636, 322.0, 8.96, 12.86, 0.0074)
-MEDIA = {m.key: m for m in (WATER, COPPER)}
+MEDIA = {m.key: m for m in (WATER, PMMA, POLYSTYRENE, POLYETHYLENE, A150, ALUMINUM, COPPER)}
 
 
 def medium_for(key: str) -> Medium:

@@ -344,8 +344,18 @@ void store_ray(float lo, float hi) {
     imageStore(ray_image, ivec2(gl_FragCoord.xy), vec4(lo, hi, 0.0, 0.0));
 }
 
+float catrom(float x) {
+    float a = abs(x);
+    if (a < 1.0)
+        return (1.5 * a - 2.5) * a * a + 1.0;
+    if (a < 2.0)
+        return ((-0.5 * a + 2.5) * a - 4.0) * a + 2.0;
+    return 0.0;
+}
+
 float sample_vol(sampler3D tex, vec3 p) {
     vec3 cell = (p - u_origin) / u_voxel;
+    // 0 nearest, 1 trilinear, 2 Catmull-Rom tricubic.
     if (u_smooth < 0.5) {
         vec3 c = floor(cell);
         return voxel(tex, int(c.x), int(c.y), int(c.z));
@@ -353,15 +363,31 @@ float sample_vol(sampler3D tex, vec3 p) {
     vec3 q = cell - vec3(0.5);
     vec3 base = floor(q);
     vec3 f = q - base;
+    if (u_smooth < 1.5) {
+        float acc = 0.0;
+        for (int dz = 0; dz < 2; ++dz) {
+            for (int dy = 0; dy < 2; ++dy) {
+                for (int dx = 0; dx < 2; ++dx) {
+                    float wx = dx == 1 ? f.x : 1.0 - f.x;
+                    float wy = dy == 1 ? f.y : 1.0 - f.y;
+                    float wz = dz == 1 ? f.z : 1.0 - f.z;
+                    acc += wx * wy * wz * voxel(
+                        tex, int(base.x) + dx, int(base.y) + dy, int(base.z) + dz
+                    );
+                }
+            }
+        }
+        return acc;
+    }
     float acc = 0.0;
-    for (int dz = 0; dz < 2; ++dz) {
-        for (int dy = 0; dy < 2; ++dy) {
-            for (int dx = 0; dx < 2; ++dx) {
-                float wx = dx == 1 ? f.x : 1.0 - f.x;
-                float wy = dy == 1 ? f.y : 1.0 - f.y;
-                float wz = dz == 1 ? f.z : 1.0 - f.z;
+    for (int dz = 0; dz < 4; ++dz) {
+        float wz = catrom(f.z - float(dz - 1));
+        for (int dy = 0; dy < 4; ++dy) {
+            float wy = catrom(f.y - float(dy - 1));
+            for (int dx = 0; dx < 4; ++dx) {
+                float wx = catrom(f.x - float(dx - 1));
                 acc += wx * wy * wz * voxel(
-                    tex, int(base.x) + dx, int(base.y) + dy, int(base.z) + dz
+                    tex, int(base.x) + dx - 1, int(base.y) + dy - 1, int(base.z) + dz - 1
                 );
             }
         }
@@ -1229,8 +1255,9 @@ def make_dose_box_node():
             self.shared_program["u_shape"] = (float(sh[0]), float(sh[1]), float(sh[2]))
             self.shared_program["u_voxel"] = float(voxel)
 
-        def set_smooth(self, smooth: bool) -> None:
-            self.shared_program["u_smooth"] = 1.0 if smooth else 0.0
+        def set_interp(self, mode: str) -> None:
+            code = {"nearest": 0.0, "cubic": 2.0}.get(mode, 1.0)
+            self.shared_program["u_smooth"] = code
 
         def set_volumes(self, measured, plan) -> None:
             self.shared_program["u_meas"] = measured

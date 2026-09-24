@@ -40,8 +40,15 @@ DEFAULT_ENERGY_SPREAD_PCT = 1.0
 DEFAULT_GANTRY_DEG = 90.0
 
 MEDIUM_WATER = "water"
+MEDIUM_PMMA = "pmma"
+MEDIUM_POLYSTYRENE = "polystyrene"
+MEDIUM_POLYETHYLENE = "polyethylene"
+MEDIUM_A150 = "a150"
+MEDIUM_ALUMINUM = "aluminum"
 MEDIUM_COPPER = "copper"
-MediumKind = Literal["water", "copper"]
+MediumKind = Literal[
+    "water", "pmma", "polystyrene", "polyethylene", "a150", "aluminum", "copper",
+]
 DEFAULT_MEDIUM = MEDIUM_WATER
 # Phantom thickness along the beam; 0 means auto (deep enough that nothing exits).
 DEFAULT_PHANTOM_MM = 0.0
@@ -205,6 +212,8 @@ class DoseVolumeConfig:
     plan_sigma_ref: str = ""
     # Multiple Coulomb scattering in the phantom, applied to measured and plan alike.
     scatter: bool = True
+    show_phantom: bool = False
+    show_field: bool = True
     gain: float = DEFAULT_GAIN
     smear_axis_units: float = DEFAULT_ENERGY_SPREAD_PCT
     splat_cap: int = DEFAULT_SPOT_CAP
@@ -223,7 +232,8 @@ class DoseVolumeConfig:
     scale: str = DEFAULT_SCALE
     auto_scale: bool = True
     voxel_mm: float = 1.0
-    smooth: bool = True
+    # How a viewing ray samples the voxel grid: nearest, trilinear, or tricubic.
+    interp: str = "linear"
     gamma: bool = False
     gamma_dose_pct: float = DEFAULT_GAMMA_DOSE_PCT
     gamma_dta_mm: float = DEFAULT_GAMMA_DTA_MM

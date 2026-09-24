@@ -47,8 +47,6 @@ from .dose_volume_physics import csda_range_mm, depth_sigma_mm, medium_for
 from .dose_volume_catalog import (
     GRAIN_SPOT,
     GRAIN_TIMESLICE,
-    MEDIUM_COPPER,
-    MEDIUM_WATER,
     PLAN_SIGMA_INTERLOCK,
     PLAN_SIGMA_REFERENCE,
     SIGMA_PLANE_CHAMBER,
@@ -138,8 +136,8 @@ class RangeAxis:
 
 
 def range_axis_for_medium(medium: str) -> RangeAxis:
-    key = MEDIUM_COPPER if medium == MEDIUM_COPPER else MEDIUM_WATER
-    return RangeAxis(medium=key, axis_label=f"Depth in {key} (mm)")
+    spec = medium_for(medium)
+    return RangeAxis(medium=spec.key, axis_label=f"Depth in {spec.label} (mm)")
 
 
 @dataclass(frozen=True)
