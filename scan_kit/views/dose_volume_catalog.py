@@ -48,6 +48,35 @@ DEFAULT_PHANTOM_MM = 0.0
 # How far past the deepest range an Auto phantom reaches, in range-spread σ.
 # The depth-dose tables carry 5σ, so that is also the most Auto can hold.
 DEFAULT_AUTO_MARGIN_SIGMA = 5.0
+
+# Field box. ICRU 78 takes the lateral field edge as 50 % of the dose at that
+# depth (not of the peak), and the lateral penumbra as 80 %–20 %. The 90 %
+# isodose is the high-dose core; range is often quoted at the distal 90 %.
+FIELD_SLICE_50 = "slice50"
+FIELD_PEAK_90 = "peak90"
+FIELD_PEAK_50 = "peak50"
+FIELD_SLICE_20 = "slice20"
+# 90 % of the plan peak: the high-dose volume the plan covers (ICRU 78 quotes
+# coverage and distal range at 90 %). Read from the plan, not the measurement.
+FIELD_PLAN_90 = "plan90"
+FieldEdgeKind = Literal["slice50", "peak90", "peak50", "slice20", "plan90"]
+DEFAULT_FIELD_EDGE = FIELD_SLICE_50
+# (id, label, fraction, per depth slice, from the plan volume).
+FIELD_EDGES: tuple[tuple[str, str, float, bool, bool], ...] = (
+    (FIELD_SLICE_50, "Field size (50% of slice)", 0.5, True, False),
+    (FIELD_PEAK_90, "High dose (90% of peak)", 0.9, False, False),
+    (FIELD_PEAK_50, "Half maximum (50% of peak)", 0.5, False, False),
+    (FIELD_SLICE_20, "Penumbra outer (20% of slice)", 0.2, True, False),
+    (FIELD_PLAN_90, "Planned (90% of plan)", 0.9, False, True),
+)
+
+
+def field_edge_spec(kind: str) -> tuple[float, bool, bool]:
+    """(fraction, per-slice, from the plan) for a field-edge id."""
+    for edge_id, _label, fraction, per_slice, from_plan in FIELD_EDGES:
+        if edge_id == kind:
+            return fraction, per_slice, from_plan
+    return 0.5, True, False
 # Water-equivalent material between nozzle and phantom surface (tank wall, buildup, range shifter).
 DEFAULT_ENTRANCE_WET_MM = 0.0
 
@@ -184,6 +213,8 @@ class DoseVolumeConfig:
     phantom_mm: float = DEFAULT_PHANTOM_MM
     auto_margin_sigma: float = DEFAULT_AUTO_MARGIN_SIGMA
     entrance_wet_mm: float = DEFAULT_ENTRANCE_WET_MM
+    # Which isodose the field box follows. See FIELD_EDGES.
+    field_edge: str = DEFAULT_FIELD_EDGE
     error_mode: ErrorKind = DEFAULT_ERROR_MODE
     error_scale: float = DEFAULT_ERROR_SCALE
     weight_mode: WeightKind = DEFAULT_WEIGHT

@@ -13,6 +13,7 @@ from .dose_volume_catalog import (
     DEFAULT_ERROR_SCALE,
     DEFAULT_GAIN,
     DEFAULT_RAY,
+    field_edge_spec,
     DEFAULT_SCALE,
     ERROR_ABSOLUTE,
     RAY_INTEGRAL,
@@ -53,6 +54,7 @@ from .dose_volume_raycast import (
     fill_texture,
     gamma_texture,
     make_dose_box_node,
+    read_texture,
     manual_color_limits,
 )
 from .vispy_plot import bind_blender_view_keys
@@ -135,12 +137,17 @@ class AxisText:
     """One edge's labels: numbers hang off the tick tips, the title off the midpoint."""
 
     axis: int  # 0, 1, 2 for the X, Y, Z edge
-    tips: np.ndarray  # (n, 3) tips of the numbered ticks
+    tips: np.ndarray  # (n, 3) tips of the numbered ticks, along the default outward
     numbers: list[str]
     mid: np.ndarray  # tick-length out from the edge midpoint
-    out: np.ndarray  # unit vector away from the box
+    out: np.ndarray  # default unit vector away from the box
     title: str
     length: float  # edge length, mm
+    roots: np.ndarray  # (n, 3) every tick, on the edge
+    major: np.ndarray  # which roots carry a number
+    outs: np.ndarray  # (2, 3) the two directions that leave the box
+    edge_mid: np.ndarray
+    tick_mm: float
 
 
 @dataclass(frozen=True)
@@ -159,32 +166,57 @@ def box_axes(origin, extent_mm, names, *, depth_sign: int = 1, step: float = TIC
     o = np.asarray(origin, dtype=float).reshape(3)
     h = o + np.asarray(extent_mm, dtype=float).reshape(3)
     tick = float(np.clip(0.02 * float(np.max(h - o)), 1.5, 6.0))
+    # Each edge offers the two directions that leave the box; the view picks one per frame.
     edges = (
-        (np.array([0.0, o[1], h[2]]), np.array([0.0, -1.0, 0.0]), 1),
-        (np.array([o[0], 0.0, h[2]]), np.array([-1.0, 0.0, 0.0]), 1),
-        (np.array([o[0], o[1], 0.0]), np.array([-1.0, -1.0, 0.0]) / math.sqrt(2.0), depth_sign),
+        (np.array([0.0, o[1], h[2]]), (np.array([0.0, -1.0, 0.0]), np.array([0.0, 0.0, 1.0])), 1),
+        (np.array([o[0], 0.0, h[2]]), (np.array([-1.0, 0.0, 0.0]), np.array([0.0, 0.0, 1.0])), 1),
+        (np.array([o[0], o[1], 0.0]), (np.array([-1.0, 0.0, 0.0]), np.array([0.0, -1.0, 0.0])), depth_sign),
     )
     ticks, axes = [], []
-    for i, ((base, out, sign), name) in enumerate(zip(edges, names)):
+    for i, ((base, outs, sign), name) in enumerate(zip(edges, names)):
+        out = outs[0]
         vals, labeled = axis_ticks(o[i], h[i], step)
-        tips, numbers = [], []
-        for v, major in zip(vals, labeled):
+        roots, major, tips, numbers = [], [], [], []
+        for v, is_major in zip(vals, labeled):
             p = base.copy()
             p[i] = v
-            ticks += [p, p + out * tick * (1.0 if major else 0.55)]
-            if major:
+            roots.append(p)
+            major.append(bool(is_major))
+            ticks += [p, p + out * tick * (1.0 if is_major else 0.55)]
+            if is_major:
                 tips.append(p + out * tick)
                 numbers.append(f"{v * sign + 0.0:g}")
-        mid = base.copy()
-        mid[i] = 0.5 * (o[i] + h[i])
-        tips = np.array(tips, dtype=float).reshape(-1, 3)
-        axes.append(AxisText(i, tips, numbers, mid + out * tick, out, name, float(h[i] - o[i])))
+        edge_mid = base.copy()
+        edge_mid[i] = 0.5 * (o[i] + h[i])
+        axes.append(AxisText(
+            i, np.array(tips, dtype=float).reshape(-1, 3), numbers, edge_mid + out * tick, out, name,
+            float(h[i] - o[i]), np.array(roots, dtype=float).reshape(-1, 3), np.array(major, dtype=bool),
+            np.stack(outs), edge_mid, tick,
+        ))
     return BoxAxes(np.array(ticks, dtype=float).reshape(-1, 3), axes)
 
 
 NUMBER_PT = 7
 TITLE_PT = 9
-LABEL_GAP_PX = 9.0
+LABEL_GAP_PX = 14.0
+
+
+def outward_index(edge, candidates, away) -> int:
+    """Which candidate points off the edge, on the side *away* from the box.
+
+    *edge*, *candidates* ``(2, 2)`` and *away* are screen pixels. A candidate that
+    runs along the edge scores nothing, so a side view takes the other one.
+    """
+    edge = np.asarray(edge, dtype=float)
+    cands = np.asarray(candidates, dtype=float).reshape(2, 2)
+    away = np.asarray(away, dtype=float)
+    n = float(np.hypot(*edge))
+    if n < 1e-6:
+        return int(np.argmax(cands @ away))
+    perp = np.array([-edge[1], edge[0]]) / n
+    if float(perp @ away) < 0.0:
+        perp = -perp
+    return int(np.argmax(cands @ perp))
 
 
 def label_direction(edge, out) -> np.ndarray:
@@ -207,6 +239,20 @@ def spaced_labels(tips_px, need_px: float) -> list[int]:
     if n < 2 or float(np.hypot(*np.diff(tips, axis=0).T).min()) >= need_px:
         return list(range(n))
     return [0, n - 1] if float(np.hypot(*(tips[-1] - tips[0]))) >= need_px else []
+
+
+def readable_angle(edge) -> float:
+    """Clockwise degrees of a screen edge (y down), folded into [-90, 90].
+
+    vispy text rotation is clockwise. Folding keeps the baseline along the
+    axis with the top of the letters toward the top of the view.
+    """
+    deg = math.degrees(math.atan2(float(edge[1]), float(edge[0])))
+    if deg > 90.0:
+        deg -= 180.0
+    elif deg < -90.0:
+        deg += 180.0
+    return deg
 
 
 def label_anchors(d) -> tuple[str, str]:
@@ -234,7 +280,10 @@ def box_edge_segments(origin, extent_mm) -> np.ndarray:
     return np.array([c[i] for pair in pairs for i in pair], dtype=float)
 
 
-PHANTOM_PAD_MM = 10.0
+# Wider than the axis titles, which sit about 36 mm off the voxel box.
+PHANTOM_PAD_MM = 48.0
+# ICRU 78 takes the geometric field edge as the 50 % isodose.
+FIELD_FRACTION = 0.5
 # Box edges and ticks share one muted ink; text needs a little more to stay legible.
 BOX_ALPHA = 0.3
 NUMBER_ALPHA = 0.6
@@ -242,6 +291,43 @@ TITLE_ALPHA = 0.75
 # Auto difference never spans less than ±1 % of the dose scale.
 AUTO_DIFF_FLOOR = 0.01
 PHANTOM_RGBA = (0.30, 0.80, 0.90, 0.35)
+FIELD_RGBA = (0.95, 0.85, 0.45, 0.55)
+
+
+def field_box(
+    volume_zyx, origin, voxel: float, fraction: float = FIELD_FRACTION, *, per_slice: bool = False,
+):
+    """Axis-aligned box of voxels at or above *fraction* of the reference dose.
+
+    The reference is the volume peak. With *per_slice*, a depth counts only when
+    its own maximum reaches that fraction of the peak, and the lateral edge
+    inside the slice is the same fraction of the slice maximum. Returns
+    ``(origin, extent)`` in beam millimetres, or None when nothing qualifies.
+    """
+    vol = np.asarray(volume_zyx, dtype=float)
+    if vol.size == 0:
+        return None
+    if per_slice:
+        peak = np.max(vol, axis=(1, 2))
+        global_peak = float(np.max(peak)) if peak.size else 0.0
+        if not math.isfinite(global_peak) or global_peak <= 0.0:
+            return None
+        kept = peak >= fraction * global_peak
+        mask = vol >= (fraction * peak)[:, None, None]
+        mask &= kept[:, None, None]
+        zz, yy, xx = np.nonzero(mask)
+    else:
+        peak_v = float(np.max(vol))
+        if not math.isfinite(peak_v) or peak_v <= 0.0:
+            return None
+        zz, yy, xx = np.nonzero(vol >= fraction * peak_v)
+    if xx.size == 0:
+        return None
+    v = float(voxel)
+    o = np.asarray(origin, dtype=float).reshape(3)
+    lo = o + np.array([xx.min(), yy.min(), zz.min()], dtype=float) * v
+    hi = o + np.array([xx.max() + 1, yy.max() + 1, zz.max() + 1], dtype=float) * v
+    return lo, hi - lo
 
 
 def phantom_box(grid_origin, grid_extent_mm, depth_mm: float, pad_mm: float = PHANTOM_PAD_MM):
@@ -393,6 +479,8 @@ class DoseScene:
         self._typical = 1.0
         self.dose_peak = 1.0
         self.ray_peak = 1.0
+        self.field_extent: tuple[float, float, float] | None = None
+        self.phantom_note = ""
         self._ray_mode = DEFAULT_RAY
         self._scale = DEFAULT_SCALE
         self._error_scale = DEFAULT_ERROR_SCALE
@@ -411,6 +499,7 @@ class DoseScene:
         self._inked: list = []
         # (2D Text, gantry-space anchors) reprojected every draw.
         self._labels: list = []
+        self._tick_line = None
         self._axes_center = np.zeros(3)
         self._canvas.on_draw = self._on_draw
 
@@ -447,10 +536,12 @@ class DoseScene:
             origin, extent_mm, ("X (mm)", "Y (mm)", axis.axis_label),
             depth_sign=int(getattr(axis, "depth_sign", 1)),
         )
+        self._tick_line = None
         if guides.ticks.size:
             ticks = self._late_line(
                 pos=guides.ticks, connect="segments", color=(*self._ink, BOX_ALPHA), width=1,
             )
+            self._tick_line = ticks
             self._nodes.append(ticks)
             self._inked.append((ticks, BOX_ALPHA))
         # 3D Text shrinks by the perspective w, so labels are 2D text on the view, placed each draw.
@@ -483,13 +574,26 @@ class DoseScene:
         center = screen(self._axes_center)[0]
         em = NUMBER_PT * px_per_pt
         projected = []
+        segments = []
         for _numbers, _title, ax in self._labels:
             along = np.zeros(3)
             along[ax.axis] = 1.0
-            a, b, c = screen(np.stack([ax.mid, ax.mid + ax.out, ax.mid + along]))
-            projected.append((a, b, c, float(np.hypot(*(c - a)))))
+            pts = screen(np.vstack([
+                ax.edge_mid, ax.edge_mid + ax.outs[0], ax.edge_mid + ax.outs[1], ax.edge_mid + along,
+            ]))
+            edge = pts[3] - pts[0]
+            per_mm = float(np.hypot(*edge))
+            away = pts[0] - center
+            idx = outward_index(edge, pts[1:3] - pts[0], away if np.hypot(*away) > 1e-6 else pts[1] - pts[0])
+            choice = ax.outs[idx]
+            span = ax.tick_mm * np.where(ax.major, 1.0, 0.55)[:, None]
+            ends = ax.roots + choice * span
+            segments += [p for pair in zip(ax.roots, ends) for p in pair]
+            projected.append((pts[0], pts[1 + idx] - pts[0], edge, per_mm, ends[ax.major]))
+        if self._tick_line is not None and segments:
+            self._tick_line.set_data(pos=np.asarray(segments, dtype=float))
         widest = max(p[3] for p in projected)
-        for (numbers, title, ax), (a, b, c, per_mm) in zip(self._labels, projected):
+        for (numbers, title, ax), (a, side, edge, per_mm, tips3) in zip(self._labels, projected):
             # Edge seen (nearly) end-on: its labels would pile onto the corner.
             shown = per_mm * ax.length >= 3.0 * em and per_mm >= 0.3 * widest
             title.visible = shown
@@ -498,15 +602,15 @@ class DoseScene:
             if not shown:
                 continue
             # Outward toward the camera picks no side; step away from the box instead.
-            side = b - a if np.hypot(*(b - a)) >= 0.25 * per_mm else a - center
-            d = label_direction(c - a, side)
-            anchors = label_anchors(d)
-            gap = LABEL_GAP_PX
+            d = label_direction(edge, side if np.hypot(*side) >= 0.25 * per_mm else a - center)
+            angle = readable_angle(edge)
+            # Rotated glyphs spin about their center, so the center sits a glyph-height off the edge.
+            gap = LABEL_GAP_PX + 0.8 * em
+            anchors = ("center", "center")
             if numbers is not None:
                 wide = 0.6 * em * max(len(s) for s in ax.numbers)
-                edge = (c - a) / per_mm
-                tips = screen(ax.tips)
-                keep = spaced_labels(tips, abs(edge[0]) * wide + abs(edge[1]) * em + 4.0)
+                tips = screen(tips3)
+                keep = spaced_labels(tips, wide + 4.0)
                 strings = [ax.numbers[i] for i in keep]
                 numbers.visible = bool(keep)
                 if strings and strings != numbers.text:
@@ -515,16 +619,16 @@ class DoseScene:
                     numbers.pos = tips[keep] + d * gap
                     if numbers.anchors != anchors:
                         numbers.anchors = anchors
-                    gap += abs(d[0]) * wide + abs(d[1]) * em + LABEL_GAP_PX
-            # Keep the title inside the view even when the box fills it.
-            half = 0.3 * TITLE_PT * px_per_pt * len(ax.title)
-            lo_x = {"right": 2 * half, "center": half}.get(anchors[0], 0.0) + 2.0
-            hi_x = float(self._view.size[0]) - {"left": 2 * half, "center": half}.get(anchors[0], 0.0) - 2.0
-            pos = screen(ax.mid)[0] + d * gap
-            pos[0] = min(max(pos[0], lo_x), max(hi_x, lo_x))
+                    if abs(float(np.reshape(numbers.rotation, -1)[0]) - angle) > 0.5:
+                        numbers.rotation = angle
+            half = 0.5 * TITLE_PT * px_per_pt
+            pos = screen(ax.edge_mid)[0] + d * (gap + half)
+            pos[0] = min(max(pos[0], 4.0), max(float(self._view.size[0]) - 4.0, 4.0))
             title.pos = pos
             if title.anchors != anchors:
                 title.anchors = anchors
+            if abs(float(np.reshape(title.rotation, -1)[0]) - angle) > 0.5:
+                title.rotation = angle
 
     def _late_line(self, **kwargs):
         line = _late_class()(parent=self._gantry, **kwargs)
@@ -637,6 +741,7 @@ class DoseScene:
         entrance_wet_mm: float = 0.0,
         auto_margin_sigma: float = 5.0,
         scatter: bool = True,
+        field_edge: str = "slice50",
         status: str | None = None,
     ) -> None:
         from vispy import scene
@@ -646,6 +751,8 @@ class DoseScene:
         self._has_volume = False
         self._broken = False
         self.volume_note = ""
+        self.phantom_note = ""
+        self.field_extent = None
         self._gain = float(gain)
         self._error_scale = float(error_scale)
         self._absolute = error_mode == ERROR_ABSOLUTE
@@ -721,7 +828,10 @@ class DoseScene:
         plan_prep = prepared(plan_in) if plan_in is not None else None
         # The grid holds the plan either way, so switching Show keeps the frame.
         spans = [p for p in (meas, plan_prep) if p is not None]
-        planned = plan_prep if difference or gamma else None
+        fraction, per_slice, from_plan = field_edge_spec(field_edge)
+        # The march ignores the plan texture unless a difference is shown, so the
+        # planned field can be filled without changing the picture.
+        planned = plan_prep if difference or gamma or from_plan else None
         entry_energy = np.concatenate([s[3] for s in live])
         depth = None
         if medium_key:
@@ -737,7 +847,7 @@ class DoseScene:
         if grid.cropped:
             self.volume_note += f" (cropped to {MAX_CELLS} cells)"
         if medium_key:
-            self.volume_note += "\n" + phantom_note(
+            self.phantom_note = phantom_note(
                 medium, depth or 0.0, wet,
                 auto=phantom_mm <= 0.0,
                 n_nozzle=sum(len(b.energy_mev) for b in batches),
@@ -782,6 +892,21 @@ class DoseScene:
         corners = volume_corners(grid.origin, grid.extent_mm)
         self._add_bounds(grid.origin, grid.extent_mm)
         self._add_axes(axis, grid.origin, grid.extent_mm)
+        src = self._plan_tex if from_plan else self._meas_tex if meas is not None else self._plan_tex
+        try:
+            boxed = field_box(
+                read_texture(self._canvas, src, (nz, ny, nx)), grid.origin, grid.voxel,
+                fraction, per_slice=per_slice,
+            )
+        except Exception:
+            _log.debug("field box unavailable", exc_info=True)
+            boxed = None
+        if boxed is not None:
+            f_o, f_e = boxed
+            self.field_extent = (float(f_e[0]), float(f_e[1]), float(f_e[2]))
+            self._nodes.append(self._late_line(
+                pos=box_edge_segments(f_o, f_e), connect="segments", color=FIELD_RGBA, width=1,
+            ))
         if depth:
             p_o, p_e = phantom_box(grid.origin, grid.extent_mm, depth)
             self._nodes.append(self._late_line(

@@ -41,6 +41,8 @@ from .dose_volume_catalog import (
     DEFAULT_AUTO_MARGIN_SIGMA,
     DEFAULT_ENERGY_SPREAD_PCT,
     DEFAULT_ENTRANCE_WET_MM,
+    DEFAULT_FIELD_EDGE,
+    FIELD_EDGES,
     DEFAULT_GAMMA_CUTOFF_PCT,
     DEFAULT_GAMMA_DOSE_PCT,
     DEFAULT_GAMMA_DTA_MM,
@@ -428,7 +430,7 @@ class DoseVolumeWindow(VispyViewWindow):
         initial_preset: str | None = None,
         parent: QWidget | None = None,
     ) -> None:
-        super().__init__(title="Dose Volume (3D)", parent=parent)
+        super().__init__(title="Dose Volume (3D)", side_panel_default_width=420, parent=parent)
         self._updating = True
         # Before the canvas exists: moving a live GL widget can drop its context.
         self._mount_color_axis()
@@ -438,6 +440,11 @@ class DoseVolumeWindow(VispyViewWindow):
         )
         self._scene = DoseScene(self._vispy_canvas)
         self.set_side_panel(self._build_controls())
+        # The shared shell caps a side panel at a quarter of the window, which
+        # clips this one. 420 is 50 % wider than the usual 280.
+        side = self._side_default_width
+        total = max(self._splitter.size().width(), self.width(), side + 400)
+        self._splitter.setSizes([total - side, side])
         self._update_legend()
         self._scene.range_listener = self._on_gpu_range
 
@@ -472,8 +479,8 @@ class DoseVolumeWindow(VispyViewWindow):
             )
         )
 
-        # Session: which log. Beam: the logged spots and what the machine did.
-        # Phantom: what they hit. Volume: what the voxels hold. Color: how it is painted.
+        # Compare first: what the picture answers. Then the log, the plan, the dose
+        # model, and only then how the camera paints it.
         self._session_group = QGroupBox("Session")
         self._session_layout = QVBoxLayout(self._session_group)
         self._session_layout.setSpacing(2)
@@ -483,27 +490,58 @@ class DoseVolumeWindow(VispyViewWindow):
         self._session_group.setVisible(False)
         layout.addWidget(self._session_group)
 
+        compare_layout = self._add_group(layout, "Compare")
+        self._show_combo = self._add_combo(
+            compare_layout, "Show", _SHOW_ITEMS, self._on_show_changed,
+        )
+        self._show_combo.setToolTip(
+            "Measured paints the delivered field. Measured − plan paints the "
+            "signed difference. Gamma paints the 3D γ index of measured against "
+            "plan, worst voxel along each ray."
+        )
+        self._gamma_group = QGroupBox("Gamma")
+        gamma_layout = QVBoxLayout(self._gamma_group)
+        gamma_layout.setSpacing(4)
+        self._gamma_dd_spin = self._add_spin(
+            gamma_layout, "Dose diff.", 0.5, 20.0, 0.5, DEFAULT_GAMMA_DOSE_PCT, decimals=1,
+        )
+        self._gamma_dd_spin.setSuffix(" %")
+        self._gamma_dd_spin.setToolTip("Global: percent of the plan's maximum dose.")
+        self._gamma_dta_spin = self._add_spin(
+            gamma_layout, "DTA", 0.5, 10.0, 0.5, DEFAULT_GAMMA_DTA_MM, decimals=1,
+        )
+        self._gamma_dta_spin.setSuffix(" mm")
+        self._gamma_dta_spin.setToolTip("Distance to agreement, searched in 3D.")
+        self._gamma_cut_spin = self._add_spin(
+            gamma_layout, "Low cutoff", 0.0, 50.0, 1.0, DEFAULT_GAMMA_CUTOFF_PCT, decimals=0,
+        )
+        self._gamma_cut_spin.setSuffix(" %")
+        self._gamma_cut_spin.setToolTip("Measured voxels below this share of the plan maximum are not scored.")
+        self._gamma_label = QLabel("—")
+        self._gamma_label.setWordWrap(True)
+        self._gamma_label.setToolTip(
+            f"AAPM TG-218: ≥ {GAMMA_TOLERANCE_PCT:g} % passing is within tolerance; "
+            f"below {GAMMA_ACTION_PCT:g} % calls for action."
+        )
+        gamma_layout.addWidget(self._gamma_label)
+        self._gamma_group.setVisible(False)
+        layout.addWidget(self._gamma_group)
+
         beam_layout = self._add_group(layout, "Beam")
         self._grain_combo = self._add_combo(
-            beam_layout, "Grain", _GRAIN_ITEMS, self._on_grain_changed,
+            beam_layout, "Data", _GRAIN_ITEMS, self._on_grain_changed,
         )
         self._xy_combo = self._add_combo(
-            beam_layout, "XY", _XY_ITEMS, self._on_controls_changed,
+            beam_layout, "Position", _XY_ITEMS, self._on_controls_changed,
         )
         self._plane_combo = self._add_combo(
-            beam_layout, "σ plane", _SIGMA_PLANE_ITEMS, self._on_controls_changed,
+            beam_layout, "Spot σ", _SIGMA_PLANE_ITEMS, self._on_controls_changed,
         )
         self._plane_combo.setToolTip(
             "Chamber draws the spot σ the IC measured. Isocenter scales it by "
             "SAD / SDD like a position, which is exact only for a point-like source."
         )
         self._set_combo(self._plane_combo, DEFAULT_SIGMA_PLANE)
-        self._gantry_spin = self._add_spin(
-            beam_layout, "Gantry", 0.0, 360.0, 5.0, DEFAULT_GANTRY_DEG,
-            decimals=1,
-        )
-        self._gantry_spin.setWrapping(True)
-        self._gantry_spin.setSuffix(" °")
         self._smear_spin = self._add_spin(
             beam_layout, "Energy spread", 0.0, 10.0, 0.1, DEFAULT_ENERGY_SPREAD_PCT,
             decimals=2,
@@ -513,20 +551,6 @@ class DoseVolumeWindow(VispyViewWindow):
             "Beam energy spread σE as % of energy. Range straggling in the "
             "medium is added on top, so 0 still gives a physical Bragg peak."
         )
-        self._gap_spin = self._add_spin(
-            beam_layout, "IC gap", 0.1, 100.0, 0.5, DEFAULT_IC_GAP_MM,
-            decimals=1,
-        )
-        self._gap_spin.setSuffix(" mm")
-        self._gap_spin.setToolTip("Ion chamber gap used to turn logged charge into protons.")
-        self._gap_spin.setEnabled(DEFAULT_WEIGHT != WEIGHT_MU)
-        self._cap_spin = QSpinBox()
-        self._cap_spin.setRange(1_000, 5_000_000)
-        self._cap_spin.setSingleStep(50_000)
-        self._cap_spin.setValue(DEFAULT_SPOT_CAP)
-        self._cap_spin.setToolTip("Most spots drawn; longer sessions are thinned evenly.")
-        self._cap_spin.valueChanged.connect(self._on_controls_changed)
-        self._add_row(beam_layout, "Spot cap", self._cap_spin)
 
         plan_layout = self._add_group(layout, "Plan")
         self._plan_sigma_combo = self._add_combo(
@@ -545,6 +569,16 @@ class DoseVolumeWindow(VispyViewWindow):
         self._add_row(plan_layout, "Reference", self._ref_combo)
         self._ref_row = self._ref_combo.parentWidget()
         self._ref_row.setVisible(DEFAULT_PLAN_SIGMA == PLAN_SIGMA_REFERENCE)
+
+        dose_layout = self._add_group(layout, "Dose")
+        self._weight_combo = self._add_combo(
+            dose_layout, "Quantity", _WEIGHT_ITEMS, self._on_weight_mode_changed,
+        )
+        self._weight_combo.setToolTip(
+            "Dose: Bragg curve with nuclear losses and scatter that grows with "
+            "depth, in Gy. Stops: where the protons come to rest."
+        )
+        self._set_combo(self._weight_combo, DEFAULT_WEIGHT)
         self._scatter_check = QCheckBox("Scatter in medium")
         self._scatter_check.setChecked(True)
         self._scatter_check.setToolTip(
@@ -553,7 +587,14 @@ class DoseVolumeWindow(VispyViewWindow):
             "Off shows the spots at the σ they entered with."
         )
         self._scatter_check.toggled.connect(self._on_controls_changed)
-        plan_layout.addWidget(self._scatter_check)
+        dose_layout.addWidget(self._scatter_check)
+        self._gap_spin = self._add_spin(
+            dose_layout, "IC gap", 0.1, 100.0, 0.5, DEFAULT_IC_GAP_MM,
+            decimals=1,
+        )
+        self._gap_spin.setSuffix(" mm")
+        self._gap_spin.setToolTip("Ion chamber gap used to turn logged charge into protons.")
+        self._gap_spin.setEnabled(DEFAULT_WEIGHT != WEIGHT_MU)
 
         phantom_layout = self._add_group(layout, "Phantom")
         self._medium_combo = self._add_combo(
@@ -587,18 +628,27 @@ class DoseVolumeWindow(VispyViewWindow):
             "tank wall, buildup slabs, range shifter. IC readings are unaffected; "
             "the beam loses range and a little fluence before it enters."
         )
+        self._phantom_note = QLabel("—")
+        self._phantom_note.setWordWrap(True)
+        phantom_layout.addWidget(self._phantom_note)
 
-        volume_layout = self._add_group(layout, "Volume")
-        self._weight_combo = self._add_combo(
-            volume_layout, "Quantity", _WEIGHT_ITEMS, self._on_weight_mode_changed,
+        view_layout = self._add_group(layout, "View")
+        self._gantry_spin = self._add_spin(
+            view_layout, "Gantry", 0.0, 360.0, 5.0, DEFAULT_GANTRY_DEG,
+            decimals=1,
         )
-        self._weight_combo.setToolTip(
-            "Dose: Bragg curve with nuclear losses and scatter that grows with "
-            "depth, in Gy. Stops: where the protons come to rest."
+        self._gantry_spin.setWrapping(True)
+        self._gantry_spin.setSuffix(" °")
+        self._ray_combo = self._add_combo(
+            view_layout, "Ray", _RAY_ITEMS, self._on_ray_changed,
         )
-        self._set_combo(self._weight_combo, DEFAULT_WEIGHT)
+        self._ray_combo.setToolTip(
+            "How each viewing ray combines the field. Integrate sums the whole "
+            "ray. Maximum keeps the hottest sample. Transparent fades like fog."
+        )
+        self._set_combo(self._ray_combo, DEFAULT_RAY)
         self._voxel_spin = self._add_spin(
-            volume_layout, "Voxel", MIN_VOXEL_MM, MAX_VOXEL_MM, 0.25, VOXEL_MM,
+            view_layout, "Voxel", MIN_VOXEL_MM, MAX_VOXEL_MM, 0.25, VOXEL_MM,
             decimals=2,
         )
         self._voxel_spin.setSuffix(" mm")
@@ -612,29 +662,20 @@ class DoseVolumeWindow(VispyViewWindow):
             "Blend between voxel centers along each ray. Off shows each voxel as a flat block."
         )
         self._smooth_check.toggled.connect(self._scene.set_smooth)
-        volume_layout.addWidget(self._smooth_check)
+        view_layout.addWidget(self._smooth_check)
+        self._cap_spin = QSpinBox()
+        self._cap_spin.setRange(1_000, 5_000_000)
+        self._cap_spin.setSingleStep(50_000)
+        self._cap_spin.setValue(DEFAULT_SPOT_CAP)
+        self._cap_spin.setToolTip("Most spots drawn; longer sessions are thinned evenly.")
+        self._cap_spin.valueChanged.connect(self._on_controls_changed)
+        self._add_row(view_layout, "Spot cap", self._cap_spin)
 
         self._seq_scale = DEFAULT_SCALE
         self._div_scale = DEFAULT_DIVERGENT_SCALE
         color_group = QGroupBox("Color")
         color_layout = QVBoxLayout(color_group)
         color_layout.setSpacing(4)
-        self._show_combo = self._add_combo(
-            color_layout, "Show", _SHOW_ITEMS, self._on_show_changed,
-        )
-        self._show_combo.setToolTip(
-            "Measured paints the delivered field. Measured − plan paints the "
-            "signed difference. Gamma paints the 3D γ index of measured against "
-            "plan, worst voxel along each ray."
-        )
-        self._ray_combo = self._add_combo(
-            color_layout, "Ray", _RAY_ITEMS, self._on_ray_changed,
-        )
-        self._ray_combo.setToolTip(
-            "How each viewing ray combines the field. Integrate sums the whole "
-            "ray. Maximum keeps the hottest sample. Transparent fades like fog."
-        )
-        self._set_combo(self._ray_combo, DEFAULT_RAY)
         self._scale_combo = self._add_combo(
             color_layout, "Scale", scales_for(False), self._on_scale_changed,
         )
@@ -679,33 +720,23 @@ class DoseVolumeWindow(VispyViewWindow):
         self._auto_check.setChecked(True)
         layout.addWidget(color_group)
 
-        self._gamma_group = QGroupBox("Gamma")
-        gamma_layout = QVBoxLayout(self._gamma_group)
-        gamma_layout.setSpacing(4)
-        self._gamma_dd_spin = self._add_spin(
-            gamma_layout, "Dose diff.", 0.5, 20.0, 0.5, DEFAULT_GAMMA_DOSE_PCT, decimals=1,
+        field_layout = self._add_group(layout, "Field Bounds")
+        self._field_combo = self._add_combo(
+            field_layout, "Edge",
+            [(edge_id, label) for edge_id, label, *_rest in FIELD_EDGES],
+            self._on_controls_changed,
         )
-        self._gamma_dd_spin.setSuffix(" %")
-        self._gamma_dd_spin.setToolTip("Global: percent of the plan's maximum dose.")
-        self._gamma_dta_spin = self._add_spin(
-            gamma_layout, "DTA", 0.5, 10.0, 0.5, DEFAULT_GAMMA_DTA_MM, decimals=1,
+        self._set_combo(self._field_combo, DEFAULT_FIELD_EDGE)
+        self._field_combo.setToolTip(
+            "Which dose the gold box encloses. Field size keeps a depth only when "
+            "that slice reaches 50% of the peak, then takes the lateral 50% of the "
+            "slice (ICRU 78). Penumbra outer does the same at 20%. High dose and "
+            "half maximum cut every axis against the volume peak. Planned is "
+            "90% of the plan's own peak: the high-dose volume the plan covers."
         )
-        self._gamma_dta_spin.setSuffix(" mm")
-        self._gamma_dta_spin.setToolTip("Distance to agreement, searched in 3D.")
-        self._gamma_cut_spin = self._add_spin(
-            gamma_layout, "Low cutoff", 0.0, 50.0, 1.0, DEFAULT_GAMMA_CUTOFF_PCT, decimals=0,
-        )
-        self._gamma_cut_spin.setSuffix(" %")
-        self._gamma_cut_spin.setToolTip("Measured voxels below this share of the plan maximum are not scored.")
-        self._gamma_label = QLabel("—")
-        self._gamma_label.setWordWrap(True)
-        self._gamma_label.setToolTip(
-            f"AAPM TG-218: ≥ {GAMMA_TOLERANCE_PCT:g} % passing is within tolerance; "
-            f"below {GAMMA_ACTION_PCT:g} % calls for action."
-        )
-        gamma_layout.addWidget(self._gamma_label)
-        self._gamma_group.setVisible(False)
-        layout.addWidget(self._gamma_group)
+        self._field_size = QLabel("—")
+        self._field_size.setToolTip("X × Y × depth, in millimetres.")
+        self._add_row(field_layout, "Size", self._field_size)
 
         info_group = QGroupBox("Loaded")
         info_layout = QVBoxLayout(info_group)
@@ -981,6 +1012,7 @@ class DoseVolumeWindow(VispyViewWindow):
             phantom_mm=self._phantom_spin.value(),
             auto_margin_sigma=self._margin_spin.value(),
             entrance_wet_mm=self._wet_spin.value(),
+            field_edge=self._field_combo.currentData() or DEFAULT_FIELD_EDGE,
             ray_mode=self._ray_combo.currentData(),
             scale=active_scale(compare, self._scale_combo.currentData() or DEFAULT_SCALE),
             auto_scale=self._auto_check.isChecked(),
@@ -1023,6 +1055,7 @@ class DoseVolumeWindow(VispyViewWindow):
             self._margin_spin.setValue(config.auto_margin_sigma)
             self._sync_phantom_controls()
             self._wet_spin.setValue(config.entrance_wet_mm)
+            self._set_combo(self._field_combo, config.field_edge)
             self._set_combo(self._weight_combo, config.weight_mode)
             self._set_combo(self._ray_combo, config.ray_mode)
             self._auto_check.setChecked(config.auto_scale)
@@ -1374,7 +1407,10 @@ class DoseVolumeWindow(VispyViewWindow):
             phantom_mm=config.phantom_mm, entrance_wet_mm=config.entrance_wet_mm,
             auto_margin_sigma=config.auto_margin_sigma,
             scatter=config.scatter,
+            field_edge=config.field_edge,
         )
+        self._show_field_extent()
+        self._phantom_note.setText(self._scene.phantom_note or "—")
         self._maybe_seed_absolute_window()
         self._update_legend()
         self._show_gamma_verdict()
@@ -1397,6 +1433,10 @@ class DoseVolumeWindow(VispyViewWindow):
                 else "\nNo delivered spot MU: measured uses plan MU"
             )
         self._info_label.setText(info)
+
+    def _show_field_extent(self) -> None:
+        ext = getattr(self._scene, "field_extent", None)
+        self._field_size.setText("—" if ext is None else f"{ext[0]:.0f} × {ext[1]:.0f} × {ext[2]:.0f} mm")
 
     def _no_plan_reason(self) -> str:
         if self._xy_combo.currentData() == XY_PLAN:

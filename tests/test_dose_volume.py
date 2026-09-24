@@ -44,7 +44,8 @@ from scan_kit.views.dose_volume_fill import (
     normal_mass,
 )
 from scan_kit.views.dose_volume_vispy import (
-    apply_gantry, axis_ticks, box_axes, label_anchors, label_direction, spaced_labels,
+    apply_gantry, axis_ticks, box_axes, label_anchors, label_direction, outward_index,
+    readable_angle, spaced_labels,
 )
 
 
@@ -472,7 +473,7 @@ def test_box_axes_tick_every_cm_on_the_box_edges() -> None:
     # Depth numbers read positive and hang off tick tips outside the box.
     x_ax, _y_ax, z_ax = guides.axes
     assert z_ax.numbers == ["330", "300", "250", "200", "150", "100", "50", "0"]
-    assert (z_ax.tips[:, 0] < -15.0).all() and (z_ax.tips[:, 1] < -20.0).all()
+    assert (z_ax.tips[:, 0] < -15.0).all() and np.allclose(z_ax.tips[:, 1], -20.0)
     np.testing.assert_allclose(x_ax.out, [0.0, -1.0, 0.0])
     assert [a.title for a in guides.axes] == ["X", "Y", "Depth"]
     assert label_anchors((-1.0, 0.1)) == ("right", "center")
@@ -480,6 +481,13 @@ def test_box_axes_tick_every_cm_on_the_box_edges() -> None:
     # A nearly-parallel outward still hangs labels square off the edge, on its side.
     np.testing.assert_allclose(label_direction((1.0, 0.0), (-0.9, 0.1)), [0.0, 1.0])
     np.testing.assert_allclose(label_direction((0.0, 0.0), (0.0, -2.0)), [0.0, -1.0])
+    # A side view: the outward that runs along the edge loses to the one that leaves it.
+    assert outward_index((10.0, 0.0), [(1.0, 0.0), (0.0, -1.0)], (0.0, -1.0)) == 1
+    assert outward_index((10.0, 0.0), [(0.0, 1.0), (1.0, 0.0)], (0.0, 1.0)) == 0
+    assert readable_angle((1.0, 0.0)) == pytest.approx(0.0)
+    assert readable_angle((-1.0, 0.0)) == pytest.approx(0.0)
+    assert readable_angle((0.0, 1.0)) == pytest.approx(90.0)
+    assert readable_angle((0.0, -1.0)) == pytest.approx(-90.0)
 
 
 def test_gantry_90_swaps_y_and_energy_axis() -> None:
@@ -667,9 +675,11 @@ def test_dose_volume_window_opens_with_absolute_scale(qapp, tmp_path) -> None:
         def group_of(widget):
             return widget.parentWidget().parentWidget().title()
 
-        assert [group_of(w) for w in (window._grain_combo, window._gap_spin, window._cap_spin)] == ["Beam"] * 3
+        assert [group_of(w) for w in (window._grain_combo, window._gap_spin, window._cap_spin)] == [
+            "Beam", "Dose", "View",
+        ]
         assert [group_of(w) for w in (window._medium_combo, window._margin_spin, window._wet_spin)] == ["Phantom"] * 3
-        assert [group_of(w) for w in (window._weight_combo, window._voxel_spin)] == ["Volume"] * 2
+        assert [group_of(w) for w in (window._weight_combo, window._voxel_spin)] == ["Dose", "View"]
         # Session radios sit above Beam, show only for 2+, and the pick survives a rebuild.
         assert window._session_group.isHidden()
         window._update_session_list(["s1", "s2"])
@@ -691,7 +701,7 @@ def test_dose_volume_window_opens_with_absolute_scale(qapp, tmp_path) -> None:
         window._phantom_spin.setValue(0.0)
         assert window._wet_spin.value() == 0.0
         assert window._scale_mode_row.isHidden()
-        assert window._grain_combo.parentWidget().findChild(QLabel).text() == "Grain"
+        assert window._grain_combo.parentWidget().findChild(QLabel).text() == "Data"
         assert window._cap_spin.parentWidget().findChild(QLabel).text() == "Spot cap"
         # The splitter handle sits between the axis and the controls.
         view = window._color_axis.parentWidget()
@@ -884,7 +894,7 @@ def test_offscreen_dose_volume_render(qapp) -> None:
     auto_hi = scene.auto_hi
     # The box and its ticks; each must depth test against the march, not inherit its "always".
     lines = [node for node in scene._late if hasattr(node, "_line_visual")]
-    assert len(lines) == 2
+    assert len(lines) == 3
     # Labels land on the canvas, not collapsed to a point by the perspective divide.
     numbers = next(n for n, _title, _ax in scene._labels if n is not None)
     assert np.ptp(np.asarray(numbers.pos)[:, :2], axis=0).max() > 5.0
@@ -993,6 +1003,29 @@ def test_auto_depth_for_250_mev_in_water() -> None:
     assert auto_depth_mm(WATER, [70.0, 250.0], 1.0, 5.0) == pytest.approx(417.0, abs=2.0)
     assert auto_depth_mm(WATER, [70.0, 250.0], 1.0, 3.0) == pytest.approx(402.0, abs=2.0)
     assert auto_depth_mm(WATER, [], 1.0, 5.0) == 0.0
+
+
+def test_field_box_is_the_half_maximum_extent() -> None:
+    from scan_kit.views.dose_volume_vispy import field_box
+
+    vol = np.zeros((4, 5, 6), dtype=np.float32)
+    vol[1:3, 2:4, 1:4] = 1.0
+    vol[2, 3, 2] = 2.0
+    origin, extent = field_box(vol, [-10.0, 0.0, -40.0], 1.0)
+    np.testing.assert_allclose(origin, [-9.0, 2.0, -39.0])
+    np.testing.assert_allclose(extent, [3.0, 2.0, 2.0])
+    assert field_box(np.zeros((2, 2, 2)), [0, 0, 0], 1.0) is None
+    # Entrance is wide but below half the peak, so the depth edge leaves it out.
+    # A slice at 60 % of the peak stays, and its own 50 % sets the width.
+    spread = np.zeros((3, 3, 5), dtype=float)
+    spread[0, 1, :] = 1.0
+    spread[1, 1, :] = 4.0
+    spread[1, 1, 2] = 6.0
+    spread[2, 1, 2] = 10.0
+    _o, wide = field_box(spread, [0, 0, 0], 1.0, per_slice=True)
+    assert wide[0] == 5.0 and wide[2] == 2.0
+    _o, hot = field_box(spread, [0, 0, 0], 1.0, per_slice=False)
+    assert hot[0] == 1.0 and hot[2] == 2.0
 
 
 def test_phantom_box_spans_surface_to_back_face() -> None:
