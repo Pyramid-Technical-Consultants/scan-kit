@@ -3,6 +3,7 @@
 
 Usage:
     python scripts/capture_doc_screenshots.py
+    python scripts/capture_doc_screenshots.py dose_volume   # one job whose label contains this
 
 Requires a local test_data/ folder (not shipped with the repo). Forces the dark
 theme for the grab only; it does not persist View > Theme.
@@ -307,6 +308,97 @@ def _capture_fft_explorer(session_ids: list[str], output: Path, *, base_dir: str
     _capture_qt_window(window, output, ready=lambda: _figure_has_axes(window))
 
 
+def _dose_frame(window):
+    """Scene plus the ray march. ``canvas.render`` stops before the march."""
+    import numpy as np
+    from vispy import gloo
+
+    canvas = window._vispy_canvas
+    scene = window._scene
+    canvas.set_current()
+    scene._place_labels()
+    csize = canvas.size
+    scale = canvas.pixel_scale
+    size = tuple(int(x * scale) for x in csize)
+    fbo = gloo.FrameBuffer(
+        color=gloo.RenderBuffer(size[::-1]),
+        depth=gloo.RenderBuffer(size[::-1]),
+    )
+    canvas.push_fbo(fbo, (0, 0), csize)
+    try:
+        canvas._draw_scene()
+        if scene._has_volume and not scene._broken:
+            scene._box.draw_volume(canvas)
+            for line in scene._late:
+                line.held = False
+                if line.visible:
+                    line.draw()
+        frame = np.asarray(fbo.read())
+    finally:
+        canvas.pop_fbo()
+    return frame
+
+
+def _composite_vispy(window, pix):
+    """Paste the visPy framebuffer over the blank OpenGL widget in a window grab."""
+    import numpy as np
+    from PySide6.QtCore import QPoint
+    from PySide6.QtGui import QImage, QPainter
+
+    frame = _dose_frame(window)
+    if frame.ndim != 3 or frame.shape[2] < 3:
+        return pix
+    frame = np.ascontiguousarray(frame[:, :, :3], dtype=np.uint8)
+    height, width, _ = frame.shape
+    image = QImage(frame.tobytes(), width, height, 3 * width, QImage.Format.Format_RGB888).copy()
+    canvas = window._vispy_canvas
+    native = canvas.native
+    origin = native.mapTo(window, QPoint(0, 0))
+    ratio = window.devicePixelRatioF()
+    painter = QPainter(pix)
+    painter.drawImage(
+        int(origin.x() * ratio),
+        int(origin.y() * ratio),
+        image.scaled(int(native.width() * ratio), int(native.height() * ratio)),
+    )
+    painter.end()
+    return pix
+
+
+def _capture_dose_volume(session_ids: list[str], output: Path, *, base_dir: str, preset_id: str) -> None:
+    from PySide6.QtWidgets import QApplication
+
+    from scan_kit.views.dose_volume_window import DoseVolumeWindow
+
+    window = DoseVolumeWindow(session_ids, base_dir, initial_preset=preset_id)
+    app = QApplication.instance()
+    assert app is not None
+    # A real GL surface: DontShowOnScreen leaves the visPy canvas blank.
+    window.resize(*VIEW_SIZE)
+    window.show()
+    app.processEvents()
+    _wait_until(
+        lambda: window._scene._has_volume and "×" in window._grid_label.text(),
+        timeout_ms=180_000,
+    )
+    camera = window._scene._view.camera
+    camera.azimuth = 40.0
+    camera.elevation = -28.0
+    camera.roll = 0.0
+    for _ in range(20):
+        window._vispy_canvas.update()
+        app.processEvents()
+    pix = window.grab()
+    if pix.isNull():
+        raise RuntimeError(f"grab() returned null pixmap for {output.name}")
+    pix = _composite_vispy(window, pix)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    if not pix.save(str(output), "PNG"):
+        raise RuntimeError(f"Failed to write {output}")
+    window.close()
+    app.processEvents()
+
+
 def _capture_session_log(session_ids: list[str], output: Path, *, base_dir: str) -> None:
     from scan_kit.common.plot_colors import DEFAULT_SESSION_COLORS
     from scan_kit.common.session_log import load_session_log
@@ -352,15 +444,16 @@ def _capture_matplotlib_view(
         raise RuntimeError(f"Failed to capture {module_name} → {output}")
 
 
-def main() -> None:
+def main(only: list[str] | None = None) -> None:
     sys.path.insert(0, str(ROOT))
     os.environ.setdefault("QT_LOGGING_RULES", "qt.qpa.*=false")
     _ensure_paths()
     base_dir = str(TEST_DATA)
     _qt_app()
 
-    print("Capturing launcher screenshots…")
-    _capture_launcher_screenshots(base_dir)
+    if not only:
+        print("Capturing launcher screenshots…")
+        _capture_launcher_screenshots(base_dir)
 
     print("Capturing analysis view screenshots…")
     jobs = [
@@ -427,6 +520,15 @@ def main() -> None:
             ),
         ),
         (
+            "dose_volume/spot_ic1",
+            lambda: _capture_dose_volume(
+                ["1093436476"],
+                OUT_DIR / "view-dose-volume.png",
+                base_dir=base_dir,
+                preset_id="spot_ic1",
+            ),
+        ),
+        (
             "amplifier_correlation",
             lambda: _capture_matplotlib_view(
                 "amplifier_correlation",
@@ -437,6 +539,8 @@ def main() -> None:
         ),
     ]
     for label, job in jobs:
+        if only and not any(part in label for part in only):
+            continue
         print(f"  {label} ->")
         job()
 
@@ -449,4 +553,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    main(sys.argv[1:])

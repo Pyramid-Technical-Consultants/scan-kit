@@ -121,6 +121,12 @@ On a dev install, the default data source is the bundled `test_data/` folder.
 </p>
 
 <p align="center">
+  <img src="docs/images/view-dose-volume.png" alt="Dose Volume showing a ray-marched measured dose with field bounds and the control sidebar" width="920">
+  <br>
+  <sub><em>Dose Volume (3D): measured dose in the phantom, with field bounds and the comparison sidebar.</em></sub>
+</p>
+
+<p align="center">
   <img src="docs/images/view-ic-timeslice-replay.png" alt="Timeslice Replay viewer with signal-source controls and timeline brush" width="920">
   <br>
   <sub><em>Timeslice Replay: pick a signal source, tick channels, and scrub the timeline brush.</em></sub>
@@ -210,9 +216,16 @@ Configurable Qt shells for the metrics most sessions need day to day.
 | FFT Explorer | Frequency-domain line spectra for timeslice IC current, dDose/dt, source beam current, chamber position, sigma, G3 Gaussian peak, magnetic field, and amplifier command/readback. |
 | Audio Explorer | Listen to the same timeslice families, with transport, a live playhead FFT, and **Save WAV** *(needs a working audio device / PortAudio)* |
 | IC Beam Trajectory (3D) | Per-spot IC beam paths in 3D with plan overlay, dipole pivots, and iso/IC planes (visPy) |
+| Dose Volume (3D) | Ray-marched dose from IC, ISO-ray, or plan spots. Compare measured, measured minus plan, or 3D gamma, in water, plastic, or metal. See [details](#dose-volume-3d) |
 | Session Log Compare | Layer timings, grouped errors, event browser, two-session diff. See [details](#session-log-compare) |
 
 For position scatter, position-error outliers, beam-on/off IC current histograms, and most dose/position/sigma summaries, start with **Binned Summary** or **Distribution Explorer** instead of opening a dedicated legacy plot.
+
+### Dose Volume (3D)
+
+Builds a 1 mm dose volume from the measured spot or timeslice Gaussians and ray-marches it. Position can come from IC1, IC2, the ISO ray between them, or the plan. When a plan is loaded, **Compare** switches among the measured volume, measured minus plan, and a 3D gamma map scored the AAPM TG-218 way. **Quantity** is dose in Gy along the Bragg curve, or where monitor units or protons stop.
+
+**Beam** sets the energy spread and the spot size: chamber or isocenter σ, and a plan σ taken from this session per layer, another loaded session, or the interlock. Scatter in the phantom widens measured and plan together. **Phantom** picks the medium (water, PMMA, polystyrene, polyethylene, A-150, aluminum, or copper), the thickness, and any entrance water-equivalent thickness. **Field Bounds** reports the field size, by default the lateral 50% edge on each slice (ICRU 78), with options for the high-dose core and the planned 90% volume. **View** sets the gantry angle, whether a ray integrates, keeps its maximum, or fades, the voxel size, and nearest, linear, or cubic sampling. See the [screenshot](#screenshots).
 
 ### Specialized analysis
 

@@ -22,6 +22,7 @@ dependencies = [
     "PySide6>=6.6.0",
     "pydicom",
     "vispy>=0.14.0",
+    "PyOpenGL",
     "msgpack",
     "requests",
     "websocket-client",

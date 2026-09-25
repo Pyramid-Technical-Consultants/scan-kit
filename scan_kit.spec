@@ -51,6 +51,8 @@ _pyside6_datas, _pyside6_binaries, _pyside6_hiddenimports = collect_all("PySide6
 # vispy loads GLSL shaders from disk at import time; hiddenimports alone are not enough.
 _vispy_datas, _vispy_binaries, _vispy_hiddenimports = collect_all("vispy")
 _vispy_datas = _drop_test_tree_datas(_vispy_datas)
+# vispy gl+ (instanced Gaussian splats) imports PyOpenGL as ``OpenGL``.
+_opengl_datas, _opengl_binaries, _opengl_hiddenimports = collect_all("OpenGL")
 
 _mpl_datas = collect_data_files("matplotlib", includes=["**/mpl-data/**"])
 
@@ -92,6 +94,7 @@ hiddenimports = list(
             *_scan_kit_hiddenimports,
             *_pyside6_hiddenimports,
             *_vispy_hiddenimports,
+            *_opengl_hiddenimports,
             *_fsspec_hiddenimports,
             *_paramiko_hiddenimports,
             *_smb_hiddenimports,
@@ -102,8 +105,8 @@ hiddenimports = list(
 a = Analysis(
     [str(ROOT / "scan_kit" / "__main__.py")],
     pathex=[str(ROOT)],
-    binaries=_extra_binaries + _pyside6_binaries + _vispy_binaries,
-    datas=_pyside6_datas + _app_datas + _vispy_datas + _mpl_datas,
+    binaries=_extra_binaries + _pyside6_binaries + _vispy_binaries + _opengl_binaries,
+    datas=_pyside6_datas + _app_datas + _vispy_datas + _mpl_datas + _opengl_datas,
     hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={

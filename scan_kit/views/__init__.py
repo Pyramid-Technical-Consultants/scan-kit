@@ -66,6 +66,12 @@ _UNIFIED_VIEWS.extend(
         "and optional plan overlay (visPy).",
     ),
     (
+        "Dose Volume (3D)",
+        "dose_volume",
+        "Ray-marched dose volume from IC, ISO-ray, or plan spots: measured, "
+        "plan difference, or 3D gamma, in water, plastic, or metal (visPy).",
+    ),
+    (
         "Session Log Compare",
         "session_log_compare",
         "Session log layer timings, errors, and side-by-side event comparison.",
