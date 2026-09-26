@@ -5,6 +5,7 @@ Agreement with MCsquare lives in ``validation/`` and is not run by pytest.
 
 from __future__ import annotations
 
+import functools
 from pathlib import Path
 
 import numpy as np
@@ -86,20 +87,30 @@ def test_same_seed_is_bit_identical(canvas) -> None:
     assert a.max() > 0.0 and np.array_equal(a, b) and not np.array_equal(a, c)
 
 
-def test_sliced_run_matches_one_shot(canvas) -> None:
+TWO_SPOTS = ((0.0, 0.0, 100.0, 1.0), (6.0, -4.0, 120.0, 2.0))
+
+
+def _two_spot_run(canvas, histories):
+    """McRun of TWO_SPOTS on the grid ``_dose(..., depth=110)`` uses, and its texture."""
     from scan_kit.views.dose_mc import McRun
     from scan_kit.views.dose_volume_fill import DoseGrid
-    from scan_kit.views.dose_volume_raycast import _alloc_texture, read_texture
+    from scan_kit.views.dose_volume_raycast import _alloc_texture
 
-    spots = ((0.0, 0.0, 100.0, 1.0), (6.0, -4.0, 120.0, 2.0))
-    one, whole = _dose(canvas, "water", spots, depth=110, histories=60_000)
     grid = DoseGrid(np.array([-20.0, -20.0, -110.0]), (40, 40, 110), False, 1.0)
     tex = _alloc_texture((110, 40, 40))
-    x, y, e, w = (np.array(c, dtype=float) for c in zip(*spots))
+    x, y, e, w = (np.array(c, dtype=float) for c in zip(*TWO_SPOTS))
     run = McRun(
         canvas, tex, x, y, np.full(2, 3.0), np.full(2, 3.0), e, w, "water", grid,
-        depth=110.0, wet=0.0, spread_pct=0.7, histories=60_000, seed=1,
+        depth=110.0, wet=0.0, spread_pct=0.7, histories=histories, seed=1,
     )
+    return run, tex
+
+
+def test_sliced_run_matches_one_shot(canvas) -> None:
+    from scan_kit.views.dose_volume_raycast import read_texture
+
+    one, whole = _dose(canvas, "water", TWO_SPOTS, depth=110, histories=60_000)
+    run, tex = _two_spot_run(canvas, 60_000)
     run.step(1e-4)
     run.preview()
     partial = read_texture(canvas, tex, (110, 40, 40))
@@ -107,6 +118,23 @@ def test_sliced_run_matches_one_shot(canvas) -> None:
     while not run.step(1e-4):
         run.preview()
     assert np.array_equal(read_texture(canvas, tex, (110, 40, 40)), one) and run.result == whole
+    run.close()
+
+
+def test_raised_target_resumes_a_finished_run(canvas) -> None:
+    from scan_kit.views.dose_volume_raycast import read_texture
+
+    one, whole = _dose(canvas, "water", TWO_SPOTS, depth=110, histories=60_000)
+    run, tex = _two_spot_run(canvas, 30_000)
+    run.step()
+    assert run.done and not run.extend(20_000)
+    assert run.extend(60_000) and run.progress == 0.5
+    run.step()
+    # Same histories as the one-shot run, folded in smaller batches.
+    np.testing.assert_allclose(read_texture(canvas, tex, (110, 40, 40)), one, rtol=1e-4, atol=1e-6 * one.max())
+    assert run.result.histories == 60_000 and run.result.ledger == pytest.approx(whole.ledger, rel=1e-6)
+    run.close()
+    assert not run.extend(90_000)
 
 
 def test_spot_lands_where_planned(canvas) -> None:
@@ -150,10 +178,11 @@ def test_plan_vs_plan_monte_carlo_shares_random_numbers(canvas) -> None:
         k_mu=2.6e-8,
     )
     scene = DoseScene(canvas)
-    scene.render(
-        plan, plan, range_axis_for_medium("water"), gain=1.0, gantry_deg=0.0, weight_mode=WEIGHT_DOSE,
-        voxel_mm=2.0, gamma=True, model=MODEL_MC, mc_histories=100_000,
+    show = functools.partial(
+        scene.render, plan, plan, range_axis_for_medium("water"), gain=1.0, gantry_deg=0.0,
+        weight_mode=WEIGHT_DOSE, voxel_mm=2.0, gamma=True, model=MODEL_MC,
     )
+    show(mc_histories=100_000)
     assert scene.mc_refining and scene.gamma_pending and scene.gamma_pass is None
     while scene.mc_step():
         assert "MC" in scene.volume_note and "%" in scene.volume_note
@@ -163,7 +192,12 @@ def test_plan_vs_plan_monte_carlo_shares_random_numbers(canvas) -> None:
     assert meas.max() > 0.0 and np.array_equal(meas, read_texture(canvas, scene._plan_tex, shape))
     passed, total = scene.gamma_pass
     assert total > 0 and passed == total
-    assert "MC 100k" in scene.volume_note
+    assert "MC 100k" in scene.volume_note and scene.mc_progress is None
+    show(mc_histories=200_000)
+    assert scene.mc_progress == 0.5 and scene.gamma_pending
+    while scene.mc_step():
+        pass
+    assert "MC 200k" in scene.volume_note and scene.gamma
 
 
 def test_model_controls_follow_medium_and_weight(qapp, tmp_path) -> None:
@@ -172,6 +206,7 @@ def test_model_controls_follow_medium_and_weight(qapp, tmp_path) -> None:
 
     window = DoseVolumeWindow([], str(tmp_path))
     try:
+        assert window.progress.active  # loading
         assert not window._model_row.isHidden() and window._histories_row.isHidden()
         window._model_combo.set_current(MODEL_MC)
         window._sync_model_controls()

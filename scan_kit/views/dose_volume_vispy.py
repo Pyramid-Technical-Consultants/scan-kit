@@ -499,10 +499,9 @@ class DoseScene:
         # (passed, evaluated) voxels of the last γ map.
         self.gamma_pass: tuple[int, int] | None = None
         self._tex_shape: tuple[int, int, int] | None = None
-        # Per texture slot: (inputs key, McResult) of the Monte Carlo run it holds.
-        self._mc_runs: dict[str, tuple] = {}
-        # Per texture slot: (inputs key, McRun) still refining.
-        self._mc_live: dict[str, tuple] = {}
+        # Per texture slot: (inputs key less histories, McRun) it holds, refining or finished.
+        # ponytail: a finished run keeps its GPU sums (4 floats a voxel) so more histories can resume it.
+        self._mc: dict[str, tuple] = {}
         self._mc_preview_at = 0.0
         self._mc_turn = -1
         self._mc_redraw = False  # the next draw is a preview mc_step asked for
@@ -554,7 +553,13 @@ class DoseScene:
     @property
     def mc_refining(self) -> bool:
         """True while a Monte Carlo run is still filling the volume."""
-        return bool(self._mc_live)
+        return any(not run.done for _, run in self._mc.values())
+
+    @property
+    def mc_progress(self) -> float | None:
+        """Share of the refining Monte Carlo transported, or None when nothing is refining."""
+        live = [run.progress for _, run in self._mc.values() if not run.done]
+        return min(live) if live else None
 
     @property
     def gamma_pending(self) -> bool:
@@ -719,15 +724,14 @@ class DoseScene:
             return
         self._canvas.set_current()
         self._tex_shape = key
-        self._mc_stop()
-        self._mc_runs.clear()
+        self._mc_drop()
         self._meas_tex = _alloc_texture(key)
         self._plan_tex = _alloc_texture(key)
         self._gamma_tex = _alloc_texture(key)
         self._box.set_volumes(self._meas_tex, self._plan_tex)
 
     def _mc_start(self, slot, tex, batch, grid, medium_key, *, depth, wet, spread_pct, histories, ic_gap_mm):
-        """Start filling *tex* with *batch* by Monte Carlo, unless it already holds or is refining that run.
+        """Start filling *tex* with *batch* by Monte Carlo, or retarget the run it holds for the same inputs.
 
         Returns the McResult when the texture already holds the finished run, else None.
         """
@@ -742,37 +746,38 @@ class DoseScene:
             digest.update(np.ascontiguousarray(a, dtype=np.float64).tobytes())
         key = (
             digest.hexdigest(), tuple(float(v) for v in grid.origin), tuple(grid.shape), float(grid.voxel),
-            medium_key, float(depth), float(wet), float(spread_pct), int(histories), MC_SEED,
+            medium_key, float(depth), float(wet), float(spread_pct), MC_SEED,
         )
-        held = self._mc_runs.get(slot)
-        if held is not None and held[0] == key:
-            return held[1]
-        live = self._mc_live.get(slot)
-        if live is not None and live[0] == key:
-            return None
-        self._mc_stop(slot)
-        self._mc_runs.pop(slot, None)
-        run = McRun(
-            self._canvas, tex, c[:, 0], c[:, 1], s[:, 0], s[:, 1], e, protons, medium_key, grid,
-            depth=depth, wet=wet, spread_pct=spread_pct, histories=histories, seed=MC_SEED,
-        )
+        held = self._mc.get(slot)
+        if held is not None and held[0] == key and held[1].extend(histories):
+            run = held[1]
+        else:
+            self._mc_drop(slot)
+            run = McRun(
+                self._canvas, tex, c[:, 0], c[:, 1], s[:, 0], s[:, 1], e, protons, medium_key, grid,
+                depth=depth, wet=wet, spread_pct=spread_pct, histories=histories, seed=MC_SEED,
+            )
+            self._mc[slot] = (key, run)
         if run.done:
-            self._mc_runs[slot] = (key, run.result)
             return run.result
-        self._mc_live[slot] = (key, run)
         self._mc_preview_at = 0.0
         return None
 
-    def _mc_stop(self, slot: str | None = None) -> None:
-        """Drop the refining run in *slot*, or all of them."""
-        for s in [slot] if slot is not None else list(self._mc_live):
-            live = self._mc_live.pop(s, None)
-            if live is not None:
-                live[1].close()
+    def _mc_drop(self, slot: str | None = None) -> None:
+        """Free the run in *slot*, or all of them."""
+        for s in [slot] if slot is not None else list(self._mc):
+            held = self._mc.pop(s, None)
+            if held is not None:
+                held[1].close()
+
+    def _mc_stop(self) -> None:
+        """Drop the runs still refining; finished ones stay for reuse."""
+        for slot, (_key, run) in list(self._mc.items()):
+            if not run.done:
+                self._mc_drop(slot)
 
     def _mc_progress_note(self) -> str:
-        done = min(run.progress for _, run in self._mc_live.values())
-        return f" · MC {100.0 * done:.0f} %"
+        return f" · MC {100.0 * self.mc_progress:.0f} %"
 
     def mc_step(self, budget_s: float | None = None) -> bool:
         """Advance one refining Monte Carlo run for about *budget_s*; True while any is still going.
@@ -780,37 +785,32 @@ class DoseScene:
         Measured and plan take turns, so both previews stay at about the same progress.
         By default the slice is short while the view is moving, so a drag keeps its frames.
         """
-        if not self._mc_live:
+        pending = [run for _, run in self._mc.values() if not run.done]
+        if not pending:
             return False
         if budget_s is None:
             moving = time.perf_counter() - self._moved_at < MC_PREVIEW_S
             budget_s = MC_SLICE_S if moving else MC_IDLE_SLICE_S
-        live = list(self._mc_live.items())
-        pending = [run for _, (_, run) in live if not run.done]
         self._mc_turn = (self._mc_turn + 1) % len(pending)
         try:
             pending[self._mc_turn].step(budget_s)
         except Exception:
             _log.warning("Monte Carlo dose unavailable", exc_info=True)
-            for slot, (_key, run) in live:
-                run.close()
+            for slot in list(self._mc):
+                self._mc_drop(slot)
                 tex = self._meas_tex if slot == "meas" else self._plan_tex
                 tex.set_data(np.zeros(self._tex_shape, dtype=np.float32))
             self._canvas.context.flush_commands()
-            self._mc_live.clear()
             self.volume_note = self._note_base + " · MC unavailable"
             self._post = None
             self._canvas.update()
             return False
-        if all(run.done for _, (_, run) in live):
-            for slot, (key, run) in live:
-                self._mc_runs[slot] = (key, run.result)
-            self._mc_live.clear()
-            first = self._mc_runs.get("meas") or self._mc_runs.get("plan")
-            self.volume_note = self._note_base + mc_note(first[1])
+        if not self.mc_refining:
+            first = self._mc.get("meas") or self._mc.get("plan")
+            self.volume_note = self._note_base + mc_note(first[1].result)
             self._finish_volume()
         elif time.perf_counter() >= self._mc_preview_at:
-            for _slot, (_key, run) in live:
+            for run in pending:
                 run.preview()
             self._mc_preview_at = time.perf_counter() + MC_PREVIEW_S
             self.volume_note = self._note_base + self._mc_progress_note()
@@ -1046,8 +1046,7 @@ class DoseScene:
         slots = (("meas", self._meas_tex, meas, measured), ("plan", self._plan_tex, planned, plan))
         for slot, tex, prep, raw in slots:
             if prep is None or not mc:
-                self._mc_stop(slot)
-                self._mc_runs.pop(slot, None)
+                self._mc_drop(slot)
             if prep is None:
                 fill_texture(self._canvas, tex, *empty, kernel, grid)
                 continue
@@ -1064,8 +1063,7 @@ class DoseScene:
                 mc_result = mc_result or result
             except Exception:
                 _log.warning("Monte Carlo dose unavailable", exc_info=True)
-                self._mc_stop(slot)
-                self._mc_runs.pop(slot, None)
+                self._mc_drop(slot)
                 tex.set_data(np.zeros((nz, ny, nx), dtype=np.float32))
                 self._canvas.context.flush_commands()
                 mc_failed = True
@@ -1075,7 +1073,7 @@ class DoseScene:
             self._mc_stop()
             self.volume_note += " · MC unavailable"
         self._note_base = self.volume_note
-        if self._mc_live:
+        if self.mc_refining:
             self.volume_note += self._mc_progress_note()
         elif mc_result is not None:
             self.volume_note += mc_note(mc_result)
@@ -1105,7 +1103,7 @@ class DoseScene:
         self._add_axes(axis, grid.origin, grid.extent_mm)
         src = self._plan_tex if from_plan else self._meas_tex if meas is not None else self._plan_tex
         self._post = (grid, self._want_gamma, crit, src, (fraction, per_slice), show_field)
-        if not self._mc_live:
+        if not self.mc_refining:
             self._finish_volume()
         if depth:
             p_o, p_e = phantom_box(grid.origin, grid.extent_mm, depth)

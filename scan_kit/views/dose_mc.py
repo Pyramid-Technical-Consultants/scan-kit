@@ -28,6 +28,8 @@ from .dose_volume_raycast import (
 )
 
 BATCHES = 10  # MCsquare MIN_NUM_BATCH
+# Batches stay this size as a run grows, so its uncertainty estimate survives a raised target.
+BATCH_HISTORIES = 100_000
 DISPATCH_HISTORIES = 32768
 QUANTUM_MEV = 1e-4
 MEV_TO_J = 1.602176634e-13
@@ -45,7 +47,7 @@ layout(r32f, binding = 1) uniform writeonly image3D u_out;
 uniform ivec3 u_dims;
 uniform float u_scale;
 uniform int u_mode;  // 0 fold a batch, 1 fold the last batch and store, 2 store a preview
-uniform float u_gain;
+uniform float u_gain;  // 1 / histories behind the stored dose
 
 void main() {
     ivec3 c = ivec3(gl_GlobalInvocationID);
@@ -62,7 +64,7 @@ void main() {
     float s = dose_sum[i] + b;
     dose_sum[i] = s;
     dose_sq[i] += b * b;
-    if (u_mode == 1) imageStore(u_out, c, vec4(s, 0.0, 0.0, 0.0));
+    if (u_mode == 1) imageStore(u_out, c, vec4(s * u_gain, 0.0, 0.0, 0.0));
 }
 """
 
@@ -272,8 +274,9 @@ class McRun:
         for c in cols:
             ok &= np.isfinite(c)
         total = float(w[ok].sum())
-        self.histories = max(int(histories) // BATCHES, 1) * BATCHES
-        self._per_batch = self.histories // BATCHES
+        histories = max(int(histories), BATCHES)
+        self._per_batch = min(BATCH_HISTORIES, histories // BATCHES)
+        self.histories = histories // self._per_batch * self._per_batch
         self._next = 0  # histories dispatched so far
         self._chunk = DISPATCH_HISTORIES
 
@@ -307,8 +310,8 @@ class McRun:
 
         medium_rho = float(t["m_props"][medium, 0])
         voxel_cm = float(grid.voxel) / 10.0
-        per_history = total / self.histories
-        gy_per_quantum = QUANTUM_MEV * per_history * MEV_TO_J / (medium_rho * voxel_cm**3 * 1e-3)
+        # Tallies weight each history by every proton; storing divides by the histories run.
+        gy_per_quantum = QUANTUM_MEV * total * MEV_TO_J / (medium_rho * voxel_cm**3 * 1e-3)
         origin = np.asarray(grid.origin, dtype=float) / 10.0
         # The programs are shared by every run, so each slice sets its own uniforms.
         self._tp_uniforms = (
@@ -340,6 +343,16 @@ class McRun:
     def progress(self) -> float:
         """Share of the histories transported."""
         return 1.0 if self.done else self._next / self.histories
+
+    def extend(self, histories: int) -> bool:
+        """Retarget to *histories*, keeping what's transported; False when that's already past it."""
+        target = max(int(histories) // self._per_batch, 1) * self._per_batch
+        if not self._bufs or target < self._next:
+            return False
+        if target != self.histories:
+            self.histories = target
+            self.result = None
+        return True
 
     def _bind(self) -> None:
         from OpenGL.GL import GL_R32F, GL_SHADER_STORAGE_BUFFER, GL_TRUE, GL_WRITE_ONLY, glBindBufferBase, glBindImageTexture
@@ -400,7 +413,7 @@ class McRun:
                         self._chunk = min(self._chunk * 2, DISPATCH_HISTORIES)
                 if self._next % self._per_batch == 0:
                     last = self._next == self.histories
-                    self._fold(1 if last else 0)
+                    self._fold(1 if last else 0, 1.0 / self._next)
                     if last:
                         self._finish()
                         return True
@@ -410,12 +423,12 @@ class McRun:
             self._unbind()
 
     def preview(self) -> None:
-        """Write the dose so far, scaled up to the full run, into the texture."""
+        """Write the mean dose of the histories so far into the texture."""
         if self.done or self._next == 0:
             return
         self._bind()
         try:
-            self._fold(2, self.histories / self._next)
+            self._fold(2, 1.0 / self._next)
         finally:
             self._unbind()
 
@@ -423,19 +436,18 @@ class McRun:
         raw = _read_buffer(self._bufs[5], 12, np.uint32)
         dose_sum = _read_buffer(self._bufs[6], self._nvox, np.float32)
         dose_sq = _read_buffer(self._bufs[7], self._nvox, np.float32)
-        self.close()
         pairs = raw[:10].view(np.int64)  # (lo, hi) little-endian pairs
         ledger = {k: float(pairs[i]) * QUANTUM_MEV / self.histories for i, k in enumerate(LEDGER_KEYS)}
         self.result = McResult(
             histories=self.histories,
-            uncertainty=batch_uncertainty(dose_sum, dose_sq),
+            uncertainty=batch_uncertainty(dose_sum, dose_sq, self.histories // self._per_batch),
             ledger=ledger,
             overflow=int(raw[10]),
             deepest=int(raw[11]),
         )
 
     def close(self) -> None:
-        """Free the GPU buffers; a run closed before it finishes leaves its last preview."""
+        """Free the GPU buffers, after which the run can't :meth:`extend`; the texture keeps its dose."""
         if self._bufs:
             self._canvas.set_current()
             _delete_buffers(self._bufs)
@@ -446,6 +458,7 @@ def mc_fill_texture(canvas, tex, *args, **kwargs) -> McResult:
     """:class:`McRun` to completion in one call."""
     run = McRun(canvas, tex, *args, **kwargs)
     run.step()
+    run.close()
     return run.result
 
 

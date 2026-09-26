@@ -465,8 +465,8 @@ class DoseVolumeWindow(VispyViewWindow):
 
         self._load_task = DebouncedBackgroundTask(debounce_ms=0, parent=self)
         self._load_task.finished.connect(self._on_load_finished)
+        self._loading = False
 
-        self._show_status("Loading dose data…")
         self._start_load()
 
     def _build_controls(self) -> QWidget:
@@ -524,7 +524,7 @@ class DoseVolumeWindow(VispyViewWindow):
         self._model_row = self._model_combo.parentWidget()
         self._histories_combo = self._add_segment(
             compare_layout, "Histories",
-            tuple((str(h), f"{h / 1e6:g}M" if h >= 1_000_000 else f"{h // 1000}k") for h in MC_HISTORIES),
+            tuple((str(h), f"{h / 1e6:g}M") for h in MC_HISTORIES),
             self._on_controls_changed,
         )
         self._histories_combo.setToolTip("Protons simulated for each volume. 4× the histories halves the noise.")
@@ -1423,12 +1423,16 @@ class DoseVolumeWindow(VispyViewWindow):
             return load_splat_sessions(session_ids, base_dir, grain)
 
         self._show_status("Loading dose data…")
+        self._loading = True
+        self._sync_progress()
         self._load_task.schedule(loader)
 
     @Slot(int, object)
     def _on_load_finished(self, gen: int, result: object) -> None:
         if gen != self._load_task.generation:
             return
+        self._loading = False
+        self._sync_progress()
         if not isinstance(result, dict):
             self._show_status("Failed to load dose data")
             return
@@ -1447,6 +1451,17 @@ class DoseVolumeWindow(VispyViewWindow):
     def _schedule_refresh(self) -> None:
         self._refresh_generation += 1
         self._refresh_timer.start()
+        self._sync_progress()
+
+    def _sync_progress(self) -> None:
+        """Busy while loading or about to refresh; the Monte Carlo's share while it refines."""
+        mc = self._scene.mc_progress
+        if self._loading or (mc is None and self._refresh_timer.isActive()):
+            self.progress.busy()
+        elif mc is not None:
+            self.progress.set_progress(mc)
+        else:
+            self.progress.done()
 
     def _start_refresh(self) -> None:
         gen = self._refresh_generation
@@ -1502,6 +1517,7 @@ class DoseVolumeWindow(VispyViewWindow):
             self._mc_timer.start()
         else:
             self._mc_timer.stop()
+        self._sync_progress()
         n_meas = 0 if measured_batch is None else int(measured_batch.center.shape[0])
         spots = f"{n_meas:,}"
         if residual:
@@ -1521,7 +1537,9 @@ class DoseVolumeWindow(VispyViewWindow):
         self._show_gamma_verdict()
 
     def _mc_tick(self) -> None:
-        if self._scene.mc_step():
+        refining = self._scene.mc_step()
+        self._sync_progress()
+        if refining:
             self._grid_label.setText(self._scene.volume_note or "—")
             return
         self._mc_timer.stop()
