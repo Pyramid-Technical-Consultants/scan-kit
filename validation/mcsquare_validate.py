@@ -5,9 +5,10 @@ Checks only run the GPU; MCsquare's dose is cached in ``validation/goldens/``.
 Each golden holds the depth dose, R80, lateral sigma, energy and centroid over the
 whole grid, plus the dose around the beam for a 3D gamma. Run from the repo root::
 
-    python validation/mcsquare_validate.py fast                  # tricky small cases, ~30 s
-    python validation/mcsquare_validate.py full                  # every case, ~10 min
+    python validation/mcsquare_validate.py fast                  # tricky small cases, ~5 s
+    python validation/mcsquare_validate.py full                  # every case, ~1 min
     python validation/mcsquare_validate.py full --case water_150_s3
+    python validation/mcsquare_validate.py patient               # CTs, clinical BDL, gamma + DVH + LETd
     python validation/mcsquare_validate.py fast --write-goldens  # rerun MCsquare, replace the cache
 
 ``--write-goldens`` needs ``MCSQUARE_DIR`` pointing at an MCsquare build (the
@@ -383,45 +384,25 @@ def gpu_grid(case: Case):
     return DoseGrid(np.array([-lat / 2, -lat / 2, -float(depth)]), (lat, lat, depth), False, 1.0)
 
 
-def run_gpu(canvas, case: Case, histories: int, seed: int = SEED):
+def run_gpu(case: Case, histories: int, seed: int = SEED):
     """GPU dose (nz, ny, nx) Gy per proton and the McResult."""
-    from scan_kit.views.dose_mc import mc_fill_texture
-    from scan_kit.views.dose_volume_raycast import _alloc_texture, read_texture
+    from scan_kit.views.dose_mc import mc_dose
 
-    grid = gpu_grid(case)
-    shape = tuple(grid.shape[::-1])
-    tex = _alloc_texture(shape)
     x, y, e, w = (np.array(c, dtype=float) for c in zip(*case.spots))
-    res = mc_fill_texture(
-        canvas, tex, x, y, np.full_like(x, case.sigma), np.full_like(x, case.sigma), e, w / w.sum(), case.medium,
-        grid, depth=float(case.depth), wet=float(case.wet), spread_pct=SPREAD_PCT, histories=histories, seed=seed,
+    return mc_dose(
+        x, y, np.full_like(x, case.sigma), np.full_like(x, case.sigma), e, w / w.sum(), case.medium,
+        gpu_grid(case), depth=float(case.depth), wet=float(case.wet), spread_pct=SPREAD_PCT,
+        histories=histories, seed=seed,
     )
-    return read_texture(canvas, tex, shape), res
 
 
-def gamma_rate(canvas, ref: np.ndarray, evl: np.ndarray, dose_pct: float) -> float:
+def gamma_rate(ref: np.ndarray, evl: np.ndarray, dose_pct: float, spacing_mm=1.0) -> float:
     """Global gamma pass rate, dose_pct / 1 mm, 10 % cutoff, of *evl* against *ref*."""
-    from scan_kit.views.dose_volume_fill import DoseGrid
+    from scan_kit.gpu.gamma import gamma_volume
     from scan_kit.views.dose_volume_physics import GammaCriteria
-    from scan_kit.views.dose_volume_raycast import _alloc_texture, gamma_texture
 
-    ref_tex, evl_tex, out_tex = (_alloc_texture(ref.shape) for _ in range(3))
-    ref_tex.set_data(np.ascontiguousarray(ref, dtype=np.float32))
-    evl_tex.set_data(np.ascontiguousarray(evl, dtype=np.float32))
-    grid = DoseGrid(np.zeros(3), ref.shape[::-1], False, 1.0)
-    passed, evaluated = gamma_texture(canvas, ref_tex, evl_tex, out_tex, grid, GammaCriteria(dose_pct, 1.0, 10.0))
+    _gam, passed, evaluated = gamma_volume(ref, evl, spacing_mm, GammaCriteria(dose_pct, 1.0, 10.0))
     return passed / evaluated if evaluated else float("nan")
-
-
-def make_canvas():
-    from PySide6.QtWidgets import QApplication
-
-    from scan_kit.views.vispy_plot import make_scene_canvas
-
-    app = QApplication.instance() or QApplication(sys.argv)
-    canvas = make_scene_canvas(size=(64, 64), show=False, gl="gl+")
-    canvas.set_current()
-    return app, canvas
 
 
 def passes(diff: dict, gamma: float, tol: dict) -> bool:
@@ -430,14 +411,332 @@ def passes(diff: dict, gamma: float, tol: dict) -> bool:
     return bool(ok and gamma >= tol["gamma"])
 
 
+# ---- patient suite: voxel CTs through the clinical BDL, oblique beams and a range shifter.
+# Both engines read the same CT.mhd and Plan.txt; dose is dose-to-water (OnlineSPR) in Gy.
+
+PATIENT_TOL = dict(histories=1e7, gamma_pct=2.0, gamma_mm=2.0, gamma=0.99, dmean=0.01, d95=0.02, d2=0.02, let=0.03)
+PATIENT_BDL = ROOT / "third_party" / "MCsquare" / "BDL" / "BDL_default_DN_RangeShifter.txt"
+SCANNER = ROOT / "third_party" / "MCsquare" / "Scanners" / "default"
+SAMPLE = ROOT / "third_party" / "MCsquare" / "Sample_input_data"
+LOW_DENSITY = 0.1  # g/cm3; MCsquare's Ignore_low_density_voxels threshold, air is not compared
+TARGET_FRAC = 0.5  # DVH metrics over the reference's >= 50 % region
+
+
+@dataclass(frozen=True)
+class PatientCase:
+    name: str
+    insert_hu: float | None = None  # slab in the upstream half of the tissue block
+    gantry: float = 0.0
+    couch: float = 0.0
+    rs_wet: float = 0.0  # mm
+    energies: tuple = (130.0, 140.0)
+    sample: bool = False  # MCsquare's Sample_input_data CT and PlanPencil.txt instead
+
+
+PATIENT_CASES = (
+    PatientCase("tissue_bone_slab", insert_hu=1200.0),
+    PatientCase("tissue_lung_slab", insert_hu=-700.0),
+    PatientCase("tissue_range_shifter", rs_wet=40.0, energies=(150.0, 160.0)),
+    PatientCase("bone_slab_g45_c20", insert_hu=1200.0, gantry=45.0, couch=20.0),
+    PatientCase("sample_ct_3field", sample=True),
+)
+
+
+def write_mhd(path: Path, vol: np.ndarray, spacing) -> None:
+    np.ascontiguousarray(vol, dtype=np.float32).tofile(path.with_suffix(".raw"))
+    nz, ny, nx = vol.shape
+    path.write_text(
+        f"ObjectType = Image\nNDims = 3\nDimSize = {nx} {ny} {nz}\n"
+        f"ElementSpacing = {' '.join(f'{s:g}' for s in spacing)}\nOffset = 0 0 0\n"
+        f"ElementType = MET_FLOAT\nElementByteOrderMSB = False\nElementDataFile = {path.with_suffix('.raw').name}\n"
+    )
+
+
+def mhd_spacing(path: Path) -> np.ndarray:
+    for line in path.read_text().splitlines():
+        key, _, value = line.partition("=")
+        if key.strip() == "ElementSpacing":
+            return np.array(value.split(), dtype=float)
+    raise ValueError(f"{path}: no ElementSpacing")
+
+
+def write_plan(path: Path, fields: list) -> None:
+    """MCsquare Plan.txt; each field: gantry, couch, iso (mm, MCsquare frame), rs, layers of
+    (energy, rs_wet, rs_dist, spots [(x, y, MU)])."""
+    total = sum(float(np.sum(np.asarray(s)[:, 2])) for f in fields for _, _, _, s in f["layers"])
+    lines = ["#TREATMENT-PLAN-DESCRIPTION", "#PlanName", path.stem, "#NumberOfFractions", "1", "##FractionID", "1",
+             "##NumberOfFields", f"{len(fields)}"]
+    for k in range(len(fields)):
+        lines += ["###FieldsID", f"{k + 1}"]
+    lines += ["#TotalMetersetWeightOfAllFields", f"{total}", ""]
+    for k, f in enumerate(fields):
+        lines += ["#FIELD-DESCRIPTION", "###FieldID", f"{k + 1}", "###FinalCumulativeMeterSetWeight",
+                  f"{sum(float(np.sum(np.asarray(s)[:, 2])) for *_, s in f['layers'])}",
+                  "###GantryAngle", f"{f['gantry']}", "###PatientSupportAngle", f"{f['couch']}",
+                  "###IsocenterPosition", " ".join(f"{v}" for v in f["iso"])]
+        if f["rs"]:
+            lines += ["###RangeShifterID", f["rs"], "###RangeShifterType", "binary"]
+        lines += ["###NumberOfControlPoints", f"{len(f['layers'])}", "", "#SPOTS-DESCRIPTION"]
+        cum = 0.0
+        for j, (energy, wet, dist, spots) in enumerate(f["layers"], start=1):
+            spots = np.asarray(spots, dtype=float)
+            cum += float(spots[:, 2].sum())
+            lines += ["####ControlPointIndex", f"{j}", "####SpotTunnedID", "1", "####CumulativeMetersetWeight",
+                      f"{cum}", "####Energy (MeV)", f"{energy}"]
+            if f["rs"]:
+                lines += ["####RangeShifterSetting", "IN" if wet > 0 else "OUT",
+                          "####IsocenterToRangeShifterDistance", f"{dist}",
+                          "####RangeShifterWaterEquivalentThickness", f"{wet}"]
+            lines += ["####NbOfScannedSpots", f"{len(spots)}", "####X Y Weight"]
+            lines += [f"{x} {y} {w}" for x, y, w in spots]
+    path.write_text("\n".join(lines) + "\n")
+
+
+def read_plan(path: Path) -> list:
+    """Fields of an MCsquare Plan.txt, as :func:`write_plan` takes them (rs_wet 0 when out)."""
+    lines = [line.strip() for line in path.read_text().splitlines()]
+    fields, field, layer, n = [], None, None, 0
+    i = 0
+    while i < len(lines):
+        key, nxt = lines[i], lines[i + 1] if i + 1 < len(lines) else ""
+        if key == "#FIELD-DESCRIPTION":
+            field = dict(gantry=0.0, couch=0.0, iso=None, rs="", layers=[])
+            fields.append(field)
+        elif key == "###GantryAngle":
+            field["gantry"] = float(nxt)
+        elif key == "###PatientSupportAngle":
+            field["couch"] = float(nxt)
+        elif key == "###IsocenterPosition":
+            field["iso"] = np.array(nxt.split(), dtype=float)
+        elif key == "###RangeShifterID":
+            field["rs"] = nxt
+        elif key == "####ControlPointIndex":
+            layer = dict(energy=0.0, rs_in=False, rs_wet=0.0, rs_dist=400.0, spots=None)
+            field["layers"].append(layer)
+        elif key.startswith("####Energy"):
+            layer["energy"] = float(nxt)
+        elif key == "####RangeShifterSetting":
+            layer["rs_in"] = nxt == "IN"
+        elif key == "####IsocenterToRangeShifterDistance":
+            layer["rs_dist"] = float(nxt)
+        elif key == "####RangeShifterWaterEquivalentThickness":
+            layer["rs_wet"] = float(nxt)
+        elif key == "####NbOfScannedSpots":
+            n = int(nxt)
+        elif key.startswith("####X"):
+            layer["spots"] = np.array([lines[i + 1 + k].split()[:3] for k in range(n)], dtype=float)
+            i += n
+        i += 1
+    for f in fields:
+        f["layers"] = [
+            (ly["energy"], ly["rs_wet"] if (ly["rs_in"] and f["rs"]) else 0.0, ly["rs_dist"], ly["spots"])
+            for ly in f["layers"]
+        ]
+    return fields
+
+
+def build_patient(case: PatientCase, work: Path) -> None:
+    """CT.mhd and Plan.txt for *case* in *work*."""
+    if case.sample:
+        import shutil
+
+        for name in ("CT.mhd", "CT.raw"):
+            shutil.copy(SAMPLE / name, work / name)
+        shutil.copy(SAMPLE / "PlanPencil.txt", work / "Plan.txt")
+        return
+    n, spacing = 80, 2.0
+    hu = np.full((n, n, n), -1000.0, dtype=np.float32)
+    hu[5:75, 5:75, 5:75] = 0.0
+    if case.insert_hu is not None:
+        # Gantry 0 travels -y through the CT; the slab covers half the field at 40-60 mm depth.
+        hu[5:75, 45:55, 5:40] = case.insert_hu
+    write_mhd(work / "CT.mhd", hu, (spacing,) * 3)
+    grid = np.arange(-12.0, 12.1, 6.0)
+    spots = np.array([(x, y, 1.0) for y in grid for x in grid])
+    write_plan(work / "Plan.txt", [dict(
+        gantry=case.gantry, couch=case.couch, iso=(n * spacing / 2,) * 3, rs="RS_Block" if case.rs_wet else "",
+        layers=[(e, case.rs_wet, 300.0, spots) for e in case.energies],
+    )])
+
+
+def plan_protons(fields: list, model) -> float:
+    return float(sum(np.sum(s[:, 2]) * model.protons_per_mu(e) for f in fields for e, _, _, s in f["layers"]))
+
+
+def write_patient_inputs(work: Path, primaries: int) -> None:
+    (work / "config.txt").write_text(
+        f"Num_Threads 0\nRNG_Seed 0\nNum_Primaries {primaries}\nCT_File CT.mhd\n"
+        f"HU_Density_Conversion_File {SCANNER / 'HU_Density_Conversion.txt'}\n"
+        f"HU_Material_Conversion_File {SCANNER / 'HU_Material_Conversion.txt'}\n"
+        f"BDL_Machine_Parameter_File {PATIENT_BDL}\nBDL_Plan_File Plan.txt\n"
+        "Output_Directory Outputs\nDose_MHD_Output True\nLET_MHD_Output True\nCompute_stat_uncertainty True\n"
+        "Dose_to_Water_conversion OnlineSPR\n"
+    )
+    (work / "Outputs").mkdir(exist_ok=True)
+
+
+def run_mcsquare_patient(case: PatientCase, exe: Path, primaries: int, work: Path) -> tuple[np.ndarray, np.ndarray]:
+    """MCsquare (dose Gy, LETd keV/um) on the CT grid, (nz, ny, nx)."""
+    from scan_kit.qa import BeamModel
+
+    build_patient(case, work)
+    write_patient_inputs(work, primaries)
+    done = subprocess.run([str(exe), "config.txt"], cwd=work, env=_env(), capture_output=True, text=True)
+    out = work / "Outputs"
+    if done.returncode != 0 or not (out / "Dose.mhd").is_file():
+        raise RuntimeError(f"MCsquare failed on {case.name}:\n{done.stdout[-2000:]}\n{done.stderr[-2000:]}")
+    protons = plan_protons(read_plan(work / "Plan.txt"), BeamModel.read(PATIENT_BDL))
+    dose = read_mhd(out / "Dose.mhd").astype(np.float64) * EV_PER_G_TO_GY * protons
+    return dose.astype(np.float32), read_mhd(out / "LET.mhd").astype(np.float32)
+
+
+def run_gpu_patient(work: Path, histories: int, seed: int = SEED):
+    """GPU (dose, LETd, density, McResult) for the case built in *work*."""
+    from scan_kit.dicom import gantry_to_patient
+    from scan_kit.dicom.calibration import CtCalibration
+    from scan_kit.qa import BeamModel
+    from scan_kit.views.dose_mc import McRun, beam_record
+
+    hu = read_mhd(work / "CT.mhd")
+    spacing = mhd_spacing(work / "CT.mhd")
+    material, density = CtCalibration.mcsquare(SCANNER).voxels(hu)
+    model = BeamModel.read(PATIENT_BDL)
+    fields = read_plan(work / "Plan.txt")
+    size = np.array(hu.shape[::-1]) * spacing
+    beams, records, protons = [], [], []
+    for k, f in enumerate(fields):
+        # MCsquare's simulation frame is HFS patient LPS with y flipped, and its x runs
+        # against the CT's (x_ct = Lx - x_sim): two mirrors, so diag(-1, -1, 1) from LPS.
+        rotation = np.diag([-1.0, -1.0, 1.0]) @ gantry_to_patient(f["gantry"], f["couch"], "HFS")
+        iso = np.array(f["iso"], dtype=float)
+        iso[0] = size[0] - iso[0]
+        beams.append(beam_record(rotation, iso, model.nozzle_to_iso, model.smx_to_iso, model.smy_to_iso))
+        for energy, wet, dist, spots in f["layers"]:
+            records.append(model.spot_records(energy, spots[:, 0], spots[:, 1], beam=k, rs_id=f["rs"],
+                                              rs_wet=wet, rs_distance=dist))
+            protons.append(spots[:, 2] * model.protons_per_mu(energy))
+    run = McRun.patient(np.concatenate(records), np.concatenate(protons), np.stack(beams), material, density,
+                        spacing, histories=histories, seed=seed, dose_to_water=True, let=True)
+    run.step()
+    run.close()
+    return run.dose, run.let, density, run.result
+
+
+def patient_hash(work: Path) -> str:
+    import hashlib
+
+    h = hashlib.sha256()
+    for p in (work / "CT.raw", work / "Plan.txt", PATIENT_BDL, SCANNER / "HU_Density_Conversion.txt",
+              SCANNER / "HU_Material_Conversion.txt"):
+        h.update(p.read_bytes())
+    return h.hexdigest()[:16]
+
+
+def write_patient_golden(case: PatientCase, dose, let, primaries: int, version: str, digest: str) -> Path:
+    idx = np.argwhere(dose >= CROP_FRAC * dose.max())
+    lo = np.maximum(idx.min(axis=0) - CROP_MARGIN, 0)
+    hi = np.minimum(idx.max(axis=0) + CROP_MARGIN + 1, dose.shape)
+    box = tuple(slice(a, b) for a, b in zip(lo, hi))
+    scale = float(dose[box].max())
+    GOLDEN_DIR.mkdir(parents=True, exist_ok=True)
+    path = GOLDEN_DIR / f"patient_{case.name}.npz"
+    np.savez_compressed(path, inputs=digest, primaries=primaries, version=version, crop=np.stack([lo, hi]),
+                        dose_scale=scale, dose=(dose[box] / scale).astype(np.float16), let=let[box].astype(np.float16))
+    return path
+
+
+def dvh_metrics(dose: np.ndarray, region: np.ndarray) -> dict:
+    d = dose[region].astype(np.float64)
+    return {"dmean": float(d.mean()), "d95": float(np.percentile(d, 5.0)), "d2": float(np.percentile(d, 98.0))}
+
+
+def check_patient(case: PatientCase, histories: int, tol: dict) -> tuple[bool, str]:
+    path = GOLDEN_DIR / f"patient_{case.name}.npz"
+    if not path.is_file():
+        return False, "no golden; run with --write-goldens"
+    with tempfile.TemporaryDirectory(prefix="qa_") as tmp:
+        work = Path(tmp)
+        build_patient(case, work)
+        digest = patient_hash(work)
+        with np.load(path) as g:
+            gold = {k: g[k] for k in g.files}
+        if str(gold["inputs"]) != digest:
+            return False, "golden made from different inputs; rerun --write-goldens"
+        t0 = time.perf_counter()
+        dose, let, density, result = run_gpu_patient(work, histories)
+        seconds = time.perf_counter() - t0
+        spacing = mhd_spacing(work / "CT.mhd")
+    lo, hi = gold["crop"]
+    box = tuple(slice(a, b) for a, b in zip(lo, hi))
+    body = density[box] >= LOW_DENSITY
+    ref = np.where(body, gold["dose"].astype(np.float32) * np.float32(gold["dose_scale"]), 0.0).astype(np.float32)
+    evl = np.where(body, dose[box], 0.0).astype(np.float32)
+    ref_let = gold["let"].astype(np.float32)
+
+    from scan_kit.gpu.gamma import gamma_volume
+    from scan_kit.views.dose_volume_physics import GammaCriteria
+
+    _g, passed, evaluated = gamma_volume(ref, evl, spacing, GammaCriteria(tol["gamma_pct"], tol["gamma_mm"], 10.0))
+    gamma = passed / evaluated if evaluated else float("nan")
+    region = ref >= TARGET_FRAC * ref.max()
+    a, b = dvh_metrics(ref, region), dvh_metrics(evl, region)
+    diff = {k: b[k] / a[k] - 1.0 for k in a}
+    w = ref[region]
+    diff["let"] = float(np.average(let[box][region], weights=w) / np.average(ref_let[region], weights=w) - 1.0)
+    ok = gamma >= tol["gamma"] and all(abs(diff[k]) <= tol[k] for k in ("dmean", "d95", "d2", "let"))
+    line = (f"{100 * gamma:6.2f}% {100 * diff['dmean']:+6.2f}% {100 * diff['d95']:+6.2f}% {100 * diff['d2']:+6.2f}% "
+            f"{100 * diff['let']:+6.2f}% {result.closure:+.0e} {seconds:5.1f}")
+    return bool(ok), line
+
+
+def main_patient(args) -> int:
+    tol = PATIENT_TOL
+    cases = [c for c in PATIENT_CASES if not args.case or c.name in args.case]
+    histories = int(args.histories or tol["histories"])
+    if args.write_goldens:
+        exe = mcsquare_exe()
+        version = mcsquare_version(exe)
+        print(f"Writing patient goldens with MCsquare: {version}")
+        for case in cases:
+            n = int(args.golden_primaries)
+            t0 = time.perf_counter()
+            with tempfile.TemporaryDirectory(prefix="mcsq_") as tmp:
+                dose, let = run_mcsquare_patient(case, exe, n, Path(tmp))
+                write_patient_golden(case, dose, let, n, version, patient_hash(Path(tmp)))
+            print(f"  {case.name:24} {n:.0e} primaries  {time.perf_counter() - t0:5.0f} s", flush=True)
+        print()
+    print(f"patient suite: GPU {histories:.0e} histories per case against cached MCsquare\n")
+    print(f"{'case':24} {'gamma':>7} {'Dmean':>7} {'D95':>7} {'D2':>7} {'LETd':>7} {'closure':>7}  GPU s")
+    failed = []
+    for case in cases:
+        ok, line = check_patient(case, histories, tol)
+        failed += [] if ok else [case.name]
+        print(f"{case.name:24} {line}  {'ok' if ok else 'FAIL'}", flush=True)
+    print(
+        f"\nTolerances: gamma {tol['gamma_pct']:g}%/{tol['gamma_mm']:g}mm (10% cutoff, density >= {LOW_DENSITY}) "
+        f">= {100 * tol['gamma']:g}%, Dmean {100 * tol['dmean']:g}%, D95 {100 * tol['d95']:g}%, "
+        f"D2 {100 * tol['d2']:g}%, dose-weighted LETd {100 * tol['let']:g}% over the >= {100 * TARGET_FRAC:g}% region"
+    )
+    if failed:
+        print(f"FAILED: {', '.join(failed)}")
+        return 1
+    print("All cases pass.")
+    return 0
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("suite", choices=SUITES)
+    ap.add_argument("suite", choices=(*SUITES, "patient"))
     ap.add_argument("--case", action="append", default=[], help="only these cases (repeatable)")
     ap.add_argument("--histories", type=float, help="GPU histories per case (default: the suite's)")
     ap.add_argument("--write-goldens", action="store_true", help="rerun MCsquare and replace the cached goldens")
     ap.add_argument("--golden-primaries", type=float, default=GOLDEN_PRIMARIES)
     args = ap.parse_args(argv)
+    if args.suite == "patient":
+        unknown = set(args.case) - {c.name for c in PATIENT_CASES}
+        if unknown:
+            ap.error(f"unknown patient cases {sorted(unknown)}; choose from {[c.name for c in PATIENT_CASES]}")
+        return main_patient(args)
     tol = SUITES[args.suite]
     cases = [c for c in CASES if c.fast or args.suite == "full"]
     unknown = set(args.case) - {c.name for c in cases}
@@ -458,7 +757,6 @@ def main(argv=None) -> int:
             print(f"  {case.name:24} {n:.0e} primaries  {time.perf_counter() - t0:5.0f} s", flush=True)
         print()
 
-    _app, canvas = make_canvas()
     print(f"{args.suite} suite: GPU {histories:.0e} histories per case against cached MCsquare\n")
     print(f"{'case':24} {'IDD':>7} {'dR80':>7} {'sigma':>7} {'energy':>7} {'xy':>7} {'gamma':>7}  GPU s")
     failed = []
@@ -469,11 +767,11 @@ def main(argv=None) -> int:
             continue
         gold = load_golden(case)
         t0 = time.perf_counter()
-        vol, _res = run_gpu(canvas, case, int(histories * case.scale))
+        vol, _res = run_gpu(case, int(histories * case.scale))
         seconds = time.perf_counter() - t0
         diff = compare(gold, summary(vol, case))
         lo, hi = gold["crop"]
-        gamma = gamma_rate(canvas, gold["dose"], vol[lo[0]:hi[0], lo[1]:hi[1], lo[2]:hi[2]], tol["gamma_pct"])
+        gamma = gamma_rate(gold["dose"], vol[lo[0]:hi[0], lo[1]:hi[1], lo[2]:hi[2]], tol["gamma_pct"])
         ok = passes(diff, gamma, tol)
         if not ok:
             failed.append(case.name)
