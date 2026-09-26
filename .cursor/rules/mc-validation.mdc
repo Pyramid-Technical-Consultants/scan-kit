@@ -1,0 +1,13 @@
+---
+description: When to run the MCsquare validation of the GPU Monte Carlo dose engine
+globs: scan_kit/views/dose_mc.py,scan_kit/assets/dose_mc_transport.comp,scan_kit/assets/mc_materials.npz,scripts/build_mc_tables.py,validation/**
+alwaysApply: false
+---
+
+# MCsquare validation
+
+`pytest` covers the GPU Monte Carlo with self-checking unit tests (`tests/test_dose_mc.py`). Agreement with MCsquare lives in `validation/` and is deliberately outside `pytest`.
+
+- Only run it after changing Monte Carlo physics or transport: `dose_mc.py`, `dose_mc_transport.comp`, `mc_materials.npz`, or `build_mc_tables.py`. UI, catalog, or other dose-view changes don't need it.
+- `python validation/mcsquare_validate.py fast` (about 30 s) after each physics change; `python validation/mcsquare_validate.py full` (about 10 min) before a PR with physics changes.
+- Don't pass `--write-goldens` unless the user asks. It reruns MCsquare (needs `MCSQUARE_DIR`, many minutes) and is only needed when a case in `CASES` changes or MCsquare is updated.

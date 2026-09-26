@@ -439,15 +439,21 @@ git submodule update --init third_party/MCsquare
 
 `scan_kit/assets/mc_materials.npz` packs the stopping-power, scattering and nuclear tables that the shader reads from `third_party/MCsquare/Materials`. After the submodule changes, rebuild it with `python scripts/build_mc_tables.py`.
 
-`scripts/mcsquare_validate.py` runs matched pencil beams and a small spot field through MCsquare and the GPU. The field case runs 4× `--primaries`, because it spreads its histories over far more voxels than a pencil beam. The cases cover water from 70 to 230 MeV at two spot sizes, each other Monte Carlo medium, and an entrance WET. For each case it reports the integrated depth dose, R80, lateral σ at three depths, total energy and a 1%/1 mm 3D gamma. Point `MCSQUARE_DIR` at an MCsquare build, either the folder holding `MCsquare_win.exe`, `MCsquare_linux` or `MCsquare_mac`, or the executable itself:
+`pytest` doesn't compare against MCsquare. `tests/test_dose_mc.py` checks the engine against itself: tables, energy bookkeeping, determinism, spot placement, and range against its own stopping powers. These tests need an OpenGL 4.3 context and skip without one. MCsquare agreement lives in `validation/mcsquare_validate.py`, which you run by hand after changing the Monte Carlo physics. It has two suites:
+
+- **fast** (about 30 s): five small, awkward cases at 1e6 GPU histories with looser tolerances. They cover a 1 mm spot, copper at 70 MeV, a water-to-aluminum interface, nuclear build-up at 180 MeV, and three off-axis spots of mixed energy and weight in PMMA.
+- **full** (about 10 min): the fast cases plus water from 70 to 230 MeV at two spot sizes, each other Monte Carlo medium, an entrance WET and a 245-spot field, all at 1e7 histories. The field runs 4× the histories because it spreads them over far more voxels.
+
+Each case reports the integrated depth dose, R80, lateral σ at three depths, total energy, dose centroid and a 3D gamma. A check runs only the GPU. MCsquare's result for every case is cached in `validation/goldens/` as its summaries plus the dose around the beam.
 
 ```bash
-MCSQUARE_DIR=/path/to/MCsquare python scripts/mcsquare_validate.py            # all cases, 1e7 primaries
-python scripts/mcsquare_validate.py water_150_s3 --primaries 1e6              # one case
-python scripts/mcsquare_validate.py --write-goldens                           # refresh tests/data/mcsquare/
+python validation/mcsquare_validate.py fast
+python validation/mcsquare_validate.py full
+python validation/mcsquare_validate.py full --case water_150_s3 --histories 1e6
+MCSQUARE_DIR=/path/to/MCsquare python validation/mcsquare_validate.py full --write-goldens
 ```
 
-`--write-goldens` stores the MCsquare summaries in `tests/data/mcsquare/`. `tests/test_dose_mc.py` compares the GPU against those summaries, so CI needs no MCsquare. With `MCSQUARE_DIR` set, one extra test also runs MCsquare live. The Monte Carlo tests need an OpenGL 4.3 context and skip without one.
+`--write-goldens` reruns MCsquare, at 1e7 primaries by default, and replaces the cache. You only need it after changing a case or updating MCsquare. `MCSQUARE_DIR` is either the folder holding `MCsquare_win.exe`, `MCsquare_linux` or `MCsquare_mac`, or the executable itself.
 
 Deliberate MCsquare 1.1 behaviours kept in the port:
 

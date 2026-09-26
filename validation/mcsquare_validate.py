@@ -1,17 +1,17 @@
-"""Validate the GPU Monte Carlo against MCsquare, the reference engine.
+"""Check the GPU Monte Carlo against MCsquare, the reference engine.
 
-Each case is run through an MCsquare binary (uniform phantom CT, parallel
-mono-Gaussian beam model, one field at gantry 0 with the nozzle on the CT
-surface) and through ``mc_fill_texture`` on the same 1 mm grid, then compared on
-depth dose, R80, lateral sigma, deposited energy and 3D gamma. Run from the
-repo root with ``MCSQUARE_DIR`` pointing at an MCsquare build (the folder or
-the executable)::
+Not part of ``pytest``: run it after changing Monte Carlo physics, not after UI work.
+Checks only run the GPU; MCsquare's dose is cached in ``validation/goldens/``.
+Each golden holds the depth dose, R80, lateral sigma, energy and centroid over the
+whole grid, plus the dose around the beam for a 3D gamma. Run from the repo root::
 
-    python scripts/mcsquare_validate.py                  # all cases, 1e7 primaries
-    python scripts/mcsquare_validate.py water_150_s3     # just some cases
-    python scripts/mcsquare_validate.py --write-goldens  # refresh tests/data/mcsquare
+    python validation/mcsquare_validate.py fast                  # tricky small cases, ~30 s
+    python validation/mcsquare_validate.py full                  # every case, ~10 min
+    python validation/mcsquare_validate.py full --case water_150_s3
+    python validation/mcsquare_validate.py fast --write-goldens  # rerun MCsquare, replace the cache
 
-Exits nonzero if any case misses a tolerance.
+``--write-goldens`` needs ``MCSQUARE_DIR`` pointing at an MCsquare build (the
+folder or the executable). Exits nonzero if any case misses its suite's tolerance.
 """
 
 from __future__ import annotations
@@ -30,14 +30,21 @@ import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
 MATERIALS = ROOT / "third_party" / "MCsquare" / "Materials"
-GOLDEN_DIR = ROOT / "tests" / "data" / "mcsquare"
+GOLDEN_DIR = Path(__file__).resolve().parent / "goldens"
+GOLDEN_PRIMARIES = 1e7
 EV_PER_G_TO_GY = 1.602176e-16
 MEV_TO_J = 1.602176634e-13
 SPREAD_PCT = 0.7
 SEED = 1
 LATERAL_MM = 100
 SIGMA_DEPTHS = (0.25, 0.5, 0.9)  # fractions of R80
-TOL = {"idd": 0.01, "r80": 0.2, "sigma": 0.02, "energy": 0.005, "gamma": 0.99}
+# Gamma only scores reference dose >= 10 % of the maximum, searching up to 2 mm.
+CROP_FRAC, CROP_MARGIN = 0.05, 3
+# fast runs 10x fewer GPU histories than the goldens, so its noise allows less.
+SUITES = {
+    "fast": dict(histories=1e6, idd=0.02, r80=0.25, sigma=0.03, energy=0.01, centroid=0.2, gamma_pct=2.0, gamma=0.98),
+    "full": dict(histories=1e7, idd=0.01, r80=0.2, sigma=0.02, energy=0.005, centroid=0.1, gamma_pct=1.0, gamma=0.99),
+}
 
 
 @dataclass(frozen=True)
@@ -48,7 +55,8 @@ class Case:
     spots: tuple  # ((x mm, y mm, energy MeV, protons), ...)
     wet: int = 0  # mm of water in front of the phantom
     lateral: int = LATERAL_MM
-    scale: float = 1.0  # x --primaries; a field spreads them over far more voxels than a pencil
+    scale: float = 1.0  # x histories; a field spreads them over far more voxels than a pencil
+    fast: bool = False  # also in the fast suite
 
     @property
     def pencil(self) -> bool:
@@ -60,9 +68,9 @@ class Case:
         return int(math.ceil(1.1 * csda_range_mm(self.medium, e_max) + 10.0))
 
 
-def _pencil(medium: str, energy: float, sigma: float, wet: int = 0) -> Case:
-    name = f"{medium}_{energy:g}_s{sigma:g}" + (f"_wet{wet}" if wet else "")
-    return Case(name, medium, sigma, ((0.0, 0.0, energy, 1.0),), wet)
+def _pencil(medium: str, energy: float, sigma: float, wet: int = 0, **kw) -> Case:
+    name = kw.pop("name", None) or f"{medium}_{energy:g}_s{sigma:g}" + (f"_wet{wet}" if wet else "")
+    return Case(name, medium, sigma, ((0.0, 0.0, energy, 1.0),), wet, **kw)
 
 
 def _field() -> Case:
@@ -77,6 +85,16 @@ def _field() -> Case:
 
 
 CASES = (
+    # fast: small grids, each aimed at a place a transport bug would show first.
+    _pencil("water", 100.0, 1.0, lateral=40, fast=True, name="water_100_s1_narrow"),  # scatter-dominated width
+    _pencil("copper", 70.0, 3.0, lateral=30, fast=True),  # high Z, 6 mm range, ends below the ICRU 7 MeV cut
+    _pencil("aluminum", 120.0, 3.0, wet=40, lateral=40, fast=True),  # water -> aluminum interface
+    _pencil("water", 180.0, 3.0, lateral=40, fast=True),  # nuclear build-up and secondary protons
+    Case(  # off-axis spots, mixed energies and weights: placement, mirroring, weighting
+        "pmma_offaxis_3spot", "pmma", 3.0,
+        ((12.0, -7.0, 100.0, 1.0), (-8.0, 9.0, 120.0, 2.0), (0.0, 0.0, 110.0, 0.5)), lateral=60, fast=True,
+    ),
+    # full only
     *(_pencil("water", e, s) for e in (70.0, 100.0, 150.0, 200.0, 230.0) for s in (3.0, 6.0)),
     _pencil("pmma", 150.0, 4.0),
     _pencil("polystyrene", 150.0, 4.0),
@@ -148,6 +166,15 @@ def lateral_sigmas(vol: np.ndarray, depths) -> np.ndarray:
     return np.array([fwhm_sigma(surface_first[int(d)].sum(axis=0)) for d in depths])
 
 
+def centroid_mm(vol: np.ndarray) -> np.ndarray:
+    """Dose-weighted (x, y) in plan mm."""
+    v = np.asarray(vol, dtype=float)
+    ny, nx = v.shape[1:]
+    x = (v.sum(axis=(0, 1)) * (np.arange(nx) + 0.5 - nx / 2)).sum()
+    y = (v.sum(axis=(0, 2)) * (np.arange(ny) + 0.5 - ny / 2)).sum()
+    return np.array([x, y]) / v.sum()
+
+
 def energy_mev(vol: np.ndarray, medium: str) -> float:
     """Energy deposited in the grid per proton (1 mm voxels)."""
     return float(np.asarray(vol, dtype=float).sum()) * medium_rho(medium) * 1e-6 / MEV_TO_J
@@ -164,6 +191,7 @@ def summary(vol: np.ndarray, case: Case) -> dict:
         "sigma_depths": depths,
         "sigmas": lateral_sigmas(vol, depths) if case.pencil else np.full(depths.size, np.nan),
         "energy": energy_mev(vol, case.medium),
+        "centroid": centroid_mm(vol),
     }
 
 
@@ -178,6 +206,7 @@ def compare(ref: dict, gpu: dict) -> dict:
         "r80": float(gpu["r80"] - ref["r80"]),
         "sigma": float(np.max(np.abs(sig))) if np.all(np.isfinite(sig)) else float("nan"),
         "energy": float(gpu["energy"] / ref["energy"] - 1.0),
+        "centroid": float(np.max(np.abs(gpu["centroid"] - ref["centroid"]))),
     }
 
 
@@ -297,15 +326,52 @@ def run_mcsquare(case: Case, exe: Path, primaries: int, work: Path) -> np.ndarra
     dose = read_mhd(work / "Outputs" / "Dose.mhd") * EV_PER_G_TO_GY  # [plan Y, beam, -plan X]
     # MCsquare's transport x runs against the CT's (get_CT_Offset), so plan X is mirrored.
     vol = np.ascontiguousarray(dose.transpose(1, 0, 2)[: case.depth, :, ::-1], dtype=np.float32)
-    # The beam axis must land where the plan puts it: centred laterally.
-    c = np.arange(case.lateral) + 0.5 - case.lateral / 2
-    for axis, name in ((2, "x"), (1, "y")):
-        prof = vol.sum(axis=tuple(a for a in range(3) if a != axis))
-        off = float((prof * c).sum() / prof.sum()) if prof.sum() > 0 else float("nan")
-        expect = float(np.average([s[0 if name == "x" else 1] for s in case.spots], weights=[s[3] for s in case.spots]))
-        if not abs(off - expect) <= 1.0:
-            raise RuntimeError(f"{case.name}: MCsquare beam centroid {name}={off:.2f} mm, expected {expect:.2f}")
+    # The beam must land where the plan puts it; each spot deposits roughly protons x energy.
+    expect = np.average([s[:2] for s in case.spots], axis=0, weights=[s[3] * s[2] for s in case.spots])
+    got = centroid_mm(vol)
+    if not np.all(np.abs(got - expect) <= 1.0):
+        raise RuntimeError(f"{case.name}: MCsquare beam centroid {got} mm, expected {expect}")
     return vol
+
+
+# ---- goldens: MCsquare summaries plus the dose around the beam
+
+def golden_path(case: Case) -> Path:
+    return GOLDEN_DIR / f"{case.name}.npz"
+
+
+def _params(case: Case) -> dict:
+    return dict(
+        medium=case.medium, sigma=case.sigma, spots=np.array(case.spots, dtype=float), wet=case.wet,
+        lateral=case.lateral, depth=case.depth, spread_pct=SPREAD_PCT,
+    )
+
+
+def write_golden(case: Case, vol: np.ndarray, primaries: int, version: str) -> Path:
+    idx = np.argwhere(vol >= CROP_FRAC * vol.max())
+    lo = np.maximum(idx.min(axis=0) - CROP_MARGIN, 0)
+    hi = np.minimum(idx.max(axis=0) + CROP_MARGIN + 1, vol.shape)
+    core = vol[lo[0]:hi[0], lo[1]:hi[1], lo[2]:hi[2]]
+    scale = float(core.max())
+    GOLDEN_DIR.mkdir(parents=True, exist_ok=True)
+    path = golden_path(case)
+    np.savez_compressed(
+        path, **_params(case), primaries=primaries, version=version,
+        crop=np.stack([lo, hi]), dose_scale=scale, dose=(core / scale).astype(np.float16),
+        **{k: np.asarray(v) for k, v in summary(vol, case).items()},
+    )
+    return path
+
+
+def load_golden(case: Case) -> dict:
+    """The cached MCsquare result; raises if it was made for a different case setup."""
+    with np.load(golden_path(case)) as g:
+        gold = {k: g[k] for k in g.files}
+    for k, v in _params(case).items():
+        if not np.array_equal(np.asarray(gold[k]), np.asarray(v)):
+            raise ValueError(f"{case.name}: golden {k} is {gold[k]}, case has {v}; rerun --write-goldens")
+    gold["dose"] = gold["dose"].astype(np.float32) * np.float32(gold["dose_scale"])
+    return gold
 
 
 # ---- GPU
@@ -318,7 +384,7 @@ def gpu_grid(case: Case):
 
 
 def run_gpu(canvas, case: Case, histories: int, seed: int = SEED):
-    """GPU dose (nz, ny, nx) Gy per proton, the texture it lives in, and the McResult."""
+    """GPU dose (nz, ny, nx) Gy per proton and the McResult."""
     from scan_kit.views.dose_mc import mc_fill_texture
     from scan_kit.views.dose_volume_raycast import _alloc_texture, read_texture
 
@@ -330,18 +396,20 @@ def run_gpu(canvas, case: Case, histories: int, seed: int = SEED):
         canvas, tex, x, y, np.full_like(x, case.sigma), np.full_like(x, case.sigma), e, w / w.sum(), case.medium,
         grid, depth=float(case.depth), wet=float(case.wet), spread_pct=SPREAD_PCT, histories=histories, seed=seed,
     )
-    return read_texture(canvas, tex, shape), tex, res
+    return read_texture(canvas, tex, shape), res
 
 
-def gamma_rate(canvas, case: Case, ref: np.ndarray, gpu_tex) -> float:
+def gamma_rate(canvas, ref: np.ndarray, evl: np.ndarray, dose_pct: float) -> float:
+    """Global gamma pass rate, dose_pct / 1 mm, 10 % cutoff, of *evl* against *ref*."""
+    from scan_kit.views.dose_volume_fill import DoseGrid
     from scan_kit.views.dose_volume_physics import GammaCriteria
     from scan_kit.views.dose_volume_raycast import _alloc_texture, gamma_texture
 
-    grid = gpu_grid(case)
-    ref_tex = _alloc_texture(ref.shape)
-    ref_tex.set_data(ref)
-    out_tex = _alloc_texture(ref.shape)
-    passed, evaluated = gamma_texture(canvas, ref_tex, gpu_tex, out_tex, grid, GammaCriteria(1.0, 1.0, 10.0))
+    ref_tex, evl_tex, out_tex = (_alloc_texture(ref.shape) for _ in range(3))
+    ref_tex.set_data(np.ascontiguousarray(ref, dtype=np.float32))
+    evl_tex.set_data(np.ascontiguousarray(evl, dtype=np.float32))
+    grid = DoseGrid(np.zeros(3), ref.shape[::-1], False, 1.0)
+    passed, evaluated = gamma_texture(canvas, ref_tex, evl_tex, out_tex, grid, GammaCriteria(dose_pct, 1.0, 10.0))
     return passed / evaluated if evaluated else float("nan")
 
 
@@ -356,67 +424,69 @@ def make_canvas():
     return app, canvas
 
 
-def write_golden(case: Case, ref: dict, primaries: int, version: str) -> Path:
-    GOLDEN_DIR.mkdir(parents=True, exist_ok=True)
-    path = GOLDEN_DIR / f"{case.name}.npz"
-    np.savez_compressed(
-        path, medium=case.medium, sigma=case.sigma, spots=np.array(case.spots, dtype=float), wet=case.wet,
-        lateral=case.lateral, depth=case.depth, spread_pct=SPREAD_PCT, primaries=primaries, version=version,
-        **{k: np.asarray(v) for k, v in ref.items()},
-    )
-    return path
-
-
-def passes(diff: dict, gamma: float) -> bool:
-    ok = diff["idd"] <= TOL["idd"] and abs(diff["r80"]) <= TOL["r80"] and abs(diff["energy"]) <= TOL["energy"]
-    ok &= not (diff["sigma"] > TOL["sigma"])  # nan (fields) is not a failure
-    return bool(ok and gamma >= TOL["gamma"])
+def passes(diff: dict, gamma: float, tol: dict) -> bool:
+    ok = all(abs(diff[k]) <= tol[k] for k in ("idd", "r80", "energy", "centroid"))
+    ok &= not (diff["sigma"] > tol["sigma"])  # nan (fields) is not a failure
+    return bool(ok and gamma >= tol["gamma"])
 
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("cases", nargs="*", help="case names (default: all)")
-    ap.add_argument("--primaries", type=float, default=1e7)
-    ap.add_argument("--write-goldens", action="store_true")
+    ap.add_argument("suite", choices=SUITES)
+    ap.add_argument("--case", action="append", default=[], help="only these cases (repeatable)")
+    ap.add_argument("--histories", type=float, help="GPU histories per case (default: the suite's)")
+    ap.add_argument("--write-goldens", action="store_true", help="rerun MCsquare and replace the cached goldens")
+    ap.add_argument("--golden-primaries", type=float, default=GOLDEN_PRIMARIES)
     args = ap.parse_args(argv)
-    names = {c.name for c in CASES}
-    unknown = set(args.cases) - names
+    tol = SUITES[args.suite]
+    cases = [c for c in CASES if c.fast or args.suite == "full"]
+    unknown = set(args.case) - {c.name for c in cases}
     if unknown:
-        ap.error(f"unknown cases {sorted(unknown)}; choose from {sorted(names)}")
-    cases = [c for c in CASES if not args.cases or c.name in args.cases]
-    primaries = int(args.primaries)
-    exe = mcsquare_exe()
-    version = mcsquare_version(exe)
-    print(f"MCsquare: {version}\n{primaries:.0e} primaries per case\n")
+        ap.error(f"unknown {args.suite} cases {sorted(unknown)}; choose from {[c.name for c in cases]}")
+    cases = [c for c in cases if not args.case or c.name in args.case]
+    histories = int(args.histories or tol["histories"])
+
+    if args.write_goldens:
+        exe = mcsquare_exe()
+        version = mcsquare_version(exe)
+        print(f"Writing goldens with MCsquare: {version}")
+        for case in cases:
+            n = int(args.golden_primaries * case.scale)
+            t0 = time.perf_counter()
+            with tempfile.TemporaryDirectory(prefix="mcsq_") as tmp:
+                write_golden(case, run_mcsquare(case, exe, n, Path(tmp)), n, version)
+            print(f"  {case.name:24} {n:.0e} primaries  {time.perf_counter() - t0:5.0f} s", flush=True)
+        print()
+
     _app, canvas = make_canvas()
-    print(f"{'case':24} {'IDD':>7} {'dR80':>7} {'sigma':>7} {'energy':>7} {'gamma':>7}  MCsq/GPU s")
+    print(f"{args.suite} suite: GPU {histories:.0e} histories per case against cached MCsquare\n")
+    print(f"{'case':24} {'IDD':>7} {'dR80':>7} {'sigma':>7} {'energy':>7} {'xy':>7} {'gamma':>7}  GPU s")
     failed = []
     for case in cases:
-        n = int(primaries * case.scale)
-        with tempfile.TemporaryDirectory(prefix="mcsq_") as tmp:
-            t0 = time.perf_counter()
-            ref_vol = run_mcsquare(case, exe, n, Path(tmp))
-            t1 = time.perf_counter()
-        gpu_vol, gpu_tex, _res = run_gpu(canvas, case, n)
-        t2 = time.perf_counter()
-        ref, gpu = summary(ref_vol, case), summary(gpu_vol, case)
-        diff = compare(ref, gpu)
-        gamma = gamma_rate(canvas, case, ref_vol, gpu_tex)
-        ok = passes(diff, gamma)
+        if not golden_path(case).is_file():
+            print(f"{case.name:24} no golden; run with --write-goldens")
+            failed.append(case.name)
+            continue
+        gold = load_golden(case)
+        t0 = time.perf_counter()
+        vol, _res = run_gpu(canvas, case, int(histories * case.scale))
+        seconds = time.perf_counter() - t0
+        diff = compare(gold, summary(vol, case))
+        lo, hi = gold["crop"]
+        gamma = gamma_rate(canvas, gold["dose"], vol[lo[0]:hi[0], lo[1]:hi[1], lo[2]:hi[2]], tol["gamma_pct"])
+        ok = passes(diff, gamma, tol)
         if not ok:
             failed.append(case.name)
         print(
             f"{case.name:24} {100 * diff['idd']:6.2f}% {diff['r80']:+6.2f}mm {100 * diff['sigma']:6.2f}% "
-            f"{100 * diff['energy']:+6.2f}% {100 * gamma:6.2f}%  {t1 - t0:5.0f}/{t2 - t1:<4.0f} "
+            f"{100 * diff['energy']:+6.2f}% {diff['centroid']:5.2f}mm {100 * gamma:6.2f}%  {seconds:4.0f}  "
             f"{'ok' if ok else 'FAIL'}",
             flush=True,
         )
-        if args.write_goldens:
-            write_golden(case, ref, n, version)
-    tol = TOL
     print(
         f"\nTolerances: IDD {100 * tol['idd']:g}% to R90, |dR80| {tol['r80']} mm, sigma {100 * tol['sigma']:g}% "
-        f"at {SIGMA_DEPTHS} R80, energy {100 * tol['energy']:g}%, gamma 1%/1mm (10% cutoff) >= {100 * tol['gamma']:g}%"
+        f"at {SIGMA_DEPTHS} R80, energy {100 * tol['energy']:g}%, centroid {tol['centroid']} mm, "
+        f"gamma {tol['gamma_pct']:g}%/1mm (10% cutoff) >= {100 * tol['gamma']:g}%"
     )
     if failed:
         print(f"FAILED: {', '.join(failed)}")

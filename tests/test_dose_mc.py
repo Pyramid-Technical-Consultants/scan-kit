@@ -1,10 +1,10 @@
-"""GPU Monte Carlo dose: MCsquare tables, energy bookkeeping, and agreement with MCsquare goldens."""
+"""GPU Monte Carlo dose: tables, energy bookkeeping, geometry and range, checked against the engine itself.
+
+Agreement with MCsquare lives in ``validation/`` and is not run by pytest.
+"""
 
 from __future__ import annotations
 
-import importlib.util
-import os
-import sys
 from pathlib import Path
 
 import numpy as np
@@ -14,14 +14,6 @@ from scan_kit.views.dose_mc import load_tables, mc_media
 from scan_kit.views.dose_volume_catalog import MC_MEDIA, MEDIUM_POLYETHYLENE, MODEL_ANALYTIC, MODEL_MC, WEIGHT_DOSE
 
 ROOT = Path(__file__).resolve().parents[1]
-_spec = importlib.util.spec_from_file_location("mcsquare_validate", ROOT / "scripts" / "mcsquare_validate.py")
-mv = sys.modules.setdefault("mcsquare_validate", importlib.util.module_from_spec(_spec))
-_spec.loader.exec_module(mv)
-
-GOLDENS = sorted(mv.GOLDEN_DIR.glob("*.npz"))
-# Everything else runs with -m slow.
-QUICK = {"water_150_s3", "water_150_s4_wet30", "copper_100_s4"}
-HISTORIES = 1_000_000
 
 
 @pytest.fixture(scope="module")
@@ -37,6 +29,23 @@ def canvas(qapp):
     if not _gl_at_least(4, 3):
         pytest.skip("OpenGL 4.3 compute unavailable")
     return c
+
+
+def _dose(canvas, medium, spots, *, sigma=3.0, lateral=40, depth=60, wet=0.0, histories=100_000, seed=1):
+    """(nz, ny, nx) Gy per proton on a 1 mm grid centred on the beam axis, z index 0 deepest."""
+    from scan_kit.views.dose_mc import mc_fill_texture
+    from scan_kit.views.dose_volume_fill import DoseGrid
+    from scan_kit.views.dose_volume_raycast import _alloc_texture, read_texture
+
+    grid = DoseGrid(np.array([-lateral / 2, -lateral / 2, -float(depth)]), (lateral, lateral, depth), False, 1.0)
+    shape = (depth, lateral, lateral)
+    tex = _alloc_texture(shape)
+    x, y, e, w = (np.array(c, dtype=float) for c in zip(*spots))
+    res = mc_fill_texture(
+        canvas, tex, x, y, np.full_like(x, sigma), np.full_like(x, sigma), e, w, medium, grid,
+        depth=float(depth), wet=float(wet), spread_pct=0.7, histories=histories, seed=seed,
+    )
+    return read_texture(canvas, tex, shape), res
 
 
 def test_tables_match_mcsquare_data() -> None:
@@ -61,8 +70,7 @@ def test_tables_match_mcsquare_data() -> None:
 
 
 def test_energy_ledger_closes(canvas) -> None:
-    case = mv.Case("ledger", "water", 4.0, ((0.0, 0.0, 150.0, 1.0),), wet=30)
-    _dose, _tex, res = mv.run_gpu(canvas, case, 100_000)
+    _dose_vol, res = _dose(canvas, "water", ((0.0, 0.0, 150.0, 1.0),), sigma=4.0, lateral=100, depth=180, wet=30.0)
     assert res.overflow == 0 and res.deepest >= 1
     assert abs(res.closure) < 1e-4
     assert res.ledger["incident"] == pytest.approx(150.0, rel=1e-3)
@@ -71,50 +79,36 @@ def test_energy_ledger_closes(canvas) -> None:
 
 
 def test_same_seed_is_bit_identical(canvas) -> None:
-    case = mv.Case("seed", "pmma", 3.0, ((0.0, 0.0, 100.0, 1.0),), lateral=40)
-    a, _, _ = mv.run_gpu(canvas, case, 50_000, seed=7)
-    b, _, _ = mv.run_gpu(canvas, case, 50_000, seed=7)
-    c, _, _ = mv.run_gpu(canvas, case, 50_000, seed=8)
+    spots = ((0.0, 0.0, 100.0, 1.0),)
+    a, _ = _dose(canvas, "pmma", spots, histories=50_000, depth=90, seed=7)
+    b, _ = _dose(canvas, "pmma", spots, histories=50_000, depth=90, seed=7)
+    c, _ = _dose(canvas, "pmma", spots, histories=50_000, depth=90, seed=8)
     assert a.max() > 0.0 and np.array_equal(a, b) and not np.array_equal(a, c)
 
 
-def _golden_params():
-    for path in GOLDENS:
-        marks = () if path.stem in QUICK else (pytest.mark.slow,)
-        yield pytest.param(path, id=path.stem, marks=marks)
+def test_spot_lands_where_planned(canvas) -> None:
+    vol, _ = _dose(canvas, "water", ((12.0, -7.0, 100.0, 1.0),), lateral=60, depth=90)
+    c = np.arange(60) + 0.5 - 30.0
+    px, py = vol.sum(axis=(0, 1)), vol.sum(axis=(0, 2))
+    x, y = (px * c).sum() / px.sum(), (py * c).sum() / py.sum()
+    assert x == pytest.approx(12.0, abs=0.3) and y == pytest.approx(-7.0, abs=0.3)
+    sx, sy = np.sqrt((px * (c - x) ** 2).sum() / px.sum()), np.sqrt((py * (c - y) ** 2).sum() / py.sum())
+    assert sx == pytest.approx(sy, rel=0.05)
 
 
-def _assert_close(ref: dict, gpu: dict, tol: dict) -> None:
-    diff = mv.compare(ref, gpu)
-    assert diff["idd"] <= tol["idd"], diff
-    assert abs(diff["r80"]) <= tol["r80"], diff
-    assert not diff["sigma"] > tol["sigma"], diff
-    assert abs(diff["energy"]) <= tol["energy"], diff
-
-
-GOLDEN_TOL = {"idd": 0.015, "r80": 0.3, "sigma": 0.03, "energy": 0.01}
-
-
-@pytest.mark.skipif(not GOLDENS, reason="no MCsquare goldens; run scripts/mcsquare_validate.py --write-goldens")
-@pytest.mark.parametrize("path", list(_golden_params()))
-def test_gpu_matches_mcsquare_golden(canvas, path) -> None:
-    with np.load(path) as g:
-        case = mv.Case(
-            path.stem, str(g["medium"]), float(g["sigma"]), tuple(map(tuple, g["spots"])),
-            int(g["wet"]), int(g["lateral"]),
-        )
-        assert case.depth == int(g["depth"]) and float(g["spread_pct"]) == mv.SPREAD_PCT
-        ref = {k: g[k] for k in ("idd", "r80", "r90", "sigma_depths", "sigmas", "energy")}
-    gpu_vol, _tex, _res = mv.run_gpu(canvas, case, HISTORIES)
-    _assert_close(ref, mv.summary(gpu_vol, case), GOLDEN_TOL)
-
-
-@pytest.mark.skipif(not os.environ.get("MCSQUARE_DIR"), reason="MCSQUARE_DIR not set")
-def test_gpu_matches_live_mcsquare(canvas, tmp_path) -> None:
-    case = mv.Case("live", "water", 4.0, ((0.0, 0.0, 120.0, 1.0),), lateral=80)
-    ref = mv.run_mcsquare(case, mv.mcsquare_exe(), HISTORIES, tmp_path)
-    gpu, _tex, _res = mv.run_gpu(canvas, case, HISTORIES)
-    _assert_close(mv.summary(ref, case), mv.summary(gpu, case), GOLDEN_TOL)
+def test_range_matches_its_own_stopping_powers(canvas) -> None:
+    t = load_tables()
+    m = list(t["media"]).index("water")
+    stop = t["m_stop"][m] * float(t["m_props"][m, 0]) / 1e6  # MeV/cm
+    fine = np.linspace(0.5, 150.0, 2000)
+    csda = np.trapezoid(1.0 / np.interp(fine, np.arange(stop.size) * 0.5, stop), fine) * 10.0
+    vol, _ = _dose(canvas, "water", ((0.0, 0.0, 150.0, 1.0),), depth=180)
+    idd = vol[::-1].sum(axis=(1, 2))
+    peak = int(np.argmax(idd))
+    level = 0.8 * idd[peak]
+    i = peak + int(np.argmax(idd[peak:] < level)) - 1
+    r80 = i + 0.5 + (idd[i] - level) / (idd[i] - idd[i + 1])
+    assert r80 == pytest.approx(csda, rel=0.01)
 
 
 def test_plan_vs_plan_monte_carlo_shares_random_numbers(canvas) -> None:
