@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import functools
+import hashlib
 import logging
 import math
+import time
 from dataclasses import dataclass
 
 import numpy as np
@@ -12,10 +14,15 @@ import numpy as np
 from .dose_volume_catalog import (
     DEFAULT_ERROR_SCALE,
     DEFAULT_GAIN,
+    DEFAULT_MC_HISTORIES,
     DEFAULT_RAY,
     field_edge_spec,
     DEFAULT_SCALE,
     ERROR_ABSOLUTE,
+    MC_MEDIA,
+    MC_SEED,
+    MODEL_ANALYTIC,
+    MODEL_MC,
     RAY_INTEGRAL,
     RAY_MAXIMUM,
     RAY_TRANSPARENT,
@@ -24,6 +31,7 @@ from .dose_volume_catalog import (
     WEIGHT_PROTONS,
     active_scale,
 )
+from .dose_mc import McRun, mc_note
 from .dose_volume_data import DepthAxis, SplatBatch, protons_from_mu
 from .dose_volume_fill import (
     GAMMA_CMAP,
@@ -59,6 +67,10 @@ from .dose_volume_raycast import (
 from .vispy_plot import bind_blender_view_keys
 
 _log = logging.getLogger(__name__)
+
+MC_PREVIEW_S = 0.25  # refining Monte Carlo redraws this often
+# Transport slice between frames: short while the view is being moved, long (full GPU) otherwise.
+MC_SLICE_S, MC_IDLE_SLICE_S = 0.012, 0.05
 
 
 @functools.cache
@@ -487,6 +499,17 @@ class DoseScene:
         # (passed, evaluated) voxels of the last γ map.
         self.gamma_pass: tuple[int, int] | None = None
         self._tex_shape: tuple[int, int, int] | None = None
+        # Per texture slot: (inputs key less histories, McRun) it holds, refining or finished.
+        # ponytail: a finished run keeps its GPU sums (4 floats a voxel) so more histories can resume it.
+        self._mc: dict[str, tuple] = {}
+        self._mc_preview_at = 0.0
+        self._mc_turn = -1
+        self._mc_redraw = False  # the next draw is a preview mc_step asked for
+        self._moved_at = 0.0  # last draw something else asked for
+        self._note_base = ""
+        # What render left for the finished volume: (grid, want γ, criteria, field-box source, field edge spec, show).
+        self._post: tuple | None = None
+        self._want_gamma = False
         self._has_volume = False
         self._broken = False
         self._gain = DEFAULT_GAIN
@@ -526,6 +549,22 @@ class DoseScene:
     def gamma(self) -> bool:
         """True when the volume shows the γ map."""
         return self._gamma
+
+    @property
+    def mc_refining(self) -> bool:
+        """True while a Monte Carlo run is still filling the volume."""
+        return any(not run.done for _, run in self._mc.values())
+
+    @property
+    def mc_progress(self) -> float | None:
+        """Share of the refining Monte Carlo transported, or None when nothing is refining."""
+        live = [run.progress for _, run in self._mc.values() if not run.done]
+        return min(live) if live else None
+
+    @property
+    def gamma_pending(self) -> bool:
+        """True when γ waits for a refining Monte Carlo run."""
+        return self._want_gamma and self.mc_refining
 
     def _scale_name(self) -> str:
         return GAMMA_CMAP if self._gamma else active_scale(self._difference, self._scale)
@@ -685,10 +724,129 @@ class DoseScene:
             return
         self._canvas.set_current()
         self._tex_shape = key
+        self._mc_drop()
         self._meas_tex = _alloc_texture(key)
         self._plan_tex = _alloc_texture(key)
         self._gamma_tex = _alloc_texture(key)
         self._box.set_volumes(self._meas_tex, self._plan_tex)
+
+    def _mc_start(self, slot, tex, batch, grid, medium_key, *, depth, wet, spread_pct, histories, ic_gap_mm):
+        """Start filling *tex* with *batch* by Monte Carlo, or retarget the run it holds for the same inputs.
+
+        Returns the McResult when the texture already holds the finished run, else None.
+        """
+        if medium_key not in MC_MEDIA:
+            raise ValueError(f"no MCsquare material data for {medium_key!r}")
+        protons = deposit_amounts(batch, WEIGHT_DOSE, ic_gap_mm)
+        c = np.asarray(batch.center, dtype=float)
+        s = np.asarray(batch.sigma, dtype=float)
+        e = np.asarray(batch.energy_mev, dtype=float)
+        digest = hashlib.sha1()
+        for a in (c[:, 0:2], s[:, 0:2], e, protons):
+            digest.update(np.ascontiguousarray(a, dtype=np.float64).tobytes())
+        key = (
+            digest.hexdigest(), tuple(float(v) for v in grid.origin), tuple(grid.shape), float(grid.voxel),
+            medium_key, float(depth), float(wet), float(spread_pct), MC_SEED,
+        )
+        held = self._mc.get(slot)
+        if held is not None and held[0] == key and held[1].extend(histories):
+            run = held[1]
+        else:
+            self._mc_drop(slot)
+            run = McRun(
+                self._canvas, tex, c[:, 0], c[:, 1], s[:, 0], s[:, 1], e, protons, medium_key, grid,
+                depth=depth, wet=wet, spread_pct=spread_pct, histories=histories, seed=MC_SEED,
+            )
+            self._mc[slot] = (key, run)
+        if run.done:
+            return run.result
+        self._mc_preview_at = 0.0
+        return None
+
+    def _mc_drop(self, slot: str | None = None) -> None:
+        """Free the run in *slot*, or all of them."""
+        for s in [slot] if slot is not None else list(self._mc):
+            held = self._mc.pop(s, None)
+            if held is not None:
+                held[1].close()
+
+    def _mc_stop(self) -> None:
+        """Drop the runs still refining; finished ones stay for reuse."""
+        for slot, (_key, run) in list(self._mc.items()):
+            if not run.done:
+                self._mc_drop(slot)
+
+    def _mc_progress_note(self) -> str:
+        return f" · MC {100.0 * self.mc_progress:.0f} %"
+
+    def mc_step(self, budget_s: float | None = None) -> bool:
+        """Advance one refining Monte Carlo run for about *budget_s*; True while any is still going.
+
+        Measured and plan take turns, so both previews stay at about the same progress.
+        By default the slice is short while the view is moving, so a drag keeps its frames.
+        """
+        pending = [run for _, run in self._mc.values() if not run.done]
+        if not pending:
+            return False
+        if budget_s is None:
+            moving = time.perf_counter() - self._moved_at < MC_PREVIEW_S
+            budget_s = MC_SLICE_S if moving else MC_IDLE_SLICE_S
+        self._mc_turn = (self._mc_turn + 1) % len(pending)
+        try:
+            pending[self._mc_turn].step(budget_s)
+        except Exception:
+            _log.warning("Monte Carlo dose unavailable", exc_info=True)
+            for slot in list(self._mc):
+                self._mc_drop(slot)
+                tex = self._meas_tex if slot == "meas" else self._plan_tex
+                tex.set_data(np.zeros(self._tex_shape, dtype=np.float32))
+            self._canvas.context.flush_commands()
+            self.volume_note = self._note_base + " · MC unavailable"
+            self._post = None
+            self._canvas.update()
+            return False
+        if not self.mc_refining:
+            first = self._mc.get("meas") or self._mc.get("plan")
+            self.volume_note = self._note_base + mc_note(first[1].result)
+            self._finish_volume()
+        elif time.perf_counter() >= self._mc_preview_at:
+            for run in pending:
+                run.preview()
+            self._mc_preview_at = time.perf_counter() + MC_PREVIEW_S
+            self.volume_note = self._note_base + self._mc_progress_note()
+        else:
+            return True
+        self._mc_redraw = True
+        self._canvas.update()
+        return self.mc_refining
+
+    def _finish_volume(self) -> None:
+        """γ and the field box, which need the finished dose."""
+        post, self._post = self._post, None
+        if post is None:
+            return
+        grid, want_gamma, crit, src, (fraction, per_slice), show_field = post
+        nx, ny, nz = grid.shape
+        if want_gamma:
+            self._gamma = True
+            self.gamma_pass = gamma_texture(
+                self._canvas, self._meas_tex, self._plan_tex, self._gamma_tex, grid, crit,
+            )
+            self._box.set_volumes(self._gamma_tex, self._plan_tex)
+            self._push_display()
+        try:
+            boxed = field_box(read_texture(self._canvas, src, (nz, ny, nx)), grid.origin, grid.voxel, fraction,
+                              per_slice=per_slice)
+        except Exception:
+            _log.debug("field box unavailable", exc_info=True)
+            boxed = None
+        if boxed is not None:
+            f_o, f_e = boxed
+            self.field_extent = (float(f_e[0]), float(f_e[1]), float(f_e[2]))
+            if show_field:
+                self._nodes.append(self._late_line(
+                    pos=box_edge_segments(f_o, f_e), connect="segments", color=FIELD_RGBA, width=1,
+                ))
 
     def _color_limits(self) -> tuple[float, float]:
         if self._gamma:
@@ -762,6 +920,8 @@ class DoseScene:
         show_phantom: bool = False,
         show_field: bool = True,
         status: str | None = None,
+        model: str = MODEL_ANALYTIC,
+        mc_histories: int = DEFAULT_MC_HISTORIES,
     ) -> None:
         from vispy import scene
 
@@ -783,8 +943,11 @@ class DoseScene:
         self.auto_hi = None
         self._box.set_interp(interp)
         self._bounds = None
+        self._post = None
+        self._want_gamma = False
 
         if status:
+            self._mc_stop()
             text = scene.Text(
                 status, color=self._ink, font_size=14, pos=(0.0, 0.0, 0.0), parent=self._view.scene,
             )
@@ -794,6 +957,7 @@ class DoseScene:
 
         batches = [b for b in (measured, plan) if b is not None and b.center.size]
         if not batches:
+            self._mc_stop()
             text = scene.Text(
                 "No dose samples for this mode",
                 color=self._ink, font_size=14, pos=(0.0, 0.0, 0.0), parent=self._view.scene,
@@ -875,16 +1039,44 @@ class DoseScene:
         self._ensure_textures((nz, ny, nx))
         empty = (np.zeros((0, 3)), np.zeros((0, 3)), np.zeros(0), np.zeros(0))
         gpu = True
+        mc = dose and model == MODEL_MC
+        mc_result = None
+        mc_failed = False
         peak_w, peak_s, peak_e = np.zeros(0), np.zeros((0, 3)), np.zeros(0)
-        for tex, prep in ((self._meas_tex, meas), (self._plan_tex, planned)):
+        slots = (("meas", self._meas_tex, meas, measured), ("plan", self._plan_tex, planned, plan))
+        for slot, tex, prep, raw in slots:
+            if prep is None or not mc:
+                self._mc_drop(slot)
             if prep is None:
                 fill_texture(self._canvas, tex, *empty, kernel, grid)
                 continue
             center, sigma, amounts, e = prep[:4]
-            gpu = fill_texture(self._canvas, tex, center, sigma, amounts, e, kernel, grid) and gpu
             peak_w, peak_s, peak_e = amounts, np.array(sigma, dtype=float), e
+            if not mc:
+                gpu = fill_texture(self._canvas, tex, center, sigma, amounts, e, kernel, grid) and gpu
+                continue
+            try:
+                result = self._mc_start(
+                    slot, tex, raw, grid, medium_key, depth=depth, wet=wet, spread_pct=smear,
+                    histories=mc_histories, ic_gap_mm=ic_gap_mm,
+                )
+                mc_result = mc_result or result
+            except Exception:
+                _log.warning("Monte Carlo dose unavailable", exc_info=True)
+                self._mc_drop(slot)
+                tex.set_data(np.zeros((nz, ny, nx), dtype=np.float32))
+                self._canvas.context.flush_commands()
+                mc_failed = True
         if planned is None:
             self._difference = False
+        if mc_failed:
+            self._mc_stop()
+            self.volume_note += " · MC unavailable"
+        self._note_base = self.volume_note
+        if self.mc_refining:
+            self.volume_note += self._mc_progress_note()
+        elif mc_result is not None:
+            self.volume_note += mc_note(mc_result)
         if not gpu:
             self.volume_note += " · CPU fill"
         if dose and peak_w.size:
@@ -893,16 +1085,14 @@ class DoseScene:
         self.dose_peak = self._typical
         self.ray_peak = typical_ray(peak_w, peak_s)
 
-        self._gamma = bool(gamma) and meas is not None and planned is not None
+        self._want_gamma = bool(gamma) and meas is not None and planned is not None
+        self._gamma = False
         self.gamma_pass = None
-        if self._gamma:
-            crit = gamma_criteria or GammaCriteria()
+        crit = gamma_criteria or GammaCriteria()
+        if self._want_gamma:
             self._gamma_cap = crit.cap
-            self.gamma_pass = gamma_texture(
-                self._canvas, self._meas_tex, self._plan_tex, self._gamma_tex, grid, crit,
-            )
             self._difference = False
-        self._box.set_volumes(self._gamma_tex if self._gamma else self._meas_tex, self._plan_tex)
+        self._box.set_volumes(self._meas_tex, self._plan_tex)
         self._box.set_box(grid.origin, grid.shape, grid.voxel)
         self._scale = active_scale(self._difference, self._scale)
         self._push_display()
@@ -912,21 +1102,9 @@ class DoseScene:
         self._add_bounds(grid.origin, grid.extent_mm)
         self._add_axes(axis, grid.origin, grid.extent_mm)
         src = self._plan_tex if from_plan else self._meas_tex if meas is not None else self._plan_tex
-        try:
-            boxed = field_box(
-                read_texture(self._canvas, src, (nz, ny, nx)), grid.origin, grid.voxel,
-                fraction, per_slice=per_slice,
-            )
-        except Exception:
-            _log.debug("field box unavailable", exc_info=True)
-            boxed = None
-        if boxed is not None:
-            f_o, f_e = boxed
-            self.field_extent = (float(f_e[0]), float(f_e[1]), float(f_e[2]))
-            if show_field:
-                self._nodes.append(self._late_line(
-                    pos=box_edge_segments(f_o, f_e), connect="segments", color=FIELD_RGBA, width=1,
-                ))
+        self._post = (grid, self._want_gamma, crit, src, (fraction, per_slice), show_field)
+        if not self.mc_refining:
+            self._finish_volume()
         if depth:
             p_o, p_e = phantom_box(grid.origin, grid.extent_mm, depth)
             if show_phantom:
@@ -1009,6 +1187,10 @@ class DoseScene:
     def _on_draw(self, event) -> None:
         from vispy.scene import SceneCanvas
 
+        if self._mc_redraw:
+            self._mc_redraw = False
+        else:
+            self._moved_at = time.perf_counter()
         marching = self._has_volume and not self._broken
         for line in self._late:
             line.held = marching

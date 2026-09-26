@@ -96,6 +96,18 @@ WEIGHT_PROTONS = "protons"
 WeightKind = Literal["dose", "mu", "protons"]
 DEFAULT_WEIGHT = WEIGHT_DOSE
 
+# Dose model. Analytic is the fast preview; Monte Carlo is the GPU port of MCsquare.
+MODEL_ANALYTIC = "analytic"
+MODEL_MC = "mc"
+ModelKind = Literal["analytic", "mc"]
+DEFAULT_MODEL = MODEL_ANALYTIC
+# Media MCsquare ships material data for (see scan_kit/assets/mc_materials.npz).
+MC_MEDIA = (MEDIUM_WATER, MEDIUM_PMMA, MEDIUM_POLYSTYRENE, MEDIUM_ALUMINUM, MEDIUM_COPPER)
+MC_HISTORIES = (1_000_000, 3_000_000, 10_000_000, 50_000_000)
+DEFAULT_MC_HISTORIES = 10_000_000
+# Measured and plan share this seed, so their noise cancels in a difference.
+MC_SEED = 1
+
 # Global 3D gamma (AAPM TG-218 defaults): measured is the reference, plan is searched.
 DEFAULT_GAMMA_DOSE_PCT = 3.0
 DEFAULT_GAMMA_DTA_MM = 2.0
@@ -219,6 +231,8 @@ class DoseVolumeConfig:
     error_mode: ErrorKind = DEFAULT_ERROR_MODE
     error_scale: float = DEFAULT_ERROR_SCALE
     weight_mode: WeightKind = DEFAULT_WEIGHT
+    dose_model: ModelKind = DEFAULT_MODEL
+    mc_histories: int = DEFAULT_MC_HISTORIES
     ic_gap_mm: float = DEFAULT_IC_GAP_MM
     ray_mode: RayKind = DEFAULT_RAY
     scale: str = DEFAULT_SCALE

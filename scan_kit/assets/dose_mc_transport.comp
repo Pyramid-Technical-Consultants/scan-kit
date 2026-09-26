@@ -1,0 +1,576 @@
+#version 430
+// Proton transport ported from MCsquare (Universite catholique de Louvain, Apache-2.0;
+// see MCsquare_LICENSE.txt). Mirrors compute_hadron.c, compute_EM_interaction.c and
+// compute_nuclear_interaction.c with MCsquare's default build: Geant4 stopping powers,
+// PSTAR EM method, voxel-interface stepping, float32. Units are MCsquare's: eV and cm.
+// The host prepends #defines for the table layout (dose_mc.py: pack_tables).
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly buffer Spots { float spot[]; };  // x, y, sx, sy (cm), E, sE (MeV), cdf, pad
+layout(std430, binding = 1) readonly buffer Tables { float F[]; };
+layout(std430, binding = 2) readonly buffer Index { int I[]; };
+layout(std430, binding = 3) buffer TallyLo { uint tally_lo[]; };
+layout(std430, binding = 4) buffer TallyHi { uint tally_hi[]; };
+// Pairs (lo, hi): incident, grid, off-grid, leaked, lost. Then overflow count, deepest stack.
+layout(std430, binding = 5) buffer Ledger { uint ledger[]; };
+
+uniform vec3 u_origin;
+uniform float u_voxel;
+uniform ivec3 u_dims;
+uniform float u_depth;
+uniform float u_wet;
+uniform int u_medium;
+uniform int u_nspots;
+uniform uint u_hist_base;
+uniform uint u_nhist;
+uniform uint u_seed;
+
+#define PI 3.14159265358979
+#define R_ELEC 2.8179403e-13
+#define MC2_ELEC 0.5109989e6
+#define MC2_PRO 938.272046e6
+#define UAMU 931.46e6
+#define UMEV 1e6
+#define ECUT 0.5e6
+#define TE_MIN 0.05e6
+#define D_MAX 0.2
+#define EPS_MAX 0.25
+#define CONST_MS 18.3
+#define CONST_DERIV 0.99
+#define QUANTUM 100.0
+#define STACK 16
+#define TWO_PI_RE2_MC2 (2.0 * PI * R_ELEC * R_ELEC * MC2_ELEC)
+
+struct Particle {
+    vec3 x;
+    vec3 d;
+    float T;
+    float M;
+    float mass;
+    float charge;
+};
+
+Particle g_stack[STACK];
+int g_sp = 0;
+int g_deepest = 0;
+uint g_overflow = 0u;
+// Per-history ledger in quanta, flushed once at the end.
+int g_inc = 0, g_grid = 0, g_off = 0, g_leak = 0, g_lost = 0;
+
+// ---------------------------------------------------------------- random numbers
+// Counter-based (pcg4d), so a history's stream depends only on (seed, history).
+uvec4 g_key;
+uint g_ctr = 0u;
+uvec4 g_buf;
+int g_left = 0;
+
+uvec4 pcg4d(uvec4 v) {
+    v = v * 1664525u + 1013904223u;
+    v.x += v.y * v.w; v.y += v.z * v.x; v.z += v.x * v.y; v.w += v.y * v.z;
+    v ^= v >> 16u;
+    v.x += v.y * v.w; v.y += v.z * v.x; v.z += v.x * v.y; v.w += v.y * v.z;
+    return v;
+}
+
+// Uniform on (0, 1]: log() below never sees 0.
+float urand() {
+    if (g_left == 0) {
+        g_buf = pcg4d(uvec4(g_key.x, g_key.y, g_ctr, g_key.z));
+        g_ctr += 1u;
+        g_left = 4;
+    }
+    g_left -= 1;
+    return float((g_buf[g_left] >> 8u) + 1u) * (1.0 / 16777216.0);
+}
+
+float gauss() {
+    return sqrt(-2.0 * log(urand())) * cos(2.0 * PI * urand());
+}
+
+int quanta(float e_ev) {
+    return int(floor(e_ev / QUANTUM + urand() - 1e-7));
+}
+
+void add64(uint slot_lo, uint slot_hi, int v, bool tally) {
+    uint lo = uint(v);
+    uint hi = v < 0 ? 0xFFFFFFFFu : 0u;
+    if (tally) {
+        uint old = atomicAdd(tally_lo[slot_lo], lo);
+        if (old + lo < old) hi += 1u;
+        if (hi != 0u) atomicAdd(tally_hi[slot_hi], hi);
+    } else {
+        uint old = atomicAdd(ledger[slot_lo], lo);
+        if (old + lo < old) hi += 1u;
+        if (hi != 0u) atomicAdd(ledger[slot_hi], hi);
+    }
+}
+
+// ---------------------------------------------------------------- geometry
+// -1 outside, 0 entrance WET slab (water, not scored), 1 phantom.
+int region(float z) {
+    if (z <= 0.0 && z >= -u_depth) return 1;
+    if (z > 0.0 && z <= u_wet) return 0;
+    return -1;
+}
+
+int medium_of(int reg) {
+    return reg == 1 ? u_medium : WATER_MEDIUM;
+}
+
+// Linear scoring index, or -1 outside the grid or the phantom.
+int cell(vec3 x, int reg) {
+    if (reg != 1) return -1;
+    ivec3 c = ivec3(floor((x - u_origin) / u_voxel));
+    if (any(lessThan(c, ivec3(0))) || any(greaterThanEqual(c, u_dims))) return -1;
+    return c.x + u_dims.x * (c.y + u_dims.y * c.z);
+}
+
+void deposit(int idx, float e_ev) {
+    if (e_ev == 0.0) return;
+    int q = quanta(e_ev);
+    if (q == 0) return;
+    if (idx >= 0) {
+        add64(uint(idx), uint(idx), q, true);
+        g_grid += q;
+    } else {
+        g_off += q;
+    }
+}
+
+float lattice_dist(float x, float o, float u) {
+    if (abs(u) < 1e-12) return 1e30;
+    float f = (x - o) / u_voxel;
+    return abs(((floor(f) + (u > 0.0 ? 1.0 : 0.0)) * u_voxel + o - x) / u);
+}
+
+float plane_dist(float z, float w, float p) {
+    float d = (p - z) / w;
+    return d > 0.0 ? d : 1e30;
+}
+
+// Dist_To_Interface: next scoring-voxel face, or a phantom/WET plane.
+float dist_to_interface(vec3 x, vec3 d) {
+    float s = min(lattice_dist(x.x, u_origin.x, d.x), min(lattice_dist(x.y, u_origin.y, d.y), lattice_dist(x.z, u_origin.z, d.z)));
+    if (abs(d.z) >= 1e-12) {
+        s = min(s, plane_dist(x.z, d.z, 0.0));
+        s = min(s, plane_dist(x.z, d.z, -u_depth));
+        if (u_wet > 0.0) s = min(s, plane_dist(x.z, d.z, u_wet));
+    }
+    return s < 1e-3 ? s + 2e-4 : s + 5e-5;
+}
+
+// ---------------------------------------------------------------- tables
+int mbase(int m) { return M_BASE + m * M_STRIDE; }
+
+float lerp(float x, float x1, float x2, float y1, float y2) {
+    return ((y2 - y1) / (x2 - x1)) * (x - x1) + y1;
+}
+
+// MCsquare Binary_Search over F[base .. base+n): largest i with F[i] < v, or -1.
+int bsearch(float v, int base, int n) {
+    if (n <= 1) return -1;
+    int i = -1, j = n;
+    while (j - i > 1) {
+        int k = (i + j) / 2;
+        if (F[base + k] < v) i = k; else j = k;
+    }
+    return i;
+}
+
+// Update_Hadron: (E, gamma, beta2, Te_max).
+vec4 kin(float T, float mass) {
+    float mM = mass * MC2_PRO;
+    float E = T + mM;
+    float g = E / mM;
+    float b2 = 1.0 - 1.0 / (g * g);
+    float te = (2.0 * MC2_ELEC * mM * mM * (g * g - 1.0)) / (mM * mM + 2.0 * MC2_ELEC * g * mM + MC2_ELEC * MC2_ELEC);
+    return vec4(E, g, b2, te);
+}
+
+// Total_Stop_Pow: eV cm^2/g at T/mass on 0.5 MeV bins.
+float stop_pow(int mb, float T, float mass) {
+    float s = T / mass;
+    int i = clamp(int(floor(s / (0.5 * UMEV))), 0, STOP_BINS - 2);
+    return lerp(s, float(i) * 0.5 * UMEV, float(i + 1) * 0.5 * UMEV, F[mb + M_STOP + i], F[mb + M_STOP + i + 1]);
+}
+
+float sigma_ion(float nel, float z2, vec4 k) {
+    if (k.w <= TE_MIN) return 0.0;
+    return TWO_PI_RE2_MC2 * nel * z2
+        * ((1.0 / TE_MIN - 1.0 / k.w) - (k.z / k.w) * log(k.w / TE_MIN) + (k.w - TE_MIN) / (2.0 * k.x * k.x))
+        / k.z;
+}
+
+// total_Nuclear_cross_section, 1/cm.
+float sigma_nuc(int mb, float T, float rho) {
+    int i = int(floor(T / UMEV));
+    float T1 = float(i) * UMEV;
+    float T2 = float(i + 1) * UMEV;
+    // MCsquare quirk: tables stop at 250 MeV and the index wraps to 0 above 249.
+    if (i >= 249) i = 0;
+    return lerp(T, T1, T2, F[mb + M_NUC + i], F[mb + M_NUC + i + 1]) * rho;
+}
+
+float compute_L(int mb, float nel, float rho, float z2, float T, float mass, vec4 k) {
+    float m = 0.0;
+    if (k.w > TE_MIN) {
+        m = (TWO_PI_RE2_MC2 * nel * z2 / k.z)
+            * (log(k.w / TE_MIN) - (k.w - TE_MIN) * k.z / k.w + (k.w * k.w - TE_MIN * TE_MIN) / (4.0 * k.x * k.x));
+    }
+    return rho * z2 * stop_pow(mb, T, mass) - m;
+}
+
+float compute_dE2(int mb, float nel, float rho, float z2, float T, float mass, vec4 k, float s) {
+    float L = compute_L(mb, nel, rho, z2, T, mass, k);
+    float dE1 = L * s;
+    float tau1 = T / MC2_PRO;
+    float e1 = dE1 / T;
+    float C = L * k.z;
+    float T2 = T * CONST_DERIV;
+    vec4 k2 = kin(T2, mass);
+    float C2 = compute_L(mb, nel, rho, z2, T2, mass, k2) * k2.z;
+    float b = T * ((C2 - C) / (T2 - T)) / C;
+    float a1 = (1.0 + tau1) * (2.0 + tau1);
+    return dE1 * (1.0 + e1 / a1 + e1 * e1 * (2.0 + 2.0 * tau1 + tau1 * tau1) / (a1 * a1)
+                  - b * e1 * (0.5 + 2.0 * e1 / (3.0 * a1) + (1.0 - b) * e1 / 6.0));
+}
+
+// Update_direction, verbatim.
+vec3 rotate(vec3 d, float theta, float phi) {
+    float cT = cos(theta), sT = sin(theta), cP = cos(phi), sP = sin(phi);
+    vec3 o;
+    if (abs(d.z) < 0.999999) {
+        float r = sqrt(1.0 - d.z * d.z);
+        o.x = d.x * cT + (sT / r) * (d.x * d.z * cP - d.y * sP);
+        o.y = d.y * cT + (sT / r) * (d.y * d.z * cP + d.x * sP);
+        o.z = d.z * cT - r * sT * cP;
+    } else {
+        o.y = sT * sP;
+        if (d.z > 0.0) { o.x = sT * cP; o.z = cT; }
+        else { o.x = -sT * cP; o.z = -cT; }
+    }
+    return o / length(o);
+}
+
+// Compute_Ionization_Energy.
+float ionization_energy(vec4 k) {
+    if (k.w < TE_MIN) return 0.0;
+    for (int n = 0; n < 1000; n++) {
+        float r = urand();
+        float te = (TE_MIN * k.w) / ((1.0 - r) * k.w + r * TE_MIN);
+        float g = 1.0 - k.z * (te / k.w) + te * te / (2.0 * k.x * k.x);
+        if (urand() <= g) return te;
+    }
+    return 0.0;
+}
+
+// ---------------------------------------------------------------- nuclear
+float pp_sigma(float e_mev) {
+    return (0.315 * pow(e_mev, -1.126) + 3.78e-6 * e_mev) / 0.1119;
+}
+
+bool push(Particle s) {
+    if (g_sp >= STACK) {
+        g_overflow += 1u;
+        return false;
+    }
+    g_stack[g_sp] = s;
+    g_sp += 1;
+    g_deepest = max(g_deepest, g_sp);
+    return true;
+}
+
+// Compute_Elastic_PP. Returns energy deposited locally (unweighted).
+float elastic_pp(inout Particle p) {
+    float c = 2.0 * urand() - 1.0;
+    float dE = p.T * (1.0 - c) / 2.0;
+    float k = 1.0 - p.T / (p.T + 2.0 * MC2_PRO);
+    float theta = acos((c + 1.0) / max(sqrt((c + 1.0) * (c + 1.0) + k * (1.0 - c * c)), 1e-30));
+    float phi = 2.0 * PI * urand();
+    float s_theta = acos((1.0 - c) / max(sqrt((1.0 - c) * (1.0 - c) + k * (1.0 - c * c)), 1e-30));
+    float s_phi = phi > PI ? phi - PI : phi + PI;
+    Particle s = Particle(p.x, rotate(p.d, s_theta, s_phi), dE, p.M, 1.0, 1.0);
+    p.d = rotate(p.d, theta, phi);
+    p.T -= dE;
+    if (dE < ECUT) return dE;
+    if (!push(s)) return dE;
+    return 0.0;
+}
+
+// Compute_Elastic_ICRU for element e.
+float elastic_icru(int e, inout Particle p) {
+    int eb = I_EL + 5 * e;
+    int base = I[eb + 1], n = I[eb + 2];
+    float E = p.T / UMEV;
+    int idx = bsearch(E, F_ELE + base, n);
+    float E1 = F[F_ELE + base + idx], E2 = F[F_ELE + base + idx + 1];
+    int c1 = F_ELC + 36 * (base + idx), c2 = c1 + 36;
+    float top = lerp(E, E1, E2, F[c1 + 35], F[c2 + 35]);
+    float r = urand() * top;
+    int i = 0;
+    while (i < 36 && r > lerp(E, E1, E2, F[c1 + i], F[c2 + i])) i++;
+    // Sequential_Search + 1 is the first bin whose CDF reaches r.
+    float cos_cm;
+    // Bin edges exactly as MCsquare has them, including its bin 0 and bin 35 ranges.
+    if (i == 0) cos_cm = cos(5.0 * PI / 180.0) + urand() * (cos(7.5 * PI / 180.0) - cos(5.0 * PI / 180.0));
+    else if (i >= 35) cos_cm = cos(175.5 * PI / 180.0) + urand() * (cos(PI) - cos(177.5 * PI / 180.0));
+    else {
+        float lo = (float(i + 1) * 5.0 - 2.5) * PI / 180.0, hi = (float(i + 1) * 5.0 + 2.5) * PI / 180.0;
+        cos_cm = cos(lo) + urand() * (cos(hi) - cos(lo));
+    }
+    float A = F[F_EA + e];
+    float den = p.T + MC2_PRO + A * UAMU;
+    float b2 = (p.T * (p.T + 2.0 * MC2_PRO)) / (den * den);
+    float g2 = 1.0 / (1.0 - b2);
+    float ratio = MC2_PRO / (A * UAMU);
+    float tau = sqrt(ratio * ratio * (1.0 - b2) + b2);
+    float theta = acos((cos_cm + tau) / sqrt((cos_cm + tau) * (cos_cm + tau) + (1.0 - cos_cm * cos_cm) / g2));
+    p.d = rotate(p.d, theta, 2.0 * PI * urand());
+    float dE = g2 * b2 * A * UAMU * (1.0 - cos_cm);
+    p.T -= dE;
+    return dE;
+}
+
+// Cumulative secondary-energy CDF at row i, interpolated between incident energies.
+float cum_d(int r0, int r1, int i, float E, float Ek0, float Ek1) {
+    return lerp(E, Ek0, Ek1, F[F_SD + r0 + i], F[F_SD + r1 + i]);
+}
+
+// Compute_Nuclear_Inelastic_{proton,deuteron,alpha} + recoils; kills the primary.
+float inelastic(int e, int idx, inout Particle p, inout float pushed) {
+    int k0 = I[I_EL + 5 * e + 3] + idx;
+    int k1 = k0 + 1;
+    float E = p.T / UMEV;
+    float Ek0 = F[F_INE + k0], Ek1 = F[F_INE + k1];
+    float dE = 0.0;
+    for (int s = 0; s < 3; s++) {
+        float m0 = F[F_INM + 3 * k0 + s], m1 = F[F_INM + 3 * k1 + s];
+        if (m0 == 0.0 || m1 == 0.0) continue;
+        float Ms = p.M * lerp(E, Ek0, Ek1, m0, m1);
+        int n = I[I_RN + 3 * k0 + s];
+        int r0 = I[I_RS + 3 * k0 + s], r1 = I[I_RS + 3 * k1 + s];
+        float total = cum_d(r0, r1, n - 1, E, Ek0, Ek1);
+        if (!(total > 0.0)) continue;
+        float r = urand() * total;
+        int lo = -1, hi = n;
+        while (hi - lo > 1) {
+            int mid = (lo + hi) / 2;
+            if (cum_d(r0, r1, mid, E, Ek0, Ek1) < r) lo = mid; else hi = mid;
+        }
+        int si = clamp(lo, 0, n - 2);
+        float ca = cum_d(r0, r1, si, E, Ek0, Ek1), cb = cum_d(r0, r1, si + 1, E, Ek0, Ek1);
+        float ea = F[F_SE + r0 + si], eb = F[F_SE + r0 + si + 1];
+        float Ts = lerp(r, ca, cb, ea, eb);
+        Ts = (E / Ek0) * UMEV * Ts;
+        if (!(Ts >= ECUT)) {
+            dE += Ms * Ts / p.M;
+            continue;
+        }
+        float phi = 2.0 * PI * urand();
+        float dd[13];
+        for (int j = 0; j < 13; j++) {
+            float d1 = lerp(E, Ek0, Ek1, F[F_SDD + 13 * (r0 + si) + j], F[F_SDD + 13 * (r1 + si) + j]);
+            float d2 = lerp(E, Ek0, Ek1, F[F_SDD + 13 * (r0 + si + 1) + j], F[F_SDD + 13 * (r1 + si + 1) + j]);
+            // Matches MCsquare: Ts is in eV here while the row energies are in MeV.
+            dd[j] = lerp(Ts, ea, eb, d1, d2);
+        }
+        float ra = urand() * dd[12];
+        int alo = -1, ahi = 13;
+        while (ahi - alo > 1) {
+            int mid = (alo + ahi) / 2;
+            if (dd[mid] < ra) alo = mid; else ahi = mid;
+        }
+        int ai = alo + 1;
+        float theta;
+        const float ang[13] = float[13](0.0, 10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 90.0, 110.0, 130.0, 150.0, 180.0);
+        if (ai == 0) theta = acos(1.0 + urand() * (cos(5.0 * PI / 180.0) - 1.0));
+        else if (ai == 12) theta = acos(cos(165.0 * PI / 180.0) + urand() * (-1.0 - cos(165.0 * PI / 180.0)));
+        // MCsquare reads ICRU_angles[13] and [14] past the array; every build has zero
+        // padding there, which makes this bin isotropic over the forward hemisphere.
+        else if (ai == 13) theta = acos(urand());
+        else {
+            float c1 = cos((ang[ai - 1] + ang[ai]) * PI / 360.0), c2 = cos((ang[ai] + ang[ai + 1]) * PI / 360.0);
+            theta = acos(c1 + urand() * (c2 - c1));
+        }
+        float mass = s == 0 ? 1.0 : (s == 1 ? 2.0 : 4.0);
+        float charge = s == 2 ? 2.0 : 1.0;
+        if (push(Particle(p.x, rotate(p.d, theta, phi), Ts, Ms, mass, charge))) pushed += Ms * Ts;
+        else dE += Ms * Ts / p.M;
+    }
+    dE += p.T * lerp(E, Ek0, Ek1, F[F_INR + k0], F[F_INR + k1]);
+    return dE;
+}
+
+// Compute_Nuclear_interaction. Sets alive = false on an inelastic event and
+// reports the weighted energy that leaves as neutrals and gammas in lost.
+float nuclear(int m, inout Particle p, inout bool alive, inout float lost) {
+    int mb = mbase(m);
+    int mtype = I[I_M + 6 * m], ncomp = I[I_M + 6 * m + 1];
+    float E = p.T / UMEV;
+    if (mtype == TYPE_ICRU) {
+        // MCsquare quirk: no ICRU nuclear interactions below 7 or above 249 MeV.
+        if (!(E > 7.0 && E < 249.0)) return 0.0;
+        int e = I[I_M + 6 * m + 2];
+        float r = urand();
+        int i = int(floor(E));
+        float total = lerp(E, float(i), float(i + 1), F[mb + M_NUC + i], F[mb + M_NUC + i + 1]);
+        int base = I[I_EL + 5 * e + 1];
+        int ie = bsearch(E, F_ELE + base, I[I_EL + 5 * e + 2]);
+        float el = lerp(E, F[F_ELE + base + ie], F[F_ELE + base + ie + 1], F[F_ELS + base + ie], F[F_ELS + base + ie + 1]);
+        if (r <= el / total) return elastic_icru(e, p);
+        int ib = I[I_EL + 5 * e + 3];
+        int ii = bsearch(E, F_INE + ib, I[I_EL + 5 * e + 4]);
+        float pushed = 0.0;
+        float before = p.M * p.T;
+        float dE = inelastic(e, ii, p, pushed);
+        lost += before - p.M * dE - pushed;
+        alive = false;
+        return dE;
+    }
+    int i = min(int(floor(E)), NUC_BINS - 2);
+    float total = lerp(E, float(i), float(i + 1), F[mb + M_NUC + i], F[mb + M_NUC + i + 1]);
+    float r = urand() * total;
+    float cs = 0.0;
+    for (int c = 0; c < ncomp; c++) {
+        int e = I[I_M + 6 * m + 2 + c];
+        float f = F[mb + M_FRAC + c];
+        if (I[I_EL + 5 * e] == TYPE_PP) {
+            // MCsquare quirk: no proton-proton elastic below 10 MeV.
+            if (E > 10.0) cs += f * pp_sigma(E);
+            if (r <= cs) return elastic_pp(p);
+        } else if (E > 7.0 && E < 249.0) {
+            int base = I[I_EL + 5 * e + 1];
+            int ie = bsearch(E, F_ELE + base, I[I_EL + 5 * e + 2]);
+            cs += f * lerp(E, F[F_ELE + base + ie], F[F_ELE + base + ie + 1], F[F_ELS + base + ie], F[F_ELS + base + ie + 1]);
+            if (r <= cs) return elastic_icru(e, p);
+            int ib = I[I_EL + 5 * e + 3];
+            int ii = bsearch(E, F_INE + ib, I[I_EL + 5 * e + 4]);
+            cs += f * lerp(E, F[F_INE + ib + ii], F[F_INE + ib + ii + 1], F[F_INS + ib + ii], F[F_INS + ib + ii + 1]);
+            if (r <= cs) {
+                float pushed = 0.0;
+                float before = p.M * p.T;
+                float dE = inelastic(e, ii, p, pushed);
+                lost += before - p.M * dE - pushed;
+                alive = false;
+                return dE;
+            }
+        }
+    }
+    return 0.0;
+}
+
+// ---------------------------------------------------------------- transport
+// hadron_step until the particle stops or leaves.
+void transport(Particle p) {
+    bool alive = p.T >= ECUT;
+    if (!alive) {
+        deposit(cell(p.x, region(p.x.z)), p.M * p.T);
+        return;
+    }
+    for (int guard = 0; guard < 100000 && alive; guard++) {
+        int reg = region(p.x.z);
+        int m = medium_of(reg);
+        int mb = mbase(m);
+        float rho = F[mb + M_RHO];
+        float nel = F[mb + M_NEL] * rho;
+        float z2 = p.charge * p.charge;
+        vec4 k = kin(p.T, p.mass);
+        float S = rho * z2 * stop_pow(mb, p.T, p.mass);
+        float step_max = min(min(dist_to_interface(p.x, p.d), D_MAX), EPS_MAX * p.T / S);
+        float dE_max = step_max * S;
+
+        // Total_Hard_Cross_Section
+        float sig = sigma_ion(nel, z2, k) + sigma_nuc(mb, p.T, rho);
+        float T2 = p.T - dE_max;
+        if (T2 <= 0.0) T2 = p.T;
+        vec4 k2 = kin(T2, p.mass);
+        sig = max(sig, sigma_ion(nel, z2, k2) + sigma_nuc(mb, T2, rho));
+        sig = (sig + 1e-10) * 1.017;
+
+        float step = -log(urand()) / sig;
+        if (step > step_max) step = step_max;
+        float mean_dE = compute_dE2(mb, nel, rho, z2, p.T, p.mass, k, step);
+        float strag = sqrt(TWO_PI_RE2_MC2 * nel * z2 * step * min(TE_MIN, k.w) * (1.0 - 0.5 * k.z) / k.z);
+        float dE = mean_dE + strag * gauss();
+        float X0 = F[mb + M_X0] / rho;
+        float theta = (CONST_MS * UMEV * p.charge / (k.z * k.y * MC2_PRO)) * sqrt(step / X0) * gauss();
+        float phi = 2.0 * PI * urand();
+
+        int hinge = cell(p.x, reg);
+        p.x += step * p.d;
+        if (p.T - dE <= ECUT) {
+            dE = p.T;
+            alive = false;
+        }
+        p.T -= dE;
+        deposit(hinge, p.M * dE);
+        if (!alive) break;
+
+        int reg2 = region(p.x.z);
+        p.d = rotate(p.d, theta, phi);
+        if (reg2 < 0) {
+            g_leak += quanta(p.M * p.T);
+            break;
+        }
+        k = kin(p.T, p.mass);
+
+        // get_interaction_type, with the start-of-step material and majorant.
+        int type = 0;
+        if (step != step_max) {
+            float r = urand();
+            float si = sigma_ion(nel, z2, k) / sig;
+            if (r <= si) type = 1;
+            else if (r <= si + sigma_nuc(mb, p.T, rho) / sig) type = 2;
+        }
+        float dEh = 0.0;
+        float lost = 0.0;
+        if (type == 1) {
+            dEh = ionization_energy(k);
+            p.T -= dEh;
+        } else if (type == 2) {
+            dEh = nuclear(m, p, alive, lost);
+            if (lost != 0.0) g_lost += quanta(lost);
+        }
+        if (alive && p.T <= ECUT) {
+            dEh += p.T;
+            p.T = 0.0;
+            alive = false;
+        }
+        deposit(cell(p.x, reg2), p.M * dEh);
+    }
+}
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= u_nhist) return;
+    uint h = u_hist_base + gid;
+    g_key = uvec4(h, u_seed, 0x9E3779B9u ^ (u_seed * 0x85EBCA6Bu), 0u);
+
+    // Spot from the proton CDF.
+    float u = urand();
+    int lo = -1, hi = u_nspots - 1;
+    while (hi - lo > 1) {
+        int mid = (lo + hi) / 2;
+        if (spot[8 * mid + 6] < u) lo = mid; else hi = mid;
+    }
+    int sp = 8 * hi;
+    float x = spot[sp] + spot[sp + 2] * gauss();
+    float y = spot[sp + 1] + spot[sp + 3] * gauss();
+    float e_mev = spot[sp + 4] + spot[sp + 5] * gauss();
+    Particle p = Particle(vec3(x, y, u_wet), vec3(0.0, 0.0, -1.0), max(e_mev, 0.0) * UMEV, 1.0, 1.0, 1.0);
+    g_inc = quanta(p.T);
+
+    transport(p);
+    for (int n = 0; n < 4096 && g_sp > 0; n++) {
+        g_sp -= 1;
+        transport(g_stack[g_sp]);
+    }
+
+    add64(0u, 1u, g_inc, false);
+    add64(2u, 3u, g_grid, false);
+    add64(4u, 5u, g_off, false);
+    add64(6u, 7u, g_leak, false);
+    add64(8u, 9u, g_lost, false);
+    if (g_overflow != 0u) atomicAdd(ledger[10], g_overflow);
+    atomicMax(ledger[11], uint(g_deepest));
+}

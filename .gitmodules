@@ -1,0 +1,3 @@
+[submodule "third_party/MCsquare"]
+	path = third_party/MCsquare
+	url = https://gitlab.com/openmcsquare/MCsquare.git
