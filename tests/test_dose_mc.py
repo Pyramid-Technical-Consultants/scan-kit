@@ -86,6 +86,29 @@ def test_same_seed_is_bit_identical(canvas) -> None:
     assert a.max() > 0.0 and np.array_equal(a, b) and not np.array_equal(a, c)
 
 
+def test_sliced_run_matches_one_shot(canvas) -> None:
+    from scan_kit.views.dose_mc import McRun
+    from scan_kit.views.dose_volume_fill import DoseGrid
+    from scan_kit.views.dose_volume_raycast import _alloc_texture, read_texture
+
+    spots = ((0.0, 0.0, 100.0, 1.0), (6.0, -4.0, 120.0, 2.0))
+    one, whole = _dose(canvas, "water", spots, depth=110, histories=60_000)
+    grid = DoseGrid(np.array([-20.0, -20.0, -110.0]), (40, 40, 110), False, 1.0)
+    tex = _alloc_texture((110, 40, 40))
+    x, y, e, w = (np.array(c, dtype=float) for c in zip(*spots))
+    run = McRun(
+        canvas, tex, x, y, np.full(2, 3.0), np.full(2, 3.0), e, w, "water", grid,
+        depth=110.0, wet=0.0, spread_pct=0.7, histories=60_000, seed=1,
+    )
+    run.step(1e-4)
+    run.preview()
+    partial = read_texture(canvas, tex, (110, 40, 40))
+    assert 0.0 < run.progress < 1.0 and partial.max() > 0.0
+    while not run.step(1e-4):
+        run.preview()
+    assert np.array_equal(read_texture(canvas, tex, (110, 40, 40)), one) and run.result == whole
+
+
 def test_spot_lands_where_planned(canvas) -> None:
     vol, _ = _dose(canvas, "water", ((12.0, -7.0, 100.0, 1.0),), lateral=60, depth=90)
     c = np.arange(60) + 0.5 - 30.0
@@ -131,6 +154,10 @@ def test_plan_vs_plan_monte_carlo_shares_random_numbers(canvas) -> None:
         plan, plan, range_axis_for_medium("water"), gain=1.0, gantry_deg=0.0, weight_mode=WEIGHT_DOSE,
         voxel_mm=2.0, gamma=True, model=MODEL_MC, mc_histories=100_000,
     )
+    assert scene.mc_refining and scene.gamma_pending and scene.gamma_pass is None
+    while scene.mc_step():
+        assert "MC" in scene.volume_note and "%" in scene.volume_note
+    assert not scene.gamma_pending and scene.gamma
     shape = tuple(scene._meas_tex.shape[:3])
     meas = read_texture(canvas, scene._meas_tex, shape)
     assert meas.max() > 0.0 and np.array_equal(meas, read_texture(canvas, scene._plan_tex, shape))

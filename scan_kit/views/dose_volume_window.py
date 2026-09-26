@@ -458,6 +458,10 @@ class DoseVolumeWindow(VispyViewWindow):
         self._refresh_timer.setSingleShot(True)
         self._refresh_timer.setInterval(60)
         self._refresh_timer.timeout.connect(self._start_refresh)
+        # Zero-interval ticks run between paint events, so the view stays live while MC refines.
+        self._mc_timer = QTimer(self)
+        self._mc_timer.setInterval(0)
+        self._mc_timer.timeout.connect(self._mc_tick)
 
         self._load_task = DebouncedBackgroundTask(debounce_ms=0, parent=self)
         self._load_task.finished.connect(self._on_load_finished)
@@ -514,7 +518,7 @@ class DoseVolumeWindow(VispyViewWindow):
         )
         self._model_combo.set_button_tooltips({
             MODEL_ANALYTIC: "Fast pencil-beam approximation.",
-            MODEL_MC: "GPU Monte Carlo ported from MCsquare. Runs on each refresh.",
+            MODEL_MC: "GPU Monte Carlo ported from MCsquare. Fills in progressively while the view stays live.",
         })
         self._model_combo.set_current(DEFAULT_MODEL)
         self._model_row = self._model_combo.parentWidget()
@@ -1355,6 +1359,10 @@ class DoseVolumeWindow(VispyViewWindow):
         self._on_controls_changed()
 
     def _show_gamma_verdict(self) -> None:
+        if self._scene.gamma_pending:
+            self._gamma_label.setText("Waiting for the Monte Carlo to finish")
+            self._gamma_label.setStyleSheet("")
+            return
         if not self._scene.gamma:
             self._gamma_label.setText(self._no_plan_reason() if self._gamma_mode() else "—")
             self._gamma_label.setStyleSheet("")
@@ -1489,12 +1497,11 @@ class DoseVolumeWindow(VispyViewWindow):
             model=config.dose_model,
             mc_histories=config.mc_histories,
         )
-        self._show_field_extent()
-        self._phantom_note.setText(self._scene.phantom_note or "—")
-        self._grid_label.setText(self._scene.volume_note or "—")
-        self._maybe_seed_absolute_window()
-        self._update_legend()
-        self._show_gamma_verdict()
+        self._show_scene_readouts()
+        if self._scene.mc_refining:
+            self._mc_timer.start()
+        else:
+            self._mc_timer.stop()
         n_meas = 0 if measured_batch is None else int(measured_batch.center.shape[0])
         spots = f"{n_meas:,}"
         if residual:
@@ -1504,6 +1511,21 @@ class DoseVolumeWindow(VispyViewWindow):
         if measured_batch is not None and not has_dose:
             spots += " · relative" if config.grain == GRAIN_TIMESLICE else " · plan MU"
         self._spots_label.setText(spots)
+
+    def _show_scene_readouts(self) -> None:
+        self._show_field_extent()
+        self._phantom_note.setText(self._scene.phantom_note or "—")
+        self._grid_label.setText(self._scene.volume_note or "—")
+        self._maybe_seed_absolute_window()
+        self._update_legend()
+        self._show_gamma_verdict()
+
+    def _mc_tick(self) -> None:
+        if self._scene.mc_step():
+            self._grid_label.setText(self._scene.volume_note or "—")
+            return
+        self._mc_timer.stop()
+        self._show_scene_readouts()
 
     def _show_field_extent(self) -> None:
         ext = getattr(self._scene, "field_extent", None)
