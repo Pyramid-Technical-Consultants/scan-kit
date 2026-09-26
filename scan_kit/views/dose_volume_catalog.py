@@ -15,13 +15,6 @@ XY_ISO_RAY = "iso_ray"
 XY_PLAN = "plan"
 XyMode = Literal["ic1", "ic2", "iso_ray", "plan"]
 
-# Plane the logged spot σ is drawn at. The volume sits at isocenter; projecting
-# scales σ by SAD / SDD like a position, exact only for a point-like virtual source.
-SIGMA_PLANE_CHAMBER = "chamber"
-SIGMA_PLANE_ISO = "iso"
-SigmaPlaneKind = Literal["chamber", "iso"]
-DEFAULT_SIGMA_PLANE = SIGMA_PLANE_CHAMBER
-
 # Where the plan's spot σ comes from. devices.xml holds the σ interlock's center,
 # not a beam model, so it is a last resort. Beam models from the SQL database are
 # meant to join this list.
@@ -207,7 +200,6 @@ class DoseVolumeConfig:
     grain: GrainKind = GRAIN_SPOT
     xy_mode: XyMode = XY_IC1
     overlay_plan: bool = False
-    sigma_plane: SigmaPlaneKind = DEFAULT_SIGMA_PLANE
     plan_sigma: PlanSigmaKind = DEFAULT_PLAN_SIGMA
     plan_sigma_ref: str = ""
     # Multiple Coulomb scattering in the phantom, applied to measured and plan alike.

@@ -65,7 +65,6 @@ from .dose_volume_catalog import (
     MEDIUM_POLYSTYRENE,
     MEDIUM_WATER,
     DEFAULT_PLAN_SIGMA,
-    DEFAULT_SIGMA_PLANE,
     PLAN_SIGMA_INTERLOCK,
     PLAN_SIGMA_MEASURED,
     PLAN_SIGMA_REFERENCE,
@@ -74,8 +73,6 @@ from .dose_volume_catalog import (
     RAY_INTEGRAL,
     RAY_MAXIMUM,
     RAY_TRANSPARENT,
-    SIGMA_PLANE_CHAMBER,
-    SIGMA_PLANE_ISO,
     WEIGHT_DOSE,
     WEIGHT_MU,
     WEIGHT_PROTONS,
@@ -552,6 +549,10 @@ class DoseVolumeWindow(VispyViewWindow):
         self._xy_combo = self._add_combo(
             beam_layout, "Position", _XY_ITEMS, self._on_controls_changed,
         )
+        self._xy_combo.setToolTip(
+            "IC1 and IC2 are the logged spot positions at isocenter. "
+            "ISO ray reconstructs isocenter from the two chambers."
+        )
         self._smear_spin = self._add_spin(
             beam_layout, "Energy spread", 0.0, 10.0, 0.1, DEFAULT_ENERGY_SPREAD_PCT,
             decimals=2,
@@ -560,16 +561,6 @@ class DoseVolumeWindow(VispyViewWindow):
         self._smear_spin.setToolTip(
             "Beam energy spread σE, percent of energy. Range straggle is added on top."
         )
-        self._plane_combo = self._add_segment(
-            beam_layout, "Plane",
-            ((SIGMA_PLANE_CHAMBER, "Chamber"), (SIGMA_PLANE_ISO, "Isocenter")),
-            self._on_controls_changed,
-        )
-        self._plane_combo.set_button_tooltips({
-            SIGMA_PLANE_CHAMBER: "Keep the measured spot σ at the chamber.",
-            SIGMA_PLANE_ISO: "Project spot σ to isocenter by SAD / SDD.",
-        })
-        self._plane_combo.set_current(DEFAULT_SIGMA_PLANE)
         self._plan_sigma_combo = self._add_segment(
             beam_layout, "Plan σ",
             (
@@ -580,9 +571,9 @@ class DoseVolumeWindow(VispyViewWindow):
             self._on_plan_sigma_changed,
         )
         self._plan_sigma_combo.set_button_tooltips({
-            PLAN_SIGMA_MEASURED: "This session's σ, one value per energy layer.",
-            PLAN_SIGMA_REFERENCE: "Per-layer σ from another loaded session.",
-            PLAN_SIGMA_INTERLOCK: "The interlock σ.",
+            PLAN_SIGMA_MEASURED: "This session's measured spot σ, one value per energy layer.",
+            PLAN_SIGMA_REFERENCE: "Measured per-layer σ from another loaded session.",
+            PLAN_SIGMA_INTERLOCK: "The interlock σ from devices.xml, in chamber mm.",
         })
         self._plan_sigma_combo.set_current(DEFAULT_PLAN_SIGMA)
         self._ref_combo = QComboBox()
@@ -1018,7 +1009,6 @@ class DoseVolumeWindow(VispyViewWindow):
             grain=self._choice(self._grain_combo),
             xy_mode=self._xy_combo.currentData(),
             overlay_plan=compare or gamma,
-            sigma_plane=self._choice(self._plane_combo),
             plan_sigma=self._choice(self._plan_sigma_combo),
             plan_sigma_ref=self._ref_combo.currentData() or "",
             scatter=self._scatter_check.isChecked(),
@@ -1061,7 +1051,6 @@ class DoseVolumeWindow(VispyViewWindow):
         try:
             self._set_combo(self._grain_combo, config.grain)
             self._set_combo(self._xy_combo, config.xy_mode)
-            self._set_combo(self._plane_combo, config.sigma_plane)
             self._set_combo(self._plan_sigma_combo, config.plan_sigma)
             self._ref_row.setVisible(config.plan_sigma == PLAN_SIGMA_REFERENCE)
             self._set_combo(self._ref_combo, config.plan_sigma_ref)

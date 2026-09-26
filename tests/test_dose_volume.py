@@ -390,33 +390,21 @@ def test_measured_cloud_plan_mode() -> None:
     assert cloud is plan
 
 
-def test_plan_sigma_sources_and_iso_plane() -> None:
+def test_plan_sigma_sources() -> None:
     from dataclasses import replace
 
-    from scan_kit.views.dose_volume_catalog import (
-        PLAN_SIGMA_INTERLOCK, PLAN_SIGMA_REFERENCE, SIGMA_PLANE_ISO,
-    )
+    from scan_kit.views.dose_volume_catalog import PLAN_SIGMA_INTERLOCK, PLAN_SIGMA_REFERENCE
     from scan_kit.views.dose_volume_data import plan_cloud
-
-    class _Geom:
-        def mag_factor(self, device):
-            return {"IC_1_X": 2.0, "IC_1_Y": 3.0, "IC_2_X": 1.5, "IC_2_Y": 1.5}[device]
 
     plan = SplatCloud(
         x=np.zeros(3), y=np.zeros(3), sx=np.full(3, 5.0), sy=np.full(3, 5.0),
         energy=np.array([70.0, 80.0, 75.0]), weight=np.ones(3),
     )
-    source = SessionSplatSource("s", iso=_frame(), chamber=None, plan=plan, n_raw=2, geom=_Geom())
-    iso = measured_cloud(source, XY_IC1, plane=SIGMA_PLANE_ISO)
-    np.testing.assert_allclose(iso.sx, [3.0, 3.2])
-    np.testing.assert_allclose(iso.sy, [5.1, 5.4])
-
+    source = SessionSplatSource("s", iso=_frame(), chamber=None, plan=plan, n_raw=2)
     config = SplatConfig()
     got = plan_cloud(source, config)
     np.testing.assert_allclose(got.sx, [1.5, 1.6, 1.55])
     np.testing.assert_allclose(got.sy, [1.7, 1.8, 1.75])
-    got = plan_cloud(source, replace(config, sigma_plane=SIGMA_PLANE_ISO))
-    np.testing.assert_allclose(got.sx, [3.0, 3.2, 3.1])
 
     wide = replace(_frame(), ic1_sx=np.array([4.0, 6.0]), ic1_sy=np.array([4.0, 6.0]))
     ref = SessionSplatSource("r", iso=wide, chamber=None, plan=None, n_raw=2)
@@ -425,9 +413,7 @@ def test_plan_sigma_sources_and_iso_plane() -> None:
 
     interlock = replace(config, plan_sigma=PLAN_SIGMA_INTERLOCK)
     np.testing.assert_allclose(plan_cloud(source, interlock).sx, 5.0)
-    got = plan_cloud(source, replace(interlock, sigma_plane=SIGMA_PLANE_ISO))
-    np.testing.assert_allclose(got.sx, 10.0)
-    np.testing.assert_allclose(got.sy, 15.0)
+    np.testing.assert_allclose(plan_cloud(source, interlock).sy, 5.0)
 
 
 def test_difference_scale_cannot_stay_sequential() -> None:
@@ -688,7 +674,7 @@ def test_dose_volume_window_opens_with_absolute_scale(qapp, tmp_path) -> None:
         ]
         assert [group_of(w) for w in (window._medium_combo, window._margin_spin, window._wet_spin)] == ["Phantom"] * 3
         assert [group_of(w) for w in (window._weight_combo, window._voxel_spin)] == ["Compare", "View"]
-        assert [group_of(w) for w in (window._plane_combo, window._plan_sigma_combo)] == ["Beam"] * 2
+        assert group_of(window._plan_sigma_combo) == "Beam"
         assert [group_of(w) for w in (window._grid_label, window._spots_label)] == ["View"] * 2
         assert group_of(window._scatter_check) == "Beam"
         assert not window._margin_row.isHidden() and not window._gap_row.isHidden()

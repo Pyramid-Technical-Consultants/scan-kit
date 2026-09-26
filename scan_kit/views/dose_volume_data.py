@@ -49,8 +49,6 @@ from .dose_volume_catalog import (
     GRAIN_TIMESLICE,
     PLAN_SIGMA_INTERLOCK,
     PLAN_SIGMA_REFERENCE,
-    SIGMA_PLANE_CHAMBER,
-    SIGMA_PLANE_ISO,
     XY_IC1,
     XY_IC2,
     XY_ISO_RAY,
@@ -467,31 +465,6 @@ def resolve_iso_z_mm(
     return IC1_Z_MM
 
 
-def iso_sigma_scale(geom: Map2MapGeometry | None, t: float, axis: str = "X") -> float:
-    """Chamber-to-isocenter σ scale on the IC2→IC1 ray at *t* (0 at IC2, 1 at IC1)."""
-    # ponytail: linear interpolate chamber mag; magnet-pivot drift is the upgrade.
-    if geom is None:
-        return 1.0
-    m1 = geom.mag_factor(f"IC_1_{axis}")
-    m2 = geom.mag_factor(f"IC_2_{axis}")
-    if m1 is None and m2 is None:
-        return 1.0
-    a = float(m2) if m2 is not None else 1.0
-    b = float(m1) if m1 is not None else 1.0
-    return (1.0 - t) * a + t * b
-
-
-def _to_plane(cloud: SplatCloud, geom: Map2MapGeometry | None, t: float, plane: str) -> SplatCloud:
-    """Chamber-mm σ of *cloud* drawn at *plane*; *t* places it on the IC2→IC1 ray."""
-    if plane != SIGMA_PLANE_ISO:
-        return cloud
-    return replace(
-        cloud,
-        sx=cloud.sx * iso_sigma_scale(geom, t, "X"),
-        sy=cloud.sy * iso_sigma_scale(geom, t, "Y"),
-    )
-
-
 def layer_sigmas(cloud: SplatCloud, energy: np.ndarray) -> tuple[np.ndarray, np.ndarray] | None:
     """Median σ of each energy layer in *cloud*, interpolated to *energy*."""
     # ponytail: flat beyond the cloud's energies; a σ(E) beam model is the upgrade.
@@ -872,7 +845,6 @@ def _lerp_sigma(near: np.ndarray, far: np.ndarray, t: float) -> np.ndarray:
 def _iso_ray_cloud(
     frame: PositionSigmaFrame,
     geom: Map2MapGeometry | None,
-    plane: str = SIGMA_PLANE_CHAMBER,
 ) -> SplatCloud:
     off2x, off1x = ic_alignment_offsets(frame.ic2_x, frame.ic1_x)
     off2y, off1y = ic_alignment_offsets(frame.ic2_y, frame.ic1_y)
@@ -898,27 +870,25 @@ def _iso_ray_cloud(
         x=x, y=y, sx=sx, sy=sy, energy=frame.energy, weight=frame.weight,
         dose=_frame_dose(frame, "iso"),
     )
-    return _to_plane(cloud, geom, t, plane)
+    return cloud
 
 
 def measured_cloud(
     source: SessionSplatSource,
     xy_mode: str,
     base_dir: str = "",
-    plane: str = SIGMA_PLANE_CHAMBER,
 ) -> SplatCloud | None:
     if xy_mode == XY_PLAN:
         cloud = source.plan
     elif xy_mode == XY_ISO_RAY:
         frame = source.chamber if source.chamber is not None else source.iso
-        cloud = None if frame is None else _iso_ray_cloud(frame, source.geom, plane)
+        cloud = None if frame is None else _iso_ray_cloud(frame, source.geom)
     else:
         frame = source.iso if source.iso is not None else source.chamber
         if frame is None or xy_mode not in (XY_IC1, XY_IC2):
             cloud = None
         else:
-            t = 1.0 if xy_mode == XY_IC1 else 0.0
-            cloud = _to_plane(_axis_cloud(frame, xy_mode), source.geom, t, plane)
+            cloud = _axis_cloud(frame, xy_mode)
     if cloud is None or source.k_mu is None or cloud.k_mu == source.k_mu:
         return cloud
     return replace(cloud, k_mu=source.k_mu)
@@ -929,24 +899,24 @@ def plan_cloud(
     config: SplatConfig,
     reference: SessionSplatSource | None = None,
 ) -> SplatCloud | None:
-    """The input-map plan with its spot σ from ``config.plan_sigma``, at ``config.sigma_plane``.
+    """The input-map plan with its spot σ from ``config.plan_sigma``.
 
     Measured and Reference take the median σ of each energy layer from a session's own
     IC readings (the same XY as the view, IC1 when XY is Plan). Interlock keeps the
-    devices.xml IC1 values, and so does a source with no usable σ.
+    devices.xml IC1 values, and so does a source with no usable σ. σ stays the logged
+    chamber width: SAD/SDD would widen it, and the quadrupoles do the opposite.
     """
     plan = source.plan
     if plan is None:
         return None
-    plane = config.sigma_plane
     if config.plan_sigma != PLAN_SIGMA_INTERLOCK:
         donor = reference if config.plan_sigma == PLAN_SIGMA_REFERENCE else source
         xy = XY_IC1 if config.xy_mode == XY_PLAN else config.xy_mode
-        cloud = None if donor is None else measured_cloud(donor, xy, plane=plane)
+        cloud = None if donor is None else measured_cloud(donor, xy)
         got = None if cloud is None else layer_sigmas(cloud, plan.energy)
         if got is not None:
             return replace(plan, sx=got[0], sy=got[1])
-    return _to_plane(plan, source.geom, 1.0, plane)
+    return plan
 
 
 def build_view_batches(
@@ -968,7 +938,7 @@ def build_view_batches(
         if config.xy_mode == XY_PLAN:
             measured = plan
         else:
-            measured = measured_cloud(source, config.xy_mode, base_dir, config.sigma_plane)
+            measured = measured_cloud(source, config.xy_mode, base_dir)
             if config.overlay_plan and plan is not None:
                 plan_clouds.append(plan)
         if measured is not None:
