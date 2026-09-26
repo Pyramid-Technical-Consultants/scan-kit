@@ -10,7 +10,7 @@ from datetime import datetime
 from typing import Callable, TextIO
 
 from PySide6.QtCore import QObject, Qt, Signal, Slot
-from PySide6.QtGui import QFont, QGuiApplication
+from PySide6.QtGui import QFont, QGuiApplication, QShowEvent
 from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
@@ -107,6 +107,8 @@ class _StreamTee(TextIO):
 class DebugLogPanel(QWidget):
     """Scrollable log view for launcher and subprocess diagnostics."""
 
+    clear_cache_requested = Signal()
+
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._bridge = _LogBridge()
@@ -131,6 +133,14 @@ class DebugLogPanel(QWidget):
         title.setWordWrap(True)
         header.addWidget(title, stretch=1)
 
+        self._cache_label = QLabel("")
+        header.addWidget(self._cache_label)
+
+        clear_cache_btn = QPushButton("Clear remote cache")
+        clear_cache_btn.setToolTip("Delete locally cached copies of remote sessions")
+        clear_cache_btn.clicked.connect(self.clear_cache_requested.emit)
+        header.addWidget(clear_cache_btn)
+
         clear_btn = QPushButton("Clear")
         clear_btn.clicked.connect(self.clear)
         copy_btn = QPushButton("Copy")
@@ -146,6 +156,17 @@ class DebugLogPanel(QWidget):
         mono.setStyleHint(QFont.StyleHint.Monospace)
         self._text.setFont(mono)
         root.addWidget(self._text, stretch=1)
+        self.refresh_cache_label()
+
+    def showEvent(self, event: QShowEvent) -> None:
+        super().showEvent(event)
+        self.refresh_cache_label()
+
+    def refresh_cache_label(self) -> None:
+        from .data_location import format_byte_size, remote_cache_size_bytes
+
+        n = remote_cache_size_bytes()
+        self._cache_label.setText(f"Remote cache: {format_byte_size(n)}")
 
     def append(self, level: str, source: str, message: str) -> None:
         """Thread-safe append; safe to call from worker threads."""

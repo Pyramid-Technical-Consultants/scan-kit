@@ -39,6 +39,14 @@ def test_top_level_menus_present(window) -> None:
     assert titles == ["File", "Edit", "View", "Analysis", "Help"]
 
 
+def test_file_menu_has_clear_remote_cache(window) -> None:
+    file_menu = _menu(window, "File")
+    labels = [a.text().replace("&", "") for a in file_menu.actions() if a.text()]
+    assert "Open Data Folder…" in labels
+    assert "Refresh Sessions" in labels
+    assert "Clear Remote Cache…" in labels
+
+
 def test_edit_menu_uses_browser_undo_actions(window) -> None:
     edit = _menu(window, "Edit")
     actions = edit.actions()
