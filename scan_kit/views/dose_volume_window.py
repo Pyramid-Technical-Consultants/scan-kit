@@ -48,6 +48,8 @@ from .dose_volume_catalog import (
     DEFAULT_GAMMA_DOSE_PCT,
     DEFAULT_GAMMA_DTA_MM,
     DEFAULT_IC_GAP_MM,
+    DEFAULT_MC_HISTORIES,
+    DEFAULT_MODEL,
     DEFAULT_PHANTOM_MM,
     DEFAULT_SPOT_CAP,
     DEFAULT_WEIGHT,
@@ -57,6 +59,8 @@ from .dose_volume_catalog import (
     GAMMA_TOLERANCE_PCT,
     GRAIN_SPOT,
     GRAIN_TIMESLICE,
+    MC_HISTORIES,
+    MC_MEDIA,
     MEDIUM_A150,
     MEDIUM_ALUMINUM,
     MEDIUM_COPPER,
@@ -64,6 +68,8 @@ from .dose_volume_catalog import (
     MEDIUM_POLYETHYLENE,
     MEDIUM_POLYSTYRENE,
     MEDIUM_WATER,
+    MODEL_ANALYTIC,
+    MODEL_MC,
     DEFAULT_PLAN_SIGMA,
     PLAN_SIGMA_INTERLOCK,
     PLAN_SIGMA_MEASURED,
@@ -501,6 +507,25 @@ class DoseVolumeWindow(VispyViewWindow):
             WEIGHT_PROTONS: "Where the protons stop.",
         })
         self._weight_combo.set_current(DEFAULT_WEIGHT)
+        self._model_combo = self._add_segment(
+            compare_layout, "Model",
+            ((MODEL_ANALYTIC, "Analytic"), (MODEL_MC, "Monte Carlo")),
+            self._on_model_changed,
+        )
+        self._model_combo.set_button_tooltips({
+            MODEL_ANALYTIC: "Fast pencil-beam approximation.",
+            MODEL_MC: "GPU Monte Carlo ported from MCsquare. Runs on each refresh.",
+        })
+        self._model_combo.set_current(DEFAULT_MODEL)
+        self._model_row = self._model_combo.parentWidget()
+        self._histories_combo = self._add_combo(
+            compare_layout, "Histories",
+            tuple((h, f"{h / 1e6:g}M" if h >= 1_000_000 else f"{h // 1000}k") for h in MC_HISTORIES),
+            self._on_controls_changed,
+        )
+        self._histories_combo.setToolTip("Protons simulated for each volume. 4× the histories halves the noise.")
+        self._set_combo(self._histories_combo, DEFAULT_MC_HISTORIES)
+        self._histories_row = self._histories_combo.parentWidget()
         self._gap_spin = self._add_spin(
             compare_layout, "IC gap", 0.1, 100.0, 0.5, DEFAULT_IC_GAP_MM,
             decimals=1,
@@ -594,6 +619,8 @@ class DoseVolumeWindow(VispyViewWindow):
         self._medium_combo = self._add_combo(
             phantom_layout, "Medium", _MEDIUM_ITEMS, self._on_controls_changed,
         )
+        self._medium_combo.currentIndexChanged.connect(self._sync_model_controls)
+        self._sync_model_controls()
         self._phantom_spin = self._add_spin(
             phantom_layout, "Thickness", 0.0, 1000.0, 10.0, DEFAULT_PHANTOM_MM, decimals=0,
         )
@@ -774,6 +801,25 @@ class DoseVolumeWindow(VispyViewWindow):
         inner.setSpacing(6)
         layout.addWidget(group)
         return inner
+
+    def _sync_model_controls(self, *_args) -> None:
+        """Model is for Dose, and Monte Carlo only for media MCsquare has data for."""
+        supported = self._medium_combo.currentData() in MC_MEDIA
+        if not supported:
+            self._model_combo.set_current(MODEL_ANALYTIC)
+        self._model_combo.setEnabled(supported)
+        self._model_combo.setToolTip("" if supported else "No MCsquare material data")
+        dose = self._choice(self._weight_combo) == WEIGHT_DOSE
+        self._model_row.setVisible(dose)
+        mc = dose and self._choice(self._model_combo) == MODEL_MC
+        self._histories_row.setVisible(mc)
+        self._scatter_check.setEnabled(not mc)
+
+    def _on_model_changed(self, *_args) -> None:
+        if self._updating:
+            return
+        self._sync_model_controls()
+        self._schedule_refresh()
 
     def _sync_phantom_controls(self, *_args) -> None:
         """The margin only shapes an Auto phantom, so it leaves the panel otherwise."""
@@ -1021,6 +1067,8 @@ class DoseVolumeWindow(VispyViewWindow):
             error_mode=self._error_combo.currentData(),
             error_scale=self._error_scale_value(),
             weight_mode=self._choice(self._weight_combo),
+            dose_model=self._choice(self._model_combo) or DEFAULT_MODEL,
+            mc_histories=int(self._histories_combo.currentData() or DEFAULT_MC_HISTORIES),
             ic_gap_mm=self._gap_spin.value(),
             gain=self._gain_value(),
             smear_axis_units=self._smear_spin.value(),
@@ -1079,6 +1127,9 @@ class DoseVolumeWindow(VispyViewWindow):
             self._wet_spin.setValue(config.entrance_wet_mm)
             self._set_combo(self._field_combo, config.field_edge)
             self._set_combo(self._weight_combo, config.weight_mode)
+            self._set_combo(self._model_combo, config.dose_model)
+            self._set_combo(self._histories_combo, config.mc_histories)
+            self._sync_model_controls()
             self._set_combo(self._ray_combo, config.ray_mode)
             self._auto_check.setChecked(config.auto_scale)
             self._gain = max(0.0, min(1.0, float(config.gain)))
@@ -1171,6 +1222,7 @@ class DoseVolumeWindow(VispyViewWindow):
         show_gap = self._choice(self._weight_combo) != WEIGHT_MU
         self._gap_spin.setEnabled(show_gap)
         self._gap_row.setVisible(show_gap)
+        self._sync_model_controls()
         # New units: an absolute window typed for the old ones means nothing now.
         self._abs_edited = False
         if self._error_combo.currentData() == ERROR_ABSOLUTE:
@@ -1434,6 +1486,8 @@ class DoseVolumeWindow(VispyViewWindow):
             field_edge=config.field_edge,
             show_phantom=config.show_phantom,
             show_field=config.show_field,
+            model=config.dose_model,
+            mc_histories=config.mc_histories,
         )
         self._show_field_extent()
         self._phantom_note.setText(self._scene.phantom_note or "—")

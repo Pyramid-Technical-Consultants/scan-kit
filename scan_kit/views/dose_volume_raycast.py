@@ -771,6 +771,7 @@ class _ComputeLib:
             glUniform1f,
             glUniform1i,
             glUniform2i,
+            glUniform1ui,
             glUniform3f,
             glUniform3i,
             glUseProgram,
@@ -782,6 +783,8 @@ class _ComputeLib:
             return
         if kind == "1i":
             glUniform1i(loc, int(vals[0]))
+        elif kind == "1ui":
+            glUniform1ui(loc, int(vals[0]) & 0xFFFFFFFF)
         elif kind == "1f":
             glUniform1f(loc, float(vals[0]))
         elif kind == "2i":

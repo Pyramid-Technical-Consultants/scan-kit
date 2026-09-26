@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import functools
+import hashlib
 import logging
 import math
 from dataclasses import dataclass
@@ -12,10 +13,15 @@ import numpy as np
 from .dose_volume_catalog import (
     DEFAULT_ERROR_SCALE,
     DEFAULT_GAIN,
+    DEFAULT_MC_HISTORIES,
     DEFAULT_RAY,
     field_edge_spec,
     DEFAULT_SCALE,
     ERROR_ABSOLUTE,
+    MC_MEDIA,
+    MC_SEED,
+    MODEL_ANALYTIC,
+    MODEL_MC,
     RAY_INTEGRAL,
     RAY_MAXIMUM,
     RAY_TRANSPARENT,
@@ -24,6 +30,7 @@ from .dose_volume_catalog import (
     WEIGHT_PROTONS,
     active_scale,
 )
+from .dose_mc import mc_fill_texture, mc_note
 from .dose_volume_data import DepthAxis, SplatBatch, protons_from_mu
 from .dose_volume_fill import (
     GAMMA_CMAP,
@@ -487,6 +494,8 @@ class DoseScene:
         # (passed, evaluated) voxels of the last γ map.
         self.gamma_pass: tuple[int, int] | None = None
         self._tex_shape: tuple[int, int, int] | None = None
+        # Per texture slot: (inputs key, McResult) of the Monte Carlo run it holds.
+        self._mc_runs: dict[str, tuple] = {}
         self._has_volume = False
         self._broken = False
         self._gain = DEFAULT_GAIN
@@ -685,10 +694,36 @@ class DoseScene:
             return
         self._canvas.set_current()
         self._tex_shape = key
+        self._mc_runs.clear()
         self._meas_tex = _alloc_texture(key)
         self._plan_tex = _alloc_texture(key)
         self._gamma_tex = _alloc_texture(key)
         self._box.set_volumes(self._meas_tex, self._plan_tex)
+
+    def _mc_fill(self, slot, tex, batch, grid, medium_key, *, depth, wet, spread_pct, histories, ic_gap_mm):
+        """Monte Carlo *batch* into *tex*, skipped when the inputs match the run it holds."""
+        if medium_key not in MC_MEDIA:
+            raise ValueError(f"no MCsquare material data for {medium_key!r}")
+        protons = deposit_amounts(batch, WEIGHT_DOSE, ic_gap_mm)
+        c = np.asarray(batch.center, dtype=float)
+        s = np.asarray(batch.sigma, dtype=float)
+        e = np.asarray(batch.energy_mev, dtype=float)
+        digest = hashlib.sha1()
+        for a in (c[:, 0:2], s[:, 0:2], e, protons):
+            digest.update(np.ascontiguousarray(a, dtype=np.float64).tobytes())
+        key = (
+            digest.hexdigest(), tuple(float(v) for v in grid.origin), tuple(grid.shape), float(grid.voxel),
+            medium_key, float(depth), float(wet), float(spread_pct), int(histories), MC_SEED,
+        )
+        held = self._mc_runs.get(slot)
+        if held is not None and held[0] == key:
+            return held[1]
+        result = mc_fill_texture(
+            self._canvas, tex, c[:, 0], c[:, 1], s[:, 0], s[:, 1], e, protons, medium_key, grid,
+            depth=depth, wet=wet, spread_pct=spread_pct, histories=histories, seed=MC_SEED,
+        )
+        self._mc_runs[slot] = (key, result)
+        return result
 
     def _color_limits(self) -> tuple[float, float]:
         if self._gamma:
@@ -762,6 +797,8 @@ class DoseScene:
         show_phantom: bool = False,
         show_field: bool = True,
         status: str | None = None,
+        model: str = MODEL_ANALYTIC,
+        mc_histories: int = DEFAULT_MC_HISTORIES,
     ) -> None:
         from vispy import scene
 
@@ -875,16 +912,40 @@ class DoseScene:
         self._ensure_textures((nz, ny, nx))
         empty = (np.zeros((0, 3)), np.zeros((0, 3)), np.zeros(0), np.zeros(0))
         gpu = True
+        mc = dose and model == MODEL_MC
+        mc_result = None
+        mc_failed = False
         peak_w, peak_s, peak_e = np.zeros(0), np.zeros((0, 3)), np.zeros(0)
-        for tex, prep in ((self._meas_tex, meas), (self._plan_tex, planned)):
+        slots = (("meas", self._meas_tex, meas, measured), ("plan", self._plan_tex, planned, plan))
+        for slot, tex, prep, raw in slots:
+            if prep is None or not mc:
+                self._mc_runs.pop(slot, None)
             if prep is None:
                 fill_texture(self._canvas, tex, *empty, kernel, grid)
                 continue
             center, sigma, amounts, e = prep[:4]
-            gpu = fill_texture(self._canvas, tex, center, sigma, amounts, e, kernel, grid) and gpu
             peak_w, peak_s, peak_e = amounts, np.array(sigma, dtype=float), e
+            if not mc:
+                gpu = fill_texture(self._canvas, tex, center, sigma, amounts, e, kernel, grid) and gpu
+                continue
+            try:
+                result = self._mc_fill(
+                    slot, tex, raw, grid, medium_key, depth=depth, wet=wet, spread_pct=smear,
+                    histories=mc_histories, ic_gap_mm=ic_gap_mm,
+                )
+                mc_result = mc_result or result
+            except Exception:
+                _log.warning("Monte Carlo dose unavailable", exc_info=True)
+                self._mc_runs.pop(slot, None)
+                tex.set_data(np.zeros((nz, ny, nx), dtype=np.float32))
+                self._canvas.context.flush_commands()
+                mc_failed = True
         if planned is None:
             self._difference = False
+        if mc_failed:
+            self.volume_note += " · MC unavailable"
+        elif mc_result is not None:
+            self.volume_note += mc_note(mc_result)
         if not gpu:
             self.volume_note += " · CPU fill"
         if dose and peak_w.size:

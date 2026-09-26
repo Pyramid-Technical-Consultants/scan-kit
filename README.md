@@ -225,6 +225,8 @@ For position scatter, position-error outliers, beam-on/off IC current histograms
 
 Builds a 1 mm dose volume from the measured spot or timeslice Gaussians and ray-marches it. Position can come from IC1, IC2, the ISO ray between them, or the plan. When a plan is loaded, **Compare** switches among the measured volume, measured minus plan, and a 3D gamma map scored the AAPM TG-218 way. **Quantity** is dose in Gy along the Bragg curve, or where monitor units or protons stop.
 
+**Model** picks how each spot deposits dose. **Analytic** is the fast Gaussian fill. **Monte Carlo** transports proton histories on the GPU with the physics of [MCsquare](https://gitlab.com/openmcsquare/MCsquare) (Class II condensed history, energy-loss straggling, multiple Coulomb scattering, nuclear elastic, inelastic and proton–proton interactions, secondary protons transported) and needs an OpenGL 4.3 GPU. It is offered for **Dose** in water, PMMA, polystyrene, aluminum and copper, the media with MCsquare stopping and nuclear data. **Histories** sets the total simulated for the volume. More histories take longer but are less noisy. The note under the view gives the ± statistical uncertainty in the high-dose region and the share of energy that left the grid, so widen the grid if that share is large. Measured and plan are simulated with the same random numbers, so their difference and gamma show the delivery rather than the noise. The Monte Carlo already includes scatter in the phantom, so the **Scatter** option is disabled in that mode.
+
 **Beam** sets the energy spread and the plan spot size: this session per layer, another loaded session, or the interlock. Measured spots keep the logged chamber σ. Scatter in the phantom widens measured and plan together. **Phantom** picks the medium (water, PMMA, polystyrene, polyethylene, A-150, aluminum, or copper), the thickness, and any entrance water-equivalent thickness. **Field Bounds** reports the field size, by default the lateral 50% edge on each slice (ICRU 78), with options for the high-dose core and the planned 90% volume. **View** sets the gantry angle, whether a ray integrates, keeps its maximum, or fades, the voxel size, and nearest, linear, or cubic sampling. See the [screenshot](#screenshots).
 
 ### Specialized analysis
@@ -427,6 +429,36 @@ App preferences (window geometry, last data directory, plot settings, session no
 </details>
 
 <details>
+<summary><strong>Validating the GPU Monte Carlo against MCsquare</strong></summary>
+
+MCsquare is the only reference for the GPU Monte Carlo. Its source and material data are a submodule in `third_party/MCsquare`:
+
+```bash
+git submodule update --init third_party/MCsquare
+```
+
+`scan_kit/assets/mc_materials.npz` packs the stopping-power, scattering and nuclear tables that the shader reads from `third_party/MCsquare/Materials`. After the submodule changes, rebuild it with `python scripts/build_mc_tables.py`.
+
+`scripts/mcsquare_validate.py` runs matched pencil beams and a small spot field through MCsquare and the GPU. The field case runs 4× `--primaries`, because it spreads its histories over far more voxels than a pencil beam. The cases cover water from 70 to 230 MeV at two spot sizes, each other Monte Carlo medium, and an entrance WET. For each case it reports the integrated depth dose, R80, lateral σ at three depths, total energy and a 1%/1 mm 3D gamma. Point `MCSQUARE_DIR` at an MCsquare build, either the folder holding `MCsquare_win.exe`, `MCsquare_linux` or `MCsquare_mac`, or the executable itself:
+
+```bash
+MCSQUARE_DIR=/path/to/MCsquare python scripts/mcsquare_validate.py            # all cases, 1e7 primaries
+python scripts/mcsquare_validate.py water_150_s3 --primaries 1e6              # one case
+python scripts/mcsquare_validate.py --write-goldens                           # refresh tests/data/mcsquare/
+```
+
+`--write-goldens` stores the MCsquare summaries in `tests/data/mcsquare/`. `tests/test_dose_mc.py` compares the GPU against those summaries, so CI needs no MCsquare. With `MCSQUARE_DIR` set, one extra test also runs MCsquare live. The Monte Carlo tests need an OpenGL 4.3 context and skip without one.
+
+Deliberate MCsquare 1.1 behaviours kept in the port:
+
+- The nuclear cross-section index wraps above 249 MeV.
+- ICRU inelastic data apply only between 7 and 249 MeV.
+- No proton–proton interactions at or below 10 MeV.
+- The last inelastic angle bin samples the forward hemisphere, which is what MCsquare's out-of-range table read produces.
+
+</details>
+
+<details>
 <summary><strong>Building an executable locally</strong></summary>
 
 ```bash
@@ -468,3 +500,5 @@ CI verifies the tag matches `__version__` before publishing. The project follows
 ## License
 
 [MIT](LICENSE). Copyright (c) 2026 Pyramid Technical Consultants
+
+The Monte Carlo physics and material data are ported from [MCsquare](https://gitlab.com/openmcsquare/MCsquare), Université catholique de Louvain, under the Apache License 2.0 ([`scan_kit/assets/MCsquare_LICENSE.txt`](scan_kit/assets/MCsquare_LICENSE.txt)).
