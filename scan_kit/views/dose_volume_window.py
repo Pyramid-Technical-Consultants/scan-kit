@@ -522,13 +522,13 @@ class DoseVolumeWindow(VispyViewWindow):
         })
         self._model_combo.set_current(DEFAULT_MODEL)
         self._model_row = self._model_combo.parentWidget()
-        self._histories_combo = self._add_combo(
+        self._histories_combo = self._add_segment(
             compare_layout, "Histories",
-            tuple((h, f"{h / 1e6:g}M" if h >= 1_000_000 else f"{h // 1000}k") for h in MC_HISTORIES),
+            tuple((str(h), f"{h / 1e6:g}M" if h >= 1_000_000 else f"{h // 1000}k") for h in MC_HISTORIES),
             self._on_controls_changed,
         )
         self._histories_combo.setToolTip("Protons simulated for each volume. 4× the histories halves the noise.")
-        self._set_combo(self._histories_combo, DEFAULT_MC_HISTORIES)
+        self._set_combo(self._histories_combo, str(DEFAULT_MC_HISTORIES))
         self._histories_row = self._histories_combo.parentWidget()
         self._gap_spin = self._add_spin(
             compare_layout, "IC gap", 0.1, 100.0, 0.5, DEFAULT_IC_GAP_MM,
@@ -1072,7 +1072,7 @@ class DoseVolumeWindow(VispyViewWindow):
             error_scale=self._error_scale_value(),
             weight_mode=self._choice(self._weight_combo),
             dose_model=self._choice(self._model_combo) or DEFAULT_MODEL,
-            mc_histories=int(self._histories_combo.currentData() or DEFAULT_MC_HISTORIES),
+            mc_histories=int(self._choice(self._histories_combo) or DEFAULT_MC_HISTORIES),
             ic_gap_mm=self._gap_spin.value(),
             gain=self._gain_value(),
             smear_axis_units=self._smear_spin.value(),
@@ -1132,7 +1132,7 @@ class DoseVolumeWindow(VispyViewWindow):
             self._set_combo(self._field_combo, config.field_edge)
             self._set_combo(self._weight_combo, config.weight_mode)
             self._set_combo(self._model_combo, config.dose_model)
-            self._set_combo(self._histories_combo, config.mc_histories)
+            self._set_combo(self._histories_combo, str(config.mc_histories))
             self._sync_model_controls()
             self._set_combo(self._ray_combo, config.ray_mode)
             self._auto_check.setChecked(config.auto_scale)

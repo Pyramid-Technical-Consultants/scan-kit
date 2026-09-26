@@ -177,7 +177,9 @@ def test_model_controls_follow_medium_and_weight(qapp, tmp_path) -> None:
         window._sync_model_controls()
         assert not window._histories_row.isHidden() and not window._scatter_check.isEnabled()
         config = window._read_config()
-        assert config.dose_model == MODEL_MC and config.mc_histories == 1_000_000
+        assert config.dose_model == MODEL_MC and config.mc_histories == 10_000_000
+        window._set_combo(window._histories_combo, "50000000")
+        assert window._read_config().mc_histories == 50_000_000
         window._set_combo(window._medium_combo, MEDIUM_POLYETHYLENE)
         assert not window._model_combo.isEnabled() and window._choice(window._model_combo) == MODEL_ANALYTIC
         assert window._histories_row.isHidden() and window._scatter_check.isEnabled()

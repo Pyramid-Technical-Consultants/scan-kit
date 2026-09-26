@@ -103,8 +103,8 @@ ModelKind = Literal["analytic", "mc"]
 DEFAULT_MODEL = MODEL_ANALYTIC
 # Media MCsquare ships material data for (see scan_kit/assets/mc_materials.npz).
 MC_MEDIA = (MEDIUM_WATER, MEDIUM_PMMA, MEDIUM_POLYSTYRENE, MEDIUM_ALUMINUM, MEDIUM_COPPER)
-MC_HISTORIES = (100_000, 300_000, 1_000_000, 3_000_000, 10_000_000)
-DEFAULT_MC_HISTORIES = 1_000_000
+MC_HISTORIES = (100_000, 300_000, 1_000_000, 3_000_000, 10_000_000, 50_000_000)
+DEFAULT_MC_HISTORIES = 10_000_000
 # Measured and plan share this seed, so their noise cancels in a difference.
 MC_SEED = 1
 
