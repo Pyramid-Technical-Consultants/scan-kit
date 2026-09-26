@@ -51,6 +51,7 @@ Beyond plotting, Scan Kit helps you:
 | **Session comparison** | Overlay multiple sessions in the same view with distinct colors |
 | **Interactive replay** | Scrub timeslice channels (IC, dDose/dt, sigma, field) in one Qt viewer |
 | **Plan authoring** | Generate `input_map.csv` from templates, DICOM RT Ion plans, or IBA PLD files |
+| **Patient QA** | Recalculate a DICOM RT Ion plan and its logged deliveries on the planning CT with the GPU Monte Carlo, with DVHs, clinical goals, gamma against the TPS dose and an RTDOSE/HTML report |
 | **Plan delivery** | Upload a plan to an RCI, run it, and download the session as a G3 zip |
 | **Config editing** | Browse and edit map2map XML with forms, integrity checks, and auto-tuning |
 
@@ -217,6 +218,7 @@ Configurable Qt shells for the metrics most sessions need day to day.
 | Audio Explorer | Listen to the same timeslice families, with transport, a live playhead FFT, and **Save WAV** *(needs a working audio device / PortAudio)* |
 | IC Beam Trajectory (3D) | Per-spot IC beam paths in 3D with plan overlay, dipole pivots, and iso/IC planes (visPy) |
 | Dose Volume (3D) | Ray-marched dose from IC, ISO-ray, or plan spots. Compare measured, measured minus plan, or 3D gamma, in water, plastic, or metal. See [details](#dose-volume-3d) |
+| Patient QA (DICOM) | The plan and the selected sessions recalculated by the Monte Carlo on the planning CT: tri-planar and 3D dose with contours, DVHs, clinical goals, gamma against the TPS, report export. See [details](#patient-qa-dicom) |
 | Session Log Compare | Layer timings, grouped errors, event browser, two-session diff. See [details](#session-log-compare) |
 
 For position scatter, position-error outliers, beam-on/off IC current histograms, and most dose/position/sigma summaries, start with **Binned Summary** or **Distribution Explorer** instead of opening a dedicated legacy plot.
@@ -225,9 +227,44 @@ For position scatter, position-error outliers, beam-on/off IC current histograms
 
 Builds a 1 mm dose volume from the measured spot or timeslice Gaussians and ray-marches it. Position can come from IC1, IC2, the ISO ray between them, or the plan. When a plan is loaded, **Compare** switches among the measured volume, measured minus plan, and a 3D gamma map scored the AAPM TG-218 way. **Quantity** is dose in Gy along the Bragg curve, or where monitor units or protons stop.
 
-**Model** picks how each spot deposits dose. **Analytic** is the fast Gaussian fill. **Monte Carlo** transports proton histories on the GPU with the physics of [MCsquare](https://gitlab.com/openmcsquare/MCsquare) (Class II condensed history, energy-loss straggling, multiple Coulomb scattering, nuclear elastic, inelastic and proton–proton interactions, secondary protons transported) and needs an OpenGL 4.3 GPU. It is offered for **Dose** in water, PMMA, polystyrene, aluminum and copper, the media with MCsquare stopping and nuclear data. **Histories** sets the total simulated for the volume. More histories take longer but are less noisy. The volume fills in progressively. A noisy first picture appears at once and sharpens as histories add up, and you can rotate and zoom the view throughout. A thin bar across the top of the view shows how far the run has got. Raising Histories carries on from the histories already run, while lowering it below what's done starts over. Gamma and the field bounds wait for the finished run. The note under the view gives the ± statistical uncertainty in the high-dose region and the share of energy that left the grid, so widen the grid if that share is large. Measured and plan are simulated with the same random numbers, so their difference and gamma show the delivery rather than the noise. The Monte Carlo already includes scatter in the phantom, so the **Scatter** option is disabled in that mode.
+**Model** picks how each spot deposits dose. **Analytic** is the fast Gaussian fill. **Monte Carlo** transports proton histories on the GPU with the physics of [MCsquare](https://gitlab.com/openmcsquare/MCsquare) (Class II condensed history, energy-loss straggling, multiple Coulomb scattering, nuclear elastic, inelastic and proton–proton interactions, secondary protons transported). It runs through WebGPU, so it needs a GPU with Vulkan, Metal or Direct3D 12. It is offered for **Dose** in water, PMMA, polystyrene, aluminum and copper, the media with MCsquare stopping and nuclear data. **Histories** sets the total simulated for the volume. More histories take longer but are less noisy. The volume fills in progressively. A noisy first picture appears at once and sharpens as histories add up, and you can rotate and zoom the view throughout. A thin bar across the top of the view shows how far the run has got. Raising Histories carries on from the histories already run, while lowering it below what's done starts over. Gamma and the field bounds wait for the finished run. The note under the view gives the ± statistical uncertainty in the high-dose region and the share of energy that left the grid, so widen the grid if that share is large. Measured and plan are simulated with the same random numbers, so their difference and gamma show the delivery rather than the noise. The Monte Carlo already includes scatter in the phantom, so the **Scatter** option is disabled in that mode.
 
 **Beam** sets the energy spread and the plan spot size: this session per layer, another loaded session, or the interlock. Measured spots keep the logged chamber σ. Scatter in the phantom widens measured and plan together. **Phantom** picks the medium (water, PMMA, polystyrene, polyethylene, A-150, aluminum, or copper), the thickness, and any entrance water-equivalent thickness. **Field Bounds** reports the field size, by default the lateral 50% edge on each slice (ICRU 78), with options for the high-dose core and the planned 90% volume. **View** sets the gantry angle, whether a ray integrates, keeps its maximum, or fades, the voxel size, and nearest, linear, or cubic sampling. See the [screenshot](#screenshots).
+
+### Patient QA (DICOM)
+
+**Open DICOM folder…** reads a planning CT, its RTSTRUCT, an RT Ion Plan (pencil-beam scanning) and, optionally, the TPS RTDOSE. Subfolders are scanned too, and every object must share one frame of reference or the load is refused. Nothing in the folder is modified. The Monte Carlo then recalculates the plan on the CT:
+
+- Each HU becomes a material and density through an MCsquare scanner calibration (**CT curve**).
+- Spots are sampled from an MCsquare beam model (**Beam model**). It is a double-Gaussian phase space, with any range shifter in the beamline.
+- Beams are placed through the IEC 61217 gantry, couch and isocenter chain.
+- Dose is dose-to-water in Gy. Transport is limited to the patient's bounding box.
+
+The sessions selected in the launcher are the logged deliveries:
+
+- Each session is matched to the plan beam whose layers explain its spots. Every spot takes its layer's energy, and is transported with its measured position at the isocenter plane and its measured MU.
+- The planned spots of the same beams run alongside with the same random numbers, so the difference between the two doses shows the delivery rather than the noise.
+- Sessions group into fractions in log order: a new fraction starts when a beam repeats. **Fraction** picks one fraction or their sum, and **Beams** narrows to one field.
+- The Study panel lists each beam's delivered-to-planned MU and spot position RMS.
+
+**Show** switches the colorwash between four doses:
+
+- the planned recalculation;
+- the delivered dose;
+- delivered minus planned;
+- 3D gamma against the TPS dose.
+
+Gamma is global, normalized to the TPS maximum, and compares one fraction of the TPS dose with one fraction of the selected delivery. Click a slice to move the crosshair and scroll to page through slices. The 3D pane ray-marches the same volume. Shown and gamma-evaluated dose is limited to the patient (above −900 HU), because dose in air voxels is noisy.
+
+DVHs (delivered solid, planned dashed) and **Clinical goals** are for the whole course. The selected dose is scaled to the plan's fraction count. Write one goal per line, like `PTV: D95% >= 95%`, `Cord: Dmax < 45 Gy`, `Lung: V20Gy < 30%` or `Heart: D0.03cc < 30 Gy`. Dose percentages are of **Rx**, which defaults to the plan's target prescription.
+
+**Export report…** writes three kinds of file:
+
+- An RTDOSE for each dose, in the CT's study and frame of reference, holding the raw calculation. Its Image Comments hold the provenance as JSON: input UIDs, calibration and beam-model digests, engine version, GPU, seed, histories and statistical uncertainty.
+- An HTML report with the figure, the delivery table, gamma, the goals and dose statistics.
+- The DVHs as CSV.
+
+Scan Kit is a research tool, not a medical device. Don't use its dose for clinical decisions.
 
 ### Specialized analysis
 
@@ -437,18 +474,25 @@ MCsquare is the only reference for the GPU Monte Carlo. Its source and material 
 git submodule update --init third_party/MCsquare
 ```
 
-`scan_kit/assets/mc_materials.npz` packs the stopping-power, scattering and nuclear tables that the shader reads from `third_party/MCsquare/Materials`. After the submodule changes, rebuild it with `python scripts/build_mc_tables.py`.
+`scan_kit/assets/mc_materials.npz` packs the stopping-power, scattering and nuclear tables that the shader reads from `third_party/MCsquare/Materials`. It holds the phantom media and every material that an MCsquare scanner calibration or beam-model range shifter names. The same script copies the scanner calibrations and beam models to `scan_kit/assets/mcsquare/`, so the app and the executable don't need the submodule. After the submodule changes, rebuild them with `python scripts/build_mc_tables.py`.
 
-`pytest` doesn't compare against MCsquare. `tests/test_dose_mc.py` checks the engine against itself: tables, energy bookkeeping, determinism, spot placement, and range against its own stopping powers. These tests need an OpenGL 4.3 context and skip without one. MCsquare agreement lives in `validation/mcsquare_validate.py`, which you run by hand after changing the Monte Carlo physics. It has two suites:
+`pytest` doesn't compare against MCsquare. The engine is checked against itself instead:
+
+- `tests/test_dose_mc.py` covers tables, energy bookkeeping, determinism, spot placement, and range against its own stopping powers.
+- `tests/test_qa.py` covers the patient path on a synthetic DICOM study. It checks the beam model, the IEC chain against MCsquare's, energy closure on the CT, delivery matching, DVHs, goals and gamma.
+
+These tests need a hardware WebGPU adapter and skip without one. MCsquare agreement lives in `validation/mcsquare_validate.py`, which you run by hand after changing the Monte Carlo physics, the CT calibration or the beam model. It has three suites:
 
 - **fast** (about 30 s): five small, awkward cases at 1e6 GPU histories with looser tolerances. They cover a 1 mm spot, copper at 70 MeV, a water-to-aluminum interface, nuclear build-up at 180 MeV, and three off-axis spots of mixed energy and weight in PMMA.
 - **full** (about 10 min): the fast cases plus water from 70 to 230 MeV at two spot sizes, each other Monte Carlo medium, an entrance WET and a 245-spot field, all at 1e7 histories. The field runs 4× the histories because it spreads them over far more voxels.
+- **patient** (about 1 min): CTs through MCsquare's `default` scanner calibration and `BDL_default_DN_RangeShifter` beam model, at 1e7 histories. It covers a tissue phantom with a bone slab and with a lung slab, a range shifter, an oblique gantry at 45° with couch rotation, and MCsquare's sample CT with three fields. Each case reports 3D gamma at 2 %/2 mm, Dmean, D95, D2 and dose-weighted LETd, over voxels of at least 0.1 g/cm³.
 
 Each case reports the integrated depth dose, R80, lateral σ at three depths, total energy, dose centroid and a 3D gamma. A check runs only the GPU. MCsquare's result for every case is cached in `validation/goldens/` as its summaries plus the dose around the beam.
 
 ```bash
 python validation/mcsquare_validate.py fast
 python validation/mcsquare_validate.py full
+python validation/mcsquare_validate.py patient
 python validation/mcsquare_validate.py full --case water_150_s3 --histories 1e6
 MCSQUARE_DIR=/path/to/MCsquare python validation/mcsquare_validate.py full --write-goldens
 ```
