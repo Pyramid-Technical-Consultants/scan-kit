@@ -1,7 +1,8 @@
 """A small synthetic patient written as real DICOM: CT, RTSTRUCT, RT Ion Plan (and RTDOSE).
 
-For tests and demos; it carries no patient data. The phantom is a water box in air with a
-bone and a lung insert; the PTV is a cube behind them and a ring ROI has a hole.
+For tests and demos; it carries no patient data. The phantom is a water box in air with
+bone and lung slabs (or a subset of them, see :data:`PHANTOMS`); the PTV is a cube behind
+them and a ring ROI has a hole.
 """
 
 from __future__ import annotations
@@ -20,6 +21,13 @@ BOX_MM = 120.0  # water box edge
 BONE = ((-60.0, 60.0), (-20.0, -10.0), (-30.0, 30.0))  # x, y, z extents (mm) of the bone slab
 LUNG = ((-60.0, 60.0), (-5.0, 10.0), (-30.0, 30.0))
 PTV = ((-15.0, 15.0), (20.0, 50.0), (-15.0, 15.0))
+INSERTS = {"BONE": (BONE, 700.0, (230, 220, 170)), "LUNG": (LUNG, -750.0, (120, 180, 255))}  # box, HU, color
+PHANTOMS = {  # key -> (label, inserts)
+    "slabs": ("Water box, bone and lung slabs", ("BONE", "LUNG")),
+    "bone": ("Water box, bone slab", ("BONE",)),
+    "lung": ("Water box, lung slab", ("LUNG",)),
+    "water": ("Water box", ()),
+}
 
 
 @dataclass(frozen=True)
@@ -55,7 +63,7 @@ def _base(sop_class: str, modality: str, study: str, frame: str, series: str | N
     return ds
 
 
-def phantom_hu(x: np.ndarray, y: np.ndarray, z: np.ndarray) -> np.ndarray:
+def phantom_hu(x: np.ndarray, y: np.ndarray, z: np.ndarray, phantom: str = "slabs") -> np.ndarray:
     """HU at patient points (broadcast arrays, mm)."""
 
     def inside(box):
@@ -64,8 +72,10 @@ def phantom_hu(x: np.ndarray, y: np.ndarray, z: np.ndarray) -> np.ndarray:
 
     half = BOX_MM / 2
     hu = np.where(inside(((-half, half), (-half, half), (-half, half))), 0.0, -1000.0)
-    hu = np.where(inside(BONE), 700.0, hu)
-    return np.where(inside(LUNG), -750.0, hu)
+    for name in PHANTOMS[phantom][1]:
+        box, value, _color = INSERTS[name]
+        hu = np.where(inside(box), value, hu)
+    return hu
 
 
 def _square(x0, x1, y0, y1, z) -> list[float]:
@@ -84,11 +94,15 @@ def write_phantom(
     spot_pitch: float = 6.0,
     mu_per_spot: float = 0.02,
     range_shifter_wet: float = 0.0,
+    phantom: str = "slabs",
+    fractions: int = 1,
 ) -> Phantom:
     """Write the phantom into *folder*; the CT slices are shuffled on disk on purpose."""
     import pydicom
     from pydicom.uid import generate_uid
 
+    if phantom not in PHANTOMS:
+        raise ValueError(f"unknown phantom {phantom!r}; choose from {', '.join(PHANTOMS)}")
     folder = Path(folder)
     folder.mkdir(parents=True, exist_ok=True)
     study, frame, series = generate_uid(), generate_uid(), generate_uid()
@@ -116,7 +130,7 @@ def write_phantom(
         ds.PhotometricInterpretation = "MONOCHROME2"
         ds.BitsAllocated, ds.BitsStored, ds.HighBit, ds.PixelRepresentation = 16, 16, 15, 1
         ds.RescaleSlope, ds.RescaleIntercept = 1.0, -1024.0
-        hu = phantom_hu(px, py, np.full_like(px, zs[k]))
+        hu = phantom_hu(px, py, np.full_like(px, zs[k]), phantom)
         ds.PixelData = np.rint(hu + 1024.0).astype(np.int16).tobytes()
         path = folder / f"CT_{ds.SOPInstanceUID[-12:]}.dcm"
         ds.save_as(str(path), enforce_file_format=True)
@@ -143,6 +157,9 @@ def write_phantom(
         ("RING", "ORGAN", (0, 0, 255), [[_square(-50, -10, 20, 60, z), _square(-40, -20, 30, 50, z)]
                                         for z in zs if -10 <= z < 10]),
     ]
+    for name in PHANTOMS[phantom][1]:
+        ((x0, x1), (y0, y1), (z0, z1)), _hu, color = INSERTS[name]
+        rois.append((name, "ORGAN", color, [[_square(x0, x1, y0, y1, z)] for z in zs if z0 <= z < z1]))
     rs.StructureSetROISequence, rs.ROIContourSequence, rs.RTROIObservationsSequence = [], [], []
     for n, (name, kind, color, slices) in enumerate(rois, start=1):
         roi = pydicom.Dataset()
@@ -213,7 +230,7 @@ def write_phantom(
     beam.FinalCumulativeMetersetWeight = cum
     plan.IonBeamSequence = [beam]
     fg = pydicom.Dataset()
-    fg.FractionGroupNumber, fg.NumberOfFractionsPlanned, fg.NumberOfBeams = 1, 1, 1
+    fg.FractionGroupNumber, fg.NumberOfFractionsPlanned, fg.NumberOfBeams = 1, fractions, 1
     rb = pydicom.Dataset()
     rb.ReferencedBeamNumber, rb.BeamMeterset = 1, cum * mu_per_spot
     fg.ReferencedBeamSequence = [rb]

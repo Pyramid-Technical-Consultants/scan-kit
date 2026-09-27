@@ -18,15 +18,21 @@ ParamKind = Literal[
     "button_group",
     "file_path",
 ]
-ParamFieldSet = Literal["source", "energy", "geometry", "weight"]
+ParamFieldSet = Literal["phantom", "ct", "source", "energy", "geometry", "weight", "dose"]
 
 PARAM_FIELD_SET_ORDER: tuple[ParamFieldSet, ...] = (
+    "phantom",
+    "ct",
     "source",
     "energy",
     "geometry",
     "weight",
+    "dose",
 )
 PARAM_FIELD_SET_LABELS: dict[ParamFieldSet, str] = {
+    "phantom": "Phantom",
+    "ct": "CT",
+    "dose": "Reference dose",
     "source": "Source",
     "energy": "Energy",
     "geometry": "Geometry",

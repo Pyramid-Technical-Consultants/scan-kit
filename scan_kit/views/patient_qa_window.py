@@ -40,6 +40,7 @@ from PySide6.QtWidgets import (
 
 from ..common.progress_line import ProgressLine
 from ..common.segmented_control import SegmentedControl
+from ..common.user_store import PREF_LAST_DICOM_DIR, prefs_get, prefs_set
 from ..dicom import StudyIndex, write_dose
 from ..dicom.calibration import MCSQUARE_SCANNERS, CtCalibration
 from ..dicom.structures import MAX_MASK_BITS, mask_bits
@@ -247,8 +248,10 @@ class PatientQaWindow(VispyViewWindow):
     # ---- loading --------------------------------------------------------------------------------
 
     def _pick_study(self) -> None:
-        folder = QFileDialog.getExistingDirectory(self, "DICOM study folder (CT, RTSTRUCT, RT Ion Plan, RTDOSE)")
+        folder = QFileDialog.getExistingDirectory(self, "DICOM study folder (CT, RTSTRUCT, RT Ion Plan, RTDOSE)",
+                                                  str(prefs_get(PREF_LAST_DICOM_DIR) or ""))
         if folder:
+            prefs_set(PREF_LAST_DICOM_DIR, folder)
             self.load(folder)
 
     def load(self, folder: str) -> None:

@@ -26,7 +26,7 @@ def test_study_loads_ct_structures_and_plan(hfs) -> None:
     points = ct.grid.to_patient(np.stack(np.meshgrid(np.arange(80), np.arange(80), np.arange(70), indexing="ij"), -1))
     expect = phantom_hu(points[..., 0], points[..., 1], points[..., 2]).transpose(2, 1, 0)
     assert np.array_equal(ct.hu, expect.astype(np.float32))
-    assert [r.name for r in case.structures.rois] == ["BODY", "PTV", "RING"]
+    assert [r.name for r in case.structures.rois] == ["BODY", "PTV", "RING", "BONE", "LUNG"]
     plan = case.plan()
     beam = plan.beams[0]
     assert plan.prescription == 2.0

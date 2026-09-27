@@ -151,15 +151,16 @@ On a dev install, the default data source is the bundled `test_data/` folder.
 
 ## The launcher
 
-Scan Kit opens a single window with five tabs. **View** switches tabs (`Ctrl+1` to `Ctrl+5`) and sets **Theme** (System / Light / Dark). **Analysis** opens the same views as the Data Analysis buttons. **File** opens or refreshes the session folder. **Esc** or **Ctrl+Q** quits.
+Scan Kit opens a single window with six tabs. **View** switches tabs (`Ctrl+1` to `Ctrl+6`) and sets **Theme** (System / Light / Dark). **Analysis** opens the same views as the Data Analysis buttons. **File** opens or refreshes the session folder. **Esc** or **Ctrl+Q** quits.
 
 | Tab | Shortcut | Use it to |
 |-----|----------|-----------|
 | **Data Analysis** | `Ctrl+1` | Browse sessions, adjust global plot settings, and open analysis views |
 | **Plan Synthesis** | `Ctrl+2` | Create PBS test plans and export `input_map.csv` |
-| **Plan Runner** | `Ctrl+3` | Connect to an RCI, upload a plan, run it, and download the session |
-| **Configuration Tuning** | `Ctrl+4` | Open a facility or session config folder, edit XML, run tuning workflows |
-| **Debug** | `Ctrl+5` | Live launcher and view-process logs, with Copy / Clear for support |
+| **Phantom Synthesis** | `Ctrl+3` | Write a synthetic patient study (CT, RTSTRUCT, RT Ion Plan, RTDOSE) for Patient QA |
+| **Plan Runner** | `Ctrl+4` | Connect to an RCI, upload a plan, run it, and download the session |
+| **Configuration Tuning** | `Ctrl+5` | Open a facility or session config folder, edit XML, run tuning workflows |
+| **Debug** | `Ctrl+6` | Live launcher and view-process logs, with Copy / Clear for support |
 
 Plot windows open separately. Close them when you are done. The launcher keeps running.
 
@@ -329,9 +330,20 @@ Pick a template, set parameters, preview the spot table, and export. Suggested f
   <img src="docs/images/launcher-plan-synthesis.png" alt="Plan Synthesis tab with Zero Field template and generated preview" width="720">
 </p>
 
+## Phantom Synthesis
+
+The **Phantom Synthesis** tab (`Ctrl+3`) writes a synthetic patient study as real DICOM, so you can try **Patient QA (DICOM)** without patient data. The study has four parts:
+
+- **CT:** a 120 mm water box in air, with bone and lung slabs, only one of them, or neither.
+- **RTSTRUCT:** BODY, the PTV behind the slabs, a ring with a hole, and each slab.
+- **RT Ion Plan:** one pencil-beam field over the PTV.
+- **RTDOSE (optional):** a Monte Carlo reference dose that stands in for the TPS dose, so gamma has something to compare against. It uses a different random seed from Patient QA, so gamma compares independent noise.
+
+Set the patient position, CT spacing, energies, gantry and couch angles, spot pitch, range shifter, MU and fractions. The preview shows the axial slice through the isocenter with the beam's direction. **Write DICOM…** writes the study into a new folder, and Patient QA's **Open DICOM folder…** starts in that folder.
+
 ## Plan Runner
 
-The **Plan Runner** tab (`Ctrl+3`) is the operator console for an RCI:
+The **Plan Runner** tab (`Ctrl+4`) is the operator console for an RCI:
 
 1. Enter the RCI IP (or a browser URL such as `http://192.168.100.184/io/`) and **Connect**. The last host is remembered.
 2. **Browse...** to an `input_map.csv` from Plan Synthesis and **Upload to RCI**.
@@ -346,7 +358,7 @@ Live tiles show control point, energy, layer, elapsed time, start permit, and wh
 
 ## Configuration Tuning
 
-The **Configuration Tuning** tab (`Ctrl+4`) is a structured editor for map2map XML configuration:
+The **Configuration Tuning** tab (`Ctrl+5`) is a structured editor for map2map XML configuration:
 
 - **File tree:** browse `devices.xml` and related config files
 - **Auto-generated forms:** edit XML values without raw markup
