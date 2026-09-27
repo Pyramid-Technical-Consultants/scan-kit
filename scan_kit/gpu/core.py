@@ -33,7 +33,10 @@ def _adapter():
 
     # Probing wgpu's GL backend makes its own GL context current under vispy's.
     set_instance_extras(backends=["Vulkan", "Metal", "DX12"])
-    adapter = wgpu.gpu.request_adapter_sync(power_preference="high-performance")
+    try:
+        adapter = wgpu.gpu.request_adapter_sync(power_preference="high-performance")
+    except RuntimeError as exc:  # wgpu-native raises, rather than returning None, on GPU-less hosts
+        raise GpuUnavailable(f"no WebGPU adapter: {exc}") from exc
     if adapter is None:
         raise GpuUnavailable("no WebGPU adapter")
     return adapter
