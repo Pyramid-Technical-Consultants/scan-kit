@@ -52,6 +52,14 @@ def test_patient_qa_window_runs_logged_fractions_and_exports(qapp, gpu, tmp_path
             w._show.set_current(key)
             w._on_show_changed()
             assert w._shown() is not None
+        # Axial PTV outline runs along voxel edges in mm; a click lands on the voxel under it.
+        dx, dy, _dz = w._grid.spacing
+        k, r = int(w._cursor[2]), [roi.name for roi in case.structures.rois].index("PTV")
+        cols = np.flatnonzero(((w._bits[0][k] >> np.uint32(r)) & 1).any(axis=0))
+        segs = w._contour(0, k, r, lambda v: v[k], (dx, dy))
+        assert segs[:, 0].min() == pytest.approx(cols[0] * dx) and segs[:, 0].max() == pytest.approx((cols[-1] + 1) * dx)
+        w._on_pick(0, 5.5 * dx, 7.2 * dy)
+        assert tuple(w._cursor[:2]) == (5, 7) and w._cursor[2] == k
         one = float(w._doses[pqw.DELIVERED].sum())
 
         w._fraction_combo.setCurrentIndex(2)

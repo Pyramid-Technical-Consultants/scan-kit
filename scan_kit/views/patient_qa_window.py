@@ -18,10 +18,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 import numpy as np
-from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
-from matplotlib.colors import ListedColormap
-from matplotlib.figure import Figure
-from PySide6.QtCore import Qt, QTimer, Slot
+from PySide6.QtCore import QEvent, Qt, QTimer, Slot
 from PySide6.QtWidgets import (
     QComboBox,
     QDoubleSpinBox,
@@ -53,6 +50,7 @@ from .async_refresh import DebouncedBackgroundTask
 from .dose_volume_catalog import DEFAULT_DIVERGENT_SCALE, DEFAULT_MC_HISTORIES, DEFAULT_SCALE, MC_HISTORIES, MC_SEED
 from .dose_volume_fill import GAMMA_CMAP, colormap_samples
 from .dose_volume_physics import GammaCriteria
+from .patient_qa_plots import OVERLAY_ALPHA, QaPlots
 from .plot_view_shell import VispyViewWindow, make_side_panel_column, run_view_window
 
 _log = logging.getLogger(__name__)
@@ -112,17 +110,12 @@ class PatientQaWindow(VispyViewWindow):
         self._closed = False
         self._updating = True
 
-        self.figure = Figure(figsize=(9, 8), layout="constrained")
-        self.canvas = FigureCanvasQTAgg(self.figure)
-        gs = self.figure.add_gridspec(2, 3, height_ratios=(3, 2))
-        self._ax_axial, self._ax_coronal, self._ax_sagittal = (self.figure.add_subplot(gs[0, c]) for c in range(3))
-        self._ax_dvh = self.figure.add_subplot(gs[1, :2])
-        self._ax_gamma = self.figure.add_subplot(gs[1, 2])
-        self.canvas.mpl_connect("button_press_event", self._on_click)
-        self.canvas.mpl_connect("scroll_event", self._on_scroll)
+        self._shown_now = None  # _shown() as of the last full redraw; cursor moves reuse it
+        self._contours: dict[tuple[int, int, int], np.ndarray] = {}  # (view, slice, roi) -> segments in mm
+        self._plots = QaPlots(self._on_pick, self._on_page)
         self._make_3d()
         split = QSplitter(Qt.Orientation.Horizontal)
-        split.addWidget(self.canvas)
+        split.addWidget(self._plots.native)
         split.addWidget(self._vispy.native)
         split.setSizes([900, 600])
         self._plot_layout.addWidget(split, 1)
@@ -138,9 +131,20 @@ class PatientQaWindow(VispyViewWindow):
         self._loader = DebouncedBackgroundTask(debounce_ms=0, parent=self)
         self._loader.finished.connect(self._on_loaded)
         self._updating = False
+        self._apply_theme()
         self._redraw()
         if study:
             self.load(study)
+
+    def _apply_theme(self) -> None:
+        bg, fg = self.palette().window().color().name(), self.palette().windowText().color().name()
+        self._plots.set_theme(bg, fg)
+        self._vispy.bgcolor = bg
+
+    def changeEvent(self, event) -> None:  # noqa: N802 - Qt
+        super().changeEvent(event)
+        if event.type() == QEvent.Type.PaletteChange and hasattr(self, "_plots"):
+            self._apply_theme()
 
     # ---- controls -------------------------------------------------------------------------------
 
@@ -425,6 +429,10 @@ class PatientQaWindow(VispyViewWindow):
         self._body = self._hu > BODY_HU
         rois = self._case.structures.rois if self._case.structures is not None else ()
         self._bits = [mask_bits(rois[s:s + MAX_MASK_BITS], grid) for s in range(0, len(rois), MAX_MASK_BITS)]
+        self._contours.clear()
+        (dx, dy, dz), (nx, ny, nz) = grid.spacing, grid.shape
+        self._plots.set_extents(((nx * dx, ny * dy), (nx * dx, nz * dz), (ny * dy, nz * dz)),
+                                ((dx, dy), (dx, dz), (dy, dz)))
         iso = grid.to_index(self._plan.beams[0].isocenter)
         self._cursor = np.clip(np.rint(iso).astype(int), 0, np.array(grid.shape) - 1)
         self._set_box(grid)
@@ -542,12 +550,12 @@ class PatientQaWindow(VispyViewWindow):
             self._redraw()
 
     def _shown(self):
-        """(volume, colormap, lo, hi, difference) for the chosen display, or None."""
+        """(volume, colormap name, lo, hi, difference) for the chosen display, or None."""
         mode = self._show.current_key()
         if mode == GAMMA:
             if self._gamma_grid is None:
                 return None
-            return self._gamma_grid, ListedColormap(colormap_samples(GAMMA_CMAP)), 0.0, 2.0, False
+            return self._gamma_grid, GAMMA_CMAP, 0.0, 2.0, False
         if mode == DIFF:
             d, p = self._doses.get(DELIVERED), self._doses.get(PLANNED)
             if d is None or p is None:
@@ -559,115 +567,139 @@ class PatientQaWindow(VispyViewWindow):
             return None
         return dose, DEFAULT_SCALE, 0.0, float(dose.max()) or 1.0, False
 
+    def _checked(self) -> list[int]:
+        return [r for r in range(self._roi_list.count()) if self._roi_list.item(r).checkState() == Qt.CheckState.Checked]
+
     def _redraw(self) -> None:
-        for ax in (self._ax_axial, self._ax_coronal, self._ax_sagittal, self._ax_dvh, self._ax_gamma):
-            ax.cla()
         if self._grid is None:
-            self._ax_axial.set_title("Open a DICOM folder")
-            for ax in (self._ax_axial, self._ax_coronal, self._ax_sagittal):
-                ax.set_axis_off()
-            self.canvas.draw_idle()
+            self._shown_now = None
+            self._plots.clear("Open a DICOM folder")
             return
-        shown = self._shown()
-        self._draw_slices(shown)
+        self._shown_now = shown = self._shown()
+        self._plots.show_slices()
+        self._draw_slices()
+        self._draw_colorbar(shown)
         self._draw_dvh()
         self._draw_gamma()
-        self.canvas.draw_idle()
         self._update_3d(shown)
 
-    def _draw_slices(self, shown) -> None:
-        dx, dy, dz = self._grid.spacing
-        nx, ny, nz = self._grid.shape
+    def _draw_slices(self) -> None:
+        shown, grid = self._shown_now, self._grid
+        (dx, dy, dz), (nx, ny, nz) = grid.spacing, grid.shape
         i, j, k = self._cursor
         # ponytail: image index order on screen (radiological for HFS); prone or feet-first CTs show flipped.
-        views = (
-            (self._ax_axial, lambda v: v[k], (0, nx * dx, ny * dy, 0), "upper", (i + 0.5) * dx, (j + 0.5) * dy),
-            (self._ax_coronal, lambda v: v[:, j, :], (0, nx * dx, 0, nz * dz), "lower", (i + 0.5) * dx, (k + 0.5) * dz),
-            (self._ax_sagittal, lambda v: v[:, :, i], (0, ny * dy, 0, nz * dz), "lower", (j + 0.5) * dy, (k + 0.5) * dz),
-        )
+        cuts = (lambda v: v[k], lambda v: v[:, j, :], lambda v: v[:, :, i])
+        index = (k, j, i)
+        pixels = ((dx, dy), (dx, dz), (dy, dz))
+        size = ((nx * dx, ny * dy), (nx * dx, nz * dz), (ny * dy, nz * dz))
+        cross = (((i + 0.5) * dx, (j + 0.5) * dy), ((i + 0.5) * dx, (k + 0.5) * dz), ((j + 0.5) * dy, (k + 0.5) * dz))
         rois = self._case.structures.rois if self._case.structures is not None else ()
-        checked = [r for r in range(min(len(rois), self._roi_list.count()))
-                   if self._roi_list.item(r).checkState() == Qt.CheckState.Checked]
-        for (ax, cut, extent, origin, cx, cy), name in zip(views, ("Axial", "Coronal", "Sagittal")):
-            ax.imshow(cut(self._hu), cmap="gray", vmin=CT_WINDOW[0], vmax=CT_WINDOW[1], extent=extent,
-                      origin=origin, interpolation="bilinear")
-            if shown is not None:
-                vol, cmap, lo, hi, diff = shown
-                img = cut(vol)
-                gamma = self._show.current_key() == GAMMA
-                faint = img <= 0 if gamma else np.abs(img) < WASH_FLOOR * max(abs(lo), abs(hi))
-                ax.imshow(np.ma.masked_where(faint, img), cmap=cmap, vmin=lo, vmax=hi, alpha=0.55, extent=extent,
-                          origin=origin, interpolation="bilinear")
-            for r in checked:
-                mask = (cut(self._bits[r // MAX_MASK_BITS]) >> np.uint32(r % MAX_MASK_BITS)) & 1
-                if mask.any():
-                    ax.contour(mask, levels=[0.5], colors=[np.array(rois[r].color) / 255.0], linewidths=0.9,
-                               extent=extent, origin=origin)
-            ax.axvline(cx, color="w", lw=0.4, alpha=0.5)
-            ax.axhline(cy, color="w", lw=0.4, alpha=0.5)
-            ax.set_xticks([])
-            ax.set_yticks([])
-            ax.set_title(name, fontsize=9)
+        checked = [r for r in self._checked() if r < len(rois)]
+        wash = None
         if shown is not None:
-            _vol, _cmap, lo, hi, diff = shown
-            unit = "γ" if self._show.current_key() == GAMMA else "Gy(RBE)"
-            self._ax_axial.set_title(f"Axial · {lo:.3g} to {hi:.3g} {unit}", fontsize=9)
+            vol, scale, lo, hi, _diff = shown
+            lut = (255 * colormap_samples(scale)).astype(np.uint8)
+            gamma = self._show.current_key() == GAMMA
+            wash = [self._wash(cut(vol), lut, lo, hi, gamma) for cut in cuts]
+        lines = []
+        for v in range(3):
+            (w, h), (cx, cy) = size[v], cross[v]
+            segs = [np.array([[cx, 0.0], [cx, h], [0.0, cy], [w, cy]], np.float32)]
+            colors = [np.tile(np.float32([1.0, 1.0, 1.0, 0.45]), (4, 1))]
+            for r in checked:
+                s = self._contour(v, index[v], r, cuts[v], pixels[v])
+                segs.append(s)
+                colors.append(np.tile(np.float32([*(np.array(rois[r].color) / 255.0), 1.0]), (len(s), 1)))
+            lines.append((np.concatenate(segs), np.concatenate(colors)))
+        titles = (f"Axial · {k + 1}/{nz}", f"Coronal · {j + 1}/{ny}", f"Sagittal · {i + 1}/{nx}")
+        self._plots.set_slices([cut(self._hu) for cut in cuts], wash, lines, titles, CT_WINDOW)
+
+    @staticmethod
+    def _wash(img: np.ndarray, lut: np.ndarray, lo: float, hi: float, gamma: bool) -> np.ndarray:
+        """RGBA uint8 dose wash: the scale's color, transparent where the dose is faint."""
+        t = np.clip((img - lo) / (hi - lo), 0.0, 1.0) if hi > lo else np.zeros_like(img)
+        rgba = np.empty((*img.shape, 4), np.uint8)
+        rgba[..., :3] = lut[(t * (len(lut) - 1)).astype(np.intp)]
+        faint = img <= 0 if gamma else np.abs(img) < WASH_FLOOR * max(abs(lo), abs(hi))
+        rgba[..., 3] = np.where(faint, 0, round(255 * OVERLAY_ALPHA))
+        return rgba
+
+    def _contour(self, view: int, index: int, r: int, cut, pixel) -> np.ndarray:
+        """ROI *r*'s outline on one slice as line segments ``(2n, 2)`` in mm, cached per slice."""
+        key = (view, index, r)
+        if key not in self._contours:
+            from contourpy import contour_generator
+
+            mask = cut((self._bits[r // MAX_MASK_BITS] >> np.uint32(r % MAX_MASK_BITS)) & 1)
+            segs = [np.zeros((0, 2), np.float32)]
+            rows, cols = np.flatnonzero(mask.any(axis=1)), np.flatnonzero(mask.any(axis=0))
+            if rows.size:
+                # Contour a one-voxel-padded crop: outlines close, and cost follows the ROI, not the slice.
+                r0, c0 = rows[0] - 1, cols[0] - 1
+                crop = np.zeros((rows[-1] - r0 + 2, cols[-1] - c0 + 2), np.float32)
+                crop[1:-1, 1:-1] = mask[rows[0]:rows[-1] + 1, cols[0]:cols[-1] + 1]
+                for line in contour_generator(z=crop).lines(0.5):
+                    pts = (line + (c0 + 0.5, r0 + 0.5)) * pixel
+                    segs.append(np.repeat(pts, 2, axis=0)[1:-1])
+            self._contours[key] = np.concatenate(segs).astype(np.float32)
+        return self._contours[key]
+
+    def _draw_colorbar(self, shown) -> None:
+        if shown is None:
+            self._plots.set_colorbar(None, 0.0, 1.0, "")
+            return
+        _vol, scale, lo, hi, diff = shown
+        mode = self._show.current_key()
+        title = "γ" if mode == GAMMA else ("Delivered − planned, Gy(RBE)" if diff else f"{mode.capitalize()} dose, Gy(RBE)")
+        self._plots.set_colorbar(colormap_samples(scale), lo, hi, title)
 
     def _draw_dvh(self) -> None:
-        ax = self._ax_dvh
         rois = self._case.structures.rois if self._case.structures is not None else ()
-        names = {self._roi_list.item(r).text() for r in range(self._roi_list.count())
-                 if self._roi_list.item(r).checkState() == Qt.CheckState.Checked}
-        for kind, style in ((DELIVERED, "-"), (PLANNED, "--" if DELIVERED in self._dvh else "-")):
+        names = {self._roi_list.item(r).text() for r in self._checked()}
+        both = DELIVERED in self._dvh
+        curves, legend, top = [], [], 0.0
+        for kind in (PLANNED, DELIVERED):
+            faded = both and kind == PLANNED
             for roi in rois:
                 h = self._dvh.get(kind, {}).get(roi.name)
-                if h is not None and roi.name in names:
-                    ax.plot(h.edges, 100.0 * h.cumulative, style, color=np.array(roi.color) / 255.0, lw=1.2,
-                            label=roi.name if style == "-" else None)
-        ax.set_xlabel("Dose (Gy(RBE), course)" + (" — delivered solid, plan dashed" if DELIVERED in self._dvh else ""))
-        ax.set_ylabel("Volume (%)")
-        ax.set_ylim(0, 102)
-        ax.set_xlim(left=0)
-        ax.grid(alpha=0.3)
-        if ax.lines:
-            ax.legend(fontsize=7, loc="upper right")
-        else:
-            ax.text(0.5, 0.5, "DVH when the run finishes", ha="center", va="center", transform=ax.transAxes)
+                if h is None or roi.name not in names:
+                    continue
+                color = (*(np.array(roi.color) / 255.0), 0.5 if faded else 1.0)
+                curves.append((h.edges, 100.0 * h.cumulative, color, 1.1 if faded else 1.6))
+                top = max(top, float(h.edges[np.flatnonzero(h.cumulative > 0)[-1] + 1]) if h.cumulative.any() else 0.0)
+                if not faded:
+                    legend.append((roi.name, color))
+        self._plots.set_dvh(curves, legend, top * 1.05, "" if curves else "DVH when the run finishes")
+        if curves:
+            self._plots.set_dvh_title("DVH · Gy(RBE), course" + (" · delivered bright, plan faded" if both else ""))
 
     def _draw_gamma(self) -> None:
-        ax = self._ax_gamma
         g = self._gamma
         if g is None:
-            ax.text(0.5, 0.5, "No gamma", ha="center", va="center", transform=ax.transAxes)
-            ax.set_axis_off()
+            self._plots.set_gamma(None, None, "No gamma")
             return
-        vals = g.gamma[g.gamma > 0]
-        ax.hist(np.minimum(vals, g.criteria.cap), bins=50, range=(0, g.criteria.cap), color="#4a8")
-        ax.axvline(1.0, color="#c22", lw=1)
-        ax.set_title(f"γ {g.criteria.dose_pct:g}%/{g.criteria.dta_mm:g}mm: {100 * g.rate:.1f} %", fontsize=9)
-        ax.set_yticks([])
+        counts, edges = np.histogram(np.minimum(g.gamma[g.gamma > 0], g.criteria.cap), bins=50,
+                                     range=(0.0, g.criteria.cap))
+        self._plots.set_gamma(counts, edges,
+                              f"γ {g.criteria.dose_pct:g}%/{g.criteria.dta_mm:g}mm · {100 * g.rate:.1f} % pass")
 
-    def _on_click(self, event) -> None:
-        if self._grid is None or event.xdata is None:
+    def _on_pick(self, view: int, x: float, y: float) -> None:
+        if self._grid is None:
             return
-        dx, dy, dz = self._grid.spacing
-        axes = {self._ax_axial: ((0, dx), (1, dy)), self._ax_coronal: ((0, dx), (2, dz)),
-                self._ax_sagittal: ((1, dy), (2, dz))}
-        if event.inaxes not in axes:
-            return
-        (a, sa), (b, sb) = axes[event.inaxes]
-        self._cursor[a] = int(event.xdata // sa)
-        self._cursor[b] = int(event.ydata // sb)
-        self._cursor = np.clip(self._cursor, 0, np.array(self._grid.shape) - 1)
-        self._redraw()
+        (a, b), sp = ((0, 1), (0, 2), (1, 2))[view], self._grid.spacing
+        cursor = self._cursor.copy()
+        cursor[a], cursor[b] = int(x // sp[a]), int(y // sp[b])
+        cursor = np.clip(cursor, 0, np.array(self._grid.shape) - 1)
+        if not np.array_equal(cursor, self._cursor):
+            self._cursor = cursor
+            self._draw_slices()
 
-    def _on_scroll(self, event) -> None:
-        axis = {self._ax_axial: 2, self._ax_coronal: 1, self._ax_sagittal: 0}.get(event.inaxes)
-        if self._grid is None or axis is None:
+    def _on_page(self, view: int, steps: int) -> None:
+        if self._grid is None:
             return
-        self._cursor[axis] = int(np.clip(self._cursor[axis] + (1 if event.button == "up" else -1),
-                                         0, self._grid.shape[axis] - 1))
-        self._redraw()
+        axis = (2, 1, 0)[view]
+        self._cursor[axis] = int(np.clip(self._cursor[axis] + steps, 0, self._grid.shape[axis] - 1))
+        self._draw_slices()
 
     # ---- 3D -------------------------------------------------------------------------------------
 
@@ -705,8 +737,7 @@ class PatientQaWindow(VispyViewWindow):
             self._marching = False
             self._vispy.update()
             return
-        vol, cmap, lo, hi, diff = shown
-        name = GAMMA_CMAP if isinstance(cmap, ListedColormap) else cmap
+        vol, name, lo, hi, diff = shown
         if diff:
             self._textures[0].set_data(np.ascontiguousarray(self._doses[DELIVERED], dtype=np.float32))
             self._textures[1].set_data(np.ascontiguousarray(self._doses[PLANNED], dtype=np.float32))
@@ -772,8 +803,10 @@ class PatientQaWindow(VispyViewWindow):
             provs[kind]["dose"] = f"dose-to-water, Gy over {self._n_fractions} fraction(s)"
             write_dose(folder / f"{name}_{kind}.dcm", run.dose, self._grid, self._case.ct, plan_uid=plan.sop_uid,
                        summation=summation, description=f"scan-kit MC {kind}", provenance=provs[kind])
+        from matplotlib.image import imsave
+
         buf = io.BytesIO()
-        self.figure.savefig(buf, format="png", dpi=110)
+        imsave(buf, self._plots.canvas.render(), format="png")
         main = self._main_kind()
         title = f"Patient QA: {plan.label or 'plan'}, {self._fraction_combo.currentText()}, {main} dose"
         return write_report(folder, name, title=title, provenance=provs[main], dvhs=self._dvh.get(main, {}),
