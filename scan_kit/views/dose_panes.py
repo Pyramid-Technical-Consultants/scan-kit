@@ -15,11 +15,12 @@ from dataclasses import dataclass, field
 
 import numpy as np
 from PySide6.QtCore import QEvent, Qt, Signal
-from PySide6.QtWidgets import QComboBox, QHBoxLayout, QLabel, QSplitter, QToolButton, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QHBoxLayout, QSplitter, QVBoxLayout, QWidget
 
 from .color_axis import ColorAxis
 from .dose_volume_catalog import DEFAULT_SCALE
 from .dose_volume_fill import colormap_samples, ink_rgb, zero_rgb
+from .view_header import ViewHeader
 from .vispy_plot import (
     FG,
     ORDER_DATA,
@@ -281,18 +282,10 @@ class PlotPane(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
-        header = QHBoxLayout()
-        header.setContentsMargins(4, 2, 4, 0)
-        self._picker = QComboBox()
-        for key, text in PLOT_KINDS:
-            self._picker.addItem(text, key)
-        self._picker.setCurrentIndex(max(self._picker.findData(kind), 0))
-        self._picker.currentIndexChanged.connect(lambda _i: self.kindChanged.emit(self.kind))
-        self._note = QLabel("")
-        self._note.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        header.addWidget(self._picker)
-        header.addWidget(self._note, 1)
-        layout.addLayout(header)
+        self.header = ViewHeader(PLOT_KINDS)
+        self.header.set_current(kind, quiet=True)
+        self.header.picked.connect(self.kindChanged.emit)
+        layout.addWidget(self.header)
         self.canvas = make_scene_canvas(size=(500, 260))
         layout.addWidget(self.canvas.native, 1)
         grid = self.canvas.central_widget.add_grid(spacing=0, margin=4)
@@ -313,10 +306,10 @@ class PlotPane(QWidget):
 
     @property
     def kind(self) -> str:
-        return self._picker.currentData()
+        return self.header.current
 
     def set_kind(self, kind: str) -> None:
-        self._picker.setCurrentIndex(max(self._picker.findData(kind), 0))
+        self.header.set_current(kind)
 
     def _axis(self, grid, orientation: str, *, row: int, col: int):
         axis = axis_widget(orientation)
@@ -351,7 +344,7 @@ class PlotPane(QWidget):
     def _say(self, message: str, note: str) -> None:
         self._message.text = message or " "
         self._message.pos = (0.5 * _PLOT_SPAN, 0.5 * _PLOT_SPAN)
-        self._note.setText(note)
+        self.header.note.setText(note)
 
     def show_curves(self, curves, legend, x_dom, y_dom, note: str = "", message: str = "") -> None:
         """*curves* ``[(x, y, rgba, width)]`` in data units over *x_dom* × *y_dom*; *legend* ``[(name, rgba)]``."""
@@ -421,19 +414,10 @@ class _Cell(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
-        header = QHBoxLayout()
-        header.setContentsMargins(4, 2, 4, 0)
-        self.picker = QComboBox()
-        for n, text in enumerate(VIEWS):
-            self.picker.addItem(text, n)
-        self.picker.currentIndexChanged.connect(lambda _i: self.picked.emit(self.picker.currentData()))
-        self.rotate = QToolButton()
-        self.rotate.setText("⟲ 90°")
-        self.rotate.setToolTip("Rotate this plane a quarter turn counterclockwise")
-        header.addWidget(self.picker)
-        header.addStretch(1)
-        header.addWidget(self.rotate)
-        layout.addLayout(header)
+        self.header = ViewHeader(list(enumerate(VIEWS)))
+        self.header.picked.connect(self.picked.emit)
+        self.rotate = self.header.add_button("⟲ 90°", "Rotate this plane a quarter turn counterclockwise")
+        layout.addWidget(self.header)
         self.body = QVBoxLayout()
         layout.addLayout(self.body, 1)
         self.view = -1
@@ -441,9 +425,7 @@ class _Cell(QWidget):
     def hold(self, view: int, widget: QWidget) -> None:
         self.view = view
         self.body.addWidget(widget)
-        self.picker.blockSignals(True)
-        self.picker.setCurrentIndex(view)
-        self.picker.blockSignals(False)
+        self.header.set_current(view, quiet=True)
         self.rotate.setVisible(view != VIEW_3D)
 
 

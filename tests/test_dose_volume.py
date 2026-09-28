@@ -1151,6 +1151,13 @@ def test_workspace_cells_swap_views_and_planes_rotate(qapp) -> None:
         assert (axial.view, three_d.view) == (VIEW_3D, 0)
         assert ws.volume.parentWidget() is axial and ws.slices[0].native.parentWidget() is three_d
         assert axial.rotate.isHidden() and not three_d.rotate.isHidden()
+        row = three_d.header.layout()
+        assert [row.itemAt(i).widget() for i in (row.count() - 2, row.count() - 1)] == [
+            three_d.rotate, three_d.header.picker]  # the picker in the top right, rotate left of it
+        three_d.header.picker.setCurrentIndex(2)
+        assert three_d.view == 2
+        ws.plots[0].set_kind("nope")
+        assert ws.plots[0].kind == ws.plots[0].header.picker.itemData(0)
 
         pane = ws.slices[0]  # axial: 4 mm across, 6 mm up
         pane.rotate()
