@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 from PySide6.QtCore import QEvent, Qt, Signal
-from PySide6.QtWidgets import QComboBox, QHBoxLayout, QLabel, QSplitter, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QComboBox, QHBoxLayout, QLabel, QSplitter, QToolButton, QVBoxLayout, QWidget
 
 from .color_axis import ColorAxis
 from .dose_volume_catalog import DEFAULT_SCALE
@@ -35,6 +35,9 @@ from .vispy_plot import (
 PLANES = ("Axial", "Coronal", "Sagittal")
 PLANE_AXES = ((0, 1), (0, 2), (1, 2))  # grid axes (x, y, z) across and up each plane
 PLANE_NORMAL = (2, 1, 0)
+VIEW_3D = 3
+VIEWS = (*PLANES, "3D")
+DEFAULT_CELLS = (0, VIEW_3D, 1, 2)  # axial, 3D / coronal, sagittal
 OVERLAY_ALPHA = 0.55
 WASH_FLOOR = 0.1  # dose below this share of the maximum is not washed
 CT_WINDOW = (-500.0, 500.0)  # HU shown black to white
@@ -171,11 +174,15 @@ class SlicePane:
         grid.add_widget(self._title, row=0, col=0)
         self.view = grid.add_view(row=1, col=0)
         lock_panzoom(self.view, scene.PanZoomCamera(aspect=1.0))
+        self.turns = 0  # quarter turns counterclockwise
+        self._size = (1.0, 1.0)
+        self._plane = scene.Node(parent=self.view.scene)  # plane mm; its transform turns them
+        self._plane.transform = scene.transforms.MatrixTransform()
         self._ct = scene.visuals.Image(np.zeros((2, 2), np.float32), cmap="grays", interpolation="linear",
-                                       texture_format="auto", parent=self.view.scene)
-        self._wash = scene.visuals.Image(np.zeros((2, 2, 4), np.uint8), interpolation="linear", parent=self.view.scene)
+                                       texture_format="auto", parent=self._plane)
+        self._wash = scene.visuals.Image(np.zeros((2, 2, 4), np.uint8), interpolation="linear", parent=self._plane)
         self._lines = scene.visuals.Line(np.zeros((2, 2), np.float32), connect="segments", method="gl", width=1.5,
-                                         antialias=True, parent=self.view.scene)
+                                         antialias=True, parent=self._plane)
         for visual, order in ((self._ct, ORDER_FILL), (self._wash, ORDER_DATA), (self._lines, ORDER_OVERLAY)):
             _gl_2d(visual, order)
         for visual in (self._ct, self._wash):
@@ -197,7 +204,24 @@ class SlicePane:
         """Plane (width, height) and pixel (across, up) in mm; *flip* puts row 0 at the top."""
         self._ct.transform.scale = self._wash.transform.scale = pixel
         self.view.camera.flip = (False, flip)
-        set_data_range(self.view, (0.0, size[0]), (0.0, size[1]))
+        self._size = (float(size[0]), float(size[1]))
+        self._turn()
+
+    def rotate(self, turns: int = 1) -> None:
+        """Turn the plane by quarter turns counterclockwise."""
+        self.turns = (self.turns + turns) % 4
+        self._turn()
+        self.canvas.update()
+
+    def _turn(self) -> None:
+        w, h = self._size
+        c, s = ((1, 0), (0, 1), (-1, 0), (0, -1))[self.turns]
+        m = np.eye(4)
+        m[:2, :2] = ((c, s), (-s, c))  # vispy maps row vectors: p @ m
+        m[3, :2] = ((0, 0), (h, 0), (w, h), (0, w))[self.turns]  # back into the positive quadrant
+        self._plane.transform.matrix = m
+        across, up = (h, w) if self.turns % 2 else (w, h)
+        set_data_range(self.view, (0.0, across), (0.0, up))
 
     def show(self, ct: np.ndarray | None, wash: np.ndarray | None, lines, title: str) -> None:
         """CT slice (HU) or None, wash RGBA or None, (segments mm (2n, 2), colors (2n, 4))."""
@@ -222,7 +246,7 @@ class SlicePane:
         local = self.canvas.scene.node_transform(self.view).map(pos)[:2]
         if not (0 <= local[0] < self.view.size[0] and 0 <= local[1] < self.view.size[1]):
             return None
-        x, y = self.canvas.scene.node_transform(self.view.scene).map(pos)[:2]
+        x, y = self.canvas.scene.node_transform(self._plane).map(pos)[:2]
         return float(x), float(y)
 
     def _press(self, event) -> None:
@@ -384,8 +408,44 @@ class VolumePane(QWidget):
         row.addWidget(self.color_axis)
 
 
+class _Cell(QWidget):
+    """A grid cell: picker of the view it shows (a plane or 3D) and a rotate button for planes."""
+
+    picked = Signal(int)
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        header = QHBoxLayout()
+        header.setContentsMargins(4, 2, 4, 0)
+        self.picker = QComboBox()
+        for n, text in enumerate(VIEWS):
+            self.picker.addItem(text, n)
+        self.picker.currentIndexChanged.connect(lambda _i: self.picked.emit(self.picker.currentData()))
+        self.rotate = QToolButton()
+        self.rotate.setText("⟲ 90°")
+        self.rotate.setToolTip("Rotate this plane a quarter turn counterclockwise")
+        header.addWidget(self.picker)
+        header.addStretch(1)
+        header.addWidget(self.rotate)
+        layout.addLayout(header)
+        self.body = QVBoxLayout()
+        layout.addLayout(self.body, 1)
+        self.view = -1
+
+    def hold(self, view: int, widget: QWidget) -> None:
+        self.view = view
+        self.body.addWidget(widget)
+        self.picker.blockSignals(True)
+        self.picker.setCurrentIndex(view)
+        self.picker.blockSignals(False)
+        self.rotate.setVisible(view != VIEW_3D)
+
+
 class DoseWorkspace(QWidget):
-    """Axial and 3D over coronal and sagittal, above two plots whose content each pane picks."""
+    """Four cells (axial and 3D over coronal and sagittal by default, each picks its view) above two plots."""
 
     cursorMoved = Signal()
 
@@ -404,9 +464,16 @@ class DoseWorkspace(QWidget):
         for pane in self.plots:
             pane.kindChanged.connect(lambda _k, pane=pane: self._draw_plot(pane))
 
+        self._views = [*(pane.native for pane in self.slices), self.volume]  # by view index: planes, then 3D
+        self.cells = [_Cell() for _ in range(4)]
+        for cell, view in zip(self.cells, DEFAULT_CELLS):
+            cell.hold(view, self._views[view])
+            cell.picked.connect(lambda view, cell=cell: self.show_view(cell, view))
+            cell.rotate.clicked.connect(lambda _c=False, cell=cell: self._rotate(cell))
+
         # Every boundary drags: the two grid rows share their column split so the 2×2 stays square.
-        top = _splitter(Qt.Orientation.Horizontal, self.slices[0].native, self.volume)
-        bottom = _splitter(Qt.Orientation.Horizontal, self.slices[1].native, self.slices[2].native)
+        top = _splitter(Qt.Orientation.Horizontal, *self.cells[:2])
+        bottom = _splitter(Qt.Orientation.Horizontal, *self.cells[2:])
         top.splitterMoved.connect(lambda *_: bottom.setSizes(top.sizes()))
         bottom.splitterMoved.connect(lambda *_: top.setSizes(bottom.sizes()))
         plot_row = _splitter(Qt.Orientation.Horizontal, *self.plots)
@@ -418,6 +485,23 @@ class DoseWorkspace(QWidget):
         layout.addWidget(self.splitter)
         self._apply_theme()
         self.clear("")
+
+    # ---- cells ----------------------------------------------------------------------------------
+
+    def show_view(self, cell: _Cell, view: int) -> None:
+        """Put *view* in *cell*; the cell that showed it takes this cell's old view."""
+        other = next(c for c in self.cells if c.view == view)
+        if other is cell:
+            return
+        mine = cell.view
+        for c in (cell, other):
+            c.body.removeWidget(self._views[c.view])
+        cell.hold(view, self._views[view])
+        other.hold(mine, self._views[mine])
+
+    def _rotate(self, cell: _Cell) -> None:
+        if cell.view != VIEW_3D:
+            self.slices[cell.view].rotate()
 
     # ---- theme ----------------------------------------------------------------------------------
 
@@ -539,7 +623,7 @@ class DoseWorkspace(QWidget):
             wash = None if lut is None else wash_rgba(plane_cut(lay.wash, p, index), lut, lay.lo, lay.hi,
                                                       lay.gamma, alpha)
             ct = None if f.ct is None else plane_cut(f.ct, p, index)
-            title = f"{PLANES[p]} · {index + 1}/{f.shape[PLANE_NORMAL[p]]}"
+            title = f"Slice {index + 1}/{f.shape[PLANE_NORMAL[p]]}"
             pane.show(ct, wash, (np.concatenate(segs), np.concatenate(colors)), title)
 
     def _outline(self, plane: int, index: int, r: int, pixel) -> np.ndarray:

@@ -1140,6 +1140,29 @@ def test_gpu_layer_fill_and_gamma_match_python(qapp) -> None:
 
 
 
+def test_workspace_cells_swap_views_and_planes_rotate(qapp) -> None:
+    from scan_kit.views.dose_panes import VIEW_3D, DoseFrame, DoseWorkspace
+
+    ws = DoseWorkspace()
+    try:
+        ws.set_frame(DoseFrame(origin=np.zeros(3), spacing=np.ones(3), shape=(4, 6, 8)))
+        axial, three_d = ws.cells[0], ws.cells[1]
+        ws.show_view(axial, VIEW_3D)
+        assert (axial.view, three_d.view) == (VIEW_3D, 0)
+        assert ws.volume.parentWidget() is axial and ws.slices[0].native.parentWidget() is three_d
+        assert axial.rotate.isHidden() and not three_d.rotate.isHidden()
+
+        pane = ws.slices[0]  # axial: 4 mm across, 6 mm up
+        pane.rotate()
+        m = pane._plane.transform
+        assert np.allclose(m.map((1.0, 5.0))[:2], (1.0, 1.0))  # a quarter turn left: (x, y) -> (6 - y, x)
+        assert np.allclose(m.imap((1.0, 1.0))[:2], (1.0, 5.0))
+        pane.rotate(3)
+        assert pane.turns == 0 and np.allclose(m.map((1.0, 5.0))[:2], (1.0, 5.0))
+    finally:
+        ws.close()
+
+
 def test_scene_snapshot_includes_the_ray_march(qapp) -> None:
     """``SceneCanvas.render`` skips the march; the report's snapshot must not."""
     from scan_kit.views.dose_panes import VolumePane
