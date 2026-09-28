@@ -316,7 +316,8 @@ def set_data_range(
         camera.set_range(x=xlim, y=ylim, margin=margin_v)
 
 
-def axis_widget(orientation: str, *, font_size: float = 8):
+def axis_widget(orientation: str, *, font_size: float = 8, **kwargs):
+    """1 px spine and ticks; *kwargs* go to vispy's ``AxisWidget`` (``axis_label``, ``axis_label_margin``, …)."""
     from vispy import scene
 
     widget = scene.AxisWidget(
@@ -325,6 +326,9 @@ def axis_widget(orientation: str, *, font_size: float = 8):
         tick_color=AXIS_RGBA,
         text_color=FG,
         font_size=font_size,
+        axis_width=1,
+        tick_width=1,
+        **kwargs,
     )
     if orientation == "left":
         widget.width_min = 48
@@ -372,12 +376,12 @@ def _use_agg_axis_lines(widget) -> None:
         if pos is None or len(np.asarray(pos).reshape(-1, 2)) < 2:
             mesh.visible = False
             return
-        width = float(getattr(visual, "tick_width", 1.5) or 1.5)
+        width = float(getattr(visual, "tick_width", 1.0) or 1.0)
         verts, faces = line_segments_mesh(pos, width=width)
         if len(faces) == 0:
             mesh.visible = False
             return
-        mesh.set_data(vertices=verts, faces=faces, color=AXIS_RGBA)
+        mesh.set_data(vertices=verts, faces=faces, color=getattr(visual, "tick_color", AXIS_RGBA))
         mesh.visible = True
 
     visual._update_subvisuals = _update

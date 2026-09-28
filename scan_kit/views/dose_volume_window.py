@@ -464,10 +464,12 @@ class DoseVolumeWindow(VispyViewWindow):
         )
         self._gantry_spin.setWrapping(True)
         self._gantry_spin.setSuffix(" °")
-        self._ray_combo = self._add_combo(
-            display_layout, "Ray", _RAY_ITEMS, self._on_ray_changed,
-        )
-        self._ray_combo.setToolTip("Integrate sums a ray. Maximum keeps its hottest sample. Transparent fades like fog.")
+        self._ray_combo = QComboBox()
+        for value, text in _RAY_ITEMS:
+            self._ray_combo.addItem(text, value)
+        self._ray_combo.currentIndexChanged.connect(self._on_ray_changed)
+        self._ray_combo.setToolTip("Ray: Integrate sums a ray. Maximum keeps its hottest sample. "
+                                   "Transparent fades like fog.")
         self._set_combo(self._ray_combo, DEFAULT_RAY)
         self._voxel_spin = self._add_spin(
             view_layout, "Voxel", MIN_VOXEL_MM, MAX_VOXEL_MM, 0.25, VOXEL_MM,
@@ -487,7 +489,7 @@ class DoseVolumeWindow(VispyViewWindow):
             "cubic": "Smoother, and can overshoot a little.",
         })
         self._interp.selectionChanged.connect(self._scene.set_interp)
-        self._add_row(display_layout, "Sample", self._interp)
+        self._workspace.set_volume_tools([self._ray_combo, self._interp])
         self._cap_spin = QSpinBox()
         self._cap_spin.setRange(1_000, 5_000_000)
         self._cap_spin.setSingleStep(50_000)
