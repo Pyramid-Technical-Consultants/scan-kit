@@ -1,4 +1,4 @@
-"""Patient QA window on a synthetic study: plan recalc, logged fractions, gamma, goals and report."""
+"""Dose Volume on a synthetic DICOM study: plan recalc, logged fractions, gamma, goals and report."""
 
 from __future__ import annotations
 
@@ -15,59 +15,70 @@ from scan_kit.dicom.synthetic import write_phantom
 from scan_kit.qa import BeamModel, Delivery, patient_run, plan_spots
 
 
-def _settle(qapp, window, timeout_s: float = 120.0) -> None:
+def _settle(qapp, study, timeout_s: float = 120.0) -> None:
     end = time.monotonic() + timeout_s
-    while not (window._runs and window._export_button.isEnabled()) and time.monotonic() < end:
+    while not (study._runs and study._export_button.isEnabled()) and time.monotonic() < end:
         qapp.processEvents()
-    assert window._export_button.isEnabled(), window._mc_label.text() or window._study_label.text()
+    assert study._export_button.isEnabled(), study._mc_label.text() or study._study_label.text()
 
 
-def test_patient_qa_window_runs_logged_fractions_and_exports(qapp, gpu, tmp_path, monkeypatch) -> None:
-    from scan_kit.views import patient_qa_window as pqw
+def test_dose_view_runs_a_study_with_logged_fractions_and_exports(qapp, gpu, tmp_path, monkeypatch) -> None:
+    from scan_kit.views import dose_volume_window as dvw
+    from scan_kit.views import study_source as ss
 
     ph = write_phantom(tmp_path / "study")
     case = StudyIndex.scan(ph.folder).load()
     plan = case.plan()
-    tps, grid = patient_run(case.ct, CtCalibration.mcsquare("default"), BeamModel.read(pqw.DEFAULT_BDL), plan,
+    tps, grid = patient_run(case.ct, CtCalibration.mcsquare("default"), BeamModel.read(ss.DEFAULT_BDL), plan,
                             plan_spots(plan), histories=1_000_000, seed=1)
     tps.step()
     write_dose(ph.folder / "RD_tps.dcm", tps.dose * plan.fractions, grid, case.ct, plan_uid=plan.sop_uid)
     s = plan_spots(plan)
-    monkeypatch.setattr(pqw, "delivery_from_session", lambda sid, _base: Delivery(s.x, s.y, s.energy, s.mu, sid))
+    monkeypatch.setattr(ss, "delivery_from_session", lambda sid, _base: Delivery(s.x, s.y, s.energy, s.mu, sid))
 
-    w = pqw.PatientQaWindow(["fx1", "fx2"], str(tmp_path))
+    w = dvw.DoseVolumeWindow(["fx1", "fx2"], str(tmp_path), study=str(ph.folder))
+    st = w._study
     try:
-        w._histories.set_current("1000000")
-        w.load(str(ph.folder))
-        _settle(qapp, w)
+        assert w._dicom() and st.panel.isVisibleTo(w) and not w._session_box.isVisibleTo(w)
+        st._histories.set_current("1000000")
+        st._restart()
+        _settle(qapp, st)
         # The one beam logged twice is two fractions, plus their sum.
-        assert w._fraction_combo.count() == 3 and w._n_fractions == 1
-        assert np.array_equal(w._doses[pqw.DELIVERED], w._doses[pqw.PLANNED])
-        assert w._gamma is not None and w._gamma.rate > 0.95
+        assert st._fraction_combo.count() == 3 and st._n_fractions == 1
+        assert np.array_equal(st.doses[ss.DELIVERED], st.doses[ss.PLANNED])
+        assert st.gamma is not None and st.gamma.rate > 0.95
         # The synthetic spots fall far short of the 2 Gy prescription, so D95% fails, as it should.
-        goal, value, ok = w._goal_results[0]
+        goal, value, ok = st._goal_results[0]
         assert goal.text == "PTV: D95% >= 95%" and not ok
-        assert value == pytest.approx(100.0 * w._dvh[pqw.DELIVERED]["PTV"].dose_at(0.95) / plan.prescription)
-        for key in (pqw.PLANNED, pqw.DELIVERED, pqw.DIFF, pqw.GAMMA):
-            w._show.set_current(key)
+        assert value == pytest.approx(100.0 * st.dvh[ss.DELIVERED]["PTV"].dose_at(0.95) / plan.prescription)
+        for show in ("dose", "difference", "gamma"):
+            w._show_combo.set_current(show)
             w._on_show_changed()
-            assert w._shown() is not None
+            w._start_refresh()
+            assert w._content is not None and w._scene.frame is not None
+        assert w._scene.gamma and w._content[1]["gamma"] and "pass" in w._color_axis._title
+        w._show_combo.set_current("difference")
+        w._on_show_changed()
+        w._start_refresh()
+        assert w._scene.difference and w._content[0]
+
         # Axial PTV outline runs along voxel edges in mm; a click lands on the voxel under it.
-        dx, dy, _dz = w._grid.spacing
-        k, r = int(w._cursor[2]), [roi.name for roi in case.structures.rois].index("PTV")
-        cols = np.flatnonzero(((w._bits[0][k] >> np.uint32(r)) & 1).any(axis=0))
-        segs = w._contour(0, k, r, lambda v: v[k], (dx, dy))
+        dx, dy, _dz = st._grid.spacing
+        ws = w._workspace
+        k, r = int(ws.cursor[2]), [roi.name for roi in case.structures.rois].index("PTV")
+        cols = np.flatnonzero(((st.frame().bits[0][k] >> np.uint32(r)) & 1).any(axis=0))
+        segs = ws._outline(0, k, r, (dx, dy))
         assert segs[:, 0].min() == pytest.approx(cols[0] * dx) and segs[:, 0].max() == pytest.approx((cols[-1] + 1) * dx)
-        w._on_pick(0, 5.5 * dx, 7.2 * dy)
-        assert tuple(w._cursor[:2]) == (5, 7) and w._cursor[2] == k
-        one = float(w._doses[pqw.DELIVERED].sum())
+        ws._pick(0, 5.5 * dx, 7.2 * dy)
+        assert tuple(ws.cursor[:2]) == (5, 7) and ws.cursor[2] == k
+        one = float(st.doses[ss.DELIVERED].sum())
 
-        w._fraction_combo.setCurrentIndex(2)
-        _settle(qapp, w)
-        assert w._n_fractions == 2
-        assert float(w._doses[pqw.DELIVERED].sum()) == pytest.approx(2.0 * one, rel=0.03)
+        st._fraction_combo.setCurrentIndex(2)
+        _settle(qapp, st)
+        assert st._n_fractions == 2
+        assert float(st.doses[ss.DELIVERED].sum()) == pytest.approx(2.0 * one, rel=0.03)
 
-        html = w.export_report(tmp_path / "out")
+        html = st.export_report(tmp_path / "out")
         text = html.read_text(encoding="utf-8")
         assert "Gamma vs TPS" in text and "Clinical goals" in text and "data:image/png" in text
         assert html.with_name(html.stem + "_dvh.csv").is_file()
@@ -82,13 +93,17 @@ def test_patient_qa_window_runs_logged_fractions_and_exports(qapp, gpu, tmp_path
         bare.mkdir()
         for f in ph.ct_files:
             (bare / f.name).write_bytes(f.read_bytes())
-        w.load(str(bare))
+        st.load(str(bare))
         end = time.monotonic() + 60.0
-        while "No RT Ion Plan" not in w._study_label.text() and time.monotonic() < end:
+        while "No RT Ion Plan" not in st._study_label.text() and time.monotonic() < end:
             qapp.processEvents()
-        assert w._plan is None and not w._runs and not w._export_button.isEnabled()
-        w._restart()
-        assert not w._runs
+        assert st._plan is None and not st._runs and not st._export_button.isEnabled()
+        st._restart()
+        assert not st._runs
+
+        # Back to sessions: their controls return and the study's slices clear.
+        w._set_source(dvw.SOURCE_SESSIONS)
+        assert w._session_box.isVisibleTo(w) and not st.panel.isVisibleTo(w) and ws.frame is None
     finally:
         w.close()
         tps.close()

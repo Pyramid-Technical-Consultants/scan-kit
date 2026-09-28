@@ -247,7 +247,7 @@ class DoseVolumeConfig:
 
     @property
     def title(self) -> str:
-        return "Dose Volume (3D)"
+        return "Dose Volume"
 
 
 # Loader still speaks this name.

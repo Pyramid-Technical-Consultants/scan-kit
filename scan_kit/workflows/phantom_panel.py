@@ -152,7 +152,7 @@ class PhantomSynthesisPanel(QWidget):
         right_l.setContentsMargins(4, 4, 4, 4)
         actions = QHBoxLayout()
         self._write_btn = QPushButton("Write DICOM…")
-        self._write_btn.setToolTip("Write the study into a new folder; open it in Patient QA (DICOM)")
+        self._write_btn.setToolTip("Write the study into a new folder; open it in Dose Volume as a DICOM study")
         self._write_btn.clicked.connect(self._pick_folder)
         self._show_btn = QPushButton("Show Folder")
         self._show_btn.setEnabled(False)
@@ -168,7 +168,7 @@ class PhantomSynthesisPanel(QWidget):
         self._summary = QLabel()
         self._summary.setWordWrap(True)
         right_l.addWidget(self._summary)
-        self._status = QLabel("Synthetic studies carry no patient data. Open one with Patient QA (DICOM).")
+        self._status = QLabel("Synthetic studies carry no patient data. Open one in Dose Volume with Source: DICOM study.")
         self._status.setWordWrap(True)
         right_l.addWidget(self._status)
         splitter.addWidget(right)
@@ -267,4 +267,4 @@ class PhantomSynthesisPanel(QWidget):
         self._folder = folder
         self._show_btn.setEnabled(True)
         prefs_set(PREF_LAST_DICOM_DIR, str(folder))
-        self._status.setText(f"Wrote {outcome} to {folder}. Patient QA (DICOM) opens this folder next.")
+        self._status.setText(f"Wrote {outcome} to {folder}. Dose Volume's Open DICOM folder… starts here next.")

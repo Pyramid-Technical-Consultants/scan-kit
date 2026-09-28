@@ -51,7 +51,7 @@ Beyond plotting, Scan Kit helps you:
 | **Session comparison** | Overlay multiple sessions in the same view with distinct colors |
 | **Interactive replay** | Scrub timeslice channels (IC, dDose/dt, sigma, field) in one Qt viewer |
 | **Plan authoring** | Generate `input_map.csv` from templates, DICOM RT Ion plans, or IBA PLD files |
-| **Patient QA** | Recalculate a DICOM RT Ion plan and its logged deliveries on the planning CT with the GPU Monte Carlo, with DVHs, clinical goals, gamma against the TPS dose and an RTDOSE/HTML report |
+| **Patient QA** | In **Dose Volume**, recalculate a DICOM RT Ion plan and its logged deliveries on the planning CT with the GPU Monte Carlo, with DVHs, clinical goals, gamma against the TPS dose and an RTDOSE/HTML report |
 | **Plan delivery** | Upload a plan to an RCI, run it, and download the session as a G3 zip |
 | **Config editing** | Browse and edit map2map XML with forms, integrity checks, and auto-tuning |
 
@@ -124,7 +124,7 @@ On a dev install, the default data source is the bundled `test_data/` folder.
 <p align="center">
   <img src="docs/images/view-dose-volume.png" alt="Dose Volume showing a ray-marched measured dose with field bounds and the control sidebar" width="920">
   <br>
-  <sub><em>Dose Volume (3D): measured dose in the phantom, with field bounds and the comparison sidebar.</em></sub>
+  <sub><em>Dose Volume: measured dose in the phantom, with field bounds and the comparison sidebar.</em></sub>
 </p>
 
 <p align="center">
@@ -157,7 +157,7 @@ Scan Kit opens a single window with six tabs. **View** switches tabs (`Ctrl+1` t
 |-----|----------|-----------|
 | **Data Analysis** | `Ctrl+1` | Browse sessions, adjust global plot settings, and open analysis views |
 | **Plan Synthesis** | `Ctrl+2` | Create PBS test plans and export `input_map.csv` |
-| **Phantom Synthesis** | `Ctrl+3` | Write a synthetic patient study (CT, RTSTRUCT, RT Ion Plan, RTDOSE) for Patient QA |
+| **Phantom Synthesis** | `Ctrl+3` | Write a synthetic patient study (CT, RTSTRUCT, RT Ion Plan, RTDOSE) for Dose Volume's DICOM source |
 | **Plan Runner** | `Ctrl+4` | Connect to an RCI, upload a plan, run it, and download the session |
 | **Configuration Tuning** | `Ctrl+5` | Open a facility or session config folder, edit XML, run tuning workflows |
 | **Debug** | `Ctrl+6` | Live launcher and view-process logs, with Copy / Clear for support |
@@ -218,21 +218,24 @@ Configurable Qt shells for the metrics most sessions need day to day.
 | FFT Explorer | Frequency-domain line spectra for timeslice IC current, dDose/dt, source beam current, chamber position, sigma, G3 Gaussian peak, magnetic field, and amplifier command/readback. |
 | Audio Explorer | Listen to the same timeslice families, with transport, a live playhead FFT, and **Save WAV** *(needs a working audio device / PortAudio)* |
 | IC Beam Trajectory (3D) | Per-spot IC beam paths in 3D with plan overlay, dipole pivots, and iso/IC planes (visPy) |
-| Dose Volume (3D) | Ray-marched dose from IC, ISO-ray, or plan spots. Compare measured, measured minus plan, or 3D gamma, in water, plastic, or metal. See [details](#dose-volume-3d) |
-| Patient QA (DICOM) | The plan and the selected sessions recalculated by the Monte Carlo on the planning CT: tri-planar and 3D dose with contours, DVHs, clinical goals, gamma against the TPS, report export. See [details](#patient-qa-dicom) |
+| Dose Volume | Axial, coronal and sagittal slices, a ray-marched 3D volume, and two plots. **Sessions** builds the dose from IC, ISO-ray, or plan spots in water, plastic, or metal. **DICOM study** recalculates the plan and the selected sessions by the Monte Carlo on the planning CT, with contours, DVHs, clinical goals, gamma against the TPS, and report export. See [details](#dose-volume) |
 | Session Log Compare | Layer timings, grouped errors, event browser, two-session diff. See [details](#session-log-compare) |
 
 For position scatter, position-error outliers, beam-on/off IC current histograms, and most dose/position/sigma summaries, start with **Binned Summary** or **Distribution Explorer** instead of opening a dedicated legacy plot.
 
-### Dose Volume (3D)
+### Dose Volume
 
-Builds a 1 mm dose volume from the measured spot or timeslice Gaussians and ray-marches it. Position can come from IC1, IC2, the ISO ray between them, or the plan. When a plan is loaded, **Compare** switches among the measured volume, measured minus plan, and a 3D gamma map scored the AAPM TG-218 way. **Quantity** is dose in Gy along the Bragg curve, or where monitor units or protons stop.
+The left side is a 2×2 grid over a row of two plots. The grid holds the axial slice and the 3D volume with its color axis, then the coronal and sagittal slices. Click a slice to move the crosshair, and scroll to page through slices. Each plot has a picker: **Depth dose** along the beam, **Lateral profile** across it through the crosshair, **DVH**, or **Gamma histogram**. **Source** at the top of the panel switches between logged **Sessions** in a phantom and a **DICOM study**. **Display** (what is shown, ray, sampling), **Gamma** criteria and **Color** are shared by both. The slices take the 3D view's color scale and window, except for Integrate rays and percent windows, which are per ray and not per voxel.
+
+#### Sessions
+
+Builds a 1 mm dose volume from the measured spot or timeslice Gaussians and ray-marches it. Position can come from IC1, IC2, the ISO ray between them, or the plan. When a plan is loaded, **Show** switches among the measured volume, measured minus plan, and a 3D gamma map scored the AAPM TG-218 way. **Quantity** is dose in Gy along the Bragg curve, or where monitor units or protons stop.
 
 **Model** picks how each spot deposits dose. **Analytic** is the fast Gaussian fill. **Monte Carlo** transports proton histories on the GPU with the physics of [MCsquare](https://gitlab.com/openmcsquare/MCsquare) (Class II condensed history, energy-loss straggling, multiple Coulomb scattering, nuclear elastic, inelastic and proton–proton interactions, secondary protons transported). It runs through WebGPU, so it needs a GPU with Vulkan, Metal or Direct3D 12. It is offered for **Dose** in water, PMMA, polystyrene, aluminum and copper, the media with MCsquare stopping and nuclear data. **Histories** sets the total simulated for the volume. More histories take longer but are less noisy. The volume fills in progressively. A noisy first picture appears at once and sharpens as histories add up, and you can rotate and zoom the view throughout. A thin bar across the top of the view shows how far the run has got. Raising Histories carries on from the histories already run, while lowering it below what's done starts over. Gamma and the field bounds wait for the finished run. The note under the view gives the ± statistical uncertainty in the high-dose region and the share of energy that left the grid, so widen the grid if that share is large. Measured and plan are simulated with the same random numbers, so their difference and gamma show the delivery rather than the noise. The Monte Carlo already includes scatter in the phantom, so the **Scatter** option is disabled in that mode.
 
-**Beam** sets the energy spread and the plan spot size: this session per layer, another loaded session, or the interlock. Measured spots keep the logged chamber σ. Scatter in the phantom widens measured and plan together. **Phantom** picks the medium (water, PMMA, polystyrene, polyethylene, A-150, aluminum, or copper), the thickness, and any entrance water-equivalent thickness. **Field Bounds** reports the field size, by default the lateral 50% edge on each slice (ICRU 78), with options for the high-dose core and the planned 90% volume. **View** sets the gantry angle, whether a ray integrates, keeps its maximum, or fades, the voxel size, and nearest, linear, or cubic sampling. See the [screenshot](#screenshots).
+**Beam** sets the energy spread and the plan spot size: this session per layer, another loaded session, or the interlock. Measured spots keep the logged chamber σ. Scatter in the phantom widens measured and plan together. **Phantom** picks the medium (water, PMMA, polystyrene, polyethylene, A-150, aluminum, or copper), the thickness, and any entrance water-equivalent thickness. **Field Bounds** reports the field size, by default the lateral 50% edge on each slice (ICRU 78), with options for the high-dose core and the planned 90% volume. **View** sets the gantry angle, the voxel size, and the spot cap. **Display** sets whether a ray integrates, keeps its maximum, or fades, and nearest, linear, or cubic sampling. See the [screenshot](#screenshots).
 
-### Patient QA (DICOM)
+#### DICOM study
 
 **Open DICOM folder…** reads a planning CT, its RTSTRUCT, an RT Ion Plan (pencil-beam scanning) and, optionally, the TPS RTDOSE. Subfolders are scanned too, and every object must share one frame of reference or the load is refused. Nothing in the folder is modified. The Monte Carlo then recalculates the plan on the CT:
 
@@ -248,16 +251,9 @@ The sessions selected in the launcher are the logged deliveries:
 - Sessions group into fractions in log order: a new fraction starts when a beam repeats. **Fraction** picks one fraction or their sum, and **Beams** narrows to one field.
 - The Study panel lists each beam's delivered-to-planned MU and spot position RMS.
 
-**Show** switches the colorwash between four doses:
+**Dose** in the Study group picks the planned recalculation or the delivered dose. **Show** then draws that dose, delivered minus planned, or gamma against the TPS dose, on the slices and in the 3D volume. Gamma is global, normalized to the TPS maximum, and compares one fraction of the TPS dose with one fraction of the selected delivery. The shared **Gamma** criteria set it. Shown and gamma-evaluated dose is limited to the patient (above −900 HU), because dose in air voxels is noisy.
 
-- the planned recalculation;
-- the delivered dose;
-- delivered minus planned;
-- 3D gamma against the TPS dose.
-
-Gamma is global, normalized to the TPS maximum, and compares one fraction of the TPS dose with one fraction of the selected delivery. Click a slice to move the crosshair and scroll to page through slices. The 3D pane ray-marches the same volume. Shown and gamma-evaluated dose is limited to the patient (above −900 HU), because dose in air voxels is noisy.
-
-DVHs (delivered solid, planned dashed) and **Clinical goals** are for the whole course. The selected dose is scaled to the plan's fraction count. Write one goal per line, like `PTV: D95% >= 95%`, `Cord: Dmax < 45 Gy`, `Lung: V20Gy < 30%` or `Heart: D0.03cc < 30 Gy`. Dose percentages are of **Rx**, which defaults to the plan's target prescription.
+DVHs (the picked dose bright, the other faded) and **Clinical goals** are for the whole course. The selected dose is scaled to the plan's fraction count. Write one goal per line, like `PTV: D95% >= 95%`, `Cord: Dmax < 45 Gy`, `Lung: V20Gy < 30%` or `Heart: D0.03cc < 30 Gy`. Dose percentages are of **Rx**, which defaults to the plan's target prescription.
 
 **Export report…** writes three kinds of file:
 
@@ -332,14 +328,14 @@ Pick a template, set parameters, preview the spot table, and export. Suggested f
 
 ## Phantom Synthesis
 
-The **Phantom Synthesis** tab (`Ctrl+3`) writes a synthetic patient study as real DICOM, so you can try **Patient QA (DICOM)** without patient data. The study has four parts:
+The **Phantom Synthesis** tab (`Ctrl+3`) writes a synthetic patient study as real DICOM, so you can try **Dose Volume**'s DICOM study source without patient data. The study has four parts:
 
 - **CT:** a 120 mm water box in air, with bone and lung slabs, only one of them, or neither.
 - **RTSTRUCT:** BODY, the PTV behind the slabs, a ring with a hole, and each slab.
 - **RT Ion Plan:** one pencil-beam field over the PTV.
-- **RTDOSE (optional):** a Monte Carlo reference dose that stands in for the TPS dose, so gamma has something to compare against. It uses a different random seed from Patient QA, so gamma compares independent noise.
+- **RTDOSE (optional):** a Monte Carlo reference dose that stands in for the TPS dose, so gamma has something to compare against. It uses a different random seed from Dose Volume's recalculation, so gamma compares independent noise.
 
-Set the patient position, CT spacing, energies, gantry and couch angles, spot pitch, range shifter, MU and fractions. The preview shows the axial slice through the isocenter with the beam's direction. **Write DICOM…** writes the study into a new folder, and Patient QA's **Open DICOM folder…** starts in that folder.
+Set the patient position, CT spacing, energies, gantry and couch angles, spot pitch, range shifter, MU and fractions. The preview shows the axial slice through the isocenter with the beam's direction. **Write DICOM…** writes the study into a new folder, and Dose Volume's **Open DICOM folder…** starts in that folder.
 
 ## Plan Runner
 

@@ -613,7 +613,7 @@ def test_auto_color_range_dose_keeps_zero() -> None:
 
 
 def test_color_axis_ticks_cover_the_span_and_zero() -> None:
-    from scan_kit.views.dose_volume_window import color_axis_ticks
+    from scan_kit.views.color_axis import color_axis_ticks
 
     majors, minors, labels, _offset = color_axis_ticks(-0.2, 0.5)
     assert majors[0] == -0.2 and majors[-1] == 0.5
@@ -633,7 +633,7 @@ def test_color_axis_ticks_cover_the_span_and_zero() -> None:
 def test_color_axis_paints_the_scale(qapp) -> None:
     from PySide6.QtGui import QImage
 
-    from scan_kit.views.dose_volume_window import _AXIS_PAD_X, _ColorAxis
+    from scan_kit.views.color_axis import _AXIS_PAD_X, ColorAxis as _ColorAxis
 
     axis = _ColorAxis()
     axis.resize(axis.sizeHint().width(), 360)
@@ -657,8 +657,9 @@ def test_dose_volume_window_opens_with_absolute_scale(qapp, tmp_path) -> None:
     from scan_kit.views.dose_volume_catalog import DEFAULT_ERROR_MU, RAY_TRANSPARENT
     from scan_kit.views.dose_volume_window import DoseVolumeWindow, _log_slider_pos
 
-    window = DoseVolumeWindow([], str(tmp_path))
+    window = DoseVolumeWindow(["none"], str(tmp_path))
     try:
+        assert not window._dicom() and not window._session_box.isHidden() and window._study.panel.isHidden()
         assert window._weight_combo.current_key() == WEIGHT_DOSE
         assert window._error_combo.currentData() == ERROR_ABSOLUTE
         assert window._error_scale_spin.value() == pytest.approx(DEFAULT_ERROR_MU)
@@ -675,7 +676,8 @@ def test_dose_volume_window_opens_with_absolute_scale(qapp, tmp_path) -> None:
         assert [group_of(w) for w in (window._medium_combo, window._margin_spin, window._wet_spin)] == ["Phantom"] * 3
         assert [group_of(w) for w in (window._weight_combo, window._voxel_spin)] == ["Compare", "View"]
         assert group_of(window._plan_sigma_combo) == "Beam"
-        assert [group_of(w) for w in (window._grid_label, window._spots_label)] == ["View"] * 2
+        assert [group_of(w) for w in (window._grid_label, window._spots_label)] == ["Display", "View"]
+        assert [group_of(w) for w in (window._show_combo, window._ray_combo, window._interp)] == ["Display"] * 3
         assert group_of(window._scatter_check) == "Beam"
         assert not window._margin_row.isHidden() and not window._gap_row.isHidden()
         assert not window._phantom_box_check.isChecked() and window._field_box_check.isChecked()
@@ -704,11 +706,12 @@ def test_dose_volume_window_opens_with_absolute_scale(qapp, tmp_path) -> None:
         assert window._scale_mode_row.isHidden()
         assert window._grain_combo.parentWidget().findChild(QLabel).text() == "Data"
         assert window._cap_spin.parentWidget().findChild(QLabel).text() == "Spot cap"
-        # The splitter handle sits between the axis and the controls.
+        # The color axis is glued to the right of the 3D pane; the workspace fills the plot side.
         view = window._color_axis.parentWidget()
-        assert view.layout().indexOf(window._plot_host) == 0
+        assert view is window._workspace.volume
+        assert view.layout().indexOf(window._vispy_canvas.native) == 0
         assert view.layout().indexOf(window._color_axis) == 1
-        assert window._splitter.widget(0) is view
+        assert window._splitter.widget(0) is window._plot_host
         assert window._splitter.widget(1) is window._side_scroll
         assert window._voxel_spin.value() == 1.0
         assert window._interp.current_key() == "linear"
