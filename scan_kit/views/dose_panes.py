@@ -145,6 +145,9 @@ def _splitter(orientation, *widgets) -> QSplitter:
     split.setHandleWidth(6)
     for w in widgets:
         split.addWidget(w)
+    # Even, not by size hint (the 3D pane asks for more than a slice). Weights below a pane's
+    # minimum width get clamped to it, which skews the split, so they are large.
+    split.setSizes([10_000] * len(widgets))
     return split
 
 

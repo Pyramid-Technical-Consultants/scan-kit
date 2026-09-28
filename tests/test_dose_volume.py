@@ -1163,6 +1163,24 @@ def test_workspace_cells_swap_views_and_planes_rotate(qapp) -> None:
         ws.close()
 
 
+def test_workspace_grid_starts_even(qapp) -> None:
+    from scan_kit.views.dose_panes import DoseWorkspace
+
+    ws = DoseWorkspace()
+    ws.resize(1200, 900)
+    ws.show()
+    qapp.processEvents()
+    try:
+        top, bottom, _plots = ws.rows
+        assert top.sizes() == bottom.sizes()
+        assert abs(top.sizes()[0] - top.sizes()[1]) <= 2
+        ws.resize(1500, 900)
+        qapp.processEvents()
+        assert top.sizes() == bottom.sizes() and abs(top.sizes()[0] - top.sizes()[1]) <= 2
+    finally:
+        ws.close()
+
+
 def test_scene_snapshot_includes_the_ray_march(qapp) -> None:
     """``SceneCanvas.render`` skips the march; the report's snapshot must not."""
     from scan_kit.views.dose_panes import VolumePane
