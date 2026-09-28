@@ -25,6 +25,8 @@ BATCH_HISTORIES = 100_000
 # Whole batches: every dispatch waits on its slowest history, so a batch split in two pays that twice.
 DISPATCH_HISTORIES = BATCH_HISTORIES
 IN_FLIGHT = 4
+# A slice lasts at least its slowest history (ms on a CT), so smaller ones only idle the GPU.
+MIN_SLICE_HISTORIES = DISPATCH_HISTORIES // 8
 QUANTUM_MEV = 1e-4
 # One proton stopping in a 1 mg/cm³ air voxel outdoses the target, so the uncertainty skips air (about −900 HU).
 SCORED_DENSITY = 0.1
@@ -246,7 +248,9 @@ class McRun:
         self._per_batch = min(BATCH_HISTORIES, histories // BATCHES)
         self.histories = histories // self._per_batch * self._per_batch
         self._next = 0  # histories dispatched so far
-        self._chunk = DISPATCH_HISTORIES
+        self._chunk = MIN_SLICE_HISTORIES  # histories per queued slice
+        self._queued = False
+        self._budget = math.inf
         spots = np.ascontiguousarray(spots, dtype=np.float32)
         if protons <= 0.0 or len(spots) == 0:
             self.dose = np.zeros(self._shape_zyx, dtype=np.float32)
@@ -386,44 +390,59 @@ class McRun:
         ))
         self._lib.fold.run(self._fold_group, *workgroups_1d(self._nvox))
 
+    def _queue(self, histories: int) -> None:
+        """Submit up to *histories* more, in dispatches short of the Windows GPU timeout."""
+        queue = device().queue
+        end = min(self._next + histories, self.histories)
+        while self._next < end:
+            count = min(DISPATCH_HISTORIES, self._per_batch - self._next % self._per_batch, end - self._next)
+            queue.write_buffer(self._bufs["params"], 0, _TRANSPORT.pack(
+                **self._params, hist_base=self._next, nhist=count,
+            ))
+            queue.write_buffer(self._bufs["ledger"], 56, bytes(4))
+            self._lib.transport.run(self._transport, (count + 63) // 64)
+            self._next += count
+            if self._next % self._per_batch == 0:
+                self._fold(0, 1.0 / self._next)
+
+    def _settle(self) -> None:
+        """Wait for the queued slice, and size the next by how long that blocked the caller."""
+        if not self._queued:
+            return
+        t0 = time.perf_counter()
+        # ponytail: wait() drains the whole queue, so runs stepped together share their blocking;
+        # a fence per slice needs wgpu promise polling, which wgpu-py 0.32 only offers under asyncio.
+        wait()
+        blocked = time.perf_counter() - t0
+        self._queued = False
+        # Integer tallies add in any order, so the slice size never changes the dose.
+        if blocked > 0.5 * self._budget:
+            self._chunk = max(self._chunk // 2, MIN_SLICE_HISTORIES)
+        elif blocked < 0.1 * self._budget:
+            self._chunk = min(self._chunk * 2, IN_FLIGHT * DISPATCH_HISTORIES)
+
     def step(self, budget_s: float = math.inf) -> bool:
-        """Transport for about *budget_s* seconds; True once the run is finished."""
+        """Transport; True once the run is finished.
+
+        With a finite *budget_s* this queues a slice and returns while the GPU runs it: the
+        next call (or :meth:`preview`) waits for it, which should take under about *budget_s*.
+        """
         if self.done:
             return True
-        queue = device().queue
-        end = time.perf_counter() + budget_s
-        while True:
-            t0 = time.perf_counter()
-            last = False
-            # Short submissions keep each one well under the Windows GPU timeout; queued
-            # IN_FLIGHT deep, the GPU runs them back to back instead of idling on the host.
-            for _ in range(IN_FLIGHT):
-                start = self._next % self._per_batch
-                count = min(self._chunk, self._per_batch - start)
-                queue.write_buffer(self._bufs["params"], 0, _TRANSPORT.pack(
-                    **self._params, hist_base=self._next, nhist=count,
-                ))
-                queue.write_buffer(self._bufs["ledger"], 56, bytes(4))
-                self._lib.transport.run(self._transport, (count + 63) // 64)
-                self._next += count
-                if self._next % self._per_batch == 0:
-                    last = self._next == self.histories
-                    self._fold(1 if last else 0, 1.0 / self._next)
-                    if last:
-                        break
-            wait()
+        self._budget = budget_s
+        self._settle()
+        while self._next < self.histories:
             if math.isfinite(budget_s):
-                # Integer tallies add in any order, so the slice size never changes the dose.
-                took = time.perf_counter() - t0
-                if took > 0.6 * budget_s:
-                    self._chunk = max(self._chunk // 2, 1024)
-                elif took < 0.2 * budget_s:
-                    self._chunk = min(self._chunk * 2, DISPATCH_HISTORIES)
-            if last:
-                self._finish()
-                return True
-            if time.perf_counter() >= end:
+                self._queue(self._chunk)
+                self._queued = True
                 return False
+            # Queued IN_FLIGHT deep, the GPU runs dispatches back to back instead of idling on the host.
+            self._queue(IN_FLIGHT * DISPATCH_HISTORIES)
+            wait()
+        # The last batch is folded already, so this only stores it (and covers a target lowered to here).
+        self._fold(1, 1.0 / self._next)
+        self._finish()
+        return True
 
     def preview(self) -> np.ndarray | None:
         """The mean dose of the histories so far, ``(nz, ny, nx)`` Gy; None before any."""
@@ -431,6 +450,7 @@ class McRun:
             return self.dose
         if self._next == 0:
             return None
+        self._settle()
         self._fold(2, 1.0 / self._next)
         return read(self._bufs["out"], np.float32).reshape(self._shape_zyx)
 
@@ -438,6 +458,7 @@ class McRun:
         """LETd (keV/µm) of the histories so far, ``(nz, ny, nx)``; None when not scored or before any."""
         if self.done or not self._flags & FLAG_LET or self._next == 0:
             return self.let
+        self._settle()
         return self._read_let()
 
     def _read_let(self) -> np.ndarray:
