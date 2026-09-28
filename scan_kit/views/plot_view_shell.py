@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..common.app_icon import apply_qt_application_branding, prepare_qt_app_identity
+from ..common.gui_gc import collect_on_gui_thread
 from ..common.progress_line import ProgressLine
 from ..common.qt_theme import apply_saved_ui_theme
 from ..common.view_runner import _READY_SENTINEL
@@ -298,6 +299,7 @@ def run_view_window(
     app = QApplication.instance()
     if app is None:
         app = QApplication(sys.argv)
+    collect_on_gui_thread(app)
     app_icon = apply_qt_application_branding(app)
     apply_saved_ui_theme(app=app)
 

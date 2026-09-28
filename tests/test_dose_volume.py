@@ -1138,3 +1138,31 @@ def test_gpu_layer_fill_and_gamma_match_python(qapp) -> None:
     assert n == ref_n and abs(passed - ref_pass) <= max(2, ref_n // 500)
     assert np.abs(gam - ref_gam).max() < 0.02
 
+
+
+def test_scene_snapshot_includes_the_ray_march(qapp) -> None:
+    """``SceneCanvas.render`` skips the march; the report's snapshot must not."""
+    from scan_kit.views.dose_panes import VolumePane
+    from scan_kit.views.dose_volume_vispy import VolumeScene
+    from scan_kit.views.vispy_plot import ensure_gl_plus
+
+    ensure_gl_plus()
+    pane = VolumePane()
+    pane.resize(320, 320)
+    pane.show()
+    qapp.processEvents()
+    try:
+        scene = VolumeScene(pane.canvas)
+        z, y, x = np.mgrid[:24, :24, :24]
+        scene.show_volumes((0.0, 0.0, 0.0), (1.0, 1.0, 1.0),
+                           np.exp(-((x - 12) ** 2 + (y - 12) ** 2 + (z - 12) ** 2) / 30.0).astype(np.float32))
+        qapp.processEvents()
+        try:
+            plain = np.asarray(pane.canvas.render())[..., :3].astype(int)
+            snap = scene.snapshot()[..., :3].astype(int)
+        except Exception as exc:  # noqa: BLE001
+            pytest.skip(f"visPy cannot render offscreen: {exc}")
+        assert snap.shape == plain.shape
+        assert (np.abs(snap - plain) > 30).any(-1).sum() > 200
+    finally:
+        pane.close()

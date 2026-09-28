@@ -25,6 +25,8 @@ BATCH_HISTORIES = 100_000
 # Whole batches: every dispatch waits on its slowest history, so a batch split in two pays that twice.
 DISPATCH_HISTORIES = BATCH_HISTORIES
 QUANTUM_MEV = 1e-4
+# One proton stopping in a 1 mg/cm³ air voxel outdoses the target, so the uncertainty skips air (about −900 HU).
+SCORED_DENSITY = 0.1
 MEV_TO_J = 1.602176634e-13
 LEDGER_KEYS = ("incident", "grid", "off_grid", "leaked", "lost", "beamline")
 TYPE_MIXTURE, TYPE_ICRU, TYPE_PP = 0, 1, 2
@@ -171,10 +173,13 @@ def _mc_lib() -> _McLib:
     return _McLib()
 
 
-def batch_uncertainty(dose_sum: np.ndarray, dose_sq: np.ndarray, batches: int = BATCHES) -> float:
-    """MCsquare ``Process_batch``: mean relative σ over voxels above half the maximum."""
-    s = np.asarray(dose_sum, dtype=float)
-    q = np.asarray(dose_sq, dtype=float)
+def batch_uncertainty(dose_sum: np.ndarray, dose_sq: np.ndarray, batches: int = BATCHES, scored=None) -> float:
+    """MCsquare ``Process_batch``: mean relative σ over voxels above half the maximum, of the *scored* ones."""
+    s = np.asarray(dose_sum, dtype=float).reshape(-1)
+    q = np.asarray(dose_sq, dtype=float).reshape(-1)
+    if scored is not None:
+        keep = np.asarray(scored, dtype=bool).reshape(-1)
+        s, q = s[keep], q[keep]
     peak = float(s.max()) if s.size else 0.0
     if peak <= 0.0:
         return 0.0
@@ -228,6 +233,7 @@ class McRun:
         self._shape_zyx = (nz, ny, nx)
         nvox = self._nvox = nx * ny * nz
         self._flags = int(flags)
+        self._scored = None if density is None else np.asarray(density).reshape(-1) >= SCORED_DENSITY
         histories = max(int(histories), BATCHES)
         self._per_batch = min(BATCH_HISTORIES, histories // BATCHES)
         self.histories = histories // self._per_batch * self._per_batch
@@ -425,7 +431,8 @@ class McRun:
             self.let = let.astype(np.float32).reshape(self._shape_zyx)
         self.result = McResult(
             histories=self.histories,
-            uncertainty=batch_uncertainty(dose_sum, read(b["sq"], np.float32), self.histories // self._per_batch),
+            uncertainty=batch_uncertainty(dose_sum, read(b["sq"], np.float32), self.histories // self._per_batch,
+                                          self._scored),
             ledger=ledger,
             overflow=int(raw[12]),
             deepest=int(raw[13]),

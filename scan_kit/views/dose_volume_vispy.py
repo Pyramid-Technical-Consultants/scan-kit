@@ -942,6 +942,21 @@ class VolumeScene:
                 line.draw()
         self._consume_auto_span(span)
 
+    def snapshot(self) -> np.ndarray:
+        """The canvas as drawn, RGBA ``(h, w, 4)``; ``SceneCanvas.render`` skips :meth:`_on_draw` and so the march."""
+        from vispy import gloo
+
+        w, h = (int(v) for v in self._canvas.physical_size)
+        fbo = gloo.FrameBuffer(color=gloo.RenderBuffer((h, w, 4)), depth=gloo.RenderBuffer((h, w), "depth"))
+        self._canvas.set_current()
+        self._canvas.push_fbo(fbo, (0, 0), (w, h))
+        try:
+            self._mc_redraw = True  # not a camera move
+            self._on_draw(None)
+            return fbo.read()
+        finally:
+            self._canvas.pop_fbo()
+
     def _consume_auto_span(self, span) -> None:
         if not self._auto or self._gamma or span is None:
             return

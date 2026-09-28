@@ -19,7 +19,6 @@ from PySide6.QtGui import (
     QAction,
     QActionGroup,
     QCloseEvent,
-    QIcon,
     QKeySequence,
     QMoveEvent,
     QResizeEvent,
@@ -27,13 +26,10 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QApplication,
-    QButtonGroup,
-    QFrame,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
-    QLineEdit,
     QMainWindow,
     QMenu,
     QMessageBox,
@@ -46,10 +42,10 @@ from PySide6.QtWidgets import (
 )
 
 from . import __version__
+from .common.gui_gc import collect_on_gui_thread
 from .common.app_icon import (
     apply_qt_application_branding,
     apply_windows_window_icons,
-    load_app_icon,
     prepare_qt_app_identity,
 )
 from .common.app_settings import AppSettings
@@ -161,7 +157,7 @@ class ScanKitMainWindow(QMainWindow):
         self._plan_runner_panel: PlanRunnerPanel | None = None
         self._config_tuning_panel: ConfigTuningPanel | None = None
         self._debug_log_panel: DebugLogPanel | None = None
-        self._deferred_tab_steps: list = []
+        self._deferred_tab_steps: list | None = []
 
         boot = QWidget()
         boot_l = QVBoxLayout(boot)
@@ -174,6 +170,8 @@ class ScanKitMainWindow(QMainWindow):
 
     def _deferred_finish_init(self) -> None:
         """Build UI in event-loop chunks so GNOME does not mark us unresponsive."""
+        if self._main_tabs is not None or self._deferred_tab_steps is None:
+            return  # built by _build_ui, or already shut down
         self._init_main_tabs_shell()
         self._connect_thread_signals()
         QTimer.singleShot(0, self._request_settings_then_scan)
@@ -188,6 +186,8 @@ class ScanKitMainWindow(QMainWindow):
         QTimer.singleShot(0, self._pump_deferred_tab_steps)
 
     def _pump_deferred_tab_steps(self) -> None:
+        if self._deferred_tab_steps is None:
+            return
         if not self._deferred_tab_steps:
             # Warm workers re-exec the frozen binary; delay until the shell is idle.
             QTimer.singleShot(2500, self._refill_warm_pool)
@@ -1099,6 +1099,7 @@ class ScanKitMainWindow(QMainWindow):
         super().closeEvent(event)
 
     def _shutdown_children(self) -> None:
+        self._deferred_tab_steps = None
         if self._session_browser is not None:
             self._session_browser.shutdown()
         panel = getattr(self, "_config_tuning_panel", None)
@@ -1182,6 +1183,7 @@ def main() -> None:
 
     prepare_qt_app_identity()
     app = QApplication(sys.argv)
+    collect_on_gui_thread(app)
     app_icon = apply_qt_application_branding(app)
     apply_saved_ui_theme(app=app)
     win = ScanKitMainWindow()

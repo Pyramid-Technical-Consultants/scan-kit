@@ -1530,15 +1530,18 @@ class DoseVolumeWindow(VispyViewWindow):
 
     def _snapshot(self) -> bytes:
         """The whole workspace as PNG bytes, for the report."""
-        from PySide6.QtCore import QBuffer, QIODevice, QPoint
+        from PySide6.QtCore import QBuffer, QIODevice, QPoint, QRect
+        from PySide6.QtGui import QImage, QPainter
 
-        ws, screen = self._workspace, self._workspace.screen()
-        if ws.isVisible() and screen is not None:
-            # Widget grabs and offscreen renders both miss the ray-marched volume; the screen has it.
-            at = ws.mapToGlobal(QPoint(0, 0)) - screen.geometry().topLeft()
-            pix = screen.grabWindow(0, at.x(), at.y(), ws.width(), ws.height())
-        else:
-            pix = ws.grab()
+        ws, native = self._workspace, self._vispy_canvas.native
+        pix = ws.grab()  # misses the 3D canvas, which is painted in from the scene
+        if native.isVisible():  # a never-shown canvas has no GL context
+            img = np.ascontiguousarray(self._scene.snapshot())
+            h, w = img.shape[:2]
+            painter = QPainter(pix)
+            painter.drawImage(QRect(native.mapTo(ws, QPoint(0, 0)), native.size()),
+                              QImage(img.data, w, h, 4 * w, QImage.Format.Format_RGBA8888))
+            painter.end()
         buf = QBuffer()
         buf.open(QIODevice.OpenModeFlag.WriteOnly)
         pix.save(buf, "PNG")

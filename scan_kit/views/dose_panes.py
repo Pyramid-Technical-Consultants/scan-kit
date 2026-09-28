@@ -15,11 +15,11 @@ from dataclasses import dataclass, field
 
 import numpy as np
 from PySide6.QtCore import QEvent, Qt, Signal
-from PySide6.QtWidgets import QComboBox, QGridLayout, QHBoxLayout, QLabel, QSplitter, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QComboBox, QHBoxLayout, QLabel, QSplitter, QVBoxLayout, QWidget
 
 from .color_axis import ColorAxis
 from .dose_volume_catalog import DEFAULT_SCALE
-from .dose_volume_fill import colormap_samples
+from .dose_volume_fill import colormap_samples, ink_rgb, zero_rgb
 from .vispy_plot import (
     FG,
     ORDER_DATA,
@@ -136,6 +136,15 @@ def lateral_dir(beam_dir) -> np.ndarray:
     return across / np.linalg.norm(across)
 
 
+def _splitter(orientation, *widgets) -> QSplitter:
+    split = QSplitter(orientation)
+    split.setChildrenCollapsible(False)
+    split.setHandleWidth(6)
+    for w in widgets:
+        split.addWidget(w)
+    return split
+
+
 def _gl_2d(visual, order: int) -> None:
     visual.set_gl_state("translucent", depth_test=False, depth_mask=False, cull_face=False)
     visual.order = order
@@ -179,7 +188,7 @@ class SlicePane:
     def native(self):
         return self.canvas.native
 
-    def set_theme(self, bg: str, fg: str) -> None:
+    def set_theme(self, bg, fg) -> None:
         self.canvas.bgcolor = self.view.bgcolor = bg
         self._title._text_visual.color = fg  # vispy Label has no public color setter
         self.canvas.update()
@@ -395,35 +404,37 @@ class DoseWorkspace(QWidget):
         for pane in self.plots:
             pane.kindChanged.connect(lambda _k, pane=pane: self._draw_plot(pane))
 
-        grid_host = QWidget()
-        grid = QGridLayout(grid_host)
-        grid.setContentsMargins(0, 0, 0, 0)
-        grid.setSpacing(4)
-        grid.addWidget(self.slices[0].native, 0, 0)
-        grid.addWidget(self.volume, 0, 1)
-        grid.addWidget(self.slices[1].native, 1, 0)
-        grid.addWidget(self.slices[2].native, 1, 1)
-        plot_row = QSplitter(Qt.Orientation.Horizontal)
-        for pane in self.plots:
-            plot_row.addWidget(pane)
-        split = QSplitter(Qt.Orientation.Vertical)
-        split.addWidget(grid_host)
-        split.addWidget(plot_row)
-        split.setStretchFactor(0, 3)
-        split.setStretchFactor(1, 1)
-        split.setSizes([700, 260])
+        # Every boundary drags: the two grid rows share their column split so the 2×2 stays square.
+        top = _splitter(Qt.Orientation.Horizontal, self.slices[0].native, self.volume)
+        bottom = _splitter(Qt.Orientation.Horizontal, self.slices[1].native, self.slices[2].native)
+        top.splitterMoved.connect(lambda *_: bottom.setSizes(top.sizes()))
+        bottom.splitterMoved.connect(lambda *_: top.setSizes(bottom.sizes()))
+        plot_row = _splitter(Qt.Orientation.Horizontal, *self.plots)
+        self.splitter = _splitter(Qt.Orientation.Vertical, top, bottom, plot_row)
+        self.splitter.setSizes([350, 350, 260])
+        self.rows = (top, bottom, plot_row)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.addWidget(split)
+        layout.addWidget(self.splitter)
         self._apply_theme()
         self.clear("")
 
     # ---- theme ----------------------------------------------------------------------------------
 
     def _apply_theme(self) -> None:
-        bg, fg = self.palette().window().color().name(), self.palette().windowText().color().name()
+        self._palette = self.palette().window().color().name(), self.palette().windowText().color().name()
         for pane in (*self.slices, *self.plots):
-            pane.set_theme(bg, fg)
+            pane.set_theme(*self._palette)
+        if hasattr(self, "_layers"):
+            self._draw_slices()
+
+    def _slice_colors(self) -> tuple:
+        """Background and ink: the scale's zero color under a dose, as in the 3D view, else the palette."""
+        lay = self._layers
+        if lay.wash is None:
+            return self._palette
+        bg = zero_rgb(lay.scale, lay.lo, lay.hi)
+        return bg, ink_rgb(bg)
 
     def changeEvent(self, event) -> None:  # noqa: N802 - Qt
         super().changeEvent(event)
@@ -444,6 +455,7 @@ class DoseWorkspace(QWidget):
         self._frame = None
         self._layers = DoseLayers()
         for n, pane in enumerate(self.slices):
+            pane.set_theme(*self._palette)
             pane.clear(message if n == 0 else "")
         self._draw_plots()
 
@@ -512,11 +524,14 @@ class DoseWorkspace(QWidget):
         # Over a CT the dose is a translucent wash; alone it is the picture.
         alpha = OVERLAY_ALPHA if f.ct is not None else 1.0
         checked = [r for r in self._checked if r < len(f.rois)]
+        bg, ink = self._slice_colors()
+        cross = np.tile(np.float32(_rgba(ink, 0.45)), (4, 1))
         for p, pane in enumerate(self.slices):
+            pane.set_theme(bg, ink)
             (a, b), index = PLANE_AXES[p], int(self._cursor[PLANE_NORMAL[p]])
             w, h, cx, cy = ext[a], ext[b], center[a], center[b]
             segs = [np.array([[cx, 0.0], [cx, h], [0.0, cy], [w, cy]], np.float32)]
-            colors = [np.tile(np.float32([1.0, 1.0, 1.0, 0.45]), (4, 1))]
+            colors = [cross]
             for r in checked:
                 s = self._outline(p, index, r, (sp[a], sp[b]))
                 segs.append(s)
