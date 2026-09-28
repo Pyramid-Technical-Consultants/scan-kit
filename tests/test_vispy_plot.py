@@ -211,7 +211,13 @@ def test_blender_numpad_snaps_turntable_like_blender() -> None:
     assert blender_numpad_action("7", ctrl=True) == "snap:0:-90"
     assert blender_numpad_action("9") == "opposite"
     assert blender_numpad_action("5") == "ortho"
-    assert blender_numpad_action("2") == ""
+    assert blender_numpad_action("Clear") == "ortho"
+    assert blender_numpad_action("6") == blender_numpad_action("Right") == "orbit:-15:0"
+    assert blender_numpad_action("4") == blender_numpad_action("Left") == "orbit:15:0"
+    assert blender_numpad_action("8") == blender_numpad_action("Up") == "orbit:0:15"
+    assert blender_numpad_action("2") == blender_numpad_action("Down") == "orbit:0:-15"
+    assert blender_numpad_action("2", ctrl=True) == ""
+    assert blender_numpad_action("0") == ""
 
     cam = MagicMock(azimuth=30.0, elevation=25.0, fov=45.0, roll=10.0)
     assert apply_blender_view_action(cam, "snap:180:0")
@@ -229,6 +235,35 @@ def test_blender_numpad_snaps_turntable_like_blender() -> None:
     assert cam.fov == 0.0
     assert apply_blender_view_action(cam, "ortho")
     assert cam.fov == 45.0
+    cam.azimuth, cam.elevation = 350.0, 80.0
+    assert apply_blender_view_action(cam, "orbit:15:15")
+    assert (cam.azimuth, cam.elevation) == (5.0, 90.0)
+
+
+def test_blender_keys_reach_the_camera_with_numlock_off(qapp) -> None:
+    from PySide6.QtCore import QEvent, Qt
+    from PySide6.QtGui import QKeyEvent
+
+    from scan_kit.views.vispy_plot import bind_blender_view_keys, make_scene_canvas
+
+    canvas = make_scene_canvas()
+    cam = MagicMock(azimuth=30.0, elevation=25.0, fov=45.0, roll=0.0)
+    bind_blender_view_keys(canvas, lambda: cam)
+    keypad = Qt.KeyboardModifier.KeypadModifier
+
+    def press(key, text=""):
+        qapp.sendEvent(canvas.native, QKeyEvent(QEvent.Type.KeyPress, key, keypad, text))
+
+    try:
+        press(Qt.Key.Key_Clear)  # keypad 5, NumLock off
+        assert cam.fov == 0.0
+        press(Qt.Key.Key_5, "5")
+        assert cam.fov == 45.0
+        press(Qt.Key.Key_Right)  # keypad 6, NumLock off
+        press(Qt.Key.Key_8, "8")
+        assert (cam.azimuth, cam.elevation) == (15.0, 40.0)
+    finally:
+        canvas.close()
 
 
 def test_ensure_gl_plus_returns_false_when_backend_missing() -> None:
