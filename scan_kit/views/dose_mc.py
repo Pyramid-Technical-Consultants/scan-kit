@@ -31,7 +31,8 @@ MEV_TO_J = 1.602176634e-13
 LEDGER_KEYS = ("incident", "grid", "off_grid", "leaked", "lost", "beamline")
 TYPE_MIXTURE, TYPE_ICRU, TYPE_PP = 0, 1, 2
 MODE_SLAB, MODE_PATIENT = 0, 1
-FLAG_DOSE_TO_WATER, FLAG_LET = 1, 2
+FLAG_DOSE_TO_WATER, FLAG_LET, FLAG_LET_WATER = 1, 2, 4
+LET_WATER = "water"
 SIMPLE_STRIDE, BDL_STRIDE, BEAM_STRIDE = 8, 40, 16
 
 _TRANSPORT = Params("Params", [
@@ -320,11 +321,14 @@ class McRun:
     @classmethod
     def patient(
         cls, spots: np.ndarray, protons, beams: np.ndarray, material: np.ndarray, density: np.ndarray,
-        spacing_mm, *, histories: int, seed: int, dose_to_water: bool = True, let: bool = False,
+        spacing_mm, *, histories: int, seed: int, dose_to_water: bool = True, let: bool | str = False,
     ) -> McRun:
         """BDL spot records (:meth:`~scan_kit.qa.beam_model.BeamModel.spot_records`) carrying
         *protons* each, through a ``(nz, ny, nx)`` volume of per-voxel medium and density,
         scored on its own grid.
+
+        *let* scores LETd: ``True`` in the medium, as MCsquare does; :data:`LET_WATER` in water
+        at unit density, the quantity RBE models and the EPTN reporting consensus use.
 
         *beams* rows are :func:`beam_record`\\ s in the volume's frame: mm along its axes from
         the corner of voxel 0.
@@ -341,7 +345,8 @@ class McRun:
             raise ValueError("material and density must be the same (nz, ny, nx) volume")
         if len(mc_media()) > 256 or (material.size and int(material.max()) >= len(mc_media())):
             raise ValueError("material indices must address the Monte Carlo tables")
-        flags = (FLAG_DOSE_TO_WATER if dose_to_water else 0) | (FLAG_LET if let else 0)
+        flags = ((FLAG_DOSE_TO_WATER if dose_to_water else 0) | (FLAG_LET if let else 0)
+                 | (FLAG_LET_WATER if let == LET_WATER else 0))
         return cls(
             spots, float(w.sum()), mode=MODE_PATIENT, origin_cm=(0.0, 0.0, 0.0),
             spacing_cm=np.asarray(spacing_mm, dtype=float) / 10.0, shape=material.shape[::-1],
@@ -417,6 +422,18 @@ class McRun:
         self._fold(2, 1.0 / self._next)
         return read(self._bufs["out"], np.float32).reshape(self._shape_zyx)
 
+    def preview_let(self) -> np.ndarray | None:
+        """LETd (keV/µm) of the histories so far, ``(nz, ny, nx)``; None when not scored or before any."""
+        if self.done or not self._flags & FLAG_LET or self._next == 0:
+            return self.let
+        return self._read_let()
+
+    def _read_let(self) -> np.ndarray:
+        q = _pack64(read(self._bufs["let"], np.uint32)).reshape(-1, 2).astype(np.float64)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            let = np.where(q[:, 1] > 0, q[:, 0] / q[:, 1], 0.0)
+        return let.astype(np.float32).reshape(self._shape_zyx)
+
     def _finish(self) -> None:
         b = self._bufs
         raw = read(b["ledger"], np.uint32)
@@ -425,10 +442,7 @@ class McRun:
         dose_sum = read(b["sum"], np.float32)
         self.dose = read(b["out"], np.float32).reshape(self._shape_zyx)
         if self._flags & FLAG_LET:
-            q = _pack64(read(b["let"], np.uint32)).reshape(-1, 2).astype(np.float64)
-            with np.errstate(divide="ignore", invalid="ignore"):
-                let = np.where(q[:, 1] > 0, q[:, 0] / q[:, 1], 0.0)
-            self.let = let.astype(np.float32).reshape(self._shape_zyx)
+            self.let = self._read_let()
         self.result = McResult(
             histories=self.histories,
             uncertainty=batch_uncertainty(dose_sum, read(b["sq"], np.float32), self.histories // self._per_batch,

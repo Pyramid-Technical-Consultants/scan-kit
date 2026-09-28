@@ -81,7 +81,7 @@ def sub_grid(grid: VolumeGrid, box) -> VolumeGrid:
 
 def patient_run(
     ct: CtImage, calibration: CtCalibration, model: BeamModel, plan: IonPlan, spots: SpotSet, *,
-    histories: int, seed: int, dose_to_water: bool = True, let: bool = False, crop: bool = True,
+    histories: int, seed: int, dose_to_water: bool = True, let: bool | str = False, crop: bool = True,
 ) -> tuple[McRun, VolumeGrid]:
     """A Monte Carlo run of *spots* on *ct*, and the grid its dose lands on (the CT, or
     the CT cropped to the patient). Dose is Gy for the MU given."""

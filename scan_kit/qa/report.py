@@ -20,13 +20,15 @@ def _table(head, rows) -> str:
 
 def write_report(
     folder: str | Path, name: str, *, title: str, provenance: dict, dvhs: dict, goals=(), gamma=None,
-    matches=(), png: bytes | None = None,
+    matches=(), png: bytes | None = None, let_stats: dict | None = None,
 ) -> Path:
     """Write ``name.html`` and ``name_dvh.csv`` into *folder*; returns the HTML path.
 
     *goals* are ``(Goal, value, passed)``; *gamma* a :class:`~.analysis.GammaReport`;
-    *matches* the :class:`~.delivered.DeliveryMatch` of each logged beam.
+    *matches* the :class:`~.delivered.DeliveryMatch` of each logged beam; *let_stats*
+    structure name -> (dose-weighted LETd keV/µm, dose-weighted RBE).
     """
+    let_stats = let_stats or {}
     folder = Path(folder)
     folder.mkdir(parents=True, exist_ok=True)
     parts = [f"<h1>{html.escape(title)}</h1>", f"<p class=warn>{html.escape(DISCLAIMER)}</p>"]
@@ -48,10 +50,12 @@ def write_report(
             [(html.escape(g.text), f"{v:.2f} {html.escape(g.unit)}", "pass" if ok else "<b class=warn>FAIL</b>")
              for g, v, ok in goals])]
     if dvhs:
-        parts += ["<h2>Dose statistics (Gy(RBE), whole course)</h2>", _table(
-            ("Structure", "Volume (cc)", "Dmean", "D98%", "D95%", "D50%", "D2%", "Dmax"),
+        rbe = provenance.get("rbe", {}).get("model", "RBE 1.1")
+        parts += [f"<h2>Dose statistics (Gy(RBE), {html.escape(rbe)}, whole course)</h2>", _table(
+            ("Structure", "Volume (cc)", "Dmean", "D98%", "D95%", "D50%", "D2%", "Dmax", "LETd (keV/µm)", "RBE"),
             [(html.escape(n), f"{h.volume_cc:.1f}", *(f"{v:.3f}" for v in (
-                h.mean, h.dose_at(0.98), h.dose_at(0.95), h.dose_at(0.5), h.dose_at(0.02), h.dmax)))
+                h.mean, h.dose_at(0.98), h.dose_at(0.95), h.dose_at(0.5), h.dose_at(0.02), h.dmax)),
+              *((f"{let_stats[n][0]:.2f}", f"{let_stats[n][1]:.3f}") if n in let_stats else ("", "")))
              for n, h in dvhs.items()])]
     parts += ["<h2>Provenance</h2>", f"<pre>{html.escape(json.dumps(provenance, indent=2, default=str))}</pre>"]
     style = ("body{font-family:sans-serif;max-width:1100px;margin:2em auto}img{max-width:100%}"

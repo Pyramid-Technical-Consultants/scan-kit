@@ -255,6 +255,14 @@ The sessions selected in the launcher are the logged deliveries:
 
 DVHs (the picked dose bright, the other faded) and **Clinical goals** are for the whole course. The selected dose is scaled to the plan's fraction count. Write one goal per line, like `PTV: D95% >= 95%`, `Cord: Dmax < 45 Gy`, `Lung: V20Gy < 30%` or `Heart: D0.03cc < 30 Gy`. Dose percentages are of **Rx**, which defaults to the plan's target prescription.
 
+**RBE** sets how the shown dose, DVHs and goals are weighted. **Constant 1.1** is the clinical convention and the default. The variable models weight each voxel by its LETd, and all except Unkelbach also by the dose per fraction and **(α/β)x**:
+
+- **McNamara 2015**: fitted to the largest in vitro dataset. The Dutch proton centres report with it at (α/β)x = 2 Gy, the default here.
+- **Wedenberg 2013** and **Carabe 2012**: the earlier linear-quadratic models.
+- **Unkelbach 2016**: 1 + 0.04 µm/keV × LETd, with no dose or tissue dependence.
+
+LETd is scored in every run, dose-averaged over primary and secondary protons, in water at unit density, as the EPTN consensus recommends. The RBE group lists each checked structure's dose-weighted LETd and RBE, and the report adds both columns to its dose statistics. Changing the model or (α/β)x reweights the finished doses without another Monte Carlo run. Gamma against the TPS always compares physical dose, whatever the model. One (α/β)x applies to every voxel.
+
 **Export report…** writes three kinds of file:
 
 - An RTDOSE for each dose, in the CT's study and frame of reference, holding the raw calculation. Its Image Comments hold the provenance as JSON: input UIDs, calibration and beam-model digests, engine version, GPU, seed, histories and statistical uncertainty.

@@ -13,6 +13,7 @@ from scan_kit.dicom import StudyIndex, write_dose
 from scan_kit.dicom.calibration import CtCalibration
 from scan_kit.dicom.synthetic import write_phantom
 from scan_kit.qa import BeamModel, Delivery, patient_run, plan_spots
+from scan_kit.qa.rbe import MCNAMARA
 
 
 def _settle(qapp, study, timeout_s: float = 120.0) -> None:
@@ -78,9 +79,21 @@ def test_dose_view_runs_a_study_with_logged_fractions_and_exports(qapp, gpu, tmp
         assert st._n_fractions == 2
         assert float(st.doses[ss.DELIVERED].sum()) == pytest.approx(2.0 * one, rel=0.03)
 
+        # A variable RBE reweighs the finished doses without transporting again; gamma stays dose to dose.
+        rate, ptv_1p1 = st.gamma.rate, st.dvh[ss.DELIVERED]["PTV"].mean
+        st._rbe_combo.setCurrentIndex(st._rbe_combo.findData(MCNAMARA))
+        assert st._alpha_beta.isEnabled() and st.done
+        letd, weight = st.let_stats[ss.DELIVERED]["PTV"]
+        assert 1.0 < letd < 10.0 and 1.0 < weight < 1.6
+        assert st.dvh[ss.DELIVERED]["PTV"].mean == pytest.approx(ptv_1p1 * weight / 1.1, rel=0.02)
+        assert st.gamma.rate == rate
+        st._alpha_beta.setValue(10.0)
+        assert st.let_stats[ss.DELIVERED]["PTV"][1] < weight
+
         html = st.export_report(tmp_path / "out")
         text = html.read_text(encoding="utf-8")
         assert "Gamma vs TPS" in text and "Clinical goals" in text and "data:image/png" in text
+        assert "McNamara 2015" in text and "LETd (keV/µm)" in text
         assert html.with_name(html.stem + "_dvh.csv").is_file()
         doses = sorted((tmp_path / "out").glob("*.dcm"))
         assert len(doses) == 2

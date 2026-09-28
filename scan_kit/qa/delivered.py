@@ -132,7 +132,7 @@ def group_fractions(matches: list[DeliveryMatch]) -> list[list[DeliveryMatch]]:
 
 def fraction_runs(
     ct: CtImage, calibration: CtCalibration, model: BeamModel, plan: IonPlan, matches: list[DeliveryMatch], *,
-    histories: int, seed: int, dose_to_water: bool = True, let: bool = False,
+    histories: int, seed: int, dose_to_water: bool = True, let: bool | str = False,
 ) -> tuple[McRun, McRun, VolumeGrid]:
     """(delivered, planned) runs of the matched beam deliveries, on one grid; a beam
     delivered twice (two fractions) counts its planned spots twice."""
