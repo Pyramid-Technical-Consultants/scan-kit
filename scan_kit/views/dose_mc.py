@@ -24,6 +24,7 @@ BATCHES = 10  # MCsquare MIN_NUM_BATCH
 BATCH_HISTORIES = 100_000
 # Whole batches: every dispatch waits on its slowest history, so a batch split in two pays that twice.
 DISPATCH_HISTORIES = BATCH_HISTORIES
+IN_FLIGHT = 4
 QUANTUM_MEV = 1e-4
 # One proton stopping in a 1 mg/cm³ air voxel outdoses the target, so the uncertainty skips air (about −900 HU).
 SCORED_DENSITY = 0.1
@@ -392,17 +393,25 @@ class McRun:
         queue = device().queue
         end = time.perf_counter() + budget_s
         while True:
-            start = self._next % self._per_batch
-            count = min(self._chunk, self._per_batch - start)
             t0 = time.perf_counter()
-            queue.write_buffer(self._bufs["params"], 0, _TRANSPORT.pack(
-                **self._params, hist_base=self._next, nhist=count,
-            ))
-            queue.write_buffer(self._bufs["ledger"], 56, bytes(4))
-            self._lib.transport.run(self._transport, (count + 63) // 64)
-            # Short submissions keep each one well under the Windows GPU timeout.
+            last = False
+            # Short submissions keep each one well under the Windows GPU timeout; queued
+            # IN_FLIGHT deep, the GPU runs them back to back instead of idling on the host.
+            for _ in range(IN_FLIGHT):
+                start = self._next % self._per_batch
+                count = min(self._chunk, self._per_batch - start)
+                queue.write_buffer(self._bufs["params"], 0, _TRANSPORT.pack(
+                    **self._params, hist_base=self._next, nhist=count,
+                ))
+                queue.write_buffer(self._bufs["ledger"], 56, bytes(4))
+                self._lib.transport.run(self._transport, (count + 63) // 64)
+                self._next += count
+                if self._next % self._per_batch == 0:
+                    last = self._next == self.histories
+                    self._fold(1 if last else 0, 1.0 / self._next)
+                    if last:
+                        break
             wait()
-            self._next += count
             if math.isfinite(budget_s):
                 # Integer tallies add in any order, so the slice size never changes the dose.
                 took = time.perf_counter() - t0
@@ -410,12 +419,9 @@ class McRun:
                     self._chunk = max(self._chunk // 2, 1024)
                 elif took < 0.2 * budget_s:
                     self._chunk = min(self._chunk * 2, DISPATCH_HISTORIES)
-            if self._next % self._per_batch == 0:
-                last = self._next == self.histories
-                self._fold(1 if last else 0, 1.0 / self._next)
-                if last:
-                    self._finish()
-                    return True
+            if last:
+                self._finish()
+                return True
             if time.perf_counter() >= end:
                 return False
 

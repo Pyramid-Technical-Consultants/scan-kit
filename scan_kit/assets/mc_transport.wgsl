@@ -196,12 +196,42 @@ fn locate(x: vec3f) -> Where {
     return Where(-1, WATER_MEDIUM, 1.0, -1);
 }
 
+// A lane's deposits pool while they land in one voxel and go to the tally, one atomic, when
+// the next lands elsewhere: the atomics, not the physics, bound a CT's speed.
+var<private> g_dose_idx: i32 = -1;
+var<private> g_dose_e: f32 = 0.0;
+var<private> g_let_idx: i32 = -1;
+var<private> g_let_n: f32 = 0.0;
+var<private> g_let_d: f32 = 0.0;
+
+fn flush_dose() {
+    if (g_dose_idx < 0) { return; }
+    let q = quanta(g_dose_e);
+    if (q != 0) { add_tally(2u * u32(g_dose_idx), q); }
+    g_dose_idx = -1;
+    g_dose_e = 0.0;
+}
+
+fn flush_let() {
+    if (g_let_idx < 0) { return; }
+    let qn = quanta(g_let_n);
+    let qd = quanta(g_let_d);
+    if (qn != 0) { add_let(4u * u32(g_let_idx), qn); }
+    if (qd != 0) { add_let(4u * u32(g_let_idx) + 2u, qd); }
+    g_let_idx = -1;
+    g_let_n = 0.0;
+    g_let_d = 0.0;
+}
+
 // Energy e (eV) deposited at scoring index idx; w is 1 / (rho SPR).
 fn deposit(idx: i32, e_ev: f32, w: f32) {
     if (e_ev == 0.0) { return; }
     if (idx >= 0) {
-        let q = quanta(e_ev * w);
-        if (q != 0) { add_tally(2u * u32(idx), q); }
+        if (idx != g_dose_idx) {
+            flush_dose();
+            g_dose_idx = idx;
+        }
+        g_dose_e += e_ev * w;
         g_grid += e_ev;
     } else if (g_geom == GEOM_SHIFTER) {
         g_line += e_ev;
@@ -663,10 +693,12 @@ fn hadron_step(pp: ptr<function, Particle>, wp: ptr<function, Where>) -> bool {
     }
     if (s_let > 0.0) {
         let e_let = p.M * (dE + dEh);
-        let qn = quanta(e_let * s_let * 1e-7);
-        let qd = quanta(e_let);
-        if (qn != 0) { add_let(4u * u32(hinge), qn); }
-        if (qd != 0) { add_let(4u * u32(hinge) + 2u, qd); }
+        if (hinge != g_let_idx) {
+            flush_let();
+            g_let_idx = hinge;
+        }
+        g_let_n += e_let * s_let * 1e-7;
+        g_let_d += e_let;
     }
     // MCsquare applies no SPR to nuclear deposits.
     deposit(there.idx, p.M * dEh, select(1.0 / (there.rho * spr), 1.0 / there.rho, itype == 2));
@@ -825,6 +857,8 @@ fn open_history(h: u32, pp: ptr<function, Particle>) -> bool {
 }
 
 fn close_history() {
+    flush_dose();
+    flush_let();
     add_ledger(0u, quanta(g_inc));
     add_ledger(2u, quanta(g_grid));
     add_ledger(4u, quanta(g_off));
