@@ -15,7 +15,7 @@
 // Per voxel (lo, hi) of E / (rho SPR) in quanta.
 @group(0) @binding(3) var<storage, read_write> tally: array<atomic<u32>>;
 // Pairs (lo, hi): incident, grid, off-grid, leaked, lost, beamline. Then overflow count,
-// deepest stack, and the dispatch's count of histories taken.
+// deepest stack, the dispatch's count of histories taken, and the most steps one particle took.
 @group(0) @binding(4) var<storage, read_write> ledger: array<atomic<u32>>;
 @group(0) @binding(5) var<uniform> P: Params;
 // Material index per voxel, four u8 to a word.
@@ -221,17 +221,27 @@ fn plane_dist(z: f32, w: f32, p: f32) -> f32 {
     return select(1e30, d, d > 0.0);
 }
 
-// Dist_To_Interface: next voxel face, or a slab plane.
+// Dist_To_Interface: next voxel face, or a slab plane, plus MCsquare's nudge past it. The
+// nudge also clears the face by CROSS_CM across it: along a grazing direction MCsquare's
+// alone is below float32 resolution there, and the particle crawls along the face in 2 µm
+// steps (in air, where scattering never tips it off, until the step cap).
+const CROSS_CM: f32 = 1e-5;
+
 fn dist_to_interface(x: vec3f, d: vec3f) -> f32 {
     // SemiInfiniteSlab_step: height above the exit face, whatever the direction.
     if (g_geom == GEOM_SHIFTER) { return max(x.z - g_rs_lo + 1e-4, 0.0); }
-    var s = min(lattice_dist(x.x, P.ox, P.vx, d.x), min(lattice_dist(x.y, P.oy, P.vy, d.y), lattice_dist(x.z, P.oz, P.vz, d.z)));
+    var s = lattice_dist(x.x, P.ox, P.vx, d.x);
+    var u = abs(d.x);
+    let sy = lattice_dist(x.y, P.oy, P.vy, d.y);
+    if (sy < s) { s = sy; u = abs(d.y); }
+    let sz = lattice_dist(x.z, P.oz, P.vz, d.z);
+    if (sz < s) { s = sz; u = abs(d.z); }
     if (g_geom == GEOM_SLAB && abs(d.z) >= 1e-12) {
-        s = min(s, plane_dist(x.z, d.z, 0.0));
-        s = min(s, plane_dist(x.z, d.z, -P.depth));
-        if (P.wet > 0.0) { s = min(s, plane_dist(x.z, d.z, P.wet)); }
+        var pz = min(plane_dist(x.z, d.z, 0.0), plane_dist(x.z, d.z, -P.depth));
+        if (P.wet > 0.0) { pz = min(pz, plane_dist(x.z, d.z, P.wet)); }
+        if (pz < s) { s = pz; u = abs(d.z); }
     }
-    return select(s + 5e-5, s + 2e-4, s < 1e-3);
+    return s + max(select(5e-5, 2e-4, s < 1e-3), CROSS_CM / u);
 }
 
 // Update_Hadron: (E, gamma, beta2, Te_max).
@@ -835,6 +845,7 @@ fn main() {
     var busy = false;
     var open = false;
     var steps = 0;
+    var longest = 0;
     var pops = 0;
     var next_exit = 0;
     loop {
@@ -858,6 +869,7 @@ fn main() {
                 next_exit = 0;
                 busy = open_history(P.hist_base + n, &p) && begin(p);
             }
+            longest = max(longest, steps);
             steps = 0;
         }
         if (!busy) { break; }
@@ -867,4 +879,5 @@ fn main() {
     }
     if (g_overflow != 0u) { atomicAdd(&ledger[12], g_overflow); }
     atomicMax(&ledger[13], u32(g_deepest));
+    atomicMax(&ledger[15], u32(longest));
 }

@@ -80,6 +80,27 @@ def test_energy_ledger_closes(gpu) -> None:
     assert 0.1 < res.fraction("off_grid") < 0.14 and res.fraction("grid") > 0.8 and res.ledger["lost"] > 0.0
 
 
+def test_grazing_particles_cross_voxel_faces_in_air(gpu) -> None:
+    """A particle on a face moving nearly along it must still cross: in air nothing scatters it off,
+    and a 2 µm nudge below float32 resolution left it crawling to the 100k step cap."""
+    from scan_kit.dicom import gantry_to_patient
+    from scan_kit.qa import BeamModel
+    from scan_kit.views.dose_mc import McRun, beam_record
+
+    model = BeamModel.read("BDL_default_DN_RangeShifter")
+    n, sp = 100, 2.0
+    air = np.full((n, n, n), mc_media().index("water"), np.uint8)
+    beam = beam_record(gantry_to_patient(0.0, 0.0, "HFS"), (n * sp / 2,) * 3, model.nozzle_to_iso,
+                       model.smx_to_iso, model.smy_to_iso)
+    spots = model.spot_records(150.0, np.zeros(1), np.zeros(1), beam=0, rs_id="", rs_wet=0.0, rs_distance=0.0)
+    run = McRun.patient(spots, np.ones(1), beam[None], air, np.full(air.shape, 0.0012, np.float32), (sp,) * 3,
+                        histories=50_000, seed=1, dose_to_water=False)
+    run.step()
+    run.close()
+    # 200 mm at 2 mm voxels is ~100 face crossings; the crawl took 100000 steps.
+    assert 0 < run.result.longest < 2_000
+
+
 def test_same_seed_is_bit_identical(gpu) -> None:
     spots = ((0.0, 0.0, 100.0, 1.0),)
     a, _ = _dose("pmma", spots, histories=50_000, depth=90, seed=7)

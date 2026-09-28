@@ -53,7 +53,12 @@ _FOLD = _FOLD_P.wgsl + """
 fn main(@builtin(global_invocation_id) g: vec3u, @builtin(num_workgroups) nwg: vec3u) {
     let i = g.x + g.y * nwg.x * 256u;
     if (i >= P.n) { return; }
-    let b = (f32(bitcast<i32>(tally[2u * i + 1u])) * 4294967296.0 + f32(tally[2u * i])) * P.scale;
+    let lo = tally[2u * i];
+    let hi = tally[2u * i + 1u];
+    // A small negative tally (straggling can gain energy) is hi = -1: f32(lo) would round it off.
+    var q = f32(bitcast<i32>(hi)) * 4294967296.0 + f32(lo);
+    if (hi == 0xFFFFFFFFu && lo >= 0x80000000u) { q = f32(bitcast<i32>(lo)); }
+    let b = q * P.scale;
     if (P.mode == 2) {
         dose_out[i] = (dose_sum[i] + b) * P.gain;
         return;
@@ -77,6 +82,7 @@ class McResult:
     ledger: dict
     overflow: int
     deepest: int
+    longest: int = 0  # most steps any one particle took
 
     def fraction(self, key: str) -> float:
         inc = self.ledger["incident"]
@@ -268,7 +274,7 @@ class McRun:
         b = self._bufs
         b["spots"] = storage(spots)
         b["tally"] = storage(size=8 * nvox)
-        b["ledger"] = storage(np.zeros(15, dtype=np.uint32))
+        b["ledger"] = storage(np.zeros(16, dtype=np.uint32))
         b["params"] = uniform(_TRANSPORT.nbytes)
         b["material"] = storage(material if material is not None else np.zeros(1, dtype=np.uint32))
         b["density"] = storage(np.asarray(density, dtype=np.float32).reshape(-1) if density is not None else np.zeros(1, dtype=np.float32))
@@ -450,6 +456,7 @@ class McRun:
             ledger=ledger,
             overflow=int(raw[12]),
             deepest=int(raw[13]),
+            longest=int(raw[15]),
         )
 
     def close(self) -> None:
