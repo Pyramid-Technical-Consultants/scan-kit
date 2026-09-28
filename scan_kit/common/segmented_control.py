@@ -114,6 +114,11 @@ class SegmentedControl(QWidget):
             if btn is not None:
                 btn.setToolTip(tip)
 
+    def set_option_text(self, key: str, text: str) -> None:
+        btn = self._buttons.get(key)
+        if btn is not None:
+            btn.setText(text)
+
     def set_option_enabled(self, key: str, enabled: bool) -> None:
         btn = self._buttons.get(key)
         if btn is not None:

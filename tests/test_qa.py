@@ -60,6 +60,8 @@ def test_patient_transport_closes_and_hits_the_target(gpu, phantom) -> None:
     run.step()
     r = run.result
     assert abs(r.closure) < 1e-6 and r.fraction("beamline") < 0.01 and r.overflow == 0
+    # Scored in the patient: a proton stopping in an air voxel would put the "maximum" there, at ~80 %.
+    assert 0.0 < r.uncertainty < 0.1
     ptv = rasterize(case.structures.roi("PTV"), grid)
     assert run.dose[ptv].mean() > 5.0 * run.dose[~ptv].mean()
     assert 1.0 < float(run.let[ptv].mean()) < 10.0

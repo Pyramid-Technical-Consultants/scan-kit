@@ -90,6 +90,12 @@ def _late_class(name: str = "Line"):
     return Late
 
 
+def scene_text(text: str, color, parent):
+    from vispy import scene
+
+    return scene.Text(text, color=color, font_size=14, pos=(0.0, 0.0, 0.0), parent=parent)
+
+
 def _limits_moved(old_lo, old_hi, new: tuple[float, float]) -> bool:
     if old_lo is None or old_hi is None:
         return True
@@ -472,8 +478,8 @@ def phantom_note(
     return "; ".join(parts)
 
 
-class DoseScene:
-    """Turntable view of a measured dose volume, optionally minus the plan."""
+class VolumeScene:
+    """Turntable view of a dose volume on any grid: box, axes, bounds, colors and the ray march."""
 
     def __init__(self, canvas) -> None:
         from vispy import scene
@@ -491,6 +497,7 @@ class DoseScene:
         self._gantry.transform = scene.transforms.MatrixTransform()
         self._nodes: list = []
         self._box = make_dose_box_node()(parent=self._gantry)
+        self._box.transform = scene.transforms.STTransform()
         self._meas_tex = None
         self._plan_tex = None
         self._gamma_tex = None
@@ -499,17 +506,12 @@ class DoseScene:
         # (passed, evaluated) voxels of the last γ map.
         self.gamma_pass: tuple[int, int] | None = None
         self._tex_shape: tuple[int, int, int] | None = None
-        # Per texture slot: (inputs key less histories, McRun) it holds, refining or finished.
-        # ponytail: a finished run keeps its GPU sums (4 floats a voxel) so more histories can resume it.
-        self._mc: dict[str, tuple] = {}
-        self._mc_preview_at = 0.0
-        self._mc_turn = -1
         self._mc_redraw = False  # the next draw is a preview mc_step asked for
         self._moved_at = 0.0  # last draw something else asked for
-        self._note_base = ""
-        # What render left for the finished volume: (grid, want γ, criteria, field-box source, field edge spec, show).
-        self._post: tuple | None = None
-        self._want_gamma = False
+        # (origin, spacing, shape x/y/z, axis names, beam direction) of the volume shown, or None.
+        self.frame: tuple | None = None
+        self._filled: tuple[bool, bool] = (False, False)  # first and second textures hold a volume
+        self._uploaded: dict[int, object] = {}  # texture slot -> array show_volumes last uploaded
         self._has_volume = False
         self._broken = False
         self._gain = DEFAULT_GAIN
@@ -550,22 +552,6 @@ class DoseScene:
         """True when the volume shows the γ map."""
         return self._gamma
 
-    @property
-    def mc_refining(self) -> bool:
-        """True while a Monte Carlo run is still filling the volume."""
-        return any(not run.done for _, run in self._mc.values())
-
-    @property
-    def mc_progress(self) -> float | None:
-        """Share of the refining Monte Carlo transported, or None when nothing is refining."""
-        live = [run.progress for _, run in self._mc.values() if not run.done]
-        return min(live) if live else None
-
-    @property
-    def gamma_pending(self) -> bool:
-        """True when γ waits for a refining Monte Carlo run."""
-        return self._want_gamma and self.mc_refining
-
     def _scale_name(self) -> str:
         return GAMMA_CMAP if self._gamma else active_scale(self._difference, self._scale)
 
@@ -582,13 +568,10 @@ class DoseScene:
         self._inked.clear()
         self._labels.clear()
 
-    def _add_axes(self, axis: DepthAxis, origin, extent_mm) -> None:
+    def _add_axes(self, names, depth_sign: int, origin, extent_mm) -> None:
         """Ticks every cm on the voxel box's edges, in the box's own muted ink."""
         self._axes_center = np.asarray(origin, dtype=float) + 0.5 * np.asarray(extent_mm, dtype=float)
-        guides = box_axes(
-            origin, extent_mm, ("X (mm)", "Y (mm)", axis.axis_label),
-            depth_sign=int(getattr(axis, "depth_sign", 1)),
-        )
+        guides = box_axes(origin, extent_mm, tuple(names), depth_sign=depth_sign)
         self._tick_line = None
         if guides.ticks.size:
             ticks = self._late_line(
@@ -724,11 +707,314 @@ class DoseScene:
             return
         self._canvas.set_current()
         self._tex_shape = key
-        self._mc_drop()
+        self._uploaded.clear()
+        self._drop_runs()
         self._meas_tex = _alloc_texture(key)
         self._plan_tex = _alloc_texture(key)
         self._gamma_tex = _alloc_texture(key)
         self._box.set_volumes(self._meas_tex, self._plan_tex)
+
+    def _drop_runs(self) -> None:
+        """Free whatever fills the textures; they are about to be replaced."""
+
+    def _place_box(self, origin, shape, spacing) -> None:
+        sp = np.asarray(spacing, dtype=float)
+        xf = self._box.transform
+        if np.allclose(sp, sp[0]):
+            self._box.set_box(origin, shape, float(sp[0]))
+            xf.scale, xf.translate = (1.0, 1.0, 1.0), (0.0, 0.0, 0.0)
+        else:
+            # ponytail: the march steps in voxels here, so Integrate sums per voxel, not per mm.
+            self._box.set_box((0.0, 0.0, 0.0), shape, 1.0)
+            xf.scale, xf.translate = tuple(sp), tuple(float(v) for v in origin)
+
+    def _frame_to(self, corners, gantry_deg: float) -> None:
+        # Frame through the same transform that draws the box. Axis labels are not part
+        # of it, or they pull the volume off center.
+        world = self._gantry.transform.map(corners)
+        flo, fhi, center = volume_frame(world)
+        pad = np.maximum((fhi - flo) * 0.12, 1.0)
+        self._frame_bounds = (flo, fhi, pad, center)
+        self._pending_gantry = float(gantry_deg)
+        if not keep_camera(self._framed, self._framed_gantry, gantry_deg):
+            self._apply_frame()
+
+    def show_status(self, text: str) -> None:
+        self.clear_guides()
+        self._has_volume = False
+        self.frame = None
+        self._nodes.append(scene_text(text, self._ink, self._view.scene))
+        self._canvas.update()
+
+    def show_volumes(
+        self, origin, spacing, first, second=None, gamma=None, *, names=("X (mm)", "Y (mm)", "Z (mm)"),
+        difference: bool = False, gamma_cap: float = 2.0, beam_dir=(0.0, 0.0, 1.0), note: str = "",
+    ) -> None:
+        """Draw volumes ``(z, y, x)`` computed elsewhere, on a grid whose voxel corner (0, 0, 0) sits at *origin*.
+
+        *second* is what *first* is compared with; *gamma* replaces the picture with the γ map.
+        Unchanged arrays (the same objects as last time) are not uploaded again.
+        """
+        self._drop_runs()
+        nz, ny, nx = np.shape(first)
+        origin, spacing = np.asarray(origin, dtype=float), np.asarray(spacing, dtype=float)
+        # Guides cost ~10 ms a node, so a refining dose on the same grid keeps them.
+        same = (self.frame is not None and self.frame[2] == (nx, ny, nz) and self.frame[3] == tuple(names)
+                and np.allclose(self.frame[0], origin) and np.allclose(self.frame[1], spacing))
+        if not same:
+            self.clear_guides()
+            self._set_gantry(0.0)
+        self._ensure_textures((nz, ny, nx))
+        self._upload(0, self._meas_tex, first)
+        if second is not None:
+            self._upload(1, self._plan_tex, second)
+        self._difference = bool(difference) and second is not None
+        self._gamma = gamma is not None
+        if self._gamma:
+            self._gamma_cap = float(gamma_cap)
+            self._upload(2, self._gamma_tex, gamma)
+        self._box.set_volumes(self._gamma_tex if self._gamma else self._meas_tex, self._plan_tex)
+        self._filled = (True, second is not None)
+        extent = spacing * (nx, ny, nz)
+        peak = float(np.max(first)) if np.size(first) else 0.0
+        self._typical = self.dose_peak = peak if peak > 0.0 else 1.0
+        # ponytail: half the box's worth of peak dose along a ray; Auto replaces it once the march runs.
+        self.ray_peak = self.dose_peak * 0.5 * float(extent.mean())
+        self.gamma_pass = None
+        self.auto_lo = self.auto_hi = None
+        self.field_extent = None
+        self._scale = active_scale(self._difference, self._scale)
+        self._place_box(origin, (nx, ny, nz), spacing)
+        self._push_display()
+        self._has_volume = True
+        self._broken = False
+        self.volume_note = note or f"{nx} × {ny} × {nz}"
+        if not same:
+            self._add_bounds(origin, extent)
+            self._add_axes(names, 1, origin, extent)
+            self.frame = (origin, spacing, (nx, ny, nz), tuple(names), np.asarray(beam_dir, dtype=float))
+            self._frame_to(volume_corners(origin, extent), 0.0)
+        self._canvas.update()
+
+    def _upload(self, slot: int, texture, volume) -> None:
+        if self._uploaded.get(slot) is not volume:
+            texture.set_data(np.ascontiguousarray(volume, dtype=np.float32))
+            self._uploaded[slot] = volume
+
+    def volumes(self) -> dict[str, np.ndarray]:
+        """What the textures hold, read back ``(z, y, x)``: 'first', 'second' and, while drawn, 'gamma'."""
+        if not self._has_volume or self._tex_shape is None:
+            return {}
+        held = (("first", self._meas_tex, self._filled[0]), ("second", self._plan_tex, self._filled[1]),
+                ("gamma", self._gamma_tex, self._gamma))
+        return {key: read_texture(self._canvas, tex, self._tex_shape) for key, tex, on in held if on}
+
+    def _color_limits(self) -> tuple[float, float]:
+        if self._gamma:
+            return 0.0, float(self._gamma_cap)
+        if (
+            self._auto
+            and self.auto_lo is not None
+            and self.auto_hi is not None
+            and np.isfinite(self.auto_lo)
+            and np.isfinite(self.auto_hi)
+        ):
+            return float(self.auto_lo), float(self.auto_hi)
+        integral = self._ray_mode == RAY_INTEGRAL
+        return manual_color_limits(
+            difference=self._difference,
+            transparent=self._ray_mode == RAY_TRANSPARENT,
+            integral=integral,
+            gain=self._gain,
+            typical=self._typical,
+            ray_scale=self.ray_peak if integral else self.dose_peak,
+            error_scale=self._error_scale,
+            absolute=self._absolute,
+        )
+
+    def _push_display(self) -> None:
+        scale = self.ray_peak if self._ray_mode == RAY_INTEGRAL else self.dose_peak
+        lo, hi = self._color_limits()
+        self._set_background(zero_rgb(self._scale_name(), lo, hi))
+        # γ is the worst voxel along each ray, on fixed limits.
+        ray = RAY_MAXIMUM if self._gamma else self._ray_mode
+        self._box.set_display(
+            gain=self._gain,
+            typical=self._typical,
+            error_scale=self._error_scale,
+            difference=self._difference,
+            absolute=self._absolute,
+            ray=_RAY_CODE.get(ray, 2.0),
+            ray_scale=scale,
+            scale_name=self._scale_name(),
+            auto=self._auto and not self._gamma,
+            lo=lo,
+            hi=hi,
+        )
+
+    def _apply_frame(self) -> None:
+        if self._frame_bounds is None:
+            return
+        w, h = self._view.size
+        if w < 2 or h < 2:
+            return
+        flo, fhi, pad, center = self._frame_bounds
+        self._view.camera.set_range(
+            x=(flo[0] - pad[0], fhi[0] + pad[0]),
+            y=(flo[1] - pad[1], fhi[1] + pad[1]),
+            z=(flo[2] - pad[2], fhi[2] + pad[2]),
+            margin=0.0,
+        )
+        # set_range keeps a center that was set before the first call.
+        self._view.camera.center = tuple(float(v) for v in center)
+        self._framed = True
+        self._framed_gantry = self._pending_gantry
+
+    def reframe(self) -> None:
+        """Fit the camera to the next render even if the gantry has not moved."""
+        self._framed = False
+
+    def _on_canvas_resize(self, _event=None) -> None:
+        if not self._framed:
+            self._apply_frame()
+
+    def set_ray(self, mode: str) -> None:
+        self._ray_mode = mode if mode in _RAY_CODE else DEFAULT_RAY
+        self.auto_lo = None
+        self.auto_hi = None
+        self._push_display()
+        self._canvas.update()
+
+    def set_auto(self, auto: bool) -> None:
+        self._auto = bool(auto)
+        if not self._auto:
+            self.auto_lo = None
+            self.auto_hi = None
+        self._push_display()
+        self._canvas.update()
+
+    def set_interp(self, mode: str) -> None:
+        self._box.set_interp(mode)
+        self._canvas.update()
+
+    def set_scale(self, name: str) -> None:
+        self._scale = active_scale(self._difference, name)
+        self._push_display()
+        self._canvas.update()
+
+    def set_gain(self, gain: float) -> None:
+        self._gain = float(gain)
+        self._push_display()
+        self._canvas.update()
+
+    def set_error_metric(self, mode: str, scale: float) -> None:
+        self._absolute = mode == ERROR_ABSOLUTE
+        self._error_scale = float(scale)
+        self._push_display()
+        self._canvas.update()
+
+    def _on_draw(self, event) -> None:
+        from vispy.scene import SceneCanvas
+
+        if self._mc_redraw:
+            self._mc_redraw = False
+        else:
+            self._moved_at = time.perf_counter()
+        marching = self._has_volume and not self._broken
+        for line in self._late:
+            line.held = marching
+        self._place_labels()
+        SceneCanvas.on_draw(self._canvas, event)
+        if not marching:
+            return
+        try:
+            span = self._box.draw_volume(self._canvas)
+        except Exception:
+            if not self._broken:
+                _log.exception("Dose volume ray march failed")
+            self._broken = True
+            self._canvas.update()
+            return
+        # After the march, so each line depth tests against where the dose sits.
+        for line in self._late:
+            line.held = False
+            if line.visible:
+                line.draw()
+        self._consume_auto_span(span)
+
+    def snapshot(self) -> np.ndarray:
+        """The canvas as drawn, RGBA ``(h, w, 4)``; ``SceneCanvas.render`` skips :meth:`_on_draw` and so the march."""
+        from vispy import gloo
+
+        w, h = (int(v) for v in self._canvas.physical_size)
+        fbo = gloo.FrameBuffer(color=gloo.RenderBuffer((h, w, 4)), depth=gloo.RenderBuffer((h, w), "depth"))
+        self._canvas.set_current()
+        self._canvas.push_fbo(fbo, (0, 0), (w, h))
+        try:
+            self._mc_redraw = True  # not a camera move
+            self._on_draw(None)
+            return fbo.read()
+        finally:
+            self._canvas.pop_fbo()
+
+    def _consume_auto_span(self, span) -> None:
+        if not self._auto or self._gamma or span is None:
+            return
+        scale = self.ray_peak if self._ray_mode == RAY_INTEGRAL else self.dose_peak
+        got = auto_color_range(self._difference, span[0], span[1], AUTO_DIFF_FLOOR * scale)
+        if got is None or not _limits_moved(self.auto_lo, self.auto_hi, got):
+            return
+        self.auto_lo, self.auto_hi = got
+        self._push_display()
+        listener = self.range_listener
+        if listener is not None:
+            listener()
+        self._request_redraw()
+
+    def _request_redraw(self) -> None:
+        # A repaint requested inside paintGL can be coalesced away, which left
+        # the last drag frame on a stale range until the next click.
+        try:
+            from PySide6.QtCore import QTimer
+        except ImportError:
+            self._canvas.update()
+            return
+        QTimer.singleShot(0, self._canvas.update)
+
+
+class DoseScene(VolumeScene):
+    """Session spots filled into the volume, analytically or by Monte Carlo, optionally minus the plan."""
+
+    def __init__(self, canvas) -> None:
+        # Per texture slot: (inputs key less histories, McRun) it holds, refining or finished.
+        # ponytail: a finished run keeps its GPU sums (4 floats a voxel) so more histories can resume it.
+        self._mc: dict[str, tuple] = {}
+        self._mc_preview_at = 0.0
+        self._mc_turn = -1
+        self._note_base = ""
+        # What render left for the finished volume: (grid, want γ, criteria, field-box source, field edge spec, show).
+        self._post: tuple | None = None
+        self._want_gamma = False
+        super().__init__(canvas)
+
+    def _drop_runs(self) -> None:
+        self._mc_drop()
+
+    @property
+    def mc_refining(self) -> bool:
+        """True while a Monte Carlo run is still filling the volume."""
+        return any(not run.done for _, run in self._mc.values())
+
+    @property
+    def mc_progress(self) -> float | None:
+        """Share of the refining Monte Carlo transported, or None when nothing is refining."""
+        live = [run.progress for _, run in self._mc.values() if not run.done]
+        return min(live) if live else None
+
+    @property
+    def gamma_pending(self) -> bool:
+        """True when γ waits for a refining Monte Carlo run."""
+        return self._want_gamma and self.mc_refining
 
     def _mc_start(self, slot, tex, batch, grid, medium_key, *, depth, wet, spread_pct, histories, ic_gap_mm):
         """Start filling *tex* with *batch* by Monte Carlo, or retarget the run it holds for the same inputs.
@@ -856,49 +1142,6 @@ class DoseScene:
                     pos=box_edge_segments(f_o, f_e), connect="segments", color=FIELD_RGBA, width=1,
                 ))
 
-    def _color_limits(self) -> tuple[float, float]:
-        if self._gamma:
-            return 0.0, float(self._gamma_cap)
-        if (
-            self._auto
-            and self.auto_lo is not None
-            and self.auto_hi is not None
-            and np.isfinite(self.auto_lo)
-            and np.isfinite(self.auto_hi)
-        ):
-            return float(self.auto_lo), float(self.auto_hi)
-        integral = self._ray_mode == RAY_INTEGRAL
-        return manual_color_limits(
-            difference=self._difference,
-            transparent=self._ray_mode == RAY_TRANSPARENT,
-            integral=integral,
-            gain=self._gain,
-            typical=self._typical,
-            ray_scale=self.ray_peak if integral else self.dose_peak,
-            error_scale=self._error_scale,
-            absolute=self._absolute,
-        )
-
-    def _push_display(self) -> None:
-        scale = self.ray_peak if self._ray_mode == RAY_INTEGRAL else self.dose_peak
-        lo, hi = self._color_limits()
-        self._set_background(zero_rgb(self._scale_name(), lo, hi))
-        # γ is the worst voxel along each ray, on fixed limits.
-        ray = RAY_MAXIMUM if self._gamma else self._ray_mode
-        self._box.set_display(
-            gain=self._gain,
-            typical=self._typical,
-            error_scale=self._error_scale,
-            difference=self._difference,
-            absolute=self._absolute,
-            ray=_RAY_CODE.get(ray, 2.0),
-            ray_scale=scale,
-            scale_name=self._scale_name(),
-            auto=self._auto and not self._gamma,
-            lo=lo,
-            hi=hi,
-        )
-
     def render(
         self,
         measured: SplatBatch | None,
@@ -931,11 +1174,11 @@ class DoseScene:
         model: str = MODEL_ANALYTIC,
         mc_histories: int = DEFAULT_MC_HISTORIES,
     ) -> None:
-        from vispy import scene
-
         self.clear_guides()
         self._set_gantry(gantry_deg)
+        self._uploaded.clear()
         self._has_volume = False
+        self.frame = None
         self._broken = False
         self.volume_note = ""
         self.phantom_note = ""
@@ -954,24 +1197,10 @@ class DoseScene:
         self._post = None
         self._want_gamma = False
 
-        if status:
-            self._mc_stop()
-            text = scene.Text(
-                status, color=self._ink, font_size=14, pos=(0.0, 0.0, 0.0), parent=self._view.scene,
-            )
-            self._nodes.append(text)
-            self._canvas.update()
-            return
-
         batches = [b for b in (measured, plan) if b is not None and b.center.size]
-        if not batches:
+        if status or not batches:
             self._mc_stop()
-            text = scene.Text(
-                "No dose samples for this mode",
-                color=self._ink, font_size=14, pos=(0.0, 0.0, 0.0), parent=self._view.scene,
-            )
-            self._nodes.append(text)
-            self._canvas.update()
+            self.show_status(status or "No dose samples for this mode")
             return
 
         medium_key = getattr(axis, "medium", None)
@@ -1101,14 +1330,19 @@ class DoseScene:
             self._gamma_cap = crit.cap
             self._difference = False
         self._box.set_volumes(self._meas_tex, self._plan_tex)
-        self._box.set_box(grid.origin, grid.shape, grid.voxel)
+        self._place_box(grid.origin, grid.shape, (grid.voxel,) * 3)
         self._scale = active_scale(self._difference, self._scale)
         self._push_display()
         self._has_volume = True
+        self._filled = (meas is not None, planned is not None)
+        names = ("X (mm)", "Y (mm)", axis.axis_label)
+        depth_sign = int(getattr(axis, "depth_sign", 1))
+        self.frame = (np.asarray(grid.origin, dtype=float), np.full(3, float(grid.voxel)), tuple(grid.shape),
+                      names, np.array([0.0, 0.0, float(depth_sign)]))
 
         corners = volume_corners(grid.origin, grid.extent_mm)
         self._add_bounds(grid.origin, grid.extent_mm)
-        self._add_axes(axis, grid.origin, grid.extent_mm)
+        self._add_axes(names, depth_sign, grid.origin, grid.extent_mm)
         src = self._plan_tex if from_plan else self._meas_tex if meas is not None else self._plan_tex
         self._post = (grid, self._want_gamma, crit, src, (fraction, per_slice), show_field)
         if not self.mc_refining:
@@ -1120,127 +1354,5 @@ class DoseScene:
                     pos=box_edge_segments(p_o, p_e), connect="segments", color=PHANTOM_RGBA, width=1,
                 ))
                 corners = np.vstack([corners, volume_corners(p_o, p_e)])
-        # Frame the grid and phantom through the same transform that draws them.
-        # Axis labels are not part of this box, or they pull the volume off center.
-        world = self._gantry.transform.map(corners)
-        flo, fhi, center = volume_frame(world)
-        pad = np.maximum((fhi - flo) * 0.12, 1.0)
-        self._frame_bounds = (flo, fhi, pad, center)
-        self._pending_gantry = float(gantry_deg)
-        if not keep_camera(self._framed, self._framed_gantry, gantry_deg):
-            self._apply_frame()
+        self._frame_to(corners, gantry_deg)
         self._canvas.update()
-
-    def _apply_frame(self) -> None:
-        if self._frame_bounds is None:
-            return
-        w, h = self._view.size
-        if w < 2 or h < 2:
-            return
-        flo, fhi, pad, center = self._frame_bounds
-        self._view.camera.set_range(
-            x=(flo[0] - pad[0], fhi[0] + pad[0]),
-            y=(flo[1] - pad[1], fhi[1] + pad[1]),
-            z=(flo[2] - pad[2], fhi[2] + pad[2]),
-            margin=0.0,
-        )
-        # set_range keeps a center that was set before the first call.
-        self._view.camera.center = tuple(float(v) for v in center)
-        self._framed = True
-        self._framed_gantry = self._pending_gantry
-
-    def reframe(self) -> None:
-        """Fit the camera to the next render even if the gantry has not moved."""
-        self._framed = False
-
-    def _on_canvas_resize(self, _event=None) -> None:
-        if not self._framed:
-            self._apply_frame()
-
-    def set_ray(self, mode: str) -> None:
-        self._ray_mode = mode if mode in _RAY_CODE else DEFAULT_RAY
-        self.auto_lo = None
-        self.auto_hi = None
-        self._push_display()
-        self._canvas.update()
-
-    def set_auto(self, auto: bool) -> None:
-        self._auto = bool(auto)
-        if not self._auto:
-            self.auto_lo = None
-            self.auto_hi = None
-        self._push_display()
-        self._canvas.update()
-
-    def set_interp(self, mode: str) -> None:
-        self._box.set_interp(mode)
-        self._canvas.update()
-
-    def set_scale(self, name: str) -> None:
-        self._scale = active_scale(self._difference, name)
-        self._push_display()
-        self._canvas.update()
-
-    def set_gain(self, gain: float) -> None:
-        self._gain = float(gain)
-        self._push_display()
-        self._canvas.update()
-
-    def set_error_metric(self, mode: str, scale: float) -> None:
-        self._absolute = mode == ERROR_ABSOLUTE
-        self._error_scale = float(scale)
-        self._push_display()
-        self._canvas.update()
-
-    def _on_draw(self, event) -> None:
-        from vispy.scene import SceneCanvas
-
-        if self._mc_redraw:
-            self._mc_redraw = False
-        else:
-            self._moved_at = time.perf_counter()
-        marching = self._has_volume and not self._broken
-        for line in self._late:
-            line.held = marching
-        self._place_labels()
-        SceneCanvas.on_draw(self._canvas, event)
-        if not marching:
-            return
-        try:
-            span = self._box.draw_volume(self._canvas)
-        except Exception:
-            if not self._broken:
-                _log.exception("Dose volume ray march failed")
-            self._broken = True
-            self._canvas.update()
-            return
-        # After the march, so each line depth tests against where the dose sits.
-        for line in self._late:
-            line.held = False
-            if line.visible:
-                line.draw()
-        self._consume_auto_span(span)
-
-    def _consume_auto_span(self, span) -> None:
-        if not self._auto or self._gamma or span is None:
-            return
-        scale = self.ray_peak if self._ray_mode == RAY_INTEGRAL else self.dose_peak
-        got = auto_color_range(self._difference, span[0], span[1], AUTO_DIFF_FLOOR * scale)
-        if got is None or not _limits_moved(self.auto_lo, self.auto_hi, got):
-            return
-        self.auto_lo, self.auto_hi = got
-        self._push_display()
-        listener = self.range_listener
-        if listener is not None:
-            listener()
-        self._request_redraw()
-
-    def _request_redraw(self) -> None:
-        # A repaint requested inside paintGL can be coalesced away, which left
-        # the last drag frame on a stale range until the next click.
-        try:
-            from PySide6.QtCore import QTimer
-        except ImportError:
-            self._canvas.update()
-            return
-        QTimer.singleShot(0, self._canvas.update)

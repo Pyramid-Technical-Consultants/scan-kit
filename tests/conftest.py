@@ -415,10 +415,22 @@ def qapp():
     """One ``QApplication`` for the whole test process (widgets need it, not ``QGuiApplication``)."""
     from PySide6.QtWidgets import QApplication
 
+    from scan_kit.common.gui_gc import collect_on_gui_thread
+
     app = QApplication.instance()
     if app is None:
         app = QApplication(sys.argv)
+    collect_on_gui_thread(app)
     yield app
+
+
+@pytest.fixture(autouse=True)
+def _collect_on_main_thread():
+    """Many tests never spin the event loop, so collect between them, on this thread."""
+    yield
+    from scan_kit.common.gui_gc import collect_due
+
+    collect_due()
 
 
 @pytest.fixture(scope="session")

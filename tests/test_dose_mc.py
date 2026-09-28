@@ -195,7 +195,7 @@ def test_model_controls_follow_medium_and_weight(qapp, tmp_path) -> None:
     from scan_kit.views.dose_volume_catalog import WEIGHT_MU
     from scan_kit.views.dose_volume_window import DoseVolumeWindow
 
-    window = DoseVolumeWindow([], str(tmp_path))
+    window = DoseVolumeWindow(["none"], str(tmp_path))
     try:
         assert window.progress.active  # loading
         assert not window._model_row.isHidden() and window._histories_row.isHidden()

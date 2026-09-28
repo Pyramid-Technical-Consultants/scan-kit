@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import math
+import time
 from typing import Sequence
 
 import numpy as np
-from PySide6.QtCore import QRectF, QSize, Qt, QTimer, Slot
-from PySide6.QtGui import QColor, QImage, QPainter, QPen
+from PySide6.QtCore import Qt, QTimer, Slot
 from PySide6.QtWidgets import (
     QButtonGroup,
     QCheckBox,
@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..common import ViewSettings
+from ..common.progress_line import ProgressLine
 from ..common.segmented_control import SegmentedControl
 from ..common.plotting import format_session_legend_label
 from ..common.session_notes import load_notes
@@ -100,10 +101,8 @@ from .dose_volume_fill import (
     MAX_VOXEL_MM,
     MIN_VOXEL_MM,
     VOXEL_MM,
-    colormap_samples,
-    ink_rgb,
-    zero_rgb,
 )
+from .dose_panes import DEPTH, DVH, GAMMA_HIST, LATERAL, DoseFrame, DoseLayers, DoseWorkspace
 from .dose_volume_physics import GammaCriteria
 from .dose_volume_raycast import manual_color_limits, suggest_abs_window
 from .dose_volume_vispy import DoseScene
@@ -113,7 +112,12 @@ from .plot_view_shell import (
     make_side_panel_column,
     run_view_window,
 )
-from .vispy_plot import BG, ensure_gl_plus
+from .study_source import DELIVERED, LABELS, PLANNED, StudySource
+from .vispy_plot import ensure_gl_plus
+
+SOURCE_SESSIONS, SOURCE_STUDY = "sessions", "study"
+SESSION_PLOTS, STUDY_PLOTS = (DEPTH, LATERAL), (DVH, GAMMA_HIST)
+READBACK_S = 1.0  # slices and plots follow a refining session Monte Carlo at most this often
 
 _GRAIN_ITEMS = (
     (GRAIN_SPOT, "Spot"),
@@ -182,239 +186,8 @@ def _log_slider_value(pos: int, lo: float, hi: float) -> float:
     return lo_v * (hi_v / lo_v) ** t
 
 
-_AXIS_PAD_X = 8
-_AXIS_BAR_W = 16
-# Fixed so tick text never shoves the view sideways; the ×10 offset rides in the title.
-_AXIS_WIDTH = 124
-_EXP_DIGITS = str.maketrans("-0123456789", "⁻⁰¹²³⁴⁵⁶⁷⁸⁹")
-
-def _tick_labels(values: np.ndarray) -> tuple[list[str], str]:
-    """Short tick text plus a shared power-of-ten offset when the span is tiny or huge."""
-    vals = np.asarray(values, dtype=float)
-    if vals.size == 0:
-        return [], ""
-    peak = float(np.max(np.abs(vals)))
-    scale = 1.0
-    offset = ""
-    if peak > 0.0 and np.isfinite(peak):
-        exp = int(np.floor(np.log10(peak)))
-        if exp < -2 or exp > 3:
-            scale = 10.0 ** exp
-            offset = "×10" + str(exp).translate(_EXP_DIGITS)
-    labels = []
-    for value in vals:
-        shown = float(value) / scale
-        if abs(shown) < 1e-8:
-            shown = 0.0
-        labels.append(f"{shown:.4g}".replace("-", "−"))
-    return labels, offset
-
-
-def _minor_parts(step: float) -> int:
-    if step <= 0.0 or not np.isfinite(step):
-        return 5
-    leading = step / 10.0 ** np.floor(np.log10(step))
-    if abs(leading - 2.0) < 0.05 or abs(leading - 2.5) < 0.05:
-        return 4
-    return 5
-
-
-def _minor_ticks(majors: np.ndarray, lo: float, hi: float) -> np.ndarray:
-    if majors.size < 2:
-        return np.array([], dtype=float)
-    out: list[float] = []
-
-    def _fill(start: float, step: float, *, forward: bool) -> None:
-        parts = _minor_parts(abs(step))
-        delta = abs(step) / parts
-        value = start
-        for _ in range(32):
-            value = value + delta if forward else value - delta
-            if value <= lo or value >= hi:
-                return
-            out.append(value)
-
-    for left, right in zip(majors[:-1], majors[1:]):
-        step = float(right - left)
-        parts = _minor_parts(step)
-        for k in range(1, parts):
-            value = float(left) + step * k / parts
-            if lo < value < hi:
-                out.append(value)
-    _fill(float(majors[0]), float(majors[1] - majors[0]), forward=False)
-    _fill(float(majors[-1]), float(majors[-1] - majors[-2]), forward=True)
-    return np.asarray(out, dtype=float)
-
-
-def color_axis_ticks(
-    lo: float, hi: float, *, nbins: int = 6,
-) -> tuple[np.ndarray, np.ndarray, list[str], str]:
-    """Major ticks, minor ticks, major labels, and the scientific offset.
-
-    ``majors[0]`` and ``majors[-1]`` are always the exact ends of the bar.
-    """
-    lo_f = float(lo)
-    hi_f = float(hi)
-    empty = np.array([], dtype=float)
-    if not np.isfinite(lo_f) or not np.isfinite(hi_f):
-        return empty, empty, [], ""
-    if hi_f < lo_f:
-        lo_f, hi_f = hi_f, lo_f
-    span = hi_f - lo_f
-    if span <= 0.0:
-        return np.array([lo_f]), empty, [], ""
-    from matplotlib import ticker
-
-    locator = ticker.MaxNLocator(
-        nbins=max(2, int(nbins)),
-        steps=[1, 2, 2.5, 5, 10],
-        min_n_ticks=2,
-    )
-    nice = np.asarray(locator.tick_values(lo_f, hi_f), dtype=float)
-    pad = span * 1e-6
-    nice = nice[(nice >= lo_f - pad) & (nice <= hi_f + pad)]
-    if lo_f < 0.0 < hi_f and not np.any(np.abs(nice) <= pad):
-        nice = np.sort(np.append(nice, 0.0))
-    minors = _minor_ticks(nice, lo_f, hi_f) if nice.size >= 2 else np.array([], dtype=float)
-    inner = nice[(nice > lo_f + pad) & (nice < hi_f - pad)]
-    majors = np.concatenate([[lo_f], inner, [hi_f]])
-    labels, offset = _tick_labels(majors)
-    return majors, minors, labels, offset
-
-
-class _ColorAxis(QWidget):
-    """Full-height color bar with major ticks, minor ticks, and a unit title."""
-
-    def __init__(self, parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        self._name = ""
-        self._lo = float("nan")
-        self._hi = float("nan")
-        self._title = ""
-        self._images: dict[tuple[str, int], QImage] = {}
-        self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
-        self.setFixedWidth(_AXIS_WIDTH)
-
-    def sizeHint(self) -> QSize:
-        return QSize(_AXIS_WIDTH, 480)
-
-    def set_scale(self, name: str, lo: float, hi: float, title: str) -> None:
-        lo_f = float(lo)
-        hi_f = float(hi)
-        if hi_f < lo_f:
-            lo_f, hi_f = hi_f, lo_f
-        same = (
-            name == self._name
-            and title == self._title
-            and np.isfinite(self._lo)
-            and abs(lo_f - self._lo) <= 1e-9 * max(1.0, abs(lo_f))
-            and abs(hi_f - self._hi) <= 1e-9 * max(1.0, abs(hi_f))
-        )
-        if same:
-            return
-        self._name = name
-        self._lo = lo_f
-        self._hi = hi_f
-        self._title = title
-        self.update()
-
-    def _bar_image(self, height: int) -> QImage | None:
-        if height < 2 or not self._name:
-            return None
-        key = (self._name, height)
-        cached = self._images.get(key)
-        if cached is not None:
-            return cached
-        rgb = np.clip(colormap_samples(self._name, height)[::-1], 0.0, 1.0)
-        rgba = np.zeros((height, 1, 4), dtype=np.uint8)
-        rgba[:, 0, :3] = (rgb * 255.0).astype(np.uint8)
-        rgba[:, 0, 3] = 255
-        rgba = np.ascontiguousarray(np.repeat(rgba, _AXIS_BAR_W, axis=1))
-        image = QImage(
-            rgba.data, _AXIS_BAR_W, height, int(rgba.strides[0]),
-            QImage.Format.Format_RGBA8888,
-        ).copy()
-        self._images[key] = image
-        if len(self._images) > 24:
-            self._images.pop(next(iter(self._images)))
-        return image
-
-    def paintEvent(self, _event) -> None:
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
-        fm = painter.fontMetrics()
-        lo, hi = self._lo, self._hi
-        if not self._name or not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
-            painter.fillRect(self.rect(), QColor(BG))
-            painter.end()
-            return
-        # Painted as part of the view, so it shares the canvas zero color,
-        # with a dark glass panel so the ticks read on any background.
-        painter.fillRect(self.rect(), QColor.fromRgbF(*zero_rgb(self._name, lo, hi)))
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor(12, 14, 18, 170))
-        painter.drawRoundedRect(QRectF(self.rect()).adjusted(2, 2, -2, -2), 6, 6)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
-        painter.setBrush(Qt.BrushStyle.NoBrush)
-        color = QColor.fromRgbF(*ink_rgb((0.0, 0.0, 0.0)))
-        nbins = max(2, min(8, int(self.height() / 52)))
-        majors, minors, labels, offset = color_axis_ticks(lo, hi, nbins=nbins)
-        top = fm.height() // 2 + 4
-        bottom = self.height() - (fm.height() // 2 + 4)
-        if bottom - top < 8:
-            painter.end()
-            return
-        bar = QRectF(_AXIS_PAD_X, top, _AXIS_BAR_W, bottom - top)
-        image = self._bar_image(max(2, int(bar.height())))
-        if image is not None:
-            painter.drawImage(bar, image)
-        pen = QPen(color)
-        pen.setWidth(1)
-        painter.setPen(pen)
-        painter.drawRect(bar)
-        spine = bar.right()
-
-        def y_of(value: float) -> float:
-            return top + (hi - value) / (hi - lo) * (bottom - top)
-
-        for value in minors:
-            y = y_of(float(value))
-            painter.drawLine(int(spine), int(round(y)), int(spine) + 4, int(round(y)))
-        shown_y: list[float] = []
-        # Ends first so the top and bottom labels always win a collision.
-        order = [0, len(majors) - 1, *range(1, len(majors) - 1)]
-        for idx in order:
-            value = float(majors[idx])
-            y = y_of(value)
-            if any(abs(y - prev) < fm.height() for prev in shown_y):
-                painter.drawLine(int(spine), int(round(y)), int(spine) + 5, int(round(y)))
-                continue
-            length = 9 if abs(value) <= (hi - lo) * 1e-6 else 7
-            painter.drawLine(int(spine), int(round(y)), int(spine) + length, int(round(y)))
-            painter.drawText(
-                int(spine) + length + 4,
-                int(round(y + fm.ascent() / 2 - 1)),
-                labels[idx],
-            )
-            shown_y.append(y)
-        title = f"{self._title}  {offset}".strip() if offset else self._title
-        if title:
-            title_x = self.width() - 4 - fm.height()
-            painter.save()
-            painter.translate(title_x + fm.height() / 2, (top + bottom) / 2)
-            painter.rotate(-90)
-            painter.drawText(
-                QRectF(-bar.height() / 2, -fm.height() / 2, bar.height(), fm.height()),
-                Qt.AlignmentFlag.AlignCenter,
-                title,
-            )
-            painter.restore()
-        painter.end()
-
-
 class DoseVolumeWindow(VispyViewWindow):
-    """3D dose volume with grain / XY / plan controls."""
+    """Dose from logged sessions in a phantom or from a DICOM study on its CT: slices, 3D volume and plots."""
 
     def __init__(
         self,
@@ -423,17 +196,26 @@ class DoseVolumeWindow(VispyViewWindow):
         *,
         settings: ViewSettings | None = None,
         initial_preset: str | None = None,
+        study: str | None = None,
         parent: QWidget | None = None,
     ) -> None:
-        super().__init__(title="Dose Volume (3D)", side_panel_default_width=420, parent=parent)
+        super().__init__(title="Dose Volume", side_panel_default_width=420, parent=parent)
         self._updating = True
-        # Before the canvas exists: moving a live GL widget can drop its context.
-        self._mount_color_axis()
         gl = "gl+" if ensure_gl_plus() else None
-        self._vispy_canvas = self.add_vispy_canvas(
-            keys="interactive", size=(1200, 800), gl=gl,
-        )
+        # Built whole before it is shown: moving a live GL widget can drop its context.
+        self._workspace = DoseWorkspace(gl=gl, plots=SESSION_PLOTS)
+        self._plot_layout.setContentsMargins(0, 0, 0, 0)
+        self._plot_layout.addWidget(self._workspace, 1)
+        self.progress = ProgressLine(self._workspace)
+        self._color_axis = self._workspace.volume.color_axis
+        self._vispy_canvas = self._workspace.volume.canvas
         self._scene = DoseScene(self._vispy_canvas)
+        self._study = StudySource(session_ids, base_dir, criteria=self._gamma_criteria, snapshot=self._snapshot,
+                                  parent=self)
+        self._readback_at = 0.0
+        self._study_share = None
+        self._content = None
+        self._pushed = None
         self.set_side_panel(self._build_controls())
         # The shared shell caps a side panel at a quarter of the window, which
         # clips this one. 420 is 50 % wider than the usual 280.
@@ -467,10 +249,33 @@ class DoseVolumeWindow(VispyViewWindow):
         self._load_task.finished.connect(self._on_load_finished)
         self._loading = False
 
-        self._start_load()
+        self._study.frameChanged.connect(self._on_study_frame)
+        self._study.dosesChanged.connect(self._show_study)
+        self._study.analysisChanged.connect(self._show_study)
+        self._study.roisChanged.connect(self._on_study_rois)
+        self._study.progress.connect(self._on_study_progress)
+        self._set_source(SOURCE_STUDY if study or not self._session_ids else SOURCE_SESSIONS)
+        if self._session_ids:
+            self._start_load()
+        if study:
+            self._study.load(study)
 
     def _build_controls(self) -> QWidget:
-        panel, layout = make_side_panel_column()
+        panel, outer = make_side_panel_column()
+        self._source_combo = SegmentedControl([(SOURCE_SESSIONS, "Sessions"), (SOURCE_STUDY, "DICOM study")])
+        self._source_combo.set_button_tooltips({
+            SOURCE_SESSIONS: "The selected sessions' logged spots in a water, plastic or metal phantom.",
+            SOURCE_STUDY: "A DICOM plan and the selected sessions recalculated on the planning CT.",
+        })
+        self._source_combo.selectionChanged.connect(self._on_source_changed)
+        self._add_row(outer, "Source", self._source_combo)
+        # Each source's own controls; what the picture shows and how it is colored follow, shared.
+        self._session_box = QWidget()
+        layout = QVBoxLayout(self._session_box)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+        outer.addWidget(self._session_box)
+        outer.addWidget(self._study.panel)
         layout.addWidget(
             make_presets_menu_button(
                 [(p.id, p.label, True) for p in PRESETS],
@@ -478,8 +283,7 @@ class DoseVolumeWindow(VispyViewWindow):
             )
         )
 
-        # Compare is what the picture answers, including the dose quantity.
-        # Beam, phantom, and view follow.
+        # Compare is the dose quantity and model. Beam, phantom, and view follow.
         self._session_group = QGroupBox("Session")
         self._session_layout = QVBoxLayout(self._session_group)
         self._session_layout.setSpacing(2)
@@ -490,8 +294,9 @@ class DoseVolumeWindow(VispyViewWindow):
         layout.addWidget(self._session_group)
 
         compare_layout = self._add_group(layout, "Compare")
+        display_layout = self._add_group(outer, "Display")
         self._show_combo = self._add_segment(
-            compare_layout, "Show",
+            display_layout, "Show",
             (("dose", "Measured"), ("difference", "− Plan"), ("gamma", "Gamma")),
             self._on_show_changed,
         )
@@ -565,7 +370,7 @@ class DoseVolumeWindow(VispyViewWindow):
         )
         gamma_layout.addWidget(self._gamma_label)
         self._gamma_group.setVisible(False)
-        layout.addWidget(self._gamma_group)
+        outer.addWidget(self._gamma_group)
 
         beam_layout = self._add_group(layout, "Beam")
         self._grain_combo = self._add_segment(
@@ -660,7 +465,7 @@ class DoseVolumeWindow(VispyViewWindow):
         self._gantry_spin.setWrapping(True)
         self._gantry_spin.setSuffix(" °")
         self._ray_combo = self._add_combo(
-            view_layout, "Ray", _RAY_ITEMS, self._on_ray_changed,
+            display_layout, "Ray", _RAY_ITEMS, self._on_ray_changed,
         )
         self._ray_combo.setToolTip("Integrate sums a ray. Maximum keeps its hottest sample. Transparent fades like fog.")
         self._set_combo(self._ray_combo, DEFAULT_RAY)
@@ -682,7 +487,7 @@ class DoseVolumeWindow(VispyViewWindow):
             "cubic": "Smoother, and can overshoot a little.",
         })
         self._interp.selectionChanged.connect(self._scene.set_interp)
-        self._add_row(view_layout, "Sample", self._interp)
+        self._add_row(display_layout, "Sample", self._interp)
         self._cap_spin = QSpinBox()
         self._cap_spin.setRange(1_000, 5_000_000)
         self._cap_spin.setSingleStep(50_000)
@@ -693,7 +498,7 @@ class DoseVolumeWindow(VispyViewWindow):
         self._grid_label = QLabel("—")
         self._grid_label.setToolTip("Voxels along X, Y, and depth.")
         self._grid_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        self._add_row(view_layout, "Grid", self._grid_label)
+        self._add_row(display_layout, "Grid", self._grid_label)
         self._spots_label = QLabel("—")
         self._spots_label.setToolTip("Spots in the volume. A plan count appears while comparing.")
         self._spots_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
@@ -744,7 +549,7 @@ class DoseVolumeWindow(VispyViewWindow):
         color_layout.addWidget(self._gain_box)
         self._auto_check.toggled.connect(self._on_auto_changed)
         self._auto_check.setChecked(True)
-        layout.addWidget(color_group)
+        outer.addWidget(color_group)
 
         field_layout = self._add_group(layout, "Field Bounds")
         self._field_combo = self._add_combo(
@@ -763,24 +568,8 @@ class DoseVolumeWindow(VispyViewWindow):
         self._field_size = QLabel("—")
         self._field_size.setToolTip("X × Y × depth, in millimetres.")
         self._add_check_line(field_layout, self._field_box_check, self._field_size)
-        layout.addStretch(1)
+        outer.addStretch(1)
         return panel
-
-    def _mount_color_axis(self) -> None:
-        """Glue the full-height scale to the right edge of the view, left of the splitter handle."""
-        self._color_axis = _ColorAxis()
-        wrap = QWidget()
-        row = QHBoxLayout(wrap)
-        row.setContentsMargins(0, 0, 0, 0)
-        row.setSpacing(0)
-        # The zero-colored background runs edge to edge, so no gutter around the canvas.
-        self._plot_layout.setContentsMargins(0, 0, 0, 0)
-        self._splitter.insertWidget(0, wrap)
-        # Reparent the plot host straight into the row so Qt never drops it on a null parent.
-        row.addWidget(self._plot_host, stretch=1)
-        row.addWidget(self._color_axis)
-        self._splitter.setStretchFactor(0, 1)
-        self._splitter.setStretchFactor(1, 0)
 
     def _add_check_line(self, layout: QVBoxLayout, check: QCheckBox, readout: QLabel) -> None:
         """Checkbox and its readback, aligned with the labeled controls above."""
@@ -904,8 +693,11 @@ class DoseVolumeWindow(VispyViewWindow):
             return DEFAULT_WEIGHT
         return self._choice(combo) or DEFAULT_WEIGHT
 
-    def _density_unit(self) -> str:
-        per_area = self._ray_combo.currentData() == RAY_INTEGRAL
+    def _density_unit(self, per_area: bool | None = None) -> str:
+        if per_area is None:
+            per_area = self._ray_combo.currentData() == RAY_INTEGRAL
+        if self._dicom():
+            return "Gy(RBE)·mm" if per_area else "Gy(RBE)"
         weight = self._deposit_weight()
         if weight == WEIGHT_DOSE:
             return "Gy·mm" if per_area else "Gy"
@@ -1331,13 +1123,14 @@ class DoseVolumeWindow(VispyViewWindow):
         if self._scene.gamma:
             crit = self._gamma_criteria()
             title = f"γ {crit.dose_pct:g} % / {crit.dta_mm:g} mm"
-            rate = gamma_pass_rate(self._scene.gamma_pass)
+            rate = self._gamma_rate()
             return title if rate is None else f"{title} · {rate:.1f} % pass"
         density = self._density_unit()
         if self._drawn_difference():
+            what = "deliv − plan" if self._dicom() else "meas − plan"
             if percent:
-                return "meas − plan (% of peak)"
-            return f"meas − plan ({density})"
+                return f"{what} (% of peak)"
+            return f"{what} ({density})"
         return density
 
     def _update_legend(self) -> None:
@@ -1348,6 +1141,7 @@ class DoseVolumeWindow(VispyViewWindow):
         percent = compare and self._error_combo.currentData() == ERROR_PERCENT
         lo, hi = self._legend_numbers()
         self._color_axis.set_scale(name, lo, hi, self._legend_title(percent=percent))
+        self._push_layers()
 
     def _on_controls_changed(self, *_args) -> None:
         if self._updating:
@@ -1358,8 +1152,15 @@ class DoseVolumeWindow(VispyViewWindow):
         self._ref_row.setVisible(self._choice(self._plan_sigma_combo) == PLAN_SIGMA_REFERENCE)
         self._on_controls_changed()
 
+    def _gamma_rate(self) -> float | None:
+        if self._dicom():
+            g = self._study.gamma
+            return None if g is None else 100.0 * g.rate
+        return gamma_pass_rate(self._scene.gamma_pass)
+
     def _show_gamma_verdict(self) -> None:
-        if self._scene.gamma_pending:
+        pending = not self._study.done if self._dicom() else self._scene.gamma_pending
+        if pending and self._gamma_mode():
             self._gamma_label.setText("Waiting for the Monte Carlo to finish")
             self._gamma_label.setStyleSheet("")
             return
@@ -1367,10 +1168,13 @@ class DoseVolumeWindow(VispyViewWindow):
             self._gamma_label.setText(self._no_plan_reason() if self._gamma_mode() else "—")
             self._gamma_label.setStyleSheet("")
             return
-        tally = self._scene.gamma_pass
-        rate = gamma_pass_rate(tally)
+        rate = self._gamma_rate()
         verdict, color = gamma_verdict(rate)
-        head = "—" if rate is None else f"{rate:.1f} % pass ({tally[0]:,} of {tally[1]:,} voxels)"
+        if self._dicom():
+            head = "—" if rate is None else f"{rate:.1f} % pass ({self._study.gamma.evaluated:,} voxels) vs TPS"
+        else:
+            tally = self._scene.gamma_pass
+            head = "—" if rate is None else f"{rate:.1f} % pass ({tally[0]:,} of {tally[1]:,} voxels)"
         self._gamma_label.setText(f"{head}\n{verdict}")
         self._gamma_label.setStyleSheet(f"color: {color}; font-weight: 600;")
 
@@ -1409,6 +1213,10 @@ class DoseVolumeWindow(VispyViewWindow):
             self._schedule_refresh()
 
     def _show_status(self, message: str) -> None:
+        if self._dicom():
+            return
+        self._workspace.clear("")
+        self._content = None
         self._scene.render(
             None, None, range_axis_for_medium(MEDIUM_WATER), gain=1.0, status=message,
         )
@@ -1455,6 +1263,15 @@ class DoseVolumeWindow(VispyViewWindow):
 
     def _sync_progress(self) -> None:
         """Busy while loading or about to refresh; the Monte Carlo's share while it refines."""
+        if self._dicom():
+            share = self._study_share
+            if share is None:
+                self.progress.done()
+            elif share < 0:
+                self.progress.busy()
+            else:
+                self.progress.set_progress(share)
+            return
         mc = self._scene.mc_progress
         if self._loading or (mc is None and self._refresh_timer.isActive()):
             self.progress.busy()
@@ -1464,6 +1281,14 @@ class DoseVolumeWindow(VispyViewWindow):
             self.progress.done()
 
     def _start_refresh(self) -> None:
+        if self._dicom():
+            g = self._study.gamma
+            if self._study.done and (g is None or g.criteria != self._gamma_criteria()):
+                self._study.update_gamma()  # redraws through analysisChanged
+            else:
+                self._show_study()
+            self._sync_progress()
+            return
         gen = self._refresh_generation
         self._update_session_list([sid for sid in self._session_ids if sid in self._sources])
         config = self._read_config()
@@ -1513,6 +1338,7 @@ class DoseVolumeWindow(VispyViewWindow):
             mc_histories=config.mc_histories,
         )
         self._show_scene_readouts()
+        self._push_session_layers()
         if self._scene.mc_refining:
             self._mc_timer.start()
         else:
@@ -1541,18 +1367,189 @@ class DoseVolumeWindow(VispyViewWindow):
         self._sync_progress()
         if refining:
             self._grid_label.setText(self._scene.volume_note or "—")
+            if time.perf_counter() - self._readback_at > READBACK_S:
+                self._push_session_layers()
             return
         self._mc_timer.stop()
         self._show_scene_readouts()
+        self._push_session_layers()
 
     def _show_field_extent(self) -> None:
         ext = getattr(self._scene, "field_extent", None)
         self._field_size.setText("—" if ext is None else f"{ext[0]:.0f} × {ext[1]:.0f} × {ext[2]:.0f} mm")
 
     def _no_plan_reason(self) -> str:
+        if self._dicom():
+            if self._study.main_kind != DELIVERED:
+                return "Difference is delivered minus plan: pick the Delivered dose"
+            return "Gamma is against the TPS dose once the Monte Carlo finishes"
         if self._xy_combo.currentData() == XY_PLAN:
             return "XY is Plan, so there is no separate plan to compare"
         return "No plan to compare against"
+
+    # ---- sources --------------------------------------------------------------------------------
+
+    def _dicom(self) -> bool:
+        return self._choice(self._source_combo) == SOURCE_STUDY
+
+    def _set_source(self, key: str) -> None:
+        self._source_combo.set_current(key)
+        self._on_source_changed()
+
+    def _on_source_changed(self, *_args) -> None:
+        dicom = self._dicom()
+        self._session_box.setVisible(not dicom)
+        self._study.panel.setVisible(dicom)
+        self._show_combo.set_option_text("dose", "Dose" if dicom else "Measured")
+        self._show_combo.set_button_tooltips({
+            "dose": "The dose picked in Study." if dicom else "The measured volume.",
+            "difference": "Delivered minus plan." if dicom else "Measured minus plan.",
+            "gamma": "Gamma against the TPS dose." if dicom else "3D gamma of measured against plan.",
+        })
+        self._workspace.set_plot_kinds(STUDY_PLOTS if dicom else SESSION_PLOTS)
+        self._content = None
+        self._mc_timer.stop()
+        if dicom:
+            self._scene._mc_stop()
+            self._on_study_frame()
+        else:
+            self._workspace.clear("")
+            if self._sources:
+                self._schedule_refresh()
+            elif self._session_ids:
+                self._show_status("Loading dose data…" if self._loading else "No IC position / sigma data found")
+            else:
+                self._show_status("No sessions selected")
+        self._sync_progress()
+
+    def _on_study_frame(self) -> None:
+        if not self._dicom():
+            return
+        frame = self._study.frame()
+        if frame is None:
+            self._workspace.clear("Open a DICOM study folder")
+            self._scene.show_status("Open a DICOM study folder")
+            return
+        self._workspace.set_frame(frame, self._study.iso_index)
+        self._workspace.set_checked(self._study.checked())
+        self._show_study()
+
+    def _on_study_rois(self) -> None:
+        if self._dicom():
+            self._workspace.set_checked(self._study.checked())
+
+    def _on_study_progress(self, share) -> None:
+        self._study_share = share
+        self._sync_progress()
+
+    def _show_study(self) -> None:
+        """The study's doses into the 3D view, slices and plots, as Show asks."""
+        s = self._study
+        frame = s.frame()
+        if not self._dicom() or frame is None:
+            return
+        main = s.main_kind
+        dose, plan = s.doses.get(main), s.doses.get(PLANNED)
+        if dose is None:
+            return
+        show = self._choice(self._show_combo)
+        difference = show == "difference" and main == DELIVERED and plan is not None
+        gamma = s.gamma_grid if show == "gamma" else None
+        self.setWindowTitle(f"Dose Volume: {s.title}")
+        self._scene.show_volumes(
+            frame.origin, frame.spacing, dose, plan if difference else None, gamma,
+            names=frame.names, difference=difference, gamma_cap=self._gamma_criteria().cap,
+            beam_dir=frame.beam_dir, note="{} × {} × {} at {:g} × {:g} × {:g} mm".format(*frame.shape, *frame.spacing),
+        )
+        g = s.gamma
+        self._set_content(
+            wash=gamma if gamma is not None else dose - plan if difference else dose,
+            gamma=gamma is not None, difference=difference,
+            profiles={LABELS[k]: v for k, v in s.doses.items()}, main=LABELS[main],
+            dvh={LABELS[k]: v for k, v in s.dvh.items()},
+            gamma_values=None if g is None else g.gamma,
+            gamma_note="" if g is None else
+            f"γ {g.criteria.dose_pct:g}%/{g.criteria.dta_mm:g}mm · {100 * g.rate:.1f} % pass",
+        )
+        self._show_scene_readouts()
+
+    def _push_session_layers(self) -> None:
+        """Read the session volume back from the GPU for the slices and plots."""
+        self._readback_at = time.perf_counter()
+        f = self._scene.frame
+        vols = self._scene.volumes() if f is not None else {}
+        if not vols:
+            self._workspace.clear(self._scene.volume_note or "")
+            self._content = None
+            return
+        origin, spacing, shape, names, beam_dir = f
+        frame = DoseFrame(origin=origin, spacing=spacing, shape=tuple(shape), names=names, beam_dir=beam_dir)
+        old = self._workspace.frame
+        if old is None or old.shape != frame.shape or not np.allclose(old.origin, origin):
+            self._workspace.set_frame(frame)
+        first, second = vols["first"], vols.get("second")
+        difference = self._drawn_difference() and second is not None
+        gamma = vols.get("gamma")
+        profiles = {"Measured": first} if second is None else {"Measured": first, "Plan": second}
+        self._set_content(
+            wash=gamma if gamma is not None else first - second if difference else first,
+            gamma=gamma is not None, difference=difference, profiles=profiles, main="Measured",
+            gamma_values=gamma,
+            gamma_note="" if gamma is None else self._gamma_label.text().split("\n")[0],
+        )
+
+    def _set_content(self, *, difference: bool, **content) -> None:
+        self._content = (difference, content)
+        self._pushed = None
+        self._push_layers()
+
+    def _push_layers(self) -> None:
+        """Slices take the 3D view's colors; only a new scale or window redraws them."""
+        if getattr(self, "_content", None) is None or self._workspace.frame is None:
+            return
+        difference, c = self._content
+        name = GAMMA_CMAP if c["gamma"] else active_scale(difference, self._scale_combo.currentData() or DEFAULT_SCALE)
+        lo, hi = self._slice_limits(c["wash"], c["gamma"], difference)
+        if (name, lo, hi) == self._pushed:
+            return
+        self._pushed = (name, lo, hi)
+        self._workspace.set_layers(DoseLayers(scale=name, lo=lo, hi=hi, unit=self._density_unit(per_area=False), **c))
+
+    def _slice_limits(self, wash, gamma: bool, difference: bool) -> tuple[float, float]:
+        """The color axis's numbers, unless they are per ray (Integrate) or a percent, which a slice is not."""
+        if gamma:
+            return 0.0, float(self._gamma_criteria().cap)
+        percent = difference and self._error_combo.currentData() == ERROR_PERCENT
+        if self._ray_combo.currentData() != RAY_INTEGRAL and not percent:
+            return self._legend_numbers()
+        peak = float(np.abs(wash).max()) if wash is not None and wash.size else 0.0
+        if percent:
+            peak = self._error_scale_value() * float(self._scene.dose_peak)
+        peak = peak or 1.0
+        return (-peak, peak) if difference else (0.0, peak)
+
+    def _snapshot(self) -> bytes:
+        """The whole workspace as PNG bytes, for the report."""
+        from PySide6.QtCore import QBuffer, QIODevice, QPoint, QRect
+        from PySide6.QtGui import QImage, QPainter
+
+        ws, native = self._workspace, self._vispy_canvas.native
+        pix = ws.grab()  # misses the 3D canvas, which is painted in from the scene
+        if native.isVisible():  # a never-shown canvas has no GL context
+            img = np.ascontiguousarray(self._scene.snapshot())
+            h, w = img.shape[:2]
+            painter = QPainter(pix)
+            painter.drawImage(QRect(native.mapTo(ws, QPoint(0, 0)), native.size()),
+                              QImage(img.data, w, h, 4 * w, QImage.Format.Format_RGBA8888))
+            painter.end()
+        buf = QBuffer()
+        buf.open(QIODevice.OpenModeFlag.WriteOnly)
+        pix.save(buf, "PNG")
+        return bytes(buf.data())
+
+    def closeEvent(self, event) -> None:  # noqa: N802 - Qt
+        self._study.close()
+        super().closeEvent(event)
 
 
 def run_dose_volume_window(
@@ -1561,15 +1558,15 @@ def run_dose_volume_window(
     *,
     settings: ViewSettings | None = None,
     initial_preset: str | None = None,
+    study: str | None = None,
 ) -> None:
-    if not session_ids:
-        return
     run_view_window(
         lambda: DoseVolumeWindow(
             session_ids,
             base_dir,
             settings=settings,
             initial_preset=initial_preset,
+            study=study,
         ),
         maximize=True,
     )
