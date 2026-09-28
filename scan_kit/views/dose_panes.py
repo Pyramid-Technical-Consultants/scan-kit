@@ -679,8 +679,9 @@ class DoseWorkspace(QWidget):
         self._draw_plots()
 
     def set_frame(self, frame: DoseFrame, cursor=None) -> None:
-        """A new grid; the cursor goes to *cursor* (x, y, z index) or the middle."""
+        """A new grid, with no layers until they are set on it; the cursor goes to *cursor* (x, y, z index) or the middle."""
         self._frame = frame
+        self._layers = DoseLayers()
         self._contours.clear()
         self._sums.clear()
         shape = np.asarray(frame.shape)

@@ -20,7 +20,7 @@ from ..dicom.grid import VolumeGrid
 from ..dicom.plan import IonPlan
 from ..views.dose_mc import McRun
 from .beam_model import BeamModel
-from .dose_calc import SpotSet, patient_run, plan_spots
+from .dose_calc import Phantom, SpotSet, patient_run, plan_spots
 
 ENERGY_TOL_MEV = 0.5
 
@@ -132,7 +132,7 @@ def group_fractions(matches: list[DeliveryMatch]) -> list[list[DeliveryMatch]]:
 
 def fraction_runs(
     ct: CtImage, calibration: CtCalibration, model: BeamModel, plan: IonPlan, matches: list[DeliveryMatch], *,
-    histories: int, seed: int, dose_to_water: bool = True, let: bool | str = False,
+    histories: int, seed: int, dose_to_water: bool = True, let: bool | str = False, phantom: Phantom | None = None,
 ) -> tuple[McRun, McRun, VolumeGrid]:
     """(delivered, planned) runs of the matched beam deliveries, on one grid; a beam
     delivered twice (two fractions) counts its planned spots twice."""
@@ -140,7 +140,7 @@ def fraction_runs(
         raise ValueError("no delivered beams to transport")
     delivered = SpotSet.concat(m.spots for m in matches)
     planned = SpotSet.concat(plan_spots(plan, beams={m.beam}) for m in matches)
-    kw = dict(histories=histories, seed=seed, dose_to_water=dose_to_water, let=let)
+    kw = dict(histories=histories, seed=seed, dose_to_water=dose_to_water, let=let, phantom=phantom)
     run_d, grid = patient_run(ct, calibration, model, plan, delivered, **kw)
     run_p, _ = patient_run(ct, calibration, model, plan, planned, **kw)
     return run_d, run_p, grid

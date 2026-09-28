@@ -659,7 +659,8 @@ def test_dose_volume_window_opens_with_absolute_scale(qapp, tmp_path) -> None:
 
     window = DoseVolumeWindow(["none"], str(tmp_path))
     try:
-        assert not window._dicom() and not window._session_box.isHidden() and window._study.panel.isHidden()
+        assert not window._study_engine() and not window._study.panel.isHidden() and window._study.analysis.isHidden()
+        assert not window._plan_source._buttons["dicom"].isEnabled()
         assert window._weight_combo.current_key() == WEIGHT_DOSE
         assert window._error_combo.currentData() == ERROR_ABSOLUTE
         assert window._error_scale_spin.value() == pytest.approx(DEFAULT_ERROR_MU)
