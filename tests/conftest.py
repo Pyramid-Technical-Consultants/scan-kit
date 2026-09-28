@@ -421,6 +421,20 @@ def qapp():
     yield app
 
 
+@pytest.fixture(scope="session")
+def gpu():
+    """The WebGPU adapter; skips without a hardware one (software adapters are too slow to transport)."""
+    from scan_kit.gpu import GpuUnavailable, adapter_info
+
+    try:
+        info = adapter_info()
+    except GpuUnavailable as exc:
+        pytest.skip(f"WebGPU unavailable: {exc}")
+    if info["adapter_type"] == "CPU":
+        pytest.skip("software WebGPU adapter is too slow for transport")
+    return info
+
+
 @pytest.fixture(autouse=True)
 def _isolate_user_store(tmp_path_factory, monkeypatch):
     """Keep the app SQLite DB out of the developer's ``~/.scan-kit``."""

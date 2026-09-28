@@ -1,9 +1,11 @@
-"""Pack MCsquare material data into ``scan_kit/assets/mc_materials.npz``.
+"""Pack MCsquare material data into ``scan_kit/assets/mc_materials.npz`` and copy its
+scanner calibrations and beam models to ``scan_kit/assets/mcsquare``.
 
 Reproduces MCsquare's own preprocessing (``data_materials.c``, ``data_nuclear.c``,
 ``data_Stop_Pow.c``) for the media the GPU Monte Carlo supports, so the shader
-reads exactly the numbers MCsquare would. Run from the repo root after
-``git submodule update --init``::
+reads exactly the numbers MCsquare would. The media are the phantom slabs plus every
+material an MCsquare scanner calibration or beam-model range shifter refers to.
+Run from the repo root after ``git submodule update --init``::
 
     python scripts/build_mc_tables.py
 """
@@ -11,17 +13,19 @@ reads exactly the numbers MCsquare would. Run from the repo root after
 from __future__ import annotations
 
 import math
+import shutil
 import sys
 from pathlib import Path
 
 import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
-MATERIALS = ROOT / "third_party" / "MCsquare" / "Materials"
+MCSQUARE = ROOT / "third_party" / "MCsquare"
+MATERIALS = MCSQUARE / "Materials"
 OUT = ROOT / "scan_kit" / "assets" / "mc_materials.npz"
 
-# scan-kit medium key -> MCsquare material name
-MEDIA = {
+# scan-kit slab medium key -> MCsquare material name; these keep the first rows.
+SLAB_MEDIA = {
     "water": "Water",
     "pmma": "PMMA",
     "polystyrene": "Polystyrene",
@@ -65,6 +69,27 @@ def tokens(path: Path):
         parts = line.split("#")[0].split()
         if parts:
             yield parts
+
+
+def material_ids() -> dict[str, int]:
+    """MCsquare material name -> label, from ``Materials/list.dat``."""
+    return {t[1]: int(t[0]) for t in tokens(MATERIALS / "list.dat") if len(t) >= 2 and t[0].isdigit()}
+
+
+def media() -> dict[str, str]:
+    """scan-kit key -> MCsquare name: the slabs, then scanner and range-shifter materials by label."""
+    by_id = {v: k for k, v in material_ids().items()}
+    used = {int(t[1]) for f in sorted(MCSQUARE.glob("Scanners/*/HU_Material_Conversion.txt")) for t in tokens(f)}
+    for f in sorted(MCSQUARE.glob("BDL/*.txt")):
+        for line in f.read_text(encoding="latin-1").splitlines():
+            key, _, value = line.split("#")[0].partition("=")
+            if key.strip() == "RS_material":
+                used.add(int(value))
+    out = dict(SLAB_MEDIA)
+    for label in sorted(used):
+        if by_id[label] not in out.values():
+            out[by_id[label]] = by_id[label]
+    return out
 
 
 def read_properties(name: str) -> dict:
@@ -203,6 +228,8 @@ def interp_total(props: dict, elements: dict) -> np.ndarray:
 
 
 def build() -> dict:
+    MEDIA = media()
+    ids = material_ids()
     media_props = {key: read_properties(name) for key, name in MEDIA.items()}
     element_names: list[str] = []
     for props in media_props.values():
@@ -225,14 +252,16 @@ def build() -> dict:
     out: dict[str, np.ndarray] = {
         "media": np.array(list(MEDIA)),
         "mcsquare_names": np.array(list(MEDIA.values())),
+        "mcsquare_ids": np.array([ids[n] for n in MEDIA.values()], dtype=np.int32),
         "elements": np.array(element_names),
     }
     nm = len(MEDIA)
     out["m_props"] = np.array([[p["density"], p["electron_density"] / p["density"], p["X0"]]
                                for p in media_props.values()])
     out["m_type"] = np.array([p["type"] for p in media_props.values()], dtype=np.int32)
-    out["m_comp"] = np.full((nm, 4), -1, dtype=np.int32)
-    out["m_frac"] = np.zeros((nm, 4))
+    width = max(len(p["components"]) if p["type"] == TYPE_MIXTURE else 1 for p in media_props.values())
+    out["m_comp"] = np.full((nm, width), -1, dtype=np.int32)
+    out["m_frac"] = np.zeros((nm, width))
     for m, p in enumerate(media_props.values()):
         comps = p["components"] if p["type"] == TYPE_MIXTURE else [(p["name"], 1.0)]
         for k, (n, f) in enumerate(comps):
@@ -306,6 +335,9 @@ def main() -> int:
     OUT.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(OUT, **tables)
     print(f"wrote {OUT.relative_to(ROOT)}: media={list(tables['media'])} elements={list(tables['elements'])}")
+    for data in ("Scanners", "BDL"):
+        shutil.copytree(MCSQUARE / data, OUT.parent / "mcsquare" / data, dirs_exist_ok=True)
+    print("copied the MCsquare scanner calibrations and beam models to scan_kit/assets/mcsquare")
     return 0
 
 

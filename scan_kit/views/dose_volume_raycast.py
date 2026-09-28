@@ -21,7 +21,7 @@ from .dose_volume_fill import (
     tile_shape,
     tile_slot_capacity,
 )
-from .dose_volume_physics import GammaCriteria, LayerDoseKernel, gamma_index, gamma_offsets
+from .dose_volume_physics import GammaCriteria, LayerDoseKernel, gamma_index
 
 _log = logging.getLogger(__name__)
 
@@ -219,63 +219,6 @@ void main() {
     }
     // One invocation owns each voxel, so the float sum is written directly.
     imageStore(u_img, vox, vec4(acc / (u_voxel * u_voxel * u_voxel), 0.0, 0.0, 0.0));
-}
-"""
-
-_GAMMA = """
-#version 430
-layout(local_size_x = 8, local_size_y = 8, local_size_z = 8) in;
-layout(std430, binding = 0) readonly buffer Offsets { vec4 offs[]; };
-layout(std430, binding = 1) buffer Tally { uint tally[2]; };
-layout(binding = 1, r32f) writeonly uniform image3D u_img;
-uniform sampler3D u_ref;
-uniform sampler3D u_evl;
-uniform ivec3 u_shape;
-uniform int u_noffs;
-uniform float u_dd;
-uniform float u_cut;
-uniform float u_cap2;
-
-float evl_at(vec3 p) {
-    vec3 b = floor(p);
-    vec3 f = p - b;
-    ivec3 i = ivec3(b);
-    float acc = 0.0;
-    for (int dz = 0; dz < 2; ++dz) {
-        for (int dy = 0; dy < 2; ++dy) {
-            for (int dx = 0; dx < 2; ++dx) {
-                ivec3 q = i + ivec3(dx, dy, dz);
-                if (any(lessThan(q, ivec3(0))) || any(greaterThanEqual(q, u_shape))) continue;
-                float w = (dx == 1 ? f.x : 1.0 - f.x) * (dy == 1 ? f.y : 1.0 - f.y)
-                    * (dz == 1 ? f.z : 1.0 - f.z);
-                acc += w * texelFetch(u_evl, q, 0).r;
-            }
-        }
-    }
-    return acc;
-}
-
-void main() {
-    ivec3 v = ivec3(gl_GlobalInvocationID);
-    if (any(greaterThanEqual(v, u_shape))) return;
-    float ref = texelFetch(u_ref, v, 0).r;
-    // Empty voxels are never scored, or a 0 % cutoff would pass all the air.
-    if (ref <= 0.0 || ref < u_cut) {
-        imageStore(u_img, v, vec4(0.0));
-        return;
-    }
-    // Offsets are sorted by distance, so once distance alone loses, stop.
-    float best = u_cap2;
-    for (int k = 0; k < u_noffs; ++k) {
-        vec4 o = offs[k];
-        if (o.w >= best) break;
-        float d = (evl_at(vec3(v) + o.xyz) - ref) / u_dd;
-        best = min(best, o.w + d * d);
-    }
-    float g = sqrt(best);
-    imageStore(u_img, v, vec4(g, 0.0, 0.0, 0.0));
-    atomicAdd(tally[1], 1u);
-    if (g <= 1.0) atomicAdd(tally[0], 1u);
 }
 """
 
@@ -763,7 +706,6 @@ class _ComputeLib:
         self.scan = _link_compute(_SCAN)
         self.fill = _link_compute(_FILL)
         self.brick = _link_compute(_BRICK)
-        self.gamma = _link_compute(_GAMMA)
 
     def _u(self, prog, name, kind, *vals) -> None:
         from OpenGL.GL import (
@@ -1044,97 +986,27 @@ def read_texture(canvas, texture, shape_zyx) -> np.ndarray:
     return np.asarray(raw, dtype=np.float32).reshape(tuple(int(v) for v in shape_zyx))
 
 
-def _gpu_gamma(canvas, ref_tex, evl_tex, out_tex, shape_xyz, voxel, criteria, norm) -> tuple[int, int]:
-    from OpenGL.GL import (
-        GL_ALL_BARRIER_BITS,
-        GL_FLOAT,
-        GL_R32F,
-        GL_RED,
-        GL_SHADER_STORAGE_BUFFER,
-        GL_TEXTURE0,
-        GL_TEXTURE2,
-        GL_TEXTURE3,
-        GL_TEXTURE_3D,
-        GL_TRUE,
-        GL_WRITE_ONLY,
-        glActiveTexture,
-        glBindBuffer,
-        glBindImageTexture,
-        glBindTexture,
-        glDispatchCompute,
-        glGetBufferSubData,
-        glMemoryBarrier,
-        glTexImage3D,
-    )
-
-    nx, ny, nz = shape_xyz
-    lib = _lib(canvas)
-    prog = lib.gamma
-    out = _gloo_handle(canvas, out_tex)
-    ref = _gloo_handle(canvas, ref_tex)
-    evl = _gloo_handle(canvas, evl_tex)
-    offs = gamma_offsets(voxel, criteria)
-    bufs: list[int] = []
-    try:
-        glBindTexture(GL_TEXTURE_3D, out)
-        glTexImage3D(GL_TEXTURE_3D, 0, GL_R32F, nx, ny, nz, 0, GL_RED, GL_FLOAT, None)
-        glBindTexture(GL_TEXTURE_3D, 0)
-        glActiveTexture(GL_TEXTURE2)
-        glBindTexture(GL_TEXTURE_3D, ref)
-        glActiveTexture(GL_TEXTURE3)
-        glBindTexture(GL_TEXTURE_3D, evl)
-        glActiveTexture(GL_TEXTURE0)
-        bufs = [
-            _ssbo(np.ascontiguousarray(offs), 0),
-            _ssbo(np.zeros(2, dtype=np.uint32), 1),
-        ]
-        glBindImageTexture(1, out, 0, GL_TRUE, 0, GL_WRITE_ONLY, GL_R32F)
-        lib._u(prog, "u_ref", "1i", 2)
-        lib._u(prog, "u_evl", "1i", 3)
-        lib._u(prog, "u_shape", "3i", nx, ny, nz)
-        lib._u(prog, "u_noffs", "1i", offs.shape[0])
-        lib._u(prog, "u_dd", "1f", criteria.dose_pct / 100.0 * norm)
-        lib._u(prog, "u_cut", "1f", criteria.cutoff_pct / 100.0 * norm)
-        lib._u(prog, "u_cap2", "1f", criteria.cap**2)
-        glDispatchCompute((nx + 7) // 8, (ny + 7) // 8, (nz + 7) // 8)
-        glMemoryBarrier(GL_ALL_BARRIER_BITS)
-        glBindBuffer(GL_SHADER_STORAGE_BUFFER, bufs[1])
-        tally = np.frombuffer(bytes(glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, 8)), dtype=np.uint32)
-        return int(tally[0]), int(tally[1])
-    finally:
-        glBindImageTexture(1, 0, 0, GL_TRUE, 0, GL_WRITE_ONLY, GL_R32F)
-        glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0)
-        for unit in (GL_TEXTURE2, GL_TEXTURE3):
-            glActiveTexture(unit)
-            glBindTexture(GL_TEXTURE_3D, 0)
-        glActiveTexture(GL_TEXTURE0)
-        _delete_buffers(bufs)
-        _release_program(canvas)
-
-
 def gamma_texture(canvas, ref_tex, evl_tex, out_tex, grid: DoseGrid, criteria: GammaCriteria):
     """Write the γ map of *ref_tex* against *evl_tex* into *out_tex*.
 
-    Global normalization to the evaluated maximum (read back once).
-    Returns ``(passed, evaluated)``.
+    Global normalization to the evaluated maximum. Returns ``(passed, evaluated)``.
     """
     global _GPU_GAMMA_FAILED
     canvas.set_current()
     nx, ny, nz = grid.shape
     evl = read_texture(canvas, evl_tex, (nz, ny, nx))
-    norm = float(evl.max()) if evl.size else 0.0
-    if norm <= 0.0:
-        out_tex.set_data(np.zeros((nz, ny, nx), dtype=np.float32))
-        canvas.context.flush_commands()
-        return 0, 0
+    ref = read_texture(canvas, ref_tex, (nz, ny, nx))
+    vol = None
     if not _GPU_GAMMA_FAILED:
+        from ..gpu.gamma import gamma_volume
+
         try:
-            return _gpu_gamma(canvas, ref_tex, evl_tex, out_tex, (nx, ny, nz), grid.voxel, criteria, norm)
+            vol, passed, evaluated = gamma_volume(ref, evl, grid.voxel, criteria)
         except Exception as exc:
             _GPU_GAMMA_FAILED = True
             _log.warning("GPU gamma unavailable (%s); using the Python search", exc)
-    ref = read_texture(canvas, ref_tex, (nz, ny, nx))
-    vol, passed, evaluated = gamma_index(ref, evl, grid.voxel, criteria)
+    if vol is None:
+        vol, passed, evaluated = gamma_index(ref, evl, grid.voxel, criteria)
     out_tex.set_data(np.ascontiguousarray(vol))
     canvas.context.flush_commands()
     return passed, evaluated

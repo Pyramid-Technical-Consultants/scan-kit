@@ -394,18 +394,24 @@ class GammaCriteria:
     cap: float = 2.0
 
 
-def gamma_offsets(voxel_mm: float, criteria: GammaCriteria) -> np.ndarray:
-    """Search offsets in voxel units, nearest first; ``w`` is (distance / DTA)²."""
+def gamma_offsets(voxel_mm, criteria: GammaCriteria) -> np.ndarray:
+    """Search offsets in voxel units, nearest first; ``w`` is (distance / DTA)².
+
+    *voxel_mm* is one spacing or (x, y, z) spacings.
+    """
     dta = max(float(criteria.dta_mm), 1e-3)
-    # A whole fraction of the voxel keeps exact shifts on the grid; ≤ DTA/4 bounds the miss.
-    step = float(voxel_mm) / math.ceil(float(voxel_mm) / (dta / 4.0))
     reach = criteria.cap * dta
-    n = int(math.ceil(reach / step))
-    ax = np.arange(-n, n + 1) * step
-    gx, gy, gz = np.meshgrid(ax, ax, ax, indexing="ij")
+    spacing = np.broadcast_to(np.asarray(voxel_mm, dtype=float), (3,))
+    axes = []
+    for v in spacing:
+        # A whole fraction of the voxel keeps exact shifts on the grid; ≤ DTA/4 bounds the miss.
+        step = float(v) / math.ceil(float(v) / (dta / 4.0))
+        n = int(math.ceil(reach / step))
+        axes.append(np.arange(-n, n + 1) * step)
+    gx, gy, gz = np.meshgrid(*axes, indexing="ij")
     d2 = (gx**2 + gy**2 + gz**2) / dta**2
     keep = d2 <= criteria.cap**2
-    out = np.column_stack([gx[keep], gy[keep], gz[keep]]) / float(voxel_mm)
+    out = np.column_stack([gx[keep], gy[keep], gz[keep]]) / spacing
     w = d2[keep]
     order = np.argsort(w, kind="stable")
     return np.column_stack([out[order], w[order]]).astype(np.float32)

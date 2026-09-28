@@ -72,6 +72,12 @@ _UNIFIED_VIEWS.extend(
         "plan difference, or 3D gamma, in water, plastic, or metal (visPy).",
     ),
     (
+        "Patient QA (DICOM)",
+        "patient_qa",
+        "Plan and logged deliveries recalculated by the GPU Monte Carlo on the planning CT: "
+        "tri-planar and 3D dose, DVHs, clinical goals, gamma vs the TPS, RTDOSE/HTML report.",
+    ),
+    (
         "Session Log Compare",
         "session_log_compare",
         "Session log layer timings, errors, and side-by-side event comparison.",

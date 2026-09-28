@@ -753,11 +753,13 @@ class DoseScene:
             run = held[1]
         else:
             self._mc_drop(slot)
-            run = McRun(
-                self._canvas, tex, c[:, 0], c[:, 1], s[:, 0], s[:, 1], e, protons, medium_key, grid,
+            run = McRun.slab(
+                c[:, 0], c[:, 1], s[:, 0], s[:, 1], e, protons, medium_key, grid,
                 depth=depth, wet=wet, spread_pct=spread_pct, histories=histories, seed=MC_SEED,
             )
             self._mc[slot] = (key, run)
+            if run.done:
+                tex.set_data(run.dose)
         if run.done:
             return run.result
         self._mc_preview_at = 0.0
@@ -776,6 +778,9 @@ class DoseScene:
             if not run.done:
                 self._mc_drop(slot)
 
+    def _mc_texture(self, slot: str):
+        return self._meas_tex if slot == "meas" else self._plan_tex
+
     def _mc_progress_note(self) -> str:
         return f" · MC {100.0 * self.mc_progress:.0f} %"
 
@@ -785,7 +790,7 @@ class DoseScene:
         Measured and plan take turns, so both previews stay at about the same progress.
         By default the slice is short while the view is moving, so a drag keeps its frames.
         """
-        pending = [run for _, run in self._mc.values() if not run.done]
+        pending = [(slot, run) for slot, (_, run) in self._mc.items() if not run.done]
         if not pending:
             return False
         if budget_s is None:
@@ -793,13 +798,14 @@ class DoseScene:
             budget_s = MC_SLICE_S if moving else MC_IDLE_SLICE_S
         self._mc_turn = (self._mc_turn + 1) % len(pending)
         try:
-            pending[self._mc_turn].step(budget_s)
+            slot, run = pending[self._mc_turn]
+            if run.step(budget_s):
+                self._mc_texture(slot).set_data(run.dose)
         except Exception:
             _log.warning("Monte Carlo dose unavailable", exc_info=True)
             for slot in list(self._mc):
                 self._mc_drop(slot)
-                tex = self._meas_tex if slot == "meas" else self._plan_tex
-                tex.set_data(np.zeros(self._tex_shape, dtype=np.float32))
+                self._mc_texture(slot).set_data(np.zeros(self._tex_shape, dtype=np.float32))
             self._canvas.context.flush_commands()
             self.volume_note = self._note_base + " · MC unavailable"
             self._post = None
@@ -810,8 +816,10 @@ class DoseScene:
             self.volume_note = self._note_base + mc_note(first[1].result)
             self._finish_volume()
         elif time.perf_counter() >= self._mc_preview_at:
-            for run in pending:
-                run.preview()
+            for slot, run in pending:
+                image = run.preview()
+                if image is not None:
+                    self._mc_texture(slot).set_data(image)
             self._mc_preview_at = time.perf_counter() + MC_PREVIEW_S
             self.volume_note = self._note_base + self._mc_progress_note()
         else:

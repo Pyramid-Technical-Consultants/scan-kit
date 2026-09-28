@@ -1,6 +1,6 @@
 ---
 description: When to run the MCsquare validation of the GPU Monte Carlo dose engine
-globs: scan_kit/views/dose_mc.py,scan_kit/assets/dose_mc_transport.comp,scan_kit/assets/mc_materials.npz,scripts/build_mc_tables.py,validation/**
+globs: scan_kit/views/dose_mc.py,scan_kit/assets/mc_transport.wgsl,scan_kit/assets/mc_materials.npz,scan_kit/dicom/calibration.py,scan_kit/qa/**,scripts/build_mc_tables.py,validation/**
 alwaysApply: false
 ---
 
@@ -8,6 +8,7 @@ alwaysApply: false
 
 `pytest` covers the GPU Monte Carlo with self-checking unit tests (`tests/test_dose_mc.py`). Agreement with MCsquare lives in `validation/` and is deliberately outside `pytest`.
 
-- Only run it after changing Monte Carlo physics or transport: `dose_mc.py`, `dose_mc_transport.comp`, `mc_materials.npz`, or `build_mc_tables.py`. UI, catalog, or other dose-view changes don't need it.
+- Only run it after changing Monte Carlo physics or transport: `dose_mc.py`, `mc_transport.wgsl`, `mc_materials.npz`, `build_mc_tables.py`, the CT calibration, or the beam model. UI, catalog, or other dose-view changes don't need it.
 - `python validation/mcsquare_validate.py fast` (about 30 s) after each physics change; `python validation/mcsquare_validate.py full` (about 10 min) before a PR with physics changes.
+- `python validation/mcsquare_validate.py patient` (about 1 min) after changing voxel transport, the CT calibration, the beam model, or anything under `scan_kit/qa/` that feeds the Monte Carlo.
 - Don't pass `--write-goldens` unless the user asks. It reruns MCsquare (needs `MCSQUARE_DIR`, many minutes) and is only needed when a case in `CASES` changes or MCsquare is updated.

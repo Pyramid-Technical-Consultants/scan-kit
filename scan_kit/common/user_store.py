@@ -29,6 +29,7 @@ from .settings import ViewSettings
 _SCHEMA_VERSION = 3
 _DB_NAME = "scan-kit.sqlite"
 PREF_LAST_DATA_DIR = "session.last_data_dir"
+PREF_LAST_DICOM_DIR = "dicom.last_study_dir"
 PREF_APP_SETTINGS = "app.settings"
 PREF_APP_SETTINGS_IMPORTED = "app.settings_imported"
 _LEGACY_APP_SETTINGS = "app_settings.json"
