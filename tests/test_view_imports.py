@@ -57,6 +57,17 @@ def test_trajectory_vispy_import_chain() -> None:
     from vispy.visuals.line.line import _AggLineVisual  # noqa: F401
 
 
+def test_dose_volume_import_chain() -> None:
+    importlib.import_module("scan_kit.views.dose_volume")
+    importlib.import_module("scan_kit.views.dose_volume_window")
+    importlib.import_module("scan_kit.views.dose_volume_vispy")
+    importlib.import_module("scan_kit.views.dose_volume_raycast")
+    from scan_kit.views.dose_volume_fill import deposit_gaussians, dose_grid
+
+    assert callable(deposit_gaussians)
+    assert callable(dose_grid)
+
+
 def test_vispy_glsl_tree_is_discoverable() -> None:
     from pathlib import Path
 

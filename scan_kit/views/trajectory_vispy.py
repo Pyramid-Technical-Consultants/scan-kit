@@ -45,7 +45,7 @@ from .trajectory_data import (
     segment_z_extent,
     spot_traces_3d,
 )
-from .vispy_plot import hex_to_rgba
+from .vispy_plot import bind_blender_view_keys, hex_to_rgba
 
 
 def _beam_to_scene(segments: np.ndarray) -> np.ndarray:
@@ -239,6 +239,7 @@ class TrajectoryScene:
             distance=2500,
             center=(IC1_Z_MM / 2, 0.0, 0.0),
         )
+        bind_blender_view_keys(canvas, lambda: self._view.camera)
         self._view.camera.set_range()
         self._nodes: list = []
 

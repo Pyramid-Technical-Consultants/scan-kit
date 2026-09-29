@@ -55,14 +55,40 @@ def hex_to_rgba(
     return (r, g, b, alpha)
 
 
+def ensure_gl_plus() -> bool:
+    """Select vispy ``gl+`` (PyOpenGL) before any canvas exists.
+
+    Instanced draws need this backend. Returns True when
+    ``glDrawArraysInstanced`` is available afterwards.
+    """
+    try:
+        from vispy import use
+
+        use(gl="gl+")
+        from vispy.gloo import gl
+
+        return hasattr(gl, "glDrawArraysInstanced")
+    except Exception:
+        return False
+
+
 def make_scene_canvas(
     *,
     keys=None,
     bgcolor: str = BG,
     size: tuple[int, int] = (1200, 800),
     show: bool = False,
+    gl: str | None = None,
 ):
-    """SceneCanvas on the PySide6 vispy app (safe to call more than once)."""
+    """SceneCanvas on the PySide6 vispy app (safe to call more than once).
+
+    *gl* is forwarded to ``vispy.use`` before the canvas is created. Instanced
+    draws need ``gl="gl+"``; leave unset for the default GL2 backend.
+    """
+    if gl is not None:
+        from vispy import use
+
+        use(gl=gl)
     from vispy import scene
     from vispy.app import use_app
 
@@ -86,6 +112,112 @@ def block_canvas_navigation(canvas) -> None:
         event.handled = True
 
     canvas.events.mouse_wheel.connect(_block)
+
+
+# vispy TurntableCamera: azimuth=0, elevation=0 looks along +Y.
+# Blender (Z-up): 1 front (−Y), 3 right (−X), 7 top (−Z), Ctrl for the opposite.
+# The keypad with NumLock off sends navigation keys, and 5 sends Clear.
+_BLENDER_NUMPAD_ALIASES = {
+    "End": "1",
+    "Down": "2",
+    "PageDown": "3",
+    "Left": "4",
+    "Clear": "5",
+    "Right": "6",
+    "Home": "7",
+    "Up": "8",
+    "PageUp": "9",
+}
+BLENDER_ORBIT_DEG = 15.0  # Blender's default rotation angle
+# 6 orbits toward the right view (3) and 8 toward the top view (7).
+_BLENDER_ORBITS = {"4": (1.0, 0.0), "6": (-1.0, 0.0), "8": (0.0, 1.0), "2": (0.0, -1.0)}
+_BLENDER_TURNTABLE_SNAPS = {
+    ("1", False): (180.0, 0.0),
+    ("1", True): (0.0, 0.0),
+    ("3", False): (90.0, 0.0),
+    ("3", True): (-90.0, 0.0),
+    ("7", False): (0.0, 90.0),
+    ("7", True): (0.0, -90.0),
+}
+
+
+def blender_numpad_action(key: str, *, ctrl: bool = False) -> str:
+    """Map a vispy key name to ``snap:az:el``, ``orbit:daz:del``, ``opposite``, ``ortho``, or ``""``."""
+    digit = _BLENDER_NUMPAD_ALIASES.get(key, key)
+    if digit == "5":
+        return "ortho"
+    if digit == "9":
+        return "opposite"
+    if digit in _BLENDER_ORBITS and not ctrl:
+        daz, delev = _BLENDER_ORBITS[digit]
+        return f"orbit:{daz * BLENDER_ORBIT_DEG:g}:{delev * BLENDER_ORBIT_DEG:g}"
+    pose = _BLENDER_TURNTABLE_SNAPS.get((digit, bool(ctrl)))
+    if pose is None:
+        return ""
+    return f"snap:{pose[0]:g}:{pose[1]:g}"
+
+
+def apply_blender_view_action(camera, action: str) -> bool:
+    """Apply :func:`blender_numpad_action` to a vispy TurntableCamera."""
+    if not action or camera is None:
+        return False
+    if action == "ortho":
+        fov = float(getattr(camera, "fov", 45.0) or 0.0)
+        if fov <= 0.0:
+            camera.fov = float(getattr(camera, "_persp_fov", 45.0) or 45.0)
+        else:
+            camera._persp_fov = fov
+            camera.fov = 0.0
+        return True
+    if action == "opposite":
+        elev = float(getattr(camera, "elevation", 0.0))
+        if abs(elev) >= 80.0:
+            camera.elevation = -elev
+        else:
+            camera.azimuth = (float(getattr(camera, "azimuth", 0.0)) + 180.0) % 360.0
+        camera.roll = 0.0
+        return True
+    if action.startswith("snap:"):
+        _, az, el = action.split(":")
+        camera.azimuth = float(az)
+        camera.elevation = float(el)
+        camera.roll = 0.0
+        return True
+    if action.startswith("orbit:"):
+        _, daz, delev = action.split(":")
+        camera.azimuth = (float(getattr(camera, "azimuth", 0.0)) + float(daz)) % 360.0
+        camera.elevation = min(max(float(getattr(camera, "elevation", 0.0)) + float(delev), -90.0), 90.0)
+        return True
+    return False
+
+
+def bind_blender_view_keys(canvas, get_camera) -> None:
+    """Numpad 1/3/7/9 (+ Ctrl) snap a 3D turntable like Blender, 4/6/8/2 orbit it, 5 toggles ortho.
+
+    Click the canvas first so it has focus. Number-row keys work too
+    (Blender's emulate-numpad), and the navigation keys cover NumLock off.
+    """
+    from PySide6.QtCore import Qt
+
+    native = getattr(canvas, "native", None)
+    if native is not None:
+        native.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+    def _on_key(event) -> None:
+        key = getattr(event, "key", None)
+        native_event = getattr(event, "native", None)
+        if key is None and native_event is not None and native_event.key() == Qt.Key.Key_Clear:
+            key = "Clear"  # vispy's Qt backend has no name for it
+        if key is None:
+            return
+        name = getattr(key, "name", str(key))
+        mods = getattr(event, "modifiers", ()) or ()
+        ctrl = any(getattr(m, "name", m) == "Control" for m in mods)
+        if apply_blender_view_action(get_camera(), blender_numpad_action(name, ctrl=ctrl)):
+            event.handled = True
+            canvas.update()
+
+    canvas.events.key_press.connect(_on_key)
 
 
 def _view_pixel_size(view) -> tuple[float, float] | None:
@@ -184,7 +316,8 @@ def set_data_range(
         camera.set_range(x=xlim, y=ylim, margin=margin_v)
 
 
-def axis_widget(orientation: str, *, font_size: float = 8):
+def axis_widget(orientation: str, *, font_size: float = 8, **kwargs):
+    """1 px spine and ticks; *kwargs* go to vispy's ``AxisWidget`` (``axis_label``, ``axis_label_margin``, …)."""
     from vispy import scene
 
     widget = scene.AxisWidget(
@@ -193,6 +326,9 @@ def axis_widget(orientation: str, *, font_size: float = 8):
         tick_color=AXIS_RGBA,
         text_color=FG,
         font_size=font_size,
+        axis_width=1,
+        tick_width=1,
+        **kwargs,
     )
     if orientation == "left":
         widget.width_min = 48
@@ -240,12 +376,12 @@ def _use_agg_axis_lines(widget) -> None:
         if pos is None or len(np.asarray(pos).reshape(-1, 2)) < 2:
             mesh.visible = False
             return
-        width = float(getattr(visual, "tick_width", 1.5) or 1.5)
+        width = float(getattr(visual, "tick_width", 1.0) or 1.0)
         verts, faces = line_segments_mesh(pos, width=width)
         if len(faces) == 0:
             mesh.visible = False
             return
-        mesh.set_data(vertices=verts, faces=faces, color=AXIS_RGBA)
+        mesh.set_data(vertices=verts, faces=faces, color=getattr(visual, "tick_color", AXIS_RGBA))
         mesh.visible = True
 
     visual._update_subvisuals = _update

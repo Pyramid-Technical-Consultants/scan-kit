@@ -103,3 +103,20 @@ def test_calibration_actions_form_exclusive_radio(window) -> None:
     window._sync_cal_buttons()
     checked = [m for m, a in window._cal_menu_actions.items() if a.isChecked()]
     assert checked == ["per_session"]
+
+
+def test_deferred_init_does_not_rebuild_after_shutdown(qapp) -> None:
+    import time
+
+    from PySide6.QtCore import QThread
+
+    win = ScanKitMainWindow()
+    win._build_ui()
+    win._shutdown_children()
+    end = time.perf_counter() + 1.0
+    while time.perf_counter() < end:
+        qapp.processEvents()
+    try:
+        assert not [t for t in win.findChildren(QThread) if t.isRunning()]
+    finally:
+        win.close()

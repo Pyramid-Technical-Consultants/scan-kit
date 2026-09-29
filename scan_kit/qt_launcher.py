@@ -19,7 +19,6 @@ from PySide6.QtGui import (
     QAction,
     QActionGroup,
     QCloseEvent,
-    QIcon,
     QKeySequence,
     QMoveEvent,
     QResizeEvent,
@@ -27,13 +26,10 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QApplication,
-    QButtonGroup,
-    QFrame,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
-    QLineEdit,
     QMainWindow,
     QMenu,
     QMessageBox,
@@ -47,10 +43,10 @@ from PySide6.QtWidgets import (
 )
 
 from . import __version__
+from .common.gui_gc import collect_on_gui_thread
 from .common.app_icon import (
     apply_qt_application_branding,
     apply_windows_window_icons,
-    load_app_icon,
     prepare_qt_app_identity,
 )
 from .common.app_settings import AppSettings
@@ -86,6 +82,7 @@ _VIEW_GRID_COLS = 2
 
 _MAIN_TAB_DATA_ANALYSIS = "Data Analysis"
 _MAIN_TAB_PLAN_SYNTHESIS = "Plan Synthesis"
+_MAIN_TAB_PHANTOM_SYNTHESIS = "Phantom Synthesis"
 _MAIN_TAB_PLAN_RUNNER = "Plan Runner"
 _MAIN_TAB_CONFIG_TUNING = "Configuration Tuning"
 _MAIN_TAB_DEBUG = "Debug"
@@ -168,7 +165,7 @@ class ScanKitMainWindow(QMainWindow):
         self._plan_runner_panel: PlanRunnerPanel | None = None
         self._config_tuning_panel: ConfigTuningPanel | None = None
         self._debug_log_panel: DebugLogPanel | None = None
-        self._deferred_tab_steps: list = []
+        self._deferred_tab_steps: list | None = []
         self._remote_copy_busy = False
         self._remote_progress: QProgressDialog | None = None
         self._copy_auth_tried: set[str] = set()
@@ -185,11 +182,14 @@ class ScanKitMainWindow(QMainWindow):
 
     def _deferred_finish_init(self) -> None:
         """Build UI in event-loop chunks so GNOME does not mark us unresponsive."""
+        if self._main_tabs is not None or self._deferred_tab_steps is None:
+            return  # built by _build_ui, or already shut down
         self._init_main_tabs_shell()
         self._connect_thread_signals()
         QTimer.singleShot(0, self._request_settings_then_scan)
         self._deferred_tab_steps = [
             self._add_plan_synthesis_tab,
+            self._add_phantom_synthesis_tab,
             self._add_plan_runner_tab,
             self._add_config_tuning_tab,
             self._add_debug_tab,
@@ -198,6 +198,8 @@ class ScanKitMainWindow(QMainWindow):
         QTimer.singleShot(0, self._pump_deferred_tab_steps)
 
     def _pump_deferred_tab_steps(self) -> None:
+        if self._deferred_tab_steps is None:
+            return
         if not self._deferred_tab_steps:
             # Warm workers re-exec the frozen binary; delay until the shell is idle.
             QTimer.singleShot(2500, self._refill_warm_pool)
@@ -230,6 +232,7 @@ class ScanKitMainWindow(QMainWindow):
         """Synchronously build the full UI (tests / callers that need everything now)."""
         self._init_main_tabs_shell()
         self._add_plan_synthesis_tab()
+        self._add_phantom_synthesis_tab()
         self._add_plan_runner_tab()
         self._add_config_tuning_tab()
         self._add_debug_tab()
@@ -250,6 +253,14 @@ class ScanKitMainWindow(QMainWindow):
         if tabs is None:
             return
         tabs.addTab(self._build_plan_synthesis_tab(), _MAIN_TAB_PLAN_SYNTHESIS)
+
+    def _add_phantom_synthesis_tab(self) -> None:
+        tabs = self._main_tabs
+        if tabs is None:
+            return
+        from .workflows.phantom_panel import PhantomSynthesisPanel
+
+        tabs.addTab(PhantomSynthesisPanel(), _MAIN_TAB_PHANTOM_SYNTHESIS)
 
     def _add_plan_runner_tab(self) -> None:
         tabs = self._main_tabs
@@ -350,9 +361,10 @@ class ScanKitMainWindow(QMainWindow):
         tab_shortcuts = {
             _MAIN_TAB_DATA_ANALYSIS: "Ctrl+1",
             _MAIN_TAB_PLAN_SYNTHESIS: "Ctrl+2",
-            _MAIN_TAB_PLAN_RUNNER: "Ctrl+3",
-            _MAIN_TAB_CONFIG_TUNING: "Ctrl+4",
-            _MAIN_TAB_DEBUG: "Ctrl+5",
+            _MAIN_TAB_PHANTOM_SYNTHESIS: "Ctrl+3",
+            _MAIN_TAB_PLAN_RUNNER: "Ctrl+4",
+            _MAIN_TAB_CONFIG_TUNING: "Ctrl+5",
+            _MAIN_TAB_DEBUG: "Ctrl+6",
         }
         for name, shortcut in tab_shortcuts.items():
             action = QAction(name, self)
@@ -1271,6 +1283,7 @@ class ScanKitMainWindow(QMainWindow):
         super().closeEvent(event)
 
     def _shutdown_children(self) -> None:
+        self._deferred_tab_steps = None
         if self._session_browser is not None:
             self._session_browser.shutdown()
         panel = getattr(self, "_config_tuning_panel", None)
@@ -1354,6 +1367,7 @@ def main() -> None:
 
     prepare_qt_app_identity()
     app = QApplication(sys.argv)
+    collect_on_gui_thread(app)
     app_icon = apply_qt_application_branding(app)
     apply_saved_ui_theme(app=app)
     win = ScanKitMainWindow()

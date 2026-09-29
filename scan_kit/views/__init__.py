@@ -66,6 +66,14 @@ _UNIFIED_VIEWS.extend(
         "and optional plan overlay (visPy).",
     ),
     (
+        "Dose Volume",
+        "dose_volume",
+        "Tri-planar slices, a ray-marched 3D volume, and depth, lateral, DVH, or gamma plots. "
+        "Sessions in a water, plastic, or metal phantom, or a DICOM study recalculated by the "
+        "GPU Monte Carlo on its CT: measured, plan difference, 3D gamma or gamma vs the TPS, "
+        "clinical goals, RTDOSE/HTML report (visPy).",
+    ),
+    (
         "Session Log Compare",
         "session_log_compare",
         "Session log layer timings, errors, and side-by-side event comparison.",

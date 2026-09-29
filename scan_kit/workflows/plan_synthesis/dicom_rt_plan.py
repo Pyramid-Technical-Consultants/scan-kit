@@ -180,7 +180,12 @@ def _iter_planned_spot_slots_from_dataset(ds: Any):
 
     for beam in _flatten_ds_list(ds.get("IonBeamSequence")):
 
+        energy = 0.0
+
         for cp in _flatten_ds_list(beam.get("IonControlPointSequence")):
+
+            # NominalBeamEnergy is only required where it changes.
+            energy = float(cp.get("NominalBeamEnergy", energy) or energy)
 
             n = int(cp.get("NumberOfScanSpotPositions", 0) or 0)
 
@@ -189,8 +194,6 @@ def _iter_planned_spot_slots_from_dataset(ds: Any):
             if not n or sm is None:
 
                 continue
-
-            energy = float(cp.get("NominalBeamEnergy", 0.0) or 0.0)
 
             coords = list(sm)
 
