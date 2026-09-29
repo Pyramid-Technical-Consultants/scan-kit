@@ -22,6 +22,22 @@
       "problemMatcher": []
     },
     {
+      "label": "Run Scan Kit 2",
+      "type": "shell",
+      "command": "npm",
+      "args": ["run", "tauri", "dev"],
+      "options": {
+        "cwd": "${workspaceFolder}/apps/desktop"
+      },
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "focus": false,
+        "clear": true
+      },
+      "problemMatcher": []
+    },
+    {
       "label": "Run Tests (fast)",
       "type": "shell",
       "command": "python",

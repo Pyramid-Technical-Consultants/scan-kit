@@ -14,8 +14,10 @@ dist/
 downloads/
 eggs/
 .eggs/
-lib/
-lib64/
+# Anchored to the repo root. An unanchored `lib/` also ignores
+# apps/desktop/src/lib, which is application source.
+/lib/
+/lib64/
 parts/
 sdist/
 var/
