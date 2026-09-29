@@ -207,6 +207,9 @@ marimo/_static/
 marimo/_lsp/
 __marimo__/
 
+# Node (Scan Kit 2 desktop)
+node_modules/
+
 # Scan-kit test data
 test_data/
 

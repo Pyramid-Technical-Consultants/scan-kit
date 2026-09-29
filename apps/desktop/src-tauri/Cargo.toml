@@ -1,0 +1,19 @@
+[package]
+name = "scan-kit-desktop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+authors.workspace = true
+description = "Scan Kit desktop shell"
+
+[lib]
+name = "scan_kit_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+scan-kit-core = { workspace = true }
+tauri = { version = "2", features = [] }
