@@ -16,4 +16,7 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 scan-kit-core = { workspace = true }
+scan-kit-io = { workspace = true }
+serde_json = { workspace = true }
 tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"

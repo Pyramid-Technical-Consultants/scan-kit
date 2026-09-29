@@ -15,17 +15,27 @@ SOUP is every direct dependency this project does not develop and that is linked
 
 A change that adds a direct dependency updates this list in the same change, with the version, the purpose, and where the requirement comes from (Cargo.toml, package.json, or the Rust toolchain file). Removing a direct dependency removes its row in that same change.
 
-Versions below are the ones locked for the phase 1 workspace. Anomaly review for a SOUP upgrade is the pull request that bumps the lockfile: the author records any known defect that affects Scan Kit in the pull request, or states that they found none that affect the used interface.
+Versions below are the ones locked for the workspace. Anomaly review for a SOUP upgrade is the pull request that bumps the lockfile: the author records any known defect that affects Scan Kit in the pull request, or states that they found none that affect the used interface.
 
 ## Rust workspace
 
 | SOUP | Version | Purpose |
 |---|---|---|
 | Rust | stable, pinned by `rust-toolchain.toml` | Language and standard library |
-| tokio | see `crates/scan-kit-mcp/Cargo.toml` | Async runtime for the MCP server |
-| serde / serde_json | see `crates/scan-kit-core/Cargo.toml` | Tool input and output |
+| tokio | see `Cargo.toml` | Async runtime for the MCP server and the compute test |
+| serde / serde_json | see `Cargo.toml` | Tool input and output |
 | rmcp | see `crates/scan-kit-mcp/Cargo.toml` | MCP protocol and stdio transport |
 | tauri | see `apps/desktop/src-tauri/Cargo.toml` | Desktop shell |
+| tauri-plugin-dialog | see `apps/desktop/src-tauri/Cargo.toml` | Open Data Folder dialog |
+| rusqlite (bundled SQLite) | see `crates/scan-kit-io/Cargo.toml` | Existing `~/.scan-kit/scan-kit.sqlite` file |
+| zip | see `crates/scan-kit-io/Cargo.toml` | `.zip` session archives, read without unpacking |
+| tar | see `crates/scan-kit-io/Cargo.toml` | `.tar` session archives, read without unpacking |
+| flate2 | see `crates/scan-kit-io/Cargo.toml` | `.tar.gz` and `.tgz` session archives |
+| bzip2 | see `crates/scan-kit-io/Cargo.toml` | `.tar.bz2` session archives |
+| xz2 | see `crates/scan-kit-io/Cargo.toml` | `.tar.xz` session archives |
+| csv | see `crates/scan-kit-io/Cargo.toml` | Quoted fields and header drift in session files |
+| wgpu | see `crates/scan-kit-compute/Cargo.toml` | The only GPU and compute library |
+| naga | see `crates/scan-kit-compute/Cargo.toml` | Compile the compute shader when no GPU adapter is present |
 
 ## Desktop frontend
 
@@ -33,6 +43,8 @@ Versions below are the ones locked for the phase 1 workspace. Anomaly review for
 |---|---|---|
 | React | see `apps/desktop/package.json` | User interface |
 | Tailwind CSS | see `apps/desktop/package.json` | shadcn theme utilities |
-| Radix UI packages pulled in by shadcn | see `apps/desktop/package.json` | Behavior of shadcn components |
+| Base UI (`@base-ui/react`) | see `apps/desktop/package.json` | Behavior of shadcn components |
+| `@glideapps/glide-data-grid` | see `apps/desktop/package.json` | Session list and later column views |
+| `@tauri-apps/plugin-dialog` | see `apps/desktop/package.json` | Open Data Folder dialog |
 
 shadcn component source copied into `apps/desktop/src/components/ui/` is project software, not SOUP. The packages those components import are SOUP and are listed through `package.json`.
