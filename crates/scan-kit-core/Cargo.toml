@@ -1,0 +1,12 @@
+[package]
+name = "scan-kit-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+authors.workspace = true
+description = "Scan Kit domain operations and the MCP tool catalog"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
