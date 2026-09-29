@@ -79,15 +79,38 @@ def sub_grid(grid: VolumeGrid, box) -> VolumeGrid:
     return VolumeGrid(grid.to_patient(lo), grid.spacing, shape, grid.axes, grid.frame_uid)
 
 
+@dataclass(frozen=True)
+class Phantom:
+    """A cube of one MCsquare medium, patient-axis aligned, centred on the first beam's isocenter."""
+
+    medium: str  # key in load_tables()["media"]
+    side_mm: float
+    voxel_mm: float
+
+    def voxels(self, plan: IonPlan) -> tuple[VolumeGrid, np.ndarray, np.ndarray]:
+        from ..views.dose_mc import load_tables, mc_media
+
+        m = list(mc_media()).index(self.medium)
+        n = max(int(np.ceil(self.side_mm / self.voxel_mm)), 1)
+        origin = np.asarray(plan.beams[0].isocenter, float) - 0.5 * (n - 1) * self.voxel_mm
+        grid = VolumeGrid(origin, np.full(3, float(self.voxel_mm)), (n, n, n), np.eye(3), "")
+        rho = float(load_tables()["m_props"][m, 0])
+        return grid, np.full((n, n, n), m, np.uint8), np.full((n, n, n), rho, np.float32)
+
+
 def patient_run(
-    ct: CtImage, calibration: CtCalibration, model: BeamModel, plan: IonPlan, spots: SpotSet, *,
-    histories: int, seed: int, dose_to_water: bool = True, let: bool = False, crop: bool = True,
+    ct: CtImage | None, calibration: CtCalibration | None, model: BeamModel, plan: IonPlan, spots: SpotSet, *,
+    histories: int, seed: int, dose_to_water: bool = True, let: bool | str = False, crop: bool = True,
+    phantom: Phantom | None = None,
 ) -> tuple[McRun, VolumeGrid]:
-    """A Monte Carlo run of *spots* on *ct*, and the grid its dose lands on (the CT, or
-    the CT cropped to the patient). Dose is Gy for the MU given."""
-    box = body_box(ct.hu) if crop else tuple(slice(0, n) for n in ct.hu.shape)
-    grid = sub_grid(ct.grid, box)
-    material, density = calibration.voxels(ct.hu[box])
+    """A Monte Carlo run of *spots* on *ct* (or in *phantom* instead), and the grid its dose
+    lands on (the CT, the CT cropped to the patient, or the phantom). Dose is Gy for the MU given."""
+    if phantom is not None:
+        grid, material, density = phantom.voxels(plan)
+    else:
+        box = body_box(ct.hu) if crop else tuple(slice(0, n) for n in ct.hu.shape)
+        grid = sub_grid(ct.grid, box)
+        material, density = calibration.voxels(ct.hu[box])
     numbers = sorted({int(n) for n in spots.beam})
     beams = np.stack([
         beam_record(grid.axes.T @ plan.beam(n).gantry_to_patient(), grid.to_local(plan.beam(n).isocenter),

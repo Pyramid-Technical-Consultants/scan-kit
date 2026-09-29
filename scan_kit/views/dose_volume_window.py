@@ -112,10 +112,15 @@ from .plot_view_shell import (
     make_side_panel_column,
     run_view_window,
 )
+from ..qa.dose_calc import Phantom
 from .study_source import DELIVERED, LABELS, PLANNED, StudySource
 from .vispy_plot import ensure_gl_plus
 
-SOURCE_SESSIONS, SOURCE_STUDY = "sessions", "study"
+PLAN_LOG, PLAN_DICOM = "log", "dicom"
+MEDIUM_CT = "ct"
+# ponytail: a DICOM plan in a phantom gets a fixed cube on Auto and at least 2 mm voxels; sizing
+# it to the plan's range and field would need the range tables per layer.
+STUDY_PHANTOM_MM, STUDY_MIN_VOXEL_MM = 300.0, 2.0
 SESSION_PLOTS, STUDY_PLOTS = (DEPTH, LATERAL), (DVH, GAMMA_HIST)
 READBACK_S = 1.0  # slices and plots follow a refining session Monte Carlo at most this often
 
@@ -137,6 +142,7 @@ _MEDIUM_ITEMS = (
     (MEDIUM_A150, "A-150 plastic"),
     (MEDIUM_ALUMINUM, "Aluminum"),
     (MEDIUM_COPPER, "Copper"),
+    (MEDIUM_CT, "Planning CT"),
 )
 _ERROR_ITEMS = (
     (ERROR_PERCENT, "Percent of peak"),
@@ -254,7 +260,10 @@ class DoseVolumeWindow(VispyViewWindow):
         self._study.analysisChanged.connect(self._show_study)
         self._study.roisChanged.connect(self._on_study_rois)
         self._study.progress.connect(self._on_study_progress)
-        self._set_source(SOURCE_STUDY if study or not self._session_ids else SOURCE_SESSIONS)
+        self._study.planChanged.connect(self._on_study_plan)
+        self._routed = None  # engine last routed to: True for the study's Monte Carlo
+        self._routed_ct = False
+        self._route()
         if self._session_ids:
             self._start_load()
         if study:
@@ -262,26 +271,18 @@ class DoseVolumeWindow(VispyViewWindow):
 
     def _build_controls(self) -> QWidget:
         panel, outer = make_side_panel_column()
-        self._source_combo = SegmentedControl([(SOURCE_SESSIONS, "Sessions"), (SOURCE_STUDY, "DICOM study")])
-        self._source_combo.set_button_tooltips({
-            SOURCE_SESSIONS: "The selected sessions' logged spots in a water, plastic or metal phantom.",
-            SOURCE_STUDY: "A DICOM plan and the selected sessions recalculated on the planning CT.",
-        })
-        self._source_combo.selectionChanged.connect(self._on_source_changed)
-        self._add_row(outer, "Source", self._source_combo)
-        # Each source's own controls; what the picture shows and how it is colored follow, shared.
-        self._session_box = QWidget()
-        layout = QVBoxLayout(self._session_box)
+        # What is transported and where; what the picture shows and how it is colored follow.
+        box = QWidget()
+        layout = QVBoxLayout(box)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(8)
-        outer.addWidget(self._session_box)
         outer.addWidget(self._study.panel)
-        layout.addWidget(
-            make_presets_menu_button(
-                [(p.id, p.label, True) for p in PRESETS],
-                self._apply_preset,
-            )
+        outer.addWidget(box)
+        self._presets_button = make_presets_menu_button(
+            [(p.id, p.label, True) for p in PRESETS],
+            self._apply_preset,
         )
+        layout.addWidget(self._presets_button)
 
         # Compare is the dose quantity and model. Beam, phantom, and view follow.
         self._session_group = QGroupBox("Session")
@@ -294,17 +295,19 @@ class DoseVolumeWindow(VispyViewWindow):
         layout.addWidget(self._session_group)
 
         compare_layout = self._add_group(layout, "Compare")
+        self._plan_source = self._add_segment(
+            compare_layout, "Plan", ((PLAN_LOG, "Session log"), (PLAN_DICOM, "DICOM plan")), self._route,
+        )
+        self._plan_source.set_button_tooltips({
+            PLAN_LOG: "The plan spots in the session logs; the logged spots are measured against them.",
+            PLAN_DICOM: "The study's RT Ion Plan, and its matched logged fractions, through the Monte Carlo.",
+        })
         display_layout = self._add_group(outer, "Display")
         self._show_combo = self._add_segment(
             display_layout, "Show",
-            (("dose", "Measured"), ("difference", "− Plan"), ("gamma", "Gamma")),
+            (("dose", "Dose"), ("difference", "− Plan"), ("gamma", "Gamma")),
             self._on_show_changed,
         )
-        self._show_combo.set_button_tooltips({
-            "dose": "The measured volume.",
-            "difference": "Measured minus plan.",
-            "gamma": "3D gamma of measured against plan.",
-        })
         self._weight_combo = self._add_segment(
             compare_layout, "Quantity",
             ((WEIGHT_DOSE, "Dose"), (WEIGHT_MU, "MU"), (WEIGHT_PROTONS, "Protons")),
@@ -426,9 +429,10 @@ class DoseVolumeWindow(VispyViewWindow):
 
         phantom_layout = self._add_group(layout, "Phantom")
         self._medium_combo = self._add_combo(
-            phantom_layout, "Medium", _MEDIUM_ITEMS, self._on_controls_changed,
+            phantom_layout, "Medium", _MEDIUM_ITEMS, self._on_medium_changed,
         )
-        self._medium_combo.currentIndexChanged.connect(self._sync_model_controls)
+        self._medium_combo.setToolTip("What the beam goes through: a uniform phantom, or the study's planning CT.")
+        self._last_medium = self._medium_combo.currentData()
         self._sync_model_controls()
         self._phantom_spin = self._add_spin(
             phantom_layout, "Thickness", 0.0, 1000.0, 10.0, DEFAULT_PHANTOM_MM, decimals=0,
@@ -456,6 +460,7 @@ class DoseVolumeWindow(VispyViewWindow):
         self._phantom_box_check.toggled.connect(self._on_controls_changed)
         self._phantom_note = QLabel("—")
         self._add_check_line(phantom_layout, self._phantom_box_check, self._phantom_note)
+        layout.addWidget(self._study.analysis)
 
         view_layout = self._add_group(layout, "View")
         self._gantry_spin = self._add_spin(
@@ -464,10 +469,12 @@ class DoseVolumeWindow(VispyViewWindow):
         )
         self._gantry_spin.setWrapping(True)
         self._gantry_spin.setSuffix(" °")
-        self._ray_combo = self._add_combo(
-            display_layout, "Ray", _RAY_ITEMS, self._on_ray_changed,
-        )
-        self._ray_combo.setToolTip("Integrate sums a ray. Maximum keeps its hottest sample. Transparent fades like fog.")
+        self._ray_combo = QComboBox()
+        for value, text in _RAY_ITEMS:
+            self._ray_combo.addItem(text, value)
+        self._ray_combo.currentIndexChanged.connect(self._on_ray_changed)
+        self._ray_combo.setToolTip("Ray: Integrate sums a ray. Maximum keeps its hottest sample. "
+                                   "Transparent fades like fog.")
         self._set_combo(self._ray_combo, DEFAULT_RAY)
         self._voxel_spin = self._add_spin(
             view_layout, "Voxel", MIN_VOXEL_MM, MAX_VOXEL_MM, 0.25, VOXEL_MM,
@@ -487,7 +494,7 @@ class DoseVolumeWindow(VispyViewWindow):
             "cubic": "Smoother, and can overshoot a little.",
         })
         self._interp.selectionChanged.connect(self._scene.set_interp)
-        self._add_row(display_layout, "Sample", self._interp)
+        self._workspace.set_volume_tools([self._ray_combo, self._interp])
         self._cap_spin = QSpinBox()
         self._cap_spin.setRange(1_000, 5_000_000)
         self._cap_spin.setSingleStep(50_000)
@@ -569,6 +576,12 @@ class DoseVolumeWindow(VispyViewWindow):
         self._field_size.setToolTip("X × Y × depth, in millimetres.")
         self._add_check_line(field_layout, self._field_box_check, self._field_size)
         outer.addStretch(1)
+        self._view_group = view_layout.parentWidget()
+        self._session_only = [
+            self._presets_button, self._weight_combo.parentWidget(), beam_layout.parentWidget(),
+            self._wet_spin.parentWidget(), self._phantom_note.parentWidget(), self._gantry_spin.parentWidget(),
+            self._cap_spin.parentWidget(), self._spots_label.parentWidget(), field_layout.parentWidget(),
+        ]
         return panel
 
     def _add_check_line(self, layout: QVBoxLayout, check: QCheckBox, readout: QLabel) -> None:
@@ -596,16 +609,20 @@ class DoseVolumeWindow(VispyViewWindow):
         return inner
 
     def _sync_model_controls(self, *_args) -> None:
-        """Model is for Dose, and Monte Carlo only for media MCsquare has data for."""
-        supported = self._medium_combo.currentData() in MC_MEDIA
+        """Model is for Dose, and Monte Carlo only for media MCsquare has data for; a DICOM plan is always Monte Carlo."""
+        medium = self._medium_combo.currentData()
+        supported = medium in MC_MEDIA or medium == MEDIUM_CT
         if not supported:
             self._model_combo.set_current(MODEL_ANALYTIC)
         self._model_combo.setEnabled(supported)
         self._model_combo.setToolTip("" if supported else "No MCsquare material data")
-        dose = self._choice(self._weight_combo) == WEIGHT_DOSE
-        self._model_row.setVisible(dose)
+        study = self._study_engine()
+        weight = self._choice(self._weight_combo)
+        dose = weight == WEIGHT_DOSE
+        self._model_row.setVisible(dose and not study)
+        self._gap_row.setVisible(weight != WEIGHT_MU and not study)
         mc = dose and self._choice(self._model_combo) == MODEL_MC
-        self._histories_row.setVisible(mc)
+        self._histories_row.setVisible(mc or study)
         self._scatter_check.setEnabled(not mc)
 
     def _on_model_changed(self, *_args) -> None:
@@ -618,7 +635,7 @@ class DoseVolumeWindow(VispyViewWindow):
         """The margin only shapes an Auto phantom, so it leaves the panel otherwise."""
         auto = self._phantom_spin.value() <= 0.0
         self._margin_spin.setEnabled(auto)
-        self._margin_row.setVisible(auto)
+        self._margin_row.setVisible(auto and not self._study_engine())
 
     def _add_row(self, layout: QVBoxLayout, label: str, widget: QWidget) -> None:
         host = QWidget()
@@ -696,7 +713,7 @@ class DoseVolumeWindow(VispyViewWindow):
     def _density_unit(self, per_area: bool | None = None) -> str:
         if per_area is None:
             per_area = self._ray_combo.currentData() == RAY_INTEGRAL
-        if self._dicom():
+        if self._study_engine():
             return "Gy(RBE)·mm" if per_area else "Gy(RBE)"
         weight = self._deposit_weight()
         if weight == WEIGHT_DOSE:
@@ -1015,9 +1032,7 @@ class DoseVolumeWindow(VispyViewWindow):
     def _on_weight_mode_changed(self, *_args) -> None:
         if self._updating:
             return
-        show_gap = self._choice(self._weight_combo) != WEIGHT_MU
-        self._gap_spin.setEnabled(show_gap)
-        self._gap_row.setVisible(show_gap)
+        self._gap_spin.setEnabled(self._choice(self._weight_combo) != WEIGHT_MU)
         self._sync_model_controls()
         # New units: an absolute window typed for the old ones means nothing now.
         self._abs_edited = False
@@ -1127,7 +1142,7 @@ class DoseVolumeWindow(VispyViewWindow):
             return title if rate is None else f"{title} · {rate:.1f} % pass"
         density = self._density_unit()
         if self._drawn_difference():
-            what = "deliv − plan" if self._dicom() else "meas − plan"
+            what = "deliv − plan" if self._study_engine() else "meas − plan"
             if percent:
                 return f"{what} (% of peak)"
             return f"{what} ({density})"
@@ -1146,6 +1161,8 @@ class DoseVolumeWindow(VispyViewWindow):
     def _on_controls_changed(self, *_args) -> None:
         if self._updating:
             return
+        if self._study_engine():
+            self._route()  # histories, thickness or voxel may move the study's run
         self._schedule_refresh()
 
     def _on_plan_sigma_changed(self, *_args) -> None:
@@ -1153,13 +1170,13 @@ class DoseVolumeWindow(VispyViewWindow):
         self._on_controls_changed()
 
     def _gamma_rate(self) -> float | None:
-        if self._dicom():
+        if self._study_engine():
             g = self._study.gamma
             return None if g is None else 100.0 * g.rate
         return gamma_pass_rate(self._scene.gamma_pass)
 
     def _show_gamma_verdict(self) -> None:
-        pending = not self._study.done if self._dicom() else self._scene.gamma_pending
+        pending = not self._study.done if self._study_engine() else self._scene.gamma_pending
         if pending and self._gamma_mode():
             self._gamma_label.setText("Waiting for the Monte Carlo to finish")
             self._gamma_label.setStyleSheet("")
@@ -1170,7 +1187,7 @@ class DoseVolumeWindow(VispyViewWindow):
             return
         rate = self._gamma_rate()
         verdict, color = gamma_verdict(rate)
-        if self._dicom():
+        if self._study_engine():
             head = "—" if rate is None else f"{rate:.1f} % pass ({self._study.gamma.evaluated:,} voxels) vs TPS"
         else:
             tally = self._scene.gamma_pass
@@ -1195,7 +1212,7 @@ class DoseVolumeWindow(VispyViewWindow):
             radio.setChecked(sid == self._active_session)
             self._session_buttons.addButton(radio, i)
             self._session_layout.addWidget(radio)
-        self._session_group.setVisible(len(loaded_ids) > 1)
+        self._session_group.setVisible(len(loaded_ids) > 1 and not self._study_engine())
         kept = self._ref_combo.currentData()
         others = [sid for sid in loaded_ids if sid != self._active_session]
         self._ref_combo.blockSignals(True)
@@ -1213,7 +1230,7 @@ class DoseVolumeWindow(VispyViewWindow):
             self._schedule_refresh()
 
     def _show_status(self, message: str) -> None:
-        if self._dicom():
+        if self._study_engine():
             return
         self._workspace.clear("")
         self._content = None
@@ -1263,7 +1280,7 @@ class DoseVolumeWindow(VispyViewWindow):
 
     def _sync_progress(self) -> None:
         """Busy while loading or about to refresh; the Monte Carlo's share while it refines."""
-        if self._dicom():
+        if self._study_engine():
             share = self._study_share
             if share is None:
                 self.progress.done()
@@ -1281,7 +1298,7 @@ class DoseVolumeWindow(VispyViewWindow):
             self.progress.done()
 
     def _start_refresh(self) -> None:
-        if self._dicom():
+        if self._study_engine():
             g = self._study.gamma
             if self._study.done and (g is None or g.criteria != self._gamma_criteria()):
                 self._study.update_gamma()  # redraws through analysisChanged
@@ -1379,7 +1396,7 @@ class DoseVolumeWindow(VispyViewWindow):
         self._field_size.setText("—" if ext is None else f"{ext[0]:.0f} × {ext[1]:.0f} × {ext[2]:.0f} mm")
 
     def _no_plan_reason(self) -> str:
-        if self._dicom():
+        if self._study_engine():
             if self._study.main_kind != DELIVERED:
                 return "Difference is delivered minus plan: pick the Delivered dose"
             return "Gamma is against the TPS dose once the Monte Carlo finishes"
@@ -1389,27 +1406,81 @@ class DoseVolumeWindow(VispyViewWindow):
 
     # ---- sources --------------------------------------------------------------------------------
 
-    def _dicom(self) -> bool:
-        return self._choice(self._source_combo) == SOURCE_STUDY
+    def _study_engine(self) -> bool:
+        """The study's Monte Carlo runs the dose (a DICOM plan), rather than the session calc."""
+        return self._choice(self._plan_source) == PLAN_DICOM
 
-    def _set_source(self, key: str) -> None:
-        self._source_combo.set_current(key)
-        self._on_source_changed()
+    def _on_study_plan(self, new_study: bool) -> None:
+        """A study loaded with a plan goes on its planning CT; without one, the sessions keep the view."""
+        if self._study.has_plan and new_study:
+            self._set_combo(self._plan_source, PLAN_DICOM)
+            self._medium_combo.blockSignals(True)
+            self._set_combo(self._medium_combo, MEDIUM_CT)
+            self._medium_combo.blockSignals(False)
+            self._last_medium = MEDIUM_CT
+        self._route()
 
-    def _on_source_changed(self, *_args) -> None:
-        dicom = self._dicom()
-        self._session_box.setVisible(not dicom)
-        self._study.panel.setVisible(dicom)
-        self._show_combo.set_option_text("dose", "Dose" if dicom else "Measured")
+    def _on_medium_changed(self, *_args) -> None:
+        if self._updating:
+            return
+        medium = self._medium_combo.currentData()
+        if medium == MEDIUM_CT:
+            self._set_combo(self._plan_source, PLAN_DICOM)
+        elif self._last_medium == MEDIUM_CT and self._session_ids:
+            self._set_combo(self._plan_source, PLAN_LOG)  # a phantom checks the logs against their own plan
+        self._last_medium = medium
+        self._route()
+        if not self._study_engine():
+            self._schedule_refresh()
+
+    def _route(self, *_args) -> None:
+        """Keep Plan and Medium consistent, show the controls that apply, and run the engine they pick."""
+        if self._updating:
+            return
+        s = self._study
+        if not s.has_plan:
+            self._set_combo(self._plan_source, PLAN_LOG)
+        study = self._study_engine()
+        medium = self._medium_combo.currentData()
+        if (medium == MEDIUM_CT and not s.has_plan) or (study and medium not in (*MC_MEDIA, MEDIUM_CT)):
+            medium = MEDIUM_WATER
+            self._medium_combo.blockSignals(True)
+            self._set_combo(self._medium_combo, medium)
+            self._medium_combo.blockSignals(False)
+            self._last_medium = medium
+        ct = medium == MEDIUM_CT
+        self._plan_source.set_option_enabled(PLAN_DICOM, s.has_plan)
+        self._plan_source.set_option_enabled(PLAN_LOG, not ct)
+        items = self._medium_combo.model()
+        for i in range(self._medium_combo.count()):
+            key = self._medium_combo.itemData(i)
+            items.item(i).setEnabled(s.has_plan if key == MEDIUM_CT else not study or key in MC_MEDIA)
+        for w in self._session_only:
+            w.setVisible(not study)
+        self._session_group.setVisible(len(self._listed_ids) > 1 and not study)
+        self._phantom_spin.parentWidget().setVisible(not ct)
+        self._view_group.setVisible(not (study and ct))
+        self._sync_model_controls()
+        self._sync_phantom_controls()
         self._show_combo.set_button_tooltips({
-            "dose": "The dose picked in Study." if dicom else "The measured volume.",
-            "difference": "Delivered minus plan." if dicom else "Measured minus plan.",
-            "gamma": "Gamma against the TPS dose." if dicom else "3D gamma of measured against plan.",
+            "dose": "The dose picked in Study." if study else "The measured volume.",
+            "difference": "Delivered minus plan." if study else "Measured minus plan.",
+            "gamma": ("Gamma against the TPS dose." if ct else "Not available in a phantom: the TPS dose is on the CT")
+            if study else "3D gamma of measured against plan.",
         })
-        self._workspace.set_plot_kinds(STUDY_PLOTS if dicom else SESSION_PLOTS)
+        s.set_histories(int(self._choice(self._histories_combo) or DEFAULT_MC_HISTORIES))
+        s.set_geometry(None if ct else Phantom(
+            medium, self._phantom_spin.value() or STUDY_PHANTOM_MM, max(self._voxel_spin.value(), STUDY_MIN_VOXEL_MM)))
+        s.set_active(study)
+        if ct != self._routed_ct:
+            self._routed_ct = ct
+            self._workspace.set_plot_kinds(STUDY_PLOTS if ct else SESSION_PLOTS)
+        if study == self._routed:
+            return
+        self._routed = study
         self._content = None
         self._mc_timer.stop()
-        if dicom:
+        if study:
             self._scene._mc_stop()
             self._on_study_frame()
         else:
@@ -1419,11 +1490,11 @@ class DoseVolumeWindow(VispyViewWindow):
             elif self._session_ids:
                 self._show_status("Loading dose data…" if self._loading else "No IC position / sigma data found")
             else:
-                self._show_status("No sessions selected")
+                self._show_status("Pick sessions, or open a DICOM study")
         self._sync_progress()
 
     def _on_study_frame(self) -> None:
-        if not self._dicom():
+        if not self._study_engine():
             return
         frame = self._study.frame()
         if frame is None:
@@ -1435,7 +1506,7 @@ class DoseVolumeWindow(VispyViewWindow):
         self._show_study()
 
     def _on_study_rois(self) -> None:
-        if self._dicom():
+        if self._study_engine():
             self._workspace.set_checked(self._study.checked())
 
     def _on_study_progress(self, share) -> None:
@@ -1446,7 +1517,7 @@ class DoseVolumeWindow(VispyViewWindow):
         """The study's doses into the 3D view, slices and plots, as Show asks."""
         s = self._study
         frame = s.frame()
-        if not self._dicom() or frame is None:
+        if not self._study_engine() or frame is None:
             return
         main = s.main_kind
         dose, plan = s.doses.get(main), s.doses.get(PLANNED)

@@ -659,7 +659,8 @@ def test_dose_volume_window_opens_with_absolute_scale(qapp, tmp_path) -> None:
 
     window = DoseVolumeWindow(["none"], str(tmp_path))
     try:
-        assert not window._dicom() and not window._session_box.isHidden() and window._study.panel.isHidden()
+        assert not window._study_engine() and not window._study.panel.isHidden() and window._study.analysis.isHidden()
+        assert not window._plan_source._buttons["dicom"].isEnabled()
         assert window._weight_combo.current_key() == WEIGHT_DOSE
         assert window._error_combo.currentData() == ERROR_ABSOLUTE
         assert window._error_scale_spin.value() == pytest.approx(DEFAULT_ERROR_MU)
@@ -677,7 +678,9 @@ def test_dose_volume_window_opens_with_absolute_scale(qapp, tmp_path) -> None:
         assert [group_of(w) for w in (window._weight_combo, window._voxel_spin)] == ["Compare", "View"]
         assert group_of(window._plan_sigma_combo) == "Beam"
         assert [group_of(w) for w in (window._grid_label, window._spots_label)] == ["Display", "View"]
-        assert [group_of(w) for w in (window._show_combo, window._ray_combo, window._interp)] == ["Display"] * 3
+        assert group_of(window._show_combo) == "Display"
+        three_d = next(c for c in window._workspace.cells if c.view == 3)
+        assert window._ray_combo.parentWidget() is three_d.header is window._interp.parentWidget()
         assert group_of(window._scatter_check) == "Beam"
         assert not window._margin_row.isHidden() and not window._gap_row.isHidden()
         assert not window._phantom_box_check.isChecked() and window._field_box_check.isChecked()
@@ -1140,25 +1143,92 @@ def test_gpu_layer_fill_and_gamma_match_python(qapp) -> None:
 
 
 
-def test_workspace_cells_swap_views_and_planes_rotate(qapp) -> None:
-    from scan_kit.views.dose_panes import VIEW_3D, DoseFrame, DoseWorkspace
+def test_workspace_cells_pick_views_independently_and_planes_rotate(qapp) -> None:
+    from PySide6.QtWidgets import QComboBox
+
+    from scan_kit.views.dose_panes import LAT_LONG, VIEW_3D, DoseFrame, DoseLayers, DoseWorkspace
 
     ws = DoseWorkspace()
+    tool = QComboBox()
+    ws.set_volume_tools([tool])
     try:
-        ws.set_frame(DoseFrame(origin=np.zeros(3), spacing=np.ones(3), shape=(4, 6, 8)))
-        axial, three_d = ws.cells[0], ws.cells[1]
-        ws.show_view(axial, VIEW_3D)
+        ws.set_frame(DoseFrame(origin=np.array([-2.0, 10.0, 0.0]), spacing=np.ones(3), shape=(4, 6, 8)))
+        axial, three_d, coronal, sagittal = ws.cells
+        assert tool.parentWidget() is three_d.header
+        ws.show_view(coronal, 0)  # two axial cells, nothing else moves
+        assert [c.view for c in ws.cells] == [0, VIEW_3D, 0, 2]
+        ws.show_view(axial, VIEW_3D)  # the one 3D pane leaves its cell, which takes axial's plane
         assert (axial.view, three_d.view) == (VIEW_3D, 0)
-        assert ws.volume.parentWidget() is axial and ws.slices[0].native.parentWidget() is three_d
-        assert axial.rotate.isHidden() and not three_d.rotate.isHidden()
+        assert ws.volume.parentWidget() is axial and axial.slice.isHidden() and not three_d.slice.isHidden()
+        assert tool.parentWidget() is axial.header and not tool.isHidden()
+        row = three_d.header.layout()
+        assert [row.itemAt(i).widget() for i in range(row.count() - 3, row.count())] == [
+            three_d.slice.integral_button, three_d.slice.rotate_button, three_d.header.picker]
+        ws.show_view(axial, 1)  # 3D shows nowhere now
+        assert all(c.view != VIEW_3D for c in ws.cells) and ws.volume.parentWidget() is ws._park
+        three_d.header.picker.setCurrentIndex(2)
+        assert three_d.view == 2 and three_d.slice.plane == 2
+        ws.plots[0].set_kind("nope")
+        assert ws.plots[0].kind == ws.plots[0].header.picker.itemData(0)
 
-        pane = ws.slices[0]  # axial: 4 mm across, 6 mm up
+        # A second axial cell, summed through the volume, gets its own color bar in Gy·mm.
+        vol = np.zeros((8, 6, 4))
+        vol[:, 2, 3] = 1.0
+        ws.set_layers(DoseLayers(wash=vol, hi=1.0, profiles={"dose": vol}))
+        coronal.slice.integral_button.setChecked(True)
+        assert coronal.slice.color_axis._title == "Gy·mm" and coronal.slice.color_axis._hi == 8.0
+        assert ws.slices[3].color_axis._title == "Gy"
+        # Mm axes in the frame's coordinates: axial x runs −2..2 mm across.
+        x_axis, y_axis = coronal.slice._axes
+        assert x_axis.axis.axis_label == "X (mm)" and y_axis.axis.axis_label == "Y (mm)"
+        lo, hi = sorted(x_axis.axis.domain)
+        assert lo <= -2.0 and hi >= 2.0
+        plot = ws.plots[0]
+        plot.set_kind(LAT_LONG)
+        plot.set_kind(LAT_LONG)  # setting the same tools again keeps them left of the picker
+        row = plot.header.layout()
+        assert row.indexOf(plot.integral_button) == row.indexOf(plot.header.picker) - 1
+        assert not plot.integral_button.isHidden() and len(plot._lines) >= 2
+
+        pane = ws.slices[0]
+        pane.set_plane(0)  # axial: 4 mm across, 6 mm up
         pane.rotate()
         m = pane._plane.transform
         assert np.allclose(m.map((1.0, 5.0))[:2], (1.0, 1.0))  # a quarter turn left: (x, y) -> (6 - y, x)
         assert np.allclose(m.imap((1.0, 1.0))[:2], (1.0, 5.0))
         pane.rotate(3)
         assert pane.turns == 0 and np.allclose(m.map((1.0, 5.0))[:2], (1.0, 5.0))
+    finally:
+        ws.close()
+
+
+def test_integral_profile_sums_each_plane_across_the_line() -> None:
+    from scan_kit.views.dose_panes import DoseFrame, integral_profile
+
+    rng = np.random.default_rng(0)
+    vol = rng.random((5, 4, 3))  # (z, y, x)
+    frame = DoseFrame(origin=np.zeros(3), spacing=np.array([1.0, 2.0, 3.0]), shape=(3, 4, 5))
+    t, dose = integral_profile(vol, frame, (0.0, 0.0, 1.0))
+    assert np.allclose(t, (np.arange(5) + 0.5) * 3.0)
+    assert np.allclose(dose, vol.sum(axis=(1, 2)) * 1.0 * 2.0)  # Gy·mm² over each x-y plane
+    t, dose = integral_profile(vol, frame, (-1.0, 0.0, 0.0))
+    assert np.allclose(t, -(np.arange(3)[::-1] + 0.5)) and np.allclose(dose, vol.sum(axis=(0, 1))[::-1] * 6.0)
+
+
+def test_workspace_grid_starts_even(qapp) -> None:
+    from scan_kit.views.dose_panes import DoseWorkspace
+
+    ws = DoseWorkspace()
+    ws.resize(1200, 900)
+    ws.show()
+    qapp.processEvents()
+    try:
+        top, bottom, _plots = ws.rows
+        assert top.sizes() == bottom.sizes()
+        assert abs(top.sizes()[0] - top.sizes()[1]) <= 2
+        ws.resize(1500, 900)
+        qapp.processEvents()
+        assert top.sizes() == bottom.sizes() and abs(top.sizes()[0] - top.sizes()[1]) <= 2
     finally:
         ws.close()
 

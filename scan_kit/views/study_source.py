@@ -1,8 +1,10 @@
-"""DICOM study source for the dose views: the plan and logged deliveries through the Monte Carlo on the planning CT.
+"""DICOM study source for the dose views: the plan and logged deliveries through the Monte Carlo,
+on the planning CT or in a uniform phantom.
 
-:class:`StudySource` owns its controls (study, Monte Carlo, structures, TPS reference,
-clinical goals, export) and the runs and analysis behind them. It draws nothing: a view
-reads :meth:`StudySource.frame` and the doses, and listens to its signals.
+:class:`StudySource` owns its controls (:attr:`panel`: the study; :attr:`analysis`: Monte
+Carlo, RBE, structures, TPS reference, clinical goals, export) and the runs and analysis
+behind them. It draws nothing: a view reads :meth:`StudySource.frame` and the doses,
+listens to its signals, and sets the histories, geometry and whether it runs at all.
 """
 
 from __future__ import annotations
@@ -41,11 +43,13 @@ from ..dicom.structures import MAX_MASK_BITS, mask_bits
 from ..qa import BeamModel, delivery_from_session, fraction_runs, group_fractions, match_delivery, patient_run, plan_spots
 from ..qa.analysis import BEAM_SUMMATIONS, RBE, Goal, dvhs, gamma_vs_tps, provenance, resample
 from ..qa.beam_model import MCSQUARE_BDL
-from ..qa.dose_calc import BODY_HU
+from ..qa.dose_calc import BODY_HU, Phantom
+from ..qa.rbe import CONSTANT, DEFAULT_ALPHA_BETA, MODELS, rbe, uses_alpha_beta
 from ..qa.report import write_report
+from .dose_mc import LET_WATER
 from .async_refresh import DebouncedBackgroundTask
 from .dose_panes import DoseFrame
-from .dose_volume_catalog import DEFAULT_MC_HISTORIES, MC_HISTORIES, MC_SEED
+from .dose_volume_catalog import DEFAULT_MC_HISTORIES, MC_SEED
 from .dose_volume_physics import GammaCriteria
 
 _log = logging.getLogger(__name__)
@@ -112,6 +116,7 @@ class StudySource(QObject):
     """
 
     frameChanged = Signal()
+    planChanged = Signal(bool)  # True for a newly loaded study
     dosesChanged = Signal()
     analysisChanged = Signal()
     roisChanged = Signal()
@@ -132,6 +137,9 @@ class StudySource(QObject):
         self._grid = None
         self._frame: DoseFrame | None = None
         self.doses: dict[str, np.ndarray] = {}  # kind -> Gy(RBE) over the selected fractions, blanked outside the body
+        self._physical: dict[str, np.ndarray] = {}  # kind -> Gy over the selected fractions
+        self.lets: dict[str, np.ndarray] = {}  # kind -> LETd in water, keV/µm
+        self.let_stats: dict[str, dict] = {}
         self._n_fractions = 1
         self._body = None
         self.gamma = None
@@ -140,7 +148,9 @@ class StudySource(QObject):
         self._goal_results = []
         self._preview_at = 0.0
         self._preview_cost = 0.0
-        self._run_histories = None
+        self._histories = DEFAULT_MC_HISTORIES
+        self._phantom: Phantom | None = None  # None: the planning CT
+        self._active = False
         self._closed = False
         self._updating = True
         self._timer = QTimer(self)
@@ -152,17 +162,26 @@ class StudySource(QObject):
         self._goal_timer.timeout.connect(self._update_goals)
         self._loader = DebouncedBackgroundTask(debounce_ms=0, parent=self)
         self._loader.finished.connect(self._on_loaded)
-        self.panel = self._build_controls()
+        self.panel, self.analysis = self._build_controls()
+        self._ct_only = [self._scanner_combo.parentWidget(), self._roi_list.parentWidget(),
+                         self._tps_combo.parentWidget().parentWidget(), self._rx.parentWidget().parentWidget(),
+                         self._export_button]
+        self._run_rows = [self._beam_combo.parentWidget(), self._fraction_combo.parentWidget(),
+                          self._dose_choice.parentWidget(), self._delivery_label]
+        self._show_state()
         self._updating = False
 
     # ---- controls -------------------------------------------------------------------------------
 
-    def _build_controls(self) -> QWidget:
+    def _build_controls(self) -> tuple[QWidget, QWidget]:
         panel = QWidget()
-        layout = QVBoxLayout(panel)
+        head = QVBoxLayout(panel)
+        head.setContentsMargins(0, 0, 0, 0)
+        study = _group(head, "Study")
+        analysis = QWidget()
+        layout = QVBoxLayout(analysis)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(8)
-        study = _group(layout, "Study")
         button = QPushButton("Open DICOM folder…")
         button.clicked.connect(self._pick_study)
         study.addWidget(button)
@@ -179,10 +198,6 @@ class StudySource(QObject):
         self._delivery_label = _wrapped(study)
 
         mc = _group(layout, "Monte Carlo")
-        self._histories = SegmentedControl([(str(h), f"{h / 1e6:g}M") for h in MC_HISTORIES])
-        self._histories.set_current(str(DEFAULT_MC_HISTORIES))
-        self._histories.selectionChanged.connect(lambda key: None if key == self._run_histories else self._restart())
-        _row(mc, "Histories", self._histories)
         self._scanner_combo = self._combo(mc, "CT curve", self._restart)
         for p in sorted(MCSQUARE_SCANNERS.iterdir()) if MCSQUARE_SCANNERS.is_dir() else ():
             self._scanner_combo.addItem(p.name, p.name)
@@ -191,6 +206,25 @@ class StudySource(QObject):
             self._bdl_combo.addItem(p.stem.removeprefix("BDL_"), p.stem)
         self._bdl_combo.setCurrentIndex(max(self._bdl_combo.findData(DEFAULT_BDL), 0))
         self._mc_label = _wrapped(mc)
+
+        bio = _group(layout, "RBE")
+        self._rbe_combo = self._combo(bio, "Model", self._reweigh)
+        for key, text in MODELS:
+            self._rbe_combo.addItem(text, key)
+        self._rbe_combo.setToolTip("Constant 1.1 is the clinical convention; the others weigh the dose by LETd "
+                                   "(in water, dose-averaged over primary and secondary protons).")
+        self._alpha_beta = QDoubleSpinBox()
+        self._alpha_beta.setRange(0.5, 20.0)
+        self._alpha_beta.setDecimals(1)
+        self._alpha_beta.setSingleStep(0.5)
+        self._alpha_beta.setSuffix(" Gy")
+        self._alpha_beta.setValue(DEFAULT_ALPHA_BETA)
+        # ponytail: one (α/β)x for every voxel; per-structure values would need an α/β map from the ROIs.
+        self._alpha_beta.setToolTip("(α/β)x of the tissue, for every voxel")
+        self._alpha_beta.valueChanged.connect(lambda _v: None if self._updating else self._reweigh())
+        _row(bio, "(α/β)x", self._alpha_beta)
+        self._alpha_beta.setEnabled(False)
+        self._let_label = _wrapped(bio)
 
         rois = _group(layout, "Structures")
         self._roi_list = QListWidget()
@@ -221,7 +255,47 @@ class StudySource(QObject):
         self._export_button.clicked.connect(self._pick_export)
         self._export_button.setEnabled(False)
         layout.addWidget(self._export_button)
-        return panel
+        return panel, analysis
+
+    def _show_state(self) -> None:
+        for w in self._run_rows:
+            w.setVisible(self._active)
+        self.analysis.setVisible(self._active)
+        for w in self._ct_only:
+            w.setVisible(self._phantom is None)
+
+    def set_active(self, on: bool) -> None:
+        """Run the study's plan (on) or leave it loaded but idle (off)."""
+        if on == self._active:
+            return
+        self._active = on
+        self._show_state()
+        if on:
+            self._restart()
+        else:
+            self.stop()
+            self.progress.emit(None)
+
+    def set_geometry(self, phantom: Phantom | None) -> None:
+        """Transport through *phantom*, or the planning CT for None."""
+        if phantom == self._phantom:
+            return
+        self._phantom, self._grid = phantom, None
+        self._show_state()
+        self._restart()
+
+    def set_histories(self, n: int) -> None:
+        if n != self._histories:
+            self._histories = n
+            self._restart()
+
+    @property
+    def has_plan(self) -> bool:
+        return self._plan is not None
+
+    @property
+    def in_phantom(self) -> bool:
+        return self._phantom is not None
 
     def _combo(self, layout: QVBoxLayout, label: str, handler) -> QComboBox:
         combo = QComboBox()
@@ -255,7 +329,7 @@ class StudySource(QObject):
         return bool(self._runs) and all(r.done for r in self._runs.values())
 
     def checked(self) -> list[int]:
-        return [r for r in range(self._roi_list.count()) if self._roi_list.item(r).checkState() == Qt.CheckState.Checked]
+        return [r for r in range(len(self._rois())) if self._roi_list.item(r).checkState() == Qt.CheckState.Checked]
 
     # ---- loading --------------------------------------------------------------------------------
 
@@ -305,11 +379,12 @@ class StudySource(QObject):
         if not case.plans:
             self.progress.emit(None)
             self._study_label.setText(self._study_label.text() + ". No RT Ion Plan on this frame.")
+            self.planChanged.emit(True)
             self.frameChanged.emit()
             return
-        self._on_plan_changed()
+        self._on_plan_changed(new_study=True)
 
-    def _on_plan_changed(self) -> None:
+    def _on_plan_changed(self, new_study: bool = False) -> None:
         self.stop()
         plan = self._case.plans[int(self._plan_combo.currentData() or 0)]
         try:
@@ -348,6 +423,8 @@ class StudySource(QObject):
         if targets and not self._goals_edit.toPlainText().strip():
             self._goals_edit.setPlainText(f"{targets[0]}: D95% >= 95%\n{targets[0]}: D2% <= 107%")
         self._dose_choice.set_current(DELIVERED if self._fractions else PLANNED)
+        self._grid = None
+        self.planChanged.emit(new_study)  # the view picks the geometry and engine before the run starts
         self._updating = False
         self._restart()
 
@@ -376,8 +453,9 @@ class StudySource(QObject):
         for run in self._runs.values():
             run.close()
         self._runs, self.doses, self.dvh, self.gamma, self.gamma_grid = {}, {}, {}, None, None
+        self._physical, self.lets, self.let_stats = {}, {}, {}
         self._goal_results = []
-        for label in (self._gamma_label, self._goals_label, self._mc_label, self._delivery_label):
+        for label in (self._gamma_label, self._goals_label, self._mc_label, self._delivery_label, self._let_label):
             label.setText("")
         self._export_button.setEnabled(False)
 
@@ -389,12 +467,11 @@ class StudySource(QObject):
         self.dosesChanged.emit()
 
     def _restart(self, *_args) -> None:
-        if self._updating or self._plan is None:
+        if self._updating or self._plan is None or not self._active:
             return
         self.stop()
         plan, case = self._plan, self._case
-        self._run_histories = self._histories.current_key() or str(DEFAULT_MC_HISTORIES)
-        kw = dict(histories=int(self._run_histories), seed=MC_SEED)
+        kw = dict(histories=self._histories, seed=MC_SEED, let=LET_WATER, phantom=self._phantom)
         picked, self._n_fractions = self._selected()
         self._picked = picked
         try:
@@ -425,16 +502,23 @@ class StudySource(QObject):
         self.progress.emit(0.0)
         self.dosesChanged.emit()
 
+    def _rois(self):
+        s = self._case.structures
+        return () if self._phantom is not None or s is None else s.rois
+
     def _set_grid(self, grid) -> None:
         self._grid = grid
-        ct = self._case.ct
-        off = np.rint(ct.grid.to_index(grid.origin)).astype(int)
         nx, ny, nz = grid.shape
-        hu = ct.hu[off[2]:off[2] + nz, off[1]:off[1] + ny, off[0]:off[0] + nx]
-        # Shown and gamma-evaluated dose stays in the patient: air voxels (1 mg/cm³) spike honestly but read as noise.
-        # ponytail: gas below BODY_HU inside the patient is blanked too; a BODY contour mask would keep it.
-        self._body = hu > BODY_HU
-        rois = self._case.structures.rois if self._case.structures is not None else ()
+        if self._phantom is not None:
+            hu, self._body = None, np.ones((nz, ny, nx), bool)
+        else:
+            ct = self._case.ct
+            off = np.rint(ct.grid.to_index(grid.origin)).astype(int)
+            hu = ct.hu[off[2]:off[2] + nz, off[1]:off[1] + ny, off[0]:off[0] + nx]
+            # Shown and gamma-evaluated dose stays in the patient: air voxels (1 mg/cm³) spike honestly but read as noise.
+            # ponytail: gas below BODY_HU inside the patient is blanked too; a BODY contour mask would keep it.
+            self._body = hu > BODY_HU
+        rois = self._rois()
         bits = [mask_bits(rois[s:s + MAX_MASK_BITS], grid) for s in range(0, len(rois), MAX_MASK_BITS)]
         sp = np.asarray(grid.spacing, dtype=float)
         # IEC gantry Z points at the source, so the beam travels along −Z; in grid axes, like the transport.
@@ -443,7 +527,7 @@ class StudySource(QObject):
         self._frame = DoseFrame(
             origin=np.asarray(grid.corner, dtype=float), spacing=sp, shape=tuple(grid.shape),
             names=PATIENT_AXES, beam_dir=direction, ct=hu, rois=[(r.name, tuple(r.color)) for r in rois],
-            bits=bits, flip_axial=True,
+            bits=bits, flip_axial=self._phantom is None,
         )
         self.frameChanged.emit()
 
@@ -465,7 +549,8 @@ class StudySource(QObject):
         for kind, run in self._runs.items():
             dose = run.preview()
             if dose is not None:
-                self.doses[kind] = np.where(self._body, dose * np.float32(RBE), np.float32(0.0))
+                self._physical[kind], self.lets[kind] = dose, run.preview_let()
+                self.doses[kind] = np.where(self._body, self._weighted(kind), np.float32(0.0))
         progress = float(np.mean([r.progress for r in self._runs.values()]))
         main = self._runs[self.main_kind]
         self._mc_label.setText(f"{main.histories / 1e6:g}M histories per dose, {progress:.0%}"
@@ -483,17 +568,62 @@ class StudySource(QObject):
         """Runs hold the selected fractions; DVHs and goals are for the whole course."""
         return self._plan.fractions / max(self._n_fractions, 1)
 
+    @property
+    def rbe_model(self) -> str:
+        return self._rbe_combo.currentData() or CONSTANT
+
+    def _weighted(self, kind: str) -> np.ndarray:
+        """Gy(RBE) of *kind* over the selected fractions, by the chosen RBE model."""
+        dose, let = self._physical[kind], self.lets.get(kind)
+        model = self.rbe_model
+        if model == CONSTANT or let is None:
+            return dose * np.float32(RBE)
+        n = max(self._n_fractions, 1)  # the models take the dose of one fraction
+        return (dose * rbe(model, dose / n, let, self._alpha_beta.value())).astype(np.float32)
+
+    def _reweigh(self) -> None:
+        """A new RBE model or (α/β)x: weigh the doses again, without transporting again."""
+        self._alpha_beta.setEnabled(uses_alpha_beta(self.rbe_model))
+        if not self._physical:
+            return
+        for kind in self._physical:
+            self.doses[kind] = np.where(self._body, self._weighted(kind), np.float32(0.0))
+        if self.done:
+            self._analyse()
+        self.dosesChanged.emit()
+
     def _finish(self) -> None:
-        rois = self._case.structures.rois if self._case.structures is not None else ()
-        s = self._course_scale() * RBE
-        # Unmasked: the air blanking is for display, a DVH counts every voxel of its structure.
-        bits = self._frame.bits
-        self.dvh = {k: dvhs(r.dose * s, self._grid, rois, bits=bits) for k, r in self._runs.items()} if rois else {}
+        for kind, run in self._runs.items():
+            self._physical[kind], self.lets[kind] = run.dose, run.let
+            self.doses[kind] = np.where(self._body, self._weighted(kind), np.float32(0.0))
         for run in self._runs.values():
             run.close()
+        self._export_button.setEnabled(self._phantom is None)
+        self._analyse()
+
+    def _analyse(self) -> None:
+        """DVHs, LETd per structure, gamma and goals of the finished doses."""
+        rois = self._rois()
+        s = self._course_scale()
+        # Unmasked: the air blanking is for display, a DVH counts every voxel of its structure.
+        bits = self._frame.bits
+        self.dvh = {k: dvhs(self._weighted(k) * s, self._grid, rois, bits=bits) for k in self._runs} if rois else {}
+        self.let_stats = {}
+        for kind, let in self.lets.items():
+            dose, eff = self._physical[kind], self._weighted(kind)
+            stats = {}
+            for r, roi in enumerate(rois):
+                m = ((bits[r // MAX_MASK_BITS] >> np.uint32(r % MAX_MASK_BITS)) & 1).astype(bool)
+                d = float(dose[m].sum())
+                if d > 0.0 and let is not None:
+                    stats[roi.name] = (float((dose[m] * let[m]).sum()) / d, float(eff[m].sum()) / d)
+            self.let_stats[kind] = stats  # name -> (dose-weighted LETd keV/µm, dose-weighted RBE)
+        checked = {rois[r].name for r in self.checked()}
+        shown = [(n, v) for n, v in self.let_stats.get(self.main_kind, {}).items() if n in checked]
+        self._let_label.setText("Dose-weighted: " + "; ".join(
+            f"{n} LETd {letd:.2f} keV/µm, RBE {w:.3f}" for n, (letd, w) in shown) if shown else "")
         self.update_gamma(notify=False)
         self._update_goals()
-        self._export_button.setEnabled(True)
         self.analysisChanged.emit()
 
     # ---- analysis -------------------------------------------------------------------------------
@@ -501,8 +631,14 @@ class StudySource(QObject):
     def update_gamma(self, *_args, notify: bool = True) -> None:
         """Gamma of the drawn dose against the chosen TPS dose, with the view's criteria."""
         self.gamma, self.gamma_grid = None, None
+        if self._phantom is not None:
+            if notify:
+                self.analysisChanged.emit()
+            return
         i = self._tps_combo.currentData()
-        dose = self.doses.get(self.main_kind)
+        dose = self._physical.get(self.main_kind)  # the TPS is compared dose to dose, whatever the RBE model
+        if dose is not None:
+            dose = np.where(self._body, dose, np.float32(0.0))
         tps = self._tps[int(i)] if i is not None else None
         covers = set()
         if tps is not None:
@@ -518,7 +654,7 @@ class StudySource(QObject):
             try:
                 body = resample(self._body.astype(np.float32), self._grid, tps.grid) > 0.5
                 self.gamma = gamma_vs_tps(tps, dose / self._n_fractions, self._grid, crit,
-                                          fractions=self._plan.fractions, mask=body, effective=True)
+                                          fractions=self._plan.fractions, mask=body, effective=False)
                 self.gamma_grid = resample(self.gamma.gamma, tps.grid, self._grid)
                 self._gamma_label.setText(
                     f"{100 * self.gamma.rate:.2f} % pass ({self.gamma.evaluated} voxels), "
@@ -587,12 +723,18 @@ class StudySource(QObject):
             )
             provs[kind]["fractions_summed"] = self._n_fractions
             provs[kind]["dose"] = f"dose-to-water, Gy over {self._n_fractions} fraction(s)"
+            provs[kind]["rbe"] = {
+                "model": self._rbe_combo.currentText(),
+                "alpha_beta_gy": self._alpha_beta.value() if uses_alpha_beta(self.rbe_model) else None,
+                "let": "LETd in water at unit density, dose-averaged over primary and secondary protons",
+            }
             write_dose(folder / f"{name}_{kind}.dcm", run.dose, self._grid, self._case.ct, plan_uid=plan.sop_uid,
                        summation=summation, description=f"scan-kit MC {kind}", provenance=provs[kind])
         main = self.main_kind
         title = f"Patient QA: {plan.label or 'plan'}, {self._fraction_combo.currentText()}, {LABELS[main].lower()} dose"
         return write_report(folder, name, title=title, provenance=provs[main], dvhs=self.dvh.get(main, {}),
                             goals=self._goal_results, gamma=self.gamma, matches=[m for _l, m in self._picked],
+                            let_stats=self.let_stats.get(main, {}),
                             png=self._snapshot() if self._snapshot else None)
 
     def close(self) -> None:

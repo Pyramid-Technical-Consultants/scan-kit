@@ -47,6 +47,7 @@ const BDL_STRIDE: i32 = 40;
 const BEAM_STRIDE: i32 = 16;
 const FLAG_DOSE_TO_WATER: u32 = 1u;
 const FLAG_LET: u32 = 2u;
+const FLAG_LET_WATER: u32 = 4u;
 const GEOM_SLAB: i32 = 0;
 const GEOM_VOXEL: i32 = 1;
 const GEOM_SHIFTER: i32 = 2;
@@ -553,6 +554,7 @@ fn begin(p: Particle) -> bool {
 // face is kept for the patient.
 fn hadron_step(pp: ptr<function, Particle>, wp: ptr<function, Where>) -> bool {
     var p = *pp;
+    let T0 = p.T;
     let here = *wp;
     var alive = true;
     let to_water = g_geom == GEOM_VOXEL && (P.flags & FLAG_DOSE_TO_WATER) != 0u;
@@ -634,8 +636,16 @@ fn hadron_step(pp: ptr<function, Particle>, wp: ptr<function, Where>) -> bool {
         if (lost != 0.0) { g_lost += lost; }
     }
     // LET_Scoring, StopPow method: mean of the linear stopping power before and after the step.
+    // In water at unit density (EPTN consensus) with FLAG_LET_WATER, else in the medium as MCsquare.
     var s_let: f32 = 0.0;
-    if (score_let && itype != 2 && hinge >= 0) { s_let = 0.5 * (S + rho * z2 * stop_pow(mb, p.T, p.mass)); }
+    if (score_let && itype != 2 && hinge >= 0) {
+        if ((P.flags & FLAG_LET_WATER) != 0u) {
+            let wb = mbase(WATER_MEDIUM);
+            s_let = 0.5 * z2 * (stop_pow(wb, T0, p.mass) + stop_pow(wb, p.T, p.mass));
+        } else {
+            s_let = 0.5 * (S + rho * z2 * stop_pow(mb, p.T, p.mass));
+        }
+    }
     if (alive && p.T <= ECUT) {
         dEh += p.T;
         p.T = 0.0;

@@ -13,13 +13,16 @@ from scan_kit.dicom import StudyIndex, write_dose
 from scan_kit.dicom.calibration import CtCalibration
 from scan_kit.dicom.synthetic import write_phantom
 from scan_kit.qa import BeamModel, Delivery, patient_run, plan_spots
+from scan_kit.qa.rbe import MCNAMARA
+from scan_kit.views.dose_panes import DEPTH, integral_profile
+from scan_kit.views.dose_volume_physics import WATER, csda_range_mm
 
 
 def _settle(qapp, study, timeout_s: float = 120.0) -> None:
     end = time.monotonic() + timeout_s
-    while not (study._runs and study._export_button.isEnabled()) and time.monotonic() < end:
+    while not (study._runs and study.done) and time.monotonic() < end:
         qapp.processEvents()
-    assert study._export_button.isEnabled(), study._mc_label.text() or study._study_label.text()
+    assert study.done, study._mc_label.text() or study._study_label.text()
 
 
 def test_dose_view_runs_a_study_with_logged_fractions_and_exports(qapp, gpu, tmp_path, monkeypatch) -> None:
@@ -39,10 +42,12 @@ def test_dose_view_runs_a_study_with_logged_fractions_and_exports(qapp, gpu, tmp
     w = dvw.DoseVolumeWindow(["fx1", "fx2"], str(tmp_path), study=str(ph.folder))
     st = w._study
     try:
-        assert w._dicom() and st.panel.isVisibleTo(w) and not w._session_box.isVisibleTo(w)
-        st._histories.set_current("1000000")
-        st._restart()
+        w._set_combo(w._histories_combo, "1000000")
         _settle(qapp, st)
+        # A loaded plan puts the view on the planning CT, with the study's analysis in place of the session controls.
+        assert w._study_engine() and w._choice(w._medium_combo) == dvw.MEDIUM_CT and st._histories == 1_000_000
+        assert st.analysis.isVisibleTo(w) and not w._presets_button.isVisibleTo(w)
+        assert st._export_button.isEnabled()
         # The one beam logged twice is two fractions, plus their sum.
         assert st._fraction_combo.count() == 3 and st._n_fractions == 1
         assert np.array_equal(st.doses[ss.DELIVERED], st.doses[ss.PLANNED])
@@ -78,15 +83,46 @@ def test_dose_view_runs_a_study_with_logged_fractions_and_exports(qapp, gpu, tmp
         assert st._n_fractions == 2
         assert float(st.doses[ss.DELIVERED].sum()) == pytest.approx(2.0 * one, rel=0.03)
 
+        # A variable RBE reweighs the finished doses without transporting again; gamma stays dose to dose.
+        rate, ptv_1p1 = st.gamma.rate, st.dvh[ss.DELIVERED]["PTV"].mean
+        st._rbe_combo.setCurrentIndex(st._rbe_combo.findData(MCNAMARA))
+        assert st._alpha_beta.isEnabled() and st.done
+        letd, weight = st.let_stats[ss.DELIVERED]["PTV"]
+        assert 1.0 < letd < 10.0 and 1.0 < weight < 1.6
+        assert st.dvh[ss.DELIVERED]["PTV"].mean == pytest.approx(ptv_1p1 * weight / 1.1, rel=0.02)
+        assert st.gamma.rate == rate
+        st._alpha_beta.setValue(10.0)
+        assert st.let_stats[ss.DELIVERED]["PTV"][1] < weight
+
         html = st.export_report(tmp_path / "out")
         text = html.read_text(encoding="utf-8")
         assert "Gamma vs TPS" in text and "Clinical goals" in text and "data:image/png" in text
+        assert "McNamara 2015" in text and "LETd (keV/µm)" in text
         assert html.with_name(html.stem + "_dvh.csv").is_file()
         doses = sorted((tmp_path / "out").glob("*.dcm"))
         assert len(doses) == 2
         prov = json.loads(pydicom.dcmread(doses[0]).ImageComments)
         assert prov["fractions_summed"] == 2 and prov["inputs"]["ct_images"] == len(case.ct.sop_uids)
         assert pydicom.dcmread(doses[0]).DoseSummationType == "RECORD"
+
+        # A phantom medium checks the logs against their own plan; the DICOM plan crosses over into it.
+        w._medium_combo.setCurrentIndex(w._medium_combo.findData(dvw.MEDIUM_WATER))
+        assert not w._study_engine() and not st.analysis.isVisibleTo(w) and w._presets_button.isVisibleTo(w)
+        w._plan_source.set_current(dvw.PLAN_DICOM)
+        w._route()
+        _settle(qapp, st)
+        f = st.frame()
+        assert f.ct is None and not f.rois and f.shape == (150, 150, 150) and not st._export_button.isEnabled()
+        assert np.allclose(st._grid.to_index(plan.beams[0].isocenter), 74.5) and st.gamma is None
+        x, idd = integral_profile(st._physical[ss.DELIVERED], f, f.beam_dir)
+        depth = x - x[0] + 0.5 * (x[1] - x[0])
+        # R80 of the deepest (140 MeV) layer's peak, which the summed layers may leave under 80 % of the maximum.
+        peaks = np.flatnonzero((idd[1:-1] >= idd[:-2]) & (idd[1:-1] >= idd[2:]) & (idd[1:-1] > 0.1 * idd.max())) + 1
+        top = idd[peaks[-1]]
+        i = int(np.flatnonzero(idd >= 0.8 * top)[-1])
+        r80 = np.interp(0.8 * top, [idd[i + 1], idd[i]], [depth[i + 1], depth[i]])
+        assert r80 == pytest.approx(float(csda_range_mm(WATER, 140.0)), abs=3.0)
+        assert w._workspace.plots[0].kind == DEPTH and w._content is not None
 
         # A study without a plan drops the last one's plan and runs instead of reusing them.
         bare = tmp_path / "bare"
@@ -101,9 +137,9 @@ def test_dose_view_runs_a_study_with_logged_fractions_and_exports(qapp, gpu, tmp
         st._restart()
         assert not st._runs
 
-        # Back to sessions: their controls return and the study's slices clear.
-        w._set_source(dvw.SOURCE_SESSIONS)
-        assert w._session_box.isVisibleTo(w) and not st.panel.isVisibleTo(w) and ws.frame is None
+        # No plan to run: the sessions have the view again and the study's slices clear.
+        assert not w._study_engine() and w._presets_button.isVisibleTo(w) and st.panel.isVisibleTo(w)
+        assert ws.frame is None
     finally:
         w.close()
         tps.close()

@@ -13,6 +13,7 @@ from scan_kit.dicom.structures import rasterize
 from scan_kit.dicom.synthetic import write_phantom
 from scan_kit.qa import BeamModel, Delivery, fraction_runs, match_delivery, patient_run, plan_spots
 from scan_kit.qa.beam_model import _phase_space
+from scan_kit.views.dose_mc import LET_WATER
 
 BDL = "BDL_default_DN_RangeShifter"
 
@@ -67,6 +68,16 @@ def test_patient_transport_closes_and_hits_the_target(gpu, phantom) -> None:
     assert 1.0 < float(run.let[ptv].mean()) < 10.0
     # The run is cropped to the patient.
     assert grid.shape[0] < case.ct.grid.shape[0]
+
+    # LETd in water at unit density: as the medium's in soft tissue, well under it in bone.
+    water, _ = _run(case, plan, let=LET_WATER)
+    water.step()
+    bone = rasterize(case.structures.roi("BONE"), grid)
+    d = run.dose
+    medium_ptv, water_ptv = (float(np.average(v[ptv], weights=d[ptv])) for v in (run.let, water.let))
+    assert water_ptv == pytest.approx(medium_ptv, rel=0.08)
+    hit = bone & (d > 0.1 * d.max())
+    assert float(np.average(run.let[hit], weights=d[hit])) > 1.3 * float(np.average(water.let[hit], weights=d[hit]))
 
 
 def test_patient_transport_is_deterministic_in_any_slicing(gpu, phantom) -> None:
