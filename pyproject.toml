@@ -22,9 +22,12 @@ dependencies = [
     "PySide6>=6.6.0",
     "pydicom",
     "vispy>=0.14.0",
+    "PyOpenGL",
+    "wgpu>=0.32",
     "msgpack",
     "requests",
     "websocket-client",
+    "fsspec[ssh,smb]>=2024.2.0",
 ]
 
 [project.optional-dependencies]
@@ -47,7 +50,7 @@ include = ["scan_kit*"]
 exclude = ["test_data*"]
 
 [tool.setuptools.package-data]
-scan_kit = ["assets/*"]
+scan_kit = ["assets/*", "assets/mcsquare/*/*", "assets/mcsquare/*/*/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

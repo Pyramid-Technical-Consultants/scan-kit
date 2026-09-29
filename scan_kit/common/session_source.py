@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import re
 import shutil
@@ -17,13 +18,33 @@ import logging
 
 import pandas as pd
 
-from .session_meta import SessionMeta, parse_termination_summary_text
+from .session_meta import (
+    SessionMeta,
+    merge_session_geom,
+    parse_termination_summary_text,
+)
 from .schema import (
+    C_ENERGY,
+    C_X_POSITION,
+    C_Y_POSITION,
     canonical_column_aliases,
     canonicalize_dataframe_columns,
     resolve_column_name,
     resolve_concept_column,
     resolve_requested_column,
+)
+from .data_location import (
+    canonical_location,
+    is_remote_location,
+    join_location,
+    list_location_entries,
+    location_exists,
+    location_is_dir,
+    location_is_file,
+    location_stat,
+    materialize_session,
+    open_location_binary,
+    read_location_bytes,
 )
 
 _log = logging.getLogger(__name__)
@@ -52,6 +73,7 @@ _ARCHIVE_SUFFIXES: tuple[str, ...] = (
     ".zip",
 )
 _DEFAULT_CANONICAL_ALIASES = canonical_column_aliases()
+_MAP_GEOM_USECOLS = [C_ENERGY, C_X_POSITION, C_Y_POSITION]
 
 
 def _resolve_raw_csv_usecols(
@@ -195,6 +217,9 @@ def peek_session_source_from_path(
     session_id: str,
 ) -> SessionSource | None:
     """Build a source from a discovered path without extracting archives."""
+    spec = str(storage_path)
+    if is_remote_location(spec):
+        return None
     path = Path(storage_path)
     if path.is_dir():
         root = _directory_session_root(path, session_id)
@@ -216,6 +241,9 @@ def peek_session_source(
 
     Preference matches discovery: unpacked directory, then zip, then tar.
     """
+    spec = str(base_dir)
+    if is_remote_location(spec):
+        return None
     base = Path(base_dir)
     folder = base / session_id
     if folder.is_dir():
@@ -234,17 +262,26 @@ def peek_session_source(
     return None
 
 
-def list_session_storage_paths(base_dir: str | Path, session_id: str) -> list[Path]:
+def list_session_storage_paths(base_dir: str | Path, session_id: str) -> list[str]:
     """Folder and leftover archives for *session_id* under *base_dir*."""
+    spec = str(base_dir)
+    names = [session_id]
+    names.extend(f"{session_id}{suf}" for suf in _ARCHIVE_SUFFIXES)
+    found: list[str] = []
+    if is_remote_location(spec):
+        for name in names:
+            child = join_location(spec, name)
+            if location_exists(child):
+                found.append(child)
+        return found
     base = Path(base_dir)
-    found: list[Path] = []
-    folder = base / session_id
-    if folder.exists():
-        found.append(folder)
-    for suf in _ARCHIVE_SUFFIXES:
-        archive = base / f"{session_id}{suf}"
-        if archive.is_file():
-            found.append(archive)
+    for name in names:
+        path = base / name
+        if name == session_id:
+            if path.exists():
+                found.append(str(path))
+        elif path.is_file():
+            found.append(str(path))
     return found
 
 
@@ -257,6 +294,22 @@ def storage_fingerprint(
     Directories fingerprint ``termination_summary.txt`` when present so a
     metadata edit is visible; archives use the archive file itself.
     """
+    spec = str(storage_path)
+    if is_remote_location(spec):
+        target = spec
+        if location_is_dir(spec):
+            for rel in (
+                "termination_summary.txt",
+                f"{session_id}/termination_summary.txt",
+            ):
+                child = join_location(spec, rel)
+                if location_is_file(child):
+                    target = child
+                    break
+        st = location_stat(target)
+        if st is None:
+            return None
+        return (canonical_location(target), st[0], st[1])
     path = Path(storage_path)
     target = path
     if path.is_dir():
@@ -294,8 +347,13 @@ def load_termination_summary_cached(
             hit = _META_CACHE.get(fp)
         if hit is not None:
             return hit
-    src = peek_session_source_from_path(storage_path, session_id)
-    meta = load_session_termination_summary(src) if src else None
+    spec = str(storage_path)
+    if is_remote_location(spec):
+        text = _remote_termination_summary_text(spec, session_id)
+        meta = parse_termination_summary_text(text) if text else None
+    else:
+        src = peek_session_source_from_path(storage_path, session_id)
+        meta = load_session_termination_summary(src) if src else None
     if meta is not None and fp is not None:
         with _META_CACHE_LOCK:
             _META_CACHE[fp] = meta
@@ -452,7 +510,18 @@ def resolve_session_source(
     """Find session data under *base_dir* (folder, zip, or tar archive).
 
     Preference: extracted directory over any archive with the same id.
+    Remote URLs are copied into ``~/.scan-kit/remote-cache`` first.
     """
+    spec = str(base_dir)
+    if is_remote_location(spec):
+        local = materialize_session(
+            spec, session_id, on_extracting=on_extracting
+        )
+        if local is None:
+            return None
+        return resolve_session_source(
+            session_id, local, on_extracting=on_extracting
+        )
     base = Path(base_dir)
     inner = base / session_id / session_id
     if (inner / "input_map.csv").is_file():
@@ -478,20 +547,36 @@ def resolve_session_source(
     return None
 
 
-def load_session_csv(source: SessionSource, csv_name: str) -> pd.DataFrame | None:
+def load_session_csv(
+    source: SessionSource,
+    csv_name: str,
+    *,
+    usecols: list[str] | None = None,
+) -> pd.DataFrame | None:
     """Load ``csv_name`` from the session (paths inside archives use ``session_id/``)."""
     sid = source.session_id
+    raw_usecols = None
+    if usecols is not None:
+        header = read_session_csv_columns(source, csv_name)
+        if header is None:
+            return None
+        raw = _resolve_raw_csv_usecols(header, usecols)
+        if not raw:
+            return pd.DataFrame()
+        raw_usecols = raw
     try:
         if source.kind == "directory":
             p = source.path / csv_name
             if not p.is_file():
                 return None
-            return _read_csv_robust(p)
+            return _read_csv_robust(p, usecols=usecols, raw_usecols=raw_usecols)
 
         if source.kind == "zip":
             with zipfile.ZipFile(source.path, "r") as zf:
                 with zf.open(f"{sid}/{csv_name}") as f:
-                    return _read_csv_robust(f)
+                    return _read_csv_robust(
+                        f, usecols=usecols, raw_usecols=raw_usecols
+                    )
 
         if source.kind == "tar":
             with tarfile.open(source.path, "r:*") as tf:
@@ -503,7 +588,9 @@ def load_session_csv(source: SessionSource, csv_name: str) -> pd.DataFrame | Non
                 raw = tf.extractfile(info)
                 if raw is None:
                     return None
-                return _read_csv_robust(raw)
+                return _read_csv_robust(
+                    raw, usecols=usecols, raw_usecols=raw_usecols
+                )
     except Exception as e:
         _log.debug("Error loading %s from session %s: %s", csv_name, sid, e)
         return None
@@ -968,19 +1055,71 @@ def load_session_termination_summary(source: SessionSource) -> SessionMeta | Non
     return parse_termination_summary_text(text)
 
 
+def _map_geom_from_frame(df: pd.DataFrame) -> tuple[float | None, int | None]:
+    """``(max X/Y span mm, ENERGY nunique)``; ignore ``layer_id`` (often session id)."""
+    if df is None or df.empty:
+        return None, None
+    extent: float | None = None
+    layers: int | None = None
+    energy_col = resolve_concept_column(df.columns, C_ENERGY)
+    if energy_col is not None:
+        n = int(pd.to_numeric(df[energy_col], errors="coerce").nunique(dropna=True))
+        if n:
+            layers = n
+    spans: list[float] = []
+    for concept in (C_X_POSITION, C_Y_POSITION):
+        col = resolve_concept_column(df.columns, concept)
+        if col is None:
+            continue
+        series = pd.to_numeric(df[col], errors="coerce")
+        if not series.notna().any():
+            continue
+        span = float(series.max() - series.min())
+        if math.isfinite(span):
+            spans.append(span)
+    if spans:
+        extent = max(spans)
+    return extent, layers
+
+
+def _session_geom_incomplete(meta: SessionMeta | None) -> bool:
+    return meta is None or meta.map_extent_mm is None or meta.layer_count is None
+
+
+def load_session_list_meta(
+    session_id: str,
+    storage_path: str | Path,
+) -> SessionMeta | None:
+    """Session-list metadata: term summary first, then input_map, then spot_data."""
+    meta = load_termination_summary_cached(session_id, storage_path)
+    if not _session_geom_incomplete(meta):
+        return meta
+    src = peek_session_source_from_path(storage_path, session_id)
+    if src is None:
+        return meta
+    for csv_name in ("input_map.csv", "spot_data.csv"):
+        if not _session_geom_incomplete(meta):
+            break
+        df = load_session_csv(src, csv_name, usecols=_MAP_GEOM_USECOLS)
+        if df is None:
+            continue
+        extent, layers = _map_geom_from_frame(df)
+        meta = merge_session_geom(meta, map_extent_mm=extent, layer_count=layers)
+    return meta
+
+
 def hydrate_session_metadata(
     snapshot: list[tuple[str, str, SessionMeta | None]],
     base_dir: str | Path,
     *,
     max_workers: int | None = None,
 ) -> list[tuple[str, str, SessionMeta | None]]:
-    """Load ``termination_summary`` metadata for each row in *snapshot* (parallel I/O).
+    """Load session-list metadata for each row in *snapshot* (parallel I/O).
 
     Preserves order. Safe for large trees: uses a thread pool so zip/tar opens overlap.
     """
     if not snapshot:
         return []
-    base = Path(base_dir)
     n = len(snapshot)
     if max_workers is None:
         # I/O-bound: oversubscribe modestly
@@ -988,17 +1127,23 @@ def hydrate_session_metadata(
 
     def _one(row: tuple[str, str, SessionMeta | None]) -> tuple[str, str, SessionMeta | None]:
         sid, path_str, _ = row
-        storage = Path(path_str)
-        if not storage.is_absolute():
-            storage = base / path_str
-        meta = load_termination_summary_cached(sid, storage)
+        storage: str | Path
+        if is_remote_location(path_str):
+            storage = path_str
+        else:
+            storage = Path(path_str)
+            if not storage.is_absolute():
+                storage = Path(base_dir) / path_str
+        meta = load_session_list_meta(sid, storage)
         return (sid, path_str, meta)
 
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         return list(pool.map(_one, snapshot))
 
 
-def discover_session_entries(base_path: Path) -> list[tuple[str, str, SessionMeta | None]]:
+def discover_session_entries(
+    base_path: str | Path,
+) -> list[tuple[str, str, SessionMeta | None]]:
     """List sessions under *base_path*: folders first, then archives not overridden.
 
     Returns ``(session_id, storage_path_for_display, meta)`` with *meta* always
@@ -1006,11 +1151,15 @@ def discover_session_entries(base_path: Path) -> list[tuple[str, str, SessionMet
     :func:`load_session_termination_summary` after :func:`resolve_session_source`
     to fill metadata for the TUI or scripts.
     """
+    spec = str(base_path)
+    if is_remote_location(spec):
+        return _discover_remote_entries(spec)
+    path = Path(base_path)
     seen: dict[str, tuple[Path, SessionMeta | None]] = {}
 
     # Single ``iterdir`` pass: unpacked dirs first (same sort order as before)
     try:
-        children = sorted(base_path.iterdir(), key=lambda p: p.name)
+        children = sorted(path.iterdir(), key=lambda p: p.name)
     except OSError:
         return []
 
@@ -1032,3 +1181,81 @@ def discover_session_entries(base_path: Path) -> list[tuple[str, str, SessionMet
         ((sid, str(path_obj), meta) for sid, (path_obj, meta) in seen.items()),
         key=lambda t: t[0],
     )
+
+
+def _discover_remote_entries(
+    spec: str,
+) -> list[tuple[str, str, SessionMeta | None]]:
+    children = list_location_entries(spec)
+    seen: dict[str, str] = {}
+    for name, is_dir in children:
+        if not is_dir:
+            continue
+        folder = join_location(spec, name)
+        if _remote_is_unpacked_session(folder, name):
+            seen[name] = folder
+    for name, is_dir in children:
+        if is_dir:
+            continue
+        stem = _strip_archive_suffix(name)
+        if stem is None or stem in seen:
+            continue
+        seen[stem] = join_location(spec, name)
+    return sorted(((sid, path, None) for sid, path in seen.items()), key=lambda t: t[0])
+
+
+def _remote_is_unpacked_session(folder: str, session_id: str) -> bool:
+    if location_is_file(join_location(folder, "input_map.csv")):
+        return True
+    return location_is_file(join_location(folder, f"{session_id}/input_map.csv"))
+
+
+def _tar_open_mode(filename: str) -> str:
+    lower = filename.lower()
+    if lower.endswith((".tgz", ".tar.gz")):
+        return "r:gz"
+    if lower.endswith(".tar.bz2"):
+        return "r:bz2"
+    if lower.endswith(".tar.xz"):
+        return "r:xz"
+    return "r:"
+
+
+def _remote_termination_summary_text(spec: str, session_id: str) -> str | None:
+    if location_is_dir(spec):
+        for rel in (
+            f"{session_id}/termination_summary.txt",
+            "termination_summary.txt",
+        ):
+            child = join_location(spec, rel)
+            if location_is_file(child):
+                return read_location_bytes(child).decode("utf-8", errors="replace")
+        return None
+    name = spec.rstrip("/").rsplit("/", 1)[-1].lower()
+    member = f"{session_id}/termination_summary.txt"
+    try:
+        fh = open_location_binary(spec)
+    except Exception:
+        _log.debug("Could not open %s", spec, exc_info=True)
+        return None
+    try:
+        if name.endswith(".zip"):
+            with zipfile.ZipFile(fh) as zf:
+                with zf.open(member) as raw:
+                    return raw.read().decode("utf-8", errors="replace")
+        if any(name.endswith(suf) for suf in _ARCHIVE_SUFFIXES):
+            with tarfile.open(fileobj=fh, mode=_tar_open_mode(name)) as tf:
+                try:
+                    info = tf.getmember(member)
+                except KeyError:
+                    return None
+                raw = tf.extractfile(info)
+                if raw is None:
+                    return None
+                return raw.read().decode("utf-8", errors="replace")
+    except Exception:
+        _log.debug("Could not read termination_summary from %s", spec, exc_info=True)
+        return None
+    finally:
+        fh.close()
+    return None

@@ -246,5 +246,108 @@ def test_v1_schema_migrates_and_imports_view_settings(tmp_path: Path) -> None:
     assert load_notes(tmp_path)[sid] == "keep-me"
 
     probe = sqlite3.connect(str(db_path()))
-    assert probe.execute("PRAGMA user_version").fetchone()[0] == 2
+    assert probe.execute("PRAGMA user_version").fetchone()[0] == 3
+    probe.close()
+
+
+def test_cache_round_trips_extent_and_layers(tmp_path: Path) -> None:
+    clear_termination_summary_cache()
+    sid = "555"
+    root = _session_dir(
+        tmp_path,
+        sid,
+        summary=_SUMMARY
+        + "Layer delivery: 27/27\n"
+        + "Spot extent width: 118.75 mm\n"
+        + "Spot extent height: 110.592 mm\n",
+    )
+    snapshot_library(tmp_path)
+    meta = parse_termination_summary_text(
+        (root / "termination_summary.txt").read_text(encoding="utf-8")
+    )
+    assert meta.map_extent_mm == 118.75
+    assert meta.layer_count == 27
+    record_session_meta(tmp_path, sid, str(root), meta)
+    _, _, rows = snapshot_library(tmp_path)
+    cached = rows[0][2]
+    assert cached is not None
+    assert cached.map_extent_mm == 118.75
+    assert cached.layer_count == 27
+    assert cached.short_extent == "119"
+
+
+def test_unchecked_geom_cache_misses(tmp_path: Path) -> None:
+    import sqlite3
+
+    clear_termination_summary_cache()
+    sid = "666"
+    root = _session_dir(tmp_path, sid)
+    snapshot_library(tmp_path)
+    record_session_meta(tmp_path, sid, str(root), parse_termination_summary_text(_SUMMARY))
+    conn = sqlite3.connect(str(db_path()))
+    conn.execute("UPDATE sessions SET map_geom_checked = 0")
+    conn.commit()
+    conn.close()
+    reset_connection()
+    _, _, rows = snapshot_library(tmp_path)
+    assert rows[0][2] is None
+
+
+def test_v2_schema_migrates_geom_columns(tmp_path: Path) -> None:
+    import sqlite3
+
+    sid = "111"
+    _session_dir(tmp_path, sid)
+    root = str(tmp_path.resolve())
+    user_store_mod.user_data_dir().mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db_path()))
+    conn.executescript(
+        """
+        CREATE TABLE prefs (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+        CREATE TABLE libraries (
+            id INTEGER PRIMARY KEY,
+            root_path TEXT NOT NULL UNIQUE,
+            selected_sessions TEXT NOT NULL DEFAULT '[]',
+            notes_imported INTEGER NOT NULL DEFAULT 0,
+            last_scan_at REAL,
+            bg_subtract INTEGER NOT NULL DEFAULT 0,
+            calibration_mode TEXT NOT NULL DEFAULT 'off',
+            contour_cutoff_percentile REAL NOT NULL DEFAULT 5.0,
+            view_settings_imported INTEGER NOT NULL DEFAULT 0,
+            view_settings_rev INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE sessions (
+            id INTEGER PRIMARY KEY,
+            library_id INTEGER NOT NULL REFERENCES libraries(id) ON DELETE CASCADE,
+            session_id TEXT NOT NULL,
+            storage_path TEXT,
+            kind TEXT,
+            size INTEGER,
+            mtime_ns INTEGER,
+            date TEXT,
+            primary_mu REAL,
+            treatment_time_s INTEGER,
+            room_number INTEGER,
+            config_name TEXT,
+            note TEXT NOT NULL DEFAULT '',
+            UNIQUE(library_id, session_id)
+        );
+        """
+    )
+    conn.execute("PRAGMA user_version = 2")
+    conn.execute("INSERT INTO libraries(root_path) VALUES (?)", (root,))
+    conn.commit()
+    conn.close()
+
+    reset_connection()
+    snapshot_library(tmp_path)
+    probe = sqlite3.connect(str(db_path()))
+    assert probe.execute("PRAGMA user_version").fetchone()[0] == 3
+    cols = {row[1] for row in probe.execute("PRAGMA table_info(sessions)")}
+    assert "map_extent_mm" in cols
+    assert "layer_count" in cols
+    assert "map_geom_checked" in cols
     probe.close()

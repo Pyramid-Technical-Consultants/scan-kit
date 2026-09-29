@@ -27,6 +27,8 @@ from PySide6.QtWidgets import (
 )
 
 from ..common.app_icon import apply_qt_application_branding, prepare_qt_app_identity
+from ..common.gui_gc import collect_on_gui_thread
+from ..common.progress_line import ProgressLine
 from ..common.qt_theme import apply_saved_ui_theme
 from ..common.view_runner import _READY_SENTINEL
 
@@ -197,6 +199,8 @@ class VispyViewWindow(SidePanelWindow):
         self._plot_layout = QVBoxLayout(self._plot_host)
         self._plot_layout.setContentsMargins(6, 6, 0, 0)
         self._plot_layout.setSpacing(4)
+        # Laid over the first canvas; drive it for anything the user waits on.
+        self.progress: ProgressLine | None = None
         super().__init__(
             title=title,
             plot_host=self._plot_host,
@@ -216,6 +220,7 @@ class VispyViewWindow(SidePanelWindow):
         min_height: int | None = None,
         max_height: int | None = None,
         block_wheel: bool = False,
+        gl: str | None = None,
     ):
         from .vispy_plot import BG, block_canvas_navigation, make_scene_canvas
 
@@ -223,6 +228,7 @@ class VispyViewWindow(SidePanelWindow):
             keys=keys,
             bgcolor=BG if bgcolor is None else bgcolor,
             size=size,
+            gl=gl,
         )
         native = canvas.native
         if min_height is not None:
@@ -230,6 +236,8 @@ class VispyViewWindow(SidePanelWindow):
         if max_height is not None:
             native.setMaximumHeight(max_height)
         self._plot_layout.addWidget(native, stretch)
+        if self.progress is None:
+            self.progress = ProgressLine(native)
         if block_wheel:
             block_canvas_navigation(canvas)
         return canvas
@@ -291,6 +299,7 @@ def run_view_window(
     app = QApplication.instance()
     if app is None:
         app = QApplication(sys.argv)
+    collect_on_gui_thread(app)
     app_icon = apply_qt_application_branding(app)
     apply_saved_ui_theme(app=app)
 

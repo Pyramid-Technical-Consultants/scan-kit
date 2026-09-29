@@ -39,6 +39,14 @@ def test_top_level_menus_present(window) -> None:
     assert titles == ["File", "Edit", "View", "Analysis", "Help"]
 
 
+def test_file_menu_has_clear_remote_cache(window) -> None:
+    file_menu = _menu(window, "File")
+    labels = [a.text().replace("&", "") for a in file_menu.actions() if a.text()]
+    assert "Open Data Folder…" in labels
+    assert "Refresh Sessions" in labels
+    assert "Clear Remote Cache…" in labels
+
+
 def test_edit_menu_uses_browser_undo_actions(window) -> None:
     edit = _menu(window, "Edit")
     actions = edit.actions()
@@ -95,3 +103,20 @@ def test_calibration_actions_form_exclusive_radio(window) -> None:
     window._sync_cal_buttons()
     checked = [m for m, a in window._cal_menu_actions.items() if a.isChecked()]
     assert checked == ["per_session"]
+
+
+def test_deferred_init_does_not_rebuild_after_shutdown(qapp) -> None:
+    import time
+
+    from PySide6.QtCore import QThread
+
+    win = ScanKitMainWindow()
+    win._build_ui()
+    win._shutdown_children()
+    end = time.perf_counter() + 1.0
+    while time.perf_counter() < end:
+        qapp.processEvents()
+    try:
+        assert not [t for t in win.findChildren(QThread) if t.isRunning()]
+    finally:
+        win.close()

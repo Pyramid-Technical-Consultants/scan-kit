@@ -82,8 +82,8 @@ def test_list_session_storage_paths_includes_folder_and_zip(tmp_path: Path) -> N
     (tmp_path / sid / "input_map.csv").write_text("a,b\n1,2\n", encoding="utf-8")
     zip_path = _write_zip(tmp_path, sid)
     paths = list_session_storage_paths(tmp_path, sid)
-    assert tmp_path / sid in paths
-    assert zip_path in paths
+    assert str(tmp_path / sid) in paths
+    assert str(zip_path) in paths
 
 
 def test_peek_from_unpacked_directory(tmp_path: Path) -> None:

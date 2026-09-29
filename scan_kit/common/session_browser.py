@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -9,7 +10,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
-from PySide6.QtCore import QFileSystemWatcher, QRectF, Qt, QTimer, Signal, QSize, Slot
+from PySide6.QtCore import QFileSystemWatcher, QRectF, QUrl, Qt, QTimer, Signal, QSize, Slot
 from PySide6.QtGui import (
     QAction,
     QColor,
@@ -27,6 +28,8 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QHBoxLayout,
     QHeaderView,
+    QInputDialog,
+    QLabel,
     QLineEdit,
     QMenu,
     QMessageBox,
@@ -38,6 +41,15 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from scan_kit.common.data_location import (
+    canonical_location,
+    drop_cached_fs,
+    format_location_error,
+    is_auth_error,
+    is_remote_location,
+    location_uses_password,
+    remember_password,
+)
 from scan_kit.common.plot_colors import DEFAULT_SESSION_COLORS
 from scan_kit.common.recycle import move_to_trash
 from scan_kit.common.session_meta import SessionMeta
@@ -50,6 +62,8 @@ from scan_kit.common.user_store import (
     snapshot_library,
 )
 
+_log = logging.getLogger(__name__)
+
 _SESSION_ROW_BATCH = 24
 _SESSION_ROLE = Qt.ItemDataRole.UserRole
 _SWATCH_STATE_ROLE = Qt.ItemDataRole.UserRole + 1
@@ -59,17 +73,76 @@ _COL_USE = 0
 _COL_SESSION_ID = 1
 _COL_DATE = 2
 _COL_MU = 3
-_COL_TIME = 4
-_COL_ROOM = 5
-_COL_CONFIG = 6
-_COL_NOTE = 7
+_COL_EXTENT = 4
+_COL_LAYERS = 5
+_COL_TIME = 6
+_COL_ROOM = 7
+_COL_CONFIG = 8
+_COL_NOTE = 9
 
-_COMPACT_META_COLS = (_COL_MU, _COL_TIME, _COL_ROOM)
-_META_COLS = (_COL_DATE, _COL_MU, _COL_TIME, _COL_ROOM, _COL_CONFIG)
+_COMPACT_META_COLS = (_COL_MU, _COL_EXTENT, _COL_LAYERS, _COL_TIME, _COL_ROOM)
+_META_COLS = (
+    _COL_DATE,
+    _COL_MU,
+    _COL_EXTENT,
+    _COL_LAYERS,
+    _COL_TIME,
+    _COL_ROOM,
+    _COL_CONFIG,
+)
 
 _SWATCH_PX = 14
 _UNCHECKED_SWATCH = QColor("#d0d0d0")
 _SWATCH_LINE = QColor("#6a6a6a")
+
+# Declared so native/portal dialogs can offer URI locations (GTK GVfs, KDE
+# KIO, xdg-desktop-portal). Windows still browses UNC via Network.
+_DATA_DIR_SCHEMES = (
+    "sftp",
+    "ssh",
+    "scp",
+    "smb",
+    "ftp",
+    "ftps",
+    "http",
+    "https",
+)
+
+
+def directory_url_for_dialog(spec: str) -> QUrl:
+    """Starting URL for the session-folder picker."""
+    text = spec.strip()
+    if not text:
+        return QUrl.fromLocalFile(str(Path.home()))
+    if is_remote_location(text):
+        return QUrl(text)
+    return QUrl.fromLocalFile(str(Path(text).expanduser()))
+
+
+def location_from_dialog_url(url: QUrl) -> str:
+    """Turn a picker result into a data-source string (local path or URL)."""
+    if url.isEmpty() or not url.isValid():
+        return ""
+    if url.scheme().lower() in {"clsid", "shell"}:
+        return ""
+    if url.isLocalFile():
+        return url.toLocalFile()
+    return url.toString()
+
+
+def prompt_remote_password(parent: QWidget | None, spec: str) -> bool:
+    """Ask for a remote password and remember it in process memory."""
+    label = canonical_location(spec) or spec
+    text, ok = QInputDialog.getText(
+        parent,
+        "Remote password",
+        f"Password for {label}\n(kept in memory until Scan Kit exits):",
+        QLineEdit.EchoMode.Password,
+    )
+    if not ok or not text:
+        return False
+    remember_password(spec, text)
+    return True
 
 
 def default_project_root() -> Path:
@@ -125,12 +198,14 @@ class _SortableItem(QTableWidgetItem):
             return str(a) < str(b)
 
 
-def _meta_column_texts(meta: SessionMeta | None) -> tuple[str, str, str, str, str]:
+def _meta_column_texts(meta: SessionMeta | None) -> tuple[str, str, str, str, str, str, str]:
     if meta is None:
-        return "—", "—", "—", "?", "—"
+        return "—", "—", "—", "—", "—", "?", "—"
     return (
         meta.short_date,
         meta.short_mu,
+        meta.short_extent,
+        meta.short_layers,
         meta.short_time,
         meta.short_room,
         meta.short_config,
@@ -139,18 +214,38 @@ def _meta_column_texts(meta: SessionMeta | None) -> tuple[str, str, str, str, st
 
 def _meta_sort_values(
     meta: SessionMeta | None,
-) -> tuple[datetime | None, float | None, int | None, int | None, str | None]:
+) -> tuple[
+    datetime | None,
+    float | None,
+    float | None,
+    int | None,
+    int | None,
+    int | None,
+    str | None,
+]:
     if meta is None:
-        return (None, None, None, None, None)
+        return (None, None, None, None, None, None, None)
     config = (meta.config_name or "").strip() or None
-    return (meta.date, meta.primary_mu, meta.treatment_time_s, meta.room_number, config)
+    return (
+        meta.date,
+        meta.primary_mu,
+        meta.map_extent_mm,
+        meta.layer_count,
+        meta.treatment_time_s,
+        meta.room_number,
+        config,
+    )
 
 
 def _compact_meta_column_widths(fm: QFontMetrics) -> dict[int, int]:
-    """Tight fixed widths for MU / Time / RM; global header min size would otherwise clamp them."""
+    """Tight fixed widths for MU / Ext. / Lyr. / Time / RM."""
     pad = 10  # cell padding + sort indicator slack
     return {
         _COL_MU: fm.horizontalAdvance("999.9") + pad,
+        _COL_EXTENT: max(fm.horizontalAdvance("Ext."), fm.horizontalAdvance("999"))
+        + pad,
+        _COL_LAYERS: max(fm.horizontalAdvance("Lyr."), fm.horizontalAdvance("999"))
+        + pad,
         _COL_TIME: fm.horizontalAdvance("99:59") + pad,
         _COL_ROOM: max(fm.horizontalAdvance("RM"), fm.horizontalAdvance("99")) + pad,
     }
@@ -213,6 +308,7 @@ class SessionBrowserWidget(QWidget):
     _sig_session_rows_batch = Signal(int, object)
     _sig_scan_finished = Signal(int)
     _sig_incremental_rescan = Signal(int, object)
+    _sig_scan_error = Signal(int, str, bool)
 
     def __init__(
         self,
@@ -261,6 +357,8 @@ class SessionBrowserWidget(QWidget):
         self._fs_debounce.timeout.connect(self.incremental_refresh)
         self._fs_watcher = QFileSystemWatcher(self)
         self._fs_watcher.directoryChanged.connect(self._on_data_dir_changed)
+        self._auth_prompted: set[str] = set()
+        self._scan_error_message: str | None = None
 
         self._connect_worker_signals()
         self._build_ui()
@@ -287,6 +385,10 @@ class SessionBrowserWidget(QWidget):
             self._on_incremental_rescan,
             Qt.ConnectionType.QueuedConnection,
         )
+        self._sig_scan_error.connect(
+            self._on_scan_error,
+            Qt.ConnectionType.QueuedConnection,
+        )
 
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
@@ -300,29 +402,38 @@ class SessionBrowserWidget(QWidget):
         data_dir_row.addWidget(clear_btn)
 
         self._base_dir_input = QLineEdit()
-        self._base_dir_input.setPlaceholderText("Path to session ZIPs…")
+        self._base_dir_input.setPlaceholderText(
+            "Folder, UNC, or sftp://user@host/path"
+        )
         self._base_dir_input.setText(self._base_dir)
         self._base_dir_input.editingFinished.connect(self._on_base_dir_finished)
         self._base_dir_input.returnPressed.connect(self._on_base_dir_finished)
         data_dir_row.addWidget(self._base_dir_input, stretch=1)
 
         browse_dir_btn = QPushButton("Browse…")
-        browse_dir_btn.setToolTip("Choose folder containing session archives or folders")
+        browse_dir_btn.setToolTip(
+            "Choose a local, UNC, or network folder. SFTP URLs can also be pasted."
+        )
         browse_dir_btn.setFixedWidth(96)
         browse_dir_btn.clicked.connect(self._on_browse_data_dir)
         data_dir_row.addWidget(browse_dir_btn)
 
         refresh_btn = QPushButton("↻")
         refresh_btn.setFixedWidth(28)
-        refresh_btn.setToolTip("Refresh session list from folder")
+        refresh_btn.setToolTip("Refresh session list")
         refresh_btn.clicked.connect(self.incremental_refresh)
         data_dir_row.addWidget(refresh_btn)
         root.addLayout(data_dir_row)
 
+        self._path_status = QLabel("")
+        self._path_status.setWordWrap(True)
+        self._path_status.setVisible(False)
+        root.addWidget(self._path_status)
+
         self._table = QTableWidget()
-        self._table.setColumnCount(8)
+        self._table.setColumnCount(10)
         self._table.setHorizontalHeaderLabels(
-            ["Use", "Session ID", "Date", "MU", "Time", "RM", "Config", "Note"]
+            ["Use", "Session ID", "Date", "MU", "Ext.", "Lyr.", "Time", "RM", "Config", "Note"]
         )
         self._table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self._table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
@@ -399,6 +510,8 @@ class SessionBrowserWidget(QWidget):
         text = path.strip()
         if not text:
             return
+        if canonical_location(text) != canonical_location(self._base_dir):
+            self._auth_prompted.clear()
         self._base_dir = text
         self._base_dir_input.setText(text)
         if refresh:
@@ -430,9 +543,17 @@ class SessionBrowserWidget(QWidget):
                 ordered.append(sid)
         return ordered[: self._max_selections]
 
-    def refresh(self, *, restored_selection: list[str] | None = None) -> None:
+    def refresh(
+        self,
+        *,
+        restored_selection: list[str] | None = None,
+        retrying_auth: bool = False,
+    ) -> None:
         self._hydrate_generation += 1
         gen = self._hydrate_generation
+        if not retrying_auth:
+            self._auth_prompted.discard(canonical_location(self._base_dir))
+        self._scan_error_message = None
         self._undo_stack.clear()
         self._shutdown_meta_pool()
         workers = max(4, min(12, (os.cpu_count() or 4) * 2))
@@ -447,6 +568,12 @@ class SessionBrowserWidget(QWidget):
         self._restored_selection_override = restored_selection
         self._hold_sorting()
         self._watch_base_dir()
+        if is_remote_location(self._base_dir):
+            self._set_path_status(
+                f"Listing {canonical_location(self._base_dir)}…"
+            )
+        else:
+            self._set_path_status("")
         self._track_worker(
             threading.Thread(
                 target=self._discover_sessions_worker,
@@ -461,10 +588,16 @@ class SessionBrowserWidget(QWidget):
             return
         self._hydrate_generation += 1
         gen = self._hydrate_generation
+        self._auth_prompted.discard(canonical_location(self._base_dir))
+        self._scan_error_message = None
         self._shutdown_meta_pool()
         workers = max(4, min(12, (os.cpu_count() or 4) * 2))
         self._meta_pool = ThreadPoolExecutor(max_workers=workers)
         self._hold_sorting()
+        if is_remote_location(self._base_dir):
+            self._set_path_status(
+                f"Listing {canonical_location(self._base_dir)}…"
+            )
         self._track_worker(
             threading.Thread(
                 target=self._incremental_rescan_worker,
@@ -504,22 +637,25 @@ class SessionBrowserWidget(QWidget):
         path = self._base_dir_input.text().strip()
         if not path:
             return
+        if canonical_location(path) != canonical_location(self._base_dir):
+            self._auth_prompted.clear()
         self._base_dir = path
         self.base_dir_changed.emit(self._base_dir)
         self.refresh()
 
     def _on_browse_data_dir(self) -> None:
         start = self._base_dir_input.text().strip() or self._base_dir
-        path = Path(start).expanduser()
-        initial = str(path.resolve()) if path.is_dir() else str(Path.home())
-        chosen = QFileDialog.getExistingDirectory(
+        chosen = QFileDialog.getExistingDirectoryUrl(
             self,
             "Select session data folder",
-            initial,
+            directory_url_for_dialog(start),
+            QFileDialog.Option.ShowDirsOnly,
+            list(_DATA_DIR_SCHEMES),
         )
-        if not chosen:
+        location = location_from_dialog_url(chosen)
+        if not location:
             return
-        self._base_dir_input.setText(chosen)
+        self._base_dir_input.setText(location)
         self._on_base_dir_finished()
 
     def _on_context_menu(self, pos) -> None:
@@ -534,8 +670,12 @@ class SessionBrowserWidget(QWidget):
             "Copy Session ID",
             lambda checked=False, session_id=sid: self._copy_session_id(session_id),
         )
+        if is_remote_location(self._base_dir):
+            recycle_label = "Delete from remote host…"
+        else:
+            recycle_label = "Move to Recycle Bin…"
         menu.addAction(
-            "Move to Recycle Bin…",
+            recycle_label,
             lambda checked=False, session_id=sid: self._recycle_session(session_id),
         )
         self.populate_context_menu.emit(sid, menu)
@@ -549,6 +689,8 @@ class SessionBrowserWidget(QWidget):
     def _watch_base_dir(self) -> None:
         for current in list(self._fs_watcher.directories()):
             self._fs_watcher.removePath(current)
+        if is_remote_location(self._base_dir):
+            return
         folder = Path(self._base_dir)
         if folder.is_dir():
             self._fs_watcher.addPath(str(folder))
@@ -568,7 +710,7 @@ class SessionBrowserWidget(QWidget):
         self._sorting_held = False
         self._rebuild_session_row_index()
 
-    def _confirm_recycle_dialog(self, sid: str, paths: list[Path]) -> bool:
+    def _confirm_recycle_dialog(self, sid: str, paths: list[str]) -> bool:
         lines = "\n".join(f"  {p}" for p in paths)
         selected = sid in set(self.selected_session_ids())
         extra = ""
@@ -579,13 +721,22 @@ class SessionBrowserWidget(QWidget):
             )
         box = QMessageBox(self)
         box.setIcon(QMessageBox.Icon.Warning)
-        box.setWindowTitle("Move session to Recycle Bin")
-        box.setText(
-            f"Move session {sid} to the Recycle Bin?\n\n"
-            f"These items will be removed:\n{lines}\n\n"
-            "You can restore them from the Recycle Bin if needed."
-            f"{extra}"
-        )
+        if is_remote_location(self._base_dir):
+            box.setWindowTitle("Delete remote session")
+            box.setText(
+                f"Permanently delete session {sid} from the remote host?\n\n"
+                f"These items will be removed:\n{lines}\n\n"
+                "They are not sent to the Recycle Bin."
+                f"{extra}"
+            )
+        else:
+            box.setWindowTitle("Move session to Recycle Bin")
+            box.setText(
+                f"Move session {sid} to the Recycle Bin?\n\n"
+                f"These items will be removed:\n{lines}\n\n"
+                "You can restore them from the Recycle Bin if needed."
+                f"{extra}"
+            )
         box.setStandardButtons(
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel
         )
@@ -652,12 +803,10 @@ class SessionBrowserWidget(QWidget):
 
     def _discover_sessions_worker(self, gen: int, base_dir: str) -> None:
         try:
-            try:
-                notes, selected, rows = snapshot_library(
-                    base_dir, project_root=self._project_root
-                )
-            except Exception:
-                notes, selected, rows = {}, [], []
+            result = self._snapshot_library_or_error(gen, base_dir)
+            if result is None:
+                return
+            notes, selected, rows = result
             if gen != self._hydrate_generation:
                 return
             self._sig_notes_loaded.emit(gen, {"notes": notes, "selected": selected})
@@ -678,17 +827,17 @@ class SessionBrowserWidget(QWidget):
                 self._sig_scan_finished.emit(gen)
 
     def _incremental_rescan_worker(self, gen: int, base_dir: str) -> None:
-        found: list[tuple[str, str, SessionMeta | None]] = []
+        found: list[tuple[str, str, SessionMeta | None]] | None = []
         try:
-            try:
-                notes, selected, rows = snapshot_library(
-                    base_dir, project_root=self._project_root
-                )
-            except Exception:
-                notes, selected, rows = {}, [], []
+            result = self._snapshot_library_or_error(gen, base_dir)
+            if result is None:
+                found = None
+                return
+            notes, selected, rows = result
             if gen != self._hydrate_generation:
                 return
             self._sig_notes_loaded.emit(gen, {"notes": notes, "selected": selected})
+            found = []
             for sid, path_str, meta in rows:
                 if gen != self._hydrate_generation:
                     return
@@ -696,6 +845,21 @@ class SessionBrowserWidget(QWidget):
         finally:
             if gen == self._hydrate_generation:
                 self._sig_incremental_rescan.emit(gen, found)
+
+    def _snapshot_library_or_error(
+        self, gen: int, base_dir: str
+    ) -> tuple[dict[str, str], list[str], list[tuple[str, str, SessionMeta | None]]] | None:
+        try:
+            return snapshot_library(base_dir, project_root=self._project_root)
+        except Exception as exc:
+            _log.exception("Could not list sessions in %s", canonical_location(base_dir))
+            if is_auth_error(exc):
+                drop_cached_fs(base_dir)
+            needs_pw = is_auth_error(exc) and location_uses_password(base_dir)
+            self._sig_scan_error.emit(
+                gen, format_location_error(base_dir, exc), needs_pw
+            )
+            return None
 
     @Slot(int, object)
     def _on_notes_loaded(self, gen: int, notes: object) -> None:
@@ -770,12 +934,50 @@ class SessionBrowserWidget(QWidget):
         if self._hydrate_received >= len(self._discovered):
             self._maybe_finish_hydrate()
         self._schedule_status_refresh()
+        self._refresh_path_status_after_scan()
+
+    @Slot(int, str, bool)
+    def _on_scan_error(self, gen: int, message: str, needs_password: bool) -> None:
+        if gen != self._hydrate_generation:
+            return
+        self._scan_error_message = message
+        self._set_path_status(message, error=True)
+        if needs_password:
+            QTimer.singleShot(0, self._prompt_and_retry_password)
+
+    def _prompt_and_retry_password(self) -> None:
+        key = canonical_location(self._base_dir)
+        if key in self._auth_prompted:
+            return
+        self._auth_prompted.add(key)
+        if not prompt_remote_password(self, self._base_dir):
+            return
+        self.refresh(retrying_auth=True)
+
+    def _refresh_path_status_after_scan(self) -> None:
+        if self._scan_error_message:
+            self._set_path_status(self._scan_error_message, error=True)
+            return
+        if is_remote_location(self._base_dir):
+            self._set_path_status(f"Remote  ·  {canonical_location(self._base_dir)}")
+        else:
+            self._set_path_status("")
+
+    def _set_path_status(self, text: str, *, error: bool = False) -> None:
+        self._path_status.setText(text)
+        self._path_status.setVisible(bool(text))
+        if error:
+            self._path_status.setStyleSheet("color: #c62828;")
+        else:
+            self._path_status.setStyleSheet("color: palette(mid);")
 
     @Slot(int, object)
     def _on_incremental_rescan(self, gen: int, rows_obj: object) -> None:
         if gen != self._hydrate_generation:
             return
         if not isinstance(rows_obj, list):
+            self._release_sorting()
+            self._schedule_status_refresh()
             return
         found: list[tuple[str, str, SessionMeta | None]] = []
         for item in rows_obj:
@@ -848,6 +1050,7 @@ class SessionBrowserWidget(QWidget):
         self._sync_note_cells_from_store(found_sids)
         self._maybe_finish_hydrate()
         self._schedule_status_refresh()
+        self._refresh_path_status_after_scan()
 
     def _sync_note_cells_from_store(self, sids: set[str] | None = None) -> None:
         target = sids if sids is not None else set(self._row_by_sid.keys())
@@ -874,9 +1077,9 @@ class SessionBrowserWidget(QWidget):
         base_dir = self._base_dir
 
         def job() -> tuple[str, str, SessionMeta | None]:
-            from scan_kit.common.session_source import load_termination_summary_cached
+            from scan_kit.common.session_source import load_session_list_meta
 
-            meta = load_termination_summary_cached(sid, path_str)
+            meta = load_session_list_meta(sid, path_str)
             try:
                 record_session_meta(base_dir, sid, path_str, meta)
             except Exception:
@@ -941,7 +1144,22 @@ class SessionBrowserWidget(QWidget):
         align = Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft
         for col, text, sval in zip(_META_COLS, texts, sort_vals):
             item = self._table.item(row, col)
-            tip = full_config if col == _COL_CONFIG and full_config else ""
+            if col == _COL_CONFIG and full_config:
+                tip = full_config
+            elif (
+                col == _COL_EXTENT
+                and meta is not None
+                and meta.map_extent_mm is not None
+            ):
+                tip = f"{meta.map_extent_mm:g} mm"
+            elif (
+                col == _COL_LAYERS
+                and meta is not None
+                and meta.layer_count is not None
+            ):
+                tip = f"{meta.layer_count} layers"
+            else:
+                tip = ""
             if item is None:
                 cell = _SortableItem(text)
                 cell.setFlags(cell.flags() & ~Qt.ItemFlag.ItemIsEditable)

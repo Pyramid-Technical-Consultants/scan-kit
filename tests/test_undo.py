@@ -8,6 +8,8 @@ from PySide6.QtWidgets import QApplication
 
 from scan_kit.common.session_browser import (
     _COL_CONFIG,
+    _COL_EXTENT,
+    _COL_LAYERS,
     _COL_NOTE,
     _COL_USE,
     SessionBrowserWidget,
@@ -134,7 +136,7 @@ def test_config_column_after_room_elides_with_tooltip(qapp, tmp_path) -> None:
             for i in range(widget._table.columnCount())
         ]
         assert headers == [
-            "Use", "Session ID", "Date", "MU", "Time", "RM", "Config", "Note",
+            "Use", "Session ID", "Date", "MU", "Ext.", "Lyr.", "Time", "RM", "Config", "Note",
         ]
         assert widget._table.textElideMode() == Qt.TextElideMode.ElideRight
 
@@ -151,6 +153,23 @@ def test_config_column_after_room_elides_with_tooltip(qapp, tmp_path) -> None:
         assert cell is not None
         assert cell.text() == name
         assert cell.toolTip() == name
+
+        geom = SessionMeta(
+            date=None,
+            primary_mu=12.5,
+            treatment_time_s=None,
+            room_number=None,
+            map_extent_mm=118.75,
+            layer_count=27,
+        )
+        widget._set_session_row_widgets(0, "S1", geom, use_checked=False)
+        ext = widget._table.item(0, _COL_EXTENT)
+        lyr = widget._table.item(0, _COL_LAYERS)
+        assert ext is not None and lyr is not None
+        assert ext.text() == "119"
+        assert ext.toolTip() == "118.75 mm"
+        assert lyr.text() == "27"
+        assert lyr.toolTip() == "27 layers"
     finally:
         widget.shutdown()
 

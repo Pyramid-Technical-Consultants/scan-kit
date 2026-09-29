@@ -19,7 +19,6 @@ from PySide6.QtGui import (
     QAction,
     QActionGroup,
     QCloseEvent,
-    QIcon,
     QKeySequence,
     QMoveEvent,
     QResizeEvent,
@@ -27,16 +26,14 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QApplication,
-    QButtonGroup,
-    QFrame,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
-    QLineEdit,
     QMainWindow,
     QMenu,
     QMessageBox,
+    QProgressDialog,
     QPushButton,
     QSizePolicy,
     QSplitter,
@@ -46,18 +43,23 @@ from PySide6.QtWidgets import (
 )
 
 from . import __version__
+from .common.gui_gc import collect_on_gui_thread
 from .common.app_icon import (
     apply_qt_application_branding,
     apply_windows_window_icons,
-    load_app_icon,
     prepare_qt_app_identity,
 )
 from .common.app_settings import AppSettings
 from .common.qt_theme import add_theme_menu, apply_saved_ui_theme
+from .common.data_location import (
+    canonical_location,
+    is_remote_location,
+    is_usable_data_location,
+)
 from .common.user_store import PREF_LAST_DATA_DIR, prefs_get, prefs_set
 from .common.segmented_control import SegmentedControl as _SegmentedControl
 from .common.debug_log_panel import DebugLogPanel
-from .common.session_browser import SessionBrowserWidget
+from .common.session_browser import SessionBrowserWidget, prompt_remote_password
 from .common.session_meta import SessionMeta
 from .common.settings import ViewSettings, CALIBRATION_MODES
 from .common.qt_widgets import make_pane_scroll_area, set_pane_scroll_widget
@@ -80,6 +82,7 @@ _VIEW_GRID_COLS = 2
 
 _MAIN_TAB_DATA_ANALYSIS = "Data Analysis"
 _MAIN_TAB_PLAN_SYNTHESIS = "Plan Synthesis"
+_MAIN_TAB_PHANTOM_SYNTHESIS = "Phantom Synthesis"
 _MAIN_TAB_PLAN_RUNNER = "Plan Runner"
 _MAIN_TAB_CONFIG_TUNING = "Configuration Tuning"
 _MAIN_TAB_DEBUG = "Debug"
@@ -129,6 +132,9 @@ class ScanKitMainWindow(QMainWindow):
     _sig_plot_window_ready = Signal(str, object)
     #: view settings loaded off the GUI thread (bootstrap_generation, ViewSettings).
     _sig_settings_ready = Signal(int, object)
+    #: remote session copy finished (ok, err, needs_password, module, sids, base_dir)
+    _sig_remote_copy_finished = Signal(bool, str, bool, str, list, str)
+    _sig_remote_copy_progress = Signal(str, int, int)
 
     def __init__(self) -> None:
         super().__init__()
@@ -137,7 +143,7 @@ class ScanKitMainWindow(QMainWindow):
         self._app_settings = AppSettings.load()
         self._restore_window_geometry()
         last_data = prefs_get(PREF_LAST_DATA_DIR)
-        if isinstance(last_data, str) and Path(last_data).is_dir():
+        if isinstance(last_data, str) and is_usable_data_location(last_data):
             self._initial_base_dir = last_data
         elif FROZEN:
             self._initial_base_dir = str(PROJECT_ROOT)
@@ -159,7 +165,11 @@ class ScanKitMainWindow(QMainWindow):
         self._plan_runner_panel: PlanRunnerPanel | None = None
         self._config_tuning_panel: ConfigTuningPanel | None = None
         self._debug_log_panel: DebugLogPanel | None = None
-        self._deferred_tab_steps: list = []
+        self._deferred_tab_steps: list | None = []
+        self._remote_copy_busy = False
+        self._remote_progress: QProgressDialog | None = None
+        self._copy_auth_tried: set[str] = set()
+        self._remote_copy_cancel = threading.Event()
 
         boot = QWidget()
         boot_l = QVBoxLayout(boot)
@@ -172,11 +182,14 @@ class ScanKitMainWindow(QMainWindow):
 
     def _deferred_finish_init(self) -> None:
         """Build UI in event-loop chunks so GNOME does not mark us unresponsive."""
+        if self._main_tabs is not None or self._deferred_tab_steps is None:
+            return  # built by _build_ui, or already shut down
         self._init_main_tabs_shell()
         self._connect_thread_signals()
         QTimer.singleShot(0, self._request_settings_then_scan)
         self._deferred_tab_steps = [
             self._add_plan_synthesis_tab,
+            self._add_phantom_synthesis_tab,
             self._add_plan_runner_tab,
             self._add_config_tuning_tab,
             self._add_debug_tab,
@@ -185,6 +198,8 @@ class ScanKitMainWindow(QMainWindow):
         QTimer.singleShot(0, self._pump_deferred_tab_steps)
 
     def _pump_deferred_tab_steps(self) -> None:
+        if self._deferred_tab_steps is None:
+            return
         if not self._deferred_tab_steps:
             # Warm workers re-exec the frozen binary; delay until the shell is idle.
             QTimer.singleShot(2500, self._refill_warm_pool)
@@ -200,6 +215,12 @@ class ScanKitMainWindow(QMainWindow):
         self._sig_settings_ready.connect(
             self._on_settings_ready, Qt.ConnectionType.QueuedConnection
         )
+        self._sig_remote_copy_progress.connect(
+            self._on_remote_copy_progress, Qt.ConnectionType.QueuedConnection
+        )
+        self._sig_remote_copy_finished.connect(
+            self._on_remote_copy_finished, Qt.ConnectionType.QueuedConnection
+        )
 
     @property
     def _base_dir(self) -> str:
@@ -211,6 +232,7 @@ class ScanKitMainWindow(QMainWindow):
         """Synchronously build the full UI (tests / callers that need everything now)."""
         self._init_main_tabs_shell()
         self._add_plan_synthesis_tab()
+        self._add_phantom_synthesis_tab()
         self._add_plan_runner_tab()
         self._add_config_tuning_tab()
         self._add_debug_tab()
@@ -231,6 +253,14 @@ class ScanKitMainWindow(QMainWindow):
         if tabs is None:
             return
         tabs.addTab(self._build_plan_synthesis_tab(), _MAIN_TAB_PLAN_SYNTHESIS)
+
+    def _add_phantom_synthesis_tab(self) -> None:
+        tabs = self._main_tabs
+        if tabs is None:
+            return
+        from .workflows.phantom_panel import PhantomSynthesisPanel
+
+        tabs.addTab(PhantomSynthesisPanel(), _MAIN_TAB_PHANTOM_SYNTHESIS)
 
     def _add_plan_runner_tab(self) -> None:
         tabs = self._main_tabs
@@ -254,6 +284,7 @@ class ScanKitMainWindow(QMainWindow):
         self._debug_log_panel = DebugLogPanel()
         tabs.addTab(self._debug_log_panel, _MAIN_TAB_DEBUG)
         self._debug_log_panel.install_logging()
+        self._debug_log_panel.clear_cache_requested.connect(self._on_clear_remote_cache)
 
     def _finalize_main_tabs(self) -> None:
         tabs = self._main_tabs
@@ -294,6 +325,15 @@ class ScanKitMainWindow(QMainWindow):
 
         menu.addSeparator()
 
+        clear_cache_action = QAction("Clear Remote Cache…", self)
+        clear_cache_action.setStatusTip(
+            "Delete locally cached copies of remote sessions"
+        )
+        clear_cache_action.triggered.connect(self._on_clear_remote_cache)
+        menu.addAction(clear_cache_action)
+
+        menu.addSeparator()
+
         quit_action = QAction("E&xit", self)
         quit_action.setShortcut("Ctrl+Q")
         quit_action.setMenuRole(QAction.MenuRole.QuitRole)
@@ -321,9 +361,10 @@ class ScanKitMainWindow(QMainWindow):
         tab_shortcuts = {
             _MAIN_TAB_DATA_ANALYSIS: "Ctrl+1",
             _MAIN_TAB_PLAN_SYNTHESIS: "Ctrl+2",
-            _MAIN_TAB_PLAN_RUNNER: "Ctrl+3",
-            _MAIN_TAB_CONFIG_TUNING: "Ctrl+4",
-            _MAIN_TAB_DEBUG: "Ctrl+5",
+            _MAIN_TAB_PHANTOM_SYNTHESIS: "Ctrl+3",
+            _MAIN_TAB_PLAN_RUNNER: "Ctrl+4",
+            _MAIN_TAB_CONFIG_TUNING: "Ctrl+5",
+            _MAIN_TAB_DEBUG: "Ctrl+6",
         }
         for name, shortcut in tab_shortcuts.items():
             action = QAction(name, self)
@@ -384,6 +425,34 @@ class ScanKitMainWindow(QMainWindow):
     def _on_open_data_folder(self) -> None:
         if self._session_browser is not None:
             self._session_browser.browse_for_base_dir()
+
+    def _on_clear_remote_cache(self) -> None:
+        from .common.data_location import (
+            clear_remote_cache,
+            format_byte_size,
+            remote_cache_size_bytes,
+        )
+
+        size = remote_cache_size_bytes()
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("Clear remote cache")
+        box.setText(
+            f"Delete locally cached remote sessions ({format_byte_size(size)})?\n\n"
+            "The next time you open a remote session it will be copied again."
+        )
+        box.setStandardButtons(
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel
+        )
+        box.setDefaultButton(QMessageBox.StandardButton.Cancel)
+        if box.exec() != QMessageBox.StandardButton.Yes:
+            return
+        clear_remote_cache()
+        if self._debug_log_panel is not None:
+            self._debug_log_panel.refresh_cache_label()
+            self._debug_log_panel.append(
+                "INFO", "launcher", "Cleared remote session cache"
+            )
 
     def _show_about_dialog(self) -> None:
         QMessageBox.about(
@@ -478,6 +547,14 @@ class ScanKitMainWindow(QMainWindow):
     def _on_main_tab_changed(self, _index: int) -> None:
         self._persist_main_tab()
         self._sync_tab_menu()
+        tabs = self._main_tabs
+        if (
+            tabs is not None
+            and 0 <= _index < tabs.count()
+            and tabs.tabText(_index) == _MAIN_TAB_DEBUG
+            and self._debug_log_panel is not None
+        ):
+            self._debug_log_panel.refresh_cache_label()
 
     def _switch_to_main_tab(self, tab_name: str) -> None:
         tabs = self._main_tabs
@@ -663,9 +740,10 @@ class ScanKitMainWindow(QMainWindow):
 
     def _on_session_base_dir_changed(self, path: str) -> None:
         try:
-            prefs_set(PREF_LAST_DATA_DIR, path)
+            prefs_set(PREF_LAST_DATA_DIR, canonical_location(path))
         except Exception:
             pass
+        self._copy_auth_tried.clear()
         panel = getattr(self, "_config_tuning_panel", None)
         if panel is not None:
             panel.set_session_data_dir(path)
@@ -769,6 +847,125 @@ class ScanKitMainWindow(QMainWindow):
         self._launch_view(module_name, session_ids, self._base_dir)
 
     def _launch_view(
+        self, module_name: str, session_ids: list[str], base_dir: str,
+    ) -> None:
+        if is_remote_location(base_dir):
+            self._copy_remote_then_launch(module_name, session_ids, base_dir)
+            return
+        self._launch_view_after_copy(module_name, session_ids, base_dir)
+
+    def _copy_remote_then_launch(
+        self,
+        module_name: str,
+        session_ids: list[str],
+        base_dir: str,
+        *,
+        retrying_auth: bool = False,
+    ) -> None:
+        if self._remote_copy_busy:
+            self._notify("Still copying remote sessions…")
+            return
+        if not retrying_auth:
+            self._copy_auth_tried.discard(canonical_location(base_dir))
+        self._remote_copy_busy = True
+        self._remote_copy_cancel.clear()
+        progress = QProgressDialog(
+            "Copying session from remote host…",
+            "Cancel",
+            0,
+            max(1, len(session_ids)),
+            self,
+        )
+        progress.setWindowTitle("Remote session")
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(400)
+        progress.setValue(0)
+        progress.canceled.connect(self._remote_copy_cancel.set)
+        self._remote_progress = progress
+
+        def work() -> None:
+            from .common.data_location import (
+                drop_cached_fs,
+                is_auth_error,
+                location_uses_password,
+                materialize_session,
+            )
+
+            try:
+                n = len(session_ids)
+                for i, sid in enumerate(session_ids):
+                    if self._remote_copy_cancel.is_set():
+                        self._sig_remote_copy_finished.emit(
+                            False, "Cancelled", False, module_name, session_ids, base_dir
+                        )
+                        return
+                    self._sig_remote_copy_progress.emit(
+                        f"Copying session {sid}…", i, n
+                    )
+                    local = materialize_session(base_dir, sid)
+                    if local is None:
+                        raise RuntimeError(f"Could not copy session {sid}")
+                self._sig_remote_copy_progress.emit("Remote copy complete", n, n)
+                self._sig_remote_copy_finished.emit(
+                    True, "", False, module_name, session_ids, base_dir
+                )
+            except Exception as exc:
+                if is_auth_error(exc):
+                    drop_cached_fs(base_dir)
+                self._sig_remote_copy_finished.emit(
+                    False,
+                    str(exc).strip() or type(exc).__name__,
+                    is_auth_error(exc) and location_uses_password(base_dir),
+                    module_name,
+                    session_ids,
+                    base_dir,
+                )
+
+        threading.Thread(target=work, daemon=True).start()
+
+    @Slot(str, int, int)
+    def _on_remote_copy_progress(self, message: str, value: int, maximum: int) -> None:
+        progress = self._remote_progress
+        if progress is None:
+            return
+        progress.setLabelText(message)
+        progress.setMaximum(max(1, maximum))
+        progress.setValue(value)
+
+    @Slot(bool, str, bool, str, list, str)
+    def _on_remote_copy_finished(
+        self,
+        ok: bool,
+        err: str,
+        needs_password: bool,
+        module_name: str,
+        session_ids: list,
+        base_dir: str,
+    ) -> None:
+        self._remote_copy_busy = False
+        progress = self._remote_progress
+        self._remote_progress = None
+        if progress is not None:
+            progress.blockSignals(True)
+            progress.close()
+        if self._debug_log_panel is not None:
+            self._debug_log_panel.refresh_cache_label()
+        if not ok:
+            key = canonical_location(base_dir)
+            if needs_password and key not in self._copy_auth_tried:
+                self._copy_auth_tried.add(key)
+                if prompt_remote_password(self, base_dir):
+                    self._copy_remote_then_launch(
+                        module_name, session_ids, base_dir, retrying_auth=True
+                    )
+                    return
+            if err and err != "Cancelled":
+                self._notify(f"Could not copy remote session: {err}", error=True)
+            return
+        self._copy_auth_tried.discard(canonical_location(base_dir))
+        self._launch_view_after_copy(module_name, session_ids, base_dir)
+
+    def _launch_view_after_copy(
         self, module_name: str, session_ids: list[str], base_dir: str,
     ) -> None:
         if module_name in self._open_views:
@@ -1086,6 +1283,7 @@ class ScanKitMainWindow(QMainWindow):
         super().closeEvent(event)
 
     def _shutdown_children(self) -> None:
+        self._deferred_tab_steps = None
         if self._session_browser is not None:
             self._session_browser.shutdown()
         panel = getattr(self, "_config_tuning_panel", None)
@@ -1169,6 +1367,7 @@ def main() -> None:
 
     prepare_qt_app_identity()
     app = QApplication(sys.argv)
+    collect_on_gui_thread(app)
     app_icon = apply_qt_application_branding(app)
     apply_saved_ui_theme(app=app)
     win = ScanKitMainWindow()
