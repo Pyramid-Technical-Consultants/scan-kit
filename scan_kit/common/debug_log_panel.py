@@ -178,7 +178,6 @@ class DebugLogPanel(QWidget):
         self._text.appendPlainText(line)
         self._line_count += 1
         if self._line_count > _MAX_LINES:
-            doc = self._text.document()
             excess = self._line_count - _MAX_LINES
             cursor = self._text.textCursor()
             cursor.movePosition(cursor.MoveOperation.Start)
