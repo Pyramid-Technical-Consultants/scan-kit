@@ -1,5 +1,5 @@
-//! MCP server. Registers [`scan_kit_core::tools`] and dispatches to
-//! [`scan_kit_core::invoke`]. It does not implement the operations.
+//! MCP server. Registers each crate's tool list and dispatches to that crate.
+//! It does not implement the operations.
 
 use std::sync::Arc;
 
@@ -17,22 +17,29 @@ use serde_json::{Map, Value};
 #[derive(Clone)]
 struct ScanKit;
 
-fn empty_input_schema() -> Arc<Map<String, Value>> {
-    let Value::Object(schema) = serde_json::json!({
-        "type": "object",
-        "properties": {},
-        "additionalProperties": false
-    }) else {
-        unreachable!("schema is an object");
+fn schema_object(value: Value) -> Arc<Map<String, Value>> {
+    let Value::Object(schema) = value else {
+        unreachable!("tool schema is an object");
     };
     Arc::new(schema)
 }
 
 fn catalog_tools() -> Vec<Tool> {
-    let schema = empty_input_schema();
-    scan_kit_core::tools()
-        .iter()
-        .map(|spec| Tool::new_with_raw(spec.name, Some(spec.summary.into()), Arc::clone(&schema)))
+    let mut specs = scan_kit_core::tools().to_vec();
+    specs.extend_from_slice(scan_kit_io::tools());
+    specs
+        .into_iter()
+        .map(|spec| {
+            let schema = if scan_kit_core::tools()
+                .iter()
+                .any(|tool| tool.name == spec.name)
+            {
+                scan_kit_core::tool_input_schema(spec.name)
+            } else {
+                scan_kit_io::tool_input_schema(spec.name)
+            };
+            Tool::new_with_raw(spec.name, Some(spec.summary.into()), schema_object(schema))
+        })
         .collect()
 }
 
@@ -66,11 +73,22 @@ impl ServerHandler for ScanKit {
             None => Value::Null,
             Some(arguments) => Value::Object(arguments),
         };
-        match scan_kit_core::invoke(&request.name, &input) {
+        let result = if scan_kit_core::tools()
+            .iter()
+            .any(|tool| tool.name == request.name)
+        {
+            scan_kit_core::invoke(&request.name, &input).map_err(|err| err.to_string())
+        } else if scan_kit_io::tools()
+            .iter()
+            .any(|tool| tool.name == request.name)
+        {
+            scan_kit_io::invoke(&request.name, &input).map_err(|err| err.to_string())
+        } else {
+            Err(format!("unknown tool {}", request.name))
+        };
+        match result {
             Ok(value) => Ok(CallToolResult::structured(value).into()),
-            Err(error) => {
-                Ok(CallToolResult::error(vec![ContentBlock::text(error.to_string())]).into())
-            }
+            Err(error) => Ok(CallToolResult::error(vec![ContentBlock::text(error)]).into()),
         }
     }
 }
@@ -127,5 +145,92 @@ mod tests {
 
         client.cancel().await.expect("cancel");
         server.await.expect("server task");
+    }
+
+    fn arguments(value: serde_json::Value) -> Option<serde_json::Map<String, serde_json::Value>> {
+        match value {
+            serde_json::Value::Object(map) => Some(map),
+            _ => None,
+        }
+    }
+
+    #[tokio::test]
+    async fn sk_req_003_mcp_calls_about() {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let server = tokio::spawn(async move {
+            let running = ScanKit.serve(server_io).await.expect("server");
+            running.waiting().await.expect("server wait");
+        });
+        let client = ().serve(client_io).await.expect("client");
+        let listed = client.list_tools(None).await.expect("list tools");
+        let names: Vec<&str> = listed.tools.iter().map(|tool| tool.name.as_ref()).collect();
+        assert!(names.contains(&"scan_kit_about"));
+        assert!(names.contains(&"scan_kit_open_library"));
+        assert!(names.contains(&"scan_kit_set_note"));
+        assert!(names.contains(&"scan_kit_select_sessions"));
+        assert!(names.contains(&"scan_kit_load_columns"));
+
+        let mut request = CallToolRequestParams::new("scan_kit_about");
+        request.arguments = arguments(json!({}));
+        let about = client.call_tool(request).await.expect("about");
+        assert_eq!(
+            about
+                .structured_content
+                .as_ref()
+                .and_then(|value| value.get("version")),
+            Some(&json!(scan_kit_core::version()))
+        );
+        client.cancel().await.expect("cancel");
+        server.await.expect("server task");
+    }
+
+    #[tokio::test]
+    async fn sk_req_004_mcp_opens_library() {
+        let root = std::env::temp_dir().join(format!(
+            "scan-kit-mcp-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let session = root.join("sess");
+        std::fs::create_dir_all(&session).unwrap();
+        std::fs::write(
+            session.join("input_map.csv"),
+            "energy,X_POSITION,Y_POSITION\n1,0,0\n",
+        )
+        .unwrap();
+        std::fs::write(
+            session.join("termination_summary.txt"),
+            "Date: Thu Sep 10 21:07:41 2026\nConfiguration name: mcp\n",
+        )
+        .unwrap();
+        let db = root.join("test.sqlite");
+
+        let (client_io, server_io) = tokio::io::duplex(256 * 1024);
+        let server = tokio::spawn(async move {
+            let running = ScanKit.serve(server_io).await.expect("server");
+            running.waiting().await.expect("server wait");
+        });
+        let client = ().serve(client_io).await.expect("client");
+        let mut request = CallToolRequestParams::new("scan_kit_open_library");
+        request.arguments = arguments(json!({
+            "path": root.to_string_lossy(),
+            "db_path": db.to_string_lossy(),
+        }));
+        let opened = client.call_tool(request).await.expect("open library");
+        let rows = opened
+            .structured_content
+            .as_ref()
+            .and_then(|value| value.get("rows"))
+            .and_then(|value| value.as_array())
+            .expect("rows");
+        assert!(rows
+            .iter()
+            .any(|row| row["session_id"] == "sess" && row["config"] == "mcp"));
+        client.cancel().await.expect("cancel");
+        server.await.expect("server task");
+        let _ = std::fs::remove_dir_all(root);
     }
 }

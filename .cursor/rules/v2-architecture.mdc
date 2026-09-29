@@ -7,10 +7,10 @@ alwaysApply: true
 
 Follow [docs/software/architecture.md](docs/software/architecture.md) and [docs/software/software-development-plan.md](docs/software/software-development-plan.md).
 
-- Domain behavior lives in `scan-kit-core` once. Register it on the tool catalog. `scan-kit-mcp` and Tauri commands call that function. They do not reimplement it.
+- Domain behavior lives in `scan-kit-core` once. Session files and the sqlite store live in `scan-kit-io`. GPU work lives in `scan-kit-compute` and uses `wgpu` only. Register each operation on that crate's tool catalog. `scan-kit-mcp` and Tauri commands call that function. They do not reimplement it.
 - Workflow tools call granular functions in process.
 - Do not add a PyO3 bridge or a second Python implementation of ported behavior.
 - A port deletes, in the same change, the Python modules and tests that exist only for that capability. Leave a module that unported code still imports. Files still under `scan_kit/` or `tests/` are unported. Phase 1 itself does not delete product Python.
-- Desktop UI stays on the stock shadcn dark theme. Use semantic tokens and `shadcn add` components. Do not edit theme tokens, add custom color, radius, type, or spacing CSS, or add another component library.
+- Desktop chrome stays on the stock shadcn dark theme. Tabular data uses Glide Data Grid, themed from the stock tokens. Use semantic tokens and `shadcn add` components. Do not edit theme tokens, add custom color, radius, type, or spacing CSS, or add another component library for chrome. Do not add a shadcn Table for data.
 - Pull requests target `develop`. Do not bump `scan_kit/__init__.py` to match the Rust `2.0.0-dev` workspace version.
 - A new direct dependency updates [docs/software/soup.md](docs/software/soup.md) in the same change.

@@ -1,0 +1,15 @@
+[package]
+name = "scan-kit-compute"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+authors.workspace = true
+description = "Scan Kit wgpu compute"
+
+[dependencies]
+wgpu = "27"
+naga = "27"
+
+[dev-dependencies]
+tokio = { workspace = true }

@@ -4,6 +4,13 @@
   "description": "Capability for the main window",
   "windows": ["main"],
   "permissions": [
-    "core:default"
+    "core:default",
+    "core:window:allow-close",
+    "core:window:allow-destroy",
+    "core:window:allow-outer-size",
+    "core:window:allow-outer-position",
+    "core:window:allow-set-size",
+    "core:window:allow-set-position",
+    "dialog:default"
   ]
 }
