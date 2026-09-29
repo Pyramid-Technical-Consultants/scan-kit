@@ -15,7 +15,7 @@
 // Per voxel (lo, hi) of E / (rho SPR) in quanta.
 @group(0) @binding(3) var<storage, read_write> tally: array<atomic<u32>>;
 // Pairs (lo, hi): incident, grid, off-grid, leaked, lost, beamline. Then overflow count,
-// deepest stack, and the dispatch's count of histories taken.
+// deepest stack, the dispatch's count of histories taken, and the most steps one particle took.
 @group(0) @binding(4) var<storage, read_write> ledger: array<atomic<u32>>;
 @group(0) @binding(5) var<uniform> P: Params;
 // Material index per voxel, four u8 to a word.
@@ -196,12 +196,42 @@ fn locate(x: vec3f) -> Where {
     return Where(-1, WATER_MEDIUM, 1.0, -1);
 }
 
+// A lane's deposits pool while they land in one voxel and go to the tally, one atomic, when
+// the next lands elsewhere: the atomics, not the physics, bound a CT's speed.
+var<private> g_dose_idx: i32 = -1;
+var<private> g_dose_e: f32 = 0.0;
+var<private> g_let_idx: i32 = -1;
+var<private> g_let_n: f32 = 0.0;
+var<private> g_let_d: f32 = 0.0;
+
+fn flush_dose() {
+    if (g_dose_idx < 0) { return; }
+    let q = quanta(g_dose_e);
+    if (q != 0) { add_tally(2u * u32(g_dose_idx), q); }
+    g_dose_idx = -1;
+    g_dose_e = 0.0;
+}
+
+fn flush_let() {
+    if (g_let_idx < 0) { return; }
+    let qn = quanta(g_let_n);
+    let qd = quanta(g_let_d);
+    if (qn != 0) { add_let(4u * u32(g_let_idx), qn); }
+    if (qd != 0) { add_let(4u * u32(g_let_idx) + 2u, qd); }
+    g_let_idx = -1;
+    g_let_n = 0.0;
+    g_let_d = 0.0;
+}
+
 // Energy e (eV) deposited at scoring index idx; w is 1 / (rho SPR).
 fn deposit(idx: i32, e_ev: f32, w: f32) {
     if (e_ev == 0.0) { return; }
     if (idx >= 0) {
-        let q = quanta(e_ev * w);
-        if (q != 0) { add_tally(2u * u32(idx), q); }
+        if (idx != g_dose_idx) {
+            flush_dose();
+            g_dose_idx = idx;
+        }
+        g_dose_e += e_ev * w;
         g_grid += e_ev;
     } else if (g_geom == GEOM_SHIFTER) {
         g_line += e_ev;
@@ -221,17 +251,27 @@ fn plane_dist(z: f32, w: f32, p: f32) -> f32 {
     return select(1e30, d, d > 0.0);
 }
 
-// Dist_To_Interface: next voxel face, or a slab plane.
+// Dist_To_Interface: next voxel face, or a slab plane, plus MCsquare's nudge past it. The
+// nudge also clears the face by CROSS_CM across it: along a grazing direction MCsquare's
+// alone is below float32 resolution there, and the particle crawls along the face in 2 µm
+// steps (in air, where scattering never tips it off, until the step cap).
+const CROSS_CM: f32 = 1e-5;
+
 fn dist_to_interface(x: vec3f, d: vec3f) -> f32 {
     // SemiInfiniteSlab_step: height above the exit face, whatever the direction.
     if (g_geom == GEOM_SHIFTER) { return max(x.z - g_rs_lo + 1e-4, 0.0); }
-    var s = min(lattice_dist(x.x, P.ox, P.vx, d.x), min(lattice_dist(x.y, P.oy, P.vy, d.y), lattice_dist(x.z, P.oz, P.vz, d.z)));
+    var s = lattice_dist(x.x, P.ox, P.vx, d.x);
+    var u = abs(d.x);
+    let sy = lattice_dist(x.y, P.oy, P.vy, d.y);
+    if (sy < s) { s = sy; u = abs(d.y); }
+    let sz = lattice_dist(x.z, P.oz, P.vz, d.z);
+    if (sz < s) { s = sz; u = abs(d.z); }
     if (g_geom == GEOM_SLAB && abs(d.z) >= 1e-12) {
-        s = min(s, plane_dist(x.z, d.z, 0.0));
-        s = min(s, plane_dist(x.z, d.z, -P.depth));
-        if (P.wet > 0.0) { s = min(s, plane_dist(x.z, d.z, P.wet)); }
+        var pz = min(plane_dist(x.z, d.z, 0.0), plane_dist(x.z, d.z, -P.depth));
+        if (P.wet > 0.0) { pz = min(pz, plane_dist(x.z, d.z, P.wet)); }
+        if (pz < s) { s = pz; u = abs(d.z); }
     }
-    return select(s + 5e-5, s + 2e-4, s < 1e-3);
+    return s + max(select(5e-5, 2e-4, s < 1e-3), CROSS_CM / u);
 }
 
 // Update_Hadron: (E, gamma, beta2, Te_max).
@@ -653,10 +693,12 @@ fn hadron_step(pp: ptr<function, Particle>, wp: ptr<function, Where>) -> bool {
     }
     if (s_let > 0.0) {
         let e_let = p.M * (dE + dEh);
-        let qn = quanta(e_let * s_let * 1e-7);
-        let qd = quanta(e_let);
-        if (qn != 0) { add_let(4u * u32(hinge), qn); }
-        if (qd != 0) { add_let(4u * u32(hinge) + 2u, qd); }
+        if (hinge != g_let_idx) {
+            flush_let();
+            g_let_idx = hinge;
+        }
+        g_let_n += e_let * s_let * 1e-7;
+        g_let_d += e_let;
     }
     // MCsquare applies no SPR to nuclear deposits.
     deposit(there.idx, p.M * dEh, select(1.0 / (there.rho * spr), 1.0 / there.rho, itype == 2));
@@ -815,6 +857,8 @@ fn open_history(h: u32, pp: ptr<function, Particle>) -> bool {
 }
 
 fn close_history() {
+    flush_dose();
+    flush_let();
     add_ledger(0u, quanta(g_inc));
     add_ledger(2u, quanta(g_grid));
     add_ledger(4u, quanta(g_off));
@@ -835,6 +879,7 @@ fn main() {
     var busy = false;
     var open = false;
     var steps = 0;
+    var longest = 0;
     var pops = 0;
     var next_exit = 0;
     loop {
@@ -858,6 +903,7 @@ fn main() {
                 next_exit = 0;
                 busy = open_history(P.hist_base + n, &p) && begin(p);
             }
+            longest = max(longest, steps);
             steps = 0;
         }
         if (!busy) { break; }
@@ -867,4 +913,5 @@ fn main() {
     }
     if (g_overflow != 0u) { atomicAdd(&ledger[12], g_overflow); }
     atomicMax(&ledger[13], u32(g_deepest));
+    atomicMax(&ledger[15], u32(longest));
 }
