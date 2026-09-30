@@ -124,15 +124,32 @@ type ViewTable = {
   rows: string[][];
 };
 
-type ViewFrame = {
+type PlotMeta = {
+  id: number;
   title: string;
-  width: number;
-  height: number;
-  rgba_base64: string;
   controls: ViewControl[];
   table: ViewTable | null;
   samples: number[];
 };
+
+type HoverReadout = {
+  hit: boolean;
+  x: number;
+  y: number;
+  series: number | null;
+};
+
+type PointerInput = {
+  x: number;
+  y: number;
+  dx: number;
+  dy: number;
+  wheel: number;
+  drag: boolean;
+  reset: boolean;
+};
+
+const REST: PointerInput = { x: -1, y: -1, dx: 0, dy: 0, wheel: 0, drag: false, reset: false };
 
 function tokenColor(name: string): string {
   const probe = document.createElement("span");
@@ -237,6 +254,56 @@ async function playSamples(samples: number[]) {
   source.start();
 }
 
+function messageOf(reason: unknown): string {
+  return reason instanceof Error ? reason.message : String(reason);
+}
+
+function frameBytes(payload: ArrayBuffer | Uint8Array): ArrayBuffer {
+  if (payload instanceof ArrayBuffer) {
+    return payload;
+  }
+  return payload.buffer.slice(payload.byteOffset, payload.byteOffset + payload.byteLength) as ArrayBuffer;
+}
+
+function paintFrame(node: HTMLCanvasElement, buffer: ArrayBuffer): boolean {
+  if (buffer.byteLength < 24) {
+    return false;
+  }
+  const view = new DataView(buffer);
+  const width = view.getUint32(0, true);
+  const height = view.getUint32(4, true);
+  const pixels = width * height * 4;
+  if (width === 0 || height === 0 || buffer.byteLength < 24 + pixels) {
+    return false;
+  }
+  const context = node.getContext("2d");
+  if (context == null) {
+    return false;
+  }
+  node.width = width;
+  node.height = height;
+  context.putImageData(new ImageData(new Uint8ClampedArray(buffer, 24, pixels), width, height), 0, 0);
+  return true;
+}
+
+function readoutOf(buffer: ArrayBuffer): HoverReadout | null {
+  if (buffer.byteLength < 24) {
+    return null;
+  }
+  const view = new DataView(buffer);
+  const flags = view.getUint32(8, true);
+  if ((flags & 1) === 0) {
+    return null;
+  }
+  const series = view.getUint32(20, true);
+  return {
+    hit: true,
+    x: view.getFloat32(12, true),
+    y: view.getFloat32(16, true),
+    series: (flags & 2) === 0 ? null : series,
+  };
+}
+
 export function AnalysisView({
   viewId,
   folder,
@@ -250,14 +317,96 @@ export function AnalysisView({
 }) {
   const host = useRef<HTMLDivElement>(null);
   const canvas = useRef<HTMLCanvasElement>(null);
-  const request = useRef(0);
+  const plotId = useRef(0);
+  const openSeq = useRef(0);
+  const frameSeq = useRef(0);
+  const sizeRef = useRef({ width: 960, height: 640 });
+  const hoverFlight = useRef({ busy: false, x: 0, y: 0, pending: false });
+  const drawRef = useRef<(input: PointerInput) => void>(() => {});
+  const hoverRef = useRef<(x: number, y: number) => void>(() => {});
   const [options, setOptions] = useState<Record<string, string>>({});
-  const [frame, setFrame] = useState<ViewFrame | null>(null);
+  const [meta, setMeta] = useState<PlotMeta | null>(null);
+  const [shown, setShown] = useState(false);
+  const [hover, setHover] = useState<HoverReadout | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [study, setStudy] = useState<string | null>(null);
   const [size, setSize] = useState({ width: 960, height: 640 });
+  sizeRef.current = size;
   const plotWidth = Math.max(16, Math.round(size.width * (window.devicePixelRatio || 1)));
   const plotHeight = Math.max(16, Math.round(size.height * (window.devicePixelRatio || 1)));
+
+  const draw = (input: PointerInput) => {
+    const id = plotId.current;
+    const node = canvas.current;
+    if (id === 0 || node == null) {
+      return;
+    }
+    const ticket = frameSeq.current + 1;
+    frameSeq.current = ticket;
+    const width = Math.max(16, Math.round(sizeRef.current.width * (window.devicePixelRatio || 1)));
+    const height = Math.max(16, Math.round(sizeRef.current.height * (window.devicePixelRatio || 1)));
+    void invoke<ArrayBuffer>("scan_kit_plot_frame", {
+      id,
+      width,
+      height,
+      x: input.x,
+      y: input.y,
+      dx: input.dx,
+      dy: input.dy,
+      wheel: input.wheel,
+      drag: input.drag,
+      reset: input.reset,
+    })
+      .then((payload) => {
+        if (ticket !== frameSeq.current || id !== plotId.current) {
+          return;
+        }
+        const buffer = frameBytes(payload);
+        setShown(paintFrame(node, buffer));
+        if (input.x >= 0) {
+          setHover(readoutOf(buffer));
+        }
+        setError(null);
+      })
+      .catch((reason: unknown) => {
+        const message = messageOf(reason);
+        if (message.includes("stale plot") || id !== plotId.current) {
+          return;
+        }
+        setError(message);
+      });
+  };
+
+  const readHover = (x: number, y: number) => {
+    const id = plotId.current;
+    const flight = hoverFlight.current;
+    flight.x = x;
+    flight.y = y;
+    if (flight.busy || id === 0) {
+      flight.pending = id !== 0;
+      return;
+    }
+    flight.busy = true;
+    flight.pending = false;
+    void invoke<HoverReadout>("scan_kit_plot_hover", { id, x, y })
+      .then((next) => {
+        if (id === plotId.current) {
+          setHover(next.hit ? next : null);
+        }
+      })
+      .catch((reason: unknown) => {
+        const message = messageOf(reason);
+        if (!message.includes("stale plot") && id === plotId.current) {
+          setError(message);
+        }
+      })
+      .finally(() => {
+        flight.busy = false;
+        if (flight.pending && plotId.current === id) {
+          hoverRef.current(flight.x, flight.y);
+        }
+      });
+  };
 
   useEffect(() => {
     const node = host.current;
@@ -278,54 +427,112 @@ export function AnalysisView({
   }, []);
 
   useEffect(() => {
-    const id = request.current + 1;
-    request.current = id;
+    const ticket = openSeq.current + 1;
+    openSeq.current = ticket;
     const timer = window.setTimeout(() => {
-      void invoke<ViewFrame>("scan_kit_run_view", {
+      void invoke<PlotMeta>("scan_kit_open_plot", {
         view: viewId,
         path: folder,
         sessionIds,
         options,
-        width: plotWidth,
-        height: plotHeight,
         background: parseColor(tokenColor("--background")),
         foreground: parseColor(tokenColor("--foreground")),
         palette: palette(),
       })
         .then((next) => {
-          if (request.current === id) {
-            setFrame(next);
-            setError(null);
+          if (openSeq.current !== ticket) {
+            return;
           }
+          plotId.current = next.id;
+          setMeta(next);
+          setHover(null);
+          setError(null);
         })
         .catch((reason: unknown) => {
-          if (request.current === id) {
-            setError(reason instanceof Error ? reason.message : String(reason));
+          if (openSeq.current === ticket) {
+            setError(messageOf(reason));
           }
         });
     }, 150);
     return () => window.clearTimeout(timer);
-  }, [viewId, folder, sessionIds, options, plotWidth, plotHeight]);
+  }, [viewId, folder, sessionIds, options]);
+
+  drawRef.current = draw;
+  hoverRef.current = readHover;
+
+  useEffect(() => {
+    if (meta == null) {
+      return;
+    }
+    drawRef.current(REST);
+  }, [meta, plotWidth, plotHeight]);
 
   useEffect(() => {
     const node = canvas.current;
-    if (node == null || frame == null || frame.width === 0 || frame.rgba_base64 === "") {
+    if (node == null) {
       return;
     }
-    const bytes = Uint8Array.from(atob(frame.rgba_base64), (char) => char.charCodeAt(0));
-    if (bytes.length < frame.width * frame.height * 4) {
-      return;
-    }
-    const context = node.getContext("2d");
-    if (context == null) {
-      return;
-    }
-    node.width = frame.width;
-    node.height = frame.height;
-    context.putImageData(new ImageData(new Uint8ClampedArray(bytes), frame.width, frame.height), 0, 0);
-  }, [frame]);
+    let dragging = false;
+    const locate = (event: { clientX: number; clientY: number }) => {
+      const rect = node.getBoundingClientRect();
+      const sx = rect.width > 0 ? node.width / rect.width : 1;
+      const sy = rect.height > 0 ? node.height / rect.height : 1;
+      return {
+        x: (event.clientX - rect.left) * sx,
+        y: (event.clientY - rect.top) * sy,
+        sx,
+        sy,
+      };
+    };
+    const onWheel = (event: WheelEvent) => {
+      event.preventDefault();
+      const point = locate(event);
+      drawRef.current({ x: point.x, y: point.y, dx: 0, dy: 0, wheel: event.deltaY, drag: false, reset: false });
+    };
+    const onDown = (event: PointerEvent) => {
+      dragging = true;
+      node.setPointerCapture(event.pointerId);
+    };
+    const onUp = () => {
+      dragging = false;
+    };
+    const onMove = (event: PointerEvent) => {
+      const point = locate(event);
+      if (dragging) {
+        drawRef.current({
+          x: point.x,
+          y: point.y,
+          dx: event.movementX * point.sx,
+          dy: event.movementY * point.sy,
+          wheel: 0,
+          drag: true,
+          reset: false,
+        });
+        return;
+      }
+      hoverRef.current(point.x, point.y);
+    };
+    const onDouble = (event: MouseEvent) => {
+      const point = locate(event);
+      drawRef.current({ x: point.x, y: point.y, dx: 0, dy: 0, wheel: 0, drag: false, reset: true });
+    };
+    node.addEventListener("wheel", onWheel, { passive: false });
+    node.addEventListener("pointerdown", onDown);
+    node.addEventListener("pointerup", onUp);
+    node.addEventListener("pointercancel", onUp);
+    node.addEventListener("pointermove", onMove);
+    node.addEventListener("dblclick", onDouble);
+    return () => {
+      node.removeEventListener("wheel", onWheel);
+      node.removeEventListener("pointerdown", onDown);
+      node.removeEventListener("pointerup", onUp);
+      node.removeEventListener("pointercancel", onUp);
+      node.removeEventListener("pointermove", onMove);
+      node.removeEventListener("dblclick", onDouble);
+    };
+  }, []);
 
-  const table = frame?.table;
+  const table = meta?.table;
   const columns: GridColumn[] =
     table?.columns.map((title) => ({ title, width: 180 })) ?? [];
   const getCellContent = ([col, row]: Item): GridCell => ({
@@ -341,8 +548,8 @@ export function AnalysisView({
         <Button variant="outline" onClick={onBack}>
           Sessions
         </Button>
-        <h2 className="text-sm font-medium">{frame?.title ?? "Analysis"}</h2>
-        {(frame?.controls ?? []).map((control) => {
+        <h2 className="text-sm font-medium">{meta?.title ?? "Analysis"}</h2>
+        {(meta?.controls ?? []).map((control) => {
           const items = control.options.map((option) => ({ label: option, value: option }));
           const stored = options[control.id];
           const value = stored != null && control.options.includes(stored) ? stored : control.value;
@@ -387,13 +594,13 @@ export function AnalysisView({
             </Field>
           );
         })}
-        {(frame?.samples.length ?? 0) > 0 ? (
+        {(meta?.samples.length ?? 0) > 0 ? (
           <div className="flex flex-col gap-2">
             <Button
               variant="secondary"
               onClick={() => {
-                if (frame != null) {
-                  void playSamples(frame.samples);
+                if (meta != null) {
+                  void playSamples(meta.samples);
                 }
               }}
             >
@@ -402,10 +609,10 @@ export function AnalysisView({
             <Button
               variant="outline"
               onClick={() => {
-                if (frame == null) {
+                if (meta == null) {
                   return;
                 }
-                const url = URL.createObjectURL(wavBlob(frame.samples));
+                const url = URL.createObjectURL(wavBlob(meta.samples));
                 const link = document.createElement("a");
                 link.href = url;
                 link.download = "scan-kit.wav";
@@ -439,11 +646,11 @@ export function AnalysisView({
         {study != null ? <pre className="text-muted-foreground text-xs whitespace-pre-wrap">{study}</pre> : null}
         {error != null ? <p className="text-destructive text-sm">{error}</p> : null}
       </aside>
-      <div ref={host} className="bg-background min-h-0 flex-1">
+      <div ref={host} className="bg-background relative min-h-0 flex-1">
         {table != null && table.rows.length > 0 ? (
           <DataEditor
             width={size.width}
-            height={frame != null && frame.width > 0 ? Math.min(240, size.height) : size.height}
+            height={shown ? Math.min(240, size.height) : size.height}
             columns={columns}
             rows={table.rows.length}
             getCellContent={getCellContent}
@@ -451,10 +658,13 @@ export function AnalysisView({
             rowMarkers="none"
           />
         ) : null}
-        <canvas
-          ref={canvas}
-          className={frame != null && frame.width > 0 ? "h-full w-full" : "hidden"}
-        />
+        <canvas ref={canvas} className={shown ? "h-full w-full touch-none" : "hidden"} />
+        {hover != null ? (
+          <p className="text-muted-foreground pointer-events-none absolute bottom-2 left-2 text-xs tabular-nums">
+            {hover.x.toPrecision(4)}, {hover.y.toPrecision(4)}
+            {hover.series != null ? `  #${hover.series + 1}` : ""}
+          </p>
+        ) : null}
       </div>
     </div>
   );

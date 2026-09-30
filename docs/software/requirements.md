@@ -59,13 +59,13 @@ The kernel lives in `scan-kit-compute`. `wgpu` is the only compute library. The 
 
 Opening an analysis view returns one RGBA frame and the control list for the selected sessions.
 
-`scan_kit_run_view` builds the scene, paints it, and returns the frame with the controls. At most five sessions are accepted. The shell draws that frame and renders the controls.
+`scan_kit_run_view` builds the scene, paints it, and returns the frame with the controls. At most five sessions are accepted. The shell renders those controls. It keeps the plot and blits later frames itself.
 
 ## SK-REQ-009
 
 A plot scene of polylines, points, bars, and one heatmap renders to an RGBA frame.
 
-Colors for the frame background and series come from the caller. When no GPU adapter is present, the same triangles are filled on the CPU.
+Colors for the frame background and series come from the caller. When no GPU adapter is present, the same marks are projected with the plot matrix and filled on the CPU.
 
 ## SK-REQ-010
 

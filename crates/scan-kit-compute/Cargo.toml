@@ -8,6 +8,7 @@ authors.workspace = true
 description = "Scan Kit wgpu compute"
 
 [dependencies]
+fontdue = "0.9"
 naga = "27"
 scan-kit-core = { workspace = true }
 scan-kit-io = { workspace = true }

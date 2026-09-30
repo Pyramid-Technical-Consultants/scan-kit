@@ -40,7 +40,7 @@ Tools:
 - `scan_kit_load_columns`, granular, returns requested columns after alias resolution and the G2 current scale
 - `scan_kit_load_timeslice` and `scan_kit_channel_catalog`, granular
 - `scan_kit_analysis_scene`, workflow, builds one view scene from the selected sessions
-- `scan_kit_run_view`, workflow, paints that scene to one RGBA frame
+- `scan_kit_run_view`, workflow, paints that scene to one RGBA frame for MCP and tests
 - `scan_kit_calibrate`, `scan_kit_dose_error`, `scan_kit_beam_mask`, `scan_kit_bin_edges`, `scan_kit_histogram`, `scan_kit_welch`, and `scan_kit_fit_decay`, granular
 - `scan_kit_open_study` and `scan_kit_clinical_goal`, the DICOM study index and a dose-volume goal
 
@@ -68,13 +68,13 @@ Chrome uses shadcn semantic tokens (`bg-background`, `text-foreground`, `bg-card
 
 Tabular data, including the session list and Session Log Compare, is drawn by [Glide Data Grid](https://grid.glideapps.com/). The grid theme is filled from the stock tokens (background, card, foreground, muted foreground, border, accent, and the Geist font). Those tokens are not edited. A DOM table, including a shadcn Table, is not used for data.
 
-The Analysis menu opens a view when one to five sessions are selected. Controls are shadcn components added with `shadcn add` (Select and Field for choices), not native form elements. The picture is one RGBA frame from `scan_kit_run_view`, colored from the stock tokens. Audio Explorer plays and exports that frame's samples with Web Audio. Dose Volume can open a DICOM folder through `scan_kit_open_study`.
+The Analysis menu opens a view when one to five sessions are selected. Controls are shadcn components added with `shadcn add` (Select and Field for choices), not native form elements. The window keeps one plot in the Tauri process. A control change rebuilds that plot. Wheel, drag, and hover send pointer input, and the shell blits the raw RGBA frame. `scan_kit_run_view` still returns one base64 frame for MCP and tests, colored from the stock tokens. Audio Explorer plays and exports the open plot's samples with Web Audio. Dose Volume can open a DICOM folder through `scan_kit_open_study`.
 
 No custom CSS for color, radius, type, or spacing. A unique visual style, when it exists, is a deliberate change to the shadcn theme, not one-off overrides in a feature change.
 
 ## Numeric work
 
-`wgpu` is the only compute library. It lives in `scan-kit-compute`. Nothing else links it. Plot frames, the analytic splat, ray march, gamma, DVH, resample, and Monte Carlo transport shaders go through that crate. A frame is read back as RGBA. The readback test skips the dispatch when the machine has no adapter and still compiles the shader. Orbit of the trajectory and the dose volume uses the same read-back frame.
+`wgpu` is the only compute library. It lives in `scan-kit-compute`. Nothing else links it. Plot frames, the analytic splat, ray march, gamma, DVH, resample, and Monte Carlo transport shaders go through that crate. Marks are stored as `vec3` in data space. One `clip_from_data` matrix places them, and a later orbit or volume writes that same matrix. A frame is read back as RGBA. The desktop copies that target as raw bytes. The readback test skips the dispatch when the machine has no adapter and still compiles the shader. The no-adapter picture projects the same buffers.
 
 No dataframe crate and no ORM. Session columns are `Vec<f32>` or `Vec<i32>`, parsed in one pass.
 

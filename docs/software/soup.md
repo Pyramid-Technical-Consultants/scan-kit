@@ -36,6 +36,9 @@ Versions below are the ones locked for the workspace. Anomaly review for a SOUP 
 | csv | see `crates/scan-kit-io/Cargo.toml` | Quoted fields and header drift in session files |
 | wgpu | see `crates/scan-kit-compute/Cargo.toml` | The only GPU and compute library |
 | naga | see `crates/scan-kit-compute/Cargo.toml` | Compile the compute shader when no GPU adapter is present |
+| fontdue | see `crates/scan-kit-compute/Cargo.toml` | Rasterize plot labels into one glyph atlas |
+
+Plot text uses the vendored Source Sans 3 regular face in `crates/scan-kit-compute/assets/SourceSans3-Regular.ttf` (SIL Open Font License, Latin 400 from fontsource 5.2.8). It is compiled into the compute crate with `include_bytes`. It is not a Cargo dependency.
 
 ## Desktop frontend
 

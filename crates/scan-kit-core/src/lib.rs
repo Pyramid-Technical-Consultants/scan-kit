@@ -15,7 +15,10 @@ pub use geometry::{
     beam_angle_mrad, fit_iso_plane, fit_line, magnet_pivot_z, parse_ic_geometry, IcGeometry,
     IC1_Z_MM, IC2_Z_MM, IC_SEP_MM,
 };
-pub use plot::{format_tick, map_span, Control, DataTable, Panel, PlotScene, Series};
+pub use plot::{
+    apply_clip, format_tick, map_span, project, ticks, Camera, Control, DataTable, Panel, PlotRect,
+    PlotScene, Series,
+};
 pub use session_log::{compare_templates, parse_session_log, LayerEvent, SessionLog};
 pub use signal::{
     arc_fit, arc_predict, assign_bin_centers, beam_off_edges, beam_on_mask, box_stats,

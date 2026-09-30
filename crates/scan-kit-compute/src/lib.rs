@@ -4,9 +4,10 @@
 mod kernels;
 mod present;
 mod render;
+mod text;
 
 pub use kernels::compile_scientific_shaders;
-pub use present::{invoke, run_view, tool_input_schema, tools};
+pub use present::{invoke, open_plot, plot_frame, plot_hover, run_view, tool_input_schema, tools};
 pub use render::{compile_plot_shader, plot_shader_source, render_plot};
 
 const SHADER: &str = r#"
