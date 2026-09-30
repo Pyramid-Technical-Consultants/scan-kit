@@ -7,6 +7,15 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 
+/** Glide cell bounds are already viewport coordinates. `localEvent` is the click inside that cell. */
+export function sessionMenuPoint(
+  bounds: { x: number; y: number },
+  localEventX: number,
+  localEventY: number,
+): { x: number; y: number } {
+  return { x: bounds.x + localEventX, y: bounds.y + localEventY };
+}
+
 export function SessionContextMenu({
   sessionId,
   x,
@@ -31,7 +40,10 @@ export function SessionContextMenu({
         }
       }}
     >
-      <DropdownMenuTrigger className="fixed size-px p-0 opacity-0" style={{ left: x, top: y }} />
+      <DropdownMenuTrigger
+        className="size-px p-0 opacity-0"
+        style={{ position: "fixed", left: x, top: y }}
+      />
       <DropdownMenuContent>
         <DropdownMenuGroup>
           <DropdownMenuLabel>{sessionId}</DropdownMenuLabel>

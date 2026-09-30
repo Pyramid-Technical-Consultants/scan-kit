@@ -1,4 +1,29 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  Activity,
+  AudioWaveform,
+  ChartColumn,
+  ChartScatter,
+  Cuboid,
+  Ellipsis,
+  FolderOpen,
+  Headphones,
+  Info,
+  Layers,
+  LogOut,
+  Play,
+  Redo2,
+  RefreshCw,
+  ScrollText,
+  Spline,
+  TrendingDown,
+  TrendingUp,
+  Undo2,
+  Waypoints,
+  X,
+  Zap,
+  type LucideIcon,
+} from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { PhysicalPosition, PhysicalSize } from "@tauri-apps/api/dpi";
 import { availableMonitors, getCurrentWindow } from "@tauri-apps/api/window";
@@ -7,6 +32,7 @@ import {
   DataEditor,
   GridCellKind,
   getDefaultTheme,
+  type DataEditorRef,
   type EditableGridCell,
   type GridCell,
   type GridColumn,
@@ -22,7 +48,24 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { SessionContextMenu } from "@/session-menu";
+import { Button, buttonVariants } from "@/components/ui/button";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuGroup,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import { SessionContextMenu, sessionMenuPoint } from "@/session-menu";
+import {
+  MAX_SELECTED,
+  UseColumnChecks,
+  headerCheck,
+  headerWillFill,
+  nextSessionSelection,
+} from "@/session-checks";
 import {
   Menubar,
   MenubarCheckboxItem,
@@ -36,8 +79,6 @@ import {
 } from "@/components/ui/menubar";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { AnalysisView } from "@/AnalysisView";
-
-const MAX_SELECTED = 5;
 
 const LAUNCHER_VIEWS = [
   "Data Analysis",
@@ -80,6 +121,29 @@ const ANALYSIS_GROUPS = [
     ],
   },
 ] as const;
+
+const PRIMARY_ANALYSES = [
+  "Binned Summary",
+  "Distribution Explorer",
+  "Timeslice Replay",
+] as const;
+
+const ANALYSIS_ICONS: Record<string, LucideIcon> = {
+  "Binned Summary": ChartColumn,
+  "Distribution Explorer": ChartScatter,
+  "Timeslice Replay": Play,
+  "FFT Explorer": AudioWaveform,
+  "Audio Explorer": Headphones,
+  "IC Beam Trajectory (3D)": Cuboid,
+  "Dose Volume": Layers,
+  "Session Log Compare": ScrollText,
+  "Beam Error Motion vs Energy": Spline,
+  "Dose Accumulation": TrendingUp,
+  "Beam-Off Ramp-Down": TrendingDown,
+  "IC HV Transient Test": Zap,
+  "Amplifier Command Correlations": Waypoints,
+  "IC Peak Amplitude — Beam-Off (G3)": Activity,
+};
 
 const ANALYSIS_IDS: Record<string, string> = {
   "Binned Summary": "binned_summary",
@@ -125,7 +189,7 @@ const COLUMN_SORT: Array<SortKey | null> = [
 ];
 
 const COLUMN_TITLES = [
-  "Use",
+  "",
   "Session ID",
   "Date",
   "MU",
@@ -304,6 +368,14 @@ function compareRows(left: LibraryRow, right: LibraryRow, sort: Sort): number {
   return sort.direction === "asc" ? order : -order;
 }
 
+function AnalysisIcon({ name }: { name: string }) {
+  const Icon = ANALYSIS_ICONS[name];
+  if (Icon == null) {
+    return null;
+  }
+  return <Icon />;
+}
+
 function textCell(value: string, editable: boolean): GridCell {
   return {
     kind: GridCellKind.Text,
@@ -339,6 +411,10 @@ export default function App() {
   );
   const canAnalyze = folder != null && selectedIds.length >= 1 && selectedIds.length <= MAX_SELECTED;
   const host = useRef<HTMLDivElement>(null);
+  const gridRef = useRef<DataEditorRef>(null);
+  const [region, setRegion] = useState({ y: 0, height: 40 });
+  const selectedSet = useMemo(() => new Set(selectedIds), [selectedIds]);
+  const selectionHeader = headerCheck(rows.length, selectedIds.length);
   const folderRef = useRef<string | null>(null);
   folderRef.current = folder;
 
@@ -347,6 +423,15 @@ export default function App() {
     indexes.sort((a, b) => compareRows(rows[a], rows[b], sort));
     return indexes;
   }, [rows, sort]);
+
+  const displayIds = useMemo(
+    () =>
+      order.flatMap((index) => {
+        const id = rows[index]?.session_id;
+        return id == null ? [] : [id];
+      }),
+    [order, rows],
+  );
 
   const columns = useMemo<GridColumn[]>(
     () =>
@@ -359,7 +444,7 @@ export default function App() {
         return {
           title: marked,
           id: key ?? "use",
-          width: index === 0 ? 64 : index === 8 || index === 9 ? 220 : 110,
+          width: index === 0 ? 48 : index === 8 || index === 9 ? 220 : 110,
           grow: index === 8 || index === 9 ? 1 : 0,
         };
       }),
@@ -516,6 +601,58 @@ export default function App() {
     });
   }, []);
 
+  const openAnalysis = useCallback(
+    (name: string) => {
+      const id = ANALYSIS_IDS[name];
+      if (id == null) {
+        return;
+      }
+      setAnalysis(id);
+      selectTab("Data Analysis");
+    },
+    [selectTab],
+  );
+
+  const commitSelection = useCallback((next: { ids: string[]; capped: boolean }) => {
+    const path = folderRef.current;
+    if (path == null) {
+      return;
+    }
+    const current = rows.filter((item) => item.selected).map((item) => item.session_id);
+    const same = current.length === next.ids.length && current.every((id) => next.ids.includes(id));
+    if (same) {
+      if (next.capped) {
+        setMessage("At most five sessions can be selected.");
+      }
+      return;
+    }
+    void invoke("scan_kit_select_sessions", { path, sessionIds: next.ids })
+      .then(() => {
+        const chosen = new Set(next.ids);
+        setRows((items) => items.map((item) => ({ ...item, selected: chosen.has(item.session_id) })));
+        setMessage(next.capped ? "At most five sessions can be selected." : null);
+      })
+      .catch((error: unknown) => setMessage(messageText(error)));
+  }, [rows]);
+
+  const onRowCheck = useCallback(
+    (sessionId: string, checked: boolean) => {
+      commitSelection(nextSessionSelection(displayIds, selectedIds, sessionId, checked));
+    },
+    [commitSelection, displayIds, selectedIds],
+  );
+
+  const onHeaderCheck = useCallback(() => {
+    commitSelection(
+      nextSessionSelection(
+        displayIds,
+        selectedIds,
+        "all",
+        headerWillFill(rows.length, selectedIds.length),
+      ),
+    );
+  }, [commitSelection, displayIds, rows.length, selectedIds]);
+
   const writeNote = useCallback(async (sessionId: string, note: string) => {
     const path = folderRef.current;
     if (path == null) {
@@ -533,33 +670,6 @@ export default function App() {
       const source = order[rowIndex];
       const row = source == null ? undefined : rows[source];
       if (row == null || folder == null) {
-        return;
-      }
-      if (col === 0 && newValue.kind === GridCellKind.Boolean) {
-        if (typeof newValue.data !== "boolean") {
-          return;
-        }
-        const selected = rows.filter((item) => item.selected).map((item) => item.session_id);
-        const next = newValue.data
-          ? selected.includes(row.session_id)
-            ? selected
-            : [...selected, row.session_id]
-          : selected.filter((id) => id !== row.session_id);
-        if (next.length > MAX_SELECTED) {
-          setMessage("At most five sessions can be selected.");
-          return;
-        }
-        void invoke("scan_kit_select_sessions", { path: folder, sessionIds: next })
-          .then(() => {
-            setRows((current) =>
-              current.map((item) => ({
-                ...item,
-                selected: next.includes(item.session_id),
-              })),
-            );
-            setMessage(null);
-          })
-          .catch((error: unknown) => setMessage(messageText(error)));
         return;
       }
       if (col === 9 && newValue.kind === GridCellKind.Text && newValue.data !== row.note) {
@@ -585,13 +695,7 @@ export default function App() {
         return textCell("", false);
       }
       if (col === 0) {
-        return {
-          kind: GridCellKind.Boolean,
-          data: row.selected,
-          allowOverlay: false,
-          readonly: false,
-          copyData: row.selected ? "1" : "0",
-        };
+        return textCell("", false);
       }
       const value = [
         row.session_id,
@@ -633,9 +737,13 @@ export default function App() {
       <Menubar className="w-full rounded-none border-0 border-b px-2">
         <MenubarMenu>
           <MenubarTrigger>File</MenubarTrigger>
-          <MenubarContent>
-            <MenubarItem onClick={() => void chooseFolder()}>Open Data Folder</MenubarItem>
+          <MenubarContent className="w-max">
+            <MenubarItem className="whitespace-nowrap" onClick={() => void chooseFolder()}>
+              <FolderOpen />
+              Open Data Folder
+            </MenubarItem>
             <MenubarItem
+              className="whitespace-nowrap"
               disabled={folder == null}
               onClick={() => {
                 if (folder != null) {
@@ -643,23 +751,26 @@ export default function App() {
                 }
               }}
             >
+              <RefreshCw />
               Refresh Sessions
             </MenubarItem>
             <MenubarSeparator />
             <MenubarItem
+              className="whitespace-nowrap"
               onClick={() => {
                 void getCurrentWindow()
                   .close()
                   .catch((error: unknown) => setMessage(messageText(error)));
               }}
             >
+              <LogOut />
               Exit
             </MenubarItem>
           </MenubarContent>
         </MenubarMenu>
         <MenubarMenu>
           <MenubarTrigger>Edit</MenubarTrigger>
-          <MenubarContent>
+          <MenubarContent className="w-max">
             <MenubarItem
               disabled={undo.length === 0}
               onClick={() => {
@@ -675,6 +786,7 @@ export default function App() {
                   .catch((error: unknown) => setMessage(messageText(error)));
               }}
             >
+              <Undo2 />
               Undo
             </MenubarItem>
             <MenubarItem
@@ -692,6 +804,7 @@ export default function App() {
                   .catch((error: unknown) => setMessage(messageText(error)));
               }}
             >
+              <Redo2 />
               Redo
             </MenubarItem>
           </MenubarContent>
@@ -716,7 +829,7 @@ export default function App() {
         </MenubarMenu>
         <MenubarMenu>
           <MenubarTrigger>Analysis</MenubarTrigger>
-          <MenubarContent>
+          <MenubarContent className="w-max">
             {ANALYSIS_GROUPS.map((group, index) => (
               <MenubarGroup key={group.title}>
                 {index > 0 ? <MenubarSeparator /> : null}
@@ -724,12 +837,11 @@ export default function App() {
                 {group.names.map((name) => (
                   <MenubarItem
                     key={name}
+                    className="whitespace-nowrap"
                     disabled={!canAnalyze}
-                    onClick={() => {
-                      setAnalysis(ANALYSIS_IDS[name]);
-                      selectTab("Data Analysis");
-                    }}
+                    onClick={() => openAnalysis(name)}
                   >
+                    <AnalysisIcon name={name} />
                     {name}
                   </MenubarItem>
                 ))}
@@ -740,7 +852,10 @@ export default function App() {
         <MenubarMenu>
           <MenubarTrigger>Help</MenubarTrigger>
           <MenubarContent>
-            <MenubarItem onClick={() => setAboutOpen(true)}>About</MenubarItem>
+            <MenubarItem onClick={() => setAboutOpen(true)}>
+              <Info />
+              About
+            </MenubarItem>
           </MenubarContent>
         </MenubarMenu>
       </Menubar>
@@ -771,40 +886,111 @@ export default function App() {
             />
           ) : (
           <>
-          <div className="text-muted-foreground truncate px-3 py-2 text-sm">
-            {folder ?? "Open a data folder to list sessions."}
-            {folder != null && rows.length === 0 ? " — No sessions in this folder." : ""}
-            {rows.length > 0 ? ` — ${rows.length} sessions` : ""}
+          <div className="flex items-center gap-2 px-3 py-2">
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={selectedIds.length === 0}
+              aria-label="Clear selection"
+              onClick={() =>
+                commitSelection(nextSessionSelection(displayIds, selectedIds, "all", false))
+              }
+            >
+              <X />
+              Clear
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={folder == null}
+              onClick={() => {
+                if (folder != null) {
+                  void loadFolder(folder).catch((error: unknown) => setMessage(messageText(error)));
+                }
+              }}
+            >
+              <RefreshCw />
+              Refresh
+            </Button>
+            <div className="ml-auto flex items-center gap-2">
+              {PRIMARY_ANALYSES.map((name) => (
+                <Button key={name} size="sm" disabled={!canAnalyze} onClick={() => openAnalysis(name)}>
+                  <AnalysisIcon name={name} />
+                  {name}
+                </Button>
+              ))}
+              <DropdownMenu>
+                <DropdownMenuTrigger
+                  className={buttonVariants({ variant: "outline", size: "icon-sm" })}
+                  aria-label="More analyses"
+                  disabled={!canAnalyze}
+                >
+                  <Ellipsis />
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="end" className="w-max">
+                  {ANALYSIS_GROUPS.map((group, index) => {
+                    const names = group.names.filter(
+                      (name) => !(PRIMARY_ANALYSES as readonly string[]).includes(name),
+                    );
+                    if (names.length === 0) {
+                      return null;
+                    }
+                    return (
+                      <DropdownMenuGroup key={group.title}>
+                        {index > 0 ? <DropdownMenuSeparator /> : null}
+                        <DropdownMenuLabel>{group.title}</DropdownMenuLabel>
+                        {names.map((name) => (
+                          <DropdownMenuItem
+                            key={name}
+                            className="whitespace-nowrap"
+                            onClick={() => openAnalysis(name)}
+                          >
+                            <AnalysisIcon name={name} />
+                            {name}
+                          </DropdownMenuItem>
+                        ))}
+                      </DropdownMenuGroup>
+                    );
+                  })}
+                </DropdownMenuContent>
+              </DropdownMenu>
+            </div>
           </div>
           {message != null ? (
             <div className="text-destructive px-3 pb-2 text-sm">{message}</div>
           ) : null}
           <div
             ref={host}
-            className="min-h-0 flex-1"
+            className="relative min-h-0 flex-1"
             onContextMenu={(event) => event.preventDefault()}
           >
             {theme != null && size.width > 0 && size.height > 0 ? (
               <DataEditor
+                ref={gridRef}
                 width={size.width}
                 height={size.height}
                 columns={columns}
                 rows={rows.length}
+                rowHeight={40}
+                headerHeight={40}
                 getCellContent={getCellContent}
                 onCellEdited={onCellEdited}
+                onVisibleRegionChanged={(next) => {
+                  setRegion((current) =>
+                    current.y === next.y && current.height === next.height
+                      ? current
+                      : { y: next.y, height: next.height },
+                  );
+                }}
                 onCellContextMenu={([, rowIndex], event) => {
                   event.preventDefault();
                   const source = order[rowIndex];
                   const row = source == null ? undefined : rows[source];
-                  const box = host.current?.getBoundingClientRect();
-                  if (row == null || box == null) {
+                  if (row == null) {
                     return;
                   }
-                  setSessionMenu({
-                    sessionId: row.session_id,
-                    x: box.left + event.bounds.x + event.localEventX,
-                    y: box.top + event.bounds.y + event.localEventY,
-                  });
+                  const point = sessionMenuPoint(event.bounds, event.localEventX, event.localEventY);
+                  setSessionMenu({ sessionId: row.session_id, x: point.x, y: point.y });
                 }}
                 onHeaderClicked={(col) => {
                   const key = COLUMN_SORT[col];
@@ -823,6 +1009,17 @@ export default function App() {
                 smoothScrollY
               />
             ) : null}
+            <UseColumnChecks
+              gridRef={gridRef}
+              hostRef={host}
+              sessionIds={displayIds}
+              region={region}
+              ready={theme != null && size.width > 0 && size.height > 0}
+              selected={selectedSet}
+              header={selectionHeader}
+              onRow={onRowCheck}
+              onHeader={onHeaderCheck}
+            />
             {sessionMenu != null ? (
               <SessionContextMenu
                 sessionId={sessionMenu.sessionId}
