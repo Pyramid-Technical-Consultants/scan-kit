@@ -434,20 +434,19 @@ fn hanning(n: usize) -> Vec<f32> {
 /// Real FFT power `|rfft|^2`. Length may be any n ≥ 1.
 fn rfft_power(segment: &mut [f32]) -> Vec<f32> {
     let n = segment.len();
-    let bins = n / 2 + 1;
-    let mut power = vec![0.0f32; bins];
-    for k in 0..bins {
-        let mut re = 0.0f32;
-        let mut im = 0.0f32;
-        let angle = -2.0 * std::f32::consts::PI * k as f32 / n as f32;
-        for (t, sample) in segment.iter().copied().enumerate() {
-            let phase = angle * t as f32;
-            re += sample * phase.cos();
-            im += sample * phase.sin();
-        }
-        power[k] = re * re + im * im;
-    }
-    power
+    (0..n / 2 + 1)
+        .map(|k| {
+            let mut re = 0.0f32;
+            let mut im = 0.0f32;
+            let angle = -2.0 * std::f32::consts::PI * k as f32 / n as f32;
+            for (t, sample) in segment.iter().copied().enumerate() {
+                let phase = angle * t as f32;
+                re += sample * phase.cos();
+                im += sample * phase.sin();
+            }
+            re * re + im * im
+        })
+        .collect()
 }
 
 /// Single exponential `a * exp(-t / tau)` fit on positive samples. Returns `(a, tau)`.
@@ -840,17 +839,18 @@ fn solve3(mut a: [[f64; 3]; 3], mut b: [f64; 3]) -> Option<[f64; 3]> {
         a.swap(col, pivot);
         b.swap(col, pivot);
         let div = a[col][col];
-        for j in col..3 {
-            a[col][j] /= div;
+        for value in &mut a[col][col..] {
+            *value /= div;
         }
         b[col] /= div;
+        let pivot_row = a[col];
         for row in 0..3 {
             if row == col {
                 continue;
             }
             let factor = a[row][col];
-            for j in col..3 {
-                a[row][j] -= factor * a[col][j];
+            for (value, pivot) in a[row][col..].iter_mut().zip(&pivot_row[col..]) {
+                *value -= factor * pivot;
             }
             b[row] -= factor * b[col];
         }
@@ -892,8 +892,8 @@ pub fn hv_step_window(time: &[f32], current: &[f32]) -> Option<(f32, f32)> {
     let base = median_finite(&current[..n])?;
     let mut peak_i = 0usize;
     let mut peak = f32::MIN;
-    for i in 0..n {
-        let delta = current[i] - base;
+    for (i, value) in current[..n].iter().enumerate() {
+        let delta = value - base;
         if delta.is_finite() && delta > peak {
             peak = delta;
             peak_i = i;
@@ -1352,7 +1352,7 @@ mod tests {
             [1.0, 1.0, 1.0],
             [3, 3, 1],
         );
-        let center = grid[1 + 3 * 1];
+        let center = grid[1 + 3];
         assert!(center > grid[0]);
         let image = mip_xy(&grid, [3, 3, 1]);
         assert_eq!(image[1 + 3], center);
@@ -1406,7 +1406,7 @@ mod tests {
         assert!(window.0 < 1.0 && window.1 > 1.0);
 
         let mut pulse = vec![1.0f32; 20];
-        pulse.extend(std::iter::repeat(0.0).take(20));
+        pulse.extend(std::iter::repeat_n(0.0, 20));
         assert_eq!(beam_off_edges(&pulse), vec![20]);
         let mut drifted: Vec<f32> = (0..800).map(|i| i as f32 * 0.02).collect();
         for sample in &mut drifted[500..530] {

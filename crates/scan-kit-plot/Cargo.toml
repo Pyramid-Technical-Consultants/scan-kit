@@ -10,6 +10,9 @@ description = "Scan Kit plot renderer, native offscreen and wasm canvas"
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+[lints]
+workspace = true
+
 [dependencies]
 fontdue = "0.9"
 naga = "27"

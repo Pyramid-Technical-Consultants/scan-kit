@@ -3,7 +3,7 @@
 
 use wasm_bindgen::prelude::*;
 
-use crate::render::{Plot, PlotGpu, PlotInput};
+use crate::render::{Plot, PlotGpu, PlotInput, MAX_SIDE, MIN_SIDE};
 
 #[wasm_bindgen]
 pub struct WebPlot {
@@ -15,11 +15,20 @@ pub struct WebPlot {
 }
 
 #[wasm_bindgen]
+#[derive(Clone, Copy)]
+pub struct Hover {
+    pub x: f32,
+    pub y: f32,
+    /// Series index across all panels in scene order, or `undefined` over empty plot area.
+    pub series: Option<u32>,
+}
+
+#[wasm_bindgen]
 impl WebPlot {
     /// WebGPU when the webview has it, WebGL2 otherwise.
     pub async fn create(canvas: web_sys::HtmlCanvasElement) -> Result<WebPlot, JsValue> {
-        let width = canvas.width().clamp(16, 8192);
-        let height = canvas.height().clamp(16, 8192);
+        let width = canvas.width().clamp(MIN_SIDE, MAX_SIDE);
+        let height = canvas.height().clamp(MIN_SIDE, MAX_SIDE);
         let instance = wgpu::util::new_instance_with_webgpu_detection(&wgpu::InstanceDescriptor {
             backends: wgpu::Backends::BROWSER_WEBGPU | wgpu::Backends::GL,
             ..Default::default()
@@ -95,9 +104,14 @@ impl WebPlot {
 
     /// Canvas backing size in device pixels.
     pub fn resize(&mut self, width: u32, height: u32) {
-        let limit = self.gpu.device.limits().max_texture_dimension_2d.min(8192);
-        let width = width.clamp(16, limit);
-        let height = height.clamp(16, limit);
+        let limit = self
+            .gpu
+            .device
+            .limits()
+            .max_texture_dimension_2d
+            .min(MAX_SIDE);
+        let width = width.clamp(MIN_SIDE, limit);
+        let height = height.clamp(MIN_SIDE, limit);
         if width != self.config.width || height != self.config.height {
             self.config.width = width;
             self.config.height = height;
@@ -133,18 +147,10 @@ impl WebPlot {
         });
     }
 
-    /// `[hit, data x, data y, series]`. `series` is -1 when no mark is under the pixel.
-    pub fn hover(&self, x: f32, y: f32) -> Vec<f64> {
-        let Some(plot) = self.plot.as_ref() else {
-            return vec![0.0, 0.0, 0.0, -1.0];
-        };
-        let (hit, data_x, data_y, series) = plot.hover(x, y);
-        vec![
-            f64::from(u8::from(hit)),
-            f64::from(data_x),
-            f64::from(data_y),
-            series.map_or(-1.0, f64::from),
-        ]
+    /// Data coordinates under a canvas pixel, or `undefined` outside every plot area.
+    pub fn hover(&self, x: f32, y: f32) -> Option<Hover> {
+        let (hit, x, y, series) = self.plot.as_ref()?.hover(x, y);
+        hit.then_some(Hover { x, y, series })
     }
 
     pub fn render(&mut self) -> Result<(), JsValue> {

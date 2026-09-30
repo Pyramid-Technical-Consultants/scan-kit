@@ -2,6 +2,15 @@
 //!
 //! Mark positions stay in data space (`z = 0`). The vertex shader multiplies by
 //! `clip_from_data`. Pan and zoom rewrite that matrix. Stroke width stays in pixels.
+//!
+//! Each panel paints solid quads, heatmaps, grid and spines, lines, points, then
+//! labels. [`Plot::record`] (GPU), [`Plot::paint_cpu`] (no adapter), and
+//! [`Plot::pick`] (hover, reverse order) must keep that order.
+//!
+//! A mark kind's byte layout lives in its `*_STRIDE`, `*_ATTRS`, `encode_*`,
+//! `decode_*`, and the matching WGSL `vs_*` inputs. Change them together.
+//! Draws stay within WebGL2: no base instance (bind a buffer slice instead) and
+//! one color target.
 
 use std::num::NonZeroU64;
 
@@ -291,6 +300,9 @@ pub struct PlotFrame {
     pub series: Option<u32>,
 }
 
+// `id` on a mark is 0 for the grid and spines. Otherwise it is the series index
+// across all panels, in scene order, plus 1. Hover reports `id - 1`.
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct LineRec {
     pub a: [f32; 3],
@@ -312,9 +324,11 @@ pub(crate) struct PointRec {
 pub(crate) struct QuadRec {
     pub a: [f32; 2],
     pub b: [f32; 2],
+    /// 1 samples `heatmap`, 0 fills with `color`.
     pub heat: f32,
     pub color: [f32; 4],
     pub id: u32,
+    /// Index into `Marks::heatmaps`.
     pub heatmap: Option<usize>,
 }
 
@@ -376,10 +390,14 @@ struct Offscreen {
     view: wgpu::TextureView,
 }
 
-const LINE_STRIDE: u64 = 64;
-const POINT_STRIDE: u64 = 48;
-const QUAD_STRIDE: u64 = 64;
+pub(crate) const LINE_STRIDE: u64 = 64;
+pub(crate) const POINT_STRIDE: u64 = 48;
+pub(crate) const QUAD_STRIDE: u64 = 64;
 const GLYPH_STRIDE: u64 = 64;
+
+/// Canvas and offscreen sides are clamped to this range in device pixels.
+pub(crate) const MIN_SIDE: u32 = 16;
+pub(crate) const MAX_SIDE: u32 = 8192;
 
 pub struct Plot {
     /// Panel titles, ranges, and category labels. Series live in `marks`.
@@ -486,8 +504,8 @@ impl Plot {
     /// Resize, reset, pan, or zoom. `x`, `y`, `dx`, and `dy` are framebuffer pixels
     /// at `width` by `height`.
     pub fn apply(&mut self, width: u32, height: u32, input: &PlotInput) {
-        let width = width.clamp(16, 8192);
-        let height = height.clamp(16, 8192);
+        let width = width.clamp(MIN_SIDE, MAX_SIDE);
+        let height = height.clamp(MIN_SIDE, MAX_SIDE);
         self.size = (width, height);
         if input.reset {
             self.cameras.clone_from(&self.home);
@@ -1175,6 +1193,22 @@ fn pipeline(
 }
 
 // Byte strides keep the per-mark `id` word. Only CPU picking reads it.
+const _: () = assert!(fits(&LINE_ATTRS, LINE_STRIDE));
+const _: () = assert!(fits(&POINT_ATTRS, POINT_STRIDE));
+const _: () = assert!(fits(&QUAD_ATTRS, QUAD_STRIDE));
+const _: () = assert!(fits(&TEXT_ATTRS, GLYPH_STRIDE));
+
+const fn fits(attrs: &[wgpu::VertexAttribute], stride: u64) -> bool {
+    let mut index = 0;
+    while index < attrs.len() {
+        if attrs[index].offset + attrs[index].format.size() > stride {
+            return false;
+        }
+        index += 1;
+    }
+    true
+}
+
 const LINE_ATTRS: [wgpu::VertexAttribute; 4] = wgpu::vertex_attr_array![
     0 => Float32x4,
     1 => Float32x4,
@@ -1793,11 +1827,9 @@ fn blend(
         return;
     }
     if let Some(plot) = plot {
-        if (x as f32) < plot.x - 1.0
-            || (y as f32) < plot.y - 1.0
-            || x as f32 >= plot.x + plot.w + 1.0
-            || y as f32 >= plot.y + plot.h + 1.0
-        {
+        let (sx, sy, sw, sh) = scissor(plot, width, height);
+        let (x, y) = (x as u32, y as u32);
+        if x < sx || y < sy || x >= sx + sw || y >= sy + sh {
             return;
         }
     }
@@ -1837,8 +1869,11 @@ fn colormap(t: f32) -> [f32; 3] {
     ]
 }
 
+// Instance word layouts. Words past the `*_ATTRS` tables (`id`, the heatmap
+// index, padding) never reach the shader. Only the payload and hover read them.
+
 pub(crate) fn encode_lines(lines: &[LineRec]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(lines.len() * 64);
+    let mut out = Vec::with_capacity(lines.len() * LINE_STRIDE as usize);
     for line in lines {
         push4(&mut out, [line.a[0], line.a[1], line.a[2], 0.0]);
         push4(&mut out, [line.b[0], line.b[1], line.b[2], 0.0]);
@@ -1848,11 +1883,26 @@ pub(crate) fn encode_lines(lines: &[LineRec]) -> Vec<u8> {
         push_u32(&mut out, 0);
         push_u32(&mut out, 0);
     }
+    debug_assert_eq!(out.len(), lines.len() * LINE_STRIDE as usize);
     out
 }
 
+pub(crate) fn decode_lines(bytes: &[u8]) -> Vec<LineRec> {
+    let (chunks, _) = bytes.as_chunks::<{ LINE_STRIDE as usize }>();
+    chunks
+        .iter()
+        .map(|chunk| LineRec {
+            a: [f32_at(chunk, 0), f32_at(chunk, 1), f32_at(chunk, 2)],
+            b: [f32_at(chunk, 4), f32_at(chunk, 5), f32_at(chunk, 6)],
+            color: f32x4_at(chunk, 8),
+            thickness: f32_at(chunk, 12),
+            id: u32_at(chunk, 13),
+        })
+        .collect()
+}
+
 pub(crate) fn encode_points(points: &[PointRec]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(points.len() * 48);
+    let mut out = Vec::with_capacity(points.len() * POINT_STRIDE as usize);
     for point in points {
         push4(&mut out, [point.p[0], point.p[1], point.p[2], point.radius]);
         push4(&mut out, point.color);
@@ -1861,25 +1911,68 @@ pub(crate) fn encode_points(points: &[PointRec]) -> Vec<u8> {
         push_u32(&mut out, 0);
         push_u32(&mut out, 0);
     }
+    debug_assert_eq!(out.len(), points.len() * POINT_STRIDE as usize);
     out
 }
 
+pub(crate) fn decode_points(bytes: &[u8]) -> Vec<PointRec> {
+    let (chunks, _) = bytes.as_chunks::<{ POINT_STRIDE as usize }>();
+    chunks
+        .iter()
+        .map(|chunk| PointRec {
+            p: [f32_at(chunk, 0), f32_at(chunk, 1), f32_at(chunk, 2)],
+            radius: f32_at(chunk, 3),
+            color: f32x4_at(chunk, 4),
+            id: u32_at(chunk, 8),
+        })
+        .collect()
+}
+
 pub(crate) fn encode_quads(quads: &[QuadRec]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(quads.len() * 64);
+    let mut out = Vec::with_capacity(quads.len() * QUAD_STRIDE as usize);
     for quad in quads {
         push4(&mut out, [quad.a[0], quad.a[1], quad.heat, 0.0]);
         push4(&mut out, [quad.b[0], quad.b[1], 0.0, 0.0]);
         push4(&mut out, quad.color);
         push_u32(&mut out, quad.id);
+        // 0 is a solid quad, so the heatmap index is stored plus 1.
         push_u32(&mut out, quad.heatmap.map_or(0, |index| index as u32 + 1));
         push_u32(&mut out, 0);
         push_u32(&mut out, 0);
     }
+    debug_assert_eq!(out.len(), quads.len() * QUAD_STRIDE as usize);
     out
 }
 
+pub(crate) fn decode_quads(bytes: &[u8]) -> Vec<QuadRec> {
+    let (chunks, _) = bytes.as_chunks::<{ QUAD_STRIDE as usize }>();
+    chunks
+        .iter()
+        .map(|chunk| QuadRec {
+            a: [f32_at(chunk, 0), f32_at(chunk, 1)],
+            heat: f32_at(chunk, 2),
+            b: [f32_at(chunk, 4), f32_at(chunk, 5)],
+            color: f32x4_at(chunk, 8),
+            id: u32_at(chunk, 12),
+            heatmap: u32_at(chunk, 13).checked_sub(1).map(|index| index as usize),
+        })
+        .collect()
+}
+
+fn f32_at(chunk: &[u8], word: usize) -> f32 {
+    f32::from_le_bytes(chunk[word * 4..word * 4 + 4].try_into().unwrap())
+}
+
+fn f32x4_at(chunk: &[u8], word: usize) -> [f32; 4] {
+    std::array::from_fn(|offset| f32_at(chunk, word + offset))
+}
+
+fn u32_at(chunk: &[u8], word: usize) -> u32 {
+    u32::from_le_bytes(chunk[word * 4..word * 4 + 4].try_into().unwrap())
+}
+
 fn encode_glyphs(glyphs: &[GlyphRec]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(glyphs.len() * 64);
+    let mut out = Vec::with_capacity(glyphs.len() * GLYPH_STRIDE as usize);
     for glyph in glyphs {
         push4(&mut out, glyph.anchor);
         push4(
@@ -2231,6 +2324,68 @@ mod tests {
             near(&frame.rgba, 180, 140, sample, |pixel| pixel[0] > 150),
             "sample pixel {sample:?}"
         );
+    }
+
+    #[test]
+    fn gpu_and_cpu_pictures_agree() {
+        let Ok(gpu) = crate::native_gpu() else {
+            return;
+        };
+        let mut scene = line_scene();
+        scene.panels[0].series.extend([
+            Series::Points {
+                xs: vec![2.0, 7.0],
+                ys: vec![3.0, 8.0],
+                color: [0.0, 0.0, 1.0, 1.0],
+                radius: 5.0,
+            },
+            Series::Bars {
+                edges: vec![1.0, 3.0, 5.0],
+                counts: vec![2.0, 4.0],
+                color: [0.0, 0.8, 0.0, 0.8],
+            },
+        ]);
+        scene.panels.push(Panel {
+            title: "heat".into(),
+            xmin: 0.0,
+            xmax: 1.0,
+            ymin: 0.0,
+            ymax: 1.0,
+            series: vec![Series::Heatmap {
+                values: (0..64).map(|v| v as f32).collect(),
+                cols: 8,
+                rows: 8,
+            }],
+            x_labels: Vec::new(),
+        });
+        let (width, height) = (320, 160);
+        let mut plot = Plot::new(&scene, [0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0, 1.0]);
+        plot.apply(width, height, &PlotInput::default());
+        let on_gpu = plot.paint_offscreen(gpu, width, height).unwrap();
+        let layout = plot.layout(width, height);
+        let on_cpu = plot.paint_cpu(width, height, &layout);
+        // Edges rasterize up to a pixel apart, so a pixel may match any 3x3 neighbor.
+        let pixel = |frame: &[u8], x: i64, y: i64| {
+            let x = x.clamp(0, i64::from(width) - 1) as usize;
+            let y = y.clamp(0, i64::from(height) - 1) as usize;
+            let index = (y * width as usize + x) * 4;
+            [frame[index], frame[index + 1], frame[index + 2]]
+        };
+        let mut differ = 0;
+        for y in 0..i64::from(height) {
+            for x in 0..i64::from(width) {
+                let want = pixel(&on_gpu, x, y);
+                let matched = (-1..=1).any(|dy| {
+                    (-1..=1).any(|dx| {
+                        let got = pixel(&on_cpu, x + dx, y + dy);
+                        want.iter().zip(got).all(|(a, b)| a.abs_diff(b) <= 96)
+                    })
+                });
+                differ += usize::from(!matched);
+            }
+        }
+        let share = differ as f32 / (width * height) as f32;
+        assert!(share < 0.001, "{:.2}% of pixels differ", share * 100.0);
     }
 
     #[test]

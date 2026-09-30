@@ -1,7 +1,8 @@
-//! One analysis frame. The scene comes from `scan-kit-io`. This module paints it.
+//! Analysis views. The scene comes from `scan-kit-io` and is colored here.
 //!
-//! The desktop keeps one plot and asks for raw frames. `run_view` still returns
-//! the base64 frame that MCP and the view tests use.
+//! `open_plot` packs it for the desktop, which draws it in the webview.
+//! `run_view` renders the same plot offscreen and returns the base64 frame that
+//! MCP and the view tests use.
 
 use std::path::Path;
 
@@ -300,9 +301,7 @@ mod tests {
             &[[0.8, 0.2, 0.2, 1.0]],
         )
         .unwrap();
-        let json_len = u32::from_le_bytes(opened[0..4].try_into().unwrap()) as usize;
-        let header: scan_kit_plot::PlotHeader =
-            serde_json::from_slice(&opened[4..4 + json_len]).unwrap();
+        let header = scan_kit_plot::plot_header(&opened).unwrap();
         assert_eq!(header.title, "Dose Accumulation");
         assert!(header.panels.iter().all(|panel| panel.series.is_empty()));
         let mut plot = Plot::from_payload(&opened).unwrap();

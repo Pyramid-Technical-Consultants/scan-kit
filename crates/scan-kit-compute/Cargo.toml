@@ -7,6 +7,9 @@ publish.workspace = true
 authors.workspace = true
 description = "Scan Kit wgpu compute"
 
+[lints]
+workspace = true
+
 [dependencies]
 naga = "27"
 scan-kit-core = { workspace = true }

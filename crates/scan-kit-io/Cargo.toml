@@ -7,6 +7,9 @@ publish.workspace = true
 authors.workspace = true
 description = "Scan Kit session discovery, sqlite store, and columnar loads"
 
+[lints]
+workspace = true
+
 [dependencies]
 scan-kit-core = { workspace = true }
 serde_json = { workspace = true }

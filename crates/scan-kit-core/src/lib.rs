@@ -272,13 +272,13 @@ impl std::error::Error for InvokeError {}
 
 /// Run a catalog tool. Version, health, and about take no arguments.
 pub fn invoke(name: &str, input: &Value) -> Result<Value, InvokeError> {
-    match name {
-        "scan_kit_version" | "scan_kit_health" | "scan_kit_about" => {
-            if !input.is_null() && input.as_object().is_none_or(|object| !object.is_empty()) {
-                return Err(InvokeError::UnexpectedInput);
-            }
-        }
-        _ => {}
+    if matches!(
+        name,
+        "scan_kit_version" | "scan_kit_health" | "scan_kit_about"
+    ) && !input.is_null()
+        && input.as_object().is_none_or(|object| !object.is_empty())
+    {
+        return Err(InvokeError::UnexpectedInput);
     }
     let value = match name {
         "scan_kit_version" => serde_json::to_value(scan_kit_version()).expect("version report"),

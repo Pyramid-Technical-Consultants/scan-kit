@@ -7,6 +7,9 @@ publish.workspace = true
 authors.workspace = true
 description = "Scan Kit domain operations and the MCP tool catalog"
 
+[lints]
+workspace = true
+
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }

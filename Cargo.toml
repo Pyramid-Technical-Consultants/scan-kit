@@ -24,6 +24,12 @@ license = "MIT"
 publish = false
 authors = ["Pyramid Technical Consultants, Inc. <support@ptcusa.com>"]
 
+# Numeric kernels index several parallel arrays and take many scalar inputs.
+[workspace.lints.clippy]
+needless_range_loop = "allow"
+too_many_arguments = "allow"
+type_complexity = "allow"
+
 [workspace.dependencies]
 scan-kit-core = { path = "crates/scan-kit-core" }
 scan-kit-io = { path = "crates/scan-kit-io" }

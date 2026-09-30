@@ -303,7 +303,8 @@ export function AnalysisView({
 
   const readHover = (x: number, y: number) => {
     const hit = plotter.current?.hover(x, y);
-    showReadout(hit == null || hit[0] === 0 ? null : { x: hit[1], y: hit[2], series: hit[3] < 0 ? null : hit[3] });
+    showReadout(hit == null ? null : { x: hit.x, y: hit.y, series: hit.series ?? null });
+    hit?.free();
   };
 
   const fitCanvas = () => {

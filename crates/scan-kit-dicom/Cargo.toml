@@ -7,6 +7,9 @@ publish.workspace = true
 authors.workspace = true
 description = "Scan Kit DICOM study index, clinical goals, and report"
 
+[lints]
+workspace = true
+
 [dependencies]
 scan-kit-core = { workspace = true }
 serde = { workspace = true }

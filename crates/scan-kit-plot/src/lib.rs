@@ -8,7 +8,7 @@ mod text;
 #[cfg(target_arch = "wasm32")]
 mod web;
 
-pub use payload::{encode_plot, PlotHeader};
+pub use payload::{encode_plot, plot_header, PlotHeader};
 #[cfg(not(target_arch = "wasm32"))]
 pub use render::render_plot;
 pub use render::{compile_plot_shader, plot_shader_source, Plot, PlotFrame, PlotInput};
@@ -36,16 +36,9 @@ pub async fn request_device() -> Result<(wgpu::Device, wgpu::Queue), GpuError> {
     let adapter = instance
         .request_adapter(&wgpu::RequestAdapterOptions::default())
         .await
-        .map_err(|err| {
-            let text = err.to_string().to_lowercase();
-            if text.contains("not found")
-                || text.contains("no adapter")
-                || text.contains("suitable")
-            {
-                GpuError::NoAdapter
-            } else {
-                GpuError::Message(err.to_string())
-            }
+        .map_err(|err| match err {
+            wgpu::RequestAdapterError::NotFound { .. } => GpuError::NoAdapter,
+            other => GpuError::Message(other.to_string()),
         })?;
     adapter
         .request_device(&wgpu::DeviceDescriptor::default())

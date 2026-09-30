@@ -49,6 +49,28 @@ jobs:
           PYTHONPATH: ${{ github.workspace }}
         run: pytest
 
+  rust:
+    runs-on: ubuntu-22.04
+    name: Rust format, lint, and test
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      # The Tauri shell needs WebKitGTK to build on Linux. Its commands are thin
+      # wrappers over the other crates, which carry the tests.
+      - name: Lint
+        run: cargo clippy --workspace --exclude scan-kit-desktop --all-targets --locked -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace --exclude scan-kit-desktop --locked
+
   plot-wasm:
     runs-on: ubuntu-22.04
     name: Plot wasm and desktop frontend

@@ -9,14 +9,11 @@ use scan_kit_core::{Control, DataTable, Panel, PlotScene};
 use serde::{Deserialize, Serialize};
 
 use crate::render::{
-    build_marks, encode_lines, encode_points, encode_quads, header_panels, LineRec, Marks,
-    PanelBatch, Plot, PointRec, QuadRec,
+    build_marks, decode_lines, decode_points, decode_quads, encode_lines, encode_points,
+    encode_quads, header_panels, Marks, PanelBatch, Plot, LINE_STRIDE, POINT_STRIDE, QUAD_STRIDE,
 };
 
-const LINE_BYTES: usize = 64;
-const POINT_BYTES: usize = 48;
-const QUAD_BYTES: usize = 64;
-
+/// `apps/desktop/src/plot-header.ts` mirrors the public fields. Rename both together.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PlotHeader {
     pub title: String,
@@ -61,9 +58,9 @@ pub fn encode_plot(
     let json = serde_json::to_vec(&header).map_err(|err| err.to_string())?;
     let mut out = Vec::with_capacity(
         4 + json.len()
-            + marks.lines.len() * LINE_BYTES
-            + marks.points.len() * POINT_BYTES
-            + marks.quads.len() * QUAD_BYTES
+            + marks.lines.len() * LINE_STRIDE as usize
+            + marks.points.len() * POINT_STRIDE as usize
+            + marks.quads.len() * QUAD_STRIDE as usize
             + marks.heatmaps.iter().map(Vec::len).sum::<usize>(),
     );
     out.extend_from_slice(&(json.len() as u32).to_le_bytes());
@@ -77,65 +74,18 @@ pub fn encode_plot(
     Ok(out)
 }
 
+pub fn plot_header(bytes: &[u8]) -> Result<PlotHeader, String> {
+    decode_plot(bytes).map(|(header, _)| header)
+}
+
 pub(crate) fn decode_plot(bytes: &[u8]) -> Result<(PlotHeader, Marks), String> {
     let mut reader = Reader { bytes, at: 0 };
     let json_len = u32::from_le_bytes(reader.take(4)?.try_into().unwrap()) as usize;
     let header: PlotHeader =
         serde_json::from_slice(reader.take(json_len)?).map_err(|err| err.to_string())?;
-    let lines = reader
-        .take(header.lines as usize * LINE_BYTES)?
-        .as_chunks::<LINE_BYTES>()
-        .0
-        .iter()
-        .map(|chunk| LineRec {
-            a: [f32_at(chunk, 0), f32_at(chunk, 1), f32_at(chunk, 2)],
-            b: [f32_at(chunk, 4), f32_at(chunk, 5), f32_at(chunk, 6)],
-            color: [
-                f32_at(chunk, 8),
-                f32_at(chunk, 9),
-                f32_at(chunk, 10),
-                f32_at(chunk, 11),
-            ],
-            thickness: f32_at(chunk, 12),
-            id: u32_at(chunk, 13),
-        })
-        .collect();
-    let points = reader
-        .take(header.points as usize * POINT_BYTES)?
-        .as_chunks::<POINT_BYTES>()
-        .0
-        .iter()
-        .map(|chunk| PointRec {
-            p: [f32_at(chunk, 0), f32_at(chunk, 1), f32_at(chunk, 2)],
-            radius: f32_at(chunk, 3),
-            color: [
-                f32_at(chunk, 4),
-                f32_at(chunk, 5),
-                f32_at(chunk, 6),
-                f32_at(chunk, 7),
-            ],
-            id: u32_at(chunk, 8),
-        })
-        .collect();
-    let quads = reader
-        .take(header.quads as usize * QUAD_BYTES)?
-        .as_chunks::<QUAD_BYTES>()
-        .0
-        .iter()
-        .map(|chunk| QuadRec {
-            a: [f32_at(chunk, 0), f32_at(chunk, 1)],
-            heat: f32_at(chunk, 2),
-            b: [f32_at(chunk, 4), f32_at(chunk, 5)],
-            color: [
-                f32_at(chunk, 8),
-                f32_at(chunk, 9),
-                f32_at(chunk, 10),
-                f32_at(chunk, 11),
-            ],
-            id: u32_at(chunk, 12),
-            heatmap: u32_at(chunk, 13).checked_sub(1).map(|index| index as usize),
-        })
-        .collect();
+    let lines = decode_lines(reader.take(header.lines as usize * LINE_STRIDE as usize)?);
+    let points = decode_points(reader.take(header.points as usize * POINT_STRIDE as usize)?);
+    let quads = decode_quads(reader.take(header.quads as usize * QUAD_STRIDE as usize)?);
     let heatmaps = header
         .heatmap_size
         .iter()
@@ -188,15 +138,6 @@ impl<'a> Reader<'a> {
         Ok(out)
     }
 }
-
-fn f32_at(chunk: &[u8], word: usize) -> f32 {
-    f32::from_le_bytes(chunk[word * 4..word * 4 + 4].try_into().unwrap())
-}
-
-fn u32_at(chunk: &[u8], word: usize) -> u32 {
-    u32::from_le_bytes(chunk[word * 4..word * 4 + 4].try_into().unwrap())
-}
-
 #[cfg(test)]
 mod tests {
     use scan_kit_core::Series;

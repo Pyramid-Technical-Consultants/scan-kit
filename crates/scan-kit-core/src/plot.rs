@@ -166,7 +166,15 @@ impl Camera {
         );
     }
 
-    pub fn zoom_at_pixel(&mut self, px: f32, py: f32, plot: PlotRect, width: f32, height: f32, factor: f32) {
+    pub fn zoom_at_pixel(
+        &mut self,
+        px: f32,
+        py: f32,
+        plot: PlotRect,
+        width: f32,
+        height: f32,
+        factor: f32,
+    ) {
         let [x, y] = self.data_at(px, py, plot, width, height);
         self.zoom_at(x, y, factor);
     }

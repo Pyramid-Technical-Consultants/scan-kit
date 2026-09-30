@@ -1932,7 +1932,7 @@ mod tests {
         assert!(scene
             .panels
             .iter()
-            .any(|panel| panel.title.contains("energy")));
+            .any(|panel| panel.title.contains("No finite values")));
         let _ = std::fs::remove_dir_all(&root);
     }
 }
