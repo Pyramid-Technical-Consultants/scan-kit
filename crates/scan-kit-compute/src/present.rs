@@ -144,7 +144,8 @@ fn apply_palette(scene: &mut scan_kit_core::PlotScene, palette: &[[f32; 4]]) {
                 Series::Polyline { color: slot, .. }
                 | Series::Points { color: slot, .. }
                 | Series::Bars { color: slot, .. }
-                | Series::Rects { color: slot, .. } => {
+                | Series::Rects { color: slot, .. }
+                | Series::Triangles { color: slot, .. } => {
                     let alpha = slot[3];
                     // Alpha 0 keeps the previous series color, so a mean curve and its
                     // trend stay with that session instead of taking the next chart color.

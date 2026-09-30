@@ -36,6 +36,12 @@ pub enum Series {
         h: Vec<f32>,
         color: [f32; 4],
     },
+    /// Filled triangles in data coordinates. `xs` and `ys` are groups of three corners.
+    Triangles {
+        xs: Vec<f32>,
+        ys: Vec<f32>,
+        color: [f32; 4],
+    },
     /// A polyline the shell palette leaves alone. Reference lines use this.
     Guide {
         xs: Vec<f32>,
@@ -49,6 +55,8 @@ pub enum Series {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Panel {
     pub title: String,
+    /// Quantity drawn up the left side, including units when the series has them.
+    pub y_label: String,
     pub xmin: f32,
     pub xmax: f32,
     pub ymin: f32,

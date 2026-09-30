@@ -2,7 +2,7 @@
 
 use std::sync::OnceLock;
 
-const PX: f32 = 18.0;
+const PX: f32 = 9.0;
 const ATLAS: u32 = 256;
 const FONT: &[u8] = include_bytes!("../assets/SourceSans3-Regular.ttf");
 

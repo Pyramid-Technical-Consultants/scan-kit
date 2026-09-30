@@ -151,6 +151,7 @@ mod tests {
             panels: vec![
                 Panel {
                     title: "a".into(),
+                    y_label: String::new(),
                     xmin: 0.0,
                     xmax: 4.0,
                     ymin: 0.0,
@@ -178,6 +179,7 @@ mod tests {
                 },
                 Panel {
                     title: String::new(),
+                    y_label: String::new(),
                     xmin: 0.0,
                     xmax: 1.0,
                     ymin: 0.0,

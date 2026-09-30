@@ -3,9 +3,9 @@
 //! Mark positions stay in data space (`z = 0`). The vertex shader multiplies by
 //! `clip_from_data`. Pan and zoom rewrite that matrix. Stroke width stays in pixels.
 //!
-//! Each panel paints solid quads, heatmaps, grid and spines, lines, points, then
-//! labels. [`Plot::record`] (GPU), [`Plot::paint_cpu`] (no adapter), and
-//! [`Plot::pick`] (hover, reverse order) must keep that order.
+//! Each panel paints the grid, solid quads and heatmaps, lines, points, the
+//! 1px bound, then labels. [`Plot::record`] (GPU), [`Plot::paint_cpu`] (no
+//! adapter), and [`Plot::pick`] (hover, reverse order) must keep that order.
 //!
 //! A mark kind's byte layout lives in its `*_STRIDE`, `*_ATTRS`, `encode_*`,
 //! `decode_*`, and the matching WGSL `vs_*` inputs. Change them together.
@@ -186,6 +186,30 @@ fn vs_quad(
     @location(1) b: vec4<f32>,
     @location(2) color: vec4<f32>,
 ) -> QuadOut {
+    // a.w > 0.5 is a triangle (a.xy, b.xy, b.zw). The second three vertices
+    // collapse so the six-vertex quad draw does not blend the fill twice.
+    if (a.w > 0.5) {
+        let c0 = to_px(vec3<f32>(a.xy, 0.0));
+        let c1 = to_px(vec3<f32>(b.xy, 0.0));
+        let c2 = to_px(vec3<f32>(b.zw, 0.0));
+        var p = c0;
+        if (vi < 3u) {
+            if (vi == 1u) { p = c1; }
+            else if (vi == 2u) { p = c2; }
+            let mid = (c0 + c1 + c2) * (1.0 / 3.0);
+            let delta = p - mid;
+            let len = max(length(delta), 0.001);
+            p = p + delta / len * 0.75;
+        }
+        var out: QuadOut;
+        out.clip = px_to_clip(p);
+        out.color = color;
+        out.uv = vec2<f32>(0.0, 0.0);
+        out.bounds0 = vec2<f32>(-1.0e6, -1.0e6);
+        out.bounds1 = vec2<f32>(1.0e6, 1.0e6);
+        out.heat = 0.0;
+        return out;
+    }
     let lo = min(a.xy, b.xy);
     let hi = max(a.xy, b.xy);
     let uv = quad_uv(vi);
@@ -236,7 +260,12 @@ fn vs_text(
         origin = to_px(anchor.xyz);
     }
     let xy = quad_uv(vi);
-    let px = origin + offset_size.xy + xy * offset_size.zw;
+    var local = offset_size.xy + xy * offset_size.zw;
+    // Screen-space labels with anchor.z set run up the axis (90° CCW, y down).
+    if (anchor.w < 0.5 && anchor.z > 0.5) {
+        local = vec2<f32>(local.y, -local.x);
+    }
+    let px = origin + local;
     var out: TextOut;
     out.clip = px_to_clip(px);
     out.color = color;
@@ -324,6 +353,8 @@ pub(crate) struct PointRec {
 pub(crate) struct QuadRec {
     pub a: [f32; 2],
     pub b: [f32; 2],
+    /// Third corner. `None` is an axis-aligned quad from `a` to `b`.
+    pub c: Option<[f32; 2]>,
     /// 1 samples `heatmap`, 0 fills with `color`.
     pub heat: f32,
     pub color: [f32; 4],
@@ -333,6 +364,8 @@ pub(crate) struct QuadRec {
 }
 
 struct GlyphRec {
+    /// `w` > 0.5 anchors in data space. Screen-space text with `z` > 0.5 is rotated
+    /// so the string runs up the y axis.
     anchor: [f32; 4],
     offset: [f32; 2],
     size: [f32; 2],
@@ -603,6 +636,10 @@ impl Plot {
         let covers = |quad: &QuadRec| {
             let p0 = project(matrix, [quad.a[0], quad.a[1], 0.0], w, h);
             let p1 = project(matrix, [quad.b[0], quad.b[1], 0.0], w, h);
+            if let Some(c) = quad.c {
+                let p2 = project(matrix, [c[0], c[1], 0.0], w, h);
+                return point_in_triangle([x, y], p0, p1, p2);
+            }
             x >= p0[0].min(p1[0])
                 && x <= p0[0].max(p1[0])
                 && y >= p0[1].min(p1[1])
@@ -662,11 +699,12 @@ impl Plot {
             .enumerate()
             .map(|(index, cell)| {
                 let camera = self.cameras[index];
-                let left = y_label_width(&camera) + 10.0;
-                let top = if self.panels[index].title.is_empty() {
-                    6.0
-                } else {
+                let panel = &self.panels[index];
+                let left = axis_name_width(&panel.y_label) + y_tick_width(&camera) + 8.0;
+                let top = if shows_title(panel) {
                     font.line_height + 8.0
+                } else {
+                    6.0
                 };
                 let bottom = font.line_height + 10.0;
                 Cell {
@@ -694,6 +732,9 @@ impl Plot {
             let camera = self.cameras[cell.panel];
             let matrix = camera.clip_from_data(cell.plot, width as f32, height as f32);
             let batch = &self.marks.panels[cell.panel];
+            for line in grid_lines(&camera, self.foreground) {
+                stroke_cpu(&mut frame, width, height, &matrix, &line, cell.plot);
+            }
             for quad in &self.marks.quads
                 [batch.quad_start as usize..(batch.quad_start + batch.quad_count) as usize]
             {
@@ -718,9 +759,6 @@ impl Plot {
                     cell.plot,
                 );
             }
-            for line in frame_lines(&camera, self.foreground) {
-                stroke_cpu(&mut frame, width, height, &matrix, &line, cell.plot);
-            }
             for line in &self.marks.lines
                 [batch.line_start as usize..(batch.line_start + batch.line_count) as usize]
             {
@@ -739,6 +777,9 @@ impl Plot {
                     point.color,
                     cell.plot,
                 );
+            }
+            for line in border_lines(&camera, &cell.plot, self.foreground) {
+                stroke_cpu(&mut frame, width, height, &matrix, &line, cell.plot);
             }
             for glyph in labels_for(&self.panels[cell.panel], &camera, cell, self.foreground) {
                 blit_glyph(&mut frame, width, height, &matrix, &glyph);
@@ -824,9 +865,15 @@ impl Plot {
         let layout = self.layout(width, height);
         self.ensure_uploaded(gpu)?;
         self.ensure_uniforms(gpu, layout.len());
-        let frame_lines = layout
+        let frames = layout
             .iter()
-            .map(|cell| frame_lines(&self.cameras[cell.panel], self.foreground))
+            .map(|cell| {
+                let camera = &self.cameras[cell.panel];
+                (
+                    grid_lines(camera, self.foreground),
+                    border_lines(camera, &cell.plot, self.foreground),
+                )
+            })
             .collect::<Vec<_>>();
         let labels = layout
             .iter()
@@ -839,9 +886,9 @@ impl Plot {
                 )
             })
             .collect::<Vec<_>>();
-        let frame_bytes = frame_lines
+        let frame_bytes = frames
             .iter()
-            .flat_map(|lines| encode_lines(lines))
+            .flat_map(|(grid, border)| encode_lines(grid).into_iter().chain(encode_lines(border)))
             .collect::<Vec<_>>();
         let text_bytes = labels
             .iter()
@@ -881,6 +928,14 @@ impl Plot {
                 let batch = &self.marks.panels[cell.panel];
                 let (sx, sy, sw, sh) = scissor(cell.plot, width, height);
                 pass.set_scissor_rect(sx, sy, sw, sh);
+                pass.set_pipeline(&gpu.line_pipeline);
+                pass.set_bind_group(0, &self.uniform_groups[index], &[offset]);
+                let grid_count = frames[index].0.len() as u32;
+                if let (true, Some(buffer)) = (grid_count > 0, self.frame_buf.as_ref()) {
+                    pass.set_vertex_buffer(0, buffer.slice(frame_cursor * LINE_STRIDE..));
+                    pass.draw(0..6, 0..grid_count);
+                }
+                frame_cursor += u64::from(grid_count);
                 pass.set_pipeline(&gpu.quad_pipeline);
                 pass.set_bind_group(0, &self.uniform_groups[index], &[offset]);
                 if batch.quad_count > 0 {
@@ -900,12 +955,6 @@ impl Plot {
                 }
                 pass.set_pipeline(&gpu.line_pipeline);
                 pass.set_bind_group(0, &self.uniform_groups[index], &[offset]);
-                let frame_count = frame_lines[index].len() as u32;
-                if let (true, Some(buffer)) = (frame_count > 0, self.frame_buf.as_ref()) {
-                    pass.set_vertex_buffer(0, buffer.slice(frame_cursor * LINE_STRIDE..));
-                    pass.draw(0..6, 0..frame_count);
-                }
-                frame_cursor += u64::from(frame_count);
                 if batch.line_count > 0 {
                     pass.set_vertex_buffer(
                         0,
@@ -926,6 +975,14 @@ impl Plot {
                     );
                     pass.draw(0..6, 0..batch.point_count);
                 }
+                let border_count = frames[index].1.len() as u32;
+                if let (true, Some(buffer)) = (border_count > 0, self.frame_buf.as_ref()) {
+                    pass.set_pipeline(&gpu.line_pipeline);
+                    pass.set_bind_group(0, &self.uniform_groups[index], &[offset]);
+                    pass.set_vertex_buffer(0, buffer.slice(frame_cursor * LINE_STRIDE..));
+                    pass.draw(0..6, 0..border_count);
+                }
+                frame_cursor += u64::from(border_count);
                 pass.set_scissor_rect(0, 0, width, height);
                 let text_count = labels[index].len() as u32;
                 if let (true, Some(buffer)) = (text_count > 0, self.text_buf.as_ref()) {
@@ -1019,6 +1076,7 @@ pub(crate) fn header_panels(panels: &[Panel]) -> Vec<Panel> {
         .iter()
         .map(|panel| Panel {
             title: panel.title.clone(),
+            y_label: panel.y_label.clone(),
             xmin: panel.xmin,
             xmax: panel.xmax,
             ymin: panel.ymin,
@@ -1027,6 +1085,36 @@ pub(crate) fn header_panels(panels: &[Panel]) -> Vec<Panel> {
             x_labels: panel.x_labels.clone(),
         })
         .collect()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn expand_triangle(points: [[f32; 2]; 3]) -> [[f32; 2]; 3] {
+    let mid = [
+        (points[0][0] + points[1][0] + points[2][0]) / 3.0,
+        (points[0][1] + points[1][1] + points[2][1]) / 3.0,
+    ];
+    points.map(|point| {
+        let delta = [point[0] - mid[0], point[1] - mid[1]];
+        let len = (delta[0] * delta[0] + delta[1] * delta[1])
+            .sqrt()
+            .max(0.001);
+        [
+            point[0] + delta[0] / len * 0.75,
+            point[1] + delta[1] / len * 0.75,
+        ]
+    })
+}
+
+fn point_in_triangle(p: [f32; 2], a: [f32; 2], b: [f32; 2], c: [f32; 2]) -> bool {
+    let sign = |p: [f32; 2], a: [f32; 2], b: [f32; 2]| {
+        (p[0] - b[0]) * (a[1] - b[1]) - (a[0] - b[0]) * (p[1] - b[1])
+    };
+    let d1 = sign(p, a, b);
+    let d2 = sign(p, b, c);
+    let d3 = sign(p, c, a);
+    let has_neg = d1 < 0.0 || d2 < 0.0 || d3 < 0.0;
+    let has_pos = d1 > 0.0 || d2 > 0.0 || d3 > 0.0;
+    !(has_neg && has_pos)
 }
 
 fn segment_distance(a: [f32; 2], b: [f32; 2], p: [f32; 2]) -> f32 {
@@ -1348,6 +1436,28 @@ pub(crate) fn build_marks(panels: &[Panel]) -> Marks {
                         }
                     }
                 }
+                Series::Triangles { xs, ys, color } => {
+                    let mut index = 0;
+                    while index + 2 < xs.len() && index + 2 < ys.len() {
+                        let corners = [
+                            (xs[index], ys[index]),
+                            (xs[index + 1], ys[index + 1]),
+                            (xs[index + 2], ys[index + 2]),
+                        ];
+                        index += 3;
+                        if corners.iter().all(|(x, y)| x.is_finite() && y.is_finite()) {
+                            quads.push(QuadRec {
+                                a: [corners[0].0, corners[0].1],
+                                b: [corners[1].0, corners[1].1],
+                                c: Some([corners[2].0, corners[2].1]),
+                                heat: 0.0,
+                                color: *color,
+                                id,
+                                heatmap: None,
+                            });
+                        }
+                    }
+                }
                 Series::Heatmap { values, cols, rows } => {
                     if *cols == 0 || *rows == 0 {
                         continue;
@@ -1369,6 +1479,7 @@ pub(crate) fn build_marks(panels: &[Panel]) -> Marks {
             quads.push(QuadRec {
                 a: [panel.xmin, panel.ymin],
                 b: [panel.xmax, panel.ymax],
+                c: None,
                 heat: 1.0,
                 color: [1.0, 1.0, 1.0, 1.0],
                 id,
@@ -1400,6 +1511,7 @@ fn solid_quad(a: [f32; 2], b: [f32; 2], color: [f32; 4], id: u32) -> QuadRec {
     QuadRec {
         a,
         b,
+        c: None,
         heat: 0.0,
         color,
         id,
@@ -1460,10 +1572,9 @@ fn heatmap_bytes(values: &[f32], cols: u32, rows: u32) -> Vec<u8> {
     pixels
 }
 
-fn frame_lines(camera: &Camera, foreground: [f32; 4]) -> Vec<LineRec> {
+fn grid_lines(camera: &Camera, foreground: [f32; 4]) -> Vec<LineRec> {
     let mut lines = Vec::new();
     let grid = [foreground[0], foreground[1], foreground[2], 0.45];
-    let spine = [foreground[0], foreground[1], foreground[2], 1.0];
     for tick in ticks(camera.xmin, camera.xmax) {
         lines.push(axis_line(
             [tick, camera.ymin, 0.0],
@@ -1480,19 +1591,26 @@ fn frame_lines(camera: &Camera, foreground: [f32; 4]) -> Vec<LineRec> {
             1.0,
         ));
     }
-    lines.push(axis_line(
-        [camera.xmin, camera.ymin, 0.0],
-        [camera.xmax, camera.ymin, 0.0],
-        spine,
-        1.25,
-    ));
-    lines.push(axis_line(
-        [camera.xmin, camera.ymin, 0.0],
-        [camera.xmin, camera.ymax, 0.0],
-        spine,
-        1.25,
-    ));
     lines
+}
+
+/// A 1px rectangle inset half a pixel so the stroke sits inside the plot.
+fn border_lines(camera: &Camera, plot: &PlotRect, foreground: [f32; 4]) -> Vec<LineRec> {
+    let span_x = camera.xmax - camera.xmin;
+    let span_y = camera.ymax - camera.ymin;
+    let inset_x = 0.5 * span_x.abs() / plot.w.max(1.0);
+    let inset_y = 0.5 * span_y.abs() / plot.h.max(1.0);
+    let x0 = camera.xmin + inset_x;
+    let x1 = camera.xmax - inset_x;
+    let y0 = camera.ymin + inset_y;
+    let y1 = camera.ymax - inset_y;
+    let spine = [foreground[0], foreground[1], foreground[2], 1.0];
+    vec![
+        axis_line([x0, y0, 0.0], [x1, y0, 0.0], spine, 1.0),
+        axis_line([x1, y0, 0.0], [x1, y1, 0.0], spine, 1.0),
+        axis_line([x1, y1, 0.0], [x0, y1, 0.0], spine, 1.0),
+        axis_line([x0, y1, 0.0], [x0, y0, 0.0], spine, 1.0),
+    ]
 }
 
 fn axis_line(a: [f32; 3], b: [f32; 3], color: [f32; 4], thickness: f32) -> LineRec {
@@ -1505,10 +1623,14 @@ fn axis_line(a: [f32; 3], b: [f32; 3], color: [f32; 4], thickness: f32) -> LineR
     }
 }
 
+fn shows_title(panel: &Panel) -> bool {
+    !panel.title.is_empty() && !panel.y_label.starts_with(&panel.title)
+}
+
 fn labels_for(panel: &Panel, camera: &Camera, cell: &Cell, color: [f32; 4]) -> Vec<GlyphRec> {
     let mut out = Vec::new();
     let font = atlas();
-    if !panel.title.is_empty() {
+    if shows_title(panel) {
         push_text(
             &mut out,
             &panel.title,
@@ -1519,14 +1641,26 @@ fn labels_for(panel: &Panel, camera: &Camera, cell: &Cell, color: [f32; 4]) -> V
             color,
         );
     }
+    if !panel.y_label.is_empty() {
+        push_up_text(
+            &mut out,
+            &panel.y_label,
+            [
+                cell.cell.x + axis_name_width(&panel.y_label) * 0.5,
+                cell.plot.y + cell.plot.h * 0.5,
+            ],
+            color,
+        );
+    }
     for tick in ticks(camera.ymin, camera.ymax) {
+        let label = format_tick(tick);
         push_text(
             &mut out,
-            &format_tick(tick),
+            &label,
             [camera.xmin, tick, 0.0],
             1.0,
             1.0,
-            [-8.0, -font.ascent * 0.35],
+            [-4.0, ink_center_shift(&label)],
             color,
         );
     }
@@ -1543,10 +1677,11 @@ fn labels_for(panel: &Panel, camera: &Camera, cell: &Cell, color: [f32; 4]) -> V
             );
         }
     } else {
+        let pitch = (font.line_height * 4.0).max(1.0);
         let stride = panel
             .x_labels
             .len()
-            .div_ceil((cell.plot.w / 72.0).max(1.0) as usize)
+            .div_ceil((cell.plot.w / pitch).max(1.0) as usize)
             .max(1);
         for (index, label) in panel.x_labels.iter().enumerate() {
             if index % stride != 0 || label.is_empty() {
@@ -1588,11 +1723,55 @@ fn push_text(
     }
 }
 
-fn y_label_width(camera: &Camera) -> f32 {
+fn y_tick_width(camera: &Camera) -> f32 {
     ticks(camera.ymin, camera.ymax)
         .into_iter()
         .map(|value| text::text_width(&format_tick(value)))
         .fold(0.0, f32::max)
+}
+
+fn axis_name_width(label: &str) -> f32 {
+    if label.is_empty() {
+        0.0
+    } else {
+        atlas().line_height + 4.0
+    }
+}
+
+/// Shift that puts the ink's vertical center on the anchor. Screen y grows down.
+fn ink_center_shift(text: &str) -> f32 {
+    let (stamps, _) = text::layout(text);
+    if stamps.is_empty() {
+        return 0.0;
+    }
+    let top = stamps.iter().map(|stamp| stamp.y).fold(f32::MAX, f32::min);
+    let bottom = stamps
+        .iter()
+        .map(|stamp| stamp.y + stamp.h)
+        .fold(f32::MIN, f32::max);
+    -0.5 * (top + bottom)
+}
+
+fn push_up_text(out: &mut Vec<GlyphRec>, text: &str, anchor: [f32; 2], color: [f32; 4]) {
+    let (stamps, width) = text::layout(text);
+    if stamps.is_empty() {
+        return;
+    }
+    let top = stamps.iter().map(|stamp| stamp.y).fold(f32::MAX, f32::min);
+    let bottom = stamps
+        .iter()
+        .map(|stamp| stamp.y + stamp.h)
+        .fold(f32::MIN, f32::max);
+    let mid_y = 0.5 * (top + bottom);
+    for stamp in stamps {
+        out.push(GlyphRec {
+            anchor: [anchor[0], anchor[1], 1.0, 0.0],
+            offset: [stamp.x - width * 0.5, stamp.y - mid_y],
+            size: [stamp.w, stamp.h],
+            uv: stamp.uv,
+            color,
+        });
+    }
 }
 
 fn panel_rects(
@@ -1680,6 +1859,34 @@ fn fill_quad_cpu(
     marks: &Marks,
     plot: PlotRect,
 ) {
+    if let Some(c) = quad.c {
+        let p0 = project(
+            *matrix,
+            [quad.a[0], quad.a[1], 0.0],
+            width as f32,
+            height as f32,
+        );
+        let p1 = project(
+            *matrix,
+            [quad.b[0], quad.b[1], 0.0],
+            width as f32,
+            height as f32,
+        );
+        let p2 = project(*matrix, [c[0], c[1], 0.0], width as f32, height as f32);
+        let pts = expand_triangle([p0, p1, p2]);
+        let min_x = pts.iter().map(|p| p[0]).fold(f32::MAX, f32::min).floor() as i32;
+        let max_x = pts.iter().map(|p| p[0]).fold(f32::MIN, f32::max).ceil() as i32;
+        let min_y = pts.iter().map(|p| p[1]).fold(f32::MAX, f32::min).floor() as i32;
+        let max_y = pts.iter().map(|p| p[1]).fold(f32::MIN, f32::max).ceil() as i32;
+        for y in min_y..=max_y {
+            for x in min_x..=max_x {
+                if point_in_triangle([x as f32 + 0.5, y as f32 + 0.5], pts[0], pts[1], pts[2]) {
+                    blend(frame, width, height, x, y, quad.color, Some(plot));
+                }
+            }
+        }
+        return;
+    }
     let p0 = project(
         *matrix,
         [quad.a[0], quad.a[1], 0.0],
@@ -1786,8 +1993,7 @@ fn blit_glyph(frame: &mut [u8], width: u32, height: u32, matrix: &[f32; 16], gly
         [glyph.anchor[0], glyph.anchor[1]]
     };
     let font = atlas();
-    let left = (origin[0] + glyph.offset[0]).floor() as i32;
-    let top = (origin[1] + glyph.offset[1]).floor() as i32;
+    let turned = glyph.anchor[3] < 0.5 && glyph.anchor[2] > 0.5;
     let u0 = (glyph.uv[0] * font.size as f32).round() as u32;
     let v0 = (glyph.uv[1] * font.size as f32).round() as u32;
     let columns = glyph.size[0] as u32;
@@ -1798,14 +2004,21 @@ fn blit_glyph(frame: &mut [u8], width: u32, height: u32, matrix: &[f32; 16], gly
             if coverage < 0.004 {
                 continue;
             }
+            let local_x = glyph.offset[0] + col as f32;
+            let local_y = glyph.offset[1] + row as f32;
+            let (dx, dy) = if turned {
+                (local_y, -local_x)
+            } else {
+                (local_x, local_y)
+            };
             let mut color = glyph.color;
             color[3] *= coverage;
             blend(
                 frame,
                 width,
                 height,
-                left + col as i32,
-                top + row as i32,
+                (origin[0] + dx).floor() as i32,
+                (origin[1] + dy).floor() as i32,
                 color,
                 None,
             );
@@ -1931,8 +2144,17 @@ pub(crate) fn decode_points(bytes: &[u8]) -> Vec<PointRec> {
 pub(crate) fn encode_quads(quads: &[QuadRec]) -> Vec<u8> {
     let mut out = Vec::with_capacity(quads.len() * QUAD_STRIDE as usize);
     for quad in quads {
-        push4(&mut out, [quad.a[0], quad.a[1], quad.heat, 0.0]);
-        push4(&mut out, [quad.b[0], quad.b[1], 0.0, 0.0]);
+        let [cx, cy] = quad.c.unwrap_or([0.0, 0.0]);
+        push4(
+            &mut out,
+            [
+                quad.a[0],
+                quad.a[1],
+                quad.heat,
+                if quad.c.is_some() { 1.0 } else { 0.0 },
+            ],
+        );
+        push4(&mut out, [quad.b[0], quad.b[1], cx, cy]);
         push4(&mut out, quad.color);
         push_u32(&mut out, quad.id);
         // 0 is a solid quad, so the heatmap index is stored plus 1.
@@ -1952,6 +2174,11 @@ pub(crate) fn decode_quads(bytes: &[u8]) -> Vec<QuadRec> {
             a: [f32_at(chunk, 0), f32_at(chunk, 1)],
             heat: f32_at(chunk, 2),
             b: [f32_at(chunk, 4), f32_at(chunk, 5)],
+            c: if f32_at(chunk, 3) > 0.5 {
+                Some([f32_at(chunk, 6), f32_at(chunk, 7)])
+            } else {
+                None
+            },
             color: f32x4_at(chunk, 8),
             id: u32_at(chunk, 12),
             heatmap: u32_at(chunk, 13).checked_sub(1).map(|index| index as usize),
@@ -2242,6 +2469,7 @@ mod tests {
             title: "line".into(),
             panels: vec![Panel {
                 title: String::new(),
+                y_label: String::new(),
                 xmin: 0.0,
                 xmax: 10.0,
                 ymin: 0.0,
@@ -2285,6 +2513,7 @@ mod tests {
             title: "grid".into(),
             panels: vec![Panel {
                 title: String::new(),
+                y_label: String::new(),
                 xmin: 0.0,
                 xmax: 10.0,
                 ymin: 0.0,
@@ -2347,6 +2576,7 @@ mod tests {
         ]);
         scene.panels.push(Panel {
             title: "heat".into(),
+            y_label: String::new(),
             xmin: 0.0,
             xmax: 1.0,
             ymin: 0.0,
@@ -2416,6 +2646,94 @@ mod tests {
         assert_eq!(hover.3, Some(0));
         let empty = plot.project_data(0, 8.0, 9.0, 200, 160);
         assert_eq!(plot.hover(empty[0], empty[1]).3, None);
+    }
+
+    #[test]
+    fn y_tick_ink_sits_on_its_gridline_and_the_name_runs_up_the_axis() {
+        let panel = Panel {
+            title: "IC1 X".into(),
+            y_label: "IC1 X (mm)".into(),
+            xmin: 0.0,
+            xmax: 10.0,
+            ymin: -10.0,
+            ymax: 10.0,
+            series: Vec::new(),
+            x_labels: Vec::new(),
+        };
+        let camera = Camera::new(0.0, 10.0, -10.0, 10.0);
+        let cell = Cell {
+            cell: PlotRect {
+                x: 8.0,
+                y: 4.0,
+                w: 180.0,
+                h: 140.0,
+            },
+            plot: PlotRect {
+                x: 70.0,
+                y: 16.0,
+                w: 100.0,
+                h: 100.0,
+            },
+            panel: 0,
+        };
+        let glyphs = labels_for(&panel, &camera, &cell, [1.0, 1.0, 1.0, 1.0]);
+        let row: Vec<_> = glyphs
+            .iter()
+            .filter(|glyph| (glyph.anchor[1]).abs() < 1e-3 && glyph.anchor[3] > 0.5)
+            .collect();
+        assert!(!row.is_empty(), "a zero tick should be labeled");
+        let top = row
+            .iter()
+            .map(|glyph| glyph.offset[1])
+            .fold(f32::MAX, f32::min);
+        let bottom = row
+            .iter()
+            .map(|glyph| glyph.offset[1] + glyph.size[1])
+            .fold(f32::MIN, f32::max);
+        let mid = 0.5 * (top + bottom);
+        assert!(mid.abs() < 0.51, "tick label center {mid}");
+        let turned: Vec<_> = glyphs
+            .iter()
+            .filter(|glyph| glyph.anchor[2] > 0.5 && glyph.anchor[3] < 0.5)
+            .collect();
+        assert!(!turned.is_empty(), "the y label should be rotated");
+        let name_y = cell.plot.y + cell.plot.h * 0.5;
+        assert!((turned[0].anchor[1] - name_y).abs() < 0.01);
+        let name_x = cell.cell.x + axis_name_width(&panel.y_label) * 0.5;
+        assert!(turned
+            .iter()
+            .all(|glyph| (glyph.anchor[0] - name_x).abs() < 0.01));
+    }
+
+    #[test]
+    fn grid_stays_behind_filled_data_and_a_triangle_hits_its_interior() {
+        let mut scene = line_scene();
+        scene.panels[0].series = vec![
+            Series::Rects {
+                x: vec![0.0],
+                y: vec![0.0],
+                w: vec![10.0],
+                h: vec![10.0],
+                color: [1.0, 0.0, 0.0, 1.0],
+            },
+            Series::Triangles {
+                xs: vec![1.0, 9.0, 5.0],
+                ys: vec![1.0, 1.0, 9.0],
+                color: [0.0, 0.0, 1.0, 1.0],
+            },
+        ];
+        let mut plot = Plot::new(&scene, [0.0, 0.0, 0.0, 1.0], [0.0, 1.0, 0.0, 1.0]);
+        let frame = plot.draw(180, 140, &PlotInput::default()).unwrap();
+        let covered = plot.project_data(0, 2.0, 8.0, 180, 140);
+        assert!(
+            near(&frame.rgba, 180, 140, covered, |pixel| pixel[0] > 150
+                && pixel[1] < 40),
+            "filled data should cover the grid {covered:?}"
+        );
+        let inside = plot.project_data(0, 5.0, 3.0, 180, 140);
+        assert_eq!(plot.hover(inside[0], inside[1]).3, Some(1));
+        let outside = plot.project_data(0, 1.0, 8.0, 180, 140);
+        assert_ne!(plot.hover(outside[0], outside[1]).3, Some(1));
     }
 
     fn near(

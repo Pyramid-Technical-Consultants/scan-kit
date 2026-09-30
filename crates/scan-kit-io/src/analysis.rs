@@ -1073,6 +1073,7 @@ fn panel(title: String, xmin: f32, xmax: f32, ymin: f32, ymax: f32, series: Vec<
     };
     Panel {
         title,
+        y_label: String::new(),
         xmin,
         xmax,
         ymin,
@@ -1802,6 +1803,7 @@ mod tests {
                         | ("bars", Series::Bars { .. })
                         | ("points", Series::Points { .. })
                         | ("rects", Series::Rects { .. })
+                        | ("triangles", Series::Triangles { .. })
                         | ("heat", Series::Heatmap { .. })
                 )
             })
@@ -1830,7 +1832,7 @@ mod tests {
     #[test]
     fn sk_req_017_binned_summary_and_replay_share_the_session() {
         let binned = scene_of("binned_summary");
-        assert!(has_kind(&binned, "rects"));
+        assert!(has_kind(&binned, "triangles"));
         assert!(binned
             .controls
             .iter()
@@ -1845,7 +1847,7 @@ mod tests {
             .find(|panel| panel.title.starts_with("IC1"))
             .unwrap();
         assert!(ic1.series.iter().any(|series| match series {
-            Series::Rects { y, .. } => y.iter().any(|value| (*value - 10.0).abs() < 1e-3),
+            Series::Triangles { ys, .. } => ys.iter().any(|value| (*value - 10.0).abs() < 1e-3),
             _ => false,
         }));
         assert!(ic1.x_labels.iter().any(|label| label == "70"));

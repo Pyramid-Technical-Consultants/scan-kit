@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { ArrowLeft, Download, Play } from "lucide-react";
@@ -12,11 +12,13 @@ import {
   type Theme,
 } from "@glideapps/glide-data-grid";
 
+import { controlDisabled, controlSections, type ControlSlot } from "@/analysis-controls";
 import { Button } from "@/components/ui/button";
-import { backingSize, plotHeader, type PlotHeader } from "@/plot-header";
+import { Checkbox } from "@/components/ui/checkbox";
+import { Field, FieldLabel, FieldLegend, FieldSet } from "@/components/ui/field";
+import { backingSize, plotHeader, type PlotHeader, type ViewControl } from "@/plot-header";
 import { sessionColor } from "@/session-colors";
 import { dismissNotice, notifyError } from "@/notify";
-import { Field, FieldLabel } from "@/components/ui/field";
 import {
   Select,
   SelectContent,
@@ -25,96 +27,6 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-
-const BINNED_PRESETS: Record<string, Record<string, string>> = {
-  "Dose error vs Energy": {
-    metric: "Dose Error (%)",
-    x: "Energy",
-    glyph: "Box",
-    trend: "On",
-    hist: "On",
-    corr: "On",
-  },
-  "Dose error mean vs Energy": {
-    metric: "Dose Error (%)",
-    x: "Energy",
-    glyph: "Mean",
-    trend: "On",
-    hist: "On",
-    corr: "On",
-  },
-  "Dose ratios vs Energy": {
-    metric: "Dose Ratios",
-    x: "Energy",
-    glyph: "Box",
-    trend: "On",
-    corr: "On",
-  },
-  "Dose rate vs Energy": {
-    metric: "Dose Rate (MU/s)",
-    x: "Energy",
-    glyph: "Mean",
-    trend: "On",
-  },
-  "Current ratios vs Energy": {
-    metric: "Current Ratios (%)",
-    x: "Energy",
-    glyph: "Mean",
-    trend: "On",
-  },
-  "IC current vs Energy": {
-    metric: "IC Current (nA)",
-    x: "Energy",
-    glyph: "Box",
-    trend: "On",
-  },
-  "Position error vs Energy": {
-    metric: "Position Error (mm)",
-    x: "Energy",
-    glyph: "Violin",
-    trend: "Off",
-  },
-  "Sigma vs Energy": {
-    metric: "Sigma (mm)",
-    x: "Energy",
-    glyph: "Violin",
-    trend: "Off",
-  },
-  "IC2-IC1 position vs Energy": {
-    metric: "IC2-IC1 Position (mm)",
-    x: "Energy",
-    glyph: "Violin",
-    trend: "Off",
-  },
-  "Spot time vs Energy": {
-    metric: "Spot Delivery Time",
-    x: "Energy",
-    glyph: "Box",
-    trend: "On",
-  },
-  "Dose error vs Target MU": {
-    metric: "Dose Error (%)",
-    x: "Target MU",
-    glyph: "Box",
-    trend: "On",
-    hist: "On",
-    corr: "On",
-  },
-  "Dose ratios vs Spot time": {
-    metric: "Dose Ratios",
-    x: "Spot time",
-    glyph: "Box",
-    trend: "On",
-    corr: "On",
-  },
-  "Dose ratios vs Beam radius": {
-    metric: "Dose Ratios",
-    x: "Radius",
-    glyph: "Box",
-    trend: "On",
-    corr: "On",
-  },
-};
 
 type Readout = {
   x: number;
@@ -248,6 +160,54 @@ function messageOf(reason: unknown): string {
   return reason instanceof Error ? reason.message : String(reason);
 }
 
+const SIDE_MIN = 220;
+const SIDE_DEFAULT = 280;
+const PLOT_MIN = 240;
+
+function clampSide(parentWidth: number, next: number): number {
+  const max = Math.max(SIDE_MIN, parentWidth - PLOT_MIN);
+  return Math.round(Math.min(max, Math.max(SIDE_MIN, next)));
+}
+
+function ChoiceSelect({
+  control,
+  value,
+  disabled,
+  onChange,
+}: {
+  control: ViewControl;
+  value: string;
+  disabled?: boolean;
+  onChange: (value: string) => void;
+}) {
+  const items = control.options.map((option) => ({ label: option, value: option }));
+  return (
+    <Select
+      items={items}
+      value={value}
+      disabled={disabled}
+      onValueChange={(next) => {
+        if (next != null) {
+          onChange(next);
+        }
+      }}
+    >
+      <SelectTrigger className="w-full">
+        <SelectValue />
+      </SelectTrigger>
+      <SelectContent>
+        <SelectGroup>
+          {items.map((item) => (
+            <SelectItem key={item.value} value={item.value}>
+              {item.label}
+            </SelectItem>
+          ))}
+        </SelectGroup>
+      </SelectContent>
+    </Select>
+  );
+}
+
 export function AnalysisView({
   viewId,
   folder,
@@ -259,6 +219,7 @@ export function AnalysisView({
   sessionIds: string[];
   onBack: () => void;
 }) {
+  const shell = useRef<HTMLDivElement>(null);
   const host = useRef<HTMLDivElement>(null);
   const canvas = useRef<HTMLCanvasElement>(null);
   const plotter = useRef<Plotter | null>(null);
@@ -270,6 +231,7 @@ export function AnalysisView({
   const [meta, setMeta] = useState<PlotHeader | null>(null);
   const [study, setStudy] = useState<string | null>(null);
   const [size, setSize] = useState({ width: 960, height: 640 });
+  const [sideWidth, setSideWidth] = useState(SIDE_DEFAULT);
   const shown = (meta?.panels.length ?? 0) > 0;
 
   // The helpers below only read refs, so the listeners registered once keep working.
@@ -384,6 +346,12 @@ export function AnalysisView({
   }, []);
 
   useEffect(() => {
+    if (shown) {
+      fitCanvas();
+    }
+  }, [shown]);
+
+  useEffect(() => {
     const ticket = openSeq.current + 1;
     openSeq.current = ticket;
     const timer = window.setTimeout(() => {
@@ -478,6 +446,47 @@ export function AnalysisView({
     };
   }, []);
 
+  const controls = meta?.controls ?? [];
+  const resolved: Record<string, string> = {};
+  for (const control of controls) {
+    const stored = options[control.id];
+    resolved[control.id] =
+      stored != null && control.options.includes(stored) ? stored : control.value;
+  }
+  const byId = new Map(controls.map((control) => [control.id, control]));
+  const sections = controlSections(
+    viewId,
+    controls.map((control) => control.id),
+  );
+  const apply = (id: string, value: string) => {
+    setOptions((current) => ({ ...current, [id]: value }));
+  };
+
+  const resizeSide = (next: number) => {
+    const parent = shell.current?.getBoundingClientRect().width ?? window.innerWidth;
+    setSideWidth(clampSide(parent, next));
+  };
+
+  const onSplitterDown = (event: ReactPointerEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    const handle = event.currentTarget;
+    handle.setPointerCapture(event.pointerId);
+    const startX = event.clientX;
+    const startWidth = sideWidth;
+    const onMove = (ev: PointerEvent) => {
+      const parent = shell.current?.getBoundingClientRect().width ?? window.innerWidth;
+      setSideWidth(clampSide(parent, startWidth + (startX - ev.clientX)));
+    };
+    const onUp = () => {
+      handle.removeEventListener("pointermove", onMove);
+      handle.removeEventListener("pointerup", onUp);
+      handle.removeEventListener("pointercancel", onUp);
+    };
+    handle.addEventListener("pointermove", onMove);
+    handle.addEventListener("pointerup", onUp);
+    handle.addEventListener("pointercancel", onUp);
+  };
+
   const table = meta?.table;
   const columns: GridColumn[] =
     table?.columns.map((title) => ({ title, width: 180 })) ?? [];
@@ -488,59 +497,100 @@ export function AnalysisView({
     allowOverlay: false,
   });
 
+  const renderSlot = (slot: ControlSlot) => {
+    const control = byId.get(slot.id);
+    if (control == null) {
+      return null;
+    }
+    const value = resolved[slot.id] ?? control.value;
+    const label = slot.label ?? control.label;
+    const disabled = controlDisabled(slot.id, resolved);
+    if (slot.kind === "check") {
+      return (
+        <Field key={slot.id} orientation="horizontal" className={disabled ? "opacity-50" : undefined}>
+          <Checkbox
+            id={`analysis-${slot.id}`}
+            checked={value === "On"}
+            disabled={disabled}
+            onCheckedChange={(checked) => apply(slot.id, checked ? "On" : "Off")}
+          />
+          <FieldLabel htmlFor={`analysis-${slot.id}`}>{label}</FieldLabel>
+        </Field>
+      );
+    }
+    const select = (
+      <ChoiceSelect
+        control={control}
+        value={value}
+        disabled={disabled}
+        onChange={(next) => apply(slot.id, next)}
+      />
+    );
+    if (slot.kind === "bare") {
+      return <div key={slot.id}>{select}</div>;
+    }
+    return (
+      <div key={slot.id} className="flex items-center gap-2">
+        <FieldLabel className="w-28 shrink-0 whitespace-nowrap">{label}</FieldLabel>
+        <div className="min-w-0 flex-1">{select}</div>
+      </div>
+    );
+  };
+
   return (
-    <div className="flex min-h-0 flex-1 overflow-hidden">
-      <aside className="flex min-h-0 w-56 shrink-0 flex-col gap-3 overflow-y-auto border-r border-border p-3">
-        <Button variant="outline" onClick={onBack}>
-          <ArrowLeft />
-          Sessions
-        </Button>
-        <h2 className="text-sm font-medium">{meta?.title ?? "Analysis"}</h2>
-        {(meta?.controls ?? []).map((control) => {
-          const items = control.options.map((option) => ({ label: option, value: option }));
-          const stored = options[control.id];
-          const value = stored != null && control.options.includes(stored) ? stored : control.value;
-          return (
-            <Field key={control.id}>
-              <FieldLabel>{control.label}</FieldLabel>
-              <Select
-                items={items}
-                value={value}
-                onValueChange={(value) => {
-                  if (value == null) {
-                    return;
-                  }
-                  if (control.id === "preset") {
-                    const preset = BINNED_PRESETS[value];
-                    setOptions((current) => ({
-                      ...current,
-                      hist: "Off",
-                      corr: "Off",
-                      trend: "On",
-                      ...preset,
-                      preset: value,
-                    }));
-                    return;
-                  }
-                  setOptions((current) => ({ ...current, [control.id]: value }));
-                }}
-              >
-                <SelectTrigger className="w-full">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectGroup>
-                    {items.map((item) => (
-                      <SelectItem key={item.value} value={item.value}>
-                        {item.label}
-                      </SelectItem>
-                    ))}
-                  </SelectGroup>
-                </SelectContent>
-              </Select>
-            </Field>
-          );
-        })}
+    <div ref={shell} className="flex min-h-0 flex-1 overflow-hidden">
+      <div ref={host} className="bg-background flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
+        {table != null && table.rows.length > 0 ? (
+          <DataEditor
+            width={size.width}
+            height={shown ? Math.min(240, size.height) : size.height}
+            columns={columns}
+            rows={table.rows.length}
+            getCellContent={getCellContent}
+            theme={gridTheme()}
+            rowMarkers="none"
+          />
+        ) : null}
+        <div className={shown ? "relative min-h-0 flex-1" : "hidden"}>
+          <canvas ref={canvas} className="absolute inset-0 h-full w-full touch-none" />
+          <p
+            ref={hoverNode}
+            hidden
+            className="text-muted-foreground pointer-events-none absolute bottom-2 left-2 text-xs tabular-nums"
+          />
+        </div>
+      </div>
+      <div
+        role="separator"
+        aria-orientation="vertical"
+        aria-label="Resize configuration"
+        aria-valuemin={SIDE_MIN}
+        aria-valuenow={sideWidth}
+        tabIndex={0}
+        className="bg-border w-1.5 shrink-0 cursor-col-resize touch-none focus-visible:bg-ring"
+        onPointerDown={onSplitterDown}
+        onKeyDown={(event) => {
+          if (event.key === "ArrowLeft") {
+            resizeSide(sideWidth + 16);
+          } else if (event.key === "ArrowRight") {
+            resizeSide(sideWidth - 16);
+          }
+        }}
+      />
+      <aside style={{ width: sideWidth }} className="flex min-h-0 shrink-0 flex-col">
+        <div className="shrink-0 p-3 pb-0">
+          <Button type="button" variant="outline" className="w-full" onClick={onBack}>
+            <ArrowLeft />
+            Sessions
+          </Button>
+        </div>
+        <div className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto p-3">
+        {sections.map((section) => (
+          <FieldSet key={section.title} className="gap-2 rounded-lg border border-border p-3">
+            <FieldLegend variant="label">{section.title}</FieldLegend>
+            {section.slots.map((slot) => renderSlot(slot))}
+          </FieldSet>
+        ))}
         {(meta?.samples.length ?? 0) > 0 ? (
           <div className="flex flex-col gap-2">
             <Button
@@ -591,26 +641,8 @@ export function AnalysisView({
           </Button>
         ) : null}
         {study != null ? <pre className="text-muted-foreground text-xs whitespace-pre-wrap">{study}</pre> : null}
+        </div>
       </aside>
-      <div ref={host} className="bg-background relative min-h-0 flex-1">
-        {table != null && table.rows.length > 0 ? (
-          <DataEditor
-            width={size.width}
-            height={shown ? Math.min(240, size.height) : size.height}
-            columns={columns}
-            rows={table.rows.length}
-            getCellContent={getCellContent}
-            theme={gridTheme()}
-            rowMarkers="none"
-          />
-        ) : null}
-        <canvas ref={canvas} className={shown ? "h-full w-full touch-none" : "hidden"} />
-        <p
-          ref={hoverNode}
-          hidden
-          className="text-muted-foreground pointer-events-none absolute bottom-2 left-2 text-xs tabular-nums"
-        />
-      </div>
     </div>
   );
 }

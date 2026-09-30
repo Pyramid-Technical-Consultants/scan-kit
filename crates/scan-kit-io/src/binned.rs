@@ -291,22 +291,6 @@ fn sources_for(metric: &str) -> &'static [(&'static str, &'static str)] {
         _ => &SOURCE_CHOICES[..1],
     }
 }
-const PRESET_CHOICES: &[&str] = &[
-    "Choose…",
-    "Dose error vs Energy",
-    "Dose error mean vs Energy",
-    "Dose ratios vs Energy",
-    "Dose rate vs Energy",
-    "Current ratios vs Energy",
-    "IC current vs Energy",
-    "Position error vs Energy",
-    "Sigma vs Energy",
-    "IC2-IC1 position vs Energy",
-    "Spot time vs Energy",
-    "Dose error vs Target MU",
-    "Dose ratios vs Spot time",
-    "Dose ratios vs Beam radius",
-];
 const BEAM_CHOICES: &[(&str, &str)] = &[
     ("beam_on", "Beam on"),
     ("beam_off", "Beam off"),
@@ -461,14 +445,14 @@ pub(crate) fn binned_summary(root: &Path, session_ids: &[String], options: &Valu
                     .position(|item| item.key == series.key)
                     .unwrap_or(0);
                 let other = &present[(pos + 1) % present.len()];
-                panels.push(corr_panel(series, other, &tables));
+                panels.push(corr_panel(series, other, &tables, group.label));
             }
         }
     }
 
     let side = u32::from(hist) + u32::from(corr);
     let mut weights = vec![8.0];
-    weights.extend(std::iter::repeat_n(1.1, side as usize));
+    weights.extend(std::iter::repeat_n(1.65, side as usize));
     PlotScene {
         title: format!("{} vs {}", group.label, x_label(x_column)),
         panels,
@@ -526,7 +510,9 @@ fn main_panel(
             0.8,
             0.8,
             0.8,
-            if glyph == "violin" || glyph == "scatter" {
+            if glyph == "violin" {
+                0.55
+            } else if glyph == "scatter" {
                 0.4
             } else {
                 1.0
@@ -577,6 +563,7 @@ fn main_panel(
     let (ymin, ymax) = span(&ys);
     Panel {
         title: series.label.to_string(),
+        y_label: axis_label(series.label, group.label),
         xmin,
         xmax,
         ymin,
@@ -594,6 +581,23 @@ fn main_panel(
     }
 }
 
+fn axis_label(series: &str, group: &str) -> String {
+    let Some(unit) = group
+        .rfind('(')
+        .zip(group.rfind(')'))
+        .filter(|(start, end)| end > start)
+        .map(|(start, end)| group[start + 1..end].trim())
+        .filter(|unit| !unit.is_empty())
+    else {
+        return series.to_string();
+    };
+    if series.contains('(') || series.eq_ignore_ascii_case(unit) {
+        series.to_string()
+    } else {
+        format!("{series} ({unit})")
+    }
+}
+
 fn violin_series(
     table: &BTreeMap<String, Vec<f32>>,
     y: &[f32],
@@ -603,36 +607,53 @@ fn violin_series(
 ) -> Vec<Series> {
     let bins = table.get("_bin");
     let groups = group_samples(bins, y, categories);
-    let mut x = Vec::new();
-    let mut bottom = Vec::new();
-    let mut w = Vec::new();
-    let mut h = Vec::new();
+    let mut xs = Vec::new();
+    let mut ys = Vec::new();
+    let mut outline_x = Vec::new();
+    let mut outline_y = Vec::new();
     for (index, samples) in groups.iter().enumerate() {
         let center = index as f32;
         let shape = kde(samples, VIOLIN_WIDTH * 0.5);
-        if shape.len() == 1 {
-            x.push(center - shape[0].1);
-            bottom.push(shape[0].0);
-            w.push(shape[0].1 * 2.0);
-            h.push(0.0);
-        } else {
-            for pair in shape.windows(2) {
-                let half = pair[0].1.max(pair[1].1);
-                x.push(center - half);
-                bottom.push(pair[0].0.min(pair[1].0));
-                w.push(half * 2.0);
-                h.push((pair[1].0 - pair[0].0).abs());
+        if shape.len() < 2 {
+            if let Some((y, half)) = shape.first() {
+                xs.extend([center - half, center + half, center]);
+                ys.extend([*y, *y, *y]);
+                outline_x.extend([center - half, center + half, f32::NAN]);
+                outline_y.extend([*y, *y, f32::NAN]);
             }
+            continue;
         }
+        for pair in shape.windows(2) {
+            let (y0, h0) = pair[0];
+            let (y1, h1) = pair[1];
+            let (l0, r0) = (center - h0, center + h0);
+            let (l1, r1) = (center - h1, center + h1);
+            xs.extend([l0, r0, r1, l0, r1, l1]);
+            ys.extend([y0, y0, y1, y0, y1, y1]);
+        }
+        for (y, half) in &shape {
+            outline_x.push(center - half);
+            outline_y.push(*y);
+        }
+        for (y, half) in shape.iter().rev().skip(1) {
+            outline_x.push(center + half);
+            outline_y.push(*y);
+        }
+        outline_x.push(center - shape[0].1);
+        outline_y.push(shape[0].0);
+        outline_x.push(f32::NAN);
+        outline_y.push(f32::NAN);
         let _ = session;
     }
-    vec![Series::Rects {
-        x,
-        y: bottom,
-        w,
-        h,
-        color,
-    }]
+    vec![
+        Series::Triangles { xs, ys, color },
+        Series::Polyline {
+            xs: outline_x,
+            ys: outline_y,
+            color: [color[0], color[1], color[2], 0.0],
+            thickness: 1.0,
+        },
+    ]
 }
 
 fn box_series(
@@ -1093,6 +1114,7 @@ fn hist_panel(
     }
     Panel {
         title: format!("{} HIST", series.label),
+        y_label: "Probability (%)".into(),
         xmin: lo,
         xmax: hi,
         ymin: 0.0,
@@ -1102,7 +1124,12 @@ fn hist_panel(
     }
 }
 
-fn corr_panel(a: &YSeries, b: &YSeries, tables: &[BTreeMap<String, Vec<f32>>]) -> Panel {
+fn corr_panel(
+    a: &YSeries,
+    b: &YSeries,
+    tables: &[BTreeMap<String, Vec<f32>>],
+    group_label: &str,
+) -> Panel {
     let mut xs = Vec::new();
     let mut ys = Vec::new();
     for table in tables {
@@ -1142,6 +1169,7 @@ fn corr_panel(a: &YSeries, b: &YSeries, tables: &[BTreeMap<String, Vec<f32>>]) -
     }
     Panel {
         title: format!("{} VS {}", a.label, b.label),
+        y_label: axis_label(b.label, group_label),
         xmin,
         xmax,
         ymin,
@@ -1297,6 +1325,7 @@ fn hline(xmin: f32, xmax: f32, y: f32, color: [f32; 4]) -> Series {
 fn note_panel(title: &str) -> Panel {
     Panel {
         title: title.to_string(),
+        y_label: String::new(),
         xmin: 0.0,
         xmax: 1.0,
         ymin: 0.0,
@@ -1359,14 +1388,13 @@ fn controls(
     cutoff: f32,
 ) -> Vec<Control> {
     let on = |value: bool| if value { "On" } else { "Off" };
-    let mut controls = vec![control("preset", "Preset", PRESET_CHOICES, "Choose…")];
     let slice_x = matches!(source, "timeslice_iso" | "timeslice_chamber")
         && matches!(
             metric,
             "position_error" | "sigma" | "sigma_error" | "ic12_pos_diff"
         );
     let x_choices: &[(&str, &str)] = if slice_x { &X_CHOICES[..1] } else { X_CHOICES };
-    controls.extend([
+    let mut controls = vec![
         labeled("metric", "Y", METRIC_CHOICES, metric),
         labeled("source", "Source", sources_for(metric), source),
         labeled("x", "X", x_choices, x),
@@ -1397,7 +1425,7 @@ fn controls(
             &["0", "5", "10", "20"],
             &cutoff.round().to_string(),
         ),
-    ]);
+    ];
     let quantile = x != "energy";
     controls.retain(|item| match item.id.as_str() {
         "cutoff" => glyph == "contour",
@@ -3338,9 +3366,14 @@ fn flag(options: &Value, key: &str, default_on: bool) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use scan_kit_core::Series;
 
-    use super::{binned_summary, days_from_civil, parse_datetime, read_sheet, spot_delivery_ms};
+    use super::{
+        axis_label, binned_summary, days_from_civil, parse_datetime, read_sheet, spot_delivery_ms,
+        violin_series,
+    };
 
     #[test]
     fn civil_1970_is_unix_zero() {
@@ -3765,6 +3798,7 @@ mod tests {
         assert_eq!(source.value, "Spot — Isocenter");
         assert!(scene.controls.iter().any(|control| control.id == "fliers"));
         assert!(scene.controls.iter().all(|control| control.id != "cutoff"));
+        assert!(scene.controls.iter().all(|control| control.id != "preset"));
         let current = binned_summary(
             std::path::Path::new("."),
             &[],
@@ -3829,8 +3863,61 @@ mod tests {
             .iter()
             .find_map(|series| match series {
                 Series::Rects { y, .. } => Some(y.clone()),
+                Series::Triangles { ys, .. } => Some(ys.clone()),
                 _ => None,
             })
             .unwrap_or_default()
+    }
+
+    #[test]
+    fn axis_label_includes_units_and_side_plots_are_wider() {
+        assert_eq!(axis_label("IC1", "IC Current (nA)"), "IC1 (nA)");
+        assert_eq!(axis_label("IC1 (%)", "Dose Error (%)"), "IC1 (%)");
+        assert_eq!(axis_label("MU/S", "Dose Rate (MU/s)"), "MU/S");
+        assert_eq!(axis_label("TOTAL MS", "Spot Delivery Time"), "TOTAL MS");
+        let scene = binned_summary(
+            std::path::Path::new("."),
+            &[],
+            &serde_json::json!({"hist": "On", "corr": "On"}),
+        );
+        assert_eq!(scene.column_weights, vec![8.0, 1.65, 1.65]);
+    }
+
+    #[test]
+    fn violin_is_a_filled_curve_with_an_outline() {
+        let mut table = BTreeMap::new();
+        let y: Vec<f32> = (0..40).map(|i| (i as f32 - 20.0) * 0.2).collect();
+        table.insert("_bin".to_string(), vec![1.0; y.len()]);
+        let drawn = violin_series(&table, &y, &[1.0], 0, [0.2, 0.4, 0.8, 0.55]);
+        let Series::Triangles { xs, ys, color } = &drawn[0] else {
+            panic!("violin fill should be triangles");
+        };
+        assert!((color[3] - 0.55).abs() < 1e-6);
+        assert_eq!(xs.len() % 3, 0);
+        assert_eq!(xs.len(), ys.len());
+        assert!(xs.len() > 12);
+        let Series::Polyline {
+            xs: outline,
+            color: edge,
+            thickness,
+            ..
+        } = &drawn[1]
+        else {
+            panic!("violin should keep a solid outline");
+        };
+        assert!((*thickness - 1.0).abs() < 1e-6);
+        assert_eq!(edge[3], 0.0);
+        let mut widths: Vec<f32> = outline
+            .iter()
+            .copied()
+            .filter(|value| value.is_finite())
+            .map(f32::abs)
+            .collect();
+        widths.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        widths.dedup_by(|a, b| (*a - *b).abs() < 1e-4);
+        assert!(
+            widths.len() > 4,
+            "outline widths should follow the density, not a rectangle"
+        );
     }
 }
