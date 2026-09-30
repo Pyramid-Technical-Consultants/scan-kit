@@ -15,17 +15,18 @@ pub use geometry::{
     beam_angle_mrad, fit_iso_plane, fit_line, magnet_pivot_z, parse_ic_geometry, IcGeometry,
     IC1_Z_MM, IC2_Z_MM, IC_SEP_MM,
 };
-pub use plot::{map_span, Control, DataTable, Panel, PlotScene, Series};
+pub use plot::{format_tick, map_span, Control, DataTable, Panel, PlotScene, Series};
 pub use session_log::{compare_templates, parse_session_log, LayerEvent, SessionLog};
 pub use signal::{
-    arc_fit, arc_predict, beam_off_edges, beam_on_mask, calibration_factor, coverage_percent,
-    cumsum, density_counts, dose_error_pct, dose_ratio_pct, dvh, filter_beam_state, fit_decay,
-    g2_ic2_mm, gamma_index, histogram, hv_capacitance_pf, hv_delta_v, hv_expected_pf,
-    hv_firmware_flags, hv_step_window, linear_fit, median_finite, mip_xy, quantile_edges, remap,
-    remap_g2_raw, remap_g2_raw_reversed, remap_g3_raw, remap_g3_raw_reversed, resample_nearest,
-    scale_column, settled_after_step, sliding_background, spill_segments, splat_gaussians,
-    sums_by_spot_id, sums_by_spot_run, trapz, welch_psd, ArcFit, BeamState, G2_MM_PER_STRIP,
-    G2_STRIP_CENTER, G3_STRIP_CENTER, G3_STRIP_PITCH_MM, MIN_SPILL_GAP_MS,
+    arc_fit, arc_predict, assign_bin_centers, beam_off_edges, beam_on_mask, box_stats,
+    calibration_factor, coverage_percent, cumsum, density_counts, dose_error_pct, dose_ratio_pct,
+    dvh, filter_beam_state, fit_decay, g2_ic2_mm, gamma_index, histogram, hv_capacitance_pf,
+    hv_delta_v, hv_expected_pf, hv_firmware_flags, hv_step_window, linear_fit, median_finite,
+    mip_xy, quantile_edges, remap, remap_g2_raw, remap_g2_raw_reversed, remap_g3_raw,
+    remap_g3_raw_reversed, resample_nearest, scale_column, settled_after_step, sliding_background,
+    spill_segments, splat_gaussians, sums_by_spot_id, sums_by_spot_run, trapz, welch_psd, ArcFit,
+    BeamState, BoxStats, G2_MM_PER_STRIP, G2_STRIP_CENTER, G3_STRIP_CENTER, G3_STRIP_PITCH_MM,
+    MIN_SPILL_GAP_MS,
 };
 
 pub use schema::{

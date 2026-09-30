@@ -22,6 +22,96 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 
+const BINNED_PRESETS: Record<string, Record<string, string>> = {
+  "Dose error vs Energy": {
+    metric: "Dose Error (%)",
+    x: "Energy",
+    glyph: "Box",
+    trend: "On",
+    hist: "On",
+    corr: "On",
+  },
+  "Dose error mean vs Energy": {
+    metric: "Dose Error (%)",
+    x: "Energy",
+    glyph: "Mean",
+    trend: "On",
+    hist: "On",
+    corr: "On",
+  },
+  "Dose ratios vs Energy": {
+    metric: "Dose Ratios",
+    x: "Energy",
+    glyph: "Box",
+    trend: "On",
+    corr: "On",
+  },
+  "Dose rate vs Energy": {
+    metric: "Dose Rate (MU/s)",
+    x: "Energy",
+    glyph: "Mean",
+    trend: "On",
+  },
+  "Current ratios vs Energy": {
+    metric: "Current Ratios (%)",
+    x: "Energy",
+    glyph: "Mean",
+    trend: "On",
+  },
+  "IC current vs Energy": {
+    metric: "IC Current (nA)",
+    x: "Energy",
+    glyph: "Box",
+    trend: "On",
+  },
+  "Position error vs Energy": {
+    metric: "Position Error (mm)",
+    x: "Energy",
+    glyph: "Violin",
+    trend: "Off",
+  },
+  "Sigma vs Energy": {
+    metric: "Sigma (mm)",
+    x: "Energy",
+    glyph: "Violin",
+    trend: "Off",
+  },
+  "IC2-IC1 position vs Energy": {
+    metric: "IC2-IC1 Position (mm)",
+    x: "Energy",
+    glyph: "Violin",
+    trend: "Off",
+  },
+  "Spot time vs Energy": {
+    metric: "Spot Delivery Time",
+    x: "Energy",
+    glyph: "Box",
+    trend: "On",
+  },
+  "Dose error vs Target MU": {
+    metric: "Dose Error (%)",
+    x: "Target MU",
+    glyph: "Box",
+    trend: "On",
+    hist: "On",
+    corr: "On",
+  },
+  "Dose ratios vs Spot time": {
+    metric: "Dose Ratios",
+    x: "Spot time",
+    glyph: "Box",
+    trend: "On",
+    corr: "On",
+  },
+  "Dose ratios vs Beam radius": {
+    metric: "Dose Ratios",
+    x: "Radius",
+    glyph: "Box",
+    trend: "On",
+    corr: "On",
+  },
+};
+
 export type ViewControl = {
   id: string;
   label: string;
@@ -254,14 +344,28 @@ export function AnalysisView({
         <h2 className="text-sm font-medium">{frame?.title ?? "Analysis"}</h2>
         {(frame?.controls ?? []).map((control) => {
           const items = control.options.map((option) => ({ label: option, value: option }));
+          const stored = options[control.id];
+          const value = stored != null && control.options.includes(stored) ? stored : control.value;
           return (
             <Field key={control.id}>
               <FieldLabel>{control.label}</FieldLabel>
               <Select
                 items={items}
-                value={options[control.id] ?? control.value}
+                value={value}
                 onValueChange={(value) => {
                   if (value == null) {
+                    return;
+                  }
+                  if (control.id === "preset") {
+                    const preset = BINNED_PRESETS[value];
+                    setOptions((current) => ({
+                      ...current,
+                      hist: "Off",
+                      corr: "Off",
+                      trend: "On",
+                      ...preset,
+                      preset: value,
+                    }));
                     return;
                   }
                   setOptions((current) => ({ ...current, [control.id]: value }));

@@ -234,6 +234,86 @@ fn quantile_sorted(sorted: &[f32], q: f32) -> f32 {
     sorted[lo] * (1.0 - t) + sorted[hi] * t
 }
 
+/// Map each value to the center of its quantile bin. Out of range is NaN.
+///
+/// Matches `numpy.digitize` on the interior edges with the last bin closed
+/// on the right, which is what the 1.8 binned summary uses.
+pub fn assign_bin_centers(values: &[f32], edges: &[f32]) -> Vec<f32> {
+    let mut out = vec![f32::NAN; values.len()];
+    if edges.len() < 2 {
+        return out;
+    }
+    let centers: Vec<f32> = edges
+        .windows(2)
+        .map(|pair| pair[0].midpoint(pair[1]))
+        .collect();
+    let interior = &edges[1..edges.len() - 1];
+    for (slot, value) in out.iter_mut().zip(values) {
+        if !value.is_finite() || *value < edges[0] || *value > edges[edges.len() - 1] {
+            continue;
+        }
+        let mut index = 0usize;
+        for edge in interior {
+            if *value >= *edge {
+                index += 1;
+            }
+        }
+        *slot = centers[index.min(centers.len() - 1)];
+    }
+    out
+}
+
+/// Matplotlib boxplot stats. Whiskers are the extreme points inside 1.5 IQR.
+pub struct BoxStats {
+    pub q1: f32,
+    pub median: f32,
+    pub q3: f32,
+    pub whisker_lo: f32,
+    pub whisker_hi: f32,
+    pub fliers: Vec<f32>,
+}
+
+pub fn box_stats(values: &[f32]) -> Option<BoxStats> {
+    let mut sorted: Vec<f32> = values
+        .iter()
+        .copied()
+        .filter(|value| value.is_finite())
+        .collect();
+    if sorted.is_empty() {
+        return None;
+    }
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let q1 = quantile_sorted(&sorted, 0.25);
+    let median = quantile_sorted(&sorted, 0.5);
+    let q3 = quantile_sorted(&sorted, 0.75);
+    let iqr = q3 - q1;
+    let fence_lo = q1 - 1.5 * iqr;
+    let fence_hi = q3 + 1.5 * iqr;
+    let whisker_lo = sorted
+        .iter()
+        .copied()
+        .find(|value| *value >= fence_lo)
+        .unwrap_or(q1);
+    let whisker_hi = sorted
+        .iter()
+        .rev()
+        .copied()
+        .find(|value| *value <= fence_hi)
+        .unwrap_or(q3);
+    let fliers = sorted
+        .into_iter()
+        .filter(|value| *value < fence_lo || *value > fence_hi)
+        .collect();
+    Some(BoxStats {
+        q1,
+        median,
+        q3,
+        whisker_lo,
+        whisker_hi,
+        fliers,
+    })
+}
+
 /// Histogram counts and edges covering the finite values.
 pub fn histogram(values: &[f32], bins: usize) -> (Vec<f32>, Vec<f32>) {
     let finite: Vec<f32> = values
@@ -1351,5 +1431,22 @@ mod tests {
         let cfg = r#"{"dose_controller/safety_test/hv_transient_test/starting_voltage":0,"dose_controller/safety_test/hv_transient_test/ending_voltage":80,"dose_controller/safety_test/hv_transient_primary_channel_test/expected_capacitance":12.5}"#;
         assert!((hv_delta_v(cfg).unwrap() - 80.0).abs() < 1e-3);
         assert!((hv_expected_pf(cfg).unwrap() - 12.5).abs() < 1e-3);
+    }
+
+    #[test]
+    fn binned_box_and_quantile_centers_match_the_python_rules() {
+        let stats = box_stats(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0]).unwrap();
+        assert!((stats.q1 - 3.25).abs() < 1e-4);
+        assert!((stats.q3 - 7.75).abs() < 1e-4);
+        assert!((stats.whisker_lo - 1.0).abs() < 1e-4);
+        assert!((stats.whisker_hi - 10.0).abs() < 1e-4);
+        assert!(stats.fliers.is_empty());
+        let centers = assign_bin_centers(&[0.0, 9.9, 10.0, 20.0, -1.0, 21.0], &[0.0, 10.0, 20.0]);
+        assert!((centers[0] - 5.0).abs() < 1e-4);
+        assert!((centers[1] - 5.0).abs() < 1e-4);
+        assert!((centers[2] - 15.0).abs() < 1e-4);
+        assert!((centers[3] - 15.0).abs() < 1e-4);
+        assert!(centers[4].is_nan());
+        assert!(centers[5].is_nan());
     }
 }

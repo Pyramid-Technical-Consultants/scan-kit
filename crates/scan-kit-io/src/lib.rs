@@ -4,6 +4,7 @@
 //! reimplement them.
 
 mod analysis;
+mod binned;
 mod columns;
 mod discover;
 mod store;

@@ -6,12 +6,12 @@ use std::path::{Path, PathBuf};
 
 use scan_kit_core::{
     arc_fit, arc_predict, beam_angle_mrad, beam_off_edges, beam_on_mask, calibration_factor,
-    compare_templates, coverage_percent, cumsum, density_counts, dose_error_pct, dvh,
-    filter_beam_state, fit_decay, fit_iso_plane, gamma_index, histogram, hv_capacitance_pf,
-    hv_delta_v, hv_expected_pf, hv_firmware_flags, hv_step_window, linear_fit, magnet_pivot_z,
-    mip_xy, parse_session_log, quantile_edges, resample_nearest, resolve_concept_column,
-    scale_column, settled_after_step, spill_segments, splat_gaussians, sums_by_spot_id, welch_psd,
-    BeamState, Control, DataTable, Panel, PlotScene, Series, IC1_Z_MM, IC2_Z_MM, MIN_SPILL_GAP_MS,
+    compare_templates, coverage_percent, cumsum, density_counts, dvh, filter_beam_state, fit_decay,
+    fit_iso_plane, gamma_index, histogram, hv_capacitance_pf, hv_delta_v, hv_expected_pf,
+    hv_firmware_flags, hv_step_window, linear_fit, magnet_pivot_z, mip_xy, parse_session_log,
+    resample_nearest, resolve_concept_column, scale_column, settled_after_step, spill_segments,
+    splat_gaussians, sums_by_spot_id, welch_psd, BeamState, Control, DataTable, Panel, PlotScene,
+    Series, IC1_Z_MM, IC2_Z_MM, MIN_SPILL_GAP_MS,
 };
 use serde_json::{json, Value};
 
@@ -403,146 +403,7 @@ fn distribution(root: &Path, session_ids: &[String], options: &Value) -> PlotSce
 }
 
 fn binned_summary(root: &Path, session_ids: &[String], options: &Value) -> PlotScene {
-    let metric = text_option(options, "metric", "dose_error");
-    let grain = text_option(options, "grain", "spot");
-    let axis = text_option(options, "axis", "energy");
-    let style = text_option(options, "style", "mean");
-    let mut mean_x = Vec::new();
-    let mut mean_y = Vec::new();
-    let mut raw_x = Vec::new();
-    let mut raw_y = Vec::new();
-    let mut box_x = Vec::new();
-    let mut box_lo = Vec::new();
-    let mut box_hi = Vec::new();
-    let mut box_mid = Vec::new();
-    for session in session_ids {
-        let map = load_csv(root, session, "input_map.csv");
-        let spots = load_csv(root, session, "spot_data.csv");
-        let timeslice = if grain == "timeslice" || metric == "current" {
-            load_timeslice(root, session)
-        } else {
-            BTreeMap::new()
-        };
-        let (x_axis, values) = if grain == "timeslice" {
-            let samples = col(&timeslice, "ic1_current").unwrap_or(&[]);
-            let index: Vec<f32> = (0..samples.len()).map(|i| i as f32).collect();
-            (index, samples.to_vec())
-        } else {
-            let values = match metric {
-                "dose" => col(&spots, "ic1_total_dose").unwrap_or(&[]).to_vec(),
-                "current" => col(&timeslice, "ic1_current").unwrap_or(&[]).to_vec(),
-                _ => {
-                    let target = col(&map, "charge_req").unwrap_or(&[]);
-                    let dose = col(&spots, "ic1_total_dose").unwrap_or(&[]);
-                    dose_error_pct(dose, target)
-                }
-            };
-            let axis_values = match axis {
-                "mu" => col(&map, "charge_req").unwrap_or(&[]).to_vec(),
-                "time" => (0..values.len()).map(|i| i as f32).collect(),
-                "radius" => {
-                    let x = col(&spots, "position_x")
-                        .or_else(|| col(&map, "position_x"))
-                        .unwrap_or(&[]);
-                    let y = col(&spots, "position_y")
-                        .or_else(|| col(&map, "position_y"))
-                        .unwrap_or(&[]);
-                    x.iter().zip(y).map(|(px, py)| px.hypot(*py)).collect()
-                }
-                _ => col(&map, "energy").unwrap_or(&[]).to_vec(),
-            };
-            (axis_values, values)
-        };
-        let edges = quantile_edges(&x_axis, 6);
-        if edges.len() < 2 {
-            continue;
-        }
-        for (bin_i, window) in edges.windows(2).enumerate() {
-            let last = bin_i + 2 == edges.len();
-            let mut bin = Vec::new();
-            let mut bin_x = Vec::new();
-            for (e, v) in x_axis.iter().zip(&values) {
-                let inside = *e >= window[0] && (*e < window[1] || (last && *e <= window[1]));
-                if e.is_finite() && v.is_finite() && inside {
-                    bin.push(*v);
-                    bin_x.push(*e);
-                }
-            }
-            if bin.is_empty() {
-                continue;
-            }
-            let center = window[0].midpoint(window[1]);
-            let mean = bin.iter().sum::<f32>() / bin.len() as f32;
-            mean_x.push(center);
-            mean_y.push(mean);
-            if raw_x.len() < 1500 {
-                raw_x.extend(bin_x);
-                raw_y.extend_from_slice(&bin);
-            }
-            bin.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            box_x.push(center);
-            box_lo.push(quantile_at(&bin, 0.25));
-            box_hi.push(quantile_at(&bin, 0.75));
-            box_mid.push(quantile_at(&bin, 0.5));
-        }
-    }
-    let (xs, ys, title) = match style {
-        "scatter" => (raw_x, raw_y, "scatter"),
-        "box" => (box_x.clone(), box_mid.clone(), "box"),
-        _ => (mean_x.clone(), mean_y.clone(), "mean"),
-    };
-    let (xmin, xmax) = span(&xs);
-    let (ymin, ymax) = span(&ys);
-    let mut series = vec![Series::Points {
-        xs: xs.clone(),
-        ys: ys.clone(),
-        color: BLUE,
-        radius: 3.0,
-    }];
-    if style == "mean" {
-        series.push(Series::Polyline {
-            xs: mean_x,
-            ys: mean_y,
-            color: ORANGE,
-            thickness: 1.5,
-        });
-    }
-    if style == "box" {
-        let mut vx = Vec::new();
-        let mut vy = Vec::new();
-        for i in 0..box_x.len() {
-            vx.extend([box_x[i], box_x[i], f32::NAN]);
-            vy.extend([box_lo[i], box_hi[i], f32::NAN]);
-        }
-        series.push(Series::Polyline {
-            xs: vx,
-            ys: vy,
-            color: ORANGE,
-            thickness: 4.0,
-        });
-    }
-    scene(
-        "Binned Summary",
-        vec![panel(
-            format!("{title} vs {axis}"),
-            xmin,
-            xmax,
-            ymin,
-            ymax,
-            series,
-        )],
-        vec![
-            control(
-                "metric",
-                "Metric",
-                &["dose_error", "dose", "current"],
-                metric,
-            ),
-            control("axis", "Axis", &["energy", "mu", "time", "radius"], axis),
-            control("style", "Style", &["mean", "scatter", "box"], style),
-            control("grain", "Grain", &["spot", "timeslice"], grain),
-        ],
-    )
+    super::binned::binned_summary(root, session_ids, options)
 }
 
 fn replay(root: &Path, session_ids: &[String], options: &Value) -> PlotScene {
@@ -1194,6 +1055,8 @@ fn scene(title: &str, panels: Vec<Panel>, controls: Vec<Control>) -> PlotScene {
         controls,
         table: None,
         samples: Vec::new(),
+        columns: 0,
+        column_weights: Vec::new(),
     }
 }
 
@@ -1215,6 +1078,7 @@ fn panel(title: String, xmin: f32, xmax: f32, ymin: f32, ymax: f32, series: Vec<
         ymin,
         ymax,
         series,
+        x_labels: Vec::new(),
     }
 }
 
@@ -1391,7 +1255,7 @@ fn numeric_columns(bytes: &[u8]) -> Result<BTreeMap<String, Vec<f32>>, String> {
         for (index, name) in headers.iter().enumerate() {
             let value = record
                 .get(index)
-                .and_then(|text| text.parse().ok())
+                .and_then(|text| text.trim().parse().ok())
                 .unwrap_or(f32::NAN);
             if let Some(column) = columns.get_mut(name) {
                 column.push(value);
@@ -1756,14 +1620,6 @@ fn select_pairs(
     (kept_x, kept_y)
 }
 
-fn quantile_at(sorted: &[f32], p: f32) -> f32 {
-    if sorted.is_empty() {
-        return f32::NAN;
-    }
-    let index = ((sorted.len() - 1) as f32 * p).round() as usize;
-    sorted[index.min(sorted.len() - 1)]
-}
-
 fn ramp_window(samples: &[f32], edge: usize) -> Option<Vec<f32>> {
     let start = edge.saturating_sub(2);
     let stop = (edge + 9).min(samples.len());
@@ -1939,12 +1795,15 @@ mod tests {
 
     fn has_kind(scene: &PlotScene, kind: &str) -> bool {
         scene.panels.iter().any(|panel| {
-            panel.series.iter().any(|series| match (kind, series) {
-                ("line", Series::Polyline { .. }) => true,
-                ("bars", Series::Bars { .. }) => true,
-                ("points", Series::Points { .. }) => true,
-                ("heat", Series::Heatmap { .. }) => true,
-                _ => false,
+            panel.series.iter().any(|series| {
+                matches!(
+                    (kind, series),
+                    ("line", Series::Polyline { .. })
+                        | ("bars", Series::Bars { .. })
+                        | ("points", Series::Points { .. })
+                        | ("rects", Series::Rects { .. })
+                        | ("heat", Series::Heatmap { .. })
+                )
             })
         })
     }
@@ -1971,8 +1830,25 @@ mod tests {
     #[test]
     fn sk_req_017_binned_summary_and_replay_share_the_session() {
         let binned = scene_of("binned_summary");
-        assert!(has_kind(&binned, "points"));
-        assert!(binned.controls.iter().any(|control| control.id == "axis"));
+        assert!(has_kind(&binned, "rects"));
+        assert!(binned
+            .controls
+            .iter()
+            .any(|control| control.id == "glyph" && control.value == "Violin"));
+        assert!(binned
+            .controls
+            .iter()
+            .any(|control| control.id == "metric" && control.value == "Dose Error (%)"));
+        let ic1 = binned
+            .panels
+            .iter()
+            .find(|panel| panel.title.starts_with("IC1"))
+            .unwrap();
+        assert!(ic1.series.iter().any(|series| match series {
+            Series::Rects { y, .. } => y.iter().any(|value| (*value - 10.0).abs() < 1e-3),
+            _ => false,
+        }));
+        assert!(ic1.x_labels.iter().any(|label| label == "70"));
         let replay = scene_of("timeslice_replay");
         assert!(has_kind(&replay, "line"));
         assert!(replay.controls.iter().any(|control| control.id == "scrub"));
@@ -2024,7 +1900,10 @@ mod tests {
         std::fs::create_dir_all(nested.join("layer-0").join("run-0")).unwrap();
         std::fs::write(nested.join("input_map.csv"), "energy,charge_req\n70,1\n").unwrap();
         std::fs::write(
-            nested.join("layer-0").join("run-0").join("timeslice_data_device_units.csv"),
+            nested
+                .join("layer-0")
+                .join("run-0")
+                .join("timeslice_data_device_units.csv"),
             "r_ic1_current_dose\n1\n",
         )
         .unwrap();
@@ -2050,7 +1929,10 @@ mod tests {
         assert!(!names.contains(&"only_sibling"));
         assert_eq!(loaded["energy_layers"], 1);
         let scene = analysis_scene("binned_summary", &root, &["a".into()], &json!({})).unwrap();
-        assert!(scene.panels.iter().any(|panel| panel.title.contains("energy")));
+        assert!(scene
+            .panels
+            .iter()
+            .any(|panel| panel.title.contains("energy")));
         let _ = std::fs::remove_dir_all(&root);
     }
 }

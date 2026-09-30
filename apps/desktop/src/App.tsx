@@ -22,6 +22,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import { SessionContextMenu } from "@/session-menu";
 import {
   Menubar,
   MenubarCheckboxItem,
@@ -176,6 +177,8 @@ type About = {
 
 type NoteEdit = { sessionId: string; before: string; after: string };
 
+type SessionMenu = { sessionId: string; x: number; y: number };
+
 type Geometry = {
   width: number | null;
   height: number | null;
@@ -329,6 +332,7 @@ export default function App() {
   const [size, setSize] = useState({ width: 0, height: 0 });
   const [tab, setTab] = useState<LauncherView>("Data Analysis");
   const [analysis, setAnalysis] = useState<string | null>(null);
+  const [sessionMenu, setSessionMenu] = useState<SessionMenu | null>(null);
   const selectedIds = useMemo(
     () => rows.filter((row) => row.selected).map((row) => row.session_id),
     [rows],
@@ -775,7 +779,11 @@ export default function App() {
           {message != null ? (
             <div className="text-destructive px-3 pb-2 text-sm">{message}</div>
           ) : null}
-          <div ref={host} className="min-h-0 flex-1">
+          <div
+            ref={host}
+            className="min-h-0 flex-1"
+            onContextMenu={(event) => event.preventDefault()}
+          >
             {theme != null && size.width > 0 && size.height > 0 ? (
               <DataEditor
                 width={size.width}
@@ -784,6 +792,20 @@ export default function App() {
                 rows={rows.length}
                 getCellContent={getCellContent}
                 onCellEdited={onCellEdited}
+                onCellContextMenu={([, rowIndex], event) => {
+                  event.preventDefault();
+                  const source = order[rowIndex];
+                  const row = source == null ? undefined : rows[source];
+                  const box = host.current?.getBoundingClientRect();
+                  if (row == null || box == null) {
+                    return;
+                  }
+                  setSessionMenu({
+                    sessionId: row.session_id,
+                    x: box.left + event.bounds.x + event.localEventX,
+                    y: box.top + event.bounds.y + event.localEventY,
+                  });
+                }}
                 onHeaderClicked={(col) => {
                   const key = COLUMN_SORT[col];
                   if (key == null) {
@@ -799,6 +821,21 @@ export default function App() {
                 rowMarkers="none"
                 smoothScrollX
                 smoothScrollY
+              />
+            ) : null}
+            {sessionMenu != null ? (
+              <SessionContextMenu
+                sessionId={sessionMenu.sessionId}
+                x={sessionMenu.x}
+                y={sessionMenu.y}
+                onClose={() => setSessionMenu(null)}
+                onCopy={(id) => {
+                  void navigator.clipboard.writeText(id).then(
+                    () => setMessage(`Copied session ${id}`),
+                    () => setMessage(id),
+                  );
+                }}
+                onTune={() => selectTab("Configuration Tuning")}
               />
             ) : null}
           </div>

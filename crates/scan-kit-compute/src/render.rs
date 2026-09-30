@@ -4,6 +4,8 @@
 //! RGBA target and the frame is read back. Without an adapter the same
 //! triangles are filled on the CPU so a headless check still sees the picture.
 
+use std::sync::OnceLock;
+
 use scan_kit_core::{map_span, Panel, PlotScene, Series};
 
 use crate::{request_device, ComputeError};
@@ -57,10 +59,9 @@ pub fn render_plot(
     let width = width.clamp(16, 1600);
     let height = height.clamp(16, 1200);
     let triangles = scene_triangles(scene, width, height, foreground);
-    let cpu = raster_cpu(width, height, background, &triangles);
     match raster_gpu(width, height, background, &triangles) {
         Ok(frame) => Ok(frame),
-        Err(ComputeError::NoAdapter) => Ok(cpu),
+        Err(ComputeError::NoAdapter) => Ok(raster_cpu(width, height, background, &triangles)),
         Err(ComputeError::Message(message)) => Err(message),
     }
 }
@@ -77,7 +78,13 @@ pub fn compile_plot_shader() -> Result<(), String> {
 
 fn scene_triangles(scene: &PlotScene, width: u32, height: u32, foreground: [f32; 4]) -> Vec<Tri> {
     let mut triangles = Vec::new();
-    let rects = panel_rects(scene.panels.len(), width, height);
+    let rects = panel_rects(
+        scene.panels.len(),
+        width,
+        height,
+        scene.columns,
+        &scene.column_weights,
+    );
     for (panel, rect) in scene.panels.iter().zip(rects) {
         push_panel(&mut triangles, panel, rect, foreground);
     }
@@ -92,16 +99,37 @@ struct Rect {
     h: f32,
 }
 
-fn panel_rects(count: usize, width: u32, height: u32) -> Vec<Rect> {
+fn panel_rects(count: usize, width: u32, height: u32, columns: u32, weights: &[f32]) -> Vec<Rect> {
     if count == 0 {
         return Vec::new();
     }
-    let cols = (count as f32).sqrt().ceil() as usize;
+    let cols = if columns == 0 {
+        (count as f32).sqrt().ceil() as usize
+    } else {
+        columns.max(1) as usize
+    };
     let rows = count.div_ceil(cols);
     let gap = 12.0f32;
     let margin = 8.0f32;
-    let cell_w =
-        (width as f32 - margin * 2.0 - gap * (cols.saturating_sub(1) as f32)) / cols as f32;
+    let inner_w = width as f32 - margin * 2.0 - gap * (cols.saturating_sub(1) as f32);
+    let col_weight: Vec<f32> = if weights.len() == cols {
+        weights.to_vec()
+    } else {
+        vec![1.0; cols]
+    };
+    let weight_sum = col_weight.iter().sum::<f32>().max(1e-6);
+    let mut col_x = Vec::with_capacity(cols);
+    let mut col_w = Vec::with_capacity(cols);
+    let mut x = margin;
+    for (index, weight) in col_weight.iter().enumerate() {
+        let cell_w = inner_w * weight / weight_sum;
+        col_x.push(x);
+        col_w.push(cell_w);
+        x += cell_w;
+        if index + 1 < cols {
+            x += gap;
+        }
+    }
     let cell_h =
         (height as f32 - margin * 2.0 - gap * (rows.saturating_sub(1) as f32)) / rows as f32;
     (0..count)
@@ -109,9 +137,9 @@ fn panel_rects(count: usize, width: u32, height: u32) -> Vec<Rect> {
             let col = index % cols;
             let row = index / cols;
             Rect {
-                x: margin + col as f32 * (cell_w + gap),
+                x: col_x[col],
                 y: margin + row as f32 * (cell_h + gap),
-                w: cell_w,
+                w: col_w[col],
                 h: cell_h,
             }
         })
@@ -119,11 +147,22 @@ fn panel_rects(count: usize, width: u32, height: u32) -> Vec<Rect> {
 }
 
 fn push_panel(triangles: &mut Vec<Tri>, panel: &Panel, rect: Rect, foreground: [f32; 4]) {
+    let title_px = if panel.title.is_empty() { 0.0 } else { 16.0 };
+    if title_px > 0.0 {
+        draw_text(
+            triangles,
+            &panel.title,
+            rect.x + 28.0,
+            rect.y + 1.0,
+            rect.w - 32.0,
+            foreground,
+        );
+    }
     let plot = Rect {
-        x: rect.x + 36.0,
-        y: rect.y + 8.0,
-        w: (rect.w - 44.0).max(8.0),
-        h: (rect.h - 28.0).max(8.0),
+        x: rect.x + 64.0,
+        y: rect.y + 4.0 + title_px,
+        w: (rect.w - 72.0).max(8.0),
+        h: (rect.h - 32.0 - title_px).max(8.0),
     };
     // Axis frame, so an empty panel is still a plot.
     push_quad(
@@ -135,6 +174,7 @@ fn push_panel(triangles: &mut Vec<Tri>, panel: &Panel, rect: Rect, foreground: [
         foreground,
     );
     push_quad(triangles, plot.x, plot.y, 1.0, plot.h, foreground);
+    draw_ticks(triangles, panel, plot, foreground);
     for series in &panel.series {
         match series {
             Series::Polyline {
@@ -189,6 +229,21 @@ fn push_panel(triangles: &mut Vec<Tri>, panel: &Panel, rect: Rect, foreground: [
                     );
                 }
             }
+            Series::Guide {
+                xs,
+                ys,
+                color,
+                thickness,
+            } => {
+                push_polyline(triangles, xs, ys, *color, *thickness, panel, plot);
+            }
+            Series::Rects { x, y, w, h, color } => {
+                for (((left, bottom), width), height) in x.iter().zip(y).zip(w).zip(h) {
+                    push_data_rect(
+                        triangles, panel, plot, *left, *bottom, *width, *height, *color,
+                    );
+                }
+            }
             Series::Heatmap { values, cols, rows } => {
                 if *cols == 0 || *rows == 0 {
                     continue;
@@ -230,6 +285,74 @@ fn push_panel(triangles: &mut Vec<Tri>, panel: &Panel, rect: Rect, foreground: [
             }
         }
     }
+}
+
+fn draw_ticks(triangles: &mut Vec<Tri>, panel: &Panel, plot: Rect, color: [f32; 4]) {
+    for value in nice_ticks(panel.ymin, panel.ymax, 4) {
+        let py = map_span(value, panel.ymin, panel.ymax, plot.y + plot.h, plot.y);
+        let text = scan_kit_core::format_tick(value);
+        let width = text.chars().count() as f32 * 12.0;
+        draw_text(
+            triangles,
+            &text,
+            (plot.x - width - 6.0).max(0.0),
+            py - 7.0,
+            width,
+            color,
+        );
+        push_quad(triangles, plot.x - 4.0, py, 4.0, 1.0, color);
+    }
+    if panel.x_labels.is_empty() {
+        for value in nice_ticks(panel.xmin, panel.xmax, 4) {
+            let px = map_span(value, panel.xmin, panel.xmax, plot.x, plot.x + plot.w);
+            let text = scan_kit_core::format_tick(value);
+            let width = text.chars().count() as f32 * 12.0;
+            draw_text(
+                triangles,
+                &text,
+                px - width * 0.5,
+                plot.y + plot.h + 2.0,
+                width + 8.0,
+                color,
+            );
+        }
+    } else {
+        let stride = panel
+            .x_labels
+            .len()
+            .div_ceil((plot.w / 48.0).max(1.0) as usize)
+            .max(1);
+        for (index, label) in panel.x_labels.iter().enumerate() {
+            if index % stride != 0 || label.is_empty() {
+                continue;
+            }
+            let px = map_span(
+                index as f32,
+                panel.xmin,
+                panel.xmax,
+                plot.x,
+                plot.x + plot.w,
+            );
+            let width = label.chars().count() as f32 * 12.0;
+            draw_text(
+                triangles,
+                label,
+                px - width * 0.5,
+                plot.y + plot.h + 2.0,
+                width + 8.0,
+                color,
+            );
+        }
+    }
+}
+
+fn nice_ticks(lo: f32, hi: f32, count: usize) -> Vec<f32> {
+    if !lo.is_finite() || !hi.is_finite() || count < 2 || (hi - lo).abs() < 1e-6 {
+        return vec![lo];
+    }
+    (0..count)
+        .map(|index| lo + (hi - lo) * index as f32 / (count - 1) as f32)
+        .collect()
 }
 
 fn push_polyline(
@@ -284,6 +407,36 @@ fn push_segment(
     });
 }
 
+#[allow(clippy::too_many_arguments)]
+fn push_data_rect(
+    triangles: &mut Vec<Tri>,
+    panel: &Panel,
+    plot: Rect,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    color: [f32; 4],
+) {
+    if !x.is_finite() || !y.is_finite() || !w.is_finite() || !h.is_finite() {
+        return;
+    }
+    let x0 = map_span(x, panel.xmin, panel.xmax, plot.x, plot.x + plot.w);
+    let x1 = map_span(x + w, panel.xmin, panel.xmax, plot.x, plot.x + plot.w);
+    let y0 = map_span(y, panel.ymin, panel.ymax, plot.y + plot.h, plot.y);
+    let y1 = map_span(y + h, panel.ymin, panel.ymax, plot.y + plot.h, plot.y);
+    let left = x0.min(x1);
+    let top = y0.min(y1);
+    push_quad(
+        triangles,
+        left,
+        top,
+        (x1 - x0).abs().max(1.0),
+        (y1 - y0).abs().max(1.0),
+        color,
+    );
+}
+
 fn push_quad(triangles: &mut Vec<Tri>, x: f32, y: f32, w: f32, h: f32, color: [f32; 4]) {
     let a = [x, y];
     let b = [x + w, y];
@@ -329,8 +482,7 @@ fn fill_triangle(frame: &mut [u8], width: u32, height: u32, tri: &Tri) {
             if w0 >= 0.0 && w1 >= 0.0 && w2 >= 0.0 {
                 let index = ((y * width + x) * 4) as usize;
                 if index + 3 < frame.len() {
-                    let bytes = rgba_bytes(tri.color);
-                    frame[index..index + 4].copy_from_slice(&bytes);
+                    blend_pixel(frame, index, tri.color);
                 }
             }
         }
@@ -345,50 +497,206 @@ fn push_rgba(frame: &mut Vec<u8>, color: [f32; 4]) {
     frame.extend_from_slice(&rgba_bytes(color));
 }
 
+fn blend_pixel(frame: &mut [u8], index: usize, color: [f32; 4]) {
+    let src = rgba_bytes(color);
+    if src[3] == 255 {
+        frame[index..index + 4].copy_from_slice(&src);
+        return;
+    }
+    let alpha = f32::from(src[3]) / 255.0;
+    for channel in 0..3 {
+        let dst = f32::from(frame[index + channel]);
+        frame[index + channel] =
+            (f32::from(src[channel]) * alpha + dst * (1.0 - alpha)).round() as u8;
+    }
+    frame[index + 3] = 255;
+}
+
+fn draw_text(triangles: &mut Vec<Tri>, text: &str, x: f32, y: f32, max_w: f32, color: [f32; 4]) {
+    let mut cursor = x;
+    for ch in text.chars() {
+        if cursor + 8.0 > x + max_w {
+            break;
+        }
+        let Some(rows) = glyph(ch.to_ascii_uppercase()) else {
+            cursor += 8.0;
+            continue;
+        };
+        for (row, bits) in rows.iter().enumerate() {
+            for col in 0..5 {
+                if bits & (1 << (4 - col)) != 0 {
+                    push_quad(
+                        triangles,
+                        cursor + col as f32 * 2.0,
+                        y + row as f32 * 2.0,
+                        2.0,
+                        2.0,
+                        color,
+                    );
+                }
+            }
+        }
+        cursor += 12.0;
+    }
+}
+
+fn glyph(ch: char) -> Option<[u8; 7]> {
+    // 5×7, top row first, high bit on the left.
+    Some(match ch {
+        ' ' => [0, 0, 0, 0, 0, 0, 0],
+        'A' => [
+            0b01110, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001,
+        ],
+        'B' => [
+            0b11110, 0b10001, 0b10001, 0b11110, 0b10001, 0b10001, 0b11110,
+        ],
+        'C' => [
+            0b01110, 0b10001, 0b10000, 0b10000, 0b10000, 0b10001, 0b01110,
+        ],
+        'D' => [
+            0b11110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b11110,
+        ],
+        'E' => [
+            0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b11111,
+        ],
+        'F' => [
+            0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b10000,
+        ],
+        'G' => [
+            0b01110, 0b10001, 0b10000, 0b10111, 0b10001, 0b10001, 0b01110,
+        ],
+        'H' => [
+            0b10001, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001,
+        ],
+        'I' => [
+            0b01110, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110,
+        ],
+        'J' => [
+            0b00111, 0b00010, 0b00010, 0b00010, 0b10010, 0b10010, 0b01100,
+        ],
+        'K' => [
+            0b10001, 0b10010, 0b10100, 0b11000, 0b10100, 0b10010, 0b10001,
+        ],
+        'L' => [
+            0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b11111,
+        ],
+        'M' => [
+            0b10001, 0b11011, 0b10101, 0b10101, 0b10001, 0b10001, 0b10001,
+        ],
+        'N' => [
+            0b10001, 0b11001, 0b10101, 0b10011, 0b10001, 0b10001, 0b10001,
+        ],
+        'O' => [
+            0b01110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110,
+        ],
+        'P' => [
+            0b11110, 0b10001, 0b10001, 0b11110, 0b10000, 0b10000, 0b10000,
+        ],
+        'Q' => [
+            0b01110, 0b10001, 0b10001, 0b10001, 0b10101, 0b10010, 0b01101,
+        ],
+        'R' => [
+            0b11110, 0b10001, 0b10001, 0b11110, 0b10100, 0b10010, 0b10001,
+        ],
+        'S' => [
+            0b01111, 0b10000, 0b10000, 0b01110, 0b00001, 0b00001, 0b11110,
+        ],
+        'T' => [
+            0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100,
+        ],
+        'U' => [
+            0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110,
+        ],
+        'V' => [
+            0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01010, 0b00100,
+        ],
+        'W' => [
+            0b10001, 0b10001, 0b10001, 0b10101, 0b10101, 0b10101, 0b01010,
+        ],
+        'X' => [
+            0b10001, 0b10001, 0b01010, 0b00100, 0b01010, 0b10001, 0b10001,
+        ],
+        'Y' => [
+            0b10001, 0b10001, 0b01010, 0b00100, 0b00100, 0b00100, 0b00100,
+        ],
+        'Z' => [
+            0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b10000, 0b11111,
+        ],
+        '0' => [
+            0b01110, 0b10001, 0b10011, 0b10101, 0b11001, 0b10001, 0b01110,
+        ],
+        '1' => [
+            0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110,
+        ],
+        '2' => [
+            0b01110, 0b10001, 0b00001, 0b00010, 0b00100, 0b01000, 0b11111,
+        ],
+        '3' => [
+            0b11110, 0b00001, 0b00001, 0b01110, 0b00001, 0b00001, 0b11110,
+        ],
+        '4' => [
+            0b00010, 0b00110, 0b01010, 0b10010, 0b11111, 0b00010, 0b00010,
+        ],
+        '5' => [
+            0b11111, 0b10000, 0b10000, 0b11110, 0b00001, 0b00001, 0b11110,
+        ],
+        '6' => [
+            0b01110, 0b10000, 0b10000, 0b11110, 0b10001, 0b10001, 0b01110,
+        ],
+        '7' => [
+            0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b01000, 0b01000,
+        ],
+        '8' => [
+            0b01110, 0b10001, 0b10001, 0b01110, 0b10001, 0b10001, 0b01110,
+        ],
+        '9' => [
+            0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b00001, 0b01110,
+        ],
+        '/' => [
+            0b00001, 0b00001, 0b00010, 0b00100, 0b01000, 0b10000, 0b10000,
+        ],
+        '%' => [
+            0b11001, 0b11010, 0b00100, 0b00100, 0b01011, 0b10011, 0b00000,
+        ],
+        '(' => [
+            0b00010, 0b00100, 0b01000, 0b01000, 0b01000, 0b00100, 0b00010,
+        ],
+        ')' => [
+            0b01000, 0b00100, 0b00010, 0b00010, 0b00010, 0b00100, 0b01000,
+        ],
+        '.' => [0, 0, 0, 0, 0, 0b00100, 0b00100],
+        '-' => [0, 0, 0, 0b01110, 0, 0, 0],
+        '+' => [0, 0b00100, 0b00100, 0b11111, 0b00100, 0b00100, 0],
+        _ => return None,
+    })
+}
+
 fn rgba_bytes(color: [f32; 4]) -> [u8; 4] {
     color.map(|channel| (channel.clamp(0.0, 1.0) * 255.0).round() as u8)
 }
 
-fn raster_gpu(
-    width: u32,
-    height: u32,
-    background: [f32; 4],
-    triangles: &[Tri],
-) -> Result<Vec<u8>, ComputeError> {
-    if triangles.is_empty() {
-        return Ok(raster_cpu(width, height, background, triangles));
-    }
-    let (device, queue) = pollster_block(request_device())?;
+struct PlotGpu {
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    pipeline: wgpu::RenderPipeline,
+    bind_layout: wgpu::BindGroupLayout,
+}
+
+fn plot_gpu() -> Result<&'static PlotGpu, ComputeError> {
+    static GPU: OnceLock<Option<PlotGpu>> = OnceLock::new();
+    // ponytail: the first frame builds the device and pipeline; later frames reuse them.
+    // A process restart is the recovery if the device is lost.
+    GPU.get_or_init(|| pollster_block(build_plot_gpu()).ok())
+        .as_ref()
+        .ok_or(ComputeError::NoAdapter)
+}
+
+async fn build_plot_gpu() -> Result<PlotGpu, ComputeError> {
+    let (device, queue) = request_device().await?;
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("plot"),
         source: wgpu::ShaderSource::Wgsl(PLOT_SHADER.into()),
     });
-    let mut vertices: Vec<f32> = Vec::with_capacity(triangles.len() * 18);
-    for tri in triangles {
-        for point in tri.p {
-            vertices.extend_from_slice(&point);
-            vertices.extend_from_slice(&tri.color);
-        }
-    }
-    let vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("vertices"),
-        size: (vertices.len() * 4) as u64,
-        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-    let vertex_bytes = bytemuck_f32(&vertices);
-    queue.write_buffer(&vertex_buffer, 0, &vertex_bytes);
-
-    let uniform_data = [width as f32, height as f32, 0.0, 0.0];
-    let uniform = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("uniforms"),
-        size: 16,
-        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-    let uniform_bytes = bytemuck_f32(&uniform_data);
-    queue.write_buffer(&uniform, 0, &uniform_bytes);
-
     let bind_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: None,
         entries: &[wgpu::BindGroupLayoutEntry {
@@ -400,14 +708,6 @@ fn raster_gpu(
                 min_binding_size: None,
             },
             count: None,
-        }],
-    });
-    let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: None,
-        layout: &bind_layout,
-        entries: &[wgpu::BindGroupEntry {
-            binding: 0,
-            resource: uniform.as_entire_binding(),
         }],
     });
     let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -445,7 +745,7 @@ fn raster_gpu(
             compilation_options: Default::default(),
             targets: &[Some(wgpu::ColorTargetState {
                 format: wgpu::TextureFormat::Rgba8Unorm,
-                blend: Some(wgpu::BlendState::REPLACE),
+                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
                 write_mask: wgpu::ColorWrites::ALL,
             })],
         }),
@@ -454,6 +754,60 @@ fn raster_gpu(
         multisample: wgpu::MultisampleState::default(),
         multiview: None,
         cache: None,
+    });
+    Ok(PlotGpu {
+        device,
+        queue,
+        pipeline,
+        bind_layout,
+    })
+}
+
+fn raster_gpu(
+    width: u32,
+    height: u32,
+    background: [f32; 4],
+    triangles: &[Tri],
+) -> Result<Vec<u8>, ComputeError> {
+    if triangles.is_empty() {
+        return Ok(raster_cpu(width, height, background, triangles));
+    }
+    let gpu = plot_gpu()?;
+    let device = &gpu.device;
+    let queue = &gpu.queue;
+    let mut vertices: Vec<f32> = Vec::with_capacity(triangles.len() * 18);
+    for tri in triangles {
+        for point in tri.p {
+            vertices.extend_from_slice(&point);
+            vertices.extend_from_slice(&tri.color);
+        }
+    }
+    let vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("vertices"),
+        size: (vertices.len() * 4) as u64,
+        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let vertex_bytes = bytemuck_f32(&vertices);
+    queue.write_buffer(&vertex_buffer, 0, &vertex_bytes);
+
+    let uniform_data = [width as f32, height as f32, 0.0, 0.0];
+    let uniform = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("uniforms"),
+        size: 16,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let uniform_bytes = bytemuck_f32(&uniform_data);
+    queue.write_buffer(&uniform, 0, &uniform_bytes);
+
+    let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None,
+        layout: &gpu.bind_layout,
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: uniform.as_entire_binding(),
+        }],
     });
 
     let texture = device.create_texture(&wgpu::TextureDescriptor {
@@ -501,7 +855,7 @@ fn raster_gpu(
             timestamp_writes: None,
             occlusion_query_set: None,
         });
-        pass.set_pipeline(&pipeline);
+        pass.set_pipeline(&gpu.pipeline);
         pass.set_bind_group(0, &bind, &[]);
         pass.set_vertex_buffer(0, vertex_buffer.slice(..));
         pass.draw(0..(triangles.len() * 3) as u32, 0..1);
@@ -581,10 +935,13 @@ mod tests {
                     color: [1.0, 0.0, 0.0, 1.0],
                     thickness: 4.0,
                 }],
+                x_labels: Vec::new(),
             }],
             controls: Vec::new(),
             table: None,
             samples: Vec::new(),
+            columns: 0,
+            column_weights: Vec::new(),
         };
         let frame =
             render_plot(&scene, 80, 60, [0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0, 1.0]).unwrap();

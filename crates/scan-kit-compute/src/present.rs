@@ -101,20 +101,38 @@ pub fn run_view(
 
 fn apply_palette(scene: &mut scan_kit_core::PlotScene, palette: &[[f32; 4]]) {
     if palette.is_empty() {
+        for panel in &mut scene.panels {
+            for series in &mut panel.series {
+                if let Series::Polyline { color, .. } | Series::Points { color, .. } = series {
+                    if color[3] == 0.0 {
+                        color[3] = 1.0;
+                    }
+                }
+            }
+        }
         return;
     }
-    let mut index = 0usize;
     for panel in &mut scene.panels {
+        let mut index = 0usize;
         for series in &mut panel.series {
             let color = palette[index % palette.len()];
             match series {
                 Series::Polyline { color: slot, .. }
                 | Series::Points { color: slot, .. }
-                | Series::Bars { color: slot, .. } => {
-                    *slot = color;
-                    index += 1;
+                | Series::Bars { color: slot, .. }
+                | Series::Rects { color: slot, .. } => {
+                    let alpha = slot[3];
+                    // Alpha 0 keeps the previous series color, so a mean curve and its
+                    // trend stay with that session instead of taking the next chart color.
+                    if alpha == 0.0 && index > 0 {
+                        let color = palette[(index - 1) % palette.len()];
+                        *slot = [color[0], color[1], color[2], 1.0];
+                    } else {
+                        *slot = [color[0], color[1], color[2], alpha.max(0.05)];
+                        index += 1;
+                    }
                 }
-                Series::Heatmap { .. } => {}
+                Series::Heatmap { .. } | Series::Guide { .. } => {}
             }
         }
     }

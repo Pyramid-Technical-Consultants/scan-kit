@@ -46,5 +46,7 @@ Versions below are the ones locked for the workspace. Anomaly review for a SOUP 
 | Base UI (`@base-ui/react`) | see `apps/desktop/package.json` | Behavior of shadcn components |
 | `@glideapps/glide-data-grid` | see `apps/desktop/package.json` | Session list and later column views |
 | `@tauri-apps/plugin-dialog` | see `apps/desktop/package.json` | Open Data Folder dialog |
+| vitest | see `apps/desktop/package.json` | Desktop UI checks. Not linked into the product binary |
+| happy-dom | see `apps/desktop/package.json` | DOM for those checks. Not linked into the product binary |
 
 shadcn component source copied into `apps/desktop/src/components/ui/` is project software, not SOUP. The packages those components import are SOUP and are listed through `package.json`.
