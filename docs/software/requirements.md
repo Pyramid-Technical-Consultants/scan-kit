@@ -59,7 +59,7 @@ The kernel lives in `scan-kit-compute`. `wgpu` is the only compute library. The 
 
 Opening an analysis view returns one RGBA frame and the control list for the selected sessions.
 
-`scan_kit_run_view` builds the scene, paints it, and returns the frame with the controls. At most five sessions are accepted. The shell renders those controls. It keeps the plot and blits later frames itself.
+`scan_kit_run_view` builds the scene, paints it, and returns the frame with the controls. At most five sessions are accepted. The shell renders those controls. It loads the same scene as one payload through `scan_kit_open_plot` and draws later frames in the webview with the same renderer.
 
 ## SK-REQ-009
 

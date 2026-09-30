@@ -17,7 +17,7 @@ Git history is the revision record. Each requirement maps to the test that fails
 | SK-REQ-006 | `crates/scan-kit-core` `sk_req_006_g2_alias_and_scale`; `crates/scan-kit-io` `sk_req_006_quoted_csv_projects_two_columns_and_scales_g2` |
 | SK-REQ-007 | `crates/scan-kit-compute` `sk_req_007_storage_buffer_round_trip` |
 | SK-REQ-008 | `crates/scan-kit-compute` `sk_req_008_run_view_returns_a_frame_and_controls` |
-| SK-REQ-009 | `crates/scan-kit-compute` `sk_req_009_plot_shader_compiles_and_draws_a_line` |
+| SK-REQ-009 | `crates/scan-kit-plot` `sk_req_009_plot_shader_compiles_and_draws_a_line` |
 | SK-REQ-010 | `crates/scan-kit-core` `sk_req_010_remap_calibration_and_beam_mask` |
 | SK-REQ-011 | `crates/scan-kit-io` `sk_req_011_timeslice_load_reports_columns` |
 | SK-REQ-012 | `crates/scan-kit-io` `sk_req_012_dose_accumulation_scene_has_cumulative_lines` |

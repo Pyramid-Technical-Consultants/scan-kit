@@ -90,8 +90,9 @@ fn scan_kit_run_view(
     )
 }
 
+/// The packed scene for the webview's wasm plot. Pan, zoom, and hover stay in the webview.
 #[tauri::command]
-fn scan_kit_open_plot(
+async fn scan_kit_open_plot(
     view: String,
     path: String,
     session_ids: Vec<String>,
@@ -99,50 +100,27 @@ fn scan_kit_open_plot(
     background: Vec<f32>,
     foreground: Vec<f32>,
     palette: Vec<Vec<f32>>,
-) -> Result<Value, String> {
+) -> Result<tauri::ipc::Response, String> {
     let background = color4(&background, [0.11, 0.11, 0.12, 1.0]);
     let foreground = color4(&foreground, [0.92, 0.92, 0.93, 1.0]);
     let palette: Vec<[f32; 4]> = palette
         .iter()
         .map(|row| color4(row, [0.9, 0.9, 0.9, 1.0]))
         .collect();
-    scan_kit_compute::open_plot(
-        &view,
-        std::path::Path::new(&path),
-        &session_ids,
-        &options,
-        background,
-        foreground,
-        &palette,
-    )
-}
-
-#[tauri::command]
-async fn scan_kit_plot_frame(
-    id: u64,
-    width: u32,
-    height: u32,
-    x: f32,
-    y: f32,
-    dx: f32,
-    dy: f32,
-    wheel: f32,
-    drag: bool,
-    reset: bool,
-) -> Result<tauri::ipc::Response, String> {
     let bytes = tauri::async_runtime::spawn_blocking(move || {
-        scan_kit_compute::plot_frame(id, width, height, x, y, dx, dy, wheel, drag, reset)
+        scan_kit_compute::open_plot(
+            &view,
+            std::path::Path::new(&path),
+            &session_ids,
+            &options,
+            background,
+            foreground,
+            &palette,
+        )
     })
     .await
     .map_err(|err| err.to_string())??;
     Ok(tauri::ipc::Response::new(bytes))
-}
-
-#[tauri::command]
-async fn scan_kit_plot_hover(id: u64, x: f32, y: f32) -> Result<Value, String> {
-    tauri::async_runtime::spawn_blocking(move || scan_kit_compute::plot_hover(id, x, y))
-        .await
-        .map_err(|err| err.to_string())?
 }
 
 #[tauri::command]
@@ -175,8 +153,6 @@ pub fn run() {
             scan_kit_set_last_main_tab,
             scan_kit_run_view,
             scan_kit_open_plot,
-            scan_kit_plot_frame,
-            scan_kit_plot_hover,
             scan_kit_open_study
         ])
         .run(tauri::generate_context!())

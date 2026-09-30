@@ -4,14 +4,12 @@
 //! the base64 frame that MCP and the view tests use.
 
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
 
 use scan_kit_core::{Series, ToolKind, ToolSpec};
 use scan_kit_io::analysis_scene;
 use serde_json::{json, Value};
 
-use crate::render::{Plot, PlotInput};
+use scan_kit_plot::{encode_plot, Plot, PlotFrame, PlotInput};
 
 const TOOLS: &[ToolSpec] = &[ToolSpec {
     name: "scan_kit_run_view",
@@ -99,22 +97,7 @@ pub fn run_view(
     }))
 }
 
-struct LivePlot {
-    id: u64,
-    plot: Plot,
-}
-
-fn live() -> std::sync::MutexGuard<'static, Option<LivePlot>> {
-    static LIVE: Mutex<Option<LivePlot>> = Mutex::new(None);
-    LIVE.lock().unwrap_or_else(|poison| poison.into_inner())
-}
-
-fn next_id() -> u64 {
-    static NEXT: AtomicU64 = AtomicU64::new(1);
-    NEXT.fetch_add(1, Ordering::Relaxed)
-}
-
-/// Build the view once and keep the plot for pointer frames.
+/// Build the view and pack it for the desktop's wasm plot. See `scan_kit_plot::encode_plot`.
 pub fn open_plot(
     view: &str,
     root: &Path,
@@ -123,69 +106,10 @@ pub fn open_plot(
     background: [f32; 4],
     foreground: [f32; 4],
     palette: &[[f32; 4]],
-) -> Result<Value, String> {
+) -> Result<Vec<u8>, String> {
     let mut scene = analysis_scene(view, root, session_ids, options)?;
     apply_palette(&mut scene, palette);
-    let plot = Plot::new(&scene, background, foreground);
-    let id = next_id();
-    *live() = Some(LivePlot { id, plot });
-    Ok(json!({
-        "id": id,
-        "title": scene.title,
-        "controls": scene.controls,
-        "table": scene.table,
-        "samples": scene.samples,
-    }))
-}
-
-/// Redraw the retained plot. The bytes are a 24-byte header plus RGBA.
-pub fn plot_frame(
-    id: u64,
-    width: u32,
-    height: u32,
-    x: f32,
-    y: f32,
-    dx: f32,
-    dy: f32,
-    wheel: f32,
-    drag: bool,
-    reset: bool,
-) -> Result<Vec<u8>, String> {
-    let mut slot = live();
-    let live = slot.as_mut().ok_or("no plot")?;
-    if live.id != id {
-        return Err("stale plot".into());
-    }
-    let frame = live.plot.draw(
-        width,
-        height,
-        &PlotInput {
-            x,
-            y,
-            dx,
-            dy,
-            wheel,
-            drag,
-            reset,
-        },
-    )?;
-    Ok(pack_frame(frame.width, frame.height, frame.hover_hit, frame.hover_x, frame.hover_y, frame.series, &frame.rgba))
-}
-
-/// Data coordinates under the cursor. This does not copy the frame.
-pub fn plot_hover(id: u64, x: f32, y: f32) -> Result<Value, String> {
-    let slot = live();
-    let live = slot.as_ref().ok_or("no plot")?;
-    if live.id != id {
-        return Err("stale plot".into());
-    }
-    let (hit, hover_x, hover_y, series) = live.plot.hover(x, y);
-    Ok(json!({
-        "hit": hit,
-        "x": hover_x,
-        "y": hover_y,
-        "series": series,
-    }))
+    encode_plot(&scene, background, foreground)
 }
 
 fn paint_once(
@@ -194,46 +118,8 @@ fn paint_once(
     height: u32,
     background: [f32; 4],
     foreground: [f32; 4],
-) -> Result<crate::render::PlotFrame, String> {
-    if scene.panels.is_empty() {
-        return Ok(crate::render::PlotFrame {
-            rgba: Vec::new(),
-            width: 0,
-            height: 0,
-            hover_hit: false,
-            hover_x: 0.0,
-            hover_y: 0.0,
-            series: None,
-        });
-    }
+) -> Result<PlotFrame, String> {
     Plot::new(scene, background, foreground).draw(width, height, &PlotInput::default())
-}
-
-fn pack_frame(
-    width: u32,
-    height: u32,
-    hover_hit: bool,
-    hover_x: f32,
-    hover_y: f32,
-    series: Option<u32>,
-    rgba: &[u8],
-) -> Vec<u8> {
-    let mut flags = 0u32;
-    if hover_hit {
-        flags |= 1;
-    }
-    if series.is_some() {
-        flags |= 2;
-    }
-    let mut out = Vec::with_capacity(24 + rgba.len());
-    out.extend_from_slice(&width.to_le_bytes());
-    out.extend_from_slice(&height.to_le_bytes());
-    out.extend_from_slice(&flags.to_le_bytes());
-    out.extend_from_slice(&hover_x.to_le_bytes());
-    out.extend_from_slice(&hover_y.to_le_bytes());
-    out.extend_from_slice(&series.unwrap_or(u32::MAX).to_le_bytes());
-    out.extend_from_slice(rgba);
-    out
 }
 
 fn apply_palette(scene: &mut scan_kit_core::PlotScene, palette: &[[f32; 4]]) {
@@ -389,7 +275,7 @@ mod tests {
     }
 
     #[test]
-    fn retained_plot_frame_is_a_raw_header_plus_rgba() {
+    fn open_plot_packs_a_header_and_marks_the_plot_can_draw() {
         let root = std::env::temp_dir().join(format!("scan-kit-live-{}", std::process::id()));
         let session = root.join("sess");
         let _ = std::fs::remove_dir_all(&root);
@@ -414,17 +300,14 @@ mod tests {
             &[[0.8, 0.2, 0.2, 1.0]],
         )
         .unwrap();
-        let id = opened["id"].as_u64().unwrap();
-        assert_eq!(opened["title"], "Dose Accumulation");
-        let bytes = plot_frame(id, 80, 60, -1.0, -1.0, 0.0, 0.0, 0.0, false, false).unwrap();
-        assert_eq!(u32::from_le_bytes(bytes[0..4].try_into().unwrap()), 80);
-        assert_eq!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()), 60);
-        assert_eq!(bytes.len(), 24 + 80 * 60 * 4);
-        let again = plot_frame(id, 80, 60, 40.0, 30.0, 0.0, 0.0, 1.0, false, false).unwrap();
-        assert_eq!(again.len(), bytes.len());
-        let hover = plot_hover(id, 40.0, 30.0).unwrap();
-        assert!(hover["hit"].is_boolean());
-        assert!(plot_frame(id + 9, 80, 60, -1.0, -1.0, 0.0, 0.0, 0.0, false, false).is_err());
+        let json_len = u32::from_le_bytes(opened[0..4].try_into().unwrap()) as usize;
+        let header: scan_kit_plot::PlotHeader =
+            serde_json::from_slice(&opened[4..4 + json_len]).unwrap();
+        assert_eq!(header.title, "Dose Accumulation");
+        assert!(header.panels.iter().all(|panel| panel.series.is_empty()));
+        let mut plot = Plot::from_payload(&opened).unwrap();
+        let frame = plot.draw(80, 60, &PlotInput::default()).unwrap();
+        assert_eq!(frame.rgba.len(), 80 * 60 * 4);
         let _ = std::fs::remove_dir_all(&root);
     }
 }

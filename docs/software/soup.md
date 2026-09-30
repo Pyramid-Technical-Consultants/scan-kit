@@ -34,11 +34,15 @@ Versions below are the ones locked for the workspace. Anomaly review for a SOUP 
 | bzip2 | see `crates/scan-kit-io/Cargo.toml` | `.tar.bz2` session archives |
 | xz2 | see `crates/scan-kit-io/Cargo.toml` | `.tar.xz` session archives |
 | csv | see `crates/scan-kit-io/Cargo.toml` | Quoted fields and header drift in session files |
-| wgpu | see `crates/scan-kit-compute/Cargo.toml` | The only GPU and compute library |
-| naga | see `crates/scan-kit-compute/Cargo.toml` | Compile the compute shader when no GPU adapter is present |
-| fontdue | see `crates/scan-kit-compute/Cargo.toml` | Rasterize plot labels into one glyph atlas |
+| wgpu | see `crates/scan-kit-plot/Cargo.toml` and `crates/scan-kit-compute/Cargo.toml` | The only GPU library. The plot crate draws with it natively and in the webview (WebGPU, or WebGL2 through its `webgl` feature). The compute crate runs kernels with it |
+| naga | see `crates/scan-kit-plot/Cargo.toml` and `crates/scan-kit-compute/Cargo.toml` | Compile the plot and compute shaders when no GPU adapter is present |
+| fontdue | see `crates/scan-kit-plot/Cargo.toml` | Rasterize plot labels into one glyph atlas |
+| wasm-bindgen | see `crates/scan-kit-plot/Cargo.toml` | JavaScript bindings for the plot renderer built for `wasm32-unknown-unknown` |
+| wasm-bindgen-futures | see `crates/scan-kit-plot/Cargo.toml` | Await the browser GPU adapter and device from the wasm renderer |
+| web-sys | see `crates/scan-kit-plot/Cargo.toml` | The `HtmlCanvasElement` the wasm renderer draws into |
+| wasm-bindgen-cli | the `wasm-bindgen` version in `Cargo.lock` | Build tool. Generates `apps/desktop/src/wasm` from the plot crate. Not linked into the product binary |
 
-Plot text uses the vendored Source Sans 3 regular face in `crates/scan-kit-compute/assets/SourceSans3-Regular.ttf` (SIL Open Font License, Latin 400 from fontsource 5.2.8). It is compiled into the compute crate with `include_bytes`. It is not a Cargo dependency.
+Plot text uses the vendored Source Sans 3 regular face in `crates/scan-kit-plot/assets/SourceSans3-Regular.ttf` (SIL Open Font License, Latin 400 from fontsource 5.2.8). It is compiled into the plot crate with `include_bytes`. It is not a Cargo dependency.
 
 ## Desktop frontend
 

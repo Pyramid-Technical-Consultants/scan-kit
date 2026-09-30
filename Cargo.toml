@@ -4,6 +4,7 @@ members = [
     "crates/scan-kit-core",
     "crates/scan-kit-io",
     "crates/scan-kit-compute",
+    "crates/scan-kit-plot",
     "crates/scan-kit-dicom",
     "crates/scan-kit-mcp",
     "apps/desktop/src-tauri",
@@ -27,6 +28,7 @@ authors = ["Pyramid Technical Consultants, Inc. <support@ptcusa.com>"]
 scan-kit-core = { path = "crates/scan-kit-core" }
 scan-kit-io = { path = "crates/scan-kit-io" }
 scan-kit-compute = { path = "crates/scan-kit-compute" }
+scan-kit-plot = { path = "crates/scan-kit-plot" }
 scan-kit-dicom = { path = "crates/scan-kit-dicom" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

@@ -7,7 +7,7 @@ alwaysApply: true
 
 Follow [docs/software/architecture.md](docs/software/architecture.md) and [docs/software/software-development-plan.md](docs/software/software-development-plan.md).
 
-- Domain behavior lives in `scan-kit-core` once. Session files and the sqlite store live in `scan-kit-io`. GPU work lives in `scan-kit-compute` and uses `wgpu` only. Register each operation on that crate's tool catalog. `scan-kit-mcp` and Tauri commands call that function. They do not reimplement it.
+- Domain behavior lives in `scan-kit-core` once. Session files and the sqlite store live in `scan-kit-io`. GPU work uses `wgpu` only. Plot drawing lives in `scan-kit-plot`, which also builds to wasm32 for the webview. Do not draw plots in TypeScript or ship frames over the Tauri bridge. Compute kernels live in `scan-kit-compute`. Register each operation on that crate's tool catalog. `scan-kit-mcp` and Tauri commands call that function. They do not reimplement it.
 - Workflow tools call granular functions in process.
 - Do not add a PyO3 bridge or a second Python implementation of ported behavior.
 - A port deletes, in the same change, the Python modules and tests that exist only for that capability. Leave a module that unported code still imports. Files still under `scan_kit/` or `tests/` are unported. Phase 1 itself does not delete product Python.

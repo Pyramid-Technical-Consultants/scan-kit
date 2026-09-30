@@ -3230,10 +3230,10 @@ dependencies = [
 name = "scan-kit-compute"
 version = "2.0.0-dev"
 dependencies = [
- "fontdue",
  "naga",
  "scan-kit-core",
  "scan-kit-io",
+ "scan-kit-plot",
  "serde_json",
  "tokio",
  "wgpu",
@@ -3296,6 +3296,22 @@ dependencies = [
  "scan-kit-io",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "scan-kit-plot"
+version = "2.0.0-dev"
+dependencies = [
+ "fontdue",
+ "naga",
+ "scan-kit-core",
+ "serde",
+ "serde_json",
+ "tokio",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+ "wgpu",
 ]
 
 [[package]]
@@ -4903,6 +4919,7 @@ dependencies = [
  "thiserror 2.0.21",
  "wgpu-core-deps-apple",
  "wgpu-core-deps-emscripten",
+ "wgpu-core-deps-wasm",
  "wgpu-core-deps-windows-linux-android",
  "wgpu-hal",
  "wgpu-types",
@@ -4922,6 +4939,15 @@ name = "wgpu-core-deps-emscripten"
 version = "27.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b06ac3444a95b0813ecfd81ddb2774b66220b264b3e2031152a4a29fda4da6b5"
+dependencies = [
+ "wgpu-hal",
+]
+
+[[package]]
+name = "wgpu-core-deps-wasm"
+version = "27.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9b1027dcf3b027a877e44819df7ceb0e2e98578830f8cd34cd6c3c7c2a7a50b7"
 dependencies = [
  "wgpu-hal",
 ]

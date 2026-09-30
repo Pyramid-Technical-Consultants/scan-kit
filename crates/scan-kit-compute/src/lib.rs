@@ -1,14 +1,14 @@
-//! The only GPU path. Later kernels go through this device.
-//! Nothing else in the workspace links `wgpu`.
+//! Compute kernels and the analysis view tools. Plot drawing lives in
+//! `scan-kit-plot`. These two crates are the only ones that link `wgpu`.
 
 mod kernels;
 mod present;
-mod render;
-mod text;
 
 pub use kernels::compile_scientific_shaders;
-pub use present::{invoke, open_plot, plot_frame, plot_hover, run_view, tool_input_schema, tools};
-pub use render::{compile_plot_shader, plot_shader_source, render_plot};
+pub use present::{invoke, open_plot, run_view, tool_input_schema, tools};
+pub use scan_kit_plot::{
+    compile_plot_shader, plot_shader_source, render_plot, request_device, GpuError as ComputeError,
+};
 
 const SHADER: &str = r#"
 @group(0) @binding(0)
@@ -24,23 +24,6 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 "#;
 
-#[derive(Debug)]
-pub enum ComputeError {
-    NoAdapter,
-    Message(String),
-}
-
-impl std::fmt::Display for ComputeError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::NoAdapter => write!(f, "no GPU adapter"),
-            Self::Message(message) => write!(f, "{message}"),
-        }
-    }
-}
-
-impl std::error::Error for ComputeError {}
-
 pub fn shader_source() -> &'static str {
     SHADER
 }
@@ -54,29 +37,6 @@ pub fn compile_shader() -> Result<(), String> {
     );
     validator.validate(&module).map_err(|err| err.to_string())?;
     Ok(())
-}
-
-/// Shared adapter request. Plot rendering and the round-trip both use it.
-pub async fn request_device() -> Result<(wgpu::Device, wgpu::Queue), ComputeError> {
-    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
-    let adapter = instance
-        .request_adapter(&wgpu::RequestAdapterOptions::default())
-        .await
-        .map_err(|err| {
-            let text = err.to_string().to_lowercase();
-            if text.contains("not found")
-                || text.contains("no adapter")
-                || text.contains("suitable")
-            {
-                ComputeError::NoAdapter
-            } else {
-                ComputeError::Message(err.to_string())
-            }
-        })?;
-    adapter
-        .request_device(&wgpu::DeviceDescriptor::default())
-        .await
-        .map_err(|err| ComputeError::Message(err.to_string()))
 }
 
 /// Add one to each element of a storage buffer and read it back.

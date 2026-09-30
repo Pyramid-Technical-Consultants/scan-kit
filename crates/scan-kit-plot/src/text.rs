@@ -75,10 +75,9 @@ fn glyph(atlas: &Atlas, ch: char) -> Option<&Glyph> {
 }
 
 fn build() -> Atlas {
-    let font = fontdue::Font::from_bytes(FONT, fontdue::FontSettings::default()).expect("plot font");
-    let line = font
-        .horizontal_line_metrics(PX)
-        .expect("plot font metrics");
+    let font =
+        fontdue::Font::from_bytes(FONT, fontdue::FontSettings::default()).expect("plot font");
+    let line = font.horizontal_line_metrics(PX).expect("plot font metrics");
     let mut pixels = vec![0u8; (ATLAS * ATLAS) as usize];
     let mut glyphs = Vec::with_capacity(95);
     let mut cursor_x = 1u32;

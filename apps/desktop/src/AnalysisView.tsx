@@ -13,6 +13,7 @@ import {
 } from "@glideapps/glide-data-grid";
 
 import { Button } from "@/components/ui/button";
+import { backingSize, plotHeader, type PlotHeader } from "@/plot-header";
 import { sessionColor } from "@/session-colors";
 import { dismissNotice, notifyError } from "@/notify";
 import { Field, FieldLabel } from "@/components/ui/field";
@@ -115,44 +116,31 @@ const BINNED_PRESETS: Record<string, Record<string, string>> = {
   },
 };
 
-export type ViewControl = {
-  id: string;
-  label: string;
-  options: string[];
-  value: string;
-};
-
-type ViewTable = {
-  columns: string[];
-  rows: string[][];
-};
-
-type PlotMeta = {
-  id: number;
-  title: string;
-  controls: ViewControl[];
-  table: ViewTable | null;
-  samples: number[];
-};
-
-type HoverReadout = {
-  hit: boolean;
+type Readout = {
   x: number;
   y: number;
   series: number | null;
 };
 
-type PointerInput = {
-  x: number;
-  y: number;
-  dx: number;
-  dy: number;
-  wheel: number;
-  drag: boolean;
-  reset: boolean;
-};
+type Plotter = import("@/wasm/scan_kit_plot.js").WebPlot;
 
-const REST: PointerInput = { x: -1, y: -1, dx: 0, dy: 0, wheel: 0, drag: false, reset: false };
+// A canvas keeps the first context it is given, and StrictMode mounts twice,
+// so each canvas gets one WebPlot for its lifetime.
+const plotters = new WeakMap<HTMLCanvasElement, Promise<Plotter>>();
+
+function plotterFor(node: HTMLCanvasElement): Promise<Plotter> {
+  let pending = plotters.get(node);
+  if (pending == null) {
+    pending = import("@/wasm/scan_kit_plot.js").then(async (wasm) => {
+      await wasm.default();
+      const plot = await wasm.WebPlot.create(node);
+      console.info(`scan-kit plot backend: ${plot.backend()}`);
+      return plot;
+    });
+    plotters.set(node, pending);
+  }
+  return pending;
+}
 
 function tokenColor(name: string): string {
   const probe = document.createElement("span");
@@ -260,56 +248,6 @@ function messageOf(reason: unknown): string {
   return reason instanceof Error ? reason.message : String(reason);
 }
 
-function frameBytes(payload: ArrayBuffer | Uint8Array): ArrayBuffer {
-  if (payload instanceof ArrayBuffer) {
-    return payload;
-  }
-  return payload.buffer.slice(payload.byteOffset, payload.byteOffset + payload.byteLength) as ArrayBuffer;
-}
-
-function paintFrame(node: HTMLCanvasElement, buffer: ArrayBuffer): boolean {
-  if (buffer.byteLength < 24) {
-    return false;
-  }
-  const view = new DataView(buffer);
-  const width = view.getUint32(0, true);
-  const height = view.getUint32(4, true);
-  const pixels = width * height * 4;
-  if (width === 0 || height === 0 || buffer.byteLength < 24 + pixels) {
-    return false;
-  }
-  const context = node.getContext("2d");
-  if (context == null) {
-    return false;
-  }
-  if (node.width !== width) {
-    node.width = width;
-  }
-  if (node.height !== height) {
-    node.height = height;
-  }
-  context.putImageData(new ImageData(new Uint8ClampedArray(buffer, 24, pixels), width, height), 0, 0);
-  return true;
-}
-
-function readoutOf(buffer: ArrayBuffer): HoverReadout | null {
-  if (buffer.byteLength < 24) {
-    return null;
-  }
-  const view = new DataView(buffer);
-  const flags = view.getUint32(8, true);
-  if ((flags & 1) === 0) {
-    return null;
-  }
-  const series = view.getUint32(20, true);
-  return {
-    hit: true,
-    x: view.getFloat32(12, true),
-    y: view.getFloat32(16, true),
-    series: (flags & 2) === 0 ? null : series,
-  };
-}
-
 export function AnalysisView({
   viewId,
   folder,
@@ -323,34 +261,24 @@ export function AnalysisView({
 }) {
   const host = useRef<HTMLDivElement>(null);
   const canvas = useRef<HTMLCanvasElement>(null);
-  const plotId = useRef(0);
+  const plotter = useRef<Plotter | null>(null);
+  const payload = useRef<Uint8Array | null>(null);
+  const frame = useRef(0);
   const openSeq = useRef(0);
-  const sizeRef = useRef({ width: 960, height: 640 });
   const hoverNode = useRef<HTMLParagraphElement>(null);
-  const painted = useRef(false);
-  const flight = useRef({
-    busy: false,
-    gesture: null as PointerInput | null,
-    settle: false,
-  });
-  const hoverFlight = useRef({ busy: false, x: 0, y: 0, pending: false });
-  const drawRef = useRef<(input: PointerInput) => void>(() => {});
-  const hoverRef = useRef<(x: number, y: number) => void>(() => {});
   const [options, setOptions] = useState<Record<string, string>>({});
-  const [meta, setMeta] = useState<PlotMeta | null>(null);
-  const [shown, setShown] = useState(false);
+  const [meta, setMeta] = useState<PlotHeader | null>(null);
   const [study, setStudy] = useState<string | null>(null);
   const [size, setSize] = useState({ width: 960, height: 640 });
-  sizeRef.current = size;
-  const plotWidth = Math.max(16, Math.round(size.width * (window.devicePixelRatio || 1)));
-  const plotHeight = Math.max(16, Math.round(size.height * (window.devicePixelRatio || 1)));
+  const shown = (meta?.panels.length ?? 0) > 0;
 
-  const showReadout = (next: HoverReadout | null) => {
+  // The helpers below only read refs, so the listeners registered once keep working.
+  const showReadout = (next: Readout | null) => {
     const node = hoverNode.current;
     if (node == null) {
       return;
     }
-    if (next == null || !next.hit) {
+    if (next == null) {
       node.hidden = true;
       return;
     }
@@ -359,131 +287,54 @@ export function AnalysisView({
     node.textContent = `${next.x.toPrecision(4)}, ${next.y.toPrecision(4)}${series}`;
   };
 
-  const enqueue = (input: PointerInput) => {
-    const slot = flight.current;
-    if (input.reset) {
-      slot.gesture = input;
-      slot.settle = false;
+  const requestDraw = () => {
+    if (frame.current !== 0) {
       return;
     }
-    const idle = input.x < 0 && !input.drag && input.wheel === 0 && input.dx === 0 && input.dy === 0;
-    if (idle) {
-      slot.settle = true;
-      return;
-    }
-    const previous = slot.gesture;
-    if (previous == null) {
-      slot.gesture = input;
-      return;
-    }
-    slot.gesture = {
-      x: input.x,
-      y: input.y,
-      dx: previous.dx + input.dx,
-      dy: previous.dy + input.dy,
-      wheel: previous.wheel + input.wheel,
-      drag: previous.drag || input.drag,
-      reset: false,
-    };
-  };
-
-  const pump = () => {
-    const slot = flight.current;
-    const id = plotId.current;
-    const node = canvas.current;
-    if (slot.busy || id === 0 || node == null) {
-      return;
-    }
-    const gesture = slot.gesture;
-    if (gesture != null) {
-      slot.gesture = null;
-      send(id, node, gesture);
-      return;
-    }
-    if (slot.settle) {
-      slot.settle = false;
-      send(id, node, REST);
-    }
-  };
-
-  const send = (id: number, node: HTMLCanvasElement, input: PointerInput) => {
-    flight.current.busy = true;
-    const width = Math.max(16, Math.round(sizeRef.current.width * (window.devicePixelRatio || 1)));
-    const height = Math.max(16, Math.round(sizeRef.current.height * (window.devicePixelRatio || 1)));
-    void invoke<ArrayBuffer>("scan_kit_plot_frame", {
-      id,
-      width,
-      height,
-      x: input.x,
-      y: input.y,
-      dx: input.dx,
-      dy: input.dy,
-      wheel: input.wheel,
-      drag: input.drag,
-      reset: input.reset,
-    })
-      .then((payload) => {
-        if (id !== plotId.current) {
-          return;
-        }
-        const buffer = frameBytes(payload);
-        const ok = paintFrame(node, buffer);
-        if (ok !== painted.current) {
-          painted.current = ok;
-          setShown(ok);
-        }
-        if (input.x >= 0) {
-          showReadout(readoutOf(buffer));
-        }
-        dismissNotice("analysis");
-      })
-      .catch((reason: unknown) => {
-        const message = messageOf(reason);
-        if (message.includes("stale plot") || id !== plotId.current) {
-          return;
-        }
-        notifyError(message, "analysis");
-      })
-      .finally(() => {
-        flight.current.busy = false;
-        pump();
-      });
-  };
-
-  const draw = (input: PointerInput) => {
-    enqueue(input);
-    pump();
+    frame.current = requestAnimationFrame(() => {
+      frame.current = 0;
+      try {
+        plotter.current?.render();
+      } catch (reason) {
+        notifyError(messageOf(reason), "analysis");
+      }
+    });
   };
 
   const readHover = (x: number, y: number) => {
-    const id = plotId.current;
-    const flight = hoverFlight.current;
-    flight.x = x;
-    flight.y = y;
-    if (flight.busy || id === 0) {
-      flight.pending = id !== 0;
+    const hit = plotter.current?.hover(x, y);
+    showReadout(hit == null || hit[0] === 0 ? null : { x: hit[1], y: hit[2], series: hit[3] < 0 ? null : hit[3] });
+  };
+
+  const fitCanvas = () => {
+    const node = canvas.current;
+    if (node == null) {
       return;
     }
-    flight.busy = true;
-    flight.pending = false;
-    void invoke<HoverReadout>("scan_kit_plot_hover", { id, x, y })
-      .then((next) => {
-        if (id === plotId.current) {
-          showReadout(next.hit ? next : null);
-        }
-      })
-      .catch((reason: unknown) => {
-        const message = messageOf(reason);
-        if (!message.includes("stale plot") && id === plotId.current) {
-          notifyError(message, "analysis");
-        }
-      })
-      .finally(() => {
-        flight.busy = false;
-        if (flight.pending && plotId.current === id) {
-          hoverRef.current(flight.x, flight.y);
-        }
-      });
+    const rect = node.getBoundingClientRect();
+    const next = backingSize(rect.width, rect.height, window.devicePixelRatio);
+    if (node.width !== next.width || node.height !== next.height) {
+      node.width = next.width;
+      node.height = next.height;
+    }
+    plotter.current?.resize(next.width, next.height);
+    requestDraw();
+  };
+
+  const loadPayload = () => {
+    const plot = plotter.current;
+    const bytes = payload.current;
+    if (plot == null || bytes == null) {
+      return;
+    }
+    payload.current = null;
+    try {
+      plot.load(bytes);
+    } catch (reason) {
+      notifyError(messageOf(reason), "analysis");
+      return;
+    }
+    fitCanvas();
   };
 
   useEffect(() => {
@@ -505,10 +356,37 @@ export function AnalysisView({
   }, []);
 
   useEffect(() => {
+    const node = canvas.current;
+    if (node == null) {
+      return;
+    }
+    let live = true;
+    const observer = new ResizeObserver(fitCanvas);
+    observer.observe(node);
+    plotterFor(node)
+      .then((plot) => {
+        if (!live) {
+          return;
+        }
+        plotter.current = plot;
+        fitCanvas();
+        loadPayload();
+      })
+      .catch((reason: unknown) => notifyError(messageOf(reason), "analysis"));
+    return () => {
+      live = false;
+      observer.disconnect();
+      plotter.current = null;
+      cancelAnimationFrame(frame.current);
+      frame.current = 0;
+    };
+  }, []);
+
+  useEffect(() => {
     const ticket = openSeq.current + 1;
     openSeq.current = ticket;
     const timer = window.setTimeout(() => {
-      void invoke<PlotMeta>("scan_kit_open_plot", {
+      void invoke<ArrayBuffer | Uint8Array>("scan_kit_open_plot", {
         view: viewId,
         path: folder,
         sessionIds,
@@ -517,14 +395,14 @@ export function AnalysisView({
         foreground: parseColor(tokenColor("--foreground")),
         palette: palette(sessionIds),
       })
-        .then((next) => {
+        .then((result) => {
           if (openSeq.current !== ticket) {
             return;
           }
-          plotId.current = next.id;
-          flight.current.gesture = null;
-          flight.current.settle = false;
-          setMeta(next);
+          const bytes = result instanceof Uint8Array ? result : new Uint8Array(result);
+          setMeta(plotHeader(bytes));
+          payload.current = bytes;
+          loadPayload();
           showReadout(null);
           dismissNotice("analysis");
         })
@@ -536,16 +414,6 @@ export function AnalysisView({
     }, 150);
     return () => window.clearTimeout(timer);
   }, [viewId, folder, sessionIds, options]);
-
-  drawRef.current = draw;
-  hoverRef.current = readHover;
-
-  useEffect(() => {
-    if (meta == null) {
-      return;
-    }
-    drawRef.current(REST);
-  }, [meta, plotWidth, plotHeight]);
 
   useEffect(() => {
     const node = canvas.current;
@@ -567,7 +435,9 @@ export function AnalysisView({
     const onWheel = (event: WheelEvent) => {
       event.preventDefault();
       const point = locate(event);
-      drawRef.current({ x: point.x, y: point.y, dx: 0, dy: 0, wheel: event.deltaY, drag: false, reset: false });
+      plotter.current?.zoom(point.x, point.y, event.deltaY);
+      requestDraw();
+      readHover(point.x, point.y);
     };
     const onDown = (event: PointerEvent) => {
       dragging = true;
@@ -579,28 +449,22 @@ export function AnalysisView({
     const onMove = (event: PointerEvent) => {
       const point = locate(event);
       if (dragging) {
-        drawRef.current({
-          x: point.x,
-          y: point.y,
-          dx: event.movementX * point.sx,
-          dy: event.movementY * point.sy,
-          wheel: 0,
-          drag: true,
-          reset: false,
-        });
-        return;
+        plotter.current?.pan(point.x, point.y, event.movementX * point.sx, event.movementY * point.sy);
+        requestDraw();
       }
-      hoverRef.current(point.x, point.y);
+      readHover(point.x, point.y);
     };
-    const onDouble = (event: MouseEvent) => {
-      const point = locate(event);
-      drawRef.current({ x: point.x, y: point.y, dx: 0, dy: 0, wheel: 0, drag: false, reset: true });
+    const onLeave = () => showReadout(null);
+    const onDouble = () => {
+      plotter.current?.reset();
+      requestDraw();
     };
     node.addEventListener("wheel", onWheel, { passive: false });
     node.addEventListener("pointerdown", onDown);
     node.addEventListener("pointerup", onUp);
     node.addEventListener("pointercancel", onUp);
     node.addEventListener("pointermove", onMove);
+    node.addEventListener("pointerleave", onLeave);
     node.addEventListener("dblclick", onDouble);
     return () => {
       node.removeEventListener("wheel", onWheel);
@@ -608,6 +472,7 @@ export function AnalysisView({
       node.removeEventListener("pointerup", onUp);
       node.removeEventListener("pointercancel", onUp);
       node.removeEventListener("pointermove", onMove);
+      node.removeEventListener("pointerleave", onLeave);
       node.removeEventListener("dblclick", onDouble);
     };
   }, []);

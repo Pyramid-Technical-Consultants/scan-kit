@@ -4,8 +4,9 @@
   "version": "2.0.0-dev",
   "type": "module",
   "scripts": {
-    "dev": "vite",
-    "build": "tsc && vite build",
+    "wasm": "cargo build -p scan-kit-plot --target wasm32-unknown-unknown --release && wasm-bindgen --target web --out-dir src/wasm ../../target/wasm32-unknown-unknown/release/scan_kit_plot.wasm",
+    "dev": "npm run wasm && vite",
+    "build": "npm run wasm && tsc && vite build",
     "preview": "vite preview",
     "test": "vitest run",
     "tauri": "tauri"
