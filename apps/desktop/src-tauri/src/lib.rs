@@ -59,6 +59,50 @@ fn scan_kit_set_last_main_tab(tab: String) -> Result<(), String> {
     scan_kit_io::write_last_main_tab(&tab)
 }
 
+#[tauri::command]
+fn scan_kit_run_view(
+    view: String,
+    path: String,
+    session_ids: Vec<String>,
+    options: Value,
+    width: u32,
+    height: u32,
+    background: Vec<f32>,
+    foreground: Vec<f32>,
+    palette: Vec<Vec<f32>>,
+) -> Result<Value, String> {
+    let background = color4(&background, [0.11, 0.11, 0.12, 1.0]);
+    let foreground = color4(&foreground, [0.92, 0.92, 0.93, 1.0]);
+    let palette: Vec<[f32; 4]> = palette
+        .iter()
+        .map(|row| color4(row, [0.9, 0.9, 0.9, 1.0]))
+        .collect();
+    scan_kit_compute::run_view(
+        &view,
+        std::path::Path::new(&path),
+        &session_ids,
+        &options,
+        width,
+        height,
+        background,
+        foreground,
+        &palette,
+    )
+}
+
+#[tauri::command]
+fn scan_kit_open_study(path: String) -> Result<Value, String> {
+    scan_kit_dicom::invoke("scan_kit_open_study", &json!({ "path": path }))
+}
+
+fn color4(values: &[f32], fallback: [f32; 4]) -> [f32; 4] {
+    let mut out = fallback;
+    for (index, value) in values.iter().take(4).enumerate() {
+        out[index] = *value;
+    }
+    out
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -73,7 +117,9 @@ pub fn run() {
             scan_kit_window_geometry,
             scan_kit_set_window_geometry,
             scan_kit_last_main_tab,
-            scan_kit_set_last_main_tab
+            scan_kit_set_last_main_tab,
+            scan_kit_run_view,
+            scan_kit_open_study
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

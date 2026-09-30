@@ -1,19 +1,13 @@
 [package]
-name = "scan-kit-compute"
+name = "scan-kit-dicom"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
 authors.workspace = true
-description = "Scan Kit wgpu compute"
+description = "Scan Kit DICOM study index, clinical goals, and report"
 
 [dependencies]
-naga = "27"
 scan-kit-core = { workspace = true }
-scan-kit-io = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
-tokio = { workspace = true }
-wgpu = "27"
-
-[dev-dependencies]
-tokio = { workspace = true }

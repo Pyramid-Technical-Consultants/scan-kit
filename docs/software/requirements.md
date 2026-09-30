@@ -55,6 +55,102 @@ A compute kernel can update a storage buffer and read it back when a GPU adapter
 
 The kernel lives in `scan-kit-compute`. `wgpu` is the only compute library. The check compiles the shader even when the machine has no adapter, and it skips the dispatch in that case. No scientific kernel is part of this requirement.
 
+## SK-REQ-008
+
+Opening an analysis view returns one RGBA frame and the control list for the selected sessions.
+
+`scan_kit_run_view` builds the scene, paints it, and returns the frame with the controls. At most five sessions are accepted. The shell draws that frame and renders the controls.
+
+## SK-REQ-009
+
+A plot scene of polylines, points, bars, and one heatmap renders to an RGBA frame.
+
+Colors for the frame background and series come from the caller. When no GPU adapter is present, the same triangles are filled on the CPU.
+
+## SK-REQ-010
+
+Spot position remap, dose ratio, dose error, calibration, and the beam-state filter have one implementation.
+
+## SK-REQ-011
+
+A timeslice load returns device-unit columns and the `input_map.csv` energy lookup length. The channel catalog lists the concepts present for Replay, FFT, and Audio.
+
+## SK-REQ-012
+
+Dose Accumulation draws cumulative expected and measured dose for each ionization chamber that has a dose column, an optional timeslice current-sum row, and a calibrate control.
+
+## SK-REQ-013
+
+IC Peak Amplitude — Beam-Off draws histograms of beam-off samples.
+
+## SK-REQ-014
+
+Beam Error Motion vs Energy draws a spill path per energy, with IC1 and IC2 when both error pairs are present.
+
+## SK-REQ-015
+
+Distribution Explorer draws position, position error, or sigma as scatter or a density grid. Confidence is beam-on confidence against peak amplitude. Coverage is the percent of spots whose confidence stays above each threshold.
+
+## SK-REQ-016
+
+Binned summaries use quantile bin edges and a histogram of the values in each bin.
+
+## SK-REQ-017
+
+Binned Summary plots a spot metric as a mean, a quartile box, or a scatter against energy, MU, spot time, or radius. Timeslice Replay draws an overview and a scrubbed detail of one channel.
+
+## SK-REQ-018
+
+FFT Explorer draws a Welch spectrum from 1 Hz to 500 Hz using 4096-sample segments and 50% overlap. Audio Explorer returns the same channel as normalized samples for playback and WAV export in the shell.
+
+## SK-REQ-019
+
+Welch PSD of a pure tone peaks at that tone.
+
+## SK-REQ-021
+
+An exponential decay fit recovers the time constant of a falling curve. Beam-Off Ramp-Down draws the normalized window and that fit.
+
+## SK-REQ-022
+
+Amplifier Command Correlations draws settled samples, a line fit, a density grid, and an arc fit when chamber positions exist. Beam-Off Ramp-Down draws normalized windows and their decay fit. IC HV Transient draws the current trace and the measured capacitance next to the firmware grade.
+
+## SK-REQ-023
+
+A settled-sample mask stays false until the requested number of samples after a command step. A line fit returns slope and intercept.
+
+## SK-REQ-024
+
+Session Log Compare returns overview counts, timeline rows, error issues, watchdog mismatches, and a template diff when two sessions are selected.
+
+## SK-REQ-025
+
+IC geometry, the magnet pivot, and an iso-plane line fit are pure functions.
+
+## SK-REQ-026
+
+IC Beam Trajectory projects IC2 to IC1, the chamber planes, the magnet gap, and the iso-plane fit. Orbit is a control. The picture is a read-back frame.
+
+## SK-REQ-027
+
+An analytic Gaussian splat peaks on the spot. The splat, ray march, gamma, DVH, resample, and Monte Carlo transport shaders compile.
+
+## SK-REQ-028
+
+Dose Volume draws a maximum-intensity projection, sagittal and coronal slices, depth and lateral profiles, a DVH, a gamma comparison with the requested charge, and a resampled projection.
+
+## SK-REQ-030
+
+Gamma, DVH, and nearest-neighbor resample match their reference cases.
+
+## SK-REQ-032
+
+A DICOM folder of explicit little-endian files indexes by modality. A clinical goal reports the volume fraction at or above a dose, and the study report includes both.
+
+## SK-REQ-033
+
+Spot current sums, the odd circular-arc fit, HV step capacitance, beam-off edges on a rolling background, coverage percent, and session-log timeline comparison match their reference cases.
+
 ## Trace
 
 Verification links are in [traceability.md](traceability.md).

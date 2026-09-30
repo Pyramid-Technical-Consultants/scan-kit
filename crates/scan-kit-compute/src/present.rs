@@ -1,0 +1,235 @@
+//! One analysis frame. The scene comes from `scan-kit-io`. This module paints it.
+
+use std::path::Path;
+
+use scan_kit_core::{Series, ToolKind, ToolSpec};
+use scan_kit_io::analysis_scene;
+use serde_json::{json, Value};
+
+const TOOLS: &[ToolSpec] = &[ToolSpec {
+    name: "scan_kit_run_view",
+    summary: "Build an analysis view and return one RGBA frame plus its controls.",
+    kind: ToolKind::Workflow,
+}];
+
+pub fn tools() -> &'static [ToolSpec] {
+    TOOLS
+}
+
+pub fn tool_input_schema(name: &str) -> Value {
+    match name {
+        "scan_kit_run_view" => json!({
+            "type": "object",
+            "properties": {
+                "view": { "type": "string" },
+                "path": { "type": "string" },
+                "session_ids": { "type": "array", "items": { "type": "string" } },
+                "options": { "type": "object" },
+                "width": { "type": "integer" },
+                "height": { "type": "integer" },
+                "background": { "type": "array", "items": { "type": "number" } },
+                "foreground": { "type": "array", "items": { "type": "number" } },
+                "palette": { "type": "array", "items": { "type": "array", "items": { "type": "number" } } }
+            },
+            "required": ["view", "path", "session_ids"],
+            "additionalProperties": false
+        }),
+        _ => json!({ "type": "object", "additionalProperties": false }),
+    }
+}
+
+pub fn invoke(name: &str, input: &Value) -> Result<Value, String> {
+    match name {
+        "scan_kit_run_view" => {
+            let view = text(input, "view")?;
+            let path = text(input, "path")?;
+            let session_ids = strings(input, "session_ids")?;
+            let options = input.get("options").cloned().unwrap_or_else(|| json!({}));
+            let width = input.get("width").and_then(Value::as_u64).unwrap_or(960) as u32;
+            let height = input.get("height").and_then(Value::as_u64).unwrap_or(640) as u32;
+            let background = color4(input.get("background"), [0.11, 0.11, 0.12, 1.0]);
+            let foreground = color4(input.get("foreground"), [0.92, 0.92, 0.93, 1.0]);
+            let palette = palette_of(input.get("palette"));
+            run_view(
+                view,
+                Path::new(path),
+                &session_ids,
+                &options,
+                width,
+                height,
+                background,
+                foreground,
+                &palette,
+            )
+        }
+        _ => Err(format!("unknown tool {name}")),
+    }
+}
+
+/// Load the view, color its series from the shell palette, and read one frame back.
+pub fn run_view(
+    view: &str,
+    root: &Path,
+    session_ids: &[String],
+    options: &Value,
+    width: u32,
+    height: u32,
+    background: [f32; 4],
+    foreground: [f32; 4],
+    palette: &[[f32; 4]],
+) -> Result<Value, String> {
+    let mut scene = analysis_scene(view, root, session_ids, options)?;
+    apply_palette(&mut scene, palette);
+    let width = width.clamp(16, 1600);
+    let height = height.clamp(16, 1200);
+    let (frame, drawn_w, drawn_h) = if scene.panels.is_empty() {
+        (Vec::new(), 0, 0)
+    } else {
+        let frame = crate::render_plot(&scene, width, height, background, foreground)?;
+        (frame, width, height)
+    };
+    Ok(json!({
+        "title": scene.title,
+        "width": drawn_w,
+        "height": drawn_h,
+        "rgba_base64": base64(&frame),
+        "controls": scene.controls,
+        "table": scene.table,
+        "samples": scene.samples,
+    }))
+}
+
+fn apply_palette(scene: &mut scan_kit_core::PlotScene, palette: &[[f32; 4]]) {
+    if palette.is_empty() {
+        return;
+    }
+    let mut index = 0usize;
+    for panel in &mut scene.panels {
+        for series in &mut panel.series {
+            let color = palette[index % palette.len()];
+            match series {
+                Series::Polyline { color: slot, .. }
+                | Series::Points { color: slot, .. }
+                | Series::Bars { color: slot, .. } => {
+                    *slot = color;
+                    index += 1;
+                }
+                Series::Heatmap { .. } => {}
+            }
+        }
+    }
+}
+
+fn text<'a>(input: &'a Value, key: &str) -> Result<&'a str, String> {
+    input
+        .get(key)
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("{key} is required"))
+}
+
+fn strings(input: &Value, key: &str) -> Result<Vec<String>, String> {
+    input
+        .get(key)
+        .and_then(Value::as_array)
+        .ok_or_else(|| format!("{key} is required"))?
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| format!("{key} must be strings"))
+        })
+        .collect()
+}
+
+fn color4(value: Option<&Value>, fallback: [f32; 4]) -> [f32; 4] {
+    let Some(items) = value.and_then(Value::as_array) else {
+        return fallback;
+    };
+    let mut out = fallback;
+    for (index, item) in items.iter().take(4).enumerate() {
+        if let Some(number) = item.as_f64() {
+            out[index] = number as f32;
+        }
+    }
+    out
+}
+
+fn palette_of(value: Option<&Value>) -> Vec<[f32; 4]> {
+    let Some(rows) = value.and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    rows.iter()
+        .map(|row| color4(Some(row), [0.9, 0.9, 0.9, 1.0]))
+        .collect()
+}
+
+fn base64(bytes: &[u8]) -> String {
+    const TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    let mut index = 0;
+    while index + 3 <= bytes.len() {
+        let n = ((bytes[index] as u32) << 16)
+            | ((bytes[index + 1] as u32) << 8)
+            | bytes[index + 2] as u32;
+        out.push(TABLE[((n >> 18) & 63) as usize] as char);
+        out.push(TABLE[((n >> 12) & 63) as usize] as char);
+        out.push(TABLE[((n >> 6) & 63) as usize] as char);
+        out.push(TABLE[(n & 63) as usize] as char);
+        index += 3;
+    }
+    let rest = bytes.len() - index;
+    if rest == 1 {
+        let n = (bytes[index] as u32) << 16;
+        out.push(TABLE[((n >> 18) & 63) as usize] as char);
+        out.push(TABLE[((n >> 12) & 63) as usize] as char);
+        out.push('=');
+        out.push('=');
+    } else if rest == 2 {
+        let n = ((bytes[index] as u32) << 16) | ((bytes[index + 1] as u32) << 8);
+        out.push(TABLE[((n >> 18) & 63) as usize] as char);
+        out.push(TABLE[((n >> 12) & 63) as usize] as char);
+        out.push(TABLE[((n >> 6) & 63) as usize] as char);
+        out.push('=');
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sk_req_008_run_view_returns_a_frame_and_controls() {
+        let root = std::env::temp_dir().join(format!("scan-kit-frame-{}", std::process::id()));
+        let session = root.join("sess");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&session).unwrap();
+        std::fs::write(
+            session.join("input_map.csv"),
+            "energy,charge_req,position_x,position_y\n70,1,0,0\n90,2,4,1\n",
+        )
+        .unwrap();
+        std::fs::write(
+            session.join("spot_data.csv"),
+            "ic1_total_dose,ic2_total_dose,position_x,position_y\n1,1,0,0\n2,2,4,1\n",
+        )
+        .unwrap();
+        let frame = run_view(
+            "dose_accumulation",
+            &root,
+            &["sess".into()],
+            &json!({}),
+            320,
+            180,
+            [0.1, 0.1, 0.1, 1.0],
+            [0.9, 0.9, 0.9, 1.0],
+            &[[0.8, 0.8, 0.8, 1.0], [0.4, 0.4, 0.4, 1.0]],
+        )
+        .unwrap();
+        assert_eq!(frame["title"], "Dose Accumulation");
+        assert!(frame["rgba_base64"].as_str().unwrap().len() > 32);
+        assert_eq!(frame["width"], 320);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}

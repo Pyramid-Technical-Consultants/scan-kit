@@ -22,7 +22,7 @@ Versions below are the ones locked for the workspace. Anomaly review for a SOUP 
 | SOUP | Version | Purpose |
 |---|---|---|
 | Rust | stable, pinned by `rust-toolchain.toml` | Language and standard library |
-| tokio | see `Cargo.toml` | Async runtime for the MCP server and the compute test |
+| tokio | see `Cargo.toml` | Async runtime for the MCP server, plot-frame readback, and the compute test |
 | serde / serde_json | see `Cargo.toml` | Tool input and output |
 | rmcp | see `crates/scan-kit-mcp/Cargo.toml` | MCP protocol and stdio transport |
 | tauri | see `apps/desktop/src-tauri/Cargo.toml` | Desktop shell |

@@ -255,19 +255,35 @@ pub static CONCEPT_ALIASES: &[ConceptAlias] = &[
     },
     ConceptAlias {
         concept: "ic1_x_peak_amplitude",
-        names: &["r_ic1_x_peak_amplitude", "ic1_x_peak_amplitude"],
+        names: &[
+            "r_ic1_x_peak_amplitude",
+            "ic1_x_peak_amplitude",
+            "ic1_peak_amplitude_x",
+        ],
     },
     ConceptAlias {
         concept: "ic1_y_peak_amplitude",
-        names: &["r_ic1_y_peak_amplitude", "ic1_y_peak_amplitude"],
+        names: &[
+            "r_ic1_y_peak_amplitude",
+            "ic1_y_peak_amplitude",
+            "ic1_peak_amplitude_y",
+        ],
     },
     ConceptAlias {
         concept: "ic2_x_peak_amplitude",
-        names: &["r_ic2_x_peak_amplitude", "ic2_x_peak_amplitude"],
+        names: &[
+            "r_ic2_x_peak_amplitude",
+            "ic2_x_peak_amplitude",
+            "ic2_peak_amplitude_x",
+        ],
     },
     ConceptAlias {
         concept: "ic2_y_peak_amplitude",
-        names: &["r_ic2_y_peak_amplitude", "ic2_y_peak_amplitude"],
+        names: &[
+            "r_ic2_y_peak_amplitude",
+            "ic2_y_peak_amplitude",
+            "ic2_peak_amplitude_y",
+        ],
     },
 ];
 

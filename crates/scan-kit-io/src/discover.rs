@@ -130,13 +130,28 @@ fn is_unpacked_session(folder: &Path) -> bool {
     folder.join(name).join("input_map.csv").is_file() || folder.join("input_map.csv").is_file()
 }
 
-fn directory_session_root(folder: &Path, session_id: &str) -> PathBuf {
-    let inner = folder.join(session_id);
-    if inner.join("input_map.csv").is_file() {
-        inner
-    } else {
-        folder.to_path_buf()
+/// Directory that holds one session's files.
+///
+/// Unpacked logs use either `library/<id>/input_map.csv` or
+/// `library/<id>/<id>/input_map.csv`. A miss stays on that session folder.
+/// It does not fall back to the library, which would read every other session.
+pub fn session_directory(library: &Path, session_id: &str) -> PathBuf {
+    let nested = library.join(session_id).join(session_id);
+    if nested.join("input_map.csv").is_file() {
+        return nested;
     }
+    let flat = library.join(session_id);
+    if flat.join("input_map.csv").is_file() || flat.is_dir() {
+        return flat;
+    }
+    if library.join("input_map.csv").is_file() {
+        return library.to_path_buf();
+    }
+    flat
+}
+
+fn directory_session_root(folder: &Path, session_id: &str) -> PathBuf {
+    session_directory(folder, session_id)
 }
 
 fn archive_identity(path: &Path) -> Option<(String, &'static str)> {

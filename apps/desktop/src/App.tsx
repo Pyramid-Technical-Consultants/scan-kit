@@ -34,6 +34,7 @@ import {
   MenubarTrigger,
 } from "@/components/ui/menubar";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { AnalysisView } from "@/AnalysisView";
 
 const MAX_SELECTED = 5;
 
@@ -78,6 +79,23 @@ const ANALYSIS_GROUPS = [
     ],
   },
 ] as const;
+
+const ANALYSIS_IDS: Record<string, string> = {
+  "Binned Summary": "binned_summary",
+  "Distribution Explorer": "distribution",
+  "Timeslice Replay": "timeslice_replay",
+  "FFT Explorer": "ic_fft_analysis",
+  "Audio Explorer": "ic_audio_player",
+  "IC Beam Trajectory (3D)": "trajectory",
+  "Dose Volume": "dose_volume",
+  "Session Log Compare": "session_log_compare",
+  "Beam Error Motion vs Energy": "beam_motion_energy",
+  "Dose Accumulation": "dose_accumulation",
+  "Beam-Off Ramp-Down": "beam_off_rampdown",
+  "IC HV Transient Test": "ic_hv_transient",
+  "Amplifier Command Correlations": "amplifier_correlation",
+  "IC Peak Amplitude — Beam-Off (G3)": "ic_peak_amplitude_beam_off",
+};
 
 type SortKey =
   | "session_id"
@@ -310,6 +328,12 @@ export default function App() {
   const [theme, setTheme] = useState<Theme | null>(null);
   const [size, setSize] = useState({ width: 0, height: 0 });
   const [tab, setTab] = useState<LauncherView>("Data Analysis");
+  const [analysis, setAnalysis] = useState<string | null>(null);
+  const selectedIds = useMemo(
+    () => rows.filter((row) => row.selected).map((row) => row.session_id),
+    [rows],
+  );
+  const canAnalyze = folder != null && selectedIds.length >= 1 && selectedIds.length <= MAX_SELECTED;
   const host = useRef<HTMLDivElement>(null);
   const folderRef = useRef<string | null>(null);
   folderRef.current = folder;
@@ -694,7 +718,14 @@ export default function App() {
                 {index > 0 ? <MenubarSeparator /> : null}
                 <MenubarLabel>{group.title}</MenubarLabel>
                 {group.names.map((name) => (
-                  <MenubarItem key={name} disabled>
+                  <MenubarItem
+                    key={name}
+                    disabled={!canAnalyze}
+                    onClick={() => {
+                      setAnalysis(ANALYSIS_IDS[name]);
+                      selectTab("Data Analysis");
+                    }}
+                  >
                     {name}
                   </MenubarItem>
                 ))}
@@ -727,6 +758,15 @@ export default function App() {
           ))}
         </TabsList>
         <TabsContent value="Data Analysis" className="flex min-h-0 flex-col">
+          {analysis != null && folder != null ? (
+            <AnalysisView
+              viewId={analysis}
+              folder={folder}
+              sessionIds={selectedIds}
+              onBack={() => setAnalysis(null)}
+            />
+          ) : (
+          <>
           <div className="text-muted-foreground truncate px-3 py-2 text-sm">
             {folder ?? "Open a data folder to list sessions."}
             {folder != null && rows.length === 0 ? " — No sessions in this folder." : ""}
@@ -762,6 +802,8 @@ export default function App() {
               />
             ) : null}
           </div>
+          </>
+          )}
         </TabsContent>
         {LAUNCHER_VIEWS.filter((name) => name !== "Data Analysis").map((name) => (
           <TabsContent key={name} value={name}>

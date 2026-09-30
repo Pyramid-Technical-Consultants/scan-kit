@@ -3,9 +3,12 @@
 //! The desktop shell and the MCP server call these functions. They do not
 //! reimplement them.
 
+mod analysis;
 mod columns;
 mod discover;
 mod store;
+
+pub use analysis::{analysis_scene, channel_catalog, load_timeslice_columns};
 
 use std::path::{Path, PathBuf};
 
@@ -42,6 +45,21 @@ const TOOLS: &[ToolSpec] = &[
         name: "scan_kit_load_columns",
         summary: "Load named session columns after alias resolution and the G2 current scale.",
         kind: ToolKind::Granular,
+    },
+    ToolSpec {
+        name: "scan_kit_load_timeslice",
+        summary: "List device-unit timeslice columns and the input_map energy lookup length.",
+        kind: ToolKind::Granular,
+    },
+    ToolSpec {
+        name: "scan_kit_channel_catalog",
+        summary: "List timeslice channels present for Replay, FFT, and Audio.",
+        kind: ToolKind::Granular,
+    },
+    ToolSpec {
+        name: "scan_kit_analysis_scene",
+        summary: "Build one analysis view scene from the selected sessions.",
+        kind: ToolKind::Workflow,
     },
 ];
 
@@ -89,6 +107,26 @@ pub fn tool_input_schema(name: &str) -> Value {
                 "columns": { "type": "array", "items": { "type": "string" } }
             },
             "required": ["storage_path", "session_id", "columns"],
+            "additionalProperties": false
+        }),
+        "scan_kit_load_timeslice" | "scan_kit_channel_catalog" => json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string" },
+                "session_id": { "type": "string" }
+            },
+            "required": ["path", "session_id"],
+            "additionalProperties": false
+        }),
+        "scan_kit_analysis_scene" => json!({
+            "type": "object",
+            "properties": {
+                "view": { "type": "string" },
+                "path": { "type": "string" },
+                "session_ids": { "type": "array", "items": { "type": "string" } },
+                "options": { "type": "object" }
+            },
+            "required": ["view", "path", "session_ids"],
             "additionalProperties": false
         }),
         _ => json!({ "type": "object", "additionalProperties": false }),
@@ -149,6 +187,25 @@ pub fn invoke(name: &str, input: &Value) -> Result<Value, InvokeError> {
             let columns = required_strings(input, "columns")?;
             columns::load_columns(Path::new(storage), session_id, &columns)
                 .map_err(InvokeError::Message)
+        }
+        "scan_kit_load_timeslice" => {
+            let path = required_str(input, "path")?;
+            let session_id = required_str(input, "session_id")?;
+            Ok(load_timeslice_columns(Path::new(path), session_id))
+        }
+        "scan_kit_channel_catalog" => {
+            let path = required_str(input, "path")?;
+            let session_id = required_str(input, "session_id")?;
+            Ok(json!({ "channels": channel_catalog(Path::new(path), session_id) }))
+        }
+        "scan_kit_analysis_scene" => {
+            let view = required_str(input, "view")?;
+            let path = required_str(input, "path")?;
+            let session_ids = required_strings(input, "session_ids")?;
+            let options = input.get("options").cloned().unwrap_or_else(|| json!({}));
+            let scene = analysis_scene(view, Path::new(path), &session_ids, &options)
+                .map_err(InvokeError::Message)?;
+            serde_json::to_value(scene).map_err(|err| InvokeError::Message(err.to_string()))
         }
         _ => Err(InvokeError::UnknownTool {
             name: name.to_owned(),

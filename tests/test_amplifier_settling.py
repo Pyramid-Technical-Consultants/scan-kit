@@ -107,7 +107,7 @@ def test_readback_field_drive_keeps_more_g3_beam_on_samples() -> None:
         load_session_timeslice_device_units,
         resolve_session_source,
     )
-    from scan_kit.views.timeslice_replay_common import resolve_col
+    from scan_kit.common.schema import resolve_concept_column as resolve_col
 
     src = resolve_session_source("863788396", "test_data")
     assert src is not None

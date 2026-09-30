@@ -1,6 +1,14 @@
 //! The only GPU path. Later kernels go through this device.
 //! Nothing else in the workspace links `wgpu`.
 
+mod kernels;
+mod present;
+mod render;
+
+pub use kernels::compile_scientific_shaders;
+pub use present::{invoke, run_view, tool_input_schema, tools};
+pub use render::{compile_plot_shader, plot_shader_source, render_plot};
+
 const SHADER: &str = r#"
 @group(0) @binding(0)
 var<storage, read_write> data: array<f32>;
@@ -47,8 +55,8 @@ pub fn compile_shader() -> Result<(), String> {
     Ok(())
 }
 
-/// Add one to each element of a storage buffer and read it back.
-pub async fn round_trip_add_one(input: &[f32]) -> Result<Vec<f32>, ComputeError> {
+/// Shared adapter request. Plot rendering and the round-trip both use it.
+pub async fn request_device() -> Result<(wgpu::Device, wgpu::Queue), ComputeError> {
     let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
     let adapter = instance
         .request_adapter(&wgpu::RequestAdapterOptions::default())
@@ -64,10 +72,15 @@ pub async fn round_trip_add_one(input: &[f32]) -> Result<Vec<f32>, ComputeError>
                 ComputeError::Message(err.to_string())
             }
         })?;
-    let (device, queue) = adapter
+    adapter
         .request_device(&wgpu::DeviceDescriptor::default())
         .await
-        .map_err(|err| ComputeError::Message(err.to_string()))?;
+        .map_err(|err| ComputeError::Message(err.to_string()))
+}
+
+/// Add one to each element of a storage buffer and read it back.
+pub async fn round_trip_add_one(input: &[f32]) -> Result<Vec<f32>, ComputeError> {
+    let (device, queue) = request_device().await?;
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("round-trip"),
         source: wgpu::ShaderSource::Wgsl(SHADER.into()),

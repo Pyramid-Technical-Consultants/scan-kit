@@ -3204,6 +3204,9 @@ name = "scan-kit-compute"
 version = "2.0.0-dev"
 dependencies = [
  "naga",
+ "scan-kit-core",
+ "scan-kit-io",
+ "serde_json",
  "tokio",
  "wgpu",
 ]
@@ -3220,12 +3223,23 @@ dependencies = [
 name = "scan-kit-desktop"
 version = "2.0.0-dev"
 dependencies = [
+ "scan-kit-compute",
  "scan-kit-core",
+ "scan-kit-dicom",
  "scan-kit-io",
  "serde_json",
  "tauri",
  "tauri-build",
  "tauri-plugin-dialog",
+]
+
+[[package]]
+name = "scan-kit-dicom"
+version = "2.0.0-dev"
+dependencies = [
+ "scan-kit-core",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -3248,7 +3262,9 @@ name = "scan-kit-mcp"
 version = "2.0.0-dev"
 dependencies = [
  "rmcp",
+ "scan-kit-compute",
  "scan-kit-core",
+ "scan-kit-dicom",
  "scan-kit-io",
  "serde_json",
  "tokio",

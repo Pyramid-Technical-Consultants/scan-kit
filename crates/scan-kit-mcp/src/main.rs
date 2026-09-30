@@ -24,21 +24,55 @@ fn schema_object(value: Value) -> Arc<Map<String, Value>> {
     Arc::new(schema)
 }
 
-fn catalog_tools() -> Vec<Tool> {
+fn catalog_specs() -> Vec<scan_kit_core::ToolSpec> {
     let mut specs = scan_kit_core::tools().to_vec();
     specs.extend_from_slice(scan_kit_io::tools());
+    specs.extend_from_slice(scan_kit_compute::tools());
+    specs.extend_from_slice(scan_kit_dicom::tools());
     specs
+}
+
+fn schema_for(name: &str) -> Value {
+    if scan_kit_core::tools().iter().any(|tool| tool.name == name) {
+        scan_kit_core::tool_input_schema(name)
+    } else if scan_kit_io::tools().iter().any(|tool| tool.name == name) {
+        scan_kit_io::tool_input_schema(name)
+    } else if scan_kit_compute::tools()
+        .iter()
+        .any(|tool| tool.name == name)
+    {
+        scan_kit_compute::tool_input_schema(name)
+    } else {
+        scan_kit_dicom::tool_input_schema(name)
+    }
+}
+
+fn dispatch(name: &str, input: &Value) -> Result<Value, String> {
+    if scan_kit_core::tools().iter().any(|tool| tool.name == name) {
+        scan_kit_core::invoke(name, input).map_err(|err| err.to_string())
+    } else if scan_kit_io::tools().iter().any(|tool| tool.name == name) {
+        scan_kit_io::invoke(name, input).map_err(|err| err.to_string())
+    } else if scan_kit_compute::tools()
+        .iter()
+        .any(|tool| tool.name == name)
+    {
+        scan_kit_compute::invoke(name, input)
+    } else if scan_kit_dicom::tools().iter().any(|tool| tool.name == name) {
+        scan_kit_dicom::invoke(name, input)
+    } else {
+        Err(format!("unknown tool {name}"))
+    }
+}
+
+fn catalog_tools() -> Vec<Tool> {
+    catalog_specs()
         .into_iter()
         .map(|spec| {
-            let schema = if scan_kit_core::tools()
-                .iter()
-                .any(|tool| tool.name == spec.name)
-            {
-                scan_kit_core::tool_input_schema(spec.name)
-            } else {
-                scan_kit_io::tool_input_schema(spec.name)
-            };
-            Tool::new_with_raw(spec.name, Some(spec.summary.into()), schema_object(schema))
+            Tool::new_with_raw(
+                spec.name,
+                Some(spec.summary.into()),
+                schema_object(schema_for(spec.name)),
+            )
         })
         .collect()
 }
@@ -73,19 +107,7 @@ impl ServerHandler for ScanKit {
             None => Value::Null,
             Some(arguments) => Value::Object(arguments),
         };
-        let result = if scan_kit_core::tools()
-            .iter()
-            .any(|tool| tool.name == request.name)
-        {
-            scan_kit_core::invoke(&request.name, &input).map_err(|err| err.to_string())
-        } else if scan_kit_io::tools()
-            .iter()
-            .any(|tool| tool.name == request.name)
-        {
-            scan_kit_io::invoke(&request.name, &input).map_err(|err| err.to_string())
-        } else {
-            Err(format!("unknown tool {}", request.name))
-        };
+        let result = dispatch(&request.name, &input);
         match result {
             Ok(value) => Ok(CallToolResult::structured(value).into()),
             Err(error) => Ok(CallToolResult::error(vec![ContentBlock::text(error)]).into()),

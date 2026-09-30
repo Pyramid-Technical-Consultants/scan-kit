@@ -4,8 +4,29 @@
 //! implement the operations themselves. Session files live in `scan-kit-io`.
 //! GPU work lives in `scan-kit-compute`.
 
+mod geometry;
+mod plot;
 mod schema;
 mod session;
+mod session_log;
+mod signal;
+
+pub use geometry::{
+    beam_angle_mrad, fit_iso_plane, fit_line, magnet_pivot_z, parse_ic_geometry, IcGeometry,
+    IC1_Z_MM, IC2_Z_MM, IC_SEP_MM,
+};
+pub use plot::{map_span, Control, DataTable, Panel, PlotScene, Series};
+pub use session_log::{compare_templates, parse_session_log, LayerEvent, SessionLog};
+pub use signal::{
+    arc_fit, arc_predict, beam_off_edges, beam_on_mask, calibration_factor, coverage_percent,
+    cumsum, density_counts, dose_error_pct, dose_ratio_pct, dvh, filter_beam_state, fit_decay,
+    g2_ic2_mm, gamma_index, histogram, hv_capacitance_pf, hv_delta_v, hv_expected_pf,
+    hv_firmware_flags, hv_step_window, linear_fit, median_finite, mip_xy, quantile_edges, remap,
+    remap_g2_raw, remap_g2_raw_reversed, remap_g3_raw, remap_g3_raw_reversed, resample_nearest,
+    scale_column, settled_after_step, sliding_background, spill_segments, splat_gaussians,
+    sums_by_spot_id, sums_by_spot_run, trapz, welch_psd, ArcFit, BeamState, G2_MM_PER_STRIP,
+    G2_STRIP_CENTER, G3_STRIP_CENTER, G3_STRIP_PITCH_MM, MIN_SPILL_GAP_MS,
+};
 
 pub use schema::{
     column_is_integer, column_scale_factor, concept_column_candidates, normalize_column_name,
@@ -53,6 +74,41 @@ const TOOLS: &[ToolSpec] = &[
         summary: "Return the About dialog text and the workspace version.",
         kind: ToolKind::Granular,
     },
+    ToolSpec {
+        name: "scan_kit_calibrate",
+        summary: "Scale factor that zeros the dose-weighted error of one delivered column.",
+        kind: ToolKind::Granular,
+    },
+    ToolSpec {
+        name: "scan_kit_dose_error",
+        summary: "Percent dose error of delivered values against a target column.",
+        kind: ToolKind::Granular,
+    },
+    ToolSpec {
+        name: "scan_kit_beam_mask",
+        summary: "Beam-on mask and spill segments from a gate column.",
+        kind: ToolKind::Granular,
+    },
+    ToolSpec {
+        name: "scan_kit_bin_edges",
+        summary: "Quantile bin edges for a numeric column.",
+        kind: ToolKind::Granular,
+    },
+    ToolSpec {
+        name: "scan_kit_histogram",
+        summary: "Histogram counts for a numeric column.",
+        kind: ToolKind::Granular,
+    },
+    ToolSpec {
+        name: "scan_kit_welch",
+        summary: "Welch power spectrum of a 1 kHz timeslice signal.",
+        kind: ToolKind::Granular,
+    },
+    ToolSpec {
+        name: "scan_kit_fit_decay",
+        summary: "Single-exponential decay fit of a ramp-down curve.",
+        kind: ToolKind::Granular,
+    },
 ];
 
 /// SK-REQ-001. The single Rust version string.
@@ -65,14 +121,66 @@ pub fn tools() -> &'static [ToolSpec] {
     TOOLS
 }
 
-/// JSON Schema for one core tool. Core tools take no arguments.
+/// JSON Schema for one core tool.
 pub fn tool_input_schema(name: &str) -> Value {
-    let _ = name;
-    json!({
-        "type": "object",
-        "properties": {},
-        "additionalProperties": false
-    })
+    match name {
+        "scan_kit_version" | "scan_kit_health" | "scan_kit_about" => json!({
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false
+        }),
+        "scan_kit_calibrate" | "scan_kit_dose_error" => json!({
+            "type": "object",
+            "properties": {
+                "target": { "type": "array", "items": { "type": "number" } },
+                "delivered": { "type": "array", "items": { "type": "number" } }
+            },
+            "required": ["target", "delivered"],
+            "additionalProperties": false
+        }),
+        "scan_kit_beam_mask" => json!({
+            "type": "object",
+            "properties": {
+                "gate": { "type": "array", "items": { "type": "number" } }
+            },
+            "required": ["gate"],
+            "additionalProperties": false
+        }),
+        "scan_kit_bin_edges" | "scan_kit_histogram" | "scan_kit_welch" => json!({
+            "type": "object",
+            "properties": {
+                "values": { "type": "array", "items": { "type": "number" } },
+                "bins": { "type": "integer" }
+            },
+            "required": ["values"],
+            "additionalProperties": false
+        }),
+        "scan_kit_fit_decay" => json!({
+            "type": "object",
+            "properties": {
+                "time": { "type": "array", "items": { "type": "number" } },
+                "values": { "type": "array", "items": { "type": "number" } }
+            },
+            "required": ["time", "values"],
+            "additionalProperties": false
+        }),
+        _ => json!({ "type": "object", "additionalProperties": false }),
+    }
+}
+
+fn f32_array(input: &Value, key: &str) -> Result<Vec<f32>, InvokeError> {
+    input
+        .get(key)
+        .and_then(Value::as_array)
+        .ok_or(InvokeError::UnexpectedInput)?
+        .iter()
+        .map(|value| {
+            value
+                .as_f64()
+                .map(|number| number as f32)
+                .ok_or(InvokeError::UnexpectedInput)
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -158,15 +266,62 @@ impl std::fmt::Display for InvokeError {
 
 impl std::error::Error for InvokeError {}
 
-/// Run a catalog tool. Both phase 1 tools take no arguments (`null` or `{}`).
+/// Run a catalog tool. Version, health, and about take no arguments.
 pub fn invoke(name: &str, input: &Value) -> Result<Value, InvokeError> {
-    if !input.is_null() && input.as_object().is_none_or(|object| !object.is_empty()) {
-        return Err(InvokeError::UnexpectedInput);
+    match name {
+        "scan_kit_version" | "scan_kit_health" | "scan_kit_about" => {
+            if !input.is_null() && input.as_object().is_none_or(|object| !object.is_empty()) {
+                return Err(InvokeError::UnexpectedInput);
+            }
+        }
+        _ => {}
     }
     let value = match name {
         "scan_kit_version" => serde_json::to_value(scan_kit_version()).expect("version report"),
         "scan_kit_health" => serde_json::to_value(scan_kit_health()).expect("health report"),
         "scan_kit_about" => serde_json::to_value(scan_kit_about()).expect("about report"),
+        "scan_kit_calibrate" => {
+            let target = f32_array(input, "target")?;
+            let delivered = f32_array(input, "delivered")?;
+            json!({ "factor": calibration_factor(&target, &delivered) })
+        }
+        "scan_kit_dose_error" => {
+            let target = f32_array(input, "target")?;
+            let delivered = f32_array(input, "delivered")?;
+            json!({ "error_pct": dose_error_pct(&delivered, &target) })
+        }
+        "scan_kit_beam_mask" => {
+            let gate = f32_array(input, "gate")?;
+            let on = beam_on_mask(&gate);
+            json!({
+                "beam_on": on,
+                "spills": spill_segments(&on, signal::MIN_SPILL_GAP_MS, 2)
+            })
+        }
+        "scan_kit_bin_edges" => {
+            let values = f32_array(input, "values")?;
+            let bins = input.get("bins").and_then(Value::as_u64).unwrap_or(8) as usize;
+            json!({ "edges": quantile_edges(&values, bins) })
+        }
+        "scan_kit_histogram" => {
+            let values = f32_array(input, "values")?;
+            let bins = input.get("bins").and_then(Value::as_u64).unwrap_or(16) as usize;
+            let (edges, counts) = histogram(&values, bins);
+            json!({ "edges": edges, "counts": counts })
+        }
+        "scan_kit_welch" => {
+            let values = f32_array(input, "values")?;
+            let (freqs, psd) = welch_psd(&values, 1000.0, 4096, 0.5);
+            json!({ "freqs": freqs, "psd": psd })
+        }
+        "scan_kit_fit_decay" => {
+            let time = f32_array(input, "time")?;
+            let values = f32_array(input, "values")?;
+            match fit_decay(&time, &values) {
+                Some((amplitude, tau)) => json!({ "amplitude": amplitude, "tau": tau }),
+                None => json!({ "amplitude": null, "tau": null }),
+            }
+        }
         _ => {
             return Err(InvokeError::UnknownTool {
                 name: name.to_owned(),
