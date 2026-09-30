@@ -2,6 +2,7 @@ import { useLayoutEffect, useRef, useState, type RefObject } from "react";
 import type { DataEditorRef } from "@glideapps/glide-data-grid";
 
 import { Checkbox } from "@/components/ui/checkbox";
+import { sessionSwatch } from "@/session-colors";
 
 export const MAX_SELECTED = 5;
 
@@ -69,19 +70,45 @@ type CheckBox = {
   height: number;
 };
 
+/** Skip frames Glide has not laid out yet. Those bounds are NaN and break the overlay. */
+export function checkboxFrame(
+  bounds: { x: number; y: number; width: number; height: number } | undefined,
+  origin: { left: number; top: number; right: number; bottom: number },
+): { left: number; top: number; width: number; height: number } | null {
+  if (bounds == null) {
+    return null;
+  }
+  const { x, y, width, height } = bounds;
+  if (![x, y, width, height, origin.left, origin.top].every(Number.isFinite) || width <= 0 || height <= 0) {
+    return null;
+  }
+  const bottom = y + height;
+  const right = x + width;
+  if (bottom <= origin.top || y >= origin.bottom || right <= origin.left || x >= origin.right) {
+    return null;
+  }
+  return {
+    left: x - origin.left,
+    top: y - origin.top,
+    width,
+    height,
+  };
+}
+
 export function UseCheckLayer({
   boxes,
-  selected,
+  order,
   header,
   onRow,
   onHeader,
 }: {
   boxes: readonly CheckBox[];
-  selected: ReadonlySet<string>;
+  order: readonly string[];
   header: { checked: boolean; indeterminate: boolean };
   onRow: (sessionId: string, checked: boolean) => void;
   onHeader: (checked: boolean) => void;
 }) {
+  const selected = new Set(order);
   return (
     <div className="pointer-events-none absolute inset-0">
       {boxes.map((box) => (
@@ -98,21 +125,49 @@ export function UseCheckLayer({
                 aria-label="Select all"
                 onCheckedChange={(checked) => onHeader(checked)}
               />
-            ) : (
-              <Checkbox
-                checked={box.sessionId != null && selected.has(box.sessionId)}
-                aria-label="Select row"
+            ) : box.sessionId != null ? (
+              <SessionCheck
+                sessionId={box.sessionId}
+                order={order}
+                checked={selected.has(box.sessionId)}
                 onCheckedChange={(checked) => {
                   if (box.sessionId != null) {
                     onRow(box.sessionId, checked);
                   }
                 }}
               />
-            )}
+            ) : null}
           </span>
         </div>
       ))}
     </div>
+  );
+}
+
+function SessionCheck({
+  sessionId,
+  order,
+  checked,
+  onCheckedChange,
+}: {
+  sessionId: string;
+  order: readonly string[];
+  checked: boolean;
+  onCheckedChange: (checked: boolean) => void;
+}) {
+  const swatch = sessionSwatch(order, sessionId);
+  return (
+    <Checkbox
+      checked={checked}
+      aria-label="Select row"
+      title={swatch.label}
+      style={
+        checked
+          ? { backgroundColor: swatch.color, borderColor: swatch.color, color: "#fff" }
+          : undefined
+      }
+      onCheckedChange={onCheckedChange}
+    />
   );
 }
 
@@ -124,8 +179,8 @@ export function UseColumnChecks({
   ready,
   onRow,
   onHeader,
-  selected,
   header,
+  order,
 }: {
   gridRef: RefObject<DataEditorRef | null>;
   hostRef: RefObject<HTMLElement | null>;
@@ -134,8 +189,8 @@ export function UseColumnChecks({
   ready: boolean;
   onRow: (sessionId: string, checked: boolean) => void;
   onHeader: (checked: boolean) => void;
-  selected: ReadonlySet<string>;
   header: { checked: boolean; indeterminate: boolean };
+  order: readonly string[];
 }) {
   const [boxes, setBoxes] = useState<CheckBox[]>([]);
   const [pass, setPass] = useState(0);
@@ -147,24 +202,8 @@ export function UseColumnChecks({
       return;
     }
     const origin = host.getBoundingClientRect();
-    const place = (bounds: { x: number; y: number; width: number; height: number } | undefined) => {
-      if (bounds == null) {
-        return null;
-      }
-      const bottom = bounds.y + bounds.height;
-      const right = bounds.x + bounds.width;
-      if (bottom <= origin.top || bounds.y >= origin.bottom || right <= origin.left || bounds.x >= origin.right) {
-        return null;
-      }
-      return {
-        left: bounds.x - origin.left,
-        top: bounds.y - origin.top,
-        width: bounds.width,
-        height: bounds.height,
-      };
-    };
     const next: CheckBox[] = [];
-    const headerBox = place(grid.getBounds(0, -1));
+    const headerBox = checkboxFrame(grid.getBounds(0, -1), origin);
     if (headerBox != null) {
       next.push({ key: "header", kind: "header", ...headerBox });
     }
@@ -172,7 +211,7 @@ export function UseColumnChecks({
     const end = Math.min(sessionIds.length, region.y + region.height);
     for (let row = start; row < end; row += 1) {
       const sessionId = sessionIds[row];
-      const box = place(grid.getBounds(0, row));
+      const box = checkboxFrame(grid.getBounds(0, row), origin);
       if (sessionId == null || box == null) {
         continue;
       }
@@ -190,6 +229,6 @@ export function UseColumnChecks({
     return undefined;
   }, [gridRef, hostRef, pass, ready, sessionIds, region]);
   return (
-    <UseCheckLayer boxes={boxes} selected={selected} header={header} onRow={onRow} onHeader={onHeader} />
+    <UseCheckLayer boxes={boxes} order={order} header={header} onRow={onRow} onHeader={onHeader} />
   );
 }

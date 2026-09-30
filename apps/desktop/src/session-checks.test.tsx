@@ -6,6 +6,7 @@ import {
   headerCheck,
   headerWillFill,
   nextSessionSelection,
+  checkboxFrame,
   UseCheckLayer,
 } from "./session-checks";
 
@@ -31,6 +32,18 @@ it("clears the header once every visible choice is selected", () => {
   expect(headerWillFill(3, 3)).toBe(false);
 });
 
+it("ignores checkbox frames that are not on screen", () => {
+  const origin = { left: 0, top: 0, right: 400, bottom: 300 };
+  expect(checkboxFrame(undefined, origin)).toBeNull();
+  expect(checkboxFrame({ x: Number.NaN, y: 0, width: 48, height: 32 }, origin)).toBeNull();
+  expect(checkboxFrame({ x: 16, y: 40, width: 48, height: 32 }, origin)).toEqual({
+    left: 16,
+    top: 40,
+    width: 48,
+    height: 32,
+  });
+});
+
 it("renders the shadcn checkbox for the session column", async () => {
   const host = document.createElement("div");
   document.body.appendChild(host);
@@ -41,8 +54,9 @@ it("renders the shadcn checkbox for the session column", async () => {
         boxes={[
           { key: "header", kind: "header", left: 0, top: 0, width: 48, height: 40 },
           { key: "s1", kind: "row", sessionId: "s1", left: 0, top: 40, width: 48, height: 40 },
+          { key: "s2", kind: "row", sessionId: "s2", left: 0, top: 80, width: 48, height: 40 },
         ]}
-        selected={new Set(["s1"])}
+        order={["s1"]}
         header={{ checked: false, indeterminate: true }}
         onRow={() => {}}
         onHeader={() => {}}
@@ -50,10 +64,16 @@ it("renders the shadcn checkbox for the session column", async () => {
     );
   });
   const boxes = document.querySelectorAll("[data-slot=checkbox]");
-  expect(boxes).toHaveLength(2);
+  expect(boxes).toHaveLength(3);
   expect(boxes[0]?.getAttribute("aria-label")).toBe("Select all");
   expect(boxes[1]?.getAttribute("aria-label")).toBe("Select row");
   expect(boxes[1]?.getAttribute("aria-checked")).toBe("true");
+  expect(boxes[1]?.getAttribute("title")).toBe("Session color in plots: #4C72B0 (1 of 1)");
+  expect((boxes[1] as HTMLElement).style.backgroundColor).toBe("#4C72B0");
+  expect(boxes[2]?.getAttribute("title")).toBe(
+    "Not used in plots — check to assign a plot color by order",
+  );
+  expect((boxes[2] as HTMLElement).style.backgroundColor).toBe("");
   await act(async () => {
     root.unmount();
   });

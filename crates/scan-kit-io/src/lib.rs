@@ -253,8 +253,9 @@ pub fn open_library(conn: &mut rusqlite::Connection, data_dir: &Path) -> Result<
     remember_data_dir(&tx, &root)?;
     backfill_blank_notes(&tx, lib_id, Path::new(&root))?;
     let rows = library_rows(&tx, lib_id)?;
+    let selected = store::selected_session_ids(&tx, lib_id)?;
     tx.commit().map_err(|err| err.to_string())?;
-    Ok(json!({ "root": root, "rows": rows }))
+    Ok(json!({ "root": root, "rows": rows, "selected": selected }))
 }
 
 fn hydrate(entry: &Discovered) -> Option<SessionMeta> {
@@ -515,6 +516,7 @@ Layer delivery: 27/27
             .unwrap();
         assert_eq!(alpha["note"], "edited");
         assert_eq!(alpha["selected"], true);
+        assert_eq!(again["selected"], json!(["alpha"]));
 
         let conn = rusqlite::Connection::open(&db).unwrap();
         conn.execute("UPDATE sessions SET note = ''", []).unwrap();

@@ -1,3 +1,5 @@
+import { Copy, SlidersHorizontal } from "lucide-react";
+
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -53,6 +55,7 @@ export function SessionContextMenu({
               onClose();
             }}
           >
+            <Copy />
             Copy Session ID
           </DropdownMenuItem>
           <DropdownMenuItem
@@ -61,6 +64,7 @@ export function SessionContextMenu({
               onTune();
             }}
           >
+            <SlidersHorizontal />
             Open in Config Tuning…
           </DropdownMenuItem>
         </DropdownMenuGroup>

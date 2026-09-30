@@ -2,10 +2,15 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Activity,
   AudioWaveform,
+  Box,
+  Bug,
   ChartColumn,
   ChartScatter,
+  Combine,
   Cuboid,
+  CircleHelp,
   Ellipsis,
+  Eye,
   FolderOpen,
   Headphones,
   Info,
@@ -15,7 +20,10 @@ import {
   Redo2,
   RefreshCw,
   ScrollText,
+  SquarePen,
+  SlidersHorizontal,
   Spline,
+  Table2,
   TrendingDown,
   TrendingUp,
   Undo2,
@@ -30,12 +38,14 @@ import { availableMonitors, getCurrentWindow } from "@tauri-apps/api/window";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
   DataEditor,
+  emptyGridSelection,
   GridCellKind,
   getDefaultTheme,
   type DataEditorRef,
   type EditableGridCell,
   type GridCell,
   type GridColumn,
+  type GridSelection,
   type Item,
   type Theme,
 } from "@glideapps/glide-data-grid";
@@ -58,6 +68,11 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import { DebugLog } from "@/DebugLog";
+import { installDebugLog } from "@/debug-log";
+import { dismissNotice, logError, notify, notifyError } from "@/notify";
+import { selectWholeRows } from "@/grid-selection";
+import { selectionFromLibrary } from "@/session-colors";
 import { SessionContextMenu, sessionMenuPoint } from "@/session-menu";
 import {
   MAX_SELECTED,
@@ -70,15 +85,23 @@ import {
   Menubar,
   MenubarCheckboxItem,
   MenubarContent,
-  MenubarGroup,
   MenubarItem,
-  MenubarLabel,
   MenubarMenu,
   MenubarSeparator,
   MenubarTrigger,
 } from "@/components/ui/menubar";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Toaster } from "@/components/ui/sonner";
 import { AnalysisView } from "@/AnalysisView";
+
+const TAB_ICONS: Record<string, LucideIcon> = {
+  "Data Analysis": Table2,
+  "Plan Synthesis": Combine,
+  "Phantom Synthesis": Box,
+  "Plan Runner": Play,
+  "Configuration Tuning": SlidersHorizontal,
+  Debug: Bug,
+};
 
 const LAUNCHER_VIEWS = [
   "Data Analysis",
@@ -280,9 +303,12 @@ function geometryOnScreen(
   });
 }
 
-function tokenColor(name: string): string {
+function tokenColor(name: string, percent?: number): string {
   const probe = document.createElement("span");
-  probe.style.color = `var(${name})`;
+  probe.style.color =
+    percent == null
+      ? `var(${name})`
+      : `color-mix(in oklch, var(${name}) ${percent}%, transparent)`;
   document.body.append(probe);
   const resolved = getComputedStyle(probe).color;
   probe.remove();
@@ -295,20 +321,19 @@ function gridTheme(): Theme {
   const muted = tokenColor("--muted-foreground");
   const card = tokenColor("--card");
   const accent = tokenColor("--accent");
-  const accentFg = tokenColor("--accent-foreground");
   const border = tokenColor("--border");
   const wash = tokenColor("--muted");
   return {
     ...base,
-    accentColor: accent,
-    accentFg,
-    accentLight: wash,
+    accentColor: foreground,
+    accentFg: tokenColor("--background"),
+    accentLight: tokenColor("--foreground", 16),
     textDark: foreground,
     textMedium: muted,
     textLight: muted,
     textBubble: foreground,
     textHeader: foreground,
-    textHeaderSelected: accentFg,
+    textHeaderSelected: tokenColor("--background"),
     bgIconHeader: card,
     fgIconHeader: foreground,
     bgCell: tokenColor("--background"),
@@ -368,6 +393,14 @@ function compareRows(left: LibraryRow, right: LibraryRow, sort: Sort): number {
   return sort.direction === "asc" ? order : -order;
 }
 
+function TabIcon({ name }: { name: string }) {
+  const Icon = TAB_ICONS[name];
+  if (Icon == null) {
+    return null;
+  }
+  return <Icon className="size-4" />;
+}
+
 function AnalysisIcon({ name }: { name: string }) {
   const Icon = ANALYSIS_ICONS[name];
   if (Icon == null) {
@@ -387,33 +420,26 @@ function textCell(value: string, editable: boolean): GridCell {
   };
 }
 
-function messageText(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
-}
-
 export default function App() {
   const [folder, setFolder] = useState<string | null>(null);
   const [rows, setRows] = useState<LibraryRow[]>([]);
   const [sort, setSort] = useState<Sort>({ key: "date", direction: "desc" });
-  const [message, setMessage] = useState<string | null>(null);
   const [about, setAbout] = useState<About | null>(null);
   const [aboutOpen, setAboutOpen] = useState(false);
   const [undo, setUndo] = useState<NoteEdit[]>([]);
   const [redo, setRedo] = useState<NoteEdit[]>([]);
+  const [gridSelection, setGridSelection] = useState<GridSelection>(emptyGridSelection);
   const [theme, setTheme] = useState<Theme | null>(null);
   const [size, setSize] = useState({ width: 0, height: 0 });
   const [tab, setTab] = useState<LauncherView>("Data Analysis");
   const [analysis, setAnalysis] = useState<string | null>(null);
   const [sessionMenu, setSessionMenu] = useState<SessionMenu | null>(null);
-  const selectedIds = useMemo(
-    () => rows.filter((row) => row.selected).map((row) => row.session_id),
-    [rows],
-  );
+  const [selectionOrder, setSelectionOrder] = useState<string[]>([]);
+  const selectedIds = selectionOrder;
   const canAnalyze = folder != null && selectedIds.length >= 1 && selectedIds.length <= MAX_SELECTED;
   const host = useRef<HTMLDivElement>(null);
   const gridRef = useRef<DataEditorRef>(null);
   const [region, setRegion] = useState({ y: 0, height: 40 });
-  const selectedSet = useMemo(() => new Set(selectedIds), [selectedIds]);
   const selectionHeader = headerCheck(rows.length, selectedIds.length);
   const folderRef = useRef<string | null>(null);
   folderRef.current = folder;
@@ -451,19 +477,28 @@ export default function App() {
     [sort],
   );
 
+  const onGridSelectionChange = useCallback(
+    (next: GridSelection) => {
+      setGridSelection(selectWholeRows(next, columns.length));
+    },
+    [columns.length],
+  );
+
   const loadFolder = useCallback(async (path: string) => {
-    const opened = await invoke<{ root: string; rows: LibraryRow[] }>(
+    const opened = await invoke<{ root: string; rows: LibraryRow[]; selected?: string[] }>(
       "scan_kit_open_library",
       { path },
     );
     setFolder(opened.root);
     setRows(opened.rows);
-    setMessage(null);
+    setSelectionOrder(selectionFromLibrary(opened.rows, opened.selected));
+    dismissNotice();
     setUndo([]);
     setRedo([]);
   }, []);
 
   useEffect(() => {
+    installDebugLog();
     setTheme(gridTheme());
     let active = true;
     invoke<About>("scan_kit_about")
@@ -474,7 +509,7 @@ export default function App() {
       })
       .catch((error: unknown) => {
         if (active) {
-          setMessage(messageText(error));
+          logError(error);
         }
       });
     invoke<string | null>("scan_kit_last_main_tab")
@@ -485,7 +520,7 @@ export default function App() {
       })
       .catch((error: unknown) => {
         if (active) {
-          setMessage(messageText(error));
+          logError(error);
         }
       });
     invoke<string | null>("scan_kit_last_data_dir")
@@ -497,7 +532,7 @@ export default function App() {
       })
       .catch((error: unknown) => {
         if (active) {
-          setMessage(messageText(error));
+          notifyError(error);
         }
       });
     return () => {
@@ -597,7 +632,7 @@ export default function App() {
     }
     setTab(next);
     void invoke("scan_kit_set_last_main_tab", { tab: next }).catch((error: unknown) => {
-      setMessage(messageText(error));
+      notifyError(error);
     });
   }, []);
 
@@ -618,22 +653,28 @@ export default function App() {
     if (path == null) {
       return;
     }
-    const current = rows.filter((item) => item.selected).map((item) => item.session_id);
-    const same = current.length === next.ids.length && current.every((id) => next.ids.includes(id));
+    const same =
+      selectionOrder.length === next.ids.length &&
+      selectionOrder.every((id, index) => id === next.ids[index]);
     if (same) {
       if (next.capped) {
-        setMessage("At most five sessions can be selected.");
+        notify("At most five sessions can be selected.", "selection");
       }
       return;
     }
     void invoke("scan_kit_select_sessions", { path, sessionIds: next.ids })
       .then(() => {
         const chosen = new Set(next.ids);
+        setSelectionOrder(next.ids);
         setRows((items) => items.map((item) => ({ ...item, selected: chosen.has(item.session_id) })));
-        setMessage(next.capped ? "At most five sessions can be selected." : null);
+        if (next.capped) {
+          notify("At most five sessions can be selected.", "selection");
+        } else {
+          dismissNotice("selection");
+        }
       })
-      .catch((error: unknown) => setMessage(messageText(error)));
-  }, [rows]);
+      .catch((error: unknown) => notifyError(error));
+  }, [selectionOrder]);
 
   const onRowCheck = useCallback(
     (sessionId: string, checked: boolean) => {
@@ -678,9 +719,9 @@ export default function App() {
           .then(() => {
             setUndo((stack) => [...stack, edit]);
             setRedo([]);
-            setMessage(null);
+            dismissNotice();
           })
-          .catch((error: unknown) => setMessage(messageText(error)));
+          .catch((error: unknown) => notifyError(error));
       }
     },
     [folder, order, rows, writeNote],
@@ -724,7 +765,7 @@ export default function App() {
         await loadFolder(selected);
       }
     } catch (error) {
-      setMessage(messageText(error));
+      notifyError(error);
     }
   }
 
@@ -733,10 +774,23 @@ export default function App() {
   }
 
   return (
-    <div className="flex h-svh flex-col bg-background text-foreground">
-      <Menubar className="w-full rounded-none border-0 border-b px-2">
+    <div className="flex h-full min-h-0 flex-col overflow-hidden bg-background text-foreground">
+      <Tabs
+        value={tab}
+        onValueChange={(value) => {
+          if (typeof value === "string") {
+            selectTab(value);
+          }
+        }}
+        className="min-h-0 flex-1 gap-0 overflow-hidden"
+      >
+      <div className="flex shrink-0 items-center border-b">
+      <Menubar className="shrink-0 rounded-none border-0 px-2">
         <MenubarMenu>
-          <MenubarTrigger>File</MenubarTrigger>
+          <MenubarTrigger className="gap-1.5">
+            <FolderOpen className="size-4" />
+            File
+          </MenubarTrigger>
           <MenubarContent className="w-max">
             <MenubarItem className="whitespace-nowrap" onClick={() => void chooseFolder()}>
               <FolderOpen />
@@ -747,7 +801,7 @@ export default function App() {
               disabled={folder == null}
               onClick={() => {
                 if (folder != null) {
-                  void loadFolder(folder).catch((error: unknown) => setMessage(messageText(error)));
+                  void loadFolder(folder).catch((error: unknown) => notifyError(error));
                 }
               }}
             >
@@ -760,7 +814,7 @@ export default function App() {
               onClick={() => {
                 void getCurrentWindow()
                   .close()
-                  .catch((error: unknown) => setMessage(messageText(error)));
+                  .catch((error: unknown) => notifyError(error));
               }}
             >
               <LogOut />
@@ -769,7 +823,10 @@ export default function App() {
           </MenubarContent>
         </MenubarMenu>
         <MenubarMenu>
-          <MenubarTrigger>Edit</MenubarTrigger>
+          <MenubarTrigger className="gap-1.5">
+            <SquarePen className="size-4" />
+            Edit
+          </MenubarTrigger>
           <MenubarContent className="w-max">
             <MenubarItem
               disabled={undo.length === 0}
@@ -783,7 +840,7 @@ export default function App() {
                     setUndo((stack) => stack.slice(0, -1));
                     setRedo((stack) => [...stack, edit]);
                   })
-                  .catch((error: unknown) => setMessage(messageText(error)));
+                  .catch((error: unknown) => notifyError(error));
               }}
             >
               <Undo2 />
@@ -801,7 +858,7 @@ export default function App() {
                     setRedo((stack) => stack.slice(0, -1));
                     setUndo((stack) => [...stack, edit]);
                   })
-                  .catch((error: unknown) => setMessage(messageText(error)));
+                  .catch((error: unknown) => notifyError(error));
               }}
             >
               <Redo2 />
@@ -810,11 +867,15 @@ export default function App() {
           </MenubarContent>
         </MenubarMenu>
         <MenubarMenu>
-          <MenubarTrigger>View</MenubarTrigger>
-          <MenubarContent>
+          <MenubarTrigger className="gap-1.5">
+            <Eye className="size-4" />
+            View
+          </MenubarTrigger>
+          <MenubarContent className="w-max">
             {LAUNCHER_VIEWS.map((name) => (
               <MenubarCheckboxItem
                 key={name}
+                className="whitespace-nowrap"
                 checked={tab === name}
                 onCheckedChange={(checked) => {
                   if (checked) {
@@ -822,35 +883,17 @@ export default function App() {
                   }
                 }}
               >
+                <TabIcon name={name} />
                 {name}
               </MenubarCheckboxItem>
             ))}
           </MenubarContent>
         </MenubarMenu>
         <MenubarMenu>
-          <MenubarTrigger>Analysis</MenubarTrigger>
-          <MenubarContent className="w-max">
-            {ANALYSIS_GROUPS.map((group, index) => (
-              <MenubarGroup key={group.title}>
-                {index > 0 ? <MenubarSeparator /> : null}
-                <MenubarLabel>{group.title}</MenubarLabel>
-                {group.names.map((name) => (
-                  <MenubarItem
-                    key={name}
-                    className="whitespace-nowrap"
-                    disabled={!canAnalyze}
-                    onClick={() => openAnalysis(name)}
-                  >
-                    <AnalysisIcon name={name} />
-                    {name}
-                  </MenubarItem>
-                ))}
-              </MenubarGroup>
-            ))}
-          </MenubarContent>
-        </MenubarMenu>
-        <MenubarMenu>
-          <MenubarTrigger>Help</MenubarTrigger>
+          <MenubarTrigger className="gap-1.5">
+            <CircleHelp className="size-4" />
+            Help
+          </MenubarTrigger>
           <MenubarContent>
             <MenubarItem onClick={() => setAboutOpen(true)}>
               <Info />
@@ -859,24 +902,16 @@ export default function App() {
           </MenubarContent>
         </MenubarMenu>
       </Menubar>
-
-      <Tabs
-        value={tab}
-        onValueChange={(value) => {
-          if (typeof value === "string") {
-            selectTab(value);
-          }
-        }}
-        className="min-h-0 flex-1 gap-0"
-      >
-        <TabsList variant="line" className="w-full justify-start">
+        <TabsList variant="line" className="ml-auto h-8 shrink-0 justify-end px-2">
           {LAUNCHER_VIEWS.map((name) => (
-            <TabsTrigger key={name} value={name} className="flex-none">
+            <TabsTrigger key={name} value={name} className="flex-none px-2.5 after:bottom-0">
+              <TabIcon name={name} />
               {name}
             </TabsTrigger>
           ))}
         </TabsList>
-        <TabsContent value="Data Analysis" className="flex min-h-0 flex-col">
+      </div>
+        <TabsContent value="Data Analysis" className="flex min-h-0 flex-col overflow-hidden">
           {analysis != null && folder != null ? (
             <AnalysisView
               viewId={analysis}
@@ -905,7 +940,7 @@ export default function App() {
               disabled={folder == null}
               onClick={() => {
                 if (folder != null) {
-                  void loadFolder(folder).catch((error: unknown) => setMessage(messageText(error)));
+                  void loadFolder(folder).catch((error: unknown) => notifyError(error));
                 }
               }}
             >
@@ -956,12 +991,9 @@ export default function App() {
               </DropdownMenu>
             </div>
           </div>
-          {message != null ? (
-            <div className="text-destructive px-3 pb-2 text-sm">{message}</div>
-          ) : null}
           <div
             ref={host}
-            className="relative min-h-0 flex-1"
+            className="relative min-h-0 flex-1 overflow-hidden"
             onContextMenu={(event) => event.preventDefault()}
           >
             {theme != null && size.width > 0 && size.height > 0 ? (
@@ -971,8 +1003,8 @@ export default function App() {
                 height={size.height}
                 columns={columns}
                 rows={rows.length}
-                rowHeight={40}
-                headerHeight={40}
+                rowHeight={32}
+                headerHeight={32}
                 getCellContent={getCellContent}
                 onCellEdited={onCellEdited}
                 onVisibleRegionChanged={(next) => {
@@ -990,6 +1022,9 @@ export default function App() {
                     return;
                   }
                   const point = sessionMenuPoint(event.bounds, event.localEventX, event.localEventY);
+                  if (!Number.isFinite(point.x) || !Number.isFinite(point.y)) {
+                    return;
+                  }
                   setSessionMenu({ sessionId: row.session_id, x: point.x, y: point.y });
                 }}
                 onHeaderClicked={(col) => {
@@ -1004,10 +1039,20 @@ export default function App() {
                   );
                 }}
                 theme={theme}
+                gridSelection={gridSelection}
+                onGridSelectionChange={onGridSelectionChange}
+                columnSelect="none"
                 rowMarkers="none"
                 smoothScrollX
                 smoothScrollY
               />
+            ) : null}
+            {rows.length === 0 ? (
+              <p className="text-muted-foreground pointer-events-none absolute inset-x-0 top-12 text-center text-sm">
+                {folder == null
+                  ? "Open a data folder to list sessions."
+                  : "No sessions in this folder."}
+              </p>
             ) : null}
             <UseColumnChecks
               gridRef={gridRef}
@@ -1015,7 +1060,7 @@ export default function App() {
               sessionIds={displayIds}
               region={region}
               ready={theme != null && size.width > 0 && size.height > 0}
-              selected={selectedSet}
+              order={selectedIds}
               header={selectionHeader}
               onRow={onRowCheck}
               onHeader={onHeaderCheck}
@@ -1028,8 +1073,8 @@ export default function App() {
                 onClose={() => setSessionMenu(null)}
                 onCopy={(id) => {
                   void navigator.clipboard.writeText(id).then(
-                    () => setMessage(`Copied session ${id}`),
-                    () => setMessage(id),
+                    () => notify(`Copied session ${id}`),
+                    () => notifyError("Could not copy the session id"),
                   );
                 }}
                 onTune={() => selectTab("Configuration Tuning")}
@@ -1039,7 +1084,10 @@ export default function App() {
           </>
           )}
         </TabsContent>
-        {LAUNCHER_VIEWS.filter((name) => name !== "Data Analysis").map((name) => (
+        <TabsContent value="Debug" className="flex min-h-0 flex-col overflow-hidden">
+          <DebugLog />
+        </TabsContent>
+        {LAUNCHER_VIEWS.filter((name) => name !== "Data Analysis" && name !== "Debug").map((name) => (
           <TabsContent key={name} value={name}>
             <p className="text-muted-foreground px-3 py-2">{name} is not in this preview yet.</p>
           </TabsContent>
@@ -1103,6 +1151,7 @@ export default function App() {
           ) : null}
         </DialogContent>
       </Dialog>
+      <Toaster theme="dark" />
     </div>
   );
 }

@@ -49,6 +49,8 @@ Plot text uses the vendored Source Sans 3 regular face in `crates/scan-kit-compu
 | Base UI (`@base-ui/react`) | see `apps/desktop/package.json` | Behavior of shadcn components |
 | `@glideapps/glide-data-grid` | see `apps/desktop/package.json` | Session list and later column views |
 | `@tauri-apps/plugin-dialog` | see `apps/desktop/package.json` | Open Data Folder dialog |
+| sonner | see `apps/desktop/package.json` | Toast notices that do not move the layout |
+| next-themes | see `apps/desktop/package.json` | Theme value read by the stock toast toaster. The app stays dark |
 | vitest | see `apps/desktop/package.json` | Desktop UI checks. Not linked into the product binary |
 | happy-dom | see `apps/desktop/package.json` | DOM for those checks. Not linked into the product binary |
 
