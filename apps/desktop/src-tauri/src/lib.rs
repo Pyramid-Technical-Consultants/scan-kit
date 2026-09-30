@@ -118,7 +118,7 @@ fn scan_kit_open_plot(
 }
 
 #[tauri::command]
-fn scan_kit_plot_frame(
+async fn scan_kit_plot_frame(
     id: u64,
     width: u32,
     height: u32,
@@ -130,13 +130,19 @@ fn scan_kit_plot_frame(
     drag: bool,
     reset: bool,
 ) -> Result<tauri::ipc::Response, String> {
-    let bytes = scan_kit_compute::plot_frame(id, width, height, x, y, dx, dy, wheel, drag, reset)?;
+    let bytes = tauri::async_runtime::spawn_blocking(move || {
+        scan_kit_compute::plot_frame(id, width, height, x, y, dx, dy, wheel, drag, reset)
+    })
+    .await
+    .map_err(|err| err.to_string())??;
     Ok(tauri::ipc::Response::new(bytes))
 }
 
 #[tauri::command]
-fn scan_kit_plot_hover(id: u64, x: f32, y: f32) -> Result<Value, String> {
-    scan_kit_compute::plot_hover(id, x, y)
+async fn scan_kit_plot_hover(id: u64, x: f32, y: f32) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || scan_kit_compute::plot_hover(id, x, y))
+        .await
+        .map_err(|err| err.to_string())?
 }
 
 #[tauri::command]

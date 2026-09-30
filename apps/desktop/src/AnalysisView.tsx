@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
+import { ArrowLeft, Download, Play } from "lucide-react";
 import {
   DataEditor,
   GridCellKind,
@@ -12,6 +13,8 @@ import {
 } from "@glideapps/glide-data-grid";
 
 import { Button } from "@/components/ui/button";
+import { sessionColor } from "@/session-colors";
+import { dismissNotice, notifyError } from "@/notify";
 import { Field, FieldLabel } from "@/components/ui/field";
 import {
   Select,
@@ -176,10 +179,9 @@ function parseColor(value: string): [number, number, number, number] {
   return [pixel[0] / 255, pixel[1] / 255, pixel[2] / 255, pixel[3] / 255];
 }
 
-function palette(): number[][] {
-  return ["--chart-1", "--chart-2", "--chart-3", "--chart-4", "--chart-5"].map((name) =>
-    parseColor(tokenColor(name)),
-  );
+function palette(sessionIds: readonly string[]): number[][] {
+  const count = Math.max(sessionIds.length, 1);
+  return Array.from({ length: count }, (_, index) => parseColor(sessionColor(index)));
 }
 
 function gridTheme(): Theme {
@@ -280,8 +282,12 @@ function paintFrame(node: HTMLCanvasElement, buffer: ArrayBuffer): boolean {
   if (context == null) {
     return false;
   }
-  node.width = width;
-  node.height = height;
+  if (node.width !== width) {
+    node.width = width;
+  }
+  if (node.height !== height) {
+    node.height = height;
+  }
   context.putImageData(new ImageData(new Uint8ClampedArray(buffer, 24, pixels), width, height), 0, 0);
   return true;
 }
@@ -319,30 +325,89 @@ export function AnalysisView({
   const canvas = useRef<HTMLCanvasElement>(null);
   const plotId = useRef(0);
   const openSeq = useRef(0);
-  const frameSeq = useRef(0);
   const sizeRef = useRef({ width: 960, height: 640 });
+  const hoverNode = useRef<HTMLParagraphElement>(null);
+  const painted = useRef(false);
+  const flight = useRef({
+    busy: false,
+    gesture: null as PointerInput | null,
+    settle: false,
+  });
   const hoverFlight = useRef({ busy: false, x: 0, y: 0, pending: false });
   const drawRef = useRef<(input: PointerInput) => void>(() => {});
   const hoverRef = useRef<(x: number, y: number) => void>(() => {});
   const [options, setOptions] = useState<Record<string, string>>({});
   const [meta, setMeta] = useState<PlotMeta | null>(null);
   const [shown, setShown] = useState(false);
-  const [hover, setHover] = useState<HoverReadout | null>(null);
-  const [error, setError] = useState<string | null>(null);
   const [study, setStudy] = useState<string | null>(null);
   const [size, setSize] = useState({ width: 960, height: 640 });
   sizeRef.current = size;
   const plotWidth = Math.max(16, Math.round(size.width * (window.devicePixelRatio || 1)));
   const plotHeight = Math.max(16, Math.round(size.height * (window.devicePixelRatio || 1)));
 
-  const draw = (input: PointerInput) => {
-    const id = plotId.current;
-    const node = canvas.current;
-    if (id === 0 || node == null) {
+  const showReadout = (next: HoverReadout | null) => {
+    const node = hoverNode.current;
+    if (node == null) {
       return;
     }
-    const ticket = frameSeq.current + 1;
-    frameSeq.current = ticket;
+    if (next == null || !next.hit) {
+      node.hidden = true;
+      return;
+    }
+    node.hidden = false;
+    const series = next.series == null ? "" : `  #${next.series + 1}`;
+    node.textContent = `${next.x.toPrecision(4)}, ${next.y.toPrecision(4)}${series}`;
+  };
+
+  const enqueue = (input: PointerInput) => {
+    const slot = flight.current;
+    if (input.reset) {
+      slot.gesture = input;
+      slot.settle = false;
+      return;
+    }
+    const idle = input.x < 0 && !input.drag && input.wheel === 0 && input.dx === 0 && input.dy === 0;
+    if (idle) {
+      slot.settle = true;
+      return;
+    }
+    const previous = slot.gesture;
+    if (previous == null) {
+      slot.gesture = input;
+      return;
+    }
+    slot.gesture = {
+      x: input.x,
+      y: input.y,
+      dx: previous.dx + input.dx,
+      dy: previous.dy + input.dy,
+      wheel: previous.wheel + input.wheel,
+      drag: previous.drag || input.drag,
+      reset: false,
+    };
+  };
+
+  const pump = () => {
+    const slot = flight.current;
+    const id = plotId.current;
+    const node = canvas.current;
+    if (slot.busy || id === 0 || node == null) {
+      return;
+    }
+    const gesture = slot.gesture;
+    if (gesture != null) {
+      slot.gesture = null;
+      send(id, node, gesture);
+      return;
+    }
+    if (slot.settle) {
+      slot.settle = false;
+      send(id, node, REST);
+    }
+  };
+
+  const send = (id: number, node: HTMLCanvasElement, input: PointerInput) => {
+    flight.current.busy = true;
     const width = Math.max(16, Math.round(sizeRef.current.width * (window.devicePixelRatio || 1)));
     const height = Math.max(16, Math.round(sizeRef.current.height * (window.devicePixelRatio || 1)));
     void invoke<ArrayBuffer>("scan_kit_plot_frame", {
@@ -358,23 +423,36 @@ export function AnalysisView({
       reset: input.reset,
     })
       .then((payload) => {
-        if (ticket !== frameSeq.current || id !== plotId.current) {
+        if (id !== plotId.current) {
           return;
         }
         const buffer = frameBytes(payload);
-        setShown(paintFrame(node, buffer));
-        if (input.x >= 0) {
-          setHover(readoutOf(buffer));
+        const ok = paintFrame(node, buffer);
+        if (ok !== painted.current) {
+          painted.current = ok;
+          setShown(ok);
         }
-        setError(null);
+        if (input.x >= 0) {
+          showReadout(readoutOf(buffer));
+        }
+        dismissNotice("analysis");
       })
       .catch((reason: unknown) => {
         const message = messageOf(reason);
         if (message.includes("stale plot") || id !== plotId.current) {
           return;
         }
-        setError(message);
+        notifyError(message, "analysis");
+      })
+      .finally(() => {
+        flight.current.busy = false;
+        pump();
       });
+  };
+
+  const draw = (input: PointerInput) => {
+    enqueue(input);
+    pump();
   };
 
   const readHover = (x: number, y: number) => {
@@ -391,13 +469,13 @@ export function AnalysisView({
     void invoke<HoverReadout>("scan_kit_plot_hover", { id, x, y })
       .then((next) => {
         if (id === plotId.current) {
-          setHover(next.hit ? next : null);
+          showReadout(next.hit ? next : null);
         }
       })
       .catch((reason: unknown) => {
         const message = messageOf(reason);
         if (!message.includes("stale plot") && id === plotId.current) {
-          setError(message);
+          notifyError(message, "analysis");
         }
       })
       .finally(() => {
@@ -437,20 +515,22 @@ export function AnalysisView({
         options,
         background: parseColor(tokenColor("--background")),
         foreground: parseColor(tokenColor("--foreground")),
-        palette: palette(),
+        palette: palette(sessionIds),
       })
         .then((next) => {
           if (openSeq.current !== ticket) {
             return;
           }
           plotId.current = next.id;
+          flight.current.gesture = null;
+          flight.current.settle = false;
           setMeta(next);
-          setHover(null);
-          setError(null);
+          showReadout(null);
+          dismissNotice("analysis");
         })
         .catch((reason: unknown) => {
           if (openSeq.current === ticket) {
-            setError(messageOf(reason));
+            notifyError(messageOf(reason), "analysis");
           }
         });
     }, 150);
@@ -543,9 +623,10 @@ export function AnalysisView({
   });
 
   return (
-    <div className="flex min-h-0 flex-1">
-      <aside className="flex w-56 shrink-0 flex-col gap-3 border-r border-border p-3">
+    <div className="flex min-h-0 flex-1 overflow-hidden">
+      <aside className="flex min-h-0 w-56 shrink-0 flex-col gap-3 overflow-y-auto border-r border-border p-3">
         <Button variant="outline" onClick={onBack}>
+          <ArrowLeft />
           Sessions
         </Button>
         <h2 className="text-sm font-medium">{meta?.title ?? "Analysis"}</h2>
@@ -604,6 +685,7 @@ export function AnalysisView({
                 }
               }}
             >
+              <Play />
               Play
             </Button>
             <Button
@@ -620,6 +702,7 @@ export function AnalysisView({
                 URL.revokeObjectURL(url);
               }}
             >
+              <Download />
               Export WAV
             </Button>
           </div>
@@ -634,9 +717,7 @@ export function AnalysisView({
                 }
                 void invoke<{ report: string }>("scan_kit_open_study", { path: selected })
                   .then((opened) => setStudy(opened.report))
-                  .catch((reason: unknown) =>
-                    setError(reason instanceof Error ? reason.message : String(reason)),
-                  );
+                  .catch((reason: unknown) => notifyError(reason));
               });
             }}
           >
@@ -644,7 +725,6 @@ export function AnalysisView({
           </Button>
         ) : null}
         {study != null ? <pre className="text-muted-foreground text-xs whitespace-pre-wrap">{study}</pre> : null}
-        {error != null ? <p className="text-destructive text-sm">{error}</p> : null}
       </aside>
       <div ref={host} className="bg-background relative min-h-0 flex-1">
         {table != null && table.rows.length > 0 ? (
@@ -659,12 +739,11 @@ export function AnalysisView({
           />
         ) : null}
         <canvas ref={canvas} className={shown ? "h-full w-full touch-none" : "hidden"} />
-        {hover != null ? (
-          <p className="text-muted-foreground pointer-events-none absolute bottom-2 left-2 text-xs tabular-nums">
-            {hover.x.toPrecision(4)}, {hover.y.toPrecision(4)}
-            {hover.series != null ? `  #${hover.series + 1}` : ""}
-          </p>
-        ) : null}
+        <p
+          ref={hoverNode}
+          hidden
+          className="text-muted-foreground pointer-events-none absolute bottom-2 left-2 text-xs tabular-nums"
+        />
       </div>
     </div>
   );

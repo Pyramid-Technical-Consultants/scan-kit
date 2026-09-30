@@ -408,6 +408,8 @@ pub struct Plot {
     text_buf: Option<wgpu::Buffer>,
     uniform_buf: Option<wgpu::Buffer>,
     uniform_groups: Vec<wgpu::BindGroup>,
+    color_stage: Option<wgpu::Buffer>,
+    id_stage: Option<wgpu::Buffer>,
     cpu_ids: Vec<u32>,
     mark_uploads: u32,
     on_gpu: bool,
@@ -452,6 +454,8 @@ impl Plot {
             text_buf: None,
             uniform_buf: None,
             uniform_groups: Vec::new(),
+            color_stage: None,
+            id_stage: None,
             cpu_ids: Vec::new(),
             mark_uploads: 0,
             on_gpu: false,
@@ -496,8 +500,9 @@ impl Plot {
         }
         self.apply_pointer(width, height, input);
         let layout = self.layout(width, height);
-        let rgba = self.paint(width, height, &layout)?;
-        let hover = self.hover_at(input.x, input.y, width, height, &layout);
+        let sample = pixel_of(input.x, input.y, width, height);
+        let (rgba, series) = self.paint(width, height, &layout, sample)?;
+        let hover = self.hover_at(input.x, input.y, width, height, &layout, false);
         self.size = (width, height);
         Ok(PlotFrame {
             rgba,
@@ -506,7 +511,7 @@ impl Plot {
             hover_hit: hover.0,
             hover_x: hover.1,
             hover_y: hover.2,
-            series: hover.3,
+            series: if hover.0 { series } else { None },
         })
     }
 
@@ -516,7 +521,7 @@ impl Plot {
             return (false, 0.0, 0.0, None);
         }
         let layout = self.layout(width, height);
-        self.hover_at(x, y, width, height, &layout)
+        self.hover_at(x, y, width, height, &layout, true)
     }
 
     fn apply_pointer(&mut self, width: u32, height: u32, input: &PlotInput) {
@@ -579,14 +584,29 @@ impl Plot {
             .collect()
     }
 
-    fn paint(&mut self, width: u32, height: u32, layout: &[Cell]) -> Result<Vec<u8>, String> {
+    fn paint(
+        &mut self,
+        width: u32,
+        height: u32,
+        layout: &[Cell],
+        sample: Option<(u32, u32)>,
+    ) -> Result<(Vec<u8>, Option<u32>), String> {
         self.try_gpu();
         if self.on_gpu {
-            self.paint_gpu(width, height, layout)
-                .map_err(|err| err.to_string())
-        } else {
-            Ok(self.paint_cpu(width, height, layout))
+            return self
+                .paint_gpu(width, height, layout, sample)
+                .map_err(|err| err.to_string());
         }
+        let frame = self.paint_cpu(width, height, layout);
+        let series = sample.and_then(|(x, y)| {
+            let id = self
+                .cpu_ids
+                .get((y * width + x) as usize)
+                .copied()
+                .unwrap_or(0);
+            if id == 0 { None } else { Some(id - 1) }
+        });
+        Ok((frame, series))
     }
 
     fn try_gpu(&mut self) {
@@ -684,7 +704,8 @@ impl Plot {
         width: u32,
         height: u32,
         layout: &[Cell],
-    ) -> Result<Vec<u8>, ComputeError> {
+        sample: Option<(u32, u32)>,
+    ) -> Result<(Vec<u8>, Option<u32>), ComputeError> {
         self.ensure_uploaded()?;
         let gpu = plot_gpu()?;
         self.ensure_targets(width, height)?;
@@ -802,12 +823,7 @@ impl Plot {
             }
         }
         let padded = (width * 4).div_ceil(256) * 256;
-        let readback = gpu.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("readback"),
-            size: u64::from(padded) * u64::from(height),
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
+        let readback = self.color_stage(u64::from(padded) * u64::from(height))?;
         encoder.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
                 texture: &color,
@@ -829,17 +845,84 @@ impl Plot {
                 depth_or_array_layers: 1,
             },
         );
+        let id_stage = if let Some((x, y)) = sample {
+            let id_stage = self.id_stage()?;
+            let id_tex = self.targets.as_ref().unwrap().id.clone();
+            encoder.copy_texture_to_buffer(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &id_tex,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d { x, y, z: 0 },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &id_stage,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(256),
+                        rows_per_image: Some(1),
+                    },
+                },
+                wgpu::Extent3d {
+                    width: 1,
+                    height: 1,
+                    depth_or_array_layers: 1,
+                },
+            );
+            Some(id_stage)
+        } else {
+            None
+        };
         gpu.queue.submit(Some(encoder.finish()));
-        read_buffer(&gpu.device, &readback, width, height, padded)
+        map_color_and_id(&gpu.device, &readback, id_stage.as_ref(), width, height, padded)
     }
 
-    fn hover_at(&self, x: f32, y: f32, width: u32, height: u32, layout: &[Cell]) -> (bool, f32, f32, Option<u32>) {
+    fn color_stage(&mut self, bytes: u64) -> Result<wgpu::Buffer, ComputeError> {
+        let gpu = plot_gpu()?;
+        let fits = self.color_stage.as_ref().is_some_and(|buffer| buffer.size() >= bytes);
+        if !fits {
+            self.color_stage = Some(gpu.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("readback"),
+                size: bytes,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            }));
+        }
+        Ok(self.color_stage.as_ref().unwrap().clone())
+    }
+
+    fn id_stage(&mut self) -> Result<wgpu::Buffer, ComputeError> {
+        let gpu = plot_gpu()?;
+        if self.id_stage.is_none() {
+            self.id_stage = Some(gpu.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("id"),
+                size: 256,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            }));
+        }
+        Ok(self.id_stage.as_ref().unwrap().clone())
+    }
+
+    fn hover_at(
+        &self,
+        x: f32,
+        y: f32,
+        width: u32,
+        height: u32,
+        layout: &[Cell],
+        read_series: bool,
+    ) -> (bool, f32, f32, Option<u32>) {
         let Some(index) = hit_plot(layout, x, y) else {
             return (false, 0.0, 0.0, None);
         };
         let cell = &layout[index];
         let data = self.cameras[cell.panel].data_at(x, y, cell.plot, width as f32, height as f32);
-        let series = self.series_at(x, y, width, height);
+        let series = if read_series {
+            self.series_at(x, y, width, height)
+        } else {
+            None
+        };
         (true, data[0], data[1], series)
     }
 
@@ -1923,6 +2006,65 @@ fn color_attachment(view: &wgpu::TextureView, color: [f32; 4]) -> wgpu::RenderPa
         },
         depth_slice: None,
     }
+}
+
+fn pixel_of(x: f32, y: f32, width: u32, height: u32) -> Option<(u32, u32)> {
+    let px = x.floor() as i32;
+    let py = y.floor() as i32;
+    if px < 0 || py < 0 || px >= width as i32 || py >= height as i32 {
+        None
+    } else {
+        Some((px as u32, py as u32))
+    }
+}
+
+fn map_color_and_id(
+    device: &wgpu::Device,
+    color: &wgpu::Buffer,
+    id: Option<&wgpu::Buffer>,
+    width: u32,
+    height: u32,
+    padded: u32,
+) -> Result<(Vec<u8>, Option<u32>), ComputeError> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let color_done = sender.clone();
+    color.slice(..).map_async(wgpu::MapMode::Read, move |result| {
+        let _ = color_done.send(result);
+    });
+    if let Some(id) = id {
+        id.slice(..).map_async(wgpu::MapMode::Read, move |result| {
+            let _ = sender.send(result);
+        });
+    }
+    device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .map_err(|err| ComputeError::Message(err.to_string()))?;
+    let waits = if id.is_some() { 2 } else { 1 };
+    for _ in 0..waits {
+        receiver
+            .recv()
+            .map_err(|err| ComputeError::Message(err.to_string()))?
+            .map_err(|err| ComputeError::Message(err.to_string()))?;
+    }
+    let mapped = color.slice(..).get_mapped_range();
+    let mut frame = Vec::with_capacity((width * height * 4) as usize);
+    let row_bytes = (width * 4) as usize;
+    for row in 0..height {
+        let start = (row * padded) as usize;
+        frame.extend_from_slice(&mapped[start..start + row_bytes]);
+    }
+    drop(mapped);
+    color.unmap();
+    let series = if let Some(id) = id {
+        let mapped = id.slice(..).get_mapped_range();
+        let value = u32::from(mapped[0]) + u32::from(mapped[1]) * 255;
+        drop(mapped);
+        id.unmap();
+        if value == 0 { None } else { Some(value - 1) }
+    } else {
+        None
+    };
+    Ok((frame, series))
 }
 
 fn read_buffer(
