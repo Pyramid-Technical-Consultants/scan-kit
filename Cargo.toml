@@ -4,6 +4,8 @@ members = [
     "crates/scan-kit-core",
     "crates/scan-kit-io",
     "crates/scan-kit-compute",
+    "crates/scan-kit-plot",
+    "crates/scan-kit-dicom",
     "crates/scan-kit-mcp",
     "apps/desktop/src-tauri",
 ]
@@ -22,10 +24,18 @@ license = "MIT"
 publish = false
 authors = ["Pyramid Technical Consultants, Inc. <support@ptcusa.com>"]
 
+# Numeric kernels index several parallel arrays and take many scalar inputs.
+[workspace.lints.clippy]
+needless_range_loop = "allow"
+too_many_arguments = "allow"
+type_complexity = "allow"
+
 [workspace.dependencies]
 scan-kit-core = { path = "crates/scan-kit-core" }
 scan-kit-io = { path = "crates/scan-kit-io" }
 scan-kit-compute = { path = "crates/scan-kit-compute" }
+scan-kit-plot = { path = "crates/scan-kit-plot" }
+scan-kit-dicom = { path = "crates/scan-kit-dicom" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "io-util"] }

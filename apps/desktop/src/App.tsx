@@ -1,15 +1,51 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  Activity,
+  AudioWaveform,
+  Box,
+  Bug,
+  ChartColumn,
+  ChartScatter,
+  Combine,
+  Cuboid,
+  CircleHelp,
+  Ellipsis,
+  Eye,
+  FolderOpen,
+  Headphones,
+  Info,
+  Layers,
+  LogOut,
+  Play,
+  Redo2,
+  RefreshCw,
+  ScrollText,
+  SquarePen,
+  SlidersHorizontal,
+  Spline,
+  Table2,
+  TrendingDown,
+  TrendingUp,
+  Undo2,
+  Waypoints,
+  X,
+  Zap,
+  type LucideIcon,
+} from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { PhysicalPosition, PhysicalSize } from "@tauri-apps/api/dpi";
 import { availableMonitors, getCurrentWindow } from "@tauri-apps/api/window";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
   DataEditor,
+  emptyGridSelection,
   GridCellKind,
   getDefaultTheme,
+  type DataEditorRef,
   type EditableGridCell,
   type GridCell,
   type GridColumn,
+  type GridSelection,
   type Item,
   type Theme,
 } from "@glideapps/glide-data-grid";
@@ -22,20 +58,50 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import { Button, buttonVariants } from "@/components/ui/button";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuGroup,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import { DebugLog } from "@/DebugLog";
+import { installDebugLog } from "@/debug-log";
+import { dismissNotice, logError, notify, notifyError } from "@/notify";
+import { selectWholeRows } from "@/grid-selection";
+import { selectionFromLibrary } from "@/session-colors";
+import { SessionContextMenu, sessionMenuPoint } from "@/session-menu";
+import {
+  MAX_SELECTED,
+  UseColumnChecks,
+  headerCheck,
+  headerWillFill,
+  nextSessionSelection,
+} from "@/session-checks";
 import {
   Menubar,
   MenubarCheckboxItem,
   MenubarContent,
-  MenubarGroup,
   MenubarItem,
-  MenubarLabel,
   MenubarMenu,
   MenubarSeparator,
   MenubarTrigger,
 } from "@/components/ui/menubar";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Toaster } from "@/components/ui/sonner";
+import { AnalysisView } from "@/AnalysisView";
 
-const MAX_SELECTED = 5;
+const TAB_ICONS: Record<string, LucideIcon> = {
+  "Data Analysis": Table2,
+  "Plan Synthesis": Combine,
+  "Phantom Synthesis": Box,
+  "Plan Runner": Play,
+  "Configuration Tuning": SlidersHorizontal,
+  Debug: Bug,
+};
 
 const LAUNCHER_VIEWS = [
   "Data Analysis",
@@ -79,6 +145,46 @@ const ANALYSIS_GROUPS = [
   },
 ] as const;
 
+const PRIMARY_ANALYSES = [
+  "Binned Summary",
+  "Distribution Explorer",
+  "Timeslice Replay",
+] as const;
+
+const ANALYSIS_ICONS: Record<string, LucideIcon> = {
+  "Binned Summary": ChartColumn,
+  "Distribution Explorer": ChartScatter,
+  "Timeslice Replay": Play,
+  "FFT Explorer": AudioWaveform,
+  "Audio Explorer": Headphones,
+  "IC Beam Trajectory (3D)": Cuboid,
+  "Dose Volume": Layers,
+  "Session Log Compare": ScrollText,
+  "Beam Error Motion vs Energy": Spline,
+  "Dose Accumulation": TrendingUp,
+  "Beam-Off Ramp-Down": TrendingDown,
+  "IC HV Transient Test": Zap,
+  "Amplifier Command Correlations": Waypoints,
+  "IC Peak Amplitude — Beam-Off (G3)": Activity,
+};
+
+const ANALYSIS_IDS: Record<string, string> = {
+  "Binned Summary": "binned_summary",
+  "Distribution Explorer": "distribution",
+  "Timeslice Replay": "timeslice_replay",
+  "FFT Explorer": "ic_fft_analysis",
+  "Audio Explorer": "ic_audio_player",
+  "IC Beam Trajectory (3D)": "trajectory",
+  "Dose Volume": "dose_volume",
+  "Session Log Compare": "session_log_compare",
+  "Beam Error Motion vs Energy": "beam_motion_energy",
+  "Dose Accumulation": "dose_accumulation",
+  "Beam-Off Ramp-Down": "beam_off_rampdown",
+  "IC HV Transient Test": "ic_hv_transient",
+  "Amplifier Command Correlations": "amplifier_correlation",
+  "IC Peak Amplitude — Beam-Off (G3)": "ic_peak_amplitude_beam_off",
+};
+
 type SortKey =
   | "session_id"
   | "date"
@@ -106,7 +212,7 @@ const COLUMN_SORT: Array<SortKey | null> = [
 ];
 
 const COLUMN_TITLES = [
-  "Use",
+  "",
   "Session ID",
   "Date",
   "MU",
@@ -158,6 +264,8 @@ type About = {
 
 type NoteEdit = { sessionId: string; before: string; after: string };
 
+type SessionMenu = { sessionId: string; x: number; y: number };
+
 type Geometry = {
   width: number | null;
   height: number | null;
@@ -195,9 +303,12 @@ function geometryOnScreen(
   });
 }
 
-function tokenColor(name: string): string {
+function tokenColor(name: string, percent?: number): string {
   const probe = document.createElement("span");
-  probe.style.color = `var(${name})`;
+  probe.style.color =
+    percent == null
+      ? `var(${name})`
+      : `color-mix(in oklch, var(${name}) ${percent}%, transparent)`;
   document.body.append(probe);
   const resolved = getComputedStyle(probe).color;
   probe.remove();
@@ -210,20 +321,19 @@ function gridTheme(): Theme {
   const muted = tokenColor("--muted-foreground");
   const card = tokenColor("--card");
   const accent = tokenColor("--accent");
-  const accentFg = tokenColor("--accent-foreground");
   const border = tokenColor("--border");
   const wash = tokenColor("--muted");
   return {
     ...base,
-    accentColor: accent,
-    accentFg,
-    accentLight: wash,
+    accentColor: foreground,
+    accentFg: tokenColor("--background"),
+    accentLight: tokenColor("--foreground", 16),
     textDark: foreground,
     textMedium: muted,
     textLight: muted,
     textBubble: foreground,
     textHeader: foreground,
-    textHeaderSelected: accentFg,
+    textHeaderSelected: tokenColor("--background"),
     bgIconHeader: card,
     fgIconHeader: foreground,
     bgCell: tokenColor("--background"),
@@ -283,6 +393,22 @@ function compareRows(left: LibraryRow, right: LibraryRow, sort: Sort): number {
   return sort.direction === "asc" ? order : -order;
 }
 
+function TabIcon({ name }: { name: string }) {
+  const Icon = TAB_ICONS[name];
+  if (Icon == null) {
+    return null;
+  }
+  return <Icon className="size-4" />;
+}
+
+function AnalysisIcon({ name }: { name: string }) {
+  const Icon = ANALYSIS_ICONS[name];
+  if (Icon == null) {
+    return null;
+  }
+  return <Icon />;
+}
+
 function textCell(value: string, editable: boolean): GridCell {
   return {
     kind: GridCellKind.Text,
@@ -294,23 +420,27 @@ function textCell(value: string, editable: boolean): GridCell {
   };
 }
 
-function messageText(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
-}
-
 export default function App() {
   const [folder, setFolder] = useState<string | null>(null);
   const [rows, setRows] = useState<LibraryRow[]>([]);
   const [sort, setSort] = useState<Sort>({ key: "date", direction: "desc" });
-  const [message, setMessage] = useState<string | null>(null);
   const [about, setAbout] = useState<About | null>(null);
   const [aboutOpen, setAboutOpen] = useState(false);
   const [undo, setUndo] = useState<NoteEdit[]>([]);
   const [redo, setRedo] = useState<NoteEdit[]>([]);
+  const [gridSelection, setGridSelection] = useState<GridSelection>(emptyGridSelection);
   const [theme, setTheme] = useState<Theme | null>(null);
   const [size, setSize] = useState({ width: 0, height: 0 });
   const [tab, setTab] = useState<LauncherView>("Data Analysis");
+  const [analysis, setAnalysis] = useState<string | null>(null);
+  const [sessionMenu, setSessionMenu] = useState<SessionMenu | null>(null);
+  const [selectionOrder, setSelectionOrder] = useState<string[]>([]);
+  const selectedIds = selectionOrder;
+  const canAnalyze = folder != null && selectedIds.length >= 1 && selectedIds.length <= MAX_SELECTED;
   const host = useRef<HTMLDivElement>(null);
+  const gridRef = useRef<DataEditorRef>(null);
+  const [region, setRegion] = useState({ y: 0, height: 40 });
+  const selectionHeader = headerCheck(rows.length, selectedIds.length);
   const folderRef = useRef<string | null>(null);
   folderRef.current = folder;
 
@@ -319,6 +449,15 @@ export default function App() {
     indexes.sort((a, b) => compareRows(rows[a], rows[b], sort));
     return indexes;
   }, [rows, sort]);
+
+  const displayIds = useMemo(
+    () =>
+      order.flatMap((index) => {
+        const id = rows[index]?.session_id;
+        return id == null ? [] : [id];
+      }),
+    [order, rows],
+  );
 
   const columns = useMemo<GridColumn[]>(
     () =>
@@ -331,26 +470,35 @@ export default function App() {
         return {
           title: marked,
           id: key ?? "use",
-          width: index === 0 ? 64 : index === 8 || index === 9 ? 220 : 110,
+          width: index === 0 ? 48 : index === 8 || index === 9 ? 220 : 110,
           grow: index === 8 || index === 9 ? 1 : 0,
         };
       }),
     [sort],
   );
 
+  const onGridSelectionChange = useCallback(
+    (next: GridSelection) => {
+      setGridSelection(selectWholeRows(next, columns.length));
+    },
+    [columns.length],
+  );
+
   const loadFolder = useCallback(async (path: string) => {
-    const opened = await invoke<{ root: string; rows: LibraryRow[] }>(
+    const opened = await invoke<{ root: string; rows: LibraryRow[]; selected?: string[] }>(
       "scan_kit_open_library",
       { path },
     );
     setFolder(opened.root);
     setRows(opened.rows);
-    setMessage(null);
+    setSelectionOrder(selectionFromLibrary(opened.rows, opened.selected));
+    dismissNotice();
     setUndo([]);
     setRedo([]);
   }, []);
 
   useEffect(() => {
+    installDebugLog();
     setTheme(gridTheme());
     let active = true;
     invoke<About>("scan_kit_about")
@@ -361,7 +509,7 @@ export default function App() {
       })
       .catch((error: unknown) => {
         if (active) {
-          setMessage(messageText(error));
+          logError(error);
         }
       });
     invoke<string | null>("scan_kit_last_main_tab")
@@ -372,7 +520,7 @@ export default function App() {
       })
       .catch((error: unknown) => {
         if (active) {
-          setMessage(messageText(error));
+          logError(error);
         }
       });
     invoke<string | null>("scan_kit_last_data_dir")
@@ -384,7 +532,7 @@ export default function App() {
       })
       .catch((error: unknown) => {
         if (active) {
-          setMessage(messageText(error));
+          notifyError(error);
         }
       });
     return () => {
@@ -484,9 +632,67 @@ export default function App() {
     }
     setTab(next);
     void invoke("scan_kit_set_last_main_tab", { tab: next }).catch((error: unknown) => {
-      setMessage(messageText(error));
+      notifyError(error);
     });
   }, []);
+
+  const openAnalysis = useCallback(
+    (name: string) => {
+      const id = ANALYSIS_IDS[name];
+      if (id == null) {
+        return;
+      }
+      setAnalysis(id);
+      selectTab("Data Analysis");
+    },
+    [selectTab],
+  );
+
+  const commitSelection = useCallback((next: { ids: string[]; capped: boolean }) => {
+    const path = folderRef.current;
+    if (path == null) {
+      return;
+    }
+    const same =
+      selectionOrder.length === next.ids.length &&
+      selectionOrder.every((id, index) => id === next.ids[index]);
+    if (same) {
+      if (next.capped) {
+        notify("At most five sessions can be selected.", "selection");
+      }
+      return;
+    }
+    void invoke("scan_kit_select_sessions", { path, sessionIds: next.ids })
+      .then(() => {
+        const chosen = new Set(next.ids);
+        setSelectionOrder(next.ids);
+        setRows((items) => items.map((item) => ({ ...item, selected: chosen.has(item.session_id) })));
+        if (next.capped) {
+          notify("At most five sessions can be selected.", "selection");
+        } else {
+          dismissNotice("selection");
+        }
+      })
+      .catch((error: unknown) => notifyError(error));
+  }, [selectionOrder]);
+
+  const onRowCheck = useCallback(
+    (sessionId: string, checked: boolean) => {
+      commitSelection(nextSessionSelection(displayIds, selectedIds, sessionId, checked));
+    },
+    [commitSelection, displayIds, selectedIds],
+  );
+
+  const onHeaderCheck = useCallback(() => {
+    commitSelection(
+      nextSessionSelection(
+        displayIds,
+        selectedIds,
+        "all",
+        headerWillFill(rows.length, selectedIds.length),
+      ),
+    );
+  }, [commitSelection, displayIds, rows.length, selectedIds]);
 
   const writeNote = useCallback(async (sessionId: string, note: string) => {
     const path = folderRef.current;
@@ -507,42 +713,15 @@ export default function App() {
       if (row == null || folder == null) {
         return;
       }
-      if (col === 0 && newValue.kind === GridCellKind.Boolean) {
-        if (typeof newValue.data !== "boolean") {
-          return;
-        }
-        const selected = rows.filter((item) => item.selected).map((item) => item.session_id);
-        const next = newValue.data
-          ? selected.includes(row.session_id)
-            ? selected
-            : [...selected, row.session_id]
-          : selected.filter((id) => id !== row.session_id);
-        if (next.length > MAX_SELECTED) {
-          setMessage("At most five sessions can be selected.");
-          return;
-        }
-        void invoke("scan_kit_select_sessions", { path: folder, sessionIds: next })
-          .then(() => {
-            setRows((current) =>
-              current.map((item) => ({
-                ...item,
-                selected: next.includes(item.session_id),
-              })),
-            );
-            setMessage(null);
-          })
-          .catch((error: unknown) => setMessage(messageText(error)));
-        return;
-      }
       if (col === 9 && newValue.kind === GridCellKind.Text && newValue.data !== row.note) {
         const edit = { sessionId: row.session_id, before: row.note, after: newValue.data };
         void writeNote(row.session_id, newValue.data)
           .then(() => {
             setUndo((stack) => [...stack, edit]);
             setRedo([]);
-            setMessage(null);
+            dismissNotice();
           })
-          .catch((error: unknown) => setMessage(messageText(error)));
+          .catch((error: unknown) => notifyError(error));
       }
     },
     [folder, order, rows, writeNote],
@@ -557,13 +736,7 @@ export default function App() {
         return textCell("", false);
       }
       if (col === 0) {
-        return {
-          kind: GridCellKind.Boolean,
-          data: row.selected,
-          allowOverlay: false,
-          readonly: false,
-          copyData: row.selected ? "1" : "0",
-        };
+        return textCell("", false);
       }
       const value = [
         row.session_id,
@@ -592,7 +765,7 @@ export default function App() {
         await loadFolder(selected);
       }
     } catch (error) {
-      setMessage(messageText(error));
+      notifyError(error);
     }
   }
 
@@ -601,37 +774,60 @@ export default function App() {
   }
 
   return (
-    <div className="flex h-svh flex-col bg-background text-foreground">
-      <Menubar className="w-full rounded-none border-0 border-b px-2">
+    <div className="flex h-full min-h-0 flex-col overflow-hidden bg-background text-foreground">
+      <Tabs
+        value={tab}
+        onValueChange={(value) => {
+          if (typeof value === "string") {
+            selectTab(value);
+          }
+        }}
+        className="min-h-0 flex-1 gap-0 overflow-hidden"
+      >
+      <div className="flex shrink-0 items-center border-b">
+      <Menubar className="shrink-0 rounded-none border-0 px-2">
         <MenubarMenu>
-          <MenubarTrigger>File</MenubarTrigger>
-          <MenubarContent>
-            <MenubarItem onClick={() => void chooseFolder()}>Open Data Folder</MenubarItem>
+          <MenubarTrigger className="gap-1.5">
+            <FolderOpen className="size-4" />
+            File
+          </MenubarTrigger>
+          <MenubarContent className="w-max">
+            <MenubarItem className="whitespace-nowrap" onClick={() => void chooseFolder()}>
+              <FolderOpen />
+              Open Data Folder
+            </MenubarItem>
             <MenubarItem
+              className="whitespace-nowrap"
               disabled={folder == null}
               onClick={() => {
                 if (folder != null) {
-                  void loadFolder(folder).catch((error: unknown) => setMessage(messageText(error)));
+                  void loadFolder(folder).catch((error: unknown) => notifyError(error));
                 }
               }}
             >
+              <RefreshCw />
               Refresh Sessions
             </MenubarItem>
             <MenubarSeparator />
             <MenubarItem
+              className="whitespace-nowrap"
               onClick={() => {
                 void getCurrentWindow()
                   .close()
-                  .catch((error: unknown) => setMessage(messageText(error)));
+                  .catch((error: unknown) => notifyError(error));
               }}
             >
+              <LogOut />
               Exit
             </MenubarItem>
           </MenubarContent>
         </MenubarMenu>
         <MenubarMenu>
-          <MenubarTrigger>Edit</MenubarTrigger>
-          <MenubarContent>
+          <MenubarTrigger className="gap-1.5">
+            <SquarePen className="size-4" />
+            Edit
+          </MenubarTrigger>
+          <MenubarContent className="w-max">
             <MenubarItem
               disabled={undo.length === 0}
               onClick={() => {
@@ -644,9 +840,10 @@ export default function App() {
                     setUndo((stack) => stack.slice(0, -1));
                     setRedo((stack) => [...stack, edit]);
                   })
-                  .catch((error: unknown) => setMessage(messageText(error)));
+                  .catch((error: unknown) => notifyError(error));
               }}
             >
+              <Undo2 />
               Undo
             </MenubarItem>
             <MenubarItem
@@ -661,19 +858,24 @@ export default function App() {
                     setRedo((stack) => stack.slice(0, -1));
                     setUndo((stack) => [...stack, edit]);
                   })
-                  .catch((error: unknown) => setMessage(messageText(error)));
+                  .catch((error: unknown) => notifyError(error));
               }}
             >
+              <Redo2 />
               Redo
             </MenubarItem>
           </MenubarContent>
         </MenubarMenu>
         <MenubarMenu>
-          <MenubarTrigger>View</MenubarTrigger>
-          <MenubarContent>
+          <MenubarTrigger className="gap-1.5">
+            <Eye className="size-4" />
+            View
+          </MenubarTrigger>
+          <MenubarContent className="w-max">
             {LAUNCHER_VIEWS.map((name) => (
               <MenubarCheckboxItem
                 key={name}
+                className="whitespace-nowrap"
                 checked={tab === name}
                 onCheckedChange={(checked) => {
                   if (checked) {
@@ -681,69 +883,150 @@ export default function App() {
                   }
                 }}
               >
+                <TabIcon name={name} />
                 {name}
               </MenubarCheckboxItem>
             ))}
           </MenubarContent>
         </MenubarMenu>
         <MenubarMenu>
-          <MenubarTrigger>Analysis</MenubarTrigger>
+          <MenubarTrigger className="gap-1.5">
+            <CircleHelp className="size-4" />
+            Help
+          </MenubarTrigger>
           <MenubarContent>
-            {ANALYSIS_GROUPS.map((group, index) => (
-              <MenubarGroup key={group.title}>
-                {index > 0 ? <MenubarSeparator /> : null}
-                <MenubarLabel>{group.title}</MenubarLabel>
-                {group.names.map((name) => (
-                  <MenubarItem key={name} disabled>
-                    {name}
-                  </MenubarItem>
-                ))}
-              </MenubarGroup>
-            ))}
-          </MenubarContent>
-        </MenubarMenu>
-        <MenubarMenu>
-          <MenubarTrigger>Help</MenubarTrigger>
-          <MenubarContent>
-            <MenubarItem onClick={() => setAboutOpen(true)}>About</MenubarItem>
+            <MenubarItem onClick={() => setAboutOpen(true)}>
+              <Info />
+              About
+            </MenubarItem>
           </MenubarContent>
         </MenubarMenu>
       </Menubar>
-
-      <Tabs
-        value={tab}
-        onValueChange={(value) => {
-          if (typeof value === "string") {
-            selectTab(value);
-          }
-        }}
-        className="min-h-0 flex-1 gap-0"
-      >
-        <TabsList variant="line" className="w-full justify-start">
+        <TabsList variant="line" className="ml-auto h-8 shrink-0 justify-end px-2">
           {LAUNCHER_VIEWS.map((name) => (
-            <TabsTrigger key={name} value={name} className="flex-none">
+            <TabsTrigger key={name} value={name} className="flex-none px-2.5 after:bottom-0">
+              <TabIcon name={name} />
               {name}
             </TabsTrigger>
           ))}
         </TabsList>
-        <TabsContent value="Data Analysis" className="flex min-h-0 flex-col">
-          <div className="text-muted-foreground truncate px-3 py-2 text-sm">
-            {folder ?? "Open a data folder to list sessions."}
-            {folder != null && rows.length === 0 ? " — No sessions in this folder." : ""}
-            {rows.length > 0 ? ` — ${rows.length} sessions` : ""}
+      </div>
+        <TabsContent value="Data Analysis" className="flex min-h-0 flex-col overflow-hidden">
+          {analysis != null && folder != null ? (
+            <AnalysisView
+              viewId={analysis}
+              folder={folder}
+              sessionIds={selectedIds}
+              onBack={() => setAnalysis(null)}
+            />
+          ) : (
+          <>
+          <div className="flex items-center gap-2 px-3 py-2">
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={selectedIds.length === 0}
+              aria-label="Clear selection"
+              onClick={() =>
+                commitSelection(nextSessionSelection(displayIds, selectedIds, "all", false))
+              }
+            >
+              <X />
+              Clear
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={folder == null}
+              onClick={() => {
+                if (folder != null) {
+                  void loadFolder(folder).catch((error: unknown) => notifyError(error));
+                }
+              }}
+            >
+              <RefreshCw />
+              Refresh
+            </Button>
+            <div className="ml-auto flex items-center gap-2">
+              {PRIMARY_ANALYSES.map((name) => (
+                <Button key={name} size="sm" disabled={!canAnalyze} onClick={() => openAnalysis(name)}>
+                  <AnalysisIcon name={name} />
+                  {name}
+                </Button>
+              ))}
+              <DropdownMenu>
+                <DropdownMenuTrigger
+                  className={buttonVariants({ variant: "outline", size: "icon-sm" })}
+                  aria-label="More analyses"
+                  disabled={!canAnalyze}
+                >
+                  <Ellipsis />
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="end" className="w-max">
+                  {ANALYSIS_GROUPS.map((group, index) => {
+                    const names = group.names.filter(
+                      (name) => !(PRIMARY_ANALYSES as readonly string[]).includes(name),
+                    );
+                    if (names.length === 0) {
+                      return null;
+                    }
+                    return (
+                      <DropdownMenuGroup key={group.title}>
+                        {index > 0 ? <DropdownMenuSeparator /> : null}
+                        <DropdownMenuLabel>{group.title}</DropdownMenuLabel>
+                        {names.map((name) => (
+                          <DropdownMenuItem
+                            key={name}
+                            className="whitespace-nowrap"
+                            onClick={() => openAnalysis(name)}
+                          >
+                            <AnalysisIcon name={name} />
+                            {name}
+                          </DropdownMenuItem>
+                        ))}
+                      </DropdownMenuGroup>
+                    );
+                  })}
+                </DropdownMenuContent>
+              </DropdownMenu>
+            </div>
           </div>
-          {message != null ? (
-            <div className="text-destructive px-3 pb-2 text-sm">{message}</div>
-          ) : null}
-          <div ref={host} className="min-h-0 flex-1">
+          <div
+            ref={host}
+            className="relative min-h-0 flex-1 overflow-hidden"
+            onContextMenu={(event) => event.preventDefault()}
+          >
             {theme != null && size.width > 0 && size.height > 0 ? (
               <DataEditor
+                ref={gridRef}
                 width={size.width}
                 height={size.height}
                 columns={columns}
                 rows={rows.length}
+                rowHeight={32}
+                headerHeight={32}
                 getCellContent={getCellContent}
                 onCellEdited={onCellEdited}
+                onVisibleRegionChanged={(next) => {
+                  setRegion((current) =>
+                    current.y === next.y && current.height === next.height
+                      ? current
+                      : { y: next.y, height: next.height },
+                  );
+                }}
+                onCellContextMenu={([, rowIndex], event) => {
+                  event.preventDefault();
+                  const source = order[rowIndex];
+                  const row = source == null ? undefined : rows[source];
+                  if (row == null) {
+                    return;
+                  }
+                  const point = sessionMenuPoint(event.bounds, event.localEventX, event.localEventY);
+                  if (!Number.isFinite(point.x) || !Number.isFinite(point.y)) {
+                    return;
+                  }
+                  setSessionMenu({ sessionId: row.session_id, x: point.x, y: point.y });
+                }}
                 onHeaderClicked={(col) => {
                   const key = COLUMN_SORT[col];
                   if (key == null) {
@@ -756,14 +1039,55 @@ export default function App() {
                   );
                 }}
                 theme={theme}
+                gridSelection={gridSelection}
+                onGridSelectionChange={onGridSelectionChange}
+                columnSelect="none"
                 rowMarkers="none"
                 smoothScrollX
                 smoothScrollY
               />
             ) : null}
+            {rows.length === 0 ? (
+              <p className="text-muted-foreground pointer-events-none absolute inset-x-0 top-12 text-center text-sm">
+                {folder == null
+                  ? "Open a data folder to list sessions."
+                  : "No sessions in this folder."}
+              </p>
+            ) : null}
+            <UseColumnChecks
+              gridRef={gridRef}
+              hostRef={host}
+              sessionIds={displayIds}
+              region={region}
+              ready={theme != null && size.width > 0 && size.height > 0}
+              order={selectedIds}
+              header={selectionHeader}
+              onRow={onRowCheck}
+              onHeader={onHeaderCheck}
+            />
+            {sessionMenu != null ? (
+              <SessionContextMenu
+                sessionId={sessionMenu.sessionId}
+                x={sessionMenu.x}
+                y={sessionMenu.y}
+                onClose={() => setSessionMenu(null)}
+                onCopy={(id) => {
+                  void navigator.clipboard.writeText(id).then(
+                    () => notify(`Copied session ${id}`),
+                    () => notifyError("Could not copy the session id"),
+                  );
+                }}
+                onTune={() => selectTab("Configuration Tuning")}
+              />
+            ) : null}
           </div>
+          </>
+          )}
         </TabsContent>
-        {LAUNCHER_VIEWS.filter((name) => name !== "Data Analysis").map((name) => (
+        <TabsContent value="Debug" className="flex min-h-0 flex-col overflow-hidden">
+          <DebugLog />
+        </TabsContent>
+        {LAUNCHER_VIEWS.filter((name) => name !== "Data Analysis" && name !== "Debug").map((name) => (
           <TabsContent key={name} value={name}>
             <p className="text-muted-foreground px-3 py-2">{name} is not in this preview yet.</p>
           </TabsContent>
@@ -827,6 +1151,7 @@ export default function App() {
           ) : null}
         </DialogContent>
       </Dialog>
+      <Toaster theme="dark" />
     </div>
   );
 }

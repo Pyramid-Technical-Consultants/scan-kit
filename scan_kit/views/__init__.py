@@ -10,8 +10,6 @@ without importing :mod:`sounddevice`.
 
 from __future__ import annotations
 
-import importlib.util
-
 ViewEntry = tuple[str, str, str]
 
 
@@ -23,97 +21,10 @@ def view_description(entry: ViewEntry) -> str:
     return entry[2]
 
 
-_HAS_AUDIO = importlib.util.find_spec("sounddevice") is not None
-
-_UNIFIED_VIEWS: list[ViewEntry] = [
-    (
-        "Binned Summary",
-        "binned_summary",
-        "Universal binned summary: dose error, dose ratios, dose rate, current ratios, "
-        "IC current, position error, sigma, and spot time vs energy, target MU, spot time, or beam radius.",
-    ),
-    (
-        "Distribution Explorer",
-        "distribution",
-        "Density or scatter plots for position, position error, sigma, sigma error, "
-        "confidence correlations, and Gaussian filter coverage.",
-    ),
-    (
-        "Timeslice Replay",
-        "timeslice_replay",
-        "Interactive timeslice viewer with unified signal sources (IC current, dDose/dt, sigma, position, and more).",
-    ),
-    (
-        "FFT Explorer",
-        "ic_fft_analysis",
-        "Frequency-domain FFT line spectra for selectable timeslice IC currents.",
-    ),
-]
-if _HAS_AUDIO:
-    _UNIFIED_VIEWS.append(
-        (
-            "Audio Explorer",
-            "ic_audio_player",
-            "Listen to selectable timeslice signals and export WAV audio files (visPy).",
-        ),
-    )
-_UNIFIED_VIEWS.extend(
-    [
-    (
-        "IC Beam Trajectory (3D)",
-        "trajectory",
-        "Interactive 3D per-spot IC beam paths, dipole gaps, iso/IC planes, "
-        "and optional plan overlay (visPy).",
-    ),
-    (
-        "Dose Volume",
-        "dose_volume",
-        "Tri-planar slices, a ray-marched 3D volume, and depth, lateral, DVH, or gamma plots. "
-        "Sessions in a water, plastic, or metal phantom, or a DICOM study recalculated by the "
-        "GPU Monte Carlo on its CT: measured, plan difference, 3D gamma or gamma vs the TPS, "
-        "clinical goals, RTDOSE/HTML report (visPy).",
-    ),
-    (
-        "Session Log Compare",
-        "session_log_compare",
-        "Session log layer timings, errors, and side-by-side event comparison.",
-    ),
-    ]
-)
-
-_SPECIALIZED_VIEWS: list[ViewEntry] = [
-    (
-        "Beam Error Motion vs Energy",
-        "beam_motion_energy",
-        "Per-energy X/Y position error spill paths from IC1 (solid) and IC2 (dotted).",
-    ),
-    (
-        "Dose Accumulation",
-        "dose_accumulation",
-        "Expected versus measured cumulative dose for each ion chamber.",
-    ),
-    (
-        "Beam-Off Ramp-Down",
-        "beam_off_rampdown",
-        "Beam-off ramp-down curves for IC1, IC2, and IC3 from scan-total dose.",
-    ),
-    (
-        "IC HV Transient Test",
-        "ic_hv_transient",
-        "IC high-voltage toggle transients with capacitance re-derived from the nA waveforms "
-        "(HCC + strips), compared to the firmware result.",
-    ),
-    (
-        "Amplifier Command Correlations",
-        "amplifier_correlation",
-        "Beam-on scatter plots of settled amplifier command vs readback, field, and IC iso position.",
-    ),
-    (
-        "IC Peak Amplitude — Beam-Off (G3)",
-        "ic_peak_amplitude_beam_off",
-        "G3 beam-off peak current amplitude distributions for IC1/IC2 X and Y.",
-    ),
-]
+# Analysis views run in the Rust shell. These lists stay empty so the Qt launcher
+# no longer imports the deleted windows.
+_UNIFIED_VIEWS: list[ViewEntry] = []
+_SPECIALIZED_VIEWS: list[ViewEntry] = []
 
 VIEW_GROUPS: list[tuple[str, list[ViewEntry]]] = [
     ("Unified Views", _UNIFIED_VIEWS),

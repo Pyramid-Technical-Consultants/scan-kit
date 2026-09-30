@@ -609,6 +609,10 @@ fn delete_missing(conn: &Connection, lib_id: i64, found: &HashSet<String>) -> Re
     Ok(())
 }
 
+pub(crate) fn selected_session_ids(conn: &Connection, lib_id: i64) -> Result<Vec<String>, String> {
+    selected_list(conn, lib_id)
+}
+
 fn selected_list(conn: &Connection, lib_id: i64) -> Result<Vec<String>, String> {
     let raw: String = conn
         .query_row(

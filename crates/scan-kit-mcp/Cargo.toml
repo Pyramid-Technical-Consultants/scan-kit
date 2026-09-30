@@ -11,9 +11,14 @@ description = "Scan Kit MCP server"
 name = "scan-kit-mcp"
 path = "src/main.rs"
 
+[lints]
+workspace = true
+
 [dependencies]
 rmcp = { version = "3.5.0", features = ["server", "transport-io", "transport-worker", "client"] }
+scan-kit-compute = { workspace = true }
 scan-kit-core = { workspace = true }
+scan-kit-dicom = { workspace = true }
 scan-kit-io = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }

@@ -44,6 +44,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "allocator-api2"
+version = "0.2.21"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
+
+[[package]]
 name = "android_system_properties"
 version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -495,6 +501,15 @@ dependencies = [
  "bitflags 2.13.2",
  "core-foundation",
  "libc",
+]
+
+[[package]]
+name = "core_maths"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "77745e017f5edba1a9c1d854f6f3a52dac8a12dd5af5d2f54aecf61e43d80d30"
+dependencies = [
+ "libm",
 ]
 
 [[package]]
@@ -1000,6 +1015,16 @@ name = "foldhash"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
+
+[[package]]
+name = "fontdue"
+version = "0.9.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7894823fa221401399e2598f8b63f81ac77ff5c63248b7656779bff1632d7d3d"
+dependencies = [
+ "hashbrown 0.15.5",
+ "ttf-parser",
+]
 
 [[package]]
 name = "foreign-types"
@@ -1514,6 +1539,8 @@ version = "0.15.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9229cfe53dfd69f0609a49f65461bd93001ea1ef889cd5529dd176593f5338a1"
 dependencies = [
+ "allocator-api2",
+ "equivalent",
  "foldhash 0.1.5",
 ]
 
@@ -3204,6 +3231,10 @@ name = "scan-kit-compute"
 version = "2.0.0-dev"
 dependencies = [
  "naga",
+ "scan-kit-core",
+ "scan-kit-io",
+ "scan-kit-plot",
+ "serde_json",
  "tokio",
  "wgpu",
 ]
@@ -3220,12 +3251,23 @@ dependencies = [
 name = "scan-kit-desktop"
 version = "2.0.0-dev"
 dependencies = [
+ "scan-kit-compute",
  "scan-kit-core",
+ "scan-kit-dicom",
  "scan-kit-io",
  "serde_json",
  "tauri",
  "tauri-build",
  "tauri-plugin-dialog",
+]
+
+[[package]]
+name = "scan-kit-dicom"
+version = "2.0.0-dev"
+dependencies = [
+ "scan-kit-core",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -3248,10 +3290,28 @@ name = "scan-kit-mcp"
 version = "2.0.0-dev"
 dependencies = [
  "rmcp",
+ "scan-kit-compute",
  "scan-kit-core",
+ "scan-kit-dicom",
  "scan-kit-io",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "scan-kit-plot"
+version = "2.0.0-dev"
+dependencies = [
+ "fontdue",
+ "naga",
+ "scan-kit-core",
+ "serde",
+ "serde_json",
+ "tokio",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+ "wgpu",
 ]
 
 [[package]]
@@ -4471,6 +4531,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
+name = "ttf-parser"
+version = "0.25.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d2df906b07856748fa3f6e0ad0cbaa047052d4a7dd609e231c4f72cee8c36f31"
+dependencies = [
+ "core_maths",
+]
+
+[[package]]
 name = "typeid"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4850,6 +4919,7 @@ dependencies = [
  "thiserror 2.0.21",
  "wgpu-core-deps-apple",
  "wgpu-core-deps-emscripten",
+ "wgpu-core-deps-wasm",
  "wgpu-core-deps-windows-linux-android",
  "wgpu-hal",
  "wgpu-types",
@@ -4869,6 +4939,15 @@ name = "wgpu-core-deps-emscripten"
 version = "27.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b06ac3444a95b0813ecfd81ddb2774b66220b264b3e2031152a4a29fda4da6b5"
+dependencies = [
+ "wgpu-hal",
+]
+
+[[package]]
+name = "wgpu-core-deps-wasm"
+version = "27.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9b1027dcf3b027a877e44819df7ceb0e2e98578830f8cd34cd6c3c7c2a7a50b7"
 dependencies = [
  "wgpu-hal",
 ]

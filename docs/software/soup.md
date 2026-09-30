@@ -22,7 +22,7 @@ Versions below are the ones locked for the workspace. Anomaly review for a SOUP 
 | SOUP | Version | Purpose |
 |---|---|---|
 | Rust | stable, pinned by `rust-toolchain.toml` | Language and standard library |
-| tokio | see `Cargo.toml` | Async runtime for the MCP server and the compute test |
+| tokio | see `Cargo.toml` | Async runtime for the MCP server, plot-frame readback, and the compute test |
 | serde / serde_json | see `Cargo.toml` | Tool input and output |
 | rmcp | see `crates/scan-kit-mcp/Cargo.toml` | MCP protocol and stdio transport |
 | tauri | see `apps/desktop/src-tauri/Cargo.toml` | Desktop shell |
@@ -34,8 +34,15 @@ Versions below are the ones locked for the workspace. Anomaly review for a SOUP 
 | bzip2 | see `crates/scan-kit-io/Cargo.toml` | `.tar.bz2` session archives |
 | xz2 | see `crates/scan-kit-io/Cargo.toml` | `.tar.xz` session archives |
 | csv | see `crates/scan-kit-io/Cargo.toml` | Quoted fields and header drift in session files |
-| wgpu | see `crates/scan-kit-compute/Cargo.toml` | The only GPU and compute library |
-| naga | see `crates/scan-kit-compute/Cargo.toml` | Compile the compute shader when no GPU adapter is present |
+| wgpu | see `crates/scan-kit-plot/Cargo.toml` and `crates/scan-kit-compute/Cargo.toml` | The only GPU library. The plot crate draws with it natively and in the webview (WebGPU, or WebGL2 through its `webgl` feature). The compute crate runs kernels with it |
+| naga | see `crates/scan-kit-plot/Cargo.toml` and `crates/scan-kit-compute/Cargo.toml` | Compile the plot and compute shaders when no GPU adapter is present |
+| fontdue | see `crates/scan-kit-plot/Cargo.toml` | Rasterize plot labels into one glyph atlas |
+| wasm-bindgen | see `crates/scan-kit-plot/Cargo.toml` | JavaScript bindings for the plot renderer built for `wasm32-unknown-unknown` |
+| wasm-bindgen-futures | see `crates/scan-kit-plot/Cargo.toml` | Await the browser GPU adapter and device from the wasm renderer |
+| web-sys | see `crates/scan-kit-plot/Cargo.toml` | The `HtmlCanvasElement` the wasm renderer draws into |
+| wasm-bindgen-cli | the `wasm-bindgen` version in `Cargo.lock` | Build tool. Generates `apps/desktop/src/wasm` from the plot crate. Not linked into the product binary |
+
+Plot text uses the vendored Source Sans 3 regular face in `crates/scan-kit-plot/assets/SourceSans3-Regular.ttf` (SIL Open Font License, Latin 400 from fontsource 5.2.8). It is compiled into the plot crate with `include_bytes`. It is not a Cargo dependency.
 
 ## Desktop frontend
 
@@ -46,5 +53,9 @@ Versions below are the ones locked for the workspace. Anomaly review for a SOUP 
 | Base UI (`@base-ui/react`) | see `apps/desktop/package.json` | Behavior of shadcn components |
 | `@glideapps/glide-data-grid` | see `apps/desktop/package.json` | Session list and later column views |
 | `@tauri-apps/plugin-dialog` | see `apps/desktop/package.json` | Open Data Folder dialog |
+| sonner | see `apps/desktop/package.json` | Toast notices that do not move the layout |
+| next-themes | see `apps/desktop/package.json` | Theme value read by the stock toast toaster. The app stays dark |
+| vitest | see `apps/desktop/package.json` | Desktop UI checks. Not linked into the product binary |
+| happy-dom | see `apps/desktop/package.json` | DOM for those checks. Not linked into the product binary |
 
 shadcn component source copied into `apps/desktop/src/components/ui/` is project software, not SOUP. The packages those components import are SOUP and are listed through `package.json`.

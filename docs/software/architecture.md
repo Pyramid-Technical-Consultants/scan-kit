@@ -11,15 +11,17 @@ Cargo.toml                      workspace
 rust-toolchain.toml             stable pin
 crates/scan-kit-core/           pure behavior: version, tools, summary parse, column aliases
 crates/scan-kit-io/             session discovery, the sqlite store, columnar loads
-crates/scan-kit-compute/        wgpu device and kernels
+crates/scan-kit-plot/           wgpu plot renderer, native and wasm32
+crates/scan-kit-compute/        wgpu kernels, view scenes, and MCP plot frames
+crates/scan-kit-dicom/          DICOM study index, clinical goals, and report
 crates/scan-kit-mcp/            stdio MCP server
 apps/desktop/                   React, Tailwind, shadcn, Glide Data Grid
 apps/desktop/src-tauri/         Tauri 2 shell
 ```
 
-`scan-kit-core` does not depend on Tauri, the MCP SDK, sqlite, or `wgpu`. `scan-kit-io` and `scan-kit-compute` depend on core. Only `scan-kit-compute` links `wgpu`. `scan-kit-mcp` registers the concatenation of each crate's tool list and dispatches to that crate. It does not reimplement an operation. The Tauri shell calls the same functions through commands.
+`scan-kit-core` does not depend on Tauri, the MCP SDK, sqlite, or `wgpu`. `scan-kit-io` and `scan-kit-compute` depend on core. `scan-kit-plot` depends on core. `scan-kit-compute` also depends on `scan-kit-io` so one function can load a view, and on `scan-kit-plot` to paint it. Only `scan-kit-plot` and `scan-kit-compute` link `wgpu`. `scan-kit-mcp` registers the concatenation of each crate's tool list and dispatches to that crate. It does not reimplement an operation. The Tauri shell calls the same functions through commands.
 
-A DICOM crate waits until DICOM is ported. WGSL that still lives under `scan_kit/assets/` stays there until a kernel moves into `scan-kit-compute`.
+`scan-kit-dicom` reads an explicit little-endian DICOM folder. The Monte Carlo transport shader lives in `scan-kit-compute`. The material tables stay under `scan_kit/assets/`.
 
 ## MCP first
 
@@ -37,6 +39,11 @@ Tools:
 - `scan_kit_open_library`, workflow, discovers a local data folder, syncs the sqlite index, and returns the session rows
 - `scan_kit_set_note` and `scan_kit_select_sessions`, granular
 - `scan_kit_load_columns`, granular, returns requested columns after alias resolution and the G2 current scale
+- `scan_kit_load_timeslice` and `scan_kit_channel_catalog`, granular
+- `scan_kit_analysis_scene`, workflow, builds one view scene from the selected sessions
+- `scan_kit_run_view`, workflow, paints that scene to one RGBA frame for MCP and tests
+- `scan_kit_calibrate`, `scan_kit_dose_error`, `scan_kit_beam_mask`, `scan_kit_bin_edges`, `scan_kit_histogram`, `scan_kit_welch`, and `scan_kit_fit_decay`, granular
+- `scan_kit_open_study` and `scan_kit_clinical_goal`, the DICOM study index and a dose-volume goal
 
 Agents in this repository launch the server with `.cursor/mcp.json` (`cargo run -p scan-kit-mcp --quiet` on stdio).
 
@@ -60,13 +67,15 @@ The desktop chrome is React, Tailwind, and shadcn. Dark mode is always on. The p
 
 Chrome uses shadcn semantic tokens (`bg-background`, `text-foreground`, `bg-card`, `border-border`, and the rest of that theme) and components added with `shadcn add`. The menu bar is a shadcn menu, not a native menu. There is no theme menu.
 
-Tabular data, including the session list and later column views, is drawn by [Glide Data Grid](https://grid.glideapps.com/). The grid theme is filled from the stock tokens (background, card, foreground, muted foreground, border, accent, and the Geist font). Those tokens are not edited. A DOM table, including a shadcn Table, is not used for data. Later views that show loaded columns use this same grid, fed by `load_columns`.
+Tabular data, including the session list and Session Log Compare, is drawn by [Glide Data Grid](https://grid.glideapps.com/). The grid theme is filled from the stock tokens (background, card, foreground, muted foreground, border, accent, and the Geist font). Those tokens are not edited. A DOM table, including a shadcn Table, is not used for data.
+
+The Analysis menu opens a view when one to five sessions are selected. Controls are shadcn components added with `shadcn add` (Select and Field for choices), not native form elements. A control change calls `scan_kit_open_plot`, which returns one binary payload: a JSON header (controls, table, samples, panel frames) and the encoded marks. The webview loads that payload into `scan-kit-plot` built for wasm32 and draws on the canvas with WebGPU, or WebGL2 where WebGPU is missing. Wheel, drag, hover, and resize stay in the webview. No frame crosses the Tauri bridge. `scan_kit_run_view` renders the same `Plot` offscreen and returns one base64 frame for MCP and tests, colored from the stock tokens. Audio Explorer plays and exports the open plot's samples with Web Audio. Dose Volume can open a DICOM folder through `scan_kit_open_study`.
 
 No custom CSS for color, radius, type, or spacing. A unique visual style, when it exists, is a deliberate change to the shadcn theme, not one-off overrides in a feature change.
 
 ## Numeric work
 
-`wgpu` is the only compute library. It lives in `scan-kit-compute`. Nothing else links it. This phase stands up the device, one storage-buffer dispatch, and a readback so later kernels use that path. No scientific kernel moves yet. The readback test skips when the machine has no adapter and still compiles the shader.
+`wgpu` is the only GPU library. Drawing lives in `scan-kit-plot`, which builds natively and for `wasm32-unknown-unknown` from one source and one WGSL shader. The analytic splat, ray march, gamma, DVH, resample, and Monte Carlo transport shaders live in `scan-kit-compute`. Nothing else links `wgpu`. Marks are stored as `vec3` in data space. One `clip_from_data` matrix places them, and a later orbit or volume writes that same matrix. The shader stays inside the WebGL2 downlevel limits: no nonzero base instance and one color target. Series hover is a CPU hit test on the same marks. The native path reads a frame back as RGBA for MCP. The readback test skips the dispatch when the machine has no adapter and still compiles the shader. The no-adapter picture projects the same buffers.
 
 No dataframe crate and no ORM. Session columns are `Vec<f32>` or `Vec<i32>`, parsed in one pass.
 

@@ -5,31 +5,15 @@ Agreement with MCsquare lives in ``validation/`` and is not run by pytest.
 
 from __future__ import annotations
 
-import functools
 from pathlib import Path
 
 import numpy as np
 import pytest
 
 from scan_kit.views.dose_mc import load_tables, mc_media
-from scan_kit.views.dose_volume_catalog import MC_MEDIA, MEDIUM_POLYETHYLENE, MODEL_ANALYTIC, MODEL_MC, WEIGHT_DOSE
+from scan_kit.views.dose_volume_catalog import MC_MEDIA
 
 ROOT = Path(__file__).resolve().parents[1]
-
-
-@pytest.fixture(scope="module")
-def canvas(qapp, gpu):
-    from scan_kit.views.dose_volume_raycast import _gl_at_least
-    from scan_kit.views.vispy_plot import make_scene_canvas
-
-    try:
-        c = make_scene_canvas(size=(64, 64), show=False, gl="gl+")
-        c.set_current()
-    except Exception as exc:
-        pytest.skip(f"visPy canvas unavailable: {exc}")
-    if not _gl_at_least(4, 3):
-        pytest.skip("OpenGL 4.3 compute unavailable")
-    return c
 
 
 def _grid(lateral, depth):
@@ -172,68 +156,3 @@ def test_range_matches_its_own_stopping_powers(gpu) -> None:
     i = peak + int(np.argmax(idd[peak:] < level)) - 1
     r80 = i + 0.5 + (idd[i] - level) / (idd[i] - idd[i + 1])
     assert r80 == pytest.approx(csda, rel=0.01)
-
-
-def test_plan_vs_plan_monte_carlo_shares_random_numbers(canvas) -> None:
-    from scan_kit.views.dose_volume_data import SplatBatch, range_axis_for_medium
-    from scan_kit.views.dose_volume_raycast import read_texture
-    from scan_kit.views.dose_volume_vispy import DoseScene
-
-    rng = np.random.default_rng(3)
-    n = 20
-    plan = SplatBatch(
-        center=np.column_stack([rng.uniform(-15, 15, (n, 2)), np.zeros(n)]).astype(np.float32),
-        sigma=np.full((n, 3), 3.5, dtype=np.float32),
-        weight=rng.uniform(0.5, 2.0, n).astype(np.float32),
-        energy_mev=rng.choice([90.0, 120.0], n).astype(np.float32),
-        dose_mu=rng.uniform(0.5, 2.0, n).astype(np.float32),
-        k_mu=2.6e-8,
-    )
-    scene = DoseScene(canvas)
-    show = functools.partial(
-        scene.render, plan, plan, range_axis_for_medium("water"), gain=1.0, gantry_deg=0.0,
-        weight_mode=WEIGHT_DOSE, voxel_mm=2.0, gamma=True, model=MODEL_MC,
-    )
-    show(mc_histories=100_000)
-    assert scene.mc_refining and scene.gamma_pending and scene.gamma_pass is None
-    while scene.mc_step():
-        assert "MC" in scene.volume_note and "%" in scene.volume_note
-    assert not scene.gamma_pending and scene.gamma
-    shape = tuple(scene._meas_tex.shape[:3])
-    meas = read_texture(canvas, scene._meas_tex, shape)
-    assert meas.max() > 0.0 and np.array_equal(meas, read_texture(canvas, scene._plan_tex, shape))
-    passed, total = scene.gamma_pass
-    assert total > 0 and passed == total
-    assert "MC 100k" in scene.volume_note and scene.mc_progress is None
-    show(mc_histories=200_000)
-    assert scene.mc_progress == 0.5 and scene.gamma_pending
-    while scene.mc_step():
-        pass
-    assert "MC 200k" in scene.volume_note and scene.gamma
-
-
-def test_model_controls_follow_medium_and_weight(qapp, tmp_path) -> None:
-    from scan_kit.views.dose_volume_catalog import WEIGHT_MU
-    from scan_kit.views.dose_volume_window import DoseVolumeWindow
-
-    window = DoseVolumeWindow(["none"], str(tmp_path))
-    try:
-        assert window.progress.active  # loading
-        assert not window._model_row.isHidden() and window._histories_row.isHidden()
-        window._model_combo.set_current(MODEL_MC)
-        window._sync_model_controls()
-        assert not window._histories_row.isHidden() and not window._scatter_check.isEnabled()
-        config = window._read_config()
-        assert config.dose_model == MODEL_MC and config.mc_histories == 10_000_000
-        window._set_combo(window._histories_combo, "50000000")
-        assert window._read_config().mc_histories == 50_000_000
-        window._set_combo(window._medium_combo, MEDIUM_POLYETHYLENE)
-        assert not window._model_combo.isEnabled() and window._choice(window._model_combo) == MODEL_ANALYTIC
-        assert window._histories_row.isHidden() and window._scatter_check.isEnabled()
-        window._set_combo(window._weight_combo, WEIGHT_MU)
-        window._sync_model_controls()
-        assert window._model_row.isHidden()
-    finally:
-        window.close()
-        window.deleteLater()
-        qapp.processEvents()

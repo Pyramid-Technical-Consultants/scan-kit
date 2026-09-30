@@ -13,18 +13,6 @@ from scan_kit.common.plotting import (
     scatter_with_trend,
     set_view_header,
 )
-from scan_kit.views.beam_off_rampdown import _heatmap_energy_extent
-
-
-def test_heatmap_energy_extent_expands_zero_span() -> None:
-    assert _heatmap_energy_extent([220.0]) == (219.5, 220.5)
-    assert _heatmap_energy_extent([220.0, 220.0]) == (219.5, 220.5)
-
-
-def test_heatmap_energy_extent_preserves_span() -> None:
-    assert _heatmap_energy_extent([100.0, 220.0]) == (100.0, 220.0)
-
-
 def test_apply_tight_layout_skips_manual_gridspec() -> None:
     fig = plt.figure(figsize=(10, 6))
     gs = fig.add_gridspec(1, 1, left=0.1, right=0.9, top=0.9, bottom=0.1)

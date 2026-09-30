@@ -14,8 +14,13 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
+[lints]
+workspace = true
+
 [dependencies]
+scan-kit-compute = { workspace = true }
 scan-kit-core = { workspace = true }
+scan-kit-dicom = { workspace = true }
 scan-kit-io = { workspace = true }
 serde_json = { workspace = true }
 tauri = { version = "2", features = [] }
