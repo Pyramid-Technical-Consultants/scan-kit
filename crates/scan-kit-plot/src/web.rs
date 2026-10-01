@@ -79,6 +79,13 @@ impl WebPlot {
             view_formats: Vec::new(),
         };
         surface.configure(&device, &config);
+        #[cfg(target_arch = "wasm32")]
+        {
+            use std::sync::Arc;
+            device.on_uncaptured_error(Arc::new(|err| {
+                web_sys::console::error_1(&JsValue::from_str(&format!("plot gpu: {err}")));
+            }));
+        }
         let backend = format!("{:?}", adapter.get_info().backend);
         let gpu = PlotGpu::new(device, queue, format).map_err(js)?;
         Ok(Self {
@@ -162,16 +169,19 @@ impl WebPlot {
         }
         let frame = match self.surface.get_current_texture() {
             Ok(frame) => frame,
+            // A resize leaves the first acquire outdated. Reconfigure and take
+            // the next one; giving up here leaves the canvas at its default black.
             Err(wgpu::SurfaceError::Outdated | wgpu::SurfaceError::Lost) => {
                 self.surface.configure(&self.gpu.device, &self.config);
-                return Ok(());
+                self.surface.get_current_texture().map_err(js)?
             }
             Err(err) => return Err(js(err)),
         };
-        let view = frame.texture.create_view(&Default::default());
-        let encoder = plot
-            .record(&self.gpu, &view, self.config.width, self.config.height)
-            .map_err(js)?;
+        let encoder = {
+            let view = frame.texture.create_view(&Default::default());
+            plot.record(&self.gpu, &view, self.config.width, self.config.height)
+                .map_err(js)?
+        };
         self.gpu.queue.submit(Some(encoder.finish()));
         frame.present();
         Ok(())

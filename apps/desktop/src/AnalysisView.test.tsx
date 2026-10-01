@@ -14,9 +14,9 @@ vi.mock("@tauri-apps/api/core", () => ({
       controls: [
         { id: "metric", label: "Y", options: ["Dose Ratios"], value: "Dose Ratios" },
         { id: "source", label: "Source", options: ["Spot — Isocenter"], value: "Spot — Isocenter" },
-        { id: "x", label: "X", options: ["Energy"], value: "Energy" },
-        { id: "domain", label: "Domain", options: ["All"], value: "All" },
-        { id: "beam", label: "Beam", options: ["Beam on"], value: "Beam on" },
+        { id: "x", label: "X", options: ["Energy", "Target MU", "Spot time", "Radius"], value: "Energy" },
+        { id: "domain", label: "Domain", options: ["All", "Lower 95%", "Upper 95%", "MAD outliers"], value: "All" },
+        { id: "beam", label: "Beam", options: ["Beam on", "Beam off", "Both"], value: "Beam on" },
         { id: "trend", label: "Trend", options: ["On", "Off"], value: "On" },
       ],
       table: null,
@@ -72,7 +72,7 @@ it("puts grouped controls on the right and returns to sessions", async () => {
   });
 
   const legends = [...host.querySelectorAll("legend")].map((node) => node.textContent);
-  expect(legends).toEqual(["Y Metric", "X Parameter", "Plot Style", "Filter Data"]);
+  expect(legends).toEqual(["Data Source", "Plot Style", "Filter Data"]);
   expect(host.querySelector("h2")).toBeNull();
   expect(host.textContent).not.toContain("Presets");
   expect(host.textContent).not.toContain("Dose Ratios vs Energy");
@@ -85,6 +85,12 @@ it("puts grouped controls on the right and returns to sessions", async () => {
   expect(handle?.getAttribute("aria-label")).toBe("Resize configuration");
   expect(aside?.textContent).toContain("Sessions");
   expect(aside?.textContent).toContain("Domain");
+  expect((aside as HTMLElement | undefined)?.style.width).toBe("350px");
+  const segments = [...host.querySelectorAll("[data-slot='toggle-group-item']")].map((node) =>
+    node.textContent?.trim(),
+  );
+  expect(segments).toEqual(["Beam on", "Beam off", "Both"]);
+  expect(host.querySelector("[data-slot='radio-group']")).toBeNull();
 
   const back = [...host.querySelectorAll("button")].find((button) => button.textContent?.includes("Sessions"));
   await act(async () => {

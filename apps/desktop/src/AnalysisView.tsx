@@ -12,10 +12,12 @@ import {
   type Theme,
 } from "@glideapps/glide-data-grid";
 
-import { controlDisabled, controlSections, type ControlSlot } from "@/analysis-controls";
+import { controlDisabled, controlSections, segmentChoices, type ControlSlot } from "@/analysis-controls";
+import { ButtonSegmentGroup } from "@/components/button-segment-group";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Field, FieldLabel, FieldLegend, FieldSet } from "@/components/ui/field";
+import { optionIcon } from "@/option-icons";
 import { backingSize, plotHeader, type PlotHeader, type ViewControl } from "@/plot-header";
 import { sessionColor } from "@/session-colors";
 import { dismissNotice, notifyError } from "@/notify";
@@ -27,12 +29,6 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-
-type Readout = {
-  x: number;
-  y: number;
-  series: number | null;
-};
 
 type Plotter = import("@/wasm/scan_kit_plot.js").WebPlot;
 
@@ -161,7 +157,7 @@ function messageOf(reason: unknown): string {
 }
 
 const SIDE_MIN = 220;
-const SIDE_DEFAULT = 280;
+const SIDE_DEFAULT = 350;
 const PLOT_MIN = 240;
 
 function clampSide(parentWidth: number, next: number): number {
@@ -181,6 +177,7 @@ function ChoiceSelect({
   onChange: (value: string) => void;
 }) {
   const items = control.options.map((option) => ({ label: option, value: option }));
+  const Icon = optionIcon(value);
   return (
     <Select
       items={items}
@@ -193,15 +190,20 @@ function ChoiceSelect({
       }}
     >
       <SelectTrigger className="w-full">
+        {Icon == null ? null : <Icon />}
         <SelectValue />
       </SelectTrigger>
       <SelectContent>
         <SelectGroup>
-          {items.map((item) => (
-            <SelectItem key={item.value} value={item.value}>
-              {item.label}
-            </SelectItem>
-          ))}
+          {items.map((item) => {
+            const ItemIcon = optionIcon(item.value);
+            return (
+              <SelectItem key={item.value} value={item.value}>
+                {ItemIcon == null ? null : <ItemIcon />}
+                {item.label}
+              </SelectItem>
+            );
+          })}
         </SelectGroup>
       </SelectContent>
     </Select>
@@ -226,28 +228,12 @@ export function AnalysisView({
   const payload = useRef<Uint8Array | null>(null);
   const frame = useRef(0);
   const openSeq = useRef(0);
-  const hoverNode = useRef<HTMLParagraphElement>(null);
   const [options, setOptions] = useState<Record<string, string>>({});
   const [meta, setMeta] = useState<PlotHeader | null>(null);
   const [study, setStudy] = useState<string | null>(null);
   const [size, setSize] = useState({ width: 960, height: 640 });
   const [sideWidth, setSideWidth] = useState(SIDE_DEFAULT);
   const shown = (meta?.panels.length ?? 0) > 0;
-
-  // The helpers below only read refs, so the listeners registered once keep working.
-  const showReadout = (next: Readout | null) => {
-    const node = hoverNode.current;
-    if (node == null) {
-      return;
-    }
-    if (next == null) {
-      node.hidden = true;
-      return;
-    }
-    node.hidden = false;
-    const series = next.series == null ? "" : `  #${next.series + 1}`;
-    node.textContent = `${next.x.toPrecision(4)}, ${next.y.toPrecision(4)}${series}`;
-  };
 
   const requestDraw = () => {
     if (frame.current !== 0) {
@@ -263,12 +249,6 @@ export function AnalysisView({
     });
   };
 
-  const readHover = (x: number, y: number) => {
-    const hit = plotter.current?.hover(x, y);
-    showReadout(hit == null ? null : { x: hit.x, y: hit.y, series: hit.series ?? null });
-    hit?.free();
-  };
-
   const fitCanvas = () => {
     const node = canvas.current;
     if (node == null) {
@@ -276,7 +256,11 @@ export function AnalysisView({
     }
     const rect = node.getBoundingClientRect();
     const next = backingSize(rect.width, rect.height, window.devicePixelRatio);
-    if (node.width !== next.width || node.height !== next.height) {
+    // The plotter configures the drawing buffer. Assigning width here resets it.
+    if (
+      plotter.current == null &&
+      (node.width !== next.width || node.height !== next.height)
+    ) {
       node.width = next.width;
       node.height = next.height;
     }
@@ -320,12 +304,15 @@ export function AnalysisView({
 
   useEffect(() => {
     const node = canvas.current;
-    if (node == null) {
+    // The canvas stays in the tree while hidden. A surface created at that
+    // 0×0 box, then resized, drops the only frame and the view stays black.
+    if (node == null || !shown) {
       return;
     }
     let live = true;
     const observer = new ResizeObserver(fitCanvas);
     observer.observe(node);
+    fitCanvas();
     plotterFor(node)
       .then((plot) => {
         if (!live) {
@@ -343,7 +330,7 @@ export function AnalysisView({
       cancelAnimationFrame(frame.current);
       frame.current = 0;
     };
-  }, []);
+  }, [shown]);
 
   useEffect(() => {
     if (shown) {
@@ -372,7 +359,6 @@ export function AnalysisView({
           setMeta(plotHeader(bytes));
           payload.current = bytes;
           loadPayload();
-          showReadout(null);
           dismissNotice("analysis");
         })
         .catch((reason: unknown) => {
@@ -406,7 +392,6 @@ export function AnalysisView({
       const point = locate(event);
       plotter.current?.zoom(point.x, point.y, event.deltaY);
       requestDraw();
-      readHover(point.x, point.y);
     };
     const onDown = (event: PointerEvent) => {
       dragging = true;
@@ -416,14 +401,13 @@ export function AnalysisView({
       dragging = false;
     };
     const onMove = (event: PointerEvent) => {
-      const point = locate(event);
-      if (dragging) {
-        plotter.current?.pan(point.x, point.y, event.movementX * point.sx, event.movementY * point.sy);
-        requestDraw();
+      if (!dragging) {
+        return;
       }
-      readHover(point.x, point.y);
+      const point = locate(event);
+      plotter.current?.pan(point.x, point.y, event.movementX * point.sx, event.movementY * point.sy);
+      requestDraw();
     };
-    const onLeave = () => showReadout(null);
     const onDouble = () => {
       plotter.current?.reset();
       requestDraw();
@@ -433,7 +417,6 @@ export function AnalysisView({
     node.addEventListener("pointerup", onUp);
     node.addEventListener("pointercancel", onUp);
     node.addEventListener("pointermove", onMove);
-    node.addEventListener("pointerleave", onLeave);
     node.addEventListener("dblclick", onDouble);
     return () => {
       node.removeEventListener("wheel", onWheel);
@@ -441,7 +424,6 @@ export function AnalysisView({
       node.removeEventListener("pointerup", onUp);
       node.removeEventListener("pointercancel", onUp);
       node.removeEventListener("pointermove", onMove);
-      node.removeEventListener("pointerleave", onLeave);
       node.removeEventListener("dblclick", onDouble);
     };
   }, []);
@@ -505,6 +487,19 @@ export function AnalysisView({
     const value = resolved[slot.id] ?? control.value;
     const label = slot.label ?? control.label;
     const disabled = controlDisabled(slot.id, resolved);
+    if (slot.kind !== "check" && segmentChoices(control.options)) {
+      return (
+        <div key={slot.id} className="flex items-center gap-2">
+          <FieldLabel className="w-28 shrink-0 whitespace-nowrap">{label}</FieldLabel>
+          <ButtonSegmentGroup
+            options={control.options}
+            value={value}
+            disabled={disabled}
+            onChange={(next) => apply(slot.id, next)}
+          />
+        </div>
+      );
+    }
     if (slot.kind === "check") {
       return (
         <Field key={slot.id} orientation="horizontal" className={disabled ? "opacity-50" : undefined}>
@@ -553,11 +548,6 @@ export function AnalysisView({
         ) : null}
         <div className={shown ? "relative min-h-0 flex-1" : "hidden"}>
           <canvas ref={canvas} className="absolute inset-0 h-full w-full touch-none" />
-          <p
-            ref={hoverNode}
-            hidden
-            className="text-muted-foreground pointer-events-none absolute bottom-2 left-2 text-xs tabular-nums"
-          />
         </div>
       </div>
       <div

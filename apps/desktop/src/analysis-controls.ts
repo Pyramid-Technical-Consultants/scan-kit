@@ -15,23 +15,18 @@ export type ControlSection = {
 const SECTIONS: Record<string, ControlSection[]> = {
   binned_summary: [
     {
-      title: "Y Metric",
+      title: "Data Source",
       slots: [
         { id: "source", kind: "select" },
-        { id: "metric", kind: "bare" },
-      ],
-    },
-    {
-      title: "X Parameter",
-      slots: [
-        { id: "x", kind: "bare" },
+        { id: "metric", kind: "select" },
+        { id: "x", kind: "select" },
         { id: "bins", kind: "select", label: "Bins" },
       ],
     },
     {
       title: "Plot Style",
       slots: [
-        { id: "glyph", kind: "bare" },
+        { id: "glyph", kind: "select" },
         { id: "trend", kind: "check", label: "Trend Line" },
         { id: "cutoff", kind: "select" },
         { id: "fliers", kind: "check", label: "Show Box Outliers" },
@@ -62,11 +57,11 @@ const SECTIONS: Record<string, ControlSection[]> = {
     {
       title: "Distribution",
       slots: [
-        { id: "mode", kind: "bare" },
+        { id: "mode", kind: "select" },
         { id: "grain", kind: "select" },
       ],
     },
-    { title: "Plot Style", slots: [{ id: "draw", kind: "bare" }] },
+    { title: "Plot Style", slots: [{ id: "draw", kind: "select" }] },
     { title: "Filter Data", slots: [{ id: "beam", kind: "select" }] },
   ],
   timeslice_replay: [
@@ -106,6 +101,17 @@ export function controlSections(viewId: string, ids: readonly string[]): Control
     });
   }
   return sections;
+}
+
+const SHORT_CHOICE = 10;
+
+/** Two or three short labels sit in a joined button row. */
+export function segmentChoices(options: readonly string[]): boolean {
+  return (
+    options.length >= 2 &&
+    options.length < 4 &&
+    options.every((option) => option.length > 0 && option.length <= SHORT_CHOICE)
+  );
 }
 
 /** Histogram bin controls follow the show-panel checkbox, same as the Python panel. */

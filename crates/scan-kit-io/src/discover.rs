@@ -112,6 +112,15 @@ pub fn read_session_file(storage: &Path, session_id: &str, filename: &str) -> Op
 }
 
 pub fn read_timeslices(storage: &Path) -> Vec<Vec<u8>> {
+    read_timeslice_frames(storage)
+        .into_iter()
+        .map(|(_, bytes)| bytes)
+        .collect()
+}
+
+/// Timeslice files in layer/run order. The index is the `layer-N` folder, or
+/// `-1` when the path has no layer folder.
+pub fn read_timeslice_frames(storage: &Path) -> Vec<(i64, Vec<u8>)> {
     let mut members = if storage.is_dir() {
         let mut found = Vec::new();
         walk_files(storage, storage, 0, &is_timeslice, &mut found);
@@ -120,7 +129,17 @@ pub fn read_timeslices(storage: &Path) -> Vec<Vec<u8>> {
         archive_members(storage, &|name| is_timeslice(&normalize_member(name))).unwrap_or_default()
     };
     members.sort_by_key(|member| timeslice_key(&member.0));
-    members.into_iter().map(|(_, bytes)| bytes).collect()
+    members
+        .into_iter()
+        .map(|(name, bytes)| {
+            let index = if name.contains("layer-") {
+                number_after(&name, "layer-")
+            } else {
+                -1
+            };
+            (index, bytes)
+        })
+        .collect()
 }
 
 fn is_unpacked_session(folder: &Path) -> bool {

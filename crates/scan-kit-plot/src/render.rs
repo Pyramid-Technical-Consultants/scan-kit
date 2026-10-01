@@ -58,6 +58,39 @@ fn shade(rgb: vec3<f32>, alpha: f32, coverage: f32) -> vec4<f32> {
     return vec4<f32>(rgb * a, a);
 }
 
+fn orient(a: vec2<f32>, b: vec2<f32>, p: vec2<f32>) -> f32 {
+    return (b.x - a.x) * (p.y - a.y) - (b.y - a.y) * (p.x - a.x);
+}
+
+fn is_top_left(a: vec2<f32>, b: vec2<f32>) -> bool {
+    let d = b - a;
+    return d.y > 0.0 || (d.y == 0.0 && d.x < 0.0);
+}
+
+fn same_side(w: f32, area: f32, a: vec2<f32>, b: vec2<f32>) -> bool {
+    if (w * area > 0.0) {
+        return true;
+    }
+    if (w != 0.0) {
+        return false;
+    }
+    if (area > 0.0) {
+        return is_top_left(a, b);
+    }
+    return is_top_left(b, a);
+}
+
+// Screen y grows down. A shared edge is included on one triangle only.
+fn owns_pixel(p: vec2<f32>, a: vec2<f32>, b: vec2<f32>, c: vec2<f32>) -> bool {
+    let area = orient(a, b, c);
+    if (area == 0.0) {
+        return false;
+    }
+    return same_side(orient(a, b, p), area, a, b)
+        && same_side(orient(b, c, p), area, b, c)
+        && same_side(orient(c, a, p), area, c, a);
+}
+
 fn colormap(t: f32) -> vec3<f32> {
     let stops = array<vec3<f32>, 6>(
         vec3<f32>(0.267, 0.005, 0.329),
@@ -186,28 +219,30 @@ fn vs_quad(
     @location(1) b: vec4<f32>,
     @location(2) color: vec4<f32>,
 ) -> QuadOut {
-    // a.w > 0.5 is a triangle (a.xy, b.xy, b.zw). The second three vertices
-    // collapse so the six-vertex quad draw does not blend the fill twice.
+    // a.w > 0.5 is a triangle (a.xy, b.xy, b.zw). Vertices grow a pixel so the
+    // rasterizer emits every sample the original triangle owns. The fragment
+    // shader keeps that original triangle, top-left edges included, so a shared
+    // edge composites once. Vertices 3–5 collapse and add no second copy.
     if (a.w > 0.5) {
         let c0 = to_px(vec3<f32>(a.xy, 0.0));
         let c1 = to_px(vec3<f32>(b.xy, 0.0));
         let c2 = to_px(vec3<f32>(b.zw, 0.0));
         var p = c0;
+        if (vi == 1u) { p = c1; }
+        else if (vi == 2u) { p = c2; }
         if (vi < 3u) {
-            if (vi == 1u) { p = c1; }
-            else if (vi == 2u) { p = c2; }
             let mid = (c0 + c1 + c2) * (1.0 / 3.0);
             let delta = p - mid;
             let len = max(length(delta), 0.001);
-            p = p + delta / len * 0.75;
+            p = p + delta / len * 1.0;
         }
         var out: QuadOut;
         out.clip = px_to_clip(p);
         out.color = color;
-        out.uv = vec2<f32>(0.0, 0.0);
-        out.bounds0 = vec2<f32>(-1.0e6, -1.0e6);
-        out.bounds1 = vec2<f32>(1.0e6, 1.0e6);
-        out.heat = 0.0;
+        out.uv = c2;
+        out.bounds0 = c0;
+        out.bounds1 = c1;
+        out.heat = -1.0;
         return out;
     }
     let lo = min(a.xy, b.xy);
@@ -233,10 +268,16 @@ fn vs_quad(
 
 @fragment
 fn fs_quad(in: QuadOut) -> @location(0) vec4<f32> {
+    if (in.heat < -0.5) {
+        let coverage = select(0.0, 1.0, owns_pixel(in.clip.xy, in.bounds0, in.bounds1, in.uv));
+        return shade(in.color.rgb, in.color.a, coverage);
+    }
     let p = in.clip.xy;
     let outside = max(max(in.bounds0.x - p.x, p.x - in.bounds1.x), max(in.bounds0.y - p.y, p.y - in.bounds1.y));
     let coverage = clamp(0.5 - outside, 0.0, 1.0);
-    let sample = textureSample(mark_tex, mark_samp, in.uv).r;
+    // textureSample is illegal on a branch the triangle pixels skip. Level 0
+    // has no derivatives, so this heatmap lookup can sit in that branch.
+    let sample = textureSampleLevel(mark_tex, mark_samp, in.uv, 0.0).r;
     let rgb = mix(in.color.rgb, colormap(sample), in.heat);
     return shade(rgb, in.color.a, coverage);
 }
@@ -711,7 +752,7 @@ impl Plot {
                     plot: PlotRect {
                         x: cell.x + left,
                         y: cell.y + top,
-                        w: (cell.w - left - 8.0).max(8.0),
+                        w: (cell.w - left - 16.0).max(8.0),
                         h: (cell.h - top - bottom).max(8.0),
                     },
                     cell,
@@ -1088,21 +1129,43 @@ pub(crate) fn header_panels(panels: &[Panel]) -> Vec<Panel> {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn expand_triangle(points: [[f32; 2]; 3]) -> [[f32; 2]; 3] {
-    let mid = [
-        (points[0][0] + points[1][0] + points[2][0]) / 3.0,
-        (points[0][1] + points[1][1] + points[2][1]) / 3.0,
-    ];
-    points.map(|point| {
-        let delta = [point[0] - mid[0], point[1] - mid[1]];
-        let len = (delta[0] * delta[0] + delta[1] * delta[1])
-            .sqrt()
-            .max(0.001);
-        [
-            point[0] + delta[0] / len * 0.75,
-            point[1] + delta[1] / len * 0.75,
-        ]
-    })
+fn orient_px(a: [f32; 2], b: [f32; 2], p: [f32; 2]) -> f32 {
+    (b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0])
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn is_top_left_px(a: [f32; 2], b: [f32; 2]) -> bool {
+    let dx = b[0] - a[0];
+    let dy = b[1] - a[1];
+    dy > 0.0 || (dy == 0.0 && dx < 0.0)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn same_side_px(w: f32, area: f32, a: [f32; 2], b: [f32; 2]) -> bool {
+    if w * area > 0.0 {
+        return true;
+    }
+    if w != 0.0 {
+        return false;
+    }
+    if area > 0.0 {
+        is_top_left_px(a, b)
+    } else {
+        is_top_left_px(b, a)
+    }
+}
+
+/// Screen y grows down. Matches `owns_pixel` in the plot shader: a shared edge
+/// belongs to one triangle, so a transparent fill is not composited twice.
+#[cfg(not(target_arch = "wasm32"))]
+fn owns_pixel_px(p: [f32; 2], a: [f32; 2], b: [f32; 2], c: [f32; 2]) -> bool {
+    let area = orient_px(a, b, c);
+    if area == 0.0 {
+        return false;
+    }
+    same_side_px(orient_px(a, b, p), area, a, b)
+        && same_side_px(orient_px(b, c, p), area, b, c)
+        && same_side_px(orient_px(c, a, p), area, c, a)
 }
 
 fn point_in_triangle(p: [f32; 2], a: [f32; 2], b: [f32; 2], c: [f32; 2]) -> bool {
@@ -1574,7 +1637,7 @@ fn heatmap_bytes(values: &[f32], cols: u32, rows: u32) -> Vec<u8> {
 
 fn grid_lines(camera: &Camera, foreground: [f32; 4]) -> Vec<LineRec> {
     let mut lines = Vec::new();
-    let grid = [foreground[0], foreground[1], foreground[2], 0.45];
+    let grid = frame_color(foreground);
     for tick in ticks(camera.xmin, camera.xmax) {
         lines.push(axis_line(
             [tick, camera.ymin, 0.0],
@@ -1594,23 +1657,27 @@ fn grid_lines(camera: &Camera, foreground: [f32; 4]) -> Vec<LineRec> {
     lines
 }
 
-/// A 1px rectangle inset half a pixel so the stroke sits inside the plot.
+/// A 1px rectangle inset one pixel so the stroke stays inside the plot.
 fn border_lines(camera: &Camera, plot: &PlotRect, foreground: [f32; 4]) -> Vec<LineRec> {
     let span_x = camera.xmax - camera.xmin;
     let span_y = camera.ymax - camera.ymin;
-    let inset_x = 0.5 * span_x.abs() / plot.w.max(1.0);
-    let inset_y = 0.5 * span_y.abs() / plot.h.max(1.0);
+    let inset_x = span_x.abs() / plot.w.max(1.0);
+    let inset_y = span_y.abs() / plot.h.max(1.0);
     let x0 = camera.xmin + inset_x;
     let x1 = camera.xmax - inset_x;
     let y0 = camera.ymin + inset_y;
     let y1 = camera.ymax - inset_y;
-    let spine = [foreground[0], foreground[1], foreground[2], 1.0];
+    let spine = frame_color(foreground);
     vec![
         axis_line([x0, y0, 0.0], [x1, y0, 0.0], spine, 1.0),
         axis_line([x1, y0, 0.0], [x1, y1, 0.0], spine, 1.0),
         axis_line([x1, y1, 0.0], [x0, y1, 0.0], spine, 1.0),
         axis_line([x0, y1, 0.0], [x0, y0, 0.0], spine, 1.0),
     ]
+}
+
+fn frame_color(foreground: [f32; 4]) -> [f32; 4] {
+    [foreground[0], foreground[1], foreground[2], 0.45]
 }
 
 fn axis_line(a: [f32; 3], b: [f32; 3], color: [f32; 4], thickness: f32) -> LineRec {
@@ -1792,7 +1859,9 @@ fn panel_rects(
     let rows = count.div_ceil(cols);
     let gap = 12.0f32;
     let margin = 8.0f32;
-    let inner_w = width as f32 - margin * 2.0 - gap * (cols.saturating_sub(1) as f32);
+    // Extra room on the right so the 1px frame is not cut by the canvas edge.
+    let margin_right = 16.0f32;
+    let inner_w = width as f32 - margin - margin_right - gap * (cols.saturating_sub(1) as f32);
     let col_weight = if weights.len() == cols {
         weights.to_vec()
     } else {
@@ -1873,14 +1942,14 @@ fn fill_quad_cpu(
             height as f32,
         );
         let p2 = project(*matrix, [c[0], c[1], 0.0], width as f32, height as f32);
-        let pts = expand_triangle([p0, p1, p2]);
+        let pts = [p0, p1, p2];
         let min_x = pts.iter().map(|p| p[0]).fold(f32::MAX, f32::min).floor() as i32;
         let max_x = pts.iter().map(|p| p[0]).fold(f32::MIN, f32::max).ceil() as i32;
         let min_y = pts.iter().map(|p| p[1]).fold(f32::MAX, f32::min).floor() as i32;
         let max_y = pts.iter().map(|p| p[1]).fold(f32::MIN, f32::max).ceil() as i32;
         for y in min_y..=max_y {
             for x in min_x..=max_x {
-                if point_in_triangle([x as f32 + 0.5, y as f32 + 0.5], pts[0], pts[1], pts[2]) {
+                if owns_pixel_px([x as f32 + 0.5, y as f32 + 0.5], pts[0], pts[1], pts[2]) {
                     blend(frame, width, height, x, y, quad.color, Some(plot));
                 }
             }
@@ -2734,6 +2803,66 @@ mod tests {
         assert_eq!(plot.hover(inside[0], inside[1]).3, Some(1));
         let outside = plot.project_data(0, 1.0, 8.0, 180, 140);
         assert_ne!(plot.hover(outside[0], outside[1]).3, Some(1));
+    }
+
+    #[test]
+    fn shared_edge_belongs_to_one_triangle() {
+        let left = [[0.0, 0.0], [10.0, 10.0], [0.0, 10.0]];
+        let right = [[0.0, 0.0], [10.0, 0.0], [10.0, 10.0]];
+        let owns = |p, tri: [[f32; 2]; 3]| owns_pixel_px(p, tri[0], tri[1], tri[2]);
+        assert!(owns([1.5, 7.5], left));
+        assert!(!owns([1.5, 7.5], right));
+        assert!(owns([7.5, 1.5], right));
+        assert!(!owns([7.5, 1.5], left));
+        let seam = [5.0, 5.0];
+        assert_eq!(
+            usize::from(owns(seam, left)) + usize::from(owns(seam, right)),
+            1,
+            "the diagonal is drawn by one triangle"
+        );
+    }
+
+    #[test]
+    fn triangle_seam_stays_the_same_color_as_the_fill() {
+        let mut scene = line_scene();
+        scene.panels[0].series = vec![Series::Triangles {
+            xs: vec![0.0, 10.0, 10.0, 0.0, 10.0, 0.0],
+            ys: vec![0.0, 0.0, 10.0, 0.0, 10.0, 10.0],
+            color: [1.0, 0.0, 0.0, 0.5],
+        }];
+        let (width, height) = (180, 140);
+        let mut plot = Plot::new(&scene, [0.0, 0.0, 0.0, 1.0], [0.0, 1.0, 0.0, 1.0]);
+        plot.apply(width, height, &PlotInput::default());
+        let layout = plot.layout(width, height);
+        let cpu = plot.paint_cpu(width, height, &layout);
+        assert_fill_is_even(&cpu, width, &layout[0].plot);
+        if let Ok(gpu) = crate::native_gpu() {
+            let on_gpu = plot.paint_offscreen(gpu, width, height).unwrap();
+            assert_fill_is_even(&on_gpu, width, &layout[0].plot);
+        }
+    }
+
+    fn assert_fill_is_even(frame: &[u8], width: u32, plot: &PlotRect) {
+        let mut quiet = 255u8;
+        let mut peak = 0u8;
+        let x0 = plot.x as u32 + 8;
+        let x1 = (plot.x + plot.w) as u32 - 8;
+        let y0 = plot.y as u32 + 8;
+        let y1 = (plot.y + plot.h) as u32 - 8;
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let red = frame[((y * width + x) * 4) as usize];
+                if red > 40 {
+                    quiet = quiet.min(red);
+                    peak = peak.max(red);
+                }
+            }
+        }
+        assert!(quiet > 80 && quiet < 255, "fill red {quiet}");
+        assert!(
+            peak - quiet < 24,
+            "overlapping triangles darkened the fill ({quiet}..={peak})"
+        );
     }
 
     fn near(

@@ -31,7 +31,7 @@ struct YGroup {
     id: &'static str,
     label: &'static str,
     series: &'static [YSeries],
-    /// Draw the zero line and include 0 in the y range.
+    /// Include 0 in the y range so a gridline lands on zero.
     zero: bool,
     /// Beam and domain filters apply.
     filter: bool,
@@ -356,23 +356,38 @@ pub(crate) fn binned_summary(root: &Path, session_ids: &[String], options: &Valu
     let unique = x_column == "energy";
     let raw_x = glyph == "scatter" || glyph == "contour";
 
-    let mut tables = Vec::new();
-    for session in session_ids {
+    let load_one = |session: &String| {
         let mut table = if geometry {
             load_slice_metric(root, session, group.id, source == "timeslice_chamber")
         } else if group.timeslice {
             load_timeslice(root, session, group.id)
         } else if group.id == "dose_rate" {
-            dose_rate_table(&load_spot(root, session, false))
+            dose_rate_table(&load_spot(root, session, false, false))
         } else {
-            load_spot(root, session, chamber)
+            load_spot(root, session, chamber, group.id == "spot_time")
         };
         if group.filter {
             let keys: Vec<&str> = group.series.iter().map(|series| series.key).collect();
             apply_filter(&mut table, &keys, domain, beam);
         }
-        tables.push(table);
-    }
+        table
+    };
+    // A handful of sessions, one thread each. The spot cache covers a repeat open.
+    let mut tables = if session_ids.len() < 2 {
+        session_ids.iter().map(load_one).collect::<Vec<_>>()
+    } else {
+        let mut tables = Vec::with_capacity(session_ids.len());
+        std::thread::scope(|scope| {
+            let mut joins = Vec::with_capacity(session_ids.len());
+            for session in session_ids {
+                joins.push(scope.spawn(|| load_one(session)));
+            }
+            for join in joins {
+                tables.push(join.join().unwrap());
+            }
+        });
+        tables
+    };
 
     let categories = if raw_x {
         Vec::new()
@@ -552,7 +567,6 @@ fn main_panel(
         }
     }
     if group.zero {
-        drawn.push(hline(xmin, xmax, 0.0, [0.55, 0.55, 0.55, 0.8]));
         ys.push(0.0);
     }
     if interlock {
@@ -1469,7 +1483,103 @@ fn control(id: &str, label: &str, options: &[&str], value: &str) -> Control {
     }
 }
 
-fn load_spot(root: &Path, session: &str, chamber: bool) -> BTreeMap<String, Vec<f32>> {
+// ponytail: keyed by spot/map length, mtime, and the first 4KB. devices.xml and
+// per-layer point-time files stay stale until the spot csv changes. Past 16
+// entries the map is cleared.
+const SPOT_CACHE_CAP: usize = 16;
+
+#[derive(Hash, PartialEq, Eq)]
+struct SpotCacheKey {
+    dir: PathBuf,
+    chamber: bool,
+    spot_len: u64,
+    spot_ns: u128,
+    spot_head: u64,
+    map_len: u64,
+    map_ns: u128,
+    map_head: u64,
+    points: bool,
+}
+
+fn spot_cache() -> &'static std::sync::Mutex<HashMap<SpotCacheKey, BTreeMap<String, Vec<f32>>>> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<HashMap<SpotCacheKey, BTreeMap<String, Vec<f32>>>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+fn file_fingerprint(path: &Path) -> Option<(u64, u128, u64)> {
+    let meta = std::fs::metadata(path).ok()?;
+    let ns = meta
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_nanos();
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut buf = [0u8; 4096];
+    let n = std::io::Read::read(&mut file, &mut buf).ok()?;
+    Some((meta.len(), ns, fnv64(&buf[..n])))
+}
+
+fn fnv64(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+fn load_spot(
+    root: &Path,
+    session: &str,
+    chamber: bool,
+    points: bool,
+) -> BTreeMap<String, Vec<f32>> {
+    let dir = discover::session_directory(root, session);
+    let key = match (
+        file_fingerprint(&dir.join("spot_data.csv")),
+        file_fingerprint(&dir.join("input_map.csv")),
+    ) {
+        (Some((spot_len, spot_ns, spot_head)), Some((map_len, map_ns, map_head))) => {
+            Some(SpotCacheKey {
+                dir,
+                chamber,
+                spot_len,
+                spot_ns,
+                spot_head,
+                map_len,
+                map_ns,
+                map_head,
+                points,
+            })
+        }
+        _ => None,
+    };
+    if let Some(key) = &key {
+        let cache = spot_cache().lock().unwrap_or_else(|err| err.into_inner());
+        if let Some(hit) = cache.get(key) {
+            return hit.clone();
+        }
+    }
+    let table = build_spot(root, session, chamber, points);
+    if let Some(key) = key {
+        let mut cache = spot_cache().lock().unwrap_or_else(|err| err.into_inner());
+        if cache.len() >= SPOT_CACHE_CAP {
+            cache.clear();
+        }
+        cache.insert(key, table.clone());
+    }
+    table
+}
+
+fn build_spot(
+    root: &Path,
+    session: &str,
+    chamber: bool,
+    points: bool,
+) -> BTreeMap<String, Vec<f32>> {
     let Some(spot_bytes) = discover::read_session_file(root, session, "spot_data.csv") else {
         return BTreeMap::new();
     };
@@ -1607,6 +1717,9 @@ fn load_spot(root: &Path, session: &str, chamber: bool) -> BTreeMap<String, Vec<
             .filter(|values| values.len() >= n)
             .map(|values| take_kept(values, &keep))
             .or_else(|| {
+                if !points {
+                    return None;
+                }
                 let spots = spot_no?;
                 let layers = layer;
                 Some(lookup_point_time(
@@ -2089,10 +2202,13 @@ fn load_slice_metric(
     let map = read_sheet(&map_bytes);
     let spot =
         discover::read_session_file(root, session, "spot_data.csv").map(|bytes| read_sheet(&bytes));
-    let files = discover::read_timeslices(&discover::session_directory(root, session));
-    let energy_of = layer_energy(&map);
+    let frames = discover::read_timeslice_frames(&discover::session_directory(root, session));
+    let layer_of: Vec<i64> = frames.iter().map(|(index, _)| *index).collect();
+    let files: Vec<Vec<u8>> = frames.into_iter().map(|(_, bytes)| bytes).collect();
+    let sheets = read_sheets(&files, slice_column);
+    let energies = unique_seen(&column(&map, "energy", &[]));
     let plan = plan_xy(&map);
-    let (axes, spot_shift) = iso_axes(spot.as_ref(), &plan, &files);
+    let (axes, spot_shift) = iso_axes(spot.as_ref(), &plan, &sheets);
     let mut energy = Vec::new();
     let mut beam = Vec::new();
     let mut ic1_x = Vec::new();
@@ -2105,8 +2221,12 @@ fn load_slice_metric(
     let mut ic2_y_mm = Vec::new();
     let mut sig = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
     let mut sig_err = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
-    for bytes in &files {
-        let sheet = read_sheet(bytes);
+    for (file_index, sheet) in sheets.iter().enumerate() {
+        let tagged = frame_energy(
+            &energies,
+            layer_of.get(file_index).copied().unwrap_or(-1),
+            file_index,
+        );
         let Some(trigger) = sheet
             .num
             .get("rci_in_trigger")
@@ -2124,22 +2244,22 @@ fn load_slice_metric(
                 .and_then(|values| values.get(row))
                 .copied()
                 .unwrap_or(f32::NAN);
-            energy.push(energy_of.get(&layer.to_bits()).copied().unwrap_or(f32::NAN));
-            let spot_ic1 = spot_index(&sheet, &["spot_no.1", "spot_no"], row) + spot_shift;
+            energy.push(tagged);
+            let spot_ic1 = spot_index(sheet, &["spot_no.1", "spot_no"], row) + spot_shift;
             let spot_ic2 =
-                spot_index(&sheet, &["spot_no.2", "spot_no.1", "spot_no"], row) + spot_shift;
+                spot_index(sheet, &["spot_no.2", "spot_no.1", "spot_no"], row) + spot_shift;
             let measured = [
-                ("r_ic1_x_position", "ic1_x", &axes[0], spot_ic1, 0usize),
-                ("r_ic1_y_position", "ic1_y", &axes[1], spot_ic1, 1),
-                ("r_ic2_x_position", "ic2_x", &axes[2], spot_ic2, 0),
-                ("r_ic2_y_position", "ic2_y", &axes[3], spot_ic2, 1),
+                ("ic1", "x", "ic1_x", &axes[0], spot_ic1, 0usize),
+                ("ic1", "y", "ic1_y", &axes[1], spot_ic1, 1),
+                ("ic2", "x", "ic2_x", &axes[2], spot_ic2, 0),
+                ("ic2", "y", "ic2_y", &axes[3], spot_ic2, 1),
             ];
             let mut mm = [f32::NAN; 4];
-            for (index, (name, axis_name, axis, spot_no, plan_axis)) in
+            for (index, (ic, axis, axis_name, fit, spot_no, plan_axis)) in
                 measured.into_iter().enumerate()
             {
-                let raw = cell(&sheet, name, row);
-                let accepted = axis_ok(&sheet, axis_name, row);
+                let raw = slice_position(sheet, ic, axis, row);
+                let accepted = axis_ok(sheet, axis_name, row);
                 mm[index] = if !accepted {
                     f32::NAN
                 } else if chamber {
@@ -2148,7 +2268,7 @@ fn load_slice_metric(
                     } else {
                         f32::NAN
                     }
-                } else if let Some((slope, intercept)) = *axis {
+                } else if let Some((slope, intercept)) = *fit {
                     if raw.is_finite() && raw >= 0.0 {
                         slope * raw + intercept
                     } else {
@@ -2189,9 +2309,9 @@ fn load_slice_metric(
                 .into_iter()
                 .enumerate()
             {
-                let value = slice_sigma(&sheet, ic, axis, row);
+                let value = slice_sigma(sheet, ic, axis, row);
                 sig[index].push(value);
-                let target = cell(&sheet, &format!("{ic}_sigma_{axis}_target"), row);
+                let target = cell(sheet, &format!("{ic}_sigma_{axis}_target"), row);
                 sig_err[index].push(if value.is_finite() && target.is_finite() && target > 0.0 {
                     value - target
                 } else {
@@ -2255,6 +2375,19 @@ fn cell(sheet: &Sheet, name: &str, row: usize) -> f32 {
         .unwrap_or(f32::NAN)
 }
 
+/// Prefer `r_{ic}_{axis}_position`, then the device-units `r_{ic}_{axis}_spot_position`.
+fn slice_position(sheet: &Sheet, ic: &str, axis: &str, row: usize) -> f32 {
+    for name in [
+        format!("r_{ic}_{axis}_position"),
+        format!("r_{ic}_{axis}_spot_position"),
+    ] {
+        if sheet.num.contains_key(&name) {
+            return cell(sheet, &name, row);
+        }
+    }
+    f32::NAN
+}
+
 fn slice_sigma(sheet: &Sheet, ic: &str, axis: &str, row: usize) -> f32 {
     let value = cell(sheet, &format!("r_{ic}_{axis}_sigma"), row);
     if !value.is_finite() || value <= 0.0 || value > 20.0 {
@@ -2275,12 +2408,20 @@ fn spot_index(sheet: &Sheet, names: &[&str], row: usize) -> f32 {
     f32::NAN
 }
 
-/// Fit-ok, confidence, and error-code gates. A missing column is ignored.
-/// A present column with a non-finite cell fails, matching the pandas fill.
+/// Fit gate, then confidence and error-code. A missing column is ignored.
+/// The first present fit column wins: `{axis}_fit_ok`, then
+/// `r_{axis}_spot_position_ok`, then `r_{axis}_position_ok`.
 fn axis_ok(sheet: &Sheet, axis: &str, row: usize) -> bool {
-    let fit = format!("{axis}_fit_ok");
-    if sheet.num.contains_key(&fit) {
-        let value = cell(sheet, &fit, row);
+    let gates = [
+        format!("{axis}_fit_ok"),
+        format!("r_{axis}_spot_position_ok"),
+        format!("r_{axis}_position_ok"),
+    ];
+    if let Some(name) = gates
+        .iter()
+        .find(|name| sheet.num.contains_key(name.as_str()))
+    {
+        let value = cell(sheet, name, row);
         if !value.is_finite() || value == 0.0 {
             return false;
         }
@@ -2334,16 +2475,6 @@ fn flip_chamber_error(err: &mut [f32], forward_mm: &[f32]) {
     }
 }
 
-fn layer_energy(map: &Sheet) -> HashMap<u32, f32> {
-    let mut out = HashMap::new();
-    let energy = column(map, "energy", &[]);
-    let layer = column(map, "layer_id", &["layer_id"]);
-    for (layer, energy) in layer.iter().zip(&energy) {
-        out.entry(layer.to_bits()).or_insert(*energy);
-    }
-    out
-}
-
 fn plan_xy(map: &Sheet) -> HashMap<(u32, u32), (f32, f32)> {
     let mut out = HashMap::new();
     let layer = column(map, "layer_id", &["layer_id"]);
@@ -2359,9 +2490,9 @@ fn plan_xy(map: &Sheet) -> HashMap<(u32, u32), (f32, f32)> {
 fn iso_axes(
     spot: Option<&Sheet>,
     plan: &HashMap<(u32, u32), (f32, f32)>,
-    files: &[Vec<u8>],
+    sheets: &[Sheet],
 ) -> ([Option<(f32, f32)>; 4], f32) {
-    if let Some(fitted) = plan_target_axes(plan, files) {
+    if let Some(fitted) = plan_target_axes(plan, sheets) {
         return fitted;
     }
     (
@@ -2392,14 +2523,13 @@ fn plan_spans(plan: &HashMap<(u32, u32), (f32, f32)>) -> bool {
 /// ponytail: the first finite target per spot stands in for the per-spot median.
 fn plan_target_axes(
     plan: &HashMap<(u32, u32), (f32, f32)>,
-    files: &[Vec<u8>],
+    sheets: &[Sheet],
 ) -> Option<([Option<(f32, f32)>; 4], f32)> {
     if !plan_spans(plan) {
         return None;
     }
     let mut targets: HashMap<(u32, u32), [f32; 4]> = HashMap::new();
-    for bytes in files {
-        let sheet = read_sheet(bytes);
+    for sheet in sheets {
         let names = [
             "ic1_position_x_target",
             "ic1_position_y_target",
@@ -2411,16 +2541,16 @@ fn plan_target_axes(
         }
         let n = sheet.num.get("layer_id").map(Vec::len).unwrap_or(0);
         for row in 0..n {
-            let layer = cell(&sheet, "layer_id", row);
-            let spot = spot_index(&sheet, &["spot_no.1", "spot_no"], row);
+            let layer = cell(sheet, "layer_id", row);
+            let spot = spot_index(sheet, &["spot_no.1", "spot_no"], row);
             if !layer.is_finite() || !spot.is_finite() {
                 continue;
             }
             let sample = [
-                cell(&sheet, names[0], row),
-                cell(&sheet, names[1], row),
-                cell(&sheet, names[2], row),
-                cell(&sheet, names[3], row),
+                cell(sheet, names[0], row),
+                cell(sheet, names[1], row),
+                cell(sheet, names[2], row),
+                cell(sheet, names[3], row),
             ];
             if sample.iter().any(|value| !value.is_finite()) {
                 continue;
@@ -2565,44 +2695,45 @@ fn load_timeslice(root: &Path, session: &str, metric: &str) -> BTreeMap<String, 
         return BTreeMap::new();
     };
     let map = read_sheet(&map_bytes);
-    let energy = column(&map, "energy", &[]);
-    let layers = map.num.get("layer_id").map(Vec::as_slice).unwrap_or(&[]);
-    let files = discover::read_timeslices(&discover::session_directory(root, session));
+    let energies = unique_seen(&column(&map, "energy", &[]));
+    let frames = discover::read_timeslice_frames(&discover::session_directory(root, session));
+    let layer_of: Vec<i64> = frames.iter().map(|(index, _)| *index).collect();
+    let files: Vec<Vec<u8>> = frames.into_iter().map(|(_, bytes)| bytes).collect();
     if metric == "current_ratio" {
-        return current_ratio_table(&files, &energy, layers);
+        return current_ratio_table(&files, &energies, &layer_of);
     }
-    current_table(&files, &energy, layers)
+    current_table(&files, &energies, &layer_of)
 }
 
-fn file_energy(energy: &[f32], layers: &[f32], file: &Sheet, file_index: usize) -> f32 {
-    let distinct = unique_sorted(if layers.is_empty() { energy } else { layers });
-    if distinct.len() > 1 {
-        if let Some(layer) = file.num.get("layer_id").and_then(|v| v.first()) {
-            for (row, value) in layers.iter().enumerate() {
-                if same(*value, *layer) {
-                    return energy.get(row).copied().unwrap_or(f32::NAN);
-                }
-            }
-        }
-    }
-    let unique_energy = unique_sorted(energy);
-    unique_energy.get(file_index).copied().unwrap_or(f32::NAN)
+/// Folder `layer-N` picks the Nth energy in input-map order. A path with no
+/// layer folder uses the file's order instead.
+fn frame_energy(energies: &[f32], layer_idx: i64, file_index: usize) -> f32 {
+    let index = if layer_idx >= 0 {
+        layer_idx as usize
+    } else {
+        file_index
+    };
+    energies.get(index).copied().unwrap_or(f32::NAN)
 }
 
-fn current_table(files: &[Vec<u8>], energy: &[f32], layers: &[f32]) -> BTreeMap<String, Vec<f32>> {
+fn current_table(
+    files: &[Vec<u8>],
+    energies: &[f32],
+    layers: &[i64],
+) -> BTreeMap<String, Vec<f32>> {
     let mut out_energy = Vec::new();
     let mut ic1 = Vec::new();
     let mut ic2 = Vec::new();
     let mut ic3 = Vec::new();
     let mut beam = Vec::new();
     let mut any_ic3 = false;
-    for (index, bytes) in files.iter().enumerate() {
-        let sheet = read_sheet(bytes);
-        let tag = file_energy(energy, layers, &sheet, index);
-        let a = scaled_current(&sheet, "ic1");
-        let b = scaled_current(&sheet, "ic2");
-        let c = ic3_current(&sheet);
-        let gate = column_any(&sheet, &["rci_in_trigger", "r_beamOk", "beam_on"]);
+    let sheets = read_sheets(files, current_column);
+    for (index, sheet) in sheets.iter().enumerate() {
+        let tag = frame_energy(energies, layers.get(index).copied().unwrap_or(-1), index);
+        let a = scaled_current(sheet, "ic1");
+        let b = scaled_current(sheet, "ic2");
+        let c = ic3_current(sheet);
+        let gate = column_any(sheet, &["rci_in_trigger", "r_beamOk", "beam_on"]);
         let n = a.len().max(b.len()).max(c.len());
         // ponytail: a timeslice past 80k samples is strided. Raise the cap if a
         // chamber view needs every sample.
@@ -2638,21 +2769,21 @@ fn current_table(files: &[Vec<u8>], energy: &[f32], layers: &[f32]) -> BTreeMap<
 
 fn current_ratio_table(
     files: &[Vec<u8>],
-    energy: &[f32],
-    layers: &[f32],
+    energies: &[f32],
+    layers: &[i64],
 ) -> BTreeMap<String, Vec<f32>> {
     let mut out_energy = Vec::new();
     let mut ic21 = Vec::new();
     let mut ic31 = Vec::new();
     let mut ic32 = Vec::new();
     let mut any_ic3 = false;
-    for (index, bytes) in files.iter().enumerate() {
-        let sheet = read_sheet(bytes);
-        let tag = file_energy(energy, layers, &sheet, index);
-        let a = scaled_current(&sheet, "ic1");
-        let b = scaled_current(&sheet, "ic2");
-        let c = ic3_current(&sheet);
-        let gate = column_any(&sheet, &["rci_in_trigger", "r_beamOk", "beam_on"]);
+    let sheets = read_sheets(files, current_column);
+    for (index, sheet) in sheets.iter().enumerate() {
+        let tag = frame_energy(energies, layers.get(index).copied().unwrap_or(-1), index);
+        let a = scaled_current(sheet, "ic1");
+        let b = scaled_current(sheet, "ic2");
+        let c = ic3_current(sheet);
+        let gate = column_any(sheet, &["rci_in_trigger", "r_beamOk", "beam_on"]);
         let plateau = |values: &[f32]| plateau_mean(values, gate.as_deref());
         let left = plateau(&a);
         let right = plateau(&b);
@@ -2712,30 +2843,50 @@ fn sym_pct(a: f32, b: f32) -> f32 {
 }
 
 fn scaled_current(sheet: &Sheet, ic: &str) -> Vec<f32> {
-    let names = [
+    let fallback = [
         format!("r_{ic}_current_dose"),
         format!("{ic}_current_dose"),
         format!("r_{ic}_current"),
         format!("{ic}_current"),
     ];
-    let Some(values) = column_any(sheet, &names.iter().map(String::as_str).collect::<Vec<_>>())
-    else {
+    let keys: Vec<String> = sheet.num.keys().cloned().collect();
+    let header = resolve_concept_column(&keys, &format!("{ic}_current"))
+        .map(str::to_owned)
+        .or_else(|| {
+            fallback
+                .iter()
+                .find(|name| sheet.num.contains_key(name.as_str()))
+                .cloned()
+        });
+    let Some(header) = header else {
         return Vec::new();
     };
-    let header = names
-        .iter()
-        .find(|name| sheet.num.contains_key(name.as_str()))
-        .cloned()
-        .unwrap_or_default();
+    let Some(values) = sheet.num.get(&header) else {
+        return Vec::new();
+    };
     let factor = column_scale_factor(&header).unwrap_or(1.0) as f32;
-    scale_column(&values, factor)
+    scale_column(values, factor)
 }
 
 fn ic3_current(sheet: &Sheet) -> Vec<f32> {
-    let parts = ["a", "b", "c", "d"];
+    let keys: Vec<String> = sheet.num.keys().cloned().collect();
     let mut sum = Vec::new();
-    for part in parts {
-        let values = scaled_current(sheet, &format!("ic3_{part}"));
+    for (concept, part) in [
+        ("ic3_current_a", "a"),
+        ("ic3_current_b", "b"),
+        ("ic3_current_c", "c"),
+        ("ic3_current_d", "d"),
+    ] {
+        let values = if let Some(header) = resolve_concept_column(&keys, concept) {
+            let factor = column_scale_factor(header).unwrap_or(1.0) as f32;
+            sheet
+                .num
+                .get(header)
+                .map(|values| scale_column(values, factor))
+                .unwrap_or_default()
+        } else {
+            scaled_current(sheet, &format!("ic3_{part}"))
+        };
         if values.is_empty() {
             continue;
         }
@@ -3102,14 +3253,13 @@ fn modified_z(values: &[f32]) -> Vec<f32> {
     out
 }
 
-fn unique_sorted(values: &[f32]) -> Vec<f32> {
+fn unique_seen(values: &[f32]) -> Vec<f32> {
     let mut out = Vec::new();
     for value in values {
         if value.is_finite() && !out.iter().any(|have: &f32| same(*have, *value)) {
             out.push(*value);
         }
     }
-    out.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     out
 }
 
@@ -3216,7 +3366,88 @@ fn xml_attr(tag: &str, name: &str) -> Option<String> {
     Some(body.split(quote).next()?.to_string())
 }
 
+fn header_base(name: &str) -> &str {
+    name.split('.').next().unwrap_or(name)
+}
+
+fn current_column(name: &str) -> bool {
+    let lower = header_base(name).to_ascii_lowercase();
+    lower == "layer_id"
+        || lower == "rci_in_trigger"
+        || lower == "r_beamok"
+        || lower == "beam_on"
+        || lower.contains("current")
+        || lower.contains("primary_channel")
+}
+
+fn slice_column(name: &str) -> bool {
+    let lower = header_base(name).to_ascii_lowercase();
+    lower == "layer_id"
+        || lower == "spot_no"
+        || lower == "rci_in_trigger"
+        || lower == "r_beamok"
+        || lower == "beam_on"
+        || lower.contains("position")
+        || lower.contains("sigma")
+        || lower.contains("fit_ok")
+        || lower.contains("confidence")
+        || lower.contains("error_code")
+}
+
+// ponytail: a few chunks, not a pool. Tens of timeslice files, not thousands.
+fn read_sheets(files: &[Vec<u8>], keep: fn(&str) -> bool) -> Vec<Sheet> {
+    if files.len() < 2 {
+        return files
+            .iter()
+            .map(|bytes| read_sheet_where(bytes, keep))
+            .collect();
+    }
+    let workers = std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(1)
+        .clamp(1, files.len());
+    let chunk = files.len().div_ceil(workers);
+    let mut sheets = Vec::with_capacity(files.len());
+    std::thread::scope(|scope| {
+        let mut joins = Vec::new();
+        for piece in files.chunks(chunk) {
+            joins.push(scope.spawn(move || {
+                piece
+                    .iter()
+                    .map(|bytes| read_sheet_where(bytes, keep))
+                    .collect::<Vec<_>>()
+            }));
+        }
+        for join in joins {
+            sheets.extend(join.join().unwrap());
+        }
+    });
+    sheets
+}
+
+enum Slot {
+    Skip,
+    Num(Vec<f32>),
+    Wide(Vec<f64>),
+    Clock(Vec<f64>),
+}
+
+enum Num {
+    Nan,
+    Value(f64),
+    Std,
+}
+
 fn read_sheet(bytes: &[u8]) -> Sheet {
+    read_sheet_where(bytes, |_| true)
+}
+
+/// Parse a device CSV without a `String` per cell.
+///
+/// ponytail: the decimal scanner handles the padded fixed-point form these logs
+/// use. Scientific notation and non-finite tokens fall back to `str::parse`.
+/// `keep` drops columns a caller will not read. Strip columns stay dropped.
+fn read_sheet_where(bytes: &[u8], keep: impl Fn(&str) -> bool) -> Sheet {
     let text = String::from_utf8_lossy(bytes);
     let mut lines = text.lines();
     let Some(header) = lines.next() else {
@@ -3225,81 +3456,268 @@ fn read_sheet(bytes: &[u8]) -> Sheet {
             wide: BTreeMap::new(),
         };
     };
-    let headers: Vec<String> = split_csv(header);
-    // Later copies of a header keep a pandas-style suffix so IC2 spot_no survives.
-    let mut used = BTreeMap::<String, ()>::new();
-    let mut names: Vec<Option<String>> = Vec::with_capacity(headers.len());
-    for name in &headers {
+    let rows = bytes.iter().filter(|byte| **byte == b'\n').count();
+    let mut used = HashMap::<String, ()>::new();
+    let mut names = Vec::new();
+    let mut slots = Vec::new();
+    let mut cursor = 0usize;
+    while let Some((start, end, next)) = next_cell(header, cursor) {
+        let name = cell_owned(header, start, end);
+        let base = header_base(&name);
         // ponytail: strip columns are not a binned metric. Stop skipping them if one is.
-        if name.is_empty() || name.to_ascii_lowercase().contains("strip") {
+        if name.is_empty() || base.to_ascii_lowercase().contains("strip") || !keep(&name) {
             names.push(None);
-            continue;
-        }
-        let mut key = name.clone();
-        let mut n = 1;
-        while used.contains_key(&key) {
-            key = format!("{name}.{n}");
-            n += 1;
-        }
-        used.insert(key.clone(), ());
-        names.push(Some(key));
-    }
-    let wide_name = |name: &str| {
-        let base = name.split('.').next().unwrap_or(name);
-        matches!(base, "timestamp" | "time_s" | "time_ns" | "datetime")
-    };
-    let mut num: BTreeMap<String, Vec<f32>> = BTreeMap::new();
-    let mut wide: BTreeMap<String, Vec<f64>> = BTreeMap::new();
-    for name in names.iter().flatten() {
-        if wide_name(name) {
-            wide.insert(name.clone(), Vec::new());
+            slots.push(Slot::Skip);
         } else {
-            num.insert(name.clone(), Vec::new());
+            let key = unique_header(&name, &mut used);
+            let slot = if base == "datetime" {
+                Slot::Clock(Vec::with_capacity(rows))
+            } else if matches!(base, "timestamp" | "time_s" | "time_ns") {
+                Slot::Wide(Vec::with_capacity(rows))
+            } else {
+                Slot::Num(Vec::with_capacity(rows))
+            };
+            names.push(Some(key));
+            slots.push(slot);
         }
+        if next <= cursor {
+            break;
+        }
+        cursor = next;
     }
+    let mut seen = vec![0u32; slots.len()];
+    let mut row = 1u32;
     for line in lines {
         if line.trim().is_empty() {
             continue;
         }
-        let cells = split_csv(line);
-        for (index, name) in names.iter().enumerate() {
-            let Some(name) = name else {
-                continue;
+        let mut cursor = 0usize;
+        let mut index = 0usize;
+        while index < slots.len() {
+            let Some((start, end, next)) = next_cell(line, cursor) else {
+                break;
             };
-            // Device logs pad numbers with spaces. Rust's float parser rejects that.
-            let cell = cells.get(index).map(|text| text.trim()).unwrap_or("");
-            if wide_name(name) {
-                let parsed = if name.starts_with("datetime") {
-                    parse_datetime(cell).unwrap_or(f64::NAN)
-                } else {
-                    cell.parse::<f64>().unwrap_or(f64::NAN)
-                };
-                wide.get_mut(name).unwrap().push(parsed);
-            } else {
-                num.get_mut(name)
-                    .unwrap()
-                    .push(cell.parse::<f32>().unwrap_or(f32::NAN));
+            push_cell(&mut slots[index], line, start, end);
+            seen[index] = row;
+            index += 1;
+            if next <= cursor {
+                break;
+            }
+            cursor = next;
+        }
+        for (index, slot) in slots.iter_mut().enumerate() {
+            if seen[index] != row {
+                push_nan(slot);
+            }
+        }
+        row = row.wrapping_add(1);
+        if row == 0 {
+            row = 1;
+            seen.fill(0);
+        }
+    }
+    let mut num = BTreeMap::new();
+    let mut wide = BTreeMap::new();
+    for (name, slot) in names.into_iter().zip(slots) {
+        let Some(name) = name else {
+            continue;
+        };
+        match slot {
+            Slot::Skip => {}
+            Slot::Num(values) => {
+                num.insert(name, values);
+            }
+            Slot::Wide(values) | Slot::Clock(values) => {
+                wide.insert(name, values);
             }
         }
     }
     Sheet { num, wide }
 }
 
-fn split_csv(line: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut cell = String::new();
-    let mut quoted = false;
-    for ch in line.chars() {
-        match ch {
-            '"' => quoted = !quoted,
-            ',' if !quoted => {
-                out.push(std::mem::take(&mut cell));
+fn unique_header(name: &str, used: &mut HashMap<String, ()>) -> String {
+    if !used.contains_key(name) {
+        used.insert(name.to_string(), ());
+        return name.to_string();
+    }
+    let mut n = 1;
+    loop {
+        let candidate = format!("{name}.{n}");
+        if !used.contains_key(&candidate) {
+            used.insert(candidate.clone(), ());
+            return candidate;
+        }
+        n += 1;
+    }
+}
+
+fn next_cell(line: &str, start: usize) -> Option<(usize, usize, usize)> {
+    let bytes = line.as_bytes();
+    if start > bytes.len() {
+        return None;
+    }
+    if start == bytes.len() {
+        if start > 0 && bytes[start - 1] == b',' {
+            return Some((start, start, start + 1));
+        }
+        return None;
+    }
+    if bytes[start] == b'"' {
+        let mut i = start + 1;
+        while i < bytes.len() {
+            if bytes[i] == b'"' {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                    i += 2;
+                    continue;
+                }
+                i += 1;
+                break;
             }
-            _ => cell.push(ch),
+            i += 1;
+        }
+        let end = i;
+        let next = if i < bytes.len() && bytes[i] == b',' {
+            i + 1
+        } else {
+            i
+        };
+        return Some((start, end, next));
+    }
+    let mut i = start;
+    while i < bytes.len() && bytes[i] != b',' {
+        i += 1;
+    }
+    let next = if i < bytes.len() { i + 1 } else { i };
+    Some((start, i, next))
+}
+
+fn cell_owned(line: &str, start: usize, end: usize) -> String {
+    let cell = &line[start..end];
+    if cell.as_bytes().first() == Some(&b'"') {
+        strip_quotes(cell)
+    } else {
+        cell.to_string()
+    }
+}
+
+fn strip_quotes(cell: &str) -> String {
+    cell.replace('"', "")
+}
+
+fn push_cell(slot: &mut Slot, line: &str, start: usize, end: usize) {
+    match slot {
+        Slot::Skip => {}
+        Slot::Num(values) => values.push(cell_f32(line, start, end)),
+        Slot::Wide(values) => values.push(cell_f64(line, start, end)),
+        Slot::Clock(values) => values.push(cell_datetime(line, start, end)),
+    }
+}
+
+fn push_nan(slot: &mut Slot) {
+    match slot {
+        Slot::Skip => {}
+        Slot::Num(values) => values.push(f32::NAN),
+        Slot::Wide(values) | Slot::Clock(values) => values.push(f64::NAN),
+    }
+}
+
+fn cell_f32(line: &str, start: usize, end: usize) -> f32 {
+    let cell = &line[start..end];
+    if cell.as_bytes().first() == Some(&b'"') {
+        let stripped = strip_quotes(cell);
+        return f32_bytes(stripped.as_bytes());
+    }
+    f32_bytes(cell.as_bytes())
+}
+
+fn f32_bytes(bytes: &[u8]) -> f32 {
+    match parse_decimal(bytes) {
+        Num::Nan => f32::NAN,
+        Num::Value(value) => value as f32,
+        Num::Std => std::str::from_utf8(bytes)
+            .ok()
+            .and_then(|text| text.trim().parse().ok())
+            .unwrap_or(f32::NAN),
+    }
+}
+
+fn cell_f64(line: &str, start: usize, end: usize) -> f64 {
+    let cell = &line[start..end];
+    if cell.as_bytes().first() == Some(&b'"') {
+        return strip_quotes(cell).trim().parse().unwrap_or(f64::NAN);
+    }
+    cell.trim().parse().unwrap_or(f64::NAN)
+}
+
+fn cell_datetime(line: &str, start: usize, end: usize) -> f64 {
+    let cell = &line[start..end];
+    if cell.as_bytes().first() == Some(&b'"') {
+        return parse_datetime(&strip_quotes(cell)).unwrap_or(f64::NAN);
+    }
+    parse_datetime(cell).unwrap_or(f64::NAN)
+}
+
+fn parse_decimal(bytes: &[u8]) -> Num {
+    let n = bytes.len();
+    let mut i = 0;
+    while i < n && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if i >= n {
+        return Num::Nan;
+    }
+    if bytes[i] != b'+' && bytes[i] != b'-' && bytes[i] != b'.' && !bytes[i].is_ascii_digit() {
+        return Num::Std;
+    }
+    let neg = if bytes[i] == b'+' || bytes[i] == b'-' {
+        let minus = bytes[i] == b'-';
+        i += 1;
+        minus
+    } else {
+        false
+    };
+    let mut value = 0u64;
+    let mut saw = false;
+    while i < n && bytes[i].is_ascii_digit() {
+        let digit = u64::from(bytes[i] - b'0');
+        if value > (u64::MAX - digit) / 10 {
+            return Num::Std;
+        }
+        value = value * 10 + digit;
+        saw = true;
+        i += 1;
+    }
+    let mut scale = 1u64;
+    if i < n && bytes[i] == b'.' {
+        i += 1;
+        while i < n && bytes[i].is_ascii_digit() {
+            let digit = u64::from(bytes[i] - b'0');
+            if scale > u64::MAX / 10 || value > (u64::MAX - digit) / 10 {
+                return Num::Std;
+            }
+            value = value * 10 + digit;
+            scale *= 10;
+            saw = true;
+            i += 1;
         }
     }
-    out.push(cell);
-    out
+    if !saw {
+        return Num::Nan;
+    }
+    if i < n && (bytes[i] == b'e' || bytes[i] == b'E') {
+        return Num::Std;
+    }
+    while i < n && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if i != n {
+        return Num::Std;
+    }
+    let mut out = value as f64 / scale as f64;
+    if neg {
+        out = -out;
+    }
+    Num::Value(out)
 }
 
 fn parse_datetime(text: &str) -> Option<f64> {
@@ -3392,6 +3810,25 @@ mod tests {
         let sheet = read_sheet(b"energy,energy,charge_req\n70,999,1\n");
         assert_eq!(sheet.num["energy"], vec![70.0]);
         assert_eq!(sheet.num["charge_req"], vec![1.0]);
+    }
+
+    #[test]
+    fn sheet_cells_keep_alignment() {
+        let sheet = read_sheet(
+            b"energy,ic1_strip_sum,energy,dose,timestamp,datetime\n\"70.5\",9,1.5e-3,2,826.0233764648437500,1970-01-01 00:00:00\n3\n",
+        );
+        assert!((sheet.num["energy"][0] - 70.5).abs() < 1e-4);
+        assert!((sheet.num["energy.1"][0] - 0.0015).abs() < 1e-6);
+        assert!((sheet.num["dose"][0] - 2.0).abs() < 1e-6);
+        assert!((sheet.num["energy"][1] - 3.0).abs() < 1e-6);
+        assert!(sheet.num["energy.1"][1].is_nan());
+        assert!(sheet.num["dose"][1].is_nan());
+        assert!(!sheet.num.contains_key("ic1_strip_sum"));
+        let expected: f64 = "826.0233764648437500".parse().unwrap();
+        assert!((sheet.wide["timestamp"][0] - expected).abs() <= 1e-6);
+        assert!(sheet.wide["timestamp"][1].is_nan());
+        assert!(sheet.wide["datetime"][0].abs() < 1e-6);
+        assert!(sheet.wide["datetime"][1].is_nan());
     }
 
     #[test]
@@ -3685,6 +4122,125 @@ mod tests {
             .find(|panel| panel.title == "IC1 X")
             .unwrap();
         assert!(rect_ys(panel).iter().any(|value| value.abs() < 1e-2));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn timeslice_isocenter_error_reads_spot_position() {
+        let root = std::env::temp_dir().join("scan-kit-binned-slice-spot-pos");
+        let _ = std::fs::remove_dir_all(&root);
+        let session = root.join("sess");
+        std::fs::create_dir_all(session.join("layer-0/run-0")).unwrap();
+        let mut spot = String::from(
+            "spot_no,layer_id,r_ic1_x_spot_position_raw,r_ic1_x_spot_position,r_ic1_y_spot_position_raw,r_ic1_y_spot_position,r_ic2_x_spot_position_raw,r_ic2_x_spot_position,r_ic2_y_spot_position_raw,r_ic2_y_spot_position\n",
+        );
+        let mut map = String::from("energy,layer_id,spot_no,position_x,position_y\n");
+        for i in 0..12 {
+            let strip = 20.0 + i as f32;
+            let iso = strip - 64.5;
+            spot.push_str(&format!(
+                "{i},1,{strip},{iso},{strip},{iso},{strip},{iso},{strip},{iso}\n"
+            ));
+            map.push_str(&format!("70,1,{i},{iso},0\n"));
+        }
+        std::fs::write(session.join("spot_data.csv"), spot).unwrap();
+        std::fs::write(session.join("input_map.csv"), map).unwrap();
+        std::fs::write(
+            session.join("layer-0/run-0/timeslice_data_device_units.csv"),
+            "layer_id,spot_no,rci_in_trigger,r_ic1_x_spot_position\n1,5,1,25\n",
+        )
+        .unwrap();
+        let scene = binned_summary(
+            &root,
+            &["sess".to_string()],
+            &serde_json::json!({"metric": "Position Error (mm)", "source": "Timeslice — Isocenter"}),
+        );
+        let panel = scene
+            .panels
+            .iter()
+            .find(|panel| panel.title == "IC1 X")
+            .unwrap();
+        assert!(rect_ys(panel).iter().any(|value| value.abs() < 1e-2));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn timeslice_primary_channel_is_ic_current() {
+        let root = std::env::temp_dir().join("scan-kit-binned-slice-current");
+        let _ = std::fs::remove_dir_all(&root);
+        let session = root.join("sess");
+        std::fs::create_dir_all(session.join("layer-0/run-0")).unwrap();
+        std::fs::write(session.join("input_map.csv"), "energy,layer_id\n70,1\n").unwrap();
+        std::fs::write(
+            session.join("layer-0/run-0/timeslice_data_device_units.csv"),
+            "layer_id,ic1_primary_channel,ic3_current_A\n1,12,3\n",
+        )
+        .unwrap();
+        let scene = binned_summary(
+            &root,
+            &["sess".to_string()],
+            &serde_json::json!({"metric": "IC Current (nA)"}),
+        );
+        let ic1 = scene
+            .panels
+            .iter()
+            .find(|panel| panel.title == "IC1")
+            .unwrap();
+        let ic3 = scene
+            .panels
+            .iter()
+            .find(|panel| panel.title == "IC3")
+            .unwrap();
+        assert!(rect_ys(ic1).iter().any(|value| (value - 12.0).abs() < 1e-2));
+        assert!(rect_ys(ic3).iter().any(|value| (value - 3.0).abs() < 1e-2));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn timeslice_energy_follows_the_layer_folder() {
+        let root = std::env::temp_dir().join("scan-kit-binned-slice-energy");
+        let _ = std::fs::remove_dir_all(&root);
+        let session = root.join("sess");
+        std::fs::create_dir_all(session.join("layer-0/run-0")).unwrap();
+        std::fs::create_dir_all(session.join("layer-1/run-0")).unwrap();
+        std::fs::write(
+            session.join("input_map.csv"),
+            "energy,layer_id\n180,9\n70,9\n",
+        )
+        .unwrap();
+        std::fs::write(
+            session.join("layer-0/run-0/timeslice_data_device_units.csv"),
+            "layer_id,ic1_primary_channel\n9,11\n",
+        )
+        .unwrap();
+        std::fs::write(
+            session.join("layer-1/run-0/timeslice_data_device_units.csv"),
+            "layer_id,ic1_primary_channel\n9,22\n",
+        )
+        .unwrap();
+        let scene = binned_summary(
+            &root,
+            &["sess".to_string()],
+            &serde_json::json!({"metric": "IC Current (nA)", "glyph": "Scatter"}),
+        );
+        let panel = scene
+            .panels
+            .iter()
+            .find(|panel| panel.title == "IC1")
+            .unwrap();
+        let points = panel.series.iter().find_map(|series| match series {
+            Series::Points { xs, ys, .. } => {
+                Some(xs.iter().zip(ys).map(|(x, y)| (*x, *y)).collect::<Vec<_>>())
+            }
+            _ => None,
+        });
+        let points = points.unwrap();
+        assert!(points
+            .iter()
+            .any(|(x, y)| (x - 180.0).abs() < 1.0 && (y - 11.0).abs() < 1e-2));
+        assert!(points
+            .iter()
+            .any(|(x, y)| (x - 70.0).abs() < 1.0 && (y - 22.0).abs() < 1e-2));
         let _ = std::fs::remove_dir_all(&root);
     }
 
