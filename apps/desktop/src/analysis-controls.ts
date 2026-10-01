@@ -27,23 +27,22 @@ const SECTIONS: Record<string, ControlSection[]> = {
       title: "Plot Style",
       slots: [
         { id: "glyph", kind: "select" },
-        { id: "trend", kind: "check", label: "Trend Line" },
-        { id: "cutoff", kind: "select" },
-        { id: "fliers", kind: "check", label: "Show Box Outliers" },
-        { id: "interlock", kind: "check", label: "Interlock thresholds" },
+        { id: "trend", kind: "select", label: "Trend" },
+        { id: "cutoff", kind: "select", label: "Contour Cutoff" },
+        { id: "interlock", kind: "select", label: "Interlock Thresholds" },
       ],
     },
     {
       title: "Histogram",
       slots: [
-        { id: "hist", kind: "check", label: "Show panel" },
+        { id: "hist", kind: "check", label: "Show Panel" },
         { id: "hist_bins", kind: "select", label: "Bins" },
-        { id: "shared", kind: "check", label: "Share bin edges across rows" },
+        { id: "shared", kind: "check", label: "Share Bin Edges Across Rows" },
       ],
     },
     {
       title: "Correlation",
-      slots: [{ id: "corr", kind: "check", label: "Show panel" }],
+      slots: [{ id: "corr", kind: "check", label: "Show Panel" }],
     },
     {
       title: "Filter Data",
@@ -55,23 +54,65 @@ const SECTIONS: Record<string, ControlSection[]> = {
   ],
   distribution: [
     {
-      title: "Distribution",
+      title: "Data Source",
       slots: [
-        { id: "mode", kind: "select" },
         { id: "grain", kind: "select" },
+        { id: "mode", kind: "select" },
       ],
     },
-    { title: "Plot Style", slots: [{ id: "draw", kind: "select" }] },
+    {
+      title: "Plot Style",
+      slots: [
+        { id: "draw", kind: "select" },
+        { id: "ramp", kind: "select" },
+        { id: "cutoff", kind: "select", label: "Contour Cutoff" },
+      ],
+    },
     { title: "Filter Data", slots: [{ id: "beam", kind: "select" }] },
   ],
-  timeslice_replay: [
-    { title: "Signal Source", slots: [{ id: "channel", kind: "bare" }] },
-    { title: "Options", slots: [{ id: "scrub", kind: "select" }] },
-  ],
-  ic_fft_analysis: [{ title: "Signal Source", slots: [{ id: "channel", kind: "bare" }] }],
-  ic_audio_player: [{ title: "Signal Source", slots: [{ id: "channel", kind: "bare" }] }],
+  timeslice_replay: [{ title: "Data Source", slots: [{ id: "channel", kind: "bare" }] }],
+  ic_fft_analysis: [{ title: "Data Source", slots: [{ id: "channel", kind: "bare" }] }],
+  ic_audio_player: [{ title: "Data Source", slots: [{ id: "channel", kind: "bare" }] }],
   trajectory: [{ title: "Display", slots: [{ id: "azimuth", kind: "select" }] }],
   dose_accumulation: [{ title: "Options", slots: [{ id: "calibrate", kind: "select" }] }],
+  dose_volume: [
+    {
+      title: "Data Source",
+      slots: [
+        { id: "grain", kind: "select" },
+        { id: "xy", kind: "select", label: "Position" },
+        { id: "quantity", kind: "select" },
+        { id: "plan_sigma", kind: "select", label: "Plan Sigma" },
+        { id: "sigma_ref", kind: "select", label: "Reference" },
+      ],
+    },
+    {
+      title: "Model",
+      slots: [
+        { id: "model", kind: "select" },
+        { id: "scatter", kind: "select" },
+        { id: "histories", kind: "select" },
+        { id: "spread", kind: "select", label: "Energy Spread" },
+      ],
+    },
+    {
+      title: "Phantom",
+      slots: [
+        { id: "medium", kind: "select" },
+        { id: "phantom", kind: "select", label: "Thickness" },
+        { id: "wet", kind: "select", label: "Entrance" },
+      ],
+    },
+    {
+      title: "Compare",
+      slots: [
+        { id: "compare", kind: "select" },
+        { id: "edge", kind: "select", label: "Field Edge" },
+      ],
+    },
+    { title: "Color", slots: [{ id: "scale", kind: "select" }] },
+    { title: "Patient", slots: [{ id: "fraction", kind: "select" }] },
+  ],
 };
 
 /** Sidebar groups for one view. Unknown controls land in Options. */
@@ -114,7 +155,7 @@ export function segmentChoices(options: readonly string[]): boolean {
   );
 }
 
-/** Histogram bin controls follow the show-panel checkbox, same as the Python panel. */
+/** Histogram bins follow the show-panel checkbox. X bins apply to every axis. */
 export function controlDisabled(id: string, values: Readonly<Record<string, string>>): boolean {
   return (id === "hist_bins" || id === "shared") && values.hist !== "On";
 }

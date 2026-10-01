@@ -12,6 +12,7 @@ workspace = true
 
 [dependencies]
 scan-kit-core = { workspace = true }
+scan-kit-dicom = { workspace = true }
 serde_json = { workspace = true }
 rusqlite = { version = "0.37", features = ["bundled"] }
 zip = "2"

@@ -1,5 +1,32 @@
 import type { GridSelection } from "@glideapps/glide-data-grid";
 
+/** Rows the context menu should toggle. A click inside the highlight uses that span; otherwise just the clicked row. */
+export function selectedSessionIds(
+  displayIds: readonly string[],
+  selection: GridSelection,
+  clickedRow: number,
+): string[] {
+  const indexes = new Set<number>();
+  const add = (range: { y: number; height: number }) => {
+    for (let offset = 0; offset < range.height; offset += 1) {
+      indexes.add(range.y + offset);
+    }
+  };
+  const current = selection.current;
+  if (current != null) {
+    add(current.range);
+    for (const range of current.rangeStack) {
+      add(range);
+    }
+  }
+  const rows = indexes.has(clickedRow) ? [...indexes] : [clickedRow];
+  rows.sort((left, right) => left - right);
+  return rows.flatMap((index) => {
+    const id = displayIds[index];
+    return id == null ? [] : [id];
+  });
+}
+
 type Range = {
   readonly x: number;
   readonly y: number;

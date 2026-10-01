@@ -1,46 +1,48 @@
 //! Analysis view workflows. Each one loads columns and returns a plot scene.
 //! Pixels are rendered later by `scan-kit-compute`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use scan_kit_core::{
     arc_fit, arc_predict, beam_angle_mrad, beam_off_edges, beam_on_mask, calibration_factor,
-    compare_templates, coverage_percent, cumsum, density_counts, dvh, filter_beam_state, fit_decay,
-    fit_iso_plane, gamma_index, histogram, hv_capacitance_pf, hv_delta_v, hv_expected_pf,
-    hv_firmware_flags, hv_step_window, linear_fit, magnet_pivot_z, mip_xy, parse_session_log,
-    resample_nearest, resolve_concept_column, scale_column, settled_after_step, spill_segments,
-    splat_gaussians, sums_by_spot_id, welch_psd, BeamState, Control, DataTable, Panel, PlotScene,
+    compare_templates, coverage_percent, cumsum, density_counts, fit_decay, fit_iso_plane,
+    histogram, hv_capacitance_pf, hv_delta_v, hv_expected_pf, hv_firmware_flags, hv_step_window,
+    linear_fit, magnet_pivot_z, parse_session_log, resolve_concept_column, scale_column,
+    settled_after_step, spill_segments, welch_psd, BeamState, Control, DataTable, Panel, PlotScene,
     Series, IC1_Z_MM, IC2_Z_MM, MIN_SPILL_GAP_MS,
 };
 use serde_json::{json, Value};
 
+use super::binned::{
+    apply_filter, contour_bands, labeled, pick, slice_table, spot_table, timeslice_metric,
+    timeslice_signals, BEAM_CHOICES,
+};
 use super::discover;
 
-const BLUE: [f32; 4] = [0.35, 0.55, 0.95, 1.0];
-const ORANGE: [f32; 4] = [0.95, 0.55, 0.3, 1.0];
-const GREEN: [f32; 4] = [0.4, 0.75, 0.45, 1.0];
+/// A session series. `apply_palette` replaces the RGB and keeps this alpha.
+const MARK: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
+/// A companion of the previous series. Alpha 0 copies that session's color.
+const LINKED: [f32; 4] = [0.0, 0.0, 0.0, 0.0];
+const GUIDE_COLOR: [f32; 4] = [0.62, 0.62, 0.62, 0.9];
 
-const CHANNELS: &[&str] = &[
-    "ic1_current",
-    "ic2_current",
-    "ic3_current",
-    "dose_rate",
-    "sigma_x",
-    "sigma_y",
-    "position_x",
-    "position_y",
-    "position_error_x",
-    "position_error_y",
-    "field_x",
-    "field_y",
-    "spot_no",
-    "layer_id",
-    "r_ic1_x_confidence",
-    "r_ic1_y_confidence",
-    "r_ic2_x_confidence",
-    "r_ic2_y_confidence",
+const MODE_CHOICES: &[(&str, &str)] = &[
+    ("position", "Position"),
+    ("position_error", "Position Error"),
+    ("sigma", "Sigma"),
+    ("confidence", "Confidence"),
+    ("coverage", "Coverage"),
 ];
+const GRAIN_CHOICES: &[(&str, &str)] = &[("spot", "Spot"), ("timeslice", "Timeslice")];
+const DRAW_CHOICES: &[(&str, &str)] = &[
+    ("scatter", "Scatter"),
+    ("contour", "Contour"),
+    ("density", "Density"),
+];
+const RAMP_CHOICES: &[(&str, &str)] = &[("turbo", "Turbo"), ("viridis", "Viridis")];
+const CUTOFF_CHOICES: &[(&str, &str)] = &[("0", "0"), ("5", "5"), ("10", "10"), ("20", "20")];
+const DENSITY_BINS: usize = 80;
+const CALIBRATE_CHOICES: &[(&str, &str)] = &[("off", "Off"), ("on", "On")];
 
 pub fn analysis_scene(
     view: &str,
@@ -68,18 +70,21 @@ pub fn analysis_scene(
         "ic_hv_transient" => Ok(hv_transient(root, session_ids)),
         "session_log_compare" => Ok(session_log(root, session_ids)),
         "trajectory" => Ok(trajectory(root, session_ids, options)),
-        "dose_volume" => Ok(dose_volume(root, session_ids)),
+        "dose_volume" => Ok(crate::dose_view::dose_volume(
+            root,
+            session_ids,
+            options,
+            None,
+        )),
         _ => Err(format!("unknown view {view}")),
     }
 }
 
 pub fn channel_catalog(root: &Path, session_id: &str) -> Vec<String> {
-    let columns = load_timeslice(root, session_id);
-    let names: Vec<String> = columns.keys().cloned().collect();
-    CHANNELS
-        .iter()
-        .filter(|concept| resolve_concept_column(&names, concept).is_some())
-        .map(|concept| (*concept).to_owned())
+    session_channels(root, session_id)
+        .into_iter()
+        .filter(|(name, values)| channel_key(name) && values.iter().any(|value| value.is_finite()))
+        .map(|(name, _)| name)
         .collect()
 }
 
@@ -98,28 +103,28 @@ pub fn load_timeslice_columns(root: &Path, session_id: &str) -> Value {
 }
 
 fn dose_accumulation(root: &Path, session_ids: &[String], options: &Value) -> PlotScene {
-    let calibrate = text_option(options, "calibrate", "off") == "on";
+    let calibrate = pick(options, "calibrate", "off", CALIBRATE_CHOICES) == "on";
     let mut panels = Vec::new();
-    for (label, concept, current_name) in [
-        ("IC1", "ic1_total_dose", "ic1_current"),
-        ("IC2", "ic2_total_dose", "ic2_current"),
-        ("IC3", "ic3_total_dose", "ic3_current"),
+    for (label, dose_key, current_key) in [
+        ("IC1", "ic1_dose", "ic1_current"),
+        ("IC2", "ic2_dose", "ic2_current"),
+        ("IC3", "ic3_dose", "ic3_current"),
     ] {
-        let mut expected = empty_line(ORANGE);
-        let mut measured = empty_line(BLUE);
-        let mut error = empty_line(GREEN);
-        let mut current_sum = empty_line(BLUE);
-        let mut drew = false;
+        let mut cumulative = Vec::new();
+        let mut error = Vec::new();
+        let mut current_sum = Vec::new();
         for session in session_ids {
-            let map = load_csv(root, session, "input_map.csv");
-            let spots = load_csv(root, session, "spot_data.csv");
-            let Some(target) = col(&map, "charge_req") else {
+            let table = spot_table(root, session);
+            let Some(target) = col(&table, "target_mu") else {
                 continue;
             };
-            let Some(dose) = col(&spots, concept) else {
+            let Some(dose) = col(&table, dose_key) else {
                 continue;
             };
             let n = target.len().min(dose.len());
+            if n == 0 {
+                continue;
+            }
             let mut dose = dose[..n].to_vec();
             if calibrate {
                 if let Some(factor) = calibration_factor(&target[..n], &dose) {
@@ -130,339 +135,258 @@ fn dose_accumulation(root: &Path, session_ids: &[String], options: &Value) -> Pl
             let cum_d = cumsum(&dose);
             let xs: Vec<f32> = (1..=n).map(|i| i as f32).collect();
             let err: Vec<f32> = cum_d.iter().zip(&cum_t).map(|(d, t)| d - t).collect();
-            extend_line(&mut expected, &xs, &cum_t);
-            extend_line(&mut measured, &xs, &cum_d);
-            extend_line(&mut error, &xs, &err);
-            drew = true;
-            if let Some(sums) = timeslice_spot_sums(root, session, current_name, n) {
-                let cum = cumsum(&sums);
-                extend_line(&mut current_sum, &xs[..cum.len().min(xs.len())], &cum);
+            cumulative.push(stroke(xs.clone(), cum_d, false));
+            cumulative.push(guide(xs.clone(), cum_t));
+            error.push(stroke(xs, err, false));
+            let currents = timeslice_metric(root, session, "ic_current");
+            if let Some(samples) = col(&currents, current_key).filter(|values| values.len() == n) {
+                current_sum.push(stroke(
+                    (1..=n).map(|i| i as f32).collect(),
+                    cumsum(samples),
+                    false,
+                ));
             }
         }
-        if !drew {
-            continue;
+        if drew_line(&cumulative) {
+            panels.push(placed(format!("{label} Cumulative"), cumulative));
+            panels.push(placed(format!("{label} Error"), error));
         }
-        let ymax = line_max(&expected).max(line_max(&measured)).max(1.0);
-        panels.push(panel(
-            format!("{label} cumulative"),
-            1.0,
-            xs_end(&expected),
-            0.0,
-            ymax,
-            vec![expected, measured],
-        ));
-        let emin = line_min(&error);
-        let emax = line_max(&error).max(emin + 1.0);
-        panels.push(panel(
-            format!("{label} error"),
-            1.0,
-            xs_end(&error),
-            emin,
-            emax,
-            vec![error],
-        ));
-        if line_has_finite(&current_sum) {
-            panels.push(panel(
-                format!("{label} current sum"),
-                1.0,
-                xs_end(&current_sum),
-                0.0,
-                line_max(&current_sum).max(1.0),
-                vec![current_sum],
-            ));
+        if drew_line(&current_sum) {
+            panels.push(placed(format!("{label} Current Sum"), current_sum));
         }
     }
     scene(
         "Dose Accumulation",
         panels,
-        vec![control(
+        vec![labeled(
             "calibrate",
             "Calibrate",
-            &["off", "on"],
-            text_option(options, "calibrate", "off"),
+            CALIBRATE_CHOICES,
+            if calibrate { "on" } else { "off" },
         )],
     )
 }
 
 fn peak_amplitude(root: &Path, session_ids: &[String]) -> PlotScene {
     let mut panels = Vec::new();
-    for concept in [
-        "ic1_x_peak_amplitude",
-        "ic1_y_peak_amplitude",
-        "ic2_x_peak_amplitude",
-        "ic2_y_peak_amplitude",
+    for (title, key) in [
+        ("IC1 X", "ic1_x_peak"),
+        ("IC1 Y", "ic1_y_peak"),
+        ("IC2 X", "ic2_x_peak"),
+        ("IC2 Y", "ic2_y_peak"),
     ] {
-        let mut values = Vec::new();
+        let mut series = Vec::new();
+        let mut lo = f32::MAX;
+        let mut hi = f32::MIN;
+        let mut top = 1.0f32;
         for session in session_ids {
-            let columns = load_timeslice(root, session);
-            let names: Vec<String> = columns.keys().cloned().collect();
-            let Some(name) = resolve_concept_column(&names, concept) else {
+            let mut table = timeslice_metric(root, session, "peak_amplitude");
+            apply_filter(&mut table, &[key], "all", "beam_off");
+            let values = table.get(key).cloned().unwrap_or_default();
+            if !values.iter().any(|value| value.is_finite()) {
                 continue;
-            };
-            let gate = col(&columns, "rci_in_trigger").or_else(|| col(&columns, "r_beamOk"));
-            let samples = columns.get(name).map(Vec::as_slice).unwrap_or(&[]);
-            let on = gate
-                .map(beam_on_mask)
-                .unwrap_or_else(|| vec![false; samples.len()]);
-            values.extend(
-                filter_beam_state(samples, &on, BeamState::Off)
-                    .into_iter()
-                    .filter(|v| v.is_finite()),
-            );
-        }
-        let (edges, counts) = histogram(&values, 16);
-        let xmax = edges.last().copied().unwrap_or(1.0);
-        let ymax = counts.iter().copied().fold(0.0, f32::max).max(1.0);
-        panels.push(panel(
-            concept.to_owned(),
-            edges.first().copied().unwrap_or(0.0),
-            xmax,
-            0.0,
-            ymax,
-            vec![Series::Bars {
+            }
+            let (edges, counts) = histogram(&values, 16);
+            lo = lo.min(edges.first().copied().unwrap_or(0.0));
+            hi = hi.max(edges.last().copied().unwrap_or(1.0));
+            top = top.max(counts.iter().copied().fold(0.0, f32::max));
+            series.push(Series::Bars {
                 edges,
                 counts,
-                color: BLUE,
-            }],
-        ));
+                color: MARK,
+            });
+        }
+        if series.is_empty() {
+            continue;
+        }
+        panels.push(panel(title.to_owned(), lo, hi, 0.0, top, series));
     }
     scene("IC Peak Amplitude — Beam-Off", panels, Vec::new())
 }
 
 fn beam_motion(root: &Path, session_ids: &[String]) -> PlotScene {
-    let mut panels = Vec::new();
+    let mut groups: BTreeMap<i32, Vec<Series>> = BTreeMap::new();
     for session in session_ids {
-        let columns = load_timeslice(root, session);
-        let x = col(&columns, "position_error_x").unwrap_or(&[]);
-        if x.is_empty() {
+        let Some(motion) = motion_columns(root, session) else {
             continue;
-        }
-        let y = col(&columns, "position_error_y").unwrap_or(&[]);
-        let x2 = col(&columns, "position_error_x2").unwrap_or(&[]);
-        let y2 = col(&columns, "position_error_y2").unwrap_or(&[]);
-        let gate = col(&columns, "rci_in_trigger").or_else(|| col(&columns, "r_beamOk"));
-        let on = gate
-            .map(beam_on_mask)
-            .unwrap_or_else(|| vec![true; x.len()]);
-        let mut segments = spill_segments(&on, MIN_SPILL_GAP_MS, 2);
+        };
+        let mut segments = spill_segments(&motion.on, MIN_SPILL_GAP_MS, 2);
         if segments.is_empty() {
-            segments.push((0, x.len()));
+            segments.push((0, motion.x.len()));
         }
-        let energies = sample_energy(root, session, &columns, x.len());
         let mut by_energy: BTreeMap<i32, Vec<(usize, usize)>> = BTreeMap::new();
         for (start, end) in segments {
-            let sample = start.min(energies.len().saturating_sub(1));
-            let key = (energies.get(sample).copied().unwrap_or(0.0) * 10.0).round() as i32;
+            let sample = start.min(motion.energy.len().saturating_sub(1));
+            let key = (motion.energy.get(sample).copied().unwrap_or(0.0) * 10.0).round() as i32;
             by_energy.entry(key).or_default().push((start, end));
         }
-        for (key, spills) in by_energy.iter().take(40) {
+        for (key, spills) in by_energy {
             let mut sx = Vec::new();
             let mut sy = Vec::new();
             let mut tx = Vec::new();
             let mut ty = Vec::new();
             for (start, end) in spills {
-                push_spill(&mut sx, &mut sy, x, y, *start, *end);
-                if !x2.is_empty() {
-                    push_spill(&mut tx, &mut ty, x2, y2, *start, *end);
+                push_spill(&mut sx, &mut sy, &motion.x, &motion.y, start, end);
+                if !motion.x2.is_empty() {
+                    push_spill(&mut tx, &mut ty, &motion.x2, &motion.y2, start, end);
                 }
             }
-            if y.len() >= x.len() && sx.iter().any(|v| v.is_finite()) {
+            if !sx.iter().any(|value| value.is_finite()) {
+                continue;
+            }
+            if motion.y.len() >= motion.x.len() {
                 push_circle(&mut sx, &mut sy, 1.0);
             }
-            let mut series = vec![Series::Polyline {
+            let series = groups.entry(key).or_default();
+            series.push(Series::Polyline {
                 xs: sx,
                 ys: sy,
-                color: BLUE,
+                color: MARK,
                 thickness: 1.2,
-            }];
-            if tx.iter().any(|v| v.is_finite()) {
+            });
+            if tx.iter().any(|value| value.is_finite()) {
                 series.push(Series::Polyline {
                     xs: tx,
                     ys: ty,
-                    color: ORANGE,
+                    color: LINKED,
                     thickness: 1.2,
                 });
             }
-            let (xmin, xmax, ymin, ymax) = series_span(&series);
-            panels.push(panel(
-                format!("{session} {:.0} MeV", *key as f32 / 10.0),
-                xmin,
-                xmax,
-                ymin,
-                ymax,
-                series,
-            ));
         }
     }
+    let panels = groups
+        .into_iter()
+        .take(40)
+        .map(|(key, series)| placed(format!("{:.0} MeV", key as f32 / 10.0), series))
+        .collect();
     scene("Beam Error Motion vs Energy", panels, Vec::new())
 }
 
 fn distribution(root: &Path, session_ids: &[String], options: &Value) -> PlotScene {
-    let mode = text_option(options, "mode", "position");
-    let grain = text_option(options, "grain", "spot");
-    let beam = text_option(options, "beam", "all");
-    let draw = text_option(options, "draw", "scatter");
-    let (x_concept, y_concept) = match mode {
-        "sigma" => ("sigma_x", "sigma_y"),
-        "position_error" => ("position_error_x", "position_error_y"),
-        "confidence" => ("r_ic1_x_confidence", "r_ic1_y_confidence"),
-        _ => ("position_x", "position_y"),
-    };
-    let state = match beam {
-        "on" => BeamState::On,
-        "off" => BeamState::Off,
-        "all" if mode == "confidence" || mode == "coverage" => BeamState::On,
-        _ => BeamState::All,
-    };
-    let mut panels = Vec::new();
-    for session in session_ids {
-        let timeslice = load_timeslice(root, session);
-        if mode == "confidence" {
-            panels.extend(confidence_panels(session, &timeslice, state));
-            continue;
-        }
-        if mode == "coverage" {
-            panels.extend(coverage_panels(session, &timeslice, state));
-            continue;
-        }
-        let spots = load_csv(root, session, "spot_data.csv");
-        let map = load_csv(root, session, "input_map.csv");
-        let source = if grain == "timeslice" && col(&timeslice, x_concept).is_some() {
-            &timeslice
-        } else if col(&spots, x_concept).is_some() {
-            &spots
+    let mode = pick(options, "mode", "position", MODE_CHOICES);
+    let grain = pick(options, "grain", "spot", GRAIN_CHOICES);
+    let beam = pick(
+        options,
+        "beam",
+        if grain == "timeslice" {
+            "beam_on"
         } else {
-            &map
-        };
-        let Some(xs) = col(source, x_concept) else {
-            continue;
-        };
-        let Some(ys) = col(source, y_concept) else {
-            continue;
-        };
-        let gate = col(&timeslice, "rci_in_trigger").or_else(|| col(&timeslice, "r_beamOk"));
-        let (xs, ys) = select_pairs(xs, ys, gate, state);
-        if xs.is_empty() {
-            continue;
-        }
-        let (xmin, xmax) = span(&xs);
-        let (ymin, ymax) = span(&ys);
-        let series = if draw == "density" {
-            match density_counts(&xs, &ys, 32) {
-                Some((values, x0, x1, y0, y1)) => {
-                    panels.push(panel(
-                        session.clone(),
-                        x0,
-                        x1,
-                        y0,
-                        y1,
-                        vec![Series::Heatmap {
-                            values,
-                            cols: 32,
-                            rows: 32,
-                        }],
-                    ));
-                    continue;
-                }
-                None => Vec::new(),
-            }
-        } else {
-            vec![Series::Points {
-                xs,
-                ys,
-                color: BLUE,
-                radius: 2.0,
-            }]
-        };
-        if series.is_empty() {
-            continue;
-        }
-        panels.push(panel(session.clone(), xmin, xmax, ymin, ymax, series));
+            "beam_both"
+        },
+        BEAM_CHOICES,
+    );
+    let draw = pick(options, "draw", "scatter", DRAW_CHOICES);
+    let ramp = pick(options, "ramp", "turbo", RAMP_CHOICES);
+    let cutoff_id = pick(options, "cutoff", "5", CUTOFF_CHOICES);
+    let cutoff = cutoff_id.parse::<f32>().unwrap_or(5.0);
+    let xy = matches!(mode, "position" | "position_error" | "sigma");
+    let (panels, columns) = if mode == "confidence" {
+        (
+            confidence_scene(root, session_ids, beam, draw, ramp, cutoff),
+            0,
+        )
+    } else if mode == "coverage" {
+        (coverage_scene(root, session_ids, beam), 0)
+    } else {
+        column_scene(root, session_ids, mode, grain, beam, draw, ramp, cutoff)
+    };
+    let mut controls = Vec::new();
+    if xy {
+        controls.push(labeled("grain", "Source", GRAIN_CHOICES, grain));
     }
-    scene(
-        "Distribution Explorer",
-        panels,
-        vec![
-            control(
-                "mode",
-                "Signal",
-                &[
-                    "position",
-                    "position_error",
-                    "sigma",
-                    "confidence",
-                    "coverage",
-                ],
-                mode,
-            ),
-            control("grain", "Grain", &["spot", "timeslice"], grain),
-            control("beam", "Beam", &["all", "on", "off"], beam),
-            control("draw", "Draw", &["scatter", "density"], draw),
-        ],
-    )
+    controls.push(labeled("mode", "Signal", MODE_CHOICES, mode));
+    if mode != "coverage" {
+        controls.push(labeled("draw", "Style", DRAW_CHOICES, draw));
+        if draw == "density" && session_ids.len() == 1 {
+            controls.push(labeled("ramp", "Ramp", RAMP_CHOICES, ramp));
+        }
+        if draw == "contour" {
+            controls.push(labeled(
+                "cutoff",
+                "Contour Cutoff",
+                CUTOFF_CHOICES,
+                cutoff_id,
+            ));
+        }
+    }
+    controls.push(labeled("beam", "Beam", BEAM_CHOICES, beam));
+    let mut scene = scene("Distribution Explorer", panels, controls);
+    scene.columns = columns;
+    scene
 }
 
 fn binned_summary(root: &Path, session_ids: &[String], options: &Value) -> PlotScene {
     super::binned::binned_summary(root, session_ids, options)
 }
 
+/// Timeslice rows are 1 ms apart.
+const SAMPLE_S: f32 = 0.001;
+
 fn replay(root: &Path, session_ids: &[String], options: &Value) -> PlotScene {
-    let channel = text_option(options, "channel", "ic1_current");
-    let scrub = number_option(options, "scrub", 0.0).clamp(0.0, 1.0);
-    let mut panels = Vec::new();
-    let mut choices = Vec::new();
-    for session in session_ids {
-        let catalog = channel_catalog(root, session);
-        if choices.is_empty() {
-            choices = catalog.clone();
-        }
-        let columns = load_timeslice(root, session);
-        let Some(samples) = col(&columns, channel) else {
+    let tables = timeline(root, session_ids);
+    let pairs = channel_pairs_of(&tables);
+    let channel = choose(options, "channel", "ic1_current", &pairs);
+    let label = pairs
+        .iter()
+        .find(|(id, _)| id == &channel)
+        .map(|(_, label)| label.clone())
+        .unwrap_or_else(|| channel.clone());
+    let mut overview = Vec::new();
+    let mut detail = Vec::new();
+    let mut xmax = SAMPLE_S;
+    let mut ymin = f32::MAX;
+    let mut ymax = f32::MIN;
+    for columns in &tables {
+        let Some(samples) = columns.get(&channel) else {
             continue;
         };
-        let step = (samples.len() / 400).max(1);
-        let xs: Vec<f32> = (0..samples.len()).step_by(step).map(|i| i as f32).collect();
-        let ys: Vec<f32> = (0..samples.len())
-            .step_by(step)
-            .map(|i| samples[i])
-            .collect();
-        let start = ((samples.len() as f32) * scrub) as usize;
-        let end = (start + 200).min(samples.len());
-        let detail_x: Vec<f32> = (start..end).map(|i| i as f32).collect();
-        let detail_y = samples[start..end].to_vec();
-        panels.push(line_panel(format!("{session} overview"), &xs, &ys, BLUE));
-        panels.push(line_panel(
-            format!("{session} detail"),
-            &detail_x,
-            &detail_y,
-            ORANGE,
-        ));
+        if samples.is_empty() {
+            continue;
+        }
+        xmax = xmax.max(samples.len().saturating_sub(1) as f32 * SAMPLE_S);
+        if let Some((lo, hi)) = robust_span(samples) {
+            ymin = ymin.min(lo);
+            ymax = ymax.max(hi);
+        }
+        let (xs, ys) = envelope(samples, 480);
+        overview.push(stroke(xs, ys, false));
+        let (xs, ys) = indexed(samples, 4000);
+        detail.push(stroke(xs, ys, false));
     }
-    if choices.is_empty() {
-        choices = CHANNELS.iter().map(|name| (*name).to_owned()).collect();
+    let mut panels = Vec::new();
+    if drew_line(&overview) {
+        if ymin > ymax {
+            ymin = 0.0;
+            ymax = 1.0;
+        }
+        panels.push(time_panel("Overview", overview, xmax, ymin, ymax, &label));
+        panels.push(time_panel("Detail", detail, xmax, ymin, ymax, &label));
     }
-    let choice_refs: Vec<&str> = choices.iter().map(String::as_str).collect();
-    scene(
+    let mut scene = scene(
         "Timeslice Replay",
         panels,
-        vec![
-            control("channel", "Channel", &choice_refs, channel),
-            control(
-                "scrub",
-                "Scrub",
-                &["0", "0.25", "0.5", "0.75"],
-                &scrub_label(scrub),
-            ),
-        ],
-    )
+        vec![choice_control("channel", "Channel", &pairs, &channel)],
+    );
+    scene.columns = 1;
+    scene
 }
 
 fn fft_view(root: &Path, session_ids: &[String], options: &Value) -> PlotScene {
-    let channel = text_option(options, "channel", "ic1_current");
-    let mut panels = Vec::new();
-    for session in session_ids {
-        let columns = load_timeslice(root, session);
-        let Some(samples) = col(&columns, channel) else {
+    spectrum(root, session_ids, options, false)
+}
+
+fn audio_view(root: &Path, session_ids: &[String], options: &Value) -> PlotScene {
+    spectrum(root, session_ids, options, true)
+}
+
+fn spectrum(root: &Path, session_ids: &[String], options: &Value, audio: bool) -> PlotScene {
+    let tables = timeline(root, session_ids);
+    let pairs = channel_pairs_of(&tables);
+    let channel = choose(options, "channel", "ic1_current", &pairs);
+    let mut series = Vec::new();
+    let mut played = Vec::new();
+    for (index, columns) in tables.iter().enumerate() {
+        let Some(samples) = columns.get(&channel) else {
             continue;
         };
         let (freqs, psd) = welch_psd(samples, 1000.0, 4096, 0.5);
@@ -471,63 +395,73 @@ fn fft_view(root: &Path, session_ids: &[String], options: &Value) -> PlotScene {
         for (freq, power) in freqs.iter().zip(&psd) {
             if *freq >= 1.0 && *freq <= 500.0 {
                 xs.push(*freq);
-                ys.push(*power);
+                // A linear PSD sits on the axis. Decades match the Python explorer.
+                ys.push(if power.is_finite() && *power > 0.0 {
+                    power.log10()
+                } else {
+                    f32::NAN
+                });
             }
         }
-        panels.push(line_panel(session.clone(), &xs, &ys, BLUE));
-    }
-    scene(
-        "FFT Explorer",
-        panels,
-        vec![control("channel", "Channel", CHANNELS, channel)],
-    )
-}
-
-fn audio_view(root: &Path, session_ids: &[String], options: &Value) -> PlotScene {
-    let mut scene = fft_view(root, session_ids, options);
-    scene.title = "Audio Explorer".into();
-    if let Some(session) = session_ids.first() {
-        let columns = load_timeslice(root, session);
-        let channel = text_option(options, "channel", "ic1_current");
-        if let Some(samples) = col(&columns, channel) {
-            let peak = samples
-                .iter()
-                .copied()
-                .filter(|v| v.is_finite())
-                .fold(0.0f32, |m, v| m.max(v.abs()))
-                .max(1e-6);
-            scene.samples = samples
-                .iter()
-                .take(8000)
-                .map(|v| (v / peak).clamp(-1.0, 1.0))
-                .collect();
+        if ys.iter().any(|value| value.is_finite()) {
+            series.push(stroke(xs, ys, false));
+        }
+        if audio && index == 0 {
+            played = audible(samples);
         }
     }
+    let mut panels = if series.is_empty() {
+        Vec::new()
+    } else {
+        vec![placed("Spectrum".into(), series)]
+    };
+    if let Some(panel) = panels.first_mut() {
+        panel.y_label = "log10 PSD".into();
+    }
+    let mut scene = scene(
+        if audio {
+            "Audio Explorer"
+        } else {
+            "FFT Explorer"
+        },
+        panels,
+        vec![choice_control("channel", "Channel", &pairs, &channel)],
+    );
+    scene.samples = played;
     scene
+}
+
+fn audible(samples: &[f32]) -> Vec<f32> {
+    let peak = samples
+        .iter()
+        .copied()
+        .filter(|value| value.is_finite())
+        .fold(0.0f32, |max, value| max.max(value.abs()))
+        .max(1e-6);
+    samples
+        .iter()
+        .take(8000)
+        .map(|value| (value / peak).clamp(-1.0, 1.0))
+        .collect()
 }
 
 fn rampdown(root: &Path, session_ids: &[String]) -> PlotScene {
     let mut panels = Vec::new();
-    for session in session_ids {
-        let columns = load_timeslice(root, session);
-        for (label, concept) in [
-            ("IC1", "ic1_current"),
-            ("IC2", "ic2_current"),
-            ("IC3", "ic3_current"),
-        ] {
-            let Some(samples) = col(&columns, concept).or_else(|| {
-                if concept == "ic1_current" {
-                    col(&columns, "ic1_scan_dose")
-                } else {
-                    None
-                }
-            }) else {
+    for (label, key) in [
+        ("IC1", "ic1_current"),
+        ("IC2", "ic2_current"),
+        ("IC3", "ic3_current"),
+    ] {
+        let mut series = Vec::new();
+        let mut windows_panels = Vec::new();
+        for session in session_ids {
+            let table = timeslice_metric(root, session, "ic_current");
+            let Some(samples) = col(&table, key) else {
                 continue;
             };
             let mut edges = beam_off_edges(samples);
             if edges.is_empty() {
-                let gate = col(&columns, "rci_in_trigger").or_else(|| col(&columns, "r_beamOk"));
-                let on = gate
+                let on = col(&table, "beam_on")
                     .map(beam_on_mask)
                     .unwrap_or_else(|| vec![true; samples.len()]);
                 if let Some(end) = on.iter().rposition(|flag| *flag) {
@@ -558,127 +492,119 @@ fn rampdown(root: &Path, session_ids: &[String]) -> PlotScene {
                     heat[i + width * row] = *value;
                 }
             }
-            let mut series = vec![Series::Polyline {
-                xs: xs.clone(),
-                ys: ys.clone(),
-                color: BLUE,
-                thickness: 1.5,
-            }];
+            series.push(stroke(xs, ys, false));
             let time: Vec<f32> = (0..width).map(|i| i as f32).collect();
             let mean = mean_window(&windows, width);
             if let Some((amp, tau)) = fit_decay(&time, &mean) {
                 let fit: Vec<f32> = time.iter().map(|t| amp * (-t / tau).exp()).collect();
-                series.push(Series::Polyline {
-                    xs: time,
-                    ys: fit,
-                    color: ORANGE,
-                    thickness: 1.5,
-                });
+                series.push(stroke(time, fit, true));
             }
-            panels.push(panel(
-                format!("{session} {label}"),
-                0.0,
-                width as f32,
-                0.0,
-                1.05,
-                series,
-            ));
-            panels.push(panel(
-                format!("{label} windows"),
+            windows_panels.push(panel(
+                format!("{session} {label} Windows"),
                 0.0,
                 width as f32,
                 0.0,
                 windows.len() as f32,
-                vec![Series::Heatmap {
-                    values: heat,
-                    cols: width as u32,
-                    rows: windows.len() as u32,
-                }],
+                vec![Series::heatmap(heat, width as u32, windows.len() as u32)],
             ));
         }
+        if drew_line(&series) {
+            panels.push(placed(label.into(), series));
+        }
+        panels.extend(windows_panels);
     }
     scene("Beam-Off Ramp-Down", panels, Vec::new())
 }
 
 fn amplifier(root: &Path, session_ids: &[String]) -> PlotScene {
     let mut panels = Vec::new();
-    for session in session_ids {
-        let columns = load_timeslice(root, session);
-        let Some(cmd) = col(&columns, "amplifier_command_x").or_else(|| col(&columns, "field_x"))
-        else {
-            continue;
-        };
-        let Some(readback) =
-            col(&columns, "amplifier_readback_x").or_else(|| col(&columns, "field_y"))
-        else {
-            continue;
-        };
-        let n = cmd.len().min(readback.len()).min(2000);
-        let mask = settled_after_step(&cmd[..n], 3, 0.05);
-        let mut xs = Vec::new();
-        let mut ys = Vec::new();
-        for i in 0..n {
-            if mask[i] && cmd[i].is_finite() && readback[i].is_finite() {
-                xs.push(cmd[i]);
-                ys.push(readback[i]);
+    for (title, cmd_key, read_key) in [
+        ("X", "amp_cmd_x", "amp_read_x"),
+        ("Y", "amp_cmd_y", "amp_read_y"),
+    ] {
+        let mut series = Vec::new();
+        let mut arcs = Vec::new();
+        for session in session_ids {
+            let table = timeslice_metric(root, session, "amplifier_error");
+            let Some(cmd) = col(&table, cmd_key) else {
+                continue;
+            };
+            let Some(readback) = col(&table, read_key) else {
+                continue;
+            };
+            let n = cmd.len().min(readback.len()).min(2000);
+            if n == 0 {
+                continue;
             }
-        }
-        if xs.len() < 2 {
-            xs = cmd[..n].to_vec();
-            ys = readback[..n].to_vec();
-        }
-        let (xmin, xmax) = span(&xs);
-        let (ymin, ymax) = span(&ys);
-        let mut series = vec![Series::Points {
-            xs: xs.clone(),
-            ys: ys.clone(),
-            color: BLUE,
-            radius: 1.5,
-        }];
-        if let Some((slope, intercept)) = linear_fit(&xs, &ys) {
-            series.push(Series::Polyline {
-                xs: vec![xmin, xmax],
-                ys: vec![intercept + slope * xmin, intercept + slope * xmax],
-                color: ORANGE,
-                thickness: 1.5,
-            });
-        }
-        panels.push(panel(session.clone(), xmin, xmax, ymin, ymax, series));
-        if let Some((counts, x0, x1, y0, y1)) = density_counts(&xs, &ys, 24) {
-            panels.push(panel(
-                format!("{session} density"),
-                x0,
-                x1,
-                y0,
-                y1,
-                vec![Series::Heatmap {
-                    values: counts,
-                    cols: 24,
-                    rows: 24,
-                }],
-            ));
-        }
-        let spots = load_csv(root, session, "spot_data.csv");
-        let x1 = col(&spots, "ic1_position_x").or_else(|| col(&columns, "position_x"));
-        let x2 = col(&spots, "position_x").or_else(|| col(&columns, "ic2_position_x"));
-        if let (Some(ic1), Some(ic2)) = (x1, x2) {
-            let n = ic1.len().min(ic2.len()).min(cmd.len());
-            let angle: Vec<f32> = (0..n).map(|i| beam_angle_mrad(ic1[i], ic2[i])).collect();
-            if let Some(fit) = arc_fit(&cmd[..n], &angle) {
-                let mut curve_x = Vec::new();
-                let mut curve_y = Vec::new();
-                for step in 0..40 {
-                    let field = xmin + (xmax - xmin) * step as f32 / 39.0;
-                    curve_x.push(field);
-                    curve_y.push(arc_predict(fit, field));
+            let mask = settled_after_step(&cmd[..n], 3, 0.05);
+            let mut xs = Vec::new();
+            let mut ys = Vec::new();
+            for i in 0..n {
+                if mask[i] && cmd[i].is_finite() && readback[i].is_finite() {
+                    xs.push(cmd[i]);
+                    ys.push(readback[i]);
                 }
-                panels.push(line_panel(
-                    format!("{session} arc"),
-                    &curve_x,
-                    &curve_y,
-                    ORANGE,
+            }
+            if xs.len() < 2 {
+                xs.clear();
+                ys.clear();
+                for i in 0..n {
+                    if cmd[i].is_finite() && readback[i].is_finite() {
+                        xs.push(cmd[i]);
+                        ys.push(readback[i]);
+                    }
+                }
+            }
+            if xs.len() < 2 {
+                continue;
+            }
+            let (xmin, xmax) = span(&xs);
+            series.push(Series::Points {
+                xs: xs.clone(),
+                ys: ys.clone(),
+                color: MARK,
+                radius: 1.5,
+            });
+            if let Some((slope, intercept)) = linear_fit(&xs, &ys) {
+                series.push(stroke(
+                    vec![xmin, xmax],
+                    vec![intercept + slope * xmin, intercept + slope * xmax],
+                    true,
                 ));
             }
+            if let Some((counts, x0, x1, y0, y1)) = density_counts(&xs, &ys, 24) {
+                panels.push(panel(
+                    format!("{session} {title} Density"),
+                    x0,
+                    x1,
+                    y0,
+                    y1,
+                    vec![Series::heatmap(counts, 24, 24)],
+                ));
+            }
+            let spots = spot_table(root, session);
+            let ic1 = finite_col(&spots, "ic1_x");
+            let ic2 = finite_col(&spots, "ic2_x");
+            if let (Some(ic1), Some(ic2)) = (ic1, ic2) {
+                let n = ic1.len().min(ic2.len()).min(cmd.len());
+                let angle: Vec<f32> = (0..n).map(|i| beam_angle_mrad(ic1[i], ic2[i])).collect();
+                if let Some(fit) = arc_fit(&cmd[..n], &angle) {
+                    let mut curve_x = Vec::new();
+                    let mut curve_y = Vec::new();
+                    for step in 0..40 {
+                        let field = xmin + (xmax - xmin) * step as f32 / 39.0;
+                        curve_x.push(field);
+                        curve_y.push(arc_predict(fit, field));
+                    }
+                    arcs.push(stroke(curve_x, curve_y, false));
+                }
+            }
+        }
+        if !series.is_empty() {
+            panels.insert(0, placed(title.into(), series));
+        }
+        if drew_line(&arcs) {
+            panels.push(placed(format!("{title} Arc"), arcs));
         }
     }
     scene("Amplifier Command Correlations", panels, Vec::new())
@@ -715,7 +641,7 @@ fn hv_transient(root: &Path, session_ids: &[String]) -> PlotScene {
                 format!("{device} {grade}"),
                 &time,
                 current,
-                BLUE,
+                MARK,
             ));
             let mut counts = vec![measured];
             let mut edges = vec![0.0, 1.0];
@@ -733,7 +659,7 @@ fn hv_transient(root: &Path, session_ids: &[String]) -> PlotScene {
                 vec![Series::Bars {
                     edges,
                     counts,
-                    color: ORANGE,
+                    color: MARK,
                 }],
             ));
         }
@@ -749,26 +675,30 @@ fn session_log(root: &Path, session_ids: &[String]) -> PlotScene {
         let log = parse_session_log(&text);
         rows.push(vec![
             session.clone(),
-            "OVERVIEW".into(),
+            "Overview".into(),
             format!("{} lines", log.lines),
         ]);
         for (level, count) in &log.level_counts {
-            rows.push(vec![session.clone(), level.clone(), count.to_string()]);
+            rows.push(vec![
+                session.clone(),
+                "Overview".into(),
+                format!("{level} {count}"),
+            ]);
         }
         for event in &log.timeline {
             rows.push(vec![
                 session.clone(),
-                "TIMELINE".into(),
+                "Timeline".into(),
                 format!("layer {} {} {:.3}s", event.layer, event.kind, event.seconds),
             ]);
         }
         for issue in log.issues.iter().take(40) {
-            rows.push(vec![session.clone(), "ERROR".into(), issue.clone()]);
+            rows.push(vec![session.clone(), "Errors".into(), issue.clone()]);
         }
         for (device, count) in &log.wdt {
             rows.push(vec![
                 session.clone(),
-                "WDT".into(),
+                "Watchdog".into(),
                 format!("{device} {count}"),
             ]);
         }
@@ -781,14 +711,14 @@ fn session_log(root: &Path, session_ids: &[String]) -> PlotScene {
         {
             rows.push(vec![
                 format!("{} vs {}", parsed[0].0, parsed[1].0),
-                "DIFF".into(),
+                "Diff".into(),
                 format!("{template} {a} {b} {delta}"),
             ]);
         }
     }
     let mut scene = scene("Session Log Compare", Vec::new(), Vec::new());
     scene.table = Some(DataTable {
-        columns: vec!["Session".into(), "Level".into(), "Detail".into()],
+        columns: vec!["Session".into(), "Section".into(), "Detail".into()],
         rows,
     });
     scene
@@ -796,87 +726,89 @@ fn session_log(root: &Path, session_ids: &[String]) -> PlotScene {
 
 fn trajectory(root: &Path, session_ids: &[String], options: &Value) -> PlotScene {
     let azimuth = number_option(options, "azimuth", 0.4);
-    let mut panels = Vec::new();
+    let orbit = ["0.2", "0.4", "0.8", "1.2"]
+        .into_iter()
+        .find(|label| *label == format!("{azimuth:.1}"))
+        .unwrap_or("0.4");
+    let azimuth: f32 = orbit.parse().unwrap_or(0.4);
+    let mut paths = Vec::new();
+    let mut iso = Vec::new();
+    let mut pivot = 0.0f32;
+    let mut have_pivot = false;
     for session in session_ids {
-        let spots = load_csv(root, session, "spot_data.csv");
-        let map = load_csv(root, session, "input_map.csv");
-        let x2 = col(&spots, "position_x")
-            .or_else(|| col(&map, "position_x"))
-            .unwrap_or(&[]);
-        let y2 = col(&spots, "position_y")
-            .or_else(|| col(&map, "position_y"))
-            .unwrap_or(&[]);
-        let x1 = col(&spots, "ic1_position_x").unwrap_or(x2);
-        let energy = col(&map, "energy").unwrap_or(&[]);
+        let table = spot_table(root, session);
+        let plan_x = col(&table, "plan_x").unwrap_or(&[]);
+        let plan_y = col(&table, "plan_y").unwrap_or(&[]);
+        let ic1_x = finite_col(&table, "ic1_x").unwrap_or(plan_x);
+        let ic1_y = finite_col(&table, "ic1_y").unwrap_or(plan_y);
+        let ic2_x = finite_col(&table, "ic2_x").unwrap_or(plan_x);
+        let ic2_y = finite_col(&table, "ic2_y").unwrap_or(plan_y);
+        let energy = col(&table, "energy").unwrap_or(&[]);
+        let n = ic1_x
+            .len()
+            .min(ic2_x.len())
+            .min(ic1_y.len())
+            .min(ic2_y.len());
         let mut sx = Vec::new();
         let mut sy = Vec::new();
-        for i in 0..x2.len().min(y2.len()).min(400) {
-            let (px, py) = project(x2[i], y2.get(i).copied().unwrap_or(0.0), IC2_Z_MM, azimuth);
-            let (qx, qy) = project(
-                x1.get(i).copied().unwrap_or(x2[i]),
-                y2.get(i).copied().unwrap_or(0.0),
-                IC1_Z_MM,
-                azimuth,
-            );
+        for i in 0..n.min(400) {
+            let (px, py) = project(ic2_x[i], ic2_y[i], IC2_Z_MM, azimuth);
+            let (qx, qy) = project(ic1_x[i], ic1_y[i], IC1_Z_MM, azimuth);
             sx.extend([px, qx, f32::NAN]);
             sy.extend([py, qy, f32::NAN]);
         }
-        push_projected(
-            &mut sx,
-            &mut sy,
+        if sx.iter().any(|value| value.is_finite()) {
+            if !have_pivot {
+                pivot = magnet_pivot_z(
+                    ic2_x.first().copied().unwrap_or(0.0),
+                    ic1_x.first().copied().unwrap_or(0.0),
+                );
+                have_pivot = true;
+            }
+            paths.push(stroke(sx, sy, false));
+        }
+        let fit_x = if finite_col(&table, "ic1_x").is_some() {
+            ic1_x
+        } else {
+            plan_x
+        };
+        if let Some((intercept, slope)) = fit_iso_plane(energy, fit_x) {
+            let (e0, e1) = span(energy);
+            iso.push(stroke(
+                vec![e0, e1],
+                vec![intercept + slope * e0, intercept + slope * e1],
+                false,
+            ));
+        }
+    }
+    if have_pivot {
+        paths.push(plane_guide(
             (-40.0, 0.0, IC2_Z_MM),
             (40.0, 0.0, IC2_Z_MM),
             azimuth,
-        );
-        push_projected(
-            &mut sx,
-            &mut sy,
+        ));
+        paths.push(plane_guide(
             (-40.0, 0.0, IC1_Z_MM),
             (40.0, 0.0, IC1_Z_MM),
             azimuth,
-        );
-        let pivot = magnet_pivot_z(
-            x2.first().copied().unwrap_or(0.0),
-            x1.first().copied().unwrap_or(0.0),
-        );
-        push_projected(
-            &mut sx,
-            &mut sy,
+        ));
+        paths.push(plane_guide(
             (-20.0, -4.0, pivot),
             (20.0, -4.0, pivot),
             azimuth,
-        );
-        push_projected(
-            &mut sx,
-            &mut sy,
+        ));
+        paths.push(plane_guide(
             (-20.0, 4.0, pivot),
             (20.0, 4.0, pivot),
             azimuth,
-        );
-        let (xmin, xmax) = span(&sx);
-        let (ymin, ymax) = span(&sy);
-        panels.push(panel(
-            format!("{session} planes pivot {pivot:.0} mm"),
-            xmin,
-            xmax,
-            ymin,
-            ymax,
-            vec![Series::Polyline {
-                xs: sx,
-                ys: sy,
-                color: BLUE,
-                thickness: 1.2,
-            }],
         ));
-        if let Some((intercept, slope)) = fit_iso_plane(energy, x2) {
-            let (e0, e1) = span(energy);
-            panels.push(line_panel(
-                format!("{session} iso"),
-                &[e0, e1],
-                &[intercept + slope * e0, intercept + slope * e1],
-                GREEN,
-            ));
-        }
+    }
+    let mut panels = Vec::new();
+    if !paths.is_empty() {
+        panels.push(placed(format!("Planes Pivot {pivot:.0} mm"), paths));
+    }
+    if drew_line(&iso) {
+        panels.push(placed("Iso".into(), iso));
     }
     scene(
         "IC Beam Trajectory",
@@ -885,167 +817,9 @@ fn trajectory(root: &Path, session_ids: &[String], options: &Value) -> PlotScene
             "azimuth",
             "Orbit",
             &["0.2", "0.4", "0.8", "1.2"],
-            &format!("{azimuth:.1}"),
+            orbit,
         )],
     )
-}
-
-fn dose_volume(root: &Path, session_ids: &[String]) -> PlotScene {
-    let mut panels = Vec::new();
-    for session in session_ids {
-        let map = load_csv(root, session, "input_map.csv");
-        let spots = load_csv(root, session, "spot_data.csv");
-        let x = col(&map, "position_x")
-            .or_else(|| col(&spots, "position_x"))
-            .unwrap_or(&[]);
-        let y = col(&map, "position_y")
-            .or_else(|| col(&spots, "position_y"))
-            .unwrap_or(&[]);
-        let dose = col(&spots, "ic1_total_dose")
-            .or_else(|| col(&map, "charge_req"))
-            .unwrap_or(&[]);
-        let n = x.len().min(y.len()).min(dose.len()).min(2000);
-        if n == 0 {
-            continue;
-        }
-        let mut spots_in = Vec::with_capacity(n);
-        let mut lo_x = x[0];
-        let mut hi_x = x[0];
-        let mut lo_y = y[0];
-        let mut hi_y = y[0];
-        for i in 0..n {
-            lo_x = lo_x.min(x[i]);
-            hi_x = hi_x.max(x[i]);
-            lo_y = lo_y.min(y[i]);
-            hi_y = hi_y.max(y[i]);
-            spots_in.push([x[i], y[i], 0.0, dose[i].max(0.0), 4.0]);
-        }
-        let shape = [32usize, 32, 8];
-        let spacing = [
-            ((hi_x - lo_x) / 31.0).max(1.0),
-            ((hi_y - lo_y) / 31.0).max(1.0),
-            5.0,
-        ];
-        let grid = splat_gaussians(&spots_in, [lo_x, lo_y, 0.0], spacing, shape);
-        let image = mip_xy(&grid, shape);
-        let lateral: Vec<f32> = (0..shape[0])
-            .map(|x| (0..shape[1]).map(|y| image[x + shape[0] * y]).sum())
-            .collect();
-        let depth: Vec<f32> = (0..shape[2])
-            .map(|z| {
-                let start = shape[0] * shape[1] * z;
-                grid[start..start + shape[0] * shape[1]].iter().sum()
-            })
-            .collect();
-        let depth_x: Vec<f32> = (0..depth.len()).map(|i| i as f32 * spacing[2]).collect();
-        panels.push(panel(
-            format!("{session} MIP"),
-            0.0,
-            32.0,
-            0.0,
-            32.0,
-            vec![Series::Heatmap {
-                values: image,
-                cols: 32,
-                rows: 32,
-            }],
-        ));
-        panels.push(line_panel(
-            format!("{session} depth"),
-            &depth_x,
-            &depth,
-            ORANGE,
-        ));
-        let lateral_x: Vec<f32> = (0..lateral.len()).map(|i| i as f32).collect();
-        panels.push(line_panel(
-            format!("{session} lateral"),
-            &lateral_x,
-            &lateral,
-            GREEN,
-        ));
-        let mut sagittal = vec![0.0f32; shape[1] * shape[2]];
-        let xmid = shape[0] / 2;
-        for z in 0..shape[2] {
-            for y in 0..shape[1] {
-                sagittal[y + shape[1] * z] = grid[xmid + shape[0] * (y + shape[1] * z)];
-            }
-        }
-        panels.push(panel(
-            format!("{session} sagittal"),
-            0.0,
-            shape[1] as f32,
-            0.0,
-            shape[2] as f32,
-            vec![Series::Heatmap {
-                values: sagittal,
-                cols: shape[1] as u32,
-                rows: shape[2] as u32,
-            }],
-        ));
-        let mut coronal = vec![0.0f32; shape[0] * shape[2]];
-        let ymid = shape[1] / 2;
-        for z in 0..shape[2] {
-            for x in 0..shape[0] {
-                coronal[x + shape[0] * z] = grid[x + shape[0] * (ymid + shape[1] * z)];
-            }
-        }
-        panels.push(panel(
-            format!("{session} coronal"),
-            0.0,
-            shape[0] as f32,
-            0.0,
-            shape[2] as f32,
-            vec![Series::Heatmap {
-                values: coronal,
-                cols: shape[0] as u32,
-                rows: shape[2] as u32,
-            }],
-        ));
-        let mask = vec![true; grid.len()];
-        let (edges, curve) = dvh(&grid, &mask, 12);
-        let dvh_x: Vec<f32> = edges.iter().take(curve.len()).copied().collect();
-        panels.push(line_panel(format!("{session} DVH"), &dvh_x, &curve, BLUE));
-        let charge = col(&map, "charge_req").unwrap_or(&[]);
-        let plan_in: Vec<[f32; 5]> = (0..n)
-            .map(|i| {
-                [
-                    x[i],
-                    y[i],
-                    0.0,
-                    charge.get(i).copied().unwrap_or(dose[i]).max(0.0),
-                    4.0,
-                ]
-            })
-            .collect();
-        let plan = splat_gaussians(&plan_in, [lo_x, lo_y, 0.0], spacing, shape);
-        let (gamma, _, _) = gamma_index(&plan, &grid, shape, 3.0, 2.0, spacing, 0.1);
-        panels.push(panel(
-            format!("{session} gamma"),
-            0.0,
-            32.0,
-            0.0,
-            32.0,
-            vec![Series::Heatmap {
-                values: mip_xy(&gamma, shape),
-                cols: 32,
-                rows: 32,
-            }],
-        ));
-        let coarse = resample_nearest(&grid, shape, [16, 16, 4]);
-        panels.push(panel(
-            format!("{session} resample"),
-            0.0,
-            16.0,
-            0.0,
-            16.0,
-            vec![Series::Heatmap {
-                values: mip_xy(&coarse, [16, 16, 4]),
-                cols: 16,
-                rows: 16,
-            }],
-        ));
-    }
-    scene("Dose Volume", panels, Vec::new())
 }
 
 fn scene(title: &str, panels: Vec<Panel>, controls: Vec<Control>) -> PlotScene {
@@ -1080,6 +854,7 @@ fn panel(title: String, xmin: f32, xmax: f32, ymin: f32, ymax: f32, series: Vec<
         ymax,
         series,
         x_labels: Vec::new(),
+        equal: false,
     }
 }
 
@@ -1110,48 +885,83 @@ fn control(id: &str, label: &str, options: &[&str], value: &str) -> Control {
     }
 }
 
-fn extend_line(series: &mut Series, xs: &[f32], ys: &[f32]) {
-    if let Series::Polyline { xs: dx, ys: dy, .. } = series {
-        if !dx.is_empty() {
-            dx.push(f32::NAN);
-            dy.push(f32::NAN);
+fn stroke(xs: Vec<f32>, ys: Vec<f32>, linked: bool) -> Series {
+    Series::Polyline {
+        xs,
+        ys,
+        color: if linked { LINKED } else { MARK },
+        thickness: 1.5,
+    }
+}
+
+fn guide(xs: Vec<f32>, ys: Vec<f32>) -> Series {
+    Series::Guide {
+        xs,
+        ys,
+        color: GUIDE_COLOR,
+        thickness: 1.0,
+    }
+}
+
+fn placed(title: String, series: Vec<Series>) -> Panel {
+    let (xmin, xmax, ymin, ymax) = series_span(&series);
+    panel(title, xmin, xmax, ymin, ymax, series)
+}
+
+fn time_panel(
+    title: &str,
+    series: Vec<Series>,
+    xmax: f32,
+    ymin: f32,
+    ymax: f32,
+    y_label: &str,
+) -> Panel {
+    let mut panel = panel(title.into(), 0.0, xmax, ymin, ymax, series);
+    panel.y_label = y_label.to_owned();
+    panel
+}
+
+fn drew_line(series: &[Series]) -> bool {
+    series.iter().any(|item| {
+        matches!(item, Series::Polyline { ys, .. } if ys.iter().any(|value| value.is_finite()))
+    })
+}
+
+fn finite_pairs(xs: &[f32], ys: &[f32]) -> (Vec<f32>, Vec<f32>) {
+    let mut ox = Vec::new();
+    let mut oy = Vec::new();
+    for (x, y) in xs.iter().zip(ys) {
+        if x.is_finite() && y.is_finite() {
+            ox.push(*x);
+            oy.push(*y);
         }
-        dx.extend_from_slice(xs);
-        dy.extend_from_slice(ys);
     }
+    (ox, oy)
 }
 
-fn line_max(series: &Series) -> f32 {
-    match series {
-        Series::Polyline { ys, .. } => ys
-            .iter()
-            .copied()
-            .filter(|v| v.is_finite())
-            .fold(0.0, f32::max),
-        _ => 0.0,
-    }
+fn finite_col<'a>(table: &'a BTreeMap<String, Vec<f32>>, key: &str) -> Option<&'a [f32]> {
+    col(table, key).filter(|values| values.iter().any(|value| value.is_finite()))
 }
 
-fn line_min(series: &Series) -> f32 {
-    match series {
-        Series::Polyline { ys, .. } => ys
-            .iter()
-            .copied()
-            .filter(|v| v.is_finite())
-            .fold(0.0, f32::min),
-        _ => 0.0,
-    }
+fn kept_pairs(
+    table: &BTreeMap<String, Vec<f32>>,
+    x_key: &str,
+    y_key: &str,
+    beam: &str,
+) -> (Vec<f32>, Vec<f32>) {
+    let mut copy = table.clone();
+    apply_filter(&mut copy, &[x_key, y_key], "all", beam);
+    finite_pairs(
+        copy.get(x_key).map(Vec::as_slice).unwrap_or(&[]),
+        copy.get(y_key).map(Vec::as_slice).unwrap_or(&[]),
+    )
 }
 
-fn xs_end(series: &Series) -> f32 {
-    match series {
-        Series::Polyline { xs, .. } => xs
-            .iter()
-            .copied()
-            .filter(|v| v.is_finite())
-            .fold(1.0, f32::max),
-        _ => 1.0,
-    }
+fn plane_guide(from: (f32, f32, f32), to: (f32, f32, f32), azimuth: f32) -> Series {
+    let mut xs = Vec::new();
+    let mut ys = Vec::new();
+    push_projected(&mut xs, &mut ys, from, to, azimuth);
+    guide(xs, ys)
 }
 
 fn span(values: &[f32]) -> (f32, f32) {
@@ -1174,22 +984,6 @@ fn project(x: f32, y: f32, z: f32, azimuth: f32) -> (f32, f32) {
     let px = x * azimuth.cos() - z * azimuth.sin();
     let py = y + z * 0.15;
     (px, py)
-}
-
-fn scrub_label(scrub: f32) -> String {
-    if scrub < 0.125 {
-        "0".into()
-    } else if scrub < 0.375 {
-        "0.25".into()
-    } else if scrub < 0.625 {
-        "0.5".into()
-    } else {
-        "0.75".into()
-    }
-}
-
-fn text_option<'a>(options: &'a Value, key: &str, default: &'a str) -> &'a str {
-    options.get(key).and_then(Value::as_str).unwrap_or(default)
 }
 
 fn number_option(options: &Value, key: &str, default: f32) -> f32 {
@@ -1272,130 +1066,638 @@ fn session_text(root: &Path, session_id: &str, name: &str) -> String {
         .unwrap_or_default()
 }
 
-fn empty_line(color: [f32; 4]) -> Series {
-    Series::Polyline {
-        xs: Vec::new(),
-        ys: Vec::new(),
-        color,
-        thickness: 1.5,
-    }
+fn session_channels(root: &Path, session: &str) -> BTreeMap<String, Vec<f32>> {
+    timeslice_signals(root, session)
 }
 
-fn line_has_finite(series: &Series) -> bool {
-    match series {
-        Series::Polyline { ys, .. } => ys.iter().any(|value| value.is_finite()),
-        _ => false,
-    }
+fn timeline(root: &Path, session_ids: &[String]) -> Vec<BTreeMap<String, Vec<f32>>> {
+    session_ids
+        .iter()
+        .map(|session| session_channels(root, session))
+        .collect()
 }
 
-fn timeslice_spot_sums(root: &Path, session: &str, concept: &str, n: usize) -> Option<Vec<f32>> {
-    let mut sums = Vec::new();
-    let mut found = false;
-    for bytes in discover::read_timeslices(&session_dir(root, session)) {
-        let Ok(frame) = numeric_columns(&bytes) else {
-            continue;
-        };
-        let Some(part) = frame_spot_sums(&frame, concept) else {
-            continue;
-        };
-        found = true;
-        sums.extend(part);
-    }
-    if !found {
-        return None;
-    }
-    sums.truncate(n);
-    while sums.len() < n {
-        sums.push(f32::NAN);
-    }
-    Some(sums)
+fn channel_key(name: &str) -> bool {
+    !matches!(name, "energy" | "beam_on" | "beam_on_time" | "spot_time")
 }
 
-fn frame_spot_sums(columns: &BTreeMap<String, Vec<f32>>, concept: &str) -> Option<Vec<f32>> {
-    let spot = col(columns, "spot_no")?;
-    let current = if let Some(found) = col(columns, concept) {
-        found.to_vec()
-    } else if concept == "ic3_current" {
-        sum_ic3_quads(columns)?
+fn channel_label(id: &str) -> String {
+    match id {
+        "ic1_current" => "IC1 Current",
+        "ic2_current" => "IC2 Current",
+        "ic3_current" => "IC3 Current",
+        "ic1_x" => "IC1 X",
+        "ic1_y" => "IC1 Y",
+        "ic2_x" => "IC2 X",
+        "ic2_y" => "IC2 Y",
+        "ic1_x_err" => "IC1 X Error",
+        "ic1_y_err" => "IC1 Y Error",
+        "ic2_x_err" => "IC2 X Error",
+        "ic2_y_err" => "IC2 Y Error",
+        "ic1_sig_x" => "IC1 Sigma X",
+        "ic1_sig_y" => "IC1 Sigma Y",
+        "ic2_sig_x" => "IC2 Sigma X",
+        "ic2_sig_y" => "IC2 Sigma Y",
+        "ic12_x_diff" => "IC2-IC1 X",
+        "ic12_y_diff" => "IC2-IC1 Y",
+        "field_x" => "Field X",
+        "field_y" => "Field Y",
+        "ic1_x_confidence" => "IC1 X Confidence",
+        "ic1_y_confidence" => "IC1 Y Confidence",
+        "ic2_x_confidence" => "IC2 X Confidence",
+        "ic2_y_confidence" => "IC2 Y Confidence",
+        "ic1_x_peak" => "IC1 X Peak",
+        "ic1_y_peak" => "IC1 Y Peak",
+        "ic2_x_peak" => "IC2 X Peak",
+        "ic2_y_peak" => "IC2 Y Peak",
+        "amp_x" => "Amplifier X",
+        "amp_y" => "Amplifier Y",
+        "amp_cmd_x" => "Amplifier Command X",
+        "amp_read_x" => "Amplifier Readback X",
+        "amp_cmd_y" => "Amplifier Command Y",
+        "amp_read_y" => "Amplifier Readback Y",
+        _ => {
+            return id
+                .split('_')
+                .map(|part| {
+                    let mut chars = part.chars();
+                    match chars.next() {
+                        None => String::new(),
+                        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        }
+    }
+    .to_owned()
+}
+
+fn channel_pairs_of(tables: &[BTreeMap<String, Vec<f32>>]) -> Vec<(String, String)> {
+    let mut ids = BTreeSet::new();
+    for table in tables {
+        for (name, values) in table {
+            if channel_key(name) && values.iter().any(|value| value.is_finite()) {
+                ids.insert(name.clone());
+            }
+        }
+    }
+    if ids.is_empty() {
+        ids.insert("ic1_current".to_owned());
+    }
+    ids.into_iter()
+        .map(|id| {
+            let label = channel_label(&id);
+            (id, label)
+        })
+        .collect()
+}
+
+fn choose(options: &Value, key: &str, default_id: &str, pairs: &[(String, String)]) -> String {
+    let raw = options
+        .get(key)
+        .and_then(Value::as_str)
+        .unwrap_or(default_id);
+    if let Some((id, _)) = pairs.iter().find(|(id, label)| id == raw || label == raw) {
+        return id.clone();
+    }
+    if pairs.iter().any(|(id, _)| id == default_id) {
+        default_id.to_owned()
     } else {
-        return None;
-    };
-    let sums = sums_by_spot_id(spot, &current);
-    (!sums.is_empty()).then_some(sums)
+        pairs
+            .first()
+            .map(|(id, _)| id.clone())
+            .unwrap_or_else(|| default_id.to_owned())
+    }
 }
 
-fn confidence_panels(
-    session: &str,
-    columns: &BTreeMap<String, Vec<f32>>,
-    state: BeamState,
-) -> Vec<Panel> {
-    let gate = col(columns, "rci_in_trigger").or_else(|| col(columns, "r_beamOk"));
-    let mut panels = Vec::new();
-    for (label, confidence, peak) in [
-        ("IC1 X", "r_ic1_x_confidence", "ic1_x_peak_amplitude"),
-        ("IC1 Y", "r_ic1_y_confidence", "ic1_y_peak_amplitude"),
-        ("IC2 X", "r_ic2_x_confidence", "ic2_x_peak_amplitude"),
-        ("IC2 Y", "r_ic2_y_confidence", "ic2_y_peak_amplitude"),
-    ] {
-        let Some(conf) = col(columns, confidence) else {
-            continue;
-        };
-        let index: Vec<f32> = (0..conf.len()).map(|i| i as f32).collect();
-        let xs = col(columns, peak).unwrap_or(&index);
-        let (xs, ys) = select_pairs(xs, conf, gate, state);
-        if xs.is_empty() {
+fn choice_control(id: &str, label: &str, pairs: &[(String, String)], current: &str) -> Control {
+    let value = pairs
+        .iter()
+        .find(|(key, _)| key == current)
+        .map(|(_, label)| label.clone())
+        .unwrap_or_else(|| current.to_owned());
+    Control {
+        id: id.to_owned(),
+        label: label.to_owned(),
+        options: pairs.iter().map(|(_, label)| label.clone()).collect(),
+        value,
+    }
+}
+
+fn indexed(samples: &[f32], target: usize) -> (Vec<f32>, Vec<f32>) {
+    let step = (samples.len() / target.max(1)).max(1);
+    (
+        (0..samples.len())
+            .step_by(step)
+            .map(|i| i as f32 * SAMPLE_S)
+            .collect(),
+        (0..samples.len())
+            .step_by(step)
+            .map(|i| samples[i])
+            .collect(),
+    )
+}
+
+/// Min and max of each bucket, so a pulse narrower than the stride still draws.
+fn envelope(samples: &[f32], buckets: usize) -> (Vec<f32>, Vec<f32>) {
+    let n = samples.len();
+    if n == 0 {
+        return (Vec::new(), Vec::new());
+    }
+    let buckets = buckets.max(1).min(n);
+    let mut xs = Vec::with_capacity(buckets * 2);
+    let mut ys = Vec::with_capacity(buckets * 2);
+    for bucket in 0..buckets {
+        let start = bucket * n / buckets;
+        let end = ((bucket + 1) * n / buckets).max(start + 1).min(n);
+        let mut lo = f32::INFINITY;
+        let mut hi = f32::NEG_INFINITY;
+        for value in &samples[start..end] {
+            if value.is_finite() {
+                lo = lo.min(*value);
+                hi = hi.max(*value);
+            }
+        }
+        if !lo.is_finite() {
             continue;
         }
-        let (xmin, xmax) = span(&xs);
-        let (ymin, ymax) = span(&ys);
-        panels.push(panel(
-            format!("{session} {label}"),
-            xmin,
-            xmax,
-            ymin,
-            ymax,
-            vec![Series::Points {
+        let x = start as f32 * SAMPLE_S;
+        xs.push(x);
+        ys.push(lo);
+        if hi > lo {
+            xs.push(x);
+            ys.push(hi);
+        }
+    }
+    (xs, ys)
+}
+
+/// 0.5% tails. One ADC spike was setting the axis and the trace sat on the frame.
+fn robust_span(samples: &[f32]) -> Option<(f32, f32)> {
+    let mut values: Vec<f32> = samples
+        .iter()
+        .copied()
+        .filter(|value| value.is_finite())
+        .collect();
+    if values.len() < 2 {
+        return None;
+    }
+    values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let lo = percentile_sorted(&values, 0.005);
+    let hi = percentile_sorted(&values, 0.995);
+    let pad = ((hi - lo) * 0.06).max(1.0e-4);
+    Some((lo - pad, hi + pad))
+}
+
+const HIST_BINS: usize = 101;
+/// Histogram bars stay translucent so overlaid sessions both stay visible.
+const HIST: [f32; 4] = [0.0, 0.0, 0.0, 0.55];
+
+fn distribution_limits(mode: &str, samples: &[f32]) -> (f32, f32) {
+    if mode == "sigma" {
+        let mut positive: Vec<f32> = samples
+            .iter()
+            .copied()
+            .filter(|value| *value > 0.0)
+            .collect();
+        positive.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let hi = percentile_sorted(&positive, 0.9995).max(1.0);
+        return (0.0, hi);
+    }
+    if mode == "position_error" {
+        let mut abs: Vec<f32> = samples
+            .iter()
+            .copied()
+            .filter(|value| value.is_finite())
+            .map(f32::abs)
+            .collect();
+        abs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let bound = percentile_sorted(&abs, 0.9995).max(1.0);
+        return (-bound, bound);
+    }
+    let mut finite: Vec<f32> = samples
+        .iter()
+        .copied()
+        .filter(|value| value.is_finite())
+        .collect();
+    finite.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    if finite.is_empty() {
+        return (-1.0, 1.0);
+    }
+    let lo = percentile_sorted(&finite, 0.0005);
+    let hi = percentile_sorted(&finite, 0.9995);
+    let mid = 0.5 * (lo + hi);
+    let half = (mid - lo).max(hi - mid).max(0.5);
+    (mid - half, mid + half)
+}
+
+fn percentile_sorted(values: &[f32], p: f32) -> f32 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    let index = ((values.len() - 1) as f32 * p).round() as usize;
+    values[index.min(values.len() - 1)]
+}
+
+fn probability_panel(title: &str, lo: f32, hi: f32, columns: &[&[f32]]) -> Panel {
+    let mut edges = Vec::with_capacity(HIST_BINS + 1);
+    for step in 0..=HIST_BINS {
+        edges.push(lo + (hi - lo) * step as f32 / HIST_BINS as f32);
+    }
+    let mut series = Vec::new();
+    let mut top = 1.0f32;
+    for values in columns {
+        let counts = probability_counts(values, &edges);
+        top = top.max(counts.iter().copied().fold(0.0, f32::max));
+        series.push(Series::Bars {
+            edges: edges.clone(),
+            counts,
+            color: HIST,
+        });
+    }
+    let mut panel = panel(title.to_owned(), lo, hi, 0.0, top, series);
+    panel.y_label = "Probability (%)".into();
+    panel
+}
+
+fn probability_counts(values: &[f32], edges: &[f32]) -> Vec<f32> {
+    let bins = edges.len().saturating_sub(1).max(1);
+    let mut counts = vec![0.0f32; bins];
+    let lo = edges[0];
+    let hi = edges[edges.len() - 1];
+    let width = hi - lo;
+    let mut total = 0.0f32;
+    for value in values.iter().copied() {
+        if !value.is_finite() || value < lo || value > hi || width <= 0.0 {
+            continue;
+        }
+        let index = (((value - lo) / width) * bins as f32) as usize;
+        counts[index.min(bins - 1)] += 1.0;
+        total += 1.0;
+    }
+    if total > 0.0 {
+        for count in &mut counts {
+            *count = 100.0 * *count / total;
+        }
+    }
+    counts
+}
+
+fn grain_table(root: &Path, session: &str, grain: &str) -> BTreeMap<String, Vec<f32>> {
+    if grain == "timeslice" {
+        slice_table(root, session)
+    } else {
+        spot_table(root, session)
+    }
+}
+
+/// Several sessions fade from transparent to their own color. One session uses the chosen ramp.
+fn heat_ramp(sessions: usize, ramp: &str) -> u8 {
+    if sessions > 1 {
+        2
+    } else if ramp == "viridis" {
+        0
+    } else {
+        1
+    }
+}
+
+fn density_map(values: Vec<f32>, ramp: u8) -> Series {
+    let bins = DENSITY_BINS as u32;
+    Series::Heatmap {
+        values,
+        cols: bins,
+        rows: bins,
+        ramp,
+        color: if ramp == 2 {
+            MARK
+        } else {
+            [1.0, 1.0, 1.0, 1.0]
+        },
+        lo: 0.0,
+        hi: 0.0,
+    }
+}
+
+fn density_grid(xs: &[f32], ys: &[f32], x0: f32, x1: f32, y0: f32, y1: f32) -> Vec<f32> {
+    let bins = DENSITY_BINS;
+    let mut counts = vec![0.0f32; bins * bins];
+    let dx = (x1 - x0).max(1e-6);
+    let dy = (y1 - y0).max(1e-6);
+    for (x, y) in xs.iter().zip(ys) {
+        if !x.is_finite() || !y.is_finite() || *x < x0 || *x > x1 || *y < y0 || *y > y1 {
+            continue;
+        }
+        let ix = (((x - x0) / dx) * bins as f32) as usize;
+        let iy = (((y - y0) / dy) * bins as f32) as usize;
+        counts[ix.min(bins - 1) + bins * iy.min(bins - 1)] += 1.0;
+    }
+    counts
+}
+
+fn reference_ring() -> Series {
+    let steps = 64;
+    let mut xs = Vec::with_capacity(steps + 1);
+    let mut ys = Vec::with_capacity(steps + 1);
+    for step in 0..=steps {
+        let angle = step as f32 / steps as f32 * std::f32::consts::TAU;
+        xs.push(angle.cos());
+        ys.push(angle.sin());
+    }
+    guide(xs, ys)
+}
+
+fn padded_span(values: &[f32]) -> (f32, f32) {
+    let mut lo = f32::MAX;
+    let mut hi = f32::MIN;
+    for value in values {
+        if value.is_finite() {
+            lo = lo.min(*value);
+            hi = hi.max(*value);
+        }
+    }
+    if !lo.is_finite() || hi <= lo {
+        return (0.0, 1.0);
+    }
+    let pad = ((hi - lo) * 0.04).max(1e-4);
+    (lo - pad, hi + pad)
+}
+
+fn column_scene(
+    root: &Path,
+    session_ids: &[String],
+    mode: &str,
+    grain: &str,
+    beam: &str,
+    draw: &str,
+    ramp: &str,
+    cutoff: f32,
+) -> (Vec<Panel>, u32) {
+    let mut pairs: Vec<(&str, &str, &str)> = match mode {
+        "position_error" => vec![
+            ("IC1", "ic1_x_err", "ic1_y_err"),
+            ("IC2", "ic2_x_err", "ic2_y_err"),
+        ],
+        "sigma" => vec![
+            ("IC1", "ic1_sig_x", "ic1_sig_y"),
+            ("IC2", "ic2_sig_x", "ic2_sig_y"),
+        ],
+        _ => vec![
+            ("IC1", "ic1_x", "ic1_y"),
+            ("IC2", "ic2_x", "ic2_y"),
+            ("Plan", "plan_x", "plan_y"),
+        ],
+    };
+    let tables: Vec<_> = session_ids
+        .iter()
+        .map(|session| grain_table(root, session, grain))
+        .collect();
+    if mode == "position" {
+        let measured = tables
+            .iter()
+            .any(|table| finite_col(table, "ic1_x").is_some());
+        if measured {
+            pairs.retain(|(_, x_key, _)| *x_key != "plan_x");
+        } else {
+            pairs.retain(|(_, x_key, _)| *x_key == "plan_x");
+        }
+    }
+    let (x_label, y_label) = match mode {
+        "position_error" => ("X Error (mm)", "Y Error (mm)"),
+        "sigma" => ("X Sigma (mm)", "Y Sigma (mm)"),
+        _ => ("X Position (mm)", "Y Position (mm)"),
+    };
+    let mut tops = Vec::new();
+    let mut x_hists = Vec::new();
+    let mut y_hists = Vec::new();
+    for (title, x_key, y_key) in pairs {
+        let mut clouds = Vec::new();
+        for table in &tables {
+            let (xs, ys) = kept_pairs(table, x_key, y_key, beam);
+            if !xs.is_empty() {
+                clouds.push((xs, ys));
+            }
+        }
+        if clouds.is_empty() {
+            continue;
+        }
+        let mut samples = Vec::new();
+        for (xs, ys) in &clouds {
+            samples.extend(xs.iter().copied());
+            samples.extend(ys.iter().copied());
+        }
+        let (lo, hi) = distribution_limits(mode, &samples);
+        let mut series = Vec::new();
+        if mode == "position_error" {
+            series.push(guide(vec![lo, hi], vec![0.0, 0.0]));
+            series.push(guide(vec![0.0, 0.0], vec![lo, hi]));
+            series.push(reference_ring());
+        }
+        let ramp_id = heat_ramp(session_ids.len(), ramp);
+        match draw {
+            "density" => {
+                for (xs, ys) in &clouds {
+                    series.push(density_map(density_grid(xs, ys, lo, hi, lo, hi), ramp_id));
+                }
+            }
+            "contour" => {
+                for (xs, ys) in &clouds {
+                    series.extend(contour_bands(xs, ys, cutoff));
+                }
+            }
+            _ => {
+                for (xs, ys) in &clouds {
+                    series.push(Series::Points {
+                        xs: xs.clone(),
+                        ys: ys.clone(),
+                        color: MARK,
+                        radius: 2.0,
+                    });
+                }
+            }
+        }
+        let mut top = panel(title.to_owned(), lo, hi, lo, hi, series);
+        top.equal = true;
+        tops.push(top);
+        let xs: Vec<&[f32]> = clouds.iter().map(|(xs, _)| xs.as_slice()).collect();
+        let ys: Vec<&[f32]> = clouds.iter().map(|(_, ys)| ys.as_slice()).collect();
+        x_hists.push(probability_panel(x_label, lo, hi, &xs));
+        y_hists.push(probability_panel(y_label, lo, hi, &ys));
+    }
+    let columns = tops.len() as u32;
+    tops.extend(x_hists);
+    tops.extend(y_hists);
+    (tops, columns)
+}
+
+fn confidence_scene(
+    root: &Path,
+    session_ids: &[String],
+    beam: &str,
+    draw: &str,
+    ramp: &str,
+    cutoff: f32,
+) -> Vec<Panel> {
+    let axes = [
+        ("IC1 X", "ic1_x_peak", "ic1_x_confidence"),
+        ("IC1 Y", "ic1_y_peak", "ic1_y_confidence"),
+        ("IC2 X", "ic2_x_peak", "ic2_x_confidence"),
+        ("IC2 Y", "ic2_y_peak", "ic2_y_confidence"),
+    ];
+    let mut panels = Vec::new();
+    for (title, peak_key, conf_key) in axes {
+        let mut clouds = Vec::new();
+        for session in session_ids {
+            let mut peaks = timeslice_metric(root, session, "peak_amplitude");
+            let mut confidence = timeslice_metric(root, session, "fit_confidence");
+            apply_filter(&mut peaks, &[peak_key], "all", beam);
+            apply_filter(&mut confidence, &[conf_key], "all", beam);
+            let (xs, ys) = finite_pairs(
+                peaks.get(peak_key).map(Vec::as_slice).unwrap_or(&[]),
+                confidence.get(conf_key).map(Vec::as_slice).unwrap_or(&[]),
+            );
+            if !xs.is_empty() {
+                clouds.push((xs, ys));
+            }
+        }
+        if clouds.is_empty() {
+            continue;
+        }
+        if draw == "density" || draw == "contour" {
+            let mut all_x = Vec::new();
+            let mut all_y = Vec::new();
+            for (xs, ys) in &clouds {
+                all_x.extend(xs.iter().copied());
+                all_y.extend(ys.iter().copied());
+            }
+            let (x0, x1) = padded_span(&all_x);
+            let (y0, y1) = padded_span(&all_y);
+            let series = if draw == "density" {
+                let ramp_id = heat_ramp(session_ids.len(), ramp);
+                clouds
+                    .iter()
+                    .map(|(xs, ys)| density_map(density_grid(xs, ys, x0, x1, y0, y1), ramp_id))
+                    .collect()
+            } else {
+                let mut series = Vec::new();
+                for (xs, ys) in &clouds {
+                    series.extend(contour_bands(xs, ys, cutoff));
+                }
+                series
+            };
+            if !series.is_empty() {
+                panels.push(panel(title.to_owned(), x0, x1, y0, y1, series));
+            }
+            continue;
+        }
+        let series = clouds
+            .into_iter()
+            .map(|(xs, ys)| Series::Points {
                 xs,
                 ys,
-                color: BLUE,
+                color: MARK,
                 radius: 2.0,
-            }],
-        ));
+            })
+            .collect();
+        panels.push(placed(title.to_owned(), series));
     }
     panels
 }
 
-fn coverage_panels(
-    session: &str,
-    columns: &BTreeMap<String, Vec<f32>>,
-    state: BeamState,
-) -> Vec<Panel> {
+fn coverage_scene(root: &Path, session_ids: &[String], beam: &str) -> Vec<Panel> {
     let thresholds: Vec<f32> = (0..=400).map(|step| step as f32 * 0.25).collect();
-    let gate = col(columns, "rci_in_trigger").or_else(|| col(columns, "r_beamOk"));
     let mut panels = Vec::new();
-    for (label, x_name, y_name) in [
-        ("IC1", "r_ic1_x_confidence", "r_ic1_y_confidence"),
-        ("IC2", "r_ic2_x_confidence", "r_ic2_y_confidence"),
+    for (title, x_key, y_key) in [
+        ("IC1 Coverage", "ic1_x_confidence", "ic1_y_confidence"),
+        ("IC2 Coverage", "ic2_x_confidence", "ic2_y_confidence"),
     ] {
-        let metrics = spot_coverage_metrics(
-            col(columns, "spot_no"),
-            col(columns, x_name),
-            col(columns, y_name),
-            gate,
-            state,
-        );
-        if metrics.is_empty() {
-            continue;
+        let mut series = Vec::new();
+        for session in session_ids {
+            let mut table = timeslice_metric(root, session, "fit_confidence");
+            apply_filter(&mut table, &[x_key, y_key], "all", beam);
+            let metrics = spot_coverage_metrics(
+                None,
+                col(&table, x_key),
+                col(&table, y_key),
+                None,
+                BeamState::All,
+            );
+            if metrics.is_empty() {
+                continue;
+            }
+            series.push(stroke(
+                thresholds.clone(),
+                coverage_percent(&metrics, &thresholds),
+                false,
+            ));
         }
-        let percent = coverage_percent(&metrics, &thresholds);
-        panels.push(line_panel(
-            format!("{session} {label} coverage"),
-            &thresholds,
-            &percent,
-            BLUE,
-        ));
+        if drew_line(&series) {
+            panels.push(placed(title.to_owned(), series));
+        }
     }
     panels
+}
+
+struct Motion {
+    x: Vec<f32>,
+    y: Vec<f32>,
+    x2: Vec<f32>,
+    y2: Vec<f32>,
+    energy: Vec<f32>,
+    on: Vec<bool>,
+}
+
+fn motion_columns(root: &Path, session: &str) -> Option<Motion> {
+    let slice = slice_table(root, session);
+    if finite_col(&slice, "ic1_x_err").is_some() {
+        let x = col(&slice, "ic1_x_err")?.to_vec();
+        let y = finite_col(&slice, "ic1_y_err").unwrap_or(&[]).to_vec();
+        let x2 = finite_col(&slice, "ic2_x_err").unwrap_or(&[]).to_vec();
+        let y2 = finite_col(&slice, "ic2_y_err").unwrap_or(&[]).to_vec();
+        let energy = col(&slice, "energy").unwrap_or(&[]).to_vec();
+        let on = beam_flags(col(&slice, "beam_on"), x.len());
+        return Some(Motion {
+            x,
+            y,
+            x2,
+            y2,
+            energy,
+            on,
+        });
+    }
+    let raw = load_timeslice(root, session);
+    let x = col(&raw, "position_error_x")?.to_vec();
+    if x.is_empty() {
+        return None;
+    }
+    let y = finite_col(&raw, "position_error_y").unwrap_or(&[]).to_vec();
+    let x2 = finite_col(&raw, "position_error_x2")
+        .unwrap_or(&[])
+        .to_vec();
+    let y2 = finite_col(&raw, "position_error_y2")
+        .unwrap_or(&[])
+        .to_vec();
+    let energy = sample_energy(root, session, &raw, x.len());
+    let gate = col(&raw, "rci_in_trigger").or_else(|| col(&raw, "r_beamOk"));
+    let on = gate
+        .map(beam_on_mask)
+        .unwrap_or_else(|| vec![true; x.len()]);
+    Some(Motion {
+        x,
+        y,
+        x2,
+        y2,
+        energy,
+        on,
+    })
+}
+
+fn beam_flags(gate: Option<&[f32]>, n: usize) -> Vec<bool> {
+    match gate {
+        Some(values) if values.len() == n => values.iter().map(|value| *value > 0.5).collect(),
+        _ => vec![true; n],
+    }
 }
 
 fn spot_coverage_metrics(
@@ -1472,31 +1774,6 @@ fn spot_coverage_metrics(
         .collect()
 }
 
-fn sum_ic3_quads(columns: &BTreeMap<String, Vec<f32>>) -> Option<Vec<f32>> {
-    let parts: Vec<&[f32]> = [
-        "ic3_current_a",
-        "ic3_current_b",
-        "ic3_current_c",
-        "ic3_current_d",
-    ]
-    .into_iter()
-    .filter_map(|name| col(columns, name))
-    .collect();
-    if parts.is_empty() {
-        return None;
-    }
-    let n = parts.iter().map(|part| part.len()).max().unwrap_or(0);
-    let mut out = vec![0.0f32; n];
-    for part in parts {
-        for (i, value) in part.iter().enumerate() {
-            if value.is_finite() {
-                out[i] += value;
-            }
-        }
-    }
-    Some(out)
-}
-
 fn sample_energy(
     root: &Path,
     session: &str,
@@ -1567,8 +1844,11 @@ fn series_span(series: &[Series]) -> (f32, f32, f32, f32) {
     let mut ymin = f32::MAX;
     let mut ymax = f32::MIN;
     for item in series {
-        let Series::Polyline { xs, ys, .. } = item else {
-            continue;
+        let (xs, ys) = match item {
+            Series::Polyline { xs, ys, .. }
+            | Series::Points { xs, ys, .. }
+            | Series::Guide { xs, ys, .. } => (xs, ys),
+            _ => continue,
         };
         for (x, y) in xs.iter().zip(ys) {
             if x.is_finite() && y.is_finite() {
@@ -1584,41 +1864,6 @@ fn series_span(series: &[Series]) -> (f32, f32, f32, f32) {
     } else {
         (xmin, xmax, ymin, ymax)
     }
-}
-
-fn select_pairs(
-    xs: &[f32],
-    ys: &[f32],
-    gate: Option<&[f32]>,
-    state: BeamState,
-) -> (Vec<f32>, Vec<f32>) {
-    let n = xs.len().min(ys.len());
-    let on = gate.filter(|values| values.len() == n).map(beam_on_mask);
-    let mut kept_x = Vec::new();
-    let mut kept_y = Vec::new();
-    for i in 0..n {
-        if !xs[i].is_finite() || !ys[i].is_finite() {
-            continue;
-        }
-        let keep = match state {
-            BeamState::All => true,
-            BeamState::On => on
-                .as_ref()
-                .and_then(|mask| mask.get(i))
-                .copied()
-                .unwrap_or(true),
-            BeamState::Off => !on
-                .as_ref()
-                .and_then(|mask| mask.get(i))
-                .copied()
-                .unwrap_or(false),
-        };
-        if keep {
-            kept_x.push(xs[i]);
-            kept_y.push(ys[i]);
-        }
-    }
-    (kept_x, kept_y)
 }
 
 fn ramp_window(samples: &[f32], edge: usize) -> Option<Vec<f32>> {
@@ -1713,7 +1958,7 @@ mod tests {
         )
         .unwrap();
         let mut timeslice = String::from(
-            "r_ic1_current_dose,rci_in_trigger,ic1_peak_amplitude_x,ic1_peak_amplitude_y,ic2_peak_amplitude_x,ic2_peak_amplitude_y,position_error_x,field_x,field_y\n",
+            "r_ic1_current_dose,rci_in_trigger,ic1_peak_amplitude_x,ic1_peak_amplitude_y,ic2_peak_amplitude_x,ic2_peak_amplitude_y,position_error_x,field_x,field_y,c_x,r_xV\n",
         );
         for i in 0..32 {
             let on = if (8..24).contains(&i) { 1 } else { 0 };
@@ -1722,9 +1967,11 @@ mod tests {
             } else {
                 (24 - i).max(0) as f32 * 0.05
             };
+            let cmd = i as f32 * 0.1;
             timeslice.push_str(&format!(
-                "{current},{on},{current},{current},1,1,{err},0.{i},0.2\n",
-                err = (i as f32) * 0.01
+                "{current},{on},{current},{current},1,1,{err},0.{i},0.2,{cmd},{read}\n",
+                err = (i as f32) * 0.01,
+                read = cmd + 0.05
             ));
         }
         std::fs::write(
@@ -1780,8 +2027,8 @@ mod tests {
         let scene =
             analysis_scene("session_log_compare", &root, &["sess".into()], &json!({})).unwrap();
         let table = scene.table.unwrap();
-        assert!(table.rows.iter().any(|row| row[1] == "ERROR"));
-        assert!(table.rows.iter().any(|row| row[1] == "TIMELINE"));
+        assert!(table.rows.iter().any(|row| row[1] == "Errors"));
+        assert!(table.rows.iter().any(|row| row[1] == "Timeline"));
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1824,9 +2071,124 @@ mod tests {
     fn sk_req_015_distribution_exposes_spot_modes() {
         let scene = scene_of("distribution");
         assert!(has_kind(&scene, "points"));
-        assert!(scene.controls.iter().any(|control| control.id == "mode"));
-        assert!(scene.controls.iter().any(|control| control.id == "draw"));
-        assert!(scene.controls.iter().any(|control| control.id == "beam"));
+        assert!(has_kind(&scene, "bars"));
+        assert!(scene
+            .panels
+            .iter()
+            .any(|panel| panel.title == "X Position (mm)"));
+        assert!(scene
+            .panels
+            .iter()
+            .any(|panel| panel.title == "Y Position (mm)"));
+        assert!(scene
+            .controls
+            .iter()
+            .any(|control| control.id == "mode" && control.value == "Position"));
+        assert!(scene
+            .controls
+            .iter()
+            .any(|control| control.id == "draw" && control.value == "Scatter"));
+        assert!(scene
+            .controls
+            .iter()
+            .any(|control| control.id == "beam" && control.value == "Both"));
+        assert!(scene
+            .controls
+            .iter()
+            .any(|control| control.id == "grain" && control.value == "Spot"));
+        assert!(scene.controls.iter().any(|control| control.id == "draw"
+            && control.options.iter().any(|option| option == "Contour")));
+        assert!(scene
+            .panels
+            .iter()
+            .filter(|panel| panel.y_label.is_empty())
+            .all(|panel| panel.equal));
+    }
+
+    #[test]
+    fn position_error_ring_has_radius_one_mm() {
+        let Series::Guide { xs, ys, .. } = reference_ring() else {
+            panic!("ring");
+        };
+        assert!(xs.len() >= 32);
+        for (x, y) in xs.iter().zip(ys) {
+            let radius = (x * x + y * y).sqrt();
+            assert!((radius - 1.0).abs() < 1.0e-4, "{radius}");
+        }
+    }
+
+    #[test]
+    fn distribution_density_overlays_sessions_on_one_column() {
+        let root = std::env::temp_dir().join(format!("scan-kit-density-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        write_session(&root);
+        let from = root.join("sess");
+        let to = root.join("sess-b");
+        std::fs::create_dir_all(&to).unwrap();
+        for name in ["input_map.csv", "spot_data.csv"] {
+            std::fs::copy(from.join(name), to.join(name)).unwrap();
+        }
+        let scene = analysis_scene(
+            "distribution",
+            &root,
+            &["sess".into(), "sess-b".into()],
+            &json!({"draw": "Density"}),
+        )
+        .unwrap();
+        let tops: Vec<_> = scene
+            .panels
+            .iter()
+            .filter(|panel| panel.y_label.is_empty())
+            .collect();
+        assert_eq!(scene.columns as usize, tops.len());
+        assert!(tops.iter().all(|panel| panel.equal));
+        assert!(tops.iter().all(|panel| !panel.title.contains("sess")));
+        assert!(tops.iter().any(|panel| {
+            panel
+                .series
+                .iter()
+                .filter(|series| matches!(series, Series::Heatmap { ramp: 2, .. }))
+                .count()
+                == 2
+        }));
+        assert_eq!(
+            scene
+                .panels
+                .iter()
+                .filter(|panel| panel.title == "X Position (mm)")
+                .count(),
+            1
+        );
+        assert!(scene.controls.iter().all(|control| control.id != "ramp"));
+        let one = analysis_scene(
+            "distribution",
+            &root,
+            &["sess".into()],
+            &json!({"draw": "Density"}),
+        )
+        .unwrap();
+        assert!(one
+            .controls
+            .iter()
+            .any(|control| control.id == "ramp" && control.value == "Turbo"));
+        assert!(one.panels.iter().any(|panel| {
+            panel
+                .series
+                .iter()
+                .any(|series| matches!(series, Series::Heatmap { ramp: 1, .. }))
+        }));
+        let contour = analysis_scene(
+            "distribution",
+            &root,
+            &["sess".into()],
+            &json!({"draw": "Contour"}),
+        )
+        .unwrap();
+        assert!(contour
+            .controls
+            .iter()
+            .any(|control| control.id == "cutoff" && control.value == "5"));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -1853,14 +2215,42 @@ mod tests {
         assert!(ic1.x_labels.iter().any(|label| label == "70"));
         let replay = scene_of("timeslice_replay");
         assert!(has_kind(&replay, "line"));
-        assert!(replay.controls.iter().any(|control| control.id == "scrub"));
+        assert_eq!(replay.columns, 1);
+        assert!(replay.panels.iter().any(|panel| panel.title == "Overview"));
+        assert!(replay.panels.iter().any(|panel| panel.title == "Detail"));
+        assert!(replay.panels.iter().all(|panel| panel.xmax < 1.0));
+        assert!(replay
+            .panels
+            .iter()
+            .any(|panel| panel.y_label == "IC1 Current"));
+        assert!(replay.controls.iter().all(|control| control.id != "scrub"));
+    }
+
+    #[test]
+    fn replay_axis_ignores_a_single_spike() {
+        let mut samples = vec![1.0f32; 400];
+        samples[3] = 10_000.0;
+        let (lo, hi) = robust_span(&samples).unwrap();
+        assert!(hi < 10.0, "{hi}");
+        assert!(lo < 2.0);
+    }
+
+    #[test]
+    fn replay_overview_keeps_a_narrow_pulse() {
+        let mut samples = vec![0.0f32; 10_000];
+        samples[5000] = 40.0;
+        let (_, ys) = envelope(&samples, 480);
+        assert!(ys.iter().copied().any(|value| value > 30.0));
     }
 
     #[test]
     fn sk_req_018_fft_and_audio_share_the_spectrum() {
-        assert!(has_kind(&scene_of("ic_fft_analysis"), "line"));
+        let fft = scene_of("ic_fft_analysis");
+        assert!(has_kind(&fft, "line"));
+        assert!(fft.panels.iter().any(|panel| panel.y_label == "log10 PSD"));
         let audio = scene_of("ic_audio_player");
         assert!(!audio.samples.is_empty());
+        assert_eq!(audio.title, "Audio Explorer");
     }
 
     #[test]
@@ -1892,6 +2282,103 @@ mod tests {
             .panels
             .iter()
             .any(|panel| panel.title.contains("coronal")));
+        assert!(scene.panels.iter().any(|panel| {
+            panel.series.iter().any(|series| {
+                matches!(
+                    series,
+                    Series::Heatmap {
+                        ramp: 1,
+                        lo: 0.0,
+                        ..
+                    }
+                )
+            })
+        }));
+        assert!(scene.controls.iter().any(|control| control.id == "scale"));
+    }
+
+    #[test]
+    fn dose_volume_difference_drops_a_sequential_scale() {
+        let root = std::env::temp_dir().join(format!("scan-kit-dose-diff-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        write_session(&root);
+        let scene = analysis_scene(
+            "dose_volume",
+            &root,
+            &["sess".into()],
+            &json!({"compare": "Difference", "scale": "Turbo"}),
+        )
+        .unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(scene
+            .controls
+            .iter()
+            .any(|control| { control.id == "scale" && control.value == "Managua" }));
+        assert!(scene.panels.iter().any(|panel| {
+            panel
+                .series
+                .iter()
+                .any(|series| matches!(series, Series::Heatmap { ramp: 10, .. }))
+        }));
+        assert!(scene
+            .panels
+            .iter()
+            .any(|panel| panel.title.contains("gamma") && panel.title.contains('%')));
+    }
+
+    #[test]
+    fn patient_ct_adds_dvh_gamma_and_a_fraction_control() {
+        let root =
+            std::env::temp_dir().join(format!("scan-kit-patient-view-{}", std::process::id()));
+        let study = root.join("study");
+        let _ = std::fs::remove_dir_all(&root);
+        write_session(&root);
+        scan_kit_dicom::write_water_study(&study).unwrap();
+        let scene = crate::dose_volume(
+            &root,
+            &["sess".into()],
+            &serde_json::json!({"study": study.display().to_string(), "model": "Monte Carlo"}),
+            Some(&|job| {
+                let scan_kit_core::McJob::Patient(request) = job else {
+                    return Err("expected a patient job".into());
+                };
+                assert!(request.dose_to_water);
+                assert_eq!(request.seed, 1);
+                assert_eq!(request.material.len(), 32);
+                assert!(request.protons.iter().any(|weight| *weight > 0.0));
+                Ok(scan_kit_core::McResult {
+                    volume: scan_kit_core::Volume {
+                        origin: request.origin_mm,
+                        shape: request.shape,
+                        voxel: request.spacing_mm[0],
+                        values: vec![1.0; request.material.len()],
+                    },
+                    uncertainty: 0.0,
+                    ledger: [1.0, 1.0, 0.0, 0.0, 0.0, 0.0],
+                })
+            }),
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(scene
+            .controls
+            .iter()
+            .any(|control| control.id == "fraction"));
+        assert!(scene.panels.iter().any(|panel| panel.title.contains("DVH")));
+        assert!(scene
+            .panels
+            .iter()
+            .any(|panel| panel.title.contains("gamma") && panel.title.contains('%')));
+        assert!(scene.table.as_ref().is_some_and(|table| {
+            table.rows.iter().any(|row| {
+                row.iter()
+                    .any(|cell| cell.contains("Gamma") || cell.contains("PTV"))
+            })
+        }));
+        let plain = scene_of("dose_volume");
+        assert!(plain
+            .controls
+            .iter()
+            .all(|control| control.id != "fraction"));
     }
 
     #[test]

@@ -141,4 +141,12 @@
   body {
     @apply bg-background text-foreground;
     }
+  button:not(:disabled):not([aria-disabled="true"]),
+  [role="combobox"]:not([aria-disabled="true"]),
+  [role="checkbox"]:not(:disabled),
+  [role="option"],
+  [role="menuitem"],
+  label[for] {
+    cursor: pointer;
+    }
 }

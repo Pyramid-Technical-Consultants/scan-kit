@@ -548,7 +548,9 @@ pub fn mip_xy(grid: &[f32], shape: [usize; 3]) -> Vec<f32> {
     image
 }
 
-/// Global gamma on a coarse offset set. Returns `(gamma, passed, evaluated)`.
+/// Global 3D gamma. `cutoff_pct` is a percent of the maximum of `evaluated`
+/// (TG-218), not an absolute dose. The search is sub-voxel and stops at γ = 2.
+/// Returns `(gamma, passed, evaluated)`.
 pub fn gamma_index(
     reference: &[f32],
     evaluated: &[f32],
@@ -556,75 +558,17 @@ pub fn gamma_index(
     dose_percent: f32,
     distance_mm: f32,
     spacing: [f32; 3],
-    cutoff: f32,
+    cutoff_pct: f32,
 ) -> (Vec<f32>, u32, u32) {
-    let [nx, ny, nz] = shape;
-    let n = nx * ny * nz;
-    let mut gamma = vec![0.0f32; n.min(reference.len()).min(evaluated.len())];
-    let dose_tol = dose_percent.max(1e-6) / 100.0;
-    let mut norm = 0.0f32;
-    for value in evaluated.iter().take(gamma.len()) {
-        if value.is_finite() {
-            norm = norm.max(*value);
-        }
-    }
-    let dd = (dose_tol * norm).max(1e-6);
-    let reach = [
-        (distance_mm / spacing[0]).ceil() as i32,
-        (distance_mm / spacing[1]).ceil() as i32,
-        (distance_mm / spacing[2]).ceil() as i32,
-    ];
-    let mut passed = 0u32;
-    let mut scored = 0u32;
-    for z in 0..nz {
-        for y in 0..ny {
-            for x in 0..nx {
-                let i = x + nx * (y + ny * z);
-                if i >= gamma.len() {
-                    continue;
-                }
-                let r = reference[i];
-                if !r.is_finite() || r <= 0.0 || r < cutoff {
-                    continue;
-                }
-                scored += 1;
-                let mut best = 4.0f32;
-                for dz in -reach[2]..=reach[2] {
-                    for dy in -reach[1]..=reach[1] {
-                        for dx in -reach[0]..=reach[0] {
-                            let xx = x as i32 + dx;
-                            let yy = y as i32 + dy;
-                            let zz = z as i32 + dz;
-                            if xx < 0
-                                || yy < 0
-                                || zz < 0
-                                || xx >= nx as i32
-                                || yy >= ny as i32
-                                || zz >= nz as i32
-                            {
-                                continue;
-                            }
-                            let j = xx as usize + nx * (yy as usize + ny * zz as usize);
-                            let dist2 = (dx as f32 * spacing[0] / distance_mm).powi(2)
-                                + (dy as f32 * spacing[1] / distance_mm).powi(2)
-                                + (dz as f32 * spacing[2] / distance_mm).powi(2);
-                            if dist2 >= best {
-                                continue;
-                            }
-                            let dose = (evaluated[j] - r) / dd;
-                            best = best.min(dist2 + dose * dose);
-                        }
-                    }
-                }
-                let g = best.sqrt();
-                gamma[i] = g;
-                if g <= 1.0 {
-                    passed += 1;
-                }
-            }
-        }
-    }
-    (gamma, passed, scored)
+    crate::dose::gamma_index(
+        reference,
+        evaluated,
+        shape,
+        dose_percent,
+        distance_mm,
+        spacing,
+        cutoff_pct,
+    )
 }
 
 /// True once a sample is `settle` steps after the last change larger than `tol`.
@@ -1374,6 +1318,20 @@ mod tests {
         );
         assert_eq!(scored, 3);
         assert_eq!(passed, 3);
+        let shape = [9usize, 1, 1];
+        let mut reference = vec![0.0f32; 9];
+        reference[4] = 1.0;
+        let mut near = vec![0.0f32; 9];
+        near[5] = 1.0;
+        let mut far = vec![0.0f32; 9];
+        far[7] = 1.0;
+        let (_g, passed, scored) =
+            gamma_index(&reference, &near, shape, 3.0, 2.0, [1.0, 1.0, 1.0], 10.0);
+        assert_eq!((scored, passed), (1, 1));
+        let (gamma, passed, _) =
+            gamma_index(&reference, &far, shape, 3.0, 2.0, [1.0, 1.0, 1.0], 10.0);
+        assert_eq!(passed, 0);
+        assert!((gamma[4] - 1.5).abs() < 1e-3, "{}", gamma[4]);
         let (edges, curve) = dvh(&[0.0, 1.0, 2.0], &[true, true, true], 2);
         assert!(edges.len() >= 2);
         assert!((curve[0] - 1.0).abs() < 1e-4);

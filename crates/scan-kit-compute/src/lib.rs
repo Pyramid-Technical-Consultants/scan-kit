@@ -2,7 +2,10 @@
 //! `scan-kit-plot`. These two crates are the only ones that link `wgpu`.
 
 mod kernels;
+mod mc;
 mod present;
+
+pub use mc::run_mc;
 
 pub use kernels::compile_scientific_shaders;
 pub use present::{invoke, open_plot, run_view, tool_input_schema, tools};

@@ -13,13 +13,14 @@ import {
 } from "@glideapps/glide-data-grid";
 
 import { controlDisabled, controlSections, segmentChoices, type ControlSlot } from "@/analysis-controls";
+import { AnalysisMenu, analysisId, analysisName } from "@/analysis-menu";
 import { ButtonSegmentGroup } from "@/components/button-segment-group";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
-import { Field, FieldLabel, FieldLegend, FieldSet } from "@/components/ui/field";
+import { Field, FieldContent, FieldDescription, FieldLabel, FieldLegend, FieldSet } from "@/components/ui/field";
 import { optionIcon } from "@/option-icons";
 import { backingSize, plotHeader, type PlotHeader, type ViewControl } from "@/plot-header";
-import { sessionColor } from "@/session-colors";
+import { sessionColor, shownSessionIds } from "@/session-colors";
 import { dismissNotice, notifyError } from "@/notify";
 import {
   Select,
@@ -75,9 +76,8 @@ function parseColor(value: string): [number, number, number, number] {
   return [pixel[0] / 255, pixel[1] / 255, pixel[2] / 255, pixel[3] / 255];
 }
 
-function palette(sessionIds: readonly string[]): number[][] {
-  const count = Math.max(sessionIds.length, 1);
-  return Array.from({ length: count }, (_, index) => parseColor(sessionColor(index)));
+function palette(order: readonly string[], shown: readonly string[]): number[][] {
+  return shown.map((id) => parseColor(sessionColor(Math.max(0, order.indexOf(id)))));
 }
 
 function gridTheme(): Theme {
@@ -157,7 +157,7 @@ function messageOf(reason: unknown): string {
 }
 
 const SIDE_MIN = 220;
-const SIDE_DEFAULT = 350;
+const SIDE_DEFAULT = 420;
 const PLOT_MIN = 240;
 
 function clampSide(parentWidth: number, next: number): number {
@@ -189,7 +189,7 @@ function ChoiceSelect({
         }
       }}
     >
-      <SelectTrigger className="w-full">
+      <SelectTrigger size="sm" className="w-full cursor-pointer">
         {Icon == null ? null : <Icon />}
         <SelectValue />
       </SelectTrigger>
@@ -213,13 +213,15 @@ function ChoiceSelect({
 export function AnalysisView({
   viewId,
   folder,
-  sessionIds,
+  sessions,
   onBack,
+  onOpenView,
 }: {
   viewId: string;
   folder: string;
-  sessionIds: string[];
+  sessions: readonly { id: string; note: string }[];
   onBack: () => void;
+  onOpenView: (viewId: string) => void;
 }) {
   const shell = useRef<HTMLDivElement>(null);
   const host = useRef<HTMLDivElement>(null);
@@ -229,7 +231,10 @@ export function AnalysisView({
   const frame = useRef(0);
   const openSeq = useRef(0);
   const [options, setOptions] = useState<Record<string, string>>({});
+  const [hidden, setHidden] = useState<string[]>([]);
   const [meta, setMeta] = useState<PlotHeader | null>(null);
+  const [plotError, setPlotError] = useState<string | null>(null);
+  const [studyPath, setStudyPath] = useState<string | null>(null);
   const [study, setStudy] = useState<string | null>(null);
   const [size, setSize] = useState({ width: 960, height: 640 });
   const [sideWidth, setSideWidth] = useState(SIDE_DEFAULT);
@@ -338,24 +343,32 @@ export function AnalysisView({
     }
   }, [shown]);
 
+  const orderKey = sessions.map((session) => session.id).join("\0");
+  const hiddenKey = hidden.join("\0");
   useEffect(() => {
     const ticket = openSeq.current + 1;
     openSeq.current = ticket;
+    const order = orderKey === "" ? [] : orderKey.split("\0");
+    const shown = shownSessionIds(order, hiddenKey === "" ? [] : hiddenKey.split("\0"));
+    const plotOptions =
+      viewId === "dose_volume" && studyPath != null ? { ...options, study: studyPath } : options;
     const timer = window.setTimeout(() => {
+      setPlotError(null);
       void invoke<ArrayBuffer | Uint8Array>("scan_kit_open_plot", {
         view: viewId,
         path: folder,
-        sessionIds,
-        options,
+        sessionIds: shown,
+        options: plotOptions,
         background: parseColor(tokenColor("--background")),
         foreground: parseColor(tokenColor("--foreground")),
-        palette: palette(sessionIds),
+        palette: palette(order, shown),
       })
         .then((result) => {
           if (openSeq.current !== ticket) {
             return;
           }
           const bytes = result instanceof Uint8Array ? result : new Uint8Array(result);
+          setPlotError(null);
           setMeta(plotHeader(bytes));
           payload.current = bytes;
           loadPayload();
@@ -363,12 +376,14 @@ export function AnalysisView({
         })
         .catch((reason: unknown) => {
           if (openSeq.current === ticket) {
-            notifyError(messageOf(reason), "analysis");
+            const message = messageOf(reason);
+            setPlotError(message);
+            notifyError(message, "analysis");
           }
         });
     }, 150);
     return () => window.clearTimeout(timer);
-  }, [viewId, folder, sessionIds, options]);
+  }, [viewId, folder, orderKey, hiddenKey, options, studyPath]);
 
   useEffect(() => {
     const node = canvas.current;
@@ -487,33 +502,30 @@ export function AnalysisView({
     const value = resolved[slot.id] ?? control.value;
     const label = slot.label ?? control.label;
     const disabled = controlDisabled(slot.id, resolved);
-    if (slot.kind !== "check" && segmentChoices(control.options)) {
-      return (
-        <div key={slot.id} className="flex items-center gap-2">
-          <FieldLabel className="w-28 shrink-0 whitespace-nowrap">{label}</FieldLabel>
-          <ButtonSegmentGroup
-            options={control.options}
-            value={value}
-            disabled={disabled}
-            onChange={(next) => apply(slot.id, next)}
-          />
-        </div>
-      );
-    }
     if (slot.kind === "check") {
       return (
         <Field key={slot.id} orientation="horizontal" className={disabled ? "opacity-50" : undefined}>
           <Checkbox
             id={`analysis-${slot.id}`}
+            className="cursor-pointer"
             checked={value === "On"}
             disabled={disabled}
             onCheckedChange={(checked) => apply(slot.id, checked ? "On" : "Off")}
           />
-          <FieldLabel htmlFor={`analysis-${slot.id}`}>{label}</FieldLabel>
+          <FieldLabel className="cursor-pointer" htmlFor={`analysis-${slot.id}`}>
+            {label}
+          </FieldLabel>
         </Field>
       );
     }
-    const select = (
+    const widget = segmentChoices(control.options) ? (
+      <ButtonSegmentGroup
+        options={control.options}
+        value={value}
+        disabled={disabled}
+        onChange={(next) => apply(slot.id, next)}
+      />
+    ) : (
       <ChoiceSelect
         control={control}
         value={value}
@@ -522,13 +534,17 @@ export function AnalysisView({
       />
     );
     if (slot.kind === "bare") {
-      return <div key={slot.id}>{select}</div>;
+      return <div key={slot.id}>{widget}</div>;
     }
     return (
-      <div key={slot.id} className="flex items-center gap-2">
-        <FieldLabel className="w-28 shrink-0 whitespace-nowrap">{label}</FieldLabel>
-        <div className="min-w-0 flex-1">{select}</div>
-      </div>
+      <Field
+        key={slot.id}
+        orientation="horizontal"
+        className={disabled ? "opacity-50" : undefined}
+      >
+        <FieldLabel className="flex-none! shrink-0 whitespace-nowrap">{label}</FieldLabel>
+        <div className="min-w-0 flex-1">{widget}</div>
+      </Field>
     );
   };
 
@@ -546,6 +562,11 @@ export function AnalysisView({
             rowMarkers="none"
           />
         ) : null}
+        {shown ? null : (
+          <div className="text-muted-foreground flex flex-1 items-center justify-center px-6 text-center text-sm">
+            {plotError ?? "Loading plot…"}
+          </div>
+        )}
         <div className={shown ? "relative min-h-0 flex-1" : "hidden"}>
           <canvas ref={canvas} className="absolute inset-0 h-full w-full touch-none" />
         </div>
@@ -568,13 +589,63 @@ export function AnalysisView({
         }}
       />
       <aside style={{ width: sideWidth }} className="flex min-h-0 shrink-0 flex-col">
-        <div className="shrink-0 p-3 pb-0">
-          <Button type="button" variant="outline" className="w-full" onClick={onBack}>
+        <div className="flex shrink-0 items-center gap-2 p-3 pb-0">
+          <Button type="button" variant="outline" className="min-w-0 flex-1" onClick={onBack}>
             <ArrowLeft />
             Sessions
           </Button>
+          <AnalysisMenu
+            omit={analysisName(viewId)}
+            onOpen={(name) => {
+              const id = analysisId(name);
+              if (id != null) {
+                onOpenView(id);
+              }
+            }}
+          />
         </div>
         <div className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto p-3">
+        <FieldSet className="gap-2 rounded-lg border border-border p-3">
+          <FieldLegend variant="label">Sessions</FieldLegend>
+          {sessions.map((session, index) => {
+            const checked = !hidden.includes(session.id);
+            const color = sessionColor(index);
+            const inputId = `analysis-session-${session.id}`;
+            return (
+              <Field key={session.id} orientation="horizontal">
+                <Checkbox
+                  id={inputId}
+                  className="cursor-pointer"
+                  checked={checked}
+                  aria-label={`Include ${session.id}`}
+                  title={
+                    checked
+                      ? `Session color in plots: ${color}`
+                      : `Hidden. Check to draw ${session.id} in ${color}`
+                  }
+                  style={
+                    checked
+                      ? { backgroundColor: color, borderColor: color, color: "#fff" }
+                      : { borderColor: color }
+                  }
+                  onCheckedChange={(next) => {
+                    setHidden((current) =>
+                      next ? current.filter((id) => id !== session.id) : [...current, session.id],
+                    );
+                  }}
+                />
+                <FieldContent className="min-w-0">
+                  <FieldLabel htmlFor={inputId} className="w-full cursor-pointer truncate">
+                    {session.id}
+                  </FieldLabel>
+                  {session.note === "" ? null : (
+                    <FieldDescription className="truncate">{session.note}</FieldDescription>
+                  )}
+                </FieldContent>
+              </Field>
+            );
+          })}
+        </FieldSet>
         {sections.map((section) => (
           <FieldSet key={section.title} className="gap-2 rounded-lg border border-border p-3">
             <FieldLegend variant="label">{section.title}</FieldLegend>
@@ -622,12 +693,26 @@ export function AnalysisView({
                   return;
                 }
                 void invoke<{ report: string }>("scan_kit_open_study", { path: selected })
-                  .then((opened) => setStudy(opened.report))
+                  .then((opened) => {
+                    setStudyPath(selected);
+                    setStudy(opened.report);
+                  })
                   .catch((reason: unknown) => notifyError(reason));
               });
             }}
           >
-            Open study
+            Open Study
+          </Button>
+        ) : null}
+        {viewId === "dose_volume" && studyPath != null ? (
+          <Button
+            variant="outline"
+            onClick={() => {
+              setStudyPath(null);
+              setStudy(null);
+            }}
+          >
+            Close Study
           </Button>
         ) : null}
         {study != null ? <pre className="text-muted-foreground text-xs whitespace-pre-wrap">{study}</pre> : null}

@@ -176,6 +176,7 @@ mod tests {
                         },
                     ],
                     x_labels: vec!["x".into()],
+                    equal: false,
                 },
                 Panel {
                     title: String::new(),
@@ -184,12 +185,9 @@ mod tests {
                     xmax: 1.0,
                     ymin: 0.0,
                     ymax: 1.0,
-                    series: vec![Series::Heatmap {
-                        values: vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0],
-                        cols: 3,
-                        rows: 2,
-                    }],
+                    series: vec![Series::heatmap(vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0], 3, 2)],
                     x_labels: Vec::new(),
+                    equal: false,
                 },
             ],
             controls: Vec::new(),

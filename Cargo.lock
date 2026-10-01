@@ -3279,6 +3279,7 @@ dependencies = [
  "flate2",
  "rusqlite",
  "scan-kit-core",
+ "scan-kit-dicom",
  "serde_json",
  "tar",
  "xz2",

@@ -1,35 +1,21 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
-  Activity,
-  AudioWaveform,
   Box,
   Bug,
-  ChartColumn,
-  ChartScatter,
   Combine,
-  Cuboid,
   CircleHelp,
-  Ellipsis,
   Eye,
   FolderOpen,
-  Headphones,
   Info,
-  Layers,
   LogOut,
   Play,
   Redo2,
   RefreshCw,
-  ScrollText,
   SquarePen,
   SlidersHorizontal,
-  Spline,
   Table2,
-  TrendingDown,
-  TrendingUp,
   Undo2,
-  Waypoints,
   X,
-  Zap,
   type LucideIcon,
 } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
@@ -41,7 +27,6 @@ import {
   emptyGridSelection,
   GridCellKind,
   getDefaultTheme,
-  type DataEditorRef,
   type EditableGridCell,
   type GridCell,
   type GridColumn,
@@ -58,28 +43,22 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { Button, buttonVariants } from "@/components/ui/button";
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuGroup,
-  DropdownMenuItem,
-  DropdownMenuLabel,
-  DropdownMenuSeparator,
-  DropdownMenuTrigger,
-} from "@/components/ui/dropdown-menu";
+import { AnalysisIcon, AnalysisMenu, PRIMARY_ANALYSES, analysisId } from "@/analysis-menu";
+import { Button } from "@/components/ui/button";
 import { DebugLog } from "@/DebugLog";
 import { installDebugLog } from "@/debug-log";
 import { dismissNotice, logError, notify, notifyError } from "@/notify";
-import { selectWholeRows } from "@/grid-selection";
-import { selectionFromLibrary } from "@/session-colors";
+import { selectedSessionIds, selectWholeRows } from "@/grid-selection";
+import { selectionFromLibrary, sessionColor } from "@/session-colors";
+import { drawSessionCheckbox, type CheckPaint } from "@/session-checkbox";
 import { SessionContextMenu, sessionMenuPoint } from "@/session-menu";
 import {
   MAX_SELECTED,
-  UseColumnChecks,
   headerCheck,
   headerWillFill,
   nextSessionSelection,
+  shouldToggleRow,
+  toggleListedSessions,
 } from "@/session-checks";
 import {
   Menubar,
@@ -117,73 +96,6 @@ type LauncherView = (typeof LAUNCHER_VIEWS)[number];
 function isLauncherView(value: string): value is LauncherView {
   return (LAUNCHER_VIEWS as readonly string[]).includes(value);
 }
-
-const ANALYSIS_GROUPS = [
-  {
-    title: "Unified Views",
-    names: [
-      "Binned Summary",
-      "Distribution Explorer",
-      "Timeslice Replay",
-      "FFT Explorer",
-      "Audio Explorer",
-      "IC Beam Trajectory (3D)",
-      "Dose Volume",
-      "Session Log Compare",
-    ],
-  },
-  {
-    title: "Specialized Analysis",
-    names: [
-      "Beam Error Motion vs Energy",
-      "Dose Accumulation",
-      "Beam-Off Ramp-Down",
-      "IC HV Transient Test",
-      "Amplifier Command Correlations",
-      "IC Peak Amplitude — Beam-Off (G3)",
-    ],
-  },
-] as const;
-
-const PRIMARY_ANALYSES = [
-  "Binned Summary",
-  "Distribution Explorer",
-  "Timeslice Replay",
-] as const;
-
-const ANALYSIS_ICONS: Record<string, LucideIcon> = {
-  "Binned Summary": ChartColumn,
-  "Distribution Explorer": ChartScatter,
-  "Timeslice Replay": Play,
-  "FFT Explorer": AudioWaveform,
-  "Audio Explorer": Headphones,
-  "IC Beam Trajectory (3D)": Cuboid,
-  "Dose Volume": Layers,
-  "Session Log Compare": ScrollText,
-  "Beam Error Motion vs Energy": Spline,
-  "Dose Accumulation": TrendingUp,
-  "Beam-Off Ramp-Down": TrendingDown,
-  "IC HV Transient Test": Zap,
-  "Amplifier Command Correlations": Waypoints,
-  "IC Peak Amplitude — Beam-Off (G3)": Activity,
-};
-
-const ANALYSIS_IDS: Record<string, string> = {
-  "Binned Summary": "binned_summary",
-  "Distribution Explorer": "distribution",
-  "Timeslice Replay": "timeslice_replay",
-  "FFT Explorer": "ic_fft_analysis",
-  "Audio Explorer": "ic_audio_player",
-  "IC Beam Trajectory (3D)": "trajectory",
-  "Dose Volume": "dose_volume",
-  "Session Log Compare": "session_log_compare",
-  "Beam Error Motion vs Energy": "beam_motion_energy",
-  "Dose Accumulation": "dose_accumulation",
-  "Beam-Off Ramp-Down": "beam_off_rampdown",
-  "IC HV Transient Test": "ic_hv_transient",
-  "Amplifier Command Correlations": "amplifier_correlation",
-  "IC Peak Amplitude — Beam-Off (G3)": "ic_peak_amplitude_beam_off",
-};
 
 type SortKey =
   | "session_id"
@@ -264,7 +176,7 @@ type About = {
 
 type NoteEdit = { sessionId: string; before: string; after: string };
 
-type SessionMenu = { sessionId: string; x: number; y: number };
+type SessionMenu = { sessionId: string; x: number; y: number; rowIds: string[] };
 
 type Geometry = {
   width: number | null;
@@ -348,6 +260,29 @@ function gridTheme(): Theme {
     drilldownBorder: border,
     linkColor: accent,
     fontFamily: getComputedStyle(document.documentElement).fontFamily,
+    checkboxMaxSize: 16,
+    roundingRadius: 4,
+  };
+}
+
+function paintedColor(
+  className: string,
+  property: "color" | "backgroundColor" | "borderTopColor",
+): string {
+  const probe = document.createElement("span");
+  probe.className = className;
+  document.body.append(probe);
+  const resolved = getComputedStyle(probe)[property];
+  probe.remove();
+  return resolved;
+}
+
+function checkPaint(): CheckPaint {
+  return {
+    border: paintedColor("border border-input", "borderTopColor"),
+    idle: paintedColor("bg-input/30", "backgroundColor"),
+    mark: paintedColor("text-primary-foreground", "color"),
+    header: paintedColor("bg-primary", "backgroundColor"),
   };
 }
 
@@ -401,14 +336,6 @@ function TabIcon({ name }: { name: string }) {
   return <Icon className="size-4" />;
 }
 
-function AnalysisIcon({ name }: { name: string }) {
-  const Icon = ANALYSIS_ICONS[name];
-  if (Icon == null) {
-    return null;
-  }
-  return <Icon />;
-}
-
 function textCell(value: string, editable: boolean): GridCell {
   return {
     kind: GridCellKind.Text,
@@ -430,6 +357,7 @@ export default function App() {
   const [redo, setRedo] = useState<NoteEdit[]>([]);
   const [gridSelection, setGridSelection] = useState<GridSelection>(emptyGridSelection);
   const [theme, setTheme] = useState<Theme | null>(null);
+  const [checks, setChecks] = useState<CheckPaint | null>(null);
   const [size, setSize] = useState({ width: 0, height: 0 });
   const [tab, setTab] = useState<LauncherView>("Data Analysis");
   const [analysis, setAnalysis] = useState<string | null>(null);
@@ -438,9 +366,11 @@ export default function App() {
   const selectedIds = selectionOrder;
   const canAnalyze = folder != null && selectedIds.length >= 1 && selectedIds.length <= MAX_SELECTED;
   const host = useRef<HTMLDivElement>(null);
-  const gridRef = useRef<DataEditorRef>(null);
-  const [region, setRegion] = useState({ y: 0, height: 40 });
-  const selectionHeader = headerCheck(rows.length, selectedIds.length);
+  const lastRowToggle = useRef<{ row: number; at: number } | null>(null);
+  const { checked: headerChecked, indeterminate: headerMixed } = headerCheck(
+    rows.length,
+    selectedIds.length,
+  );
   const folderRef = useRef<string | null>(null);
   folderRef.current = folder;
 
@@ -500,6 +430,7 @@ export default function App() {
   useEffect(() => {
     installDebugLog();
     setTheme(gridTheme());
+    setChecks(checkPaint());
     let active = true;
     invoke<About>("scan_kit_about")
       .then((value) => {
@@ -639,7 +570,7 @@ export default function App() {
 
   const openAnalysis = useCallback(
     (name: string) => {
-      const id = ANALYSIS_IDS[name];
+      const id = analysisId(name);
       if (id == null) {
         return;
       }
@@ -737,7 +668,15 @@ export default function App() {
         return textCell("", false);
       }
       if (col === 0) {
-        return textCell("", false);
+        const checked = selectedIds.includes(row.session_id);
+        return {
+          kind: GridCellKind.Boolean,
+          data: checked,
+          allowOverlay: false,
+          readonly: true,
+          copyData: checked ? "true" : "false",
+          cursor: "pointer",
+        };
       }
       const value = [
         row.session_id,
@@ -752,7 +691,53 @@ export default function App() {
       ][col - 1];
       return textCell(value ?? "", col === 9);
     },
-    [order, rows],
+    [order, rows, selectedIds],
+  );
+
+  const drawGridCell = useCallback(
+    (
+      args: {
+        ctx: CanvasRenderingContext2D;
+        rect: { x: number; y: number; width: number; height: number };
+        col: number;
+        row: number;
+      },
+      drawContent: () => void,
+    ) => {
+      if (args.col !== 0 || checks == null) {
+        drawContent();
+        return;
+      }
+      const id = displayIds[args.row];
+      const on = id != null && selectedIds.includes(id);
+      drawSessionCheckbox(
+        args.ctx,
+        args.rect,
+        on ? "on" : "off",
+        on && id != null ? sessionColor(selectedIds.indexOf(id)) : checks.header,
+        on ? { ...checks, mark: "#fff" } : checks,
+      );
+    },
+    [checks, displayIds, selectedIds],
+  );
+
+  const drawGridHeader = useCallback(
+    (
+      args: {
+        ctx: CanvasRenderingContext2D;
+        columnIndex: number;
+        rect: { x: number; y: number; width: number; height: number };
+      },
+      drawContent: () => void,
+    ) => {
+      drawContent();
+      if (args.columnIndex !== 0 || checks == null) {
+        return;
+      }
+      const mode = headerMixed ? "mixed" : headerChecked ? "on" : "off";
+      drawSessionCheckbox(args.ctx, args.rect, mode, checks.header, checks);
+    },
+    [checks, headerChecked, headerMixed],
   );
 
   async function chooseFolder() {
@@ -917,8 +902,12 @@ export default function App() {
             <AnalysisView
               viewId={analysis}
               folder={folder}
-              sessionIds={selectedIds}
+              sessions={selectedIds.map((id) => ({
+                id,
+                note: rows.find((row) => row.session_id === id)?.note ?? "",
+              }))}
               onBack={() => setAnalysis(null)}
+              onOpenView={setAnalysis}
             />
           ) : (
           <>
@@ -955,41 +944,11 @@ export default function App() {
                   {name}
                 </Button>
               ))}
-              <DropdownMenu>
-                <DropdownMenuTrigger
-                  className={buttonVariants({ variant: "outline", size: "icon-sm" })}
-                  aria-label="More analyses"
-                  disabled={!canAnalyze}
-                >
-                  <Ellipsis />
-                </DropdownMenuTrigger>
-                <DropdownMenuContent align="end" className="w-max">
-                  {ANALYSIS_GROUPS.map((group, index) => {
-                    const names = group.names.filter(
-                      (name) => !(PRIMARY_ANALYSES as readonly string[]).includes(name),
-                    );
-                    if (names.length === 0) {
-                      return null;
-                    }
-                    return (
-                      <DropdownMenuGroup key={group.title}>
-                        {index > 0 ? <DropdownMenuSeparator /> : null}
-                        <DropdownMenuLabel>{group.title}</DropdownMenuLabel>
-                        {names.map((name) => (
-                          <DropdownMenuItem
-                            key={name}
-                            className="whitespace-nowrap"
-                            onClick={() => openAnalysis(name)}
-                          >
-                            <AnalysisIcon name={name} />
-                            {name}
-                          </DropdownMenuItem>
-                        ))}
-                      </DropdownMenuGroup>
-                    );
-                  })}
-                </DropdownMenuContent>
-              </DropdownMenu>
+              <AnalysisMenu
+                disabled={!canAnalyze}
+                omit={PRIMARY_ANALYSES}
+                onOpen={openAnalysis}
+              />
             </div>
           </div>
           <div
@@ -999,7 +958,6 @@ export default function App() {
           >
             {theme != null && size.width > 0 && size.height > 0 ? (
               <DataEditor
-                ref={gridRef}
                 width={size.width}
                 height={size.height}
                 columns={columns}
@@ -1007,13 +965,25 @@ export default function App() {
                 rowHeight={32}
                 headerHeight={32}
                 getCellContent={getCellContent}
+                drawCell={drawGridCell}
+                drawHeader={drawGridHeader}
                 onCellEdited={onCellEdited}
-                onVisibleRegionChanged={(next) => {
-                  setRegion((current) =>
-                    current.y === next.y && current.height === next.height
-                      ? current
-                      : { y: next.y, height: next.height },
-                  );
+                onCellClicked={([col, rowIndex], event) => {
+                  const source = order[rowIndex];
+                  const row = source == null ? undefined : rows[source];
+                  if (row == null) {
+                    return;
+                  }
+                  const recent = lastRowToggle.current;
+                  const justToggled =
+                    recent != null && recent.row === rowIndex && performance.now() - recent.at < 500;
+                  if (event.isDoubleClick) {
+                    event.preventDefault();
+                  }
+                  if (shouldToggleRow(col, event.isDoubleClick === true, justToggled)) {
+                    lastRowToggle.current = { row: rowIndex, at: performance.now() };
+                    onRowCheck(row.session_id, !selectedIds.includes(row.session_id));
+                  }
                 }}
                 onCellContextMenu={([, rowIndex], event) => {
                   event.preventDefault();
@@ -1026,9 +996,18 @@ export default function App() {
                   if (!Number.isFinite(point.x) || !Number.isFinite(point.y)) {
                     return;
                   }
-                  setSessionMenu({ sessionId: row.session_id, x: point.x, y: point.y });
+                  setSessionMenu({
+                    sessionId: row.session_id,
+                    x: point.x,
+                    y: point.y,
+                    rowIds: selectedSessionIds(displayIds, gridSelection, rowIndex),
+                  });
                 }}
                 onHeaderClicked={(col) => {
+                  if (col === 0) {
+                    onHeaderCheck();
+                    return;
+                  }
                   const key = COLUMN_SORT[col];
                   if (key == null) {
                     return;
@@ -1055,22 +1034,16 @@ export default function App() {
                   : "No sessions in this folder."}
               </p>
             ) : null}
-            <UseColumnChecks
-              gridRef={gridRef}
-              hostRef={host}
-              sessionIds={displayIds}
-              region={region}
-              ready={theme != null && size.width > 0 && size.height > 0}
-              order={selectedIds}
-              header={selectionHeader}
-              onRow={onRowCheck}
-              onHeader={onHeaderCheck}
-            />
             {sessionMenu != null ? (
               <SessionContextMenu
                 sessionId={sessionMenu.sessionId}
                 x={sessionMenu.x}
                 y={sessionMenu.y}
+                rowIds={sessionMenu.rowIds}
+                rowsSelected={
+                  sessionMenu.rowIds.length > 0 &&
+                  sessionMenu.rowIds.every((id) => selectedIds.includes(id))
+                }
                 onClose={() => setSessionMenu(null)}
                 onCopy={(id) => {
                   void navigator.clipboard.writeText(id).then(
@@ -1079,6 +1052,9 @@ export default function App() {
                   );
                 }}
                 onTune={() => selectTab("Configuration Tuning")}
+                onToggleRows={() => {
+                  commitSelection(toggleListedSessions(selectedIds, sessionMenu.rowIds));
+                }}
               />
             ) : null}
           </div>

@@ -148,6 +148,62 @@ const IC12: &[YSeries] = &[
         label: "DY",
     },
 ];
+const CONFIDENCE: &[YSeries] = &[
+    YSeries {
+        key: "ic1_x_confidence",
+        label: "IC1 X",
+    },
+    YSeries {
+        key: "ic1_y_confidence",
+        label: "IC1 Y",
+    },
+    YSeries {
+        key: "ic2_x_confidence",
+        label: "IC2 X",
+    },
+    YSeries {
+        key: "ic2_y_confidence",
+        label: "IC2 Y",
+    },
+];
+const PEAK: &[YSeries] = &[
+    YSeries {
+        key: "ic1_x_peak",
+        label: "IC1 X",
+    },
+    YSeries {
+        key: "ic1_y_peak",
+        label: "IC1 Y",
+    },
+    YSeries {
+        key: "ic2_x_peak",
+        label: "IC2 X",
+    },
+    YSeries {
+        key: "ic2_y_peak",
+        label: "IC2 Y",
+    },
+];
+const AMPLIFIER: &[YSeries] = &[
+    YSeries {
+        key: "amp_x",
+        label: "X",
+    },
+    YSeries {
+        key: "amp_y",
+        label: "Y",
+    },
+];
+const PROBE: &[YSeries] = &[
+    YSeries {
+        key: "field_x",
+        label: "X",
+    },
+    YSeries {
+        key: "field_y",
+        label: "Y",
+    },
+];
 const SPOT_TIME: &[YSeries] = &[
     YSeries {
         key: "spot_time",
@@ -193,13 +249,45 @@ const GROUPS: &[YGroup] = &[
         label: "Current Ratios (%)",
         series: DOSE_RATIO,
         zero: true,
-        filter: false,
+        filter: true,
         timeslice: true,
     },
     YGroup {
         id: "ic_current",
         label: "IC Current (nA)",
         series: CURRENT,
+        zero: true,
+        filter: true,
+        timeslice: true,
+    },
+    YGroup {
+        id: "fit_confidence",
+        label: "Fit Confidence",
+        series: CONFIDENCE,
+        zero: true,
+        filter: true,
+        timeslice: true,
+    },
+    YGroup {
+        id: "peak_amplitude",
+        label: "Peak Amplitude",
+        series: PEAK,
+        zero: true,
+        filter: true,
+        timeslice: true,
+    },
+    YGroup {
+        id: "amplifier_error",
+        label: "Amplifier Error (V)",
+        series: AMPLIFIER,
+        zero: true,
+        filter: true,
+        timeslice: true,
+    },
+    YGroup {
+        id: "probe_field",
+        label: "Probe Field (G)",
+        series: PROBE,
         zero: true,
         filter: true,
         timeslice: true,
@@ -241,7 +329,7 @@ const GROUPS: &[YGroup] = &[
         label: "Spot Delivery Time",
         series: SPOT_TIME,
         zero: true,
-        filter: false,
+        filter: true,
         timeslice: false,
     },
 ];
@@ -257,6 +345,10 @@ const METRIC_CHOICES: &[(&str, &str)] = &[
     ("dose_rate", "Dose Rate (MU/s)"),
     ("current_ratio", "Current Ratios (%)"),
     ("ic_current", "IC Current (nA)"),
+    ("fit_confidence", "Fit Confidence"),
+    ("peak_amplitude", "Peak Amplitude"),
+    ("amplifier_error", "Amplifier Error (V)"),
+    ("probe_field", "Probe Field (G)"),
     ("position_error", "Position Error (mm)"),
     ("sigma", "Sigma (mm)"),
     ("sigma_error", "Sigma Error (mm)"),
@@ -282,46 +374,346 @@ const SOURCE_CHOICES: &[(&str, &str)] = &[
     ("timeslice_iso", "Timeslice — Isocenter"),
     ("timeslice_chamber", "Timeslice — Chamber"),
 ];
+/// Spot vs timeslice, then isocenter vs chamber when a metric has both.
+/// Same split as the Python granularity control (`GRANULARITY_SOURCES`).
+const COARSE_CHOICES: &[(&str, &str)] = &[("spot", "Spot"), ("timeslice", "Timeslice")];
+const FRAME_CHOICES: &[(&str, &str)] = &[("iso", "Isocenter"), ("chamber", "Chamber")];
 
 fn sources_for(metric: &str) -> &'static [(&'static str, &'static str)] {
     match metric {
-        "current_ratio" | "ic_current" => &SOURCE_CHOICES[2..3],
+        "current_ratio" | "ic_current" | "fit_confidence" | "peak_amplitude"
+        | "amplifier_error" | "probe_field" => &SOURCE_CHOICES[2..3],
         "position_error" | "sigma" | "sigma_error" => &SOURCE_CHOICES[..3],
         "ic12_pos_diff" => SOURCE_CHOICES,
         _ => &SOURCE_CHOICES[..1],
     }
 }
-const BEAM_CHOICES: &[(&str, &str)] = &[
-    ("beam_on", "Beam on"),
-    ("beam_off", "Beam off"),
+
+fn coarse_of(source: &str) -> &'static str {
+    if source.starts_with("timeslice") {
+        "timeslice"
+    } else {
+        "spot"
+    }
+}
+
+fn frame_of(source: &str) -> &'static str {
+    if source == "chamber" || source.ends_with("_chamber") {
+        "chamber"
+    } else {
+        "iso"
+    }
+}
+
+struct YChoice {
+    metric: &'static str,
+    frame: &'static str,
+    label: String,
+}
+
+/// One Y row per metric. Isocenter and chamber are extra rows when both exist.
+fn y_choices(coarse: &str) -> Vec<YChoice> {
+    let mut choices = Vec::new();
+    for &(metric, base) in METRIC_CHOICES {
+        let frames = frames_for(metric, coarse);
+        if frames.is_empty() {
+            continue;
+        }
+        let qualify = frames.len() > 1;
+        for (frame, frame_label) in frames {
+            let label = if qualify {
+                format!("{base} ({frame_label})")
+            } else {
+                base.to_string()
+            };
+            choices.push(YChoice {
+                metric,
+                frame,
+                label,
+            });
+        }
+    }
+    choices
+}
+
+fn split_frame_suffix(raw: &str) -> (&str, Option<&'static str>) {
+    if let Some(bare) = raw.strip_suffix(" (Chamber)") {
+        (bare, Some("chamber"))
+    } else if let Some(bare) = raw.strip_suffix(" (Isocenter)") {
+        (bare, Some("iso"))
+    } else {
+        (raw, None)
+    }
+}
+
+fn metric_label(id: &str) -> &str {
+    METRIC_CHOICES
+        .iter()
+        .find(|(key, _)| *key == id)
+        .map(|(_, label)| *label)
+        .unwrap_or(id)
+}
+
+fn resolve_y(
+    choices: &[YChoice],
+    options: &Value,
+    concrete: Option<&str>,
+) -> (&'static str, &'static str) {
+    let Some(raw) = options.get("metric").and_then(Value::as_str) else {
+        return choices
+            .iter()
+            .find(|choice| choice.metric == "dose_error")
+            .or_else(|| choices.first())
+            .map(|choice| (choice.metric, choice.frame))
+            .unwrap_or(("dose_error", "iso"));
+    };
+    if let Some(exact) = choices.iter().find(|choice| choice.label == raw) {
+        return (exact.metric, exact.frame);
+    }
+    let (bare, suffix_frame) = split_frame_suffix(raw);
+    let frame_hint = suffix_frame
+        .or_else(|| pick_in(options, "frame", FRAME_CHOICES))
+        .or_else(|| concrete.map(frame_of));
+    let hits: Vec<_> = choices
+        .iter()
+        .filter(|choice| {
+            choice.metric == raw || choice.metric == bare || metric_label(choice.metric) == bare
+        })
+        .collect();
+    if let Some(frame) = frame_hint {
+        if let Some(hit) = hits.iter().find(|choice| choice.frame == frame) {
+            return (hit.metric, hit.frame);
+        }
+    }
+    hits.first()
+        .map(|choice| (choice.metric, choice.frame))
+        .unwrap_or((
+            choices
+                .first()
+                .map(|choice| choice.metric)
+                .unwrap_or("dose_error"),
+            choices.first().map(|choice| choice.frame).unwrap_or("iso"),
+        ))
+}
+
+fn frames_for(metric: &str, coarse: &str) -> Vec<(&'static str, &'static str)> {
+    FRAME_CHOICES
+        .iter()
+        .copied()
+        .filter(|(frame, _)| {
+            sources_for(metric)
+                .iter()
+                .any(|(source, _)| coarse_of(source) == coarse && frame_of(source) == *frame)
+        })
+        .collect()
+}
+pub(crate) const BEAM_CHOICES: &[(&str, &str)] = &[
+    ("beam_on", "Beam On"),
+    ("beam_off", "Beam Off"),
     ("beam_both", "Both"),
 ];
 const DOMAIN_CHOICES: &[(&str, &str)] = &[
     ("all", "All"),
     ("lower_95", "Lower 95%"),
-    ("upper_95", "Upper 95%"),
-    ("mad_outliers", "MAD outliers"),
+    ("upper_95", "Upper 5%"),
+    ("mad_outliers", "MAD Outliers"),
 ];
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Trend {
+    Off,
+    Linear,
+    Polynomial,
+}
+
+fn trend_mode(options: &Value) -> Trend {
+    match text(options, "trend", "Off") {
+        "Linear" | "linear" | "On" | "on" | "true" | "1" => Trend::Linear,
+        "Polynomial" | "polynomial" => Trend::Polynomial,
+        _ => Trend::Off,
+    }
+}
+
+fn trend_value(trend: Trend) -> &'static str {
+    match trend {
+        Trend::Off => "Off",
+        Trend::Linear => "Linear",
+        Trend::Polynomial => "Polynomial",
+    }
+}
+
+/// Glyph marks for one data identity. Trend and interlock are drawn on top.
+///
+/// ponytail: one slot, keyed by the data options plus spot/map fingerprints and
+/// the session directory mtime. A timeslice frame that changes without touching
+/// those stays stale until the directory mtime moves. Upgrade path: hash the
+/// frame list.
+#[derive(Clone)]
+struct Prepared {
+    key: String,
+    tables: Vec<BTreeMap<String, Vec<f32>>>,
+    categories: Vec<f32>,
+    xmin: f32,
+    xmax: f32,
+    x_labels: Vec<String>,
+    glyph: String,
+    x_column: String,
+    raw_x: bool,
+    series: Vec<PreparedSeries>,
+}
+
+#[derive(Clone)]
+struct PreparedSeries {
+    key: String,
+    label: String,
+    y_label: String,
+    glyphs: Vec<Vec<Series>>,
+    contour: Vec<Series>,
+    ymin: f32,
+    ymax: f32,
+}
+
+fn prepared_cache() -> &'static std::sync::Mutex<Option<Prepared>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<Option<Prepared>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+fn cached_prepared(key: String, build: impl FnOnce() -> Prepared) -> Prepared {
+    if let Some(hit) = prepared_cache()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .as_ref()
+        .filter(|item| item.key == key)
+        .cloned()
+    {
+        return hit;
+    }
+    let mut built = build();
+    built.key = key;
+    *prepared_cache()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner()) = Some(built.clone());
+    built
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepared_key(
+    root: &Path,
+    session_ids: &[String],
+    metric: &str,
+    source: &str,
+    x_column: &str,
+    bins: &BinChoice,
+    glyph: &str,
+    domain: &str,
+    beam: &str,
+    cutoff: f32,
+) -> String {
+    let mut stamp = String::new();
+    for session in session_ids {
+        stamp.push_str(session);
+        stamp.push(':');
+        stamp.push_str(&session_stamp(root, session).to_string());
+        stamp.push(';');
+    }
+    format!(
+        "{}|{stamp}|{metric}|{source}|{x_column}|{}|{glyph}|{domain}|{beam}|{cutoff}",
+        root.display(),
+        bin_label(bins),
+    )
+}
+
+fn session_stamp(root: &Path, session: &str) -> u128 {
+    let dir = discover::session_directory(root, session);
+    let mut stamp = mtime_ns(&dir);
+    for name in ["spot_data.csv", "input_map.csv"] {
+        if let Some((len, ns, head)) = file_fingerprint(&dir.join(name)) {
+            stamp ^= ns ^ u128::from(len) ^ u128::from(head);
+        }
+    }
+    stamp
+}
+
+fn mtime_ns(path: &Path) -> u128 {
+    std::fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|time| time.as_nanos())
+        .unwrap_or(0)
+}
+
+pub(crate) fn spot_table(root: &Path, session: &str) -> BTreeMap<String, Vec<f32>> {
+    load_spot(root, session, false, false)
+}
+
+pub(crate) fn slice_table(root: &Path, session: &str) -> BTreeMap<String, Vec<f32>> {
+    load_slice_metric(root, session, "position_error", false)
+}
+
+pub(crate) fn timeslice_metric(
+    root: &Path,
+    session: &str,
+    metric: &str,
+) -> BTreeMap<String, Vec<f32>> {
+    load_timeslice(root, session, metric)
+}
+
+/// Current, confidence, peak, field, and amplifier columns from one timeslice read.
+pub(crate) fn timeslice_signals(root: &Path, session: &str) -> BTreeMap<String, Vec<f32>> {
+    let Some((files, energies, layers)) = timeslice_inputs(root, session) else {
+        return BTreeMap::new();
+    };
+    let sheets = read_sheets(&files, timeline_column);
+    let mut out = current_from(&sheets, &energies, &layers);
+    for metric in [
+        "fit_confidence",
+        "peak_amplitude",
+        "amplifier_error",
+        "probe_field",
+    ] {
+        for (key, values) in signal_from(&sheets, &energies, &layers, metric) {
+            out.entry(key).or_insert(values);
+        }
+    }
+    out
+}
+
 pub(crate) fn binned_summary(root: &Path, session_ids: &[String], options: &Value) -> PlotScene {
-    let metric = pick(options, "metric", "dose_error", METRIC_CHOICES);
+    let metric_hint = pick(options, "metric", "dose_error", METRIC_CHOICES);
+    let concrete = options
+        .get("source")
+        .and_then(Value::as_str)
+        .and_then(|raw| {
+            SOURCE_CHOICES
+                .iter()
+                .find(|(id, label)| *id == raw || *label == raw)
+                .map(|(id, _)| *id)
+        });
+    let coarse = pick_in(options, "source", COARSE_CHOICES)
+        .or_else(|| concrete.map(coarse_of))
+        .unwrap_or_else(|| coarse_of(sources_for(metric_hint)[0].0));
+    let y_opts = y_choices(coarse);
+    let (metric, frame) = resolve_y(&y_opts, options, concrete);
     let group = GROUPS
         .iter()
         .find(|group| group.id == metric)
         .unwrap_or(&GROUPS[0]);
     let x_id = pick(options, "x", "energy", X_CHOICES);
     let glyph = pick(options, "glyph", "violin", GLYPH_CHOICES);
-    let beam = pick(options, "beam", "beam_on", BEAM_CHOICES);
+    let beam_default = if coarse == "timeslice" {
+        "beam_on"
+    } else {
+        "beam_both"
+    };
+    let beam = pick(options, "beam", beam_default, BEAM_CHOICES);
     let domain = pick(options, "domain", "all", DOMAIN_CHOICES);
-    let trend = flag(options, "trend", true);
+    let trend = trend_mode(options);
     let hist = flag(options, "hist", false);
     let corr = flag(options, "corr", false);
-    let fliers = flag(options, "fliers", false);
     let mut interlock = flag(options, "interlock", false);
-    let n_bins = text(options, "bins", "8")
-        .parse::<usize>()
-        .unwrap_or(8)
-        .clamp(2, 24);
+    let bins = bin_choice(options);
     let hist_bins = text(options, "hist_bins", "30")
         .parse::<usize>()
         .unwrap_or(30)
@@ -330,20 +722,30 @@ pub(crate) fn binned_summary(root: &Path, session_ids: &[String], options: &Valu
         .parse::<f32>()
         .unwrap_or(5.0)
         .clamp(0.0, 90.0);
-    let allowed = sources_for(group.id);
-    let source = pick(options, "source", allowed[0].0, allowed);
+    let source = sources_for(group.id)
+        .iter()
+        .find(|(id, _)| coarse_of(id) == coarse && frame_of(id) == frame)
+        .map(|(id, _)| *id)
+        .unwrap_or_else(|| {
+            sources_for(group.id)
+                .iter()
+                .find(|(id, _)| coarse_of(id) == coarse)
+                .map(|(id, _)| *id)
+                .unwrap_or(sources_for(group.id)[0].0)
+        });
     let shared_bins = flag(options, "shared", false);
     let geometry = matches!(source, "timeslice_iso" | "timeslice_chamber")
         && matches!(
             group.id,
             "position_error" | "sigma" | "sigma_error" | "ic12_pos_diff"
         );
+    let energy_only = geometry || timeslice_energy_only(group.id);
     let chamber = source == "chamber"
         && matches!(
             group.id,
             "position_error" | "sigma" | "sigma_error" | "ic12_pos_diff"
         );
-    let x_id = if geometry { "energy" } else { x_id };
+    let x_id = if energy_only { "energy" } else { x_id };
     if !interlock_ok(group.id, x_id, glyph) {
         interlock = false;
     }
@@ -353,114 +755,172 @@ pub(crate) fn binned_summary(root: &Path, session_ids: &[String], options: &Valu
         "radius" => "radius",
         _ => "energy",
     };
-    let unique = x_column == "energy";
     let raw_x = glyph == "scatter" || glyph == "contour";
 
-    let load_one = |session: &String| {
-        let mut table = if geometry {
-            load_slice_metric(root, session, group.id, source == "timeslice_chamber")
-        } else if group.timeslice {
-            load_timeslice(root, session, group.id)
-        } else if group.id == "dose_rate" {
-            dose_rate_table(&load_spot(root, session, false, false))
-        } else {
-            load_spot(root, session, chamber, group.id == "spot_time")
+    // Trend and interlock only add guides. The glyph geometry stays cached.
+    let key = prepared_key(
+        root,
+        session_ids,
+        group.id,
+        source,
+        x_column,
+        &bins,
+        glyph,
+        domain,
+        beam,
+        cutoff,
+    );
+    let prepared = cached_prepared(key, || {
+        let load_one = |session: &String| {
+            let mut table = if geometry {
+                load_slice_metric(root, session, group.id, source == "timeslice_chamber")
+            } else if group.timeslice {
+                load_timeslice(root, session, group.id)
+            } else if group.id == "dose_rate" {
+                dose_rate_table(&load_spot(root, session, false, false))
+            } else {
+                load_spot(root, session, chamber, group.id == "spot_time")
+            };
+            if group.filter {
+                let keys: Vec<&str> = group.series.iter().map(|series| series.key).collect();
+                apply_filter(&mut table, &keys, domain, beam);
+            }
+            table
         };
-        if group.filter {
-            let keys: Vec<&str> = group.series.iter().map(|series| series.key).collect();
-            apply_filter(&mut table, &keys, domain, beam);
-        }
-        table
-    };
-    // A handful of sessions, one thread each. The spot cache covers a repeat open.
-    let mut tables = if session_ids.len() < 2 {
-        session_ids.iter().map(load_one).collect::<Vec<_>>()
-    } else {
-        let mut tables = Vec::with_capacity(session_ids.len());
-        std::thread::scope(|scope| {
-            let mut joins = Vec::with_capacity(session_ids.len());
-            for session in session_ids {
-                joins.push(scope.spawn(|| load_one(session)));
-            }
-            for join in joins {
-                tables.push(join.join().unwrap());
-            }
-        });
-        tables
-    };
-
-    let categories = if raw_x {
-        Vec::new()
-    } else if unique {
-        unique_values(&tables, x_column)
-    } else {
-        quantile_categories(&tables, x_column, n_bins)
-    };
-    if !raw_x {
-        let edges = if unique {
+        // A handful of sessions, one thread each. The spot cache covers a repeat open.
+        let mut tables = if session_ids.len() < 2 {
+            session_ids.iter().map(load_one).collect::<Vec<_>>()
+        } else {
+            let mut tables = Vec::with_capacity(session_ids.len());
+            std::thread::scope(|scope| {
+                let mut joins = Vec::with_capacity(session_ids.len());
+                for session in session_ids {
+                    joins.push(scope.spawn(|| load_one(session)));
+                }
+                for join in joins {
+                    tables.push(join.join().unwrap());
+                }
+            });
+            tables
+        };
+        let categories = if raw_x {
             Vec::new()
         } else {
-            let values: Vec<f32> = tables
-                .iter()
-                .flat_map(|table| table.get(x_column).into_iter().flatten().copied())
-                .collect();
-            quantile_edges(&values, n_bins)
+            assign_x(&mut tables, x_column, &bins)
         };
-        for table in &mut tables {
-            let centers = if unique {
-                table.get(x_column).cloned().unwrap_or_default()
-            } else {
-                assign_bin_centers(
-                    table.get(x_column).map(Vec::as_slice).unwrap_or(&[]),
-                    &edges,
-                )
-            };
-            table.insert("_bin".to_string(), centers);
+        let present: Vec<&YSeries> = group
+            .series
+            .iter()
+            .filter(|series| tables.iter().any(|table| has_finite(table.get(series.key))))
+            .collect();
+        let (xmin, xmax) = x_span(&tables, &categories, raw_x, x_column, present.len());
+        let x_labels = if raw_x {
+            Vec::new()
+        } else {
+            categories
+                .iter()
+                .copied()
+                .map(scan_kit_core::format_tick)
+                .collect()
+        };
+        let series = present
+            .iter()
+            .map(|series| {
+                let mut ys = Vec::new();
+                let glyphs = tables
+                    .iter()
+                    .enumerate()
+                    .map(|(index, table)| {
+                        let Some(y) = table.get(series.key) else {
+                            return Vec::new();
+                        };
+                        if !has_finite(Some(y)) {
+                            return Vec::new();
+                        }
+                        ys.extend(y.iter().copied().filter(|value| value.is_finite()));
+                        let color = [
+                            0.8,
+                            0.8,
+                            0.8,
+                            if glyph == "violin" {
+                                0.55
+                            } else if glyph == "scatter" {
+                                0.4
+                            } else {
+                                1.0
+                            },
+                        ];
+                        match glyph {
+                            "mean" => mean_series(table, y, &categories, index, color),
+                            "scatter" => vec![scatter_series(table, y, x_column, color)],
+                            "contour" => Vec::new(),
+                            "box" => box_series(table, y, &categories, index, color),
+                            _ => violin_series(table, y, &categories, index, color),
+                        }
+                    })
+                    .collect();
+                if group.zero {
+                    ys.push(0.0);
+                }
+                let (ymin, ymax) = span(&ys);
+                let contour = if glyph == "contour" {
+                    contour_series(&tables, series.key, x_column, cutoff)
+                } else {
+                    Vec::new()
+                };
+                PreparedSeries {
+                    key: series.key.to_string(),
+                    label: series.label.to_string(),
+                    y_label: axis_label(series.label, group.label),
+                    glyphs,
+                    contour,
+                    ymin,
+                    ymax,
+                }
+            })
+            .collect();
+        Prepared {
+            key: String::new(),
+            tables,
+            categories,
+            xmin,
+            xmax,
+            x_labels,
+            glyph: glyph.to_string(),
+            x_column: x_column.to_string(),
+            raw_x,
+            series,
         }
-    }
+    });
 
-    let present: Vec<&YSeries> = group
-        .series
-        .iter()
-        .filter(|series| tables.iter().any(|table| has_finite(table.get(series.key))))
-        .collect();
     let mut panels = Vec::new();
-    if present.is_empty() {
+    if prepared.series.is_empty() {
         panels.push(note_panel("No finite values for this metric"));
     } else {
-        let (xmin, xmax) = x_span(&tables, &categories, raw_x, x_column, present.len());
-        for series in &present {
-            panels.push(main_panel(
-                series,
-                &tables,
-                &categories,
-                x_column,
-                raw_x,
-                glyph,
-                trend,
-                fliers,
-                interlock,
-                group,
-                xmin,
-                xmax,
-                cutoff,
-            ));
+        for (index, item) in prepared.series.iter().enumerate() {
+            panels.push(assemble_panel(&prepared, index, trend, interlock, group));
+            let series = group
+                .series
+                .iter()
+                .find(|series| series.key == item.key)
+                .unwrap();
             if hist {
                 panels.push(hist_panel(
                     series,
-                    &tables,
+                    &prepared.tables,
                     hist_bins,
                     shared_bins,
                     interlock && group.id == "position_error",
                 ));
             }
             if corr {
-                let pos = present
+                let other = &prepared.series[(index + 1) % prepared.series.len()];
+                let other = group
+                    .series
                     .iter()
-                    .position(|item| item.key == series.key)
-                    .unwrap_or(0);
-                let other = &present[(pos + 1) % present.len()];
-                panels.push(corr_panel(series, other, &tables, group.label));
+                    .find(|series| series.key == other.key)
+                    .unwrap();
+                panels.push(corr_panel(series, other, &prepared.tables, group.label));
             }
         }
     }
@@ -481,9 +941,8 @@ pub(crate) fn binned_summary(root: &Path, session_ids: &[String], options: &Valu
             trend,
             hist,
             corr,
-            fliers,
             interlock,
-            n_bins,
+            &bin_label(&bins),
             hist_bins,
             shared_bins,
             cutoff,
@@ -495,103 +954,102 @@ pub(crate) fn binned_summary(root: &Path, session_ids: &[String], options: &Valu
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn main_panel(
-    series: &YSeries,
-    tables: &[BTreeMap<String, Vec<f32>>],
-    categories: &[f32],
-    x_column: &str,
-    raw_x: bool,
-    glyph: &str,
-    trend: bool,
-    fliers: bool,
+fn assemble_panel(
+    prepared: &Prepared,
+    index: usize,
+    trend: Trend,
     interlock: bool,
     group: &YGroup,
-    xmin: f32,
-    xmax: f32,
-    cutoff: f32,
 ) -> Panel {
+    let item = &prepared.series[index];
+    let glyph = prepared.glyph.as_str();
+    let x_column = prepared.x_column.as_str();
     let mut drawn = Vec::new();
-    let mut ys = Vec::new();
-    for (index, table) in tables.iter().enumerate() {
-        let Some(y) = table.get(series.key) else {
+    for (session, table) in prepared.tables.iter().enumerate() {
+        drawn.extend(item.glyphs[session].clone());
+        let Some(y) = table.get(&item.key) else {
             continue;
         };
         if !has_finite(Some(y)) {
             continue;
         }
-        ys.extend(y.iter().copied().filter(|value| value.is_finite()));
-        let color = [
-            0.8,
-            0.8,
-            0.8,
-            if glyph == "violin" {
-                0.55
-            } else if glyph == "scatter" {
-                0.4
-            } else {
-                1.0
-            },
-        ];
-        match glyph {
-            "mean" => drawn.extend(mean_series(table, y, categories, index, color)),
-            "scatter" => drawn.push(scatter_series(table, y, x_column, color)),
-            "contour" => {}
-            "box" => drawn.extend(box_series(table, y, categories, index, fliers, color)),
-            _ => drawn.extend(violin_series(table, y, categories, index, color)),
-        }
-        if trend && glyph != "contour" && group.id != "dose_rate" && !raw_x {
-            if let Some(guide) = trend_guide(table, y, categories, index) {
+        if trend != Trend::Off && glyph != "contour" && group.id != "dose_rate" && !prepared.raw_x {
+            if let Some(guide) = binned_trend(
+                table,
+                y,
+                &prepared.categories,
+                session,
+                prepared.xmin,
+                prepared.xmax,
+                trend,
+            ) {
                 drawn.push(guide);
             }
         }
-        if trend && group.id == "dose_rate" {
+        if trend != Trend::Off && group.id == "dose_rate" {
             if let Some(rate) = table
                 .get("session_avg_rate")
                 .and_then(|v| v.first().copied())
             {
                 if rate.is_finite() {
-                    drawn.push(hline(xmin, xmax, rate, [0.9, 0.75, 0.3, 1.0]));
+                    drawn.push(hline(
+                        prepared.xmin,
+                        prepared.xmax,
+                        rate,
+                        [0.9, 0.75, 0.3, 1.0],
+                    ));
                 }
             }
         }
-    }
-    if glyph == "contour" {
-        drawn.extend(contour_series(tables, series.key, x_column, cutoff));
-        if trend {
-            for table in tables {
-                if let Some(guide) = scatter_trend(table, series.key, x_column) {
-                    drawn.push(guide);
-                }
+        if trend != Trend::Off && glyph == "scatter" {
+            if let Some(guide) = scatter_trend(
+                table,
+                &item.key,
+                x_column,
+                prepared.xmin,
+                prepared.xmax,
+                trend,
+            ) {
+                drawn.push(guide);
             }
         }
     }
-    if group.zero {
-        ys.push(0.0);
+    drawn.extend(item.contour.clone());
+    if trend != Trend::Off && glyph == "contour" {
+        for table in &prepared.tables {
+            if let Some(guide) = scatter_trend(
+                table,
+                &item.key,
+                x_column,
+                prepared.xmin,
+                prepared.xmax,
+                trend,
+            ) {
+                drawn.push(guide);
+            }
+        }
     }
     if interlock {
         drawn.extend(interlock_guides(
-            tables, categories, group.id, x_column, glyph, xmin, xmax,
+            &prepared.tables,
+            &prepared.categories,
+            group.id,
+            x_column,
+            glyph,
+            prepared.xmin,
+            prepared.xmax,
         ));
     }
-    let (ymin, ymax) = span(&ys);
     Panel {
-        title: series.label.to_string(),
-        y_label: axis_label(series.label, group.label),
-        xmin,
-        xmax,
-        ymin,
-        ymax,
+        title: item.label.clone(),
+        y_label: item.y_label.clone(),
+        xmin: prepared.xmin,
+        xmax: prepared.xmax,
+        ymin: item.ymin,
+        ymax: item.ymax,
         series: drawn,
-        x_labels: if raw_x {
-            Vec::new()
-        } else {
-            categories
-                .iter()
-                .copied()
-                .map(scan_kit_core::format_tick)
-                .collect()
-        },
+        x_labels: prepared.x_labels.clone(),
+        equal: false,
     }
 }
 
@@ -649,7 +1107,9 @@ fn violin_series(
             outline_x.push(center - half);
             outline_y.push(*y);
         }
-        for (y, half) in shape.iter().rev().skip(1) {
+        // The top sample is a short cap. Both corners have to be on the stroke,
+        // or the line cuts across the fill's peak.
+        for (y, half) in shape.iter().rev() {
             outline_x.push(center + half);
             outline_y.push(*y);
         }
@@ -675,7 +1135,6 @@ fn box_series(
     y: &[f32],
     categories: &[f32],
     session: usize,
-    fliers: bool,
     color: [f32; 4],
 ) -> Vec<Series> {
     let bins = table.get("_bin");
@@ -708,14 +1167,6 @@ fn box_series(
         med_y.extend([stats.median, stats.median]);
         med_x.push(f32::NAN);
         med_y.push(f32::NAN);
-        if fliers {
-            for flier in stats.fliers {
-                x.push(center - 0.03);
-                bottom.push(flier);
-                w.push(0.06);
-                h.push(0.0);
-            }
-        }
     }
     vec![
         Series::Rects {
@@ -812,7 +1263,7 @@ fn contour_series(
 }
 
 /// Nested density fills plus the isolines around each band.
-fn contour_bands(xs: &[f32], ys: &[f32], cutoff_pct: f32) -> Vec<Series> {
+pub(crate) fn contour_bands(xs: &[f32], ys: &[f32], cutoff_pct: f32) -> Vec<Series> {
     let mut pairs: Vec<(f32, f32)> = xs
         .iter()
         .zip(ys)
@@ -870,29 +1321,15 @@ fn contour_bands(xs: &[f32], ys: &[f32], cutoff_pct: f32) -> Vec<Series> {
     if levels.is_empty() {
         return Vec::new();
     }
-    let mut x = Vec::new();
-    let mut y = Vec::new();
-    let mut w = Vec::new();
-    let mut h = Vec::new();
-    for &level in &levels {
-        for iy in 0..bins {
-            for ix in 0..bins {
-                if counts[ix + bins * iy] >= level {
-                    x.push(x0 + ix as f32 * dx);
-                    y.push(y0 + iy as f32 * dy);
-                    w.push(dx);
-                    h.push(dy);
-                }
-            }
-        }
+    let (mesh_x, mesh_y) = contour_mesh(&counts, bins, &levels, x0, y0, dx, dy);
+    let mut drawn = Vec::new();
+    if mesh_x.len() >= 3 {
+        drawn.push(Series::Triangles {
+            xs: mesh_x,
+            ys: mesh_y,
+            color: [0.8, 0.8, 0.8, 0.13],
+        });
     }
-    let mut drawn = vec![Series::Rects {
-        x,
-        y,
-        w,
-        h,
-        color: [0.8, 0.8, 0.8, 0.13],
-    }];
     let (line_x, line_y) = isolines(&counts, bins, &levels, x0, y0, dx, dy);
     if line_x.len() >= 2 {
         drawn.push(Series::Polyline {
@@ -903,6 +1340,84 @@ fn contour_bands(xs: &[f32], ys: &[f32], cutoff_pct: f32) -> Vec<Series> {
         });
     }
     drawn
+}
+
+/// The part of each cell on or above a level. Corners and edge crossings match `isolines`.
+fn contour_mesh(
+    counts: &[f32],
+    bins: usize,
+    levels: &[f32],
+    x0: f32,
+    y0: f32,
+    dx: f32,
+    dy: f32,
+) -> (Vec<f32>, Vec<f32>) {
+    let mut xs = Vec::new();
+    let mut ys = Vec::new();
+    let at = |ix: usize, iy: usize| counts[ix + bins * iy];
+    for level in levels {
+        for iy in 0..bins.saturating_sub(1) {
+            for ix in 0..bins.saturating_sub(1) {
+                let c00 = at(ix, iy);
+                let c10 = at(ix + 1, iy);
+                let c11 = at(ix + 1, iy + 1);
+                let c01 = at(ix, iy + 1);
+                let case = u8::from(c00 >= *level)
+                    | (u8::from(c10 >= *level) << 1)
+                    | (u8::from(c11 >= *level) << 2)
+                    | (u8::from(c01 >= *level) << 3);
+                if case == 0 {
+                    continue;
+                }
+                let x = x0 + (ix as f32 + 0.5) * dx;
+                let y = y0 + (iy as f32 + 0.5) * dy;
+                let p00 = (x, y);
+                let p10 = (x + dx, y);
+                let p11 = (x + dx, y + dy);
+                let p01 = (x, y + dy);
+                let cross =
+                    |edge| edge_point(ix, iy, edge, c00, c10, c11, c01, *level, x0, y0, dx, dy);
+                let e0 = cross(0);
+                let e1 = cross(1);
+                let e2 = cross(2);
+                let e3 = cross(3);
+                match case {
+                    1 => fan(&mut xs, &mut ys, &[p00, e0, e3]),
+                    2 => fan(&mut xs, &mut ys, &[p10, e1, e0]),
+                    3 => fan(&mut xs, &mut ys, &[p00, p10, e1, e3]),
+                    4 => fan(&mut xs, &mut ys, &[p11, e2, e1]),
+                    5 => {
+                        fan(&mut xs, &mut ys, &[p00, e0, e3]);
+                        fan(&mut xs, &mut ys, &[p11, e2, e1]);
+                    }
+                    6 => fan(&mut xs, &mut ys, &[e0, p10, p11, e2]),
+                    7 => fan(&mut xs, &mut ys, &[p00, p10, p11, e2, e3]),
+                    8 => fan(&mut xs, &mut ys, &[p01, e3, e2]),
+                    9 => fan(&mut xs, &mut ys, &[p00, e0, e2, p01]),
+                    10 => {
+                        fan(&mut xs, &mut ys, &[p10, e1, e0]);
+                        fan(&mut xs, &mut ys, &[p01, e3, e2]);
+                    }
+                    11 => fan(&mut xs, &mut ys, &[p00, p10, e1, e2, p01]),
+                    12 => fan(&mut xs, &mut ys, &[e3, e1, p11, p01]),
+                    13 => fan(&mut xs, &mut ys, &[p00, e0, e1, p11, p01]),
+                    14 => fan(&mut xs, &mut ys, &[e0, p10, p11, p01, e3]),
+                    _ => fan(&mut xs, &mut ys, &[p00, p10, p11, p01]),
+                }
+            }
+        }
+    }
+    (xs, ys)
+}
+
+fn fan(xs: &mut Vec<f32>, ys: &mut Vec<f32>, poly: &[(f32, f32)]) {
+    if poly.len() < 3 {
+        return;
+    }
+    for index in 1..poly.len() - 1 {
+        xs.extend([poly[0].0, poly[index].0, poly[index + 1].0]);
+        ys.extend([poly[0].1, poly[index].1, poly[index + 1].1]);
+    }
 }
 
 fn isolines(
@@ -1009,39 +1524,46 @@ fn density_range(values: &[f32]) -> (f32, f32) {
     }
 }
 
-fn trend_guide(
+fn binned_trend(
     table: &BTreeMap<String, Vec<f32>>,
     y: &[f32],
     categories: &[f32],
     session: usize,
+    xmin: f32,
+    xmax: f32,
+    trend: Trend,
 ) -> Option<Series> {
     let bins = table.get("_bin")?;
+    if categories.len() < 2 {
+        return None;
+    }
     let groups = group_samples(Some(bins), y, categories);
     let mut phys = Vec::new();
     let mut medians = Vec::new();
-    let mut draw_x = Vec::new();
-    for (index, (category, samples)) in categories.iter().zip(&groups).enumerate() {
+    for (category, samples) in categories.iter().zip(&groups) {
         if samples.is_empty() {
             continue;
         }
         phys.push(*category);
         medians.push(median(samples));
-        draw_x.push(index as f32 + (session as f32 - 0.5) * OFFSET);
     }
-    if phys.len() < 2 {
-        return None;
-    }
-    let (slope, intercept) = linear_fit(&phys, &medians)?;
-    let ys = phys.iter().map(|value| slope * value + intercept).collect();
-    Some(Series::Polyline {
-        xs: draw_x,
-        ys,
-        color: [0.85, 0.85, 0.85, 0.0],
-        thickness: 1.5,
+    let coef = fit_trend(&phys, &medians, trend == Trend::Polynomial)?;
+    let knots: Vec<f32> = (0..categories.len())
+        .map(|index| index as f32 + (session as f32 - 0.5) * OFFSET)
+        .collect();
+    curve_across(xmin, xmax, &knots, coef[2] != 0.0, |plot_x| {
+        eval_trend(coef, phys_at_plot_x(plot_x, categories, session))
     })
 }
 
-fn scatter_trend(table: &BTreeMap<String, Vec<f32>>, key: &str, x_column: &str) -> Option<Series> {
+fn scatter_trend(
+    table: &BTreeMap<String, Vec<f32>>,
+    key: &str,
+    x_column: &str,
+    xmin: f32,
+    xmax: f32,
+    trend: Trend,
+) -> Option<Series> {
     let x = table.get(x_column)?;
     let y = table.get(key)?;
     let mut xs = Vec::new();
@@ -1052,13 +1574,161 @@ fn scatter_trend(table: &BTreeMap<String, Vec<f32>>, key: &str, x_column: &str) 
             ys.push(*y);
         }
     }
-    let (slope, intercept) = linear_fit(&xs, &ys)?;
-    let lo = xs.iter().copied().fold(f32::MAX, f32::min);
-    let hi = xs.iter().copied().fold(f32::MIN, f32::max);
-    Some(Series::Guide {
-        xs: vec![lo, hi],
-        ys: vec![slope * lo + intercept, slope * hi + intercept],
-        color: [0.85, 0.85, 0.85, 0.9],
+    let coef = fit_trend(&xs, &ys, trend == Trend::Polynomial)?;
+    curve_across(xmin, xmax, &[], coef[2] != 0.0, |plot_x| {
+        eval_trend(coef, plot_x)
+    })
+}
+
+/// `y = a + b x + c x^2`, centered so a wide energy axis stays stable.
+/// A polynomial with too few points falls back to a line.
+fn fit_trend(xs: &[f32], ys: &[f32], quadratic: bool) -> Option<[f64; 3]> {
+    let pairs: Vec<(f64, f64)> = xs
+        .iter()
+        .zip(ys)
+        .filter(|(x, y)| x.is_finite() && y.is_finite())
+        .map(|(x, y)| (f64::from(*x), f64::from(*y)))
+        .collect();
+    if pairs.len() < 2 {
+        return None;
+    }
+    if !quadratic || pairs.len() < 3 {
+        let x32: Vec<f32> = pairs.iter().map(|(x, _)| *x as f32).collect();
+        let y32: Vec<f32> = pairs.iter().map(|(_, y)| *y as f32).collect();
+        let (slope, intercept) = linear_fit(&x32, &y32)?;
+        return Some([f64::from(intercept), f64::from(slope), 0.0]);
+    }
+    let mean = pairs.iter().map(|(x, _)| *x).sum::<f64>() / pairs.len() as f64;
+    let mut n = 0.0;
+    let mut s1 = 0.0;
+    let mut s2 = 0.0;
+    let mut s3 = 0.0;
+    let mut s4 = 0.0;
+    let mut sy = 0.0;
+    let mut szy = 0.0;
+    let mut sz2y = 0.0;
+    for (x, y) in &pairs {
+        let z = x - mean;
+        let z2 = z * z;
+        n += 1.0;
+        s1 += z;
+        s2 += z2;
+        s3 += z2 * z;
+        s4 += z2 * z2;
+        sy += y;
+        szy += z * y;
+        sz2y += z2 * y;
+    }
+    let solved = solve3([n, s1, s2, sy], [s1, s2, s3, szy], [s2, s3, s4, sz2y]);
+    let Some([a, b, c]) = solved else {
+        let x32: Vec<f32> = pairs.iter().map(|(x, _)| *x as f32).collect();
+        let y32: Vec<f32> = pairs.iter().map(|(_, y)| *y as f32).collect();
+        let (slope, intercept) = linear_fit(&x32, &y32)?;
+        return Some([f64::from(intercept), f64::from(slope), 0.0]);
+    };
+    let m = mean;
+    Some([a - b * m + c * m * m, b - 2.0 * c * m, c])
+}
+
+fn solve3(r0: [f64; 4], r1: [f64; 4], r2: [f64; 4]) -> Option<[f64; 3]> {
+    let mut rows = [r0, r1, r2];
+    for col in 0..3 {
+        let mut pivot = col;
+        for row in (col + 1)..3 {
+            if rows[row][col].abs() > rows[pivot][col].abs() {
+                pivot = row;
+            }
+        }
+        if rows[pivot][col].abs() < 1e-12 {
+            return None;
+        }
+        rows.swap(col, pivot);
+        let div = rows[col][col];
+        for k in col..4 {
+            rows[col][k] /= div;
+        }
+        for row in 0..3 {
+            if row == col {
+                continue;
+            }
+            let factor = rows[row][col];
+            for k in col..4 {
+                rows[row][k] -= factor * rows[col][k];
+            }
+        }
+    }
+    Some([rows[0][3], rows[1][3], rows[2][3]])
+}
+
+fn eval_trend(coef: [f64; 3], x: f32) -> f32 {
+    let x = f64::from(x);
+    (coef[0] + coef[1] * x + coef[2] * x * x) as f32
+}
+
+fn phys_at_plot_x(plot_x: f32, categories: &[f32], session: usize) -> f32 {
+    let index = plot_x - (session as f32 - 0.5) * OFFSET;
+    let n = categories.len();
+    if n == 0 {
+        return index;
+    }
+    if n == 1 {
+        return categories[0];
+    }
+    if index <= 0.0 {
+        return categories[0] + index * (categories[1] - categories[0]);
+    }
+    let last = (n - 1) as f32;
+    if index >= last {
+        return categories[n - 1] + (index - last) * (categories[n - 1] - categories[n - 2]);
+    }
+    let i = (index.floor() as usize).min(n - 2);
+    let t = index - i as f32;
+    categories[i] + t * (categories[i + 1] - categories[i])
+}
+
+fn curve_across(
+    xmin: f32,
+    xmax: f32,
+    knots: &[f32],
+    smooth: bool,
+    at: impl Fn(f32) -> f32,
+) -> Option<Series> {
+    let mut samples = vec![xmin];
+    for knot in knots {
+        if *knot > xmin && *knot < xmax {
+            samples.push(*knot);
+        }
+    }
+    samples.push(xmax);
+    if smooth {
+        let knots = samples;
+        samples = Vec::with_capacity(knots.len() * 4);
+        for pair in knots.windows(2) {
+            let (a, b) = (pair[0], pair[1]);
+            samples.push(a);
+            samples.push(a + (b - a) * 0.25);
+            samples.push(a + (b - a) * 0.5);
+            samples.push(a + (b - a) * 0.75);
+        }
+        samples.push(xmax);
+    }
+    let mut xs = Vec::new();
+    let mut ys = Vec::new();
+    for x in samples {
+        let y = at(x);
+        if x.is_finite() && y.is_finite() {
+            xs.push(x);
+            ys.push(y);
+        }
+    }
+    if xs.len() < 2 {
+        return None;
+    }
+    // Alpha 0 keeps the previous series color, so the line stays with its session.
+    Some(Series::Polyline {
+        xs,
+        ys,
+        color: [0.85, 0.85, 0.85, 0.0],
         thickness: 1.5,
     })
 }
@@ -1070,42 +1740,46 @@ fn hist_panel(
     shared: bool,
     position_guides: bool,
 ) -> Panel {
-    let pooled: Vec<f32> = tables
+    let columns: Vec<&[f32]> = tables
         .iter()
-        .flat_map(|table| table.get(series.key).into_iter().flatten().copied())
-        .filter(|value| value.is_finite())
+        .filter_map(|table| table.get(series.key).map(Vec::as_slice))
+        .filter(|column| column.iter().any(|value| value.is_finite()))
         .collect();
-    let shared_edges = shared.then(|| histogram(&pooled, bins).0);
+    let shared_edges = shared.then(|| {
+        let mut lo = f32::MAX;
+        let mut hi = f32::MIN;
+        for column in &columns {
+            for value in *column {
+                if value.is_finite() {
+                    lo = lo.min(*value);
+                    hi = hi.max(*value);
+                }
+            }
+        }
+        uniform_edges(lo, hi, bins)
+    });
     let mut drawn = Vec::new();
     let mut peak = 1.0f32;
     let mut lo = f32::MAX;
     let mut hi = f32::MIN;
-    for table in tables {
-        let Some(column) = table.get(series.key) else {
-            continue;
+    for column in columns {
+        let (edges, counts) = if let Some(edges) = &shared_edges {
+            (edges.clone(), count_bins(edges, column))
+        } else {
+            histogram(column, bins)
         };
-        let own: Vec<f32> = column
-            .iter()
-            .copied()
-            .filter(|value| value.is_finite())
-            .collect();
-        if own.is_empty() {
-            continue;
-        }
-        let edges = shared_edges
-            .clone()
-            .unwrap_or_else(|| histogram(&own, bins).0);
         lo = lo.min(edges.first().copied().unwrap_or(0.0));
         hi = hi.max(edges.last().copied().unwrap_or(1.0));
-        let counts = counts_in(&edges, column);
         let total = counts.iter().sum::<f32>().max(1.0);
         let percent: Vec<f32> = counts.iter().map(|count| count / total * 100.0).collect();
         peak = peak.max(percent.iter().copied().fold(0.0, f32::max));
+        let outline = bar_outline(&edges, &percent);
         drawn.push(Series::Bars {
-            edges: edges.clone(),
+            edges,
             counts: percent,
             color: [0.8, 0.8, 0.8, 0.45],
         });
+        drawn.push(outline);
     }
     if position_guides
         && matches!(
@@ -1127,7 +1801,7 @@ fn hist_panel(
         hi = 1.0;
     }
     Panel {
-        title: format!("{} HIST", series.label),
+        title: String::new(),
         y_label: "Probability (%)".into(),
         xmin: lo,
         xmax: hi,
@@ -1135,6 +1809,7 @@ fn hist_panel(
         ymax: peak * 1.1,
         series: drawn,
         x_labels: Vec::new(),
+        equal: false,
     }
 }
 
@@ -1182,7 +1857,7 @@ fn corr_panel(
         });
     }
     Panel {
-        title: format!("{} VS {}", a.label, b.label),
+        title: String::new(),
         y_label: axis_label(b.label, group_label),
         xmin,
         xmax,
@@ -1190,6 +1865,7 @@ fn corr_panel(
         ymax,
         series,
         x_labels: Vec::new(),
+        equal: false,
     }
 }
 
@@ -1346,6 +2022,7 @@ fn note_panel(title: &str) -> Panel {
         ymax: 1.0,
         series: Vec::new(),
         x_labels: Vec::new(),
+        equal: false,
     }
 }
 
@@ -1391,61 +2068,75 @@ fn controls(
     source: &str,
     beam: &str,
     domain: &str,
-    trend: bool,
+    trend: Trend,
     hist: bool,
     corr: bool,
-    fliers: bool,
     interlock: bool,
-    bins: usize,
+    bins: &str,
     hist_bins: usize,
     shared: bool,
     cutoff: f32,
 ) -> Vec<Control> {
     let on = |value: bool| if value { "On" } else { "Off" };
+    let coarse = coarse_of(source);
+    let frame = frame_of(source);
+    let y_opts = y_choices(coarse);
+    let y_labels: Vec<&str> = y_opts.iter().map(|choice| choice.label.as_str()).collect();
+    let y_value = y_opts
+        .iter()
+        .find(|choice| choice.metric == metric && choice.frame == frame)
+        .map(|choice| choice.label.as_str())
+        .unwrap_or(y_labels.first().copied().unwrap_or(metric));
     let slice_x = matches!(source, "timeslice_iso" | "timeslice_chamber")
-        && matches!(
-            metric,
-            "position_error" | "sigma" | "sigma_error" | "ic12_pos_diff"
-        );
+        && (timeslice_energy_only(metric)
+            || matches!(
+                metric,
+                "position_error" | "sigma" | "sigma_error" | "ic12_pos_diff"
+            ));
     let x_choices: &[(&str, &str)] = if slice_x { &X_CHOICES[..1] } else { X_CHOICES };
     let mut controls = vec![
-        labeled("metric", "Y", METRIC_CHOICES, metric),
-        labeled("source", "Source", sources_for(metric), source),
+        labeled("source", "Source", COARSE_CHOICES, coarse),
+        control("metric", "Y", &y_labels, y_value),
         labeled("x", "X", x_choices, x),
         labeled("glyph", "Glyph", GLYPH_CHOICES, glyph),
         labeled("beam", "Beam", BEAM_CHOICES, beam),
         labeled("domain", "Domain", DOMAIN_CHOICES, domain),
-        control("trend", "Trend", &["On", "Off"], on(trend)),
+        control(
+            "trend",
+            "Trend",
+            &["Off", "Linear", "Polynomial"],
+            trend_value(trend),
+        ),
         control("hist", "Histogram", &["Off", "On"], on(hist)),
         control("corr", "Correlation", &["Off", "On"], on(corr)),
-        control("fliers", "Fliers", &["Off", "On"], on(fliers)),
-        control("interlock", "Interlock", &["Off", "On"], on(interlock)),
         control(
-            "bins",
-            "Quantile bins",
-            &["4", "6", "8", "12"],
-            &bins.to_string(),
+            "interlock",
+            "Interlock Thresholds",
+            &["Off", "On"],
+            on(interlock),
         ),
+        control("bins", "Bins", &["Automatic", "8", "16", "32", "64"], bins),
         control(
             "hist_bins",
-            "Histogram bins",
+            "Histogram Bins",
             &["10", "20", "30", "50"],
             &hist_bins.to_string(),
         ),
-        control("shared", "Shared bins", &["Off", "On"], on(shared)),
+        control("shared", "Shared Bins", &["Off", "On"], on(shared)),
         control(
             "cutoff",
-            "Contour cutoff",
+            "Contour Cutoff",
             &["0", "5", "10", "20"],
             &cutoff.round().to_string(),
         ),
     ];
-    let quantile = x != "energy";
+    let filters = GROUPS
+        .iter()
+        .any(|group| group.id == metric && group.filter);
     controls.retain(|item| match item.id.as_str() {
         "cutoff" => glyph == "contour",
-        "fliers" => matches!(glyph, "box" | "violin" | "mean"),
-        "bins" => quantile && !matches!(glyph, "scatter" | "contour"),
         "interlock" => interlock_ok(metric, x, glyph),
+        "beam" | "domain" => filters,
         _ => true,
     });
     controls
@@ -1460,7 +2151,7 @@ fn interlock_ok(metric: &str, x: &str, glyph: &str) -> bool {
     }
 }
 
-fn labeled(id: &str, label: &str, pairs: &[(&str, &str)], current: &str) -> Control {
+pub(crate) fn labeled(id: &str, label: &str, pairs: &[(&str, &str)], current: &str) -> Control {
     let value = pairs
         .iter()
         .find(|(key, _)| *key == current)
@@ -2361,6 +3052,10 @@ fn load_slice_metric(
             .map(|(ic2, ic1)| ic2 - ic1)
             .collect::<Vec<_>>()
     };
+    table.insert("ic1_x".to_string(), take(ic1_x_mm.clone()));
+    table.insert("ic1_y".to_string(), take(ic1_y_mm.clone()));
+    table.insert("ic2_x".to_string(), take(ic2_x_mm.clone()));
+    table.insert("ic2_y".to_string(), take(ic2_y_mm.clone()));
     table.insert("ic12_x_diff".to_string(), take(gap(&ic2_x_mm, &ic1_x_mm)));
     table.insert("ic12_y_diff".to_string(), take(gap(&ic2_y_mm, &ic1_y_mm)));
     table
@@ -2690,19 +3385,40 @@ fn fit_strip_iso(strip: &[f32], iso: &[f32]) -> Option<(f32, f32)> {
     Some((slope, intercept))
 }
 
-fn load_timeslice(root: &Path, session: &str, metric: &str) -> BTreeMap<String, Vec<f32>> {
-    let Some(map_bytes) = discover::read_session_file(root, session, "input_map.csv") else {
-        return BTreeMap::new();
-    };
+fn timeslice_inputs(root: &Path, session: &str) -> Option<(Vec<Vec<u8>>, Vec<f32>, Vec<i64>)> {
+    let map_bytes = discover::read_session_file(root, session, "input_map.csv")?;
     let map = read_sheet(&map_bytes);
     let energies = unique_seen(&column(&map, "energy", &[]));
     let frames = discover::read_timeslice_frames(&discover::session_directory(root, session));
-    let layer_of: Vec<i64> = frames.iter().map(|(index, _)| *index).collect();
-    let files: Vec<Vec<u8>> = frames.into_iter().map(|(_, bytes)| bytes).collect();
+    if frames.is_empty() {
+        return None;
+    }
+    let layers = frames.iter().map(|(index, _)| *index).collect();
+    let files = frames.into_iter().map(|(_, bytes)| bytes).collect();
+    Some((files, energies, layers))
+}
+
+fn load_timeslice(root: &Path, session: &str, metric: &str) -> BTreeMap<String, Vec<f32>> {
+    let Some((files, energies, layer_of)) = timeslice_inputs(root, session) else {
+        return BTreeMap::new();
+    };
     if metric == "current_ratio" {
         return current_ratio_table(&files, &energies, &layer_of);
     }
+    if matches!(
+        metric,
+        "fit_confidence" | "peak_amplitude" | "amplifier_error" | "probe_field"
+    ) {
+        return signal_table(&files, &energies, &layer_of, metric);
+    }
     current_table(&files, &energies, &layer_of)
+}
+
+fn timeslice_energy_only(metric: &str) -> bool {
+    matches!(
+        metric,
+        "fit_confidence" | "peak_amplitude" | "amplifier_error" | "probe_field"
+    )
 }
 
 /// Folder `layer-N` picks the Nth energy in input-map order. A path with no
@@ -2716,18 +3432,180 @@ fn frame_energy(energies: &[f32], layer_idx: i64, file_index: usize) -> f32 {
     energies.get(index).copied().unwrap_or(f32::NAN)
 }
 
+fn signal_table(
+    files: &[Vec<u8>],
+    energies: &[f32],
+    layers: &[i64],
+    metric: &str,
+) -> BTreeMap<String, Vec<f32>> {
+    signal_from(&read_sheets(files, signal_column), energies, layers, metric)
+}
+
+fn signal_from(
+    sheets: &[Sheet],
+    energies: &[f32],
+    layers: &[i64],
+    metric: &str,
+) -> BTreeMap<String, Vec<f32>> {
+    let spec: &[(&str, &str)] = match metric {
+        "fit_confidence" => &[
+            ("ic1_x_confidence", "r_ic1_x_confidence"),
+            ("ic1_y_confidence", "r_ic1_y_confidence"),
+            ("ic2_x_confidence", "r_ic2_x_confidence"),
+            ("ic2_y_confidence", "r_ic2_y_confidence"),
+        ],
+        "peak_amplitude" => &[
+            ("ic1_x_peak", "ic1_x_peak_amplitude"),
+            ("ic1_y_peak", "ic1_y_peak_amplitude"),
+            ("ic2_x_peak", "ic2_x_peak_amplitude"),
+            ("ic2_y_peak", "ic2_y_peak_amplitude"),
+        ],
+        "probe_field" => &[("field_x", "mag_field_x"), ("field_y", "mag_field_y")],
+        _ => &[],
+    };
+    let mut energy = Vec::new();
+    let mut beam = Vec::new();
+    if metric == "amplifier_error" {
+        let mut stored = vec![Vec::new(); 6];
+        for (index, sheet) in sheets.iter().enumerate() {
+            let tag = frame_energy(energies, layers.get(index).copied().unwrap_or(-1), index);
+            let columns = [
+                column_diff(sheet, "amplifier_cmd_x", "amplifier_readback_x"),
+                column_diff(sheet, "amplifier_cmd_y", "amplifier_readback_y"),
+                resolved_column(sheet, "amplifier_cmd_x"),
+                resolved_column(sheet, "amplifier_readback_x"),
+                resolved_column(sheet, "amplifier_cmd_y"),
+                resolved_column(sheet, "amplifier_readback_y"),
+            ];
+            append_samples(sheet, tag, &columns, &mut energy, &mut beam, &mut stored);
+        }
+        return signal_rows(
+            energy,
+            beam,
+            &[
+                ("amp_x", &stored[0]),
+                ("amp_y", &stored[1]),
+                ("amp_cmd_x", &stored[2]),
+                ("amp_read_x", &stored[3]),
+                ("amp_cmd_y", &stored[4]),
+                ("amp_read_y", &stored[5]),
+            ],
+        );
+    }
+    let mut stored = vec![Vec::new(); spec.len()];
+    for (index, sheet) in sheets.iter().enumerate() {
+        let tag = frame_energy(energies, layers.get(index).copied().unwrap_or(-1), index);
+        let columns: Vec<Vec<f32>> = spec
+            .iter()
+            .map(|(_, concept)| resolved_column(sheet, concept))
+            .collect();
+        append_samples(sheet, tag, &columns, &mut energy, &mut beam, &mut stored);
+    }
+    let pairs: Vec<(&str, &Vec<f32>)> = spec
+        .iter()
+        .zip(&stored)
+        .map(|((key, _), values)| (*key, values))
+        .collect();
+    signal_rows(energy, beam, &pairs)
+}
+
+fn resolved_column(sheet: &Sheet, concept: &str) -> Vec<f32> {
+    let keys: Vec<String> = sheet.num.keys().cloned().collect();
+    let Some(name) = resolve_concept_column(&keys, concept) else {
+        return Vec::new();
+    };
+    sheet.num.get(name).cloned().unwrap_or_default()
+}
+
+/// Readback minus command. An axis is absent when either column is missing.
+fn column_diff(sheet: &Sheet, command: &str, readback: &str) -> Vec<f32> {
+    let command = resolved_column(sheet, command);
+    let readback = resolved_column(sheet, readback);
+    if command.is_empty() || readback.is_empty() {
+        return Vec::new();
+    }
+    command
+        .into_iter()
+        .zip(readback)
+        .map(|(command, readback)| {
+            if command.is_finite() && readback.is_finite() {
+                readback - command
+            } else {
+                f32::NAN
+            }
+        })
+        .collect()
+}
+
+fn append_samples(
+    sheet: &Sheet,
+    tag: f32,
+    columns: &[Vec<f32>],
+    energy: &mut Vec<f32>,
+    beam_out: &mut Vec<f32>,
+    series_out: &mut [Vec<f32>],
+) {
+    let n = columns.iter().map(Vec::len).max().unwrap_or(0);
+    if n == 0 {
+        return;
+    }
+    let gate = column_any(sheet, &["rci_in_trigger", "r_beamOk", "beam_on"]);
+    // ponytail: one sample per stride past 80k rows. The plot is a distribution,
+    // so a uniform subsample keeps the shape; raise the cap if a tail matters.
+    let stride = (n / 80_000).max(1);
+    for sample in (0..n).step_by(stride) {
+        let any = columns
+            .iter()
+            .any(|column| column.get(sample).copied().unwrap_or(f32::NAN).is_finite());
+        if !any {
+            continue;
+        }
+        energy.push(tag);
+        for (out, column) in series_out.iter_mut().zip(columns) {
+            out.push(column.get(sample).copied().unwrap_or(f32::NAN));
+        }
+        beam_out.push(
+            gate.as_ref()
+                .and_then(|values| values.get(sample).copied())
+                .unwrap_or(1.0),
+        );
+    }
+}
+
+fn signal_rows(
+    energy: Vec<f32>,
+    beam: Vec<f32>,
+    pairs: &[(&str, &Vec<f32>)],
+) -> BTreeMap<String, Vec<f32>> {
+    let mut table = BTreeMap::new();
+    if energy.is_empty() {
+        return table;
+    }
+    table.insert("energy".to_string(), energy);
+    table.insert("beam_on".to_string(), beam);
+    for (key, values) in pairs {
+        if values.iter().any(|value| value.is_finite()) {
+            table.insert((*key).to_string(), (*values).clone());
+        }
+    }
+    table
+}
+
 fn current_table(
     files: &[Vec<u8>],
     energies: &[f32],
     layers: &[i64],
 ) -> BTreeMap<String, Vec<f32>> {
+    current_from(&read_sheets(files, current_column), energies, layers)
+}
+
+fn current_from(sheets: &[Sheet], energies: &[f32], layers: &[i64]) -> BTreeMap<String, Vec<f32>> {
     let mut out_energy = Vec::new();
     let mut ic1 = Vec::new();
     let mut ic2 = Vec::new();
     let mut ic3 = Vec::new();
     let mut beam = Vec::new();
     let mut any_ic3 = false;
-    let sheets = read_sheets(files, current_column);
     for (index, sheet) in sheets.iter().enumerate() {
         let tag = frame_energy(energies, layers.get(index).copied().unwrap_or(-1), index);
         let a = scaled_current(sheet, "ic1");
@@ -2798,7 +3676,9 @@ fn current_ratio_table(
     }
     let mut table = BTreeMap::new();
     if !out_energy.is_empty() {
+        let rows = out_energy.len();
         table.insert("energy".to_string(), out_energy);
+        table.insert("beam_on".to_string(), vec![1.0; rows]);
         table.insert("ic21_ratio".to_string(), ic21);
         if any_ic3 {
             table.insert("ic31_ratio".to_string(), ic31);
@@ -2928,7 +3808,12 @@ fn column_any(sheet: &Sheet, names: &[&str]) -> Option<Vec<f32>> {
     names.iter().find_map(|name| sheet.num.get(*name).cloned())
 }
 
-fn apply_filter(table: &mut BTreeMap<String, Vec<f32>>, keys: &[&str], domain: &str, beam: &str) {
+pub(crate) fn apply_filter(
+    table: &mut BTreeMap<String, Vec<f32>>,
+    keys: &[&str],
+    domain: &str,
+    beam: &str,
+) {
     let n = table.values().map(Vec::len).max().unwrap_or(0);
     if n == 0 {
         return;
@@ -2967,11 +3852,10 @@ fn apply_filter(table: &mut BTreeMap<String, Vec<f32>>, keys: &[&str], domain: &
             if domain == "mad_outliers" {
                 let z: Vec<Vec<f32>> = columns.iter().map(|column| modified_z(column)).collect();
                 for row in 0..n {
-                    if z.iter()
-                        .any(|axis| axis.get(row).copied().unwrap_or(0.0).abs() > MOD_Z)
-                    {
-                        keep[row] = false;
-                    }
+                    let outlier = z
+                        .iter()
+                        .any(|axis| axis.get(row).copied().unwrap_or(0.0).abs() > MOD_Z);
+                    keep[row] &= outlier;
                 }
             } else if !valid.is_empty() {
                 let cutoff = percentile(&valid, 0.95);
@@ -2999,6 +3883,88 @@ fn apply_filter(table: &mut BTreeMap<String, Vec<f32>>, keys: &[&str], domain: &
     }
 }
 
+const AUTO_LEVELS: usize = 100;
+const AUTO_QUANTILES: usize = 32;
+
+enum BinChoice {
+    Automatic,
+    Fixed(usize),
+}
+
+fn bin_choice(options: &Value) -> BinChoice {
+    let raw = text(options, "bins", "Automatic");
+    if raw.eq_ignore_ascii_case("automatic") {
+        BinChoice::Automatic
+    } else {
+        BinChoice::Fixed(raw.parse::<usize>().unwrap_or(AUTO_QUANTILES).clamp(2, 64))
+    }
+}
+
+fn bin_label(choice: &BinChoice) -> String {
+    match choice {
+        BinChoice::Automatic => "Automatic".to_string(),
+        BinChoice::Fixed(count) => count.to_string(),
+    }
+}
+
+/// Sorted levels when fewer than `limit` exist. `None` means the column is continuous.
+fn quantized_levels(
+    tables: &[BTreeMap<String, Vec<f32>>],
+    key: &str,
+    limit: usize,
+) -> Option<Vec<f32>> {
+    let mut levels = Vec::new();
+    for table in tables {
+        let Some(column) = table.get(key) else {
+            continue;
+        };
+        for value in column {
+            if !value.is_finite() || levels.iter().any(|have| same(*have, *value)) {
+                continue;
+            }
+            if levels.len() + 1 >= limit {
+                return None;
+            }
+            levels.push(*value);
+        }
+    }
+    levels.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    Some(levels)
+}
+
+/// One X rule for every column. Automatic keeps a short quantized axis and
+/// otherwise uses 32 quantile bins. A fixed count always regroups.
+fn assign_x(
+    tables: &mut [BTreeMap<String, Vec<f32>>],
+    column: &str,
+    choice: &BinChoice,
+) -> Vec<f32> {
+    let quantiles = match choice {
+        BinChoice::Fixed(count) => *count,
+        BinChoice::Automatic => match quantized_levels(tables, column, AUTO_LEVELS) {
+            Some(levels) => {
+                for table in tables.iter_mut() {
+                    let values = table.get(column).cloned().unwrap_or_default();
+                    table.insert("_bin".to_string(), values);
+                }
+                return levels;
+            }
+            None => AUTO_QUANTILES,
+        },
+    };
+    let values: Vec<f32> = tables
+        .iter()
+        .flat_map(|table| table.get(column).into_iter().flatten().copied())
+        .collect();
+    let edges = quantile_edges(&values, quantiles);
+    for table in tables.iter_mut() {
+        let centers =
+            assign_bin_centers(table.get(column).map(Vec::as_slice).unwrap_or(&[]), &edges);
+        table.insert("_bin".to_string(), centers);
+    }
+    unique_values(tables, "_bin")
+}
+
 fn unique_values(tables: &[BTreeMap<String, Vec<f32>>], key: &str) -> Vec<f32> {
     let mut values = Vec::new();
     for table in tables {
@@ -3012,23 +3978,6 @@ fn unique_values(tables: &[BTreeMap<String, Vec<f32>>], key: &str) -> Vec<f32> {
     }
     values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     values
-}
-
-fn quantile_categories(tables: &[BTreeMap<String, Vec<f32>>], key: &str, bins: usize) -> Vec<f32> {
-    let values: Vec<f32> = tables
-        .iter()
-        .flat_map(|table| table.get(key).into_iter().flatten().copied())
-        .filter(|value| value.is_finite())
-        .collect();
-    let edges = quantile_edges(&values, bins);
-    let mut unique = Vec::new();
-    for center in assign_bin_centers(&values, &edges) {
-        if center.is_finite() && !unique.iter().any(|have| same(*have, center)) {
-            unique.push(center);
-        }
-    }
-    unique.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    unique
 }
 
 fn dose_rate_table(table: &BTreeMap<String, Vec<f32>>) -> BTreeMap<String, Vec<f32>> {
@@ -3156,21 +4105,67 @@ fn pchip(xs: &[f32], ys: &[f32]) -> (Vec<f32>, Vec<f32>) {
     (out_x, out_y)
 }
 
-fn counts_in(edges: &[f32], values: &[f32]) -> Vec<f32> {
-    let mut counts = vec![0.0f32; edges.len().saturating_sub(1)];
+fn uniform_edges(lo: f32, hi: f32, bins: usize) -> Vec<f32> {
+    let bins = bins.max(1);
+    let (lo, hi) = if !lo.is_finite() || !hi.is_finite() || (hi - lo).abs() < 1e-12 {
+        (lo - 0.5, (lo - 0.5) + 1.0)
+    } else {
+        (lo, hi)
+    };
+    (0..=bins)
+        .map(|step| lo + (hi - lo) * step as f32 / bins as f32)
+        .collect()
+}
+
+fn count_bins(edges: &[f32], values: &[f32]) -> Vec<f32> {
+    let bins = edges.len().saturating_sub(1);
+    let mut counts = vec![0.0f32; bins];
+    if bins == 0 {
+        return counts;
+    }
+    let lo = edges[0];
+    let hi = edges[bins];
+    let span = hi - lo;
+    if !span.is_finite() || span <= 0.0 {
+        return counts;
+    }
+    let scale = bins as f32 / span;
     for value in values {
-        if !value.is_finite() || counts.is_empty() {
+        if !value.is_finite() || *value < lo || *value > hi {
             continue;
         }
-        let mut index = 0usize;
-        while index + 1 < edges.len() - 1 && *value >= edges[index + 1] {
-            index += 1;
+        let mut index = ((*value - lo) * scale) as usize;
+        if index >= bins {
+            index = bins - 1;
         }
-        if *value >= edges[0] && *value <= *edges.last().unwrap_or(&f32::MAX) {
-            counts[index] += 1.0;
-        }
+        counts[index] += 1.0;
     }
     counts
+}
+
+fn bar_outline(edges: &[f32], counts: &[f32]) -> Series {
+    let mut xs = Vec::new();
+    let mut ys = Vec::new();
+    for (index, count) in counts.iter().copied().enumerate() {
+        if !count.is_finite() || count <= 0.0 {
+            continue;
+        }
+        let (Some(left), Some(right)) = (edges.get(index).copied(), edges.get(index + 1).copied())
+        else {
+            continue;
+        };
+        if !left.is_finite() || !right.is_finite() {
+            continue;
+        }
+        xs.extend([left, right, right, left, left, f32::NAN]);
+        ys.extend([0.0, 0.0, count, count, 0.0, f32::NAN]);
+    }
+    Series::Polyline {
+        xs,
+        ys,
+        color: [0.85, 0.85, 0.85, 0.0],
+        thickness: 1.0,
+    }
 }
 
 fn has_finite(values: Option<&Vec<f32>>) -> bool {
@@ -3346,6 +4341,10 @@ fn parse_sigma_bands(xml: &str) -> Vec<Band> {
     bands
 }
 
+pub(crate) fn interlock_sigma_mm(xml: &str, device: &str, energy: f64) -> Option<f64> {
+    expected_mm(&parse_sigma_bands(xml), device, energy)
+}
+
 fn expected_mm(bands: &[Band], device: &str, energy: f64) -> Option<f64> {
     let band = bands
         .iter()
@@ -3370,6 +4369,10 @@ fn header_base(name: &str) -> &str {
     name.split('.').next().unwrap_or(name)
 }
 
+fn timeline_column(name: &str) -> bool {
+    current_column(name) || signal_column(name)
+}
+
 fn current_column(name: &str) -> bool {
     let lower = header_base(name).to_ascii_lowercase();
     lower == "layer_id"
@@ -3378,6 +4381,48 @@ fn current_column(name: &str) -> bool {
         || lower == "beam_on"
         || lower.contains("current")
         || lower.contains("primary_channel")
+}
+
+fn signal_column(name: &str) -> bool {
+    let lower = header_base(name).to_ascii_lowercase();
+    if lower == "layer_id"
+        || lower == "rci_in_trigger"
+        || lower == "r_beamok"
+        || lower == "beam_on"
+        || lower == "c_x"
+        || lower == "c_y"
+        || lower.contains("confidence")
+        || lower.contains("peak")
+    {
+        return true;
+    }
+    const NAMES: &[&str] = &[
+        "amplifier_x_target",
+        "amplifier_cmd_x",
+        "amplifier_y_target",
+        "amplifier_cmd_y",
+        "amplifier_x_readback",
+        "r_xi",
+        "r_xv",
+        "amplifier_readback_x",
+        "amplifier_y_readback",
+        "r_yi",
+        "r_yv",
+        "amplifier_readback_y",
+        "r_tx2_probe_x",
+        "field_c_x",
+        "r_xb",
+        "mag_field_x",
+        "field_x",
+        "b_field_x",
+        "r_tx2_probe_y",
+        "field_c_y",
+        "r_yb",
+        "mag_field_y",
+        "field_y",
+        "b_field_y",
+    ];
+    NAMES.contains(&lower.as_str())
 }
 
 fn slice_column(name: &str) -> bool {
@@ -3757,21 +4802,21 @@ fn text<'a>(options: &'a Value, key: &str, default: &'a str) -> &'a str {
     options.get(key).and_then(Value::as_str).unwrap_or(default)
 }
 
-fn pick(
+pub(crate) fn pick(
     options: &Value,
     key: &str,
     default_id: &'static str,
     pairs: &[(&'static str, &'static str)],
 ) -> &'static str {
-    let raw = options
-        .get(key)
-        .and_then(Value::as_str)
-        .unwrap_or(default_id);
+    pick_in(options, key, pairs).unwrap_or(default_id)
+}
+
+fn pick_in<'a>(options: &Value, key: &str, pairs: &[(&'a str, &'a str)]) -> Option<&'a str> {
+    let raw = options.get(key).and_then(Value::as_str)?;
     pairs
         .iter()
         .find(|(id, label)| *id == raw || *label == raw)
         .map(|(id, _)| *id)
-        .unwrap_or(default_id)
 }
 
 fn flag(options: &Value, key: &str, default_on: bool) -> bool {
@@ -3789,8 +4834,9 @@ mod tests {
     use scan_kit_core::Series;
 
     use super::{
-        axis_label, binned_summary, days_from_civil, parse_datetime, read_sheet, spot_delivery_ms,
-        violin_series,
+        apply_filter, assign_x, axis_label, binned_summary, binned_trend, contour_bands,
+        days_from_civil, parse_datetime, read_sheet, signal_table, spot_delivery_ms, violin_series,
+        BinChoice, Trend,
     };
 
     #[test]
@@ -4339,33 +5385,188 @@ mod tests {
     }
 
     #[test]
-    fn dose_error_source_stays_on_the_spot_frame() {
-        let scene = binned_summary(
+    fn spot_timeslice_switch_follows_the_metric_list() {
+        let spot = binned_summary(
             std::path::Path::new("."),
             &[],
-            &serde_json::json!({"metric": "Dose Error (%)", "source": "Timeslice — Isocenter"}),
+            &serde_json::json!({"metric": "Dose Error (%)"}),
         );
-        let source = scene
+        let source = spot
             .controls
             .iter()
             .find(|control| control.id == "source")
             .unwrap();
-        assert_eq!(source.options, vec!["Spot — Isocenter".to_string()]);
-        assert_eq!(source.value, "Spot — Isocenter");
-        assert!(scene.controls.iter().any(|control| control.id == "fliers"));
-        assert!(scene.controls.iter().all(|control| control.id != "cutoff"));
-        assert!(scene.controls.iter().all(|control| control.id != "preset"));
+        assert_eq!(
+            source.options,
+            vec!["Spot".to_string(), "Timeslice".to_string()]
+        );
+        assert_eq!(source.value, "Spot");
+        assert!(spot.controls.iter().all(|control| control.id != "frame"));
+        let metric = spot
+            .controls
+            .iter()
+            .find(|control| control.id == "metric")
+            .unwrap();
+        assert_eq!(metric.value, "Dose Error (%)");
+        assert!(metric
+            .options
+            .iter()
+            .any(|option| option == "Position Error (mm) (Isocenter)"));
+        assert!(metric
+            .options
+            .iter()
+            .any(|option| option == "Position Error (mm) (Chamber)"));
+        assert!(metric
+            .options
+            .iter()
+            .all(|option| option != "IC Current (nA)"));
+        assert!(metric
+            .options
+            .iter()
+            .all(|option| option != "Fit Confidence"));
+        let bins = spot
+            .controls
+            .iter()
+            .find(|control| control.id == "bins")
+            .unwrap();
+        assert_eq!(bins.value, "Automatic");
+        assert_eq!(
+            bins.options,
+            vec![
+                "Automatic".to_string(),
+                "8".to_string(),
+                "16".to_string(),
+                "32".to_string(),
+                "64".to_string()
+            ]
+        );
+        let trend = spot
+            .controls
+            .iter()
+            .find(|control| control.id == "trend")
+            .unwrap();
+        assert_eq!(trend.value, "Off");
+        assert_eq!(
+            trend.options,
+            vec![
+                "Off".to_string(),
+                "Linear".to_string(),
+                "Polynomial".to_string()
+            ]
+        );
+        assert!(spot.controls.iter().all(|control| control.id != "fliers"));
+        assert!(spot.controls.iter().all(|control| control.id != "cutoff"));
+        let position = binned_summary(
+            std::path::Path::new("."),
+            &[],
+            &serde_json::json!({"metric": "position_error"}),
+        );
+        let interlock = position
+            .controls
+            .iter()
+            .find(|control| control.id == "interlock")
+            .unwrap();
+        assert_eq!(interlock.label, "Interlock Thresholds");
+        assert_eq!(interlock.value, "Off");
+        assert_eq!(interlock.options, vec!["Off".to_string(), "On".to_string()]);
+
+        let switched = binned_summary(
+            std::path::Path::new("."),
+            &[],
+            &serde_json::json!({"metric": "Dose Error (%)", "source": "Timeslice"}),
+        );
+        let metric = switched
+            .controls
+            .iter()
+            .find(|control| control.id == "metric")
+            .unwrap();
+        assert_eq!(metric.value, "Current Ratios (%)");
+        for label in [
+            "Fit Confidence",
+            "Peak Amplitude",
+            "Amplifier Error (V)",
+            "Probe Field (G)",
+            "Position Error (mm)",
+        ] {
+            assert!(
+                metric.options.iter().any(|option| option == label),
+                "{label}"
+            );
+        }
+        let fit = binned_summary(
+            std::path::Path::new("."),
+            &[],
+            &serde_json::json!({"metric": "Fit Confidence", "source": "Timeslice", "x": "Target MU"}),
+        );
+        let x = fit
+            .controls
+            .iter()
+            .find(|control| control.id == "x")
+            .unwrap();
+        assert_eq!(x.value, "Energy");
+        assert_eq!(x.options, vec!["Energy".to_string()]);
+        assert!(metric
+            .options
+            .iter()
+            .any(|option| option == "IC2-IC1 Position (mm) (Chamber)"));
+        assert!(metric
+            .options
+            .iter()
+            .all(|option| option != "Dose Error (%)"));
+        assert!(metric
+            .options
+            .iter()
+            .all(|option| option != "Position Error (mm) (Chamber)"));
+
+        let position = binned_summary(
+            std::path::Path::new("."),
+            &[],
+            &serde_json::json!({"metric": "Position Error (mm) (Chamber)", "source": "Spot"}),
+        );
+        assert_eq!(
+            position
+                .controls
+                .iter()
+                .find(|control| control.id == "metric")
+                .unwrap()
+                .value,
+            "Position Error (mm) (Chamber)"
+        );
+        assert!(position
+            .controls
+            .iter()
+            .all(|control| control.id != "frame"));
+        let slice = binned_summary(
+            std::path::Path::new("."),
+            &[],
+            &serde_json::json!({"metric": "Position Error (mm)", "source": "Timeslice", "frame": "Chamber"}),
+        );
+        assert_eq!(
+            slice
+                .controls
+                .iter()
+                .find(|control| control.id == "metric")
+                .unwrap()
+                .value,
+            "Position Error (mm)"
+        );
+        assert!(slice.controls.iter().any(|control| control.id == "bins"));
+        assert!(slice.controls.iter().all(|control| control.id != "frame"));
+
         let current = binned_summary(
             std::path::Path::new("."),
             &[],
             &serde_json::json!({"metric": "IC Current (nA)"}),
         );
-        let source = current
-            .controls
-            .iter()
-            .find(|control| control.id == "source")
-            .unwrap();
-        assert_eq!(source.options, vec!["Timeslice — Isocenter".to_string()]);
+        assert_eq!(
+            current
+                .controls
+                .iter()
+                .find(|control| control.id == "source")
+                .unwrap()
+                .value,
+            "Timeslice"
+        );
     }
 
     #[test]
@@ -4389,6 +5590,16 @@ mod tests {
             &ids,
             &serde_json::json!({"hist": "On", "shared": "On"}),
         );
+        let hist = own
+            .panels
+            .iter()
+            .find(|panel| panel.y_label == "Probability (%)")
+            .unwrap();
+        assert!(hist.title.is_empty());
+        assert!(hist
+            .series
+            .iter()
+            .any(|series| matches!(series, Series::Polyline { .. })));
         let own_edges = hist_edges(&own);
         let shared_edges = hist_edges(&shared);
         assert!(own_edges[0].last().unwrap() < &10.0);
@@ -4398,11 +5609,181 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    #[test]
+    fn automatic_bins_keep_a_short_axis_and_a_fixed_count_regroups() {
+        let column = |values: &[f32]| {
+            let mut table = BTreeMap::new();
+            table.insert("x".to_string(), values.to_vec());
+            vec![table]
+        };
+        let short = column(&[1.0, 1.0, 2.0, 5.0]);
+        let mut tables = short;
+        let levels = assign_x(&mut tables, "x", &BinChoice::Automatic);
+        assert_eq!(levels, vec![1.0, 2.0, 5.0]);
+        assert_eq!(tables[0]["_bin"], vec![1.0, 1.0, 2.0, 5.0]);
+
+        let many: Vec<f32> = (0..100).map(|value| value as f32).collect();
+        let mut tables = column(&many);
+        let grouped = assign_x(&mut tables, "x", &BinChoice::Automatic);
+        assert!(
+            grouped.len() <= 32,
+            "a long axis falls back to quantile bins"
+        );
+        assert!(grouped.len() > 1);
+
+        let mut tables = column(&[10.0, 20.0, 30.0, 40.0, 50.0]);
+        let fixed = assign_x(&mut tables, "x", &BinChoice::Fixed(2));
+        assert!(fixed.len() <= 2);
+    }
+
+    #[test]
+    fn trend_line_crosses_the_axis_and_a_polynomial_bends() {
+        let mut table = BTreeMap::new();
+        table.insert("_bin".to_string(), vec![20.0, 20.0, 30.0, 30.0]);
+        table.insert("y".to_string(), vec![2.0, 2.0, 4.0, 4.0]);
+        let line = binned_trend(
+            &table,
+            &table["y"],
+            &[10.0, 20.0, 30.0],
+            0,
+            -0.6,
+            2.6,
+            Trend::Linear,
+        )
+        .unwrap();
+        let Series::Polyline { xs, .. } = &line else {
+            panic!("trend is a polyline");
+        };
+        assert!((xs[0] + 0.6).abs() < 1e-4, "left edge, got {}", xs[0]);
+        assert!((xs.last().unwrap() - 2.6).abs() < 1e-4, "right edge");
+
+        let mut curved = BTreeMap::new();
+        curved.insert("_bin".to_string(), vec![0.0, 1.0, 2.0]);
+        curved.insert("y".to_string(), vec![0.0, 1.0, 0.0]);
+        let y_at_middle = |mode: Trend| {
+            let line =
+                binned_trend(&curved, &curved["y"], &[0.0, 1.0, 2.0], 0, -0.6, 2.6, mode).unwrap();
+            let Series::Polyline { xs, ys, .. } = line else {
+                panic!("trend is a polyline");
+            };
+            let middle = 1.0 + (0.0 - 0.5) * super::OFFSET;
+            let (mut best, mut y) = (f32::MAX, 0.0);
+            for (x, value) in xs.iter().zip(&ys) {
+                let distance = (x - middle).abs();
+                if distance < best {
+                    best = distance;
+                    y = *value;
+                }
+            }
+            y
+        };
+        assert!(y_at_middle(Trend::Linear) < 0.5);
+        assert!(y_at_middle(Trend::Polynomial) > 0.5);
+    }
+
+    #[test]
+    fn filters_keep_the_rows_their_names_describe() {
+        let values: Vec<f32> = (0..20).map(|value| value as f32).chain([1000.0]).collect();
+        let mut beam = vec![1.0; values.len()];
+        beam[0] = 0.0;
+        let fresh = || {
+            let mut table = BTreeMap::new();
+            table.insert("y".to_string(), values.clone());
+            table.insert("beam_on".to_string(), beam.clone());
+            table
+        };
+        let finite = |table: &BTreeMap<String, Vec<f32>>| {
+            table["y"]
+                .iter()
+                .copied()
+                .filter(|value| value.is_finite())
+                .collect::<Vec<_>>()
+        };
+
+        let mut upper = fresh();
+        apply_filter(&mut upper, &["y"], "upper_95", "beam_both");
+        assert_eq!(finite(&upper), vec![1000.0]);
+
+        let mut lower = fresh();
+        apply_filter(&mut lower, &["y"], "lower_95", "beam_both");
+        let kept = finite(&lower);
+        assert!(kept.contains(&1.0));
+        assert!(!kept.contains(&1000.0));
+
+        let mut mad = fresh();
+        apply_filter(&mut mad, &["y"], "mad_outliers", "beam_both");
+        assert_eq!(finite(&mad), vec![1000.0]);
+
+        let mut off = fresh();
+        apply_filter(&mut off, &["y"], "all", "beam_off");
+        assert_eq!(finite(&off), vec![0.0]);
+
+        let mut on = fresh();
+        apply_filter(&mut on, &["y"], "all", "beam_on");
+        let kept = finite(&on);
+        assert!(!kept.contains(&0.0));
+        assert!(kept.contains(&1000.0));
+
+        let dose = binned_summary(
+            std::path::Path::new("."),
+            &[],
+            &serde_json::json!({"metric": "dose_error"}),
+        );
+        let beam = dose
+            .controls
+            .iter()
+            .find(|control| control.id == "beam")
+            .unwrap();
+        assert_eq!(beam.value, "Both");
+        assert_eq!(
+            beam.options,
+            vec![
+                "Beam On".to_string(),
+                "Beam Off".to_string(),
+                "Both".to_string()
+            ]
+        );
+        let domain = dose
+            .controls
+            .iter()
+            .find(|control| control.id == "domain")
+            .unwrap();
+        assert_eq!(
+            domain.options,
+            vec![
+                "All".to_string(),
+                "Lower 95%".to_string(),
+                "Upper 5%".to_string(),
+                "MAD Outliers".to_string()
+            ]
+        );
+        let current = binned_summary(
+            std::path::Path::new("."),
+            &[],
+            &serde_json::json!({"metric": "ic_current"}),
+        );
+        let current_beam = current
+            .controls
+            .iter()
+            .find(|control| control.id == "beam")
+            .unwrap();
+        assert_eq!(current_beam.value, "Beam On");
+        let rate = binned_summary(
+            std::path::Path::new("."),
+            &[],
+            &serde_json::json!({"metric": "dose_rate"}),
+        );
+        assert!(rate
+            .controls
+            .iter()
+            .all(|control| control.id != "beam" && control.id != "domain"));
+    }
+
     fn hist_edges(scene: &scan_kit_core::PlotScene) -> Vec<Vec<f32>> {
         scene
             .panels
             .iter()
-            .find(|panel| panel.title.contains("HIST"))
+            .find(|panel| panel.y_label == "Probability (%)")
             .unwrap()
             .series
             .iter()
@@ -4426,17 +5807,116 @@ mod tests {
     }
 
     #[test]
+    fn timeslice_signals_keep_low_confidence_and_tracking_error() {
+        let device = b"\
+rci_in_trigger,r_ic1_x_confidence,r_ic1_x_peak_amplitude,c_x,r_xV,r_tx2_probe_x
+1,90,4,1.0,1.2,30
+0,10,1,1.0,1.5,-10
+1,40,2,2.0,2.0,5
+";
+        let other = b"rci_in_trigger,r_ic1_current\n1,3\n";
+        let files = vec![device.to_vec(), other.to_vec()];
+        let energies = [150.0];
+        let layers = [0, 1];
+        let close = |got: &[f32], want: &[f32]| {
+            assert_eq!(got.len(), want.len());
+            for (got, want) in got.iter().zip(want) {
+                assert!((got - want).abs() < 1e-4, "{got} vs {want}");
+            }
+        };
+
+        let confidence = signal_table(&files, &energies, &layers, "fit_confidence");
+        close(&confidence["ic1_x_confidence"], &[90.0, 10.0, 40.0]);
+        close(&confidence["energy"], &[150.0, 150.0, 150.0]);
+        close(&confidence["beam_on"], &[1.0, 0.0, 1.0]);
+        assert!(!confidence.contains_key("ic1_y_confidence"));
+
+        let mut filtered = confidence;
+        apply_filter(&mut filtered, &["ic1_x_confidence"], "all", "beam_on");
+        assert!(filtered["ic1_x_confidence"][0].is_finite());
+        assert!(filtered["ic1_x_confidence"][1].is_nan());
+        assert!((filtered["ic1_x_confidence"][2] - 40.0).abs() < 1e-4);
+
+        let peak = signal_table(&files, &energies, &layers, "peak_amplitude");
+        close(&peak["ic1_x_peak"], &[4.0, 1.0, 2.0]);
+        assert!(!peak.contains_key("ic1_y_peak"));
+
+        let amplifier = signal_table(&files, &energies, &layers, "amplifier_error");
+        close(&amplifier["amp_x"], &[0.2, 0.5, 0.0]);
+        assert!(!amplifier.contains_key("amp_y"));
+
+        let field = signal_table(&files, &energies, &layers, "probe_field");
+        close(&field["field_x"], &[30.0, -10.0, 5.0]);
+        assert!(!field.contains_key("field_y"));
+    }
+
+    #[test]
     fn axis_label_includes_units_and_side_plots_are_wider() {
         assert_eq!(axis_label("IC1", "IC Current (nA)"), "IC1 (nA)");
         assert_eq!(axis_label("IC1 (%)", "Dose Error (%)"), "IC1 (%)");
         assert_eq!(axis_label("MU/S", "Dose Rate (MU/s)"), "MU/S");
         assert_eq!(axis_label("TOTAL MS", "Spot Delivery Time"), "TOTAL MS");
+        assert_eq!(axis_label("IC1 X", "Fit Confidence"), "IC1 X");
+        assert_eq!(axis_label("X", "Amplifier Error (V)"), "X (V)");
+        assert_eq!(axis_label("Y", "Probe Field (G)"), "Y (G)");
         let scene = binned_summary(
             std::path::Path::new("."),
             &[],
             &serde_json::json!({"hist": "On", "corr": "On"}),
         );
         assert_eq!(scene.column_weights, vec![8.0, 1.65, 1.65]);
+    }
+
+    #[test]
+    fn contour_fill_uses_the_isoline_vertices() {
+        let mut xs = Vec::new();
+        let mut ys = Vec::new();
+        for i in 0..50 {
+            for j in 0..50 {
+                let x = (i as f32 - 25.0) * 0.15;
+                let y = (j as f32 - 25.0) * 0.15;
+                let weight = (-0.5 * (x * x + y * y) / 0.8).exp();
+                for _ in 0..(weight * 8.0) as i32 {
+                    xs.push(x);
+                    ys.push(y);
+                }
+            }
+        }
+        let drawn = contour_bands(&xs, &ys, 5.0);
+        let Series::Triangles {
+            xs: mesh_x,
+            ys: mesh_y,
+            color,
+        } = &drawn[0]
+        else {
+            panic!("contour fill should be a triangle mesh");
+        };
+        assert!((color[3] - 0.13).abs() < 1e-6);
+        assert_eq!(mesh_x.len() % 3, 0);
+        assert!(mesh_x.len() > 12);
+        let Series::Polyline {
+            xs: line_x,
+            ys: line_y,
+            ..
+        } = &drawn[1]
+        else {
+            panic!("contour should keep its isolines");
+        };
+        let mut shared = 0;
+        for (x, y) in line_x.iter().zip(line_y) {
+            if !x.is_finite() {
+                continue;
+            }
+            assert!(
+                mesh_x
+                    .iter()
+                    .zip(mesh_y)
+                    .any(|(mx, my)| { (mx - x).abs() < 1e-4 && (my - y).abs() < 1e-4 }),
+                "isoline point {x},{y} is missing from the fill"
+            );
+            shared += 1;
+        }
+        assert!(shared > 8);
     }
 
     #[test]
@@ -4454,15 +5934,32 @@ mod tests {
         assert!(xs.len() > 12);
         let Series::Polyline {
             xs: outline,
+            ys: outline_y,
             color: edge,
             thickness,
-            ..
         } = &drawn[1]
         else {
             panic!("violin should keep a solid outline");
         };
         assert!((*thickness - 1.0).abs() < 1e-6);
         assert_eq!(edge[3], 0.0);
+        let top = outline_y
+            .iter()
+            .copied()
+            .filter(|value| value.is_finite())
+            .fold(f32::MIN, f32::max);
+        let mut cap: Vec<f32> = outline
+            .iter()
+            .zip(outline_y)
+            .filter(|(x, y)| x.is_finite() && (**y - top).abs() < 1e-4)
+            .map(|(x, _)| *x)
+            .collect();
+        cap.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        cap.dedup_by(|a, b| (*a - *b).abs() < 1e-4);
+        assert!(
+            cap.len() >= 2,
+            "the outline should reach both corners of the top cap"
+        );
         let mut widths: Vec<f32> = outline
             .iter()
             .copied()

@@ -20,6 +20,7 @@ export function ButtonSegmentGroup({
       spacing={0}
       size="sm"
       disabled={disabled}
+      className="w-full"
       value={selected == null ? [] : [selected]}
       onValueChange={(next) => {
         const picked = next.find((item) => item !== selected) ?? next[0];
@@ -31,7 +32,11 @@ export function ButtonSegmentGroup({
       {options.map((option) => {
         const Icon = optionIcon(option);
         return (
-          <ToggleGroupItem key={option} value={option}>
+          <ToggleGroupItem
+            key={option}
+            value={option}
+            className="min-w-0 flex-1 shrink cursor-pointer text-sm group-data-horizontal/toggle-group:data-[spacing=0]:first:rounded-l-[min(var(--radius-md),10px)] group-data-horizontal/toggle-group:data-[spacing=0]:last:rounded-r-[min(var(--radius-md),10px)] [&_svg:not([class*='size-'])]:size-4"
+          >
             {Icon == null ? null : <Icon />}
             {option}
           </ToggleGroupItem>

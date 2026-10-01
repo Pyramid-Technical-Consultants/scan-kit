@@ -41,3 +41,13 @@ it("presses the matching segment", () => {
 it("presses the first segment when the value is not in the group", () => {
   expect(pressed(render("missing"))).toContain("Beam on");
 });
+
+it("uses the compact select height and corner radius", () => {
+  const host = render("Both");
+  const group = host.querySelector("[data-slot='toggle-group']");
+  const item = host.querySelector("[data-slot='toggle-group-item']");
+  expect(group?.getAttribute("data-size")).toBe("sm");
+  expect(item?.className).toContain("h-7");
+  expect(item?.className).toContain("rounded-l-[min(var(--radius-md),10px)]");
+  expect(item?.className).not.toContain("h-8");
+});

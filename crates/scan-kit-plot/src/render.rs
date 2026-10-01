@@ -6,6 +6,11 @@
 //! Each panel paints the grid, solid quads and heatmaps, lines, points, the
 //! 1px bound, then labels. [`Plot::record`] (GPU), [`Plot::paint_cpu`] (no
 //! adapter), and [`Plot::pick`] (hover, reverse order) must keep that order.
+//! The plot rectangle is whole pixels. Axis-aligned strokes sit on pixel
+//! centers, in the vertex shader and in [`stroke_cpu`], so a 1px line is one
+//! pixel. The bound is that stroke on the rectangle's outer pixels.
+//! A panel with `equal` letterboxes that rectangle to the camera's data
+//! aspect, so one data unit has the same pixel length on both axes.
 //!
 //! A mark kind's byte layout lives in its `*_STRIDE`, `*_ATTRS`, `encode_*`,
 //! `decode_*`, and the matching WGSL `vs_*` inputs. Change them together.
@@ -106,6 +111,162 @@ fn colormap(t: f32) -> vec3<f32> {
     return mix(stops[i], stops[i + 1u], f);
 }
 
+// Eight stops from the Turbo look-up table. heat 1 stays on colormap.
+fn turbo(t: f32) -> vec3<f32> {
+    let stops = array<vec3<f32>, 8>(
+        vec3<f32>(0.18995, 0.07176, 0.23217),
+        vec3<f32>(0.27698, 0.46153, 0.93309),
+        vec3<f32>(0.10738, 0.81381, 0.83484),
+        vec3<f32>(0.38127, 0.98909, 0.42386),
+        vec3<f32>(0.82333, 0.91253, 0.20663),
+        vec3<f32>(0.99672, 0.60977, 0.17842),
+        vec3<f32>(0.85380, 0.22170, 0.02677),
+        vec3<f32>(0.47960, 0.01583, 0.01055),
+    );
+    let x = min(clamp(t, 0.0, 1.0) * 7.0, 6.999);
+    let i = u32(x);
+    return mix(stops[i], stops[i + 1u], fract(x));
+}
+
+fn pick_stop(map: u32, i: u32) -> vec3<f32> {
+    // Eight matplotlib samples. map 0..12 are magma through purple–orange. 17 is gamma.
+    switch (map) {
+        case 0u: {
+            let s = array<vec3<f32>, 8>(
+                vec3<f32>(0.00146, 0.00047, 0.01387), vec3<f32>(0.13505, 0.06839, 0.31500),
+                vec3<f32>(0.37212, 0.09282, 0.49905), vec3<f32>(0.59451, 0.17570, 0.50124),
+                vec3<f32>(0.82889, 0.26223, 0.43064), vec3<f32>(0.97338, 0.46152, 0.36197),
+                vec3<f32>(0.99734, 0.73355, 0.50517), vec3<f32>(0.98705, 0.99144, 0.74950));
+            return s[i];
+        }
+        case 1u: {
+            let s = array<vec3<f32>, 8>(
+                vec3<f32>(0.00146, 0.00047, 0.01387), vec3<f32>(0.15585, 0.04456, 0.32534),
+                vec3<f32>(0.39767, 0.08326, 0.43318), vec3<f32>(0.62169, 0.16418, 0.38878),
+                vec3<f32>(0.83230, 0.28391, 0.25738), vec3<f32>(0.96129, 0.48872, 0.08429),
+                vec3<f32>(0.98117, 0.75914, 0.15686), vec3<f32>(0.98836, 0.99836, 0.64492));
+            return s[i];
+        }
+        case 2u: {
+            let s = array<vec3<f32>, 8>(
+                vec3<f32>(0.05038, 0.02980, 0.52798), vec3<f32>(0.32515, 0.00691, 0.63951),
+                vec3<f32>(0.54616, 0.03895, 0.64701), vec3<f32>(0.72344, 0.19616, 0.53898),
+                vec3<f32>(0.85975, 0.36059, 0.40692), vec3<f32>(0.95547, 0.53309, 0.28549),
+                vec3<f32>(0.99449, 0.74088, 0.16634), vec3<f32>(0.94002, 0.97516, 0.13133));
+            return s[i];
+        }
+        case 3u: {
+            let s = array<vec3<f32>, 8>(
+                vec3<f32>(0.00000, 0.13511, 0.30475), vec3<f32>(0.13067, 0.23146, 0.43284),
+                vec3<f32>(0.29842, 0.33225, 0.42397), vec3<f32>(0.42512, 0.43133, 0.44769),
+                vec3<f32>(0.55539, 0.53781, 0.47115), vec3<f32>(0.69599, 0.64833, 0.44007),
+                vec3<f32>(0.84922, 0.77195, 0.35973), vec3<f32>(0.99574, 0.90934, 0.21777));
+            return s[i];
+        }
+        case 4u: {
+            let s = array<vec3<f32>, 8>(
+                vec3<f32>(0.03137, 0.11373, 0.34510), vec3<f32>(0.14358, 0.22524, 0.59054),
+                vec3<f32>(0.12764, 0.42667, 0.68614), vec3<f32>(0.17296, 0.62951, 0.75952),
+                vec3<f32>(0.39602, 0.76607, 0.74814), vec3<f32>(0.69845, 0.88186, 0.71385),
+                vec3<f32>(0.91013, 0.96494, 0.69564), vec3<f32>(1.00000, 1.00000, 0.85098));
+            return s[i];
+        }
+        case 5u: {
+            let s = array<vec3<f32>, 8>(
+                vec3<f32>(0.00000, 0.00000, 0.00000), vec3<f32>(0.10231, 0.13953, 0.25601),
+                vec3<f32>(0.10594, 0.38097, 0.27015), vec3<f32>(0.41061, 0.48045, 0.18912),
+                vec3<f32>(0.78292, 0.48158, 0.48672), vec3<f32>(0.80462, 0.63657, 0.87966),
+                vec3<f32>(0.77756, 0.88404, 0.94520), vec3<f32>(1.00000, 1.00000, 1.00000));
+            return s[i];
+        }
+        case 6u: {
+            let s = array<vec3<f32>, 8>(
+                vec3<f32>(0.00000, 0.00000, 0.00000), vec3<f32>(0.28235, 0.00000, 0.00000),
+                vec3<f32>(0.57255, 0.07255, 0.00000), vec3<f32>(0.85490, 0.35490, 0.00000),
+                vec3<f32>(1.00000, 0.64510, 0.14510), vec3<f32>(1.00000, 0.92745, 0.42745),
+                vec3<f32>(1.00000, 1.00000, 0.71765), vec3<f32>(1.00000, 1.00000, 1.00000));
+            return s[i];
+        }
+        case 7u: {
+            let s = array<vec3<f32>, 8>(
+                vec3<f32>(0.50411, 0.90708, 0.99978), vec3<f32>(0.40856, 0.63822, 0.83546),
+                vec3<f32>(0.32446, 0.40575, 0.65370), vec3<f32>(0.30204, 0.20905, 0.39924),
+                vec3<f32>(0.42665, 0.17723, 0.22938), vec3<f32>(0.64425, 0.33480, 0.24742),
+                vec3<f32>(0.82772, 0.54983, 0.31656), vec3<f32>(1.00000, 0.81263, 0.40424));
+            return s[i];
+        }
+        case 8u: {
+            let s = array<vec3<f32>, 8>(
+                vec3<f32>(0.62108, 0.69018, 0.99951), vec3<f32>(0.28410, 0.60348, 0.79347),
+                vec3<f32>(0.13208, 0.34215, 0.44209), vec3<f32>(0.06452, 0.11507, 0.14389),
+                vec3<f32>(0.17780, 0.05602, 0.00147), vec3<f32>(0.40622, 0.14080, 0.05785),
+                vec3<f32>(0.70543, 0.39879, 0.34380), vec3<f32>(0.99987, 0.68007, 0.67995));
+            return s[i];
+        }
+        case 9u: {
+            let s = array<vec3<f32>, 8>(
+                vec3<f32>(0.22981, 0.29872, 0.75368), vec3<f32>(0.40442, 0.53464, 0.93200),
+                vec3<f32>(0.60316, 0.73153, 0.99957), vec3<f32>(0.78672, 0.84481, 0.93981),
+                vec3<f32>(0.93067, 0.81888, 0.75915), vec3<f32>(0.96732, 0.65747, 0.53816),
+                vec3<f32>(0.88464, 0.41002, 0.32251), vec3<f32>(0.70567, 0.01556, 0.15023));
+            return s[i];
+        }
+        case 10u: {
+            let s = array<vec3<f32>, 8>(
+                vec3<f32>(0.19216, 0.21176, 0.58431), vec3<f32>(0.34648, 0.54925, 0.75271),
+                vec3<f32>(0.64098, 0.82730, 0.90081), vec3<f32>(0.91180, 0.96586, 0.91119),
+                vec3<f32>(0.99715, 0.91180, 0.61530), vec3<f32>(0.98731, 0.64737, 0.36424),
+                vec3<f32>(0.88997, 0.28674, 0.19815), vec3<f32>(0.64706, 0.00000, 0.14902));
+            return s[i];
+        }
+        case 11u: {
+            let s = array<vec3<f32>, 8>(
+                vec3<f32>(0.36863, 0.30980, 0.63529), vec3<f32>(0.28005, 0.62699, 0.70242),
+                vec3<f32>(0.63345, 0.85213, 0.64368), vec3<f32>(0.92887, 0.97155, 0.63806),
+                vec3<f32>(0.99715, 0.91180, 0.60108), vec3<f32>(0.98731, 0.64737, 0.36424),
+                vec3<f32>(0.88535, 0.31903, 0.29043), vec3<f32>(0.61961, 0.00392, 0.25882));
+            return s[i];
+        }
+        default: {
+            let s = array<vec3<f32>, 8>(
+                vec3<f32>(0.17647, 0.00000, 0.29412), vec3<f32>(0.40046, 0.27566, 0.59146),
+                vec3<f32>(0.67113, 0.64045, 0.80308), vec3<f32>(0.88043, 0.88612, 0.93449),
+                vec3<f32>(0.98854, 0.90319, 0.78370), vec3<f32>(0.97655, 0.69250, 0.34571),
+                vec3<f32>(0.77463, 0.41292, 0.04614), vec3<f32>(0.49804, 0.23137, 0.03137));
+            return s[i];
+        }
+    }
+}
+
+fn gamma_ramp(t: f32) -> vec3<f32> {
+    let u = clamp(t, 0.0, 1.0);
+    let teal0 = vec3<f32>(0.07843, 0.10196, 0.14902);
+    let teal1 = vec3<f32>(0.12157, 0.30588, 0.37255);
+    let teal2 = vec3<f32>(0.43529, 0.76078, 0.69020);
+    let hot0 = vec3<f32>(0.96078, 0.64706, 0.14118);
+    let hot1 = vec3<f32>(0.89804, 0.28235, 0.30196);
+    let hot2 = vec3<f32>(1.0, 0.30980, 0.84706);
+    if (u < 0.5) {
+        if (u < 0.25) {
+            return mix(teal0, teal1, u / 0.25);
+        }
+        return mix(teal1, teal2, (u - 0.25) / 0.249);
+    }
+    if (u < 0.75) {
+        return mix(hot0, hot1, (u - 0.5) / 0.25);
+    }
+    return mix(hot1, hot2, (u - 0.75) / 0.25);
+}
+
+fn named_ramp(id: u32, t: f32) -> vec3<f32> {
+    if (id >= 17u) {
+        return gamma_ramp(t);
+    }
+    let x = min(clamp(t, 0.0, 1.0) * 7.0, 6.999);
+    let i = u32(x);
+    return mix(pick_stop(id - 4u, i), pick_stop(id - 4u, i + 1u), fract(x));
+}
+
 fn corner(index: u32) -> vec2<f32> {
     switch index {
         case 0u: { return vec2<f32>(-1.0, -1.0); }
@@ -133,8 +294,22 @@ fn vs_line(
     @location(2) color: vec4<f32>,
     @location(3) thickness: f32,
 ) -> LineOut {
-    let pa = to_px(a.xyz);
-    let pb = to_px(b.xyz);
+    var pa = to_px(a.xyz);
+    var pb = to_px(b.xyz);
+    // A vertical or horizontal stroke centered on a pixel boundary covers two
+    // pixels. Park it on one pixel center. Diagonals keep their antialiasing.
+    // `snap_hairline` is this same test.
+    let dx = abs(pa.x - pb.x);
+    let dy = abs(pa.y - pb.y);
+    if (dx < 0.05 && dy >= dx) {
+        let x = floor((pa.x + pb.x) * 0.5) + 0.5;
+        pa.x = x;
+        pb.x = x;
+    } else if (dy < 0.05) {
+        let y = floor((pa.y + pb.y) * 0.5) + 0.5;
+        pa.y = y;
+        pb.y = y;
+    }
     let delta = pb - pa;
     let len = max(length(delta), 0.001);
     let dir = delta / len;
@@ -278,6 +453,17 @@ fn fs_quad(in: QuadOut) -> @location(0) vec4<f32> {
     // textureSample is illegal on a branch the triangle pixels skip. Level 0
     // has no derivatives, so this heatmap lookup can sit in that branch.
     let sample = textureSampleLevel(mark_tex, mark_samp, in.uv, 0.0).r;
+    // heat 1 viridis, 2 session fade, 3 turbo, 4–16 named scales, 17 gamma.
+    let ramp_id = u32(in.heat + 0.5);
+    if (ramp_id >= 4u) {
+        return shade(named_ramp(ramp_id, sample), in.color.a, coverage);
+    }
+    if (ramp_id == 3u) {
+        return shade(turbo(sample), in.color.a, coverage);
+    }
+    if (ramp_id == 2u) {
+        return shade(in.color.rgb, sample * in.color.a, coverage);
+    }
     let rgb = mix(in.color.rgb, colormap(sample), in.heat);
     return shade(rgb, in.color.a, coverage);
 }
@@ -571,6 +757,25 @@ impl Plot {
         }
     }
 
+    /// Keep a zoomed window when a new scene describes the same axes.
+    #[cfg_attr(not(any(test, target_arch = "wasm32")), allow(dead_code))]
+    pub(crate) fn adopt_view(&mut self, previous: &Plot) {
+        if self.cameras.len() != previous.cameras.len() {
+            return;
+        }
+        for (index, camera) in self.cameras.iter_mut().enumerate() {
+            let home = self.home[index];
+            let previous_home = previous.home[index];
+            if same_span(home.xmin, previous_home.xmin)
+                && same_span(home.xmax, previous_home.xmax)
+                && same_span(home.ymin, previous_home.ymin)
+                && same_span(home.ymax, previous_home.ymax)
+            {
+                *camera = previous.cameras[index];
+            }
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
         self.panels.is_empty()
     }
@@ -748,13 +953,17 @@ impl Plot {
                     6.0
                 };
                 let bottom = font.line_height + 10.0;
+                let mut plot = snap_plot(PlotRect {
+                    x: cell.x + left,
+                    y: cell.y + top,
+                    w: (cell.w - left - 16.0).max(8.0),
+                    h: (cell.h - top - bottom).max(8.0),
+                });
+                if panel.equal {
+                    plot = snap_plot(equal_scale(plot, &camera));
+                }
                 Cell {
-                    plot: PlotRect {
-                        x: cell.x + left,
-                        y: cell.y + top,
-                        w: (cell.w - left - 16.0).max(8.0),
-                        h: (cell.h - top - bottom).max(8.0),
-                    },
+                    plot,
                     cell,
                     panel: index,
                 }
@@ -1124,6 +1333,7 @@ pub(crate) fn header_panels(panels: &[Panel]) -> Vec<Panel> {
             ymax: panel.ymax,
             series: Vec::new(),
             x_labels: panel.x_labels.clone(),
+            equal: panel.equal,
         })
         .collect()
 }
@@ -1521,15 +1731,32 @@ pub(crate) fn build_marks(panels: &[Panel]) -> Marks {
                         }
                     }
                 }
-                Series::Heatmap { values, cols, rows } => {
+                Series::Heatmap {
+                    values,
+                    cols,
+                    rows,
+                    ramp,
+                    color,
+                    lo,
+                    hi,
+                } => {
                     if *cols == 0 || *rows == 0 {
                         continue;
                     }
-                    let pixels = heatmap_bytes(values, *cols, *rows);
+                    let pixels = heatmap_bytes(values, *cols, *rows, *lo, *hi);
                     if pixels.is_empty() {
                         continue;
                     }
-                    pending.push((heatmaps.len(), id));
+                    pending.push((
+                        heatmaps.len(),
+                        id,
+                        ramp_heat(*ramp),
+                        if *ramp == 2 {
+                            *color
+                        } else {
+                            [1.0, 1.0, 1.0, 1.0]
+                        },
+                    ));
                     heatmaps.push(pixels);
                     heatmap_size.push((*cols, *rows));
                 }
@@ -1537,14 +1764,14 @@ pub(crate) fn build_marks(panels: &[Panel]) -> Marks {
         }
         let quad_count = quads.len() as u32 - quad_start;
         let mut heats = Vec::new();
-        for (texture, id) in pending {
+        for (texture, id, heat, color) in pending {
             let start = quads.len() as u32;
             quads.push(QuadRec {
                 a: [panel.xmin, panel.ymin],
                 b: [panel.xmax, panel.ymax],
                 c: None,
-                heat: 1.0,
-                color: [1.0, 1.0, 1.0, 1.0],
+                heat,
+                color,
                 id,
                 heatmap: Some(texture),
             });
@@ -1610,16 +1837,30 @@ fn push_polyline(
     }
 }
 
-fn heatmap_bytes(values: &[f32], cols: u32, rows: u32) -> Vec<u8> {
-    let mut lo = f32::MAX;
-    let mut hi = f32::MIN;
-    for value in values {
-        if value.is_finite() {
-            lo = lo.min(*value);
-            hi = hi.max(*value);
-        }
+fn ramp_heat(ramp: u8) -> f32 {
+    match ramp {
+        0 => 1.0,
+        1 => 3.0,
+        2 => 2.0,
+        other => f32::from(other) + 1.0,
     }
-    if !lo.is_finite() {
+}
+
+fn heatmap_bytes(values: &[f32], cols: u32, rows: u32, window_lo: f32, window_hi: f32) -> Vec<u8> {
+    let (lo, mut hi) = if window_hi > window_lo {
+        (window_lo, window_hi)
+    } else {
+        let mut lo = f32::MAX;
+        let mut hi = f32::MIN;
+        for value in values {
+            if value.is_finite() {
+                lo = lo.min(*value);
+                hi = hi.max(*value);
+            }
+        }
+        (lo, hi)
+    };
+    if !lo.is_finite() || !hi.is_finite() {
         return Vec::new();
     }
     if (hi - lo).abs() < 1.0e-8 {
@@ -1637,7 +1878,7 @@ fn heatmap_bytes(values: &[f32], cols: u32, rows: u32) -> Vec<u8> {
 
 fn grid_lines(camera: &Camera, foreground: [f32; 4]) -> Vec<LineRec> {
     let mut lines = Vec::new();
-    let grid = frame_color(foreground);
+    let grid = grid_color(foreground);
     for tick in ticks(camera.xmin, camera.xmax) {
         lines.push(axis_line(
             [tick, camera.ymin, 0.0],
@@ -1657,12 +1898,53 @@ fn grid_lines(camera: &Camera, foreground: [f32; 4]) -> Vec<LineRec> {
     lines
 }
 
-/// A 1px rectangle inset one pixel so the stroke stays inside the plot.
+/// Whole-pixel plot box. The scissor, the camera, and the frame share it, so a
+/// 1px stroke on the outer pixel is not cut off when the cell size is fractional.
+/// Shrink the plot so one data unit is the same length on both axes.
+fn equal_scale(plot: PlotRect, camera: &Camera) -> PlotRect {
+    let data_w = (camera.xmax - camera.xmin).abs().max(1e-6);
+    let data_h = (camera.ymax - camera.ymin).abs().max(1e-6);
+    let data_aspect = data_w / data_h;
+    let pixel_aspect = plot.w / plot.h.max(1.0);
+    if pixel_aspect > data_aspect {
+        let w = (plot.h * data_aspect).max(1.0).min(plot.w);
+        PlotRect {
+            x: plot.x + (plot.w - w) * 0.5,
+            y: plot.y,
+            w,
+            h: plot.h,
+        }
+    } else {
+        let h = (plot.w / data_aspect).max(1.0).min(plot.h);
+        PlotRect {
+            x: plot.x,
+            y: plot.y + (plot.h - h) * 0.5,
+            w: plot.w,
+            h,
+        }
+    }
+}
+
+fn snap_plot(plot: PlotRect) -> PlotRect {
+    let x = plot.x.floor();
+    let y = plot.y.floor();
+    let right = (plot.x + plot.w).floor().max(x + 1.0);
+    let bottom = (plot.y + plot.h).floor().max(y + 1.0);
+    PlotRect {
+        x,
+        y,
+        w: right - x,
+        h: bottom - y,
+    }
+}
+
+/// A 1px rectangle on the plot's outer pixels. Half a pixel in lands on those
+/// pixel centers; a full pixel in used to sit on the boundary and get clipped.
 fn border_lines(camera: &Camera, plot: &PlotRect, foreground: [f32; 4]) -> Vec<LineRec> {
     let span_x = camera.xmax - camera.xmin;
     let span_y = camera.ymax - camera.ymin;
-    let inset_x = span_x.abs() / plot.w.max(1.0);
-    let inset_y = span_y.abs() / plot.h.max(1.0);
+    let inset_x = 0.5 * span_x.abs() / plot.w.max(1.0);
+    let inset_y = 0.5 * span_y.abs() / plot.h.max(1.0);
     let x0 = camera.xmin + inset_x;
     let x1 = camera.xmax - inset_x;
     let y0 = camera.ymin + inset_y;
@@ -1678,6 +1960,10 @@ fn border_lines(camera: &Camera, plot: &PlotRect, foreground: [f32; 4]) -> Vec<L
 
 fn frame_color(foreground: [f32; 4]) -> [f32; 4] {
     [foreground[0], foreground[1], foreground[2], 0.45]
+}
+
+fn grid_color(foreground: [f32; 4]) -> [f32; 4] {
+    [foreground[0], foreground[1], foreground[2], 0.3]
 }
 
 fn axis_line(a: [f32; 3], b: [f32; 3], color: [f32; 4], thickness: f32) -> LineRec {
@@ -1909,6 +2195,7 @@ fn inside(rect: PlotRect, x: f32, y: f32) -> bool {
 }
 
 fn scissor(plot: PlotRect, width: u32, height: u32) -> (u32, u32, u32, u32) {
+    // `snap_plot` makes this an exact pixel range. Truncation is that range.
     let x = (plot.x.max(0.0) as u32).min(width.saturating_sub(1));
     let y = (plot.y.max(0.0) as u32).min(height.saturating_sub(1));
     let w = (plot.w.max(1.0) as u32).min(width.saturating_sub(x)).max(1);
@@ -1983,13 +2270,28 @@ fn fill_quad_cpu(
                 let col = ((u * cols as f32) as u32).min(cols.saturating_sub(1));
                 let row = ((v * rows as f32) as u32).min(rows.saturating_sub(1));
                 let sample = marks.heatmaps[index][(row * cols + col) as usize] as f32 / 255.0;
-                let rgb = colormap(sample);
-                [rgb[0], rgb[1], rgb[2], 1.0]
+                heatmap_ink(quad, sample)
             } else {
                 quad.color
             };
             blend(frame, width, height, x, y, color, Some(plot));
         }
+    }
+}
+
+/// Same rule as `vs_line`: an axis-aligned stroke moves onto one pixel center.
+#[cfg(not(target_arch = "wasm32"))]
+fn snap_hairline(pa: &mut [f32; 2], pb: &mut [f32; 2]) {
+    let dx = (pa[0] - pb[0]).abs();
+    let dy = (pa[1] - pb[1]).abs();
+    if dx < 0.05 && dy >= dx {
+        let x = ((pa[0] + pb[0]) * 0.5).floor() + 0.5;
+        pa[0] = x;
+        pb[0] = x;
+    } else if dy < 0.05 {
+        let y = ((pa[1] + pb[1]) * 0.5).floor() + 0.5;
+        pa[1] = y;
+        pb[1] = y;
     }
 }
 
@@ -2002,8 +2304,9 @@ fn stroke_cpu(
     line: &LineRec,
     plot: PlotRect,
 ) {
-    let pa = project(*matrix, line.a, width as f32, height as f32);
-    let pb = project(*matrix, line.b, width as f32, height as f32);
+    let mut pa = project(*matrix, line.a, width as f32, height as f32);
+    let mut pb = project(*matrix, line.b, width as f32, height as f32);
+    snap_hairline(&mut pa, &mut pb);
     let radius = line.thickness.max(1.0) * 0.5;
     let steps = ((pa[0] - pb[0]).abs().max((pa[1] - pb[1]).abs()) as i32).max(1);
     for step in 0..=steps {
@@ -2127,6 +2430,208 @@ fn blend(
         frame[pixel + channel] = (src + dst * (1.0 - alpha)).round().clamp(0.0, 255.0) as u8;
     }
     frame[pixel + 3] = 255;
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn named_rgb(id: u32, t: f32) -> [f32; 3] {
+    if id >= 17 {
+        return gamma_rgb(t);
+    }
+    const N: usize = 8;
+    let map = id.saturating_sub(4).min(12) as usize;
+    let x = (t.clamp(0.0, 1.0) * 7.0).min(6.999);
+    let i = x.floor() as usize;
+    let f = x - i as f32;
+    let a = RAMP_STOPS[map * N + i];
+    let b = RAMP_STOPS[map * N + i + 1];
+    [
+        a[0] + (b[0] - a[0]) * f,
+        a[1] + (b[1] - a[1]) * f,
+        a[2] + (b[2] - a[2]) * f,
+    ]
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn gamma_rgb(t: f32) -> [f32; 3] {
+    let u = t.clamp(0.0, 1.0);
+    let mix = |a: [f32; 3], b: [f32; 3], f: f32| {
+        [
+            a[0] + (b[0] - a[0]) * f,
+            a[1] + (b[1] - a[1]) * f,
+            a[2] + (b[2] - a[2]) * f,
+        ]
+    };
+    let teal0 = [0.07843, 0.10196, 0.14902];
+    let teal1 = [0.12157, 0.30588, 0.37255];
+    let teal2 = [0.43529, 0.76078, 0.69020];
+    let hot0 = [0.96078, 0.64706, 0.14118];
+    let hot1 = [0.89804, 0.28235, 0.30196];
+    let hot2 = [1.0, 0.30980, 0.84706];
+    if u < 0.5 {
+        if u < 0.25 {
+            return mix(teal0, teal1, u / 0.25);
+        }
+        return mix(teal1, teal2, (u - 0.25) / 0.249);
+    }
+    if u < 0.75 {
+        return mix(hot0, hot1, (u - 0.5) / 0.25);
+    }
+    mix(hot1, hot2, (u - 0.75) / 0.25)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+const RAMP_STOPS: [[f32; 3]; 104] = [
+    [0.00146, 0.00047, 0.01387],
+    [0.13505, 0.06839, 0.31500],
+    [0.37212, 0.09282, 0.49905],
+    [0.59451, 0.17570, 0.50124],
+    [0.82889, 0.26223, 0.43064],
+    [0.97338, 0.46152, 0.36197],
+    [0.99734, 0.73355, 0.50517],
+    [0.98705, 0.99144, 0.74950],
+    [0.00146, 0.00047, 0.01387],
+    [0.15585, 0.04456, 0.32534],
+    [0.39767, 0.08326, 0.43318],
+    [0.62169, 0.16418, 0.38878],
+    [0.83230, 0.28391, 0.25738],
+    [0.96129, 0.48872, 0.08429],
+    [0.98117, 0.75914, 0.15686],
+    [0.98836, 0.99836, 0.64492],
+    [0.05038, 0.02980, 0.52798],
+    [0.32515, 0.00691, 0.63951],
+    [0.54616, 0.03895, 0.64701],
+    [0.72344, 0.19616, 0.53898],
+    [0.85975, 0.36059, 0.40692],
+    [0.95547, 0.53309, 0.28549],
+    [0.99449, 0.74088, 0.16634],
+    [0.94002, 0.97516, 0.13133],
+    [0.00000, 0.13511, 0.30475],
+    [0.13067, 0.23146, 0.43284],
+    [0.29842, 0.33225, 0.42397],
+    [0.42512, 0.43133, 0.44769],
+    [0.55539, 0.53781, 0.47115],
+    [0.69599, 0.64833, 0.44007],
+    [0.84922, 0.77195, 0.35973],
+    [0.99574, 0.90934, 0.21777],
+    [0.03137, 0.11373, 0.34510],
+    [0.14358, 0.22524, 0.59054],
+    [0.12764, 0.42667, 0.68614],
+    [0.17296, 0.62951, 0.75952],
+    [0.39602, 0.76607, 0.74814],
+    [0.69845, 0.88186, 0.71385],
+    [0.91013, 0.96494, 0.69564],
+    [1.00000, 1.00000, 0.85098],
+    [0.00000, 0.00000, 0.00000],
+    [0.10231, 0.13953, 0.25601],
+    [0.10594, 0.38097, 0.27015],
+    [0.41061, 0.48045, 0.18912],
+    [0.78292, 0.48158, 0.48672],
+    [0.80462, 0.63657, 0.87966],
+    [0.77756, 0.88404, 0.94520],
+    [1.00000, 1.00000, 1.00000],
+    [0.00000, 0.00000, 0.00000],
+    [0.28235, 0.00000, 0.00000],
+    [0.57255, 0.07255, 0.00000],
+    [0.85490, 0.35490, 0.00000],
+    [1.00000, 0.64510, 0.14510],
+    [1.00000, 0.92745, 0.42745],
+    [1.00000, 1.00000, 0.71765],
+    [1.00000, 1.00000, 1.00000],
+    [0.50411, 0.90708, 0.99978],
+    [0.40856, 0.63822, 0.83546],
+    [0.32446, 0.40575, 0.65370],
+    [0.30204, 0.20905, 0.39924],
+    [0.42665, 0.17723, 0.22938],
+    [0.64425, 0.33480, 0.24742],
+    [0.82772, 0.54983, 0.31656],
+    [1.00000, 0.81263, 0.40424],
+    [0.62108, 0.69018, 0.99951],
+    [0.28410, 0.60348, 0.79347],
+    [0.13208, 0.34215, 0.44209],
+    [0.06452, 0.11507, 0.14389],
+    [0.17780, 0.05602, 0.00147],
+    [0.40622, 0.14080, 0.05785],
+    [0.70543, 0.39879, 0.34380],
+    [0.99987, 0.68007, 0.67995],
+    [0.22981, 0.29872, 0.75368],
+    [0.40442, 0.53464, 0.93200],
+    [0.60316, 0.73153, 0.99957],
+    [0.78672, 0.84481, 0.93981],
+    [0.93067, 0.81888, 0.75915],
+    [0.96732, 0.65747, 0.53816],
+    [0.88464, 0.41002, 0.32251],
+    [0.70567, 0.01556, 0.15023],
+    [0.19216, 0.21176, 0.58431],
+    [0.34648, 0.54925, 0.75271],
+    [0.64098, 0.82730, 0.90081],
+    [0.91180, 0.96586, 0.91119],
+    [0.99715, 0.91180, 0.61530],
+    [0.98731, 0.64737, 0.36424],
+    [0.88997, 0.28674, 0.19815],
+    [0.64706, 0.00000, 0.14902],
+    [0.36863, 0.30980, 0.63529],
+    [0.28005, 0.62699, 0.70242],
+    [0.63345, 0.85213, 0.64368],
+    [0.92887, 0.97155, 0.63806],
+    [0.99715, 0.91180, 0.60108],
+    [0.98731, 0.64737, 0.36424],
+    [0.88535, 0.31903, 0.29043],
+    [0.61961, 0.00392, 0.25882],
+    [0.17647, 0.00000, 0.29412],
+    [0.40046, 0.27566, 0.59146],
+    [0.67113, 0.64045, 0.80308],
+    [0.88043, 0.88612, 0.93449],
+    [0.98854, 0.90319, 0.78370],
+    [0.97655, 0.69250, 0.34571],
+    [0.77463, 0.41292, 0.04614],
+    [0.49804, 0.23137, 0.03137],
+];
+
+#[cfg(not(target_arch = "wasm32"))]
+fn heatmap_ink(quad: &QuadRec, sample: f32) -> [f32; 4] {
+    let id = (quad.heat + 0.5) as u32;
+    if id >= 4 {
+        let rgb = named_rgb(id, sample);
+        return [rgb[0], rgb[1], rgb[2], quad.color[3]];
+    }
+    if id == 3 {
+        let rgb = turbo(sample);
+        return [rgb[0], rgb[1], rgb[2], quad.color[3]];
+    }
+    if id == 2 {
+        return [
+            quad.color[0],
+            quad.color[1],
+            quad.color[2],
+            sample * quad.color[3],
+        ];
+    }
+    let rgb = colormap(sample);
+    [rgb[0], rgb[1], rgb[2], 1.0]
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn turbo(t: f32) -> [f32; 3] {
+    const STOPS: [[f32; 3]; 8] = [
+        [0.18995, 0.07176, 0.23217],
+        [0.27698, 0.46153, 0.93309],
+        [0.10738, 0.81381, 0.83484],
+        [0.38127, 0.98909, 0.42386],
+        [0.82333, 0.91253, 0.20663],
+        [0.99672, 0.60977, 0.17842],
+        [0.85380, 0.22170, 0.02677],
+        [0.47960, 0.01583, 0.01055],
+    ];
+    let x = (t.clamp(0.0, 1.0) * 7.0).min(6.999);
+    let index = x.floor() as usize;
+    let fract = x - index as f32;
+    let a = STOPS[index];
+    let b = STOPS[index + 1];
+    [
+        a[0] + (b[0] - a[0]) * fract,
+        a[1] + (b[1] - a[1]) * fract,
+        a[2] + (b[2] - a[2]) * fract,
+    ]
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -2529,6 +3034,12 @@ fn rgba_bytes(color: [f32; 4]) -> [u8; 4] {
     color.map(|channel| (channel.clamp(0.0, 1.0) * 255.0).round() as u8)
 }
 
+#[cfg_attr(not(any(test, target_arch = "wasm32")), allow(dead_code))]
+fn same_span(a: f32, b: f32) -> bool {
+    let scale = a.abs().max(b.abs()).max(1.0);
+    (a - b).abs() <= scale * 1.0e-4
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2550,6 +3061,7 @@ mod tests {
                     thickness: 4.0,
                 }],
                 x_labels: Vec::new(),
+                equal: false,
             }],
             controls: Vec::new(),
             table: None,
@@ -2557,6 +3069,62 @@ mod tests {
             columns: 0,
             column_weights: Vec::new(),
         }
+    }
+
+    #[test]
+    fn equal_axes_stay_square_in_a_wide_frame() {
+        let mut scene = line_scene();
+        scene.panels[0].equal = true;
+        scene.panels[0].xmin = -2.0;
+        scene.panels[0].xmax = 2.0;
+        scene.panels[0].ymin = -2.0;
+        scene.panels[0].ymax = 2.0;
+        let plot = Plot::new(&scene, [0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0, 1.0]);
+        let frame = plot.layout(480, 200)[0].plot;
+        assert!(
+            (frame.w - frame.h).abs() <= 1.0,
+            "{} x {}",
+            frame.w,
+            frame.h
+        );
+    }
+
+    #[test]
+    fn turbo_runs_from_dark_blue_to_dark_red() {
+        let start = turbo(0.0);
+        let end = turbo(1.0);
+        assert!(start[2] > start[0]);
+        assert!(end[0] > end[1] && end[0] > end[2]);
+    }
+
+    #[test]
+    fn gamma_steps_at_one_and_zero_stays_dark() {
+        let under = gamma_rgb(0.49);
+        let over = gamma_rgb(0.51);
+        assert!(under[1] > under[0]);
+        assert!(over[0] > under[0] + 0.4);
+        let magma = named_rgb(4, 0.0);
+        assert!(magma[0] + magma[1] + magma[2] < 0.05);
+        let bytes = heatmap_bytes(&[0.0, 5.0], 2, 1, 0.0, 5.0);
+        assert_eq!(bytes, vec![0, 255]);
+        assert!((ramp_heat(1) - 3.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_reload_keeps_the_zoomed_window_when_the_axes_match() {
+        let scene = line_scene();
+        let mut first = Plot::new(&scene, [0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0, 1.0]);
+        first.zoom(0, 5.0, 5.0, 2.0);
+        let zoomed = first.cameras[0];
+        let mut second = Plot::new(&scene, [0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0, 1.0]);
+        second.adopt_view(&first);
+        assert_eq!(second.cameras[0], zoomed);
+
+        let mut shifted = line_scene();
+        shifted.panels[0].xmax = 40.0;
+        let mut third = Plot::new(&shifted, [0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0, 1.0]);
+        third.adopt_view(&first);
+        assert_eq!(third.cameras[0], third.home[0]);
     }
 
     #[test]
@@ -2594,6 +3162,7 @@ mod tests {
                     thickness: 3.0,
                 }],
                 x_labels: Vec::new(),
+                equal: false,
             }],
             controls: Vec::new(),
             table: None,
@@ -2650,12 +3219,9 @@ mod tests {
             xmax: 1.0,
             ymin: 0.0,
             ymax: 1.0,
-            series: vec![Series::Heatmap {
-                values: (0..64).map(|v| v as f32).collect(),
-                cols: 8,
-                rows: 8,
-            }],
+            series: vec![Series::heatmap((0..64).map(|v| v as f32).collect(), 8, 8)],
             x_labels: Vec::new(),
+            equal: false,
         });
         let (width, height) = (320, 160);
         let mut plot = Plot::new(&scene, [0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0, 1.0]);
@@ -2718,6 +3284,80 @@ mod tests {
     }
 
     #[test]
+    fn every_panel_frame_is_one_crisp_pixel() {
+        let mut horizontal = [10.2, 4.0];
+        let mut horizontal_end = [80.0, 4.0];
+        snap_hairline(&mut horizontal, &mut horizontal_end);
+        assert_eq!(horizontal[1], 4.5);
+        assert_eq!(horizontal_end[1], 4.5);
+        let mut vertical = [3.2, 1.0];
+        let mut vertical_end = [3.2, 40.0];
+        snap_hairline(&mut vertical, &mut vertical_end);
+        assert_eq!(vertical[0], 3.5);
+        let mut diagonal = [0.0, 0.0];
+        let mut diagonal_end = [10.0, 8.0];
+        snap_hairline(&mut diagonal, &mut diagonal_end);
+        assert_eq!(
+            [diagonal[0], diagonal[1], diagonal_end[0], diagonal_end[1]],
+            [0.0, 0.0, 10.0, 8.0]
+        );
+
+        let mut scene = line_scene();
+        scene.panels.push(Panel {
+            title: String::new(),
+            y_label: "Probability (%)".into(),
+            xmin: 0.0,
+            xmax: 10.0,
+            ymin: 0.0,
+            ymax: 10.0,
+            series: Vec::new(),
+            x_labels: Vec::new(),
+            equal: false,
+        });
+        scene.columns = 2;
+        scene.column_weights = vec![8.0, 1.65];
+        let mut plot = Plot::new(&scene, [0.05, 0.05, 0.05, 1.0], [0.9, 0.9, 0.9, 1.0]);
+        let (width, height) = (640, 360);
+        let layout = plot.layout(width, height);
+        let frame = plot.paint_cpu(width, height, &layout);
+        let luma = |x: u32, y: u32| {
+            let index = ((y * width + x) * 4) as usize;
+            frame[index].max(frame[index + 1]).max(frame[index + 2])
+        };
+        for cell in &layout {
+            let plot = cell.plot;
+            assert_eq!(plot.x.fract(), 0.0);
+            assert_eq!(plot.y.fract(), 0.0);
+            assert_eq!(plot.w.fract(), 0.0);
+            assert_eq!(plot.h.fract(), 0.0);
+            let x0 = plot.x as u32;
+            let y0 = plot.y as u32;
+            let x1 = x0 + plot.w as u32 - 1;
+            let y1 = y0 + plot.h as u32 - 1;
+            let column = (x0 + 2..x1)
+                .find(|x| luma(*x, y0 + 3) < 30)
+                .expect("a column clear of the grid");
+            let row = (y0 + 2..y1)
+                .find(|y| luma(x0 + 3, *y) < 30)
+                .expect("a row clear of the grid");
+            for (edge, inward) in [
+                ((column, y0), (column, y0 + 1)),
+                ((column, y1), (column, y1 - 1)),
+                ((x0, row), (x0 + 1, row)),
+                ((x1, row), (x1 - 1, row)),
+            ] {
+                let on = luma(edge.0, edge.1);
+                let inside = luma(inward.0, inward.1);
+                assert!(on > 60, "missing frame pixel {edge:?} luma {on}");
+                assert!(
+                    on > inside + 30,
+                    "frame at {edge:?} bled inward ({on} vs {inside})"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn y_tick_ink_sits_on_its_gridline_and_the_name_runs_up_the_axis() {
         let panel = Panel {
             title: "IC1 X".into(),
@@ -2728,6 +3368,7 @@ mod tests {
             ymax: 10.0,
             series: Vec::new(),
             x_labels: Vec::new(),
+            equal: false,
         };
         let camera = Camera::new(0.0, 10.0, -10.0, 10.0);
         let cell = Cell {

@@ -1,6 +1,12 @@
 import { expect, it } from "vitest";
 
-import { selectionFromLibrary, sessionColor, sessionSwatch, UNCHECKED_SWATCH } from "./session-colors";
+import {
+  selectionFromLibrary,
+  sessionColor,
+  sessionSwatch,
+  shownSessionIds,
+  UNCHECKED_SWATCH,
+} from "./session-colors";
 
 it("assigns the seaborn palette by check order and wraps", () => {
   expect(sessionColor(0)).toBe("#4C72B0");
@@ -20,4 +26,8 @@ it("assigns the seaborn palette by check order and wraps", () => {
       ["b", "a"],
     ),
   ).toEqual(["b", "a"]);
+  expect(shownSessionIds(["a", "b", "c"], ["a"]).map((id) => sessionColor(["a", "b", "c"].indexOf(id)))).toEqual([
+    sessionColor(1),
+    sessionColor(2),
+  ]);
 });

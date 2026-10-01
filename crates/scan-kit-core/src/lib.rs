@@ -4,6 +4,7 @@
 //! implement the operations themselves. Session files live in `scan-kit-io`.
 //! GPU work lives in `scan-kit-compute`.
 
+mod dose;
 mod geometry;
 mod plot;
 mod schema;
@@ -11,6 +12,11 @@ mod session;
 mod session_log;
 mod signal;
 
+pub use dose::{
+    analytic_on, analytic_volume, bragg_idd, csda_range_mm, field_bounds, medium, protons_from_mu,
+    robust_high, through_wet, water, McJob, McResult, Medium, PatientRequest, Pencil, Quantity,
+    SlabRequest, Volume,
+};
 pub use geometry::{
     beam_angle_mrad, fit_iso_plane, fit_line, magnet_pivot_z, parse_ic_geometry, IcGeometry,
     IC1_Z_MM, IC2_Z_MM, IC_SEP_MM,
