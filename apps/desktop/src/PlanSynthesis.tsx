@@ -69,7 +69,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
-import { notify, notifyError } from "@/notify";
+import { notifyError, notifySaved } from "@/notify";
 import { SidePane } from "@/SidePane";
 
 type Choice = { value: string; label: string };
@@ -127,15 +127,6 @@ const CHOICE_ICONS: Record<string, LucideIcon> = {
   "Even per Layer": Layers,
   "Even Total": Scale,
   "Random Total": Dices,
-};
-
-// The corner arrow's elbow sits in one corner of the icon box, so the ink
-// reads about a pixel off the label. Nudge it back toward the button center.
-const CORNER_NUDGE: Record<string, string> = {
-  "Top Left": "translate-y-px",
-  "Top Right": "translate-y-px",
-  "Bottom Left": "-translate-y-px",
-  "Bottom Right": "-translate-y-px",
 };
 
 const PRESET_ORDER = ["Select All", "Clear All", "Whole MeV Steps", "10 MeV Steps"];
@@ -409,7 +400,7 @@ export function PlanSynthesis() {
         csv: plan.csv,
       });
       setSaveDir(parentDir(selected));
-      notify(`Saved ${selected}`);
+      notifySaved(selected, { title: "Input map saved" });
     } catch (caught) {
       notifyError(caught);
     }
@@ -857,7 +848,7 @@ function SegmentField({
         const Icon = choiceIcon(choice.label);
         return (
           <ToggleGroupItem key={choice.value} value={choice.value} className="min-w-0 flex-1 cursor-pointer">
-            {Icon == null ? null : <Icon className={CORNER_NUDGE[choice.label]} />}
+            {Icon == null ? null : <Icon />}
             {choice.label}
           </ToggleGroupItem>
         );

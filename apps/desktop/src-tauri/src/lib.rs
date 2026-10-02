@@ -303,6 +303,61 @@ fn scan_kit_runner_remember(file_dir: String) -> Result<Value, String> {
         .map_err(|err| err.to_string())
 }
 
+#[tauri::command]
+fn scan_kit_reveal(path: String) -> Result<(), String> {
+    let target = std::path::PathBuf::from(&path);
+    if !target.exists() {
+        return Err(format!("Nothing at {path}"));
+    }
+    // explorer.exe often exits nonzero after the window is already open.
+    std::process::Command::new(reveal_program())
+        .args(reveal_args(&target))
+        .spawn()
+        .map(|_| ())
+        .map_err(|err| err.to_string())
+}
+
+fn reveal_program() -> &'static str {
+    #[cfg(windows)]
+    {
+        "explorer"
+    }
+    #[cfg(target_os = "macos")]
+    {
+        "open"
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        "xdg-open"
+    }
+}
+
+fn reveal_args(path: &std::path::Path) -> Vec<std::ffi::OsString> {
+    #[cfg(windows)]
+    {
+        if path.is_dir() {
+            vec![path.as_os_str().to_os_string()]
+        } else {
+            vec![std::ffi::OsString::from(format!(
+                "/select,{}",
+                path.display()
+            ))]
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        vec![
+            std::ffi::OsString::from("-R"),
+            path.as_os_str().to_os_string(),
+        ]
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let folder = path.parent().unwrap_or(path);
+        vec![folder.as_os_str().to_os_string()]
+    }
+}
+
 fn color4(values: &[f32], fallback: [f32; 4]) -> [f32; 4] {
     let mut out = fallback;
     for (index, value) in values.iter().take(4).enumerate() {
@@ -348,8 +403,30 @@ pub fn run() {
             scan_kit_runner_upload,
             scan_kit_runner_control,
             scan_kit_runner_download,
-            scan_kit_runner_remember
+            scan_kit_runner_remember,
+            scan_kit_reveal
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod reveal_tests {
+    use super::reveal_args;
+
+    #[test]
+    fn a_file_is_selected_and_a_folder_is_opened() {
+        let file = std::env::temp_dir().join("scan-kit-not-a-dir.csv");
+        assert!(!reveal_args(&file).is_empty());
+        assert!(!reveal_args(&std::env::temp_dir()).is_empty());
+        #[cfg(windows)]
+        {
+            let file_arg = reveal_args(&file)[0].to_string_lossy().into_owned();
+            assert!(file_arg.starts_with("/select,"));
+            assert!(file_arg.contains("scan-kit-not-a-dir.csv"));
+            assert!(!reveal_args(&std::env::temp_dir())[0]
+                .to_string_lossy()
+                .starts_with("/select,"));
+        }
+    }
 }

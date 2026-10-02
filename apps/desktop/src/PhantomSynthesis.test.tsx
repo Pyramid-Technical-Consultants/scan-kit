@@ -41,6 +41,7 @@ vi.mock("@tauri-apps/api/core", () => ({
     if (command === "scan_kit_write_phantom") {
       return {
         status: "Wrote 70 CT slices, RTSTRUCT and RT Ion Plan to C:/out/synthetic_slabs.",
+        folder: "C:/out/synthetic_slabs",
       };
     }
     throw new Error(command);

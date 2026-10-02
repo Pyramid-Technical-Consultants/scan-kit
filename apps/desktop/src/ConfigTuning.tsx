@@ -1,7 +1,18 @@
 import { useEffect, useMemo, useRef, useState, type WheelEvent } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
-import { ChevronDown, ChevronRight } from "lucide-react";
+import {
+  ChevronDown,
+  ChevronRight,
+  CircleCheck,
+  Eye,
+  EyeOff,
+  FileQuestion,
+  FolderOpen,
+  Save,
+  TriangleAlert,
+  Undo2,
+} from "lucide-react";
 import {
   DataEditor,
   GridCellKind,
@@ -14,6 +25,8 @@ import {
 import "@glideapps/glide-data-grid/dist/index.css";
 
 import { Button } from "@/components/ui/button";
+import { Separator } from "@/components/ui/separator";
+import { Toggle } from "@/components/ui/toggle";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Checkbox } from "@/components/ui/checkbox";
 import {
@@ -34,10 +47,10 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
-import { notify, notifyError } from "@/notify";
+import { notify, notifyError, notifySaved } from "@/notify";
 import { SidePane } from "@/SidePane";
 
-type Choice = { value: string; label: string };
+type Choice = { value: string; label: string; tooltip?: string };
 type Param = {
   key: string;
   label: string;
@@ -45,6 +58,8 @@ type Param = {
   default?: unknown;
   minimum?: number;
   step?: number;
+  suffix?: string;
+  tooltip?: string;
   choices?: Choice[];
   visible_when?: Record<string, string[]>;
 };
@@ -88,6 +103,32 @@ type TuneResult = {
   rows: string[][];
   changed: boolean;
 };
+type HeldPreview = { stamp: string; result: TuneResult };
+
+const PREVIEW_MS = 200;
+
+function applyPrompt(workflow: Workflow, params: Record<string, unknown>, ids: string[]): string {
+  const source =
+    ids.length === 1 ? `session ${ids[0]}` : ids.length > 1 ? `${ids.length} sessions` : "the selected sessions";
+  const tail = "The configuration stays unsaved until you save.";
+  if (workflow.id === "sigma_tuning") {
+    const tolerance = params.sigma_tolerance_percent ?? 20;
+    const headroom = params.sigma_lower_headroom_percent ?? 1;
+    return `Rewrite beam sigma K0 values in devices.xml using data from ${source}?\n\nEach band is tuned to the ±${tolerance}% tolerance window with ${headroom}% lower headroom above the smallest observed sigma.\n\n${tail}`;
+  }
+  if (workflow.id === "position_offset_tuning") {
+    const dataSource = params.data_source ?? "spot";
+    return `Rewrite zero offset at iso values in devices.xml using ${dataSource} data from ${source}?\n\n${tail}`;
+  }
+  if (workflow.id === "ic_distance_tuning") {
+    return `Rewrite source to device distance and zero offset in devices.xml using spot data from ${source}?\n\nThis assumes delivery at isocenter is correct and the chambers are mis-scaled. Review the proposed distance, then re-run Sigma Tuning.\n\n${tail}`;
+  }
+  const primary = String(params.primary_ic ?? "ic1").toUpperCase();
+  if (params.primary_mode === "unchanged" || params.primary_mode == null) {
+    return `Rewrite secondary IC K_MU values in devices.xml so they agree with ${primary} using data from ${source}?\n\nPrimary ${primary} K_MU is left unchanged.\n\n${tail}`;
+  }
+  return `Rewrite K_MU values in devices.xml using data from ${source}?\n\nThis changes the primary (${primary}) K_MU, which changes future delivered charge for the same CHARGE_REQ.\n\n${tail}`;
+}
 
 function defaultsOf(workflow: Workflow): Record<string, unknown> {
   const values: Record<string, unknown> = {};
@@ -279,7 +320,8 @@ export function ConfigTuning({
   const [integrity, setIntegrity] = useState<Integrity | null>(null);
   const [hideUnused, setHideUnused] = useState(false);
   const [dirty, setDirty] = useState(false);
-  const [preview, setPreview] = useState<TuneResult | null>(null);
+  const [preview, setPreview] = useState<HeldPreview | null>(null);
+  const [previewing, setPreviewing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const openSeq = useRef(0);
@@ -287,6 +329,15 @@ export function ConfigTuning({
   dirtyRef.current = dirty;
   const sessionKey = selectedIds.join("|");
   const workflow = catalog?.workflows.find((item) => item.id === workflowId) ?? catalog?.workflows[0];
+  const previewStamp = JSON.stringify({
+    workflow: workflow?.id ?? "",
+    params,
+    sessions: sessionKey,
+    folder,
+    xml,
+    form: dirty ? form : null,
+  });
+  const matched = preview != null && preview.stamp === previewStamp ? preview.result : null;
 
   useEffect(() => {
     const seq = ++openSeq.current;
@@ -331,6 +382,47 @@ export function ConfigTuning({
       cancel = true;
     };
   }, [folder, sessionKey]);
+
+  useEffect(() => {
+    if (workflow == null || xml.length === 0 || selectedIds.length === 0 || folder.length === 0) {
+      return;
+    }
+    let cancel = false;
+    const stamp = previewStamp;
+    const timer = window.setTimeout(() => {
+      setPreviewing(true);
+      void invoke<TuneResult>("scan_kit_config_tune", {
+        workflow: workflow.id,
+        xml,
+        form: dirty ? form : null,
+        dataDir: folder,
+        sessionIds: selectedIds,
+        params,
+      })
+        .then((result) => {
+          if (!cancel) {
+            setPreview({ stamp, result });
+            setError(null);
+          }
+        })
+        .catch((caught: unknown) => {
+          if (!cancel) {
+            const message = caught instanceof Error ? caught.message : String(caught);
+            setError(message);
+            notifyError(caught);
+          }
+        })
+        .finally(() => {
+          if (!cancel) {
+            setPreviewing(false);
+          }
+        });
+    }, PREVIEW_MS);
+    return () => {
+      cancel = true;
+      window.clearTimeout(timer);
+    };
+  }, [previewStamp]);
 
   async function loadFile(path: string, cancel = false) {
     const loaded = await invoke<Loaded>("scan_kit_config_form", { path });
@@ -409,36 +501,17 @@ export function ConfigTuning({
     }
   }
 
-  async function runTune() {
-    if (workflow == null || xml.length === 0) {
+  function applyPreview() {
+    if (workflow == null || matched == null || !matched.changed) {
       return;
     }
-    setBusy(true);
-    setError(null);
-    try {
-      const result = await invoke<TuneResult>("scan_kit_config_tune", {
-        workflow: workflow.id,
-        xml,
-        form: dirty ? form : null,
-        dataDir: folder,
-        sessionIds: selectedIds,
-        params,
-      });
-      setXml(result.xml);
-      setForm(result.form);
-      setPreview(result);
-      setDirty(result.changed || dirty);
-      if (result.warnings.length > 0) {
-        setError(result.warnings.join(" "));
-      }
-      notify(result.summary);
-    } catch (caught) {
-      const message = caught instanceof Error ? caught.message : String(caught);
-      setError(message);
-      notifyError(caught);
-    } finally {
-      setBusy(false);
+    if (!window.confirm(applyPrompt(workflow, params, selectedIds))) {
+      return;
     }
+    setXml(matched.xml);
+    setForm(matched.form);
+    setDirty(true);
+    notify(matched.summary);
   }
 
   async function revert() {
@@ -498,7 +571,11 @@ export function ConfigTuning({
         });
         setIntegrity(loaded.integrity);
       }
-      notify("Saved the configuration and refreshed .md5 sidecars.");
+      notifySaved(selected, {
+        title: "Configuration saved",
+        description: "Refreshed .md5 sidecars.",
+        folder: true,
+      });
     } catch (caught) {
       notifyError(caught);
     } finally {
@@ -507,89 +584,120 @@ export function ConfigTuning({
   }
 
   const sessionLine =
+    selectedIds.length === 1
+      ? `Session ${selectedIds[0]}`
+      : selectedIds.length > 1
+        ? `${selectedIds.length} sessions`
+        : "";
+  const previewStatus =
     selectedIds.length === 0
-      ? "Select sessions in Data Analysis, then tune."
-      : selectedIds.length === 1
-        ? `Tuning ${selectedIds[0]}`
-        : `Tuning ${selectedIds.length} sessions`;
+      ? "Select a session to preview proposed values."
+      : xml.length === 0
+        ? "Open devices.xml to preview proposed values."
+        : matched != null
+          ? matched.summary
+          : "Previewing proposed values.";
 
+  const fileItems = files.map((name) => ({ value: name, label: name }));
   return (
     <SidePane
       main={
-        <div
-          data-form-scroll
-          className="flex min-h-0 min-w-0 flex-1 flex-col gap-4 overflow-x-hidden overflow-y-auto p-3"
-          style={{ overflowAnchor: "none" }}
-        >
-          {preview != null ? <p className="text-sm">{preview.summary}</p> : null}
-          {preview != null && preview.columns.length > 0 ? (
-            <PreviewGrid columns={preview.columns} rows={preview.rows} />
-          ) : null}
-          {form != null ? (
-            <FormTree
-              nodes={form.nodes}
-              hideUnused={hideUnused}
-              onField={changeField}
-              onCell={changeCell}
-            />
-          ) : (
-            <p className="text-muted-foreground text-sm">Open a configuration folder to edit devices.xml.</p>
-          )}
+        <div className="flex min-h-0 min-w-0 flex-1 flex-col">
+          <div className="flex shrink-0 items-center gap-2 border-b px-3 py-2">
+            <Select
+              items={fileItems}
+              value={file}
+              onValueChange={(value) => {
+                if (value != null) {
+                  void chooseFile(value);
+                }
+              }}
+            >
+              <SelectTrigger size="sm" className="w-56" aria-label="XML file">
+                <SelectValue placeholder="XML file" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectGroup>
+                  {files.map((name) => (
+                    <SelectItem key={name} value={name}>
+                      {name}
+                    </SelectItem>
+                  ))}
+                </SelectGroup>
+              </SelectContent>
+            </Select>
+            <div className="ml-auto flex items-center gap-1">
+              {integrity == null ? null : <IntegrityMark status={integrity.status} label={integrity.label} />}
+              <Separator orientation="vertical" />
+              <Toggle
+                variant="outline"
+                size="sm"
+                pressed={hideUnused}
+                aria-label="Hide unused map2map XML"
+                title="Hide unused map2map XML"
+                onPressedChange={(next) => void toggleHide(next)}
+              >
+                {hideUnused ? <EyeOff /> : <Eye />}
+              </Toggle>
+              <Button
+                type="button"
+                variant="outline"
+                size="icon-sm"
+                aria-label="Configuration folder"
+                title={configDir.length > 0 ? configDir : "Open configuration folder"}
+                disabled={busy}
+                onClick={() => void browse()}
+              >
+                <FolderOpen />
+              </Button>
+              <Button
+                type="button"
+                variant="outline"
+                size="icon-sm"
+                aria-label="Revert"
+                title="Revert"
+                disabled={busy || !dirty}
+                onClick={() => void revert()}
+              >
+                <Undo2 />
+              </Button>
+              <Button
+                type="button"
+                variant={dirty ? "default" : "outline"}
+                size="icon-sm"
+                aria-label="Save folder"
+                title="Save folder"
+                disabled={busy || file.length === 0}
+                onClick={() => void save()}
+              >
+                <Save />
+              </Button>
+            </div>
+          </div>
+          <div
+            data-form-scroll
+            className="flex min-h-0 min-w-0 flex-1 flex-col gap-4 overflow-x-hidden overflow-y-auto p-3"
+            style={{ overflowAnchor: "none" }}
+          >
+            {matched != null ? <p className="text-sm">{matched.summary}</p> : null}
+            {matched != null && matched.columns.length > 0 ? (
+              <PreviewGrid columns={matched.columns} rows={matched.rows} />
+            ) : null}
+            {form != null ? (
+              <FormTree
+                nodes={form.nodes}
+                hideUnused={hideUnused}
+                onField={changeField}
+                onCell={changeCell}
+              />
+            ) : (
+              <p className="text-muted-foreground text-sm">Open a configuration folder to edit devices.xml.</p>
+            )}
+          </div>
         </div>
       }
       side={
         <div className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto p-3">
-      <Field>
-        <FieldLabel>Configuration folder</FieldLabel>
-        <div className="flex gap-2">
-          <Input value={configDir} readOnly />
-          <Button type="button" variant="outline" onClick={() => void browse()} disabled={busy}>
-            Browse
-          </Button>
-        </div>
-      </Field>
-      <Field>
-        <FieldLabel>File</FieldLabel>
-        <Select
-          items={files.map((name) => ({ value: name, label: name }))}
-          value={file}
-          onValueChange={(value) => {
-            if (value != null) {
-              void chooseFile(value);
-            }
-          }}
-        >
-          <SelectTrigger className="w-full">
-            <SelectValue placeholder="Choose an XML file" />
-          </SelectTrigger>
-          <SelectContent>
-            <SelectGroup>
-              {files.map((name) => (
-                <SelectItem key={name} value={name}>
-                  {name}
-                </SelectItem>
-              ))}
-            </SelectGroup>
-          </SelectContent>
-        </Select>
-      </Field>
-      {integrity != null ? <p className="text-muted-foreground text-sm">{integrity.label}</p> : null}
-      <Field orientation="horizontal">
-        <Checkbox
-          id="hide-unused"
-          checked={hideUnused}
-          onCheckedChange={(next) => void toggleHide(next === true)}
-        />
-        <FieldLabel htmlFor="hide-unused">Hide unused map2map XML</FieldLabel>
-      </Field>
-      <div className="flex gap-2">
-        <Button type="button" variant="outline" onClick={() => void save()} disabled={busy || file.length === 0}>
-          Save folder
-        </Button>
-        <Button type="button" variant="outline" onClick={() => void revert()} disabled={busy || !dirty}>
-          Revert
-        </Button>
-      </div>
       <FieldSet>
         <FieldLegend>Auto tune</FieldLegend>
         <FieldGroup>
@@ -623,10 +731,7 @@ export function ConfigTuning({
             </Select>
           </Field>
           {workflow != null ? <p className="text-muted-foreground text-sm">{workflow.description}</p> : null}
-          <p className="text-muted-foreground text-sm">
-            {sessionLine}
-            {folder.length > 0 ? ` · ${folder}` : ""}
-          </p>
+          {sessionLine.length > 0 ? <p className="text-muted-foreground text-sm">{sessionLine}</p> : null}
           {(workflow?.params ?? []).filter((param) => shown(param, params)).map((param) => (
             <ParamField
               key={param.key}
@@ -635,15 +740,32 @@ export function ConfigTuning({
               onChange={(value) => setParams((current) => ({ ...current, [param.key]: value }))}
             />
           ))}
-          <Button type="button" onClick={() => void runTune()} disabled={busy || xml.length === 0}>
-            Tune
+          {error != null ? <FieldError>{error}</FieldError> : <p className="text-sm">{previewStatus}</p>}
+          {matched != null && matched.warnings.length > 0 ? (
+            <FieldError>{matched.warnings.join(" ")}</FieldError>
+          ) : null}
+          <Button
+            type="button"
+            onClick={applyPreview}
+            disabled={busy || previewing || matched == null || !matched.changed}
+            title="Apply the preview to devices.xml. The file stays unsaved until you save."
+          >
+            Apply
           </Button>
-          {error != null ? <FieldError>{error}</FieldError> : null}
         </FieldGroup>
       </FieldSet>
         </div>
       }
     />
+  );
+}
+
+function IntegrityMark({ status, label }: { status: string; label: string }) {
+  const Icon = status === "OK" ? CircleCheck : status === "HASH_ERR" ? TriangleAlert : FileQuestion;
+  return (
+    <span className="text-muted-foreground inline-flex" title={label} aria-label={label}>
+      <Icon className="size-4" />
+    </span>
   );
 }
 
@@ -922,7 +1044,7 @@ function ParamField({
   if (param.kind === "choice" && shortChoices(param)) {
     return (
       <Field>
-        <FieldLabel>{param.label}</FieldLabel>
+        <FieldLabel title={param.tooltip}>{param.label}</FieldLabel>
         <ToggleGroup
           variant="outline"
           spacing={0}
@@ -938,7 +1060,12 @@ function ParamField({
           }}
         >
           {(param.choices ?? []).map((choice) => (
-            <ToggleGroupItem key={choice.value} value={choice.value} className="min-w-0 flex-1 cursor-pointer">
+            <ToggleGroupItem
+              key={choice.value}
+              value={choice.value}
+              title={choice.tooltip}
+              className="min-w-0 flex-1 cursor-pointer"
+            >
               {choice.label}
             </ToggleGroupItem>
           ))}
@@ -949,7 +1076,7 @@ function ParamField({
   if (param.kind === "choice") {
     return (
       <Field>
-        <FieldLabel>{param.label}</FieldLabel>
+        <FieldLabel title={param.tooltip}>{param.label}</FieldLabel>
         <Select
           items={(param.choices ?? []).map((choice) => ({ value: choice.value, label: choice.label }))}
           value={typeof value === "string" ? value : ""}
@@ -965,7 +1092,7 @@ function ParamField({
           <SelectContent>
             <SelectGroup>
               {(param.choices ?? []).map((choice) => (
-                <SelectItem key={choice.value} value={choice.value}>
+                <SelectItem key={choice.value} value={choice.value} title={choice.tooltip}>
                   {choice.label}
                 </SelectItem>
               ))}
@@ -977,15 +1104,23 @@ function ParamField({
   }
   return (
     <Field>
-      <FieldLabel>{param.label}</FieldLabel>
-      <Input
-        value={value == null ? "" : String(value)}
-        onChange={(event) => {
-          const text = event.target.value;
-          const number = Number(text);
-          onChange(Number.isFinite(number) && text.trim() !== "" ? number : text);
-        }}
-      />
+      <FieldLabel title={param.tooltip}>{param.label}</FieldLabel>
+      <div className="flex items-center gap-2">
+        <Input
+          type="number"
+          inputMode="decimal"
+          min={param.minimum}
+          step={param.step ?? "any"}
+          title={param.tooltip}
+          value={value == null ? "" : String(value)}
+          onChange={(event) => {
+            const text = event.target.value;
+            const number = Number(text);
+            onChange(Number.isFinite(number) && text.trim() !== "" ? number : text);
+          }}
+        />
+        {param.suffix != null ? <span className="text-muted-foreground text-sm">{param.suffix}</span> : null}
+      </div>
     </Field>
   );
 }

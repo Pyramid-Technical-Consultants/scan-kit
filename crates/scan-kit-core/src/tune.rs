@@ -27,8 +27,16 @@ pub fn tune_catalog() -> Value {
                 "name": "Sigma Tuning",
                 "description": "IC1/IC2 σ K0 to fit ±tolerance band",
                 "params": [
-                    spec_float("sigma_tolerance_percent", "Sigma Tolerance (%)", 20.0, 0.0, 0.1),
-                    spec_float("sigma_lower_headroom_percent", "Lower Headroom (%)", 1.0, 0.0, 0.1)
+                    hint(
+                        spec_float("sigma_tolerance_percent", "Sigma Tolerance", 20.0, 0.0, 0.1),
+                        "%",
+                        "Symmetric ±% band around each proposed K0."
+                    ),
+                    hint(
+                        spec_float("sigma_lower_headroom_percent", "Lower Headroom", 1.0, 0.0, 0.1),
+                        "%",
+                        "Extra margin added above the smallest observed sigma before fitting the tolerance band, so K0 does not sit flush against the measured minimum."
+                    )
                 ]
             },
             {
@@ -37,20 +45,20 @@ pub fn tune_catalog() -> Value {
                 "description": "IC1/IC2 zero offset at iso mm from session(s)",
                 "params": [
                     spec_choice("optimize_method", "Optimize Using", "median", json!([
-                        {"value": "median", "label": "Median"},
-                        {"value": "weighted_average", "label": "Weighted Average"},
-                        {"value": "min_max_midpoint", "label": "Min-Max Midpoint"}
+                        choice("median", "Median", "Robust median of position errors across all samples."),
+                        choice("weighted_average", "Weighted", "Mean weighted by charge per spot. Falls back to an unweighted mean."),
+                        choice("min_max_midpoint", "Midpoint", "Midpoint between the smallest and largest observed error.")
                     ])),
                     spec_choice("data_source", "Data Source", "spot", json!([
-                        {"value": "spot", "label": "Spot"},
-                        {"value": "timeslice", "label": "Timeslice"}
+                        choice("spot", "Spot", "One sample per delivered spot from spot_data.csv."),
+                        choice("timeslice", "Timeslice", "Beam-on timeslice samples from timeslice_data_device_units.csv.")
                     ]))
                 ]
             },
             {
                 "id": "ic_distance_tuning",
                 "name": "IC Distance Tuning",
-                "description": "IC1/IC2 source to device distance + zero offset from session(s)",
+                "description": "IC1/IC2 source to device distance and zero offset. Review the change, then re-run Sigma Tuning.",
                 "params": []
             },
             {
@@ -59,17 +67,25 @@ pub fn tune_catalog() -> Value {
                 "description": "Secondary IC K_MU to match primary (optional primary rescale)",
                 "params": [
                     spec_choice("primary_ic", "Primary IC", "ic1", json!([
-                        {"value": "ic1", "label": "IC1"},
-                        {"value": "ic2", "label": "IC2"},
-                        {"value": "ic3", "label": "IC3"}
+                        choice("ic1", "IC1", "Beam-terminator chamber. Left unchanged unless you rescale it below."),
+                        choice("ic2", "IC2", "Use IC2 as the primary reference chamber."),
+                        choice("ic3", "IC3", "Use IC3 as the primary reference chamber.")
                     ])),
                     spec_choice("primary_mode", "Primary K_MU", "unchanged", json!([
-                        {"value": "unchanged", "label": "Leave Unchanged"},
-                        {"value": "known_mu", "label": "Known MU"},
-                        {"value": "percent", "label": "Adjust by Percent"}
+                        choice("unchanged", "Unchanged", "Do not write primary K_MU. Secondaries are scaled to agree with it."),
+                        choice("known_mu", "Known MU", "Independent Faraday or iso-chamber total for the selected sessions combined. Changing primary K_MU changes future delivered charge for the same CHARGE_REQ."),
+                        choice("percent", "Percent", "Positive means more reported MU for the same prescription, so K_MU decreases. +2% scales by 1/1.02.")
                     ])),
-                    spec_float_when("known_mu", "Known MU", 0.0, 0.0, 0.1, "primary_mode", "known_mu"),
-                    spec_float_when("percent", "Percent (%)", 0.0, -99.0, 0.1, "primary_mode", "percent")
+                    hint(
+                        spec_float_when("known_mu", "Known MU", 0.0, 0.0, 0.1, "primary_mode", "known_mu"),
+                        "MU",
+                        "Total MU at isocenter for the selected sessions combined."
+                    ),
+                    hint(
+                        spec_float_when("percent", "Percent", 0.0, -99.0, 0.1, "primary_mode", "percent"),
+                        "%",
+                        "Positive means more reported MU for the same prescription, so K_MU decreases. +2% scales by 1/1.02."
+                    )
                 ]
             }
         ]
@@ -143,6 +159,18 @@ fn spec_choice(key: &str, label: &str, default: &str, choices: Value) -> Value {
     })
 }
 
+fn choice(value: &str, label: &str, tooltip: &str) -> Value {
+    json!({"value": value, "label": label, "tooltip": tooltip})
+}
+
+fn hint(mut spec: Value, suffix: &str, tooltip: &str) -> Value {
+    if !suffix.is_empty() {
+        spec["suffix"] = json!(suffix);
+    }
+    spec["tooltip"] = json!(tooltip);
+    spec
+}
+
 fn tune_sigma(
     root: &mut Elem,
     spots: &TuneSpots,
@@ -154,6 +182,7 @@ fn tune_sigma(
     let mut warnings = Vec::new();
     let mut rows = Vec::new();
     let mut updates = 0;
+    let mut max_extreme = 0.0_f64;
     for (index, device) in DEVICES.iter().enumerate() {
         let Some(chamber) = find_chamber(root, device) else {
             continue;
@@ -188,6 +217,9 @@ fn tune_sigma(
                 continue;
             }
             let (extreme, observed, kind) = excursion(&samples, new_k0, tolerance);
+            if extreme > max_extreme {
+                max_extreme = extreme;
+            }
             chamber.children[band_index].set_attr("K0", &format_k0(new_k0));
             updates += 1;
             rows.push(vec![
@@ -207,7 +239,7 @@ fn tune_sigma(
     let summary = if updates == 0 {
         "No sigma bands were updated.".to_owned()
     } else {
-        format!("Updated {updates} beam_sigma band(s) from {session_label}. Save the configuration to write devices.xml.")
+        format!("{updates} energy band(s) will be updated from {session_label}. Max OOB: {max_extreme:.1}%.")
     };
     Ok((
         summary,
@@ -236,6 +268,7 @@ fn tune_offset(
     let mut warnings = Vec::new();
     let mut rows = Vec::new();
     let mut updates = 0;
+    let mut max_correction = 0.0_f64;
     for (index, device) in DEVICES.iter().enumerate() {
         let Some(chamber) = find_chamber(root, device) else {
             warnings.push(format!("No zero_offset_at_iso_mm found for {device}."));
@@ -265,6 +298,9 @@ fn tune_offset(
             .parse::<f64>()
             .unwrap_or(0.0);
         let new_offset = old - correction;
+        if correction.abs() > max_correction {
+            max_correction = correction.abs();
+        }
         chamber.children[offset_index].text = format_k0(new_offset);
         updates += 1;
         rows.push(vec![
@@ -282,7 +318,9 @@ fn tune_offset(
     let summary = if updates == 0 {
         "No position offsets were updated.".into()
     } else {
-        format!("Updated {updates} zero_offset_at_iso_mm value(s) from {session_label}. Save the configuration to write devices.xml.")
+        format!(
+            "{updates} zero offset(s) will be updated from {session_label}. Max correction: {max_correction:.3} mm."
+        )
     };
     Ok((
         summary,
@@ -412,8 +450,9 @@ fn tune_distance(
         "No IC distances were updated.".into()
     } else {
         format!(
-            "Updated {updates} IC distance(s) and zero offset(s) from {session_label}; largest distance change {:+.2} mm ({:+.2}%) on {}, removing up to {:.3} mm of position error at the field edge ({}). Save the configuration to write devices.xml.",
-            largest.1, largest.2, largest.0, best_removed.1, best_removed.0
+            "{updates} chamber(s): distance and zero offset will be updated from {session_label}. Removes up to {:.3} mm at the field edge. Max distance change: {:.2}%.",
+            best_removed.1,
+            largest.2.abs()
         )
     };
     Ok((
@@ -525,6 +564,7 @@ fn tune_kmu(
     }
     let mut rows = Vec::new();
     let mut updates = 0;
+    let mut max_delta = 0.0_f64;
     let mut found = Vec::new();
     collect_kmu(root, &mut found);
     for (path, attr, old, family) in found {
@@ -536,6 +576,10 @@ fn tune_kmu(
             (old * scale, scale)
         };
         if write[family] {
+            let delta = (applied - 1.0).abs() * 100.0;
+            if delta > max_delta {
+                max_delta = delta;
+            }
             if let Some(elem) = root.at_mut(&path) {
                 elem.set_attr(&attr, &format_k0(new_kmu));
                 updates += 1;
@@ -561,7 +605,9 @@ fn tune_kmu(
     let summary = if updates == 0 {
         "No K_MU values were updated.".into()
     } else {
-        format!("Updated {updates} K_MU value(s) from {session_label}. Save the configuration to write devices.xml.")
+        format!(
+            "{updates} K_MU value(s) will be updated from {session_label}. Max |Δ K_MU|: {max_delta:.2}%. Σ primary {sum_pri:.4} MU."
+        )
     };
     Ok((
         summary,
@@ -1137,6 +1183,9 @@ mod tests {
         };
         let result = run_tune("sigma_tuning", xml, &spots, &json!({}), "one session").unwrap();
         assert_eq!(result["changed"], true);
+        let summary = result["summary"].as_str().unwrap();
+        assert!(summary.contains("from one session"));
+        assert!(summary.contains("Max OOB"));
         let xml = result["xml"].as_str().unwrap();
         assert!(xml.contains("K0=\""));
         assert!(!xml.contains("K0=\"1\""));
@@ -1169,6 +1218,8 @@ mod tests {
             "one session",
         )
         .unwrap();
+        let summary = result["summary"].as_str().unwrap();
+        assert!(summary.contains("Max correction: 0.400 mm"));
         assert!(result["xml"].as_str().unwrap().contains("0.6"));
     }
 }

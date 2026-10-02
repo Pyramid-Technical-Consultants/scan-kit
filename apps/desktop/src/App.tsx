@@ -70,7 +70,7 @@ import {
   MenubarTrigger,
 } from "@/components/ui/menubar";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { Toaster } from "@/components/ui/sonner";
+import { Toaster } from "@/components/ui/toast";
 import { AnalysisView } from "@/AnalysisView";
 import { ConfigTuning } from "@/ConfigTuning";
 import { PhantomSynthesis } from "@/PhantomSynthesis";
@@ -1144,7 +1144,7 @@ export default function App() {
           ) : null}
         </DialogContent>
       </Dialog>
-      <Toaster theme="dark" />
+      <Toaster />
     </div>
   );
 }

@@ -5,7 +5,7 @@ import { open, save } from "@tauri-apps/plugin-dialog";
 import { Button } from "@/components/ui/button";
 import { Field, FieldLabel } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
-import { notify, notifyError } from "@/notify";
+import { notify, notifyError, notifySaved } from "@/notify";
 
 type Enables = { start: boolean; pause: boolean; stop: boolean; reset: boolean };
 
@@ -205,8 +205,8 @@ export function PlanRunner() {
       return;
     }
     await run(async () => {
-      const saved = await invoke<{ message: string }>("scan_kit_runner_download", { dest });
-      notify(saved.message);
+      await invoke("scan_kit_runner_download", { dest });
+      notifySaved(dest, { title: "Session saved" });
     });
   }
 

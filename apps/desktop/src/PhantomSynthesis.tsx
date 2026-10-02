@@ -14,7 +14,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { notify, notifyError } from "@/notify";
+import { notifyError, notifySaved } from "@/notify";
 import { SidePane } from "@/SidePane";
 
 type Choice = { value: string; label: string };
@@ -90,12 +90,12 @@ export function PhantomSynthesis() {
     }
     setBusy(true);
     try {
-      const written = await invoke<{ status: string }>("scan_kit_write_phantom", {
+      const written = await invoke<{ status: string; folder: string }>("scan_kit_write_phantom", {
         parent: selectedDir,
         params,
       });
       setStatus(written.status);
-      notify(written.status);
+      notifySaved(written.folder, { title: "Study written", folder: true });
     } catch (reason: unknown) {
       notifyError(reason);
     } finally {
