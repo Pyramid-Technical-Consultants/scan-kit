@@ -18,6 +18,12 @@ export function sessionColor(index: number): string {
   return SESSION_COLORS[wrapped];
 }
 
+/** Drawn sessions, in selection order. A hidden session keeps its color for the others. */
+export function shownSessionIds(order: readonly string[], hidden: readonly string[]): string[] {
+  const dropped = new Set(hidden);
+  return order.filter((id) => !dropped.has(id));
+}
+
 export function selectionFromLibrary(
   rows: readonly { session_id: string; selected: boolean }[],
   stored?: readonly string[],

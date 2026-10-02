@@ -4,12 +4,19 @@
 //! reimplement them.
 
 mod analysis;
+mod beam;
 mod binned;
 mod columns;
 mod discover;
+mod dose_view;
+mod mc_tables;
+mod patient_view;
 mod store;
 
 pub use analysis::{analysis_scene, channel_catalog, load_timeslice_columns};
+pub use beam::{beam_record, protons_per_mu, spot_record};
+pub use dose_view::dose_volume;
+pub use mc_tables::mc_tables;
 
 use std::path::{Path, PathBuf};
 

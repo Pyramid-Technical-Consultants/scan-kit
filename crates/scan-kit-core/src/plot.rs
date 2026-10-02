@@ -23,10 +23,21 @@ pub enum Series {
         counts: Vec<f32>,
         color: [f32; 4],
     },
+    /// `ramp` is a catalog index. 0 is viridis, and the session index fades
+    /// `color` from clear to that ink. `lo` and `hi` are the color window;
+    /// `hi <= lo` stretches each image to its own min and max.
     Heatmap {
         values: Vec<f32>,
         cols: u32,
         rows: u32,
+        #[serde(default)]
+        ramp: u8,
+        #[serde(default = "heatmap_white")]
+        color: [f32; 4],
+        #[serde(default)]
+        lo: f32,
+        #[serde(default)]
+        hi: f32,
     },
     /// Filled rectangles in data coordinates. `x` and `y` are the lower-left corner.
     Rects {
@@ -34,6 +45,12 @@ pub enum Series {
         y: Vec<f32>,
         w: Vec<f32>,
         h: Vec<f32>,
+        color: [f32; 4],
+    },
+    /// Filled triangles in data coordinates. `xs` and `ys` are groups of three corners.
+    Triangles {
+        xs: Vec<f32>,
+        ys: Vec<f32>,
         color: [f32; 4],
     },
     /// A polyline the shell palette leaves alone. Reference lines use this.
@@ -49,6 +66,8 @@ pub enum Series {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Panel {
     pub title: String,
+    /// Quantity drawn up the left side, including units when the series has them.
+    pub y_label: String,
     pub xmin: f32,
     pub xmax: f32,
     pub ymin: f32,
@@ -56,6 +75,28 @@ pub struct Panel {
     pub series: Vec<Series>,
     /// Category names drawn at x = 0, 1, 2, …. Empty draws numeric ticks from the range.
     pub x_labels: Vec<String>,
+    /// One data unit has the same pixel length on both axes.
+    #[serde(default)]
+    pub equal: bool,
+}
+
+fn heatmap_white() -> [f32; 4] {
+    [1.0, 1.0, 1.0, 1.0]
+}
+
+impl Series {
+    /// Viridis heatmap. Existing dose and window maps use this.
+    pub fn heatmap(values: Vec<f32>, cols: u32, rows: u32) -> Self {
+        Self::Heatmap {
+            values,
+            cols,
+            rows,
+            ramp: crate::ramp::VIRIDIS,
+            color: heatmap_white(),
+            lo: 0.0,
+            hi: 0.0,
+        }
+    }
 }
 
 /// A control the shell renders with shadcn. The view does not draw it.
@@ -87,6 +128,8 @@ pub struct PlotScene {
     pub columns: u32,
     /// Relative column widths. Empty means equal columns.
     pub column_weights: Vec<f32>,
+    /// Relative row heights. Empty means equal rows.
+    pub row_weights: Vec<f32>,
 }
 
 impl PlotScene {
@@ -99,6 +142,7 @@ impl PlotScene {
             samples: Vec::new(),
             columns: 0,
             column_weights: Vec::new(),
+            row_weights: Vec::new(),
         }
     }
 }

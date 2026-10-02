@@ -6,7 +6,7 @@
 
 use std::path::Path;
 
-use scan_kit_core::{Series, ToolKind, ToolSpec};
+use scan_kit_core::{is_session, Series, ToolKind, ToolSpec};
 use scan_kit_io::analysis_scene;
 use serde_json::{json, Value};
 
@@ -84,7 +84,7 @@ pub fn run_view(
     foreground: [f32; 4],
     palette: &[[f32; 4]],
 ) -> Result<Value, String> {
-    let mut scene = analysis_scene(view, root, session_ids, options)?;
+    let mut scene = load_scene(view, root, session_ids, options)?;
     apply_palette(&mut scene, palette);
     let frame = paint_once(&scene, width, height, background, foreground)?;
     Ok(json!({
@@ -108,9 +108,26 @@ pub fn open_plot(
     foreground: [f32; 4],
     palette: &[[f32; 4]],
 ) -> Result<Vec<u8>, String> {
-    let mut scene = analysis_scene(view, root, session_ids, options)?;
+    let mut scene = load_scene(view, root, session_ids, options)?;
     apply_palette(&mut scene, palette);
     encode_plot(&scene, background, foreground)
+}
+
+fn load_scene(
+    view: &str,
+    root: &Path,
+    session_ids: &[String],
+    options: &Value,
+) -> Result<scan_kit_core::PlotScene, String> {
+    if view == "dose_volume" {
+        return Ok(scan_kit_io::dose_volume(
+            root,
+            session_ids,
+            options,
+            Some(&|job| crate::run_mc(job).map_err(|err| err.to_string())),
+        ));
+    }
+    analysis_scene(view, root, session_ids, options)
 }
 
 fn paint_once(
@@ -144,7 +161,8 @@ fn apply_palette(scene: &mut scan_kit_core::PlotScene, palette: &[[f32; 4]]) {
                 Series::Polyline { color: slot, .. }
                 | Series::Points { color: slot, .. }
                 | Series::Bars { color: slot, .. }
-                | Series::Rects { color: slot, .. } => {
+                | Series::Rects { color: slot, .. }
+                | Series::Triangles { color: slot, .. } => {
                     let alpha = slot[3];
                     // Alpha 0 keeps the previous series color, so a mean curve and its
                     // trend stay with that session instead of taking the next chart color.
@@ -156,7 +174,15 @@ fn apply_palette(scene: &mut scan_kit_core::PlotScene, palette: &[[f32; 4]]) {
                         index += 1;
                     }
                 }
-                Series::Heatmap { .. } | Series::Guide { .. } => {}
+                Series::Heatmap {
+                    color: slot, ramp, ..
+                } => {
+                    if is_session(*ramp) {
+                        *slot = [color[0], color[1], color[2], 1.0];
+                        index += 1;
+                    }
+                }
+                Series::Guide { .. } => {}
             }
         }
     }
@@ -308,5 +334,63 @@ mod tests {
         let frame = plot.draw(80, 60, &PlotInput::default()).unwrap();
         assert_eq!(frame.rgba.len(), 80 * 60 * 4);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn session_heatmaps_take_palette_colors() {
+        use scan_kit_core::{Panel, PlotScene, Series, SESSION};
+        let mut scene = PlotScene::empty("heat");
+        scene.panels.push(Panel {
+            title: String::new(),
+            y_label: String::new(),
+            xmin: 0.0,
+            xmax: 1.0,
+            ymin: 0.0,
+            ymax: 1.0,
+            series: vec![
+                Series::Heatmap {
+                    values: vec![0.0, 1.0],
+                    cols: 1,
+                    rows: 2,
+                    ramp: SESSION,
+                    color: [0.0, 0.0, 0.0, 1.0],
+                    lo: 0.0,
+                    hi: 0.0,
+                },
+                Series::Heatmap {
+                    values: vec![0.0, 1.0],
+                    cols: 1,
+                    rows: 2,
+                    ramp: 1,
+                    color: [1.0, 1.0, 1.0, 1.0],
+                    lo: 0.0,
+                    hi: 0.0,
+                },
+                Series::Heatmap {
+                    values: vec![0.0, 1.0],
+                    cols: 1,
+                    rows: 2,
+                    ramp: SESSION,
+                    color: [0.0, 0.0, 0.0, 1.0],
+                    lo: 0.0,
+                    hi: 0.0,
+                },
+            ],
+            x_labels: Vec::new(),
+            equal: false,
+        });
+        apply_palette(&mut scene, &[[0.8, 0.1, 0.1, 1.0], [0.1, 0.7, 0.2, 1.0]]);
+        let colors: Vec<_> = scene.panels[0]
+            .series
+            .iter()
+            .map(|series| match series {
+                Series::Heatmap { color, ramp, .. } => (*ramp, *color),
+                _ => unreachable!(),
+            })
+            .collect();
+        assert_eq!(colors[0].0, SESSION);
+        assert_eq!(colors[0].1, [0.8, 0.1, 0.1, 1.0]);
+        assert_eq!(colors[1], (1, [1.0, 1.0, 1.0, 1.0]));
+        assert_eq!(colors[2].1, [0.1, 0.7, 0.2, 1.0]);
     }
 }

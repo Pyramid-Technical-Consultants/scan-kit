@@ -1,7 +1,7 @@
 import { CompactSelection, type GridSelection } from "@glideapps/glide-data-grid";
 import { expect, it } from "vitest";
 
-import { selectWholeRows } from "./grid-selection";
+import { selectedSessionIds, selectWholeRows } from "./grid-selection";
 
 function selection(
   cell: readonly [number, number],
@@ -28,6 +28,16 @@ it("keeps a dragged row span and widens each extra range", () => {
   );
   expect(next.current?.range).toEqual({ x: 0, y: 2, width: 10, height: 3 });
   expect(next.current?.rangeStack).toEqual([{ x: 0, y: 0, width: 10, height: 1 }]);
+});
+
+it("toggles the highlighted rows, or only the clicked row when it sits outside them", () => {
+  const ids = ["a", "b", "c", "d", "e"];
+  const span = selection([0, 1], { x: 0, y: 1, width: 10, height: 2 }, [{ x: 0, y: 4, width: 10, height: 1 }]);
+  expect(selectedSessionIds(ids, span, 2)).toEqual(["b", "c", "e"]);
+  expect(selectedSessionIds(ids, span, 0)).toEqual(["a"]);
+  expect(
+    selectedSessionIds(ids, { columns: CompactSelection.empty(), rows: CompactSelection.empty() }, 3),
+  ).toEqual(["d"]);
 });
 
 it("leaves a selection that is already full width alone", () => {

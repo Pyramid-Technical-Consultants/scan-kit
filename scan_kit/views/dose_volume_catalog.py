@@ -1,4 +1,4 @@
-"""Presets and display options for the 3D dose-volume viewer."""
+"""Display options for the 3D dose-volume viewer."""
 
 from __future__ import annotations
 
@@ -177,34 +177,6 @@ def active_scale(compare: bool, scale: str) -> str:
     if scale in allowed:
         return scale
     return DEFAULT_DIVERGENT_SCALE if compare else DEFAULT_SCALE
-
-PRESET_SPOT_IC1 = "spot_ic1"
-PRESET_SPOT_ISO_RAY = "spot_iso_ray"
-PRESET_TIMESLICE_IC1 = "timeslice_ic1"
-PRESET_SPOT_VS_PLAN = "spot_vs_plan"
-
-
-@dataclass(frozen=True)
-class PresetDef:
-    id: str
-    label: str
-    grain: GrainKind = GRAIN_SPOT
-    xy_mode: XyMode = XY_IC1
-    overlay_plan: bool = False
-
-
-PRESETS: tuple[PresetDef, ...] = (
-    PresetDef(PRESET_SPOT_IC1, "Spot · IC1"),
-    PresetDef(PRESET_SPOT_ISO_RAY, "Spot · ISO ray", xy_mode=XY_ISO_RAY),
-    PresetDef(PRESET_TIMESLICE_IC1, "Timeslice · IC1", grain=GRAIN_TIMESLICE),
-    PresetDef(
-        PRESET_SPOT_VS_PLAN,
-        "Spot · IC1 − plan",
-        overlay_plan=True,
-    ),
-)
-
-PRESET_BY_ID = {p.id: p for p in PRESETS}
 
 
 @dataclass

@@ -204,7 +204,7 @@ Click any button in the right-hand panel, or use **Analysis** in the menu bar. *
 
 ## Analysis views
 
-Views are organized in the launcher as **Unified Views** (configurable Qt explorers with a side panel of metrics, presets, and filters) and **Specialized Analysis** (focused matplotlib tools not yet folded into a unified shell).
+Views are organized in the launcher as **Unified Views** (configurable explorers with a side panel of metrics and filters) and **Specialized Analysis** (focused plots not yet folded into a unified shell).
 
 ### Unified views
 
@@ -292,10 +292,10 @@ Focused plots that still use standalone matplotlib windows:
 
 ### Interactive replay views
 
-**Timeslice Replay** opens a Qt window with an embedded Matplotlib plot and a unified **Signal Source** list (same metric names and isocenter/chamber variants as Binned Summary and Distribution Explorer where applicable). Sources include **IC current**, **dDose/dt**, **sigma**, **sigma error**, **position**, **position error**, **IC2-IC1 position**, and **magnetic field**. Presets jump to common sets; pick channels within the selected source from the checklist below. Detail traces sit above a compressed timeline brush. See the [screenshots](#screenshots) for examples.
+**Timeslice Replay** opens a plot with a **Signal Source** list (same metric names and isocenter/chamber variants as Binned Summary and Distribution Explorer where applicable). Sources include **IC current**, **dDose/dt**, **sigma**, **sigma error**, **position**, **position error**, **IC2-IC1 position**, and **magnetic field**. Pick channels within the selected source from the checklist below. Detail traces sit above a compressed timeline brush. See the [screenshots](#screenshots) for examples.
 
 1. Select session(s) and open **Timeslice Replay**.
-2. Choose a signal source from the list (or use a preset), then tick the channels to plot.
+2. Choose a signal source from the list, then tick the channels to plot.
 3. Drag the bottom timeline brush to set the detail window (scroll to zoom).
 
 Layer boundaries appear as annotated vertical lines. Multiple sessions overlay with distinct colors. Large windows are auto-decimated so scrubbing stays smooth.

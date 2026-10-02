@@ -1,8 +1,8 @@
 //! One binary payload per opened view.
 //!
 //! Layout: `u32` little-endian header length, the JSON [`PlotHeader`], then the
-//! line, point, and quad instance bytes in GPU layout, then each heatmap's `R8`
-//! pixels. The shell reads the header for its controls. The wasm plot uploads
+//! line, point, and quad instance bytes in GPU layout, then each heatmap's
+//! RGBA pixels. The shell reads the header for its controls. The wasm plot uploads
 //! the rest without parsing series again.
 
 use scan_kit_core::{Control, DataTable, Panel, PlotScene};
@@ -24,6 +24,8 @@ pub struct PlotHeader {
     pub panels: Vec<Panel>,
     pub columns: u32,
     pub column_weights: Vec<f32>,
+    #[serde(default)]
+    pub row_weights: Vec<f32>,
     pub background: [f32; 4],
     pub foreground: [f32; 4],
     batches: Vec<PanelBatch>,
@@ -47,6 +49,7 @@ pub fn encode_plot(
         panels: header_panels(&scene.panels),
         columns: scene.columns,
         column_weights: scene.column_weights.clone(),
+        row_weights: scene.row_weights.clone(),
         background,
         foreground,
         batches: marks.panels.clone(),
@@ -89,7 +92,7 @@ pub(crate) fn decode_plot(bytes: &[u8]) -> Result<(PlotHeader, Marks), String> {
     let heatmaps = header
         .heatmap_size
         .iter()
-        .map(|(cols, rows)| reader.take((cols * rows) as usize).map(<[u8]>::to_vec))
+        .map(|(cols, rows)| reader.take((cols * rows * 4) as usize).map(<[u8]>::to_vec))
         .collect::<Result<Vec<_>, _>>()?;
     let marks = Marks {
         lines,
@@ -112,6 +115,7 @@ impl Plot {
             header.panels,
             header.columns,
             header.column_weights,
+            header.row_weights,
             marks,
             header.background,
             header.foreground,
@@ -151,6 +155,7 @@ mod tests {
             panels: vec![
                 Panel {
                     title: "a".into(),
+                    y_label: String::new(),
                     xmin: 0.0,
                     xmax: 4.0,
                     ymin: 0.0,
@@ -175,19 +180,18 @@ mod tests {
                         },
                     ],
                     x_labels: vec!["x".into()],
+                    equal: false,
                 },
                 Panel {
                     title: String::new(),
+                    y_label: String::new(),
                     xmin: 0.0,
                     xmax: 1.0,
                     ymin: 0.0,
                     ymax: 1.0,
-                    series: vec![Series::Heatmap {
-                        values: vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0],
-                        cols: 3,
-                        rows: 2,
-                    }],
+                    series: vec![Series::heatmap(vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0], 3, 2)],
                     x_labels: Vec::new(),
+                    equal: false,
                 },
             ],
             controls: Vec::new(),
@@ -195,6 +199,7 @@ mod tests {
             samples: vec![0.5],
             columns: 2,
             column_weights: vec![2.0, 1.0],
+            row_weights: vec![2.0, 1.0, 1.0],
         };
         let bytes = encode_plot(&scene, [0.1, 0.1, 0.1, 1.0], [0.9, 0.9, 0.9, 1.0]).unwrap();
         let (header, marks) = decode_plot(&bytes).unwrap();
@@ -202,6 +207,7 @@ mod tests {
         assert_eq!(header.panels, header_panels(&scene.panels));
         assert_eq!(header.samples, vec![0.5]);
         assert_eq!(header.column_weights, vec![2.0, 1.0]);
+        assert_eq!(header.row_weights, vec![2.0, 1.0, 1.0]);
         assert!(marks.quads.iter().any(|quad| quad.heatmap == Some(0)));
         assert!(decode_plot(&bytes[..bytes.len() - 1]).is_err());
     }

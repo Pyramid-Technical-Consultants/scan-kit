@@ -18,9 +18,12 @@ it("opens the session menu without throwing", async () => {
         sessionId="1022244633"
         x={12}
         y={24}
+        rowIds={["1022244633"]}
+        rowsSelected={false}
         onClose={() => {}}
         onCopy={() => {}}
         onTune={() => {}}
+        onToggleRows={() => {}}
       />,
     );
   });
@@ -30,8 +33,16 @@ it("opens the session menu without throwing", async () => {
   expect((trigger as HTMLElement).style.left).toBe("12px");
   expect((trigger as HTMLElement).style.top).toBe("24px");
   expect(document.body.textContent).toContain("1022244633");
+  expect(document.body.textContent).toContain("Select Row");
   expect(document.body.textContent).toContain("Copy Session ID");
   expect(document.body.textContent).toContain("Open in Config Tuning");
+  const content = document.querySelector("[data-slot=dropdown-menu-content]");
+  expect(content).toBeInstanceOf(HTMLElement);
+  expect((content as HTMLElement).className).toContain("w-max");
+  expect((content as HTMLElement).className).not.toContain("anchor-width");
+  const item = document.querySelector("[data-slot=dropdown-menu-item]");
+  expect(item).toBeInstanceOf(HTMLElement);
+  expect((item as HTMLElement).className).toContain("whitespace-nowrap");
   await act(async () => {
     root.unmount();
   });

@@ -1,7 +1,14 @@
-//! Study index for explicit little-endian DICOM headers.
+//! Explicit little-endian DICOM: a study index, and CT, structure, ion-plan, and dose reads.
 //!
-//! ponytail: implicit VR and undefined-length sequences are skipped. A full
-//! toolkit replaces this reader when pixel decode is required.
+//! ponytail: implicit VR and undefined-length sequences are rejected. Compressed
+//! pixel data is not decoded.
+
+mod patient;
+
+pub use patient::{
+    gantry_to_patient, hu_density, hu_label, inside_structure, load_study, write_water_study, Beam,
+    CtVolume, PatientStudy, Spot, Structure,
+};
 
 use std::fs;
 use std::path::Path;

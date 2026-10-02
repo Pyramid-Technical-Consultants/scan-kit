@@ -4,13 +4,20 @@
 //! implement the operations themselves. Session files live in `scan-kit-io`.
 //! GPU work lives in `scan-kit-compute`.
 
+mod dose;
 mod geometry;
 mod plot;
+mod ramp;
 mod schema;
 mod session;
 mod session_log;
 mod signal;
 
+pub use dose::{
+    analytic_on, analytic_volume, bragg_idd, csda_range_mm, dose_frame, field_bounds, medium,
+    protons_from_mu, robust_high, through_wet, water, DoseFrame, McJob, McResult, Medium,
+    PatientRequest, Pencil, Quantity, SlabRequest, Volume,
+};
 pub use geometry::{
     beam_angle_mrad, fit_iso_plane, fit_line, magnet_pivot_z, parse_ic_geometry, IcGeometry,
     IC1_Z_MM, IC2_Z_MM, IC_SEP_MM,
@@ -19,6 +26,7 @@ pub use plot::{
     apply_clip, format_tick, map_span, project, ticks, Camera, Control, DataTable, Panel, PlotRect,
     PlotScene, Series,
 };
+pub use ramp::{choices, index, is_session, resolve, sample, session, Family, SESSION, VIRIDIS};
 pub use session_log::{compare_templates, parse_session_log, LayerEvent, SessionLog};
 pub use signal::{
     arc_fit, arc_predict, assign_bin_centers, beam_off_edges, beam_on_mask, box_stats,

@@ -2,6 +2,7 @@ import { Copy, SlidersHorizontal } from "lucide-react";
 
 import {
   DropdownMenu,
+  DropdownMenuCheckboxItem,
   DropdownMenuContent,
   DropdownMenuGroup,
   DropdownMenuItem,
@@ -22,17 +23,24 @@ export function SessionContextMenu({
   sessionId,
   x,
   y,
+  rowIds,
+  rowsSelected,
   onClose,
   onCopy,
   onTune,
+  onToggleRows,
 }: {
   sessionId: string;
   x: number;
   y: number;
+  rowIds: readonly string[];
+  rowsSelected: boolean;
   onClose: () => void;
   onCopy: (sessionId: string) => void;
   onTune: () => void;
+  onToggleRows: () => void;
 }) {
+  const rowLabel = rowIds.length === 1 ? "Row" : "Rows";
   return (
     <DropdownMenu
       open
@@ -46,10 +54,21 @@ export function SessionContextMenu({
         className="size-px p-0 opacity-0"
         style={{ position: "fixed", left: x, top: y }}
       />
-      <DropdownMenuContent>
+      <DropdownMenuContent className="w-max">
         <DropdownMenuGroup>
-          <DropdownMenuLabel>{sessionId}</DropdownMenuLabel>
+          <DropdownMenuLabel className="whitespace-nowrap">{sessionId}</DropdownMenuLabel>
+          <DropdownMenuCheckboxItem
+            className="whitespace-nowrap"
+            checked={rowsSelected}
+            onCheckedChange={() => {
+              onToggleRows();
+              onClose();
+            }}
+          >
+            {rowsSelected ? "Deselect" : "Select"} {rowLabel}
+          </DropdownMenuCheckboxItem>
           <DropdownMenuItem
+            className="whitespace-nowrap"
             onClick={() => {
               onCopy(sessionId);
               onClose();
@@ -59,6 +78,7 @@ export function SessionContextMenu({
             Copy Session ID
           </DropdownMenuItem>
           <DropdownMenuItem
+            className="whitespace-nowrap"
             onClick={() => {
               onClose();
               onTune();
