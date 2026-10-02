@@ -951,6 +951,7 @@ pub(crate) fn binned_summary(root: &Path, session_ids: &[String], options: &Valu
         samples: Vec::new(),
         columns: 1 + side,
         column_weights: weights,
+        row_weights: Vec::new(),
     }
 }
 

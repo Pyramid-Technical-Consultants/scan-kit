@@ -3,7 +3,7 @@
 use std::path::Path;
 
 use scan_kit_core::{
-    dvh, gamma_index, DataTable, McJob, Panel, PatientRequest, PlotScene, Series, Volume,
+    dvh, gamma_index, index, DataTable, McJob, Panel, PatientRequest, PlotScene, Series, Volume,
 };
 use scan_kit_dicom::{hu_density, hu_label, inside_structure, load_study, PatientStudy};
 use serde_json::Value;
@@ -116,7 +116,7 @@ pub(crate) fn scene(
         ny,
         shown.origin,
         shown.voxel,
-        1,
+        index("gray"),
         0.0,
         0.0,
     )];
@@ -190,7 +190,7 @@ pub(crate) fn scene(
                     ny,
                     shown.origin,
                     shown.voxel,
-                    16,
+                    index("gamma"),
                     0.0,
                     2.0,
                 ));
@@ -216,6 +216,7 @@ pub(crate) fn scene(
         samples: Vec::new(),
         columns: 3,
         column_weights: Vec::new(),
+        row_weights: Vec::new(),
     }
 }
 
@@ -459,6 +460,7 @@ fn note_scene(message: &str) -> PlotScene {
         samples: Vec::new(),
         columns: 1,
         column_weights: Vec::new(),
+        row_weights: Vec::new(),
     }
 }
 

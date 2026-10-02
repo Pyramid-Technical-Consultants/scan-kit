@@ -6,7 +6,7 @@
 
 use std::path::Path;
 
-use scan_kit_core::{Series, ToolKind, ToolSpec};
+use scan_kit_core::{is_session, Series, ToolKind, ToolSpec};
 use scan_kit_io::analysis_scene;
 use serde_json::{json, Value};
 
@@ -177,7 +177,7 @@ fn apply_palette(scene: &mut scan_kit_core::PlotScene, palette: &[[f32; 4]]) {
                 Series::Heatmap {
                     color: slot, ramp, ..
                 } => {
-                    if *ramp == 2 {
+                    if is_session(*ramp) {
                         *slot = [color[0], color[1], color[2], 1.0];
                         index += 1;
                     }
@@ -338,7 +338,7 @@ mod tests {
 
     #[test]
     fn session_heatmaps_take_palette_colors() {
-        use scan_kit_core::{Panel, PlotScene, Series};
+        use scan_kit_core::{Panel, PlotScene, Series, SESSION};
         let mut scene = PlotScene::empty("heat");
         scene.panels.push(Panel {
             title: String::new(),
@@ -352,7 +352,7 @@ mod tests {
                     values: vec![0.0, 1.0],
                     cols: 1,
                     rows: 2,
-                    ramp: 2,
+                    ramp: SESSION,
                     color: [0.0, 0.0, 0.0, 1.0],
                     lo: 0.0,
                     hi: 0.0,
@@ -370,7 +370,7 @@ mod tests {
                     values: vec![0.0, 1.0],
                     cols: 1,
                     rows: 2,
-                    ramp: 2,
+                    ramp: SESSION,
                     color: [0.0, 0.0, 0.0, 1.0],
                     lo: 0.0,
                     hi: 0.0,
@@ -388,7 +388,7 @@ mod tests {
                 _ => unreachable!(),
             })
             .collect();
-        assert_eq!(colors[0].0, 2);
+        assert_eq!(colors[0].0, SESSION);
         assert_eq!(colors[0].1, [0.8, 0.1, 0.1, 1.0]);
         assert_eq!(colors[1], (1, [1.0, 1.0, 1.0, 1.0]));
         assert_eq!(colors[2].1, [0.1, 0.7, 0.2, 1.0]);

@@ -23,10 +23,9 @@ pub enum Series {
         counts: Vec<f32>,
         color: [f32; 4],
     },
-    /// `ramp` selects the color scale. 0 viridis, 1 turbo, 2 fades from transparent
-    /// to `color`. 3–15 are the other dose and difference scales, and 16 is the
-    /// gamma map that steps at the middle of the window. `lo` and `hi` are the
-    /// color window; `hi <= lo` stretches each image to its own min and max.
+    /// `ramp` is a catalog index. 0 is viridis, and the session index fades
+    /// `color` from clear to that ink. `lo` and `hi` are the color window;
+    /// `hi <= lo` stretches each image to its own min and max.
     Heatmap {
         values: Vec<f32>,
         cols: u32,
@@ -92,7 +91,7 @@ impl Series {
             values,
             cols,
             rows,
-            ramp: 0,
+            ramp: crate::ramp::VIRIDIS,
             color: heatmap_white(),
             lo: 0.0,
             hi: 0.0,
@@ -129,6 +128,8 @@ pub struct PlotScene {
     pub columns: u32,
     /// Relative column widths. Empty means equal columns.
     pub column_weights: Vec<f32>,
+    /// Relative row heights. Empty means equal rows.
+    pub row_weights: Vec<f32>,
 }
 
 impl PlotScene {
@@ -141,6 +142,7 @@ impl PlotScene {
             samples: Vec::new(),
             columns: 0,
             column_weights: Vec::new(),
+            row_weights: Vec::new(),
         }
     }
 }

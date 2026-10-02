@@ -9,8 +9,8 @@ use scan_kit_core::{
     compare_templates, coverage_percent, cumsum, density_counts, fit_decay, fit_iso_plane,
     histogram, hv_capacitance_pf, hv_delta_v, hv_expected_pf, hv_firmware_flags, hv_step_window,
     linear_fit, magnet_pivot_z, parse_session_log, resolve_concept_column, scale_column,
-    settled_after_step, spill_segments, welch_psd, BeamState, Control, DataTable, Panel, PlotScene,
-    Series, IC1_Z_MM, IC2_Z_MM, MIN_SPILL_GAP_MS,
+    settled_after_step, spill_segments, welch_psd, BeamState, Control, DataTable, Family, Panel,
+    PlotScene, Series, IC1_Z_MM, IC2_Z_MM, MIN_SPILL_GAP_MS, SESSION,
 };
 use serde_json::{json, Value};
 
@@ -39,7 +39,6 @@ const DRAW_CHOICES: &[(&str, &str)] = &[
     ("contour", "Contour"),
     ("density", "Density"),
 ];
-const RAMP_CHOICES: &[(&str, &str)] = &[("turbo", "Turbo"), ("viridis", "Viridis")];
 const CUTOFF_CHOICES: &[(&str, &str)] = &[("0", "0"), ("5", "5"), ("10", "10"), ("20", "20")];
 const DENSITY_BINS: usize = 80;
 const CALIBRATE_CHOICES: &[(&str, &str)] = &[("off", "Off"), ("on", "On")];
@@ -276,7 +275,12 @@ fn distribution(root: &Path, session_ids: &[String], options: &Value) -> PlotSce
         BEAM_CHOICES,
     );
     let draw = pick(options, "draw", "scatter", DRAW_CHOICES);
-    let ramp = pick(options, "ramp", "turbo", RAMP_CHOICES);
+    let ramp = pick(
+        options,
+        "ramp",
+        "turbo",
+        scan_kit_core::choices(Family::Sequential),
+    );
     let cutoff_id = pick(options, "cutoff", "5", CUTOFF_CHOICES);
     let cutoff = cutoff_id.parse::<f32>().unwrap_or(5.0);
     let xy = matches!(mode, "position" | "position_error" | "sigma");
@@ -298,7 +302,12 @@ fn distribution(root: &Path, session_ids: &[String], options: &Value) -> PlotSce
     if mode != "coverage" {
         controls.push(labeled("draw", "Style", DRAW_CHOICES, draw));
         if draw == "density" && session_ids.len() == 1 {
-            controls.push(labeled("ramp", "Ramp", RAMP_CHOICES, ramp));
+            controls.push(labeled(
+                "ramp",
+                "Ramp",
+                scan_kit_core::choices(Family::Sequential),
+                ramp,
+            ));
         }
         if draw == "contour" {
             controls.push(labeled(
@@ -312,6 +321,9 @@ fn distribution(root: &Path, session_ids: &[String], options: &Value) -> PlotSce
     controls.push(labeled("beam", "Beam", BEAM_CHOICES, beam));
     let mut scene = scene("Distribution Explorer", panels, controls);
     scene.columns = columns;
+    if columns > 0 && scene.panels.len() == columns as usize * 3 {
+        scene.row_weights = vec![2.0, 1.0, 1.0];
+    }
     scene
 }
 
@@ -831,6 +843,7 @@ fn scene(title: &str, panels: Vec<Panel>, controls: Vec<Control>) -> PlotScene {
         samples: Vec::new(),
         columns: 0,
         column_weights: Vec::new(),
+        row_weights: Vec::new(),
     }
 }
 
@@ -1255,7 +1268,7 @@ const HIST_BINS: usize = 101;
 const HIST: [f32; 4] = [0.0, 0.0, 0.0, 0.55];
 
 fn distribution_limits(mode: &str, samples: &[f32]) -> (f32, f32) {
-    if mode == "sigma" {
+    let (lo, hi) = if mode == "sigma" {
         let mut positive: Vec<f32> = samples
             .iter()
             .copied()
@@ -1263,9 +1276,8 @@ fn distribution_limits(mode: &str, samples: &[f32]) -> (f32, f32) {
             .collect();
         positive.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let hi = percentile_sorted(&positive, 0.9995).max(1.0);
-        return (0.0, hi);
-    }
-    if mode == "position_error" {
+        (0.0, hi)
+    } else if mode == "position_error" {
         let mut abs: Vec<f32> = samples
             .iter()
             .copied()
@@ -1274,22 +1286,27 @@ fn distribution_limits(mode: &str, samples: &[f32]) -> (f32, f32) {
             .collect();
         abs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let bound = percentile_sorted(&abs, 0.9995).max(1.0);
-        return (-bound, bound);
-    }
-    let mut finite: Vec<f32> = samples
-        .iter()
-        .copied()
-        .filter(|value| value.is_finite())
-        .collect();
-    finite.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    if finite.is_empty() {
-        return (-1.0, 1.0);
-    }
-    let lo = percentile_sorted(&finite, 0.0005);
-    let hi = percentile_sorted(&finite, 0.9995);
-    let mid = 0.5 * (lo + hi);
-    let half = (mid - lo).max(hi - mid).max(0.5);
-    (mid - half, mid + half)
+        (-bound, bound)
+    } else {
+        let mut finite: Vec<f32> = samples
+            .iter()
+            .copied()
+            .filter(|value| value.is_finite())
+            .collect();
+        finite.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        if finite.is_empty() {
+            (-1.0, 1.0)
+        } else {
+            let lo = percentile_sorted(&finite, 0.0005);
+            let hi = percentile_sorted(&finite, 0.9995);
+            let mid = 0.5 * (lo + hi);
+            let half = (mid - lo).max(hi - mid).max(0.5);
+            (mid - half, mid + half)
+        }
+    };
+    // A little past the spots so they are not drawn on the frame.
+    let pad = ((hi - lo) * 0.06).max(1.0e-4);
+    (lo - pad, hi + pad)
 }
 
 fn percentile_sorted(values: &[f32], p: f32) -> f32 {
@@ -1355,11 +1372,9 @@ fn grain_table(root: &Path, session: &str, grain: &str) -> BTreeMap<String, Vec<
 /// Several sessions fade from transparent to their own color. One session uses the chosen ramp.
 fn heat_ramp(sessions: usize, ramp: &str) -> u8 {
     if sessions > 1 {
-        2
-    } else if ramp == "viridis" {
-        0
+        SESSION
     } else {
-        1
+        scan_kit_core::resolve(ramp, Family::Sequential)
     }
 }
 
@@ -1370,7 +1385,7 @@ fn density_map(values: Vec<f32>, ramp: u8) -> Series {
         cols: bins,
         rows: bins,
         ramp,
-        color: if ramp == 2 {
+        color: if scan_kit_core::is_session(ramp) {
             MARK
         } else {
             [1.0, 1.0, 1.0, 1.0]
@@ -2072,6 +2087,7 @@ mod tests {
         let scene = scene_of("distribution");
         assert!(has_kind(&scene, "points"));
         assert!(has_kind(&scene, "bars"));
+        assert_eq!(scene.row_weights, vec![2.0, 1.0, 1.0]);
         assert!(scene
             .panels
             .iter()
@@ -2103,6 +2119,13 @@ mod tests {
             .iter()
             .filter(|panel| panel.y_label.is_empty())
             .all(|panel| panel.equal));
+    }
+
+    #[test]
+    fn distribution_position_leaves_room_around_the_spots() {
+        let (lo, hi) = distribution_limits("position", &[0.0, 10.0, 0.0, 10.0]);
+        assert!((lo - -0.6).abs() < 1.0e-3, "{lo}");
+        assert!((hi - 10.6).abs() < 1.0e-3, "{hi}");
     }
 
     #[test]
@@ -2147,7 +2170,7 @@ mod tests {
             panel
                 .series
                 .iter()
-                .filter(|series| matches!(series, Series::Heatmap { ramp: 2, .. }))
+                .filter(|series| matches!(series, Series::Heatmap { ramp: SESSION, .. }))
                 .count()
                 == 2
         }));
@@ -2167,15 +2190,27 @@ mod tests {
             &json!({"draw": "Density"}),
         )
         .unwrap();
-        assert!(one
+        let ramp_control = one
             .controls
             .iter()
-            .any(|control| control.id == "ramp" && control.value == "Turbo"));
+            .find(|control| control.id == "ramp")
+            .unwrap();
+        assert_eq!(ramp_control.value, "Turbo");
+        assert_eq!(
+            ramp_control.options.len(),
+            scan_kit_core::choices(Family::Sequential).len()
+        );
+        assert!(ramp_control.options.iter().any(|option| option == "Gray"));
         assert!(one.panels.iter().any(|panel| {
-            panel
-                .series
-                .iter()
-                .any(|series| matches!(series, Series::Heatmap { ramp: 1, .. }))
+            panel.series.iter().any(|series| {
+                matches!(
+                    series,
+                    Series::Heatmap {
+                        ramp,
+                        ..
+                    } if *ramp == scan_kit_core::index("turbo")
+                )
+            })
         }));
         let contour = analysis_scene(
             "distribution",
@@ -2287,10 +2322,10 @@ mod tests {
                 matches!(
                     series,
                     Series::Heatmap {
-                        ramp: 1,
+                        ramp,
                         lo: 0.0,
                         ..
-                    }
+                    } if *ramp == scan_kit_core::index("turbo")
                 )
             })
         }));
@@ -2315,10 +2350,12 @@ mod tests {
             .iter()
             .any(|control| { control.id == "scale" && control.value == "Managua" }));
         assert!(scene.panels.iter().any(|panel| {
-            panel
-                .series
-                .iter()
-                .any(|series| matches!(series, Series::Heatmap { ramp: 10, .. }))
+            panel.series.iter().any(|series| {
+                matches!(
+                    series,
+                    Series::Heatmap { ramp, .. } if *ramp == scan_kit_core::index("managua")
+                )
+            })
         }));
         assert!(scene
             .panels

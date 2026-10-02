@@ -4,9 +4,9 @@
 use std::path::Path;
 
 use scan_kit_core::{
-    analytic_on, dose_frame, dvh, field_bounds, gamma_index, medium, protons_from_mu, robust_high,
-    McJob, McResult, Panel, Pencil, PlotScene, Quantity, Series, Volume, IC1_Z_MM, IC2_Z_MM,
-    IC_SEP_MM,
+    analytic_on, choices, dose_frame, dvh, field_bounds, gamma_index, index, is_session, medium,
+    protons_from_mu, resolve, robust_high, Family, McJob, McResult, Panel, Pencil, PlotScene,
+    Quantity, Series, Volume, IC1_Z_MM, IC2_Z_MM, IC_SEP_MM, SESSION,
 };
 use serde_json::Value;
 
@@ -72,25 +72,6 @@ const EDGE: &[(&str, &str)] = &[
     ("slice20", "Slice 20%"),
     ("plan90", "Plan 90%"),
 ];
-const SEQUENTIAL: &[(&str, &str)] = &[
-    ("turbo", "Turbo"),
-    ("viridis", "Viridis"),
-    ("magma", "Magma"),
-    ("inferno", "Inferno"),
-    ("plasma", "Plasma"),
-    ("cividis", "Cividis"),
-    ("deep", "Deep"),
-    ("cubehelix", "Cubehelix"),
-    ("heat", "Heat"),
-];
-const DIVERGENT: &[(&str, &str)] = &[
-    ("managua", "Managua"),
-    ("berlin", "Berlin"),
-    ("coolwarm", "Coolwarm"),
-    ("rdylbu", "RdYlBu"),
-    ("spectral", "Spectral"),
-    ("puor", "PuOr"),
-];
 
 pub(crate) type McRunner<'a> = &'a dyn Fn(&McJob) -> Result<McResult, String>;
 
@@ -137,6 +118,11 @@ pub fn dose_volume(
     let compare = pick(options, "compare", "measured", COMPARE);
     let plan_sigma = pick(options, "plan_sigma", "measured", SIGMA);
     let edge = pick(options, "edge", "slice50", EDGE);
+    let family = if compare == "difference" {
+        Family::Divergent
+    } else {
+        Family::Sequential
+    };
     let scale = pick(
         options,
         "scale",
@@ -145,11 +131,7 @@ pub fn dose_volume(
         } else {
             "turbo"
         },
-        if compare == "difference" {
-            DIVERGENT
-        } else {
-            SEQUENTIAL
-        },
+        choices(family),
     );
     let sigma_ref = options
         .get("sigma_ref")
@@ -270,11 +252,11 @@ pub fn dose_volume(
     };
     let sessions = shown.len().max(1);
     let ramp = if compare == "gamma" {
-        16
+        index("gamma")
     } else if sessions > 1 {
-        2
+        SESSION
     } else {
-        scale_ramp(scale, compare == "difference")
+        resolve(scale, family)
     };
     let (lo, hi) = window(&shown, compare);
     let mut panels = Vec::new();
@@ -520,11 +502,11 @@ pub fn dose_volume(
     }
     controls.push(control("edge", "Field Edge", EDGE, edge));
     if session_ids.len() <= 1 && compare != "gamma" {
-        let scales = if compare == "difference" {
-            DIVERGENT
+        let scales = choices(if compare == "difference" {
+            Family::Divergent
         } else {
-            SEQUENTIAL
-        };
+            Family::Sequential
+        });
         controls.push(control("scale", "Scale", scales, scale));
     }
     PlotScene {
@@ -535,6 +517,7 @@ pub fn dose_volume(
         samples: Vec::new(),
         columns: 3,
         column_weights: Vec::new(),
+        row_weights: Vec::new(),
     }
 }
 
@@ -1080,30 +1063,6 @@ fn window(volumes: &[Volume], compare: &str) -> (f32, f32) {
     }
 }
 
-fn scale_ramp(scale: &str, divergent: bool) -> u8 {
-    if divergent {
-        return match scale {
-            "berlin" => 11,
-            "coolwarm" => 12,
-            "rdylbu" => 13,
-            "spectral" => 14,
-            "puor" => 15,
-            _ => 10,
-        };
-    }
-    match scale {
-        "viridis" => 0,
-        "magma" => 3,
-        "inferno" => 4,
-        "plasma" => 5,
-        "cividis" => 6,
-        "deep" => 7,
-        "cubehelix" => 8,
-        "heat" => 9,
-        _ => 1,
-    }
-}
-
 fn slice_panel(
     title: &str,
     volumes: &[Volume],
@@ -1126,7 +1085,7 @@ fn slice_panel(
             cols,
             rows,
             ramp,
-            color: if ramp == 2 {
+            color: if is_session(ramp) {
                 MARK
             } else {
                 [1.0, 1.0, 1.0, 1.0]

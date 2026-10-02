@@ -14,6 +14,9 @@
 //!
 //! A mark kind's byte layout lives in its `*_STRIDE`, `*_ATTRS`, `encode_*`,
 //! `decode_*`, and the matching WGSL `vs_*` inputs. Change them together.
+//! Heatmap value row 0 is the low data y. The texture is stored top-first, so
+//! that row is the last row of pixels. Those pixels are the catalog color for
+//! the series ramp, baked before upload.
 //! Draws stay within WebGL2: no base instance (bind a buffer slice instead) and
 //! one color target.
 
@@ -94,177 +97,6 @@ fn owns_pixel(p: vec2<f32>, a: vec2<f32>, b: vec2<f32>, c: vec2<f32>) -> bool {
     return same_side(orient(a, b, p), area, a, b)
         && same_side(orient(b, c, p), area, b, c)
         && same_side(orient(c, a, p), area, c, a);
-}
-
-fn colormap(t: f32) -> vec3<f32> {
-    let stops = array<vec3<f32>, 6>(
-        vec3<f32>(0.267, 0.005, 0.329),
-        vec3<f32>(0.230, 0.322, 0.546),
-        vec3<f32>(0.128, 0.567, 0.551),
-        vec3<f32>(0.267, 0.749, 0.441),
-        vec3<f32>(0.741, 0.873, 0.150),
-        vec3<f32>(0.993, 0.906, 0.144),
-    );
-    let x = clamp(t, 0.0, 1.0) * 5.0;
-    let i = min(u32(x), 4u);
-    let f = fract(x);
-    return mix(stops[i], stops[i + 1u], f);
-}
-
-// Eight stops from the Turbo look-up table. heat 1 stays on colormap.
-fn turbo(t: f32) -> vec3<f32> {
-    let stops = array<vec3<f32>, 8>(
-        vec3<f32>(0.18995, 0.07176, 0.23217),
-        vec3<f32>(0.27698, 0.46153, 0.93309),
-        vec3<f32>(0.10738, 0.81381, 0.83484),
-        vec3<f32>(0.38127, 0.98909, 0.42386),
-        vec3<f32>(0.82333, 0.91253, 0.20663),
-        vec3<f32>(0.99672, 0.60977, 0.17842),
-        vec3<f32>(0.85380, 0.22170, 0.02677),
-        vec3<f32>(0.47960, 0.01583, 0.01055),
-    );
-    let x = min(clamp(t, 0.0, 1.0) * 7.0, 6.999);
-    let i = u32(x);
-    return mix(stops[i], stops[i + 1u], fract(x));
-}
-
-fn pick_stop(map: u32, i: u32) -> vec3<f32> {
-    // Eight matplotlib samples. map 0..12 are magma through purple–orange. 17 is gamma.
-    switch (map) {
-        case 0u: {
-            let s = array<vec3<f32>, 8>(
-                vec3<f32>(0.00146, 0.00047, 0.01387), vec3<f32>(0.13505, 0.06839, 0.31500),
-                vec3<f32>(0.37212, 0.09282, 0.49905), vec3<f32>(0.59451, 0.17570, 0.50124),
-                vec3<f32>(0.82889, 0.26223, 0.43064), vec3<f32>(0.97338, 0.46152, 0.36197),
-                vec3<f32>(0.99734, 0.73355, 0.50517), vec3<f32>(0.98705, 0.99144, 0.74950));
-            return s[i];
-        }
-        case 1u: {
-            let s = array<vec3<f32>, 8>(
-                vec3<f32>(0.00146, 0.00047, 0.01387), vec3<f32>(0.15585, 0.04456, 0.32534),
-                vec3<f32>(0.39767, 0.08326, 0.43318), vec3<f32>(0.62169, 0.16418, 0.38878),
-                vec3<f32>(0.83230, 0.28391, 0.25738), vec3<f32>(0.96129, 0.48872, 0.08429),
-                vec3<f32>(0.98117, 0.75914, 0.15686), vec3<f32>(0.98836, 0.99836, 0.64492));
-            return s[i];
-        }
-        case 2u: {
-            let s = array<vec3<f32>, 8>(
-                vec3<f32>(0.05038, 0.02980, 0.52798), vec3<f32>(0.32515, 0.00691, 0.63951),
-                vec3<f32>(0.54616, 0.03895, 0.64701), vec3<f32>(0.72344, 0.19616, 0.53898),
-                vec3<f32>(0.85975, 0.36059, 0.40692), vec3<f32>(0.95547, 0.53309, 0.28549),
-                vec3<f32>(0.99449, 0.74088, 0.16634), vec3<f32>(0.94002, 0.97516, 0.13133));
-            return s[i];
-        }
-        case 3u: {
-            let s = array<vec3<f32>, 8>(
-                vec3<f32>(0.00000, 0.13511, 0.30475), vec3<f32>(0.13067, 0.23146, 0.43284),
-                vec3<f32>(0.29842, 0.33225, 0.42397), vec3<f32>(0.42512, 0.43133, 0.44769),
-                vec3<f32>(0.55539, 0.53781, 0.47115), vec3<f32>(0.69599, 0.64833, 0.44007),
-                vec3<f32>(0.84922, 0.77195, 0.35973), vec3<f32>(0.99574, 0.90934, 0.21777));
-            return s[i];
-        }
-        case 4u: {
-            let s = array<vec3<f32>, 8>(
-                vec3<f32>(0.03137, 0.11373, 0.34510), vec3<f32>(0.14358, 0.22524, 0.59054),
-                vec3<f32>(0.12764, 0.42667, 0.68614), vec3<f32>(0.17296, 0.62951, 0.75952),
-                vec3<f32>(0.39602, 0.76607, 0.74814), vec3<f32>(0.69845, 0.88186, 0.71385),
-                vec3<f32>(0.91013, 0.96494, 0.69564), vec3<f32>(1.00000, 1.00000, 0.85098));
-            return s[i];
-        }
-        case 5u: {
-            let s = array<vec3<f32>, 8>(
-                vec3<f32>(0.00000, 0.00000, 0.00000), vec3<f32>(0.10231, 0.13953, 0.25601),
-                vec3<f32>(0.10594, 0.38097, 0.27015), vec3<f32>(0.41061, 0.48045, 0.18912),
-                vec3<f32>(0.78292, 0.48158, 0.48672), vec3<f32>(0.80462, 0.63657, 0.87966),
-                vec3<f32>(0.77756, 0.88404, 0.94520), vec3<f32>(1.00000, 1.00000, 1.00000));
-            return s[i];
-        }
-        case 6u: {
-            let s = array<vec3<f32>, 8>(
-                vec3<f32>(0.00000, 0.00000, 0.00000), vec3<f32>(0.28235, 0.00000, 0.00000),
-                vec3<f32>(0.57255, 0.07255, 0.00000), vec3<f32>(0.85490, 0.35490, 0.00000),
-                vec3<f32>(1.00000, 0.64510, 0.14510), vec3<f32>(1.00000, 0.92745, 0.42745),
-                vec3<f32>(1.00000, 1.00000, 0.71765), vec3<f32>(1.00000, 1.00000, 1.00000));
-            return s[i];
-        }
-        case 7u: {
-            let s = array<vec3<f32>, 8>(
-                vec3<f32>(0.50411, 0.90708, 0.99978), vec3<f32>(0.40856, 0.63822, 0.83546),
-                vec3<f32>(0.32446, 0.40575, 0.65370), vec3<f32>(0.30204, 0.20905, 0.39924),
-                vec3<f32>(0.42665, 0.17723, 0.22938), vec3<f32>(0.64425, 0.33480, 0.24742),
-                vec3<f32>(0.82772, 0.54983, 0.31656), vec3<f32>(1.00000, 0.81263, 0.40424));
-            return s[i];
-        }
-        case 8u: {
-            let s = array<vec3<f32>, 8>(
-                vec3<f32>(0.62108, 0.69018, 0.99951), vec3<f32>(0.28410, 0.60348, 0.79347),
-                vec3<f32>(0.13208, 0.34215, 0.44209), vec3<f32>(0.06452, 0.11507, 0.14389),
-                vec3<f32>(0.17780, 0.05602, 0.00147), vec3<f32>(0.40622, 0.14080, 0.05785),
-                vec3<f32>(0.70543, 0.39879, 0.34380), vec3<f32>(0.99987, 0.68007, 0.67995));
-            return s[i];
-        }
-        case 9u: {
-            let s = array<vec3<f32>, 8>(
-                vec3<f32>(0.22981, 0.29872, 0.75368), vec3<f32>(0.40442, 0.53464, 0.93200),
-                vec3<f32>(0.60316, 0.73153, 0.99957), vec3<f32>(0.78672, 0.84481, 0.93981),
-                vec3<f32>(0.93067, 0.81888, 0.75915), vec3<f32>(0.96732, 0.65747, 0.53816),
-                vec3<f32>(0.88464, 0.41002, 0.32251), vec3<f32>(0.70567, 0.01556, 0.15023));
-            return s[i];
-        }
-        case 10u: {
-            let s = array<vec3<f32>, 8>(
-                vec3<f32>(0.19216, 0.21176, 0.58431), vec3<f32>(0.34648, 0.54925, 0.75271),
-                vec3<f32>(0.64098, 0.82730, 0.90081), vec3<f32>(0.91180, 0.96586, 0.91119),
-                vec3<f32>(0.99715, 0.91180, 0.61530), vec3<f32>(0.98731, 0.64737, 0.36424),
-                vec3<f32>(0.88997, 0.28674, 0.19815), vec3<f32>(0.64706, 0.00000, 0.14902));
-            return s[i];
-        }
-        case 11u: {
-            let s = array<vec3<f32>, 8>(
-                vec3<f32>(0.36863, 0.30980, 0.63529), vec3<f32>(0.28005, 0.62699, 0.70242),
-                vec3<f32>(0.63345, 0.85213, 0.64368), vec3<f32>(0.92887, 0.97155, 0.63806),
-                vec3<f32>(0.99715, 0.91180, 0.60108), vec3<f32>(0.98731, 0.64737, 0.36424),
-                vec3<f32>(0.88535, 0.31903, 0.29043), vec3<f32>(0.61961, 0.00392, 0.25882));
-            return s[i];
-        }
-        default: {
-            let s = array<vec3<f32>, 8>(
-                vec3<f32>(0.17647, 0.00000, 0.29412), vec3<f32>(0.40046, 0.27566, 0.59146),
-                vec3<f32>(0.67113, 0.64045, 0.80308), vec3<f32>(0.88043, 0.88612, 0.93449),
-                vec3<f32>(0.98854, 0.90319, 0.78370), vec3<f32>(0.97655, 0.69250, 0.34571),
-                vec3<f32>(0.77463, 0.41292, 0.04614), vec3<f32>(0.49804, 0.23137, 0.03137));
-            return s[i];
-        }
-    }
-}
-
-fn gamma_ramp(t: f32) -> vec3<f32> {
-    let u = clamp(t, 0.0, 1.0);
-    let teal0 = vec3<f32>(0.07843, 0.10196, 0.14902);
-    let teal1 = vec3<f32>(0.12157, 0.30588, 0.37255);
-    let teal2 = vec3<f32>(0.43529, 0.76078, 0.69020);
-    let hot0 = vec3<f32>(0.96078, 0.64706, 0.14118);
-    let hot1 = vec3<f32>(0.89804, 0.28235, 0.30196);
-    let hot2 = vec3<f32>(1.0, 0.30980, 0.84706);
-    if (u < 0.5) {
-        if (u < 0.25) {
-            return mix(teal0, teal1, u / 0.25);
-        }
-        return mix(teal1, teal2, (u - 0.25) / 0.249);
-    }
-    if (u < 0.75) {
-        return mix(hot0, hot1, (u - 0.5) / 0.25);
-    }
-    return mix(hot1, hot2, (u - 0.75) / 0.25);
-}
-
-fn named_ramp(id: u32, t: f32) -> vec3<f32> {
-    if (id >= 17u) {
-        return gamma_ramp(t);
-    }
-    let x = min(clamp(t, 0.0, 1.0) * 7.0, 6.999);
-    let i = u32(x);
-    return mix(pick_stop(id - 4u, i), pick_stop(id - 4u, i + 1u), fract(x));
 }
 
 fn corner(index: u32) -> vec2<f32> {
@@ -452,20 +284,12 @@ fn fs_quad(in: QuadOut) -> @location(0) vec4<f32> {
     let coverage = clamp(0.5 - outside, 0.0, 1.0);
     // textureSample is illegal on a branch the triangle pixels skip. Level 0
     // has no derivatives, so this heatmap lookup can sit in that branch.
-    let sample = textureSampleLevel(mark_tex, mark_samp, in.uv, 0.0).r;
-    // heat 1 viridis, 2 session fade, 3 turbo, 4–16 named scales, 17 gamma.
-    let ramp_id = u32(in.heat + 0.5);
-    if (ramp_id >= 4u) {
-        return shade(named_ramp(ramp_id, sample), in.color.a, coverage);
+    // heat > 0.5 is a baked ramp. Otherwise the quad is a solid color.
+    if (in.heat > 0.5) {
+        let texel = textureSampleLevel(mark_tex, mark_samp, in.uv, 0.0);
+        return shade(texel.rgb, texel.a, coverage);
     }
-    if (ramp_id == 3u) {
-        return shade(turbo(sample), in.color.a, coverage);
-    }
-    if (ramp_id == 2u) {
-        return shade(in.color.rgb, sample * in.color.a, coverage);
-    }
-    let rgb = mix(in.color.rgb, colormap(sample), in.heat);
-    return shade(rgb, in.color.a, coverage);
+    return shade(in.color.rgb, in.color.a, coverage);
 }
 
 struct TextOut {
@@ -664,6 +488,7 @@ pub struct Plot {
     panels: Vec<Panel>,
     columns: u32,
     weights: Vec<f32>,
+    row_weights: Vec<f32>,
     cameras: Vec<Camera>,
     home: Vec<Camera>,
     background: [f32; 4],
@@ -704,6 +529,7 @@ impl Plot {
             header_panels(&scene.panels),
             scene.columns,
             scene.column_weights.clone(),
+            scene.row_weights.clone(),
             build_marks(&scene.panels),
             background,
             foreground,
@@ -714,6 +540,7 @@ impl Plot {
         panels: Vec<Panel>,
         columns: u32,
         weights: Vec<f32>,
+        row_weights: Vec<f32>,
         marks: Marks,
         background: [f32; 4],
         foreground: [f32; 4],
@@ -727,6 +554,7 @@ impl Plot {
             panels,
             columns,
             weights,
+            row_weights,
             home: cameras.clone(),
             cameras,
             background,
@@ -938,6 +766,7 @@ impl Plot {
             height,
             self.columns,
             &self.weights,
+            &self.row_weights,
         );
         let font = atlas();
         rects
@@ -1280,7 +1109,7 @@ impl Plot {
             .iter()
             .zip(&self.marks.heatmap_size)
             .map(|(pixels, (cols, rows))| {
-                let texture = upload_r8(&gpu.device, &gpu.queue, pixels, *cols, *rows)?;
+                let texture = upload_rgba(&gpu.device, &gpu.queue, pixels, *cols, *rows)?;
                 let group =
                     textured_group(&gpu.device, &gpu.textured_layout, &texture, &gpu.sampler);
                 Ok(HeatGpu { group, texture })
@@ -1743,20 +1572,11 @@ pub(crate) fn build_marks(panels: &[Panel]) -> Marks {
                     if *cols == 0 || *rows == 0 {
                         continue;
                     }
-                    let pixels = heatmap_bytes(values, *cols, *rows, *lo, *hi);
+                    let pixels = heatmap_bytes(values, *cols, *rows, *ramp, *color, *lo, *hi);
                     if pixels.is_empty() {
                         continue;
                     }
-                    pending.push((
-                        heatmaps.len(),
-                        id,
-                        ramp_heat(*ramp),
-                        if *ramp == 2 {
-                            *color
-                        } else {
-                            [1.0, 1.0, 1.0, 1.0]
-                        },
-                    ));
+                    pending.push((heatmaps.len(), id, 1.0, *color));
                     heatmaps.push(pixels);
                     heatmap_size.push((*cols, *rows));
                 }
@@ -1837,16 +1657,15 @@ fn push_polyline(
     }
 }
 
-fn ramp_heat(ramp: u8) -> f32 {
-    match ramp {
-        0 => 1.0,
-        1 => 3.0,
-        2 => 2.0,
-        other => f32::from(other) + 1.0,
-    }
-}
-
-fn heatmap_bytes(values: &[f32], cols: u32, rows: u32, window_lo: f32, window_hi: f32) -> Vec<u8> {
+fn heatmap_bytes(
+    values: &[f32],
+    cols: u32,
+    rows: u32,
+    ramp: u8,
+    tint: [f32; 4],
+    window_lo: f32,
+    window_hi: f32,
+) -> Vec<u8> {
     let (lo, mut hi) = if window_hi > window_lo {
         (window_lo, window_hi)
     } else {
@@ -1866,14 +1685,39 @@ fn heatmap_bytes(values: &[f32], cols: u32, rows: u32, window_lo: f32, window_hi
     if (hi - lo).abs() < 1.0e-8 {
         hi = lo + 1.0;
     }
-    let mut pixels = vec![0u8; (cols * rows) as usize];
-    for (index, value) in values.iter().take(pixels.len()).enumerate() {
-        if value.is_finite() {
-            let t = ((*value - lo) / (hi - lo)).clamp(0.0, 1.0);
-            pixels[index] = (t * 255.0).round() as u8;
-        }
+    let cols_n = cols as usize;
+    let rows_n = rows as usize;
+    if cols_n == 0 || rows_n == 0 {
+        return Vec::new();
+    }
+    let mut pixels = vec![0u8; cols_n * rows_n * 4];
+    for (index, value) in values.iter().take(cols_n * rows_n).enumerate() {
+        let t = if value.is_finite() {
+            ((*value - lo) / (hi - lo)).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let row = index / cols_n;
+        let col = index % cols_n;
+        // The sampler treats pixel row 0 as the top of the plot.
+        let dst = ((rows_n - 1 - row) * cols_n + col) * 4;
+        pixels[dst..dst + 4].copy_from_slice(&ramp_pixel(ramp, tint, t));
     }
     pixels
+}
+
+fn ramp_pixel(ramp: u8, tint: [f32; 4], t: f32) -> [u8; 4] {
+    let (rgb, alpha) = if scan_kit_core::is_session(ramp) {
+        let color = scan_kit_core::session([tint[0], tint[1], tint[2]], t);
+        ([color[0], color[1], color[2]], color[3] * tint[3])
+    } else {
+        (scan_kit_core::sample(ramp, t), 1.0)
+    };
+    [byte(rgb[0]), byte(rgb[1]), byte(rgb[2]), byte(alpha)]
+}
+
+fn byte(channel: f32) -> u8 {
+    (channel.clamp(0.0, 1.0) * 255.0).round() as u8
 }
 
 fn grid_lines(camera: &Camera, foreground: [f32; 4]) -> Vec<LineRec> {
@@ -2133,6 +1977,7 @@ fn panel_rects(
     height: u32,
     columns: u32,
     weights: &[f32],
+    row_weights: &[f32],
 ) -> Vec<PlotRect> {
     if count == 0 {
         return Vec::new();
@@ -2166,17 +2011,34 @@ fn panel_rects(
             x += gap;
         }
     }
-    let cell_h =
-        (height as f32 - margin * 2.0 - gap * (rows.saturating_sub(1) as f32)) / rows as f32;
+    let row_weight = if row_weights.len() == rows {
+        row_weights.to_vec()
+    } else {
+        vec![1.0; rows]
+    };
+    let row_sum = row_weight.iter().sum::<f32>().max(1.0e-6);
+    let inner_h = height as f32 - margin * 2.0 - gap * (rows.saturating_sub(1) as f32);
+    let mut row_y = Vec::with_capacity(rows);
+    let mut row_h = Vec::with_capacity(rows);
+    let mut y = margin;
+    for (index, weight) in row_weight.iter().enumerate() {
+        let cell_h = inner_h * weight / row_sum;
+        row_y.push(y);
+        row_h.push(cell_h);
+        y += cell_h;
+        if index + 1 < rows {
+            y += gap;
+        }
+    }
     (0..count)
         .map(|index| {
             let col = index % cols;
             let row = index / cols;
             PlotRect {
                 x: col_x[col],
-                y: margin + row as f32 * (cell_h + gap),
+                y: row_y[row],
                 w: col_w[col],
-                h: cell_h,
+                h: row_h[row],
             }
         })
         .collect()
@@ -2269,8 +2131,14 @@ fn fill_quad_cpu(
                 let (cols, rows) = marks.heatmap_size[index];
                 let col = ((u * cols as f32) as u32).min(cols.saturating_sub(1));
                 let row = ((v * rows as f32) as u32).min(rows.saturating_sub(1));
-                let sample = marks.heatmaps[index][(row * cols + col) as usize] as f32 / 255.0;
-                heatmap_ink(quad, sample)
+                let texel = (row * cols + col) as usize * 4;
+                let px = &marks.heatmaps[index];
+                [
+                    px[texel] as f32 / 255.0,
+                    px[texel + 1] as f32 / 255.0,
+                    px[texel + 2] as f32 / 255.0,
+                    px[texel + 3] as f32 / 255.0,
+                ]
             } else {
                 quad.color
             };
@@ -2430,230 +2298,6 @@ fn blend(
         frame[pixel + channel] = (src + dst * (1.0 - alpha)).round().clamp(0.0, 255.0) as u8;
     }
     frame[pixel + 3] = 255;
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn named_rgb(id: u32, t: f32) -> [f32; 3] {
-    if id >= 17 {
-        return gamma_rgb(t);
-    }
-    const N: usize = 8;
-    let map = id.saturating_sub(4).min(12) as usize;
-    let x = (t.clamp(0.0, 1.0) * 7.0).min(6.999);
-    let i = x.floor() as usize;
-    let f = x - i as f32;
-    let a = RAMP_STOPS[map * N + i];
-    let b = RAMP_STOPS[map * N + i + 1];
-    [
-        a[0] + (b[0] - a[0]) * f,
-        a[1] + (b[1] - a[1]) * f,
-        a[2] + (b[2] - a[2]) * f,
-    ]
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn gamma_rgb(t: f32) -> [f32; 3] {
-    let u = t.clamp(0.0, 1.0);
-    let mix = |a: [f32; 3], b: [f32; 3], f: f32| {
-        [
-            a[0] + (b[0] - a[0]) * f,
-            a[1] + (b[1] - a[1]) * f,
-            a[2] + (b[2] - a[2]) * f,
-        ]
-    };
-    let teal0 = [0.07843, 0.10196, 0.14902];
-    let teal1 = [0.12157, 0.30588, 0.37255];
-    let teal2 = [0.43529, 0.76078, 0.69020];
-    let hot0 = [0.96078, 0.64706, 0.14118];
-    let hot1 = [0.89804, 0.28235, 0.30196];
-    let hot2 = [1.0, 0.30980, 0.84706];
-    if u < 0.5 {
-        if u < 0.25 {
-            return mix(teal0, teal1, u / 0.25);
-        }
-        return mix(teal1, teal2, (u - 0.25) / 0.249);
-    }
-    if u < 0.75 {
-        return mix(hot0, hot1, (u - 0.5) / 0.25);
-    }
-    mix(hot1, hot2, (u - 0.75) / 0.25)
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-const RAMP_STOPS: [[f32; 3]; 104] = [
-    [0.00146, 0.00047, 0.01387],
-    [0.13505, 0.06839, 0.31500],
-    [0.37212, 0.09282, 0.49905],
-    [0.59451, 0.17570, 0.50124],
-    [0.82889, 0.26223, 0.43064],
-    [0.97338, 0.46152, 0.36197],
-    [0.99734, 0.73355, 0.50517],
-    [0.98705, 0.99144, 0.74950],
-    [0.00146, 0.00047, 0.01387],
-    [0.15585, 0.04456, 0.32534],
-    [0.39767, 0.08326, 0.43318],
-    [0.62169, 0.16418, 0.38878],
-    [0.83230, 0.28391, 0.25738],
-    [0.96129, 0.48872, 0.08429],
-    [0.98117, 0.75914, 0.15686],
-    [0.98836, 0.99836, 0.64492],
-    [0.05038, 0.02980, 0.52798],
-    [0.32515, 0.00691, 0.63951],
-    [0.54616, 0.03895, 0.64701],
-    [0.72344, 0.19616, 0.53898],
-    [0.85975, 0.36059, 0.40692],
-    [0.95547, 0.53309, 0.28549],
-    [0.99449, 0.74088, 0.16634],
-    [0.94002, 0.97516, 0.13133],
-    [0.00000, 0.13511, 0.30475],
-    [0.13067, 0.23146, 0.43284],
-    [0.29842, 0.33225, 0.42397],
-    [0.42512, 0.43133, 0.44769],
-    [0.55539, 0.53781, 0.47115],
-    [0.69599, 0.64833, 0.44007],
-    [0.84922, 0.77195, 0.35973],
-    [0.99574, 0.90934, 0.21777],
-    [0.03137, 0.11373, 0.34510],
-    [0.14358, 0.22524, 0.59054],
-    [0.12764, 0.42667, 0.68614],
-    [0.17296, 0.62951, 0.75952],
-    [0.39602, 0.76607, 0.74814],
-    [0.69845, 0.88186, 0.71385],
-    [0.91013, 0.96494, 0.69564],
-    [1.00000, 1.00000, 0.85098],
-    [0.00000, 0.00000, 0.00000],
-    [0.10231, 0.13953, 0.25601],
-    [0.10594, 0.38097, 0.27015],
-    [0.41061, 0.48045, 0.18912],
-    [0.78292, 0.48158, 0.48672],
-    [0.80462, 0.63657, 0.87966],
-    [0.77756, 0.88404, 0.94520],
-    [1.00000, 1.00000, 1.00000],
-    [0.00000, 0.00000, 0.00000],
-    [0.28235, 0.00000, 0.00000],
-    [0.57255, 0.07255, 0.00000],
-    [0.85490, 0.35490, 0.00000],
-    [1.00000, 0.64510, 0.14510],
-    [1.00000, 0.92745, 0.42745],
-    [1.00000, 1.00000, 0.71765],
-    [1.00000, 1.00000, 1.00000],
-    [0.50411, 0.90708, 0.99978],
-    [0.40856, 0.63822, 0.83546],
-    [0.32446, 0.40575, 0.65370],
-    [0.30204, 0.20905, 0.39924],
-    [0.42665, 0.17723, 0.22938],
-    [0.64425, 0.33480, 0.24742],
-    [0.82772, 0.54983, 0.31656],
-    [1.00000, 0.81263, 0.40424],
-    [0.62108, 0.69018, 0.99951],
-    [0.28410, 0.60348, 0.79347],
-    [0.13208, 0.34215, 0.44209],
-    [0.06452, 0.11507, 0.14389],
-    [0.17780, 0.05602, 0.00147],
-    [0.40622, 0.14080, 0.05785],
-    [0.70543, 0.39879, 0.34380],
-    [0.99987, 0.68007, 0.67995],
-    [0.22981, 0.29872, 0.75368],
-    [0.40442, 0.53464, 0.93200],
-    [0.60316, 0.73153, 0.99957],
-    [0.78672, 0.84481, 0.93981],
-    [0.93067, 0.81888, 0.75915],
-    [0.96732, 0.65747, 0.53816],
-    [0.88464, 0.41002, 0.32251],
-    [0.70567, 0.01556, 0.15023],
-    [0.19216, 0.21176, 0.58431],
-    [0.34648, 0.54925, 0.75271],
-    [0.64098, 0.82730, 0.90081],
-    [0.91180, 0.96586, 0.91119],
-    [0.99715, 0.91180, 0.61530],
-    [0.98731, 0.64737, 0.36424],
-    [0.88997, 0.28674, 0.19815],
-    [0.64706, 0.00000, 0.14902],
-    [0.36863, 0.30980, 0.63529],
-    [0.28005, 0.62699, 0.70242],
-    [0.63345, 0.85213, 0.64368],
-    [0.92887, 0.97155, 0.63806],
-    [0.99715, 0.91180, 0.60108],
-    [0.98731, 0.64737, 0.36424],
-    [0.88535, 0.31903, 0.29043],
-    [0.61961, 0.00392, 0.25882],
-    [0.17647, 0.00000, 0.29412],
-    [0.40046, 0.27566, 0.59146],
-    [0.67113, 0.64045, 0.80308],
-    [0.88043, 0.88612, 0.93449],
-    [0.98854, 0.90319, 0.78370],
-    [0.97655, 0.69250, 0.34571],
-    [0.77463, 0.41292, 0.04614],
-    [0.49804, 0.23137, 0.03137],
-];
-
-#[cfg(not(target_arch = "wasm32"))]
-fn heatmap_ink(quad: &QuadRec, sample: f32) -> [f32; 4] {
-    let id = (quad.heat + 0.5) as u32;
-    if id >= 4 {
-        let rgb = named_rgb(id, sample);
-        return [rgb[0], rgb[1], rgb[2], quad.color[3]];
-    }
-    if id == 3 {
-        let rgb = turbo(sample);
-        return [rgb[0], rgb[1], rgb[2], quad.color[3]];
-    }
-    if id == 2 {
-        return [
-            quad.color[0],
-            quad.color[1],
-            quad.color[2],
-            sample * quad.color[3],
-        ];
-    }
-    let rgb = colormap(sample);
-    [rgb[0], rgb[1], rgb[2], 1.0]
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn turbo(t: f32) -> [f32; 3] {
-    const STOPS: [[f32; 3]; 8] = [
-        [0.18995, 0.07176, 0.23217],
-        [0.27698, 0.46153, 0.93309],
-        [0.10738, 0.81381, 0.83484],
-        [0.38127, 0.98909, 0.42386],
-        [0.82333, 0.91253, 0.20663],
-        [0.99672, 0.60977, 0.17842],
-        [0.85380, 0.22170, 0.02677],
-        [0.47960, 0.01583, 0.01055],
-    ];
-    let x = (t.clamp(0.0, 1.0) * 7.0).min(6.999);
-    let index = x.floor() as usize;
-    let fract = x - index as f32;
-    let a = STOPS[index];
-    let b = STOPS[index + 1];
-    [
-        a[0] + (b[0] - a[0]) * fract,
-        a[1] + (b[1] - a[1]) * fract,
-        a[2] + (b[2] - a[2]) * fract,
-    ]
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn colormap(t: f32) -> [f32; 3] {
-    const STOPS: [[f32; 3]; 6] = [
-        [0.267, 0.005, 0.329],
-        [0.230, 0.322, 0.546],
-        [0.128, 0.567, 0.551],
-        [0.267, 0.749, 0.441],
-        [0.741, 0.873, 0.150],
-        [0.993, 0.906, 0.144],
-    ];
-    let x = (t.clamp(0.0, 1.0) * 5.0).min(4.999);
-    let index = x.floor() as usize;
-    let fract = x - index as f32;
-    let a = STOPS[index];
-    let b = STOPS[index + 1];
-    [
-        a[0] + (b[0] - a[0]) * fract,
-        a[1] + (b[1] - a[1]) * fract,
-        a[2] + (b[2] - a[2]) * fract,
-    ]
 }
 
 // Instance word layouts. Words past the `*_ATTRS` tables (`id`, the heatmap
@@ -2900,6 +2544,62 @@ fn write_grow(
     queue.write_buffer(slot.as_ref().unwrap(), 0, bytes);
 }
 
+fn upload_rgba(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    pixels: &[u8],
+    cols: u32,
+    rows: u32,
+) -> Result<wgpu::Texture, GpuError> {
+    let cols = cols.max(1);
+    let rows = rows.max(1);
+    let row_bytes = cols * 4;
+    let stride = row_bytes.next_multiple_of(256);
+    let mut padded = vec![0u8; (stride * rows) as usize];
+    for row in 0..rows {
+        let src = (row * row_bytes) as usize;
+        let dst = (row * stride) as usize;
+        let end = src + row_bytes as usize;
+        if end <= pixels.len() {
+            padded[dst..dst + row_bytes as usize].copy_from_slice(&pixels[src..end]);
+        }
+    }
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("rgba"),
+        size: wgpu::Extent3d {
+            width: cols,
+            height: rows,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        &padded,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(stride),
+            rows_per_image: Some(rows),
+        },
+        wgpu::Extent3d {
+            width: cols,
+            height: rows,
+            depth_or_array_layers: 1,
+        },
+    );
+    Ok(texture)
+}
+
 fn upload_r8(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -3068,7 +2768,28 @@ mod tests {
             samples: Vec::new(),
             columns: 0,
             column_weights: Vec::new(),
+            row_weights: Vec::new(),
         }
+    }
+
+    #[test]
+    fn the_top_row_can_take_half_the_height() {
+        let mut scene = line_scene();
+        let panel = scene.panels[0].clone();
+        scene.panels.push(panel.clone());
+        scene.panels.push(panel);
+        scene.columns = 1;
+        scene.row_weights = vec![2.0, 1.0, 1.0];
+        let plot = Plot::new(&scene, [0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0, 1.0]);
+        let layout = plot.layout(400, 420);
+        let top = layout[0].cell.h;
+        let middle = layout[1].cell.h;
+        let bottom = layout[2].cell.h;
+        assert!(
+            (top - (middle + bottom)).abs() < 1.0,
+            "{top} {middle} {bottom}"
+        );
+        assert!((middle - bottom).abs() < 1.0, "{middle} {bottom}");
     }
 
     #[test]
@@ -3090,24 +2811,47 @@ mod tests {
     }
 
     #[test]
-    fn turbo_runs_from_dark_blue_to_dark_red() {
-        let start = turbo(0.0);
-        let end = turbo(1.0);
-        assert!(start[2] > start[0]);
-        assert!(end[0] > end[1] && end[0] > end[2]);
+    fn a_baked_heatmap_matches_the_catalog_and_keeps_low_y_last() {
+        let turbo = scan_kit_core::index("turbo");
+        let bytes = heatmap_bytes(&[1.0], 1, 1, turbo, [1.0; 4], 0.0, 1.0);
+        let rgb = scan_kit_core::sample(turbo, 1.0);
+        assert_eq!(bytes[0], byte(rgb[0]));
+        assert_eq!(bytes[1], byte(rgb[1]));
+        assert_eq!(bytes[2], byte(rgb[2]));
+        assert_eq!(bytes[3], 255);
+        let gray = scan_kit_core::index("gray");
+        let white = [1.0, 1.0, 1.0, 1.0];
+        let bytes = heatmap_bytes(&[0.0, 5.0], 2, 1, gray, white, 0.0, 5.0);
+        assert_eq!(bytes, vec![0, 0, 0, 255, 255, 255, 255, 255]);
+        // Value row 0 is the low y, so it is the last texture row.
+        let bytes = heatmap_bytes(&[0.0, 5.0], 1, 2, gray, white, 0.0, 5.0);
+        assert_eq!(bytes, vec![255, 255, 255, 255, 0, 0, 0, 255]);
     }
 
     #[test]
-    fn gamma_steps_at_one_and_zero_stays_dark() {
-        let under = gamma_rgb(0.49);
-        let over = gamma_rgb(0.51);
-        assert!(under[1] > under[0]);
-        assert!(over[0] > under[0] + 0.4);
-        let magma = named_rgb(4, 0.0);
-        assert!(magma[0] + magma[1] + magma[2] < 0.05);
-        let bytes = heatmap_bytes(&[0.0, 5.0], 2, 1, 0.0, 5.0);
-        assert_eq!(bytes, vec![0, 255]);
-        assert!((ramp_heat(1) - 3.0).abs() < 1e-6);
+    fn the_cpu_fill_reads_the_baked_ramp() {
+        let mut scene = line_scene();
+        scene.panels[0].xmin = 0.0;
+        scene.panels[0].xmax = 1.0;
+        scene.panels[0].ymin = 0.0;
+        scene.panels[0].ymax = 1.0;
+        scene.panels[0].series = vec![Series::Heatmap {
+            values: vec![1.0],
+            cols: 1,
+            rows: 1,
+            ramp: scan_kit_core::index("gray"),
+            color: [1.0; 4],
+            lo: 0.0,
+            hi: 1.0,
+        }];
+        let mut plot = Plot::new(&scene, [0.0, 0.0, 0.0, 1.0], [0.9, 0.9, 0.9, 1.0]);
+        let layout = plot.layout(64, 64);
+        let frame = plot.paint_cpu(64, 64, &layout);
+        let rect = layout[0].plot;
+        let x = (rect.x + rect.w * 0.5) as u32;
+        let y = (rect.y + rect.h * 0.5) as u32;
+        let pixel = (y * 64 + x) as usize * 4;
+        assert_eq!(&frame[pixel..pixel + 3], &[255, 255, 255]);
     }
 
     #[test]
@@ -3169,6 +2913,7 @@ mod tests {
             samples: Vec::new(),
             columns: 0,
             column_weights: Vec::new(),
+            row_weights: Vec::new(),
         };
         let mut plot = Plot::new(&scene, [0.0, 0.0, 0.0, 1.0], [0.0, 1.0, 0.0, 1.0]);
         let first = plot.draw(180, 140, &PlotInput::default()).unwrap();
