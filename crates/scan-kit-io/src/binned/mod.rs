@@ -11,8 +11,7 @@ use super::marks::{apply_filter, contour_bands, control, flag, labeled, pick, te
 mod glyphs;
 
 use super::tables::{
-    file_fingerprint, load_slice_metric, load_spot, load_timeslice, median, same, span,
-    timeslice_energy_only,
+    load_slice_metric, load_spot, load_timeslice, median, same, span, timeslice_energy_only,
 };
 use glyphs::{
     binned_trend, box_series, contour_series, corr_panel, hist_panel, hline, interlock_guides,
@@ -491,9 +490,7 @@ fn session_stamp(root: &Path, session: &str) -> u128 {
     let dir = discover::session_directory(root, session);
     let mut stamp = mtime_ns(&dir);
     for name in ["spot_data.csv", "input_map.csv"] {
-        if let Some((len, ns, head)) = file_fingerprint(&dir.join(name)) {
-            stamp ^= ns ^ u128::from(len) ^ u128::from(head);
-        }
+        stamp ^= discover::meta_stamp(&dir.join(name));
     }
     stamp
 }
@@ -607,15 +604,18 @@ pub(crate) fn binned_summary(root: &Path, session_ids: &[String], options: &Valu
     );
     let prepared = cached_prepared(key, || {
         let load_one = |session: &String| {
-            let mut table = if geometry {
+            let loaded = if geometry {
                 load_slice_metric(root, session, group.id, source == "timeslice_chamber")
             } else if group.timeslice {
                 load_timeslice(root, session, group.id)
             } else if group.id == "dose_rate" {
-                dose_rate_table(&load_spot(root, session, false, false, false))
+                std::sync::Arc::new(dose_rate_table(
+                    load_spot(root, session, false, false, false).as_ref(),
+                ))
             } else {
                 load_spot(root, session, chamber, group.id == "spot_time", false)
             };
+            let mut table = std::sync::Arc::unwrap_or_clone(loaded);
             if group.filter {
                 let keys: Vec<&str> = group.series.iter().map(|series| series.key).collect();
                 apply_filter(&mut table, &keys, domain, beam);

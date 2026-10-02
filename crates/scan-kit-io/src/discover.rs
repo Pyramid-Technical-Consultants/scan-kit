@@ -3,9 +3,11 @@
 //! ponytail: directory walks stop at depth 6, which covers `layer-N/run-M`.
 //! A session laid out deeper than that needs a longer walk.
 
+use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 const ARCHIVE_SUFFIXES: &[(&str, &str)] = &[
     (".tar.gz", "tar"),
@@ -235,24 +237,95 @@ fn walk_files(
     });
 }
 
+/// Timeslice files in layer/run order, without reading them.
+pub(crate) fn list_timeslice_paths(storage: &Path) -> Vec<(i64, PathBuf)> {
+    if !storage.is_dir() {
+        return Vec::new();
+    }
+    let mut found = Vec::new();
+    visit_files(storage, storage, 0, &is_timeslice, &mut |name, path| {
+        found.push((name.to_string(), path.to_path_buf()));
+    });
+    found.sort_by_key(|left| timeslice_key(&left.0));
+    found
+        .into_iter()
+        .map(|(name, path)| {
+            let index = if name.contains("layer-") {
+                number_after(&name, "layer-")
+            } else {
+                -1
+            };
+            (index, path)
+        })
+        .collect()
+}
+
+struct SliceWatch {
+    dirs: Vec<(PathBuf, u128)>,
+    files: Vec<(PathBuf, u128)>,
+    stamp: u128,
+}
+
+fn slice_watches() -> &'static Mutex<HashMap<PathBuf, SliceWatch>> {
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, SliceWatch>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 /// Length and mtime of each timeslice, or of the archive itself.
 ///
-/// Cheap enough to check on every load. A matching stamp means the parsed
-/// frames from last time are still the file.
+/// An unchanged session restats the files and layer directories from the last
+/// walk. A changed layer directory, or a changed file, walks again.
 ///
 /// ponytail: metadata only, so a same-size rewrite in the same timestamp tick
-/// is missed. Hash a prefix if that shows up.
+/// is missed. Hash a prefix if that shows up. 32 sessions stay remembered.
 pub fn timeslice_stamp(storage: &Path) -> u128 {
     if storage.is_file() {
         return meta_stamp(storage);
     }
+    let key = storage.to_path_buf();
+    if let Some(hit) = slice_watches()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .get(&key)
+    {
+        if hit
+            .dirs
+            .iter()
+            .all(|(path, stamp)| meta_stamp(path) == *stamp)
+            && hit
+                .files
+                .iter()
+                .all(|(path, stamp)| meta_stamp(path) == *stamp)
+        {
+            return hit.stamp;
+        }
+    }
+    let mut files = Vec::new();
+    let mut dirs = vec![(storage.to_path_buf(), meta_stamp(storage))];
+    visit_files(storage, storage, 0, &is_timeslice, &mut |_name, path| {
+        if let Some(parent) = path.parent() {
+            let parent = parent.to_path_buf();
+            if dirs.iter().all(|(have, _)| have != &parent) {
+                dirs.push((parent.clone(), meta_stamp(&parent)));
+            }
+        }
+        files.push((path.to_path_buf(), meta_stamp(path)));
+    });
     let mut stamp = 0x9e3779b97f4a7c15u128;
     let mut count = 0u128;
-    visit_files(storage, storage, 0, &is_timeslice, &mut |_name, path| {
+    for (_, file_stamp) in &files {
         count += 1;
-        stamp ^= meta_stamp(path).wrapping_mul(count | 1);
-    });
-    stamp ^ count.rotate_left(17)
+        stamp ^= file_stamp.wrapping_mul(count | 1);
+    }
+    stamp ^= count.rotate_left(17);
+    let mut cache = slice_watches()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    if cache.len() >= 32 {
+        cache.clear();
+    }
+    cache.insert(key, SliceWatch { dirs, files, stamp });
+    stamp
 }
 
 pub(crate) fn meta_stamp(path: &Path) -> u128 {

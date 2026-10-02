@@ -237,7 +237,7 @@ fn limit_kind(mode: &str) -> &'static str {
     }
 }
 
-fn grain_table(root: &Path, session: &str, grain: &str) -> BTreeMap<String, Vec<f32>> {
+fn grain_table(root: &Path, session: &str, grain: &str) -> super::super::tables::Table {
     if grain == "timeslice" {
         slice_table(root, session)
     } else {
@@ -250,7 +250,7 @@ fn session_table(
     session: &str,
     mode: &str,
     grain: &str,
-) -> BTreeMap<String, Vec<f32>> {
+) -> super::super::tables::Table {
     match mode {
         "amplifier" => timeslice_metric(root, session, "amplifier_error"),
         "probe" => timeslice_metric(root, session, "probe_field"),
@@ -388,10 +388,9 @@ fn column_scene(
     plan: bool,
     bins: usize,
 ) -> (Vec<Panel>, u32, bool) {
-    let tables: Vec<_> = session_ids
-        .iter()
-        .map(|session| session_table(root, session, mode, grain))
-        .collect();
+    let tables = crate::tables::map_sessions(session_ids, |session| {
+        session_table(root, session, mode, grain)
+    });
     let has_plan = tables
         .iter()
         .any(|table| finite_col(table, "plan_x").is_some());
@@ -518,12 +517,18 @@ fn confidence_scene(
         ("IC2 X", "ic2_x_peak", "ic2_x_confidence"),
         ("IC2 Y", "ic2_y_peak", "ic2_y_confidence"),
     ];
+    let peaks = crate::tables::map_sessions(session_ids, |session| {
+        timeslice_metric(root, session, "peak_amplitude")
+    });
+    let confidence = crate::tables::map_sessions(session_ids, |session| {
+        timeslice_metric(root, session, "fit_confidence")
+    });
     let mut panels = Vec::new();
     for (title, peak_key, conf_key) in axes {
         let mut clouds = Vec::new();
-        for session in session_ids {
-            let mut peaks = timeslice_metric(root, session, "peak_amplitude");
-            let mut confidence = timeslice_metric(root, session, "fit_confidence");
+        for (peaks, confidence) in peaks.iter().zip(&confidence) {
+            let mut peaks = std::sync::Arc::unwrap_or_clone(std::sync::Arc::clone(peaks));
+            let mut confidence = std::sync::Arc::unwrap_or_clone(std::sync::Arc::clone(confidence));
             apply_filter(&mut peaks, &[peak_key], "all", beam);
             apply_filter(&mut confidence, &[conf_key], "all", beam);
             let (xs, ys) = finite_pairs(
@@ -585,9 +590,12 @@ fn coverage_scene(root: &Path, session_ids: &[String], beam: &str) -> Vec<Panel>
         ("IC1 Coverage", "ic1_x_confidence", "ic1_y_confidence"),
         ("IC2 Coverage", "ic2_x_confidence", "ic2_y_confidence"),
     ] {
+        let loaded = crate::tables::map_sessions(session_ids, |session| {
+            timeslice_metric(root, session, "fit_confidence")
+        });
         let mut series = Vec::new();
-        for session in session_ids {
-            let mut table = timeslice_metric(root, session, "fit_confidence");
+        for table in loaded {
+            let mut table = std::sync::Arc::unwrap_or_clone(table);
             apply_filter(&mut table, &[x_key, y_key], "all", beam);
             let metrics = spot_coverage_metrics(
                 None,

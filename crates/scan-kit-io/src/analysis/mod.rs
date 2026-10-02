@@ -63,16 +63,16 @@ pub fn analysis_scene(
 
 pub fn channel_catalog(root: &Path, session_id: &str) -> Vec<String> {
     session_channels(root, session_id)
-        .into_iter()
+        .iter()
         .filter(|(name, values)| channel_key(name) && values.iter().any(|value| value.is_finite()))
-        .map(|(name, _)| name)
+        .map(|(name, _)| name.clone())
         .collect()
 }
 
 pub fn load_timeslice_columns(root: &Path, session_id: &str) -> Value {
     let columns = load_timeslice(root, session_id);
     let mut listed = Vec::new();
-    for (name, values) in &columns {
+    for (name, values) in columns.iter() {
         listed.push(json!({ "name": name, "len": values.len() }));
     }
     let energy = energy_lookup(root, session_id);
@@ -180,7 +180,7 @@ fn load_csv(root: &Path, session_id: &str, name: &str) -> BTreeMap<String, Vec<f
         .unwrap_or_default()
 }
 
-fn load_timeslice(root: &Path, session_id: &str) -> BTreeMap<String, Vec<f32>> {
+fn load_timeslice(root: &Path, session_id: &str) -> super::tables::Table {
     super::tables::merged_timeslice(root, session_id)
 }
 
@@ -202,25 +202,7 @@ fn col<'a>(columns: &'a BTreeMap<String, Vec<f32>>, concept: &str) -> Option<&'a
 }
 
 fn numeric_columns(bytes: &[u8]) -> Result<BTreeMap<String, Vec<f32>>, String> {
-    let mut reader = csv::ReaderBuilder::new().flexible(true).from_reader(bytes);
-    let headers = reader.headers().map_err(|err| err.to_string())?.clone();
-    let mut columns: BTreeMap<String, Vec<f32>> = headers
-        .iter()
-        .map(|name| (name.to_owned(), Vec::new()))
-        .collect();
-    for record in reader.records() {
-        let record = record.map_err(|err| err.to_string())?;
-        for (index, name) in headers.iter().enumerate() {
-            let value = record
-                .get(index)
-                .and_then(|text| text.trim().parse().ok())
-                .unwrap_or(f32::NAN);
-            if let Some(column) = columns.get_mut(name) {
-                column.push(value);
-            }
-        }
-    }
-    Ok(columns)
+    Ok(super::tables::read_sheet(bytes).num)
 }
 
 fn session_text(root: &Path, session_id: &str, name: &str) -> String {
@@ -229,15 +211,12 @@ fn session_text(root: &Path, session_id: &str, name: &str) -> String {
         .unwrap_or_default()
 }
 
-fn session_channels(root: &Path, session: &str) -> BTreeMap<String, Vec<f32>> {
+fn session_channels(root: &Path, session: &str) -> super::tables::Table {
     timeslice_signals(root, session)
 }
 
-fn timeline(root: &Path, session_ids: &[String]) -> Vec<BTreeMap<String, Vec<f32>>> {
-    session_ids
-        .iter()
-        .map(|session| session_channels(root, session))
-        .collect()
+fn timeline(root: &Path, session_ids: &[String]) -> Vec<super::tables::Table> {
+    super::tables::map_sessions(session_ids, |session| session_channels(root, session))
 }
 
 pub(super) fn channel_key(name: &str) -> bool {
@@ -246,7 +225,7 @@ pub(super) fn channel_key(name: &str) -> bool {
 
 pub(super) fn finite_names(
     session_ids: &[String],
-    tables: &[BTreeMap<String, Vec<f32>>],
+    tables: &[super::tables::Table],
 ) -> Vec<(String, Vec<String>)> {
     session_ids
         .iter()

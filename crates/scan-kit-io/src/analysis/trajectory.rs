@@ -16,8 +16,8 @@ pub(super) fn trajectory(root: &Path, session_ids: &[String], options: &Value) -
     let mut iso = Vec::new();
     let mut pivot = 0.0f32;
     let mut have_pivot = false;
-    for session in session_ids {
-        let table = spot_table(root, session);
+    let tables = crate::tables::map_sessions(session_ids, |session| spot_table(root, session));
+    for table in tables {
         let plan_x = col(&table, "plan_x").unwrap_or(&[]);
         let plan_y = col(&table, "plan_y").unwrap_or(&[]);
         let ic1_x = finite_col(&table, "ic1_x").unwrap_or(plan_x);

@@ -68,10 +68,12 @@ pub(super) fn rampdown(root: &Path, session_ids: &[String]) -> PlotScene {
         ("IC2", "ic2_current"),
         ("IC3", "ic3_current"),
     ] {
+        let tables = crate::tables::map_sessions(session_ids, |session| {
+            timeslice_metric(root, session, "ic_current")
+        });
         let mut series = Vec::new();
         let mut windows_panels = Vec::new();
-        for session in session_ids {
-            let table = timeslice_metric(root, session, "ic_current");
+        for (session, table) in session_ids.iter().zip(tables) {
             let Some(samples) = col(&table, key) else {
                 continue;
             };
@@ -138,10 +140,13 @@ pub(super) fn amplifier(root: &Path, session_ids: &[String]) -> PlotScene {
         ("X", "amp_cmd_x", "amp_read_x"),
         ("Y", "amp_cmd_y", "amp_read_y"),
     ] {
+        let tables = crate::tables::map_sessions(session_ids, |session| {
+            timeslice_metric(root, session, "amplifier_error")
+        });
+        let spots = crate::tables::map_sessions(session_ids, |session| spot_table(root, session));
         let mut series = Vec::new();
         let mut arcs = Vec::new();
-        for session in session_ids {
-            let table = timeslice_metric(root, session, "amplifier_error");
+        for ((session, table), spots) in session_ids.iter().zip(tables).zip(spots) {
             let Some(cmd) = col(&table, cmd_key) else {
                 continue;
             };
@@ -198,7 +203,6 @@ pub(super) fn amplifier(root: &Path, session_ids: &[String]) -> PlotScene {
                     vec![Series::heatmap(counts, 24, 24)],
                 ));
             }
-            let spots = spot_table(root, session);
             let ic1 = finite_col(&spots, "ic1_x");
             let ic2 = finite_col(&spots, "ic2_x");
             if let (Some(ic1), Some(ic2)) = (ic1, ic2) {
@@ -227,8 +231,8 @@ pub(super) fn amplifier(root: &Path, session_ids: &[String]) -> PlotScene {
 }
 
 pub(super) fn hv_transient(root: &Path, session_ids: &[String]) -> PlotScene {
-    let mut panels = Vec::new();
-    for session in session_ids {
+    let groups = crate::tables::map_sessions(session_ids, |session| {
+        let mut panels = Vec::new();
         for device in ["IC1", "IC2", "IC3"] {
             let path = format!("ic_hv_toggle/{device}_HCC.csv");
             let columns = load_csv(root, session, &path);
@@ -279,6 +283,11 @@ pub(super) fn hv_transient(root: &Path, session_ids: &[String]) -> PlotScene {
                 }],
             ));
         }
+        panels
+    });
+    let mut panels = Vec::new();
+    for group in groups {
+        panels.extend(group);
     }
     scene("IC HV Transient Test", panels, Vec::new())
 }
