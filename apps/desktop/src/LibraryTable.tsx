@@ -55,6 +55,11 @@ const COLUMN_TITLES = [
   "Note",
 ];
 
+/** Double-click selects a row. The note column edits in place instead. */
+export function clickEditsNote(column: number): boolean {
+  return COLUMN_SORT[column] === "note";
+}
+
 export type LibraryRow = {
   session_id: string;
   storage_path: string;
@@ -223,7 +228,7 @@ export function LibraryTable({
       if (row == null || folder == null) {
         return;
       }
-      if (col === 9 && newValue.kind === GridCellKind.Text && newValue.data !== row.note) {
+      if (clickEditsNote(col) && newValue.kind === GridCellKind.Text && newValue.data !== row.note) {
         onCommitNote({ sessionId: row.session_id, before: row.note, after: newValue.data });
       }
     },
@@ -260,7 +265,7 @@ export function LibraryTable({
         row.config,
         row.note,
       ][col - 1];
-      return textCell(value ?? "", col === 9);
+      return textCell(value ?? "", clickEditsNote(col));
     },
     [order, rows, selectedIds],
   );
@@ -317,8 +322,8 @@ export function LibraryTable({
       height={height}
       columns={columns}
       rows={rows.length}
-      rowHeight={32}
-      headerHeight={32}
+      rowHeight={28}
+      headerHeight={28}
       getCellContent={getCellContent}
       drawCell={drawGridCell}
       drawHeader={drawGridHeader}
@@ -326,7 +331,7 @@ export function LibraryTable({
       onCellClicked={([col, rowIndex], event) => {
         const source = order[rowIndex];
         const row = source == null ? undefined : rows[source];
-        if (row == null) {
+        if (row == null || clickEditsNote(col)) {
           return;
         }
         const recent = lastRowToggle.current;

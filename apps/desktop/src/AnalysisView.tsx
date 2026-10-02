@@ -16,7 +16,8 @@ import { AnalysisMenu, analysisId, analysisName } from "@/analysis-menu";
 import { ButtonSegmentGroup } from "@/components/button-segment-group";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
-import { Field, FieldContent, FieldDescription, FieldLabel, FieldLegend, FieldSet } from "@/components/ui/field";
+import { Field, FieldLabel, FieldLegend, FieldSet } from "@/components/ui/field";
+import { SessionList } from "@/session-list";
 import { optionIcon } from "@/option-icons";
 import { backingSize, plotHeader, type PlotHeader, type ViewControl } from "@/plot-header";
 import { sessionColor, shownSessionIds } from "@/session-colors";
@@ -528,47 +529,13 @@ export function AnalysisView({
           />
         </div>
         <div className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto p-3">
-        <FieldSet className="gap-2 rounded-lg border border-border p-3">
-          <FieldLegend variant="label">Sessions</FieldLegend>
-          {sessions.map((session, index) => {
-            const checked = !hidden.includes(session.id);
-            const color = sessionColor(index);
-            const inputId = `analysis-session-${session.id}`;
-            return (
-              <Field key={session.id} orientation="horizontal">
-                <Checkbox
-                  id={inputId}
-                  className="cursor-pointer"
-                  checked={checked}
-                  aria-label={`Include ${session.id}`}
-                  title={
-                    checked
-                      ? `Session color in plots: ${color}`
-                      : `Hidden. Check to draw ${session.id} in ${color}`
-                  }
-                  style={
-                    checked
-                      ? { backgroundColor: color, borderColor: color, color: "#fff" }
-                      : { borderColor: color }
-                  }
-                  onCheckedChange={(next) => {
-                    setHidden((current) =>
-                      next ? current.filter((id) => id !== session.id) : [...current, session.id],
-                    );
-                  }}
-                />
-                <FieldContent className="min-w-0">
-                  <FieldLabel htmlFor={inputId} className="w-full cursor-pointer truncate">
-                    {session.id}
-                  </FieldLabel>
-                  {session.note === "" ? null : (
-                    <FieldDescription className="truncate">{session.note}</FieldDescription>
-                  )}
-                </FieldContent>
-              </Field>
-            );
-          })}
-        </FieldSet>
+        <SessionList
+          sessions={sessions}
+          isChecked={(id) => !hidden.includes(id)}
+          onCheckedChange={(id, next) => {
+            setHidden((current) => (next ? current.filter((item) => item !== id) : [...current, id]));
+          }}
+        />
         {sections.map((section) => (
           <FieldSet key={section.title} className="gap-2 rounded-lg border border-border p-3">
             <FieldLegend variant="label">{section.title}</FieldLegend>

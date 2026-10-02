@@ -1,5 +1,6 @@
 import { expect, it } from "vitest";
 
+import { clickEditsNote } from "./LibraryTable";
 import {
   headerCheck,
   headerWillFill,
@@ -35,6 +36,12 @@ it("toggles a row on double-click, and only once when the checkbox already did",
   expect(shouldToggleRow(0, true, true)).toBe(false);
   expect(shouldToggleRow(0, false, false)).toBe(true);
   expect(shouldToggleRow(3, false, false)).toBe(false);
+});
+
+it("leaves the note column for editing", () => {
+  expect(clickEditsNote(9)).toBe(true);
+  expect(clickEditsNote(0)).toBe(false);
+  expect(clickEditsNote(3)).toBe(false);
 });
 
 it("checks listed rows up to the cap and clears them when every one is on", () => {

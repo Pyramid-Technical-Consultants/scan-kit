@@ -88,6 +88,12 @@ it("puts grouped controls on the right and returns to sessions", async () => {
   expect(host.textContent).toContain("1093436476");
   expect(host.textContent).toContain("Morning");
   expect(host.textContent).toContain("1093436477");
+  const noted = host.querySelector("label[for='session-list-1093436476']");
+  const note = noted?.querySelector("span.truncate");
+  expect(note?.textContent).toBe("Morning");
+  expect(note?.getAttribute("title")).toBe("Morning");
+  expect(noted?.contains(note ?? null)).toBe(true);
+  expect(host.querySelector("label[for='session-list-1093436477']")?.querySelector(".truncate")).toBeNull();
   const sessionBoxes = [...host.querySelectorAll("fieldset")][0]?.querySelectorAll("[data-slot='checkbox']");
   expect(sessionBoxes?.length).toBe(2);
   expect(sessionBoxes?.[0]?.getAttribute("aria-checked")).toBe("true");
