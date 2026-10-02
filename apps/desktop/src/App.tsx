@@ -180,8 +180,6 @@ export default function App() {
   const selectedIds = selectionOrder;
   const canAnalyze = folder != null && selectedIds.length >= 1 && selectedIds.length <= MAX_SELECTED;
   const host = useRef<HTMLDivElement>(null);
-  const folderRef = useRef<string | null>(null);
-  folderRef.current = folder;
 
   const order = useMemo(() => {
     const indexes = rows.map((_, index) => index);
@@ -213,9 +211,15 @@ export default function App() {
 
   useEffect(() => {
     installDebugLog();
-    setTheme(gridTheme());
-    setChecks(checkPaint());
     let active = true;
+    // Theme reads CSS variables from the document, so it waits until after this commit.
+    const frame = requestAnimationFrame(() => {
+      if (!active) {
+        return;
+      }
+      setTheme(gridTheme());
+      setChecks(checkPaint());
+    });
     invoke<About>("scan_kit_about")
       .then((value) => {
         if (active) {
@@ -252,6 +256,7 @@ export default function App() {
       });
     return () => {
       active = false;
+      cancelAnimationFrame(frame);
     };
   }, [loadFolder]);
 
@@ -365,8 +370,7 @@ export default function App() {
   );
 
   const commitSelection = useCallback((next: { ids: string[]; capped: boolean }) => {
-    const path = folderRef.current;
-    if (path == null) {
+    if (folder == null) {
       return;
     }
     const same =
@@ -378,7 +382,7 @@ export default function App() {
       }
       return;
     }
-    void invoke("scan_kit_select_sessions", { path, sessionIds: next.ids })
+    void invoke("scan_kit_select_sessions", { path: folder, sessionIds: next.ids })
       .then(() => {
         const chosen = new Set(next.ids);
         setSelectionOrder(next.ids);
@@ -390,7 +394,7 @@ export default function App() {
         }
       })
       .catch((error: unknown) => notifyError(error));
-  }, [selectionOrder]);
+  }, [folder, selectionOrder]);
 
   const onRowCheck = useCallback(
     (sessionId: string, checked: boolean) => {
@@ -411,15 +415,14 @@ export default function App() {
   }, [commitSelection, displayIds, rows.length, selectedIds]);
 
   const writeNote = useCallback(async (sessionId: string, note: string) => {
-    const path = folderRef.current;
-    if (path == null) {
+    if (folder == null) {
       return;
     }
-    await invoke("scan_kit_set_note", { path, sessionId, note });
+    await invoke("scan_kit_set_note", { path: folder, sessionId, note });
     setRows((current) =>
       current.map((row) => (row.session_id === sessionId ? { ...row, note } : row)),
     );
-  }, []);
+  }, [folder]);
 
   const commitNote = useCallback(
     (edit: NoteEdit) => {

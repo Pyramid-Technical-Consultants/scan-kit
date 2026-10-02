@@ -156,7 +156,7 @@ function textCell(value: string, editable: boolean): GridCell {
   };
 }
 
-export function libraryColumns(sort: Sort): GridColumn[] {
+function libraryColumns(sort: Sort): GridColumn[] {
   return COLUMN_TITLES.map((title, index) => {
     const key = COLUMN_SORT[index];
     const marked =

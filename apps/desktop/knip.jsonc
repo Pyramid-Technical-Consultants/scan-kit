@@ -1,0 +1,10 @@
+{
+  "$schema": "https://unpkg.com/knip@6/schema.json",
+  "ignore": [
+    // Copied shadcn components. Leave them as `npx shadcn add` wrote them.
+    // Generated src/wasm is gitignored, which Knip already skips.
+    "src/components/ui/**"
+  ],
+  // The wasm script calls the Rust wasm-bindgen CLI pinned in Cargo.lock, not an npm package.
+  "ignoreBinaries": ["wasm-bindgen"]
+}

@@ -1,4 +1,4 @@
-export type ControlKind = "select" | "bare" | "check";
+type ControlKind = "select" | "bare" | "check";
 
 export type ControlSlot = {
   id: string;
@@ -144,16 +144,7 @@ export function controlSections(viewId: string, ids: readonly string[]): Control
   return sections;
 }
 
-const SHORT_CHOICE = 10;
-
-/** Two or three short labels sit in a joined button row. */
-export function segmentChoices(options: readonly string[]): boolean {
-  return (
-    options.length >= 2 &&
-    options.length < 4 &&
-    options.every((option) => option.length > 0 && option.length <= SHORT_CHOICE)
-  );
-}
+export { segmentChoices } from "@/CatalogField";
 
 /** Histogram bins follow the show-panel checkbox. X bins apply to every axis. */
 export function controlDisabled(id: string, values: Readonly<Record<string, string>>): boolean {

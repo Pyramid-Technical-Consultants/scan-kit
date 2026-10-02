@@ -1,6 +1,6 @@
 /** Painted to match the shadcn checkbox: 16px, 4px corners, input border, colored fill. */
-export const CHECK_SIZE = 16;
-export const CHECK_RADIUS = 4;
+const CHECK_SIZE = 16;
+const CHECK_RADIUS = 4;
 
 export type CheckPaint = {
   border: string;

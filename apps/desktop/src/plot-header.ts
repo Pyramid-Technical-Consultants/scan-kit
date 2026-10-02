@@ -5,7 +5,7 @@ export type ViewControl = {
   value: string;
 };
 
-export type ViewTable = {
+type ViewTable = {
   columns: string[];
   rows: string[][];
 };

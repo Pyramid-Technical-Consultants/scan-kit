@@ -67,10 +67,15 @@ Build outputs (`target/`, `node_modules/`, `dist/`, Python `dist/`) are not conf
 
 Pull requests to `develop` or `main` run:
 
-- `cargo fmt --check`
-- `cargo clippy --workspace --all-targets -- -D warnings`
-- `cargo test --workspace`
-- `tsc --noEmit` for the desktop frontend
+- `cargo fmt --all --check`
+- `cargo clippy --workspace --exclude scan-kit-desktop --all-targets --locked -- -D warnings` (the Tauri shell needs WebKitGTK, which the Linux job does not install)
+- `cargo clippy -p scan-kit-plot --no-deps --target wasm32-unknown-unknown -- -D warnings`
+- `cargo test --workspace --exclude scan-kit-desktop --locked`
+- `cargo deny check` (advisories, licenses, and crate sources)
+- `cargo machete --with-metadata` (unused direct Cargo dependencies)
+- in `apps/desktop`: `npm run build` (wasm plot, `tsc`, and the Vite bundle), `npm test` (Vitest), `npm run lint` (Oxlint), and `npm run knip`
+
+`cargo deny` and `cargo machete` are development tools installed in the Rust job. They are not linked into the binaries. The command list an agent runs is the same one, in [.cursor/skills/static-analysis/SKILL.md](../../.cursor/skills/static-analysis/SKILL.md).
 
 Pushes to `develop` or `main` also upload preview desktop and MCP binaries. Those artifacts are not a GitHub Release.
 
@@ -98,4 +103,4 @@ Software of unknown provenance is every direct dependency this project does not 
 
 ## Tools used to develop the software
 
-Rust (stable, pinned by `rust-toolchain.toml`), Cargo, the Tauri CLI, Node.js, and GitHub Actions. These tools are development tools. They are not part of the released medical-device software except where a dependency is linked into the binaries and listed as SOUP.
+Rust (stable, pinned by `rust-toolchain.toml`), Cargo, the Tauri CLI, Node.js, GitHub Actions, cargo-deny, cargo-machete, Oxlint, and Knip. These tools are development tools. They are not part of the released medical-device software except where a dependency is linked into the binaries and listed as SOUP.

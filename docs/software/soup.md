@@ -59,5 +59,7 @@ Plot text uses the vendored Source Sans 3 regular face in `crates/scan-kit-plot/
 | `@tauri-apps/plugin-dialog` | see `apps/desktop/package.json` | Open Data Folder dialog |
 | vitest | see `apps/desktop/package.json` | Desktop UI checks. Not linked into the product binary |
 | happy-dom | see `apps/desktop/package.json` | DOM for those checks. Not linked into the product binary |
+| oxlint | see `apps/desktop/package.json` | Desktop correctness lint, including React hooks. Not linked into the product binary |
+| knip | see `apps/desktop/package.json` | Unused desktop files, exports, and npm dependencies. Not linked into the product binary |
 
 shadcn component source copied into `apps/desktop/src/components/ui/` is project software, not SOUP. The packages those components import are SOUP and are listed through `package.json`.

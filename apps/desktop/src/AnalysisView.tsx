@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { createElement, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { ArrowLeft, Download, Play } from "lucide-react";
@@ -72,14 +72,22 @@ function palette(order: readonly string[], shown: readonly string[]): number[][]
   return shown.map((id) => parseColor(sessionColor(Math.max(0, order.indexOf(id)))));
 }
 
-function wavBlob(samples: number[]): Blob {
-  const rate = 8000;
+const AUDIO_RATE = 8000;
+const AUDIO_HOLD = 8;
+
+function heldSamples(samples: readonly number[]): number[] {
   const held: number[] = [];
   for (const sample of samples) {
-    for (let i = 0; i < 8; i += 1) {
+    for (let i = 0; i < AUDIO_HOLD; i += 1) {
       held.push(sample);
     }
   }
+  return held;
+}
+
+function wavBlob(samples: number[]): Blob {
+  const rate = AUDIO_RATE;
+  const held = heldSamples(samples);
   const bytes = new ArrayBuffer(44 + held.length * 2);
   const view = new DataView(bytes);
   const write = (offset: number, text: string) => {
@@ -108,15 +116,10 @@ function wavBlob(samples: number[]): Blob {
 }
 
 async function playSamples(samples: number[]) {
-  const rate = 8000;
-  const context = new AudioContext({ sampleRate: rate });
-  const buffer = context.createBuffer(1, samples.length * 8, rate);
-  const channel = buffer.getChannelData(0);
-  samples.forEach((sample, index) => {
-    for (let i = 0; i < 8; i += 1) {
-      channel[index * 8 + i] = sample;
-    }
-  });
+  const held = heldSamples(samples);
+  const context = new AudioContext({ sampleRate: AUDIO_RATE });
+  const buffer = context.createBuffer(1, held.length, AUDIO_RATE);
+  buffer.getChannelData(0).set(held);
   const source = context.createBufferSource();
   source.buffer = buffer;
   source.connect(context.destination);
@@ -128,6 +131,11 @@ async function playSamples(samples: number[]) {
 
 function messageOf(reason: unknown): string {
   return reason instanceof Error ? reason.message : String(reason);
+}
+
+function ChoiceIcon({ name }: { name: string }) {
+  const icon = optionIcon(name);
+  return icon == null ? null : createElement(icon);
 }
 
 function ChoiceSelect({
@@ -142,7 +150,6 @@ function ChoiceSelect({
   onChange: (value: string) => void;
 }) {
   const items = control.options.map((option) => ({ label: option, value: option }));
-  const Icon = optionIcon(value);
   return (
     <Select
       items={items}
@@ -155,20 +162,17 @@ function ChoiceSelect({
       }}
     >
       <SelectTrigger size="sm" className="w-full cursor-pointer">
-        {Icon == null ? null : <Icon />}
+        <ChoiceIcon name={value} />
         <SelectValue />
       </SelectTrigger>
       <SelectContent>
         <SelectGroup>
-          {items.map((item) => {
-            const ItemIcon = optionIcon(item.value);
-            return (
-              <SelectItem key={item.value} value={item.value}>
-                {ItemIcon == null ? null : <ItemIcon />}
-                {item.label}
-              </SelectItem>
-            );
-          })}
+          {items.map((item) => (
+            <SelectItem key={item.value} value={item.value}>
+              <ChoiceIcon name={item.value} />
+              {item.label}
+            </SelectItem>
+          ))}
         </SelectGroup>
       </SelectContent>
     </Select>
