@@ -436,7 +436,7 @@ export function AnalysisView({
     allowOverlay: false,
   });
 
-  const renderSlot = (slot: ControlSlot) => {
+  const renderSlot = (slot: ControlSlot, inline = false) => {
     const control = byId.get(slot.id);
     if (control == null) {
       return null;
@@ -446,7 +446,15 @@ export function AnalysisView({
     const disabled = controlDisabled(slot.id, resolved);
     if (slot.kind === "check") {
       return (
-        <Field key={slot.id} orientation="horizontal" className={disabled ? "opacity-50" : undefined}>
+        <Field
+          key={slot.id}
+          orientation="horizontal"
+          className={
+            [inline ? "min-w-0 flex-1" : null, disabled ? "opacity-50" : null]
+              .filter((item) => item != null)
+              .join(" ") || undefined
+          }
+        >
           <Checkbox
             id={`analysis-${slot.id}`}
             className="cursor-pointer"
@@ -454,7 +462,11 @@ export function AnalysisView({
             disabled={disabled}
             onCheckedChange={(checked) => apply(slot.id, checked ? "On" : "Off")}
           />
-          <FieldLabel className="cursor-pointer" htmlFor={`analysis-${slot.id}`}>
+          <FieldLabel
+            className="cursor-pointer [&_svg:not([class*='size-'])]:size-4"
+            htmlFor={`analysis-${slot.id}`}
+          >
+            {inline ? <ChoiceIcon name={label} /> : null}
             {label}
           </FieldLabel>
         </Field>
@@ -543,7 +555,13 @@ export function AnalysisView({
         {sections.map((section) => (
           <FieldSet key={section.title} className="gap-2 rounded-lg border border-border p-3">
             <FieldLegend variant="label">{section.title}</FieldLegend>
-            {section.slots.map((slot) => renderSlot(slot))}
+            {section.inline ? (
+              <div className="flex flex-row gap-3">
+                {section.slots.map((slot) => renderSlot(slot, true))}
+              </div>
+            ) : (
+              section.slots.map((slot) => renderSlot(slot))
+            )}
           </FieldSet>
         ))}
         {(meta?.samples.length ?? 0) > 0 ? (

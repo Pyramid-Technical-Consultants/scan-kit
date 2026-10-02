@@ -10,6 +10,8 @@ export type ControlSlot = {
 export type ControlSection = {
   title: string;
   slots: ControlSlot[];
+  /** Checks share one row, in the same order as the plot. */
+  inline?: boolean;
 };
 
 const SECTIONS: Record<string, ControlSection[]> = {
@@ -62,10 +64,11 @@ const SECTIONS: Record<string, ControlSection[]> = {
     },
     {
       title: "Columns",
+      inline: true,
       slots: [
+        { id: "plan", kind: "check" },
         { id: "ic1", kind: "check" },
         { id: "ic2", kind: "check" },
-        { id: "plan", kind: "check" },
       ],
     },
     {
@@ -143,7 +146,7 @@ export function controlSections(viewId: string, ids: readonly string[]): Control
       used.add(slot.id);
     }
     if (slots.length > 0) {
-      sections.push({ title: spec.title, slots });
+      sections.push({ ...spec, slots });
     }
   }
   const extra = ids.filter((id) => !used.has(id));

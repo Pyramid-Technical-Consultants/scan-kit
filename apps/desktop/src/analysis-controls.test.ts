@@ -94,7 +94,8 @@ it("puts the spot source ahead of the distribution signal", () => {
     "Filter Data",
   ]);
   expect(sections[0]?.slots.map((slot) => slot.id)).toEqual(["grain", "mode"]);
-  expect(sections[1]?.slots.map((slot) => slot.id)).toEqual(["ic1", "ic2", "plan"]);
+  expect(sections[1]?.inline).toBe(true);
+  expect(sections[1]?.slots.map((slot) => slot.id)).toEqual(["plan", "ic1", "ic2"]);
   expect(sections[1]?.slots.every((slot) => slot.kind === "check")).toBe(true);
   expect(sections[2]?.slots.map((slot) => slot.id)).toEqual(["draw", "ramp", "cutoff"]);
   expect(sections[3]?.slots.map((slot) => slot.id)).toEqual(["hist_bins"]);

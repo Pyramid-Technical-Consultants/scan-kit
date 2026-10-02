@@ -7,25 +7,40 @@ import { AnalysisView } from "./AnalysisView";
 import { sessionColor } from "./session-colors";
 
 vi.mock("@tauri-apps/api/core", () => ({
-  invoke: vi.fn(async (command: string) => {
+  invoke: vi.fn(async (command: string, args?: { view?: string }) => {
     if (command !== "scan_kit_open_plot") {
       throw new Error(command);
     }
-    const header = {
-      title: "Dose Ratios vs Energy",
-      controls: [
-        { id: "metric", label: "Y", options: ["Dose Ratios"], value: "Dose Ratios" },
-        { id: "source", label: "Source", options: ["Spot", "Timeslice"], value: "Spot" },
-        { id: "x", label: "X", options: ["Energy", "Target MU", "Spot time", "Radius"], value: "Energy" },
-        { id: "bins", label: "Bins", options: ["Automatic", "8", "16", "32", "64"], value: "Automatic" },
-        { id: "domain", label: "Domain", options: ["All", "Lower 95%", "Upper 5%", "MAD Outliers"], value: "All" },
-        { id: "beam", label: "Beam", options: ["Beam On", "Beam Off", "Both"], value: "Beam On" },
-        { id: "trend", label: "Trend", options: ["Off", "Linear", "Polynomial"], value: "Off" },
-      ],
-      table: null,
-      samples: [],
-      panels: [{}],
-    };
+    const distribution = args?.view === "distribution";
+    const header = distribution
+      ? {
+          title: "Distribution",
+          controls: [
+            { id: "grain", label: "Source", options: ["Spot", "Timeslice"], value: "Spot" },
+            { id: "mode", label: "XY", options: ["Position"], value: "Position" },
+            { id: "ic1", label: "IC1", options: ["Off", "On"], value: "On" },
+            { id: "ic2", label: "IC2", options: ["Off", "On"], value: "Off" },
+            { id: "plan", label: "Plan", options: ["Off", "On"], value: "On" },
+          ],
+          table: null,
+          samples: [],
+          panels: [{}],
+        }
+      : {
+          title: "Dose Ratios vs Energy",
+          controls: [
+            { id: "metric", label: "Y", options: ["Dose Ratios"], value: "Dose Ratios" },
+            { id: "source", label: "Source", options: ["Spot", "Timeslice"], value: "Spot" },
+            { id: "x", label: "X", options: ["Energy", "Target MU", "Spot time", "Radius"], value: "Energy" },
+            { id: "bins", label: "Bins", options: ["Automatic", "8", "16", "32", "64"], value: "Automatic" },
+            { id: "domain", label: "Domain", options: ["All", "Lower 95%", "Upper 5%", "MAD Outliers"], value: "All" },
+            { id: "beam", label: "Beam", options: ["Beam On", "Beam Off", "Both"], value: "Beam On" },
+            { id: "trend", label: "Trend", options: ["Off", "Linear", "Polynomial"], value: "Off" },
+          ],
+          table: null,
+          samples: [],
+          panels: [{}],
+        };
     const json = new TextEncoder().encode(JSON.stringify(header));
     const bytes = new Uint8Array(4 + json.length);
     new DataView(bytes.buffer).setUint32(0, json.length, true);
@@ -220,4 +235,35 @@ it("hides an unchecked session and keeps the other session's color", async () =>
   const kept = last?.palette[0];
   const original = calls[0]?.palette[1];
   expect(kept).toEqual(original);
+});
+
+it("lays distribution columns in plot order on one row with icons", async () => {
+  const host = document.createElement("div");
+  document.body.append(host);
+  await act(() => {
+    root = createRoot(host);
+    root.render(
+      <AnalysisView
+        viewId="distribution"
+        folder="C:/data"
+        sessions={[{ id: "a", note: "" }]}
+        onBack={() => undefined}
+        onOpenView={() => undefined}
+      />,
+    );
+  });
+  await act(async () => {
+    await new Promise((resolve) => setTimeout(resolve, 200));
+  });
+  const columns = [...host.querySelectorAll("fieldset")].find(
+    (node) => node.querySelector("legend")?.textContent === "Columns",
+  );
+  const row = columns?.querySelector(":scope > div");
+  expect(row?.className).toContain("flex-row");
+  const labels = [...(row?.querySelectorAll("label") ?? [])].map((node) => node.textContent?.trim());
+  expect(labels).toEqual(["Plan", "IC1", "IC2"]);
+  expect(row?.querySelector(".lucide-target")).not.toBeNull();
+  expect(row?.querySelectorAll(".lucide-zap").length).toBe(2);
+  const checks = [...(row?.querySelectorAll("[data-slot='checkbox']") ?? [])];
+  expect(checks.map((node) => node.getAttribute("aria-checked"))).toEqual(["true", "true", "false"]);
 });
