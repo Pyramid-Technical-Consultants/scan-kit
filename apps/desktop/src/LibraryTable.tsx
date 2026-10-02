@@ -1,4 +1,4 @@
-import { useCallback, useRef } from "react";
+import { useCallback, useMemo, useRef } from "react";
 import {
   DataEditor,
   GridCellKind,
@@ -203,7 +203,13 @@ export function LibraryTable({
   onOpenMenu: (menu: SessionMenu) => void;
 }) {
   const lastRowToggle = useRef<{ row: number; at: number } | null>(null);
-  const columns = libraryColumns(sort);
+  const columns = useMemo(() => libraryColumns(sort), [sort]);
+  const changeSelection = useCallback(
+    (next: GridSelection) => {
+      onGridSelectionChange(selectWholeRows(next, columns.length));
+    },
+    [columns.length, onGridSelectionChange],
+  );
   const { checked: headerChecked, indeterminate: headerMixed } = headerCheck(
     rows.length,
     selectedIds.length,
@@ -364,7 +370,7 @@ export function LibraryTable({
       }}
       theme={theme}
       gridSelection={gridSelection}
-      onGridSelectionChange={(next) => onGridSelectionChange(selectWholeRows(next, columns.length))}
+      onGridSelectionChange={changeSelection}
       columnSelect="none"
       rowMarkers="none"
       smoothScrollX

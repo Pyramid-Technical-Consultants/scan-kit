@@ -18,11 +18,7 @@ macro_rules! forward {
 }
 
 forward!(scan_kit_open_library(path: String));
-forward!(scan_kit_set_note(
-    path: String,
-    session_id: String,
-    note: String
-));
+forward!(scan_kit_set_note(path: String, session_id: String, note: String));
 forward!(scan_kit_select_sessions(path: String, session_ids: Vec<String>));
 forward!(scan_kit_plan_catalog);
 forward!(scan_kit_config_catalog);
