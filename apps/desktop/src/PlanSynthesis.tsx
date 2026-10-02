@@ -2,6 +2,31 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import {
+  ArrowDownLeft,
+  ArrowDownRight,
+  ArrowRight,
+  ArrowUpLeft,
+  ArrowUpRight,
+  Combine,
+  CornerUpLeft,
+  Dices,
+  Download,
+  FolderOpen,
+  Hash,
+  Layers,
+  ListChecks,
+  ListOrdered,
+  ListX,
+  Lock,
+  MoveHorizontal,
+  MoveVertical,
+  Route,
+  Rows3,
+  Scale,
+  Shuffle,
+  type LucideIcon,
+} from "lucide-react";
+import {
   DataEditor,
   GridCellKind,
   getDefaultTheme,
@@ -16,13 +41,21 @@ import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import {
   Field,
+  FieldDescription,
   FieldError,
   FieldGroup,
   FieldLabel,
   FieldLegend,
   FieldSet,
 } from "@/components/ui/field";
-import { Input } from "@/components/ui/input";
+import {
+  InputGroup,
+  InputGroupAddon,
+  InputGroupButton,
+  InputGroupInput,
+  InputGroupText,
+} from "@/components/ui/input-group";
+import { optionIcon } from "@/option-icons";
 import {
   Select,
   SelectContent,
@@ -33,6 +66,7 @@ import {
 } from "@/components/ui/select";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import { notify, notifyError } from "@/notify";
+import { SidePane } from "@/SidePane";
 
 type Choice = { value: string; label: string };
 type QuickSet = { label: string; values: Record<string, number> };
@@ -66,10 +100,37 @@ type PlanResult = {
 
 const FIELD_SETS: Array<[string, string]> = [
   ["source", "Source"],
-  ["energy", "Energy"],
+  ["energy", "Energy (MeV)"],
   ["geometry", "Geometry"],
   ["weight", "Weight"],
 ];
+
+const LABEL_CLASS = "w-28 shrink-0 flex-none! leading-snug";
+
+const CHOICE_ICONS: Record<string, LucideIcon> = {
+  X: MoveHorizontal,
+  Y: MoveVertical,
+  "Top Left": ArrowUpLeft,
+  "Top Right": ArrowUpRight,
+  "Bottom Left": ArrowDownLeft,
+  "Bottom Right": ArrowDownRight,
+  "Reset to Corner": CornerUpLeft,
+  "Continue from End": ArrowRight,
+  "Plan Order": ListOrdered,
+  "Minimize Travel": Route,
+  Fixed: Lock,
+  "Random Range": Shuffle,
+  "Even per Layer": Layers,
+  "Even Total": Scale,
+  "Random Total": Dices,
+};
+
+const ENERGY_PRESETS: Record<string, { label: string; title: string; icon: LucideIcon }> = {
+  "Select All": { label: "All", title: "Select every layer", icon: ListChecks },
+  "Whole MeV Steps": { label: "Whole MeV", title: "Integer MeV layers", icon: Hash },
+  "10 MeV Steps": { label: "10 MeV", title: "Every 10 MeV", icon: Rows3 },
+  "Clear All": { label: "None", title: "Clear the selection", icon: ListX },
+};
 
 function defaultsOf(template: Template): Record<string, unknown> {
   const values: Record<string, unknown> = {};
@@ -97,8 +158,43 @@ function shortChoices(param: Param): boolean {
   );
 }
 
-function energyText(energy: number): string {
-  return `${String(energy)} MeV`;
+function labelParts(label: string): { name: string; unit?: string } {
+  const match = /^(.*)\s+\(([^)]+)\)$/.exec(label);
+  if (match == null) {
+    return { name: label };
+  }
+  return { name: match[1], unit: match[2] };
+}
+
+function unitOf(param: Param): string | undefined {
+  const unit =
+    param.suffix != null && param.suffix.length > 0 ? param.suffix : labelParts(param.label).unit;
+  if (unit == null || labelParts(param.label).name.toLowerCase().includes(unit.toLowerCase())) {
+    return undefined;
+  }
+  return unit;
+}
+
+function numericKind(kind: string): boolean {
+  return kind === "int" || kind === "float";
+}
+
+function choiceIcon(label: string): LucideIcon | undefined {
+  return CHOICE_ICONS[label] ?? optionIcon(label);
+}
+
+function sameNumbers(left: number[], right: number[]): boolean {
+  if (left.length !== right.length) {
+    return false;
+  }
+  const a = [...left].sort((x, y) => x - y);
+  const b = [...right].sort((x, y) => x - y);
+  return a.every((value, index) => value === b[index]);
+}
+
+function fileName(path: string): string {
+  const cut = Math.max(path.lastIndexOf("/"), path.lastIndexOf("\\"));
+  return cut >= 0 ? path.slice(cut + 1) : path;
 }
 
 function parentDir(path: string): string {
@@ -301,111 +397,263 @@ export function PlanSynthesis() {
     return <p className="text-muted-foreground px-3 py-2">Loading templates…</p>;
   }
 
-  const items = catalog.templates.map((item) => ({ value: item.id, label: item.name }));
+  const applyQuick = (next: Record<string, number>) => {
+    setValues((current) => ({ ...current, ...next }));
+  };
   return (
-    <div className="flex min-h-0 flex-1">
-      <div className="flex w-[26rem] shrink-0 flex-col gap-3 overflow-auto border-r p-3">
-        <Field>
-          <FieldLabel>Template</FieldLabel>
-          <Select items={items} value={template.id} onValueChange={(next) => next != null && selectTemplate(next)}>
-            <SelectTrigger className="w-full cursor-pointer">
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectGroup>
-                {items.map((item) => (
-                  <SelectItem key={item.value} value={item.value}>
-                    {item.label}
-                  </SelectItem>
+    <SidePane
+      side={
+        <div className="flex min-h-0 flex-1 flex-col">
+          <div className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto p-3">
+            <FieldSet className="gap-2 rounded-lg border border-border p-3">
+              <FieldLegend variant="label">Template</FieldLegend>
+              <ToggleGroup
+                variant="outline"
+                orientation="vertical"
+                spacing={2}
+                className="w-full flex-col items-stretch"
+                value={[template.id]}
+                onValueChange={(next) => {
+                  const picked = next.find((item) => item !== template.id) ?? next[0];
+                  if (picked != null) {
+                    selectTemplate(picked);
+                  }
+                }}
+              >
+                {catalog.templates.map((item) => (
+                  <ToggleGroupItem
+                    key={item.id}
+                    value={item.id}
+                    className="w-full min-w-0 justify-start gap-3 px-2.5 font-normal"
+                  >
+                    <span className="shrink-0 font-medium">{item.name}</span>
+                    <span
+                      className="text-muted-foreground ml-auto min-w-0 truncate text-right font-normal"
+                      title={item.description}
+                    >
+                      {item.description}
+                    </span>
+                  </ToggleGroupItem>
                 ))}
-              </SelectGroup>
-            </SelectContent>
-          </Select>
-        </Field>
-        <p className="text-muted-foreground text-sm">{template.description}</p>
-        {FIELD_SETS.map(([setId, title]) => {
-          const params = template.params.filter(
-            (param) => (param.field_set ?? "geometry") === setId && shown(param, values) && param.row_partner == null,
-          );
-          if (params.length === 0) {
-            return null;
-          }
-          return (
-            <FieldSet key={setId}>
-              <FieldLegend variant="label">{title}</FieldLegend>
-              <FieldGroup>
-                {params.map((param) => {
-                  const partner = template.params.find(
-                    (item) => item.row_partner === param.key && shown(item, values),
-                  );
-                  return (
-                    <div key={param.key} className="flex flex-col gap-2">
-                      <div className={partner == null ? undefined : "grid grid-cols-2 gap-2"}>
+              </ToggleGroup>
+            </FieldSet>
+            {FIELD_SETS.map(([setId, title]) => {
+              const params = template.params.filter(
+                (param) =>
+                  (param.field_set ?? "geometry") === setId && shown(param, values) && param.row_partner == null,
+              );
+              if (params.length === 0) {
+                return null;
+              }
+              return (
+                <FieldSet key={setId} className="gap-2 rounded-lg border border-border p-3">
+                  <FieldLegend variant="label">{title}</FieldLegend>
+                  <FieldGroup className="gap-3">
+                    {params.map((param) => {
+                      const partner = template.params.find(
+                        (item) => item.row_partner === param.key && shown(item, values),
+                      );
+                      if (numericKind(param.kind)) {
+                        return (
+                          <NumberRow
+                            key={param.key}
+                            param={param}
+                            partner={partner != null && numericKind(partner.kind) ? partner : undefined}
+                            values={values}
+                            onChange={setValue}
+                            onQuick={applyQuick}
+                          />
+                        );
+                      }
+                      return (
                         <ParamControl
+                          key={param.key}
                           param={param}
                           values={values}
                           onChange={setValue}
                           onBrowse={() => void browse(param)}
                         />
-                        {partner == null ? null : (
-                          <ParamControl
-                            param={partner}
-                            values={values}
-                            onChange={setValue}
-                            onBrowse={() => void browse(partner)}
-                          />
-                        )}
-                      </div>
-                      {param.quick_sets == null || param.quick_sets.length === 0 ? null : (
-                        <div className="flex flex-wrap gap-1">
-                          {param.quick_sets.map((quick) => (
-                            <Button
-                              key={quick.label}
-                              type="button"
-                              size="sm"
-                              variant="outline"
-                              onClick={() => setValues((current) => ({ ...current, ...quick.values }))}
-                            >
-                              {quick.label}
-                            </Button>
-                          ))}
-                        </div>
-                      )}
-                    </div>
-                  );
-                })}
-              </FieldGroup>
-            </FieldSet>
-          );
-        })}
-        {error == null ? null : <FieldError>{error}</FieldError>}
-        <Button type="button" disabled={busy} onClick={() => void generate()}>
-          {busy ? "Generating…" : "Generate"}
+                      );
+                    })}
+                  </FieldGroup>
+                </FieldSet>
+              );
+            })}
+          </div>
+          <div className="flex flex-col gap-2 border-t p-3">
+            {error == null ? null : <FieldError>{error}</FieldError>}
+            <div className="flex gap-2">
+              <Button type="button" className="min-w-0 flex-1" disabled={busy} onClick={() => void generate()}>
+                <Combine />
+                {busy ? "Generating…" : "Generate"}
+              </Button>
+              <Button
+                type="button"
+                variant="outline"
+                className="min-w-0 flex-1"
+                disabled={plan == null}
+                onClick={() => void savePlan()}
+              >
+                <Download />
+                Save CSV
+              </Button>
+            </div>
+          </div>
+        </div>
+      }
+      main={
+        <div className="flex min-h-0 min-w-0 flex-1 flex-col">
+          {plan == null ? (
+            <div className="text-muted-foreground flex flex-1 items-center justify-center px-6 text-center text-sm">
+              No plan generated yet.
+            </div>
+          ) : (
+            <>
+              <p className="border-b px-3 py-2 text-sm tabular-nums">{plan.summary}</p>
+              <div ref={host} className="min-h-0 flex-1">
+                {theme != null && size.width > 0 && size.height > 0 ? (
+                  <DataEditor
+                    width={size.width}
+                    height={size.height}
+                    columns={columns}
+                    rows={plan.rows.length}
+                    rowHeight={28}
+                    headerHeight={32}
+                    getCellContent={getCellContent}
+                    theme={theme}
+                  />
+                ) : null}
+              </div>
+            </>
+          )}
+        </div>
+      }
+    />
+  );
+}
+
+function NumberInput({
+  id,
+  label,
+  value,
+  prefix,
+  suffix,
+  param,
+  onChange,
+}: {
+  id: string;
+  label: string;
+  value: unknown;
+  prefix?: string;
+  suffix?: string;
+  param: Param;
+  onChange: (key: string, value: unknown) => void;
+}) {
+  return (
+    <InputGroup>
+      <InputGroupInput
+        id={id}
+        aria-label={prefix == null ? undefined : label}
+        type="number"
+        className="tabular-nums [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
+        value={value == null ? "" : String(value)}
+        min={param.minimum}
+        max={param.maximum}
+        step={param.step}
+        onChange={(event) => {
+          const next = event.target.value;
+          onChange(param.key, next === "" ? "" : Number(next));
+        }}
+      />
+      {prefix == null || prefix.length === 0 ? null : (
+        <InputGroupAddon>
+          <InputGroupText>{prefix}</InputGroupText>
+        </InputGroupAddon>
+      )}
+      {suffix == null || suffix.length === 0 ? null : (
+        <InputGroupAddon align="inline-end">
+          <InputGroupText>{suffix}</InputGroupText>
+        </InputGroupAddon>
+      )}
+    </InputGroup>
+  );
+}
+
+function QuickSets({
+  sets,
+  onApply,
+}: {
+  sets: QuickSet[];
+  onApply: (values: Record<string, number>) => void;
+}) {
+  if (sets.length === 0) {
+    return null;
+  }
+  return (
+    <div className="flex gap-1">
+      {sets.map((quick) => (
+        <Button
+          key={quick.label}
+          type="button"
+          size="sm"
+          variant="outline"
+          className={sets.length === 1 ? undefined : "min-w-0 flex-1"}
+          onClick={() => onApply(quick.values)}
+        >
+          {quick.label}
         </Button>
-      </div>
-      <div className="flex min-w-0 flex-1 flex-col">
-        <div className="flex items-center gap-2 border-b px-3 py-2">
-          <p className="text-sm">{plan?.summary ?? "No plan generated yet."}</p>
-          <Button className="ml-auto" type="button" size="sm" disabled={plan == null} onClick={() => void savePlan()}>
-            Save CSV
-          </Button>
-        </div>
-        <div ref={host} className="min-h-0 flex-1">
-          {plan != null && theme != null && size.width > 0 && size.height > 0 ? (
-            <DataEditor
-              width={size.width}
-              height={size.height}
-              columns={columns}
-              rows={plan.rows.length}
-              rowHeight={28}
-              headerHeight={32}
-              getCellContent={getCellContent}
-              theme={theme}
-            />
-          ) : null}
-        </div>
-      </div>
+      ))}
     </div>
+  );
+}
+
+function NumberRow({
+  param,
+  partner,
+  values,
+  onChange,
+  onQuick,
+}: {
+  param: Param;
+  partner?: Param;
+  values: Record<string, unknown>;
+  onChange: (key: string, value: unknown) => void;
+  onQuick: (values: Record<string, number>) => void;
+}) {
+  const name = labelParts(param.label).name;
+  const unit = unitOf(param);
+  const quick = param.quick_sets ?? [];
+  return (
+    <Field orientation="horizontal" className={quick.length > 0 ? "items-start" : undefined}>
+      <FieldLabel htmlFor={`plan-${param.key}`} className={quick.length > 0 ? `${LABEL_CLASS} mt-1.5` : LABEL_CLASS}>
+        {name}
+      </FieldLabel>
+      <div className="flex min-w-0 flex-1 flex-col gap-2">
+        <div className={partner == null ? undefined : "flex gap-1.5"}>
+          <NumberInput
+            id={`plan-${param.key}`}
+            label={param.sub_label == null || param.sub_label.length === 0 ? name : `${name} ${param.sub_label}`}
+            value={values[param.key]}
+            prefix={partner == null ? undefined : param.sub_label}
+            suffix={partner == null ? unit : undefined}
+            param={param}
+            onChange={onChange}
+          />
+          {partner == null ? null : (
+            <NumberInput
+              id={`plan-${partner.key}`}
+              label={`${name} ${partner.sub_label ?? ""}`.trim()}
+              value={values[partner.key]}
+              prefix={partner.sub_label}
+              suffix={unit}
+              param={partner}
+              onChange={onChange}
+            />
+          )}
+        </div>
+        <QuickSets sets={quick} onApply={onQuick} />
+      </div>
+    </Field>
   );
 }
 
@@ -420,34 +668,45 @@ function ParamControl({
   onChange: (key: string, value: unknown) => void;
   onBrowse: () => void;
 }) {
-  const label = param.sub_label == null || param.sub_label.length === 0 ? param.label : `${param.label} ${param.sub_label}`;
   if (param.kind === "energy_multiselect") {
     const selected = Array.isArray(values[param.key]) ? (values[param.key] as number[]) : [];
     const catalog = Array.isArray(param.default) ? [...(param.default as number[])].reverse() : [];
+    const presets = param.presets ?? [];
+    const active = presets.find((preset) => sameNumbers(preset.energies, selected));
+    const count =
+      selected.length === 0
+        ? "No layers selected"
+        : selected.length === catalog.length
+          ? `All ${catalog.length} layers`
+          : `${selected.length} of ${catalog.length} layers`;
     return (
       <Field>
-        <FieldLabel>{param.label}</FieldLabel>
-        <div className="flex flex-wrap gap-1">
-          {(param.presets ?? []).map((preset) => (
-            <Button
-              key={preset.label}
-              type="button"
-              size="sm"
-              variant="outline"
-              onClick={() => onChange(param.key, preset.energies)}
-            >
-              {preset.label}
-            </Button>
-          ))}
-        </div>
-        <p className="text-muted-foreground text-sm">
-          {selected.length === 0
-            ? "No layers selected"
-            : selected.length === 1
-              ? "1 layer selected"
-              : `${selected.length} layers selected`}
-        </p>
-        <div className="flex max-h-48 flex-col gap-1 overflow-auto">
+        {presets.length === 0 ? null : (
+          <div className={presets.length >= 4 ? "grid grid-cols-2 gap-1" : "flex gap-1"}>
+            {presets.map((preset) => {
+              const view = ENERGY_PRESETS[preset.label];
+              const Icon = view?.icon;
+              const pressed = active?.label === preset.label;
+              return (
+                <Button
+                  key={preset.label}
+                  type="button"
+                  size="sm"
+                  variant={pressed ? "secondary" : "outline"}
+                  className="min-w-0 flex-1"
+                  title={view?.title ?? preset.label}
+                  aria-pressed={pressed}
+                  onClick={() => onChange(param.key, preset.energies)}
+                >
+                  {Icon == null ? null : <Icon />}
+                  {view?.label ?? preset.label}
+                </Button>
+              );
+            })}
+          </div>
+        )}
+        <FieldDescription>{count}</FieldDescription>
+        <div className="grid max-h-52 grid-cols-2 gap-x-3 gap-y-1 overflow-y-auto">
           {catalog.map((energy) => {
             const id = `energy-${energy}`;
             const checked = selected.includes(energy);
@@ -462,8 +721,8 @@ function ParamControl({
                     onChange(param.key, next ? [...without, energy] : without);
                   }}
                 />
-                <FieldLabel className="cursor-pointer" htmlFor={id}>
-                  {energyText(energy)}
+                <FieldLabel className="cursor-pointer tabular-nums" htmlFor={id}>
+                  {String(energy)}
                 </FieldLabel>
               </Field>
             );
@@ -489,94 +748,127 @@ function ParamControl({
     );
   }
   if (param.kind === "file_path") {
-    return (
-      <Field>
-        <FieldLabel>{param.label}</FieldLabel>
-        <div className="flex gap-2">
-          <Input readOnly value={String(values[param.key] ?? "")} />
-          <Button type="button" variant="outline" onClick={onBrowse}>
-            Browse
-          </Button>
-        </div>
-      </Field>
-    );
+    return <FileField param={param} value={String(values[param.key] ?? "")} onBrowse={onBrowse} />;
   }
-  if ((param.kind === "choice" || param.kind === "button_group") && param.choices != null) {
-    if (shortChoices(param)) {
-      const current = String(values[param.key] ?? param.choices[0]?.value ?? "");
-      return (
-        <Field>
-          <FieldLabel>{param.label}</FieldLabel>
-          <ToggleGroup
-            variant="outline"
-            spacing={0}
-            size="sm"
-            className="w-full"
-            value={[current]}
-            onValueChange={(next) => {
-              const picked = next.find((item) => item !== current) ?? next[0];
-              if (picked != null) {
-                onChange(param.key, picked);
-              }
-            }}
-          >
-            {param.choices.map((choice) => (
-              <ToggleGroupItem key={choice.value} value={choice.value} className="min-w-0 flex-1 cursor-pointer">
-                {choice.label}
-              </ToggleGroupItem>
-            ))}
-          </ToggleGroup>
-        </Field>
-      );
-    }
+  if ((param.kind === "button_group" || (param.kind === "choice" && shortChoices(param))) && param.choices != null) {
+    return <SegmentField param={param} value={String(values[param.key] ?? "")} onChange={onChange} />;
+  }
+  if (param.kind === "choice" && param.choices != null) {
+    const current = String(values[param.key] ?? "");
     const items = param.choices.map((choice) => ({ value: choice.value, label: choice.label }));
+    const Icon = choiceIcon(param.choices.find((choice) => choice.value === current)?.label ?? "");
     return (
-      <Field>
-        <FieldLabel>{param.label}</FieldLabel>
+      <Field orientation="horizontal">
+        <FieldLabel className={LABEL_CLASS}>{param.label}</FieldLabel>
         <Select
           items={items}
-          value={String(values[param.key] ?? "")}
+          value={current}
           onValueChange={(next) => {
             if (next != null) {
               onChange(param.key, next);
             }
           }}
         >
-          <SelectTrigger className="w-full cursor-pointer">
+          <SelectTrigger className="w-full min-w-0 cursor-pointer">
+            {Icon == null ? null : <Icon />}
             <SelectValue />
           </SelectTrigger>
           <SelectContent>
             <SelectGroup>
-              {items.map((item) => (
-                <SelectItem key={item.value} value={item.value}>
-                  {item.label}
-                </SelectItem>
-              ))}
+              {param.choices.map((choice) => {
+                const ItemIcon = choiceIcon(choice.label);
+                return (
+                  <SelectItem key={choice.value} value={choice.value}>
+                    {ItemIcon == null ? null : <ItemIcon />}
+                    {choice.label}
+                  </SelectItem>
+                );
+              })}
             </SelectGroup>
           </SelectContent>
         </Select>
       </Field>
     );
   }
+  return null;
+}
+
+function SegmentField({
+  param,
+  value,
+  onChange,
+}: {
+  param: Param;
+  value: string;
+  onChange: (key: string, value: unknown) => void;
+}) {
+  const choices = param.choices ?? [];
+  const current = choices.some((choice) => choice.value === value) ? value : (choices[0]?.value ?? "");
+  const grid = choices.length >= 4;
+  const stacked = grid || choices.some((choice) => choice.label.length > 8);
+  const group = (
+    <ToggleGroup
+      variant="outline"
+      spacing={grid ? 2 : 0}
+      size="sm"
+      className={grid ? "grid w-full grid-cols-2" : "w-full"}
+      value={current.length === 0 ? [] : [current]}
+      onValueChange={(next) => {
+        const picked = next.find((item) => item !== current) ?? next[0];
+        if (picked != null) {
+          onChange(param.key, picked);
+        }
+      }}
+    >
+      {choices.map((choice) => {
+        const Icon = choiceIcon(choice.label);
+        return (
+          <ToggleGroupItem key={choice.value} value={choice.value} className="min-w-0 flex-1 cursor-pointer">
+            {Icon == null ? null : <Icon />}
+            {choice.label}
+          </ToggleGroupItem>
+        );
+      })}
+    </ToggleGroup>
+  );
+  if (stacked) {
+    return (
+      <Field>
+        <FieldLabel>{param.label}</FieldLabel>
+        {group}
+      </Field>
+    );
+  }
+  return (
+    <Field orientation="horizontal">
+      <FieldLabel className={LABEL_CLASS}>{param.label}</FieldLabel>
+      <div className="min-w-0 flex-1">{group}</div>
+    </Field>
+  );
+}
+
+function FileField({ param, value, onBrowse }: { param: Param; value: string; onBrowse: () => void }) {
+  const id = `plan-${param.key}`;
+  const dir = parentDir(value);
   return (
     <Field>
-      <FieldLabel>{label}</FieldLabel>
-      <div className="flex items-center gap-2">
-        <Input
-          type="number"
-          value={values[param.key] == null ? "" : String(values[param.key])}
-          min={param.minimum}
-          max={param.maximum}
-          step={param.step}
-          onChange={(event) => {
-            const next = event.target.value;
-            onChange(param.key, next === "" ? "" : Number(next));
-          }}
+      <FieldLabel htmlFor={id}>{labelParts(param.label).name}</FieldLabel>
+      <InputGroup>
+        <InputGroupInput
+          id={id}
+          readOnly
+          value={value.length === 0 ? "" : fileName(value)}
+          title={value.length === 0 ? undefined : value}
+          placeholder="No file selected"
         />
-        {param.suffix == null || param.suffix.length === 0 ? null : (
-          <span className="text-muted-foreground text-sm">{param.suffix}</span>
-        )}
-      </div>
+        <InputGroupAddon align="inline-end">
+          <InputGroupButton onClick={onBrowse}>
+            <FolderOpen />
+            Browse
+          </InputGroupButton>
+        </InputGroupAddon>
+      </InputGroup>
+      {dir.length === 0 || dir === value ? null : <FieldDescription className="truncate">{dir}</FieldDescription>}
     </Field>
   );
 }
