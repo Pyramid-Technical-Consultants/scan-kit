@@ -10,6 +10,7 @@ mod columns;
 mod config;
 mod discover;
 mod dose_view;
+mod histogram;
 mod marks;
 mod mc_tables;
 mod patient_view;

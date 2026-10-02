@@ -11,7 +11,7 @@ use scan_kit_core::{
 use serde_json::Value;
 
 use super::discover;
-use super::marks::pick;
+use super::marks::{labeled, pick};
 use super::tables::{interlock_sigma_mm, spot_table};
 
 const GUIDE: [f32; 4] = [0.62, 0.62, 0.62, 0.9];
@@ -443,27 +443,27 @@ pub fn dose_volume(
     }
 
     let mut controls = vec![
-        control("grain", "Source", GRAIN, grain),
-        control("xy", "Signal", XY, xy),
-        control("quantity", "Quantity", QUANTITY, quantity_id),
+        labeled("grain", "Source", GRAIN, grain),
+        labeled("xy", "Signal", XY, xy),
+        labeled("quantity", "Quantity", QUANTITY, quantity_id),
     ];
-    controls.push(control("model", "Model", MODEL, model));
+    controls.push(labeled("model", "Model", MODEL, model));
     if model == "analytic" {
-        controls.push(control(
+        controls.push(labeled(
             "scatter",
             "Scatter",
             SCATTER,
             if scatter { "on" } else { "off" },
         ));
     } else {
-        controls.push(control(
+        controls.push(labeled(
             "histories",
             "Histories",
             HISTORIES,
             &histories.to_string(),
         ));
     }
-    controls.push(control("spread", "Spread", SPREAD, &trim_num(spread)));
+    controls.push(labeled("spread", "Spread", SPREAD, &trim_num(spread)));
     let media: Vec<(&str, &str)> = if model == "mc" {
         MEDIA
             .iter()
@@ -473,17 +473,17 @@ pub fn dose_volume(
     } else {
         MEDIA.to_vec()
     };
-    controls.push(control("medium", "Medium", &media, medium_key));
-    controls.push(control(
+    controls.push(labeled("medium", "Medium", &media, medium_key));
+    controls.push(labeled(
         "phantom",
         "Thickness",
         PHANTOM,
         &phantom_mm.round().to_string(),
     ));
-    controls.push(control("wet", "Entrance", WET, &wet_mm.round().to_string()));
-    controls.push(control("compare", "Compare", COMPARE, compare));
+    controls.push(labeled("wet", "Entrance", WET, &wet_mm.round().to_string()));
+    controls.push(labeled("compare", "Compare", COMPARE, compare));
     if xy == "plan" || compare != "measured" {
-        controls.push(control("plan_sigma", "Plan Sigma", SIGMA, plan_sigma));
+        controls.push(labeled("plan_sigma", "Plan Sigma", SIGMA, plan_sigma));
         if session_ids.len() > 1 {
             let pairs: Vec<(String, String)> = session_ids
                 .iter()
@@ -498,17 +498,17 @@ pub fn dose_volume(
             } else {
                 refs.first().map(|(id, _)| *id).unwrap_or("")
             };
-            controls.push(control("sigma_ref", "Reference", &refs, chosen));
+            controls.push(labeled("sigma_ref", "Reference", &refs, chosen));
         }
     }
-    controls.push(control("edge", "Field Edge", EDGE, edge));
+    controls.push(labeled("edge", "Field Edge", EDGE, edge));
     if session_ids.len() <= 1 && compare != "gamma" {
         let scales = choices(if compare == "difference" {
             Family::Divergent
         } else {
             Family::Sequential
         });
-        controls.push(control("scale", "Scale", scales, scale));
+        controls.push(labeled("scale", "Scale", scales, scale));
     }
     PlotScene {
         title: "Dose Volume".into(),
@@ -1098,6 +1098,7 @@ fn slice_panel(
     Panel {
         title: title.into(),
         y_label: String::new(),
+        x_label: String::new(),
         xmin,
         xmax,
         ymin,
@@ -1113,6 +1114,7 @@ fn lines_panel(title: &str, series: Vec<Series>, y_label: &str) -> Panel {
     Panel {
         title: title.into(),
         y_label: y_label.into(),
+        x_label: String::new(),
         xmin,
         xmax,
         ymin,
@@ -1136,6 +1138,7 @@ fn note(title: &str) -> Panel {
     Panel {
         title: title.into(),
         y_label: String::new(),
+        x_label: String::new(),
         xmin: 0.0,
         xmax: 1.0,
         ymin: 0.0,
@@ -1216,24 +1219,5 @@ fn trim_num(value: f32) -> String {
         "2".into()
     } else {
         "1".into()
-    }
-}
-
-fn control(
-    id: &str,
-    label: &str,
-    pairs: &[(&str, &str)],
-    value_id: &str,
-) -> scan_kit_core::Control {
-    let value = pairs
-        .iter()
-        .find(|(id, _)| *id == value_id)
-        .map(|(_, label)| *label)
-        .unwrap_or(value_id);
-    scan_kit_core::Control {
-        id: id.into(),
-        label: label.into(),
-        options: pairs.iter().map(|(_, label)| (*label).to_owned()).collect(),
-        value: value.into(),
     }
 }

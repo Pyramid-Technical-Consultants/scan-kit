@@ -81,14 +81,23 @@ it("puts the spot source ahead of the distribution signal", () => {
     "beam",
     "ramp",
     "cutoff",
+    "ic1",
+    "ic2",
+    "plan",
+    "hist_bins",
   ]);
   expect(sections.map((section) => section.title)).toEqual([
     "Data Source",
+    "Columns",
     "Plot Style",
+    "Histogram",
     "Filter Data",
   ]);
   expect(sections[0]?.slots.map((slot) => slot.id)).toEqual(["grain", "mode"]);
-  expect(sections[1]?.slots.map((slot) => slot.id)).toEqual(["draw", "ramp", "cutoff"]);
+  expect(sections[1]?.slots.map((slot) => slot.id)).toEqual(["ic1", "ic2", "plan"]);
+  expect(sections[1]?.slots.every((slot) => slot.kind === "check")).toBe(true);
+  expect(sections[2]?.slots.map((slot) => slot.id)).toEqual(["draw", "ramp", "cutoff"]);
+  expect(sections[3]?.slots.map((slot) => slot.id)).toEqual(["hist_bins"]);
   expect(controlSections("timeslice_replay", ["channel"])[0]?.title).toBe("Data Source");
   expect(controlSections("ic_fft_analysis", ["channel"])[0]?.title).toBe("Data Source");
   expect(controlSections("ic_audio_player", ["channel"])[0]?.title).toBe("Data Source");
@@ -130,6 +139,7 @@ it("groups dose volume into source, model, phantom, compare, and color", () => {
 
 it("disables histogram bin controls until the panel is on", () => {
   expect(controlDisabled("hist_bins", { hist: "Off" })).toBe(true);
+  expect(controlDisabled("hist_bins", {})).toBe(false);
   expect(controlDisabled("shared", { hist: "On" })).toBe(false);
   expect(controlDisabled("domain", { hist: "Off" })).toBe(false);
 });

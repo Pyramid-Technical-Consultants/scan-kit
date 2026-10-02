@@ -1,6 +1,8 @@
 use std::collections::BTreeMap;
 
-use scan_kit_core::{box_stats, histogram, linear_fit, Panel, Series};
+use scan_kit_core::{box_stats, linear_fit, Panel, Series};
+
+use crate::histogram::histogram_panel;
 
 use super::*;
 
@@ -417,72 +419,16 @@ pub(super) fn hist_panel(
         .filter_map(|table| table.get(series.key).map(Vec::as_slice))
         .filter(|column| column.iter().any(|value| value.is_finite()))
         .collect();
-    let shared_edges = shared.then(|| {
-        let mut lo = f32::MAX;
-        let mut hi = f32::MIN;
-        for column in &columns {
-            for value in *column {
-                if value.is_finite() {
-                    lo = lo.min(*value);
-                    hi = hi.max(*value);
-                }
-            }
-        }
-        uniform_edges(lo, hi, bins)
-    });
-    let mut drawn = Vec::new();
-    let mut peak = 1.0f32;
-    let mut lo = f32::MAX;
-    let mut hi = f32::MIN;
-    for column in columns {
-        let (edges, counts) = if let Some(edges) = &shared_edges {
-            (edges.clone(), count_bins(edges, column))
-        } else {
-            histogram(column, bins)
-        };
-        lo = lo.min(edges.first().copied().unwrap_or(0.0));
-        hi = hi.max(edges.last().copied().unwrap_or(1.0));
-        let total = counts.iter().sum::<f32>().max(1.0);
-        let percent: Vec<f32> = counts.iter().map(|count| count / total * 100.0).collect();
-        peak = peak.max(percent.iter().copied().fold(0.0, f32::max));
-        let outline = bar_outline(&edges, &percent);
-        drawn.push(Series::Bars {
-            edges,
-            counts: percent,
-            color: [0.8, 0.8, 0.8, 0.45],
-        });
-        drawn.push(outline);
-    }
-    if position_guides
+    let guides: Vec<f32> = if position_guides
         && matches!(
             series.key,
             "ic1_x_err" | "ic1_y_err" | "ic2_x_err" | "ic2_y_err"
-        )
-    {
-        for level in [1.0, 2.0, 3.0, -1.0, -2.0, -3.0] {
-            drawn.push(Series::Guide {
-                xs: vec![level, level],
-                ys: vec![0.0, peak],
-                color: [0.45, 0.7, 0.4, 0.7],
-                thickness: 1.0,
-            });
-        }
-    }
-    if !lo.is_finite() || !hi.is_finite() || hi <= lo {
-        lo = 0.0;
-        hi = 1.0;
-    }
-    Panel {
-        title: String::new(),
-        y_label: "Probability (%)".into(),
-        xmin: lo,
-        xmax: hi,
-        ymin: 0.0,
-        ymax: peak * 1.1,
-        series: drawn,
-        x_labels: Vec::new(),
-        equal: false,
-    }
+        ) {
+        vec![1.0, 2.0, 3.0, -1.0, -2.0, -3.0]
+    } else {
+        Vec::new()
+    };
+    histogram_panel("", &columns, bins, shared, None, &guides)
 }
 
 pub(super) fn corr_panel(
@@ -531,6 +477,7 @@ pub(super) fn corr_panel(
     Panel {
         title: String::new(),
         y_label: axis_label(b.label, group_label),
+        x_label: axis_label(a.label, group_label),
         xmin,
         xmax,
         ymin,
@@ -688,6 +635,7 @@ pub(super) fn note_panel(title: &str) -> Panel {
     Panel {
         title: title.to_string(),
         y_label: String::new(),
+        x_label: String::new(),
         xmin: 0.0,
         xmax: 1.0,
         ymin: 0.0,
@@ -784,67 +732,4 @@ pub(super) fn pchip(xs: &[f32], ys: &[f32]) -> (Vec<f32>, Vec<f32>) {
     out_x.push(*xs.last().unwrap_or(&0.0));
     out_y.push(*ys.last().unwrap_or(&0.0));
     (out_x, out_y)
-}
-
-pub(super) fn uniform_edges(lo: f32, hi: f32, bins: usize) -> Vec<f32> {
-    let bins = bins.max(1);
-    let (lo, hi) = if !lo.is_finite() || !hi.is_finite() || (hi - lo).abs() < 1e-12 {
-        (lo - 0.5, (lo - 0.5) + 1.0)
-    } else {
-        (lo, hi)
-    };
-    (0..=bins)
-        .map(|step| lo + (hi - lo) * step as f32 / bins as f32)
-        .collect()
-}
-
-pub(super) fn count_bins(edges: &[f32], values: &[f32]) -> Vec<f32> {
-    let bins = edges.len().saturating_sub(1);
-    let mut counts = vec![0.0f32; bins];
-    if bins == 0 {
-        return counts;
-    }
-    let lo = edges[0];
-    let hi = edges[bins];
-    let span = hi - lo;
-    if !span.is_finite() || span <= 0.0 {
-        return counts;
-    }
-    let scale = bins as f32 / span;
-    for value in values {
-        if !value.is_finite() || *value < lo || *value > hi {
-            continue;
-        }
-        let mut index = ((*value - lo) * scale) as usize;
-        if index >= bins {
-            index = bins - 1;
-        }
-        counts[index] += 1.0;
-    }
-    counts
-}
-
-pub(super) fn bar_outline(edges: &[f32], counts: &[f32]) -> Series {
-    let mut xs = Vec::new();
-    let mut ys = Vec::new();
-    for (index, count) in counts.iter().copied().enumerate() {
-        if !count.is_finite() || count <= 0.0 {
-            continue;
-        }
-        let (Some(left), Some(right)) = (edges.get(index).copied(), edges.get(index + 1).copied())
-        else {
-            continue;
-        };
-        if !left.is_finite() || !right.is_finite() {
-            continue;
-        }
-        xs.extend([left, right, right, left, left, f32::NAN]);
-        ys.extend([0.0, 0.0, count, count, 0.0, f32::NAN]);
-    }
-    Series::Polyline {
-        xs,
-        ys,
-        color: [0.85, 0.85, 0.85, 0.0],
-        thickness: 1.0,
-    }
 }

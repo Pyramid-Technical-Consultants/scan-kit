@@ -343,6 +343,7 @@ mod tests {
         scene.panels.push(Panel {
             title: String::new(),
             y_label: String::new(),
+            x_label: String::new(),
             xmin: 0.0,
             xmax: 1.0,
             ymin: 0.0,

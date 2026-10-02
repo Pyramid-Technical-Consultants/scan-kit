@@ -382,6 +382,7 @@ fn heat(
     Panel {
         title: title.into(),
         y_label: String::new(),
+        x_label: String::new(),
         xmin: origin[0],
         xmax: origin[0] + nx as f32 * voxel,
         ymin: origin[1],
@@ -406,6 +407,7 @@ fn lines(title: &str, xs: Vec<f32>, ys: Vec<f32>) -> Panel {
     Panel {
         title: title.into(),
         y_label: "Volume".into(),
+        x_label: String::new(),
         xmin: 0.0,
         xmax: xmax.max(1.0),
         ymin: 0.0,
@@ -448,6 +450,7 @@ fn note_scene(message: &str) -> PlotScene {
         panels: vec![Panel {
             title: message.into(),
             y_label: String::new(),
+            x_label: String::new(),
             xmin: 0.0,
             xmax: 1.0,
             ymin: 0.0,

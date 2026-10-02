@@ -1,11 +1,9 @@
 use std::path::Path;
 
-use scan_kit_core::{
-    fit_iso_plane, magnet_pivot_z, Control, PlotScene, Series, IC1_Z_MM, IC2_Z_MM,
-};
+use scan_kit_core::{fit_iso_plane, magnet_pivot_z, PlotScene, Series, IC1_Z_MM, IC2_Z_MM};
 use serde_json::Value;
 
-use super::{col, drew_line, finite_col, guide, placed, scene, span, spot_table, stroke};
+use super::{col, control, drew_line, finite_col, guide, placed, scene, span, spot_table, stroke};
 
 pub(super) fn trajectory(root: &Path, session_ids: &[String], options: &Value) -> PlotScene {
     let azimuth = number_option(options, "azimuth", 0.4);
@@ -103,15 +101,6 @@ pub(super) fn trajectory(root: &Path, session_ids: &[String], options: &Value) -
             orbit,
         )],
     )
-}
-
-fn control(id: &str, label: &str, options: &[&str], value: &str) -> Control {
-    Control {
-        id: id.into(),
-        label: label.into(),
-        options: options.iter().map(|option| (*option).to_owned()).collect(),
-        value: value.into(),
-    }
 }
 
 fn plane_guide(from: (f32, f32, f32), to: (f32, f32, f32), azimuth: f32) -> Series {

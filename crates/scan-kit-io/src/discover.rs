@@ -228,6 +228,53 @@ fn walk_files(
     want: &dyn Fn(&str) -> bool,
     out: &mut Vec<(String, Vec<u8>)>,
 ) {
+    visit_files(root, dir, depth, want, &mut |name, path| {
+        if let Ok(bytes) = fs::read(path) {
+            out.push((name.to_string(), bytes));
+        }
+    });
+}
+
+/// Length and mtime of each timeslice, or of the archive itself.
+///
+/// Cheap enough to check on every load. A matching stamp means the parsed
+/// frames from last time are still the file.
+///
+/// ponytail: metadata only, so a same-size rewrite in the same timestamp tick
+/// is missed. Hash a prefix if that shows up.
+pub fn timeslice_stamp(storage: &Path) -> u128 {
+    if storage.is_file() {
+        return meta_stamp(storage);
+    }
+    let mut stamp = 0x9e3779b97f4a7c15u128;
+    let mut count = 0u128;
+    visit_files(storage, storage, 0, &is_timeslice, &mut |_name, path| {
+        count += 1;
+        stamp ^= meta_stamp(path).wrapping_mul(count | 1);
+    });
+    stamp ^ count.rotate_left(17)
+}
+
+pub(crate) fn meta_stamp(path: &Path) -> u128 {
+    let Ok(meta) = fs::metadata(path) else {
+        return 0;
+    };
+    let ns = meta
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|time| time.as_nanos())
+        .unwrap_or(0);
+    ns ^ u128::from(meta.len())
+}
+
+fn visit_files(
+    root: &Path,
+    dir: &Path,
+    depth: u8,
+    want: &dyn Fn(&str) -> bool,
+    visit: &mut dyn FnMut(&str, &Path),
+) {
     if depth > 6 {
         return;
     }
@@ -239,7 +286,7 @@ fn walk_files(
     for child in children {
         let path = child.path();
         if path.is_dir() {
-            walk_files(root, &path, depth + 1, want, out);
+            visit_files(root, &path, depth + 1, want, visit);
         } else if path.is_file() {
             let name = path
                 .strip_prefix(root)
@@ -247,9 +294,7 @@ fn walk_files(
                 .to_string_lossy()
                 .replace('\\', "/");
             if want(&name) {
-                if let Ok(bytes) = fs::read(&path) {
-                    out.push((name, bytes));
-                }
+                visit(&name, &path);
             }
         }
     }

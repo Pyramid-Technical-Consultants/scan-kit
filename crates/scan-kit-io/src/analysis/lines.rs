@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use scan_kit_core::{
     beam_on_mask, calibration_factor, cumsum, histogram, scale_column, spill_segments, PlotScene,
@@ -8,7 +8,7 @@ use scan_kit_core::{
 use serde_json::Value;
 
 use super::{
-    apply_filter, col, discover, drew_line, energy_lookup, finite_col, guide, labeled, load_csv,
+    apply_filter, col, drew_line, energy_lookup, finite_col, guide, labeled, load_csv,
     load_timeslice, panel, pick, placed, scene, slice_table, spot_table, stroke, timeslice_metric,
     LINKED, MARK,
 };
@@ -173,10 +173,6 @@ pub(super) fn beam_motion(root: &Path, session_ids: &[String]) -> PlotScene {
         .map(|(key, series)| placed(format!("{:.0} MeV", key as f32 / 10.0), series))
         .collect();
     scene("Beam Error Motion vs Energy", panels, Vec::new())
-}
-
-pub(super) fn session_dir(root: &Path, session_id: &str) -> PathBuf {
-    discover::session_directory(root, session_id)
 }
 
 struct Motion {

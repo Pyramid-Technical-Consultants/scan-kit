@@ -8,7 +8,9 @@ use scan_kit_core::{resolve_concept_column, Control, Panel, PlotScene, Series};
 use serde_json::{json, Value};
 
 pub(super) use super::discover;
-pub(super) use super::marks::{apply_filter, contour_bands, labeled, pick, BEAM_CHOICES};
+pub(super) use super::marks::{
+    apply_filter, contour_bands, control, flag, labeled, pick, pick_in, text, BEAM_CHOICES,
+};
 pub(super) use super::tables::{slice_table, spot_table, timeslice_metric, timeslice_signals};
 mod distribution;
 mod lines;
@@ -112,6 +114,7 @@ fn panel(title: String, xmin: f32, xmax: f32, ymin: f32, ymax: f32, series: Vec<
     Panel {
         title,
         y_label: String::new(),
+        x_label: String::new(),
         xmin,
         xmax,
         ymin,
@@ -178,16 +181,7 @@ fn load_csv(root: &Path, session_id: &str, name: &str) -> BTreeMap<String, Vec<f
 }
 
 fn load_timeslice(root: &Path, session_id: &str) -> BTreeMap<String, Vec<f32>> {
-    let mut merged: BTreeMap<String, Vec<f32>> = BTreeMap::new();
-    for bytes in discover::read_timeslices(&lines::session_dir(root, session_id)) {
-        let Ok(frame) = numeric_columns(&bytes) else {
-            continue;
-        };
-        for (name, values) in frame {
-            merged.entry(name).or_default().extend(values);
-        }
-    }
-    merged
+    super::tables::merged_timeslice(root, session_id)
 }
 
 fn energy_lookup(root: &Path, session_id: &str) -> Vec<f32> {
@@ -323,12 +317,12 @@ fn channel_pairs_of(tables: &[BTreeMap<String, Vec<f32>>]) -> Vec<(String, Strin
 }
 
 fn choose(options: &Value, key: &str, default_id: &str, pairs: &[(String, String)]) -> String {
-    let raw = options
-        .get(key)
-        .and_then(Value::as_str)
-        .unwrap_or(default_id);
-    if let Some((id, _)) = pairs.iter().find(|(id, label)| id == raw || label == raw) {
-        return id.clone();
+    let refs: Vec<(&str, &str)> = pairs
+        .iter()
+        .map(|(id, label)| (id.as_str(), label.as_str()))
+        .collect();
+    if let Some(id) = pick_in(options, key, &refs) {
+        return id.to_owned();
     }
     if pairs.iter().any(|(id, _)| id == default_id) {
         default_id.to_owned()
@@ -341,17 +335,11 @@ fn choose(options: &Value, key: &str, default_id: &str, pairs: &[(String, String
 }
 
 fn choice_control(id: &str, label: &str, pairs: &[(String, String)], current: &str) -> Control {
-    let value = pairs
+    let refs: Vec<(&str, &str)> = pairs
         .iter()
-        .find(|(key, _)| key == current)
-        .map(|(_, label)| label.clone())
-        .unwrap_or_else(|| current.to_owned());
-    Control {
-        id: id.to_owned(),
-        label: label.to_owned(),
-        options: pairs.iter().map(|(_, label)| label.clone()).collect(),
-        value,
-    }
+        .map(|(id, label)| (id.as_str(), label.as_str()))
+        .collect();
+    labeled(id, label, &refs, current)
 }
 
 fn percentile_sorted(values: &[f32], p: f32) -> f32 {
@@ -526,18 +514,34 @@ mod tests {
         assert!(has_kind(&scene, "points"));
         assert!(has_kind(&scene, "bars"));
         assert_eq!(scene.row_weights, vec![2.0, 1.0, 1.0]);
-        assert!(scene
-            .panels
-            .iter()
-            .any(|panel| panel.title == "X Position (mm)"));
-        assert!(scene
-            .panels
-            .iter()
-            .any(|panel| panel.title == "Y Position (mm)"));
+        assert!(scene.panels.iter().any(|panel| {
+            panel.equal
+                && panel.title.is_empty()
+                && panel.x_label == "Plan X (mm)"
+                && panel.y_label == "Plan Y (mm)"
+        }));
+        assert!(scene.panels.iter().any(|panel| {
+            !panel.equal
+                && panel.x_label == "Plan X (mm)"
+                && panel.y_label == "Probability (%)"
+                && panel
+                    .series
+                    .iter()
+                    .any(|series| matches!(series, Series::Polyline { .. }))
+        }));
+        assert!(scene.controls.iter().any(|control| control.id == "mode"
+            && control.label == "XY"
+            && control.value == "Position"
+            && control.options.iter().any(|option| option == "Amplifier")
+            && control.options.iter().any(|option| option == "Probe")));
         assert!(scene
             .controls
             .iter()
-            .any(|control| control.id == "mode" && control.value == "Position"));
+            .any(|control| control.id == "hist_bins" && control.value == "30"));
+        assert!(scene
+            .controls
+            .iter()
+            .any(|control| control.id == "plan" && control.value == "On"));
         assert!(scene
             .controls
             .iter()
@@ -552,11 +556,36 @@ mod tests {
             .any(|control| control.id == "grain" && control.value == "Spot"));
         assert!(scene.controls.iter().any(|control| control.id == "draw"
             && control.options.iter().any(|option| option == "Contour")));
+        let root = std::env::temp_dir().join(format!("scan-kit-plan-first-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let session = root.join("sess");
+        std::fs::create_dir_all(&session).unwrap();
+        std::fs::write(
+            session.join("input_map.csv"),
+            "energy,charge_req,position_x,position_y\n70,1,0,0\n",
+        )
+        .unwrap();
+        std::fs::write(
+            session.join("spot_data.csv"),
+            "ic1_x_spot,ic1_y_spot,ic2_x_spot,ic2_y_spot\n1,2,3,4\n",
+        )
+        .unwrap();
+        let ordered = analysis_scene("distribution", &root, &["sess".into()], &json!({})).unwrap();
+        let labels: Vec<_> = ordered
+            .panels
+            .iter()
+            .filter(|panel| panel.equal)
+            .map(|panel| panel.x_label.as_str())
+            .collect();
+        assert_eq!(labels, ["Plan X (mm)", "IC1 X (mm)", "IC2 X (mm)"]);
+        let _ = std::fs::remove_dir_all(&root);
         assert!(scene
             .panels
             .iter()
-            .filter(|panel| panel.y_label.is_empty())
-            .all(|panel| panel.equal));
+            .filter(|panel| panel.equal)
+            .all(|panel| {
+                panel.title.is_empty() && !panel.x_label.is_empty() && !panel.y_label.is_empty()
+            }));
     }
 
     #[test]
@@ -564,6 +593,58 @@ mod tests {
         let (lo, hi) = distribution_limits("position", &[0.0, 10.0, 0.0, 10.0]);
         assert!((lo - -0.6).abs() < 1.0e-3, "{lo}");
         assert!((hi - 10.6).abs() < 1.0e-3, "{hi}");
+    }
+
+    #[test]
+    fn amplifier_and_probe_are_xy_clouds() {
+        let root = std::env::temp_dir().join(format!("scan-kit-amp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let session = root.join("sess");
+        std::fs::create_dir_all(&session).unwrap();
+        std::fs::write(session.join("input_map.csv"), "energy\n70\n").unwrap();
+        std::fs::write(
+            session.join("000_timeslice_data_device_units.csv"),
+            "rci_in_trigger,field_x,field_y,c_x,c_y,r_xV,r_yV\n1,0.1,0.2,1,2,1.2,2.4\n1,0.3,0.4,1,2,1.1,2.3\n",
+        )
+        .unwrap();
+        let probe = analysis_scene(
+            "distribution",
+            &root,
+            &["sess".into()],
+            &json!({"mode": "Probe"}),
+        )
+        .unwrap();
+        assert!(probe
+            .panels
+            .iter()
+            .any(|panel| { panel.equal && panel.x_label == "X (G)" && panel.y_label == "Y (G)" }));
+        assert!(probe
+            .controls
+            .iter()
+            .all(|control| control.id != "grain" && control.id != "ic1" && control.id != "plan"));
+        assert!(probe
+            .controls
+            .iter()
+            .any(|control| control.id == "beam" && control.value == "Beam On"));
+        let amplifier = analysis_scene(
+            "distribution",
+            &root,
+            &["sess".into()],
+            &json!({"mode": "Amplifier"}),
+        )
+        .unwrap();
+        assert!(amplifier.panels.iter().any(|panel| {
+            panel.equal && panel.x_label == "X Error (V)" && panel.y_label == "Y Error (V)"
+        }));
+        assert!(amplifier.panels.iter().any(|panel| {
+            !panel.equal
+                && panel.x_label == "X Error (V)"
+                && panel
+                    .series
+                    .iter()
+                    .any(|series| matches!(series, Series::Bars { .. }))
+        }));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -596,11 +677,7 @@ mod tests {
             &json!({"draw": "Density"}),
         )
         .unwrap();
-        let tops: Vec<_> = scene
-            .panels
-            .iter()
-            .filter(|panel| panel.y_label.is_empty())
-            .collect();
+        let tops: Vec<_> = scene.panels.iter().filter(|panel| panel.equal).collect();
         assert_eq!(scene.columns as usize, tops.len());
         assert!(tops.iter().all(|panel| panel.equal));
         assert!(tops.iter().all(|panel| !panel.title.contains("sess")));
@@ -612,14 +689,29 @@ mod tests {
                 .count()
                 == 2
         }));
-        assert_eq!(
-            scene
-                .panels
-                .iter()
-                .filter(|panel| panel.title == "X Position (mm)")
-                .count(),
-            1
-        );
+        assert!(scene.panels.iter().any(|panel| {
+            !panel.equal
+                && panel.x_label.ends_with("X (mm)")
+                && panel
+                    .series
+                    .iter()
+                    .any(|series| matches!(series, Series::Bars { .. }))
+                && panel
+                    .series
+                    .iter()
+                    .any(|series| matches!(series, Series::Polyline { .. }))
+        }));
+        let planned = analysis_scene(
+            "distribution",
+            &root,
+            &["sess".into(), "sess-b".into()],
+            &json!({"draw": "Density", "plan": "Off"}),
+        )
+        .unwrap();
+        assert!(planned
+            .panels
+            .iter()
+            .all(|panel| panel.x_label != "Plan X (mm)"));
         assert!(scene.controls.iter().all(|control| control.id != "ramp"));
         let one = analysis_scene(
             "distribution",

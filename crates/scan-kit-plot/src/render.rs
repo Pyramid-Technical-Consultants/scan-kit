@@ -781,7 +781,13 @@ impl Plot {
                 } else {
                     6.0
                 };
-                let bottom = font.line_height + 10.0;
+                let bottom = font.line_height
+                    + 10.0
+                    + if panel.x_label.is_empty() {
+                        0.0
+                    } else {
+                        font.line_height + 4.0
+                    };
                 let mut plot = snap_plot(PlotRect {
                     x: cell.x + left,
                     y: cell.y + top,
@@ -1156,6 +1162,7 @@ pub(crate) fn header_panels(panels: &[Panel]) -> Vec<Panel> {
         .map(|panel| Panel {
             title: panel.title.clone(),
             y_label: panel.y_label.clone(),
+            x_label: panel.x_label.clone(),
             xmin: panel.xmin,
             xmax: panel.xmax,
             ymin: panel.ymin,
@@ -1895,7 +1902,28 @@ fn labels_for(panel: &Panel, camera: &Camera, cell: &Cell, color: [f32; 4]) -> V
             );
         }
     }
+    if !panel.x_label.is_empty() {
+        push_text(
+            &mut out,
+            &panel.x_label,
+            [
+                cell.plot.x + cell.plot.w * 0.5,
+                x_axis_name_y(&cell.plot),
+                0.0,
+            ],
+            0.0,
+            0.5,
+            [0.0, ink_center_shift(&panel.x_label)],
+            color,
+        );
+    }
     out
+}
+
+/// Screen y of the x-axis name, centered in the band under the tick labels.
+fn x_axis_name_y(plot: &PlotRect) -> f32 {
+    let font = atlas();
+    plot.y + plot.h + font.line_height + 10.0 + font.line_height * 0.5
 }
 
 fn push_text(
@@ -2750,6 +2778,7 @@ mod tests {
             panels: vec![Panel {
                 title: String::new(),
                 y_label: String::new(),
+                x_label: String::new(),
                 xmin: 0.0,
                 xmax: 10.0,
                 ymin: 0.0,
@@ -2895,6 +2924,7 @@ mod tests {
             panels: vec![Panel {
                 title: String::new(),
                 y_label: String::new(),
+                x_label: String::new(),
                 xmin: 0.0,
                 xmax: 10.0,
                 ymin: 0.0,
@@ -2960,6 +2990,7 @@ mod tests {
         scene.panels.push(Panel {
             title: "heat".into(),
             y_label: String::new(),
+            x_label: String::new(),
             xmin: 0.0,
             xmax: 1.0,
             ymin: 0.0,
@@ -3051,6 +3082,7 @@ mod tests {
         scene.panels.push(Panel {
             title: String::new(),
             y_label: "Probability (%)".into(),
+            x_label: String::new(),
             xmin: 0.0,
             xmax: 10.0,
             ymin: 0.0,
@@ -3107,6 +3139,7 @@ mod tests {
         let panel = Panel {
             title: "IC1 X".into(),
             y_label: "IC1 X (mm)".into(),
+            x_label: String::new(),
             xmin: 0.0,
             xmax: 10.0,
             ymin: -10.0,
@@ -3158,6 +3191,62 @@ mod tests {
         assert!(turned
             .iter()
             .all(|glyph| (glyph.anchor[0] - name_x).abs() < 0.01));
+    }
+
+    #[test]
+    fn x_axis_name_sits_under_the_ticks() {
+        let mut panel = Panel {
+            title: String::new(),
+            y_label: "Y (mm)".into(),
+            x_label: "X (mm)".into(),
+            xmin: 0.0,
+            xmax: 10.0,
+            ymin: 0.0,
+            ymax: 10.0,
+            series: Vec::new(),
+            x_labels: Vec::new(),
+            equal: false,
+        };
+        let camera = Camera::new(0.0, 10.0, 0.0, 10.0);
+        let cell = Cell {
+            cell: PlotRect {
+                x: 8.0,
+                y: 4.0,
+                w: 180.0,
+                h: 140.0,
+            },
+            plot: PlotRect {
+                x: 70.0,
+                y: 16.0,
+                w: 100.0,
+                h: 100.0,
+            },
+            panel: 0,
+        };
+        let glyphs = labels_for(&panel, &camera, &cell, [1.0, 1.0, 1.0, 1.0]);
+        let center = cell.plot.x + cell.plot.w * 0.5;
+        let named: Vec<_> = glyphs
+            .iter()
+            .filter(|glyph| {
+                glyph.anchor[2] < 0.5
+                    && glyph.anchor[3] < 0.5
+                    && (glyph.anchor[0] - center).abs() < 0.01
+            })
+            .collect();
+        assert!(!named.is_empty(), "the x label should be centered");
+        assert!((named[0].anchor[1] - x_axis_name_y(&cell.plot)).abs() < 0.01);
+        assert!(named[0].anchor[1] > cell.plot.y + cell.plot.h + atlas().line_height);
+
+        let mut scene = line_scene();
+        let bare = Plot::new(&scene, [0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0, 1.0]).layout(200, 160);
+        panel.series = scene.panels[0].series.clone();
+        scene.panels[0] = panel;
+        let named_layout =
+            Plot::new(&scene, [0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0, 1.0]).layout(200, 160);
+        assert!(
+            named_layout[0].plot.h + 8.0 < bare[0].plot.h,
+            "x label should take a line under the ticks"
+        );
     }
 
     #[test]

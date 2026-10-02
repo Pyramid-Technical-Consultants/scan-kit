@@ -68,6 +68,9 @@ pub struct Panel {
     pub title: String,
     /// Quantity drawn up the left side, including units when the series has them.
     pub y_label: String,
+    /// Quantity drawn under the tick labels, including units.
+    #[serde(default)]
+    pub x_label: String,
     pub xmin: f32,
     pub xmax: f32,
     pub ymin: f32,

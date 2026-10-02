@@ -1002,6 +1002,7 @@ fn assemble_panel(
     Panel {
         title: item.label.clone(),
         y_label: item.y_label.clone(),
+        x_label: String::new(),
         xmin: prepared.xmin,
         xmax: prepared.xmax,
         ymin: item.ymin,

@@ -61,12 +61,24 @@ const SECTIONS: Record<string, ControlSection[]> = {
       ],
     },
     {
+      title: "Columns",
+      slots: [
+        { id: "ic1", kind: "check" },
+        { id: "ic2", kind: "check" },
+        { id: "plan", kind: "check" },
+      ],
+    },
+    {
       title: "Plot Style",
       slots: [
         { id: "draw", kind: "select" },
         { id: "ramp", kind: "select" },
         { id: "cutoff", kind: "select", label: "Contour Cutoff" },
       ],
+    },
+    {
+      title: "Histogram",
+      slots: [{ id: "hist_bins", kind: "select", label: "Bins" }],
     },
     { title: "Filter Data", slots: [{ id: "beam", kind: "select" }] },
   ],
@@ -148,5 +160,5 @@ export { segmentChoices } from "@/CatalogField";
 
 /** Histogram bins follow the show-panel checkbox. X bins apply to every axis. */
 export function controlDisabled(id: string, values: Readonly<Record<string, string>>): boolean {
-  return (id === "hist_bins" || id === "shared") && values.hist !== "On";
+  return (id === "hist_bins" || id === "shared") && values.hist != null && values.hist !== "On";
 }
