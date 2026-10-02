@@ -14,16 +14,6 @@ use super::{
     timeslice_metric, BEAM_CHOICES, MARK,
 };
 
-const MODE_CHOICES: &[(&str, &str)] = &[
-    ("position", "Position"),
-    ("position_error", "Position Error"),
-    ("sigma", "Sigma"),
-    ("amplifier", "Amplifier"),
-    ("probe", "Probe"),
-    ("confidence", "Confidence"),
-    ("coverage", "Coverage"),
-];
-const GRAIN_CHOICES: &[(&str, &str)] = &[("spot", "Spot"), ("timeslice", "Timeslice")];
 const DRAW_CHOICES: &[(&str, &str)] = &[
     ("scatter", "Scatter"),
     ("contour", "Contour"),
@@ -33,8 +23,23 @@ const CUTOFF_CHOICES: &[(&str, &str)] = &[("0", "0"), ("5", "5"), ("10", "10"), 
 const DENSITY_BINS: usize = 80;
 
 pub(super) fn distribution(root: &Path, session_ids: &[String], options: &Value) -> PlotScene {
-    let mode = pick(options, "mode", "position", MODE_CHOICES);
-    let grain = pick(options, "grain", "spot", GRAIN_CHOICES);
+    let timeslice = crate::source::wants_timeslice(crate::source::Shape::Xy, options);
+    let owned: Vec<(String, Vec<String>)> = session_ids
+        .iter()
+        .map(|id| {
+            (
+                id.clone(),
+                crate::tables::grain_columns(root, id, timeslice),
+            )
+        })
+        .collect();
+    let headers: Vec<crate::source::SessionCols<'_>> = owned
+        .iter()
+        .map(|(name, columns)| crate::source::SessionCols { name, columns })
+        .collect();
+    let picked = crate::source::select(crate::source::Shape::Xy, true, true, &headers, options);
+    let mode = picked.xy;
+    let grain = picked.grain;
     let beam = pick(
         options,
         "beam",
@@ -84,46 +89,52 @@ pub(super) fn distribution(root: &Path, session_ids: &[String], options: &Value)
             bins,
         )
     };
-    let mut controls = Vec::new();
+    let mut controls = picked.controls;
     if chambers {
-        controls.push(labeled("grain", "Source", GRAIN_CHOICES, grain));
-    }
-    controls.push(labeled("mode", "XY", MODE_CHOICES, mode));
-    if chambers {
-        controls.push(control("ic1", "IC1", &["Off", "On"], on_off(show_ic1)));
-        controls.push(control("ic2", "IC2", &["Off", "On"], on_off(show_ic2)));
+        controls.push(
+            control("ic1", "IC1", &["Off", "On"], on_off(show_ic1))
+                .grouped("Data Source")
+                .checked(),
+        );
+        controls.push(
+            control("ic2", "IC2", &["Off", "On"], on_off(show_ic2))
+                .grouped("Data Source")
+                .checked(),
+        );
         if mode == "position" && has_plan {
-            controls.push(control("plan", "Plan", &["Off", "On"], on_off(show_plan)));
+            controls.push(
+                control("plan", "Plan", &["Off", "On"], on_off(show_plan))
+                    .grouped("Data Source")
+                    .checked(),
+            );
         }
     }
     if mode != "coverage" {
-        controls.push(labeled("draw", "Style", DRAW_CHOICES, draw));
+        controls.push(labeled("draw", "Style", DRAW_CHOICES, draw).grouped("Plot Style"));
         if draw == "density" && session_ids.len() == 1 {
-            controls.push(labeled(
-                "ramp",
-                "Ramp",
-                scan_kit_core::choices(Family::Sequential),
-                ramp,
-            ));
+            controls.push(
+                labeled(
+                    "ramp",
+                    "Ramp",
+                    scan_kit_core::choices(Family::Sequential),
+                    ramp,
+                )
+                .grouped("Plot Style"),
+            );
         }
         if draw == "contour" {
-            controls.push(labeled(
-                "cutoff",
-                "Contour Cutoff",
-                CUTOFF_CHOICES,
-                cutoff_id,
-            ));
+            controls.push(
+                labeled("cutoff", "Contour Cutoff", CUTOFF_CHOICES, cutoff_id)
+                    .grouped("Plot Style"),
+            );
         }
     }
     if cloud {
-        controls.push(control(
-            "hist_bins",
-            "Bins",
-            HIST_BIN_CHOICES,
-            &bins.to_string(),
-        ));
+        controls.push(
+            control("hist_bins", "Bins", HIST_BIN_CHOICES, &bins.to_string()).grouped("Histogram"),
+        );
     }
-    controls.push(labeled("beam", "Beam", BEAM_CHOICES, beam));
+    controls.push(labeled("beam", "Beam", BEAM_CHOICES, beam).grouped("Filter Data"));
     let mut scene = scene("Distribution Explorer", panels, controls);
     scene.columns = columns;
     if columns > 0 && scene.panels.len() == columns as usize * 3 {

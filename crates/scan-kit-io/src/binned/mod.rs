@@ -7,9 +7,7 @@ use scan_kit_core::{assign_bin_centers, quantile_edges, Control, Panel, PlotScen
 use serde_json::Value;
 
 use super::discover;
-use super::marks::{
-    apply_filter, contour_bands, control, flag, labeled, pick, pick_in, text, BEAM_CHOICES,
-};
+use super::marks::{apply_filter, contour_bands, control, flag, labeled, pick, text, BEAM_CHOICES};
 mod glyphs;
 
 use super::tables::{
@@ -338,28 +336,6 @@ const GROUPS: &[YGroup] = &[
     },
 ];
 
-const METRIC_CHOICES: &[(&str, &str)] = &[
-    ("dose_error", "Dose Error (%)"),
-    ("dose_ratio", "Dose Ratios"),
-    ("dose_rate", "Dose Rate (MU/s)"),
-    ("current_ratio", "Current Ratios (%)"),
-    ("ic_current", "IC Current (nA)"),
-    ("fit_confidence", "Fit Confidence"),
-    ("peak_amplitude", "Peak Amplitude"),
-    ("amplifier_error", "Amplifier Error (V)"),
-    ("probe_field", "Probe Field (G)"),
-    ("position_error", "Position Error (mm)"),
-    ("sigma", "Sigma (mm)"),
-    ("sigma_error", "Sigma Error (mm)"),
-    ("ic12_pos_diff", "IC2-IC1 Position (mm)"),
-    ("spot_time", "Spot Delivery Time"),
-];
-const X_CHOICES: &[(&str, &str)] = &[
-    ("energy", "Energy"),
-    ("target_mu", "Target MU"),
-    ("spot_time", "Spot time"),
-    ("radius", "Radius"),
-];
 const GLYPH_CHOICES: &[(&str, &str)] = &[
     ("violin", "Violin"),
     ("box", "Box"),
@@ -373,11 +349,6 @@ const SOURCE_CHOICES: &[(&str, &str)] = &[
     ("timeslice_iso", "Timeslice — Isocenter"),
     ("timeslice_chamber", "Timeslice — Chamber"),
 ];
-/// Spot vs timeslice, then isocenter vs chamber when a metric has both.
-/// Same split as the Python granularity control (`GRANULARITY_SOURCES`).
-const COARSE_CHOICES: &[(&str, &str)] = &[("spot", "Spot"), ("timeslice", "Timeslice")];
-const FRAME_CHOICES: &[(&str, &str)] = &[("iso", "Isocenter"), ("chamber", "Chamber")];
-
 fn sources_for(metric: &str) -> &'static [(&'static str, &'static str)] {
     match metric {
         "current_ratio" | "ic_current" | "fit_confidence" | "peak_amplitude"
@@ -404,108 +375,6 @@ fn frame_of(source: &str) -> &'static str {
     }
 }
 
-struct YChoice {
-    metric: &'static str,
-    frame: &'static str,
-    label: String,
-}
-
-/// One Y row per metric. Isocenter and chamber are extra rows when both exist.
-fn y_choices(coarse: &str) -> Vec<YChoice> {
-    let mut choices = Vec::new();
-    for &(metric, base) in METRIC_CHOICES {
-        let frames = frames_for(metric, coarse);
-        if frames.is_empty() {
-            continue;
-        }
-        let qualify = frames.len() > 1;
-        for (frame, frame_label) in frames {
-            let label = if qualify {
-                format!("{base} ({frame_label})")
-            } else {
-                base.to_string()
-            };
-            choices.push(YChoice {
-                metric,
-                frame,
-                label,
-            });
-        }
-    }
-    choices
-}
-
-fn split_frame_suffix(raw: &str) -> (&str, Option<&'static str>) {
-    if let Some(bare) = raw.strip_suffix(" (Chamber)") {
-        (bare, Some("chamber"))
-    } else if let Some(bare) = raw.strip_suffix(" (Isocenter)") {
-        (bare, Some("iso"))
-    } else {
-        (raw, None)
-    }
-}
-
-fn metric_label(id: &str) -> &str {
-    METRIC_CHOICES
-        .iter()
-        .find(|(key, _)| *key == id)
-        .map(|(_, label)| *label)
-        .unwrap_or(id)
-}
-
-fn resolve_y(
-    choices: &[YChoice],
-    options: &Value,
-    concrete: Option<&str>,
-) -> (&'static str, &'static str) {
-    let Some(raw) = options.get("metric").and_then(Value::as_str) else {
-        return choices
-            .iter()
-            .find(|choice| choice.metric == "dose_error")
-            .or_else(|| choices.first())
-            .map(|choice| (choice.metric, choice.frame))
-            .unwrap_or(("dose_error", "iso"));
-    };
-    if let Some(exact) = choices.iter().find(|choice| choice.label == raw) {
-        return (exact.metric, exact.frame);
-    }
-    let (bare, suffix_frame) = split_frame_suffix(raw);
-    let frame_hint = suffix_frame
-        .or_else(|| pick_in(options, "frame", FRAME_CHOICES))
-        .or_else(|| concrete.map(frame_of));
-    let hits: Vec<_> = choices
-        .iter()
-        .filter(|choice| {
-            choice.metric == raw || choice.metric == bare || metric_label(choice.metric) == bare
-        })
-        .collect();
-    if let Some(frame) = frame_hint {
-        if let Some(hit) = hits.iter().find(|choice| choice.frame == frame) {
-            return (hit.metric, hit.frame);
-        }
-    }
-    hits.first()
-        .map(|choice| (choice.metric, choice.frame))
-        .unwrap_or((
-            choices
-                .first()
-                .map(|choice| choice.metric)
-                .unwrap_or("dose_error"),
-            choices.first().map(|choice| choice.frame).unwrap_or("iso"),
-        ))
-}
-
-fn frames_for(metric: &str, coarse: &str) -> Vec<(&'static str, &'static str)> {
-    FRAME_CHOICES
-        .iter()
-        .copied()
-        .filter(|(frame, _)| {
-            sources_for(metric)
-                .iter()
-                .any(|(source, _)| coarse_of(source) == coarse && frame_of(source) == *frame)
-        })
-        .collect()
-}
 const DOMAIN_CHOICES: &[(&str, &str)] = &[
     ("all", "All"),
     ("lower_95", "Lower 95%"),
@@ -639,26 +508,34 @@ fn mtime_ns(path: &Path) -> u128 {
 }
 
 pub(crate) fn binned_summary(root: &Path, session_ids: &[String], options: &Value) -> PlotScene {
-    let metric_hint = pick(options, "metric", "dose_error", METRIC_CHOICES);
-    let concrete = options
-        .get("source")
-        .and_then(Value::as_str)
-        .and_then(|raw| {
-            SOURCE_CHOICES
-                .iter()
-                .find(|(id, label)| *id == raw || *label == raw)
-                .map(|(id, _)| *id)
-        });
-    let coarse = pick_in(options, "source", COARSE_CHOICES)
-        .or_else(|| concrete.map(coarse_of))
-        .unwrap_or_else(|| coarse_of(sources_for(metric_hint)[0].0));
-    let y_opts = y_choices(coarse);
-    let (metric, frame) = resolve_y(&y_opts, options, concrete);
+    let timeslice = crate::source::wants_timeslice(crate::source::Shape::YAndX, options);
+    let owned: Vec<(String, Vec<String>)> = session_ids
+        .iter()
+        .map(|id| {
+            (
+                id.clone(),
+                super::tables::grain_columns(root, id, timeslice),
+            )
+        })
+        .collect();
+    let headers: Vec<crate::source::SessionCols<'_>> = owned
+        .iter()
+        .map(|(name, columns)| crate::source::SessionCols { name, columns })
+        .collect();
+    let picked = crate::source::select(crate::source::Shape::YAndX, true, true, &headers, options);
+    let crate::source::Picked {
+        y,
+        frame,
+        x: x_id,
+        grain: coarse,
+        controls: source_controls,
+        ..
+    } = picked;
+    let metric = y.as_str();
     let group = GROUPS
         .iter()
         .find(|group| group.id == metric)
         .unwrap_or(&GROUPS[0]);
-    let x_id = pick(options, "x", "energy", X_CHOICES);
     let glyph = pick(options, "glyph", "violin", GLYPH_CHOICES);
     let beam_default = if coarse == "timeslice" {
         "beam_on"
@@ -890,10 +767,10 @@ pub(crate) fn binned_summary(root: &Path, session_ids: &[String], options: &Valu
         title: format!("{} vs {}", group.label, x_label(x_column)),
         panels,
         controls: controls(
+            source_controls,
             group.id,
             x_id,
             glyph,
-            source,
             beam,
             domain,
             trend,
@@ -1066,10 +943,10 @@ fn x_label(column: &str) -> &'static str {
 
 #[allow(clippy::too_many_arguments)]
 fn controls(
+    mut controls: Vec<Control>,
     metric: &str,
     x: &str,
     glyph: &str,
-    source: &str,
     beam: &str,
     domain: &str,
     trend: Trend,
@@ -1082,58 +959,68 @@ fn controls(
     cutoff: f32,
 ) -> Vec<Control> {
     let on = |value: bool| if value { "On" } else { "Off" };
-    let coarse = coarse_of(source);
-    let frame = frame_of(source);
-    let y_opts = y_choices(coarse);
-    let y_labels: Vec<&str> = y_opts.iter().map(|choice| choice.label.as_str()).collect();
-    let y_value = y_opts
-        .iter()
-        .find(|choice| choice.metric == metric && choice.frame == frame)
-        .map(|choice| choice.label.as_str())
-        .unwrap_or(y_labels.first().copied().unwrap_or(metric));
-    let slice_x = matches!(source, "timeslice_iso" | "timeslice_chamber")
-        && (timeslice_energy_only(metric)
-            || matches!(
-                metric,
-                "position_error" | "sigma" | "sigma_error" | "ic12_pos_diff"
-            ));
-    let x_choices: &[(&str, &str)] = if slice_x { &X_CHOICES[..1] } else { X_CHOICES };
-    let mut controls = vec![
-        labeled("source", "Source", COARSE_CHOICES, coarse),
-        control("metric", "Y", &y_labels, y_value),
-        labeled("x", "X", x_choices, x),
-        labeled("glyph", "Glyph", GLYPH_CHOICES, glyph),
-        labeled("beam", "Beam", BEAM_CHOICES, beam),
-        labeled("domain", "Domain", DOMAIN_CHOICES, domain),
+    controls.push(
+        control("bins", "Bins", &["Automatic", "8", "16", "32", "64"], bins).grouped("Data Source"),
+    );
+    controls.push(labeled("glyph", "Glyph", GLYPH_CHOICES, glyph).grouped("Plot Style"));
+    controls.push(
         control(
             "trend",
             "Trend",
             &["Off", "Linear", "Polynomial"],
             trend_value(trend),
-        ),
-        control("hist", "Histogram", &["Off", "On"], on(hist)),
-        control("corr", "Correlation", &["Off", "On"], on(corr)),
+        )
+        .grouped("Plot Style"),
+    );
+    controls.push(
         control(
             "interlock",
             "Interlock Thresholds",
             &["Off", "On"],
             on(interlock),
-        ),
-        control("bins", "Bins", &["Automatic", "8", "16", "32", "64"], bins),
-        control(
-            "hist_bins",
-            "Histogram Bins",
-            &["10", "20", "30", "50"],
-            &hist_bins.to_string(),
-        ),
-        control("shared", "Shared Bins", &["Off", "On"], on(shared)),
+        )
+        .grouped("Plot Style"),
+    );
+    controls.push(
         control(
             "cutoff",
             "Contour Cutoff",
             &["0", "5", "10", "20"],
             &cutoff.round().to_string(),
-        ),
-    ];
+        )
+        .grouped("Plot Style"),
+    );
+    controls.push(
+        control("hist", "Show Panel", &["Off", "On"], on(hist))
+            .grouped("Histogram")
+            .checked(),
+    );
+    controls.push(
+        control(
+            "hist_bins",
+            "Bins",
+            &["10", "20", "30", "50"],
+            &hist_bins.to_string(),
+        )
+        .grouped("Histogram"),
+    );
+    controls.push(
+        control(
+            "shared",
+            "Share Bin Edges Across Rows",
+            &["Off", "On"],
+            on(shared),
+        )
+        .grouped("Histogram")
+        .checked(),
+    );
+    controls.push(
+        control("corr", "Show Panel", &["Off", "On"], on(corr))
+            .grouped("Correlation")
+            .checked(),
+    );
+    controls.push(labeled("domain", "Domain", DOMAIN_CHOICES, domain).grouped("Filter Data"));
+    controls.push(labeled("beam", "Beam", BEAM_CHOICES, beam).grouped("Filter Data"));
     let filters = GROUPS
         .iter()
         .any(|group| group.id == metric && group.filter);
@@ -1813,16 +1700,13 @@ mod tests {
             .iter()
             .find(|control| control.id == "source")
             .unwrap();
-        assert_eq!(
-            source.options,
-            vec!["Spot".to_string(), "Timeslice".to_string()]
-        );
+        assert_eq!(source.labels(), vec!["Spot", "Timeslice"]);
         assert_eq!(source.value, "Spot");
         assert!(spot.controls.iter().all(|control| control.id != "frame"));
         let metric = spot
             .controls
             .iter()
-            .find(|control| control.id == "metric")
+            .find(|control| control.id == "y")
             .unwrap();
         assert_eq!(metric.value, "Dose Error (%)");
         assert!(metric
@@ -1847,30 +1731,14 @@ mod tests {
             .find(|control| control.id == "bins")
             .unwrap();
         assert_eq!(bins.value, "Automatic");
-        assert_eq!(
-            bins.options,
-            vec![
-                "Automatic".to_string(),
-                "8".to_string(),
-                "16".to_string(),
-                "32".to_string(),
-                "64".to_string()
-            ]
-        );
+        assert_eq!(bins.labels(), vec!["Automatic", "8", "16", "32", "64"]);
         let trend = spot
             .controls
             .iter()
             .find(|control| control.id == "trend")
             .unwrap();
         assert_eq!(trend.value, "Off");
-        assert_eq!(
-            trend.options,
-            vec![
-                "Off".to_string(),
-                "Linear".to_string(),
-                "Polynomial".to_string()
-            ]
-        );
+        assert_eq!(trend.labels(), vec!["Off", "Linear", "Polynomial"]);
         assert!(spot.controls.iter().all(|control| control.id != "fliers"));
         assert!(spot.controls.iter().all(|control| control.id != "cutoff"));
         let position = binned_summary(
@@ -1885,7 +1753,7 @@ mod tests {
             .unwrap();
         assert_eq!(interlock.label, "Interlock Thresholds");
         assert_eq!(interlock.value, "Off");
-        assert_eq!(interlock.options, vec!["Off".to_string(), "On".to_string()]);
+        assert_eq!(interlock.labels(), vec!["Off", "On"]);
 
         let switched = binned_summary(
             std::path::Path::new("."),
@@ -1895,7 +1763,7 @@ mod tests {
         let metric = switched
             .controls
             .iter()
-            .find(|control| control.id == "metric")
+            .find(|control| control.id == "y")
             .unwrap();
         assert_eq!(metric.value, "Current Ratios (%)");
         for label in [
@@ -1920,8 +1788,8 @@ mod tests {
             .iter()
             .find(|control| control.id == "x")
             .unwrap();
-        assert_eq!(x.value, "Energy");
-        assert_eq!(x.options, vec!["Energy".to_string()]);
+        assert_eq!(x.value, "Energy (MeV)");
+        assert_eq!(x.labels(), vec!["Energy (MeV)"]);
         assert!(metric
             .options
             .iter()
@@ -1944,7 +1812,7 @@ mod tests {
             position
                 .controls
                 .iter()
-                .find(|control| control.id == "metric")
+                .find(|control| control.id == "y")
                 .unwrap()
                 .value,
             "Position Error (mm) (Chamber)"
@@ -1962,7 +1830,7 @@ mod tests {
             slice
                 .controls
                 .iter()
-                .find(|control| control.id == "metric")
+                .find(|control| control.id == "y")
                 .unwrap()
                 .value,
             "Position Error (mm)"
@@ -2152,27 +2020,15 @@ mod tests {
             .find(|control| control.id == "beam")
             .unwrap();
         assert_eq!(beam.value, "Both");
-        assert_eq!(
-            beam.options,
-            vec![
-                "Beam On".to_string(),
-                "Beam Off".to_string(),
-                "Both".to_string()
-            ]
-        );
+        assert_eq!(beam.labels(), vec!["Beam On", "Beam Off", "Both"]);
         let domain = dose
             .controls
             .iter()
             .find(|control| control.id == "domain")
             .unwrap();
         assert_eq!(
-            domain.options,
-            vec![
-                "All".to_string(),
-                "Lower 95%".to_string(),
-                "Upper 5%".to_string(),
-                "MAD Outliers".to_string()
-            ]
+            domain.labels(),
+            vec!["All", "Lower 95%", "Upper 5%", "MAD Outliers"]
         );
         let current = binned_summary(
             std::path::Path::new("."),

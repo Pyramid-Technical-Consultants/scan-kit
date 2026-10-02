@@ -33,8 +33,8 @@ pub use plan::{
     ImportSpot, PlanDocument, PlanSource,
 };
 pub use plot::{
-    apply_clip, format_tick, map_span, project, ticks, Camera, Control, DataTable, Panel, PlotRect,
-    PlotScene, Series,
+    apply_clip, format_tick, map_span, project, ticks, Camera, Choice, Control, DataTable, Panel,
+    PlotRect, PlotScene, Series,
 };
 pub use ramp::{choices, index, is_session, resolve, sample, session, Family, SESSION, VIRIDIS};
 pub use runner::{

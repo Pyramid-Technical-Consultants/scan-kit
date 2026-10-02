@@ -16,11 +16,17 @@ vi.mock("@tauri-apps/api/core", () => ({
       ? {
           title: "Distribution",
           controls: [
-            { id: "grain", label: "Source", options: ["Spot", "Timeslice"], value: "Spot" },
-            { id: "mode", label: "XY", options: ["Position"], value: "Position" },
-            { id: "ic1", label: "IC1", options: ["Off", "On"], value: "On" },
-            { id: "ic2", label: "IC2", options: ["Off", "On"], value: "Off" },
-            { id: "plan", label: "Plan", options: ["Off", "On"], value: "On" },
+            { id: "source", label: "Source", group: "Data Source", options: ["Spot", "Timeslice"], value: "Spot" },
+            {
+              id: "xy",
+              label: "XY",
+              group: "Data Source",
+              options: [{ id: "position", label: "Position (mm)", detail: "Chamber or plan", icon: "position" }],
+              value: "Position (mm)",
+            },
+            { id: "ic1", label: "IC1", group: "Data Source", kind: "check", options: ["Off", "On"], value: "On" },
+            { id: "ic2", label: "IC2", group: "Data Source", kind: "check", options: ["Off", "On"], value: "Off" },
+            { id: "plan", label: "Plan", group: "Data Source", kind: "check", options: ["Off", "On"], value: "On" },
           ],
           table: null,
           samples: [],
@@ -29,13 +35,19 @@ vi.mock("@tauri-apps/api/core", () => ({
       : {
           title: "Dose Ratios vs Energy",
           controls: [
-            { id: "metric", label: "Y", options: ["Dose Ratios"], value: "Dose Ratios" },
-            { id: "source", label: "Source", options: ["Spot", "Timeslice"], value: "Spot" },
-            { id: "x", label: "X", options: ["Energy", "Target MU", "Spot time", "Radius"], value: "Energy" },
-            { id: "bins", label: "Bins", options: ["Automatic", "8", "16", "32", "64"], value: "Automatic" },
-            { id: "domain", label: "Domain", options: ["All", "Lower 95%", "Upper 5%", "MAD Outliers"], value: "All" },
-            { id: "beam", label: "Beam", options: ["Beam On", "Beam Off", "Both"], value: "Beam On" },
-            { id: "trend", label: "Trend", options: ["Off", "Linear", "Polynomial"], value: "Off" },
+            { id: "source", label: "Source", group: "Data Source", options: ["Spot", "Timeslice"], value: "Spot" },
+            {
+              id: "y",
+              label: "Y",
+              group: "Data Source",
+              options: [{ id: "dose_ratio", label: "Dose Ratios", detail: "Chambers over each other", icon: "dose_ratio" }],
+              value: "Dose Ratios",
+            },
+            { id: "x", label: "X", group: "Data Source", options: ["Energy", "Target MU", "Spot time", "Radius"], value: "Energy" },
+            { id: "bins", label: "Bins", group: "Data Source", options: ["Automatic", "8", "16", "32", "64"], value: "Automatic" },
+            { id: "trend", label: "Trend", group: "Plot Style", options: ["Off", "Linear", "Polynomial"], value: "Off" },
+            { id: "domain", label: "Domain", group: "Filter Data", options: ["All", "Lower 95%", "Upper 5%", "MAD Outliers"], value: "All" },
+            { id: "beam", label: "Beam", group: "Filter Data", options: ["Beam On", "Beam Off", "Both"], value: "Beam On" },
           ],
           table: null,
           samples: [],
@@ -117,6 +129,7 @@ it("puts grouped controls on the right and returns to sessions", async () => {
   expect(host.querySelector("h2")).toBeNull();
   expect(host.textContent).not.toContain("Presets");
   expect(host.textContent).not.toContain("Dose Ratios vs Energy");
+  expect(host.textContent).toContain("Chambers over each other");
 
   const shell = host.firstElementChild;
   const plot = shell?.children[0];
@@ -255,15 +268,18 @@ it("lays distribution columns in plot order on one row with icons", async () => 
   await act(async () => {
     await new Promise((resolve) => setTimeout(resolve, 200));
   });
-  const columns = [...host.querySelectorAll("fieldset")].find(
-    (node) => node.querySelector("legend")?.textContent === "Columns",
+  const source = [...host.querySelectorAll("fieldset")].find(
+    (node) => node.querySelector("legend")?.textContent === "Data Source",
   );
-  const row = columns?.querySelector(":scope > div");
+  expect(source?.textContent).toContain("Chamber or plan");
+  const row = [...(source?.querySelectorAll(":scope > div") ?? [])].find(
+    (node) => node.querySelectorAll("[data-slot='checkbox']").length === 3,
+  );
   expect(row?.className).toContain("flex-row");
   const labels = [...(row?.querySelectorAll("label") ?? [])].map((node) => node.textContent?.trim());
-  expect(labels).toEqual(["Plan", "IC1", "IC2"]);
+  expect(labels).toEqual(["IC1", "IC2", "Plan"]);
   expect(row?.querySelector(".lucide-target")).not.toBeNull();
   expect(row?.querySelectorAll(".lucide-zap").length).toBe(2);
   const checks = [...(row?.querySelectorAll("[data-slot='checkbox']") ?? [])];
-  expect(checks.map((node) => node.getAttribute("aria-checked"))).toEqual(["true", "true", "false"]);
+  expect(checks.map((node) => node.getAttribute("aria-checked"))).toEqual(["true", "false", "true"]);
 });

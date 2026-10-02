@@ -8,9 +8,8 @@ use scan_kit_core::{
 use serde_json::Value;
 
 use super::{
-    channel_pairs_of, choice_control, choose, col, drew_line, finite_col, load_csv, panel,
-    percentile_sorted, placed, scene, session_text, span, spot_table, stroke, timeline,
-    timeslice_metric, MARK,
+    col, drew_line, finite_col, finite_names, load_csv, panel, percentile_sorted, placed, scene,
+    session_text, span, spot_table, stroke, timeline, timeslice_metric, MARK,
 };
 
 /// Timeslice rows are 1 ms apart.
@@ -18,13 +17,14 @@ const SAMPLE_S: f32 = 0.001;
 
 pub(super) fn replay(root: &Path, session_ids: &[String], options: &Value) -> PlotScene {
     let tables = timeline(root, session_ids);
-    let pairs = channel_pairs_of(&tables);
-    let channel = choose(options, "channel", "ic1_current", &pairs);
-    let label = pairs
+    let owned = finite_names(session_ids, &tables);
+    let headers: Vec<crate::source::SessionCols<'_>> = owned
         .iter()
-        .find(|(id, _)| id == &channel)
-        .map(|(_, label)| label.clone())
-        .unwrap_or_else(|| channel.clone());
+        .map(|(name, columns)| crate::source::SessionCols { name, columns })
+        .collect();
+    let picked = crate::source::select(crate::source::Shape::Y, false, true, &headers, options);
+    let channel = picked.y.clone();
+    let label = crate::source::channel_text(&channel);
     let mut overview = Vec::new();
     let mut detail = Vec::new();
     let mut xmax = SAMPLE_S;
@@ -56,11 +56,7 @@ pub(super) fn replay(root: &Path, session_ids: &[String], options: &Value) -> Pl
         panels.push(time_panel("Overview", overview, xmax, ymin, ymax, &label));
         panels.push(time_panel("Detail", detail, xmax, ymin, ymax, &label));
     }
-    let mut scene = scene(
-        "Timeslice Replay",
-        panels,
-        vec![choice_control("channel", "Channel", &pairs, &channel)],
-    );
+    let mut scene = scene("Timeslice Replay", panels, picked.controls);
     scene.columns = 1;
     scene
 }

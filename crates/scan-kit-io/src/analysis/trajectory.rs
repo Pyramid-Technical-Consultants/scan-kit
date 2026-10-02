@@ -94,12 +94,7 @@ pub(super) fn trajectory(root: &Path, session_ids: &[String], options: &Value) -
     scene(
         "IC Beam Trajectory",
         panels,
-        vec![control(
-            "azimuth",
-            "Orbit",
-            &["0.2", "0.4", "0.8", "1.2"],
-            orbit,
-        )],
+        vec![control("azimuth", "Orbit", &["0.2", "0.4", "0.8", "1.2"], orbit).grouped("Display")],
     )
 }
 

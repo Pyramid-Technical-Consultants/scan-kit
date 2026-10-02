@@ -291,12 +291,7 @@ pub(crate) fn labeled(id: &str, label: &str, pairs: &[(&str, &str)], current: &s
 }
 
 pub(crate) fn control(id: &str, label: &str, options: &[&str], value: &str) -> Control {
-    Control {
-        id: id.to_string(),
-        label: label.to_string(),
-        options: options.iter().map(|option| (*option).to_string()).collect(),
-        value: value.to_string(),
-    }
+    Control::plain(id, label, options.iter().copied(), value)
 }
 
 pub(crate) fn apply_filter(

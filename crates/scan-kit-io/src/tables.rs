@@ -1460,6 +1460,157 @@ pub(crate) fn load_timeslice(
     )
 }
 
+/// Column names from the first line of the files for one grain.
+///
+/// The body stays unread. The picker uses these names and does not open a file.
+///
+/// ponytail: 32 header lists. A repeat plot (glyph, bins, filter) stats the same
+/// files and skips the directory walk. A changed length or mtime reads the line
+/// again. A timeslice file that is not there yet is not cached, so the next
+/// call still looks.
+const HEADER_CACHE_CAP: usize = 32;
+
+#[derive(Hash, PartialEq, Eq)]
+struct HeaderKey {
+    dir: PathBuf,
+    timeslice: bool,
+}
+
+struct HeaderEntry {
+    watched: Vec<(PathBuf, u128)>,
+    columns: Vec<String>,
+}
+
+fn header_cache() -> &'static Mutex<HashMap<HeaderKey, HeaderEntry>> {
+    static CACHE: OnceLock<Mutex<HashMap<HeaderKey, HeaderEntry>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub(crate) fn grain_columns(root: &Path, session: &str, timeslice: bool) -> Vec<String> {
+    let dir = discover::session_directory(root, session);
+    let key = HeaderKey {
+        dir: dir.clone(),
+        timeslice,
+    };
+    if let Some(hit) = header_cache()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .get(&key)
+    {
+        if hit
+            .watched
+            .iter()
+            .all(|(path, stamp)| discover::meta_stamp(path) == *stamp)
+        {
+            return hit.columns.clone();
+        }
+    }
+    let (columns, watched, cacheable) = read_grain_headers(&dir, timeslice);
+    if cacheable {
+        let mut cache = header_cache().lock().unwrap_or_else(|err| err.into_inner());
+        if cache.len() >= HEADER_CACHE_CAP {
+            cache.clear();
+        }
+        cache.insert(
+            key,
+            HeaderEntry {
+                watched,
+                columns: columns.clone(),
+            },
+        );
+    }
+    columns
+}
+
+fn read_grain_headers(dir: &Path, timeslice: bool) -> (Vec<String>, Vec<(PathBuf, u128)>, bool) {
+    let mut names = Vec::new();
+    let mut watched = Vec::new();
+    let mut cacheable = true;
+    if timeslice {
+        if let Some(path) = first_named(dir, |name| {
+            name.ends_with("timeslice_data_device_units.csv")
+        }) {
+            names.extend(header_columns(&path));
+            watched.push(watch(&path));
+        } else {
+            cacheable = false;
+        }
+    } else {
+        let path = dir.join("spot_data.csv");
+        names.extend(header_columns(&path));
+        watched.push(watch(&path));
+    }
+    let map = dir.join("input_map.csv");
+    names.extend(header_columns(&map));
+    watched.push(watch(&map));
+    (names, watched, cacheable)
+}
+
+fn watch(path: &Path) -> (PathBuf, u128) {
+    let stamp = discover::meta_stamp(path);
+    (path.to_path_buf(), stamp)
+}
+
+fn header_columns(path: &Path) -> Vec<String> {
+    let Ok(file) = std::fs::File::open(path) else {
+        return Vec::new();
+    };
+    let mut line = String::new();
+    let Ok(read) = std::io::BufRead::read_line(&mut std::io::BufReader::new(file), &mut line)
+    else {
+        return Vec::new();
+    };
+    if read == 0 {
+        return Vec::new();
+    }
+    let line = line.trim_end_matches(['\r', '\n']);
+    let mut names = Vec::new();
+    let mut cursor = 0usize;
+    while let Some((start, end, next)) = next_cell(line, cursor) {
+        if next <= cursor {
+            break;
+        }
+        let name = cell_owned(line, start, end);
+        if !name.is_empty() {
+            names.push(name);
+        }
+        cursor = next;
+    }
+    names
+}
+
+fn first_named(dir: &Path, pred: impl Fn(&str) -> bool) -> Option<PathBuf> {
+    fn walk(dir: &Path, pred: &impl Fn(&str) -> bool, depth: u8) -> Option<PathBuf> {
+        let mut files = Vec::new();
+        let mut dirs = Vec::new();
+        for entry in std::fs::read_dir(dir).ok()?.flatten() {
+            let path = entry.path();
+            if path.is_file() {
+                files.push(path);
+            } else if path.is_dir() && depth < 4 {
+                dirs.push(path);
+            }
+        }
+        files.sort();
+        for path in files {
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            if pred(name) {
+                return Some(path);
+            }
+        }
+        dirs.sort();
+        for child in dirs {
+            if let Some(found) = walk(&child, pred, depth + 1) {
+                return Some(found);
+            }
+        }
+        None
+    }
+    walk(dir, &pred, 0)
+}
+
 pub(crate) fn timeslice_energy_only(metric: &str) -> bool {
     matches!(
         metric,
@@ -2551,6 +2702,29 @@ mod tests {
             merged_timeslice(&root, "sess")["r_ic1_current_dose"],
             vec![4.0, 5.0]
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_rewritten_header_is_read_again() {
+        let root = std::env::temp_dir().join(format!(
+            "scan-kit-header-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let session = root.join("sess");
+        std::fs::create_dir_all(&session).unwrap();
+        let spot = session.join("spot_data.csv");
+        std::fs::write(&spot, "energy,ic1_total_dose\n").unwrap();
+        let first = grain_columns(&root, "sess", false);
+        assert!(first.iter().any(|name| name == "energy"));
+        assert!(first.iter().all(|name| name != "r_ic1_x_spot_sigma"));
+        std::fs::write(&spot, "energy,ic1_total_dose,r_ic1_x_spot_sigma\n").unwrap();
+        let second = grain_columns(&root, "sess", false);
+        assert!(second.iter().any(|name| name == "r_ic1_x_spot_sigma"));
         let _ = std::fs::remove_dir_all(&root);
     }
 }

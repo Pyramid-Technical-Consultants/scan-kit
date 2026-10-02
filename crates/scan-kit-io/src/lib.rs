@@ -16,6 +16,7 @@ mod mc_tables;
 mod patient_view;
 mod phantom;
 mod runner;
+mod source;
 mod store;
 mod synthesis;
 mod tables;

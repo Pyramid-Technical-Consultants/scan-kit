@@ -2,25 +2,25 @@ import { expect, it } from "vitest";
 
 import { controlDisabled, controlSections, segmentChoices } from "./analysis-controls";
 
-const BINNED_IDS = [
-  "metric",
-  "source",
-  "x",
-  "glyph",
-  "beam",
-  "domain",
-  "trend",
-  "hist",
-  "corr",
-  "interlock",
-  "bins",
-  "hist_bins",
-  "shared",
-  "cutoff",
+const BINNED = [
+  { id: "source", group: "Data Source" },
+  { id: "y", group: "Data Source" },
+  { id: "x", group: "Data Source" },
+  { id: "bins", group: "Data Source" },
+  { id: "glyph", group: "Plot Style" },
+  { id: "trend", group: "Plot Style" },
+  { id: "interlock", group: "Plot Style" },
+  { id: "cutoff", group: "Plot Style" },
+  { id: "hist", group: "Histogram", kind: "check" },
+  { id: "hist_bins", group: "Histogram" },
+  { id: "shared", group: "Histogram", kind: "check" },
+  { id: "corr", group: "Correlation", kind: "check" },
+  { id: "domain", group: "Filter Data" },
+  { id: "beam", group: "Filter Data" },
 ];
 
-it("groups binned summary controls", () => {
-  const sections = controlSections("binned_summary", BINNED_IDS);
+it("groups binned summary controls in plot order", () => {
+  const sections = controlSections(BINNED);
   expect(sections.map((section) => section.title)).toEqual([
     "Data Source",
     "Plot Style",
@@ -28,27 +28,11 @@ it("groups binned summary controls", () => {
     "Correlation",
     "Filter Data",
   ]);
-  expect(sections.flatMap((section) => section.slots.map((slot) => slot.id))).toEqual([
-    "source",
-    "metric",
-    "x",
-    "bins",
-    "glyph",
-    "trend",
-    "cutoff",
-    "interlock",
-    "hist",
-    "hist_bins",
-    "shared",
-    "corr",
-    "domain",
-    "beam",
-  ]);
-  expect(sections[1]?.slots.find((slot) => slot.id === "trend")?.label).toBe("Trend");
-  expect(sections[1]?.slots.find((slot) => slot.id === "interlock")?.label).toBe(
-    "Interlock Thresholds",
+  expect(sections.flatMap((section) => section.slots.map((slot) => slot.id))).toEqual(
+    BINNED.map((control) => control.id),
   );
-  expect(sections[1]?.slots.some((slot) => slot.id === "fliers")).toBe(false);
+  expect(sections[2]?.slots.find((slot) => slot.id === "hist")?.kind).toBe("check");
+  expect(sections[1]?.slots.find((slot) => slot.id === "interlock")?.kind).toBe("select");
 });
 
 it("keeps a joined button row for two or three short names", () => {
@@ -62,68 +46,79 @@ it("keeps a joined button row for two or three short names", () => {
   expect(segmentChoices(["Violin", "Box", "Mean", "Scatter", "Contour"])).toBe(false);
   expect(segmentChoices(["Spot — Isocenter", "Spot — Chamber"])).toBe(false);
   expect(segmentChoices(["Energy"])).toBe(false);
+  expect(
+    segmentChoices([
+      { label: "Spot", detail: "One row per spot" },
+      { label: "Timeslice", detail: "One row per millisecond" },
+    ]),
+  ).toBe(false);
 });
 
-it("drops controls the view did not send and parks unknown ones in Options", () => {
-  const sections = controlSections("binned_summary", ["metric", "x", "glyph", "azimuth"]);
+it("parks a control with no group in Options", () => {
+  const sections = controlSections([
+    { id: "y", group: "Data Source" },
+    { id: "x", group: "Data Source" },
+    { id: "glyph", group: "Plot Style" },
+    { id: "azimuth" },
+  ]);
   expect(sections.map((section) => [section.title, section.slots.map((slot) => slot.id)])).toEqual([
-    ["Data Source", ["metric", "x"]],
+    ["Data Source", ["y", "x"]],
     ["Plot Style", ["glyph"]],
     ["Options", ["azimuth"]],
   ]);
 });
 
-it("puts the spot source ahead of the distribution signal", () => {
-  const sections = controlSections("distribution", [
-    "mode",
-    "grain",
-    "draw",
-    "beam",
-    "ramp",
-    "cutoff",
-    "ic1",
-    "ic2",
-    "plan",
-    "hist_bins",
+it("keeps distribution checks in Data Source after the axes", () => {
+  const sections = controlSections([
+    { id: "source", group: "Data Source" },
+    { id: "xy", group: "Data Source" },
+    { id: "ic1", group: "Data Source", kind: "check" },
+    { id: "ic2", group: "Data Source", kind: "check" },
+    { id: "plan", group: "Data Source", kind: "check" },
+    { id: "draw", group: "Plot Style" },
+    { id: "ramp", group: "Plot Style" },
+    { id: "cutoff", group: "Plot Style" },
+    { id: "hist_bins", group: "Histogram" },
+    { id: "beam", group: "Filter Data" },
   ]);
   expect(sections.map((section) => section.title)).toEqual([
     "Data Source",
-    "Columns",
     "Plot Style",
     "Histogram",
     "Filter Data",
   ]);
-  expect(sections[0]?.slots.map((slot) => slot.id)).toEqual(["grain", "mode"]);
-  expect(sections[1]?.inline).toBe(true);
-  expect(sections[1]?.slots.map((slot) => slot.id)).toEqual(["plan", "ic1", "ic2"]);
-  expect(sections[1]?.slots.every((slot) => slot.kind === "check")).toBe(true);
-  expect(sections[2]?.slots.map((slot) => slot.id)).toEqual(["draw", "ramp", "cutoff"]);
-  expect(sections[3]?.slots.map((slot) => slot.id)).toEqual(["hist_bins"]);
-  expect(controlSections("timeslice_replay", ["channel"])[0]?.title).toBe("Data Source");
-  expect(controlSections("ic_fft_analysis", ["channel"])[0]?.title).toBe("Data Source");
-  expect(controlSections("ic_audio_player", ["channel"])[0]?.title).toBe("Data Source");
+  expect(sections[0]?.slots.map((slot) => slot.id)).toEqual(["source", "xy", "ic1", "ic2", "plan"]);
+  expect(sections[0]?.slots.filter((slot) => slot.kind === "check").map((slot) => slot.id)).toEqual([
+    "ic1",
+    "ic2",
+    "plan",
+  ]);
+  expect(sections[1]?.slots.map((slot) => slot.id)).toEqual(["draw", "ramp", "cutoff"]);
+  expect(sections[2]?.slots.map((slot) => slot.id)).toEqual(["hist_bins"]);
+  expect(controlSections([{ id: "y", group: "Data Source" }])[0]?.title).toBe("Data Source");
 });
 
-it("uses one Options group when the view has no sidebar map", () => {
-  expect(controlSections("session_log_compare", ["calibrate"])).toEqual([
+it("uses one Options group when the control names no fieldset", () => {
+  expect(controlSections([{ id: "calibrate", kind: "select" }])).toEqual([
     { title: "Options", slots: [{ id: "calibrate", kind: "select" }] },
   ]);
 });
 
 it("groups dose volume into source, model, phantom, compare, and color", () => {
-  const sections = controlSections("dose_volume", [
-    "grain",
-    "xy",
-    "quantity",
-    "model",
-    "scatter",
-    "spread",
-    "medium",
-    "phantom",
-    "wet",
-    "compare",
-    "edge",
-    "scale",
+  const sections = controlSections([
+    { id: "source", group: "Data Source" },
+    { id: "xy", group: "Data Source" },
+    { id: "quantity", group: "Data Source" },
+    { id: "plan_sigma", group: "Data Source" },
+    { id: "model", group: "Model" },
+    { id: "scatter", group: "Model" },
+    { id: "spread", group: "Model" },
+    { id: "medium", group: "Phantom" },
+    { id: "phantom", group: "Phantom" },
+    { id: "wet", group: "Phantom" },
+    { id: "compare", group: "Compare" },
+    { id: "edge", group: "Compare" },
+    { id: "scale", group: "Color" },
   ]);
   expect(sections.map((section) => section.title)).toEqual([
     "Data Source",
@@ -132,9 +127,14 @@ it("groups dose volume into source, model, phantom, compare, and color", () => {
     "Compare",
     "Color",
   ]);
-  expect(sections[0]?.slots.map((slot) => slot.id)).toEqual(["grain", "xy", "quantity"]);
+  expect(sections[0]?.slots.map((slot) => slot.id)).toEqual([
+    "source",
+    "xy",
+    "quantity",
+    "plan_sigma",
+  ]);
   expect(sections[4]?.slots.map((slot) => slot.id)).toEqual(["scale"]);
-  const withCt = controlSections("dose_volume", ["fraction"]);
+  const withCt = controlSections([{ id: "fraction", group: "Patient" }]);
   expect(withCt.map((section) => section.title)).toEqual(["Patient"]);
 });
 

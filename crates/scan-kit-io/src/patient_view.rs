@@ -203,12 +203,8 @@ pub(crate) fn scene(
         panels,
         controls: vec![
             history_control(histories),
-            scan_kit_core::Control {
-                id: "fraction".into(),
-                label: "Fraction".into(),
-                options: names,
-                value: fraction.into(),
-            },
+            scan_kit_core::Control::plain("fraction", "Fraction", &names, fraction)
+                .grouped("Patient"),
         ],
         table: Some(DataTable {
             columns: vec!["Item".into(), "Value".into()],
@@ -436,12 +432,13 @@ fn history_control(histories: u32) -> scan_kit_core::Control {
         .find(|(key, _)| *key == id)
         .map(|(_, label)| *label)
         .unwrap_or("1e7");
-    scan_kit_core::Control {
-        id: "histories".into(),
-        label: "Histories".into(),
-        options: PAIRS.iter().map(|(_, label)| (*label).to_owned()).collect(),
-        value: value.into(),
-    }
+    scan_kit_core::Control::plain(
+        "histories",
+        "Histories",
+        PAIRS.iter().map(|(_, label)| *label),
+        value,
+    )
+    .grouped("Model")
 }
 
 fn note_scene(message: &str) -> PlotScene {

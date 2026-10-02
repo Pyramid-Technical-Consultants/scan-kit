@@ -21,7 +21,6 @@ const FALLBACK_KMU: f32 = 2.0e-8;
 const GAP_MM: f32 = 10.0;
 const MC_SEED: u32 = 1;
 
-const GRAIN: &[(&str, &str)] = &[("spot", "Spot"), ("timeslice", "Timeslice")];
 const XY: &[(&str, &str)] = &[
     ("ic1", "IC1"),
     ("ic2", "IC2"),
@@ -92,7 +91,8 @@ pub fn dose_volume(
             return super::patient_view::scene(root, session_ids, options, mc);
         }
     }
-    let grain = pick(options, "grain", "spot", GRAIN);
+    let picked = crate::source::select(crate::source::Shape::Source, true, true, &[], options);
+    let grain = picked.grain;
     let xy = pick(options, "xy", "ic1", XY);
     let quantity_id = pick(options, "quantity", "dose", QUANTITY);
     let quantity = match quantity_id {
@@ -442,48 +442,12 @@ pub fn dose_volume(
         }
     }
 
-    let mut controls = vec![
-        labeled("grain", "Source", GRAIN, grain),
-        labeled("xy", "Signal", XY, xy),
-        labeled("quantity", "Quantity", QUANTITY, quantity_id),
-    ];
-    controls.push(labeled("model", "Model", MODEL, model));
-    if model == "analytic" {
-        controls.push(labeled(
-            "scatter",
-            "Scatter",
-            SCATTER,
-            if scatter { "on" } else { "off" },
-        ));
-    } else {
-        controls.push(labeled(
-            "histories",
-            "Histories",
-            HISTORIES,
-            &histories.to_string(),
-        ));
-    }
-    controls.push(labeled("spread", "Spread", SPREAD, &trim_num(spread)));
-    let media: Vec<(&str, &str)> = if model == "mc" {
-        MEDIA
-            .iter()
-            .copied()
-            .filter(|(id, _)| MC_MEDIA.contains(id))
-            .collect()
-    } else {
-        MEDIA.to_vec()
-    };
-    controls.push(labeled("medium", "Medium", &media, medium_key));
-    controls.push(labeled(
-        "phantom",
-        "Thickness",
-        PHANTOM,
-        &phantom_mm.round().to_string(),
-    ));
-    controls.push(labeled("wet", "Entrance", WET, &wet_mm.round().to_string()));
-    controls.push(labeled("compare", "Compare", COMPARE, compare));
+    let mut controls = picked.controls;
+    controls.push(labeled("xy", "Signal", XY, xy).grouped("Data Source"));
+    controls.push(labeled("quantity", "Quantity", QUANTITY, quantity_id).grouped("Data Source"));
     if xy == "plan" || compare != "measured" {
-        controls.push(labeled("plan_sigma", "Plan Sigma", SIGMA, plan_sigma));
+        controls
+            .push(labeled("plan_sigma", "Plan Sigma", SIGMA, plan_sigma).grouped("Data Source"));
         if session_ids.len() > 1 {
             let pairs: Vec<(String, String)> = session_ids
                 .iter()
@@ -498,17 +462,55 @@ pub fn dose_volume(
             } else {
                 refs.first().map(|(id, _)| *id).unwrap_or("")
             };
-            controls.push(labeled("sigma_ref", "Reference", &refs, chosen));
+            controls.push(labeled("sigma_ref", "Reference", &refs, chosen).grouped("Data Source"));
         }
     }
-    controls.push(labeled("edge", "Field Edge", EDGE, edge));
+    controls.push(labeled("model", "Model", MODEL, model).grouped("Model"));
+    if model == "analytic" {
+        controls.push(
+            labeled(
+                "scatter",
+                "Scatter",
+                SCATTER,
+                if scatter { "on" } else { "off" },
+            )
+            .grouped("Model"),
+        );
+    } else {
+        controls.push(
+            labeled("histories", "Histories", HISTORIES, &histories.to_string()).grouped("Model"),
+        );
+    }
+    controls.push(labeled("spread", "Spread", SPREAD, &trim_num(spread)).grouped("Model"));
+    let media: Vec<(&str, &str)> = if model == "mc" {
+        MEDIA
+            .iter()
+            .copied()
+            .filter(|(id, _)| MC_MEDIA.contains(id))
+            .collect()
+    } else {
+        MEDIA.to_vec()
+    };
+    controls.push(labeled("medium", "Medium", &media, medium_key).grouped("Phantom"));
+    controls.push(
+        labeled(
+            "phantom",
+            "Thickness",
+            PHANTOM,
+            &phantom_mm.round().to_string(),
+        )
+        .grouped("Phantom"),
+    );
+    controls.push(labeled("wet", "Entrance", WET, &wet_mm.round().to_string()).grouped("Phantom"));
+    controls.push(labeled("compare", "Compare", COMPARE, compare).grouped("Compare"));
+    controls.push(labeled("edge", "Field Edge", EDGE, edge).grouped("Compare"));
     if session_ids.len() <= 1 && compare != "gamma" {
         let scales = choices(if compare == "difference" {
             Family::Divergent
         } else {
             Family::Sequential
         });
-        controls.push(labeled("scale", "Scale", scales, scale));
+        controls.push(labeled("scale", "Scale", scales, scale).grouped("Color"));
     }
     PlotScene {
         title: "Dose Volume".into(),

@@ -1,7 +1,7 @@
 //! Analysis view workflows. Each one loads columns and returns a plot scene.
 //! Pixels are rendered later by `scan-kit-compute`.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use scan_kit_core::{resolve_concept_column, Control, Panel, PlotScene, Series};
@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 
 pub(super) use super::discover;
 pub(super) use super::marks::{
-    apply_filter, contour_bands, control, flag, labeled, pick, pick_in, text, BEAM_CHOICES,
+    apply_filter, contour_bands, control, flag, labeled, pick, text, BEAM_CHOICES,
 };
 pub(super) use super::tables::{slice_table, spot_table, timeslice_metric, timeslice_signals};
 mod distribution;
@@ -240,106 +240,29 @@ fn timeline(root: &Path, session_ids: &[String]) -> Vec<BTreeMap<String, Vec<f32
         .collect()
 }
 
-fn channel_key(name: &str) -> bool {
+pub(super) fn channel_key(name: &str) -> bool {
     !matches!(name, "energy" | "beam_on" | "beam_on_time" | "spot_time")
 }
 
-fn channel_label(id: &str) -> String {
-    match id {
-        "ic1_current" => "IC1 Current",
-        "ic2_current" => "IC2 Current",
-        "ic3_current" => "IC3 Current",
-        "ic1_x" => "IC1 X",
-        "ic1_y" => "IC1 Y",
-        "ic2_x" => "IC2 X",
-        "ic2_y" => "IC2 Y",
-        "ic1_x_err" => "IC1 X Error",
-        "ic1_y_err" => "IC1 Y Error",
-        "ic2_x_err" => "IC2 X Error",
-        "ic2_y_err" => "IC2 Y Error",
-        "ic1_sig_x" => "IC1 Sigma X",
-        "ic1_sig_y" => "IC1 Sigma Y",
-        "ic2_sig_x" => "IC2 Sigma X",
-        "ic2_sig_y" => "IC2 Sigma Y",
-        "ic12_x_diff" => "IC2-IC1 X",
-        "ic12_y_diff" => "IC2-IC1 Y",
-        "field_x" => "Field X",
-        "field_y" => "Field Y",
-        "ic1_x_confidence" => "IC1 X Confidence",
-        "ic1_y_confidence" => "IC1 Y Confidence",
-        "ic2_x_confidence" => "IC2 X Confidence",
-        "ic2_y_confidence" => "IC2 Y Confidence",
-        "ic1_x_peak" => "IC1 X Peak",
-        "ic1_y_peak" => "IC1 Y Peak",
-        "ic2_x_peak" => "IC2 X Peak",
-        "ic2_y_peak" => "IC2 Y Peak",
-        "amp_x" => "Amplifier X",
-        "amp_y" => "Amplifier Y",
-        "amp_cmd_x" => "Amplifier Command X",
-        "amp_read_x" => "Amplifier Readback X",
-        "amp_cmd_y" => "Amplifier Command Y",
-        "amp_read_y" => "Amplifier Readback Y",
-        _ => {
-            return id
-                .split('_')
-                .map(|part| {
-                    let mut chars = part.chars();
-                    match chars.next() {
-                        None => String::new(),
-                        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
-                    }
+pub(super) fn finite_names(
+    session_ids: &[String],
+    tables: &[BTreeMap<String, Vec<f32>>],
+) -> Vec<(String, Vec<String>)> {
+    session_ids
+        .iter()
+        .zip(tables)
+        .map(|(id, table)| {
+            let mut columns: Vec<String> = table
+                .iter()
+                .filter(|(name, values)| {
+                    channel_key(name) && values.iter().any(|value| value.is_finite())
                 })
-                .collect::<Vec<_>>()
-                .join(" ")
-        }
-    }
-    .to_owned()
-}
-
-fn channel_pairs_of(tables: &[BTreeMap<String, Vec<f32>>]) -> Vec<(String, String)> {
-    let mut ids = BTreeSet::new();
-    for table in tables {
-        for (name, values) in table {
-            if channel_key(name) && values.iter().any(|value| value.is_finite()) {
-                ids.insert(name.clone());
-            }
-        }
-    }
-    if ids.is_empty() {
-        ids.insert("ic1_current".to_owned());
-    }
-    ids.into_iter()
-        .map(|id| {
-            let label = channel_label(&id);
-            (id, label)
+                .map(|(name, _)| name.clone())
+                .collect();
+            columns.sort();
+            (id.clone(), columns)
         })
         .collect()
-}
-
-fn choose(options: &Value, key: &str, default_id: &str, pairs: &[(String, String)]) -> String {
-    let refs: Vec<(&str, &str)> = pairs
-        .iter()
-        .map(|(id, label)| (id.as_str(), label.as_str()))
-        .collect();
-    if let Some(id) = pick_in(options, key, &refs) {
-        return id.to_owned();
-    }
-    if pairs.iter().any(|(id, _)| id == default_id) {
-        default_id.to_owned()
-    } else {
-        pairs
-            .first()
-            .map(|(id, _)| id.clone())
-            .unwrap_or_else(|| default_id.to_owned())
-    }
-}
-
-fn choice_control(id: &str, label: &str, pairs: &[(String, String)], current: &str) -> Control {
-    let refs: Vec<(&str, &str)> = pairs
-        .iter()
-        .map(|(id, label)| (id.as_str(), label.as_str()))
-        .collect();
-    labeled(id, label, &refs, current)
 }
 
 fn percentile_sorted(values: &[f32], p: f32) -> f32 {
@@ -529,11 +452,14 @@ mod tests {
                     .iter()
                     .any(|series| matches!(series, Series::Polyline { .. }))
         }));
-        assert!(scene.controls.iter().any(|control| control.id == "mode"
+        assert!(scene.controls.iter().any(|control| control.id == "xy"
             && control.label == "XY"
-            && control.value == "Position"
-            && control.options.iter().any(|option| option == "Amplifier")
-            && control.options.iter().any(|option| option == "Probe")));
+            && control.value == "Position (mm)"
+            && control
+                .options
+                .iter()
+                .any(|option| option == "Amplifier (V)")
+            && control.options.iter().any(|option| option == "Probe (G)")));
         assert!(scene
             .controls
             .iter()
@@ -553,7 +479,7 @@ mod tests {
         assert!(scene
             .controls
             .iter()
-            .any(|control| control.id == "grain" && control.value == "Spot"));
+            .any(|control| control.id == "source" && control.value == "Spot"));
         assert!(scene.controls.iter().any(|control| control.id == "draw"
             && control.options.iter().any(|option| option == "Contour")));
         let root = std::env::temp_dir().join(format!("scan-kit-plan-first-{}", std::process::id()));
@@ -767,7 +693,7 @@ mod tests {
         assert!(binned
             .controls
             .iter()
-            .any(|control| control.id == "metric" && control.value == "Dose Error (%)"));
+            .any(|control| control.id == "y" && control.value == "Dose Error (%)"));
         let ic1 = binned
             .panels
             .iter()
@@ -787,7 +713,7 @@ mod tests {
         assert!(replay
             .panels
             .iter()
-            .any(|panel| panel.y_label == "IC1 Current"));
+            .any(|panel| panel.y_label == "IC1 Current (nA)"));
         assert!(replay.controls.iter().all(|control| control.id != "scrub"));
     }
 

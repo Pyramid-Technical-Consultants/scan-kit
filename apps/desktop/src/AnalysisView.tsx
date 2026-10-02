@@ -133,9 +133,35 @@ function messageOf(reason: unknown): string {
   return reason instanceof Error ? reason.message : String(reason);
 }
 
-function ChoiceIcon({ name }: { name: string }) {
-  const icon = optionIcon(name);
-  return icon == null ? null : createElement(icon);
+function ChoiceIcon({ name, icon }: { name: string; icon?: string }) {
+  const found =
+    (icon != null && icon.length > 0 ? optionIcon(icon) : undefined) ?? optionIcon(name);
+  return found == null ? null : createElement(found);
+}
+
+function ChoiceFace({
+  label,
+  detail,
+  icon,
+}: {
+  label: string;
+  detail: string;
+  icon: string;
+}) {
+  return (
+    <>
+      <ChoiceIcon name={label} icon={icon} />
+      <span>{label}</span>
+      {detail.length > 0 ? (
+        <span
+          className="text-muted-foreground ml-auto min-w-0 flex-1 truncate text-right font-normal"
+          title={detail}
+        >
+          {detail}
+        </span>
+      ) : null}
+    </>
+  );
 }
 
 function ChoiceSelect({
@@ -149,7 +175,8 @@ function ChoiceSelect({
   disabled?: boolean;
   onChange: (value: string) => void;
 }) {
-  const items = control.options.map((option) => ({ label: option, value: option }));
+  const items = control.options.map((option) => ({ ...option, value: option.label }));
+  const selected = items.find((item) => item.value === value) ?? items[0];
   return (
     <Select
       items={items}
@@ -162,21 +189,37 @@ function ChoiceSelect({
       }}
     >
       <SelectTrigger size="sm" className="w-full cursor-pointer">
-        <ChoiceIcon name={value} />
-        <SelectValue />
+        <SelectValue>
+          {selected == null ? null : (
+            <ChoiceFace label={selected.label} detail={selected.detail} icon={selected.icon} />
+          )}
+        </SelectValue>
       </SelectTrigger>
       <SelectContent>
         <SelectGroup>
           {items.map((item) => (
             <SelectItem key={item.value} value={item.value}>
-              <ChoiceIcon name={item.value} />
-              {item.label}
+              <ChoiceFace label={item.label} detail={item.detail} icon={item.icon} />
             </SelectItem>
           ))}
         </SelectGroup>
       </SelectContent>
     </Select>
   );
+}
+
+function slotRows(slots: readonly ControlSlot[]): { inline: boolean; slots: ControlSlot[] }[] {
+  const rows: { inline: boolean; slots: ControlSlot[] }[] = [];
+  for (const slot of slots) {
+    const last = rows[rows.length - 1];
+    if (slot.kind === "check" && last != null && last.slots.every((item) => item.kind === "check")) {
+      last.slots.push(slot);
+      last.inline = true;
+      continue;
+    }
+    rows.push({ inline: false, slots: [slot] });
+  }
+  return rows;
 }
 
 export function AnalysisView({
@@ -414,14 +457,11 @@ export function AnalysisView({
   const resolved: Record<string, string> = {};
   for (const control of controls) {
     const stored = options[control.id];
-    resolved[control.id] =
-      stored != null && control.options.includes(stored) ? stored : control.value;
+    const known = control.options.some((option) => option.label === stored);
+    resolved[control.id] = stored != null && known ? stored : control.value;
   }
   const byId = new Map(controls.map((control) => [control.id, control]));
-  const sections = controlSections(
-    viewId,
-    controls.map((control) => control.id),
-  );
+  const sections = controlSections(controls);
   const apply = (id: string, value: string) => {
     setOptions((current) => ({ ...current, [id]: value }));
   };
@@ -442,7 +482,7 @@ export function AnalysisView({
       return null;
     }
     const value = resolved[slot.id] ?? control.value;
-    const label = slot.label ?? control.label;
+    const label = control.label;
     const disabled = controlDisabled(slot.id, resolved);
     if (slot.kind === "check") {
       return (
@@ -487,9 +527,6 @@ export function AnalysisView({
         onChange={(next) => apply(slot.id, next)}
       />
     );
-    if (slot.kind === "bare") {
-      return <div key={slot.id}>{widget}</div>;
-    }
     return (
       <Field
         key={slot.id}
@@ -552,16 +589,22 @@ export function AnalysisView({
             setHidden((current) => (next ? current.filter((item) => item !== id) : [...current, id]));
           }}
         />
-        {sections.map((section) => (
-          <FieldSet key={section.title} className="gap-2 rounded-lg border border-border p-3">
+        {sections.map((section, index) => (
+          <FieldSet key={`${section.title}-${index}`} className="gap-2 rounded-lg border border-border p-3">
             <FieldLegend variant="label">{section.title}</FieldLegend>
-            {section.inline ? (
-              <div className="flex flex-row gap-3">
-                {section.slots.map((slot) => renderSlot(slot, true))}
-              </div>
-            ) : (
-              section.slots.map((slot) => renderSlot(slot))
-            )}
+            {slotRows(section.slots).map((row) => {
+              const lead = row.slots[0];
+              if (lead == null) {
+                return null;
+              }
+              return row.inline ? (
+                <div key={lead.id} className="flex flex-row gap-3">
+                  {row.slots.map((slot) => renderSlot(slot, true))}
+                </div>
+              ) : (
+                renderSlot(lead)
+              );
+            })}
           </FieldSet>
         ))}
         {(meta?.samples.length ?? 0) > 0 ? (
