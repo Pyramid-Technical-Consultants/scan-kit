@@ -1,0 +1,2296 @@
+//! Binned Summary, matching the 1.8 metric groups, binning, and glyphs.
+
+use std::collections::BTreeMap;
+use std::path::Path;
+
+use scan_kit_core::{assign_bin_centers, quantile_edges, Control, Panel, PlotScene, Series};
+use serde_json::Value;
+
+use super::discover;
+use super::marks::{
+    apply_filter, contour_bands, control, flag, labeled, pick, pick_in, text, BEAM_CHOICES,
+};
+mod glyphs;
+
+use super::tables::{
+    file_fingerprint, load_slice_metric, load_spot, load_timeslice, median, same, span,
+    timeslice_energy_only,
+};
+use glyphs::{
+    binned_trend, box_series, contour_series, corr_panel, hist_panel, hline, interlock_guides,
+    mean_series, note_panel, scatter_series, scatter_trend, violin_series,
+};
+
+const OFFSET: f32 = 0.35;
+const BOX_WIDTH: f32 = 0.3;
+const VIOLIN_WIDTH: f32 = 0.65;
+const GATE_ABS_MU: f64 = 0.002;
+
+struct YSeries {
+    key: &'static str,
+    label: &'static str,
+}
+
+struct YGroup {
+    id: &'static str,
+    label: &'static str,
+    series: &'static [YSeries],
+    /// Include 0 in the y range so a gridline lands on zero.
+    zero: bool,
+    /// Beam and domain filters apply.
+    filter: bool,
+    timeslice: bool,
+}
+
+const DOSE_ERROR: &[YSeries] = &[
+    YSeries {
+        key: "ic1_dose_err_pct",
+        label: "IC1 (%)",
+    },
+    YSeries {
+        key: "ic2_dose_err_pct",
+        label: "IC2 (%)",
+    },
+    YSeries {
+        key: "ic3_dose_err_pct",
+        label: "IC3 (%)",
+    },
+];
+const DOSE_RATIO: &[YSeries] = &[
+    YSeries {
+        key: "ic21_ratio",
+        label: "IC2/IC1 (%)",
+    },
+    YSeries {
+        key: "ic31_ratio",
+        label: "IC3/IC1 (%)",
+    },
+    YSeries {
+        key: "ic32_ratio",
+        label: "IC3/IC2 (%)",
+    },
+];
+const DOSE_RATE: &[YSeries] = &[YSeries {
+    key: "mu_rate",
+    label: "MU/S",
+}];
+const CURRENT: &[YSeries] = &[
+    YSeries {
+        key: "ic1_current",
+        label: "IC1",
+    },
+    YSeries {
+        key: "ic2_current",
+        label: "IC2",
+    },
+    YSeries {
+        key: "ic3_current",
+        label: "IC3",
+    },
+];
+const POSITION: &[YSeries] = &[
+    YSeries {
+        key: "ic1_x_err",
+        label: "IC1 X",
+    },
+    YSeries {
+        key: "ic1_y_err",
+        label: "IC1 Y",
+    },
+    YSeries {
+        key: "ic2_x_err",
+        label: "IC2 X",
+    },
+    YSeries {
+        key: "ic2_y_err",
+        label: "IC2 Y",
+    },
+];
+const SIGMA: &[YSeries] = &[
+    YSeries {
+        key: "ic1_sig_x",
+        label: "IC1 SX",
+    },
+    YSeries {
+        key: "ic1_sig_y",
+        label: "IC1 SY",
+    },
+    YSeries {
+        key: "ic2_sig_x",
+        label: "IC2 SX",
+    },
+    YSeries {
+        key: "ic2_sig_y",
+        label: "IC2 SY",
+    },
+];
+const SIGMA_ERR: &[YSeries] = &[
+    YSeries {
+        key: "ic1_sig_x_err",
+        label: "IC1 SX ERR",
+    },
+    YSeries {
+        key: "ic1_sig_y_err",
+        label: "IC1 SY ERR",
+    },
+    YSeries {
+        key: "ic2_sig_x_err",
+        label: "IC2 SX ERR",
+    },
+    YSeries {
+        key: "ic2_sig_y_err",
+        label: "IC2 SY ERR",
+    },
+];
+const IC12: &[YSeries] = &[
+    YSeries {
+        key: "ic12_x_diff",
+        label: "DX",
+    },
+    YSeries {
+        key: "ic12_y_diff",
+        label: "DY",
+    },
+];
+const CONFIDENCE: &[YSeries] = &[
+    YSeries {
+        key: "ic1_x_confidence",
+        label: "IC1 X",
+    },
+    YSeries {
+        key: "ic1_y_confidence",
+        label: "IC1 Y",
+    },
+    YSeries {
+        key: "ic2_x_confidence",
+        label: "IC2 X",
+    },
+    YSeries {
+        key: "ic2_y_confidence",
+        label: "IC2 Y",
+    },
+];
+const PEAK: &[YSeries] = &[
+    YSeries {
+        key: "ic1_x_peak",
+        label: "IC1 X",
+    },
+    YSeries {
+        key: "ic1_y_peak",
+        label: "IC1 Y",
+    },
+    YSeries {
+        key: "ic2_x_peak",
+        label: "IC2 X",
+    },
+    YSeries {
+        key: "ic2_y_peak",
+        label: "IC2 Y",
+    },
+];
+const AMPLIFIER: &[YSeries] = &[
+    YSeries {
+        key: "amp_x",
+        label: "X",
+    },
+    YSeries {
+        key: "amp_y",
+        label: "Y",
+    },
+];
+const PROBE: &[YSeries] = &[
+    YSeries {
+        key: "field_x",
+        label: "X",
+    },
+    YSeries {
+        key: "field_y",
+        label: "Y",
+    },
+];
+const SPOT_TIME: &[YSeries] = &[
+    YSeries {
+        key: "spot_time",
+        label: "TOTAL MS",
+    },
+    YSeries {
+        key: "beam_on_time",
+        label: "BEAM ON",
+    },
+    YSeries {
+        key: "overhead_time",
+        label: "OVERHEAD",
+    },
+];
+
+const GROUPS: &[YGroup] = &[
+    YGroup {
+        id: "dose_error",
+        label: "Dose Error (%)",
+        series: DOSE_ERROR,
+        zero: true,
+        filter: true,
+        timeslice: false,
+    },
+    YGroup {
+        id: "dose_ratio",
+        label: "Dose Ratios",
+        series: DOSE_RATIO,
+        zero: true,
+        filter: true,
+        timeslice: false,
+    },
+    YGroup {
+        id: "dose_rate",
+        label: "Dose Rate (MU/s)",
+        series: DOSE_RATE,
+        zero: false,
+        filter: false,
+        timeslice: false,
+    },
+    YGroup {
+        id: "current_ratio",
+        label: "Current Ratios (%)",
+        series: DOSE_RATIO,
+        zero: true,
+        filter: true,
+        timeslice: true,
+    },
+    YGroup {
+        id: "ic_current",
+        label: "IC Current (nA)",
+        series: CURRENT,
+        zero: true,
+        filter: true,
+        timeslice: true,
+    },
+    YGroup {
+        id: "fit_confidence",
+        label: "Fit Confidence",
+        series: CONFIDENCE,
+        zero: true,
+        filter: true,
+        timeslice: true,
+    },
+    YGroup {
+        id: "peak_amplitude",
+        label: "Peak Amplitude",
+        series: PEAK,
+        zero: true,
+        filter: true,
+        timeslice: true,
+    },
+    YGroup {
+        id: "amplifier_error",
+        label: "Amplifier Error (V)",
+        series: AMPLIFIER,
+        zero: true,
+        filter: true,
+        timeslice: true,
+    },
+    YGroup {
+        id: "probe_field",
+        label: "Probe Field (G)",
+        series: PROBE,
+        zero: true,
+        filter: true,
+        timeslice: true,
+    },
+    YGroup {
+        id: "position_error",
+        label: "Position Error (mm)",
+        series: POSITION,
+        zero: true,
+        filter: true,
+        timeslice: false,
+    },
+    YGroup {
+        id: "sigma",
+        label: "Sigma (mm)",
+        series: SIGMA,
+        zero: true,
+        filter: true,
+        timeslice: false,
+    },
+    YGroup {
+        id: "sigma_error",
+        label: "Sigma Error (mm)",
+        series: SIGMA_ERR,
+        zero: true,
+        filter: true,
+        timeslice: false,
+    },
+    YGroup {
+        id: "ic12_pos_diff",
+        label: "IC2-IC1 Position (mm)",
+        series: IC12,
+        zero: true,
+        filter: true,
+        timeslice: false,
+    },
+    YGroup {
+        id: "spot_time",
+        label: "Spot Delivery Time",
+        series: SPOT_TIME,
+        zero: true,
+        filter: true,
+        timeslice: false,
+    },
+];
+
+const METRIC_CHOICES: &[(&str, &str)] = &[
+    ("dose_error", "Dose Error (%)"),
+    ("dose_ratio", "Dose Ratios"),
+    ("dose_rate", "Dose Rate (MU/s)"),
+    ("current_ratio", "Current Ratios (%)"),
+    ("ic_current", "IC Current (nA)"),
+    ("fit_confidence", "Fit Confidence"),
+    ("peak_amplitude", "Peak Amplitude"),
+    ("amplifier_error", "Amplifier Error (V)"),
+    ("probe_field", "Probe Field (G)"),
+    ("position_error", "Position Error (mm)"),
+    ("sigma", "Sigma (mm)"),
+    ("sigma_error", "Sigma Error (mm)"),
+    ("ic12_pos_diff", "IC2-IC1 Position (mm)"),
+    ("spot_time", "Spot Delivery Time"),
+];
+const X_CHOICES: &[(&str, &str)] = &[
+    ("energy", "Energy"),
+    ("target_mu", "Target MU"),
+    ("spot_time", "Spot time"),
+    ("radius", "Radius"),
+];
+const GLYPH_CHOICES: &[(&str, &str)] = &[
+    ("violin", "Violin"),
+    ("box", "Box"),
+    ("mean", "Mean"),
+    ("scatter", "Scatter"),
+    ("contour", "Contour"),
+];
+const SOURCE_CHOICES: &[(&str, &str)] = &[
+    ("iso", "Spot — Isocenter"),
+    ("chamber", "Spot — Chamber"),
+    ("timeslice_iso", "Timeslice — Isocenter"),
+    ("timeslice_chamber", "Timeslice — Chamber"),
+];
+/// Spot vs timeslice, then isocenter vs chamber when a metric has both.
+/// Same split as the Python granularity control (`GRANULARITY_SOURCES`).
+const COARSE_CHOICES: &[(&str, &str)] = &[("spot", "Spot"), ("timeslice", "Timeslice")];
+const FRAME_CHOICES: &[(&str, &str)] = &[("iso", "Isocenter"), ("chamber", "Chamber")];
+
+fn sources_for(metric: &str) -> &'static [(&'static str, &'static str)] {
+    match metric {
+        "current_ratio" | "ic_current" | "fit_confidence" | "peak_amplitude"
+        | "amplifier_error" | "probe_field" => &SOURCE_CHOICES[2..3],
+        "position_error" | "sigma" | "sigma_error" => &SOURCE_CHOICES[..3],
+        "ic12_pos_diff" => SOURCE_CHOICES,
+        _ => &SOURCE_CHOICES[..1],
+    }
+}
+
+fn coarse_of(source: &str) -> &'static str {
+    if source.starts_with("timeslice") {
+        "timeslice"
+    } else {
+        "spot"
+    }
+}
+
+fn frame_of(source: &str) -> &'static str {
+    if source == "chamber" || source.ends_with("_chamber") {
+        "chamber"
+    } else {
+        "iso"
+    }
+}
+
+struct YChoice {
+    metric: &'static str,
+    frame: &'static str,
+    label: String,
+}
+
+/// One Y row per metric. Isocenter and chamber are extra rows when both exist.
+fn y_choices(coarse: &str) -> Vec<YChoice> {
+    let mut choices = Vec::new();
+    for &(metric, base) in METRIC_CHOICES {
+        let frames = frames_for(metric, coarse);
+        if frames.is_empty() {
+            continue;
+        }
+        let qualify = frames.len() > 1;
+        for (frame, frame_label) in frames {
+            let label = if qualify {
+                format!("{base} ({frame_label})")
+            } else {
+                base.to_string()
+            };
+            choices.push(YChoice {
+                metric,
+                frame,
+                label,
+            });
+        }
+    }
+    choices
+}
+
+fn split_frame_suffix(raw: &str) -> (&str, Option<&'static str>) {
+    if let Some(bare) = raw.strip_suffix(" (Chamber)") {
+        (bare, Some("chamber"))
+    } else if let Some(bare) = raw.strip_suffix(" (Isocenter)") {
+        (bare, Some("iso"))
+    } else {
+        (raw, None)
+    }
+}
+
+fn metric_label(id: &str) -> &str {
+    METRIC_CHOICES
+        .iter()
+        .find(|(key, _)| *key == id)
+        .map(|(_, label)| *label)
+        .unwrap_or(id)
+}
+
+fn resolve_y(
+    choices: &[YChoice],
+    options: &Value,
+    concrete: Option<&str>,
+) -> (&'static str, &'static str) {
+    let Some(raw) = options.get("metric").and_then(Value::as_str) else {
+        return choices
+            .iter()
+            .find(|choice| choice.metric == "dose_error")
+            .or_else(|| choices.first())
+            .map(|choice| (choice.metric, choice.frame))
+            .unwrap_or(("dose_error", "iso"));
+    };
+    if let Some(exact) = choices.iter().find(|choice| choice.label == raw) {
+        return (exact.metric, exact.frame);
+    }
+    let (bare, suffix_frame) = split_frame_suffix(raw);
+    let frame_hint = suffix_frame
+        .or_else(|| pick_in(options, "frame", FRAME_CHOICES))
+        .or_else(|| concrete.map(frame_of));
+    let hits: Vec<_> = choices
+        .iter()
+        .filter(|choice| {
+            choice.metric == raw || choice.metric == bare || metric_label(choice.metric) == bare
+        })
+        .collect();
+    if let Some(frame) = frame_hint {
+        if let Some(hit) = hits.iter().find(|choice| choice.frame == frame) {
+            return (hit.metric, hit.frame);
+        }
+    }
+    hits.first()
+        .map(|choice| (choice.metric, choice.frame))
+        .unwrap_or((
+            choices
+                .first()
+                .map(|choice| choice.metric)
+                .unwrap_or("dose_error"),
+            choices.first().map(|choice| choice.frame).unwrap_or("iso"),
+        ))
+}
+
+fn frames_for(metric: &str, coarse: &str) -> Vec<(&'static str, &'static str)> {
+    FRAME_CHOICES
+        .iter()
+        .copied()
+        .filter(|(frame, _)| {
+            sources_for(metric)
+                .iter()
+                .any(|(source, _)| coarse_of(source) == coarse && frame_of(source) == *frame)
+        })
+        .collect()
+}
+const DOMAIN_CHOICES: &[(&str, &str)] = &[
+    ("all", "All"),
+    ("lower_95", "Lower 95%"),
+    ("upper_95", "Upper 5%"),
+    ("mad_outliers", "MAD Outliers"),
+];
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Trend {
+    Off,
+    Linear,
+    Polynomial,
+}
+
+fn trend_mode(options: &Value) -> Trend {
+    match text(options, "trend", "Off") {
+        "Linear" | "linear" | "On" | "on" | "true" | "1" => Trend::Linear,
+        "Polynomial" | "polynomial" => Trend::Polynomial,
+        _ => Trend::Off,
+    }
+}
+
+fn trend_value(trend: Trend) -> &'static str {
+    match trend {
+        Trend::Off => "Off",
+        Trend::Linear => "Linear",
+        Trend::Polynomial => "Polynomial",
+    }
+}
+
+/// Glyph marks for one data identity. Trend and interlock are drawn on top.
+///
+/// ponytail: one slot, keyed by the data options plus spot/map fingerprints and
+/// the session directory mtime. A timeslice frame that changes without touching
+/// those stays stale until the directory mtime moves. Upgrade path: hash the
+/// frame list.
+#[derive(Clone)]
+struct Prepared {
+    key: String,
+    tables: Vec<BTreeMap<String, Vec<f32>>>,
+    categories: Vec<f32>,
+    xmin: f32,
+    xmax: f32,
+    x_labels: Vec<String>,
+    glyph: String,
+    x_column: String,
+    raw_x: bool,
+    series: Vec<PreparedSeries>,
+}
+
+#[derive(Clone)]
+struct PreparedSeries {
+    key: String,
+    label: String,
+    y_label: String,
+    glyphs: Vec<Vec<Series>>,
+    contour: Vec<Series>,
+    ymin: f32,
+    ymax: f32,
+}
+
+fn prepared_cache() -> &'static std::sync::Mutex<Option<Prepared>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<Option<Prepared>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+fn cached_prepared(key: String, build: impl FnOnce() -> Prepared) -> Prepared {
+    if let Some(hit) = prepared_cache()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .as_ref()
+        .filter(|item| item.key == key)
+        .cloned()
+    {
+        return hit;
+    }
+    let mut built = build();
+    built.key = key;
+    *prepared_cache()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner()) = Some(built.clone());
+    built
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepared_key(
+    root: &Path,
+    session_ids: &[String],
+    metric: &str,
+    source: &str,
+    x_column: &str,
+    bins: &BinChoice,
+    glyph: &str,
+    domain: &str,
+    beam: &str,
+    cutoff: f32,
+) -> String {
+    let mut stamp = String::new();
+    for session in session_ids {
+        stamp.push_str(session);
+        stamp.push(':');
+        stamp.push_str(&session_stamp(root, session).to_string());
+        stamp.push(';');
+    }
+    format!(
+        "{}|{stamp}|{metric}|{source}|{x_column}|{}|{glyph}|{domain}|{beam}|{cutoff}",
+        root.display(),
+        bin_label(bins),
+    )
+}
+
+fn session_stamp(root: &Path, session: &str) -> u128 {
+    let dir = discover::session_directory(root, session);
+    let mut stamp = mtime_ns(&dir);
+    for name in ["spot_data.csv", "input_map.csv"] {
+        if let Some((len, ns, head)) = file_fingerprint(&dir.join(name)) {
+            stamp ^= ns ^ u128::from(len) ^ u128::from(head);
+        }
+    }
+    stamp
+}
+
+fn mtime_ns(path: &Path) -> u128 {
+    std::fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|time| time.as_nanos())
+        .unwrap_or(0)
+}
+
+pub(crate) fn binned_summary(root: &Path, session_ids: &[String], options: &Value) -> PlotScene {
+    let metric_hint = pick(options, "metric", "dose_error", METRIC_CHOICES);
+    let concrete = options
+        .get("source")
+        .and_then(Value::as_str)
+        .and_then(|raw| {
+            SOURCE_CHOICES
+                .iter()
+                .find(|(id, label)| *id == raw || *label == raw)
+                .map(|(id, _)| *id)
+        });
+    let coarse = pick_in(options, "source", COARSE_CHOICES)
+        .or_else(|| concrete.map(coarse_of))
+        .unwrap_or_else(|| coarse_of(sources_for(metric_hint)[0].0));
+    let y_opts = y_choices(coarse);
+    let (metric, frame) = resolve_y(&y_opts, options, concrete);
+    let group = GROUPS
+        .iter()
+        .find(|group| group.id == metric)
+        .unwrap_or(&GROUPS[0]);
+    let x_id = pick(options, "x", "energy", X_CHOICES);
+    let glyph = pick(options, "glyph", "violin", GLYPH_CHOICES);
+    let beam_default = if coarse == "timeslice" {
+        "beam_on"
+    } else {
+        "beam_both"
+    };
+    let beam = pick(options, "beam", beam_default, BEAM_CHOICES);
+    let domain = pick(options, "domain", "all", DOMAIN_CHOICES);
+    let trend = trend_mode(options);
+    let hist = flag(options, "hist", false);
+    let corr = flag(options, "corr", false);
+    let mut interlock = flag(options, "interlock", false);
+    let bins = bin_choice(options);
+    let hist_bins = text(options, "hist_bins", "30")
+        .parse::<usize>()
+        .unwrap_or(30)
+        .clamp(5, 80);
+    let cutoff = text(options, "cutoff", "5")
+        .parse::<f32>()
+        .unwrap_or(5.0)
+        .clamp(0.0, 90.0);
+    let source = sources_for(group.id)
+        .iter()
+        .find(|(id, _)| coarse_of(id) == coarse && frame_of(id) == frame)
+        .map(|(id, _)| *id)
+        .unwrap_or_else(|| {
+            sources_for(group.id)
+                .iter()
+                .find(|(id, _)| coarse_of(id) == coarse)
+                .map(|(id, _)| *id)
+                .unwrap_or(sources_for(group.id)[0].0)
+        });
+    let shared_bins = flag(options, "shared", false);
+    let geometry = matches!(source, "timeslice_iso" | "timeslice_chamber")
+        && matches!(
+            group.id,
+            "position_error" | "sigma" | "sigma_error" | "ic12_pos_diff"
+        );
+    let energy_only = geometry || timeslice_energy_only(group.id);
+    let chamber = source == "chamber"
+        && matches!(
+            group.id,
+            "position_error" | "sigma" | "sigma_error" | "ic12_pos_diff"
+        );
+    let x_id = if energy_only { "energy" } else { x_id };
+    if !interlock_ok(group.id, x_id, glyph) {
+        interlock = false;
+    }
+    let x_column = match x_id {
+        "target_mu" => "target_mu",
+        "spot_time" => "spot_time",
+        "radius" => "radius",
+        _ => "energy",
+    };
+    let raw_x = glyph == "scatter" || glyph == "contour";
+
+    // Trend and interlock only add guides. The glyph geometry stays cached.
+    let key = prepared_key(
+        root,
+        session_ids,
+        group.id,
+        source,
+        x_column,
+        &bins,
+        glyph,
+        domain,
+        beam,
+        cutoff,
+    );
+    let prepared = cached_prepared(key, || {
+        let load_one = |session: &String| {
+            let mut table = if geometry {
+                load_slice_metric(root, session, group.id, source == "timeslice_chamber")
+            } else if group.timeslice {
+                load_timeslice(root, session, group.id)
+            } else if group.id == "dose_rate" {
+                dose_rate_table(&load_spot(root, session, false, false, false))
+            } else {
+                load_spot(root, session, chamber, group.id == "spot_time", false)
+            };
+            if group.filter {
+                let keys: Vec<&str> = group.series.iter().map(|series| series.key).collect();
+                apply_filter(&mut table, &keys, domain, beam);
+            }
+            table
+        };
+        // A handful of sessions, one thread each. The spot cache covers a repeat open.
+        let mut tables = if session_ids.len() < 2 {
+            session_ids.iter().map(load_one).collect::<Vec<_>>()
+        } else {
+            let mut tables = Vec::with_capacity(session_ids.len());
+            std::thread::scope(|scope| {
+                let mut joins = Vec::with_capacity(session_ids.len());
+                for session in session_ids {
+                    joins.push(scope.spawn(|| load_one(session)));
+                }
+                for join in joins {
+                    tables.push(join.join().unwrap());
+                }
+            });
+            tables
+        };
+        let categories = if raw_x {
+            Vec::new()
+        } else {
+            assign_x(&mut tables, x_column, &bins)
+        };
+        let present: Vec<&YSeries> = group
+            .series
+            .iter()
+            .filter(|series| tables.iter().any(|table| has_finite(table.get(series.key))))
+            .collect();
+        let (xmin, xmax) = x_span(&tables, &categories, raw_x, x_column, present.len());
+        let x_labels = if raw_x {
+            Vec::new()
+        } else {
+            categories
+                .iter()
+                .copied()
+                .map(scan_kit_core::format_tick)
+                .collect()
+        };
+        let series = present
+            .iter()
+            .map(|series| {
+                let mut ys = Vec::new();
+                let glyphs = tables
+                    .iter()
+                    .enumerate()
+                    .map(|(index, table)| {
+                        let Some(y) = table.get(series.key) else {
+                            return Vec::new();
+                        };
+                        if !has_finite(Some(y)) {
+                            return Vec::new();
+                        }
+                        ys.extend(y.iter().copied().filter(|value| value.is_finite()));
+                        let color = [
+                            0.8,
+                            0.8,
+                            0.8,
+                            if glyph == "violin" {
+                                0.55
+                            } else if glyph == "scatter" {
+                                0.4
+                            } else {
+                                1.0
+                            },
+                        ];
+                        match glyph {
+                            "mean" => mean_series(table, y, &categories, index, color),
+                            "scatter" => vec![scatter_series(table, y, x_column, color)],
+                            "contour" => Vec::new(),
+                            "box" => box_series(table, y, &categories, index, color),
+                            _ => violin_series(table, y, &categories, index, color),
+                        }
+                    })
+                    .collect();
+                if group.zero {
+                    ys.push(0.0);
+                }
+                let (ymin, ymax) = span(&ys);
+                let contour = if glyph == "contour" {
+                    contour_series(&tables, series.key, x_column, cutoff)
+                } else {
+                    Vec::new()
+                };
+                PreparedSeries {
+                    key: series.key.to_string(),
+                    label: series.label.to_string(),
+                    y_label: axis_label(series.label, group.label),
+                    glyphs,
+                    contour,
+                    ymin,
+                    ymax,
+                }
+            })
+            .collect();
+        Prepared {
+            key: String::new(),
+            tables,
+            categories,
+            xmin,
+            xmax,
+            x_labels,
+            glyph: glyph.to_string(),
+            x_column: x_column.to_string(),
+            raw_x,
+            series,
+        }
+    });
+
+    let mut panels = Vec::new();
+    if prepared.series.is_empty() {
+        panels.push(note_panel("No finite values for this metric"));
+    } else {
+        for (index, item) in prepared.series.iter().enumerate() {
+            panels.push(assemble_panel(&prepared, index, trend, interlock, group));
+            let series = group
+                .series
+                .iter()
+                .find(|series| series.key == item.key)
+                .unwrap();
+            if hist {
+                panels.push(hist_panel(
+                    series,
+                    &prepared.tables,
+                    hist_bins,
+                    shared_bins,
+                    interlock && group.id == "position_error",
+                ));
+            }
+            if corr {
+                let other = &prepared.series[(index + 1) % prepared.series.len()];
+                let other = group
+                    .series
+                    .iter()
+                    .find(|series| series.key == other.key)
+                    .unwrap();
+                panels.push(corr_panel(series, other, &prepared.tables, group.label));
+            }
+        }
+    }
+
+    let side = u32::from(hist) + u32::from(corr);
+    let mut weights = vec![8.0];
+    weights.extend(std::iter::repeat_n(1.65, side as usize));
+    PlotScene {
+        title: format!("{} vs {}", group.label, x_label(x_column)),
+        panels,
+        controls: controls(
+            group.id,
+            x_id,
+            glyph,
+            source,
+            beam,
+            domain,
+            trend,
+            hist,
+            corr,
+            interlock,
+            &bin_label(&bins),
+            hist_bins,
+            shared_bins,
+            cutoff,
+        ),
+        table: None,
+        samples: Vec::new(),
+        columns: 1 + side,
+        column_weights: weights,
+        row_weights: Vec::new(),
+    }
+}
+
+fn assemble_panel(
+    prepared: &Prepared,
+    index: usize,
+    trend: Trend,
+    interlock: bool,
+    group: &YGroup,
+) -> Panel {
+    let item = &prepared.series[index];
+    let glyph = prepared.glyph.as_str();
+    let x_column = prepared.x_column.as_str();
+    let mut drawn = Vec::new();
+    for (session, table) in prepared.tables.iter().enumerate() {
+        drawn.extend(item.glyphs[session].clone());
+        let Some(y) = table.get(&item.key) else {
+            continue;
+        };
+        if !has_finite(Some(y)) {
+            continue;
+        }
+        if trend != Trend::Off && glyph != "contour" && group.id != "dose_rate" && !prepared.raw_x {
+            if let Some(guide) = binned_trend(
+                table,
+                y,
+                &prepared.categories,
+                session,
+                prepared.xmin,
+                prepared.xmax,
+                trend,
+            ) {
+                drawn.push(guide);
+            }
+        }
+        if trend != Trend::Off && group.id == "dose_rate" {
+            if let Some(rate) = table
+                .get("session_avg_rate")
+                .and_then(|v| v.first().copied())
+            {
+                if rate.is_finite() {
+                    drawn.push(hline(
+                        prepared.xmin,
+                        prepared.xmax,
+                        rate,
+                        [0.9, 0.75, 0.3, 1.0],
+                    ));
+                }
+            }
+        }
+        if trend != Trend::Off && glyph == "scatter" {
+            if let Some(guide) = scatter_trend(
+                table,
+                &item.key,
+                x_column,
+                prepared.xmin,
+                prepared.xmax,
+                trend,
+            ) {
+                drawn.push(guide);
+            }
+        }
+    }
+    drawn.extend(item.contour.clone());
+    if trend != Trend::Off && glyph == "contour" {
+        for table in &prepared.tables {
+            if let Some(guide) = scatter_trend(
+                table,
+                &item.key,
+                x_column,
+                prepared.xmin,
+                prepared.xmax,
+                trend,
+            ) {
+                drawn.push(guide);
+            }
+        }
+    }
+    if interlock {
+        drawn.extend(interlock_guides(
+            &prepared.tables,
+            &prepared.categories,
+            group.id,
+            x_column,
+            glyph,
+            prepared.xmin,
+            prepared.xmax,
+        ));
+    }
+    Panel {
+        title: item.label.clone(),
+        y_label: item.y_label.clone(),
+        xmin: prepared.xmin,
+        xmax: prepared.xmax,
+        ymin: item.ymin,
+        ymax: item.ymax,
+        series: drawn,
+        x_labels: prepared.x_labels.clone(),
+        equal: false,
+    }
+}
+
+fn axis_label(series: &str, group: &str) -> String {
+    let Some(unit) = group
+        .rfind('(')
+        .zip(group.rfind(')'))
+        .filter(|(start, end)| end > start)
+        .map(|(start, end)| group[start + 1..end].trim())
+        .filter(|unit| !unit.is_empty())
+    else {
+        return series.to_string();
+    };
+    if series.contains('(') || series.eq_ignore_ascii_case(unit) {
+        series.to_string()
+    } else {
+        format!("{series} ({unit})")
+    }
+}
+
+fn x_span(
+    tables: &[BTreeMap<String, Vec<f32>>],
+    categories: &[f32],
+    raw_x: bool,
+    x_column: &str,
+    _series: usize,
+) -> (f32, f32) {
+    if raw_x {
+        let values: Vec<f32> = tables
+            .iter()
+            .flat_map(|table| table.get(x_column).into_iter().flatten().copied())
+            .filter(|value| value.is_finite())
+            .collect();
+        let (lo, hi) = span(&values);
+        return (
+            lo - (hi - lo).max(1.0) * 0.05,
+            hi + (hi - lo).max(1.0) * 0.05,
+        );
+    }
+    if categories.is_empty() {
+        return (-0.5, 0.5);
+    }
+    (-0.6, categories.len() as f32 - 0.4)
+}
+
+fn x_label(column: &str) -> &'static str {
+    match column {
+        "target_mu" => "Target MU",
+        "spot_time" => "Spot time (ms)",
+        "radius" => "Radius (mm)",
+        _ => "Energy (MeV)",
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn controls(
+    metric: &str,
+    x: &str,
+    glyph: &str,
+    source: &str,
+    beam: &str,
+    domain: &str,
+    trend: Trend,
+    hist: bool,
+    corr: bool,
+    interlock: bool,
+    bins: &str,
+    hist_bins: usize,
+    shared: bool,
+    cutoff: f32,
+) -> Vec<Control> {
+    let on = |value: bool| if value { "On" } else { "Off" };
+    let coarse = coarse_of(source);
+    let frame = frame_of(source);
+    let y_opts = y_choices(coarse);
+    let y_labels: Vec<&str> = y_opts.iter().map(|choice| choice.label.as_str()).collect();
+    let y_value = y_opts
+        .iter()
+        .find(|choice| choice.metric == metric && choice.frame == frame)
+        .map(|choice| choice.label.as_str())
+        .unwrap_or(y_labels.first().copied().unwrap_or(metric));
+    let slice_x = matches!(source, "timeslice_iso" | "timeslice_chamber")
+        && (timeslice_energy_only(metric)
+            || matches!(
+                metric,
+                "position_error" | "sigma" | "sigma_error" | "ic12_pos_diff"
+            ));
+    let x_choices: &[(&str, &str)] = if slice_x { &X_CHOICES[..1] } else { X_CHOICES };
+    let mut controls = vec![
+        labeled("source", "Source", COARSE_CHOICES, coarse),
+        control("metric", "Y", &y_labels, y_value),
+        labeled("x", "X", x_choices, x),
+        labeled("glyph", "Glyph", GLYPH_CHOICES, glyph),
+        labeled("beam", "Beam", BEAM_CHOICES, beam),
+        labeled("domain", "Domain", DOMAIN_CHOICES, domain),
+        control(
+            "trend",
+            "Trend",
+            &["Off", "Linear", "Polynomial"],
+            trend_value(trend),
+        ),
+        control("hist", "Histogram", &["Off", "On"], on(hist)),
+        control("corr", "Correlation", &["Off", "On"], on(corr)),
+        control(
+            "interlock",
+            "Interlock Thresholds",
+            &["Off", "On"],
+            on(interlock),
+        ),
+        control("bins", "Bins", &["Automatic", "8", "16", "32", "64"], bins),
+        control(
+            "hist_bins",
+            "Histogram Bins",
+            &["10", "20", "30", "50"],
+            &hist_bins.to_string(),
+        ),
+        control("shared", "Shared Bins", &["Off", "On"], on(shared)),
+        control(
+            "cutoff",
+            "Contour Cutoff",
+            &["0", "5", "10", "20"],
+            &cutoff.round().to_string(),
+        ),
+    ];
+    let filters = GROUPS
+        .iter()
+        .any(|group| group.id == metric && group.filter);
+    controls.retain(|item| match item.id.as_str() {
+        "cutoff" => glyph == "contour",
+        "interlock" => interlock_ok(metric, x, glyph),
+        "beam" | "domain" => filters,
+        _ => true,
+    });
+    controls
+}
+
+fn interlock_ok(metric: &str, x: &str, glyph: &str) -> bool {
+    match metric {
+        "position_error" => true,
+        "dose_error" => x == "target_mu",
+        "sigma" | "sigma_error" => x == "energy" && !matches!(glyph, "scatter" | "contour"),
+        _ => false,
+    }
+}
+
+const AUTO_LEVELS: usize = 100;
+const AUTO_QUANTILES: usize = 32;
+
+enum BinChoice {
+    Automatic,
+    Fixed(usize),
+}
+
+fn bin_choice(options: &Value) -> BinChoice {
+    let raw = text(options, "bins", "Automatic");
+    if raw.eq_ignore_ascii_case("automatic") {
+        BinChoice::Automatic
+    } else {
+        BinChoice::Fixed(raw.parse::<usize>().unwrap_or(AUTO_QUANTILES).clamp(2, 64))
+    }
+}
+
+fn bin_label(choice: &BinChoice) -> String {
+    match choice {
+        BinChoice::Automatic => "Automatic".to_string(),
+        BinChoice::Fixed(count) => count.to_string(),
+    }
+}
+
+/// Sorted levels when fewer than `limit` exist. `None` means the column is continuous.
+fn quantized_levels(
+    tables: &[BTreeMap<String, Vec<f32>>],
+    key: &str,
+    limit: usize,
+) -> Option<Vec<f32>> {
+    let mut levels = Vec::new();
+    for table in tables {
+        let Some(column) = table.get(key) else {
+            continue;
+        };
+        for value in column {
+            if !value.is_finite() || levels.iter().any(|have| same(*have, *value)) {
+                continue;
+            }
+            if levels.len() + 1 >= limit {
+                return None;
+            }
+            levels.push(*value);
+        }
+    }
+    levels.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    Some(levels)
+}
+
+/// One X rule for every column. Automatic keeps a short quantized axis and
+/// otherwise uses 32 quantile bins. A fixed count always regroups.
+fn assign_x(
+    tables: &mut [BTreeMap<String, Vec<f32>>],
+    column: &str,
+    choice: &BinChoice,
+) -> Vec<f32> {
+    let quantiles = match choice {
+        BinChoice::Fixed(count) => *count,
+        BinChoice::Automatic => match quantized_levels(tables, column, AUTO_LEVELS) {
+            Some(levels) => {
+                for table in tables.iter_mut() {
+                    let values = table.get(column).cloned().unwrap_or_default();
+                    table.insert("_bin".to_string(), values);
+                }
+                return levels;
+            }
+            None => AUTO_QUANTILES,
+        },
+    };
+    let values: Vec<f32> = tables
+        .iter()
+        .flat_map(|table| table.get(column).into_iter().flatten().copied())
+        .collect();
+    let edges = quantile_edges(&values, quantiles);
+    for table in tables.iter_mut() {
+        let centers =
+            assign_bin_centers(table.get(column).map(Vec::as_slice).unwrap_or(&[]), &edges);
+        table.insert("_bin".to_string(), centers);
+    }
+    unique_values(tables, "_bin")
+}
+
+fn unique_values(tables: &[BTreeMap<String, Vec<f32>>], key: &str) -> Vec<f32> {
+    let mut values = Vec::new();
+    for table in tables {
+        if let Some(column) = table.get(key) {
+            for value in column {
+                if value.is_finite() && !values.iter().any(|have| same(*have, *value)) {
+                    values.push(*value);
+                }
+            }
+        }
+    }
+    values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    values
+}
+
+fn dose_rate_table(table: &BTreeMap<String, Vec<f32>>) -> BTreeMap<String, Vec<f32>> {
+    let mut out = BTreeMap::new();
+    if let (Some(energy), Some(rate)) = (table.get("rate_energy"), table.get("mu_rate")) {
+        out.insert("energy".to_string(), energy.clone());
+        out.insert("mu_rate".to_string(), rate.clone());
+    }
+    if let Some(avg) = table.get("session_avg_rate") {
+        out.insert("session_avg_rate".to_string(), avg.clone());
+    }
+    out
+}
+
+fn group_samples(bins: Option<&Vec<f32>>, y: &[f32], categories: &[f32]) -> Vec<Vec<f32>> {
+    let mut groups = vec![Vec::new(); categories.len()];
+    let Some(bins) = bins else {
+        return groups;
+    };
+    if categories.is_empty() {
+        return groups;
+    }
+    for (bin, value) in bins.iter().zip(y) {
+        if !bin.is_finite() || !value.is_finite() {
+            continue;
+        }
+        let mut index = categories.partition_point(|category| *category < *bin);
+        if index == categories.len() || !same(categories[index], *bin) {
+            if index > 0 && same(categories[index - 1], *bin) {
+                index -= 1;
+            } else {
+                continue;
+            }
+        }
+        groups[index].push(*value);
+    }
+    groups
+}
+
+fn has_finite(values: Option<&Vec<f32>>) -> bool {
+    values.is_some_and(|values| values.iter().any(|value| value.is_finite()))
+}
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use scan_kit_core::Series;
+
+    use super::super::marks::apply_filter;
+    use super::{
+        assign_x, axis_label, binned_summary, binned_trend, violin_series, BinChoice, Trend,
+    };
+
+    #[test]
+    fn first_log_on_disk_has_finite_dose_error() {
+        let root =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../test_data/logs");
+        let Ok(entries) = std::fs::read_dir(&root) else {
+            return;
+        };
+        let Some(session) = entries.filter_map(|entry| entry.ok()).find_map(|entry| {
+            let id = entry.file_name().to_string_lossy().into_owned();
+            crate::discover::session_directory(&root, &id)
+                .join("spot_data.csv")
+                .is_file()
+                .then_some(id)
+        }) else {
+            return;
+        };
+        let scene = binned_summary(&root, &[session], &serde_json::json!({}));
+        assert!(
+            scene
+                .panels
+                .iter()
+                .any(|panel| panel.title.starts_with("IC1")),
+            "dose error should plot when the log has padded dose numbers",
+        );
+    }
+
+    #[test]
+    fn scatter_position_and_dose_rate_follow_the_python_rules() {
+        let root = std::env::temp_dir().join(format!("scan-kit-binned-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let session = root.join("sess");
+        std::fs::create_dir_all(&session).unwrap();
+        std::fs::write(
+            session.join("input_map.csv"),
+            "energy,charge_req,position_x,position_y,layer_id\n70,1,0,0,1\n70,1,0,0,1\n90,2,10,0,2\n",
+        )
+        .unwrap();
+        std::fs::write(
+            session.join("spot_data.csv"),
+            "ic1_total_dose,r_ic1_x_spot_position,r_ic1_y_spot_position,layer_id,timestamp,timestamp\n1.1,1,0,1,0,999\n1.1,3,0,1,1000,999\n2.2,12,-1,2,2000,999\n",
+        )
+        .unwrap();
+        let ids = ["sess".to_string()];
+        let scatter = binned_summary(&root, &ids, &serde_json::json!({"glyph": "Scatter"}));
+        let dose = scatter
+            .panels
+            .iter()
+            .find(|panel| panel.title.starts_with("IC1"))
+            .unwrap();
+        assert!(dose.xmin > 50.0, "scatter x is energy in MeV");
+        let position = binned_summary(
+            &root,
+            &ids,
+            &serde_json::json!({"metric": "Position Error (mm)"}),
+        );
+        let xerr = position
+            .panels
+            .iter()
+            .find(|panel| panel.title == "IC1 X")
+            .unwrap();
+        let marks = rect_ys(xerr);
+        assert!(marks.iter().any(|value| (*value - 1.0).abs() < 1e-3));
+        let rate = binned_summary(
+            &root,
+            &ids,
+            &serde_json::json!({"metric": "Dose Rate (MU/s)"}),
+        );
+        let mu = rate
+            .panels
+            .iter()
+            .find(|panel| panel.title == "MU/S")
+            .unwrap();
+        assert!(rect_ys(mu).iter().any(|value| (*value - 2.0).abs() < 1e-3));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn sigma_is_twice_the_logged_column() {
+        let root = std::env::temp_dir().join("scan-kit-binned-sigma");
+        let _ = std::fs::remove_dir_all(&root);
+        let session = root.join("sess");
+        std::fs::create_dir_all(&session).unwrap();
+        std::fs::write(session.join("input_map.csv"), "energy,charge_req\n250,1\n").unwrap();
+        std::fs::write(
+            session.join("spot_data.csv"),
+            "ic1_total_dose_spot,r_ic1_x_spot_sigma\n1,3\n",
+        )
+        .unwrap();
+        let scene = binned_summary(
+            &root,
+            &["sess".to_string()],
+            &serde_json::json!({"metric": "Sigma (mm)"}),
+        );
+        let panel = scene
+            .panels
+            .iter()
+            .find(|panel| panel.title == "IC1 SX")
+            .unwrap();
+        assert!(rect_ys(panel)
+            .iter()
+            .any(|value| (*value - 6.0).abs() < 1e-3));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn chamber_raw_maps_strip_64_5_to_zero() {
+        let root = std::env::temp_dir().join("scan-kit-binned-chamber");
+        let _ = std::fs::remove_dir_all(&root);
+        let session = root.join("sess");
+        std::fs::create_dir_all(&session).unwrap();
+        std::fs::write(
+            session.join("input_map.csv"),
+            "energy,charge_req,position_x,position_y\n250,1,0,0\n",
+        )
+        .unwrap();
+        std::fs::write(
+            session.join("spot_data.csv"),
+            "ic1_total_dose_spot,r_ic1_x_spot_position,r_ic1_y_spot_position,r_ic2_x_spot_position,r_ic2_y_spot_position,r_ic1_x_spot_position_raw,r_ic1_y_spot_position_raw,r_ic2_x_spot_position_raw,r_ic2_y_spot_position_raw\n1,5,0,0,0,64.5,64.5,64.5,64.5\n",
+        )
+        .unwrap();
+        let ids = ["sess".to_string()];
+        let iso = binned_summary(
+            &root,
+            &ids,
+            &serde_json::json!({"metric": "Position Error (mm)"}),
+        );
+        let iso_x = iso
+            .panels
+            .iter()
+            .find(|panel| panel.title == "IC1 X")
+            .unwrap();
+        assert!(rect_ys(iso_x)
+            .iter()
+            .any(|value| (*value - 5.0).abs() < 1e-3));
+        let chamber = binned_summary(
+            &root,
+            &ids,
+            &serde_json::json!({"metric": "Position Error (mm)", "source": "chamber"}),
+        );
+        let chamber_x = chamber
+            .panels
+            .iter()
+            .find(|panel| panel.title == "IC1 X")
+            .unwrap();
+        assert!(rect_ys(chamber_x).iter().any(|value| value.abs() < 1e-2));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn spot_time_uses_time_s_and_time_ns_when_timestamp_is_absent() {
+        let root = std::env::temp_dir().join("scan-kit-binned-times");
+        let _ = std::fs::remove_dir_all(&root);
+        let session = root.join("sess");
+        std::fs::create_dir_all(&session).unwrap();
+        std::fs::write(
+            session.join("input_map.csv"),
+            "energy,charge_req,layer_id\n70,1,1\n",
+        )
+        .unwrap();
+        std::fs::write(
+            session.join("spot_data.csv"),
+            "layer_id,ic1_total_dose_spot,time_s,time_ns\n1,1,1,0\n",
+        )
+        .unwrap();
+        let scene = binned_summary(
+            &root,
+            &["sess".to_string()],
+            &serde_json::json!({"metric": "Spot Delivery Time"}),
+        );
+        let total = scene
+            .panels
+            .iter()
+            .find(|panel| panel.title == "TOTAL MS")
+            .unwrap();
+        assert!(rect_ys(total)
+            .iter()
+            .any(|value| (*value - 1000.0).abs() < 1e-2));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn beam_on_time_comes_from_the_layer_run() {
+        let root = std::env::temp_dir().join("scan-kit-binned-point");
+        let _ = std::fs::remove_dir_all(&root);
+        let session = root.join("sess");
+        std::fs::create_dir_all(session.join("layer-0/run-0")).unwrap();
+        std::fs::write(
+            session.join("input_map.csv"),
+            "energy,charge_req,layer_id\n250,1,7\n",
+        )
+        .unwrap();
+        std::fs::write(
+            session.join("spot_data.csv"),
+            "spot_no,layer_id,ic1_total_dose_spot,timestamp\n4,7,1,1000\n",
+        )
+        .unwrap();
+        std::fs::write(
+            session.join("layer-0/run-0/FX4_spot_data.csv"),
+            "spot_no,layer_id,point_time(ms)\n4,7,12.5\n",
+        )
+        .unwrap();
+        let scene = binned_summary(
+            &root,
+            &["sess".to_string()],
+            &serde_json::json!({"metric": "Spot Delivery Time"}),
+        );
+        let beam = scene
+            .panels
+            .iter()
+            .find(|panel| panel.title == "BEAM ON")
+            .unwrap();
+        assert!(rect_ys(beam)
+            .iter()
+            .any(|value| (*value - 12.5).abs() < 1e-3));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn timeslice_sigma_stays_in_millimetres() {
+        let root = std::env::temp_dir().join("scan-kit-binned-slice-sigma");
+        let _ = std::fs::remove_dir_all(&root);
+        let session = root.join("sess");
+        std::fs::create_dir_all(session.join("layer-0/run-0")).unwrap();
+        std::fs::write(session.join("input_map.csv"), "energy,layer_id\n70,1\n").unwrap();
+        std::fs::write(session.join("spot_data.csv"), "ic1_total_dose_spot\n1\n").unwrap();
+        std::fs::write(
+            session.join("layer-0/run-0/timeslice_data_device_units.csv"),
+            "layer_id,rci_in_trigger,r_ic1_x_sigma,r_ic1_x_spot_error_code\n1,1,4,0\n1,1,30,0\n",
+        )
+        .unwrap();
+        let scene = binned_summary(
+            &root,
+            &["sess".to_string()],
+            &serde_json::json!({"metric": "Sigma (mm)", "source": "timeslice_iso"}),
+        );
+        let panel = scene
+            .panels
+            .iter()
+            .find(|panel| panel.title == "IC1 SX")
+            .unwrap();
+        let marks = rect_ys(panel);
+        assert!(marks.iter().any(|value| (*value - 4.0).abs() < 1e-2));
+        assert!(marks.iter().all(|value| *value < 20.0));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn timeslice_isocenter_error_uses_the_strip_fit() {
+        let root = std::env::temp_dir().join("scan-kit-binned-slice-pos");
+        let _ = std::fs::remove_dir_all(&root);
+        let session = root.join("sess");
+        std::fs::create_dir_all(session.join("layer-0/run-0")).unwrap();
+        let mut spot = String::from(
+            "spot_no,layer_id,r_ic1_x_spot_position_raw,r_ic1_x_spot_position,r_ic1_y_spot_position_raw,r_ic1_y_spot_position,r_ic2_x_spot_position_raw,r_ic2_x_spot_position,r_ic2_y_spot_position_raw,r_ic2_y_spot_position\n",
+        );
+        let mut map = String::from("energy,layer_id,spot_no,position_x,position_y\n");
+        for i in 0..12 {
+            let strip = 20.0 + i as f32;
+            let iso = strip - 64.5;
+            spot.push_str(&format!(
+                "{i},1,{strip},{iso},{strip},{iso},{strip},{iso},{strip},{iso}\n"
+            ));
+            map.push_str(&format!("70,1,{i},{iso},0\n"));
+        }
+        std::fs::write(session.join("spot_data.csv"), spot).unwrap();
+        std::fs::write(session.join("input_map.csv"), map).unwrap();
+        std::fs::write(
+            session.join("layer-0/run-0/timeslice_data_device_units.csv"),
+            "layer_id,spot_no,rci_in_trigger,r_ic1_x_position\n1,5,1,25\n",
+        )
+        .unwrap();
+        let scene = binned_summary(
+            &root,
+            &["sess".to_string()],
+            &serde_json::json!({"metric": "Position Error (mm)", "source": "Timeslice — Isocenter"}),
+        );
+        let panel = scene
+            .panels
+            .iter()
+            .find(|panel| panel.title == "IC1 X")
+            .unwrap();
+        assert!(rect_ys(panel).iter().any(|value| value.abs() < 1e-2));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn timeslice_isocenter_error_reads_spot_position() {
+        let root = std::env::temp_dir().join("scan-kit-binned-slice-spot-pos");
+        let _ = std::fs::remove_dir_all(&root);
+        let session = root.join("sess");
+        std::fs::create_dir_all(session.join("layer-0/run-0")).unwrap();
+        let mut spot = String::from(
+            "spot_no,layer_id,r_ic1_x_spot_position_raw,r_ic1_x_spot_position,r_ic1_y_spot_position_raw,r_ic1_y_spot_position,r_ic2_x_spot_position_raw,r_ic2_x_spot_position,r_ic2_y_spot_position_raw,r_ic2_y_spot_position\n",
+        );
+        let mut map = String::from("energy,layer_id,spot_no,position_x,position_y\n");
+        for i in 0..12 {
+            let strip = 20.0 + i as f32;
+            let iso = strip - 64.5;
+            spot.push_str(&format!(
+                "{i},1,{strip},{iso},{strip},{iso},{strip},{iso},{strip},{iso}\n"
+            ));
+            map.push_str(&format!("70,1,{i},{iso},0\n"));
+        }
+        std::fs::write(session.join("spot_data.csv"), spot).unwrap();
+        std::fs::write(session.join("input_map.csv"), map).unwrap();
+        std::fs::write(
+            session.join("layer-0/run-0/timeslice_data_device_units.csv"),
+            "layer_id,spot_no,rci_in_trigger,r_ic1_x_spot_position\n1,5,1,25\n",
+        )
+        .unwrap();
+        let scene = binned_summary(
+            &root,
+            &["sess".to_string()],
+            &serde_json::json!({"metric": "Position Error (mm)", "source": "Timeslice — Isocenter"}),
+        );
+        let panel = scene
+            .panels
+            .iter()
+            .find(|panel| panel.title == "IC1 X")
+            .unwrap();
+        assert!(rect_ys(panel).iter().any(|value| value.abs() < 1e-2));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn timeslice_primary_channel_is_ic_current() {
+        let root = std::env::temp_dir().join("scan-kit-binned-slice-current");
+        let _ = std::fs::remove_dir_all(&root);
+        let session = root.join("sess");
+        std::fs::create_dir_all(session.join("layer-0/run-0")).unwrap();
+        std::fs::write(session.join("input_map.csv"), "energy,layer_id\n70,1\n").unwrap();
+        std::fs::write(
+            session.join("layer-0/run-0/timeslice_data_device_units.csv"),
+            "layer_id,ic1_primary_channel,ic3_current_A\n1,12,3\n",
+        )
+        .unwrap();
+        let scene = binned_summary(
+            &root,
+            &["sess".to_string()],
+            &serde_json::json!({"metric": "IC Current (nA)"}),
+        );
+        let ic1 = scene
+            .panels
+            .iter()
+            .find(|panel| panel.title == "IC1")
+            .unwrap();
+        let ic3 = scene
+            .panels
+            .iter()
+            .find(|panel| panel.title == "IC3")
+            .unwrap();
+        assert!(rect_ys(ic1).iter().any(|value| (value - 12.0).abs() < 1e-2));
+        assert!(rect_ys(ic3).iter().any(|value| (value - 3.0).abs() < 1e-2));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn timeslice_energy_follows_the_layer_folder() {
+        let root = std::env::temp_dir().join("scan-kit-binned-slice-energy");
+        let _ = std::fs::remove_dir_all(&root);
+        let session = root.join("sess");
+        std::fs::create_dir_all(session.join("layer-0/run-0")).unwrap();
+        std::fs::create_dir_all(session.join("layer-1/run-0")).unwrap();
+        std::fs::write(
+            session.join("input_map.csv"),
+            "energy,layer_id\n180,9\n70,9\n",
+        )
+        .unwrap();
+        std::fs::write(
+            session.join("layer-0/run-0/timeslice_data_device_units.csv"),
+            "layer_id,ic1_primary_channel\n9,11\n",
+        )
+        .unwrap();
+        std::fs::write(
+            session.join("layer-1/run-0/timeslice_data_device_units.csv"),
+            "layer_id,ic1_primary_channel\n9,22\n",
+        )
+        .unwrap();
+        let scene = binned_summary(
+            &root,
+            &["sess".to_string()],
+            &serde_json::json!({"metric": "IC Current (nA)", "glyph": "Scatter"}),
+        );
+        let panel = scene
+            .panels
+            .iter()
+            .find(|panel| panel.title == "IC1")
+            .unwrap();
+        let points = panel.series.iter().find_map(|series| match series {
+            Series::Points { xs, ys, .. } => {
+                Some(xs.iter().zip(ys).map(|(x, y)| (*x, *y)).collect::<Vec<_>>())
+            }
+            _ => None,
+        });
+        let points = points.unwrap();
+        assert!(points
+            .iter()
+            .any(|(x, y)| (x - 180.0).abs() < 1.0 && (y - 11.0).abs() < 1e-2));
+        assert!(points
+            .iter()
+            .any(|(x, y)| (x - 70.0).abs() < 1.0 && (y - 22.0).abs() < 1e-2));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn timeslice_ic2_uses_its_own_spot_number() {
+        let root = std::env::temp_dir().join("scan-kit-binned-slice-ic2");
+        let _ = std::fs::remove_dir_all(&root);
+        let session = root.join("sess");
+        std::fs::create_dir_all(session.join("layer-0/run-0")).unwrap();
+        let mut spot = String::from(
+            "spot_no,layer_id,r_ic1_x_spot_position_raw,r_ic1_x_spot_position,r_ic1_y_spot_position_raw,r_ic1_y_spot_position,r_ic2_x_spot_position_raw,r_ic2_x_spot_position,r_ic2_y_spot_position_raw,r_ic2_y_spot_position\n",
+        );
+        let mut map = String::from("energy,layer_id,spot_no,position_x,position_y\n");
+        for i in 0..12 {
+            let strip = 20.0 + i as f32;
+            let iso = strip - 64.5;
+            spot.push_str(&format!(
+                "{i},1,{strip},{iso},{strip},{iso},{strip},{iso},{strip},{iso}\n"
+            ));
+            map.push_str(&format!("70,1,{i},{iso},0\n"));
+        }
+        std::fs::write(session.join("spot_data.csv"), spot).unwrap();
+        std::fs::write(session.join("input_map.csv"), map).unwrap();
+        std::fs::write(
+            session.join("layer-0/run-0/timeslice_data_device_units.csv"),
+            "layer_id,spot_no,spot_no,spot_no,rci_in_trigger,r_ic2_x_position\n1,0,1,5,1,25\n",
+        )
+        .unwrap();
+        let scene = binned_summary(
+            &root,
+            &["sess".to_string()],
+            &serde_json::json!({"metric": "Position Error (mm)", "source": "timeslice_iso"}),
+        );
+        let panel = scene
+            .panels
+            .iter()
+            .find(|panel| panel.title == "IC2 X")
+            .unwrap();
+        assert!(rect_ys(panel).iter().any(|value| value.abs() < 1e-2));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn timeslice_sigma_rejects_low_confidence() {
+        let root = std::env::temp_dir().join("scan-kit-binned-slice-conf");
+        let _ = std::fs::remove_dir_all(&root);
+        let session = root.join("sess");
+        std::fs::create_dir_all(session.join("layer-0/run-0")).unwrap();
+        std::fs::write(session.join("input_map.csv"), "energy,layer_id\n70,1\n").unwrap();
+        std::fs::write(session.join("spot_data.csv"), "ic1_total_dose_spot\n1\n").unwrap();
+        std::fs::write(
+            session.join("layer-0/run-0/timeslice_data_device_units.csv"),
+            "layer_id,rci_in_trigger,r_ic1_x_sigma,r_ic1_x_confidence,ic1_x_fit_ok,r_ic1_x_spot_error_code\n1,1,4,50,1,0\n",
+        )
+        .unwrap();
+        let scene = binned_summary(
+            &root,
+            &["sess".to_string()],
+            &serde_json::json!({"metric": "sigma", "source": "timeslice_iso"}),
+        );
+        assert!(scene.panels.iter().all(|panel| panel.title != "IC1 SX"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn timeslice_chamber_reverses_ic2_when_closer() {
+        let root = std::env::temp_dir().join("scan-kit-binned-slice-chamber");
+        let _ = std::fs::remove_dir_all(&root);
+        let session = root.join("sess");
+        std::fs::create_dir_all(session.join("layer-0/run-0")).unwrap();
+        std::fs::write(
+            session.join("input_map.csv"),
+            "energy,layer_id,spot_no,position_x,position_y\n70,1,1,0,0\n",
+        )
+        .unwrap();
+        std::fs::write(session.join("spot_data.csv"), "ic1_total_dose_spot\n1\n").unwrap();
+        std::fs::write(
+            session.join("layer-0/run-0/timeslice_data_device_units.csv"),
+            "layer_id,spot_no,rci_in_trigger,r_ic1_x_position,r_ic2_x_position\n1,1,1,70,60\n",
+        )
+        .unwrap();
+        let scene = binned_summary(
+            &root,
+            &["sess".to_string()],
+            &serde_json::json!({"metric": "ic12_pos_diff", "source": "timeslice_chamber"}),
+        );
+        let panel = scene
+            .panels
+            .iter()
+            .find(|panel| panel.title == "DX")
+            .unwrap();
+        assert!(rect_ys(panel)
+            .iter()
+            .any(|value| (*value + 2.0).abs() < 1e-2));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn spot_timeslice_switch_follows_the_metric_list() {
+        let spot = binned_summary(
+            std::path::Path::new("."),
+            &[],
+            &serde_json::json!({"metric": "Dose Error (%)"}),
+        );
+        let source = spot
+            .controls
+            .iter()
+            .find(|control| control.id == "source")
+            .unwrap();
+        assert_eq!(
+            source.options,
+            vec!["Spot".to_string(), "Timeslice".to_string()]
+        );
+        assert_eq!(source.value, "Spot");
+        assert!(spot.controls.iter().all(|control| control.id != "frame"));
+        let metric = spot
+            .controls
+            .iter()
+            .find(|control| control.id == "metric")
+            .unwrap();
+        assert_eq!(metric.value, "Dose Error (%)");
+        assert!(metric
+            .options
+            .iter()
+            .any(|option| option == "Position Error (mm) (Isocenter)"));
+        assert!(metric
+            .options
+            .iter()
+            .any(|option| option == "Position Error (mm) (Chamber)"));
+        assert!(metric
+            .options
+            .iter()
+            .all(|option| option != "IC Current (nA)"));
+        assert!(metric
+            .options
+            .iter()
+            .all(|option| option != "Fit Confidence"));
+        let bins = spot
+            .controls
+            .iter()
+            .find(|control| control.id == "bins")
+            .unwrap();
+        assert_eq!(bins.value, "Automatic");
+        assert_eq!(
+            bins.options,
+            vec![
+                "Automatic".to_string(),
+                "8".to_string(),
+                "16".to_string(),
+                "32".to_string(),
+                "64".to_string()
+            ]
+        );
+        let trend = spot
+            .controls
+            .iter()
+            .find(|control| control.id == "trend")
+            .unwrap();
+        assert_eq!(trend.value, "Off");
+        assert_eq!(
+            trend.options,
+            vec![
+                "Off".to_string(),
+                "Linear".to_string(),
+                "Polynomial".to_string()
+            ]
+        );
+        assert!(spot.controls.iter().all(|control| control.id != "fliers"));
+        assert!(spot.controls.iter().all(|control| control.id != "cutoff"));
+        let position = binned_summary(
+            std::path::Path::new("."),
+            &[],
+            &serde_json::json!({"metric": "position_error"}),
+        );
+        let interlock = position
+            .controls
+            .iter()
+            .find(|control| control.id == "interlock")
+            .unwrap();
+        assert_eq!(interlock.label, "Interlock Thresholds");
+        assert_eq!(interlock.value, "Off");
+        assert_eq!(interlock.options, vec!["Off".to_string(), "On".to_string()]);
+
+        let switched = binned_summary(
+            std::path::Path::new("."),
+            &[],
+            &serde_json::json!({"metric": "Dose Error (%)", "source": "Timeslice"}),
+        );
+        let metric = switched
+            .controls
+            .iter()
+            .find(|control| control.id == "metric")
+            .unwrap();
+        assert_eq!(metric.value, "Current Ratios (%)");
+        for label in [
+            "Fit Confidence",
+            "Peak Amplitude",
+            "Amplifier Error (V)",
+            "Probe Field (G)",
+            "Position Error (mm)",
+        ] {
+            assert!(
+                metric.options.iter().any(|option| option == label),
+                "{label}"
+            );
+        }
+        let fit = binned_summary(
+            std::path::Path::new("."),
+            &[],
+            &serde_json::json!({"metric": "Fit Confidence", "source": "Timeslice", "x": "Target MU"}),
+        );
+        let x = fit
+            .controls
+            .iter()
+            .find(|control| control.id == "x")
+            .unwrap();
+        assert_eq!(x.value, "Energy");
+        assert_eq!(x.options, vec!["Energy".to_string()]);
+        assert!(metric
+            .options
+            .iter()
+            .any(|option| option == "IC2-IC1 Position (mm) (Chamber)"));
+        assert!(metric
+            .options
+            .iter()
+            .all(|option| option != "Dose Error (%)"));
+        assert!(metric
+            .options
+            .iter()
+            .all(|option| option != "Position Error (mm) (Chamber)"));
+
+        let position = binned_summary(
+            std::path::Path::new("."),
+            &[],
+            &serde_json::json!({"metric": "Position Error (mm) (Chamber)", "source": "Spot"}),
+        );
+        assert_eq!(
+            position
+                .controls
+                .iter()
+                .find(|control| control.id == "metric")
+                .unwrap()
+                .value,
+            "Position Error (mm) (Chamber)"
+        );
+        assert!(position
+            .controls
+            .iter()
+            .all(|control| control.id != "frame"));
+        let slice = binned_summary(
+            std::path::Path::new("."),
+            &[],
+            &serde_json::json!({"metric": "Position Error (mm)", "source": "Timeslice", "frame": "Chamber"}),
+        );
+        assert_eq!(
+            slice
+                .controls
+                .iter()
+                .find(|control| control.id == "metric")
+                .unwrap()
+                .value,
+            "Position Error (mm)"
+        );
+        assert!(slice.controls.iter().any(|control| control.id == "bins"));
+        assert!(slice.controls.iter().all(|control| control.id != "frame"));
+
+        let current = binned_summary(
+            std::path::Path::new("."),
+            &[],
+            &serde_json::json!({"metric": "IC Current (nA)"}),
+        );
+        assert_eq!(
+            current
+                .controls
+                .iter()
+                .find(|control| control.id == "source")
+                .unwrap()
+                .value,
+            "Timeslice"
+        );
+    }
+
+    #[test]
+    fn histograms_keep_each_session_range() {
+        let root = std::env::temp_dir().join("scan-kit-binned-hist");
+        let _ = std::fs::remove_dir_all(&root);
+        for (id, dose) in [("a", "1"), ("b", "2")] {
+            let session = root.join(id);
+            std::fs::create_dir_all(&session).unwrap();
+            std::fs::write(session.join("input_map.csv"), "energy,charge_req\n70,1\n").unwrap();
+            std::fs::write(
+                session.join("spot_data.csv"),
+                format!("ic1_total_dose_spot\n{dose}\n"),
+            )
+            .unwrap();
+        }
+        let ids = ["a".to_string(), "b".to_string()];
+        let own = binned_summary(&root, &ids, &serde_json::json!({"hist": "On"}));
+        let shared = binned_summary(
+            &root,
+            &ids,
+            &serde_json::json!({"hist": "On", "shared": "On"}),
+        );
+        let hist = own
+            .panels
+            .iter()
+            .find(|panel| panel.y_label == "Probability (%)")
+            .unwrap();
+        assert!(hist.title.is_empty());
+        assert!(hist
+            .series
+            .iter()
+            .any(|series| matches!(series, Series::Polyline { .. })));
+        let own_edges = hist_edges(&own);
+        let shared_edges = hist_edges(&shared);
+        assert!(own_edges[0].last().unwrap() < &10.0);
+        assert!(own_edges[1].last().unwrap() > &50.0);
+        assert!(shared_edges[0].last().unwrap() > &50.0);
+        assert!(shared_edges[1].last().unwrap() > &50.0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn automatic_bins_keep_a_short_axis_and_a_fixed_count_regroups() {
+        let column = |values: &[f32]| {
+            let mut table = BTreeMap::new();
+            table.insert("x".to_string(), values.to_vec());
+            vec![table]
+        };
+        let short = column(&[1.0, 1.0, 2.0, 5.0]);
+        let mut tables = short;
+        let levels = assign_x(&mut tables, "x", &BinChoice::Automatic);
+        assert_eq!(levels, vec![1.0, 2.0, 5.0]);
+        assert_eq!(tables[0]["_bin"], vec![1.0, 1.0, 2.0, 5.0]);
+
+        let many: Vec<f32> = (0..100).map(|value| value as f32).collect();
+        let mut tables = column(&many);
+        let grouped = assign_x(&mut tables, "x", &BinChoice::Automatic);
+        assert!(
+            grouped.len() <= 32,
+            "a long axis falls back to quantile bins"
+        );
+        assert!(grouped.len() > 1);
+
+        let mut tables = column(&[10.0, 20.0, 30.0, 40.0, 50.0]);
+        let fixed = assign_x(&mut tables, "x", &BinChoice::Fixed(2));
+        assert!(fixed.len() <= 2);
+    }
+
+    #[test]
+    fn trend_line_crosses_the_axis_and_a_polynomial_bends() {
+        let mut table = BTreeMap::new();
+        table.insert("_bin".to_string(), vec![20.0, 20.0, 30.0, 30.0]);
+        table.insert("y".to_string(), vec![2.0, 2.0, 4.0, 4.0]);
+        let line = binned_trend(
+            &table,
+            &table["y"],
+            &[10.0, 20.0, 30.0],
+            0,
+            -0.6,
+            2.6,
+            Trend::Linear,
+        )
+        .unwrap();
+        let Series::Polyline { xs, .. } = &line else {
+            panic!("trend is a polyline");
+        };
+        assert!((xs[0] + 0.6).abs() < 1e-4, "left edge, got {}", xs[0]);
+        assert!((xs.last().unwrap() - 2.6).abs() < 1e-4, "right edge");
+
+        let mut curved = BTreeMap::new();
+        curved.insert("_bin".to_string(), vec![0.0, 1.0, 2.0]);
+        curved.insert("y".to_string(), vec![0.0, 1.0, 0.0]);
+        let y_at_middle = |mode: Trend| {
+            let line =
+                binned_trend(&curved, &curved["y"], &[0.0, 1.0, 2.0], 0, -0.6, 2.6, mode).unwrap();
+            let Series::Polyline { xs, ys, .. } = line else {
+                panic!("trend is a polyline");
+            };
+            let middle = 1.0 + (0.0 - 0.5) * super::OFFSET;
+            let (mut best, mut y) = (f32::MAX, 0.0);
+            for (x, value) in xs.iter().zip(&ys) {
+                let distance = (x - middle).abs();
+                if distance < best {
+                    best = distance;
+                    y = *value;
+                }
+            }
+            y
+        };
+        assert!(y_at_middle(Trend::Linear) < 0.5);
+        assert!(y_at_middle(Trend::Polynomial) > 0.5);
+    }
+
+    #[test]
+    fn filters_keep_the_rows_their_names_describe() {
+        let values: Vec<f32> = (0..20).map(|value| value as f32).chain([1000.0]).collect();
+        let mut beam = vec![1.0; values.len()];
+        beam[0] = 0.0;
+        let fresh = || {
+            let mut table = BTreeMap::new();
+            table.insert("y".to_string(), values.clone());
+            table.insert("beam_on".to_string(), beam.clone());
+            table
+        };
+        let finite = |table: &BTreeMap<String, Vec<f32>>| {
+            table["y"]
+                .iter()
+                .copied()
+                .filter(|value| value.is_finite())
+                .collect::<Vec<_>>()
+        };
+
+        let mut upper = fresh();
+        apply_filter(&mut upper, &["y"], "upper_95", "beam_both");
+        assert_eq!(finite(&upper), vec![1000.0]);
+
+        let mut lower = fresh();
+        apply_filter(&mut lower, &["y"], "lower_95", "beam_both");
+        let kept = finite(&lower);
+        assert!(kept.contains(&1.0));
+        assert!(!kept.contains(&1000.0));
+
+        let mut mad = fresh();
+        apply_filter(&mut mad, &["y"], "mad_outliers", "beam_both");
+        assert_eq!(finite(&mad), vec![1000.0]);
+
+        let mut off = fresh();
+        apply_filter(&mut off, &["y"], "all", "beam_off");
+        assert_eq!(finite(&off), vec![0.0]);
+
+        let mut on = fresh();
+        apply_filter(&mut on, &["y"], "all", "beam_on");
+        let kept = finite(&on);
+        assert!(!kept.contains(&0.0));
+        assert!(kept.contains(&1000.0));
+
+        let dose = binned_summary(
+            std::path::Path::new("."),
+            &[],
+            &serde_json::json!({"metric": "dose_error"}),
+        );
+        let beam = dose
+            .controls
+            .iter()
+            .find(|control| control.id == "beam")
+            .unwrap();
+        assert_eq!(beam.value, "Both");
+        assert_eq!(
+            beam.options,
+            vec![
+                "Beam On".to_string(),
+                "Beam Off".to_string(),
+                "Both".to_string()
+            ]
+        );
+        let domain = dose
+            .controls
+            .iter()
+            .find(|control| control.id == "domain")
+            .unwrap();
+        assert_eq!(
+            domain.options,
+            vec![
+                "All".to_string(),
+                "Lower 95%".to_string(),
+                "Upper 5%".to_string(),
+                "MAD Outliers".to_string()
+            ]
+        );
+        let current = binned_summary(
+            std::path::Path::new("."),
+            &[],
+            &serde_json::json!({"metric": "ic_current"}),
+        );
+        let current_beam = current
+            .controls
+            .iter()
+            .find(|control| control.id == "beam")
+            .unwrap();
+        assert_eq!(current_beam.value, "Beam On");
+        let rate = binned_summary(
+            std::path::Path::new("."),
+            &[],
+            &serde_json::json!({"metric": "dose_rate"}),
+        );
+        assert!(rate
+            .controls
+            .iter()
+            .all(|control| control.id != "beam" && control.id != "domain"));
+    }
+
+    fn hist_edges(scene: &scan_kit_core::PlotScene) -> Vec<Vec<f32>> {
+        scene
+            .panels
+            .iter()
+            .find(|panel| panel.y_label == "Probability (%)")
+            .unwrap()
+            .series
+            .iter()
+            .filter_map(|series| match series {
+                Series::Bars { edges, .. } => Some(edges.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn rect_ys(panel: &scan_kit_core::Panel) -> Vec<f32> {
+        panel
+            .series
+            .iter()
+            .find_map(|series| match series {
+                Series::Rects { y, .. } => Some(y.clone()),
+                Series::Triangles { ys, .. } => Some(ys.clone()),
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn axis_label_includes_units_and_side_plots_are_wider() {
+        assert_eq!(axis_label("IC1", "IC Current (nA)"), "IC1 (nA)");
+        assert_eq!(axis_label("IC1 (%)", "Dose Error (%)"), "IC1 (%)");
+        assert_eq!(axis_label("MU/S", "Dose Rate (MU/s)"), "MU/S");
+        assert_eq!(axis_label("TOTAL MS", "Spot Delivery Time"), "TOTAL MS");
+        assert_eq!(axis_label("IC1 X", "Fit Confidence"), "IC1 X");
+        assert_eq!(axis_label("X", "Amplifier Error (V)"), "X (V)");
+        assert_eq!(axis_label("Y", "Probe Field (G)"), "Y (G)");
+        let scene = binned_summary(
+            std::path::Path::new("."),
+            &[],
+            &serde_json::json!({"hist": "On", "corr": "On"}),
+        );
+        assert_eq!(scene.column_weights, vec![8.0, 1.65, 1.65]);
+    }
+
+    #[test]
+    fn violin_is_a_filled_curve_with_an_outline() {
+        let mut table = BTreeMap::new();
+        let y: Vec<f32> = (0..40).map(|i| (i as f32 - 20.0) * 0.2).collect();
+        table.insert("_bin".to_string(), vec![1.0; y.len()]);
+        let drawn = violin_series(&table, &y, &[1.0], 0, [0.2, 0.4, 0.8, 0.55]);
+        let Series::Triangles { xs, ys, color } = &drawn[0] else {
+            panic!("violin fill should be triangles");
+        };
+        assert!((color[3] - 0.55).abs() < 1e-6);
+        assert_eq!(xs.len() % 3, 0);
+        assert_eq!(xs.len(), ys.len());
+        assert!(xs.len() > 12);
+        let Series::Polyline {
+            xs: outline,
+            ys: outline_y,
+            color: edge,
+            thickness,
+        } = &drawn[1]
+        else {
+            panic!("violin should keep a solid outline");
+        };
+        assert!((*thickness - 1.0).abs() < 1e-6);
+        assert_eq!(edge[3], 0.0);
+        let top = outline_y
+            .iter()
+            .copied()
+            .filter(|value| value.is_finite())
+            .fold(f32::MIN, f32::max);
+        let mut cap: Vec<f32> = outline
+            .iter()
+            .zip(outline_y)
+            .filter(|(x, y)| x.is_finite() && (**y - top).abs() < 1e-4)
+            .map(|(x, _)| *x)
+            .collect();
+        cap.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        cap.dedup_by(|a, b| (*a - *b).abs() < 1e-4);
+        assert!(
+            cap.len() >= 2,
+            "the outline should reach both corners of the top cap"
+        );
+        let mut widths: Vec<f32> = outline
+            .iter()
+            .copied()
+            .filter(|value| value.is_finite())
+            .map(f32::abs)
+            .collect();
+        widths.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        widths.dedup_by(|a, b| (*a - *b).abs() < 1e-4);
+        assert!(
+            widths.len() > 4,
+            "outline widths should follow the density, not a rectangle"
+        );
+    }
+}

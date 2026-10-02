@@ -10,12 +10,14 @@ mod columns;
 mod config;
 mod discover;
 mod dose_view;
+mod marks;
 mod mc_tables;
 mod patient_view;
 mod phantom;
 mod runner;
 mod store;
 mod synthesis;
+mod tables;
 
 pub use analysis::{analysis_scene, channel_catalog, load_timeslice_columns};
 pub use beam::{beam_record, protons_per_mu, spot_record};

@@ -10,8 +10,9 @@ use scan_kit_core::{
 };
 use serde_json::Value;
 
-use super::binned::{interlock_sigma_mm, pick, spot_table};
 use super::discover;
+use super::marks::pick;
+use super::tables::{interlock_sigma_mm, spot_table};
 
 const GUIDE: [f32; 4] = [0.62, 0.62, 0.62, 0.9];
 const MARK: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
@@ -609,7 +610,7 @@ fn load_cloud(
     sigma_ref: &str,
 ) -> Cloud {
     let table = if grain == "timeslice" {
-        super::binned::timeslice_signals(root, session)
+        super::tables::timeslice_signals(root, session)
     } else {
         spot_table(root, session)
     };

@@ -2,18 +2,10 @@ import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 
+import { CatalogField } from "@/CatalogField";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Field, FieldGroup, FieldLabel } from "@/components/ui/field";
-import { Input } from "@/components/ui/input";
-import {
-  Select,
-  SelectContent,
-  SelectGroup,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
 import { notifyError, notifySaved } from "@/notify";
 import { SidePane } from "@/SidePane";
 
@@ -113,29 +105,31 @@ export function PhantomSynthesis() {
       side={
       <div className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto p-3">
       <FieldGroup>
-        <ChoiceField
-          label="Phantom"
+        <CatalogField
+          param={{ label: "Phantom", kind: "choice", choices: catalog.phantoms }}
           value={params.phantom}
-          items={catalog.phantoms}
-          onChange={(phantom) => setParams({ ...params, phantom })}
+          onChange={(phantom) => setParams({ ...params, phantom: String(phantom) })}
         />
-        <ChoiceField
-          label="Patient Position"
+        <CatalogField
+          param={{
+            label: "Patient Position",
+            kind: "choice",
+            choices: catalog.positions.map((position) => ({ value: position, label: position })),
+          }}
           value={params.position}
-          items={catalog.positions.map((position) => ({ value: position, label: position }))}
-          onChange={(position) => setParams({ ...params, position })}
+          onChange={(position) => setParams({ ...params, position: String(position) })}
         />
-        <NumberField
-          label="Pixel Spacing (mm)"
+        <CatalogField
+          param={{ label: "Pixel Spacing (mm)", kind: "float", step: 0.25 }}
           value={params.pixel}
-          step={0.25}
-          onChange={(pixel) => setParams({ ...params, pixel })}
+          finiteOnly
+          onChange={(pixel) => setParams({ ...params, pixel: Number(pixel) })}
         />
-        <NumberField
-          label="Slice Thickness (mm)"
+        <CatalogField
+          param={{ label: "Slice Thickness (mm)", kind: "float", step: 0.5 }}
           value={params.slice}
-          step={0.5}
-          onChange={(slice) => setParams({ ...params, slice })}
+          finiteOnly
+          onChange={(slice) => setParams({ ...params, slice: Number(slice) })}
         />
         <Field>
           <FieldLabel>Energy Layers (MeV)</FieldLabel>
@@ -189,41 +183,41 @@ export function PhantomSynthesis() {
             })}
           </div>
         </Field>
-        <NumberField
-          label="Gantry Angle (°)"
+        <CatalogField
+          param={{ label: "Gantry Angle (°)", kind: "float", step: 15 }}
           value={params.gantry}
-          step={15}
-          onChange={(gantry) => setParams({ ...params, gantry })}
+          finiteOnly
+          onChange={(gantry) => setParams({ ...params, gantry: Number(gantry) })}
         />
-        <NumberField
-          label="Couch Angle (°)"
+        <CatalogField
+          param={{ label: "Couch Angle (°)", kind: "float", step: 15 }}
           value={params.couch}
-          step={15}
-          onChange={(couch) => setParams({ ...params, couch })}
+          finiteOnly
+          onChange={(couch) => setParams({ ...params, couch: Number(couch) })}
         />
-        <NumberField
-          label="Spot Pitch (mm)"
+        <CatalogField
+          param={{ label: "Spot Pitch (mm)", kind: "float", step: 1 }}
           value={params.spot_pitch}
-          step={1}
-          onChange={(spot_pitch) => setParams({ ...params, spot_pitch })}
+          finiteOnly
+          onChange={(spot_pitch) => setParams({ ...params, spot_pitch: Number(spot_pitch) })}
         />
-        <NumberField
-          label="Range Shifter WET (mm)"
+        <CatalogField
+          param={{ label: "Range Shifter WET (mm)", kind: "float", step: 5 }}
           value={params.range_shifter_wet}
-          step={5}
-          onChange={(range_shifter_wet) => setParams({ ...params, range_shifter_wet })}
+          finiteOnly
+          onChange={(range_shifter_wet) => setParams({ ...params, range_shifter_wet: Number(range_shifter_wet) })}
         />
-        <NumberField
-          label="MU per Spot"
+        <CatalogField
+          param={{ label: "MU per Spot", kind: "float", step: 0.01 }}
           value={params.mu_per_spot}
-          step={0.01}
-          onChange={(mu_per_spot) => setParams({ ...params, mu_per_spot })}
+          finiteOnly
+          onChange={(mu_per_spot) => setParams({ ...params, mu_per_spot: Number(mu_per_spot) })}
         />
-        <NumberField
-          label="Fractions"
+        <CatalogField
+          param={{ label: "Fractions", kind: "float", step: 1 }}
           value={params.fractions}
-          step={1}
-          onChange={(fractions) => setParams({ ...params, fractions })}
+          finiteOnly
+          onChange={(fractions) => setParams({ ...params, fractions: Number(fractions) })}
         />
         <Button type="button" disabled={busy} onClick={() => void writeStudy()}>
           Write DICOM
@@ -238,67 +232,6 @@ export function PhantomSynthesis() {
   function setEnergies(next: number[]) {
     setParams({ ...params!, energies: next });
   }
-}
-
-function ChoiceField({
-  label,
-  value,
-  items,
-  onChange,
-}: {
-  label: string;
-  value: string;
-  items: Choice[];
-  onChange: (value: string) => void;
-}) {
-  return (
-    <Field>
-      <FieldLabel>{label}</FieldLabel>
-      <Select items={items} value={value} onValueChange={(next) => next != null && onChange(next)}>
-        <SelectTrigger className="w-full cursor-pointer">
-          <SelectValue />
-        </SelectTrigger>
-        <SelectContent>
-          <SelectGroup>
-            {items.map((item) => (
-              <SelectItem key={item.value} value={item.value}>
-                {item.label}
-              </SelectItem>
-            ))}
-          </SelectGroup>
-        </SelectContent>
-      </Select>
-    </Field>
-  );
-}
-
-function NumberField({
-  label,
-  value,
-  step,
-  onChange,
-}: {
-  label: string;
-  value: number;
-  step: number;
-  onChange: (value: number) => void;
-}) {
-  return (
-    <Field>
-      <FieldLabel>{label}</FieldLabel>
-      <Input
-        type="number"
-        step={step}
-        value={Number.isFinite(value) ? String(value) : ""}
-        onChange={(event) => {
-          const next = Number(event.target.value);
-          if (Number.isFinite(next)) {
-            onChange(next);
-          }
-        }}
-      />
-    </Field>
-  );
 }
 
 function parentDir(path: string | null): string | undefined {

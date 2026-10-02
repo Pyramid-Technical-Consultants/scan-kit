@@ -4,14 +4,24 @@
 
 use serde_json::{json, Value};
 
+mod field;
+mod name;
+mod pld;
+mod weight;
+
+use field::{order_within_layers, rectangular_field, sort_rows, zero_field};
+use name::suggest_filename;
+pub use pld::parse_pld;
+use weight::spot_weights;
+
 pub const PREVIEW_CAP: usize = 5_000;
 /// ponytail: a larger request is refused so one call cannot allocate hundreds of megabytes.
 /// Raise this if a real template needs more spots.
-const MAX_SPOTS: usize = 1_000_000;
-const DEFAULT_CURRENT_A: f64 = 1e-9;
-const DEFAULT_BEAM_SIZE_MM: f64 = 3.61;
-const DELIVERY_MU_PER_S: f64 = 0.4;
-const WEIGHT_SCALE: f64 = 10_000.0;
+pub(super) const MAX_SPOTS: usize = 1_000_000;
+pub(super) const DEFAULT_CURRENT_A: f64 = 1e-9;
+pub(super) const DEFAULT_BEAM_SIZE_MM: f64 = 3.61;
+pub(super) const DELIVERY_MU_PER_S: f64 = 0.4;
+pub(super) const WEIGHT_SCALE: f64 = 10_000.0;
 
 const EXPORT_COLUMNS: [&str; 8] = [
     "#NO",
@@ -29,7 +39,7 @@ pub fn standard_energies() -> &'static [f64] {
     &STANDARD_ENERGIES_MEV
 }
 
-const STANDARD_ENERGIES_MEV: [f64; 76] = [
+pub(super) const STANDARD_ENERGIES_MEV: [f64; 76] = [
     70.0, 72.0, 74.0, 76.0, 78.0, 80.0, 82.0, 84.0, 86.0, 88.0, 90.0, 92.0, 94.0, 96.0, 98.0,
     100.0, 102.5, 105.0, 107.5, 110.0, 112.5, 115.0, 117.5, 120.0, 122.5, 125.0, 127.5, 130.0,
     132.5, 135.0, 137.5, 140.0, 142.5, 145.0, 147.5, 150.0, 152.5, 155.0, 157.5, 160.0, 162.5,
@@ -39,7 +49,7 @@ const STANDARD_ENERGIES_MEV: [f64; 76] = [
 ];
 
 #[derive(Clone, Debug)]
-struct Row {
+pub(super) struct Row {
     energy: f64,
     x: f64,
     y: f64,
@@ -313,65 +323,14 @@ pub fn dicom_beam_size(size_x: f64, size_y: f64, fallback: f64, use_dicom: bool)
     }
 }
 
-fn zero_field(params: &Value) -> Result<Vec<Row>, String> {
-    let energies = selected_energies(params);
-    let spots = int_param(params, "spots_per_layer", 100).max(0) as usize;
-    let mut draft = Vec::new();
-    for (layer, energy) in energies.iter().enumerate() {
-        for _ in 0..spots {
-            draft.push(Draft {
-                energy: *energy,
-                layer: layer as i32,
-                x: 0.0,
-                y: 0.0,
-            });
-        }
-    }
-    finish_generated(draft, params)
-}
-
-fn rectangular_field(params: &Value) -> Result<Vec<Row>, String> {
-    let energies = selected_energies(params);
-    let base = grid_positions(
-        number(params, "center_x_mm", 0.0),
-        number(params, "center_y_mm", 0.0),
-        number(params, "field_width_mm", 100.0),
-        number(params, "field_height_mm", 100.0),
-        int_param(params, "spots_x", 33).max(1) as usize,
-        int_param(params, "spots_y", 33).max(1) as usize,
-        &text(params, "fast_axis", "x"),
-        &text(params, "start_corner", "top_left"),
-    );
-    let transition = text(params, "layer_transition", "reset");
-    let mut draft = Vec::new();
-    for (layer, energy) in energies.iter().enumerate() {
-        let positions = if transition == "continue" && layer % 2 == 1 {
-            let mut reversed = base.clone();
-            reversed.reverse();
-            reversed
-        } else {
-            base.clone()
-        };
-        for (x, y) in positions {
-            draft.push(Draft {
-                energy: *energy,
-                layer: layer as i32,
-                x,
-                y,
-            });
-        }
-    }
-    finish_generated(draft, params)
-}
-
-struct Draft {
+pub(super) struct Draft {
     energy: f64,
     layer: i32,
     x: f64,
     y: f64,
 }
 
-fn finish_generated(draft: Vec<Draft>, params: &Value) -> Result<Vec<Row>, String> {
+pub(super) fn finish_generated(draft: Vec<Draft>, params: &Value) -> Result<Vec<Row>, String> {
     let charges = spot_weights(&draft, params)?;
     let current = DEFAULT_CURRENT_A;
     let beam = DEFAULT_BEAM_SIZE_MM;
@@ -414,470 +373,6 @@ fn rows_from_import(spots: &[ImportSpot], params: &Value) -> Result<Vec<Row>, St
         .collect();
     sort_rows(&mut rows);
     Ok(rows)
-}
-
-fn sort_rows(rows: &mut [Row]) {
-    rows.sort_by(|a, b| {
-        b.energy
-            .partial_cmp(&a.energy)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-}
-
-fn order_within_layers(spots: &[ImportSpot], order: &str, axis: &str) -> Vec<ImportSpot> {
-    let mut energies = Vec::new();
-    for spot in spots {
-        if !energies.contains(&spot.energy) {
-            energies.push(spot.energy);
-        }
-    }
-    let mut ordered = Vec::with_capacity(spots.len());
-    for energy in energies {
-        let layer: Vec<ImportSpot> = spots
-            .iter()
-            .filter(|spot| spot.energy == energy)
-            .cloned()
-            .collect();
-        let indices = if order == "minimize_travel" {
-            serpentine_indices(
-                &layer.iter().map(|spot| spot.x).collect::<Vec<_>>(),
-                &layer.iter().map(|spot| spot.y).collect::<Vec<_>>(),
-                axis,
-            )
-        } else {
-            let mut indices: Vec<usize> = (0..layer.len()).collect();
-            indices.sort_by_key(|&index| layer[index].plan_index);
-            indices
-        };
-        for index in indices {
-            ordered.push(layer[index].clone());
-        }
-    }
-    ordered
-}
-
-fn serpentine_indices(x: &[f64], y: &[f64], axis: &str) -> Vec<usize> {
-    let n = x.len();
-    if n <= 1 {
-        return (0..n).collect();
-    }
-    let (slow, fast): (Vec<f64>, Vec<f64>) = if axis == "y" {
-        (x.to_vec(), y.to_vec())
-    } else {
-        (y.to_vec(), x.to_vec())
-    };
-    let mut slow_order: Vec<usize> = (0..n).collect();
-    slow_order.sort_by(|&a, &b| {
-        slow[a]
-            .partial_cmp(&slow[b])
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    let tolerance = row_tolerance(&slow, &slow_order);
-    let mut rows: Vec<Vec<usize>> = Vec::new();
-    let mut current = vec![slow_order[0]];
-    for &index in &slow_order[1..] {
-        if (slow[index] - slow[*current.last().unwrap()]).abs() <= tolerance {
-            current.push(index);
-        } else {
-            rows.push(std::mem::take(&mut current));
-            current.push(index);
-        }
-    }
-    rows.push(current);
-    let mut ordered = Vec::with_capacity(n);
-    for (row_index, row) in rows.into_iter().enumerate() {
-        let mut sorted = row;
-        sorted.sort_by(|&a, &b| {
-            fast[a]
-                .partial_cmp(&fast[b])
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        if row_index % 2 == 1 {
-            sorted.reverse();
-        }
-        ordered.extend(sorted);
-    }
-    ordered
-}
-
-fn row_tolerance(slow: &[f64], order: &[usize]) -> f64 {
-    let mut unique = Vec::new();
-    for &index in order {
-        let value = slow[index];
-        if !unique.contains(&value) {
-            unique.push(value);
-        }
-    }
-    if unique.len() <= 1 {
-        return 1.0;
-    }
-    let mut min_gap = f64::MAX;
-    for pair in unique.windows(2) {
-        let gap = pair[1] - pair[0];
-        if gap > 0.0 && gap < min_gap {
-            min_gap = gap;
-        }
-    }
-    if min_gap.is_finite() {
-        min_gap * 0.5
-    } else {
-        1.0
-    }
-}
-
-fn grid_positions(
-    center_x: f64,
-    center_y: f64,
-    width: f64,
-    height: f64,
-    spots_x: usize,
-    spots_y: usize,
-    fast_axis: &str,
-    start_corner: &str,
-) -> Vec<(f64, f64)> {
-    let xs = linspace(center_x - width / 2.0, center_x + width / 2.0, spots_x);
-    let ys = linspace(center_y - height / 2.0, center_y + height / 2.0, spots_y);
-    let mut positions = Vec::with_capacity(spots_x.saturating_mul(spots_y));
-    if fast_axis == "y" {
-        let start_low_x = start_corner == "bottom_left" || start_corner == "top_left";
-        let start_y_forward = start_corner == "bottom_left" || start_corner == "bottom_right";
-        let slow = if start_low_x {
-            xs.clone()
-        } else {
-            let mut copy = xs.clone();
-            copy.reverse();
-            copy
-        };
-        for (slow_index, x) in slow.into_iter().enumerate() {
-            let forward = if slow_index % 2 == 0 {
-                start_y_forward
-            } else {
-                !start_y_forward
-            };
-            let y_vals = if forward {
-                ys.clone()
-            } else {
-                let mut copy = ys.clone();
-                copy.reverse();
-                copy
-            };
-            for y in y_vals {
-                positions.push((x, y));
-            }
-        }
-        return positions;
-    }
-    let start_low_y = start_corner == "bottom_left" || start_corner == "bottom_right";
-    let start_x_forward = start_corner == "bottom_left" || start_corner == "top_left";
-    let slow = if start_low_y {
-        ys.clone()
-    } else {
-        let mut copy = ys.clone();
-        copy.reverse();
-        copy
-    };
-    for (slow_index, y) in slow.into_iter().enumerate() {
-        let forward = if slow_index % 2 == 0 {
-            start_x_forward
-        } else {
-            !start_x_forward
-        };
-        let x_vals = if forward {
-            xs.clone()
-        } else {
-            let mut copy = xs.clone();
-            copy.reverse();
-            copy
-        };
-        for x in x_vals {
-            positions.push((x, y));
-        }
-    }
-    positions
-}
-
-fn linspace(start: f64, stop: f64, n: usize) -> Vec<f64> {
-    if n == 0 {
-        return Vec::new();
-    }
-    if n == 1 {
-        return vec![start];
-    }
-    (0..n)
-        .map(|index| start + (stop - start) * index as f64 / (n - 1) as f64)
-        .collect()
-}
-
-fn spot_weights(rows: &[Draft], params: &Value) -> Result<Vec<f64>, String> {
-    let method = text(params, "spot_weight_method", "fixed");
-    match method.as_str() {
-        "fixed" => {
-            let weight = round4(number(params, "spot_weight_mu", 0.02));
-            Ok(vec![weight; rows.len()])
-        }
-        "random_range" => {
-            let min_mu = number(params, "spot_weight_min_mu", 0.002);
-            let max_mu = number(params, "spot_weight_max_mu", 0.1);
-            let mut rng = Rng::new(mix_seed(rows.len(), min_mu, max_mu));
-            Ok((0..rows.len())
-                .map(|_| round4(rng.uniform(min_mu, max_mu)))
-                .collect())
-        }
-        "layer_even_range" => {
-            let min_mu = number(params, "spot_weight_min_mu", 0.002);
-            let max_mu = number(params, "spot_weight_max_mu", 0.1);
-            let shuffle = bool_param(params, "spot_weight_layer_shuffle", false);
-            Ok(layer_even(rows, min_mu, max_mu, shuffle))
-        }
-        "even_total" => even_total(rows.len(), number(params, "spot_weight_total_mu", 1.0)),
-        "random_total_variance" => random_total(
-            rows.len(),
-            number(params, "spot_weight_total_mu", 1.0),
-            number(params, "spot_weight_variance_pct", 10.0),
-        ),
-        _ => Err("Select a spot weight method.".into()),
-    }
-}
-
-fn layer_even(rows: &[Draft], min_mu: f64, max_mu: f64, shuffle: bool) -> Vec<f64> {
-    let mut weights = vec![0.0; rows.len()];
-    let mut layers = Vec::new();
-    for row in rows {
-        if !layers.contains(&row.layer) {
-            layers.push(row.layer);
-        }
-    }
-    for layer in layers {
-        let indices: Vec<usize> = rows
-            .iter()
-            .enumerate()
-            .filter(|(_, row)| row.layer == layer)
-            .map(|(index, _)| index)
-            .collect();
-        let mut values = linspace(min_mu, max_mu, indices.len())
-            .into_iter()
-            .map(round4)
-            .collect::<Vec<_>>();
-        if shuffle && values.len() > 1 {
-            let mut rng = Rng::new(layer as u64 + 7);
-            rng.shuffle(&mut values);
-        }
-        for (index, value) in indices.into_iter().zip(values) {
-            weights[index] = value;
-        }
-    }
-    weights
-}
-
-fn even_total(n: usize, target: f64) -> Result<Vec<f64>, String> {
-    if n == 0 {
-        return Ok(Vec::new());
-    }
-    let mut weights = vec![round4(target / n as f64); n];
-    apply_remainder(&mut weights, target);
-    if weights.last().copied().unwrap_or(0.0) <= 0.0 {
-        return Err(format!(
-            "Target Total Weight (MU) is too small to assign a positive weight to each of {n} spots."
-        ));
-    }
-    Ok(weights)
-}
-
-fn random_total(n: usize, target: f64, variance_pct: f64) -> Result<Vec<f64>, String> {
-    if n == 0 {
-        return Ok(Vec::new());
-    }
-    if variance_pct <= 0.0 {
-        return even_total(n, target);
-    }
-    let base = target / n as f64;
-    let spread = variance_pct / 100.0;
-    let mut rng = Rng::new(mix_seed(n, target, variance_pct));
-    let raw: Vec<f64> = (0..n)
-        .map(|_| base * (1.0 + rng.uniform(-spread, spread)))
-        .collect();
-    let scaled_total: f64 = raw.iter().sum();
-    if scaled_total <= 0.0 {
-        return Err("Spot Variance (%) is too large to assign positive spot weights.".into());
-    }
-    let scale = target / scaled_total;
-    let mut weights: Vec<f64> = raw.into_iter().map(|value| round4(value * scale)).collect();
-    apply_remainder(&mut weights, target);
-    if weights.last().copied().unwrap_or(0.0) <= 0.0 {
-        return Err(format!(
-            "Target Total Weight (MU) is too small to assign a positive weight to each of {n} spots at {variance_pct}% variance."
-        ));
-    }
-    Ok(weights)
-}
-
-fn apply_remainder(weights: &mut [f64], target: f64) {
-    if weights.is_empty() {
-        return;
-    }
-    let remainder = round4(target - weights.iter().sum::<f64>());
-    if remainder != 0.0 {
-        let last = weights.len() - 1;
-        weights[last] = round4(weights[last] + remainder);
-    }
-}
-
-fn round4(value: f64) -> f64 {
-    (value * WEIGHT_SCALE).round() / WEIGHT_SCALE
-}
-
-struct Rng(u64);
-
-impl Rng {
-    fn new(seed: u64) -> Self {
-        Self(seed | 1)
-    }
-
-    fn next(&mut self) -> u64 {
-        let mut x = self.0;
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        self.0 = x;
-        x
-    }
-
-    fn uniform(&mut self, min: f64, max: f64) -> f64 {
-        let unit = (self.next() >> 11) as f64 / ((1u64 << 53) as f64);
-        min + (max - min) * unit
-    }
-
-    fn shuffle(&mut self, values: &mut [f64]) {
-        for index in (1..values.len()).rev() {
-            let swap = (self.next() as usize) % (index + 1);
-            values.swap(index, swap);
-        }
-    }
-}
-
-fn mix_seed(n: usize, a: f64, b: f64) -> u64 {
-    let bits = a.to_bits() ^ b.to_bits().rotate_left(17) ^ (n as u64).wrapping_mul(0x9E37_79B9);
-    let tick = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_nanos() as u64)
-        .unwrap_or(1);
-    bits ^ tick
-}
-
-pub fn parse_pld(text: &str, beam_size: f64) -> Result<Vec<ImportSpot>, String> {
-    let lines: Vec<&str> = text
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .collect();
-    if lines.is_empty() {
-        return Err("PLD file is empty".into());
-    }
-    let header = parse_beam_header(lines[0])?;
-    let mut spots = Vec::new();
-    let mut plan_index = 0i32;
-    let mut energy = None;
-    let mut pending: Vec<(f64, f64, f64)> = Vec::new();
-    let flush = |energy: &Option<f64>,
-                 pending: &mut Vec<(f64, f64, f64)>,
-                 spots: &mut Vec<ImportSpot>,
-                 plan_index: &mut i32| {
-        let Some(energy) = *energy else {
-            return;
-        };
-        for (x, y, weight) in pending.drain(..) {
-            let charge = if weight <= 0.0 || header.cumulative <= 0.0 {
-                0.0
-            } else {
-                weight * header.total_mu / header.cumulative
-            };
-            if charge <= 0.0 {
-                continue;
-            }
-            spots.push(ImportSpot {
-                x,
-                y,
-                energy,
-                charge,
-                beam_size,
-                plan_index: *plan_index,
-            });
-            *plan_index += 1;
-        }
-    };
-    for line in &lines[1..] {
-        if line.starts_with("Layer,") {
-            flush(&energy, &mut pending, &mut spots, &mut plan_index);
-            energy = Some(parse_layer_header(line)?.0);
-            continue;
-        }
-        if !line.starts_with("Element,") {
-            return Err(format!("Unexpected PLD line: {line:?}"));
-        }
-        if energy.is_none() {
-            return Err("PLD Element line found before any Layer header".into());
-        }
-        let parts: Vec<&str> = line.split(',').map(str::trim).collect();
-        if parts.len() < 4 {
-            return Err(format!("Invalid PLD element line: {line:?}"));
-        }
-        let x = parse_pld_float(parts[1], "element X position")?;
-        let y = parse_pld_float(parts[2], "element Y position")?;
-        let weight = parse_pld_float(parts[3], "element meterset weight")?;
-        if let Some(found) = pending.iter_mut().find(|item| item.0 == x && item.1 == y) {
-            found.2 += weight;
-        } else {
-            pending.push((x, y, weight));
-        }
-    }
-    flush(&energy, &mut pending, &mut spots, &mut plan_index);
-    if energy.is_none() {
-        return Err("PLD file contains no Layer headers".into());
-    }
-    if spots.is_empty() {
-        return Err("No planned spots with positive MU found in PLD plan".into());
-    }
-    Ok(spots)
-}
-
-struct BeamHeader {
-    total_mu: f64,
-    cumulative: f64,
-}
-
-fn parse_beam_header(line: &str) -> Result<BeamHeader, String> {
-    let parts: Vec<&str> = line.split(',').map(str::trim).collect();
-    if parts.first().copied() != Some("Beam") {
-        return Err("PLD file must start with a Beam header line".into());
-    }
-    if parts.len() < 10 {
-        return Err("PLD Beam header is missing required fields".into());
-    }
-    Ok(BeamHeader {
-        total_mu: parse_pld_float(parts[7], "beam total MU")?,
-        cumulative: parse_pld_float(parts[8], "cumulative meterset weight")?,
-    })
-}
-
-fn parse_layer_header(line: &str) -> Result<(f64,), String> {
-    let parts: Vec<&str> = line.split(',').map(str::trim).collect();
-    if parts.first().copied() != Some("Layer") {
-        return Err("Expected a Layer header line".into());
-    }
-    if parts.len() < 5 {
-        return Err("PLD Layer header is missing required fields".into());
-    }
-    Ok((parse_pld_float(parts[2], "layer energy")?,))
-}
-
-fn parse_pld_float(value: &str, label: &str) -> Result<f64, String> {
-    let number: f64 = value
-        .parse()
-        .map_err(|_| format!("Invalid {label}: {value:?}"))?;
-    if !number.is_finite() {
-        return Err(format!("Invalid {label}: {value:?}"));
-    }
-    Ok(number)
 }
 
 fn document(
@@ -954,7 +449,7 @@ fn trim_float(value: f64) -> String {
     trim_zeros(&format!("{value:.6}"))
 }
 
-fn trim_zeros(text: &str) -> String {
+pub(super) fn trim_zeros(text: &str) -> String {
     if !text.contains('.') {
         return text.to_owned();
     }
@@ -1058,248 +553,7 @@ fn with_commas(value: usize) -> String {
     out.chars().rev().collect()
 }
 
-fn suggest_filename(
-    template: &str,
-    params: &Value,
-    dicom_label: Option<&str>,
-    max_length: usize,
-) -> String {
-    if template == "iba_pld_plan" {
-        let stem = sanitize(&path_stem(&text(params, "pld_path", "")));
-        return limit_name(&[stem], max_length);
-    }
-    let slug = match template {
-        "dicom_rt_plan" => "DicomPlan".to_owned(),
-        "zero_field" => "ZeroField".to_owned(),
-        "rectangular_field" => "RectField".to_owned(),
-        _ => sanitize(template),
-    };
-    let energy = energy_part(template, params);
-    let geometry = geometry_part(template, params, dicom_label);
-    let weight = weight_part(template, params);
-    limit_name(&[slug, energy, geometry, weight], max_length)
-}
-
-fn energy_part(template: &str, params: &Value) -> String {
-    if template == "dicom_rt_plan" || template == "iba_pld_plan" {
-        return String::new();
-    }
-    let energies = selected_energies(params);
-    if energies.is_empty() {
-        return "E0L".into();
-    }
-    if energies.len() == STANDARD_ENERGIES_MEV.len()
-        && energies
-            .iter()
-            .all(|energy| STANDARD_ENERGIES_MEV.contains(energy))
-    {
-        return format!(
-            "E{:.0}-{:.0}",
-            STANDARD_ENERGIES_MEV[STANDARD_ENERGIES_MEV.len() - 1],
-            STANDARD_ENERGIES_MEV[0]
-        );
-    }
-    if energies.len() == 1 {
-        return format!("E{}", num(energies[0], 3));
-    }
-    let mut indices = Vec::new();
-    for energy in &energies {
-        if let Some(index) = STANDARD_ENERGIES_MEV
-            .iter()
-            .position(|have| *have == *energy)
-        {
-            indices.push(index);
-        }
-    }
-    if indices.len() == energies.len() {
-        let lo = *indices.iter().min().unwrap_or(&0);
-        let hi = *indices.iter().max().unwrap_or(&0);
-        if hi - lo + 1 == energies.len() {
-            return format!(
-                "E{}-{}",
-                num(STANDARD_ENERGIES_MEV[hi], 3),
-                num(STANDARD_ENERGIES_MEV[lo], 3)
-            );
-        }
-    }
-    if energies.len() <= 4 {
-        return format!(
-            "E{}",
-            energies
-                .iter()
-                .map(|energy| num(*energy, 3))
-                .collect::<Vec<_>>()
-                .join("-")
-        );
-    }
-    format!(
-        "E{}L_{}-{}",
-        energies.len(),
-        num(energies[0], 3),
-        num(*energies.last().unwrap_or(&0.0), 3)
-    )
-}
-
-fn geometry_part(template: &str, params: &Value, dicom_label: Option<&str>) -> String {
-    match template {
-        "dicom_rt_plan" => {
-            if let Some(label) = dicom_label.filter(|label| !label.is_empty()) {
-                sanitize(label)
-            } else {
-                sanitize(&path_stem(&text(params, "dicom_path", "")))
-            }
-        }
-        "zero_field" => format!("Sp{}", int_param(params, "spots_per_layer", 0)),
-        "rectangular_field" => {
-            let mut segments = Vec::new();
-            let center_x = number(params, "center_x_mm", 0.0);
-            let center_y = number(params, "center_y_mm", 0.0);
-            if center_x != 0.0 || center_y != 0.0 {
-                segments.push(format!("C{}x{}", num(center_x, 3), num(center_y, 3)));
-            }
-            segments.push(format!(
-                "{}x{}mm",
-                num(number(params, "field_width_mm", 0.0), 3),
-                num(number(params, "field_height_mm", 0.0), 3)
-            ));
-            segments.push(format!(
-                "G{}x{}",
-                int_param(params, "spots_x", 0),
-                int_param(params, "spots_y", 0)
-            ));
-            segments.join("_")
-        }
-        _ => String::new(),
-    }
-}
-
-fn weight_part(template: &str, params: &Value) -> String {
-    if template == "dicom_rt_plan" || template == "iba_pld_plan" {
-        return String::new();
-    }
-    match text(params, "spot_weight_method", "fixed").as_str() {
-        "fixed" => format!("Wfix{}", num(number(params, "spot_weight_mu", 0.0), 4)),
-        "random_range" => format!(
-            "Wrng{}-{}",
-            num(number(params, "spot_weight_min_mu", 0.0), 4),
-            num(number(params, "spot_weight_max_mu", 0.0), 4)
-        ),
-        "layer_even_range" => {
-            let prefix = if bool_param(params, "spot_weight_layer_shuffle", false) {
-                "Wlyrs"
-            } else {
-                "Wlyr"
-            };
-            format!(
-                "{prefix}{}-{}",
-                num(number(params, "spot_weight_min_mu", 0.0), 4),
-                num(number(params, "spot_weight_max_mu", 0.0), 4)
-            )
-        }
-        "even_total" => format!(
-            "Wtot{}",
-            num(number(params, "spot_weight_total_mu", 0.0), 4)
-        ),
-        "random_total_variance" => format!(
-            "Wtot{}v{}",
-            num(number(params, "spot_weight_total_mu", 0.0), 4),
-            num(number(params, "spot_weight_variance_pct", 0.0), 1)
-        ),
-        _ => "W".into(),
-    }
-}
-
-fn num(value: f64, decimals: usize) -> String {
-    let text = trim_zeros(&format!("{value:.decimals$}"));
-    if text.is_empty() {
-        "0".into()
-    } else {
-        text
-    }
-}
-
-fn path_stem(path: &str) -> String {
-    std::path::Path::new(path)
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .unwrap_or("")
-        .to_owned()
-}
-
-fn sanitize(text: &str) -> String {
-    text.chars()
-        .filter(|ch| {
-            !matches!(ch, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*') && !ch.is_control()
-        })
-        .map(|ch| if ch == ' ' { '_' } else { ch })
-        .collect()
-}
-
-fn limit_name(parts: &[String], max_length: usize) -> String {
-    let suffix = ".csv";
-    let max_stem = max_length.saturating_sub(suffix.len()).max(1);
-    let join = |parts: &[String]| {
-        sanitize(
-            &parts
-                .iter()
-                .filter(|part| !part.is_empty())
-                .cloned()
-                .collect::<Vec<_>>()
-                .join("_"),
-        )
-    };
-    let mut compact = parts.to_vec();
-    let mut stem = join(&compact);
-    if stem.is_empty() {
-        stem = "input_map".into();
-    }
-    if stem.len() <= max_stem {
-        return format!("{stem}{suffix}");
-    }
-    if compact.len() > 1 {
-        compact[1] = energy_compact(&compact[1]);
-        stem = join(&compact);
-        if stem.len() <= max_stem {
-            return format!("{stem}{suffix}");
-        }
-    }
-    if compact.len() > 2 && !compact[2].is_empty() {
-        compact[2] = geometry_compact(&compact[2]);
-        stem = join(&compact);
-        if stem.len() <= max_stem {
-            return format!("{stem}{suffix}");
-        }
-    }
-    let minimal = join(&compact[..compact.len().min(2)]);
-    if minimal.len() <= max_stem {
-        return format!("{minimal}{suffix}");
-    }
-    let cut = minimal.chars().take(max_stem).collect::<String>();
-    format!("{cut}{suffix}")
-}
-
-fn energy_compact(part: &str) -> String {
-    if let Some(rest) = part.strip_prefix('E') {
-        if let Some((count, _)) = rest.split_once("L_") {
-            if count.chars().all(|ch| ch.is_ascii_digit()) {
-                return format!("E{count}L");
-            }
-        }
-    }
-    part.to_owned()
-}
-
-fn geometry_compact(part: &str) -> String {
-    if part.starts_with("Sp") {
-        return part.to_owned();
-    }
-    part.split('_')
-        .find(|segment| segment.starts_with('G'))
-        .unwrap_or_else(|| part.split('_').next_back().unwrap_or(part))
-        .to_owned()
-}
-
-fn selected_energies(params: &Value) -> Vec<f64> {
+pub(super) fn selected_energies(params: &Value) -> Vec<f64> {
     let Some(list) = params.get("selected_energies").and_then(Value::as_array) else {
         return Vec::new();
     };
@@ -1434,7 +688,7 @@ fn as_int(value: &Value) -> Option<i64> {
     }
 }
 
-fn number(params: &Value, key: &str, fallback: f64) -> f64 {
+pub(super) fn number(params: &Value, key: &str, fallback: f64) -> f64 {
     params
         .get(key)
         .and_then(Value::as_f64)
@@ -1442,11 +696,11 @@ fn number(params: &Value, key: &str, fallback: f64) -> f64 {
         .unwrap_or(fallback)
 }
 
-fn int_param(params: &Value, key: &str, fallback: i64) -> i64 {
+pub(super) fn int_param(params: &Value, key: &str, fallback: i64) -> i64 {
     params.get(key).and_then(as_int).unwrap_or(fallback)
 }
 
-fn text(params: &Value, key: &str, fallback: &str) -> String {
+pub(super) fn text(params: &Value, key: &str, fallback: &str) -> String {
     params
         .get(key)
         .and_then(Value::as_str)
@@ -1454,7 +708,7 @@ fn text(params: &Value, key: &str, fallback: &str) -> String {
         .to_owned()
 }
 
-fn bool_param(params: &Value, key: &str, fallback: bool) -> bool {
+pub(super) fn bool_param(params: &Value, key: &str, fallback: bool) -> bool {
     params.get(key).and_then(Value::as_bool).unwrap_or(fallback)
 }
 
@@ -1725,6 +979,8 @@ fn spot_order_choices() -> Value {
 
 #[cfg(test)]
 mod tests {
+    use super::field::grid_positions;
+    use super::weight::{even_total, layer_even, random_total};
     use super::*;
 
     fn params(value: Value) -> Value {

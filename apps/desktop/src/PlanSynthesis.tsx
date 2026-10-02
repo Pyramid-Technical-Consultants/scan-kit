@@ -33,12 +33,11 @@ import {
 import {
   DataEditor,
   GridCellKind,
-  getDefaultTheme,
   type GridCell,
   type GridColumn,
   type Item,
-  type Theme,
 } from "@glideapps/glide-data-grid";
+import { gridTheme } from "@/grid-theme";
 import "@glideapps/glide-data-grid/dist/index.css";
 
 import { Button } from "@/components/ui/button";
@@ -60,14 +59,7 @@ import {
   InputGroupText,
 } from "@/components/ui/input-group";
 import { optionIcon } from "@/option-icons";
-import {
-  Select,
-  SelectContent,
-  SelectGroup,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
+import { CatalogField, catalogShown } from "@/CatalogField";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import { notifyError, notifySaved } from "@/notify";
 import { SidePane } from "@/SidePane";
@@ -158,24 +150,6 @@ function defaultsOf(template: Template): Record<string, unknown> {
   return values;
 }
 
-function shown(param: Param, values: Record<string, unknown>): boolean {
-  if (param.visible_when == null) {
-    return true;
-  }
-  return Object.entries(param.visible_when).every(([key, allowed]) =>
-    allowed.some((item) => item === values[key]),
-  );
-}
-
-function shortChoices(param: Param): boolean {
-  const labels = param.choices?.map((choice) => choice.label) ?? [];
-  return (
-    labels.length >= 2 &&
-    labels.length <= 3 &&
-    labels.every((label) => label.length >= 1 && label.length <= 10)
-  );
-}
-
 function labelParts(label: string): { name: string; unit?: string } {
   const match = /^(.*)\s+\(([^)]+)\)$/.exec(label);
   if (match == null) {
@@ -225,55 +199,6 @@ function joinPath(dir: string, name: string): string {
   }
   const sep = dir.includes("\\") ? "\\" : "/";
   return dir.endsWith(sep) ? `${dir}${name}` : `${dir}${sep}${name}`;
-}
-
-function tokenColor(name: string, percent?: number): string {
-  const probe = document.createElement("span");
-  probe.style.color =
-    percent == null
-      ? `var(${name})`
-      : `color-mix(in oklch, var(${name}) ${percent}%, transparent)`;
-  document.body.append(probe);
-  const resolved = getComputedStyle(probe).color;
-  probe.remove();
-  return resolved;
-}
-
-function gridTheme(): Theme {
-  const base = getDefaultTheme();
-  const foreground = tokenColor("--foreground");
-  const muted = tokenColor("--muted-foreground");
-  const card = tokenColor("--card");
-  const accent = tokenColor("--accent");
-  const border = tokenColor("--border");
-  const wash = tokenColor("--muted");
-  return {
-    ...base,
-    accentColor: foreground,
-    accentFg: tokenColor("--background"),
-    accentLight: tokenColor("--foreground", 16),
-    textDark: foreground,
-    textMedium: muted,
-    textLight: muted,
-    textBubble: foreground,
-    textHeader: foreground,
-    textHeaderSelected: tokenColor("--background"),
-    bgIconHeader: card,
-    fgIconHeader: foreground,
-    bgCell: tokenColor("--background"),
-    bgCellMedium: card,
-    bgHeader: card,
-    bgHeaderHasFocus: wash,
-    bgHeaderHovered: wash,
-    bgBubble: card,
-    bgBubbleSelected: accent,
-    bgSearchResult: wash,
-    borderColor: border,
-    drilldownBorder: border,
-    linkColor: accent,
-    fontFamily: getComputedStyle(document.documentElement).fontFamily,
-    roundingRadius: 4,
-  };
 }
 
 export function PlanSynthesis() {
@@ -464,7 +389,7 @@ export function PlanSynthesis() {
             {FIELD_SETS.map(([setId, title]) => {
               const params = template.params.filter(
                 (param) =>
-                  (param.field_set ?? "geometry") === setId && shown(param, values) && param.row_partner == null,
+                  (param.field_set ?? "geometry") === setId && catalogShown(param, values) && param.row_partner == null,
               );
               if (params.length === 0) {
                 return null;
@@ -475,7 +400,7 @@ export function PlanSynthesis() {
                   <FieldGroup className="gap-3">
                     {params.map((param) => {
                       const partner = template.params.find(
-                        (item) => item.row_partner === param.key && shown(item, values),
+                        (item) => item.row_partner === param.key && catalogShown(item, values),
                       );
                       if (numericKind(param.kind)) {
                         return (
@@ -774,101 +699,21 @@ function ParamControl({
   if (param.kind === "file_path") {
     return <FileField param={param} value={String(values[param.key] ?? "")} onBrowse={onBrowse} />;
   }
-  if ((param.kind === "button_group" || (param.kind === "choice" && shortChoices(param))) && param.choices != null) {
-    return <SegmentField param={param} value={String(values[param.key] ?? "")} onChange={onChange} />;
-  }
-  if (param.kind === "choice" && param.choices != null) {
-    const current = String(values[param.key] ?? "");
-    const items = param.choices.map((choice) => ({ value: choice.value, label: choice.label }));
-    const Icon = choiceIcon(param.choices.find((choice) => choice.value === current)?.label ?? "");
+  if (param.kind === "button_group" || param.kind === "choice") {
     return (
-      <Field orientation="horizontal">
-        <FieldLabel className={LABEL_CLASS}>{param.label}</FieldLabel>
-        <Select
-          items={items}
-          value={current}
-          onValueChange={(next) => {
-            if (next != null) {
-              onChange(param.key, next);
-            }
-          }}
-        >
-          <SelectTrigger className="w-full min-w-0 cursor-pointer">
-            {Icon == null ? null : <Icon />}
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent>
-            <SelectGroup>
-              {param.choices.map((choice) => {
-                const ItemIcon = choiceIcon(choice.label);
-                return (
-                  <SelectItem key={choice.value} value={choice.value}>
-                    {ItemIcon == null ? null : <ItemIcon />}
-                    {choice.label}
-                  </SelectItem>
-                );
-              })}
-            </SelectGroup>
-          </SelectContent>
-        </Select>
-      </Field>
+      <CatalogField
+        param={param}
+        value={values[param.key]}
+        beside
+        icon={(label) => {
+          const Icon = choiceIcon(label);
+          return Icon == null ? null : <Icon />;
+        }}
+        onChange={(next) => onChange(param.key, next)}
+      />
     );
   }
   return null;
-}
-
-function SegmentField({
-  param,
-  value,
-  onChange,
-}: {
-  param: Param;
-  value: string;
-  onChange: (key: string, value: unknown) => void;
-}) {
-  const choices = param.choices ?? [];
-  const current = choices.some((choice) => choice.value === value) ? value : (choices[0]?.value ?? "");
-  const grid = choices.length >= 4;
-  const stacked = grid || choices.some((choice) => choice.label.length > 8);
-  const group = (
-    <ToggleGroup
-      variant="outline"
-      spacing={grid ? 2 : 0}
-      size="sm"
-      className={grid ? "grid w-full grid-cols-2" : "w-full"}
-      value={current.length === 0 ? [] : [current]}
-      onValueChange={(next) => {
-        const picked = next.find((item) => item !== current) ?? next[0];
-        if (picked != null) {
-          onChange(param.key, picked);
-        }
-      }}
-    >
-      {choices.map((choice) => {
-        const Icon = choiceIcon(choice.label);
-        return (
-          <ToggleGroupItem key={choice.value} value={choice.value} className="min-w-0 flex-1 cursor-pointer">
-            {Icon == null ? null : <Icon />}
-            {choice.label}
-          </ToggleGroupItem>
-        );
-      })}
-    </ToggleGroup>
-  );
-  if (stacked) {
-    return (
-      <Field>
-        <FieldLabel>{param.label}</FieldLabel>
-        {group}
-      </Field>
-    );
-  }
-  return (
-    <Field orientation="horizontal">
-      <FieldLabel className={LABEL_CLASS}>{param.label}</FieldLabel>
-      <div className="min-w-0 flex-1">{group}</div>
-    </Field>
-  );
 }
 
 function FileField({ param, value, onBrowse }: { param: Param; value: string; onBrowse: () => void }) {

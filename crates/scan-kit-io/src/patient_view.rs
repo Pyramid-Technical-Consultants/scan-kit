@@ -9,9 +9,10 @@ use scan_kit_dicom::{hu_density, hu_label, inside_structure, load_study, Patient
 use serde_json::Value;
 
 use super::beam::{beam_record, protons_per_mu, spot_record};
-use super::binned::{pick, spot_table};
 use super::dose_view::McRunner;
+use super::marks::pick;
 use super::mc_tables::mc_tables;
+use super::tables::spot_table;
 
 const MARK: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
 const SEED: u32 = 1;

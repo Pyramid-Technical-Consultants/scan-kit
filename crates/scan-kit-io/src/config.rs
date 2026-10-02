@@ -11,9 +11,9 @@ use md5::{Digest, Md5};
 use scan_kit_core::{apply_form, config_form, run_tune, tune_catalog, TuneSpots};
 use serde_json::{json, Value};
 
-use crate::binned::{slice_table, tune_spot_table};
 use crate::discover;
 use crate::store::{self, with_store};
+use crate::tables::{slice_table, tune_spot_table};
 
 const DOSE: [&str; 3] = ["ic1_dose", "ic2_dose", "ic3_dose"];
 const MEASURED: [&str; 4] = ["ic1_x", "ic1_y", "ic2_x", "ic2_y"];
