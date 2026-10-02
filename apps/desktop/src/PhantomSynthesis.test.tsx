@@ -71,6 +71,9 @@ it("writes a phantom study from the catalog defaults", async () => {
   await act(async () => {
     button?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
   });
+  const handle = document.querySelector("[aria-label='Resize configuration']");
+  const write = [...document.body.querySelectorAll("button")].find((item) => item.textContent === "Write DICOM");
+  expect(handle?.nextElementSibling?.contains(write ?? null)).toBe(true);
   expect(open).toHaveBeenCalled();
   expect(invoke).toHaveBeenCalledWith(
     "scan_kit_write_phantom",

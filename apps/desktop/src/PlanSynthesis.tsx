@@ -9,8 +9,11 @@ import {
   ArrowUpRight,
   Combine,
   CornerUpLeft,
+  Crosshair,
   Dices,
   Download,
+  File,
+  FileText,
   FolderOpen,
   Hash,
   Layers,
@@ -24,6 +27,7 @@ import {
   Rows3,
   Scale,
   Shuffle,
+  Square,
   type LucideIcon,
 } from "lucide-react";
 import {
@@ -125,11 +129,34 @@ const CHOICE_ICONS: Record<string, LucideIcon> = {
   "Random Total": Dices,
 };
 
+// The corner arrow's elbow sits in one corner of the icon box, so the ink
+// reads about a pixel off the label. Nudge it back toward the button center.
+const CORNER_NUDGE: Record<string, string> = {
+  "Top Left": "translate-y-px",
+  "Top Right": "translate-y-px",
+  "Bottom Left": "-translate-y-px",
+  "Bottom Right": "-translate-y-px",
+};
+
+const PRESET_ORDER = ["Select All", "Clear All", "Whole MeV Steps", "10 MeV Steps"];
+
+function presetRank(label: string): number {
+  const rank = PRESET_ORDER.indexOf(label);
+  return rank < 0 ? PRESET_ORDER.length : rank;
+}
+
 const ENERGY_PRESETS: Record<string, { label: string; title: string; icon: LucideIcon }> = {
   "Select All": { label: "All", title: "Select every layer", icon: ListChecks },
   "Whole MeV Steps": { label: "Whole MeV", title: "Integer MeV layers", icon: Hash },
   "10 MeV Steps": { label: "10 MeV", title: "Every 10 MeV", icon: Rows3 },
   "Clear All": { label: "None", title: "Clear the selection", icon: ListX },
+};
+
+const TEMPLATE_ICONS: Record<string, LucideIcon> = {
+  zero_field: Crosshair,
+  rectangular_field: Square,
+  dicom_rt_plan: FileText,
+  iba_pld_plan: File,
 };
 
 function defaultsOf(template: Template): Record<string, unknown> {
@@ -403,15 +430,15 @@ export function PlanSynthesis() {
   return (
     <SidePane
       side={
-        <div className="flex min-h-0 flex-1 flex-col">
-          <div className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto p-3">
-            <FieldSet className="gap-2 rounded-lg border border-border p-3">
+        <div className="flex min-h-0 min-w-0 flex-1 flex-col">
+          <div className="flex min-h-0 min-w-0 flex-1 flex-col gap-3 overflow-x-hidden overflow-y-auto p-3">
+            <FieldSet className="min-w-0 gap-2 rounded-lg border border-border p-3">
               <FieldLegend variant="label">Template</FieldLegend>
               <ToggleGroup
                 variant="outline"
                 orientation="vertical"
                 spacing={2}
-                className="w-full flex-col items-stretch"
+                className="w-full min-w-0 flex-col items-stretch"
                 value={[template.id]}
                 onValueChange={(next) => {
                   const picked = next.find((item) => item !== template.id) ?? next[0];
@@ -420,21 +447,27 @@ export function PlanSynthesis() {
                   }
                 }}
               >
-                {catalog.templates.map((item) => (
-                  <ToggleGroupItem
-                    key={item.id}
-                    value={item.id}
-                    className="w-full min-w-0 justify-start gap-3 px-2.5 font-normal"
-                  >
-                    <span className="shrink-0 font-medium">{item.name}</span>
-                    <span
-                      className="text-muted-foreground ml-auto min-w-0 truncate text-right font-normal"
-                      title={item.description}
+                {catalog.templates.map((item) => {
+                  const Icon = TEMPLATE_ICONS[item.id];
+                  return (
+                    <ToggleGroupItem
+                      key={item.id}
+                      value={item.id}
+                      className="w-full min-w-0 justify-start gap-3 overflow-hidden px-2.5 font-normal"
                     >
-                      {item.description}
-                    </span>
-                  </ToggleGroupItem>
-                ))}
+                      <span className="flex shrink-0 items-center gap-1.5 font-medium">
+                        {Icon == null ? null : <Icon />}
+                        {item.name}
+                      </span>
+                      <span
+                        className="text-muted-foreground ml-auto min-w-0 flex-1 truncate text-right font-normal"
+                        title={item.description}
+                      >
+                        {item.description}
+                      </span>
+                    </ToggleGroupItem>
+                  );
+                })}
               </ToggleGroup>
             </FieldSet>
             {FIELD_SETS.map(([setId, title]) => {
@@ -671,7 +704,7 @@ function ParamControl({
   if (param.kind === "energy_multiselect") {
     const selected = Array.isArray(values[param.key]) ? (values[param.key] as number[]) : [];
     const catalog = Array.isArray(param.default) ? [...(param.default as number[])].reverse() : [];
-    const presets = param.presets ?? [];
+    const presets = [...(param.presets ?? [])].sort((a, b) => presetRank(a.label) - presetRank(b.label));
     const active = presets.find((preset) => sameNumbers(preset.energies, selected));
     const count =
       selected.length === 0
@@ -706,7 +739,7 @@ function ParamControl({
           </div>
         )}
         <FieldDescription>{count}</FieldDescription>
-        <div className="grid max-h-52 grid-cols-2 gap-x-3 gap-y-1 overflow-y-auto">
+        <div className="grid max-h-52 grid-cols-4 gap-x-2 gap-y-1 overflow-y-auto">
           {catalog.map((energy) => {
             const id = `energy-${energy}`;
             const checked = selected.includes(energy);
@@ -824,7 +857,7 @@ function SegmentField({
         const Icon = choiceIcon(choice.label);
         return (
           <ToggleGroupItem key={choice.value} value={choice.value} className="min-w-0 flex-1 cursor-pointer">
-            {Icon == null ? null : <Icon />}
+            {Icon == null ? null : <Icon className={CORNER_NUDGE[choice.label]} />}
             {choice.label}
           </ToggleGroupItem>
         );

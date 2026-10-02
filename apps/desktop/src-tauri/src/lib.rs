@@ -156,10 +156,20 @@ fn scan_kit_config_catalog() -> Result<Value, String> {
 }
 
 #[tauri::command]
-fn scan_kit_config_open(path: Option<String>) -> Result<Value, String> {
+fn scan_kit_config_open(
+    path: Option<String>,
+    data_dir: Option<String>,
+    session_id: Option<String>,
+) -> Result<Value, String> {
     let mut body = json!({});
-    if let Some(path) = path {
+    if let Some(path) = path.filter(|text| !text.is_empty()) {
         body["path"] = json!(path);
+    }
+    if let Some(data_dir) = data_dir.filter(|text| !text.is_empty()) {
+        body["data_dir"] = json!(data_dir);
+    }
+    if let Some(session_id) = session_id.filter(|text| !text.is_empty()) {
+        body["session_id"] = json!(session_id);
     }
     scan_kit_io::invoke("scan_kit_config_open", &body).map_err(|err| err.to_string())
 }

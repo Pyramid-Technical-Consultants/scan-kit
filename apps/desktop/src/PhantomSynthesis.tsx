@@ -15,6 +15,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { notify, notifyError } from "@/notify";
+import { SidePane } from "@/SidePane";
 
 type Choice = { value: string; label: string };
 type Params = {
@@ -103,9 +104,15 @@ export function PhantomSynthesis() {
   }
 
   return (
-    <div className="flex min-h-0 flex-1 flex-col gap-4 overflow-auto p-4">
-      <p className="text-sm">{summary}</p>
-      <FieldGroup className="max-w-xl">
+    <SidePane
+      main={
+        <div className="flex min-h-0 flex-1 flex-col gap-3 overflow-auto p-4">
+          <p className="text-sm">{summary}</p>
+        </div>
+      }
+      side={
+      <div className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto p-3">
+      <FieldGroup>
         <ChoiceField
           label="Phantom"
           value={params.phantom}
@@ -223,7 +230,9 @@ export function PhantomSynthesis() {
         </Button>
       </FieldGroup>
       <p className="text-muted-foreground text-sm">{status}</p>
-    </div>
+      </div>
+      }
+    />
   );
 
   function setEnergies(next: number[]) {

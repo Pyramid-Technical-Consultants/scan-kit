@@ -112,6 +112,7 @@ it("generates a plan from the catalog", async () => {
     item.textContent?.includes("Zero Field"),
   );
   expect(templateRow?.textContent).toContain("Every spot at (0, 0)");
+  expect(templateRow?.querySelector("svg")).toBeTruthy();
   expect(templateRow?.getAttribute("aria-pressed")).toBe("true");
   expect(document.body.textContent).toContain("Field Center");
   expect(document.body.textContent).not.toContain("Field Center Y");
@@ -122,6 +123,10 @@ it("generates a plan from the catalog", async () => {
   expect(document.body.textContent).toContain("10 MeV");
   expect(document.body.textContent).not.toContain("Whole MeV Steps");
   expect(document.body.textContent).not.toContain("Select All");
+  const presetLabels = [...document.body.querySelectorAll("button")]
+    .map((item) => item.textContent?.replace(/\s+/g, " ").trim() ?? "")
+    .filter((label) => ["All", "None", "Whole MeV", "10 MeV"].includes(label));
+  expect(presetLabels).toEqual(["All", "None", "Whole MeV", "10 MeV"]);
   const allLayers = [...document.body.querySelectorAll("button")].find((item) => item.textContent?.includes("All"));
   expect(allLayers?.querySelector("svg")).toBeTruthy();
   expect(allLayers?.getAttribute("aria-pressed")).toBe("true");

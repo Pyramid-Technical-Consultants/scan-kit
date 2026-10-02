@@ -11,7 +11,7 @@ use md5::{Digest, Md5};
 use scan_kit_core::{apply_form, config_form, run_tune, tune_catalog, TuneSpots};
 use serde_json::{json, Value};
 
-use crate::binned::{slice_table, spot_table};
+use crate::binned::{slice_table, tune_spot_table};
 use crate::discover;
 use crate::store::{self, with_store};
 
@@ -30,13 +30,24 @@ pub fn catalog(db: &Path) -> Value {
     body
 }
 
-pub fn open_folder(db: &Path, path: Option<&str>) -> Result<Value, String> {
+pub fn open_folder(
+    db: &Path,
+    path: Option<&str>,
+    data_dir: Option<&str>,
+    session_id: Option<&str>,
+) -> Result<Value, String> {
     let remembered = with_store(db, |conn| store::config_settings(conn)).ok();
     let (remembered_dir, hide) = remembered.unwrap_or((None, false));
-    let chosen = path
+    let explicit = path
         .map(str::trim)
         .filter(|text| !text.is_empty())
-        .map(PathBuf::from)
+        .map(PathBuf::from);
+    let from_session = match (data_dir, session_id) {
+        (Some(dir), Some(id)) => session_config_dir(dir, id),
+        _ => None,
+    };
+    let chosen = explicit
+        .or(from_session)
         .or_else(|| remembered_dir.map(PathBuf::from));
     let Some(folder) = chosen else {
         return Ok(json!({ "path": Value::Null, "files": [], "hide_unused": hide }));
@@ -210,7 +221,7 @@ fn load_spots(
         let table = if timeslice {
             slice_table(root, session_id)
         } else {
-            spot_table(root, session_id)
+            tune_spot_table(root, session_id)
         };
         let n = table.get("energy").map(Vec::len).unwrap_or(0);
         if n == 0 {
@@ -255,6 +266,18 @@ fn finite(value: Option<f32>) -> f64 {
         .map(|value| value as f64)
         .filter(|value| value.is_finite())
         .unwrap_or(f64::NAN)
+}
+
+fn session_config_dir(data_dir: &str, session_id: &str) -> Option<PathBuf> {
+    let data_dir = data_dir.trim();
+    let session_id = session_id.trim();
+    if data_dir.is_empty() || session_id.is_empty() {
+        return None;
+    }
+    let dir = discover::session_directory(Path::new(data_dir), session_id)
+        .join("config")
+        .join("map2map");
+    dir.is_dir().then_some(dir)
 }
 
 fn session_present(root: &Path, session_id: &str) -> bool {
@@ -585,6 +608,107 @@ mod tests {
     }
 
     #[test]
+    fn sigma_tuning_prefers_raw_spot_sigma() {
+        let root = std::env::temp_dir().join(format!("scan-kit-tune-raw-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let session = root.join("sess");
+        fs::create_dir_all(&session).unwrap();
+        fs::write(
+            session.join("input_map.csv"),
+            "energy,charge_req,x_position,y_position\n100,0.02,0,0\n100,0.02,10,0\n100,0.02,-10,0\n",
+        )
+        .unwrap();
+        fs::write(
+            session.join("spot_data.csv"),
+            "ic1_total_dose_spot,r_ic1_x_spot_sigma,r_ic1_x_spot_sigma_raw\n0.02,4,1.4\n0.02,5,1.5\n0.02,6,1.6\n",
+        )
+        .unwrap();
+        let xml = r#"<devices><ion_chamber><device name="IC_1_X"/><beam_sigma_conversions in_units="MEV" out_units="mm" min_energy="70" max_energy="250" K0="1" K1="0" K2="0" K3="0"/></ion_chamber></devices>"#;
+        let result = tune(
+            &json!({
+                "workflow": "sigma_tuning",
+                "xml": xml,
+                "data_dir": root.to_string_lossy(),
+                "session_ids": ["sess"],
+                "params": {}
+            }),
+            &root.join("unused.sqlite"),
+        )
+        .unwrap();
+        let after = preview_number(&result, "IC_1_X", "70", 4);
+        // raw 1.4 mm ×2, then the ±20% band with 1% lower headroom.
+        assert!(
+            (after - 3.535).abs() < 0.02,
+            "K0 {after} followed the processed sigma column"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn session_1093436476_tunes_its_map2map_devices() {
+        let logs = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../test_data/logs");
+        let devices = logs.join("1093436476/1093436476/config/map2map/devices.xml");
+        if !devices.is_file() {
+            return;
+        }
+        let db = std::env::temp_dir().join(format!(
+            "scan-kit-tune-1093436476-{}.sqlite",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&db);
+        let opened =
+            open_folder(&db, None, Some(&logs.to_string_lossy()), Some("1093436476")).unwrap();
+        let path = opened["path"].as_str().unwrap().replace('\\', "/");
+        assert!(
+            path.ends_with("1093436476/1093436476/config/map2map"),
+            "{path}"
+        );
+        assert!(opened["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|file| file.as_str() == Some("devices.xml")));
+
+        let xml = fs::read_to_string(&devices).unwrap();
+        let form = config_form(&xml).unwrap();
+        assert!(form_has(&form, "IC 1 X", true));
+
+        let sigma = tune(
+            &json!({
+                "workflow": "sigma_tuning",
+                "xml": &xml,
+                "data_dir": logs.to_string_lossy(),
+                "session_ids": ["1093436476"],
+                "params": {}
+            }),
+            &db,
+        )
+        .unwrap();
+        assert_eq!(sigma["changed"], true, "{sigma}");
+        let k0 = preview_number(&sigma, "IC_1_X", "179.5", 4);
+        assert!(
+            (2.0..6.0).contains(&k0),
+            "180 MeV K0 {k0} is outside the raw-sigma band"
+        );
+
+        for workflow in ["position_offset_tuning", "ic_distance_tuning", "kmu_tuning"] {
+            let result = tune(
+                &json!({
+                    "workflow": workflow,
+                    "xml": &xml,
+                    "data_dir": logs.to_string_lossy(),
+                    "session_ids": ["1093436476"],
+                    "params": {}
+                }),
+                &db,
+            )
+            .unwrap_or_else(|err| panic!("{workflow}: {err}"));
+            assert_eq!(result["changed"], true, "{workflow}: {}", result["summary"]);
+        }
+        let _ = fs::remove_file(&db);
+    }
+
+    #[test]
     fn known_fixture_digests_match_when_the_files_are_present() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../test_data/1943968267/1943968267/config/map2map");
@@ -625,5 +749,40 @@ mod tests {
             let file = fs::read(&path).unwrap();
             assert_eq!(hex_digest(&file, found_salt), digest, "{name}");
         }
+    }
+
+    fn preview_number(result: &Value, device: &str, energy: &str, column: usize) -> f64 {
+        let rows = result["rows"].as_array().expect("preview rows");
+        let row = rows
+            .iter()
+            .find(|row| {
+                let cells = row.as_array().expect("row");
+                cells.first().and_then(Value::as_str) == Some(device)
+                    && cells
+                        .get(1)
+                        .and_then(Value::as_str)
+                        .is_some_and(|text| text.starts_with(energy))
+            })
+            .unwrap_or_else(|| panic!("no {device} row starting {energy} in {result}"));
+        row.as_array().unwrap()[column]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap()
+    }
+
+    fn form_has(node: &Value, title: &str, collapsible: bool) -> bool {
+        let titled = node.get("title").and_then(Value::as_str) == Some(title);
+        let folds = node.get("collapsible").and_then(Value::as_bool) == Some(true);
+        if titled && (!collapsible || folds) {
+            return true;
+        }
+        node.get("nodes")
+            .and_then(Value::as_array)
+            .is_some_and(|nodes| {
+                nodes
+                    .iter()
+                    .any(|child| form_has(child, title, collapsible))
+            })
     }
 }

@@ -3,7 +3,7 @@ import { act } from "react";
 import { afterEach, expect, it, vi } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
 
-import { ConfigTuning } from "./ConfigTuning";
+import { ConfigTuning, fieldBoxClass, sourceColumn } from "./ConfigTuning";
 
 vi.mock("@tauri-apps/plugin-dialog", () => ({
   open: vi.fn(),
@@ -48,11 +48,32 @@ vi.mock("@tauri-apps/api/core", () => ({
               kind: "fields",
               fields: [
                 {
-                  id: "0#text",
-                  label: "Devices",
+                  id: "0@type",
+                  label: "Type",
                   kind: "string",
-                  value: "",
+                  value: "device",
                   dead: false,
+                },
+                {
+                  id: "0@version",
+                  label: "Version",
+                  kind: "int",
+                  value: "1",
+                  dead: false,
+                },
+              ],
+            },
+            {
+              kind: "section",
+              title: "IC 1 X",
+              collapsible: true,
+              nodes: [
+                {
+                  kind: "table",
+                  id: "sigma",
+                  title: "Beam sigma conversions (72 rows)",
+                  columns: [{ name: "K0", label: "K0" }],
+                  rows: [["3.002"]],
                 },
               ],
             },
@@ -94,11 +115,27 @@ it("tunes the open devices file from the selected sessions", async () => {
   });
   expect(document.body.textContent).toContain("IC1/IC2");
   expect(document.body.textContent).toContain("No .md5 sidecar");
+  const version = [...document.querySelectorAll("[data-slot=field]")].find((node) =>
+    node.textContent?.includes("Version"),
+  );
+  expect(version?.className).toContain("w-28");
+  expect(document.querySelector("summary")).toBeNull();
+  expect(document.body.textContent).not.toContain("Beam sigma");
+  const chamber = [...document.body.querySelectorAll("button")].find((item) => item.textContent?.includes("IC 1 X"));
+  expect(chamber?.getAttribute("aria-expanded")).toBe("false");
+  await act(async () => {
+    chamber?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+  });
+  expect(document.body.textContent).toContain("Beam sigma");
   const button = [...document.body.querySelectorAll("button")].find((item) => item.textContent === "Tune");
   expect(button).toBeTruthy();
   await act(async () => {
     button?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
   });
+  expect(invoke).toHaveBeenCalledWith(
+    "scan_kit_config_open",
+    expect.objectContaining({ dataDir: "C:/data", sessionId: "sess" }),
+  );
   expect(invoke).toHaveBeenCalledWith(
     "scan_kit_config_tune",
     expect.objectContaining({
@@ -108,4 +145,20 @@ it("tunes the open devices file from the selected sessions", async () => {
     }),
   );
   expect(document.body.textContent).toContain("Updated 1 beam_sigma");
+  const handle = document.querySelector("[aria-label='Resize configuration']");
+  const tune = [...document.body.querySelectorAll("button")].find((item) => item.textContent === "Tune");
+  expect(handle?.nextElementSibling?.contains(tune ?? null)).toBe(true);
+});
+
+it("keeps short xml values in a short field", () => {
+  expect(fieldBoxClass({ kind: "int", value: "1" })).toBe("w-28");
+  expect(fieldBoxClass({ kind: "string", value: "device" })).toBe("w-36");
+  expect(fieldBoxClass({ kind: "string", value: "x".repeat(48) })).toBe("w-full max-w-lg");
+});
+
+it("maps a hidden unused column back to the full row", () => {
+  const columns = [{ dead: true }, { dead: false }, { dead: true }, { dead: false }];
+  expect(sourceColumn(columns, 0, true)).toBe(1);
+  expect(sourceColumn(columns, 1, true)).toBe(3);
+  expect(sourceColumn(columns, 1, false)).toBe(1);
 });

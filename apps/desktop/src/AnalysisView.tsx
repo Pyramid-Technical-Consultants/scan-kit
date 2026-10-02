@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
+import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { ArrowLeft, Download, Play } from "lucide-react";
@@ -22,6 +22,7 @@ import { optionIcon } from "@/option-icons";
 import { backingSize, plotHeader, type PlotHeader, type ViewControl } from "@/plot-header";
 import { sessionColor, shownSessionIds } from "@/session-colors";
 import { dismissNotice, notifyError } from "@/notify";
+import { SidePane } from "@/SidePane";
 import {
   Select,
   SelectContent,
@@ -156,15 +157,6 @@ function messageOf(reason: unknown): string {
   return reason instanceof Error ? reason.message : String(reason);
 }
 
-const SIDE_MIN = 220;
-const SIDE_DEFAULT = 420;
-const PLOT_MIN = 240;
-
-function clampSide(parentWidth: number, next: number): number {
-  const max = Math.max(SIDE_MIN, parentWidth - PLOT_MIN);
-  return Math.round(Math.min(max, Math.max(SIDE_MIN, next)));
-}
-
 function ChoiceSelect({
   control,
   value,
@@ -223,7 +215,6 @@ export function AnalysisView({
   onBack: () => void;
   onOpenView: (viewId: string) => void;
 }) {
-  const shell = useRef<HTMLDivElement>(null);
   const host = useRef<HTMLDivElement>(null);
   const canvas = useRef<HTMLCanvasElement>(null);
   const plotter = useRef<Plotter | null>(null);
@@ -237,7 +228,6 @@ export function AnalysisView({
   const [studyPath, setStudyPath] = useState<string | null>(null);
   const [study, setStudy] = useState<string | null>(null);
   const [size, setSize] = useState({ width: 960, height: 640 });
-  const [sideWidth, setSideWidth] = useState(SIDE_DEFAULT);
   const shown = (meta?.panels.length ?? 0) > 0;
 
   const requestDraw = () => {
@@ -459,31 +449,6 @@ export function AnalysisView({
     setOptions((current) => ({ ...current, [id]: value }));
   };
 
-  const resizeSide = (next: number) => {
-    const parent = shell.current?.getBoundingClientRect().width ?? window.innerWidth;
-    setSideWidth(clampSide(parent, next));
-  };
-
-  const onSplitterDown = (event: ReactPointerEvent<HTMLDivElement>) => {
-    event.preventDefault();
-    const handle = event.currentTarget;
-    handle.setPointerCapture(event.pointerId);
-    const startX = event.clientX;
-    const startWidth = sideWidth;
-    const onMove = (ev: PointerEvent) => {
-      const parent = shell.current?.getBoundingClientRect().width ?? window.innerWidth;
-      setSideWidth(clampSide(parent, startWidth + (startX - ev.clientX)));
-    };
-    const onUp = () => {
-      handle.removeEventListener("pointermove", onMove);
-      handle.removeEventListener("pointerup", onUp);
-      handle.removeEventListener("pointercancel", onUp);
-    };
-    handle.addEventListener("pointermove", onMove);
-    handle.addEventListener("pointerup", onUp);
-    handle.addEventListener("pointercancel", onUp);
-  };
-
   const table = meta?.table;
   const columns: GridColumn[] =
     table?.columns.map((title) => ({ title, width: 180 })) ?? [];
@@ -549,7 +514,8 @@ export function AnalysisView({
   };
 
   return (
-    <div ref={shell} className="flex min-h-0 flex-1 overflow-hidden">
+    <SidePane
+      main={
       <div ref={host} className="bg-background flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
         {table != null && table.rows.length > 0 ? (
           <DataEditor
@@ -571,24 +537,9 @@ export function AnalysisView({
           <canvas ref={canvas} className="absolute inset-0 h-full w-full touch-none" />
         </div>
       </div>
-      <div
-        role="separator"
-        aria-orientation="vertical"
-        aria-label="Resize configuration"
-        aria-valuemin={SIDE_MIN}
-        aria-valuenow={sideWidth}
-        tabIndex={0}
-        className="bg-border w-1.5 shrink-0 cursor-col-resize touch-none focus-visible:bg-ring"
-        onPointerDown={onSplitterDown}
-        onKeyDown={(event) => {
-          if (event.key === "ArrowLeft") {
-            resizeSide(sideWidth + 16);
-          } else if (event.key === "ArrowRight") {
-            resizeSide(sideWidth - 16);
-          }
-        }}
-      />
-      <aside style={{ width: sideWidth }} className="flex min-h-0 shrink-0 flex-col">
+      }
+      side={
+        <>
         <div className="flex shrink-0 items-center gap-2 p-3 pb-0">
           <Button type="button" variant="outline" className="min-w-0 flex-1" onClick={onBack}>
             <ArrowLeft />
@@ -726,7 +677,8 @@ export function AnalysisView({
         ) : null}
         {study != null ? <pre className="text-muted-foreground text-xs whitespace-pre-wrap">{study}</pre> : null}
         </div>
-      </aside>
-    </div>
+        </>
+      }
+    />
   );
 }

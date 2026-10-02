@@ -494,7 +494,9 @@ pub fn invoke(name: &str, input: &Value) -> Result<Value, InvokeError> {
         "scan_kit_config_open" => {
             let db = database_path(input)?;
             let path = input.get("path").and_then(Value::as_str);
-            config::open_folder(&db, path).map_err(InvokeError::Message)
+            let data_dir = input.get("data_dir").and_then(Value::as_str);
+            let session_id = input.get("session_id").and_then(Value::as_str);
+            config::open_folder(&db, path, data_dir, session_id).map_err(InvokeError::Message)
         }
         "scan_kit_config_form" => {
             let path = required_str(input, "path")?;
