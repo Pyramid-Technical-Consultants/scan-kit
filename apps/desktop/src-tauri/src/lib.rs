@@ -1,5 +1,45 @@
 use serde_json::{json, Value};
 
+/// A command whose JSON object uses each argument name as the key.
+macro_rules! forward {
+    ($name:ident) => {
+        #[tauri::command]
+        fn $name() -> Result<Value, String> {
+            scan_kit_io::invoke(stringify!($name), &json!({})).map_err(|err| err.to_string())
+        }
+    };
+    ($name:ident ( $($arg:ident : $ty:ty),+ $(,)? )) => {
+        #[tauri::command]
+        fn $name($($arg: $ty),+) -> Result<Value, String> {
+            scan_kit_io::invoke(stringify!($name), &json!({ $(stringify!($arg): $arg),+ }))
+                .map_err(|err| err.to_string())
+        }
+    };
+}
+
+forward!(scan_kit_open_library(path: String));
+forward!(scan_kit_set_note(
+    path: String,
+    session_id: String,
+    note: String
+));
+forward!(scan_kit_select_sessions(path: String, session_ids: Vec<String>));
+forward!(scan_kit_plan_catalog);
+forward!(scan_kit_config_catalog);
+forward!(scan_kit_config_form(path: String));
+forward!(scan_kit_config_apply(xml: String, form: Value));
+forward!(scan_kit_config_hide(hide_unused: bool));
+forward!(scan_kit_phantom_catalog);
+forward!(scan_kit_phantom_preview(params: Value));
+forward!(scan_kit_write_phantom(parent: String, params: Value));
+forward!(scan_kit_runner_catalog);
+forward!(scan_kit_runner_connect(host: String));
+forward!(scan_kit_runner_disconnect);
+forward!(scan_kit_runner_upload(path: String));
+forward!(scan_kit_runner_control(action: String));
+forward!(scan_kit_runner_download(dest: String));
+forward!(scan_kit_runner_remember(file_dir: String));
+
 #[tauri::command]
 fn version() -> &'static str {
     scan_kit_core::version()
@@ -8,30 +48,6 @@ fn version() -> &'static str {
 #[tauri::command]
 fn scan_kit_about() -> Result<Value, String> {
     scan_kit_core::invoke("scan_kit_about", &Value::Null).map_err(|err| err.to_string())
-}
-
-#[tauri::command]
-fn scan_kit_open_library(path: String) -> Result<Value, String> {
-    scan_kit_io::invoke("scan_kit_open_library", &json!({ "path": path }))
-        .map_err(|err| err.to_string())
-}
-
-#[tauri::command]
-fn scan_kit_set_note(path: String, session_id: String, note: String) -> Result<Value, String> {
-    scan_kit_io::invoke(
-        "scan_kit_set_note",
-        &json!({ "path": path, "session_id": session_id, "note": note }),
-    )
-    .map_err(|err| err.to_string())
-}
-
-#[tauri::command]
-fn scan_kit_select_sessions(path: String, session_ids: Vec<String>) -> Result<Value, String> {
-    scan_kit_io::invoke(
-        "scan_kit_select_sessions",
-        &json!({ "path": path, "session_ids": session_ids }),
-    )
-    .map_err(|err| err.to_string())
 }
 
 #[tauri::command]
@@ -129,11 +145,6 @@ fn scan_kit_open_study(path: String) -> Result<Value, String> {
 }
 
 #[tauri::command]
-fn scan_kit_plan_catalog() -> Result<Value, String> {
-    scan_kit_io::invoke("scan_kit_plan_catalog", &json!({})).map_err(|err| err.to_string())
-}
-
-#[tauri::command]
 fn scan_kit_synthesize_plan(
     template: String,
     params: Value,
@@ -148,11 +159,6 @@ fn scan_kit_synthesize_plan(
         body["csv"] = json!(csv);
     }
     scan_kit_io::invoke("scan_kit_synthesize_plan", &body).map_err(|err| err.to_string())
-}
-
-#[tauri::command]
-fn scan_kit_config_catalog() -> Result<Value, String> {
-    scan_kit_io::invoke("scan_kit_config_catalog", &json!({})).map_err(|err| err.to_string())
 }
 
 #[tauri::command]
@@ -172,21 +178,6 @@ fn scan_kit_config_open(
         body["session_id"] = json!(session_id);
     }
     scan_kit_io::invoke("scan_kit_config_open", &body).map_err(|err| err.to_string())
-}
-
-#[tauri::command]
-fn scan_kit_config_form(path: String) -> Result<Value, String> {
-    scan_kit_io::invoke("scan_kit_config_form", &json!({ "path": path }))
-        .map_err(|err| err.to_string())
-}
-
-#[tauri::command]
-fn scan_kit_config_apply(xml: String, form: Value) -> Result<Value, String> {
-    scan_kit_io::invoke(
-        "scan_kit_config_apply",
-        &json!({ "xml": xml, "form": form }),
-    )
-    .map_err(|err| err.to_string())
 }
 
 #[tauri::command]
@@ -226,81 +217,12 @@ fn scan_kit_config_tune(
 }
 
 #[tauri::command]
-fn scan_kit_phantom_catalog() -> Result<Value, String> {
-    scan_kit_io::invoke("scan_kit_phantom_catalog", &json!({})).map_err(|err| err.to_string())
-}
-
-#[tauri::command]
-fn scan_kit_phantom_preview(params: Value) -> Result<Value, String> {
-    scan_kit_io::invoke("scan_kit_phantom_preview", &json!({ "params": params }))
-        .map_err(|err| err.to_string())
-}
-
-#[tauri::command]
-fn scan_kit_write_phantom(parent: String, params: Value) -> Result<Value, String> {
-    scan_kit_io::invoke(
-        "scan_kit_write_phantom",
-        &json!({ "parent": parent, "params": params }),
-    )
-    .map_err(|err| err.to_string())
-}
-
-#[tauri::command]
-fn scan_kit_config_hide(hide_unused: bool) -> Result<Value, String> {
-    scan_kit_io::invoke(
-        "scan_kit_config_hide",
-        &json!({ "hide_unused": hide_unused }),
-    )
-    .map_err(|err| err.to_string())
-}
-
-#[tauri::command]
-fn scan_kit_runner_catalog() -> Result<Value, String> {
-    scan_kit_io::invoke("scan_kit_runner_catalog", &json!({})).map_err(|err| err.to_string())
-}
-
-#[tauri::command]
-fn scan_kit_runner_connect(host: String) -> Result<Value, String> {
-    scan_kit_io::invoke("scan_kit_runner_connect", &json!({ "host": host }))
-        .map_err(|err| err.to_string())
-}
-
-#[tauri::command]
-fn scan_kit_runner_disconnect() -> Result<Value, String> {
-    scan_kit_io::invoke("scan_kit_runner_disconnect", &json!({})).map_err(|err| err.to_string())
-}
-
-#[tauri::command]
 fn scan_kit_runner_status(has_plan: Option<bool>, dest: Option<String>) -> Result<Value, String> {
     scan_kit_io::invoke(
         "scan_kit_runner_status",
         &json!({ "has_plan": has_plan.unwrap_or(false), "dest": dest.unwrap_or_default() }),
     )
     .map_err(|err| err.to_string())
-}
-
-#[tauri::command]
-fn scan_kit_runner_upload(path: String) -> Result<Value, String> {
-    scan_kit_io::invoke("scan_kit_runner_upload", &json!({ "path": path }))
-        .map_err(|err| err.to_string())
-}
-
-#[tauri::command]
-fn scan_kit_runner_control(action: String) -> Result<Value, String> {
-    scan_kit_io::invoke("scan_kit_runner_control", &json!({ "action": action }))
-        .map_err(|err| err.to_string())
-}
-
-#[tauri::command]
-fn scan_kit_runner_download(dest: String) -> Result<Value, String> {
-    scan_kit_io::invoke("scan_kit_runner_download", &json!({ "dest": dest }))
-        .map_err(|err| err.to_string())
-}
-
-#[tauri::command]
-fn scan_kit_runner_remember(file_dir: String) -> Result<Value, String> {
-    scan_kit_io::invoke("scan_kit_runner_remember", &json!({ "file_dir": file_dir }))
-        .map_err(|err| err.to_string())
 }
 
 #[tauri::command]

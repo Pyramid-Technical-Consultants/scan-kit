@@ -5,12 +5,11 @@ import { ArrowLeft, Download, Play } from "lucide-react";
 import {
   DataEditor,
   GridCellKind,
-  getDefaultTheme,
   type GridCell,
   type GridColumn,
   type Item,
-  type Theme,
 } from "@glideapps/glide-data-grid";
+import { gridTheme, tokenColor } from "@/grid-theme";
 
 import { controlDisabled, controlSections, segmentChoices, type ControlSlot } from "@/analysis-controls";
 import { AnalysisMenu, analysisId, analysisName } from "@/analysis-menu";
@@ -52,15 +51,6 @@ function plotterFor(node: HTMLCanvasElement): Promise<Plotter> {
   return pending;
 }
 
-function tokenColor(name: string): string {
-  const probe = document.createElement("span");
-  probe.style.color = `var(${name})`;
-  document.body.append(probe);
-  const resolved = getComputedStyle(probe).color;
-  probe.remove();
-  return resolved;
-}
-
 function parseColor(value: string): [number, number, number, number] {
   const canvas = document.createElement("canvas");
   canvas.width = 1;
@@ -79,24 +69,6 @@ function parseColor(value: string): [number, number, number, number] {
 
 function palette(order: readonly string[], shown: readonly string[]): number[][] {
   return shown.map((id) => parseColor(sessionColor(Math.max(0, order.indexOf(id)))));
-}
-
-function gridTheme(): Theme {
-  const base = getDefaultTheme();
-  const foreground = tokenColor("--foreground");
-  const muted = tokenColor("--muted-foreground");
-  const card = tokenColor("--card");
-  return {
-    ...base,
-    textDark: foreground,
-    textMedium: muted,
-    textHeader: foreground,
-    bgCell: tokenColor("--background"),
-    bgHeader: card,
-    bgHeaderHovered: tokenColor("--muted"),
-    borderColor: tokenColor("--border"),
-    horizontalBorderColor: tokenColor("--border"),
-  };
 }
 
 function wavBlob(samples: number[]): Blob {
