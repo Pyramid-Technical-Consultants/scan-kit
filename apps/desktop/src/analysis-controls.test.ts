@@ -1,6 +1,8 @@
+import { ChartColumn, Columns2, LayoutGrid } from "lucide-react";
 import { expect, it } from "vitest";
 
 import { controlDisabled, controlSections, segmentChoices } from "./analysis-controls";
+import { optionIcon } from "./option-icons";
 
 const BINNED = [
   { id: "source", group: "Data Source" },
@@ -46,6 +48,9 @@ it("keeps a joined button row for two or three short names", () => {
   expect(segmentChoices(["Violin", "Box", "Mean", "Scatter", "Contour"])).toBe(false);
   expect(segmentChoices(["Spot — Isocenter", "Spot — Chamber"])).toBe(false);
   expect(segmentChoices(["Energy"])).toBe(false);
+  expect(optionIcon("Own")).toBe(ChartColumn);
+  expect(optionIcon("Plot")).toBe(Columns2);
+  expect(optionIcon("Page")).toBe(LayoutGrid);
   expect(
     segmentChoices([
       { label: "Spot", detail: "One row per spot" },
