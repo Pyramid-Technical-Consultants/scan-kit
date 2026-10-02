@@ -4,15 +4,21 @@
 //! implement the operations themselves. Session files live in `scan-kit-io`.
 //! GPU work lives in `scan-kit-compute`.
 
+mod config;
 mod dose;
 mod geometry;
+mod plan;
 mod plot;
 mod ramp;
+mod runner;
 mod schema;
 mod session;
 mod session_log;
 mod signal;
+mod tune;
+mod xml_dom;
 
+pub use config::{apply_form, config_form};
 pub use dose::{
     analytic_on, analytic_volume, bragg_idd, csda_range_mm, dose_frame, field_bounds, medium,
     protons_from_mu, robust_high, through_wet, water, DoseFrame, McJob, McResult, Medium,
@@ -22,11 +28,22 @@ pub use geometry::{
     beam_angle_mrad, fit_iso_plane, fit_line, magnet_pivot_z, parse_ic_geometry, IcGeometry,
     IC1_Z_MM, IC2_Z_MM, IC_SEP_MM,
 };
+pub use plan::{
+    build_plan, dicom_beam_size, parse_pld, plan_catalog, standard_energies, validate_plan,
+    ImportSpot, PlanDocument, PlanSource,
+};
 pub use plot::{
     apply_clip, format_tick, map_span, project, ticks, Camera, Control, DataTable, Panel, PlotRect,
     PlotScene, Series,
 };
 pub use ramp::{choices, index, is_session, resolve, sample, session, Family, SESSION, VIRIDIS};
+pub use runner::{
+    control_button, default_session_zip_path, device_file_url, field_subscribe_key, io_bool,
+    io_number, io_url, normalize_host, parse_host, resolve_session_download, runner_view,
+    session_download_hint, DEFAULT_CONTROL_POINTS, DEFAULT_SESSION_ROOT, LOAD_STATE_SUCCESS,
+    POINTS_LOAD_STATE, POINTS_UPLOAD, POINTS_UPLOAD_TARGET, POINTS_VALID, SESSION_DIRECTORY,
+    STATUS_PATHS,
+};
 pub use session_log::{compare_templates, parse_session_log, LayerEvent, SessionLog};
 pub use signal::{
     arc_fit, arc_predict, assign_bin_centers, beam_off_edges, beam_on_mask, box_stats,
@@ -39,6 +56,8 @@ pub use signal::{
     BeamState, BoxStats, G2_MM_PER_STRIP, G2_STRIP_CENTER, G3_STRIP_CENTER, G3_STRIP_PITCH_MM,
     MIN_SPILL_GAP_MS,
 };
+pub use tune::{run_tune, tune_catalog, TuneSpots};
+pub use xml_dom::{parse_xml, write_xml, Elem};
 
 pub use schema::{
     column_is_integer, column_scale_factor, concept_column_candidates, normalize_column_name,

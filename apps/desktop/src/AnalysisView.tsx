@@ -688,7 +688,16 @@ export function AnalysisView({
           <Button
             variant="outline"
             onClick={() => {
-              void open({ directory: true, title: "DICOM study" }).then((selected) => {
+              void invoke<{ save_dir: string | null }>("scan_kit_phantom_catalog")
+                .catch(() => ({ save_dir: null }))
+                .then((catalog) =>
+                  open({
+                    directory: true,
+                    title: "DICOM study",
+                    defaultPath: catalog.save_dir ?? undefined,
+                  }),
+                )
+                .then((selected) => {
                 if (typeof selected !== "string") {
                   return;
                 }

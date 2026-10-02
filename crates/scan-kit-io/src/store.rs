@@ -15,6 +15,7 @@ use super::discover::{self, Discovered};
 
 const SCHEMA_VERSION: i32 = 3;
 const PREF_LAST_DATA_DIR: &str = "session.last_data_dir";
+const PREF_LAST_DICOM_DIR: &str = "dicom.last_study_dir";
 const PREF_APP_SETTINGS: &str = "app.settings";
 const PREF_APP_SETTINGS_IMPORTED: &str = "app.settings_imported";
 
@@ -121,6 +122,92 @@ pub fn set_last_main_tab(conn: &Connection, tab: &str) -> Result<(), String> {
         .and_then(|value| value.as_object().cloned())
         .unwrap_or_default();
     settings.insert("last_main_tab".to_owned(), json!(tab));
+    prefs_set(conn, PREF_APP_SETTINGS, &Value::Object(settings))
+}
+
+pub fn last_plan_save_dir(conn: &Connection) -> Result<Option<String>, String> {
+    let settings = prefs_get(conn, PREF_APP_SETTINGS)?.unwrap_or_else(|| json!({}));
+    Ok(settings
+        .get("last_plan_synthesis_save_dir")
+        .and_then(Value::as_str)
+        .filter(|dir| !dir.is_empty())
+        .map(str::to_owned))
+}
+
+pub fn config_settings(conn: &Connection) -> Result<(Option<String>, bool), String> {
+    let settings = prefs_get(conn, PREF_APP_SETTINGS)?.unwrap_or_else(|| json!({}));
+    let dir = settings
+        .get("config_dir")
+        .and_then(Value::as_str)
+        .filter(|dir| !dir.is_empty())
+        .map(str::to_owned);
+    let hide = settings
+        .get("hide_unused_map2map_xml")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    Ok((dir, hide))
+}
+
+pub fn set_config_settings(
+    conn: &Connection,
+    dir: Option<&str>,
+    hide: Option<bool>,
+) -> Result<(), String> {
+    let mut settings = prefs_get(conn, PREF_APP_SETTINGS)?
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    if let Some(dir) = dir {
+        settings.insert("config_dir".to_owned(), json!(dir));
+    }
+    if let Some(hide) = hide {
+        settings.insert("hide_unused_map2map_xml".to_owned(), json!(hide));
+    }
+    prefs_set(conn, PREF_APP_SETTINGS, &Value::Object(settings))
+}
+
+pub fn last_dicom_dir(conn: &Connection) -> Result<Option<String>, String> {
+    Ok(prefs_get(conn, PREF_LAST_DICOM_DIR)?
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .filter(|dir| !dir.is_empty()))
+}
+
+pub fn set_last_dicom_dir(conn: &Connection, dir: &str) -> Result<(), String> {
+    prefs_set(conn, PREF_LAST_DICOM_DIR, &json!(dir))
+}
+
+pub fn set_last_plan_save_dir(conn: &Connection, dir: &str) -> Result<(), String> {
+    let mut settings = prefs_get(conn, PREF_APP_SETTINGS)?
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    settings.insert("last_plan_synthesis_save_dir".to_owned(), json!(dir));
+    prefs_set(conn, PREF_APP_SETTINGS, &Value::Object(settings))
+}
+
+pub fn runner_settings(conn: &Connection) -> Result<(Option<String>, Option<String>), String> {
+    let settings = prefs_get(conn, PREF_APP_SETTINGS)?.unwrap_or_else(|| json!({}));
+    let text = |key: &str| {
+        settings
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+    };
+    Ok((text("last_rci_host"), text("last_plan_runner_file_dir")))
+}
+
+pub fn set_runner_host(conn: &Connection, host: &str) -> Result<(), String> {
+    set_runner_pref(conn, "last_rci_host", host)
+}
+
+pub fn set_runner_file_dir(conn: &Connection, dir: &str) -> Result<(), String> {
+    set_runner_pref(conn, "last_plan_runner_file_dir", dir)
+}
+
+fn set_runner_pref(conn: &Connection, key: &str, value: &str) -> Result<(), String> {
+    let mut settings = prefs_get(conn, PREF_APP_SETTINGS)?
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    settings.insert(key.to_owned(), json!(value));
     prefs_set(conn, PREF_APP_SETTINGS, &Value::Object(settings))
 }
 

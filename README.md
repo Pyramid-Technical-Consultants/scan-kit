@@ -100,7 +100,7 @@ On a dev install, the default data source is the bundled `test_data/` folder.
 | Data Analysis | Plan Synthesis |
 |:---:|:---:|
 | [![](docs/images/launcher-data-analysis.png)](docs/images/launcher-data-analysis.png) | [![](docs/images/launcher-plan-synthesis.png)](docs/images/launcher-plan-synthesis.png) |
-| Browse sessions and launch views | Build and export `input_map.csv` |
+| Browse sessions and launch views | Build and export `input_map.csv` (now in the desktop app) |
 
 | Plan Runner | Configuration Tuning |
 |:---:|:---:|
@@ -151,15 +151,11 @@ On a dev install, the default data source is the bundled `test_data/` folder.
 
 ## The launcher
 
-Scan Kit opens a single window with six tabs. **View** switches tabs (`Ctrl+1` to `Ctrl+6`) and sets **Theme** (System / Light / Dark). **Analysis** opens the same views as the Data Analysis buttons. **File** opens or refreshes the session folder. **Esc** or **Ctrl+Q** quits.
+Scan Kit opens a single window with two tabs. **View** switches tabs and sets **Theme** (System / Light / Dark). **Analysis** opens the same views as the Data Analysis buttons. **File** opens or refreshes the session folder. **Esc** or **Ctrl+Q** quits. Plan Synthesis, Phantom Synthesis, Configuration Tuning, and Plan Runner live in the Scan Kit 2 desktop app.
 
 | Tab | Shortcut | Use it to |
 |-----|----------|-----------|
 | **Data Analysis** | `Ctrl+1` | Browse sessions, adjust global plot settings, and open analysis views |
-| **Plan Synthesis** | `Ctrl+2` | Create PBS test plans and export `input_map.csv` |
-| **Phantom Synthesis** | `Ctrl+3` | Write a synthetic patient study (CT, RTSTRUCT, RT Ion Plan, RTDOSE) for Dose Volume's DICOM source |
-| **Plan Runner** | `Ctrl+4` | Connect to an RCI, upload a plan, run it, and download the session |
-| **Configuration Tuning** | `Ctrl+5` | Open a facility or session config folder, edit XML, run tuning workflows |
 | **Debug** | `Ctrl+6` | Live launcher and view-process logs, with Copy / Clear for support |
 
 Plot windows open separately. Close them when you are done. The launcher keeps running.
@@ -325,7 +321,7 @@ Every session ships a verbose `SessionLogFile.log` from DCS. This view distills 
 
 ## Plan Synthesis
 
-Switch to the **Plan Synthesis** tab (`Ctrl+2`) to build `input_map.csv` files for PBS test plans.
+The Scan Kit 2 desktop app's **Plan Synthesis** tab builds `input_map.csv` files for PBS test plans.
 
 | Template | Description |
 |----------|-------------|
@@ -342,25 +338,24 @@ Pick a template, set parameters, preview the spot table, and export. Suggested f
 
 ## Phantom Synthesis
 
-The **Phantom Synthesis** tab (`Ctrl+3`) writes a synthetic patient study as real DICOM, so you can try **Dose Volume**'s DICOM study source without patient data. The study has four parts:
+The Scan Kit 2 **Phantom Synthesis** tab writes a synthetic patient study as real DICOM, so you can try **Dose Volume**'s DICOM study source without patient data. The study has three parts:
 
 - **CT:** a 120 mm water box in air, with bone and lung slabs, only one of them, or neither.
 - **RTSTRUCT:** BODY, the PTV behind the slabs, a ring with a hole, and each slab.
 - **RT Ion Plan:** one pencil-beam field over the PTV.
-- **RTDOSE (optional):** a Monte Carlo reference dose that stands in for the TPS dose, so gamma has something to compare against. It uses a different random seed from Dose Volume's recalculation, so gamma compares independent noise.
 
-Set the patient position, CT spacing, energies, gantry and couch angles, spot pitch, range shifter, MU and fractions. The preview shows the axial slice through the isocenter with the beam's direction. **Write DICOM…** writes the study into a new folder, and Dose Volume's **Open DICOM folder…** starts in that folder.
+Set the patient position, CT spacing, energies, gantry and couch angles, spot pitch, range shifter, MU and fractions. The summary line reports the CT size, the layer count, and the MU per fraction. **Write DICOM** writes the study into a new folder under the one you pick. Dose Volume's **Open Study** starts in that folder next time.
 
 ## Plan Runner
 
-The **Plan Runner** tab (`Ctrl+4`) is the operator console for an RCI:
+The Scan Kit 2 **Plan Runner** tab is the operator console for an RCI:
 
 1. Enter the RCI IP (or a browser URL such as `http://192.168.100.184/io/`) and **Connect**. The last host is remembered.
-2. **Browse...** to an `input_map.csv` from Plan Synthesis and **Upload to RCI**.
-3. **Start** / **Pause** / **Stop** / **Reset** follow the controller ready-permit. Start enables when the RCI grants permit.
-4. After the run, **Download** saves a G3-layout session zip under `/root/reports/session/` on the RCI so Data Analysis can open it like any other session.
+2. **Browse** to an `input_map.csv` from Plan Synthesis and **Upload to RCI**.
+3. **Start** / **Pause** / **Stop** / **Reset** follow the controller ready permit. Start enables when the RCI grants the permit.
+4. After the run, **Download** saves the session zip. The remote folder is the session id under `/root/reports/session/` (or the controller's session directory). Data Analysis opens that zip like any other session.
 
-Live tiles show control point, energy, layer, elapsed time, start permit, and whether the uploaded points were accepted.
+Live tiles show control point, energy, layer, elapsed time, start permit, and whether the uploaded points were accepted. If the controller omitted `spot_data.csv`, the download joins the device spot files. Iso conversion of those positions stays with the Python session builder.
 
 <p align="center">
   <img src="docs/images/launcher-plan-runner.png" alt="Plan Runner tab before connecting to an RCI" width="720">
@@ -368,15 +363,15 @@ Live tiles show control point, energy, layer, elapsed time, start permit, and wh
 
 ## Configuration Tuning
 
-The **Configuration Tuning** tab (`Ctrl+5`) is a structured editor for map2map XML configuration:
+The Scan Kit 2 **Configuration Tuning** tab is a structured editor for map2map XML configuration:
 
 - **File tree:** browse `devices.xml` and related config files
 - **Auto-generated forms:** edit XML values without raw markup
 - **Hide unused map2map XML:** collapse attributes the map2map library never reads
-- **Integrity badges:** SHA-256 sidecar verification at a glance
+- **Integrity badges:** Pyramid `.md5` sidecar verification at a glance
 - **Auto-tuning workflows:** **Sigma Tuning**, **Position Offset Tuning**, **IC Distance Tuning**, and **Dose Calibration** derive updated `devices.xml` values from measured sessions, with preview before apply
 
-Jump here directly from a session's context menu in Data Analysis when an on-disk config folder exists.
+Jump here from a session's context menu in Data Analysis. Tune uses the sessions selected there.
 
 ### Ion chamber magnification
 
@@ -426,7 +421,7 @@ Positive percent means more reported MU / more delivered charge for the same pre
 HCC and strip devices in one IC family keep their relative `K_MU` and all move by the same factor. Large commissioning corrections are allowed; the preview warns above 5% rather than blocking the write. This is not Data Analysis plot calibration (`per_session` / `constrained`), which never writes `devices.xml`.
 
 <p align="center">
-  <img src="docs/images/launcher-config-tuning.png" alt="Configuration Tuning tab editing devices.xml" width="720">
+  <img src="docs/images/launcher-config-tuning.png" alt="Configuration Tuning tab editing devices.xml (now in the desktop app)" width="720">
 </p>
 
 ## Session data layout
@@ -469,7 +464,7 @@ Screenshots in `docs/images/` are captured from real session data with:
 python scripts/capture_doc_screenshots.py
 ```
 
-Requires a local `test_data/` folder (not shipped with the repo). The script grabs launcher tabs and unified view windows off-screen (dark theme for the grab only; it does not persist **View → Theme**), generates a compact Zero Field preview for Plan Synthesis, and renders the remaining specialized matplotlib view headlessly.
+Requires a local `test_data/` folder (not shipped with the repo). The script grabs launcher tabs and unified view windows off-screen (dark theme for the grab only; it does not persist **View → Theme**) and renders the remaining specialized matplotlib view headlessly.
 
 </details>
 

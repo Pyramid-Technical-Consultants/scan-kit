@@ -34,6 +34,10 @@ Versions below are the ones locked for the workspace. Anomaly review for a SOUP 
 | bzip2 | see `crates/scan-kit-io/Cargo.toml` | `.tar.bz2` session archives |
 | xz2 | see `crates/scan-kit-io/Cargo.toml` | `.tar.xz` session archives |
 | csv | see `crates/scan-kit-io/Cargo.toml` | Quoted fields and header drift in session files |
+| md-5 | see `crates/scan-kit-io/Cargo.toml` | MD5 digest inside Pyramid `.md5` configuration sidecars |
+| chrono | see `crates/scan-kit-io/Cargo.toml` | Local reading of a UTC file time, matching `mktime(gmtime(...))` for those sidecars |
+| tungstenite | see `crates/scan-kit-io/Cargo.toml` | mpack WebSocket to an RCI. Handshake only, no TLS |
+| rmpv | see `crates/scan-kit-io/Cargo.toml` | MessagePack encode and decode for that session |
 | wgpu | see `crates/scan-kit-plot/Cargo.toml` and `crates/scan-kit-compute/Cargo.toml` | The only GPU library. The plot crate draws with it natively and in the webview (WebGPU, or WebGL2 through its `webgl` feature). The compute crate runs kernels with it |
 | naga | see `crates/scan-kit-plot/Cargo.toml` and `crates/scan-kit-compute/Cargo.toml` | Compile the plot and compute shaders when no GPU adapter is present |
 | fontdue | see `crates/scan-kit-plot/Cargo.toml` | Rasterize plot labels into one glyph atlas |

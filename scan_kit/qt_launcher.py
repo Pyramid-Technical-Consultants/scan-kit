@@ -64,10 +64,6 @@ from .common.session_meta import SessionMeta
 from .common.settings import ViewSettings, CALIBRATION_MODES
 from .common.qt_widgets import make_pane_scroll_area, set_pane_scroll_widget
 from .views import TK_ONLY_VIEW_MODULES, VIEW_GROUPS, VIEWS
-from .workflows.plan_synthesis_panel import PlanSynthesisPanel
-from .workflows.plan_runner_panel import PlanRunnerPanel
-from .workflows.config_tuning.auto_tuning.paths import resolve_session_config_dir
-from .workflows.config_tuning_panel import ConfigTuningPanel
 
 MAX_SESSIONS = 5
 FROZEN = getattr(sys, "frozen", False)
@@ -81,10 +77,6 @@ else:
 _VIEW_GRID_COLS = 2
 
 _MAIN_TAB_DATA_ANALYSIS = "Data Analysis"
-_MAIN_TAB_PLAN_SYNTHESIS = "Plan Synthesis"
-_MAIN_TAB_PHANTOM_SYNTHESIS = "Phantom Synthesis"
-_MAIN_TAB_PLAN_RUNNER = "Plan Runner"
-_MAIN_TAB_CONFIG_TUNING = "Configuration Tuning"
 _MAIN_TAB_DEBUG = "Debug"
 
 _DEFAULT_WINDOW_WIDTH = 1400
@@ -162,8 +154,6 @@ class ScanKitMainWindow(QMainWindow):
         self._view_buttons: dict[str, QPushButton] = {}
         self._bootstrap_generation: int = 0
         self._main_tabs: QTabWidget | None = None
-        self._plan_runner_panel: PlanRunnerPanel | None = None
-        self._config_tuning_panel: ConfigTuningPanel | None = None
         self._debug_log_panel: DebugLogPanel | None = None
         self._deferred_tab_steps: list | None = []
         self._remote_copy_busy = False
@@ -188,10 +178,6 @@ class ScanKitMainWindow(QMainWindow):
         self._connect_thread_signals()
         QTimer.singleShot(0, self._request_settings_then_scan)
         self._deferred_tab_steps = [
-            self._add_plan_synthesis_tab,
-            self._add_phantom_synthesis_tab,
-            self._add_plan_runner_tab,
-            self._add_config_tuning_tab,
             self._add_debug_tab,
             self._finalize_main_tabs,
         ]
@@ -231,10 +217,6 @@ class ScanKitMainWindow(QMainWindow):
     def _build_ui(self) -> None:
         """Synchronously build the full UI (tests / callers that need everything now)."""
         self._init_main_tabs_shell()
-        self._add_plan_synthesis_tab()
-        self._add_phantom_synthesis_tab()
-        self._add_plan_runner_tab()
-        self._add_config_tuning_tab()
         self._add_debug_tab()
         self._finalize_main_tabs()
 
@@ -247,35 +229,6 @@ class ScanKitMainWindow(QMainWindow):
         self._build_menu_bar()
         self._sync_tab_menu()
         QShortcut(QKeySequence("Esc"), self, activated=self.close)
-
-    def _add_plan_synthesis_tab(self) -> None:
-        tabs = self._main_tabs
-        if tabs is None:
-            return
-        tabs.addTab(self._build_plan_synthesis_tab(), _MAIN_TAB_PLAN_SYNTHESIS)
-
-    def _add_phantom_synthesis_tab(self) -> None:
-        tabs = self._main_tabs
-        if tabs is None:
-            return
-        from .workflows.phantom_panel import PhantomSynthesisPanel
-
-        tabs.addTab(PhantomSynthesisPanel(), _MAIN_TAB_PHANTOM_SYNTHESIS)
-
-    def _add_plan_runner_tab(self) -> None:
-        tabs = self._main_tabs
-        if tabs is None:
-            return
-        self._plan_runner_panel = PlanRunnerPanel(app_settings=self._app_settings)
-        tabs.addTab(self._plan_runner_panel, _MAIN_TAB_PLAN_RUNNER)
-
-    def _add_config_tuning_tab(self) -> None:
-        tabs = self._main_tabs
-        if tabs is None:
-            return
-        self._config_tuning_panel = ConfigTuningPanel(app_settings=self._app_settings)
-        self._config_tuning_panel.set_session_data_dir(self._base_dir)
-        tabs.addTab(self._config_tuning_panel, _MAIN_TAB_CONFIG_TUNING)
 
     def _add_debug_tab(self) -> None:
         tabs = self._main_tabs
@@ -360,10 +313,6 @@ class ScanKitMainWindow(QMainWindow):
         group.setExclusive(True)
         tab_shortcuts = {
             _MAIN_TAB_DATA_ANALYSIS: "Ctrl+1",
-            _MAIN_TAB_PLAN_SYNTHESIS: "Ctrl+2",
-            _MAIN_TAB_PHANTOM_SYNTHESIS: "Ctrl+3",
-            _MAIN_TAB_PLAN_RUNNER: "Ctrl+4",
-            _MAIN_TAB_CONFIG_TUNING: "Ctrl+5",
             _MAIN_TAB_DEBUG: "Ctrl+6",
         }
         for name, shortcut in tab_shortcuts.items():
@@ -565,30 +514,6 @@ class ScanKitMainWindow(QMainWindow):
                 tabs.setCurrentIndex(i)
                 return
 
-    def _populate_session_context_menu(self, sid: str, menu: QMenu) -> None:
-        menu.addAction(
-            "Open in Config Tuning…",
-            lambda checked=False, session_id=sid: self._open_session_configuration(
-                session_id
-            ),
-        )
-
-    def _open_session_configuration(self, sid: str) -> None:
-        config_dir = resolve_session_config_dir(sid, self._base_dir)
-        if config_dir is None:
-            self._notify(
-                f"No configuration folder with map2map/devices.xml found for session {sid}.",
-                error=True,
-            )
-            return
-
-        panel = getattr(self, "_config_tuning_panel", None)
-        if panel is None:
-            return
-        if not panel.open_config_root(config_dir, select_devices_xml=True):
-            return
-        self._switch_to_main_tab(_MAIN_TAB_CONFIG_TUNING)
-
     def _build_data_analysis_tab(self) -> QWidget:
         tab = QWidget()
         outer = QHBoxLayout(tab)
@@ -606,9 +531,6 @@ class ScanKitMainWindow(QMainWindow):
         )
         self._session_browser.set_selection_persistence(self._persist_selected_sessions)
         self._session_browser.base_dir_changed.connect(self._on_session_base_dir_changed)
-        self._session_browser.populate_context_menu.connect(
-            self._populate_session_context_menu,
-        )
         left = self._session_browser
 
         # --- Right panel ---
@@ -699,9 +621,6 @@ class ScanKitMainWindow(QMainWindow):
         splitter.setSizes([720, 680])
         return tab
 
-    def _build_plan_synthesis_tab(self) -> QWidget:
-        return PlanSynthesisPanel(app_settings=self._app_settings)
-
     def _track_worker(self, thread: threading.Thread) -> None:
         self._worker_threads = [t for t in self._worker_threads if t.is_alive()]
         self._worker_threads.append(thread)
@@ -744,9 +663,6 @@ class ScanKitMainWindow(QMainWindow):
         except Exception:
             pass
         self._copy_auth_tried.clear()
-        panel = getattr(self, "_config_tuning_panel", None)
-        if panel is not None:
-            panel.set_session_data_dir(path)
         self._request_settings_then_scan()
 
     def _on_bg_segment_changed(self, key: str) -> None:
@@ -1273,10 +1189,6 @@ class ScanKitMainWindow(QMainWindow):
         self._child_procs = [p for p in self._child_procs if p.poll() is None]
 
     def closeEvent(self, event: QCloseEvent) -> None:
-        panel = getattr(self, "_config_tuning_panel", None)
-        if panel is not None and not panel.confirm_discard_if_dirty():
-            event.ignore()
-            return
         self._remember_window_geometry()
         self._persist_main_tab()
         self._shutdown_children()
@@ -1286,12 +1198,6 @@ class ScanKitMainWindow(QMainWindow):
         self._deferred_tab_steps = None
         if self._session_browser is not None:
             self._session_browser.shutdown()
-        panel = getattr(self, "_config_tuning_panel", None)
-        if panel is not None:
-            panel.shutdown()
-        runner = getattr(self, "_plan_runner_panel", None)
-        if runner is not None:
-            runner.shutdown()
         for t in self._worker_threads:
             if t.is_alive():
                 t.join(timeout=2.0)

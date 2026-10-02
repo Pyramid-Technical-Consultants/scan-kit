@@ -21,3 +21,7 @@ flate2 = "1"
 bzip2 = "0.5"
 xz2 = { version = "0.1", features = ["static"] }
 csv = "1"
+md-5 = "0.10"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+rmpv = "1"
+tungstenite = { version = "0.27", default-features = false, features = ["handshake"] }

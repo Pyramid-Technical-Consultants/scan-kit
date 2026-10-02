@@ -44,6 +44,18 @@ Tools:
 - `scan_kit_run_view`, workflow, paints that scene to one RGBA frame for MCP and tests
 - `scan_kit_calibrate`, `scan_kit_dose_error`, `scan_kit_beam_mask`, `scan_kit_bin_edges`, `scan_kit_histogram`, `scan_kit_welch`, and `scan_kit_fit_decay`, granular
 - `scan_kit_open_study` and `scan_kit_clinical_goal`, the DICOM study index and a dose-volume goal
+- `scan_kit_plan_catalog`, granular, lists the four plan templates and their parameter specs
+- `scan_kit_synthesize_plan`, workflow, builds an input map CSV from one of those templates
+- `scan_kit_config_catalog`, granular, lists the four configuration tuners and the remembered config folder
+- `scan_kit_config_open`, `scan_kit_config_form`, and `scan_kit_config_apply`, granular, browse a config folder and edit its XML through a form
+- `scan_kit_config_save`, workflow, writes the folder and refreshes Pyramid `.md5` sidecars
+- `scan_kit_config_tune`, workflow, updates devices.xml from the selected sessions
+- `scan_kit_config_integrity` and `scan_kit_config_hide`, granular
+- `scan_kit_phantom_catalog` and `scan_kit_phantom_preview`, granular, the phantom form and its CT summary
+- `scan_kit_write_phantom`, workflow, writes a synthetic CT, RTSTRUCT, and RT Ion plan
+- `scan_kit_runner_catalog` and `scan_kit_runner_status`, granular, the Plan Runner operator view
+- `scan_kit_runner_connect`, `scan_kit_runner_upload`, `scan_kit_runner_control`, and `scan_kit_runner_download`, workflow, the live RCI session
+- `scan_kit_runner_disconnect` and `scan_kit_runner_remember`, granular
 
 Agents in this repository launch the server with `.cursor/mcp.json` (`cargo run -p scan-kit-mcp --quiet` on stdio).
 
