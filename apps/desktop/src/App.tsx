@@ -38,6 +38,8 @@ import { Button } from "@/components/ui/button";
 import { DebugLog } from "@/DebugLog";
 import { installDebugLog } from "@/debug-log";
 import { dismissNotice, logError, notify, notifyError } from "@/notify";
+import { ProgressHairline } from "@/progress-line";
+import { driveTask, type Report } from "@/task-client";
 import { selectionFromLibrary } from "@/session-colors";
 import { type CheckPaint } from "@/session-checkbox";
 import { SessionContextMenu } from "@/session-menu";
@@ -177,6 +179,8 @@ export default function App() {
   const [analysis, setAnalysis] = useState<string | null>(null);
   const [sessionMenu, setSessionMenu] = useState<SessionMenu | null>(null);
   const [selectionOrder, setSelectionOrder] = useState<string[]>([]);
+  const [libraryReport, setLibraryReport] = useState<Report | null>(null);
+  const libraryToken = useRef<object>({});
   const selectedIds = selectionOrder;
   const canAnalyze = folder != null && selectedIds.length >= 1 && selectedIds.length <= MAX_SELECTED;
   const host = useRef<HTMLDivElement>(null);
@@ -197,16 +201,45 @@ export default function App() {
   );
 
   const loadFolder = useCallback(async (path: string) => {
-    const opened = await invoke<{ root: string; rows: LibraryRow[]; selected?: string[] }>(
-      "scan_kit_open_library",
-      { path },
+    const mine = {};
+    libraryToken.current = mine;
+    await driveTask(
+      {
+        view: "library",
+        path,
+        sessionIds: [],
+        options: {},
+        background: [],
+        foreground: [],
+        palette: [],
+      },
+      (report, payload) => {
+        if (libraryToken.current !== mine) {
+          return;
+        }
+        setLibraryReport(report.finished ? null : report);
+        if (payload == null) {
+          return;
+        }
+        const opened = JSON.parse(new TextDecoder().decode(payload)) as {
+          root: string;
+          rows: LibraryRow[];
+          selected?: string[];
+        };
+        if (report.finished) {
+          setFolder(opened.root);
+          setRows(opened.rows);
+          setSelectionOrder(selectionFromLibrary(opened.rows, opened.selected));
+          dismissNotice();
+          setUndo([]);
+          setRedo([]);
+        } else if (opened.rows.length > 0) {
+          setFolder(opened.root);
+          setRows(opened.rows);
+        }
+      },
+      () => libraryToken.current !== mine,
     );
-    setFolder(opened.root);
-    setRows(opened.rows);
-    setSelectionOrder(selectionFromLibrary(opened.rows, opened.selected));
-    dismissNotice();
-    setUndo([]);
-    setRedo([]);
   }, []);
 
   useEffect(() => {
@@ -256,6 +289,7 @@ export default function App() {
       });
     return () => {
       active = false;
+      libraryToken.current = {};
       cancelAnimationFrame(frame);
     };
   }, [loadFolder]);
@@ -465,7 +499,17 @@ export default function App() {
   }
 
   return (
-    <div className="flex h-full min-h-0 flex-col overflow-hidden bg-background text-foreground">
+    <div className="relative flex h-full min-h-0 flex-col overflow-hidden bg-background text-foreground">
+      {libraryReport != null && !libraryReport.finished ? (
+        <>
+          <ProgressHairline done={libraryReport.done} total={libraryReport.total} />
+          {libraryReport.note.length > 0 ? (
+            <p className="text-muted-foreground pointer-events-none absolute top-1 right-3 z-10 text-xs">
+              {libraryReport.note}
+            </p>
+          ) : null}
+        </>
+      ) : null}
       <Tabs
         value={tab}
         onValueChange={(value) => {

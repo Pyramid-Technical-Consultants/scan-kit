@@ -7,6 +7,7 @@ use scan_kit_core::{assign_bin_centers, quantile_edges, Control, Panel, PlotScen
 use serde_json::Value;
 
 use super::discover;
+use super::histogram::{bin_button, bin_share, hist_bin_count, share_key, BinShare, BIN_CHOICES};
 use super::marks::{apply_filter, contour_bands, control, flag, labeled, pick, text, BEAM_CHOICES};
 mod glyphs;
 
@@ -546,10 +547,8 @@ pub(crate) fn binned_summary(root: &Path, session_ids: &[String], options: &Valu
     let corr = flag(options, "corr", false);
     let mut interlock = flag(options, "interlock", false);
     let bins = bin_choice(options);
-    let hist_bins = text(options, "hist_bins", "30")
-        .parse::<usize>()
-        .unwrap_or(30)
-        .clamp(5, 80);
+    let hist_label = bin_button(text(options, "hist_bins", "Auto"));
+    let hist_bins = hist_bin_count(&hist_label);
     let cutoff = text(options, "cutoff", "5")
         .parse::<f32>()
         .unwrap_or(5.0)
@@ -565,7 +564,7 @@ pub(crate) fn binned_summary(root: &Path, session_ids: &[String], options: &Valu
                 .map(|(id, _)| *id)
                 .unwrap_or(sources_for(group.id)[0].0)
         });
-    let shared_bins = flag(options, "shared", false);
+    let share = bin_share(text(options, "share", ""), flag(options, "shared", false));
     let geometry = matches!(source, "timeslice_iso" | "timeslice_chamber")
         && matches!(
             group.id,
@@ -732,6 +731,16 @@ pub(crate) fn binned_summary(root: &Path, session_ids: &[String], options: &Valu
     if prepared.series.is_empty() {
         panels.push(note_panel("No finite values for this metric"));
     } else {
+        let page = if share == BinShare::Page {
+            let keys: Vec<&str> = prepared
+                .series
+                .iter()
+                .map(|item| item.key.as_str())
+                .collect();
+            page_span(&prepared.tables, &keys)
+        } else {
+            None
+        };
         for (index, item) in prepared.series.iter().enumerate() {
             panels.push(assemble_panel(&prepared, index, trend, interlock, group));
             let series = group
@@ -744,7 +753,8 @@ pub(crate) fn binned_summary(root: &Path, session_ids: &[String], options: &Valu
                     series,
                     &prepared.tables,
                     hist_bins,
-                    shared_bins,
+                    share == BinShare::Plot,
+                    page,
                     interlock && group.id == "position_error",
                 ));
             }
@@ -778,8 +788,8 @@ pub(crate) fn binned_summary(root: &Path, session_ids: &[String], options: &Valu
             corr,
             interlock,
             &bin_label(&bins),
-            hist_bins,
-            shared_bins,
+            &hist_label,
+            share,
             cutoff,
         ),
         table: None,
@@ -954,14 +964,12 @@ fn controls(
     corr: bool,
     interlock: bool,
     bins: &str,
-    hist_bins: usize,
-    shared: bool,
+    hist_bins: &str,
+    share: BinShare,
     cutoff: f32,
 ) -> Vec<Control> {
     let on = |value: bool| if value { "On" } else { "Off" };
-    controls.push(
-        control("bins", "Bins", &["Automatic", "8", "16", "32", "64"], bins).grouped("Data Source"),
-    );
+    controls.push(control("bins", "Bins", BIN_CHOICES, bins).grouped("Data Source"));
     controls.push(labeled("glyph", "Glyph", GLYPH_CHOICES, glyph).grouped("Plot Style"));
     controls.push(
         control(
@@ -995,24 +1003,15 @@ fn controls(
             .grouped("Histogram")
             .checked(),
     );
+    controls.push(control("hist_bins", "Bins", BIN_CHOICES, hist_bins).grouped("Histogram"));
     controls.push(
-        control(
-            "hist_bins",
-            "Bins",
-            &["10", "20", "30", "50"],
-            &hist_bins.to_string(),
+        labeled(
+            "share",
+            "Share",
+            &[("own", "Own"), ("plot", "Plot"), ("page", "Page")],
+            share_key(share),
         )
         .grouped("Histogram"),
-    );
-    controls.push(
-        control(
-            "shared",
-            "Share Bin Edges Across Rows",
-            &["Off", "On"],
-            on(shared),
-        )
-        .grouped("Histogram")
-        .checked(),
     );
     controls.push(
         control("corr", "Show Panel", &["Off", "On"], on(corr))
@@ -1051,19 +1050,36 @@ enum BinChoice {
 }
 
 fn bin_choice(options: &Value) -> BinChoice {
-    let raw = text(options, "bins", "Automatic");
-    if raw.eq_ignore_ascii_case("automatic") {
-        BinChoice::Automatic
-    } else {
-        BinChoice::Fixed(raw.parse::<usize>().unwrap_or(AUTO_QUANTILES).clamp(2, 64))
+    match crate::histogram::count_choice(text(options, "bins", "Auto")) {
+        None => BinChoice::Automatic,
+        Some(count) => BinChoice::Fixed(count),
     }
 }
 
 fn bin_label(choice: &BinChoice) -> String {
     match choice {
-        BinChoice::Automatic => "Automatic".to_string(),
+        BinChoice::Automatic => "Auto".to_string(),
         BinChoice::Fixed(count) => count.to_string(),
     }
+}
+
+fn page_span(tables: &[BTreeMap<String, Vec<f32>>], keys: &[&str]) -> Option<(f32, f32)> {
+    let mut lo = f32::MAX;
+    let mut hi = f32::MIN;
+    for key in keys {
+        for table in tables {
+            let Some(column) = table.get(*key) else {
+                continue;
+            };
+            for value in column {
+                if value.is_finite() {
+                    lo = lo.min(*value);
+                    hi = hi.max(*value);
+                }
+            }
+        }
+    }
+    (lo <= hi).then_some((lo, hi))
 }
 
 /// Sorted levels when fewer than `limit` exist. `None` means the column is continuous.
@@ -1730,8 +1746,21 @@ mod tests {
             .iter()
             .find(|control| control.id == "bins")
             .unwrap();
-        assert_eq!(bins.value, "Automatic");
-        assert_eq!(bins.labels(), vec!["Automatic", "8", "16", "32", "64"]);
+        assert_eq!(bins.value, "Auto");
+        assert_eq!(bins.labels(), vec!["Auto", "8", "16", "32", "64"]);
+        let hist = spot
+            .controls
+            .iter()
+            .find(|control| control.id == "hist_bins")
+            .unwrap();
+        assert_eq!(hist.value, "Auto");
+        assert_eq!(hist.labels(), vec!["Auto", "8", "16", "32", "64"]);
+        let share = spot
+            .controls
+            .iter()
+            .find(|control| control.id == "share")
+            .unwrap();
+        assert_eq!(share.labels(), vec!["Own", "Plot", "Page"]);
         let trend = spot
             .controls
             .iter()
@@ -1895,6 +1924,38 @@ mod tests {
     }
 
     #[test]
+    fn page_share_uses_one_range_for_every_histogram() {
+        let root = std::env::temp_dir().join("scan-kit-binned-page");
+        let _ = std::fs::remove_dir_all(&root);
+        let session = root.join("a");
+        std::fs::create_dir_all(&session).unwrap();
+        std::fs::write(session.join("input_map.csv"), "energy,charge_req\n70,1\n").unwrap();
+        std::fs::write(
+            session.join("spot_data.csv"),
+            "ic1_total_dose_spot,ic2_total_dose_spot\n1,50\n",
+        )
+        .unwrap();
+        let ids = ["a".to_string()];
+        let plot = binned_summary(
+            &root,
+            &ids,
+            &serde_json::json!({"hist": "On", "share": "Plot"}),
+        );
+        let page = binned_summary(
+            &root,
+            &ids,
+            &serde_json::json!({"hist": "On", "share": "Page"}),
+        );
+        let plot_spans = probability_spans(&plot);
+        let page_spans = probability_spans(&page);
+        assert_eq!(plot_spans.len(), 2);
+        assert!(plot_spans[0] < 10.0);
+        assert!(plot_spans[1] > 100.0);
+        assert!(page_spans.iter().all(|span| *span > 100.0));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn automatic_bins_keep_a_short_axis_and_a_fixed_count_regroups() {
         let column = |values: &[f32]| {
             let mut table = BTreeMap::new();
@@ -2050,6 +2111,20 @@ mod tests {
             .controls
             .iter()
             .all(|control| control.id != "beam" && control.id != "domain"));
+    }
+
+    fn probability_spans(scene: &scan_kit_core::PlotScene) -> Vec<f32> {
+        scene
+            .panels
+            .iter()
+            .filter(|panel| panel.y_label == "Probability (%)")
+            .filter_map(|panel| {
+                panel.series.iter().find_map(|series| match series {
+                    Series::Bars { edges, .. } => edges.last().copied(),
+                    _ => None,
+                })
+            })
+            .collect()
     }
 
     fn hist_edges(scene: &scan_kit_core::PlotScene) -> Vec<Vec<f32>> {

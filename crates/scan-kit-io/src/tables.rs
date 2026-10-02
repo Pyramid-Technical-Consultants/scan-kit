@@ -239,12 +239,6 @@ fn open_frames(root: &Path, session: &str, family: Family) -> Option<Arc<Frames>
     Some(frames)
 }
 
-/// ponytail: one sample per stride past 80k rows. The plot keeps the shape;
-/// raise the cap if a tail or a chamber view needs every sample.
-fn sample_stride(rows: usize) -> usize {
-    (rows / 80_000).max(1)
-}
-
 pub(crate) fn merged_timeslice(root: &Path, session: &str) -> Table {
     cached_timeslice(root, session, "merged", false, Family::All, |frames| {
         let mut merged: BTreeMap<String, Vec<f32>> = BTreeMap::new();
@@ -983,6 +977,8 @@ fn build_slice_metric(
         .sum();
     let mut energy = Vec::with_capacity(rows);
     let mut beam = Vec::with_capacity(rows);
+    let mut plan_xs = Vec::with_capacity(rows);
+    let mut plan_ys = Vec::with_capacity(rows);
     let mut ic1_x = Vec::with_capacity(rows);
     let mut ic1_y = Vec::with_capacity(rows);
     let mut ic2_x = Vec::with_capacity(rows);
@@ -1027,6 +1023,9 @@ fn build_slice_metric(
             let spot1 = at(spot_of[0], row) + spot_shift;
             let spot2 = at(spot_of[2], row) + spot_shift;
             let plan1 = plan.get(&(layer_bits, spot1.to_bits())).copied();
+            let (planned_x, planned_y) = plan1.unwrap_or((f32::NAN, f32::NAN));
+            plan_xs.push(planned_x);
+            plan_ys.push(planned_y);
             let plan2 = if spot1.to_bits() == spot2.to_bits() {
                 plan1
             } else {
@@ -1117,14 +1116,12 @@ fn build_slice_metric(
     if energy.is_empty() {
         return table;
     }
-    let step = sample_stride(energy.len());
-    let take = |values: Vec<f32>| values.into_iter().step_by(step).collect::<Vec<_>>();
-    table.insert("energy".to_string(), take(energy));
-    table.insert("beam_on".to_string(), take(beam));
-    table.insert("ic1_x_err".to_string(), take(ic1_x));
-    table.insert("ic1_y_err".to_string(), take(ic1_y));
-    table.insert("ic2_x_err".to_string(), take(ic2_x));
-    table.insert("ic2_y_err".to_string(), take(ic2_y));
+    table.insert("energy".to_string(), energy);
+    table.insert("beam_on".to_string(), beam);
+    table.insert("ic1_x_err".to_string(), ic1_x);
+    table.insert("ic1_y_err".to_string(), ic1_y);
+    table.insert("ic2_x_err".to_string(), ic2_x);
+    table.insert("ic2_y_err".to_string(), ic2_y);
     for (key, values) in [
         ("ic1_sig_x", std::mem::take(&mut sig[0])),
         ("ic1_sig_y", std::mem::take(&mut sig[1])),
@@ -1135,7 +1132,7 @@ fn build_slice_metric(
         ("ic2_sig_x_err", std::mem::take(&mut sig_err[2])),
         ("ic2_sig_y_err", std::mem::take(&mut sig_err[3])),
     ] {
-        table.insert(key.to_string(), take(values));
+        table.insert(key.to_string(), values);
     }
     let gap = |left: &[f32], right: &[f32]| {
         left.iter()
@@ -1145,12 +1142,16 @@ fn build_slice_metric(
     };
     let x_diff = gap(&ic2_x_mm, &ic1_x_mm);
     let y_diff = gap(&ic2_y_mm, &ic1_y_mm);
-    table.insert("ic1_x".to_string(), take(ic1_x_mm));
-    table.insert("ic1_y".to_string(), take(ic1_y_mm));
-    table.insert("ic2_x".to_string(), take(ic2_x_mm));
-    table.insert("ic2_y".to_string(), take(ic2_y_mm));
-    table.insert("ic12_x_diff".to_string(), take(x_diff));
-    table.insert("ic12_y_diff".to_string(), take(y_diff));
+    table.insert("ic1_x".to_string(), ic1_x_mm);
+    table.insert("ic1_y".to_string(), ic1_y_mm);
+    table.insert("ic2_x".to_string(), ic2_x_mm);
+    table.insert("ic2_y".to_string(), ic2_y_mm);
+    table.insert("ic12_x_diff".to_string(), x_diff);
+    table.insert("ic12_y_diff".to_string(), y_diff);
+    if plan_xs.iter().any(|value| value.is_finite()) {
+        table.insert("plan_x".to_string(), plan_xs);
+        table.insert("plan_y".to_string(), plan_ys);
+    }
     table
 }
 
@@ -1799,8 +1800,7 @@ fn append_samples(
         return;
     }
     let gate = column_any(sheet, &["rci_in_trigger", "r_beamOk", "beam_on"]);
-    let stride = sample_stride(n);
-    for sample in (0..n).step_by(stride) {
+    for sample in 0..n {
         let any = columns
             .iter()
             .any(|column| column.get(sample).copied().unwrap_or(f32::NAN).is_finite());
@@ -1851,8 +1851,7 @@ fn current_from(sheets: &[Sheet], energies: &[f32], layers: &[i64]) -> BTreeMap<
         let c = ic3_current(sheet);
         let gate = column_any(sheet, &["rci_in_trigger", "r_beamOk", "beam_on"]);
         let n = a.len().max(b.len()).max(c.len());
-        let stride = sample_stride(n);
-        for sample in (0..n).step_by(stride) {
+        for sample in 0..n {
             out_energy.push(tag);
             ic1.push(*a.get(sample).unwrap_or(&f32::NAN));
             ic2.push(*b.get(sample).unwrap_or(&f32::NAN));
@@ -2978,6 +2977,32 @@ mod tests {
         assert_eq!(column.len(), rows);
         assert!(column.iter().all(|value| (*value - 1.5).abs() < 1.0e-5));
         assert_eq!(sheet.num.get("b").map(Vec::len), Some(rows));
+    }
+
+    #[test]
+    fn a_long_timeslice_keeps_every_sample() {
+        let root = std::env::temp_dir().join(format!("scan-kit-slice-all-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let session = root.join("sess");
+        std::fs::create_dir_all(session.join("layer-0/run-0")).unwrap();
+        std::fs::write(session.join("input_map.csv"), "energy,layer_id\n70,1\n").unwrap();
+        let rows = 80_001usize;
+        let mut text = String::from(
+            "layer_id,rci_in_trigger,r_ic1_x_position,r_ic1_x_confidence,ic1_x_fit_ok,r_ic1_x_spot_error_code,ic1_primary_channel\n",
+        );
+        for _ in 0..rows {
+            text.push_str("1,1,64,100,1,0,12\n");
+        }
+        std::fs::write(
+            session.join("layer-0/run-0/timeslice_data_device_units.csv"),
+            text,
+        )
+        .unwrap();
+        let position = load_slice_metric(&root, "sess", "position_error", true);
+        assert_eq!(position.get("ic1_x").map(Vec::len), Some(rows));
+        let current = load_timeslice(&root, "sess", "ic_current");
+        assert_eq!(current.get("ic1_current").map(Vec::len), Some(rows));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// `SCAN_KIT_SESSION` is the session folder that contains `input_map.csv`.

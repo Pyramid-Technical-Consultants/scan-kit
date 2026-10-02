@@ -25,6 +25,7 @@ export type PlotHeader = {
   table: ViewTable | null;
   samples: number[];
   panels: unknown[];
+  quality: string;
 };
 
 function text(value: unknown): string {
@@ -85,7 +86,9 @@ export function plotHeader(bytes: Uint8Array): PlotHeader {
     table?: ViewTable | null;
     samples?: unknown;
     panels?: unknown;
+    quality?: unknown;
   };
+  const quality = text(parsed.quality);
   return {
     title: text(parsed.title),
     controls: Array.isArray(parsed.controls) ? parsed.controls.map(viewControl) : [],
@@ -94,6 +97,7 @@ export function plotHeader(bytes: Uint8Array): PlotHeader {
       ? parsed.samples.filter((sample): sample is number => typeof sample === "number")
       : [],
     panels: Array.isArray(parsed.panels) ? parsed.panels : [],
+    quality: quality.length > 0 ? quality : "final",
   };
 }
 

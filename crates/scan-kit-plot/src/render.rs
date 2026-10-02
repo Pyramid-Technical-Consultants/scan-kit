@@ -585,21 +585,20 @@ impl Plot {
         }
     }
 
-    /// Keep a zoomed window when a new scene describes the same axes.
+    /// Keep a zoomed window when the new panel is the same quantity and its
+    /// data range is still close. A different label or a much larger span
+    /// starts from the new limits. Extra panels keep their own fit.
     #[cfg_attr(not(any(test, target_arch = "wasm32")), allow(dead_code))]
     pub(crate) fn adopt_view(&mut self, previous: &Plot) {
-        if self.cameras.len() != previous.cameras.len() {
-            return;
-        }
-        for (index, camera) in self.cameras.iter_mut().enumerate() {
-            let home = self.home[index];
-            let previous_home = previous.home[index];
-            if same_span(home.xmin, previous_home.xmin)
-                && same_span(home.xmax, previous_home.xmax)
-                && same_span(home.ymin, previous_home.ymin)
-                && same_span(home.ymax, previous_home.ymax)
-            {
-                *camera = previous.cameras[index];
+        let count = self.cameras.len().min(previous.cameras.len());
+        for index in 0..count {
+            let panel = &self.panels[index];
+            let previous_panel = &previous.panels[index];
+            if panel.x_label != previous_panel.x_label || panel.y_label != previous_panel.y_label {
+                continue;
+            }
+            if axes_close(previous.home[index], self.home[index]) {
+                self.cameras[index] = previous.cameras[index];
             }
         }
     }
@@ -2763,9 +2762,18 @@ fn rgba_bytes(color: [f32; 4]) -> [u8; 4] {
 }
 
 #[cfg_attr(not(any(test, target_arch = "wasm32")), allow(dead_code))]
-fn same_span(a: f32, b: f32) -> bool {
-    let scale = a.abs().max(b.abs()).max(1.0);
-    (a - b).abs() <= scale * 1.0e-4
+fn axes_close(before: Camera, after: Camera) -> bool {
+    axis_close(before.xmin, before.xmax, after.xmin, after.xmax)
+        && axis_close(before.ymin, before.ymax, after.ymin, after.ymax)
+}
+
+#[cfg_attr(not(any(test, target_arch = "wasm32")), allow(dead_code))]
+fn axis_close(a0: f32, a1: f32, b0: f32, b1: f32) -> bool {
+    let a_span = (a1 - a0).abs().max(1.0e-6);
+    let b_span = (b1 - b0).abs().max(1.0e-6);
+    let ratio = (a_span / b_span).max(b_span / a_span);
+    let mid_delta = ((a0 + a1) - (b0 + b1)).abs() * 0.5;
+    ratio <= 3.0 && mid_delta <= a_span.max(b_span)
 }
 
 #[cfg(test)]
@@ -2893,11 +2901,30 @@ mod tests {
         second.adopt_view(&first);
         assert_eq!(second.cameras[0], zoomed);
 
+        let mut nudged = line_scene();
+        nudged.panels[0].xmax = 12.0;
+        let mut kept = Plot::new(&nudged, [0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0, 1.0]);
+        kept.adopt_view(&first);
+        assert_eq!(kept.cameras[0], zoomed);
+
         let mut shifted = line_scene();
         shifted.panels[0].xmax = 40.0;
         let mut third = Plot::new(&shifted, [0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0, 1.0]);
         third.adopt_view(&first);
         assert_eq!(third.cameras[0], third.home[0]);
+
+        let mut relabeled = line_scene();
+        relabeled.panels[0].y_label = "IC1 (nA)".into();
+        let mut renamed = Plot::new(&relabeled, [0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0, 1.0]);
+        renamed.adopt_view(&first);
+        assert_eq!(renamed.cameras[0], renamed.home[0]);
+
+        let mut extra = line_scene();
+        extra.panels.push(extra.panels[0].clone());
+        let mut added = Plot::new(&extra, [0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0, 1.0]);
+        added.adopt_view(&first);
+        assert_eq!(added.cameras[0], zoomed);
+        assert_eq!(added.cameras[1], added.home[1]);
     }
 
     #[test]

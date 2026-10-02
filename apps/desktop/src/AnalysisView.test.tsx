@@ -6,17 +6,52 @@ import { invoke } from "@tauri-apps/api/core";
 import { AnalysisView } from "./AnalysisView";
 import { sessionColor } from "./session-colors";
 
+function pollFrame(payload: Uint8Array): Uint8Array {
+  const report = {
+    task: 1,
+    generation: 1,
+    phase: "done",
+    done: 1,
+    total: 1,
+    note: "",
+    finished: true,
+  };
+  const json = new TextEncoder().encode(JSON.stringify(report));
+  const out = new Uint8Array(4 + json.length + payload.byteLength);
+  new DataView(out.buffer).setUint32(0, json.length, true);
+  out.set(json, 4);
+  out.set(payload, 4 + json.length);
+  return out;
+}
+
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: vi.fn(async (command: string, args?: { view?: string }) => {
-    if (command !== "scan_kit_open_plot") {
+    if (command === "scan_kit_cancel") {
+      return null;
+    }
+    if (command === "scan_kit_start") {
+      return { task: 1, generation: 1 };
+    }
+    if (command !== "scan_kit_poll") {
       throw new Error(command);
     }
-    const distribution = args?.view === "distribution";
+    const starts = vi.mocked(invoke).mock.calls.filter(([name]) => name === "scan_kit_start");
+    const started = starts[starts.length - 1]?.[1] as { view?: string } | undefined;
+    const distribution = (started?.view ?? args?.view) === "distribution";
     const header = distribution
       ? {
           title: "Distribution",
           controls: [
-            { id: "source", label: "Source", group: "Data Source", options: ["Spot", "Timeslice"], value: "Spot" },
+            {
+              id: "source",
+              label: "Source",
+              group: "Data Source",
+              options: [
+                { id: "spot", label: "Spot", detail: "One row per spot", icon: "spot" },
+                { id: "timeslice", label: "Timeslice", detail: "One row per millisecond", icon: "timeslice" },
+              ],
+              value: "Spot",
+            },
             {
               id: "xy",
               label: "XY",
@@ -35,7 +70,16 @@ vi.mock("@tauri-apps/api/core", () => ({
       : {
           title: "Dose Ratios vs Energy",
           controls: [
-            { id: "source", label: "Source", group: "Data Source", options: ["Spot", "Timeslice"], value: "Spot" },
+            {
+              id: "source",
+              label: "Source",
+              group: "Data Source",
+              options: [
+                { id: "spot", label: "Spot", detail: "One row per spot", icon: "spot" },
+                { id: "timeslice", label: "Timeslice", detail: "One row per millisecond", icon: "timeslice" },
+              ],
+              value: "Spot",
+            },
             {
               id: "y",
               label: "Y",
@@ -44,7 +88,7 @@ vi.mock("@tauri-apps/api/core", () => ({
               value: "Dose Ratios",
             },
             { id: "x", label: "X", group: "Data Source", options: ["Energy", "Target MU", "Spot time", "Radius"], value: "Energy" },
-            { id: "bins", label: "Bins", group: "Data Source", options: ["Automatic", "8", "16", "32", "64"], value: "Automatic" },
+            { id: "bins", label: "Bins", group: "Data Source", options: ["Auto", "8", "16", "32", "64"], value: "Auto" },
             { id: "trend", label: "Trend", group: "Plot Style", options: ["Off", "Linear", "Polynomial"], value: "Off" },
             { id: "domain", label: "Domain", group: "Filter Data", options: ["All", "Lower 95%", "Upper 5%", "MAD Outliers"], value: "All" },
             { id: "beam", label: "Beam", group: "Filter Data", options: ["Beam On", "Beam Off", "Both"], value: "Beam On" },
@@ -57,7 +101,7 @@ vi.mock("@tauri-apps/api/core", () => ({
     const bytes = new Uint8Array(4 + json.length);
     new DataView(bytes.buffer).setUint32(0, json.length, true);
     bytes.set(json, 4);
-    return bytes;
+    return pollFrame(bytes);
   }),
 }));
 
@@ -129,7 +173,16 @@ it("puts grouped controls on the right and returns to sessions", async () => {
   expect(host.querySelector("h2")).toBeNull();
   expect(host.textContent).not.toContain("Presets");
   expect(host.textContent).not.toContain("Dose Ratios vs Energy");
-  expect(host.textContent).toContain("Chambers over each other");
+  expect(host.textContent).not.toContain("Chambers over each other");
+  expect(host.textContent).not.toContain("One row per spot");
+  const dose = [...host.querySelectorAll("[data-slot='select-trigger']")].find((node) =>
+    node.textContent?.includes("Dose Ratios"),
+  );
+  expect(dose?.querySelector("[title]")?.getAttribute("title")).toBe("Chambers over each other");
+  const spot = [...host.querySelectorAll("[data-slot='toggle-group-item']")].find((node) =>
+    node.textContent?.trim() === "Spot",
+  );
+  expect(spot?.getAttribute("title")).toBe("One row per spot");
 
   const shell = host.firstElementChild;
   const plot = shell?.children[0];
@@ -149,6 +202,11 @@ it("puts grouped controls on the right and returns to sessions", async () => {
   expect(segments).toEqual([
     "Spot",
     "Timeslice",
+    "Auto",
+    "8",
+    "16",
+    "32",
+    "64",
     "Off",
     "Linear",
     "Polynomial",
@@ -158,11 +216,11 @@ it("puts grouped controls on the right and returns to sessions", async () => {
   ]);
   expect(host.textContent).not.toContain("Show Box Outliers");
   expect(host.textContent).not.toContain("Trend Line");
-  const bins = [...host.querySelectorAll("[data-slot='select-trigger']")].find((node) =>
-    node.textContent?.includes("Automatic"),
+  const energy = [...host.querySelectorAll("[data-slot='select-trigger']")].find((node) =>
+    node.textContent?.includes("Energy"),
   );
-  expect(bins?.hasAttribute("disabled") || bins?.getAttribute("aria-disabled") === "true").toBe(false);
-  expect(bins?.getAttribute("data-size")).toBe("sm");
+  expect(energy?.hasAttribute("disabled") || energy?.getAttribute("aria-disabled") === "true").toBe(false);
+  expect(energy?.getAttribute("data-size")).toBe("sm");
   expect(host.querySelector("[data-slot='toggle-group']")?.getAttribute("data-size")).toBe("sm");
   expect(host.querySelector("[data-slot='radio-group']")).toBeNull();
 
@@ -241,7 +299,7 @@ it("hides an unchecked session and keeps the other session's color", async () =>
   });
   const calls = vi
     .mocked(invoke)
-    .mock.calls.filter(([command]) => command === "scan_kit_open_plot")
+    .mock.calls.filter(([command]) => command === "scan_kit_start")
     .map(([, args]) => args as { sessionIds: string[]; palette: number[][] });
   const last = calls[calls.length - 1];
   expect(last?.sessionIds).toEqual(["b"]);
@@ -271,7 +329,16 @@ it("lays distribution columns in plot order on one row with icons", async () => 
   const source = [...host.querySelectorAll("fieldset")].find(
     (node) => node.querySelector("legend")?.textContent === "Data Source",
   );
-  expect(source?.textContent).toContain("Chamber or plan");
+  expect(source?.textContent).not.toContain("Chamber or plan");
+  expect(source?.textContent).not.toContain("One row per millisecond");
+  const xy = [...(source?.querySelectorAll("[data-slot='select-trigger']") ?? [])].find((node) =>
+    node.textContent?.includes("Position"),
+  );
+  expect(xy?.querySelector("[title]")?.getAttribute("title")).toBe("Chamber or plan");
+  const timeslice = [...(source?.querySelectorAll("[data-slot='toggle-group-item']") ?? [])].find(
+    (node) => node.textContent?.trim() === "Timeslice",
+  );
+  expect(timeslice?.getAttribute("title")).toBe("One row per millisecond");
   const row = [...(source?.querySelectorAll(":scope > div") ?? [])].find(
     (node) => node.querySelectorAll("[data-slot='checkbox']").length === 3,
   );

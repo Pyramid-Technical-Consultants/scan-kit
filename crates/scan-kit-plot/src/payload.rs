@@ -28,6 +28,9 @@ pub struct PlotHeader {
     pub row_weights: Vec<f32>,
     pub background: [f32; 4],
     pub foreground: [f32; 4],
+    /// `partial` while a task is still loading. `final` on the last payload.
+    #[serde(default = "final_quality")]
+    pub quality: String,
     batches: Vec<PanelBatch>,
     heatmap_size: Vec<(u32, u32)>,
     lines: u32,
@@ -35,10 +38,23 @@ pub struct PlotHeader {
     quads: u32,
 }
 
+fn final_quality() -> String {
+    "final".into()
+}
+
 pub fn encode_plot(
     scene: &PlotScene,
     background: [f32; 4],
     foreground: [f32; 4],
+) -> Result<Vec<u8>, String> {
+    encode_plot_quality(scene, background, foreground, "final")
+}
+
+pub fn encode_plot_quality(
+    scene: &PlotScene,
+    background: [f32; 4],
+    foreground: [f32; 4],
+    quality: &str,
 ) -> Result<Vec<u8>, String> {
     let marks = build_marks(&scene.panels);
     let header = PlotHeader {
@@ -52,6 +68,7 @@ pub fn encode_plot(
         row_weights: scene.row_weights.clone(),
         background,
         foreground,
+        quality: quality.into(),
         batches: marks.panels.clone(),
         heatmap_size: marks.heatmap_size.clone(),
         lines: marks.lines.len() as u32,

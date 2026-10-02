@@ -5,24 +5,77 @@
 
 use scan_kit_core::{histogram, Panel, Series};
 
-pub(crate) const HIST_BIN_CHOICES: &[&str] = &["10", "20", "30", "50"];
+pub(crate) const BIN_CHOICES: &[&str] = &["Auto", "8", "16", "32", "64"];
+
+const BIN_STEPS: [usize; 4] = [8, 16, 32, 64];
 
 const FILL: [f32; 4] = [0.8, 0.8, 0.8, 0.45];
 const OUTLINE: [f32; 4] = [0.85, 0.85, 0.85, 0.0];
 const GUIDE: [f32; 4] = [0.45, 0.7, 0.4, 0.7];
 
-pub(crate) fn hist_bin_count(raw: &str) -> usize {
-    match raw {
-        "10" => 10,
-        "20" => 20,
-        "50" => 50,
-        _ => 30,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BinShare {
+    Own,
+    Plot,
+    Page,
+}
+
+/// `Auto` and `Automatic` stay automatic. Any other count snaps to 8, 16, 32, or 64.
+pub(crate) fn count_choice(raw: &str) -> Option<usize> {
+    let raw = raw.trim();
+    if raw.is_empty() || raw.eq_ignore_ascii_case("auto") || raw.eq_ignore_ascii_case("automatic") {
+        None
+    } else {
+        let parsed = raw.parse::<usize>().unwrap_or(32);
+        Some(
+            BIN_STEPS
+                .into_iter()
+                .min_by_key(|step| step.abs_diff(parsed))
+                .unwrap_or(32),
+        )
     }
 }
 
-/// Filled bars and their outline. `range` forces one edge set (the distribution
-/// plots share the XY limits). Otherwise `shared` uses one data range, and each
-/// column keeps its own. `guides` are vertical lines at those x values.
+pub(crate) fn bin_button(raw: &str) -> String {
+    match count_choice(raw) {
+        None => "Auto".to_string(),
+        Some(count) => count.to_string(),
+    }
+}
+
+/// Equal-width histogram count. Auto is 32, the same width the grouped axis uses.
+pub(crate) fn hist_bin_count(raw: &str) -> usize {
+    count_choice(raw).unwrap_or(32)
+}
+
+pub(crate) fn bin_share(raw: &str, legacy_on: bool) -> BinShare {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "plot" | "shared" => BinShare::Plot,
+        "page" | "global" => BinShare::Page,
+        "own" | "none" => BinShare::Own,
+        "" => {
+            if legacy_on {
+                BinShare::Plot
+            } else {
+                BinShare::Own
+            }
+        }
+        _ => BinShare::Own,
+    }
+}
+
+pub(crate) fn share_key(share: BinShare) -> &'static str {
+    match share {
+        BinShare::Own => "own",
+        BinShare::Plot => "plot",
+        BinShare::Page => "page",
+    }
+}
+
+/// Filled bars and their outline. `range` forces one edge set: the distribution
+/// marginals use the cloud limits, and a page share uses one range for every
+/// histogram. Otherwise `shared` uses one range for the columns on this plot,
+/// and each column keeps its own. `guides` are vertical lines at those x values.
 pub(crate) fn histogram_panel(
     x_label: &str,
     columns: &[&[f32]],
@@ -198,5 +251,19 @@ mod tests {
             series,
             Series::Guide { xs, .. } if xs.first() == Some(&0.0)
         )));
+    }
+
+    #[test]
+    fn bin_counts_snap_to_the_button_row() {
+        assert_eq!(bin_button("Automatic"), "Auto");
+        assert_eq!(bin_button("30"), "32");
+        assert_eq!(bin_button("10"), "8");
+        assert_eq!(bin_button("20"), "16");
+        assert_eq!(bin_button("50"), "64");
+        assert_eq!(hist_bin_count("Auto"), 32);
+        assert_eq!(bin_share("Plot", false), BinShare::Plot);
+        assert_eq!(bin_share("", true), BinShare::Plot);
+        assert_eq!(bin_share("", false), BinShare::Own);
+        assert_eq!(share_key(BinShare::Page), "page");
     }
 }

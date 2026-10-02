@@ -91,6 +91,8 @@ No custom CSS for color, radius, type, or spacing. A unique visual style, when i
 
 No dataframe crate and no ORM. Session columns are `Vec<f32>` or `Vec<i32>`, parsed in one pass.
 
+A view that takes long enough to block the window runs as a task: one bounded slice per poll, one progress report, and cancel by generation. Plot payloads stay the binary scene the webview already draws. The slice rules, the Monte Carlo preview contract, and the view faces are in [progressive-loading.md](progressive-loading.md).
+
 ## Session data
 
 The database path, table names, and `user_version` 3 match the Python store: `~/.scan-kit/scan-kit.sqlite`, tables `prefs`, `libraries`, and `sessions`, WAL, foreign keys. An existing file opens as-is. This window uses the last data folder and the window geometry prefs.

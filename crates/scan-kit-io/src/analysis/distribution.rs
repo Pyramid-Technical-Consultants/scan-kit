@@ -6,7 +6,7 @@ use scan_kit_core::{
 };
 use serde_json::Value;
 
-use crate::histogram::{hist_bin_count, histogram_panel, HIST_BIN_CHOICES};
+use crate::histogram::{bin_button, hist_bin_count, histogram_panel, BIN_CHOICES};
 
 use super::{
     apply_filter, col, contour_bands, control, drew_line, finite_col, flag, guide, labeled, panel,
@@ -64,7 +64,8 @@ pub(super) fn distribution(root: &Path, session_ids: &[String], options: &Value)
     let show_ic1 = flag(options, "ic1", true);
     let show_ic2 = flag(options, "ic2", true);
     let show_plan = flag(options, "plan", true);
-    let bins = hist_bin_count(text(options, "hist_bins", "30"));
+    let hist_raw = text(options, "hist_bins", "Auto");
+    let bins = hist_bin_count(hist_raw);
     let (panels, columns, has_plan) = if mode == "confidence" {
         (
             confidence_scene(root, session_ids, beam, draw, ramp, cutoff),
@@ -131,7 +132,7 @@ pub(super) fn distribution(root: &Path, session_ids: &[String], options: &Value)
     }
     if cloud {
         controls.push(
-            control("hist_bins", "Bins", HIST_BIN_CHOICES, &bins.to_string()).grouped("Histogram"),
+            control("hist_bins", "Bins", BIN_CHOICES, &bin_button(hist_raw)).grouped("Histogram"),
         );
     }
     controls.push(labeled("beam", "Beam", BEAM_CHOICES, beam).grouped("Filter Data"));

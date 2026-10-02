@@ -412,6 +412,7 @@ pub(super) fn hist_panel(
     tables: &[BTreeMap<String, Vec<f32>>],
     bins: usize,
     shared: bool,
+    range: Option<(f32, f32)>,
     position_guides: bool,
 ) -> Panel {
     let columns: Vec<&[f32]> = tables
@@ -428,7 +429,7 @@ pub(super) fn hist_panel(
     } else {
         Vec::new()
     };
-    histogram_panel("", &columns, bins, shared, None, &guides)
+    histogram_panel("", &columns, bins, shared, range, &guides)
 }
 
 pub(super) fn corr_panel(

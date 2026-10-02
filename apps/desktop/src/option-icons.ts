@@ -99,6 +99,7 @@ const ICONS: Record<string, LucideIcon> = {
   "Beam Off": CircleOff,
   Both: CircleDot,
   All: Layers,
+  Auto: Layers,
   Automatic: Layers,
   Off: CircleOff,
   On: Circle,

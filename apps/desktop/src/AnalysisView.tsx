@@ -11,7 +11,14 @@ import {
 } from "@glideapps/glide-data-grid";
 import { gridTheme, tokenColor } from "@/grid-theme";
 
-import { controlDisabled, controlSections, segmentChoices, type ControlSlot } from "@/analysis-controls";
+import {
+  applyOption,
+  controlDisabled,
+  controlSections,
+  segmentChoices,
+  type ControlSlot,
+  type GrainMemory,
+} from "@/analysis-controls";
 import { AnalysisMenu, analysisId, analysisName } from "@/analysis-menu";
 import { ButtonSegmentGroup } from "@/components/button-segment-group";
 import { Button } from "@/components/ui/button";
@@ -20,7 +27,9 @@ import { Field, FieldLabel, FieldLegend, FieldSet } from "@/components/ui/field"
 import { SessionList } from "@/session-list";
 import { optionIcon } from "@/option-icons";
 import { backingSize, plotHeader, type PlotHeader, type ViewControl } from "@/plot-header";
+import { ProgressHairline } from "@/progress-line";
 import { sessionColor, shownSessionIds } from "@/session-colors";
+import { acceptReport, bytesOf, parsePoll, type Report } from "@/task-client";
 import { dismissNotice, notifyError } from "@/notify";
 import { SidePane } from "@/SidePane";
 import {
@@ -149,18 +158,10 @@ function ChoiceFace({
   icon: string;
 }) {
   return (
-    <>
+    <span className="flex min-w-0 items-center gap-1.5" title={detail.length > 0 ? detail : undefined}>
       <ChoiceIcon name={label} icon={icon} />
-      <span>{label}</span>
-      {detail.length > 0 ? (
-        <span
-          className="text-muted-foreground ml-auto min-w-0 flex-1 truncate text-right font-normal"
-          title={detail}
-        >
-          {detail}
-        </span>
-      ) : null}
-    </>
+      <span className="truncate">{label}</span>
+    </span>
   );
 }
 
@@ -239,9 +240,13 @@ export function AnalysisView({
   const canvas = useRef<HTMLCanvasElement>(null);
   const plotter = useRef<Plotter | null>(null);
   const payload = useRef<Uint8Array | null>(null);
+  const hold = useRef(0);
+  const taskId = useRef(0);
+  const [taskReport, setTaskReport] = useState<Report | null>(null);
   const frame = useRef(0);
   const openSeq = useRef(0);
   const [options, setOptions] = useState<Record<string, string>>({});
+  const grains = useRef<GrainMemory>({});
   const [hidden, setHidden] = useState<string[]>([]);
   const [meta, setMeta] = useState<PlotHeader | null>(null);
   const [plotError, setPlotError] = useState<string | null>(null);
@@ -356,43 +361,80 @@ export function AnalysisView({
   const orderKey = sessions.map((session) => session.id).join("\0");
   const hiddenKey = hidden.join("\0");
   useEffect(() => {
+    const mine = hold.current + 1;
+    hold.current = mine;
     const ticket = openSeq.current + 1;
     openSeq.current = ticket;
     const order = orderKey === "" ? [] : orderKey.split("\0");
     const shown = shownSessionIds(order, hiddenKey === "" ? [] : hiddenKey.split("\0"));
     const plotOptions =
       viewId === "dose_volume" && studyPath != null ? { ...options, study: studyPath } : options;
+    let stop = false;
     const timer = window.setTimeout(() => {
       setPlotError(null);
-      void invoke<ArrayBuffer | Uint8Array>("scan_kit_open_plot", {
-        view: viewId,
-        path: folder,
-        sessionIds: shown,
-        options: plotOptions,
-        background: parseColor(tokenColor("--background")),
-        foreground: parseColor(tokenColor("--foreground")),
-        palette: palette(order, shown),
-      })
-        .then((result) => {
-          if (openSeq.current !== ticket) {
+      void (async () => {
+        const started = await invoke<{ task: number; generation: number }>("scan_kit_start", {
+          view: viewId,
+          path: folder,
+          sessionIds: shown,
+          options: plotOptions,
+          background: parseColor(tokenColor("--background")),
+          foreground: parseColor(tokenColor("--foreground")),
+          palette: palette(order, shown),
+        });
+        if (stop || openSeq.current !== ticket) {
+          await invoke("scan_kit_cancel", { task: started.task });
+          return;
+        }
+        taskId.current = started.task;
+        for (;;) {
+          if (stop || openSeq.current !== ticket) {
             return;
           }
-          const bytes = result instanceof Uint8Array ? result : new Uint8Array(result);
-          setPlotError(null);
-          setMeta(plotHeader(bytes));
-          payload.current = bytes;
-          loadPayload();
-          dismissNotice("analysis");
-        })
-        .catch((reason: unknown) => {
-          if (openSeq.current === ticket) {
-            const message = messageOf(reason);
-            setPlotError(message);
-            notifyError(message, "analysis");
+          const raw = await invoke<ArrayBuffer | Uint8Array>("scan_kit_poll", { task: started.task });
+          if (stop || openSeq.current !== ticket) {
+            return;
           }
-        });
+          const parsed = parsePoll(bytesOf(raw));
+          if (!acceptReport(parsed.report, started.task, started.generation)) {
+            continue;
+          }
+          setTaskReport(parsed.report.finished ? null : parsed.report);
+          if (parsed.payload != null) {
+            setPlotError(null);
+            setMeta(plotHeader(parsed.payload));
+            payload.current = parsed.payload;
+            loadPayload();
+            dismissNotice("analysis");
+          }
+          if (parsed.report.finished) {
+            if (parsed.report.phase === "failed") {
+              const message = parsed.report.note.length > 0 ? parsed.report.note : "The plot failed.";
+              setPlotError(message);
+              notifyError(message, "analysis");
+            }
+            return;
+          }
+        }
+      })().catch((reason: unknown) => {
+        if (openSeq.current === ticket) {
+          const message = messageOf(reason);
+          setPlotError(message);
+          notifyError(message, "analysis");
+        }
+      });
     }, 150);
-    return () => window.clearTimeout(timer);
+    return () => {
+      stop = true;
+      window.clearTimeout(timer);
+      const id = taskId.current;
+      queueMicrotask(() => {
+        if (hold.current === mine && id !== 0) {
+          taskId.current = 0;
+          void invoke("scan_kit_cancel", { task: id });
+        }
+      });
+    };
   }, [viewId, folder, orderKey, hiddenKey, options, studyPath]);
 
   useEffect(() => {
@@ -463,7 +505,7 @@ export function AnalysisView({
   const byId = new Map(controls.map((control) => [control.id, control]));
   const sections = controlSections(controls);
   const apply = (id: string, value: string) => {
-    setOptions((current) => ({ ...current, [id]: value }));
+    setOptions((current) => applyOption(current, resolved, grains.current, id, value));
   };
 
   const table = meta?.table;
@@ -542,7 +584,10 @@ export function AnalysisView({
   return (
     <SidePane
       main={
-      <div ref={host} className="bg-background flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
+      <div ref={host} className="bg-background relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
+        {taskReport != null && !taskReport.finished ? (
+          <ProgressHairline done={taskReport.done} total={taskReport.total} />
+        ) : null}
         {table != null && table.rows.length > 0 ? (
           <DataEditor
             width={size.width}
@@ -561,6 +606,11 @@ export function AnalysisView({
         )}
         <div className={shown ? "relative min-h-0 flex-1" : "hidden"}>
           <canvas ref={canvas} className="absolute inset-0 h-full w-full touch-none" />
+          {taskReport != null && !taskReport.finished && taskReport.note.length > 0 ? (
+            <p className="text-muted-foreground pointer-events-none absolute bottom-2 left-2 text-xs">
+              {taskReport.note}
+            </p>
+          ) : null}
         </div>
       </div>
       }

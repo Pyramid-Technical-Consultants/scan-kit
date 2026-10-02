@@ -442,7 +442,7 @@ mod tests {
         assert!(scene
             .controls
             .iter()
-            .any(|control| control.id == "hist_bins" && control.value == "30"));
+            .any(|control| control.id == "hist_bins" && control.value == "Auto"));
         assert!(scene
             .controls
             .iter()
@@ -498,6 +498,39 @@ mod tests {
             .all(|panel| {
                 panel.title.is_empty() && !panel.x_label.is_empty() && !panel.y_label.is_empty()
             }));
+    }
+
+    #[test]
+    fn distribution_timeslice_keeps_the_plan_column() {
+        let root = std::env::temp_dir().join(format!("scan-kit-slice-plan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let session = root.join("sess");
+        std::fs::create_dir_all(session.join("layer-0/run-0")).unwrap();
+        std::fs::write(
+            session.join("input_map.csv"),
+            "energy,layer_id,spot_no,position_x,position_y\n70,1,5,3,4\n",
+        )
+        .unwrap();
+        std::fs::write(
+            session.join("layer-0/run-0/timeslice_data_device_units.csv"),
+            "layer_id,spot_no,rci_in_trigger,r_ic1_x_position\n1,5,1,64\n1,5,1,64\n",
+        )
+        .unwrap();
+        let scene = analysis_scene(
+            "distribution",
+            &root,
+            &["sess".into()],
+            &json!({"source": "Timeslice"}),
+        )
+        .unwrap();
+        assert!(scene
+            .controls
+            .iter()
+            .any(|control| control.id == "plan" && control.value == "On"));
+        assert!(scene.panels.iter().any(|panel| {
+            panel.equal && panel.x_label == "Plan X (mm)" && panel.y_label == "Plan Y (mm)"
+        }));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

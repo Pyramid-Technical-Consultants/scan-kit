@@ -15,6 +15,7 @@ mod schema;
 mod session;
 mod session_log;
 mod signal;
+mod task;
 mod tune;
 mod xml_dom;
 
@@ -66,6 +67,9 @@ pub use schema::{
     IC3_QUAD_ZERO_FILL, POSITION_KEY_G2_RAW, POSITION_KEY_G3_RAW,
 };
 pub use session::{merge_session_geom, parse_termination_summary_text, SessionMeta, SummaryDate};
+pub use task::{
+    adapt_chunk, decode_poll, encode_poll, generation_matches, settle, Cancel, Phase, Poll, Report,
+};
 
 use serde::Serialize;
 use serde_json::{json, Value};

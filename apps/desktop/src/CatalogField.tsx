@@ -40,14 +40,19 @@ export function catalogShown(
   );
 }
 
-/** Two or three short labels sit in a joined button row. A note stays in a select. */
+const BIN_BUTTONS = ["Auto", "8", "16", "32", "64"];
+
+/** Two or three short labels sit in a joined button row. Bin counts are the one five-item row. */
 export function segmentChoices(
   options: readonly (string | { label: string; detail?: string })[],
 ): boolean {
-  if (options.some((option) => typeof option !== "string" && (option.detail?.length ?? 0) > 0)) {
-    return false;
-  }
   const labels = options.map((option) => (typeof option === "string" ? option : option.label));
+  if (
+    labels.length === BIN_BUTTONS.length &&
+    labels.every((label, index) => label === BIN_BUTTONS[index])
+  ) {
+    return true;
+  }
   return (
     labels.length >= 2 &&
     labels.length < 4 &&

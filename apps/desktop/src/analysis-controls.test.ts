@@ -1,7 +1,13 @@
 import { ChartColumn, Columns2, LayoutGrid } from "lucide-react";
 import { expect, it } from "vitest";
 
-import { controlDisabled, controlSections, segmentChoices } from "./analysis-controls";
+import {
+  applyOption,
+  controlDisabled,
+  controlSections,
+  segmentChoices,
+  type GrainMemory,
+} from "./analysis-controls";
 import { optionIcon } from "./option-icons";
 
 const BINNED = [
@@ -15,7 +21,7 @@ const BINNED = [
   { id: "cutoff", group: "Plot Style" },
   { id: "hist", group: "Histogram", kind: "check" },
   { id: "hist_bins", group: "Histogram" },
-  { id: "shared", group: "Histogram", kind: "check" },
+  { id: "share", group: "Histogram" },
   { id: "corr", group: "Correlation", kind: "check" },
   { id: "domain", group: "Filter Data" },
   { id: "beam", group: "Filter Data" },
@@ -48,6 +54,8 @@ it("keeps a joined button row for two or three short names", () => {
   expect(segmentChoices(["Violin", "Box", "Mean", "Scatter", "Contour"])).toBe(false);
   expect(segmentChoices(["Spot — Isocenter", "Spot — Chamber"])).toBe(false);
   expect(segmentChoices(["Energy"])).toBe(false);
+  expect(segmentChoices(["Auto", "8", "16", "32", "64"])).toBe(true);
+  expect(segmentChoices(["Own", "Plot", "Page"])).toBe(true);
   expect(optionIcon("Own")).toBe(ChartColumn);
   expect(optionIcon("Plot")).toBe(Columns2);
   expect(optionIcon("Page")).toBe(LayoutGrid);
@@ -56,7 +64,7 @@ it("keeps a joined button row for two or three short names", () => {
       { label: "Spot", detail: "One row per spot" },
       { label: "Timeslice", detail: "One row per millisecond" },
     ]),
-  ).toBe(false);
+  ).toBe(true);
 });
 
 it("parks a control with no group in Options", () => {
@@ -143,10 +151,76 @@ it("groups dose volume into source, model, phantom, compare, and color", () => {
   expect(withCt.map((section) => section.title)).toEqual(["Patient"]);
 });
 
+it("remembers the axes picked on spot and on timeslice", () => {
+  const memory: GrainMemory = {};
+  const spot = { y: "Dose Error (%)", x: "Radius (mm)", glyph: "Violin", ic1: "On" };
+  let options = applyOption(spot, { ...spot, source: "Spot" }, memory, "source", "Timeslice");
+  expect(options).toMatchObject({
+    source: "Timeslice",
+    y: "Dose Error (%)",
+    x: "Radius (mm)",
+    glyph: "Violin",
+  });
+
+  options = applyOption(
+    options,
+    { source: "Timeslice", y: "Current Ratios (%)", x: "Energy (MeV)", glyph: "Violin" },
+    memory,
+    "source",
+    "Spot",
+  );
+  expect(options.y).toBe("Dose Error (%)");
+  expect(options.x).toBe("Radius (mm)");
+
+  options = applyOption(
+    options,
+    { source: "Spot", y: "Dose Error (%)", x: "Radius (mm)" },
+    memory,
+    "source",
+    "Timeslice",
+  );
+  expect(options.y).toBe("Current Ratios (%)");
+  expect(options.x).toBe("Energy (MeV)");
+
+  const distribution: GrainMemory = {};
+  options = applyOption(
+    { xy: "Position (mm)", ic1: "On" },
+    { source: "Spot", xy: "Position (mm)", ic1: "On" },
+    distribution,
+    "source",
+    "Timeslice",
+  );
+  options = applyOption(
+    options,
+    { source: "Timeslice", xy: "Position (mm)", ic1: "On" },
+    distribution,
+    "xy",
+    "Amplifier (V)",
+  );
+  options = applyOption(
+    options,
+    { source: "Timeslice", xy: "Amplifier (V)", ic1: "On" },
+    distribution,
+    "source",
+    "Spot",
+  );
+  expect(options.xy).toBe("Position (mm)");
+  expect(options.ic1).toBe("On");
+  options = applyOption(
+    options,
+    { source: "Spot", xy: "Position (mm)", ic1: "On" },
+    distribution,
+    "source",
+    "Timeslice",
+  );
+  expect(options.xy).toBe("Amplifier (V)");
+});
+
 it("disables histogram bin controls until the panel is on", () => {
   expect(controlDisabled("hist_bins", { hist: "Off" })).toBe(true);
   expect(controlDisabled("hist_bins", {})).toBe(false);
-  expect(controlDisabled("shared", { hist: "On" })).toBe(false);
+  expect(controlDisabled("share", { hist: "On" })).toBe(false);
+  expect(controlDisabled("share", { hist: "Off" })).toBe(true);
   expect(controlDisabled("domain", { hist: "Off" })).toBe(false);
 });
 

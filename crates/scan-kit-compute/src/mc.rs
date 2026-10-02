@@ -1,8 +1,13 @@
 //! Host for the MCsquare transport shader. A run returns the finished dose.
+//!
+//! [`McRun`] is the sliced form of the same transport. [`run_mc`] drains it.
 
 use std::future::Future;
+use std::time::{Duration, Instant};
 
-use scan_kit_core::{McJob, McResult, PatientRequest, SlabRequest, Volume};
+use scan_kit_core::{
+    adapt_chunk, Cancel, McJob, McResult, PatientRequest, Phase, Poll, Report, SlabRequest, Volume,
+};
 use scan_kit_io::mc_tables;
 
 use crate::ComputeError;
@@ -67,11 +72,143 @@ struct Launch {
 }
 
 pub fn run_mc(job: &McJob) -> Result<McResult, ComputeError> {
-    let launch = match job {
-        McJob::Slab(request) => slab_launch(request)?,
-        McJob::Patient(request) => patient_launch(request)?,
-    };
-    block_on(execute(launch))
+    let mut run = McRun::open(job)?;
+    match run.poll(Duration::MAX, &Cancel::new()) {
+        Poll::Ready(result) => Ok(result),
+        Poll::Failed(message) => Err(ComputeError::Message(message)),
+        Poll::Cancelled => Err(ComputeError::Message("cancelled".into())),
+        Poll::Pending { .. } => Err(ComputeError::Message("monte carlo did not finish".into())),
+    }
+}
+
+/// One Monte Carlo transport. An unlimited poll runs every history. A short poll
+/// queues one chunk and returns while the GPU runs it.
+pub struct McRun {
+    live: Option<Live>,
+    done: Option<McResult>,
+}
+
+impl McRun {
+    pub fn open(job: &McJob) -> Result<Self, ComputeError> {
+        let launch = match job {
+            McJob::Slab(request) => slab_launch(request)?,
+            McJob::Patient(request) => patient_launch(request)?,
+        };
+        if launch.protons <= 0.0 || launch.spots.is_empty() {
+            return Ok(Self {
+                live: None,
+                done: Some(empty_result(&launch)),
+            });
+        }
+        Ok(Self {
+            live: Some(block_on(prepare(launch))?),
+            done: None,
+        })
+    }
+
+    pub fn poll(&mut self, budget: Duration, cancel: &Cancel) -> Poll<McResult> {
+        if cancel.is_cancelled() {
+            return Poll::Cancelled;
+        }
+        if let Some(result) = &self.done {
+            return Poll::Ready(result.clone());
+        }
+        let Some(live) = self.live.as_mut() else {
+            return Poll::Failed("monte carlo has no buffers".into());
+        };
+        if budget >= Duration::from_secs(30) {
+            return match live.drain() {
+                Ok(result) => {
+                    self.done = Some(result.clone());
+                    Poll::Ready(result)
+                }
+                Err(err) => Poll::Failed(err.to_string()),
+            };
+        }
+        match live.step(budget, cancel) {
+            Ok(Slice::Pending(preview)) => {
+                let report = live.report(preview.is_some());
+                Poll::Pending { report, preview }
+            }
+            Ok(Slice::Ready(result)) => {
+                self.done = Some(result.clone());
+                Poll::Ready(result)
+            }
+            Ok(Slice::Cancelled) => Poll::Cancelled,
+            Err(err) => Poll::Failed(err.to_string()),
+        }
+    }
+
+    /// Keep the tallies and aim at `histories` when that is still ahead.
+    pub fn extend(&mut self, histories: u32) -> bool {
+        let Some(live) = self.live.as_mut() else {
+            return false;
+        };
+        let target = (histories / live.per_batch).max(1) * live.per_batch;
+        if target < live.next {
+            return false;
+        }
+        if target != live.histories {
+            live.histories = target;
+            live.finished = false;
+            self.done = None;
+        }
+        true
+    }
+
+    pub fn progress(&self) -> f64 {
+        if self.done.is_some() {
+            return 1.0;
+        }
+        let Some(live) = &self.live else {
+            return 1.0;
+        };
+        if live.histories == 0 {
+            1.0
+        } else {
+            f64::from(live.next) / f64::from(live.histories)
+        }
+    }
+}
+
+enum Slice {
+    Pending(Option<McResult>),
+    Ready(McResult),
+    Cancelled,
+}
+
+struct Live {
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    transport_pipe: wgpu::ComputePipeline,
+    transport_group: wgpu::BindGroup,
+    fold_pipe: wgpu::ComputePipeline,
+    fold_group: wgpu::BindGroup,
+    params: wgpu::Buffer,
+    ledger: wgpu::Buffer,
+    fold_params: wgpu::Buffer,
+    out: wgpu::Buffer,
+    sum: wgpu::Buffer,
+    sq: wgpu::Buffer,
+    /// Buffers the bind groups borrow. Read so the field is not dead.
+    kept: Vec<wgpu::Buffer>,
+    base: [u8; 80],
+    next: u32,
+    histories: u32,
+    per_batch: u32,
+    chunk: u32,
+    floor: u32,
+    cap: u32,
+    nvox: usize,
+    scale: f32,
+    shape: [usize; 3],
+    origin: [f32; 3],
+    voxel: f32,
+    inflight: bool,
+    finished: bool,
+    previews: u32,
+    last_preview: Instant,
+    cached: Option<McResult>,
 }
 
 fn slab_launch(request: &SlabRequest) -> Result<Launch, ComputeError> {
@@ -205,22 +342,24 @@ fn patient_launch(request: &PatientRequest) -> Result<Launch, ComputeError> {
     })
 }
 
-async fn execute(launch: Launch) -> Result<McResult, ComputeError> {
+fn empty_result(launch: &Launch) -> McResult {
     let [nx, ny, nz] = launch.shape;
     let nvox = nx.saturating_mul(ny).saturating_mul(nz).max(1);
-    let empty = Volume {
-        origin: launch.origin_mm,
-        shape: [nx.max(1), ny.max(1), nz.max(1)],
-        voxel: launch.voxel_mm,
-        values: vec![0.0; nvox],
-    };
-    if launch.protons <= 0.0 || launch.spots.is_empty() {
-        return Ok(McResult {
-            volume: empty,
-            uncertainty: 0.0,
-            ledger: [0.0; 6],
-        });
+    McResult {
+        volume: Volume {
+            origin: launch.origin_mm,
+            shape: [nx.max(1), ny.max(1), nz.max(1)],
+            voxel: launch.voxel_mm,
+            values: vec![0.0; nvox],
+        },
+        uncertainty: 0.0,
+        ledger: [0.0; 6],
     }
+}
+
+async fn prepare(launch: Launch) -> Result<Live, ComputeError> {
+    let [nx, ny, nz] = launch.shape;
+    let nvox = nx.saturating_mul(ny).saturating_mul(nz).max(1);
     let (device, queue) = mc_device().await?;
     let tables = mc_tables();
     let histories = batch_count(launch.histories);
@@ -302,59 +441,231 @@ async fn execute(launch: Launch) -> Result<McResult, ComputeError> {
         &launch,
         launch.spots.len() / if launch.mode == 0 { 8 } else { 40 },
     );
-    let mut next = 0u32;
-    while next < histories {
-        let count = (per_batch - next % per_batch)
-            .min(100_000)
-            .min(histories - next);
-        write_u32(&mut base, 15, next);
-        write_u32(&mut base, 16, count);
-        queue.write_buffer(&params, 0, &base);
-        queue.write_buffer(&ledger, 56, &0u32.to_le_bytes());
-        dispatch(
-            &device,
-            &queue,
-            &transport_pipe,
-            &transport_group,
-            count.div_ceil(64),
-            1,
-        );
-        next += count;
-        if next.is_multiple_of(per_batch) {
-            queue.write_buffer(&fold_params, 0, &fold_bytes(nvox as u32, 0, scale, 1.0));
-            let (x, y) = fold_groups(nvox);
-            dispatch(&device, &queue, &fold_pipe, &fold_group, x, y);
+    let floor = (per_batch / 8).max(1);
+    let cap = per_batch.saturating_mul(4).max(floor);
+    Ok(Live {
+        device,
+        queue,
+        transport_pipe,
+        transport_group,
+        fold_pipe,
+        fold_group,
+        params,
+        ledger,
+        fold_params,
+        out,
+        sum,
+        sq,
+        kept: vec![
+            spots, floats, ints, tally, material, density, let_tally, beams,
+        ],
+        base,
+        next: 0,
+        histories,
+        per_batch,
+        chunk: floor,
+        floor,
+        cap,
+        nvox,
+        scale,
+        shape: [nx, ny, nz],
+        origin: launch.origin_mm,
+        voxel: launch.voxel_mm,
+        inflight: false,
+        finished: false,
+        previews: 0,
+        last_preview: Instant::now(),
+        cached: None,
+    })
+}
+
+impl Live {
+    fn report(&self, preview: bool) -> Report {
+        let uncertainty = self
+            .cached
+            .as_ref()
+            .map(|result| result.uncertainty)
+            .unwrap_or(0.0);
+        Report {
+            task: 0,
+            generation: 0,
+            phase: if preview {
+                Phase::Preview
+            } else {
+                Phase::Compute
+            },
+            done: u64::from(self.next),
+            total: u64::from(self.histories),
+            note: history_note(self.next, self.histories, uncertainty),
         }
     }
-    queue.write_buffer(
-        &fold_params,
-        0,
-        &fold_bytes(nvox as u32, 1, scale, 1.0 / histories as f32),
-    );
-    let (x, y) = fold_groups(nvox);
-    dispatch(&device, &queue, &fold_pipe, &fold_group, x, y);
 
-    let dose = read_f32(&device, &queue, &out, nvox)?;
-    let dose_sum = read_f32(&device, &queue, &sum, nvox)?;
-    let dose_sq = read_f32(&device, &queue, &sq, nvox)?;
-    let raw = read_u32(&device, &queue, &ledger, 16)?;
-    let mut ledger_mev = [0.0f32; 6];
-    for i in 0..6 {
-        let lo = u64::from(raw[i * 2]);
-        let hi = u64::from(raw[i * 2 + 1]);
-        let quanta = ((hi << 32) | lo) as i64;
-        ledger_mev[i] = (quanta as f64 * QUANTUM_MEV / f64::from(histories)) as f32;
+    /// The original one-shot loop: every history, then the store fold.
+    fn drain(&mut self) -> Result<McResult, ComputeError> {
+        let _kept = self.kept.len();
+        self.submit_until(self.histories);
+        self.finish()
     }
-    Ok(McResult {
-        volume: Volume {
-            origin: launch.origin_mm,
-            shape: [nx, ny, nz],
-            voxel: launch.voxel_mm,
-            values: dose,
-        },
-        uncertainty: uncertainty(&dose_sum, &dose_sq, histories / per_batch),
-        ledger: ledger_mev,
-    })
+
+    fn step(&mut self, budget: Duration, cancel: &Cancel) -> Result<Slice, ComputeError> {
+        let _kept = self.kept.len();
+        if self.finished {
+            return Ok(Slice::Ready(self.cached.clone().ok_or_else(|| {
+                ComputeError::Message("monte carlo finished without a dose".into())
+            })?));
+        }
+        if self.inflight {
+            let blocked = self.wait_fence()?;
+            self.inflight = false;
+            self.chunk = adapt_chunk(self.chunk, self.floor, self.cap, blocked, budget);
+            if cancel.is_cancelled() {
+                return Ok(Slice::Cancelled);
+            }
+            if self.next > 0
+                && (self.previews == 0 || self.last_preview.elapsed() >= Duration::from_millis(100))
+            {
+                self.cached = Some(self.preview()?);
+                self.last_preview = Instant::now();
+                self.previews += 1;
+            }
+            if self.next >= self.histories {
+                let result = self.finish()?;
+                self.finished = true;
+                return Ok(Slice::Ready(result));
+            }
+        }
+        if cancel.is_cancelled() {
+            return Ok(Slice::Cancelled);
+        }
+        let end = self.next.saturating_add(self.chunk).min(self.histories);
+        self.submit_until(end);
+        self.inflight = true;
+        Ok(Slice::Pending(self.cached.clone()))
+    }
+
+    fn submit_until(&mut self, end: u32) {
+        while self.next < end {
+            let count = (self.per_batch - self.next % self.per_batch)
+                .min(100_000)
+                .min(end - self.next);
+            write_u32(&mut self.base, 15, self.next);
+            write_u32(&mut self.base, 16, count);
+            self.queue.write_buffer(&self.params, 0, &self.base);
+            self.queue
+                .write_buffer(&self.ledger, 56, &0u32.to_le_bytes());
+            dispatch(
+                &self.device,
+                &self.queue,
+                &self.transport_pipe,
+                &self.transport_group,
+                count.div_ceil(64),
+                1,
+            );
+            self.next += count;
+            if self.next.is_multiple_of(self.per_batch) {
+                self.queue.write_buffer(
+                    &self.fold_params,
+                    0,
+                    &fold_bytes(self.nvox as u32, 0, self.scale, 1.0),
+                );
+                let (x, y) = fold_groups(self.nvox);
+                dispatch(
+                    &self.device,
+                    &self.queue,
+                    &self.fold_pipe,
+                    &self.fold_group,
+                    x,
+                    y,
+                );
+            }
+        }
+    }
+
+    fn wait_fence(&self) -> Result<Duration, ComputeError> {
+        let started = Instant::now();
+        self.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .map_err(|err| ComputeError::Message(err.to_string()))?;
+        Ok(started.elapsed())
+    }
+
+    fn preview(&self) -> Result<McResult, ComputeError> {
+        let gain = 1.0 / (self.next.max(1) as f32);
+        self.queue.write_buffer(
+            &self.fold_params,
+            0,
+            &fold_bytes(self.nvox as u32, 2, self.scale, gain),
+        );
+        let (x, y) = fold_groups(self.nvox);
+        dispatch(
+            &self.device,
+            &self.queue,
+            &self.fold_pipe,
+            &self.fold_group,
+            x,
+            y,
+        );
+        self.read_result(self.next.max(1))
+    }
+
+    fn finish(&mut self) -> Result<McResult, ComputeError> {
+        let gain = 1.0 / (self.histories.max(1) as f32);
+        self.queue.write_buffer(
+            &self.fold_params,
+            0,
+            &fold_bytes(self.nvox as u32, 1, self.scale, gain),
+        );
+        let (x, y) = fold_groups(self.nvox);
+        dispatch(
+            &self.device,
+            &self.queue,
+            &self.fold_pipe,
+            &self.fold_group,
+            x,
+            y,
+        );
+        let result = self.read_result(self.histories.max(1))?;
+        self.cached = Some(result.clone());
+        self.finished = true;
+        Ok(result)
+    }
+
+    fn read_result(&self, histories: u32) -> Result<McResult, ComputeError> {
+        let dose = read_f32(&self.device, &self.queue, &self.out, self.nvox)?;
+        let dose_sum = read_f32(&self.device, &self.queue, &self.sum, self.nvox)?;
+        let dose_sq = read_f32(&self.device, &self.queue, &self.sq, self.nvox)?;
+        let raw = read_u32(&self.device, &self.queue, &self.ledger, 16)?;
+        let histories = histories.max(1);
+        let mut ledger_mev = [0.0f32; 6];
+        for i in 0..6 {
+            let lo = u64::from(raw[i * 2]);
+            let hi = u64::from(raw[i * 2 + 1]);
+            let quanta = ((hi << 32) | lo) as i64;
+            ledger_mev[i] = (quanta as f64 * QUANTUM_MEV / f64::from(histories)) as f32;
+        }
+        Ok(McResult {
+            volume: Volume {
+                origin: self.origin,
+                shape: self.shape,
+                voxel: self.voxel,
+                values: dose,
+            },
+            uncertainty: uncertainty(&dose_sum, &dose_sq, histories / self.per_batch.max(1)),
+            ledger: ledger_mev,
+        })
+    }
+}
+
+fn history_note(done: u32, total: u32, uncertainty: f32) -> String {
+    if total == 0 {
+        return String::new();
+    }
+    let pct = (100.0 * f64::from(done) / f64::from(total)).round() as u32;
+    if uncertainty > 0.0 {
+        format!("{pct}% · ±{:.1}%", uncertainty * 100.0)
+    } else {
+        format!("{pct}%")
+    }
 }
 
 fn batch_count(histories: u32) -> u32 {
@@ -816,5 +1127,134 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn slab(histories: u32) -> SlabRequest {
+        SlabRequest {
+            medium: "water".into(),
+            x: vec![0.0],
+            y: vec![0.0],
+            sx: vec![2.0],
+            sy: vec![2.0],
+            energy: vec![70.0],
+            protons: vec![1.0e6],
+            histories,
+            seed: 1,
+            spread_pct: 1.0,
+            wet_mm: 0.0,
+            depth_mm: 40.0,
+            voxel_mm: 2.0,
+            origin: [-8.0, -8.0, -40.0],
+            shape: [8, 8, 20],
+        }
+    }
+
+    fn finish(run: &mut McRun) -> Result<McResult, String> {
+        let cancel = Cancel::new();
+        loop {
+            match run.poll(Duration::from_micros(100), &cancel) {
+                Poll::Pending { .. } => {}
+                Poll::Ready(result) => return Ok(result),
+                Poll::Cancelled => return Err("cancelled".into()),
+                Poll::Failed(message) => return Err(message),
+            }
+        }
+    }
+
+    #[test]
+    fn sliced_run_matches_one_shot() {
+        let job = McJob::Slab(slab(60_000));
+        let one = match run_mc(&job) {
+            Err(ComputeError::NoAdapter) => return,
+            Err(err) => panic!("{err}"),
+            Ok(result) => result,
+        };
+        let mut sliced = McRun::open(&job).expect("adapter");
+        let cancel = Cancel::new();
+        let mut saw_dose = false;
+        let ready = loop {
+            match sliced.poll(Duration::from_micros(100), &cancel) {
+                Poll::Pending { preview, report } => {
+                    assert!(report.done <= report.total);
+                    if preview
+                        .as_ref()
+                        .is_some_and(|result| result.volume.values.iter().any(|value| *value > 0.0))
+                    {
+                        saw_dose = true;
+                    }
+                }
+                Poll::Ready(result) => break result,
+                Poll::Failed(message) => panic!("{message}"),
+                Poll::Cancelled => panic!("cancelled"),
+            }
+        };
+        assert!(saw_dose, "a sliced run never published a dose");
+        assert_eq!(ready.volume.values, one.volume.values);
+        assert_eq!(ready.ledger, one.ledger);
+    }
+
+    #[test]
+    fn raised_target_resumes_a_finished_run() {
+        let mut run = match McRun::open(&McJob::Slab(slab(30_000))) {
+            Err(ComputeError::NoAdapter) => return,
+            Err(err) => panic!("{err}"),
+            Ok(run) => run,
+        };
+        let cancel = Cancel::new();
+        match run.poll(Duration::MAX, &cancel) {
+            Poll::Ready(_) => {}
+            Poll::Failed(message) => panic!("{message}"),
+            other => panic!("30k run did not finish in one drain: {other:?}"),
+        }
+        assert!((run.progress() - 1.0).abs() < 1.0e-6);
+        assert!(!run.extend(20_000));
+        assert!(run.extend(60_000));
+        assert!(
+            (run.progress() - 0.5).abs() < 1.0e-6,
+            "progress {}",
+            run.progress()
+        );
+        let resumed = finish(&mut run).expect("resume");
+        let one = run_mc(&McJob::Slab(slab(60_000))).expect("one shot");
+        // The first target keeps its batch size, so the float fold is not bit-identical.
+        close(&resumed.volume.values, &one.volume.values);
+        close(&resumed.ledger, &one.ledger);
+    }
+
+    fn close(left: &[f32], right: &[f32]) {
+        assert_eq!(left.len(), right.len());
+        for (left, right) in left.iter().zip(right) {
+            let scale = left.abs().max(right.abs()).max(1.0e-6);
+            assert!((left - right).abs() <= scale * 1.0e-4, "{left} vs {right}");
+        }
+    }
+
+    #[test]
+    fn cancel_after_a_preview_publishes_nothing_further() {
+        let mut run = match McRun::open(&McJob::Slab(slab(8_000))) {
+            Err(ComputeError::NoAdapter) => return,
+            Err(err) => panic!("{err}"),
+            Ok(run) => run,
+        };
+        let cancel = Cancel::new();
+        let mut saw = false;
+        loop {
+            match run.poll(Duration::from_micros(100), &cancel) {
+                Poll::Pending { preview, .. } => {
+                    if preview.is_some() {
+                        saw = true;
+                        cancel.cancel();
+                    }
+                }
+                Poll::Ready(_) => panic!("finished before cancel"),
+                Poll::Cancelled => break,
+                Poll::Failed(message) => panic!("{message}"),
+            }
+        }
+        assert!(saw, "cancel landed before any preview");
+        assert!(matches!(
+            run.poll(Duration::from_micros(100), &cancel),
+            Poll::Cancelled
+        ));
     }
 }
