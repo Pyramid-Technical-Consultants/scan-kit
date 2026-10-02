@@ -20,7 +20,6 @@ TEST_DATA = ROOT / "test_data"
 OUT_DIR = ROOT / "docs" / "images"
 
 # Sessions with rich data for representative plots.
-SESSION_G3_A = "1943968267"
 SESSION_G3_B = "1091134775"
 SESSION_G2 = "590658542"
 # Adjacent in the date-sorted table so both Use swatches show in the launcher shot.
@@ -29,7 +28,6 @@ LAUNCHER_SESSIONS = ["656350661", "1943968267"]
 LAUNCHER_SIZE = (1400, 760)
 VIEW_SIZE = (1400, 860)
 PUBLIC_DATA_DIR = "test_data"
-PUBLIC_RCI_HOST = "192.168.100.184"
 
 
 def _ensure_paths() -> None:
@@ -178,33 +176,13 @@ def _switch_tab(window, tab_name: str) -> None:
     app.processEvents()
 
 
-def _generate_zero_field_preview(panel) -> None:
-    from PySide6.QtWidgets import QPushButton
-
-    for btn in panel.findChildren(QPushButton):
-        if btn.text() == "10 MeV Steps":
-            btn.click()
-            break
-    panel._on_generate()
-    _wait_until(
-        lambda: panel._generated is not None and not panel._generating,
-        timeout_ms=120_000,
-    )
-    _wait_until(lambda: panel._preview_table.rowCount() >= 8, timeout_ms=60_000)
-
-
 def _capture_launcher_screenshots(base_dir: str) -> None:
     from PySide6.QtWidgets import QApplication, QSplitter
 
     from scan_kit.qt_launcher import (
         ScanKitMainWindow,
-        _MAIN_TAB_CONFIG_TUNING,
         _MAIN_TAB_DATA_ANALYSIS,
-        _MAIN_TAB_PLAN_RUNNER,
-        _MAIN_TAB_PLAN_SYNTHESIS,
     )
-    from scan_kit.workflows.config_tuning.auto_tuning.paths import resolve_session_config_dir
-    from scan_kit.workflows.plan_synthesis_panel import PlanSynthesisPanel
 
     app = QApplication.instance()
     assert app is not None
@@ -213,7 +191,7 @@ def _capture_launcher_screenshots(base_dir: str) -> None:
     _prepare_offscreen(window, LAUNCHER_SIZE)
 
     _wait_until(
-        lambda: window._main_tabs is not None and window._main_tabs.count() >= 5
+        lambda: window._main_tabs is not None and window._main_tabs.count() >= 2
     )
     _wait_until(lambda: window._session_browser is not None)
     browser = window._session_browser
@@ -227,10 +205,6 @@ def _capture_launcher_screenshots(base_dir: str) -> None:
     _select_sessions(browser, LAUNCHER_SESSIONS)
     browser._base_dir_input.setText(PUBLIC_DATA_DIR)
     app.processEvents()
-
-    runner = window._plan_runner_panel
-    if runner is not None:
-        runner._host_edit.setText(PUBLIC_RCI_HOST)
 
     tabs = window._main_tabs
     assert tabs is not None
@@ -247,33 +221,6 @@ def _capture_launcher_screenshots(base_dir: str) -> None:
             break
     app.processEvents()
     _grab_widget(window, OUT_DIR / "launcher-data-analysis.png")
-
-    _switch_tab(window, _MAIN_TAB_PLAN_SYNTHESIS)
-    plan_panel = None
-    for i in range(tabs.count()):
-        widget = tabs.widget(i)
-        if isinstance(widget, PlanSynthesisPanel):
-            plan_panel = widget
-            break
-    if plan_panel is not None:
-        try:
-            _generate_zero_field_preview(plan_panel)
-        except Exception as exc:
-            print(f"  (plan preview skipped: {exc})")
-        app.processEvents()
-    _grab_widget(window, OUT_DIR / "launcher-plan-synthesis.png")
-
-    _switch_tab(window, _MAIN_TAB_PLAN_RUNNER)
-    _grab_widget(window, OUT_DIR / "launcher-plan-runner.png")
-
-    config_dir = resolve_session_config_dir(SESSION_G3_A, base_dir)
-    panel = window._config_tuning_panel
-    if config_dir is not None and panel is not None:
-        if panel.open_config_root(config_dir, select_devices_xml=True):
-            panel._path_input.setText(f"{PUBLIC_DATA_DIR}/{SESSION_G3_A}/config")
-            _switch_tab(window, _MAIN_TAB_CONFIG_TUNING)
-            app.processEvents()
-            _grab_widget(window, OUT_DIR / "launcher-config-tuning.png")
 
     window.close()
     app.processEvents()

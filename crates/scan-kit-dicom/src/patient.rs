@@ -27,6 +27,8 @@ pub struct Spot {
     pub shifter: String,
     pub wet_mm: f32,
     pub shifter_distance_mm: f32,
+    /// Mean scanning-spot size in mm, or 0 when the control point does not carry one.
+    pub spot_size_mm: f32,
 }
 
 #[derive(Clone, Debug)]
@@ -47,7 +49,24 @@ pub struct Structure {
     pub contour: Vec<[f32; 3]>,
 }
 
+/// One control-point spot from an RT Ion plan, with the raw meterset weight.
 #[derive(Clone, Debug)]
+pub struct IonPlanSpot {
+    pub x: f32,
+    pub y: f32,
+    pub energy: f32,
+    pub charge: f32,
+    pub size_x: f32,
+    pub size_y: f32,
+    pub plan_index: i32,
+}
+
+#[derive(Clone, Debug)]
+pub struct IonPlan {
+    pub label: String,
+    pub spots: Vec<IonPlanSpot>,
+}
+
 pub struct PatientStudy {
     pub frame: String,
     pub ct: CtVolume,
@@ -125,6 +144,63 @@ pub fn load_study(path: &Path) -> Result<PatientStudy, String> {
         tps,
         prescription,
     })
+}
+
+/// Spots from one RT Ion file. Charge is the raw meterset weight, not the scaled MU.
+pub fn read_ion_plan(path: &Path) -> Result<IonPlan, String> {
+    let bytes = fs::read(path).map_err(|err| format!("Could not read DICOM plan file: {err}"))?;
+    if bytes.len() < 132 || &bytes[128..132] != b"DICM" {
+        return Err(format!(
+            "Could not read DICOM plan file: {}",
+            path.display()
+        ));
+    }
+    let elems = parse_dataset(&bytes[132..])?;
+    let label = text_tag(&elems, tag(0x300A, 0x0002));
+    let mut spots = Vec::new();
+    let mut plan_index = 0i32;
+    for beam in seq(&elems, tag(0x300A, 0x03A2)) {
+        let mut energy = 0.0f32;
+        for cp in seq(beam, tag(0x300A, 0x03A8)) {
+            energy = float_tag(cp, tag(0x300A, 0x0114)).unwrap_or(energy);
+            let n = int_tag(cp, tag(0x300A, 0x0392)).unwrap_or(0).max(0) as usize;
+            let xy = floats_tag(cp, tag(0x300A, 0x0394));
+            if n == 0 || xy.is_empty() {
+                continue;
+            }
+            let weights = floats_tag(cp, tag(0x300A, 0x0396));
+            let has_weights = elem(cp, tag(0x300A, 0x0396)).is_some();
+            let size = floats_tag(cp, tag(0x300A, 0x0398));
+            let (size_x, size_y) = if size.len() >= 2 {
+                (size[0], size[1])
+            } else {
+                (f32::NAN, f32::NAN)
+            };
+            let limit = n.min(xy.len() / 2);
+            for i in 0..limit {
+                let mu = if has_weights {
+                    weights.get(i).copied().unwrap_or(f32::NAN)
+                } else {
+                    f32::NAN
+                };
+                let index = plan_index;
+                plan_index += 1;
+                if has_weights && (!mu.is_finite() || mu <= 0.0) {
+                    continue;
+                }
+                spots.push(IonPlanSpot {
+                    x: xy[i * 2],
+                    y: xy[i * 2 + 1],
+                    energy,
+                    charge: mu,
+                    size_x,
+                    size_y,
+                    plan_index: index,
+                });
+            }
+        }
+    }
+    Ok(IonPlan { label, spots })
 }
 
 /// Rotation from the IEC 61217 gantry frame into patient LPS, row-major.
@@ -459,6 +535,7 @@ fn read_plan(elems: &[Elem], frame: String) -> Result<(Vec<Beam>, i32, f32, Stri
             let n = int_tag(cp, tag(0x300A, 0x0392)).unwrap_or(0) as usize;
             let xy = floats_tag(cp, tag(0x300A, 0x0394));
             let weights = floats_tag(cp, tag(0x300A, 0x0396));
+            let spot_size_mm = scanning_spot_mm(cp);
             if n == 0 || !energy.is_finite() {
                 continue;
             }
@@ -490,6 +567,7 @@ fn read_plan(elems: &[Elem], frame: String) -> Result<(Vec<Beam>, i32, f32, Stri
                         shifter: shifter.clone(),
                         wet_mm,
                         shifter_distance_mm,
+                        spot_size_mm,
                     });
                 }
             }
@@ -748,6 +826,22 @@ fn floats_tag(elems: &[Elem], tag: u32) -> Vec<f32> {
         .collect()
 }
 
+fn scanning_spot_mm(cp: &[Elem]) -> f32 {
+    let size = floats_tag(cp, tag(0x300A, 0x0398));
+    if size.len() >= 2
+        && size[0] > 0.0
+        && size[1] > 0.0
+        && size[0] < 500.0
+        && size[1] < 500.0
+        && size[0].is_finite()
+        && size[1].is_finite()
+    {
+        (size[0] + size[1]) / 2.0
+    } else {
+        0.0
+    }
+}
+
 fn float_tag(elems: &[Elem], tag: u32) -> Option<f32> {
     floats_tag(elems, tag).first().copied()
 }
@@ -767,7 +861,7 @@ fn int_tag(elems: &[Elem], tag: u32) -> Option<i32> {
     None
 }
 
-fn preamble() -> Vec<u8> {
+pub(crate) fn preamble() -> Vec<u8> {
     let mut bytes = vec![0u8; 128];
     bytes.extend_from_slice(b"DICM");
     bytes
@@ -795,7 +889,7 @@ fn push_elem(bytes: &mut Vec<u8>, group: u16, slot: u16, vr: &[u8], value: &[u8]
     bytes.extend_from_slice(value);
 }
 
-fn ui(bytes: &mut Vec<u8>, group: u16, element: u16, text: &str) {
+pub(crate) fn ui(bytes: &mut Vec<u8>, group: u16, element: u16, text: &str) {
     let mut value = text.as_bytes().to_vec();
     if value.len() % 2 == 1 {
         value.push(0);
@@ -803,15 +897,23 @@ fn ui(bytes: &mut Vec<u8>, group: u16, element: u16, text: &str) {
     push_elem(bytes, group, element, b"UI", &value);
 }
 
-fn cs(bytes: &mut Vec<u8>, group: u16, element: u16, text: &str) {
+pub(crate) fn cs(bytes: &mut Vec<u8>, group: u16, element: u16, text: &str) {
     push_elem(bytes, group, element, b"CS", &even(text));
 }
 
-fn lo(bytes: &mut Vec<u8>, group: u16, element: u16, text: &str) {
+pub(crate) fn lo(bytes: &mut Vec<u8>, group: u16, element: u16, text: &str) {
     push_elem(bytes, group, element, b"LO", &even(text));
 }
 
-fn ds(bytes: &mut Vec<u8>, group: u16, element: u16, values: &[f32]) {
+pub(crate) fn pn(bytes: &mut Vec<u8>, group: u16, element: u16, text: &str) {
+    push_elem(bytes, group, element, b"PN", &even(text));
+}
+
+pub(crate) fn sh(bytes: &mut Vec<u8>, group: u16, element: u16, text: &str) {
+    push_elem(bytes, group, element, b"SH", &even(text));
+}
+
+pub(crate) fn ds(bytes: &mut Vec<u8>, group: u16, element: u16, values: &[f32]) {
     let text = values
         .iter()
         .map(|value| format!("{value:.6}"))
@@ -820,15 +922,23 @@ fn ds(bytes: &mut Vec<u8>, group: u16, element: u16, values: &[f32]) {
     push_elem(bytes, group, element, b"DS", &even(&text));
 }
 
-fn is(bytes: &mut Vec<u8>, group: u16, element: u16, value: i32) {
+pub(crate) fn is(bytes: &mut Vec<u8>, group: u16, element: u16, value: i32) {
     push_elem(bytes, group, element, b"IS", &even(&value.to_string()));
 }
 
-fn us(bytes: &mut Vec<u8>, group: u16, element: u16, value: u16) {
+pub(crate) fn us(bytes: &mut Vec<u8>, group: u16, element: u16, value: u16) {
     push_elem(bytes, group, element, b"US", &value.to_le_bytes());
 }
 
-fn ow(bytes: &mut Vec<u8>, group: u16, element: u16, values: &[u16]) {
+pub(crate) fn us_list(bytes: &mut Vec<u8>, group: u16, element: u16, values: &[u16]) {
+    let mut raw = Vec::with_capacity(values.len() * 2);
+    for value in values {
+        raw.extend_from_slice(&value.to_le_bytes());
+    }
+    push_elem(bytes, group, element, b"US", &raw);
+}
+
+pub(crate) fn ow(bytes: &mut Vec<u8>, group: u16, element: u16, values: &[u16]) {
     let raw: Vec<u8> = values
         .iter()
         .flat_map(|value| value.to_le_bytes())
@@ -836,7 +946,7 @@ fn ow(bytes: &mut Vec<u8>, group: u16, element: u16, values: &[u16]) {
     push_elem(bytes, group, element, b"OW", &raw);
 }
 
-fn sq(bytes: &mut Vec<u8>, group: u16, element: u16, items: &[Vec<u8>]) {
+pub(crate) fn sq(bytes: &mut Vec<u8>, group: u16, element: u16, items: &[Vec<u8>]) {
     let mut body = Vec::new();
     for item in items {
         body.extend_from_slice(&0xFFFEu16.to_le_bytes());
@@ -887,6 +997,66 @@ mod tests {
         std::fs::write(root.join("other.dcm"), extra).unwrap();
         assert!(load_study(&root).is_err());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_ion_plan_keeps_raw_weights_and_the_scanning_spot_size() {
+        let mut cp = Vec::new();
+        ds(&mut cp, 0x300A, 0x0114, &[100.0]);
+        is(&mut cp, 0x300A, 0x0392, 2);
+        ds(&mut cp, 0x300A, 0x0394, &[1.0, 2.0, 3.0, 4.0]);
+        ds(&mut cp, 0x300A, 0x0396, &[0.5, 0.25]);
+        ds(&mut cp, 0x300A, 0x0398, &[4.0, 6.0]);
+        let mut beam = Vec::new();
+        sq(&mut beam, 0x300A, 0x03A8, &[cp]);
+        let mut bytes = preamble();
+        ui(&mut bytes, 0x0008, 0x0016, "1.2.840.10008.5.1.4.1.1.481.8");
+        lo(&mut bytes, 0x300A, 0x0002, "TESTPLAN");
+        sq(&mut bytes, 0x300A, 0x03A2, &[beam]);
+        let path = std::env::temp_dir().join(format!("scan-kit-ion-{}.dcm", std::process::id()));
+        std::fs::write(&path, bytes).unwrap();
+        let plan = read_ion_plan(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(plan.label, "TESTPLAN");
+        assert_eq!(plan.spots.len(), 2);
+        assert!((plan.spots[0].charge - 0.5).abs() < 1e-4);
+        assert!((plan.spots[0].x - 1.0).abs() < 1e-4);
+        assert!((plan.spots[0].y - 2.0).abs() < 1e-4);
+        assert!((plan.spots[1].x - 3.0).abs() < 1e-4);
+        assert!((plan.spots[1].y - 4.0).abs() < 1e-4);
+        assert!((plan.spots[0].size_x - 4.0).abs() < 1e-3);
+        assert!((plan.spots[0].size_y - 6.0).abs() < 1e-3);
+        let imported: Vec<_> = plan
+            .spots
+            .iter()
+            .map(|spot| scan_kit_core::ImportSpot {
+                x: f64::from(spot.x),
+                y: f64::from(spot.y),
+                energy: f64::from(spot.energy),
+                charge: f64::from(spot.charge),
+                beam_size: scan_kit_core::dicom_beam_size(
+                    f64::from(spot.size_x),
+                    f64::from(spot.size_y),
+                    3.61,
+                    true,
+                ),
+                plan_index: spot.plan_index,
+            })
+            .collect();
+        let built = scan_kit_core::build_plan(
+            "dicom_rt_plan",
+            &serde_json::json!({
+                "dicom_path": "plan.dcm",
+                "use_dicom_beam_size": true,
+                "spot_order": "plan_order"
+            }),
+            scan_kit_core::PlanSource::Ion(&imported),
+            Some(&plan.label),
+        )
+        .unwrap();
+        assert_eq!(built.preview[0][3], "5");
+        assert_eq!(built.preview[0][6], "0.5000");
+        assert_eq!(built.preview[1][6], "0.2500");
     }
 
     #[test]

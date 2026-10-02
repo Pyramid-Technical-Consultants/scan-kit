@@ -645,7 +645,15 @@ fn mtime_ns(path: &Path) -> u128 {
 }
 
 pub(crate) fn spot_table(root: &Path, session: &str) -> BTreeMap<String, Vec<f32>> {
-    load_spot(root, session, false, false)
+    load_spot(root, session, false, false, false)
+}
+
+/// Spot table for configuration tuning.
+///
+/// Sigma prefers `spot_sigma_raw`, then scales ×2 to mm, matching
+/// `session_sigma.py`. Analysis plots prefer the processed `spot_sigma` column.
+pub(crate) fn tune_spot_table(root: &Path, session: &str) -> BTreeMap<String, Vec<f32>> {
+    load_spot(root, session, false, false, true)
 }
 
 pub(crate) fn slice_table(root: &Path, session: &str) -> BTreeMap<String, Vec<f32>> {
@@ -777,9 +785,9 @@ pub(crate) fn binned_summary(root: &Path, session_ids: &[String], options: &Valu
             } else if group.timeslice {
                 load_timeslice(root, session, group.id)
             } else if group.id == "dose_rate" {
-                dose_rate_table(&load_spot(root, session, false, false))
+                dose_rate_table(&load_spot(root, session, false, false, false))
             } else {
-                load_spot(root, session, chamber, group.id == "spot_time")
+                load_spot(root, session, chamber, group.id == "spot_time", false)
             };
             if group.filter {
                 let keys: Vec<&str> = group.series.iter().map(|series| series.key).collect();
@@ -2191,6 +2199,7 @@ struct SpotCacheKey {
     map_ns: u128,
     map_head: u64,
     points: bool,
+    raw_sigma: bool,
 }
 
 fn spot_cache() -> &'static std::sync::Mutex<HashMap<SpotCacheKey, BTreeMap<String, Vec<f32>>>> {
@@ -2228,6 +2237,7 @@ fn load_spot(
     session: &str,
     chamber: bool,
     points: bool,
+    raw_sigma: bool,
 ) -> BTreeMap<String, Vec<f32>> {
     let dir = discover::session_directory(root, session);
     let key = match (
@@ -2245,6 +2255,7 @@ fn load_spot(
                 map_ns,
                 map_head,
                 points,
+                raw_sigma,
             })
         }
         _ => None,
@@ -2255,7 +2266,7 @@ fn load_spot(
             return hit.clone();
         }
     }
-    let table = build_spot(root, session, chamber, points);
+    let table = build_spot(root, session, chamber, points, raw_sigma);
     if let Some(key) = key {
         let mut cache = spot_cache().lock().unwrap_or_else(|err| err.into_inner());
         if cache.len() >= SPOT_CACHE_CAP {
@@ -2271,6 +2282,7 @@ fn build_spot(
     session: &str,
     chamber: bool,
     points: bool,
+    raw_sigma: bool,
 ) -> BTreeMap<String, Vec<f32>> {
     let Some(spot_bytes) = discover::read_session_file(root, session, "spot_data.csv") else {
         return BTreeMap::new();
@@ -2309,7 +2321,7 @@ fn build_spot(
         }
     }
     let (mask_pos, mm_pos) = spot_positions(&spot, chamber, n);
-    let sigma = spot_sigma(&spot, chamber, n);
+    let sigma = spot_sigma(&spot, raw_sigma || chamber, n);
     let mut mask_cols: Vec<&[f32]> = vec![&energy];
     if target.len() >= n {
         mask_cols.push(&target);
@@ -2597,8 +2609,8 @@ fn g3_mm(raw: &[f32], reversed: bool) -> Vec<f32> {
         .collect()
 }
 
-fn spot_sigma(spot: &Sheet, chamber: bool, n: usize) -> Vec<(&'static str, Vec<f32>)> {
-    let order: &[&str] = if chamber {
+fn spot_sigma(spot: &Sheet, prefer_raw: bool, n: usize) -> Vec<(&'static str, Vec<f32>)> {
+    let order: &[&str] = if prefer_raw {
         &["spot_sigma_raw", "spot_sigma"]
     } else {
         &["spot_sigma", "spot_sigma_raw"]

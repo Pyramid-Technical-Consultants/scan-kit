@@ -7,7 +7,6 @@ import zipfile
 from pathlib import Path
 
 from scan_kit.common.session_source import ensure_session_on_disk, resolve_session_source
-from scan_kit.workflows.config_tuning.auto_tuning.paths import resolve_session_config_dir
 
 
 def _write_minimal_session_tree(root: Path, session_id: str) -> None:
@@ -30,7 +29,7 @@ def _zip_session_tree(session_root: Path, zip_path: Path) -> None:
                 zf.write(path, rel.as_posix())
 
 
-def test_resolve_session_config_dir_from_zip(tmp_path: Path) -> None:
+def test_zip_session_extracts_its_config_folder(tmp_path: Path) -> None:
     sid = "1262268206"
     staging = tmp_path / "staging"
     _write_minimal_session_tree(staging, sid)
@@ -39,10 +38,9 @@ def test_resolve_session_config_dir_from_zip(tmp_path: Path) -> None:
     _zip_session_tree(staging / sid, zip_path)
     shutil.rmtree(staging)
 
-    config_dir = resolve_session_config_dir(sid, tmp_path)
-    assert config_dir is not None
-    assert config_dir.name == "config"
-    assert (config_dir / "map2map" / "devices.xml").is_file()
+    extracted = ensure_session_on_disk(sid, tmp_path)
+    assert extracted is not None
+    assert (extracted / "config" / "map2map" / "devices.xml").is_file()
 
     source = resolve_session_source(sid, tmp_path)
     assert source is not None

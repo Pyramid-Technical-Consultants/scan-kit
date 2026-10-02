@@ -70,8 +70,12 @@ import {
   MenubarTrigger,
 } from "@/components/ui/menubar";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { Toaster } from "@/components/ui/sonner";
+import { Toaster } from "@/components/ui/toast";
 import { AnalysisView } from "@/AnalysisView";
+import { ConfigTuning } from "@/ConfigTuning";
+import { PhantomSynthesis } from "@/PhantomSynthesis";
+import { PlanRunner } from "@/PlanRunner";
+import { PlanSynthesis } from "@/PlanSynthesis";
 
 const TAB_ICONS: Record<string, LucideIcon> = {
   "Data Analysis": Table2,
@@ -1064,7 +1068,19 @@ export default function App() {
         <TabsContent value="Debug" className="flex min-h-0 flex-col overflow-hidden">
           <DebugLog />
         </TabsContent>
-        {LAUNCHER_VIEWS.filter((name) => name !== "Data Analysis" && name !== "Debug").map((name) => (
+        <TabsContent value="Plan Synthesis" className="flex min-h-0 flex-col overflow-hidden">
+          <PlanSynthesis />
+        </TabsContent>
+        <TabsContent value="Phantom Synthesis" className="flex min-h-0 flex-col overflow-hidden">
+          <PhantomSynthesis />
+        </TabsContent>
+        <TabsContent value="Plan Runner" className="flex min-h-0 flex-col overflow-hidden">
+          <PlanRunner />
+        </TabsContent>
+        <TabsContent value="Configuration Tuning" className="flex min-h-0 flex-col overflow-hidden">
+          <ConfigTuning folder={folder ?? ""} selectedIds={selectedIds} />
+        </TabsContent>
+        {LAUNCHER_VIEWS.filter((name) => name !== "Data Analysis" && name !== "Debug" && name !== "Plan Synthesis" && name !== "Phantom Synthesis" && name !== "Configuration Tuning" && name !== "Plan Runner").map((name) => (
           <TabsContent key={name} value={name}>
             <p className="text-muted-foreground px-3 py-2">{name} is not in this preview yet.</p>
           </TabsContent>
@@ -1128,7 +1144,7 @@ export default function App() {
           ) : null}
         </DialogContent>
       </Dialog>
-      <Toaster theme="dark" />
+      <Toaster />
     </div>
   );
 }

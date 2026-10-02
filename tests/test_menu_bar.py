@@ -6,7 +6,6 @@ import pytest
 from PySide6.QtWidgets import QMenu
 
 from scan_kit.qt_launcher import (
-    _MAIN_TAB_CONFIG_TUNING,
     _MAIN_TAB_DATA_ANALYSIS,
     _MAIN_TAB_DEBUG,
     ScanKitMainWindow,
@@ -81,11 +80,11 @@ def test_view_menu_switches_tab_and_syncs(window) -> None:
     window._sync_tab_menu()
     assert window._tab_menu_actions[_MAIN_TAB_DATA_ANALYSIS].isChecked()
 
-    window._tab_menu_actions[_MAIN_TAB_CONFIG_TUNING].trigger()
+    window._tab_menu_actions[_MAIN_TAB_DEBUG].trigger()
     tabs = window._main_tabs
-    assert tabs.tabText(tabs.currentIndex()) == _MAIN_TAB_CONFIG_TUNING
-    assert window._tab_menu_actions[_MAIN_TAB_CONFIG_TUNING].isChecked()
-    assert not window._tab_menu_actions[_MAIN_TAB_DEBUG].isChecked()
+    assert tabs.tabText(tabs.currentIndex()) == _MAIN_TAB_DEBUG
+    assert window._tab_menu_actions[_MAIN_TAB_DEBUG].isChecked()
+    assert not window._tab_menu_actions[_MAIN_TAB_DATA_ANALYSIS].isChecked()
 
 
 def test_background_subtraction_action_syncs_with_settings(window) -> None:

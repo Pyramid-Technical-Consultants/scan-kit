@@ -72,16 +72,6 @@ from .session_source import (
     discover_session_entries,
     list_session_storage_paths,
 )
-from .file_integrity import (
-    IntegrityStatus,
-    IntegrityCheckResult,
-    FileIntegritySidecar,
-    commit_file_integrity,
-    compute_hex_digest,
-    parse_sidecar,
-    sidecar_path,
-    verify_file_integrity,
-)
 from .devices_xml import (
     BeamSigmaConversion,
     DevicesConfig,
@@ -269,14 +259,6 @@ __all__ = [
     "load_session_devices_config",
     "parse_devices_xml",
     "parse_system_geometry",
-    "IntegrityStatus",
-    "IntegrityCheckResult",
-    "FileIntegritySidecar",
-    "commit_file_integrity",
-    "compute_hex_digest",
-    "parse_sidecar",
-    "sidecar_path",
-    "verify_file_integrity",
     "remap",
     "remap_g2_raw",
     "remap_g2_raw_reversed",

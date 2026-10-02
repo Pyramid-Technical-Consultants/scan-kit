@@ -36,10 +36,6 @@ AMP_G3_OLD_SESSION = "1262268206"
 AMP_G3_CONST_SESSION = "845596095"
 AMP_G3_STUCK_SESSION = "863788396"
 
-# First line of Qt-heavy tests in large modules (auto-marked slow below).
-_PLAN_SYNTHESIS_UI_START_LINE = 724
-_CONFIG_TUNING_UI_START_LINE = 459
-
 _SESSION_FIXTURES = frozenset({
     "test_data_dir",
     "g3_session_id",
@@ -149,10 +145,6 @@ def g2_position_errors(test_data_dir: str):
 def pytest_collection_modifyitems(config, items) -> None:
     """Auto-mark heavy integration and Qt widget tests as slow."""
     slow_marker = pytest.mark.slow
-    ui_start_lines = {
-        "test_plan_synthesis.py": _PLAN_SYNTHESIS_UI_START_LINE,
-        "test_config_tuning_xml.py": _CONFIG_TUNING_UI_START_LINE,
-    }
     slow_modules = frozenset({
         "test_g2_timeslice_position.py",
         "test_g3_iso_timeslice_position.py",
@@ -168,11 +160,6 @@ def pytest_collection_modifyitems(config, items) -> None:
         path_name = item.path.name
         if path_name in slow_modules:
             item.add_marker(slow_marker)
-            continue
-        start_line = ui_start_lines.get(path_name)
-        if start_line is not None and path_name == item.path.name:
-            if item.location[1] >= start_line:
-                item.add_marker(slow_marker)
 
 
 @pytest.fixture

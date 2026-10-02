@@ -7,11 +7,15 @@ mod analysis;
 mod beam;
 mod binned;
 mod columns;
+mod config;
 mod discover;
 mod dose_view;
 mod mc_tables;
 mod patient_view;
+mod phantom;
+mod runner;
 mod store;
+mod synthesis;
 
 pub use analysis::{analysis_scene, channel_catalog, load_timeslice_columns};
 pub use beam::{beam_record, protons_per_mu, spot_record};
@@ -68,6 +72,111 @@ const TOOLS: &[ToolSpec] = &[
         name: "scan_kit_analysis_scene",
         summary: "Build one analysis view scene from the selected sessions.",
         kind: ToolKind::Workflow,
+    },
+    ToolSpec {
+        name: "scan_kit_plan_catalog",
+        summary: "List plan templates and the parameter specs for each.",
+        kind: ToolKind::Granular,
+    },
+    ToolSpec {
+        name: "scan_kit_synthesize_plan",
+        summary: "Build an input map CSV from a plan template.",
+        kind: ToolKind::Workflow,
+    },
+    ToolSpec {
+        name: "scan_kit_config_catalog",
+        summary: "List configuration tuning workflows and the remembered config folder.",
+        kind: ToolKind::Granular,
+    },
+    ToolSpec {
+        name: "scan_kit_config_open",
+        summary: "List XML files in a configuration folder.",
+        kind: ToolKind::Granular,
+    },
+    ToolSpec {
+        name: "scan_kit_config_form",
+        summary: "Turn one XML file into an editable form.",
+        kind: ToolKind::Granular,
+    },
+    ToolSpec {
+        name: "scan_kit_config_apply",
+        summary: "Write form edits back into XML text.",
+        kind: ToolKind::Granular,
+    },
+    ToolSpec {
+        name: "scan_kit_config_save",
+        summary: "Save a configuration folder and refresh .md5 sidecars.",
+        kind: ToolKind::Workflow,
+    },
+    ToolSpec {
+        name: "scan_kit_config_tune",
+        summary: "Apply one devices.xml tuner to the selected sessions.",
+        kind: ToolKind::Workflow,
+    },
+    ToolSpec {
+        name: "scan_kit_config_integrity",
+        summary: "Check one XML file against its .md5 sidecar.",
+        kind: ToolKind::Granular,
+    },
+    ToolSpec {
+        name: "scan_kit_config_hide",
+        summary: "Remember whether unused map2map fields are hidden.",
+        kind: ToolKind::Granular,
+    },
+    ToolSpec {
+        name: "scan_kit_phantom_catalog",
+        summary: "List phantom presets, positions, and the remembered DICOM folder.",
+        kind: ToolKind::Granular,
+    },
+    ToolSpec {
+        name: "scan_kit_phantom_preview",
+        summary: "Describe the CT size, layers, spots, and MU of a phantom study.",
+        kind: ToolKind::Granular,
+    },
+    ToolSpec {
+        name: "scan_kit_write_phantom",
+        summary: "Write a synthetic CT, RTSTRUCT, and RT Ion plan into a new folder.",
+        kind: ToolKind::Workflow,
+    },
+    ToolSpec {
+        name: "scan_kit_runner_catalog",
+        summary: "Return the remembered RCI host and an idle Plan Runner view.",
+        kind: ToolKind::Granular,
+    },
+    ToolSpec {
+        name: "scan_kit_runner_connect",
+        summary: "Open an mpack session to an RCI and read its status.",
+        kind: ToolKind::Workflow,
+    },
+    ToolSpec {
+        name: "scan_kit_runner_disconnect",
+        summary: "Close the Plan Runner session.",
+        kind: ToolKind::Granular,
+    },
+    ToolSpec {
+        name: "scan_kit_runner_status",
+        summary: "Poll the connected RCI and return the operator view.",
+        kind: ToolKind::Granular,
+    },
+    ToolSpec {
+        name: "scan_kit_runner_upload",
+        summary: "Upload an input_map.csv to the connected RCI.",
+        kind: ToolKind::Workflow,
+    },
+    ToolSpec {
+        name: "scan_kit_runner_control",
+        summary: "Press Start, Pause, Stop, or Reset on the connected RCI.",
+        kind: ToolKind::Workflow,
+    },
+    ToolSpec {
+        name: "scan_kit_runner_download",
+        summary: "Download the latest session folder from the RCI into a zip.",
+        kind: ToolKind::Workflow,
+    },
+    ToolSpec {
+        name: "scan_kit_runner_remember",
+        summary: "Remember the folder used to browse plan and session files.",
+        kind: ToolKind::Granular,
     },
 ];
 
@@ -135,6 +244,161 @@ pub fn tool_input_schema(name: &str) -> Value {
                 "options": { "type": "object" }
             },
             "required": ["view", "path", "session_ids"],
+            "additionalProperties": false
+        }),
+        "scan_kit_plan_catalog" => json!({
+            "type": "object",
+            "properties": { "db_path": { "type": "string" } },
+            "additionalProperties": false
+        }),
+        "scan_kit_synthesize_plan" => json!({
+            "type": "object",
+            "properties": {
+                "template": { "type": "string" },
+                "params": { "type": "object" },
+                "path": { "type": "string" },
+                "csv": { "type": "string" },
+                "db_path": { "type": "string" }
+            },
+            "required": ["template", "params"],
+            "additionalProperties": false
+        }),
+        "scan_kit_config_catalog" | "scan_kit_config_open" => json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string" },
+                "db_path": { "type": "string" }
+            },
+            "additionalProperties": false
+        }),
+        "scan_kit_config_form" | "scan_kit_config_integrity" => json!({
+            "type": "object",
+            "properties": { "path": { "type": "string" } },
+            "required": ["path"],
+            "additionalProperties": false
+        }),
+        "scan_kit_config_apply" => json!({
+            "type": "object",
+            "properties": {
+                "xml": { "type": "string" },
+                "form": { "type": "object" }
+            },
+            "required": ["xml", "form"],
+            "additionalProperties": false
+        }),
+        "scan_kit_config_save" => json!({
+            "type": "object",
+            "properties": {
+                "source": { "type": "string" },
+                "dest": { "type": "string" },
+                "files": { "type": "array" },
+                "hide_unused": { "type": "boolean" },
+                "db_path": { "type": "string" }
+            },
+            "required": ["source", "dest", "files"],
+            "additionalProperties": false
+        }),
+        "scan_kit_config_tune" => json!({
+            "type": "object",
+            "properties": {
+                "workflow": { "type": "string" },
+                "xml": { "type": "string" },
+                "form": { "type": "object" },
+                "data_dir": { "type": "string" },
+                "session_ids": { "type": "array", "items": { "type": "string" } },
+                "params": { "type": "object" },
+                "db_path": { "type": "string" }
+            },
+            "required": ["workflow", "xml", "data_dir", "session_ids"],
+            "additionalProperties": false
+        }),
+        "scan_kit_config_hide" => json!({
+            "type": "object",
+            "properties": {
+                "hide_unused": { "type": "boolean" },
+                "db_path": { "type": "string" }
+            },
+            "required": ["hide_unused"],
+            "additionalProperties": false
+        }),
+        "scan_kit_phantom_catalog" => json!({
+            "type": "object",
+            "properties": { "db_path": { "type": "string" } },
+            "additionalProperties": false
+        }),
+        "scan_kit_phantom_preview" => json!({
+            "type": "object",
+            "properties": { "params": { "type": "object" } },
+            "required": ["params"],
+            "additionalProperties": false
+        }),
+        "scan_kit_write_phantom" => json!({
+            "type": "object",
+            "properties": {
+                "parent": { "type": "string" },
+                "params": { "type": "object" },
+                "db_path": { "type": "string" }
+            },
+            "required": ["parent", "params"],
+            "additionalProperties": false
+        }),
+        "scan_kit_runner_catalog" | "scan_kit_runner_disconnect" => json!({
+            "type": "object",
+            "properties": { "db_path": { "type": "string" } },
+            "additionalProperties": false
+        }),
+        "scan_kit_runner_connect" => json!({
+            "type": "object",
+            "properties": {
+                "host": { "type": "string" },
+                "db_path": { "type": "string" }
+            },
+            "required": ["host"],
+            "additionalProperties": false
+        }),
+        "scan_kit_runner_status" => json!({
+            "type": "object",
+            "properties": {
+                "has_plan": { "type": "boolean" },
+                "dest": { "type": "string" },
+                "db_path": { "type": "string" }
+            },
+            "additionalProperties": false
+        }),
+        "scan_kit_runner_upload" => json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string" },
+                "db_path": { "type": "string" }
+            },
+            "required": ["path"],
+            "additionalProperties": false
+        }),
+        "scan_kit_runner_control" => json!({
+            "type": "object",
+            "properties": {
+                "action": { "type": "string" },
+                "db_path": { "type": "string" }
+            },
+            "required": ["action"],
+            "additionalProperties": false
+        }),
+        "scan_kit_runner_download" => json!({
+            "type": "object",
+            "properties": {
+                "dest": { "type": "string" },
+                "db_path": { "type": "string" }
+            },
+            "required": ["dest"],
+            "additionalProperties": false
+        }),
+        "scan_kit_runner_remember" => json!({
+            "type": "object",
+            "properties": {
+                "file_dir": { "type": "string" },
+                "db_path": { "type": "string" }
+            },
+            "required": ["file_dir"],
             "additionalProperties": false
         }),
         _ => json!({ "type": "object", "additionalProperties": false }),
@@ -214,6 +478,114 @@ pub fn invoke(name: &str, input: &Value) -> Result<Value, InvokeError> {
             let scene = analysis_scene(view, Path::new(path), &session_ids, &options)
                 .map_err(InvokeError::Message)?;
             serde_json::to_value(scene).map_err(|err| InvokeError::Message(err.to_string()))
+        }
+        "scan_kit_plan_catalog" => {
+            let db = database_path(input)?;
+            Ok(synthesis::catalog(&db))
+        }
+        "scan_kit_synthesize_plan" => {
+            let db = database_path(input)?;
+            synthesis::synthesize(input, &db).map_err(InvokeError::Message)
+        }
+        "scan_kit_config_catalog" => {
+            let db = database_path(input)?;
+            Ok(config::catalog(&db))
+        }
+        "scan_kit_config_open" => {
+            let db = database_path(input)?;
+            let path = input.get("path").and_then(Value::as_str);
+            let data_dir = input.get("data_dir").and_then(Value::as_str);
+            let session_id = input.get("session_id").and_then(Value::as_str);
+            config::open_folder(&db, path, data_dir, session_id).map_err(InvokeError::Message)
+        }
+        "scan_kit_config_form" => {
+            let path = required_str(input, "path")?;
+            config::read_form(Path::new(path)).map_err(InvokeError::Message)
+        }
+        "scan_kit_config_apply" => {
+            let xml = required_str(input, "xml")?;
+            let form = input.get("form").cloned().unwrap_or_else(|| json!({}));
+            config::apply(xml, &form).map_err(InvokeError::Message)
+        }
+        "scan_kit_config_save" => {
+            let db = database_path(input)?;
+            let source = required_str(input, "source")?;
+            let dest = required_str(input, "dest")?;
+            let files = input.get("files").cloned().unwrap_or_else(|| json!([]));
+            let hide = input.get("hide_unused").and_then(Value::as_bool);
+            config::save_folder(&db, Path::new(source), Path::new(dest), &files, hide)
+                .map_err(InvokeError::Message)
+        }
+        "scan_kit_config_tune" => {
+            let db = database_path(input)?;
+            config::tune(input, &db).map_err(InvokeError::Message)
+        }
+        "scan_kit_config_integrity" => {
+            let path = required_str(input, "path")?;
+            Ok(config::integrity(Path::new(path)))
+        }
+        "scan_kit_config_hide" => {
+            let db = database_path(input)?;
+            let hide = input
+                .get("hide_unused")
+                .and_then(Value::as_bool)
+                .ok_or_else(|| InvokeError::Message("hide_unused is required".into()))?;
+            config::set_hide_unused(&db, hide).map_err(InvokeError::Message)
+        }
+        "scan_kit_phantom_catalog" => {
+            let db = database_path(input)?;
+            Ok(phantom::catalog(&db))
+        }
+        "scan_kit_phantom_preview" => {
+            let params = input.get("params").cloned().unwrap_or_else(|| json!({}));
+            phantom::preview(&params).map_err(InvokeError::Message)
+        }
+        "scan_kit_write_phantom" => {
+            let db = database_path(input)?;
+            let parent = required_str(input, "parent")?;
+            let params = input.get("params").cloned().unwrap_or_else(|| json!({}));
+            phantom::write(Path::new(parent), &params, &db).map_err(InvokeError::Message)
+        }
+        "scan_kit_runner_catalog" => {
+            let db = database_path(input)?;
+            Ok(runner::catalog(&db))
+        }
+        "scan_kit_runner_connect" => {
+            let db = database_path(input)?;
+            let host = required_str(input, "host")?;
+            runner::connect(&db, host).map_err(InvokeError::Message)
+        }
+        "scan_kit_runner_disconnect" => {
+            let db = database_path(input)?;
+            runner::disconnect();
+            Ok(runner::catalog(&db))
+        }
+        "scan_kit_runner_status" => {
+            let has_plan = input
+                .get("has_plan")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let dest = input.get("dest").and_then(Value::as_str).unwrap_or("");
+            runner::read_status(has_plan, dest).map_err(InvokeError::Message)
+        }
+        "scan_kit_runner_upload" => {
+            let db = database_path(input)?;
+            let path = required_str(input, "path")?;
+            runner::upload(&db, Path::new(path)).map_err(InvokeError::Message)
+        }
+        "scan_kit_runner_control" => {
+            let action = required_str(input, "action")?;
+            runner::control(action).map_err(InvokeError::Message)
+        }
+        "scan_kit_runner_download" => {
+            let db = database_path(input)?;
+            let dest = required_str(input, "dest")?;
+            runner::download(&db, dest).map_err(InvokeError::Message)
+        }
+        "scan_kit_runner_remember" => {
+            let db = database_path(input)?;
+            let dir = required_str(input, "file_dir")?;
+            runner::remember_dir(&db, dir).map_err(InvokeError::Message)
         }
         _ => Err(InvokeError::UnknownTool {
             name: name.to_owned(),
