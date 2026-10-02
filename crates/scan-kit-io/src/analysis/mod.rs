@@ -476,6 +476,13 @@ mod tests {
         )
         .unwrap();
         let ordered = analysis_scene("distribution", &root, &["sess".into()], &json!({})).unwrap();
+        let checks: Vec<_> = ordered
+            .controls
+            .iter()
+            .filter(|control| matches!(control.id.as_str(), "plan" | "ic1" | "ic2"))
+            .map(|control| control.id.as_str())
+            .collect();
+        assert_eq!(checks, ["plan", "ic1", "ic2"]);
         let labels: Vec<_> = ordered
             .panels
             .iter()

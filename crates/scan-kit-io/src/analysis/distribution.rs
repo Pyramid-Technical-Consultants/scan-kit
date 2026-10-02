@@ -91,6 +91,13 @@ pub(super) fn distribution(root: &Path, session_ids: &[String], options: &Value)
     };
     let mut controls = picked.controls;
     if chambers {
+        if mode == "position" && has_plan {
+            controls.push(
+                control("plan", "Plan", &["Off", "On"], on_off(show_plan))
+                    .grouped("Data Source")
+                    .checked(),
+            );
+        }
         controls.push(
             control("ic1", "IC1", &["Off", "On"], on_off(show_ic1))
                 .grouped("Data Source")
@@ -101,13 +108,6 @@ pub(super) fn distribution(root: &Path, session_ids: &[String], options: &Value)
                 .grouped("Data Source")
                 .checked(),
         );
-        if mode == "position" && has_plan {
-            controls.push(
-                control("plan", "Plan", &["Off", "On"], on_off(show_plan))
-                    .grouped("Data Source")
-                    .checked(),
-            );
-        }
     }
     if mode != "coverage" {
         controls.push(labeled("draw", "Style", DRAW_CHOICES, draw).grouped("Plot Style"));

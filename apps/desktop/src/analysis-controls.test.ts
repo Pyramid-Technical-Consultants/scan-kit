@@ -72,9 +72,9 @@ it("keeps distribution checks in Data Source after the axes", () => {
   const sections = controlSections([
     { id: "source", group: "Data Source" },
     { id: "xy", group: "Data Source" },
+    { id: "plan", group: "Data Source", kind: "check" },
     { id: "ic1", group: "Data Source", kind: "check" },
     { id: "ic2", group: "Data Source", kind: "check" },
-    { id: "plan", group: "Data Source", kind: "check" },
     { id: "draw", group: "Plot Style" },
     { id: "ramp", group: "Plot Style" },
     { id: "cutoff", group: "Plot Style" },
@@ -87,11 +87,11 @@ it("keeps distribution checks in Data Source after the axes", () => {
     "Histogram",
     "Filter Data",
   ]);
-  expect(sections[0]?.slots.map((slot) => slot.id)).toEqual(["source", "xy", "ic1", "ic2", "plan"]);
+  expect(sections[0]?.slots.map((slot) => slot.id)).toEqual(["source", "xy", "plan", "ic1", "ic2"]);
   expect(sections[0]?.slots.filter((slot) => slot.kind === "check").map((slot) => slot.id)).toEqual([
+    "plan",
     "ic1",
     "ic2",
-    "plan",
   ]);
   expect(sections[1]?.slots.map((slot) => slot.id)).toEqual(["draw", "ramp", "cutoff"]);
   expect(sections[2]?.slots.map((slot) => slot.id)).toEqual(["hist_bins"]);

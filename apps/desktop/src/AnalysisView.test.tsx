@@ -24,9 +24,9 @@ vi.mock("@tauri-apps/api/core", () => ({
               options: [{ id: "position", label: "Position (mm)", detail: "Chamber or plan", icon: "position" }],
               value: "Position (mm)",
             },
+            { id: "plan", label: "Plan", group: "Data Source", kind: "check", options: ["Off", "On"], value: "On" },
             { id: "ic1", label: "IC1", group: "Data Source", kind: "check", options: ["Off", "On"], value: "On" },
             { id: "ic2", label: "IC2", group: "Data Source", kind: "check", options: ["Off", "On"], value: "Off" },
-            { id: "plan", label: "Plan", group: "Data Source", kind: "check", options: ["Off", "On"], value: "On" },
           ],
           table: null,
           samples: [],
@@ -277,9 +277,9 @@ it("lays distribution columns in plot order on one row with icons", async () => 
   );
   expect(row?.className).toContain("flex-row");
   const labels = [...(row?.querySelectorAll("label") ?? [])].map((node) => node.textContent?.trim());
-  expect(labels).toEqual(["IC1", "IC2", "Plan"]);
+  expect(labels).toEqual(["Plan", "IC1", "IC2"]);
   expect(row?.querySelector(".lucide-target")).not.toBeNull();
   expect(row?.querySelectorAll(".lucide-zap").length).toBe(2);
   const checks = [...(row?.querySelectorAll("[data-slot='checkbox']") ?? [])];
-  expect(checks.map((node) => node.getAttribute("aria-checked"))).toEqual(["true", "false", "true"]);
+  expect(checks.map((node) => node.getAttribute("aria-checked"))).toEqual(["true", "true", "false"]);
 });
