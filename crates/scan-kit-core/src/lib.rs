@@ -13,9 +13,9 @@ mod session_log;
 mod signal;
 
 pub use dose::{
-    analytic_on, analytic_volume, bragg_idd, csda_range_mm, field_bounds, medium, protons_from_mu,
-    robust_high, through_wet, water, McJob, McResult, Medium, PatientRequest, Pencil, Quantity,
-    SlabRequest, Volume,
+    analytic_on, analytic_volume, bragg_idd, csda_range_mm, dose_frame, field_bounds, medium,
+    protons_from_mu, robust_high, through_wet, water, DoseFrame, McJob, McResult, Medium,
+    PatientRequest, Pencil, Quantity, SlabRequest, Volume,
 };
 pub use geometry::{
     beam_angle_mrad, fit_iso_plane, fit_line, magnet_pivot_z, parse_ic_geometry, IcGeometry,

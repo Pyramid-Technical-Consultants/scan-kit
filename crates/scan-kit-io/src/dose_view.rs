@@ -4,9 +4,9 @@
 use std::path::Path;
 
 use scan_kit_core::{
-    analytic_on, analytic_volume, dvh, field_bounds, gamma_index, medium, protons_from_mu,
-    robust_high, McJob, McResult, Panel, Pencil, PlotScene, Quantity, Series, Volume, IC1_Z_MM,
-    IC2_Z_MM, IC_SEP_MM,
+    analytic_on, dose_frame, dvh, field_bounds, gamma_index, medium, protons_from_mu, robust_high,
+    McJob, McResult, Panel, Pencil, PlotScene, Quantity, Series, Volume, IC1_Z_MM, IC2_Z_MM,
+    IC_SEP_MM,
 };
 use serde_json::Value;
 
@@ -176,7 +176,7 @@ pub fn dose_volume(
                 .chain(cloud.plan.iter().copied())
         })
         .collect();
-    let template = analytic_volume(
+    let frame = dose_frame(
         mat,
         &all,
         quantity,
@@ -188,7 +188,8 @@ pub fn dose_volume(
         k_mu,
         GAP_MM,
     );
-    let grid = Some((template.origin, template.shape, template.voxel));
+    let grid = Some((frame.origin, frame.shape, frame.voxel));
+    let planes = frame.planes_only().then_some(frame.focus);
 
     let mut measured = Vec::new();
     let mut plans = Vec::new();
@@ -208,6 +209,7 @@ pub fn dose_volume(
             medium_key,
             mc,
             grid,
+            planes,
         );
         mc_note = mc_note.or(ran);
         measured.push(volume);
@@ -225,19 +227,39 @@ pub fn dose_volume(
             medium_key,
             mc,
             grid,
+            planes,
         );
         plans.push(volume);
     }
 
+    let used_planes = mc_note.is_none() && planes.is_some();
+    let gamma_slice = used_planes
+        || measured
+            .first()
+            .is_some_and(|volume| volume.values.len() > 2_000_000);
     let primary = measured
         .first()
         .filter(|volume| volume.values.iter().any(|v| *v > 0.0));
-    let (ix, iy, iz) = primary.map(Volume::peak_index).unwrap_or((0, 0, 0));
+    let (ix, iy, iz) = if used_planes {
+        let [nx, ny, nz] = primary.map(|volume| volume.shape).unwrap_or([1, 1, 1]);
+        (
+            frame.focus[0].min(nx.saturating_sub(1)),
+            frame.focus[1].min(ny.saturating_sub(1)),
+            frame.focus[2].min(nz.saturating_sub(1)),
+        )
+    } else {
+        primary.map(Volume::peak_index).unwrap_or((0, 0, 0))
+    };
     let shown: Vec<Volume> = match compare {
         "difference" => measured
             .iter()
             .zip(&plans)
             .map(|(got, plan)| difference(got, plan))
+            .collect(),
+        "gamma" if gamma_slice => measured
+            .iter()
+            .zip(&plans)
+            .map(|(got, plan)| gamma_planes(got, plan, frame.focus).0)
             .collect(),
         "gamma" => measured
             .iter()
@@ -339,34 +361,78 @@ pub fn dose_volume(
         panels.push(depth_panel);
         panels.push(lines_panel("Lateral", lateral, y_name(quantity)));
         let mut dvh_lines = Vec::new();
-        for volume in &shown {
-            let mask = vec![true; volume.values.len()];
-            let (edges, curve) = dvh(&volume.values, &mask, 32);
-            let xs = edges.iter().take(curve.len()).copied().collect();
-            dvh_lines.push(line(xs, curve));
+        if used_planes {
+            for volume in coarse_dvh_volumes(
+                &clouds,
+                &all,
+                mat,
+                quantity,
+                spread,
+                scatter && model != "mc",
+                wet_mm,
+                phantom_mm,
+                k_mu,
+                compare,
+                frame.visits,
+            ) {
+                push_dvh(&mut dvh_lines, &volume);
+            }
+        } else {
+            for volume in &shown {
+                push_dvh(&mut dvh_lines, volume);
+            }
         }
         panels.push(lines_panel("DVH", dvh_lines, "Volume"));
         if let (Some(got), Some(plan)) = (measured.first(), plans.first()) {
-            let (gamma, passed, scored) = gamma_of(got, plan);
+            let (gamma_vol, passed, scored) = if gamma_slice {
+                let iz = iz.min(got.shape[2].saturating_sub(1));
+                let [nx, ny, _] = got.shape;
+                let (values, passed, scored) =
+                    plane_gamma(&plan.axial(iz), &got.axial(iz), nx, ny, got.voxel);
+                (
+                    Volume {
+                        origin: got.origin,
+                        shape: [nx, ny, 1],
+                        voxel: got.voxel,
+                        values,
+                    },
+                    passed,
+                    scored,
+                )
+            } else {
+                let (gamma, passed, scored) = gamma_of(got, plan);
+                (gamma_image(got, &gamma), passed, scored)
+            };
             let rate = if scored == 0 {
                 0.0
             } else {
                 100.0 * passed as f32 / scored as f32
             };
+            let cols = gamma_vol.shape[0] as u32;
+            let rows = gamma_vol.shape[1] as u32;
+            let x0 = gamma_vol.origin[0];
+            let y0 = gamma_vol.origin[1];
+            let x1 = x0 + gamma_vol.shape[0] as f32 * gamma_vol.voxel;
+            let y1 = y0 + gamma_vol.shape[1] as f32 * gamma_vol.voxel;
+            let gz = if gamma_vol.shape[2] == 1 {
+                0
+            } else {
+                iz.min(gamma_vol.shape[2].saturating_sub(1))
+            };
             panels.push(slice_panel(
                 &format!("gamma {rate:.0}%"),
-                &[gamma_image(got, &gamma)],
+                &[gamma_vol],
                 16,
                 0.0,
                 2.0,
-                got.origin[0],
-                got.origin[0] + got.shape[0] as f32 * got.voxel,
-                got.origin[1],
-                got.origin[1] + got.shape[1] as f32 * got.voxel,
+                x0,
+                x1,
+                y0,
+                y1,
                 true,
-                |volume| volume.axial(iz.min(got.shape[2].saturating_sub(1))),
-                got.shape[0] as u32,
-                got.shape[1] as u32,
+                |volume| volume.axial(gz),
+                cols,
+                rows,
             ));
             if let Some(bounds) =
                 field_readout(if edge == "plan90" { plan } else { got }, plan, iz, edge)
@@ -486,6 +552,7 @@ fn fill(
     medium_key: &str,
     mc: Option<McRunner<'_>>,
     grid: Option<([f32; 3], [usize; 3], f32)>,
+    planes: Option<[usize; 3]>,
 ) -> (Volume, Option<McResult>) {
     if model == "mc" {
         if let Some(run) = mc {
@@ -543,6 +610,7 @@ fn fill(
             k_mu,
             GAP_MM,
             grid,
+            planes,
         ),
         None,
     )
@@ -809,6 +877,134 @@ fn gamma_volume(measured: &Volume, plan: &Volume) -> Volume {
     gamma_image(measured, &values)
 }
 
+fn push_dvh(lines: &mut Vec<Series>, volume: &Volume) {
+    let mask = vec![true; volume.values.len()];
+    let (edges, curve) = dvh(&volume.values, &mask, 32);
+    let xs = edges.iter().take(curve.len()).copied().collect();
+    lines.push(line(xs, curve));
+}
+
+fn coarse_voxel(visits: u64, voxel: f32) -> f32 {
+    if visits <= 4_000_000 {
+        return voxel;
+    }
+    let scale = (visits as f64 / 4_000_000.0).cbrt() as f32;
+    (voxel * scale).clamp(voxel, 10.0)
+}
+
+fn coarse_dvh_volumes(
+    clouds: &[Cloud],
+    all: &[Pencil],
+    mat: scan_kit_core::Medium,
+    quantity: Quantity,
+    spread: f32,
+    scatter: bool,
+    wet_mm: f32,
+    phantom_mm: f32,
+    k_mu: f32,
+    compare: &str,
+    visits: u64,
+) -> Vec<Volume> {
+    let vox = coarse_voxel(visits, 1.0);
+    let frame = dose_frame(
+        mat, all, quantity, spread, scatter, wet_mm, phantom_mm, vox, k_mu, GAP_MM,
+    );
+    let grid = Some((frame.origin, frame.shape, frame.voxel));
+    let paint = |pencils: &[Pencil]| {
+        analytic_on(
+            mat, pencils, quantity, spread, scatter, wet_mm, phantom_mm, vox, k_mu, GAP_MM, grid,
+            None,
+        )
+    };
+    if compare == "difference" {
+        clouds
+            .iter()
+            .map(|cloud| difference(&paint(&cloud.pencils), &paint(&cloud.plan)))
+            .collect()
+    } else {
+        clouds.iter().map(|cloud| paint(&cloud.pencils)).collect()
+    }
+}
+
+// ponytail: a clinical lattice's 3D gamma (thousands of offsets times the
+// high-dose box) does not return. Large maps score the peak slice in plane.
+// Upgrade path: search only the high-dose box on the GPU.
+fn plane_gamma(
+    reference: &[f32],
+    evaluated: &[f32],
+    cols: usize,
+    rows: usize,
+    voxel: f32,
+) -> (Vec<f32>, u32, u32) {
+    gamma_index(
+        reference,
+        evaluated,
+        [cols, rows, 1],
+        3.0,
+        2.0,
+        [voxel, voxel, voxel],
+        10.0,
+    )
+}
+
+fn gamma_planes(measured: &Volume, plan: &Volume, focus: [usize; 3]) -> (Volume, u32, u32) {
+    let [nx, ny, nz] = measured.shape;
+    let ix = focus[0].min(nx.saturating_sub(1));
+    let iy = focus[1].min(ny.saturating_sub(1));
+    let iz = focus[2].min(nz.saturating_sub(1));
+    let (axial, passed, scored) =
+        plane_gamma(&plan.axial(iz), &measured.axial(iz), nx, ny, measured.voxel);
+    let (coronal, _, _) = plane_gamma(
+        &plan.coronal(iy),
+        &measured.coronal(iy),
+        nx,
+        nz,
+        measured.voxel,
+    );
+    let (sagittal, _, _) = plane_gamma(
+        &plan.sagittal(ix),
+        &measured.sagittal(ix),
+        ny,
+        nz,
+        measured.voxel,
+    );
+    let mut values = vec![0.0; measured.values.len()];
+    for y in 0..ny {
+        for x in 0..nx {
+            values[x + nx * (y + ny * iz)] = axial[x + nx * y];
+        }
+    }
+    for z in 0..nz {
+        if z == iz {
+            continue;
+        }
+        for x in 0..nx {
+            values[x + nx * (iy + ny * z)] = coronal[x + nx * z];
+        }
+    }
+    for z in 0..nz {
+        if z == iz {
+            continue;
+        }
+        for y in 0..ny {
+            if y == iy {
+                continue;
+            }
+            values[ix + nx * (y + ny * z)] = sagittal[y + ny * z];
+        }
+    }
+    (
+        Volume {
+            origin: measured.origin,
+            shape: measured.shape,
+            voxel: measured.voxel,
+            values,
+        },
+        passed,
+        scored,
+    )
+}
+
 fn gamma_of(measured: &Volume, plan: &Volume) -> (Vec<f32>, u32, u32) {
     let n = measured.values.len().min(plan.values.len());
     gamma_index(
@@ -861,19 +1057,27 @@ fn window(volumes: &[Volume], compare: &str) -> (f32, f32) {
     if compare == "gamma" {
         return (0.0, 2.0);
     }
-    if compare == "difference" {
-        let mut flat = Vec::new();
-        for volume in volumes {
-            flat.extend(volume.values.iter().map(|v| v.abs()));
-        }
-        let hi = robust_high(&flat);
-        return (-hi, hi);
-    }
     let mut flat = Vec::new();
     for volume in volumes {
-        flat.extend_from_slice(&volume.values);
+        if compare == "difference" {
+            flat.extend(
+                volume
+                    .values
+                    .iter()
+                    .copied()
+                    .filter(|value| *value != 0.0)
+                    .map(f32::abs),
+            );
+        } else {
+            flat.extend(volume.values.iter().copied().filter(|value| *value > 0.0));
+        }
     }
-    (0.0, robust_high(&flat))
+    if compare == "difference" {
+        let hi = robust_high(&flat);
+        (-hi, hi)
+    } else {
+        (0.0, robust_high(&flat))
+    }
 }
 
 fn scale_ramp(scale: &str, divergent: bool) -> u8 {
