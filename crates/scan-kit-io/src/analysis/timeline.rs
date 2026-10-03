@@ -25,8 +25,7 @@ pub(super) fn replay(root: &Path, session_ids: &[String], options: &Value) -> Pl
     let picked = crate::source::select(crate::source::Shape::Y, false, true, &headers, options);
     let channel = picked.y.clone();
     let label = crate::source::channel_text(&channel);
-    let mut overview = Vec::new();
-    let mut detail = Vec::new();
+    let mut series = Vec::new();
     let mut xmax = SAMPLE_S;
     let mut ymin = f32::MAX;
     let mut ymax = f32::MIN;
@@ -42,19 +41,16 @@ pub(super) fn replay(root: &Path, session_ids: &[String], options: &Value) -> Pl
             ymin = ymin.min(lo);
             ymax = ymax.max(hi);
         }
-        let (xs, ys) = envelope(samples, 480);
-        overview.push(stroke(xs, ys, false));
-        let (xs, ys) = indexed(samples, 4000);
-        detail.push(stroke(xs, ys, false));
+        let (xs, ys) = trace(samples);
+        series.push(stroke(xs, ys, false));
     }
     let mut panels = Vec::new();
-    if drew_line(&overview) {
+    if drew_line(&series) {
         if ymin > ymax {
             ymin = 0.0;
             ymax = 1.0;
         }
-        panels.push(time_panel("Overview", overview, xmax, ymin, ymax, &label));
-        panels.push(time_panel("Detail", detail, xmax, ymin, ymax, &label));
+        panels.push(time_panel(&label, series, xmax, ymin, ymax, &label));
     }
     let mut scene = scene("Timeslice Replay", panels, picked.controls);
     scene.columns = 1;
@@ -323,52 +319,14 @@ fn time_panel(
     panel
 }
 
-fn indexed(samples: &[f32], target: usize) -> (Vec<f32>, Vec<f32>) {
-    let step = (samples.len() / target.max(1)).max(1);
+/// One point per sample. Time is the row index, so a gap stays where the file has one.
+pub(super) fn trace(samples: &[f32]) -> (Vec<f32>, Vec<f32>) {
     (
         (0..samples.len())
-            .step_by(step)
-            .map(|i| i as f32 * SAMPLE_S)
+            .map(|index| index as f32 * SAMPLE_S)
             .collect(),
-        (0..samples.len())
-            .step_by(step)
-            .map(|i| samples[i])
-            .collect(),
+        samples.to_vec(),
     )
-}
-
-/// Min and max of each bucket, so a pulse narrower than the stride still draws.
-pub(super) fn envelope(samples: &[f32], buckets: usize) -> (Vec<f32>, Vec<f32>) {
-    let n = samples.len();
-    if n == 0 {
-        return (Vec::new(), Vec::new());
-    }
-    let buckets = buckets.max(1).min(n);
-    let mut xs = Vec::with_capacity(buckets * 2);
-    let mut ys = Vec::with_capacity(buckets * 2);
-    for bucket in 0..buckets {
-        let start = bucket * n / buckets;
-        let end = ((bucket + 1) * n / buckets).max(start + 1).min(n);
-        let mut lo = f32::INFINITY;
-        let mut hi = f32::NEG_INFINITY;
-        for value in &samples[start..end] {
-            if value.is_finite() {
-                lo = lo.min(*value);
-                hi = hi.max(*value);
-            }
-        }
-        if !lo.is_finite() {
-            continue;
-        }
-        let x = start as f32 * SAMPLE_S;
-        xs.push(x);
-        ys.push(lo);
-        if hi > lo {
-            xs.push(x);
-            ys.push(hi);
-        }
-    }
-    (xs, ys)
 }
 
 /// 0.5% tails. One ADC spike was setting the axis and the trace sat on the frame.

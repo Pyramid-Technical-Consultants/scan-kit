@@ -14,6 +14,10 @@
 //!
 //! A mark kind's byte layout lives in its `*_STRIDE`, `*_ATTRS`, `encode_*`,
 //! `decode_*`, and the matching WGSL `vs_*` inputs. Change them together.
+//! The scene's lines and points are the filtered samples. A stroke may be
+//! simplified here for the current camera when several samples share a pixel,
+//! and that pass keeps the extrema in the pixel. A camera that gives a sample
+//! its own pixel draws it. Do not thin the series before it reaches this crate.
 //! Heatmap value row 0 is the low data y. The texture is stored top-first, so
 //! that row is the last row of pixels. Those pixels are the catalog color for
 //! the series ramp, baked before upload.

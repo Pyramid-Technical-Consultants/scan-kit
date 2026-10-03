@@ -165,10 +165,8 @@ pub(super) fn scatter_series(
     let xs_in = table.get(x_column).map(Vec::as_slice).unwrap_or(&[]);
     let mut xs = Vec::new();
     let mut ys = Vec::new();
-    // ponytail: scatter past 20k points is strided. Draw every point if a tail matters.
-    let stride = (xs_in.len() / 20_000).max(1);
-    for (index, (x, y)) in xs_in.iter().zip(y).enumerate() {
-        if index % stride == 0 && x.is_finite() && y.is_finite() {
+    for (x, y) in xs_in.iter().zip(y) {
+        if x.is_finite() && y.is_finite() {
             xs.push(*x);
             ys.push(*y);
         }

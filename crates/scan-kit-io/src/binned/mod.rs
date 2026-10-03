@@ -1203,7 +1203,8 @@ mod tests {
 
     use super::super::marks::apply_filter;
     use super::{
-        assign_x, axis_label, binned_summary, binned_trend, violin_series, BinChoice, Trend,
+        assign_x, axis_label, binned_summary, binned_trend, scatter_series, violin_series,
+        BinChoice, Trend,
     };
 
     #[test]
@@ -1230,6 +1231,21 @@ mod tests {
                 .any(|panel| panel.title.starts_with("IC1")),
             "dose error should plot when the log has padded dose numbers",
         );
+    }
+
+    #[test]
+    fn scatter_keeps_every_finite_point() {
+        let n = 20_001;
+        let mut table = BTreeMap::new();
+        table.insert("x".into(), (0..n).map(|index| index as f32).collect());
+        let y: Vec<f32> = (0..n)
+            .map(|index| if index == n - 1 { 7.0 } else { 1.0 })
+            .collect();
+        let Series::Points { xs, ys, .. } = scatter_series(&table, &y, "x", [1.0; 4]) else {
+            panic!("scatter should be points");
+        };
+        assert_eq!(xs.len(), n);
+        assert_eq!(ys[n - 1], 7.0);
     }
 
     #[test]

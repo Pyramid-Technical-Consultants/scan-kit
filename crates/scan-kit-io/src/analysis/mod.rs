@@ -284,7 +284,7 @@ mod tests {
     use scan_kit_core::{Family, SESSION};
 
     use super::distribution::{distribution_limits, reference_ring};
-    use super::timeline::{envelope, robust_span};
+    use super::timeline::{robust_span, trace};
     use super::*;
 
     fn write_session(root: &Path) {
@@ -726,8 +726,11 @@ mod tests {
         let replay = scene_of("timeslice_replay");
         assert!(has_kind(&replay, "line"));
         assert_eq!(replay.columns, 1);
-        assert!(replay.panels.iter().any(|panel| panel.title == "Overview"));
-        assert!(replay.panels.iter().any(|panel| panel.title == "Detail"));
+        assert_eq!(replay.panels.len(), 1);
+        let Series::Polyline { xs, .. } = &replay.panels[0].series[0] else {
+            panic!("replay should be one trace");
+        };
+        assert_eq!(xs.len(), 32);
         assert!(replay.panels.iter().all(|panel| panel.xmax < 1.0));
         assert!(replay
             .panels
@@ -746,11 +749,13 @@ mod tests {
     }
 
     #[test]
-    fn replay_overview_keeps_a_narrow_pulse() {
-        let mut samples = vec![0.0f32; 10_000];
-        samples[5000] = 40.0;
-        let (_, ys) = envelope(&samples, 480);
-        assert!(ys.iter().copied().any(|value| value > 30.0));
+    fn replay_trace_keeps_a_narrow_pulse() {
+        let mut samples = vec![0.0f32; 8_001];
+        samples[1] = 40.0;
+        let (xs, ys) = trace(&samples);
+        assert_eq!(ys.len(), samples.len());
+        assert_eq!(ys[1], 40.0);
+        assert!((xs[1] - 0.001).abs() < 1e-6);
     }
 
     #[test]

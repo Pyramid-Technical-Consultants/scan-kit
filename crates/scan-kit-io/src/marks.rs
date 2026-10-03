@@ -22,10 +22,6 @@ pub(crate) fn contour_bands(xs: &[f32], ys: &[f32], cutoff_pct: f32) -> Vec<Seri
         .filter(|(x, y)| x.is_finite() && y.is_finite())
         .map(|(x, y)| (*x, *y))
         .collect();
-    if pairs.len() > 8000 {
-        let step = (pairs.len() / 8000).max(1);
-        pairs = pairs.into_iter().step_by(step).collect();
-    }
     if pairs.len() < 20 {
         return Vec::new();
     }
@@ -452,6 +448,19 @@ rci_in_trigger,r_ic1_x_confidence,r_ic1_x_peak_amplitude,c_x,r_xV,r_tx2_probe_x
         close(&field["field_x"], &[30.0, -10.0, 5.0]);
         assert!(!field.contains_key("field_y"));
     }
+    #[test]
+    fn contour_counts_every_sample() {
+        let n = 16_001;
+        let mut xs = vec![0.0f32; n];
+        let mut ys = vec![0.0f32; n];
+        for index in (1..n).step_by(2) {
+            let turn = index as f32;
+            xs[index] = (turn * 0.01).sin();
+            ys[index] = (turn * 0.013).cos();
+        }
+        assert!(!contour_bands(&xs, &ys, 5.0).is_empty());
+    }
+
     #[test]
     fn contour_fill_uses_the_isoline_vertices() {
         let mut xs = Vec::new();
