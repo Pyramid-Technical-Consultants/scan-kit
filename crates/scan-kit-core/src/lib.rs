@@ -15,6 +15,7 @@ mod schema;
 mod session;
 mod session_log;
 mod signal;
+mod task;
 mod tune;
 mod xml_dom;
 
@@ -33,8 +34,8 @@ pub use plan::{
     ImportSpot, PlanDocument, PlanSource,
 };
 pub use plot::{
-    apply_clip, format_tick, map_span, project, ticks, Camera, Control, DataTable, Panel, PlotRect,
-    PlotScene, Series,
+    apply_clip, format_tick, map_span, project, ticks, Camera, Choice, Control, DataTable, Panel,
+    PlotRect, PlotScene, Series,
 };
 pub use ramp::{choices, index, is_session, resolve, sample, session, Family, SESSION, VIRIDIS};
 pub use runner::{
@@ -66,6 +67,9 @@ pub use schema::{
     IC3_QUAD_ZERO_FILL, POSITION_KEY_G2_RAW, POSITION_KEY_G3_RAW,
 };
 pub use session::{merge_session_geom, parse_termination_summary_text, SessionMeta, SummaryDate};
+pub use task::{
+    adapt_chunk, decode_poll, encode_poll, generation_matches, settle, Cancel, Phase, Poll, Report,
+};
 
 use serde::Serialize;
 use serde_json::{json, Value};

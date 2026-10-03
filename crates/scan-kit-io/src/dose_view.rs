@@ -11,7 +11,7 @@ use scan_kit_core::{
 use serde_json::Value;
 
 use super::discover;
-use super::marks::pick;
+use super::marks::{labeled, pick};
 use super::tables::{interlock_sigma_mm, spot_table};
 
 const GUIDE: [f32; 4] = [0.62, 0.62, 0.62, 0.9];
@@ -21,7 +21,6 @@ const FALLBACK_KMU: f32 = 2.0e-8;
 const GAP_MM: f32 = 10.0;
 const MC_SEED: u32 = 1;
 
-const GRAIN: &[(&str, &str)] = &[("spot", "Spot"), ("timeslice", "Timeslice")];
 const XY: &[(&str, &str)] = &[
     ("ic1", "IC1"),
     ("ic2", "IC2"),
@@ -92,7 +91,8 @@ pub fn dose_volume(
             return super::patient_view::scene(root, session_ids, options, mc);
         }
     }
-    let grain = pick(options, "grain", "spot", GRAIN);
+    let picked = crate::source::select(crate::source::Shape::Source, true, true, &[], options);
+    let grain = picked.grain;
     let xy = pick(options, "xy", "ic1", XY);
     let quantity_id = pick(options, "quantity", "dose", QUANTITY);
     let quantity = match quantity_id {
@@ -442,48 +442,12 @@ pub fn dose_volume(
         }
     }
 
-    let mut controls = vec![
-        control("grain", "Source", GRAIN, grain),
-        control("xy", "Signal", XY, xy),
-        control("quantity", "Quantity", QUANTITY, quantity_id),
-    ];
-    controls.push(control("model", "Model", MODEL, model));
-    if model == "analytic" {
-        controls.push(control(
-            "scatter",
-            "Scatter",
-            SCATTER,
-            if scatter { "on" } else { "off" },
-        ));
-    } else {
-        controls.push(control(
-            "histories",
-            "Histories",
-            HISTORIES,
-            &histories.to_string(),
-        ));
-    }
-    controls.push(control("spread", "Spread", SPREAD, &trim_num(spread)));
-    let media: Vec<(&str, &str)> = if model == "mc" {
-        MEDIA
-            .iter()
-            .copied()
-            .filter(|(id, _)| MC_MEDIA.contains(id))
-            .collect()
-    } else {
-        MEDIA.to_vec()
-    };
-    controls.push(control("medium", "Medium", &media, medium_key));
-    controls.push(control(
-        "phantom",
-        "Thickness",
-        PHANTOM,
-        &phantom_mm.round().to_string(),
-    ));
-    controls.push(control("wet", "Entrance", WET, &wet_mm.round().to_string()));
-    controls.push(control("compare", "Compare", COMPARE, compare));
+    let mut controls = picked.controls;
+    controls.push(labeled("xy", "Signal", XY, xy).grouped("Data Source"));
+    controls.push(labeled("quantity", "Quantity", QUANTITY, quantity_id).grouped("Data Source"));
     if xy == "plan" || compare != "measured" {
-        controls.push(control("plan_sigma", "Plan Sigma", SIGMA, plan_sigma));
+        controls
+            .push(labeled("plan_sigma", "Plan Sigma", SIGMA, plan_sigma).grouped("Data Source"));
         if session_ids.len() > 1 {
             let pairs: Vec<(String, String)> = session_ids
                 .iter()
@@ -498,17 +462,55 @@ pub fn dose_volume(
             } else {
                 refs.first().map(|(id, _)| *id).unwrap_or("")
             };
-            controls.push(control("sigma_ref", "Reference", &refs, chosen));
+            controls.push(labeled("sigma_ref", "Reference", &refs, chosen).grouped("Data Source"));
         }
     }
-    controls.push(control("edge", "Field Edge", EDGE, edge));
+    controls.push(labeled("model", "Model", MODEL, model).grouped("Model"));
+    if model == "analytic" {
+        controls.push(
+            labeled(
+                "scatter",
+                "Scatter",
+                SCATTER,
+                if scatter { "on" } else { "off" },
+            )
+            .grouped("Model"),
+        );
+    } else {
+        controls.push(
+            labeled("histories", "Histories", HISTORIES, &histories.to_string()).grouped("Model"),
+        );
+    }
+    controls.push(labeled("spread", "Spread", SPREAD, &trim_num(spread)).grouped("Model"));
+    let media: Vec<(&str, &str)> = if model == "mc" {
+        MEDIA
+            .iter()
+            .copied()
+            .filter(|(id, _)| MC_MEDIA.contains(id))
+            .collect()
+    } else {
+        MEDIA.to_vec()
+    };
+    controls.push(labeled("medium", "Medium", &media, medium_key).grouped("Phantom"));
+    controls.push(
+        labeled(
+            "phantom",
+            "Thickness",
+            PHANTOM,
+            &phantom_mm.round().to_string(),
+        )
+        .grouped("Phantom"),
+    );
+    controls.push(labeled("wet", "Entrance", WET, &wet_mm.round().to_string()).grouped("Phantom"));
+    controls.push(labeled("compare", "Compare", COMPARE, compare).grouped("Compare"));
+    controls.push(labeled("edge", "Field Edge", EDGE, edge).grouped("Compare"));
     if session_ids.len() <= 1 && compare != "gamma" {
         let scales = choices(if compare == "difference" {
             Family::Divergent
         } else {
             Family::Sequential
         });
-        controls.push(control("scale", "Scale", scales, scale));
+        controls.push(labeled("scale", "Scale", scales, scale).grouped("Color"));
     }
     PlotScene {
         title: "Dose Volume".into(),
@@ -1098,6 +1100,7 @@ fn slice_panel(
     Panel {
         title: title.into(),
         y_label: String::new(),
+        x_label: String::new(),
         xmin,
         xmax,
         ymin,
@@ -1113,6 +1116,7 @@ fn lines_panel(title: &str, series: Vec<Series>, y_label: &str) -> Panel {
     Panel {
         title: title.into(),
         y_label: y_label.into(),
+        x_label: String::new(),
         xmin,
         xmax,
         ymin,
@@ -1136,6 +1140,7 @@ fn note(title: &str) -> Panel {
     Panel {
         title: title.into(),
         y_label: String::new(),
+        x_label: String::new(),
         xmin: 0.0,
         xmax: 1.0,
         ymin: 0.0,
@@ -1216,24 +1221,5 @@ fn trim_num(value: f32) -> String {
         "2".into()
     } else {
         "1".into()
-    }
-}
-
-fn control(
-    id: &str,
-    label: &str,
-    pairs: &[(&str, &str)],
-    value_id: &str,
-) -> scan_kit_core::Control {
-    let value = pairs
-        .iter()
-        .find(|(id, _)| *id == value_id)
-        .map(|(_, label)| *label)
-        .unwrap_or(value_id);
-    scan_kit_core::Control {
-        id: id.into(),
-        label: label.into(),
-        options: pairs.iter().map(|(_, label)| (*label).to_owned()).collect(),
-        value: value.into(),
     }
 }

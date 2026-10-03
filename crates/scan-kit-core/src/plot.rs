@@ -68,6 +68,9 @@ pub struct Panel {
     pub title: String,
     /// Quantity drawn up the left side, including units when the series has them.
     pub y_label: String,
+    /// Quantity drawn under the tick labels, including units.
+    #[serde(default)]
+    pub x_label: String,
     pub xmin: f32,
     pub xmax: f32,
     pub ymin: f32,
@@ -99,13 +102,116 @@ impl Series {
     }
 }
 
+/// One menu row. `label` includes the unit when the source has one.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Choice {
+    pub id: String,
+    pub label: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub detail: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub icon: String,
+}
+
+impl Choice {
+    pub fn plain(text: &str) -> Self {
+        Self {
+            id: text.to_string(),
+            label: text.to_string(),
+            detail: String::new(),
+            icon: String::new(),
+        }
+    }
+
+    pub fn full(id: &str, label: &str, detail: impl Into<String>, icon: &str) -> Self {
+        Self {
+            id: id.to_string(),
+            label: label.to_string(),
+            detail: detail.into(),
+            icon: icon.to_string(),
+        }
+    }
+}
+
+impl PartialEq<str> for Choice {
+    fn eq(&self, other: &str) -> bool {
+        self.label == other || self.id == other
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ChoiceWire {
+    Text(String),
+    Full(Choice),
+}
+
+fn choices_de<'de, D>(deserializer: D) -> Result<Vec<Choice>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Vec::<ChoiceWire>::deserialize(deserializer)?;
+    Ok(raw
+        .into_iter()
+        .map(|item| match item {
+            ChoiceWire::Text(text) => Choice::plain(&text),
+            ChoiceWire::Full(choice) => choice,
+        })
+        .collect())
+}
+
 /// A control the shell renders with shadcn. The view does not draw it.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Control {
     pub id: String,
     pub label: String,
-    pub options: Vec<String>,
+    #[serde(deserialize_with = "choices_de")]
+    pub options: Vec<Choice>,
     pub value: String,
+    /// Sidebar fieldset. Empty lands in Options.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub group: String,
+    /// `check` is a checkbox. Empty is a select.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub kind: String,
+}
+
+impl Control {
+    pub fn plain(
+        id: impl Into<String>,
+        label: impl Into<String>,
+        options: impl IntoIterator<Item = impl AsRef<str>>,
+        value: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            label: label.into(),
+            options: options
+                .into_iter()
+                .map(|option| Choice::plain(option.as_ref()))
+                .collect(),
+            value: value.into(),
+            group: String::new(),
+            kind: String::new(),
+        }
+    }
+
+    pub fn grouped(mut self, group: &str) -> Self {
+        self.group = group.to_string();
+        self
+    }
+
+    pub fn checked(mut self) -> Self {
+        self.kind = "check".to_string();
+        self
+    }
+
+    pub fn labels(&self) -> Vec<&str> {
+        self.options
+            .iter()
+            .map(|choice| choice.label.as_str())
+            .collect()
+    }
 }
 
 /// Tabular result for views that are not pictures. The shell uses Glide.

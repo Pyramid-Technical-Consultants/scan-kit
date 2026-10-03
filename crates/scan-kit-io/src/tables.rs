@@ -6,11 +6,12 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use super::discover;
 use scan_kit_core::{
     column_scale_factor, dose_error_pct, dose_ratio_pct, g2_ic2_mm, linear_fit, remap,
-    remap_g2_raw, remap_g3_raw, resolve_concept_column, scale_column,
+    remap_g2_raw, remap_g3_raw, scale_column,
 };
 
 pub(crate) struct Sheet {
@@ -18,7 +19,25 @@ pub(crate) struct Sheet {
     pub(crate) wide: BTreeMap<String, Vec<f64>>,
 }
 
-pub(crate) fn spot_table(root: &Path, session: &str) -> BTreeMap<String, Vec<f32>> {
+pub(crate) type Table = std::sync::Arc<BTreeMap<String, Vec<f32>>>;
+
+pub(crate) fn map_sessions<T: Send>(
+    session_ids: &[String],
+    load: impl Fn(&str) -> T + Sync,
+) -> Vec<T> {
+    if session_ids.len() < 2 {
+        return session_ids.iter().map(|id| load(id)).collect();
+    }
+    std::thread::scope(|scope| {
+        let mut joins = Vec::with_capacity(session_ids.len());
+        for session in session_ids {
+            joins.push(scope.spawn(|| load(session)));
+        }
+        joins.into_iter().map(|join| join.join().unwrap()).collect()
+    })
+}
+
+pub(crate) fn spot_table(root: &Path, session: &str) -> Table {
     load_spot(root, session, false, false, false)
 }
 
@@ -26,89 +45,213 @@ pub(crate) fn spot_table(root: &Path, session: &str) -> BTreeMap<String, Vec<f32
 ///
 /// Sigma prefers `spot_sigma_raw`, then scales ×2 to mm, matching
 /// `session_sigma.py`. Analysis plots prefer the processed `spot_sigma` column.
-pub(crate) fn tune_spot_table(root: &Path, session: &str) -> BTreeMap<String, Vec<f32>> {
+pub(crate) fn tune_spot_table(root: &Path, session: &str) -> Table {
     load_spot(root, session, false, false, true)
 }
 
-pub(crate) fn slice_table(root: &Path, session: &str) -> BTreeMap<String, Vec<f32>> {
+pub(crate) fn slice_table(root: &Path, session: &str) -> Table {
     load_slice_metric(root, session, "position_error", false)
 }
 
-pub(crate) fn timeslice_metric(
-    root: &Path,
-    session: &str,
-    metric: &str,
-) -> BTreeMap<String, Vec<f32>> {
+pub(crate) fn timeslice_metric(root: &Path, session: &str, metric: &str) -> Table {
     load_timeslice(root, session, metric)
 }
 
 /// Current, confidence, peak, field, and amplifier columns from one timeslice read.
-pub(crate) fn timeslice_signals(root: &Path, session: &str) -> BTreeMap<String, Vec<f32>> {
-    let Some((files, energies, layers)) = timeslice_inputs(root, session) else {
-        return BTreeMap::new();
-    };
-    let sheets = read_sheets(&files, timeline_column);
-    let mut out = current_from(&sheets, &energies, &layers);
-    for metric in [
-        "fit_confidence",
-        "peak_amplitude",
-        "amplifier_error",
-        "probe_field",
-    ] {
-        for (key, values) in signal_from(&sheets, &energies, &layers, metric) {
-            out.entry(key).or_insert(values);
+pub(crate) fn timeslice_signals(root: &Path, session: &str) -> Table {
+    cached_timeslice(root, session, "signals", false, Family::Signals, |frames| {
+        let mut out = current_from(&frames.sheets, &frames.energies, &frames.layers);
+        for metric in [
+            "fit_confidence",
+            "peak_amplitude",
+            "amplifier_error",
+            "probe_field",
+        ] {
+            for (key, values) in
+                signal_from(&frames.sheets, &frames.energies, &frames.layers, metric)
+            {
+                out.entry(key).or_insert(values);
+            }
         }
-    }
-    out
+        out
+    })
 }
 
-// ponytail: keyed by spot/map length, mtime, and the first 4KB. devices.xml and
-// per-layer point-time files stay stale until the spot csv changes. Past 16
-// entries the map is cleared.
+// ponytail: keyed by spot/map length and mtime. devices.xml and per-layer
+// point-time files stay stale until the spot csv changes. Past 16 entries the
+// map is cleared. A same-size rewrite in the same timestamp tick is missed.
 const SPOT_CACHE_CAP: usize = 16;
 
 #[derive(Hash, PartialEq, Eq)]
 struct SpotCacheKey {
     dir: PathBuf,
     chamber: bool,
-    spot_len: u64,
-    spot_ns: u128,
-    spot_head: u64,
-    map_len: u64,
-    map_ns: u128,
-    map_head: u64,
+    spot_stamp: u128,
+    map_stamp: u128,
     points: bool,
     raw_sigma: bool,
 }
 
-fn spot_cache() -> &'static std::sync::Mutex<HashMap<SpotCacheKey, BTreeMap<String, Vec<f32>>>> {
-    static CACHE: std::sync::OnceLock<
-        std::sync::Mutex<HashMap<SpotCacheKey, BTreeMap<String, Vec<f32>>>>,
-    > = std::sync::OnceLock::new();
+fn spot_cache() -> &'static std::sync::Mutex<HashMap<SpotCacheKey, Table>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<SpotCacheKey, Table>>> =
+        std::sync::OnceLock::new();
     CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
 }
 
-pub(crate) fn file_fingerprint(path: &Path) -> Option<(u64, u128, u64)> {
-    let meta = std::fs::metadata(path).ok()?;
-    let ns = meta
-        .modified()
-        .ok()?
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()?
-        .as_nanos();
-    let mut file = std::fs::File::open(path).ok()?;
-    let mut buf = [0u8; 4096];
-    let n = std::io::Read::read(&mut file, &mut buf).ok()?;
-    Some((meta.len(), ns, fnv64(&buf[..n])))
+/// Parsed timeslice frames shared by every metric.
+///
+/// ponytail: four sessions stay parsed. Past that the map is cleared. The files
+/// are the expensive part; the derived tables below are the cheap repeat.
+const FRAME_CACHE_CAP: usize = 4;
+const TABLE_CACHE_CAP: usize = 32;
+
+struct Frames {
+    energies: Vec<f32>,
+    layers: Vec<i64>,
+    sheets: Vec<Sheet>,
+    map: Sheet,
 }
 
-fn fnv64(bytes: &[u8]) -> u64 {
-    let mut hash = 0xcbf29ce484222325u64;
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
+#[derive(Clone, Copy, Hash, PartialEq, Eq)]
+enum Family {
+    Signals,
+    Geometry,
+    All,
+}
+
+#[derive(Hash, PartialEq, Eq, Clone)]
+struct FrameKey {
+    dir: PathBuf,
+    map_stamp: u128,
+    slice_stamp: u128,
+    family: Family,
+}
+
+#[derive(Hash, PartialEq, Eq)]
+struct TableKey {
+    frames: FrameKey,
+    spot_stamp: u128,
+    kind: String,
+}
+
+fn frame_cache() -> &'static Mutex<HashMap<FrameKey, Arc<Frames>>> {
+    static CACHE: OnceLock<Mutex<HashMap<FrameKey, Arc<Frames>>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn table_cache() -> &'static Mutex<HashMap<TableKey, Table>> {
+    static CACHE: OnceLock<Mutex<HashMap<TableKey, Table>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn frame_key(root: &Path, session: &str, family: Family) -> FrameKey {
+    let dir = discover::session_directory(root, session);
+    FrameKey {
+        map_stamp: discover::meta_stamp(&dir.join("input_map.csv")),
+        slice_stamp: discover::timeslice_stamp(&dir),
+        family,
+        dir,
     }
-    hash
+}
+
+fn cached_timeslice(
+    root: &Path,
+    session: &str,
+    kind: &str,
+    spot: bool,
+    family: Family,
+    build: impl FnOnce(&Frames) -> BTreeMap<String, Vec<f32>>,
+) -> Table {
+    let frames = frame_key(root, session, family);
+    let key = TableKey {
+        spot_stamp: if spot {
+            discover::meta_stamp(&frames.dir.join("spot_data.csv"))
+        } else {
+            0
+        },
+        kind: kind.to_string(),
+        frames,
+    };
+    if let Some(hit) = table_cache()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .get(&key)
+    {
+        return Arc::clone(hit);
+    }
+    let table = Arc::new(
+        open_frames(root, session, family)
+            .map(|frames| build(&frames))
+            .unwrap_or_default(),
+    );
+    let mut cache = table_cache().lock().unwrap_or_else(|err| err.into_inner());
+    if cache.len() >= TABLE_CACHE_CAP {
+        cache.clear();
+    }
+    cache.insert(key, Arc::clone(&table));
+    table
+}
+
+fn open_frames(root: &Path, session: &str, family: Family) -> Option<Arc<Frames>> {
+    let key = frame_key(root, session, family);
+    if let Some(hit) = frame_cache()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .get(&key)
+    {
+        return Some(Arc::clone(hit));
+    }
+    let map = discover::read_session_file(root, session, "input_map.csv")
+        .map(|bytes| read_sheet(&bytes))
+        .unwrap_or_else(|| Sheet {
+            num: BTreeMap::new(),
+            wide: BTreeMap::new(),
+        });
+    let energies = unique_seen(column(&map, "energy", &[]));
+    let keep = keep_of(family);
+    let (layers, sheets) = if key.dir.is_dir() {
+        let listed = discover::list_timeslice_paths(&key.dir);
+        if listed.is_empty() {
+            return None;
+        }
+        let layers = listed.iter().map(|(index, _)| *index).collect();
+        (layers, parse_paths(&listed, keep))
+    } else {
+        let listed = discover::read_timeslice_frames(&key.dir);
+        if listed.is_empty() {
+            return None;
+        }
+        let layers = listed.iter().map(|(index, _)| *index).collect();
+        let files: Vec<Vec<u8>> = listed.into_iter().map(|(_, bytes)| bytes).collect();
+        (layers, read_sheets(&files, keep))
+    };
+    let frames = Arc::new(Frames {
+        energies,
+        layers,
+        sheets,
+        map,
+    });
+    let mut cache = frame_cache().lock().unwrap_or_else(|err| err.into_inner());
+    if cache.len() >= FRAME_CACHE_CAP {
+        cache.clear();
+    }
+    cache.insert(key, Arc::clone(&frames));
+    Some(frames)
+}
+
+pub(crate) fn merged_timeslice(root: &Path, session: &str) -> Table {
+    cached_timeslice(root, session, "merged", false, Family::All, |frames| {
+        let mut merged: BTreeMap<String, Vec<f32>> = BTreeMap::new();
+        for sheet in &frames.sheets {
+            for (name, values) in &sheet.num {
+                merged
+                    .entry(name.clone())
+                    .or_default()
+                    .extend(values.iter().copied());
+            }
+        }
+        merged
+    })
 }
 
 pub(crate) fn load_spot(
@@ -117,41 +260,31 @@ pub(crate) fn load_spot(
     chamber: bool,
     points: bool,
     raw_sigma: bool,
-) -> BTreeMap<String, Vec<f32>> {
+) -> Table {
     let dir = discover::session_directory(root, session);
-    let key = match (
-        file_fingerprint(&dir.join("spot_data.csv")),
-        file_fingerprint(&dir.join("input_map.csv")),
-    ) {
-        (Some((spot_len, spot_ns, spot_head)), Some((map_len, map_ns, map_head))) => {
-            Some(SpotCacheKey {
-                dir,
-                chamber,
-                spot_len,
-                spot_ns,
-                spot_head,
-                map_len,
-                map_ns,
-                map_head,
-                points,
-                raw_sigma,
-            })
-        }
-        _ => None,
-    };
+    let spot_path = dir.join("spot_data.csv");
+    let map_path = dir.join("input_map.csv");
+    let key = (spot_path.is_file() && map_path.is_file()).then(|| SpotCacheKey {
+        spot_stamp: discover::meta_stamp(&spot_path),
+        map_stamp: discover::meta_stamp(&map_path),
+        dir,
+        chamber,
+        points,
+        raw_sigma,
+    });
     if let Some(key) = &key {
         let cache = spot_cache().lock().unwrap_or_else(|err| err.into_inner());
         if let Some(hit) = cache.get(key) {
-            return hit.clone();
+            return Arc::clone(hit);
         }
     }
-    let table = build_spot(root, session, chamber, points, raw_sigma);
+    let table = Arc::new(build_spot(root, session, chamber, points, raw_sigma));
     if let Some(key) = key {
         let mut cache = spot_cache().lock().unwrap_or_else(|err| err.into_inner());
         if cache.len() >= SPOT_CACHE_CAP {
             cache.clear();
         }
-        cache.insert(key, table.clone());
+        cache.insert(key, Arc::clone(&table));
     }
     table
 }
@@ -169,7 +302,7 @@ fn build_spot(
     let Some(map_bytes) = discover::read_session_file(root, session, "input_map.csv") else {
         return BTreeMap::new();
     };
-    let spot = read_sheet(&spot_bytes);
+    let spot = read_sheet_where(&spot_bytes, spot_keep);
     let map = read_sheet(&map_bytes);
     let energy = column(&map, "energy", &[]);
     let dose = column(
@@ -188,7 +321,7 @@ fn build_spot(
     let target = column(&map, "charge_req", &["target_mu", "MU", "mu"]);
     let plan_x = column(&map, "x_position", &["position_x", "X_POSITION", "x_pos"]);
     let plan_y = column(&map, "y_position", &["position_y", "Y_POSITION", "y_pos"]);
-    let mut doses = BTreeMap::new();
+    let mut doses = Vec::new();
     for (concept, key) in [
         ("ic1_total_dose", "ic1_dose"),
         ("ic2_total_dose", "ic2_dose"),
@@ -196,39 +329,39 @@ fn build_spot(
     ] {
         let values = column(&spot, concept, &[key]);
         if values.len() >= n {
-            doses.insert(key, values);
+            doses.push((key, values));
         }
     }
     let (mask_pos, mm_pos) = spot_positions(&spot, chamber, n);
     let sigma = spot_sigma(&spot, raw_sigma || chamber, n);
-    let mut mask_cols: Vec<&[f32]> = vec![&energy];
+    let mut mask_cols: Vec<&[f32]> = vec![energy];
     if target.len() >= n {
-        mask_cols.push(&target);
+        mask_cols.push(target);
     }
     if plan_x.len() >= n {
-        mask_cols.push(&plan_x);
+        mask_cols.push(plan_x);
     }
     if plan_y.len() >= n {
-        mask_cols.push(&plan_y);
+        mask_cols.push(plan_y);
     }
-    for values in doses.values() {
-        mask_cols.push(values);
+    for (_, values) in &doses {
+        mask_cols.push(*values);
     }
     for values in &mask_pos {
-        mask_cols.push(values);
+        mask_cols.push(*values);
     }
     let keep = keep_mask(&mask_cols, n);
     if !keep.iter().any(|row| *row) {
         return BTreeMap::new();
     }
     let mut table = BTreeMap::new();
-    table.insert("energy".to_string(), take_kept(&energy, &keep));
+    table.insert("energy".to_string(), take_kept(energy, &keep));
     if target.len() >= n {
-        table.insert("target_mu".to_string(), take_kept(&target, &keep));
+        table.insert("target_mu".to_string(), take_kept(target, &keep));
     }
     if plan_x.len() >= n && plan_y.len() >= n {
-        let x = take_kept(&plan_x, &keep);
-        let y = take_kept(&plan_y, &keep);
+        let x = take_kept(plan_x, &keep);
+        let y = take_kept(plan_y, &keep);
         table.insert(
             "radius".to_string(),
             x.iter()
@@ -242,47 +375,40 @@ fn build_spot(
     for (key, values) in &doses {
         table.insert((*key).to_string(), take_kept(values, &keep));
     }
-    if let (Some(target), Some(ic1)) = (
-        table.get("target_mu").cloned(),
-        table.get("ic1_dose").cloned(),
-    ) {
-        table.insert(
-            "ic1_dose_err_pct".to_string(),
-            dose_error_pct(&ic1, &target),
-        );
-    }
-    if let (Some(target), Some(ic2)) = (
-        table.get("target_mu").cloned(),
-        table.get("ic2_dose").cloned(),
-    ) {
-        table.insert(
-            "ic2_dose_err_pct".to_string(),
-            dose_error_pct(&ic2, &target),
-        );
-    }
-    if let (Some(target), Some(ic3)) = (
-        table.get("target_mu").cloned(),
-        table.get("ic3_dose").cloned(),
-    ) {
-        table.insert(
-            "ic3_dose_err_pct".to_string(),
-            dose_error_pct(&ic3, &target),
-        );
-    }
-    if let (Some(ic1), Some(ic2)) = (
-        table.get("ic1_dose").cloned(),
-        table.get("ic2_dose").cloned(),
-    ) {
-        table.insert("ic21_ratio".to_string(), dose_ratio_pct(&ic2, &ic1));
-        if let Some(ic3) = table.get("ic3_dose").cloned() {
-            table.insert("ic31_ratio".to_string(), dose_ratio_pct(&ic3, &ic1));
-            table.insert("ic32_ratio".to_string(), dose_ratio_pct(&ic3, &ic2));
+    let mut derived = Vec::new();
+    for (out, left, right, combine) in [
+        (
+            "ic1_dose_err_pct",
+            "ic1_dose",
+            "target_mu",
+            dose_error_pct as fn(&[f32], &[f32]) -> Vec<f32>,
+        ),
+        ("ic2_dose_err_pct", "ic2_dose", "target_mu", dose_error_pct),
+        ("ic3_dose_err_pct", "ic3_dose", "target_mu", dose_error_pct),
+    ] {
+        if let Some(values) = paired(&table, left, right, combine) {
+            derived.push((out, values));
         }
     }
-    let mm = mm_pos.map(|values| values.map(|column| take_kept(&column, &keep)));
+    if let Some(values) = paired(&table, "ic2_dose", "ic1_dose", dose_ratio_pct) {
+        derived.push(("ic21_ratio", values));
+        if let Some(values) = paired(&table, "ic3_dose", "ic1_dose", dose_ratio_pct) {
+            derived.push(("ic31_ratio", values));
+        }
+        if let Some(values) = paired(&table, "ic3_dose", "ic2_dose", dose_ratio_pct) {
+            derived.push(("ic32_ratio", values));
+        }
+    }
+    for (key, values) in derived {
+        table.insert(key.to_string(), values);
+    }
+    let mm = mm_pos.map(|column| column.map(|column| take_kept(column.as_slice(), &keep)));
     store_positions(&mut table, mm);
     for (key, values) in sigma {
-        table.insert(key.to_string(), take_kept(&values, &keep));
+        table.insert(
+            key.to_string(),
+            map_kept(values, &keep, |value| value * 2.0),
+        );
     }
     let dir = discover::session_directory(root, session);
     if let Ok(xml) = std::fs::read_to_string(dir.join("config/map2map/devices.xml")) {
@@ -334,7 +460,7 @@ fn build_spot(
     }
     if let Some(beam) = column_any(&spot, &["beam_on", "rci_in_trigger", "r_beamOk"]) {
         if beam.len() >= n {
-            table.insert("beam_on".to_string(), take_kept(&beam, &keep));
+            table.insert("beam_on".to_string(), take_kept(beam, &keep));
         }
     }
     table
@@ -388,71 +514,118 @@ fn take_kept<T: Copy>(values: &[T], keep: &[bool]) -> Vec<T> {
         .collect()
 }
 
+fn map_kept(values: &[f32], keep: &[bool], mut map: impl FnMut(f32) -> f32) -> Vec<f32> {
+    values
+        .iter()
+        .zip(keep)
+        .filter(|(_, keep)| **keep)
+        .map(|(value, _)| map(*value))
+        .collect()
+}
+
+fn paired(
+    table: &BTreeMap<String, Vec<f32>>,
+    left: &str,
+    right: &str,
+    combine: fn(&[f32], &[f32]) -> Vec<f32>,
+) -> Option<Vec<f32>> {
+    Some(combine(table.get(left)?, table.get(right)?))
+}
+
+enum Measured<'a> {
+    Same(&'a [f32]),
+    Owned(Vec<f32>),
+}
+
+impl Measured<'_> {
+    fn as_slice(&self) -> &[f32] {
+        match self {
+            Measured::Same(values) => values,
+            Measured::Owned(values) => values,
+        }
+    }
+}
+
 fn store_positions(table: &mut BTreeMap<String, Vec<f32>>, mm: [Option<Vec<f32>>; 4]) {
-    let plans = [
-        table.get("plan_x").cloned(),
-        table.get("plan_y").cloned(),
-        table.get("plan_x").cloned(),
-        table.get("plan_y").cloned(),
-    ];
     let keys = [
-        ("ic1_x", "ic1_x_err"),
-        ("ic1_y", "ic1_y_err"),
-        ("ic2_x", "ic2_x_err"),
-        ("ic2_y", "ic2_y_err"),
+        ("ic1_x", "ic1_x_err", "plan_x"),
+        ("ic1_y", "ic1_y_err", "plan_y"),
+        ("ic2_x", "ic2_x_err", "plan_x"),
+        ("ic2_y", "ic2_y_err", "plan_y"),
     ];
-    for ((pos_key, err_key), (measured, plan)) in keys.into_iter().zip(mm.into_iter().zip(plans)) {
+    let mut errors = Vec::new();
+    for ((_, err_key, plan_key), measured) in keys.into_iter().zip(mm.iter()) {
         let Some(measured) = measured else {
             continue;
         };
-        if let Some(plan) = plan {
-            if plan.len() == measured.len() {
-                table.insert(
-                    err_key.to_string(),
-                    measured
-                        .iter()
-                        .zip(&plan)
-                        .map(|(measured, plan)| measured - plan)
-                        .collect(),
-                );
-            }
+        let Some(plan) = table.get(plan_key) else {
+            continue;
+        };
+        if plan.len() == measured.len() {
+            errors.push((
+                err_key,
+                measured
+                    .iter()
+                    .zip(plan)
+                    .map(|(measured, plan)| measured - plan)
+                    .collect::<Vec<_>>(),
+            ));
         }
+    }
+    for (key, values) in errors {
+        table.insert(key.to_string(), values);
+    }
+    let x_diff = match (mm[0].as_deref(), mm[2].as_deref()) {
+        (Some(ic1), Some(ic2)) => column_diff(ic1, ic2),
+        _ => Vec::new(),
+    };
+    let y_diff = match (mm[1].as_deref(), mm[3].as_deref()) {
+        (Some(ic1), Some(ic2)) => column_diff(ic1, ic2),
+        _ => Vec::new(),
+    };
+    for ((pos_key, _, _), measured) in keys.into_iter().zip(mm) {
+        let Some(measured) = measured else {
+            continue;
+        };
         table.insert(pos_key.to_string(), measured);
     }
-    if let (Some(a), Some(b)) = (table.get("ic1_x").cloned(), table.get("ic2_x").cloned()) {
-        table.insert(
-            "ic12_x_diff".to_string(),
-            b.iter().zip(&a).map(|(b, a)| b - a).collect(),
-        );
+    if !x_diff.is_empty() {
+        table.insert("ic12_x_diff".to_string(), x_diff);
     }
-    if let (Some(a), Some(b)) = (table.get("ic1_y").cloned(), table.get("ic2_y").cloned()) {
-        table.insert(
-            "ic12_y_diff".to_string(),
-            b.iter().zip(&a).map(|(b, a)| b - a).collect(),
-        );
+    if !y_diff.is_empty() {
+        table.insert("ic12_y_diff".to_string(), y_diff);
     }
 }
 
 /// Columns that participate in the row mask, plus mm positions when the frame resolves.
-fn spot_positions(spot: &Sheet, chamber: bool, n: usize) -> (Vec<Vec<f32>>, [Option<Vec<f32>>; 4]) {
+fn spot_positions<'a>(
+    spot: &'a Sheet,
+    chamber: bool,
+    n: usize,
+) -> (Vec<&'a [f32]>, [Option<Measured<'a>>; 4]) {
     if chamber {
-        if let Some(raw) = four_columns(spot, "spot_position_raw", n) {
+        if let Some(raw) = four_slices(spot, "spot_position_raw", n) {
             let mm = [
-                Some(g3_mm(&raw[0], false)),
-                Some(g3_mm(&raw[1], true)),
-                Some(g3_mm(&raw[2], true)),
-                Some(g3_mm(&raw[3], false)),
+                Some(Measured::Owned(g3_mm(raw[0], false))),
+                Some(Measured::Owned(g3_mm(raw[1], true))),
+                Some(Measured::Owned(g3_mm(raw[2], true))),
+                Some(Measured::Owned(g3_mm(raw[3], false))),
             ];
             return (raw.to_vec(), mm);
         }
-        if let Some(raw) = four_columns(spot, "spot_raw", n) {
+        if let Some(raw) = four_slices(spot, "spot_raw", n) {
             let ic1_x = raw[0].iter().copied().map(remap_g2_raw).collect::<Vec<_>>();
             let ic1_y = raw[1].iter().copied().map(remap_g2_raw).collect::<Vec<_>>();
-            let ic2_x = g2_ic2_mm(&ic1_x, &raw[2]);
-            let ic2_y = g2_ic2_mm(&ic1_y, &raw[3]);
+            let ic2_x = g2_ic2_mm(&ic1_x, raw[2]);
+            let ic2_y = g2_ic2_mm(&ic1_y, raw[3]);
             return (
                 raw.to_vec(),
-                [Some(ic1_x), Some(ic1_y), Some(ic2_x), Some(ic2_y)],
+                [
+                    Some(Measured::Owned(ic1_x)),
+                    Some(Measured::Owned(ic1_y)),
+                    Some(Measured::Owned(ic2_x)),
+                    Some(Measured::Owned(ic2_y)),
+                ],
             );
         }
     }
@@ -468,9 +641,9 @@ fn spot_positions(spot: &Sheet, chamber: bool, n: usize) -> (Vec<Vec<f32>>, [Opt
         if values.len() < n {
             continue;
         }
-        let values = values[..n].to_vec();
-        mask.push(values.clone());
-        mm[index] = Some(values);
+        let values = &values[..n];
+        mask.push(values);
+        mm[index] = Some(Measured::Same(values));
     }
     (mask, mm)
 }
@@ -488,7 +661,7 @@ fn g3_mm(raw: &[f32], reversed: bool) -> Vec<f32> {
         .collect()
 }
 
-fn spot_sigma(spot: &Sheet, prefer_raw: bool, n: usize) -> Vec<(&'static str, Vec<f32>)> {
+fn spot_sigma(spot: &Sheet, prefer_raw: bool, n: usize) -> Vec<(&'static str, &[f32])> {
     let order: &[&str] = if prefer_raw {
         &["spot_sigma_raw", "spot_sigma"]
     } else {
@@ -505,27 +678,22 @@ fn spot_sigma(spot: &Sheet, prefer_raw: bool, n: usize) -> Vec<(&'static str, Ve
             continue;
         };
         if values.len() >= n {
-            out.push((key, values[..n].iter().map(|value| value * 2.0).collect()));
+            out.push((key, &values[..n]));
         }
     }
     out
 }
 
-fn four_columns(spot: &Sheet, suffix: &str, n: usize) -> Option<[Vec<f32>; 4]> {
+fn four_slices<'a>(spot: &'a Sheet, suffix: &str, n: usize) -> Option<[&'a [f32]; 4]> {
     let mut out = Vec::new();
     for (ic, axis) in [("ic1", "x"), ("ic1", "y"), ("ic2", "x"), ("ic2", "y")] {
         let values = column_suffix(spot, ic, axis, &[suffix])?;
         if values.len() < n {
             return None;
         }
-        out.push(values[..n].to_vec());
+        out.push(&values[..n]);
     }
-    Some([
-        out[0].clone(),
-        out[1].clone(),
-        out[2].clone(),
-        out[3].clone(),
-    ])
+    Some([out[0], out[1], out[2], out[3]])
 }
 
 fn column_suffix<'a>(
@@ -649,9 +817,7 @@ fn insert_point_times(found: &mut HashMap<(u32, u32), f32>, sheet: &Sheet) {
 
 fn add_sigma_error(table: &mut BTreeMap<String, Vec<f32>>, xml: &str) {
     let bands = parse_sigma_bands(xml);
-    let Some(energy) = table.get("energy").cloned() else {
-        return;
-    };
+    let mut made = Vec::new();
     let mut pairs = Vec::new();
     for (key, device) in [
         ("ic1_sig_x", "IC_1_X"),
@@ -659,11 +825,11 @@ fn add_sigma_error(table: &mut BTreeMap<String, Vec<f32>>, xml: &str) {
         ("ic2_sig_x", "IC_2_X"),
         ("ic2_sig_y", "IC_2_Y"),
     ] {
-        let Some(measured) = table.get(key).cloned() else {
+        let (Some(energy), Some(measured)) = (table.get("energy"), table.get(key)) else {
             continue;
         };
         let mut error = Vec::with_capacity(measured.len());
-        for (sample, energy) in measured.iter().zip(&energy) {
+        for (sample, energy) in measured.iter().zip(energy) {
             match expected_mm(&bands, device, f64::from(*energy)) {
                 Some(expected) if sample.is_finite() => {
                     pairs.push(*energy);
@@ -673,7 +839,10 @@ fn add_sigma_error(table: &mut BTreeMap<String, Vec<f32>>, xml: &str) {
                 _ => error.push(f32::NAN),
             }
         }
-        table.insert(format!("{key}_err"), error);
+        made.push((format!("{key}_err"), error));
+    }
+    for (key, error) in made {
+        table.insert(key, error);
     }
     if !pairs.is_empty() {
         table.insert("expected_sigma".to_string(), pairs);
@@ -773,41 +942,57 @@ fn wall_time(spot: &Sheet, n: usize) -> Option<Vec<f64>> {
     Some(stamp.iter().take(n).map(|value| value / 1000.0).collect())
 }
 
-pub(crate) fn load_slice_metric(
+pub(crate) fn load_slice_metric(root: &Path, session: &str, _metric: &str, chamber: bool) -> Table {
+    let kind = if chamber {
+        "slice-chamber"
+    } else {
+        "slice-iso"
+    };
+    cached_timeslice(root, session, kind, true, Family::Geometry, |frames| {
+        build_slice_metric(root, session, chamber, frames)
+    })
+}
+
+fn build_slice_metric(
     root: &Path,
     session: &str,
-    _metric: &str,
     chamber: bool,
+    frames: &Frames,
 ) -> BTreeMap<String, Vec<f32>> {
-    let Some(map_bytes) = discover::read_session_file(root, session, "input_map.csv") else {
-        return BTreeMap::new();
-    };
-    let map = read_sheet(&map_bytes);
-    let spot =
-        discover::read_session_file(root, session, "spot_data.csv").map(|bytes| read_sheet(&bytes));
-    let frames = discover::read_timeslice_frames(&discover::session_directory(root, session));
-    let layer_of: Vec<i64> = frames.iter().map(|(index, _)| *index).collect();
-    let files: Vec<Vec<u8>> = frames.into_iter().map(|(_, bytes)| bytes).collect();
-    let sheets = read_sheets(&files, slice_column);
-    let energies = unique_seen(&column(&map, "energy", &[]));
-    let plan = plan_xy(&map);
-    let (axes, spot_shift) = iso_axes(spot.as_ref(), &plan, &sheets);
-    let mut energy = Vec::new();
-    let mut beam = Vec::new();
-    let mut ic1_x = Vec::new();
-    let mut ic1_y = Vec::new();
-    let mut ic2_x = Vec::new();
-    let mut ic2_y = Vec::new();
-    let mut ic1_x_mm = Vec::new();
-    let mut ic1_y_mm = Vec::new();
-    let mut ic2_x_mm = Vec::new();
-    let mut ic2_y_mm = Vec::new();
-    let mut sig = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
-    let mut sig_err = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
-    for (file_index, sheet) in sheets.iter().enumerate() {
+    let spot = discover::read_session_file(root, session, "spot_data.csv")
+        .map(|bytes| read_sheet_where(&bytes, spot_keep));
+    let plan = plan_xy(&frames.map);
+    let (axes, spot_shift) = iso_axes(spot.as_ref(), &plan, &frames.sheets);
+    let rows = frames
+        .sheets
+        .iter()
+        .map(|sheet| {
+            sheet
+                .num
+                .get("rci_in_trigger")
+                .or_else(|| sheet.num.get("r_beamOk"))
+                .map(Vec::len)
+                .unwrap_or(0)
+        })
+        .sum();
+    let mut energy = Vec::with_capacity(rows);
+    let mut beam = Vec::with_capacity(rows);
+    let mut plan_xs = Vec::with_capacity(rows);
+    let mut plan_ys = Vec::with_capacity(rows);
+    let mut ic1_x = Vec::with_capacity(rows);
+    let mut ic1_y = Vec::with_capacity(rows);
+    let mut ic2_x = Vec::with_capacity(rows);
+    let mut ic2_y = Vec::with_capacity(rows);
+    let mut ic1_x_mm = Vec::with_capacity(rows);
+    let mut ic1_y_mm = Vec::with_capacity(rows);
+    let mut ic2_x_mm = Vec::with_capacity(rows);
+    let mut ic2_y_mm = Vec::with_capacity(rows);
+    let mut sig: [Vec<f32>; 4] = std::array::from_fn(|_| Vec::with_capacity(rows));
+    let mut sig_err: [Vec<f32>; 4] = std::array::from_fn(|_| Vec::with_capacity(rows));
+    for (file_index, sheet) in frames.sheets.iter().enumerate() {
         let tagged = frame_energy(
-            &energies,
-            layer_of.get(file_index).copied().unwrap_or(-1),
+            &frames.energies,
+            frames.layers.get(file_index).copied().unwrap_or(-1),
             file_index,
         );
         let Some(trigger) = sheet
@@ -818,31 +1003,40 @@ pub(crate) fn load_slice_metric(
             continue;
         };
         let n = trigger.len();
+        let layer_col = sheet.num.get("layer_id").map(Vec::as_slice);
+        let spots_ic1 = first_column(sheet, &["spot_no.1", "spot_no"]);
+        let spots_ic2 = first_column(sheet, &["spot_no.2", "spot_no.1", "spot_no"]);
+        let bound = [
+            bind_axis(sheet, "ic1", "x"),
+            bind_axis(sheet, "ic1", "y"),
+            bind_axis(sheet, "ic2", "x"),
+            bind_axis(sheet, "ic2", "y"),
+        ];
+        let spot_of = [spots_ic1, spots_ic1, spots_ic2, spots_ic2];
+        let plan_x = [true, false, true, false];
         for row in 0..n {
             let on = trigger[row] > 0.5;
             beam.push(if on { 1.0 } else { 0.0 });
-            let layer = sheet
-                .num
-                .get("layer_id")
-                .and_then(|values| values.get(row))
-                .copied()
-                .unwrap_or(f32::NAN);
+            let layer = at(layer_col, row);
             energy.push(tagged);
-            let spot_ic1 = spot_index(sheet, &["spot_no.1", "spot_no"], row) + spot_shift;
-            let spot_ic2 =
-                spot_index(sheet, &["spot_no.2", "spot_no.1", "spot_no"], row) + spot_shift;
-            let measured = [
-                ("ic1", "x", "ic1_x", &axes[0], spot_ic1, 0usize),
-                ("ic1", "y", "ic1_y", &axes[1], spot_ic1, 1),
-                ("ic2", "x", "ic2_x", &axes[2], spot_ic2, 0),
-                ("ic2", "y", "ic2_y", &axes[3], spot_ic2, 1),
-            ];
+            let layer_bits = layer.to_bits();
+            let spot1 = at(spot_of[0], row) + spot_shift;
+            let spot2 = at(spot_of[2], row) + spot_shift;
+            let plan1 = plan.get(&(layer_bits, spot1.to_bits())).copied();
+            let (planned_x, planned_y) = plan1.unwrap_or((f32::NAN, f32::NAN));
+            plan_xs.push(planned_x);
+            plan_ys.push(planned_y);
+            let plan2 = if spot1.to_bits() == spot2.to_bits() {
+                plan1
+            } else {
+                plan.get(&(layer_bits, spot2.to_bits())).copied()
+            };
+            let planned_xy = [plan1, plan1, plan2, plan2];
             let mut mm = [f32::NAN; 4];
-            for (index, (ic, axis, axis_name, fit, spot_no, plan_axis)) in
-                measured.into_iter().enumerate()
-            {
-                let raw = slice_position(sheet, ic, axis, row);
-                let accepted = axis_ok(sheet, axis_name, row);
+            for index in 0..4 {
+                let axis = &bound[index];
+                let raw = at(axis.raw, row);
+                let accepted = axis_passes(axis, row);
                 mm[index] = if !accepted {
                     f32::NAN
                 } else if chamber {
@@ -851,7 +1045,7 @@ pub(crate) fn load_slice_metric(
                     } else {
                         f32::NAN
                     }
-                } else if let Some((slope, intercept)) = *fit {
+                } else if let Some((slope, intercept)) = axes[index] {
                     if raw.is_finite() && raw >= 0.0 {
                         slope * raw + intercept
                     } else {
@@ -860,9 +1054,8 @@ pub(crate) fn load_slice_metric(
                 } else {
                     f32::NAN
                 };
-                let planned = plan
-                    .get(&(layer.to_bits(), spot_no.to_bits()))
-                    .map(|xy| if plan_axis == 0 { xy.0 } else { xy.1 })
+                let planned = planned_xy[index]
+                    .map(|xy| if plan_x[index] { xy.0 } else { xy.1 })
                     .unwrap_or(f32::NAN);
                 let err = if mm[index].is_finite() && planned.is_finite() {
                     mm[index] - planned
@@ -888,13 +1081,19 @@ pub(crate) fn load_slice_metric(
                     }
                 }
             }
-            for (index, (ic, axis)) in [("ic1", "x"), ("ic1", "y"), ("ic2", "x"), ("ic2", "y")]
-                .into_iter()
-                .enumerate()
-            {
-                let value = slice_sigma(sheet, ic, axis, row);
+            for (index, axis) in bound.iter().enumerate() {
+                let value = at(axis.sigma, row);
+                let value = if !value.is_finite()
+                    || value <= 0.0
+                    || value > 20.0
+                    || !axis_passes(axis, row)
+                {
+                    f32::NAN
+                } else {
+                    value
+                };
                 sig[index].push(value);
-                let target = cell(sheet, &format!("{ic}_sigma_{axis}_target"), row);
+                let target = at(axis.sigma_target, row);
                 sig_err[index].push(if value.is_finite() && target.is_finite() && target > 0.0 {
                     value - target
                 } else {
@@ -917,26 +1116,23 @@ pub(crate) fn load_slice_metric(
     if energy.is_empty() {
         return table;
     }
-    // ponytail: a timeslice past 80k samples is strided. Raise the cap if a tail matters.
-    let step = (energy.len() / 80_000).max(1);
-    let take = |values: Vec<f32>| values.into_iter().step_by(step).collect::<Vec<_>>();
-    table.insert("energy".to_string(), take(energy));
-    table.insert("beam_on".to_string(), take(beam));
-    table.insert("ic1_x_err".to_string(), take(ic1_x));
-    table.insert("ic1_y_err".to_string(), take(ic1_y));
-    table.insert("ic2_x_err".to_string(), take(ic2_x));
-    table.insert("ic2_y_err".to_string(), take(ic2_y));
+    table.insert("energy".to_string(), energy);
+    table.insert("beam_on".to_string(), beam);
+    table.insert("ic1_x_err".to_string(), ic1_x);
+    table.insert("ic1_y_err".to_string(), ic1_y);
+    table.insert("ic2_x_err".to_string(), ic2_x);
+    table.insert("ic2_y_err".to_string(), ic2_y);
     for (key, values) in [
-        ("ic1_sig_x", sig[0].clone()),
-        ("ic1_sig_y", sig[1].clone()),
-        ("ic2_sig_x", sig[2].clone()),
-        ("ic2_sig_y", sig[3].clone()),
-        ("ic1_sig_x_err", sig_err[0].clone()),
-        ("ic1_sig_y_err", sig_err[1].clone()),
-        ("ic2_sig_x_err", sig_err[2].clone()),
-        ("ic2_sig_y_err", sig_err[3].clone()),
+        ("ic1_sig_x", std::mem::take(&mut sig[0])),
+        ("ic1_sig_y", std::mem::take(&mut sig[1])),
+        ("ic2_sig_x", std::mem::take(&mut sig[2])),
+        ("ic2_sig_y", std::mem::take(&mut sig[3])),
+        ("ic1_sig_x_err", std::mem::take(&mut sig_err[0])),
+        ("ic1_sig_y_err", std::mem::take(&mut sig_err[1])),
+        ("ic2_sig_x_err", std::mem::take(&mut sig_err[2])),
+        ("ic2_sig_y_err", std::mem::take(&mut sig_err[3])),
     ] {
-        table.insert(key.to_string(), take(values));
+        table.insert(key.to_string(), values);
     }
     let gap = |left: &[f32], right: &[f32]| {
         left.iter()
@@ -944,85 +1140,96 @@ pub(crate) fn load_slice_metric(
             .map(|(ic2, ic1)| ic2 - ic1)
             .collect::<Vec<_>>()
     };
-    table.insert("ic1_x".to_string(), take(ic1_x_mm.clone()));
-    table.insert("ic1_y".to_string(), take(ic1_y_mm.clone()));
-    table.insert("ic2_x".to_string(), take(ic2_x_mm.clone()));
-    table.insert("ic2_y".to_string(), take(ic2_y_mm.clone()));
-    table.insert("ic12_x_diff".to_string(), take(gap(&ic2_x_mm, &ic1_x_mm)));
-    table.insert("ic12_y_diff".to_string(), take(gap(&ic2_y_mm, &ic1_y_mm)));
+    let x_diff = gap(&ic2_x_mm, &ic1_x_mm);
+    let y_diff = gap(&ic2_y_mm, &ic1_y_mm);
+    table.insert("ic1_x".to_string(), ic1_x_mm);
+    table.insert("ic1_y".to_string(), ic1_y_mm);
+    table.insert("ic2_x".to_string(), ic2_x_mm);
+    table.insert("ic2_y".to_string(), ic2_y_mm);
+    table.insert("ic12_x_diff".to_string(), x_diff);
+    table.insert("ic12_y_diff".to_string(), y_diff);
+    if plan_xs.iter().any(|value| value.is_finite()) {
+        table.insert("plan_x".to_string(), plan_xs);
+        table.insert("plan_y".to_string(), plan_ys);
+    }
     table
 }
 
-pub(crate) fn cell(sheet: &Sheet, name: &str, row: usize) -> f32 {
-    sheet
-        .num
-        .get(name)
+struct AxisCols<'a> {
+    raw: Option<&'a [f32]>,
+    gate: Option<&'a [f32]>,
+    confidence: Option<&'a [f32]>,
+    error_code: Option<&'a [f32]>,
+    sigma: Option<&'a [f32]>,
+    sigma_target: Option<&'a [f32]>,
+}
+
+fn bind_axis<'a>(sheet: &'a Sheet, ic: &str, axis: &str) -> AxisCols<'a> {
+    let position = format!("r_{ic}_{axis}_position");
+    let spot_position = format!("r_{ic}_{axis}_spot_position");
+    let gates = [
+        format!("{ic}_{axis}_fit_ok"),
+        format!("r_{ic}_{axis}_spot_position_ok"),
+        format!("r_{ic}_{axis}_position_ok"),
+    ];
+    AxisCols {
+        raw: sheet
+            .num
+            .get(&position)
+            .or_else(|| sheet.num.get(&spot_position))
+            .map(Vec::as_slice),
+        gate: gates
+            .iter()
+            .find_map(|name| sheet.num.get(name))
+            .map(Vec::as_slice),
+        confidence: sheet
+            .num
+            .get(&format!("r_{ic}_{axis}_confidence"))
+            .map(Vec::as_slice),
+        error_code: sheet
+            .num
+            .get(&format!("r_{ic}_{axis}_spot_error_code"))
+            .map(Vec::as_slice),
+        sigma: sheet
+            .num
+            .get(&format!("r_{ic}_{axis}_sigma"))
+            .map(Vec::as_slice),
+        sigma_target: sheet
+            .num
+            .get(&format!("{ic}_sigma_{axis}_target"))
+            .map(Vec::as_slice),
+    }
+}
+
+fn first_column<'a>(sheet: &'a Sheet, names: &[&str]) -> Option<&'a [f32]> {
+    names
+        .iter()
+        .find_map(|name| sheet.num.get(*name))
+        .map(Vec::as_slice)
+}
+
+fn at(column: Option<&[f32]>, row: usize) -> f32 {
+    column
         .and_then(|values| values.get(row))
         .copied()
         .unwrap_or(f32::NAN)
 }
 
-/// Prefer `r_{ic}_{axis}_position`, then the device-units `r_{ic}_{axis}_spot_position`.
-fn slice_position(sheet: &Sheet, ic: &str, axis: &str, row: usize) -> f32 {
-    for name in [
-        format!("r_{ic}_{axis}_position"),
-        format!("r_{ic}_{axis}_spot_position"),
-    ] {
-        if sheet.num.contains_key(&name) {
-            return cell(sheet, &name, row);
-        }
-    }
-    f32::NAN
-}
-
-fn slice_sigma(sheet: &Sheet, ic: &str, axis: &str, row: usize) -> f32 {
-    let value = cell(sheet, &format!("r_{ic}_{axis}_sigma"), row);
-    if !value.is_finite() || value <= 0.0 || value > 20.0 {
-        return f32::NAN;
-    }
-    if !axis_ok(sheet, &format!("{ic}_{axis}"), row) {
-        return f32::NAN;
-    }
-    value
-}
-
-fn spot_index(sheet: &Sheet, names: &[&str], row: usize) -> f32 {
-    for name in names {
-        if sheet.num.contains_key(*name) {
-            return cell(sheet, name, row);
-        }
-    }
-    f32::NAN
-}
-
-/// Fit gate, then confidence and error-code. A missing column is ignored.
-/// The first present fit column wins: `{axis}_fit_ok`, then
-/// `r_{axis}_spot_position_ok`, then `r_{axis}_position_ok`.
-fn axis_ok(sheet: &Sheet, axis: &str, row: usize) -> bool {
-    let gates = [
-        format!("{axis}_fit_ok"),
-        format!("r_{axis}_spot_position_ok"),
-        format!("r_{axis}_position_ok"),
-    ];
-    if let Some(name) = gates
-        .iter()
-        .find(|name| sheet.num.contains_key(name.as_str()))
-    {
-        let value = cell(sheet, name, row);
+fn axis_passes(axis: &AxisCols<'_>, row: usize) -> bool {
+    if let Some(values) = axis.gate {
+        let value = values.get(row).copied().unwrap_or(f32::NAN);
         if !value.is_finite() || value == 0.0 {
             return false;
         }
     }
-    let confidence = format!("r_{axis}_confidence");
-    if sheet.num.contains_key(&confidence) {
-        let value = cell(sheet, &confidence, row);
+    if let Some(values) = axis.confidence {
+        let value = values.get(row).copied().unwrap_or(f32::NAN);
         if !value.is_finite() || value < 80.0 {
             return false;
         }
     }
-    let code = format!("r_{axis}_spot_error_code");
-    if sheet.num.contains_key(&code) {
-        let value = cell(sheet, &code, row);
+    if let Some(values) = axis.error_code {
+        let value = values.get(row).copied().unwrap_or(f32::NAN);
         if !value.is_finite() || value != 0.0 {
             return false;
         }
@@ -1068,7 +1275,7 @@ fn plan_xy(map: &Sheet) -> HashMap<(u32, u32), (f32, f32)> {
     let spot = column(map, "spot_no", &["spot_no"]);
     let x = column(map, "x_position", &["position_x", "X_POSITION", "x_pos"]);
     let y = column(map, "y_position", &["position_y", "Y_POSITION", "y_pos"]);
-    for (((layer, spot), x), y) in layer.iter().zip(&spot).zip(&x).zip(&y) {
+    for (((layer, spot), x), y) in layer.iter().zip(spot).zip(x).zip(y) {
         out.insert((layer.to_bits(), spot.to_bits()), (*x, *y));
     }
     out
@@ -1127,17 +1334,20 @@ fn plan_target_axes(
             continue;
         }
         let n = sheet.num.get("layer_id").map(Vec::len).unwrap_or(0);
+        let layer_col = sheet.num.get("layer_id").map(Vec::as_slice);
+        let spots = first_column(sheet, &["spot_no.1", "spot_no"]);
+        let cols = names.map(|name| sheet.num.get(name).map(Vec::as_slice));
         for row in 0..n {
-            let layer = cell(sheet, "layer_id", row);
-            let spot = spot_index(sheet, &["spot_no.1", "spot_no"], row);
+            let layer = at(layer_col, row);
+            let spot = at(spots, row);
             if !layer.is_finite() || !spot.is_finite() {
                 continue;
             }
             let sample = [
-                cell(sheet, names[0], row),
-                cell(sheet, names[1], row),
-                cell(sheet, names[2], row),
-                cell(sheet, names[3], row),
+                at(cols[0], row),
+                at(cols[1], row),
+                at(cols[2], row),
+                at(cols[3], row),
             ];
             if sample.iter().any(|value| !value.is_finite()) {
                 continue;
@@ -1277,37 +1487,177 @@ fn fit_strip_iso(strip: &[f32], iso: &[f32]) -> Option<(f32, f32)> {
     Some((slope, intercept))
 }
 
-fn timeslice_inputs(root: &Path, session: &str) -> Option<(Vec<Vec<u8>>, Vec<f32>, Vec<i64>)> {
-    let map_bytes = discover::read_session_file(root, session, "input_map.csv")?;
-    let map = read_sheet(&map_bytes);
-    let energies = unique_seen(&column(&map, "energy", &[]));
-    let frames = discover::read_timeslice_frames(&discover::session_directory(root, session));
-    if frames.is_empty() {
-        return None;
-    }
-    let layers = frames.iter().map(|(index, _)| *index).collect();
-    let files = frames.into_iter().map(|(_, bytes)| bytes).collect();
-    Some((files, energies, layers))
+pub(crate) fn load_timeslice(root: &Path, session: &str, metric: &str) -> Table {
+    cached_timeslice(
+        root,
+        session,
+        &format!("metric:{metric}"),
+        false,
+        Family::Signals,
+        |frames| {
+            if metric == "current_ratio" {
+                return current_ratio_from(&frames.sheets, &frames.energies, &frames.layers);
+            }
+            if matches!(
+                metric,
+                "fit_confidence" | "peak_amplitude" | "amplifier_error" | "probe_field"
+            ) {
+                return signal_from(&frames.sheets, &frames.energies, &frames.layers, metric);
+            }
+            current_from(&frames.sheets, &frames.energies, &frames.layers)
+        },
+    )
 }
 
-pub(crate) fn load_timeslice(
-    root: &Path,
-    session: &str,
-    metric: &str,
-) -> BTreeMap<String, Vec<f32>> {
-    let Some((files, energies, layer_of)) = timeslice_inputs(root, session) else {
-        return BTreeMap::new();
+/// Column names from the first line of the files for one grain.
+///
+/// The body stays unread. The picker uses these names and does not open a file.
+///
+/// ponytail: 32 header lists. A repeat plot (glyph, bins, filter) stats the same
+/// files and skips the directory walk. A changed length or mtime reads the line
+/// again. A timeslice file that is not there yet is not cached, so the next
+/// call still looks.
+const HEADER_CACHE_CAP: usize = 32;
+
+#[derive(Hash, PartialEq, Eq)]
+struct HeaderKey {
+    dir: PathBuf,
+    timeslice: bool,
+}
+
+struct HeaderEntry {
+    watched: Vec<(PathBuf, u128)>,
+    columns: Vec<String>,
+}
+
+fn header_cache() -> &'static Mutex<HashMap<HeaderKey, HeaderEntry>> {
+    static CACHE: OnceLock<Mutex<HashMap<HeaderKey, HeaderEntry>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub(crate) fn grain_columns(root: &Path, session: &str, timeslice: bool) -> Vec<String> {
+    let dir = discover::session_directory(root, session);
+    let key = HeaderKey {
+        dir: dir.clone(),
+        timeslice,
     };
-    if metric == "current_ratio" {
-        return current_ratio_table(&files, &energies, &layer_of);
+    if let Some(hit) = header_cache()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .get(&key)
+    {
+        if hit
+            .watched
+            .iter()
+            .all(|(path, stamp)| discover::meta_stamp(path) == *stamp)
+        {
+            return hit.columns.clone();
+        }
     }
-    if matches!(
-        metric,
-        "fit_confidence" | "peak_amplitude" | "amplifier_error" | "probe_field"
-    ) {
-        return signal_table(&files, &energies, &layer_of, metric);
+    let (columns, watched, cacheable) = read_grain_headers(&dir, timeslice);
+    if cacheable {
+        let mut cache = header_cache().lock().unwrap_or_else(|err| err.into_inner());
+        if cache.len() >= HEADER_CACHE_CAP {
+            cache.clear();
+        }
+        cache.insert(
+            key,
+            HeaderEntry {
+                watched,
+                columns: columns.clone(),
+            },
+        );
     }
-    current_table(&files, &energies, &layer_of)
+    columns
+}
+
+fn read_grain_headers(dir: &Path, timeslice: bool) -> (Vec<String>, Vec<(PathBuf, u128)>, bool) {
+    let mut names = Vec::new();
+    let mut watched = Vec::new();
+    let mut cacheable = true;
+    if timeslice {
+        if let Some(path) = first_named(dir, |name| {
+            name.ends_with("timeslice_data_device_units.csv")
+        }) {
+            names.extend(header_columns(&path));
+            watched.push(watch(&path));
+        } else {
+            cacheable = false;
+        }
+    } else {
+        let path = dir.join("spot_data.csv");
+        names.extend(header_columns(&path));
+        watched.push(watch(&path));
+    }
+    let map = dir.join("input_map.csv");
+    names.extend(header_columns(&map));
+    watched.push(watch(&map));
+    (names, watched, cacheable)
+}
+
+fn watch(path: &Path) -> (PathBuf, u128) {
+    let stamp = discover::meta_stamp(path);
+    (path.to_path_buf(), stamp)
+}
+
+fn header_columns(path: &Path) -> Vec<String> {
+    let Ok(file) = std::fs::File::open(path) else {
+        return Vec::new();
+    };
+    let mut line = String::new();
+    let Ok(read) = std::io::BufRead::read_line(&mut std::io::BufReader::new(file), &mut line)
+    else {
+        return Vec::new();
+    };
+    if read == 0 {
+        return Vec::new();
+    }
+    let line = line.trim_end_matches(['\r', '\n']);
+    let mut names = Vec::new();
+    let mut cursor = 0usize;
+    while let Some((start, end, next)) = next_cell(line, cursor) {
+        if next <= cursor {
+            break;
+        }
+        let name = cell_owned(line, start, end);
+        if !name.is_empty() {
+            names.push(name);
+        }
+        cursor = next;
+    }
+    names
+}
+
+fn first_named(dir: &Path, pred: impl Fn(&str) -> bool) -> Option<PathBuf> {
+    fn walk(dir: &Path, pred: &impl Fn(&str) -> bool, depth: u8) -> Option<PathBuf> {
+        let mut files = Vec::new();
+        let mut dirs = Vec::new();
+        for entry in std::fs::read_dir(dir).ok()?.flatten() {
+            let path = entry.path();
+            if path.is_file() {
+                files.push(path);
+            } else if path.is_dir() && depth < 4 {
+                dirs.push(path);
+            }
+        }
+        files.sort();
+        for path in files {
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            if pred(name) {
+                return Some(path);
+            }
+        }
+        dirs.sort();
+        for child in dirs {
+            if let Some(found) = walk(&child, pred, depth + 1) {
+                return Some(found);
+            }
+        }
+        None
+    }
+    walk(dir, &pred, 0)
 }
 
 pub(crate) fn timeslice_energy_only(metric: &str) -> bool {
@@ -1328,6 +1678,7 @@ fn frame_energy(energies: &[f32], layer_idx: i64, file_index: usize) -> f32 {
     energies.get(index).copied().unwrap_or(f32::NAN)
 }
 
+#[cfg(test)]
 pub(crate) fn signal_table(
     files: &[Vec<u8>],
     energies: &[f32],
@@ -1365,13 +1716,19 @@ fn signal_from(
         let mut stored = vec![Vec::new(); 6];
         for (index, sheet) in sheets.iter().enumerate() {
             let tag = frame_energy(energies, layers.get(index).copied().unwrap_or(-1), index);
+            let cmd_x = concept_col(sheet, "amplifier_cmd_x");
+            let read_x = concept_col(sheet, "amplifier_readback_x");
+            let cmd_y = concept_col(sheet, "amplifier_cmd_y");
+            let read_y = concept_col(sheet, "amplifier_readback_y");
+            let diff_x = column_diff(cmd_x, read_x);
+            let diff_y = column_diff(cmd_y, read_y);
             let columns = [
-                column_diff(sheet, "amplifier_cmd_x", "amplifier_readback_x"),
-                column_diff(sheet, "amplifier_cmd_y", "amplifier_readback_y"),
-                resolved_column(sheet, "amplifier_cmd_x"),
-                resolved_column(sheet, "amplifier_readback_x"),
-                resolved_column(sheet, "amplifier_cmd_y"),
-                resolved_column(sheet, "amplifier_readback_y"),
+                diff_x.as_slice(),
+                diff_y.as_slice(),
+                cmd_x,
+                read_x,
+                cmd_y,
+                read_y,
             ];
             append_samples(sheet, tag, &columns, &mut energy, &mut beam, &mut stored);
         }
@@ -1391,9 +1748,9 @@ fn signal_from(
     let mut stored = vec![Vec::new(); spec.len()];
     for (index, sheet) in sheets.iter().enumerate() {
         let tag = frame_energy(energies, layers.get(index).copied().unwrap_or(-1), index);
-        let columns: Vec<Vec<f32>> = spec
+        let columns: Vec<&[f32]> = spec
             .iter()
-            .map(|(_, concept)| resolved_column(sheet, concept))
+            .map(|(_, concept)| concept_col(sheet, concept))
             .collect();
         append_samples(sheet, tag, &columns, &mut energy, &mut beam, &mut stored);
     }
@@ -1405,23 +1762,20 @@ fn signal_from(
     signal_rows(energy, beam, &pairs)
 }
 
-fn resolved_column(sheet: &Sheet, concept: &str) -> Vec<f32> {
-    let keys: Vec<String> = sheet.num.keys().cloned().collect();
-    let Some(name) = resolve_concept_column(&keys, concept) else {
-        return Vec::new();
-    };
-    sheet.num.get(name).cloned().unwrap_or_default()
+fn concept_col<'a>(sheet: &'a Sheet, concept: &str) -> &'a [f32] {
+    find_header(sheet, concept, &[])
+        .and_then(|name| sheet.num.get(name))
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
 }
 
 /// Readback minus command. An axis is absent when either column is missing.
-fn column_diff(sheet: &Sheet, command: &str, readback: &str) -> Vec<f32> {
-    let command = resolved_column(sheet, command);
-    let readback = resolved_column(sheet, readback);
+fn column_diff(command: &[f32], readback: &[f32]) -> Vec<f32> {
     if command.is_empty() || readback.is_empty() {
         return Vec::new();
     }
     command
-        .into_iter()
+        .iter()
         .zip(readback)
         .map(|(command, readback)| {
             if command.is_finite() && readback.is_finite() {
@@ -1436,20 +1790,17 @@ fn column_diff(sheet: &Sheet, command: &str, readback: &str) -> Vec<f32> {
 fn append_samples(
     sheet: &Sheet,
     tag: f32,
-    columns: &[Vec<f32>],
+    columns: &[&[f32]],
     energy: &mut Vec<f32>,
     beam_out: &mut Vec<f32>,
     series_out: &mut [Vec<f32>],
 ) {
-    let n = columns.iter().map(Vec::len).max().unwrap_or(0);
+    let n = columns.iter().map(|column| column.len()).max().unwrap_or(0);
     if n == 0 {
         return;
     }
     let gate = column_any(sheet, &["rci_in_trigger", "r_beamOk", "beam_on"]);
-    // ponytail: one sample per stride past 80k rows. The plot is a distribution,
-    // so a uniform subsample keeps the shape; raise the cap if a tail matters.
-    let stride = (n / 80_000).max(1);
-    for sample in (0..n).step_by(stride) {
+    for sample in 0..n {
         let any = columns
             .iter()
             .any(|column| column.get(sample).copied().unwrap_or(f32::NAN).is_finite());
@@ -1461,8 +1812,7 @@ fn append_samples(
             out.push(column.get(sample).copied().unwrap_or(f32::NAN));
         }
         beam_out.push(
-            gate.as_ref()
-                .and_then(|values| values.get(sample).copied())
+            gate.and_then(|values| values.get(sample).copied())
                 .unwrap_or(1.0),
         );
     }
@@ -1487,14 +1837,6 @@ fn signal_rows(
     table
 }
 
-fn current_table(
-    files: &[Vec<u8>],
-    energies: &[f32],
-    layers: &[i64],
-) -> BTreeMap<String, Vec<f32>> {
-    current_from(&read_sheets(files, current_column), energies, layers)
-}
-
 fn current_from(sheets: &[Sheet], energies: &[f32], layers: &[i64]) -> BTreeMap<String, Vec<f32>> {
     let mut out_energy = Vec::new();
     let mut ic1 = Vec::new();
@@ -1509,10 +1851,7 @@ fn current_from(sheets: &[Sheet], energies: &[f32], layers: &[i64]) -> BTreeMap<
         let c = ic3_current(sheet);
         let gate = column_any(sheet, &["rci_in_trigger", "r_beamOk", "beam_on"]);
         let n = a.len().max(b.len()).max(c.len());
-        // ponytail: a timeslice past 80k samples is strided. Raise the cap if a
-        // chamber view needs every sample.
-        let stride = (n / 80_000).max(1);
-        for sample in (0..n).step_by(stride) {
+        for sample in 0..n {
             out_energy.push(tag);
             ic1.push(*a.get(sample).unwrap_or(&f32::NAN));
             ic2.push(*b.get(sample).unwrap_or(&f32::NAN));
@@ -1521,11 +1860,7 @@ fn current_from(sheets: &[Sheet], energies: &[f32], layers: &[i64]) -> BTreeMap<
                 any_ic3 = true;
             }
             ic3.push(part);
-            beam.push(
-                gate.as_ref()
-                    .and_then(|v| v.get(sample).copied())
-                    .unwrap_or(1.0),
-            );
+            beam.push(gate.and_then(|v| v.get(sample).copied()).unwrap_or(1.0));
         }
     }
     let mut table = BTreeMap::new();
@@ -1541,8 +1876,8 @@ fn current_from(sheets: &[Sheet], energies: &[f32], layers: &[i64]) -> BTreeMap<
     table
 }
 
-fn current_ratio_table(
-    files: &[Vec<u8>],
+fn current_ratio_from(
+    sheets: &[Sheet],
     energies: &[f32],
     layers: &[i64],
 ) -> BTreeMap<String, Vec<f32>> {
@@ -1551,14 +1886,13 @@ fn current_ratio_table(
     let mut ic31 = Vec::new();
     let mut ic32 = Vec::new();
     let mut any_ic3 = false;
-    let sheets = read_sheets(files, current_column);
     for (index, sheet) in sheets.iter().enumerate() {
         let tag = frame_energy(energies, layers.get(index).copied().unwrap_or(-1), index);
         let a = scaled_current(sheet, "ic1");
         let b = scaled_current(sheet, "ic2");
         let c = ic3_current(sheet);
         let gate = column_any(sheet, &["rci_in_trigger", "r_beamOk", "beam_on"]);
-        let plateau = |values: &[f32]| plateau_mean(values, gate.as_deref());
+        let plateau = |values: &[f32]| plateau_mean(values, gate);
         let left = plateau(&a);
         let right = plateau(&b);
         let third = plateau(&c);
@@ -1625,27 +1959,18 @@ fn scaled_current(sheet: &Sheet, ic: &str) -> Vec<f32> {
         format!("r_{ic}_current"),
         format!("{ic}_current"),
     ];
-    let keys: Vec<String> = sheet.num.keys().cloned().collect();
-    let header = resolve_concept_column(&keys, &format!("{ic}_current"))
-        .map(str::to_owned)
-        .or_else(|| {
-            fallback
-                .iter()
-                .find(|name| sheet.num.contains_key(name.as_str()))
-                .cloned()
-        });
-    let Some(header) = header else {
+    let extra: Vec<&str> = fallback.iter().map(String::as_str).collect();
+    let Some(header) = find_header(sheet, &format!("{ic}_current"), &extra) else {
         return Vec::new();
     };
-    let Some(values) = sheet.num.get(&header) else {
+    let Some(values) = sheet.num.get(header) else {
         return Vec::new();
     };
-    let factor = column_scale_factor(&header).unwrap_or(1.0) as f32;
+    let factor = column_scale_factor(header).unwrap_or(1.0) as f32;
     scale_column(values, factor)
 }
 
 pub(crate) fn ic3_current(sheet: &Sheet) -> Vec<f32> {
-    let keys: Vec<String> = sheet.num.keys().cloned().collect();
     let mut sum = Vec::new();
     for (concept, part) in [
         ("ic3_current_a", "a"),
@@ -1653,7 +1978,7 @@ pub(crate) fn ic3_current(sheet: &Sheet) -> Vec<f32> {
         ("ic3_current_c", "c"),
         ("ic3_current_d", "d"),
     ] {
-        let values = if let Some(header) = resolve_concept_column(&keys, concept) {
+        let values = if let Some(header) = find_header(sheet, concept, &[]) {
             let factor = column_scale_factor(header).unwrap_or(1.0) as f32;
             sheet
                 .num
@@ -1687,21 +2012,46 @@ pub(crate) fn ic3_current(sheet: &Sheet) -> Vec<f32> {
     }
 }
 
-pub(crate) fn column(sheet: &Sheet, concept: &str, extra: &[&str]) -> Vec<f32> {
-    let names: Vec<String> = sheet.num.keys().cloned().collect();
-    if let Some(found) = resolve_concept_column(&names, concept) {
-        if let Some(values) = sheet.num.get(found) {
-            return values.clone();
+fn find_header<'a>(sheet: &'a Sheet, concept: &str, extra: &[&str]) -> Option<&'a str> {
+    if let Some(name) = header_named(sheet, concept) {
+        return Some(name);
+    }
+    for candidate in scan_kit_core::concept_column_candidates(concept, None) {
+        if let Some(name) = header_named(sheet, &candidate) {
+            return Some(name);
         }
     }
     extra
         .iter()
-        .find_map(|name| sheet.num.get(*name).cloned())
-        .unwrap_or_default()
+        .find_map(|name| sheet.num.get_key_value(*name).map(|(key, _)| key.as_str()))
 }
 
-fn column_any(sheet: &Sheet, names: &[&str]) -> Option<Vec<f32>> {
-    names.iter().find_map(|name| sheet.num.get(*name).cloned())
+fn header_named<'a>(sheet: &'a Sheet, requested: &str) -> Option<&'a str> {
+    if let Some((name, _)) = sheet.num.get_key_value(requested) {
+        return Some(name);
+    }
+    let want = scan_kit_core::normalize_column_name(requested);
+    let mut found = None;
+    for name in sheet.num.keys() {
+        if scan_kit_core::normalize_column_name(name) == want {
+            found = Some(name.as_str());
+        }
+    }
+    found
+}
+
+pub(crate) fn column<'a>(sheet: &'a Sheet, concept: &str, extra: &[&str]) -> &'a [f32] {
+    find_header(sheet, concept, extra)
+        .and_then(|name| sheet.num.get(name))
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
+}
+
+fn column_any<'a>(sheet: &'a Sheet, names: &[&str]) -> Option<&'a [f32]> {
+    names
+        .iter()
+        .find_map(|name| sheet.num.get(*name))
+        .map(Vec::as_slice)
 }
 
 pub(crate) fn same(a: f32, b: f32) -> bool {
@@ -1901,6 +2251,10 @@ fn header_base(name: &str) -> &str {
     name.split('.').next().unwrap_or(name)
 }
 
+fn timeslice_keep(name: &str) -> bool {
+    timeline_column(name) || slice_column(name)
+}
+
 fn timeline_column(name: &str) -> bool {
     current_column(name) || signal_column(name)
 }
@@ -1971,6 +2325,68 @@ fn slice_column(name: &str) -> bool {
         || lower.contains("error_code")
 }
 
+fn keep_of(family: Family) -> fn(&str) -> bool {
+    match family {
+        Family::Signals => timeline_column,
+        Family::Geometry => slice_column,
+        Family::All => timeslice_keep,
+    }
+}
+
+fn spot_keep(name: &str) -> bool {
+    let lower = header_base(name).to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "layer_id"
+            | "spot_no"
+            | "beam_on"
+            | "rci_in_trigger"
+            | "r_beamok"
+            | "datetime"
+            | "timestamp"
+            | "time_s"
+            | "time_ns"
+    ) || lower.contains("dose")
+        || lower.contains("point_time")
+        || lower.contains("spot_position")
+        || lower.contains("spot_raw")
+        || lower.contains("spot_sigma")
+        || lower.contains("_spot")
+        || lower.contains("_position")
+        || lower.contains("_sigma")
+}
+
+fn parse_paths(listed: &[(i64, PathBuf)], keep: fn(&str) -> bool) -> Vec<Sheet> {
+    if listed.len() < 2 {
+        let bytes = std::fs::read(&listed[0].1).unwrap_or_default();
+        return vec![read_sheet_where(&bytes, keep)];
+    }
+    let workers = std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(1)
+        .clamp(1, listed.len());
+    let chunk = listed.len().div_ceil(workers);
+    let mut sheets = Vec::with_capacity(listed.len());
+    std::thread::scope(|scope| {
+        let mut joins = Vec::new();
+        for piece in listed.chunks(chunk) {
+            joins.push(scope.spawn(move || {
+                piece
+                    .iter()
+                    .map(|(_, path)| {
+                        let bytes = std::fs::read(path).unwrap_or_default();
+                        read_sheet_where(&bytes, keep)
+                    })
+                    .collect::<Vec<_>>()
+            }));
+        }
+        for join in joins {
+            sheets.extend(join.join().unwrap());
+        }
+    });
+    sheets
+}
+
 // ponytail: a few chunks, not a pool. Tens of timeslice files, not thousands.
 fn read_sheets(files: &[Vec<u8>], keep: fn(&str) -> bool) -> Vec<Sheet> {
     if files.len() < 2 {
@@ -2019,24 +2435,72 @@ pub(crate) fn read_sheet(bytes: &[u8]) -> Sheet {
     read_sheet_where(bytes, |_| true)
 }
 
+/// A few megabytes. Smaller files stay on one thread; the bench can move this.
+const PARALLEL_BYTES: usize = 4 * 1024 * 1024;
+
+#[derive(Clone, Copy)]
+enum Kind {
+    Skip,
+    Num,
+    Wide,
+    Clock,
+}
+
 /// Parse a device CSV without a `String` per cell.
 ///
 /// ponytail: the decimal scanner handles the padded fixed-point form these logs
 /// use. Scientific notation and non-finite tokens fall back to `str::parse`.
 /// `keep` drops columns a caller will not read. Strip columns stay dropped.
-fn read_sheet_where(bytes: &[u8], keep: impl Fn(&str) -> bool) -> Sheet {
-    let text = String::from_utf8_lossy(bytes);
-    let mut lines = text.lines();
-    let Some(header) = lines.next() else {
+/// A large file is split on newlines and parsed in row ranges.
+fn read_sheet_where(bytes: &[u8], keep: impl Fn(&str) -> bool + Sync) -> Sheet {
+    let text = match std::str::from_utf8(bytes) {
+        Ok(text) => std::borrow::Cow::Borrowed(text),
+        Err(_) => String::from_utf8_lossy(bytes),
+    };
+    let (header, body) = text.split_once('\n').unwrap_or((text.as_ref(), ""));
+    let header = header.trim_end_matches('\r');
+    if header.is_empty() {
         return Sheet {
             num: BTreeMap::new(),
             wide: BTreeMap::new(),
         };
+    }
+    let (names, kinds) = header_schema(header, &keep);
+    let parts = body_parts(body);
+    let slots = if parts.len() < 2 {
+        let mut slots = fresh_slots(&kinds);
+        fill_rows(body, &mut slots);
+        slots
+    } else {
+        let mut slots = Vec::new();
+        std::thread::scope(|scope| {
+            let mut joins = Vec::new();
+            for part in parts {
+                let kinds = &kinds;
+                joins.push(scope.spawn(move || {
+                    let mut slots = fresh_slots(kinds);
+                    fill_rows(part, &mut slots);
+                    slots
+                }));
+            }
+            for join in joins {
+                let part = join.join().unwrap();
+                if slots.is_empty() {
+                    slots = part;
+                } else {
+                    append_slots(&mut slots, part);
+                }
+            }
+        });
+        slots
     };
-    let rows = bytes.iter().filter(|byte| **byte == b'\n').count();
+    sheet_from(names, slots)
+}
+
+fn header_schema(header: &str, keep: &impl Fn(&str) -> bool) -> (Vec<Option<String>>, Vec<Kind>) {
     let mut used = HashMap::<String, ()>::new();
     let mut names = Vec::new();
-    let mut slots = Vec::new();
+    let mut kinds = Vec::new();
     let mut cursor = 0usize;
     while let Some((start, end, next)) = next_cell(header, cursor) {
         let name = cell_owned(header, start, end);
@@ -2044,27 +2508,74 @@ fn read_sheet_where(bytes: &[u8], keep: impl Fn(&str) -> bool) -> Sheet {
         // ponytail: strip columns are not a binned metric. Stop skipping them if one is.
         if name.is_empty() || base.to_ascii_lowercase().contains("strip") || !keep(&name) {
             names.push(None);
-            slots.push(Slot::Skip);
+            kinds.push(Kind::Skip);
         } else {
             let key = unique_header(&name, &mut used);
-            let slot = if base == "datetime" {
-                Slot::Clock(Vec::with_capacity(rows))
+            let kind = if base == "datetime" {
+                Kind::Clock
             } else if matches!(base, "timestamp" | "time_s" | "time_ns") {
-                Slot::Wide(Vec::with_capacity(rows))
+                Kind::Wide
             } else {
-                Slot::Num(Vec::with_capacity(rows))
+                Kind::Num
             };
             names.push(Some(key));
-            slots.push(slot);
+            kinds.push(kind);
         }
         if next <= cursor {
             break;
         }
         cursor = next;
     }
+    (names, kinds)
+}
+
+fn fresh_slots(kinds: &[Kind]) -> Vec<Slot> {
+    kinds
+        .iter()
+        .map(|kind| match kind {
+            Kind::Skip => Slot::Skip,
+            Kind::Num => Slot::Num(Vec::new()),
+            Kind::Wide => Slot::Wide(Vec::new()),
+            Kind::Clock => Slot::Clock(Vec::new()),
+        })
+        .collect()
+}
+
+fn body_parts(body: &str) -> Vec<&str> {
+    let workers = std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(1)
+        .clamp(2, 8);
+    if body.len() < PARALLEL_BYTES {
+        return vec![body];
+    }
+    let bytes = body.as_bytes();
+    let mut starts = vec![0usize];
+    let step = body.len() / workers;
+    for index in 1..workers {
+        let mut at = index * step;
+        while at < bytes.len() && bytes[at] != b'\n' {
+            at += 1;
+        }
+        if at < bytes.len() {
+            at += 1;
+        }
+        if at > *starts.last().unwrap_or(&0) && at < bytes.len() {
+            starts.push(at);
+        }
+    }
+    let mut parts = Vec::new();
+    for pair in starts.windows(2) {
+        parts.push(&body[pair[0]..pair[1]]);
+    }
+    parts.push(&body[*starts.last().unwrap_or(&0)..]);
+    parts
+}
+
+fn fill_rows(body: &str, slots: &mut [Slot]) {
     let mut seen = vec![0u32; slots.len()];
     let mut row = 1u32;
-    for line in lines {
+    for line in body.lines() {
         if line.trim().is_empty() {
             continue;
         }
@@ -2093,6 +2604,20 @@ fn read_sheet_where(bytes: &[u8], keep: impl Fn(&str) -> bool) -> Sheet {
             seen.fill(0);
         }
     }
+}
+
+fn append_slots(base: &mut [Slot], extra: Vec<Slot>) {
+    for (slot, more) in base.iter_mut().zip(extra) {
+        match (slot, more) {
+            (Slot::Num(values), Slot::Num(more)) => values.extend(more),
+            (Slot::Wide(values), Slot::Wide(more) | Slot::Clock(more)) => values.extend(more),
+            (Slot::Clock(values), Slot::Clock(more) | Slot::Wide(more)) => values.extend(more),
+            _ => {}
+        }
+    }
+}
+
+fn sheet_from(names: Vec<Option<String>>, slots: Vec<Slot>) -> Sheet {
     let mut num = BTreeMap::new();
     let mut wide = BTreeMap::new();
     for (name, slot) in names.into_iter().zip(slots) {
@@ -2375,5 +2900,209 @@ mod tests {
         );
         assert!((sheet.num["ENERGY"][0] - 250.0).abs() < 1e-3);
         assert!((sheet.num["ic1_total_dose_spot"][0] - 0.005551793).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_rewritten_timeslice_is_read_again() {
+        let root = std::env::temp_dir().join(format!(
+            "scan-kit-ts-cache-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let session = root.join("sess");
+        let file = session
+            .join("layer-0")
+            .join("run-0")
+            .join("timeslice_data_device_units.csv");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(session.join("input_map.csv"), "energy\n70\n").unwrap();
+        std::fs::write(&file, "r_ic1_current_dose,rci_in_trigger\n1,1\n").unwrap();
+        let first = merged_timeslice(&root, "sess");
+        assert_eq!(
+            first.get("r_ic1_current_dose").map(Vec::as_slice),
+            Some([1.0].as_slice())
+        );
+        assert_eq!(
+            merged_timeslice(&root, "sess")
+                .get("r_ic1_current_dose")
+                .map(Vec::as_slice),
+            Some([1.0].as_slice())
+        );
+        std::fs::write(&file, "r_ic1_current_dose,rci_in_trigger\n4,1\n5,1\n").unwrap();
+        assert_eq!(
+            merged_timeslice(&root, "sess")
+                .get("r_ic1_current_dose")
+                .map(Vec::as_slice),
+            Some([4.0, 5.0].as_slice())
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_rewritten_header_is_read_again() {
+        let root = std::env::temp_dir().join(format!(
+            "scan-kit-header-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let session = root.join("sess");
+        std::fs::create_dir_all(&session).unwrap();
+        let spot = session.join("spot_data.csv");
+        std::fs::write(&spot, "energy,ic1_total_dose\n").unwrap();
+        let first = grain_columns(&root, "sess", false);
+        assert!(first.iter().any(|name| name == "energy"));
+        assert!(first.iter().all(|name| name != "r_ic1_x_spot_sigma"));
+        std::fs::write(&spot, "energy,ic1_total_dose,r_ic1_x_spot_sigma\n").unwrap();
+        let second = grain_columns(&root, "sess", false);
+        assert!(second.iter().any(|name| name == "r_ic1_x_spot_sigma"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_large_spot_file_parses_in_order() {
+        let row = "1.5,2.5\n";
+        let rows = PARALLEL_BYTES / row.len() + 8;
+        let mut text = String::from("a,b\n");
+        for _ in 0..rows {
+            text.push_str(row);
+        }
+        let sheet = read_sheet(text.as_bytes());
+        let column = sheet.num.get("a").map(Vec::as_slice).unwrap_or(&[]);
+        assert_eq!(column.len(), rows);
+        assert!(column.iter().all(|value| (*value - 1.5).abs() < 1.0e-5));
+        assert_eq!(sheet.num.get("b").map(Vec::len), Some(rows));
+    }
+
+    #[test]
+    fn a_long_timeslice_keeps_every_sample() {
+        let root = std::env::temp_dir().join(format!("scan-kit-slice-all-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let session = root.join("sess");
+        std::fs::create_dir_all(session.join("layer-0/run-0")).unwrap();
+        std::fs::write(session.join("input_map.csv"), "energy,layer_id\n70,1\n").unwrap();
+        let rows = 80_001usize;
+        let mut text = String::from(
+            "layer_id,rci_in_trigger,r_ic1_x_position,r_ic1_x_confidence,ic1_x_fit_ok,r_ic1_x_spot_error_code,ic1_primary_channel\n",
+        );
+        for _ in 0..rows {
+            text.push_str("1,1,64,100,1,0,12\n");
+        }
+        std::fs::write(
+            session.join("layer-0/run-0/timeslice_data_device_units.csv"),
+            text,
+        )
+        .unwrap();
+        let position = load_slice_metric(&root, "sess", "position_error", true);
+        assert_eq!(position.get("ic1_x").map(Vec::len), Some(rows));
+        let current = load_timeslice(&root, "sess", "ic_current");
+        assert_eq!(current.get("ic1_current").map(Vec::len), Some(rows));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `SCAN_KIT_SESSION` is the session folder that contains `input_map.csv`.
+    ///
+    /// ```text
+    /// cargo test -p scan-kit-io --release --lib -- --ignored session_load_bench --nocapture
+    /// ```
+    #[test]
+    #[ignore]
+    fn session_load_bench() {
+        let dir = std::path::PathBuf::from(
+            std::env::var("SCAN_KIT_SESSION").expect("set SCAN_KIT_SESSION to a session folder"),
+        );
+        let session = dir
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let root = dir.parent().expect("session folder has a parent");
+        let spot_path = dir.join("spot_data.csv");
+        let paths = crate::discover::list_timeslice_paths(&dir);
+        let started = std::time::Instant::now();
+        let spot_bytes = std::fs::read(&spot_path).unwrap_or_default();
+        let mut slice_files = Vec::with_capacity(paths.len());
+        let mut slice_bytes = 0usize;
+        for (_, path) in &paths {
+            let bytes = std::fs::read(path).unwrap_or_default();
+            slice_bytes += bytes.len();
+            slice_files.push(bytes);
+        }
+        let read = started.elapsed();
+        let started = std::time::Instant::now();
+        let spot_sheet = read_sheet_where(&spot_bytes, spot_keep);
+        let parse_spot = started.elapsed();
+        let started = std::time::Instant::now();
+        let _signals = read_sheets(&slice_files, timeline_column);
+        let parse_signals = started.elapsed();
+        let started = std::time::Instant::now();
+        let _geometry = read_sheets(&slice_files, slice_column);
+        let parse_geometry = started.elapsed();
+        let started = std::time::Instant::now();
+        let spot = load_spot(root, &session, false, false, false);
+        let cold_spot = started.elapsed();
+        let started = std::time::Instant::now();
+        let current = load_timeslice(root, &session, "ic_current");
+        let cold_current = started.elapsed();
+        let started = std::time::Instant::now();
+        let position = load_slice_metric(root, &session, "position_error", false);
+        let cold_position = started.elapsed();
+        let started = std::time::Instant::now();
+        let _ = load_spot(root, &session, false, false, false);
+        let hit_spot = started.elapsed();
+        let started = std::time::Instant::now();
+        let _ = load_timeslice(root, &session, "ic_current");
+        let hit_current = started.elapsed();
+        let started = std::time::Instant::now();
+        let _ = load_slice_metric(root, &session, "position_error", false);
+        let hit_position = started.elapsed();
+        let mb = |bytes: usize, time: std::time::Duration| {
+            if time.as_secs_f64() == 0.0 {
+                0.0
+            } else {
+                bytes as f64 / time.as_secs_f64() / 1.0e6
+            }
+        };
+        println!(
+            "spot bytes {} columns {} rows {} | timeslice files {} bytes {}",
+            spot_bytes.len(),
+            spot_sheet.num.len(),
+            spot_sheet.num.values().map(Vec::len).max().unwrap_or(0),
+            paths.len(),
+            slice_bytes
+        );
+        println!(
+            "read {:.1} ms ({:.0} MB/s)",
+            read.as_secs_f64() * 1.0e3,
+            mb(spot_bytes.len() + slice_bytes, read)
+        );
+        println!(
+            "parse spot {:.1} ms ({:.0} MB/s), signals {:.1} ms ({:.0} MB/s), geometry {:.1} ms ({:.0} MB/s)",
+            parse_spot.as_secs_f64() * 1.0e3,
+            mb(spot_bytes.len(), parse_spot),
+            parse_signals.as_secs_f64() * 1.0e3,
+            mb(slice_bytes, parse_signals),
+            parse_geometry.as_secs_f64() * 1.0e3,
+            mb(slice_bytes, parse_geometry)
+        );
+        println!(
+            "cold spot {:.1} ms rows {} | current {:.1} ms rows {} | position {:.1} ms rows {}",
+            cold_spot.as_secs_f64() * 1.0e3,
+            spot.get("energy").map(Vec::len).unwrap_or(0),
+            cold_current.as_secs_f64() * 1.0e3,
+            current.get("energy").map(Vec::len).unwrap_or(0),
+            cold_position.as_secs_f64() * 1.0e3,
+            position.get("energy").map(Vec::len).unwrap_or(0)
+        );
+        println!(
+            "cache hit spot {:.3} ms | current {:.3} ms | position {:.3} ms",
+            hit_spot.as_secs_f64() * 1.0e3,
+            hit_current.as_secs_f64() * 1.0e3,
+            hit_position.as_secs_f64() * 1.0e3
+        );
     }
 }

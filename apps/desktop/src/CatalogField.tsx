@@ -12,7 +12,7 @@ import {
 } from "@/components/ui/select";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 
-export type CatalogChoice = { value: string; label: string; tooltip?: string };
+type CatalogChoice = { value: string; label: string; tooltip?: string };
 
 export type CatalogParam = {
   label: string;
@@ -40,13 +40,28 @@ export function catalogShown(
   );
 }
 
-function shortChoices(choices: CatalogChoice[] | undefined): boolean {
-  const labels = choices?.map((choice) => choice.label) ?? [];
+const BIN_BUTTONS = ["Auto", "8", "16", "32", "64"];
+
+/** Two or three short labels sit in a joined button row. Bin counts are the one five-item row. */
+export function segmentChoices(
+  options: readonly (string | { label: string; detail?: string })[],
+): boolean {
+  const labels = options.map((option) => (typeof option === "string" ? option : option.label));
+  if (
+    labels.length === BIN_BUTTONS.length &&
+    labels.every((label, index) => label === BIN_BUTTONS[index])
+  ) {
+    return true;
+  }
   return (
     labels.length >= 2 &&
-    labels.length <= 3 &&
-    labels.every((label) => label.length >= 1 && label.length <= 10)
+    labels.length < 4 &&
+    labels.every((option) => option.length > 0 && option.length <= 10)
   );
+}
+
+function shortChoices(choices: CatalogChoice[] | undefined): boolean {
+  return segmentChoices(choices?.map((choice) => choice.label) ?? []);
 }
 
 function ChoiceControl({

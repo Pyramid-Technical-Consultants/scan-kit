@@ -8,7 +8,7 @@ mod text;
 #[cfg(target_arch = "wasm32")]
 mod web;
 
-pub use payload::{encode_plot, plot_header, PlotHeader};
+pub use payload::{encode_plot, encode_plot_quality, plot_header, PlotHeader};
 #[cfg(not(target_arch = "wasm32"))]
 pub use render::render_plot;
 pub use render::{compile_plot_shader, plot_shader_source, Plot, PlotFrame, PlotInput};

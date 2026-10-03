@@ -6,6 +6,8 @@ import { Button } from "@/components/ui/button";
 import { Field, FieldLabel } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
 import { notify, notifyError, notifySaved } from "@/notify";
+import { ProgressHairline } from "@/progress-line";
+import { driveTask, type Report } from "@/task-client";
 
 type Enables = { start: boolean; pause: boolean; stop: boolean; reset: boolean };
 
@@ -61,10 +63,18 @@ export function PlanRunner() {
   const [dest, setDest] = useState("");
   const [view, setView] = useState<RunnerView>(IDLE);
   const [busy, setBusy] = useState(false);
+  const [copyReport, setCopyReport] = useState<Report | null>(null);
+  const copyToken = useRef<object>({});
   const busyRef = useRef(false);
   const inflight = useRef(false);
   const hasPlan = useRef(false);
   const destRef = useRef("");
+
+  useEffect(() => {
+    return () => {
+      copyToken.current = {};
+    };
+  }, []);
 
   useEffect(() => {
     void invoke<Catalog>("scan_kit_runner_catalog")
@@ -205,7 +215,28 @@ export function PlanRunner() {
       return;
     }
     await run(async () => {
-      await invoke("scan_kit_runner_download", { dest });
+      const mine = {};
+      copyToken.current = mine;
+      await driveTask(
+        {
+          view: "runner_copy",
+          path: dest,
+          sessionIds: [],
+          options: { dest },
+          background: [],
+          foreground: [],
+          palette: [],
+        },
+        (report) => {
+          if (copyToken.current === mine) {
+            setCopyReport(report.finished ? null : report);
+          }
+        },
+        () => copyToken.current !== mine,
+      );
+      if (copyToken.current !== mine) {
+        return;
+      }
       notifySaved(dest, { title: "Session saved" });
     });
   }
@@ -234,7 +265,15 @@ export function PlanRunner() {
   const csvName = csvPath.length > 0 ? fileName(csvPath) : "No plan selected";
 
   return (
-    <div className="flex min-h-0 flex-1 flex-col gap-4 overflow-auto p-4">
+    <div className="relative flex min-h-0 flex-1 flex-col gap-4 overflow-auto p-4">
+      {copyReport != null && !copyReport.finished ? (
+        <>
+          <ProgressHairline done={copyReport.done} total={copyReport.total} />
+          {copyReport.note.length > 0 ? (
+            <p className="text-muted-foreground text-sm">{copyReport.note}</p>
+          ) : null}
+        </>
+      ) : null}
       <div className="flex max-w-3xl flex-col gap-3">
         <Field>
           <FieldLabel>RCI host</FieldLabel>

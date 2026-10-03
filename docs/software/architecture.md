@@ -83,6 +83,8 @@ Tabular data, including the session list and Session Log Compare, is drawn by [G
 
 The Analysis menu opens a view when one to five sessions are selected. Controls are shadcn components added with `shadcn add` (Select and Field for choices), not native form elements. A control change calls `scan_kit_open_plot`, which returns one binary payload: a JSON header (controls, table, samples, panel frames) and the encoded marks. The webview loads that payload into `scan-kit-plot` built for wasm32 and draws on the canvas with WebGPU, or WebGL2 where WebGPU is missing. Wheel, drag, hover, and resize stay in the webview. No frame crosses the Tauri bridge. `scan_kit_run_view` renders the same `Plot` offscreen and returns one base64 frame for MCP and tests, colored from the stock tokens. Audio Explorer plays and exports the open plot's samples with Web Audio. Dose Volume can open a DICOM folder through `scan_kit_open_study`.
 
+A plotted series contains every sample that passed the view's filters. Nothing drops rows before the camera exists: no fixed stride, bucket count, or point cap on a line or a scatter. Histograms, contours, and spectra still reduce the samples, and they count every sample that passed the filter. The renderer may later simplify a stroke for the current camera when several samples fall in one pixel. That simplification keeps the extrema in the pixel, and a camera that gives a sample its own pixel draws the sample. Zoom and pan stay in the webview, so a thinned payload can never grow back.
+
 No custom CSS for color, radius, type, or spacing. A unique visual style, when it exists, is a deliberate change to the shadcn theme, not one-off overrides in a feature change.
 
 ## Numeric work
@@ -90,6 +92,8 @@ No custom CSS for color, radius, type, or spacing. A unique visual style, when i
 `wgpu` is the only GPU library. Drawing lives in `scan-kit-plot`, which builds natively and for `wasm32-unknown-unknown` from one source and one WGSL shader. The analytic splat, ray march, gamma, DVH, resample, and Monte Carlo transport shaders live in `scan-kit-compute`. Nothing else links `wgpu`. Marks are stored as `vec3` in data space. One `clip_from_data` matrix places them, and a later orbit or volume writes that same matrix. The shader stays inside the WebGL2 downlevel limits: no nonzero base instance and one color target. Series hover is a CPU hit test on the same marks. The native path reads a frame back as RGBA for MCP. The readback test skips the dispatch when the machine has no adapter and still compiles the shader. The no-adapter picture projects the same buffers.
 
 No dataframe crate and no ORM. Session columns are `Vec<f32>` or `Vec<i32>`, parsed in one pass.
+
+A view that takes long enough to block the window runs as a task: one bounded slice per poll, one progress report, and cancel by generation. Plot payloads stay the binary scene the webview already draws. The slice rules, the Monte Carlo preview contract, and the view faces are in [progressive-loading.md](progressive-loading.md).
 
 ## Session data
 

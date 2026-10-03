@@ -21,6 +21,42 @@ it("reads the JSON header in front of the mark bytes", () => {
   expect(plotHeader(shifted.subarray(3)).samples).toEqual([1]);
 });
 
+it("reads a string option and a noted option", () => {
+  const header = plotHeader(
+    payload(
+      {
+        title: "Dose",
+        controls: [
+          {
+            id: "y",
+            label: "Y",
+            group: "Data Source",
+            options: [
+              "Energy",
+              {
+                id: "dose_error",
+                label: "Dose Error (%)",
+                detail: "Measured against target",
+                icon: "dose_error",
+              },
+            ],
+            value: "Dose Error (%)",
+          },
+        ],
+        table: null,
+        samples: [],
+        panels: [],
+      },
+      [],
+    ).subarray(0),
+  );
+  expect(header.controls[0]?.group).toBe("Data Source");
+  expect(header.controls[0]?.kind).toBe("");
+  expect(header.controls[0]?.options[0]).toEqual({ id: "Energy", label: "Energy", detail: "", icon: "" });
+  expect(header.controls[0]?.options[1]?.detail).toBe("Measured against target");
+  expect(header.controls[0]?.options[1]?.icon).toBe("dose_error");
+});
+
 it("rejects a payload shorter than its header", () => {
   expect(() => plotHeader(payload({ title: "x" }, []).subarray(0, 8))).toThrow("truncated");
 });

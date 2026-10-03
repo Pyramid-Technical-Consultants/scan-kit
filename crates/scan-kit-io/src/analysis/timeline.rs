@@ -8,9 +8,8 @@ use scan_kit_core::{
 use serde_json::Value;
 
 use super::{
-    channel_pairs_of, choice_control, choose, col, drew_line, finite_col, load_csv, panel,
-    percentile_sorted, placed, scene, session_text, span, spot_table, stroke, timeline,
-    timeslice_metric, MARK,
+    col, drew_line, finite_col, finite_names, load_csv, panel, percentile_sorted, placed, scene,
+    session_text, span, spot_table, stroke, timeline, timeslice_metric, MARK,
 };
 
 /// Timeslice rows are 1 ms apart.
@@ -18,15 +17,15 @@ const SAMPLE_S: f32 = 0.001;
 
 pub(super) fn replay(root: &Path, session_ids: &[String], options: &Value) -> PlotScene {
     let tables = timeline(root, session_ids);
-    let pairs = channel_pairs_of(&tables);
-    let channel = choose(options, "channel", "ic1_current", &pairs);
-    let label = pairs
+    let owned = finite_names(session_ids, &tables);
+    let headers: Vec<crate::source::SessionCols<'_>> = owned
         .iter()
-        .find(|(id, _)| id == &channel)
-        .map(|(_, label)| label.clone())
-        .unwrap_or_else(|| channel.clone());
-    let mut overview = Vec::new();
-    let mut detail = Vec::new();
+        .map(|(name, columns)| crate::source::SessionCols { name, columns })
+        .collect();
+    let picked = crate::source::select(crate::source::Shape::Y, false, true, &headers, options);
+    let channel = picked.y.clone();
+    let label = crate::source::channel_text(&channel);
+    let mut series = Vec::new();
     let mut xmax = SAMPLE_S;
     let mut ymin = f32::MAX;
     let mut ymax = f32::MIN;
@@ -42,25 +41,18 @@ pub(super) fn replay(root: &Path, session_ids: &[String], options: &Value) -> Pl
             ymin = ymin.min(lo);
             ymax = ymax.max(hi);
         }
-        let (xs, ys) = envelope(samples, 480);
-        overview.push(stroke(xs, ys, false));
-        let (xs, ys) = indexed(samples, 4000);
-        detail.push(stroke(xs, ys, false));
+        let (xs, ys) = trace(samples);
+        series.push(stroke(xs, ys, false));
     }
     let mut panels = Vec::new();
-    if drew_line(&overview) {
+    if drew_line(&series) {
         if ymin > ymax {
             ymin = 0.0;
             ymax = 1.0;
         }
-        panels.push(time_panel("Overview", overview, xmax, ymin, ymax, &label));
-        panels.push(time_panel("Detail", detail, xmax, ymin, ymax, &label));
+        panels.push(time_panel(&label, series, xmax, ymin, ymax, &label));
     }
-    let mut scene = scene(
-        "Timeslice Replay",
-        panels,
-        vec![choice_control("channel", "Channel", &pairs, &channel)],
-    );
+    let mut scene = scene("Timeslice Replay", panels, picked.controls);
     scene.columns = 1;
     scene
 }
@@ -72,10 +64,12 @@ pub(super) fn rampdown(root: &Path, session_ids: &[String]) -> PlotScene {
         ("IC2", "ic2_current"),
         ("IC3", "ic3_current"),
     ] {
+        let tables = crate::tables::map_sessions(session_ids, |session| {
+            timeslice_metric(root, session, "ic_current")
+        });
         let mut series = Vec::new();
         let mut windows_panels = Vec::new();
-        for session in session_ids {
-            let table = timeslice_metric(root, session, "ic_current");
+        for (session, table) in session_ids.iter().zip(tables) {
             let Some(samples) = col(&table, key) else {
                 continue;
             };
@@ -142,10 +136,13 @@ pub(super) fn amplifier(root: &Path, session_ids: &[String]) -> PlotScene {
         ("X", "amp_cmd_x", "amp_read_x"),
         ("Y", "amp_cmd_y", "amp_read_y"),
     ] {
+        let tables = crate::tables::map_sessions(session_ids, |session| {
+            timeslice_metric(root, session, "amplifier_error")
+        });
+        let spots = crate::tables::map_sessions(session_ids, |session| spot_table(root, session));
         let mut series = Vec::new();
         let mut arcs = Vec::new();
-        for session in session_ids {
-            let table = timeslice_metric(root, session, "amplifier_error");
+        for ((session, table), spots) in session_ids.iter().zip(tables).zip(spots) {
             let Some(cmd) = col(&table, cmd_key) else {
                 continue;
             };
@@ -202,7 +199,6 @@ pub(super) fn amplifier(root: &Path, session_ids: &[String]) -> PlotScene {
                     vec![Series::heatmap(counts, 24, 24)],
                 ));
             }
-            let spots = spot_table(root, session);
             let ic1 = finite_col(&spots, "ic1_x");
             let ic2 = finite_col(&spots, "ic2_x");
             if let (Some(ic1), Some(ic2)) = (ic1, ic2) {
@@ -231,8 +227,8 @@ pub(super) fn amplifier(root: &Path, session_ids: &[String]) -> PlotScene {
 }
 
 pub(super) fn hv_transient(root: &Path, session_ids: &[String]) -> PlotScene {
-    let mut panels = Vec::new();
-    for session in session_ids {
+    let groups = crate::tables::map_sessions(session_ids, |session| {
+        let mut panels = Vec::new();
         for device in ["IC1", "IC2", "IC3"] {
             let path = format!("ic_hv_toggle/{device}_HCC.csv");
             let columns = load_csv(root, session, &path);
@@ -283,6 +279,11 @@ pub(super) fn hv_transient(root: &Path, session_ids: &[String]) -> PlotScene {
                 }],
             ));
         }
+        panels
+    });
+    let mut panels = Vec::new();
+    for group in groups {
+        panels.extend(group);
     }
     scene("IC HV Transient Test", panels, Vec::new())
 }
@@ -318,52 +319,14 @@ fn time_panel(
     panel
 }
 
-fn indexed(samples: &[f32], target: usize) -> (Vec<f32>, Vec<f32>) {
-    let step = (samples.len() / target.max(1)).max(1);
+/// One point per sample. Time is the row index, so a gap stays where the file has one.
+pub(super) fn trace(samples: &[f32]) -> (Vec<f32>, Vec<f32>) {
     (
         (0..samples.len())
-            .step_by(step)
-            .map(|i| i as f32 * SAMPLE_S)
+            .map(|index| index as f32 * SAMPLE_S)
             .collect(),
-        (0..samples.len())
-            .step_by(step)
-            .map(|i| samples[i])
-            .collect(),
+        samples.to_vec(),
     )
-}
-
-/// Min and max of each bucket, so a pulse narrower than the stride still draws.
-pub(super) fn envelope(samples: &[f32], buckets: usize) -> (Vec<f32>, Vec<f32>) {
-    let n = samples.len();
-    if n == 0 {
-        return (Vec::new(), Vec::new());
-    }
-    let buckets = buckets.max(1).min(n);
-    let mut xs = Vec::with_capacity(buckets * 2);
-    let mut ys = Vec::with_capacity(buckets * 2);
-    for bucket in 0..buckets {
-        let start = bucket * n / buckets;
-        let end = ((bucket + 1) * n / buckets).max(start + 1).min(n);
-        let mut lo = f32::INFINITY;
-        let mut hi = f32::NEG_INFINITY;
-        for value in &samples[start..end] {
-            if value.is_finite() {
-                lo = lo.min(*value);
-                hi = hi.max(*value);
-            }
-        }
-        if !lo.is_finite() {
-            continue;
-        }
-        let x = start as f32 * SAMPLE_S;
-        xs.push(x);
-        ys.push(lo);
-        if hi > lo {
-            xs.push(x);
-            ys.push(hi);
-        }
-    }
-    (xs, ys)
 }
 
 /// 0.5% tails. One ADC spike was setting the axis and the trace sat on the frame.

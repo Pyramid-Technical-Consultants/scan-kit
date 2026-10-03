@@ -38,6 +38,8 @@ import { Button } from "@/components/ui/button";
 import { DebugLog } from "@/DebugLog";
 import { installDebugLog } from "@/debug-log";
 import { dismissNotice, logError, notify, notifyError } from "@/notify";
+import { ProgressHairline } from "@/progress-line";
+import { driveTask, type Report } from "@/task-client";
 import { selectionFromLibrary } from "@/session-colors";
 import { type CheckPaint } from "@/session-checkbox";
 import { SessionContextMenu } from "@/session-menu";
@@ -177,11 +179,11 @@ export default function App() {
   const [analysis, setAnalysis] = useState<string | null>(null);
   const [sessionMenu, setSessionMenu] = useState<SessionMenu | null>(null);
   const [selectionOrder, setSelectionOrder] = useState<string[]>([]);
+  const [libraryReport, setLibraryReport] = useState<Report | null>(null);
+  const libraryToken = useRef<object>({});
   const selectedIds = selectionOrder;
   const canAnalyze = folder != null && selectedIds.length >= 1 && selectedIds.length <= MAX_SELECTED;
   const host = useRef<HTMLDivElement>(null);
-  const folderRef = useRef<string | null>(null);
-  folderRef.current = folder;
 
   const order = useMemo(() => {
     const indexes = rows.map((_, index) => index);
@@ -199,23 +201,58 @@ export default function App() {
   );
 
   const loadFolder = useCallback(async (path: string) => {
-    const opened = await invoke<{ root: string; rows: LibraryRow[]; selected?: string[] }>(
-      "scan_kit_open_library",
-      { path },
+    const mine = {};
+    libraryToken.current = mine;
+    await driveTask(
+      {
+        view: "library",
+        path,
+        sessionIds: [],
+        options: {},
+        background: [],
+        foreground: [],
+        palette: [],
+      },
+      (report, payload) => {
+        if (libraryToken.current !== mine) {
+          return;
+        }
+        setLibraryReport(report.finished ? null : report);
+        if (payload == null) {
+          return;
+        }
+        const opened = JSON.parse(new TextDecoder().decode(payload)) as {
+          root: string;
+          rows: LibraryRow[];
+          selected?: string[];
+        };
+        if (report.finished) {
+          setFolder(opened.root);
+          setRows(opened.rows);
+          setSelectionOrder(selectionFromLibrary(opened.rows, opened.selected));
+          dismissNotice();
+          setUndo([]);
+          setRedo([]);
+        } else if (opened.rows.length > 0) {
+          setFolder(opened.root);
+          setRows(opened.rows);
+        }
+      },
+      () => libraryToken.current !== mine,
     );
-    setFolder(opened.root);
-    setRows(opened.rows);
-    setSelectionOrder(selectionFromLibrary(opened.rows, opened.selected));
-    dismissNotice();
-    setUndo([]);
-    setRedo([]);
   }, []);
 
   useEffect(() => {
     installDebugLog();
-    setTheme(gridTheme());
-    setChecks(checkPaint());
     let active = true;
+    // Theme reads CSS variables from the document, so it waits until after this commit.
+    const frame = requestAnimationFrame(() => {
+      if (!active) {
+        return;
+      }
+      setTheme(gridTheme());
+      setChecks(checkPaint());
+    });
     invoke<About>("scan_kit_about")
       .then((value) => {
         if (active) {
@@ -252,6 +289,8 @@ export default function App() {
       });
     return () => {
       active = false;
+      libraryToken.current = {};
+      cancelAnimationFrame(frame);
     };
   }, [loadFolder]);
 
@@ -365,8 +404,7 @@ export default function App() {
   );
 
   const commitSelection = useCallback((next: { ids: string[]; capped: boolean }) => {
-    const path = folderRef.current;
-    if (path == null) {
+    if (folder == null) {
       return;
     }
     const same =
@@ -378,7 +416,7 @@ export default function App() {
       }
       return;
     }
-    void invoke("scan_kit_select_sessions", { path, sessionIds: next.ids })
+    void invoke("scan_kit_select_sessions", { path: folder, sessionIds: next.ids })
       .then(() => {
         const chosen = new Set(next.ids);
         setSelectionOrder(next.ids);
@@ -390,7 +428,7 @@ export default function App() {
         }
       })
       .catch((error: unknown) => notifyError(error));
-  }, [selectionOrder]);
+  }, [folder, selectionOrder]);
 
   const onRowCheck = useCallback(
     (sessionId: string, checked: boolean) => {
@@ -411,15 +449,14 @@ export default function App() {
   }, [commitSelection, displayIds, rows.length, selectedIds]);
 
   const writeNote = useCallback(async (sessionId: string, note: string) => {
-    const path = folderRef.current;
-    if (path == null) {
+    if (folder == null) {
       return;
     }
-    await invoke("scan_kit_set_note", { path, sessionId, note });
+    await invoke("scan_kit_set_note", { path: folder, sessionId, note });
     setRows((current) =>
       current.map((row) => (row.session_id === sessionId ? { ...row, note } : row)),
     );
-  }, []);
+  }, [folder]);
 
   const commitNote = useCallback(
     (edit: NoteEdit) => {
@@ -462,7 +499,17 @@ export default function App() {
   }
 
   return (
-    <div className="flex h-full min-h-0 flex-col overflow-hidden bg-background text-foreground">
+    <div className="relative flex h-full min-h-0 flex-col overflow-hidden bg-background text-foreground">
+      {libraryReport != null && !libraryReport.finished ? (
+        <>
+          <ProgressHairline done={libraryReport.done} total={libraryReport.total} />
+          {libraryReport.note.length > 0 ? (
+            <p className="text-muted-foreground pointer-events-none absolute top-1 right-3 z-10 text-xs">
+              {libraryReport.note}
+            </p>
+          ) : null}
+        </>
+      ) : null}
       <Tabs
         value={tab}
         onValueChange={(value) => {

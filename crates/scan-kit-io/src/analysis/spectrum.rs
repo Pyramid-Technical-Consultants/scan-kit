@@ -3,7 +3,7 @@ use std::path::Path;
 use scan_kit_core::{welch_psd, PlotScene};
 use serde_json::Value;
 
-use super::{channel_pairs_of, choice_control, choose, placed, scene, stroke, timeline};
+use super::{finite_names, placed, scene, stroke, timeline};
 
 pub(super) fn fft_view(root: &Path, session_ids: &[String], options: &Value) -> PlotScene {
     spectrum(root, session_ids, options, false)
@@ -15,8 +15,13 @@ pub(super) fn audio_view(root: &Path, session_ids: &[String], options: &Value) -
 
 fn spectrum(root: &Path, session_ids: &[String], options: &Value, audio: bool) -> PlotScene {
     let tables = timeline(root, session_ids);
-    let pairs = channel_pairs_of(&tables);
-    let channel = choose(options, "channel", "ic1_current", &pairs);
+    let owned = finite_names(session_ids, &tables);
+    let headers: Vec<crate::source::SessionCols<'_>> = owned
+        .iter()
+        .map(|(name, columns)| crate::source::SessionCols { name, columns })
+        .collect();
+    let picked = crate::source::select(crate::source::Shape::Y, false, true, &headers, options);
+    let channel = picked.y.clone();
     let mut series = Vec::new();
     let mut played = Vec::new();
     for (index, columns) in tables.iter().enumerate() {
@@ -59,7 +64,7 @@ fn spectrum(root: &Path, session_ids: &[String], options: &Value, audio: bool) -
             "FFT Explorer"
         },
         panels,
-        vec![choice_control("channel", "Channel", &pairs, &channel)],
+        picked.controls,
     );
     scene.samples = played;
     scene

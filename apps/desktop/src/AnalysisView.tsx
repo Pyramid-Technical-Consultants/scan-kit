@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { createElement, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { ArrowLeft, Download, Play } from "lucide-react";
@@ -11,15 +11,25 @@ import {
 } from "@glideapps/glide-data-grid";
 import { gridTheme, tokenColor } from "@/grid-theme";
 
-import { controlDisabled, controlSections, segmentChoices, type ControlSlot } from "@/analysis-controls";
+import {
+  applyOption,
+  controlDisabled,
+  controlSections,
+  segmentChoices,
+  type ControlSlot,
+  type GrainMemory,
+} from "@/analysis-controls";
 import { AnalysisMenu, analysisId, analysisName } from "@/analysis-menu";
 import { ButtonSegmentGroup } from "@/components/button-segment-group";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
-import { Field, FieldContent, FieldDescription, FieldLabel, FieldLegend, FieldSet } from "@/components/ui/field";
+import { Field, FieldLabel, FieldLegend, FieldSet } from "@/components/ui/field";
+import { SessionList } from "@/session-list";
 import { optionIcon } from "@/option-icons";
 import { backingSize, plotHeader, type PlotHeader, type ViewControl } from "@/plot-header";
+import { ProgressHairline } from "@/progress-line";
 import { sessionColor, shownSessionIds } from "@/session-colors";
+import { acceptReport, bytesOf, parsePoll, type Report } from "@/task-client";
 import { dismissNotice, notifyError } from "@/notify";
 import { SidePane } from "@/SidePane";
 import {
@@ -71,14 +81,22 @@ function palette(order: readonly string[], shown: readonly string[]): number[][]
   return shown.map((id) => parseColor(sessionColor(Math.max(0, order.indexOf(id)))));
 }
 
-function wavBlob(samples: number[]): Blob {
-  const rate = 8000;
+const AUDIO_RATE = 8000;
+const AUDIO_HOLD = 8;
+
+function heldSamples(samples: readonly number[]): number[] {
   const held: number[] = [];
   for (const sample of samples) {
-    for (let i = 0; i < 8; i += 1) {
+    for (let i = 0; i < AUDIO_HOLD; i += 1) {
       held.push(sample);
     }
   }
+  return held;
+}
+
+function wavBlob(samples: number[]): Blob {
+  const rate = AUDIO_RATE;
+  const held = heldSamples(samples);
   const bytes = new ArrayBuffer(44 + held.length * 2);
   const view = new DataView(bytes);
   const write = (offset: number, text: string) => {
@@ -107,15 +125,10 @@ function wavBlob(samples: number[]): Blob {
 }
 
 async function playSamples(samples: number[]) {
-  const rate = 8000;
-  const context = new AudioContext({ sampleRate: rate });
-  const buffer = context.createBuffer(1, samples.length * 8, rate);
-  const channel = buffer.getChannelData(0);
-  samples.forEach((sample, index) => {
-    for (let i = 0; i < 8; i += 1) {
-      channel[index * 8 + i] = sample;
-    }
-  });
+  const held = heldSamples(samples);
+  const context = new AudioContext({ sampleRate: AUDIO_RATE });
+  const buffer = context.createBuffer(1, held.length, AUDIO_RATE);
+  buffer.getChannelData(0).set(held);
   const source = context.createBufferSource();
   source.buffer = buffer;
   source.connect(context.destination);
@@ -129,6 +142,29 @@ function messageOf(reason: unknown): string {
   return reason instanceof Error ? reason.message : String(reason);
 }
 
+function ChoiceIcon({ name, icon }: { name: string; icon?: string }) {
+  const found =
+    (icon != null && icon.length > 0 ? optionIcon(icon) : undefined) ?? optionIcon(name);
+  return found == null ? null : createElement(found);
+}
+
+function ChoiceFace({
+  label,
+  detail,
+  icon,
+}: {
+  label: string;
+  detail: string;
+  icon: string;
+}) {
+  return (
+    <span className="flex min-w-0 items-center gap-1.5" title={detail.length > 0 ? detail : undefined}>
+      <ChoiceIcon name={label} icon={icon} />
+      <span className="truncate">{label}</span>
+    </span>
+  );
+}
+
 function ChoiceSelect({
   control,
   value,
@@ -140,8 +176,8 @@ function ChoiceSelect({
   disabled?: boolean;
   onChange: (value: string) => void;
 }) {
-  const items = control.options.map((option) => ({ label: option, value: option }));
-  const Icon = optionIcon(value);
+  const items = control.options.map((option) => ({ ...option, value: option.label }));
+  const selected = items.find((item) => item.value === value) ?? items[0];
   return (
     <Select
       items={items}
@@ -154,24 +190,37 @@ function ChoiceSelect({
       }}
     >
       <SelectTrigger size="sm" className="w-full cursor-pointer">
-        {Icon == null ? null : <Icon />}
-        <SelectValue />
+        <SelectValue>
+          {selected == null ? null : (
+            <ChoiceFace label={selected.label} detail={selected.detail} icon={selected.icon} />
+          )}
+        </SelectValue>
       </SelectTrigger>
       <SelectContent>
         <SelectGroup>
-          {items.map((item) => {
-            const ItemIcon = optionIcon(item.value);
-            return (
-              <SelectItem key={item.value} value={item.value}>
-                {ItemIcon == null ? null : <ItemIcon />}
-                {item.label}
-              </SelectItem>
-            );
-          })}
+          {items.map((item) => (
+            <SelectItem key={item.value} value={item.value}>
+              <ChoiceFace label={item.label} detail={item.detail} icon={item.icon} />
+            </SelectItem>
+          ))}
         </SelectGroup>
       </SelectContent>
     </Select>
   );
+}
+
+function slotRows(slots: readonly ControlSlot[]): { inline: boolean; slots: ControlSlot[] }[] {
+  const rows: { inline: boolean; slots: ControlSlot[] }[] = [];
+  for (const slot of slots) {
+    const last = rows[rows.length - 1];
+    if (slot.kind === "check" && last != null && last.slots.every((item) => item.kind === "check")) {
+      last.slots.push(slot);
+      last.inline = true;
+      continue;
+    }
+    rows.push({ inline: false, slots: [slot] });
+  }
+  return rows;
 }
 
 export function AnalysisView({
@@ -191,9 +240,13 @@ export function AnalysisView({
   const canvas = useRef<HTMLCanvasElement>(null);
   const plotter = useRef<Plotter | null>(null);
   const payload = useRef<Uint8Array | null>(null);
+  const hold = useRef(0);
+  const taskId = useRef(0);
+  const [taskReport, setTaskReport] = useState<Report | null>(null);
   const frame = useRef(0);
   const openSeq = useRef(0);
   const [options, setOptions] = useState<Record<string, string>>({});
+  const grains = useRef<GrainMemory>({});
   const [hidden, setHidden] = useState<string[]>([]);
   const [meta, setMeta] = useState<PlotHeader | null>(null);
   const [plotError, setPlotError] = useState<string | null>(null);
@@ -308,43 +361,80 @@ export function AnalysisView({
   const orderKey = sessions.map((session) => session.id).join("\0");
   const hiddenKey = hidden.join("\0");
   useEffect(() => {
+    const mine = hold.current + 1;
+    hold.current = mine;
     const ticket = openSeq.current + 1;
     openSeq.current = ticket;
     const order = orderKey === "" ? [] : orderKey.split("\0");
     const shown = shownSessionIds(order, hiddenKey === "" ? [] : hiddenKey.split("\0"));
     const plotOptions =
       viewId === "dose_volume" && studyPath != null ? { ...options, study: studyPath } : options;
+    let stop = false;
     const timer = window.setTimeout(() => {
       setPlotError(null);
-      void invoke<ArrayBuffer | Uint8Array>("scan_kit_open_plot", {
-        view: viewId,
-        path: folder,
-        sessionIds: shown,
-        options: plotOptions,
-        background: parseColor(tokenColor("--background")),
-        foreground: parseColor(tokenColor("--foreground")),
-        palette: palette(order, shown),
-      })
-        .then((result) => {
-          if (openSeq.current !== ticket) {
+      void (async () => {
+        const started = await invoke<{ task: number; generation: number }>("scan_kit_start", {
+          view: viewId,
+          path: folder,
+          sessionIds: shown,
+          options: plotOptions,
+          background: parseColor(tokenColor("--background")),
+          foreground: parseColor(tokenColor("--foreground")),
+          palette: palette(order, shown),
+        });
+        if (stop || openSeq.current !== ticket) {
+          await invoke("scan_kit_cancel", { task: started.task });
+          return;
+        }
+        taskId.current = started.task;
+        for (;;) {
+          if (stop || openSeq.current !== ticket) {
             return;
           }
-          const bytes = result instanceof Uint8Array ? result : new Uint8Array(result);
-          setPlotError(null);
-          setMeta(plotHeader(bytes));
-          payload.current = bytes;
-          loadPayload();
-          dismissNotice("analysis");
-        })
-        .catch((reason: unknown) => {
-          if (openSeq.current === ticket) {
-            const message = messageOf(reason);
-            setPlotError(message);
-            notifyError(message, "analysis");
+          const raw = await invoke<ArrayBuffer | Uint8Array>("scan_kit_poll", { task: started.task });
+          if (stop || openSeq.current !== ticket) {
+            return;
           }
-        });
+          const parsed = parsePoll(bytesOf(raw));
+          if (!acceptReport(parsed.report, started.task, started.generation)) {
+            continue;
+          }
+          setTaskReport(parsed.report.finished ? null : parsed.report);
+          if (parsed.payload != null) {
+            setPlotError(null);
+            setMeta(plotHeader(parsed.payload));
+            payload.current = parsed.payload;
+            loadPayload();
+            dismissNotice("analysis");
+          }
+          if (parsed.report.finished) {
+            if (parsed.report.phase === "failed") {
+              const message = parsed.report.note.length > 0 ? parsed.report.note : "The plot failed.";
+              setPlotError(message);
+              notifyError(message, "analysis");
+            }
+            return;
+          }
+        }
+      })().catch((reason: unknown) => {
+        if (openSeq.current === ticket) {
+          const message = messageOf(reason);
+          setPlotError(message);
+          notifyError(message, "analysis");
+        }
+      });
     }, 150);
-    return () => window.clearTimeout(timer);
+    return () => {
+      stop = true;
+      window.clearTimeout(timer);
+      const id = taskId.current;
+      queueMicrotask(() => {
+        if (hold.current === mine && id !== 0) {
+          taskId.current = 0;
+          void invoke("scan_kit_cancel", { task: id });
+        }
+      });
+    };
   }, [viewId, folder, orderKey, hiddenKey, options, studyPath]);
 
   useEffect(() => {
@@ -409,16 +499,13 @@ export function AnalysisView({
   const resolved: Record<string, string> = {};
   for (const control of controls) {
     const stored = options[control.id];
-    resolved[control.id] =
-      stored != null && control.options.includes(stored) ? stored : control.value;
+    const known = control.options.some((option) => option.label === stored);
+    resolved[control.id] = stored != null && known ? stored : control.value;
   }
   const byId = new Map(controls.map((control) => [control.id, control]));
-  const sections = controlSections(
-    viewId,
-    controls.map((control) => control.id),
-  );
+  const sections = controlSections(controls);
   const apply = (id: string, value: string) => {
-    setOptions((current) => ({ ...current, [id]: value }));
+    setOptions((current) => applyOption(current, resolved, grains.current, id, value));
   };
 
   const table = meta?.table;
@@ -431,17 +518,25 @@ export function AnalysisView({
     allowOverlay: false,
   });
 
-  const renderSlot = (slot: ControlSlot) => {
+  const renderSlot = (slot: ControlSlot, inline = false) => {
     const control = byId.get(slot.id);
     if (control == null) {
       return null;
     }
     const value = resolved[slot.id] ?? control.value;
-    const label = slot.label ?? control.label;
+    const label = control.label;
     const disabled = controlDisabled(slot.id, resolved);
     if (slot.kind === "check") {
       return (
-        <Field key={slot.id} orientation="horizontal" className={disabled ? "opacity-50" : undefined}>
+        <Field
+          key={slot.id}
+          orientation="horizontal"
+          className={
+            [inline ? "min-w-0 flex-1" : null, disabled ? "opacity-50" : null]
+              .filter((item) => item != null)
+              .join(" ") || undefined
+          }
+        >
           <Checkbox
             id={`analysis-${slot.id}`}
             className="cursor-pointer"
@@ -449,7 +544,11 @@ export function AnalysisView({
             disabled={disabled}
             onCheckedChange={(checked) => apply(slot.id, checked ? "On" : "Off")}
           />
-          <FieldLabel className="cursor-pointer" htmlFor={`analysis-${slot.id}`}>
+          <FieldLabel
+            className="cursor-pointer [&_svg:not([class*='size-'])]:size-4"
+            htmlFor={`analysis-${slot.id}`}
+          >
+            {inline ? <ChoiceIcon name={label} /> : null}
             {label}
           </FieldLabel>
         </Field>
@@ -470,9 +569,6 @@ export function AnalysisView({
         onChange={(next) => apply(slot.id, next)}
       />
     );
-    if (slot.kind === "bare") {
-      return <div key={slot.id}>{widget}</div>;
-    }
     return (
       <Field
         key={slot.id}
@@ -488,7 +584,10 @@ export function AnalysisView({
   return (
     <SidePane
       main={
-      <div ref={host} className="bg-background flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
+      <div ref={host} className="bg-background relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
+        {taskReport != null && !taskReport.finished ? (
+          <ProgressHairline done={taskReport.done} total={taskReport.total} />
+        ) : null}
         {table != null && table.rows.length > 0 ? (
           <DataEditor
             width={size.width}
@@ -507,6 +606,11 @@ export function AnalysisView({
         )}
         <div className={shown ? "relative min-h-0 flex-1" : "hidden"}>
           <canvas ref={canvas} className="absolute inset-0 h-full w-full touch-none" />
+          {taskReport != null && !taskReport.finished && taskReport.note.length > 0 ? (
+            <p className="text-muted-foreground pointer-events-none absolute bottom-2 left-2 text-xs">
+              {taskReport.note}
+            </p>
+          ) : null}
         </div>
       </div>
       }
@@ -528,51 +632,29 @@ export function AnalysisView({
           />
         </div>
         <div className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto p-3">
-        <FieldSet className="gap-2 rounded-lg border border-border p-3">
-          <FieldLegend variant="label">Sessions</FieldLegend>
-          {sessions.map((session, index) => {
-            const checked = !hidden.includes(session.id);
-            const color = sessionColor(index);
-            const inputId = `analysis-session-${session.id}`;
-            return (
-              <Field key={session.id} orientation="horizontal">
-                <Checkbox
-                  id={inputId}
-                  className="cursor-pointer"
-                  checked={checked}
-                  aria-label={`Include ${session.id}`}
-                  title={
-                    checked
-                      ? `Session color in plots: ${color}`
-                      : `Hidden. Check to draw ${session.id} in ${color}`
-                  }
-                  style={
-                    checked
-                      ? { backgroundColor: color, borderColor: color, color: "#fff" }
-                      : { borderColor: color }
-                  }
-                  onCheckedChange={(next) => {
-                    setHidden((current) =>
-                      next ? current.filter((id) => id !== session.id) : [...current, session.id],
-                    );
-                  }}
-                />
-                <FieldContent className="min-w-0">
-                  <FieldLabel htmlFor={inputId} className="w-full cursor-pointer truncate">
-                    {session.id}
-                  </FieldLabel>
-                  {session.note === "" ? null : (
-                    <FieldDescription className="truncate">{session.note}</FieldDescription>
-                  )}
-                </FieldContent>
-              </Field>
-            );
-          })}
-        </FieldSet>
-        {sections.map((section) => (
-          <FieldSet key={section.title} className="gap-2 rounded-lg border border-border p-3">
+        <SessionList
+          sessions={sessions}
+          isChecked={(id) => !hidden.includes(id)}
+          onCheckedChange={(id, next) => {
+            setHidden((current) => (next ? current.filter((item) => item !== id) : [...current, id]));
+          }}
+        />
+        {sections.map((section, index) => (
+          <FieldSet key={`${section.title}-${index}`} className="gap-2 rounded-lg border border-border p-3">
             <FieldLegend variant="label">{section.title}</FieldLegend>
-            {section.slots.map((slot) => renderSlot(slot))}
+            {slotRows(section.slots).map((row) => {
+              const lead = row.slots[0];
+              if (lead == null) {
+                return null;
+              }
+              return row.inline ? (
+                <div key={lead.id} className="flex flex-row gap-3">
+                  {row.slots.map((slot) => renderSlot(slot, true))}
+                </div>
+              ) : (
+                renderSlot(lead)
+              );
+            })}
           </FieldSet>
         ))}
         {(meta?.samples.length ?? 0) > 0 ? (
