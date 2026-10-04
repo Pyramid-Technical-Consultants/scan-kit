@@ -1,6 +1,8 @@
 //! One driver for every long desktop task.
 //!
-//! A poll does one slice and may return a plot payload. `open_plot` drains the
+//! A poll publishes one picture and may return a plot payload. The first timed
+//! poll is one window. Each later timed poll doubles that window, still
+//! publishing every time, and reads only the new bytes. `open_plot` drains the
 //! same stage with an unlimited budget, so a one-shot call still returns the
 //! scene it returns today.
 
@@ -9,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant, UNIX_EPOCH};
+use std::time::{Duration, UNIX_EPOCH};
 
 use scan_kit_core::{encode_poll, Cancel, McJob, McResult, Phase, PlotScene, Poll, Report, Volume};
 use scan_kit_plot::encode_plot_quality;
@@ -33,7 +35,9 @@ trait Stage: Send {
 struct Running {
     generation: u64,
     cancel: Cancel,
-    stage: Box<dyn Stage>,
+    /// Taken out for the duration of a poll so cancel and a new start do not
+    /// wait on the encode.
+    stage: Option<Box<dyn Stage>>,
 }
 
 #[derive(Default)]
@@ -117,9 +121,11 @@ pub fn start_task(
     if matches!(slot, Slot::Plot) {
         if let Some(id) = driver.plot {
             if let Some(task) = driver.tasks.get_mut(&id) {
-                if !task.cancel.is_cancelled() && task.stage.retarget(options, palette) {
-                    task.generation = task.generation.saturating_add(1);
-                    return Ok(json!({ "task": id, "generation": task.generation }));
+                if let Some(stage) = task.stage.as_mut() {
+                    if !task.cancel.is_cancelled() && stage.retarget(options, palette) {
+                        task.generation = task.generation.saturating_add(1);
+                        return Ok(json!({ "task": id, "generation": task.generation }));
+                    }
                 }
             }
         }
@@ -136,50 +142,75 @@ pub fn start_task(
         Running {
             generation: 1,
             cancel: Cancel::new(),
-            stage,
+            stage: Some(stage),
         },
     );
     Ok(json!({ "task": id, "generation": 1 }))
 }
 
 pub fn poll_task(id: u64) -> Result<Vec<u8>, String> {
-    let mut driver = lock();
-    let (bytes, remove) = {
+    let (mut stage, cancel, generation) = {
+        let mut driver = lock();
         let Some(task) = driver.tasks.get_mut(&id) else {
             return Ok(encode_poll(&ended(id, 0, Phase::Cancelled, ""), None, true));
         };
-        let cancel = task.cancel.clone();
-        let generation = task.generation;
-        let outcome = task.stage.poll(POLL_BUDGET, &cancel);
-        let mut report = task.stage.report();
-        report.task = id;
-        report.generation = generation;
-        let (finished, payload, remove) = match outcome {
-            Poll::Pending { preview, .. } => (false, preview, false),
-            Poll::Ready(bytes) => {
-                report.phase = Phase::Done;
-                (true, Some(bytes), true)
-            }
-            Poll::Cancelled => {
-                report.phase = Phase::Cancelled;
-                report.note.clear();
-                (true, None, true)
-            }
-            Poll::Failed(message) => {
-                report.phase = Phase::Failed;
-                if report.note.is_empty() {
-                    report.note = message;
-                }
-                (true, None, true)
-            }
+        let Some(stage) = task.stage.take() else {
+            return Ok(encode_poll(
+                &ended(id, task.generation, Phase::Scene, ""),
+                None,
+                false,
+            ));
         };
-        (encode_poll(&report, payload.as_deref(), finished), remove)
+        (stage, task.cancel.clone(), task.generation)
     };
+    let outcome = stage.poll(POLL_BUDGET, &cancel);
+    let mut report = stage.report();
+    report.task = id;
+    report.generation = generation;
+    let (finished, payload, remove) = match outcome {
+        Poll::Pending { preview, .. } => (false, preview, false),
+        Poll::Ready(bytes) => {
+            report.phase = Phase::Done;
+            (true, Some(bytes), true)
+        }
+        Poll::Cancelled => {
+            report.phase = Phase::Cancelled;
+            report.note.clear();
+            (true, None, true)
+        }
+        Poll::Failed(message) => {
+            report.phase = Phase::Failed;
+            if report.note.is_empty() {
+                report.note = message;
+            }
+            (true, None, true)
+        }
+    };
+    let mut driver = lock();
+    let Some(current) = driver.tasks.get(&id).map(|task| task.generation) else {
+        return Ok(encode_poll(
+            &ended(id, generation, Phase::Cancelled, ""),
+            None,
+            true,
+        ));
+    };
+    if current != generation {
+        if let Some(task) = driver.tasks.get_mut(&id) {
+            task.stage = Some(stage);
+        }
+        return Ok(encode_poll(
+            &ended(id, generation, Phase::Cancelled, ""),
+            None,
+            true,
+        ));
+    }
     if remove {
         driver.tasks.remove(&id);
         driver.clear(id);
+    } else if let Some(task) = driver.tasks.get_mut(&id) {
+        task.stage = Some(stage);
     }
-    Ok(bytes)
+    Ok(encode_poll(&report, payload.as_deref(), finished))
 }
 
 pub fn cancel_task(id: u64) {
@@ -279,6 +310,18 @@ fn report_at(phase: Phase, done: usize, total: usize) -> Report {
     }
 }
 
+struct FilePlan {
+    bytes: u64,
+    chunks: usize,
+    filled: usize,
+}
+
+struct SessionPlan {
+    id: String,
+    timeslice: bool,
+    files: Vec<FilePlan>,
+}
+
 struct SessionStage {
     view: String,
     root: PathBuf,
@@ -289,9 +332,16 @@ struct SessionStage {
     palette: Vec<[f32; 4]>,
     stamps: Vec<String>,
     cached: bool,
-    chrome: bool,
     loaded: usize,
+    plan: Vec<SessionPlan>,
+    /// Windows of 4096 rows to pull into the next picture. Doubles after a timed poll.
+    blocks: u32,
     report: Report,
+}
+
+fn chunks_for(bytes: u64) -> usize {
+    let rows = (bytes / 48).max(1);
+    rows.div_ceil(scan_kit_io::SLICE_ROWS as u64).max(1) as usize
 }
 
 impl SessionStage {
@@ -323,21 +373,104 @@ impl SessionStage {
             palette: palette.to_vec(),
             stamps,
             cached,
-            chrome: false,
             loaded: 0,
+            plan: Vec::new(),
+            blocks: 1,
             report: report_at(Phase::Chrome, 0, sessions.len()),
         }
     }
 
-    fn encode(&self, ids: &[String], partial: bool) -> Result<Vec<u8>, String> {
+    fn ensure_plan(&mut self) {
+        if !self.plan.is_empty() {
+            return;
+        }
+        self.plan = self
+            .sessions
+            .iter()
+            .map(|id| {
+                let pieces = scan_kit_io::session_pieces(&self.root, id);
+                SessionPlan {
+                    id: id.clone(),
+                    timeslice: pieces.timeslice,
+                    files: pieces
+                        .sizes
+                        .iter()
+                        .map(|size| FilePlan {
+                            bytes: *size,
+                            chunks: chunks_for(*size),
+                            filled: 0,
+                        })
+                        .collect(),
+                }
+            })
+            .collect();
+    }
+
+    fn units(&self) -> usize {
+        self.plan
+            .iter()
+            .map(|session| session.files.iter().map(|file| file.chunks).sum::<usize>())
+            .sum()
+    }
+
+    fn done_units(&self) -> usize {
+        self.plan
+            .iter()
+            .map(|session| session.files.iter().map(|file| file.filled).sum::<usize>())
+            .sum()
+    }
+
+    /// Include one more row-block. Returns the session and file that moved.
+    fn step(&mut self) -> Option<(usize, usize)> {
+        for (session_index, session) in self.plan.iter_mut().enumerate() {
+            for (file_index, file) in session.files.iter_mut().enumerate() {
+                if file.filled < file.chunks {
+                    file.filled += 1;
+                    return Some((session_index, file_index));
+                }
+            }
+        }
+        None
+    }
+
+    fn settle(&mut self, at: (usize, usize), tail_done: bool) {
+        let file = &mut self.plan[at.0].files[at.1];
+        let asked = (file.filled as u64).saturating_mul(scan_kit_io::SLICE_ROWS as u64);
+        // A file cannot contain more rows than it has bytes. Stop even if the reader
+        // never reported the end.
+        if tail_done || asked >= file.bytes {
+            file.filled = file.chunks;
+        } else if file.filled == file.chunks {
+            file.chunks += 1;
+        }
+    }
+
+    fn included(&self) -> Vec<String> {
+        self.plan
+            .iter()
+            .take_while(|session| session.files.iter().any(|file| file.filled > 0))
+            .filter(|session| session.files.iter().any(|file| file.filled > 0))
+            .map(|session| session.id.clone())
+            .collect()
+    }
+
+    fn load_scene(&self, ids: &[String]) -> Result<PlotScene, String> {
         let mut scene = if self.view == "dose_volume" {
             scan_kit_io::dose_volume(&self.root, ids, &self.options, None)
         } else {
             scan_kit_io::analysis_scene(&self.view, &self.root, ids, &self.options)?
         };
         apply_palette(&mut scene, &self.palette);
+        Ok(scene)
+    }
+
+    fn pack(&self, scene: &PlotScene, partial: bool) -> Result<Vec<u8>, String> {
         let quality = if partial { "partial" } else { "final" };
-        encode_plot_quality(&scene, self.background, self.foreground, quality)
+        encode_plot_quality(scene, self.background, self.foreground, quality)
+    }
+
+    fn encode(&self, ids: &[String], partial: bool) -> Result<Vec<u8>, String> {
+        self.pack(&self.load_scene(ids)?, partial)
     }
 }
 
@@ -366,48 +499,137 @@ impl Stage for SessionStage {
                 }
             };
         }
-        if !self.chrome && !unlimited && !self.cached {
-            self.chrome = true;
-            self.report = report_at(Phase::Chrome, 0, total);
-            return Poll::Pending {
-                report: self.report.clone(),
-                preview: None,
-            };
-        }
-        if self.loaded < total {
-            if unlimited || self.cached {
-                self.loaded = total;
-            } else {
-                self.loaded += 1;
-                let started = Instant::now();
-                while self.loaded < total && started.elapsed() < budget {
-                    if cancel.is_cancelled() {
-                        self.report.phase = Phase::Cancelled;
-                        return Poll::Cancelled;
-                    }
-                    self.loaded += 1;
-                }
-            }
-        }
-        let ids = self.sessions[..self.loaded].to_vec();
-        let partial = self.loaded < total;
-        match self.encode(&ids, partial) {
-            Ok(bytes) => {
-                if partial {
-                    let phase = if self.loaded <= 1 {
-                        Phase::Parse
-                    } else {
-                        Phase::Scene
-                    };
-                    self.report = report_at(phase, self.loaded, total);
-                    Poll::Pending {
-                        report: self.report.clone(),
-                        preview: Some(bytes),
-                    }
-                } else {
+        if unlimited || self.cached {
+            self.loaded = total;
+            let ids = self.sessions.clone();
+            return match self.encode(&ids, false) {
+                Ok(bytes) => {
                     remember_stamps(&self.stamps);
                     self.report = report_at(Phase::Done, total, total);
                     Poll::Ready(bytes)
+                }
+                Err(message) => {
+                    self.report.phase = Phase::Failed;
+                    self.report.note = message.clone();
+                    Poll::Failed(message)
+                }
+            };
+        }
+        self.ensure_plan();
+        // A zero budget stays on one window, so a test can see every step.
+        // A timed poll pulls several windows into one picture, then doubles
+        // that count. The picture and the hairline still advance every poll.
+        let quota = if budget.is_zero() {
+            1
+        } else {
+            self.blocks.max(1)
+        };
+        let mut stepped = 0u32;
+        let mut at = None;
+        let started = std::time::Instant::now();
+        while stepped < quota {
+            if stepped > 0 && !budget.is_zero() && started.elapsed() >= budget {
+                break;
+            }
+            if cancel.is_cancelled() {
+                self.report.phase = Phase::Cancelled;
+                return Poll::Cancelled;
+            }
+            match self.step() {
+                Some(next) => {
+                    at = Some(next);
+                    stepped += 1;
+                }
+                None => break,
+            }
+        }
+        let Some(at) = at else {
+            let ids = self.sessions.clone();
+            return match self.encode(&ids, false) {
+                Ok(bytes) => {
+                    remember_stamps(&self.stamps);
+                    self.report = report_at(Phase::Done, self.units(), self.units());
+                    Poll::Ready(bytes)
+                }
+                Err(message) => {
+                    self.report.phase = Phase::Failed;
+                    self.report.note = message.clone();
+                    Poll::Failed(message)
+                }
+            };
+        };
+        let ids = self.included();
+        self.loaded = ids.len();
+        let session = &self.plan[at.0];
+        let rows = session.files[at.1].filled * scan_kit_io::SLICE_ROWS;
+        let take = if session.timeslice {
+            scan_kit_io::SliceTake::Timeslice {
+                files: at.1,
+                tail_rows: rows,
+            }
+        } else {
+            scan_kit_io::SliceTake::Spot { rows }
+        };
+        scan_kit_io::bind_slice(&session.id, take);
+        let scene = self.load_scene(&ids);
+        let tail_done = scan_kit_io::slice_tail_done();
+        scan_kit_io::clear_slice();
+        self.settle(at, tail_done);
+        let scene = match scene {
+            Ok(scene) => scene,
+            Err(message) => {
+                self.report.phase = Phase::Failed;
+                self.report.note = message.clone();
+                return Poll::Failed(message);
+            }
+        };
+        if self.done_units() >= self.units() && tail_done {
+            return match self.pack(&scene, false) {
+                Ok(bytes) => {
+                    remember_stamps(&self.stamps);
+                    self.loaded = total;
+                    self.report = report_at(Phase::Done, self.units(), self.units());
+                    Poll::Ready(bytes)
+                }
+                Err(message) => {
+                    self.report.phase = Phase::Failed;
+                    self.report.note = message.clone();
+                    Poll::Failed(message)
+                }
+            };
+        }
+        if self.done_units() >= self.units() {
+            scan_kit_io::clear_slice();
+            return match self.encode(&self.sessions.clone(), false) {
+                Ok(bytes) => {
+                    remember_stamps(&self.stamps);
+                    self.loaded = total;
+                    self.report = report_at(Phase::Done, self.units(), self.units());
+                    Poll::Ready(bytes)
+                }
+                Err(message) => {
+                    self.report.phase = Phase::Failed;
+                    self.report.note = message.clone();
+                    Poll::Failed(message)
+                }
+            };
+        }
+        if !budget.is_zero() {
+            // ponytail: 128 windows is 512k rows. A later poll still publishes;
+            // the cap only stops one picture from swallowing the rest of the file.
+            self.blocks = self.blocks.saturating_mul(2).clamp(1, 128);
+        }
+        match self.pack(&scene, true) {
+            Ok(bytes) => {
+                let phase = if self.loaded <= 1 {
+                    Phase::Parse
+                } else {
+                    Phase::Scene
+                };
+                self.report = report_at(phase, self.done_units(), self.units());
+                Poll::Pending {
+                    report: self.report.clone(),
+                    preview: Some(bytes),
                 }
             }
             Err(message) => {
@@ -865,16 +1087,21 @@ impl Stage for CopyStage {
         let finished = self.worker.as_ref().expect("copy worker").is_finished();
         if !finished {
             let done = self.shared.done.load(Ordering::Relaxed);
+            let total = self.shared.total.load(Ordering::Relaxed);
             self.report = Report {
                 task: 0,
                 generation: 0,
                 phase: Phase::Read,
                 done,
-                total: 0,
-                note: if done == 0 {
-                    "Copying session".into()
+                total,
+                note: if total == 0 {
+                    if done == 0 {
+                        "Copying session".into()
+                    } else {
+                        format!("{done} files")
+                    }
                 } else {
-                    format!("{done} files")
+                    format!("{done} of {total}")
                 },
             };
             return Poll::Pending {
@@ -997,11 +1224,8 @@ mod tests {
         let mut saw_final = false;
         for _ in 0..8 {
             match stage.poll(Duration::ZERO, &cancel) {
-                Poll::Pending { report, preview } => {
-                    if report.phase == Phase::Chrome {
-                        assert!(preview.is_none());
-                        assert_eq!(report.done, 0);
-                    } else if let Some(bytes) = preview {
+                Poll::Pending { preview, .. } => {
+                    if let Some(bytes) = preview {
                         let header = scan_kit_plot::plot_header(&bytes).unwrap();
                         assert_eq!(header.quality, "partial");
                         partials += 1;
@@ -1020,6 +1244,168 @@ mod tests {
         }
         assert_eq!(partials, 2);
         assert!(saw_final);
+        let paced_root = scratch();
+        for name in ["d", "e", "f"] {
+            write_session(&paced_root, name);
+        }
+        let mut paced = session_stage(&paced_root, &["d", "e", "f"]);
+        let mut paced_partials = 0;
+        let mut paced_ready = false;
+        for _ in 0..8 {
+            match paced.poll(Duration::from_secs(1), &cancel) {
+                Poll::Pending {
+                    preview: Some(_), ..
+                } => paced_partials += 1,
+                Poll::Pending { preview: None, .. } => {}
+                Poll::Ready(_) => {
+                    paced_ready = true;
+                    break;
+                }
+                other => panic!("a short budget should still publish a picture: {other:?}"),
+            }
+        }
+        assert!(paced_ready);
+        assert!(paced_partials >= 1, "the first block is still a partial");
+        assert!(
+            paced_partials < 2,
+            "a timed budget should fold the later tiny sessions into the next picture"
+        );
+        let streamed = scratch();
+        let session = streamed.join("layers");
+        std::fs::create_dir_all(&session).unwrap();
+        std::fs::write(
+            session.join("input_map.csv"),
+            "energy\n70\n80\n90\n100\n110\n120\n130\n140\n",
+        )
+        .unwrap();
+        for layer in 0..8 {
+            let file = session
+                .join(format!("layer-{layer}"))
+                .join("run-0")
+                .join("timeslice_data_device_units.csv");
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(&file, format!("r_ic1_current_dose\n{layer}\n")).unwrap();
+        }
+        let mut stage = SessionStage::new(
+            "timeslice_replay",
+            &streamed,
+            &["layers".into()],
+            &json!({}),
+            [0.1, 0.1, 0.1, 1.0],
+            [0.9, 0.9, 0.9, 1.0],
+            &[[0.2, 0.4, 0.8, 1.0]],
+        );
+        let mut streamed_partials = 0;
+        let mut streamed_ready = false;
+        for _ in 0..8 {
+            match stage.poll(Duration::from_secs(1), &cancel) {
+                Poll::Pending {
+                    preview: Some(_), ..
+                } => streamed_partials += 1,
+                Poll::Pending { preview: None, .. } => {}
+                Poll::Ready(_) => {
+                    streamed_ready = true;
+                    break;
+                }
+                other => panic!("a long file should keep publishing: {other:?}"),
+            }
+        }
+        assert!(streamed_ready);
+        assert!(
+            streamed_partials >= 2,
+            "the picture should keep updating, got {streamed_partials}"
+        );
+        assert!(
+            streamed_partials < 8,
+            "doubling should finish in fewer polls than one file at a time, got {streamed_partials}"
+        );
+        let tight = scratch();
+        let session = tight.join("layers");
+        std::fs::create_dir_all(&session).unwrap();
+        std::fs::write(
+            session.join("input_map.csv"),
+            "energy\n70\n80\n90\n100\n110\n120\n130\n140\n",
+        )
+        .unwrap();
+        for layer in 0..8 {
+            let file = session
+                .join(format!("layer-{layer}"))
+                .join("run-0")
+                .join("timeslice_data_device_units.csv");
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(&file, format!("r_ic1_current_dose\n{layer}\n")).unwrap();
+        }
+        let mut stage = SessionStage::new(
+            "timeslice_replay",
+            &tight,
+            &["layers".into()],
+            &json!({}),
+            [0.1, 0.1, 0.1, 1.0],
+            [0.9, 0.9, 0.9, 1.0],
+            &[[0.2, 0.4, 0.8, 1.0]],
+        );
+        let mut tight_partials = 0;
+        let mut tight_ready = false;
+        for _ in 0..16 {
+            match stage.poll(Duration::from_nanos(1), &cancel) {
+                Poll::Pending {
+                    preview: Some(_), ..
+                } => tight_partials += 1,
+                Poll::Pending { preview: None, .. } => {}
+                Poll::Ready(_) => {
+                    tight_ready = true;
+                    break;
+                }
+                other => panic!("a spent budget should still publish a picture: {other:?}"),
+            }
+        }
+        assert!(tight_ready);
+        assert!(
+            tight_partials > streamed_partials,
+            "a spent budget stops after one window, got {tight_partials} vs {streamed_partials}"
+        );
+        let _ = std::fs::remove_dir_all(&tight);
+        let _ = std::fs::remove_dir_all(&streamed);
+        let _ = std::fs::remove_dir_all(&paced_root);
+        let sliced = scratch();
+        let session = sliced.join("wide");
+        std::fs::create_dir_all(&session).unwrap();
+        std::fs::write(session.join("input_map.csv"), "energy\n70\n90\n110\n").unwrap();
+        for (layer, sample) in [(0, "1"), (1, "2"), (2, "3")] {
+            let file = session
+                .join(format!("layer-{layer}"))
+                .join("run-0")
+                .join("timeslice_data_device_units.csv");
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(&file, format!("r_ic1_current_dose\n{sample}\n")).unwrap();
+        }
+        let mut stage = SessionStage::new(
+            "timeslice_replay",
+            &sliced,
+            &["wide".into()],
+            &json!({}),
+            [0.1, 0.1, 0.1, 1.0],
+            [0.9, 0.9, 0.9, 1.0],
+            &[[0.2, 0.4, 0.8, 1.0]],
+        );
+        let mut sizes = Vec::new();
+        for _ in 0..8 {
+            match stage.poll(Duration::ZERO, &cancel) {
+                Poll::Pending {
+                    preview: Some(bytes),
+                    ..
+                } => sizes.push(bytes.len()),
+                Poll::Pending { preview: None, .. } => {}
+                Poll::Ready(_) => break,
+                other => panic!("each timeslice file should publish: {other:?}"),
+            }
+        }
+        assert!(
+            sizes.len() >= 2,
+            "expected a growing picture, got {sizes:?}"
+        );
+        assert!(sizes.windows(2).all(|pair| pair[1] >= pair[0]));
+        let _ = std::fs::remove_dir_all(&sliced);
         let mut again = session_stage(&root, &["a", "b", "c"]);
         match again.poll(Duration::ZERO, &cancel) {
             Poll::Ready(bytes) => {
@@ -1038,10 +1424,6 @@ mod tests {
         }
         let mut stage = session_stage(&root, &["a", "b", "c"]);
         let cancel = Cancel::new();
-        assert!(matches!(
-            stage.poll(Duration::ZERO, &cancel),
-            Poll::Pending { preview: None, .. }
-        ));
         match stage.poll(Duration::ZERO, &cancel) {
             Poll::Pending { report, preview } => {
                 assert_eq!(report.done, 1);

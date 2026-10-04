@@ -1,6 +1,11 @@
-import { expect, it } from "vitest";
+import { expect, it, vi } from "vitest";
+import { invoke } from "@tauri-apps/api/core";
 
-import { acceptReport, hairlineFraction, parsePoll, type Report } from "./task-client";
+import { acceptReport, driveTask, hairlineFraction, parsePoll, type Report } from "./task-client";
+
+vi.mock("@tauri-apps/api/core", () => ({
+  invoke: vi.fn(),
+}));
 
 function frame(report: Report, payload: Uint8Array | null): Uint8Array {
   const json = new TextEncoder().encode(JSON.stringify(report));
@@ -41,8 +46,30 @@ it("a partial poll then a final poll loads twice, and a stale generation does no
   expect(acceptReport(stale.report, 1, generation + 1)).toBe(false);
 });
 
+it("polls the next slice without waiting for a paint", async () => {
+  let polls = 0;
+  vi.mocked(invoke).mockImplementation(async (command: string) => {
+    if (command === "scan_kit_start") {
+      return { task: 1, generation: 1 };
+    }
+    polls += 1;
+    return frame(report(1, polls > 1), new Uint8Array([polls]));
+  });
+  const seen: number[] = [];
+  await driveTask(
+    {},
+    (_update, payload) => {
+      seen.push(payload?.[0] ?? 0);
+    },
+    () => false,
+  );
+  expect(seen).toEqual([1, 2]);
+  expect(polls).toBe(2);
+});
+
 it("the hairline sweeps when the length is unknown and fills a fraction", () => {
   expect(hairlineFraction(0, 0)).toBeNull();
+  expect(hairlineFraction(0, 5)).toBeNull();
   expect(hairlineFraction(1, 4)).toBe(0.25);
   expect(hairlineFraction(9, 4)).toBe(1);
 });

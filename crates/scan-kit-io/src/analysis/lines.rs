@@ -2,20 +2,30 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use scan_kit_core::{
-    beam_on_mask, calibration_factor, cumsum, histogram, scale_column, spill_segments, PlotScene,
-    Series, MIN_SPILL_GAP_MS,
+    apply_mask, beam_on_mask, calibration_factor, cumsum, histogram, scale_column,
+    segments_control, segments_from, spill_segments, BeamGate, PlotScene, Segment, Series,
+    MIN_SPILL_GAP_MS,
 };
 use serde_json::Value;
 
 use super::{
-    apply_filter, col, drew_line, energy_lookup, finite_col, guide, labeled, load_csv,
-    load_timeslice, panel, pick, placed, scene, slice_table, spot_table, stroke, timeslice_metric,
-    LINKED, MARK,
+    col, drew_line, energy_lookup, finite_col, guide, labeled, load_csv, load_timeslice, panel,
+    pick, placed, scene, slice_table, spot_table, stroke, timeslice_metric, LINKED, MARK,
 };
 
 const CALIBRATE_CHOICES: &[(&str, &str)] = &[("off", "Off"), ("on", "On")];
 
-pub(super) fn peak_amplitude(root: &Path, session_ids: &[String]) -> PlotScene {
+pub(super) fn peak_amplitude(root: &Path, session_ids: &[String], options: &Value) -> PlotScene {
+    let segments = segments_from(
+        options,
+        &[Segment::Beam {
+            state: BeamGate::Off,
+        }],
+    );
+    let loaded: Vec<_> = session_ids
+        .iter()
+        .map(|session| timeslice_metric(root, session, "peak_amplitude"))
+        .collect();
     let mut panels = Vec::new();
     for (title, key) in [
         ("IC1 X", "ic1_x_peak"),
@@ -27,10 +37,9 @@ pub(super) fn peak_amplitude(root: &Path, session_ids: &[String]) -> PlotScene {
         let mut lo = f32::MAX;
         let mut hi = f32::MIN;
         let mut top = 1.0f32;
-        for session in session_ids {
-            let mut table =
-                std::sync::Arc::unwrap_or_clone(timeslice_metric(root, session, "peak_amplitude"));
-            apply_filter(&mut table, &[key], "all", "beam_off");
+        for table in &loaded {
+            let mut table = table.as_ref().clone();
+            apply_mask(&mut table, &segments, &[key]);
             let values = table.get(key).cloned().unwrap_or_default();
             if !values.iter().any(|value| value.is_finite()) {
                 continue;
@@ -50,7 +59,11 @@ pub(super) fn peak_amplitude(root: &Path, session_ids: &[String]) -> PlotScene {
         }
         panels.push(panel(title.to_owned(), lo, hi, 0.0, top, series));
     }
-    scene("IC Peak Amplitude — Beam-Off", panels, Vec::new())
+    scene(
+        "IC Peak Amplitude — Beam-Off",
+        panels,
+        vec![segments_control(&segments, &[("beam", "Beam")])],
+    )
 }
 
 pub(super) fn dose_accumulation(root: &Path, session_ids: &[String], options: &Value) -> PlotScene {

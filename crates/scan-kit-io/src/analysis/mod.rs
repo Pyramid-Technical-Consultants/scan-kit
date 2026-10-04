@@ -8,9 +8,7 @@ use scan_kit_core::{resolve_concept_column, Control, Panel, PlotScene, Series};
 use serde_json::{json, Value};
 
 pub(super) use super::discover;
-pub(super) use super::marks::{
-    apply_filter, contour_bands, control, flag, labeled, pick, text, BEAM_CHOICES,
-};
+pub(super) use super::marks::{contour_bands, control, flag, labeled, pick, text};
 pub(super) use super::tables::{slice_table, spot_table, timeslice_metric, timeslice_signals};
 mod distribution;
 mod lines;
@@ -39,7 +37,7 @@ pub fn analysis_scene(
     }
     match view {
         "dose_accumulation" => Ok(lines::dose_accumulation(root, session_ids, options)),
-        "ic_peak_amplitude_beam_off" => Ok(lines::peak_amplitude(root, session_ids)),
+        "ic_peak_amplitude_beam_off" => Ok(lines::peak_amplitude(root, session_ids, options)),
         "beam_motion_energy" => Ok(lines::beam_motion(root, session_ids)),
         "distribution" => Ok(distribution::distribution(root, session_ids, options)),
         "binned_summary" => Ok(binned_summary(root, session_ids, options)),
@@ -451,10 +449,19 @@ mod tests {
             .controls
             .iter()
             .any(|control| control.id == "draw" && control.value == "Scatter"));
-        assert!(scene
-            .controls
-            .iter()
-            .any(|control| control.id == "beam" && control.value == "Both"));
+        assert!(scene.controls.iter().any(|control| {
+            control.id == "segments"
+                && scan_kit_core::parse_segments(&control.value).is_ok_and(|items| {
+                    items.iter().any(|item| {
+                        matches!(
+                            item,
+                            scan_kit_core::Segment::Beam {
+                                state: scan_kit_core::BeamGate::Both
+                            }
+                        )
+                    })
+                })
+        }));
         assert!(scene
             .controls
             .iter()
@@ -567,10 +574,19 @@ mod tests {
             .controls
             .iter()
             .all(|control| control.id != "grain" && control.id != "ic1" && control.id != "plan"));
-        assert!(probe
-            .controls
-            .iter()
-            .any(|control| control.id == "beam" && control.value == "Beam On"));
+        assert!(probe.controls.iter().any(|control| {
+            control.id == "segments"
+                && scan_kit_core::parse_segments(&control.value).is_ok_and(|items| {
+                    items.iter().any(|item| {
+                        matches!(
+                            item,
+                            scan_kit_core::Segment::Beam {
+                                state: scan_kit_core::BeamGate::On
+                            }
+                        )
+                    })
+                })
+        }));
         let amplifier = analysis_scene(
             "distribution",
             &root,

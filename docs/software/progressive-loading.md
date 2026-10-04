@@ -8,7 +8,7 @@ This is the engineering design for keeping the desktop responsive while session 
 
 ## What this is
 
-One task type. A view starts it, polls it, and cancels it. Each poll does a bounded slice of CPU or GPU work and may return a progress report and a partial plot payload. The webview draws that payload with the plot it already has. Zoom and pan stay when the new panel is the same quantity and the data span stays within 3×, which `adopt_view` already does.
+One task type. A view starts it, polls it, and cancels it. Each poll does a bounded slice of CPU or GPU work and may return a progress report and a partial plot payload. The webview draws that payload with the plot it already has. An untouched view refits to the data in hand. A zoom or pan stays when the new panel is the same quantity and the data span stays within 3×.
 
 MCP and tests drain the same task to the end and still get one answer. `scan_kit_run_view` stays that drain. There is no second Monte Carlo, no second plot path, and no RGBA frame on the Tauri bridge.
 
@@ -79,25 +79,25 @@ Views do not implement that trait in React. Each heavy operation exposes one con
 
 ## Slice rules
 
-These are the Python `McRun.step` rules, used for every stage.
+Monte Carlo still grows its dispatch with the Python `McRun.step` rule. An analysis load keeps publishing a picture on every poll. The first picture is one window. Each later picture doubles that window, and each window reads only the bytes it adds.
 
 - The UI poll budget is 12 ms of CPU time. A GPU submit returns without waiting.
-- The next poll starts by waiting for the previous GPU fence. If that wait took more than half the budget, the next chunk is halved, down to a floor. If it took less than a tenth, the next chunk doubles, up to a cap. The floor and cap stay the ones already in the transport (dispatch size and in-flight depth).
-- A CPU stage publishes after each finished session or file, not after every session has joined. Workers for one task are joined on cancel and on `Ready`. No detached pool.
+- A Monte Carlo poll waits for the previous GPU fence. If that wait took more than half the budget, the next chunk is halved, down to a floor. If it took less than a tenth, the next chunk doubles, up to a cap. The floor and cap stay the ones already in the transport (dispatch size and in-flight depth).
+- A CPU stage's first timed poll publishes one timeslice file, or 4096 rows of a long file, and reads only that window. A spot file uses the same row window. Each later timed poll publishes again, with twice as many of those windows as the last picture, up to 128. The hairline and the plot both advance on every poll, and a window does not read the file again from the start. A zero budget still publishes one window per poll. Workers for one task are joined on cancel and on `Ready`. No detached pool.
 - A preview readback happens only when at least 100 ms have passed since the last one, and only after at least one unit of work. Readback is the expensive part; the submit is not.
 - One device queue. Two GPU tasks do not submit together. A plot rebuild waits for the current MC slice fence, or cancels that task when the user left the view.
 - Panic or device loss ends the task as `Failed`. The last good payload stays on screen. The next `start` creates the device again. A slice does not retry on its own.
 
 ## What the user sees first
 
-Controls do not wait on the file. The first poll can return the catalog controls with an empty scene (`Chrome`). A cache hit (the existing length and mtime stamp) skips to the final payload. A miss parses one session at a time and emits a scene as soon as one session can draw.
+A cache hit (the existing length and mtime stamp) skips to the final payload. A miss draws the first file, or the first 4096 rows of a long file, on the first poll, without reading the rest of that file. Later polls keep drawing a larger picture. The picture already on screen stays up, and can be zoomed or panned, while the next window is read. An untouched view refits as those windows arrive, so a later session stays inside the window. A zoom or pan the user already made is kept when the axes are still the same quantity and a close span.
 
 Order for an analysis view:
 
 1. `Chrome` — controls from the catalog or the last header cache.
 2. `Read` — stamps. Cache hit jumps to `Done`.
-3. `Parse` — one session or one timeslice file. Emit a partial scene when that session has finite columns.
-4. `Scene` — remaining sessions append series on the same axes.
+3. `Parse` — one timeslice file, or 4096 rows when that file is long. A spot file uses the same row blocks. Emit the scene built from the rows in hand so the plot can be zoomed while the rest arrives.
+4. `Scene` — each later poll appends a doubled window and publishes again.
 5. `Compute` — gamma, DVH, splat, or transport, if this view has any.
 6. `Done` — the same panel labels, `quality: final`.
 
@@ -144,15 +144,15 @@ One hook, `useTask`, owns start, poll, cancel, and the generation check. A view 
 | Library index | Rows as folders finish | Notes filled in | "12 of 40" |
 | Runner copy | Bytes copied | The same report the copy loop already has | Determinate, cancel sets the flag |
 
-The hairline is the default. It matches the Python `ProgressLine`: unknown length sweeps, a known fraction fills, `Done` completes and fades, and it does not take clicks. It uses the stock accent token. The Monte Carlo face is a line of text under the plot, not a modal. No view invents its own thread or its own progress event.
+One hairline sits on the top edge of the window for every load: an analysis change (including Spot and Timeslice), the library index, a runner command or copy, plan and phantom synthesis, and configuration open, preview, and save. Unknown length sweeps. A known fraction fills. It hides when the load finishes, and it does not take clicks. It uses the stock accent token. No view invents its own thread or its own progress event.
 
 ## Tests
 
 - Core: a fraction clamps, `total == 0` stays indeterminate, a cancelled flag wins over a later `Ready`, a mismatched generation is droppable.
 - Compute, skipped with no adapter: sliced MC equals one-shot; extend from 30k to 60k; cancel after a preview publishes nothing further; a slow fake wait shrinks the next chunk and a fast wait grows it.
-- IO: three sessions emit three partial scenes and one final; a cache hit emits one final slice; cancel after the first session joins the workers and does not emit the third.
+- IO: three small spot sessions at a zero budget emit two partial scenes and one final; a one-second budget still emits a partial before the final; an eight-file timeslice keeps publishing partials and finishes in fewer polls than one file at a time; a three-file timeslice grows the payload on each zero-budget poll; a cache hit emits one final slice; cancel after the first session joins the workers and does not emit the third.
 - Desktop: a fake poll of partial then final calls `load` twice; a stale generation does not; the hairline treats `total == 0` as a sweep and a fraction as a width.
-- Plot: the existing `adopt_view` tests. A partial payload with the same labels and a close span keeps the zoom. A different quantity refits.
+- Plot: the existing `adopt_view` tests. An untouched view refits when a later payload is wider. A zoomed view with the same labels and a close span keeps the zoom. A different quantity refits.
 
 ## Order of work
 

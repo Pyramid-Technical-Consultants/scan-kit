@@ -90,8 +90,20 @@ vi.mock("@tauri-apps/api/core", () => ({
             { id: "x", label: "X", group: "Data Source", options: ["Energy", "Target MU", "Spot time", "Radius"], value: "Energy" },
             { id: "bins", label: "Bins", group: "Data Source", options: ["Auto", "8", "16", "32", "64"], value: "Auto" },
             { id: "trend", label: "Trend", group: "Plot Style", options: ["Off", "Linear", "Polynomial"], value: "Off" },
-            { id: "domain", label: "Domain", group: "Filter Data", options: ["All", "Lower 95%", "Upper 5%", "MAD Outliers"], value: "All" },
-            { id: "beam", label: "Beam", group: "Filter Data", options: ["Beam On", "Beam Off", "Both"], value: "Beam On" },
+            {
+              id: "segments",
+              label: "Segments",
+              group: "Filter Data",
+              kind: "segments",
+              options: [
+                { id: "beam", label: "Beam", detail: "", icon: "" },
+                { id: "rank", label: "Rank", detail: "", icon: "" },
+              ],
+              value: JSON.stringify([
+                { kind: "beam", state: "on" },
+                { kind: "rank", which: "all" },
+              ]),
+            },
           ],
           table: null,
           samples: [],
@@ -191,7 +203,7 @@ it("puts grouped controls on the right and returns to sessions", async () => {
   expect(plot?.querySelector("canvas")).not.toBeNull();
   expect(handle?.getAttribute("aria-label")).toBe("Resize configuration");
   expect(aside?.textContent).toContain("Sessions");
-  expect(aside?.textContent).toContain("Domain");
+  expect(aside?.textContent).toContain("Rank");
   const fields = [...host.querySelectorAll("[data-slot='field']")];
   expect(fields.length).toBeGreaterThan(0);
   expect(fields.every((field) => field.getAttribute("data-orientation") === "horizontal")).toBe(true);
@@ -349,4 +361,47 @@ it("lays distribution columns in plot order on one row with icons", async () => 
   expect(row?.querySelectorAll(".lucide-zap").length).toBe(2);
   const checks = [...(row?.querySelectorAll("[data-slot='checkbox']") ?? [])];
   expect(checks.map((node) => node.getAttribute("aria-checked"))).toEqual(["true", "true", "false"]);
+});
+
+it("adds and removes a segment through the plot options", async () => {
+  const host = document.createElement("div");
+  document.body.append(host);
+  await act(() => {
+    root = createRoot(host);
+    root.render(
+      <AnalysisView
+        viewId="binned_summary"
+        folder="C:/data"
+        sessions={[{ id: "a", note: "" }]}
+        onBack={() => undefined}
+        onOpenView={() => undefined}
+      />,
+    );
+  });
+  await act(async () => {
+    await new Promise((resolve) => setTimeout(resolve, 200));
+  });
+  const remove = [...host.querySelectorAll("button")].find(
+    (button) => button.getAttribute("aria-label") === "Remove Rank",
+  );
+  await act(async () => {
+    remove?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    await new Promise((resolve) => setTimeout(resolve, 200));
+  });
+  const starts = () =>
+    vi
+      .mocked(invoke)
+      .mock.calls.filter(([command]) => command === "scan_kit_start")
+      .map(([, args]) => args as { options?: { segments?: string } });
+  const dropped = JSON.parse(starts()[starts().length - 1]?.options?.segments ?? "null") as { kind: string }[];
+  expect(dropped.map((item) => item.kind)).toEqual(["beam"]);
+  const add = [...host.querySelectorAll("button")].find(
+    (button) => button.getAttribute("aria-label") === "Add segment",
+  );
+  await act(async () => {
+    add?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    await new Promise((resolve) => setTimeout(resolve, 200));
+  });
+  const restored = JSON.parse(starts()[starts().length - 1]?.options?.segments ?? "null") as { kind: string }[];
+  expect(restored.map((item) => item.kind)).toEqual(["beam", "rank"]);
 });

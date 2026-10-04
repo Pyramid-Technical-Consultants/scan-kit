@@ -25,6 +25,9 @@ pub use analysis::{analysis_scene, channel_catalog, load_timeslice_columns};
 pub use beam::{beam_record, protons_per_mu, spot_record};
 pub use dose_view::dose_volume;
 pub use mc_tables::mc_tables;
+pub use tables::{
+    bind_slice, clear_slice, session_pieces, slice_tail_done, SessionPieces, SliceTake, SLICE_ROWS,
+};
 
 use std::path::{Path, PathBuf};
 

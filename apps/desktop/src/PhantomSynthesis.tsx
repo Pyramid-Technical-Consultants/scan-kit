@@ -7,6 +7,7 @@ import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Field, FieldGroup, FieldLabel } from "@/components/ui/field";
 import { notifyError, notifySaved } from "@/notify";
+import { usePageLoad } from "@/page-load";
 import { SidePane } from "@/SidePane";
 
 type Choice = { value: string; label: string };
@@ -40,25 +41,54 @@ export function PhantomSynthesis() {
   const [summary, setSummary] = useState("");
   const [status, setStatus] = useState(IDLE);
   const [busy, setBusy] = useState(false);
+  const [waiting, setWaiting] = useState(true);
+  const [previewing, setPreviewing] = useState(false);
+  usePageLoad(waiting || busy || previewing);
 
   useEffect(() => {
     void invoke<Catalog>("scan_kit_phantom_catalog")
       .then((next) => {
         setCatalog(next);
         setParams(next.defaults);
+        setWaiting(false);
       })
-      .catch((reason: unknown) => notifyError(reason));
+      .catch((reason: unknown) => {
+        setWaiting(false);
+        notifyError(reason);
+      });
   }, []);
 
   useEffect(() => {
     if (params == null) {
       return;
     }
-    void invoke<{ summary: string }>("scan_kit_phantom_preview", { params })
-      .then((next) => setSummary(next.summary))
-      .catch((reason: unknown) => {
-        setSummary(reason instanceof Error ? reason.message : String(reason));
-      });
+    let cancel = false;
+    const arm = window.setTimeout(() => {
+      if (cancel) {
+        return;
+      }
+      setPreviewing(true);
+      void invoke<{ summary: string }>("scan_kit_phantom_preview", { params })
+        .then((next) => {
+          if (!cancel) {
+            setSummary(next.summary);
+          }
+        })
+        .catch((reason: unknown) => {
+          if (!cancel) {
+            setSummary(reason instanceof Error ? reason.message : String(reason));
+          }
+        })
+        .finally(() => {
+          if (!cancel) {
+            setPreviewing(false);
+          }
+        });
+    }, 0);
+    return () => {
+      cancel = true;
+      window.clearTimeout(arm);
+    };
   }, [params]);
 
   if (catalog == null || params == null) {

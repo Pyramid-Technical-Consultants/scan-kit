@@ -2,10 +2,14 @@ import { ChartColumn, Columns2, LayoutGrid } from "lucide-react";
 import { expect, it } from "vitest";
 
 import {
+  addSegment,
   applyOption,
   controlDisabled,
   controlSections,
+  parseSegments,
+  removeSegment,
   segmentChoices,
+  segmentsText,
   type GrainMemory,
 } from "./analysis-controls";
 import { optionIcon } from "./option-icons";
@@ -23,8 +27,7 @@ const BINNED = [
   { id: "hist_bins", group: "Histogram" },
   { id: "share", group: "Histogram" },
   { id: "corr", group: "Correlation", kind: "check" },
-  { id: "domain", group: "Filter Data" },
-  { id: "beam", group: "Filter Data" },
+  { id: "segments", group: "Filter Data", kind: "segments" },
 ];
 
 it("groups binned summary controls in plot order", () => {
@@ -40,6 +43,7 @@ it("groups binned summary controls in plot order", () => {
     BINNED.map((control) => control.id),
   );
   expect(sections[2]?.slots.find((slot) => slot.id === "hist")?.kind).toBe("check");
+  expect(sections[sections.length - 1]?.slots[0]?.kind).toBe("segments");
   expect(sections[1]?.slots.find((slot) => slot.id === "interlock")?.kind).toBe("select");
 });
 
@@ -92,7 +96,7 @@ it("keeps distribution checks in Data Source after the axes", () => {
     { id: "ramp", group: "Plot Style" },
     { id: "cutoff", group: "Plot Style" },
     { id: "hist_bins", group: "Histogram" },
-    { id: "beam", group: "Filter Data" },
+    { id: "segments", group: "Filter Data", kind: "segments" },
   ]);
   expect(sections.map((section) => section.title)).toEqual([
     "Data Source",
@@ -222,6 +226,19 @@ it("disables histogram bin controls until the panel is on", () => {
   expect(controlDisabled("share", { hist: "On" })).toBe(false);
   expect(controlDisabled("share", { hist: "Off" })).toBe(true);
   expect(controlDisabled("domain", { hist: "Off" })).toBe(false);
+});
+
+it("adds a missing segment and drops one by index", () => {
+  const beam = [{ kind: "beam", state: "on" }];
+  const both = addSegment(beam, "rank");
+  expect(both).toEqual([
+    { kind: "beam", state: "on" },
+    { kind: "rank", which: "all" },
+  ]);
+  expect(addSegment(both, "rank")).toEqual(both);
+  const text = segmentsText(removeSegment(both, 0));
+  expect(parseSegments(text)).toEqual([{ kind: "rank", which: "all" }]);
+  expect(parseSegments("nope")).toBeNull();
 });
 
 it("leaves X bins available for every axis and glyph", () => {

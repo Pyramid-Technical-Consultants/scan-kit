@@ -15,10 +15,12 @@ import {
   applyOption,
   controlDisabled,
   controlSections,
+  parseSegments,
   segmentChoices,
   type ControlSlot,
   type GrainMemory,
 } from "@/analysis-controls";
+import { SegmentList } from "@/segment-list";
 import { AnalysisMenu, analysisId, analysisName } from "@/analysis-menu";
 import { ButtonSegmentGroup } from "@/components/button-segment-group";
 import { Button } from "@/components/ui/button";
@@ -26,8 +28,8 @@ import { Checkbox } from "@/components/ui/checkbox";
 import { Field, FieldLabel, FieldLegend, FieldSet } from "@/components/ui/field";
 import { SessionList } from "@/session-list";
 import { optionIcon } from "@/option-icons";
-import { backingSize, plotHeader, type PlotHeader, type ViewControl } from "@/plot-header";
-import { ProgressHairline } from "@/progress-line";
+import { backingSize, plotHeader, sameChrome, type PlotHeader, type ViewControl } from "@/plot-header";
+import { usePageLoad } from "@/page-load";
 import { sessionColor, shownSessionIds } from "@/session-colors";
 import { acceptReport, bytesOf, parsePoll, type Report } from "@/task-client";
 import { dismissNotice, notifyError } from "@/notify";
@@ -243,6 +245,8 @@ export function AnalysisView({
   const hold = useRef(0);
   const taskId = useRef(0);
   const [taskReport, setTaskReport] = useState<Report | null>(null);
+  const [loading, setLoading] = useState(true);
+  usePageLoad(loading, taskReport?.done ?? 0, taskReport?.total ?? 0);
   const frame = useRef(0);
   const openSeq = useRef(0);
   const [options, setOptions] = useState<Record<string, string>>({});
@@ -297,11 +301,11 @@ export function AnalysisView({
     payload.current = null;
     try {
       plot.load(bytes);
+      fitCanvas();
+      plot.render();
     } catch (reason) {
       notifyError(messageOf(reason), "analysis");
-      return;
     }
-    fitCanvas();
   };
 
   useEffect(() => {
@@ -370,6 +374,11 @@ export function AnalysisView({
     const plotOptions =
       viewId === "dose_volume" && studyPath != null ? { ...options, study: studyPath } : options;
     let stop = false;
+    const arm = window.setTimeout(() => {
+      if (!stop) {
+        setLoading(true);
+      }
+    }, 0);
     const timer = window.setTimeout(() => {
       setPlotError(null);
       void (async () => {
@@ -400,9 +409,13 @@ export function AnalysisView({
             continue;
           }
           setTaskReport(parsed.report.finished ? null : parsed.report);
+          if (parsed.report.finished) {
+            setLoading(false);
+          }
           if (parsed.payload != null) {
             setPlotError(null);
-            setMeta(plotHeader(parsed.payload));
+            const header = plotHeader(parsed.payload);
+            setMeta((current) => (sameChrome(current, header) ? current : header));
             payload.current = parsed.payload;
             loadPayload();
             dismissNotice("analysis");
@@ -419,6 +432,7 @@ export function AnalysisView({
       })().catch((reason: unknown) => {
         if (openSeq.current === ticket) {
           const message = messageOf(reason);
+          setLoading(false);
           setPlotError(message);
           notifyError(message, "analysis");
         }
@@ -426,6 +440,7 @@ export function AnalysisView({
     }, 150);
     return () => {
       stop = true;
+      window.clearTimeout(arm);
       window.clearTimeout(timer);
       const id = taskId.current;
       queueMicrotask(() => {
@@ -499,6 +514,10 @@ export function AnalysisView({
   const resolved: Record<string, string> = {};
   for (const control of controls) {
     const stored = options[control.id];
+    if (control.kind === "segments") {
+      resolved[control.id] = stored != null && parseSegments(stored) != null ? stored : control.value;
+      continue;
+    }
     const known = control.options.some((option) => option.label === stored);
     resolved[control.id] = stored != null && known ? stored : control.value;
   }
@@ -526,6 +545,19 @@ export function AnalysisView({
     const value = resolved[slot.id] ?? control.value;
     const label = control.label;
     const disabled = controlDisabled(slot.id, resolved);
+    if (slot.kind === "segments") {
+      return (
+        <SegmentList
+          key={slot.id}
+          value={value}
+          kinds={control.options.map((option) => ({
+            id: option.id.length > 0 ? option.id : option.label,
+            label: option.label,
+          }))}
+          onChange={(next) => apply(slot.id, next)}
+        />
+      );
+    }
     if (slot.kind === "check") {
       return (
         <Field
@@ -585,9 +617,6 @@ export function AnalysisView({
     <SidePane
       main={
       <div ref={host} className="bg-background relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
-        {taskReport != null && !taskReport.finished ? (
-          <ProgressHairline done={taskReport.done} total={taskReport.total} />
-        ) : null}
         {table != null && table.rows.length > 0 ? (
           <DataEditor
             width={size.width}
@@ -606,11 +635,6 @@ export function AnalysisView({
         )}
         <div className={shown ? "relative min-h-0 flex-1" : "hidden"}>
           <canvas ref={canvas} className="absolute inset-0 h-full w-full touch-none" />
-          {taskReport != null && !taskReport.finished && taskReport.note.length > 0 ? (
-            <p className="text-muted-foreground pointer-events-none absolute bottom-2 left-2 text-xs">
-              {taskReport.note}
-            </p>
-          ) : null}
         </div>
       </div>
       }
@@ -706,12 +730,16 @@ export function AnalysisView({
                 if (typeof selected !== "string") {
                   return;
                 }
+                setLoading(true);
                 void invoke<{ report: string }>("scan_kit_open_study", { path: selected })
                   .then((opened) => {
                     setStudyPath(selected);
                     setStudy(opened.report);
                   })
-                  .catch((reason: unknown) => notifyError(reason));
+                  .catch((reason: unknown) => {
+                    setLoading(false);
+                    notifyError(reason);
+                  });
               });
             }}
           >

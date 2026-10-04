@@ -85,6 +85,8 @@ The Analysis menu opens a view when one to five sessions are selected. Controls 
 
 A plotted series contains every sample that passed the view's filters. Nothing drops rows before the camera exists: no fixed stride, bucket count, or point cap on a line or a scatter. Histograms, contours, and spectra still reduce the samples, and they count every sample that passed the filter. The renderer may later simplify a stroke for the current camera when several samples fall in one pixel. That simplification keeps the extrema in the pixel, and a camera that gives a sample its own pixel draws the sample. Zoom and pan stay in the webview, so a thinned payload can never grow back.
 
+Row filters are one segment list, combined with AND, and the mask is computed once per table. Beam, rank, a column range, and a threshold compare are kinds of that list. A later cut, including energy, time, and a dose threshold, is another kind. Playback writes the time range; it does not grow a second filter.
+
 No custom CSS for color, radius, type, or spacing. A unique visual style, when it exists, is a deliberate change to the shadcn theme, not one-off overrides in a feature change.
 
 ## Numeric work

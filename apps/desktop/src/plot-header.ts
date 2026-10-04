@@ -71,6 +71,54 @@ function viewControl(raw: unknown): ViewControl {
   };
 }
 
+/** True when the chrome can stay put and only the marks grew. */
+export function sameChrome(current: PlotHeader | null, next: PlotHeader): boolean {
+  if (current == null) {
+    return false;
+  }
+  if (current.title !== next.title || current.samples.length !== next.samples.length) {
+    return false;
+  }
+  if (current.controls.length !== next.controls.length) {
+    return false;
+  }
+  for (let index = 0; index < current.controls.length; index += 1) {
+    const left = current.controls[index];
+    const right = next.controls[index];
+    if (left == null || right == null || left.id !== right.id || left.value !== right.value) {
+      return false;
+    }
+  }
+  return sameTable(current.table, next.table);
+}
+
+function sameTable(left: ViewTable | null, right: ViewTable | null): boolean {
+  if (left == null || right == null) {
+    return left == null && right == null;
+  }
+  if (left.columns.length !== right.columns.length || left.rows.length !== right.rows.length) {
+    return false;
+  }
+  for (let index = 0; index < left.columns.length; index += 1) {
+    if (left.columns[index] !== right.columns[index]) {
+      return false;
+    }
+  }
+  for (let row = 0; row < left.rows.length; row += 1) {
+    const a = left.rows[row];
+    const b = right.rows[row];
+    if (a == null || b == null || a.length !== b.length) {
+      return false;
+    }
+    for (let column = 0; column < a.length; column += 1) {
+      if (a[column] !== b[column]) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
 /** `scan_kit_open_plot` bytes: a little-endian `u32` JSON length, the JSON header, then marks. */
 export function plotHeader(bytes: Uint8Array): PlotHeader {
   if (bytes.byteLength < 4) {

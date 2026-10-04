@@ -436,27 +436,46 @@ pub(super) fn corr_panel(
     tables: &[BTreeMap<String, Vec<f32>>],
     group_label: &str,
 ) -> Panel {
-    let mut xs = Vec::new();
-    let mut ys = Vec::new();
+    let mut series = Vec::new();
+    let mut all_x = Vec::new();
+    let mut all_y = Vec::new();
     for table in tables {
         let (Some(left), Some(right)) = (table.get(a.key), table.get(b.key)) else {
             continue;
         };
+        let mut xs = Vec::new();
+        let mut ys = Vec::new();
         for (left, right) in left.iter().zip(right) {
             if left.is_finite() && right.is_finite() {
                 xs.push(*left);
                 ys.push(*right);
             }
         }
+        if xs.is_empty() {
+            continue;
+        }
+        all_x.extend(xs.iter().copied());
+        all_y.extend(ys.iter().copied());
+        // One series per session. Palette assignment then uses that session's color.
+        // Alpha 0 on the fit keeps the color of the points just above it.
+        series.push(Series::Points {
+            xs: xs.clone(),
+            ys: ys.clone(),
+            color: [0.8, 0.8, 0.8, 0.45],
+            radius: 2.0,
+        });
+        if let Some((slope, intercept)) = linear_fit(&xs, &ys) {
+            let (x0, x1) = span(&xs);
+            series.push(Series::Polyline {
+                xs: vec![x0, x1],
+                ys: vec![slope * x0 + intercept, slope * x1 + intercept],
+                color: [0.8, 0.8, 0.8, 0.0],
+                thickness: 1.5,
+            });
+        }
     }
-    let (xmin, xmax) = span(&xs);
-    let (ymin, ymax) = span(&ys);
-    let mut series = vec![Series::Points {
-        xs: xs.clone(),
-        ys: ys.clone(),
-        color: [0.8, 0.8, 0.8, 0.45],
-        radius: 2.0,
-    }];
+    let (xmin, xmax) = span(&all_x);
+    let (ymin, ymax) = span(&all_y);
     let lo = xmin.min(ymin);
     let hi = xmax.max(ymax);
     series.push(Series::Guide {
@@ -465,14 +484,6 @@ pub(super) fn corr_panel(
         color: [0.6, 0.6, 0.6, 0.8],
         thickness: 1.0,
     });
-    if let Some((slope, intercept)) = linear_fit(&xs, &ys) {
-        series.push(Series::Guide {
-            xs: vec![xmin, xmax],
-            ys: vec![slope * xmin + intercept, slope * xmax + intercept],
-            color: [0.9, 0.75, 0.3, 0.9],
-            thickness: 1.5,
-        });
-    }
     Panel {
         title: String::new(),
         y_label: axis_label(b.label, group_label),

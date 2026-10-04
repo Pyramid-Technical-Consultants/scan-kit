@@ -6,7 +6,7 @@ import { Button } from "@/components/ui/button";
 import { Field, FieldLabel } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
 import { notify, notifyError, notifySaved } from "@/notify";
-import { ProgressHairline } from "@/progress-line";
+import { usePageLoad } from "@/page-load";
 import { driveTask, type Report } from "@/task-client";
 
 type Enables = { start: boolean; pause: boolean; stop: boolean; reset: boolean };
@@ -64,6 +64,9 @@ export function PlanRunner() {
   const [view, setView] = useState<RunnerView>(IDLE);
   const [busy, setBusy] = useState(false);
   const [copyReport, setCopyReport] = useState<Report | null>(null);
+  const copying = copyReport != null && !copyReport.finished;
+  const [waiting, setWaiting] = useState(true);
+  usePageLoad(waiting || busy || copying, copyReport?.done ?? 0, copyReport?.total ?? 0);
   const copyToken = useRef<object>({});
   const busyRef = useRef(false);
   const inflight = useRef(false);
@@ -85,8 +88,12 @@ export function PlanRunner() {
           setDest(next.dest);
         }
         setView(next.view);
+        setWaiting(false);
       })
-      .catch((reason: unknown) => notifyError(reason));
+      .catch((reason: unknown) => {
+        setWaiting(false);
+        notifyError(reason);
+      });
   }, []);
 
   useEffect(() => {
@@ -266,14 +273,6 @@ export function PlanRunner() {
 
   return (
     <div className="relative flex min-h-0 flex-1 flex-col gap-4 overflow-auto p-4">
-      {copyReport != null && !copyReport.finished ? (
-        <>
-          <ProgressHairline done={copyReport.done} total={copyReport.total} />
-          {copyReport.note.length > 0 ? (
-            <p className="text-muted-foreground text-sm">{copyReport.note}</p>
-          ) : null}
-        </>
-      ) : null}
       <div className="flex max-w-3xl flex-col gap-3">
         <Field>
           <FieldLabel>RCI host</FieldLabel>

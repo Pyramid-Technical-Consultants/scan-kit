@@ -1,6 +1,6 @@
 import { expect, it } from "vitest";
 
-import { backingSize, plotHeader } from "./plot-header";
+import { backingSize, plotHeader, sameChrome } from "./plot-header";
 
 function payload(header: object, marks: number[]): Uint8Array {
   const json = new TextEncoder().encode(JSON.stringify(header));
@@ -64,4 +64,36 @@ it("rejects a payload shorter than its header", () => {
 it("sizes the canvas in device pixels", () => {
   expect(backingSize(400.4, 300, 2)).toEqual({ width: 801, height: 600 });
   expect(backingSize(4, 4, 0)).toEqual({ width: 16, height: 16 });
+});
+
+it("keeps the chrome when only the plotted marks grew", () => {
+  const current = plotHeader(
+    payload(
+      {
+        title: "Dose",
+        controls: [{ id: "y", label: "Y", value: "dose", options: [] }],
+        table: { columns: ["a"], rows: [["1"]] },
+        samples: [1, 2],
+        panels: [],
+      },
+      [1],
+    ).subarray(0),
+  );
+  const grown = plotHeader(
+    payload(
+      {
+        title: "Dose",
+        controls: [{ id: "y", label: "Y", value: "dose", options: [] }],
+        table: { columns: ["a"], rows: [["1"]] },
+        samples: [1, 2],
+        panels: [{}],
+        quality: "partial",
+      },
+      [1, 2, 3],
+    ).subarray(0),
+  );
+  expect(sameChrome(current, grown)).toBe(true);
+  expect(sameChrome(current, { ...grown, title: "Current" })).toBe(false);
+  expect(sameChrome(current, { ...grown, samples: [1] })).toBe(false);
+  expect(sameChrome(null, grown)).toBe(false);
 });

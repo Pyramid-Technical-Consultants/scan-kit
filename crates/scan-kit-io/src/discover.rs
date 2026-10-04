@@ -238,31 +238,26 @@ fn walk_files(
 }
 
 /// Timeslice files in layer/run order, without reading them.
+///
+/// The ordered list stays with the stamp, so a later poll does not walk the
+/// session again.
 pub(crate) fn list_timeslice_paths(storage: &Path) -> Vec<(i64, PathBuf)> {
     if !storage.is_dir() {
         return Vec::new();
     }
-    let mut found = Vec::new();
-    visit_files(storage, storage, 0, &is_timeslice, &mut |name, path| {
-        found.push((name.to_string(), path.to_path_buf()));
-    });
-    found.sort_by_key(|left| timeslice_key(&left.0));
-    found
-        .into_iter()
-        .map(|(name, path)| {
-            let index = if name.contains("layer-") {
-                number_after(&name, "layer-")
-            } else {
-                -1
-            };
-            (index, path)
-        })
-        .collect()
+    let _ = refresh_slice(storage);
+    slice_watches()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .get(storage)
+        .map(|hit| hit.paths.clone())
+        .unwrap_or_default()
 }
 
 struct SliceWatch {
     dirs: Vec<(PathBuf, u128)>,
     files: Vec<(PathBuf, u128)>,
+    paths: Vec<(i64, PathBuf)>,
     stamp: u128,
 }
 
@@ -279,7 +274,11 @@ fn slice_watches() -> &'static Mutex<HashMap<PathBuf, SliceWatch>> {
 /// ponytail: metadata only, so a same-size rewrite in the same timestamp tick
 /// is missed. Hash a prefix if that shows up. 32 sessions stay remembered.
 pub fn timeslice_stamp(storage: &Path) -> u128 {
-    if storage.is_file() {
+    refresh_slice(storage)
+}
+
+fn refresh_slice(storage: &Path) -> u128 {
+    if !storage.is_dir() {
         return meta_stamp(storage);
     }
     let key = storage.to_path_buf();
@@ -300,17 +299,33 @@ pub fn timeslice_stamp(storage: &Path) -> u128 {
             return hit.stamp;
         }
     }
-    let mut files = Vec::new();
+    let mut found = Vec::new();
     let mut dirs = vec![(storage.to_path_buf(), meta_stamp(storage))];
-    visit_files(storage, storage, 0, &is_timeslice, &mut |_name, path| {
+    visit_files(storage, storage, 0, &is_timeslice, &mut |name, path| {
         if let Some(parent) = path.parent() {
             let parent = parent.to_path_buf();
             if dirs.iter().all(|(have, _)| have != &parent) {
                 dirs.push((parent.clone(), meta_stamp(&parent)));
             }
         }
-        files.push((path.to_path_buf(), meta_stamp(path)));
+        found.push((name.to_string(), path.to_path_buf(), meta_stamp(path)));
     });
+    found.sort_by_key(|item| timeslice_key(&item.0));
+    let paths = found
+        .iter()
+        .map(|(name, path, _)| {
+            let index = if name.contains("layer-") {
+                number_after(name, "layer-")
+            } else {
+                -1
+            };
+            (index, path.clone())
+        })
+        .collect();
+    let files = found
+        .into_iter()
+        .map(|(_, path, stamp)| (path, stamp))
+        .collect::<Vec<_>>();
     let mut stamp = 0x9e3779b97f4a7c15u128;
     let mut count = 0u128;
     for (_, file_stamp) in &files {
@@ -322,9 +337,19 @@ pub fn timeslice_stamp(storage: &Path) -> u128 {
         .lock()
         .unwrap_or_else(|err| err.into_inner());
     if cache.len() >= 32 {
-        cache.clear();
+        if let Some(drop) = cache.keys().next().cloned() {
+            cache.remove(&drop);
+        }
     }
-    cache.insert(key, SliceWatch { dirs, files, stamp });
+    cache.insert(
+        key,
+        SliceWatch {
+            dirs,
+            files,
+            paths,
+            stamp,
+        },
+    );
     stamp
 }
 

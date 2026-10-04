@@ -1,10 +1,13 @@
 //! Spot and timeslice columns shared by the analysis scenes and the tuners.
 //!
 //! ponytail: sigma expected values on the spot frame come from a string scan of
-//! devices.xml. Timeslice isocenter position uses the spot-file strip-to-mm fit,
-//! and a duplicate `spot_no` keeps pandas' `.1` suffix.
+//! devices.xml. Timeslice isocenter position uses the spot-file strip-to-mm fit
+//! when the device targets are missing. A repeated `spot_no` starts that
+//! controller's own block, and the `.1` suffix matches pandas.
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -14,9 +17,130 @@ use scan_kit_core::{
     remap_g2_raw, remap_g3_raw, scale_column,
 };
 
+#[derive(Clone)]
 pub(crate) struct Sheet {
     pub(crate) num: BTreeMap<String, Vec<f32>>,
     pub(crate) wide: BTreeMap<String, Vec<f64>>,
+    /// Header block of each kept column. A new block starts at each repeated
+    /// `spot_no`, so IC1, IC2, IC3, and the other controllers do not share a clock.
+    pub(crate) block: BTreeMap<String, u32>,
+}
+
+fn empty_sheet() -> Sheet {
+    Sheet {
+        num: BTreeMap::new(),
+        wide: BTreeMap::new(),
+        block: BTreeMap::new(),
+    }
+}
+
+/// Rows published in one slice of a long file. A short file is one slice.
+pub const SLICE_ROWS: usize = 4_096;
+
+/// How a poll limits one session. Other sessions load in full.
+#[derive(Clone, Copy)]
+pub enum SliceTake {
+    /// This many leading timeslice files, then this many rows of the next file.
+    Timeslice { files: usize, tail_rows: usize },
+    /// This many rows of `spot_data.csv`.
+    Spot { rows: usize },
+}
+
+pub struct SessionPieces {
+    pub timeslice: bool,
+    pub sizes: Vec<u64>,
+}
+
+/// File sizes for one session. Timeslice sessions list each file. Anything else is the spot file.
+pub fn session_pieces(root: &Path, session: &str) -> SessionPieces {
+    let dir = discover::session_directory(root, session);
+    if dir.is_dir() {
+        let paths = discover::list_timeslice_paths(&dir);
+        if !paths.is_empty() {
+            return SessionPieces {
+                timeslice: true,
+                sizes: paths.iter().map(|(_, path)| file_len(path)).collect(),
+            };
+        }
+    }
+    SessionPieces {
+        timeslice: false,
+        sizes: vec![file_len(&dir.join("spot_data.csv"))],
+    }
+}
+
+fn file_len(path: &Path) -> u64 {
+    std::fs::metadata(path)
+        .map(|meta| meta.len())
+        .unwrap_or(1)
+        .max(1)
+}
+
+struct BoundSlice {
+    session: String,
+    take: SliceTake,
+    tail_done: bool,
+}
+
+fn bound_slice() -> &'static Mutex<Option<BoundSlice>> {
+    static BOUND: OnceLock<Mutex<Option<BoundSlice>>> = OnceLock::new();
+    BOUND.get_or_init(|| Mutex::new(None))
+}
+
+pub fn bind_slice(session: &str, take: SliceTake) {
+    *bound_slice().lock().unwrap_or_else(|err| err.into_inner()) = Some(BoundSlice {
+        session: session.to_owned(),
+        take,
+        tail_done: false,
+    });
+}
+
+pub fn clear_slice() {
+    *bound_slice().lock().unwrap_or_else(|err| err.into_inner()) = None;
+}
+
+pub fn slice_tail_done() -> bool {
+    bound_slice()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .as_ref()
+        .is_some_and(|bound| bound.tail_done)
+}
+
+pub(crate) fn slice_is_bound() -> bool {
+    bound_slice()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .is_some()
+}
+
+fn slice_for(session: &str) -> Option<SliceTake> {
+    bound_slice()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .as_ref()
+        .filter(|bound| bound.session == session)
+        .map(|bound| bound.take)
+}
+
+fn mark_tail_done() {
+    if let Some(bound) = bound_slice()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .as_mut()
+    {
+        bound.tail_done = true;
+    }
+}
+
+fn forget_tail_done() {
+    if let Some(bound) = bound_slice()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .as_mut()
+    {
+        bound.tail_done = false;
+    }
 }
 
 pub(crate) type Table = std::sync::Arc<BTreeMap<String, Vec<f32>>>;
@@ -60,16 +184,25 @@ pub(crate) fn timeslice_metric(root: &Path, session: &str, metric: &str) -> Tabl
 /// Current, confidence, peak, field, and amplifier columns from one timeslice read.
 pub(crate) fn timeslice_signals(root: &Path, session: &str) -> Table {
     cached_timeslice(root, session, "signals", false, Family::Signals, |frames| {
-        let mut out = current_from(&frames.sheets, &frames.energies, &frames.layers);
+        let mut out = current_from(
+            &frames.sheets,
+            &frames.energies,
+            &frames.layers,
+            frames.prior,
+        );
         for metric in [
             "fit_confidence",
             "peak_amplitude",
             "amplifier_error",
             "probe_field",
         ] {
-            for (key, values) in
-                signal_from(&frames.sheets, &frames.energies, &frames.layers, metric)
-            {
+            for (key, values) in signal_from(
+                &frames.sheets,
+                &frames.energies,
+                &frames.layers,
+                metric,
+                frames.prior,
+            ) {
                 out.entry(key).or_insert(values);
             }
         }
@@ -100,7 +233,8 @@ fn spot_cache() -> &'static std::sync::Mutex<HashMap<SpotCacheKey, Table>> {
 
 /// Parsed timeslice frames shared by every metric.
 ///
-/// ponytail: four sessions stay parsed. Past that the map is cleared. The files
+/// ponytail: four sessions stay parsed. Past that one entry is dropped, so a
+/// session that is still loading is not thrown out with the rest. The files
 /// are the expensive part; the derived tables below are the cheap repeat.
 const FRAME_CACHE_CAP: usize = 4;
 const TABLE_CACHE_CAP: usize = 32;
@@ -108,8 +242,23 @@ const TABLE_CACHE_CAP: usize = 32;
 struct Frames {
     energies: Vec<f32>,
     layers: Vec<i64>,
-    sheets: Vec<Sheet>,
-    map: Sheet,
+    sheets: Vec<Arc<Sheet>>,
+    map: Arc<Sheet>,
+    /// `(complete files, rows of the next file)` already folded into the
+    /// previous partial table. `None` builds every loaded row.
+    prior: Option<(usize, usize)>,
+}
+
+fn evict_one<K, V>(map: &mut HashMap<K, V>)
+where
+    K: Eq + std::hash::Hash,
+{
+    let mut first = true;
+    map.retain(|_, _| {
+        let drop_this = first;
+        first = false;
+        !drop_this
+    });
 }
 
 #[derive(Clone, Copy, Hash, PartialEq, Eq)]
@@ -172,27 +321,163 @@ fn cached_timeslice(
         kind: kind.to_string(),
         frames,
     };
-    if let Some(hit) = table_cache()
-        .lock()
-        .unwrap_or_else(|err| err.into_inner())
-        .get(&key)
-    {
-        return Arc::clone(hit);
+    let partial = match slice_for(session) {
+        Some(SliceTake::Timeslice { files, tail_rows }) => Some((files, tail_rows)),
+        _ => None,
+    };
+    if partial.is_none() {
+        if let Some(hit) = table_cache()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .get(&key)
+        {
+            return Arc::clone(hit);
+        }
     }
+    let dir = discover::session_directory(root, session);
+    if let Some((files, tail_rows)) = partial {
+        match take_grown(&dir, kind, files, tail_rows) {
+            GrownHit::Same(table) => return table,
+            GrownHit::More(previous) => {
+                let _ = take_full_table();
+                let extra = open_frames(root, session, family)
+                    .map(|mut frames| {
+                        if let Some(inner) = Arc::get_mut(&mut frames) {
+                            inner.prior = Some((previous.files, previous.tail_rows));
+                        }
+                        build(&frames)
+                    })
+                    .unwrap_or_default();
+                let table = if take_full_table() {
+                    Arc::new(extra)
+                } else {
+                    let mut table = previous.table;
+                    extend_columns(Arc::make_mut(&mut table), extra);
+                    table
+                };
+                store_growth(&dir, kind, files, tail_rows, Arc::clone(&table));
+                return table;
+            }
+            GrownHit::Miss => {}
+        }
+    }
+    let _ = take_full_table();
     let table = Arc::new(
         open_frames(root, session, family)
             .map(|frames| build(&frames))
             .unwrap_or_default(),
     );
+    let _ = take_full_table();
+    if let Some((files, tail_rows)) = partial {
+        store_growth(&dir, kind, files, tail_rows, Arc::clone(&table));
+        return table;
+    }
     let mut cache = table_cache().lock().unwrap_or_else(|err| err.into_inner());
     if cache.len() >= TABLE_CACHE_CAP {
-        cache.clear();
+        evict_one(&mut cache);
     }
     cache.insert(key, Arc::clone(&table));
     table
 }
 
+/// Rows already published for this slice. The next poll appends the tail.
+struct Grown {
+    files: usize,
+    tail_rows: usize,
+    table: Table,
+}
+
+fn growth_cache() -> &'static Mutex<HashMap<(PathBuf, String), Grown>> {
+    static CACHE: OnceLock<Mutex<HashMap<(PathBuf, String), Grown>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+thread_local! {
+    static FULL_TABLE: Cell<bool> = const { Cell::new(false) };
+}
+
+fn mark_full_table() {
+    FULL_TABLE.with(|flag| flag.set(true));
+}
+
+fn take_full_table() -> bool {
+    FULL_TABLE.with(|flag| flag.replace(false))
+}
+
+enum GrownHit {
+    Same(Table),
+    More(Grown),
+    Miss,
+}
+
+fn take_grown(dir: &Path, kind: &str, files: usize, tail_rows: usize) -> GrownHit {
+    let key = (dir.to_path_buf(), kind.to_string());
+    let mut cache = growth_cache().lock().unwrap_or_else(|err| err.into_inner());
+    let Some(have) = cache.get(&key) else {
+        return GrownHit::Miss;
+    };
+    if have.files == files && have.tail_rows == tail_rows {
+        return GrownHit::Same(Arc::clone(&have.table));
+    }
+    if files < have.files || (files == have.files && tail_rows < have.tail_rows) {
+        cache.remove(&key);
+        return GrownHit::Miss;
+    }
+    cache
+        .remove(&key)
+        .map(GrownHit::More)
+        .unwrap_or(GrownHit::Miss)
+}
+
+fn store_growth(dir: &Path, kind: &str, files: usize, tail_rows: usize, table: Table) {
+    let mut cache = growth_cache().lock().unwrap_or_else(|err| err.into_inner());
+    if cache.len() >= TABLE_CACHE_CAP {
+        evict_one(&mut cache);
+    }
+    cache.insert(
+        (dir.to_path_buf(), kind.to_string()),
+        Grown {
+            files,
+            tail_rows,
+            table,
+        },
+    );
+}
+
+fn extend_columns(base: &mut BTreeMap<String, Vec<f32>>, extra: BTreeMap<String, Vec<f32>>) {
+    let width = base.get("energy").map(Vec::len).unwrap_or(0);
+    let extra_energy = extra.get("energy").map(Vec::len).unwrap_or(0);
+    for (key, values) in extra {
+        if let Some(have) = base.get_mut(&key) {
+            have.extend(values);
+        } else if extra_energy > 0 && values.len() == extra_energy {
+            let mut padded = vec![f32::NAN; width];
+            padded.extend(values);
+            base.insert(key, padded);
+        } else {
+            base.insert(key, values);
+        }
+    }
+}
+
+/// First sample of `index` that is not already in the previous partial table.
+fn row_origin(index: usize, prior: Option<(usize, usize)>) -> Option<usize> {
+    let Some((files, tail)) = prior else {
+        return Some(0);
+    };
+    if index < files {
+        None
+    } else if index == files {
+        Some(tail)
+    } else {
+        Some(0)
+    }
+}
+
 fn open_frames(root: &Path, session: &str, family: Family) -> Option<Arc<Frames>> {
+    if let Some(SliceTake::Timeslice { files, tail_rows }) = slice_for(session) {
+        return frames_limited(root, session, family, files, tail_rows);
+    }
     let key = frame_key(root, session, family);
     if let Some(hit) = frame_cache()
         .lock()
@@ -201,12 +486,7 @@ fn open_frames(root: &Path, session: &str, family: Family) -> Option<Arc<Frames>
     {
         return Some(Arc::clone(hit));
     }
-    let map = discover::read_session_file(root, session, "input_map.csv")
-        .map(|bytes| read_sheet(&bytes))
-        .unwrap_or_else(|| Sheet {
-            num: BTreeMap::new(),
-            wide: BTreeMap::new(),
-        });
+    let map = map_sheet(root, session);
     let energies = unique_seen(column(&map, "energy", &[]));
     let keep = keep_of(family);
     let (layers, sheets) = if key.dir.is_dir() {
@@ -215,7 +495,7 @@ fn open_frames(root: &Path, session: &str, family: Family) -> Option<Arc<Frames>
             return None;
         }
         let layers = listed.iter().map(|(index, _)| *index).collect();
-        (layers, parse_paths(&listed, keep))
+        (layers, parse_paths(&listed, keep_id(family), keep))
     } else {
         let listed = discover::read_timeslice_frames(&key.dir);
         if listed.is_empty() {
@@ -230,24 +510,87 @@ fn open_frames(root: &Path, session: &str, family: Family) -> Option<Arc<Frames>
         layers,
         sheets,
         map,
+        prior: None,
     });
     let mut cache = frame_cache().lock().unwrap_or_else(|err| err.into_inner());
     if cache.len() >= FRAME_CACHE_CAP {
-        cache.clear();
+        evict_one(&mut cache);
     }
     cache.insert(key, Arc::clone(&frames));
     Some(frames)
 }
 
+fn frames_limited(
+    root: &Path,
+    session: &str,
+    family: Family,
+    files: usize,
+    tail_rows: usize,
+) -> Option<Arc<Frames>> {
+    let dir = discover::session_directory(root, session);
+    if !dir.is_dir() {
+        return None;
+    }
+    let listed = discover::list_timeslice_paths(&dir);
+    if listed.is_empty() {
+        mark_tail_done();
+        return None;
+    }
+    let map = map_sheet(root, session);
+    let energies = unique_seen(column(&map, "energy", &[]));
+    let keep = keep_of(family);
+    let kind = keep_id(family);
+    let full = files.min(listed.len());
+    let mut sheets = Vec::with_capacity(full + 1);
+    let mut layers = Vec::with_capacity(full + 1);
+    for (index, path) in listed.iter().take(full) {
+        sheets.push(sheet_all(path, kind, keep));
+        layers.push(*index);
+    }
+    if full < listed.len() && tail_rows > 0 {
+        let (index, path) = &listed[full];
+        sheets.push(sheet_rows(path, kind, keep, tail_rows));
+        layers.push(*index);
+    } else if full >= listed.len() {
+        mark_tail_done();
+    }
+    Some(Arc::new(Frames {
+        energies,
+        layers,
+        sheets,
+        map,
+        prior: None,
+    }))
+}
+
+fn map_sheet(root: &Path, session: &str) -> Arc<Sheet> {
+    let path = discover::session_directory(root, session).join("input_map.csv");
+    if path.is_file() {
+        return sheet_all(&path, Keep::Map, |_| true);
+    }
+    Arc::new(
+        discover::read_session_file(root, session, "input_map.csv")
+            .map(|bytes| read_sheet(&bytes))
+            .unwrap_or_else(empty_sheet),
+    )
+}
+
 pub(crate) fn merged_timeslice(root: &Path, session: &str) -> Table {
     cached_timeslice(root, session, "merged", false, Family::All, |frames| {
         let mut merged: BTreeMap<String, Vec<f32>> = BTreeMap::new();
-        for sheet in &frames.sheets {
+        for (index, sheet) in frames.sheets.iter().enumerate() {
+            let Some(start) = row_origin(index, frames.prior) else {
+                continue;
+            };
             for (name, values) in &sheet.num {
+                let slice = values.get(start..).unwrap_or(&[]);
+                if slice.is_empty() {
+                    continue;
+                }
                 merged
                     .entry(name.clone())
                     .or_default()
-                    .extend(values.iter().copied());
+                    .extend_from_slice(slice);
             }
         }
         merged
@@ -264,7 +607,11 @@ pub(crate) fn load_spot(
     let dir = discover::session_directory(root, session);
     let spot_path = dir.join("spot_data.csv");
     let map_path = dir.join("input_map.csv");
-    let key = (spot_path.is_file() && map_path.is_file()).then(|| SpotCacheKey {
+    let rows = match slice_for(session) {
+        Some(SliceTake::Spot { rows }) => Some(rows),
+        _ => None,
+    };
+    let key = (rows.is_none() && spot_path.is_file() && map_path.is_file()).then(|| SpotCacheKey {
         spot_stamp: discover::meta_stamp(&spot_path),
         map_stamp: discover::meta_stamp(&map_path),
         dir,
@@ -278,11 +625,11 @@ pub(crate) fn load_spot(
             return Arc::clone(hit);
         }
     }
-    let table = Arc::new(build_spot(root, session, chamber, points, raw_sigma));
+    let table = Arc::new(build_spot(root, session, chamber, points, raw_sigma, rows));
     if let Some(key) = key {
         let mut cache = spot_cache().lock().unwrap_or_else(|err| err.into_inner());
         if cache.len() >= SPOT_CACHE_CAP {
-            cache.clear();
+            evict_one(&mut cache);
         }
         cache.insert(key, Arc::clone(&table));
     }
@@ -295,15 +642,34 @@ fn build_spot(
     chamber: bool,
     points: bool,
     raw_sigma: bool,
+    rows: Option<usize>,
 ) -> BTreeMap<String, Vec<f32>> {
-    let Some(spot_bytes) = discover::read_session_file(root, session, "spot_data.csv") else {
+    let dir = discover::session_directory(root, session);
+    let map_path = dir.join("input_map.csv");
+    let map = if map_path.is_file() {
+        sheet_all(&map_path, Keep::Map, |_| true)
+    } else if let Some(bytes) = discover::read_session_file(root, session, "input_map.csv") {
+        Arc::new(read_sheet(&bytes))
+    } else {
+        if rows.is_some() {
+            mark_tail_done();
+        }
         return BTreeMap::new();
     };
-    let Some(map_bytes) = discover::read_session_file(root, session, "input_map.csv") else {
-        return BTreeMap::new();
+    let path = dir.join("spot_data.csv");
+    let spot = if let Some(rows) = rows {
+        sheet_rows(&path, Keep::Spot, spot_keep, rows)
+    } else if path.is_file() {
+        sheet_all(&path, Keep::Spot, spot_keep)
+    } else {
+        let Some(spot_bytes) = discover::read_session_file(root, session, "spot_data.csv") else {
+            return BTreeMap::new();
+        };
+        Arc::new(read_sheet_where(&spot_bytes, spot_keep))
     };
-    let spot = read_sheet_where(&spot_bytes, spot_keep);
-    let map = read_sheet(&map_bytes);
+    // ponytail: spot_delivery_ms sorts every timestamp in a layer, so a new row
+    // can change a neighbor. The derived columns are rebuilt from this parsed
+    // sheet instead of a suffix. The sheet itself is not read from disk again.
     let energy = column(&map, "energy", &[]);
     let dose = column(
         &spot,
@@ -410,7 +776,6 @@ fn build_spot(
             map_kept(values, &keep, |value| value * 2.0),
         );
     }
-    let dir = discover::session_directory(root, session);
     if let Ok(xml) = std::fs::read_to_string(dir.join("config/map2map/devices.xml")) {
         add_sigma_error(&mut table, &xml);
     }
@@ -959,10 +1324,61 @@ fn build_slice_metric(
     chamber: bool,
     frames: &Frames,
 ) -> BTreeMap<String, Vec<f32>> {
-    let spot = discover::read_session_file(root, session, "spot_data.csv")
-        .map(|bytes| read_sheet_where(&bytes, spot_keep));
+    let spot_path = discover::session_directory(root, session).join("spot_data.csv");
+    let spot = if spot_path.is_file() {
+        Some(sheet_all(&spot_path, Keep::Spot, spot_keep))
+    } else {
+        discover::read_session_file(root, session, "spot_data.csv")
+            .map(|bytes| Arc::new(read_sheet_where(&bytes, spot_keep)))
+    };
     let plan = plan_xy(&frames.map);
-    let (axes, spot_shift) = iso_axes(spot.as_ref(), &plan, &frames.sheets);
+    let previous = frames
+        .prior
+        .and_then(|span| recall_pos(root, session, chamber, span));
+    let mut samples = previous
+        .as_ref()
+        .map(|state| state.samples.clone())
+        .unwrap_or_else(|| std::array::from_fn(|_| HashMap::new()));
+    let ingest_from = if previous.is_some() {
+        frames.prior
+    } else {
+        None
+    };
+    if plan_spans(&plan) {
+        for (index, sheet) in frames.sheets.iter().enumerate() {
+            let Some(start) = row_origin(index, ingest_from) else {
+                continue;
+            };
+            ingest_targets(sheet, &mut samples, start);
+        }
+    }
+    let fitted = plan_spans(&plan)
+        .then(|| fit_samples(&samples, &plan))
+        .flatten();
+    let strips = spot
+        .as_deref()
+        .map(strip_axes)
+        .unwrap_or([None, None, None, None]);
+    let (axes, shifts) = if let Some((fitted, shifts)) = fitted {
+        let mut axes = strips;
+        let mut out = [0.0; 4];
+        for index in 0..4 {
+            if fitted[index].is_some() {
+                axes[index] = fitted[index];
+                out[index] = shifts[index];
+            }
+        }
+        (axes, out)
+    } else {
+        (strips, [0.0; 4])
+    };
+    let append = previous
+        .as_ref()
+        .is_some_and(|state| !chamber && same_fit(&state.axes, &axes, &state.shifts, &shifts));
+    if frames.prior.is_some() && !append {
+        mark_full_table();
+    }
+    let row_from = if append { frames.prior } else { None };
     let rows = frames
         .sheets
         .iter()
@@ -1003,35 +1419,24 @@ fn build_slice_metric(
             continue;
         };
         let n = trigger.len();
-        let layer_col = sheet.num.get("layer_id").map(Vec::as_slice);
-        let spots_ic1 = first_column(sheet, &["spot_no.1", "spot_no"]);
-        let spots_ic2 = first_column(sheet, &["spot_no.2", "spot_no.1", "spot_no"]);
         let bound = [
             bind_axis(sheet, "ic1", "x"),
             bind_axis(sheet, "ic1", "y"),
             bind_axis(sheet, "ic2", "x"),
             bind_axis(sheet, "ic2", "y"),
         ];
-        let spot_of = [spots_ic1, spots_ic1, spots_ic2, spots_ic2];
         let plan_x = [true, false, true, false];
-        for row in 0..n {
+        let Some(start) = row_origin(file_index, row_from) else {
+            continue;
+        };
+        for row in start..n {
             let on = trigger[row] > 0.5;
             beam.push(if on { 1.0 } else { 0.0 });
-            let layer = at(layer_col, row);
             energy.push(tagged);
-            let layer_bits = layer.to_bits();
-            let spot1 = at(spot_of[0], row) + spot_shift;
-            let spot2 = at(spot_of[2], row) + spot_shift;
-            let plan1 = plan.get(&(layer_bits, spot1.to_bits())).copied();
-            let (planned_x, planned_y) = plan1.unwrap_or((f32::NAN, f32::NAN));
+            let ic1 = plan_at(&plan, bound[0].layer, bound[0].spot, row, shifts[0]);
+            let (planned_x, planned_y) = ic1.unwrap_or((f32::NAN, f32::NAN));
             plan_xs.push(planned_x);
             plan_ys.push(planned_y);
-            let plan2 = if spot1.to_bits() == spot2.to_bits() {
-                plan1
-            } else {
-                plan.get(&(layer_bits, spot2.to_bits())).copied()
-            };
-            let planned_xy = [plan1, plan1, plan2, plan2];
             let mut mm = [f32::NAN; 4];
             for index in 0..4 {
                 let axis = &bound[index];
@@ -1054,7 +1459,7 @@ fn build_slice_metric(
                 } else {
                     f32::NAN
                 };
-                let planned = planned_xy[index]
+                let planned = plan_at(&plan, axis.layer, axis.spot, row, shifts[index])
                     .map(|xy| if plan_x[index] { xy.0 } else { xy.1 })
                     .unwrap_or(f32::NAN);
                 let err = if mm[index].is_finite() && planned.is_finite() {
@@ -1114,6 +1519,7 @@ fn build_slice_metric(
     }
     let mut table = BTreeMap::new();
     if energy.is_empty() {
+        remember_pos(root, session, chamber, samples, axes, shifts);
         return table;
     }
     table.insert("energy".to_string(), energy);
@@ -1148,15 +1554,89 @@ fn build_slice_metric(
     table.insert("ic2_y".to_string(), ic2_y_mm);
     table.insert("ic12_x_diff".to_string(), x_diff);
     table.insert("ic12_y_diff".to_string(), y_diff);
-    if plan_xs.iter().any(|value| value.is_finite()) {
+    if row_from.is_some() || plan_xs.iter().any(|value| value.is_finite()) {
         table.insert("plan_x".to_string(), plan_xs);
         table.insert("plan_y".to_string(), plan_ys);
     }
+    remember_pos(root, session, chamber, samples, axes, shifts);
     table
+}
+
+struct PosState {
+    files: usize,
+    tail_rows: usize,
+    samples: [HashMap<(u32, u32), f32>; 4],
+    axes: [Option<(f32, f32)>; 4],
+    shifts: [f32; 4],
+}
+
+fn pos_cache() -> &'static Mutex<HashMap<(PathBuf, bool), PosState>> {
+    static CACHE: OnceLock<Mutex<HashMap<(PathBuf, bool), PosState>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn recall_pos(root: &Path, session: &str, chamber: bool, span: (usize, usize)) -> Option<PosState> {
+    let key = (discover::session_directory(root, session), chamber);
+    let mut cache = pos_cache().lock().unwrap_or_else(|err| err.into_inner());
+    let state = cache.get(&key)?;
+    if state.files != span.0 || state.tail_rows != span.1 {
+        cache.remove(&key);
+        return None;
+    }
+    cache.remove(&key)
+}
+
+fn remember_pos(
+    root: &Path,
+    session: &str,
+    chamber: bool,
+    samples: [HashMap<(u32, u32), f32>; 4],
+    axes: [Option<(f32, f32)>; 4],
+    shifts: [f32; 4],
+) {
+    let Some(SliceTake::Timeslice { files, tail_rows }) = slice_for(session) else {
+        return;
+    };
+    let mut cache = pos_cache().lock().unwrap_or_else(|err| err.into_inner());
+    if cache.len() >= TABLE_CACHE_CAP {
+        evict_one(&mut cache);
+    }
+    cache.insert(
+        (discover::session_directory(root, session), chamber),
+        PosState {
+            files,
+            tail_rows,
+            samples,
+            axes,
+            shifts,
+        },
+    );
+}
+
+fn same_fit(
+    left: &[Option<(f32, f32)>; 4],
+    right: &[Option<(f32, f32)>; 4],
+    left_shift: &[f32; 4],
+    right_shift: &[f32; 4],
+) -> bool {
+    left_shift == right_shift
+        && left
+            .iter()
+            .zip(right)
+            .all(|(left, right)| match (left, right) {
+                (Some((left_slope, left_intercept)), Some((right_slope, right_intercept))) => {
+                    left_slope.to_bits() == right_slope.to_bits()
+                        && left_intercept.to_bits() == right_intercept.to_bits()
+                }
+                (None, None) => true,
+                _ => false,
+            })
 }
 
 struct AxisCols<'a> {
     raw: Option<&'a [f32]>,
+    spot: Option<&'a [f32]>,
+    layer: Option<&'a [f32]>,
     gate: Option<&'a [f32]>,
     confidence: Option<&'a [f32]>,
     error_code: Option<&'a [f32]>,
@@ -1172,12 +1652,21 @@ fn bind_axis<'a>(sheet: &'a Sheet, ic: &str, axis: &str) -> AxisCols<'a> {
         format!("r_{ic}_{axis}_spot_position_ok"),
         format!("r_{ic}_{axis}_position_ok"),
     ];
+    let raw_name = if sheet.num.contains_key(&position) {
+        Some(position)
+    } else if sheet.num.contains_key(&spot_position) {
+        Some(spot_position)
+    } else {
+        None
+    };
+    let (spot, layer) = clock_columns(sheet, raw_name.as_deref());
     AxisCols {
-        raw: sheet
-            .num
-            .get(&position)
-            .or_else(|| sheet.num.get(&spot_position))
+        raw: raw_name
+            .as_ref()
+            .and_then(|name| sheet.num.get(name))
             .map(Vec::as_slice),
+        spot,
+        layer,
         gate: gates
             .iter()
             .find_map(|name| sheet.num.get(name))
@@ -1201,11 +1690,59 @@ fn bind_axis<'a>(sheet: &'a Sheet, ic: &str, axis: &str) -> AxisCols<'a> {
     }
 }
 
-fn first_column<'a>(sheet: &'a Sheet, names: &[&str]) -> Option<&'a [f32]> {
-    names
-        .iter()
-        .find_map(|name| sheet.num.get(*name))
-        .map(Vec::as_slice)
+/// Spot and layer written by the same controller as `column`.
+///
+/// Controllers log side by side and stay a spot or two apart. The block is the
+/// repeated `spot_no` that owns this column. A file with one spot column still
+/// shares that clock.
+fn clock_columns<'a>(
+    sheet: &'a Sheet,
+    column: Option<&str>,
+) -> (Option<&'a [f32]>, Option<&'a [f32]>) {
+    let block = column.and_then(|name| sheet.block.get(name)).copied();
+    let spot = block
+        .and_then(|block| column_on_block(sheet, "spot_no", block))
+        .or_else(|| shared_column(sheet, "spot_no"));
+    let layer = block
+        .and_then(|block| column_on_block(sheet, "layer_id", block))
+        .or_else(|| shared_column(sheet, "layer_id"));
+    (spot, layer)
+}
+
+fn column_on_block<'a>(sheet: &'a Sheet, base: &str, block: u32) -> Option<&'a [f32]> {
+    let name = sheet.block.iter().find_map(|(name, clock)| {
+        (*clock == block && header_base(name).eq_ignore_ascii_case(base)).then_some(name.as_str())
+    })?;
+    sheet.num.get(name).map(Vec::as_slice)
+}
+
+fn shared_column<'a>(sheet: &'a Sheet, base: &str) -> Option<&'a [f32]> {
+    let mut found = None;
+    for name in sheet.num.keys() {
+        if !header_base(name).eq_ignore_ascii_case(base) {
+            continue;
+        }
+        if found.is_some() {
+            return None;
+        }
+        found = Some(name.as_str());
+    }
+    found.and_then(|name| sheet.num.get(name).map(Vec::as_slice))
+}
+
+fn plan_at(
+    plan: &HashMap<(u32, u32), (f32, f32)>,
+    layer: Option<&[f32]>,
+    spot: Option<&[f32]>,
+    row: usize,
+    shift: f32,
+) -> Option<(f32, f32)> {
+    let layer = at(layer, row);
+    let spot = at(spot, row) + shift;
+    if !layer.is_finite() || !spot.is_finite() {
+        return None;
+    }
+    plan.get(&(layer.to_bits(), spot.to_bits())).copied()
 }
 
 fn at(column: Option<&[f32]>, row: usize) -> f32 {
@@ -1281,20 +1818,6 @@ fn plan_xy(map: &Sheet) -> HashMap<(u32, u32), (f32, f32)> {
     out
 }
 
-fn iso_axes(
-    spot: Option<&Sheet>,
-    plan: &HashMap<(u32, u32), (f32, f32)>,
-    sheets: &[Sheet],
-) -> ([Option<(f32, f32)>; 4], f32) {
-    if let Some(fitted) = plan_target_axes(plan, sheets) {
-        return fitted;
-    }
-    (
-        spot.map(strip_axes).unwrap_or([None, None, None, None]),
-        0.0,
-    )
-}
-
 fn plan_spans(plan: &HashMap<(u32, u32), (f32, f32)>) -> bool {
     let mut x_lo = f32::MAX;
     let mut x_hi = f32::MIN;
@@ -1313,129 +1836,82 @@ fn plan_spans(plan: &HashMap<(u32, u32), (f32, f32)>) -> bool {
     x_hi - x_lo >= 0.1 || y_hi - y_lo >= 0.1
 }
 
-/// Device-target vs plan affine when the map has position span.
+/// Each target is keyed by the spot and layer in that target's own controller
+/// block. IC2 can be on the next spot while IC1 is still on the previous one.
 /// ponytail: the first finite target per spot stands in for the per-spot median.
-fn plan_target_axes(
-    plan: &HashMap<(u32, u32), (f32, f32)>,
-    sheets: &[Sheet],
-) -> Option<([Option<(f32, f32)>; 4], f32)> {
-    if !plan_spans(plan) {
-        return None;
-    }
-    let mut targets: HashMap<(u32, u32), [f32; 4]> = HashMap::new();
-    for sheet in sheets {
-        let names = [
-            "ic1_position_x_target",
-            "ic1_position_y_target",
-            "ic2_position_x_target",
-            "ic2_position_y_target",
-        ];
-        if names.iter().any(|name| !sheet.num.contains_key(*name)) {
+fn ingest_targets(sheet: &Sheet, samples: &mut [HashMap<(u32, u32), f32>; 4], start: usize) {
+    let names = [
+        "ic1_position_x_target",
+        "ic1_position_y_target",
+        "ic2_position_x_target",
+        "ic2_position_y_target",
+    ];
+    for (index, name) in names.iter().enumerate() {
+        let Some(values) = sheet.num.get(*name) else {
             continue;
-        }
-        let n = sheet.num.get("layer_id").map(Vec::len).unwrap_or(0);
-        let layer_col = sheet.num.get("layer_id").map(Vec::as_slice);
-        let spots = first_column(sheet, &["spot_no.1", "spot_no"]);
-        let cols = names.map(|name| sheet.num.get(name).map(Vec::as_slice));
-        for row in 0..n {
-            let layer = at(layer_col, row);
+        };
+        let (spots, layers) = clock_columns(sheet, Some(name));
+        for row in start..values.len() {
+            let sample = values[row];
+            let layer = at(layers, row);
             let spot = at(spots, row);
-            if !layer.is_finite() || !spot.is_finite() {
+            if !sample.is_finite() || !layer.is_finite() || !spot.is_finite() {
                 continue;
             }
-            let sample = [
-                at(cols[0], row),
-                at(cols[1], row),
-                at(cols[2], row),
-                at(cols[3], row),
-            ];
-            if sample.iter().any(|value| !value.is_finite()) {
-                continue;
-            }
-            targets
+            samples[index]
                 .entry((layer.to_bits(), spot.to_bits()))
                 .or_insert(sample);
         }
     }
-    if targets.len() < 10 {
-        return None;
+}
+
+fn fit_samples(
+    samples: &[HashMap<(u32, u32), f32>; 4],
+    plan: &HashMap<(u32, u32), (f32, f32)>,
+) -> Option<([Option<(f32, f32)>; 4], [f32; 4])> {
+    let mut axes = [None; 4];
+    let mut shifts = [0.0; 4];
+    let mut any = false;
+    for index in 0..4 {
+        let Some((axis, shift)) = fit_target_axis(&samples[index], plan, index % 2 == 0) else {
+            continue;
+        };
+        axes[index] = Some(axis);
+        shifts[index] = shift;
+        any = true;
     }
-    let mut best: Option<(f32, i32, i32, [(f32, f32); 4])> = None;
+    any.then_some((axes, shifts))
+}
+
+fn fit_target_axis(
+    samples: &HashMap<(u32, u32), f32>,
+    plan: &HashMap<(u32, u32), (f32, f32)>,
+    x_axis: bool,
+) -> Option<((f32, f32), f32)> {
+    let mut best: Option<((usize, i32, i32), (f32, f32), f32)> = None;
     for shift in -2i32..=2 {
-        let mut strips = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
-        let mut isos = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
-        for ((layer, spot), sample) in &targets {
+        let mut strips = Vec::new();
+        let mut isos = Vec::new();
+        for ((layer, spot), sample) in samples {
             let shifted = f32::from_bits(*spot) + shift as f32;
             let Some(planned) = plan.get(&(*layer, shifted.to_bits())) else {
                 continue;
             };
-            for index in 0..4 {
-                strips[index].push(sample[index]);
-                isos[index].push(if index % 2 == 0 { planned.0 } else { planned.1 });
-            }
+            strips.push(*sample);
+            isos.push(if x_axis { planned.0 } else { planned.1 });
         }
-        let matches = strips[0].len();
-        if matches < 10 {
+        if strips.len() < 10 {
             continue;
         }
-        let mut axes = [(0.0f32, 0.0f32); 4];
-        let mut ok = true;
-        for index in 0..4 {
-            match fit_strip_iso(&strips[index], &isos[index]) {
-                Some(axis) => axes[index] = axis,
-                None => ok = false,
-            }
-        }
-        if !ok {
+        let Some(axis) = fit_strip_iso(&strips, &isos) else {
             continue;
-        }
-        let mut square = 0.0f32;
-        let mut count = 0.0f32;
-        for ((layer, spot), sample) in &targets {
-            let Some(planned) = plan.get(&(*layer, *spot)) else {
-                continue;
-            };
-            let actual = [planned.0, planned.1, planned.0, planned.1];
-            for index in 0..4 {
-                let pred = axes[index].0 * sample[index] + axes[index].1;
-                let err = actual[index] - pred;
-                square += err * err;
-                count += 1.0;
-            }
-        }
-        if count == 0.0 {
-            continue;
-        }
-        let verify = (square / count).sqrt();
-        let key = (verify, -(matches as i32), shift.abs());
-        if best
-            .as_ref()
-            .is_none_or(|have| key < (have.0, have.1, have.2))
-        {
-            best = Some((verify, -(matches as i32), shift.abs(), axes));
+        };
+        let rank = (strips.len(), -shift.abs(), shift);
+        if best.as_ref().is_none_or(|(have, _, _)| rank > *have) {
+            best = Some((rank, axis, shift as f32));
         }
     }
-    let (_, _, _, axes) = best?;
-    // The lookup shift is the one with the most plan matches, same as Python.
-    let mut chosen = 0i32;
-    let mut most = 0usize;
-    for shift in -2i32..=2 {
-        let matches = targets
-            .keys()
-            .filter(|(layer, spot)| {
-                let shifted = f32::from_bits(*spot) + shift as f32;
-                plan.contains_key(&(*layer, shifted.to_bits()))
-            })
-            .count();
-        if matches > most {
-            most = matches;
-            chosen = shift;
-        }
-    }
-    if most < 10 {
-        return None;
-    }
-    Some((axes.map(Some), chosen as f32))
+    best.map(|(_, axis, shift)| (axis, shift))
 }
 
 fn strip_axes(spot: &Sheet) -> [Option<(f32, f32)>; 4] {
@@ -1496,15 +1972,29 @@ pub(crate) fn load_timeslice(root: &Path, session: &str, metric: &str) -> Table 
         Family::Signals,
         |frames| {
             if metric == "current_ratio" {
+                if frames.prior.is_some() {
+                    mark_full_table();
+                }
                 return current_ratio_from(&frames.sheets, &frames.energies, &frames.layers);
             }
             if matches!(
                 metric,
                 "fit_confidence" | "peak_amplitude" | "amplifier_error" | "probe_field"
             ) {
-                return signal_from(&frames.sheets, &frames.energies, &frames.layers, metric);
+                return signal_from(
+                    &frames.sheets,
+                    &frames.energies,
+                    &frames.layers,
+                    metric,
+                    frames.prior,
+                );
             }
-            current_from(&frames.sheets, &frames.energies, &frames.layers)
+            current_from(
+                &frames.sheets,
+                &frames.energies,
+                &frames.layers,
+                frames.prior,
+            )
         },
     )
 }
@@ -1558,7 +2048,7 @@ pub(crate) fn grain_columns(root: &Path, session: &str, timeslice: bool) -> Vec<
     if cacheable {
         let mut cache = header_cache().lock().unwrap_or_else(|err| err.into_inner());
         if cache.len() >= HEADER_CACHE_CAP {
-            cache.clear();
+            evict_one(&mut cache);
         }
         cache.insert(
             key,
@@ -1685,14 +2175,21 @@ pub(crate) fn signal_table(
     layers: &[i64],
     metric: &str,
 ) -> BTreeMap<String, Vec<f32>> {
-    signal_from(&read_sheets(files, signal_column), energies, layers, metric)
+    signal_from(
+        &read_sheets(files, signal_column),
+        energies,
+        layers,
+        metric,
+        None,
+    )
 }
 
 fn signal_from(
-    sheets: &[Sheet],
+    sheets: &[Arc<Sheet>],
     energies: &[f32],
     layers: &[i64],
     metric: &str,
+    prior: Option<(usize, usize)>,
 ) -> BTreeMap<String, Vec<f32>> {
     let spec: &[(&str, &str)] = match metric {
         "fit_confidence" => &[
@@ -1715,6 +2212,9 @@ fn signal_from(
     if metric == "amplifier_error" {
         let mut stored = vec![Vec::new(); 6];
         for (index, sheet) in sheets.iter().enumerate() {
+            let Some(start) = row_origin(index, prior) else {
+                continue;
+            };
             let tag = frame_energy(energies, layers.get(index).copied().unwrap_or(-1), index);
             let cmd_x = concept_col(sheet, "amplifier_cmd_x");
             let read_x = concept_col(sheet, "amplifier_readback_x");
@@ -1730,7 +2230,15 @@ fn signal_from(
                 cmd_y,
                 read_y,
             ];
-            append_samples(sheet, tag, &columns, &mut energy, &mut beam, &mut stored);
+            append_samples(
+                sheet,
+                tag,
+                &columns,
+                start,
+                &mut energy,
+                &mut beam,
+                &mut stored,
+            );
         }
         return signal_rows(
             energy,
@@ -1747,12 +2255,23 @@ fn signal_from(
     }
     let mut stored = vec![Vec::new(); spec.len()];
     for (index, sheet) in sheets.iter().enumerate() {
+        let Some(start) = row_origin(index, prior) else {
+            continue;
+        };
         let tag = frame_energy(energies, layers.get(index).copied().unwrap_or(-1), index);
         let columns: Vec<&[f32]> = spec
             .iter()
             .map(|(_, concept)| concept_col(sheet, concept))
             .collect();
-        append_samples(sheet, tag, &columns, &mut energy, &mut beam, &mut stored);
+        append_samples(
+            sheet,
+            tag,
+            &columns,
+            start,
+            &mut energy,
+            &mut beam,
+            &mut stored,
+        );
     }
     let pairs: Vec<(&str, &Vec<f32>)> = spec
         .iter()
@@ -1791,16 +2310,17 @@ fn append_samples(
     sheet: &Sheet,
     tag: f32,
     columns: &[&[f32]],
+    start: usize,
     energy: &mut Vec<f32>,
     beam_out: &mut Vec<f32>,
     series_out: &mut [Vec<f32>],
 ) {
     let n = columns.iter().map(|column| column.len()).max().unwrap_or(0);
-    if n == 0 {
+    if n == 0 || start >= n {
         return;
     }
     let gate = column_any(sheet, &["rci_in_trigger", "r_beamOk", "beam_on"]);
-    for sample in 0..n {
+    for sample in start..n {
         let any = columns
             .iter()
             .any(|column| column.get(sample).copied().unwrap_or(f32::NAN).is_finite());
@@ -1837,7 +2357,12 @@ fn signal_rows(
     table
 }
 
-fn current_from(sheets: &[Sheet], energies: &[f32], layers: &[i64]) -> BTreeMap<String, Vec<f32>> {
+fn current_from(
+    sheets: &[Arc<Sheet>],
+    energies: &[f32],
+    layers: &[i64],
+    prior: Option<(usize, usize)>,
+) -> BTreeMap<String, Vec<f32>> {
     let mut out_energy = Vec::new();
     let mut ic1 = Vec::new();
     let mut ic2 = Vec::new();
@@ -1845,13 +2370,16 @@ fn current_from(sheets: &[Sheet], energies: &[f32], layers: &[i64]) -> BTreeMap<
     let mut beam = Vec::new();
     let mut any_ic3 = false;
     for (index, sheet) in sheets.iter().enumerate() {
+        let Some(start) = row_origin(index, prior) else {
+            continue;
+        };
         let tag = frame_energy(energies, layers.get(index).copied().unwrap_or(-1), index);
         let a = scaled_current(sheet, "ic1");
         let b = scaled_current(sheet, "ic2");
         let c = ic3_current(sheet);
         let gate = column_any(sheet, &["rci_in_trigger", "r_beamOk", "beam_on"]);
         let n = a.len().max(b.len()).max(c.len());
-        for sample in 0..n {
+        for sample in start..n {
             out_energy.push(tag);
             ic1.push(*a.get(sample).unwrap_or(&f32::NAN));
             ic2.push(*b.get(sample).unwrap_or(&f32::NAN));
@@ -1877,7 +2405,7 @@ fn current_from(sheets: &[Sheet], energies: &[f32], layers: &[i64]) -> BTreeMap<
 }
 
 fn current_ratio_from(
-    sheets: &[Sheet],
+    sheets: &[Arc<Sheet>],
     energies: &[f32],
     layers: &[i64],
 ) -> BTreeMap<String, Vec<f32>> {
@@ -2098,36 +2626,6 @@ pub(crate) fn percentile(sorted_or_not: &[f32], q: f64) -> f32 {
     let hi = pos.ceil().min((sorted.len() - 1) as f64) as usize;
     let frac = (pos - lo as f64) as f32;
     sorted[lo] * (1.0 - frac) + sorted[hi] * frac
-}
-
-pub(crate) fn modified_z(values: &[f32]) -> Vec<f32> {
-    let finite: Vec<f32> = values
-        .iter()
-        .copied()
-        .filter(|value| value.is_finite())
-        .collect();
-    let mut out = vec![0.0; values.len()];
-    if finite.is_empty() {
-        return out;
-    }
-    let med = median(&finite);
-    let devs: Vec<f32> = finite.iter().map(|value| (value - med).abs()).collect();
-    let mad = median(&devs);
-    let mean = finite.iter().sum::<f32>() / finite.len() as f32;
-    let mean_ad = devs.iter().sum::<f32>() / devs.len() as f32;
-    for (slot, value) in out.iter_mut().zip(values) {
-        if !value.is_finite() {
-            continue;
-        }
-        *slot = if mad > 1e-12 {
-            0.6745 * (value - med) / mad
-        } else if mean_ad > 1e-12 {
-            (value - mean) / (1.253314 * mean_ad)
-        } else {
-            0.0
-        };
-    }
-    out
 }
 
 fn unique_seen(values: &[f32]) -> Vec<f32> {
@@ -2356,10 +2854,9 @@ fn spot_keep(name: &str) -> bool {
         || lower.contains("_sigma")
 }
 
-fn parse_paths(listed: &[(i64, PathBuf)], keep: fn(&str) -> bool) -> Vec<Sheet> {
+fn parse_paths(listed: &[(i64, PathBuf)], kind: Keep, keep: fn(&str) -> bool) -> Vec<Arc<Sheet>> {
     if listed.len() < 2 {
-        let bytes = std::fs::read(&listed[0].1).unwrap_or_default();
-        return vec![read_sheet_where(&bytes, keep)];
+        return vec![sheet_all(&listed[0].1, kind, keep)];
     }
     let workers = std::thread::available_parallelism()
         .map(|count| count.get())
@@ -2373,10 +2870,7 @@ fn parse_paths(listed: &[(i64, PathBuf)], keep: fn(&str) -> bool) -> Vec<Sheet> 
             joins.push(scope.spawn(move || {
                 piece
                     .iter()
-                    .map(|(_, path)| {
-                        let bytes = std::fs::read(path).unwrap_or_default();
-                        read_sheet_where(&bytes, keep)
-                    })
+                    .map(|(_, path)| sheet_all(path, kind, keep))
                     .collect::<Vec<_>>()
             }));
         }
@@ -2388,11 +2882,11 @@ fn parse_paths(listed: &[(i64, PathBuf)], keep: fn(&str) -> bool) -> Vec<Sheet> 
 }
 
 // ponytail: a few chunks, not a pool. Tens of timeslice files, not thousands.
-fn read_sheets(files: &[Vec<u8>], keep: fn(&str) -> bool) -> Vec<Sheet> {
+fn read_sheets(files: &[Vec<u8>], keep: fn(&str) -> bool) -> Vec<Arc<Sheet>> {
     if files.len() < 2 {
         return files
             .iter()
-            .map(|bytes| read_sheet_where(bytes, keep))
+            .map(|bytes| Arc::new(read_sheet_where(bytes, keep)))
             .collect();
     }
     let workers = std::thread::available_parallelism()
@@ -2407,7 +2901,7 @@ fn read_sheets(files: &[Vec<u8>], keep: fn(&str) -> bool) -> Vec<Sheet> {
             joins.push(scope.spawn(move || {
                 piece
                     .iter()
-                    .map(|bytes| read_sheet_where(bytes, keep))
+                    .map(|bytes| Arc::new(read_sheet_where(bytes, keep)))
                     .collect::<Vec<_>>()
             }));
         }
@@ -2452,6 +2946,345 @@ enum Kind {
 /// use. Scientific notation and non-finite tokens fall back to `str::parse`.
 /// `keep` drops columns a caller will not read. Strip columns stay dropped.
 /// A large file is split on newlines and parsed in row ranges.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum Keep {
+    Signals,
+    Geometry,
+    All,
+    Spot,
+    Map,
+}
+
+fn keep_id(family: Family) -> Keep {
+    match family {
+        Family::Signals => Keep::Signals,
+        Family::Geometry => Keep::Geometry,
+        Family::All => Keep::All,
+    }
+}
+
+#[derive(PartialEq, Eq, Hash)]
+struct SheetKey {
+    path: PathBuf,
+    stamp: u128,
+    keep: Keep,
+}
+
+#[derive(Clone)]
+struct Layout {
+    names: Vec<Option<String>>,
+    kinds: Vec<Kind>,
+    block: BTreeMap<String, u32>,
+}
+
+struct Tail {
+    stamp: u128,
+    sheet: Arc<Sheet>,
+    rows: usize,
+    cursor: usize,
+    done: bool,
+    /// The header line, including its newline, so a later window can resume.
+    header: Vec<u8>,
+    layout: Option<Layout>,
+    file: Option<std::fs::File>,
+}
+
+fn file_sheets() -> &'static Mutex<HashMap<SheetKey, Arc<Sheet>>> {
+    static CACHE: OnceLock<Mutex<HashMap<SheetKey, Arc<Sheet>>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn tails() -> &'static Mutex<HashMap<(PathBuf, Keep), Tail>> {
+    static CACHE: OnceLock<Mutex<HashMap<(PathBuf, Keep), Tail>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+const FILE_SHEET_CAP: usize = 64;
+
+fn sheet_all(path: &Path, keep: Keep, pred: fn(&str) -> bool) -> Arc<Sheet> {
+    let stamp = discover::meta_stamp(path);
+    let key = SheetKey {
+        path: path.to_path_buf(),
+        stamp,
+        keep,
+    };
+    if let Some(hit) = file_sheets()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .get(&key)
+    {
+        return Arc::clone(hit);
+    }
+    let resume = tails()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .get(&(path.to_path_buf(), keep))
+        .is_some_and(|tail| tail.stamp == stamp && !tail.done && tail.rows > 0);
+    if resume {
+        return sheet_rows(path, keep, pred, usize::MAX);
+    }
+    let bytes = std::fs::read(path).unwrap_or_default();
+    let sheet = Arc::new(read_sheet_where(&bytes, pred));
+    let mut cache = file_sheets().lock().unwrap_or_else(|err| err.into_inner());
+    if cache.len() >= FILE_SHEET_CAP {
+        evict_one(&mut cache);
+    }
+    cache.insert(key, Arc::clone(&sheet));
+    sheet
+}
+
+fn empty_tail(stamp: u128) -> Tail {
+    Tail {
+        stamp,
+        sheet: Arc::new(empty_sheet()),
+        rows: 0,
+        cursor: 0,
+        done: false,
+        header: Vec::new(),
+        layout: None,
+        file: None,
+    }
+}
+
+/// Bytes through `newlines` line breaks. The file stays where the window ends.
+///
+/// One pass counts newlines. Bytes read past that newline are seeked back, so
+/// the next window does not skip them.
+fn read_more(file: &mut std::fs::File, newlines: usize) -> (Vec<u8>, bool) {
+    let mut buf = Vec::new();
+    let mut tmp = vec![0u8; 1024 * 1024];
+    let mut seen = 0usize;
+    loop {
+        let read = match file.read(&mut tmp) {
+            Ok(0) => return (buf, true),
+            Ok(count) => count,
+            Err(_) => return (buf, true),
+        };
+        let start = buf.len();
+        buf.extend_from_slice(&tmp[..read]);
+        let mut cut = None;
+        for (offset, byte) in buf[start..].iter().enumerate() {
+            if *byte != b'\n' {
+                continue;
+            }
+            seen += 1;
+            if seen == newlines {
+                cut = Some(start + offset + 1);
+                break;
+            }
+        }
+        let Some(cut) = cut else {
+            continue;
+        };
+        let extra = buf.len() - cut;
+        buf.truncate(cut);
+        if extra > 0 {
+            let _ = file.seek(SeekFrom::Current(-(extra as i64)));
+        }
+        return (buf, false);
+    }
+}
+
+fn sheet_rows(path: &Path, keep: Keep, pred: fn(&str) -> bool, want: usize) -> Arc<Sheet> {
+    // An earlier file in this same picture may have hit EOF. Only this file's end counts.
+    forget_tail_done();
+    let stamp = discover::meta_stamp(path);
+    let key = SheetKey {
+        path: path.to_path_buf(),
+        stamp,
+        keep,
+    };
+    if let Some(hit) = file_sheets()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .get(&key)
+    {
+        let rows = finished_rows(hit);
+        if want >= rows {
+            mark_tail_done();
+            return Arc::clone(hit);
+        }
+        return Arc::new(clip_sheet(hit, want));
+    }
+    let map_key = (path.to_path_buf(), keep);
+    {
+        let held = tails().lock().unwrap_or_else(|err| err.into_inner());
+        if let Some(tail) = held.get(&map_key) {
+            if tail.stamp == stamp && (tail.done || tail.rows >= want) {
+                if tail.done {
+                    mark_tail_done();
+                }
+                return shared_rows(&tail.sheet, want.min(tail.rows), tail.rows);
+            }
+        }
+    }
+    let mut held = tails().lock().unwrap_or_else(|err| err.into_inner());
+    let tail = held.entry(map_key).or_insert_with(|| empty_tail(stamp));
+    if tail.stamp != stamp {
+        *tail = empty_tail(stamp);
+    }
+    if !tail.done && tail.rows < want {
+        if tail.file.is_none() {
+            match std::fs::File::open(path) {
+                Ok(mut file) => {
+                    if tail.cursor > 0 && file.seek(SeekFrom::Start(tail.cursor as u64)).is_err() {
+                        tail.done = true;
+                    } else {
+                        tail.file = Some(file);
+                    }
+                }
+                Err(_) => tail.done = true,
+            }
+        }
+        if !tail.done {
+            let add = want - tail.rows;
+            let newlines = if tail.cursor == 0 { add + 1 } else { add };
+            let read = tail
+                .file
+                .as_mut()
+                .map(|file| read_more(file, newlines.max(1)));
+            if let Some((chunk, file_eof)) = read {
+                fold_window(tail, &chunk, pred, file_eof);
+            }
+        }
+    }
+    if tail.done {
+        mark_tail_done();
+        tail.file = None;
+        let finished = Arc::clone(&tail.sheet);
+        let have = tail.rows;
+        drop(held);
+        let mut cache = file_sheets().lock().unwrap_or_else(|err| err.into_inner());
+        if cache.len() >= FILE_SHEET_CAP {
+            evict_one(&mut cache);
+        }
+        cache.insert(
+            SheetKey {
+                path: path.to_path_buf(),
+                stamp,
+                keep,
+            },
+            Arc::clone(&finished),
+        );
+        return shared_rows(&finished, want.min(have), have);
+    }
+    let shown = tail.rows.min(want);
+    shared_rows(&tail.sheet, shown, tail.rows)
+}
+
+fn shared_rows(sheet: &Arc<Sheet>, rows: usize, have: usize) -> Arc<Sheet> {
+    if rows >= have {
+        Arc::clone(sheet)
+    } else {
+        Arc::new(clip_sheet(sheet, rows))
+    }
+}
+
+fn finished_rows(sheet: &Sheet) -> usize {
+    sheet
+        .num
+        .values()
+        .map(Vec::len)
+        .chain(sheet.wide.values().map(Vec::len))
+        .max()
+        .unwrap_or(0)
+}
+
+fn clip_sheet(sheet: &Sheet, rows: usize) -> Sheet {
+    Sheet {
+        num: sheet
+            .num
+            .iter()
+            .map(|(name, values)| (name.clone(), values.iter().take(rows).copied().collect()))
+            .collect(),
+        wide: sheet
+            .wide
+            .iter()
+            .map(|(name, values)| (name.clone(), values.iter().take(rows).copied().collect()))
+            .collect(),
+        block: sheet.block.clone(),
+    }
+}
+
+fn extend_sheet(dest: &mut Sheet, extra: &Sheet) {
+    if dest.block.is_empty() {
+        dest.block.clone_from(&extra.block);
+    }
+    for (name, values) in &extra.num {
+        dest.num
+            .entry(name.clone())
+            .or_default()
+            .extend(values.iter().copied());
+    }
+    for (name, values) in &extra.wide {
+        dest.wide
+            .entry(name.clone())
+            .or_default()
+            .extend(values.iter().copied());
+    }
+}
+
+fn header_end(bytes: &[u8]) -> usize {
+    bytes
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .map(|index| index + 1)
+        .unwrap_or(bytes.len())
+}
+
+fn fold_window(tail: &mut Tail, chunk: &[u8], pred: fn(&str) -> bool, file_eof: bool) {
+    if chunk.is_empty() {
+        tail.done = file_eof;
+        return;
+    }
+    let body = if tail.cursor == 0 {
+        let end = header_end(chunk);
+        if tail.header.is_empty() {
+            tail.header = chunk[..end].to_vec();
+        }
+        &chunk[end..]
+    } else {
+        chunk
+    };
+    adopt_layout(tail, pred);
+    let Some(layout) = tail.layout.clone() else {
+        tail.cursor += chunk.len();
+        tail.done = true;
+        return;
+    };
+    let text = String::from_utf8_lossy(body);
+    let extra = sheet_from(
+        layout.names,
+        slots_from_body(text.as_ref(), &layout.kinds),
+        layout.block,
+    );
+    tail.rows += finished_rows(&extra);
+    extend_shared(&mut tail.sheet, &extra);
+    tail.cursor += chunk.len();
+    tail.done = file_eof;
+}
+
+fn adopt_layout(tail: &mut Tail, pred: fn(&str) -> bool) {
+    if tail.layout.is_some() {
+        return;
+    }
+    let header = std::str::from_utf8(&tail.header).unwrap_or("");
+    let header = header.trim_end_matches(['\r', '\n']);
+    if header.is_empty() {
+        return;
+    }
+    let (names, kinds, block) = header_schema(header, &pred);
+    tail.layout = Some(Layout {
+        names,
+        kinds,
+        block,
+    });
+}
+
+fn extend_shared(dest: &mut Arc<Sheet>, extra: &Sheet) {
+    extend_sheet(Arc::make_mut(dest), extra);
+}
+
 fn read_sheet_where(bytes: &[u8], keep: impl Fn(&str) -> bool + Sync) -> Sheet {
     let text = match std::str::from_utf8(bytes) {
         Ok(text) => std::borrow::Cow::Borrowed(text),
@@ -2460,51 +3293,61 @@ fn read_sheet_where(bytes: &[u8], keep: impl Fn(&str) -> bool + Sync) -> Sheet {
     let (header, body) = text.split_once('\n').unwrap_or((text.as_ref(), ""));
     let header = header.trim_end_matches('\r');
     if header.is_empty() {
-        return Sheet {
-            num: BTreeMap::new(),
-            wide: BTreeMap::new(),
-        };
+        return empty_sheet();
     }
-    let (names, kinds) = header_schema(header, &keep);
-    let parts = body_parts(body);
-    let slots = if parts.len() < 2 {
-        let mut slots = fresh_slots(&kinds);
-        fill_rows(body, &mut slots);
-        slots
-    } else {
-        let mut slots = Vec::new();
-        std::thread::scope(|scope| {
-            let mut joins = Vec::new();
-            for part in parts {
-                let kinds = &kinds;
-                joins.push(scope.spawn(move || {
-                    let mut slots = fresh_slots(kinds);
-                    fill_rows(part, &mut slots);
-                    slots
-                }));
-            }
-            for join in joins {
-                let part = join.join().unwrap();
-                if slots.is_empty() {
-                    slots = part;
-                } else {
-                    append_slots(&mut slots, part);
-                }
-            }
-        });
-        slots
-    };
-    sheet_from(names, slots)
+    let (names, kinds, block) = header_schema(header, &keep);
+    sheet_from(names, slots_from_body(body, &kinds), block)
 }
 
-fn header_schema(header: &str, keep: &impl Fn(&str) -> bool) -> (Vec<Option<String>>, Vec<Kind>) {
+fn slots_from_body(body: &str, kinds: &[Kind]) -> Vec<Slot> {
+    let parts = body_parts(body);
+    if parts.len() < 2 {
+        let mut slots = fresh_slots(kinds);
+        fill_rows(body, &mut slots);
+        return slots;
+    }
+    let mut slots = Vec::new();
+    std::thread::scope(|scope| {
+        let mut joins = Vec::new();
+        for part in parts {
+            joins.push(scope.spawn(move || {
+                let mut slots = fresh_slots(kinds);
+                fill_rows(part, &mut slots);
+                slots
+            }));
+        }
+        for join in joins {
+            let part = join.join().unwrap();
+            if slots.is_empty() {
+                slots = part;
+            } else {
+                append_slots(&mut slots, part);
+            }
+        }
+    });
+    slots
+}
+
+fn header_schema(
+    header: &str,
+    keep: &impl Fn(&str) -> bool,
+) -> (Vec<Option<String>>, Vec<Kind>, BTreeMap<String, u32>) {
     let mut used = HashMap::<String, ()>::new();
     let mut names = Vec::new();
     let mut kinds = Vec::new();
+    let mut block_of = BTreeMap::new();
+    let mut block = 0u32;
+    let mut spots = 0u32;
     let mut cursor = 0usize;
     while let Some((start, end, next)) = next_cell(header, cursor) {
         let name = cell_owned(header, start, end);
         let base = header_base(&name);
+        if base.eq_ignore_ascii_case("spot_no") {
+            if spots > 0 {
+                block += 1;
+            }
+            spots += 1;
+        }
         // ponytail: strip columns are not a binned metric. Stop skipping them if one is.
         if name.is_empty() || base.to_ascii_lowercase().contains("strip") || !keep(&name) {
             names.push(None);
@@ -2518,6 +3361,7 @@ fn header_schema(header: &str, keep: &impl Fn(&str) -> bool) -> (Vec<Option<Stri
             } else {
                 Kind::Num
             };
+            block_of.insert(key.clone(), block);
             names.push(Some(key));
             kinds.push(kind);
         }
@@ -2526,7 +3370,7 @@ fn header_schema(header: &str, keep: &impl Fn(&str) -> bool) -> (Vec<Option<Stri
         }
         cursor = next;
     }
-    (names, kinds)
+    (names, kinds, block_of)
 }
 
 fn fresh_slots(kinds: &[Kind]) -> Vec<Slot> {
@@ -2617,7 +3461,7 @@ fn append_slots(base: &mut [Slot], extra: Vec<Slot>) {
     }
 }
 
-fn sheet_from(names: Vec<Option<String>>, slots: Vec<Slot>) -> Sheet {
+fn sheet_from(names: Vec<Option<String>>, slots: Vec<Slot>, block: BTreeMap<String, u32>) -> Sheet {
     let mut num = BTreeMap::new();
     let mut wide = BTreeMap::new();
     for (name, slot) in names.into_iter().zip(slots) {
@@ -2634,7 +3478,7 @@ fn sheet_from(names: Vec<Option<String>>, slots: Vec<Slot>) -> Sheet {
             }
         }
     }
-    Sheet { num, wide }
+    Sheet { num, wide, block }
 }
 
 fn unique_header(name: &str, used: &mut HashMap<String, ()>) -> String {
@@ -2726,10 +3570,42 @@ fn push_nan(slot: &mut Slot) {
 fn cell_f32(line: &str, start: usize, end: usize) -> f32 {
     let cell = &line[start..end];
     if cell.as_bytes().first() == Some(&b'"') {
-        let stripped = strip_quotes(cell);
-        return f32_bytes(stripped.as_bytes());
+        let mut buf = [0u8; 64];
+        if let Some(raw) = unquote_stack(cell, &mut buf) {
+            return f32_bytes(raw);
+        }
+        return f32_bytes(strip_quotes(cell).as_bytes());
     }
     f32_bytes(cell.as_bytes())
+}
+
+/// Copy a short quoted cell into `buf` without allocating.
+/// A cell longer than the buffer returns `None`.
+fn unquote_stack<'a>(cell: &str, buf: &'a mut [u8; 64]) -> Option<&'a [u8]> {
+    let bytes = cell.as_bytes();
+    let mut n = 0usize;
+    let mut i = 1usize;
+    while i < bytes.len() {
+        if bytes[i] == b'"' {
+            if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                if n == buf.len() {
+                    return None;
+                }
+                buf[n] = b'"';
+                n += 1;
+                i += 2;
+                continue;
+            }
+            break;
+        }
+        if n == buf.len() {
+            return None;
+        }
+        buf[n] = bytes[i];
+        n += 1;
+        i += 1;
+    }
+    Some(&buf[..n])
 }
 
 fn f32_bytes(bytes: &[u8]) -> f32 {
@@ -2746,14 +3622,34 @@ fn f32_bytes(bytes: &[u8]) -> f32 {
 fn cell_f64(line: &str, start: usize, end: usize) -> f64 {
     let cell = &line[start..end];
     if cell.as_bytes().first() == Some(&b'"') {
-        return strip_quotes(cell).trim().parse().unwrap_or(f64::NAN);
+        let mut buf = [0u8; 64];
+        if let Some(raw) = unquote_stack(cell, &mut buf) {
+            return f64_bytes(raw);
+        }
+        return f64_bytes(strip_quotes(cell).as_bytes());
     }
-    cell.trim().parse().unwrap_or(f64::NAN)
+    f64_bytes(cell.as_bytes())
+}
+
+fn f64_bytes(bytes: &[u8]) -> f64 {
+    match parse_decimal(bytes) {
+        Num::Nan => f64::NAN,
+        Num::Value(value) => value,
+        Num::Std => std::str::from_utf8(bytes)
+            .ok()
+            .and_then(|text| text.trim().parse().ok())
+            .unwrap_or(f64::NAN),
+    }
 }
 
 fn cell_datetime(line: &str, start: usize, end: usize) -> f64 {
     let cell = &line[start..end];
     if cell.as_bytes().first() == Some(&b'"') {
+        let mut buf = [0u8; 64];
+        if let Some(raw) = unquote_stack(cell, &mut buf) {
+            let text = std::str::from_utf8(raw).unwrap_or("");
+            return parse_datetime(text).unwrap_or(f64::NAN);
+        }
         return parse_datetime(&strip_quotes(cell)).unwrap_or(f64::NAN);
     }
     parse_datetime(cell).unwrap_or(f64::NAN)
@@ -2980,6 +3876,61 @@ mod tests {
     }
 
     #[test]
+    fn timeslice_position_error_uses_each_controllers_spot() {
+        let root = std::env::temp_dir().join(format!(
+            "scan-kit-slice-clock-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let session = root.join("sess");
+        std::fs::create_dir_all(session.join("layer-0/run-0")).unwrap();
+        let mut map = String::from("energy,layer_id,spot_no,position_x,position_y\n");
+        for spot in 0..16 {
+            map.push_str(&format!("70,1,{spot},{spot},{}\n", spot as f32 * 0.5));
+        }
+        std::fs::write(session.join("input_map.csv"), map).unwrap();
+        // IC3 leads, then IC1, then IC2. On one row IC2 is three spots ahead of IC1,
+        // and IC3's layer is not the layer either chamber is delivering.
+        let mut slice = String::from(
+            "spot_no,layer_id,spot_no,layer_id,r_ic1_x_position,r_ic1_y_position,ic1_position_x_target,ic1_position_y_target,spot_no,layer_id,r_ic2_x_position,r_ic2_y_position,ic2_position_x_target,ic2_position_y_target,rci_in_trigger\n",
+        );
+        for spot in 0..12 {
+            let ic2 = spot + 3;
+            let ic1_x = spot as f32 + 64.5;
+            let ic1_y = spot as f32 * 0.5 + 64.5;
+            let ic2_x = ic2 as f32 + 64.5;
+            let ic2_y = ic2 as f32 * 0.5 + 64.5;
+            slice.push_str(&format!(
+                "0,99,{spot},1,{ic1_x},{ic1_y},{ic1_x},{ic1_y},{ic2},1,{ic2_x},{ic2_y},{ic2_x},{ic2_y},1\n"
+            ));
+        }
+        std::fs::write(
+            session.join("layer-0/run-0/timeslice_data_device_units.csv"),
+            slice,
+        )
+        .unwrap();
+        let table = load_slice_metric(&root, "sess", "position_error", false);
+        let near = |values: &[f32]| {
+            values
+                .iter()
+                .all(|value| value.is_finite() && value.abs() < 1e-2)
+        };
+        assert!(near(table.get("ic1_x_err").unwrap()));
+        assert!(near(table.get("ic1_y_err").unwrap()));
+        assert!(near(table.get("ic2_x_err").unwrap()));
+        assert!(near(table.get("ic2_y_err").unwrap()));
+        let plan_x = table.get("plan_x").unwrap();
+        let plan_y = table.get("plan_y").unwrap();
+        assert!((plan_x[5] - 5.0).abs() < 1e-3);
+        assert!((plan_y[5] - 2.5).abs() < 1e-3);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn a_long_timeslice_keeps_every_sample() {
         let root = std::env::temp_dir().join(format!("scan-kit-slice-all-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -3002,6 +3953,99 @@ mod tests {
         assert_eq!(position.get("ic1_x").map(Vec::len), Some(rows));
         let current = load_timeslice(&root, "sess", "ic_current");
         assert_eq!(current.get("ic1_current").map(Vec::len), Some(rows));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_slice_keeps_a_prefix_then_the_rest_of_the_file() {
+        let root = std::env::temp_dir().join(format!(
+            "scan-kit-slice-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let session = root.join("sess");
+        std::fs::create_dir_all(&session).unwrap();
+        std::fs::write(
+            session.join("input_map.csv"),
+            "energy,charge_req,position_x,position_y\n70,1,0,0\n90,2,4,1\n110,3,8,2\n",
+        )
+        .unwrap();
+        std::fs::write(
+            session.join("spot_data.csv"),
+            "ic1_total_dose,ic2_total_dose,position_x,position_y\n1,1,0,0\n2,2,4,1\n3,3,8,2\n",
+        )
+        .unwrap();
+        bind_slice("sess", SliceTake::Spot { rows: 2 });
+        let prefix = load_spot(&root, "sess", false, false, false);
+        assert_eq!(prefix.get("ic1_dose").map(Vec::len), Some(2));
+        assert!(!slice_tail_done());
+        clear_slice();
+        bind_slice("sess", SliceTake::Spot { rows: 8 });
+        let rest = load_spot(&root, "sess", false, false, false);
+        assert_eq!(
+            rest.get("ic1_dose").map(Vec::as_slice),
+            Some([1.0, 2.0, 3.0].as_slice())
+        );
+        assert!(slice_tail_done());
+        clear_slice();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_growing_timeslice_matches_the_full_table() {
+        let root = std::env::temp_dir().join(format!(
+            "scan-kit-grow-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let session = root.join("grow");
+        std::fs::create_dir_all(session.join("layer-0/run-0")).unwrap();
+        std::fs::create_dir_all(session.join("layer-1/run-0")).unwrap();
+        std::fs::write(session.join("input_map.csv"), "energy\n70\n90\n").unwrap();
+        for (layer, values) in [(0, "1\n2\n3\n4\n"), (1, "5\n6\n7\n8\n")] {
+            std::fs::write(
+                session.join(format!(
+                    "layer-{layer}/run-0/timeslice_data_device_units.csv"
+                )),
+                format!("r_ic1_current_dose\n{values}"),
+            )
+            .unwrap();
+        }
+        for (files, tail_rows) in [(0, 2), (0, 4), (1, 2), (2, 1)] {
+            bind_slice("grow", SliceTake::Timeslice { files, tail_rows });
+            let _ = load_timeslice(&root, "grow", "ic_current");
+            let _ = timeslice_signals(&root, "grow");
+            let _ = load_slice_metric(&root, "grow", "position_error", false);
+        }
+        let grown = load_timeslice(&root, "grow", "ic_current");
+        let signals = timeslice_signals(&root, "grow");
+        let position = load_slice_metric(&root, "grow", "position_error", false);
+        clear_slice();
+        let full = load_timeslice(&root, "grow", "ic_current");
+        let full_signals = timeslice_signals(&root, "grow");
+        let full_position = load_slice_metric(&root, "grow", "position_error", false);
+        let same = |left: &BTreeMap<String, Vec<f32>>, right: &BTreeMap<String, Vec<f32>>| {
+            left.len() == right.len()
+                && left.iter().all(|(key, values)| {
+                    right.get(key).is_some_and(|other| {
+                        values.len() == other.len()
+                            && values
+                                .iter()
+                                .zip(other)
+                                .all(|(left, right)| left.to_bits() == right.to_bits())
+                    })
+                })
+        };
+        assert!(same(grown.as_ref(), full.as_ref()));
+        assert!(same(signals.as_ref(), full_signals.as_ref()));
+        assert!(same(position.as_ref(), full_position.as_ref()));
+        assert_eq!(full.get("ic1_current").map(Vec::len), Some(8));
         let _ = std::fs::remove_dir_all(&root);
     }
 

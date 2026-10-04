@@ -498,6 +498,10 @@ pub struct Plot {
     background: [f32; 4],
     foreground: [f32; 4],
     marks: Marks,
+    /// Packed line, point, and quad bytes from the payload. Taken on upload.
+    pub(crate) encoded: Option<crate::payload::EncodedMarks>,
+    /// Heat textures reused when the next payload has the same pixels.
+    kept_heats: Option<Vec<HeatGpu>>,
     gpu: Option<GpuMarks>,
     frame_buf: Option<wgpu::Buffer>,
     text_buf: Option<wgpu::Buffer>,
@@ -555,6 +559,8 @@ impl Plot {
             .collect::<Vec<_>>();
         Self {
             marks,
+            encoded: None,
+            kept_heats: None,
             panels,
             columns,
             weights,
@@ -601,7 +607,12 @@ impl Plot {
             if panel.x_label != previous_panel.x_label || panel.y_label != previous_panel.y_label {
                 continue;
             }
-            if axes_close(previous.home[index], self.home[index]) {
+            // A fit the user has not touched tracks the new data, so a session
+            // that arrives after the first partial stays on screen. A zoom or
+            // pan is kept when the quantity and the span are still close.
+            if previous.cameras[index] != previous.home[index]
+                && axes_close(previous.home[index], self.home[index])
+            {
                 self.cameras[index] = previous.cameras[index];
             }
         }
@@ -1108,41 +1119,49 @@ impl Plot {
         self.uniform_buf = Some(buffer);
     }
 
+    /// Keep heatmap textures when the pixels did not change.
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn keep_heatmaps(&mut self, mut previous: Plot) {
+        if previous.marks.heatmaps != self.marks.heatmaps {
+            return;
+        }
+        if let Some(gpu) = previous.gpu.take() {
+            self.kept_heats = Some(gpu.heats);
+        }
+    }
+
     fn ensure_uploaded(&mut self, gpu: &PlotGpu) -> Result<(), GpuError> {
         if self.gpu.is_some() {
             return Ok(());
         }
-        let heats = self
-            .marks
-            .heatmaps
-            .iter()
-            .zip(&self.marks.heatmap_size)
-            .map(|(pixels, (cols, rows))| {
-                let texture = upload_rgba(&gpu.device, &gpu.queue, pixels, *cols, *rows)?;
-                let group =
-                    textured_group(&gpu.device, &gpu.textured_layout, &texture, &gpu.sampler);
-                Ok(HeatGpu { group, texture })
-            })
-            .collect::<Result<Vec<_>, GpuError>>()?;
+        let heats = if let Some(heats) = self.kept_heats.take() {
+            heats
+        } else {
+            self.marks
+                .heatmaps
+                .iter()
+                .zip(&self.marks.heatmap_size)
+                .map(|(pixels, (cols, rows))| {
+                    let texture = upload_rgba(&gpu.device, &gpu.queue, pixels, *cols, *rows)?;
+                    let group =
+                        textured_group(&gpu.device, &gpu.textured_layout, &texture, &gpu.sampler);
+                    Ok(HeatGpu { group, texture })
+                })
+                .collect::<Result<Vec<_>, GpuError>>()?
+        };
+        let (lines, points, quads) = if let Some(encoded) = self.encoded.take() {
+            (encoded.lines, encoded.points, encoded.quads)
+        } else {
+            (
+                encode_lines(&self.marks.lines),
+                encode_points(&self.marks.points),
+                encode_quads(&self.marks.quads),
+            )
+        };
         self.gpu = Some(GpuMarks {
-            lines: upload_buffer(
-                &gpu.device,
-                &gpu.queue,
-                "lines",
-                &encode_lines(&self.marks.lines),
-            ),
-            points: upload_buffer(
-                &gpu.device,
-                &gpu.queue,
-                "points",
-                &encode_points(&self.marks.points),
-            ),
-            quads: upload_buffer(
-                &gpu.device,
-                &gpu.queue,
-                "quads",
-                &encode_quads(&self.marks.quads),
-            ),
+            lines: upload_buffer(&gpu.device, &gpu.queue, "lines", &lines),
+            points: upload_buffer(&gpu.device, &gpu.queue, "points", &points),
+            quads: upload_buffer(&gpu.device, &gpu.queue, "quads", &quads),
             heats,
         });
         self.mark_uploads += 1;
@@ -2929,6 +2948,15 @@ mod tests {
         added.adopt_view(&first);
         assert_eq!(added.cameras[0], zoomed);
         assert_eq!(added.cameras[1], added.home[1]);
+
+        let plain = Plot::new(&scene, [0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0, 1.0]);
+        let mut grown = line_scene();
+        grown.panels[0].xmax = 18.0;
+        grown.panels[0].ymax = 18.0;
+        let mut refit = Plot::new(&grown, [0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0, 1.0]);
+        refit.adopt_view(&plain);
+        assert_eq!(refit.cameras[0], refit.home[0]);
+        assert!(refit.cameras[0].xmax > plain.cameras[0].xmax);
     }
 
     #[test]

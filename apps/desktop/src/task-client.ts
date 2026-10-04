@@ -26,7 +26,7 @@ export function parsePoll(bytes: Uint8Array): { report: Report; payload: Uint8Ar
 
 /// `null` is an unknown length, so the hairline sweeps. A fraction is a width.
 export function hairlineFraction(done: number, total: number): number | null {
-  if (!(total > 0)) {
+  if (!(total > 0) || done <= 0) {
     return null;
   }
   return Math.min(1, Math.max(0, done / total));

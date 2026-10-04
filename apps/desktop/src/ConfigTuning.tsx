@@ -50,6 +50,7 @@ import {
   type FormDoc,
 } from "@/ConfigForm";
 import { notify, notifyError, notifySaved } from "@/notify";
+import { usePageLoad } from "@/page-load";
 import { SidePane } from "@/SidePane";
 
 type Choice = { value: string; label: string; tooltip?: string };
@@ -142,9 +143,15 @@ export function ConfigTuning({
   const [previewing, setPreviewing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [waiting, setWaiting] = useState(true);
+  const [opening, setOpening] = useState(false);
+  usePageLoad(waiting || busy || previewing || opening);
   const openSeq = useRef(0);
+  const previewGen = useRef(0);
   const dirtyRef = useRef(false);
-  dirtyRef.current = dirty;
+  useEffect(() => {
+    dirtyRef.current = dirty;
+  });
   const sessionKey = selectedIds.join("|");
   const workflow = catalog?.workflows.find((item) => item.id === workflowId) ?? catalog?.workflows[0];
   const previewRequest = useMemo(() => {
@@ -185,9 +192,11 @@ export function ConfigTuning({
           setParams(defaultsOf(first));
         }
         setHideUnused(loaded.hide_unused);
+        setWaiting(false);
       })
       .catch((caught: unknown) => {
         if (!cancel) {
+          setWaiting(false);
           notifyError(caught);
         }
       });
@@ -204,19 +213,26 @@ export function ConfigTuning({
       if (dirtyRef.current && !window.confirm("Discard unsaved edits in this file?")) {
         return;
       }
-      const opened = await invoke<Opened>("scan_kit_config_open", {
-        dataDir: folder,
-        sessionId,
-      });
-      if (cancel || seq !== openSeq.current || opened.path == null) {
-        return;
-      }
-      setConfigDir(opened.path);
-      setFiles(opened.files);
-      const preferred = opened.files.find((name) => name.endsWith("devices.xml")) ?? opened.files[0];
-      if (preferred != null) {
-        setFile(preferred);
-        await loadFile(joinPath(opened.path, preferred), cancel);
+      setOpening(true);
+      try {
+        const opened = await invoke<Opened>("scan_kit_config_open", {
+          dataDir: folder,
+          sessionId,
+        });
+        if (cancel || seq !== openSeq.current || opened.path == null) {
+          return;
+        }
+        setConfigDir(opened.path);
+        setFiles(opened.files);
+        const preferred = opened.files.find((name) => name.endsWith("devices.xml")) ?? opened.files[0];
+        if (preferred != null) {
+          setFile(preferred);
+          await loadFile(joinPath(opened.path, preferred), cancel);
+        }
+      } finally {
+        if (!cancel) {
+          setOpening(false);
+        }
       }
     })().catch((caught: unknown) => {
       if (!cancel) {
@@ -229,12 +245,22 @@ export function ConfigTuning({
   }, [folder, sessionKey]);
 
   useEffect(() => {
+    const mine = previewGen.current + 1;
+    previewGen.current = mine;
     if (previewRequest == null) {
-      return;
+      const arm = window.setTimeout(() => {
+        if (previewGen.current === mine) {
+          setPreviewing(false);
+        }
+      }, 0);
+      return () => window.clearTimeout(arm);
     }
     let cancel = false;
     const request = previewRequest;
     const timer = window.setTimeout(() => {
+      if (cancel || previewGen.current !== mine) {
+        return;
+      }
       setPreviewing(true);
       void invoke<TuneResult>("scan_kit_config_tune", {
         workflow: request.workflowId,
@@ -258,7 +284,7 @@ export function ConfigTuning({
           }
         })
         .finally(() => {
-          if (!cancel) {
+          if (previewGen.current === mine) {
             setPreviewing(false);
           }
         });
@@ -270,15 +296,20 @@ export function ConfigTuning({
   }, [previewRequest]);
 
   async function loadFile(path: string, cancel = false) {
-    const loaded = await invoke<Loaded>("scan_kit_config_form", { path });
-    if (cancel) {
-      return;
+    setOpening(true);
+    try {
+      const loaded = await invoke<Loaded>("scan_kit_config_form", { path });
+      if (cancel) {
+        return;
+      }
+      setXml(loaded.xml);
+      setForm(loaded.form);
+      setIntegrity(loaded.integrity);
+      setDirty(false);
+      setPreview(null);
+    } finally {
+      setOpening(false);
     }
-    setXml(loaded.xml);
-    setForm(loaded.form);
-    setIntegrity(loaded.integrity);
-    setDirty(false);
-    setPreview(null);
   }
 
   async function browse() {

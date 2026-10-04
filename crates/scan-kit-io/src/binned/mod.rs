@@ -3,12 +3,15 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use scan_kit_core::{assign_bin_centers, quantile_edges, Control, Panel, PlotScene, Series};
+use scan_kit_core::{
+    apply_mask, assign_bin_centers, quantile_edges, segments_control, segments_from, segments_json,
+    BeamGate, Control, Panel, PlotScene, Rank, Segment, Series,
+};
 use serde_json::Value;
 
 use super::discover;
 use super::histogram::{bin_button, bin_share, hist_bin_count, share_key, BinShare, BIN_CHOICES};
-use super::marks::{apply_filter, contour_bands, control, flag, labeled, pick, text, BEAM_CHOICES};
+use super::marks::{contour_bands, control, flag, labeled, pick, text};
 mod glyphs;
 
 use super::tables::{
@@ -375,13 +378,6 @@ fn frame_of(source: &str) -> &'static str {
     }
 }
 
-const DOMAIN_CHOICES: &[(&str, &str)] = &[
-    ("all", "All"),
-    ("lower_95", "Lower 95%"),
-    ("upper_95", "Upper 5%"),
-    ("mad_outliers", "MAD Outliers"),
-];
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Trend {
     Off,
@@ -443,6 +439,12 @@ fn prepared_cache() -> &'static std::sync::Mutex<Option<Prepared>> {
 }
 
 fn cached_prepared(key: String, build: impl FnOnce() -> Prepared) -> Prepared {
+    // A partial slice must not be stored as the finished session.
+    if crate::tables::slice_is_bound() {
+        let mut built = build();
+        built.key = key;
+        return built;
+    }
     if let Some(hit) = prepared_cache()
         .lock()
         .unwrap_or_else(|err| err.into_inner())
@@ -469,8 +471,7 @@ fn prepared_key(
     x_column: &str,
     bins: &BinChoice,
     glyph: &str,
-    domain: &str,
-    beam: &str,
+    segments: &str,
     cutoff: f32,
 ) -> String {
     let mut stamp = String::new();
@@ -481,7 +482,7 @@ fn prepared_key(
         stamp.push(';');
     }
     format!(
-        "{}|{stamp}|{metric}|{source}|{x_column}|{}|{glyph}|{domain}|{beam}|{cutoff}",
+        "{}|{stamp}|{metric}|{source}|{x_column}|{}|{glyph}|{segments}|{cutoff}",
         root.display(),
         bin_label(bins),
     )
@@ -535,13 +536,19 @@ pub(crate) fn binned_summary(root: &Path, session_ids: &[String], options: &Valu
         .find(|group| group.id == metric)
         .unwrap_or(&GROUPS[0]);
     let glyph = pick(options, "glyph", "violin", GLYPH_CHOICES);
-    let beam_default = if coarse == "timeslice" {
-        "beam_on"
-    } else {
-        "beam_both"
-    };
-    let beam = pick(options, "beam", beam_default, BEAM_CHOICES);
-    let domain = pick(options, "domain", "all", DOMAIN_CHOICES);
+    let segments = segments_from(
+        options,
+        &[
+            Segment::Beam {
+                state: if coarse == "timeslice" {
+                    BeamGate::On
+                } else {
+                    BeamGate::Both
+                },
+            },
+            Segment::Rank { which: Rank::All },
+        ],
+    );
     let trend = trend_mode(options);
     let hist = flag(options, "hist", false);
     let corr = flag(options, "corr", false);
@@ -597,8 +604,7 @@ pub(crate) fn binned_summary(root: &Path, session_ids: &[String], options: &Valu
         x_column,
         &bins,
         glyph,
-        domain,
-        beam,
+        &segments_json(&segments),
         cutoff,
     );
     let prepared = cached_prepared(key, || {
@@ -617,7 +623,7 @@ pub(crate) fn binned_summary(root: &Path, session_ids: &[String], options: &Valu
             let mut table = std::sync::Arc::unwrap_or_clone(loaded);
             if group.filter {
                 let keys: Vec<&str> = group.series.iter().map(|series| series.key).collect();
-                apply_filter(&mut table, &keys, domain, beam);
+                apply_mask(&mut table, &segments, &keys);
             }
             table
         };
@@ -727,6 +733,16 @@ pub(crate) fn binned_summary(root: &Path, session_ids: &[String], options: &Valu
         }
     });
 
+    let pairs = if corr && !prepared.series.is_empty() {
+        let shown: Vec<&YSeries> = prepared
+            .series
+            .iter()
+            .filter_map(|item| group.series.iter().find(|series| series.key == item.key))
+            .collect();
+        correlation_slots(group.id, &shown)
+    } else {
+        Vec::new()
+    };
     let mut panels = Vec::new();
     if prepared.series.is_empty() {
         panels.push(note_panel("No finite values for this metric"));
@@ -758,19 +774,14 @@ pub(crate) fn binned_summary(root: &Path, session_ids: &[String], options: &Valu
                     interlock && group.id == "position_error",
                 ));
             }
-            if corr {
-                let other = &prepared.series[(index + 1) % prepared.series.len()];
-                let other = group
-                    .series
-                    .iter()
-                    .find(|series| series.key == other.key)
-                    .unwrap();
-                panels.push(corr_panel(series, other, &prepared.tables, group.label));
+            if let Some((left, right)) = pairs.get(index) {
+                panels.push(corr_panel(left, right, &prepared.tables, group.label));
             }
         }
     }
 
-    let side = u32::from(hist) + u32::from(corr);
+    let draw_corr = corr && (prepared.series.is_empty() || !pairs.is_empty());
+    let side = u32::from(hist) + u32::from(draw_corr);
     let mut weights = vec![8.0];
     weights.extend(std::iter::repeat_n(1.65, side as usize));
     PlotScene {
@@ -781,8 +792,7 @@ pub(crate) fn binned_summary(root: &Path, session_ids: &[String], options: &Valu
             group.id,
             x_id,
             glyph,
-            beam,
-            domain,
+            &segments,
             trend,
             hist,
             corr,
@@ -798,6 +808,74 @@ pub(crate) fn binned_summary(root: &Path, session_ids: &[String], options: &Valu
         column_weights: weights,
         row_weights: Vec::new(),
     }
+}
+
+/// Pairs for the correlation column, one per plotted series.
+///
+/// A channel quad (IC1/IC2 by X/Y) asks four questions: the two chambers on X,
+/// the two chambers on Y, then X against Y inside each chamber. A two-axis
+/// source asks that one question. Anything else pairs each series with the next.
+/// A source with one series has nothing to correlate. Missing channels drop the
+/// pairs that need them, and the remaining pairs fill the rows.
+fn correlation_slots<'a>(metric: &str, present: &[&'a YSeries]) -> Vec<(&'a YSeries, &'a YSeries)> {
+    let preferred = match metric {
+        "position_error" => &[
+            ("ic1_x_err", "ic2_x_err"),
+            ("ic1_y_err", "ic2_y_err"),
+            ("ic1_x_err", "ic1_y_err"),
+            ("ic2_x_err", "ic2_y_err"),
+        ][..],
+        "sigma" => &[
+            ("ic1_sig_x", "ic2_sig_x"),
+            ("ic1_sig_y", "ic2_sig_y"),
+            ("ic1_sig_x", "ic1_sig_y"),
+            ("ic2_sig_x", "ic2_sig_y"),
+        ][..],
+        "sigma_error" => &[
+            ("ic1_sig_x_err", "ic2_sig_x_err"),
+            ("ic1_sig_y_err", "ic2_sig_y_err"),
+            ("ic1_sig_x_err", "ic1_sig_y_err"),
+            ("ic2_sig_x_err", "ic2_sig_y_err"),
+        ][..],
+        "fit_confidence" => &[
+            ("ic1_x_confidence", "ic2_x_confidence"),
+            ("ic1_y_confidence", "ic2_y_confidence"),
+            ("ic1_x_confidence", "ic1_y_confidence"),
+            ("ic2_x_confidence", "ic2_y_confidence"),
+        ][..],
+        "peak_amplitude" => &[
+            ("ic1_x_peak", "ic2_x_peak"),
+            ("ic1_y_peak", "ic2_y_peak"),
+            ("ic1_x_peak", "ic1_y_peak"),
+            ("ic2_x_peak", "ic2_y_peak"),
+        ][..],
+        "amplifier_error" => &[("amp_x", "amp_y")][..],
+        "probe_field" => &[("field_x", "field_y")][..],
+        "ic12_pos_diff" => &[("ic12_x_diff", "ic12_y_diff")][..],
+        _ => &[][..],
+    };
+    let mut available = Vec::new();
+    for (left, right) in preferred {
+        let Some(a) = present.iter().copied().find(|series| series.key == *left) else {
+            continue;
+        };
+        let Some(b) = present.iter().copied().find(|series| series.key == *right) else {
+            continue;
+        };
+        available.push((a, b));
+    }
+    if available.is_empty() && present.len() >= 2 {
+        for (index, series) in present.iter().copied().enumerate() {
+            let other = present[(index + 1) % present.len()];
+            available.push((series, other));
+        }
+    }
+    if available.is_empty() {
+        return Vec::new();
+    }
+    (0..present.len())
+        .map(|index| available[index % available.len()])
+        .collect()
 }
 
 fn assemble_panel(
@@ -957,8 +1035,7 @@ fn controls(
     metric: &str,
     x: &str,
     glyph: &str,
-    beam: &str,
-    domain: &str,
+    segments: &[Segment],
     trend: Trend,
     hist: bool,
     corr: bool,
@@ -1018,15 +1095,18 @@ fn controls(
             .grouped("Correlation")
             .checked(),
     );
-    controls.push(labeled("domain", "Domain", DOMAIN_CHOICES, domain).grouped("Filter Data"));
-    controls.push(labeled("beam", "Beam", BEAM_CHOICES, beam).grouped("Filter Data"));
     let filters = GROUPS
         .iter()
         .any(|group| group.id == metric && group.filter);
+    if filters {
+        controls.push(segments_control(
+            segments,
+            &[("beam", "Beam"), ("rank", "Rank")],
+        ));
+    }
     controls.retain(|item| match item.id.as_str() {
         "cutoff" => glyph == "contour",
         "interlock" => interlock_ok(metric, x, glyph),
-        "beam" | "domain" => filters,
         _ => true,
     });
     controls
@@ -1201,7 +1281,8 @@ mod tests {
 
     use scan_kit_core::Series;
 
-    use super::super::marks::apply_filter;
+    use scan_kit_core::{apply_mask, parse_segments, BeamGate, Rank, Segment};
+
     use super::{
         assign_x, axis_label, binned_summary, binned_trend, scatter_series, violin_series,
         BinChoice, Trend,
@@ -2063,25 +2144,74 @@ mod tests {
         };
 
         let mut upper = fresh();
-        apply_filter(&mut upper, &["y"], "upper_95", "beam_both");
+        apply_mask(
+            &mut upper,
+            &[
+                Segment::Beam {
+                    state: BeamGate::Both,
+                },
+                Segment::Rank {
+                    which: Rank::Upper95,
+                },
+            ],
+            &["y"],
+        );
         assert_eq!(finite(&upper), vec![1000.0]);
 
         let mut lower = fresh();
-        apply_filter(&mut lower, &["y"], "lower_95", "beam_both");
+        apply_mask(
+            &mut lower,
+            &[
+                Segment::Beam {
+                    state: BeamGate::Both,
+                },
+                Segment::Rank {
+                    which: Rank::Lower95,
+                },
+            ],
+            &["y"],
+        );
         let kept = finite(&lower);
         assert!(kept.contains(&1.0));
         assert!(!kept.contains(&1000.0));
 
         let mut mad = fresh();
-        apply_filter(&mut mad, &["y"], "mad_outliers", "beam_both");
+        apply_mask(
+            &mut mad,
+            &[
+                Segment::Beam {
+                    state: BeamGate::Both,
+                },
+                Segment::Rank { which: Rank::Mad },
+            ],
+            &["y"],
+        );
         assert_eq!(finite(&mad), vec![1000.0]);
 
         let mut off = fresh();
-        apply_filter(&mut off, &["y"], "all", "beam_off");
+        apply_mask(
+            &mut off,
+            &[
+                Segment::Beam {
+                    state: BeamGate::Off,
+                },
+                Segment::Rank { which: Rank::All },
+            ],
+            &["y"],
+        );
         assert_eq!(finite(&off), vec![0.0]);
 
         let mut on = fresh();
-        apply_filter(&mut on, &["y"], "all", "beam_on");
+        apply_mask(
+            &mut on,
+            &[
+                Segment::Beam {
+                    state: BeamGate::On,
+                },
+                Segment::Rank { which: Rank::All },
+            ],
+            &["y"],
+        );
         let kept = finite(&on);
         assert!(!kept.contains(&0.0));
         assert!(kept.contains(&1000.0));
@@ -2091,42 +2221,47 @@ mod tests {
             &[],
             &serde_json::json!({"metric": "dose_error"}),
         );
-        let beam = dose
+        let listed = dose
             .controls
             .iter()
-            .find(|control| control.id == "beam")
-            .unwrap();
-        assert_eq!(beam.value, "Both");
-        assert_eq!(beam.labels(), vec!["Beam On", "Beam Off", "Both"]);
-        let domain = dose
-            .controls
-            .iter()
-            .find(|control| control.id == "domain")
+            .find(|control| control.id == "segments")
             .unwrap();
         assert_eq!(
-            domain.labels(),
-            vec!["All", "Lower 95%", "Upper 5%", "MAD Outliers"]
+            parse_segments(&listed.value).unwrap(),
+            vec![
+                Segment::Beam {
+                    state: BeamGate::Both
+                },
+                Segment::Rank { which: Rank::All },
+            ]
         );
+        assert_eq!(listed.labels(), vec!["Beam", "Rank"]);
         let current = binned_summary(
             std::path::Path::new("."),
             &[],
             &serde_json::json!({"metric": "ic_current"}),
         );
-        let current_beam = current
-            .controls
-            .iter()
-            .find(|control| control.id == "beam")
-            .unwrap();
-        assert_eq!(current_beam.value, "Beam On");
+        let current_list = parse_segments(
+            &current
+                .controls
+                .iter()
+                .find(|control| control.id == "segments")
+                .unwrap()
+                .value,
+        )
+        .unwrap();
+        assert!(current_list.iter().any(|item| matches!(
+            item,
+            Segment::Beam {
+                state: BeamGate::On
+            }
+        )));
         let rate = binned_summary(
             std::path::Path::new("."),
             &[],
             &serde_json::json!({"metric": "dose_rate"}),
         );
-        assert!(rate
-            .controls
-            .iter()
-            .all(|control| control.id != "beam" && control.id != "domain"));
+        assert!(rate.controls.iter().all(|control| control.id != "segments"));
     }
 
     fn probability_spans(scene: &scan_kit_core::PlotScene) -> Vec<f32> {
@@ -2240,5 +2375,109 @@ mod tests {
             widths.len() > 4,
             "outline widths should follow the density, not a rectangle"
         );
+    }
+
+    fn pair_keys(metric: &str, series: &[super::YSeries]) -> Vec<(&'static str, &'static str)> {
+        let present: Vec<_> = series.iter().collect();
+        super::correlation_slots(metric, &present)
+            .into_iter()
+            .map(|(left, right)| (left.key, right.key))
+            .collect()
+    }
+
+    #[test]
+    fn correlation_pairs_follow_the_selected_source() {
+        assert_eq!(
+            pair_keys("position_error", super::POSITION),
+            vec![
+                ("ic1_x_err", "ic2_x_err"),
+                ("ic1_y_err", "ic2_y_err"),
+                ("ic1_x_err", "ic1_y_err"),
+                ("ic2_x_err", "ic2_y_err"),
+            ]
+        );
+        assert_eq!(
+            pair_keys("position_error", &super::POSITION[..2]),
+            vec![("ic1_x_err", "ic1_y_err"), ("ic1_x_err", "ic1_y_err")]
+        );
+        assert_eq!(
+            pair_keys("sigma", super::SIGMA),
+            vec![
+                ("ic1_sig_x", "ic2_sig_x"),
+                ("ic1_sig_y", "ic2_sig_y"),
+                ("ic1_sig_x", "ic1_sig_y"),
+                ("ic2_sig_x", "ic2_sig_y"),
+            ]
+        );
+        assert_eq!(
+            pair_keys("amplifier_error", super::AMPLIFIER),
+            vec![("amp_x", "amp_y"), ("amp_x", "amp_y")]
+        );
+        assert!(pair_keys("dose_rate", super::DOSE_RATE).is_empty());
+        assert_eq!(
+            pair_keys("dose_error", super::DOSE_ERROR),
+            vec![
+                ("ic1_dose_err_pct", "ic2_dose_err_pct"),
+                ("ic2_dose_err_pct", "ic3_dose_err_pct"),
+                ("ic3_dose_err_pct", "ic1_dose_err_pct"),
+            ]
+        );
+    }
+
+    fn write_position_session(root: &std::path::Path, name: &str, rows: &str) {
+        let session = root.join(name);
+        std::fs::create_dir_all(&session).unwrap();
+        std::fs::write(
+            session.join("input_map.csv"),
+            "energy,charge_req,position_x,position_y\n70,1,0,0\n90,1,4,1\n",
+        )
+        .unwrap();
+        std::fs::write(session.join("spot_data.csv"), rows).unwrap();
+    }
+
+    #[test]
+    fn position_error_correlations_use_session_colors_and_the_four_questions() {
+        let root = std::env::temp_dir().join("scan-kit-binned-corr");
+        let _ = std::fs::remove_dir_all(&root);
+        let header = "ic1_total_dose_spot,r_ic1_x_spot_position,r_ic1_y_spot_position,r_ic2_x_spot_position,r_ic2_y_spot_position\n";
+        write_position_session(&root, "a", &format!("{header}1,1,0,2,1\n1,2,3,6,4\n"));
+        write_position_session(&root, "b", &format!("{header}1,3,1,0,2\n1,5,2,2,3\n"));
+        let scene = binned_summary(
+            &root,
+            &["a".to_string(), "b".to_string()],
+            &serde_json::json!({"metric": "Position Error (mm)", "corr": "On"}),
+        );
+        let labels: Vec<_> = scene
+            .panels
+            .iter()
+            .filter(|panel| panel.title.is_empty() && !panel.x_label.is_empty())
+            .map(|panel| (panel.x_label.as_str(), panel.y_label.as_str()))
+            .collect();
+        assert_eq!(
+            labels,
+            vec![
+                ("IC1 X (mm)", "IC2 X (mm)"),
+                ("IC1 Y (mm)", "IC2 Y (mm)"),
+                ("IC1 X (mm)", "IC1 Y (mm)"),
+                ("IC2 X (mm)", "IC2 Y (mm)"),
+            ]
+        );
+        for panel in scene
+            .panels
+            .iter()
+            .filter(|panel| panel.title.is_empty() && !panel.x_label.is_empty())
+        {
+            let clouds = panel
+                .series
+                .iter()
+                .filter(|series| matches!(series, Series::Points { .. }))
+                .count();
+            assert_eq!(clouds, 2, "{} vs {}", panel.x_label, panel.y_label);
+            assert!(panel.series.iter().any(|series| matches!(
+                series,
+                Series::Polyline { color, .. } if color[3] == 0.0
+            )));
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

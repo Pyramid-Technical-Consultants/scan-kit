@@ -104,8 +104,9 @@ impl WebPlot {
     /// Replace the scene with a payload from `scan_kit_open_plot`.
     pub fn load(&mut self, bytes: &[u8]) -> Result<(), JsValue> {
         let mut plot = Plot::from_payload(bytes).map_err(|err| JsValue::from_str(&err))?;
-        if let Some(previous) = &self.plot {
-            plot.adopt_view(previous);
+        if let Some(previous) = self.plot.take() {
+            plot.adopt_view(&previous);
+            plot.keep_heatmaps(previous);
         }
         plot.apply(self.config.width, self.config.height, &PlotInput::default());
         self.plot = Some(plot);

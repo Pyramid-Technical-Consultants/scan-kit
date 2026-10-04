@@ -97,7 +97,7 @@ Binned summaries use quantile bin edges and a histogram of the values in each bi
 
 ## SK-REQ-017
 
-Binned Summary draws the 1.8 metric groups (dose error, dose ratio, dose rate, current ratio, IC current, position error, sigma, sigma error, IC2 minus IC1, and spot time) against energy, target MU, spot time, or radius. Energy is one bin per value and the other axes use quantile bins. Glyphs are violin, box, mean, scatter, and contour, with the 1.8 trend, histogram, correlation, fliers, beam and domain filters, and interlock lines. Timeslice Replay draws every sample of one channel. Zoom reads that trace; the scene is not a fixed overview or a strided detail.
+Binned Summary draws the 1.8 metric groups (dose error, dose ratio, dose rate, current ratio, IC current, position error, sigma, sigma error, IC2 minus IC1, and spot time) against energy, target MU, spot time, or radius. Energy is one bin per value and the other axes use quantile bins. Glyphs are violin, box, mean, scatter, and contour, with the 1.8 trend, histogram, correlation, fliers, the segment list, and interlock lines. Timeslice Replay draws every sample of one channel. Zoom reads that trace; the scene is not a fixed overview or a strided detail.
 
 ## SK-REQ-018
 

@@ -1,18 +1,9 @@
 //! Shared plot helpers: option picking, row filters, and contour bands.
 
-use std::collections::BTreeMap;
-
 use scan_kit_core::{Control, Series};
 use serde_json::Value;
 
-use super::tables::{modified_z, percentile};
-
-const MOD_Z: f32 = 3.5;
-pub(crate) const BEAM_CHOICES: &[(&str, &str)] = &[
-    ("beam_on", "Beam On"),
-    ("beam_off", "Beam Off"),
-    ("beam_both", "Both"),
-];
+use super::tables::percentile;
 
 /// Nested density fills plus the isolines around each band.
 pub(crate) fn contour_bands(xs: &[f32], ys: &[f32], cutoff_pct: f32) -> Vec<Series> {
@@ -290,81 +281,6 @@ pub(crate) fn control(id: &str, label: &str, options: &[&str], value: &str) -> C
     Control::plain(id, label, options.iter().copied(), value)
 }
 
-pub(crate) fn apply_filter(
-    table: &mut BTreeMap<String, Vec<f32>>,
-    keys: &[&str],
-    domain: &str,
-    beam: &str,
-) {
-    let n = table.values().map(Vec::len).max().unwrap_or(0);
-    if n == 0 {
-        return;
-    }
-    let mut keep = vec![true; n];
-    if let Some(gate) = table.get("beam_on") {
-        for (slot, value) in keep.iter_mut().zip(gate) {
-            let on = !value.is_finite() || *value > 0.5;
-            *slot = match beam {
-                "beam_off" => !on,
-                "beam_both" => true,
-                _ => on,
-            };
-        }
-    }
-    if domain != "all" {
-        let columns: Vec<Vec<f32>> = keys
-            .iter()
-            .filter_map(|key| table.get(*key).cloned())
-            .collect();
-        if !columns.is_empty() {
-            let severity: Vec<f32> = (0..n)
-                .map(|row| {
-                    columns
-                        .iter()
-                        .filter_map(|column| column.get(row).copied())
-                        .filter(|v| v.is_finite())
-                        .map(f32::abs)
-                        .fold(None, |acc: Option<f32>, v| {
-                            Some(acc.map(|a| a.max(v)).unwrap_or(v))
-                        })
-                        .unwrap_or(f32::NAN)
-                })
-                .collect();
-            let valid: Vec<f32> = severity.iter().copied().filter(|v| v.is_finite()).collect();
-            if domain == "mad_outliers" {
-                let z: Vec<Vec<f32>> = columns.iter().map(|column| modified_z(column)).collect();
-                for row in 0..n {
-                    let outlier = z
-                        .iter()
-                        .any(|axis| axis.get(row).copied().unwrap_or(0.0).abs() > MOD_Z);
-                    keep[row] &= outlier;
-                }
-            } else if !valid.is_empty() {
-                let cutoff = percentile(&valid, 0.95);
-                for (row, value) in severity.iter().enumerate() {
-                    let pass = value.is_finite()
-                        && if domain == "upper_95" {
-                            *value > cutoff
-                        } else {
-                            *value <= cutoff
-                        };
-                    keep[row] &= pass;
-                }
-            }
-        }
-    }
-    for (key, values) in table.iter_mut() {
-        if key == "beam_on" || key == "expected_sigma" || key == "session_avg_rate" {
-            continue;
-        }
-        for (value, keep) in values.iter_mut().zip(&keep) {
-            if !keep {
-                *value = f32::NAN;
-            }
-        }
-    }
-}
-
 pub(crate) fn text<'a>(options: &'a Value, key: &str, default: &'a str) -> &'a str {
     options.get(key).and_then(Value::as_str).unwrap_or(default)
 }
@@ -431,7 +347,13 @@ rci_in_trigger,r_ic1_x_confidence,r_ic1_x_peak_amplitude,c_x,r_xV,r_tx2_probe_x
         assert!(!confidence.contains_key("ic1_y_confidence"));
 
         let mut filtered = confidence;
-        apply_filter(&mut filtered, &["ic1_x_confidence"], "all", "beam_on");
+        scan_kit_core::apply_mask(
+            &mut filtered,
+            &[scan_kit_core::Segment::Beam {
+                state: scan_kit_core::BeamGate::On,
+            }],
+            &["ic1_x_confidence"],
+        );
         assert!(filtered["ic1_x_confidence"][0].is_finite());
         assert!(filtered["ic1_x_confidence"][1].is_nan());
         assert!((filtered["ic1_x_confidence"][2] - 40.0).abs() < 1e-4);

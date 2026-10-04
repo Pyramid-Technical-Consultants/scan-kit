@@ -2,16 +2,17 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use scan_kit_core::{
-    beam_on_mask, coverage_percent, BeamState, Family, Panel, PlotScene, Series, SESSION,
+    apply_mask, coverage_percent, segments_control, segments_from, BeamGate, Family, Panel,
+    PlotScene, Segment, Series, SESSION,
 };
 use serde_json::Value;
 
 use crate::histogram::{bin_button, hist_bin_count, histogram_panel, BIN_CHOICES};
 
 use super::{
-    apply_filter, col, contour_bands, control, drew_line, finite_col, flag, guide, labeled, panel,
+    col, contour_bands, control, drew_line, finite_col, flag, guide, labeled, panel,
     percentile_sorted, pick, placed, scene, slice_table, spot_table, stroke, text,
-    timeslice_metric, BEAM_CHOICES, MARK,
+    timeslice_metric, MARK,
 };
 
 const DRAW_CHOICES: &[(&str, &str)] = &[
@@ -40,15 +41,15 @@ pub(super) fn distribution(root: &Path, session_ids: &[String], options: &Value)
     let picked = crate::source::select(crate::source::Shape::Xy, true, true, &headers, options);
     let mode = picked.xy;
     let grain = picked.grain;
-    let beam = pick(
+    let segments = segments_from(
         options,
-        "beam",
-        if grain == "timeslice" || matches!(mode, "amplifier" | "probe") {
-            "beam_on"
-        } else {
-            "beam_both"
-        },
-        BEAM_CHOICES,
+        &[Segment::Beam {
+            state: if grain == "timeslice" || matches!(mode, "amplifier" | "probe") {
+                BeamGate::On
+            } else {
+                BeamGate::Both
+            },
+        }],
     );
     let draw = pick(options, "draw", "scatter", DRAW_CHOICES);
     let ramp = pick(
@@ -68,19 +69,19 @@ pub(super) fn distribution(root: &Path, session_ids: &[String], options: &Value)
     let bins = hist_bin_count(hist_raw);
     let (panels, columns, has_plan) = if mode == "confidence" {
         (
-            confidence_scene(root, session_ids, beam, draw, ramp, cutoff),
+            confidence_scene(root, session_ids, &segments, draw, ramp, cutoff),
             0,
             false,
         )
     } else if mode == "coverage" {
-        (coverage_scene(root, session_ids, beam), 0, false)
+        (coverage_scene(root, session_ids, &segments), 0, false)
     } else {
         column_scene(
             root,
             session_ids,
             mode,
             grain,
-            beam,
+            &segments,
             draw,
             ramp,
             cutoff,
@@ -135,7 +136,7 @@ pub(super) fn distribution(root: &Path, session_ids: &[String], options: &Value)
             control("hist_bins", "Bins", BIN_CHOICES, &bin_button(hist_raw)).grouped("Histogram"),
         );
     }
-    controls.push(labeled("beam", "Beam", BEAM_CHOICES, beam).grouped("Filter Data"));
+    controls.push(segments_control(&segments, &[("beam", "Beam")]));
     let mut scene = scene("Distribution Explorer", panels, controls);
     scene.columns = columns;
     if columns > 0 && scene.panels.len() == columns as usize * 3 {
@@ -160,10 +161,10 @@ fn kept_pairs(
     table: &BTreeMap<String, Vec<f32>>,
     x_key: &str,
     y_key: &str,
-    beam: &str,
+    segments: &[Segment],
 ) -> (Vec<f32>, Vec<f32>) {
     let mut copy = table.clone();
-    apply_filter(&mut copy, &[x_key, y_key], "all", beam);
+    apply_mask(&mut copy, segments, &[x_key, y_key]);
     finite_pairs(
         copy.get(x_key).map(Vec::as_slice).unwrap_or(&[]),
         copy.get(y_key).map(Vec::as_slice).unwrap_or(&[]),
@@ -380,7 +381,7 @@ fn column_scene(
     session_ids: &[String],
     mode: &str,
     grain: &str,
-    beam: &str,
+    segments: &[Segment],
     draw: &str,
     ramp: &str,
     cutoff: f32,
@@ -400,7 +401,7 @@ fn column_scene(
     for (name, x_key, y_key) in column_specs(mode, ic1, ic2, drawn_plan) {
         let mut clouds = Vec::new();
         for table in &tables {
-            let (xs, ys) = kept_pairs(table, x_key, y_key, beam);
+            let (xs, ys) = kept_pairs(table, x_key, y_key, segments);
             if !xs.is_empty() {
                 clouds.push((xs, ys));
             }
@@ -507,7 +508,7 @@ fn column_scene(
 fn confidence_scene(
     root: &Path,
     session_ids: &[String],
-    beam: &str,
+    segments: &[Segment],
     draw: &str,
     ramp: &str,
     cutoff: f32,
@@ -530,8 +531,8 @@ fn confidence_scene(
         for (peaks, confidence) in peaks.iter().zip(&confidence) {
             let mut peaks = std::sync::Arc::unwrap_or_clone(std::sync::Arc::clone(peaks));
             let mut confidence = std::sync::Arc::unwrap_or_clone(std::sync::Arc::clone(confidence));
-            apply_filter(&mut peaks, &[peak_key], "all", beam);
-            apply_filter(&mut confidence, &[conf_key], "all", beam);
+            apply_mask(&mut peaks, segments, &[peak_key]);
+            apply_mask(&mut confidence, segments, &[conf_key]);
             let (xs, ys) = finite_pairs(
                 peaks.get(peak_key).map(Vec::as_slice).unwrap_or(&[]),
                 confidence.get(conf_key).map(Vec::as_slice).unwrap_or(&[]),
@@ -584,7 +585,7 @@ fn confidence_scene(
     panels
 }
 
-fn coverage_scene(root: &Path, session_ids: &[String], beam: &str) -> Vec<Panel> {
+fn coverage_scene(root: &Path, session_ids: &[String], segments: &[Segment]) -> Vec<Panel> {
     let thresholds: Vec<f32> = (0..=400).map(|step| step as f32 * 0.25).collect();
     let mut panels = Vec::new();
     for (title, x_key, y_key) in [
@@ -597,14 +598,8 @@ fn coverage_scene(root: &Path, session_ids: &[String], beam: &str) -> Vec<Panel>
         let mut series = Vec::new();
         for table in loaded {
             let mut table = std::sync::Arc::unwrap_or_clone(table);
-            apply_filter(&mut table, &[x_key, y_key], "all", beam);
-            let metrics = spot_coverage_metrics(
-                None,
-                col(&table, x_key),
-                col(&table, y_key),
-                None,
-                BeamState::All,
-            );
+            apply_mask(&mut table, segments, &[x_key, y_key]);
+            let metrics = spot_coverage_metrics(None, col(&table, x_key), col(&table, y_key));
             if metrics.is_empty() {
                 continue;
             }
@@ -625,8 +620,6 @@ fn spot_coverage_metrics(
     spot: Option<&[f32]>,
     x_conf: Option<&[f32]>,
     y_conf: Option<&[f32]>,
-    gate: Option<&[f32]>,
-    state: BeamState,
 ) -> Vec<f32> {
     let n = x_conf
         .map(|values| values.len())
@@ -635,27 +628,10 @@ fn spot_coverage_metrics(
     if n == 0 {
         return Vec::new();
     }
-    let on = gate.filter(|values| values.len() == n).map(beam_on_mask);
     let mut order = BTreeMap::<i32, usize>::new();
     let mut max_x = Vec::new();
     let mut max_y = Vec::new();
     for i in 0..n {
-        let keep = match state {
-            BeamState::All => true,
-            BeamState::On => on
-                .as_ref()
-                .and_then(|mask| mask.get(i))
-                .copied()
-                .unwrap_or(true),
-            BeamState::Off => !on
-                .as_ref()
-                .and_then(|mask| mask.get(i))
-                .copied()
-                .unwrap_or(false),
-        };
-        if !keep {
-            continue;
-        }
         let id = if let Some(values) = spot {
             let Some(value) = values.get(i).copied() else {
                 continue;

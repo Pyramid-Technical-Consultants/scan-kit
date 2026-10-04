@@ -166,34 +166,6 @@ pub fn spill_segments(beam_on: &[bool], gap_ms: f32, min_on_slices: usize) -> Ve
     segments
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum BeamState {
-    All,
-    On,
-    Off,
-}
-
-/// Keep samples that match the beam state. Filtered samples become NaN.
-pub fn filter_beam_state(values: &[f32], beam_on: &[bool], state: BeamState) -> Vec<f32> {
-    values
-        .iter()
-        .enumerate()
-        .map(|(i, value)| {
-            let on = beam_on.get(i).copied().unwrap_or(false);
-            let keep = match state {
-                BeamState::All => true,
-                BeamState::On => on,
-                BeamState::Off => !on,
-            };
-            if keep {
-                *value
-            } else {
-                f32::NAN
-            }
-        })
-        .collect()
-}
-
 /// Quantile bin edges. A single finite value becomes a unit-width bin around it.
 pub fn quantile_edges(values: &[f32], n_bins: usize) -> Vec<f32> {
     let mut finite: Vec<f32> = values
@@ -1238,8 +1210,18 @@ mod tests {
         assert!((ratio[0] - 10.0).abs() < 1e-3);
         let mask = beam_on_mask(&[0.0, 1.0, 0.0, 1.0, 1.0]);
         assert_eq!(spill_segments(&mask, 1.0, 2), vec![(3, 5)]);
-        let filtered = filter_beam_state(&[1.0, 2.0], &[true, false], BeamState::On);
-        assert!(filtered[1].is_nan());
+        let mut filtered = std::collections::BTreeMap::from([
+            ("y".to_owned(), vec![1.0, 2.0]),
+            ("beam_on".to_owned(), vec![1.0, 0.0]),
+        ]);
+        crate::apply_mask(
+            &mut filtered,
+            &[crate::Segment::Beam {
+                state: crate::BeamGate::On,
+            }],
+            &["y"],
+        );
+        assert!(filtered["y"][1].is_nan());
     }
 
     #[test]
