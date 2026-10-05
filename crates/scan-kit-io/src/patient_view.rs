@@ -210,10 +210,10 @@ pub(crate) fn scene(
             columns: vec!["Item".into(), "Value".into()],
             rows,
         }),
-        samples: Vec::new(),
         columns: 3,
         column_weights: Vec::new(),
         row_weights: Vec::new(),
+        side: 0,
     }
 }
 
@@ -458,10 +458,10 @@ fn note_scene(message: &str) -> PlotScene {
         }],
         controls: Vec::new(),
         table: None,
-        samples: Vec::new(),
         columns: 1,
         column_weights: Vec::new(),
         row_weights: Vec::new(),
+        side: 0,
     }
 }
 

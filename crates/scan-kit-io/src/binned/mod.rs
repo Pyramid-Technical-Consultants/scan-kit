@@ -4,8 +4,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
 use scan_kit_core::{
-    assign_bin_centers, quantile_edges, row_mask, segments_control, segments_from, segments_json,
-    BeamGate, Control, Panel, PlotScene, Rank, Segment, Series,
+    assign_bin_centers, quantile_edges, row_mask, scrub_control, segments_control, segments_from,
+    segments_json, time_end, BeamGate, Control, Panel, PlotScene, Rank, Segment, Series,
 };
 use serde_json::Value;
 
@@ -25,9 +25,9 @@ const BOX_WIDTH: f32 = 0.3;
 const VIOLIN_WIDTH: f32 = 0.65;
 const GATE_ABS_MU: f64 = 0.002;
 
-struct YSeries {
-    key: &'static str,
-    label: &'static str,
+pub(crate) struct YSeries {
+    pub key: &'static str,
+    pub label: &'static str,
 }
 
 struct YGroup {
@@ -350,6 +350,14 @@ const SOURCE_CHOICES: &[(&str, &str)] = &[
     ("timeslice_iso", "Timeslice — Isocenter"),
     ("timeslice_chamber", "Timeslice — Chamber"),
 ];
+/// Series of one Y quantity, in the same order Binned Summary draws them.
+pub(crate) fn channels_for(metric: &str) -> (&'static str, &'static [YSeries]) {
+    match GROUPS.iter().find(|group| group.id == metric) {
+        Some(group) => (group.label, group.series),
+        None => ("", &[]),
+    }
+}
+
 fn sources_for(metric: &str) -> &'static [(&'static str, &'static str)] {
     match metric {
         "current_ratio" | "ic_current" | "fit_confidence" | "peak_amplitude"
@@ -417,6 +425,7 @@ struct Prepared {
     x_column: String,
     raw_x: bool,
     series: Vec<PreparedSeries>,
+    end: f32,
 }
 
 #[derive(Clone)]
@@ -634,29 +643,38 @@ pub(crate) fn binned_summary(root: &Path, session_ids: &[String], options: &Valu
             let mut names: Vec<&str> = group.series.iter().map(|series| series.key).collect();
             names.push(x_column);
             let loaded = session_columns(root, session, grain, &names);
+            let clock = time_end(loaded.get("time_s").map(Vec::as_slice));
             let loaded = if group.id == "dose_rate" {
                 std::sync::Arc::new(dose_rate_table(loaded.as_ref()))
             } else {
                 loaded
             };
-            plotted_columns(loaded.as_ref(), &names, &segments, group.filter)
+            (
+                plotted_columns(loaded.as_ref(), &names, &segments, group.filter),
+                clock,
+            )
         };
         // A handful of sessions, one thread each. The spot cache covers a repeat open.
-        let mut tables = if session_ids.len() < 2 {
+        let pairs = if session_ids.len() < 2 {
             session_ids.iter().map(load_one).collect::<Vec<_>>()
         } else {
-            let mut tables = Vec::with_capacity(session_ids.len());
             std::thread::scope(|scope| {
                 let mut joins = Vec::with_capacity(session_ids.len());
                 for session in session_ids {
                     joins.push(scope.spawn(|| load_one(session)));
                 }
-                for join in joins {
-                    tables.push(join.join().unwrap());
-                }
-            });
-            tables
+                joins
+                    .into_iter()
+                    .map(|join| join.join().unwrap())
+                    .collect::<Vec<_>>()
+            })
         };
+        let mut end = 0.0f32;
+        let mut tables = Vec::with_capacity(pairs.len());
+        for (table, clock) in pairs {
+            end = end.max(clock);
+            tables.push(table);
+        }
         let (categories, stable_bins) = if raw_x {
             (Vec::new(), false)
         } else {
@@ -765,6 +783,7 @@ pub(crate) fn binned_summary(root: &Path, session_ids: &[String], options: &Valu
             x_column: x_column.to_string(),
             raw_x,
             series,
+            end,
         }
     });
 
@@ -822,26 +841,30 @@ pub(crate) fn binned_summary(root: &Path, session_ids: &[String], options: &Valu
     PlotScene {
         title: format!("{} vs {}", group.label, x_label(x_column)),
         panels,
-        controls: controls(
-            source_controls,
-            group.id,
-            x_id,
-            glyph,
-            &segments,
-            trend,
-            hist,
-            corr,
-            interlock,
-            &bin_label(&bins),
-            &hist_label,
-            share,
-            cutoff,
-        ),
+        controls: {
+            let mut controls = controls(
+                source_controls,
+                group.id,
+                x_id,
+                glyph,
+                &segments,
+                trend,
+                hist,
+                corr,
+                interlock,
+                &bin_label(&bins),
+                &hist_label,
+                share,
+                cutoff,
+            );
+            controls.push(scrub_control(options, prepared.end));
+            controls
+        },
         table: None,
-        samples: Vec::new(),
         columns: 1 + side,
         column_weights: weights,
         row_weights: Vec::new(),
+        side: 0,
     }
 }
 
@@ -1298,7 +1321,18 @@ fn plotted_columns(
         .copied()
         .filter(|name| loaded.contains_key(*name))
         .collect();
-    let mask = filter.then(|| row_mask(loaded, segments, &keys));
+    let time_only: Vec<Segment> = segments
+        .iter()
+        .filter(|item| matches!(item, Segment::Range { column, .. } if column == "time_s"))
+        .cloned()
+        .collect();
+    let mask = if filter {
+        Some(row_mask(loaded, segments, &keys))
+    } else if time_only.is_empty() {
+        None
+    } else {
+        Some(row_mask(loaded, &time_only, &keys))
+    };
     let mut want: Vec<&str> = names.to_vec();
     for item in segments {
         match item {
@@ -1348,6 +1382,9 @@ fn dose_rate_table(table: &BTreeMap<String, Vec<f32>>) -> BTreeMap<String, Vec<f
     }
     if let Some(avg) = table.get("session_avg_rate") {
         out.insert("session_avg_rate".to_string(), avg.clone());
+    }
+    if let Some(time) = table.get("time_s") {
+        out.insert("time_s".to_string(), time.clone());
     }
     out
 }

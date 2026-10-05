@@ -88,10 +88,20 @@ fn parse_segment(value: &Value) -> Result<Segment, String> {
 }
 
 /// `segments` wins. Absent that, `beam` and `domain` fill the matching defaults.
+///
+/// An on `scrub` option appends a `time_s` window. The sidebar list does not carry it.
 pub fn segments_from(options: &Value, defaults: &[Segment]) -> Vec<Segment> {
+    let mut items = listed_segments(options, defaults);
+    if let Some(range) = scrub_range(options) {
+        items.push(range);
+    }
+    items
+}
+
+fn listed_segments(options: &Value, defaults: &[Segment]) -> Vec<Segment> {
     if let Some(text) = options.get("segments").and_then(Value::as_str) {
         if let Ok(items) = parse_segments(text) {
-            return items;
+            return without_playhead(items);
         }
     }
     let beam = options.get("beam").and_then(Value::as_str);
@@ -119,7 +129,66 @@ pub fn segments_from(options: &Value, defaults: &[Segment]) -> Vec<Segment> {
             items.push(item.clone());
         }
     }
+    without_playhead(items)
+}
+
+/// The playback bar owns `time_s`. A copy left in the segment list would freeze the playhead.
+fn without_playhead(items: Vec<Segment>) -> Vec<Segment> {
     items
+        .into_iter()
+        .filter(|item| !matches!(item, Segment::Range { column, .. } if column == "time_s"))
+        .collect()
+}
+
+fn scrub_range(options: &Value) -> Option<Segment> {
+    let value = scrub_value(options)?;
+    if value.get("on").and_then(Value::as_bool) != Some(true) {
+        return None;
+    }
+    let at = finite_f32(value.get("at")).unwrap_or(0.0);
+    let before = value.get("window").and_then(Value::as_str) == Some("before");
+    let lo = if before { f32::NEG_INFINITY } else { at - 1.0 };
+    Some(Segment::Range {
+        column: "time_s".to_owned(),
+        lo,
+        hi: at,
+    })
+}
+
+fn scrub_value(options: &Value) -> Option<Value> {
+    let raw = options.get("scrub")?.as_str()?;
+    serde_json::from_str(raw).ok()
+}
+
+fn finite_f32(value: Option<&Value>) -> Option<f32> {
+    let number = value?.as_f64()? as f32;
+    number.is_finite().then_some(number)
+}
+
+fn scrub_speed(value: Option<f64>) -> f64 {
+    let Some(value) = value else {
+        return 1.0;
+    };
+    if (value - 0.1).abs() < 1e-3 {
+        0.1
+    } else if (value - 10.0).abs() < 1e-3 {
+        10.0
+    } else {
+        1.0
+    }
+}
+
+/// Largest finite `time_s`. Missing columns stay at 0.
+pub fn time_end<'a>(columns: impl IntoIterator<Item = &'a [f32]>) -> f32 {
+    let mut end = 0.0f32;
+    for column in columns {
+        for value in column {
+            if value.is_finite() {
+                end = end.max(*value);
+            }
+        }
+    }
+    end
 }
 
 fn default_beam(defaults: &[Segment]) -> Option<BeamGate> {
@@ -153,8 +222,52 @@ fn rank_which(raw: &str) -> Rank {
     }
 }
 
+/// The playback bar. `end` is the largest `time_s` before this mask.
+pub fn scrub_control(options: &Value, end: f32) -> Control {
+    let end = if end.is_finite() { end.max(0.0) } else { 0.0 };
+    let value = scrub_value(options);
+    let on = value
+        .as_ref()
+        .and_then(|item| item.get("on"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let at = finite_f32(value.as_ref().and_then(|item| item.get("at"))).unwrap_or(0.0);
+    let speed = scrub_speed(
+        value
+            .as_ref()
+            .and_then(|item| item.get("speed"))
+            .and_then(Value::as_f64),
+    );
+    let window = if value
+        .as_ref()
+        .and_then(|item| item.get("window"))
+        .and_then(Value::as_str)
+        == Some("before")
+    {
+        "before"
+    } else {
+        "second"
+    };
+    let text = serde_json::json!({
+        "on": on,
+        "at": at.clamp(0.0, end),
+        "end": end,
+        "speed": speed,
+        "window": window,
+    });
+    Control {
+        id: "scrub".to_owned(),
+        label: "Timeline".to_owned(),
+        options: Vec::new(),
+        value: text.to_string(),
+        group: String::new(),
+        kind: "scrub".to_owned(),
+    }
+}
+
 /// The sidebar control. `kinds` are the segments this view can add (`id`, `label`).
 pub fn segments_control(items: &[Segment], kinds: &[(&str, &str)]) -> Control {
+    let shown = without_playhead(items.to_vec());
     Control {
         id: "segments".to_owned(),
         label: "Segments".to_owned(),
@@ -162,7 +275,7 @@ pub fn segments_control(items: &[Segment], kinds: &[(&str, &str)]) -> Control {
             .iter()
             .map(|(id, label)| Choice::full(id, label, "", ""))
             .collect(),
-        value: segments_json(items),
+        value: segments_json(&shown),
         group: "Filter Data".to_owned(),
         kind: "segments".to_owned(),
     }
@@ -578,5 +691,105 @@ mod tests {
             Segment::Rank { which: Rank::Mad },
         ];
         assert_eq!(parse_segments(&segments_json(&items)).unwrap(), items);
+    }
+
+    fn scrubbed(window: &str, on: bool) -> Vec<f32> {
+        let mut table = BTreeMap::from([
+            ("y".to_owned(), vec![1.0, 2.0, 3.0, 4.0]),
+            ("time_s".to_owned(), vec![0.0, 0.5, 1.2, 2.0]),
+        ]);
+        let raw = format!(r#"{{"on":{on},"at":1.2,"window":"{window}"}}"#);
+        let items = segments_from(&serde_json::json!({ "scrub": raw }), &[]);
+        apply_mask(&mut table, &items, &["y"]);
+        finite(&table)
+    }
+
+    #[test]
+    fn scrub_keeps_a_second_a_prefix_or_everything() {
+        assert_eq!(scrubbed("second", true), vec![2.0, 3.0]);
+        assert_eq!(scrubbed("before", true), vec![1.0, 2.0, 3.0]);
+        assert_eq!(scrubbed("second", false), vec![1.0, 2.0, 3.0, 4.0]);
+        let plain = segments_from(&serde_json::json!({}), &[]);
+        assert!(plain.is_empty());
+
+        let mut bare = BTreeMap::from([("y".to_owned(), vec![1.0, 2.0])]);
+        let raw = r#"{"on":true,"at":0.5,"window":"before"}"#;
+        apply_mask(
+            &mut bare,
+            &segments_from(&serde_json::json!({ "scrub": raw }), &[]),
+            &["y"],
+        );
+        assert_eq!(finite(&bare), vec![1.0, 2.0]);
+    }
+
+    #[test]
+    fn the_playhead_stays_out_of_the_segment_list() {
+        let stale =
+            r#"[{"kind":"beam","state":"on"},{"kind":"range","column":"time_s","lo":0,"hi":0.1}]"#;
+        let scrub = r#"{"on":true,"at":2.0,"speed":0.1,"window":"before"}"#;
+        let options = serde_json::json!({ "segments": stale, "scrub": scrub });
+        let items = segments_from(&options, &[]);
+        let mut table = BTreeMap::from([
+            ("y".to_owned(), vec![1.0, 2.0, 3.0]),
+            ("time_s".to_owned(), vec![0.0, 0.5, 2.0]),
+            ("beam_on".to_owned(), vec![1.0, 0.0, 1.0]),
+        ]);
+        apply_mask(&mut table, &items, &["y"]);
+        assert_eq!(finite(&table), vec![1.0, 3.0]);
+
+        let listed = segments_control(&items, &[("beam", "Beam")]);
+        let shown = parse_segments(&listed.value).unwrap();
+        assert!(shown.iter().all(|item| !matches!(
+            item,
+            Segment::Range { column, .. } if column == "time_s"
+        )));
+
+        let off = segments_from(&serde_json::json!({ "segments": stale }), &[]);
+        assert!(off.iter().all(|item| !matches!(
+            item,
+            Segment::Range { column, .. } if column == "time_s"
+        )));
+
+        let control = scrub_control(&options, 2.0);
+        let echoed: serde_json::Value = serde_json::from_str(&control.value).unwrap();
+        assert_eq!(echoed["on"], true);
+        assert_eq!(echoed["speed"], 0.1);
+        assert_eq!(echoed["window"], "before");
+        assert!((echoed["at"].as_f64().unwrap() - 2.0).abs() < 1e-6);
+        assert!((echoed["end"].as_f64().unwrap() - 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_one_second_window_keeps_the_millisecond_on_each_edge() {
+        let times: Vec<f32> = (0..2_500).map(|index| index as f32 * 0.001).collect();
+        let at = f64::from(times[2_000]);
+        let raw = format!(r#"{{"on":true,"at":{at},"window":"second"}}"#);
+        let mut table = BTreeMap::from([
+            ("y".to_owned(), times.clone()),
+            ("time_s".to_owned(), times),
+        ]);
+        apply_mask(
+            &mut table,
+            &segments_from(&serde_json::json!({ "scrub": raw }), &[]),
+            &["y"],
+        );
+        let kept: Vec<f32> = finite(&table);
+        assert!(
+            kept.contains(&table_time(1_000)),
+            "the sample one second back stays"
+        );
+        assert!(kept.contains(&table_time(2_000)));
+        assert!(
+            !kept.contains(&table_time(999)),
+            "older than one second drops"
+        );
+        assert!(
+            !kept.contains(&table_time(2_001)),
+            "past the playhead drops"
+        );
+    }
+
+    fn table_time(index: i32) -> f32 {
+        index as f32 * 0.001
     }
 }

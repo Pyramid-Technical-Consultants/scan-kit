@@ -31,6 +31,9 @@ type SectionControl = {
 export function controlSections(controls: readonly SectionControl[]): ControlSection[] {
   const sections: ControlSection[] = [];
   for (const control of controls) {
+    if (control.kind === "scrub") {
+      continue;
+    }
     const title = control.group != null && control.group.length > 0 ? control.group : "Options";
     const slot: ControlSlot = {
       id: control.id,

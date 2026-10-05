@@ -2,8 +2,8 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use scan_kit_core::{
-    coverage_percent, row_mask, segments_control, segments_from, BeamGate, Family, Panel,
-    PlotScene, Segment, Series, SESSION,
+    coverage_percent, row_mask, scrub_control, segments_control, segments_from, time_end, BeamGate,
+    Family, Panel, PlotScene, Segment, Series, SESSION,
 };
 use serde_json::Value;
 
@@ -88,6 +88,7 @@ pub(super) fn distribution(root: &Path, session_ids: &[String], options: &Value)
             show_ic2,
             show_plan,
             bins,
+            true,
         )
     };
     let mut controls = picked.controls;
@@ -136,6 +137,10 @@ pub(super) fn distribution(root: &Path, session_ids: &[String], options: &Value)
         );
     }
     controls.push(segments_control(&segments, &[("beam", "Beam")]));
+    controls.push(scrub_control(
+        options,
+        clock_end(root, session_ids, mode, grain),
+    ));
     let mut scene = scene("Distribution Explorer", panels, controls);
     scene.columns = columns;
     if columns > 0 && scene.panels.len() == columns as usize * 3 {
@@ -254,6 +259,27 @@ fn grain_table(root: &Path, session: &str, grain: &str) -> super::super::tables:
     } else {
         spot_table(root, session)
     }
+}
+
+fn clock_end(root: &Path, session_ids: &[String], mode: &str, grain: &str) -> f32 {
+    let tables = if mode == "confidence" {
+        crate::tables::map_sessions(session_ids, |session| {
+            timeslice_metric(root, session, "peak_amplitude")
+        })
+    } else if mode == "coverage" {
+        crate::tables::map_sessions(session_ids, |session| {
+            timeslice_metric(root, session, "fit_confidence")
+        })
+    } else {
+        crate::tables::map_sessions(session_ids, |session| {
+            session_table(root, session, mode, grain)
+        })
+    };
+    time_end(
+        tables
+            .iter()
+            .filter_map(|table| table.get("time_s").map(Vec::as_slice)),
+    )
 }
 
 fn session_table(
@@ -385,6 +411,38 @@ fn column_specs(
     pairs
 }
 
+/// Scatter clouds for one distribution mode, without the histograms.
+pub(super) fn scatter_panels(
+    root: &Path,
+    session_ids: &[String],
+    mode: &str,
+    grain: &str,
+    segments: &[Segment],
+) -> Vec<Panel> {
+    if mode == "confidence" {
+        return confidence_scene(root, session_ids, segments, "scatter", "turbo", 5.0);
+    }
+    if mode == "coverage" {
+        return coverage_scene(root, session_ids, segments);
+    }
+    let (panels, _, _) = column_scene(
+        root,
+        session_ids,
+        mode,
+        grain,
+        segments,
+        "scatter",
+        "turbo",
+        5.0,
+        true,
+        true,
+        true,
+        1,
+        false,
+    );
+    panels
+}
+
 fn column_scene(
     root: &Path,
     session_ids: &[String],
@@ -398,6 +456,7 @@ fn column_scene(
     ic2: bool,
     plan: bool,
     bins: usize,
+    histograms: bool,
 ) -> (Vec<Panel>, u32, bool) {
     let tables = crate::tables::map_sessions(session_ids, |session| {
         session_table(root, session, mode, grain)
@@ -491,26 +550,30 @@ fn column_scene(
         tops.push(top);
         let xs: Vec<&[f32]> = column.clouds.iter().map(|(xs, _)| xs.as_slice()).collect();
         let ys: Vec<&[f32]> = column.clouds.iter().map(|(_, ys)| ys.as_slice()).collect();
-        x_hists.push(histogram_panel(
-            &axis_name(column.name, "X", mode),
-            &xs,
-            bins,
-            true,
-            Some((lo, hi)),
-            &hist_guides,
-        ));
-        y_hists.push(histogram_panel(
-            &axis_name(column.name, "Y", mode),
-            &ys,
-            bins,
-            true,
-            Some((lo, hi)),
-            &hist_guides,
-        ));
+        if histograms {
+            x_hists.push(histogram_panel(
+                &axis_name(column.name, "X", mode),
+                &xs,
+                bins,
+                true,
+                Some((lo, hi)),
+                &hist_guides,
+            ));
+            y_hists.push(histogram_panel(
+                &axis_name(column.name, "Y", mode),
+                &ys,
+                bins,
+                true,
+                Some((lo, hi)),
+                &hist_guides,
+            ));
+        }
     }
     let count = tops.len() as u32;
-    tops.extend(x_hists);
-    tops.extend(y_hists);
+    if histograms {
+        tops.extend(x_hists);
+        tops.extend(y_hists);
+    }
     (tops, count, has_plan)
 }
 

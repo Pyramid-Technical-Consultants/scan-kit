@@ -228,14 +228,16 @@ pub struct PlotScene {
     pub panels: Vec<Panel>,
     pub controls: Vec<Control>,
     pub table: Option<DataTable>,
-    /// Audio samples at 1 kHz, when the view is Audio Explorer.
-    pub samples: Vec<f32>,
     /// Columns in the panel grid. `0` packs panels into a square.
     pub columns: u32,
     /// Relative column widths. Empty means equal columns.
     pub column_weights: Vec<f32>,
     /// Relative row heights. Empty means equal rows.
     pub row_weights: Vec<f32>,
+    /// Panels at the end of `panels` that fill the right column.
+    /// `0` keeps the row-major grid.
+    #[serde(default)]
+    pub side: u32,
 }
 
 impl PlotScene {
@@ -245,10 +247,10 @@ impl PlotScene {
             panels: Vec::new(),
             controls: Vec::new(),
             table: None,
-            samples: Vec::new(),
             columns: 0,
             column_weights: Vec::new(),
             row_weights: Vec::new(),
+            side: 0,
         }
     }
 }

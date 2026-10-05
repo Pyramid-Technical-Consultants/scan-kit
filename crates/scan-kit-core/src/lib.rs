@@ -26,10 +26,7 @@ pub use dose::{
     protons_from_mu, robust_high, through_wet, water, DoseFrame, McJob, McResult, Medium,
     PatientRequest, Pencil, Quantity, SlabRequest, Volume,
 };
-pub use geometry::{
-    beam_angle_mrad, fit_iso_plane, fit_line, magnet_pivot_z, parse_ic_geometry, IcGeometry,
-    IC1_Z_MM, IC2_Z_MM, IC_SEP_MM,
-};
+pub use geometry::{IC1_Z_MM, IC2_Z_MM, IC_SEP_MM};
 pub use plan::{
     build_plan, dicom_beam_size, parse_pld, plan_catalog, standard_energies, validate_plan,
     ImportSpot, PlanDocument, PlanSource,
@@ -48,15 +45,13 @@ pub use runner::{
 };
 pub use session_log::{compare_templates, parse_session_log, LayerEvent, SessionLog};
 pub use signal::{
-    arc_fit, arc_predict, assign_bin_centers, beam_off_edges, beam_on_mask, box_stats,
-    calibration_factor, coverage_percent, cumsum, density_counts, dose_error_pct, dose_ratio_pct,
-    dvh, fit_decay, g2_ic2_mm, gamma_index, histogram, hv_capacitance_pf, hv_delta_v,
-    hv_expected_pf, hv_firmware_flags, hv_step_window, linear_fit, median_finite, mip_xy,
-    quantile_edges, remap, remap_g2_raw, remap_g2_raw_reversed, remap_g3_raw,
-    remap_g3_raw_reversed, resample_nearest, scale_column, settled_after_step, sliding_background,
-    spill_segments, splat_gaussians, sums_by_spot_id, sums_by_spot_run, trapz, welch_psd, ArcFit,
-    BoxStats, G2_MM_PER_STRIP, G2_STRIP_CENTER, G3_STRIP_CENTER, G3_STRIP_PITCH_MM,
-    MIN_SPILL_GAP_MS,
+    assign_bin_centers, beam_on_mask, box_stats, calibration_factor, coverage_percent,
+    dose_error_pct, dose_ratio_pct, dvh, g2_ic2_mm, gamma_index, histogram, hv_capacitance_pf,
+    hv_delta_v, hv_expected_pf, hv_firmware_flags, hv_step_window, linear_fit, median_finite,
+    mip_xy, quantile_edges, remap, remap_g2_raw, remap_g2_raw_reversed, remap_g3_raw,
+    remap_g3_raw_reversed, resample_nearest, scale_column, splat_gaussians, sums_by_spot_id,
+    sums_by_spot_run, trapz, welch_psd, BoxStats, G2_MM_PER_STRIP, G2_STRIP_CENTER,
+    G3_STRIP_CENTER, G3_STRIP_PITCH_MM,
 };
 pub use tune::{run_tune, tune_catalog, TuneSpots};
 pub use xml_dom::{parse_xml, write_xml, Elem};
@@ -68,8 +63,8 @@ pub use schema::{
     IC3_QUAD_ZERO_FILL, POSITION_KEY_G2_RAW, POSITION_KEY_G3_RAW,
 };
 pub use segment::{
-    apply_mask, parse_segments, row_mask, segments_control, segments_from, segments_json, BeamGate,
-    CompareOp, Rank, Segment,
+    apply_mask, parse_segments, row_mask, scrub_control, segments_control, segments_from,
+    segments_json, time_end, BeamGate, CompareOp, Rank, Segment,
 };
 pub use session::{merge_session_geom, parse_termination_summary_text, SessionMeta, SummaryDate};
 pub use task::{
@@ -126,7 +121,7 @@ const TOOLS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "scan_kit_beam_mask",
-        summary: "Beam-on mask and spill segments from a gate column.",
+        summary: "Beam-on mask from a gate column.",
         kind: ToolKind::Granular,
     },
     ToolSpec {
@@ -142,11 +137,6 @@ const TOOLS: &[ToolSpec] = &[
     ToolSpec {
         name: "scan_kit_welch",
         summary: "Welch power spectrum of a 1 kHz timeslice signal.",
-        kind: ToolKind::Granular,
-    },
-    ToolSpec {
-        name: "scan_kit_fit_decay",
-        summary: "Single-exponential decay fit of a ramp-down curve.",
         kind: ToolKind::Granular,
     },
 ];
@@ -193,15 +183,6 @@ pub fn tool_input_schema(name: &str) -> Value {
                 "bins": { "type": "integer" }
             },
             "required": ["values"],
-            "additionalProperties": false
-        }),
-        "scan_kit_fit_decay" => json!({
-            "type": "object",
-            "properties": {
-                "time": { "type": "array", "items": { "type": "number" } },
-                "values": { "type": "array", "items": { "type": "number" } }
-            },
-            "required": ["time", "values"],
             "additionalProperties": false
         }),
         _ => json!({ "type": "object", "additionalProperties": false }),
@@ -332,11 +313,7 @@ pub fn invoke(name: &str, input: &Value) -> Result<Value, InvokeError> {
         }
         "scan_kit_beam_mask" => {
             let gate = f32_array(input, "gate")?;
-            let on = beam_on_mask(&gate);
-            json!({
-                "beam_on": on,
-                "spills": spill_segments(&on, signal::MIN_SPILL_GAP_MS, 2)
-            })
+            json!({ "beam_on": beam_on_mask(&gate) })
         }
         "scan_kit_bin_edges" => {
             let values = f32_array(input, "values")?;
@@ -353,14 +330,6 @@ pub fn invoke(name: &str, input: &Value) -> Result<Value, InvokeError> {
             let values = f32_array(input, "values")?;
             let (freqs, psd) = welch_psd(&values, 1000.0, 4096, 0.5);
             json!({ "freqs": freqs, "psd": psd })
-        }
-        "scan_kit_fit_decay" => {
-            let time = f32_array(input, "time")?;
-            let values = f32_array(input, "values")?;
-            match fit_decay(&time, &values) {
-                Some((amplitude, tau)) => json!({ "amplitude": amplitude, "tau": tau }),
-                None => json!({ "amplitude": null, "tau": null }),
-            }
         }
         _ => {
             return Err(InvokeError::UnknownTool {

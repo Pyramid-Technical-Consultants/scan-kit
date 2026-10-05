@@ -1,7 +1,7 @@
 import { createElement, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
-import { ArrowLeft, Download, Play } from "lucide-react";
+import { ArrowLeft } from "lucide-react";
 import {
   DataEditor,
   GridCellKind,
@@ -33,6 +33,7 @@ import { usePageLoad } from "@/page-load";
 import { sessionColor, shownSessionIds } from "@/session-colors";
 import { acceptReport, bytesOf, parsePoll, type Report } from "@/task-client";
 import { dismissNotice, notifyError } from "@/notify";
+import { ScrubBar, useScrub } from "@/scrub-bar";
 import { SidePane } from "@/SidePane";
 import {
   Select,
@@ -81,63 +82,6 @@ function parseColor(value: string): [number, number, number, number] {
 
 function palette(order: readonly string[], shown: readonly string[]): number[][] {
   return shown.map((id) => parseColor(sessionColor(Math.max(0, order.indexOf(id)))));
-}
-
-const AUDIO_RATE = 8000;
-const AUDIO_HOLD = 8;
-
-function heldSamples(samples: readonly number[]): number[] {
-  const held: number[] = [];
-  for (const sample of samples) {
-    for (let i = 0; i < AUDIO_HOLD; i += 1) {
-      held.push(sample);
-    }
-  }
-  return held;
-}
-
-function wavBlob(samples: number[]): Blob {
-  const rate = AUDIO_RATE;
-  const held = heldSamples(samples);
-  const bytes = new ArrayBuffer(44 + held.length * 2);
-  const view = new DataView(bytes);
-  const write = (offset: number, text: string) => {
-    for (let i = 0; i < text.length; i += 1) {
-      view.setUint8(offset + i, text.charCodeAt(i));
-    }
-  };
-  write(0, "RIFF");
-  view.setUint32(4, 36 + held.length * 2, true);
-  write(8, "WAVE");
-  write(12, "fmt ");
-  view.setUint32(16, 16, true);
-  view.setUint16(20, 1, true);
-  view.setUint16(22, 1, true);
-  view.setUint32(24, rate, true);
-  view.setUint32(28, rate * 2, true);
-  view.setUint16(32, 2, true);
-  view.setUint16(34, 16, true);
-  write(36, "data");
-  view.setUint32(40, held.length * 2, true);
-  held.forEach((sample, index) => {
-    const clipped = Math.max(-1, Math.min(1, sample));
-    view.setInt16(44 + index * 2, clipped * 0x7fff, true);
-  });
-  return new Blob([bytes], { type: "audio/wav" });
-}
-
-async function playSamples(samples: number[]) {
-  const held = heldSamples(samples);
-  const context = new AudioContext({ sampleRate: AUDIO_RATE });
-  const buffer = context.createBuffer(1, held.length, AUDIO_RATE);
-  buffer.getChannelData(0).set(held);
-  const source = context.createBufferSource();
-  source.buffer = buffer;
-  source.connect(context.destination);
-  source.onended = () => {
-    void context.close();
-  };
-  source.start();
 }
 
 function messageOf(reason: unknown): string {
@@ -253,6 +197,11 @@ export function AnalysisView({
   const grains = useRef<GrainMemory>({});
   const [hidden, setHidden] = useState<string[]>([]);
   const [meta, setMeta] = useState<PlotHeader | null>(null);
+  const [settled, setSettled] = useState(0);
+  const scrubControl = meta?.controls.find((control) => control.kind === "scrub");
+  const playback = useScrub(scrubControl?.value, settled, (text) => {
+    setOptions((current) => (current.scrub === text ? current : { ...current, scrub: text }));
+  });
   const [plotError, setPlotError] = useState<string | null>(null);
   const [studyPath, setStudyPath] = useState<string | null>(null);
   const [study, setStudy] = useState<string | null>(null);
@@ -411,6 +360,7 @@ export function AnalysisView({
           setTaskReport(parsed.report.finished ? null : parsed.report);
           if (parsed.report.finished) {
             setLoading(false);
+            setSettled((count) => count + 1);
           }
           if (parsed.payload != null) {
             setPlotError(null);
@@ -433,6 +383,7 @@ export function AnalysisView({
         if (openSeq.current === ticket) {
           const message = messageOf(reason);
           setLoading(false);
+          setSettled((count) => count + 1);
           setPlotError(message);
           notifyError(message, "analysis");
         }
@@ -636,6 +587,14 @@ export function AnalysisView({
         <div className={shown ? "relative min-h-0 flex-1" : "hidden"}>
           <canvas ref={canvas} className="absolute inset-0 h-full w-full touch-none" />
         </div>
+        {playback.shown ? (
+          <ScrubBar
+            scrub={playback.scrub}
+            playing={playback.playing}
+            onChange={playback.update}
+            onTogglePlay={playback.togglePlay}
+          />
+        ) : null}
       </div>
       }
       side={
@@ -681,38 +640,6 @@ export function AnalysisView({
             })}
           </FieldSet>
         ))}
-        {(meta?.samples.length ?? 0) > 0 ? (
-          <div className="flex flex-col gap-2">
-            <Button
-              variant="secondary"
-              onClick={() => {
-                if (meta != null) {
-                  void playSamples(meta.samples);
-                }
-              }}
-            >
-              <Play />
-              Play
-            </Button>
-            <Button
-              variant="outline"
-              onClick={() => {
-                if (meta == null) {
-                  return;
-                }
-                const url = URL.createObjectURL(wavBlob(meta.samples));
-                const link = document.createElement("a");
-                link.href = url;
-                link.download = "scan-kit.wav";
-                link.click();
-                URL.revokeObjectURL(url);
-              }}
-            >
-              <Download />
-              Export WAV
-            </Button>
-          </div>
-        ) : null}
         {viewId === "dose_volume" ? (
           <Button
             variant="outline"

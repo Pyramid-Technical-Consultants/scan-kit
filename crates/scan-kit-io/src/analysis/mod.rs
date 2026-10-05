@@ -11,11 +11,9 @@ pub(super) use super::discover;
 pub(super) use super::marks::{contour_bands, control, flag, labeled, pick, text};
 pub(super) use super::tables::{slice_table, spot_table, timeslice_metric, timeslice_signals};
 mod distribution;
-mod lines;
 mod session_log;
 mod spectrum;
 mod timeline;
-mod trajectory;
 
 /// A session series. `apply_palette` replaces the RGB and keeps this alpha.
 const MARK: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
@@ -36,19 +34,12 @@ pub fn analysis_scene(
         return Err("at most five sessions can be selected".to_owned());
     }
     match view {
-        "dose_accumulation" => Ok(lines::dose_accumulation(root, session_ids, options)),
-        "ic_peak_amplitude_beam_off" => Ok(lines::peak_amplitude(root, session_ids, options)),
-        "beam_motion_energy" => Ok(lines::beam_motion(root, session_ids)),
         "distribution" => Ok(distribution::distribution(root, session_ids, options)),
         "binned_summary" => Ok(binned_summary(root, session_ids, options)),
         "timeslice_replay" => Ok(timeline::replay(root, session_ids, options)),
         "ic_fft_analysis" => Ok(spectrum::fft_view(root, session_ids, options)),
-        "ic_audio_player" => Ok(spectrum::audio_view(root, session_ids, options)),
-        "beam_off_rampdown" => Ok(timeline::rampdown(root, session_ids)),
-        "amplifier_correlation" => Ok(timeline::amplifier(root, session_ids)),
         "ic_hv_transient" => Ok(timeline::hv_transient(root, session_ids)),
         "session_log_compare" => Ok(session_log::session_log(root, session_ids)),
-        "trajectory" => Ok(trajectory::trajectory(root, session_ids, options)),
         "dose_volume" => Ok(crate::dose_view::dose_volume(
             root,
             session_ids,
@@ -91,10 +82,10 @@ fn scene(title: &str, panels: Vec<Panel>, controls: Vec<Control>) -> PlotScene {
         panels,
         controls,
         table: None,
-        samples: Vec::new(),
         columns: 0,
         column_weights: Vec::new(),
         row_weights: Vec::new(),
+        side: 0,
     }
 }
 
@@ -335,21 +326,6 @@ mod tests {
     }
 
     #[test]
-    fn sk_req_012_dose_accumulation_scene_has_cumulative_lines() {
-        let root = std::env::temp_dir().join(format!("scan-kit-view-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        write_session(&root);
-        let scene =
-            analysis_scene("dose_accumulation", &root, &["sess".into()], &json!({})).unwrap();
-        assert!(scene.panels.iter().any(|panel| panel.series.iter().any(|series| matches!(series, Series::Polyline { ys, .. } if ys.iter().any(|y| y.is_finite())))));
-        assert!(scene
-            .controls
-            .iter()
-            .any(|control| control.id == "calibrate"));
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
     fn sk_req_011_timeslice_load_reports_columns() {
         let root = std::env::temp_dir().join(format!("scan-kit-ts-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -374,10 +350,15 @@ mod tests {
     }
 
     fn scene_of(view: &str) -> PlotScene {
-        let root = std::env::temp_dir().join(format!("scan-kit-{view}-{}", std::process::id()));
+        opened(view, view, &json!({}))
+    }
+
+    fn opened(view: &str, tag: &str, options: &Value) -> PlotScene {
+        let root =
+            std::env::temp_dir().join(format!("scan-kit-{view}-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         write_session(&root);
-        let scene = analysis_scene(view, &root, &["sess".into()], &json!({})).unwrap();
+        let scene = analysis_scene(view, &root, &["sess".into()], options).unwrap();
         let _ = std::fs::remove_dir_all(&root);
         scene
     }
@@ -396,16 +377,6 @@ mod tests {
                 )
             })
         })
-    }
-
-    #[test]
-    fn sk_req_013_peak_amplitude_is_beam_off_bars() {
-        assert!(has_kind(&scene_of("ic_peak_amplitude_beam_off"), "bars"));
-    }
-
-    #[test]
-    fn sk_req_014_beam_motion_draws_spill_paths() {
-        assert!(has_kind(&scene_of("beam_motion_energy"), "line"));
     }
 
     #[test]
@@ -742,17 +713,187 @@ mod tests {
         let replay = scene_of("timeslice_replay");
         assert!(has_kind(&replay, "line"));
         assert_eq!(replay.columns, 1);
-        assert_eq!(replay.panels.len(), 1);
-        let Series::Polyline { xs, .. } = &replay.panels[0].series[0] else {
+        assert_eq!(replay.side, 0);
+        let y = replay
+            .controls
+            .iter()
+            .find(|control| control.id == "y")
+            .unwrap();
+        assert_eq!(y.value, "IC Current (nA)");
+        assert!(y.labels().contains(&"Amplifier Error (V)"));
+        assert!(replay.controls.iter().any(|control| {
+            control.id == "ch_ic1_current" && control.kind == "check" && control.value == "On"
+        }));
+        assert!(replay
+            .controls
+            .iter()
+            .any(|control| control.id == "segments"));
+        assert!(replay
+            .panels
+            .iter()
+            .any(|panel| { panel.title == "IC1" && panel.y_label == "IC Current (nA)" }));
+        let Series::Polyline { xs, ys, .. } = &replay.panels[0].series[0] else {
             panic!("replay should be one trace");
         };
         assert_eq!(xs.len(), 32);
         assert!(replay.panels.iter().all(|panel| panel.xmax < 1.0));
-        assert!(replay
+        let on: Vec<f32> = ys
+            .iter()
+            .copied()
+            .filter(|value| value.is_finite())
+            .collect();
+        assert_eq!(on.len(), 16, "beam-on rows stay, beam-off rows drop out");
+        assert!(on
+            .iter()
+            .all(|value| (*value - on[0]).abs() <= on[0].abs() * 1e-4));
+        let scrub = replay
+            .controls
+            .iter()
+            .find(|control| control.id == "scrub")
+            .unwrap();
+        assert_eq!(scrub.kind, "scrub");
+        let scrub_value: serde_json::Value = serde_json::from_str(&scrub.value).unwrap();
+        assert_eq!(scrub_value["on"], false);
+        assert_eq!(scrub_value["speed"], 1.0);
+        assert_eq!(scrub_value["window"], "second");
+        assert!(replay.controls.iter().all(|control| control.id != "x"));
+    }
+
+    fn finite_ys(scene: &PlotScene) -> Vec<f32> {
+        let mut kept = Vec::new();
+        for panel in &scene.panels {
+            for series in &panel.series {
+                let ys = match series {
+                    Series::Polyline { ys, .. } | Series::Points { ys, .. } => ys,
+                    _ => continue,
+                };
+                kept.extend(ys.iter().copied().filter(|value| value.is_finite()));
+            }
+        }
+        kept
+    }
+
+    #[test]
+    fn scrub_drops_rows_past_the_playhead() {
+        let scrub = r#"{"on":true,"at":0.01,"speed":1,"window":"before"}"#;
+        let replay = opened("timeslice_replay", "scrub", &json!({ "scrub": scrub }));
+        let Series::Polyline { ys, .. } = &replay.panels[0].series[0] else {
+            panic!("replay should be one trace");
+        };
+        let kept = ys.iter().filter(|value| value.is_finite()).count();
+        assert!(kept > 0 && kept < 16, "{kept}");
+        for (index, value) in ys.iter().enumerate() {
+            if index as f32 * 0.001 > 0.0105 {
+                assert!(!value.is_finite(), "row {index} is past the playhead");
+            }
+        }
+
+        let full = opened(
+            "binned_summary",
+            "scrub-full",
+            &json!({ "y": "IC Current (nA)", "glyph": "Scatter" }),
+        );
+        let cut = opened(
+            "binned_summary",
+            "scrub-cut",
+            &json!({ "y": "IC Current (nA)", "glyph": "Scatter", "scrub": scrub }),
+        );
+        let full_n = finite_ys(&full).len();
+        let cut_n = finite_ys(&cut).len();
+        assert!(full_n > cut_n, "{full_n} vs {cut_n}");
+        assert!(cut_n > 0);
+
+        let spread = opened("distribution", "scrub-full", &json!({ "xy": "probe" }));
+        let window = opened(
+            "distribution",
+            "scrub-cut",
+            &json!({ "xy": "probe", "scrub": scrub }),
+        );
+        let spread_n = finite_ys(&spread).len();
+        let window_n = finite_ys(&window).len();
+        assert!(spread_n > window_n, "{spread_n} vs {window_n}");
+        assert!(window_n > 0);
+        for scene in [&replay, &cut, &window] {
+            let listed = scene
+                .controls
+                .iter()
+                .find(|control| control.id == "segments")
+                .unwrap();
+            assert!(
+                !listed.value.contains("time_s"),
+                "the playhead is not a sidebar segment"
+            );
+        }
+    }
+
+    #[test]
+    fn replay_filters_beam_off_and_draws_amplifier_with_a_scatter() {
+        let off = scan_kit_core::segments_json(&[scan_kit_core::Segment::Beam {
+            state: scan_kit_core::BeamGate::Off,
+        }]);
+        let filtered = opened("timeslice_replay", "beam-off", &json!({ "segments": off }));
+        let Series::Polyline { ys, .. } = &filtered.panels[0].series[0] else {
+            panic!("replay should be one trace");
+        };
+        let off_rows: Vec<f32> = ys
+            .iter()
+            .copied()
+            .filter(|value| value.is_finite())
+            .collect();
+        assert_eq!(off_rows.len(), 16);
+        assert!(off_rows
+            .windows(2)
+            .any(|pair| (pair[0] - pair[1]).abs() > 1.0));
+
+        let root = std::env::temp_dir().join(format!("scan-kit-replay-amp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let session = root.join("sess");
+        std::fs::create_dir_all(&session).unwrap();
+        std::fs::write(
+            session.join("input_map.csv"),
+            "energy,charge_req,position_x,position_y\n70,1,0,0\n",
+        )
+        .unwrap();
+        std::fs::write(
+            session.join("000_timeslice_data_device_units.csv"),
+            "rci_in_trigger,c_x,r_xV,c_y,r_yV\n1,1.0,1.5,2.0,2.4\n1,1.1,1.6,2.1,2.5\n1,1.2,1.7,2.2,2.6\n1,1.3,1.8,2.3,2.7\n",
+        )
+        .unwrap();
+        let amp = analysis_scene(
+            "timeslice_replay",
+            &root,
+            &["sess".into()],
+            &json!({"y": "amplifier_error"}),
+        )
+        .unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+        let titles: Vec<&str> = amp
             .panels
             .iter()
-            .any(|panel| panel.y_label == "IC1 Current (nA)"));
-        assert!(replay.controls.iter().all(|control| control.id != "scrub"));
+            .map(|panel| panel.title.as_str())
+            .collect();
+        assert_eq!(titles, vec!["X", "Y"]);
+        assert!(amp
+            .panels
+            .iter()
+            .all(|panel| panel.y_label == "Amplifier Error (V)"));
+
+        let scatter = opened("timeslice_replay", "scatter", &json!({ "scatter": "On" }));
+        let distribution = opened("distribution", "scatter-source", &json!({}));
+        assert!(scatter.side >= 1);
+        assert_eq!(scatter.columns, 2);
+        assert_eq!(scatter.column_weights, vec![3.0, 1.4]);
+        let scatter_xy = scatter
+            .controls
+            .iter()
+            .find(|control| control.id == "scatter_xy")
+            .unwrap();
+        let distribution_xy = distribution
+            .controls
+            .iter()
+            .find(|control| control.id == "xy")
+            .unwrap();
+        assert_eq!(scatter_xy.labels(), distribution_xy.labels());
     }
 
     #[test]
@@ -775,25 +916,16 @@ mod tests {
     }
 
     #[test]
-    fn sk_req_018_fft_and_audio_share_the_spectrum() {
+    fn sk_req_018_fft_draws_a_spectrum() {
         let fft = scene_of("ic_fft_analysis");
         assert!(has_kind(&fft, "line"));
         assert!(fft.panels.iter().any(|panel| panel.y_label == "log10 PSD"));
-        let audio = scene_of("ic_audio_player");
-        assert!(!audio.samples.is_empty());
-        assert_eq!(audio.title, "Audio Explorer");
+        assert_eq!(fft.title, "FFT Explorer");
     }
 
     #[test]
-    fn sk_req_022_rampdown_amplifier_and_hv() {
-        assert!(has_kind(&scene_of("beam_off_rampdown"), "line"));
-        assert!(has_kind(&scene_of("amplifier_correlation"), "points"));
+    fn sk_req_022_hv_draws_the_current() {
         assert!(has_kind(&scene_of("ic_hv_transient"), "line"));
-    }
-
-    #[test]
-    fn sk_req_026_trajectory_projects_a_path() {
-        assert!(has_kind(&scene_of("trajectory"), "line"));
     }
 
     #[test]

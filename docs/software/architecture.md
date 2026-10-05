@@ -42,7 +42,7 @@ Tools:
 - `scan_kit_load_timeslice` and `scan_kit_channel_catalog`, granular
 - `scan_kit_analysis_scene`, workflow, builds one view scene from the selected sessions
 - `scan_kit_run_view`, workflow, paints that scene to one RGBA frame for MCP and tests
-- `scan_kit_calibrate`, `scan_kit_dose_error`, `scan_kit_beam_mask`, `scan_kit_bin_edges`, `scan_kit_histogram`, `scan_kit_welch`, and `scan_kit_fit_decay`, granular
+- `scan_kit_calibrate`, `scan_kit_dose_error`, `scan_kit_beam_mask`, `scan_kit_bin_edges`, `scan_kit_histogram`, and `scan_kit_welch`, granular
 - `scan_kit_open_study` and `scan_kit_clinical_goal`, the DICOM study index and a dose-volume goal
 - `scan_kit_plan_catalog`, granular, lists the four plan templates and their parameter specs
 - `scan_kit_synthesize_plan`, workflow, builds an input map CSV from one of those templates
@@ -81,7 +81,7 @@ Chrome uses shadcn semantic tokens (`bg-background`, `text-foreground`, `bg-card
 
 Tabular data, including the session list and Session Log Compare, is drawn by [Glide Data Grid](https://grid.glideapps.com/). The grid theme is filled from the stock tokens (background, card, foreground, muted foreground, border, accent, and the Geist font). Those tokens are not edited. A DOM table, including a shadcn Table, is not used for data.
 
-The Analysis menu opens a view when one to five sessions are selected. Controls are shadcn components added with `shadcn add` (Select and Field for choices), not native form elements. A control change calls `scan_kit_open_plot`, which returns one binary payload: a JSON header (controls, table, samples, panel frames) and the encoded marks. The webview loads that payload into `scan-kit-plot` built for wasm32 and draws on the canvas with WebGPU, or WebGL2 where WebGPU is missing. Wheel, drag, hover, and resize stay in the webview. No frame crosses the Tauri bridge. `scan_kit_run_view` renders the same `Plot` offscreen and returns one base64 frame for MCP and tests, colored from the stock tokens. Audio Explorer plays and exports the open plot's samples with Web Audio. Dose Volume can open a DICOM folder through `scan_kit_open_study`.
+The Analysis menu opens a view when one to five sessions are selected. Controls are shadcn components added with `shadcn add` (Select and Field for choices), not native form elements. A control change calls `scan_kit_open_plot`, which returns one binary payload: a JSON header (controls, table, panel frames) and the encoded marks. The webview loads that payload into `scan-kit-plot` built for wasm32 and draws on the canvas with WebGPU, or WebGL2 where WebGPU is missing. Wheel, drag, hover, and resize stay in the webview. No frame crosses the Tauri bridge. `scan_kit_run_view` renders the same `Plot` offscreen and returns one base64 frame for MCP and tests, colored from the stock tokens. Dose Volume can open a DICOM folder through `scan_kit_open_study`.
 
 A plotted series contains every sample that passed the view's filters. Nothing drops rows before the camera exists: no fixed stride, bucket count, or point cap on a line or a scatter. Histograms, contours, and spectra still reduce the samples, and they count every sample that passed the filter. The renderer may later simplify a stroke for the current camera when several samples fall in one pixel. That simplification keeps the extrema in the pixel, and a camera that gives a sample its own pixel draws the sample. Zoom and pan stay in the webview, so a thinned payload can never grow back.
 

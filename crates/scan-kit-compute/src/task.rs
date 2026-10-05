@@ -1209,7 +1209,7 @@ mod tests {
 
     fn session_stage(root: &Path, sessions: &[&str]) -> SessionStage {
         SessionStage::new(
-            "dose_accumulation",
+            "timeslice_replay",
             root,
             &sessions
                 .iter()
@@ -1244,7 +1244,7 @@ mod tests {
                 Poll::Ready(bytes) => {
                     let header = scan_kit_plot::plot_header(&bytes).unwrap();
                     assert_eq!(header.quality, "final");
-                    assert_eq!(header.title, "Dose Accumulation");
+                    assert_eq!(header.title, "Timeslice Replay");
                     saw_final = true;
                     break;
                 }

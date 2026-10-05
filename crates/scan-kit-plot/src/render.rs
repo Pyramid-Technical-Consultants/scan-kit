@@ -493,6 +493,7 @@ pub struct Plot {
     columns: u32,
     weights: Vec<f32>,
     row_weights: Vec<f32>,
+    side: u32,
     cameras: Vec<Camera>,
     home: Vec<Camera>,
     background: [f32; 4],
@@ -538,6 +539,7 @@ impl Plot {
             scene.columns,
             scene.column_weights.clone(),
             scene.row_weights.clone(),
+            scene.side,
             build_marks(&scene.panels),
             background,
             foreground,
@@ -549,6 +551,7 @@ impl Plot {
         columns: u32,
         weights: Vec<f32>,
         row_weights: Vec<f32>,
+        side: u32,
         marks: Marks,
         background: [f32; 4],
         foreground: [f32; 4],
@@ -565,6 +568,7 @@ impl Plot {
             columns,
             weights,
             row_weights,
+            side,
             home: cameras.clone(),
             cameras,
             background,
@@ -781,6 +785,7 @@ impl Plot {
             self.columns,
             &self.weights,
             &self.row_weights,
+            self.side,
         );
         let font = atlas();
         rects
@@ -2028,9 +2033,13 @@ fn panel_rects(
     columns: u32,
     weights: &[f32],
     row_weights: &[f32],
+    side: u32,
 ) -> Vec<PlotRect> {
     if count == 0 {
         return Vec::new();
+    }
+    if side > 0 && (side as usize) < count {
+        return side_column(count, width, height, weights, side as usize);
     }
     let cols = if columns == 0 {
         (count as f32).sqrt().ceil() as usize
@@ -2090,6 +2099,56 @@ fn panel_rects(
                 w: col_w[col],
                 h: row_h[row],
             }
+        })
+        .collect()
+}
+
+/// Left column stacks `count - side` panels. The last `side` panels fill the right
+/// column and share that same height.
+fn side_column(
+    count: usize,
+    width: u32,
+    height: u32,
+    weights: &[f32],
+    side: usize,
+) -> Vec<PlotRect> {
+    let main = count - side;
+    let gap = 12.0f32;
+    let margin = 8.0f32;
+    let margin_right = 16.0f32;
+    let inner_w = width as f32 - margin - margin_right - gap;
+    let col_weight = if weights.len() == 2 {
+        [weights[0], weights[1]]
+    } else {
+        [1.0, 1.0]
+    };
+    let weight_sum = (col_weight[0] + col_weight[1]).max(1.0e-6);
+    let left_w = inner_w * col_weight[0] / weight_sum;
+    let right_w = inner_w * col_weight[1] / weight_sum;
+    let inner_h = height as f32 - margin * 2.0;
+    let mut rects = Vec::with_capacity(count);
+    rects.extend(stack_column(main, margin, left_w, margin, inner_h, gap));
+    rects.extend(stack_column(
+        side,
+        margin + left_w + gap,
+        right_w,
+        margin,
+        inner_h,
+        gap,
+    ));
+    rects
+}
+
+fn stack_column(rows: usize, x: f32, w: f32, top: f32, inner_h: f32, gap: f32) -> Vec<PlotRect> {
+    let rows = rows.max(1);
+    let gaps = gap * rows.saturating_sub(1) as f32;
+    let h = ((inner_h - gaps) / rows as f32).max(1.0);
+    (0..rows)
+        .map(|row| PlotRect {
+            x,
+            y: top + row as f32 * (h + gap),
+            w,
+            h,
         })
         .collect()
 }
@@ -2825,10 +2884,10 @@ mod tests {
             }],
             controls: Vec::new(),
             table: None,
-            samples: Vec::new(),
             columns: 0,
             column_weights: Vec::new(),
             row_weights: Vec::new(),
+            side: 0,
         }
     }
 
@@ -2850,6 +2909,31 @@ mod tests {
             "{top} {middle} {bottom}"
         );
         assert!((middle - bottom).abs() < 1.0, "{middle} {bottom}");
+    }
+
+    #[test]
+    fn a_side_panel_spans_the_column_beside_it() {
+        let mut scene = line_scene();
+        let panel = scene.panels[0].clone();
+        scene.panels.push(panel.clone());
+        scene.panels.push(panel);
+        scene.columns = 2;
+        scene.column_weights = vec![3.0, 1.4];
+        scene.side = 1;
+        let plot = Plot::new(&scene, [0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0, 1.0]);
+        let layout = plot.layout(400, 420);
+        let top = &layout[0].cell;
+        let lower = &layout[1].cell;
+        let side = &layout[2].cell;
+        assert!((top.y - side.y).abs() < 1.0, "{} {}", top.y, side.y);
+        let left_bottom = lower.y + lower.h;
+        let side_bottom = side.y + side.h;
+        assert!(
+            (left_bottom - side_bottom).abs() < 1.0,
+            "{left_bottom} {side_bottom}"
+        );
+        assert!(side.h > top.h, "{} {}", side.h, top.h);
+        assert!(side.x > top.x);
     }
 
     #[test]
@@ -2999,10 +3083,10 @@ mod tests {
             }],
             controls: Vec::new(),
             table: None,
-            samples: Vec::new(),
             columns: 0,
             column_weights: Vec::new(),
             row_weights: Vec::new(),
+            side: 0,
         };
         let mut plot = Plot::new(&scene, [0.0, 0.0, 0.0, 1.0], [0.0, 1.0, 0.0, 1.0]);
         let first = plot.draw(180, 140, &PlotInput::default()).unwrap();

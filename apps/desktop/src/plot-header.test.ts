@@ -12,13 +12,13 @@ function payload(header: object, marks: number[]): Uint8Array {
 }
 
 it("reads the JSON header in front of the mark bytes", () => {
-  const bytes = payload({ title: "Dose", controls: [], table: null, samples: [1], panels: [{}] }, [9, 9, 9]);
+  const bytes = payload({ title: "Dose", controls: [], table: null, panels: [{}] }, [9, 9, 9]);
   const header = plotHeader(bytes.subarray(0));
   expect(header.title).toBe("Dose");
   expect(header.panels).toHaveLength(1);
   const shifted = new Uint8Array(bytes.length + 3);
   shifted.set(bytes, 3);
-  expect(plotHeader(shifted.subarray(3)).samples).toEqual([1]);
+  expect(plotHeader(shifted.subarray(3)).title).toBe("Dose");
 });
 
 it("reads a string option and a noted option", () => {
@@ -44,7 +44,6 @@ it("reads a string option and a noted option", () => {
           },
         ],
         table: null,
-        samples: [],
         panels: [],
       },
       [],
@@ -73,7 +72,6 @@ it("keeps the chrome when only the plotted marks grew", () => {
         title: "Dose",
         controls: [{ id: "y", label: "Y", value: "dose", options: [] }],
         table: { columns: ["a"], rows: [["1"]] },
-        samples: [1, 2],
         panels: [],
       },
       [1],
@@ -85,7 +83,6 @@ it("keeps the chrome when only the plotted marks grew", () => {
         title: "Dose",
         controls: [{ id: "y", label: "Y", value: "dose", options: [] }],
         table: { columns: ["a"], rows: [["1"]] },
-        samples: [1, 2],
         panels: [{}],
         quality: "partial",
       },
@@ -94,6 +91,5 @@ it("keeps the chrome when only the plotted marks grew", () => {
   );
   expect(sameChrome(current, grown)).toBe(true);
   expect(sameChrome(current, { ...grown, title: "Current" })).toBe(false);
-  expect(sameChrome(current, { ...grown, samples: [1] })).toBe(false);
   expect(sameChrome(null, grown)).toBe(false);
 });

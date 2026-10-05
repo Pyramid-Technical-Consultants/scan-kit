@@ -72,7 +72,7 @@ const TOOLS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "scan_kit_channel_catalog",
-        summary: "List timeslice channels present for Replay, FFT, and Audio.",
+        summary: "List timeslice channels present for Replay and FFT.",
         kind: ToolKind::Granular,
     },
     ToolSpec {

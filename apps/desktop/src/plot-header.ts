@@ -23,7 +23,6 @@ export type PlotHeader = {
   title: string;
   controls: ViewControl[];
   table: ViewTable | null;
-  samples: number[];
   panels: unknown[];
   quality: string;
 };
@@ -76,7 +75,7 @@ export function sameChrome(current: PlotHeader | null, next: PlotHeader): boolea
   if (current == null) {
     return false;
   }
-  if (current.title !== next.title || current.samples.length !== next.samples.length) {
+  if (current.title !== next.title) {
     return false;
   }
   if (current.controls.length !== next.controls.length) {
@@ -132,7 +131,6 @@ export function plotHeader(bytes: Uint8Array): PlotHeader {
     title?: unknown;
     controls?: unknown;
     table?: ViewTable | null;
-    samples?: unknown;
     panels?: unknown;
     quality?: unknown;
   };
@@ -141,9 +139,6 @@ export function plotHeader(bytes: Uint8Array): PlotHeader {
     title: text(parsed.title),
     controls: Array.isArray(parsed.controls) ? parsed.controls.map(viewControl) : [],
     table: parsed.table ?? null,
-    samples: Array.isArray(parsed.samples)
-      ? parsed.samples.filter((sample): sample is number => typeof sample === "number")
-      : [],
     panels: Array.isArray(parsed.panels) ? parsed.panels : [],
     quality: quality.length > 0 ? quality : "final",
   };

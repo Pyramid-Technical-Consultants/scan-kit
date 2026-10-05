@@ -102,7 +102,6 @@ pub fn run_view(
         "rgba_base64": base64(&frame.rgba),
         "controls": header.controls,
         "table": header.table,
-        "samples": header.samples,
     }))
 }
 
@@ -273,7 +272,7 @@ mod tests {
         )
         .unwrap();
         let frame = run_view(
-            "dose_accumulation",
+            "binned_summary",
             &root,
             &["sess".into()],
             &json!({}),
@@ -284,7 +283,7 @@ mod tests {
             &[[0.8, 0.8, 0.8, 1.0], [0.4, 0.4, 0.4, 1.0]],
         )
         .unwrap();
-        assert_eq!(frame["title"], "Dose Accumulation");
+        assert!(frame["title"].as_str().unwrap().contains("vs"));
         assert!(frame["rgba_base64"].as_str().unwrap().len() > 32);
         assert_eq!(frame["width"], 320);
         let _ = std::fs::remove_dir_all(&root);
@@ -307,7 +306,7 @@ mod tests {
         )
         .unwrap();
         let opened = open_plot(
-            "dose_accumulation",
+            "binned_summary",
             &root,
             &["sess".into()],
             &json!({}),
@@ -317,7 +316,7 @@ mod tests {
         )
         .unwrap();
         let header = scan_kit_plot::plot_header(&opened).unwrap();
-        assert_eq!(header.title, "Dose Accumulation");
+        assert!(header.title.contains("vs"));
         assert!(header.panels.iter().all(|panel| panel.series.is_empty()));
         let mut plot = Plot::from_payload(&opened).unwrap();
         let frame = plot.draw(80, 60, &PlotInput::default()).unwrap();

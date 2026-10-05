@@ -104,6 +104,13 @@ vi.mock("@tauri-apps/api/core", () => ({
                 { kind: "rank", which: "all" },
               ]),
             },
+            {
+              id: "scrub",
+              label: "Timeline",
+              kind: "scrub",
+              options: [],
+              value: JSON.stringify({ on: false, at: 0, end: 12.5, speed: 1, window: "second" }),
+            },
           ],
           table: null,
           samples: [],
@@ -404,4 +411,69 @@ it("adds and removes a segment through the plot options", async () => {
   });
   const restored = JSON.parse(starts()[starts().length - 1]?.options?.segments ?? "null") as { kind: string }[];
   expect(restored.map((item) => item.kind)).toEqual(["beam", "rank"]);
+});
+
+it("keeps the playback bar on one row and arms it from the checkbox", async () => {
+  const host = document.createElement("div");
+  document.body.append(host);
+  await act(() => {
+    root = createRoot(host);
+    root.render(
+      <AnalysisView
+        viewId="binned_summary"
+        folder="C:/data"
+        sessions={[{ id: "a", note: "" }]}
+        onBack={() => undefined}
+        onOpenView={() => undefined}
+      />,
+    );
+  });
+  await act(async () => {
+    await new Promise((resolve) => setTimeout(resolve, 200));
+  });
+
+  const bar = host.querySelector("[data-slot='scrub-bar']");
+  expect(bar).not.toBeNull();
+  expect(bar?.className).toContain("flex-row");
+  expect(bar?.parentElement?.querySelectorAll("[data-slot='scrub-bar']").length).toBe(1);
+  const box = bar?.querySelector("[data-slot='checkbox']");
+  expect(box?.getAttribute("aria-checked")).toBe("false");
+  const range = bar?.querySelector("input[type='range']");
+  const skip = bar?.querySelector("[aria-label='Skip to start']");
+  expect((range as HTMLInputElement | null)?.disabled).toBe(true);
+  expect((skip as HTMLButtonElement | null)?.disabled).toBe(true);
+
+  await act(async () => {
+    box?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+  });
+
+  expect(box?.getAttribute("aria-checked")).toBe("true");
+  expect((range as HTMLInputElement | null)?.disabled).toBe(false);
+  expect((skip as HTMLButtonElement | null)?.disabled).toBe(false);
+
+  const queued: FrameRequestCallback[] = [];
+  const realFrame = window.requestAnimationFrame;
+  window.requestAnimationFrame = (callback) => {
+    queued.push(callback);
+    return queued.length;
+  };
+  try {
+    const play = () => bar?.querySelector("[aria-label='Play'], [aria-label='Pause']");
+    await act(async () => {
+      play()?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    expect(play()?.getAttribute("aria-label")).toBe("Pause");
+
+    await act(async () => {
+      bar
+        ?.querySelector("[aria-label='Skip to end']")
+        ?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    expect(play()?.getAttribute("aria-label")).toBe("Play");
+    const thumb = bar?.querySelector("input[type='range']") as HTMLInputElement | null;
+    expect(Number(thumb?.value)).toBeCloseTo(12.5);
+    expect(queued.length).toBeGreaterThan(0);
+  } finally {
+    window.requestAnimationFrame = realFrame;
+  }
 });

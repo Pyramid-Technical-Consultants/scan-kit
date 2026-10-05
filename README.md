@@ -212,8 +212,6 @@ Configurable Qt shells for the metrics most sessions need day to day.
 | Distribution Explorer | Density contours or scatter of position, position error, sigma, sigma error, IC2-IC1 position, confidence correlations, and Gaussian filter coverage, at spot or timeslice grain. |
 | Timeslice Replay | Interactive multi-channel timeslice viewer. See [details](#interactive-replay-views) |
 | FFT Explorer | Frequency-domain line spectra for timeslice IC current, dDose/dt, source beam current, chamber position, sigma, G3 Gaussian peak, magnetic field, and amplifier command/readback. |
-| Audio Explorer | Listen to the same timeslice families, with transport, a live playhead FFT, and **Save WAV** *(needs a working audio device / PortAudio)* |
-| IC Beam Trajectory (3D) | Per-spot IC beam paths in 3D with plan overlay, dipole pivots, and iso/IC planes (visPy) |
 | Dose Volume | Axial, coronal and sagittal slices, a ray-marched 3D volume, and two plots. The logged sessions build the dose from IC, ISO-ray, or plan spots in water, plastic, or metal. A loaded DICOM study's plan and the selected sessions are recalculated by the Monte Carlo on the planning CT (with contours, DVHs, clinical goals, gamma against the TPS, and report export) or in a phantom. See [details](#dose-volume) |
 | Session Log Compare | Layer timings, grouped errors, event browser, two-session diff. See [details](#session-log-compare) |
 
@@ -275,39 +273,13 @@ Scan Kit is a research tool, not a medical device. Don't use its dose for clinic
 
 ### Specialized analysis
 
-Focused plots that still use standalone matplotlib windows:
-
 | View | Summary |
 |------|---------|
-| Beam Error Motion vs Energy | Per-energy position-error spill paths (IC1 solid, IC2 dotted) |
-| Dose Accumulation | Expected vs measured cumulative dose per chamber |
-| Beam-Off Ramp-Down | Beam-off current ramp-down curves (IC1/IC2/IC3) |
 | IC HV Transient Test | IC high-voltage toggle transients with capacitance re-derived from waveforms |
-| Amplifier Command Correlations | Settled amplifier command vs readback, field, and IC iso position. See [details](#amplifier-command-correlations) |
-| IC Peak Amplitude - Beam-Off (G3) | G3 beam-off peak amplitude distributions |
 
-### Interactive replay views
+### Timeslice Replay
 
-**Timeslice Replay** opens a plot with a **Signal Source** list (same metric names and isocenter/chamber variants as Binned Summary and Distribution Explorer where applicable). Sources include **IC current**, **dDose/dt**, **sigma**, **sigma error**, **position**, **position error**, **IC2-IC1 position**, and **magnetic field**. Pick channels within the selected source from the checklist below. Detail traces sit above a compressed timeline brush. See the [screenshots](#screenshots) for examples.
-
-1. Select session(s) and open **Timeslice Replay**.
-2. Choose a signal source from the list, then tick the channels to plot.
-3. Drag the bottom timeline brush to set the detail window (scroll to zoom).
-
-Layer boundaries appear as annotated vertical lines. Multiple sessions overlay with distinct colors. Large windows are auto-decimated so scrubbing stays smooth.
-
-Optional toggles: background subtract, peer overlay (single-session), beam-off edges, digital lanes, and beam-current twin axis.
-
-**Magnetic field** channels plot scan-magnet probes in gauss:
-
-- **G3:** `r_tx2_probe_x` / `r_tx2_probe_y` (TX2 hall probes)
-- **G2:** `field_c_x` / `field_c_y` (correcting-coil readback)
-
-Selecting field channels shows a Bx-vs-By scatter panel (colored by energy) beside the timeline.
-
-### Amplifier command correlations
-
-For G2 correcting-coil sessions, this view plots beam-on samples where amplifier commands have reached a settled plateau. Scatter panels relate command to readback, magnetic field, and IC iso position, useful for diagnosing steering-chain consistency end to end.
+Timeslice Replay stacks every channel of one timeslice source from the shared Y menu. Channel checkboxes start on. Beam and rank filters use the same segment list as Binned Summary. The timeline along the bottom is off until its checkbox is enabled: play, pause, skip to either end, 1/10×, 1×, or 10×, and either the previous one second or every row at or before the playhead. An optional side scatter uses the Distribution Explorer source menu.
 
 ### Session log compare
 

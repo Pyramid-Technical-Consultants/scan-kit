@@ -19,13 +19,15 @@ pub struct PlotHeader {
     pub title: String,
     pub controls: Vec<Control>,
     pub table: Option<DataTable>,
-    pub samples: Vec<f32>,
     /// Panel frames. Series are empty. They travel as marks.
     pub panels: Vec<Panel>,
     pub columns: u32,
     pub column_weights: Vec<f32>,
     #[serde(default)]
     pub row_weights: Vec<f32>,
+    /// Panels at the end of `panels` that fill the right column.
+    #[serde(default)]
+    pub side: u32,
     pub background: [f32; 4],
     pub foreground: [f32; 4],
     /// `partial` while a task is still loading. `final` on the last payload.
@@ -61,11 +63,11 @@ pub fn encode_plot_quality(
         title: scene.title.clone(),
         controls: scene.controls.clone(),
         table: scene.table.clone(),
-        samples: scene.samples.clone(),
         panels: header_panels(&scene.panels),
         columns: scene.columns,
         column_weights: scene.column_weights.clone(),
         row_weights: scene.row_weights.clone(),
+        side: scene.side,
         background,
         foreground,
         quality: quality.into(),
@@ -158,6 +160,7 @@ impl Plot {
             header.columns,
             header.column_weights,
             header.row_weights,
+            header.side,
             marks,
             header.background,
             header.foreground,
@@ -242,18 +245,18 @@ mod tests {
             ],
             controls: Vec::new(),
             table: None,
-            samples: vec![0.5],
             columns: 2,
             column_weights: vec![2.0, 1.0],
             row_weights: vec![2.0, 1.0, 1.0],
+            side: 1,
         };
         let bytes = encode_plot(&scene, [0.1, 0.1, 0.1, 1.0], [0.9, 0.9, 0.9, 1.0]).unwrap();
         let (header, marks, _) = decode_plot(&bytes).unwrap();
         assert_eq!(marks, build_marks(&scene.panels));
         assert_eq!(header.panels, header_panels(&scene.panels));
-        assert_eq!(header.samples, vec![0.5]);
         assert_eq!(header.column_weights, vec![2.0, 1.0]);
         assert_eq!(header.row_weights, vec![2.0, 1.0, 1.0]);
+        assert_eq!(header.side, 1);
         assert!(marks.quads.iter().any(|quad| quad.heatmap == Some(0)));
         assert!(decode_plot(&bytes[..bytes.len() - 1]).is_err());
     }

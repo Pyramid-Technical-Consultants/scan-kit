@@ -73,19 +73,19 @@ Spot position remap, dose ratio, dose error, calibration, and the beam-state fil
 
 ## SK-REQ-011
 
-A timeslice load returns device-unit columns and the `input_map.csv` energy lookup length. The channel catalog lists the concepts present for Replay, FFT, and Audio.
+A timeslice load returns device-unit columns and the `input_map.csv` energy lookup length. The channel catalog lists the concepts present for Replay and FFT.
 
 ## SK-REQ-012
 
-Dose Accumulation draws cumulative expected and measured dose for each ionization chamber that has a dose column, an optional timeslice current-sum row, and a calibrate control.
+Withdrawn. Dose Accumulation is not an analysis view.
 
 ## SK-REQ-013
 
-IC Peak Amplitude — Beam-Off draws histograms of beam-off samples.
+Withdrawn. IC Peak Amplitude — Beam-Off is not an analysis view. Peak amplitude remains a timeslice source for Distribution Explorer.
 
 ## SK-REQ-014
 
-Beam Error Motion vs Energy draws a spill path per energy, with IC1 and IC2 when both error pairs are present.
+Withdrawn. Beam Error Motion vs Energy is not an analysis view.
 
 ## SK-REQ-015
 
@@ -97,11 +97,11 @@ Binned summaries use quantile bin edges and a histogram of the values in each bi
 
 ## SK-REQ-017
 
-Binned Summary draws the 1.8 metric groups (dose error, dose ratio, dose rate, current ratio, IC current, position error, sigma, sigma error, IC2 minus IC1, and spot time) against energy, target MU, spot time, or radius. Energy is one bin per value and the other axes use quantile bins. Glyphs are violin, box, mean, scatter, and contour, with the 1.8 trend, histogram, correlation, fliers, the segment list, and interlock lines. Timeslice Replay draws every sample of one channel. Zoom reads that trace; the scene is not a fixed overview or a strided detail.
+Binned Summary draws the 1.8 metric groups (dose error, dose ratio, dose rate, current ratio, IC current, position error, sigma, sigma error, IC2 minus IC1, and spot time) against energy, target MU, spot time, or radius. Energy is one bin per value and the other axes use quantile bins. Glyphs are violin, box, mean, scatter, and contour, with the 1.8 trend, histogram, correlation, fliers, the segment list, and interlock lines. Timeslice Replay stacks every channel of one timeslice source from the shared Y menu, and filters those rows with the segment list. The playhead is one more segment on that list: the previous one second, or every row at or before the playhead. An optional side scatter uses the Distribution Explorer source menu. Zoom reads those traces; the scene is not a fixed overview or a strided detail.
 
 ## SK-REQ-018
 
-FFT Explorer draws a Welch spectrum from 1 Hz to 500 Hz using 4096-sample segments and 50% overlap. Audio Explorer returns the same channel as normalized samples for playback and WAV export in the shell.
+FFT Explorer draws a Welch spectrum from 1 Hz to 500 Hz using 4096-sample segments and 50% overlap.
 
 ## SK-REQ-019
 
@@ -109,15 +109,15 @@ Welch PSD of a pure tone peaks at that tone.
 
 ## SK-REQ-021
 
-An exponential decay fit recovers the time constant of a falling curve. Beam-Off Ramp-Down draws the normalized window and that fit.
+Withdrawn. The ramp-down decay fit is not part of the product.
 
 ## SK-REQ-022
 
-Amplifier Command Correlations draws settled samples, a line fit, a density grid, and an arc fit when chamber positions exist. Beam-Off Ramp-Down draws normalized windows and their decay fit. IC HV Transient draws the current trace and the measured capacitance next to the firmware grade.
+IC HV Transient draws the current trace and the measured capacitance next to the firmware grade.
 
 ## SK-REQ-023
 
-A settled-sample mask stays false until the requested number of samples after a command step. A line fit returns slope and intercept.
+A line fit returns slope and intercept.
 
 ## SK-REQ-024
 
@@ -125,11 +125,11 @@ Session Log Compare returns overview counts, timeline rows, error issues, watchd
 
 ## SK-REQ-025
 
-IC geometry, the magnet pivot, and an iso-plane line fit are pure functions.
+IC1 sits 100 mm downstream of IC2. Dose Volume uses that separation.
 
 ## SK-REQ-026
 
-IC Beam Trajectory projects IC2 to IC1, the chamber planes, the magnet gap, and the iso-plane fit. Orbit is a control. The picture is a read-back frame.
+Withdrawn. IC Beam Trajectory is not an analysis view.
 
 ## SK-REQ-027
 
@@ -149,7 +149,7 @@ A DICOM folder of explicit little-endian files indexes by modality. A clinical g
 
 ## SK-REQ-033
 
-Spot current sums, the odd circular-arc fit, HV step capacitance, beam-off edges on a rolling background, coverage percent, and session-log timeline comparison match their reference cases.
+Spot current sums, HV step capacitance, coverage percent, and session-log timeline comparison match their reference cases.
 
 ## Trace
 

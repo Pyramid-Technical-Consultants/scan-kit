@@ -517,10 +517,10 @@ pub fn dose_volume(
         panels,
         controls,
         table: None,
-        samples: Vec::new(),
         columns: 3,
         column_weights: Vec::new(),
         row_weights: Vec::new(),
+        side: 0,
     }
 }
 
