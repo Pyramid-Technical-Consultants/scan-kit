@@ -276,7 +276,7 @@ it("opens another analysis from the menu beside Sessions", async () => {
     more?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
   });
   const item = [...document.querySelectorAll("[data-slot='dropdown-menu-item']")].find((node) =>
-    node.textContent?.includes("FFT Explorer"),
+    node.textContent?.includes("Dose Volume"),
   );
   expect(item).toBeInstanceOf(HTMLElement);
   expect(
@@ -287,7 +287,7 @@ it("opens another analysis from the menu beside Sessions", async () => {
   await act(async () => {
     item?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
   });
-  expect(onOpenView).toHaveBeenCalledWith("ic_fft_analysis");
+  expect(onOpenView).toHaveBeenCalledWith("dose_volume");
 });
 
 it("hides an unchecked session and keeps the other session's color", async () => {

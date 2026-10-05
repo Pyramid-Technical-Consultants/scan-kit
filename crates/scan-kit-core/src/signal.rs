@@ -268,7 +268,10 @@ pub fn histogram(values: &[f32], bins: usize) -> (Vec<f32>, Vec<f32>) {
     (edges, counts)
 }
 
-/// Welch PSD. `seg_len` 4096, overlap 0.5, and `fs` 1000 match FFT Explorer.
+/// Welch PSD. Timeslice Replay asks for 4096-sample segments, 50% overlap, and `fs` 1000.
+///
+/// The segment length is a power of two. A shorter trace uses the largest such
+/// length that fits, and at least 16 samples.
 pub fn welch_psd(
     signal: &[f32],
     fs: f32,
@@ -281,35 +284,37 @@ pub fn welch_psd(
         .map(|value| if value.is_finite() { value - mean } else { 0.0 })
         .collect();
     if centered.len() < seg_len {
-        seg_len = centered.len().max(16);
+        seg_len = centered.len();
+    }
+    if !seg_len.is_power_of_two() {
+        seg_len = seg_len.next_power_of_two() / 2;
+    }
+    if seg_len < 16 {
+        return (Vec::new(), Vec::new());
     }
     let step = ((seg_len as f32) * (1.0 - overlap)).round().max(1.0) as usize;
     let window = hanning(seg_len);
     let win_power: f32 = window.iter().map(|w| w * w).sum();
-    let mut accum: Option<Vec<f32>> = None;
+    let mut windowed = vec![0.0f32; seg_len];
+    let mut psd = vec![0.0f32; seg_len / 2 + 1];
     let mut count = 0usize;
     let mut start = 0usize;
     while start + seg_len <= centered.len() {
-        let mut segment: Vec<f32> = centered[start..start + seg_len]
-            .iter()
-            .zip(&window)
-            .map(|(sample, w)| sample * w)
-            .collect();
-        let power = rfft_power(&mut segment);
-        match &mut accum {
-            None => accum = Some(power),
-            Some(sum) => {
-                for (bin, value) in sum.iter_mut().zip(power) {
-                    *bin += value;
-                }
-            }
+        for (out, (sample, weight)) in windowed
+            .iter_mut()
+            .zip(centered[start..start + seg_len].iter().zip(&window))
+        {
+            *out = sample * weight;
+        }
+        for (bin, power) in psd.iter_mut().zip(rfft_power(&windowed)) {
+            *bin += power;
         }
         count += 1;
         start += step;
     }
-    let Some(mut psd) = accum else {
+    if count == 0 {
         return (Vec::new(), Vec::new());
-    };
+    }
     let scale = (count as f32) * win_power.max(1e-12);
     let last = psd.len().saturating_sub(1);
     for (i, bin) in psd.iter_mut().enumerate() {
@@ -349,21 +354,57 @@ fn hanning(n: usize) -> Vec<f32> {
         .collect()
 }
 
-/// Real FFT power `|rfft|^2`. Length may be any n ≥ 1.
-fn rfft_power(segment: &mut [f32]) -> Vec<f32> {
-    let n = segment.len();
-    (0..n / 2 + 1)
-        .map(|k| {
-            let mut re = 0.0f32;
-            let mut im = 0.0f32;
-            let angle = -2.0 * std::f32::consts::PI * k as f32 / n as f32;
-            for (t, sample) in segment.iter().copied().enumerate() {
-                let phase = angle * t as f32;
-                re += sample * phase.cos();
-                im += sample * phase.sin();
+/// One-sided power `|DFT|^2` for a power-of-two length. The sign is the analysis transform.
+fn rfft_power(samples: &[f32]) -> Vec<f32> {
+    let n = samples.len();
+    debug_assert!(n.is_power_of_two() && n >= 2);
+    let mut re = samples.to_vec();
+    let mut im = vec![0.0f32; n];
+    let bits = n.trailing_zeros();
+    for i in 0..n {
+        let j = i.reverse_bits() >> (usize::BITS - bits);
+        if i < j {
+            re.swap(i, j);
+            im.swap(i, j);
+        }
+    }
+    let mut tw_re = vec![0.0f32; n / 2];
+    let mut tw_im = vec![0.0f32; n / 2];
+    let mut len = 2usize;
+    while len <= n {
+        let half = len / 2;
+        let turn = -2.0 * std::f64::consts::PI / len as f64;
+        let step_re = turn.cos();
+        let step_im = turn.sin();
+        tw_re[0] = 1.0;
+        tw_im[0] = 0.0;
+        let mut w_re = 1.0f64;
+        let mut w_im = 0.0f64;
+        for k in 1..half {
+            let next_re = w_re * step_re - w_im * step_im;
+            w_im = w_re * step_im + w_im * step_re;
+            w_re = next_re;
+            tw_re[k] = w_re as f32;
+            tw_im[k] = w_im as f32;
+        }
+        let mut i = 0usize;
+        while i < n {
+            for k in 0..half {
+                let v_re = re[i + k + half] * tw_re[k] - im[i + k + half] * tw_im[k];
+                let v_im = re[i + k + half] * tw_im[k] + im[i + k + half] * tw_re[k];
+                let u_re = re[i + k];
+                let u_im = im[i + k];
+                re[i + k] = u_re + v_re;
+                im[i + k] = u_im + v_im;
+                re[i + k + half] = u_re - v_re;
+                im[i + k + half] = u_im - v_im;
             }
-            re * re + im * im
-        })
+            i += len;
+        }
+        len <<= 1;
+    }
+    (0..n / 2 + 1)
+        .map(|k| re[k] * re[k] + im[k] * im[k])
         .collect()
 }
 /// Deposit isotropic Gaussians onto a regular grid. `spots` are `(x, y, z, weight, sigma)`.
@@ -835,6 +876,29 @@ mod tests {
         let (bins, counts) = histogram(&[0.0, 0.1, 0.9, 1.0], 2);
         assert_eq!(bins.len(), 3);
         assert_eq!(counts.iter().sum::<f32>(), 4.0);
+    }
+
+    #[test]
+    fn a_power_of_two_fft_matches_the_summed_dft() {
+        let samples: Vec<f32> = (0..32).map(|i| (i as f32 * 0.37).sin() + 0.2).collect();
+        let fast = rfft_power(&samples);
+        let n = samples.len();
+        for (k, power) in fast.iter().enumerate() {
+            let mut re = 0.0f32;
+            let mut im = 0.0f32;
+            let angle = -2.0 * std::f32::consts::PI * k as f32 / n as f32;
+            for (t, sample) in samples.iter().copied().enumerate() {
+                let phase = angle * t as f32;
+                re += sample * phase.cos();
+                im += sample * phase.sin();
+            }
+            let expected = re * re + im * im;
+            let tol = 1e-3 * expected.abs().max(1.0);
+            assert!(
+                (power - expected).abs() < tol,
+                "bin {k}: {power} vs {expected}"
+            );
+        }
     }
 
     #[test]

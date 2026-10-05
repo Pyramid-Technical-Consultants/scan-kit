@@ -134,11 +134,9 @@ On a dev install, the default data source is the bundled `test_data/` folder.
 </p>
 
 <p align="center">
-  <img src="docs/images/view-magnetic-field-replay.png" alt="Magnetic field timeslice replay with Bx and By traces" width="460">
-  &nbsp;
-  <img src="docs/images/view-fft-explorer.png" alt="FFT Explorer line spectra for IC currents" width="460">
+  <img src="docs/images/view-magnetic-field-replay.png" alt="Magnetic field timeslice replay with Bx and By traces" width="920">
   <br>
-  <sub><em>Magnetic field replay (G3 hall probes) and FFT Explorer spectra.</em></sub>
+  <sub><em>Timeslice Replay of the magnetic field, with Bx and By traces.</em></sub>
 </p>
 
 <p align="center">
@@ -210,8 +208,7 @@ Configurable Qt shells for the metrics most sessions need day to day.
 |------|---------|
 | Binned Summary | Box / violin / mean / scatter / contour summary. Pick **Y metric** (dose error, dose ratios, dose rate, current ratios, IC current, position error, sigma, sigma error, IC2-IC1 position, spot time) and **X parameter** (energy, target MU, spot time, beam radius). **Filter Data** includes beam on/off/both plus All Data / Within Lower 95% / Upper 5% Only / MAD Outliers. Optional interlock-threshold overlay on dose-vs-MU plots. |
 | Distribution Explorer | Density contours or scatter of position, position error, sigma, sigma error, IC2-IC1 position, confidence correlations, and Gaussian filter coverage, at spot or timeslice grain. |
-| Timeslice Replay | Interactive multi-channel timeslice viewer. See [details](#interactive-replay-views) |
-| FFT Explorer | Frequency-domain line spectra for timeslice IC current, dDose/dt, source beam current, chamber position, sigma, G3 Gaussian peak, magnetic field, and amplifier command/readback. |
+| Timeslice Replay | Interactive multi-channel timeslice viewer, with an optional spectrum beside each channel. See [details](#timeslice-replay) |
 | Dose Volume | Axial, coronal and sagittal slices, a ray-marched 3D volume, and two plots. The logged sessions build the dose from IC, ISO-ray, or plan spots in water, plastic, or metal. A loaded DICOM study's plan and the selected sessions are recalculated by the Monte Carlo on the planning CT (with contours, DVHs, clinical goals, gamma against the TPS, and report export) or in a phantom. See [details](#dose-volume) |
 | Session Log Compare | Layer timings, grouped errors, event browser, two-session diff. See [details](#session-log-compare) |
 
@@ -279,7 +276,7 @@ Scan Kit is a research tool, not a medical device. Don't use its dose for clinic
 
 ### Timeslice Replay
 
-Timeslice Replay stacks every channel of one timeslice source from the shared Y menu. Channel checkboxes start on. Beam and rank filters use the same segment list as Binned Summary. The timeline along the bottom is off until its checkbox is enabled: play, pause, skip to either end, 1/10×, 1×, or 10×, and either the previous one second or every row at or before the playhead. An optional side scatter uses the Distribution Explorer source menu.
+Timeslice Replay stacks every channel of one timeslice source from the shared Y menu. Channel checkboxes start on. Beam and rank filters use the same segment list as Binned Summary. The timeline along the bottom is off until its checkbox is enabled: play, pause, skip to either end, 1/10×, 1×, or 10×, and either the previous one second or every row at or before the playhead. FFT draws a Welch spectrum from 1 Hz to 500 Hz to the right of each channel. An optional side scatter uses the Distribution Explorer source menu.
 
 ### Session log compare
 

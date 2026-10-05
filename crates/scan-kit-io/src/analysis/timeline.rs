@@ -2,14 +2,14 @@ use std::path::Path;
 
 use scan_kit_core::{
     hv_capacitance_pf, hv_delta_v, hv_expected_pf, hv_firmware_flags, hv_step_window, row_mask,
-    scrub_control, segments_control, segments_from, time_end, BeamGate, Panel, PlotScene, Rank,
-    Segment, Series,
+    scrub_control, segments_control, segments_from, time_end, welch_psd, BeamGate, Panel,
+    PlotScene, Rank, Segment, Series,
 };
 use serde_json::Value;
 
 use super::{
-    col, control, drew_line, flag, load_csv, panel, percentile_sorted, scene, session_text, span,
-    stroke, MARK,
+    col, control, drew_line, flag, load_csv, panel, percentile_sorted, placed, scene, session_text,
+    span, stroke, MARK,
 };
 
 /// Timeslice rows are 1 ms apart.
@@ -51,6 +51,7 @@ pub(super) fn replay(root: &Path, session_ids: &[String], options: &Value) -> Pl
         .iter()
         .map(|table| row_mask(table, &segments, &keys))
         .collect();
+    let show_fft = flag(&options, "fft", false);
     let mut xmax = SAMPLE_S;
     for table in &tables {
         for series in channels {
@@ -91,8 +92,22 @@ pub(super) fn replay(root: &Path, session_ids: &[String], options: &Value) -> Pl
             ymax = 1.0;
         }
         panels.push(time_panel(series.label, drawn, xmax, ymin, ymax, quantity));
+        if show_fft {
+            let columns: Vec<Vec<f32>> = tables
+                .iter()
+                .zip(&masks)
+                .filter_map(|(table, keep)| {
+                    table.get(series.key).map(|samples| gated(samples, keep))
+                })
+                .collect();
+            panels.push(spectrum_panel(&columns));
+        }
     }
-    let time_count = panels.len();
+    let time_count = if show_fft {
+        panels.len() / 2
+    } else {
+        panels.len()
+    };
     let show_scatter = flag(&options, "scatter", false);
     if show_scatter {
         let query = scatter_query(&options);
@@ -127,21 +142,34 @@ pub(super) fn replay(root: &Path, session_ids: &[String], options: &Value) -> Pl
         let mut controls = time_controls(&picked.controls, channels, &options, &segments, end);
         controls.push(scatter_toggle(true));
         controls.extend(scatter.controls.into_iter().map(scatter_control));
-        return finish(panels, controls, time_count);
+        return finish(panels, controls, time_count, show_fft);
     }
     let mut controls = time_controls(&picked.controls, channels, &options, &segments, end);
     controls.push(scatter_toggle(false));
-    finish(panels, controls, time_count)
+    finish(panels, controls, time_count, show_fft)
 }
 
 fn finish(
     panels: Vec<Panel>,
     controls: Vec<scan_kit_core::Control>,
     time_count: usize,
+    fft: bool,
 ) -> PlotScene {
-    let side = panels.len().saturating_sub(time_count);
+    let rows = if fft {
+        time_count.saturating_mul(2)
+    } else {
+        time_count
+    };
+    let side = panels.len().saturating_sub(rows);
     let mut scene = scene("Timeslice Replay", panels, controls);
-    if side > 0 && time_count > 0 {
+    if fft && time_count > 0 && side > 0 {
+        scene.columns = 2;
+        scene.column_weights = vec![3.0, 1.4, 1.4];
+        scene.side = side as u32;
+    } else if fft && time_count > 0 {
+        scene.columns = 2;
+        scene.column_weights = vec![3.0, 1.4];
+    } else if side > 0 && time_count > 0 {
         scene.columns = 2;
         scene.column_weights = vec![3.0, 1.4];
         scene.side = side as u32;
@@ -180,8 +208,15 @@ fn time_controls(
         segments,
         &[("beam", "Beam"), ("rank", "Rank")],
     ));
+    controls.push(fft_toggle(flag(options, "fft", false)));
     controls.push(scrub_control(options, end));
     controls
+}
+
+fn fft_toggle(on: bool) -> scan_kit_core::Control {
+    control("fft", "FFT", &["Off", "On"], on_off(on))
+        .grouped("FFT")
+        .checked()
 }
 
 fn scatter_toggle(on: bool) -> scan_kit_core::Control {
@@ -338,6 +373,52 @@ fn line_panel(title: String, xs: &[f32], ys: &[f32], color: [f32; 4]) -> Panel {
             thickness: 1.5,
         }],
     )
+}
+
+/// Welch spectrum of the samples this row draws, 1 Hz to 500 Hz.
+///
+/// ponytail: a beam-off gap is dropped, not written as a zero, so the frequency
+/// axis is the 1 ms clock of the kept samples. Zero-fill at that clock if a
+/// notch from the gate starts to matter.
+fn spectrum_panel(columns: &[Vec<f32>]) -> Panel {
+    let mut series = Vec::new();
+    for samples in columns {
+        let kept: Vec<f32> = samples
+            .iter()
+            .copied()
+            .filter(|value| value.is_finite())
+            .collect();
+        if kept.len() < 16 {
+            continue;
+        }
+        let (freqs, psd) = welch_psd(&kept, 1.0 / SAMPLE_S, 4096, 0.5);
+        let mut xs = Vec::new();
+        let mut ys = Vec::new();
+        for (freq, power) in freqs.iter().zip(&psd) {
+            if (1.0..=500.0).contains(freq) {
+                xs.push(*freq);
+                ys.push(if power.is_finite() && *power > 0.0 {
+                    power.log10()
+                } else {
+                    f32::NAN
+                });
+            }
+        }
+        if ys.iter().any(|value| value.is_finite()) {
+            series.push(stroke(xs, ys, false));
+        }
+    }
+    let mut panel = if series.is_empty() {
+        panel(String::new(), 1.0, 500.0, 0.0, 1.0, series)
+    } else {
+        let mut panel = placed(String::new(), series);
+        panel.xmin = 1.0;
+        panel.xmax = 500.0;
+        panel
+    };
+    panel.x_label = "Hz".into();
+    panel.y_label = "log10 PSD".into();
+    panel
 }
 
 fn time_panel(

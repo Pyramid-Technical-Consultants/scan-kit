@@ -12,7 +12,6 @@ pub(super) use super::marks::{contour_bands, control, flag, labeled, pick, text}
 pub(super) use super::tables::{slice_table, spot_table, timeslice_metric, timeslice_signals};
 mod distribution;
 mod session_log;
-mod spectrum;
 mod timeline;
 
 /// A session series. `apply_palette` replaces the RGB and keeps this alpha.
@@ -37,7 +36,6 @@ pub fn analysis_scene(
         "distribution" => Ok(distribution::distribution(root, session_ids, options)),
         "binned_summary" => Ok(binned_summary(root, session_ids, options)),
         "timeslice_replay" => Ok(timeline::replay(root, session_ids, options)),
-        "ic_fft_analysis" => Ok(spectrum::fft_view(root, session_ids, options)),
         "ic_hv_transient" => Ok(timeline::hv_transient(root, session_ids)),
         "session_log_compare" => Ok(session_log::session_log(root, session_ids)),
         "dose_volume" => Ok(crate::dose_view::dose_volume(
@@ -204,33 +202,8 @@ fn session_channels(root: &Path, session: &str) -> super::tables::Table {
     timeslice_signals(root, session)
 }
 
-fn timeline(root: &Path, session_ids: &[String]) -> Vec<super::tables::Table> {
-    super::tables::map_sessions(session_ids, |session| session_channels(root, session))
-}
-
 pub(super) fn channel_key(name: &str) -> bool {
     !matches!(name, "energy" | "beam_on" | "beam_on_time" | "spot_time")
-}
-
-pub(super) fn finite_names(
-    session_ids: &[String],
-    tables: &[super::tables::Table],
-) -> Vec<(String, Vec<String>)> {
-    session_ids
-        .iter()
-        .zip(tables)
-        .map(|(id, table)| {
-            let mut columns: Vec<String> = table
-                .iter()
-                .filter(|(name, values)| {
-                    channel_key(name) && values.iter().any(|value| value.is_finite())
-                })
-                .map(|(name, _)| name.clone())
-                .collect();
-            columns.sort();
-            (id.clone(), columns)
-        })
-        .collect()
 }
 
 fn percentile_sorted(values: &[f32], p: f32) -> f32 {
@@ -917,10 +890,40 @@ mod tests {
 
     #[test]
     fn sk_req_018_fft_draws_a_spectrum() {
-        let fft = scene_of("ic_fft_analysis");
-        assert!(has_kind(&fft, "line"));
-        assert!(fft.panels.iter().any(|panel| panel.y_label == "log10 PSD"));
-        assert_eq!(fft.title, "FFT Explorer");
+        let fft = opened(
+            "timeslice_replay",
+            "fft",
+            &json!({ "fft": "On", "beam": "Both" }),
+        );
+        assert_eq!(fft.title, "Timeslice Replay");
+        assert_eq!(fft.columns, 2);
+        assert_eq!(fft.side, 0);
+        assert_eq!(fft.column_weights, vec![3.0, 1.4]);
+        assert!(fft.panels.len() >= 2 && fft.panels.len().is_multiple_of(2));
+        for pair in fft.panels.chunks(2) {
+            assert_eq!(pair[1].y_label, "log10 PSD");
+            assert_eq!(pair[1].x_label, "Hz");
+            assert_eq!(pair[1].xmin, 1.0);
+            assert_eq!(pair[1].xmax, 500.0);
+            assert!(pair[1].series.iter().any(|series| {
+                matches!(series, Series::Polyline { ys, .. } if ys.iter().any(|value| value.is_finite()))
+            }));
+        }
+        let off = scene_of("timeslice_replay");
+        assert!(off.panels.iter().all(|panel| panel.y_label != "log10 PSD"));
+        assert!(off.controls.iter().any(|control| control.id == "fft"));
+
+        let both = opened(
+            "timeslice_replay",
+            "fft-scatter",
+            &json!({ "fft": "On", "scatter": "On" }),
+        );
+        assert_eq!(both.columns, 2);
+        assert_eq!(both.column_weights, vec![3.0, 1.4, 1.4]);
+        assert!(both.side >= 1);
+        let main = both.panels.len() - both.side as usize;
+        assert_eq!(main % 2, 0);
+        assert_eq!(both.panels[1].y_label, "log10 PSD");
     }
 
     #[test]

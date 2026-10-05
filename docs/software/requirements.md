@@ -73,7 +73,7 @@ Spot position remap, dose ratio, dose error, calibration, and the beam-state fil
 
 ## SK-REQ-011
 
-A timeslice load returns device-unit columns and the `input_map.csv` energy lookup length. The channel catalog lists the concepts present for Replay and FFT.
+A timeslice load returns device-unit columns and the `input_map.csv` energy lookup length. The channel catalog lists the concepts present for Replay.
 
 ## SK-REQ-012
 
@@ -97,11 +97,11 @@ Binned summaries use quantile bin edges and a histogram of the values in each bi
 
 ## SK-REQ-017
 
-Binned Summary draws the 1.8 metric groups (dose error, dose ratio, dose rate, current ratio, IC current, position error, sigma, sigma error, IC2 minus IC1, and spot time) against energy, target MU, spot time, or radius. Energy is one bin per value and the other axes use quantile bins. Glyphs are violin, box, mean, scatter, and contour, with the 1.8 trend, histogram, correlation, fliers, the segment list, and interlock lines. Timeslice Replay stacks every channel of one timeslice source from the shared Y menu, and filters those rows with the segment list. The playhead is one more segment on that list: the previous one second, or every row at or before the playhead. An optional side scatter uses the Distribution Explorer source menu. Zoom reads those traces; the scene is not a fixed overview or a strided detail.
+Binned Summary draws the 1.8 metric groups (dose error, dose ratio, dose rate, current ratio, IC current, position error, sigma, sigma error, IC2 minus IC1, and spot time) against energy, target MU, spot time, or radius. Energy is one bin per value and the other axes use quantile bins. Glyphs are violin, box, mean, scatter, and contour, with the 1.8 trend, histogram, correlation, fliers, the segment list, and interlock lines. Timeslice Replay stacks every channel of one timeslice source from the shared Y menu, and filters those rows with the segment list. The playhead is one more segment on that list: the previous one second, or every row at or before the playhead. An optional FFT column sits beside each channel, and an optional side scatter uses the Distribution Explorer source menu. Zoom reads those traces; the scene is not a fixed overview or a strided detail.
 
 ## SK-REQ-018
 
-FFT Explorer draws a Welch spectrum from 1 Hz to 500 Hz using 4096-sample segments and 50% overlap.
+Timeslice Replay can draw a Welch spectrum beside each channel, from 1 Hz to 500 Hz, using 4096-sample segments and 50% overlap.
 
 ## SK-REQ-019
 

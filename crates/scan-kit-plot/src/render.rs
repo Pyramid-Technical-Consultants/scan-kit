@@ -2039,6 +2039,18 @@ fn panel_rects(
         return Vec::new();
     }
     if side > 0 && (side as usize) < count {
+        // A weight per grid column plus one for the side column means the main
+        // panels are a row-major grid and the side panels stack beside it.
+        if columns > 1 && weights.len() == columns as usize + 1 {
+            return grid_with_side(
+                count,
+                width,
+                height,
+                columns as usize,
+                weights,
+                side as usize,
+            );
+        }
         return side_column(count, width, height, weights, side as usize);
     }
     let cols = if columns == 0 {
@@ -2132,6 +2144,62 @@ fn side_column(
         side,
         margin + left_w + gap,
         right_w,
+        margin,
+        inner_h,
+        gap,
+    ));
+    rects
+}
+
+/// Main panels fill a row-major grid. The last `side` panels stack in the
+/// column to the right of that grid and share its full height.
+fn grid_with_side(
+    count: usize,
+    width: u32,
+    height: u32,
+    columns: usize,
+    weights: &[f32],
+    side: usize,
+) -> Vec<PlotRect> {
+    let main = count - side;
+    let cols = columns.max(1);
+    let rows = main.div_ceil(cols).max(1);
+    let gap = 12.0f32;
+    let margin = 8.0f32;
+    let margin_right = 16.0f32;
+    let bands = cols + 1;
+    let inner_w = width as f32 - margin - margin_right - gap * (bands.saturating_sub(1) as f32);
+    let weight_sum = weights.iter().sum::<f32>().max(1.0e-6);
+    let mut col_x = Vec::with_capacity(bands);
+    let mut col_w = Vec::with_capacity(bands);
+    let mut x = margin;
+    for (index, weight) in weights.iter().enumerate() {
+        let cell_w = inner_w * weight / weight_sum;
+        col_x.push(x);
+        col_w.push(cell_w);
+        x += cell_w;
+        if index + 1 < bands {
+            x += gap;
+        }
+    }
+    let inner_h = height as f32 - margin * 2.0;
+    let mut rects = Vec::with_capacity(count);
+    let row_gaps = gap * rows.saturating_sub(1) as f32;
+    let row_h = ((inner_h - row_gaps) / rows as f32).max(1.0);
+    for index in 0..main {
+        let col = index % cols;
+        let row = index / cols;
+        rects.push(PlotRect {
+            x: col_x[col],
+            y: margin + row as f32 * (row_h + gap),
+            w: col_w[col],
+            h: row_h,
+        });
+    }
+    rects.extend(stack_column(
+        side,
+        col_x[cols],
+        col_w[cols],
         margin,
         inner_h,
         gap,
@@ -2934,6 +3002,32 @@ mod tests {
         );
         assert!(side.h > top.h, "{} {}", side.h, top.h);
         assert!(side.x > top.x);
+    }
+
+    #[test]
+    fn a_paired_grid_keeps_a_side_column() {
+        let mut scene = line_scene();
+        let panel = scene.panels[0].clone();
+        scene.panels.push(panel.clone());
+        scene.panels.push(panel.clone());
+        scene.panels.push(panel.clone());
+        scene.panels.push(panel);
+        scene.columns = 2;
+        scene.column_weights = vec![3.0, 1.4, 1.4];
+        scene.side = 1;
+        let plot = Plot::new(&scene, [0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0, 1.0]);
+        let layout = plot.layout(800, 420);
+        let time = &layout[0].cell;
+        let spectrum = &layout[1].cell;
+        let time_below = &layout[2].cell;
+        let side = &layout[4].cell;
+        assert!((time.y - spectrum.y).abs() < 1.0);
+        assert!(spectrum.x > time.x);
+        assert!(time_below.y > time.y);
+        assert!((time.y - side.y).abs() < 1.0);
+        let left_bottom = time_below.y + time_below.h;
+        assert!((left_bottom - (side.y + side.h)).abs() < 1.0);
+        assert!(side.x > spectrum.x);
     }
 
     #[test]
