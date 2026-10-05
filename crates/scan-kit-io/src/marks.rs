@@ -341,9 +341,12 @@ rci_in_trigger,r_ic1_x_confidence,r_ic1_x_peak_amplitude,c_x,r_xV,r_tx2_probe_x
         };
 
         let confidence = signal_table(&files, &energies, &layers, "fit_confidence");
-        close(&confidence["ic1_x_confidence"], &[90.0, 10.0, 40.0]);
-        close(&confidence["energy"], &[150.0, 150.0, 150.0]);
-        close(&confidence["beam_on"], &[1.0, 0.0, 1.0]);
+        // The second file has a trigger and no confidence sample. That row stays.
+        close(&confidence["ic1_x_confidence"][..3], &[90.0, 10.0, 40.0]);
+        assert!(confidence["ic1_x_confidence"][3].is_nan());
+        close(&confidence["energy"][..3], &[150.0, 150.0, 150.0]);
+        assert!(confidence["energy"][3].is_nan());
+        close(&confidence["beam_on"], &[1.0, 0.0, 1.0, 1.0]);
         assert!(!confidence.contains_key("ic1_y_confidence"));
 
         let mut filtered = confidence;
@@ -357,17 +360,21 @@ rci_in_trigger,r_ic1_x_confidence,r_ic1_x_peak_amplitude,c_x,r_xV,r_tx2_probe_x
         assert!(filtered["ic1_x_confidence"][0].is_finite());
         assert!(filtered["ic1_x_confidence"][1].is_nan());
         assert!((filtered["ic1_x_confidence"][2] - 40.0).abs() < 1e-4);
+        assert!(filtered["ic1_x_confidence"][3].is_nan());
 
         let peak = signal_table(&files, &energies, &layers, "peak_amplitude");
-        close(&peak["ic1_x_peak"], &[4.0, 1.0, 2.0]);
+        close(&peak["ic1_x_peak"][..3], &[4.0, 1.0, 2.0]);
+        assert!(peak["ic1_x_peak"][3].is_nan());
         assert!(!peak.contains_key("ic1_y_peak"));
 
         let amplifier = signal_table(&files, &energies, &layers, "amplifier_error");
-        close(&amplifier["amp_x"], &[0.2, 0.5, 0.0]);
+        close(&amplifier["amp_x"][..3], &[0.2, 0.5, 0.0]);
+        assert!(amplifier["amp_x"][3].is_nan());
         assert!(!amplifier.contains_key("amp_y"));
 
         let field = signal_table(&files, &energies, &layers, "probe_field");
-        close(&field["field_x"], &[30.0, -10.0, 5.0]);
+        close(&field["field_x"][..3], &[30.0, -10.0, 5.0]);
+        assert!(field["field_x"][3].is_nan());
         assert!(!field.contains_key("field_y"));
     }
     #[test]

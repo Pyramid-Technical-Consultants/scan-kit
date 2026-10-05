@@ -957,4 +957,150 @@ mod tests {
             .any(|panel| panel.title.contains("No finite values")));
         let _ = std::fs::remove_dir_all(&root);
     }
+
+    fn finite(values: Option<&Vec<f32>>) -> Vec<f32> {
+        values
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(|value| value.is_finite())
+            .collect()
+    }
+
+    #[test]
+    fn a_parked_beam_converts_strips_with_device_geometry() {
+        let root = std::env::temp_dir().join("scan-kit-parked-geometry");
+        let _ = std::fs::remove_dir_all(&root);
+        let session = root.join("sess");
+        std::fs::create_dir_all(session.join("layer-0/run-0")).unwrap();
+        std::fs::create_dir_all(session.join("config/map2map")).unwrap();
+        std::fs::write(
+            session.join("config/map2map/devices.xml"),
+            r#"<devices><ion_chamber><device name="IC_1_X"/>
+            <strip_count>128</strip_count><strip_to_mm>2</strip_to_mm>
+            <zero_offset_at_iso_mm>-4</zero_offset_at_iso_mm>
+            <source_to_device_distance_mm>1250</source_to_device_distance_mm>
+            </ion_chamber></devices>"#,
+        )
+        .unwrap();
+        std::fs::write(
+            session.join("config/map2map/scan_dose_system.xml"),
+            "<MapToMap><geometry><source_to_isocenter_distance>2500</source_to_isocenter_distance></geometry></MapToMap>",
+        )
+        .unwrap();
+        std::fs::write(
+            session.join("input_map.csv"),
+            "energy,layer_id,spot_no,X_POSITION,Y_POSITION\n250,1,0,0,0\n",
+        )
+        .unwrap();
+        let mut spot = String::from(
+            "spot_no,layer_id,r_ic1_x_spot_sigma_raw,r_ic1_x_spot_sigma,r_ic1_x_spot_position_raw,r_ic1_x_spot_position\n",
+        );
+        for index in 0..12 {
+            spot.push_str(&format!("{index},1,1,4,64.5,0\n"));
+        }
+        std::fs::write(session.join("spot_data.csv"), spot).unwrap();
+        std::fs::write(
+            session.join("layer-0/run-0/timeslice_data_device_units.csv"),
+            "layer_id,rci_in_trigger,r_ic1_x_spot_position,r_ic1_x_sigma\n1,1,64.5,2\n",
+        )
+        .unwrap();
+        let table = crate::tables::slice_table(&root, "sess");
+        let x = table
+            .get("ic1_x")
+            .and_then(|values| values.first())
+            .copied();
+        let sigma = table
+            .get("ic1_sig_x")
+            .and_then(|values| values.first())
+            .copied();
+        assert!(x.is_some_and(|value| value.abs() < 1e-2), "position {x:?}");
+        assert!(
+            sigma.is_some_and(|value| (value - 8.0).abs() < 1e-2),
+            "sigma {sigma:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn modern_sessions_draw_a_millimetre_distribution() {
+        let root =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../test_data/logs");
+        for id in ["1905185100", "1093436476", "1771520329"] {
+            if !crate::discover::session_directory(&root, id)
+                .join("spot_data.csv")
+                .is_file()
+            {
+                continue;
+            }
+            let spot = crate::tables::spot_table(&root, id);
+            let slice = crate::tables::slice_table(&root, id);
+            let spot_x = finite(spot.get("ic1_x"));
+            let slice_x = finite(slice.get("ic1_x"));
+            let spot_sig = finite(spot.get("ic1_sig_x"));
+            let slice_sig = finite(slice.get("ic1_sig_x"));
+            let plan = finite(spot.get("plan_x"));
+            assert!(
+                spot_x.len() > 100 && slice_x.len() > 1_000,
+                "{id} spot {} slice {}",
+                spot_x.len(),
+                slice_x.len()
+            );
+            assert!(
+                slice_x.iter().all(|value| value.abs() < 200.0),
+                "{id} timeslice position left the millimetre field"
+            );
+            let plan_span = plan.iter().copied().fold(f32::MIN, f32::max)
+                - plan.iter().copied().fold(f32::MAX, f32::min);
+            if plan_span < 0.1 {
+                let median = crate::tables::median(&slice_x);
+                assert!(
+                    median.abs() < 5.0,
+                    "{id} parked beam median {median} is not at isocenter"
+                );
+            } else {
+                let span = slice_x.iter().copied().fold(f32::MIN, f32::max)
+                    - slice_x.iter().copied().fold(f32::MAX, f32::min);
+                assert!(span > 40.0, "{id} timeslice field span {span}");
+            }
+            let slice_sigma = crate::tables::median(&slice_sig);
+            let spot_sigma = crate::tables::median(&spot_sig);
+            let ratio = spot_sigma / slice_sigma;
+            assert!(
+                slice_sigma > 2.0 && (1.2..=3.2).contains(&ratio),
+                "{id} sigma spot {spot_sigma} slice {slice_sigma}"
+            );
+            let scene = analysis_scene(
+                "distribution",
+                &root,
+                &[id.to_string()],
+                &json!({ "xy": "position", "source": "timeslice" }),
+            )
+            .unwrap();
+            let points: usize = scene
+                .panels
+                .iter()
+                .flat_map(|panel| &panel.series)
+                .map(|series| match series {
+                    scan_kit_core::Series::Points { xs, .. } => xs.len(),
+                    _ => 0,
+                })
+                .sum();
+            let axis = scene.panels.first().unwrap();
+            assert!(
+                points > 1_000 && axis.xmin > -250.0 && axis.xmax < 250.0,
+                "{id} distribution points {points} axis {}..{}",
+                axis.xmin,
+                axis.xmax
+            );
+            if plan_span < 0.1 {
+                assert!(
+                    axis.xmin > -30.0 && axis.xmax < 30.0,
+                    "{id} parked distribution axis {}..{}",
+                    axis.xmin,
+                    axis.xmax
+                );
+            }
+        }
+    }
 }

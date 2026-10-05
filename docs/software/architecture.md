@@ -99,7 +99,9 @@ A view that takes long enough to block the window runs as a task: one bounded sl
 
 ## Session data
 
-The database path, table names, and `user_version` 3 match the Python store: `~/.scan-kit/scan-kit.sqlite`, tables `prefs`, `libraries`, and `sessions`, WAL, foreign keys. An existing file opens as-is. This window uses the last data folder and the window geometry prefs.
+The database path, table names, and `user_version` 3 match the Python store: `~/.scan-kit/scan-kit.sqlite`, tables `prefs`, `libraries`, and `sessions`, WAL, foreign keys. An existing file opens as-is. This window uses the last data folder and the window geometry prefs. Sqlite is the library index, not the sample store.
+
+A loaded session keeps one in-memory column table per grain: one row per spot record, one row per timeslice trigger, and one row per timeslice file. Each column has one producer. A view asks for columns by name. A slice window is read once, and a later view decodes any headers it still needs from those bytes.
 
 Discovery reads a local directory of session folders and `.zip`, `.tar`, `.tar.gz`, `.tgz`, `.tar.bz2`, and `.tar.xz`. It reads `termination_summary.txt` out of a folder or archive and does not unpack the archive. Unpacked folders win over an archive with the same id. The sqlite index skips re-parsing when size and mtime match. Map extent is filled from spot positions only when the cached row does not already have it.
 

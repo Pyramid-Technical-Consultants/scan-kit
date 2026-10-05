@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use scan_kit_core::{
-    apply_mask, coverage_percent, segments_control, segments_from, BeamGate, Family, Panel,
+    coverage_percent, row_mask, segments_control, segments_from, BeamGate, Family, Panel,
     PlotScene, Segment, Series, SESSION,
 };
 use serde_json::Value;
@@ -10,9 +10,8 @@ use serde_json::Value;
 use crate::histogram::{bin_button, hist_bin_count, histogram_panel, BIN_CHOICES};
 
 use super::{
-    col, contour_bands, control, drew_line, finite_col, flag, guide, labeled, panel,
-    percentile_sorted, pick, placed, scene, slice_table, spot_table, stroke, text,
-    timeslice_metric, MARK,
+    col, contour_bands, control, drew_line, finite_col, flag, guide, labeled, panel, pick, placed,
+    scene, slice_table, spot_table, stroke, text, timeslice_metric, MARK,
 };
 
 const DRAW_CHOICES: &[(&str, &str)] = &[
@@ -145,11 +144,11 @@ pub(super) fn distribution(root: &Path, session_ids: &[String], options: &Value)
     scene
 }
 
-fn finite_pairs(xs: &[f32], ys: &[f32]) -> (Vec<f32>, Vec<f32>) {
+fn masked_pairs(xs: &[f32], ys: &[f32], keep: &[bool]) -> (Vec<f32>, Vec<f32>) {
     let mut ox = Vec::new();
     let mut oy = Vec::new();
-    for (x, y) in xs.iter().zip(ys) {
-        if x.is_finite() && y.is_finite() {
+    for (index, (x, y)) in xs.iter().zip(ys).enumerate() {
+        if keep.get(index).copied().unwrap_or(true) && x.is_finite() && y.is_finite() {
             ox.push(*x);
             oy.push(*y);
         }
@@ -163,12 +162,25 @@ fn kept_pairs(
     y_key: &str,
     segments: &[Segment],
 ) -> (Vec<f32>, Vec<f32>) {
-    let mut copy = table.clone();
-    apply_mask(&mut copy, segments, &[x_key, y_key]);
-    finite_pairs(
-        copy.get(x_key).map(Vec::as_slice).unwrap_or(&[]),
-        copy.get(y_key).map(Vec::as_slice).unwrap_or(&[]),
+    let keep = row_mask(table, segments, &[x_key, y_key]);
+    masked_pairs(
+        table.get(x_key).map(Vec::as_slice).unwrap_or(&[]),
+        table.get(y_key).map(Vec::as_slice).unwrap_or(&[]),
+        &keep,
     )
+}
+
+/// Same index `percentile_sorted` would pick, without sorting the whole cloud.
+fn percentile_at(values: &mut [f32], p: f32) -> f32 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    let index = ((values.len() - 1) as f32 * p).round() as usize;
+    let index = index.min(values.len() - 1);
+    values.select_nth_unstable_by(index, |left, right| {
+        left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    values[index]
 }
 
 pub(super) fn distribution_limits(mode: &str, samples: &[f32]) -> (f32, f32) {
@@ -178,8 +190,7 @@ pub(super) fn distribution_limits(mode: &str, samples: &[f32]) -> (f32, f32) {
             .copied()
             .filter(|value| *value > 0.0)
             .collect();
-        positive.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let hi = percentile_sorted(&positive, 0.9995).max(1.0);
+        let hi = percentile_at(&mut positive, 0.9995).max(1.0);
         (0.0, hi)
     } else if mode == "position_error" {
         let mut abs: Vec<f32> = samples
@@ -188,8 +199,7 @@ pub(super) fn distribution_limits(mode: &str, samples: &[f32]) -> (f32, f32) {
             .filter(|value| value.is_finite())
             .map(f32::abs)
             .collect();
-        abs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let bound = percentile_sorted(&abs, 0.9995).max(1.0);
+        let bound = percentile_at(&mut abs, 0.9995).max(1.0);
         (-bound, bound)
     } else {
         let mut finite: Vec<f32> = samples
@@ -197,12 +207,11 @@ pub(super) fn distribution_limits(mode: &str, samples: &[f32]) -> (f32, f32) {
             .copied()
             .filter(|value| value.is_finite())
             .collect();
-        finite.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         if finite.is_empty() {
             (-1.0, 1.0)
         } else {
-            let lo = percentile_sorted(&finite, 0.0005);
-            let hi = percentile_sorted(&finite, 0.9995);
+            let lo = percentile_at(&mut finite, 0.0005);
+            let hi = percentile_at(&mut finite, 0.9995);
             let mid = 0.5 * (lo + hi);
             let half = (mid - lo).max(hi - mid).max(0.5);
             (mid - half, mid + half)
@@ -529,13 +538,15 @@ fn confidence_scene(
     for (title, peak_key, conf_key) in axes {
         let mut clouds = Vec::new();
         for (peaks, confidence) in peaks.iter().zip(&confidence) {
-            let mut peaks = std::sync::Arc::unwrap_or_clone(std::sync::Arc::clone(peaks));
-            let mut confidence = std::sync::Arc::unwrap_or_clone(std::sync::Arc::clone(confidence));
-            apply_mask(&mut peaks, segments, &[peak_key]);
-            apply_mask(&mut confidence, segments, &[conf_key]);
-            let (xs, ys) = finite_pairs(
+            let mut keep = row_mask(peaks, segments, &[peak_key]);
+            let other = row_mask(confidence, segments, &[conf_key]);
+            for (slot, pass) in keep.iter_mut().zip(&other) {
+                *slot = *slot && *pass;
+            }
+            let (xs, ys) = masked_pairs(
                 peaks.get(peak_key).map(Vec::as_slice).unwrap_or(&[]),
                 confidence.get(conf_key).map(Vec::as_slice).unwrap_or(&[]),
+                &keep,
             );
             if !xs.is_empty() {
                 clouds.push((xs, ys));
@@ -597,9 +608,9 @@ fn coverage_scene(root: &Path, session_ids: &[String], segments: &[Segment]) -> 
         });
         let mut series = Vec::new();
         for table in loaded {
-            let mut table = std::sync::Arc::unwrap_or_clone(table);
-            apply_mask(&mut table, segments, &[x_key, y_key]);
-            let metrics = spot_coverage_metrics(None, col(&table, x_key), col(&table, y_key));
+            let keep = row_mask(&table, segments, &[x_key, y_key]);
+            let metrics =
+                spot_coverage_metrics(None, col(&table, x_key), col(&table, y_key), &keep);
             if metrics.is_empty() {
                 continue;
             }
@@ -620,6 +631,7 @@ fn spot_coverage_metrics(
     spot: Option<&[f32]>,
     x_conf: Option<&[f32]>,
     y_conf: Option<&[f32]>,
+    keep: &[bool],
 ) -> Vec<f32> {
     let n = x_conf
         .map(|values| values.len())
@@ -632,6 +644,9 @@ fn spot_coverage_metrics(
     let mut max_x = Vec::new();
     let mut max_y = Vec::new();
     for i in 0..n {
+        if !keep.get(i).copied().unwrap_or(true) {
+            continue;
+        }
         let id = if let Some(values) = spot {
             let Some(value) = values.get(i).copied() else {
                 continue;

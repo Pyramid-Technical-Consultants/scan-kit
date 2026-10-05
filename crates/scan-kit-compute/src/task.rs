@@ -339,8 +339,13 @@ struct SessionStage {
     report: Report,
 }
 
-fn chunks_for(bytes: u64) -> usize {
-    let rows = (bytes / 48).max(1);
+fn chunks_for(bytes: u64, timeslice: bool) -> usize {
+    // Timeslice lines are about a kilobyte. Counting every 48 bytes invented
+    // windows, so a 128-window poll stayed on one long file and the rest were
+    // read one file at a time. 512 still over-counts these rows. Spot lines
+    // can be short, so they keep the 48-byte floor.
+    let width = if timeslice { 512 } else { 48 };
+    let rows = (bytes / width).max(1);
     rows.div_ceil(scan_kit_io::SLICE_ROWS as u64).max(1) as usize
 }
 
@@ -397,7 +402,7 @@ impl SessionStage {
                         .iter()
                         .map(|size| FilePlan {
                             bytes: *size,
-                            chunks: chunks_for(*size),
+                            chunks: chunks_for(*size, pieces.timeslice),
                             filled: 0,
                         })
                         .collect(),
@@ -441,7 +446,12 @@ impl SessionStage {
         if tail_done || asked >= file.bytes {
             file.filled = file.chunks;
         } else if file.filled == file.chunks {
-            file.chunks += 1;
+            // The file outlived the estimate. Double it instead of adding one
+            // window per poll.
+            file.chunks = file
+                .chunks
+                .saturating_mul(2)
+                .max(file.filled.saturating_add(1));
         }
     }
 

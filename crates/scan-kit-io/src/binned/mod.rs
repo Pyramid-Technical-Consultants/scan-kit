@@ -1,10 +1,10 @@
 //! Binned Summary, matching the 1.8 metric groups, binning, and glyphs.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
 use scan_kit_core::{
-    apply_mask, assign_bin_centers, quantile_edges, segments_control, segments_from, segments_json,
+    assign_bin_centers, quantile_edges, row_mask, segments_control, segments_from, segments_json,
     BeamGate, Control, Panel, PlotScene, Rank, Segment, Series,
 };
 use serde_json::Value;
@@ -14,12 +14,10 @@ use super::histogram::{bin_button, bin_share, hist_bin_count, share_key, BinShar
 use super::marks::{contour_bands, control, flag, labeled, pick, text};
 mod glyphs;
 
-use super::tables::{
-    load_slice_metric, load_spot, load_timeslice, median, same, span, timeslice_energy_only,
-};
+use super::tables::{median, same, session_columns, span, timeslice_energy_only, Grain};
 use glyphs::{
-    binned_trend, box_series, contour_series, corr_panel, hist_panel, hline, interlock_guides,
-    mean_series, note_panel, scatter_series, scatter_trend, violin_series,
+    begin_grown, binned_trend, box_series, contour_series, corr_panel, grown_violin, hist_panel,
+    hline, interlock_guides, mean_series, note_panel, scatter_series, scatter_trend, violin_series,
 };
 
 const OFFSET: f32 = 0.35;
@@ -607,25 +605,41 @@ pub(crate) fn binned_summary(root: &Path, session_ids: &[String], options: &Valu
         &segments_json(&segments),
         cutoff,
     );
+    let grow_key = key.clone();
+    let grow_ok = segments.iter().all(|item| {
+        !matches!(
+            item,
+            Segment::Rank {
+                which: Rank::Lower95 | Rank::Upper95 | Rank::Mad
+            }
+        )
+    });
     let prepared = cached_prepared(key, || {
         let load_one = |session: &String| {
-            let loaded = if geometry {
-                load_slice_metric(root, session, group.id, source == "timeslice_chamber")
+            let grain = if geometry {
+                if source == "timeslice_chamber" {
+                    Grain::SampleChamber
+                } else {
+                    Grain::Sample
+                }
+            } else if group.id == "current_ratio" {
+                Grain::Layer
             } else if group.timeslice {
-                load_timeslice(root, session, group.id)
-            } else if group.id == "dose_rate" {
-                std::sync::Arc::new(dose_rate_table(
-                    load_spot(root, session, false, false, false).as_ref(),
-                ))
+                Grain::Sample
+            } else if chamber {
+                Grain::SpotChamber
             } else {
-                load_spot(root, session, chamber, group.id == "spot_time", false)
+                Grain::Spot
             };
-            let mut table = std::sync::Arc::unwrap_or_clone(loaded);
-            if group.filter {
-                let keys: Vec<&str> = group.series.iter().map(|series| series.key).collect();
-                apply_mask(&mut table, &segments, &keys);
-            }
-            table
+            let mut names: Vec<&str> = group.series.iter().map(|series| series.key).collect();
+            names.push(x_column);
+            let loaded = session_columns(root, session, grain, &names);
+            let loaded = if group.id == "dose_rate" {
+                std::sync::Arc::new(dose_rate_table(loaded.as_ref()))
+            } else {
+                loaded
+            };
+            plotted_columns(loaded.as_ref(), &names, &segments, group.filter)
         };
         // A handful of sessions, one thread each. The spot cache covers a repeat open.
         let mut tables = if session_ids.len() < 2 {
@@ -643,11 +657,15 @@ pub(crate) fn binned_summary(root: &Path, session_ids: &[String], options: &Valu
             });
             tables
         };
-        let categories = if raw_x {
-            Vec::new()
+        let (categories, stable_bins) = if raw_x {
+            (Vec::new(), false)
         } else {
             assign_x(&mut tables, x_column, &bins)
         };
+        let grow = grow_ok && stable_bins && crate::tables::slice_is_bound();
+        if grow {
+            begin_grown(&grow_key);
+        }
         let present: Vec<&YSeries> = group
             .series
             .iter()
@@ -666,7 +684,9 @@ pub(crate) fn binned_summary(root: &Path, session_ids: &[String], options: &Valu
         let series = present
             .iter()
             .map(|series| {
-                let mut ys = Vec::new();
+                let mut lo = f32::MAX;
+                let mut hi = f32::MIN;
+                let mut any = false;
                 let glyphs = tables
                     .iter()
                     .enumerate()
@@ -677,7 +697,13 @@ pub(crate) fn binned_summary(root: &Path, session_ids: &[String], options: &Valu
                         if !has_finite(Some(y)) {
                             return Vec::new();
                         }
-                        ys.extend(y.iter().copied().filter(|value| value.is_finite()));
+                        for value in y {
+                            if value.is_finite() {
+                                any = true;
+                                lo = lo.min(*value);
+                                hi = hi.max(*value);
+                            }
+                        }
                         let color = [
                             0.8,
                             0.8,
@@ -695,14 +721,23 @@ pub(crate) fn binned_summary(root: &Path, session_ids: &[String], options: &Valu
                             "scatter" => vec![scatter_series(table, y, x_column, color)],
                             "contour" => Vec::new(),
                             "box" => box_series(table, y, &categories, index, color),
+                            _ if grow => grown_violin(
+                                &format!("{grow_key}|{}|{index}", series.key),
+                                table.get("_bin").map(Vec::as_slice).unwrap_or(&[]),
+                                y,
+                                &categories,
+                                color,
+                            ),
                             _ => violin_series(table, y, &categories, index, color),
                         }
                     })
                     .collect();
                 if group.zero {
-                    ys.push(0.0);
+                    any = true;
+                    lo = lo.min(0.0);
+                    hi = hi.max(0.0);
                 }
-                let (ymin, ymax) = span(&ys);
+                let (ymin, ymax) = if any { span(&[lo, hi]) } else { span(&[]) };
                 let contour = if glyph == "contour" {
                     contour_series(&tables, series.key, x_column, cutoff)
                 } else {
@@ -1169,12 +1204,18 @@ fn quantized_levels(
     limit: usize,
 ) -> Option<Vec<f32>> {
     let mut levels = Vec::new();
+    // Exact repeats are the common case (one energy copied down a layer).
+    // `same` still merges a value that is only a tolerance away.
+    let mut seen = HashSet::new();
     for table in tables {
         let Some(column) = table.get(key) else {
             continue;
         };
         for value in column {
-            if !value.is_finite() || levels.iter().any(|have| same(*have, *value)) {
+            if !value.is_finite() || !seen.insert(value.to_bits()) {
+                continue;
+            }
+            if levels.iter().any(|have| same(*have, *value)) {
                 continue;
             }
             if levels.len() + 1 >= limit {
@@ -1187,13 +1228,15 @@ fn quantized_levels(
     Some(levels)
 }
 
-/// One X rule for every column. Automatic keeps a short quantized axis and
-/// otherwise uses 32 quantile bins. A fixed count always regroups.
+/// Levels, and whether each row's bin is that row's own x value.
+///
+/// A quantized axis stays put as later rows arrive. Quantile edges move, so a
+/// growing picture cannot reuse the previous groups.
 fn assign_x(
     tables: &mut [BTreeMap<String, Vec<f32>>],
     column: &str,
     choice: &BinChoice,
-) -> Vec<f32> {
+) -> (Vec<f32>, bool) {
     let quantiles = match choice {
         BinChoice::Fixed(count) => *count,
         BinChoice::Automatic => match quantized_levels(tables, column, AUTO_LEVELS) {
@@ -1202,7 +1245,7 @@ fn assign_x(
                     let values = table.get(column).cloned().unwrap_or_default();
                     table.insert("_bin".to_string(), values);
                 }
-                return levels;
+                return (levels, true);
             }
             None => AUTO_QUANTILES,
         },
@@ -1217,22 +1260,84 @@ fn assign_x(
             assign_bin_centers(table.get(column).map(Vec::as_slice).unwrap_or(&[]), &edges);
         table.insert("_bin".to_string(), centers);
     }
-    unique_values(tables, "_bin")
+    (unique_values(tables, "_bin"), false)
 }
 
 fn unique_values(tables: &[BTreeMap<String, Vec<f32>>], key: &str) -> Vec<f32> {
     let mut values = Vec::new();
+    let mut seen = HashSet::new();
     for table in tables {
         if let Some(column) = table.get(key) {
             for value in column {
-                if value.is_finite() && !values.iter().any(|have| same(*have, *value)) {
-                    values.push(*value);
+                if !value.is_finite() || !seen.insert(value.to_bits()) {
+                    continue;
                 }
+                if values.iter().any(|have| same(*have, *value)) {
+                    continue;
+                }
+                values.push(*value);
             }
         }
     }
     values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     values
+}
+
+/// Copy the columns this glyph reads and apply the mask there.
+///
+/// The session table stays shared. `beam_on`, `expected_sigma`, and
+/// `session_avg_rate` stay finite, matching `apply_mask`.
+fn plotted_columns(
+    loaded: &BTreeMap<String, Vec<f32>>,
+    names: &[&str],
+    segments: &[Segment],
+    filter: bool,
+) -> BTreeMap<String, Vec<f32>> {
+    let keys: Vec<&str> = names
+        .iter()
+        .copied()
+        .filter(|name| loaded.contains_key(*name))
+        .collect();
+    let mask = filter.then(|| row_mask(loaded, segments, &keys));
+    let mut want: Vec<&str> = names.to_vec();
+    for item in segments {
+        match item {
+            Segment::Range { column, .. } | Segment::Compare { column, .. } => {
+                want.push(column.as_str());
+            }
+            Segment::Beam { .. } | Segment::Rank { .. } => {}
+        }
+    }
+    want.extend([
+        "expected_sigma",
+        "session_avg_rate",
+        "rate_energy",
+        "mu_rate",
+        "energy",
+        "beam_on",
+    ]);
+    let mut table = BTreeMap::new();
+    for name in want {
+        let Some(values) = loaded.get(name) else {
+            continue;
+        };
+        if table.contains_key(name) {
+            continue;
+        }
+        let mut values = values.clone();
+        let protect = matches!(name, "beam_on" | "expected_sigma" | "session_avg_rate");
+        if let Some(mask) = &mask {
+            if !protect {
+                for (value, keep) in values.iter_mut().zip(mask.iter()) {
+                    if !*keep {
+                        *value = f32::NAN;
+                    }
+                }
+            }
+        }
+        table.insert(name.to_string(), values);
+    }
+    table
 }
 
 fn dose_rate_table(table: &BTreeMap<String, Vec<f32>>) -> BTreeMap<String, Vec<f32>> {
@@ -1255,18 +1360,27 @@ fn group_samples(bins: Option<&Vec<f32>>, y: &[f32], categories: &[f32]) -> Vec<
     if categories.is_empty() {
         return groups;
     }
+    let mut index_of = HashMap::with_capacity(categories.len());
+    for (index, category) in categories.iter().enumerate() {
+        index_of.insert(category.to_bits(), index);
+    }
     for (bin, value) in bins.iter().zip(y) {
         if !bin.is_finite() || !value.is_finite() {
             continue;
         }
-        let mut index = categories.partition_point(|category| *category < *bin);
-        if index == categories.len() || !same(categories[index], *bin) {
-            if index > 0 && same(categories[index - 1], *bin) {
-                index -= 1;
-            } else {
-                continue;
+        let index = if let Some(index) = index_of.get(&bin.to_bits()).copied() {
+            index
+        } else {
+            let mut index = categories.partition_point(|category| *category < *bin);
+            if index == categories.len() || !same(categories[index], *bin) {
+                if index > 0 && same(categories[index - 1], *bin) {
+                    index -= 1;
+                } else {
+                    continue;
+                }
             }
-        }
+            index
+        };
         groups[index].push(*value);
     }
     groups
@@ -2061,21 +2175,23 @@ mod tests {
         };
         let short = column(&[1.0, 1.0, 2.0, 5.0]);
         let mut tables = short;
-        let levels = assign_x(&mut tables, "x", &BinChoice::Automatic);
+        let (levels, stable) = assign_x(&mut tables, "x", &BinChoice::Automatic);
+        assert!(stable);
         assert_eq!(levels, vec![1.0, 2.0, 5.0]);
         assert_eq!(tables[0]["_bin"], vec![1.0, 1.0, 2.0, 5.0]);
 
         let many: Vec<f32> = (0..100).map(|value| value as f32).collect();
         let mut tables = column(&many);
-        let grouped = assign_x(&mut tables, "x", &BinChoice::Automatic);
+        let (grouped, stable) = assign_x(&mut tables, "x", &BinChoice::Automatic);
         assert!(
-            grouped.len() <= 32,
+            !stable && grouped.len() <= 32,
             "a long axis falls back to quantile bins"
         );
         assert!(grouped.len() > 1);
 
         let mut tables = column(&[10.0, 20.0, 30.0, 40.0, 50.0]);
-        let fixed = assign_x(&mut tables, "x", &BinChoice::Fixed(2));
+        let (fixed, stable) = assign_x(&mut tables, "x", &BinChoice::Fixed(2));
+        assert!(!stable);
         assert!(fixed.len() <= 2);
     }
 
@@ -2320,6 +2436,51 @@ mod tests {
             &serde_json::json!({"hist": "On", "corr": "On"}),
         );
         assert_eq!(scene.column_weights, vec![8.0, 1.65, 1.65]);
+    }
+
+    #[test]
+    fn a_growing_violin_matches_one_pass() {
+        let bins: Vec<f32> = (0..900)
+            .map(|index| if index < 400 { 1.0 } else { 2.0 })
+            .collect();
+        let y: Vec<f32> = (0..900)
+            .map(|index| ((index * 17) % 50) as f32 * 0.05)
+            .collect();
+        let categories = [1.0, 2.0];
+        let color = [0.2, 0.4, 0.8, 0.55];
+        let mut table = BTreeMap::new();
+        table.insert("_bin".to_string(), bins.clone());
+        let once = super::glyphs::violin_series(&table, &y, &categories, 0, color);
+        let id = "grow-violin-one-pass";
+        super::glyphs::begin_grown(id);
+        let _ = super::glyphs::grown_violin(
+            &format!("{id}|y|0"),
+            &bins[..400],
+            &y[..400],
+            &categories,
+            color,
+        );
+        let grown =
+            super::glyphs::grown_violin(&format!("{id}|y|0"), &bins, &y, &categories, color);
+        let ys = |series: &[scan_kit_core::Series]| match &series[0] {
+            scan_kit_core::Series::Triangles { ys, .. } => ys.clone(),
+            _ => panic!("violin fill should be triangles"),
+        };
+        assert_eq!(ys(&once), ys(&grown));
+    }
+
+    #[test]
+    fn a_long_violin_peaks_on_the_dense_value() {
+        let mut values = vec![0.0f32; 1_500];
+        values.extend((0..500).map(|i| (i as f32 - 250.0) * 0.02));
+        let shape = super::glyphs::kde(&values, 0.3);
+        assert_eq!(shape.len(), 48);
+        let (peak, _) = shape
+            .iter()
+            .max_by(|left, right| left.1.partial_cmp(&right.1).unwrap())
+            .copied()
+            .unwrap();
+        assert!(peak.abs() < 0.25, "{peak}");
     }
 
     #[test]
