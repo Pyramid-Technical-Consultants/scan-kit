@@ -14,6 +14,10 @@
 //!
 //! A mark kind's byte layout lives in its `*_STRIDE`, `*_ATTRS`, `encode_*`,
 //! `decode_*`, and the matching WGSL `vs_*` inputs. Change them together.
+//! The scene's lines and points are the filtered samples. A stroke may be
+//! simplified here for the current camera when several samples share a pixel,
+//! and that pass keeps the extrema in the pixel. A camera that gives a sample
+//! its own pixel draws it. Do not thin the series before it reaches this crate.
 //! Heatmap value row 0 is the low data y. The texture is stored top-first, so
 //! that row is the last row of pixels. Those pixels are the catalog color for
 //! the series ramp, baked before upload.
@@ -494,6 +498,10 @@ pub struct Plot {
     background: [f32; 4],
     foreground: [f32; 4],
     marks: Marks,
+    /// Packed line, point, and quad bytes from the payload. Taken on upload.
+    pub(crate) encoded: Option<crate::payload::EncodedMarks>,
+    /// Heat textures reused when the next payload has the same pixels.
+    kept_heats: Option<Vec<HeatGpu>>,
     gpu: Option<GpuMarks>,
     frame_buf: Option<wgpu::Buffer>,
     text_buf: Option<wgpu::Buffer>,
@@ -551,6 +559,8 @@ impl Plot {
             .collect::<Vec<_>>();
         Self {
             marks,
+            encoded: None,
+            kept_heats: None,
             panels,
             columns,
             weights,
@@ -585,21 +595,25 @@ impl Plot {
         }
     }
 
-    /// Keep a zoomed window when a new scene describes the same axes.
+    /// Keep a zoomed window when the new panel is the same quantity and its
+    /// data range is still close. A different label or a much larger span
+    /// starts from the new limits. Extra panels keep their own fit.
     #[cfg_attr(not(any(test, target_arch = "wasm32")), allow(dead_code))]
     pub(crate) fn adopt_view(&mut self, previous: &Plot) {
-        if self.cameras.len() != previous.cameras.len() {
-            return;
-        }
-        for (index, camera) in self.cameras.iter_mut().enumerate() {
-            let home = self.home[index];
-            let previous_home = previous.home[index];
-            if same_span(home.xmin, previous_home.xmin)
-                && same_span(home.xmax, previous_home.xmax)
-                && same_span(home.ymin, previous_home.ymin)
-                && same_span(home.ymax, previous_home.ymax)
+        let count = self.cameras.len().min(previous.cameras.len());
+        for index in 0..count {
+            let panel = &self.panels[index];
+            let previous_panel = &previous.panels[index];
+            if panel.x_label != previous_panel.x_label || panel.y_label != previous_panel.y_label {
+                continue;
+            }
+            // A fit the user has not touched tracks the new data, so a session
+            // that arrives after the first partial stays on screen. A zoom or
+            // pan is kept when the quantity and the span are still close.
+            if previous.cameras[index] != previous.home[index]
+                && axes_close(previous.home[index], self.home[index])
             {
-                *camera = previous.cameras[index];
+                self.cameras[index] = previous.cameras[index];
             }
         }
     }
@@ -781,7 +795,13 @@ impl Plot {
                 } else {
                     6.0
                 };
-                let bottom = font.line_height + 10.0;
+                let bottom = font.line_height
+                    + 10.0
+                    + if panel.x_label.is_empty() {
+                        0.0
+                    } else {
+                        font.line_height + 4.0
+                    };
                 let mut plot = snap_plot(PlotRect {
                     x: cell.x + left,
                     y: cell.y + top,
@@ -1099,41 +1119,49 @@ impl Plot {
         self.uniform_buf = Some(buffer);
     }
 
+    /// Keep heatmap textures when the pixels did not change.
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn keep_heatmaps(&mut self, mut previous: Plot) {
+        if previous.marks.heatmaps != self.marks.heatmaps {
+            return;
+        }
+        if let Some(gpu) = previous.gpu.take() {
+            self.kept_heats = Some(gpu.heats);
+        }
+    }
+
     fn ensure_uploaded(&mut self, gpu: &PlotGpu) -> Result<(), GpuError> {
         if self.gpu.is_some() {
             return Ok(());
         }
-        let heats = self
-            .marks
-            .heatmaps
-            .iter()
-            .zip(&self.marks.heatmap_size)
-            .map(|(pixels, (cols, rows))| {
-                let texture = upload_rgba(&gpu.device, &gpu.queue, pixels, *cols, *rows)?;
-                let group =
-                    textured_group(&gpu.device, &gpu.textured_layout, &texture, &gpu.sampler);
-                Ok(HeatGpu { group, texture })
-            })
-            .collect::<Result<Vec<_>, GpuError>>()?;
+        let heats = if let Some(heats) = self.kept_heats.take() {
+            heats
+        } else {
+            self.marks
+                .heatmaps
+                .iter()
+                .zip(&self.marks.heatmap_size)
+                .map(|(pixels, (cols, rows))| {
+                    let texture = upload_rgba(&gpu.device, &gpu.queue, pixels, *cols, *rows)?;
+                    let group =
+                        textured_group(&gpu.device, &gpu.textured_layout, &texture, &gpu.sampler);
+                    Ok(HeatGpu { group, texture })
+                })
+                .collect::<Result<Vec<_>, GpuError>>()?
+        };
+        let (lines, points, quads) = if let Some(encoded) = self.encoded.take() {
+            (encoded.lines, encoded.points, encoded.quads)
+        } else {
+            (
+                encode_lines(&self.marks.lines),
+                encode_points(&self.marks.points),
+                encode_quads(&self.marks.quads),
+            )
+        };
         self.gpu = Some(GpuMarks {
-            lines: upload_buffer(
-                &gpu.device,
-                &gpu.queue,
-                "lines",
-                &encode_lines(&self.marks.lines),
-            ),
-            points: upload_buffer(
-                &gpu.device,
-                &gpu.queue,
-                "points",
-                &encode_points(&self.marks.points),
-            ),
-            quads: upload_buffer(
-                &gpu.device,
-                &gpu.queue,
-                "quads",
-                &encode_quads(&self.marks.quads),
-            ),
+            lines: upload_buffer(&gpu.device, &gpu.queue, "lines", &lines),
+            points: upload_buffer(&gpu.device, &gpu.queue, "points", &points),
+            quads: upload_buffer(&gpu.device, &gpu.queue, "quads", &quads),
             heats,
         });
         self.mark_uploads += 1;
@@ -1156,6 +1184,7 @@ pub(crate) fn header_panels(panels: &[Panel]) -> Vec<Panel> {
         .map(|panel| Panel {
             title: panel.title.clone(),
             y_label: panel.y_label.clone(),
+            x_label: panel.x_label.clone(),
             xmin: panel.xmin,
             xmax: panel.xmax,
             ymin: panel.ymin,
@@ -1895,7 +1924,28 @@ fn labels_for(panel: &Panel, camera: &Camera, cell: &Cell, color: [f32; 4]) -> V
             );
         }
     }
+    if !panel.x_label.is_empty() {
+        push_text(
+            &mut out,
+            &panel.x_label,
+            [
+                cell.plot.x + cell.plot.w * 0.5,
+                x_axis_name_y(&cell.plot),
+                0.0,
+            ],
+            0.0,
+            0.5,
+            [0.0, ink_center_shift(&panel.x_label)],
+            color,
+        );
+    }
     out
+}
+
+/// Screen y of the x-axis name, centered in the band under the tick labels.
+fn x_axis_name_y(plot: &PlotRect) -> f32 {
+    let font = atlas();
+    plot.y + plot.h + font.line_height + 10.0 + font.line_height * 0.5
 }
 
 fn push_text(
@@ -2735,9 +2785,18 @@ fn rgba_bytes(color: [f32; 4]) -> [u8; 4] {
 }
 
 #[cfg_attr(not(any(test, target_arch = "wasm32")), allow(dead_code))]
-fn same_span(a: f32, b: f32) -> bool {
-    let scale = a.abs().max(b.abs()).max(1.0);
-    (a - b).abs() <= scale * 1.0e-4
+fn axes_close(before: Camera, after: Camera) -> bool {
+    axis_close(before.xmin, before.xmax, after.xmin, after.xmax)
+        && axis_close(before.ymin, before.ymax, after.ymin, after.ymax)
+}
+
+#[cfg_attr(not(any(test, target_arch = "wasm32")), allow(dead_code))]
+fn axis_close(a0: f32, a1: f32, b0: f32, b1: f32) -> bool {
+    let a_span = (a1 - a0).abs().max(1.0e-6);
+    let b_span = (b1 - b0).abs().max(1.0e-6);
+    let ratio = (a_span / b_span).max(b_span / a_span);
+    let mid_delta = ((a0 + a1) - (b0 + b1)).abs() * 0.5;
+    ratio <= 3.0 && mid_delta <= a_span.max(b_span)
 }
 
 #[cfg(test)]
@@ -2750,6 +2809,7 @@ mod tests {
             panels: vec![Panel {
                 title: String::new(),
                 y_label: String::new(),
+                x_label: String::new(),
                 xmin: 0.0,
                 xmax: 10.0,
                 ymin: 0.0,
@@ -2864,11 +2924,39 @@ mod tests {
         second.adopt_view(&first);
         assert_eq!(second.cameras[0], zoomed);
 
+        let mut nudged = line_scene();
+        nudged.panels[0].xmax = 12.0;
+        let mut kept = Plot::new(&nudged, [0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0, 1.0]);
+        kept.adopt_view(&first);
+        assert_eq!(kept.cameras[0], zoomed);
+
         let mut shifted = line_scene();
         shifted.panels[0].xmax = 40.0;
         let mut third = Plot::new(&shifted, [0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0, 1.0]);
         third.adopt_view(&first);
         assert_eq!(third.cameras[0], third.home[0]);
+
+        let mut relabeled = line_scene();
+        relabeled.panels[0].y_label = "IC1 (nA)".into();
+        let mut renamed = Plot::new(&relabeled, [0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0, 1.0]);
+        renamed.adopt_view(&first);
+        assert_eq!(renamed.cameras[0], renamed.home[0]);
+
+        let mut extra = line_scene();
+        extra.panels.push(extra.panels[0].clone());
+        let mut added = Plot::new(&extra, [0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0, 1.0]);
+        added.adopt_view(&first);
+        assert_eq!(added.cameras[0], zoomed);
+        assert_eq!(added.cameras[1], added.home[1]);
+
+        let plain = Plot::new(&scene, [0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0, 1.0]);
+        let mut grown = line_scene();
+        grown.panels[0].xmax = 18.0;
+        grown.panels[0].ymax = 18.0;
+        let mut refit = Plot::new(&grown, [0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0, 1.0]);
+        refit.adopt_view(&plain);
+        assert_eq!(refit.cameras[0], refit.home[0]);
+        assert!(refit.cameras[0].xmax > plain.cameras[0].xmax);
     }
 
     #[test]
@@ -2895,6 +2983,7 @@ mod tests {
             panels: vec![Panel {
                 title: String::new(),
                 y_label: String::new(),
+                x_label: String::new(),
                 xmin: 0.0,
                 xmax: 10.0,
                 ymin: 0.0,
@@ -2960,6 +3049,7 @@ mod tests {
         scene.panels.push(Panel {
             title: "heat".into(),
             y_label: String::new(),
+            x_label: String::new(),
             xmin: 0.0,
             xmax: 1.0,
             ymin: 0.0,
@@ -3051,6 +3141,7 @@ mod tests {
         scene.panels.push(Panel {
             title: String::new(),
             y_label: "Probability (%)".into(),
+            x_label: String::new(),
             xmin: 0.0,
             xmax: 10.0,
             ymin: 0.0,
@@ -3107,6 +3198,7 @@ mod tests {
         let panel = Panel {
             title: "IC1 X".into(),
             y_label: "IC1 X (mm)".into(),
+            x_label: String::new(),
             xmin: 0.0,
             xmax: 10.0,
             ymin: -10.0,
@@ -3158,6 +3250,62 @@ mod tests {
         assert!(turned
             .iter()
             .all(|glyph| (glyph.anchor[0] - name_x).abs() < 0.01));
+    }
+
+    #[test]
+    fn x_axis_name_sits_under_the_ticks() {
+        let mut panel = Panel {
+            title: String::new(),
+            y_label: "Y (mm)".into(),
+            x_label: "X (mm)".into(),
+            xmin: 0.0,
+            xmax: 10.0,
+            ymin: 0.0,
+            ymax: 10.0,
+            series: Vec::new(),
+            x_labels: Vec::new(),
+            equal: false,
+        };
+        let camera = Camera::new(0.0, 10.0, 0.0, 10.0);
+        let cell = Cell {
+            cell: PlotRect {
+                x: 8.0,
+                y: 4.0,
+                w: 180.0,
+                h: 140.0,
+            },
+            plot: PlotRect {
+                x: 70.0,
+                y: 16.0,
+                w: 100.0,
+                h: 100.0,
+            },
+            panel: 0,
+        };
+        let glyphs = labels_for(&panel, &camera, &cell, [1.0, 1.0, 1.0, 1.0]);
+        let center = cell.plot.x + cell.plot.w * 0.5;
+        let named: Vec<_> = glyphs
+            .iter()
+            .filter(|glyph| {
+                glyph.anchor[2] < 0.5
+                    && glyph.anchor[3] < 0.5
+                    && (glyph.anchor[0] - center).abs() < 0.01
+            })
+            .collect();
+        assert!(!named.is_empty(), "the x label should be centered");
+        assert!((named[0].anchor[1] - x_axis_name_y(&cell.plot)).abs() < 0.01);
+        assert!(named[0].anchor[1] > cell.plot.y + cell.plot.h + atlas().line_height);
+
+        let mut scene = line_scene();
+        let bare = Plot::new(&scene, [0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0, 1.0]).layout(200, 160);
+        panel.series = scene.panels[0].series.clone();
+        scene.panels[0] = panel;
+        let named_layout =
+            Plot::new(&scene, [0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0, 1.0]).layout(200, 160);
+        assert!(
+            named_layout[0].plot.h + 8.0 < bare[0].plot.h,
+            "x label should take a line under the ticks"
+        );
     }
 
     #[test]

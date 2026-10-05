@@ -50,6 +50,7 @@ import {
   type FormDoc,
 } from "@/ConfigForm";
 import { notify, notifyError, notifySaved } from "@/notify";
+import { usePageLoad } from "@/page-load";
 import { SidePane } from "@/SidePane";
 
 type Choice = { value: string; label: string; tooltip?: string };
@@ -142,28 +143,46 @@ export function ConfigTuning({
   const [previewing, setPreviewing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [waiting, setWaiting] = useState(true);
+  const [opening, setOpening] = useState(false);
+  usePageLoad(waiting || busy || previewing || opening);
   const openSeq = useRef(0);
+  const previewGen = useRef(0);
   const dirtyRef = useRef(false);
-  dirtyRef.current = dirty;
+  useEffect(() => {
+    dirtyRef.current = dirty;
+  });
   const sessionKey = selectedIds.join("|");
   const workflow = catalog?.workflows.find((item) => item.id === workflowId) ?? catalog?.workflows[0];
-  const previewStamp = JSON.stringify({
-    workflow: workflow?.id ?? "",
-    params,
-    sessions: sessionKey,
-    folder,
-    xml,
-    form: dirty ? form : null,
-  });
-  const matched = preview != null && preview.stamp === previewStamp ? preview.result : null;
+  const previewRequest = useMemo(() => {
+    if (workflow == null || xml.length === 0 || selectedIds.length === 0 || folder.length === 0) {
+      return null;
+    }
+    const formValue = dirty ? form : null;
+    return {
+      stamp: JSON.stringify({
+        workflow: workflow.id,
+        params,
+        sessions: sessionKey,
+        folder,
+        xml,
+        form: formValue,
+      }),
+      workflowId: workflow.id,
+      xml,
+      form: formValue,
+      folder,
+      sessionIds: selectedIds,
+      params,
+    };
+  }, [dirty, folder, form, params, selectedIds, sessionKey, workflow, xml]);
+  const matched = preview != null && preview.stamp === previewRequest?.stamp ? preview.result : null;
 
   useEffect(() => {
-    const seq = ++openSeq.current;
     let cancel = false;
-    void (async () => {
-      if (catalog == null) {
-        const loaded = await invoke<Catalog>("scan_kit_config_catalog");
-        if (cancel || seq !== openSeq.current) {
+    void invoke<Catalog>("scan_kit_config_catalog")
+      .then((loaded) => {
+        if (cancel) {
           return;
         }
         setCatalog(loaded);
@@ -173,23 +192,47 @@ export function ConfigTuning({
           setParams(defaultsOf(first));
         }
         setHideUnused(loaded.hide_unused);
-      }
+        setWaiting(false);
+      })
+      .catch((caught: unknown) => {
+        if (!cancel) {
+          setWaiting(false);
+          notifyError(caught);
+        }
+      });
+    return () => {
+      cancel = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    const seq = ++openSeq.current;
+    let cancel = false;
+    const sessionId = sessionKey.split("|")[0] ?? "";
+    void (async () => {
       if (dirtyRef.current && !window.confirm("Discard unsaved edits in this file?")) {
         return;
       }
-      const opened = await invoke<Opened>("scan_kit_config_open", {
-        dataDir: folder,
-        sessionId: selectedIds[0] ?? "",
-      });
-      if (cancel || seq !== openSeq.current || opened.path == null) {
-        return;
-      }
-      setConfigDir(opened.path);
-      setFiles(opened.files);
-      const preferred = opened.files.find((name) => name.endsWith("devices.xml")) ?? opened.files[0];
-      if (preferred != null) {
-        setFile(preferred);
-        await loadFile(joinPath(opened.path, preferred), cancel);
+      setOpening(true);
+      try {
+        const opened = await invoke<Opened>("scan_kit_config_open", {
+          dataDir: folder,
+          sessionId,
+        });
+        if (cancel || seq !== openSeq.current || opened.path == null) {
+          return;
+        }
+        setConfigDir(opened.path);
+        setFiles(opened.files);
+        const preferred = opened.files.find((name) => name.endsWith("devices.xml")) ?? opened.files[0];
+        if (preferred != null) {
+          setFile(preferred);
+          await loadFile(joinPath(opened.path, preferred), cancel);
+        }
+      } finally {
+        if (!cancel) {
+          setOpening(false);
+        }
       }
     })().catch((caught: unknown) => {
       if (!cancel) {
@@ -202,24 +245,34 @@ export function ConfigTuning({
   }, [folder, sessionKey]);
 
   useEffect(() => {
-    if (workflow == null || xml.length === 0 || selectedIds.length === 0 || folder.length === 0) {
-      return;
+    const mine = previewGen.current + 1;
+    previewGen.current = mine;
+    if (previewRequest == null) {
+      const arm = window.setTimeout(() => {
+        if (previewGen.current === mine) {
+          setPreviewing(false);
+        }
+      }, 0);
+      return () => window.clearTimeout(arm);
     }
     let cancel = false;
-    const stamp = previewStamp;
+    const request = previewRequest;
     const timer = window.setTimeout(() => {
+      if (cancel || previewGen.current !== mine) {
+        return;
+      }
       setPreviewing(true);
       void invoke<TuneResult>("scan_kit_config_tune", {
-        workflow: workflow.id,
-        xml,
-        form: dirty ? form : null,
-        dataDir: folder,
-        sessionIds: selectedIds,
-        params,
+        workflow: request.workflowId,
+        xml: request.xml,
+        form: request.form,
+        dataDir: request.folder,
+        sessionIds: request.sessionIds,
+        params: request.params,
       })
         .then((result) => {
           if (!cancel) {
-            setPreview({ stamp, result });
+            setPreview({ stamp: request.stamp, result });
             setError(null);
           }
         })
@@ -231,7 +284,7 @@ export function ConfigTuning({
           }
         })
         .finally(() => {
-          if (!cancel) {
+          if (previewGen.current === mine) {
             setPreviewing(false);
           }
         });
@@ -240,18 +293,23 @@ export function ConfigTuning({
       cancel = true;
       window.clearTimeout(timer);
     };
-  }, [previewStamp]);
+  }, [previewRequest]);
 
   async function loadFile(path: string, cancel = false) {
-    const loaded = await invoke<Loaded>("scan_kit_config_form", { path });
-    if (cancel) {
-      return;
+    setOpening(true);
+    try {
+      const loaded = await invoke<Loaded>("scan_kit_config_form", { path });
+      if (cancel) {
+        return;
+      }
+      setXml(loaded.xml);
+      setForm(loaded.form);
+      setIntegrity(loaded.integrity);
+      setDirty(false);
+      setPreview(null);
+    } finally {
+      setOpening(false);
     }
-    setXml(loaded.xml);
-    setForm(loaded.form);
-    setIntegrity(loaded.integrity);
-    setDirty(false);
-    setPreview(null);
   }
 
   async function browse() {

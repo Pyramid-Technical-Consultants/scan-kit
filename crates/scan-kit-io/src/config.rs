@@ -239,7 +239,16 @@ fn load_spots(
         for index in 0..4 {
             extend_column(&mut spots.measured[index], &table, MEASURED[index], n);
             extend_named(&mut spots.error[index], &table, ERRORS[index], n);
-            extend_column(&mut spots.sigma[index], &table, SIGMA[index], n);
+            let raw = format!("{}_raw", SIGMA[index]);
+            let key = if table
+                .get(&raw)
+                .is_some_and(|values| values.iter().any(|value| value.is_finite()))
+            {
+                raw
+            } else {
+                SIGMA[index].to_string()
+            };
+            extend_column(&mut spots.sigma[index], &table, &key, n);
         }
         for index in 0..3 {
             extend_named(&mut spots.mu[index], &table, DOSE[index], n);

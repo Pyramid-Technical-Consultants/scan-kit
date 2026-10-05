@@ -26,6 +26,10 @@ tokio = { workspace = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = "0.2"
+# #[wasm_bindgen] async fn expands to this crate. cargo-machete does not see that.
 wasm-bindgen-futures = "0.4"
 web-sys = { version = "0.3", features = ["HtmlCanvasElement", "console"] }
 wgpu = { version = "27", features = ["webgl"] }
+
+[package.metadata.cargo-machete]
+ignored = ["wasm-bindgen-futures"]

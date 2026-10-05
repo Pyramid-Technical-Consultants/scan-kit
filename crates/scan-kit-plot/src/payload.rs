@@ -28,6 +28,9 @@ pub struct PlotHeader {
     pub row_weights: Vec<f32>,
     pub background: [f32; 4],
     pub foreground: [f32; 4],
+    /// `partial` while a task is still loading. `final` on the last payload.
+    #[serde(default = "final_quality")]
+    pub quality: String,
     batches: Vec<PanelBatch>,
     heatmap_size: Vec<(u32, u32)>,
     lines: u32,
@@ -35,10 +38,23 @@ pub struct PlotHeader {
     quads: u32,
 }
 
+fn final_quality() -> String {
+    "final".into()
+}
+
 pub fn encode_plot(
     scene: &PlotScene,
     background: [f32; 4],
     foreground: [f32; 4],
+) -> Result<Vec<u8>, String> {
+    encode_plot_quality(scene, background, foreground, "final")
+}
+
+pub fn encode_plot_quality(
+    scene: &PlotScene,
+    background: [f32; 4],
+    foreground: [f32; 4],
+    quality: &str,
 ) -> Result<Vec<u8>, String> {
     let marks = build_marks(&scene.panels);
     let header = PlotHeader {
@@ -52,6 +68,7 @@ pub fn encode_plot(
         row_weights: scene.row_weights.clone(),
         background,
         foreground,
+        quality: quality.into(),
         batches: marks.panels.clone(),
         heatmap_size: marks.heatmap_size.clone(),
         lines: marks.lines.len() as u32,
@@ -78,17 +95,34 @@ pub fn encode_plot(
 }
 
 pub fn plot_header(bytes: &[u8]) -> Result<PlotHeader, String> {
-    decode_plot(bytes).map(|(header, _)| header)
+    decode_plot(bytes).map(|(header, _, _)| header)
 }
 
-pub(crate) fn decode_plot(bytes: &[u8]) -> Result<(PlotHeader, Marks), String> {
+/// GPU bytes already packed by [`encode_plot_quality`]. Uploading these skips a
+/// second pass through the mark structs.
+pub(crate) struct EncodedMarks {
+    pub lines: Vec<u8>,
+    pub points: Vec<u8>,
+    pub quads: Vec<u8>,
+}
+
+pub(crate) fn decode_plot(bytes: &[u8]) -> Result<(PlotHeader, Marks, EncodedMarks), String> {
     let mut reader = Reader { bytes, at: 0 };
     let json_len = u32::from_le_bytes(reader.take(4)?.try_into().unwrap()) as usize;
     let header: PlotHeader =
         serde_json::from_slice(reader.take(json_len)?).map_err(|err| err.to_string())?;
-    let lines = decode_lines(reader.take(header.lines as usize * LINE_STRIDE as usize)?);
-    let points = decode_points(reader.take(header.points as usize * POINT_STRIDE as usize)?);
-    let quads = decode_quads(reader.take(header.quads as usize * QUAD_STRIDE as usize)?);
+    let line_bytes = reader
+        .take(header.lines as usize * LINE_STRIDE as usize)?
+        .to_vec();
+    let point_bytes = reader
+        .take(header.points as usize * POINT_STRIDE as usize)?
+        .to_vec();
+    let quad_bytes = reader
+        .take(header.quads as usize * QUAD_STRIDE as usize)?
+        .to_vec();
+    let lines = decode_lines(&line_bytes);
+    let points = decode_points(&point_bytes);
+    let quads = decode_quads(&quad_bytes);
     let heatmaps = header
         .heatmap_size
         .iter()
@@ -105,13 +139,21 @@ pub(crate) fn decode_plot(bytes: &[u8]) -> Result<(PlotHeader, Marks), String> {
     if marks.panels.len() != header.panels.len() {
         return Err("plot payload panel count mismatch".into());
     }
-    Ok((header, marks))
+    Ok((
+        header,
+        marks,
+        EncodedMarks {
+            lines: line_bytes,
+            points: point_bytes,
+            quads: quad_bytes,
+        },
+    ))
 }
 
 impl Plot {
     pub fn from_payload(bytes: &[u8]) -> Result<Self, String> {
-        let (header, marks) = decode_plot(bytes)?;
-        Ok(Self::from_parts(
+        let (header, marks, encoded) = decode_plot(bytes)?;
+        let mut plot = Self::from_parts(
             header.panels,
             header.columns,
             header.column_weights,
@@ -119,7 +161,9 @@ impl Plot {
             marks,
             header.background,
             header.foreground,
-        ))
+        );
+        plot.encoded = Some(encoded);
+        Ok(plot)
     }
 }
 
@@ -156,6 +200,7 @@ mod tests {
                 Panel {
                     title: "a".into(),
                     y_label: String::new(),
+                    x_label: String::new(),
                     xmin: 0.0,
                     xmax: 4.0,
                     ymin: 0.0,
@@ -185,6 +230,7 @@ mod tests {
                 Panel {
                     title: String::new(),
                     y_label: String::new(),
+                    x_label: String::new(),
                     xmin: 0.0,
                     xmax: 1.0,
                     ymin: 0.0,
@@ -202,7 +248,7 @@ mod tests {
             row_weights: vec![2.0, 1.0, 1.0],
         };
         let bytes = encode_plot(&scene, [0.1, 0.1, 0.1, 1.0], [0.9, 0.9, 0.9, 1.0]).unwrap();
-        let (header, marks) = decode_plot(&bytes).unwrap();
+        let (header, marks, _) = decode_plot(&bytes).unwrap();
         assert_eq!(marks, build_marks(&scene.panels));
         assert_eq!(header.panels, header_panels(&scene.panels));
         assert_eq!(header.samples, vec![0.5]);

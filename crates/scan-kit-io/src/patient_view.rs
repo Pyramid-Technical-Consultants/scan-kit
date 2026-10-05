@@ -203,12 +203,8 @@ pub(crate) fn scene(
         panels,
         controls: vec![
             history_control(histories),
-            scan_kit_core::Control {
-                id: "fraction".into(),
-                label: "Fraction".into(),
-                options: names,
-                value: fraction.into(),
-            },
+            scan_kit_core::Control::plain("fraction", "Fraction", &names, fraction)
+                .grouped("Patient"),
         ],
         table: Some(DataTable {
             columns: vec!["Item".into(), "Value".into()],
@@ -382,6 +378,7 @@ fn heat(
     Panel {
         title: title.into(),
         y_label: String::new(),
+        x_label: String::new(),
         xmin: origin[0],
         xmax: origin[0] + nx as f32 * voxel,
         ymin: origin[1],
@@ -406,6 +403,7 @@ fn lines(title: &str, xs: Vec<f32>, ys: Vec<f32>) -> Panel {
     Panel {
         title: title.into(),
         y_label: "Volume".into(),
+        x_label: String::new(),
         xmin: 0.0,
         xmax: xmax.max(1.0),
         ymin: 0.0,
@@ -434,12 +432,13 @@ fn history_control(histories: u32) -> scan_kit_core::Control {
         .find(|(key, _)| *key == id)
         .map(|(_, label)| *label)
         .unwrap_or("1e7");
-    scan_kit_core::Control {
-        id: "histories".into(),
-        label: "Histories".into(),
-        options: PAIRS.iter().map(|(_, label)| (*label).to_owned()).collect(),
-        value: value.into(),
-    }
+    scan_kit_core::Control::plain(
+        "histories",
+        "Histories",
+        PAIRS.iter().map(|(_, label)| *label),
+        value,
+    )
+    .grouped("Model")
 }
 
 fn note_scene(message: &str) -> PlotScene {
@@ -448,6 +447,7 @@ fn note_scene(message: &str) -> PlotScene {
         panels: vec![Panel {
             title: message.into(),
             y_label: String::new(),
+            x_label: String::new(),
             xmin: 0.0,
             xmax: 1.0,
             ymin: 0.0,

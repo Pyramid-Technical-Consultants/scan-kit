@@ -10,11 +10,13 @@ mod columns;
 mod config;
 mod discover;
 mod dose_view;
+mod histogram;
 mod marks;
 mod mc_tables;
 mod patient_view;
 mod phantom;
 mod runner;
+mod source;
 mod store;
 mod synthesis;
 mod tables;
@@ -23,6 +25,9 @@ pub use analysis::{analysis_scene, channel_catalog, load_timeslice_columns};
 pub use beam::{beam_record, protons_per_mu, spot_record};
 pub use dose_view::dose_volume;
 pub use mc_tables::mc_tables;
+pub use tables::{
+    bind_slice, clear_slice, session_pieces, slice_tail_done, SessionPieces, SliceTake, SLICE_ROWS,
+};
 
 use std::path::{Path, PathBuf};
 
@@ -595,6 +600,11 @@ pub fn invoke(name: &str, input: &Value) -> Result<Value, InvokeError> {
     }
 }
 
+/// Copy the connected session into `dest`, calling `keep` after each file.
+pub fn copy_runner(dest: &str, keep: &mut dyn FnMut(u64, u64) -> bool) -> Result<Value, String> {
+    runner::download_with(&default_db_path(), dest, keep)
+}
+
 pub fn read_last_data_dir() -> Result<Option<String>, String> {
     with_store(&default_db_path(), |conn| store::last_data_dir(conn))
 }
@@ -619,16 +629,50 @@ pub fn write_last_main_tab(tab: &str) -> Result<(), String> {
 
 /// Workflow `scan_kit_open_library`. Discovers, syncs the index, and returns rows.
 pub fn open_library(conn: &mut rusqlite::Connection, data_dir: &Path) -> Result<Value, String> {
+    open_library_keep(conn, data_dir, &mut |_, _, _| true)
+}
+
+/// Same index as [`open_library`], publishing `done`, `total`, and the rows so far.
+///
+/// `keep` returns false to roll the index back. The final value is still the committed rows.
+pub fn index_library(
+    data_dir: &Path,
+    keep: &mut dyn FnMut(u64, u64, Option<&Value>) -> bool,
+) -> Result<Value, String> {
+    with_store(&default_db_path(), |conn| {
+        open_library_keep(conn, data_dir, keep)
+    })
+}
+
+fn open_library_keep(
+    conn: &mut rusqlite::Connection,
+    data_dir: &Path,
+    keep: &mut dyn FnMut(u64, u64, Option<&Value>) -> bool,
+) -> Result<Value, String> {
     if !data_dir.is_dir() {
         return Err(format!("{} is not a directory", data_dir.display()));
     }
     let root = canonical_local(data_dir);
     let tx = conn.transaction().map_err(|err| err.to_string())?;
     let lib_id = prepare_library(&tx, &root)?;
-    for entry in discover::discover_entries(Path::new(&root))? {
+    let entries = discover::discover_entries(Path::new(&root))?;
+    let total = entries.len() as u64;
+    if !keep(0, total, None) {
+        return Err("cancelled".into());
+    }
+    for (index, entry) in entries.into_iter().enumerate() {
         if let Cache::Hydrate = sync_entry(&tx, lib_id, &entry)? {
             let meta = hydrate(&entry);
             record_meta(&tx, lib_id, &entry, meta.as_ref())?;
+        }
+        let done = (index as u64) + 1;
+        let preview = json!({
+            "root": root,
+            "rows": library_rows(&tx, lib_id)?,
+            "selected": [],
+        });
+        if !keep(done, total, Some(&preview)) {
+            return Err("cancelled".into());
         }
     }
     remember_data_dir(&tx, &root)?;

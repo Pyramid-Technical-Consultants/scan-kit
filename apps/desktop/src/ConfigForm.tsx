@@ -15,7 +15,7 @@ import { Field, FieldLabel } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
 import { gridTheme } from "@/grid-theme";
 
-export type FormField = {
+type FormField = {
   id: string;
   label: string;
   kind: string;
@@ -23,7 +23,7 @@ export type FormField = {
   dead?: boolean;
   tooltip?: string;
 };
-export type FormColumn = { name: string; label: string; dead?: boolean; tooltip?: string };
+type FormColumn = { name: string; label: string; dead?: boolean; tooltip?: string };
 export type FormNode = {
   kind: string;
   title?: string;

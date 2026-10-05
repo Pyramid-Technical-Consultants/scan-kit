@@ -1,6 +1,9 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::{Mutex, OnceLock};
 
-use scan_kit_core::{box_stats, histogram, linear_fit, Panel, Series};
+use scan_kit_core::{box_stats, linear_fit, Panel, Series};
+
+use crate::histogram::histogram_panel;
 
 use super::*;
 
@@ -11,15 +14,129 @@ pub(super) fn violin_series(
     session: usize,
     color: [f32; 4],
 ) -> Vec<Series> {
-    let bins = table.get("_bin");
-    let groups = group_samples(bins, y, categories);
+    let _ = session;
+    let groups = group_samples(table.get("_bin"), y, categories);
+    let shapes: Vec<Vec<(f32, f32)>> = groups
+        .iter()
+        .map(|samples| kde(samples, VIOLIN_WIDTH * 0.5))
+        .collect();
+    violin_marks(&shapes, color)
+}
+
+struct GrowSlot {
+    rows: usize,
+    groups: HashMap<u32, Vec<f32>>,
+    shape: HashMap<u32, Vec<(f32, f32)>>,
+}
+
+struct GrowCache {
+    base: String,
+    slots: HashMap<String, GrowSlot>,
+}
+
+fn grow_cache() -> &'static Mutex<GrowCache> {
+    static CACHE: OnceLock<Mutex<GrowCache>> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        Mutex::new(GrowCache {
+            base: String::new(),
+            slots: HashMap::new(),
+        })
+    })
+}
+
+pub(super) fn begin_grown(base: &str) {
+    let mut cache = grow_cache().lock().unwrap_or_else(|err| err.into_inner());
+    if cache.base != base {
+        cache.slots.clear();
+        cache.base = base.to_owned();
+    }
+}
+
+/// Append rows onto the violins from the last picture.
+///
+/// A quantized axis does not move a sample that was already drawn, so only the
+/// bins that received new rows are estimated again.
+pub(super) fn grown_violin(
+    id: &str,
+    bins: &[f32],
+    y: &[f32],
+    categories: &[f32],
+    color: [f32; 4],
+) -> Vec<Series> {
+    let half = VIOLIN_WIDTH * 0.5;
+    let mut cache = grow_cache().lock().unwrap_or_else(|err| err.into_inner());
+    let slot = cache
+        .slots
+        .entry(id.to_owned())
+        .or_insert_with(|| GrowSlot {
+            rows: 0,
+            groups: HashMap::new(),
+            shape: HashMap::new(),
+        });
+    let n = y.len().min(bins.len());
+    if slot.rows > n {
+        slot.rows = 0;
+        slot.groups.clear();
+        slot.shape.clear();
+    }
+    let mut index_of = HashMap::with_capacity(categories.len());
+    for (index, category) in categories.iter().enumerate() {
+        index_of.insert(category.to_bits(), index);
+    }
+    let mut dirty = HashSet::new();
+    for row in slot.rows..n {
+        let bin = bins[row];
+        let value = y[row];
+        if !bin.is_finite() || !value.is_finite() {
+            continue;
+        }
+        let Some(index) = category_index(&index_of, categories, bin) else {
+            continue;
+        };
+        let bits = categories[index].to_bits();
+        slot.groups.entry(bits).or_default().push(value);
+        dirty.insert(bits);
+    }
+    slot.rows = n;
+    for bits in dirty {
+        if let Some(samples) = slot.groups.get(&bits) {
+            let shape = kde(samples, half);
+            slot.shape.insert(bits, shape);
+        }
+    }
+    let shapes: Vec<Vec<(f32, f32)>> = categories
+        .iter()
+        .map(|category| {
+            slot.shape
+                .get(&category.to_bits())
+                .cloned()
+                .unwrap_or_default()
+        })
+        .collect();
+    violin_marks(&shapes, color)
+}
+
+fn category_index(index_of: &HashMap<u32, usize>, categories: &[f32], bin: f32) -> Option<usize> {
+    if let Some(index) = index_of.get(&bin.to_bits()).copied() {
+        return Some(index);
+    }
+    let index = categories.partition_point(|category| *category < bin);
+    if index == categories.len() || !same(categories[index], bin) {
+        if index > 0 && same(categories[index - 1], bin) {
+            return Some(index - 1);
+        }
+        return None;
+    }
+    Some(index)
+}
+
+fn violin_marks(shapes: &[Vec<(f32, f32)>], color: [f32; 4]) -> Vec<Series> {
     let mut xs = Vec::new();
     let mut ys = Vec::new();
     let mut outline_x = Vec::new();
     let mut outline_y = Vec::new();
-    for (index, samples) in groups.iter().enumerate() {
+    for (index, shape) in shapes.iter().enumerate() {
         let center = index as f32;
-        let shape = kde(samples, VIOLIN_WIDTH * 0.5);
         if shape.len() < 2 {
             if let Some((y, half)) = shape.first() {
                 xs.extend([center - half, center + half, center]);
@@ -37,7 +154,7 @@ pub(super) fn violin_series(
             xs.extend([l0, r0, r1, l0, r1, l1]);
             ys.extend([y0, y0, y1, y0, y1, y1]);
         }
-        for (y, half) in &shape {
+        for (y, half) in shape {
             outline_x.push(center - half);
             outline_y.push(*y);
         }
@@ -51,7 +168,6 @@ pub(super) fn violin_series(
         outline_y.push(shape[0].0);
         outline_x.push(f32::NAN);
         outline_y.push(f32::NAN);
-        let _ = session;
     }
     vec![
         Series::Triangles { xs, ys, color },
@@ -163,10 +279,8 @@ pub(super) fn scatter_series(
     let xs_in = table.get(x_column).map(Vec::as_slice).unwrap_or(&[]);
     let mut xs = Vec::new();
     let mut ys = Vec::new();
-    // ponytail: scatter past 20k points is strided. Draw every point if a tail matters.
-    let stride = (xs_in.len() / 20_000).max(1);
-    for (index, (x, y)) in xs_in.iter().zip(y).enumerate() {
-        if index % stride == 0 && x.is_finite() && y.is_finite() {
+    for (x, y) in xs_in.iter().zip(y) {
+        if x.is_finite() && y.is_finite() {
             xs.push(*x);
             ys.push(*y);
         }
@@ -410,6 +524,7 @@ pub(super) fn hist_panel(
     tables: &[BTreeMap<String, Vec<f32>>],
     bins: usize,
     shared: bool,
+    range: Option<(f32, f32)>,
     position_guides: bool,
 ) -> Panel {
     let columns: Vec<&[f32]> = tables
@@ -417,72 +532,16 @@ pub(super) fn hist_panel(
         .filter_map(|table| table.get(series.key).map(Vec::as_slice))
         .filter(|column| column.iter().any(|value| value.is_finite()))
         .collect();
-    let shared_edges = shared.then(|| {
-        let mut lo = f32::MAX;
-        let mut hi = f32::MIN;
-        for column in &columns {
-            for value in *column {
-                if value.is_finite() {
-                    lo = lo.min(*value);
-                    hi = hi.max(*value);
-                }
-            }
-        }
-        uniform_edges(lo, hi, bins)
-    });
-    let mut drawn = Vec::new();
-    let mut peak = 1.0f32;
-    let mut lo = f32::MAX;
-    let mut hi = f32::MIN;
-    for column in columns {
-        let (edges, counts) = if let Some(edges) = &shared_edges {
-            (edges.clone(), count_bins(edges, column))
-        } else {
-            histogram(column, bins)
-        };
-        lo = lo.min(edges.first().copied().unwrap_or(0.0));
-        hi = hi.max(edges.last().copied().unwrap_or(1.0));
-        let total = counts.iter().sum::<f32>().max(1.0);
-        let percent: Vec<f32> = counts.iter().map(|count| count / total * 100.0).collect();
-        peak = peak.max(percent.iter().copied().fold(0.0, f32::max));
-        let outline = bar_outline(&edges, &percent);
-        drawn.push(Series::Bars {
-            edges,
-            counts: percent,
-            color: [0.8, 0.8, 0.8, 0.45],
-        });
-        drawn.push(outline);
-    }
-    if position_guides
+    let guides: Vec<f32> = if position_guides
         && matches!(
             series.key,
             "ic1_x_err" | "ic1_y_err" | "ic2_x_err" | "ic2_y_err"
-        )
-    {
-        for level in [1.0, 2.0, 3.0, -1.0, -2.0, -3.0] {
-            drawn.push(Series::Guide {
-                xs: vec![level, level],
-                ys: vec![0.0, peak],
-                color: [0.45, 0.7, 0.4, 0.7],
-                thickness: 1.0,
-            });
-        }
-    }
-    if !lo.is_finite() || !hi.is_finite() || hi <= lo {
-        lo = 0.0;
-        hi = 1.0;
-    }
-    Panel {
-        title: String::new(),
-        y_label: "Probability (%)".into(),
-        xmin: lo,
-        xmax: hi,
-        ymin: 0.0,
-        ymax: peak * 1.1,
-        series: drawn,
-        x_labels: Vec::new(),
-        equal: false,
-    }
+        ) {
+        vec![1.0, 2.0, 3.0, -1.0, -2.0, -3.0]
+    } else {
+        Vec::new()
+    };
+    histogram_panel("", &columns, bins, shared, range, &guides)
 }
 
 pub(super) fn corr_panel(
@@ -491,27 +550,46 @@ pub(super) fn corr_panel(
     tables: &[BTreeMap<String, Vec<f32>>],
     group_label: &str,
 ) -> Panel {
-    let mut xs = Vec::new();
-    let mut ys = Vec::new();
+    let mut series = Vec::new();
+    let mut all_x = Vec::new();
+    let mut all_y = Vec::new();
     for table in tables {
         let (Some(left), Some(right)) = (table.get(a.key), table.get(b.key)) else {
             continue;
         };
+        let mut xs = Vec::new();
+        let mut ys = Vec::new();
         for (left, right) in left.iter().zip(right) {
             if left.is_finite() && right.is_finite() {
                 xs.push(*left);
                 ys.push(*right);
             }
         }
+        if xs.is_empty() {
+            continue;
+        }
+        all_x.extend(xs.iter().copied());
+        all_y.extend(ys.iter().copied());
+        // One series per session. Palette assignment then uses that session's color.
+        // Alpha 0 on the fit keeps the color of the points just above it.
+        series.push(Series::Points {
+            xs: xs.clone(),
+            ys: ys.clone(),
+            color: [0.8, 0.8, 0.8, 0.45],
+            radius: 2.0,
+        });
+        if let Some((slope, intercept)) = linear_fit(&xs, &ys) {
+            let (x0, x1) = span(&xs);
+            series.push(Series::Polyline {
+                xs: vec![x0, x1],
+                ys: vec![slope * x0 + intercept, slope * x1 + intercept],
+                color: [0.8, 0.8, 0.8, 0.0],
+                thickness: 1.5,
+            });
+        }
     }
-    let (xmin, xmax) = span(&xs);
-    let (ymin, ymax) = span(&ys);
-    let mut series = vec![Series::Points {
-        xs: xs.clone(),
-        ys: ys.clone(),
-        color: [0.8, 0.8, 0.8, 0.45],
-        radius: 2.0,
-    }];
+    let (xmin, xmax) = span(&all_x);
+    let (ymin, ymax) = span(&all_y);
     let lo = xmin.min(ymin);
     let hi = xmax.max(ymax);
     series.push(Series::Guide {
@@ -520,17 +598,10 @@ pub(super) fn corr_panel(
         color: [0.6, 0.6, 0.6, 0.8],
         thickness: 1.0,
     });
-    if let Some((slope, intercept)) = linear_fit(&xs, &ys) {
-        series.push(Series::Guide {
-            xs: vec![xmin, xmax],
-            ys: vec![slope * xmin + intercept, slope * xmax + intercept],
-            color: [0.9, 0.75, 0.3, 0.9],
-            thickness: 1.5,
-        });
-    }
     Panel {
         title: String::new(),
         y_label: axis_label(b.label, group_label),
+        x_label: axis_label(a.label, group_label),
         xmin,
         xmax,
         ymin,
@@ -688,6 +759,7 @@ pub(super) fn note_panel(title: &str) -> Panel {
     Panel {
         title: title.to_string(),
         y_label: String::new(),
+        x_label: String::new(),
         xmin: 0.0,
         xmax: 1.0,
         ymin: 0.0,
@@ -706,10 +778,13 @@ pub(super) fn kde(values: &[f32], half: f32) -> Vec<(f32, f32)> {
         return vec![(values[0], half * 0.7)];
     }
     let n = values.len() as f64;
-    let mean = values.iter().sum::<f32>() as f64 / n;
+    let mean = values.iter().map(|value| f64::from(*value)).sum::<f64>() / n;
     let var = values
         .iter()
-        .map(|value| (f64::from(*value) - mean).powi(2))
+        .map(|value| {
+            let delta = f64::from(*value) - mean;
+            delta * delta
+        })
         .sum::<f64>()
         / (n - 1.0);
     let bw = n.powf(-0.2) * var.sqrt();
@@ -718,26 +793,69 @@ pub(super) fn kde(values: &[f32], half: f32) -> Vec<(f32, f32)> {
     }
     let lo = values.iter().copied().fold(f32::MAX, f32::min);
     let hi = values.iter().copied().fold(f32::MIN, f32::max);
-    let steps = 48;
-    let mut density = Vec::with_capacity(steps);
-    for step in 0..steps {
-        let y = lo + (hi - lo) * step as f32 / (steps - 1) as f32;
-        let mut total = 0.0f64;
-        for sample in values {
-            let z = (f64::from(y) - f64::from(*sample)) / bw;
-            total += (-0.5 * z * z).exp();
+    const STEPS: usize = 48;
+    // ponytail: a long bin is a 256-bin histogram, gaussian cut at 4 bandwidths.
+    // Under 512 samples the kernel still visits every point, which is what the
+    // small-fixture outline checks. A wider histogram if a violin looks faceted.
+    let mut totals = [0.0f64; STEPS];
+    if values.len() < 512 {
+        for (step, total) in totals.iter_mut().enumerate() {
+            let y =
+                f64::from(lo) + (f64::from(hi) - f64::from(lo)) * step as f64 / (STEPS - 1) as f64;
+            let mut sum = 0.0;
+            for sample in values {
+                let z = (y - f64::from(*sample)) / bw;
+                sum += (-0.5 * z * z).exp();
+            }
+            *total = sum;
         }
-        density.push((y, total));
+    } else {
+        hist_density(values, lo, hi, bw, &mut totals);
     }
-    let peak = density
-        .iter()
-        .map(|(_, value)| *value)
-        .fold(0.0, f64::max)
-        .max(1e-12);
-    density
+    let peak = totals.iter().copied().fold(0.0, f64::max).max(1e-12);
+    totals
         .into_iter()
-        .map(|(y, value)| (y, half * (value / peak) as f32))
+        .enumerate()
+        .map(|(step, value)| {
+            let y = lo + (hi - lo) * step as f32 / (STEPS - 1) as f32;
+            (y, half * (value / peak) as f32)
+        })
         .collect()
+}
+
+fn hist_density(values: &[f32], lo: f32, hi: f32, bw: f64, totals: &mut [f64]) {
+    const BINS: usize = 256;
+    let span = (f64::from(hi) - f64::from(lo)).max(1e-12);
+    let mut counts = [0.0f64; BINS];
+    let scale = (BINS - 1) as f64 / span;
+    for sample in values {
+        let index = ((f64::from(*sample) - f64::from(lo)) * scale)
+            .round()
+            .clamp(0.0, (BINS - 1) as f64) as usize;
+        counts[index] += 1.0;
+    }
+    let bin_width = span / (BINS - 1) as f64;
+    let radius = ((4.0 * bw) / bin_width)
+        .ceil()
+        .clamp(1.0, (BINS - 1) as f64) as isize;
+    let steps = totals.len();
+    for (step, total) in totals.iter_mut().enumerate() {
+        let y = f64::from(lo) + span * step as f64 / (steps - 1) as f64;
+        let center_bin = ((y - f64::from(lo)) / bin_width).round() as isize;
+        let start = (center_bin - radius).max(0) as usize;
+        let end = (center_bin + radius).min((BINS - 1) as isize) as usize;
+        let mut sum = 0.0;
+        for index in start..=end {
+            let count = counts[index];
+            if count == 0.0 {
+                continue;
+            }
+            let center = f64::from(lo) + bin_width * index as f64;
+            let z = (y - center) / bw;
+            sum += count * (-0.5 * z * z).exp();
+        }
+        *total = sum;
+    }
 }
 
 pub(super) fn pchip(xs: &[f32], ys: &[f32]) -> (Vec<f32>, Vec<f32>) {
@@ -784,67 +902,4 @@ pub(super) fn pchip(xs: &[f32], ys: &[f32]) -> (Vec<f32>, Vec<f32>) {
     out_x.push(*xs.last().unwrap_or(&0.0));
     out_y.push(*ys.last().unwrap_or(&0.0));
     (out_x, out_y)
-}
-
-pub(super) fn uniform_edges(lo: f32, hi: f32, bins: usize) -> Vec<f32> {
-    let bins = bins.max(1);
-    let (lo, hi) = if !lo.is_finite() || !hi.is_finite() || (hi - lo).abs() < 1e-12 {
-        (lo - 0.5, (lo - 0.5) + 1.0)
-    } else {
-        (lo, hi)
-    };
-    (0..=bins)
-        .map(|step| lo + (hi - lo) * step as f32 / bins as f32)
-        .collect()
-}
-
-pub(super) fn count_bins(edges: &[f32], values: &[f32]) -> Vec<f32> {
-    let bins = edges.len().saturating_sub(1);
-    let mut counts = vec![0.0f32; bins];
-    if bins == 0 {
-        return counts;
-    }
-    let lo = edges[0];
-    let hi = edges[bins];
-    let span = hi - lo;
-    if !span.is_finite() || span <= 0.0 {
-        return counts;
-    }
-    let scale = bins as f32 / span;
-    for value in values {
-        if !value.is_finite() || *value < lo || *value > hi {
-            continue;
-        }
-        let mut index = ((*value - lo) * scale) as usize;
-        if index >= bins {
-            index = bins - 1;
-        }
-        counts[index] += 1.0;
-    }
-    counts
-}
-
-pub(super) fn bar_outline(edges: &[f32], counts: &[f32]) -> Series {
-    let mut xs = Vec::new();
-    let mut ys = Vec::new();
-    for (index, count) in counts.iter().copied().enumerate() {
-        if !count.is_finite() || count <= 0.0 {
-            continue;
-        }
-        let (Some(left), Some(right)) = (edges.get(index).copied(), edges.get(index + 1).copied())
-        else {
-            continue;
-        };
-        if !left.is_finite() || !right.is_finite() {
-            continue;
-        }
-        xs.extend([left, right, right, left, left, f32::NAN]);
-        ys.extend([0.0, 0.0, count, count, 0.0, f32::NAN]);
-    }
-    Series::Polyline {
-        xs,
-        ys,
-        color: [0.85, 0.85, 0.85, 0.0],
-        thickness: 1.0,
-    }
 }

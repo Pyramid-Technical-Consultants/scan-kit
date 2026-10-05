@@ -4,8 +4,10 @@
 mod kernels;
 mod mc;
 mod present;
+mod task;
 
 pub use mc::run_mc;
+pub use task::{cancel_task, poll_task, start_task};
 
 pub use kernels::compile_scientific_shaders;
 pub use present::{invoke, open_plot, run_view, tool_input_schema, tools};

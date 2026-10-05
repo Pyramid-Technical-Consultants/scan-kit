@@ -1,18 +1,9 @@
 //! Shared plot helpers: option picking, row filters, and contour bands.
 
-use std::collections::BTreeMap;
-
 use scan_kit_core::{Control, Series};
 use serde_json::Value;
 
-use super::tables::{modified_z, percentile};
-
-const MOD_Z: f32 = 3.5;
-pub(crate) const BEAM_CHOICES: &[(&str, &str)] = &[
-    ("beam_on", "Beam On"),
-    ("beam_off", "Beam Off"),
-    ("beam_both", "Both"),
-];
+use super::tables::percentile;
 
 /// Nested density fills plus the isolines around each band.
 pub(crate) fn contour_bands(xs: &[f32], ys: &[f32], cutoff_pct: f32) -> Vec<Series> {
@@ -22,10 +13,6 @@ pub(crate) fn contour_bands(xs: &[f32], ys: &[f32], cutoff_pct: f32) -> Vec<Seri
         .filter(|(x, y)| x.is_finite() && y.is_finite())
         .map(|(x, y)| (*x, *y))
         .collect();
-    if pairs.len() > 8000 {
-        let step = (pairs.len() / 8000).max(1);
-        pairs = pairs.into_iter().step_by(step).collect();
-    }
     if pairs.len() < 20 {
         return Vec::new();
     }
@@ -291,87 +278,7 @@ pub(crate) fn labeled(id: &str, label: &str, pairs: &[(&str, &str)], current: &s
 }
 
 pub(crate) fn control(id: &str, label: &str, options: &[&str], value: &str) -> Control {
-    Control {
-        id: id.to_string(),
-        label: label.to_string(),
-        options: options.iter().map(|option| (*option).to_string()).collect(),
-        value: value.to_string(),
-    }
-}
-
-pub(crate) fn apply_filter(
-    table: &mut BTreeMap<String, Vec<f32>>,
-    keys: &[&str],
-    domain: &str,
-    beam: &str,
-) {
-    let n = table.values().map(Vec::len).max().unwrap_or(0);
-    if n == 0 {
-        return;
-    }
-    let mut keep = vec![true; n];
-    if let Some(gate) = table.get("beam_on") {
-        for (slot, value) in keep.iter_mut().zip(gate) {
-            let on = !value.is_finite() || *value > 0.5;
-            *slot = match beam {
-                "beam_off" => !on,
-                "beam_both" => true,
-                _ => on,
-            };
-        }
-    }
-    if domain != "all" {
-        let columns: Vec<Vec<f32>> = keys
-            .iter()
-            .filter_map(|key| table.get(*key).cloned())
-            .collect();
-        if !columns.is_empty() {
-            let severity: Vec<f32> = (0..n)
-                .map(|row| {
-                    columns
-                        .iter()
-                        .filter_map(|column| column.get(row).copied())
-                        .filter(|v| v.is_finite())
-                        .map(f32::abs)
-                        .fold(None, |acc: Option<f32>, v| {
-                            Some(acc.map(|a| a.max(v)).unwrap_or(v))
-                        })
-                        .unwrap_or(f32::NAN)
-                })
-                .collect();
-            let valid: Vec<f32> = severity.iter().copied().filter(|v| v.is_finite()).collect();
-            if domain == "mad_outliers" {
-                let z: Vec<Vec<f32>> = columns.iter().map(|column| modified_z(column)).collect();
-                for row in 0..n {
-                    let outlier = z
-                        .iter()
-                        .any(|axis| axis.get(row).copied().unwrap_or(0.0).abs() > MOD_Z);
-                    keep[row] &= outlier;
-                }
-            } else if !valid.is_empty() {
-                let cutoff = percentile(&valid, 0.95);
-                for (row, value) in severity.iter().enumerate() {
-                    let pass = value.is_finite()
-                        && if domain == "upper_95" {
-                            *value > cutoff
-                        } else {
-                            *value <= cutoff
-                        };
-                    keep[row] &= pass;
-                }
-            }
-        }
-    }
-    for (key, values) in table.iter_mut() {
-        if key == "beam_on" || key == "expected_sigma" || key == "session_avg_rate" {
-            continue;
-        }
-        for (value, keep) in values.iter_mut().zip(&keep) {
-            if !keep {
-                *value = f32::NAN;
-            }
-        }
-    }
+    Control::plain(id, label, options.iter().copied(), value)
 }
 
 pub(crate) fn text<'a>(options: &'a Value, key: &str, default: &'a str) -> &'a str {
@@ -434,29 +341,55 @@ rci_in_trigger,r_ic1_x_confidence,r_ic1_x_peak_amplitude,c_x,r_xV,r_tx2_probe_x
         };
 
         let confidence = signal_table(&files, &energies, &layers, "fit_confidence");
-        close(&confidence["ic1_x_confidence"], &[90.0, 10.0, 40.0]);
-        close(&confidence["energy"], &[150.0, 150.0, 150.0]);
-        close(&confidence["beam_on"], &[1.0, 0.0, 1.0]);
+        // The second file has a trigger and no confidence sample. That row stays.
+        close(&confidence["ic1_x_confidence"][..3], &[90.0, 10.0, 40.0]);
+        assert!(confidence["ic1_x_confidence"][3].is_nan());
+        close(&confidence["energy"][..3], &[150.0, 150.0, 150.0]);
+        assert!(confidence["energy"][3].is_nan());
+        close(&confidence["beam_on"], &[1.0, 0.0, 1.0, 1.0]);
         assert!(!confidence.contains_key("ic1_y_confidence"));
 
         let mut filtered = confidence;
-        apply_filter(&mut filtered, &["ic1_x_confidence"], "all", "beam_on");
+        scan_kit_core::apply_mask(
+            &mut filtered,
+            &[scan_kit_core::Segment::Beam {
+                state: scan_kit_core::BeamGate::On,
+            }],
+            &["ic1_x_confidence"],
+        );
         assert!(filtered["ic1_x_confidence"][0].is_finite());
         assert!(filtered["ic1_x_confidence"][1].is_nan());
         assert!((filtered["ic1_x_confidence"][2] - 40.0).abs() < 1e-4);
+        assert!(filtered["ic1_x_confidence"][3].is_nan());
 
         let peak = signal_table(&files, &energies, &layers, "peak_amplitude");
-        close(&peak["ic1_x_peak"], &[4.0, 1.0, 2.0]);
+        close(&peak["ic1_x_peak"][..3], &[4.0, 1.0, 2.0]);
+        assert!(peak["ic1_x_peak"][3].is_nan());
         assert!(!peak.contains_key("ic1_y_peak"));
 
         let amplifier = signal_table(&files, &energies, &layers, "amplifier_error");
-        close(&amplifier["amp_x"], &[0.2, 0.5, 0.0]);
+        close(&amplifier["amp_x"][..3], &[0.2, 0.5, 0.0]);
+        assert!(amplifier["amp_x"][3].is_nan());
         assert!(!amplifier.contains_key("amp_y"));
 
         let field = signal_table(&files, &energies, &layers, "probe_field");
-        close(&field["field_x"], &[30.0, -10.0, 5.0]);
+        close(&field["field_x"][..3], &[30.0, -10.0, 5.0]);
+        assert!(field["field_x"][3].is_nan());
         assert!(!field.contains_key("field_y"));
     }
+    #[test]
+    fn contour_counts_every_sample() {
+        let n = 16_001;
+        let mut xs = vec![0.0f32; n];
+        let mut ys = vec![0.0f32; n];
+        for index in (1..n).step_by(2) {
+            let turn = index as f32;
+            xs[index] = (turn * 0.01).sin();
+            ys[index] = (turn * 0.013).cos();
+        }
+        assert!(!contour_bands(&xs, &ys, 5.0).is_empty());
+    }
+
     #[test]
     fn contour_fill_uses_the_isoline_vertices() {
         let mut xs = Vec::new();

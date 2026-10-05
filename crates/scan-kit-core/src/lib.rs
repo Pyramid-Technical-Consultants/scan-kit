@@ -12,9 +12,11 @@ mod plot;
 mod ramp;
 mod runner;
 mod schema;
+mod segment;
 mod session;
 mod session_log;
 mod signal;
+mod task;
 mod tune;
 mod xml_dom;
 
@@ -33,8 +35,8 @@ pub use plan::{
     ImportSpot, PlanDocument, PlanSource,
 };
 pub use plot::{
-    apply_clip, format_tick, map_span, project, ticks, Camera, Control, DataTable, Panel, PlotRect,
-    PlotScene, Series,
+    apply_clip, format_tick, map_span, project, ticks, Camera, Choice, Control, DataTable, Panel,
+    PlotRect, PlotScene, Series,
 };
 pub use ramp::{choices, index, is_session, resolve, sample, session, Family, SESSION, VIRIDIS};
 pub use runner::{
@@ -48,12 +50,12 @@ pub use session_log::{compare_templates, parse_session_log, LayerEvent, SessionL
 pub use signal::{
     arc_fit, arc_predict, assign_bin_centers, beam_off_edges, beam_on_mask, box_stats,
     calibration_factor, coverage_percent, cumsum, density_counts, dose_error_pct, dose_ratio_pct,
-    dvh, filter_beam_state, fit_decay, g2_ic2_mm, gamma_index, histogram, hv_capacitance_pf,
-    hv_delta_v, hv_expected_pf, hv_firmware_flags, hv_step_window, linear_fit, median_finite,
-    mip_xy, quantile_edges, remap, remap_g2_raw, remap_g2_raw_reversed, remap_g3_raw,
+    dvh, fit_decay, g2_ic2_mm, gamma_index, histogram, hv_capacitance_pf, hv_delta_v,
+    hv_expected_pf, hv_firmware_flags, hv_step_window, linear_fit, median_finite, mip_xy,
+    quantile_edges, remap, remap_g2_raw, remap_g2_raw_reversed, remap_g3_raw,
     remap_g3_raw_reversed, resample_nearest, scale_column, settled_after_step, sliding_background,
     spill_segments, splat_gaussians, sums_by_spot_id, sums_by_spot_run, trapz, welch_psd, ArcFit,
-    BeamState, BoxStats, G2_MM_PER_STRIP, G2_STRIP_CENTER, G3_STRIP_CENTER, G3_STRIP_PITCH_MM,
+    BoxStats, G2_MM_PER_STRIP, G2_STRIP_CENTER, G3_STRIP_CENTER, G3_STRIP_PITCH_MM,
     MIN_SPILL_GAP_MS,
 };
 pub use tune::{run_tune, tune_catalog, TuneSpots};
@@ -65,7 +67,14 @@ pub use schema::{
     timeslice_amplifier_field_columns, ConceptAlias, DerivedSum, CONCEPT_ALIASES, DERIVED_SUMS,
     IC3_QUAD_ZERO_FILL, POSITION_KEY_G2_RAW, POSITION_KEY_G3_RAW,
 };
+pub use segment::{
+    apply_mask, parse_segments, row_mask, segments_control, segments_from, segments_json, BeamGate,
+    CompareOp, Rank, Segment,
+};
 pub use session::{merge_session_geom, parse_termination_summary_text, SessionMeta, SummaryDate};
+pub use task::{
+    adapt_chunk, decode_poll, encode_poll, generation_matches, settle, Cancel, Phase, Poll, Report,
+};
 
 use serde::Serialize;
 use serde_json::{json, Value};

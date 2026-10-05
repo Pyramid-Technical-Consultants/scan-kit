@@ -7,10 +7,9 @@
 use std::path::Path;
 
 use scan_kit_core::{is_session, Series, ToolKind, ToolSpec};
-use scan_kit_io::analysis_scene;
 use serde_json::{json, Value};
 
-use scan_kit_plot::{encode_plot, Plot, PlotFrame, PlotInput};
+use scan_kit_plot::{Plot, PlotInput};
 
 const TOOLS: &[ToolSpec] = &[ToolSpec {
     name: "scan_kit_run_view",
@@ -84,21 +83,32 @@ pub fn run_view(
     foreground: [f32; 4],
     palette: &[[f32; 4]],
 ) -> Result<Value, String> {
-    let mut scene = load_scene(view, root, session_ids, options)?;
-    apply_palette(&mut scene, palette);
-    let frame = paint_once(&scene, width, height, background, foreground)?;
+    let bytes = open_plot(
+        view,
+        root,
+        session_ids,
+        options,
+        background,
+        foreground,
+        palette,
+    )?;
+    let header = scan_kit_plot::plot_header(&bytes)?;
+    let mut plot = Plot::from_payload(&bytes)?;
+    let frame = plot.draw(width, height, &PlotInput::default())?;
     Ok(json!({
-        "title": scene.title,
+        "title": header.title,
         "width": frame.width,
         "height": frame.height,
         "rgba_base64": base64(&frame.rgba),
-        "controls": scene.controls,
-        "table": scene.table,
-        "samples": scene.samples,
+        "controls": header.controls,
+        "table": header.table,
+        "samples": header.samples,
     }))
 }
 
 /// Build the view and pack it for the desktop's wasm plot. See `scan_kit_plot::encode_plot`.
+///
+/// This drains the progressive task in one slice, so the bytes match a finished load.
 pub fn open_plot(
     view: &str,
     root: &Path,
@@ -108,39 +118,18 @@ pub fn open_plot(
     foreground: [f32; 4],
     palette: &[[f32; 4]],
 ) -> Result<Vec<u8>, String> {
-    let mut scene = load_scene(view, root, session_ids, options)?;
-    apply_palette(&mut scene, palette);
-    encode_plot(&scene, background, foreground)
+    crate::task::drain_plot(
+        view,
+        root,
+        session_ids,
+        options,
+        background,
+        foreground,
+        palette,
+    )
 }
 
-fn load_scene(
-    view: &str,
-    root: &Path,
-    session_ids: &[String],
-    options: &Value,
-) -> Result<scan_kit_core::PlotScene, String> {
-    if view == "dose_volume" {
-        return Ok(scan_kit_io::dose_volume(
-            root,
-            session_ids,
-            options,
-            Some(&|job| crate::run_mc(job).map_err(|err| err.to_string())),
-        ));
-    }
-    analysis_scene(view, root, session_ids, options)
-}
-
-fn paint_once(
-    scene: &scan_kit_core::PlotScene,
-    width: u32,
-    height: u32,
-    background: [f32; 4],
-    foreground: [f32; 4],
-) -> Result<PlotFrame, String> {
-    Plot::new(scene, background, foreground).draw(width, height, &PlotInput::default())
-}
-
-fn apply_palette(scene: &mut scan_kit_core::PlotScene, palette: &[[f32; 4]]) {
+pub(crate) fn apply_palette(scene: &mut scan_kit_core::PlotScene, palette: &[[f32; 4]]) {
     if palette.is_empty() {
         for panel in &mut scene.panels {
             for series in &mut panel.series {
@@ -343,6 +332,7 @@ mod tests {
         scene.panels.push(Panel {
             title: String::new(),
             y_label: String::new(),
+            x_label: String::new(),
             xmin: 0.0,
             xmax: 1.0,
             ymin: 0.0,

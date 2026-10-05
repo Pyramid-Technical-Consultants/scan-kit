@@ -62,6 +62,7 @@ import { optionIcon } from "@/option-icons";
 import { CatalogField, catalogShown } from "@/CatalogField";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import { notifyError, notifySaved } from "@/notify";
+import { usePageLoad } from "@/page-load";
 import { SidePane } from "@/SidePane";
 
 type Choice = { value: string; label: string };
@@ -208,6 +209,8 @@ export function PlanSynthesis() {
   const [plan, setPlan] = useState<PlanResult | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [waiting, setWaiting] = useState(true);
+  usePageLoad(waiting || busy);
   const [saveDir, setSaveDir] = useState("");
   const [size, setSize] = useState({ width: 0, height: 0 });
   const host = useRef<HTMLDivElement>(null);
@@ -227,9 +230,11 @@ export function PlanSynthesis() {
           setValues(defaultsOf(first));
         }
         setSaveDir(loaded.save_dir ?? "");
+        setWaiting(false);
       })
       .catch((caught: unknown) => {
         if (!cancel) {
+          setWaiting(false);
           notifyError(caught);
         }
       });
@@ -317,6 +322,7 @@ export function PlanSynthesis() {
     if (typeof selected !== "string") {
       return;
     }
+    setBusy(true);
     try {
       await invoke("scan_kit_synthesize_plan", {
         template: template.id,
@@ -328,6 +334,8 @@ export function PlanSynthesis() {
       notifySaved(selected, { title: "Input map saved" });
     } catch (caught) {
       notifyError(caught);
+    } finally {
+      setBusy(false);
     }
   }
 
@@ -337,7 +345,7 @@ export function PlanSynthesis() {
   }
 
   if (catalog == null || template == null) {
-    return <p className="text-muted-foreground px-3 py-2">Loading templates…</p>;
+    return null;
   }
 
   const applyQuick = (next: Record<string, number>) => {
@@ -434,7 +442,7 @@ export function PlanSynthesis() {
             <div className="flex gap-2">
               <Button type="button" className="min-w-0 flex-1" disabled={busy} onClick={() => void generate()}>
                 <Combine />
-                {busy ? "Generating…" : "Generate"}
+                Generate
               </Button>
               <Button
                 type="button"

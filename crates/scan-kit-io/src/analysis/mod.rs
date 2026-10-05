@@ -1,14 +1,14 @@
 //! Analysis view workflows. Each one loads columns and returns a plot scene.
 //! Pixels are rendered later by `scan-kit-compute`.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use scan_kit_core::{resolve_concept_column, Control, Panel, PlotScene, Series};
 use serde_json::{json, Value};
 
 pub(super) use super::discover;
-pub(super) use super::marks::{apply_filter, contour_bands, labeled, pick, BEAM_CHOICES};
+pub(super) use super::marks::{contour_bands, control, flag, labeled, pick, text};
 pub(super) use super::tables::{slice_table, spot_table, timeslice_metric, timeslice_signals};
 mod distribution;
 mod lines;
@@ -37,7 +37,7 @@ pub fn analysis_scene(
     }
     match view {
         "dose_accumulation" => Ok(lines::dose_accumulation(root, session_ids, options)),
-        "ic_peak_amplitude_beam_off" => Ok(lines::peak_amplitude(root, session_ids)),
+        "ic_peak_amplitude_beam_off" => Ok(lines::peak_amplitude(root, session_ids, options)),
         "beam_motion_energy" => Ok(lines::beam_motion(root, session_ids)),
         "distribution" => Ok(distribution::distribution(root, session_ids, options)),
         "binned_summary" => Ok(binned_summary(root, session_ids, options)),
@@ -61,16 +61,16 @@ pub fn analysis_scene(
 
 pub fn channel_catalog(root: &Path, session_id: &str) -> Vec<String> {
     session_channels(root, session_id)
-        .into_iter()
+        .iter()
         .filter(|(name, values)| channel_key(name) && values.iter().any(|value| value.is_finite()))
-        .map(|(name, _)| name)
+        .map(|(name, _)| name.clone())
         .collect()
 }
 
 pub fn load_timeslice_columns(root: &Path, session_id: &str) -> Value {
     let columns = load_timeslice(root, session_id);
     let mut listed = Vec::new();
-    for (name, values) in &columns {
+    for (name, values) in columns.iter() {
         listed.push(json!({ "name": name, "len": values.len() }));
     }
     let energy = energy_lookup(root, session_id);
@@ -112,6 +112,7 @@ fn panel(title: String, xmin: f32, xmax: f32, ymin: f32, ymax: f32, series: Vec<
     Panel {
         title,
         y_label: String::new(),
+        x_label: String::new(),
         xmin,
         xmax,
         ymin,
@@ -177,17 +178,8 @@ fn load_csv(root: &Path, session_id: &str, name: &str) -> BTreeMap<String, Vec<f
         .unwrap_or_default()
 }
 
-fn load_timeslice(root: &Path, session_id: &str) -> BTreeMap<String, Vec<f32>> {
-    let mut merged: BTreeMap<String, Vec<f32>> = BTreeMap::new();
-    for bytes in discover::read_timeslices(&lines::session_dir(root, session_id)) {
-        let Ok(frame) = numeric_columns(&bytes) else {
-            continue;
-        };
-        for (name, values) in frame {
-            merged.entry(name).or_default().extend(values);
-        }
-    }
-    merged
+fn load_timeslice(root: &Path, session_id: &str) -> super::tables::Table {
+    super::tables::merged_timeslice(root, session_id)
 }
 
 fn energy_lookup(root: &Path, session_id: &str) -> Vec<f32> {
@@ -208,25 +200,7 @@ fn col<'a>(columns: &'a BTreeMap<String, Vec<f32>>, concept: &str) -> Option<&'a
 }
 
 fn numeric_columns(bytes: &[u8]) -> Result<BTreeMap<String, Vec<f32>>, String> {
-    let mut reader = csv::ReaderBuilder::new().flexible(true).from_reader(bytes);
-    let headers = reader.headers().map_err(|err| err.to_string())?.clone();
-    let mut columns: BTreeMap<String, Vec<f32>> = headers
-        .iter()
-        .map(|name| (name.to_owned(), Vec::new()))
-        .collect();
-    for record in reader.records() {
-        let record = record.map_err(|err| err.to_string())?;
-        for (index, name) in headers.iter().enumerate() {
-            let value = record
-                .get(index)
-                .and_then(|text| text.trim().parse().ok())
-                .unwrap_or(f32::NAN);
-            if let Some(column) = columns.get_mut(name) {
-                column.push(value);
-            }
-        }
-    }
-    Ok(columns)
+    Ok(super::tables::read_sheet(bytes).num)
 }
 
 fn session_text(root: &Path, session_id: &str, name: &str) -> String {
@@ -235,123 +209,37 @@ fn session_text(root: &Path, session_id: &str, name: &str) -> String {
         .unwrap_or_default()
 }
 
-fn session_channels(root: &Path, session: &str) -> BTreeMap<String, Vec<f32>> {
+fn session_channels(root: &Path, session: &str) -> super::tables::Table {
     timeslice_signals(root, session)
 }
 
-fn timeline(root: &Path, session_ids: &[String]) -> Vec<BTreeMap<String, Vec<f32>>> {
-    session_ids
-        .iter()
-        .map(|session| session_channels(root, session))
-        .collect()
+fn timeline(root: &Path, session_ids: &[String]) -> Vec<super::tables::Table> {
+    super::tables::map_sessions(session_ids, |session| session_channels(root, session))
 }
 
-fn channel_key(name: &str) -> bool {
+pub(super) fn channel_key(name: &str) -> bool {
     !matches!(name, "energy" | "beam_on" | "beam_on_time" | "spot_time")
 }
 
-fn channel_label(id: &str) -> String {
-    match id {
-        "ic1_current" => "IC1 Current",
-        "ic2_current" => "IC2 Current",
-        "ic3_current" => "IC3 Current",
-        "ic1_x" => "IC1 X",
-        "ic1_y" => "IC1 Y",
-        "ic2_x" => "IC2 X",
-        "ic2_y" => "IC2 Y",
-        "ic1_x_err" => "IC1 X Error",
-        "ic1_y_err" => "IC1 Y Error",
-        "ic2_x_err" => "IC2 X Error",
-        "ic2_y_err" => "IC2 Y Error",
-        "ic1_sig_x" => "IC1 Sigma X",
-        "ic1_sig_y" => "IC1 Sigma Y",
-        "ic2_sig_x" => "IC2 Sigma X",
-        "ic2_sig_y" => "IC2 Sigma Y",
-        "ic12_x_diff" => "IC2-IC1 X",
-        "ic12_y_diff" => "IC2-IC1 Y",
-        "field_x" => "Field X",
-        "field_y" => "Field Y",
-        "ic1_x_confidence" => "IC1 X Confidence",
-        "ic1_y_confidence" => "IC1 Y Confidence",
-        "ic2_x_confidence" => "IC2 X Confidence",
-        "ic2_y_confidence" => "IC2 Y Confidence",
-        "ic1_x_peak" => "IC1 X Peak",
-        "ic1_y_peak" => "IC1 Y Peak",
-        "ic2_x_peak" => "IC2 X Peak",
-        "ic2_y_peak" => "IC2 Y Peak",
-        "amp_x" => "Amplifier X",
-        "amp_y" => "Amplifier Y",
-        "amp_cmd_x" => "Amplifier Command X",
-        "amp_read_x" => "Amplifier Readback X",
-        "amp_cmd_y" => "Amplifier Command Y",
-        "amp_read_y" => "Amplifier Readback Y",
-        _ => {
-            return id
-                .split('_')
-                .map(|part| {
-                    let mut chars = part.chars();
-                    match chars.next() {
-                        None => String::new(),
-                        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
-                    }
+pub(super) fn finite_names(
+    session_ids: &[String],
+    tables: &[super::tables::Table],
+) -> Vec<(String, Vec<String>)> {
+    session_ids
+        .iter()
+        .zip(tables)
+        .map(|(id, table)| {
+            let mut columns: Vec<String> = table
+                .iter()
+                .filter(|(name, values)| {
+                    channel_key(name) && values.iter().any(|value| value.is_finite())
                 })
-                .collect::<Vec<_>>()
-                .join(" ")
-        }
-    }
-    .to_owned()
-}
-
-fn channel_pairs_of(tables: &[BTreeMap<String, Vec<f32>>]) -> Vec<(String, String)> {
-    let mut ids = BTreeSet::new();
-    for table in tables {
-        for (name, values) in table {
-            if channel_key(name) && values.iter().any(|value| value.is_finite()) {
-                ids.insert(name.clone());
-            }
-        }
-    }
-    if ids.is_empty() {
-        ids.insert("ic1_current".to_owned());
-    }
-    ids.into_iter()
-        .map(|id| {
-            let label = channel_label(&id);
-            (id, label)
+                .map(|(name, _)| name.clone())
+                .collect();
+            columns.sort();
+            (id.clone(), columns)
         })
         .collect()
-}
-
-fn choose(options: &Value, key: &str, default_id: &str, pairs: &[(String, String)]) -> String {
-    let raw = options
-        .get(key)
-        .and_then(Value::as_str)
-        .unwrap_or(default_id);
-    if let Some((id, _)) = pairs.iter().find(|(id, label)| id == raw || label == raw) {
-        return id.clone();
-    }
-    if pairs.iter().any(|(id, _)| id == default_id) {
-        default_id.to_owned()
-    } else {
-        pairs
-            .first()
-            .map(|(id, _)| id.clone())
-            .unwrap_or_else(|| default_id.to_owned())
-    }
-}
-
-fn choice_control(id: &str, label: &str, pairs: &[(String, String)], current: &str) -> Control {
-    let value = pairs
-        .iter()
-        .find(|(key, _)| key == current)
-        .map(|(_, label)| label.clone())
-        .unwrap_or_else(|| current.to_owned());
-    Control {
-        id: id.to_owned(),
-        label: label.to_owned(),
-        options: pairs.iter().map(|(_, label)| label.clone()).collect(),
-        value,
-    }
 }
 
 fn percentile_sorted(values: &[f32], p: f32) -> f32 {
@@ -394,7 +282,7 @@ mod tests {
     use scan_kit_core::{Family, SESSION};
 
     use super::distribution::{distribution_limits, reference_ring};
-    use super::timeline::{envelope, robust_span};
+    use super::timeline::{robust_span, trace};
     use super::*;
 
     fn write_session(root: &Path) {
@@ -526,37 +414,130 @@ mod tests {
         assert!(has_kind(&scene, "points"));
         assert!(has_kind(&scene, "bars"));
         assert_eq!(scene.row_weights, vec![2.0, 1.0, 1.0]);
-        assert!(scene
-            .panels
-            .iter()
-            .any(|panel| panel.title == "X Position (mm)"));
-        assert!(scene
-            .panels
-            .iter()
-            .any(|panel| panel.title == "Y Position (mm)"));
+        assert!(scene.panels.iter().any(|panel| {
+            panel.equal
+                && panel.title.is_empty()
+                && panel.x_label == "Plan X (mm)"
+                && panel.y_label == "Plan Y (mm)"
+        }));
+        assert!(scene.panels.iter().any(|panel| {
+            !panel.equal
+                && panel.x_label == "Plan X (mm)"
+                && panel.y_label == "Probability (%)"
+                && panel
+                    .series
+                    .iter()
+                    .any(|series| matches!(series, Series::Polyline { .. }))
+        }));
+        assert!(scene.controls.iter().any(|control| control.id == "xy"
+            && control.label == "XY"
+            && control.value == "Position (mm)"
+            && control
+                .options
+                .iter()
+                .any(|option| option == "Amplifier (V)")
+            && control.options.iter().any(|option| option == "Probe (G)")));
         assert!(scene
             .controls
             .iter()
-            .any(|control| control.id == "mode" && control.value == "Position"));
+            .any(|control| control.id == "hist_bins" && control.value == "Auto"));
+        assert!(scene
+            .controls
+            .iter()
+            .any(|control| control.id == "plan" && control.value == "On"));
         assert!(scene
             .controls
             .iter()
             .any(|control| control.id == "draw" && control.value == "Scatter"));
+        assert!(scene.controls.iter().any(|control| {
+            control.id == "segments"
+                && scan_kit_core::parse_segments(&control.value).is_ok_and(|items| {
+                    items.iter().any(|item| {
+                        matches!(
+                            item,
+                            scan_kit_core::Segment::Beam {
+                                state: scan_kit_core::BeamGate::Both
+                            }
+                        )
+                    })
+                })
+        }));
         assert!(scene
             .controls
             .iter()
-            .any(|control| control.id == "beam" && control.value == "Both"));
-        assert!(scene
-            .controls
-            .iter()
-            .any(|control| control.id == "grain" && control.value == "Spot"));
+            .any(|control| control.id == "source" && control.value == "Spot"));
         assert!(scene.controls.iter().any(|control| control.id == "draw"
             && control.options.iter().any(|option| option == "Contour")));
+        let root = std::env::temp_dir().join(format!("scan-kit-plan-first-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let session = root.join("sess");
+        std::fs::create_dir_all(&session).unwrap();
+        std::fs::write(
+            session.join("input_map.csv"),
+            "energy,charge_req,position_x,position_y\n70,1,0,0\n",
+        )
+        .unwrap();
+        std::fs::write(
+            session.join("spot_data.csv"),
+            "ic1_x_spot,ic1_y_spot,ic2_x_spot,ic2_y_spot\n1,2,3,4\n",
+        )
+        .unwrap();
+        let ordered = analysis_scene("distribution", &root, &["sess".into()], &json!({})).unwrap();
+        let checks: Vec<_> = ordered
+            .controls
+            .iter()
+            .filter(|control| matches!(control.id.as_str(), "plan" | "ic1" | "ic2"))
+            .map(|control| control.id.as_str())
+            .collect();
+        assert_eq!(checks, ["plan", "ic1", "ic2"]);
+        let labels: Vec<_> = ordered
+            .panels
+            .iter()
+            .filter(|panel| panel.equal)
+            .map(|panel| panel.x_label.as_str())
+            .collect();
+        assert_eq!(labels, ["Plan X (mm)", "IC1 X (mm)", "IC2 X (mm)"]);
+        let _ = std::fs::remove_dir_all(&root);
         assert!(scene
             .panels
             .iter()
-            .filter(|panel| panel.y_label.is_empty())
-            .all(|panel| panel.equal));
+            .filter(|panel| panel.equal)
+            .all(|panel| {
+                panel.title.is_empty() && !panel.x_label.is_empty() && !panel.y_label.is_empty()
+            }));
+    }
+
+    #[test]
+    fn distribution_timeslice_keeps_the_plan_column() {
+        let root = std::env::temp_dir().join(format!("scan-kit-slice-plan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let session = root.join("sess");
+        std::fs::create_dir_all(session.join("layer-0/run-0")).unwrap();
+        std::fs::write(
+            session.join("input_map.csv"),
+            "energy,layer_id,spot_no,position_x,position_y\n70,1,5,3,4\n",
+        )
+        .unwrap();
+        std::fs::write(
+            session.join("layer-0/run-0/timeslice_data_device_units.csv"),
+            "layer_id,spot_no,rci_in_trigger,r_ic1_x_position\n1,5,1,64\n1,5,1,64\n",
+        )
+        .unwrap();
+        let scene = analysis_scene(
+            "distribution",
+            &root,
+            &["sess".into()],
+            &json!({"source": "Timeslice"}),
+        )
+        .unwrap();
+        assert!(scene
+            .controls
+            .iter()
+            .any(|control| control.id == "plan" && control.value == "On"));
+        assert!(scene.panels.iter().any(|panel| {
+            panel.equal && panel.x_label == "Plan X (mm)" && panel.y_label == "Plan Y (mm)"
+        }));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -564,6 +545,67 @@ mod tests {
         let (lo, hi) = distribution_limits("position", &[0.0, 10.0, 0.0, 10.0]);
         assert!((lo - -0.6).abs() < 1.0e-3, "{lo}");
         assert!((hi - 10.6).abs() < 1.0e-3, "{hi}");
+    }
+
+    #[test]
+    fn amplifier_and_probe_are_xy_clouds() {
+        let root = std::env::temp_dir().join(format!("scan-kit-amp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let session = root.join("sess");
+        std::fs::create_dir_all(&session).unwrap();
+        std::fs::write(session.join("input_map.csv"), "energy\n70\n").unwrap();
+        std::fs::write(
+            session.join("000_timeslice_data_device_units.csv"),
+            "rci_in_trigger,field_x,field_y,c_x,c_y,r_xV,r_yV\n1,0.1,0.2,1,2,1.2,2.4\n1,0.3,0.4,1,2,1.1,2.3\n",
+        )
+        .unwrap();
+        let probe = analysis_scene(
+            "distribution",
+            &root,
+            &["sess".into()],
+            &json!({"mode": "Probe"}),
+        )
+        .unwrap();
+        assert!(probe
+            .panels
+            .iter()
+            .any(|panel| { panel.equal && panel.x_label == "X (G)" && panel.y_label == "Y (G)" }));
+        assert!(probe
+            .controls
+            .iter()
+            .all(|control| control.id != "grain" && control.id != "ic1" && control.id != "plan"));
+        assert!(probe.controls.iter().any(|control| {
+            control.id == "segments"
+                && scan_kit_core::parse_segments(&control.value).is_ok_and(|items| {
+                    items.iter().any(|item| {
+                        matches!(
+                            item,
+                            scan_kit_core::Segment::Beam {
+                                state: scan_kit_core::BeamGate::On
+                            }
+                        )
+                    })
+                })
+        }));
+        let amplifier = analysis_scene(
+            "distribution",
+            &root,
+            &["sess".into()],
+            &json!({"mode": "Amplifier"}),
+        )
+        .unwrap();
+        assert!(amplifier.panels.iter().any(|panel| {
+            panel.equal && panel.x_label == "X Error (V)" && panel.y_label == "Y Error (V)"
+        }));
+        assert!(amplifier.panels.iter().any(|panel| {
+            !panel.equal
+                && panel.x_label == "X Error (V)"
+                && panel
+                    .series
+                    .iter()
+                    .any(|series| matches!(series, Series::Bars { .. }))
+        }));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -596,11 +638,7 @@ mod tests {
             &json!({"draw": "Density"}),
         )
         .unwrap();
-        let tops: Vec<_> = scene
-            .panels
-            .iter()
-            .filter(|panel| panel.y_label.is_empty())
-            .collect();
+        let tops: Vec<_> = scene.panels.iter().filter(|panel| panel.equal).collect();
         assert_eq!(scene.columns as usize, tops.len());
         assert!(tops.iter().all(|panel| panel.equal));
         assert!(tops.iter().all(|panel| !panel.title.contains("sess")));
@@ -612,14 +650,29 @@ mod tests {
                 .count()
                 == 2
         }));
-        assert_eq!(
-            scene
-                .panels
-                .iter()
-                .filter(|panel| panel.title == "X Position (mm)")
-                .count(),
-            1
-        );
+        assert!(scene.panels.iter().any(|panel| {
+            !panel.equal
+                && panel.x_label.ends_with("X (mm)")
+                && panel
+                    .series
+                    .iter()
+                    .any(|series| matches!(series, Series::Bars { .. }))
+                && panel
+                    .series
+                    .iter()
+                    .any(|series| matches!(series, Series::Polyline { .. }))
+        }));
+        let planned = analysis_scene(
+            "distribution",
+            &root,
+            &["sess".into(), "sess-b".into()],
+            &json!({"draw": "Density", "plan": "Off"}),
+        )
+        .unwrap();
+        assert!(planned
+            .panels
+            .iter()
+            .all(|panel| panel.x_label != "Plan X (mm)"));
         assert!(scene.controls.iter().all(|control| control.id != "ramp"));
         let one = analysis_scene(
             "distribution",
@@ -675,7 +728,7 @@ mod tests {
         assert!(binned
             .controls
             .iter()
-            .any(|control| control.id == "metric" && control.value == "Dose Error (%)"));
+            .any(|control| control.id == "y" && control.value == "Dose Error (%)"));
         let ic1 = binned
             .panels
             .iter()
@@ -689,13 +742,16 @@ mod tests {
         let replay = scene_of("timeslice_replay");
         assert!(has_kind(&replay, "line"));
         assert_eq!(replay.columns, 1);
-        assert!(replay.panels.iter().any(|panel| panel.title == "Overview"));
-        assert!(replay.panels.iter().any(|panel| panel.title == "Detail"));
+        assert_eq!(replay.panels.len(), 1);
+        let Series::Polyline { xs, .. } = &replay.panels[0].series[0] else {
+            panic!("replay should be one trace");
+        };
+        assert_eq!(xs.len(), 32);
         assert!(replay.panels.iter().all(|panel| panel.xmax < 1.0));
         assert!(replay
             .panels
             .iter()
-            .any(|panel| panel.y_label == "IC1 Current"));
+            .any(|panel| panel.y_label == "IC1 Current (nA)"));
         assert!(replay.controls.iter().all(|control| control.id != "scrub"));
     }
 
@@ -709,11 +765,13 @@ mod tests {
     }
 
     #[test]
-    fn replay_overview_keeps_a_narrow_pulse() {
-        let mut samples = vec![0.0f32; 10_000];
-        samples[5000] = 40.0;
-        let (_, ys) = envelope(&samples, 480);
-        assert!(ys.iter().copied().any(|value| value > 30.0));
+    fn replay_trace_keeps_a_narrow_pulse() {
+        let mut samples = vec![0.0f32; 8_001];
+        samples[1] = 40.0;
+        let (xs, ys) = trace(&samples);
+        assert_eq!(ys.len(), samples.len());
+        assert_eq!(ys[1], 40.0);
+        assert!((xs[1] - 0.001).abs() < 1e-6);
     }
 
     #[test]
@@ -898,5 +956,151 @@ mod tests {
             .iter()
             .any(|panel| panel.title.contains("No finite values")));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn finite(values: Option<&Vec<f32>>) -> Vec<f32> {
+        values
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(|value| value.is_finite())
+            .collect()
+    }
+
+    #[test]
+    fn a_parked_beam_converts_strips_with_device_geometry() {
+        let root = std::env::temp_dir().join("scan-kit-parked-geometry");
+        let _ = std::fs::remove_dir_all(&root);
+        let session = root.join("sess");
+        std::fs::create_dir_all(session.join("layer-0/run-0")).unwrap();
+        std::fs::create_dir_all(session.join("config/map2map")).unwrap();
+        std::fs::write(
+            session.join("config/map2map/devices.xml"),
+            r#"<devices><ion_chamber><device name="IC_1_X"/>
+            <strip_count>128</strip_count><strip_to_mm>2</strip_to_mm>
+            <zero_offset_at_iso_mm>-4</zero_offset_at_iso_mm>
+            <source_to_device_distance_mm>1250</source_to_device_distance_mm>
+            </ion_chamber></devices>"#,
+        )
+        .unwrap();
+        std::fs::write(
+            session.join("config/map2map/scan_dose_system.xml"),
+            "<MapToMap><geometry><source_to_isocenter_distance>2500</source_to_isocenter_distance></geometry></MapToMap>",
+        )
+        .unwrap();
+        std::fs::write(
+            session.join("input_map.csv"),
+            "energy,layer_id,spot_no,X_POSITION,Y_POSITION\n250,1,0,0,0\n",
+        )
+        .unwrap();
+        let mut spot = String::from(
+            "spot_no,layer_id,r_ic1_x_spot_sigma_raw,r_ic1_x_spot_sigma,r_ic1_x_spot_position_raw,r_ic1_x_spot_position\n",
+        );
+        for index in 0..12 {
+            spot.push_str(&format!("{index},1,1,4,64.5,0\n"));
+        }
+        std::fs::write(session.join("spot_data.csv"), spot).unwrap();
+        std::fs::write(
+            session.join("layer-0/run-0/timeslice_data_device_units.csv"),
+            "layer_id,rci_in_trigger,r_ic1_x_spot_position,r_ic1_x_sigma\n1,1,64.5,2\n",
+        )
+        .unwrap();
+        let table = crate::tables::slice_table(&root, "sess");
+        let x = table
+            .get("ic1_x")
+            .and_then(|values| values.first())
+            .copied();
+        let sigma = table
+            .get("ic1_sig_x")
+            .and_then(|values| values.first())
+            .copied();
+        assert!(x.is_some_and(|value| value.abs() < 1e-2), "position {x:?}");
+        assert!(
+            sigma.is_some_and(|value| (value - 8.0).abs() < 1e-2),
+            "sigma {sigma:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn modern_sessions_draw_a_millimetre_distribution() {
+        let root =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../test_data/logs");
+        for id in ["1905185100", "1093436476", "1771520329"] {
+            if !crate::discover::session_directory(&root, id)
+                .join("spot_data.csv")
+                .is_file()
+            {
+                continue;
+            }
+            let spot = crate::tables::spot_table(&root, id);
+            let slice = crate::tables::slice_table(&root, id);
+            let spot_x = finite(spot.get("ic1_x"));
+            let slice_x = finite(slice.get("ic1_x"));
+            let spot_sig = finite(spot.get("ic1_sig_x"));
+            let slice_sig = finite(slice.get("ic1_sig_x"));
+            let plan = finite(spot.get("plan_x"));
+            assert!(
+                spot_x.len() > 100 && slice_x.len() > 1_000,
+                "{id} spot {} slice {}",
+                spot_x.len(),
+                slice_x.len()
+            );
+            assert!(
+                slice_x.iter().all(|value| value.abs() < 200.0),
+                "{id} timeslice position left the millimetre field"
+            );
+            let plan_span = plan.iter().copied().fold(f32::MIN, f32::max)
+                - plan.iter().copied().fold(f32::MAX, f32::min);
+            if plan_span < 0.1 {
+                let median = crate::tables::median(&slice_x);
+                assert!(
+                    median.abs() < 5.0,
+                    "{id} parked beam median {median} is not at isocenter"
+                );
+            } else {
+                let span = slice_x.iter().copied().fold(f32::MIN, f32::max)
+                    - slice_x.iter().copied().fold(f32::MAX, f32::min);
+                assert!(span > 40.0, "{id} timeslice field span {span}");
+            }
+            let slice_sigma = crate::tables::median(&slice_sig);
+            let spot_sigma = crate::tables::median(&spot_sig);
+            let ratio = spot_sigma / slice_sigma;
+            assert!(
+                slice_sigma > 2.0 && (1.2..=3.2).contains(&ratio),
+                "{id} sigma spot {spot_sigma} slice {slice_sigma}"
+            );
+            let scene = analysis_scene(
+                "distribution",
+                &root,
+                &[id.to_string()],
+                &json!({ "xy": "position", "source": "timeslice" }),
+            )
+            .unwrap();
+            let points: usize = scene
+                .panels
+                .iter()
+                .flat_map(|panel| &panel.series)
+                .map(|series| match series {
+                    scan_kit_core::Series::Points { xs, .. } => xs.len(),
+                    _ => 0,
+                })
+                .sum();
+            let axis = scene.panels.first().unwrap();
+            assert!(
+                points > 1_000 && axis.xmin > -250.0 && axis.xmax < 250.0,
+                "{id} distribution points {points} axis {}..{}",
+                axis.xmin,
+                axis.xmax
+            );
+            if plan_span < 0.1 {
+                assert!(
+                    axis.xmin > -30.0 && axis.xmax < 30.0,
+                    "{id} parked distribution axis {}..{}",
+                    axis.xmin,
+                    axis.xmax
+                );
+            }
+        }
     }
 }

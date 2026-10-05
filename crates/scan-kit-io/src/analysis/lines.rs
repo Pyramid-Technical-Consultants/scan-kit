@@ -1,21 +1,31 @@
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use scan_kit_core::{
-    beam_on_mask, calibration_factor, cumsum, histogram, scale_column, spill_segments, PlotScene,
-    Series, MIN_SPILL_GAP_MS,
+    apply_mask, beam_on_mask, calibration_factor, cumsum, histogram, scale_column,
+    segments_control, segments_from, spill_segments, BeamGate, PlotScene, Segment, Series,
+    MIN_SPILL_GAP_MS,
 };
 use serde_json::Value;
 
 use super::{
-    apply_filter, col, discover, drew_line, energy_lookup, finite_col, guide, labeled, load_csv,
-    load_timeslice, panel, pick, placed, scene, slice_table, spot_table, stroke, timeslice_metric,
-    LINKED, MARK,
+    col, drew_line, energy_lookup, finite_col, guide, labeled, load_csv, load_timeslice, panel,
+    pick, placed, scene, slice_table, spot_table, stroke, timeslice_metric, LINKED, MARK,
 };
 
 const CALIBRATE_CHOICES: &[(&str, &str)] = &[("off", "Off"), ("on", "On")];
 
-pub(super) fn peak_amplitude(root: &Path, session_ids: &[String]) -> PlotScene {
+pub(super) fn peak_amplitude(root: &Path, session_ids: &[String], options: &Value) -> PlotScene {
+    let segments = segments_from(
+        options,
+        &[Segment::Beam {
+            state: BeamGate::Off,
+        }],
+    );
+    let loaded: Vec<_> = session_ids
+        .iter()
+        .map(|session| timeslice_metric(root, session, "peak_amplitude"))
+        .collect();
     let mut panels = Vec::new();
     for (title, key) in [
         ("IC1 X", "ic1_x_peak"),
@@ -27,9 +37,9 @@ pub(super) fn peak_amplitude(root: &Path, session_ids: &[String]) -> PlotScene {
         let mut lo = f32::MAX;
         let mut hi = f32::MIN;
         let mut top = 1.0f32;
-        for session in session_ids {
-            let mut table = timeslice_metric(root, session, "peak_amplitude");
-            apply_filter(&mut table, &[key], "all", "beam_off");
+        for table in &loaded {
+            let mut table = table.as_ref().clone();
+            apply_mask(&mut table, &segments, &[key]);
             let values = table.get(key).cloned().unwrap_or_default();
             if !values.iter().any(|value| value.is_finite()) {
                 continue;
@@ -49,11 +59,19 @@ pub(super) fn peak_amplitude(root: &Path, session_ids: &[String]) -> PlotScene {
         }
         panels.push(panel(title.to_owned(), lo, hi, 0.0, top, series));
     }
-    scene("IC Peak Amplitude — Beam-Off", panels, Vec::new())
+    scene(
+        "IC Peak Amplitude — Beam-Off",
+        panels,
+        vec![segments_control(&segments, &[("beam", "Beam")])],
+    )
 }
 
 pub(super) fn dose_accumulation(root: &Path, session_ids: &[String], options: &Value) -> PlotScene {
     let calibrate = pick(options, "calibrate", "off", CALIBRATE_CHOICES) == "on";
+    let spots = crate::tables::map_sessions(session_ids, |session| spot_table(root, session));
+    let currents = crate::tables::map_sessions(session_ids, |session| {
+        timeslice_metric(root, session, "ic_current")
+    });
     let mut panels = Vec::new();
     for (label, dose_key, current_key) in [
         ("IC1", "ic1_dose", "ic1_current"),
@@ -63,12 +81,11 @@ pub(super) fn dose_accumulation(root: &Path, session_ids: &[String], options: &V
         let mut cumulative = Vec::new();
         let mut error = Vec::new();
         let mut current_sum = Vec::new();
-        for session in session_ids {
-            let table = spot_table(root, session);
-            let Some(target) = col(&table, "target_mu") else {
+        for (table, currents) in spots.iter().zip(&currents) {
+            let Some(target) = col(table, "target_mu") else {
                 continue;
             };
-            let Some(dose) = col(&table, dose_key) else {
+            let Some(dose) = col(table, dose_key) else {
                 continue;
             };
             let n = target.len().min(dose.len());
@@ -88,8 +105,7 @@ pub(super) fn dose_accumulation(root: &Path, session_ids: &[String], options: &V
             cumulative.push(stroke(xs.clone(), cum_d, false));
             cumulative.push(guide(xs.clone(), cum_t));
             error.push(stroke(xs, err, false));
-            let currents = timeslice_metric(root, session, "ic_current");
-            if let Some(samples) = col(&currents, current_key).filter(|values| values.len() == n) {
+            if let Some(samples) = col(currents, current_key).filter(|values| values.len() == n) {
                 current_sum.push(stroke(
                     (1..=n).map(|i| i as f32).collect(),
                     cumsum(samples),
@@ -173,10 +189,6 @@ pub(super) fn beam_motion(root: &Path, session_ids: &[String]) -> PlotScene {
         .map(|(key, series)| placed(format!("{:.0} MeV", key as f32 / 10.0), series))
         .collect();
     scene("Beam Error Motion vs Energy", panels, Vec::new())
-}
-
-pub(super) fn session_dir(root: &Path, session_id: &str) -> PathBuf {
-    discover::session_directory(root, session_id)
 }
 
 struct Motion {

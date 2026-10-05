@@ -184,6 +184,14 @@ pub fn remember_dir(db: &Path, dir: &str) -> Result<Value, String> {
 }
 
 pub fn download(db: &Path, dest: &str) -> Result<Value, String> {
+    download_with(db, dest, &mut |_, _| true)
+}
+
+pub fn download_with(
+    db: &Path,
+    dest: &str,
+    keep: &mut dyn FnMut(u64, u64) -> bool,
+) -> Result<Value, String> {
     let (host, root) = {
         let guard = lock();
         let live = guard.as_ref().ok_or("not connected")?;
@@ -209,7 +217,10 @@ pub fn download(db: &Path, dest: &str) -> Result<Value, String> {
     let _ = std::fs::remove_dir_all(&staging);
     std::fs::create_dir_all(&session_dir).map_err(|err| err.to_string())?;
     let result = (|| {
-        let count = download_files(&host, &remote, &session_dir)?;
+        let count = download_files(&host, &remote, &session_dir, keep)?;
+        if !keep(count as u64, count as u64) {
+            return Err("cancelled".into());
+        }
         if count == 0 {
             return Err(format!("no session files found under {remote}"));
         }
@@ -787,8 +798,21 @@ fn decode_chunks(mut data: &[u8]) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
-fn download_files(host: &str, remote: &str, dest: &Path) -> Result<usize, String> {
+fn download_files(
+    host: &str,
+    remote: &str,
+    dest: &Path,
+    keep: &mut dyn FnMut(u64, u64) -> bool,
+) -> Result<usize, String> {
     let mut count = 0;
+    let mut tick = |count: usize| -> Result<(), String> {
+        if keep(count as u64, 0) {
+            Ok(())
+        } else {
+            Err("cancelled".into())
+        }
+    };
+    tick(count)?;
     for name in [
         "input_map.csv",
         "spot_data.csv",
@@ -799,6 +823,7 @@ fn download_files(host: &str, remote: &str, dest: &Path) -> Result<usize, String
     ] {
         if fetch(host, &format!("{remote}/{name}"), &dest.join(name))? {
             count += 1;
+            tick(count)?;
         }
     }
     for rel in [
@@ -812,10 +837,12 @@ fn download_files(host: &str, remote: &str, dest: &Path) -> Result<usize, String
     ] {
         if fetch(host, &format!("{remote}/{rel}"), &dest.join(rel))? {
             count += 1;
+            tick(count)?;
         }
     }
     let mut empty_layers = 0;
     for layer in 0..MAX_LAYER {
+        tick(count)?;
         let mut layer_hits = 0;
         for run in 0..MAX_RUN {
             let mut run_hits = 0;
@@ -836,6 +863,7 @@ fn download_files(host: &str, remote: &str, dest: &Path) -> Result<usize, String
                     &dest.join(&prefix).join(name),
                 )? {
                     count += 1;
+                    tick(count)?;
                     run_hits += 1;
                     layer_hits += 1;
                 }

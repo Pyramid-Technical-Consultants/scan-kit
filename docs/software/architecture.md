@@ -83,6 +83,10 @@ Tabular data, including the session list and Session Log Compare, is drawn by [G
 
 The Analysis menu opens a view when one to five sessions are selected. Controls are shadcn components added with `shadcn add` (Select and Field for choices), not native form elements. A control change calls `scan_kit_open_plot`, which returns one binary payload: a JSON header (controls, table, samples, panel frames) and the encoded marks. The webview loads that payload into `scan-kit-plot` built for wasm32 and draws on the canvas with WebGPU, or WebGL2 where WebGPU is missing. Wheel, drag, hover, and resize stay in the webview. No frame crosses the Tauri bridge. `scan_kit_run_view` renders the same `Plot` offscreen and returns one base64 frame for MCP and tests, colored from the stock tokens. Audio Explorer plays and exports the open plot's samples with Web Audio. Dose Volume can open a DICOM folder through `scan_kit_open_study`.
 
+A plotted series contains every sample that passed the view's filters. Nothing drops rows before the camera exists: no fixed stride, bucket count, or point cap on a line or a scatter. Histograms, contours, and spectra still reduce the samples, and they count every sample that passed the filter. The renderer may later simplify a stroke for the current camera when several samples fall in one pixel. That simplification keeps the extrema in the pixel, and a camera that gives a sample its own pixel draws the sample. Zoom and pan stay in the webview, so a thinned payload can never grow back.
+
+Row filters are one segment list, combined with AND, and the mask is computed once per table. Beam, rank, a column range, and a threshold compare are kinds of that list. A later cut, including energy, time, and a dose threshold, is another kind. Playback writes the time range; it does not grow a second filter.
+
 No custom CSS for color, radius, type, or spacing. A unique visual style, when it exists, is a deliberate change to the shadcn theme, not one-off overrides in a feature change.
 
 ## Numeric work
@@ -91,9 +95,13 @@ No custom CSS for color, radius, type, or spacing. A unique visual style, when i
 
 No dataframe crate and no ORM. Session columns are `Vec<f32>` or `Vec<i32>`, parsed in one pass.
 
+A view that takes long enough to block the window runs as a task: one bounded slice per poll, one progress report, and cancel by generation. Plot payloads stay the binary scene the webview already draws. The slice rules, the Monte Carlo preview contract, and the view faces are in [progressive-loading.md](progressive-loading.md).
+
 ## Session data
 
-The database path, table names, and `user_version` 3 match the Python store: `~/.scan-kit/scan-kit.sqlite`, tables `prefs`, `libraries`, and `sessions`, WAL, foreign keys. An existing file opens as-is. This window uses the last data folder and the window geometry prefs.
+The database path, table names, and `user_version` 3 match the Python store: `~/.scan-kit/scan-kit.sqlite`, tables `prefs`, `libraries`, and `sessions`, WAL, foreign keys. An existing file opens as-is. This window uses the last data folder and the window geometry prefs. Sqlite is the library index, not the sample store.
+
+A loaded session keeps one in-memory column table per grain: one row per spot record, one row per timeslice trigger, and one row per timeslice file. Each column has one producer. A view asks for columns by name. A slice window is read once, and a later view decodes any headers it still needs from those bytes.
 
 Discovery reads a local directory of session folders and `.zip`, `.tar`, `.tar.gz`, `.tgz`, `.tar.bz2`, and `.tar.xz`. It reads `termination_summary.txt` out of a folder or archive and does not unpack the archive. Unpacked folders win over an archive with the same id. The sqlite index skips re-parsing when size and mtime match. Map extent is filled from spot positions only when the cached row does not already have it.
 

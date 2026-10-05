@@ -102,6 +102,54 @@ fn scan_kit_run_view(
     )
 }
 
+/// Start a progressive task. The webview polls it and draws each payload itself.
+#[tauri::command]
+async fn scan_kit_start(
+    view: String,
+    path: String,
+    session_ids: Vec<String>,
+    options: Value,
+    background: Vec<f32>,
+    foreground: Vec<f32>,
+    palette: Vec<Vec<f32>>,
+) -> Result<Value, String> {
+    let background = color4(&background, [0.11, 0.11, 0.12, 1.0]);
+    let foreground = color4(&foreground, [0.92, 0.92, 0.93, 1.0]);
+    let palette: Vec<[f32; 4]> = palette
+        .iter()
+        .map(|row| color4(row, [0.9, 0.9, 0.9, 1.0]))
+        .collect();
+    tauri::async_runtime::spawn_blocking(move || {
+        scan_kit_compute::start_task(
+            &view,
+            std::path::Path::new(&path),
+            &session_ids,
+            &options,
+            background,
+            foreground,
+            &palette,
+        )
+    })
+    .await
+    .map_err(|err| err.to_string())?
+}
+
+/// One slice of a task: a progress report and, when this slice drew something, its payload.
+#[tauri::command]
+async fn scan_kit_poll(task: u64) -> Result<tauri::ipc::Response, String> {
+    let bytes = tauri::async_runtime::spawn_blocking(move || scan_kit_compute::poll_task(task))
+        .await
+        .map_err(|err| err.to_string())??;
+    Ok(tauri::ipc::Response::new(bytes))
+}
+
+#[tauri::command]
+async fn scan_kit_cancel(task: u64) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || scan_kit_compute::cancel_task(task))
+        .await
+        .map_err(|err| err.to_string())
+}
+
 /// The packed scene for the webview's wasm plot. Pan, zoom, and hover stay in the webview.
 #[tauri::command]
 async fn scan_kit_open_plot(
@@ -300,6 +348,9 @@ pub fn run() {
             scan_kit_last_main_tab,
             scan_kit_set_last_main_tab,
             scan_kit_run_view,
+            scan_kit_start,
+            scan_kit_poll,
+            scan_kit_cancel,
             scan_kit_open_plot,
             scan_kit_open_study,
             scan_kit_plan_catalog,

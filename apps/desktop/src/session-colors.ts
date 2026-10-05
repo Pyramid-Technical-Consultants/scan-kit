@@ -1,5 +1,5 @@
 /** Seaborn "deep" palette. Index 0 is the first checked session. */
-export const SESSION_COLORS = [
+const SESSION_COLORS = [
   "#4C72B0",
   "#DD8452",
   "#55A868",

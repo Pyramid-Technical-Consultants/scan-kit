@@ -1,11 +1,9 @@
 use std::path::Path;
 
-use scan_kit_core::{
-    fit_iso_plane, magnet_pivot_z, Control, PlotScene, Series, IC1_Z_MM, IC2_Z_MM,
-};
+use scan_kit_core::{fit_iso_plane, magnet_pivot_z, PlotScene, Series, IC1_Z_MM, IC2_Z_MM};
 use serde_json::Value;
 
-use super::{col, drew_line, finite_col, guide, placed, scene, span, spot_table, stroke};
+use super::{col, control, drew_line, finite_col, guide, placed, scene, span, spot_table, stroke};
 
 pub(super) fn trajectory(root: &Path, session_ids: &[String], options: &Value) -> PlotScene {
     let azimuth = number_option(options, "azimuth", 0.4);
@@ -18,8 +16,8 @@ pub(super) fn trajectory(root: &Path, session_ids: &[String], options: &Value) -
     let mut iso = Vec::new();
     let mut pivot = 0.0f32;
     let mut have_pivot = false;
-    for session in session_ids {
-        let table = spot_table(root, session);
+    let tables = crate::tables::map_sessions(session_ids, |session| spot_table(root, session));
+    for table in tables {
         let plan_x = col(&table, "plan_x").unwrap_or(&[]);
         let plan_y = col(&table, "plan_y").unwrap_or(&[]);
         let ic1_x = finite_col(&table, "ic1_x").unwrap_or(plan_x);
@@ -96,22 +94,8 @@ pub(super) fn trajectory(root: &Path, session_ids: &[String], options: &Value) -
     scene(
         "IC Beam Trajectory",
         panels,
-        vec![control(
-            "azimuth",
-            "Orbit",
-            &["0.2", "0.4", "0.8", "1.2"],
-            orbit,
-        )],
+        vec![control("azimuth", "Orbit", &["0.2", "0.4", "0.8", "1.2"], orbit).grouped("Display")],
     )
-}
-
-fn control(id: &str, label: &str, options: &[&str], value: &str) -> Control {
-    Control {
-        id: id.into(),
-        label: label.into(),
-        options: options.iter().map(|option| (*option).to_owned()).collect(),
-        value: value.into(),
-    }
 }
 
 fn plane_guide(from: (f32, f32, f32), to: (f32, f32, f32), azimuth: f32) -> Series {
