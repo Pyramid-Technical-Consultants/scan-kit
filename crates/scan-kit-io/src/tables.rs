@@ -13,8 +13,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use super::discover;
 use scan_kit_core::{
-    column_scale_factor, dose_error_pct, dose_ratio_pct, g2_ic2_mm, linear_fit, remap,
-    remap_g2_raw, remap_g3_raw, scale_column,
+    column_scale_factor, dose_error_pct, dose_ratio_pct, finite_minmax, g2_ic2_mm, linear_fit,
+    median_unstable, percentile_linear, remap, remap_g2_raw, remap_g3_raw, scale_column,
 };
 
 #[derive(Clone)]
@@ -3245,19 +3245,9 @@ pub(crate) fn same(a: f32, b: f32) -> bool {
 }
 
 pub(crate) fn span(values: &[f32]) -> (f32, f32) {
-    let mut lo = f32::MAX;
-    let mut hi = f32::MIN;
-    let mut any = false;
-    for value in values {
-        if value.is_finite() {
-            any = true;
-            lo = lo.min(*value);
-            hi = hi.max(*value);
-        }
-    }
-    if !any {
+    let Some((lo, hi)) = finite_minmax(values) else {
         return (0.0, 1.0);
-    }
+    };
     if (hi - lo).abs() < 1e-6 {
         return (lo - 1.0, hi + 1.0);
     }
@@ -3266,27 +3256,13 @@ pub(crate) fn span(values: &[f32]) -> (f32, f32) {
 }
 
 pub(crate) fn median(values: &[f32]) -> f32 {
-    let mut sorted = values.to_vec();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let mid = sorted.len() / 2;
-    if sorted.len().is_multiple_of(2) {
-        (sorted[mid - 1] + sorted[mid]) * 0.5
-    } else {
-        sorted[mid]
-    }
+    let mut values = values.to_vec();
+    median_unstable(&mut values)
 }
 
 pub(crate) fn percentile(sorted_or_not: &[f32], q: f64) -> f32 {
-    let mut sorted = sorted_or_not.to_vec();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    if sorted.is_empty() {
-        return f32::NAN;
-    }
-    let pos = q * (sorted.len() - 1) as f64;
-    let lo = pos.floor() as usize;
-    let hi = pos.ceil().min((sorted.len() - 1) as f64) as usize;
-    let frac = (pos - lo as f64) as f32;
-    sorted[lo] * (1.0 - frac) + sorted[hi] * frac
+    let mut values = sorted_or_not.to_vec();
+    percentile_linear(&mut values, q)
 }
 
 fn unique_seen(values: &[f32]) -> Vec<f32> {

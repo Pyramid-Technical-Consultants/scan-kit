@@ -457,27 +457,13 @@ fn compare_keep(column: Option<&[f32]>, op: CompareOp, threshold: f32, keep: &mu
 }
 
 fn percentile(values: &[f32], q: f64) -> f32 {
-    let mut sorted = values.to_vec();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    if sorted.is_empty() {
-        return f32::NAN;
-    }
-    let pos = q * (sorted.len() - 1) as f64;
-    let lo = pos.floor() as usize;
-    let hi = pos.ceil().min((sorted.len() - 1) as f64) as usize;
-    let frac = (pos - lo as f64) as f32;
-    sorted[lo] * (1.0 - frac) + sorted[hi] * frac
+    let mut values = values.to_vec();
+    crate::stats::percentile_linear(&mut values, q)
 }
 
 fn median(values: &[f32]) -> f32 {
-    let mut sorted = values.to_vec();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let mid = sorted.len() / 2;
-    if sorted.len().is_multiple_of(2) {
-        (sorted[mid - 1] + sorted[mid]) * 0.5
-    } else {
-        sorted[mid]
-    }
+    let mut values = values.to_vec();
+    crate::stats::median_unstable(&mut values)
 }
 
 fn modified_z(values: &[f32]) -> Vec<f32> {

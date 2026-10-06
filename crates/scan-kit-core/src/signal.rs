@@ -594,16 +594,12 @@ pub fn robust_limits(samples: &[f32]) -> Option<(f32, f32)> {
     if values.is_empty() {
         return None;
     }
-    values.sort_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal));
     let (lo, hi) = if values.len() == 1 {
         (values[0], values[0])
     } else {
         let last = values.len() - 1;
-        let at = |portion: f32| {
-            let index = ((last as f32) * portion).round() as usize;
-            values[index.min(last)]
-        };
-        (at(0.005), at(0.995))
+        let rank = |portion: f32| ((last as f32) * portion).round() as usize;
+        crate::stats::select_ranks(&mut values, rank(0.005).min(last), rank(0.995).min(last))
     };
     let scale = hi.abs().max(lo.abs());
     let pad = ((hi - lo) * 0.02).max(scale * 0.02).max(1.0e-6);
@@ -621,13 +617,7 @@ pub fn median_finite(values: &[f32]) -> Option<f32> {
     if kept.is_empty() {
         return None;
     }
-    kept.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let n = kept.len();
-    if n % 2 == 1 {
-        Some(kept[n / 2])
-    } else {
-        Some((kept[n / 2 - 1] + kept[n / 2]) * 0.5)
-    }
+    Some(crate::stats::median_unstable(&mut kept))
 }
 
 pub fn trapz(time: &[f32], values: &[f32]) -> f32 {
@@ -1046,5 +1036,19 @@ mod tests {
         assert!((centers[3] - 15.0).abs() < 1e-4);
         assert!(centers[4].is_nan());
         assert!(centers[5].is_nan());
+    }
+
+    #[test]
+    fn robust_limits_drop_one_spike_and_non_finite() {
+        let mut samples = vec![1.0; 400];
+        samples.push(f32::NAN);
+        samples.push(100.0);
+        let (lo, hi) = robust_limits(&samples).unwrap();
+        assert!(hi < 2.0, "{hi}");
+        assert!(lo > 0.5 && lo < 1.5, "{lo}");
+        let (lo, hi) = robust_limits(&[2.0]).unwrap();
+        assert!((lo - 1.96).abs() < 1e-3, "{lo}");
+        assert!((hi - 2.04).abs() < 1e-3, "{hi}");
+        assert!(robust_limits(&[f32::NAN]).is_none());
     }
 }

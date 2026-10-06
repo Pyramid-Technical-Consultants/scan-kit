@@ -2,8 +2,8 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use scan_kit_core::{
-    coverage_percent, row_mask, scrub_control, segments_control, segments_from, time_end, BeamGate,
-    Family, Panel, PlotScene, Segment, Series, SESSION,
+    coverage_percent, percentile_nearest, row_mask, scrub_control, segments_control, segments_from,
+    time_end, BeamGate, Family, Panel, PlotScene, Segment, Series, SESSION,
 };
 use serde_json::Value;
 
@@ -179,16 +179,8 @@ fn kept_pairs(
 }
 
 /// Nearest-rank percentile without sorting the whole cloud.
-fn percentile_at(values: &mut [f32], p: f32) -> f32 {
-    if values.is_empty() {
-        return 0.0;
-    }
-    let index = ((values.len() - 1) as f32 * p).round() as usize;
-    let index = index.min(values.len() - 1);
-    values.select_nth_unstable_by(index, |left, right| {
-        left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal)
-    });
-    values[index]
+fn percentile_at(values: &mut [f32], portion: f32) -> f32 {
+    percentile_nearest(values, portion)
 }
 
 pub(super) fn distribution_limits(mode: &str, samples: &[f32]) -> (f32, f32) {

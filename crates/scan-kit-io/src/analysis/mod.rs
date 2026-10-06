@@ -4,7 +4,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use scan_kit_core::{resolve_concept_column, Control, Panel, PlotScene, Series};
+use scan_kit_core::{finite_minmax, resolve_concept_column, Control, Panel, PlotScene, Series};
 use serde_json::{json, Value};
 
 pub(super) use super::discover;
@@ -146,15 +146,10 @@ fn finite_col<'a>(table: &'a BTreeMap<String, Vec<f32>>, key: &str) -> Option<&'
 }
 
 fn span(values: &[f32]) -> (f32, f32) {
-    let mut lo = f32::MAX;
-    let mut hi = f32::MIN;
-    for value in values.iter().copied().filter(|v| v.is_finite()) {
-        lo = lo.min(value);
-        hi = hi.max(value);
-    }
-    if !lo.is_finite() {
-        (0.0, 1.0)
-    } else if (hi - lo).abs() < 1e-4 {
+    let Some((lo, hi)) = finite_minmax(values) else {
+        return (0.0, 1.0);
+    };
+    if (hi - lo).abs() < 1e-4 {
         (lo - 0.5, hi + 0.5)
     } else {
         (lo, hi)

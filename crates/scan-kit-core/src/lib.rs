@@ -16,6 +16,7 @@ mod segment;
 mod session;
 mod session_log;
 mod signal;
+mod stats;
 mod task;
 mod tune;
 mod xml_dom;
@@ -52,6 +53,10 @@ pub use signal::{
     remap_g3_raw_reversed, resample_nearest, robust_limits, scale_column, splat_gaussians,
     sums_by_spot_id, sums_by_spot_run, time_window, trapz, welch_psd, BoxStats, G2_MM_PER_STRIP,
     G2_STRIP_CENTER, G3_STRIP_CENTER, G3_STRIP_PITCH_MM,
+};
+pub use stats::{
+    finite_minmax, mean_finite, median_unstable, percentile_linear, percentile_nearest,
+    reduce_finite, select_ranks, FiniteReduce,
 };
 pub use tune::{run_tune, tune_catalog, TuneSpots};
 pub use xml_dom::{parse_xml, write_xml, Elem};
