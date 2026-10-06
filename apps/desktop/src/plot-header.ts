@@ -91,6 +91,20 @@ export function sameChrome(current: PlotHeader | null, next: PlotHeader): boolea
   return sameTable(current.table, next.table);
 }
 
+/**
+ * Header to leave on screen. A payload with no panels keeps the picture already
+ * up. A blank header does not swallow the first frame that actually has panels.
+ */
+export function shownHeader(current: PlotHeader | null, incoming: PlotHeader): PlotHeader | null {
+  if (incoming.panels.length === 0) {
+    return current;
+  }
+  if (current == null || current.panels.length === 0) {
+    return incoming;
+  }
+  return sameChrome(current, incoming) ? current : incoming;
+}
+
 function sameTable(left: ViewTable | null, right: ViewTable | null): boolean {
   if (left == null || right == null) {
     return left == null && right == null;

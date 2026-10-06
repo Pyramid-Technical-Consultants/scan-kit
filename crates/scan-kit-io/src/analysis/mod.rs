@@ -206,14 +206,6 @@ pub(super) fn channel_key(name: &str) -> bool {
     !matches!(name, "energy" | "beam_on" | "beam_on_time" | "spot_time")
 }
 
-fn percentile_sorted(values: &[f32], p: f32) -> f32 {
-    if values.is_empty() {
-        return 0.0;
-    }
-    let index = ((values.len() - 1) as f32 * p).round() as usize;
-    values[index.min(values.len() - 1)]
-}
-
 fn series_span(series: &[Series]) -> (f32, f32, f32, f32) {
     let mut xmin = f32::MAX;
     let mut xmax = f32::MIN;
@@ -327,8 +319,12 @@ mod tests {
     }
 
     fn opened(view: &str, tag: &str, options: &Value) -> PlotScene {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        // Parallel tests share a process id, so the folder also needs a call counter.
+        static SCENE: AtomicU64 = AtomicU64::new(0);
+        let n = SCENE.fetch_add(1, Ordering::Relaxed);
         let root =
-            std::env::temp_dir().join(format!("scan-kit-{view}-{tag}-{}", std::process::id()));
+            std::env::temp_dir().join(format!("scan-kit-{view}-{tag}-{n}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         write_session(&root);
         let scene = analysis_scene(view, &root, &["sess".into()], options).unwrap();
@@ -663,7 +659,11 @@ mod tests {
 
     #[test]
     fn sk_req_017_binned_summary_and_replay_share_the_session() {
-        let binned = scene_of("binned_summary");
+        let binned = opened(
+            "binned_summary",
+            "binned_summary",
+            &json!({"metric": "Dose Error (%)"}),
+        );
         assert!(has_kind(&binned, "triangles"));
         assert!(binned
             .controls
@@ -704,18 +704,24 @@ mod tests {
         assert!(replay
             .panels
             .iter()
-            .any(|panel| { panel.title == "IC1" && panel.y_label == "IC Current (nA)" }));
+            .any(|panel| panel.title.is_empty() && panel.y_label == "IC1 (nA)"));
+        let (xmin, xmax, y_span) = {
+            let time = &replay.panels[0];
+            (time.xmin, time.xmax, time.ymax - time.ymin)
+        };
         let Series::Polyline { xs, ys, .. } = &replay.panels[0].series[0] else {
             panic!("replay should be one trace");
         };
         assert_eq!(xs.len(), 32);
-        assert!(replay.panels.iter().all(|panel| panel.xmax < 1.0));
+        assert!(xmin > 0.004 && xmin < 0.009, "{xmin}");
+        assert!(xmax > 0.022 && xmax < 0.028, "{xmax}");
         let on: Vec<f32> = ys
             .iter()
             .copied()
             .filter(|value| value.is_finite())
             .collect();
         assert_eq!(on.len(), 16, "beam-on rows stay, beam-off rows drop out");
+        assert!(y_span < on[0].abs().max(1.0e-6) * 0.2, "{y_span}");
         assert!(on
             .iter()
             .all(|value| (*value - on[0]).abs() <= on[0].abs() * 1e-4));
@@ -754,12 +760,14 @@ mod tests {
             panic!("replay should be one trace");
         };
         let kept = ys.iter().filter(|value| value.is_finite()).count();
-        assert!(kept > 0 && kept < 16, "{kept}");
-        for (index, value) in ys.iter().enumerate() {
-            if index as f32 * 0.001 > 0.0105 {
-                assert!(!value.is_finite(), "row {index} is past the playhead");
-            }
-        }
+        assert_eq!(kept, 16, "time traces keep every beam-on sample");
+        assert!(replay.panels[0].xmax < 0.015, "{}", replay.panels[0].xmax);
+        assert!(replay.panels[0].xmin > 0.004, "{}", replay.panels[0].xmin);
+        assert!(ys[8].is_finite());
+        assert!(
+            ys[23].is_finite(),
+            "rows past the playhead stay in the trace"
+        );
 
         let full = opened(
             "binned_summary",
@@ -840,22 +848,27 @@ mod tests {
         )
         .unwrap();
         let _ = std::fs::remove_dir_all(&root);
-        let titles: Vec<&str> = amp
+        assert!(amp.panels.iter().all(|panel| panel.title.is_empty()));
+        let labels: Vec<&str> = amp
             .panels
             .iter()
-            .map(|panel| panel.title.as_str())
+            .map(|panel| panel.y_label.as_str())
             .collect();
-        assert_eq!(titles, vec!["X", "Y"]);
-        assert!(amp
-            .panels
-            .iter()
-            .all(|panel| panel.y_label == "Amplifier Error (V)"));
+        assert_eq!(labels, vec!["X (V)", "Y (V)"]);
 
         let scatter = opened("timeslice_replay", "scatter", &json!({ "scatter": "On" }));
-        let distribution = opened("distribution", "scatter-source", &json!({}));
+        let distribution = opened(
+            "distribution",
+            "scatter-source",
+            &json!({ "source": "Timeslice" }),
+        );
         assert!(scatter.side >= 1);
         assert_eq!(scatter.columns, 2);
         assert_eq!(scatter.column_weights, vec![3.0, 1.4]);
+        assert!(scatter
+            .controls
+            .iter()
+            .all(|control| control.id != "scatter_source"));
         let scatter_xy = scatter
             .controls
             .iter()

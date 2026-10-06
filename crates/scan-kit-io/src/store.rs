@@ -1,4 +1,5 @@
-//! Sqlite store compatible with `scan_kit/common/user_store.py` (`user_version` 3).
+//! Sqlite store. Rust writes `user_version` 4. Python stays at 3 and only
+//! migrates a file when its version is older, so it leaves the exams table.
 //!
 //! ponytail: one process-wide lock serializes every store call. A pool can
 //! replace it if command latency shows up.
@@ -11,10 +12,26 @@ use rusqlite::{params, Connection, OptionalExtension};
 use scan_kit_core::{SessionMeta, SummaryDate};
 use serde_json::{json, Value};
 
-use super::discover::{self, Discovered};
+use super::discover::{self, Discovered, ExamHit};
 
-const SCHEMA_VERSION: i32 = 3;
+const SCHEMA_VERSION: i32 = 4;
 const PREF_LAST_DATA_DIR: &str = "session.last_data_dir";
+const PREF_DATA_DIRS: &str = "session.data_dirs";
+const EXAMS_TABLE: &str = "
+CREATE TABLE IF NOT EXISTS exams (
+    id INTEGER PRIMARY KEY,
+    library_id INTEGER NOT NULL REFERENCES libraries(id) ON DELETE CASCADE,
+    study_uid TEXT NOT NULL,
+    folder_name TEXT NOT NULL,
+    storage_path TEXT,
+    patient_name TEXT NOT NULL DEFAULT '',
+    patient_id TEXT NOT NULL DEFAULT '',
+    study_date TEXT,
+    study_description TEXT NOT NULL DEFAULT '',
+    file_count INTEGER NOT NULL DEFAULT 0,
+    UNIQUE(library_id, study_uid)
+);
+";
 const PREF_LAST_DICOM_DIR: &str = "dicom.last_study_dir";
 const PREF_APP_SETTINGS: &str = "app.settings";
 const PREF_APP_SETTINGS_IMPORTED: &str = "app.settings_imported";
@@ -405,11 +422,6 @@ pub fn backfill_blank_notes(conn: &Connection, lib_id: i64, root: &Path) -> Resu
 pub fn prepare_library(conn: &Connection, root: &str) -> Result<i64, String> {
     let lib_id = ensure_library(conn, root)?;
     import_legacy(conn, lib_id, Path::new(root))?;
-    let found = discover::discover_entries(Path::new(root))?
-        .into_iter()
-        .map(|entry| entry.session_id)
-        .collect::<HashSet<_>>();
-    delete_missing(conn, lib_id, &found)?;
     Ok(lib_id)
 }
 
@@ -466,7 +478,158 @@ pub fn library_rows(conn: &Connection, lib_id: i64) -> Result<Vec<Value>, String
 }
 
 pub fn remember_data_dir(conn: &Connection, root: &str) -> Result<(), String> {
+    let mut dirs = data_dirs(conn)?;
+    if !dirs.iter().any(|dir| dir == root) {
+        dirs.push(root.to_owned());
+    }
+    prefs_set(conn, PREF_DATA_DIRS, &json!(dirs))?;
     prefs_set(conn, PREF_LAST_DATA_DIR, &json!(root))
+}
+
+/// Saved roots in order. The first read of an older store turns the last folder into a one-item list.
+pub fn data_dirs(conn: &Connection) -> Result<Vec<String>, String> {
+    if let Some(value) = prefs_get(conn, PREF_DATA_DIRS)? {
+        return Ok(string_list(&value));
+    }
+    let Some(last) = last_data_dir(conn)?.filter(|dir| !dir.is_empty()) else {
+        return Ok(Vec::new());
+    };
+    let dirs = vec![last];
+    prefs_set(conn, PREF_DATA_DIRS, &json!(dirs))?;
+    Ok(dirs)
+}
+
+pub fn forget_data_dir(conn: &Connection, root: &str) -> Result<(), String> {
+    let mut dirs = data_dirs(conn)?;
+    dirs.retain(|dir| dir != root);
+    prefs_set(conn, PREF_DATA_DIRS, &json!(dirs))?;
+    if last_data_dir(conn)?.as_deref() == Some(root) {
+        prefs_set(
+            conn,
+            PREF_LAST_DATA_DIR,
+            &json!(dirs.first().cloned().unwrap_or_default()),
+        )?;
+    }
+    Ok(())
+}
+
+fn string_list(value: &Value) -> Vec<String> {
+    value
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    item.as_str()
+                        .filter(|text| !text.is_empty())
+                        .map(str::to_owned)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+pub(crate) struct StoredExam {
+    pub folder_name: String,
+    pub storage_path: String,
+    pub patient_name: String,
+    pub patient_id: String,
+    pub study_date: String,
+    pub study_description: String,
+    pub file_count: i64,
+}
+
+pub fn library_id(conn: &Connection, root: &str) -> Result<Option<i64>, String> {
+    conn.query_row(
+        "SELECT id FROM libraries WHERE root_path = ?1",
+        params![root],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(|err| err.to_string())
+}
+
+pub fn upsert_exam(conn: &Connection, lib_id: i64, exam: &ExamHit) -> Result<(), String> {
+    let study_date = if exam.study_date.is_empty() {
+        None
+    } else {
+        Some(exam.study_date.as_str())
+    };
+    conn.execute(
+        "INSERT INTO exams(
+            library_id, study_uid, folder_name, storage_path, patient_name, patient_id,
+            study_date, study_description, file_count
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+         ON CONFLICT(library_id, study_uid) DO UPDATE SET
+            folder_name = excluded.folder_name,
+            storage_path = excluded.storage_path,
+            patient_name = excluded.patient_name,
+            patient_id = excluded.patient_id,
+            study_date = excluded.study_date,
+            study_description = excluded.study_description,
+            file_count = excluded.file_count",
+        params![
+            lib_id,
+            exam.study_uid,
+            exam.folder_name,
+            exam.storage_path.to_string_lossy().to_string(),
+            exam.patient_name,
+            exam.patient_id,
+            study_date,
+            exam.study_description,
+            exam.file_count,
+        ],
+    )
+    .map_err(|err| err.to_string())?;
+    Ok(())
+}
+
+pub fn exam_rows(conn: &Connection, lib_id: i64) -> Result<Vec<StoredExam>, String> {
+    let mut statement = conn
+        .prepare(
+            "SELECT folder_name, storage_path, patient_name, patient_id, study_date,
+                    study_description, file_count
+             FROM exams WHERE library_id = ?1 ORDER BY folder_name",
+        )
+        .map_err(|err| err.to_string())?;
+    let rows = statement
+        .query_map(params![lib_id], |row| {
+            Ok(StoredExam {
+                folder_name: row.get(0)?,
+                storage_path: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                patient_name: row.get(2)?,
+                patient_id: row.get(3)?,
+                study_date: row.get::<_, Option<String>>(4)?.unwrap_or_default(),
+                study_description: row.get(5)?,
+                file_count: row.get(6)?,
+            })
+        })
+        .map_err(|err| err.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|err| err.to_string())
+}
+
+pub(crate) fn delete_missing_exams(
+    conn: &Connection,
+    lib_id: i64,
+    found: &HashSet<String>,
+) -> Result<(), String> {
+    let mut statement = conn
+        .prepare("SELECT study_uid FROM exams WHERE library_id = ?1")
+        .map_err(|err| err.to_string())?;
+    let ids = statement
+        .query_map(params![lib_id], |row| row.get::<_, String>(0))
+        .map_err(|err| err.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| err.to_string())?;
+    for study_uid in ids.into_iter().filter(|id| !found.contains(id)) {
+        conn.execute(
+            "DELETE FROM exams WHERE library_id = ?1 AND study_uid = ?2",
+            params![lib_id, study_uid],
+        )
+        .map_err(|err| err.to_string())?;
+    }
+    Ok(())
 }
 
 fn migrate(conn: &Connection) -> Result<(), String> {
@@ -512,6 +675,8 @@ fn migrate(conn: &Connection) -> Result<(), String> {
             ",
         )
         .map_err(|err| err.to_string())?;
+        conn.execute_batch(EXAMS_TABLE)
+            .map_err(|err| err.to_string())?;
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)
             .map_err(|err| err.to_string())?;
         return Ok(());
@@ -537,6 +702,10 @@ fn migrate(conn: &Connection) -> Result<(), String> {
             ",
         )
         .map_err(|err| err.to_string())?;
+    }
+    if version < 4 {
+        conn.execute_batch(EXAMS_TABLE)
+            .map_err(|err| err.to_string())?;
     }
     if version < SCHEMA_VERSION {
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)
@@ -659,7 +828,11 @@ fn import_app_settings_once(conn: &Connection) -> Result<(), String> {
     prefs_set(conn, PREF_APP_SETTINGS_IMPORTED, &json!(true))
 }
 
-fn delete_missing(conn: &Connection, lib_id: i64, found: &HashSet<String>) -> Result<(), String> {
+pub(crate) fn delete_missing(
+    conn: &Connection,
+    lib_id: i64,
+    found: &HashSet<String>,
+) -> Result<(), String> {
     let mut statement = conn
         .prepare("SELECT session_id FROM sessions WHERE library_id = ?1")
         .map_err(|err| err.to_string())?;

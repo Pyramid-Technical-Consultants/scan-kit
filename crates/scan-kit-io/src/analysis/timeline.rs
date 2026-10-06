@@ -1,15 +1,14 @@
 use std::path::Path;
 
 use scan_kit_core::{
-    hv_capacitance_pf, hv_delta_v, hv_expected_pf, hv_firmware_flags, hv_step_window, row_mask,
-    scrub_control, segments_control, segments_from, time_end, welch_psd, BeamGate, Panel,
-    PlotScene, Rank, Segment, Series,
+    hv_capacitance_pf, hv_delta_v, hv_expected_pf, hv_firmware_flags, hv_step_window,
+    robust_limits, row_mask, scrub_control, scrub_limits, segments_control, segments_from,
+    time_end, time_window, welch_psd, BeamGate, Panel, PlotScene, Rank, Segment, Series,
 };
 use serde_json::Value;
 
 use super::{
-    col, control, drew_line, flag, load_csv, panel, percentile_sorted, placed, scene, session_text,
-    span, stroke, MARK,
+    col, control, drew_line, flag, load_csv, panel, placed, scene, session_text, span, stroke, MARK,
 };
 
 /// Timeslice rows are 1 ms apart.
@@ -42,6 +41,15 @@ pub(super) fn replay(root: &Path, session_ids: &[String], options: &Value) -> Pl
             Segment::Rank { which: Rank::All },
         ],
     );
+    // Time traces keep every beam-gated sample. Playback slides a camera across
+    // them. The spectrum and the scatter still use the playhead, and catch up
+    // once it settles.
+    let trace_segments: Vec<Segment> = segments
+        .iter()
+        .filter(|item| !matches!(item, Segment::Range { column, .. } if column == "time_s"))
+        .cloned()
+        .collect();
+    let window = scrub_limits(&options);
     let end = time_end(
         tables
             .iter()
@@ -49,21 +57,19 @@ pub(super) fn replay(root: &Path, session_ids: &[String], options: &Value) -> Pl
     );
     let masks: Vec<Vec<bool>> = tables
         .iter()
-        .map(|table| row_mask(table, &segments, &keys))
+        .map(|table| row_mask(table, &trace_segments, &keys))
         .collect();
     let show_fft = flag(&options, "fft", false);
-    let mut xmax = SAMPLE_S;
-    for table in &tables {
-        for series in channels {
-            let Some(samples) = table.get(series.key) else {
-                continue;
-            };
-            if samples.is_empty() || !flag(&options, &channel_id(series.key), true) {
-                continue;
-            }
-            xmax = xmax.max(samples.len().saturating_sub(1) as f32 * SAMPLE_S);
-        }
-    }
+    let fft_masks: Vec<Vec<bool>> = if show_fft {
+        tables
+            .iter()
+            .map(|table| row_mask(table, &segments, &keys))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let mut x_lo = f32::MAX;
+    let mut x_hi = f32::MIN;
     let mut panels = Vec::new();
     for series in channels {
         if !flag(&options, &channel_id(series.key), true) {
@@ -77,9 +83,13 @@ pub(super) fn replay(root: &Path, session_ids: &[String], options: &Value) -> Pl
                 continue;
             };
             let samples = gated(samples, keep);
-            if let Some((lo, hi)) = robust_span(&samples) {
+            if let Some((lo, hi)) = robust_span(&axis_samples(&samples, window)) {
                 ymin = ymin.min(lo);
                 ymax = ymax.max(hi);
+            }
+            if let Some((lo, hi)) = finite_window(&samples, window) {
+                x_lo = x_lo.min(lo);
+                x_hi = x_hi.max(hi);
             }
             let (xs, ys) = trace(&samples);
             drawn.push(stroke(xs, ys, false));
@@ -91,11 +101,16 @@ pub(super) fn replay(root: &Path, session_ids: &[String], options: &Value) -> Pl
             ymin = 0.0;
             ymax = 1.0;
         }
-        panels.push(time_panel(series.label, drawn, xmax, ymin, ymax, quantity));
+        panels.push(time_panel(
+            drawn,
+            ymin,
+            ymax,
+            &crate::binned::axis_label(series.label, quantity),
+        ));
         if show_fft {
             let columns: Vec<Vec<f32>> = tables
                 .iter()
-                .zip(&masks)
+                .zip(&fft_masks)
                 .filter_map(|(table, keep)| {
                     table.get(series.key).map(|samples| gated(samples, keep))
                 })
@@ -108,18 +123,14 @@ pub(super) fn replay(root: &Path, session_ids: &[String], options: &Value) -> Pl
     } else {
         panels.len()
     };
+    fit_time_axis(&mut panels, x_lo, x_hi, show_fft);
+    let layers = crate::tables::timeline_layers(root, session_ids, true);
     let show_scatter = flag(&options, "scatter", false);
     if show_scatter {
         let query = scatter_query(&options);
-        let timeslice = crate::source::wants_timeslice(crate::source::Shape::Xy, &query);
         let scatter_owned: Vec<(String, Vec<String>)> = session_ids
             .iter()
-            .map(|id| {
-                (
-                    id.clone(),
-                    crate::tables::grain_columns(root, id, timeslice),
-                )
-            })
+            .map(|id| (id.clone(), crate::tables::grain_columns(root, id, true)))
             .collect();
         let scatter_headers: Vec<crate::source::SessionCols<'_>> = scatter_owned
             .iter()
@@ -127,7 +138,7 @@ pub(super) fn replay(root: &Path, session_ids: &[String], options: &Value) -> Pl
             .collect();
         let scatter = crate::source::select(
             crate::source::Shape::Xy,
-            true,
+            false,
             true,
             &scatter_headers,
             &query,
@@ -139,12 +150,26 @@ pub(super) fn replay(root: &Path, session_ids: &[String], options: &Value) -> Pl
             scatter.grain,
             &segments,
         ));
-        let mut controls = time_controls(&picked.controls, channels, &options, &segments, end);
+        let mut controls = time_controls(
+            &picked.controls,
+            channels,
+            &options,
+            &segments,
+            end,
+            &layers,
+        );
         controls.push(scatter_toggle(true));
         controls.extend(scatter.controls.into_iter().map(scatter_control));
         return finish(panels, controls, time_count, show_fft);
     }
-    let mut controls = time_controls(&picked.controls, channels, &options, &segments, end);
+    let mut controls = time_controls(
+        &picked.controls,
+        channels,
+        &options,
+        &segments,
+        end,
+        &layers,
+    );
     controls.push(scatter_toggle(false));
     finish(panels, controls, time_count, show_fft)
 }
@@ -185,6 +210,7 @@ fn time_controls(
     options: &Value,
     segments: &[Segment],
     end: f32,
+    layers: &[f32],
 ) -> Vec<scan_kit_core::Control> {
     let mut controls: Vec<_> = source
         .iter()
@@ -209,7 +235,7 @@ fn time_controls(
         &[("beam", "Beam"), ("rank", "Rank")],
     ));
     controls.push(fft_toggle(flag(options, "fft", false)));
-    controls.push(scrub_control(options, end));
+    controls.push(scrub_control(options, end, layers));
     controls
 }
 
@@ -228,8 +254,6 @@ fn scatter_toggle(on: bool) -> scan_kit_core::Control {
 fn scatter_control(mut control: scan_kit_core::Control) -> scan_kit_core::Control {
     if control.id == "xy" {
         control.id = "scatter_xy".to_string();
-    } else if control.id == "source" {
-        control.id = "scatter_source".to_string();
     }
     control.group = "Scatter".to_string();
     control
@@ -239,9 +263,6 @@ fn scatter_query(options: &Value) -> Value {
     let mut query = serde_json::Map::new();
     if let Some(value) = options.get("scatter_xy") {
         query.insert("xy".into(), value.clone());
-    }
-    if let Some(value) = options.get("scatter_source") {
-        query.insert("source".into(), value.clone());
     }
     Value::Object(query)
 }
@@ -421,17 +442,61 @@ fn spectrum_panel(columns: &[Vec<f32>]) -> Panel {
     panel
 }
 
-fn time_panel(
-    title: &str,
-    series: Vec<Series>,
-    xmax: f32,
-    ymin: f32,
-    ymax: f32,
-    y_label: &str,
-) -> Panel {
-    let mut panel = panel(title.into(), 0.0, xmax, ymin, ymax, series);
+fn time_panel(series: Vec<Series>, ymin: f32, ymax: f32, y_label: &str) -> Panel {
+    let mut panel = panel(String::new(), 0.0, 1.0, ymin, ymax, series);
+    // `panel` turns a tiny span into +1. A flat trace should stay near its value.
+    panel.ymin = ymin;
+    panel.ymax = if ymax > ymin { ymax } else { ymin + 1.0e-6 };
     panel.y_label = y_label.to_owned();
     panel
+}
+
+/// Shared time window of the finite samples, with a small margin.
+fn fit_time_axis(panels: &mut [Panel], x_lo: f32, x_hi: f32, fft: bool) {
+    if x_lo > x_hi {
+        return;
+    }
+    let (xmin, xmax) = time_window(x_lo, x_hi);
+    let step = if fft { 2 } else { 1 };
+    for item in panels.iter_mut().step_by(step) {
+        item.xmin = xmin;
+        item.xmax = xmax;
+    }
+}
+
+fn axis_samples(samples: &[f32], window: Option<(f32, f32)>) -> Vec<f32> {
+    samples
+        .iter()
+        .enumerate()
+        .filter_map(|(index, value)| {
+            if !value.is_finite() || !inside(index, window) {
+                return None;
+            }
+            Some(*value)
+        })
+        .collect()
+}
+
+fn finite_window(samples: &[f32], window: Option<(f32, f32)>) -> Option<(f32, f32)> {
+    let mut lo = f32::MAX;
+    let mut hi = f32::MIN;
+    for (index, value) in samples.iter().enumerate() {
+        if !value.is_finite() || !inside(index, window) {
+            continue;
+        }
+        let t = index as f32 * SAMPLE_S;
+        lo = lo.min(t);
+        hi = hi.max(t);
+    }
+    (lo <= hi).then_some((lo, hi))
+}
+
+fn inside(index: usize, window: Option<(f32, f32)>) -> bool {
+    let Some((lo, hi)) = window else {
+        return true;
+    };
+    let t = index as f32 * SAMPLE_S;
+    t >= lo && t <= hi
 }
 
 /// One point per sample. Time is the row index, so a gap stays where the file has one.
@@ -444,21 +509,10 @@ pub(super) fn trace(samples: &[f32]) -> (Vec<f32>, Vec<f32>) {
     )
 }
 
-/// 0.5% tails. One ADC spike was setting the axis and the trace sat on the frame.
+/// 0.5% tails, then a slim margin. One ADC spike must not set the axis, and a
+/// flat trace stays near its value instead of gaining an empty unit of range.
 pub(super) fn robust_span(samples: &[f32]) -> Option<(f32, f32)> {
-    let mut values: Vec<f32> = samples
-        .iter()
-        .copied()
-        .filter(|value| value.is_finite())
-        .collect();
-    if values.len() < 2 {
-        return None;
-    }
-    values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let lo = percentile_sorted(&values, 0.005);
-    let hi = percentile_sorted(&values, 0.995);
-    let pad = ((hi - lo) * 0.06).max(1.0e-4);
-    Some((lo - pad, hi + pad))
+    robust_limits(samples)
 }
 
 fn hv_config_text(root: &Path, session: &str, device: &str) -> Option<String> {

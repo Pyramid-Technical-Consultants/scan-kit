@@ -6,6 +6,8 @@ import { invoke } from "@tauri-apps/api/core";
 import { AnalysisView } from "./AnalysisView";
 import { sessionColor } from "./session-colors";
 
+const { followPlot } = vi.hoisted(() => ({ followPlot: vi.fn() }));
+
 function pollFrame(payload: Uint8Array): Uint8Array {
   const report = {
     task: 1,
@@ -109,7 +111,14 @@ vi.mock("@tauri-apps/api/core", () => ({
               label: "Timeline",
               kind: "scrub",
               options: [],
-              value: JSON.stringify({ on: false, at: 0, end: 12.5, speed: 1, window: "second" }),
+              value: JSON.stringify({
+                on: false,
+                at: 0,
+                end: 12.5,
+                speed: 1,
+                window: "second",
+                layers: [1, 4],
+              }),
             },
           ],
           table: null,
@@ -136,6 +145,7 @@ vi.mock("@/wasm/scan_kit_plot.js", () => ({
       zoom: () => undefined,
       pan: () => undefined,
       reset: () => undefined,
+      follow: (...args: unknown[]) => followPlot(...args),
     }),
   },
 }));
@@ -148,6 +158,7 @@ afterEach(() => {
   });
   root = null;
   document.body.replaceChildren();
+  followPlot.mockClear();
 });
 
 it("puts grouped controls on the right and returns to sessions", async () => {
@@ -215,8 +226,8 @@ it("puts grouped controls on the right and returns to sessions", async () => {
   expect(fields.length).toBeGreaterThan(0);
   expect(fields.every((field) => field.getAttribute("data-orientation") === "horizontal")).toBe(true);
   expect((aside as HTMLElement | undefined)?.style.width).toBe("420px");
-  const segments = [...host.querySelectorAll("[data-slot='toggle-group-item']")].map((node) =>
-    node.textContent?.trim(),
+  const segments = [...(aside?.querySelectorAll("[data-slot='toggle-group-item']") ?? [])].map(
+    (node) => node.textContent?.trim(),
   );
   expect(segments).toEqual([
     "Spot",
@@ -391,6 +402,8 @@ it("adds and removes a segment through the plot options", async () => {
   const remove = [...host.querySelectorAll("button")].find(
     (button) => button.getAttribute("aria-label") === "Remove Rank",
   );
+  expect(remove?.textContent?.trim()).toBe("");
+  expect(remove?.querySelector("svg")).not.toBeNull();
   await act(async () => {
     remove?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     await new Promise((resolve) => setTimeout(resolve, 200));
@@ -442,6 +455,30 @@ it("keeps the playback bar on one row and arms it from the checkbox", async () =
   const skip = bar?.querySelector("[aria-label='Skip to start']");
   expect((range as HTMLInputElement | null)?.disabled).toBe(true);
   expect((skip as HTMLButtonElement | null)?.disabled).toBe(true);
+  expect(bar?.querySelector("[data-slot='select-trigger']")).toBeNull();
+  const speed = bar?.querySelector("[aria-label='Speed']");
+  const windowMode = bar?.querySelector("[aria-label='Window']");
+  const choiceName = (node: Element) =>
+    node.getAttribute("aria-label") || node.textContent?.trim() || "";
+  const pressed = (group: Element | null | undefined) => {
+    const button = group?.querySelector("button[aria-pressed='true']");
+    return button == null ? undefined : choiceName(button);
+  };
+  const labels = (group: Element | null | undefined) =>
+    [...(group?.querySelectorAll("[data-slot='toggle-group-item']") ?? [])].map(choiceName);
+  expect(labels(speed)).toEqual(["1/10", "1×", "10×"]);
+  expect(labels(windowMode)).toEqual(["1 s", "Before"]);
+  const before = [...(windowMode?.querySelectorAll("button") ?? [])].find(
+    (item) => choiceName(item) === "Before",
+  );
+  expect(before?.textContent?.trim()).toBe("");
+  expect(before?.querySelector("svg")).not.toBeNull();
+  expect(pressed(speed)).toBe("1×");
+  expect(pressed(windowMode)).toBe("1 s");
+  const marks = () => [...(bar?.querySelectorAll("[data-slot='slider-mark']") ?? [])];
+  expect(marks().map((mark) => mark.getAttribute("data-passed"))).toEqual(["false", "false"]);
+  expect((speed?.querySelector("button") as HTMLButtonElement | null)?.disabled).toBe(true);
+  expect((windowMode?.querySelector("button") as HTMLButtonElement | null)?.disabled).toBe(true);
 
   await act(async () => {
     box?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
@@ -450,6 +487,25 @@ it("keeps the playback bar on one row and arms it from the checkbox", async () =
   expect(box?.getAttribute("aria-checked")).toBe("true");
   expect((range as HTMLInputElement | null)?.disabled).toBe(false);
   expect((skip as HTMLButtonElement | null)?.disabled).toBe(false);
+  expect((speed?.querySelector("button") as HTMLButtonElement | null)?.disabled).toBe(false);
+  const clickChoice = (group: Element | null | undefined, text: string) => {
+    const button = [...(group?.querySelectorAll("button") ?? [])].find(
+      (item) => choiceName(item) === text,
+    );
+    if (!(button instanceof HTMLButtonElement)) {
+      throw new Error(`missing ${text}: ${[...(group?.querySelectorAll("button") ?? [])].map((item) => item.textContent).join("|")}`);
+    }
+    button.click();
+  };
+  await act(async () => {
+    clickChoice(speed, "10×");
+  });
+  expect(pressed(speed)).toBe("10×");
+  await act(async () => {
+    clickChoice(windowMode, "Before");
+  });
+  expect(pressed(speed)).toBe("10×");
+  expect(pressed(windowMode)).toBe("Before");
 
   const queued: FrameRequestCallback[] = [];
   const realFrame = window.requestAnimationFrame;
@@ -472,8 +528,150 @@ it("keeps the playback bar on one row and arms it from the checkbox", async () =
     expect(play()?.getAttribute("aria-label")).toBe("Play");
     const thumb = bar?.querySelector("input[type='range']") as HTMLInputElement | null;
     expect(Number(thumb?.value)).toBeCloseTo(12.5);
+    expect(marks().map((mark) => mark.getAttribute("data-passed"))).toEqual(["true", "true"]);
     expect(queued.length).toBeGreaterThan(0);
   } finally {
     window.requestAnimationFrame = realFrame;
+  }
+});
+
+it("plays the timeslice window without reloading each step", async () => {
+  const host = document.createElement("div");
+  document.body.append(host);
+  await act(() => {
+    root = createRoot(host);
+    root.render(
+      <AnalysisView
+        viewId="timeslice_replay"
+        folder="C:/data"
+        sessions={[{ id: "a", note: "" }]}
+        onBack={() => undefined}
+        onOpenView={() => undefined}
+      />,
+    );
+  });
+  await act(async () => {
+    await new Promise((resolve) => setTimeout(resolve, 200));
+  });
+  const starts = () =>
+    vi.mocked(invoke).mock.calls.filter(([command]) => command === "scan_kit_start").length;
+  const bar = host.querySelector("[data-slot='scrub-bar']");
+  await act(async () => {
+    bar?.querySelector("[data-slot='checkbox']")?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    await new Promise((resolve) => setTimeout(resolve, 400));
+  });
+  const armed = starts();
+  expect(armed).toBeGreaterThan(1);
+  expect(followPlot).toHaveBeenCalledWith(true, 0, 0, true);
+
+  const queued: FrameRequestCallback[] = [];
+  const realFrame = window.requestAnimationFrame;
+  window.requestAnimationFrame = (callback) => {
+    queued.push(callback);
+    return queued.length;
+  };
+  try {
+    await act(async () => {
+      bar?.querySelector("[aria-label='Play']")?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await act(async () => {
+      let now = performance.now();
+      for (let step = 0; step < 4; step += 1) {
+        const batch = queued.splice(0, queued.length);
+        now += 200;
+        for (const frame of batch) {
+          frame(now);
+        }
+      }
+    });
+    expect(starts()).toBe(armed);
+    const highs = followPlot.mock.calls.map((call) => call[2] as number);
+    expect(Math.max(...highs)).toBeGreaterThan(0.1);
+    await act(async () => {
+      bar?.querySelector("[aria-label='Pause']")?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      await new Promise((resolve) => setTimeout(resolve, 300));
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 300));
+    });
+    expect(starts()).toBe(armed + 1);
+  } finally {
+    window.requestAnimationFrame = realFrame;
+  }
+});
+
+it("keeps the timeslice picture when the next payload is empty", async () => {
+  const invokeMock = vi.mocked(invoke);
+  const original = invokeMock.getMockImplementation();
+  let polls = 0;
+  invokeMock.mockImplementation(async (command: string) => {
+    if (command === "scan_kit_cancel") {
+      return null;
+    }
+    if (command === "scan_kit_start") {
+      return { task: 1, generation: 1 };
+    }
+    if (command !== "scan_kit_poll") {
+      throw new Error(command);
+    }
+    polls += 1;
+    const header = {
+      title: "Timeslice Replay",
+      controls: [
+        {
+          id: "scrub",
+          label: "Timeline",
+          kind: "scrub",
+          options: [],
+          value: JSON.stringify({ on: false, at: 0, end: 12.5, speed: 1, window: "second" }),
+        },
+      ],
+      table: null,
+      panels: polls === 1 ? [{}] : [],
+    };
+    const json = new TextEncoder().encode(JSON.stringify(header));
+    const bytes = new Uint8Array(4 + json.length);
+    new DataView(bytes.buffer).setUint32(0, json.length, true);
+    bytes.set(json, 4);
+    return pollFrame(bytes);
+  });
+  try {
+    const host = document.createElement("div");
+    document.body.append(host);
+    await act(() => {
+      root = createRoot(host);
+      root.render(
+        <AnalysisView
+          viewId="timeslice_replay"
+          folder="C:/data"
+          sessions={[{ id: "a", note: "" }]}
+          onBack={() => undefined}
+          onOpenView={() => undefined}
+        />,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    });
+    const frame = () => host.querySelector("canvas")?.parentElement;
+    expect(frame()?.className).toContain("relative");
+    expect(host.textContent).not.toContain("Loading plot");
+
+    await act(async () => {
+      host.querySelector("[data-slot='scrub-bar'] [data-slot='checkbox']")?.dispatchEvent(
+        new MouseEvent("click", { bubbles: true }),
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 400));
+    });
+    expect(polls).toBeGreaterThan(1);
+    expect(frame()?.className).toContain("relative");
+    expect(frame()?.className).not.toContain("hidden");
+    expect(host.textContent).not.toContain("Loading plot");
+  } finally {
+    if (original != null) {
+      invokeMock.mockImplementation(original);
+    }
   }
 });

@@ -155,7 +155,9 @@ impl Drop for QuietTail {
     }
 }
 
-fn mark_tail_done() {
+/// Publish only for the bound session. A parallel load of another session
+/// finishes its own file and must not move this flag.
+fn set_tail_done(done: bool, belongs: impl FnOnce(&str) -> bool) {
     if !PUBLISH_TAIL.with(Cell::get) {
         return;
     }
@@ -164,21 +166,14 @@ fn mark_tail_done() {
         .unwrap_or_else(|err| err.into_inner())
         .as_mut()
     {
-        bound.tail_done = true;
+        if belongs(&bound.session) {
+            bound.tail_done = done;
+        }
     }
 }
 
-fn forget_tail_done() {
-    if !PUBLISH_TAIL.with(Cell::get) {
-        return;
-    }
-    if let Some(bound) = bound_slice()
-        .lock()
-        .unwrap_or_else(|err| err.into_inner())
-        .as_mut()
-    {
-        bound.tail_done = false;
-    }
+fn path_has_session(path: &Path, session: &str) -> bool {
+    path.components().any(|part| part.as_os_str() == session)
 }
 
 pub(crate) type Table = std::sync::Arc<BTreeMap<String, Vec<f32>>>;
@@ -814,7 +809,7 @@ fn frames_limited(
     }
     let listed = discover::list_timeslice_paths(&dir);
     if listed.is_empty() {
-        mark_tail_done();
+        set_tail_done(true, |name| name == session);
         return None;
     }
     let map = map_sheet(root, session);
@@ -843,7 +838,7 @@ fn frames_limited(
         (sheets, layers)
     });
     if no_tail && full >= listed.len() {
-        mark_tail_done();
+        set_tail_done(true, |name| name == session);
     }
     Some(Arc::new(Frames {
         energies,
@@ -943,7 +938,7 @@ fn build_spot(
         Arc::new(read_sheet(&bytes))
     } else {
         if rows.is_some() {
-            mark_tail_done();
+            set_tail_done(true, |name| name == session);
         }
         return BTreeMap::new();
     };
@@ -1134,6 +1129,12 @@ fn build_spot(
     if let Some(beam) = column_any(&spot, &["beam_on", "rci_in_trigger", "r_beamOk"]) {
         if beam.len() >= n {
             table.insert("beam_on".to_string(), take_kept(beam, &keep));
+        }
+    }
+    if let Some(layer) = spot.num.get("layer_id").filter(|values| values.len() >= n) {
+        let kept = take_kept(layer, &keep);
+        if kept.len() == table.get("energy").map(Vec::len).unwrap_or(0) {
+            table.insert("layer_id".to_string(), kept);
         }
     }
     stamp_spot_clock(&mut table, &spot, n, &keep);
@@ -2981,6 +2982,80 @@ fn restamp_sample_time(table: &mut BTreeMap<String, Vec<f32>>) {
     }
 }
 
+/// Layer-change times for the scrubber. Timeslice uses the 1 ms file clock.
+/// Spot rows use the wall clock already stored on `time_s`.
+pub(crate) fn timeline_layers(root: &Path, sessions: &[String], timeslice: bool) -> Vec<f32> {
+    let mut marks = Vec::new();
+    for session in sessions {
+        if timeslice {
+            marks.extend(timeslice_layer_marks(root, session));
+        } else {
+            marks.extend(spot_layer_marks(root, session));
+        }
+    }
+    marks.sort_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal));
+    marks.dedup_by(|left, right| left.to_bits() == right.to_bits());
+    marks
+}
+
+fn spot_layer_marks(root: &Path, session: &str) -> Vec<f32> {
+    let table = load_spot(root, session, false, false, false);
+    scan_kit_core::layer_edges(
+        table.get("time_s").map(Vec::as_slice).unwrap_or(&[]),
+        table.get("layer_id").map(Vec::as_slice).unwrap_or(&[]),
+    )
+}
+
+fn timeslice_layer_marks(root: &Path, session: &str) -> Vec<f32> {
+    let Some(frames) = open_frames(root, session, Family::Current) else {
+        return Vec::new();
+    };
+    let mut marks = Vec::new();
+    let mut cursor = 0.0f32;
+    let mut previous: Option<i64> = None;
+    for (index, sheet) in frames.sheets.iter().enumerate() {
+        let rows = clock_rows(sheet);
+        let folder = frames.layers.get(index).copied().unwrap_or(-1);
+        let column = sheet
+            .num
+            .get("layer_id")
+            .filter(|values| values.iter().any(|value| value.is_finite()));
+        if let Some(ids) = column {
+            for row in 0..rows {
+                let Some(id) = ids.get(row).copied().filter(|value| value.is_finite()) else {
+                    continue;
+                };
+                note_layer(
+                    &mut marks,
+                    &mut previous,
+                    id as i64,
+                    cursor + row as f32 * SAMPLE_S,
+                );
+            }
+        } else if folder >= 0 && rows > 0 {
+            note_layer(&mut marks, &mut previous, folder, cursor);
+        }
+        cursor += rows as f32 * SAMPLE_S;
+    }
+    marks
+}
+
+fn clock_rows(sheet: &Sheet) -> usize {
+    let triggered = sample_len(sheet, &[]);
+    if triggered > 0 {
+        triggered
+    } else {
+        sheet.num.values().map(Vec::len).max().unwrap_or(0)
+    }
+}
+
+fn note_layer(marks: &mut Vec<f32>, previous: &mut Option<i64>, id: i64, at: f32) {
+    if previous.is_some_and(|seen| seen != id) && at > 0.0 {
+        marks.push(at);
+    }
+    *previous = Some(id);
+}
+
 fn current_ratio_from(
     sheets: &[Arc<Sheet>],
     energies: &[f32],
@@ -3856,7 +3931,7 @@ fn sheet_from_window(
         if hit.stamp == stamp && hit.rows == window.rows {
             let have = finished_rows(&hit.sheet);
             if window.done && want >= have {
-                mark_tail_done();
+                set_tail_done(true, |name| path_has_session(path, name));
             }
             return Some(shared_rows(&hit.sheet, want.min(have), have));
         }
@@ -3866,7 +3941,7 @@ fn sheet_from_window(
     if window.done {
         store_sheet(sheet_key(path, stamp, keep), &sheet);
         if want >= have {
-            mark_tail_done();
+            set_tail_done(true, |name| path_has_session(path, name));
         }
     } else {
         let mut cache = parsed_windows()
@@ -4025,13 +4100,13 @@ fn pull_window(
 
 fn sheet_rows(path: &Path, keep: Keep, pred: fn(&str) -> bool, want: usize) -> Arc<Sheet> {
     // An earlier file in this same picture may have hit EOF. Only this file's end counts.
-    forget_tail_done();
+    set_tail_done(false, |name| path_has_session(path, name));
     let stamp = discover::meta_stamp(path);
     let key = sheet_key(path, stamp, keep);
     if let Some(hit) = cached_sheet(&key) {
         let rows = finished_rows(&hit);
         if want >= rows {
-            mark_tail_done();
+            set_tail_done(true, |name| path_has_session(path, name));
             return hit;
         }
         return Arc::new(clip_sheet(&hit, want));
@@ -4053,7 +4128,7 @@ fn sheet_rows(path: &Path, keep: Keep, pred: fn(&str) -> bool, want: usize) -> A
         let sheet = read_and_cache(path, stamp, keep, pred);
         let have = finished_rows(&sheet);
         if want >= have {
-            mark_tail_done();
+            set_tail_done(true, |name| path_has_session(path, name));
             return sheet;
         }
         return Arc::new(clip_sheet(&sheet, want));
@@ -4106,7 +4181,7 @@ fn sheet_rows(path: &Path, keep: Keep, pred: fn(&str) -> bool, want: usize) -> A
         if tail.pieces.len() == 1 {
             remember_window(path, stamp, Arc::clone(&tail.pieces[0]), tail.rows, true);
         }
-        mark_tail_done();
+        set_tail_done(true, |name| path_has_session(path, name));
         tail.file = None;
         let finished = Arc::clone(&tail.sheet);
         let have = tail.rows;
@@ -4818,6 +4893,12 @@ pub(crate) fn days_from_civil(mut year: i32, month: u32, day: u32) -> Option<i64
 mod tests {
     use super::*;
 
+    /// `bind_slice` is one process-wide slot. The tests that use it take turns.
+    fn slice_gate() -> &'static Mutex<()> {
+        static GATE: OnceLock<Mutex<()>> = OnceLock::new();
+        GATE.get_or_init(|| Mutex::new(()))
+    }
+
     #[test]
     fn civil_1970_is_unix_zero() {
         assert_eq!(days_from_civil(1970, 1, 1), Some(0));
@@ -5066,7 +5147,7 @@ mod tests {
 
         std::fs::write(
             session.join("spot_data.csv"),
-            "ic1_total_dose,timestamp,layer_id\n1,1000,1\n2,2500,1\n",
+            "ic1_total_dose,timestamp,layer_id\n1,1000,1\n2,2500,2\n",
         )
         .unwrap();
         let spots = load_spot(&root, "sess", false, false, false);
@@ -5074,6 +5155,12 @@ mod tests {
         assert_eq!(spot_time.len(), 2);
         assert_eq!(spot_time[0], 0.0);
         assert!((spot_time[1] - 1.5).abs() < 1e-4);
+        let slice_marks = timeslice_layer_marks(&root, "sess");
+        assert_eq!(slice_marks.len(), 1);
+        assert!((slice_marks[0] - 0.004).abs() < 1e-6);
+        let spot_marks = spot_layer_marks(&root, "sess");
+        assert_eq!(spot_marks.len(), 1);
+        assert!((spot_marks[0] - 1.5).abs() < 1e-4);
 
         let bare = root.join("nostamp");
         std::fs::create_dir_all(&bare).unwrap();
@@ -5095,6 +5182,7 @@ mod tests {
 
     #[test]
     fn a_slice_keeps_a_prefix_then_the_rest_of_the_file() {
+        let _gate = slice_gate().lock().unwrap_or_else(|err| err.into_inner());
         let root = std::env::temp_dir().join(format!(
             "scan-kit-slice-{}-{}",
             std::process::id(),
@@ -5103,7 +5191,8 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        let session = root.join("sess");
+        // Other tests load a session named "sess" and would publish this slice's tail.
+        let session = root.join("slice");
         std::fs::create_dir_all(&session).unwrap();
         std::fs::write(
             session.join("input_map.csv"),
@@ -5115,13 +5204,13 @@ mod tests {
             "ic1_total_dose,ic2_total_dose,position_x,position_y\n1,1,0,0\n2,2,4,1\n3,3,8,2\n",
         )
         .unwrap();
-        bind_slice("sess", SliceTake::Spot { rows: 2 });
-        let prefix = load_spot(&root, "sess", false, false, false);
+        bind_slice("slice", SliceTake::Spot { rows: 2 });
+        let prefix = load_spot(&root, "slice", false, false, false);
         assert_eq!(prefix.get("ic1_dose").map(Vec::len), Some(2));
         assert!(!slice_tail_done());
         clear_slice();
-        bind_slice("sess", SliceTake::Spot { rows: 8 });
-        let rest = load_spot(&root, "sess", false, false, false);
+        bind_slice("slice", SliceTake::Spot { rows: 8 });
+        let rest = load_spot(&root, "slice", false, false, false);
         assert_eq!(
             rest.get("ic1_dose").map(Vec::as_slice),
             Some([1.0, 2.0, 3.0].as_slice())
@@ -5133,6 +5222,7 @@ mod tests {
 
     #[test]
     fn a_growing_timeslice_matches_the_full_table() {
+        let _gate = slice_gate().lock().unwrap_or_else(|err| err.into_inner());
         let root = std::env::temp_dir().join(format!(
             "scan-kit-grow-{}-{}",
             std::process::id(),

@@ -137,9 +137,12 @@ pub(super) fn distribution(root: &Path, session_ids: &[String], options: &Value)
         );
     }
     controls.push(segments_control(&segments, &[("beam", "Beam")]));
+    let timeslice_clock =
+        grain == "timeslice" || matches!(mode, "amplifier" | "probe" | "confidence" | "coverage");
     controls.push(scrub_control(
         options,
         clock_end(root, session_ids, mode, grain),
+        &crate::tables::timeline_layers(root, session_ids, timeslice_clock),
     ));
     let mut scene = scene("Distribution Explorer", panels, controls);
     scene.columns = columns;
@@ -175,7 +178,7 @@ fn kept_pairs(
     )
 }
 
-/// Same index `percentile_sorted` would pick, without sorting the whole cloud.
+/// Nearest-rank percentile without sorting the whole cloud.
 fn percentile_at(values: &mut [f32], p: f32) -> f32 {
     if values.is_empty() {
         return 0.0;

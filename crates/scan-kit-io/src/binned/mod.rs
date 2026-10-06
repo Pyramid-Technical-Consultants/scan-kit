@@ -857,7 +857,11 @@ pub(crate) fn binned_summary(root: &Path, session_ids: &[String], options: &Valu
                 share,
                 cutoff,
             );
-            controls.push(scrub_control(options, prepared.end));
+            controls.push(scrub_control(
+                options,
+                prepared.end,
+                &crate::tables::timeline_layers(root, session_ids, coarse == "timeslice"),
+            ));
             controls
         },
         table: None,
@@ -1036,7 +1040,7 @@ fn assemble_panel(
     }
 }
 
-fn axis_label(series: &str, group: &str) -> String {
+pub(crate) fn axis_label(series: &str, group: &str) -> String {
     let Some(unit) = group
         .rfind('(')
         .zip(group.rfind(')'))
@@ -1455,7 +1459,11 @@ mod tests {
         }) else {
             return;
         };
-        let scene = binned_summary(&root, &[session], &serde_json::json!({}));
+        let scene = binned_summary(
+            &root,
+            &[session],
+            &serde_json::json!({"metric": "Dose Error (%)"}),
+        );
         assert!(
             scene
                 .panels
@@ -1497,7 +1505,11 @@ mod tests {
         )
         .unwrap();
         let ids = ["sess".to_string()];
-        let scatter = binned_summary(&root, &ids, &serde_json::json!({"glyph": "Scatter"}));
+        let scatter = binned_summary(
+            &root,
+            &ids,
+            &serde_json::json!({"glyph": "Scatter", "metric": "Dose Error (%)"}),
+        );
         let dose = scatter
             .panels
             .iter()
@@ -2042,7 +2054,7 @@ mod tests {
             .iter()
             .find(|control| control.id == "y")
             .unwrap();
-        assert_eq!(metric.value, "Current Ratios (%)");
+        assert_eq!(metric.value, "IC2-IC1 Position (mm) (Isocenter)");
         for label in [
             "Fit Confidence",
             "Peak Amplitude",
@@ -2146,11 +2158,15 @@ mod tests {
             .unwrap();
         }
         let ids = ["a".to_string(), "b".to_string()];
-        let own = binned_summary(&root, &ids, &serde_json::json!({"hist": "On"}));
+        let own = binned_summary(
+            &root,
+            &ids,
+            &serde_json::json!({"hist": "On", "metric": "Dose Error (%)"}),
+        );
         let shared = binned_summary(
             &root,
             &ids,
-            &serde_json::json!({"hist": "On", "shared": "On"}),
+            &serde_json::json!({"hist": "On", "shared": "On", "metric": "Dose Error (%)"}),
         );
         let hist = own
             .panels
@@ -2187,12 +2203,12 @@ mod tests {
         let plot = binned_summary(
             &root,
             &ids,
-            &serde_json::json!({"hist": "On", "share": "Plot"}),
+            &serde_json::json!({"hist": "On", "share": "Plot", "metric": "Dose Error (%)"}),
         );
         let page = binned_summary(
             &root,
             &ids,
-            &serde_json::json!({"hist": "On", "share": "Page"}),
+            &serde_json::json!({"hist": "On", "share": "Page", "metric": "Dose Error (%)"}),
         );
         let plot_spans = probability_spans(&plot);
         let page_spans = probability_spans(&page);

@@ -99,13 +99,13 @@ A view that takes long enough to block the window runs as a task: one bounded sl
 
 ## Session data
 
-The database path, table names, and `user_version` 3 match the Python store: `~/.scan-kit/scan-kit.sqlite`, tables `prefs`, `libraries`, and `sessions`, WAL, foreign keys. An existing file opens as-is. This window uses the last data folder and the window geometry prefs. Sqlite is the library index, not the sample store.
+The database path is `~/.scan-kit/scan-kit.sqlite`, with tables `prefs`, `libraries`, `sessions`, and `exams`, `user_version` 4, WAL, and foreign keys. Rust writes that version. The Python store stays at version 3 and only migrates a file when its version is older. An existing file opens as-is. This window uses the saved data locations and the window geometry prefs. Sqlite is the library index, not the sample store.
 
 A loaded session keeps one in-memory column table per grain: one row per spot record, one row per timeslice trigger, and one row per timeslice file. Each column has one producer. A view asks for columns by name. A slice window is read once, and a later view decodes any headers it still needs from those bytes.
 
-Discovery reads a local directory of session folders and `.zip`, `.tar`, `.tar.gz`, `.tgz`, `.tar.bz2`, and `.tar.xz`. It reads `termination_summary.txt` out of a folder or archive and does not unpack the archive. Unpacked folders win over an archive with the same id. The sqlite index skips re-parsing when size and mtime match. Map extent is filled from spot positions only when the cached row does not already have it.
+Discovery reads session folders and `.zip`, `.tar`, `.tar.gz`, `.tgz`, `.tar.bz2`, and `.tar.xz`. It reads `termination_summary.txt` out of a folder or archive and does not unpack the archive. Unpacked folders win over an archive with the same id. The sqlite index skips re-parsing when size and mtime match. Map extent is filled from spot positions only when the cached row does not already have it.
 
-SFTP and SMB are not in this phase. A normal path, including a Windows UNC path, needs no extra crate.
+A library root is a local path, a Windows UNC path, or an `sftp://`, `smb://`, `ftp://`, or `http://` URL. `ssh` and `scp` open as SFTP, and `ftps` and `https` are included. The password stays in process memory. UNC and `smb://` are read through the operating system. SFTP uses `ssh2`, FTP uses `suppaftp`, and an http URL is one archive downloaded with `ureq`. The first view of a remote session copies it into `~/.scan-kit/remote-cache`. Discovery walks nested folders that are not themselves sessions, to eight levels, and does not follow symlinks. The same walk records a DICOM exam folder in `exams` and does not walk inside it. Saved locations are one search set. The session catalog is one list, and a repeated folder name is disambiguated with its parent folder.
 
 ## Where not to put logic
 

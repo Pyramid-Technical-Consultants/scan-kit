@@ -1,24 +1,18 @@
 import { useEffect, useRef, useState } from "react";
 import { Pause, Play, SkipBack, SkipForward } from "lucide-react";
 
+import { ButtonSegmentGroup } from "@/components/button-segment-group";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
-import {
-  Select,
-  SelectContent,
-  SelectGroup,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
 import { Slider } from "@/components/ui/slider";
 
-type Scrub = {
+export type Scrub = {
   on: boolean;
   at: number;
   end: number;
   speed: 0.1 | 1 | 10;
   window: "second" | "before";
+  layers: number[];
 };
 
 const SPEEDS = [
@@ -65,6 +59,9 @@ function parseScrub(raw: string | undefined): Scrub {
     end,
     speed: speedOf(value.speed),
     window: value.window === "before" ? "before" : "second",
+    layers: Array.isArray(value.layers)
+      ? value.layers.filter((item): item is number => typeof item === "number" && Number.isFinite(item))
+      : [],
   };
 }
 
@@ -87,20 +84,27 @@ function samePlay(left: Scrub, right: Scrub): boolean {
   );
 }
 
-/** Keep one analysis task in flight and send the latest playhead when it settles. */
+/**
+ * Timeslice Replay follows the playhead on the camera. Commit when the window
+ * shape changes, and once `at` has settled, so the spectrum and scatter catch
+ * up. Other views still send every playhead step, one task at a time.
+ */
 export function useScrub(
   controlValue: string | undefined,
   settled: number,
   commit: (text: string) => void,
+  cameraFollow: boolean,
+  onMove: (scrub: Scrub) => void,
 ): {
   scrub: Scrub;
   playing: boolean;
   shown: boolean;
-  update: (next: Scrub) => void;
+  update: (patch: Partial<Scrub>) => void;
   togglePlay: () => void;
 } {
   const reported = parseScrub(controlValue);
   const commitRef = useRef(commit);
+  const onMoveRef = useRef(onMove);
   const [play, setPlay] = useState(() => reported);
   const [playing, setPlaying] = useState(false);
   const scrub: Scrub = {
@@ -109,6 +113,7 @@ export function useScrub(
     window: play.window,
     end: reported.end,
     at: Math.min(play.at, reported.end),
+    layers: reported.layers,
   };
   const scrubRef = useRef(scrub);
   const lastSent = useRef(scrub);
@@ -119,12 +124,17 @@ export function useScrub(
   }, [commit]);
 
   useEffect(() => {
+    onMoveRef.current = onMove;
+  }, [onMove]);
+
+  useEffect(() => {
     scrubRef.current = {
       on: scrub.on,
       at: scrub.at,
       end: scrub.end,
       speed: scrub.speed,
       window: scrub.window,
+      layers: scrubRef.current.layers,
     };
   }, [scrub.on, scrub.at, scrub.end, scrub.speed, scrub.window]);
 
@@ -139,21 +149,64 @@ export function useScrub(
       end: scrub.end,
       speed: scrub.speed,
       window: scrub.window,
+      layers: lastSent.current.layers,
     };
     if (controlValue == null) {
       return;
     }
-    if (samePlay(lastSent.current, current)) {
-      lastSent.current = { ...lastSent.current, end: current.end };
+    if (!cameraFollow) {
+      if (samePlay(lastSent.current, current)) {
+        lastSent.current = { ...lastSent.current, end: current.end };
+        return;
+      }
+      if (pending.current) {
+        return;
+      }
+      pending.current = true;
+      lastSent.current = current;
+      commitRef.current(scrubText(current));
       return;
     }
-    if (pending.current) {
+    const shapeChanged =
+      lastSent.current.on !== current.on || lastSent.current.window !== current.window;
+    const moved = Math.abs(lastSent.current.at - current.at) >= 1e-4;
+    if (playing && !shapeChanged) {
       return;
     }
-    pending.current = true;
-    lastSent.current = current;
-    commitRef.current(scrubText(current));
-  }, [scrub.on, scrub.at, scrub.end, scrub.speed, scrub.window, settled, controlValue]);
+    if (!shapeChanged && !moved) {
+      lastSent.current = { ...lastSent.current, end: current.end, speed: current.speed };
+      return;
+    }
+    if (shapeChanged) {
+      if (pending.current) {
+        return;
+      }
+      pending.current = true;
+      lastSent.current = current;
+      commitRef.current(scrubText(current));
+      return;
+    }
+    const handle = window.setTimeout(() => {
+      if (pending.current) {
+        return;
+      }
+      const latest = scrubRef.current;
+      pending.current = true;
+      lastSent.current = latest;
+      commitRef.current(scrubText(latest));
+    }, 200);
+    return () => window.clearTimeout(handle);
+  }, [
+    cameraFollow,
+    playing,
+    scrub.on,
+    scrub.at,
+    scrub.end,
+    scrub.speed,
+    scrub.window,
+    settled,
+    controlValue,
+  ]);
 
   useEffect(() => {
     if (!playing) {
@@ -169,6 +222,7 @@ export function useScrub(
       if (at !== current.at) {
         const next = { ...current, at };
         scrubRef.current = next;
+        onMoveRef.current(next);
         setPlay(next);
       }
       if (at >= current.end) {
@@ -181,11 +235,13 @@ export function useScrub(
     return () => cancelAnimationFrame(frame);
   }, [playing]);
 
-  const update = (next: Scrub) => {
+  const update = (patch: Partial<Scrub>) => {
+    const next = { ...scrubRef.current, ...patch };
     if (!next.on || next.at !== scrubRef.current.at) {
       setPlaying(false);
     }
     scrubRef.current = next;
+    onMoveRef.current(next);
     setPlay(next);
   };
 
@@ -210,7 +266,7 @@ export function ScrubBar({
 }: {
   scrub: Scrub;
   playing: boolean;
-  onChange: (next: Scrub) => void;
+  onChange: (patch: Partial<Scrub>) => void;
   onTogglePlay: () => void;
 }) {
   const armed = scrub.on;
@@ -223,7 +279,7 @@ export function ScrubBar({
       <Checkbox
         checked={scrub.on}
         aria-label="Timeline"
-        onCheckedChange={(checked) => onChange({ ...scrub, on: checked === true })}
+        onCheckedChange={(checked) => onChange({ on: checked === true })}
       />
       <Button
         type="button"
@@ -231,7 +287,7 @@ export function ScrubBar({
         size="icon"
         disabled={!armed}
         aria-label="Skip to start"
-        onClick={() => onChange({ ...scrub, at: 0 })}
+        onClick={() => onChange({ at: 0 })}
       >
         <SkipBack />
       </Button>
@@ -251,7 +307,7 @@ export function ScrubBar({
         size="icon"
         disabled={!armed}
         aria-label="Skip to end"
-        onClick={() => onChange({ ...scrub, at: scrub.end })}
+        onClick={() => onChange({ at: scrub.end })}
       >
         <SkipForward />
       </Button>
@@ -260,60 +316,43 @@ export function ScrubBar({
         min={0}
         max={scrub.end}
         value={[scrub.at]}
+        marks={scrub.layers}
         disabled={!armed}
         onValueChange={(next) => {
           const at = Array.isArray(next) ? next[0] : next;
           if (typeof at === "number") {
-            onChange({ ...scrub, at });
+            onChange({ at });
           }
         }}
       />
-      <Select
-        items={SPEEDS}
-        value={speed}
+      <ButtonSegmentGroup
+        label="Speed"
+        className="w-fit shrink-0"
+        options={SPEEDS.map((item) => item.label)}
+        value={SPEEDS.find((item) => item.value === speed)?.label ?? "1×"}
         disabled={!armed}
-        onValueChange={(next) => {
-          if (next === "0.1" || next === "1" || next === "10") {
-            onChange({ ...scrub, speed: speedOf(Number(next)) });
+        onChange={(picked) => {
+          const next = SPEEDS.find((item) => item.label === picked);
+          if (next != null) {
+            onChange({ speed: speedOf(Number(next.value)) });
           }
         }}
-      >
-        <SelectTrigger size="sm" className="w-24 cursor-pointer" aria-label="Speed">
-          <SelectValue />
-        </SelectTrigger>
-        <SelectContent>
-          <SelectGroup>
-            {SPEEDS.map((item) => (
-              <SelectItem key={item.value} value={item.value}>
-                {item.label}
-              </SelectItem>
-            ))}
-          </SelectGroup>
-        </SelectContent>
-      </Select>
-      <Select
-        items={WINDOWS}
-        value={scrub.window}
+      />
+      <ButtonSegmentGroup
+        label="Window"
+        className="w-fit shrink-0"
+        options={WINDOWS.map((item) =>
+          item.value === "before" ? { label: item.label, iconOnly: true } : item.label,
+        )}
+        value={WINDOWS.find((item) => item.value === scrub.window)?.label ?? "1 s"}
         disabled={!armed}
-        onValueChange={(next) => {
+        onChange={(picked) => {
+          const next = WINDOWS.find((item) => item.label === picked)?.value;
           if (next === "second" || next === "before") {
-            onChange({ ...scrub, window: next });
+            onChange({ window: next });
           }
         }}
-      >
-        <SelectTrigger size="sm" className="w-24 cursor-pointer" aria-label="Window">
-          <SelectValue />
-        </SelectTrigger>
-        <SelectContent>
-          <SelectGroup>
-            {WINDOWS.map((item) => (
-              <SelectItem key={item.value} value={item.value}>
-                {item.label}
-              </SelectItem>
-            ))}
-          </SelectGroup>
-        </SelectContent>
-      </Select>
+      />
     </div>
   );
 }

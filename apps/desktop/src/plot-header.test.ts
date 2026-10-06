@@ -1,6 +1,6 @@
 import { expect, it } from "vitest";
 
-import { backingSize, plotHeader, sameChrome } from "./plot-header";
+import { backingSize, plotHeader, sameChrome, shownHeader } from "./plot-header";
 
 function payload(header: object, marks: number[]): Uint8Array {
   const json = new TextEncoder().encode(JSON.stringify(header));
@@ -92,4 +92,34 @@ it("keeps the chrome when only the plotted marks grew", () => {
   expect(sameChrome(current, grown)).toBe(true);
   expect(sameChrome(current, { ...grown, title: "Current" })).toBe(false);
   expect(sameChrome(null, grown)).toBe(false);
+});
+
+it("keeps the picture when the next payload has no panels", () => {
+  const current = plotHeader(
+    payload(
+      {
+        title: "Timeslice Replay",
+        controls: [{ id: "scrub", label: "Timeline", value: "{\"at\":1}", options: [] }],
+        table: null,
+        panels: [{}],
+      },
+      [],
+    ).subarray(0),
+  );
+  const empty = plotHeader(
+    payload(
+      {
+        title: "Timeslice Replay",
+        controls: [{ id: "scrub", label: "Timeline", value: "{\"at\":2}", options: [] }],
+        table: null,
+        panels: [],
+      },
+      [],
+    ).subarray(0),
+  );
+  expect(shownHeader(current, empty)).toBe(current);
+  expect(shownHeader(null, empty)).toBeNull();
+  const frame = { ...empty, panels: [{}] };
+  expect(shownHeader(empty, frame)?.panels).toHaveLength(1);
+  expect(shownHeader(current, { ...empty, title: "Dose Volume" })).toBe(current);
 });

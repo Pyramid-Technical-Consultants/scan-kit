@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { createElement, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Box,
   Bug,
@@ -7,6 +7,8 @@ import {
   Eye,
   FolderOpen,
   Info,
+  Plus,
+  Trash2,
   LogOut,
   Play,
   Redo2,
@@ -28,19 +30,24 @@ import "@glideapps/glide-data-grid/dist/index.css";
 import { gridTheme } from "@/grid-theme";
 import {
   Dialog,
+  DialogClose,
   DialogContent,
   DialogDescription,
+  DialogFooter,
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import { Input } from "@/components/ui/input";
 import { AnalysisIcon, AnalysisMenu, PRIMARY_ANALYSES, analysisId } from "@/analysis-menu";
+import { optionIcon } from "@/option-icons";
 import { Button } from "@/components/ui/button";
+import { ButtonSegmentGroup } from "@/components/button-segment-group";
+import { ExamTable, type ExamRow } from "@/ExamTable";
 import { DebugLog } from "@/DebugLog";
 import { installDebugLog } from "@/debug-log";
 import { dismissNotice, logError, notify, notifyError } from "@/notify";
 import { usePageLoad } from "@/page-load";
 import { driveTask, type Report } from "@/task-client";
-import { selectionFromLibrary } from "@/session-colors";
 import { type CheckPaint } from "@/session-checkbox";
 import { SessionContextMenu } from "@/session-menu";
 import {
@@ -75,6 +82,11 @@ import { ConfigTuning } from "@/ConfigTuning";
 import { PhantomSynthesis } from "@/PhantomSynthesis";
 import { PlanRunner } from "@/PlanRunner";
 import { PlanSynthesis } from "@/PlanSynthesis";
+
+function authenticationRequired(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.startsWith("authentication required");
+}
 
 const TAB_ICONS: Record<string, LucideIcon> = {
   "Data Analysis": Table2,
@@ -155,6 +167,32 @@ function geometryOnScreen(
   });
 }
 
+function CatalogEmpty({
+  name,
+  message,
+  onLocations,
+}: {
+  name: "Sessions" | "Exams";
+  message: string;
+  onLocations: () => void;
+}) {
+  const icon = optionIcon(name);
+  return (
+    <div className="absolute inset-0 flex items-center justify-center p-6">
+      <div className="flex max-w-sm flex-col items-center gap-3 text-center">
+        {icon == null
+          ? null
+          : createElement(icon, { className: "text-muted-foreground size-8" })}
+        <p className="text-muted-foreground text-sm">{message}</p>
+        <Button onClick={onLocations}>
+          <FolderOpen />
+          Locations
+        </Button>
+      </div>
+    </div>
+  );
+}
+
 function TabIcon({ name }: { name: string }) {
   const Icon = TAB_ICONS[name];
   if (Icon == null) {
@@ -163,9 +201,23 @@ function TabIcon({ name }: { name: string }) {
   return <Icon className="size-4" />;
 }
 
+type CatalogPayload = {
+  locations: string[];
+  rows: LibraryRow[];
+  exams: ExamRow[];
+  selected: string[];
+};
+
 export default function App() {
-  const [folder, setFolder] = useState<string | null>(null);
+  const [locations, setLocations] = useState<string[]>([]);
+  const [locationDraft, setLocationDraft] = useState("");
+  const [locationsOpen, setLocationsOpen] = useState(false);
+  const [catalog, setCatalog] = useState<"Sessions" | "Exams">("Sessions");
+  const [passwordFor, setPasswordFor] = useState<string | null>(null);
+  const [password, setPassword] = useState("");
   const [rows, setRows] = useState<LibraryRow[]>([]);
+  const [exams, setExams] = useState<ExamRow[]>([]);
+  const folder = locations[0] ?? null;
   const [sort, setSort] = useState<Sort>({ key: "date", direction: "desc" });
   const [about, setAbout] = useState<About | null>(null);
   const [aboutOpen, setAboutOpen] = useState(false);
@@ -183,8 +235,17 @@ export default function App() {
   const [libraryLoading, setLibraryLoading] = useState(false);
   usePageLoad(libraryLoading, libraryReport?.done ?? 0, libraryReport?.total ?? 0);
   const libraryToken = useRef<object>({});
+  const pendingLocations = useRef<string[]>([]);
   const selectedIds = selectionOrder;
   const canAnalyze = folder != null && selectedIds.length >= 1 && selectedIds.length <= MAX_SELECTED;
+  const emptyMessage =
+    catalog === "Sessions" && rows.length === 0
+      ? locations.length === 0
+        ? "Add a data location to list sessions."
+        : "No sessions in the saved locations."
+      : catalog === "Exams" && exams.length === 0
+        ? "No DICOM exams in the saved locations."
+        : null;
   const host = useRef<HTMLDivElement>(null);
 
   const order = useMemo(() => {
@@ -217,30 +278,11 @@ export default function App() {
           foreground: [],
           palette: [],
         },
-        (report, payload) => {
+        (report) => {
           if (libraryToken.current !== mine) {
             return;
           }
           setLibraryReport(report.finished ? null : report);
-          if (payload == null) {
-            return;
-          }
-          const opened = JSON.parse(new TextDecoder().decode(payload)) as {
-            root: string;
-            rows: LibraryRow[];
-            selected?: string[];
-          };
-          if (report.finished) {
-            setFolder(opened.root);
-            setRows(opened.rows);
-            setSelectionOrder(selectionFromLibrary(opened.rows, opened.selected));
-            dismissNotice();
-            setUndo([]);
-            setRedo([]);
-          } else if (opened.rows.length > 0) {
-            setFolder(opened.root);
-            setRows(opened.rows);
-          }
         },
         () => libraryToken.current !== mine,
       );
@@ -250,6 +292,96 @@ export default function App() {
       }
     }
   }, []);
+
+  const applyCatalog = useCallback((payload: CatalogPayload) => {
+    setLocations(payload.locations);
+    setRows(payload.rows);
+    setExams(payload.exams);
+    setSelectionOrder(payload.selected);
+  }, []);
+
+  const pullCatalog = useCallback(async () => {
+    applyCatalog(await invoke<CatalogPayload>("scan_kit_read_catalog"));
+  }, [applyCatalog]);
+
+  const indexLocation = useCallback(
+    async (path: string): Promise<"ok" | "auth" | "error"> => {
+      try {
+        await loadFolder(path);
+        return "ok";
+      } catch (error: unknown) {
+        if (authenticationRequired(error)) {
+          setPassword("");
+          setPasswordFor(path);
+          return "auth";
+        }
+        notifyError(error);
+        return "error";
+      }
+    },
+    [loadFolder],
+  );
+
+  const openLocation = useCallback(
+    async (path: string) => {
+      const result = await indexLocation(path);
+      if (result !== "ok") {
+        return;
+      }
+      try {
+        await pullCatalog();
+        dismissNotice();
+        setUndo([]);
+        setRedo([]);
+        setLocationDraft("");
+      } catch (error: unknown) {
+        notifyError(error);
+      }
+    },
+    [indexLocation, pullCatalog],
+  );
+
+  const indexMany = useCallback(
+    async (roots: string[]) => {
+      let stopped = -1;
+      for (let index = 0; index < roots.length; index += 1) {
+        const root = roots[index];
+        if (root == null) {
+          continue;
+        }
+        const result = await indexLocation(root);
+        if (result === "auth") {
+          stopped = index;
+          break;
+        }
+      }
+      pendingLocations.current = stopped >= 0 ? roots.slice(stopped + 1) : [];
+      try {
+        await pullCatalog();
+        dismissNotice();
+        setUndo([]);
+        setRedo([]);
+      } catch (error: unknown) {
+        notifyError(error);
+      }
+    },
+    [indexLocation, pullCatalog],
+  );
+
+  const refreshLocations = useCallback(async () => {
+    await indexMany(locations);
+  }, [indexMany, locations]);
+
+  const removeLocation = useCallback(
+    async (path: string) => {
+      try {
+        applyCatalog(await invoke<CatalogPayload>("scan_kit_forget_data_dir", { path }));
+      } catch (error: unknown) {
+        notifyError(error);
+      }
+    },
+    [applyCatalog],
+  );
 
   useEffect(() => {
     installDebugLog();
@@ -284,12 +416,14 @@ export default function App() {
           logError(error);
         }
       });
-    invoke<string | null>("scan_kit_last_data_dir")
-      .then((path) => {
-        if (active && path) {
-          return loadFolder(path);
+    invoke<string[]>("scan_kit_data_dirs")
+      .then(async (roots) => {
+        if (!active || roots.length === 0) {
+          return;
         }
-        return undefined;
+        if (active) {
+          await indexMany(roots);
+        }
       })
       .catch((error: unknown) => {
         if (active) {
@@ -301,7 +435,7 @@ export default function App() {
       libraryToken.current = {};
       cancelAnimationFrame(frame);
     };
-  }, [loadFolder]);
+  }, [indexMany]);
 
   useEffect(() => {
     const node = host.current;
@@ -413,7 +547,7 @@ export default function App() {
   );
 
   const commitSelection = useCallback((next: { ids: string[]; capped: boolean }) => {
-    if (folder == null) {
+    if (locations.length === 0) {
       return;
     }
     const same =
@@ -425,19 +559,27 @@ export default function App() {
       }
       return;
     }
-    void invoke("scan_kit_select_sessions", { path: folder, sessionIds: next.ids })
-      .then(() => {
-        const chosen = new Set(next.ids);
-        setSelectionOrder(next.ids);
-        setRows((items) => items.map((item) => ({ ...item, selected: chosen.has(item.session_id) })));
-        if (next.capped) {
-          notify("At most five sessions can be selected.", "selection");
-        } else {
-          dismissNotice("selection");
-        }
-      })
-      .catch((error: unknown) => notifyError(error));
-  }, [folder, selectionOrder]);
+    void (async () => {
+      for (const root of locations) {
+        const sessionIds = next.ids.flatMap((id) => {
+          const row = rows.find((item) => item.session_id === id);
+          if ((row?.library ?? locations[0]) !== root) {
+            return [];
+          }
+          return [row?.folder_id ?? id];
+        });
+        await invoke("scan_kit_select_sessions", { path: root, sessionIds });
+      }
+      const chosen = new Set(next.ids);
+      setSelectionOrder(next.ids);
+      setRows((items) => items.map((item) => ({ ...item, selected: chosen.has(item.session_id) })));
+      if (next.capped) {
+        notify("At most five sessions can be selected.", "selection");
+      } else {
+        dismissNotice("selection");
+      }
+    })().catch((error: unknown) => notifyError(error));
+  }, [locations, rows, selectionOrder]);
 
   const onRowCheck = useCallback(
     (sessionId: string, checked: boolean) => {
@@ -458,14 +600,16 @@ export default function App() {
   }, [commitSelection, displayIds, rows.length, selectedIds]);
 
   const writeNote = useCallback(async (sessionId: string, note: string) => {
-    if (folder == null) {
+    const row = rows.find((item) => item.session_id === sessionId);
+    const path = row?.library ?? locations[0];
+    if (path == null) {
       return;
     }
-    await invoke("scan_kit_set_note", { path: folder, sessionId, note });
+    await invoke("scan_kit_set_note", { path, sessionId: row?.folder_id ?? sessionId, note });
     setRows((current) =>
-      current.map((row) => (row.session_id === sessionId ? { ...row, note } : row)),
+      current.map((item) => (item.session_id === sessionId ? { ...item, note } : item)),
     );
-  }, [folder]);
+  }, [locations, rows]);
 
   const commitNote = useCallback(
     (edit: NoteEdit) => {
@@ -496,7 +640,7 @@ export default function App() {
         title: "Open Data Folder",
       });
       if (typeof selected === "string") {
-        await loadFolder(selected);
+        await openLocation(selected);
       }
     } catch (error) {
       notifyError(error);
@@ -535,7 +679,7 @@ export default function App() {
               disabled={folder == null}
               onClick={() => {
                 if (folder != null) {
-                  void loadFolder(folder).catch((error: unknown) => notifyError(error));
+                  void openLocation(folder);
                 }
               }}
             >
@@ -675,28 +819,45 @@ export default function App() {
             <Button
               variant="outline"
               size="sm"
-              disabled={folder == null}
+              disabled={locations.length === 0}
               onClick={() => {
-                if (folder != null) {
-                  void loadFolder(folder).catch((error: unknown) => notifyError(error));
-                }
+                void refreshLocations();
               }}
             >
               <RefreshCw />
               Refresh
             </Button>
+            <Button variant="outline" size="sm" onClick={() => setLocationsOpen(true)}>
+              <FolderOpen />
+              Locations
+            </Button>
+            <ButtonSegmentGroup
+              label="Catalog"
+              className="w-fit shrink-0"
+              options={["Sessions", "Exams"]}
+              value={catalog}
+              onChange={(value) => {
+                if (value === "Sessions" || value === "Exams") {
+                  setCatalog(value);
+                }
+              }}
+            />
             <div className="ml-auto flex items-center gap-2">
-              {PRIMARY_ANALYSES.map((name) => (
-                <Button key={name} size="sm" disabled={!canAnalyze} onClick={() => openAnalysis(name)}>
-                  <AnalysisIcon name={name} />
-                  {name}
-                </Button>
-              ))}
-              <AnalysisMenu
-                disabled={!canAnalyze}
-                omit={PRIMARY_ANALYSES}
-                onOpen={openAnalysis}
-              />
+              {catalog === "Sessions"
+                ? PRIMARY_ANALYSES.map((name) => (
+                    <Button key={name} size="sm" disabled={!canAnalyze} onClick={() => openAnalysis(name)}>
+                      <AnalysisIcon name={name} />
+                      {name}
+                    </Button>
+                  ))
+                : null}
+              {catalog === "Sessions" ? (
+                <AnalysisMenu
+                  disabled={!canAnalyze}
+                  omit={PRIMARY_ANALYSES}
+                  onOpen={openAnalysis}
+                />
+              ) : null}
             </div>
           </div>
           <div
@@ -704,7 +865,7 @@ export default function App() {
             className="relative min-h-0 flex-1 overflow-hidden"
             onContextMenu={(event) => event.preventDefault()}
           >
-            {theme != null && size.width > 0 && size.height > 0 ? (
+            {emptyMessage == null && theme != null && size.width > 0 && size.height > 0 && catalog === "Sessions" ? (
               <LibraryTable
                 rows={rows}
                 order={order}
@@ -725,14 +886,17 @@ export default function App() {
                 onOpenMenu={setSessionMenu}
               />
             ) : null}
-            {rows.length === 0 ? (
-              <p className="text-muted-foreground pointer-events-none absolute inset-x-0 top-12 text-center text-sm">
-                {folder == null
-                  ? "Open a data folder to list sessions."
-                  : "No sessions in this folder."}
-              </p>
+            {emptyMessage == null && theme != null && size.width > 0 && size.height > 0 && catalog === "Exams" ? (
+              <ExamTable rows={exams} theme={theme} width={size.width} height={size.height} />
             ) : null}
-            {sessionMenu != null ? (
+            {emptyMessage != null ? (
+              <CatalogEmpty
+                name={catalog}
+                message={emptyMessage}
+                onLocations={() => setLocationsOpen(true)}
+              />
+            ) : null}
+            {catalog === "Sessions" && sessionMenu != null ? (
               <SessionContextMenu
                 sessionId={sessionMenu.sessionId}
                 x={sessionMenu.x}
@@ -836,6 +1000,119 @@ export default function App() {
               </p>
             </div>
           ) : null}
+        </DialogContent>
+      </Dialog>
+      <Dialog open={locationsOpen} onOpenChange={setLocationsOpen}>
+        <DialogContent className="sm:max-w-3xl">
+          <DialogHeader>
+            <DialogTitle>Locations</DialogTitle>
+            <DialogDescription>
+              Sessions and exams from every location are listed together.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="flex max-h-60 flex-col gap-2 overflow-auto">
+            {locations.length === 0 ? (
+              <p className="text-muted-foreground text-sm">No saved locations.</p>
+            ) : (
+              locations.map((root) => (
+                <div key={root} className="flex items-center gap-2">
+                  <span className="min-w-0 flex-1 truncate text-sm" title={root}>
+                    {root}
+                  </span>
+                  <Button variant="outline" size="sm" onClick={() => void removeLocation(root)}>
+                    <Trash2 />
+                    Remove
+                  </Button>
+                </div>
+              ))
+            )}
+          </div>
+          <form
+            className="flex items-center gap-2"
+            onSubmit={(event) => {
+              event.preventDefault();
+              const spec = locationDraft.trim();
+              if (spec.length > 0) {
+                void openLocation(spec);
+              }
+            }}
+          >
+            <Input
+              value={locationDraft}
+              placeholder="Folder, UNC, or sftp://user@host/path"
+              aria-label="Folder, UNC, or sftp://user@host/path"
+              onChange={(event) => setLocationDraft(event.target.value)}
+            />
+            <Button type="submit">
+              <Plus />
+              Add
+            </Button>
+          </form>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => void chooseFolder()}>
+              <FolderOpen />
+              Folder
+            </Button>
+            <DialogClose render={<Button variant="outline" />}>
+              <X />
+              Close
+            </DialogClose>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+      <Dialog
+        open={passwordFor != null}
+        onOpenChange={(open) => {
+          if (!open) {
+            setPasswordFor(null);
+            setPassword("");
+          }
+        }}
+      >
+        <DialogContent>
+          <form
+            className="grid gap-4"
+            onSubmit={(event) => {
+              event.preventDefault();
+              if (passwordFor == null) {
+                return;
+              }
+              const spec = passwordFor;
+              void invoke("scan_kit_remember_password", { path: spec, password })
+                .then(() => {
+                  setPassword("");
+                  setPasswordFor(null);
+                  const rest = pendingLocations.current;
+                  pendingLocations.current = [];
+                  return indexMany([spec, ...rest]);
+                })
+                .catch((error: unknown) => notifyError(error));
+            }}
+          >
+            <DialogHeader>
+              <DialogTitle>Password</DialogTitle>
+              <DialogDescription>
+                {passwordFor} needs a password. It stays in memory for this session.
+              </DialogDescription>
+            </DialogHeader>
+            <Input
+              type="password"
+              autoComplete="off"
+              aria-label="Password"
+              value={password}
+              onChange={(event) => setPassword(event.target.value)}
+            />
+            <DialogFooter>
+              <DialogClose render={<Button variant="outline" />}>
+                <X />
+                Cancel
+              </DialogClose>
+              <Button type="submit">
+                <FolderOpen />
+                Open
+              </Button>
+            </DialogFooter>
+          </form>
         </DialogContent>
       </Dialog>
       <Toaster />

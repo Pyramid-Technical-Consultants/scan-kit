@@ -1,7 +1,11 @@
-//! Local session discovery. Archives are read in memory and not unpacked.
+//! Session discovery. Archives are read in memory and not unpacked.
 //!
-//! ponytail: directory walks stop at depth 6, which covers `layer-N/run-M`.
-//! A session laid out deeper than that needs a longer walk.
+//! A library walk classifies each directory once. A session or a DICOM exam is
+//! not walked further. Anything else is a container, up to eight levels.
+//! Symlinks are not followed. A file walk inside one session is separate.
+//!
+//! ponytail: directory walks inside a session stop at depth 6, which covers
+//! `layer-N/run-M`. A session laid out deeper than that needs a longer walk.
 
 use std::collections::HashMap;
 use std::fs::{self, File};
@@ -25,49 +29,250 @@ pub struct Discovered {
     pub kind: &'static str,
 }
 
-pub fn discover_entries(root: &Path) -> Result<Vec<Discovered>, String> {
-    let mut children = match fs::read_dir(root) {
-        Ok(entries) => entries.filter_map(|entry| entry.ok()).collect::<Vec<_>>(),
-        Err(_) => return Ok(Vec::new()),
-    };
-    children.sort_by_key(|entry| entry.file_name());
+#[derive(Clone, Debug)]
+pub(crate) struct ExamHit {
+    pub study_uid: String,
+    pub folder_name: String,
+    pub storage_path: PathBuf,
+    pub patient_name: String,
+    pub patient_id: String,
+    pub study_date: String,
+    pub study_description: String,
+    pub file_count: i64,
+}
 
-    let mut seen: Vec<Discovered> = Vec::new();
-    for entry in &children {
-        let path = entry.path();
-        if path.is_dir() && is_unpacked_session(&path) {
-            let Some(session_id) = file_name(&path) else {
-                continue;
-            };
-            seen.push(Discovered {
+pub(crate) struct Found {
+    pub entries: Vec<Discovered>,
+    pub skipped: Vec<String>,
+    pub exams: Vec<ExamHit>,
+}
+
+pub(crate) fn discover(root: &Path) -> Result<Found, String> {
+    let text = root.to_string_lossy();
+    if crate::location::is_remote_location(&text) {
+        return crate::location::discover_remote(&text);
+    }
+    let mut entries = Vec::new();
+    let mut skipped = Vec::new();
+    let mut archives = Vec::new();
+    let mut exams = Vec::new();
+    if is_unpacked_session(root) {
+        if let Some(session_id) = file_name(root) {
+            add_directory(
+                &mut entries,
+                &mut skipped,
+                Discovered {
+                    session_id,
+                    storage_path: root.to_path_buf(),
+                    kind: "directory",
+                },
+                "",
+            );
+        }
+    } else if let Some(exam) = exam_in(root) {
+        add_exam(&mut exams, &mut skipped, exam, "");
+    } else {
+        walk_local(
+            root,
+            root,
+            0,
+            &mut entries,
+            &mut skipped,
+            &mut archives,
+            &mut exams,
+        );
+    }
+    add_archives(&mut entries, &mut skipped, archives);
+    exams.sort_by(|left, right| left.folder_name.cmp(&right.folder_name));
+    Ok(Found {
+        entries,
+        skipped,
+        exams,
+    })
+}
+
+fn walk_local(
+    library: &Path,
+    dir: &Path,
+    depth: u32,
+    entries: &mut Vec<Discovered>,
+    skipped: &mut Vec<String>,
+    archives: &mut Vec<(Discovered, String)>,
+    exams: &mut Vec<ExamHit>,
+) {
+    if depth >= crate::location::NEST_DEPTH {
+        return;
+    }
+    let Ok(read) = fs::read_dir(dir) else {
+        return;
+    };
+    let mut children: Vec<_> = read.filter_map(|entry| entry.ok()).collect();
+    children.sort_by_key(|entry| entry.file_name());
+    let mut sessions = Vec::new();
+    for child in &children {
+        let Ok(kind) = child.file_type() else {
+            continue;
+        };
+        if kind.is_symlink() || !kind.is_dir() {
+            continue;
+        }
+        let path = child.path();
+        if !is_unpacked_session(&path) {
+            continue;
+        }
+        let Some(session_id) = file_name(&path) else {
+            continue;
+        };
+        let rel = relative(library, &path);
+        add_directory(
+            entries,
+            skipped,
+            Discovered {
                 session_id,
                 storage_path: path,
                 kind: "directory",
-            });
-        }
+            },
+            &rel,
+        );
+        sessions.push(child.file_name());
     }
-    for entry in &children {
-        let path = entry.path();
-        if !path.is_file() {
+    for child in &children {
+        let Ok(kind) = child.file_type() else {
+            continue;
+        };
+        if kind.is_symlink() || !kind.is_file() {
             continue;
         }
+        let path = child.path();
         let Some((session_id, kind)) = archive_identity(&path) else {
             continue;
         };
-        if seen.iter().any(|item| item.session_id == session_id) {
+        archives.push((
+            Discovered {
+                session_id,
+                storage_path: path,
+                kind,
+            },
+            relative(library, &child.path()),
+        ));
+    }
+    for child in &children {
+        let Ok(kind) = child.file_type() else {
+            continue;
+        };
+        if kind.is_symlink()
+            || !kind.is_dir()
+            || sessions.iter().any(|name| name == &child.file_name())
+        {
             continue;
         }
-        seen.push(Discovered {
-            session_id,
-            storage_path: path,
-            kind,
-        });
+        let path = child.path();
+        if let Some(exam) = exam_in(&path) {
+            add_exam(exams, skipped, exam, &relative(library, &path));
+            continue;
+        }
+        walk_local(library, &path, depth + 1, entries, skipped, archives, exams);
     }
-    seen.sort_by(|left, right| left.session_id.cmp(&right.session_id));
-    Ok(seen)
+}
+
+fn exam_in(dir: &Path) -> Option<ExamHit> {
+    let folder_name = file_name(dir)?;
+    let mut files = Vec::new();
+    let mut count = 0i64;
+    for entry in fs::read_dir(dir).ok()?.flatten() {
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        if kind.is_symlink() {
+            continue;
+        }
+        count += 1;
+        if kind.is_file() {
+            files.push(entry.path());
+        }
+    }
+    files.sort();
+    let sample = files
+        .into_iter()
+        .find(|path| scan_kit_dicom::file_is_dicom(path))?;
+    let peek = scan_kit_dicom::peek_file(&sample);
+    let study_uid = if peek.study_uid.is_empty() {
+        folder_name.clone()
+    } else {
+        peek.study_uid
+    };
+    Some(ExamHit {
+        study_uid,
+        folder_name,
+        storage_path: dir.to_path_buf(),
+        patient_name: peek.patient_name,
+        patient_id: peek.patient_id,
+        study_date: peek.study_date,
+        study_description: peek.study_description,
+        file_count: count,
+    })
+}
+
+pub(crate) fn add_exam(
+    exams: &mut Vec<ExamHit>,
+    skipped: &mut Vec<String>,
+    exam: ExamHit,
+    rel: &str,
+) {
+    if exams.iter().any(|have| have.study_uid == exam.study_uid) {
+        skipped.push(format!("{} ({rel})", exam.study_uid));
+        return;
+    }
+    exams.push(exam);
+}
+
+pub(crate) fn add_directory(
+    entries: &mut Vec<Discovered>,
+    skipped: &mut Vec<String>,
+    entry: Discovered,
+    rel: &str,
+) {
+    if entries
+        .iter()
+        .any(|have| have.session_id == entry.session_id)
+    {
+        skipped.push(format!("{} ({rel})", entry.session_id));
+        return;
+    }
+    entries.push(entry);
+}
+
+pub(crate) fn add_archives(
+    entries: &mut Vec<Discovered>,
+    skipped: &mut Vec<String>,
+    archives: Vec<(Discovered, String)>,
+) {
+    for (entry, rel) in archives {
+        if entries
+            .iter()
+            .any(|have| have.session_id == entry.session_id)
+        {
+            skipped.push(format!("{} ({rel})", entry.session_id));
+            continue;
+        }
+        entries.push(entry);
+    }
+    entries.sort_by(|left, right| left.session_id.cmp(&right.session_id));
+    skipped.sort();
+}
+
+fn relative(library: &Path, path: &Path) -> String {
+    path.strip_prefix(library)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
 }
 
 pub fn storage_fingerprint(storage: &Path, session_id: &str) -> Option<(i64, i64)> {
+    let text = storage.to_string_lossy();
+    if crate::location::is_remote_location(&text) {
+        return crate::location::remote_fingerprint(&text, session_id);
+    }
     let target = if storage.is_dir() {
         let outer = storage.join("termination_summary.txt");
         let inner = storage.join(session_id).join("termination_summary.txt");
@@ -91,6 +296,10 @@ pub fn storage_fingerprint(storage: &Path, session_id: &str) -> Option<(i64, i64
 }
 
 pub fn read_session_file(storage: &Path, session_id: &str, filename: &str) -> Option<Vec<u8>> {
+    let text = storage.to_string_lossy();
+    if crate::location::is_remote_location(&text) {
+        return crate::location::read_remote_session_file(&text, session_id, filename);
+    }
     if storage.is_dir() {
         let root = directory_session_root(storage, session_id);
         return fs::read(root.join(filename)).ok();
@@ -168,6 +377,12 @@ pub fn session_directory(library: &Path, session_id: &str) -> PathBuf {
     if library.join("input_map.csv").is_file() {
         return library.to_path_buf();
     }
+    if let Some(recorded) = crate::location::recorded_directory(library, session_id) {
+        return recorded;
+    }
+    if let Some(catalog) = crate::location::catalog_directory(library, session_id) {
+        return catalog;
+    }
     flat
 }
 
@@ -175,8 +390,7 @@ fn directory_session_root(folder: &Path, session_id: &str) -> PathBuf {
     session_directory(folder, session_id)
 }
 
-fn archive_identity(path: &Path) -> Option<(String, &'static str)> {
-    let name = file_name(path)?;
+pub(crate) fn archive_kind(name: &str) -> Option<(String, &'static str)> {
     let lower = name.to_ascii_lowercase();
     for (suffix, kind) in ARCHIVE_SUFFIXES {
         if lower.ends_with(suffix) {
@@ -184,10 +398,14 @@ fn archive_identity(path: &Path) -> Option<(String, &'static str)> {
             if session_id.is_empty() {
                 return None;
             }
-            return Some((session_id, kind));
+            return Some((session_id, *kind));
         }
     }
     None
+}
+
+fn archive_identity(path: &Path) -> Option<(String, &'static str)> {
+    archive_kind(&file_name(path)?)
 }
 
 fn file_name(path: &Path) -> Option<String> {
@@ -481,4 +699,46 @@ pub fn write_zip(path: &Path, members: &[(&str, &[u8])]) -> Result<(), String> {
     }
     zip.finish().map_err(|err| err.to_string())?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_walk_stops_at_eight_levels() {
+        let root = std::env::temp_dir().join(format!(
+            "scan-kit-nest-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let mut seen = root.clone();
+        for index in 0..7 {
+            seen.push(format!("n{index}"));
+        }
+        seen.push("seen");
+        fs::create_dir_all(&seen).unwrap();
+        fs::write(seen.join("input_map.csv"), b"energy\n1\n").unwrap();
+        let mut miss = root.clone();
+        for index in 0..8 {
+            miss.push(format!("n{index}"));
+        }
+        miss.push("miss");
+        fs::create_dir_all(&miss).unwrap();
+        fs::write(miss.join("input_map.csv"), b"energy\n1\n").unwrap();
+
+        let ids = discover(&root)
+            .unwrap()
+            .entries
+            .into_iter()
+            .map(|entry| entry.session_id)
+            .collect::<Vec<_>>();
+        assert!(ids.contains(&"seen".to_owned()), "{ids:?}");
+        assert!(!ids.contains(&"miss".to_owned()), "{ids:?}");
+        let _ = fs::remove_dir_all(&root);
+    }
 }

@@ -12,7 +12,8 @@ pub use patient::{
 };
 pub use phantom::{phantom_summary, write_phantom_study};
 
-use std::fs;
+use std::fs::{self, File};
+use std::io::Read;
 use std::path::Path;
 
 use scan_kit_core::{dvh, ToolKind, ToolSpec};
@@ -193,6 +194,101 @@ fn is_dicom(bytes: &[u8]) -> bool {
     bytes.len() > 132 && &bytes[128..132] == b"DICM"
 }
 
+const PEEK_CAP: usize = 4 * 1024 * 1024;
+
+/// Header fields read from one file, stopping at the pixel-data tag.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct StudyPeek {
+    pub study_uid: String,
+    pub patient_name: String,
+    pub patient_id: String,
+    pub study_date: String,
+    pub study_description: String,
+}
+
+pub fn looks_like_dicom(bytes: &[u8]) -> bool {
+    bytes.len() >= 132 && &bytes[128..132] == b"DICM"
+}
+
+/// Read study tags from the start of an explicit little-endian file.
+///
+/// Stops at the pixel-data tag or after 4 MiB, so a CT slice is not pulled in.
+pub fn peek_study(bytes: &[u8]) -> StudyPeek {
+    let mut out = StudyPeek::default();
+    if !looks_like_dicom(bytes) {
+        return out;
+    }
+    let limit = bytes.len().min(PEEK_CAP);
+    let mut cursor = 132usize;
+    while cursor + 8 <= limit {
+        let group = u16::from_le_bytes([bytes[cursor], bytes[cursor + 1]]);
+        let element = u16::from_le_bytes([bytes[cursor + 2], bytes[cursor + 3]]);
+        if group == 0x7FE0 && element == 0x0010 {
+            break;
+        }
+        let vr = &bytes[cursor + 4..cursor + 6];
+        let Some((length, header)) = value_length(vr, &bytes[cursor + 6..]) else {
+            break;
+        };
+        let Some(start) = cursor.checked_add(6 + header) else {
+            break;
+        };
+        let Some(end) = start.checked_add(length) else {
+            break;
+        };
+        if end > limit {
+            break;
+        }
+        let text = dicom_text(&bytes[start..end]);
+        match (group, element) {
+            (0x0020, 0x000D) => out.study_uid = text,
+            (0x0010, 0x0010) => out.patient_name = text.replace('^', " "),
+            (0x0010, 0x0020) => out.patient_id = text,
+            (0x0008, 0x0020) => out.study_date = text,
+            (0x0008, 0x1030) => out.study_description = text,
+            _ => {}
+        }
+        cursor = end;
+    }
+    out
+}
+
+pub fn peek_file(path: &Path) -> StudyPeek {
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(_) => return StudyPeek::default(),
+    };
+    let mut bytes = vec![0u8; PEEK_CAP];
+    let Ok(read) = file.read(&mut bytes) else {
+        return StudyPeek::default();
+    };
+    bytes.truncate(read);
+    peek_study(&bytes)
+}
+
+/// `.dcm`, or the `DICM` preamble at byte 128. The name is enough for `.dcm`.
+pub fn file_is_dicom(path: &Path) -> bool {
+    if path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("dcm"))
+    {
+        return true;
+    }
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(_) => return false,
+    };
+    let mut head = [0u8; 132];
+    file.read_exact(&mut head).is_ok() && looks_like_dicom(&head)
+}
+
+fn dicom_text(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes)
+        .trim_matches(|ch: char| ch == '\0' || ch.is_whitespace())
+        .to_owned()
+}
+
 fn read_entry(path: &Path) -> Option<DicomEntry> {
     let bytes = fs::read(path).ok()?;
     if !is_dicom(&bytes) {
@@ -324,5 +420,41 @@ mod tests {
         .unwrap();
         assert_eq!(opened["entries"].as_array().unwrap().len(), 2);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn peek_stops_at_pixel_data_and_reads_the_study_header() {
+        let mut bytes = vec![0u8; 128];
+        bytes.extend_from_slice(b"DICM");
+        push_tag(&mut bytes, 0x0010, 0x0010, b"PN", "Doe^Jane");
+        push_tag(&mut bytes, 0x0010, 0x0020, b"LO", "P1");
+        push_tag(&mut bytes, 0x0008, 0x0020, b"DA", "20260102");
+        push_tag(&mut bytes, 0x0008, 0x1030, b"LO", "Head");
+        push_tag(&mut bytes, 0x0020, 0x000D, b"UI", "1.2.3");
+        bytes.extend_from_slice(&0x7FE0u16.to_le_bytes());
+        bytes.extend_from_slice(&0x0010u16.to_le_bytes());
+        bytes.extend_from_slice(b"OB");
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes.extend_from_slice(&u32::MAX.to_le_bytes());
+        let peek = peek_study(&bytes);
+        assert_eq!(peek.patient_name, "Doe Jane");
+        assert_eq!(peek.patient_id, "P1");
+        assert_eq!(peek.study_date, "20260102");
+        assert_eq!(peek.study_description, "Head");
+        assert_eq!(peek.study_uid, "1.2.3");
+        assert!(looks_like_dicom(&bytes));
+        assert!(!looks_like_dicom(b"nope"));
+    }
+
+    fn push_tag(bytes: &mut Vec<u8>, group: u16, element: u16, vr: &[u8], text: &str) {
+        let mut value = text.as_bytes().to_vec();
+        if value.len() % 2 == 1 {
+            value.push(b' ');
+        }
+        bytes.extend_from_slice(&group.to_le_bytes());
+        bytes.extend_from_slice(&element.to_le_bytes());
+        bytes.extend_from_slice(vr);
+        bytes.extend_from_slice(&(u16::try_from(value.len()).unwrap_or(u16::MAX)).to_le_bytes());
+        bytes.extend(value);
     }
 }

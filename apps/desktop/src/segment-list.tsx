@@ -1,3 +1,5 @@
+import { X } from "lucide-react";
+
 import { ButtonSegmentGroup } from "@/components/button-segment-group";
 import { Button } from "@/components/ui/button";
 import { Field, FieldLabel } from "@/components/ui/field";
@@ -117,11 +119,12 @@ export function SegmentList({
             <Button
               type="button"
               variant="ghost"
-              size="sm"
+              size="icon-sm"
               aria-label={`Remove ${label}`}
+              title={`Remove ${label}`}
               onClick={() => commit(removeSegment(items, index))}
             >
-              Remove
+              <X />
             </Button>
           </Field>
         );

@@ -26,7 +26,10 @@
 
 use std::num::NonZeroU64;
 
-use scan_kit_core::{format_tick, project, ticks, Camera, Panel, PlotRect, PlotScene, Series};
+use scan_kit_core::{
+    format_tick, project, robust_limits, ticks, time_window, Camera, Panel, PlotRect, PlotScene,
+    Series,
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -620,6 +623,71 @@ impl Plot {
                 self.cameras[index] = previous.cameras[index];
             }
         }
+    }
+
+    /// Slide time-panel cameras to `[lo, hi]`. `on == false` restores the full
+    /// traces. A zoom sticks when `force` is false. Spectrum (`Hz`) and side
+    /// panels stay put. Marks are not rebuilt.
+    #[cfg_attr(not(any(test, target_arch = "wasm32")), allow(dead_code))]
+    pub(crate) fn follow_time(&mut self, on: bool, lo: f32, hi: f32, force: bool) {
+        let (lo, hi) = if on {
+            (lo, hi)
+        } else {
+            (f32::NEG_INFINITY, f32::INFINITY)
+        };
+        let mut fits = Vec::new();
+        let mut x_lo = f32::MAX;
+        let mut x_hi = f32::MIN;
+        for index in 0..self.panels.len() {
+            if !self.is_time_panel(index) {
+                continue;
+            }
+            if !force && self.cameras[index] != self.home[index] {
+                continue;
+            }
+            let span = self.panel_span(index, lo, hi);
+            if let Some((start, end, _, _)) = span {
+                x_lo = x_lo.min(start);
+                x_hi = x_hi.max(end);
+            }
+            fits.push((index, span));
+        }
+        let shared = (x_lo <= x_hi).then(|| time_window(x_lo, x_hi));
+        for (index, span) in fits {
+            let Some((xmin, xmax)) = shared.or_else(|| {
+                (on && lo.is_finite() && hi.is_finite() && hi >= lo).then(|| time_window(lo, hi))
+            }) else {
+                continue;
+            };
+            let (ymin, ymax) = span.map_or(
+                (self.cameras[index].ymin, self.cameras[index].ymax),
+                |(_, _, low, high)| (low, high),
+            );
+            let camera = Camera {
+                xmin,
+                xmax,
+                ymin,
+                ymax,
+            };
+            self.cameras[index] = camera;
+            self.home[index] = camera;
+        }
+    }
+
+    #[cfg_attr(not(any(test, target_arch = "wasm32")), allow(dead_code))]
+    fn is_time_panel(&self, index: usize) -> bool {
+        self.panels
+            .get(index)
+            .is_some_and(|panel| panel.x_label != "Hz")
+            && index + (self.side as usize) < self.panels.len()
+    }
+
+    #[cfg_attr(not(any(test, target_arch = "wasm32")), allow(dead_code))]
+    fn panel_span(&self, index: usize, lo: f32, hi: f32) -> Option<(f32, f32, f32, f32)> {
+        let batch = self.marks.panels.get(index)?;
+        let start = batch.line_start as usize;
+        let end = start + batch.line_count as usize;
+        follow_span(self.marks.lines.get(start..end)?, lo, hi)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -1661,6 +1729,66 @@ fn solid_quad(a: [f32; 2], b: [f32; 2], color: [f32; 4], id: u32) -> QuadRec {
         id,
         heatmap: None,
     }
+}
+
+#[cfg_attr(not(any(test, target_arch = "wasm32")), allow(dead_code))]
+/// Raw x extent and the padded y extent of one panel's strokes inside `[lo, hi]`.
+///
+/// ponytail: each playhead step walks every segment in the panel. A multi-minute
+/// timeslice is a few hundred thousand of them. Binary-search each stroke if a
+/// profile shows this scan.
+fn follow_span(lines: &[LineRec], lo: f32, hi: f32) -> Option<(f32, f32, f32, f32)> {
+    let mut x_lo = f32::MAX;
+    let mut x_hi = f32::MIN;
+    let mut y_lo = f32::MAX;
+    let mut y_hi = f32::MIN;
+    let mut index = 0;
+    while index < lines.len() {
+        if lines[index].id == 0 {
+            index += 1;
+            continue;
+        }
+        let id = lines[index].id;
+        let start = index;
+        let mut end = index;
+        while end + 1 < lines.len() && lines[end + 1].id == id {
+            end += 1;
+        }
+        let mut ys = Vec::new();
+        let mut previous: Option<[f32; 3]> = None;
+        for line in &lines[start..=end] {
+            if previous != Some(line.a) {
+                take_vertex(&mut ys, &mut x_lo, &mut x_hi, line.a, lo, hi);
+            }
+            take_vertex(&mut ys, &mut x_lo, &mut x_hi, line.b, lo, hi);
+            previous = Some(line.b);
+        }
+        if let Some((low, high)) = robust_limits(&ys) {
+            y_lo = y_lo.min(low);
+            y_hi = y_hi.max(high);
+        }
+        index = end + 1;
+    }
+    (x_lo <= x_hi && y_lo <= y_hi).then_some((x_lo, x_hi, y_lo, y_hi))
+}
+
+#[cfg_attr(not(any(test, target_arch = "wasm32")), allow(dead_code))]
+fn take_vertex(
+    ys: &mut Vec<f32>,
+    x_lo: &mut f32,
+    x_hi: &mut f32,
+    point: [f32; 3],
+    lo: f32,
+    hi: f32,
+) {
+    let x = point[0];
+    let y = point[1];
+    if !x.is_finite() || !y.is_finite() || x < lo || x > hi {
+        return;
+    }
+    *x_lo = x_lo.min(x);
+    *x_hi = x_hi.max(x);
+    ys.push(y);
 }
 
 fn push_polyline(
@@ -3203,6 +3331,75 @@ mod tests {
             near(&frame.rgba, 180, 140, sample, |pixel| pixel[0] > 150),
             "sample pixel {sample:?}"
         );
+    }
+
+    fn time_panel(x_label: &str, xmin: f32, xmax: f32, xs: Vec<f32>, ys: Vec<f32>) -> Panel {
+        Panel {
+            title: String::new(),
+            y_label: String::new(),
+            x_label: x_label.into(),
+            xmin,
+            xmax,
+            ymin: 0.0,
+            ymax: 10.0,
+            series: vec![Series::Polyline {
+                xs,
+                ys,
+                color: [1.0, 0.0, 0.0, 1.0],
+                thickness: 2.0,
+            }],
+            x_labels: Vec::new(),
+            equal: false,
+        }
+    }
+
+    #[test]
+    fn follow_time_slides_time_panels_and_leaves_the_rest() {
+        let scene = PlotScene {
+            title: "replay".into(),
+            panels: vec![
+                time_panel(
+                    "",
+                    0.0,
+                    10.0,
+                    vec![0.0, 1.0, 2.0, 3.0],
+                    vec![1.0, 1.0, 100.0, 1.0],
+                ),
+                time_panel("Hz", 1.0, 500.0, vec![10.0, 20.0], vec![0.0, 1.0]),
+                time_panel("mm", 2.0, 8.0, vec![2.0, 4.0], vec![3.0, 4.0]),
+            ],
+            controls: Vec::new(),
+            table: None,
+            columns: 2,
+            column_weights: vec![3.0, 1.4],
+            row_weights: Vec::new(),
+            side: 1,
+        };
+        let mut plot = Plot::new(&scene, [0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0, 1.0]);
+        let lines = plot.marks.lines.len();
+        let spectrum = plot.cameras[1];
+        let side = plot.cameras[2];
+        plot.follow_time(true, 0.0, 1.5, true);
+        let time = plot.cameras[0];
+        assert!(time.xmin >= 0.0 && time.xmin < 0.01, "{}", time.xmin);
+        assert!((time.xmax - 1.02).abs() < 1.0e-4, "{}", time.xmax);
+        assert!(
+            time.ymax < 2.0,
+            "the spike outside the window stays offscreen {}",
+            time.ymax
+        );
+        assert_eq!(plot.cameras[1], spectrum);
+        assert_eq!(plot.cameras[2], side);
+        assert_eq!(plot.marks.lines.len(), lines);
+        plot.zoom(0, 0.5, 1.0, 2.0);
+        let zoomed = plot.cameras[0];
+        plot.follow_time(true, 2.0, 3.0, false);
+        assert_eq!(plot.cameras[0], zoomed);
+        plot.follow_time(false, 0.0, 0.0, true);
+        assert!(plot.cameras[0].xmax > 3.0, "{}", plot.cameras[0].xmax);
+        assert!(plot.cameras[0].ymax > 50.0, "{}", plot.cameras[0].ymax);
+        assert_eq!(plot.cameras[1], spectrum);
+        assert_eq!(plot.marks.lines.len(), lines);
     }
 
     #[test]

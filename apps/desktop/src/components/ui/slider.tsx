@@ -7,8 +7,12 @@ function Slider({
   value,
   min = 0,
   max = 100,
+  marks = [],
   ...props
-}: SliderPrimitive.Root.Props) {
+}: SliderPrimitive.Root.Props & {
+  /** Times on the same scale as `value`. Drawn on the track, under the thumb. */
+  marks?: readonly number[]
+}) {
   const _values = Array.isArray(value)
     ? value
     : Array.isArray(defaultValue)
@@ -35,6 +39,26 @@ function Slider({
             data-slot="slider-range"
             className="bg-primary select-none data-horizontal:h-full data-vertical:w-full"
           />
+          {marks.map((mark) => {
+            const span = max - min
+            const fraction = span > 0 ? Math.min(1, Math.max(0, (mark - min) / span)) : 0
+            const at = _values[0] ?? min
+            return (
+              <span
+                key={mark}
+                data-slot="slider-mark"
+                data-passed={mark <= at ? "true" : "false"}
+                aria-hidden
+                className={cn(
+                  "pointer-events-none absolute inset-y-0 w-px -translate-x-1/2",
+                  mark <= at ? "bg-primary-foreground" : "bg-primary"
+                )}
+                style={{
+                  left: `calc(0.375rem + (100% - 0.75rem) * ${fraction})`,
+                }}
+              />
+            )
+          })}
         </SliderPrimitive.Track>
         {Array.from({ length: _values.length }, (_, index) => (
           <SliderPrimitive.Thumb

@@ -140,7 +140,9 @@ fn without_playhead(items: Vec<Segment>) -> Vec<Segment> {
         .collect()
 }
 
-fn scrub_range(options: &Value) -> Option<Segment> {
+/// `(lo, hi)` of the playhead window, or nothing when the timeline is off.
+/// `before` starts at negative infinity. The one-second window starts one second earlier.
+pub fn scrub_limits(options: &Value) -> Option<(f32, f32)> {
     let value = scrub_value(options)?;
     if value.get("on").and_then(Value::as_bool) != Some(true) {
         return None;
@@ -148,10 +150,15 @@ fn scrub_range(options: &Value) -> Option<Segment> {
     let at = finite_f32(value.get("at")).unwrap_or(0.0);
     let before = value.get("window").and_then(Value::as_str) == Some("before");
     let lo = if before { f32::NEG_INFINITY } else { at - 1.0 };
+    Some((lo, at))
+}
+
+fn scrub_range(options: &Value) -> Option<Segment> {
+    let (lo, hi) = scrub_limits(options)?;
     Some(Segment::Range {
         column: "time_s".to_owned(),
         lo,
-        hi: at,
+        hi,
     })
 }
 
@@ -176,6 +183,23 @@ fn scrub_speed(value: Option<f64>) -> f64 {
     } else {
         1.0
     }
+}
+
+/// Times where `layer` changes, on the same rows as `time`. The origin is not a mark.
+pub fn layer_edges(time: &[f32], layer: &[f32]) -> Vec<f32> {
+    let mut marks = Vec::new();
+    let mut previous: Option<i64> = None;
+    for (at, id) in time.iter().zip(layer) {
+        if !at.is_finite() || !id.is_finite() {
+            continue;
+        }
+        let id = *id as i64;
+        if previous.is_some_and(|seen| seen != id) && *at > 0.0 {
+            marks.push(*at);
+        }
+        previous = Some(id);
+    }
+    marks
 }
 
 /// Largest finite `time_s`. Missing columns stay at 0.
@@ -222,8 +246,8 @@ fn rank_which(raw: &str) -> Rank {
     }
 }
 
-/// The playback bar. `end` is the largest `time_s` before this mask.
-pub fn scrub_control(options: &Value, end: f32) -> Control {
+/// The playback bar. `end` is the largest `time_s`. `layers` are change times on that clock.
+pub fn scrub_control(options: &Value, end: f32, layers: &[f32]) -> Control {
     let end = if end.is_finite() { end.max(0.0) } else { 0.0 };
     let value = scrub_value(options);
     let on = value
@@ -248,12 +272,18 @@ pub fn scrub_control(options: &Value, end: f32) -> Control {
     } else {
         "second"
     };
+    let layers: Vec<f32> = layers
+        .iter()
+        .copied()
+        .filter(|mark| mark.is_finite() && *mark > 0.0 && *mark <= end)
+        .collect();
     let text = serde_json::json!({
         "on": on,
         "at": at.clamp(0.0, end),
         "end": end,
         "speed": speed,
         "window": window,
+        "layers": layers,
     });
     Control {
         id: "scrub".to_owned(),
@@ -750,13 +780,24 @@ mod tests {
             Segment::Range { column, .. } if column == "time_s"
         )));
 
-        let control = scrub_control(&options, 2.0);
+        let control = scrub_control(&options, 2.0, &[0.0, 0.5, 3.0]);
         let echoed: serde_json::Value = serde_json::from_str(&control.value).unwrap();
         assert_eq!(echoed["on"], true);
         assert_eq!(echoed["speed"], 0.1);
         assert_eq!(echoed["window"], "before");
         assert!((echoed["at"].as_f64().unwrap() - 2.0).abs() < 1e-6);
         assert!((echoed["end"].as_f64().unwrap() - 2.0).abs() < 1e-6);
+        let layers = echoed["layers"].as_array().unwrap();
+        assert_eq!(layers.len(), 1);
+        assert!((layers[0].as_f64().unwrap() - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_layer_change_marks_the_first_row_of_the_new_layer() {
+        let time = [0.0, 0.1, 0.2, 0.4];
+        let layer = [1.0, 1.0, 2.0, f32::NAN];
+        assert_eq!(layer_edges(&time, &layer), vec![0.2]);
+        assert!(layer_edges(&time, &[1.0, 1.0, 1.0, 1.0]).is_empty());
     }
 
     #[test]

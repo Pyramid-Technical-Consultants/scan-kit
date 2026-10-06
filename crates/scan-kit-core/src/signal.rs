@@ -583,6 +583,39 @@ pub fn sums_by_spot_run(spot: &[f32], current: &[f32]) -> Vec<f32> {
     out
 }
 
+/// 0.5% tails, then a slim margin. One spike does not set the axis, and a flat
+/// trace stays near its value.
+pub fn robust_limits(samples: &[f32]) -> Option<(f32, f32)> {
+    let mut values: Vec<f32> = samples
+        .iter()
+        .copied()
+        .filter(|value| value.is_finite())
+        .collect();
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal));
+    let (lo, hi) = if values.len() == 1 {
+        (values[0], values[0])
+    } else {
+        let last = values.len() - 1;
+        let at = |portion: f32| {
+            let index = ((last as f32) * portion).round() as usize;
+            values[index.min(last)]
+        };
+        (at(0.005), at(0.995))
+    };
+    let scale = hi.abs().max(lo.abs());
+    let pad = ((hi - lo) * 0.02).max(scale * 0.02).max(1.0e-6);
+    Some((lo - pad, hi + pad))
+}
+
+/// Time span plus a small margin. The floor is one 1 ms sample, and the start stays at 0.
+pub fn time_window(lo: f32, hi: f32) -> (f32, f32) {
+    let pad = ((hi - lo) * 0.02).max(0.001);
+    ((lo - pad).max(0.0), hi + pad)
+}
+
 pub fn median_finite(values: &[f32]) -> Option<f32> {
     let mut kept: Vec<f32> = values.iter().copied().filter(|v| v.is_finite()).collect();
     if kept.is_empty() {

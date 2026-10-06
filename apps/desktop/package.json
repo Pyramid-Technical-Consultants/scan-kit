@@ -5,13 +5,13 @@
   "type": "module",
   "scripts": {
     "wasm": "cargo build -p scan-kit-plot --target wasm32-unknown-unknown --release && wasm-bindgen --target web --out-dir src/wasm ../../target/wasm32-unknown-unknown/release/scan_kit_plot.wasm",
-    "dev": "npm run wasm && vite",
+    "dev": "node scripts/dev-server.mjs",
     "build": "npm run wasm && tsc && vite build",
     "preview": "vite preview",
-    "test": "vitest run",
+    "test": "vitest run && node --test scripts/keep-up.test.mjs",
     "lint": "oxlint",
     "knip": "knip",
-    "tauri": "tauri"
+    "tauri": "node scripts/tauri.mjs"
   },
   "dependencies": {
     "@base-ui/react": "^1.8.0",

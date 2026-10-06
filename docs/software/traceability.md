@@ -12,8 +12,8 @@ Git history is the revision record. Each requirement maps to the test that fails
 | SK-REQ-001 | `crates/scan-kit-core` `sk_req_001_version_is_a_single_string` |
 | SK-REQ-002 | `crates/scan-kit-core` `sk_req_002_health_uses_version_and_catalog`; `crates/scan-kit-mcp` `sk_req_002_mcp_lists_and_calls_version_and_health` |
 | SK-REQ-003 | `crates/scan-kit-core` `sk_req_003_about_includes_version`; `crates/scan-kit-mcp` `sk_req_003_mcp_calls_about` |
-| SK-REQ-004 | `crates/scan-kit-core` `sk_req_004_termination_summary_parses`; `crates/scan-kit-io` `sk_req_004_open_library_reuses_fingerprint`; `crates/scan-kit-mcp` `sk_req_004_mcp_opens_library` |
-| SK-REQ-005 | `crates/scan-kit-io` `sk_req_005_notes_and_selection_round_trip`; `crates/scan-kit-io` `sk_req_005_migrates_user_version_1` |
+| SK-REQ-004 | `crates/scan-kit-core` `sk_req_004_termination_summary_parses`; `crates/scan-kit-io` `sk_req_004_open_library_reuses_fingerprint`; `crates/scan-kit-io` `urls_classify_and_drop_the_password`; `crates/scan-kit-io` `a_nested_session_is_found_and_a_duplicate_is_named`; `crates/scan-kit-io` `a_walk_stops_at_eight_levels`; `crates/scan-kit-io` `a_remote_listing_is_cached_when_the_view_opens`; `crates/scan-kit-io` `a_remote_open_asks_again_when_the_password_is_missing`; `crates/scan-kit-io` `saved_locations_share_one_session_list_and_exams_stay_separate`; `crates/scan-kit-dicom` `peek_stops_at_pixel_data_and_reads_the_study_header`; `crates/scan-kit-mcp` `sk_req_004_mcp_opens_library` |
+| SK-REQ-005 | `crates/scan-kit-io` `sk_req_005_notes_and_selection_round_trip`; `crates/scan-kit-io` `sk_req_005_migrates_user_version_1`; `crates/scan-kit-io` `saved_locations_share_one_session_list_and_exams_stay_separate` |
 | SK-REQ-006 | `crates/scan-kit-core` `sk_req_006_g2_alias_and_scale`; `crates/scan-kit-io` `sk_req_006_quoted_csv_projects_two_columns_and_scales_g2` |
 | SK-REQ-007 | `crates/scan-kit-compute` `sk_req_007_storage_buffer_round_trip` |
 | SK-REQ-008 | `crates/scan-kit-compute` `sk_req_008_run_view_returns_a_frame_and_controls` |

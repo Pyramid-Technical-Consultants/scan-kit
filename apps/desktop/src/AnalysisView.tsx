@@ -28,12 +28,12 @@ import { Checkbox } from "@/components/ui/checkbox";
 import { Field, FieldLabel, FieldLegend, FieldSet } from "@/components/ui/field";
 import { SessionList } from "@/session-list";
 import { optionIcon } from "@/option-icons";
-import { backingSize, plotHeader, sameChrome, type PlotHeader, type ViewControl } from "@/plot-header";
+import { backingSize, plotHeader, shownHeader, type PlotHeader, type ViewControl } from "@/plot-header";
 import { usePageLoad } from "@/page-load";
 import { sessionColor, shownSessionIds } from "@/session-colors";
 import { acceptReport, bytesOf, parsePoll, type Report } from "@/task-client";
 import { dismissNotice, notifyError } from "@/notify";
-import { ScrubBar, useScrub } from "@/scrub-bar";
+import { ScrubBar, useScrub, type Scrub } from "@/scrub-bar";
 import { SidePane } from "@/SidePane";
 import {
   Select,
@@ -197,12 +197,26 @@ export function AnalysisView({
   const grains = useRef<GrainMemory>({});
   const [hidden, setHidden] = useState<string[]>([]);
   const [meta, setMeta] = useState<PlotHeader | null>(null);
+  const metaRef = useRef<PlotHeader | null>(null);
   const [settled, setSettled] = useState(0);
   const scrubControl = meta?.controls.find((control) => control.kind === "scrub");
-  const playback = useScrub(scrubControl?.value, settled, (text) => {
-    setOptions((current) => (current.scrub === text ? current : { ...current, scrub: text }));
-  });
+  const wasOn = useRef(false);
+  const playhead = useRef<Scrub>({ on: false, at: 0, end: 0, speed: 1, window: "second", layers: [] });
+  const slideRef = useRef<(scrub: Scrub, force: boolean) => void>(() => undefined);
+  const playback = useScrub(
+    scrubControl?.value,
+    settled,
+    (text) => {
+      setOptions((current) => (current.scrub === text ? current : { ...current, scrub: text }));
+    },
+    viewId === "timeslice_replay",
+    (next) => {
+      playhead.current = next;
+      slideRef.current(next, true);
+    },
+  );
   const [plotError, setPlotError] = useState<string | null>(null);
+  const [quiet, setQuiet] = useState<string | null>(null);
   const [studyPath, setStudyPath] = useState<string | null>(null);
   const [study, setStudy] = useState<string | null>(null);
   const [size, setSize] = useState({ width: 960, height: 640 });
@@ -241,6 +255,32 @@ export function AnalysisView({
     requestDraw();
   };
 
+  useEffect(() => {
+    slideRef.current = (scrub, force) => {
+      if (viewId !== "timeslice_replay") {
+        return;
+      }
+      const plot = plotter.current as
+        | (Plotter & { follow?: (on: boolean, lo: number, hi: number, force: boolean) => void })
+        | null;
+      if (plot?.follow == null) {
+        return;
+      }
+      if (!scrub.on) {
+        if (wasOn.current) {
+          plot.follow(false, 0, 0, true);
+          requestDraw();
+        }
+        wasOn.current = false;
+        return;
+      }
+      wasOn.current = true;
+      const lo = scrub.window === "before" ? 0 : Math.max(0, scrub.at - 1);
+      plot.follow(true, lo, scrub.at, force);
+      requestDraw();
+    };
+  }, [viewId]);
+
   const loadPayload = () => {
     const plot = plotter.current;
     const bytes = payload.current;
@@ -250,6 +290,9 @@ export function AnalysisView({
     payload.current = null;
     try {
       plot.load(bytes);
+      if (playhead.current.on) {
+        slideRef.current(playhead.current, false);
+      }
       fitCanvas();
       plot.render();
     } catch (reason) {
@@ -323,12 +366,22 @@ export function AnalysisView({
     const plotOptions =
       viewId === "dose_volume" && studyPath != null ? { ...options, study: studyPath } : options;
     let stop = false;
-    const arm = window.setTimeout(() => {
-      if (!stop) {
-        setLoading(true);
-      }
-    }, 0);
+    let reveal = 0;
     const timer = window.setTimeout(() => {
+      if (stop) {
+        return;
+      }
+      const picture = (metaRef.current?.panels.length ?? 0) > 0;
+      if (!picture) {
+        setQuiet(null);
+      }
+      // A picture already on screen stays up. The hairline waits so a fast
+      // refresh, such as a playhead step, does not flash over it.
+      reveal = window.setTimeout(() => {
+        if (!stop && openSeq.current === ticket) {
+          setLoading(true);
+        }
+      }, picture ? 250 : 0);
       setPlotError(null);
       void (async () => {
         const started = await invoke<{ task: number; generation: number }>("scan_kit_start", {
@@ -341,16 +394,19 @@ export function AnalysisView({
           palette: palette(order, shown),
         });
         if (stop || openSeq.current !== ticket) {
+          window.clearTimeout(reveal);
           await invoke("scan_kit_cancel", { task: started.task });
           return;
         }
         taskId.current = started.task;
         for (;;) {
           if (stop || openSeq.current !== ticket) {
+            window.clearTimeout(reveal);
             return;
           }
           const raw = await invoke<ArrayBuffer | Uint8Array>("scan_kit_poll", { task: started.task });
           if (stop || openSeq.current !== ticket) {
+            window.clearTimeout(reveal);
             return;
           }
           const parsed = parsePoll(bytesOf(raw));
@@ -358,17 +414,36 @@ export function AnalysisView({
             continue;
           }
           setTaskReport(parsed.report.finished ? null : parsed.report);
-          if (parsed.report.finished) {
+          if (parsed.report.finished && openSeq.current === ticket) {
+            window.clearTimeout(reveal);
             setLoading(false);
             setSettled((count) => count + 1);
           }
           if (parsed.payload != null) {
             setPlotError(null);
             const header = plotHeader(parsed.payload);
-            setMeta((current) => (sameChrome(current, header) ? current : header));
-            payload.current = parsed.payload;
-            loadPayload();
-            dismissNotice("analysis");
+            const chosen = shownHeader(metaRef.current, header);
+            if (header.panels.length > 0) {
+              if (chosen !== metaRef.current) {
+                metaRef.current = chosen;
+                setMeta(chosen);
+              }
+              setQuiet(null);
+              payload.current = parsed.payload;
+              loadPayload();
+              dismissNotice("analysis");
+            } else if (parsed.report.finished && parsed.report.phase === "done") {
+              const current = metaRef.current;
+              const sameView =
+                current != null && current.panels.length > 0 && current.title === header.title;
+              if (!sameView) {
+                if (current != null) {
+                  metaRef.current = null;
+                  setMeta(null);
+                }
+                setQuiet("No samples in this window.");
+              }
+            }
           }
           if (parsed.report.finished) {
             if (parsed.report.phase === "failed") {
@@ -380,6 +455,7 @@ export function AnalysisView({
           }
         }
       })().catch((reason: unknown) => {
+        window.clearTimeout(reveal);
         if (openSeq.current === ticket) {
           const message = messageOf(reason);
           setLoading(false);
@@ -391,7 +467,7 @@ export function AnalysisView({
     }, 150);
     return () => {
       stop = true;
-      window.clearTimeout(arm);
+      window.clearTimeout(reveal);
       window.clearTimeout(timer);
       const id = taskId.current;
       queueMicrotask(() => {
@@ -579,9 +655,9 @@ export function AnalysisView({
             rowMarkers="none"
           />
         ) : null}
-        {shown ? null : (
+        {shown || (table?.rows.length ?? 0) > 0 ? null : (
           <div className="text-muted-foreground flex flex-1 items-center justify-center px-6 text-center text-sm">
-            {plotError ?? "Loading plot…"}
+            {plotError ?? quiet ?? "Loading plot…"}
           </div>
         )}
         <div className={shown ? "relative min-h-0 flex-1" : "hidden"}>

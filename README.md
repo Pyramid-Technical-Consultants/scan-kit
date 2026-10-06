@@ -276,7 +276,7 @@ Scan Kit is a research tool, not a medical device. Don't use its dose for clinic
 
 ### Timeslice Replay
 
-Timeslice Replay stacks every channel of one timeslice source from the shared Y menu. Channel checkboxes start on. Beam and rank filters use the same segment list as Binned Summary. The timeline along the bottom is off until its checkbox is enabled: play, pause, skip to either end, 1/10×, 1×, or 10×, and either the previous one second or every row at or before the playhead. FFT draws a Welch spectrum from 1 Hz to 500 Hz to the right of each channel. An optional side scatter uses the Distribution Explorer source menu.
+Timeslice Replay stacks every channel of one timeslice source from the shared Y menu. Channel checkboxes start on. Beam and rank filters use the same segment list as Binned Summary. The timeline along the bottom is off until its checkbox is enabled: play, pause, skip to either end, 1/10×, 1×, or 10×, and either the previous one second or every row at or before the playhead. Layer changes are hairlines on that slider. Playback slides that window across the time traces already on screen. The spectrum and scatter take the window when the playhead settles. FFT draws a Welch spectrum from 1 Hz to 500 Hz to the right of each channel. An optional side scatter draws timeslice rows, with the Distribution Explorer XY list.
 
 ### Session log compare
 

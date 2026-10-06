@@ -49,9 +49,9 @@ pub use signal::{
     dose_error_pct, dose_ratio_pct, dvh, g2_ic2_mm, gamma_index, histogram, hv_capacitance_pf,
     hv_delta_v, hv_expected_pf, hv_firmware_flags, hv_step_window, linear_fit, median_finite,
     mip_xy, quantile_edges, remap, remap_g2_raw, remap_g2_raw_reversed, remap_g3_raw,
-    remap_g3_raw_reversed, resample_nearest, scale_column, splat_gaussians, sums_by_spot_id,
-    sums_by_spot_run, trapz, welch_psd, BoxStats, G2_MM_PER_STRIP, G2_STRIP_CENTER,
-    G3_STRIP_CENTER, G3_STRIP_PITCH_MM,
+    remap_g3_raw_reversed, resample_nearest, robust_limits, scale_column, splat_gaussians,
+    sums_by_spot_id, sums_by_spot_run, time_window, trapz, welch_psd, BoxStats, G2_MM_PER_STRIP,
+    G2_STRIP_CENTER, G3_STRIP_CENTER, G3_STRIP_PITCH_MM,
 };
 pub use tune::{run_tune, tune_catalog, TuneSpots};
 pub use xml_dom::{parse_xml, write_xml, Elem};
@@ -63,8 +63,8 @@ pub use schema::{
     IC3_QUAD_ZERO_FILL, POSITION_KEY_G2_RAW, POSITION_KEY_G3_RAW,
 };
 pub use segment::{
-    apply_mask, parse_segments, row_mask, scrub_control, segments_control, segments_from,
-    segments_json, time_end, BeamGate, CompareOp, Rank, Segment,
+    apply_mask, layer_edges, parse_segments, row_mask, scrub_control, scrub_limits,
+    segments_control, segments_from, segments_json, time_end, BeamGate, CompareOp, Rank, Segment,
 };
 pub use session::{merge_session_geom, parse_termination_summary_text, SessionMeta, SummaryDate};
 pub use task::{

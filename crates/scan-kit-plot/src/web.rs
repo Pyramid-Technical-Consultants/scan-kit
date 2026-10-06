@@ -101,6 +101,13 @@ impl WebPlot {
         self.backend.clone()
     }
 
+    /// Move time-panel cameras to the playhead window. `force` replaces a zoom.
+    pub fn follow(&mut self, on: bool, lo: f32, hi: f32, force: bool) {
+        if let Some(plot) = self.plot.as_mut() {
+            plot.follow_time(on, lo, hi, force);
+        }
+    }
+
     /// Replace the scene with a payload from `scan_kit_open_plot`.
     pub fn load(&mut self, bytes: &[u8]) -> Result<(), JsValue> {
         let mut plot = Plot::from_payload(bytes).map_err(|err| JsValue::from_str(&err))?;
