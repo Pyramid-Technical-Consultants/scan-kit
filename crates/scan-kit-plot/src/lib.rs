@@ -2,6 +2,7 @@
 //! and tests. Built for `wasm32`, the desktop webview draws the same marks into
 //! its canvas with WebGPU or WebGL2.
 
+mod dose;
 mod payload;
 mod render;
 mod text;

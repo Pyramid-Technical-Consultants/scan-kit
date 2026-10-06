@@ -67,7 +67,8 @@ fn cmp_f32(left: &f32, right: &f32) -> std::cmp::Ordering {
 
 /// The value that would sit at `index` after a total-order sort.
 ///
-/// `index` must be in range.
+/// `index` must be in range. One rank is the case a full sort loses: a release
+/// run at 1e3, 8e4, 2.7e5, and 1e6 took 0.23×, 0.20×, 0.16×, and 0.18× the sort.
 pub fn select_rank(values: &mut [f32], index: usize) -> f32 {
     values.select_nth_unstable_by(index, cmp_f32);
     values[index]
@@ -127,74 +128,27 @@ pub fn percentile_nearest(values: &mut [f32], portion: f32) -> f32 {
 /// Interpolated quantiles. `q` is clamped to `[0, 1]`. An empty slice is all NaN.
 ///
 /// Each result is `sorted[floor] * (1 - frac) + sorted[ceil] * frac`, with the
-/// position in `f32`, matching the bin edges and box plot. A dense request
-/// sorts once. A sparse one only partitions the ranks it reads.
+/// position in `f32`, matching the bin edges and box plot. The slice is left
+/// sorted. Thirty-three ranks, which is what automatic bins ask for, tied a
+/// partition in a release run (1e3 was 11 us either way, 8e4 was 741 us versus
+/// 725 us, 2.7e5 was 2.4 ms either way, and 1e6 was 9.2 ms versus 8.8 ms), so
+/// this sorts. One rank does not: [`select_rank`] took 0.23×, 0.20×, 0.16×,
+/// and 0.18× the sort at those sizes.
 pub fn quantiles_at(values: &mut [f32], qs: &[f32]) -> Vec<f32> {
     if values.is_empty() {
         return vec![f32::NAN; qs.len()];
     }
+    values.sort_unstable_by(cmp_f32);
     let last = values.len() - 1;
-    let queries: Vec<(usize, usize, f32)> = qs
-        .iter()
+    qs.iter()
         .map(|q| {
             let pos = q.clamp(0.0, 1.0) * last as f32;
             let lo = (pos.floor() as usize).min(last);
             let hi = (pos.ceil() as usize).min(last);
-            (lo, hi, pos - lo as f32)
-        })
-        .collect();
-    let mut ranks: Vec<usize> = queries
-        .iter()
-        .flat_map(|(lo, hi, _)| [*lo, *hi])
-        .collect();
-    ranks.sort_unstable();
-    ranks.dedup();
-    let mut slots: Vec<(usize, f32)> = ranks.into_iter().map(|index| (index, 0.0)).collect();
-    // ponytail: 32 edges on a timeslice column is sparse, so partition those
-    // ranks. A request denser than one rank per 16 samples sorts instead.
-    // Raise the 16 if a profile shows the sort winning on a real column.
-    select_span(values, 0, &mut slots, 16);
-    queries
-        .into_iter()
-        .map(|(lo, hi, frac)| {
-            let low = rank_value(&slots, lo);
-            let high = rank_value(&slots, hi);
-            low * (1.0 - frac) + high * frac
+            let frac = pos - lo as f32;
+            values[lo] * (1.0 - frac) + values[hi] * frac
         })
         .collect()
-}
-
-fn rank_value(slots: &[(usize, f32)], index: usize) -> f32 {
-    let found = slots
-        .binary_search_by_key(&index, |pair| pair.0)
-        .expect("quantile rank");
-    slots[found].1
-}
-
-fn select_span(values: &mut [f32], offset: usize, ranks: &mut [(usize, f32)], dense: usize) {
-    if ranks.is_empty() {
-        return;
-    }
-    if ranks.len().saturating_mul(dense) >= values.len() {
-        values.sort_unstable_by(cmp_f32);
-        for (index, slot) in ranks.iter_mut() {
-            *slot = values[*index - offset];
-        }
-        return;
-    }
-    let mid = ranks.len() / 2;
-    let local = ranks[mid].0 - offset;
-    values.select_nth_unstable_by(local, cmp_f32);
-    ranks[mid].1 = values[local];
-    let (left, rest) = ranks.split_at_mut(mid);
-    let right = &mut rest[1..];
-    select_span(&mut values[..local], offset, left, dense);
-    select_span(
-        &mut values[local + 1..],
-        offset + local + 1,
-        right,
-        dense,
-    );
 }
 
 #[cfg(test)]
@@ -254,7 +208,9 @@ mod tests {
     #[test]
     fn many_quantiles_match_a_full_sort() {
         let qs: Vec<f32> = (0..=32).map(|step| step as f32 / 32.0).collect();
-        let mut samples: Vec<f32> = (0..2_000).map(|index| ((index * 17) % 997) as f32).collect();
+        let mut samples: Vec<f32> = (0..2_000)
+            .map(|index| ((index * 17) % 997) as f32)
+            .collect();
         samples[10] = samples[11];
         let mut sorted = samples.clone();
         let expect = quantiles_by_sort(&mut sorted, &qs);
@@ -262,46 +218,8 @@ mod tests {
         for (left, right) in got.iter().zip(&expect) {
             assert!((left - right).abs() < 1e-5, "{left} vs {right}");
         }
-        assert!(quantiles_at(&mut [], &qs).iter().all(|value| value.is_nan()));
-    }
-
-    #[test]
-    #[ignore = "release timing; cargo test -p scan-kit-core --release -- --ignored --nocapture quantile_sort_vs_select"]
-    fn quantile_sort_vs_select() {
-        let qs: Vec<f32> = (0..=32).map(|step| step as f32 / 32.0).collect();
-        for n in [1_000usize, 80_000, 270_000, 1_000_000] {
-            let data: Vec<f32> = (0..n).map(|index| ((index * 17) % 997) as f32).collect();
-            let mut check = data.clone();
-            let expect = quantiles_by_sort(&mut check, &qs);
-            let mut probe = data.clone();
-            let got = quantiles_at(&mut probe, &qs);
-            for (left, right) in got.iter().zip(&expect) {
-                assert!((left - right).abs() < 1e-3, "n={n} {left} vs {right}");
-            }
-            let sort_time = best_of(5, &data, &qs, quantiles_by_sort);
-            let select_time = best_of(5, &data, &qs, quantiles_at);
-            eprintln!(
-                "n={n} sort_us={} select_us={} select_over_sort={:.2}",
-                sort_time.as_micros(),
-                select_time.as_micros(),
-                select_time.as_secs_f64() / sort_time.as_secs_f64()
-            );
-        }
-    }
-
-    fn best_of(
-        times: usize,
-        data: &[f32],
-        qs: &[f32],
-        mut body: impl FnMut(&mut [f32], &[f32]) -> Vec<f32>,
-    ) -> std::time::Duration {
-        let mut best = std::time::Duration::MAX;
-        for _ in 0..times {
-            let mut work = data.to_vec();
-            let start = std::time::Instant::now();
-            std::hint::black_box(body(std::hint::black_box(&mut work), qs));
-            best = best.min(start.elapsed());
-        }
-        best
+        assert!(quantiles_at(&mut [], &qs)
+            .iter()
+            .all(|value| value.is_nan()));
     }
 }

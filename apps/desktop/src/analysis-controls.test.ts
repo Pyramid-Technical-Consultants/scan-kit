@@ -31,13 +31,17 @@ const BINNED = [
   { id: "segments", group: "Filter Data", kind: "segments" },
 ];
 
-it("rebuilds a settled playhead only for the spectrum and the reduced scatters", () => {
+it("rebuilds a settled playhead for the spectrum and the reduced distributions", () => {
   expect(playheadReplay({})).toBe(false);
   expect(playheadReplay({ scatter: "On" })).toBe(false);
   expect(playheadReplay({ scatter: "On", scatter_xy: "Probe (G)" })).toBe(false);
+  expect(playheadReplay({ scatter: "On", scatter_xy: "Probe (G)", draw: "Scatter" })).toBe(false);
   expect(playheadReplay({ fft: "On" })).toBe(true);
   expect(playheadReplay({ scatter: "On", scatter_xy: "Confidence" })).toBe(true);
   expect(playheadReplay({ scatter: "On", scatter_xy: "Coverage (%)" })).toBe(true);
+  expect(playheadReplay({ scatter: "On", draw: "Contour" })).toBe(false);
+  expect(playheadReplay({ scatter: "On", draw: "Density" })).toBe(false);
+  expect(playheadReplay({ draw: "Density" })).toBe(false);
 });
 
 it("groups binned summary controls in plot order", () => {
@@ -70,6 +74,26 @@ it("keeps a joined button row for two or three short names", () => {
   expect(segmentChoices(["Energy"])).toBe(false);
   expect(segmentChoices(["Auto", "8", "16", "32", "64"])).toBe(true);
   expect(segmentChoices(["Own", "Plot", "Page"])).toBe(true);
+  for (const scale of [
+    "Turbo",
+    "Viridis",
+    "Magma",
+    "Inferno",
+    "Plasma",
+    "Cividis",
+    "Deep",
+    "Cubehelix",
+    "Heat",
+    "Gray",
+    "Managua",
+    "Berlin",
+    "Coolwarm",
+    "RdYlBu",
+    "Spectral",
+    "PuOr",
+  ]) {
+    expect(optionIcon(scale), scale).toBeTruthy();
+  }
   expect(optionIcon("Own")).toBe(ChartColumn);
   expect(optionIcon("Plot")).toBe(Columns2);
   expect(optionIcon("Page")).toBe(LayoutGrid);
@@ -250,6 +274,19 @@ it("adds a missing segment and drops one by index", () => {
   const text = segmentsText(removeSegment(both, 0));
   expect(parseSegments(text)).toEqual([{ kind: "rank", which: "all" }]);
   expect(parseSegments("nope")).toBeNull();
+});
+
+it("a volumetric preset writes the shared options and returns to custom", () => {
+  const next = applyOption({}, {}, {}, "preset", "Gamma");
+  expect(next.preset).toBe("Custom");
+  expect(next.compare).toBe("Gamma");
+  expect(next.dd).toBe("3%");
+  expect(next.dta).toBe("2 mm");
+  expect(next.cutoff).toBe("10%");
+  const measured = applyOption({}, {}, {}, "preset", "Measured dose");
+  expect(measured.compare).toBe("Measured");
+  expect(measured.model).toBe("Analytic");
+  expect(applyOption({ compare: "Gamma" }, {}, {}, "preset", "Custom").compare).toBe("Gamma");
 });
 
 it("leaves X bins available for every axis and glyph", () => {

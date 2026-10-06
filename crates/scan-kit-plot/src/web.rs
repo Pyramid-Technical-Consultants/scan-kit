@@ -166,6 +166,24 @@ impl WebPlot {
         });
     }
 
+    /// Panel rectangles in framebuffer pixels, for the cell and plot pickers.
+    pub fn frames(&self) -> String {
+        self.plot
+            .as_ref()
+            .map(|plot| {
+                let (width, height) = (self.config.width, self.config.height);
+                plot.frames_json(width, height)
+            })
+            .unwrap_or_else(|| "[]".into())
+    }
+
+    /// `rotate` turns a slice. `integral` sums through its plane or along a profile.
+    pub fn dose_action(&mut self, panel: u32, action: &str) {
+        if let Some(plot) = self.plot.as_mut() {
+            plot.dose_action(panel as usize, action);
+        }
+    }
+
     pub fn reset(&mut self) {
         self.input(PlotInput {
             reset: true,

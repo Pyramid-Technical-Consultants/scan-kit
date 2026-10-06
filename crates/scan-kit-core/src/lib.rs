@@ -4,6 +4,7 @@
 //! implement the operations themselves. Session files live in `scan-kit-io`.
 //! GPU work lives in `scan-kit-compute`.
 
+mod cloud;
 mod config;
 mod dose;
 mod geometry;
@@ -21,11 +22,14 @@ mod task;
 mod tune;
 mod xml_dom;
 
+pub use cloud::{
+    cloud_series, contour_bands, contour_in_frame, count_grid, scatter_cloud, CloudDraw, CLOUD_BINS,
+};
 pub use config::{apply_form, config_form};
 pub use dose::{
     analytic_on, analytic_volume, bragg_idd, csda_range_mm, dose_frame, field_bounds, medium,
-    protons_from_mu, robust_high, through_wet, water, DoseFrame, McJob, McResult, Medium,
-    PatientRequest, Pencil, Quantity, SlabRequest, Volume,
+    protons_from_mu, ray_value, raymarch, robust_high, sample_index, sample_mm, through_wet, water,
+    DoseFrame, McJob, McResult, Medium, PatientRequest, Pencil, Quantity, SlabRequest, Volume,
 };
 pub use geometry::{IC1_Z_MM, IC2_Z_MM, IC_SEP_MM};
 pub use plan::{
@@ -33,8 +37,8 @@ pub use plan::{
     ImportSpot, PlanDocument, PlanSource,
 };
 pub use plot::{
-    apply_clip, format_tick, map_span, project, ticks, Camera, Choice, Control, DataTable, Panel,
-    PlotRect, PlotScene, Series,
+    apply_clip, format_tick, map_span, project, ticks, Camera, Choice, CloudStyle, Control,
+    DataTable, Panel, PlotRect, PlotScene, Series, VolumeMark,
 };
 pub use ramp::{choices, index, is_session, resolve, sample, session, Family, SESSION, VIRIDIS};
 pub use runner::{

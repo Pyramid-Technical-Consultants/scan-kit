@@ -217,7 +217,7 @@ For position scatter, position-error outliers, beam-on/off IC current histograms
 
 ### Volumetric
 
-The left side is a 2×2 grid over a row of two plots. The grid starts with the axial slice and the 3D volume, then the coronal and sagittal slices. The picker in the top right corner of each cell sets what it shows, independently of the others: two cells can show the same plane. There is one 3D view, so picking it in a cell hands the old cell that cell's plane. Each view's own settings sit in its header, left of the picker. A slice can turn a quarter turn (**⟲ 90°**) or show the whole volume summed through the plane (**∫**) instead of one slice. The 3D view sets whether a ray integrates, keeps its maximum or fades, and nearest, linear or cubic sampling. Slices have mm axes in the frame's coordinates, a box around the grid, and their own color bar. They take the 3D view's color scale and window, except for Integrate rays and percent windows, which are per ray and not per voxel. A summed slice scales to its own range, in Gy·mm. Click a slice to move the crosshair, and scroll to page through slices. Each plot has a picker: **Depth dose** along the beam from the grid edge, **Lateral profile** across the beam and **Longitudinal profile** along it through the crosshair, **Lateral + longitudinal** together, **DVH**, or **Gamma histogram**. A profile's **∫** sums the dose over each plane across the line, in Gy·mm², so a depth dose becomes an integrated depth dose. There are no modes to switch. Two settings pick what runs: **Compare → Plan** and **Phantom → Medium**.
+The left side is a 2×3 grid. Drag the gaps to resize a row or that row's two cells. The grid starts with the axial slice and the 3D volume, then the coronal and sagittal slices, then two plots. The picker in the top right corner of each cell sets what it shows, independently of the others: two cells can show the same plane. There is one 3D view, so picking it in a cell hands the old cell that cell's plane. The dose grid is uploaded once; paging, rotating, and orbiting stay in the view. A loaded planning CT draws on this same grid, with the CT under the dose wash and structure outlines, and the two plots start as a DVH and a gamma histogram. Each view's own settings sit in its header, left of the picker. A slice can turn a quarter turn (**⟲ 90°**) or show the whole volume summed through the plane (**∫**) instead of one slice. The 3D view sets whether a ray integrates, keeps its maximum or fades, and nearest, linear or cubic sampling. Slices have mm axes in the frame's coordinates, a box around the grid, and their own color bar. They take the 3D view's color scale and window, except for Integrate rays and percent windows, which are per ray and not per voxel. A summed slice scales to its own range, in Gy·mm. Click a slice to move the crosshair, and scroll to page through slices. Each plot has a picker: **Depth dose** along the beam from the grid edge, **Lateral profile** across the beam and **Longitudinal profile** along it through the crosshair, **Lateral + longitudinal** together, **DVH**, or **Gamma histogram**. A profile's **∫** sums the dose over each plane across the line, in Gy·mm², so a depth dose becomes an integrated depth dose. There are no modes to switch. Two settings pick what runs: **Compare → Plan** and **Phantom → Medium**.
 - **Session log** measures the logged spots against the session's own plan spots in a phantom. The Sessions section below covers it.
 - **DICOM plan** runs the loaded study's RT Ion Plan, and its matched logged fractions, through the Monte Carlo.
 - **Medium** picks where the beam goes: a uniform phantom, or the study's **Planning CT**. Loading a study with a plan selects the planning CT.
@@ -253,19 +253,9 @@ The sessions selected in the launcher are the logged deliveries:
 
 DVHs (the picked dose bright, the other faded) and **Clinical goals** are for the whole course. The selected dose is scaled to the plan's fraction count. Write one goal per line, like `PTV: D95% >= 95%`, `Cord: Dmax < 45 Gy`, `Lung: V20Gy < 30%` or `Heart: D0.03cc < 30 Gy`. Dose percentages are of **Rx**, which defaults to the plan's target prescription.
 
-**RBE** sets how the shown dose, DVHs and goals are weighted. **Constant 1.1** is the clinical convention and the default. The variable models weight each voxel by its LETd, and all except Unkelbach also by the dose per fraction and **(α/β)x**:
+**RBE** weights the shown dose, DVHs, and clinical goals by 1.0 or 1.1. Gamma against the TPS stays on physical dose.
 
-- **McNamara 2015**: fitted to the largest in vitro dataset. The Dutch proton centres report with it at (α/β)x = 2 Gy, the default here.
-- **Wedenberg 2013** and **Carabe 2012**: the earlier linear-quadratic models.
-- **Unkelbach 2016**: 1 + 0.04 µm/keV × LETd, with no dose or tissue dependence.
-
-LETd is scored in every run, dose-averaged over primary and secondary protons, in water at unit density, as the EPTN consensus recommends. The RBE group lists each checked structure's dose-weighted LETd and RBE, and the report adds both columns to its dose statistics. Changing the model or (α/β)x reweights the finished doses without another Monte Carlo run. Gamma against the TPS always compares physical dose, whatever the model. One (α/β)x applies to every voxel.
-
-**Export report…** writes three kinds of file:
-
-- An RTDOSE for each dose, in the CT's study and frame of reference, holding the raw calculation. Its Image Comments hold the provenance as JSON: input UIDs, calibration and beam-model digests, engine version, GPU, seed, histories and statistical uncertainty.
-- An HTML report with the figure, the delivery table, gamma, the goals and dose statistics.
-- The DVHs as CSV.
+**Export report** writes the study table (frame, beams, uncertainty, clinical goals, and the gamma pass rate) as a text file.
 
 Scan Kit is a research tool, not a medical device. Don't use its dose for clinical decisions.
 

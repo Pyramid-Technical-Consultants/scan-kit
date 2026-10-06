@@ -25,7 +25,7 @@ Git history is the revision record. Each requirement maps to the test that fails
 | SK-REQ-014 | Withdrawn |
 | SK-REQ-015 | `crates/scan-kit-io` `sk_req_015_distribution_exposes_spot_modes` |
 | SK-REQ-016 | `crates/scan-kit-core` `sk_req_016_quantile_edges_and_histogram` |
-| SK-REQ-017 | `crates/scan-kit-io` `sk_req_017_bins_and_timeline_share_the_session`; `crates/scan-kit-io` `timeline_scatter_keeps_rows_past_the_playhead`; `crates/scan-kit-plot` `follow_time_hides_scatter_points_outside_the_playhead`; `crates/scan-kit-plot` `follow_time_draws_the_time_trace_inside_the_playhead` |
+| SK-REQ-017 | `crates/scan-kit-io` `sk_req_017_bins_and_timeline_share_the_session`; `crates/scan-kit-io` `timeline_scatter_keeps_rows_past_the_playhead`; `crates/scan-kit-io` `timeline_distribution_switches_scatter_contour_and_density`; `crates/scan-kit-plot` `follow_time_hides_scatter_points_outside_the_playhead`; `crates/scan-kit-plot` `follow_time_draws_the_time_trace_inside_the_playhead`; `crates/scan-kit-plot` `follow_time_counts_the_visible_density_without_replacing_points` |
 | SK-REQ-018 | `crates/scan-kit-io` `sk_req_018_fft_draws_a_spectrum` |
 | SK-REQ-019 | `crates/scan-kit-core` `sk_req_019_welch_sees_a_tone` |
 | SK-REQ-021 | Withdrawn |
@@ -35,7 +35,7 @@ Git history is the revision record. Each requirement maps to the test that fails
 | SK-REQ-025 | `crates/scan-kit-core` `sk_req_025_chambers_are_100_mm_apart` |
 | SK-REQ-026 | Withdrawn |
 | SK-REQ-027 | `crates/scan-kit-core` `sk_req_027_splat_peaks_on_the_spot`; `crates/scan-kit-compute` `sk_req_027_through_031_scientific_shaders_compile` |
-| SK-REQ-028 | `crates/scan-kit-io` `sk_req_028_volumetric_has_slices_dvh_and_gamma` |
+| SK-REQ-028 | `crates/scan-kit-io` `sk_req_028_volumetric_has_slices_dvh_and_gamma`; `crates/scan-kit-io` `patient_ct_adds_dvh_gamma_and_a_fraction_control`; `crates/scan-kit-io` `choosing_3d_swaps_with_the_cell_that_had_it`; `crates/scan-kit-io` `each_plot_kind_builds_a_panel`; `crates/scan-kit-plot` `paging_a_slice_does_not_upload_the_volume_again`; `crates/scan-kit-plot` `dragging_a_gap_resizes_that_split_only` |
 | SK-REQ-030 | `crates/scan-kit-core` `sk_req_030_gamma_dvh_and_resample` |
 | SK-REQ-032 | `crates/scan-kit-dicom` `sk_req_032_study_index_goal_and_report` |
 | SK-REQ-033 | `crates/scan-kit-core` `sk_req_033_spot_sums_hv_and_coverage`; `crates/scan-kit-core` `sk_req_033_session_log_timeline_issue_and_diff` |

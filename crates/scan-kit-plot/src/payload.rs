@@ -5,7 +5,7 @@
 //! RGBA pixels. The shell reads the header for its controls. The wasm plot uploads
 //! the rest without parsing series again.
 
-use scan_kit_core::{Control, DataTable, Panel, PlotScene};
+use scan_kit_core::{Control, DataTable, Panel, PlotScene, VolumeMark};
 use serde::{Deserialize, Serialize};
 
 use crate::render::{
@@ -26,6 +26,9 @@ pub struct PlotHeader {
     pub column_weights: Vec<f32>,
     #[serde(default)]
     pub row_weights: Vec<f32>,
+    /// One left/right pair per panel when the grid is two columns.
+    #[serde(default)]
+    pub row_splits: Vec<f32>,
     /// Panels at the end of `panels` that fill the right column.
     #[serde(default)]
     pub side: u32,
@@ -49,6 +52,30 @@ pub struct PlotHeader {
     lines: u32,
     points: u32,
     quads: u32,
+    #[serde(default)]
+    volume_shape: [u32; 3],
+    #[serde(default)]
+    volume_origin: [f32; 3],
+    #[serde(default)]
+    volume_voxel: f32,
+    #[serde(default)]
+    volume_ramp: u8,
+    #[serde(default)]
+    volume_lo: f32,
+    #[serde(default)]
+    volume_hi: f32,
+    #[serde(default)]
+    volume_gain: f32,
+    #[serde(default)]
+    volume_opacity: f32,
+    #[serde(default)]
+    volume_mode: u8,
+    #[serde(default)]
+    volume_filter: u8,
+    #[serde(default)]
+    volume_ct: bool,
+    #[serde(default)]
+    volume_labels: bool,
 }
 
 fn final_quality() -> String {
@@ -97,6 +124,7 @@ pub fn encode_plot_reusing(
         columns: scene.columns,
         column_weights: scene.column_weights.clone(),
         row_weights: scene.row_weights.clone(),
+        row_splits: scene.row_splits.clone(),
         side: scene.side,
         background,
         foreground,
@@ -109,6 +137,18 @@ pub fn encode_plot_reusing(
         lines: marks.lines.len() as u32,
         points: marks.points.len() as u32,
         quads: marks.quads.len() as u32,
+        volume_shape: scene.volume.shape,
+        volume_origin: scene.volume.origin,
+        volume_voxel: scene.volume.voxel,
+        volume_ramp: scene.volume.ramp,
+        volume_lo: scene.volume.lo,
+        volume_hi: scene.volume.hi,
+        volume_gain: scene.volume.gain,
+        volume_opacity: scene.volume.opacity,
+        volume_mode: scene.volume.mode,
+        volume_filter: scene.volume.filter,
+        volume_ct: !scene.volume.ct.is_empty(),
+        volume_labels: !scene.volume.labels.is_empty(),
     };
     let json = serde_json::to_vec(&header).map_err(|err| err.to_string())?;
     let mut out = Vec::with_capacity(
@@ -126,11 +166,27 @@ pub fn encode_plot_reusing(
     for pixels in &marks.heatmaps {
         out.extend_from_slice(pixels);
     }
+    let voxels = scene.volume.shape[0] as usize
+        * scene.volume.shape[1] as usize
+        * scene.volume.shape[2] as usize;
+    if voxels > 0 && scene.volume.values.len() >= voxels {
+        for value in scene.volume.values.iter().take(voxels) {
+            out.extend_from_slice(&value.to_le_bytes());
+        }
+        if !scene.volume.ct.is_empty() {
+            for value in scene.volume.ct.iter().take(voxels) {
+                out.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+        if !scene.volume.labels.is_empty() {
+            out.extend_from_slice(&scene.volume.labels[..voxels.min(scene.volume.labels.len())]);
+        }
+    }
     Ok(out)
 }
 
 pub fn plot_header(bytes: &[u8]) -> Result<PlotHeader, String> {
-    decode_plot(bytes).map(|(header, _, _)| header)
+    decode_plot(bytes).map(|(header, _, _, _)| header)
 }
 
 /// GPU bytes already packed by [`encode_plot_quality`]. Uploading these skips a
@@ -141,7 +197,9 @@ pub(crate) struct EncodedMarks {
     pub quads: Vec<u8>,
 }
 
-pub(crate) fn decode_plot(bytes: &[u8]) -> Result<(PlotHeader, Marks, EncodedMarks), String> {
+pub(crate) fn decode_plot(
+    bytes: &[u8],
+) -> Result<(PlotHeader, Marks, EncodedMarks, VolumeMark), String> {
     let mut reader = Reader { bytes, at: 0 };
     let json_len = u32::from_le_bytes(reader.take(4)?.try_into().unwrap()) as usize;
     let header: PlotHeader =
@@ -174,6 +232,41 @@ pub(crate) fn decode_plot(bytes: &[u8]) -> Result<(PlotHeader, Marks, EncodedMar
     if marks.panels.len() != header.panels.len() {
         return Err("plot payload panel count mismatch".into());
     }
+    let voxels = header.volume_shape[0] as usize
+        * header.volume_shape[1] as usize
+        * header.volume_shape[2] as usize;
+    let mut volume = VolumeMark {
+        shape: header.volume_shape,
+        origin: header.volume_origin,
+        voxel: header.volume_voxel,
+        ramp: header.volume_ramp,
+        lo: header.volume_lo,
+        hi: header.volume_hi,
+        gain: header.volume_gain,
+        opacity: header.volume_opacity,
+        mode: header.volume_mode,
+        filter: header.volume_filter,
+        ..VolumeMark::default()
+    };
+    if voxels > 0 {
+        let mut values = Vec::with_capacity(voxels);
+        for _ in 0..voxels {
+            let bytes = reader.take(4)?;
+            values.push(f32::from_le_bytes(bytes.try_into().unwrap()));
+        }
+        volume.values = values;
+        if header.volume_ct {
+            let mut ct = Vec::with_capacity(voxels);
+            for _ in 0..voxels {
+                let bytes = reader.take(4)?;
+                ct.push(f32::from_le_bytes(bytes.try_into().unwrap()));
+            }
+            volume.ct = ct;
+        }
+        if header.volume_labels {
+            volume.labels = reader.take(voxels)?.to_vec();
+        }
+    }
     Ok((
         header,
         marks,
@@ -182,23 +275,26 @@ pub(crate) fn decode_plot(bytes: &[u8]) -> Result<(PlotHeader, Marks, EncodedMar
             points: point_bytes,
             quads: quad_bytes,
         },
+        volume,
     ))
 }
 
 impl Plot {
     pub fn from_payload(bytes: &[u8]) -> Result<Self, String> {
-        let (header, marks, encoded) = decode_plot(bytes)?;
+        let (header, marks, encoded, volume) = decode_plot(bytes)?;
         let mut plot = Self::from_parts(
             header.panels,
             header.columns,
             header.column_weights,
             header.row_weights,
+            header.row_splits,
             header.side,
             marks,
             header.background,
             header.foreground,
         );
         plot.encoded = Some(encoded);
+        plot.attach_volume(&volume);
         plot.carry_lines(
             header.line_token.parse::<u64>().unwrap_or(0),
             header.reuse_lines,
@@ -288,9 +384,11 @@ mod tests {
             column_weights: vec![2.0, 1.0],
             row_weights: vec![2.0, 1.0, 1.0],
             side: 1,
+            row_splits: Vec::new(),
+            volume: scan_kit_core::VolumeMark::default(),
         };
         let bytes = encode_plot(&scene, [0.1, 0.1, 0.1, 1.0], [0.9, 0.9, 0.9, 1.0]).unwrap();
-        let (header, marks, _) = decode_plot(&bytes).unwrap();
+        let (header, marks, _, _) = decode_plot(&bytes).unwrap();
         assert_eq!(marks, build_marks(&scene.panels));
         assert_eq!(header.panels, header_panels(&scene.panels));
         assert_eq!(header.column_weights, vec![2.0, 1.0]);
@@ -304,7 +402,7 @@ mod tests {
     fn a_settled_playhead_omits_trace_lines_the_plot_already_has() {
         let scene = trace_and_guide(0.0);
         let bytes = encode_plot(&scene, [0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0, 1.0]).unwrap();
-        let (header, _, _) = decode_plot(&bytes).unwrap();
+        let (header, _, _, _) = decode_plot(&bytes).unwrap();
         assert!(!header.reuse_lines);
         assert!(header.line_prefix > 1);
         let moved = trace_and_guide(0.4);
@@ -316,7 +414,7 @@ mod tests {
             Some(&header.line_token),
         )
         .unwrap();
-        let (next, _, _) = decode_plot(&again).unwrap();
+        let (next, _, _, _) = decode_plot(&again).unwrap();
         assert!(next.reuse_lines);
         assert_eq!(next.line_token, header.line_token);
         assert_eq!(next.lines, 1, "only the guide tail is in the payload");
@@ -391,6 +489,8 @@ mod tests {
             column_weights: Vec::new(),
             row_weights: Vec::new(),
             side: 1,
+            row_splits: Vec::new(),
+            volume: scan_kit_core::VolumeMark::default(),
         }
     }
 }

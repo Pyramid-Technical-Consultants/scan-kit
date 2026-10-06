@@ -103,7 +103,7 @@ Binned summaries use quantile bin edges and a histogram of the values in each bi
 
 ## SK-REQ-017
 
-Bins draws the 1.8 metric groups (dose error, dose ratio, dose rate, current ratio, IC current, position error, sigma, sigma error, IC2 minus IC1, and spot time) against energy, target MU, spot time, or radius. Energy is one bin per value and the other axes use quantile bins. Glyphs are violin, box, mean, scatter, and contour, with the 1.8 trend, histogram, correlation, fliers, the segment list, and interlock lines. Timeline stacks every channel of one timeslice source from the shared Y menu, and filters those rows with the segment list. The playhead is one more segment on that list for Bins, Distribution, and the spectrum: the previous one second, or every row at or before the playhead. The slider marks each layer change, dark on the played portion and light ahead of the playhead. Timeline keeps the beam-gated samples in the time traces and fits those axes to the same window. An optional FFT column sits beside each channel, and an optional side scatter draws every beam-gated timeslice row, with the Distribution XY list. That scatter stores each row's time, and the plot hides rows outside the same playhead window while the scrubber moves. Zoom reads those traces; the scene is not a fixed overview or a strided detail.
+Bins draws the 1.8 metric groups (dose error, dose ratio, dose rate, current ratio, IC current, position error, sigma, sigma error, IC2 minus IC1, and spot time) against energy, target MU, spot time, or radius. Energy is one bin per value and the other axes use quantile bins. Glyphs are violin, box, mean, scatter, and contour, with the 1.8 trend, histogram, correlation, fliers, the segment list, and interlock lines. Timeline stacks every channel of one timeslice source from the shared Y menu, and filters those rows with the segment list. The playhead is one more segment on that list for Bins, confidence, coverage, and the spectrum: the previous one second, or every row at or before the playhead. The slider marks each layer change, dark on the played portion and light ahead of the playhead. Timeline keeps the beam-gated samples in the time traces and fits those axes to the same window. An optional FFT column sits beside each channel, and an optional side column draws the distribution cloud for that same XY list: scatter, contour, or density. A timed scatter, contour, or density stores each row's time. While the scrubber moves, the plot hides scatter rows outside the playhead window and counts that same window into the density or contour. The distribution view does the same when its rows have a clock. Confidence, coverage, and the spectrum catch up once the playhead settles. Zoom reads those traces; the scene is not a fixed overview or a strided detail.
 
 ## SK-REQ-018
 
@@ -143,7 +143,7 @@ An analytic Gaussian splat peaks on the spot. The splat, ray march, gamma, DVH, 
 
 ## SK-REQ-028
 
-Volumetric draws a maximum-intensity projection, sagittal and coronal slices, depth and lateral profiles, a DVH, a gamma comparison with the requested charge, and a resampled projection.
+Volumetric draws a two-by-three workspace: axial, coronal, and sagittal slices, one 3D view, and two plots. Session plots start as depth dose and a lateral profile. A loaded planning CT uses the same grid, with the CT under the dose wash and structure outlines, and starts on a DVH and a gamma histogram. The gamma comparison uses the requested dose difference, distance, and low-dose cutoff.
 
 ## SK-REQ-030
 
@@ -159,11 +159,11 @@ Spot current sums, HV step capacitance, coverage percent, and session-log timeli
 
 ## SK-REQ-034
 
-Distribution and the timeline scatter draw Amplifier (V) from the command and the readback. Amplifier Error (V) is readback minus command.
+Distribution and the timeline side plot draw Amplifier (V) from the command and the readback. Amplifier Error (V) is readback minus command.
 
 ## SK-REQ-035
 
-Spot and timeslice tables store delivered dose per requested MU, position error as a radial distance, and that error with one nozzle offset removed. The offset is the mean of the finite samples on that chamber and axis. Sigma error is also stored as a percent of the expected width. These columns are analysis inputs. They are not a baseline and they do not report a pass.
+Spot and timeslice tables store delivered dose per requested MU, position error as a distance, and that error with one nozzle offset removed. The offset is the mean of the finite samples on that chamber and axis. Sigma error is also stored as a percent of the expected width. These columns are analysis inputs. They are not a baseline and they do not report a pass.
 
 ## Trace
 

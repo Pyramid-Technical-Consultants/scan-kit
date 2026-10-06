@@ -55,9 +55,9 @@ export { segmentChoices };
 const GRAIN_FIELDS = ["y", "x", "xy"] as const;
 
 /**
- * Timeline playback filters the scatter in the plot. A settled playhead still
- * has to rebuild the picture when the spectrum, confidence, or coverage depends
- * on that window.
+ * Timeline playback follows scatter, contour, and density in the plot. A settled
+ * playhead still rebuilds the picture when the spectrum, confidence, or coverage
+ * depends on that window.
  */
 export function playheadReplay(options: Readonly<Record<string, string>>): boolean {
   if (options.fft === "On") {
@@ -96,6 +96,23 @@ export function applyOption(
   id: string,
   value: string,
 ): Record<string, string> {
+  if (id === "preset") {
+    const next: Record<string, string> = { ...options, preset: "Custom" };
+    if (value === "Measured dose") {
+      next.compare = "Measured";
+      next.model = "Analytic";
+    } else if (value === "Difference") {
+      next.compare = "Difference";
+    } else if (value === "Gamma") {
+      next.compare = "Gamma";
+      next.dd = "3%";
+      next.dta = "2 mm";
+      next.cutoff = "10%";
+    } else if (value === "Monte Carlo") {
+      next.model = "Monte Carlo";
+    }
+    return next;
+  }
   if (id !== "source") {
     return { ...options, [id]: value };
   }

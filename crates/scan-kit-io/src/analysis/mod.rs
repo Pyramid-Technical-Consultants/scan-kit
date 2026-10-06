@@ -8,7 +8,7 @@ use scan_kit_core::{finite_minmax, resolve_concept_column, Control, Panel, PlotS
 use serde_json::{json, Value};
 
 pub(super) use super::discover;
-pub(super) use super::marks::{contour_bands, control, flag, labeled, pick, text};
+pub(super) use super::marks::{control, flag, labeled, pick, text};
 pub(super) use super::tables::{slice_table, spot_table, timeslice_metric, timeslice_signals};
 mod distribution;
 mod session_log;
@@ -80,6 +80,8 @@ fn scene(title: &str, panels: Vec<Panel>, controls: Vec<Control>) -> PlotScene {
         column_weights: Vec::new(),
         row_weights: Vec::new(),
         side: 0,
+        row_splits: Vec::new(),
+        volume: scan_kit_core::VolumeMark::default(),
     }
 }
 
@@ -226,7 +228,7 @@ fn series_span(series: &[Series]) -> (f32, f32, f32, f32) {
 }
 #[cfg(test)]
 mod tests {
-    use scan_kit_core::{Family, SESSION};
+    use scan_kit_core::{CloudStyle, Family, SESSION};
 
     use super::distribution::{distribution_limits, reference_ring};
     use super::timeline::{robust_span, trace};
@@ -974,6 +976,143 @@ mod tests {
     }
 
     #[test]
+    fn timeline_distribution_switches_scatter_contour_and_density() {
+        let off = scene_of("timeline");
+        assert_eq!(
+            off.controls
+                .iter()
+                .find(|control| control.id == "scatter")
+                .unwrap()
+                .label,
+            "Distribution"
+        );
+        assert!(off.controls.iter().all(|control| control.id != "draw"));
+
+        let scatter = opened(
+            "timeline",
+            "dist-scatter",
+            &json!({ "scatter": "On", "scatter_xy": "probe", "draw": "Scatter" }),
+        );
+        let style = scatter
+            .controls
+            .iter()
+            .find(|control| control.id == "draw")
+            .unwrap();
+        assert_eq!(style.labels(), vec!["Scatter", "Contour", "Density"]);
+        assert_eq!(style.value, "Scatter");
+        assert_eq!(style.group, "Distribution");
+        assert!(scatter
+            .controls
+            .iter()
+            .filter(|control| { matches!(control.id.as_str(), "scatter" | "scatter_xy" | "draw") })
+            .all(|control| control.group == "Distribution"));
+        assert!(scatter
+            .controls
+            .iter()
+            .all(|control| control.id != "hist_bins"));
+        assert!(has_kind(&scatter, "points"));
+        assert!(!has_kind(&scatter, "bars"));
+        assert!(!has_kind(&scatter, "heat"));
+
+        let density = opened(
+            "timeline",
+            "dist-density",
+            &json!({ "scatter": "On", "scatter_xy": "probe", "draw": "Density" }),
+        );
+        assert_eq!(
+            density
+                .controls
+                .iter()
+                .find(|control| control.id == "draw")
+                .unwrap()
+                .value,
+            "Density"
+        );
+        assert!(density
+            .controls
+            .iter()
+            .any(|control| { control.id == "ramp" && control.group == "Distribution" }));
+        assert!(has_kind(&density, "heat"));
+        assert!(!has_kind(&density, "bars"));
+        assert!(!density.panels.iter().any(|panel| {
+            panel
+                .series
+                .iter()
+                .any(|series| matches!(series, Series::Points { .. }))
+        }));
+        assert!(density.panels.iter().any(|panel| {
+            panel.series.iter().any(|series| {
+                matches!(
+                    series,
+                    Series::Cloud {
+                        times,
+                        style: CloudStyle::Density,
+                        ..
+                    } if !times.is_empty()
+                )
+            })
+        }));
+        let scrub = r#"{"on":true,"at":0.01,"speed":1,"window":"before"}"#;
+        let scrubbed = opened(
+            "timeline",
+            "dist-density-live",
+            &json!({ "scatter": "On", "scatter_xy": "probe", "draw": "Density", "scrub": scrub }),
+        );
+        let Some(Series::Cloud { times, .. }) = scrubbed
+            .panels
+            .iter()
+            .flat_map(|panel| &panel.series)
+            .find(|series| {
+                matches!(
+                    series,
+                    Series::Cloud {
+                        style: CloudStyle::Density,
+                        ..
+                    }
+                )
+            })
+        else {
+            panic!("a scrubbed density keeps the timed cloud");
+        };
+        assert!(
+            times.iter().any(|time| *time > 0.02),
+            "rows past the playhead stay in the density cloud {times:?}"
+        );
+
+        let contour = opened(
+            "timeline",
+            "dist-contour",
+            &json!({ "scatter": "On", "scatter_xy": "probe", "draw": "Contour" }),
+        );
+        assert_eq!(
+            contour
+                .controls
+                .iter()
+                .find(|control| control.id == "draw")
+                .unwrap()
+                .value,
+            "Contour"
+        );
+        assert!(contour.controls.iter().any(|control| {
+            control.id == "cutoff" && control.value == "5" && control.group == "Distribution"
+        }));
+        assert!(has_kind(&contour, "triangles"));
+        assert!(!has_kind(&contour, "bars"));
+        assert!(contour.panels.iter().any(|panel| {
+            panel.series.iter().any(|series| {
+                matches!(
+                    series,
+                    Series::Cloud {
+                        times,
+                        style: CloudStyle::Contour,
+                        ..
+                    } if !times.is_empty()
+                )
+            })
+        }));
+    }
+
+    #[test]
     fn replay_axis_ignores_a_single_spike() {
         let mut samples = vec![1.0f32; 400];
         samples[3] = 10_000.0;
@@ -1033,21 +1172,37 @@ mod tests {
 
     #[test]
     fn sk_req_028_volumetric_has_slices_dvh_and_gamma() {
-        let scene = scene_of("volumetric");
+        let scene = opened(
+            "volumetric",
+            "req-028",
+            &json!({"plot0": "DVH", "plot1": "Gamma histogram"}),
+        );
+        assert_eq!(scene.columns, 2);
+        assert_eq!(scene.panels.len(), 6);
         assert!(has_kind(&scene, "heat"));
         assert!(scene.panels.iter().any(|panel| panel.title.contains("DVH")));
         assert!(scene
             .panels
             .iter()
-            .any(|panel| panel.title.contains("gamma")));
+            .any(|panel| panel.title.contains("Gamma") && panel.title.contains('%')));
         assert!(scene
             .panels
             .iter()
-            .any(|panel| panel.title.contains("sagittal")));
+            .any(|panel| panel.title.contains("Sagittal")));
         assert!(scene
             .panels
             .iter()
-            .any(|panel| panel.title.contains("coronal")));
+            .any(|panel| panel.title.contains("Coronal")));
+        assert!(scene.panels.iter().any(|panel| panel.title == "3D"));
+        let defaults = scene_of("volumetric");
+        assert!(defaults
+            .panels
+            .iter()
+            .any(|panel| panel.title.contains("Depth")));
+        assert!(defaults
+            .panels
+            .iter()
+            .any(|panel| panel.title.contains("Lateral")));
         assert!(scene.panels.iter().any(|panel| {
             panel.series.iter().any(|series| {
                 matches!(
@@ -1072,7 +1227,7 @@ mod tests {
             "volumetric",
             &root,
             &["sess".into()],
-            &json!({"compare": "Difference", "scale": "Turbo"}),
+            &json!({"compare": "Difference", "scale": "Turbo", "plot1": "Gamma histogram"}),
         )
         .unwrap();
         let _ = std::fs::remove_dir_all(&root);
@@ -1091,7 +1246,7 @@ mod tests {
         assert!(scene
             .panels
             .iter()
-            .any(|panel| panel.title.contains("gamma") && panel.title.contains('%')));
+            .any(|panel| panel.title.contains("Gamma") && panel.title.contains('%')));
     }
 
     #[test]
@@ -1135,7 +1290,7 @@ mod tests {
         assert!(scene
             .panels
             .iter()
-            .any(|panel| panel.title.contains("gamma") && panel.title.contains('%')));
+            .any(|panel| panel.title.contains("Gamma") && panel.title.contains('%')));
         assert!(scene.table.as_ref().is_some_and(|table| {
             table.rows.iter().any(|row| {
                 row.iter()

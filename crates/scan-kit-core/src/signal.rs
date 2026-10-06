@@ -50,7 +50,8 @@ pub fn g2_ic2_mm(ic1_mm: &[f32], raw_ic2: &[f32]) -> Vec<f32> {
         if vals.is_empty() {
             return f32::MAX;
         }
-        crate::stats::median_unstable(&mut vals)
+        let mid = vals.len() / 2;
+        crate::stats::select_rank(&mut vals, mid)
     };
     if err(&fwd, true) < err(&fwd, false) {
         raw_ic2.iter().copied().map(remap_g2_raw_reversed).collect()
@@ -204,16 +205,17 @@ pub fn quantile_edges(values: &[f32], n_bins: usize) -> Vec<f32> {
         let lo = finite[0];
         return vec![lo - 0.5, lo + 0.5];
     }
-    let qs: Vec<f32> = (0..=n_bins).map(|step| step as f32 / n_bins as f32).collect();
+    let qs: Vec<f32> = (0..=n_bins)
+        .map(|step| step as f32 / n_bins as f32)
+        .collect();
     let mut edges = crate::stats::quantiles_at(&mut finite, &qs);
     edges.dedup_by(|a, b| (*a - *b).abs() < 1e-6);
     if edges.len() < 2 {
-        let lo = finite[0];
+        let lo = edges.first().copied().unwrap_or(0.0);
         return vec![lo - 0.5, lo + 0.5];
     }
     edges
 }
-
 
 /// Map each value to the center of its quantile bin. Out of range is NaN.
 ///
@@ -263,10 +265,8 @@ pub fn box_stats(values: &[f32]) -> Option<BoxStats> {
     if sorted.is_empty() {
         return None;
     }
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let q1 = quantile_sorted(&sorted, 0.25);
-    let median = quantile_sorted(&sorted, 0.5);
-    let q3 = quantile_sorted(&sorted, 0.75);
+    let quartiles = crate::stats::quantiles_at(&mut sorted, &[0.25, 0.5, 0.75]);
+    let [q1, median, q3] = [quartiles[0], quartiles[1], quartiles[2]];
     let iqr = q3 - q1;
     let fence_lo = q1 - 1.5 * iqr;
     let fence_hi = q3 + 1.5 * iqr;

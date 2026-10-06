@@ -129,9 +129,9 @@ const Y_QTY: &[YQty] = &[
         geometry: true,
     },
     YQty {
-        id: "position_radius",
-        label: "Position Radius (mm)",
-        icon: "position_radius",
+        id: "distance_error",
+        label: "Distance Error (mm)",
+        icon: "distance_error",
         detail: "Distance from the plan",
         spot: 2,
         slice: 1,
@@ -141,9 +141,9 @@ const Y_QTY: &[YQty] = &[
         geometry: true,
     },
     YQty {
-        id: "position_radius_rel",
-        label: "Relative Position Radius (mm)",
-        icon: "position_radius_rel",
+        id: "distance_error_rel",
+        label: "Relative Distance Error (mm)",
+        icon: "distance_error_rel",
         detail: "Distance after the nozzle offset",
         spot: 2,
         slice: 1,
@@ -889,7 +889,7 @@ fn name_needles(id: &str) -> &'static [&'static str] {
     match id {
         // Measured columns use several spellings. Plan `position_x` is not one of them.
         "sigma" | "sigma_error" | "sigma_error_pct" => &["sigma"],
-        "position_error" | "position_error_rel" | "position_radius" | "position_radius_rel" => {
+        "position_error" | "position_error_rel" | "distance_error" | "distance_error_rel" => {
             &["spot_position", "spot_raw", "_x_position", "_y_position"]
         }
         _ => &[],
@@ -1286,10 +1286,10 @@ mod tests {
                 "Position Error (mm) (Chamber)",
                 "Relative Position Error (mm) (Isocenter)",
                 "Relative Position Error (mm) (Chamber)",
-                "Position Radius (mm) (Isocenter)",
-                "Position Radius (mm) (Chamber)",
-                "Relative Position Radius (mm) (Isocenter)",
-                "Relative Position Radius (mm) (Chamber)",
+                "Distance Error (mm) (Isocenter)",
+                "Distance Error (mm) (Chamber)",
+                "Relative Distance Error (mm) (Isocenter)",
+                "Relative Distance Error (mm) (Chamber)",
                 "Sigma (mm) (Isocenter)",
                 "Sigma (mm) (Chamber)",
                 "Sigma Error (mm) (Isocenter)",
@@ -1325,8 +1325,8 @@ mod tests {
             vec![
                 "Position Error (mm)",
                 "Relative Position Error (mm)",
-                "Position Radius (mm)",
-                "Relative Position Radius (mm)",
+                "Distance Error (mm)",
+                "Relative Distance Error (mm)",
                 "Sigma (mm)",
                 "Sigma Error (mm)",
                 "Sigma Error (%)",

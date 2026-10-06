@@ -47,6 +47,109 @@ import {
 
 type Plotter = import("@/wasm/scan_kit_plot.js").WebPlot;
 
+type DoseFrame = { x: number; y: number; w: number; h: number };
+
+function isDoseFrame(value: unknown): value is DoseFrame {
+  if (typeof value !== "object" || value == null) {
+    return false;
+  }
+  const frame = value as DoseFrame;
+  return [frame.x, frame.y, frame.w, frame.h].every(
+    (item) => typeof item === "number" && Number.isFinite(item),
+  );
+}
+
+function exportStudyReport(table: { columns: readonly string[]; rows: readonly (readonly string[])[] }) {
+  const lines = [table.columns.join("\t"), ...table.rows.map((row) => row.join("\t"))];
+  const blob = new Blob([lines.join("\n")], { type: "text/plain" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = "scan-kit-report.txt";
+  link.click();
+  URL.revokeObjectURL(url);
+}
+
+function canvasScale(node: HTMLCanvasElement | null): { sx: number; sy: number } {
+  if (node == null) {
+    return { sx: 1, sy: 1 };
+  }
+  const rect = node.getBoundingClientRect();
+  return {
+    sx: rect.width > 0 ? node.width / rect.width : 1,
+    sy: rect.height > 0 ? node.height / rect.height : 1,
+  };
+}
+
+function DoseChrome({
+  controls,
+  frames,
+  scale,
+  resolved,
+  onChange,
+  onAction,
+}: {
+  controls: readonly ViewControl[];
+  frames: readonly DoseFrame[];
+  scale: { sx: number; sy: number };
+  resolved: Readonly<Record<string, string>>;
+  onChange: (id: string, value: string) => void;
+  onAction: (panel: number, action: string) => void;
+}) {
+  const sx = scale.sx > 0 ? scale.sx : 1;
+  const sy = scale.sy > 0 ? scale.sy : 1;
+  const items = [
+    { id: "cell0", panel: 0, kind: "cell" },
+    { id: "cell1", panel: 1, kind: "cell" },
+    { id: "cell2", panel: 2, kind: "cell" },
+    { id: "cell3", panel: 3, kind: "cell" },
+    { id: "plot0", panel: 4, kind: "plot" },
+    { id: "plot1", panel: 5, kind: "plot" },
+  ] as const;
+  return (
+    <>
+      {items.map((item) => {
+        const control = controls.find((entry) => entry.id === item.id);
+        const frame = frames[item.panel];
+        if (control == null || frame == null || frame.w < 8 || frame.h < 8) {
+          return null;
+        }
+        const value = resolved[item.id] ?? control.value;
+        const slice = item.kind === "cell" && value !== "3D";
+        const profile = item.kind === "plot" && value !== "DVH" && value !== "Gamma histogram";
+        return (
+          <div
+            key={item.id}
+            className="pointer-events-none absolute flex items-start justify-between"
+            style={{ left: frame.x / sx, top: frame.y / sy, width: frame.w / sx }}
+          >
+            <div className="pointer-events-auto flex">
+              {slice ? (
+                <Button type="button" size="sm" variant="outline" onClick={() => onAction(item.panel, "rotate")}>
+                  90°
+                </Button>
+              ) : null}
+              {slice || profile ? (
+                <Button type="button" size="sm" variant="outline" onClick={() => onAction(item.panel, "integral")}>
+                  ∫
+                </Button>
+              ) : null}
+            </div>
+            <div className="pointer-events-auto min-w-0">
+              <ChoiceSelect
+                control={control}
+                value={value}
+                disabled={false}
+                onChange={(next) => onChange(item.id, next)}
+              />
+            </div>
+          </div>
+        );
+      })}
+    </>
+  );
+}
+
 // A canvas keeps the first context it is given, and StrictMode mounts twice,
 // so each canvas gets one WebPlot for its lifetime.
 const plotters = new WeakMap<HTMLCanvasElement, Promise<Plotter>>();
@@ -213,18 +316,20 @@ export function AnalysisView({
     (text) => {
       setOptions((current) => (current.scrub === text ? current : { ...current, scrub: text }));
     },
-    viewId === "timeline",
+    viewId === "timeline" || viewId === "distribution",
     (next) => {
       playhead.current = next;
       slideRef.current(next, true);
     },
-    viewId === "timeline" && playheadReplay(options),
+    (viewId === "timeline" && playheadReplay(options)) || viewId === "distribution",
   );
   const [plotError, setPlotError] = useState<string | null>(null);
   const [quiet, setQuiet] = useState<string | null>(null);
   const [studyPath, setStudyPath] = useState<string | null>(null);
   const [study, setStudy] = useState<string | null>(null);
   const [size, setSize] = useState({ width: 960, height: 640 });
+  const [frames, setFrames] = useState<DoseFrame[]>([]);
+  const [frameScale, setFrameScale] = useState({ sx: 1, sy: 1 });
   const shown = (meta?.panels.length ?? 0) > 0;
 
   const requestDraw = () => {
@@ -262,7 +367,7 @@ export function AnalysisView({
 
   useEffect(() => {
     slideRef.current = (scrub, force) => {
-      if (viewId !== "timeline") {
+      if (viewId !== "timeline" && viewId !== "distribution") {
         return;
       }
       const plot = plotter.current as
@@ -380,7 +485,7 @@ export function AnalysisView({
     const order = orderKey === "" ? [] : orderKey.split("\0");
     const shown = shownSessionIds(order, hiddenKey === "" ? [] : hiddenKey.split("\0"));
     const plotOptions: Record<string, string> = { ...options };
-    if (viewId === "timeline") {
+    if (viewId === "timeline" || viewId === "distribution") {
       const head = playhead.current;
       plotOptions.scrub = JSON.stringify({
         on: head.on,
@@ -569,6 +674,24 @@ export function AnalysisView({
     };
   }, []);
 
+  useEffect(() => {
+    const plot = plotter.current;
+    const node = canvas.current;
+    if (node != null) {
+      setFrameScale(canvasScale(node));
+    }
+    if (viewId !== "volumetric" || plot == null) {
+      setFrames([]);
+      return;
+    }
+    try {
+      const parsed: unknown = JSON.parse(plot.frames());
+      setFrames(Array.isArray(parsed) ? parsed.filter(isDoseFrame) : []);
+    } catch {
+      setFrames([]);
+    }
+  }, [meta, size, viewId, settled]);
+
   const controls = meta?.controls ?? [];
   const resolved: Record<string, string> = {};
   for (const control of controls) {
@@ -581,7 +704,9 @@ export function AnalysisView({
     resolved[control.id] = stored != null && known ? stored : control.value;
   }
   const byId = new Map(controls.map((control) => [control.id, control]));
-  const sections = controlSections(controls);
+  const sections = controlSections(controls).filter(
+    (section) => viewId !== "volumetric" || (section.title !== "Cell" && section.title !== "Plot"),
+  );
   const apply = (id: string, value: string) => {
     setOptions((current) => applyOption(current, resolved, grains.current, id, value));
   };
@@ -694,6 +819,19 @@ export function AnalysisView({
         )}
         <div className={shown ? "relative min-h-0 flex-1" : "hidden"}>
           <canvas ref={canvas} className="absolute inset-0 h-full w-full touch-none" />
+          {viewId === "volumetric" ? (
+            <DoseChrome
+              controls={controls}
+              frames={frames}
+              scale={frameScale}
+              resolved={resolved}
+              onChange={apply}
+              onAction={(panel, action) => {
+                plotter.current?.dose_action(panel, action);
+                plotter.current?.render();
+              }}
+            />
+          ) : null}
         </div>
         {playback.shown ? (
           <ScrubBar
@@ -790,6 +928,11 @@ export function AnalysisView({
             }}
           >
             Close Study
+          </Button>
+        ) : null}
+        {viewId === "volumetric" && study != null && table != null && table.rows.length > 0 ? (
+          <Button variant="outline" onClick={() => exportStudyReport(table)}>
+            Export report
           </Button>
         ) : null}
         {study != null ? <pre className="text-muted-foreground text-xs whitespace-pre-wrap">{study}</pre> : null}

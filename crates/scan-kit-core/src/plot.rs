@@ -2,6 +2,14 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Density or contour built from a timed cloud.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CloudStyle {
+    Density,
+    Contour,
+}
+
 /// One drawable series in data coordinates.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -18,8 +26,8 @@ pub enum Series {
         color: [f32; 4],
         radius: f32,
         /// Sample time, one entry per point. Empty means the point is always drawn.
-        /// The timeline scatter fills this so playback can hide rows outside the
-        /// playhead without building the cloud again.
+        /// A live scatter fills this so playback can hide rows outside the playhead
+        /// without building the cloud again.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         times: Vec<f32>,
     },
@@ -64,6 +72,21 @@ pub enum Series {
         ys: Vec<f32>,
         color: [f32; 4],
         thickness: f32,
+    },
+    /// Timed samples a density or contour was counted from. The plot does not
+    /// draw these as dots. A playhead step counts the visible window into the
+    /// heatmap or contour that precedes this series.
+    Cloud {
+        xs: Vec<f32>,
+        ys: Vec<f32>,
+        times: Vec<f32>,
+        x0: f32,
+        x1: f32,
+        y0: f32,
+        y1: f32,
+        style: CloudStyle,
+        #[serde(default)]
+        cutoff: f32,
     },
 }
 
@@ -226,6 +249,39 @@ pub struct DataTable {
     pub rows: Vec<Vec<String>>,
 }
 
+/// Dose grid the plot uploads once. Slice and 3D cells sample it locally.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct VolumeMark {
+    /// Dose samples, x-fastest.
+    pub values: Vec<f32>,
+    /// CT samples under the wash. Empty leaves the wash on its own.
+    #[serde(default)]
+    pub ct: Vec<f32>,
+    /// Structure id per voxel. `0` is outside every outline.
+    #[serde(default)]
+    pub labels: Vec<u8>,
+    pub shape: [u32; 3],
+    pub origin: [f32; 3],
+    pub voxel: f32,
+    #[serde(default)]
+    pub ramp: u8,
+    #[serde(default)]
+    pub lo: f32,
+    #[serde(default)]
+    pub hi: f32,
+    /// 0 is treated as 1 when the plot attaches the grid.
+    #[serde(default)]
+    pub gain: f32,
+    #[serde(default)]
+    pub opacity: f32,
+    /// 0 integrate, 1 maximum, 2 transparent.
+    #[serde(default)]
+    pub mode: u8,
+    /// 0 nearest, 1 linear, 2 cubic.
+    #[serde(default)]
+    pub filter: u8,
+}
+
 /// What a view workflow returns before pixels are rendered.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PlotScene {
@@ -243,6 +299,13 @@ pub struct PlotScene {
     /// `0` keeps the row-major grid.
     #[serde(default)]
     pub side: u32,
+    /// Left and right weight of every row when `columns` is 2 and this holds
+    /// one pair per panel. Empty shares [`Self::column_weights`] across rows.
+    #[serde(default)]
+    pub row_splits: Vec<f32>,
+    /// Volume sampled by the dose workspace. Empty for every other view.
+    #[serde(default)]
+    pub volume: VolumeMark,
 }
 
 impl PlotScene {
@@ -256,6 +319,8 @@ impl PlotScene {
             column_weights: Vec::new(),
             row_weights: Vec::new(),
             side: 0,
+            row_splits: Vec::new(),
+            volume: VolumeMark::default(),
         }
     }
 }

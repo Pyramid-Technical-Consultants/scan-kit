@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Mutex, OnceLock};
 
-use scan_kit_core::{box_stats, linear_fit, Panel, Series};
+use scan_kit_core::{box_stats, cloud_series, linear_fit, scatter_cloud, CloudDraw, Panel, Series};
 
 use crate::histogram::histogram_panel;
 
@@ -286,13 +286,7 @@ pub(super) fn scatter_series(
             ys.push(*y);
         }
     }
-    Series::Points {
-        xs,
-        ys,
-        color,
-        radius: 2.5,
-        times: Vec::new(),
-    }
+    scatter_cloud(xs, ys, Vec::new(), color, 2.5)
 }
 
 pub(super) fn contour_series(
@@ -307,7 +301,12 @@ pub(super) fn contour_series(
             continue;
         };
         let Some(ys) = table.get(key) else { continue };
-        drawn.extend(contour_bands(xs, ys, cutoff_pct));
+        drawn.extend(cloud_series(
+            xs,
+            ys,
+            &[],
+            CloudDraw::Contour { cutoff: cutoff_pct },
+        ));
     }
     drawn
 }
@@ -651,7 +650,7 @@ pub(super) fn interlock_guides(
             guides.push(hline(xmin, xmax, -level, color));
         }
     }
-    if matches!(metric, "position_radius" | "position_radius_rel") {
+    if matches!(metric, "distance_error" | "distance_error_rel") {
         for (level, color) in [
             (1.0, [0.35, 0.75, 0.4, 0.85]),
             (2.0, [0.9, 0.6, 0.2, 0.85]),

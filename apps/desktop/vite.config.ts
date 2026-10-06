@@ -29,7 +29,10 @@ export default defineConfig(() => ({
         }
       : undefined,
     watch: {
-      ignored: ["**/src-tauri/**", "**/src/wasm/**"],
+      // The glue and the binary share function-table indices. Ignore only the
+      // binary so a regen reloads the glue; ignoring the folder serves the old
+      // glue against the new module (`__wasm_bindgen_func_elem_* is not a function`).
+      ignored: ["**/src-tauri/**", "**/src/wasm/**/*.wasm"],
     },
   },
 }));

@@ -170,7 +170,7 @@ pub(crate) fn apply_palette(scene: &mut scan_kit_core::PlotScene, palette: &[[f3
                         index += 1;
                     }
                 }
-                Series::Guide { .. } => {}
+                Series::Guide { .. } | Series::Cloud { .. } => {}
             }
         }
     }

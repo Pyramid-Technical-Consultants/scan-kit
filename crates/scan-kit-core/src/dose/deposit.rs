@@ -208,6 +208,7 @@ pub fn dose_frame(
     voxel_mm: f32,
     k_mu: f32,
     gap_mm: f32,
+    margin_mm: f32,
 ) -> DoseFrame {
     let (kernel, spots) = prepare(
         medium,
@@ -221,8 +222,15 @@ pub fn dose_frame(
     );
     let dose_mode = quantity == Quantity::Dose;
     let floor = (phantom_mm > 0.0).then_some(-phantom_mm);
-    let (origin, shape) = dose_grid(&spots, voxel_mm, floor);
+    let (mut origin, mut shape) = dose_grid(&spots, voxel_mm, floor);
     let voxel = voxel_mm.clamp(0.25, 10.0);
+    if margin_mm > 0.0 {
+        let cells = ((margin_mm / voxel).ceil() as usize).min(32);
+        origin[0] -= cells as f32 * voxel;
+        origin[1] -= cells as f32 * voxel;
+        shape[0] = (shape[0] + cells * 2).min(super::MAX_CELLS);
+        shape[1] = (shape[1] + cells * 2).min(super::MAX_CELLS);
+    }
     let focus = focus_index(&kernel, &spots, origin, shape, voxel, dose_mode);
     let visits = visit_count(&spots, origin, shape, voxel, dose_mode);
     DoseFrame {
@@ -726,6 +734,7 @@ mod tests {
             1.0,
             2.0e-8,
             10.0,
+            0.0,
         );
         assert!((frame.focus[0] as i32 - ix as i32).abs() <= 2);
         assert!((frame.focus[1] as i32 - iy as i32).abs() <= 2);
@@ -821,6 +830,7 @@ mod tests {
             1.0,
             2.0e-8,
             10.0,
+            0.0,
         );
         assert!(frame.planes_only(), "visits {}", frame.visits);
     }

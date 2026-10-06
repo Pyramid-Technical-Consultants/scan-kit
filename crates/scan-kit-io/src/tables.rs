@@ -3190,9 +3190,7 @@ fn plateau_mean(values: &[f32], gate: Option<&[f32]>) -> f32 {
     if on.len() < 10 {
         return f32::NAN;
     }
-    let mut sorted = on.clone();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let p95 = percentile(&sorted, 0.95);
+    let p95 = percentile(&on, 0.95);
     let floor = 5.0f32.max(0.75 * p95);
     let kept: Vec<f32> = on.into_iter().filter(|value| *value >= floor).collect();
     if kept.len() < 3 {

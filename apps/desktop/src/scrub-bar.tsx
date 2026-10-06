@@ -85,10 +85,11 @@ function samePlay(left: Scrub, right: Scrub): boolean {
 }
 
 /**
- * Timeline follows the playhead on the camera, and the scatter hides points
- * outside that window. Commit when the window shape changes. Commit a settled
- * playhead only when `replay` is set, so the spectrum can catch up. Other
- * views still send every playhead step, one task at a time.
+ * Timeline and distribution follow the playhead in the plot. Scatter slices its
+ * point buffer. Contour and density count that same slice. Commit when the window
+ * shape changes. Commit a settled playhead when `replay` is set, so the spectrum,
+ * confidence, coverage, and histograms can catch up. Other views still send every
+ * playhead step, one task at a time.
  */
 export function useScrub(
   controlValue: string | undefined,

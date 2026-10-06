@@ -7,9 +7,9 @@ pub fn robust_high(values: &[f32]) -> f32 {
     if kept.is_empty() {
         return 1.0;
     }
-    kept.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let index = ((kept.len() - 1) as f64 * 0.999) as usize;
-    kept[index].max(1e-6)
+    let last = kept.len() - 1;
+    let index = ((last as f64) * 0.999) as usize;
+    crate::stats::select_rank(&mut kept, index.min(last)).max(1e-6)
 }
 
 /// Bounding box of samples at or above `threshold`, in the same coordinates as the slice axes.

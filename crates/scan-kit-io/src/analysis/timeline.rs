@@ -42,10 +42,10 @@ pub(super) fn timeline(root: &Path, session_ids: &[String], options: &Value) -> 
         ],
     );
     // Time traces keep every beam-gated sample. Playback slides a camera across
-    // them and draws the playhead slice. The scatter keeps those samples too,
-    // with a time on each point, and the plot hides the ones outside the
-    // playhead. Confidence, coverage, and the spectrum still use the playhead,
-    // and catch up once it settles.
+    // them and draws the playhead slice. Scatter, contour, and density keep
+    // those samples too. Scatter draws a slice of the point buffer. Contour and
+    // density rebin that same slice. Confidence, coverage, and the spectrum
+    // still use the playhead, and catch up once it settles.
     let trace_segments: Vec<Segment> = segments
         .iter()
         .filter(|item| !matches!(item, Segment::Range { column, .. } if column == "time_s"))
@@ -145,16 +145,18 @@ pub(super) fn timeline(root: &Path, session_ids: &[String], options: &Value) -> 
             &scatter_headers,
             &query,
         );
-        let live = !matches!(scatter.xy, "confidence" | "coverage");
-        let filter = if live { &trace_segments } else { &segments };
-        panels.extend(super::distribution::scatter_panels(
+        let windowed = super::distribution::scatter_uses_playhead_window(scatter.xy, &options);
+        let filter = if windowed { &segments } else { &trace_segments };
+        let (side, side_controls) = super::distribution::scatter_panels(
             root,
             session_ids,
             scatter.xy,
             scatter.grain,
             filter,
-            live,
-        ));
+            &options,
+            !windowed,
+        );
+        panels.extend(side);
         let mut controls = time_controls(
             &picked.controls,
             channels,
@@ -165,6 +167,7 @@ pub(super) fn timeline(root: &Path, session_ids: &[String], options: &Value) -> 
         );
         controls.push(scatter_toggle(true));
         controls.extend(scatter.controls.into_iter().map(scatter_control));
+        controls.extend(side_controls);
         return finish(panels, controls, time_count, show_fft);
     }
     let mut controls = time_controls(
@@ -251,8 +254,8 @@ fn fft_toggle(on: bool) -> scan_kit_core::Control {
 }
 
 fn scatter_toggle(on: bool) -> scan_kit_core::Control {
-    control("scatter", "Scatter", &["Off", "On"], on_off(on))
-        .grouped("Scatter")
+    control("scatter", "Distribution", &["Off", "On"], on_off(on))
+        .grouped("Distribution")
         .checked()
 }
 
@@ -260,7 +263,7 @@ fn scatter_control(mut control: scan_kit_core::Control) -> scan_kit_core::Contro
     if control.id == "xy" {
         control.id = "scatter_xy".to_string();
     }
-    control.group = "Scatter".to_string();
+    control.group = "Distribution".to_string();
     control
 }
 

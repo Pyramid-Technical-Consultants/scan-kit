@@ -22,6 +22,7 @@ mod store;
 mod synthesis;
 mod tables;
 pub mod volumetric;
+mod workspace;
 
 pub use analysis::{analysis_scene, channel_catalog, load_timeslice_columns};
 pub use beam::{beam_record, protons_per_mu, spot_record};

@@ -11,7 +11,7 @@ use serde_json::Value;
 
 use super::discover;
 use super::histogram::{bin_button, bin_share, hist_bin_count, share_key, BinShare, BIN_CHOICES};
-use super::marks::{contour_bands, control, flag, labeled, pick, text};
+use super::marks::{control, flag, labeled, pick, text};
 mod glyphs;
 
 use super::tables::{median, same, session_columns, span, timeslice_energy_only, Grain};
@@ -390,16 +390,16 @@ const GROUPS: &[YGroup] = &[
         timeslice: false,
     },
     YGroup {
-        id: "position_radius",
-        label: "Position Radius (mm)",
+        id: "distance_error",
+        label: "Distance Error (mm)",
         series: POSITION_R,
         zero: true,
         filter: true,
         timeslice: false,
     },
     YGroup {
-        id: "position_radius_rel",
-        label: "Relative Position Radius (mm)",
+        id: "distance_error_rel",
+        label: "Relative Distance Error (mm)",
         series: POSITION_R_REL,
         zero: true,
         filter: true,
@@ -472,13 +472,8 @@ fn sources_for(metric: &str) -> &'static [(&'static str, &'static str)] {
     match metric {
         "current_ratio" | "ic_current" | "fit_confidence" | "peak_amplitude"
         | "amplifier_error" | "probe_field" => &SOURCE_CHOICES[2..3],
-        "position_error"
-        | "position_error_rel"
-        | "position_radius"
-        | "position_radius_rel"
-        | "sigma"
-        | "sigma_error"
-        | "sigma_error_pct" => &SOURCE_CHOICES[..3],
+        "position_error" | "position_error_rel" | "distance_error" | "distance_error_rel"
+        | "sigma" | "sigma_error" | "sigma_error_pct" => &SOURCE_CHOICES[..3],
         "ic12_pos_diff" => SOURCE_CHOICES,
         _ => &SOURCE_CHOICES[..1],
     }
@@ -696,8 +691,8 @@ pub(crate) fn bins(root: &Path, session_ids: &[String], options: &Value) -> Plot
             group.id,
             "position_error"
                 | "position_error_rel"
-                | "position_radius"
-                | "position_radius_rel"
+                | "distance_error"
+                | "distance_error_rel"
                 | "sigma"
                 | "sigma_error"
                 | "sigma_error_pct"
@@ -709,8 +704,8 @@ pub(crate) fn bins(root: &Path, session_ids: &[String], options: &Value) -> Plot
             group.id,
             "position_error"
                 | "position_error_rel"
-                | "position_radius"
-                | "position_radius_rel"
+                | "distance_error"
+                | "distance_error_rel"
                 | "sigma"
                 | "sigma_error"
                 | "sigma_error_pct"
@@ -766,7 +761,8 @@ pub(crate) fn bins(root: &Path, session_ids: &[String], options: &Value) -> Plot
             } else {
                 Grain::Spot
             };
-            let mut names: Vec<&str> = group.series.iter().map(|series| series.key).collect();
+            let metric: Vec<&str> = group.series.iter().map(|series| series.key).collect();
+            let mut names = metric.clone();
             names.push(x_column);
             let loaded = session_columns(root, session, grain, &names);
             let clock = time_end(loaded.get("time_s").map(Vec::as_slice));
@@ -776,7 +772,7 @@ pub(crate) fn bins(root: &Path, session_ids: &[String], options: &Value) -> Plot
                 loaded
             };
             (
-                plotted_columns(loaded.as_ref(), &names, &segments, group.filter),
+                plotted_columns(loaded.as_ref(), &names, &metric, &segments, group.filter),
                 clock,
             )
         };
@@ -956,8 +952,8 @@ pub(crate) fn bins(root: &Path, session_ids: &[String], options: &Value) -> Plot
                             group.id,
                             "position_error"
                                 | "position_error_rel"
-                                | "position_radius"
-                                | "position_radius_rel"
+                                | "distance_error"
+                                | "distance_error_rel"
                         ),
                 ));
             }
@@ -1002,6 +998,8 @@ pub(crate) fn bins(root: &Path, session_ids: &[String], options: &Value) -> Plot
         column_weights: weights,
         row_weights: Vec::new(),
         side: 0,
+        row_splits: Vec::new(),
+        volume: scan_kit_core::VolumeMark::default(),
     }
 }
 
@@ -1321,7 +1319,7 @@ fn controls(
 
 fn interlock_ok(metric: &str, x: &str, glyph: &str) -> bool {
     match metric {
-        "position_error" | "position_error_rel" | "position_radius" | "position_radius_rel" => true,
+        "position_error" | "position_error_rel" | "distance_error" | "distance_error_rel" => true,
         "dose_error" => x == "target_mu",
         "sigma" | "sigma_error" | "sigma_error_pct" => {
             x == "energy" && !matches!(glyph, "scatter" | "contour")
@@ -1459,15 +1457,18 @@ fn unique_values(tables: &[BTreeMap<String, Vec<f32>>], key: &str) -> Vec<f32> {
 
 /// Copy the columns this glyph reads and apply the mask there.
 ///
-/// The session table stays shared. `beam_on`, `expected_sigma`, and
+/// Rank looks at the metric columns only. The bin axis is copied so the groups
+/// still exist, and a high energy is not treated as an outlier of position or
+/// current. The session table stays shared. `beam_on`, `expected_sigma`, and
 /// `session_avg_rate` stay finite, matching `apply_mask`.
 fn plotted_columns(
     loaded: &BTreeMap<String, Vec<f32>>,
     names: &[&str],
+    rank_on: &[&str],
     segments: &[Segment],
     filter: bool,
 ) -> BTreeMap<String, Vec<f32>> {
-    let keys: Vec<&str> = names
+    let rank_on: Vec<&str> = rank_on
         .iter()
         .copied()
         .filter(|name| loaded.contains_key(*name))
@@ -1478,11 +1479,11 @@ fn plotted_columns(
         .cloned()
         .collect();
     let mask = if filter {
-        Some(row_mask(loaded, segments, &keys))
+        Some(row_mask(loaded, segments, &rank_on))
     } else if time_only.is_empty() {
         None
     } else {
-        Some(row_mask(loaded, &time_only, &keys))
+        Some(row_mask(loaded, &time_only, &rank_on))
     };
     let mut want: Vec<&str> = names.to_vec();
     for item in segments {
@@ -1586,7 +1587,8 @@ mod tests {
     use scan_kit_core::{apply_mask, parse_segments, BeamGate, Rank, Segment};
 
     use super::{
-        assign_x, axis_label, binned_trend, bins, scatter_series, violin_series, BinChoice, Trend,
+        assign_x, axis_label, binned_trend, bins, plotted_columns, scatter_series, violin_series,
+        BinChoice, Trend,
     };
 
     #[test]
@@ -2502,6 +2504,27 @@ mod tests {
             &["y"],
         );
         assert_eq!(finite(&mad), vec![1000.0]);
+
+        let mut mixed = BTreeMap::new();
+        mixed.insert("ic1_x_err".to_string(), vec![0.2, 0.2, 0.2, 8.0, 0.2]);
+        mixed.insert("energy".to_string(), vec![70.0, 100.0, 150.0, 70.0, 230.0]);
+        let ranked = plotted_columns(
+            &mixed,
+            &["ic1_x_err", "energy"],
+            &["ic1_x_err"],
+            &[Segment::Rank {
+                which: Rank::Lower95,
+            }],
+            true,
+        );
+        assert!(
+            ranked["energy"].contains(&230.0),
+            "the high energy stays {ranked:?}"
+        );
+        assert!(
+            !ranked["ic1_x_err"].contains(&8.0),
+            "the position outlier goes {ranked:?}"
+        );
 
         let mut off = fresh();
         apply_mask(
