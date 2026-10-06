@@ -20,43 +20,32 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 
+const CORE_ANALYSES = ["Timeline", "Bins", "Distribution", "Volumetric"] as const;
+
+const SPECIALIZED_ANALYSES = ["Session Log Compare", "IC HV Transient Test"] as const;
+
 const ANALYSIS_GROUPS = [
-  {
-    title: "Unified Views",
-    names: [
-      "Binned Summary",
-      "Distribution Explorer",
-      "Timeslice Replay",
-      "Dose Volume",
-      "Session Log Compare",
-    ],
-  },
-  {
-    title: "Specialized Analysis",
-    names: ["IC HV Transient Test"],
-  },
+  { title: "Core Analysis", names: CORE_ANALYSES },
+  { title: "Specialized Analysis", names: SPECIALIZED_ANALYSES },
 ] as const;
 
-export const PRIMARY_ANALYSES = [
-  "Binned Summary",
-  "Distribution Explorer",
-  "Timeslice Replay",
-] as const;
+/** Session-list buttons, in the same order as Core Analysis. */
+export const PRIMARY_ANALYSES = CORE_ANALYSES;
 
 const ANALYSIS_ICONS: Record<string, LucideIcon> = {
-  "Binned Summary": ChartColumn,
-  "Distribution Explorer": ChartScatter,
-  "Timeslice Replay": Play,
-  "Dose Volume": Layers,
+  "Bins": ChartColumn,
+  "Distribution": ChartScatter,
+  "Timeline": Play,
+  "Volumetric": Layers,
   "Session Log Compare": ScrollText,
   "IC HV Transient Test": Zap,
 };
 
 const ANALYSIS_IDS: Record<string, string> = {
-  "Binned Summary": "binned_summary",
-  "Distribution Explorer": "distribution",
-  "Timeslice Replay": "timeslice_replay",
-  "Dose Volume": "dose_volume",
+  "Bins": "bins",
+  "Distribution": "distribution",
+  "Timeline": "timeline",
+  "Volumetric": "volumetric",
   "Session Log Compare": "session_log_compare",
   "IC HV Transient Test": "ic_hv_transient",
 };

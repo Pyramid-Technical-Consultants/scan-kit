@@ -81,14 +81,74 @@ const Y_QTY: &[YQty] = &[
         geometry: false,
     },
     YQty {
-        id: "ic12_pos_diff",
-        label: "IC2-IC1 Position (mm)",
-        icon: "ic12_pos_diff",
-        detail: "IC2 minus IC1",
+        id: "dose_error",
+        label: "Dose Error (%)",
+        icon: "dose_error",
+        detail: "Measured against target",
+        spot: 1,
+        slice: 0,
+        concepts: &["ic1_total_dose", "ic2_total_dose"],
+        keys: &["ic1_dose", "ic1_dose_err_pct"],
+        energy_only: false,
+        geometry: false,
+    },
+    YQty {
+        id: "dose_per_mu",
+        label: "Dose per MU",
+        icon: "dose_per_mu",
+        detail: "Delivered over requested MU",
+        spot: 1,
+        slice: 0,
+        concepts: &["ic1_total_dose", "ic2_total_dose"],
+        keys: &["ic1_dose", "ic1_dose_per_mu"],
+        energy_only: false,
+        geometry: false,
+    },
+    YQty {
+        id: "position_error",
+        label: "Position Error (mm)",
+        icon: "position_error",
+        detail: "Measured minus plan",
         spot: 2,
-        slice: 2,
-        concepts: &["ic1_x_pos_raw", "ic2_x_pos_raw", "ic1_x_pos", "ic2_x_pos"],
-        keys: &["ic12_x_diff", "r_ic1_x_position", "r_ic2_x_position"],
+        slice: 1,
+        concepts: &["ic1_x_pos_raw", "ic1_y_pos_raw", "ic1_x_pos", "ic2_x_pos"],
+        keys: &["position_error_x", "ic1_x_err", "r_ic1_x_position"],
+        energy_only: true,
+        geometry: true,
+    },
+    YQty {
+        id: "position_error_rel",
+        label: "Relative Position Error (mm)",
+        icon: "position_error_rel",
+        detail: "Nozzle offset removed",
+        spot: 2,
+        slice: 1,
+        concepts: &["ic1_x_pos_raw", "ic1_y_pos_raw", "ic1_x_pos", "ic2_x_pos"],
+        keys: &["position_error_x", "ic1_x_err", "r_ic1_x_position"],
+        energy_only: true,
+        geometry: true,
+    },
+    YQty {
+        id: "position_radius",
+        label: "Position Radius (mm)",
+        icon: "position_radius",
+        detail: "Distance from the plan",
+        spot: 2,
+        slice: 1,
+        concepts: &["ic1_x_pos_raw", "ic1_y_pos_raw", "ic1_x_pos", "ic2_x_pos"],
+        keys: &["position_error_x", "ic1_x_err", "r_ic1_x_position"],
+        energy_only: true,
+        geometry: true,
+    },
+    YQty {
+        id: "position_radius_rel",
+        label: "Relative Position Radius (mm)",
+        icon: "position_radius_rel",
+        detail: "Distance after the nozzle offset",
+        spot: 2,
+        slice: 1,
+        concepts: &["ic1_x_pos_raw", "ic1_y_pos_raw", "ic1_x_pos", "ic2_x_pos"],
+        keys: &["position_error_x", "ic1_x_err", "r_ic1_x_position"],
         energy_only: true,
         geometry: true,
     },
@@ -101,6 +161,30 @@ const Y_QTY: &[YQty] = &[
         slice: 1,
         concepts: &[],
         keys: &["sigma", "ic1_sig_x", "spot_sigma", "ic1_sigma_x"],
+        energy_only: true,
+        geometry: true,
+    },
+    YQty {
+        id: "sigma_error",
+        label: "Sigma Error (mm)",
+        icon: "sigma_error",
+        detail: "Against expected",
+        spot: 2,
+        slice: 1,
+        concepts: &[],
+        keys: &["sigma_error", "ic1_sig_x"],
+        energy_only: true,
+        geometry: true,
+    },
+    YQty {
+        id: "sigma_error_pct",
+        label: "Sigma Error (%)",
+        icon: "sigma_error_pct",
+        detail: "Percent of expected width",
+        spot: 2,
+        slice: 1,
+        concepts: &[],
+        keys: &["sigma_error", "ic1_sig_x"],
         energy_only: true,
         geometry: true,
     },
@@ -141,38 +225,14 @@ const Y_QTY: &[YQty] = &[
         geometry: false,
     },
     YQty {
-        id: "dose_error",
-        label: "Dose Error (%)",
-        icon: "dose_error",
-        detail: "Measured against target",
-        spot: 1,
-        slice: 0,
-        concepts: &["ic1_total_dose", "ic2_total_dose"],
-        keys: &["ic1_dose", "ic1_dose_err_pct"],
-        energy_only: false,
-        geometry: false,
-    },
-    YQty {
-        id: "position_error",
-        label: "Position Error (mm)",
-        icon: "position_error",
-        detail: "Against the plan",
+        id: "ic12_pos_diff",
+        label: "IC2-IC1 Position (mm)",
+        icon: "ic12_pos_diff",
+        detail: "IC2 minus IC1",
         spot: 2,
-        slice: 1,
-        concepts: &["ic1_x_pos_raw", "ic1_y_pos_raw", "ic1_x_pos", "ic2_x_pos"],
-        keys: &["position_error_x", "ic1_x_err", "r_ic1_x_position"],
-        energy_only: true,
-        geometry: true,
-    },
-    YQty {
-        id: "sigma_error",
-        label: "Sigma Error (mm)",
-        icon: "sigma_error",
-        detail: "Against expected",
-        spot: 2,
-        slice: 1,
-        concepts: &[],
-        keys: &["sigma_error", "ic1_sig_x"],
+        slice: 2,
+        concepts: &["ic1_x_pos_raw", "ic2_x_pos_raw", "ic1_x_pos", "ic2_x_pos"],
+        keys: &["ic12_x_diff", "r_ic1_x_position", "r_ic2_x_position"],
         energy_only: true,
         geometry: true,
     },
@@ -295,6 +355,16 @@ const XY_MODE: &[XyMode] = &[
         geometry: true,
     },
     XyMode {
+        id: "position_error_rel",
+        label: "Relative Position Error (mm)",
+        icon: "position_error_rel",
+        detail: "Nozzle offset removed",
+        slice_only: false,
+        concepts: &["ic1_x_pos_raw", "ic1_x_pos"],
+        keys: &["position_error_x", "ic1_x_err"],
+        geometry: true,
+    },
+    XyMode {
         id: "sigma",
         label: "Sigma (mm)",
         icon: "sigma",
@@ -305,10 +375,20 @@ const XY_MODE: &[XyMode] = &[
         geometry: true,
     },
     XyMode {
-        id: "amplifier",
+        id: "amplifier_voltage",
         label: "Amplifier (V)",
         icon: "amplifier",
         detail: "Command and readback",
+        slice_only: true,
+        concepts: &["amplifier_cmd_x", "amplifier_readback_x"],
+        keys: &["amp_cmd_x", "amp_read_x", "c_x", "r_xV"],
+        geometry: false,
+    },
+    XyMode {
+        id: "amplifier",
+        label: "Amplifier Error (V)",
+        icon: "amplifier_error",
+        detail: "Readback minus command",
         slice_only: true,
         concepts: &["amplifier_cmd_x", "amplifier_readback_x"],
         keys: &["amp_x", "c_x", "r_xV"],
@@ -808,8 +888,10 @@ fn column_hits(
 fn name_needles(id: &str) -> &'static [&'static str] {
     match id {
         // Measured columns use several spellings. Plan `position_x` is not one of them.
-        "sigma" | "sigma_error" => &["sigma"],
-        "position_error" => &["spot_position", "spot_raw", "_x_position", "_y_position"],
+        "sigma" | "sigma_error" | "sigma_error_pct" => &["sigma"],
+        "position_error" | "position_error_rel" | "position_radius" | "position_radius_rel" => {
+            &["spot_position", "spot_raw", "_x_position", "_y_position"]
+        }
         _ => &[],
     }
 }
@@ -1195,12 +1277,29 @@ mod tests {
             .find(|control| control.id == "y")
             .unwrap();
         assert_eq!(
-            y.labels().into_iter().take(4).collect::<Vec<_>>(),
+            y.labels(),
             vec![
                 "Dose Ratios",
+                "Dose Error (%)",
+                "Dose per MU",
+                "Position Error (mm) (Isocenter)",
+                "Position Error (mm) (Chamber)",
+                "Relative Position Error (mm) (Isocenter)",
+                "Relative Position Error (mm) (Chamber)",
+                "Position Radius (mm) (Isocenter)",
+                "Position Radius (mm) (Chamber)",
+                "Relative Position Radius (mm) (Isocenter)",
+                "Relative Position Radius (mm) (Chamber)",
+                "Sigma (mm) (Isocenter)",
+                "Sigma (mm) (Chamber)",
+                "Sigma Error (mm) (Isocenter)",
+                "Sigma Error (mm) (Chamber)",
+                "Sigma Error (%) (Isocenter)",
+                "Sigma Error (%) (Chamber)",
+                "Dose Rate (MU/s)",
                 "IC2-IC1 Position (mm) (Isocenter)",
                 "IC2-IC1 Position (mm) (Chamber)",
-                "Sigma (mm) (Isocenter)",
+                "Spot Delivery Time (ms)",
             ]
         );
         assert!(y
@@ -1220,19 +1319,25 @@ mod tests {
             .iter()
             .find(|control| control.id == "y")
             .unwrap();
-        assert_eq!(y.value, "IC2-IC1 Position (mm) (Isocenter)");
+        assert_eq!(y.value, "Position Error (mm)");
         assert_eq!(
-            y.labels().into_iter().take(9).collect::<Vec<_>>(),
+            y.labels(),
             vec![
-                "IC2-IC1 Position (mm) (Isocenter)",
-                "IC2-IC1 Position (mm) (Chamber)",
+                "Position Error (mm)",
+                "Relative Position Error (mm)",
+                "Position Radius (mm)",
+                "Relative Position Radius (mm)",
                 "Sigma (mm)",
+                "Sigma Error (mm)",
+                "Sigma Error (%)",
                 "IC Current (nA)",
                 "Current Ratios (%)",
-                "Position Error (mm)",
-                "Sigma Error (mm)",
+                "IC2-IC1 Position (mm) (Isocenter)",
+                "IC2-IC1 Position (mm) (Chamber)",
                 "Amplifier Error (V)",
                 "Fit Confidence",
+                "Peak Amplitude",
+                "Probe Field (G)",
             ]
         );
         assert!(y.options.iter().all(|option| option != "Dose Error (%)"));
@@ -1264,7 +1369,21 @@ mod tests {
             .iter()
             .find(|control| control.id == "xy")
             .unwrap();
-        assert_eq!(xy.value, "Amplifier (V)");
+        assert_eq!(xy.value, "Amplifier Error (V)");
+        assert_eq!(
+            xy.labels(),
+            vec![
+                "Position (mm)",
+                "Position Error (mm)",
+                "Relative Position Error (mm)",
+                "Sigma (mm)",
+                "Amplifier (V)",
+                "Amplifier Error (V)",
+                "Probe (G)",
+                "Confidence",
+                "Coverage (%)",
+            ]
+        );
     }
 
     #[test]

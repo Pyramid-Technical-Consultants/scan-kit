@@ -272,7 +272,7 @@ mod tests {
         )
         .unwrap();
         let frame = run_view(
-            "binned_summary",
+            "bins",
             &root,
             &["sess".into()],
             &json!({}),
@@ -306,7 +306,7 @@ mod tests {
         )
         .unwrap();
         let opened = open_plot(
-            "binned_summary",
+            "bins",
             &root,
             &["sess".into()],
             &json!({}),

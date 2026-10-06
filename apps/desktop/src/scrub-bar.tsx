@@ -85,9 +85,10 @@ function samePlay(left: Scrub, right: Scrub): boolean {
 }
 
 /**
- * Timeslice Replay follows the playhead on the camera. Commit when the window
- * shape changes, and once `at` has settled, so the spectrum and scatter catch
- * up. Other views still send every playhead step, one task at a time.
+ * Timeline follows the playhead on the camera, and the scatter hides points
+ * outside that window. Commit when the window shape changes. Commit a settled
+ * playhead only when `replay` is set, so the spectrum can catch up. Other
+ * views still send every playhead step, one task at a time.
  */
 export function useScrub(
   controlValue: string | undefined,
@@ -95,6 +96,7 @@ export function useScrub(
   commit: (text: string) => void,
   cameraFollow: boolean,
   onMove: (scrub: Scrub) => void,
+  replay: boolean,
 ): {
   scrub: Scrub;
   playing: boolean;
@@ -186,6 +188,10 @@ export function useScrub(
       commitRef.current(scrubText(current));
       return;
     }
+    if (!replay) {
+      lastSent.current = current;
+      return;
+    }
     const handle = window.setTimeout(() => {
       if (pending.current) {
         return;
@@ -198,6 +204,7 @@ export function useScrub(
     return () => window.clearTimeout(handle);
   }, [
     cameraFollow,
+    replay,
     playing,
     scrub.on,
     scrub.at,

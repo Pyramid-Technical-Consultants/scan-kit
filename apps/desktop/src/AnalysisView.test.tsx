@@ -102,7 +102,7 @@ vi.mock("@tauri-apps/api/core", () => ({
                 { id: "rank", label: "Rank", detail: "", icon: "" },
               ],
               value: JSON.stringify([
-                { kind: "beam", state: "on" },
+                { kind: "beam", state: "both" },
                 { kind: "rank", which: "all" },
               ]),
             },
@@ -169,7 +169,7 @@ it("puts grouped controls on the right and returns to sessions", async () => {
     root = createRoot(host);
     root.render(
       <AnalysisView
-        viewId="binned_summary"
+        viewId="bins"
         folder="C:/data"
         sessions={[
           { id: "1093436476", note: "Morning" },
@@ -240,10 +240,19 @@ it("puts grouped controls on the right and returns to sessions", async () => {
     "Off",
     "Linear",
     "Polynomial",
-    "Beam On",
-    "Beam Off",
     "Both",
+    "On",
+    "Off",
+    "All",
+    "95%",
+    "5%",
+    "MAD",
   ]);
+  const lower = [...(aside?.querySelectorAll("[data-slot='toggle-group-item']") ?? [])].find(
+    (node) => node.textContent?.trim() === "95%",
+  );
+  expect(lower?.getAttribute("title")).toBe("Within the lower 95%");
+  expect(lower?.querySelector("svg")).not.toBeNull();
   expect(host.textContent).not.toContain("Show Box Outliers");
   expect(host.textContent).not.toContain("Trend Line");
   const energy = [...host.querySelectorAll("[data-slot='select-trigger']")].find((node) =>
@@ -269,7 +278,7 @@ it("opens another analysis from the menu beside Sessions", async () => {
     root = createRoot(host);
     root.render(
       <AnalysisView
-        viewId="binned_summary"
+        viewId="bins"
         folder="C:/data"
         sessions={[{ id: "a", note: "" }]}
         onBack={() => undefined}
@@ -287,18 +296,18 @@ it("opens another analysis from the menu beside Sessions", async () => {
     more?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
   });
   const item = [...document.querySelectorAll("[data-slot='dropdown-menu-item']")].find((node) =>
-    node.textContent?.includes("Dose Volume"),
+    node.textContent?.includes("Volumetric"),
   );
   expect(item).toBeInstanceOf(HTMLElement);
   expect(
     [...document.querySelectorAll("[data-slot='dropdown-menu-item']")].some((node) =>
-      node.textContent?.includes("Binned Summary"),
+      node.textContent?.includes("Bins"),
     ),
   ).toBe(false);
   await act(async () => {
     item?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
   });
-  expect(onOpenView).toHaveBeenCalledWith("dose_volume");
+  expect(onOpenView).toHaveBeenCalledWith("volumetric");
 });
 
 it("hides an unchecked session and keeps the other session's color", async () => {
@@ -308,7 +317,7 @@ it("hides an unchecked session and keeps the other session's color", async () =>
     root = createRoot(host);
     root.render(
       <AnalysisView
-        viewId="binned_summary"
+        viewId="bins"
         folder="C:/data"
         sessions={[
           { id: "a", note: "first" },
@@ -388,7 +397,7 @@ it("adds and removes a segment through the plot options", async () => {
     root = createRoot(host);
     root.render(
       <AnalysisView
-        viewId="binned_summary"
+        viewId="bins"
         folder="C:/data"
         sessions={[{ id: "a", note: "" }]}
         onBack={() => undefined}
@@ -433,7 +442,7 @@ it("keeps the playback bar on one row and arms it from the checkbox", async () =
     root = createRoot(host);
     root.render(
       <AnalysisView
-        viewId="binned_summary"
+        viewId="bins"
         folder="C:/data"
         sessions={[{ id: "a", note: "" }]}
         onBack={() => undefined}
@@ -542,7 +551,7 @@ it("plays the timeslice window without reloading each step", async () => {
     root = createRoot(host);
     root.render(
       <AnalysisView
-        viewId="timeslice_replay"
+        viewId="timeline"
         folder="C:/data"
         sessions={[{ id: "a", note: "" }]}
         onBack={() => undefined}
@@ -594,7 +603,7 @@ it("plays the timeslice window without reloading each step", async () => {
     await act(async () => {
       await new Promise((resolve) => setTimeout(resolve, 300));
     });
-    expect(starts()).toBe(armed + 1);
+    expect(starts()).toBe(armed);
   } finally {
     window.requestAnimationFrame = realFrame;
   }
@@ -616,7 +625,7 @@ it("keeps the timeslice picture when the next payload is empty", async () => {
     }
     polls += 1;
     const header = {
-      title: "Timeslice Replay",
+      title: "Timeline",
       controls: [
         {
           id: "scrub",
@@ -642,7 +651,7 @@ it("keeps the timeslice picture when the next payload is empty", async () => {
       root = createRoot(host);
       root.render(
         <AnalysisView
-          viewId="timeslice_replay"
+          viewId="timeline"
           folder="C:/data"
           sessions={[{ id: "a", note: "" }]}
           onBack={() => undefined}

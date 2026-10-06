@@ -14,7 +14,7 @@ use super::{
 /// Timeslice rows are 1 ms apart.
 const SAMPLE_S: f32 = 0.001;
 
-pub(super) fn replay(root: &Path, session_ids: &[String], options: &Value) -> PlotScene {
+pub(super) fn timeline(root: &Path, session_ids: &[String], options: &Value) -> PlotScene {
     let options = default_metric(options);
     let owned: Vec<(String, Vec<String>)> = session_ids
         .iter()
@@ -26,7 +26,7 @@ pub(super) fn replay(root: &Path, session_ids: &[String], options: &Value) -> Pl
         .collect();
     let picked =
         crate::source::select(crate::source::Shape::YAndX, false, true, &headers, &options);
-    let (quantity, channels) = crate::binned::channels_for(&picked.y);
+    let (quantity, channels) = crate::bins::channels_for(&picked.y);
     let grain = replay_grain(&picked.y, picked.frame);
     let keys: Vec<&str> = channels.iter().map(|series| series.key).collect();
     let tables = crate::tables::map_sessions(session_ids, |session| {
@@ -36,14 +36,16 @@ pub(super) fn replay(root: &Path, session_ids: &[String], options: &Value) -> Pl
         &options,
         &[
             Segment::Beam {
-                state: BeamGate::On,
+                state: BeamGate::Both,
             },
             Segment::Rank { which: Rank::All },
         ],
     );
     // Time traces keep every beam-gated sample. Playback slides a camera across
-    // them. The spectrum and the scatter still use the playhead, and catch up
-    // once it settles.
+    // them and draws the playhead slice. The scatter keeps those samples too,
+    // with a time on each point, and the plot hides the ones outside the
+    // playhead. Confidence, coverage, and the spectrum still use the playhead,
+    // and catch up once it settles.
     let trace_segments: Vec<Segment> = segments
         .iter()
         .filter(|item| !matches!(item, Segment::Range { column, .. } if column == "time_s"))
@@ -105,7 +107,7 @@ pub(super) fn replay(root: &Path, session_ids: &[String], options: &Value) -> Pl
             drawn,
             ymin,
             ymax,
-            &crate::binned::axis_label(series.label, quantity),
+            &crate::bins::axis_label(series.label, quantity),
         ));
         if show_fft {
             let columns: Vec<Vec<f32>> = tables
@@ -143,12 +145,15 @@ pub(super) fn replay(root: &Path, session_ids: &[String], options: &Value) -> Pl
             &scatter_headers,
             &query,
         );
+        let live = !matches!(scatter.xy, "confidence" | "coverage");
+        let filter = if live { &trace_segments } else { &segments };
         panels.extend(super::distribution::scatter_panels(
             root,
             session_ids,
             scatter.xy,
             scatter.grain,
-            &segments,
+            filter,
+            live,
         ));
         let mut controls = time_controls(
             &picked.controls,
@@ -186,7 +191,7 @@ fn finish(
         time_count
     };
     let side = panels.len().saturating_sub(rows);
-    let mut scene = scene("Timeslice Replay", panels, controls);
+    let mut scene = scene("Timeline", panels, controls);
     if fft && time_count > 0 && side > 0 {
         scene.columns = 2;
         scene.column_weights = vec![3.0, 1.4, 1.4];
@@ -206,7 +211,7 @@ fn finish(
 
 fn time_controls(
     source: &[scan_kit_core::Control],
-    channels: &[crate::binned::YSeries],
+    channels: &[crate::bins::YSeries],
     options: &Value,
     segments: &[Segment],
     end: f32,

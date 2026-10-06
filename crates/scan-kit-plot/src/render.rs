@@ -18,12 +18,20 @@
 //! simplified here for the current camera when several samples share a pixel,
 //! and that pass keeps the extrema in the pixel. A camera that gives a sample
 //! its own pixel draws it. Do not thin the series before it reaches this crate.
+//! Points that share a cell of a 4096 grid over the panel range keep the first
+//! sample. That is the mark that is uploaded, so a later zoom does not restore
+//! samples that shared the cell. A point series that carries a sample time keeps
+//! every sample, sorted by that time. A time trace is monotonic in x and keeps
+//! every sample too. Playback draws each of those as one buffer range inside
+//! the playhead window, not a new upload. Guides and panels that are not time
+//! traces stay whole draws.
 //! Heatmap value row 0 is the low data y. The texture is stored top-first, so
 //! that row is the last row of pixels. Those pixels are the catalog color for
 //! the series ramp, baked before upload.
 //! Draws stay within WebGL2: no base instance (bind a buffer slice instead) and
 //! one color target.
 
+use std::collections::HashSet;
 use std::num::NonZeroU64;
 
 use scan_kit_core::{
@@ -399,12 +407,24 @@ pub(crate) struct LineRec {
     pub id: u32,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub(crate) struct PointRec {
     pub p: [f32; 3],
     pub radius: f32,
     pub color: [f32; 4],
     pub id: u32,
+    /// Sample time. NaN is drawn in every playhead window.
+    pub time: f32,
+}
+
+impl PartialEq for PointRec {
+    fn eq(&self, other: &Self) -> bool {
+        self.p == other.p
+            && self.radius == other.radius
+            && self.color == other.color
+            && self.id == other.id
+            && self.time.to_bits() == other.time.to_bits()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -431,6 +451,22 @@ struct GlyphRec {
     color: [f32; 4],
 }
 
+/// One point series in a panel. A timed run is sorted by [`PointRec::time`].
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub(crate) struct PointRun {
+    pub start: u32,
+    pub count: u32,
+    pub timed: bool,
+}
+
+/// One line series. A monotonic stroke is sorted by x, so a playhead is one slice.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub(crate) struct LineRun {
+    pub start: u32,
+    pub count: u32,
+    pub monotonic: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct PanelBatch {
     pub line_start: u32,
@@ -441,6 +477,14 @@ pub(crate) struct PanelBatch {
     pub quad_count: u32,
     /// `(quad index, heatmap texture)` for each heatmap in the panel.
     pub heats: Vec<(u32, usize)>,
+    /// Empty means the whole point range is untimed. A payload from this crate
+    /// always fills it when the panel has points.
+    #[serde(default)]
+    pub point_runs: Vec<PointRun>,
+    /// Empty means draw `line_start..line_count` whole. A payload from this crate
+    /// always fills it when the panel has lines.
+    #[serde(default)]
+    pub line_runs: Vec<LineRun>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -484,6 +528,8 @@ struct Offscreen {
 pub(crate) const LINE_STRIDE: u64 = 64;
 pub(crate) const POINT_STRIDE: u64 = 48;
 pub(crate) const QUAD_STRIDE: u64 = 64;
+/// Cells across one axis of the panel range. Samples in one cell upload once.
+const POINT_CELLS: u32 = 4096;
 const GLYPH_STRIDE: u64 = 64;
 
 /// Canvas and offscreen sides are clamped to this range in device pixels.
@@ -506,6 +552,13 @@ pub struct Plot {
     pub(crate) encoded: Option<crate::payload::EncodedMarks>,
     /// Heat textures reused when the next payload has the same pixels.
     kept_heats: Option<Vec<HeatGpu>>,
+    /// Trace lines already on the GPU. A later payload can replace the tail.
+    kept_line_buf: Option<wgpu::Buffer>,
+    line_token: u64,
+    reuse_lines: bool,
+    line_prefix: u32,
+    /// Playhead window for timed points. `None` draws every sample.
+    time_window: Option<(f32, f32)>,
     gpu: Option<GpuMarks>,
     frame_buf: Option<wgpu::Buffer>,
     text_buf: Option<wgpu::Buffer>,
@@ -567,6 +620,11 @@ impl Plot {
             marks,
             encoded: None,
             kept_heats: None,
+            kept_line_buf: None,
+            line_token: 0,
+            reuse_lines: false,
+            line_prefix: 0,
+            time_window: None,
             panels,
             columns,
             weights,
@@ -625,11 +683,14 @@ impl Plot {
         }
     }
 
-    /// Slide time-panel cameras to `[lo, hi]`. `on == false` restores the full
-    /// traces. A zoom sticks when `force` is false. Spectrum (`Hz`) and side
-    /// panels stay put. Marks are not rebuilt.
+    /// Slide time-panel cameras to `[lo, hi]`. Timed points and monotonic time
+    /// traces draw the samples inside that window. `on == false` restores the
+    /// full traces and every point. A zoom sticks when `force` is false.
+    /// Spectrum and side panels stay put. Marks are not rebuilt. The window
+    /// updates even when a zoom sticks.
     #[cfg_attr(not(any(test, target_arch = "wasm32")), allow(dead_code))]
     pub(crate) fn follow_time(&mut self, on: bool, lo: f32, hi: f32, force: bool) {
+        self.time_window = (on && lo.is_finite() && hi.is_finite() && hi >= lo).then_some((lo, hi));
         let (lo, hi) = if on {
             (lo, hi)
         } else {
@@ -676,18 +737,51 @@ impl Plot {
 
     #[cfg_attr(not(any(test, target_arch = "wasm32")), allow(dead_code))]
     fn is_time_panel(&self, index: usize) -> bool {
+        // Time traces leave the x label empty. Spectrum, scatter, and the side
+        // column keep their own axes.
         self.panels
             .get(index)
-            .is_some_and(|panel| panel.x_label != "Hz")
+            .is_some_and(|panel| panel.x_label.is_empty())
             && index + (self.side as usize) < self.panels.len()
     }
 
     #[cfg_attr(not(any(test, target_arch = "wasm32")), allow(dead_code))]
     fn panel_span(&self, index: usize, lo: f32, hi: f32) -> Option<(f32, f32, f32, f32)> {
         let batch = self.marks.panels.get(index)?;
-        let start = batch.line_start as usize;
-        let end = start + batch.line_count as usize;
-        follow_span(self.marks.lines.get(start..end)?, lo, hi)
+        if batch.line_runs.is_empty() {
+            let start = batch.line_start as usize;
+            let end = start + batch.line_count as usize;
+            return follow_span(self.marks.lines.get(start..end)?, &[], lo, hi);
+        }
+        follow_span(&self.marks.lines, &batch.line_runs, lo, hi)
+    }
+
+    /// One draw range per stroke. Time panels clip monotonic strokes to the playhead.
+    fn line_draw_ranges(&self) -> Vec<Vec<(u32, u32)>> {
+        let windows: Vec<Option<(f32, f32)>> = (0..self.marks.panels.len())
+            .map(|index| {
+                if self.is_time_panel(index) {
+                    self.time_window
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let lines = &self.marks.lines;
+        let panels = &self.marks.panels;
+        panels
+            .iter()
+            .zip(windows)
+            .map(|(batch, window)| {
+                visible_line_draws(
+                    lines,
+                    batch.line_start,
+                    batch.line_count,
+                    &batch.line_runs,
+                    window,
+                )
+            })
+            .collect()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -773,24 +867,46 @@ impl Plot {
         let matrix =
             self.cameras[cell.panel].clip_from_data(cell.plot, width as f32, height as f32);
         let (w, h) = (width as f32, height as f32);
+        let clip = if self.is_time_panel(cell.panel) {
+            self.time_window
+        } else {
+            None
+        };
         let batch = &self.marks.panels[cell.panel];
         let hit = |id: u32| id.checked_sub(1);
         let points = &self.marks.points
             [batch.point_start as usize..(batch.point_start + batch.point_count) as usize];
         for point in points.iter().rev() {
+            if !point_shown(point.time, self.time_window) {
+                continue;
+            }
             let center = project(matrix, point.p, w, h);
             let reach = point.radius.max(1.0) + 0.5;
             if (center[0] - x).powi(2) + (center[1] - y).powi(2) <= reach * reach {
                 return hit(point.id);
             }
         }
-        let lines = &self.marks.lines
-            [batch.line_start as usize..(batch.line_start + batch.line_count) as usize];
-        for line in lines.iter().rev() {
-            let a = project(matrix, line.a, w, h);
-            let b = project(matrix, line.b, w, h);
-            if segment_distance(a, b, [x, y]) <= line.thickness.max(1.0) * 0.5 + 0.5 {
-                return hit(line.id);
+        let draws = visible_line_draws(
+            &self.marks.lines,
+            batch.line_start,
+            batch.line_count,
+            &batch.line_runs,
+            clip,
+        );
+        for (start, count) in draws.iter().rev() {
+            let Some(segments) = self
+                .marks
+                .lines
+                .get(*start as usize..(*start + *count) as usize)
+            else {
+                continue;
+            };
+            for line in segments.iter().rev() {
+                let a = project(matrix, line.a, w, h);
+                let b = project(matrix, line.b, w, h);
+                if segment_distance(a, b, [x, y]) <= line.thickness.max(1.0) * 0.5 + 0.5 {
+                    return hit(line.id);
+                }
             }
         }
         let covers = |quad: &QuadRec| {
@@ -895,6 +1011,7 @@ impl Plot {
 
     #[cfg(not(target_arch = "wasm32"))]
     fn paint_cpu(&mut self, width: u32, height: u32, layout: &[Cell]) -> Vec<u8> {
+        let line_draws = self.line_draw_ranges();
         let mut frame = Vec::with_capacity((width * height * 4) as usize);
         let pixel = rgba_bytes(self.background);
         for _ in 0..width * height {
@@ -931,14 +1048,24 @@ impl Plot {
                     cell.plot,
                 );
             }
-            for line in &self.marks.lines
-                [batch.line_start as usize..(batch.line_start + batch.line_count) as usize]
-            {
-                stroke_cpu(&mut frame, width, height, &matrix, line, cell.plot);
+            for (start, count) in &line_draws[cell.panel] {
+                let Some(segments) = self
+                    .marks
+                    .lines
+                    .get(*start as usize..(*start + *count) as usize)
+                else {
+                    continue;
+                };
+                for line in segments {
+                    stroke_cpu(&mut frame, width, height, &matrix, line, cell.plot);
+                }
             }
             for point in &self.marks.points
                 [batch.point_start as usize..(batch.point_start + batch.point_count) as usize]
             {
+                if !point_shown(point.time, self.time_window) {
+                    continue;
+                }
                 let px = project(matrix, point.p, width as f32, height as f32);
                 disc_cpu(
                     &mut frame,
@@ -1037,6 +1164,22 @@ impl Plot {
         let layout = self.layout(width, height);
         self.ensure_uploaded(gpu)?;
         self.ensure_uniforms(gpu, layout.len());
+        let window = self.time_window;
+        let line_draws = self.line_draw_ranges();
+        let points = &self.marks.points;
+        let panels = &self.marks.panels;
+        let point_draws: Vec<Vec<(u32, u32)>> = panels
+            .iter()
+            .map(|batch| {
+                visible_draws(
+                    points,
+                    batch.point_start,
+                    batch.point_count,
+                    &batch.point_runs,
+                    window,
+                )
+            })
+            .collect();
         let frames = layout
             .iter()
             .map(|cell| {
@@ -1127,25 +1270,21 @@ impl Plot {
                 }
                 pass.set_pipeline(&gpu.line_pipeline);
                 pass.set_bind_group(0, &self.uniform_groups[index], &[offset]);
-                if batch.line_count > 0 {
-                    pass.set_vertex_buffer(
-                        0,
-                        marks
-                            .lines
-                            .slice(u64::from(batch.line_start) * LINE_STRIDE..),
-                    );
-                    pass.draw(0..6, 0..batch.line_count);
+                for (start, count) in &line_draws[cell.panel] {
+                    pass.set_vertex_buffer(0, marks.lines.slice(u64::from(*start) * LINE_STRIDE..));
+                    pass.draw(0..6, 0..*count);
                 }
-                if batch.point_count > 0 {
+                let draws = &point_draws[cell.panel];
+                if !draws.is_empty() {
                     pass.set_pipeline(&gpu.point_pipeline);
                     pass.set_bind_group(0, &self.uniform_groups[index], &[offset]);
-                    pass.set_vertex_buffer(
-                        0,
-                        marks
-                            .points
-                            .slice(u64::from(batch.point_start) * POINT_STRIDE..),
-                    );
-                    pass.draw(0..6, 0..batch.point_count);
+                    for (start, count) in draws {
+                        pass.set_vertex_buffer(
+                            0,
+                            marks.points.slice(u64::from(*start) * POINT_STRIDE..),
+                        );
+                        pass.draw(0..6, 0..*count);
+                    }
                 }
                 let border_count = frames[index].1.len() as u32;
                 if let (true, Some(buffer)) = (border_count > 0, self.frame_buf.as_ref()) {
@@ -1203,6 +1342,77 @@ impl Plot {
         }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn line_marks(&self) -> &[LineRec] {
+        &self.marks.lines
+    }
+
+    pub(crate) fn carry_lines(&mut self, token: u64, reuse: bool, prefix: u32) {
+        self.line_token = token;
+        self.reuse_lines = reuse;
+        self.line_prefix = prefix;
+    }
+
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    pub(crate) fn needs_cached_lines(&self) -> bool {
+        self.reuse_lines
+    }
+
+    /// Keep trace lines from `previous` and append this payload's tail.
+    ///
+    /// Returns an error before it changes `previous` when the cache does not match.
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    pub(crate) fn adopt_lines(
+        &mut self,
+        previous: &mut Plot,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+    ) -> Result<(), String> {
+        if !self.reuse_lines {
+            return Ok(());
+        }
+        let prefix = self.line_prefix as usize;
+        if self.line_token == 0
+            || self.line_token != previous.line_token
+            || previous.marks.lines.len() < prefix
+        {
+            return Err("plot lines are not in the previous picture".into());
+        }
+        let suffix = self
+            .encoded
+            .as_mut()
+            .map(|encoded| std::mem::take(&mut encoded.lines))
+            .unwrap_or_default();
+        let offset = u64::from(self.line_prefix) * LINE_STRIDE;
+        let gpu_holds_prefix = previous
+            .gpu
+            .as_ref()
+            .is_some_and(|gpu| gpu.lines.size() >= offset);
+        if gpu_holds_prefix {
+            self.kept_line_buf = Some(reuse_line_buffer(previous, device, queue, offset, &suffix));
+            self.splice_cached_lines(previous);
+            return Ok(());
+        }
+        if let Some(bytes) = stitched_line_bytes(previous, offset as usize, &suffix) {
+            if let Some(encoded) = self.encoded.as_mut() {
+                encoded.lines = bytes;
+            }
+            self.splice_cached_lines(previous);
+            return Ok(());
+        }
+        Err("plot lines are not in the previous picture".into())
+    }
+
+    #[cfg_attr(not(any(test, target_arch = "wasm32")), allow(dead_code))]
+    pub(crate) fn splice_cached_lines(&mut self, previous: &mut Plot) {
+        let prefix = self.line_prefix as usize;
+        let suffix = std::mem::take(&mut self.marks.lines);
+        let mut lines = std::mem::take(&mut previous.marks.lines);
+        lines.truncate(prefix);
+        lines.extend(suffix);
+        self.marks.lines = lines;
+    }
+
     fn ensure_uploaded(&mut self, gpu: &PlotGpu) -> Result<(), GpuError> {
         if self.gpu.is_some() {
             return Ok(());
@@ -1222,6 +1432,7 @@ impl Plot {
                 })
                 .collect::<Result<Vec<_>, GpuError>>()?
         };
+        let kept_lines = self.kept_line_buf.take();
         let (lines, points, quads) = if let Some(encoded) = self.encoded.take() {
             (encoded.lines, encoded.points, encoded.quads)
         } else {
@@ -1231,8 +1442,13 @@ impl Plot {
                 encode_quads(&self.marks.quads),
             )
         };
+        let lines = if let Some(buffer) = kept_lines {
+            buffer
+        } else {
+            upload_buffer(&gpu.device, &gpu.queue, "lines", &lines)
+        };
         self.gpu = Some(GpuMarks {
-            lines: upload_buffer(&gpu.device, &gpu.queue, "lines", &lines),
+            lines,
             points: upload_buffer(&gpu.device, &gpu.queue, "points", &points),
             quads: upload_buffer(&gpu.device, &gpu.queue, "quads", &quads),
             heats,
@@ -1556,6 +1772,18 @@ fn text_vertex() -> wgpu::VertexBufferLayout<'static> {
 }
 
 pub(crate) fn build_marks(panels: &[Panel]) -> Marks {
+    build_marks_inner(panels, false)
+}
+
+/// Guides and other marks, with polyline samples counted but not stored.
+///
+/// The caller already has those line records. Batch ranges still address the
+/// full buffer, prefix first.
+pub(crate) fn build_marks_without_polylines(panels: &[Panel]) -> Marks {
+    build_marks_inner(panels, true)
+}
+
+fn build_marks_inner(panels: &[Panel], skip_polylines: bool) -> Marks {
     let mut lines = Vec::new();
     let mut points = Vec::new();
     let mut quads = Vec::new();
@@ -1563,10 +1791,13 @@ pub(crate) fn build_marks(panels: &[Panel]) -> Marks {
     let mut heatmap_size = Vec::new();
     let mut batches = Vec::new();
     let mut next_id = 1u32;
+    let mut cursor = 0u32;
     for panel in panels {
-        let line_start = lines.len() as u32;
+        let line_start = cursor;
         let point_start = points.len() as u32;
         let quad_start = quads.len() as u32;
+        let mut point_runs = Vec::new();
+        let mut line_runs = Vec::new();
         let mut pending = Vec::new();
         for series in &panel.series {
             let id = next_id;
@@ -1577,30 +1808,59 @@ pub(crate) fn build_marks(panels: &[Panel]) -> Marks {
                     ys,
                     color,
                     thickness,
+                } => {
+                    let start = cursor;
+                    let added = if skip_polylines {
+                        polyline_segments(xs, ys)
+                    } else {
+                        let before = lines.len();
+                        push_polyline(&mut lines, xs, ys, *color, *thickness, id);
+                        (lines.len() - before) as u32
+                    };
+                    cursor = cursor.saturating_add(added);
+                    if added > 0 {
+                        line_runs.push(LineRun {
+                            start,
+                            count: added,
+                            monotonic: true,
+                        });
+                    }
                 }
-                | Series::Guide {
+                Series::Guide {
                     xs,
                     ys,
                     color,
                     thickness,
                 } => {
+                    let start = cursor;
+                    let before = lines.len();
                     push_polyline(&mut lines, xs, ys, *color, *thickness, id);
+                    let added = (lines.len() - before) as u32;
+                    cursor = cursor.saturating_add(added);
+                    if added > 0 {
+                        line_runs.push(LineRun {
+                            start,
+                            count: added,
+                            monotonic: false,
+                        });
+                    }
                 }
                 Series::Points {
                     xs,
                     ys,
                     color,
                     radius,
+                    times,
                 } => {
-                    for (x, y) in xs.iter().zip(ys) {
-                        if x.is_finite() && y.is_finite() {
-                            points.push(PointRec {
-                                p: [*x, *y, 0.0],
-                                radius: *radius,
-                                color: *color,
-                                id,
-                            });
-                        }
+                    let before = points.len() as u32;
+                    push_points(&mut points, xs, ys, times, *color, *radius, id, panel);
+                    let count = points.len() as u32 - before;
+                    if count > 0 {
+                        point_runs.push(PointRun {
+                            start: before,
+                            count,
+                            timed: !times.is_empty(),
+                        });
                     }
                 }
                 Series::Bars {
@@ -1701,13 +1961,18 @@ pub(crate) fn build_marks(panels: &[Panel]) -> Marks {
         }
         batches.push(PanelBatch {
             line_start,
-            line_count: lines.len() as u32 - line_start,
+            line_count: cursor - line_start,
             point_start,
             point_count: points.len() as u32 - point_start,
             quad_start,
             quad_count,
             heats,
+            point_runs,
+            line_runs,
         });
+    }
+    if !skip_polylines {
+        debug_assert_eq!(cursor, lines.len() as u32);
     }
     Marks {
         lines,
@@ -1734,29 +1999,27 @@ fn solid_quad(a: [f32; 2], b: [f32; 2], color: [f32; 4], id: u32) -> QuadRec {
 #[cfg_attr(not(any(test, target_arch = "wasm32")), allow(dead_code))]
 /// Raw x extent and the padded y extent of one panel's strokes inside `[lo, hi]`.
 ///
-/// ponytail: each playhead step walks every segment in the panel. A multi-minute
-/// timeslice is a few hundred thousand of them. Binary-search each stroke if a
-/// profile shows this scan.
-fn follow_span(lines: &[LineRec], lo: f32, hi: f32) -> Option<(f32, f32, f32, f32)> {
+/// Each monotonic stroke is sorted by x, so the window is a binary search plus
+/// the samples that fall inside it. `runs` addresses `lines`. An empty `runs`
+/// scans `lines` by series id, which is the panel slice from an older payload.
+fn follow_span(
+    lines: &[LineRec],
+    runs: &[LineRun],
+    lo: f32,
+    hi: f32,
+) -> Option<(f32, f32, f32, f32)> {
     let mut x_lo = f32::MAX;
     let mut x_hi = f32::MIN;
     let mut y_lo = f32::MAX;
     let mut y_hi = f32::MIN;
-    let mut index = 0;
-    while index < lines.len() {
-        if lines[index].id == 0 {
-            index += 1;
-            continue;
-        }
-        let id = lines[index].id;
-        let start = index;
-        let mut end = index;
-        while end + 1 < lines.len() && lines[end + 1].id == id {
-            end += 1;
+    let mut absorb = |series: &[LineRec]| {
+        let (first, stop) = window_range(series, lo, hi);
+        if first >= stop {
+            return;
         }
         let mut ys = Vec::new();
         let mut previous: Option<[f32; 3]> = None;
-        for line in &lines[start..=end] {
+        for line in &series[first..stop] {
             if previous != Some(line.a) {
                 take_vertex(&mut ys, &mut x_lo, &mut x_hi, line.a, lo, hi);
             }
@@ -1767,9 +2030,43 @@ fn follow_span(lines: &[LineRec], lo: f32, hi: f32) -> Option<(f32, f32, f32, f3
             y_lo = y_lo.min(low);
             y_hi = y_hi.max(high);
         }
-        index = end + 1;
+    };
+    if runs.is_empty() {
+        let mut index = 0;
+        while index < lines.len() {
+            if lines[index].id == 0 {
+                index += 1;
+                continue;
+            }
+            let id = lines[index].id;
+            let start = index;
+            let mut end = index;
+            while end + 1 < lines.len() && lines[end + 1].id == id {
+                end += 1;
+            }
+            absorb(&lines[start..=end]);
+            index = end + 1;
+        }
+    } else {
+        for run in runs {
+            if !run.monotonic || run.count == 0 {
+                continue;
+            }
+            let Some(series) = lines.get(run.start as usize..(run.start + run.count) as usize)
+            else {
+                continue;
+            };
+            absorb(series);
+        }
     }
     (x_lo <= x_hi && y_lo <= y_hi).then_some((x_lo, x_hi, y_lo, y_hi))
+}
+
+/// Half-open segment range of a monotonic stroke whose x overlaps `[lo, hi]`.
+fn window_range(series: &[LineRec], lo: f32, hi: f32) -> (usize, usize) {
+    let first = series.partition_point(|line| line.b[0] < lo);
+    let stop = series.partition_point(|line| line.a[0] <= hi);
+    (first, stop)
 }
 
 #[cfg_attr(not(any(test, target_arch = "wasm32")), allow(dead_code))]
@@ -1789,6 +2086,237 @@ fn take_vertex(
     *x_lo = x_lo.min(x);
     *x_hi = x_hi.max(x);
     ys.push(y);
+}
+
+pub(crate) struct LineStamp {
+    pub token: u64,
+    pub prefix: u32,
+    pub reusable: bool,
+}
+
+/// Identity of the polyline samples. Guides are not part of it, so a scatter
+/// crosshair can change without rebuilding the traces.
+pub(crate) fn line_stamp(panels: &[Panel]) -> LineStamp {
+    let mut state = 0x9E37_79B1_85EB_CA87u64;
+    let mut prefix = 0u32;
+    for panel in panels {
+        for series in &panel.series {
+            let Series::Polyline {
+                xs,
+                ys,
+                color,
+                thickness,
+            } = series
+            else {
+                continue;
+            };
+            state = mix(state, xs.len() as u64);
+            state = mix(state, ys.len() as u64);
+            for value in xs.iter().chain(ys) {
+                state = mix(state, u64::from(value.to_bits()));
+            }
+            for channel in color {
+                state = mix(state, u64::from(channel.to_bits()));
+            }
+            state = mix(state, u64::from(thickness.to_bits()));
+            prefix = prefix.saturating_add(polyline_segments(xs, ys));
+        }
+    }
+    LineStamp {
+        token: state.max(1),
+        prefix,
+        reusable: prefix > 0 && polylines_are_prefix(panels),
+    }
+}
+
+fn mix(state: u64, value: u64) -> u64 {
+    state
+        .wrapping_add(value)
+        .wrapping_mul(0x517c_c1b7_2722_0a95)
+}
+
+fn polylines_are_prefix(panels: &[Panel]) -> bool {
+    let mut seen_guide = false;
+    for panel in panels {
+        for series in &panel.series {
+            match series {
+                Series::Guide { .. } => seen_guide = true,
+                Series::Polyline { .. } if seen_guide => return false,
+                _ => {}
+            }
+        }
+    }
+    true
+}
+
+fn polyline_segments(xs: &[f32], ys: &[f32]) -> u32 {
+    let mut prev = false;
+    let mut count = 0u32;
+    for (x, y) in xs.iter().zip(ys) {
+        let finite = x.is_finite() && y.is_finite();
+        if finite && prev {
+            count = count.saturating_add(1);
+        }
+        prev = finite;
+    }
+    count
+}
+
+fn point_shown(time: f32, window: Option<(f32, f32)>) -> bool {
+    let Some((lo, hi)) = window else {
+        return true;
+    };
+    !time.is_finite() || (time >= lo && time <= hi)
+}
+
+/// Draw ranges for one panel. A timed run is sorted, so the playhead is one slice.
+///
+/// ponytail: a "before" window draws every sample up to the playhead. A
+/// multi-minute dwell is one instanced draw of that prefix. If fill rate shows
+/// up, decimate the visible slice into the 4096 grid and upload that.
+fn visible_draws(
+    points: &[PointRec],
+    start: u32,
+    count: u32,
+    runs: &[PointRun],
+    window: Option<(f32, f32)>,
+) -> Vec<(u32, u32)> {
+    let mut draws = Vec::new();
+    if runs.is_empty() {
+        if count > 0 {
+            draws.push((start, count));
+        }
+        return draws;
+    }
+    for run in runs {
+        let (offset, shown) = if run.timed {
+            let Some(range) = points.get(run.start as usize..(run.start + run.count) as usize)
+            else {
+                continue;
+            };
+            if let Some((lo, hi)) = window {
+                let begin = range.partition_point(|point| point.time < lo);
+                let end = begin + range[begin..].partition_point(|point| point.time <= hi);
+                (begin, (end - begin) as u32)
+            } else {
+                (0usize, run.count)
+            }
+        } else {
+            (0usize, run.count)
+        };
+        if shown > 0 {
+            draws.push((run.start + offset as u32, shown));
+        }
+    }
+    draws
+}
+
+/// Draw ranges for one panel's lines. A monotonic time trace is one slice.
+///
+/// ponytail: a "before" window draws every segment up to the playhead. A
+/// multi-minute dwell is one instanced draw of that prefix per stroke. If fill
+/// rate shows up, bin the slice to one extrema pair per pixel column and upload
+/// that. The 1 s window is about a thousand segments and does not need it.
+fn visible_line_draws(
+    lines: &[LineRec],
+    start: u32,
+    count: u32,
+    runs: &[LineRun],
+    window: Option<(f32, f32)>,
+) -> Vec<(u32, u32)> {
+    let Some((lo, hi)) = window else {
+        return full_line_draw(start, count);
+    };
+    if runs.is_empty() {
+        return full_line_draw(start, count);
+    }
+    let mut draws = Vec::new();
+    for run in runs {
+        if run.count == 0 {
+            continue;
+        }
+        if !run.monotonic {
+            draws.push((run.start, run.count));
+            continue;
+        }
+        let Some(series) = lines.get(run.start as usize..(run.start + run.count) as usize) else {
+            continue;
+        };
+        let (first, stop) = window_range(series, lo, hi);
+        if first < stop {
+            draws.push((run.start + first as u32, (stop - first) as u32));
+        }
+    }
+    draws
+}
+
+fn full_line_draw(start: u32, count: u32) -> Vec<(u32, u32)> {
+    if count == 0 {
+        Vec::new()
+    } else {
+        vec![(start, count)]
+    }
+}
+
+/// One sample per cell. Overlapping dots in a scatter upload and shade once.
+///
+/// ponytail: the grid is fixed when the payload is built, 4096 cells on each
+/// axis of the panel range. A zoom that would split a cell still draws the
+/// kept sample. Upgrade: retain the series and rebuild marks on camera change.
+fn push_points(
+    points: &mut Vec<PointRec>,
+    xs: &[f32],
+    ys: &[f32],
+    times: &[f32],
+    color: [f32; 4],
+    radius: f32,
+    id: u32,
+    panel: &Panel,
+) {
+    if !times.is_empty() {
+        let start = points.len();
+        for ((x, y), time) in xs.iter().zip(ys).zip(times) {
+            if !x.is_finite() || !y.is_finite() || !time.is_finite() {
+                continue;
+            }
+            points.push(PointRec {
+                p: [*x, *y, 0.0],
+                radius,
+                color,
+                id,
+                time: *time,
+            });
+        }
+        points[start..].sort_by(|left, right| left.time.total_cmp(&right.time));
+        return;
+    }
+    let x0 = panel.xmin.min(panel.xmax);
+    let y0 = panel.ymin.min(panel.ymax);
+    let x_span = (panel.xmax - panel.xmin).abs().max(1.0e-12);
+    let y_span = (panel.ymax - panel.ymin).abs().max(1.0e-12);
+    let mut occupied = HashSet::with_capacity(xs.len().min(POINT_CELLS as usize));
+    for (x, y) in xs.iter().zip(ys) {
+        if !x.is_finite() || !y.is_finite() {
+            continue;
+        }
+        let cell =
+            (u64::from(point_cell(*x, x0, x_span)) << 32) | u64::from(point_cell(*y, y0, y_span));
+        if !occupied.insert(cell) {
+            continue;
+        }
+        points.push(PointRec {
+            p: [*x, *y, 0.0],
+            radius,
+            color,
+            id,
+            time: f32::NAN,
+        });
+    }
+}
+
+fn point_cell(value: f32, origin: f32, span: f32) -> u32 {
+    let t = ((value - origin) / span).clamp(0.0, 0.999_984);
+    ((t * POINT_CELLS as f32) as u32).min(POINT_CELLS - 1)
 }
 
 fn push_polyline(
@@ -2643,7 +3171,7 @@ pub(crate) fn encode_points(points: &[PointRec]) -> Vec<u8> {
         push4(&mut out, [point.p[0], point.p[1], point.p[2], point.radius]);
         push4(&mut out, point.color);
         push_u32(&mut out, point.id);
-        push_u32(&mut out, 0);
+        push_f32(&mut out, point.time);
         push_u32(&mut out, 0);
         push_u32(&mut out, 0);
     }
@@ -2660,6 +3188,7 @@ pub(crate) fn decode_points(bytes: &[u8]) -> Vec<PointRec> {
             radius: f32_at(chunk, 3),
             color: f32x4_at(chunk, 4),
             id: u32_at(chunk, 8),
+            time: f32_at(chunk, 9),
         })
         .collect()
 }
@@ -2806,6 +3335,63 @@ fn textured_group(
     })
 }
 
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+fn reuse_line_buffer(
+    previous: &mut Plot,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    offset: u64,
+    suffix: &[u8],
+) -> wgpu::Buffer {
+    let gpu = previous
+        .gpu
+        .as_mut()
+        .expect("trace lines are already uploaded");
+    let needed = (offset + suffix.len() as u64).max(4);
+    let dummy = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("lines-moved"),
+        size: 4,
+        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let current = std::mem::replace(&mut gpu.lines, dummy);
+    if current.size() >= needed {
+        if !suffix.is_empty() {
+            queue.write_buffer(&current, offset, suffix);
+        }
+        return current;
+    }
+    let next = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("lines"),
+        size: needed,
+        usage: wgpu::BufferUsages::VERTEX
+            | wgpu::BufferUsages::COPY_DST
+            | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    if offset > 0 && current.size() >= offset {
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        encoder.copy_buffer_to_buffer(&current, 0, &next, 0, offset);
+        queue.submit(Some(encoder.finish()));
+    }
+    if !suffix.is_empty() {
+        queue.write_buffer(&next, offset, suffix);
+    }
+    next
+}
+
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+fn stitched_line_bytes(previous: &Plot, prefix_bytes: usize, suffix: &[u8]) -> Option<Vec<u8>> {
+    let encoded = previous.encoded.as_ref()?;
+    if encoded.lines.len() < prefix_bytes {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(prefix_bytes + suffix.len());
+    bytes.extend_from_slice(&encoded.lines[..prefix_bytes]);
+    bytes.extend_from_slice(suffix);
+    Some(bytes)
+}
+
 fn upload_buffer(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -2815,7 +3401,9 @@ fn upload_buffer(
     let buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some(label),
         size: bytes.len().max(4) as u64,
-        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+        usage: wgpu::BufferUsages::VERTEX
+            | wgpu::BufferUsages::COPY_DST
+            | wgpu::BufferUsages::COPY_SRC,
         mapped_at_creation: false,
     });
     if !bytes.is_empty() {
@@ -3403,6 +3991,137 @@ mod tests {
     }
 
     #[test]
+    fn follow_time_hides_scatter_points_outside_the_playhead() {
+        let scene = PlotScene {
+            title: "replay".into(),
+            panels: vec![
+                time_panel(
+                    "",
+                    0.0,
+                    4.0,
+                    vec![0.0, 1.0, 2.0, 3.0],
+                    vec![1.0, 1.0, 1.0, 1.0],
+                ),
+                Panel {
+                    title: String::new(),
+                    y_label: String::new(),
+                    x_label: "mm".into(),
+                    xmin: -1.0,
+                    xmax: 4.0,
+                    ymin: -1.0,
+                    ymax: 4.0,
+                    series: vec![
+                        Series::Points {
+                            xs: vec![0.0, 2.0],
+                            ys: vec![0.0, 0.0],
+                            color: [0.1, 0.4, 0.9, 1.0],
+                            radius: 4.0,
+                            times: vec![0.0, 2.0],
+                        },
+                        Series::Points {
+                            xs: vec![1.0],
+                            ys: vec![1.0],
+                            color: [0.9, 0.2, 0.1, 1.0],
+                            radius: 4.0,
+                            times: Vec::new(),
+                        },
+                    ],
+                    x_labels: Vec::new(),
+                    equal: false,
+                },
+            ],
+            controls: Vec::new(),
+            table: None,
+            columns: 2,
+            column_weights: vec![3.0, 1.4],
+            row_weights: Vec::new(),
+            side: 1,
+        };
+        let mut plot = Plot::new(&scene, [0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0, 1.0]);
+        plot.apply(320, 180, &PlotInput::default());
+        let at = |plot: &Plot, x: f32, y: f32| {
+            let px = plot.project_data(1, x, y, 320, 180);
+            plot.hover(px[0], px[1]).3
+        };
+        plot.follow_time(true, 0.0, 0.5, true);
+        assert_eq!(at(&plot, 0.0, 0.0), Some(1));
+        assert_eq!(at(&plot, 2.0, 0.0), None);
+        assert_eq!(at(&plot, 1.0, 1.0), Some(2), "a point without a time stays");
+        plot.follow_time(true, 1.5, 2.5, true);
+        assert_eq!(at(&plot, 0.0, 0.0), None);
+        assert_eq!(at(&plot, 2.0, 0.0), Some(1));
+        plot.follow_time(false, 0.0, 0.0, true);
+        assert_eq!(at(&plot, 0.0, 0.0), Some(1));
+        assert_eq!(at(&plot, 2.0, 0.0), Some(1));
+        let draws = visible_draws(
+            &plot.marks.points,
+            0,
+            plot.marks.points.len() as u32,
+            &plot.marks.panels[1].point_runs,
+            Some((1.5, 2.5)),
+        );
+        assert_eq!(draws, vec![(1, 1), (2, 1)]);
+    }
+
+    #[test]
+    fn follow_time_draws_the_time_trace_inside_the_playhead() {
+        let scene = PlotScene {
+            title: "replay".into(),
+            panels: vec![
+                Panel {
+                    title: String::new(),
+                    y_label: String::new(),
+                    x_label: String::new(),
+                    xmin: 0.0,
+                    xmax: 4.0,
+                    ymin: 0.0,
+                    ymax: 10.0,
+                    series: vec![
+                        Series::Polyline {
+                            xs: vec![0.0, 1.0, 2.0, 3.0],
+                            ys: vec![1.0, 1.0, 1.0, 1.0],
+                            color: [1.0, 0.0, 0.0, 1.0],
+                            thickness: 2.0,
+                        },
+                        Series::Guide {
+                            xs: vec![10.0, 12.0],
+                            ys: vec![5.0, 5.0],
+                            color: [0.4, 0.4, 0.4, 1.0],
+                            thickness: 1.0,
+                        },
+                    ],
+                    x_labels: Vec::new(),
+                    equal: false,
+                },
+                time_panel("Hz", 1.0, 500.0, vec![10.0, 20.0], vec![0.0, 1.0]),
+            ],
+            controls: Vec::new(),
+            table: None,
+            columns: 2,
+            column_weights: Vec::new(),
+            row_weights: Vec::new(),
+            side: 0,
+        };
+        let mut plot = Plot::new(&scene, [0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0, 1.0]);
+        assert_eq!(plot.marks.lines.len(), 5);
+        let runs = &plot.marks.panels[0].line_runs;
+        assert!(runs[0].monotonic);
+        assert!(!runs[1].monotonic);
+        plot.follow_time(true, 0.5, 1.5, true);
+        assert_eq!(
+            plot.line_draw_ranges(),
+            vec![vec![(0, 2), (3, 1)], vec![(4, 1)]]
+        );
+        plot.follow_time(true, 0.0, 4.0, true);
+        assert_eq!(
+            plot.line_draw_ranges(),
+            vec![vec![(0, 3), (3, 1)], vec![(4, 1)]]
+        );
+        plot.follow_time(false, 0.0, 0.0, true);
+        assert_eq!(plot.line_draw_ranges(), vec![vec![(0, 4)], vec![(4, 1)]]);
+    }
+
+    #[test]
     fn gpu_and_cpu_pictures_agree() {
         let Ok(gpu) = crate::native_gpu() else {
             return;
@@ -3414,6 +4133,7 @@ mod tests {
                 ys: vec![3.0, 8.0],
                 color: [0.0, 0.0, 1.0, 1.0],
                 radius: 5.0,
+                times: Vec::new(),
             },
             Series::Bars {
                 edges: vec![1.0, 3.0, 5.0],
@@ -3471,6 +4191,7 @@ mod tests {
             ys: vec![5.0],
             color: [0.0, 0.0, 1.0, 1.0],
             radius: 6.0,
+            times: Vec::new(),
         });
         let mut plot = Plot::new(&scene, [0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0, 1.0]);
         plot.apply(200, 160, &PlotInput::default());
@@ -3491,6 +4212,39 @@ mod tests {
         assert_eq!(hover.3, Some(0));
         let empty = plot.project_data(0, 8.0, 9.0, 200, 160);
         assert_eq!(plot.hover(empty[0], empty[1]).3, None);
+    }
+
+    #[test]
+    fn scatter_samples_in_one_cell_upload_once() {
+        let mut xs = Vec::new();
+        let mut ys = Vec::new();
+        for index in 0..400 {
+            xs.push(1.0 + index as f32 * 1.0e-6);
+            ys.push(1.0);
+        }
+        xs.push(8.0);
+        ys.push(8.0);
+        let marks = build_marks(&[Panel {
+            title: String::new(),
+            y_label: String::new(),
+            x_label: String::new(),
+            xmin: 0.0,
+            xmax: 10.0,
+            ymin: 0.0,
+            ymax: 10.0,
+            series: vec![Series::Points {
+                xs,
+                ys,
+                color: [0.1, 0.2, 0.8, 1.0],
+                radius: 2.0,
+                times: Vec::new(),
+            }],
+            x_labels: Vec::new(),
+            equal: true,
+        }]);
+        assert_eq!(marks.points.len(), 2);
+        assert!((marks.points[0].p[0] - 1.0).abs() < 1.0e-4);
+        assert!((marks.points[1].p[0] - 8.0).abs() < 1.0e-4);
     }
 
     #[test]

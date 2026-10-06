@@ -50,8 +50,7 @@ pub fn g2_ic2_mm(ic1_mm: &[f32], raw_ic2: &[f32]) -> Vec<f32> {
         if vals.is_empty() {
             return f32::MAX;
         }
-        vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        vals[vals.len() / 2]
+        crate::stats::median_unstable(&mut vals)
     };
     if err(&fwd, true) < err(&fwd, false) {
         raw_ic2.iter().copied().map(remap_g2_raw_reversed).collect()
@@ -106,6 +105,84 @@ pub fn dose_error_pct(delivered: &[f32], target: &[f32]) -> Vec<f32> {
         })
         .collect()
 }
+
+/// `delivered / target`. A non-finite value or a zero target becomes NaN.
+pub fn dose_per_mu(delivered: &[f32], target: &[f32]) -> Vec<f32> {
+    delivered
+        .iter()
+        .zip(target)
+        .map(|(d, t)| {
+            if d.is_finite() && t.is_finite() && t.abs() > 1e-15 {
+                d / t
+            } else {
+                f32::NAN
+            }
+        })
+        .collect()
+}
+
+/// Distance from the origin. A non-finite axis becomes NaN.
+pub fn radial_mm(x: &[f32], y: &[f32]) -> Vec<f32> {
+    x.iter()
+        .zip(y)
+        .map(|(x, y)| {
+            if x.is_finite() && y.is_finite() {
+                x.hypot(*y)
+            } else {
+                f32::NAN
+            }
+        })
+        .collect()
+}
+
+/// Subtract the mean of the finite samples. A non-finite sample stays NaN.
+///
+/// ponytail: each row weighs the same, so a long timeslice spot outweighs a short
+/// one. The upgrade is a mean of per-spot centroids.
+pub fn remove_mean(values: &[f32]) -> Vec<f32> {
+    let mut sum = 0.0f64;
+    let mut count = 0u32;
+    for value in values {
+        if value.is_finite() {
+            sum += f64::from(*value);
+            count += 1;
+        }
+    }
+    if count == 0 {
+        return vec![f32::NAN; values.len()];
+    }
+    let mean = (sum / f64::from(count)) as f32;
+    values
+        .iter()
+        .map(|value| {
+            if value.is_finite() {
+                value - mean
+            } else {
+                f32::NAN
+            }
+        })
+        .collect()
+}
+
+/// Error as a percent of the expected width. Expected width is `measured - error`.
+pub fn sigma_error_pct(measured: &[f32], error_mm: &[f32]) -> Vec<f32> {
+    measured
+        .iter()
+        .zip(error_mm)
+        .map(|(measured, error)| {
+            if measured.is_finite() && error.is_finite() {
+                let expected = measured - error;
+                if expected > 1.0e-6 {
+                    error / expected * 100.0
+                } else {
+                    f32::NAN
+                }
+            } else {
+                f32::NAN
+            }
+        })
+        .collect()
+}
 /// Gate is on when the column is non-zero. An empty column is all off.
 pub fn beam_on_mask(gate: &[f32]) -> Vec<bool> {
     gate.iter()
@@ -122,17 +199,13 @@ pub fn quantile_edges(values: &[f32], n_bins: usize) -> Vec<f32> {
     if finite.is_empty() {
         return vec![0.0, 1.0];
     }
-    finite.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let n_bins = n_bins.max(1);
-    if finite.first() == finite.last() {
+    if finite.iter().all(|value| *value == finite[0]) {
         let lo = finite[0];
         return vec![lo - 0.5, lo + 0.5];
     }
-    let mut edges = Vec::with_capacity(n_bins + 1);
-    for i in 0..=n_bins {
-        let q = i as f32 / n_bins as f32;
-        edges.push(quantile_sorted(&finite, q));
-    }
+    let qs: Vec<f32> = (0..=n_bins).map(|step| step as f32 / n_bins as f32).collect();
+    let mut edges = crate::stats::quantiles_at(&mut finite, &qs);
     edges.dedup_by(|a, b| (*a - *b).abs() < 1e-6);
     if edges.len() < 2 {
         let lo = finite[0];
@@ -141,16 +214,6 @@ pub fn quantile_edges(values: &[f32], n_bins: usize) -> Vec<f32> {
     edges
 }
 
-fn quantile_sorted(sorted: &[f32], q: f32) -> f32 {
-    if sorted.is_empty() {
-        return f32::NAN;
-    }
-    let pos = q.clamp(0.0, 1.0) * (sorted.len() - 1) as f32;
-    let lo = pos.floor() as usize;
-    let hi = pos.ceil() as usize;
-    let t = pos - lo as f32;
-    sorted[lo] * (1.0 - t) + sorted[hi] * t
-}
 
 /// Map each value to the center of its quantile bin. Out of range is NaN.
 ///
@@ -268,7 +331,7 @@ pub fn histogram(values: &[f32], bins: usize) -> (Vec<f32>, Vec<f32>) {
     (edges, counts)
 }
 
-/// Welch PSD. Timeslice Replay asks for 4096-sample segments, 50% overlap, and `fs` 1000.
+/// Welch PSD. Timeline asks for 4096-sample segments, 50% overlap, and `fs` 1000.
 ///
 /// The segment length is a power of two. A shorter trace uses the largest such
 /// length that fits, and at least 16 samples.
@@ -852,6 +915,24 @@ pub fn resample_nearest(source: &[f32], shape: [usize; 3], out_shape: [usize; 3]
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sk_req_035_relative_position_radius_sigma_percent_and_dose_per_mu() {
+        let per_mu = dose_per_mu(&[2.0, 1.0], &[1.0, 0.0]);
+        assert!((per_mu[0] - 2.0).abs() < 1e-5);
+        assert!(per_mu[1].is_nan());
+        let radius = radial_mm(&[3.0, f32::NAN], &[4.0, 1.0]);
+        assert!((radius[0] - 5.0).abs() < 1e-5);
+        assert!(radius[1].is_nan());
+        let residual = remove_mean(&[1.0, 3.0, f32::NAN]);
+        assert!((residual[0] + 1.0).abs() < 1e-5);
+        assert!((residual[1] - 1.0).abs() < 1e-5);
+        assert!(residual[2].is_nan());
+        assert!(remove_mean(&[f32::NAN]).iter().all(|value| value.is_nan()));
+        let percent = sigma_error_pct(&[11.0, 5.0], &[1.0, f32::NAN]);
+        assert!((percent[0] - 10.0).abs() < 1e-4);
+        assert!(percent[1].is_nan());
+    }
 
     #[test]
     fn sk_req_010_remap_calibration_and_beam_mask() {

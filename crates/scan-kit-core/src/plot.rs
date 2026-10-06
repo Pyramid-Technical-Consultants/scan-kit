@@ -17,6 +17,11 @@ pub enum Series {
         ys: Vec<f32>,
         color: [f32; 4],
         radius: f32,
+        /// Sample time, one entry per point. Empty means the point is always drawn.
+        /// The timeline scatter fills this so playback can hide rows outside the
+        /// playhead without building the cloud again.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        times: Vec<f32>,
     },
     Bars {
         edges: Vec<f32>,

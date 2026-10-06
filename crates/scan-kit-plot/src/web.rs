@@ -111,9 +111,17 @@ impl WebPlot {
     /// Replace the scene with a payload from `scan_kit_open_plot`.
     pub fn load(&mut self, bytes: &[u8]) -> Result<(), JsValue> {
         let mut plot = Plot::from_payload(bytes).map_err(|err| JsValue::from_str(&err))?;
-        if let Some(previous) = self.plot.take() {
+        if let Some(mut previous) = self.plot.take() {
+            if let Err(err) = plot.adopt_lines(&mut previous, &self.gpu.device, &self.gpu.queue) {
+                self.plot = Some(previous);
+                return Err(JsValue::from_str(&err));
+            }
             plot.adopt_view(&previous);
             plot.keep_heatmaps(previous);
+        } else if plot.needs_cached_lines() {
+            return Err(JsValue::from_str(
+                "plot lines are not in the previous picture",
+            ));
         }
         plot.apply(self.config.width, self.config.height, &PlotInput::default());
         self.plot = Some(plot);

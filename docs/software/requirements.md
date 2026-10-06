@@ -79,7 +79,7 @@ Spot position remap, dose ratio, dose error, calibration, and the beam-state fil
 
 ## SK-REQ-011
 
-A timeslice load returns device-unit columns and the `input_map.csv` energy lookup length. The channel catalog lists the concepts present for Replay.
+A timeslice load returns device-unit columns and the `input_map.csv` energy lookup length. The channel catalog lists the concepts present for Timeline.
 
 ## SK-REQ-012
 
@@ -87,7 +87,7 @@ Withdrawn. Dose Accumulation is not an analysis view.
 
 ## SK-REQ-013
 
-Withdrawn. IC Peak Amplitude — Beam-Off is not an analysis view. Peak amplitude remains a timeslice source for Distribution Explorer.
+Withdrawn. IC Peak Amplitude — Beam-Off is not an analysis view. Peak amplitude remains a timeslice source for Distribution.
 
 ## SK-REQ-014
 
@@ -95,7 +95,7 @@ Withdrawn. Beam Error Motion vs Energy is not an analysis view.
 
 ## SK-REQ-015
 
-Distribution Explorer draws position, position error, or sigma as scatter or a density grid. Confidence is beam-on confidence against peak amplitude. Coverage is the percent of spots whose confidence stays above each threshold.
+Distribution draws position, position error, or sigma as scatter or a density grid. Confidence is beam-on confidence against peak amplitude. Coverage is the percent of spots whose confidence stays above each threshold.
 
 ## SK-REQ-016
 
@@ -103,11 +103,11 @@ Binned summaries use quantile bin edges and a histogram of the values in each bi
 
 ## SK-REQ-017
 
-Binned Summary draws the 1.8 metric groups (dose error, dose ratio, dose rate, current ratio, IC current, position error, sigma, sigma error, IC2 minus IC1, and spot time) against energy, target MU, spot time, or radius. Energy is one bin per value and the other axes use quantile bins. Glyphs are violin, box, mean, scatter, and contour, with the 1.8 trend, histogram, correlation, fliers, the segment list, and interlock lines. Timeslice Replay stacks every channel of one timeslice source from the shared Y menu, and filters those rows with the segment list. The playhead is one more segment on that list for Binned Summary, Distribution Explorer, the spectrum, and the scatter: the previous one second, or every row at or before the playhead. The slider marks each layer change, dark on the played portion and light ahead of the playhead. Timeslice Replay keeps the beam-gated samples in the time traces and fits those axes to the same window. An optional FFT column sits beside each channel, and an optional side scatter draws timeslice rows, with the Distribution Explorer XY list. Zoom reads those traces; the scene is not a fixed overview or a strided detail.
+Bins draws the 1.8 metric groups (dose error, dose ratio, dose rate, current ratio, IC current, position error, sigma, sigma error, IC2 minus IC1, and spot time) against energy, target MU, spot time, or radius. Energy is one bin per value and the other axes use quantile bins. Glyphs are violin, box, mean, scatter, and contour, with the 1.8 trend, histogram, correlation, fliers, the segment list, and interlock lines. Timeline stacks every channel of one timeslice source from the shared Y menu, and filters those rows with the segment list. The playhead is one more segment on that list for Bins, Distribution, and the spectrum: the previous one second, or every row at or before the playhead. The slider marks each layer change, dark on the played portion and light ahead of the playhead. Timeline keeps the beam-gated samples in the time traces and fits those axes to the same window. An optional FFT column sits beside each channel, and an optional side scatter draws every beam-gated timeslice row, with the Distribution XY list. That scatter stores each row's time, and the plot hides rows outside the same playhead window while the scrubber moves. Zoom reads those traces; the scene is not a fixed overview or a strided detail.
 
 ## SK-REQ-018
 
-Timeslice Replay can draw a Welch spectrum beside each channel, from 1 Hz to 500 Hz, using 4096-sample segments and 50% overlap.
+Timeline can draw a Welch spectrum beside each channel, from 1 Hz to 500 Hz, using 4096-sample segments and 50% overlap.
 
 ## SK-REQ-019
 
@@ -131,7 +131,7 @@ Session Log Compare returns overview counts, timeline rows, error issues, watchd
 
 ## SK-REQ-025
 
-IC1 sits 100 mm downstream of IC2. Dose Volume uses that separation.
+IC1 sits 100 mm downstream of IC2. Volumetric uses that separation.
 
 ## SK-REQ-026
 
@@ -143,7 +143,7 @@ An analytic Gaussian splat peaks on the spot. The splat, ray march, gamma, DVH, 
 
 ## SK-REQ-028
 
-Dose Volume draws a maximum-intensity projection, sagittal and coronal slices, depth and lateral profiles, a DVH, a gamma comparison with the requested charge, and a resampled projection.
+Volumetric draws a maximum-intensity projection, sagittal and coronal slices, depth and lateral profiles, a DVH, a gamma comparison with the requested charge, and a resampled projection.
 
 ## SK-REQ-030
 
@@ -156,6 +156,14 @@ A DICOM folder of explicit little-endian files indexes by modality. A clinical g
 ## SK-REQ-033
 
 Spot current sums, HV step capacitance, coverage percent, and session-log timeline comparison match their reference cases.
+
+## SK-REQ-034
+
+Distribution and the timeline scatter draw Amplifier (V) from the command and the readback. Amplifier Error (V) is readback minus command.
+
+## SK-REQ-035
+
+Spot and timeslice tables store delivered dose per requested MU, position error as a radial distance, and that error with one nozzle offset removed. The offset is the mean of the finite samples on that chamber and axis. Sigma error is also stored as a percent of the expected width. These columns are analysis inputs. They are not a baseline and they do not report a pass.
 
 ## Trace
 

@@ -13,8 +13,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use super::discover;
 use scan_kit_core::{
-    column_scale_factor, dose_error_pct, dose_ratio_pct, finite_minmax, g2_ic2_mm, linear_fit,
-    median_unstable, percentile_linear, remap, remap_g2_raw, remap_g3_raw, scale_column,
+    column_scale_factor, dose_error_pct, dose_per_mu, dose_ratio_pct, finite_minmax, g2_ic2_mm,
+    linear_fit, median_unstable, percentile_linear, radial_mm, remap, remap_g2_raw, remap_g3_raw,
+    remove_mean, scale_column, sigma_error_pct,
 };
 
 #[derive(Clone)]
@@ -332,6 +333,14 @@ fn sample_fill(name: &str) -> u8 {
             | "ic1_y_err"
             | "ic2_x_err"
             | "ic2_y_err"
+            | "ic1_x_err_rel"
+            | "ic1_y_err_rel"
+            | "ic2_x_err_rel"
+            | "ic2_y_err_rel"
+            | "ic1_r_err"
+            | "ic1_r_err_rel"
+            | "ic2_r_err"
+            | "ic2_r_err_rel"
             | "ic1_sig_x"
             | "ic1_sig_y"
             | "ic2_sig_x"
@@ -340,6 +349,10 @@ fn sample_fill(name: &str) -> u8 {
             | "ic1_sig_y_err"
             | "ic2_sig_x_err"
             | "ic2_sig_y_err"
+            | "ic1_sig_x_err_pct"
+            | "ic1_sig_y_err_pct"
+            | "ic2_sig_x_err_pct"
+            | "ic2_sig_y_err_pct"
             | "ic12_x_diff"
             | "ic12_y_diff"
     ) {
@@ -1037,6 +1050,9 @@ fn build_spot(
         ),
         ("ic2_dose_err_pct", "ic2_dose", "target_mu", dose_error_pct),
         ("ic3_dose_err_pct", "ic3_dose", "target_mu", dose_error_pct),
+        ("ic1_dose_per_mu", "ic1_dose", "target_mu", dose_per_mu),
+        ("ic2_dose_per_mu", "ic2_dose", "target_mu", dose_per_mu),
+        ("ic3_dose_per_mu", "ic3_dose", "target_mu", dose_per_mu),
     ] {
         if let Some(values) = paired(&table, left, right, combine) {
             derived.push((out, values));
@@ -1304,6 +1320,59 @@ fn store_positions(table: &mut BTreeMap<String, Vec<f32>>, mm: [Option<Vec<f32>>
     if !y_diff.is_empty() {
         table.insert("ic12_y_diff".to_string(), y_diff);
     }
+    attach_position_derived(table);
+}
+
+/// Radial plan-frame error, and the same axes with one nozzle offset removed.
+///
+/// The offset is the mean of the finite samples on that chamber and axis.
+fn attach_position_derived(table: &mut BTreeMap<String, Vec<f32>>) {
+    for (x_key, y_key, radial, x_rel, y_rel, radial_rel) in [
+        (
+            "ic1_x_err",
+            "ic1_y_err",
+            "ic1_r_err",
+            "ic1_x_err_rel",
+            "ic1_y_err_rel",
+            "ic1_r_err_rel",
+        ),
+        (
+            "ic2_x_err",
+            "ic2_y_err",
+            "ic2_r_err",
+            "ic2_x_err_rel",
+            "ic2_y_err_rel",
+            "ic2_r_err_rel",
+        ),
+    ] {
+        let (Some(x), Some(y)) = (table.get(x_key).cloned(), table.get(y_key).cloned()) else {
+            continue;
+        };
+        table.insert(radial.to_string(), radial_mm(&x, &y));
+        let x_residual = remove_mean(&x);
+        let y_residual = remove_mean(&y);
+        table.insert(radial_rel.to_string(), radial_mm(&x_residual, &y_residual));
+        table.insert(x_rel.to_string(), x_residual);
+        table.insert(y_rel.to_string(), y_residual);
+    }
+}
+
+fn attach_sigma_percent(table: &mut BTreeMap<String, Vec<f32>>) {
+    let mut made = Vec::new();
+    for (measured, error, out) in [
+        ("ic1_sig_x", "ic1_sig_x_err", "ic1_sig_x_err_pct"),
+        ("ic1_sig_y", "ic1_sig_y_err", "ic1_sig_y_err_pct"),
+        ("ic2_sig_x", "ic2_sig_x_err", "ic2_sig_x_err_pct"),
+        ("ic2_sig_y", "ic2_sig_y_err", "ic2_sig_y_err_pct"),
+    ] {
+        let (Some(measured), Some(error)) = (table.get(measured), table.get(error)) else {
+            continue;
+        };
+        made.push((out, sigma_error_pct(measured, error)));
+    }
+    for (key, values) in made {
+        table.insert(key.to_string(), values);
+    }
 }
 
 /// Columns that participate in the row mask, plus mm positions when the frame resolves.
@@ -1556,6 +1625,7 @@ fn add_sigma_error(table: &mut BTreeMap<String, Vec<f32>>, xml: &str) {
     if !pairs.is_empty() {
         table.insert("expected_sigma".to_string(), pairs);
     }
+    attach_sigma_percent(table);
 }
 
 fn add_dose_rate(table: &mut BTreeMap<String, Vec<f32>>, time: &[f64]) {
@@ -1862,6 +1932,8 @@ fn build_slice_metric(
         table.insert("plan_x".to_string(), plan_xs);
         table.insert("plan_y".to_string(), plan_ys);
     }
+    attach_position_derived(&mut table);
+    attach_sigma_percent(&mut table);
     stamp_sample_time(&mut table);
     remember_pos(root, session, chamber, samples, axes, shifts);
     table
@@ -2963,7 +3035,7 @@ fn current_from(
     table
 }
 
-/// Timeslice rows are 1 ms apart, the same clock Timeslice Replay draws.
+/// Timeslice rows are 1 ms apart, the same clock Timeline draws.
 const SAMPLE_S: f32 = 0.001;
 
 fn stamp_sample_time(table: &mut BTreeMap<String, Vec<f32>>) {
@@ -5048,10 +5120,51 @@ mod tests {
         assert!(near(table.get("ic1_y_err").unwrap()));
         assert!(near(table.get("ic2_x_err").unwrap()));
         assert!(near(table.get("ic2_y_err").unwrap()));
+        assert!(near(table.get("ic1_x_err_rel").unwrap()));
+        assert!(near(table.get("ic1_r_err").unwrap()));
+        assert!(near(table.get("ic2_r_err_rel").unwrap()));
         let plan_x = table.get("plan_x").unwrap();
         let plan_y = table.get("plan_y").unwrap();
         assert!((plan_x[5] - 5.0).abs() < 1e-3);
         assert!((plan_y[5] - 2.5).abs() < 1e-3);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn sk_req_035_spot_table_removes_one_nozzle_offset() {
+        let root = std::env::temp_dir().join(format!(
+            "scan-kit-nozzle-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let session = root.join("sess");
+        std::fs::create_dir_all(&session).unwrap();
+        std::fs::write(
+            session.join("input_map.csv"),
+            "energy,charge_req,position_x,position_y\n70,1,0,0\n70,2,0,0\n",
+        )
+        .unwrap();
+        std::fs::write(
+            session.join("spot_data.csv"),
+            "ic1_total_dose,ic1_x_spot_position,ic1_y_spot_position\n1,1,0\n2,3,0\n",
+        )
+        .unwrap();
+        let table = load_spot(&root, "sess", false, false, false);
+        let near = |values: &[f32], expected: &[f32]| {
+            assert_eq!(values.len(), expected.len());
+            for (value, expected) in values.iter().zip(expected) {
+                assert!((value - expected).abs() < 1e-4, "{value} {expected}");
+            }
+        };
+        near(table.get("ic1_x_err").unwrap(), &[1.0, 3.0]);
+        near(table.get("ic1_x_err_rel").unwrap(), &[-1.0, 1.0]);
+        near(table.get("ic1_y_err_rel").unwrap(), &[0.0, 0.0]);
+        near(table.get("ic1_r_err").unwrap(), &[1.0, 3.0]);
+        near(table.get("ic1_r_err_rel").unwrap(), &[1.0, 1.0]);
+        near(table.get("ic1_dose_per_mu").unwrap(), &[1.0, 1.0]);
         let _ = std::fs::remove_dir_all(&root);
     }
 

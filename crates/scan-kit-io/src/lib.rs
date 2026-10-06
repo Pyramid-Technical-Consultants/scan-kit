@@ -5,11 +5,10 @@
 
 mod analysis;
 mod beam;
-mod binned;
+mod bins;
 mod columns;
 mod config;
 mod discover;
-mod dose_view;
 mod histogram;
 mod location;
 mod marks;
@@ -22,14 +21,15 @@ mod source;
 mod store;
 mod synthesis;
 mod tables;
+pub mod volumetric;
 
 pub use analysis::{analysis_scene, channel_catalog, load_timeslice_columns};
 pub use beam::{beam_record, protons_per_mu, spot_record};
-pub use dose_view::dose_volume;
 pub use mc_tables::mc_tables;
 pub use tables::{
     bind_slice, clear_slice, session_pieces, slice_tail_done, SessionPieces, SliceTake, SLICE_ROWS,
 };
+pub use volumetric::volumetric;
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};

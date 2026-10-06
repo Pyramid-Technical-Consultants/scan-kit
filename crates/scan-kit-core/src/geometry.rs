@@ -1,4 +1,4 @@
-//! Chamber spacing used by Dose Volume.
+//! Chamber spacing used by Volumetric.
 
 /// IC2 is the plot origin. IC1 sits 100 mm downstream.
 pub const IC2_Z_MM: f32 = 0.0;

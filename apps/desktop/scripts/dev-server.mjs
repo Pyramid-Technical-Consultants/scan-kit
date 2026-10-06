@@ -7,7 +7,7 @@ import { keepUp } from "./keep-up.mjs";
 const dir = path.dirname(fileURLToPath(import.meta.url));
 const desktop = path.resolve(dir, "..");
 
-const wasm = spawn("npm", ["run", "wasm"], {
+const wasm = spawn("npm run wasm", {
   cwd: desktop,
   stdio: "inherit",
   shell: true,

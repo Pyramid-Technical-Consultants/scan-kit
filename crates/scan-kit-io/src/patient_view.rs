@@ -9,10 +9,10 @@ use scan_kit_dicom::{hu_density, hu_label, inside_structure, load_study, Patient
 use serde_json::Value;
 
 use super::beam::{beam_record, protons_per_mu, spot_record};
-use super::dose_view::McRunner;
 use super::marks::pick;
 use super::mc_tables::mc_tables;
 use super::tables::spot_table;
+use super::volumetric::McRunner;
 
 const MARK: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
 const SEED: u32 = 1;
@@ -199,7 +199,7 @@ pub(crate) fn scene(
         }
     }
     PlotScene {
-        title: "Dose Volume".into(),
+        title: "Volumetric".into(),
         panels,
         controls: vec![
             history_control(histories),
@@ -443,7 +443,7 @@ fn history_control(histories: u32) -> scan_kit_core::Control {
 
 fn note_scene(message: &str) -> PlotScene {
     PlotScene {
-        title: "Dose Volume".into(),
+        title: "Volumetric".into(),
         panels: vec![Panel {
             title: message.into(),
             y_label: String::new(),

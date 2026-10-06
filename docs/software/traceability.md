@@ -25,7 +25,7 @@ Git history is the revision record. Each requirement maps to the test that fails
 | SK-REQ-014 | Withdrawn |
 | SK-REQ-015 | `crates/scan-kit-io` `sk_req_015_distribution_exposes_spot_modes` |
 | SK-REQ-016 | `crates/scan-kit-core` `sk_req_016_quantile_edges_and_histogram` |
-| SK-REQ-017 | `crates/scan-kit-io` `sk_req_017_binned_summary_and_replay_share_the_session` |
+| SK-REQ-017 | `crates/scan-kit-io` `sk_req_017_bins_and_timeline_share_the_session`; `crates/scan-kit-io` `timeline_scatter_keeps_rows_past_the_playhead`; `crates/scan-kit-plot` `follow_time_hides_scatter_points_outside_the_playhead`; `crates/scan-kit-plot` `follow_time_draws_the_time_trace_inside_the_playhead` |
 | SK-REQ-018 | `crates/scan-kit-io` `sk_req_018_fft_draws_a_spectrum` |
 | SK-REQ-019 | `crates/scan-kit-core` `sk_req_019_welch_sees_a_tone` |
 | SK-REQ-021 | Withdrawn |
@@ -35,9 +35,11 @@ Git history is the revision record. Each requirement maps to the test that fails
 | SK-REQ-025 | `crates/scan-kit-core` `sk_req_025_chambers_are_100_mm_apart` |
 | SK-REQ-026 | Withdrawn |
 | SK-REQ-027 | `crates/scan-kit-core` `sk_req_027_splat_peaks_on_the_spot`; `crates/scan-kit-compute` `sk_req_027_through_031_scientific_shaders_compile` |
-| SK-REQ-028 | `crates/scan-kit-io` `sk_req_028_dose_volume_has_slices_dvh_and_gamma` |
+| SK-REQ-028 | `crates/scan-kit-io` `sk_req_028_volumetric_has_slices_dvh_and_gamma` |
 | SK-REQ-030 | `crates/scan-kit-core` `sk_req_030_gamma_dvh_and_resample` |
 | SK-REQ-032 | `crates/scan-kit-dicom` `sk_req_032_study_index_goal_and_report` |
 | SK-REQ-033 | `crates/scan-kit-core` `sk_req_033_spot_sums_hv_and_coverage`; `crates/scan-kit-core` `sk_req_033_session_log_timeline_issue_and_diff` |
+| SK-REQ-034 | `crates/scan-kit-io` `sk_req_034_amplifier_voltage_is_not_the_error` |
+| SK-REQ-035 | `crates/scan-kit-core` `sk_req_035_relative_position_radius_sigma_percent_and_dose_per_mu`; `crates/scan-kit-io` `sk_req_035_spot_table_removes_one_nozzle_offset` |
 
 The desktop shell shows the same version string. Its command calls `scan_kit_core::version` and does not have a separate requirement.

@@ -7,6 +7,7 @@ import {
   controlDisabled,
   controlSections,
   parseSegments,
+  playheadReplay,
   removeSegment,
   segmentChoices,
   segmentsText,
@@ -29,6 +30,15 @@ const BINNED = [
   { id: "corr", group: "Correlation", kind: "check" },
   { id: "segments", group: "Filter Data", kind: "segments" },
 ];
+
+it("rebuilds a settled playhead only for the spectrum and the reduced scatters", () => {
+  expect(playheadReplay({})).toBe(false);
+  expect(playheadReplay({ scatter: "On" })).toBe(false);
+  expect(playheadReplay({ scatter: "On", scatter_xy: "Probe (G)" })).toBe(false);
+  expect(playheadReplay({ fft: "On" })).toBe(true);
+  expect(playheadReplay({ scatter: "On", scatter_xy: "Confidence" })).toBe(true);
+  expect(playheadReplay({ scatter: "On", scatter_xy: "Coverage (%)" })).toBe(true);
+});
 
 it("groups binned summary controls in plot order", () => {
   const sections = controlSections(BINNED);
@@ -229,6 +239,7 @@ it("disables histogram bin controls until the panel is on", () => {
 });
 
 it("adds a missing segment and drops one by index", () => {
+  expect(addSegment([], "beam")).toEqual([{ kind: "beam", state: "both" }]);
   const beam = [{ kind: "beam", state: "on" }];
   const both = addSegment(beam, "rank");
   expect(both).toEqual([

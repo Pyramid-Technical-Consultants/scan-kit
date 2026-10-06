@@ -98,7 +98,7 @@ it("keeps the picture when the next payload has no panels", () => {
   const current = plotHeader(
     payload(
       {
-        title: "Timeslice Replay",
+        title: "Timeline",
         controls: [{ id: "scrub", label: "Timeline", value: "{\"at\":1}", options: [] }],
         table: null,
         panels: [{}],
@@ -109,7 +109,7 @@ it("keeps the picture when the next payload has no panels", () => {
   const empty = plotHeader(
     payload(
       {
-        title: "Timeslice Replay",
+        title: "Timeline",
         controls: [{ id: "scrub", label: "Timeline", value: "{\"at\":2}", options: [] }],
         table: null,
         panels: [],
@@ -121,5 +121,5 @@ it("keeps the picture when the next payload has no panels", () => {
   expect(shownHeader(null, empty)).toBeNull();
   const frame = { ...empty, panels: [{}] };
   expect(shownHeader(empty, frame)?.panels).toHaveLength(1);
-  expect(shownHeader(current, { ...empty, title: "Dose Volume" })).toBe(current);
+  expect(shownHeader(current, { ...empty, title: "Volumetric" })).toBe(current);
 });

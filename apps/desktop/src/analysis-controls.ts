@@ -54,6 +54,21 @@ export { segmentChoices };
 
 const GRAIN_FIELDS = ["y", "x", "xy"] as const;
 
+/**
+ * Timeline playback filters the scatter in the plot. A settled playhead still
+ * has to rebuild the picture when the spectrum, confidence, or coverage depends
+ * on that window.
+ */
+export function playheadReplay(options: Readonly<Record<string, string>>): boolean {
+  if (options.fft === "On") {
+    return true;
+  }
+  if (options.scatter !== "On") {
+    return false;
+  }
+  return options.scatter_xy === "Confidence" || options.scatter_xy === "Coverage (%)";
+}
+
 export type GrainMemory = {
   spot?: Record<string, string>;
   timeslice?: Record<string, string>;
@@ -110,7 +125,7 @@ export function applyOption(
 }
 
 const FRESH_SEGMENT: Record<string, SegmentItem> = {
-  beam: { kind: "beam", state: "on" },
+  beam: { kind: "beam", state: "both" },
   rank: { kind: "rank", which: "all" },
   range: { kind: "range", column: "energy", lo: 0, hi: 0 },
   compare: { kind: "compare", column: "", op: "abs_gt", threshold: 1 },

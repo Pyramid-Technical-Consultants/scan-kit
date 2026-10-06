@@ -16,6 +16,7 @@ import {
   controlDisabled,
   controlSections,
   parseSegments,
+  playheadReplay,
   segmentChoices,
   type ControlSlot,
   type GrainMemory,
@@ -194,6 +195,9 @@ export function AnalysisView({
   const frame = useRef(0);
   const openSeq = useRef(0);
   const [options, setOptions] = useState<Record<string, string>>({});
+  const lineToken = useRef("");
+  const nextToken = useRef("");
+  const [lineEpoch, setLineEpoch] = useState(0);
   const grains = useRef<GrainMemory>({});
   const [hidden, setHidden] = useState<string[]>([]);
   const [meta, setMeta] = useState<PlotHeader | null>(null);
@@ -209,11 +213,12 @@ export function AnalysisView({
     (text) => {
       setOptions((current) => (current.scrub === text ? current : { ...current, scrub: text }));
     },
-    viewId === "timeslice_replay",
+    viewId === "timeline",
     (next) => {
       playhead.current = next;
       slideRef.current(next, true);
     },
+    viewId === "timeline" && playheadReplay(options),
   );
   const [plotError, setPlotError] = useState<string | null>(null);
   const [quiet, setQuiet] = useState<string | null>(null);
@@ -257,7 +262,7 @@ export function AnalysisView({
 
   useEffect(() => {
     slideRef.current = (scrub, force) => {
-      if (viewId !== "timeslice_replay") {
+      if (viewId !== "timeline") {
         return;
       }
       const plot = plotter.current as
@@ -290,12 +295,23 @@ export function AnalysisView({
     payload.current = null;
     try {
       plot.load(bytes);
+      if (nextToken.current !== "") {
+        lineToken.current = nextToken.current;
+      }
       if (playhead.current.on) {
         slideRef.current(playhead.current, false);
       }
       fitCanvas();
       plot.render();
     } catch (reason) {
+      // The picture kept its lines, but this payload left them out. Ask again
+      // with the full traces.
+      if (lineToken.current !== "") {
+        lineToken.current = "";
+        nextToken.current = "";
+        setLineEpoch((epoch) => epoch + 1);
+        return;
+      }
       notifyError(messageOf(reason), "analysis");
     }
   };
@@ -363,8 +379,23 @@ export function AnalysisView({
     openSeq.current = ticket;
     const order = orderKey === "" ? [] : orderKey.split("\0");
     const shown = shownSessionIds(order, hiddenKey === "" ? [] : hiddenKey.split("\0"));
-    const plotOptions =
-      viewId === "dose_volume" && studyPath != null ? { ...options, study: studyPath } : options;
+    const plotOptions: Record<string, string> = { ...options };
+    if (viewId === "timeline") {
+      const head = playhead.current;
+      plotOptions.scrub = JSON.stringify({
+        on: head.on,
+        at: head.at,
+        end: head.end,
+        speed: head.speed,
+        window: head.window,
+      });
+    }
+    if (viewId === "volumetric" && studyPath != null) {
+      plotOptions.study = studyPath;
+    }
+    if (lineToken.current !== "") {
+      plotOptions._lines = lineToken.current;
+    }
     let stop = false;
     let reveal = 0;
     const timer = window.setTimeout(() => {
@@ -422,6 +453,7 @@ export function AnalysisView({
           if (parsed.payload != null) {
             setPlotError(null);
             const header = plotHeader(parsed.payload);
+            nextToken.current = header.lineToken;
             const chosen = shownHeader(metaRef.current, header);
             if (header.panels.length > 0) {
               if (chosen !== metaRef.current) {
@@ -477,7 +509,7 @@ export function AnalysisView({
         }
       });
     };
-  }, [viewId, folder, orderKey, hiddenKey, options, studyPath]);
+  }, [viewId, folder, orderKey, hiddenKey, options, studyPath, lineEpoch]);
 
   useEffect(() => {
     const node = canvas.current;
@@ -716,7 +748,7 @@ export function AnalysisView({
             })}
           </FieldSet>
         ))}
-        {viewId === "dose_volume" ? (
+        {viewId === "volumetric" ? (
           <Button
             variant="outline"
             onClick={() => {
@@ -749,7 +781,7 @@ export function AnalysisView({
             Open Study
           </Button>
         ) : null}
-        {viewId === "dose_volume" && studyPath != null ? (
+        {viewId === "volumetric" && studyPath != null ? (
           <Button
             variant="outline"
             onClick={() => {

@@ -9,6 +9,7 @@ import {
   Info,
   Plus,
   Trash2,
+  Loader2,
   LogOut,
   Play,
   Redo2,
@@ -167,6 +168,26 @@ function geometryOnScreen(
   });
 }
 
+function emptyCatalogMessage(catalog: "Sessions" | "Exams", locations: number): string {
+  if (locations === 0) {
+    return catalog === "Sessions"
+      ? "Add a data location to list sessions."
+      : "Add a data location to list exams.";
+  }
+  return catalog === "Sessions"
+    ? "No sessions in the saved locations."
+    : "No DICOM exams in the saved locations.";
+}
+
+function CatalogPending({ name }: { name: "Sessions" | "Exams" }) {
+  return (
+    <div className="absolute inset-0 flex items-center justify-center" role="status">
+      <Loader2 className="text-muted-foreground size-8 animate-spin" />
+      <span className="sr-only">Loading {name.toLowerCase()}</span>
+    </div>
+  );
+}
+
 function CatalogEmpty({
   name,
   message,
@@ -210,6 +231,7 @@ type CatalogPayload = {
 
 export default function App() {
   const [locations, setLocations] = useState<string[]>([]);
+  const [locationsKnown, setLocationsKnown] = useState(false);
   const [locationDraft, setLocationDraft] = useState("");
   const [locationsOpen, setLocationsOpen] = useState(false);
   const [catalog, setCatalog] = useState<"Sessions" | "Exams">("Sessions");
@@ -235,17 +257,14 @@ export default function App() {
   const [libraryLoading, setLibraryLoading] = useState(false);
   usePageLoad(libraryLoading, libraryReport?.done ?? 0, libraryReport?.total ?? 0);
   const libraryToken = useRef<object>({});
+  const loadDepth = useRef(0);
   const pendingLocations = useRef<string[]>([]);
   const selectedIds = selectionOrder;
   const canAnalyze = folder != null && selectedIds.length >= 1 && selectedIds.length <= MAX_SELECTED;
+  const noRows = catalog === "Sessions" ? rows.length === 0 : exams.length === 0;
+  const catalogWaiting = noRows && (!locationsKnown || libraryLoading);
   const emptyMessage =
-    catalog === "Sessions" && rows.length === 0
-      ? locations.length === 0
-        ? "Add a data location to list sessions."
-        : "No sessions in the saved locations."
-      : catalog === "Exams" && exams.length === 0
-        ? "No DICOM exams in the saved locations."
-        : null;
+    catalogWaiting || !noRows ? null : emptyCatalogMessage(catalog, locations.length);
   const host = useRef<HTMLDivElement>(null);
 
   const order = useMemo(() => {
@@ -263,35 +282,49 @@ export default function App() {
     [order, rows],
   );
 
-  const loadFolder = useCallback(async (path: string) => {
-    const mine = {};
-    libraryToken.current = mine;
+  const beginCatalogLoad = useCallback(() => {
+    loadDepth.current += 1;
     setLibraryLoading(true);
-    try {
-      await driveTask(
-        {
-          view: "library",
-          path,
-          sessionIds: [],
-          options: {},
-          background: [],
-          foreground: [],
-          palette: [],
-        },
-        (report) => {
-          if (libraryToken.current !== mine) {
-            return;
-          }
-          setLibraryReport(report.finished ? null : report);
-        },
-        () => libraryToken.current !== mine,
-      );
-    } finally {
-      if (libraryToken.current === mine) {
-        setLibraryLoading(false);
-      }
+  }, []);
+
+  const endCatalogLoad = useCallback(() => {
+    loadDepth.current -= 1;
+    if (loadDepth.current <= 0) {
+      loadDepth.current = 0;
+      setLibraryLoading(false);
     }
   }, []);
+
+  const loadFolder = useCallback(
+    async (path: string) => {
+      const mine = {};
+      libraryToken.current = mine;
+      beginCatalogLoad();
+      try {
+        await driveTask(
+          {
+            view: "library",
+            path,
+            sessionIds: [],
+            options: {},
+            background: [],
+            foreground: [],
+            palette: [],
+          },
+          (report) => {
+            if (libraryToken.current !== mine) {
+              return;
+            }
+            setLibraryReport(report.finished ? null : report);
+          },
+          () => libraryToken.current !== mine,
+        );
+      } finally {
+        endCatalogLoad();
+      }
+    },
+    [beginCatalogLoad, endCatalogLoad],
+  );
 
   const applyCatalog = useCallback((payload: CatalogPayload) => {
     setLocations(payload.locations);
@@ -324,48 +357,58 @@ export default function App() {
 
   const openLocation = useCallback(
     async (path: string) => {
-      const result = await indexLocation(path);
-      if (result !== "ok") {
-        return;
-      }
+      beginCatalogLoad();
       try {
-        await pullCatalog();
-        dismissNotice();
-        setUndo([]);
-        setRedo([]);
-        setLocationDraft("");
-      } catch (error: unknown) {
-        notifyError(error);
+        const result = await indexLocation(path);
+        if (result !== "ok") {
+          return;
+        }
+        try {
+          await pullCatalog();
+          dismissNotice();
+          setUndo([]);
+          setRedo([]);
+          setLocationDraft("");
+        } catch (error: unknown) {
+          notifyError(error);
+        }
+      } finally {
+        endCatalogLoad();
       }
     },
-    [indexLocation, pullCatalog],
+    [beginCatalogLoad, endCatalogLoad, indexLocation, pullCatalog],
   );
 
   const indexMany = useCallback(
     async (roots: string[]) => {
+      beginCatalogLoad();
       let stopped = -1;
-      for (let index = 0; index < roots.length; index += 1) {
-        const root = roots[index];
-        if (root == null) {
-          continue;
-        }
-        const result = await indexLocation(root);
-        if (result === "auth") {
-          stopped = index;
-          break;
-        }
-      }
-      pendingLocations.current = stopped >= 0 ? roots.slice(stopped + 1) : [];
       try {
-        await pullCatalog();
-        dismissNotice();
-        setUndo([]);
-        setRedo([]);
-      } catch (error: unknown) {
-        notifyError(error);
+        for (let index = 0; index < roots.length; index += 1) {
+          const root = roots[index];
+          if (root == null) {
+            continue;
+          }
+          const result = await indexLocation(root);
+          if (result === "auth") {
+            stopped = index;
+            break;
+          }
+        }
+        pendingLocations.current = stopped >= 0 ? roots.slice(stopped + 1) : [];
+        try {
+          await pullCatalog();
+          dismissNotice();
+          setUndo([]);
+          setRedo([]);
+        } catch (error: unknown) {
+          notifyError(error);
+        }
+      } finally {
+        endCatalogLoad();
       }
     },
-    [indexLocation, pullCatalog],
+    [beginCatalogLoad, endCatalogLoad, indexLocation, pullCatalog],
   );
 
   const refreshLocations = useCallback(async () => {
@@ -418,15 +461,19 @@ export default function App() {
       });
     invoke<string[]>("scan_kit_data_dirs")
       .then(async (roots) => {
-        if (!active || roots.length === 0) {
+        if (!active) {
           return;
         }
-        if (active) {
-          await indexMany(roots);
+        setLocations(roots);
+        setLocationsKnown(true);
+        if (roots.length === 0) {
+          return;
         }
+        await indexMany(roots);
       })
       .catch((error: unknown) => {
         if (active) {
+          setLocationsKnown(true);
           notifyError(error);
         }
       });
@@ -865,7 +912,7 @@ export default function App() {
             className="relative min-h-0 flex-1 overflow-hidden"
             onContextMenu={(event) => event.preventDefault()}
           >
-            {emptyMessage == null && theme != null && size.width > 0 && size.height > 0 && catalog === "Sessions" ? (
+            {!catalogWaiting && emptyMessage == null && theme != null && size.width > 0 && size.height > 0 && catalog === "Sessions" ? (
               <LibraryTable
                 rows={rows}
                 order={order}
@@ -886,9 +933,10 @@ export default function App() {
                 onOpenMenu={setSessionMenu}
               />
             ) : null}
-            {emptyMessage == null && theme != null && size.width > 0 && size.height > 0 && catalog === "Exams" ? (
+            {!catalogWaiting && emptyMessage == null && theme != null && size.width > 0 && size.height > 0 && catalog === "Exams" ? (
               <ExamTable rows={exams} theme={theme} width={size.width} height={size.height} />
             ) : null}
+            {catalogWaiting ? <CatalogPending name={catalog} /> : null}
             {emptyMessage != null ? (
               <CatalogEmpty
                 name={catalog}

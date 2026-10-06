@@ -9,8 +9,9 @@ use scan_kit_core::{Control, DataTable, Panel, PlotScene};
 use serde::{Deserialize, Serialize};
 
 use crate::render::{
-    build_marks, decode_lines, decode_points, decode_quads, encode_lines, encode_points,
-    encode_quads, header_panels, Marks, PanelBatch, Plot, LINE_STRIDE, POINT_STRIDE, QUAD_STRIDE,
+    build_marks, build_marks_without_polylines, decode_lines, decode_points, decode_quads,
+    encode_lines, encode_points, encode_quads, header_panels, line_stamp, Marks, PanelBatch, Plot,
+    LINE_STRIDE, POINT_STRIDE, QUAD_STRIDE,
 };
 
 /// `apps/desktop/src/plot-header.ts` mirrors the public fields. Rename both together.
@@ -33,6 +34,16 @@ pub struct PlotHeader {
     /// `partial` while a task is still loading. `final` on the last payload.
     #[serde(default = "final_quality")]
     pub quality: String,
+    /// Polyline identity. The shell sends it back so the next picture can omit
+    /// trace lines the plot already has.
+    #[serde(default)]
+    line_token: String,
+    /// When set, `lines` counts only the records after `line_prefix`.
+    #[serde(default)]
+    reuse_lines: bool,
+    /// Polyline records already stored from the payload that issued `line_token`.
+    #[serde(default)]
+    line_prefix: u32,
     batches: Vec<PanelBatch>,
     heatmap_size: Vec<(u32, u32)>,
     lines: u32,
@@ -58,7 +69,26 @@ pub fn encode_plot_quality(
     foreground: [f32; 4],
     quality: &str,
 ) -> Result<Vec<u8>, String> {
-    let marks = build_marks(&scene.panels);
+    encode_plot_reusing(scene, background, foreground, quality, None)
+}
+
+/// `held_lines` is the `line_token` the plot already uploaded. When the polyline
+/// samples match, the byte section keeps the guide tail and omits the traces.
+pub fn encode_plot_reusing(
+    scene: &PlotScene,
+    background: [f32; 4],
+    foreground: [f32; 4],
+    quality: &str,
+    held_lines: Option<&str>,
+) -> Result<Vec<u8>, String> {
+    let stamp = line_stamp(&scene.panels);
+    let held = held_lines.and_then(|text| text.parse::<u64>().ok());
+    let reuse = stamp.reusable && held == Some(stamp.token);
+    let marks = if reuse {
+        build_marks_without_polylines(&scene.panels)
+    } else {
+        build_marks(&scene.panels)
+    };
     let header = PlotHeader {
         title: scene.title.clone(),
         controls: scene.controls.clone(),
@@ -71,6 +101,9 @@ pub fn encode_plot_quality(
         background,
         foreground,
         quality: quality.into(),
+        line_token: stamp.token.to_string(),
+        reuse_lines: reuse,
+        line_prefix: stamp.prefix,
         batches: marks.panels.clone(),
         heatmap_size: marks.heatmap_size.clone(),
         lines: marks.lines.len() as u32,
@@ -166,6 +199,11 @@ impl Plot {
             header.foreground,
         );
         plot.encoded = Some(encoded);
+        plot.carry_lines(
+            header.line_token.parse::<u64>().unwrap_or(0),
+            header.reuse_lines,
+            header.line_prefix,
+        );
         Ok(plot)
     }
 }
@@ -220,6 +258,7 @@ mod tests {
                             ys: vec![1.0, 2.0],
                             color: [0.0, 1.0, 0.0, 1.0],
                             radius: 3.0,
+                            times: Vec::new(),
                         },
                         Series::Bars {
                             edges: vec![0.0, 1.0, 2.0],
@@ -259,5 +298,99 @@ mod tests {
         assert_eq!(header.side, 1);
         assert!(marks.quads.iter().any(|quad| quad.heatmap == Some(0)));
         assert!(decode_plot(&bytes[..bytes.len() - 1]).is_err());
+    }
+
+    #[test]
+    fn a_settled_playhead_omits_trace_lines_the_plot_already_has() {
+        let scene = trace_and_guide(0.0);
+        let bytes = encode_plot(&scene, [0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0, 1.0]).unwrap();
+        let (header, _, _) = decode_plot(&bytes).unwrap();
+        assert!(!header.reuse_lines);
+        assert!(header.line_prefix > 1);
+        let moved = trace_and_guide(0.4);
+        let again = encode_plot_reusing(
+            &moved,
+            [0.0, 0.0, 0.0, 1.0],
+            [1.0, 1.0, 1.0, 1.0],
+            "final",
+            Some(&header.line_token),
+        )
+        .unwrap();
+        let (next, _, _) = decode_plot(&again).unwrap();
+        assert!(next.reuse_lines);
+        assert_eq!(next.line_token, header.line_token);
+        assert_eq!(next.lines, 1, "only the guide tail is in the payload");
+        assert_eq!(
+            next.batches,
+            build_marks(&moved.panels).panels,
+            "a reused payload still addresses the full line buffer"
+        );
+        assert!(again.len() < bytes.len());
+        let mut plot = Plot::from_payload(&again).unwrap();
+        let mut previous = Plot::from_payload(&bytes).unwrap();
+        plot.splice_cached_lines(&mut previous);
+        assert_eq!(
+            plot.line_marks(),
+            build_marks(&moved.panels).lines.as_slice()
+        );
+        let miss = encode_plot_reusing(
+            &moved,
+            [0.0, 0.0, 0.0, 1.0],
+            [1.0, 1.0, 1.0, 1.0],
+            "final",
+            Some("1"),
+        )
+        .unwrap();
+        assert!(!decode_plot(&miss).unwrap().0.reuse_lines);
+    }
+
+    fn trace_and_guide(guide_y: f32) -> PlotScene {
+        let xs: Vec<f32> = (0..48).map(|index| index as f32).collect();
+        let ys = vec![1.0; xs.len()];
+        PlotScene {
+            title: "timeline".into(),
+            panels: vec![
+                Panel {
+                    title: String::new(),
+                    y_label: "mm".into(),
+                    x_label: String::new(),
+                    xmin: 0.0,
+                    xmax: 47.0,
+                    ymin: 0.0,
+                    ymax: 2.0,
+                    series: vec![Series::Polyline {
+                        xs,
+                        ys,
+                        color: [0.2, 0.4, 0.8, 1.0],
+                        thickness: 1.5,
+                    }],
+                    x_labels: Vec::new(),
+                    equal: false,
+                },
+                Panel {
+                    title: String::new(),
+                    y_label: String::new(),
+                    x_label: String::new(),
+                    xmin: 0.0,
+                    xmax: 1.0,
+                    ymin: 0.0,
+                    ymax: 1.0,
+                    series: vec![Series::Guide {
+                        xs: vec![0.0, 1.0],
+                        ys: vec![guide_y, guide_y],
+                        color: [0.5, 0.5, 0.5, 1.0],
+                        thickness: 1.0,
+                    }],
+                    x_labels: Vec::new(),
+                    equal: true,
+                },
+            ],
+            controls: Vec::new(),
+            table: None,
+            columns: 2,
+            column_weights: Vec::new(),
+            row_weights: Vec::new(),
+            side: 1,
+        }
     }
 }

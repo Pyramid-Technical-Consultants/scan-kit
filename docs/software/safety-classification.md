@@ -32,3 +32,7 @@ If a later use of any of those behaviors makes Scan Kit an input to a treatment-
 ## What this record is not
 
 This document does not assign a safety class to the treatment system, the room controller, or the planning system. It classifies Scan Kit software only.
+
+## Machine QA intent
+
+The calculations that would support AAPM TG-224 pencil-beam machine QA, and the gaps that remain, are recorded in [tg-224.md](../quality/tg-224.md). That note does not change this classification. Scan Kit is not the record that a machine may treat. Offering that use reopens this classification before the behavior is added.

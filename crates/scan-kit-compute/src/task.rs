@@ -14,7 +14,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, UNIX_EPOCH};
 
 use scan_kit_core::{encode_poll, Cancel, McJob, McResult, Phase, PlotScene, Poll, Report, Volume};
-use scan_kit_plot::encode_plot_quality;
+use scan_kit_plot::encode_plot_reusing;
 use serde_json::{json, Value};
 
 use crate::mc::McRun;
@@ -280,7 +280,7 @@ fn build_stage(
 }
 
 fn wants_mc(view: &str, options: &Value) -> bool {
-    if view != "dose_volume" {
+    if view != "volumetric" {
         return false;
     }
     let model = options.get("model").and_then(Value::as_str).unwrap_or("");
@@ -297,6 +297,13 @@ fn ended(task: u64, generation: u64, phase: Phase, note: &str) -> Report {
         total: 0,
         note: note.into(),
     }
+}
+
+fn held_lines(options: &Value) -> Option<&str> {
+    options
+        .get("_lines")
+        .and_then(|value| value.as_str())
+        .filter(|text| !text.is_empty())
 }
 
 fn report_at(phase: Phase, done: usize, total: usize) -> Report {
@@ -465,8 +472,8 @@ impl SessionStage {
     }
 
     fn load_scene(&self, ids: &[String]) -> Result<PlotScene, String> {
-        let mut scene = if self.view == "dose_volume" {
-            scan_kit_io::dose_volume(&self.root, ids, &self.options, None)
+        let mut scene = if self.view == "volumetric" {
+            scan_kit_io::volumetric::volumetric(&self.root, ids, &self.options, None)
         } else {
             scan_kit_io::analysis_scene(&self.view, &self.root, ids, &self.options)?
         };
@@ -476,7 +483,13 @@ impl SessionStage {
 
     fn pack(&self, scene: &PlotScene, partial: bool) -> Result<Vec<u8>, String> {
         let quality = if partial { "partial" } else { "final" };
-        encode_plot_quality(scene, self.background, self.foreground, quality)
+        encode_plot_reusing(
+            scene,
+            self.background,
+            self.foreground,
+            quality,
+            held_lines(&self.options),
+        )
     }
 
     fn encode(&self, ids: &[String], partial: bool) -> Result<Vec<u8>, String> {
@@ -687,11 +700,17 @@ impl McPlotStage {
 
     fn pack(&self, scene: &mut PlotScene, quality: &str) -> Result<Vec<u8>, String> {
         apply_palette(scene, &self.palette);
-        encode_plot_quality(scene, self.background, self.foreground, quality)
+        encode_plot_reusing(
+            scene,
+            self.background,
+            self.foreground,
+            quality,
+            held_lines(&self.options),
+        )
     }
 
     fn paint(&self, result: &McResult, quality: &str) -> Result<Vec<u8>, String> {
-        let mut scene = scan_kit_io::dose_volume(
+        let mut scene = scan_kit_io::volumetric::volumetric(
             &self.root,
             &self.sessions,
             &self.options,
@@ -832,7 +851,7 @@ impl Stage for McPlotStage {
 
 fn capture_job(root: &Path, sessions: &[String], options: &Value) -> (PlotScene, Option<McJob>) {
     let job = std::cell::RefCell::new(None);
-    let scene = scan_kit_io::dose_volume(
+    let scene = scan_kit_io::volumetric::volumetric(
         root,
         sessions,
         options,
@@ -1209,7 +1228,7 @@ mod tests {
 
     fn session_stage(root: &Path, sessions: &[&str]) -> SessionStage {
         SessionStage::new(
-            "timeslice_replay",
+            "timeline",
             root,
             &sessions
                 .iter()
@@ -1244,7 +1263,7 @@ mod tests {
                 Poll::Ready(bytes) => {
                     let header = scan_kit_plot::plot_header(&bytes).unwrap();
                     assert_eq!(header.quality, "final");
-                    assert_eq!(header.title, "Timeslice Replay");
+                    assert_eq!(header.title, "Timeline");
                     saw_final = true;
                     break;
                 }
@@ -1297,7 +1316,7 @@ mod tests {
             std::fs::write(&file, format!("r_ic1_current_dose\n{layer}\n")).unwrap();
         }
         let mut stage = SessionStage::new(
-            "timeslice_replay",
+            "timeline",
             &streamed,
             &["layers".into()],
             &json!({}),
@@ -1346,7 +1365,7 @@ mod tests {
             std::fs::write(&file, format!("r_ic1_current_dose\n{layer}\n")).unwrap();
         }
         let mut stage = SessionStage::new(
-            "timeslice_replay",
+            "timeline",
             &tight,
             &["layers".into()],
             &json!({}),
@@ -1390,7 +1409,7 @@ mod tests {
             std::fs::write(&file, format!("r_ic1_current_dose\n{sample}\n")).unwrap();
         }
         let mut stage = SessionStage::new(
-            "timeslice_replay",
+            "timeline",
             &sliced,
             &["wide".into()],
             &json!({}),

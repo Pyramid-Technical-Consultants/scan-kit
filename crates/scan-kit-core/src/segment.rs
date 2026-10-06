@@ -231,7 +231,8 @@ fn default_rank(defaults: &[Segment]) -> Option<Rank> {
 
 fn beam_gate(raw: &str) -> BeamGate {
     match raw {
-        "beam_off" | "Beam Off" | "off" => BeamGate::Off,
+        "beam_on" | "Beam On" | "on" | "On" => BeamGate::On,
+        "beam_off" | "Beam Off" | "off" | "Off" => BeamGate::Off,
         "beam_both" | "Both" | "both" => BeamGate::Both,
         _ => BeamGate::On,
     }

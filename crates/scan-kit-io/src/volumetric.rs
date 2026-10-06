@@ -1,4 +1,4 @@
-//! Dose Volume: analytic Bragg dose, and a Monte Carlo fill when the compute
+//! Volumetric: analytic Bragg dose, and a Monte Carlo fill when the compute
 //! crate supplies a runner. The sidebar is the analysis shell.
 
 use std::path::Path;
@@ -80,7 +80,7 @@ struct Cloud {
     plan: Vec<Pencil>,
 }
 
-pub fn dose_volume(
+pub fn volumetric(
     root: &Path,
     session_ids: &[String],
     options: &Value,
@@ -513,7 +513,7 @@ pub fn dose_volume(
         controls.push(labeled("scale", "Scale", scales, scale).grouped("Color"));
     }
     PlotScene {
-        title: "Dose Volume".into(),
+        title: "Volumetric".into(),
         panels,
         controls,
         table: None,

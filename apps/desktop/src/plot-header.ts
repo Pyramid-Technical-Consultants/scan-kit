@@ -25,6 +25,8 @@ export type PlotHeader = {
   table: ViewTable | null;
   panels: unknown[];
   quality: string;
+  /** Polyline identity. Empty when this payload has no trace lines to reuse. */
+  lineToken: string;
 };
 
 function text(value: unknown): string {
@@ -147,6 +149,7 @@ export function plotHeader(bytes: Uint8Array): PlotHeader {
     table?: ViewTable | null;
     panels?: unknown;
     quality?: unknown;
+    line_token?: unknown;
   };
   const quality = text(parsed.quality);
   return {
@@ -155,6 +158,7 @@ export function plotHeader(bytes: Uint8Array): PlotHeader {
     table: parsed.table ?? null,
     panels: Array.isArray(parsed.panels) ? parsed.panels : [],
     quality: quality.length > 0 ? quality : "final",
+    lineToken: text(parsed.line_token),
   };
 }
 
