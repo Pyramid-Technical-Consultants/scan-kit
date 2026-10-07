@@ -193,6 +193,14 @@ impl WebPlot {
             .is_some_and(|plot| plot.dose_key(key, ctrl))
     }
 
+    /// Window, gain, color scale, ray mode, and sampling. Returns the level slider, or empty.
+    pub fn paint(&mut self, spec: &str) -> String {
+        self.plot
+            .as_mut()
+            .map(|plot| plot.paint(spec))
+            .unwrap_or_default()
+    }
+
     /// `rotate` turns a slice. `integral` sums through its plane or along a profile.
     pub fn dose_action(&mut self, panel: u32, action: &str) {
         if let Some(plot) = self.plot.as_mut() {

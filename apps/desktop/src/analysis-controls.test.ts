@@ -1,4 +1,4 @@
-import { ChartColumn, Columns2, LayoutGrid, Box, RectangleHorizontal, RectangleVertical, Square } from "lucide-react";
+import { ChartColumn, Columns2, LayoutGrid, Box, RectangleHorizontal, RectangleVertical, Spline, Square } from "lucide-react";
 import { expect, it } from "vitest";
 
 import {
@@ -7,8 +7,10 @@ import {
   controlDisabled,
   controlSections,
   parseSegments,
+  paintSpec,
   playheadReplay,
   removeSegment,
+  sceneOptions,
   segmentChoices,
   segmentsText,
   type GrainMemory,
@@ -30,6 +32,20 @@ const BINNED = [
   { id: "corr", group: "Correlation", kind: "check" },
   { id: "segments", group: "Filter Data", kind: "segments" },
 ];
+
+it("keeps color settings off the dose rebuild", () => {
+  const base = { voxel: "1 mm", model: "Analytic", auto: "On", level: "1", scale: "Turbo" };
+  expect(JSON.stringify(sceneOptions(base))).toBe(
+    JSON.stringify(sceneOptions({ ...base, level: "2", scale: "Viridis", auto: "Off" })),
+  );
+  expect(JSON.stringify(sceneOptions(base))).not.toBe(
+    JSON.stringify(sceneOptions({ ...base, voxel: "2 mm" })),
+  );
+  expect(paintSpec({ scale: "Turbo", auto: "On", level: "1" }, {})).toContain("Turbo");
+  expect(paintSpec({ scale: "Turbo", auto: "On", level: "1" }, {})).not.toContain("level");
+  expect(paintSpec({ auto: "Off" }, { level: "1.5" })).toContain("1.5");
+  expect(paintSpec({}, {})).toBe("");
+});
 
 it("rebuilds a settled playhead for the spectrum and the reduced distributions", () => {
   expect(playheadReplay({})).toBe(false);
@@ -102,6 +118,9 @@ it("keeps a joined button row for two or three short names", () => {
   expect(optionIcon("sagittal")).toBe(RectangleVertical);
   expect(optionIcon("volume")).toBe(Box);
   expect(optionIcon("3D")).toBe(Box);
+  expect(optionIcon("analytic")).toBe(Spline);
+  expect(optionIcon("Monte Carlo")).toBeTruthy();
+  expect(optionIcon("1e7")).toBeTruthy();
   expect(
     segmentChoices([
       { label: "Spot", detail: "One row per spot" },

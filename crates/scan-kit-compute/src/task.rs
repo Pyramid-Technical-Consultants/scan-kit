@@ -971,6 +971,7 @@ fn blank_result(job: &McJob) -> McResult {
         },
         uncertainty: 0.0,
         ledger: [0.0; 6],
+        let_d: Vec::new(),
     }
 }
 
@@ -1003,6 +1004,7 @@ fn same_phantom(left: &McJob, right: &McJob) -> bool {
                 && left.shape == right.shape
                 && left.seed == right.seed
                 && left.dose_to_water == right.dose_to_water
+                && left.score_let == right.score_let
         }
         _ => false,
     }

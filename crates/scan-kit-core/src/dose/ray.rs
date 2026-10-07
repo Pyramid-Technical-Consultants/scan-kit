@@ -586,8 +586,9 @@ pub fn dose_film_uv(volume: &Volume, view: RayView, point: [f32; 3]) -> Option<[
     film_uv(volume, view, point)
 }
 
-/// Film uv of a world point. `None` when it sits behind the camera or off the frame.
-fn film_uv(volume: &Volume, view: RayView, point: [f32; 3]) -> Option<[f32; 2]> {
+/// Film uv of a world point, including points outside the frame.
+/// `None` only when the point sits behind the camera.
+pub fn dose_film_open(volume: &Volume, view: RayView, point: [f32; 3]) -> Option<[f32; 2]> {
     let point = if view.gantry.abs() > 1e-3 {
         to_view(point, lattice_center(volume), view.gantry)
     } else {
@@ -619,12 +620,16 @@ fn film_uv(volume: &Volume, view: RayView, point: [f32; 3]) -> Option<[f32; 2]> 
             dot(rel, frame.up) / (depth * frame.tan_y),
         )
     };
-    let u = (x + 1.0) * 0.5;
-    let v = (1.0 - y) * 0.5;
-    if !(0.0..=1.0).contains(&u) || !(0.0..=1.0).contains(&v) {
+    Some([(x + 1.0) * 0.5, (1.0 - y) * 0.5])
+}
+
+/// Film uv of a world point. `None` when it sits behind the camera or off the frame.
+fn film_uv(volume: &Volume, view: RayView, point: [f32; 3]) -> Option<[f32; 2]> {
+    let uv = dose_film_open(volume, view, point)?;
+    if !(0.0..=1.0).contains(&uv[0]) || !(0.0..=1.0).contains(&uv[1]) {
         return None;
     }
-    Some([u, v])
+    Some(uv)
 }
 
 /// Vispy turntable, +z up. Azimuth 0 and elevation 0 look along +y.

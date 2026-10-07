@@ -37,7 +37,6 @@ pub(super) fn prepare(
     pencils: &[Pencil],
     quantity: Quantity,
     spread_pct: f64,
-    scatter: bool,
     wet_mm: f64,
     k_mu: f64,
     gap_mm: f64,
@@ -54,12 +53,7 @@ pub(super) fn prepare(
         residual.push(e as f32);
         kept.push(k as f32);
     }
-    let kernel = build_kernel(
-        medium,
-        &residual,
-        spread_pct,
-        scatter && quantity == Quantity::Dose,
-    );
+    let kernel = build_kernel(medium, &residual, spread_pct);
     let mut out = Vec::new();
     for (pencil, (&energy, &factor)) in pencils.iter().zip(residual.iter().zip(&kept)) {
         if energy <= 1.0 || factor <= 0.0 {
@@ -82,12 +76,8 @@ pub(super) fn prepare(
         } else {
             let range = csda_range_mm(medium, f64::from(energy)) as f32;
             let sigma = depth_sigma_mm(medium, f64::from(energy), spread_pct) as f32;
-            let end = if scatter {
-                let (path, var) = mcs_along(medium, f64::from(energy));
-                mcs_at(&path, &var, f64::from(range), f64::from(range)) as f32
-            } else {
-                0.0
-            };
+            let (path, var) = mcs_along(medium, f64::from(energy));
+            let end = mcs_at(&path, &var, f64::from(range), f64::from(range)) as f32;
             let amount = match quantity {
                 Quantity::Mu => pencil.amount * factor,
                 _ => protons as f32,
@@ -183,7 +173,6 @@ pub fn analytic_volume(
     pencils: &[Pencil],
     quantity: Quantity,
     spread_pct: f32,
-    scatter: bool,
     wet_mm: f32,
     phantom_mm: f32,
     voxel_mm: f32,
@@ -191,8 +180,8 @@ pub fn analytic_volume(
     gap_mm: f32,
 ) -> Volume {
     analytic_on(
-        medium, pencils, quantity, spread_pct, scatter, wet_mm, phantom_mm, voxel_mm, k_mu, gap_mm,
-        None, None,
+        medium, pencils, quantity, spread_pct, wet_mm, phantom_mm, voxel_mm, k_mu, gap_mm, None,
+        None,
     )
 }
 
@@ -214,7 +203,6 @@ pub fn dose_frame(
     pencils: &[Pencil],
     quantity: Quantity,
     spread_pct: f32,
-    scatter: bool,
     wet_mm: f32,
     phantom_mm: f32,
     voxel_mm: f32,
@@ -227,7 +215,6 @@ pub fn dose_frame(
         pencils,
         quantity,
         f64::from(spread_pct),
-        scatter,
         f64::from(wet_mm),
         f64::from(k_mu),
         f64::from(gap_mm),
@@ -267,7 +254,6 @@ pub fn analytic_on(
     pencils: &[Pencil],
     quantity: Quantity,
     spread_pct: f32,
-    scatter: bool,
     wet_mm: f32,
     phantom_mm: f32,
     voxel_mm: f32,
@@ -281,7 +267,6 @@ pub fn analytic_on(
         pencils,
         quantity,
         f64::from(spread_pct),
-        scatter,
         f64::from(wet_mm),
         f64::from(k_mu),
         f64::from(gap_mm),
@@ -793,7 +778,6 @@ mod tests {
             }],
             Quantity::Dose,
             1.0,
-            true,
             0.0,
             0.0,
             1.0,
@@ -821,7 +805,6 @@ mod tests {
             }],
             Quantity::Dose,
             1.0,
-            true,
             0.0,
             0.0,
             1.0,
@@ -853,7 +836,6 @@ mod tests {
             &[pencil],
             Quantity::Dose,
             1.0,
-            true,
             0.0,
             0.0,
             1.0,
@@ -867,7 +849,6 @@ mod tests {
             &[pencil],
             Quantity::Dose,
             1.0,
-            true,
             0.0,
             0.0,
             1.0,
@@ -917,7 +898,6 @@ mod tests {
             &pencils,
             Quantity::Dose,
             1.0,
-            true,
             0.0,
             0.0,
             1.0,
@@ -945,7 +925,6 @@ mod tests {
             &pencils,
             Quantity::Dose,
             1.0,
-            true,
             0.0,
             0.0,
             1.0,
@@ -978,8 +957,7 @@ mod tests {
                 amount: 0.05,
             })
             .collect();
-        let (kernel, spots) =
-            super::prepare(WATER, &pencils, Quantity::Dose, 1.0, true, 0.0, 2e-8, 10.0);
+        let (kernel, spots) = super::prepare(WATER, &pencils, Quantity::Dose, 1.0, 0.0, 2e-8, 10.0);
         let (origin, shape) = super::dose_grid(&spots, 1.0, None);
         let [nx, ny, nz] = shape;
         let mut one = vec![0.0f32; nx * ny * nz];
@@ -1008,7 +986,6 @@ mod tests {
             &[pencil],
             Quantity::Dose,
             1.0,
-            true,
             0.0,
             0.0,
             1.0,
@@ -1021,7 +998,6 @@ mod tests {
             &[pencil],
             Quantity::Dose,
             1.0,
-            true,
             0.0,
             0.0,
             1.0,
@@ -1038,7 +1014,6 @@ mod tests {
             &[pencil],
             Quantity::Dose,
             1.0,
-            true,
             0.0,
             0.0,
             1.0,

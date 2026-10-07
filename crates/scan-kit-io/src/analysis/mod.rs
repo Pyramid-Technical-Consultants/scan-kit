@@ -1266,6 +1266,7 @@ mod tests {
                     return Err("expected a patient job".into());
                 };
                 assert!(request.dose_to_water);
+                assert!(!request.score_let);
                 assert_eq!(request.seed, 1);
                 assert_eq!(request.material.len(), 32);
                 assert!(request.protons.iter().any(|weight| *weight > 0.0));
@@ -1278,6 +1279,7 @@ mod tests {
                     },
                     uncertainty: 0.0,
                     ledger: [1.0, 1.0, 0.0, 0.0, 0.0, 0.0],
+                    let_d: Vec::new(),
                 })
             }),
         );

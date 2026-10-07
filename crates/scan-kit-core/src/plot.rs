@@ -199,7 +199,7 @@ pub struct Control {
     /// Sidebar fieldset. Empty lands in Options.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub group: String,
-    /// `check` is a checkbox. `radio` is a radio group. Empty is a select.
+    /// `check` is a checkbox. `radio` is an exclusive button group. Empty is a select.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub kind: String,
 }
@@ -239,6 +239,13 @@ impl Control {
         self
     }
 
+    pub fn icons(mut self, icons: &[&str]) -> Self {
+        for (choice, icon) in self.options.iter_mut().zip(icons) {
+            choice.icon = (*icon).to_string();
+        }
+        self
+    }
+
     pub fn labels(&self) -> Vec<&str> {
         self.options
             .iter()
@@ -274,6 +281,11 @@ pub struct VolumeMark {
     pub lo: f32,
     #[serde(default)]
     pub hi: f32,
+    /// Dose window before gain or a manual window. Both zero means the plot measures the cube.
+    #[serde(default)]
+    pub base_lo: f32,
+    #[serde(default)]
+    pub base_hi: f32,
     /// 0 is treated as 1 when the plot attaches the grid.
     #[serde(default)]
     pub gain: f32,
@@ -297,6 +309,25 @@ pub struct VolumeMark {
     /// Field box in millimetres: x0, x1, y0, y1, z0, z1. A zero span draws nothing.
     #[serde(default)]
     pub field: [f32; 6],
+    /// Other loaded sessions, in selection order. An empty `values` buffer is the
+    /// cube in `values` above (`session_focus`). Line plots draw every entry.
+    #[serde(default)]
+    pub sessions: Vec<SessionDose>,
+    /// Palette ink for `sessions`, same order. Empty keeps the foreground.
+    #[serde(default)]
+    pub session_colors: Vec<[f32; 4]>,
+    /// Which `sessions` entry is the cube shown in the image cells.
+    #[serde(default)]
+    pub session_focus: u32,
+}
+
+/// One session cube for the dose line plots. Empty `values` means the main cube.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct SessionDose {
+    pub values: Vec<f32>,
+    pub shape: [u32; 3],
+    pub origin: [f32; 3],
+    pub voxel: f32,
 }
 
 /// What a view workflow returns before pixels are rendered.

@@ -14,8 +14,20 @@
 //! pixel. The bound is that stroke on the rectangle's outer pixels.
 //! A panel with `equal` letterboxes that rectangle to the camera's data
 //! aspect, so one data unit has the same pixel length on both axes.
-//! A dose image fills its cell instead. Slice axes sit on that border. The 3D
-//! cell keeps its axes in the volume and leaves the border clear.
+//! A dose slice fills its cell. The window grows on the longer side so a
+//! millimetre has the same pixel length on both axes, including after a
+//! quarter turn. That window is the ramp's zero. The volume stays on its
+//! own bounds, and the crosshair runs out to the window. Slice axes sit on
+//! that border. The 3D cell keeps its axes in the volume and leaves the
+//! border clear. Tick marks and their numbers hang off the three edges that
+//! meet at the entrance corner, on the side facing the camera, and the text
+//! turns to follow the edge. The titles are X (mm), Y (mm), and Depth (mm).
+//! The field box is an amber rectangle on each slice and an amber wireframe
+//! through the volume. Dose line plots draw every loaded session in that
+//! session's color. A toolbar band names the plot, so the canvas title stays off.
+//! Color gain, window, opacity, ray mode, and the sample filter are uniforms.
+//! A color-scale change rewrites the 256 ramp pixels on the last atlas row.
+//! Neither rebuilds the volume.
 //!
 //! A mark kind's byte layout lives in its `*_STRIDE`, `*_ATTRS`, `encode_*`,
 //! `decode_*`, and the matching WGSL `vs_*` inputs. Change them together.
@@ -68,7 +80,7 @@ struct Uniforms {
     dose4: vec4<f32>,
     // film aspect, line scale, typical, march voxel
     dose5: vec4<f32>,
-    // march shape, or integral cols, rows, row
+    // march shape, or integral cols, rows, row. Volume w picks each axis's outward side.
     dose6: vec4<f32>,
     // look-at offset xyz, field of view (0 is orthographic)
     dose7: vec4<f32>,
@@ -389,8 +401,13 @@ fn vs_text(
     }
     let xy = quad_uv(vi);
     var local = offset_size.xy + xy * offset_size.zw;
-    // Screen-space labels with anchor.z set run up the axis (90° CCW, y down).
-    if (anchor.w < 0.5 && anchor.z > 0.5) {
+    // w < -0.5 rotates by z radians, clockwise with y down, so a 3D axis title
+    // follows its edge. z > 0.5 on other screen text runs up the axis (90° CCW).
+    if (anchor.w < -0.5) {
+        let c = cos(anchor.z);
+        let s = sin(anchor.z);
+        local = vec2<f32>(c * local.x - s * local.y, s * local.x + c * local.y);
+    } else if (anchor.w < 0.5 && anchor.z > 0.5) {
         local = vec2<f32>(local.y, -local.x);
     }
     let px = origin + local;
@@ -809,41 +826,86 @@ fn box_near(eye: vec3<f32>, dir: vec3<f32>, lo: vec3<f32>, hi: vec3<f32>, origin
     return best;
 }
 
-fn tick_near(eye: vec3<f32>, dir: vec3<f32>, origin: vec3<f32>, extent: vec3<f32>) -> vec2<f32> {
-    let stub = clamp(0.02 * max(extent.x, max(extent.y, extent.z)), 1.5, 6.0);
-    let z1 = origin.z + extent.z;
-    var best = vec2<f32>(0.0, 1e30);
-    var mark = ceil(origin.x / 10.0) * 10.0;
-    var n = 0;
-    loop {
-        if (mark > origin.x + extent.x + 0.01 || n >= 64) { break; }
-        best = nearer(eye, dir, to_view_pt(vec3<f32>(mark, origin.y, z1), origin, extent), to_view_pt(vec3<f32>(mark, origin.y + stub, z1), origin, extent), best);
-        mark = mark + 10.0;
-        n = n + 1;
-    }
-    mark = ceil(origin.y / 10.0) * 10.0;
-    n = 0;
-    loop {
-        if (mark > origin.y + extent.y + 0.01 || n >= 64) { break; }
-        best = nearer(eye, dir, to_view_pt(vec3<f32>(origin.x, mark, z1), origin, extent), to_view_pt(vec3<f32>(origin.x + stub, mark, z1), origin, extent), best);
-        mark = mark + 10.0;
-        n = n + 1;
-    }
-    mark = ceil(origin.z / 10.0) * 10.0;
-    n = 0;
-    loop {
-        if (mark > z1 + 0.01 || n >= 64) { break; }
-        best = nearer(eye, dir, to_view_pt(vec3<f32>(origin.x, origin.y, mark), origin, extent), to_view_pt(vec3<f32>(origin.x, origin.y + stub, mark), origin, extent), best);
-        mark = mark + 10.0;
-        n = n + 1;
-    }
-    return best;
+fn label_every(count: f32) -> f32 {
+    if (count <= 8.0) { return 1.0; }
+    if (count <= 16.0) { return 2.0; }
+    if (count <= 40.0) { return 5.0; }
+    if (count <= 80.0) { return 10.0; }
+    if (count <= 160.0) { return 20.0; }
+    if (count <= 400.0) { return 50.0; }
+    return 100.0;
 }
 
-fn over_guides(color: vec4<f32>, eye: vec3<f32>, dir: vec3<f32>, origin: vec3<f32>, extent: vec3<f32>, hit_t: f32, t0: f32, fy: f32) -> vec4<f32> {
+fn tick_major(k: f32, every: f32, k0: f32, k1: f32) -> bool {
+    let gap = min(k - k0, k1 - k);
+    if (gap < 0.01) { return true; }
+    let on_step = abs(k - every * round(k / every)) < 0.01;
+    return on_step && gap >= 0.6 * every;
+}
+
+fn edge_root(axis: i32, mark: f32, origin: vec3<f32>, z1: f32) -> vec3<f32> {
+    if (axis == 0) { return vec3<f32>(mark, origin.y, z1); }
+    if (axis == 1) { return vec3<f32>(origin.x, mark, z1); }
+    return vec3<f32>(origin.x, origin.y, mark);
+}
+
+fn hang_ticks(best: vec2<f32>, eye: vec3<f32>, dir: vec3<f32>, origin: vec3<f32>, extent: vec3<f32>, axis: i32, out: vec3<f32>, stub: f32) -> vec2<f32> {
+    var nearest = best;
+    let z1 = origin.z + extent.z;
+    var lo = origin.x;
+    var hi = origin.x + extent.x;
+    if (axis == 1) {
+        lo = origin.y;
+        hi = origin.y + extent.y;
+    } else if (axis == 2) {
+        lo = origin.z;
+        hi = z1;
+    }
+    let k0 = ceil(lo / 10.0 - 0.000001);
+    let k1 = floor(hi / 10.0 + 0.000001);
+    let every = label_every(max(k1 - k0 + 1.0, 0.0));
+    var k = k0;
+    var n = 0;
+    loop {
+        if (k > k1 + 0.01 || n >= 96) { break; }
+        let mark = k * 10.0;
+        let len = select(stub * 0.55, stub, tick_major(k, every, k0, k1));
+        let root = edge_root(axis, mark, origin, z1);
+        nearest = nearer(eye, dir, to_view_pt(root, origin, extent), to_view_pt(root + out * len, origin, extent), nearest);
+        k = k + 1.0;
+        n = n + 1;
+    }
+    if (k1 < k0 || abs(lo - k0 * 10.0) > 0.05) {
+        let root = edge_root(axis, lo, origin, z1);
+        nearest = nearer(eye, dir, to_view_pt(root, origin, extent), to_view_pt(root + out * stub, origin, extent), nearest);
+    }
+    if (k1 < k0 || abs(hi - k1 * 10.0) > 0.05) {
+        let root = edge_root(axis, hi, origin, z1);
+        nearest = nearer(eye, dir, to_view_pt(root, origin, extent), to_view_pt(root + out * stub, origin, extent), nearest);
+    }
+    return nearest;
+}
+
+// Centimetre ticks on the three edges that meet at the entrance corner.
+// dose6.w bits 0..2 pick EDGE_OUT's second direction for X, Y, and depth.
+// Numbered ticks are the long ones; they match axis_ticks.
+fn tick_near(eye: vec3<f32>, dir: vec3<f32>, origin: vec3<f32>, extent: vec3<f32>) -> vec2<f32> {
+    let stub = clamp(0.02 * max(extent.x, max(extent.y, extent.z)), 1.5, 6.0);
+    let code = u32(u.dose6.w + 0.5);
+    var best = vec2<f32>(0.0, 1e30);
+    let x_out = select(vec3<f32>(0.0, -1.0, 0.0), vec3<f32>(0.0, 0.0, 1.0), (code & 1u) == 1u);
+    let y_out = select(vec3<f32>(-1.0, 0.0, 0.0), vec3<f32>(0.0, 0.0, 1.0), (code & 2u) == 2u);
+    let z_out = select(vec3<f32>(-1.0, 0.0, 0.0), vec3<f32>(0.0, -1.0, 0.0), (code & 4u) == 4u);
+    best = hang_ticks(best, eye, dir, origin, extent, 0, x_out, stub);
+    best = hang_ticks(best, eye, dir, origin, extent, 1, y_out, stub);
+    return hang_ticks(best, eye, dir, origin, extent, 2, z_out, stub);
+}
+
+fn over_guides(color: vec4<f32>, eye: vec3<f32>, dir: vec3<f32>, origin: vec3<f32>, extent: vec3<f32>, hit_t: f32, t0: f32, t1: f32, fy: f32) -> vec4<f32> {
     let px = 1.5 * fy / max(u.resolution.y, 1.0);
     var best = box_near(eye, dir, origin, origin + extent, origin, extent);
     var ink = vec3<f32>(0.55, 0.58, 0.62);
+    var limit = hit_t;
     if (u.dose9.w > 0.5) {
         ink = vec3<f32>(0.25, 0.8, 0.85);
     }
@@ -857,9 +919,10 @@ fn over_guides(color: vec4<f32>, eye: vec3<f32>, dir: vec3<f32>, origin: vec3<f3
         if (field.y < best.y) {
             best = field;
             ink = vec3<f32>(0.86, 0.68, 0.22);
+            limit = t1;
         }
     }
-    if (best.y <= px && best.x >= t0 - px && best.x <= hit_t + px) {
+    if (best.y <= px && best.x >= t0 - px && best.x <= limit + px) {
         return vec4<f32>(ink, 1.0);
     }
     return color;
@@ -996,7 +1059,7 @@ fn march_color(uv: vec2<f32>) -> vec4<f32> {
             hit_t = t1;
         }
     }
-    return over_guides(color, eye, dir, origin, extent, hit_t, t0, fy);
+    return over_guides(color, eye, dir, origin, extent, hit_t, t0, t1, fy);
 }
 "#;
 
@@ -1102,8 +1165,8 @@ pub(crate) struct QuadRec {
 }
 
 struct GlyphRec {
-    /// `w` > 0.5 anchors in data space. Screen-space text with `z` > 0.5 is rotated
-    /// so the string runs up the y axis.
+    /// `w` > 0.5 anchors in data space. `w` < −0.5 rotates screen text by `z`
+    /// radians, clockwise with y down. Other screen text with `z` > 0.5 runs up the axis.
     anchor: [f32; 4],
     offset: [f32; 2],
     size: [f32; 2],
@@ -1152,6 +1215,9 @@ struct LiveCloud {
     quads: Vec<QuadRec>,
     lines: Vec<LineRec>,
     dose: bool,
+    /// The slice crosshair. Its quad is the ramp zero behind the volume, and
+    /// its lines run to the fitted window rather than the volume edge.
+    crosshair: bool,
 }
 
 /// One line series. A monotonic stroke is sorted by x, so a playhead is one slice.
@@ -1259,6 +1325,10 @@ pub struct Plot {
     split_grab: Option<SplitGrab>,
     /// Uploaded dose grid. Paging and orbit sample it; they do not replace it.
     dose: Option<crate::dose::DoseGrid>,
+    /// Atlas heatmap that holds the dose slices and the ramp row.
+    dose_atlas: Option<usize>,
+    /// The ramp row changed after the atlas texture was uploaded.
+    ramp_dirty: bool,
     cursor: [usize; 3],
     azimuth: f32,
     elevation: f32,
@@ -1370,6 +1440,8 @@ impl Plot {
             side,
             split_grab: None,
             dose: None,
+            dose_atlas: None,
+            ramp_dirty: false,
             cursor: [0, 0, 0],
             azimuth: HOME_AZIMUTH,
             elevation: HOME_ELEVATION,
@@ -1452,6 +1524,10 @@ impl Plot {
         grid.unit = mark.unit.clone();
         grid.show_phantom = mark.show_phantom;
         grid.field = mark.field;
+        grid.session_colors = mark.session_colors.clone();
+        grid.session_focus = mark.session_focus as usize;
+        grid.sessions = mark.sessions.iter().map(session_volume).collect();
+        crate::dose::remember_window(&mut grid, mark.base_lo, mark.base_hi);
         let (pixels, cols, rows) = crate::dose::atlas_bytes(&grid);
         let atlas = self.marks.heatmaps.len();
         self.marks.heatmaps.push(pixels);
@@ -1489,6 +1565,8 @@ impl Plot {
             }
         }
         self.dose = Some(grid);
+        self.dose_atlas = Some(atlas);
+        self.ramp_dirty = false;
         self.volume_draw = None;
         self.atlas_stamp = self.atlas_stamp.wrapping_add(1);
         self.heat_revision = self.heat_revision.wrapping_add(1);
@@ -1590,7 +1668,13 @@ impl Plot {
         ]);
         let [full_nx, full_ny, full_nz] = grid.volume.shape;
         let dose6 = if plane == 3 {
-            [march_shape[0], march_shape[1], march_shape[2], 0.0]
+            let sides = axis_sides(&grid.volume, dose_ray(self, grid, aspect));
+            [
+                march_shape[0],
+                march_shape[1],
+                march_shape[2],
+                (sides[0] + sides[1] * 2 + sides[2] * 4) as f32,
+            ]
         } else if integral > 0.0 {
             match plane {
                 1 => [full_nx as f32, full_nz as f32, full_ny as f32, 0.0],
@@ -1683,6 +1767,7 @@ impl Plot {
                     quads: Vec::new(),
                     lines,
                     dose: true,
+                    crosshair: false,
                 });
             }
             if let Some(plane) = dose_plane(&title) {
@@ -1694,6 +1779,7 @@ impl Plot {
                         quads: Vec::new(),
                         lines: crosshair_lines(grid, plane, cursor, bounds, turns, foreground),
                         dose: true,
+                        crosshair: true,
                     });
                     let mut lines = Vec::new();
                     for (id, a, b) in
@@ -1715,6 +1801,7 @@ impl Plot {
                             quads: Vec::new(),
                             lines,
                             dose: true,
+                            crosshair: false,
                         });
                     }
                     let mut lines = Vec::new();
@@ -1735,6 +1822,17 @@ impl Plot {
                             quads: Vec::new(),
                             lines,
                             dose: true,
+                            crosshair: false,
+                        });
+                    }
+                    let lines = field_lines(grid.field, plane, bounds, turns);
+                    if !lines.is_empty() {
+                        extra.push(LiveCloud {
+                            panel: index,
+                            quads: Vec::new(),
+                            lines,
+                            dose: true,
+                            crosshair: false,
                         });
                     }
                 }
@@ -1924,6 +2022,90 @@ impl Plot {
     #[cfg_attr(not(any(test, target_arch = "wasm32")), allow(dead_code))]
     pub(crate) fn set_chrome(&mut self, px: f32) {
         self.chrome = px.max(0.0);
+    }
+
+    /// Window, gain, opacity, ray mode, sample filter, and color scale.
+    /// The voxels stay. A ramp change rewrites one texture row.
+    #[cfg_attr(not(any(test, target_arch = "wasm32")), allow(dead_code))]
+    pub(crate) fn paint(&mut self, spec: &str) -> String {
+        if self.dose.is_none() {
+            return String::new();
+        }
+        let spec: serde_json::Value = serde_json::from_str(spec).unwrap_or(serde_json::Value::Null);
+        let text = |key: &str| spec.get(key).and_then(|value| value.as_str()).unwrap_or("");
+        let level = spec.get("level").and_then(|value| {
+            value
+                .as_str()
+                .and_then(|text| text.parse().ok())
+                .or_else(|| value.as_f64().map(|number| number as f32))
+        });
+        let auto = match spec.get("auto").and_then(|value| value.as_str()) {
+            None | Some("") => true,
+            Some(text) => matches!(text, "on" | "On" | "true" | "1"),
+        };
+        let percent = matches!(text("error"), "percent" | "Percent");
+        let (base_lo, base_hi, gamma, difference, ramp_now, opacity_now, unit_now) = {
+            let grid = self.dose.as_ref().unwrap();
+            (
+                grid.base_lo,
+                grid.base_hi,
+                grid.gamma,
+                grid.difference,
+                grid.ramp,
+                grid.opacity,
+                grid.unit.clone(),
+            )
+        };
+        let wash = scan_kit_core::wash_of(scan_kit_core::PaintChoice {
+            base_lo,
+            base_hi,
+            gamma,
+            difference,
+            scale: text("scale"),
+            auto,
+            level,
+            percent,
+            ray: text("ray"),
+            sample: text("sample"),
+        });
+        let session = scan_kit_core::is_session(ramp_now);
+        let ramp = if session || text("scale").is_empty() {
+            ramp_now
+        } else {
+            wash.ramp
+        };
+        let unit = scan_kit_core::painted_unit(&unit_now, wash.mode, gamma);
+        let ramp_changed = ramp_now != ramp;
+        let opacity_changed = (opacity_now - wash.opacity).abs() > 1.0e-4;
+        if let Some(index) = self.dose_atlas {
+            if ramp_changed || opacity_changed {
+                let size = self.marks.heatmap_size.get(index).copied();
+                if let (Some((cols, rows)), Some(pixels)) =
+                    (size, self.marks.heatmaps.get_mut(index))
+                {
+                    if ramp_changed && !session {
+                        crate::dose::paint_ramp_row(pixels, cols, rows, ramp, wash.opacity);
+                    } else {
+                        crate::dose::paint_ramp_alpha(pixels, cols, rows, wash.opacity);
+                    }
+                    if self.gpu.is_some() || self.kept_heats.is_some() {
+                        self.ramp_dirty = true;
+                    }
+                }
+            }
+        }
+        let grid = self.dose.as_mut().unwrap();
+        grid.lo = wash.lo;
+        grid.hi = wash.hi;
+        grid.gain = wash.gain;
+        grid.opacity = wash.opacity;
+        grid.ramp = ramp;
+        grid.mode = wash.mode;
+        grid.filter = wash.filter;
+        grid.unit = unit;
+        wash.level
+            .map(scan_kit_core::LevelSpan::json)
+            .unwrap_or_default()
     }
 
     /// Keep a zoomed window when the new panel is the same quantity and its
@@ -2132,6 +2314,7 @@ impl Plot {
                             quads,
                             lines,
                             dose: false,
+                            crosshair: false,
                         });
                     }
                 }
@@ -2288,7 +2471,13 @@ impl Plot {
             return (false, 0.0, 0.0, None);
         };
         let cell = &layout[index];
-        let data = self.cameras[cell.panel].data_at(x, y, cell.plot, width as f32, height as f32);
+        let data = self.view_camera(cell.panel, &cell.plot).data_at(
+            x,
+            y,
+            cell.plot,
+            width as f32,
+            height as f32,
+        );
         (true, data[0], data[1], self.pick(cell, x, y, width, height))
     }
 
@@ -2296,8 +2485,11 @@ impl Plot {
     // ponytail: linear scan over the panel's marks per hover. Past a few million
     // marks, bucket them into a per-panel screen grid on camera change.
     fn pick(&self, cell: &Cell, x: f32, y: f32, width: u32, height: u32) -> Option<u32> {
-        let matrix =
-            self.cameras[cell.panel].clip_from_data(cell.plot, width as f32, height as f32);
+        let matrix = self.view_camera(cell.panel, &cell.plot).clip_from_data(
+            cell.plot,
+            width as f32,
+            height as f32,
+        );
         let (w, h) = (width as f32, height as f32);
         let clip = if self.is_time_panel(cell.panel) {
             self.time_window
@@ -2480,7 +2672,8 @@ impl Plot {
                 }
             }
             if input.wheel != 0.0 {
-                self.orbit_zoom = (self.orbit_zoom * (-input.wheel * 0.0015).exp()).clamp(0.2, 8.0);
+                // A positive wheel is scroll-down. That zooms out, matching the charts.
+                self.orbit_zoom = (self.orbit_zoom * (input.wheel * 0.0015).exp()).clamp(0.2, 8.0);
             }
             return true;
         }
@@ -2499,7 +2692,7 @@ impl Plot {
         }
         if input.drag {
             let cell = &layout[index];
-            let [x, y] = self.cameras[panel].data_at(
+            let [x, y] = self.view_camera(panel, &cell.plot).data_at(
                 input.x,
                 input.y,
                 cell.plot,
@@ -2622,7 +2815,7 @@ impl Plot {
                 let panel = &self.panels[index];
                 let plane = dose_plane(&panel.title);
                 let edge = font.line_height * 0.5 + 4.0;
-                let (left, top, bottom, right) = if plane == Some(3) {
+                let (mut left, top, bottom, right) = if plane == Some(3) {
                     (4.0, edge, edge, color_column_width())
                 } else {
                     let left = axis_name_width(&panel.y_label) + y_tick_width(&camera) + 8.0;
@@ -2658,6 +2851,20 @@ impl Plot {
                     w: (cell.w - left - right).max(8.0),
                     h: (cell.h - top - bottom).max(8.0),
                 });
+                if plane.is_some_and(|plane| plane < 3) {
+                    let turns = self.turns.get(index).copied().unwrap_or(0);
+                    let fitted = fit_domain(camera, &plot, turns);
+                    let wider = axis_name_width(&panel.y_label) + y_tick_width(&fitted) + 8.0;
+                    if wider > left {
+                        left = wider;
+                        plot = snap_plot(PlotRect {
+                            x: cell.x + left,
+                            y: cell.y + top,
+                            w: (cell.w - left - right).max(8.0),
+                            h: (cell.h - top - bottom).max(8.0),
+                        });
+                    }
+                }
                 if panel.equal && plane.is_none() {
                     plot = snap_plot(equal_scale(plot, &camera));
                 }
@@ -2732,6 +2939,7 @@ impl Plot {
 
     #[cfg(not(target_arch = "wasm32"))]
     fn paint_cpu(&mut self, width: u32, height: u32, layout: &[Cell]) -> Vec<u8> {
+        self.fit_slice_chrome(layout);
         let line_draws = self.line_draw_ranges();
         let mut frame = Vec::with_capacity((width * height * 4) as usize);
         let pixel = rgba_bytes(self.background);
@@ -2739,13 +2947,30 @@ impl Plot {
             frame.extend_from_slice(&pixel);
         }
         for cell in layout {
-            let camera = self.cameras[cell.panel];
+            let camera = self.view_camera(cell.panel, &cell.plot);
             let matrix = camera.clip_from_data(cell.plot, width as f32, height as f32);
             let batch = &self.marks.panels[cell.panel];
             let scale = self.integrate_scale(cell.panel, cell.plot.w / cell.plot.h.max(1.0));
             let (grid, border) = panel_frame(self, cell);
             for line in grid {
                 stroke_cpu(&mut frame, width, height, &matrix, &line, cell.plot);
+            }
+            for cloud in self
+                .live
+                .iter()
+                .filter(|cloud| cloud.panel == cell.panel && cloud.crosshair)
+            {
+                for quad in &cloud.quads {
+                    fill_quad_cpu(
+                        &mut frame,
+                        width,
+                        height,
+                        &matrix,
+                        quad,
+                        &self.marks,
+                        cell.plot,
+                    );
+                }
             }
             let solid: Vec<QuadRec> = self.marks.quads
                 [batch.quad_start as usize..(batch.quad_start + batch.quad_count) as usize]
@@ -2770,7 +2995,11 @@ impl Plot {
                     );
                 }
             }
-            for cloud in self.live.iter().filter(|cloud| cloud.panel == cell.panel) {
+            for cloud in self
+                .live
+                .iter()
+                .filter(|cloud| cloud.panel == cell.panel && !cloud.crosshair)
+            {
                 for quad in &cloud.quads {
                     fill_quad_cpu(
                         &mut frame,
@@ -2841,7 +3070,13 @@ impl Plot {
             let mut glyphs = if cell_plane(self, cell) == Some(3) {
                 Vec::new()
             } else {
-                labels_for(&self.panels[cell.panel], &camera, cell, self.foreground)
+                labels_for(
+                    &self.panels[cell.panel],
+                    &camera,
+                    cell,
+                    self.foreground,
+                    self.chrome <= 0.0,
+                )
             };
             glyphs.extend(dose_chrome(self, cell));
             glyphs.extend(color_axis_glyphs(self, cell, scale));
@@ -2927,10 +3162,12 @@ impl Plot {
         height: u32,
     ) -> Result<wgpu::CommandEncoder, GpuError> {
         let layout = self.layout(width, height);
+        self.fit_slice_chrome(&layout);
         self.ensure_uploaded(gpu)?;
+        self.flush_ramp(&gpu.queue);
         self.ensure_volume(gpu)?;
         self.sync_heatmaps(&gpu.queue);
-        let (cloud_quad_span, cloud_line_span) = self.upload_live(gpu);
+        let (cloud_quad_span, cloud_line_span, grounds) = self.upload_live(gpu);
         self.ensure_uniforms(gpu, layout.len());
         let window = self.time_window;
         let line_draws = self.line_draw_ranges();
@@ -2965,9 +3202,10 @@ impl Plot {
                 } else {
                     labels_for(
                         &self.panels[cell.panel],
-                        &self.cameras[cell.panel],
+                        &self.view_camera(cell.panel, &cell.plot),
                         cell,
                         self.foreground,
+                        self.chrome <= 0.0,
                     )
                 };
                 glyphs.extend(dose_chrome(self, cell));
@@ -3006,8 +3244,11 @@ impl Plot {
             return Err(GpuError::Message("uniform buffer missing".into()));
         };
         for (index, cell) in layout.iter().enumerate() {
-            let matrix =
-                self.cameras[cell.panel].clip_from_data(cell.plot, width as f32, height as f32);
+            let matrix = self.view_camera(cell.panel, &cell.plot).clip_from_data(
+                cell.plot,
+                width as f32,
+                height as f32,
+            );
             let bytes = encode_uniform(
                 matrix,
                 width as f32,
@@ -3060,6 +3301,13 @@ impl Plot {
                     .map(|draw| &draw.group)
                     .unwrap_or(&gpu.empty_volume);
                 pass.set_bind_group(2, volume, &[]);
+                let (quad_at, quad_count) = cloud_quad_span[cell.panel];
+                let ground = grounds[cell.panel];
+                if let (true, Some(buffer)) = (ground > 0, self.cloud_quads.as_ref()) {
+                    pass.set_bind_group(1, &gpu.white_group, &[]);
+                    pass.set_vertex_buffer(0, buffer.slice(quad_at * QUAD_STRIDE..));
+                    pass.draw(0..6, 0..ground as u32);
+                }
                 if batch.quad_count > 0 {
                     pass.set_bind_group(1, &gpu.white_group, &[]);
                     pass.set_vertex_buffer(
@@ -3075,11 +3323,11 @@ impl Plot {
                     pass.set_vertex_buffer(0, marks.quads.slice(u64::from(*start) * QUAD_STRIDE..));
                     pass.draw(0..6, 0..1);
                 }
-                let (quad_at, quad_count) = cloud_quad_span[cell.panel];
-                if let (true, Some(buffer)) = (quad_count > 0, self.cloud_quads.as_ref()) {
+                let rest = quad_count.saturating_sub(ground);
+                if let (true, Some(buffer)) = (rest > 0, self.cloud_quads.as_ref()) {
                     pass.set_bind_group(1, &gpu.white_group, &[]);
-                    pass.set_vertex_buffer(0, buffer.slice(quad_at * QUAD_STRIDE..));
-                    pass.draw(0..6, 0..quad_count as u32);
+                    pass.set_vertex_buffer(0, buffer.slice((quad_at + ground) * QUAD_STRIDE..));
+                    pass.draw(0..6, 0..rest as u32);
                 }
                 pass.set_pipeline(&gpu.line_pipeline);
                 pass.set_bind_group(0, &self.uniform_groups[index], &[offset]);
@@ -3251,6 +3499,42 @@ impl Plot {
         self.marks.lines = lines;
     }
 
+    fn flush_ramp(&mut self, queue: &wgpu::Queue) {
+        if !self.ramp_dirty {
+            return;
+        }
+        self.ramp_dirty = false;
+        let Some(index) = self.dose_atlas else {
+            return;
+        };
+        let Some((cols, rows)) = self.marks.heatmap_size.get(index).copied() else {
+            return;
+        };
+        if rows == 0 {
+            return;
+        }
+        let row_bytes = (cols * 4) as usize;
+        let start = (rows as usize - 1) * row_bytes;
+        let Some(row) = self
+            .marks
+            .heatmaps
+            .get(index)
+            .and_then(|pixels| pixels.get(start..start + row_bytes))
+            .map(<[u8]>::to_vec)
+        else {
+            return;
+        };
+        let Some(texture) = self
+            .gpu
+            .as_ref()
+            .and_then(|gpu| gpu.heats.get(index))
+            .map(|heat| &heat.texture)
+        else {
+            return;
+        };
+        write_rgba_row(queue, texture, &row, cols, rows - 1);
+    }
+
     fn ensure_uploaded(&mut self, gpu: &PlotGpu) -> Result<(), GpuError> {
         if self.gpu.is_some() {
             return Ok(());
@@ -3392,10 +3676,11 @@ impl Plot {
         self.heat_uploaded = self.heat_revision;
     }
 
-    fn upload_live(&mut self, gpu: &PlotGpu) -> (Vec<(u64, u64)>, Vec<(u64, u64)>) {
+    fn upload_live(&mut self, gpu: &PlotGpu) -> (Vec<(u64, u64)>, Vec<(u64, u64)>, Vec<u64>) {
         let panels = self.marks.panels.len();
         let mut quad_span = vec![(0u64, 0u64); panels];
         let mut line_span = vec![(0u64, 0u64); panels];
+        let mut grounds = vec![0u64; panels];
         let mut quad_bytes = Vec::new();
         let mut line_bytes = Vec::new();
         let mut quads = 0u64;
@@ -3403,10 +3688,25 @@ impl Plot {
         for panel in 0..panels {
             let quad_at = quads;
             let line_at = lines;
-            for cloud in self.live.iter().filter(|cloud| cloud.panel == panel) {
+            for cloud in self
+                .live
+                .iter()
+                .filter(|cloud| cloud.panel == panel && cloud.crosshair)
+            {
                 quad_bytes.extend(encode_quads(&cloud.quads));
-                line_bytes.extend(encode_lines(&cloud.lines));
                 quads += cloud.quads.len() as u64;
+            }
+            grounds[panel] = quads - quad_at;
+            for cloud in self
+                .live
+                .iter()
+                .filter(|cloud| cloud.panel == panel && !cloud.crosshair)
+            {
+                quad_bytes.extend(encode_quads(&cloud.quads));
+                quads += cloud.quads.len() as u64;
+            }
+            for cloud in self.live.iter().filter(|cloud| cloud.panel == panel) {
+                line_bytes.extend(encode_lines(&cloud.lines));
                 lines += cloud.lines.len() as u64;
             }
             quad_span[panel] = (quad_at, quads - quad_at);
@@ -3414,15 +3714,73 @@ impl Plot {
         }
         write_grow(&gpu.device, &gpu.queue, &mut self.cloud_quads, &quad_bytes);
         write_grow(&gpu.device, &gpu.queue, &mut self.cloud_lines, &line_bytes);
-        (quad_span, line_span)
+        (quad_span, line_span, grounds)
     }
 
     #[cfg(test)]
     fn project_data(&self, panel: usize, x: f32, y: f32, width: u32, height: u32) -> [f32; 2] {
         let layout = self.layout(width, height);
         let cell = &layout[panel];
-        let matrix = self.cameras[panel].clip_from_data(cell.plot, width as f32, height as f32);
+        let matrix = self.view_camera(panel, &cell.plot).clip_from_data(
+            cell.plot,
+            width as f32,
+            height as f32,
+        );
         project(matrix, [x, y, 0.0], width as f32, height as f32)
+    }
+
+    /// Slice windows grow so a millimetre matches on both axes. Other panels keep their camera.
+    fn view_camera(&self, panel: usize, plot: &PlotRect) -> Camera {
+        let camera = self.cameras[panel];
+        let spatial = self
+            .panels
+            .get(panel)
+            .and_then(|item| dose_plane(&item.title))
+            .is_some_and(|plane| plane < 3);
+        if !spatial {
+            return camera;
+        }
+        let turns = self.turns.get(panel).copied().unwrap_or(0);
+        fit_domain(camera, plot, turns)
+    }
+
+    /// Paint the ramp's zero across each slice window and run that crosshair to
+    /// the window. The volume quad stays on the lattice.
+    fn fit_slice_chrome(&mut self, layout: &[Cell]) {
+        if self.dose.is_none() {
+            return;
+        }
+        let jobs: Vec<(usize, Camera, [f32; 4])> = layout
+            .iter()
+            .filter_map(|cell| {
+                let plane = cell_plane(self, cell).filter(|plane| *plane < 3)?;
+                let camera = self.view_camera(cell.panel, &cell.plot);
+                let integral = self.integral.get(cell.panel).copied().unwrap_or(false);
+                let color = slice_zero(self.dose.as_ref()?, integral, plane);
+                Some((cell.panel, camera, color))
+            })
+            .collect();
+        for (panel, camera, color) in jobs {
+            for cloud in self
+                .live
+                .iter_mut()
+                .filter(|cloud| cloud.panel == panel && cloud.crosshair)
+            {
+                for line in &mut cloud.lines {
+                    extend_crosshair(line, camera);
+                }
+                cloud.quads.clear();
+                cloud.quads.push(QuadRec {
+                    a: [camera.xmin, camera.ymin],
+                    b: [camera.xmax, camera.ymax],
+                    c: None,
+                    heat: 0.0,
+                    color,
+                    id: 0,
+                    heatmap: None,
+                });
+            }
+        }
     }
 }
 
@@ -4613,6 +4971,65 @@ fn grid_lines(camera: &Camera, foreground: [f32; 4]) -> Vec<LineRec> {
 
 /// Whole-pixel plot box. The scissor, the camera, and the frame share it, so a
 /// 1px stroke on the outer pixel is not cut off when the cell size is fractional.
+/// Grow the window so one data unit is the same length on both axes.
+///
+/// The plot rectangle is unchanged. A quarter turn swaps which millimetre
+/// runs along the pixel width, so the window grows to match that picture.
+fn fit_domain(camera: Camera, plot: &PlotRect, turns: u8) -> Camera {
+    let dw = (camera.xmax - camera.xmin).abs().max(1e-6);
+    let dh = (camera.ymax - camera.ymin).abs().max(1e-6);
+    let pixel = plot.w.max(1.0) / plot.h.max(1.0);
+    let data = dw / dh;
+    let ratio = if turns.is_multiple_of(2) {
+        pixel
+    } else {
+        pixel * data * data
+    };
+    let (cw, ch) = if data < ratio {
+        (ratio * dh, dh)
+    } else {
+        (dw, dw / ratio.max(1e-6))
+    };
+    let cx = (camera.xmin + camera.xmax) * 0.5;
+    let cy = (camera.ymin + camera.ymax) * 0.5;
+    Camera {
+        xmin: cx - cw * 0.5,
+        xmax: cx + cw * 0.5,
+        ymin: cy - ch * 0.5,
+        ymax: cy + ch * 0.5,
+    }
+}
+
+/// Color of a dose of zero on this slice, the same window the volume shader uses.
+fn slice_zero(grid: &crate::dose::DoseGrid, integral: bool, plane: u8) -> [f32; 4] {
+    let (lo, hi) = if integral {
+        crate::dose::integral_limits(grid, plane)
+    } else if grid.hi > grid.lo {
+        (grid.lo, grid.hi)
+    } else {
+        (0.0, grid.peak)
+    };
+    let span = (hi - lo).abs().max(1e-6);
+    let t = ((0.0 * grid.gain - lo) / span).clamp(0.0, 1.0);
+    let rgb = scan_kit_core::sample(grid.ramp, t);
+    [rgb[0], rgb[1], rgb[2], grid.opacity.clamp(0.0, 1.0)]
+}
+
+/// Stretch one crosshair segment to the fitted window. The shared coordinate is the cursor.
+fn extend_crosshair(line: &mut LineRec, camera: Camera) {
+    let dx = (line.b[0] - line.a[0]).abs();
+    let dy = (line.b[1] - line.a[1]).abs();
+    if dx >= dy {
+        let y = (line.a[1] + line.b[1]) * 0.5;
+        line.a = [camera.xmin, y, line.a[2]];
+        line.b = [camera.xmax, y, line.b[2]];
+    } else {
+        let x = (line.a[0] + line.b[0]) * 0.5;
+        line.a = [x, camera.ymin, line.a[2]];
+        line.b = [x, camera.ymax, line.b[2]];
+    }
+}
+
 /// Shrink the plot so one data unit is the same length on both axes.
 fn equal_scale(plot: PlotRect, camera: &Camera) -> PlotRect {
     let data_w = (camera.xmax - camera.xmin).abs().max(1e-6);
@@ -4720,16 +5137,16 @@ fn cell_plane(plot: &Plot, cell: &Cell) -> Option<u8> {
 }
 
 fn panel_frame(plot: &Plot, cell: &Cell) -> (Vec<LineRec>, Vec<LineRec>) {
-    let camera = &plot.cameras[cell.panel];
+    let camera = plot.view_camera(cell.panel, &cell.plot);
     match cell_plane(plot, cell) {
         Some(3) => (Vec::new(), Vec::new()),
         Some(_) => (
             Vec::new(),
-            border_lines(camera, &cell.plot, plot.foreground),
+            border_lines(&camera, &cell.plot, plot.foreground),
         ),
         None => (
-            grid_lines(camera, plot.foreground),
-            border_lines(camera, &cell.plot, plot.foreground),
+            grid_lines(&camera, plot.foreground),
+            border_lines(&camera, &cell.plot, plot.foreground),
         ),
     }
 }
@@ -5182,32 +5599,59 @@ fn paint_color_axis(
 
 fn dose_chrome(plot: &Plot, cell: &Cell) -> Vec<GlyphRec> {
     let mut out = Vec::new();
-    let Some(grid) = &plot.dose else {
-        return out;
-    };
-    let Some(plane) = plot
-        .panels
-        .get(cell.panel)
-        .and_then(|panel| dose_plane(&panel.title))
-    else {
-        return out;
-    };
-    if plane != 3 {
-        return out;
+    for label in volume_labels(plot, cell) {
+        let mut color = plot.foreground;
+        color[3] *= if label.title { 0.75 } else { 0.6 };
+        push_text(
+            &mut out,
+            &label.text,
+            [label.at[0], label.at[1], label.angle],
+            -1.0,
+            0.5,
+            [0.0, ink_center_shift(&label.text)],
+            color,
+        );
     }
-    let volume = &grid.volume;
-    let voxel = volume.voxel.max(1e-6);
-    let extent = [
-        volume.shape[0] as f32 * voxel,
-        volume.shape[1] as f32 * voxel,
-        volume.shape[2] as f32 * voxel,
-    ];
-    let origin = volume.origin;
-    let view = scan_kit_core::RayView {
+    out
+}
+
+/// Outward candidates for the X, Y, and depth edges. `tick_near` uses the same pair.
+const EDGE_OUT: [[[f32; 3]; 2]; 3] = [
+    [[0.0, -1.0, 0.0], [0.0, 0.0, 1.0]],
+    [[-1.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
+    [[-1.0, 0.0, 0.0], [0.0, -1.0, 0.0]],
+];
+const AXIS_TITLE: [&str; 3] = ["X (mm)", "Y (mm)", "Depth (mm)"];
+
+fn depth_title(plot: &Plot, panel: usize, axis: usize) -> String {
+    if axis == 2 {
+        if let Some(label) = plot
+            .panels
+            .get(panel)
+            .map(|item| item.x_label.as_str())
+            .filter(|label| !label.is_empty())
+        {
+            return label.to_string();
+        }
+    }
+    AXIS_TITLE[axis].to_string()
+}
+const LABEL_GAP_PX: f32 = 14.0;
+
+struct VolumeLabel {
+    text: String,
+    at: [f32; 2],
+    /// Clockwise radians, y down.
+    angle: f32,
+    title: bool,
+}
+
+fn dose_ray(plot: &Plot, grid: &crate::dose::DoseGrid, aspect: f32) -> scan_kit_core::RayView {
+    scan_kit_core::RayView {
         azimuth: plot.azimuth,
         elevation: plot.elevation,
         zoom: plot.orbit_zoom,
-        aspect: crate::dose::FILM_X * cell.plot.w / cell.plot.h.max(1.0),
+        aspect,
         mode: grid.mode,
         filter: grid.filter,
         gain: grid.gain,
@@ -5219,70 +5663,352 @@ fn dose_chrome(plot: &Plot, cell: &Cell) -> Vec<GlyphRec> {
         fov: plot.fov,
         center: plot.pan,
         gantry: grid.gantry,
-    };
-    let place = |out: &mut Vec<GlyphRec>, text: &str, point: [f32; 3]| {
-        let Some(uv) = scan_kit_core::dose_film_uv(volume, view, point) else {
-            return;
-        };
-        push_text(
-            out,
-            text,
-            [
-                cell.plot.x + uv[0] * cell.plot.w * crate::dose::FILM_X,
-                cell.plot.y + uv[1] * cell.plot.h,
-                0.0,
-            ],
-            0.0,
-            0.5,
-            [0.0, 0.0],
-            plot.foreground,
-        );
-    };
-    let z1 = origin[2] + extent[2];
-    let step_x = tick_step(extent[0]);
-    let mut mark = (origin[0] / step_x).ceil() * step_x;
-    let mut n = 0;
-    while mark <= origin[0] + extent[0] + 0.01 && n < 8 {
-        place(&mut out, &format_tick(mark), [mark, origin[1], z1]);
-        mark += step_x;
-        n += 1;
     }
-    let step_y = tick_step(extent[1]);
-    mark = (origin[1] / step_y).ceil() * step_y;
-    n = 0;
-    while mark <= origin[1] + extent[1] + 0.01 && n < 8 {
-        place(&mut out, &format_tick(mark), [origin[0], mark, z1]);
-        mark += step_y;
-        n += 1;
-    }
-    let step_z = tick_step(extent[2]);
-    mark = (origin[2] / step_z).ceil() * step_z;
-    n = 0;
-    while mark <= z1 + 0.01 && n < 8 {
-        place(
-            &mut out,
-            &format_tick(z1 - mark),
-            [origin[0], origin[1], mark],
-        );
-        mark += step_z;
-        n += 1;
-    }
-    out
 }
 
-fn tick_step(span: f32) -> f32 {
-    for step in [10.0, 20.0, 50.0, 100.0, 200.0, 500.0] {
-        if span / step <= 8.0 {
-            return step;
+fn lattice_box(volume: &scan_kit_core::Volume) -> ([f32; 3], [f32; 3]) {
+    let voxel = volume.voxel.max(1e-6);
+    let extent = [
+        volume.shape[0] as f32 * voxel,
+        volume.shape[1] as f32 * voxel,
+        volume.shape[2] as f32 * voxel,
+    ];
+    (volume.origin, extent)
+}
+
+fn edge_point(axis: usize, mark: f32, origin: [f32; 3], extent: [f32; 3]) -> [f32; 3] {
+    let z1 = origin[2] + extent[2];
+    match axis {
+        0 => [mark, origin[1], z1],
+        1 => [origin[0], mark, z1],
+        _ => [origin[0], origin[1], mark],
+    }
+}
+
+fn add3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
+}
+
+fn mul3(a: [f32; 3], scale: f32) -> [f32; 3] {
+    [a[0] * scale, a[1] * scale, a[2] * scale]
+}
+
+/// Tick positions every 10 mm, plus the box ends. Numbered ticks stay under eight
+/// per edge; both ends always carry a number.
+fn axis_ticks(lo: f32, hi: f32) -> Vec<(f32, bool)> {
+    const STEP: f32 = 10.0;
+    let k0 = (lo / STEP - 1e-9).ceil() as i32;
+    let k1 = (hi / STEP + 1e-9).floor() as i32;
+    let count = if k1 >= k0 { (k1 - k0 + 1) as usize } else { 0 };
+    let every = [1i32, 2, 5, 10, 20, 50, 100]
+        .into_iter()
+        .find(|step| count <= *step as usize * 8)
+        .unwrap_or(100);
+    let mut ticks = Vec::with_capacity(count + 2);
+    for index in 0..count {
+        let k = k0 + index as i32;
+        let gap = (k - k0).min(k1 - k);
+        let major = index == 0
+            || index + 1 == count
+            || (k.rem_euclid(every) == 0 && gap as f32 >= 0.6 * every as f32);
+        ticks.push((k as f32 * STEP, major));
+    }
+    if ticks.first().is_none_or(|(value, _)| *value - lo > 1e-4) {
+        ticks.insert(0, (lo, true));
+    }
+    if ticks.last().is_none_or(|(value, _)| hi - *value > 1e-4) {
+        ticks.push((hi, true));
+    }
+    ticks
+}
+
+fn axis_number(axis: usize, value: f32, hi: f32) -> String {
+    format_tick(if axis == 2 { hi - value } else { value })
+}
+
+fn film_step(
+    volume: &scan_kit_core::Volume,
+    view: scan_kit_core::RayView,
+    from: [f32; 3],
+    to: [f32; 3],
+    scale: [f32; 2],
+) -> Option<[f32; 2]> {
+    let a = scan_kit_core::dose_film_open(volume, view, from)?;
+    let b = scan_kit_core::dose_film_open(volume, view, to)?;
+    Some([(b[0] - a[0]) * scale[0], (b[1] - a[1]) * scale[1]])
+}
+
+fn hypot2(v: [f32; 2]) -> f32 {
+    v[0].hypot(v[1])
+}
+
+fn clamp_on_film(at: [f32; 2], plot: &PlotRect, half: [f32; 2]) -> [f32; 2] {
+    let place = |value: f32, start: f32, span: f32, pad: f32| {
+        let lo = start + pad;
+        let hi = start + span - pad;
+        if lo <= hi {
+            value.clamp(lo, hi)
+        } else {
+            start + span * 0.5
+        }
+    };
+    [
+        place(at[0], plot.x, plot.w, half[0]),
+        place(at[1], plot.y, plot.h, half[1]),
+    ]
+}
+
+fn outward_index(edge: [f32; 2], candidates: [[f32; 2]; 2], away: [f32; 2]) -> usize {
+    let length = hypot2(edge);
+    if length < 1e-6 {
+        let score = |cand: [f32; 2]| cand[0] * away[0] + cand[1] * away[1];
+        return usize::from(score(candidates[1]) > score(candidates[0]));
+    }
+    let mut perp = [-edge[1] / length, edge[0] / length];
+    if perp[0] * away[0] + perp[1] * away[1] < 0.0 {
+        perp = [-perp[0], -perp[1]];
+    }
+    let score = |cand: [f32; 2]| cand[0] * perp[0] + cand[1] * perp[1];
+    usize::from(score(candidates[1]) > score(candidates[0]))
+}
+
+fn label_direction(edge: [f32; 2], out: [f32; 2]) -> [f32; 2] {
+    let length = hypot2(edge);
+    let mut direction = if length > 1e-6 {
+        [-edge[1] / length, edge[0] / length]
+    } else {
+        out
+    };
+    if length > 1e-6 && direction[0] * out[0] + direction[1] * out[1] < 0.0 {
+        direction = [-direction[0], -direction[1]];
+    }
+    let span = hypot2(direction).max(1e-9);
+    [direction[0] / span, direction[1] / span]
+}
+
+fn readable_angle(edge: [f32; 2]) -> f32 {
+    let mut degrees = edge[1].atan2(edge[0]).to_degrees();
+    if degrees > 90.0 {
+        degrees -= 180.0;
+    } else if degrees < -90.0 {
+        degrees += 180.0;
+    }
+    degrees.to_radians()
+}
+
+fn spaced_labels(tips: &[[f32; 2]], need: f32) -> Vec<usize> {
+    let count = tips.len();
+    if count < 2 {
+        return (0..count).collect();
+    }
+    let mut keep = vec![0];
+    for index in 1..count - 1 {
+        let previous = tips[keep[keep.len() - 1]];
+        if hypot2([tips[index][0] - previous[0], tips[index][1] - previous[1]]) >= need {
+            keep.push(index);
         }
     }
-    500.0
+    while keep.len() > 1 {
+        let previous = tips[keep[keep.len() - 1]];
+        let last = tips[count - 1];
+        if hypot2([last[0] - previous[0], last[1] - previous[1]]) >= need {
+            break;
+        }
+        keep.pop();
+    }
+    keep.push(count - 1);
+    keep
 }
 
-fn labels_for(panel: &Panel, camera: &Camera, cell: &Cell, color: [f32; 4]) -> Vec<GlyphRec> {
+/// Which of [`EDGE_OUT`] faces the camera. Bit 0 is X, bit 1 is Y, bit 2 is depth.
+fn axis_sides(volume: &scan_kit_core::Volume, view: scan_kit_core::RayView) -> [usize; 3] {
+    let (origin, extent) = lattice_box(volume);
+    let center = [
+        origin[0] + extent[0] * 0.5,
+        origin[1] + extent[1] * 0.5,
+        origin[2] + extent[2] * 0.5,
+    ];
+    let scale = [view.aspect.max(1e-3), 1.0];
+    let mut sides = [0; 3];
+    let Some(center_uv) = scan_kit_core::dose_film_open(volume, view, center) else {
+        return sides;
+    };
+    for axis in 0..3 {
+        let mid = edge_point(axis, origin[axis] + extent[axis] * 0.5, origin, extent);
+        let Some(mid_uv) = scan_kit_core::dose_film_open(volume, view, mid) else {
+            continue;
+        };
+        let Some(edge) = film_step(volume, view, mid, add3(mid, axis_along(axis)), scale) else {
+            continue;
+        };
+        let Some(first) = film_step(volume, view, mid, add3(mid, EDGE_OUT[axis][0]), scale) else {
+            continue;
+        };
+        let Some(second) = film_step(volume, view, mid, add3(mid, EDGE_OUT[axis][1]), scale) else {
+            continue;
+        };
+        let away = [
+            (mid_uv[0] - center_uv[0]) * scale[0],
+            (mid_uv[1] - center_uv[1]) * scale[1],
+        ];
+        let away = if hypot2(away) > 1e-6 { away } else { first };
+        sides[axis] = outward_index(edge, [first, second], away);
+    }
+    sides
+}
+
+fn axis_along(axis: usize) -> [f32; 3] {
+    let mut step = [0.0; 3];
+    step[axis] = 1.0;
+    step
+}
+
+fn volume_labels(plot: &Plot, cell: &Cell) -> Vec<VolumeLabel> {
+    let Some(grid) = &plot.dose else {
+        return Vec::new();
+    };
+    if plot
+        .panels
+        .get(cell.panel)
+        .and_then(|panel| dose_plane(&panel.title))
+        != Some(3)
+    {
+        return Vec::new();
+    }
+    let volume = &grid.volume;
+    let (origin, extent) = lattice_box(volume);
+    if extent.iter().any(|span| *span <= 0.0) {
+        return Vec::new();
+    }
+    let aspect = cell.plot.w / cell.plot.h.max(1.0);
+    let view = dose_ray(plot, grid, aspect);
+    let sides = axis_sides(volume, view);
+    let pixel = [cell.plot.w * crate::dose::FILM_X, cell.plot.h];
+    let to_px = |uv: [f32; 2]| -> [f32; 2] {
+        [
+            cell.plot.x + uv[0] * pixel[0],
+            cell.plot.y + uv[1] * pixel[1],
+        ]
+    };
+    let em = atlas().line_height;
+    let stub = (0.02 * extent[0].max(extent[1]).max(extent[2])).clamp(1.5, 6.0);
+    let mut frames = Vec::new();
+    for axis in 0..3 {
+        let lo = origin[axis];
+        let hi = lo + extent[axis];
+        let mid = edge_point(axis, lo + extent[axis] * 0.5, origin, extent);
+        let out = EDGE_OUT[axis][sides[axis]];
+        let Some(mid_uv) = scan_kit_core::dose_film_open(volume, view, mid) else {
+            continue;
+        };
+        let Some(edge) = film_step(volume, view, mid, add3(mid, axis_along(axis)), pixel) else {
+            continue;
+        };
+        let Some(side) = film_step(volume, view, mid, add3(mid, out), pixel) else {
+            continue;
+        };
+        let per_mm = hypot2(edge);
+        frames.push((axis, lo, hi, mid_uv, out, edge, side, per_mm));
+    }
+    let widest = frames.iter().map(|frame| frame.7).fold(0.0_f32, f32::max);
+    let mut labels = Vec::new();
+    for (axis, lo, hi, mid_uv, out, edge, side, per_mm) in frames {
+        let shown = per_mm * extent[axis] >= 3.0 * em && per_mm >= 0.3 * widest;
+        if !shown {
+            continue;
+        }
+        let center = [
+            origin[0] + extent[0] * 0.5,
+            origin[1] + extent[1] * 0.5,
+            origin[2] + extent[2] * 0.5,
+        ];
+        let away = scan_kit_core::dose_film_open(volume, view, center)
+            .map(|uv| {
+                let at = to_px(uv);
+                let here = to_px(mid_uv);
+                [here[0] - at[0], here[1] - at[1]]
+            })
+            .unwrap_or([0.0, 0.0]);
+        let direction = label_direction(
+            edge,
+            if hypot2(side) >= 0.25 * per_mm {
+                side
+            } else {
+                away
+            },
+        );
+        let angle = readable_angle(edge);
+        let gap = LABEL_GAP_PX + 0.8 * em;
+        let paired: Vec<(String, [f32; 2])> = axis_ticks(lo, hi)
+            .into_iter()
+            .filter(|(_, major)| *major)
+            .filter_map(|(value, _)| {
+                let text = axis_number(axis, value, hi);
+                if text.is_empty() {
+                    return None;
+                }
+                let tip = add3(edge_point(axis, value, origin, extent), mul3(out, stub));
+                let px = scan_kit_core::dose_film_open(volume, view, tip).map(to_px)?;
+                Some((text, px))
+            })
+            .collect();
+        if !paired.is_empty() {
+            let wide = paired
+                .iter()
+                .map(|(text, _)| text::text_width(text))
+                .fold(0.0, f32::max);
+            let points: Vec<[f32; 2]> = paired.iter().map(|(_, px)| *px).collect();
+            for index in spaced_labels(&points, wide + 4.0) {
+                let (text, tip) = &paired[index];
+                let at = [tip[0] + direction[0] * gap, tip[1] + direction[1] * gap];
+                if at[0] < cell.plot.x
+                    || at[0] > cell.plot.x + cell.plot.w
+                    || at[1] < cell.plot.y
+                    || at[1] > cell.plot.y + cell.plot.h
+                {
+                    continue;
+                }
+                labels.push(VolumeLabel {
+                    text: text.clone(),
+                    at,
+                    angle,
+                    title: false,
+                });
+            }
+        }
+        let tick_px = (side[0] * direction[0] + side[1] * direction[1]).abs() * stub;
+        let mut title_at = to_px(mid_uv);
+        let reach = tick_px + gap + em + LABEL_GAP_PX + 0.6 * em;
+        title_at[0] += direction[0] * reach;
+        title_at[1] += direction[1] * reach;
+        let title = depth_title(plot, cell.panel, axis);
+        let (sin_t, cos_t) = angle.sin_cos();
+        let width = text::text_width(&title);
+        let half = [
+            0.5 * width * cos_t.abs() + 0.5 * em * sin_t.abs(),
+            0.5 * width * sin_t.abs() + 0.5 * em * cos_t.abs(),
+        ];
+        title_at = clamp_on_film(title_at, &cell.plot, half);
+        labels.push(VolumeLabel {
+            text: title,
+            at: title_at,
+            angle,
+            title: true,
+        });
+    }
+    labels
+}
+
+fn labels_for(
+    panel: &Panel,
+    camera: &Camera,
+    cell: &Cell,
+    color: [f32; 4],
+    title: bool,
+) -> Vec<GlyphRec> {
     let mut out = Vec::new();
     let font = atlas();
-    if shows_title(panel) {
+    if title && shows_title(panel) {
         push_text(
             &mut out,
             &panel.title,
@@ -5561,6 +6287,9 @@ fn integral_profile_axis(grid: &crate::dose::DoseGrid, kind: u8) -> (f32, f32) {
             fold(&grid.integrals[2], &mut lo, &mut hi, &mut any);
         }
     }
+    for volume in grid.sessions.iter().flatten() {
+        fold_cube(volume, kind, &mut lo, &mut hi, &mut any);
+    }
     if !any || !lo.is_finite() || !hi.is_finite() {
         return (0.0, 1.0);
     }
@@ -5606,62 +6335,202 @@ fn structure_color(id: u8) -> [f32; 4] {
     INK[(id as usize).saturating_sub(1) % INK.len()]
 }
 
+fn session_volume(dose: &scan_kit_core::SessionDose) -> Option<scan_kit_core::Volume> {
+    if dose.values.is_empty() {
+        return None;
+    }
+    let shape = [
+        dose.shape[0] as usize,
+        dose.shape[1] as usize,
+        dose.shape[2] as usize,
+    ];
+    let n = shape[0].saturating_mul(shape[1]).saturating_mul(shape[2]);
+    if n == 0 || dose.values.len() < n {
+        return None;
+    }
+    let mut values = dose.values.clone();
+    values.truncate(n);
+    Some(scan_kit_core::Volume {
+        origin: dose.origin,
+        shape,
+        voxel: dose.voxel.max(1e-3),
+        values,
+    })
+}
+
+fn fold_cube(volume: &scan_kit_core::Volume, kind: u8, lo: &mut f32, hi: &mut f32, any: &mut bool) {
+    let [nx, ny, nz] = volume.shape;
+    if nx == 0 || ny == 0 || nz == 0 {
+        return;
+    }
+    let area = volume.voxel * volume.voxel;
+    let mut touch = |sum: f32| {
+        if !sum.is_finite() {
+            return;
+        }
+        if *any {
+            *lo = lo.min(sum);
+            *hi = hi.max(sum);
+        } else {
+            *lo = sum;
+            *hi = sum;
+            *any = true;
+        }
+    };
+    let sum_x = kind != 1;
+    let sum_y = kind == 1 || kind >= 3;
+    if sum_x {
+        for y in 0..ny {
+            for z in 0..nz {
+                let mut sum = 0.0;
+                for x in 0..nx {
+                    sum += volume.get(x, y, z);
+                }
+                touch(sum * area);
+            }
+        }
+    }
+    if sum_y {
+        for z in 0..nz {
+            for x in 0..nx {
+                let mut sum = 0.0;
+                for y in 0..ny {
+                    sum += volume.get(x, y, z);
+                }
+                touch(sum * area);
+            }
+        }
+    }
+}
+
+fn profile_curves(
+    grid: &crate::dose::DoseGrid,
+    volume: &scan_kit_core::Volume,
+    own: bool,
+    kind: u8,
+    at: [usize; 3],
+    integrate: bool,
+) -> Vec<(Vec<f32>, Vec<f32>)> {
+    let [ix, iy, iz] = at;
+    let mut series = Vec::new();
+    match kind {
+        0 if integrate && own => series.push(cached_depth_integral(grid, iy)),
+        0 if integrate => series.push(volume.depth_integral(iy)),
+        0 => series.push(volume.depth_profile(ix, iy)),
+        1 if integrate && own => series.push(cached_lateral_integral(grid, ix, iz)),
+        1 if integrate => series.push(volume.lateral_integral(ix, iz)),
+        1 => series.push(volume.lateral_profile(ix, iy, iz)),
+        2 if integrate && own => series.push(cached_longitudinal_integral(grid, iy, iz)),
+        2 if integrate => series.push(volume.longitudinal_integral(iy, iz)),
+        2 => series.push(volume.longitudinal_profile(ix, iy, iz)),
+        _ if integrate && own => {
+            series.push(cached_lateral_integral(grid, ix, iz));
+            series.push(cached_longitudinal_integral(grid, iy, iz));
+        }
+        _ if integrate => {
+            series.push(volume.lateral_integral(ix, iz));
+            series.push(volume.longitudinal_integral(iy, iz));
+        }
+        _ => {
+            series.push(volume.lateral_profile(ix, iy, iz));
+            series.push(volume.longitudinal_profile(ix, iy, iz));
+        }
+    }
+    series
+}
+
 fn profile_lines(
     grid: &crate::dose::DoseGrid,
     kind: u8,
     cursor: [usize; 3],
     integrate: bool,
-    color: [f32; 4],
+    fallback: [f32; 4],
 ) -> Vec<LineRec> {
-    let volume = &grid.volume;
-    let [ix, iy, iz] = cursor;
-    let mut series = Vec::new();
-    let push = |series: &mut Vec<(Vec<f32>, Vec<f32>)>, pair: (Vec<f32>, Vec<f32>)| {
-        series.push(pair);
-    };
-    match kind {
-        0 if integrate => push(&mut series, cached_depth_integral(grid, iy)),
-        0 => push(&mut series, volume.depth_profile(ix, iy)),
-        1 if integrate => push(&mut series, cached_lateral_integral(grid, ix, iz)),
-        1 => push(&mut series, volume.lateral_profile(ix, iy, iz)),
-        2 if integrate => push(&mut series, cached_longitudinal_integral(grid, iy, iz)),
-        2 => push(&mut series, volume.longitudinal_profile(ix, iy, iz)),
-        _ if integrate => {
-            push(&mut series, cached_lateral_integral(grid, ix, iz));
-            push(&mut series, cached_longitudinal_integral(grid, iy, iz));
-        }
-        _ => {
-            push(&mut series, volume.lateral_profile(ix, iy, iz));
-            push(&mut series, volume.longitudinal_profile(ix, iy, iz));
-        }
-    }
+    let count = grid.sessions.len().max(1);
+    let focus = grid.session_focus.min(count - 1);
+    let mut order: Vec<usize> = (0..count).filter(|index| *index != focus).collect();
+    order.push(focus);
+    let home = &grid.volume;
+    let mm = [
+        home.mm_of(0, cursor[0].min(home.shape[0].saturating_sub(1))),
+        home.mm_of(1, cursor[1].min(home.shape[1].saturating_sub(1))),
+        home.mm_of(2, cursor[2].min(home.shape[2].saturating_sub(1))),
+    ];
     let mut lines = Vec::new();
-    for (index, (xs, ys)) in series.into_iter().enumerate() {
-        let ink = if index == 0 {
-            color
-        } else {
-            [0.95, 0.65, 0.25, color[3]]
+    for index in order {
+        let foreign = grid.sessions.get(index).and_then(|slot| slot.as_ref());
+        let at = match foreign {
+            Some(volume) => [
+                volume.index_of(0, mm[0]),
+                volume.index_of(1, mm[1]),
+                volume.index_of(2, mm[2]),
+            ],
+            None => cursor,
         };
-        let mut prev: Option<[f32; 3]> = None;
-        for (x, y) in xs.into_iter().zip(ys) {
-            if !x.is_finite() || !y.is_finite() {
-                prev = None;
-                continue;
+        let color = grid.session_colors.get(index).copied().unwrap_or(fallback);
+        let volume = foreign.unwrap_or(home);
+        for (curve, (xs, ys)) in
+            profile_curves(grid, volume, foreign.is_none(), kind, at, integrate)
+                .into_iter()
+                .enumerate()
+        {
+            let ink = if curve == 0 {
+                color
+            } else {
+                [color[0], color[1], color[2], color[3] * 0.55]
+            };
+            let mut prev: Option<[f32; 3]> = None;
+            for (x, y) in xs.into_iter().zip(ys) {
+                if !x.is_finite() || !y.is_finite() {
+                    prev = None;
+                    continue;
+                }
+                let point = [x, y, 0.0];
+                if let Some(start) = prev {
+                    lines.push(LineRec {
+                        a: start,
+                        b: point,
+                        color: ink,
+                        thickness: 1.5,
+                        id: 0,
+                    });
+                }
+                prev = Some(point);
             }
-            let point = [x, y, 0.0];
-            if let Some(start) = prev {
-                lines.push(LineRec {
-                    a: start,
-                    b: point,
-                    color: ink,
-                    thickness: 1.5,
-                    id: 0,
-                });
-            }
-            prev = Some(point);
         }
     }
     lines
+}
+
+const FIELD_INK: [f32; 4] = [0.95, 0.72, 0.2, 0.95];
+
+fn field_lines(field: [f32; 6], plane: u8, bounds: [f32; 4], turns: u8) -> Vec<LineRec> {
+    if plane >= 3 || !(field[1] > field[0] && field[3] > field[2] && field[5] > field[4]) {
+        return Vec::new();
+    }
+    let (x0, x1, y0, y1) = match plane {
+        1 => (field[0], field[1], field[4], field[5]),
+        2 => (field[2], field[3], field[4], field[5]),
+        _ => (field[0], field[1], field[2], field[3]),
+    };
+    let corners = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)];
+    let end = |px: f32, py: f32| {
+        let point = crate::dose::display_mm(px, py, bounds, turns);
+        [point[0], point[1], 0.0]
+    };
+    (0..4)
+        .map(|i| {
+            let (ax, ay) = corners[i];
+            let (bx, by) = corners[(i + 1) % 4];
+            LineRec {
+                a: end(ax, ay),
+                b: end(bx, by),
+                color: FIELD_INK,
+                thickness: 1.5,
+                id: 0,
+            }
+        })
+        .collect()
 }
 
 fn crosshair_lines(
@@ -6171,7 +7040,9 @@ fn blit_glyph(frame: &mut [u8], width: u32, height: u32, matrix: &[f32; 16], gly
         [glyph.anchor[0], glyph.anchor[1]]
     };
     let font = atlas();
+    let (sin_t, cos_t) = glyph.anchor[2].sin_cos();
     let turned = glyph.anchor[3] < 0.5 && glyph.anchor[2] > 0.5;
+    let spun = glyph.anchor[3] < -0.5;
     let u0 = (glyph.uv[0] * font.size as f32).round() as u32;
     let v0 = (glyph.uv[1] * font.size as f32).round() as u32;
     let columns = glyph.size[0] as u32;
@@ -6184,7 +7055,12 @@ fn blit_glyph(frame: &mut [u8], width: u32, height: u32, matrix: &[f32; 16], gly
             }
             let local_x = glyph.offset[0] + col as f32;
             let local_y = glyph.offset[1] + row as f32;
-            let (dx, dy) = if turned {
+            let (dx, dy) = if spun {
+                (
+                    cos_t * local_x - sin_t * local_y,
+                    sin_t * local_x + cos_t * local_y,
+                )
+            } else if turned {
                 (local_y, -local_x)
             } else {
                 (local_x, local_y)
@@ -6551,6 +7427,34 @@ fn write_grow(
         }));
     }
     queue.write_buffer(slot.as_ref().unwrap(), 0, bytes);
+}
+
+fn write_rgba_row(queue: &wgpu::Queue, texture: &wgpu::Texture, row: &[u8], cols: u32, y: u32) {
+    let cols = cols.max(1);
+    let row_bytes = cols * 4;
+    let stride = row_bytes.next_multiple_of(256);
+    let mut padded = vec![0u8; stride as usize];
+    let take = row.len().min(row_bytes as usize);
+    padded[..take].copy_from_slice(&row[..take]);
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d { x: 0, y, z: 0 },
+            aspect: wgpu::TextureAspect::All,
+        },
+        &padded,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(stride),
+            rows_per_image: Some(1),
+        },
+        wgpu::Extent3d {
+            width: cols,
+            height: 1,
+            depth_or_array_layers: 1,
+        },
+    );
 }
 
 fn write_rgba(queue: &wgpu::Queue, texture: &wgpu::Texture, pixels: &[u8], cols: u32, rows: u32) {
@@ -7435,6 +8339,252 @@ mod tests {
     }
 
     #[test]
+    fn a_color_change_does_not_rebuild_the_volume() {
+        let mut scene = line_scene();
+        scene.panels[0].title = "Axial".into();
+        scene.volume = scan_kit_core::VolumeMark {
+            values: vec![1.0; 8],
+            shape: [2, 2, 2],
+            origin: [0.0, 0.0, 0.0],
+            voxel: 1.0,
+            ramp: 1,
+            lo: 0.0,
+            hi: 4.0,
+            base_lo: 0.0,
+            base_hi: 4.0,
+            gain: 1.0,
+            unit: "Gy·mm".into(),
+            ..scan_kit_core::VolumeMark::default()
+        };
+        let mut plot = Plot::new(&scene, [0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0, 1.0]);
+        let stamp = plot.atlas_stamp();
+        let ptr = plot.dose.as_ref().unwrap().volume.values.as_ptr();
+        let before = ramp_corner(&plot);
+        let window = plot.paint(r#"{"auto":"Off","level":"1.5","ray":"Maximum"}"#);
+        let grid = plot.dose.as_ref().unwrap();
+        assert_eq!(grid.volume.values.as_ptr(), ptr);
+        assert_eq!(plot.atlas_stamp(), stamp);
+        assert!((grid.hi - 1.5).abs() < 1e-4);
+        assert!((grid.gain - 1.0).abs() < 1e-4);
+        assert_eq!(grid.mode, 1);
+        assert_eq!(grid.unit, "Gy");
+        assert!(window.contains("Window"));
+        assert!(window.contains("\"max\":\"8\""));
+        assert_eq!(
+            ramp_corner(&plot),
+            before,
+            "gain and window leave the ramp row"
+        );
+        plot.paint(r#"{"scale":"Viridis","auto":"On"}"#);
+        assert_ne!(ramp_corner(&plot), before);
+        assert_eq!(
+            plot.dose.as_ref().unwrap().ramp,
+            scan_kit_core::index("viridis")
+        );
+        assert_eq!(plot.atlas_stamp(), stamp);
+        assert_eq!(plot.dose.as_ref().unwrap().volume.values.as_ptr(), ptr);
+    }
+
+    fn ramp_corner(plot: &Plot) -> [u8; 3] {
+        let index = plot.dose_atlas.expect("dose atlas");
+        let pixels = &plot.marks.heatmaps[index];
+        let (cols, rows) = plot.marks.heatmap_size[index];
+        let dst = (((rows - 1) * cols + 255) * 4) as usize;
+        [pixels[dst], pixels[dst + 1], pixels[dst + 2]]
+    }
+
+    #[test]
+    fn scrolling_down_on_the_volume_zooms_out() {
+        let mut scene = line_scene();
+        scene.panels[0].title = "3D".into();
+        scene.volume = scan_kit_core::VolumeMark {
+            values: vec![1.0],
+            shape: [1, 1, 1],
+            origin: [0.0, 0.0, 0.0],
+            voxel: 1.0,
+            ..scan_kit_core::VolumeMark::default()
+        };
+        let mut plot = Plot::new(&scene, [0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0, 1.0]);
+        let layout = plot.layout(600, 480);
+        let picture = layout[0].plot;
+        plot.apply(
+            600,
+            480,
+            &PlotInput {
+                x: picture.x + picture.w * 0.5,
+                y: picture.y + picture.h * 0.5,
+                wheel: 120.0,
+                ..PlotInput::default()
+            },
+        );
+        assert!(plot.orbit_zoom > 1.0);
+    }
+
+    #[test]
+    fn the_field_box_shows_on_every_dose_view() {
+        let mut scene = line_scene();
+        let mut panel = scene.panels[0].clone();
+        panel.series = vec![Series::Heatmap {
+            values: vec![1.0; 64],
+            cols: 8,
+            rows: 8,
+            ramp: 0,
+            color: [1.0; 4],
+            lo: 0.0,
+            hi: 1.0,
+        }];
+        panel.xmin = 0.0;
+        panel.xmax = 8.0;
+        panel.ymin = 0.0;
+        panel.ymax = 8.0;
+        panel.equal = false;
+        scene.panels = ["Axial", "Coronal", "Sagittal", "3D"]
+            .into_iter()
+            .map(|title| {
+                let mut cell = panel.clone();
+                cell.title = title.into();
+                cell
+            })
+            .collect();
+        scene.columns = 2;
+        scene.volume = scan_kit_core::VolumeMark {
+            values: vec![1.0; 512],
+            shape: [8, 8, 8],
+            origin: [0.0, 0.0, 0.0],
+            voxel: 1.0,
+            field: [1.0, 3.0, 0.0, 2.0, 4.0, 6.0],
+            ..scan_kit_core::VolumeMark::default()
+        };
+        let plot = Plot::new(&scene, [0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0, 1.0]);
+        let expect = [
+            (0usize, 1.0, 3.0, 0.0, 2.0),
+            (1, 1.0, 3.0, 4.0, 6.0),
+            (2, 0.0, 2.0, 4.0, 6.0),
+        ];
+        for (panel, x0, x1, y0, y1) in expect {
+            let mut lines = Vec::new();
+            for cloud in plot.live.iter().filter(|cloud| cloud.panel == panel) {
+                for line in &cloud.lines {
+                    if line.color[0] > 0.9 && line.color[1] > 0.6 && line.color[2] < 0.4 {
+                        lines.push(line);
+                    }
+                }
+            }
+            assert_eq!(lines.len(), 4, "panel {panel}");
+            let span = |axis: usize| {
+                lines
+                    .iter()
+                    .flat_map(|line| [line.a[axis], line.b[axis]])
+                    .fold((f32::MAX, f32::MIN), |(lo, hi), value| {
+                        (lo.min(value), hi.max(value))
+                    })
+            };
+            let (got_x0, got_x1) = span(0);
+            let (got_y0, got_y1) = span(1);
+            assert!(
+                (got_x0 - x0).abs() < 1e-3 && (got_x1 - x1).abs() < 1e-3,
+                "{panel}"
+            );
+            assert!(
+                (got_y0 - y0).abs() < 1e-3 && (got_y1 - y1).abs() < 1e-3,
+                "{panel}"
+            );
+        }
+        let uniform = plot.dose_uniform(3, 1.0, 0.0);
+        assert_eq!(uniform[8][3], 1.0);
+        assert_eq!(uniform[8][..3], [1.0, 0.0, 4.0]);
+        assert_eq!(uniform[9][..3], [3.0, 2.0, 6.0]);
+    }
+
+    #[test]
+    fn dose_profiles_overlay_each_session_color() {
+        let mut scene = line_scene();
+        scene.panels[0].title = "Depth dose".into();
+        scene.panels[0].series.clear();
+        scene.panels[0].y_label = "Gy".into();
+        scene.volume = scan_kit_core::VolumeMark {
+            values: vec![1.0, 4.0],
+            shape: [1, 1, 2],
+            origin: [0.0; 3],
+            voxel: 1.0,
+            session_colors: vec![[0.1, 0.2, 0.8, 1.0], [0.9, 0.4, 0.1, 1.0]],
+            session_focus: 0,
+            sessions: vec![
+                scan_kit_core::SessionDose {
+                    values: Vec::new(),
+                    shape: [1, 1, 2],
+                    origin: [0.0; 3],
+                    voxel: 1.0,
+                },
+                scan_kit_core::SessionDose {
+                    values: vec![9.0, 2.0],
+                    shape: [1, 1, 2],
+                    origin: [0.0; 3],
+                    voxel: 1.0,
+                },
+            ],
+            ..scan_kit_core::VolumeMark::default()
+        };
+        let plot = Plot::new(&scene, [0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0, 1.0]);
+        let lines: Vec<_> = plot
+            .live
+            .iter()
+            .filter(|cloud| cloud.panel == 0)
+            .flat_map(|cloud| cloud.lines.iter())
+            .collect();
+        assert_eq!(lines.len(), 2);
+        let blue = lines.iter().find(|line| line.color[2] > 0.5).unwrap();
+        let orange = lines.iter().find(|line| line.color[0] > 0.5).unwrap();
+        assert!((blue.a[1].max(blue.b[1]) - 4.0).abs() < 1e-3);
+        assert!((orange.a[1].max(orange.b[1]) - 9.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn a_toolbar_hides_the_canvas_title() {
+        let panel = Panel {
+            title: "Depth dose".into(),
+            y_label: "Gy".into(),
+            x_label: String::new(),
+            xmin: 0.0,
+            xmax: 1.0,
+            ymin: 0.0,
+            ymax: 1.0,
+            series: Vec::new(),
+            x_labels: Vec::new(),
+            equal: false,
+        };
+        let camera = Camera::new(0.0, 1.0, 0.0, 1.0);
+        let cell = Cell {
+            cell: PlotRect {
+                x: 0.0,
+                y: 0.0,
+                w: 200.0,
+                h: 160.0,
+            },
+            plot: PlotRect {
+                x: 40.0,
+                y: 28.0,
+                w: 120.0,
+                h: 100.0,
+            },
+            panel: 0,
+        };
+        let ink = [1.0, 1.0, 1.0, 1.0];
+        let shown = labels_for(&panel, &camera, &cell, ink, true);
+        let hidden = labels_for(&panel, &camera, &cell, ink, false);
+        let title_y = cell.cell.y + atlas().ascent;
+        let on_title = |glyphs: &[GlyphRec]| {
+            glyphs
+                .iter()
+                .filter(|glyph| (glyph.anchor[1] - title_y).abs() < 0.5 && glyph.anchor[3] < 0.5)
+                .count()
+        };
+        assert!(on_title(&shown) >= 8);
+        assert_eq!(on_title(&hidden), 0);
+        assert!(!hidden.is_empty(), "axis labels stay");
+    }
+
+    #[test]
     fn the_crosshair_sits_on_the_slice_picture() {
         let mut scene = line_scene();
         scene.panels.truncate(1);
@@ -7497,7 +8647,9 @@ mod tests {
 
         let layout = plot.layout(200, 200);
         let cell = &layout[0];
-        let matrix = plot.cameras[0].clip_from_data(cell.plot, 200.0, 200.0);
+        let matrix = plot
+            .view_camera(0, &cell.plot)
+            .clip_from_data(cell.plot, 200.0, 200.0);
         let data_x = 1.5;
         let data_y = 1.0;
         let ndc_x = matrix[0] * data_x + matrix[12];
@@ -7526,6 +8678,101 @@ mod tests {
         let hit = line_crossing(&cross.lines);
         assert!((hit[0] - expected[0]).abs() < 1e-3);
         assert!((hit[1] - expected[1]).abs() < 1e-3);
+    }
+
+    fn pixel_rgb(frame: &[u8], width: u32, x: i32, y: i32) -> [u8; 3] {
+        if x < 0 || y < 0 {
+            return [0; 3];
+        }
+        let index = ((y as u32 * width) + x as u32) as usize * 4;
+        if index + 2 >= frame.len() {
+            return [0; 3];
+        }
+        [frame[index], frame[index + 1], frame[index + 2]]
+    }
+
+    #[test]
+    fn a_wide_slice_paints_zero_and_the_crosshair_past_the_volume() {
+        let mut scene = line_scene();
+        scene.panels[0].title = "Axial".into();
+        scene.panels[0].equal = false;
+        scene.panels[0].xmin = 0.0;
+        scene.panels[0].xmax = 4.0;
+        scene.panels[0].ymin = 0.0;
+        scene.panels[0].ymax = 4.0;
+        scene.panels[0].series = vec![Series::Heatmap {
+            values: vec![0.0; 16],
+            cols: 4,
+            rows: 4,
+            ramp: 1,
+            color: [1.0; 4],
+            lo: 0.0,
+            hi: 4.0,
+        }];
+        scene.volume = scan_kit_core::VolumeMark {
+            values: vec![4.0; 16],
+            shape: [4, 4, 1],
+            origin: [0.0, 0.0, 0.0],
+            voxel: 1.0,
+            ramp: 1,
+            lo: 0.0,
+            hi: 4.0,
+            mode: 0,
+            ..scan_kit_core::VolumeMark::default()
+        };
+        let mut plot = Plot::new(&scene, [0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0, 1.0]);
+        let dose = plot
+            .marks
+            .quads
+            .iter()
+            .find(|quad| quad.heat > 1.5 && quad.heat < 2.5)
+            .unwrap();
+        assert!((dose.a[0]).abs() < 1e-3 && (dose.b[0] - 4.0).abs() < 1e-3);
+        let layout = plot.layout(480, 160);
+        let camera = plot.view_camera(0, &layout[0].plot);
+        assert!(
+            camera.xmin < -0.5,
+            "the window opens past the volume, xmin {}",
+            camera.xmin
+        );
+        let cpu = plot.paint_cpu(480, 160, &layout);
+        let cross = plot.live.iter().find(|cloud| cloud.crosshair).unwrap();
+        let horizontal = cross
+            .lines
+            .iter()
+            .find(|line| (line.a[1] - line.b[1]).abs() < 1e-3)
+            .unwrap();
+        assert!(horizontal.a[0] <= camera.xmin + 1e-3);
+        assert!(horizontal.b[0] >= camera.xmax - 1e-3);
+        let margin_x = camera.xmin * 0.5;
+        let quiet = plot.project_data(0, margin_x, 3.0, 480, 160);
+        let zero = scan_kit_core::sample(1, 0.0).map(|channel| (channel * 255.0).round() as u8);
+        let got = pixel_rgb(&cpu, 480, quiet[0] as i32, quiet[1] as i32);
+        assert!(
+            got.iter()
+                .zip(zero)
+                .all(|(got, want)| (*got as i32 - want as i32).abs() <= 2),
+            "margin {got:?} zero {zero:?}"
+        );
+        let inside = plot.project_data(0, 2.0, 2.0, 480, 160);
+        let hot = pixel_rgb(&cpu, 480, inside[0] as i32, inside[1] as i32);
+        assert!(
+            hot.iter()
+                .zip(zero)
+                .any(|(got, want)| (*got as i32 - want as i32).abs() > 20),
+            "the volume stays on its bounds, pixel {hot:?}"
+        );
+        let on_line = plot.project_data(0, margin_x, horizontal.a[1], 480, 160);
+        let mut brightest = 0i32;
+        for dy in -2..=2 {
+            let rgb = pixel_rgb(&cpu, 480, on_line[0] as i32, on_line[1] as i32 + dy);
+            brightest = brightest.max(rgb.iter().map(|channel| *channel as i32).sum());
+        }
+        let quiet_sum: i32 = got.iter().map(|channel| *channel as i32).sum();
+        assert!(
+            brightest > quiet_sum + 80,
+            "crosshair sum {brightest} beside zero sum {quiet_sum}"
+        );
     }
 
     #[test]
@@ -7675,6 +8922,87 @@ mod tests {
     }
 
     #[test]
+    fn the_3d_axes_hang_readable_titles() {
+        let short = axis_ticks(0.0, 4.0);
+        assert_eq!(short, vec![(0.0, true), (4.0, true)]);
+        let partial = axis_ticks(0.0, 16.0);
+        assert_eq!(partial.last().map(|tick| tick.0), Some(16.0));
+        assert!(partial.last().is_some_and(|tick| tick.1));
+        let century = axis_ticks(0.0, 100.0);
+        assert_eq!(century.first().map(|tick| tick.0), Some(0.0));
+        assert_eq!(century.last().map(|tick| tick.0), Some(100.0));
+        let numbered = century.iter().filter(|tick| tick.1).count();
+        assert!(numbered <= 8, "{numbered} numbered ticks");
+        assert!(century.iter().any(|tick| !tick.1), "minor ticks");
+
+        let n = 8usize;
+        let mut scene = line_scene();
+        scene.panels[0].title = "3D".into();
+        scene.panels[0].series.clear();
+        scene.volume = scan_kit_core::VolumeMark {
+            values: vec![1.0; n * n * n],
+            shape: [n as u32, n as u32, n as u32],
+            origin: [0.0, 0.0, 0.0],
+            voxel: 10.0,
+            ramp: 1,
+            hi: 1.0,
+            mode: 1,
+            ..scan_kit_core::VolumeMark::default()
+        };
+        let plot = Plot::new(&scene, [0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0, 1.0]);
+        let layout = plot.layout(360, 360);
+        let cell = &layout[0];
+        let labels = volume_labels(&plot, cell);
+        let titles: Vec<_> = labels
+            .iter()
+            .filter(|label| label.title)
+            .map(|label| label.text.as_str())
+            .collect();
+        assert_eq!(titles, ["X (mm)", "Y (mm)", "Depth (mm)"]);
+        assert!(
+            labels.iter().any(|label| label.angle.abs() > 0.05),
+            "titles follow the edge"
+        );
+        for title in labels.iter().filter(|label| label.title) {
+            assert!(
+                title.at[0] > cell.plot.x && title.at[0] < cell.plot.x + cell.plot.w,
+                "{} left the film",
+                title.text
+            );
+        }
+        assert!(
+            labels.iter().any(|label| !label.title && label.text == "0"),
+            "an edge starts at 0"
+        );
+        assert!(
+            labels
+                .iter()
+                .any(|label| !label.title && label.text == "80"),
+            "an edge names its far end"
+        );
+        let grid = plot.dose.as_ref().expect("volume");
+        let view = dose_ray(&plot, grid, cell.plot.w / cell.plot.h.max(1.0));
+        let corner = scan_kit_core::dose_film_open(&grid.volume, view, [0.0, 0.0, 80.0])
+            .expect("entrance corner");
+        let corner = [
+            cell.plot.x + corner[0] * cell.plot.w,
+            cell.plot.y + corner[1] * cell.plot.h,
+        ];
+        let hung = labels.iter().any(|label| {
+            !label.title
+                && label.text == "0"
+                && (label.at[0] - corner[0]).hypot(label.at[1] - corner[1]) > 10.0
+        });
+        assert!(hung, "numbers hang off the tick");
+        let glyphs = dose_chrome(&plot, cell);
+        assert!(glyphs.iter().all(|glyph| glyph.anchor[3] < -0.5));
+        let bits = plot.dose_uniform(0, cell.plot.w / cell.plot.h.max(1.0), 0.0)[6][3];
+        let sides = axis_sides(&grid.volume, view);
+        let packed = (sides[0] + sides[1] * 2 + sides[2] * 4) as f32;
+        assert_eq!(bits, packed, "the march ticks use the same outward side");
+    }
+
+    #[test]
     fn dose_views_fill_the_cell_and_the_color_axis_is_numbered() {
         let (majors, _, labels, offset) = color_axis_ticks(0.0, 4.0, 6);
         assert!((majors[0]).abs() < 1e-4);
@@ -7694,7 +9022,8 @@ mod tests {
         scene.panels[0].equal = true;
         scene.panels[0].x_label = "X (mm)".into();
         scene.panels[0].y_label = "Y (mm)".into();
-        let axial = Plot::new(&scene, [0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0, 1.0]).layout(400, 160);
+        let mut axial_plot = Plot::new(&scene, [0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0, 1.0]);
+        let axial = axial_plot.layout(400, 160);
         let cell = &axial[0];
         assert!(
             cell.plot.w > cell.plot.h * 1.3,
@@ -7703,6 +9032,30 @@ mod tests {
             cell.plot.h
         );
         assert!(cell.plot.x > cell.cell.x + 8.0, "y ticks sit on the border");
+        let origin = axial_plot.project_data(0, 0.0, 0.0, 400, 160);
+        let east = axial_plot.project_data(0, 1.0, 0.0, 400, 160);
+        let north = axial_plot.project_data(0, 0.0, 1.0, 400, 160);
+        let dx = (east[0] - origin[0]).abs();
+        let dy = (origin[1] - north[1]).abs();
+        assert!(
+            (dx - dy).abs() < 0.05,
+            "a millimetre is {dx} px across and {dy} px up"
+        );
+        axial_plot.cameras[0] = scan_kit_core::Camera::new(0.0, 20.0, 0.0, 10.0);
+        axial_plot.turns[0] = 1;
+        let bounds = [0.0, 20.0, 0.0, 10.0];
+        let here = crate::dose::display_mm(5.0, 5.0, bounds, 1);
+        let along = crate::dose::display_mm(6.0, 5.0, bounds, 1);
+        let across = crate::dose::display_mm(5.0, 6.0, bounds, 1);
+        let p0 = axial_plot.project_data(0, here[0], here[1], 400, 160);
+        let p1 = axial_plot.project_data(0, along[0], along[1], 400, 160);
+        let p2 = axial_plot.project_data(0, across[0], across[1], 400, 160);
+        let turned_x = (p1[0] - p0[0]).hypot(p1[1] - p0[1]);
+        let turned_y = (p2[0] - p0[0]).hypot(p2[1] - p0[1]);
+        assert!(
+            (turned_x - turned_y).abs() < 0.05,
+            "a turned millimetre is {turned_x} px by {turned_y} px"
+        );
 
         scene.panels[0].title = "3D".into();
         scene.panels[0].x_label.clear();
@@ -8649,7 +10002,7 @@ mod tests {
             },
             panel: 0,
         };
-        let glyphs = labels_for(&panel, &camera, &cell, [1.0, 1.0, 1.0, 1.0]);
+        let glyphs = labels_for(&panel, &camera, &cell, [1.0, 1.0, 1.0, 1.0], true);
         let row: Vec<_> = glyphs
             .iter()
             .filter(|glyph| (glyph.anchor[1]).abs() < 1e-3 && glyph.anchor[3] > 0.5)
@@ -8708,7 +10061,7 @@ mod tests {
             },
             panel: 0,
         };
-        let glyphs = labels_for(&panel, &camera, &cell, [1.0, 1.0, 1.0, 1.0]);
+        let glyphs = labels_for(&panel, &camera, &cell, [1.0, 1.0, 1.0, 1.0], true);
         let center = cell.plot.x + cell.plot.w * 0.5;
         let named: Vec<_> = glyphs
             .iter()

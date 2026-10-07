@@ -209,6 +209,8 @@ struct Live {
     previews: u32,
     last_preview: Instant,
     cached: Option<McResult>,
+    score_let: bool,
+    let_buf: wgpu::Buffer,
 }
 
 fn slab_launch(request: &SlabRequest) -> Result<Launch, ComputeError> {
@@ -321,7 +323,7 @@ fn patient_launch(request: &PatientRequest) -> Result<Launch, ComputeError> {
         spots: kept_spots,
         protons,
         mode: 1,
-        flags: if request.dose_to_water { 1 } else { 0 },
+        flags: u32::from(request.dose_to_water) | (u32::from(request.score_let) * 2),
         origin_cm: request.origin_mm.map(|mm| mm / 10.0),
         spacing_cm: spacing,
         shape: request.shape,
@@ -354,6 +356,7 @@ fn empty_result(launch: &Launch) -> McResult {
         },
         uncertainty: 0.0,
         ledger: [0.0; 6],
+        let_d: Vec::new(),
     }
 }
 
@@ -414,7 +417,8 @@ async fn prepare(launch: Launch) -> Result<Live, ComputeError> {
     let params = uniform_buf(&device, 80);
     let material = storage_init(&device, &u32_bytes(&launch.material));
     let density = storage_init(&device, &f32_bytes(&launch.density));
-    let let_tally = storage_zero(&device, 4);
+    let score_let = launch.flags & 2 != 0;
+    let let_buf = storage_zero(&device, if score_let { (nvox * 16) as u64 } else { 4 });
     let beams = storage_init(&device, &f32_bytes(&launch.beams));
     let sum = storage_zero(&device, (nvox * 4) as u64);
     let sq = storage_zero(&device, (nvox * 4) as u64);
@@ -425,8 +429,7 @@ async fn prepare(launch: Launch) -> Result<Live, ComputeError> {
         &device,
         &transport_layout,
         &[
-            &spots, &floats, &ints, &tally, &ledger, &params, &material, &density, &let_tally,
-            &beams,
+            &spots, &floats, &ints, &tally, &ledger, &params, &material, &density, &let_buf, &beams,
         ],
     );
     let fold_group = bind(
@@ -456,9 +459,7 @@ async fn prepare(launch: Launch) -> Result<Live, ComputeError> {
         out,
         sum,
         sq,
-        kept: vec![
-            spots, floats, ints, tally, material, density, let_tally, beams,
-        ],
+        kept: vec![spots, floats, ints, tally, material, density, beams],
         base,
         next: 0,
         histories,
@@ -476,6 +477,8 @@ async fn prepare(launch: Launch) -> Result<Live, ComputeError> {
         previews: 0,
         last_preview: Instant::now(),
         cached: None,
+        score_let,
+        let_buf,
     })
 }
 
@@ -643,6 +646,11 @@ impl Live {
             let quanta = ((hi << 32) | lo) as i64;
             ledger_mev[i] = (quanta as f64 * QUANTUM_MEV / f64::from(histories)) as f32;
         }
+        let let_d = if self.score_let {
+            read_let(&self.device, &self.queue, &self.let_buf, self.nvox)?
+        } else {
+            Vec::new()
+        };
         Ok(McResult {
             volume: Volume {
                 origin: self.origin,
@@ -652,6 +660,7 @@ impl Live {
             },
             uncertainty: uncertainty(&dose_sum, &dose_sq, histories / self.per_batch.max(1)),
             ledger: ledger_mev,
+            let_d,
         })
     }
 }
@@ -915,6 +924,32 @@ fn read_f32(
         .collect())
 }
 
+fn pack_i64(lo: u32, hi: u32) -> i64 {
+    let mut bytes = [0u8; 8];
+    bytes[..4].copy_from_slice(&lo.to_le_bytes());
+    bytes[4..].copy_from_slice(&hi.to_le_bytes());
+    i64::from_le_bytes(bytes)
+}
+
+/// Dose-weighted LET, keV/µm. Each voxel is two little-endian i64 quanta: E×LET, then E.
+fn read_let(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    buffer: &wgpu::Buffer,
+    nvox: usize,
+) -> Result<Vec<f32>, ComputeError> {
+    let raw = read_u32(device, queue, buffer, nvox * 4)?;
+    let mut out = vec![0.0f32; nvox];
+    for (i, slot) in out.iter_mut().enumerate() {
+        let den = pack_i64(raw[i * 4 + 2], raw[i * 4 + 3]);
+        if den > 0 {
+            let num = pack_i64(raw[i * 4], raw[i * 4 + 1]);
+            *slot = (num as f64 / den as f64) as f32;
+        }
+    }
+    Ok(out)
+}
+
 fn read_u32(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -1067,6 +1102,7 @@ mod tests {
                     "ledger {incident} vs accounted {accounted} {:?}",
                     result.ledger
                 );
+                assert!(result.let_d.is_empty());
             }
         }
     }
@@ -1089,6 +1125,7 @@ mod tests {
             histories: 4_000,
             seed: 1,
             dose_to_water: true,
+            score_let: true,
         };
         match run_mc(&McJob::Patient(request)) {
             Err(ComputeError::NoAdapter) => {}
@@ -1124,6 +1161,17 @@ mod tests {
                     (incident - accounted).abs() / incident < 0.15,
                     "ledger {incident} vs accounted {accounted} {:?}",
                     result.ledger
+                );
+                assert_eq!(result.let_d.len(), nx * ny * nz);
+                let mut let_peak = 0.0f32;
+                for value in &result.let_d {
+                    if *value > let_peak {
+                        let_peak = *value;
+                    }
+                }
+                assert!(
+                    (0.2..200.0).contains(&let_peak),
+                    "peak LETd {let_peak} keV/um is outside the proton range"
                 );
             }
         }

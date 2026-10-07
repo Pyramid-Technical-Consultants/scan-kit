@@ -93,6 +93,97 @@ export function sameChrome(current: PlotHeader | null, next: PlotHeader): boolea
   return sameTable(current.table, next.table);
 }
 
+type LevelPaint = {
+  label: string;
+  min: string;
+  max: string;
+  step: string;
+  value: string;
+};
+
+function levelPaint(raw: string): LevelPaint | null {
+  try {
+    const spec = JSON.parse(raw) as {
+      label?: unknown;
+      min?: unknown;
+      max?: unknown;
+      step?: unknown;
+      value?: unknown;
+    };
+    if (
+      typeof spec.label !== "string" ||
+      typeof spec.min !== "string" ||
+      typeof spec.max !== "string" ||
+      typeof spec.step !== "string" ||
+      typeof spec.value !== "string"
+    ) {
+      return null;
+    }
+    return {
+      label: spec.label,
+      min: spec.min,
+      max: spec.max,
+      step: spec.step,
+      value: spec.value,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/** Point the level slider at the window the picture is using. */
+export function applyLevelPaint(header: PlotHeader | null, raw: string): PlotHeader | null {
+  if (header == null || raw.length === 0) {
+    return header;
+  }
+  const spec = levelPaint(raw);
+  if (spec == null) {
+    return header;
+  }
+  const index = header.controls.findIndex((control) => control.id === "level");
+  if (index < 0) {
+    return header;
+  }
+  const control = header.controls[index];
+  if (control == null) {
+    return header;
+  }
+  const bound = (id: string) => control.options.find((option) => option.id === id)?.label;
+  if (
+    control.label === spec.label &&
+    control.value === spec.value &&
+    bound("min") === spec.min &&
+    bound("max") === spec.max &&
+    bound("step") === spec.step
+  ) {
+    return header;
+  }
+  let options = control.options.map((option) => {
+    if (option.id === "min") {
+      return { ...option, label: spec.min };
+    }
+    if (option.id === "max") {
+      return { ...option, label: spec.max };
+    }
+    if (option.id === "step") {
+      return { ...option, label: spec.step };
+    }
+    return option;
+  });
+  for (const [id, label] of [
+    ["min", spec.min],
+    ["max", spec.max],
+    ["step", spec.step],
+  ] as const) {
+    if (!options.some((option) => option.id === id)) {
+      options = [...options, { id, label, detail: "", icon: "" }];
+    }
+  }
+  const controls = header.controls.slice();
+  controls[index] = { ...control, label: spec.label, value: spec.value, options };
+  return { ...header, controls };
+}
+
 /**
  * Header to leave on screen. A payload with no panels keeps the picture already
  * up. A blank header does not swallow the first frame that actually has panels.

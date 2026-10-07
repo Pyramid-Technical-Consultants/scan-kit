@@ -1,8 +1,8 @@
 """Check the GPU Monte Carlo against MCsquare, the reference engine.
 
 Not part of ``pytest``: run it after changing Monte Carlo physics, not after UI work.
-Slab checks run the Rust engine in ``scan-kit-compute`` (the one the app uses).
-The patient suite still runs the Python engine, which is the one that returns LETd.
+Slab checks and the patient suite both run the Rust engine in ``scan-kit-compute``
+(the one the app uses). The patient suite also checks dose-weighted LETd.
 MCsquare's dose is cached in ``validation/goldens/``.
 Each golden holds the depth dose, R80, lateral sigma, energy and centroid over the
 whole grid, plus the dose around the beam for a 3D gamma. Run from the repo root::
@@ -381,13 +381,14 @@ def load_golden(case: Case) -> dict:
 # ---- GPU
 
 def rust_mc() -> Path:
-    """Release binary of the app's slab Monte Carlo. Built when the sources are newer."""
+    """Release binary of the app's Monte Carlo. Built when the sources are newer."""
     name = "mc-case.exe" if os.name == "nt" else "mc-case"
     path = ROOT / "target" / "release" / name
     sources = (
         ROOT / "crates" / "scan-kit-compute" / "src" / "bin" / "mc-case.rs",
         ROOT / "crates" / "scan-kit-compute" / "src" / "mc.rs",
         ROOT / "crates" / "scan-kit-compute" / "src" / "mc_transport.wgsl",
+        ROOT / "crates" / "scan-kit-core" / "src" / "dose" / "mod.rs",
     )
     built = path.is_file() and path.stat().st_mtime
     if not path.is_file() or any(src.stat().st_mtime > built for src in sources):
@@ -636,15 +637,15 @@ def run_mcsquare_patient(case: PatientCase, exe: Path, primaries: int, work: Pat
 
 
 def run_gpu_patient(work: Path, histories: int, seed: int = SEED):
-    """Python GPU (dose, LETd, density, McResult) for the case built in *work*.
+    """Rust GPU (dose, LETd, density, ledger) for the case built in *work*.
 
-    The Rust host does not read the LET tally back yet, so this suite stays on
-    the Python engine that does.
+    The beam records and the CT calibration stay in Python. Transport, dose and
+    LETd are the engine the app runs.
     """
     from scan_kit.dicom import gantry_to_patient
     from scan_kit.dicom.calibration import CtCalibration
     from scan_kit.qa import BeamModel
-    from scan_kit.views.dose_mc import McRun, beam_record
+    from scan_kit.views.dose_mc import beam_record
 
     hu = read_mhd(work / "CT.mhd")
     spacing = mhd_spacing(work / "CT.mhd")
@@ -664,11 +665,64 @@ def run_gpu_patient(work: Path, histories: int, seed: int = SEED):
             records.append(model.spot_records(energy, spots[:, 0], spots[:, 1], beam=k, rs_id=f["rs"],
                                               rs_wet=wet, rs_distance=dist))
             protons.append(spots[:, 2] * model.protons_per_mu(energy))
-    run = McRun.patient(np.concatenate(records), np.concatenate(protons), np.stack(beams), material, density,
-                        spacing, histories=histories, seed=seed, dose_to_water=True, let=True)
-    run.step()
-    run.close()
-    return run.dose, run.let, density, run.result
+    spots = np.concatenate(records).astype(np.float32)
+    weights = np.concatenate(protons).astype(np.float32)
+    beam_rows = np.stack(beams).astype(np.float32)
+    nz, ny, nx = material.shape
+    case = work / "mc"
+    case.mkdir()
+    spots.ravel().tofile(case / "spots.f32")
+    weights.ravel().tofile(case / "protons.f32")
+    beam_rows.ravel().tofile(case / "beams.f32")
+    np.ascontiguousarray(material, dtype=np.uint8).tofile(case / "material.u8")
+    np.ascontiguousarray(density, dtype=np.float32).tofile(case / "density.f32")
+    request = {
+        "kind": "patient",
+        "spots": "spots.f32",
+        "protons": "protons.f32",
+        "beams": "beams.f32",
+        "material": "material.u8",
+        "density": "density.f32",
+        "spacing_mm": [float(v) for v in spacing],
+        "origin_mm": [0.0, 0.0, 0.0],
+        "shape": [int(nx), int(ny), int(nz)],
+        "histories": int(histories),
+        "seed": int(seed),
+        "dose_to_water": True,
+    }
+    req = case / "request.json"
+    dose_path = case / "dose.f32"
+    let_path = case / "let.f32"
+    req.write_text(json.dumps(request))
+    done = subprocess.run(
+        [str(rust_mc()), str(req), str(dose_path), str(let_path)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if done.returncode != 0 or not dose_path.is_file() or not let_path.is_file():
+        raise RuntimeError(done.stderr[-2000:] or done.stdout[-2000:] or "mc-case failed")
+    lines = [line for line in done.stdout.splitlines() if line.strip()]
+    got = tuple(int(part) for part in lines[0].split())
+    if got != (nx, ny, nz):
+        raise RuntimeError(f"mc-case wrote shape {got}, CT is {(nx, ny, nz)}")
+    dose = np.fromfile(dose_path, dtype="<f4").reshape(nz, ny, nx)
+    let = np.fromfile(let_path, dtype="<f4").reshape(nz, ny, nx)
+    return dose, let, density, _Ledger(lines[1].split())
+
+
+class _Ledger:
+    """MeV per history: incident, grid, off-grid, leaked, lost, beamline."""
+
+    def __init__(self, ledger):
+        self.ledger = np.asarray(ledger, dtype=float)
+
+    @property
+    def closure(self) -> float:
+        incident = float(self.ledger[0])
+        if incident == 0.0:
+            return float("nan")
+        return (incident - float(self.ledger[1:].sum())) / incident
 
 
 def patient_hash(work: Path) -> str:

@@ -187,6 +187,37 @@ export function replaceSegment(
   return items.map((item, itemIndex) => (itemIndex === index ? next : item));
 }
 
+const DOSE_PAINT_IDS = ["scale", "auto", "level", "error", "ray", "sample"] as const;
+
+/** Options that rebuild the dose. Color, window, ray mode, and sampling are not in here. */
+export function sceneOptions(options: Readonly<Record<string, string>>): Record<string, string> {
+  const rest: Record<string, string> = {};
+  for (const [key, value] of Object.entries(options)) {
+    if (!(DOSE_PAINT_IDS as readonly string[]).includes(key)) {
+      rest[key] = value;
+    }
+  }
+  return rest;
+}
+
+/**
+ * Picture settings for the plot already on screen. Empty when the view has none yet.
+ * Level is sent only after the user moves it. The gain default of 1 is not a window.
+ */
+export function paintSpec(
+  resolved: Readonly<Record<string, string>>,
+  options: Readonly<Record<string, string>>,
+): string {
+  const spec: Record<string, string> = {};
+  for (const id of DOSE_PAINT_IDS) {
+    const value = id === "level" ? options[id] : resolved[id];
+    if (value != null && value.length > 0) {
+      spec[id] = value;
+    }
+  }
+  return Object.keys(spec).length === 0 ? "" : JSON.stringify(spec);
+}
+
 /** Histogram bins follow the show-panel checkbox. X bins apply to every axis. */
 export function controlDisabled(id: string, values: Readonly<Record<string, string>>): boolean {
   return (

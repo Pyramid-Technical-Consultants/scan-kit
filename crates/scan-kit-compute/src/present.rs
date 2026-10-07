@@ -174,6 +174,9 @@ pub(crate) fn apply_palette(scene: &mut scan_kit_core::PlotScene, palette: &[[f3
             }
         }
     }
+    if !palette.is_empty() && !scene.volume.values.is_empty() {
+        scene.volume.session_colors = palette.to_vec();
+    }
 }
 
 fn text<'a>(input: &'a Value, key: &str) -> Result<&'a str, String> {

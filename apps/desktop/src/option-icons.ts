@@ -263,6 +263,12 @@ const ICONS: Record<string, LucideIcon> = {
   Sagittal: RectangleVertical,
   volume: Box,
   "3D": Box,
+  analytic: Spline,
+  mc: Atom,
+  "1e6": Circle,
+  "3e6": CircleDot,
+  "1e7": Orbit,
+  "5e7": Sparkles,
 };
 
 export function optionIcon(name: string): LucideIcon | undefined {

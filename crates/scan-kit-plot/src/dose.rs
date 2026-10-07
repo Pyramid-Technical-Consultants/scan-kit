@@ -6,9 +6,9 @@
 //! `0.5 + 0.5 * dose/span` (zero at mid-grey). G is the CT window, B is 1 when
 //! a CT sample is present.
 
+use scan_kit_core::{index, robust_high, sample, scan_volume, Volume};
 #[cfg(not(target_arch = "wasm32"))]
 use scan_kit_core::{ray_rgba, RayView};
-use scan_kit_core::{sample, scan_volume, Volume};
 
 /// Display state copied from the scene. The plot owns it after the upload.
 #[derive(Clone, Debug)]
@@ -22,6 +22,11 @@ pub struct DoseGrid {
     pub ramp: u8,
     pub lo: f32,
     pub hi: f32,
+    /// Data window. Gain and a manual window scale this; they do not replace it.
+    pub base_lo: f32,
+    pub base_hi: f32,
+    pub gamma: bool,
+    pub difference: bool,
     pub gain: f32,
     pub opacity: f32,
     /// 0 integrate, 1 maximum, 2 transparent.
@@ -43,6 +48,10 @@ pub struct DoseGrid {
     pub unit: String,
     pub show_phantom: bool,
     pub field: [f32; 6],
+    /// Selection order. `None` is `volume`.
+    pub sessions: Vec<Option<Volume>>,
+    pub session_colors: Vec<[f32; 4]>,
+    pub session_focus: usize,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -121,6 +130,10 @@ pub fn grid_from(
         ramp,
         lo,
         hi,
+        base_lo: lo,
+        base_hi: hi,
+        gamma: false,
+        difference: false,
         gain,
         opacity,
         mode,
@@ -129,6 +142,9 @@ pub fn grid_from(
         unit: String::new(),
         show_phantom: false,
         field: [0.0; 6],
+        sessions: Vec::new(),
+        session_colors: Vec::new(),
+        session_focus: 0,
     })
 }
 
@@ -191,6 +207,77 @@ pub fn atlas_bytes(grid: &DoseGrid) -> (Vec<u8>, u32, u32) {
         pixels[dst + 3] = byte(grid.opacity);
     }
     (pixels, width as u32, height as u32)
+}
+
+/// Keep the measured window. A shipped `base_hi` skips a second pass over the cube.
+pub fn remember_window(grid: &mut DoseGrid, base_lo: f32, base_hi: f32) {
+    let gamma = grid.unit == "γ" || grid.ramp == index("gamma");
+    if gamma {
+        grid.gamma = true;
+        grid.difference = false;
+        grid.base_lo = 0.0;
+        grid.base_hi = 2.0;
+        return;
+    }
+    grid.gamma = false;
+    if base_hi > base_lo || base_lo < 0.0 {
+        grid.difference = base_lo < 0.0;
+        grid.base_lo = base_lo;
+        grid.base_hi = base_hi;
+        return;
+    }
+    let difference = grid.lo < 0.0 || grid.volume.values.iter().any(|value| *value < 0.0);
+    grid.difference = difference;
+    if difference {
+        let flat: Vec<f32> = grid
+            .volume
+            .values
+            .iter()
+            .copied()
+            .filter(|value| *value != 0.0)
+            .map(f32::abs)
+            .collect();
+        let hi = robust_high(&flat);
+        grid.base_lo = -hi;
+        grid.base_hi = hi;
+    } else {
+        grid.base_lo = 0.0;
+        grid.base_hi = robust_high(&grid.volume.values);
+    }
+}
+
+/// Rewrite the 256 color-scale pixels on the last atlas row.
+pub fn paint_ramp_row(pixels: &mut [u8], cols: u32, rows: u32, ramp: u8, opacity: f32) {
+    let alpha = byte(opacity);
+    for x in 0..256 {
+        let Some(pixel) = ramp_pixel(pixels, cols, rows, x) else {
+            return;
+        };
+        let rgb = sample(ramp, x as f32 / 255.0);
+        pixel[0] = byte(rgb[0]);
+        pixel[1] = byte(rgb[1]);
+        pixel[2] = byte(rgb[2]);
+        pixel[3] = alpha;
+    }
+}
+
+/// Opacity lives in the ramp-row alpha because the color bar reads that texel.
+pub fn paint_ramp_alpha(pixels: &mut [u8], cols: u32, rows: u32, opacity: f32) {
+    let alpha = byte(opacity);
+    for x in 0..256 {
+        let Some(pixel) = ramp_pixel(pixels, cols, rows, x) else {
+            return;
+        };
+        pixel[3] = alpha;
+    }
+}
+
+fn ramp_pixel(pixels: &mut [u8], cols: u32, rows: u32, x: usize) -> Option<&mut [u8]> {
+    if cols < 256 || rows == 0 || x >= 256 {
+        return None;
+    }
+    let dst = ((rows as usize - 1) * cols as usize + x) * 4;
+    pixels.get_mut(dst..dst + 4)
 }
 
 fn fill_atlas(

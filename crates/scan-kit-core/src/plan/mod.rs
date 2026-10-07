@@ -15,9 +15,6 @@ pub use pld::parse_pld;
 use weight::spot_weights;
 
 pub const PREVIEW_CAP: usize = 5_000;
-/// ponytail: a larger request is refused so one call cannot allocate hundreds of megabytes.
-/// Raise this if a real template needs more spots.
-pub(super) const MAX_SPOTS: usize = 1_000_000;
 pub(super) const DEFAULT_CURRENT_A: f64 = 1e-9;
 pub(super) const DEFAULT_BEAM_SIZE_MM: f64 = 3.61;
 pub(super) const DELIVERY_MU_PER_S: f64 = 0.4;
@@ -224,12 +221,6 @@ pub fn build_plan(
         },
         _ => return Err("Unknown plan template.".into()),
     };
-    if rows.len() > MAX_SPOTS {
-        return Err(format!(
-            "The plan has {} spots, above the {MAX_SPOTS} spot limit.",
-            rows.len()
-        ));
-    }
     Ok(document(template, params, dicom_label, rows))
 }
 

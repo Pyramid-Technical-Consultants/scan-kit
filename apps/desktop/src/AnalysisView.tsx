@@ -15,8 +15,10 @@ import {
   applyOption,
   controlDisabled,
   controlSections,
+  paintSpec,
   parseSegments,
   playheadReplay,
+  sceneOptions,
   segmentChoices,
   type ControlSlot,
   type GrainMemory,
@@ -29,10 +31,16 @@ import { Checkbox } from "@/components/ui/checkbox";
 import { Slider } from "@/components/ui/slider";
 import { Textarea } from "@/components/ui/textarea";
 import { Field, FieldLabel, FieldLegend, FieldSet } from "@/components/ui/field";
-import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
 import { SessionList } from "@/session-list";
 import { optionIcon } from "@/option-icons";
-import { backingSize, plotHeader, shownHeader, type PlotHeader, type ViewControl } from "@/plot-header";
+import {
+  applyLevelPaint,
+  backingSize,
+  plotHeader,
+  shownHeader,
+  type PlotHeader,
+  type ViewControl,
+} from "@/plot-header";
 import { usePageLoad } from "@/page-load";
 import { sessionColor, shownSessionIds } from "@/session-colors";
 import { acceptReport, bytesOf, parsePoll, type Report } from "@/task-client";
@@ -49,6 +57,11 @@ import {
 } from "@/components/ui/select";
 
 type Plotter = import("@/wasm/scan_kit_plot.js").WebPlot;
+
+function paintPlot(plot: Plotter, spec: string): string {
+  const raw = plot.paint(spec);
+  return typeof raw === "string" ? raw : "";
+}
 
 type DoseFrame = {
   x: number;
@@ -370,6 +383,9 @@ export function AnalysisView({
   const frame = useRef(0);
   const openSeq = useRef(0);
   const [options, setOptions] = useState<Record<string, string>>({});
+  const optionsRef = useRef(options);
+  const paintRef = useRef("");
+  const [plotEpoch, setPlotEpoch] = useState(0);
   const lineToken = useRef("");
   const nextToken = useRef("");
   const [lineEpoch, setLineEpoch] = useState(0);
@@ -467,15 +483,16 @@ export function AnalysisView({
     };
   }, [viewId]);
 
-  const loadPayload = () => {
+  const loadPayload = (): string => {
     const plot = plotter.current;
     const bytes = payload.current;
     if (plot == null || bytes == null) {
-      return;
+      return "";
     }
     payload.current = null;
     try {
       plot.load(bytes);
+      const painted = paintRef.current.length > 0 ? paintPlot(plot, paintRef.current) : "";
       if (nextToken.current !== "") {
         lineToken.current = nextToken.current;
       }
@@ -484,6 +501,7 @@ export function AnalysisView({
       }
       fitCanvas();
       plot.render();
+      return painted;
     } catch (reason) {
       // The picture kept its lines, but this payload left them out. Ask again
       // with the full traces.
@@ -491,9 +509,10 @@ export function AnalysisView({
         lineToken.current = "";
         nextToken.current = "";
         setLineEpoch((epoch) => epoch + 1);
-        return;
+        return "";
       }
       notifyError(messageOf(reason), "analysis");
+      return "";
     }
   };
 
@@ -532,6 +551,7 @@ export function AnalysisView({
           return;
         }
         plotter.current = plot;
+        setPlotEpoch((epoch) => epoch + 1);
         fitCanvas();
         loadPayload();
       })
@@ -554,6 +574,10 @@ export function AnalysisView({
 
   const orderKey = sessions.map((session) => session.id).join("\0");
   const hiddenKey = hidden.join("\0");
+  const sceneKey = viewId === "volumetric" ? JSON.stringify(sceneOptions(options)) : options;
+  useEffect(() => {
+    optionsRef.current = options;
+  }, [options]);
   useEffect(() => {
     const mine = hold.current + 1;
     hold.current = mine;
@@ -561,28 +585,28 @@ export function AnalysisView({
     openSeq.current = ticket;
     const order = orderKey === "" ? [] : orderKey.split("\0");
     const shown = shownSessionIds(order, hiddenKey === "" ? [] : hiddenKey.split("\0"));
-    const plotOptions: Record<string, string> = { ...options };
-    if (viewId === "timeline" || viewId === "distribution") {
-      const head = playhead.current;
-      plotOptions.scrub = JSON.stringify({
-        on: head.on,
-        at: head.at,
-        end: head.end,
-        speed: head.speed,
-        window: head.window,
-      });
-    }
-    if (viewId === "volumetric" && studyPath != null) {
-      plotOptions.study = studyPath;
-    }
-    if (lineToken.current !== "") {
-      plotOptions._lines = lineToken.current;
-    }
     let stop = false;
     let reveal = 0;
     const timer = window.setTimeout(() => {
       if (stop) {
         return;
+      }
+      const plotOptions: Record<string, string> = { ...optionsRef.current };
+      if (viewId === "timeline" || viewId === "distribution") {
+        const head = playhead.current;
+        plotOptions.scrub = JSON.stringify({
+          on: head.on,
+          at: head.at,
+          end: head.end,
+          speed: head.speed,
+          window: head.window,
+        });
+      }
+      if (viewId === "volumetric" && studyPath != null) {
+        plotOptions.study = studyPath;
+      }
+      if (lineToken.current !== "") {
+        plotOptions._lines = lineToken.current;
       }
       const picture = (metaRef.current?.panels.length ?? 0) > 0;
       if (!picture) {
@@ -634,22 +658,22 @@ export function AnalysisView({
           }
           if (parsed.payload != null) {
             setPlotError(null);
-            const header = plotHeader(parsed.payload);
-            nextToken.current = header.lineToken;
-            const chosen = shownHeader(metaRef.current, header);
-            if (header.panels.length > 0) {
+            const parsedHeader = plotHeader(parsed.payload);
+            nextToken.current = parsedHeader.lineToken;
+            if (parsedHeader.panels.length > 0) {
+              payload.current = parsed.payload;
+              const header = applyLevelPaint(parsedHeader, loadPayload()) ?? parsedHeader;
+              const chosen = shownHeader(metaRef.current, header);
               if (chosen !== metaRef.current) {
                 metaRef.current = chosen;
                 setMeta(chosen);
               }
               setQuiet(null);
-              payload.current = parsed.payload;
-              loadPayload();
               dismissNotice("analysis");
             } else if (parsed.report.finished && parsed.report.phase === "done") {
               const current = metaRef.current;
               const sameView =
-                current != null && current.panels.length > 0 && current.title === header.title;
+                current != null && current.panels.length > 0 && current.title === parsedHeader.title;
               if (!sameView) {
                 if (current != null) {
                   metaRef.current = null;
@@ -691,7 +715,7 @@ export function AnalysisView({
         }
       });
     };
-  }, [viewId, folder, orderKey, hiddenKey, options, studyPath, lineEpoch]);
+  }, [viewId, folder, orderKey, hiddenKey, sceneKey, studyPath, lineEpoch]);
 
   useEffect(() => {
     const node = canvas.current;
@@ -813,6 +837,28 @@ export function AnalysisView({
     const known = control.options.some((option) => option.label === stored);
     resolved[control.id] = stored != null && known ? stored : control.value;
   }
+  const dosePaint = viewId === "volumetric" ? paintSpec(resolved, options) : "";
+  useEffect(() => {
+    paintRef.current = dosePaint;
+  }, [dosePaint]);
+  useEffect(() => {
+    if (dosePaint.length === 0) {
+      return;
+    }
+    const plot = plotter.current;
+    if (plot == null) {
+      return;
+    }
+    const raw = paintPlot(plot, dosePaint);
+    requestDraw();
+    setMeta((current) => {
+      const next = applyLevelPaint(current, raw);
+      if (next !== current) {
+        metaRef.current = next;
+      }
+      return next;
+    });
+  }, [dosePaint, plotEpoch]);
   const byId = new Map(controls.map((control) => [control.id, control]));
   const sections = controlSections(controls).filter(
     (section) => viewId !== "volumetric" || (section.title !== "Cell" && section.title !== "Plot"),
@@ -895,30 +941,19 @@ export function AnalysisView({
     }
     if (slot.kind === "radio") {
       return (
-        <Field key={slot.id}>
-          <FieldLabel>{label}</FieldLabel>
-          <RadioGroup
+        <Field
+          key={slot.id}
+          orientation="horizontal"
+          className={disabled ? "opacity-50" : undefined}
+        >
+          <FieldLabel className="flex-none! shrink-0 whitespace-nowrap">{label}</FieldLabel>
+          <ButtonSegmentGroup
+            options={control.options}
             value={value}
             disabled={disabled}
-            aria-label={label}
-            onValueChange={(next) => {
-              if (typeof next === "string") {
-                apply(slot.id, next);
-              }
-            }}
-          >
-            {control.options.map((option, index) => {
-              const inputId = `analysis-${slot.id}-${index}`;
-              return (
-                <Field key={inputId} orientation="horizontal">
-                  <RadioGroupItem value={option.label} id={inputId} disabled={disabled} />
-                  <FieldLabel className="cursor-pointer" htmlFor={inputId}>
-                    {option.label}
-                  </FieldLabel>
-                </Field>
-              );
-            })}
-          </RadioGroup>
+            label={label}
+            onChange={(next) => apply(slot.id, next)}
+          />
         </Field>
       );
     }

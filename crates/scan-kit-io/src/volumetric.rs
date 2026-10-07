@@ -4,9 +4,9 @@
 use std::path::Path;
 
 use scan_kit_core::{
-    analytic_on, choices, dose_frame, dvh, gamma_index, index, medium, protons_from_mu, resolve,
-    robust_high, Family, McJob, McResult, Panel, Pencil, PlotScene, Quantity, Series, Volume,
-    IC1_Z_MM, IC2_Z_MM, IC_SEP_MM, SESSION,
+    analytic_on, choices, dose_frame, dvh, gamma_index, medium, protons_from_mu, robust_high,
+    trim_number, wash_of, Family, McJob, McResult, Panel, Pencil, PlotScene, Quantity, Series,
+    Volume, IC1_Z_MM, IC2_Z_MM, IC_SEP_MM, SESSION,
 };
 use serde_json::Value;
 
@@ -30,7 +30,6 @@ const XY: &[(&str, &str)] = &[
 ];
 const QUANTITY: &[(&str, &str)] = &[("dose", "Dose"), ("mu", "MU"), ("protons", "Protons")];
 const MODEL: &[(&str, &str)] = &[("analytic", "Analytic"), ("mc", "Monte Carlo")];
-const SCATTER: &[(&str, &str)] = &[("on", "On"), ("off", "Off")];
 const HISTORIES: &[(&str, &str)] = &[
     ("1000000", "1e6"),
     ("3000000", "3e6"),
@@ -120,7 +119,6 @@ pub fn volumetric(
         _ => Quantity::Dose,
     };
     let model = pick(options, "model", "analytic", MODEL);
-    let scatter = pick(options, "scatter", "on", SCATTER) == "on";
     let histories = pick(options, "histories", "10000000", HISTORIES)
         .parse::<u32>()
         .unwrap_or(10_000_000);
@@ -191,24 +189,9 @@ pub fn volumetric(
     )
     .parse::<f32>()
     .unwrap_or(90.0);
-    let spot_cap = pick(
-        options,
-        "spot_cap",
-        "1000000",
-        &[("10000", "10k"), ("100000", "100k"), ("1000000", "1M")],
-    )
-    .parse::<usize>()
-    .unwrap_or(1_000_000)
-    .max(1);
     let clouds: Vec<Cloud> = session_ids
         .iter()
-        .map(|session| {
-            let mut cloud =
-                load_cloud(root, session, session_ids, grain, xy, plan_sigma, sigma_ref);
-            cloud.pencils.truncate(spot_cap);
-            cloud.plan.truncate(spot_cap);
-            cloud
-        })
+        .map(|session| load_cloud(root, session, session_ids, grain, xy, plan_sigma, sigma_ref))
         .collect();
     let k_mu = session_ids
         .first()
@@ -243,14 +226,12 @@ pub fn volumetric(
         .get("_preview")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let scatter_on = scatter && model != "mc";
     let mut voxel_mm = voxel_mm;
     let mut frame = dose_frame(
         mat,
         &all,
         quantity,
         spread,
-        scatter_on,
         wet_mm,
         phantom_mm,
         voxel_mm,
@@ -270,7 +251,6 @@ pub fn volumetric(
                 &all,
                 quantity,
                 spread,
-                scatter_on,
                 wet_mm,
                 phantom_mm,
                 voxel_mm,
@@ -294,7 +274,6 @@ pub fn volumetric(
             &cloud.pencils,
             quantity,
             spread,
-            scatter,
             wet_mm,
             phantom_mm,
             k_mu,
@@ -314,7 +293,6 @@ pub fn volumetric(
                 &cloud.plan,
                 quantity,
                 spread,
-                scatter,
                 wet_mm,
                 phantom_mm,
                 k_mu,
@@ -363,14 +341,51 @@ pub fn volumetric(
         _ => measured.clone(),
     };
     let sessions = shown.len().max(1);
-    let ramp = if compare == "gamma" {
-        index("gamma")
-    } else if sessions > 1 {
+    let (lo, hi) = window(&shown, compare);
+    let level = options
+        .get("level")
+        .and_then(Value::as_str)
+        .and_then(|text| text.parse::<f32>().ok());
+    let wash = wash_of(scan_kit_core::PaintChoice {
+        base_lo: lo,
+        base_hi: hi,
+        gamma: compare == "gamma",
+        difference: compare == "difference",
+        scale,
+        auto: super::marks::flag(options, "auto", true),
+        level,
+        percent: pick(
+            options,
+            "error",
+            "absolute",
+            &[("absolute", "Absolute"), ("percent", "Percent")],
+        ) == "percent",
+        ray: pick(
+            options,
+            "ray",
+            "integrate",
+            &[
+                ("integrate", "Integrate"),
+                ("maximum", "Maximum"),
+                ("transparent", "Transparent"),
+            ],
+        ),
+        sample: pick(
+            options,
+            "sample",
+            "linear",
+            &[
+                ("nearest", "Nearest"),
+                ("linear", "Linear"),
+                ("cubic", "Cubic"),
+            ],
+        ),
+    });
+    let ramp = if sessions > 1 && compare != "gamma" {
         SESSION
     } else {
-        resolve(scale, family)
+        wash.ramp
     };
-    let (lo, hi) = window(&shown, compare);
     let mut panels = Vec::new();
     let has_dose = measured
         .iter()
@@ -408,16 +423,9 @@ pub fn volumetric(
             let extent = field_dose.and_then(|dose| {
                 crate::workspace::field_extent(dose, field_fraction, field_per_slice)
             });
-            let field = if show_field {
-                extent.map(|bounds| [bounds[0], bounds[1], bounds[2], bounds[3]])
-            } else {
-                None
-            };
-            let (mut mode, filter) = view_paint(options);
-            if compare == "gamma" {
-                mode = 1;
-            }
-            let (lo_paint, hi_paint, gain, opacity) = paint_of(options, compare, lo, hi, mode);
+            let mode = wash.mode;
+            let filter = wash.filter;
+            let (lo_paint, hi_paint, gain, opacity) = (wash.lo, wash.hi, wash.gain, wash.opacity);
             let (built, mut mark) = crate::workspace::assemble(&crate::workspace::Workspace {
                 dose: volume.clone(),
                 ct: Vec::new(),
@@ -435,9 +443,9 @@ pub fn volumetric(
                 y_label: y_name(quantity).into(),
                 dvh: dvh_lines,
                 gamma,
-                field,
-                show_field,
             });
+            mark.base_lo = lo;
+            mark.base_hi = hi;
             mark.gantry = gantry;
             mark.show_phantom = phantom_shown(options);
             mark.field = if show_field {
@@ -447,6 +455,12 @@ pub fn volumetric(
             };
             mark.unit = volume_unit(quantity, mode, compare).into();
             panels = built;
+            if let Some(view) = panels
+                .iter_mut()
+                .find(|panel| panel.title.starts_with("3D"))
+            {
+                view.x_label = depth_axis_title(medium_key);
+            }
             if let Some(depth) = panels
                 .iter_mut()
                 .find(|panel| panel.title.starts_with("Depth"))
@@ -458,14 +472,46 @@ pub fn volumetric(
                     } else {
                         0.0
                     };
-                    depth.title = format!(
-                        "Depth dose  {:.1}%  left {:.1}%",
+                    depth.y_label = format!(
+                        "{} · {:.1}% left {:.1}%",
+                        depth.y_label,
                         result.uncertainty * 100.0,
                         left
                     );
                 } else if model == "mc" {
-                    depth.title = "Depth dose  analytic fallback".into();
+                    depth.y_label = format!("{} · analytic fallback", depth.y_label);
                 }
+            }
+            if shown.len() > 1 {
+                let focus = &shown[session_at];
+                let (ix, iy, iz) = focus.peak_index();
+                let at = [focus.mm_of(0, ix), focus.mm_of(1, iy), focus.mm_of(2, iz)];
+                let gamma_volumes: Vec<Volume> = gamma_fields
+                    .iter()
+                    .map(|(volume, _)| volume.clone())
+                    .collect();
+                for panel in &mut panels {
+                    crate::workspace::overlay_sessions(panel, &shown, at, &gamma_volumes);
+                }
+                mark.session_focus = session_at as u32;
+                mark.sessions = shown
+                    .iter()
+                    .enumerate()
+                    .map(|(index, volume)| scan_kit_core::SessionDose {
+                        values: if index == session_at {
+                            Vec::new()
+                        } else {
+                            volume.values.clone()
+                        },
+                        shape: [
+                            volume.shape[0] as u32,
+                            volume.shape[1] as u32,
+                            volume.shape[2] as u32,
+                        ],
+                        origin: volume.origin,
+                        voxel: volume.voxel,
+                    })
+                    .collect();
             }
             volume_mark = mark;
             let size = match extent {
@@ -544,23 +590,15 @@ pub fn volumetric(
     controls.push(
         labeled("model", "Model", MODEL, model)
             .grouped("Calculation")
-            .radio(),
+            .radio()
+            .icons(&["analytic", "mc"]),
     );
-    if model == "analytic" {
-        controls.push(
-            labeled(
-                "scatter",
-                "Scatter",
-                SCATTER,
-                if scatter { "on" } else { "off" },
-            )
-            .grouped("Calculation"),
-        );
-    } else {
+    if model != "analytic" {
         controls.push(
             labeled("histories", "Histories", HISTORIES, &histories.to_string())
                 .grouped("Calculation")
-                .radio(),
+                .radio()
+                .icons(&["1e6", "3e6", "1e7", "5e7"]),
         );
     }
     controls
@@ -576,15 +614,6 @@ pub fn volumetric(
             .grouped("Calculation"),
         );
     }
-    controls.push(
-        labeled(
-            "spot_cap",
-            "Max spots",
-            &[("10000", "10k"), ("100000", "100k"), ("1000000", "1M")],
-            &spot_cap.to_string(),
-        )
-        .grouped("Calculation"),
-    );
     let media: Vec<(&str, &str)> = if model == "mc" {
         MEDIA
             .iter()
@@ -677,6 +706,7 @@ pub fn volumetric(
             compare,
             session_ids.len(),
             scale,
+            wash.level.as_ref(),
         );
     }
     let layout = if has_dose {
@@ -698,39 +728,6 @@ pub fn volumetric(
     }
 }
 
-fn paint_of(options: &Value, compare: &str, lo: f32, hi: f32, mode: u8) -> (f32, f32, f32, f32) {
-    if compare == "gamma" {
-        return (0.0, 2.0, 1.0, 1.0);
-    }
-    let level = options
-        .get("level")
-        .and_then(Value::as_str)
-        .and_then(|text| text.parse::<f32>().ok());
-    if mode == 2 {
-        let opacity = level.unwrap_or(1.0).clamp(0.0, 1.0);
-        return (lo, hi, opacity, opacity);
-    }
-    if compare == "difference" {
-        let percent = pick(
-            options,
-            "error",
-            "absolute",
-            &[("absolute", "Absolute"), ("percent", "Percent")],
-        ) == "percent";
-        let reach = if percent {
-            hi.abs().max(1e-6) * level.unwrap_or(10.0).clamp(0.1, 100.0) / 100.0
-        } else {
-            level.unwrap_or(0.2).abs().max(1e-6)
-        };
-        return (-reach, reach, 1.0, 1.0);
-    }
-    if super::marks::flag(options, "auto", true) {
-        let gain = level.unwrap_or(1.0).clamp(0.05, 8.0);
-        return (lo, hi, gain, 1.0);
-    }
-    (0.0, level.unwrap_or(hi).max(1e-6), 1.0, 1.0)
-}
-
 fn range_control(
     id: &str,
     label: &str,
@@ -741,30 +738,12 @@ fn range_control(
 ) -> scan_kit_core::Control {
     let mut control = scan_kit_core::Control::plain(id, label, Vec::<&str>::new(), value);
     control.options = vec![
-        scan_kit_core::Choice::full("min", &trim_range(min), "", ""),
-        scan_kit_core::Choice::full("max", &trim_range(max), "", ""),
-        scan_kit_core::Choice::full("step", &trim_range(step), "", ""),
+        scan_kit_core::Choice::full("min", &trim_number(min), "", ""),
+        scan_kit_core::Choice::full("max", &trim_number(max), "", ""),
+        scan_kit_core::Choice::full("step", &trim_number(step), "", ""),
     ];
     control.kind = "range".into();
     control
-}
-
-fn trim_range(value: f32) -> String {
-    if (value - value.round()).abs() < 1e-4 && value.abs() < 1.0e6 {
-        format!("{}", value.round() as i32)
-    } else {
-        let text = format!("{value:.4}");
-        text.trim_end_matches('0').trim_end_matches('.').to_string()
-    }
-}
-
-fn level_text(options: &Value, default: f32, min: f32, max: f32) -> String {
-    let raw = options
-        .get("level")
-        .and_then(Value::as_str)
-        .and_then(|text| text.parse::<f32>().ok())
-        .unwrap_or(default);
-    trim_range(raw.clamp(min, max))
 }
 
 fn session_at(options: &Value, ids: &[String]) -> usize {
@@ -780,17 +759,8 @@ fn push_picture_controls(
     compare: &str,
     sessions: usize,
     scale: &str,
+    level: Option<&scan_kit_core::LevelSpan>,
 ) {
-    let ray = pick(
-        options,
-        "ray",
-        "integrate",
-        &[
-            ("integrate", "Integrate"),
-            ("maximum", "Maximum"),
-            ("transparent", "Transparent"),
-        ],
-    );
     let auto = super::marks::flag(options, "auto", true);
     if compare != "gamma" {
         if sessions <= 1 {
@@ -827,38 +797,19 @@ fn push_picture_controls(
                 .grouped("Picture"),
             );
         }
-        let (level_label, level_min, level_max, level_step, level_default) =
-            if compare == "difference" {
-                if pick(
-                    options,
-                    "error",
-                    "absolute",
-                    &[("absolute", "Absolute"), ("percent", "Percent")],
-                ) == "percent"
-                {
-                    ("Percent", 1.0, 100.0, 1.0, 10.0)
-                } else {
-                    ("Full scale", 0.01, 5.0, 0.01, 0.2)
-                }
-            } else if ray == "transparent" {
-                ("Opacity", 0.0, 1.0, 0.05, 1.0)
-            } else if auto {
-                ("Gain", 0.25, 4.0, 0.05, 1.0)
-            } else {
-                let span = mark.hi.abs().max(mark.lo.abs()).max(1.0);
-                ("Window", 0.0, span * 2.0, (span / 50.0).max(0.01), span)
-            };
-        controls.push(
-            range_control(
-                "level",
-                level_label,
-                level_min,
-                level_max,
-                level_step,
-                &level_text(options, level_default, level_min, level_max),
-            )
-            .grouped("Picture"),
-        );
+        if let Some(level) = level {
+            controls.push(
+                range_control(
+                    "level",
+                    level.label,
+                    level.min,
+                    level.max,
+                    level.step,
+                    &trim_number(level.value),
+                )
+                .grouped("Picture"),
+            );
+        }
     }
     controls.push(
         labeled(
@@ -995,38 +946,6 @@ fn phantom_shown(options: &Value) -> bool {
     )
 }
 
-fn view_paint(options: &Value) -> (u8, u8) {
-    let mode = match pick(
-        options,
-        "ray",
-        "integrate",
-        &[
-            ("integrate", "Integrate"),
-            ("maximum", "Maximum"),
-            ("transparent", "Transparent"),
-        ],
-    ) {
-        "maximum" => 1,
-        "transparent" => 2,
-        _ => 0,
-    };
-    let filter = match pick(
-        options,
-        "sample",
-        "linear",
-        &[
-            ("nearest", "Nearest"),
-            ("linear", "Linear"),
-            ("cubic", "Cubic"),
-        ],
-    ) {
-        "nearest" => 0,
-        "cubic" => 2,
-        _ => 1,
-    };
-    (mode, filter)
-}
-
 /// The displayed lattice. A heavy visit count used to keep only three planes;
 /// that shortcut is a cross in the ray march, so the view always asks for every voxel.
 fn lattice_planes(_frame: &scan_kit_core::DoseFrame) -> Option<[usize; 3]> {
@@ -1051,7 +970,6 @@ fn fill(
     pencils: &[Pencil],
     quantity: Quantity,
     spread: f32,
-    scatter: bool,
     wet_mm: f32,
     phantom_mm: f32,
     k_mu: f32,
@@ -1108,18 +1026,7 @@ fn fill(
     }
     (
         analytic_on(
-            mat,
-            pencils,
-            quantity,
-            spread,
-            scatter && model != "mc",
-            wet_mm,
-            phantom_mm,
-            1.0,
-            k_mu,
-            gap_mm,
-            grid,
-            planes,
+            mat, pencils, quantity, spread, wet_mm, phantom_mm, 1.0, k_mu, gap_mm, grid, planes,
         ),
         None,
     )
@@ -1565,6 +1472,14 @@ fn note(title: &str) -> Panel {
     }
 }
 
+fn depth_axis_title(medium_key: &str) -> String {
+    MEDIA
+        .iter()
+        .find(|(id, _)| *id == medium_key)
+        .map(|(_, label)| format!("Depth in {label} (mm)"))
+        .unwrap_or_else(|| "Depth (mm)".into())
+}
+
 fn volume_unit(quantity: Quantity, mode: u8, compare: &str) -> &'static str {
     if compare == "gamma" {
         return "γ";
@@ -1618,7 +1533,6 @@ mod tests {
             &pencils,
             Quantity::Dose,
             1.0,
-            true,
             0.0,
             0.0,
             1.0,
@@ -1837,6 +1751,9 @@ mod tests {
         .unwrap();
         std::fs::write(session.join("spot_data.csv"), "ic1_total_dose\n0.05\n").unwrap();
         let scene = super::volumetric(&root, &["sess".into()], &serde_json::json!({}), None);
+        assert!(scene.panels.iter().any(|panel| {
+            panel.title.starts_with("3D") && panel.x_label == "Depth in Water (mm)"
+        }));
         let titles = fieldsets(&scene.controls);
         assert_eq!(
             titles,
@@ -1854,6 +1771,10 @@ mod tests {
             .controls
             .iter()
             .any(|control| control.id == "phantom_box"));
+        assert!(scene
+            .controls
+            .iter()
+            .all(|control| control.id != "spot_cap"));
         assert!(scene
             .controls
             .iter()
@@ -1903,18 +1824,45 @@ mod tests {
                 .controls
                 .iter()
                 .find(|control| control.id == "model")
+                .map(|control| {
+                    control
+                        .options
+                        .iter()
+                        .map(|choice| choice.icon.as_str())
+                        .collect::<Vec<_>>()
+                }),
+            Some(vec!["analytic", "mc"])
+        );
+        assert_eq!(
+            scene
+                .controls
+                .iter()
+                .find(|control| control.id == "model")
                 .map(|control| control.kind.as_str()),
             Some("radio")
         );
         assert!(scene
             .controls
             .iter()
-            .all(|control| control.id != "histories"));
+            .all(|control| control.id != "histories" && control.id != "scatter"));
         let mc = super::volumetric(
             &root,
             &["sess".into()],
             &serde_json::json!({ "model": "mc" }),
             None,
+        );
+        assert_eq!(
+            mc.controls
+                .iter()
+                .find(|control| control.id == "histories")
+                .map(|control| {
+                    control
+                        .options
+                        .iter()
+                        .map(|choice| choice.icon.as_str())
+                        .collect::<Vec<_>>()
+                }),
+            Some(vec!["1e6", "3e6", "1e7", "5e7"])
         );
         assert_eq!(
             mc.controls

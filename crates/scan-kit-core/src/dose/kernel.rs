@@ -304,12 +304,7 @@ pub(super) fn layer_energies(energy: &[f32]) -> Vec<f32> {
     }
 }
 
-pub(super) fn build_kernel(
-    medium: Medium,
-    energy: &[f32],
-    spread_pct: f64,
-    scatter: bool,
-) -> LayerKernel {
+pub(super) fn build_kernel(medium: Medium, energy: &[f32], spread_pct: f64) -> LayerKernel {
     let energies = layer_energies(energy);
     let nodes = LAYER_NODES;
     let n = energies.len();
@@ -341,17 +336,15 @@ pub(super) fn build_kernel(
             cdf[i * nodes + k] = (acc[k] / total) as f32;
         }
         zmin[i] = -dmax as f32;
-        if scatter {
-            let (path, var) = mcs_along(medium, e);
-            let mut peak = 0.0f32;
-            for k in 0..nodes {
-                let depth = dmax * (nodes - 1 - k) as f64 / (nodes - 1) as f64;
-                let w = mcs_at(&path, &var, depth, r0) as f32;
-                mcs[i * nodes + k] = w;
-                peak = peak.max(w);
-            }
-            mcs_max[i] = peak;
+        let (path, var) = mcs_along(medium, e);
+        let mut peak = 0.0f32;
+        for k in 0..nodes {
+            let depth = dmax * (nodes - 1 - k) as f64 / (nodes - 1) as f64;
+            let w = mcs_at(&path, &var, depth, r0) as f32;
+            mcs[i * nodes + k] = w;
+            peak = peak.max(w);
         }
+        mcs_max[i] = peak;
     }
     LayerKernel {
         energies,

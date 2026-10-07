@@ -119,8 +119,6 @@ pub(crate) struct Workspace {
     pub y_label: String,
     pub dvh: Vec<Series>,
     pub gamma: Option<(Volume, f32)>,
-    pub field: Option<[f32; 4]>,
-    pub show_field: bool,
 }
 
 pub(crate) fn assemble(space: &Workspace) -> (Vec<Panel>, VolumeMark) {
@@ -151,6 +149,8 @@ pub(crate) fn assemble(space: &Workspace) -> (Vec<Panel>, VolumeMark) {
         ramp: space.ramp,
         lo: space.lo,
         hi: space.hi,
+        base_lo: 0.0,
+        base_hi: 0.0,
         gain: space.gain,
         opacity: space.opacity,
         mode: space.mode,
@@ -159,6 +159,9 @@ pub(crate) fn assemble(space: &Workspace) -> (Vec<Panel>, VolumeMark) {
         unit: String::new(),
         show_phantom: false,
         field: [0.0; 6],
+        sessions: Vec::new(),
+        session_colors: Vec::new(),
+        session_focus: 0,
     };
     (panels, mark)
 }
@@ -216,7 +219,7 @@ fn image_panel(space: &Workspace, cell: CellView) -> Panel {
             volume.origin[1] + ny as f32 * volume.voxel,
         ),
     };
-    let mut series = vec![Series::Heatmap {
+    let series = vec![Series::Heatmap {
         values,
         cols: cols as u32,
         rows: rows as u32,
@@ -225,16 +228,6 @@ fn image_panel(space: &Workspace, cell: CellView) -> Panel {
         lo: space.lo,
         hi: space.hi,
     }];
-    if cell == CellView::Axial && space.show_field {
-        if let Some(bounds) = space.field {
-            series.push(Series::Guide {
-                xs: vec![bounds[0], bounds[1], bounds[1], bounds[0], bounds[0]],
-                ys: vec![bounds[2], bounds[2], bounds[3], bounds[3], bounds[2]],
-                color: GUIDE,
-                thickness: 1.0,
-            });
-        }
-    }
     let (x_label, y_label) = match cell {
         CellView::Axial => ("X (mm)", "Y (mm)"),
         CellView::Coronal => ("X (mm)", "Z (mm)"),
@@ -283,7 +276,11 @@ fn plot_panel(space: &Workspace, kind: PlotKind) -> Panel {
         PlotKind::Dvh => ("DVH".into(), space.dvh.clone(), "Volume".into()),
         PlotKind::Gamma => {
             let (title, series) = gamma_panel(space);
-            (title, series, "Voxels".into())
+            let y_label = match space.gamma {
+                Some((_, rate)) => format!("Voxels · {rate:.0}% {}", gamma_verdict(rate)),
+                None => "Voxels".into(),
+            };
+            (title, series, y_label)
         }
         PlotKind::Depth => (
             "Depth dose".into(),
@@ -314,29 +311,25 @@ fn plot_panel(space: &Workspace, kind: PlotKind) -> Panel {
 }
 
 /// TG-218: at least 95% passes, 90% is the action level.
-fn gamma_heading(rate: f32) -> String {
-    let verdict = if rate >= 95.0 {
+fn gamma_verdict(rate: f32) -> &'static str {
+    if rate >= 95.0 {
         "pass"
     } else if rate >= 90.0 {
         "action"
     } else {
         "fail"
-    };
-    format!("Gamma histogram  {rate:.0}% {verdict}")
+    }
+}
+
+fn gamma_heading(rate: f32) -> String {
+    format!("Gamma histogram  {rate:.0}% {}", gamma_verdict(rate))
 }
 
 fn gamma_panel(space: &Workspace) -> (String, Vec<Series>) {
     let Some((gamma, rate)) = &space.gamma else {
         return ("Gamma histogram".into(), Vec::new());
     };
-    let mut counts = [0.0f32; 20];
-    for value in &gamma.values {
-        if !value.is_finite() || *value <= 0.0 {
-            continue;
-        }
-        let bin = ((*value / 2.0) * 20.0).floor() as usize;
-        counts[bin.min(19)] += 1.0;
-    }
+    let counts = gamma_counts(gamma);
     let edges: Vec<f32> = (0..=20).map(|i| i as f32 * 0.1).collect();
     let peak = counts.iter().copied().fold(1.0f32, f32::max);
     (
@@ -554,6 +547,111 @@ fn span(series: &[Series]) -> (f32, f32, f32, f32) {
     (xmin, xmax, ymin, ymax)
 }
 
+fn fit_panel(panel: &mut Panel) {
+    let (xmin, xmax, ymin, ymax) = span(&panel.series);
+    panel.xmin = xmin;
+    panel.xmax = xmax;
+    panel.ymin = ymin;
+    panel.ymax = ymax;
+}
+
+fn profile_series(kind: PlotKind, volumes: &[Volume], at: [f32; 3]) -> Vec<Series> {
+    let mut series = Vec::new();
+    for volume in volumes {
+        let ix = volume.index_of(0, at[0]);
+        let iy = volume.index_of(1, at[1]);
+        let iz = volume.index_of(2, at[2]);
+        match kind {
+            PlotKind::Depth => series.push(line(volume.depth_profile(ix, iy))),
+            PlotKind::Lateral => series.push(line(volume.lateral_profile(ix, iy, iz))),
+            PlotKind::Longitudinal => series.push(line(volume.longitudinal_profile(ix, iy, iz))),
+            PlotKind::Both => {
+                series.push(line(volume.lateral_profile(ix, iy, iz)));
+                series.push(line_colored(
+                    volume.longitudinal_profile(ix, iy, iz),
+                    [0.0, 0.0, 0.0, 0.0],
+                ));
+            }
+            PlotKind::Dvh | PlotKind::Gamma => {}
+        }
+    }
+    series
+}
+
+fn gamma_counts(volume: &Volume) -> [f32; 20] {
+    let mut counts = [0.0f32; 20];
+    for value in &volume.values {
+        if !value.is_finite() || *value <= 0.0 {
+            continue;
+        }
+        let bin = ((*value / 2.0) * 20.0).floor() as usize;
+        counts[bin.min(19)] += 1.0;
+    }
+    counts
+}
+
+/// One curve per session, plus the γ = 1 guide. Bars would hide each other.
+fn gamma_lines(volumes: &[Volume]) -> Vec<Series> {
+    let mut series = Vec::new();
+    let mut peak = 1.0f32;
+    for volume in volumes {
+        let counts = gamma_counts(volume);
+        peak = peak.max(counts.iter().copied().fold(0.0, f32::max));
+        let xs: Vec<f32> = (0..20).map(|bin| (bin as f32 + 0.5) * 0.1).collect();
+        series.push(line((xs, counts.to_vec())));
+    }
+    series.push(Series::Guide {
+        xs: vec![1.0, 1.0],
+        ys: vec![0.0, peak],
+        color: GUIDE,
+        thickness: 1.5,
+    });
+    series
+}
+
+/// Draw every loaded session on the line plots. Image cells stay on one cube.
+pub(crate) fn overlay_sessions(
+    panel: &mut Panel,
+    volumes: &[Volume],
+    at: [f32; 3],
+    gamma: &[Volume],
+) {
+    if volumes.len() < 2 {
+        return;
+    }
+    let title = panel.title.to_ascii_lowercase();
+    if title.starts_with("depth") {
+        panel.series = profile_series(PlotKind::Depth, volumes, at);
+        fit_panel(panel);
+    } else if title.starts_with("lateral +") || title.starts_with("lateral+") {
+        panel.series = profile_series(PlotKind::Both, volumes, at);
+        fit_panel(panel);
+    } else if title.starts_with("lateral") {
+        panel.series = profile_series(PlotKind::Lateral, volumes, at);
+        fit_panel(panel);
+    } else if title.starts_with("longitudinal") {
+        panel.series = profile_series(PlotKind::Longitudinal, volumes, at);
+        fit_panel(panel);
+    } else if title.starts_with("dvh") {
+        panel.series = volumes.iter().map(dvh_line).collect();
+        fit_panel(panel);
+    } else if title.starts_with("gamma") && gamma.len() > 1 {
+        panel.series = gamma_lines(gamma);
+        panel.xmin = 0.0;
+        panel.xmax = 2.0;
+        panel.ymin = 0.0;
+        let peak = panel
+            .series
+            .iter()
+            .filter_map(|series| match series {
+                Series::Guide { ys, .. } => ys.iter().copied().reduce(f32::max),
+                _ => None,
+            })
+            .fold(1.0, f32::max);
+        panel.ymax = peak;
+    }
+}
+
 pub(crate) fn readout(label: &str, id: &str, text: &str, group: &str) -> Control {
     Control::plain(id, label, [text], text).grouped(group)
 }
@@ -587,6 +685,37 @@ mod tests {
         assert!(gamma_heading(95.0).ends_with("pass"));
         assert!(gamma_heading(90.0).ends_with("action"));
         assert!(gamma_heading(89.9).ends_with("fail"));
+    }
+
+    #[test]
+    fn two_sessions_share_the_depth_axis() {
+        let low = Volume {
+            origin: [0.0; 3],
+            shape: [1, 1, 2],
+            voxel: 1.0,
+            values: vec![1.0, 3.0],
+        };
+        let high = Volume {
+            origin: [0.0; 3],
+            shape: [1, 1, 2],
+            voxel: 1.0,
+            values: vec![2.0, 8.0],
+        };
+        let mut panel = Panel {
+            title: "Depth dose".into(),
+            y_label: "Gy".into(),
+            x_label: String::new(),
+            xmin: 0.0,
+            xmax: 1.0,
+            ymin: 0.0,
+            ymax: 1.0,
+            series: Vec::new(),
+            x_labels: Vec::new(),
+            equal: false,
+        };
+        overlay_sessions(&mut panel, &[low, high], [0.5, 0.5, 0.5], &[]);
+        assert_eq!(panel.series.len(), 2);
+        assert!(panel.ymax >= 8.0, "{}", panel.ymax);
     }
 
     #[test]
@@ -646,8 +775,6 @@ mod tests {
                 y_label: "Gy".into(),
                 dvh: vec![dvh_line(&volume)],
                 gamma: Some((gamma.clone(), 95.0)),
-                field: None,
-                show_field: false,
             };
             let (panels, mark) = assemble(&space);
             assert_eq!(panels.len(), 6, "{kind:?}");

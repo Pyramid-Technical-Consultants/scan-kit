@@ -6,7 +6,14 @@ import { invoke } from "@tauri-apps/api/core";
 import { AnalysisView } from "./AnalysisView";
 import { sessionColor } from "./session-colors";
 
-const { followPlot } = vi.hoisted(() => ({ followPlot: vi.fn() }));
+const { followPlot, paintPlot } = vi.hoisted(() => ({
+  followPlot: vi.fn(),
+  paintPlot: vi.fn((spec: string) =>
+    spec.includes('"Off"')
+      ? JSON.stringify({ label: "Window", min: "0", max: "8", step: "0.08", value: "4" })
+      : "",
+  ),
+}));
 
 function pollFrame(payload: Uint8Array): Uint8Array {
   const report = {
@@ -51,8 +58,8 @@ vi.mock("@tauri-apps/api/core", () => ({
                 group: "Calculation",
                 kind: "radio",
                 options: [
-                  { id: "analytic", label: "Analytic", detail: "", icon: "" },
-                  { id: "mc", label: "Monte Carlo", detail: "", icon: "" },
+                  { id: "analytic", label: "Analytic", detail: "", icon: "analytic" },
+                  { id: "mc", label: "Monte Carlo", detail: "", icon: "mc" },
                 ],
                 value: "Analytic",
               },
@@ -63,6 +70,26 @@ vi.mock("@tauri-apps/api/core", () => ({
                 kind: "radio",
                 options: ["1e6", "3e6", "1e7", "5e7"],
                 value: "1e7",
+              },
+              {
+                id: "auto",
+                label: "Auto",
+                group: "Picture",
+                kind: "check",
+                options: ["Off", "On"],
+                value: "On",
+              },
+              {
+                id: "level",
+                label: "Gain",
+                group: "Picture",
+                kind: "range",
+                options: [
+                  { id: "min", label: "0.25", detail: "", icon: "" },
+                  { id: "max", label: "4", detail: "", icon: "" },
+                  { id: "step", label: "0.05", detail: "", icon: "" },
+                ],
+                value: "1",
               },
             ],
             table: null,
@@ -178,6 +205,7 @@ vi.mock("@/wasm/scan_kit_plot.js", () => ({
       pan: () => undefined,
       reset: () => undefined,
       follow: (...args: unknown[]) => followPlot(...args),
+      paint: (spec: string) => paintPlot(spec),
     }),
   },
 }));
@@ -191,6 +219,7 @@ afterEach(() => {
   root = null;
   document.body.replaceChildren();
   followPlot.mockClear();
+  paintPlot.mockClear();
 });
 
 it("puts grouped controls on the right and returns to sessions", async () => {
@@ -735,19 +764,21 @@ it("switches analytic and Monte Carlo with radio groups", async () => {
   await act(async () => {
     await new Promise((resolve) => setTimeout(resolve, 200));
   });
-  const groups = [...host.querySelectorAll("[data-slot='radio-group']")];
+  const groups = [...host.querySelectorAll("[data-slot='toggle-group']")];
   expect(groups).toHaveLength(2);
+  expect(groups[0]?.querySelector("svg")).not.toBeNull();
   expect(groups[0]?.textContent).toContain("Analytic");
   expect(groups[0]?.textContent).toContain("Monte Carlo");
+  expect(groups[1]?.querySelector("svg")).not.toBeNull();
   expect(groups[1]?.textContent).toContain("1e6");
   expect(groups[1]?.textContent).toContain("5e7");
+  expect(host.querySelector("[data-slot='radio-group']")).toBeNull();
   expect(host.querySelector("[data-slot='select-trigger']")).toBeNull();
-  const monteCarlo = [...host.querySelectorAll("[data-slot='radio-group-item']")].find(
-    (node) => node.getAttribute("value") === "Monte Carlo" || node.textContent?.includes("Monte Carlo"),
+  const monteCarlo = [...(groups[0]?.querySelectorAll("button") ?? [])].find((node) =>
+    node.textContent?.includes("Monte Carlo"),
   );
-  const label = [...host.querySelectorAll("label")].find((node) => node.textContent?.trim() === "Monte Carlo");
   await act(async () => {
-    (label ?? monteCarlo)?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    monteCarlo?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
   });
   await act(async () => {
     await new Promise((resolve) => setTimeout(resolve, 200));
@@ -755,4 +786,38 @@ it("switches analytic and Monte Carlo with radio groups", async () => {
   const starts = vi.mocked(invoke).mock.calls.filter(([name]) => name === "scan_kit_start");
   const last = starts[starts.length - 1]?.[1] as { options?: { model?: string } } | undefined;
   expect(last?.options?.model).toBe("Monte Carlo");
+});
+
+it("changes color gain without rebuilding the dose", async () => {
+  const host = document.createElement("div");
+  document.body.append(host);
+  await act(() => {
+    root = createRoot(host);
+    root.render(
+      <AnalysisView
+        viewId="volumetric"
+        folder="C:/data"
+        sessions={[{ id: "a", note: "" }]}
+        onBack={() => undefined}
+        onOpenView={() => undefined}
+      />,
+    );
+  });
+  await act(async () => {
+    await new Promise((resolve) => setTimeout(resolve, 200));
+  });
+  const starts = () => vi.mocked(invoke).mock.calls.filter(([name]) => name === "scan_kit_start").length;
+  const before = starts();
+  expect(before).toBeGreaterThan(0);
+  expect(paintPlot).toHaveBeenCalled();
+  paintPlot.mockClear();
+  await act(async () => {
+    host.querySelector("#analysis-auto")?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+  });
+  await act(async () => {
+    await new Promise((resolve) => setTimeout(resolve, 400));
+  });
+  expect(starts()).toBe(before);
+  expect(paintPlot).toHaveBeenCalled();
+  expect(host.textContent).toContain("Window");
 });

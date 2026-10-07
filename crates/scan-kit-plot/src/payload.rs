@@ -64,6 +64,11 @@ pub struct PlotHeader {
     volume_lo: f32,
     #[serde(default)]
     volume_hi: f32,
+    /// Data window. Zero means the plot measures the cube it was given.
+    #[serde(default)]
+    volume_base_lo: f32,
+    #[serde(default)]
+    volume_base_hi: f32,
     #[serde(default)]
     volume_gain: f32,
     #[serde(default)]
@@ -73,9 +78,23 @@ pub struct PlotHeader {
     #[serde(default)]
     volume_filter: u8,
     #[serde(default)]
+    volume_gantry: f32,
+    #[serde(default)]
+    volume_unit: String,
+    #[serde(default)]
+    volume_phantom: bool,
+    #[serde(default)]
+    volume_field: [f32; 6],
+    #[serde(default)]
     volume_ct: bool,
     #[serde(default)]
     volume_labels: bool,
+    #[serde(default)]
+    volume_sessions: u32,
+    #[serde(default)]
+    volume_session_focus: u32,
+    #[serde(default)]
+    volume_colors: Vec<[f32; 4]>,
 }
 
 fn final_quality() -> String {
@@ -143,12 +162,21 @@ pub fn encode_plot_reusing(
         volume_ramp: scene.volume.ramp,
         volume_lo: scene.volume.lo,
         volume_hi: scene.volume.hi,
+        volume_base_lo: scene.volume.base_lo,
+        volume_base_hi: scene.volume.base_hi,
         volume_gain: scene.volume.gain,
         volume_opacity: scene.volume.opacity,
         volume_mode: scene.volume.mode,
         volume_filter: scene.volume.filter,
+        volume_gantry: scene.volume.gantry,
+        volume_unit: scene.volume.unit.clone(),
+        volume_phantom: scene.volume.show_phantom,
+        volume_field: scene.volume.field,
         volume_ct: !scene.volume.ct.is_empty(),
         volume_labels: !scene.volume.labels.is_empty(),
+        volume_sessions: scene.volume.sessions.len() as u32,
+        volume_session_focus: scene.volume.session_focus,
+        volume_colors: scene.volume.session_colors.clone(),
     };
     let json = serde_json::to_vec(&header).map_err(|err| err.to_string())?;
     let mut out = Vec::with_capacity(
@@ -180,6 +208,20 @@ pub fn encode_plot_reusing(
         }
         if !scene.volume.labels.is_empty() {
             out.extend_from_slice(&scene.volume.labels[..voxels.min(scene.volume.labels.len())]);
+        }
+    }
+    for session in &scene.volume.sessions {
+        for value in session.shape {
+            out.extend_from_slice(&value.to_le_bytes());
+        }
+        for value in session.origin {
+            out.extend_from_slice(&value.to_le_bytes());
+        }
+        out.extend_from_slice(&session.voxel.to_le_bytes());
+        let count = session.values.len() as u32;
+        out.extend_from_slice(&count.to_le_bytes());
+        for value in &session.values {
+            out.extend_from_slice(&value.to_le_bytes());
         }
     }
     Ok(out)
@@ -242,10 +284,18 @@ pub(crate) fn decode_plot(
         ramp: header.volume_ramp,
         lo: header.volume_lo,
         hi: header.volume_hi,
+        base_lo: header.volume_base_lo,
+        base_hi: header.volume_base_hi,
         gain: header.volume_gain,
         opacity: header.volume_opacity,
         mode: header.volume_mode,
         filter: header.volume_filter,
+        gantry: header.volume_gantry,
+        unit: header.volume_unit.clone(),
+        show_phantom: header.volume_phantom,
+        field: header.volume_field,
+        session_colors: header.volume_colors.clone(),
+        session_focus: header.volume_session_focus,
         ..VolumeMark::default()
     };
     if voxels > 0 {
@@ -266,6 +316,30 @@ pub(crate) fn decode_plot(
         if header.volume_labels {
             volume.labels = reader.take(voxels)?.to_vec();
         }
+    }
+    for _ in 0..header.volume_sessions {
+        let shape = [
+            u32::from_le_bytes(reader.take(4)?.try_into().unwrap()),
+            u32::from_le_bytes(reader.take(4)?.try_into().unwrap()),
+            u32::from_le_bytes(reader.take(4)?.try_into().unwrap()),
+        ];
+        let origin = [
+            f32::from_le_bytes(reader.take(4)?.try_into().unwrap()),
+            f32::from_le_bytes(reader.take(4)?.try_into().unwrap()),
+            f32::from_le_bytes(reader.take(4)?.try_into().unwrap()),
+        ];
+        let voxel = f32::from_le_bytes(reader.take(4)?.try_into().unwrap());
+        let count = u32::from_le_bytes(reader.take(4)?.try_into().unwrap()) as usize;
+        let mut values = Vec::with_capacity(count);
+        for _ in 0..count {
+            values.push(f32::from_le_bytes(reader.take(4)?.try_into().unwrap()));
+        }
+        volume.sessions.push(scan_kit_core::SessionDose {
+            values,
+            shape,
+            origin,
+            voxel,
+        });
     }
     Ok((
         header,
@@ -396,6 +470,70 @@ mod tests {
         assert_eq!(header.side, 1);
         assert!(marks.quads.iter().any(|quad| quad.heatmap == Some(0)));
         assert!(decode_plot(&bytes[..bytes.len() - 1]).is_err());
+    }
+
+    #[test]
+    fn payload_keeps_the_dose_window_and_gantry() {
+        let mut scene = PlotScene {
+            title: "dose".into(),
+            panels: vec![Panel {
+                title: "Axial".into(),
+                y_label: String::new(),
+                x_label: String::new(),
+                xmin: 0.0,
+                xmax: 1.0,
+                ymin: 0.0,
+                ymax: 1.0,
+                series: Vec::new(),
+                x_labels: Vec::new(),
+                equal: false,
+            }],
+            controls: Vec::new(),
+            table: None,
+            columns: 1,
+            column_weights: Vec::new(),
+            row_weights: Vec::new(),
+            side: 0,
+            row_splits: Vec::new(),
+            volume: VolumeMark {
+                values: vec![1.0],
+                shape: [1, 1, 1],
+                origin: [0.0, 0.0, 0.0],
+                voxel: 1.0,
+                lo: 0.0,
+                hi: 1.5,
+                base_lo: 0.0,
+                base_hi: 4.0,
+                gantry: 90.0,
+                unit: "Gy".into(),
+                show_phantom: true,
+                field: [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+                ..VolumeMark::default()
+            },
+        };
+        scene.volume.gain = 1.0;
+        scene.volume.session_colors = vec![[0.2, 0.3, 0.8, 1.0]];
+        scene.volume.session_focus = 1;
+        scene.volume.sessions = vec![scan_kit_core::SessionDose {
+            values: vec![4.0, 5.0],
+            shape: [1, 1, 2],
+            origin: [1.0, 2.0, 3.0],
+            voxel: 2.0,
+        }];
+        let bytes = encode_plot(&scene, [0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0, 1.0]).unwrap();
+        let (_, _, _, volume) = decode_plot(&bytes).unwrap();
+        assert!((volume.gantry - 90.0).abs() < 1e-4);
+        assert_eq!(volume.session_focus, 1);
+        assert_eq!(volume.session_colors, vec![[0.2, 0.3, 0.8, 1.0]]);
+        assert_eq!(volume.sessions[0].values, vec![4.0, 5.0]);
+        assert_eq!(volume.sessions[0].shape, [1, 1, 2]);
+        assert!((volume.sessions[0].voxel - 2.0).abs() < 1e-4);
+        assert_eq!(volume.unit, "Gy");
+        assert!(volume.show_phantom);
+        assert_eq!(volume.field, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        assert!((volume.base_hi - 4.0).abs() < 1e-4);
+        assert!((volume.hi - 1.5).abs() < 1e-4);
+        assert_eq!(volume.values, vec![1.0]);
     }
 
     #[test]

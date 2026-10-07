@@ -130,6 +130,7 @@ pub(crate) fn scene(
         histories,
         seed: SEED,
         dose_to_water: true,
+        score_let: false,
     };
     let ran = mc.and_then(|run| run(&McJob::Patient(request)).ok());
     let mut dose = ran
@@ -294,8 +295,6 @@ pub(crate) fn scene(
         y_label: "Dose".into(),
         dvh: dvh_lines,
         gamma,
-        field: None,
-        show_field: false,
     });
     volume.unit = if (rbe - 1.0).abs() > 1e-3 {
         "Gy(RBE)".into()
@@ -608,6 +607,7 @@ fn history_control(histories: u32) -> scan_kit_core::Control {
     )
     .grouped("Calculation")
     .radio()
+    .icons(&["1e6", "3e6", "1e7", "5e7"])
 }
 
 fn note_scene(message: &str) -> PlotScene {
