@@ -23,8 +23,11 @@
 //! meet at the entrance corner, on the side facing the camera, and the text
 //! turns to follow the edge. The titles are X (mm), Y (mm), and Depth (mm).
 //! The field box is an amber rectangle on each slice and an amber wireframe
-//! through the volume. Dose line plots draw every loaded session in that
-//! session's color. A toolbar band names the plot, so the canvas title stays off.
+//! through the volume. The wire is a pixel and a half wide on that picture,
+//! at the edge's own depth, so orbit and zoom do not drop it. Dose line plots
+//! draw every loaded session in that session's color. A second chamber uses
+//! that color at reduced alpha. The plan is a dashed stroke in the same color.
+//! A toolbar band names the plot, so the canvas title stays off.
 //! Color gain, window, opacity, ray mode, and the sample filter are uniforms.
 //! A color-scale change rewrites the 256 ramp pixels on the last atlas row.
 //! Neither rebuilds the volume.
@@ -372,7 +375,8 @@ fn fs_quad(in: QuadOut) -> @location(0) vec4<f32> {
     // lookup can sit in this branch. heat > 1.5 samples the uploaded volume.
     // heat > 0.5 is a baked ramp. Otherwise the quad is a solid color.
     if (in.heat > 1.5) {
-        return dose_fragment(in.uv, coverage);
+        let plot_h = max(abs(in.bounds1.y - in.bounds0.y), 1.0);
+        return dose_fragment(in.uv, coverage, plot_h);
     }
     if (in.heat > 0.5) {
         let texel = textureSampleLevel(mark_tex, mark_samp, in.uv, 0.0);
@@ -520,11 +524,11 @@ fn wash(raw: f32, lo: f32, hi: f32, under: vec3<f32>, has_ct: bool) -> vec4<f32>
     return vec4<f32>(rgb, 1.0);
 }
 
-fn dose_fragment(uv: vec2<f32>, coverage: f32) -> vec4<f32> {
+fn dose_fragment(uv: vec2<f32>, coverage: f32, plot_h: f32) -> vec4<f32> {
     let plane = u32(u.dose0.x + 0.5);
     if (plane == 3u) {
         // Elevation lives in dose0.z. Turning the film with it rolls the picture.
-        let marched = march_color(uv);
+        let marched = march_color(uv, plot_h);
         return shade(marched.rgb, marched.a, coverage);
     }
     let film = turned_uv(uv, u32(u.dose0.z + 0.5));
@@ -534,9 +538,6 @@ fn dose_fragment(uv: vec2<f32>, coverage: f32) -> vec4<f32> {
     var raw = 0.0;
     var under = vec3<f32>(0.0);
     var has_ct = false;
-    let ix = film.x * nx - 0.5;
-    let iy = (1.0 - film.y) * ny - 0.5;
-    let iz = u.dose0.y;
     if (u.dose0.w > 0.5) {
         let cols = max(u.dose6.x, 1.0);
         let rows = max(u.dose6.y, 1.0);
@@ -549,11 +550,20 @@ fn dose_fragment(uv: vec2<f32>, coverage: f32) -> vec4<f32> {
         let color = wash(raw, u.dose2.x, u.dose2.y, under, false);
         return shade(color.rgb, color.a, coverage);
     }
-    let texel = select(
-        select(sample_grid(ix, iy, iz), sample_grid(ix, iz, iy), plane == 1u),
-        sample_grid(iz, iy, ix),
-        plane == 2u,
-    );
+    // Axial is X across and Y up. Coronal is X across and depth up.
+    // Sagittal is Y across and depth up, the same axes as the field box.
+    var vx = film.x * nx - 0.5;
+    var vy = (1.0 - film.y) * ny - 0.5;
+    var vz = u.dose0.y;
+    if (plane == 1u) {
+        vy = u.dose0.y;
+        vz = (1.0 - film.y) * nz - 0.5;
+    } else if (plane == 2u) {
+        vx = u.dose0.y;
+        vy = film.x * ny - 0.5;
+        vz = (1.0 - film.y) * nz - 0.5;
+    }
+    let texel = sample_grid(vx, vy, vz);
     raw = atlas_dose(texel.r);
     has_ct = texel.b > 0.5;
     under = vec3<f32>(texel.g);
@@ -901,34 +911,56 @@ fn tick_near(eye: vec3<f32>, dir: vec3<f32>, origin: vec3<f32>, extent: vec3<f32
     return hang_ticks(best, eye, dir, origin, extent, 2, z_out, stub);
 }
 
-fn over_guides(color: vec4<f32>, eye: vec3<f32>, dir: vec3<f32>, origin: vec3<f32>, extent: vec3<f32>, hit_t: f32, t0: f32, t1: f32, fy: f32) -> vec4<f32> {
-    let px = 1.5 * fy / max(u.resolution.y, 1.0);
-    var best = box_near(eye, dir, origin, origin + extent, origin, extent);
-    var ink = vec3<f32>(0.55, 0.58, 0.62);
-    var limit = hit_t;
+fn clip_box(eye: vec3<f32>, dir: vec3<f32>, bmin: vec3<f32>, bmax: vec3<f32>) -> vec3<f32> {
+    var clip = clip_axis(vec2<f32>(0.0, 1e30), eye.x, dir.x, bmin.x, bmax.x);
+    if (clip.z < 0.5) { return clip; }
+    clip = clip_axis(clip.xy, eye.y, dir.y, bmin.y, bmax.y);
+    if (clip.z < 0.5) { return clip; }
+    return clip_axis(clip.xy, eye.z, dir.z, bmin.z, bmax.z);
+}
+
+// World size of one picture pixel at distance `t` along the ray. `plot_h` is the
+// picture, not the canvas: the volume is one cell of a taller frame.
+fn world_per_pixel(t: f32, fy: f32, plot_h: f32) -> f32 {
+    let span = max(plot_h, 1.0);
+    let fov = min(u.dose7.w, 3.124139);
+    if (fov <= 0.0001) {
+        return fy / span;
+    }
+    return max(t, 0.001) * 2.0 * tan(fov * 0.5) / span;
+}
+
+// best.xyz is ink. best.w is the gap, or 1e30 when nothing has hit.
+fn keep_guide(best: vec4<f32>, t: f32, gap: f32, ink: vec3<f32>, t_lo: f32, t_hi: f32, fy: f32, plot_h: f32) -> vec4<f32> {
+    let px = 1.5 * world_per_pixel(t, fy, plot_h);
+    if (t < t_lo - px || t > t_hi + px || gap > px || gap >= best.w) {
+        return best;
+    }
+    return vec4<f32>(ink, gap);
+}
+
+fn over_guides(color: vec4<f32>, eye: vec3<f32>, dir: vec3<f32>, origin: vec3<f32>, extent: vec3<f32>, hit_t: f32, t0: f32, t1: f32, fy: f32, plot_h: f32) -> vec4<f32> {
+    var box_ink = vec3<f32>(0.55, 0.58, 0.62);
     if (u.dose9.w > 0.5) {
-        ink = vec3<f32>(0.25, 0.8, 0.85);
+        box_ink = vec3<f32>(0.25, 0.8, 0.85);
     }
+    var best = vec4<f32>(0.0, 0.0, 0.0, 1e30);
+    let lattice = box_near(eye, dir, origin, origin + extent, origin, extent);
+    best = keep_guide(best, lattice.x, lattice.y, box_ink, t0, hit_t, fy, plot_h);
     let ticks = tick_near(eye, dir, origin, extent);
-    if (ticks.y < best.y) {
-        best = ticks;
-        ink = vec3<f32>(0.62, 0.66, 0.7);
-    }
+    best = keep_guide(best, ticks.x, ticks.y, vec3<f32>(0.62, 0.66, 0.7), t0, hit_t, fy, plot_h);
     if (u.dose8.w > 0.5) {
         let field = box_near(eye, dir, u.dose8.xyz, u.dose9.xyz, origin, extent);
-        if (field.y < best.y) {
-            best = field;
-            ink = vec3<f32>(0.86, 0.68, 0.22);
-            limit = t1;
-        }
+        // Through the slab. A nearer lattice edge that the dose hides must not erase it.
+        best = keep_guide(best, field.x, field.y, vec3<f32>(0.86, 0.68, 0.22), t0, t1, fy, plot_h);
     }
-    if (best.y <= px && best.x >= t0 - px && best.x <= limit + px) {
-        return vec4<f32>(ink, 1.0);
+    if (best.w < 1e20) {
+        return vec4<f32>(best.xyz, 1.0);
     }
     return color;
 }
 
-fn march_color(uv: vec2<f32>) -> vec4<f32> {
+fn march_color(uv: vec2<f32>, plot_h: f32) -> vec4<f32> {
     let voxel = max(u.dose5.w, 0.000001);
     let dims = max(u.dose6.xyz, vec3<f32>(1.0));
     let extent = dims * voxel;
@@ -955,28 +987,32 @@ fn march_color(uv: vec2<f32>) -> vec4<f32> {
     let y = (1.0 - uv.y) * 2.0 - 1.0;
     var eye: vec3<f32>;
     var dir: vec3<f32>;
+    var distance: f32;
     if (fov <= 0.0001) {
         let half_y = fy * 0.5;
-        let distance = length(box_e) + half_y;
+        distance = length(box_e) + half_y;
         eye = center - look * distance + right * x * aspect * half_y + up * y * half_y;
         dir = look;
     } else {
-        let distance = fy / (2.0 * tan(fov * 0.5));
+        distance = fy / (2.0 * tan(fov * 0.5));
         let tan_y = tan(fov * 0.5);
         eye = center - look * distance;
         dir = normalize(look + right * x * aspect * tan_y + up * y * tan_y);
     }
     let bmax = box_o + box_e;
-    var clip = clip_axis(vec2<f32>(0.0, 1e30), eye.x, dir.x, box_o.x, bmax.x);
-    if (clip.z < 0.5) { return zero_color(); }
-    clip = clip_axis(clip.xy, eye.y, dir.y, box_o.y, bmax.y);
-    if (clip.z < 0.5) { return zero_color(); }
-    clip = clip_axis(clip.xy, eye.z, dir.z, box_o.z, bmax.z);
-    if (clip.z < 0.5 || clip.y < 0.0) { return zero_color(); }
+    // Ticks stick out, and half of a silhouette stroke sits outside the cube.
+    // Test that shell before giving up, so a miss still draws the wire.
+    let reach = distance + length(box_e);
+    let shell = max(6.0, 2.0 * world_per_pixel(reach, fy, plot_h));
+    let wide = clip_box(eye, dir, box_o - vec3<f32>(shell), bmax + vec3<f32>(shell));
+    if (wide.z < 0.5 || wide.y < 0.0) { return zero_color(); }
+    let clip = clip_box(eye, dir, box_o, bmax);
     let t0 = max(clip.x, 0.0);
     let t1 = clip.y;
     let dist = t1 - t0;
-    if (dist < 0.001) { return zero_color(); }
+    if (clip.z < 0.5 || dist < 0.001) {
+        return over_guides(zero_color(), eye, dir, origin, extent, wide.y, 0.0, wide.y, fy, plot_h);
+    }
     let nstep = i32(clamp(ceil(dist / voxel), 1.0, 1024.0));
     let entry = eye + dir * t0;
     let mode = u32(u.dose3.x + 0.5);
@@ -1059,7 +1095,7 @@ fn march_color(uv: vec2<f32>) -> vec4<f32> {
             hit_t = t1;
         }
     }
-    return over_guides(color, eye, dir, origin, extent, hit_t, t0, t1, fy);
+    return over_guides(color, eye, dir, origin, extent, hit_t, t0, t1, fy, plot_h);
 }
 "#;
 
@@ -1527,6 +1563,8 @@ impl Plot {
         grid.session_colors = mark.session_colors.clone();
         grid.session_focus = mark.session_focus as usize;
         grid.sessions = mark.sessions.iter().map(session_volume).collect();
+        grid.companions = mark.companions.iter().map(session_volume).collect();
+        grid.plans = mark.plans.iter().map(session_volume).collect();
         crate::dose::remember_window(&mut grid, mark.base_lo, mark.base_hi);
         let (pixels, cols, rows) = crate::dose::atlas_bytes(&grid);
         let atlas = self.marks.heatmaps.len();
@@ -6287,7 +6325,13 @@ fn integral_profile_axis(grid: &crate::dose::DoseGrid, kind: u8) -> (f32, f32) {
             fold(&grid.integrals[2], &mut lo, &mut hi, &mut any);
         }
     }
-    for volume in grid.sessions.iter().flatten() {
+    for volume in grid
+        .sessions
+        .iter()
+        .chain(grid.companions.iter())
+        .chain(grid.plans.iter())
+        .flatten()
+    {
         fold_cube(volume, kind, &mut lo, &mut hi, &mut any);
     }
     if !any || !lo.is_finite() || !hi.is_finite() {
@@ -6469,37 +6513,116 @@ fn profile_lines(
         };
         let color = grid.session_colors.get(index).copied().unwrap_or(fallback);
         let volume = foreign.unwrap_or(home);
-        for (curve, (xs, ys)) in
-            profile_curves(grid, volume, foreign.is_none(), kind, at, integrate)
-                .into_iter()
-                .enumerate()
-        {
-            let ink = if curve == 0 {
-                color
-            } else {
-                [color[0], color[1], color[2], color[3] * 0.55]
-            };
-            let mut prev: Option<[f32; 3]> = None;
-            for (x, y) in xs.into_iter().zip(ys) {
-                if !x.is_finite() || !y.is_finite() {
-                    prev = None;
-                    continue;
-                }
-                let point = [x, y, 0.0];
-                if let Some(start) = prev {
-                    lines.push(LineRec {
-                        a: start,
-                        b: point,
-                        color: ink,
-                        thickness: 1.5,
-                        id: 0,
-                    });
-                }
-                prev = Some(point);
-            }
+        push_profile_curves(
+            &mut lines,
+            grid,
+            volume,
+            foreign.is_none(),
+            kind,
+            at,
+            integrate,
+            color,
+            1.0,
+            false,
+        );
+        if let Some(extra) = grid.companions.get(index).and_then(|slot| slot.as_ref()) {
+            push_profile_curves(
+                &mut lines,
+                grid,
+                extra,
+                false,
+                kind,
+                index_mm(extra, mm),
+                integrate,
+                color,
+                0.55,
+                false,
+            );
+        }
+        if let Some(extra) = grid.plans.get(index).and_then(|slot| slot.as_ref()) {
+            push_profile_curves(
+                &mut lines,
+                grid,
+                extra,
+                false,
+                kind,
+                index_mm(extra, mm),
+                integrate,
+                color,
+                1.0,
+                true,
+            );
         }
     }
     lines
+}
+
+fn index_mm(volume: &scan_kit_core::Volume, mm: [f32; 3]) -> [usize; 3] {
+    [
+        volume.index_of(0, mm[0]),
+        volume.index_of(1, mm[1]),
+        volume.index_of(2, mm[2]),
+    ]
+}
+
+fn push_profile_curves(
+    lines: &mut Vec<LineRec>,
+    grid: &crate::dose::DoseGrid,
+    volume: &scan_kit_core::Volume,
+    own: bool,
+    kind: u8,
+    at: [usize; 3],
+    integrate: bool,
+    color: [f32; 4],
+    fade: f32,
+    dashed: bool,
+) {
+    for (curve, (xs, ys)) in profile_curves(grid, volume, own, kind, at, integrate)
+        .into_iter()
+        .enumerate()
+    {
+        let mut ink = if curve == 0 {
+            color
+        } else {
+            [color[0], color[1], color[2], color[3] * 0.55]
+        };
+        ink[3] *= fade;
+        stroke_profile(lines, xs, ys, ink, dashed);
+    }
+}
+
+fn stroke_profile(
+    lines: &mut Vec<LineRec>,
+    xs: Vec<f32>,
+    ys: Vec<f32>,
+    color: [f32; 4],
+    dashed: bool,
+) {
+    let mut prev: Option<[f32; 3]> = None;
+    let mut step = 0u32;
+    for (x, y) in xs.into_iter().zip(ys) {
+        if !x.is_finite() || !y.is_finite() {
+            prev = None;
+            continue;
+        }
+        let point = [x, y, 0.0];
+        if let Some(start) = prev {
+            // ponytail: 3 samples on, 2 off. A shader dash is a line attribute,
+            // which means changing LINE_STRIDE with the encoder and the WGSL inputs.
+            let draw = !dashed || step % 5 < 3;
+            if draw {
+                lines.push(LineRec {
+                    a: start,
+                    b: point,
+                    color,
+                    thickness: 1.5,
+                    id: 0,
+                });
+            }
+            step += 1;
+        }
+        prev = Some(point);
+    }
 }
 
 const FIELD_INK: [f32; 4] = [0.95, 0.72, 0.2, 0.95];
@@ -8496,6 +8619,251 @@ mod tests {
         assert_eq!(uniform[9][..3], [3.0, 2.0, 6.0]);
     }
 
+    fn box_edges(lo: [f32; 3], hi: [f32; 3]) -> [([f32; 3], [f32; 3]); 12] {
+        let corner = |bits: i32| {
+            [
+                if (bits & 1) == 0 { lo[0] } else { hi[0] },
+                if (bits & 2) == 0 { lo[1] } else { hi[1] },
+                if (bits & 4) == 0 { lo[2] } else { hi[2] },
+            ]
+        };
+        let mut edges = [([0.0; 3], [0.0; 3]); 12];
+        let mut at = 0;
+        for axis in 0..3 {
+            let bit = 1 << axis;
+            for i in 0..4 {
+                let low = if axis == 0 {
+                    (i % 2) * 2 + (i / 2) * 4
+                } else if axis == 1 {
+                    (i % 2) + (i / 2) * 4
+                } else {
+                    i
+                };
+                edges[at] = (corner(low), corner(low + bit));
+                at += 1;
+            }
+        }
+        edges
+    }
+
+    fn seg_dist(p: [f32; 2], a: [f32; 2], b: [f32; 2]) -> f32 {
+        let ab = [b[0] - a[0], b[1] - a[1]];
+        let len2 = ab[0] * ab[0] + ab[1] * ab[1];
+        if len2 < 1.0e-6 {
+            return (p[0] - a[0]).hypot(p[1] - a[1]);
+        }
+        let t = (((p[0] - a[0]) * ab[0] + (p[1] - a[1]) * ab[1]) / len2).clamp(0.0, 1.0);
+        let q = [a[0] + ab[0] * t, a[1] + ab[1] * t];
+        (p[0] - q[0]).hypot(p[1] - q[1])
+    }
+
+    /// Pixels about a picture-pixel off the projected edge. That is where a stroke
+    /// sized to the whole canvas used to disappear.
+    fn wires_near(
+        frame: &[u8],
+        width: u32,
+        plot: &PlotRect,
+        edges: &[([f32; 2], [f32; 2])],
+        avoid: &[([f32; 2], [f32; 2])],
+        field: bool,
+    ) -> (usize, [u8; 3]) {
+        let height = frame.len() / 4 / width as usize;
+        let mut hits = 0usize;
+        let mut sample = [0u8; 3];
+        for &(a, b) in edges {
+            for step in [0.3_f32, 0.5, 0.7] {
+                let mid = [a[0] + (b[0] - a[0]) * step, a[1] + (b[1] - a[1]) * step];
+                let x0 = (mid[0].floor() as i32 - 3).max(0);
+                let y0 = (mid[1].floor() as i32 - 3).max(0);
+                let x1 = (mid[0].ceil() as i32 + 3).min(width as i32 - 1);
+                let y1 = (mid[1].ceil() as i32 + 3).min(height as i32 - 1);
+                for y in y0..=y1 {
+                    for x in x0..=x1 {
+                        let center = [x as f32 + 0.5, y as f32 + 0.5];
+                        if center[0] < plot.x + 1.0 || center[0] > plot.x + plot.w - 1.0 {
+                            continue;
+                        }
+                        if center[1] < plot.y + 1.0 || center[1] > plot.y + plot.h - 1.0 {
+                            continue;
+                        }
+                        let dist = seg_dist(center, a, b);
+                        if !(0.7..=1.2).contains(&dist) {
+                            continue;
+                        }
+                        if field && avoid.iter().any(|&(c, d)| seg_dist(center, c, d) < 4.0) {
+                            continue;
+                        }
+                        let index = (y as usize * width as usize + x as usize) * 4;
+                        let rgb = [frame[index], frame[index + 1], frame[index + 2]];
+                        sample = rgb;
+                        let ink = if field {
+                            rgb[0] > 190 && rgb[1] > 120 && rgb[2] < 100
+                        } else {
+                            rgb[1] > 100 && rgb[2] > 120 && rgb[0] < 190
+                        };
+                        if ink {
+                            hits += 1;
+                        }
+                    }
+                }
+            }
+        }
+        (hits, sample)
+    }
+
+    #[test]
+    fn the_3d_box_stays_visible_as_the_camera_moves() {
+        let n = 8usize;
+        let mut scene = dose_scene(n, vec![0.0; n * n * n], 1, 0);
+        scene.volume.field = [2.0, 6.0, 2.0, 6.0, 2.0, 6.0];
+        scene.volume.gantry = 90.0;
+        let mut plot = Plot::new(&scene, [0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0, 1.0]);
+        let Ok(gpu) = crate::native_gpu() else {
+            return;
+        };
+        let (width, height) = (960u32, 640u32);
+        let lattice = box_edges([0.0; 3], [n as f32; 3]);
+        let field = box_edges([2.0, 2.0, 2.0], [6.0, 6.0, 6.0]);
+        let views = [
+            (HOME_AZIMUTH, HOME_ELEVATION, 1.0_f32, "home"),
+            (HOME_AZIMUTH + 0.9, HOME_ELEVATION - 0.2, 4.0, "zoomed out"),
+            (0.15, 1.15, 0.4, "close"),
+        ];
+        for (azimuth, elevation, zoom, name) in views {
+            plot.azimuth = azimuth;
+            plot.elevation = elevation;
+            plot.orbit_zoom = zoom;
+            let layout = plot.layout(width, height);
+            let cell = layout
+                .iter()
+                .find(|cell| plot.panels[cell.panel].title == "3D")
+                .expect("3D cell");
+            let old = 1.5 * cell.plot.h / height as f32;
+            assert!(
+                old < 0.65,
+                "{name}: the 3D picture fills the frame, so this no longer tests a short cell"
+            );
+            let frame = plot
+                .paint_offscreen(gpu, width, height)
+                .expect("dose shader");
+            let project = |point: [f32; 3]| {
+                let grid = plot.dose.as_ref().expect("volume");
+                let aspect = cell.plot.w / cell.plot.h.max(1.0);
+                let uv = scan_kit_core::dose_film_open(
+                    &grid.volume,
+                    dose_ray(&plot, grid, aspect),
+                    point,
+                )?;
+                Some([
+                    cell.plot.x + uv[0] * cell.plot.w,
+                    cell.plot.y + uv[1] * cell.plot.h,
+                ])
+            };
+            let on_film = |edge: ([f32; 3], [f32; 3])| {
+                let (a, b) = (project(edge.0)?, project(edge.1)?);
+                ((a[0] - b[0]).hypot(a[1] - b[1]) >= 10.0).then_some((a, b))
+            };
+            let lattice_px: Vec<_> = lattice.iter().copied().filter_map(on_film).collect();
+            let field_px: Vec<_> = field.iter().copied().filter_map(on_film).collect();
+            let (gray, gray_at) = wires_near(&frame, width, &cell.plot, &lattice_px, &[], false);
+            let (amber, amber_at) =
+                wires_near(&frame, width, &cell.plot, &field_px, &lattice_px, true);
+            assert!(
+                gray >= 4,
+                "{name}: bounding box {gray} px, sample {gray_at:?}"
+            );
+            assert!(
+                amber >= 4,
+                "{name}: field bounds {amber} px, sample {amber_at:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_sagittal_dose_sits_inside_its_field_box() {
+        let (nx, ny, nz) = (3usize, 8usize, 16usize);
+        let (hx, hy, hz) = (1usize, 6usize, 2usize);
+        let mut values = vec![0.0f32; nx * ny * nz];
+        values[hx + nx * (hy + ny * hz)] = 8.0;
+        let heat = |cols: u32, rows: u32| Series::Heatmap {
+            values: vec![0.0; (cols * rows) as usize],
+            cols,
+            rows,
+            ramp: 1,
+            color: [1.0; 4],
+            lo: 0.0,
+            hi: 8.0,
+        };
+        let mut scene = line_scene();
+        let mut sagittal = scene.panels[0].clone();
+        sagittal.title = "Sagittal".into();
+        sagittal.xmin = 0.0;
+        sagittal.xmax = ny as f32;
+        sagittal.ymin = 0.0;
+        sagittal.ymax = nz as f32;
+        sagittal.series = vec![heat(ny as u32, nz as u32)];
+        let mut coronal = sagittal.clone();
+        coronal.title = "Coronal".into();
+        coronal.xmin = 0.0;
+        coronal.xmax = nx as f32;
+        coronal.series = vec![heat(nx as u32, nz as u32)];
+        scene.panels = vec![sagittal, coronal];
+        scene.columns = 2;
+        scene.volume = scan_kit_core::VolumeMark {
+            values,
+            shape: [nx as u32, ny as u32, nz as u32],
+            origin: [0.0, 0.0, 0.0],
+            voxel: 1.0,
+            ramp: 1,
+            hi: 8.0,
+            field: [
+                hx as f32,
+                (hx + 1) as f32,
+                hy as f32,
+                (hy + 1) as f32,
+                hz as f32,
+                (hz + 1) as f32,
+            ],
+            ..scan_kit_core::VolumeMark::default()
+        };
+        let mut plot = Plot::new(&scene, [0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0, 1.0]);
+        let (width, height) = (480u32, 320u32);
+        let layout = plot.layout(width, height);
+        let cpu = plot.paint_cpu(width, height, &layout);
+        let device = crate::native_gpu();
+        let gpu = device.as_ref().map(|gpu| {
+            plot.paint_offscreen(gpu, width, height)
+                .expect("dose shader")
+        });
+        let hot = scan_kit_core::sample(1, 1.0).map(|channel| (channel * 255.0).round() as u8);
+        let pixel = |frame: &[u8], x: f32, y: f32| {
+            let x = x.round().clamp(0.0, width as f32 - 1.0) as usize;
+            let y = y.round().clamp(0.0, height as f32 - 1.0) as usize;
+            let index = (y * width as usize + x) * 4;
+            [frame[index], frame[index + 1], frame[index + 2]]
+        };
+        let near = |got: [u8; 3], label: &str| {
+            assert!(
+                got.iter()
+                    .zip(hot)
+                    .all(|(channel, want)| (*channel as i32 - want as i32).abs() <= 8),
+                "{label} {got:?} expect {hot:?}"
+            );
+        };
+        // Off the crosshair, still inside the hot voxel and inside the field box.
+        let sagittal_at = plot.project_data(0, hy as f32 + 0.7, hz as f32 + 0.2, width, height);
+        near(pixel(&cpu, sagittal_at[0], sagittal_at[1]), "cpu sagittal");
+        let coronal_at = plot.project_data(1, hx as f32 + 0.7, hz as f32 + 0.2, width, height);
+        near(pixel(&cpu, coronal_at[0], coronal_at[1]), "cpu coronal");
+        if let Ok(frame) = gpu {
+            near(
+                pixel(&frame, sagittal_at[0], sagittal_at[1]),
+                "gpu sagittal",
+            );
+            near(pixel(&frame, coronal_at[0], coronal_at[1]), "gpu coronal");
+        }
+    }
+
     #[test]
     fn dose_profiles_overlay_each_session_color() {
         let mut scene = line_scene();
@@ -8537,6 +8905,51 @@ mod tests {
         let orange = lines.iter().find(|line| line.color[0] > 0.5).unwrap();
         assert!((blue.a[1].max(blue.b[1]) - 4.0).abs() < 1e-3);
         assert!((orange.a[1].max(orange.b[1]) - 9.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn a_plan_is_dashed_in_the_session_color() {
+        let mut scene = line_scene();
+        scene.panels[0].title = "Depth dose".into();
+        scene.panels[0].series.clear();
+        scene.panels[0].y_label = "Gy".into();
+        let color = [0.1, 0.2, 0.8, 1.0];
+        scene.volume = scan_kit_core::VolumeMark {
+            values: vec![1.0; 8],
+            shape: [1, 1, 8],
+            origin: [0.0; 3],
+            voxel: 1.0,
+            session_colors: vec![color],
+            plans: vec![scan_kit_core::SessionDose {
+                values: vec![2.0; 8],
+                shape: [1, 1, 8],
+                origin: [0.0; 3],
+                voxel: 1.0,
+            }],
+            companions: vec![scan_kit_core::SessionDose {
+                values: vec![3.0; 8],
+                shape: [1, 1, 8],
+                origin: [0.0; 3],
+                voxel: 1.0,
+            }],
+            ..scan_kit_core::VolumeMark::default()
+        };
+        let plot = Plot::new(&scene, [0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0, 1.0]);
+        let lines: Vec<_> = plot
+            .live
+            .iter()
+            .filter(|cloud| cloud.panel == 0)
+            .flat_map(|cloud| cloud.lines.iter())
+            .collect();
+        let full = lines.iter().filter(|line| line.color[3] > 0.9).count();
+        let faded = lines.iter().filter(|line| line.color[3] < 0.7).count();
+        // 7 solid samples, and 5 of the 7 plan samples (3 on, 2 off).
+        assert_eq!(full, 12);
+        assert_eq!(faded, 7);
+        assert!(lines.iter().all(|line| line.color[2] > 0.5));
+        assert!(lines
+            .iter()
+            .all(|line| (line.color[0] - color[0]).abs() < 1e-3));
     }
 
     #[test]

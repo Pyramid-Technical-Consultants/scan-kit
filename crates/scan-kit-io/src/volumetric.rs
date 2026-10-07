@@ -22,12 +22,7 @@ const FALLBACK_KMU: f32 = 2.0e-8;
 const GAP_MM: f32 = 10.0;
 const MC_SEED: u32 = 1;
 
-const XY: &[(&str, &str)] = &[
-    ("ic1", "IC1"),
-    ("ic2", "IC2"),
-    ("iso_ray", "ISO Ray"),
-    ("plan", "Plan"),
-];
+const CHAMBERS: &[(&str, &str)] = &[("independent", "Independent"), ("combined", "Combined")];
 const QUANTITY: &[(&str, &str)] = &[("dose", "Dose"), ("mu", "MU"), ("protons", "Protons")];
 const MODEL: &[(&str, &str)] = &[("analytic", "Analytic"), ("mc", "Monte Carlo")];
 const HISTORIES: &[(&str, &str)] = &[
@@ -80,6 +75,14 @@ const EDGE: &[(&str, &str)] = &[
     ("plan90", "Plan 90%"),
 ];
 
+/// Saved Signal values stay on `xy`. A trajectory bookmark is the combined ray.
+fn chamber_mode(options: &Value) -> &'static str {
+    match options.get("xy").and_then(Value::as_str) {
+        Some("combined" | "Combined" | "iso_ray" | "ISO Ray") => "combined",
+        _ => "independent",
+    }
+}
+
 /// `(fraction, per slice, from the plan)`. Slice edges use each depth's own maximum.
 fn field_edge(kind: &str) -> (f32, bool, bool) {
     match kind {
@@ -94,7 +97,10 @@ fn field_edge(kind: &str) -> (f32, bool, bool) {
 pub(crate) type McRunner<'a> = &'a dyn Fn(&McJob) -> Result<McResult, String>;
 
 struct Cloud {
+    /// Image cube and the solid profile. IC1, or IC2 when IC1 has no spots.
     pencils: Vec<Pencil>,
+    /// The other chamber. Empty for the combined ray, and when only one chamber has spots.
+    companion: Vec<Pencil>,
     plan: Vec<Pencil>,
 }
 
@@ -111,7 +117,7 @@ pub fn volumetric(
     }
     let picked = crate::source::select(crate::source::Shape::Source, true, true, &[], options);
     let grain = picked.grain;
-    let xy = pick(options, "xy", "ic1", XY);
+    let chambers = chamber_mode(options);
     let quantity_id = pick(options, "quantity", "dose", QUANTITY);
     let quantity = match quantity_id {
         "mu" => Quantity::Mu,
@@ -191,7 +197,17 @@ pub fn volumetric(
     .unwrap_or(90.0);
     let clouds: Vec<Cloud> = session_ids
         .iter()
-        .map(|session| load_cloud(root, session, session_ids, grain, xy, plan_sigma, sigma_ref))
+        .map(|session| {
+            load_cloud(
+                root,
+                session,
+                session_ids,
+                grain,
+                chambers,
+                plan_sigma,
+                sigma_ref,
+            )
+        })
         .collect();
     let k_mu = session_ids
         .first()
@@ -206,20 +222,15 @@ pub fn volumetric(
         false,
     );
     let (field_fraction, field_per_slice, field_from_plan) = field_edge(edge);
-    let need_plan = compare != "measured"
-        || plots.contains(&crate::workspace::PlotKind::Gamma)
-        || field_from_plan;
     let all: Vec<Pencil> = clouds
         .iter()
         .flat_map(|cloud| {
-            let measured = cloud.pencils.iter().copied();
-            if need_plan {
-                measured
-                    .chain(cloud.plan.iter().copied())
-                    .collect::<Vec<_>>()
-            } else {
-                measured.collect()
-            }
+            cloud
+                .pencils
+                .iter()
+                .copied()
+                .chain(cloud.companion.iter().copied())
+                .chain(cloud.plan.iter().copied())
         })
         .collect();
     let preview = options
@@ -242,7 +253,27 @@ pub fn volumetric(
     if preview {
         let mut steps = 0;
         while steps < 3 {
-            let Some(next) = next_preview_voxel(voxel_mm, frame.visits) else {
+            // The plan and the second chamber are separate deposits on this grid.
+            // Budget the preview from the heavier one so a matching plan does not
+            // coarsen the cube.
+            let Some(next) = next_preview_voxel(
+                voxel_mm,
+                heaviest_visits(&clouds, frame.visits, |pencils| {
+                    dose_frame(
+                        mat,
+                        pencils,
+                        quantity,
+                        spread,
+                        wet_mm,
+                        phantom_mm,
+                        voxel_mm,
+                        k_mu,
+                        gap_mm,
+                        margin_sigma,
+                    )
+                    .visits
+                }),
+            ) else {
                 break;
             };
             voxel_mm = next;
@@ -266,6 +297,7 @@ pub fn volumetric(
     let planes = lattice_planes(&frame);
 
     let mut measured = Vec::new();
+    let mut companions = Vec::new();
     let mut plans = Vec::new();
     let mut mc_note = None;
     for cloud in &clouds {
@@ -287,10 +319,17 @@ pub fn volumetric(
         );
         mc_note = mc_note.or(ran);
         measured.push(volume);
-        if need_plan {
+        if cloud.companion.is_empty() {
+            companions.push(Volume {
+                origin: [0.0; 3],
+                shape: [0, 0, 0],
+                voxel: 1.0,
+                values: Vec::new(),
+            });
+        } else {
             let (volume, _) = fill(
                 mat,
-                &cloud.plan,
+                &cloud.companion,
                 quantity,
                 spread,
                 wet_mm,
@@ -304,8 +343,25 @@ pub fn volumetric(
                 grid,
                 planes,
             );
-            plans.push(volume);
+            companions.push(volume);
         }
+        let (volume, _) = fill(
+            mat,
+            &cloud.plan,
+            quantity,
+            spread,
+            wet_mm,
+            phantom_mm,
+            k_mu,
+            gap_mm,
+            model,
+            histories,
+            medium_key,
+            mc,
+            grid,
+            planes,
+        );
+        plans.push(volume);
     }
 
     let (dd, dta, cutoff) = gamma_criteria(options);
@@ -482,10 +538,12 @@ pub fn volumetric(
                     depth.y_label = format!("{} · analytic fallback", depth.y_label);
                 }
             }
+            let at = [
+                volume.mm_of(0, ix),
+                volume.mm_of(1, iy),
+                volume.mm_of(2, iz),
+            ];
             if shown.len() > 1 {
-                let focus = &shown[session_at];
-                let (ix, iy, iz) = focus.peak_index();
-                let at = [focus.mm_of(0, ix), focus.mm_of(1, iy), focus.mm_of(2, iz)];
                 let gamma_volumes: Vec<Volume> = gamma_fields
                     .iter()
                     .map(|(volume, _)| volume.clone())
@@ -497,21 +555,31 @@ pub fn volumetric(
                 mark.sessions = shown
                     .iter()
                     .enumerate()
-                    .map(|(index, volume)| scan_kit_core::SessionDose {
-                        values: if index == session_at {
-                            Vec::new()
-                        } else {
-                            volume.values.clone()
-                        },
-                        shape: [
-                            volume.shape[0] as u32,
-                            volume.shape[1] as u32,
-                            volume.shape[2] as u32,
-                        ],
-                        origin: volume.origin,
-                        voxel: volume.voxel,
+                    .map(|(index, volume)| session_dose(volume, index == session_at))
+                    .collect();
+            }
+            if compare == "measured" {
+                mark.plans = plans
+                    .iter()
+                    .map(|volume| session_dose(volume, false))
+                    .collect();
+                mark.companions = companions
+                    .iter()
+                    .map(|volume| session_dose(volume, false))
+                    .collect();
+                let extras: Vec<&Volume> = plans
+                    .iter()
+                    .chain(&companions)
+                    .filter(|volume| {
+                        volume
+                            .values
+                            .iter()
+                            .any(|value| value.is_finite() && *value > 1.0e-8)
                     })
                     .collect();
+                for panel in &mut panels {
+                    crate::workspace::widen_profiles(panel, &extras, at);
+                }
             }
             volume_mark = mark;
             let size = match extent {
@@ -548,40 +616,41 @@ pub fn volumetric(
             .unwrap_or("");
         controls.push(labeled("session", "Session", &refs, chosen).grouped("Dose"));
     }
-    controls.push(labeled("xy", "Signal", XY, xy).grouped("Dose"));
+    controls.push(labeled("xy", "Chambers", CHAMBERS, chambers).grouped("Dose"));
     controls.push(labeled("quantity", "Quantity", QUANTITY, quantity_id).grouped("Dose"));
     controls.push(labeled("compare", "Compare", COMPARE, compare).grouped("Dose"));
-    if xy == "plan" || compare != "measured" {
-        controls.push(labeled("plan_sigma", "Plan σ", SIGMA, plan_sigma).grouped("Dose"));
-        if session_ids.len() > 1 {
-            let pairs: Vec<(String, String)> = session_ids
-                .iter()
-                .map(|id| (id.clone(), id.clone()))
-                .collect();
-            let refs: Vec<(&str, &str)> = pairs
-                .iter()
-                .map(|(a, b)| (a.as_str(), b.as_str()))
-                .collect();
-            let chosen = if refs.iter().any(|(id, _)| *id == sigma_ref) {
-                sigma_ref
-            } else {
-                refs.first().map(|(id, _)| *id).unwrap_or("")
-            };
-            controls.push(labeled("sigma_ref", "Reference", &refs, chosen).grouped("Dose"));
-        }
+    controls.push(labeled("plan_sigma", "Plan σ", SIGMA, plan_sigma).grouped("Dose"));
+    if plan_sigma == "reference" && session_ids.len() > 1 {
+        let pairs: Vec<(String, String)> = session_ids
+            .iter()
+            .map(|id| (id.clone(), id.clone()))
+            .collect();
+        let refs: Vec<(&str, &str)> = pairs
+            .iter()
+            .map(|(a, b)| (a.as_str(), b.as_str()))
+            .collect();
+        let chosen = if refs.iter().any(|(id, _)| *id == sigma_ref) {
+            sigma_ref
+        } else {
+            refs.first().map(|(id, _)| *id).unwrap_or("")
+        };
+        controls.push(labeled("sigma_ref", "Reference", &refs, chosen).grouped("Dose"));
     }
     if has_dose {
-        let raw_spots: usize = clouds.iter().map(|cloud| cloud.pencils.len()).sum();
+        let measured_spots: usize = clouds.iter().map(|cloud| cloud.pencils.len()).sum();
+        let other_spots: usize = clouds.iter().map(|cloud| cloud.companion.len()).sum();
         let plan_spots: usize = clouds.iter().map(|cloud| cloud.plan.len()).sum();
-        let spot_note = if plan_spots == 0 {
-            format!("{raw_spots} · no plan")
+        let weights = match quantity {
+            Quantity::Mu => "plan MU",
+            Quantity::Protons => "protons",
+            Quantity::Dose => "relative",
+        };
+        let spot_note = if other_spots > 0 {
+            format!("{measured_spots} IC1 · {other_spots} IC2 · {plan_spots} plan · {weights}")
+        } else if plan_spots == 0 {
+            format!("{measured_spots} · no plan")
         } else {
-            let weights = match quantity {
-                Quantity::Mu => "plan MU",
-                Quantity::Protons => "protons",
-                Quantity::Dose => "relative",
-            };
-            format!("{raw_spots} measured · {plan_spots} plan · {weights}")
+            format!("{measured_spots} measured · {plan_spots} plan · {weights}")
         };
         controls.push(crate::workspace::readout(
             "Spots", "spots", &spot_note, "Dose",
@@ -952,6 +1021,24 @@ fn lattice_planes(_frame: &scan_kit_core::DoseFrame) -> Option<[usize; 3]> {
     None
 }
 
+fn heaviest_visits(clouds: &[Cloud], combined: u64, visits: impl Fn(&[Pencil]) -> u64) -> u64 {
+    let lists: Vec<&[Pencil]> = clouds
+        .iter()
+        .flat_map(|cloud| {
+            [
+                cloud.pencils.as_slice(),
+                cloud.companion.as_slice(),
+                cloud.plan.as_slice(),
+            ]
+        })
+        .filter(|pencils| !pencils.is_empty())
+        .collect();
+    if lists.len() <= 1 {
+        return combined;
+    }
+    lists.into_iter().map(visits).max().unwrap_or(combined)
+}
+
 /// Coarser spacing for the first picture. A 1 mm lattice of 24 million visits
 /// took 59 ms to deposit in release and 617 ms in debug, and the open waited
 /// for that before any picture. Doubling the spacing cuts the visits by about
@@ -1032,12 +1119,34 @@ fn fill(
     )
 }
 
+fn session_dose(volume: &Volume, blank: bool) -> scan_kit_core::SessionDose {
+    let live = !blank
+        && volume
+            .values
+            .iter()
+            .any(|value| value.is_finite() && *value > 1.0e-8);
+    scan_kit_core::SessionDose {
+        values: if live {
+            volume.values.clone()
+        } else {
+            Vec::new()
+        },
+        shape: [
+            volume.shape[0] as u32,
+            volume.shape[1] as u32,
+            volume.shape[2] as u32,
+        ],
+        origin: volume.origin,
+        voxel: volume.voxel,
+    }
+}
+
 fn load_cloud(
     root: &Path,
     session: &str,
     sessions: &[String],
     grain: &str,
-    xy: &str,
+    chambers: &str,
     plan_sigma: &str,
     sigma_ref: &str,
 ) -> Cloud {
@@ -1049,34 +1158,56 @@ fn load_cloud(
     let energy = col(&table, "energy");
     let n = energy.len();
     let target = col(&table, "target_mu");
-    let dose = col(&table, "ic1_dose");
-    let (mx, my, msx, msy) = match xy {
-        "ic2" => (
-            col(&table, "ic2_x"),
-            col(&table, "ic2_y"),
-            col(&table, "ic2_sig_x"),
-            col(&table, "ic2_sig_y"),
-        ),
-        "iso_ray" => iso_ray(&table),
-        "plan" => (
-            col(&table, "plan_x"),
-            col(&table, "plan_y"),
-            Vec::new(),
-            Vec::new(),
-        ),
-        _ => (
-            or_plan(&table, "ic1_x"),
-            or_plan_y(&table, "ic1_y"),
-            col(&table, "ic1_sig_x"),
-            col(&table, "ic1_sig_y"),
-        ),
-    };
+    let ic1_dose = col(&table, "ic1_dose");
+    let ic2_dose = col(&table, "ic2_dose");
     let xml = devices_xml(root, session);
-    let measured = pencils_from(
-        &energy, &mx, &my, &msx, &msy, &dose, &target, &xml, n, false,
+    let ic1 = pencils_from(
+        &energy,
+        &or_plan(&table, "ic1_x"),
+        &or_plan_y(&table, "ic1_y"),
+        &col(&table, "ic1_sig_x"),
+        &col(&table, "ic1_sig_y"),
+        &ic1_dose,
+        &target,
+        &xml,
+        n,
+        false,
+    );
+    let ic2 = pencils_from(
+        &energy,
+        &col(&table, "ic2_x"),
+        &col(&table, "ic2_y"),
+        &col(&table, "ic2_sig_x"),
+        &col(&table, "ic2_sig_y"),
+        &ic2_dose,
+        &target,
+        &xml,
+        n,
+        false,
+    );
+    let (cx, cy) = iso_positions(&table);
+    let combined = pencils_from(
+        &energy,
+        &cx,
+        &cy,
+        &mean_column(
+            &col(&table, "ic1_sig_x"),
+            &col(&table, "ic2_sig_x"),
+            usable_sigma,
+        ),
+        &mean_column(
+            &col(&table, "ic1_sig_y"),
+            &col(&table, "ic2_sig_y"),
+            usable_sigma,
+        ),
+        &mean_column(&ic1_dose, &ic2_dose, usable_dose),
+        &target,
+        &xml,
+        n,
+        false,
     );
     let donor = if plan_sigma == "reference" {
-        let id = if sessions.iter().any(|s| s == sigma_ref) {
+        let id = if sessions.iter().any(|item| item == sigma_ref) {
             sigma_ref
         } else {
             sessions.first().map(String::as_str).unwrap_or(session)
@@ -1088,7 +1219,18 @@ fn load_cloud(
     let (psx, psy) = if plan_sigma == "interlock" {
         (Vec::new(), Vec::new())
     } else {
-        (col(&donor, "ic1_sig_x"), col(&donor, "ic1_sig_y"))
+        (
+            mean_column(
+                &col(&donor, "ic1_sig_x"),
+                &col(&donor, "ic2_sig_x"),
+                usable_sigma,
+            ),
+            mean_column(
+                &col(&donor, "ic1_sig_y"),
+                &col(&donor, "ic2_sig_y"),
+                usable_sigma,
+            ),
+        )
     };
     let plan = pencils_from(
         &energy,
@@ -1096,14 +1238,48 @@ fn load_cloud(
         &col(&table, "plan_y"),
         &psx,
         &psy,
-        &dose,
+        &ic1_dose,
         &target,
         &xml,
         n,
         plan_sigma == "interlock",
     );
-    let pencils = if xy == "plan" { plan.clone() } else { measured };
-    Cloud { pencils, plan }
+    let (pencils, companion) = if chambers == "combined" {
+        (combined, Vec::new())
+    } else if ic1.is_empty() {
+        (ic2, Vec::new())
+    } else {
+        (ic1, ic2)
+    };
+    Cloud {
+        pencils,
+        companion,
+        plan,
+    }
+}
+
+fn usable_sigma(value: f32) -> bool {
+    value.is_finite() && value > 0.2
+}
+
+fn usable_dose(value: f32) -> bool {
+    value.is_finite() && value > 0.0
+}
+
+fn mean_column(left: &[f32], right: &[f32], keep: fn(f32) -> bool) -> Vec<f32> {
+    let n = left.len().max(right.len());
+    (0..n)
+        .map(|i| {
+            let a = left.get(i).copied().unwrap_or(f32::NAN);
+            let b = right.get(i).copied().unwrap_or(f32::NAN);
+            match (keep(a), keep(b)) {
+                (true, true) => (a + b) * 0.5,
+                (true, false) => a,
+                (false, true) => b,
+                (false, false) => f32::NAN,
+            }
+        })
+        .collect()
 }
 
 fn pencils_from(
@@ -1242,20 +1418,13 @@ fn axis_iso_z(near: &[f32], far: &[f32], plan: &[f32]) -> Option<f32> {
     }
 }
 
-fn iso_ray(
-    table: &std::collections::BTreeMap<String, Vec<f32>>,
-) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
+fn iso_positions(table: &std::collections::BTreeMap<String, Vec<f32>>) -> (Vec<f32>, Vec<f32>) {
     let x2 = col(table, "ic2_x");
     let x1 = col(table, "ic1_x");
     let y2 = col(table, "ic2_y");
     let y1 = col(table, "ic1_y");
     if x1.is_empty() || x2.is_empty() {
-        return (
-            or_plan(table, "ic1_x"),
-            or_plan_y(table, "ic1_y"),
-            col(table, "ic1_sig_x"),
-            col(table, "ic1_sig_y"),
-        );
+        return (or_plan(table, "ic1_x"), or_plan_y(table, "ic1_y"));
     }
     let z = iso_plane_z(table);
     let t = (z - IC2_Z_MM) / IC_SEP_MM;
@@ -1273,26 +1442,7 @@ fn iso_ray(
         .zip(y1.iter().chain(std::iter::repeat(&f32::NAN)))
         .map(|(a, b)| a + t * (b - a))
         .collect();
-    let sx = lerp_sigma(&col(table, "ic2_sig_x"), &col(table, "ic1_sig_x"), t);
-    let sy = lerp_sigma(&col(table, "ic2_sig_y"), &col(table, "ic1_sig_y"), t);
-    (x, y, sx, sy)
-}
-
-fn lerp_sigma(near: &[f32], far: &[f32], t: f32) -> Vec<f32> {
-    let n = near.len().max(far.len());
-    (0..n)
-        .map(|i| {
-            let a = near.get(i).copied().unwrap_or(f32::NAN);
-            let b = far.get(i).copied().unwrap_or(f32::NAN);
-            if a.is_finite() && b.is_finite() {
-                (1.0 - t) * a + t * b
-            } else if a.is_finite() {
-                a
-            } else {
-                b
-            }
-        })
-        .collect()
+    (x, y)
 }
 
 fn or_plan(table: &std::collections::BTreeMap<String, Vec<f32>>, key: &str) -> Vec<f32> {
@@ -1872,6 +2022,113 @@ mod tests {
             Some("radio")
         );
         assert!(mc.controls.iter().all(|control| control.id != "scatter"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn saved_signal_maps_onto_chambers() {
+        assert_eq!(super::chamber_mode(&serde_json::json!({})), "independent");
+        assert_eq!(
+            super::chamber_mode(&serde_json::json!({ "xy": "ic2" })),
+            "independent"
+        );
+        assert_eq!(
+            super::chamber_mode(&serde_json::json!({ "xy": "plan" })),
+            "independent"
+        );
+        assert_eq!(
+            super::chamber_mode(&serde_json::json!({ "xy": "iso_ray" })),
+            "combined"
+        );
+        assert_eq!(
+            super::chamber_mode(&serde_json::json!({ "xy": "Combined" })),
+            "combined"
+        );
+    }
+
+    #[test]
+    fn combined_averages_dose_and_sigma() {
+        let root = std::env::temp_dir().join(format!(
+            "scan-kit-chambers-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let session = root.join("sess");
+        std::fs::create_dir_all(&session).unwrap();
+        std::fs::write(
+            session.join("input_map.csv"),
+            "energy,charge_req,position_x,position_y\n180,1,0,0\n180,1,0,0\n",
+        )
+        .unwrap();
+        std::fs::write(
+            session.join("spot_data.csv"),
+            "ic1_total_dose,ic2_total_dose,ic1_x_spot_position,ic1_y_spot_position,ic2_x_spot_position,ic2_y_spot_position,ic1_x_spot_sigma,ic1_y_spot_sigma,ic2_x_spot_sigma,ic2_y_spot_sigma\n2,4,10,0,0,0,2,2,6,6\n6,10,40,0,20,0,4,4,8,8\n",
+        )
+        .unwrap();
+        let ids = ["sess".to_string()];
+        let independent =
+            super::load_cloud(&root, "sess", &ids, "spot", "independent", "measured", "");
+        let combined = super::load_cloud(&root, "sess", &ids, "spot", "combined", "measured", "");
+        assert_eq!(independent.pencils.len(), 2);
+        assert_eq!(independent.companion.len(), 2);
+        assert_eq!(combined.pencils.len(), 2);
+        assert!(combined.companion.is_empty());
+        assert!((independent.pencils[0].amount - 2.0).abs() < 1e-3);
+        assert!((independent.companion[0].amount - 4.0).abs() < 1e-3);
+        assert!((combined.pencils[0].amount - 3.0).abs() < 1e-3);
+        assert!((combined.pencils[1].amount - 8.0).abs() < 1e-3);
+        let mean = (independent.pencils[0].sx + independent.companion[0].sx) * 0.5;
+        assert!((combined.pencils[0].sx - mean).abs() < 1e-3);
+        assert!((independent.plan[0].sx - mean).abs() < 1e-3);
+        assert!((combined.pencils[0].x - independent.pencils[0].x).abs() > 0.5);
+        let scene = super::volumetric(&root, &ids, &serde_json::json!({}), None);
+        let chambers = scene
+            .controls
+            .iter()
+            .find(|control| control.id == "xy")
+            .unwrap();
+        assert_eq!(chambers.label, "Chambers");
+        assert_eq!(chambers.value, "Independent");
+        assert_eq!(
+            chambers
+                .options
+                .iter()
+                .map(|choice| choice.label.as_str())
+                .collect::<Vec<_>>(),
+            ["Independent", "Combined"]
+        );
+        assert!(scene
+            .controls
+            .iter()
+            .any(|control| control.id == "plan_sigma"));
+        assert!(scene
+            .volume
+            .plans
+            .iter()
+            .any(|dose| !dose.values.is_empty()));
+        assert!(scene
+            .volume
+            .companions
+            .iter()
+            .any(|dose| !dose.values.is_empty()));
+        let ray = super::volumetric(&root, &ids, &serde_json::json!({ "xy": "iso_ray" }), None);
+        assert_eq!(
+            ray.controls
+                .iter()
+                .find(|control| control.id == "xy")
+                .map(|control| control.value.as_str()),
+            Some("Combined")
+        );
+        assert!(ray
+            .volume
+            .companions
+            .iter()
+            .all(|dose| dose.values.is_empty()));
+        assert!(ray.volume.plans.iter().any(|dose| !dose.values.is_empty()));
         let _ = std::fs::remove_dir_all(&root);
     }
 

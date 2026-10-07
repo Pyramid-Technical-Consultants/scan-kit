@@ -133,6 +133,8 @@ const ICONS: Record<string, LucideIcon> = {
   Timeslice: Clock,
   IC1: Zap,
   IC2: Zap,
+  Independent: Columns2,
+  Combined: Layers,
   "ISO Ray": Crosshair,
   Plan: Target,
   Dose: Gauge,

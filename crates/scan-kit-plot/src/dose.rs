@@ -52,6 +52,10 @@ pub struct DoseGrid {
     pub sessions: Vec<Option<Volume>>,
     pub session_colors: Vec<[f32; 4]>,
     pub session_focus: usize,
+    /// Second chamber. `None` skips the line.
+    pub companions: Vec<Option<Volume>>,
+    /// Plan dose. `None` skips the dashed line.
+    pub plans: Vec<Option<Volume>>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -145,6 +149,8 @@ pub fn grid_from(
         sessions: Vec::new(),
         session_colors: Vec::new(),
         session_focus: 0,
+        companions: Vec::new(),
+        plans: Vec::new(),
     })
 }
 

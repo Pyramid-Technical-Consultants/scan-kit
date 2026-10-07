@@ -92,6 +92,10 @@ pub struct PlotHeader {
     #[serde(default)]
     volume_sessions: u32,
     #[serde(default)]
+    volume_plans: u32,
+    #[serde(default)]
+    volume_companions: u32,
+    #[serde(default)]
     volume_session_focus: u32,
     #[serde(default)]
     volume_colors: Vec<[f32; 4]>,
@@ -175,6 +179,8 @@ pub fn encode_plot_reusing(
         volume_ct: !scene.volume.ct.is_empty(),
         volume_labels: !scene.volume.labels.is_empty(),
         volume_sessions: scene.volume.sessions.len() as u32,
+        volume_plans: scene.volume.plans.len() as u32,
+        volume_companions: scene.volume.companions.len() as u32,
         volume_session_focus: scene.volume.session_focus,
         volume_colors: scene.volume.session_colors.clone(),
     };
@@ -210,21 +216,63 @@ pub fn encode_plot_reusing(
             out.extend_from_slice(&scene.volume.labels[..voxels.min(scene.volume.labels.len())]);
         }
     }
-    for session in &scene.volume.sessions {
-        for value in session.shape {
-            out.extend_from_slice(&value.to_le_bytes());
-        }
-        for value in session.origin {
-            out.extend_from_slice(&value.to_le_bytes());
-        }
-        out.extend_from_slice(&session.voxel.to_le_bytes());
-        let count = session.values.len() as u32;
-        out.extend_from_slice(&count.to_le_bytes());
-        for value in &session.values {
-            out.extend_from_slice(&value.to_le_bytes());
-        }
+    for session in scene
+        .volume
+        .sessions
+        .iter()
+        .chain(&scene.volume.plans)
+        .chain(&scene.volume.companions)
+    {
+        write_session(&mut out, session);
     }
     Ok(out)
+}
+
+fn read_sessions(
+    reader: &mut Reader<'_>,
+    count: u32,
+) -> Result<Vec<scan_kit_core::SessionDose>, String> {
+    let mut doses = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        let shape = [
+            u32::from_le_bytes(reader.take(4)?.try_into().unwrap()),
+            u32::from_le_bytes(reader.take(4)?.try_into().unwrap()),
+            u32::from_le_bytes(reader.take(4)?.try_into().unwrap()),
+        ];
+        let origin = [
+            f32::from_le_bytes(reader.take(4)?.try_into().unwrap()),
+            f32::from_le_bytes(reader.take(4)?.try_into().unwrap()),
+            f32::from_le_bytes(reader.take(4)?.try_into().unwrap()),
+        ];
+        let voxel = f32::from_le_bytes(reader.take(4)?.try_into().unwrap());
+        let n = u32::from_le_bytes(reader.take(4)?.try_into().unwrap()) as usize;
+        let mut values = Vec::with_capacity(n);
+        for _ in 0..n {
+            values.push(f32::from_le_bytes(reader.take(4)?.try_into().unwrap()));
+        }
+        doses.push(scan_kit_core::SessionDose {
+            values,
+            shape,
+            origin,
+            voxel,
+        });
+    }
+    Ok(doses)
+}
+
+fn write_session(out: &mut Vec<u8>, session: &scan_kit_core::SessionDose) {
+    for value in session.shape {
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+    for value in session.origin {
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+    out.extend_from_slice(&session.voxel.to_le_bytes());
+    let count = session.values.len() as u32;
+    out.extend_from_slice(&count.to_le_bytes());
+    for value in &session.values {
+        out.extend_from_slice(&value.to_le_bytes());
+    }
 }
 
 pub fn plot_header(bytes: &[u8]) -> Result<PlotHeader, String> {
@@ -317,30 +365,9 @@ pub(crate) fn decode_plot(
             volume.labels = reader.take(voxels)?.to_vec();
         }
     }
-    for _ in 0..header.volume_sessions {
-        let shape = [
-            u32::from_le_bytes(reader.take(4)?.try_into().unwrap()),
-            u32::from_le_bytes(reader.take(4)?.try_into().unwrap()),
-            u32::from_le_bytes(reader.take(4)?.try_into().unwrap()),
-        ];
-        let origin = [
-            f32::from_le_bytes(reader.take(4)?.try_into().unwrap()),
-            f32::from_le_bytes(reader.take(4)?.try_into().unwrap()),
-            f32::from_le_bytes(reader.take(4)?.try_into().unwrap()),
-        ];
-        let voxel = f32::from_le_bytes(reader.take(4)?.try_into().unwrap());
-        let count = u32::from_le_bytes(reader.take(4)?.try_into().unwrap()) as usize;
-        let mut values = Vec::with_capacity(count);
-        for _ in 0..count {
-            values.push(f32::from_le_bytes(reader.take(4)?.try_into().unwrap()));
-        }
-        volume.sessions.push(scan_kit_core::SessionDose {
-            values,
-            shape,
-            origin,
-            voxel,
-        });
-    }
+    volume.sessions = read_sessions(&mut reader, header.volume_sessions)?;
+    volume.plans = read_sessions(&mut reader, header.volume_plans)?;
+    volume.companions = read_sessions(&mut reader, header.volume_companions)?;
     Ok((
         header,
         marks,
@@ -520,12 +547,26 @@ mod tests {
             origin: [1.0, 2.0, 3.0],
             voxel: 2.0,
         }];
+        scene.volume.plans = vec![scan_kit_core::SessionDose {
+            values: vec![7.0],
+            shape: [1, 1, 1],
+            origin: [0.0; 3],
+            voxel: 1.0,
+        }];
+        scene.volume.companions = vec![scan_kit_core::SessionDose {
+            values: vec![8.0],
+            shape: [1, 1, 1],
+            origin: [0.0; 3],
+            voxel: 1.0,
+        }];
         let bytes = encode_plot(&scene, [0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0, 1.0]).unwrap();
         let (_, _, _, volume) = decode_plot(&bytes).unwrap();
         assert!((volume.gantry - 90.0).abs() < 1e-4);
         assert_eq!(volume.session_focus, 1);
         assert_eq!(volume.session_colors, vec![[0.2, 0.3, 0.8, 1.0]]);
         assert_eq!(volume.sessions[0].values, vec![4.0, 5.0]);
+        assert_eq!(volume.plans[0].values, vec![7.0]);
+        assert_eq!(volume.companions[0].values, vec![8.0]);
         assert_eq!(volume.sessions[0].shape, [1, 1, 2]);
         assert!((volume.sessions[0].voxel - 2.0).abs() < 1e-4);
         assert_eq!(volume.unit, "Gy");

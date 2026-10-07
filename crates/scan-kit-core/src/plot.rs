@@ -319,6 +319,13 @@ pub struct VolumeMark {
     /// Which `sessions` entry is the cube shown in the image cells.
     #[serde(default)]
     pub session_focus: u32,
+    /// Plan dose for each session, same order as `sessions` (or one entry when
+    /// the image is the only cube). Empty `values` skips the dashed line.
+    #[serde(default)]
+    pub plans: Vec<SessionDose>,
+    /// The other chamber in independent mode. Empty in the combined calculation.
+    #[serde(default)]
+    pub companions: Vec<SessionDose>,
 }
 
 /// One session cube for the dose line plots. Empty `values` means the main cube.

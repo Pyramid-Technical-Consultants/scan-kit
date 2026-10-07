@@ -162,6 +162,8 @@ pub(crate) fn assemble(space: &Workspace) -> (Vec<Panel>, VolumeMark) {
         sessions: Vec::new(),
         session_colors: Vec::new(),
         session_focus: 0,
+        plans: Vec::new(),
+        companions: Vec::new(),
     };
     (panels, mark)
 }
@@ -555,7 +557,11 @@ fn fit_panel(panel: &mut Panel) {
     panel.ymax = ymax;
 }
 
-fn profile_series(kind: PlotKind, volumes: &[Volume], at: [f32; 3]) -> Vec<Series> {
+fn profile_series<'a>(
+    kind: PlotKind,
+    volumes: impl IntoIterator<Item = &'a Volume>,
+    at: [f32; 3],
+) -> Vec<Series> {
     let mut series = Vec::new();
     for volume in volumes {
         let ix = volume.index_of(0, at[0]);
@@ -609,6 +615,32 @@ fn gamma_lines(volumes: &[Volume]) -> Vec<Series> {
     series
 }
 
+/// Grow a profile's fitted range so a plan or second chamber is not clipped.
+pub(crate) fn widen_profiles(panel: &mut Panel, volumes: &[&Volume], at: [f32; 3]) {
+    if volumes.is_empty() {
+        return;
+    }
+    let title = panel.title.to_ascii_lowercase();
+    let kind = if title.starts_with("depth") {
+        PlotKind::Depth
+    } else if title.starts_with("lateral +") || title.starts_with("lateral+") {
+        PlotKind::Both
+    } else if title.starts_with("lateral") {
+        PlotKind::Lateral
+    } else if title.starts_with("longitudinal") {
+        PlotKind::Longitudinal
+    } else {
+        return;
+    };
+    let mut series = panel.series.clone();
+    series.extend(profile_series(kind, volumes.iter().copied(), at));
+    let (xmin, xmax, ymin, ymax) = span(&series);
+    panel.xmin = xmin;
+    panel.xmax = xmax;
+    panel.ymin = ymin;
+    panel.ymax = ymax;
+}
+
 /// Draw every loaded session on the line plots. Image cells stay on one cube.
 pub(crate) fn overlay_sessions(
     panel: &mut Panel,
@@ -621,16 +653,16 @@ pub(crate) fn overlay_sessions(
     }
     let title = panel.title.to_ascii_lowercase();
     if title.starts_with("depth") {
-        panel.series = profile_series(PlotKind::Depth, volumes, at);
+        panel.series = profile_series(PlotKind::Depth, volumes.iter(), at);
         fit_panel(panel);
     } else if title.starts_with("lateral +") || title.starts_with("lateral+") {
-        panel.series = profile_series(PlotKind::Both, volumes, at);
+        panel.series = profile_series(PlotKind::Both, volumes.iter(), at);
         fit_panel(panel);
     } else if title.starts_with("lateral") {
-        panel.series = profile_series(PlotKind::Lateral, volumes, at);
+        panel.series = profile_series(PlotKind::Lateral, volumes.iter(), at);
         fit_panel(panel);
     } else if title.starts_with("longitudinal") {
-        panel.series = profile_series(PlotKind::Longitudinal, volumes, at);
+        panel.series = profile_series(PlotKind::Longitudinal, volumes.iter(), at);
         fit_panel(panel);
     } else if title.starts_with("dvh") {
         panel.series = volumes.iter().map(dvh_line).collect();
@@ -716,6 +748,37 @@ mod tests {
         overlay_sessions(&mut panel, &[low, high], [0.5, 0.5, 0.5], &[]);
         assert_eq!(panel.series.len(), 2);
         assert!(panel.ymax >= 8.0, "{}", panel.ymax);
+    }
+
+    #[test]
+    fn a_plan_profile_widens_the_depth_axis() {
+        let measured = Volume {
+            origin: [0.0; 3],
+            shape: [1, 1, 2],
+            voxel: 1.0,
+            values: vec![1.0, 3.0],
+        };
+        let plan = Volume {
+            origin: [0.0; 3],
+            shape: [1, 1, 2],
+            voxel: 1.0,
+            values: vec![1.0, 9.0],
+        };
+        let mut panel = Panel {
+            title: "Depth dose".into(),
+            y_label: "Gy".into(),
+            x_label: String::new(),
+            xmin: 0.0,
+            xmax: 1.0,
+            ymin: 0.0,
+            ymax: 3.0,
+            series: vec![line(measured.depth_profile(0, 0))],
+            x_labels: Vec::new(),
+            equal: false,
+        };
+        widen_profiles(&mut panel, &[&plan], [0.5, 0.5, 0.5]);
+        assert!(panel.ymax >= 9.0, "{}", panel.ymax);
+        assert_eq!(panel.series.len(), 1);
     }
 
     #[test]

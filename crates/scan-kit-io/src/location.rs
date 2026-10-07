@@ -883,26 +883,25 @@ fn recorded(library: &str, session_id: &str) -> Option<String> {
         .cloned()
 }
 
+#[cfg(not(windows))]
 fn connect_smb(remote: &Remote) -> Result<PathBuf, String> {
-    #[cfg(not(windows))]
-    {
-        let _ = remote;
-        return Err("an smb URL opens as a Windows UNC path".into());
+    let _ = remote;
+    Err("an smb URL opens as a Windows UNC path".into())
+}
+
+#[cfg(windows)]
+fn connect_smb(remote: &Remote) -> Result<PathBuf, String> {
+    let unc = unc_path(remote)?;
+    let password = password_of(remote);
+    if !password.is_empty() {
+        add_windows_connection(&share_root(remote)?, &remote.username, &password)?;
     }
-    #[cfg(windows)]
-    {
-        let unc = unc_path(remote)?;
-        let password = password_of(remote);
-        if !password.is_empty() {
-            add_windows_connection(&share_root(remote)?, &remote.username, &password)?;
+    match fs::read_dir(&unc) {
+        Ok(_) => Ok(unc),
+        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+            Err(auth_error("the share refused the password"))
         }
-        match fs::read_dir(&unc) {
-            Ok(_) => Ok(unc),
-            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
-                Err(auth_error("the share refused the password"))
-            }
-            Err(_) => Err(format!("{} is not a directory", unc.display())),
-        }
+        Err(_) => Err(format!("{} is not a directory", unc.display())),
     }
 }
 

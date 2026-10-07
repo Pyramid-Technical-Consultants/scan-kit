@@ -191,7 +191,7 @@ function DoseChrome({
             style={{
               left: frame.x / sx,
               top: frame.y / sy,
-              width: (frame.plotX + frame.plotW - frame.x) / sx,
+              width: frame.w / sx,
               height: band,
             }}
           >
