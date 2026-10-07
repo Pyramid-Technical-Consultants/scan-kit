@@ -1015,6 +1015,10 @@ fn build_spot(
     for values in &mask_pos {
         mask_cols.push(*values);
     }
+    // Same row rule as the Python loader: a NaN, -1, or -10000 in sigma drops the spot.
+    for (_, values) in &sigma {
+        mask_cols.push(*values);
+    }
     let keep = keep_mask(&mask_cols, n);
     if !keep.iter().any(|row| *row) {
         return BTreeMap::new();

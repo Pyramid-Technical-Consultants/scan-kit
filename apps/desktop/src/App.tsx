@@ -74,6 +74,7 @@ import {
   MenubarItem,
   MenubarMenu,
   MenubarSeparator,
+  MenubarShortcut,
   MenubarTrigger,
 } from "@/components/ui/menubar";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
@@ -83,6 +84,30 @@ import { ConfigTuning } from "@/ConfigTuning";
 import { PhantomSynthesis } from "@/PhantomSynthesis";
 import { PlanRunner } from "@/PlanRunner";
 import { PlanSynthesis } from "@/PlanSynthesis";
+
+function typingTarget(target: EventTarget | null): boolean {
+  return (
+    target instanceof HTMLElement &&
+    (target.isContentEditable ||
+      target.tagName === "INPUT" ||
+      target.tagName === "TEXTAREA" ||
+      target.tagName === "SELECT")
+  );
+}
+
+function layerOpen(target: EventTarget | null): boolean {
+  if (
+    target instanceof Element &&
+    target.closest("[role='dialog'], [role='menu'], [role='listbox']") != null
+  ) {
+    return true;
+  }
+  return (
+    document.querySelector(
+      "[role='dialog'][data-open], [role='menu'][data-open], [role='listbox'][data-open]",
+    ) != null
+  );
+}
 
 function authenticationRequired(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
@@ -258,6 +283,7 @@ export default function App() {
   usePageLoad(libraryLoading, libraryReport?.done ?? 0, libraryReport?.total ?? 0);
   const libraryToken = useRef<object>({});
   const loadDepth = useRef(0);
+  const noteBusy = useRef(false);
   const pendingLocations = useRef<string[]>([]);
   const selectedIds = selectionOrder;
   const canAnalyze = folder != null && selectedIds.length >= 1 && selectedIds.length <= MAX_SELECTED;
@@ -581,6 +607,88 @@ export default function App() {
     });
   }, []);
 
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (event.defaultPrevented || layerOpen(event.target)) {
+        return;
+      }
+      const key = event.key.toLowerCase();
+      const ctrl = event.ctrlKey;
+      const typing = typingTarget(event.target);
+      if (event.key === "Escape") {
+        if (event.repeat || typing) {
+          return;
+        }
+        event.preventDefault();
+        void getCurrentWindow()
+          .close()
+          .catch((error: unknown) => notifyError(error));
+        return;
+      }
+      if (key === "f5") {
+        if (event.repeat || typing) {
+          return;
+        }
+        event.preventDefault();
+        if (folder != null) {
+          void openLocation(folder);
+        }
+        return;
+      }
+      if (!ctrl || typing) {
+        return;
+      }
+      if (key === "o") {
+        if (event.repeat) {
+          return;
+        }
+        event.preventDefault();
+        void chooseFolder();
+        return;
+      }
+      if (key === "q") {
+        if (event.repeat) {
+          return;
+        }
+        event.preventDefault();
+        void getCurrentWindow()
+          .close()
+          .catch((error: unknown) => notifyError(error));
+        return;
+      }
+      if (key === "1" && !event.shiftKey) {
+        if (!event.repeat) {
+          selectTab("Data Analysis");
+        }
+        event.preventDefault();
+        return;
+      }
+      if (key === "6") {
+        if (!event.repeat) {
+          selectTab("Debug");
+        }
+        event.preventDefault();
+        return;
+      }
+      if (key === "z" && event.shiftKey) {
+        redoNote();
+        event.preventDefault();
+        return;
+      }
+      if (key === "y") {
+        redoNote();
+        event.preventDefault();
+        return;
+      }
+      if (key === "z") {
+        undoNote();
+        event.preventDefault();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  });
+
   const openAnalysis = useCallback(
     (name: string) => {
       const id = analysisId(name);
@@ -698,6 +806,40 @@ export default function App() {
     await writeNote(edit.sessionId, note);
   }
 
+  function undoNote() {
+    const edit = undo[undo.length - 1];
+    if (edit == null || noteBusy.current) {
+      return;
+    }
+    noteBusy.current = true;
+    void applyNote(edit, edit.before)
+      .then(() => {
+        setUndo((stack) => stack.slice(0, -1));
+        setRedo((stack) => [...stack, edit]);
+      })
+      .catch((error: unknown) => notifyError(error))
+      .finally(() => {
+        noteBusy.current = false;
+      });
+  }
+
+  function redoNote() {
+    const edit = redo[redo.length - 1];
+    if (edit == null || noteBusy.current) {
+      return;
+    }
+    noteBusy.current = true;
+    void applyNote(edit, edit.after)
+      .then(() => {
+        setRedo((stack) => stack.slice(0, -1));
+        setUndo((stack) => [...stack, edit]);
+      })
+      .catch((error: unknown) => notifyError(error))
+      .finally(() => {
+        noteBusy.current = false;
+      });
+  }
+
   return (
     <div className="relative flex h-full min-h-0 flex-col overflow-hidden bg-background text-foreground">
       <Tabs
@@ -720,6 +862,7 @@ export default function App() {
             <MenubarItem className="whitespace-nowrap" onClick={() => void chooseFolder()}>
               <FolderOpen />
               Open Data Folder
+              <MenubarShortcut>Ctrl+O</MenubarShortcut>
             </MenubarItem>
             <MenubarItem
               className="whitespace-nowrap"
@@ -732,6 +875,7 @@ export default function App() {
             >
               <RefreshCw />
               Refresh Sessions
+              <MenubarShortcut>F5</MenubarShortcut>
             </MenubarItem>
             <MenubarSeparator />
             <MenubarItem
@@ -744,6 +888,7 @@ export default function App() {
             >
               <LogOut />
               Exit
+              <MenubarShortcut>Ctrl+Q</MenubarShortcut>
             </MenubarItem>
           </MenubarContent>
         </MenubarMenu>
@@ -753,41 +898,15 @@ export default function App() {
             Edit
           </MenubarTrigger>
           <MenubarContent className="w-max">
-            <MenubarItem
-              disabled={undo.length === 0}
-              onClick={() => {
-                const edit = undo[undo.length - 1];
-                if (edit == null) {
-                  return;
-                }
-                void applyNote(edit, edit.before)
-                  .then(() => {
-                    setUndo((stack) => stack.slice(0, -1));
-                    setRedo((stack) => [...stack, edit]);
-                  })
-                  .catch((error: unknown) => notifyError(error));
-              }}
-            >
+            <MenubarItem disabled={undo.length === 0} onClick={undoNote}>
               <Undo2 />
               Undo
+              <MenubarShortcut>Ctrl+Z</MenubarShortcut>
             </MenubarItem>
-            <MenubarItem
-              disabled={redo.length === 0}
-              onClick={() => {
-                const edit = redo[redo.length - 1];
-                if (edit == null) {
-                  return;
-                }
-                void applyNote(edit, edit.after)
-                  .then(() => {
-                    setRedo((stack) => stack.slice(0, -1));
-                    setUndo((stack) => [...stack, edit]);
-                  })
-                  .catch((error: unknown) => notifyError(error));
-              }}
-            >
+            <MenubarItem disabled={redo.length === 0} onClick={redoNote}>
               <Redo2 />
               Redo
+              <MenubarShortcut>Ctrl+Y</MenubarShortcut>
             </MenubarItem>
           </MenubarContent>
         </MenubarMenu>
@@ -810,6 +929,8 @@ export default function App() {
               >
                 <TabIcon name={name} />
                 {name}
+                {name === "Data Analysis" ? <MenubarShortcut>Ctrl+1</MenubarShortcut> : null}
+                {name === "Debug" ? <MenubarShortcut>Ctrl+6</MenubarShortcut> : null}
               </MenubarCheckboxItem>
             ))}
           </MenubarContent>

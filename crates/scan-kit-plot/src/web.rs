@@ -128,6 +128,13 @@ impl WebPlot {
         Ok(())
     }
 
+    /// Height of the dose toolbar, in framebuffer pixels. The picture starts below it.
+    pub fn set_chrome(&mut self, px: f32) {
+        if let Some(plot) = self.plot.as_mut() {
+            plot.set_chrome(px);
+        }
+    }
+
     /// Canvas backing size in device pixels.
     pub fn resize(&mut self, width: u32, height: u32) {
         let limit = self
@@ -146,13 +153,15 @@ impl WebPlot {
         self.input(PlotInput::default());
     }
 
-    pub fn pan(&mut self, x: f32, y: f32, dx: f32, dy: f32) {
+    pub fn pan(&mut self, x: f32, y: f32, dx: f32, dy: f32, buttons: u32, shift: bool) {
         self.input(PlotInput {
             x,
             y,
             dx,
             dy,
             drag: true,
+            buttons: buttons as u8,
+            shift,
             ..PlotInput::default()
         });
     }
@@ -175,6 +184,13 @@ impl WebPlot {
                 plot.frames_json(width, height)
             })
             .unwrap_or_else(|| "[]".into())
+    }
+
+    /// Blender numpad view for the dose turntable. `true` when the key was used.
+    pub fn dose_key(&mut self, key: &str, ctrl: bool) -> bool {
+        self.plot
+            .as_mut()
+            .is_some_and(|plot| plot.dose_key(key, ctrl))
     }
 
     /// `rotate` turns a slice. `integral` sums through its plane or along a profile.

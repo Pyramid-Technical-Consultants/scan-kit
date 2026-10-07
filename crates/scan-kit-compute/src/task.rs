@@ -306,6 +306,14 @@ fn held_lines(options: &Value) -> Option<&str> {
         .filter(|text| !text.is_empty())
 }
 
+fn requested_voxel(options: &Value) -> f32 {
+    options
+        .get("voxel")
+        .and_then(Value::as_str)
+        .and_then(|text| text.parse().ok())
+        .unwrap_or(1.0)
+}
+
 fn report_at(phase: Phase, done: usize, total: usize) -> Report {
     Report {
         task: 0,
@@ -343,6 +351,9 @@ struct SessionStage {
     plan: Vec<SessionPlan>,
     /// Windows of 4096 rows to pull into the next picture. Doubles after a timed poll.
     blocks: u32,
+    /// 0 until a volumetric picture has been published. Later deposits stay on
+    /// that preview spacing. A heavy field finishes on the coarser cube.
+    lattice: u8,
     report: Report,
 }
 
@@ -388,6 +399,7 @@ impl SessionStage {
             loaded: 0,
             plan: Vec::new(),
             blocks: 1,
+            lattice: 0,
             report: report_at(Phase::Chrome, 0, sessions.len()),
         }
     }
@@ -472,13 +484,31 @@ impl SessionStage {
     }
 
     fn load_scene(&self, ids: &[String]) -> Result<PlotScene, String> {
+        // ponytail: interactive volumetric stays on the preview spacing (2–4 mm
+        // when a 1 mm lattice is heavy). The finer grid is what the view pools
+        // back down, so a second deposit does not change the picture. A drain
+        // (`lattice` still 0) still uses the requested spacing.
+        self.open_scene(ids, self.view == "volumetric" && self.lattice == 1)
+    }
+
+    fn open_scene(&self, ids: &[String], preview: bool) -> Result<PlotScene, String> {
         let mut scene = if self.view == "volumetric" {
-            scan_kit_io::volumetric::volumetric(&self.root, ids, &self.options, None)
+            if preview {
+                let mut options = self.options.clone();
+                options["_preview"] = Value::Bool(true);
+                scan_kit_io::volumetric::volumetric(&self.root, ids, &options, None)
+            } else {
+                scan_kit_io::volumetric::volumetric(&self.root, ids, &self.options, None)
+            }
         } else {
             scan_kit_io::analysis_scene(&self.view, &self.root, ids, &self.options)?
         };
         apply_palette(&mut scene, &self.palette);
         Ok(scene)
+    }
+
+    fn coarse_preview(&self, scene: &PlotScene) -> bool {
+        scene.volume.values.len() > 1 && scene.volume.voxel > requested_voxel(&self.options) + 0.05
     }
 
     fn pack(&self, scene: &PlotScene, partial: bool) -> Result<Vec<u8>, String> {
@@ -494,6 +524,35 @@ impl SessionStage {
 
     fn encode(&self, ids: &[String], partial: bool) -> Result<Vec<u8>, String> {
         self.pack(&self.load_scene(ids)?, partial)
+    }
+
+    fn publish_volume_preview(&mut self) -> Poll<Vec<u8>> {
+        self.lattice = 1;
+        let ids = self.sessions.clone();
+        let scene = match self.open_scene(&ids, true) {
+            Ok(scene) => scene,
+            Err(message) => {
+                self.report.phase = Phase::Failed;
+                self.report.note = message.clone();
+                return Poll::Failed(message);
+            }
+        };
+        // The preview spacing is the finished picture. Reporting it as 1 of 2
+        // left the hairline at 50% for a second deposit the view does not show.
+        match self.pack(&scene, false) {
+            Ok(bytes) => {
+                remember_stamps(&self.stamps);
+                self.loaded = self.sessions.len();
+                let total = self.sessions.len();
+                self.report = report_at(Phase::Done, total, total);
+                Poll::Ready(bytes)
+            }
+            Err(message) => {
+                self.report.phase = Phase::Failed;
+                self.report.note = message.clone();
+                Poll::Failed(message)
+            }
+        }
     }
 }
 
@@ -521,6 +580,9 @@ impl Stage for SessionStage {
                     Poll::Failed(message)
                 }
             };
+        }
+        if self.cached && self.view == "volumetric" && !unlimited && self.lattice == 0 {
+            return self.publish_volume_preview();
         }
         if unlimited || self.cached {
             self.loaded = total;
@@ -594,7 +656,15 @@ impl Stage for SessionStage {
             scan_kit_io::SliceTake::Spot { rows }
         };
         scan_kit_io::bind_slice(&session.id, take);
-        let scene = self.load_scene(&ids);
+        let preview = self.view == "volumetric" && self.lattice == 0 && !unlimited;
+        if preview {
+            self.lattice = 1;
+        }
+        let scene = if preview {
+            self.open_scene(&ids, true)
+        } else {
+            self.load_scene(&ids)
+        };
         let tail_done = scan_kit_io::slice_tail_done();
         scan_kit_io::clear_slice();
         self.settle(at, tail_done);
@@ -606,6 +676,29 @@ impl Stage for SessionStage {
                 return Poll::Failed(message);
             }
         };
+        // A coarse cube of a file that is still coming in. File progress, not
+        // 1 of 2: the rest of the task stays on this spacing and finishes there.
+        if preview && self.coarse_preview(&scene) && self.done_units() < self.units() {
+            return match self.pack(&scene, true) {
+                Ok(bytes) => {
+                    let phase = if self.loaded <= 1 {
+                        Phase::Parse
+                    } else {
+                        Phase::Scene
+                    };
+                    self.report = report_at(phase, self.done_units(), self.units().max(1));
+                    Poll::Pending {
+                        report: self.report.clone(),
+                        preview: Some(bytes),
+                    }
+                }
+                Err(message) => {
+                    self.report.phase = Phase::Failed;
+                    self.report.note = message.clone();
+                    Poll::Failed(message)
+                }
+            };
+        }
         if self.done_units() >= self.units() && tail_done {
             return match self.pack(&scene, false) {
                 Ok(bytes) => {
@@ -1224,6 +1317,93 @@ mod tests {
             "ic1_total_dose,ic2_total_dose,position_x,position_y\n1,1,0,0\n2,2,4,1\n",
         )
         .unwrap();
+    }
+
+    #[test]
+    fn a_small_volume_opens_as_the_final_picture() {
+        let root = scratch();
+        write_session(&root, "sess");
+        let mut stage = SessionStage::new(
+            "volumetric",
+            &root,
+            &["sess".into()],
+            &json!({}),
+            [0.1, 0.1, 0.1, 1.0],
+            [0.9, 0.9, 0.9, 1.0],
+            &[[0.2, 0.4, 0.8, 1.0]],
+        );
+        let cancel = Cancel::new();
+        match stage.poll(Duration::from_millis(12), &cancel) {
+            Poll::Ready(bytes) => {
+                let header = scan_kit_plot::plot_header(&bytes).unwrap();
+                assert_eq!(header.quality, "final");
+                assert_eq!(header.title, "Volumetric");
+            }
+            Poll::Pending { .. } => panic!("a two-spot field should not wait on a coarser cube"),
+            Poll::Failed(message) => panic!("{message}"),
+            Poll::Cancelled => panic!("cancelled"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_heavy_volume_finishes_on_the_coarse_cube() {
+        let root = scratch();
+        let session = root.join("sess");
+        std::fs::create_dir_all(&session).unwrap();
+        let mut map = String::from("energy,charge_req,position_x,position_y\n");
+        let mut spots = String::from("ic1_total_dose,ic2_total_dose,position_x,position_y\n");
+        for i in 0..40 {
+            let x = i * 5;
+            map.push_str(&format!("180,0.05,{x},0\n"));
+            spots.push_str(&format!("0.05,0.05,{x},0\n"));
+        }
+        std::fs::write(session.join("input_map.csv"), map).unwrap();
+        std::fs::write(session.join("spot_data.csv"), spots).unwrap();
+        let mut stage = SessionStage::new(
+            "volumetric",
+            &root,
+            &["sess".into()],
+            &json!({}),
+            [0.1, 0.1, 0.1, 1.0],
+            [0.9, 0.9, 0.9, 1.0],
+            &[[0.2, 0.4, 0.8, 1.0]],
+        );
+        let cancel = Cancel::new();
+        match stage.poll(Duration::from_millis(12), &cancel) {
+            Poll::Ready(bytes) => {
+                let header = scan_kit_plot::plot_header(&bytes).unwrap();
+                assert_eq!(header.quality, "final");
+                assert_eq!(stage.report.done, stage.report.total);
+            }
+            Poll::Pending { report, .. } => {
+                panic!("stuck at {}/{}", report.done, report.total)
+            }
+            Poll::Failed(message) => panic!("{message}"),
+            Poll::Cancelled => panic!("cancelled"),
+        }
+        let mut again = SessionStage::new(
+            "volumetric",
+            &root,
+            &["sess".into()],
+            &json!({}),
+            [0.1, 0.1, 0.1, 1.0],
+            [0.9, 0.9, 0.9, 1.0],
+            &[[0.2, 0.4, 0.8, 1.0]],
+        );
+        assert!(again.cached);
+        match again.poll(Duration::from_millis(12), &cancel) {
+            Poll::Ready(bytes) => {
+                let header = scan_kit_plot::plot_header(&bytes).unwrap();
+                assert_eq!(header.quality, "final");
+            }
+            Poll::Pending { report, .. } => {
+                panic!("reopen stuck at {}/{}", report.done, report.total)
+            }
+            Poll::Failed(message) => panic!("{message}"),
+            Poll::Cancelled => panic!("cancelled"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     fn session_stage(root: &Path, sessions: &[&str]) -> SessionStage {

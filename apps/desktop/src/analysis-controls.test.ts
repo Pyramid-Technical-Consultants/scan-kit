@@ -1,4 +1,4 @@
-import { ChartColumn, Columns2, LayoutGrid } from "lucide-react";
+import { ChartColumn, Columns2, LayoutGrid, Box, RectangleHorizontal, RectangleVertical, Square } from "lucide-react";
 import { expect, it } from "vitest";
 
 import {
@@ -97,6 +97,11 @@ it("keeps a joined button row for two or three short names", () => {
   expect(optionIcon("Own")).toBe(ChartColumn);
   expect(optionIcon("Plot")).toBe(Columns2);
   expect(optionIcon("Page")).toBe(LayoutGrid);
+  expect(optionIcon("axial")).toBe(Square);
+  expect(optionIcon("coronal")).toBe(RectangleHorizontal);
+  expect(optionIcon("sagittal")).toBe(RectangleVertical);
+  expect(optionIcon("volume")).toBe(Box);
+  expect(optionIcon("3D")).toBe(Box);
   expect(
     segmentChoices([
       { label: "Spot", detail: "One row per spot" },
@@ -149,44 +154,53 @@ it("keeps distribution checks in Data Source after the axes", () => {
   expect(controlSections([{ id: "y", group: "Data Source" }])[0]?.title).toBe("Data Source");
 });
 
+it("keeps a goals note as a text field", () => {
+  expect(controlSections([{ id: "goals", kind: "text", group: "Goals" }])).toEqual([
+    { title: "Goals", slots: [{ id: "goals", kind: "text" }] },
+  ]);
+});
+
 it("uses one Options group when the control names no fieldset", () => {
   expect(controlSections([{ id: "calibrate", kind: "select" }])).toEqual([
     { title: "Options", slots: [{ id: "calibrate", kind: "select" }] },
   ]);
 });
 
-it("groups dose volume into source, model, phantom, compare, and color", () => {
+it("groups dose volume by the order a user sets it up", () => {
   const sections = controlSections([
-    { id: "source", group: "Data Source" },
-    { id: "xy", group: "Data Source" },
-    { id: "quantity", group: "Data Source" },
-    { id: "plan_sigma", group: "Data Source" },
-    { id: "model", group: "Model" },
-    { id: "scatter", group: "Model" },
-    { id: "spread", group: "Model" },
+    { id: "source", group: "Dose" },
+    { id: "xy", group: "Dose" },
+    { id: "quantity", group: "Dose" },
+    { id: "compare", group: "Dose" },
+    { id: "model", group: "Calculation", kind: "radio" },
+    { id: "histories", group: "Calculation", kind: "radio" },
+    { id: "spread", group: "Calculation" },
     { id: "medium", group: "Phantom" },
     { id: "phantom", group: "Phantom" },
     { id: "wet", group: "Phantom" },
-    { id: "compare", group: "Compare" },
-    { id: "edge", group: "Compare" },
-    { id: "scale", group: "Color" },
+    { id: "edge", group: "Field" },
+    { id: "field", group: "Field", kind: "check" },
+    { id: "ray", group: "Picture" },
+    { id: "scale", group: "Picture" },
+    { id: "level", group: "Picture", kind: "range" },
   ]);
   expect(sections.map((section) => section.title)).toEqual([
-    "Data Source",
-    "Model",
+    "Dose",
+    "Calculation",
     "Phantom",
-    "Compare",
-    "Color",
+    "Field",
+    "Picture",
   ]);
-  expect(sections[0]?.slots.map((slot) => slot.id)).toEqual([
-    "source",
-    "xy",
-    "quantity",
-    "plan_sigma",
+  expect(sections[0]?.slots.map((slot) => slot.id)).toEqual(["source", "xy", "quantity", "compare"]);
+  expect(sections[1]?.slots.map((slot) => slot.id)).toEqual(["model", "histories", "spread"]);
+  expect(sections[1]?.slots.filter((slot) => slot.kind === "radio").map((slot) => slot.id)).toEqual([
+    "model",
+    "histories",
   ]);
-  expect(sections[4]?.slots.map((slot) => slot.id)).toEqual(["scale"]);
-  const withCt = controlSections([{ id: "fraction", group: "Patient" }]);
-  expect(withCt.map((section) => section.title)).toEqual(["Patient"]);
+  expect(sections[4]?.slots.map((slot) => slot.id)).toEqual(["ray", "scale", "level"]);
+  expect(sections[4]?.slots.find((slot) => slot.id === "level")?.kind).toBe("range");
+  const withCt = controlSections([{ id: "fraction", group: "Study" }]);
+  expect(withCt.map((section) => section.title)).toEqual(["Study"]);
 });
 
 it("remembers the axes picked on spot and on timeslice", () => {
@@ -274,19 +288,6 @@ it("adds a missing segment and drops one by index", () => {
   const text = segmentsText(removeSegment(both, 0));
   expect(parseSegments(text)).toEqual([{ kind: "rank", which: "all" }]);
   expect(parseSegments("nope")).toBeNull();
-});
-
-it("a volumetric preset writes the shared options and returns to custom", () => {
-  const next = applyOption({}, {}, {}, "preset", "Gamma");
-  expect(next.preset).toBe("Custom");
-  expect(next.compare).toBe("Gamma");
-  expect(next.dd).toBe("3%");
-  expect(next.dta).toBe("2 mm");
-  expect(next.cutoff).toBe("10%");
-  const measured = applyOption({}, {}, {}, "preset", "Measured dose");
-  expect(measured.compare).toBe("Measured");
-  expect(measured.model).toBe("Analytic");
-  expect(applyOption({ compare: "Gamma" }, {}, {}, "preset", "Custom").compare).toBe("Gamma");
 });
 
 it("leaves X bins available for every axis and glyph", () => {

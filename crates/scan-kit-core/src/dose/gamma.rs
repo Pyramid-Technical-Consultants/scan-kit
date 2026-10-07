@@ -94,14 +94,76 @@ pub fn gamma_index(
         return (gamma, 0, 0);
     }
     let offsets = gamma_offsets(spacing, distance_mm.max(1e-3), cap);
-    let mut best = vec![cap * cap; len];
-    let mut worst = cap * cap;
-    for offset in &offsets {
+    let cap2 = cap * cap;
+    let scores = score_mask(reference, evaluated, shape, &mask, &offsets, dd, cap2);
+    let mut passed = 0u32;
+    for (&(_, _, _, i), g2) in mask.iter().zip(scores) {
+        let g = g2.sqrt();
+        gamma[i] = g;
+        if g <= 1.0 {
+            passed += 1;
+        }
+    }
+    (gamma, passed, mask.len() as u32)
+}
+
+/// γ² at each masked voxel. Bands own disjoint voxels, so a large field still
+/// searches the whole box instead of three planes.
+fn score_mask(
+    reference: &[f32],
+    evaluated: &[f32],
+    shape: [usize; 3],
+    mask: &[(usize, usize, usize, usize)],
+    offsets: &[[f32; 4]],
+    dd: f32,
+    cap2: f32,
+) -> Vec<f32> {
+    let workers = std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(1)
+        .clamp(1, 8);
+    let bands = if mask.len() < 2_048 || workers == 1 {
+        1
+    } else {
+        workers.min(mask.len() / 512).max(1)
+    };
+    if bands == 1 {
+        return score_chunk(reference, evaluated, shape, mask, offsets, dd, cap2);
+    }
+    let chunk = mask.len().div_ceil(bands);
+    std::thread::scope(|scope| {
+        let mut joins = Vec::new();
+        for band in mask.chunks(chunk) {
+            joins.push(
+                scope.spawn(move || {
+                    score_chunk(reference, evaluated, shape, band, offsets, dd, cap2)
+                }),
+            );
+        }
+        joins
+            .into_iter()
+            .flat_map(|join| join.join().expect("gamma band"))
+            .collect()
+    })
+}
+
+fn score_chunk(
+    reference: &[f32],
+    evaluated: &[f32],
+    shape: [usize; 3],
+    mask: &[(usize, usize, usize, usize)],
+    offsets: &[[f32; 4]],
+    dd: f32,
+    cap2: f32,
+) -> Vec<f32> {
+    let mut best = vec![cap2; mask.len()];
+    let mut worst = cap2;
+    for offset in offsets {
         if offset[3] >= worst {
             break;
         }
         let mut next = 0.0f32;
-        for &(x, y, z, i) in &mask {
+        for (slot, &(x, y, z, i)) in mask.iter().enumerate() {
             let sample = sample_linear(
                 evaluated,
                 shape,
@@ -111,22 +173,14 @@ pub fn gamma_index(
             );
             let dose = (sample - reference[i]) / dd;
             let g2 = offset[3] + dose * dose;
-            if g2 < best[i] {
-                best[i] = g2;
+            if g2 < best[slot] {
+                best[slot] = g2;
             }
-            next = next.max(best[i]);
+            next = next.max(best[slot]);
         }
         worst = next;
     }
-    let mut passed = 0u32;
-    for &(_, _, _, i) in &mask {
-        let g = best[i].sqrt();
-        gamma[i] = g;
-        if g <= 1.0 {
-            passed += 1;
-        }
-    }
-    (gamma, passed, mask.len() as u32)
+    best
 }
 
 pub(super) fn gamma_offsets(spacing: [f32; 3], dta: f32, cap: f32) -> Vec<[f32; 4]> {
@@ -190,4 +244,43 @@ pub(super) fn sample_linear(vol: &[f32], shape: [usize; 3], x: f32, y: f32, z: f
         }
     }
     acc
+}
+
+#[cfg(test)]
+mod tests {
+    use super::gamma_index;
+
+    #[test]
+    fn a_shift_along_depth_within_dta_passes() {
+        let n = 5usize;
+        let shape = [n, n, n];
+        let mut reference = vec![0.0f32; n * n * n];
+        let mut evaluated = vec![0.0f32; n * n * n];
+        let center = 2 + n * (2 + n * 2);
+        let deeper = 2 + n * (2 + n * 4);
+        reference[center] = 1.0;
+        evaluated[deeper] = 1.0;
+        let (gamma, passed, scored) = gamma_index(
+            &reference,
+            &evaluated,
+            shape,
+            3.0,
+            2.0,
+            [1.0, 1.0, 1.0],
+            10.0,
+        );
+        assert_eq!((scored, passed), (1, 1));
+        assert!((gamma[center] - 1.0).abs() < 1e-3, "{}", gamma[center]);
+    }
+
+    #[test]
+    fn a_wide_match_scores_every_voxel() {
+        let shape = [32usize, 32, 4];
+        let n = shape[0] * shape[1] * shape[2];
+        let dose = vec![1.0f32; n];
+        let (gamma, passed, scored) =
+            gamma_index(&dose, &dose, shape, 3.0, 2.0, [1.0, 1.0, 1.0], 10.0);
+        assert_eq!((scored, passed), (n as u32, n as u32));
+        assert!(gamma.iter().all(|value| *value <= 1e-4));
+    }
 }

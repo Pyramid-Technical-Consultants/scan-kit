@@ -1,13 +1,14 @@
-//! Dose workspace sampling. The volume is uploaded once as an atlas. Slice and
-//! 3D cells read that atlas, so paging, rotation, and orbit do not build a new one.
+//! Dose workspace sampling. Slices read an atlas uploaded once. The 3D cell
+//! marches the float volume, so paging and orbit do not build a new grid.
 //!
 //! Atlas: z slices in a square of tiles, row 0 of a slice at the bottom of its
 //! tile. The last texture row is the color scale, 256 entries. Voxel R is
-//! dose/peak, G is the CT window, B is 1 when a CT sample is present.
+//! `0.5 + 0.5 * dose/span` (zero at mid-grey). G is the CT window, B is 1 when
+//! a CT sample is present.
 
 #[cfg(not(target_arch = "wasm32"))]
-use scan_kit_core::ray_value;
-use scan_kit_core::{sample, Volume};
+use scan_kit_core::{ray_rgba, RayView};
+use scan_kit_core::{sample, scan_volume, Volume};
 
 /// Display state copied from the scene. The plot owns it after the upload.
 #[derive(Clone, Debug)]
@@ -16,6 +17,8 @@ pub struct DoseGrid {
     pub ct: Vec<f32>,
     pub labels: Vec<u8>,
     pub peak: f32,
+    /// Max |dose|. Slice texels store `0.5 + 0.5 * dose/span`, so a difference keeps its sign.
+    pub span: f32,
     pub ramp: u8,
     pub lo: f32,
     pub hi: f32,
@@ -26,6 +29,20 @@ pub struct DoseGrid {
     /// 0 nearest, 1 linear, 2 cubic.
     pub filter: u8,
     pub atlas_shape: [usize; 3],
+    /// Dilated max-|dose| bricks. A zero is safe to leap in the 3D march.
+    pub bricks: Vec<f32>,
+    pub brick_shape: [usize; 3],
+    /// Brightest axis-aligned line integral, dose × mm.
+    pub line_scale: f32,
+    pub peak_at: [usize; 3],
+    /// Axial, coronal, and sagittal integrals in dose × mm.
+    pub integrals: [Vec<f32>; 3],
+    pub integral_peaks: [f32; 3],
+    /// Degrees about +X. Zero keeps the lattice box.
+    pub gantry: f32,
+    pub unit: String,
+    pub show_phantom: bool,
+    pub field: [f32; 6],
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -37,6 +54,12 @@ pub struct ViewSample {
     pub integral: bool,
     pub azimuth: f32,
     pub elevation: f32,
+    pub zoom: f32,
+    pub aspect: f32,
+    /// Brightest integrate ray. Zero keeps the axis line scale.
+    pub ray_scale: f32,
+    pub fov: f32,
+    pub center: [f32; 3],
 }
 
 pub fn grid_from(
@@ -59,21 +82,30 @@ pub fn grid_from(
     if n == 0 || values.len() < n {
         return None;
     }
-    let peak = values
-        .iter()
-        .take(n)
-        .copied()
-        .fold(0.0f32, f32::max)
-        .max(1e-6);
+    let mut values = values;
+    values.truncate(n);
     let volume = Volume {
         origin,
         shape: shape_us,
         voxel: voxel.max(1e-3),
-        values: values[..n].to_vec(),
+        values,
     };
+    let scan = scan_volume(&volume);
+    let span = volume
+        .values
+        .iter()
+        .copied()
+        .fold(0.0f32, |best, value| best.max(value.abs()))
+        .max(1e-6);
     Some(DoseGrid {
         atlas_shape: fit_shape(shape_us),
         volume,
+        bricks: scan.bricks,
+        brick_shape: scan.brick_shape,
+        line_scale: scan.line_scale,
+        peak_at: scan.peak_at,
+        integrals: scan.integrals,
+        integral_peaks: scan.integral_peaks,
         ct: if ct.len() >= n {
             ct[..n].to_vec()
         } else {
@@ -84,7 +116,8 @@ pub fn grid_from(
         } else {
             Vec::new()
         },
-        peak,
+        peak: scan.peak.max(1e-6),
+        span,
         ramp,
         lo,
         hi,
@@ -92,6 +125,10 @@ pub fn grid_from(
         opacity,
         mode,
         filter,
+        gantry: 0.0,
+        unit: String::new(),
+        show_phantom: false,
+        field: [0.0; 6],
     })
 }
 
@@ -124,32 +161,25 @@ pub fn atlas_bytes(grid: &DoseGrid) -> (Vec<u8>, u32, u32) {
     let height = tiles_y.saturating_mul(ny) + 1;
     let mut pixels = vec![0u8; width * height * 4];
     let [fx, fy, fz] = grid.volume.shape;
-    for z in 0..nz {
-        let tx = z % tiles;
-        let ty = z / tiles;
-        for y in 0..ny {
-            for x in 0..nx {
-                let sx = if fx == nx { x } else { x * fx / nx };
-                let sy = if fy == ny { y } else { y * fy / ny };
-                let sz = if fz == nz { z } else { z * fz / nz };
-                let dose = grid
-                    .volume
-                    .get(sx.min(fx - 1), sy.min(fy - 1), sz.min(fz - 1));
-                let index = sx + fx * (sy + fy * sz);
-                let (ct, has_ct) = grid
-                    .ct
-                    .get(index)
-                    .copied()
-                    .map(|hu| ((((hu + 500.0) / 1000.0).clamp(0.0, 1.0)), 255u8))
-                    .unwrap_or((0.0, 0));
-                let dst = ((ty * ny + (ny - 1 - y)) * width + tx * nx + x) * 4;
-                let t = (dose / grid.peak).clamp(0.0, 1.0);
-                pixels[dst] = byte(t);
-                pixels[dst + 1] = byte(ct);
-                pixels[dst + 2] = has_ct;
-                pixels[dst + 3] = 255;
+    if fx == nx && fy == ny && fz == nz && grid.ct.is_empty() {
+        let values = &grid.volume.values;
+        let span = grid.span;
+        for z in 0..nz {
+            let tx = z % tiles;
+            let ty = z / tiles;
+            let src_z = z * nx * ny;
+            for y in 0..ny {
+                let dst_row = (ty * ny + (ny - 1 - y)) * width + tx * nx;
+                let src_row = src_z + y * nx;
+                for x in 0..nx {
+                    let dst = (dst_row + x) * 4;
+                    pixels[dst] = stored_dose(values[src_row + x], span);
+                    pixels[dst + 3] = 255;
+                }
             }
         }
+    } else {
+        fill_atlas(&mut pixels, grid, nx, ny, nz, tiles, width);
     }
     let ramp_row = height - 1;
     for x in 0..256 {
@@ -161,6 +191,84 @@ pub fn atlas_bytes(grid: &DoseGrid) -> (Vec<u8>, u32, u32) {
         pixels[dst + 3] = byte(grid.opacity);
     }
     (pixels, width as u32, height as u32)
+}
+
+fn fill_atlas(
+    pixels: &mut [u8],
+    grid: &DoseGrid,
+    nx: usize,
+    ny: usize,
+    nz: usize,
+    tiles: usize,
+    width: usize,
+) {
+    let [fx, fy, fz] = grid.volume.shape;
+    let values = &grid.volume.values;
+    let span = grid.span;
+    let x_of: Vec<usize> = (0..nx)
+        .map(|x| {
+            if fx == nx {
+                x
+            } else {
+                (x * fx / nx).min(fx - 1)
+            }
+        })
+        .collect();
+    let y_of: Vec<usize> = (0..ny)
+        .map(|y| {
+            if fy == ny {
+                y
+            } else {
+                (y * fy / ny).min(fy - 1)
+            }
+        })
+        .collect();
+    let z_of: Vec<usize> = (0..nz)
+        .map(|z| {
+            if fz == nz {
+                z
+            } else {
+                (z * fz / nz).min(fz - 1)
+            }
+        })
+        .collect();
+    if grid.ct.is_empty() {
+        for z in 0..nz {
+            let tx = z % tiles;
+            let ty = z / tiles;
+            let src_z = fx * fy * z_of[z];
+            for y in 0..ny {
+                let src_row = src_z + fx * y_of[y];
+                let dst_row = (ty * ny + (ny - 1 - y)) * width + tx * nx;
+                for x in 0..nx {
+                    let dst = (dst_row + x) * 4;
+                    pixels[dst] = stored_dose(values[src_row + x_of[x]], span);
+                    pixels[dst + 3] = 255;
+                }
+            }
+        }
+        return;
+    }
+    for z in 0..nz {
+        let tx = z % tiles;
+        let ty = z / tiles;
+        let src_z = fx * fy * z_of[z];
+        for y in 0..ny {
+            let src_row = src_z + fx * y_of[y];
+            let dst_row = (ty * ny + (ny - 1 - y)) * width + tx * nx;
+            for x in 0..nx {
+                let sx = x_of[x];
+                let dose = values[src_row + sx];
+                let dst = (dst_row + x) * 4;
+                pixels[dst] = stored_dose(dose, span);
+                if let Some(&hu) = grid.ct.get(src_row + sx) {
+                    pixels[dst + 1] = byte(((hu + 500.0) / 1000.0).clamp(0.0, 1.0));
+                    pixels[dst + 2] = 255;
+                }
+                pixels[dst + 3] = 255;
+            }
+        }
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -192,15 +300,10 @@ pub fn shade_uv(
     plane: Option<&PlaneImage>,
     uv: [f32; 2],
 ) -> [f32; 4] {
-    if uv[0] > 0.94 {
-        let t = (1.0 - uv[1]).clamp(0.0, 1.0);
-        let rgb = sample(grid.ramp, t);
-        return [rgb[0], rgb[1], rgb[2], grid.opacity];
-    }
-    let film = turn_uv([uv[0] / 0.94, uv[1]], view.turns);
     if view.plane == 3 {
-        return shade_ray(grid, view, film);
+        return shade_ray(grid, view, uv);
     }
+    let film = turn_uv(uv, view.turns);
     let Some(image) = plane else {
         return [0.0, 0.0, 0.0, 0.0];
     };
@@ -209,15 +312,12 @@ pub fn shade_uv(
     }
     let x = (film[0] * image.cols as f32).clamp(0.0, image.cols as f32 - 0.001);
     let y = ((1.0 - film[1]) * image.rows as f32).clamp(0.0, image.rows as f32 - 0.001);
-    let dose = image_sample(&image.values, image.cols, image.rows, x, y, grid.filter);
+    // Integrals are nearest on the GPU. A slice cubic is 2D Catmull-Rom: at an
+    // integer depth the shader's z weights collapse onto this slice.
+    let filter = if view.integral { 0 } else { grid.filter };
+    let dose = image_sample(&image.values, image.cols, image.rows, x, y, filter);
     let (lo, hi) = if image.own {
-        let peak = image
-            .values
-            .iter()
-            .copied()
-            .fold(0.0f32, f32::max)
-            .max(1e-6);
-        (0.0, peak)
+        integral_limits_of(&image.values)
     } else {
         window(grid)
     };
@@ -228,8 +328,29 @@ pub fn shade_uv(
 }
 
 pub fn integral_peak(grid: &DoseGrid, plane: u8) -> f32 {
-    let (image, _, _) = grid.volume.integrated_slice(plane as usize);
-    image.into_iter().fold(0.0f32, f32::max).max(1e-6)
+    grid.integral_peaks[(plane as usize).min(2)]
+}
+
+/// Color window for one plane integral. A positive projection sits on `0..peak`.
+/// A difference keeps its sign, with zero in the middle of the ramp.
+pub fn integral_limits(grid: &DoseGrid, plane: u8) -> (f32, f32) {
+    integral_limits_of(&grid.integrals[(plane as usize).min(2)])
+}
+
+fn integral_limits_of(values: &[f32]) -> (f32, f32) {
+    let mut peak = 1e-6f32;
+    let mut negative = false;
+    for value in values {
+        if value.is_finite() {
+            peak = peak.max(value.abs());
+            negative |= *value < 0.0;
+        }
+    }
+    if negative {
+        (-peak, peak)
+    } else {
+        (0.0, peak)
+    }
 }
 
 pub fn page(grid: &DoseGrid, plane: u8, index: usize, delta: i32) -> usize {
@@ -315,29 +436,47 @@ fn plane_mm(plane: u8, origin: [f32; 3], voxel: f32, col: usize, row: usize) -> 
 
 #[cfg(not(target_arch = "wasm32"))]
 fn shade_ray(grid: &DoseGrid, view: &ViewSample, uv: [f32; 2]) -> [f32; 4] {
-    let u = uv[0] * 2.0 - 1.0;
-    let v = (1.0 - uv[1]) * 2.0 - 1.0;
-    let dose = ray_value(
-        &grid.volume,
-        view.azimuth,
-        view.elevation,
-        grid.mode,
-        grid.filter,
-        u,
-        v,
-    );
     let (lo, hi) = window(grid);
-    let t = ((dose * grid.gain - lo) / (hi - lo).max(1e-6)).clamp(0.0, 1.0);
-    let rgb = sample(grid.ramp, t);
-    [rgb[0], rgb[1], rgb[2], grid.opacity]
+    ray_rgba(
+        &grid.volume,
+        &grid.bricks,
+        grid.brick_shape,
+        RayView {
+            azimuth: view.azimuth,
+            elevation: view.elevation,
+            zoom: view.zoom,
+            aspect: view.aspect,
+            mode: grid.mode,
+            filter: grid.filter,
+            gain: grid.gain,
+            opacity: grid.opacity,
+            lo,
+            hi,
+            ramp: grid.ramp,
+            line_scale: if view.ray_scale > 0.0 {
+                view.ray_scale
+            } else {
+                grid.line_scale
+            },
+            fov: view.fov,
+            center: view.center,
+            gantry: grid.gantry,
+        },
+        uv,
+    )
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 fn plane_image(grid: &DoseGrid, view: &ViewSample) -> (Vec<f32>, usize, usize, bool) {
     if view.integral {
-        let (image, cols, rows) = grid.volume.integrated_slice(view.plane as usize);
-        let (turned, cols, rows) = Volume::rotate_plane(&image, cols, rows, view.turns);
-        return (turned, cols, rows, true);
+        let plane = (view.plane as usize).min(2);
+        let [nx, ny, nz] = grid.volume.shape;
+        let (cols, rows) = match plane {
+            1 => (nx, nz),
+            2 => (ny, nz),
+            _ => (nx, ny),
+        };
+        return (grid.integrals[plane].clone(), cols, rows, true);
     }
     let n = match view.plane {
         1 => grid.volume.shape[1],
@@ -346,8 +485,7 @@ fn plane_image(grid: &DoseGrid, view: &ViewSample) -> (Vec<f32>, usize, usize, b
     };
     let index = view.index.min(n.saturating_sub(1));
     let (image, cols, rows) = grid.volume.slice_at(view.plane as usize, index);
-    let (turned, cols, rows) = Volume::rotate_plane(&image, cols, rows, view.turns);
-    (turned, cols, rows, false)
+    (image, cols, rows, false)
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -361,27 +499,64 @@ fn ct_under(grid: &DoseGrid, view: &ViewSample, film: [f32; 2]) -> Option<[f32; 
         2 => (ny, nz),
         _ => (nx, ny),
     };
-    let x = (film[0] * cols as f32) as usize;
-    let y = ((1.0 - film[1]) * rows as f32) as usize;
-    let index = match view.plane {
-        1 => x.min(nx - 1) + nx * (view.index.min(ny - 1) + ny * y.min(nz - 1)),
-        2 => view.index.min(nx - 1) + nx * (x.min(ny - 1) + ny * y.min(nz - 1)),
-        _ => x.min(nx - 1) + nx * (y.min(ny - 1) + ny * view.index.min(nz - 1)),
-    };
-    grid.ct.get(index).copied().map(|hu| {
-        let t = ((hu + 500.0) / 1000.0).clamp(0.0, 1.0);
-        [t, t, t]
+    let hu = sample_plane(
+        film[0] * cols as f32,
+        (1.0 - film[1]) * rows as f32,
+        cols,
+        rows,
+        grid.filter,
+        |ix, iy| {
+            let index = match view.plane {
+                1 => ix.min(nx - 1) + nx * (view.index.min(ny - 1) + ny * iy.min(nz - 1)),
+                2 => view.index.min(nx - 1) + nx * (ix.min(ny - 1) + ny * iy.min(nz - 1)),
+                _ => ix.min(nx - 1) + nx * (iy.min(ny - 1) + ny * view.index.min(nz - 1)),
+            };
+            grid.ct.get(index).copied().unwrap_or(0.0)
+        },
+    );
+    let t = ((hu + 500.0) / 1000.0).clamp(0.0, 1.0);
+    Some([t, t, t])
+}
+
+/// `x` and `y` are cell coordinates: the center of voxel 0 is 0.5, matching
+/// `film * n` in the slice shader. The shader then subtracts 0.5 before filtering.
+#[cfg(not(target_arch = "wasm32"))]
+fn image_sample(image: &[f32], cols: usize, rows: usize, x: f32, y: f32, filter: u8) -> f32 {
+    sample_plane(x, y, cols, rows, filter, |ix, iy| {
+        *image.get(ix + cols * iy).unwrap_or(&0.0)
     })
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn image_sample(image: &[f32], cols: usize, rows: usize, x: f32, y: f32, filter: u8) -> f32 {
+fn sample_plane(
+    x: f32,
+    y: f32,
+    cols: usize,
+    rows: usize,
+    filter: u8,
+    tap: impl Fn(usize, usize) -> f32,
+) -> f32 {
+    if cols == 0 || rows == 0 {
+        return 0.0;
+    }
+    let x = x - 0.5;
+    let y = y - 0.5;
+    let ix_of = |ix: i32| ix.clamp(0, cols as i32 - 1) as usize;
+    let iy_of = |iy: i32| iy.clamp(0, rows as i32 - 1) as usize;
     if filter == 0 {
-        let ix = x.round() as usize;
-        let iy = y.round() as usize;
-        return *image
-            .get(ix.min(cols - 1) + cols * iy.min(rows - 1))
-            .unwrap_or(&0.0);
+        return tap(ix_of(x.round() as i32), iy_of(y.round() as i32));
+    }
+    if filter == 2 {
+        let x0 = x.floor();
+        let y0 = y.floor();
+        let mut acc = 0.0;
+        for oy in -1..3 {
+            for ox in -1..3 {
+                let w = catmull(x - (x0 + ox as f32)) * catmull(y - (y0 + oy as f32));
+                acc += w * tap(ix_of(x0 as i32 + ox), iy_of(y0 as i32 + oy));
+            }
+        }
+        return acc;
     }
     let x0 = x.floor();
     let y0 = y.floor();
@@ -390,13 +565,23 @@ fn image_sample(image: &[f32], cols: usize, rows: usize, x: f32, y: f32, filter:
     let mut acc = 0.0;
     for dy in 0..2 {
         for dx in 0..2 {
-            let ix = (x0 as i32 + dx).clamp(0, cols as i32 - 1) as usize;
-            let iy = (y0 as i32 + dy).clamp(0, rows as i32 - 1) as usize;
             let w = (if dx == 0 { 1.0 - tx } else { tx }) * (if dy == 0 { 1.0 - ty } else { ty });
-            acc += w * image[ix + cols * iy];
+            acc += w * tap(ix_of(x0 as i32 + dx), iy_of(y0 as i32 + dy));
         }
     }
     acc
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn catmull(d: f32) -> f32 {
+    let x = d.abs();
+    if x >= 2.0 {
+        0.0
+    } else if x >= 1.0 {
+        ((-0.5 * x + 2.5) * x - 4.0) * x + 2.0
+    } else {
+        (1.5 * x - 2.5) * x * x + 1.0
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -408,7 +593,19 @@ fn window(grid: &DoseGrid) -> (f32, f32) {
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+/// The dose picture fills the quad. The color axis is a column beside it.
+pub(crate) const FILM_X: f32 = 1.0;
+
+/// Display UV whose turned lookup is `film`. `film` is the unrotated slice.
+fn unturn_uv(film: [f32; 2], turns: u8) -> [f32; 2] {
+    match turns % 4 {
+        1 => [1.0 - film[1], film[0]],
+        2 => [1.0 - film[0], 1.0 - film[1]],
+        3 => [film[1], 1.0 - film[0]],
+        _ => film,
+    }
+}
+
 fn turn_uv(uv: [f32; 2], turns: u8) -> [f32; 2] {
     match turns % 4 {
         1 => [uv[1], 1.0 - uv[0]],
@@ -416,6 +613,28 @@ fn turn_uv(uv: [f32; 2], turns: u8) -> [f32; 2] {
         3 => [1.0 - uv[1], uv[0]],
         _ => uv,
     }
+}
+
+/// Where a slice millimetre is drawn. The picture fills the quad.
+pub(crate) fn display_mm(x: f32, y: f32, bounds: [f32; 4], turns: u8) -> [f32; 2] {
+    let width = (bounds[1] - bounds[0]).max(1e-6);
+    let height = (bounds[3] - bounds[2]).max(1e-6);
+    let film = [(x - bounds[0]) / width, (bounds[3] - y) / height];
+    let uv = unturn_uv(film, turns);
+    [
+        bounds[0] + uv[0] * FILM_X * width,
+        bounds[3] - uv[1] * height,
+    ]
+}
+
+/// Slice millimetres under a data-space click.
+pub(crate) fn source_mm(x: f32, y: f32, bounds: [f32; 4], turns: u8) -> Option<[f32; 2]> {
+    let width = (bounds[1] - bounds[0]).max(1e-6);
+    let height = (bounds[3] - bounds[2]).max(1e-6);
+    let uvx = (x - bounds[0]) / width;
+    let uvy = (bounds[3] - y) / height;
+    let film = turn_uv([uvx / FILM_X, uvy], turns);
+    Some([bounds[0] + film[0] * width, bounds[3] - film[1] * height])
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -434,6 +653,11 @@ fn mix(under: Option<[f32; 3]>, wash: [f32; 4]) -> [f32; 4] {
 
 fn byte(value: f32) -> u8 {
     (value.clamp(0.0, 1.0) * 255.0).round() as u8
+}
+
+/// `0` is `-span`, `128` is zero, `255` is `+span`.
+fn stored_dose(value: f32, span: f32) -> u8 {
+    byte(0.5 + 0.5 * value / span.max(1e-6))
 }
 
 #[cfg(test)]
@@ -469,8 +693,152 @@ mod tests {
         let tx = z % tiles;
         let dst = ((ny - 1) * width as usize + tx * nx + x) * 4;
         assert!(pixels[dst] > 200, "the hot voxel stays in the atlas");
+        let cold = grid_from(
+            vec![-2.0, 1.0],
+            Vec::new(),
+            Vec::new(),
+            [2, 1, 1],
+            [0.0, 0.0, 0.0],
+            1.0,
+            0,
+            -2.0,
+            2.0,
+            1.0,
+            1.0,
+            0,
+            0,
+        )
+        .unwrap();
+        let (signed, signed_width, _) = atlas_bytes(&cold);
+        assert!(
+            signed[0] < 10,
+            "a negative voxel stays below zero in the atlas"
+        );
+        let positive = signed[4];
+        assert!(
+            positive > 160 && positive < 220,
+            "half the span lands between zero and the top, got {positive}"
+        );
+        assert!(signed_width >= 2);
         let ramp = ((height as usize - 1) * width as usize) * 4;
         assert_eq!(pixels.len(), width as usize * height as usize * 4);
         assert!(pixels[ramp + 3] > 0);
+    }
+
+    #[test]
+    fn a_slice_center_reads_that_voxel() {
+        let image = [0.0, 10.0];
+        assert_eq!(image_sample(&image, 2, 1, 0.5, 0.5, 0), 0.0);
+        assert!((image_sample(&image, 2, 1, 0.5, 0.5, 1) - 0.0).abs() < 1e-4);
+        assert!((image_sample(&image, 2, 1, 0.5, 0.5, 2) - 0.0).abs() < 1e-3);
+        assert_eq!(image_sample(&image, 2, 1, 1.5, 0.5, 0), 10.0);
+        assert!((image_sample(&image, 2, 1, 1.0, 0.5, 1) - 5.0).abs() < 1e-4);
+        assert!((image_sample(&image, 2, 1, 0.0, 0.5, 1) - 0.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn a_turned_slice_is_not_rotated_twice() {
+        let grid = grid_from(
+            vec![10.0, 0.0],
+            Vec::new(),
+            Vec::new(),
+            [2, 1, 1],
+            [0.0, 0.0, 0.0],
+            1.0,
+            1,
+            0.0,
+            10.0,
+            1.0,
+            1.0,
+            0,
+            0,
+        )
+        .unwrap();
+        let view = ViewSample {
+            plane: 0,
+            index: 0,
+            turns: 1,
+            integral: false,
+            azimuth: 0.0,
+            elevation: 0.0,
+            zoom: 1.0,
+            aspect: 1.0,
+            ray_scale: 0.0,
+            fov: 0.0,
+            center: [0.0; 3],
+        };
+        let plane = prepare_plane(&grid, &view).unwrap();
+        assert_eq!((plane.cols, plane.rows), (2, 1));
+        assert_eq!(plane.values[0], 10.0);
+        let shown = unturn_uv([0.25, 0.5], 1);
+        let color = shade_uv(&grid, &view, Some(&plane), [shown[0] * FILM_X, shown[1]]);
+        let hot = sample(1, 1.0);
+        assert!((color[0] - hot[0]).abs() < 1e-3);
+        assert!((color[1] - hot[1]).abs() < 1e-3);
+        assert!((color[2] - hot[2]).abs() < 1e-3);
+    }
+
+    #[test]
+    fn the_film_puts_a_voxel_on_its_pixel() {
+        let bounds = [0.0, 100.0, 0.0, 50.0];
+        let shown = display_mm(50.0, 25.0, bounds, 0);
+        assert!((shown[0] - 50.0).abs() < 1e-3);
+        assert!((shown[1] - 25.0).abs() < 1e-3);
+        let back = source_mm(shown[0], shown[1], bounds, 0).unwrap();
+        assert!((back[0] - 50.0).abs() < 1e-3);
+        assert!((back[1] - 25.0).abs() < 1e-3);
+        let edge = source_mm(96.0, 25.0, bounds, 0).unwrap();
+        assert!((edge[0] - 96.0).abs() < 1e-3);
+        let turned = display_mm(0.0, 25.0, bounds, 1);
+        let back = source_mm(turned[0], turned[1], bounds, 1).unwrap();
+        assert!((back[0] - 0.0).abs() < 1e-3);
+        assert!((back[1] - 25.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn a_negative_integral_keeps_its_sign_on_the_ramp() {
+        let grid = grid_from(
+            vec![4.0, -1.0, -4.0],
+            Vec::new(),
+            Vec::new(),
+            [3, 1, 1],
+            [0.0, 0.0, 0.0],
+            1.0,
+            1,
+            -4.0,
+            4.0,
+            1.0,
+            1.0,
+            0,
+            0,
+        )
+        .unwrap();
+        let (lo, hi) = integral_limits(&grid, 0);
+        assert!((lo + 4.0).abs() < 1e-4);
+        assert!((hi - 4.0).abs() < 1e-4);
+        let view = ViewSample {
+            plane: 0,
+            index: 0,
+            turns: 0,
+            integral: true,
+            azimuth: 0.0,
+            elevation: 0.0,
+            zoom: 1.0,
+            aspect: 1.0,
+            ray_scale: 0.0,
+            fov: 0.0,
+            center: [0.0; 3],
+        };
+        let plane = prepare_plane(&grid, &view).unwrap();
+        let color = shade_uv(&grid, &view, Some(&plane), [0.5 * FILM_X, 0.5]);
+        let expected = sample(1, 0.375);
+        assert!((color[0] - expected[0]).abs() < 1e-3);
+        assert!((color[1] - expected[1]).abs() < 1e-3);
+        assert!((color[2] - expected[2]).abs() < 1e-3);
+        let floor = sample(1, 0.0);
+        assert!(
+            (color[0] - floor[0]).abs() + (color[1] - floor[1]).abs() + (color[2] - floor[2]).abs()
+                > 0.05
+        );
     }
 }

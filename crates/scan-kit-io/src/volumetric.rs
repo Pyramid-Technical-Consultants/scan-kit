@@ -4,9 +4,9 @@
 use std::path::Path;
 
 use scan_kit_core::{
-    analytic_on, choices, dose_frame, dvh, field_bounds, gamma_index, index, is_session, medium,
-    protons_from_mu, resolve, robust_high, Family, McJob, McResult, Panel, Pencil, PlotScene,
-    Quantity, Series, Volume, IC1_Z_MM, IC2_Z_MM, IC_SEP_MM, SESSION,
+    analytic_on, choices, dose_frame, dvh, gamma_index, index, medium, protons_from_mu, resolve,
+    robust_high, Family, McJob, McResult, Panel, Pencil, PlotScene, Quantity, Series, Volume,
+    IC1_Z_MM, IC2_Z_MM, IC_SEP_MM, SESSION,
 };
 use serde_json::Value;
 
@@ -14,9 +14,10 @@ use super::discover;
 use super::marks::{labeled, pick};
 use super::tables::{interlock_sigma_mm, spot_table};
 
-const GUIDE: [f32; 4] = [0.62, 0.62, 0.62, 0.9];
 const MARK: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
 const FALLBACK_SIGMA: f32 = 4.0;
+/// `abs(-10000) * 0.9`, the dose loader's missing-position cut.
+const ABS_INVALID_MM: f32 = 9_000.0;
 const FALLBACK_KMU: f32 = 2.0e-8;
 const GAP_MM: f32 = 10.0;
 const MC_SEED: u32 = 1;
@@ -79,6 +80,17 @@ const EDGE: &[(&str, &str)] = &[
     ("slice20", "Slice 20%"),
     ("plan90", "Plan 90%"),
 ];
+
+/// `(fraction, per slice, from the plan)`. Slice edges use each depth's own maximum.
+fn field_edge(kind: &str) -> (f32, bool, bool) {
+    match kind {
+        "peak90" => (0.9, false, false),
+        "peak50" => (0.5, false, false),
+        "slice20" => (0.2, true, false),
+        "plan90" => (0.9, false, true),
+        _ => (0.5, true, false),
+    }
+}
 
 pub(crate) type McRunner<'a> = &'a dyn Fn(&McJob) -> Result<McResult, String>;
 
@@ -147,8 +159,6 @@ pub fn volumetric(
         .unwrap_or("");
 
     let mat = medium(medium_key);
-    let owned = preset_options(options);
-    let options = &owned;
     let voxel_mm = pick(
         options,
         "voxel",
@@ -165,27 +175,22 @@ pub fn volumetric(
     )
     .parse::<f32>()
     .unwrap_or(GAP_MM);
-    let margin_mm = pick(
+    let margin_sigma = pick(
         options,
         "margin",
-        "0",
-        &[
-            ("0", "Auto"),
-            ("5", "5 mm"),
-            ("10", "10 mm"),
-            ("20", "20 mm"),
-        ],
+        "5",
+        &[("5", "5 σ"), ("4", "4 σ"), ("3", "3 σ"), ("1", "1 σ")],
     )
     .parse::<f32>()
-    .unwrap_or(0.0);
+    .unwrap_or(5.0);
     let gantry = pick(
         options,
         "gantry",
-        "0",
+        "90",
         &[("0", "0°"), ("90", "90°"), ("180", "180°"), ("270", "270°")],
     )
     .parse::<f32>()
-    .unwrap_or(0.0);
+    .unwrap_or(90.0);
     let spot_cap = pick(
         options,
         "spot_cap",
@@ -200,8 +205,6 @@ pub fn volumetric(
         .map(|session| {
             let mut cloud =
                 load_cloud(root, session, session_ids, grain, xy, plan_sigma, sigma_ref);
-            rotate_pencils(&mut cloud.pencils, gantry);
-            rotate_pencils(&mut cloud.plan, gantry);
             cloud.pencils.truncate(spot_cap);
             cloud.plan.truncate(spot_cap);
             cloud
@@ -212,31 +215,75 @@ pub fn volumetric(
         .map(|session| read_kmu(root, session))
         .unwrap_or(FALLBACK_KMU);
 
+    let plots = crate::workspace::plots_from(
+        [
+            options.get("plot0").and_then(Value::as_str),
+            options.get("plot1").and_then(Value::as_str),
+        ],
+        false,
+    );
+    let (field_fraction, field_per_slice, field_from_plan) = field_edge(edge);
+    let need_plan = compare != "measured"
+        || plots.contains(&crate::workspace::PlotKind::Gamma)
+        || field_from_plan;
     let all: Vec<Pencil> = clouds
         .iter()
         .flat_map(|cloud| {
-            cloud
-                .pencils
-                .iter()
-                .copied()
-                .chain(cloud.plan.iter().copied())
+            let measured = cloud.pencils.iter().copied();
+            if need_plan {
+                measured
+                    .chain(cloud.plan.iter().copied())
+                    .collect::<Vec<_>>()
+            } else {
+                measured.collect()
+            }
         })
         .collect();
-    let frame = dose_frame(
+    let preview = options
+        .get("_preview")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let scatter_on = scatter && model != "mc";
+    let mut voxel_mm = voxel_mm;
+    let mut frame = dose_frame(
         mat,
         &all,
         quantity,
         spread,
-        scatter && model != "mc",
+        scatter_on,
         wet_mm,
         phantom_mm,
         voxel_mm,
         k_mu,
         gap_mm,
-        margin_mm,
+        margin_sigma,
     );
+    if preview {
+        let mut steps = 0;
+        while steps < 3 {
+            let Some(next) = next_preview_voxel(voxel_mm, frame.visits) else {
+                break;
+            };
+            voxel_mm = next;
+            frame = dose_frame(
+                mat,
+                &all,
+                quantity,
+                spread,
+                scatter_on,
+                wet_mm,
+                phantom_mm,
+                voxel_mm,
+                k_mu,
+                gap_mm,
+                margin_sigma,
+            );
+            steps += 1;
+        }
+    }
     let grid = Some((frame.origin, frame.shape, frame.voxel));
-    let planes = frame.planes_only().then_some(frame.focus);
+    // Three planes through the peak raymarch as a cross. The 3D cell needs the cube.
+    let planes = lattice_planes(&frame);
 
     let mut measured = Vec::new();
     let mut plans = Vec::new();
@@ -251,6 +298,7 @@ pub fn volumetric(
             wet_mm,
             phantom_mm,
             k_mu,
+            gap_mm,
             model,
             histories,
             medium_key,
@@ -260,42 +308,47 @@ pub fn volumetric(
         );
         mc_note = mc_note.or(ran);
         measured.push(volume);
-        let (volume, _) = fill(
-            mat,
-            &cloud.plan,
-            quantity,
-            spread,
-            scatter,
-            wet_mm,
-            phantom_mm,
-            k_mu,
-            model,
-            histories,
-            medium_key,
-            mc,
-            grid,
-            planes,
-        );
-        plans.push(volume);
+        if need_plan {
+            let (volume, _) = fill(
+                mat,
+                &cloud.plan,
+                quantity,
+                spread,
+                scatter,
+                wet_mm,
+                phantom_mm,
+                k_mu,
+                gap_mm,
+                model,
+                histories,
+                medium_key,
+                mc,
+                grid,
+                planes,
+            );
+            plans.push(volume);
+        }
     }
 
-    let used_planes = mc_note.is_none() && planes.is_some();
-    let gamma_slice = used_planes
-        || measured
-            .first()
-            .is_some_and(|volume| volume.values.len() > 2_000_000);
-    let primary = measured
-        .first()
-        .filter(|volume| volume.values.iter().any(|v| *v > 0.0));
-    let (ix, iy, iz) = if used_planes {
-        let [nx, ny, nz] = primary.map(|volume| volume.shape).unwrap_or([1, 1, 1]);
-        (
-            frame.focus[0].min(nx.saturating_sub(1)),
-            frame.focus[1].min(ny.saturating_sub(1)),
-            frame.focus[2].min(nz.saturating_sub(1)),
-        )
+    let (dd, dta, cutoff) = gamma_criteria(options);
+    // Measured is the reference and the plan is searched, as in the Python dose view.
+    let want_gamma = compare == "gamma" || plots.contains(&crate::workspace::PlotKind::Gamma);
+    let gamma_fields: Vec<(Volume, f32)> = if want_gamma {
+        measured
+            .iter()
+            .zip(&plans)
+            .map(|(got, plan)| {
+                let (values, passed, scored) = gamma_with(got, plan, dd, dta, cutoff);
+                let rate = if scored == 0 {
+                    0.0
+                } else {
+                    100.0 * passed as f32 / scored as f32
+                };
+                (gamma_image(got, &values), rate)
+            })
+            .collect()
     } else {
-        primary.map(Volume::peak_index).unwrap_or((0, 0, 0))
+        Vec::new()
     };
     let shown: Vec<Volume> = match compare {
         "difference" => measured
@@ -303,15 +356,9 @@ pub fn volumetric(
             .zip(&plans)
             .map(|(got, plan)| difference(got, plan))
             .collect(),
-        "gamma" if gamma_slice => measured
+        "gamma" => gamma_fields
             .iter()
-            .zip(&plans)
-            .map(|(got, plan)| gamma_planes(got, plan, frame.focus).0)
-            .collect(),
-        "gamma" => measured
-            .iter()
-            .zip(&plans)
-            .map(|(got, plan)| gamma_volume(got, plan))
+            .map(|(volume, _)| volume.clone())
             .collect(),
         _ => measured.clone(),
     };
@@ -330,186 +377,13 @@ pub fn volumetric(
         .any(|volume| volume.values.iter().any(|value| *value > 0.0));
     if !has_dose {
         panels.push(note("No spots"));
-    } else {
-        let volume = &shown[0];
-        let [nx, ny, nz] = volume.shape;
-        let iz = iz.min(nz.saturating_sub(1));
-        let iy = iy.min(ny.saturating_sub(1));
-        let ix = ix.min(nx.saturating_sub(1));
-        panels.push(slice_panel(
-            "Axial",
-            &shown,
-            ramp,
-            lo,
-            hi,
-            volume.origin[0],
-            volume.origin[0] + nx as f32 * volume.voxel,
-            volume.origin[1],
-            volume.origin[1] + ny as f32 * volume.voxel,
-            true,
-            |volume| volume.axial(iz),
-            nx as u32,
-            ny as u32,
-        ));
-        panels.push(slice_panel(
-            "coronal",
-            &shown,
-            ramp,
-            lo,
-            hi,
-            volume.origin[0],
-            volume.origin[0] + nx as f32 * volume.voxel,
-            volume.origin[2],
-            volume.origin[2] + nz as f32 * volume.voxel,
-            true,
-            |volume| volume.coronal(iy),
-            nx as u32,
-            nz as u32,
-        ));
-        panels.push(slice_panel(
-            "sagittal",
-            &shown,
-            ramp,
-            lo,
-            hi,
-            volume.origin[1],
-            volume.origin[1] + ny as f32 * volume.voxel,
-            volume.origin[2],
-            volume.origin[2] + nz as f32 * volume.voxel,
-            true,
-            |volume| volume.sagittal(ix),
-            ny as u32,
-            nz as u32,
-        ));
-        let mut depth = Vec::new();
-        let mut lateral = Vec::new();
-        for volume in &shown {
-            let (xs, ys) = volume.depth_profile(ix, iy);
-            depth.push(line(xs, ys));
-            let (xs, ys) = volume.lateral_profile(iy, iz);
-            lateral.push(line(xs, ys));
-        }
-        let mut depth_panel = lines_panel("Depth", depth, y_name(quantity));
-        if let Some(result) = &mc_note {
-            let incident = result.ledger[0];
-            let left = if incident > 0.0 {
-                100.0 * (result.ledger[2] + result.ledger[3]) / incident
-            } else {
-                0.0
-            };
-            depth_panel.title = format!(
-                "Depth  {:.1}%  left {:.1}%",
-                result.uncertainty * 100.0,
-                left
-            );
-        } else if model == "mc" {
-            depth_panel.title = "Depth  analytic fallback".into();
-        }
-        panels.push(depth_panel);
-        panels.push(lines_panel("Lateral", lateral, y_name(quantity)));
-        let mut dvh_lines = Vec::new();
-        if used_planes {
-            for volume in coarse_dvh_volumes(
-                &clouds,
-                &all,
-                mat,
-                quantity,
-                spread,
-                scatter && model != "mc",
-                wet_mm,
-                phantom_mm,
-                k_mu,
-                compare,
-                frame.visits,
-            ) {
-                push_dvh(&mut dvh_lines, &volume);
-            }
-        } else {
-            for volume in &shown {
-                push_dvh(&mut dvh_lines, volume);
-            }
-        }
-        panels.push(lines_panel("DVH", dvh_lines, "Volume"));
-        if let (Some(got), Some(plan)) = (measured.first(), plans.first()) {
-            let (gamma_vol, passed, scored) = if gamma_slice {
-                let iz = iz.min(got.shape[2].saturating_sub(1));
-                let [nx, ny, _] = got.shape;
-                let (values, passed, scored) =
-                    plane_gamma(&plan.axial(iz), &got.axial(iz), nx, ny, got.voxel);
-                (
-                    Volume {
-                        origin: got.origin,
-                        shape: [nx, ny, 1],
-                        voxel: got.voxel,
-                        values,
-                    },
-                    passed,
-                    scored,
-                )
-            } else {
-                let (gamma, passed, scored) = gamma_of(got, plan);
-                (gamma_image(got, &gamma), passed, scored)
-            };
-            let rate = if scored == 0 {
-                0.0
-            } else {
-                100.0 * passed as f32 / scored as f32
-            };
-            let cols = gamma_vol.shape[0] as u32;
-            let rows = gamma_vol.shape[1] as u32;
-            let x0 = gamma_vol.origin[0];
-            let y0 = gamma_vol.origin[1];
-            let x1 = x0 + gamma_vol.shape[0] as f32 * gamma_vol.voxel;
-            let y1 = y0 + gamma_vol.shape[1] as f32 * gamma_vol.voxel;
-            let gz = if gamma_vol.shape[2] == 1 {
-                0
-            } else {
-                iz.min(gamma_vol.shape[2].saturating_sub(1))
-            };
-            panels.push(slice_panel(
-                &format!("gamma {rate:.0}%"),
-                &[gamma_vol],
-                16,
-                0.0,
-                2.0,
-                x0,
-                x1,
-                y0,
-                y1,
-                true,
-                |volume| volume.axial(gz),
-                cols,
-                rows,
-            ));
-            if let Some(bounds) =
-                field_readout(if edge == "plan90" { plan } else { got }, plan, iz, edge)
-            {
-                if let Some(axial) = panels.first_mut() {
-                    let width = bounds[1] - bounds[0];
-                    let height = bounds[3] - bounds[2];
-                    axial.title = format!("Axial  {width:.0} × {height:.0} mm");
-                    axial.series.push(rect_guide(bounds));
-                    let x_mm = volume_cross_x(got, ix);
-                    let y_mm = got.origin[1] + (iy as f32 + 0.5) * got.voxel;
-                    let y0 = got.origin[1];
-                    let y1 = got.origin[1] + got.shape[1] as f32 * got.voxel;
-                    let x0 = got.origin[0];
-                    let x1 = got.origin[0] + got.shape[0] as f32 * got.voxel;
-                    axial
-                        .series
-                        .push(guide_line(vec![x_mm, x_mm], vec![y0, y1]));
-                    axial
-                        .series
-                        .push(guide_line(vec![x0, x1], vec![y_mm, y_mm]));
-                }
-            }
-        }
     }
 
     let mut volume_mark = scan_kit_core::VolumeMark::default();
     let mut field_size: Option<String> = None;
+    let session_at = session_at(options, session_ids).min(shown.len().saturating_sub(1));
     if has_dose {
-        if let Some(volume) = shown.first() {
+        if let Some(volume) = shown.get(session_at) {
             let (ix, iy, iz) = volume.peak_index();
             let cells = crate::workspace::cells_from(&[
                 options.get("cell0").and_then(Value::as_str),
@@ -517,54 +391,34 @@ pub fn volumetric(
                 options.get("cell2").and_then(Value::as_str),
                 options.get("cell3").and_then(Value::as_str),
             ]);
-            let plots = crate::workspace::plots_from(
-                [
-                    options.get("plot0").and_then(Value::as_str),
-                    options.get("plot1").and_then(Value::as_str),
-                ],
-                false,
-            );
             let mut dvh_lines = Vec::new();
-            for item in &shown {
-                push_dvh(&mut dvh_lines, item);
+            if plots.contains(&crate::workspace::PlotKind::Dvh) {
+                push_dvh(&mut dvh_lines, volume);
             }
-            let gamma = measured.first().zip(plans.first()).map(|(got, plan)| {
-                let dd = pick(options, "dd", "3", &[("2", "2%"), ("3", "3%"), ("5", "5%")])
-                    .parse::<f32>()
-                    .unwrap_or(3.0);
-                let dta = pick(options, "dta", "2", &[("2", "2 mm"), ("3", "3 mm")])
-                    .parse::<f32>()
-                    .unwrap_or(2.0);
-                let cutoff = pick(
-                    options,
-                    "cutoff",
-                    "10",
-                    &[("5", "5%"), ("10", "10%"), ("20", "20%")],
-                )
-                .parse::<f32>()
-                .unwrap_or(10.0);
-                let (values, passed, scored) = gamma_with(got, plan, dd, dta, cutoff);
-                let rate = if scored == 0 {
-                    0.0
-                } else {
-                    100.0 * passed as f32 / scored as f32
-                };
-                (gamma_image(got, &values), rate)
-            });
+            let gamma = plots
+                .contains(&crate::workspace::PlotKind::Gamma)
+                .then(|| gamma_fields.get(session_at).cloned())
+                .flatten();
             let show_field = super::marks::flag(options, "field", true);
-            let fraction = match edge {
-                "peak90" | "plan90" => 0.9,
-                "peak50" => 0.5,
-                "slice20" => 0.2,
-                _ => 0.5,
+            let field_dose = if field_from_plan {
+                plans.get(session_at)
+            } else {
+                measured.get(session_at)
             };
+            let extent = field_dose.and_then(|dose| {
+                crate::workspace::field_extent(dose, field_fraction, field_per_slice)
+            });
             let field = if show_field {
-                crate::workspace::field_box(volume, iz, fraction)
+                extent.map(|bounds| [bounds[0], bounds[1], bounds[2], bounds[3]])
             } else {
                 None
             };
-            let (gain, opacity, mode, filter) = view_paint(options);
-            let (built, mark) = crate::workspace::assemble(&crate::workspace::Workspace {
+            let (mut mode, filter) = view_paint(options);
+            if compare == "gamma" {
+                mode = 1;
+            }
+            let (lo_paint, hi_paint, gain, opacity) = paint_of(options, compare, lo, hi, mode);
+            let (built, mut mark) = crate::workspace::assemble(&crate::workspace::Workspace {
                 dose: volume.clone(),
                 ct: Vec::new(),
                 labels: Vec::new(),
@@ -572,8 +426,8 @@ pub fn volumetric(
                 cells,
                 plots,
                 ramp,
-                lo: color_limits(lo, hi, options).0,
-                hi: color_limits(lo, hi, options).1,
+                lo: lo_paint,
+                hi: hi_paint,
                 gain,
                 opacity,
                 mode,
@@ -584,14 +438,42 @@ pub fn volumetric(
                 field,
                 show_field,
             });
+            mark.gantry = gantry;
+            mark.show_phantom = phantom_shown(options);
+            mark.field = if show_field {
+                extent.unwrap_or([0.0; 6])
+            } else {
+                [0.0; 6]
+            };
+            mark.unit = volume_unit(quantity, mode, compare).into();
             panels = built;
+            if let Some(depth) = panels
+                .iter_mut()
+                .find(|panel| panel.title.starts_with("Depth"))
+            {
+                if let Some(result) = &mc_note {
+                    let incident = result.ledger[0];
+                    let left = if incident > 0.0 {
+                        100.0 * (result.ledger[2] + result.ledger[3]) / incident
+                    } else {
+                        0.0
+                    };
+                    depth.title = format!(
+                        "Depth dose  {:.1}%  left {:.1}%",
+                        result.uncertainty * 100.0,
+                        left
+                    );
+                } else if model == "mc" {
+                    depth.title = "Depth dose  analytic fallback".into();
+                }
+            }
             volume_mark = mark;
-            let depth = crate::workspace::field_depth(volume, fraction);
-            let size = match field {
+            let size = match extent {
                 Some(bounds) => format!(
-                    "{:.0} × {:.0} × {depth:.0} mm",
+                    "{:.0} × {:.0} × {:.0} mm",
                     bounds[1] - bounds[0],
-                    bounds[3] - bounds[2]
+                    bounds[3] - bounds[2],
+                    bounds[5] - bounds[4]
                 ),
                 None => "—".into(),
             };
@@ -602,13 +484,29 @@ pub fn volumetric(
     let mut controls = picked.controls;
     for control in &mut controls {
         if control.id == "source" {
-            control.group = "Beam".into();
+            control.group = "Dose".into();
         }
     }
-    controls.push(labeled("xy", "Signal", XY, xy).grouped("Data Source"));
-    controls.push(labeled("quantity", "Quantity", QUANTITY, quantity_id).grouped("Data Source"));
+    if session_ids.len() > 1 {
+        let pairs: Vec<(String, String)> = session_ids
+            .iter()
+            .map(|id| (id.clone(), id.clone()))
+            .collect();
+        let refs: Vec<(&str, &str)> = pairs
+            .iter()
+            .map(|(a, b)| (a.as_str(), b.as_str()))
+            .collect();
+        let chosen = session_ids
+            .get(session_at)
+            .map(String::as_str)
+            .unwrap_or("");
+        controls.push(labeled("session", "Session", &refs, chosen).grouped("Dose"));
+    }
+    controls.push(labeled("xy", "Signal", XY, xy).grouped("Dose"));
+    controls.push(labeled("quantity", "Quantity", QUANTITY, quantity_id).grouped("Dose"));
+    controls.push(labeled("compare", "Compare", COMPARE, compare).grouped("Dose"));
     if xy == "plan" || compare != "measured" {
-        controls.push(labeled("plan_sigma", "Plan σ", SIGMA, plan_sigma).grouped("Beam"));
+        controls.push(labeled("plan_sigma", "Plan σ", SIGMA, plan_sigma).grouped("Dose"));
         if session_ids.len() > 1 {
             let pairs: Vec<(String, String)> = session_ids
                 .iter()
@@ -623,10 +521,31 @@ pub fn volumetric(
             } else {
                 refs.first().map(|(id, _)| *id).unwrap_or("")
             };
-            controls.push(labeled("sigma_ref", "Reference", &refs, chosen).grouped("Beam"));
+            controls.push(labeled("sigma_ref", "Reference", &refs, chosen).grouped("Dose"));
         }
     }
-    controls.push(labeled("model", "Model", MODEL, model).grouped("Model"));
+    if has_dose {
+        let raw_spots: usize = clouds.iter().map(|cloud| cloud.pencils.len()).sum();
+        let plan_spots: usize = clouds.iter().map(|cloud| cloud.plan.len()).sum();
+        let spot_note = if plan_spots == 0 {
+            format!("{raw_spots} · no plan")
+        } else {
+            let weights = match quantity {
+                Quantity::Mu => "plan MU",
+                Quantity::Protons => "protons",
+                Quantity::Dose => "relative",
+            };
+            format!("{raw_spots} measured · {plan_spots} plan · {weights}")
+        };
+        controls.push(crate::workspace::readout(
+            "Spots", "spots", &spot_note, "Dose",
+        ));
+    }
+    controls.push(
+        labeled("model", "Model", MODEL, model)
+            .grouped("Calculation")
+            .radio(),
+    );
     if model == "analytic" {
         controls.push(
             labeled(
@@ -635,14 +554,37 @@ pub fn volumetric(
                 SCATTER,
                 if scatter { "on" } else { "off" },
             )
-            .grouped("Model"),
+            .grouped("Calculation"),
         );
     } else {
         controls.push(
-            labeled("histories", "Histories", HISTORIES, &histories.to_string()).grouped("Model"),
+            labeled("histories", "Histories", HISTORIES, &histories.to_string())
+                .grouped("Calculation")
+                .radio(),
         );
     }
-    controls.push(labeled("spread", "Energy spread", SPREAD, &trim_num(spread)).grouped("Beam"));
+    controls
+        .push(labeled("spread", "Energy spread", SPREAD, &trim_num(spread)).grouped("Calculation"));
+    if quantity_id != "mu" {
+        controls.push(
+            labeled(
+                "gap",
+                "IC gap",
+                &[("5", "5 mm"), ("10", "10 mm"), ("20", "20 mm")],
+                &gap_mm.round().to_string(),
+            )
+            .grouped("Calculation"),
+        );
+    }
+    controls.push(
+        labeled(
+            "spot_cap",
+            "Max spots",
+            &[("10000", "10k"), ("100000", "100k"), ("1000000", "1M")],
+            &spot_cap.to_string(),
+        )
+        .grouped("Calculation"),
+    );
     let media: Vec<(&str, &str)> = if model == "mc" {
         MEDIA
             .iter()
@@ -663,31 +605,79 @@ pub fn volumetric(
         .grouped("Phantom"),
     );
     controls.push(labeled("wet", "Entrance", WET, &wet_mm.round().to_string()).grouped("Phantom"));
-    controls.push(labeled("compare", "Compare", COMPARE, compare).grouped("Compare"));
-    controls.push(labeled("edge", "Field Edge", EDGE, edge).grouped("Compare"));
-    if session_ids.len() <= 1 && compare != "gamma" {
-        let scales = choices(if compare == "difference" {
-            Family::Divergent
-        } else {
-            Family::Sequential
-        });
-        controls.push(labeled("scale", "Scale", scales, scale).grouped("Color"));
-    }
+    controls.push(
+        labeled(
+            "margin",
+            "Auto margin",
+            &[("5", "5 σ"), ("4", "4 σ"), ("3", "3 σ"), ("1", "1 σ")],
+            &margin_sigma.round().to_string(),
+        )
+        .grouped("Phantom"),
+    );
+    controls.push(
+        labeled(
+            "gantry",
+            "Gantry",
+            &[("0", "0°"), ("90", "90°"), ("180", "180°"), ("270", "270°")],
+            &gantry.round().to_string(),
+        )
+        .grouped("Phantom"),
+    );
     if has_dose {
-        push_workspace_controls(
-            &mut controls,
-            options,
-            &volume_mark,
-            Some(clouds.iter().map(|cloud| cloud.pencils.len()).sum()),
+        let sizing = if phantom_mm <= 0.0 { " auto" } else { "" };
+        let phantom = format!(
+            "{:.0} × {:.0} × {:.0} mm{sizing}",
+            volume_mark.shape[0] as f32 * volume_mark.voxel,
+            volume_mark.shape[1] as f32 * volume_mark.voxel,
+            volume_mark.shape[2] as f32 * volume_mark.voxel
+        );
+        controls.push(crate::workspace::readout(
+            "Size",
+            "phantom_size",
+            &phantom,
+            "Phantom",
+        ));
+        controls.push(
+            scan_kit_core::Control::plain(
+                "phantom_box",
+                "Box",
+                ["On", "Off"],
+                if phantom_shown(options) { "On" } else { "Off" },
+            )
+            .grouped("Phantom")
+            .checked(),
+        );
+    }
+    controls.push(labeled("edge", "Edge", EDGE, edge).grouped("Field"));
+    if has_dose {
+        let show_box = super::marks::flag(options, "field", true);
+        controls.push(
+            scan_kit_core::Control::plain(
+                "field",
+                "Bounds",
+                ["On", "Off"],
+                if show_box { "On" } else { "Off" },
+            )
+            .grouped("Field")
+            .checked(),
         );
         if let Some(size) = field_size {
             controls.push(crate::workspace::readout(
-                "Field size",
+                "Size",
                 "field_size",
                 &size,
                 "Field",
             ));
         }
+        push_picture_controls(
+            &mut controls,
+            options,
+            &volume_mark,
+            model,
+            compare,
+            session_ids.len(),
+            scale,
+        );
     }
     let layout = if has_dose {
         crate::workspace::layout()
@@ -708,85 +698,168 @@ pub fn volumetric(
     }
 }
 
-fn color_limits(lo: f32, hi: f32, options: &Value) -> (f32, f32) {
-    match pick(
-        options,
-        "window",
-        "full",
-        &[("full", "Full"), ("upper", "Upper half"), ("mid", "10–90%")],
-    ) {
-        "upper" => (lo + 0.5 * (hi - lo), hi),
-        "mid" => (lo + 0.1 * (hi - lo), lo + 0.9 * (hi - lo)),
-        _ => (lo, hi),
+fn paint_of(options: &Value, compare: &str, lo: f32, hi: f32, mode: u8) -> (f32, f32, f32, f32) {
+    if compare == "gamma" {
+        return (0.0, 2.0, 1.0, 1.0);
+    }
+    let level = options
+        .get("level")
+        .and_then(Value::as_str)
+        .and_then(|text| text.parse::<f32>().ok());
+    if mode == 2 {
+        let opacity = level.unwrap_or(1.0).clamp(0.0, 1.0);
+        return (lo, hi, opacity, opacity);
+    }
+    if compare == "difference" {
+        let percent = pick(
+            options,
+            "error",
+            "absolute",
+            &[("absolute", "Absolute"), ("percent", "Percent")],
+        ) == "percent";
+        let reach = if percent {
+            hi.abs().max(1e-6) * level.unwrap_or(10.0).clamp(0.1, 100.0) / 100.0
+        } else {
+            level.unwrap_or(0.2).abs().max(1e-6)
+        };
+        return (-reach, reach, 1.0, 1.0);
+    }
+    if super::marks::flag(options, "auto", true) {
+        let gain = level.unwrap_or(1.0).clamp(0.05, 8.0);
+        return (lo, hi, gain, 1.0);
+    }
+    (0.0, level.unwrap_or(hi).max(1e-6), 1.0, 1.0)
+}
+
+fn range_control(
+    id: &str,
+    label: &str,
+    min: f32,
+    max: f32,
+    step: f32,
+    value: &str,
+) -> scan_kit_core::Control {
+    let mut control = scan_kit_core::Control::plain(id, label, Vec::<&str>::new(), value);
+    control.options = vec![
+        scan_kit_core::Choice::full("min", &trim_range(min), "", ""),
+        scan_kit_core::Choice::full("max", &trim_range(max), "", ""),
+        scan_kit_core::Choice::full("step", &trim_range(step), "", ""),
+    ];
+    control.kind = "range".into();
+    control
+}
+
+fn trim_range(value: f32) -> String {
+    if (value - value.round()).abs() < 1e-4 && value.abs() < 1.0e6 {
+        format!("{}", value.round() as i32)
+    } else {
+        let text = format!("{value:.4}");
+        text.trim_end_matches('0').trim_end_matches('.').to_string()
     }
 }
 
-fn push_workspace_controls(
+fn level_text(options: &Value, default: f32, min: f32, max: f32) -> String {
+    let raw = options
+        .get("level")
+        .and_then(Value::as_str)
+        .and_then(|text| text.parse::<f32>().ok())
+        .unwrap_or(default);
+    trim_range(raw.clamp(min, max))
+}
+
+fn session_at(options: &Value, ids: &[String]) -> usize {
+    let raw = options.get("session").and_then(Value::as_str).unwrap_or("");
+    ids.iter().position(|id| id == raw).unwrap_or(0)
+}
+
+fn push_picture_controls(
     controls: &mut Vec<scan_kit_core::Control>,
     options: &Value,
     mark: &scan_kit_core::VolumeMark,
-    spots: Option<usize>,
+    model: &str,
+    compare: &str,
+    sessions: usize,
+    scale: &str,
 ) {
-    let cells = crate::workspace::cells_from(&[
-        options.get("cell0").and_then(Value::as_str),
-        options.get("cell1").and_then(Value::as_str),
-        options.get("cell2").and_then(Value::as_str),
-        options.get("cell3").and_then(Value::as_str),
-    ]);
-    for (index, cell) in cells.iter().enumerate() {
-        controls.push(crate::workspace::cell_control(index, *cell));
-    }
-    let plots = crate::workspace::plots_from(
-        [
-            options.get("plot0").and_then(Value::as_str),
-            options.get("plot1").and_then(Value::as_str),
+    let ray = pick(
+        options,
+        "ray",
+        "integrate",
+        &[
+            ("integrate", "Integrate"),
+            ("maximum", "Maximum"),
+            ("transparent", "Transparent"),
         ],
-        false,
     );
-    controls.push(crate::workspace::plot_control(0, plots[0]));
-    controls.push(crate::workspace::plot_control(1, plots[1]));
-    controls.push(
-        labeled(
-            "window",
-            "Window",
-            &[("full", "Full"), ("upper", "Upper half"), ("mid", "10–90%")],
-            pick(
-                options,
-                "window",
-                "full",
-                &[("full", "Full"), ("upper", "Upper half"), ("mid", "10–90%")],
-            ),
-        )
-        .grouped("Color"),
-    );
-    controls.push(
-        labeled(
-            "opacity",
-            "Opacity",
-            &[("1", "100%"), ("0.7", "70%"), ("0.4", "40%")],
-            pick(
-                options,
-                "opacity",
-                "1",
-                &[("1", "100%"), ("0.7", "70%"), ("0.4", "40%")],
-            ),
-        )
-        .grouped("Color"),
-    );
-    controls.push(
-        labeled(
-            "gain",
-            "Gain",
-            &[("0.5", "0.5"), ("1", "1"), ("2", "2")],
-            pick(
-                options,
-                "gain",
-                "1",
-                &[("0.5", "0.5"), ("1", "1"), ("2", "2")],
-            ),
-        )
-        .grouped("Color"),
-    );
+    let auto = super::marks::flag(options, "auto", true);
+    if compare != "gamma" {
+        if sessions <= 1 {
+            let family = if compare == "difference" {
+                Family::Divergent
+            } else {
+                Family::Sequential
+            };
+            controls.push(labeled("scale", "Scale", choices(family), scale).grouped("Picture"));
+        }
+        controls.push(
+            scan_kit_core::Control::plain(
+                "auto",
+                "Auto",
+                ["On", "Off"],
+                if auto { "On" } else { "Off" },
+            )
+            .grouped("Picture")
+            .checked(),
+        );
+        if compare == "difference" {
+            controls.push(
+                labeled(
+                    "error",
+                    "Full scale",
+                    &[("absolute", "Absolute"), ("percent", "Percent")],
+                    pick(
+                        options,
+                        "error",
+                        "absolute",
+                        &[("absolute", "Absolute"), ("percent", "Percent")],
+                    ),
+                )
+                .grouped("Picture"),
+            );
+        }
+        let (level_label, level_min, level_max, level_step, level_default) =
+            if compare == "difference" {
+                if pick(
+                    options,
+                    "error",
+                    "absolute",
+                    &[("absolute", "Absolute"), ("percent", "Percent")],
+                ) == "percent"
+                {
+                    ("Percent", 1.0, 100.0, 1.0, 10.0)
+                } else {
+                    ("Full scale", 0.01, 5.0, 0.01, 0.2)
+                }
+            } else if ray == "transparent" {
+                ("Opacity", 0.0, 1.0, 0.05, 1.0)
+            } else if auto {
+                ("Gain", 0.25, 4.0, 0.05, 1.0)
+            } else {
+                let span = mark.hi.abs().max(mark.lo.abs()).max(1.0);
+                ("Window", 0.0, span * 2.0, (span / 50.0).max(0.01), span)
+            };
+        controls.push(
+            range_control(
+                "level",
+                level_label,
+                level_min,
+                level_max,
+                level_step,
+                &level_text(options, level_default, level_min, level_max),
+            )
+            .grouped("Picture"),
+        );
+    }
     controls.push(
         labeled(
             "ray",
@@ -807,7 +880,7 @@ fn push_workspace_controls(
                 ],
             ),
         )
-        .grouped("View"),
+        .grouped("Picture"),
     );
     controls.push(
         labeled(
@@ -829,21 +902,7 @@ fn push_workspace_controls(
                 ],
             ),
         )
-        .grouped("View"),
-    );
-    controls.push(
-        labeled(
-            "gantry",
-            "Gantry",
-            &[("0", "0°"), ("90", "90°"), ("180", "180°"), ("270", "270°")],
-            pick(
-                options,
-                "gantry",
-                "0",
-                &[("0", "0°"), ("90", "90°"), ("180", "180°"), ("270", "270°")],
-            ),
-        )
-        .grouped("View"),
+        .grouped("Picture"),
     );
     controls.push(
         labeled(
@@ -857,163 +916,86 @@ fn push_workspace_controls(
                 &[("0.5", "0.5 mm"), ("1", "1 mm"), ("2", "2 mm")],
             ),
         )
-        .grouped("View"),
+        .grouped("Picture"),
     );
-    controls.push(
-        labeled(
-            "spot_cap",
-            "Spot cap",
-            &[("10000", "10k"), ("100000", "100k"), ("1000000", "1M")],
-            pick(
-                options,
-                "spot_cap",
-                "1000000",
-                &[("10000", "10k"), ("100000", "100k"), ("1000000", "1M")],
-            ),
-        )
-        .grouped("View"),
-    );
-    let grid = format!("{} × {} × {}", mark.shape[0], mark.shape[1], mark.shape[2]);
-    controls.push(crate::workspace::readout("Grid", "grid", &grid, "View"));
-    let spots = spots.unwrap_or(0).to_string();
-    controls.push(crate::workspace::readout("Spots", "spots", &spots, "View"));
-    controls.push(
-        labeled(
-            "dd",
-            "Dose difference",
-            &[("2", "2%"), ("3", "3%"), ("5", "5%")],
-            pick(options, "dd", "3", &[("2", "2%"), ("3", "3%"), ("5", "5%")]),
-        )
-        .grouped("Gamma"),
-    );
-    controls.push(
-        labeled(
-            "dta",
-            "Distance",
-            &[("2", "2 mm"), ("3", "3 mm")],
-            pick(options, "dta", "2", &[("2", "2 mm"), ("3", "3 mm")]),
-        )
-        .grouped("Gamma"),
-    );
-    controls.push(
-        labeled(
-            "cutoff",
-            "Low dose",
-            &[("5", "5%"), ("10", "10%"), ("20", "20%")],
-            pick(
-                options,
+    let mut grid = format!("{} × {} × {}", mark.shape[0], mark.shape[1], mark.shape[2]);
+    if model == "mc" {
+        grid.push_str(" · MC");
+    }
+    controls.push(crate::workspace::readout("Grid", "grid", &grid, "Picture"));
+    if compare == "gamma" {
+        controls.push(
+            labeled(
+                "dd",
+                "Dose difference",
+                &[("2", "2%"), ("3", "3%"), ("5", "5%")],
+                pick(options, "dd", "3", &[("2", "2%"), ("3", "3%"), ("5", "5%")]),
+            )
+            .grouped("Gamma"),
+        );
+        controls.push(
+            labeled(
+                "dta",
+                "Distance",
+                &[("2", "2 mm"), ("3", "3 mm")],
+                pick(options, "dta", "2", &[("2", "2 mm"), ("3", "3 mm")]),
+            )
+            .grouped("Gamma"),
+        );
+        controls.push(
+            labeled(
                 "cutoff",
-                "10",
+                "Low dose",
                 &[("5", "5%"), ("10", "10%"), ("20", "20%")],
-            ),
-        )
-        .grouped("Gamma"),
+                pick(
+                    options,
+                    "cutoff",
+                    "10",
+                    &[("5", "5%"), ("10", "10%"), ("20", "20%")],
+                ),
+            )
+            .grouped("Gamma"),
+        );
+        controls.push(crate::workspace::readout(
+            "TG-218",
+            "tg218",
+            "≥95% tolerance, <90% action",
+            "Gamma",
+        ));
+    }
+    let cells = crate::workspace::cells_from(&[
+        options.get("cell0").and_then(Value::as_str),
+        options.get("cell1").and_then(Value::as_str),
+        options.get("cell2").and_then(Value::as_str),
+        options.get("cell3").and_then(Value::as_str),
+    ]);
+    for (index, cell) in cells.iter().enumerate() {
+        controls.push(crate::workspace::cell_control(index, *cell));
+    }
+    let plots = crate::workspace::plots_from(
+        [
+            options.get("plot0").and_then(Value::as_str),
+            options.get("plot1").and_then(Value::as_str),
+        ],
+        false,
     );
-    controls.push(crate::workspace::readout(
-        "TG-218",
-        "tg218",
-        "≥95% tolerance, <90% action",
-        "Gamma",
-    ));
-    controls.push(
-        labeled(
-            "gap",
-            "IC gap",
-            &[("5", "5 mm"), ("10", "10 mm"), ("20", "20 mm")],
-            pick(
-                options,
-                "gap",
-                "10",
-                &[("5", "5 mm"), ("10", "10 mm"), ("20", "20 mm")],
-            ),
-        )
-        .grouped("Beam"),
-    );
-    controls.push(
-        labeled(
-            "margin",
-            "Auto margin",
-            &[
-                ("0", "Auto"),
-                ("5", "5 mm"),
-                ("10", "10 mm"),
-                ("20", "20 mm"),
-            ],
-            pick(
-                options,
-                "margin",
-                "0",
-                &[
-                    ("0", "Auto"),
-                    ("5", "5 mm"),
-                    ("10", "10 mm"),
-                    ("20", "20 mm"),
-                ],
-            ),
-        )
-        .grouped("Phantom"),
-    );
-    let phantom = format!(
-        "{:.0} × {:.0} × {:.0} mm",
-        mark.shape[0] as f32 * mark.voxel,
-        mark.shape[1] as f32 * mark.voxel,
-        mark.shape[2] as f32 * mark.voxel
-    );
-    controls.push(crate::workspace::readout(
-        "Phantom size",
-        "phantom_size",
-        &phantom,
-        "Phantom",
-    ));
-    let on = super::marks::flag(options, "field", true);
-    controls.push(
-        scan_kit_core::Control::plain(
-            "field",
-            "Field bounds",
-            ["On", "Off"],
-            if on { "On" } else { "Off" },
-        )
-        .grouped("Field")
-        .checked(),
-    );
-    controls.push(
-        labeled(
-            "preset",
-            "Preset",
-            &[
-                ("custom", "Custom"),
-                ("measured", "Measured dose"),
-                ("difference", "Difference"),
-                ("gamma", "Gamma"),
-                ("mc", "Monte Carlo"),
-            ],
-            "custom",
-        )
-        .grouped("Presets"),
-    );
+    controls.push(crate::workspace::plot_control(0, plots[0]));
+    controls.push(crate::workspace::plot_control(1, plots[1]));
 }
 
-fn view_paint(options: &Value) -> (f32, f32, u8, u8) {
-    let gain = match pick(
-        options,
-        "gain",
-        "1",
-        &[("0.5", "0.5"), ("1", "1"), ("2", "2")],
-    ) {
-        "0.5" => 0.5,
-        "2" => 2.0,
-        _ => 1.0,
-    };
-    let opacity = match pick(
-        options,
-        "opacity",
-        "1",
-        &[("0.4", "40%"), ("0.7", "70%"), ("1", "100%")],
-    ) {
-        "0.4" => 0.4,
-        "0.7" => 0.7,
-        _ => 1.0,
-    };
+/// The cyan phantom box. Thickness stays on `phantom`. Older saves stored the
+/// box on that same key as On or Off.
+fn phantom_shown(options: &Value) -> bool {
+    if options.get("phantom_box").is_some() {
+        return super::marks::flag(options, "phantom_box", false);
+    }
+    matches!(
+        options.get("phantom").and_then(Value::as_str),
+        Some("on" | "On" | "true")
+    )
+}
+
+fn view_paint(options: &Value) -> (u8, u8) {
     let mode = match pick(
         options,
         "ray",
@@ -1042,7 +1024,26 @@ fn view_paint(options: &Value) -> (f32, f32, u8, u8) {
         "cubic" => 2,
         _ => 1,
     };
-    (gain, opacity, mode, filter)
+    (mode, filter)
+}
+
+/// The displayed lattice. A heavy visit count used to keep only three planes;
+/// that shortcut is a cross in the ray march, so the view always asks for every voxel.
+fn lattice_planes(_frame: &scan_kit_core::DoseFrame) -> Option<[usize; 3]> {
+    None
+}
+
+/// Coarser spacing for the first picture. A 1 mm lattice of 24 million visits
+/// took 59 ms to deposit in release and 617 ms in debug, and the open waited
+/// for that before any picture. Doubling the spacing cuts the visits by about
+/// eight. 4 mm is the coarsest cube we still show.
+fn next_preview_voxel(voxel: f32, visits: u64) -> Option<f32> {
+    const PREVIEW_VISITS: u64 = 4_000_000;
+    if visits <= PREVIEW_VISITS || voxel >= 4.0 {
+        return None;
+    }
+    let next = (voxel * 2.0).min(4.0);
+    (next > voxel + 1e-4).then_some(next)
 }
 
 fn fill(
@@ -1054,6 +1055,7 @@ fn fill(
     wet_mm: f32,
     phantom_mm: f32,
     k_mu: f32,
+    gap_mm: f32,
     model: &str,
     histories: u32,
     medium_key: &str,
@@ -1083,7 +1085,7 @@ fn fill(
                             _ => protons_from_mu(
                                 f64::from(p.amount),
                                 f64::from(p.energy),
-                                f64::from(GAP_MM),
+                                f64::from(gap_mm),
                                 f64::from(k_mu),
                             ) as f32,
                         })
@@ -1115,7 +1117,7 @@ fn fill(
             phantom_mm,
             1.0,
             k_mu,
-            GAP_MM,
+            gap_mm,
             grid,
             planes,
         ),
@@ -1214,7 +1216,14 @@ fn pencils_from(
         let e = energy.get(i).copied().unwrap_or(f32::NAN);
         let px = x.get(i).copied().unwrap_or(f32::NAN);
         let py = y.get(i).copied().unwrap_or(f32::NAN);
-        if !e.is_finite() || !px.is_finite() || !py.is_finite() || e <= 1.0 {
+        // Python's dose loader treats |xy| past 0.9 × 10000 mm as a missing reading.
+        if !e.is_finite()
+            || !px.is_finite()
+            || !py.is_finite()
+            || e <= 1.0
+            || px.abs() >= ABS_INVALID_MM
+            || py.abs() >= ABS_INVALID_MM
+        {
             continue;
         }
         let delivered = dose.get(i).copied().unwrap_or(f32::NAN);
@@ -1260,6 +1269,72 @@ fn sigma_at(
         .unwrap_or(FALLBACK_SIGMA)
 }
 
+fn finite_median(values: &[f32]) -> f32 {
+    let mut kept: Vec<f32> = values
+        .iter()
+        .copied()
+        .filter(|value| value.is_finite())
+        .collect();
+    if kept.is_empty() {
+        return 0.0;
+    }
+    kept.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mid = kept.len() / 2;
+    if kept.len().is_multiple_of(2) {
+        (kept[mid - 1] + kept[mid]) * 0.5
+    } else {
+        kept[mid]
+    }
+}
+
+fn shifted(values: &[f32]) -> Vec<f32> {
+    let offset = finite_median(values);
+    values.iter().map(|value| value - offset).collect()
+}
+
+/// Plan-crossing isocenter, else the IC1 plane. Chamber medians are removed later.
+fn iso_plane_z(table: &std::collections::BTreeMap<String, Vec<f32>>) -> f32 {
+    let zx = axis_iso_z(
+        &col(table, "ic2_x"),
+        &col(table, "ic1_x"),
+        &col(table, "plan_x"),
+    );
+    let zy = axis_iso_z(
+        &col(table, "ic2_y"),
+        &col(table, "ic1_y"),
+        &col(table, "plan_y"),
+    );
+    match (zx, zy) {
+        (Some(x), Some(y)) => finite_median(&[x, y]),
+        (Some(z), None) | (None, Some(z)) => z,
+        (None, None) => IC1_Z_MM,
+    }
+}
+
+fn axis_iso_z(near: &[f32], far: &[f32], plan: &[f32]) -> Option<f32> {
+    let n = near.len().min(far.len()).min(plan.len());
+    let mut zs = Vec::new();
+    for i in 0..n {
+        let (a, b, spot) = (near[i], far[i], plan[i]);
+        if !a.is_finite() || !b.is_finite() || !spot.is_finite() {
+            continue;
+        }
+        let slope = (b - a) / IC_SEP_MM;
+        if slope.abs() < 1e-6 {
+            continue;
+        }
+        let z = IC2_Z_MM + (spot - a) / slope;
+        if z.is_finite() && z > IC2_Z_MM {
+            zs.push(z);
+        }
+    }
+    if zs.is_empty() {
+        None
+    } else {
+        Some(finite_median(&zs))
+    }
+}
+
 fn iso_ray(
     table: &std::collections::BTreeMap<String, Vec<f32>>,
 ) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
@@ -1275,8 +1350,12 @@ fn iso_ray(
             col(table, "ic1_sig_y"),
         );
     }
-    let z = IC1_Z_MM + 0.5 * IC_SEP_MM;
+    let z = iso_plane_z(table);
     let t = (z - IC2_Z_MM) / IC_SEP_MM;
+    let x2 = shifted(&x2);
+    let x1 = shifted(&x1);
+    let y2 = shifted(&y2);
+    let y1 = shifted(&y1);
     let x = x2
         .iter()
         .zip(x1.iter().chain(std::iter::repeat(&f32::NAN)))
@@ -1375,13 +1454,10 @@ fn difference(measured: &Volume, plan: &Volume) -> Volume {
     }
     Volume {
         values,
-        ..measured.clone()
+        origin: measured.origin,
+        shape: measured.shape,
+        voxel: measured.voxel,
     }
-}
-
-fn gamma_volume(measured: &Volume, plan: &Volume) -> Volume {
-    let (values, _, _) = gamma_of(measured, plan);
-    gamma_image(measured, &values)
 }
 
 fn push_dvh(lines: &mut Vec<Series>, volume: &Volume) {
@@ -1391,131 +1467,25 @@ fn push_dvh(lines: &mut Vec<Series>, volume: &Volume) {
     lines.push(line(xs, curve));
 }
 
-fn coarse_voxel(visits: u64, voxel: f32) -> f32 {
-    if visits <= 4_000_000 {
-        return voxel;
-    }
-    let scale = (visits as f64 / 4_000_000.0).cbrt() as f32;
-    (voxel * scale).clamp(voxel, 10.0)
-}
-
-fn coarse_dvh_volumes(
-    clouds: &[Cloud],
-    all: &[Pencil],
-    mat: scan_kit_core::Medium,
-    quantity: Quantity,
-    spread: f32,
-    scatter: bool,
-    wet_mm: f32,
-    phantom_mm: f32,
-    k_mu: f32,
-    compare: &str,
-    visits: u64,
-) -> Vec<Volume> {
-    let vox = coarse_voxel(visits, 1.0);
-    let frame = dose_frame(
-        mat, all, quantity, spread, scatter, wet_mm, phantom_mm, vox, k_mu, GAP_MM, 0.0,
-    );
-    let grid = Some((frame.origin, frame.shape, frame.voxel));
-    let paint = |pencils: &[Pencil]| {
-        analytic_on(
-            mat, pencils, quantity, spread, scatter, wet_mm, phantom_mm, vox, k_mu, GAP_MM, grid,
-            None,
-        )
-    };
-    if compare == "difference" {
-        clouds
-            .iter()
-            .map(|cloud| difference(&paint(&cloud.pencils), &paint(&cloud.plan)))
-            .collect()
-    } else {
-        clouds.iter().map(|cloud| paint(&cloud.pencils)).collect()
-    }
-}
-
-// ponytail: a clinical lattice's 3D gamma (thousands of offsets times the
-// high-dose box) does not return. Large maps score the peak slice in plane.
-// Upgrade path: search only the high-dose box on the GPU.
-fn plane_gamma(
-    reference: &[f32],
-    evaluated: &[f32],
-    cols: usize,
-    rows: usize,
-    voxel: f32,
-) -> (Vec<f32>, u32, u32) {
-    gamma_index(
-        reference,
-        evaluated,
-        [cols, rows, 1],
-        3.0,
-        2.0,
-        [voxel, voxel, voxel],
-        10.0,
+fn gamma_criteria(options: &Value) -> (f32, f32, f32) {
+    let dd = pick(options, "dd", "3", &[("2", "2%"), ("3", "3%"), ("5", "5%")])
+        .parse::<f32>()
+        .unwrap_or(3.0);
+    let dta = pick(options, "dta", "2", &[("2", "2 mm"), ("3", "3 mm")])
+        .parse::<f32>()
+        .unwrap_or(2.0);
+    let cutoff = pick(
+        options,
+        "cutoff",
+        "10",
+        &[("5", "5%"), ("10", "10%"), ("20", "20%")],
     )
+    .parse::<f32>()
+    .unwrap_or(10.0);
+    (dd, dta, cutoff)
 }
 
-fn gamma_planes(measured: &Volume, plan: &Volume, focus: [usize; 3]) -> (Volume, u32, u32) {
-    let [nx, ny, nz] = measured.shape;
-    let ix = focus[0].min(nx.saturating_sub(1));
-    let iy = focus[1].min(ny.saturating_sub(1));
-    let iz = focus[2].min(nz.saturating_sub(1));
-    let (axial, passed, scored) =
-        plane_gamma(&plan.axial(iz), &measured.axial(iz), nx, ny, measured.voxel);
-    let (coronal, _, _) = plane_gamma(
-        &plan.coronal(iy),
-        &measured.coronal(iy),
-        nx,
-        nz,
-        measured.voxel,
-    );
-    let (sagittal, _, _) = plane_gamma(
-        &plan.sagittal(ix),
-        &measured.sagittal(ix),
-        ny,
-        nz,
-        measured.voxel,
-    );
-    let mut values = vec![0.0; measured.values.len()];
-    for y in 0..ny {
-        for x in 0..nx {
-            values[x + nx * (y + ny * iz)] = axial[x + nx * y];
-        }
-    }
-    for z in 0..nz {
-        if z == iz {
-            continue;
-        }
-        for x in 0..nx {
-            values[x + nx * (iy + ny * z)] = coronal[x + nx * z];
-        }
-    }
-    for z in 0..nz {
-        if z == iz {
-            continue;
-        }
-        for y in 0..ny {
-            if y == iy {
-                continue;
-            }
-            values[ix + nx * (y + ny * z)] = sagittal[y + ny * z];
-        }
-    }
-    (
-        Volume {
-            origin: measured.origin,
-            shape: measured.shape,
-            voxel: measured.voxel,
-            values,
-        },
-        passed,
-        scored,
-    )
-}
-
-fn gamma_of(measured: &Volume, plan: &Volume) -> (Vec<f32>, u32, u32) {
-    gamma_with(measured, plan, 3.0, 2.0, 10.0)
-}
-
+/// Measured dose is the reference. The plan is what the search samples.
 fn gamma_with(
     measured: &Volume,
     plan: &Volume,
@@ -1525,57 +1495,14 @@ fn gamma_with(
 ) -> (Vec<f32>, u32, u32) {
     let n = measured.values.len().min(plan.values.len());
     gamma_index(
-        &plan.values[..n],
         &measured.values[..n],
+        &plan.values[..n],
         measured.shape,
         dose_percent,
         distance_mm,
         [measured.voxel, measured.voxel, measured.voxel],
         cutoff_pct,
     )
-}
-
-fn preset_options(options: &Value) -> Value {
-    let mut owned = options.clone();
-    let preset = options
-        .get("preset")
-        .and_then(Value::as_str)
-        .unwrap_or("custom");
-    match preset {
-        "measured" | "Measured dose" => {
-            owned["compare"] = Value::String("measured".into());
-            owned["model"] = Value::String("analytic".into());
-        }
-        "difference" | "Difference" => {
-            owned["compare"] = Value::String("difference".into());
-        }
-        "gamma" | "Gamma" => {
-            owned["compare"] = Value::String("gamma".into());
-            owned["dd"] = Value::String("3".into());
-            owned["dta"] = Value::String("2".into());
-            owned["cutoff"] = Value::String("10".into());
-        }
-        "mc" | "Monte Carlo" => {
-            owned["model"] = Value::String("mc".into());
-        }
-        _ => {}
-    }
-    owned["preset"] = Value::String("custom".into());
-    owned
-}
-
-fn rotate_pencils(pencils: &mut [Pencil], degrees: f32) {
-    if degrees.abs() < 1e-3 {
-        return;
-    }
-    let angle = degrees.to_radians();
-    let (sin, cos) = angle.sin_cos();
-    for pencil in pencils {
-        let x = pencil.x;
-        let y = pencil.y;
-        pencil.x = cos * x - sin * y;
-        pencil.y = sin * x + cos * y;
-    }
 }
 
 fn gamma_image(template: &Volume, values: &[f32]) -> Volume {
@@ -1585,32 +1512,6 @@ fn gamma_image(template: &Volume, values: &[f32]) -> Volume {
         voxel: template.voxel,
         values: values.to_vec(),
     }
-}
-
-fn field_readout(volume: &Volume, plan: &Volume, iz: usize, edge: &str) -> Option<[f32; 4]> {
-    let (fraction, per_slice, from_plan) = match edge {
-        "peak90" => (0.9, false, false),
-        "peak50" => (0.5, false, false),
-        "slice20" => (0.2, true, false),
-        "plan90" => (0.9, false, true),
-        _ => (0.5, true, false),
-    };
-    let source = if from_plan { plan } else { volume };
-    let image = source.axial(iz.min(source.shape[2].saturating_sub(1)));
-    let peak = if per_slice {
-        image.iter().copied().fold(0.0f32, f32::max)
-    } else {
-        source.values.iter().copied().fold(0.0f32, f32::max)
-    };
-    field_bounds(
-        &image,
-        source.shape[0],
-        source.shape[1],
-        source.origin[0],
-        source.origin[1],
-        source.voxel,
-        fraction * peak,
-    )
 }
 
 fn window(volumes: &[Volume], compare: &str) -> (f32, f32) {
@@ -1640,67 +1541,6 @@ fn window(volumes: &[Volume], compare: &str) -> (f32, f32) {
     }
 }
 
-fn slice_panel(
-    title: &str,
-    volumes: &[Volume],
-    ramp: u8,
-    lo: f32,
-    hi: f32,
-    xmin: f32,
-    xmax: f32,
-    ymin: f32,
-    ymax: f32,
-    equal: bool,
-    image: impl Fn(&Volume) -> Vec<f32>,
-    cols: u32,
-    rows: u32,
-) -> Panel {
-    let series = volumes
-        .iter()
-        .map(|volume| Series::Heatmap {
-            values: image(volume),
-            cols,
-            rows,
-            ramp,
-            color: if is_session(ramp) {
-                MARK
-            } else {
-                [1.0, 1.0, 1.0, 1.0]
-            },
-            lo,
-            hi,
-        })
-        .collect();
-    Panel {
-        title: title.into(),
-        y_label: String::new(),
-        x_label: String::new(),
-        xmin,
-        xmax,
-        ymin,
-        ymax,
-        series,
-        x_labels: Vec::new(),
-        equal,
-    }
-}
-
-fn lines_panel(title: &str, series: Vec<Series>, y_label: &str) -> Panel {
-    let (xmin, xmax, ymin, ymax) = series_span(&series);
-    Panel {
-        title: title.into(),
-        y_label: y_label.into(),
-        x_label: String::new(),
-        xmin,
-        xmax,
-        ymin,
-        ymax,
-        series,
-        x_labels: Vec::new(),
-        equal: false,
-    }
-}
-
 fn line(xs: Vec<f32>, ys: Vec<f32>) -> Series {
     Series::Polyline {
         xs,
@@ -1725,58 +1565,15 @@ fn note(title: &str) -> Panel {
     }
 }
 
-fn rect_guide(bounds: [f32; 4]) -> Series {
-    let [x0, x1, y0, y1] = bounds;
-    Series::Guide {
-        xs: vec![x0, x1, x1, x0, x0],
-        ys: vec![y0, y0, y1, y1, y0],
-        color: GUIDE,
-        thickness: 1.0,
+fn volume_unit(quantity: Quantity, mode: u8, compare: &str) -> &'static str {
+    if compare == "gamma" {
+        return "γ";
     }
-}
-
-fn guide_line(xs: Vec<f32>, ys: Vec<f32>) -> Series {
-    Series::Guide {
-        xs,
-        ys,
-        color: GUIDE,
-        thickness: 1.0,
-    }
-}
-
-fn volume_cross_x(volume: &Volume, ix: usize) -> f32 {
-    volume.origin[0] + (ix as f32 + 0.5) * volume.voxel
-}
-
-fn series_span(series: &[Series]) -> (f32, f32, f32, f32) {
-    let mut xmin = f32::MAX;
-    let mut xmax = f32::MIN;
-    let mut ymin = f32::MAX;
-    let mut ymax = f32::MIN;
-    for series in series {
-        if let Series::Polyline { xs, ys, .. } = series {
-            for (x, y) in xs.iter().zip(ys) {
-                if x.is_finite() && y.is_finite() {
-                    xmin = xmin.min(*x);
-                    xmax = xmax.max(*x);
-                    ymin = ymin.min(*y);
-                    ymax = ymax.max(*y);
-                }
-            }
-        }
-    }
-    if !xmin.is_finite() {
-        (0.0, 1.0, 0.0, 1.0)
-    } else {
-        if (xmax - xmin).abs() < 1e-4 {
-            xmin -= 0.5;
-            xmax += 0.5;
-        }
-        if (ymax - ymin).abs() < 1e-4 {
-            ymin -= 0.5;
-            ymax += 0.5;
-        }
-        (xmin, xmax, ymin, ymax)
+    match quantity {
+        Quantity::Dose if mode == 0 => "Gy·mm",
+        Quantity::Dose => "Gy",
+        Quantity::Mu => "MU/mm³",
+        Quantity::Protons => "protons/mm³",
     }
 }
 
@@ -1795,5 +1592,351 @@ fn trim_num(value: f32) -> String {
         "2".into()
     } else {
         "1".into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use scan_kit_core::{dose_frame, water, Pencil, Quantity, Volume};
+
+    use super::{lattice_planes, next_preview_voxel};
+
+    #[test]
+    fn a_heavy_field_is_still_the_full_lattice() {
+        let pencils: Vec<_> = (0..40)
+            .map(|i| Pencil {
+                x: i as f32 * 5.0,
+                y: 0.0,
+                sx: 4.0,
+                sy: 4.0,
+                energy: 180.0,
+                amount: 0.05,
+            })
+            .collect();
+        let frame = dose_frame(
+            water(),
+            &pencils,
+            Quantity::Dose,
+            1.0,
+            true,
+            0.0,
+            0.0,
+            1.0,
+            2.0e-8,
+            10.0,
+            0.0,
+        );
+        assert!(frame.planes_only(), "visits {}", frame.visits);
+        assert!(lattice_planes(&frame).is_none());
+        assert_eq!(next_preview_voxel(1.0, frame.visits), Some(2.0));
+        assert_eq!(next_preview_voxel(1.0, 1_000), None);
+        assert_eq!(next_preview_voxel(4.0, frame.visits), None);
+    }
+
+    #[test]
+    fn a_heavy_preview_opens_as_a_coarser_cube() {
+        let root = std::env::temp_dir().join(format!(
+            "scan-kit-preview-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let session = root.join("sess");
+        std::fs::create_dir_all(&session).unwrap();
+        let mut map = String::from("energy,charge_req,position_x,position_y\n");
+        let mut spots = String::from("ic1_total_dose,ic2_total_dose,position_x,position_y\n");
+        for i in 0..40 {
+            let x = i * 5;
+            map.push_str(&format!("180,0.05,{x},0\n"));
+            spots.push_str(&format!("0.05,0.05,{x},0\n"));
+        }
+        std::fs::write(session.join("input_map.csv"), map).unwrap();
+        std::fs::write(session.join("spot_data.csv"), spots).unwrap();
+        let scene = super::volumetric(
+            &root,
+            &["sess".into()],
+            &serde_json::json!({ "_preview": true }),
+            None,
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(
+            (scene.volume.voxel - 2.0).abs() < 0.05,
+            "voxel {}",
+            scene.volume.voxel
+        );
+        let [nx, ny, nz] = scene.volume.shape;
+        let nx = nx as usize;
+        let ny = ny as usize;
+        let nz = nz as usize;
+        let (px, py, pz) = {
+            let mut best = 0.0f32;
+            let mut at = (0, 0, 0);
+            for z in 0..nz {
+                for y in 0..ny {
+                    for x in 0..nx {
+                        let value = scene.volume.values[x + nx * (y + ny * z)];
+                        if value > best {
+                            best = value;
+                            at = (x, y, z);
+                        }
+                    }
+                }
+            }
+            at
+        };
+        let off = scene
+            .volume
+            .values
+            .iter()
+            .enumerate()
+            .filter(|(index, value)| {
+                if **value <= 0.0 {
+                    return false;
+                }
+                let x = index % nx;
+                let y = (index / nx) % ny;
+                let z = index / (nx * ny);
+                x != px && y != py && z != pz
+            })
+            .count();
+        assert!(off > 100, "off-plane voxels {off}");
+    }
+
+    #[test]
+    fn a_sentinel_position_does_not_stretch_the_lattice() {
+        let root = std::env::temp_dir().join(format!(
+            "scan-kit-sentinel-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let session = root.join("sess");
+        std::fs::create_dir_all(&session).unwrap();
+        std::fs::write(
+            session.join("input_map.csv"),
+            "energy,charge_req,position_x,position_y\n180,0.05,0,0\n180,0.05,10000,0\n",
+        )
+        .unwrap();
+        std::fs::write(
+            session.join("spot_data.csv"),
+            "ic1_total_dose\n0.05\n0.05\n",
+        )
+        .unwrap();
+        let scene = super::volumetric(&root, &["sess".into()], &serde_json::json!({}), None);
+        let _ = std::fs::remove_dir_all(&root);
+        let span = scene.volume.shape[0] as f32 * scene.volume.voxel;
+        assert!(span < 120.0, "x span {span} mm");
+    }
+
+    #[test]
+    fn a_sentinel_sigma_drops_the_spot() {
+        let root = std::env::temp_dir().join(format!(
+            "scan-kit-sigma-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let session = root.join("sess");
+        std::fs::create_dir_all(&session).unwrap();
+        std::fs::write(
+            session.join("input_map.csv"),
+            "energy,charge_req,position_x,position_y\n180,0.05,0,0\n180,0.05,200,0\n",
+        )
+        .unwrap();
+        std::fs::write(
+            session.join("spot_data.csv"),
+            "ic1_total_dose,r_ic1_x_spot_sigma,r_ic1_y_spot_sigma\n0.05,2,2\n0.05,-1,2\n",
+        )
+        .unwrap();
+        let scene = super::volumetric(&root, &["sess".into()], &serde_json::json!({}), None);
+        let _ = std::fs::remove_dir_all(&root);
+        let span = scene.volume.shape[0] as f32 * scene.volume.voxel;
+        assert!(span < 120.0, "x span {span} mm");
+    }
+
+    #[test]
+    fn gamma_scores_measured_points_and_searches_the_plan() {
+        let measured = Volume {
+            origin: [0.0, 0.0, 0.0],
+            shape: [2, 2, 1],
+            voxel: 1.0,
+            values: vec![1.0, 0.0, 0.0, 0.0],
+        };
+        let plan = Volume {
+            values: vec![1.0, 1.0, 1.0, 1.0],
+            ..measured.clone()
+        };
+        let (_, passed, scored) = super::gamma_with(&measured, &plan, 3.0, 2.0, 10.0);
+        assert_eq!((scored, passed), (1, 1));
+    }
+
+    #[test]
+    fn ic_gap_scales_the_deposited_dose() {
+        let root = std::env::temp_dir().join(format!(
+            "scan-kit-gap-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let session = root.join("sess");
+        std::fs::create_dir_all(&session).unwrap();
+        std::fs::write(
+            session.join("input_map.csv"),
+            "energy,charge_req,position_x,position_y\n180,0.05,0,0\n",
+        )
+        .unwrap();
+        std::fs::write(session.join("spot_data.csv"), "ic1_total_dose\n0.05\n").unwrap();
+        let peak = |gap: &str| {
+            let scene = super::volumetric(
+                &root,
+                &["sess".into()],
+                &serde_json::json!({ "gap": gap, "voxel": "2" }),
+                None,
+            );
+            scene.volume.values.iter().copied().fold(0.0f32, f32::max)
+        };
+        let narrow = peak("5");
+        let wide = peak("20");
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(narrow > 0.0 && wide > 0.0, "narrow {narrow} wide {wide}");
+        assert!(
+            narrow > wide * 2.0,
+            "a 5 mm gap ({narrow}) should deposit more than a 20 mm gap ({wide})"
+        );
+    }
+
+    #[test]
+    fn the_sidebar_follows_the_dose_workflow() {
+        let root = std::env::temp_dir().join(format!(
+            "scan-kit-sidebar-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let session = root.join("sess");
+        std::fs::create_dir_all(&session).unwrap();
+        std::fs::write(
+            session.join("input_map.csv"),
+            "energy,charge_req,position_x,position_y\n180,0.05,0,0\n",
+        )
+        .unwrap();
+        std::fs::write(session.join("spot_data.csv"), "ic1_total_dose\n0.05\n").unwrap();
+        let scene = super::volumetric(&root, &["sess".into()], &serde_json::json!({}), None);
+        let titles = fieldsets(&scene.controls);
+        assert_eq!(
+            titles,
+            ["Dose", "Calculation", "Phantom", "Field", "Picture"]
+        );
+        assert_eq!(
+            scene
+                .controls
+                .iter()
+                .filter(|control| control.id == "phantom")
+                .count(),
+            1
+        );
+        assert!(scene
+            .controls
+            .iter()
+            .any(|control| control.id == "phantom_box"));
+        assert!(scene
+            .controls
+            .iter()
+            .all(|control| control.id != "dd" && control.group != "Gamma"));
+        let boxed = super::volumetric(
+            &root,
+            &["sess".into()],
+            &serde_json::json!({ "phantom_box": "On", "phantom": "100" }),
+            None,
+        );
+        assert!(boxed.volume.show_phantom);
+        assert!(boxed
+            .controls
+            .iter()
+            .any(|control| { control.id == "phantom" && control.value.starts_with("100") }));
+        let old = super::volumetric(
+            &root,
+            &["sess".into()],
+            &serde_json::json!({ "phantom": "On" }),
+            None,
+        );
+        assert!(old.volume.show_phantom);
+        let gamma = super::volumetric(
+            &root,
+            &["sess".into()],
+            &serde_json::json!({ "compare": "gamma" }),
+            None,
+        );
+        let gamma_sets = fieldsets(&gamma.controls);
+        assert_eq!(
+            gamma_sets,
+            [
+                "Dose",
+                "Calculation",
+                "Phantom",
+                "Field",
+                "Picture",
+                "Gamma"
+            ]
+        );
+        assert!(gamma
+            .controls
+            .iter()
+            .all(|control| control.id != "scale" && control.id != "level" && control.id != "auto"));
+        assert_eq!(
+            scene
+                .controls
+                .iter()
+                .find(|control| control.id == "model")
+                .map(|control| control.kind.as_str()),
+            Some("radio")
+        );
+        assert!(scene
+            .controls
+            .iter()
+            .all(|control| control.id != "histories"));
+        let mc = super::volumetric(
+            &root,
+            &["sess".into()],
+            &serde_json::json!({ "model": "mc" }),
+            None,
+        );
+        assert_eq!(
+            mc.controls
+                .iter()
+                .find(|control| control.id == "histories")
+                .map(|control| control.kind.as_str()),
+            Some("radio")
+        );
+        assert!(mc.controls.iter().all(|control| control.id != "scatter"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn fieldsets(controls: &[scan_kit_core::Control]) -> Vec<&str> {
+        let mut titles = Vec::new();
+        for control in controls {
+            if control.group == "Cell" || control.group == "Plot" {
+                continue;
+            }
+            if titles.last() != Some(&control.group.as_str()) {
+                titles.push(control.group.as_str());
+            }
+        }
+        titles
     }
 }

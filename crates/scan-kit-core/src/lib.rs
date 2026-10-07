@@ -27,9 +27,11 @@ pub use cloud::{
 };
 pub use config::{apply_form, config_form};
 pub use dose::{
-    analytic_on, analytic_volume, bragg_idd, csda_range_mm, dose_frame, field_bounds, medium,
-    protons_from_mu, ray_value, raymarch, robust_high, sample_index, sample_mm, through_wet, water,
-    DoseFrame, McJob, McResult, Medium, PatientRequest, Pencil, Quantity, SlabRequest, Volume,
+    analytic_on, analytic_volume, bragg_idd, brick_grid, csda_range_mm, dose_film_uv, dose_frame,
+    field_bounds, film_height, line_scale, medium, protons_from_mu, ray_rgba, ray_value, raymarch,
+    robust_high, sample_index, sample_mm, scan_volume, through_wet, view_ray_scale, water,
+    DoseFrame, McJob, McResult, Medium, PatientRequest, Pencil, Quantity, RayView, SlabRequest,
+    Volume, VolumeScan, BRICK, FOV_Y,
 };
 pub use geometry::{IC1_Z_MM, IC2_Z_MM, IC_SEP_MM};
 pub use plan::{

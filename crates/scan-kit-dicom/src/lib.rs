@@ -8,7 +8,8 @@ mod phantom;
 
 pub use patient::{
     gantry_to_patient, hu_density, hu_label, inside_structure, load_study, read_ion_plan,
-    write_water_study, Beam, CtVolume, IonPlan, IonPlanSpot, PatientStudy, Spot, Structure,
+    scanner_density, scanner_label, write_water_study, Beam, CtVolume, IonPlan, IonPlanSpot,
+    PatientStudy, Spot, Structure,
 };
 pub use phantom::{phantom_summary, write_phantom_study};
 

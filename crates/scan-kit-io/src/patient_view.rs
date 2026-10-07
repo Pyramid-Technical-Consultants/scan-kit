@@ -5,10 +5,10 @@ use std::path::Path;
 use scan_kit_core::{
     dvh, gamma_index, index, DataTable, McJob, Panel, PatientRequest, PlotScene, Volume,
 };
-use scan_kit_dicom::{hu_density, hu_label, inside_structure, load_study, PatientStudy};
+use scan_kit_dicom::{inside_structure, load_study, scanner_density, scanner_label, PatientStudy};
 use serde_json::Value;
 
-use super::beam::{beam_record, protons_per_mu, spot_record};
+use super::beam::{beam_record_bdl, protons_per_mu_bdl, spot_record_bdl};
 use super::marks::pick;
 use super::mc_tables::mc_tables;
 use super::tables::spot_table;
@@ -47,14 +47,28 @@ pub(crate) fn scene(
     for index in 1..=groups.len() {
         names.push(index.to_string());
     }
+    let segment = pick(
+        options,
+        "segment",
+        if groups.is_empty() {
+            "plan"
+        } else {
+            "delivered"
+        },
+        &[("plan", "Plan"), ("delivered", "Delivered")],
+    );
     let sent = options
         .get("fraction")
         .and_then(Value::as_str)
         .unwrap_or("Plan");
-    let fraction = if names.iter().any(|name| name == sent) {
-        sent
-    } else {
+    let fraction = if segment == "plan" {
         "Plan"
+    } else if names.iter().any(|name| name == sent) && sent != "Plan" {
+        sent
+    } else if groups.is_empty() {
+        "Plan"
+    } else {
+        "1"
     };
     let beam_filter = options
         .get("beams")
@@ -64,17 +78,45 @@ pub(crate) fn scene(
                 .ok()
                 .and_then(|index| index.checked_sub(1))
         });
-    let (spots, protons, beams) =
-        records(&study, root, fraction, &deliveries, &groups, beam_filter);
+    let bdl = pick(
+        options,
+        "bdl",
+        "un_rs",
+        &[
+            ("un_rs", "UN + shifter"),
+            ("un", "UN"),
+            ("dn_rs", "DN + shifter"),
+            ("dn", "DN"),
+        ],
+    );
+    let scanner = pick(
+        options,
+        "scanner",
+        "default",
+        &[
+            ("default", "Default"),
+            ("water", "Water"),
+            ("solid", "Solid water"),
+        ],
+    );
+    let (spots, protons, beams) = records(
+        &study,
+        root,
+        fraction,
+        &deliveries,
+        &groups,
+        beam_filter,
+        bdl,
+    );
     let tables = mc_tables();
     let [nx, ny, nz] = study.ct.shape;
     let nvox = nx * ny * nz;
     let mut material = vec![0u8; nvox];
     let mut density = vec![0.0f32; nvox];
     for (index, hu) in study.ct.hu.iter().enumerate() {
-        let label = hu_label(*hu);
+        let label = scanner_label(scanner, *hu);
         material[index] = tables.ids.iter().position(|id| *id == label).unwrap_or(0) as u8;
-        density[index] = hu_density(*hu);
+        density[index] = scanner_density(scanner, *hu);
     }
     let request = PatientRequest {
         spots,
@@ -99,9 +141,9 @@ pub(crate) fn scene(
             voxel: study.ct.spacing[0],
             values: vec![0.0; nvox],
         });
-    let rbe = match pick(options, "rbe", "1", &[("1", "1.0"), ("1.1", "1.1")]) {
-        "1.1" => 1.1f32,
-        _ => 1.0,
+    let rbe = match pick(options, "rbe", "1.1", &[("1", "1.0"), ("1.1", "1.1")]) {
+        "1" | "1.0" => 1.0f32,
+        _ => 1.1,
     };
     if (rbe - 1.0).abs() > 1e-3 {
         for value in &mut dose.values {
@@ -128,12 +170,11 @@ pub(crate) fn scene(
         ]);
         rows.push(vec!["Left grid".into(), format!("{left:.1}%")]);
     }
-    let goal = study
-        .tps
-        .as_ref()
-        .map(|tps| tps.hu.iter().copied().fold(0.0f32, f32::max) * 0.95)
-        .unwrap_or(0.0);
+    let goals_text = goal_text(options, &study);
     for (id, structure) in study.structures.iter().enumerate() {
+        if !structure_on(options, id, &structure.name) {
+            continue;
+        }
         let mark = (id + 1) as u8;
         let mut mask = vec![false; nvox];
         for index in 0..nvox {
@@ -154,26 +195,41 @@ pub(crate) fn scene(
         let xs = edges.iter().take(curve.len()).copied().collect();
         dvh_lines.push(scan_kit_core::Series::Polyline {
             xs,
-            ys: curve,
+            ys: curve.clone(),
             color: MARK,
             thickness: 1.5,
         });
-        if goal > 0.0 {
-            let ptv: Vec<f32> = dose
-                .values
-                .iter()
-                .zip(&mask)
-                .filter_map(|(value, keep)| keep.then_some(*value))
-                .collect();
-            let result = scan_kit_dicom::clinical_goal(&ptv, goal, 0.95);
+        let reference = study
+            .tps
+            .as_ref()
+            .map(|tps| {
+                tps.hu
+                    .iter()
+                    .zip(&mask)
+                    .filter_map(|(value, keep)| keep.then_some(*value))
+                    .fold(0.0f32, f32::max)
+            })
+            .filter(|value| *value > 0.0)
+            .map(|peak| peak * rbe)
+            .unwrap_or_else(|| {
+                dose.values
+                    .iter()
+                    .zip(&mask)
+                    .filter_map(|(value, keep)| keep.then_some(*value))
+                    .fold(0.0f32, f32::max)
+            });
+        for (name, body) in parse_goals(&goals_text) {
+            if !structure.name.eq_ignore_ascii_case(&name) {
+                continue;
+            }
             rows.push(vec![
                 structure.name.clone(),
-                format!(
-                    "{} {:.0}%",
-                    if result.passed { "pass" } else { "fail" },
-                    result.volume_fraction * 100.0
-                ),
+                eval_goal(&body, &dose.values, &mask, reference),
             ]);
+        }
+        rows.push(vec!["DVH".into(), structure.name.clone()]);
+        for (edge, volume) in edges.iter().zip(&curve) {
+            rows.push(vec!["curve".into(), format!("{edge:.4},{volume:.4}")]);
         }
     }
     if dvh_lines.is_empty() {
@@ -184,14 +240,15 @@ pub(crate) fn scene(
         if tps.shape != dose.shape || tps.hu.len() != result.volume.values.len() {
             return None;
         }
+        let (dd, dta, cutoff) = gamma_criteria(options);
         let (values, passed, scored) = gamma_index(
             &tps.hu,
             &result.volume.values,
             dose.shape,
-            3.0,
-            2.0,
+            dd,
+            dta,
             study.ct.spacing,
-            10.0,
+            cutoff,
         );
         let rate = if scored == 0 {
             0.0
@@ -220,7 +277,7 @@ pub(crate) fn scene(
         ],
         true,
     );
-    let (panels, volume) = crate::workspace::assemble(&crate::workspace::Workspace {
+    let (panels, mut volume) = crate::workspace::assemble(&crate::workspace::Workspace {
         dose,
         ct: study.ct.hu.clone(),
         labels,
@@ -240,23 +297,101 @@ pub(crate) fn scene(
         field: None,
         show_field: false,
     });
+    volume.unit = if (rbe - 1.0).abs() > 1e-3 {
+        "Gy(RBE)".into()
+    } else {
+        "Gy".into()
+    };
     let (columns, column_weights, row_weights, row_splits) = crate::workspace::layout();
     let mut controls = vec![
-        history_control(histories),
+        scan_kit_core::Control::plain(
+            "segment",
+            "Dose",
+            ["Plan", "Delivered"],
+            if segment == "plan" {
+                "Plan"
+            } else {
+                "Delivered"
+            },
+        )
+        .grouped("Study"),
         scan_kit_core::Control::plain("fraction", "Fraction", &names, fraction).grouped("Study"),
         beam_control(&study, beam_filter),
         scan_kit_core::Control::plain(
             "rbe",
             "RBE",
             ["1.0", "1.1"],
-            if (rbe - 1.1).abs() < 1e-3 {
-                "1.1"
-            } else {
+            if (rbe - 1.0).abs() < 1e-3 {
                 "1.0"
+            } else {
+                "1.1"
             },
         )
         .grouped("Study"),
+        scan_kit_core::Control::plain(
+            "scanner",
+            "Scanner",
+            ["Default", "Water", "Solid water"],
+            match scanner {
+                "water" => "Water",
+                "solid" => "Solid water",
+                _ => "Default",
+            },
+        )
+        .grouped("Study"),
+        scan_kit_core::Control::plain(
+            "bdl",
+            "Beam model",
+            ["UN + shifter", "UN", "DN + shifter", "DN"],
+            match bdl {
+                "un" => "UN",
+                "dn" => "DN",
+                "dn_rs" => "DN + shifter",
+                _ => "UN + shifter",
+            },
+        )
+        .grouped("Study"),
+        history_control(histories),
+        gamma_control(
+            "dd",
+            "Dose difference",
+            "3",
+            &[("2", "2%"), ("3", "3%"), ("5", "5%")],
+            options,
+        ),
+        gamma_control(
+            "dta",
+            "Distance",
+            "2",
+            &[("2", "2 mm"), ("3", "3 mm")],
+            options,
+        ),
+        gamma_control(
+            "cutoff",
+            "Low dose",
+            "10",
+            &[("5", "5%"), ("10", "10%"), ("20", "20%")],
+            options,
+        ),
     ];
+    let goals_value = goal_text(options, &study);
+    let mut goals =
+        scan_kit_core::Control::plain("goals", "Goals", Vec::<&str>::new(), &goals_value);
+    goals.kind = "text".into();
+    controls.push(goals.grouped("Goals"));
+    for (id, structure) in study.structures.iter().enumerate() {
+        let on = structure_on(options, id, &structure.name);
+        controls.push(
+            scan_kit_core::Control::plain(
+                format!("roi{id}"),
+                &structure.name,
+                ["On", "Off"],
+                if on { "On" } else { "Off" },
+            )
+            .grouped("Structures")
+            .checked(),
+        );
+    }
     for (index, cell) in cells.iter().enumerate() {
         controls.push(crate::workspace::cell_control(index, *cell));
     }
@@ -348,12 +483,15 @@ fn records(
     deliveries: &[Delivery],
     groups: &[Vec<usize>],
     beam_filter: Option<usize>,
+    bdl: &str,
 ) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
     let mut spots = Vec::new();
     let mut protons = Vec::new();
     let mut beams = Vec::new();
     for (index, beam) in study.beams.iter().enumerate() {
-        if let Ok(record) = beam_record(beam.gantry, beam.couch, &beam.position, beam.isocenter) {
+        if let Ok(record) =
+            beam_record_bdl(beam.gantry, beam.couch, &beam.position, beam.isocenter, bdl)
+        {
             beams.extend_from_slice(&record);
         }
         if fraction == "Plan" {
@@ -371,6 +509,7 @@ fn records(
                     index,
                     spot.wet_mm,
                     spot.shifter_distance_mm,
+                    bdl,
                 );
             }
         }
@@ -409,6 +548,7 @@ fn records(
                     delivery.beam,
                     plan_spot.wet_mm,
                     plan_spot.shifter_distance_mm,
+                    bdl,
                 );
             }
         }
@@ -426,10 +566,11 @@ fn push_spot(
     beam: usize,
     wet: f32,
     distance: f32,
+    bdl: &str,
 ) {
-    if let Ok(record) = spot_record(energy, x, y, beam as f32, wet, distance) {
+    if let Ok(record) = spot_record_bdl(energy, x, y, beam as f32, wet, distance, bdl) {
         spots.extend_from_slice(&record);
-        protons.push(mu * protons_per_mu(energy));
+        protons.push(mu * protons_per_mu_bdl(energy, bdl));
     }
 }
 
@@ -465,7 +606,8 @@ fn history_control(histories: u32) -> scan_kit_core::Control {
         PAIRS.iter().map(|(_, label)| *label),
         value,
     )
-    .grouped("Model")
+    .grouped("Calculation")
+    .radio()
 }
 
 fn note_scene(message: &str) -> PlotScene {
@@ -494,14 +636,227 @@ fn note_scene(message: &str) -> PlotScene {
     }
 }
 
+fn structure_on(options: &Value, id: usize, name: &str) -> bool {
+    super::marks::flag(
+        options,
+        &format!("roi{id}"),
+        !name.eq_ignore_ascii_case("EXTERNAL"),
+    )
+}
+
+fn goal_text(options: &Value, study: &PatientStudy) -> String {
+    let stored = options
+        .get("goals")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    if stored.is_empty() {
+        default_goals(study)
+    } else {
+        stored.to_string()
+    }
+}
+
+fn default_goals(study: &PatientStudy) -> String {
+    let target = study
+        .structures
+        .iter()
+        .find(|structure| structure.name.to_ascii_uppercase().contains("PTV"))
+        .or_else(|| {
+            study
+                .structures
+                .iter()
+                .find(|structure| !structure.name.eq_ignore_ascii_case("EXTERNAL"))
+        });
+    match target {
+        Some(structure) => format!(
+            "{}: D95% >= 95%\n{}: D2% <= 107%",
+            structure.name, structure.name
+        ),
+        None => String::new(),
+    }
+}
+
+fn parse_goals(text: &str) -> Vec<(String, String)> {
+    text.lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            let (name, rest) = line.split_once(':')?;
+            let name = name.trim();
+            let rest = rest.trim();
+            (!name.is_empty() && !rest.is_empty()).then(|| (name.to_string(), rest.to_string()))
+        })
+        .collect()
+}
+
+fn gamma_control(
+    id: &str,
+    label: &str,
+    default: &'static str,
+    pairs: &[(&'static str, &'static str)],
+    options: &Value,
+) -> scan_kit_core::Control {
+    let shown = pick(options, id, default, pairs);
+    let value = pairs
+        .iter()
+        .find(|(key, _)| *key == shown)
+        .map(|(_, label)| *label)
+        .unwrap_or(shown);
+    let labels: Vec<&str> = pairs.iter().map(|(_, label)| *label).collect();
+    scan_kit_core::Control::plain(id, label, labels, value).grouped("Gamma")
+}
+
+fn gamma_criteria(options: &Value) -> (f32, f32, f32) {
+    (
+        pick(options, "dd", "3", &[("2", "2%"), ("3", "3%"), ("5", "5%")])
+            .parse()
+            .unwrap_or(3.0),
+        pick(options, "dta", "2", &[("2", "2 mm"), ("3", "3 mm")])
+            .parse()
+            .unwrap_or(2.0),
+        pick(
+            options,
+            "cutoff",
+            "10",
+            &[("5", "5%"), ("10", "10%"), ("20", "20%")],
+        )
+        .parse()
+        .unwrap_or(10.0),
+    )
+}
+
+fn eval_goal(body: &str, dose: &[f32], mask: &[bool], reference: f32) -> String {
+    let compact: String = body
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect::<String>()
+        .to_ascii_lowercase();
+    if let Some(rest) = compact.strip_prefix("dmax") {
+        let (op, rest) = split_cmp(rest);
+        let (limit, _) = take_number(rest);
+        let max = masked_max(dose, mask);
+        return verdict(compare(max, op, limit), format!("Dmax {max:.2} Gy"));
+    }
+    if let Some(rest) = compact.strip_prefix('v') {
+        let (gy, rest) = take_number(rest);
+        let rest = rest.trim_start_matches("gy");
+        let (op, rest) = split_cmp(rest);
+        let (pct, _) = take_number(rest);
+        let got = volume_above(dose, mask, gy) * 100.0;
+        return verdict(compare(got, op, pct), format!("V{gy:.0} {got:.0}%"));
+    }
+    if let Some(rest) = compact.strip_prefix('d') {
+        let (vol, rest) = take_number(rest);
+        let rest = rest.trim_start_matches('%');
+        let (op, rest) = split_cmp(rest);
+        let (limit, unit) = take_number(rest);
+        let (edges, curve) = dvh(dose, mask, 32);
+        let got = dose_at_volume(&edges, &curve, vol / 100.0);
+        let want = if unit.contains("gy") {
+            limit
+        } else {
+            reference * limit / 100.0
+        };
+        return verdict(compare(got, op, want), format!("D{vol:.0}% {got:.2} Gy"));
+    }
+    "unparsed".into()
+}
+
+fn dose_at_volume(edges: &[f32], curve: &[f32], fraction: f32) -> f32 {
+    if curve.is_empty() {
+        return 0.0;
+    }
+    for index in 0..curve.len().saturating_sub(1) {
+        if curve[index] >= fraction && curve[index + 1] <= fraction {
+            let span = (curve[index] - curve[index + 1]).max(1e-6);
+            let t = (curve[index] - fraction) / span;
+            return edges[index] + t * (edges[index + 1] - edges[index]);
+        }
+    }
+    if curve[0] < fraction {
+        edges[0]
+    } else {
+        edges[curve.len().min(edges.len()).saturating_sub(1)]
+    }
+}
+
+fn split_cmp(text: &str) -> (&str, &str) {
+    for op in [">=", "<=", ">", "<"] {
+        if let Some(rest) = text.strip_prefix(op) {
+            return (op, rest);
+        }
+    }
+    (">=", text)
+}
+
+fn take_number(text: &str) -> (f32, &str) {
+    let end = text
+        .find(|c: char| !(c.is_ascii_digit() || c == '.' || c == '-'))
+        .unwrap_or(text.len());
+    let (head, rest) = text.split_at(end);
+    (head.parse().unwrap_or(0.0), rest)
+}
+
+fn compare(got: f32, op: &str, want: f32) -> bool {
+    match op {
+        ">=" => got + 1e-4 >= want,
+        "<=" => got - 1e-4 <= want,
+        ">" => got > want,
+        "<" => got < want,
+        _ => false,
+    }
+}
+
+fn verdict(passed: bool, detail: String) -> String {
+    format!("{} {detail}", if passed { "pass" } else { "fail" })
+}
+
+fn masked_max(dose: &[f32], mask: &[bool]) -> f32 {
+    dose.iter()
+        .zip(mask)
+        .filter_map(|(value, keep)| keep.then_some(*value))
+        .fold(0.0f32, f32::max)
+}
+
+fn volume_above(dose: &[f32], mask: &[bool], gy: f32) -> f32 {
+    let mut hit = 0.0;
+    let mut total = 0.0;
+    for (value, keep) in dose.iter().zip(mask) {
+        if *keep {
+            total += 1.0;
+            if *value >= gy {
+                hit += 1.0;
+            }
+        }
+    }
+    if total == 0.0 {
+        0.0
+    } else {
+        hit / total
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::group_fractions;
+    use super::{eval_goal, group_fractions, parse_goals};
 
     #[test]
     fn a_repeated_beam_starts_another_fraction() {
         assert_eq!(group_fractions(&[0, 1]), vec![vec![0, 1]]);
         assert_eq!(group_fractions(&[0, 0]), vec![vec![0], vec![1]]);
         assert_eq!(group_fractions(&[0, 1, 0]), vec![vec![0, 1], vec![2]]);
+    }
+
+    #[test]
+    fn a_flat_dose_meets_d95_and_fails_a_tight_maximum() {
+        let dose = vec![2.0; 8];
+        let mask = vec![true; 8];
+        let pass = eval_goal("D95% >= 95%", &dose, &mask, 2.0);
+        assert!(pass.starts_with("pass"), "{pass}");
+        let fail = eval_goal("Dmax < 1 Gy", &dose, &mask, 2.0);
+        assert!(fail.starts_with("fail"), "{fail}");
+        let volume = eval_goal("V20Gy < 30%", &dose, &mask, 2.0);
+        assert!(volume.starts_with("pass"), "{volume}");
+        assert_eq!(parse_goals("PTV: D95% >= 95%").len(), 1);
     }
 }

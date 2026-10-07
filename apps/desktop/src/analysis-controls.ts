@@ -2,7 +2,7 @@ import { segmentChoices } from "@/CatalogField";
 
 export type ControlSlot = {
   id: string;
-  kind: "select" | "check" | "segments";
+  kind: "select" | "check" | "segments" | "range" | "text" | "radio";
 };
 
 export type SegmentItem = {
@@ -38,7 +38,17 @@ export function controlSections(controls: readonly SectionControl[]): ControlSec
     const slot: ControlSlot = {
       id: control.id,
       kind:
-        control.kind === "check" ? "check" : control.kind === "segments" ? "segments" : "select",
+        control.kind === "check"
+          ? "check"
+          : control.kind === "segments"
+            ? "segments"
+            : control.kind === "range"
+              ? "range"
+              : control.kind === "text"
+                ? "text"
+                : control.kind === "radio"
+                  ? "radio"
+                  : "select",
     };
     const last = sections[sections.length - 1];
     if (last != null && last.title === title) {
@@ -96,23 +106,6 @@ export function applyOption(
   id: string,
   value: string,
 ): Record<string, string> {
-  if (id === "preset") {
-    const next: Record<string, string> = { ...options, preset: "Custom" };
-    if (value === "Measured dose") {
-      next.compare = "Measured";
-      next.model = "Analytic";
-    } else if (value === "Difference") {
-      next.compare = "Difference";
-    } else if (value === "Gamma") {
-      next.compare = "Gamma";
-      next.dd = "3%";
-      next.dta = "2 mm";
-      next.cutoff = "10%";
-    } else if (value === "Monte Carlo") {
-      next.model = "Monte Carlo";
-    }
-    return next;
-  }
   if (id !== "source") {
     return { ...options, [id]: value };
   }

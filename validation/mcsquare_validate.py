@@ -1,7 +1,9 @@
 """Check the GPU Monte Carlo against MCsquare, the reference engine.
 
 Not part of ``pytest``: run it after changing Monte Carlo physics, not after UI work.
-Checks only run the GPU; MCsquare's dose is cached in ``validation/goldens/``.
+Slab checks run the Rust engine in ``scan-kit-compute`` (the one the app uses).
+The patient suite still runs the Python engine, which is the one that returns LETd.
+MCsquare's dose is cached in ``validation/goldens/``.
 Each golden holds the depth dose, R80, lateral sigma, energy and centroid over the
 whole grid, plus the dose around the beam for a 3D gamma. Run from the repo root::
 
@@ -18,6 +20,7 @@ folder or the executable). Exits nonzero if any case misses its suite's toleranc
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import os
 import subprocess
@@ -377,23 +380,65 @@ def load_golden(case: Case) -> dict:
 
 # ---- GPU
 
-def gpu_grid(case: Case):
-    from scan_kit.views.dose_volume_fill import DoseGrid
-
-    lat, depth = case.lateral, case.depth
-    return DoseGrid(np.array([-lat / 2, -lat / 2, -float(depth)]), (lat, lat, depth), False, 1.0)
+def rust_mc() -> Path:
+    """Release binary of the app's slab Monte Carlo. Built when the sources are newer."""
+    name = "mc-case.exe" if os.name == "nt" else "mc-case"
+    path = ROOT / "target" / "release" / name
+    sources = (
+        ROOT / "crates" / "scan-kit-compute" / "src" / "bin" / "mc-case.rs",
+        ROOT / "crates" / "scan-kit-compute" / "src" / "mc.rs",
+        ROOT / "crates" / "scan-kit-compute" / "src" / "mc_transport.wgsl",
+    )
+    built = path.is_file() and path.stat().st_mtime
+    if not path.is_file() or any(src.stat().st_mtime > built for src in sources):
+        subprocess.run(
+            ["cargo", "build", "--release", "-p", "scan-kit-compute", "--bin", "mc-case"],
+            cwd=ROOT,
+            check=True,
+        )
+    if not path.is_file():
+        raise RuntimeError(f"missing {path}")
+    return path
 
 
 def run_gpu(case: Case, histories: int, seed: int = SEED):
-    """GPU dose (nz, ny, nx) Gy per proton and the McResult."""
-    from scan_kit.views.dose_mc import mc_dose
-
+    """Rust GPU dose (nz, ny, nx) Gy per proton, and ``None`` in place of the old result."""
     x, y, e, w = (np.array(c, dtype=float) for c in zip(*case.spots))
-    return mc_dose(
-        x, y, np.full_like(x, case.sigma), np.full_like(x, case.sigma), e, w / w.sum(), case.medium,
-        gpu_grid(case), depth=float(case.depth), wet=float(case.wet), spread_pct=SPREAD_PCT,
-        histories=histories, seed=seed,
-    )
+    w = w / w.sum()
+    lat, depth = case.lateral, case.depth
+    request = {
+        "medium": case.medium,
+        "x": x.tolist(),
+        "y": y.tolist(),
+        "sx": [case.sigma] * len(x),
+        "sy": [case.sigma] * len(x),
+        "energy": e.tolist(),
+        "protons": w.tolist(),
+        "histories": int(histories),
+        "seed": int(seed),
+        "spread_pct": SPREAD_PCT,
+        "wet_mm": float(case.wet),
+        "depth_mm": float(depth),
+        "voxel_mm": 1.0,
+        "origin": [-lat / 2, -lat / 2, -float(depth)],
+        "shape": [lat, lat, depth],
+    }
+    with tempfile.TemporaryDirectory(prefix="mc_case_") as tmp:
+        work = Path(tmp)
+        req = work / "request.json"
+        out = work / "dose.f32"
+        req.write_text(json.dumps(request))
+        done = subprocess.run(
+            [str(rust_mc()), str(req), str(out)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if done.returncode != 0 or not out.is_file():
+            raise RuntimeError(done.stderr[-2000:] or done.stdout[-2000:] or "mc-case failed")
+        nx, ny, nz = (int(part) for part in done.stdout.strip().splitlines()[-1].split())
+        dose = np.fromfile(out, dtype="<f4").reshape(nz, ny, nx)
+    return dose, None
 
 
 def gamma_rate(ref: np.ndarray, evl: np.ndarray, dose_pct: float, spacing_mm=1.0) -> float:
@@ -591,7 +636,11 @@ def run_mcsquare_patient(case: PatientCase, exe: Path, primaries: int, work: Pat
 
 
 def run_gpu_patient(work: Path, histories: int, seed: int = SEED):
-    """GPU (dose, LETd, density, McResult) for the case built in *work*."""
+    """Python GPU (dose, LETd, density, McResult) for the case built in *work*.
+
+    The Rust host does not read the LET tally back yet, so this suite stays on
+    the Python engine that does.
+    """
     from scan_kit.dicom import gantry_to_patient
     from scan_kit.dicom.calibration import CtCalibration
     from scan_kit.qa import BeamModel

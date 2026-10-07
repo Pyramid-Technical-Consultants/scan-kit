@@ -459,13 +459,13 @@ git submodule update --init third_party/MCsquare
 - `tests/test_dose_mc.py` covers tables, energy bookkeeping, determinism, spot placement, and range against its own stopping powers.
 - `tests/test_qa.py` covers the patient path on a synthetic DICOM study. It checks the beam model, the IEC chain against MCsquare's, energy closure on the CT, delivery matching, DVHs, goals and gamma.
 
-These tests need a hardware WebGPU adapter and skip without one. MCsquare agreement lives in `validation/mcsquare_validate.py`, which you run by hand after changing the Monte Carlo physics, the CT calibration or the beam model. It has three suites:
+These tests need a hardware WebGPU adapter and skip without one. MCsquare agreement lives in `validation/mcsquare_validate.py`, which you run by hand after changing the Monte Carlo physics, the CT calibration or the beam model. The slab suites run the Rust engine in `scan-kit-compute` (they build `mc-case` if it is missing). The patient suite still runs the Python engine, which returns LETd. It has three suites:
 
 - **fast** (about 30 s): five small, awkward cases at 1e6 GPU histories with looser tolerances. They cover a 1 mm spot, copper at 70 MeV, a water-to-aluminum interface, nuclear build-up at 180 MeV, and three off-axis spots of mixed energy and weight in PMMA.
 - **full** (about 10 min): the fast cases plus water from 70 to 230 MeV at two spot sizes, each other Monte Carlo medium, an entrance WET and a 245-spot field, all at 1e7 histories. The field runs 4× the histories because it spreads them over far more voxels.
 - **patient** (about 1 min): CTs through MCsquare's `default` scanner calibration and `BDL_default_DN_RangeShifter` beam model, at 1e7 histories. It covers a tissue phantom with a bone slab and with a lung slab, a range shifter, an oblique gantry at 45° with couch rotation, and MCsquare's sample CT with three fields. Each case reports 3D gamma at 2 %/2 mm, Dmean, D95, D2 and dose-weighted LETd, over voxels of at least 0.1 g/cm³.
 
-Each case reports the integrated depth dose, R80, lateral σ at three depths, total energy, dose centroid and a 3D gamma. A check runs only the GPU. MCsquare's result for every case is cached in `validation/goldens/` as its summaries plus the dose around the beam.
+Each case reports the integrated depth dose, R80, lateral σ at three depths, total energy, dose centroid and a 3D gamma. A check runs only that engine. MCsquare's result for every case is cached in `validation/goldens/` as its summaries plus the dose around the beam.
 
 ```bash
 python validation/mcsquare_validate.py fast

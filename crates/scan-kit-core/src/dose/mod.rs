@@ -14,7 +14,10 @@ mod ray;
 pub use deposit::{analytic_on, analytic_volume, dose_frame};
 pub use gamma::{field_bounds, gamma_index, robust_high};
 pub use kernel::{bragg_idd, csda_range_mm, protons_from_mu, through_wet};
-pub use ray::{ray_value, raymarch, sample_index, sample_mm};
+pub use ray::{
+    brick_grid, dose_film_uv, film_height, line_scale, ray_rgba, ray_value, raymarch, sample_index,
+    sample_mm, scan_volume, view_ray_scale, RayView, VolumeScan, BRICK, FOV_Y,
+};
 
 pub(super) const K_BETHE: f64 = 0.307075;
 pub(super) const ME: f64 = 0.51099895;
@@ -27,9 +30,9 @@ pub(super) const LAYER_STEP: f64 = 0.1;
 pub(super) const MAX_LAYERS: usize = 1024;
 pub(super) const SIGMA_CUT: f64 = 4.0;
 pub(super) const MAX_CELLS: usize = 512;
-// ponytail: 8e6 cell visits is the debug-build ceiling for a full 1 mm deposit.
-// Above it, only the three planes through the weighted peak are filled.
-// Upgrade path: a GPU splat of the same kernel.
+// A full 1 mm deposit past this many cell visits is expensive in a debug build.
+// `analytic_on` can still fill only the three focus planes, but the volumetric
+// view does not: that lattice raymarches as a cross.
 pub(super) const PLANE_VISITS: u64 = 8_000_000;
 pub(super) const TABLE_N: usize = 4000;
 pub(super) const W_AIR_EV: f64 = 33.97;
@@ -265,46 +268,53 @@ impl Volume {
         image
     }
 
-    /// Depth from the entrance (mm) and dose, entrance first.
+    /// Depth from the entrance face of the grid (mm) and dose, entrance first.
+    /// The beam is −Z, so the high-z face is the entrance.
     pub fn depth_profile(&self, x: usize, y: usize) -> (Vec<f32>, Vec<f32>) {
         let nz = self.shape[2];
+        let face = self.origin[2] + nz as f32 * self.voxel;
         let mut depth = Vec::with_capacity(nz);
         let mut dose = Vec::with_capacity(nz);
         for z in (0..nz).rev() {
             let z_mm = self.origin[2] + (z as f32 + 0.5) * self.voxel;
-            depth.push(-z_mm);
+            depth.push(face - z_mm);
             dose.push(self.get(x, y, z));
         }
         (depth, dose)
     }
 
-    pub fn lateral_profile(&self, y: usize, z: usize) -> (Vec<f32>, Vec<f32>) {
+    /// Across the beam (X), millimetres from the crosshair.
+    pub fn lateral_profile(&self, x: usize, y: usize, z: usize) -> (Vec<f32>, Vec<f32>) {
         let nx = self.shape[0];
+        let x0 = self.origin[0] + (x as f32 + 0.5) * self.voxel;
         let mut xs = Vec::with_capacity(nx);
         let mut dose = Vec::with_capacity(nx);
-        for x in 0..nx {
-            xs.push(self.origin[0] + (x as f32 + 0.5) * self.voxel);
-            dose.push(self.get(x, y, z));
+        for column in 0..nx {
+            xs.push(self.origin[0] + (column as f32 + 0.5) * self.voxel - x0);
+            dose.push(self.get(column, y, z));
         }
         (xs, dose)
     }
 
-    /// Profile along y at one x and depth.
-    pub fn longitudinal_profile(&self, x: usize, z: usize) -> (Vec<f32>, Vec<f32>) {
-        let ny = self.shape[1];
-        let mut ys = Vec::with_capacity(ny);
-        let mut dose = Vec::with_capacity(ny);
-        for y in 0..ny {
-            ys.push(self.origin[1] + (y as f32 + 0.5) * self.voxel);
-            dose.push(self.get(x, y, z));
+    /// Along the beam, millimetres from the crosshair. Positive is deeper.
+    pub fn longitudinal_profile(&self, x: usize, y: usize, z: usize) -> (Vec<f32>, Vec<f32>) {
+        let nz = self.shape[2];
+        let z0 = self.origin[2] + (z as f32 + 0.5) * self.voxel;
+        let mut xs = Vec::with_capacity(nz);
+        let mut dose = Vec::with_capacity(nz);
+        for depth in 0..nz {
+            let z_mm = self.origin[2] + (depth as f32 + 0.5) * self.voxel;
+            xs.push(z0 - z_mm);
+            dose.push(self.get(x, y, depth));
         }
-        (ys, dose)
+        (xs, dose)
     }
 
     /// Sum across the profile's other in-plane axis. The unit is Gy·mm².
     pub fn depth_integral(&self, y: usize) -> (Vec<f32>, Vec<f32>) {
         let [nx, _, nz] = self.shape;
         let area = self.voxel * self.voxel;
+        let face = self.origin[2] + nz as f32 * self.voxel;
         let mut depth = Vec::with_capacity(nz);
         let mut dose = Vec::with_capacity(nz);
         for z in (0..nz).rev() {
@@ -312,42 +322,45 @@ impl Volume {
             for x in 0..nx {
                 sum += self.get(x, y, z);
             }
-            depth.push(-(self.origin[2] + (z as f32 + 0.5) * self.voxel));
+            depth.push(face - (self.origin[2] + (z as f32 + 0.5) * self.voxel));
             dose.push(sum * area);
         }
         (depth, dose)
     }
 
-    pub fn lateral_integral(&self, z: usize) -> (Vec<f32>, Vec<f32>) {
+    pub fn lateral_integral(&self, x: usize, z: usize) -> (Vec<f32>, Vec<f32>) {
         let [nx, ny, _] = self.shape;
         let area = self.voxel * self.voxel;
+        let x0 = self.origin[0] + (x as f32 + 0.5) * self.voxel;
         let mut xs = Vec::with_capacity(nx);
         let mut dose = Vec::with_capacity(nx);
-        for x in 0..nx {
+        for column in 0..nx {
             let mut sum = 0.0;
             for y in 0..ny {
-                sum += self.get(x, y, z);
+                sum += self.get(column, y, z);
             }
-            xs.push(self.origin[0] + (x as f32 + 0.5) * self.voxel);
+            xs.push(self.origin[0] + (column as f32 + 0.5) * self.voxel - x0);
             dose.push(sum * area);
         }
         (xs, dose)
     }
 
-    pub fn longitudinal_integral(&self, z: usize) -> (Vec<f32>, Vec<f32>) {
-        let [nx, ny, _] = self.shape;
+    pub fn longitudinal_integral(&self, y: usize, z: usize) -> (Vec<f32>, Vec<f32>) {
+        let [nx, _, nz] = self.shape;
         let area = self.voxel * self.voxel;
-        let mut ys = Vec::with_capacity(ny);
-        let mut dose = Vec::with_capacity(ny);
-        for y in 0..ny {
+        let z0 = self.origin[2] + (z as f32 + 0.5) * self.voxel;
+        let mut xs = Vec::with_capacity(nz);
+        let mut dose = Vec::with_capacity(nz);
+        for depth in 0..nz {
             let mut sum = 0.0;
             for x in 0..nx {
-                sum += self.get(x, y, z);
+                sum += self.get(x, y, depth);
             }
-            ys.push(self.origin[1] + (y as f32 + 0.5) * self.voxel);
+            let z_mm = self.origin[2] + (depth as f32 + 0.5) * self.voxel;
+            xs.push(z0 - z_mm);
             dose.push(sum * area);
         }
-        (ys, dose)
+        (xs, dose)
     }
 
     /// Sum through the plane. Values are Gy·mm and use their own range.
@@ -402,36 +415,6 @@ impl Volume {
             2 => (self.sagittal(index), self.shape[1], self.shape[2]),
             _ => (self.axial(index), self.shape[0], self.shape[1]),
         }
-    }
-
-    /// Clockwise quarter turns of an image whose row 0 is the low axis.
-    pub fn rotate_plane(
-        image: &[f32],
-        cols: usize,
-        rows: usize,
-        turns: u8,
-    ) -> (Vec<f32>, usize, usize) {
-        let turns = turns % 4;
-        if turns == 0 || cols == 0 || rows == 0 {
-            return (image.to_vec(), cols, rows);
-        }
-        let (ncols, nrows) = if turns % 2 == 1 {
-            (rows, cols)
-        } else {
-            (cols, rows)
-        };
-        let mut out = vec![0.0; ncols * nrows];
-        for y in 0..rows {
-            for x in 0..cols {
-                let (nx, ny) = match turns {
-                    1 => (rows - 1 - y, x),
-                    2 => (cols - 1 - x, rows - 1 - y),
-                    _ => (y, cols - 1 - x),
-                };
-                out[nx + ncols * ny] = image[x + cols * y];
-            }
-        }
-        (out, ncols, nrows)
     }
 
     pub fn index_of(&self, axis: usize, mm: f32) -> usize {

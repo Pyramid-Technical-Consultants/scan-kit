@@ -26,7 +26,10 @@ import { AnalysisMenu, analysisId, analysisName } from "@/analysis-menu";
 import { ButtonSegmentGroup } from "@/components/button-segment-group";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
+import { Slider } from "@/components/ui/slider";
+import { Textarea } from "@/components/ui/textarea";
 import { Field, FieldLabel, FieldLegend, FieldSet } from "@/components/ui/field";
+import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
 import { SessionList } from "@/session-list";
 import { optionIcon } from "@/option-icons";
 import { backingSize, plotHeader, shownHeader, type PlotHeader, type ViewControl } from "@/plot-header";
@@ -47,27 +50,77 @@ import {
 
 type Plotter = import("@/wasm/scan_kit_plot.js").WebPlot;
 
-type DoseFrame = { x: number; y: number; w: number; h: number };
+type DoseFrame = {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  plotX: number;
+  plotY: number;
+  plotW: number;
+  plotH: number;
+};
 
 function isDoseFrame(value: unknown): value is DoseFrame {
   if (typeof value !== "object" || value == null) {
     return false;
   }
   const frame = value as DoseFrame;
-  return [frame.x, frame.y, frame.w, frame.h].every(
+  return [frame.x, frame.y, frame.w, frame.h, frame.plotX, frame.plotY, frame.plotW, frame.plotH].every(
     (item) => typeof item === "number" && Number.isFinite(item),
   );
 }
 
-function exportStudyReport(table: { columns: readonly string[]; rows: readonly (readonly string[])[] }) {
-  const lines = [table.columns.join("\t"), ...table.rows.map((row) => row.join("\t"))];
-  const blob = new Blob([lines.join("\n")], { type: "text/plain" });
+function rangeBound(
+  options: readonly { id: string; label: string }[],
+  id: string,
+  fallback: number,
+): number {
+  const found = options.find((option) => option.id === id);
+  const value = Number(found?.label);
+  return Number.isFinite(value) ? value : fallback;
+}
+
+function escapeHtml(text: string): string {
+  return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+function downloadText(name: string, text: string, type: string) {
+  const blob = new Blob([text], { type });
   const url = URL.createObjectURL(blob);
   const link = document.createElement("a");
   link.href = url;
-  link.download = "scan-kit-report.txt";
+  link.download = name;
   link.click();
   URL.revokeObjectURL(url);
+}
+
+function exportStudyReport(table: { columns: readonly string[]; rows: readonly (readonly string[])[] }) {
+  const summary = table.rows.filter((row) => row[0] !== "DVH" && row[0] !== "curve");
+  const body = summary
+    .map((row) => `<tr><td>${escapeHtml(row[0] ?? "")}</td><td>${escapeHtml(row[1] ?? "")}</td></tr>`)
+    .join("\n");
+  downloadText(
+    "scan-kit-report.html",
+    `<!DOCTYPE html>\n<meta charset="utf-8">\n<title>Scan Kit dose report</title>\n<table>\n<tr><th>Item</th><th>Value</th></tr>\n${body}\n</table>\n`,
+    "text/html",
+  );
+  const curves = table.rows.filter((row) => row[0] === "DVH" || row[0] === "curve");
+  if (curves.length === 0) {
+    return;
+  }
+  const lines = ["structure,dose_gy,volume"];
+  let name = "";
+  for (const row of curves) {
+    if (row[0] === "DVH") {
+      name = row[1] ?? "";
+      continue;
+    }
+    const [dose, volume] = (row[1] ?? "").split(",");
+    const cell = name.includes(",") || name.includes('"') ? `"${name.replace(/"/g, '""')}"` : name;
+    lines.push(`${cell},${dose ?? ""},${volume ?? ""}`);
+  }
+  downloadText("scan-kit-dvh.csv", `${lines.join("\n")}\n`, "text/csv");
 }
 
 function canvasScale(node: HTMLCanvasElement | null): { sx: number; sy: number } {
@@ -117,29 +170,46 @@ function DoseChrome({
         const value = resolved[item.id] ?? control.value;
         const slice = item.kind === "cell" && value !== "3D";
         const profile = item.kind === "plot" && value !== "DVH" && value !== "Gamma histogram";
+        const band = Math.max(0, (frame.plotY - frame.y) / sy);
         return (
           <div
             key={item.id}
-            className="pointer-events-none absolute flex items-start justify-between"
-            style={{ left: frame.x / sx, top: frame.y / sy, width: frame.w / sx }}
+            className="pointer-events-none absolute flex items-center justify-end"
+            style={{
+              left: frame.x / sx,
+              top: frame.y / sy,
+              width: (frame.plotX + frame.plotW - frame.x) / sx,
+              height: band,
+            }}
           >
-            <div className="pointer-events-auto flex">
+            <div className="pointer-events-auto flex items-center gap-1 pr-1">
               {slice ? (
-                <Button type="button" size="sm" variant="outline" onClick={() => onAction(item.panel, "rotate")}>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  aria-label="Rotate 90 degrees"
+                  onClick={() => onAction(item.panel, "rotate")}
+                >
                   90°
                 </Button>
               ) : null}
               {slice || profile ? (
-                <Button type="button" size="sm" variant="outline" onClick={() => onAction(item.panel, "integral")}>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  aria-label="Integral"
+                  onClick={() => onAction(item.panel, "integral")}
+                >
                   ∫
                 </Button>
               ) : null}
-            </div>
-            <div className="pointer-events-auto min-w-0">
               <ChoiceSelect
                 control={control}
                 value={value}
                 disabled={false}
+                fit
                 onChange={(next) => onChange(item.id, next)}
               />
             </div>
@@ -219,11 +289,13 @@ function ChoiceSelect({
   control,
   value,
   disabled,
+  fit = false,
   onChange,
 }: {
   control: ViewControl;
   value: string;
   disabled?: boolean;
+  fit?: boolean;
   onChange: (value: string) => void;
 }) {
   const items = control.options.map((option) => ({ ...option, value: option.label }));
@@ -239,7 +311,7 @@ function ChoiceSelect({
         }
       }}
     >
-      <SelectTrigger size="sm" className="w-full cursor-pointer">
+      <SelectTrigger size="sm" className={fit ? "w-fit max-w-44 cursor-pointer" : "w-full cursor-pointer"}>
         <SelectValue>
           {selected == null ? null : (
             <ChoiceFace label={selected.label} detail={selected.detail} icon={selected.icon} />
@@ -331,6 +403,7 @@ export function AnalysisView({
   const [frames, setFrames] = useState<DoseFrame[]>([]);
   const [frameScale, setFrameScale] = useState({ sx: 1, sy: 1 });
   const shown = (meta?.panels.length ?? 0) > 0;
+  const viewRef = useRef(viewId);
 
   const requestDraw = () => {
     if (frame.current !== 0) {
@@ -361,6 +434,9 @@ export function AnalysisView({
       node.width = next.width;
       node.height = next.height;
     }
+    plotter.current?.set_chrome(
+      viewRef.current === "volumetric" ? Math.ceil(36 * window.devicePixelRatio) : 0,
+    );
     plotter.current?.resize(next.width, next.height);
     requestDraw();
   };
@@ -470,10 +546,11 @@ export function AnalysisView({
   }, [shown]);
 
   useEffect(() => {
+    viewRef.current = viewId;
     if (shown) {
       fitCanvas();
     }
-  }, [shown]);
+  }, [shown, viewId]);
 
   const orderKey = sessions.map((session) => session.id).join("\0");
   const hiddenKey = hidden.join("\0");
@@ -642,6 +719,7 @@ export function AnalysisView({
     const onDown = (event: PointerEvent) => {
       dragging = true;
       node.setPointerCapture(event.pointerId);
+      node.focus({ preventScroll: true });
     };
     const onUp = () => {
       dragging = false;
@@ -651,12 +729,31 @@ export function AnalysisView({
         return;
       }
       const point = locate(event);
-      plotter.current?.pan(point.x, point.y, event.movementX * point.sx, event.movementY * point.sy);
+      plotter.current?.pan(
+        point.x,
+        point.y,
+        event.movementX * point.sx,
+        event.movementY * point.sy,
+        event.buttons,
+        event.shiftKey,
+      );
       requestDraw();
     };
     const onDouble = () => {
       plotter.current?.reset();
       requestDraw();
+    };
+    const onKey = (event: KeyboardEvent) => {
+      const used = plotter.current?.dose_key(event.key, event.ctrlKey) ?? false;
+      if (!used) {
+        return;
+      }
+      event.preventDefault();
+      event.stopPropagation();
+      requestDraw();
+    };
+    const onMenu = (event: Event) => {
+      event.preventDefault();
     };
     node.addEventListener("wheel", onWheel, { passive: false });
     node.addEventListener("pointerdown", onDown);
@@ -664,6 +761,8 @@ export function AnalysisView({
     node.addEventListener("pointercancel", onUp);
     node.addEventListener("pointermove", onMove);
     node.addEventListener("dblclick", onDouble);
+    node.addEventListener("keydown", onKey);
+    node.addEventListener("contextmenu", onMenu);
     return () => {
       node.removeEventListener("wheel", onWheel);
       node.removeEventListener("pointerdown", onDown);
@@ -671,6 +770,8 @@ export function AnalysisView({
       node.removeEventListener("pointercancel", onUp);
       node.removeEventListener("pointermove", onMove);
       node.removeEventListener("dblclick", onDouble);
+      node.removeEventListener("keydown", onKey);
+      node.removeEventListener("contextmenu", onMenu);
     };
   }, []);
 
@@ -700,6 +801,15 @@ export function AnalysisView({
       resolved[control.id] = stored != null && parseSegments(stored) != null ? stored : control.value;
       continue;
     }
+    if (control.kind === "range") {
+      const numeric = Number(stored);
+      resolved[control.id] = stored != null && Number.isFinite(numeric) ? stored : control.value;
+      continue;
+    }
+    if (control.kind === "text") {
+      resolved[control.id] = stored != null && stored.trim().length > 0 ? stored : control.value;
+      continue;
+    }
     const known = control.options.some((option) => option.label === stored);
     resolved[control.id] = stored != null && known ? stored : control.value;
   }
@@ -712,12 +822,13 @@ export function AnalysisView({
   };
 
   const table = meta?.table;
+  const gridRows = (table?.rows ?? []).filter((row) => row[0] !== "DVH" && row[0] !== "curve");
   const columns: GridColumn[] =
     table?.columns.map((title) => ({ title, width: 180 })) ?? [];
   const getCellContent = ([col, row]: Item): GridCell => ({
     kind: GridCellKind.Text,
-    data: table?.rows[row]?.[col] ?? "",
-    displayData: table?.rows[row]?.[col] ?? "",
+    data: gridRows[row]?.[col] ?? "",
+    displayData: gridRows[row]?.[col] ?? "",
     allowOverlay: false,
   });
 
@@ -740,6 +851,75 @@ export function AnalysisView({
           }))}
           onChange={(next) => apply(slot.id, next)}
         />
+      );
+    }
+    if (slot.kind === "range") {
+      const min = rangeBound(control.options, "min", 0);
+      const max = rangeBound(control.options, "max", 1);
+      const step = rangeBound(control.options, "step", 0.01);
+      const numeric = Number(value);
+      const current = Number.isFinite(numeric) ? numeric : min;
+      return (
+        <Field key={slot.id} orientation="horizontal">
+          <FieldLabel className="flex-none! shrink-0 whitespace-nowrap">{label}</FieldLabel>
+          <Slider
+            className="min-w-0 flex-1"
+            min={min}
+            max={max}
+            step={step}
+            value={[current]}
+            disabled={disabled}
+            aria-label={label}
+            onValueChange={(next) => {
+              const level = Array.isArray(next) ? next[0] : next;
+              if (typeof level === "number") {
+                apply(slot.id, String(level));
+              }
+            }}
+          />
+        </Field>
+      );
+    }
+    if (slot.kind === "text") {
+      return (
+        <Field key={slot.id} orientation="vertical">
+          <FieldLabel>{label}</FieldLabel>
+          <Textarea
+            value={value}
+            disabled={disabled}
+            aria-label={label}
+            onChange={(event) => apply(slot.id, event.target.value)}
+          />
+        </Field>
+      );
+    }
+    if (slot.kind === "radio") {
+      return (
+        <Field key={slot.id}>
+          <FieldLabel>{label}</FieldLabel>
+          <RadioGroup
+            value={value}
+            disabled={disabled}
+            aria-label={label}
+            onValueChange={(next) => {
+              if (typeof next === "string") {
+                apply(slot.id, next);
+              }
+            }}
+          >
+            {control.options.map((option, index) => {
+              const inputId = `analysis-${slot.id}-${index}`;
+              return (
+                <Field key={inputId} orientation="horizontal">
+                  <RadioGroupItem value={option.label} id={inputId} disabled={disabled} />
+                  <FieldLabel className="cursor-pointer" htmlFor={inputId}>
+                    {option.label}
+                  </FieldLabel>
+                </Field>
+              );
+            })}
+          </RadioGroup>
+        </Field>
       );
     }
     if (slot.kind === "check") {
@@ -801,24 +981,24 @@ export function AnalysisView({
     <SidePane
       main={
       <div ref={host} className="bg-background relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
-        {table != null && table.rows.length > 0 ? (
+        {table != null && gridRows.length > 0 ? (
           <DataEditor
             width={size.width}
             height={shown ? Math.min(240, size.height) : size.height}
             columns={columns}
-            rows={table.rows.length}
+            rows={gridRows.length}
             getCellContent={getCellContent}
             theme={gridTheme()}
             rowMarkers="none"
           />
         ) : null}
-        {shown || (table?.rows.length ?? 0) > 0 ? null : (
+        {shown || gridRows.length > 0 ? null : (
           <div className="text-muted-foreground flex flex-1 items-center justify-center px-6 text-center text-sm">
             {plotError ?? quiet ?? "Loading plot…"}
           </div>
         )}
         <div className={shown ? "relative min-h-0 flex-1" : "hidden"}>
-          <canvas ref={canvas} className="absolute inset-0 h-full w-full touch-none" />
+          <canvas ref={canvas} tabIndex={0} className="absolute inset-0 h-full w-full touch-none" />
           {viewId === "volumetric" ? (
             <DoseChrome
               controls={controls}

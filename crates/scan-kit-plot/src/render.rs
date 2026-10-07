@@ -4,13 +4,18 @@
 //! `clip_from_data`. Pan and zoom rewrite that matrix. Stroke width stays in pixels.
 //!
 //! Each panel paints the grid, solid quads and heatmaps, lines, points, the
-//! 1px bound, then labels. [`Plot::record`] (GPU), [`Plot::paint_cpu`] (no
-//! adapter), and [`Plot::pick`] (hover, reverse order) must keep that order.
+//! 1px bound, then labels. A dose color axis is drawn with the labels, in
+//! screen pixels outside the plot scissor: `heat` above 2.5 samples the ramp
+//! and `heat` below −1.5 is a tick or the bar frame. [`Plot::record`] (GPU),
+//! [`Plot::paint_cpu`] (no adapter), and [`Plot::pick`] (hover, reverse order)
+//! must keep that order.
 //! The plot rectangle is whole pixels. Axis-aligned strokes sit on pixel
 //! centers, in the vertex shader and in [`stroke_cpu`], so a 1px line is one
 //! pixel. The bound is that stroke on the rectangle's outer pixels.
 //! A panel with `equal` letterboxes that rectangle to the camera's data
 //! aspect, so one data unit has the same pixel length on both axes.
+//! A dose image fills its cell instead. Slice axes sit on that border. The 3D
+//! cell keeps its axes in the volume and leaves the border clear.
 //!
 //! A mark kind's byte layout lives in its `*_STRIDE`, `*_ATTRS`, `encode_*`,
 //! `decode_*`, and the matching WGSL `vs_*` inputs. Change them together.
@@ -59,11 +64,27 @@ struct Uniforms {
     dose2: vec4<f32>,
     // mode, filter, voxel, integral peak
     dose3: vec4<f32>,
+    // volume origin xyz, orbit zoom
+    dose4: vec4<f32>,
+    // film aspect, line scale, typical, march voxel
+    dose5: vec4<f32>,
+    // march shape, or integral cols, rows, row
+    dose6: vec4<f32>,
+    // look-at offset xyz, field of view (0 is orthographic)
+    dose7: vec4<f32>,
+    // field min xyz, 1 when the field box is drawn
+    dose8: vec4<f32>,
+    // field max xyz, 1 when the phantom box is drawn
+    dose9: vec4<f32>,
 }
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
 @group(1) @binding(0) var mark_tex: texture_2d<f32>;
 @group(1) @binding(1) var mark_samp: sampler;
+@group(2) @binding(0) var dose_vol: texture_3d<f32>;
+@group(2) @binding(1) var dose_brick: texture_3d<f32>;
+@group(2) @binding(2) var dose_samp: sampler;
+@group(2) @binding(3) var dose_int: texture_2d<f32>;
 
 fn to_px(data: vec3<f32>) -> vec2<f32> {
     let clip = u.clip_from_data * vec4<f32>(data, 1.0);
@@ -277,6 +298,24 @@ fn vs_quad(
         out.heat = -1.0;
         return out;
     }
+    // Screen pixels, y down. a.xy and b.xy are the rectangle corners.
+    // heat > 2.5 is the color ramp. heat < -1.5 is a tick or the bar frame.
+    if (a.z > 2.5 || a.z < -1.5) {
+        let uv = quad_uv(vi);
+        let bounds0 = min(a.xy, b.xy);
+        let bounds1 = max(a.xy, b.xy);
+        var px = vec2<f32>(mix(a.x, b.x, uv.x), mix(a.y, b.y, uv.y));
+        let mid = (bounds0 + bounds1) * 0.5;
+        px = px + sign(px - mid) * 1.0;
+        var out: QuadOut;
+        out.clip = px_to_clip(px);
+        out.color = color;
+        out.uv = uv;
+        out.bounds0 = bounds0;
+        out.bounds1 = bounds1;
+        out.heat = a.z;
+        return out;
+    }
     let lo = min(a.xy, b.xy);
     let hi = max(a.xy, b.xy);
     let uv = quad_uv(vi);
@@ -300,13 +339,23 @@ fn vs_quad(
 
 @fragment
 fn fs_quad(in: QuadOut) -> @location(0) vec4<f32> {
+    let p = in.clip.xy;
+    let outside = max(max(in.bounds0.x - p.x, p.x - in.bounds1.x), max(in.bounds0.y - p.y, p.y - in.bounds1.y));
+    let coverage = clamp(0.5 - outside, 0.0, 1.0);
+    // Screen-space color axis. The ramp reads the last row of the dose atlas.
+    if (in.heat > 2.5) {
+        let span = max(in.bounds1.y - in.bounds0.y, 1.0);
+        let t = clamp(1.0 - (in.clip.y - in.bounds0.y) / span, 0.0, 1.0);
+        let bar = ramp_color(t);
+        return shade(bar.rgb, bar.a, coverage);
+    }
+    if (in.heat < -1.5) {
+        return shade(in.color.rgb, in.color.a, coverage);
+    }
     if (in.heat < -0.5) {
         let coverage = select(0.0, 1.0, owns_pixel(in.clip.xy, in.bounds0, in.bounds1, in.uv));
         return shade(in.color.rgb, in.color.a, coverage);
     }
-    let p = in.clip.xy;
-    let outside = max(max(in.bounds0.x - p.x, p.x - in.bounds1.x), max(in.bounds0.y - p.y, p.y - in.bounds1.y));
-    let coverage = clamp(0.5 - outside, 0.0, 1.0);
     // textureLoad and textureSampleLevel have no derivatives, so a dose atlas
     // lookup can sit in this branch. heat > 1.5 samples the uploaded volume.
     // heat > 0.5 is a baked ramp. Otherwise the quad is a solid color.
@@ -370,7 +419,8 @@ fn atlas_load(ix: i32, iy: i32, iz: i32) -> vec4<f32> {
     let y = ty * ny + clamp(ny - 1 - iy, 0, ny - 1);
     let dims = textureDimensions(mark_tex);
     if (x < 0 || y < 0 || x >= i32(dims.x) || y >= i32(dims.y) - 1) {
-        return vec4<f32>(0.0);
+        // 0.5 is zero dose. The slice atlas is signed around mid-grey.
+        return vec4<f32>(0.5, 0.0, 0.0, 0.0);
     }
     return textureLoad(mark_tex, vec2<i32>(x, y), 0);
 }
@@ -396,8 +446,8 @@ fn catmull(d: f32) -> f32 {
     return (1.5 * x - 2.5) * x * x + 1.0;
 }
 
-fn voxel_dose(ix: i32, iy: i32, iz: i32) -> f32 {
-    return atlas_load(ix, iy, iz).r * u.dose1.w;
+fn atlas_dose(sample: f32) -> f32 {
+    return (sample - 0.5) * 2.0 * u.dose1.w;
 }
 
 fn sample_grid(x: f32, y: f32, z: f32) -> vec4<f32> {
@@ -436,7 +486,7 @@ fn sample_grid(x: f32, y: f32, z: f32) -> vec4<f32> {
             }
         }
     }
-    return max(acc, vec4<f32>(0.0));
+    return acc;
 }
 
 fn window_t(raw: f32, lo: f32, hi: f32) -> f32 {
@@ -454,19 +504,16 @@ fn wash(raw: f32, lo: f32, hi: f32, under: vec3<f32>, has_ct: bool) -> vec4<f32>
 }
 
 fn dose_fragment(uv: vec2<f32>, coverage: f32) -> vec4<f32> {
-    if (uv.x > 0.94) {
-        let bar = ramp_color(clamp(1.0 - uv.y, 0.0, 1.0));
-        return shade(bar.rgb, bar.a, coverage);
-    }
     let plane = u32(u.dose0.x + 0.5);
-    let film = turned_uv(vec2<f32>(uv.x / 0.94, uv.y), u32(u.dose0.z + 0.5));
+    if (plane == 3u) {
+        // Elevation lives in dose0.z. Turning the film with it rolls the picture.
+        let marched = march_color(uv);
+        return shade(marched.rgb, marched.a, coverage);
+    }
+    let film = turned_uv(uv, u32(u.dose0.z + 0.5));
     let nx = max(u.dose1.x, 1.0);
     let ny = max(u.dose1.y, 1.0);
     let nz = max(u.dose1.z, 1.0);
-    if (plane == 3u) {
-        let marched = march_color(film);
-        return shade(marched.rgb, marched.a, coverage);
-    }
     var raw = 0.0;
     var under = vec3<f32>(0.0);
     var has_ct = false;
@@ -474,17 +521,15 @@ fn dose_fragment(uv: vec2<f32>, coverage: f32) -> vec4<f32> {
     let iy = (1.0 - film.y) * ny - 0.5;
     let iz = u.dose0.y;
     if (u.dose0.w > 0.5) {
-        let count = select(select(nz, ny, plane == 1u), nx, plane == 2u);
-        for (var step = 0; step < 256; step = step + 1) {
-            if (f32(step) >= count) { break; }
-            let texel = select(
-                select(atlas_load(i32(round(ix)), i32(round(iy)), step), atlas_load(i32(round(ix)), step, i32(round(iz))), plane == 1u),
-                atlas_load(step, i32(round(iy)), i32(round(iz))),
-                plane == 2u,
-            );
-            raw = raw + texel.r * u.dose1.w * u.dose3.z;
-        }
-        let color = wash(raw, 0.0, max(u.dose3.w, 0.000001), under, false);
+        let cols = max(u.dose6.x, 1.0);
+        let rows = max(u.dose6.y, 1.0);
+        let ix = i32(round(film.x * cols - 0.5));
+        let iy = i32(round((1.0 - film.y) * rows - 0.5));
+        let dims = textureDimensions(dose_int);
+        let x = clamp(ix, 0, i32(dims.x) - 1);
+        let y = clamp(iy + i32(u.dose6.z), 0, i32(dims.y) - 1);
+        raw = textureLoad(dose_int, vec2<i32>(x, y), 0).r;
+        let color = wash(raw, u.dose2.x, u.dose2.y, under, false);
         return shade(color.rgb, color.a, coverage);
     }
     let texel = select(
@@ -492,51 +537,466 @@ fn dose_fragment(uv: vec2<f32>, coverage: f32) -> vec4<f32> {
         sample_grid(iz, iy, ix),
         plane == 2u,
     );
-    raw = texel.r * u.dose1.w;
+    raw = atlas_dose(texel.r);
     has_ct = texel.b > 0.5;
     under = vec3<f32>(texel.g);
     let color = wash(raw, u.dose2.x, u.dose2.y, under, has_ct);
     return shade(color.rgb, color.a, coverage);
 }
 
-fn march_color(uv: vec2<f32>) -> vec4<f32> {
-    let azimuth = u.dose0.y;
-    let elevation = u.dose0.z;
-    let ce = cos(elevation);
-    var dir = vec3<f32>(ce * sin(azimuth), ce * cos(azimuth), sin(elevation));
-    var right = vec3<f32>(cos(azimuth), -sin(azimuth), 0.0);
-    dir = normalize(dir);
-    right = normalize(right);
-    let up = normalize(cross(dir, right));
-    let nx = max(u.dose1.x, 1.0);
-    let ny = max(u.dose1.y, 1.0);
-    let nz = max(u.dose1.z, 1.0);
-    let radius = max(max(nx, ny), nz) * u.dose3.z * 0.866;
-    let center = vec3<f32>(nx, ny, nz) * 0.5;
-    let ufilm = uv.x * 2.0 - 1.0;
-    let vfilm = (1.0 - uv.y) * 2.0 - 1.0;
-    let start = center + right * ufilm * radius + up * vfilm * radius - dir * radius;
-    let step = radius * 2.0 / 24.0;
+// Vispy turntable march. The same steps are `scan_kit_core::ray_rgba`.
+// Empty 8³ bricks are skipped. The brick grid is dilated, so a skip is exact.
+const VIEW_DEPTH_MM: f32 = 8.0;
+const DOSE_FLOOR: f32 = 0.02;
+
+fn vol_at(ix: i32, iy: i32, iz: i32) -> f32 {
+    return textureLoad(dose_vol, vec3<i32>(ix + 2, iy + 2, iz + 2), 0).r;
+}
+
+fn vol_hw(p: vec3<f32>) -> f32 {
+    let dims = vec3<f32>(textureDimensions(dose_vol));
+    let voxel = max(u.dose5.w, 0.000001);
+    let cell = (p - u.dose4.xyz) / voxel;
+    let uv = (cell + vec3<f32>(2.0)) / dims;
+    return textureSampleLevel(dose_vol, dose_samp, uv, 0.0).r;
+}
+
+fn vol_cubic(q: vec3<f32>) -> f32 {
+    let x0 = i32(floor(q.x));
+    let y0 = i32(floor(q.y));
+    let z0 = i32(floor(q.z));
     var acc = 0.0;
-    var cover = 0.0;
-    var best = 0.0;
-    let mode = u32(u.dose3.x + 0.5);
-    for (var i = 0; i < 24; i = i + 1) {
-        let point = start + dir * step * (f32(i) + 0.5);
-        let texel = sample_grid(point.x - 0.5, point.y - 0.5, point.z - 0.5);
-        let dose = texel.r * u.dose1.w;
-        if (mode == 1u) {
-            best = max(best, dose);
-        } else if (mode == 2u) {
-            let alpha = 1.0 - exp(-dose / max(u.dose1.w, 0.000001) * 1.5);
-            acc = acc + (1.0 - cover) * dose * alpha;
-            cover = cover + (1.0 - cover) * alpha;
-        } else {
-            acc = acc + dose * step;
+    for (var dz = -1; dz < 3; dz = dz + 1) {
+        for (var dy = -1; dy < 3; dy = dy + 1) {
+            for (var dx = -1; dx < 3; dx = dx + 1) {
+                let w = catmull(q.x - f32(x0 + dx)) * catmull(q.y - f32(y0 + dy)) * catmull(q.z - f32(z0 + dz));
+                acc = acc + vol_at(x0 + dx, y0 + dy, z0 + dz) * w;
+            }
         }
     }
-    let raw = select(acc, best, mode == 1u);
-    return wash(raw, u.dose2.x, u.dose2.y, vec3<f32>(0.0), false);
+    return acc;
+}
+
+fn vol_sample(p: vec3<f32>) -> f32 {
+    let voxel = max(u.dose5.w, 0.000001);
+    let q = (p - u.dose4.xyz) / voxel - 0.5;
+    let sampling = u32(u.dose3.y + 0.5);
+    if (sampling == 0u) {
+        // Python nearest is floor(cell). q is cell - 0.5.
+        let cell = q + 0.5;
+        return vol_at(i32(floor(cell.x)), i32(floor(cell.y)), i32(floor(cell.z)));
+    }
+    if (sampling == 2u) {
+        return vol_cubic(q);
+    }
+    return vol_hw(p);
+}
+
+fn brick_of(cell: vec3<f32>) -> f32 {
+    let b = vec3<i32>(floor(cell / 8.0));
+    let dims = textureDimensions(dose_brick);
+    if (b.x < 0 || b.y < 0 || b.z < 0 || b.x >= i32(dims.x) || b.y >= i32(dims.y) || b.z >= i32(dims.z)) {
+        return 0.0;
+    }
+    return textureLoad(dose_brick, b, 0).r;
+}
+
+fn axis_step(cell: f32, dir_mm: f32, voxel: f32, best: f32) -> f32 {
+    let dir_i = dir_mm / voxel;
+    if (abs(dir_i) < 1e-8) { return best; }
+    let brick = floor(cell / 8.0) * 8.0;
+    var bound = brick;
+    if (dir_i > 0.0) { bound = brick + 8.0; }
+    let step = (bound - cell) / dir_i;
+    if (step > 0.0001) { return min(best, step); }
+    return best;
+}
+
+fn steps_to_leave(cell: vec3<f32>, dir: vec3<f32>, voxel: f32) -> i32 {
+    var delta = 1e30;
+    delta = axis_step(cell.x, dir.x, voxel, delta);
+    delta = axis_step(cell.y, dir.y, voxel, delta);
+    delta = axis_step(cell.z, dir.z, voxel, delta);
+    let steps = ceil(delta / voxel);
+    if (steps < 1.0 || steps > 1e8) { return 1; }
+    return i32(steps);
+}
+
+fn clip_axis(t: vec2<f32>, origin: f32, dir: f32, bmin: f32, bmax: f32) -> vec3<f32> {
+    if (abs(dir) < 1e-8) {
+        let ok = select(0.0, 1.0, origin >= bmin && origin <= bmax);
+        return vec3<f32>(t.x, t.y, ok);
+    }
+    var near = (bmin - origin) / dir;
+    var far = (bmax - origin) / dir;
+    if (near > far) {
+        let swap = near;
+        near = far;
+        far = swap;
+    }
+    let t0 = max(t.x, near);
+    let t1 = min(t.y, far);
+    return vec3<f32>(t0, t1, select(0.0, 1.0, t0 <= t1));
+}
+
+fn march_basis(azimuth: f32, elevation: f32) -> mat3x3<f32> {
+    let ce = cos(elevation);
+    let se = sin(elevation);
+    let ca = cos(azimuth);
+    let sa = sin(azimuth);
+    let look = normalize(vec3<f32>(-ce * sa, ce * ca, -se));
+    let right = normalize(vec3<f32>(ca, sa, 0.0));
+    let up = normalize(cross(right, look));
+    return mat3x3<f32>(look, right, up);
+}
+
+fn film_fy(extent: vec3<f32>, aspect: f32, zoom: f32) -> f32 {
+    let pad_x = max(extent.x * 0.12, 1.0);
+    let pad_y = max(extent.y * 0.12, 1.0);
+    let pad_z = max(extent.z * 0.12, 1.0);
+    var rx = extent.x + 2.0 * pad_x;
+    var ry = extent.y + 2.0 * pad_y;
+    var rz = extent.z + 2.0 * pad_z;
+    if (aspect > 1.0) {
+        rx = rx / aspect;
+        ry = ry / aspect;
+    } else {
+        rz = rz * aspect;
+    }
+    let rxs = sqrt(rx * rx + ry * ry);
+    let rys = sqrt(rx * rx + ry * ry + rz * rz);
+    let scale = max(rxs, rys) * 1.04 * zoom;
+    if (aspect > 1.0) { return scale; }
+    return scale / aspect;
+}
+
+fn march_window(mode: u32, typical: f32) -> vec2<f32> {
+    let gain = max(u.dose2.z, 0.01);
+    let lo = u.dose2.x;
+    let hi = u.dose2.y;
+    let line = max(u.dose5.y, 0.000001);
+    if (mode == 0u) {
+        if (lo < 0.0) {
+            let reach = line / gain;
+            return vec2<f32>(-reach, reach);
+        }
+        let peak = max(typical, 0.000001);
+        let flo = clamp(lo / peak, 0.0, 1.0);
+        let fhi = max(hi / peak, flo + 0.0001);
+        let scale = line / gain;
+        return vec2<f32>(flo * scale, fhi * scale);
+    }
+    if (lo < 0.0) {
+        let reach = typical / gain;
+        return vec2<f32>(-reach, reach);
+    }
+    return vec2<f32>(lo / gain, max(hi, lo + 0.000001) / gain);
+}
+
+fn fog_sample(dose: f32, step: f32, typical: f32) -> vec4<f32> {
+    let gain = clamp(u.dose2.z, 0.0, 1.0);
+    let reach = max(typical, 0.000001);
+    let lo = u.dose2.x;
+    let hi = u.dose2.y;
+    let t = clamp((dose - lo) / max(hi - lo, 0.000001), 0.0, 1.0);
+    let rgb = ramp_color(t).rgb;
+    var alpha = 0.0;
+    if (lo < 0.0) {
+        alpha = clamp(abs(dose / reach), 0.0, 1.0) * gain * step / VIEW_DEPTH_MM;
+    } else {
+        let tau = gain * max(dose, 0.0) / reach * step / VIEW_DEPTH_MM;
+        alpha = 1.0 - exp(-tau);
+    }
+    return vec4<f32>(rgb, clamp(alpha, 0.0, 1.0));
+}
+
+fn gantry_cs() -> vec2<f32> {
+    let th = radians(u.dose3.w);
+    return vec2<f32>(cos(th), sin(th));
+}
+
+fn view_extent_of(extent: vec3<f32>) -> vec3<f32> {
+    let cs = gantry_cs();
+    let c = abs(cs.x);
+    let s = abs(cs.y);
+    return vec3<f32>(extent.x, c * extent.y + s * extent.z, s * extent.y + c * extent.z);
+}
+
+fn to_lattice(p: vec3<f32>, origin: vec3<f32>, extent: vec3<f32>) -> vec3<f32> {
+    let cs = gantry_cs();
+    let center = origin + extent * 0.5;
+    let d = p - center;
+    return center + vec3<f32>(d.x, cs.x * d.y + cs.y * d.z, -cs.y * d.y + cs.x * d.z);
+}
+
+fn lattice_direction(dir: vec3<f32>) -> vec3<f32> {
+    let cs = gantry_cs();
+    return vec3<f32>(dir.x, cs.x * dir.y + cs.y * dir.z, -cs.y * dir.y + cs.x * dir.z);
+}
+
+fn zero_color() -> vec4<f32> {
+    let mode = u32(u.dose3.x + 0.5);
+    let typical = max(u.dose5.z, 0.000001);
+    let window = march_window(mode, typical);
+    let t = clamp((0.0 - window.x) / max(window.y - window.x, 0.000001), 0.0, 1.0);
+    let color = ramp_color(t);
+    return vec4<f32>(color.rgb, 1.0);
+}
+
+fn to_view_pt(q: vec3<f32>, origin: vec3<f32>, extent: vec3<f32>) -> vec3<f32> {
+    let cs = gantry_cs();
+    let center = origin + extent * 0.5;
+    let d = q - center;
+    return center + vec3<f32>(d.x, cs.x * d.y - cs.y * d.z, cs.y * d.y + cs.x * d.z);
+}
+
+fn nearer(eye: vec3<f32>, dir: vec3<f32>, a: vec3<f32>, b: vec3<f32>, best: vec2<f32>) -> vec2<f32> {
+    let v = b - a;
+    let w = eye - a;
+    let bv = dot(dir, v);
+    let c = max(dot(v, v), 0.00000001);
+    let d = dot(dir, w);
+    let e = dot(v, w);
+    let denom = c - bv * bv;
+    var s = 0.0;
+    if (abs(denom) > 0.00001) {
+        s = clamp((e - bv * d) / denom, 0.0, 1.0);
+    } else {
+        s = clamp(dot(eye - a, v) / c, 0.0, 1.0);
+    }
+    let q = a + v * s;
+    let t = dot(q - eye, dir);
+    let gap = length((eye + dir * t) - q);
+    if (gap < best.y) {
+        return vec2<f32>(t, gap);
+    }
+    return best;
+}
+
+fn lattice_corner(lo: vec3<f32>, hi: vec3<f32>, bits: i32, origin: vec3<f32>, extent: vec3<f32>) -> vec3<f32> {
+    let x = select(lo.x, hi.x, (bits & 1) == 1);
+    let y = select(lo.y, hi.y, (bits & 2) == 2);
+    let z = select(lo.z, hi.z, (bits & 4) == 4);
+    return to_view_pt(vec3<f32>(x, y, z), origin, extent);
+}
+
+fn box_near(eye: vec3<f32>, dir: vec3<f32>, lo: vec3<f32>, hi: vec3<f32>, origin: vec3<f32>, extent: vec3<f32>) -> vec2<f32> {
+    var best = vec2<f32>(0.0, 1e30);
+    var axis = 0;
+    loop {
+        if (axis >= 3) { break; }
+        var bit = 1;
+        if (axis == 1) { bit = 2; }
+        else if (axis == 2) { bit = 4; }
+        var i = 0;
+        loop {
+            if (i >= 4) { break; }
+            var low = i;
+            if (axis == 0) {
+                let yb = i - (i / 2) * 2;
+                let zb = i / 2;
+                low = yb * 2 + zb * 4;
+            } else if (axis == 1) {
+                let xb = i - (i / 2) * 2;
+                let zb = i / 2;
+                low = xb + zb * 4;
+            }
+            best = nearer(eye, dir, lattice_corner(lo, hi, low, origin, extent), lattice_corner(lo, hi, low + bit, origin, extent), best);
+            i = i + 1;
+        }
+        axis = axis + 1;
+    }
+    return best;
+}
+
+fn tick_near(eye: vec3<f32>, dir: vec3<f32>, origin: vec3<f32>, extent: vec3<f32>) -> vec2<f32> {
+    let stub = clamp(0.02 * max(extent.x, max(extent.y, extent.z)), 1.5, 6.0);
+    let z1 = origin.z + extent.z;
+    var best = vec2<f32>(0.0, 1e30);
+    var mark = ceil(origin.x / 10.0) * 10.0;
+    var n = 0;
+    loop {
+        if (mark > origin.x + extent.x + 0.01 || n >= 64) { break; }
+        best = nearer(eye, dir, to_view_pt(vec3<f32>(mark, origin.y, z1), origin, extent), to_view_pt(vec3<f32>(mark, origin.y + stub, z1), origin, extent), best);
+        mark = mark + 10.0;
+        n = n + 1;
+    }
+    mark = ceil(origin.y / 10.0) * 10.0;
+    n = 0;
+    loop {
+        if (mark > origin.y + extent.y + 0.01 || n >= 64) { break; }
+        best = nearer(eye, dir, to_view_pt(vec3<f32>(origin.x, mark, z1), origin, extent), to_view_pt(vec3<f32>(origin.x + stub, mark, z1), origin, extent), best);
+        mark = mark + 10.0;
+        n = n + 1;
+    }
+    mark = ceil(origin.z / 10.0) * 10.0;
+    n = 0;
+    loop {
+        if (mark > z1 + 0.01 || n >= 64) { break; }
+        best = nearer(eye, dir, to_view_pt(vec3<f32>(origin.x, origin.y, mark), origin, extent), to_view_pt(vec3<f32>(origin.x, origin.y + stub, mark), origin, extent), best);
+        mark = mark + 10.0;
+        n = n + 1;
+    }
+    return best;
+}
+
+fn over_guides(color: vec4<f32>, eye: vec3<f32>, dir: vec3<f32>, origin: vec3<f32>, extent: vec3<f32>, hit_t: f32, t0: f32, fy: f32) -> vec4<f32> {
+    let px = 1.5 * fy / max(u.resolution.y, 1.0);
+    var best = box_near(eye, dir, origin, origin + extent, origin, extent);
+    var ink = vec3<f32>(0.55, 0.58, 0.62);
+    if (u.dose9.w > 0.5) {
+        ink = vec3<f32>(0.25, 0.8, 0.85);
+    }
+    let ticks = tick_near(eye, dir, origin, extent);
+    if (ticks.y < best.y) {
+        best = ticks;
+        ink = vec3<f32>(0.62, 0.66, 0.7);
+    }
+    if (u.dose8.w > 0.5) {
+        let field = box_near(eye, dir, u.dose8.xyz, u.dose9.xyz, origin, extent);
+        if (field.y < best.y) {
+            best = field;
+            ink = vec3<f32>(0.86, 0.68, 0.22);
+        }
+    }
+    if (best.y <= px && best.x >= t0 - px && best.x <= hit_t + px) {
+        return vec4<f32>(ink, 1.0);
+    }
+    return color;
+}
+
+fn march_color(uv: vec2<f32>) -> vec4<f32> {
+    let voxel = max(u.dose5.w, 0.000001);
+    let dims = max(u.dose6.xyz, vec3<f32>(1.0));
+    let extent = dims * voxel;
+    let origin = u.dose4.xyz;
+    let gantry = u.dose3.w;
+    var box_o = origin;
+    var box_e = extent;
+    if (abs(gantry) > 0.001) {
+        box_e = view_extent_of(extent);
+        let lcenter = origin + extent * 0.5;
+        box_o = lcenter - box_e * 0.5;
+    }
+    let center = origin + extent * 0.5 + u.dose7.xyz;
+    let aspect = max(u.dose5.x, 0.001);
+    let zoom = max(u.dose4.w, 0.05);
+    let fy = film_fy(box_e, aspect, zoom);
+    // 179 degrees. A 180 degree field makes tan(fov/2) infinite.
+    let fov = min(u.dose7.w, 3.124139);
+    let basis = march_basis(u.dose0.y, u.dose0.z);
+    let look = basis[0];
+    let right = basis[1];
+    let up = basis[2];
+    let x = uv.x * 2.0 - 1.0;
+    let y = (1.0 - uv.y) * 2.0 - 1.0;
+    var eye: vec3<f32>;
+    var dir: vec3<f32>;
+    if (fov <= 0.0001) {
+        let half_y = fy * 0.5;
+        let distance = length(box_e) + half_y;
+        eye = center - look * distance + right * x * aspect * half_y + up * y * half_y;
+        dir = look;
+    } else {
+        let distance = fy / (2.0 * tan(fov * 0.5));
+        let tan_y = tan(fov * 0.5);
+        eye = center - look * distance;
+        dir = normalize(look + right * x * aspect * tan_y + up * y * tan_y);
+    }
+    let bmax = box_o + box_e;
+    var clip = clip_axis(vec2<f32>(0.0, 1e30), eye.x, dir.x, box_o.x, bmax.x);
+    if (clip.z < 0.5) { return zero_color(); }
+    clip = clip_axis(clip.xy, eye.y, dir.y, box_o.y, bmax.y);
+    if (clip.z < 0.5) { return zero_color(); }
+    clip = clip_axis(clip.xy, eye.z, dir.z, box_o.z, bmax.z);
+    if (clip.z < 0.5 || clip.y < 0.0) { return zero_color(); }
+    let t0 = max(clip.x, 0.0);
+    let t1 = clip.y;
+    let dist = t1 - t0;
+    if (dist < 0.001) { return zero_color(); }
+    let nstep = i32(clamp(ceil(dist / voxel), 1.0, 1024.0));
+    let entry = eye + dir * t0;
+    let mode = u32(u.dose3.x + 0.5);
+    let typical = max(u.dose5.z, 0.000001);
+    var integ = 0.0;
+    var peak = 0.0;
+    var trans = 1.0;
+    var col = vec3<f32>(0.0);
+    var wsum = 0.0;
+    var wpos = 0.0;
+    var peak_t = t0;
+    var fog_t = t1;
+    var fog_marked = false;
+    var i = 0;
+    var guard = 0;
+    loop {
+        if (i >= nstep || guard >= 1024) { break; }
+        guard = guard + 1;
+        let p = entry + dir * voxel * (f32(i) + 0.5);
+        var q = p;
+        var step_dir = dir;
+        if (abs(gantry) > 0.001) {
+            q = to_lattice(p, origin, extent);
+            step_dir = lattice_direction(dir);
+        }
+        let cell = (q - origin) / voxel;
+        let occupancy = brick_of(cell);
+        if (occupancy <= 0.0 || (mode == 1u && occupancy <= peak)) {
+            i = i + steps_to_leave(cell, step_dir, voxel);
+        } else {
+            let dose = vol_sample(q);
+            let t_here = t0 + voxel * (f32(i) + 0.5);
+            if (mode == 1u) {
+                if (dose >= peak) { peak_t = t_here; }
+                peak = max(peak, dose);
+            } else if (mode == 2u) {
+                let before = trans;
+                let fog = fog_sample(dose, voxel, typical);
+                col = col + trans * fog.rgb * fog.a;
+                trans = trans * (1.0 - fog.a);
+                if (!fog_marked && before >= 0.5 && trans < 0.5) {
+                    fog_t = t_here;
+                    fog_marked = true;
+                }
+                if (trans < 0.02) { break; }
+            } else {
+                integ = integ + dose * voxel;
+                if (abs(dose) >= 0.1 * typical) {
+                    wsum = wsum + abs(dose);
+                    wpos = wpos + abs(dose) * t_here;
+                }
+            }
+            i = i + 1;
+        }
+    }
+    var hit_t = t1;
+    if (mode == 1u) {
+        hit_t = peak_t;
+    } else if (mode == 2u && fog_marked) {
+        hit_t = fog_t;
+    } else if (wsum > 0.0) {
+        hit_t = wpos / wsum;
+    }
+    let opacity = clamp(u.dose2.w, 0.0, 1.0);
+    var color = zero_color();
+    if (mode == 2u) {
+        let covered = 1.0 - trans;
+        if (covered >= 0.02) {
+            color = vec4<f32>(col / covered, covered * opacity);
+        }
+    } else {
+        var shown = integ;
+        if (mode == 1u) { shown = peak; }
+        let window = march_window(mode, typical);
+        let scale = max(max(abs(window.x), abs(window.y)), 0.000001);
+        if (abs(shown) >= scale * DOSE_FLOOR) {
+            let t = clamp((shown - window.x) / max(window.y - window.x, 0.000001), 0.0, 1.0);
+            color = vec4<f32>(ramp_color(t).rgb, opacity);
+        } else {
+            hit_t = t1;
+        }
+    }
+    return over_guides(color, eye, dir, origin, extent, hit_t, t0, fy);
 }
 "#;
 
@@ -563,6 +1023,9 @@ pub struct PlotInput {
     pub wheel: f32,
     pub drag: bool,
     pub reset: bool,
+    /// DOM `buttons`: bit 0 left, bit 1 right. Zero means left, so older callers still orbit.
+    pub buttons: u8,
+    pub shift: bool,
 }
 
 impl Default for PlotInput {
@@ -575,6 +1038,8 @@ impl Default for PlotInput {
             wheel: 0.0,
             drag: false,
             reset: false,
+            buttons: 0,
+            shift: false,
         }
     }
 }
@@ -627,7 +1092,8 @@ pub(crate) struct QuadRec {
     pub b: [f32; 2],
     /// Third corner. `None` is an axis-aligned quad from `a` to `b`.
     pub c: Option<[f32; 2]>,
-    /// 1 samples `heatmap`, 0 fills with `color`.
+    /// `> 2.5` is a screen-space color ramp, `> 1.5` samples the volume,
+    /// `> 0.5` is a baked heatmap, `< -1.5` is a screen-space tick. Otherwise `color`.
     pub heat: f32,
     pub color: [f32; 4],
     pub id: u32,
@@ -757,6 +1223,12 @@ struct Offscreen {
 }
 
 pub(crate) const LINE_STRIDE: u64 = 64;
+/// Uniform struct bytes. The dynamic offset is still 256.
+const UNIFORM_BYTES: usize = 240;
+/// Vispy turntable home: azimuth 30°, elevation 25°, 45° vertical field of view.
+const HOME_AZIMUTH: f32 = 30.0 * std::f32::consts::PI / 180.0;
+const HOME_ELEVATION: f32 = 25.0 * std::f32::consts::PI / 180.0;
+const ORBIT_STEP: f32 = 15.0 * std::f32::consts::PI / 180.0;
 pub(crate) const POINT_STRIDE: u64 = 48;
 pub(crate) const QUAD_STRIDE: u64 = 64;
 /// Cells across one axis of the panel range. Samples in one cell upload once.
@@ -766,6 +1238,14 @@ const GLYPH_STRIDE: u64 = 64;
 /// Canvas and offscreen sides are clamped to this range in device pixels.
 pub(crate) const MIN_SIDE: u32 = 16;
 pub(crate) const MAX_SIDE: u32 = 8192;
+
+struct VolumeDraw {
+    group: wgpu::BindGroup,
+    origin: [f32; 3],
+    voxel: f32,
+    line_scale: f32,
+    shape: [f32; 3],
+}
 
 pub struct Plot {
     /// Panel titles, ranges, and category labels. Series live in `marks`.
@@ -782,9 +1262,22 @@ pub struct Plot {
     cursor: [usize; 3],
     azimuth: f32,
     elevation: f32,
+    orbit_zoom: f32,
+    /// Radians. Zero is orthographic, matching vispy `fov == 0`.
+    fov: f32,
+    /// Last perspective field of view, restored by the ortho toggle.
+    persp_fov: f32,
+    /// Shift-drag look-at offset, millimetres.
+    pan: [f32; 3],
+    /// Float dose and dilated bricks for the 3D march. Absent until the first draw.
+    volume_draw: Option<VolumeDraw>,
     turns: Vec<u8>,
+    /// Field outlines in slice millimetres. Drawn on the film, so they track the picture.
+    guides: Vec<Vec<LineRec>>,
     integral: Vec<bool>,
     profile_integral: Vec<bool>,
+    /// Y window to restore when a profile leaves its integral.
+    profile_window: Vec<Option<(f32, f32)>>,
     /// Increments only when the volume atlas is built.
     atlas_stamp: u32,
     cameras: Vec<Camera>,
@@ -808,6 +1301,8 @@ pub struct Plot {
     gpu: Option<GpuMarks>,
     frame_buf: Option<wgpu::Buffer>,
     text_buf: Option<wgpu::Buffer>,
+    /// Screen-space color axis. Drawn with the labels, outside the plot scissor.
+    color_buf: Option<wgpu::Buffer>,
     cloud_quads: Option<wgpu::Buffer>,
     cloud_lines: Option<wgpu::Buffer>,
     heat_revision: u32,
@@ -816,6 +1311,8 @@ pub struct Plot {
     uniform_groups: Vec<wgpu::BindGroup>,
     mark_uploads: u32,
     size: (u32, u32),
+    /// Toolbar band above a dose cell, in framebuffer pixels. Zero leaves the title gutter alone.
+    chrome: f32,
     #[cfg(not(target_arch = "wasm32"))]
     offscreen: Option<Offscreen>,
     #[cfg(not(target_arch = "wasm32"))]
@@ -874,11 +1371,18 @@ impl Plot {
             split_grab: None,
             dose: None,
             cursor: [0, 0, 0],
-            azimuth: 0.6,
-            elevation: 0.4,
+            azimuth: HOME_AZIMUTH,
+            elevation: HOME_ELEVATION,
+            orbit_zoom: 1.0,
+            fov: scan_kit_core::FOV_Y,
+            persp_fov: scan_kit_core::FOV_Y,
+            pan: [0.0; 3],
+            volume_draw: None,
             turns: vec![0; panel_count],
+            guides: vec![Vec::new(); panel_count],
             integral: vec![false; panel_count],
             profile_integral: vec![false; panel_count],
+            profile_window: vec![None; panel_count],
             atlas_stamp: 0,
             home: cameras.clone(),
             cameras,
@@ -887,6 +1391,7 @@ impl Plot {
             gpu: None,
             frame_buf: None,
             text_buf: None,
+            color_buf: None,
             cloud_quads: None,
             cloud_lines: None,
             heat_revision: 0,
@@ -895,6 +1400,7 @@ impl Plot {
             uniform_groups: Vec::new(),
             mark_uploads: 0,
             size: (0, 0),
+            chrome: 0.0,
             #[cfg(not(target_arch = "wasm32"))]
             offscreen: None,
             #[cfg(not(target_arch = "wasm32"))]
@@ -921,7 +1427,7 @@ impl Plot {
     }
 
     pub(crate) fn attach_volume(&mut self, mark: &scan_kit_core::VolumeMark) {
-        let Some(grid) = crate::dose::grid_from(
+        let Some(mut grid) = crate::dose::grid_from(
             mark.values.clone(),
             mark.ct.clone(),
             mark.labels.clone(),
@@ -942,14 +1448,30 @@ impl Plot {
         ) else {
             return;
         };
+        grid.gantry = mark.gantry;
+        grid.unit = mark.unit.clone();
+        grid.show_phantom = mark.show_phantom;
+        grid.field = mark.field;
         let (pixels, cols, rows) = crate::dose::atlas_bytes(&grid);
         let atlas = self.marks.heatmaps.len();
         self.marks.heatmaps.push(pixels);
         self.marks.heatmap_size.push((cols, rows));
-        let (cx, cy, cz) = grid.volume.peak_index();
-        self.cursor = [cx, cy, cz];
+        self.cursor = grid.peak_at;
+        self.guides = vec![Vec::new(); self.panels.len()];
         for index in 0..self.panels.len() {
             let title = self.panels[index].title.clone();
+            if dose_plane(&title).is_some_and(|plane| plane < 3) {
+                let start = self.marks.panels[index].line_start as usize;
+                let count = self.marks.panels[index].line_count as usize;
+                self.guides[index] = self
+                    .marks
+                    .lines
+                    .get(start..start + count)
+                    .map(<[LineRec]>::to_vec)
+                    .unwrap_or_default();
+                self.marks.panels[index].line_count = 0;
+                self.marks.panels[index].line_runs.clear();
+            }
             if dose_plane(&title).is_some() {
                 let quad_index = self.marks.panels[index].heats.last().map(|slot| slot.0);
                 if let Some(quad_index) = quad_index {
@@ -967,6 +1489,7 @@ impl Plot {
             }
         }
         self.dose = Some(grid);
+        self.volume_draw = None;
         self.atlas_stamp = self.atlas_stamp.wrapping_add(1);
         self.heat_revision = self.heat_revision.wrapping_add(1);
         if let Some(encoded) = self.encoded.as_mut() {
@@ -975,16 +1498,45 @@ impl Plot {
         self.refresh_dose_overlay();
     }
 
-    fn dose_uniform(&self, panel: usize) -> [[f32; 4]; 4] {
+    fn integrate_scale(&self, panel: usize, aspect: f32) -> f32 {
         let Some(grid) = &self.dose else {
-            return [[0.0; 4]; 4];
+            return 0.0;
         };
         let Some(plane) = self
             .panels
             .get(panel)
             .and_then(|item| dose_plane(&item.title))
         else {
-            return [[0.0; 4]; 4];
+            return 0.0;
+        };
+        if plane != 3 || grid.mode != 0 {
+            return 0.0;
+        }
+        scan_kit_core::view_ray_scale(
+            &grid.volume,
+            &grid.bricks,
+            grid.brick_shape,
+            self.azimuth,
+            self.elevation,
+            self.orbit_zoom,
+            aspect,
+            grid.filter,
+            self.fov,
+            self.pan,
+            grid.gantry,
+        )
+    }
+
+    fn dose_uniform(&self, panel: usize, aspect: f32, viewed: f32) -> [[f32; 4]; 10] {
+        let Some(grid) = &self.dose else {
+            return [[0.0; 4]; 10];
+        };
+        let Some(plane) = self
+            .panels
+            .get(panel)
+            .and_then(|item| dose_plane(&item.title))
+        else {
+            return [[0.0; 4]; 10];
         };
         let [nx, ny, nz] = grid.atlas_shape;
         let (second, third, integral) = if plane == 3 {
@@ -1012,21 +1564,81 @@ impl Plot {
         } else {
             grid.peak
         };
-        let (lo, hi) = if grid.hi > grid.lo {
+        let (lo, hi) = if integral > 0.0 {
+            crate::dose::integral_limits(grid, plane)
+        } else if grid.hi > grid.lo {
             (grid.lo, grid.hi)
         } else {
             (0.0, grid.peak)
         };
+        let (origin, march_voxel, axis_line) = self
+            .volume_draw
+            .as_ref()
+            .map(|draw| (draw.origin, draw.voxel, draw.line_scale))
+            .unwrap_or((grid.volume.origin, grid.volume.voxel, grid.line_scale));
+        // Integrate colors against the brightest ray in this view: Python's auto window.
+        let line = if plane == 3 && grid.mode == 0 {
+            viewed
+        } else {
+            axis_line
+        };
+        let typical = lo.abs().max(hi.abs()).max(1e-6);
+        let march_shape = self.volume_draw.as_ref().map(|draw| draw.shape).unwrap_or([
+            grid.volume.shape[0] as f32,
+            grid.volume.shape[1] as f32,
+            grid.volume.shape[2] as f32,
+        ]);
+        let [full_nx, full_ny, full_nz] = grid.volume.shape;
+        let dose6 = if plane == 3 {
+            [march_shape[0], march_shape[1], march_shape[2], 0.0]
+        } else if integral > 0.0 {
+            match plane {
+                1 => [full_nx as f32, full_nz as f32, full_ny as f32, 0.0],
+                2 => [
+                    full_ny as f32,
+                    full_nz as f32,
+                    (full_ny + full_nz) as f32,
+                    0.0,
+                ],
+                _ => [full_nx as f32, full_ny as f32, 0.0, 0.0],
+            }
+        } else {
+            [0.0; 4]
+        };
+        let field_on = if plane == 3
+            && grid.field[1] > grid.field[0]
+            && grid.field[3] > grid.field[2]
+            && grid.field[5] > grid.field[4]
+        {
+            1.0
+        } else {
+            0.0
+        };
+        let phantom_on = if plane == 3 && grid.show_phantom {
+            1.0
+        } else {
+            0.0
+        };
         [
             [plane as f32, second, third, integral],
-            [nx as f32, ny as f32, nz as f32, grid.peak],
+            [nx as f32, ny as f32, nz as f32, grid.span],
             [lo, hi, grid.gain, grid.opacity],
             [
                 grid.mode as f32,
                 grid.filter as f32,
                 grid.volume.voxel,
-                integral_peak,
+                if plane == 3 {
+                    grid.gantry
+                } else {
+                    integral_peak
+                },
             ],
+            [origin[0], origin[1], origin[2], self.orbit_zoom],
+            [aspect, line, typical, march_voxel],
+            dose6,
+            [self.pan[0], self.pan[1], self.pan[2], self.fov],
+            [grid.field[0], grid.field[2], grid.field[4], field_on],
+            [grid.field[1], grid.field[3], grid.field[5], phantom_on],
         ]
     }
 
@@ -1075,24 +1687,46 @@ impl Plot {
             }
             if let Some(plane) = dose_plane(&title) {
                 if plane < 3 {
+                    let turns = self.turns.get(index).copied().unwrap_or(0);
+                    let bounds = [xmin, xmax, ymin, ymax];
                     extra.push(LiveCloud {
                         panel: index,
                         quads: Vec::new(),
-                        lines: crosshair_lines(
-                            grid, plane, cursor, xmin, xmax, ymin, ymax, foreground,
-                        ),
+                        lines: crosshair_lines(grid, plane, cursor, bounds, turns, foreground),
                         dose: true,
                     });
                     let mut lines = Vec::new();
                     for (id, a, b) in
                         crate::dose::outlines(grid, plane, cursor_index(plane, cursor))
                     {
+                        let a = crate::dose::display_mm(a[0], a[1], bounds, turns);
+                        let b = crate::dose::display_mm(b[0], b[1], bounds, turns);
                         lines.push(LineRec {
                             a: [a[0], a[1], 0.0],
                             b: [b[0], b[1], 0.0],
                             color: structure_color(id),
                             thickness: 1.5,
                             id: 0,
+                        });
+                    }
+                    if !lines.is_empty() {
+                        extra.push(LiveCloud {
+                            panel: index,
+                            quads: Vec::new(),
+                            lines,
+                            dose: true,
+                        });
+                    }
+                    let mut lines = Vec::new();
+                    for line in self.guides.get(index).into_iter().flatten() {
+                        let a = crate::dose::display_mm(line.a[0], line.a[1], bounds, turns);
+                        let b = crate::dose::display_mm(line.b[0], line.b[1], bounds, turns);
+                        lines.push(LineRec {
+                            a: [a[0], a[1], 0.0],
+                            b: [b[0], b[1], 0.0],
+                            color: line.color,
+                            thickness: line.thickness,
+                            id: line.id,
                         });
                     }
                     if !lines.is_empty() {
@@ -1120,6 +1754,10 @@ impl Plot {
                     "y": cell.cell.y,
                     "w": cell.cell.w,
                     "h": cell.cell.h,
+                    "plotX": cell.plot.x,
+                    "plotY": cell.plot.y,
+                    "plotW": cell.plot.w,
+                    "plotH": cell.plot.h,
                 })
             })
             .collect();
@@ -1143,14 +1781,127 @@ impl Plot {
                         *flag = !*flag;
                     }
                 } else if profile_kind(&self.panels[panel].title).is_some() {
+                    let turning_on = !self.profile_integral.get(panel).copied().unwrap_or(false);
+                    if turning_on {
+                        if let Some(camera) = self.cameras.get(panel) {
+                            if let Some(slot) = self.profile_window.get_mut(panel) {
+                                *slot = Some((camera.ymin, camera.ymax));
+                            }
+                        }
+                    }
                     if let Some(flag) = self.profile_integral.get_mut(panel) {
-                        *flag = !*flag;
+                        *flag = turning_on;
+                    }
+                    if turning_on {
+                        self.fit_integral_profile(panel);
+                    } else {
+                        // A reload keeps the flag and refits y, but the saved slice
+                        // window belongs to the previous lattice. Fall back to this
+                        // plot's slice fit so the Gy curve is back in frame.
+                        let home = self
+                            .home
+                            .get(panel)
+                            .map(|camera| (camera.ymin, camera.ymax));
+                        let saved = self
+                            .profile_window
+                            .get_mut(panel)
+                            .and_then(|slot| slot.take());
+                        if let Some(camera) = self.cameras.get_mut(panel) {
+                            if let Some((ymin, ymax)) = saved.or(home) {
+                                camera.ymin = ymin;
+                                camera.ymax = ymax;
+                            }
+                        }
+                        self.mark_profile_unit(panel, false);
                     }
                 }
             }
             _ => return,
         }
         self.refresh_dose_overlay();
+    }
+
+    /// The integral is Gy·mm² (or the quantity times mm²). Fit y to every row of
+    /// that projection so paging cannot push the curve out of the frame.
+    fn fit_integral_profile(&mut self, panel: usize) {
+        let Some(kind) = self
+            .panels
+            .get(panel)
+            .and_then(|item| profile_kind(&item.title))
+        else {
+            return;
+        };
+        let Some(grid) = self.dose.as_ref() else {
+            return;
+        };
+        let (ymin, ymax) = integral_profile_axis(grid, kind);
+        if let Some(camera) = self.cameras.get_mut(panel) {
+            camera.ymin = ymin;
+            camera.ymax = ymax;
+        }
+        self.mark_profile_unit(panel, true);
+    }
+
+    fn mark_profile_unit(&mut self, panel: usize, on: bool) {
+        let Some(label) = self.panels.get_mut(panel).map(|item| &mut item.y_label) else {
+            return;
+        };
+        const SUFFIX: &str = "·mm²";
+        if on {
+            if !label.ends_with(SUFFIX) {
+                label.push_str(SUFFIX);
+            }
+        } else if let Some(base) = label.strip_suffix(SUFFIX) {
+            *label = base.to_string();
+        }
+    }
+
+    /// Blender numpad orbit for the 3D dose cell. Number-row keys match vispy's emulate-numpad.
+    pub fn dose_key(&mut self, key: &str, ctrl: bool) -> bool {
+        if self.dose.is_none()
+            || !self
+                .panels
+                .iter()
+                .any(|panel| dose_plane(&panel.title) == Some(3))
+        {
+            return false;
+        }
+        let Some((azimuth, elevation, fov, persp)) = blender_step(
+            self.azimuth,
+            self.elevation,
+            self.fov,
+            self.persp_fov,
+            key,
+            ctrl,
+        ) else {
+            return false;
+        };
+        self.azimuth = azimuth;
+        self.elevation = elevation;
+        self.fov = fov;
+        self.persp_fov = persp;
+        true
+    }
+
+    fn pan_volume(&mut self, cell: &Cell, dx: f32, dy: f32) {
+        let extent = {
+            let Some(grid) = self.dose.as_ref() else {
+                return;
+            };
+            let voxel = grid.volume.voxel;
+            [
+                grid.volume.shape[0] as f32 * voxel,
+                grid.volume.shape[1] as f32 * voxel,
+                grid.volume.shape[2] as f32 * voxel,
+            ]
+        };
+        let aspect = cell.plot.w / cell.plot.h.max(1.0);
+        let fy = scan_kit_core::film_height(extent, aspect, self.orbit_zoom);
+        let scale = fy / cell.plot.h.max(1.0);
+        let (right, up) = turntable_axes(self.azimuth, self.elevation);
+        for axis in 0..3 {
+            self.pan[axis] -= (right[axis] * dx + up[axis] * dy) * scale;
+        }
     }
 
     #[cfg(test)]
@@ -1170,11 +1921,17 @@ impl Plot {
         }
     }
 
+    #[cfg_attr(not(any(test, target_arch = "wasm32")), allow(dead_code))]
+    pub(crate) fn set_chrome(&mut self, px: f32) {
+        self.chrome = px.max(0.0);
+    }
+
     /// Keep a zoomed window when the new panel is the same quantity and its
     /// data range is still close. A different label or a much larger span
     /// starts from the new limits. Extra panels keep their own fit.
     #[cfg_attr(not(any(test, target_arch = "wasm32")), allow(dead_code))]
     pub(crate) fn adopt_view(&mut self, previous: &Plot) {
+        self.chrome = previous.chrome;
         if self.panels.len() == previous.panels.len()
             && self.row_splits.len() == previous.row_splits.len()
             && !previous.row_splits.is_empty()
@@ -1190,9 +1947,26 @@ impl Plot {
             && previous.dose.is_some()
             && self.panels.len() == previous.panels.len()
         {
-            self.cursor = previous.cursor;
+            self.cursor =
+                if let (Some(before), Some(after)) = (previous.dose.as_ref(), self.dose.as_ref()) {
+                    carried_cursor(
+                        previous.cursor,
+                        before.volume.origin,
+                        before.volume.voxel,
+                        before.volume.shape,
+                        after.volume.origin,
+                        after.volume.voxel,
+                        after.volume.shape,
+                    )
+                } else {
+                    previous.cursor
+                };
             self.azimuth = previous.azimuth;
             self.elevation = previous.elevation;
+            self.orbit_zoom = previous.orbit_zoom;
+            self.fov = previous.fov;
+            self.persp_fov = previous.persp_fov;
+            self.pan = previous.pan;
             if previous.turns.len() == self.panels.len() {
                 self.turns.clone_from(&previous.turns);
             }
@@ -1202,7 +1976,21 @@ impl Plot {
             if previous.profile_integral.len() == self.panels.len() {
                 self.profile_integral.clone_from(&previous.profile_integral);
             }
+            if previous.profile_window.len() == self.panels.len()
+                && previous.home.len() == self.home.len()
+            {
+                for index in 0..self.panels.len() {
+                    if axes_close(previous.home[index], self.home[index]) {
+                        self.profile_window[index] = previous.profile_window[index];
+                    }
+                }
+            }
             self.refresh_dose_overlay();
+        }
+        for index in 0..self.panels.len() {
+            if self.profile_integral.get(index).copied().unwrap_or(false) {
+                self.mark_profile_unit(index, true);
+            }
         }
         let count = self.cameras.len().min(previous.cameras.len());
         for index in 0..count {
@@ -1218,6 +2006,11 @@ impl Plot {
                 && axes_close(previous.home[index], self.home[index])
             {
                 self.cameras[index] = previous.cameras[index];
+            }
+        }
+        for index in 0..self.panels.len() {
+            if self.profile_integral.get(index).copied().unwrap_or(false) {
+                self.fit_integral_profile(index);
             }
         }
     }
@@ -1424,6 +2217,17 @@ impl Plot {
         self.size = (width, height);
         if input.reset {
             self.cameras.clone_from(&self.home);
+            self.azimuth = HOME_AZIMUTH;
+            self.elevation = HOME_ELEVATION;
+            self.orbit_zoom = 1.0;
+            self.fov = scan_kit_core::FOV_Y;
+            self.persp_fov = scan_kit_core::FOV_Y;
+            self.pan = [0.0; 3];
+            for index in 0..self.panels.len() {
+                if self.profile_integral.get(index).copied().unwrap_or(false) {
+                    self.fit_integral_profile(index);
+                }
+            }
         }
         self.apply_pointer(width, height, input);
     }
@@ -1651,13 +2455,34 @@ impl Plot {
         let Some(plane) = dose_plane(&self.panels[panel].title) else {
             return false;
         };
+        if !inside(layout[index].plot, input.x, input.y) {
+            return true;
+        }
         if plane == 3 {
-            if input.drag {
-                self.azimuth += input.dx * 0.01;
-                self.elevation = (self.elevation - input.dy * 0.01).clamp(-1.2, 1.2);
-                return true;
+            let step = 0.5_f32.to_radians();
+            let buttons = if input.buttons == 0 { 1 } else { input.buttons };
+            let left = (buttons & 1) != 0;
+            let right = (buttons & 2) != 0;
+            if input.drag && !(left && right) {
+                if left && input.shift {
+                    self.pan_volume(&layout[index], input.dx, input.dy);
+                } else if right && input.shift {
+                    // The saved perspective angle stays put. Dragging to 0 is ortho;
+                    // the 5 key restores the angle from before that drag.
+                    let degrees = (self.fov.to_degrees() - input.dy / 5.0).clamp(0.0, 179.0);
+                    self.fov = degrees.to_radians();
+                } else if right {
+                    self.orbit_zoom = (self.orbit_zoom * 1.007_f32.powf(input.dy)).clamp(0.2, 8.0);
+                } else if left {
+                    self.azimuth -= input.dx * step;
+                    self.elevation = (self.elevation + input.dy * step)
+                        .clamp(-std::f32::consts::FRAC_PI_2, std::f32::consts::FRAC_PI_2);
+                }
             }
-            return false;
+            if input.wheel != 0.0 {
+                self.orbit_zoom = (self.orbit_zoom * (-input.wheel * 0.0015).exp()).clamp(0.2, 8.0);
+            }
+            return true;
         }
         if input.wheel != 0.0 {
             let delta = if input.wheel > 0.0 { 1 } else { -1 };
@@ -1681,6 +2506,16 @@ impl Plot {
                 width as f32,
                 height as f32,
             );
+            let bounds = [
+                self.panels[panel].xmin,
+                self.panels[panel].xmax,
+                self.panels[panel].ymin,
+                self.panels[panel].ymax,
+            ];
+            let turns = self.turns.get(panel).copied().unwrap_or(0);
+            let Some([x, y]) = crate::dose::source_mm(x, y, bounds, turns) else {
+                return true;
+            };
             if let Some(grid) = self.dose.as_ref() {
                 match plane {
                     1 => {
@@ -1785,26 +2620,45 @@ impl Plot {
             .map(|(index, cell)| {
                 let camera = self.cameras[index];
                 let panel = &self.panels[index];
-                let left = axis_name_width(&panel.y_label) + y_tick_width(&camera) + 8.0;
-                let top = if shows_title(panel) {
-                    font.line_height + 8.0
+                let plane = dose_plane(&panel.title);
+                let edge = font.line_height * 0.5 + 4.0;
+                let (left, top, bottom, right) = if plane == Some(3) {
+                    (4.0, edge, edge, color_column_width())
                 } else {
-                    6.0
-                };
-                let bottom = font.line_height
-                    + 10.0
-                    + if panel.x_label.is_empty() {
-                        0.0
+                    let left = axis_name_width(&panel.y_label) + y_tick_width(&camera) + 8.0;
+                    let top = if shows_title(panel) {
+                        font.line_height + 8.0
                     } else {
-                        font.line_height + 4.0
+                        6.0
                     };
+                    let bottom = font.line_height
+                        + 10.0
+                        + if panel.x_label.is_empty() {
+                            0.0
+                        } else {
+                            font.line_height + 4.0
+                        };
+                    let right = if plane.is_some() {
+                        color_column_width()
+                    } else {
+                        16.0
+                    };
+                    (left, top, bottom, right)
+                };
+                let right = if plane.is_some() {
+                    right.min((cell.w - left - 48.0).max(28.0))
+                } else {
+                    right
+                };
+                // The view picker and its slice buttons live in this band, so the picture starts below them.
+                let top = top.max(self.chrome);
                 let mut plot = snap_plot(PlotRect {
                     x: cell.x + left,
                     y: cell.y + top,
-                    w: (cell.w - left - 16.0).max(8.0),
+                    w: (cell.w - left - right).max(8.0),
                     h: (cell.h - top - bottom).max(8.0),
                 });
-                if panel.equal {
+                if panel.equal && plane.is_none() {
                     plot = snap_plot(equal_scale(plot, &camera));
                 }
                 Cell {
@@ -1825,6 +2679,7 @@ impl Plot {
         matrix: &[f32; 16],
         quad: QuadRec,
         cell: &Cell,
+        ray_scale: f32,
     ) {
         let Some(grid) = &self.dose else {
             return;
@@ -1832,15 +2687,6 @@ impl Plot {
         let Some(plane) = dose_plane(&self.panels[cell.panel].title) else {
             return;
         };
-        let view = crate::dose::ViewSample {
-            plane,
-            index: cursor_index(plane, self.cursor),
-            turns: self.turns.get(cell.panel).copied().unwrap_or(0),
-            integral: self.integral.get(cell.panel).copied().unwrap_or(false),
-            azimuth: self.azimuth,
-            elevation: self.elevation,
-        };
-        let prepared = crate::dose::prepare_plane(grid, &view);
         let p0 = project(
             *matrix,
             [quad.a[0], quad.a[1], 0.0],
@@ -1859,6 +2705,21 @@ impl Plot {
         let bottom = p0[1].max(p1[1]);
         let span_x = (right - left).max(1.0);
         let span_y = (bottom - top).max(1.0);
+        let aspect = span_x / span_y;
+        let view = crate::dose::ViewSample {
+            plane,
+            index: cursor_index(plane, self.cursor),
+            turns: self.turns.get(cell.panel).copied().unwrap_or(0),
+            integral: self.integral.get(cell.panel).copied().unwrap_or(false),
+            azimuth: self.azimuth,
+            elevation: self.elevation,
+            zoom: self.orbit_zoom,
+            aspect,
+            ray_scale,
+            fov: self.fov,
+            center: self.pan,
+        };
+        let prepared = crate::dose::prepare_plane(grid, &view);
         for y in top.floor() as i32..=bottom.ceil() as i32 {
             for x in left.floor() as i32..=right.ceil() as i32 {
                 let u = ((x as f32 - left) / span_x).clamp(0.0, 1.0);
@@ -1881,7 +2742,9 @@ impl Plot {
             let camera = self.cameras[cell.panel];
             let matrix = camera.clip_from_data(cell.plot, width as f32, height as f32);
             let batch = &self.marks.panels[cell.panel];
-            for line in grid_lines(&camera, self.foreground) {
+            let scale = self.integrate_scale(cell.panel, cell.plot.w / cell.plot.h.max(1.0));
+            let (grid, border) = panel_frame(self, cell);
+            for line in grid {
                 stroke_cpu(&mut frame, width, height, &matrix, &line, cell.plot);
             }
             let solid: Vec<QuadRec> = self.marks.quads
@@ -1893,8 +2756,8 @@ impl Plot {
                 .filter_map(|(index, _)| self.marks.quads.get(*index as usize).copied())
                 .collect();
             for quad in solid.iter().chain(&heated) {
-                if quad.heat > 1.5 {
-                    self.fill_dose_cpu(&mut frame, width, height, &matrix, *quad, cell);
+                if quad.heat > 1.5 && quad.heat < 2.5 {
+                    self.fill_dose_cpu(&mut frame, width, height, &matrix, *quad, cell, scale);
                 } else {
                     fill_quad_cpu(
                         &mut frame,
@@ -1971,10 +2834,18 @@ impl Plot {
                     );
                 }
             }
-            for line in border_lines(&camera, &cell.plot, self.foreground) {
+            for line in border {
                 stroke_cpu(&mut frame, width, height, &matrix, &line, cell.plot);
             }
-            for glyph in labels_for(&self.panels[cell.panel], &camera, cell, self.foreground) {
+            paint_color_axis(self, &mut frame, width, height, cell, scale);
+            let mut glyphs = if cell_plane(self, cell) == Some(3) {
+                Vec::new()
+            } else {
+                labels_for(&self.panels[cell.panel], &camera, cell, self.foreground)
+            };
+            glyphs.extend(dose_chrome(self, cell));
+            glyphs.extend(color_axis_glyphs(self, cell, scale));
+            for glyph in glyphs {
                 blit_glyph(&mut frame, width, height, &matrix, &glyph);
             }
         }
@@ -2057,6 +2928,7 @@ impl Plot {
     ) -> Result<wgpu::CommandEncoder, GpuError> {
         let layout = self.layout(width, height);
         self.ensure_uploaded(gpu)?;
+        self.ensure_volume(gpu)?;
         self.sync_heatmaps(&gpu.queue);
         let (cloud_quad_span, cloud_line_span) = self.upload_live(gpu);
         self.ensure_uniforms(gpu, layout.len());
@@ -2076,27 +2948,48 @@ impl Plot {
                 )
             })
             .collect();
+        let scales: Vec<f32> = layout
+            .iter()
+            .map(|cell| self.integrate_scale(cell.panel, cell.plot.w / cell.plot.h.max(1.0)))
+            .collect();
         let frames = layout
             .iter()
-            .map(|cell| {
-                let camera = &self.cameras[cell.panel];
-                (
-                    grid_lines(camera, self.foreground),
-                    border_lines(camera, &cell.plot, self.foreground),
-                )
-            })
+            .map(|cell| panel_frame(self, cell))
             .collect::<Vec<_>>();
         let labels = layout
             .iter()
-            .map(|cell| {
-                labels_for(
-                    &self.panels[cell.panel],
-                    &self.cameras[cell.panel],
-                    cell,
-                    self.foreground,
-                )
+            .enumerate()
+            .map(|(index, cell)| {
+                let mut glyphs = if cell_plane(self, cell) == Some(3) {
+                    Vec::new()
+                } else {
+                    labels_for(
+                        &self.panels[cell.panel],
+                        &self.cameras[cell.panel],
+                        cell,
+                        self.foreground,
+                    )
+                };
+                glyphs.extend(dose_chrome(self, cell));
+                glyphs.extend(color_axis_glyphs(self, cell, scales[index]));
+                glyphs
             })
             .collect::<Vec<_>>();
+        let mut bar_quads = Vec::new();
+        let bar_ranges: Vec<(u32, u32)> = layout
+            .iter()
+            .enumerate()
+            .map(|(index, cell)| {
+                let (ramp, ticks) = color_axis_quads(self, cell, scales[index]);
+                let ramp_n = u32::from(ramp.is_some());
+                let tick_n = ticks.len() as u32;
+                if let Some(quad) = ramp {
+                    bar_quads.push(quad);
+                }
+                bar_quads.extend(ticks);
+                (ramp_n, tick_n)
+            })
+            .collect();
         let frame_bytes = frames
             .iter()
             .flat_map(|(grid, border)| encode_lines(grid).into_iter().chain(encode_lines(border)))
@@ -2105,8 +2998,10 @@ impl Plot {
             .iter()
             .flat_map(|glyphs| encode_glyphs(glyphs))
             .collect::<Vec<_>>();
+        let color_bytes = encode_quads(&bar_quads);
         write_grow(&gpu.device, &gpu.queue, &mut self.frame_buf, &frame_bytes);
         write_grow(&gpu.device, &gpu.queue, &mut self.text_buf, &text_bytes);
+        write_grow(&gpu.device, &gpu.queue, &mut self.color_buf, &color_bytes);
         let Some(uniform) = self.uniform_buf.as_ref() else {
             return Err(GpuError::Message("uniform buffer missing".into()));
         };
@@ -2117,7 +3012,11 @@ impl Plot {
                 matrix,
                 width as f32,
                 height as f32,
-                self.dose_uniform(cell.panel),
+                self.dose_uniform(
+                    cell.panel,
+                    cell.plot.w / cell.plot.h.max(1.0),
+                    scales[index],
+                ),
             );
             gpu.queue
                 .write_buffer(uniform, (index * 256) as u64, &bytes);
@@ -2139,6 +3038,7 @@ impl Plot {
             // WebGL2 has no base instance, so each range binds a slice and starts at 0.
             let mut frame_cursor = 0u64;
             let mut text_cursor = 0u64;
+            let mut color_cursor = 0u64;
             for (index, cell) in layout.iter().enumerate() {
                 let offset = (index * 256) as u32;
                 let batch = &self.marks.panels[cell.panel];
@@ -2154,6 +3054,12 @@ impl Plot {
                 frame_cursor += u64::from(grid_count);
                 pass.set_pipeline(&gpu.quad_pipeline);
                 pass.set_bind_group(0, &self.uniform_groups[index], &[offset]);
+                let volume = self
+                    .volume_draw
+                    .as_ref()
+                    .map(|draw| &draw.group)
+                    .unwrap_or(&gpu.empty_volume);
+                pass.set_bind_group(2, volume, &[]);
                 if batch.quad_count > 0 {
                     pass.set_bind_group(1, &gpu.white_group, &[]);
                     pass.set_vertex_buffer(
@@ -2207,6 +3113,26 @@ impl Plot {
                 }
                 frame_cursor += u64::from(border_count);
                 pass.set_scissor_rect(0, 0, width, height);
+                let (ramp_n, tick_n) = bar_ranges[index];
+                if let (true, Some(buffer)) = (ramp_n + tick_n > 0, self.color_buf.as_ref()) {
+                    pass.set_pipeline(&gpu.quad_pipeline);
+                    pass.set_bind_group(0, &self.uniform_groups[index], &[offset]);
+                    pass.set_bind_group(2, volume, &[]);
+                    if ramp_n > 0 {
+                        if let Some(texture) = dose_heat_index(self, cell.panel) {
+                            pass.set_bind_group(1, &marks.heats[texture].group, &[]);
+                            pass.set_vertex_buffer(0, buffer.slice(color_cursor * QUAD_STRIDE..));
+                            pass.draw(0..6, 0..1);
+                        }
+                        color_cursor += 1;
+                    }
+                    if tick_n > 0 {
+                        pass.set_bind_group(1, &gpu.white_group, &[]);
+                        pass.set_vertex_buffer(0, buffer.slice(color_cursor * QUAD_STRIDE..));
+                        pass.draw(0..6, 0..tick_n);
+                        color_cursor += u64::from(tick_n);
+                    }
+                }
                 let text_count = labels[index].len() as u32;
                 if let (true, Some(buffer)) = (text_count > 0, self.text_buf.as_ref()) {
                     pass.set_pipeline(&gpu.text_pipeline);
@@ -2370,6 +3296,71 @@ impl Plot {
         Ok(())
     }
 
+    fn ensure_volume(&mut self, gpu: &PlotGpu) -> Result<(), GpuError> {
+        if self.volume_draw.is_some() || self.dose.is_none() {
+            return Ok(());
+        }
+        let limit = gpu.device.limits().max_texture_dimension_3d.max(1);
+        let grid = self.dose.as_ref().unwrap();
+        let max_axis = grid.volume.shape.iter().copied().max().unwrap_or(1) as u32;
+        let (dose_tex, brick_tex, origin, voxel, line_scale, shape) = if max_axis <= limit {
+            let dose_tex = upload_dose_f16(
+                &gpu.device,
+                &gpu.queue,
+                &grid.volume.values,
+                grid.volume.shape,
+            )?;
+            let brick_tex = upload_r32_3d(&gpu.device, &gpu.queue, &grid.bricks, grid.brick_shape)?;
+            (
+                dose_tex,
+                brick_tex,
+                grid.volume.origin,
+                grid.volume.voxel,
+                grid.line_scale,
+                [
+                    grid.volume.shape[0] as f32,
+                    grid.volume.shape[1] as f32,
+                    grid.volume.shape[2] as f32,
+                ],
+            )
+        } else {
+            let pooled = pool_volume(&grid.volume, limit);
+            let scan = scan_kit_core::scan_volume(&pooled);
+            let dose_tex = upload_dose_f16(&gpu.device, &gpu.queue, &pooled.values, pooled.shape)?;
+            let brick_tex = upload_r32_3d(&gpu.device, &gpu.queue, &scan.bricks, scan.brick_shape)?;
+            (
+                dose_tex,
+                brick_tex,
+                pooled.origin,
+                pooled.voxel,
+                scan.line_scale,
+                [
+                    pooled.shape[0] as f32,
+                    pooled.shape[1] as f32,
+                    pooled.shape[2] as f32,
+                ],
+            )
+        };
+        let (planes, plane_w, plane_h) = integral_planes(grid);
+        let integral_tex = upload_r32_2d(&gpu.device, &gpu.queue, &planes, plane_w, plane_h)?;
+        let group = volume_group(
+            &gpu.device,
+            &gpu.volume_layout,
+            &gpu.sampler,
+            &dose_tex,
+            &brick_tex,
+            &integral_tex,
+        );
+        self.volume_draw = Some(VolumeDraw {
+            group,
+            origin,
+            voxel,
+            line_scale,
+            shape,
+        });
+        Ok(())
+    }
+
     fn sync_heatmaps(&mut self, queue: &wgpu::Queue) {
         if self.heat_revision == self.heat_uploaded {
             return;
@@ -2523,6 +3514,7 @@ pub(crate) struct PlotGpu {
     pub format: wgpu::TextureFormat,
     uniform_layout: wgpu::BindGroupLayout,
     textured_layout: wgpu::BindGroupLayout,
+    volume_layout: wgpu::BindGroupLayout,
     line_pipeline: wgpu::RenderPipeline,
     point_pipeline: wgpu::RenderPipeline,
     quad_pipeline: wgpu::RenderPipeline,
@@ -2530,6 +3522,7 @@ pub(crate) struct PlotGpu {
     sampler: wgpu::Sampler,
     white_group: wgpu::BindGroup,
     atlas_group: wgpu::BindGroup,
+    empty_volume: wgpu::BindGroup,
     // The views inside the groups borrow these textures.
     #[allow(dead_code)]
     white: wgpu::Texture,
@@ -2555,7 +3548,7 @@ impl PlotGpu {
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Uniform,
                     has_dynamic_offset: true,
-                    min_binding_size: Some(NonZeroU64::new(144).unwrap()),
+                    min_binding_size: Some(NonZeroU64::new(UNIFORM_BYTES as u64).unwrap()),
                 },
                 count: None,
             }],
@@ -2591,6 +3584,52 @@ impl PlotGpu {
             bind_group_layouts: &[&uniform_layout, &textured_layout],
             push_constant_ranges: &[],
         });
+        let volume_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("dose-volume"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D3,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D3,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let quad_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("quads"),
+            bind_group_layouts: &[&uniform_layout, &textured_layout, &volume_layout],
+            push_constant_ranges: &[],
+        });
         let make = |layout: &wgpu::PipelineLayout,
                     vs: &str,
                     fs: &str,
@@ -2599,7 +3638,7 @@ impl PlotGpu {
         };
         let line_pipeline = make(&line_layout, "vs_line", "fs_line", line_vertex());
         let point_pipeline = make(&line_layout, "vs_point", "fs_point", point_vertex());
-        let quad_pipeline = make(&shaded_layout, "vs_quad", "fs_quad", quad_vertex());
+        let quad_pipeline = make(&quad_layout, "vs_quad", "fs_quad", quad_vertex());
         let text_pipeline = make(&shaded_layout, "vs_text", "fs_text", text_vertex());
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("plot"),
@@ -2607,6 +3646,7 @@ impl PlotGpu {
             min_filter: wgpu::FilterMode::Linear,
             address_mode_u: wgpu::AddressMode::ClampToEdge,
             address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
             ..Default::default()
         });
         let font = atlas();
@@ -2614,12 +3654,24 @@ impl PlotGpu {
         let white = upload_r8(&device, &queue, &[255], 1, 1)?;
         let atlas_group = textured_group(&device, &textured_layout, &atlas_tex, &sampler);
         let white_group = textured_group(&device, &textured_layout, &white, &sampler);
+        let empty_dose = upload_dose_f16(&device, &queue, &[0.0], [1, 1, 1])?;
+        let empty_brick = upload_r32_3d(&device, &queue, &[0.0], [1, 1, 1])?;
+        let empty_integral = upload_r32_2d(&device, &queue, &[0.0], 1, 1)?;
+        let empty_volume = volume_group(
+            &device,
+            &volume_layout,
+            &sampler,
+            &empty_dose,
+            &empty_brick,
+            &empty_integral,
+        );
         Ok(Self {
             device,
             queue,
             format,
             uniform_layout,
             textured_layout,
+            volume_layout,
             line_pipeline,
             point_pipeline,
             quad_pipeline,
@@ -2627,6 +3679,7 @@ impl PlotGpu {
             sampler,
             white_group,
             atlas_group,
+            empty_volume,
             white,
             atlas_tex,
         })
@@ -3640,6 +4693,592 @@ fn shows_title(panel: &Panel) -> bool {
     !panel.title.is_empty() && !panel.y_label.starts_with(&panel.title)
 }
 
+const COLOR_BAR_W: f32 = 14.0;
+const COLOR_RAMP_HEAT: f32 = 4.0;
+const COLOR_TICK_HEAT: f32 = -2.0;
+const SUPERSCRIPT: [char; 10] = ['⁰', '¹', '²', '³', '⁴', '⁵', '⁶', '⁷', '⁸', '⁹'];
+
+fn color_column_width() -> f32 {
+    let font = atlas();
+    let label = text::text_width("−0.000");
+    8.0 + COLOR_BAR_W + 14.0 + label + 8.0 + font.line_height + 6.0
+}
+
+fn color_bar_rect(cell: &Cell) -> PlotRect {
+    PlotRect {
+        x: cell.plot.x + cell.plot.w + 8.0,
+        y: cell.plot.y,
+        w: COLOR_BAR_W,
+        h: cell.plot.h.max(8.0),
+    }
+}
+
+fn cell_plane(plot: &Plot, cell: &Cell) -> Option<u8> {
+    plot.panels
+        .get(cell.panel)
+        .and_then(|panel| dose_plane(&panel.title))
+}
+
+fn panel_frame(plot: &Plot, cell: &Cell) -> (Vec<LineRec>, Vec<LineRec>) {
+    let camera = &plot.cameras[cell.panel];
+    match cell_plane(plot, cell) {
+        Some(3) => (Vec::new(), Vec::new()),
+        Some(_) => (
+            Vec::new(),
+            border_lines(camera, &cell.plot, plot.foreground),
+        ),
+        None => (
+            grid_lines(camera, plot.foreground),
+            border_lines(camera, &cell.plot, plot.foreground),
+        ),
+    }
+}
+
+fn dose_heat_index(plot: &Plot, panel: usize) -> Option<usize> {
+    let batch = plot.marks.panels.get(panel)?;
+    batch.heats.iter().rev().find_map(|(start, texture)| {
+        let quad = plot.marks.quads.get(*start as usize)?;
+        (quad.heat > 1.5 && quad.heat < 2.5).then_some(*texture)
+    })
+}
+
+fn volume_limits(grid: &crate::dose::DoseGrid, line_scale: f32) -> (f32, f32) {
+    let gain = grid.gain.max(0.01);
+    let typical = grid.lo.abs().max(grid.hi.abs()).max(1e-6);
+    if grid.mode == 0 {
+        let line = if line_scale > 0.0 {
+            line_scale
+        } else {
+            grid.line_scale.max(1e-6)
+        };
+        if grid.lo < 0.0 {
+            let reach = line / gain;
+            return (-reach, reach);
+        }
+        let peak = typical.max(1e-6);
+        let flo = (grid.lo / peak).clamp(0.0, 1.0);
+        let fhi = (grid.hi / peak).max(flo + 1e-4);
+        let scale = line / gain;
+        return (flo * scale, fhi * scale);
+    }
+    if grid.lo < 0.0 {
+        let reach = typical / gain;
+        return (-reach, reach);
+    }
+    (grid.lo / gain, grid.hi.max(grid.lo + 1e-6) / gain)
+}
+
+fn presented_limits(
+    plot: &Plot,
+    panel: usize,
+    plane: u8,
+    line_scale: f32,
+) -> Option<(f32, f32, String)> {
+    let grid = plot.dose.as_ref()?;
+    let gain = grid.gain.max(0.01);
+    let (lo, hi) = if plane >= 3 {
+        volume_limits(grid, line_scale)
+    } else if plot.integral.get(panel).copied().unwrap_or(false) {
+        let (lo, hi) = crate::dose::integral_limits(grid, plane);
+        (lo / gain, hi / gain)
+    } else if grid.hi > grid.lo {
+        (grid.lo / gain, grid.hi / gain)
+    } else {
+        (0.0, grid.peak / gain)
+    };
+    Some((lo, hi, grid.unit.clone()))
+}
+
+fn superscript_exp(exp: i32) -> String {
+    exp.to_string()
+        .chars()
+        .map(|ch| match ch {
+            '-' => '⁻',
+            '0'..='9' => SUPERSCRIPT[(ch as u8 - b'0') as usize],
+            _ => ch,
+        })
+        .collect()
+}
+
+fn short_tick(value: f32) -> String {
+    if !value.is_finite() || value.abs() < 1e-8 {
+        return "0".into();
+    }
+    let exp = value.abs().log10().floor();
+    let scale = 10.0_f32.powf(exp - 3.0);
+    let rounded = (value / scale).round() * scale;
+    if rounded.abs() < 1e-8 {
+        return "0".into();
+    }
+    let decimals = (3 - rounded.abs().log10().floor() as i32).max(0) as usize;
+    let text = format!("{rounded:.decimals$}");
+    let trimmed = if text.contains('.') {
+        text.trim_end_matches('0').trim_end_matches('.').to_string()
+    } else {
+        text
+    };
+    trimmed.replace('-', "−")
+}
+
+fn tick_labels(values: &[f32]) -> (Vec<String>, String) {
+    if values.is_empty() {
+        return (Vec::new(), String::new());
+    }
+    let peak = values
+        .iter()
+        .fold(0.0_f32, |peak, value| peak.max(value.abs()));
+    let mut scale = 1.0_f32;
+    let mut offset = String::new();
+    if peak > 0.0 && peak.is_finite() {
+        let exp = peak.log10().floor() as i32;
+        if !(-2..=3).contains(&exp) {
+            scale = 10.0_f32.powi(exp);
+            offset = format!("×10{}", superscript_exp(exp));
+        }
+    }
+    let labels = values
+        .iter()
+        .map(|value| short_tick(*value / scale))
+        .collect();
+    (labels, offset)
+}
+
+fn minor_parts(step: f32) -> i32 {
+    if step <= 0.0 || !step.is_finite() {
+        return 5;
+    }
+    let leading = step / 10.0_f32.powf(step.log10().floor());
+    if (leading - 2.0).abs() < 0.05 || (leading - 2.5).abs() < 0.05 {
+        4
+    } else {
+        5
+    }
+}
+
+fn locator_ticks(lo: f32, hi: f32, nbins: i32) -> Vec<f32> {
+    let span = (hi - lo).max(1e-12);
+    let raw = span / nbins.max(2) as f32;
+    if !raw.is_finite() || raw <= 0.0 {
+        return vec![lo, hi];
+    }
+    let mag = 10.0_f32.powf(raw.log10().floor());
+    let residual = raw / mag;
+    let nice = [1.0_f32, 2.0, 2.5, 5.0, 10.0]
+        .into_iter()
+        .find(|step| residual <= *step + 1e-3)
+        .unwrap_or(10.0);
+    let step = (nice * mag).max(1e-20);
+    let mut value = (lo / step).floor() * step;
+    if value > lo {
+        value -= step;
+    }
+    let mut out = Vec::new();
+    for _ in 0..48 {
+        let snapped = (value / step).round() * step;
+        if snapped >= lo - span * 1e-4
+            && snapped <= hi + span * 1e-4
+            && out
+                .last()
+                .is_none_or(|prev: &f32| (snapped - *prev).abs() > step * 0.25)
+        {
+            out.push(snapped);
+        }
+        if value > hi + step {
+            break;
+        }
+        value += step;
+    }
+    out
+}
+
+fn color_axis_ticks(lo: f32, hi: f32, nbins: i32) -> (Vec<f32>, Vec<f32>, Vec<String>, String) {
+    if !lo.is_finite() || !hi.is_finite() {
+        return (Vec::new(), Vec::new(), Vec::new(), String::new());
+    }
+    let (lo, hi) = if hi < lo { (hi, lo) } else { (lo, hi) };
+    let span = hi - lo;
+    if span <= 0.0 {
+        return (vec![lo], Vec::new(), Vec::new(), String::new());
+    }
+    let nbins = nbins.clamp(2, 8);
+    let pad = span * 1e-6;
+    let mut nice = locator_ticks(lo, hi, nbins);
+    nice.retain(|value| *value >= lo - pad && *value <= hi + pad);
+    if lo < 0.0 && hi > 0.0 && nice.iter().all(|value| value.abs() > pad) {
+        nice.push(0.0);
+        nice.sort_by(f32::total_cmp);
+    }
+    let inner: Vec<f32> = nice
+        .into_iter()
+        .filter(|value| *value > lo + pad && *value < hi - pad)
+        .collect();
+    let mut majors = Vec::with_capacity(inner.len() + 2);
+    majors.push(lo);
+    majors.extend(inner);
+    majors.push(hi);
+    let mut minors = Vec::new();
+    for pair in majors.windows(2) {
+        let step = pair[1] - pair[0];
+        let parts = minor_parts(step);
+        for part in 1..parts {
+            let value = pair[0] + step * part as f32 / parts as f32;
+            if value > lo && value < hi {
+                minors.push(value);
+            }
+        }
+    }
+    let (labels, offset) = tick_labels(&majors);
+    (majors, minors, labels, offset)
+}
+
+fn tick_row(value: f32, lo: f32, hi: f32, bar: &PlotRect) -> f32 {
+    let span = (hi - lo).max(1e-12);
+    (bar.y + (hi - value) / span * bar.h).round()
+}
+
+fn major_tick_length(value: f32, span: f32, labeled: bool) -> f32 {
+    if !labeled {
+        5.0
+    } else if value.abs() <= span * 1e-6 {
+        9.0
+    } else {
+        7.0
+    }
+}
+
+struct ColorScale {
+    bar: PlotRect,
+    lo: f32,
+    hi: f32,
+    majors: Vec<f32>,
+    minors: Vec<f32>,
+    labels: Vec<String>,
+    title: String,
+    labeled: Vec<bool>,
+}
+
+fn label_slots(majors: &[f32], lo: f32, hi: f32, bar: &PlotRect) -> Vec<bool> {
+    let font = atlas();
+    let mut labeled = vec![false; majors.len()];
+    let mut shown = Vec::new();
+    let mut order = Vec::with_capacity(majors.len());
+    if !majors.is_empty() {
+        order.push(0);
+    }
+    if majors.len() > 1 {
+        order.push(majors.len() - 1);
+    }
+    if majors.len() > 2 {
+        order.extend(1..majors.len() - 1);
+    }
+    for index in order {
+        let y = tick_row(majors[index], lo, hi, bar);
+        if shown
+            .iter()
+            .any(|prev: &f32| (y - *prev).abs() < font.line_height)
+        {
+            continue;
+        }
+        labeled[index] = true;
+        shown.push(y);
+    }
+    labeled
+}
+
+fn color_scale(plot: &Plot, cell: &Cell, line_scale: f32) -> Option<ColorScale> {
+    let plane = cell_plane(plot, cell)?;
+    let (mut lo, mut hi, unit) = presented_limits(plot, cell.panel, plane, line_scale)?;
+    if hi < lo {
+        std::mem::swap(&mut lo, &mut hi);
+    }
+    if !lo.is_finite() || !hi.is_finite() || hi - lo < 1e-8 {
+        return None;
+    }
+    let bar = color_bar_rect(cell);
+    let nbins = (bar.h / 52.0).floor() as i32;
+    let (majors, minors, labels, offset) = color_axis_ticks(lo, hi, nbins);
+    if majors.len() < 2 || labels.len() != majors.len() {
+        return None;
+    }
+    let title = if offset.is_empty() {
+        unit
+    } else if unit.is_empty() {
+        offset
+    } else {
+        format!("{unit}  {offset}")
+    };
+    let labeled = label_slots(&majors, lo, hi, &bar);
+    Some(ColorScale {
+        bar,
+        lo,
+        hi,
+        majors,
+        minors,
+        labels,
+        title,
+        labeled,
+    })
+}
+
+fn screen_rect(x0: f32, y0: f32, x1: f32, y1: f32, color: [f32; 4], heat: f32) -> QuadRec {
+    QuadRec {
+        a: [x0, y0],
+        b: [x1, y1],
+        c: None,
+        heat,
+        color,
+        id: 0,
+        heatmap: None,
+    }
+}
+
+fn color_axis_quads(plot: &Plot, cell: &Cell, line_scale: f32) -> (Option<QuadRec>, Vec<QuadRec>) {
+    let Some(scale) = color_scale(plot, cell, line_scale) else {
+        return (None, Vec::new());
+    };
+    let color = plot.foreground;
+    let ramp = screen_rect(
+        scale.bar.x,
+        scale.bar.y,
+        scale.bar.x + scale.bar.w,
+        scale.bar.y + scale.bar.h,
+        [1.0, 1.0, 1.0, 1.0],
+        COLOR_RAMP_HEAT,
+    );
+    let mut ticks = Vec::new();
+    let x0 = scale.bar.x;
+    let y0 = scale.bar.y;
+    let x1 = scale.bar.x + scale.bar.w;
+    let y1 = scale.bar.y + scale.bar.h;
+    ticks.push(screen_rect(x0, y0, x1, y0 + 1.0, color, COLOR_TICK_HEAT));
+    ticks.push(screen_rect(x0, y1 - 1.0, x1, y1, color, COLOR_TICK_HEAT));
+    ticks.push(screen_rect(x0, y0, x0 + 1.0, y1, color, COLOR_TICK_HEAT));
+    ticks.push(screen_rect(x1 - 1.0, y0, x1, y1, color, COLOR_TICK_HEAT));
+    let spine = x1;
+    let span = scale.hi - scale.lo;
+    for value in &scale.minors {
+        let y = tick_row(*value, scale.lo, scale.hi, &scale.bar);
+        ticks.push(screen_rect(
+            spine,
+            y,
+            spine + 4.0,
+            y + 1.0,
+            color,
+            COLOR_TICK_HEAT,
+        ));
+    }
+    for (index, value) in scale.majors.iter().enumerate() {
+        let y = tick_row(*value, scale.lo, scale.hi, &scale.bar);
+        let length = major_tick_length(*value, span, scale.labeled[index]);
+        ticks.push(screen_rect(
+            spine,
+            y,
+            spine + length,
+            y + 1.0,
+            color,
+            COLOR_TICK_HEAT,
+        ));
+    }
+    (Some(ramp), ticks)
+}
+
+fn color_axis_glyphs(plot: &Plot, cell: &Cell, line_scale: f32) -> Vec<GlyphRec> {
+    let Some(scale) = color_scale(plot, cell, line_scale) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let spine = scale.bar.x + scale.bar.w;
+    let span = scale.hi - scale.lo;
+    for (index, label) in scale.labels.iter().enumerate() {
+        if !scale.labeled[index] {
+            continue;
+        }
+        let length = major_tick_length(scale.majors[index], span, true);
+        let y = tick_row(scale.majors[index], scale.lo, scale.hi, &scale.bar) + 0.5;
+        push_text(
+            &mut out,
+            label,
+            [spine + length + 4.0, y, 0.0],
+            0.0,
+            0.0,
+            [0.0, ink_center_shift(label)],
+            plot.foreground,
+        );
+    }
+    if !scale.title.is_empty() {
+        let font = atlas();
+        push_up_text(
+            &mut out,
+            &scale.title,
+            [
+                cell.cell.x + cell.cell.w - 4.0 - font.line_height * 0.5,
+                scale.bar.y + scale.bar.h * 0.5,
+            ],
+            plot.foreground,
+        );
+    }
+    out
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn paint_color_axis(
+    plot: &Plot,
+    frame: &mut [u8],
+    width: u32,
+    height: u32,
+    cell: &Cell,
+    line_scale: f32,
+) {
+    let Some(scale) = color_scale(plot, cell, line_scale) else {
+        return;
+    };
+    let Some(grid) = &plot.dose else {
+        return;
+    };
+    let x0 = scale.bar.x.floor() as i32;
+    let x1 = (scale.bar.x + scale.bar.w).ceil() as i32;
+    let y0 = scale.bar.y.floor() as i32;
+    let y1 = (scale.bar.y + scale.bar.h).ceil() as i32;
+    for y in y0..y1 {
+        let t = (1.0 - ((y as f32 + 0.5 - scale.bar.y) / scale.bar.h)).clamp(0.0, 1.0);
+        let rgb = scan_kit_core::sample(grid.ramp, t);
+        for x in x0..x1 {
+            blend(
+                frame,
+                width,
+                height,
+                x,
+                y,
+                [rgb[0], rgb[1], rgb[2], 1.0],
+                None,
+            );
+        }
+    }
+    let ink = plot.foreground;
+    for x in x0..x1 {
+        blend(frame, width, height, x, y0, ink, None);
+        blend(frame, width, height, x, y1 - 1, ink, None);
+    }
+    for y in y0..y1 {
+        blend(frame, width, height, x0, y, ink, None);
+        blend(frame, width, height, x1 - 1, y, ink, None);
+    }
+    let spine = (scale.bar.x + scale.bar.w).round() as i32;
+    let span = scale.hi - scale.lo;
+    for value in &scale.minors {
+        let y = tick_row(*value, scale.lo, scale.hi, &scale.bar) as i32;
+        for x in spine..(spine + 4) {
+            blend(frame, width, height, x, y, ink, None);
+        }
+    }
+    for (index, value) in scale.majors.iter().enumerate() {
+        let y = tick_row(*value, scale.lo, scale.hi, &scale.bar) as i32;
+        let length = major_tick_length(*value, span, scale.labeled[index]).round() as i32;
+        for x in spine..(spine + length) {
+            blend(frame, width, height, x, y, ink, None);
+        }
+    }
+}
+
+fn dose_chrome(plot: &Plot, cell: &Cell) -> Vec<GlyphRec> {
+    let mut out = Vec::new();
+    let Some(grid) = &plot.dose else {
+        return out;
+    };
+    let Some(plane) = plot
+        .panels
+        .get(cell.panel)
+        .and_then(|panel| dose_plane(&panel.title))
+    else {
+        return out;
+    };
+    if plane != 3 {
+        return out;
+    }
+    let volume = &grid.volume;
+    let voxel = volume.voxel.max(1e-6);
+    let extent = [
+        volume.shape[0] as f32 * voxel,
+        volume.shape[1] as f32 * voxel,
+        volume.shape[2] as f32 * voxel,
+    ];
+    let origin = volume.origin;
+    let view = scan_kit_core::RayView {
+        azimuth: plot.azimuth,
+        elevation: plot.elevation,
+        zoom: plot.orbit_zoom,
+        aspect: crate::dose::FILM_X * cell.plot.w / cell.plot.h.max(1.0),
+        mode: grid.mode,
+        filter: grid.filter,
+        gain: grid.gain,
+        opacity: grid.opacity,
+        lo: grid.lo,
+        hi: grid.hi,
+        ramp: grid.ramp,
+        line_scale: grid.line_scale,
+        fov: plot.fov,
+        center: plot.pan,
+        gantry: grid.gantry,
+    };
+    let place = |out: &mut Vec<GlyphRec>, text: &str, point: [f32; 3]| {
+        let Some(uv) = scan_kit_core::dose_film_uv(volume, view, point) else {
+            return;
+        };
+        push_text(
+            out,
+            text,
+            [
+                cell.plot.x + uv[0] * cell.plot.w * crate::dose::FILM_X,
+                cell.plot.y + uv[1] * cell.plot.h,
+                0.0,
+            ],
+            0.0,
+            0.5,
+            [0.0, 0.0],
+            plot.foreground,
+        );
+    };
+    let z1 = origin[2] + extent[2];
+    let step_x = tick_step(extent[0]);
+    let mut mark = (origin[0] / step_x).ceil() * step_x;
+    let mut n = 0;
+    while mark <= origin[0] + extent[0] + 0.01 && n < 8 {
+        place(&mut out, &format_tick(mark), [mark, origin[1], z1]);
+        mark += step_x;
+        n += 1;
+    }
+    let step_y = tick_step(extent[1]);
+    mark = (origin[1] / step_y).ceil() * step_y;
+    n = 0;
+    while mark <= origin[1] + extent[1] + 0.01 && n < 8 {
+        place(&mut out, &format_tick(mark), [origin[0], mark, z1]);
+        mark += step_y;
+        n += 1;
+    }
+    let step_z = tick_step(extent[2]);
+    mark = (origin[2] / step_z).ceil() * step_z;
+    n = 0;
+    while mark <= z1 + 0.01 && n < 8 {
+        place(
+            &mut out,
+            &format_tick(z1 - mark),
+            [origin[0], origin[1], mark],
+        );
+        mark += step_z;
+        n += 1;
+    }
+    out
+}
+
+fn tick_step(span: f32) -> f32 {
+    for step in [10.0, 20.0, 50.0, 100.0, 200.0, 500.0] {
+        if span / step <= 8.0 {
+            return step;
+        }
+    }
+    500.0
+}
+
 fn labels_for(panel: &Panel, camera: &Camera, cell: &Cell, color: [f32; 4]) -> Vec<GlyphRec> {
     let mut out = Vec::new();
     let font = atlas();
@@ -3831,6 +5470,109 @@ fn dose_plane(title: &str) -> Option<u8> {
     }
 }
 
+fn cached_depth_integral(grid: &crate::dose::DoseGrid, y: usize) -> (Vec<f32>, Vec<f32>) {
+    let [_, ny, nz] = grid.volume.shape;
+    let y = y.min(ny.saturating_sub(1));
+    let voxel = grid.volume.voxel;
+    let face = grid.volume.origin[2] + nz as f32 * voxel;
+    let mut depth = Vec::with_capacity(nz);
+    let mut dose = Vec::with_capacity(nz);
+    for z in (0..nz).rev() {
+        depth.push(face - (grid.volume.origin[2] + (z as f32 + 0.5) * voxel));
+        let sum = grid.integrals[2].get(y + ny * z).copied().unwrap_or(0.0);
+        dose.push(sum * voxel);
+    }
+    (depth, dose)
+}
+
+fn cached_lateral_integral(
+    grid: &crate::dose::DoseGrid,
+    x: usize,
+    z: usize,
+) -> (Vec<f32>, Vec<f32>) {
+    let [nx, _, nz] = grid.volume.shape;
+    let x = x.min(nx.saturating_sub(1));
+    let z = z.min(nz.saturating_sub(1));
+    let voxel = grid.volume.voxel;
+    let x0 = grid.volume.origin[0] + (x as f32 + 0.5) * voxel;
+    let mut xs = Vec::with_capacity(nx);
+    let mut dose = Vec::with_capacity(nx);
+    for column in 0..nx {
+        xs.push(grid.volume.origin[0] + (column as f32 + 0.5) * voxel - x0);
+        let sum = grid.integrals[1]
+            .get(column + nx * z)
+            .copied()
+            .unwrap_or(0.0);
+        dose.push(sum * voxel);
+    }
+    (xs, dose)
+}
+
+fn cached_longitudinal_integral(
+    grid: &crate::dose::DoseGrid,
+    y: usize,
+    z: usize,
+) -> (Vec<f32>, Vec<f32>) {
+    let [_, ny, nz] = grid.volume.shape;
+    let y = y.min(ny.saturating_sub(1));
+    let z = z.min(nz.saturating_sub(1));
+    let voxel = grid.volume.voxel;
+    let z0 = grid.volume.origin[2] + (z as f32 + 0.5) * voxel;
+    let mut xs = Vec::with_capacity(nz);
+    let mut dose = Vec::with_capacity(nz);
+    for depth in 0..nz {
+        let z_mm = grid.volume.origin[2] + (depth as f32 + 0.5) * voxel;
+        xs.push(z0 - z_mm);
+        let sum = grid.integrals[2]
+            .get(y + ny * depth)
+            .copied()
+            .unwrap_or(0.0);
+        dose.push(sum * voxel);
+    }
+    (xs, dose)
+}
+
+fn integral_profile_axis(grid: &crate::dose::DoseGrid, kind: u8) -> (f32, f32) {
+    let voxel = grid.volume.voxel;
+    let mut lo = 0.0f32;
+    let mut hi = 0.0f32;
+    let mut any = false;
+    let fold = |values: &[f32], lo: &mut f32, hi: &mut f32, any: &mut bool| {
+        for value in values {
+            if !value.is_finite() {
+                continue;
+            }
+            let shown = value * voxel;
+            if *any {
+                *lo = lo.min(shown);
+                *hi = hi.max(shown);
+            } else {
+                *lo = shown;
+                *hi = shown;
+                *any = true;
+            }
+        }
+    };
+    match kind {
+        1 => fold(&grid.integrals[1], &mut lo, &mut hi, &mut any),
+        0 | 2 => fold(&grid.integrals[2], &mut lo, &mut hi, &mut any),
+        _ => {
+            fold(&grid.integrals[1], &mut lo, &mut hi, &mut any);
+            fold(&grid.integrals[2], &mut lo, &mut hi, &mut any);
+        }
+    }
+    if !any || !lo.is_finite() || !hi.is_finite() {
+        return (0.0, 1.0);
+    }
+    if (hi - lo).abs() < 1.0e-4 {
+        (lo - 0.5, hi + 0.5)
+    } else if lo <= hi {
+        (lo, hi)
+    } else {
+        (hi, lo)
+    }
+}
+
 fn profile_kind(title: &str) -> Option<u8> {
     let title = title.to_ascii_lowercase();
     if title.starts_with("depth") {
@@ -3878,19 +5620,19 @@ fn profile_lines(
         series.push(pair);
     };
     match kind {
-        0 if integrate => push(&mut series, volume.depth_integral(iy)),
+        0 if integrate => push(&mut series, cached_depth_integral(grid, iy)),
         0 => push(&mut series, volume.depth_profile(ix, iy)),
-        1 if integrate => push(&mut series, volume.lateral_integral(iz)),
-        1 => push(&mut series, volume.lateral_profile(iy, iz)),
-        2 if integrate => push(&mut series, volume.longitudinal_integral(iz)),
-        2 => push(&mut series, volume.longitudinal_profile(ix, iz)),
+        1 if integrate => push(&mut series, cached_lateral_integral(grid, ix, iz)),
+        1 => push(&mut series, volume.lateral_profile(ix, iy, iz)),
+        2 if integrate => push(&mut series, cached_longitudinal_integral(grid, iy, iz)),
+        2 => push(&mut series, volume.longitudinal_profile(ix, iy, iz)),
         _ if integrate => {
-            push(&mut series, volume.lateral_integral(iz));
-            push(&mut series, volume.longitudinal_integral(iz));
+            push(&mut series, cached_lateral_integral(grid, ix, iz));
+            push(&mut series, cached_longitudinal_integral(grid, iy, iz));
         }
         _ => {
-            push(&mut series, volume.lateral_profile(iy, iz));
-            push(&mut series, volume.longitudinal_profile(ix, iz));
+            push(&mut series, volume.lateral_profile(ix, iy, iz));
+            push(&mut series, volume.longitudinal_profile(ix, iy, iz));
         }
     }
     let mut lines = Vec::new();
@@ -3926,10 +5668,8 @@ fn crosshair_lines(
     grid: &crate::dose::DoseGrid,
     plane: u8,
     cursor: [usize; 3],
-    xmin: f32,
-    xmax: f32,
-    ymin: f32,
-    ymax: f32,
+    bounds: [f32; 4],
+    turns: u8,
     color: [f32; 4],
 ) -> Vec<LineRec> {
     let volume = &grid.volume;
@@ -3938,18 +5678,23 @@ fn crosshair_lines(
         2 => (volume.mm_of(1, cursor[1]), volume.mm_of(2, cursor[2])),
         _ => (volume.mm_of(0, cursor[0]), volume.mm_of(1, cursor[1])),
     };
+    let [xmin, xmax, ymin, ymax] = bounds;
     let ink = [color[0], color[1], color[2], 0.85];
+    let end = |px: f32, py: f32| {
+        let point = crate::dose::display_mm(px, py, bounds, turns);
+        [point[0], point[1], 0.0]
+    };
     vec![
         LineRec {
-            a: [x, ymin, 0.0],
-            b: [x, ymax, 0.0],
+            a: end(x, ymin),
+            b: end(x, ymax),
             color: ink,
             thickness: 1.0,
             id: 0,
         },
         LineRec {
-            a: [xmin, y, 0.0],
-            b: [xmax, y, 0.0],
+            a: end(xmin, y),
+            b: end(xmax, y),
             color: ink,
             thickness: 1.0,
             id: 0,
@@ -4629,8 +6374,13 @@ fn encode_glyphs(glyphs: &[GlyphRec]) -> Vec<u8> {
     out
 }
 
-fn encode_uniform(matrix: [f32; 16], width: f32, height: f32, dose: [[f32; 4]; 4]) -> [u8; 144] {
-    let mut out = [0u8; 144];
+fn encode_uniform(
+    matrix: [f32; 16],
+    width: f32,
+    height: f32,
+    dose: [[f32; 4]; 10],
+) -> [u8; UNIFORM_BYTES] {
+    let mut out = [0u8; UNIFORM_BYTES];
     for (index, value) in matrix.iter().enumerate() {
         out[index * 4..index * 4 + 4].copy_from_slice(&value.to_le_bytes());
     }
@@ -4672,7 +6422,7 @@ fn uniform_group(
             resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
                 buffer,
                 offset: 0,
-                size: Some(NonZeroU64::new(144).unwrap()),
+                size: Some(NonZeroU64::new(UNIFORM_BYTES as u64).unwrap()),
             }),
         }],
     })
@@ -4836,6 +6586,331 @@ fn write_rgba(queue: &wgpu::Queue, texture: &wgpu::Texture, pixels: &[u8], cols:
             depth_or_array_layers: 1,
         },
     );
+}
+
+fn volume_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    sampler: &wgpu::Sampler,
+    dose: &wgpu::Texture,
+    bricks: &wgpu::Texture,
+    integral: &wgpu::Texture,
+) -> wgpu::BindGroup {
+    let dose_view = dose.create_view(&Default::default());
+    let brick_view = bricks.create_view(&Default::default());
+    let integral_view = integral.create_view(&Default::default());
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("dose-volume"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&dose_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(&brick_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::Sampler(sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: wgpu::BindingResource::TextureView(&integral_view),
+            },
+        ],
+    })
+}
+
+fn integral_planes(grid: &crate::dose::DoseGrid) -> (Vec<f32>, u32, u32) {
+    let [nx, ny, nz] = grid.volume.shape;
+    let width = nx.max(ny).max(1);
+    let height = (ny + nz + nz).max(1);
+    let mut image = vec![0.0f32; width * height];
+    for (index, value) in grid.integrals[0].iter().enumerate() {
+        let x = index % nx.max(1);
+        let y = index / nx.max(1);
+        if x < width && y < height {
+            image[x + width * y] = *value;
+        }
+    }
+    for (index, value) in grid.integrals[1].iter().enumerate() {
+        let x = index % nx.max(1);
+        let z = index / nx.max(1);
+        let row = ny + z;
+        if x < width && row < height {
+            image[x + width * row] = *value;
+        }
+    }
+    for (index, value) in grid.integrals[2].iter().enumerate() {
+        let y = index % ny.max(1);
+        let z = index / ny.max(1);
+        let row = ny + nz + z;
+        if y < width && row < height {
+            image[y + width * row] = *value;
+        }
+    }
+    (image, width as u32, height as u32)
+}
+
+/// Two zero voxels on every side, so linear and cubic taps that fall outside
+/// the box read 0. The march box stays the unpadded shape.
+fn upload_dose_f16(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    values: &[f32],
+    shape: [usize; 3],
+) -> Result<wgpu::Texture, GpuError> {
+    let nx = shape[0].max(1);
+    let ny = shape[1].max(1);
+    let nz = shape[2].max(1);
+    let width = nx + 4;
+    let height = ny + 4;
+    let depth = nz + 4;
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("dose-volume"),
+        size: wgpu::Extent3d {
+            width: width as u32,
+            height: height as u32,
+            depth_or_array_layers: depth as u32,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D3,
+        format: wgpu::TextureFormat::R16Float,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let stride = ((width * 2) as u32).next_multiple_of(256);
+    let mut padded = vec![0u8; stride as usize * height * depth];
+    if shape[0] > 0 && shape[1] > 0 && shape[2] > 0 {
+        for z in 0..nz.min(shape[2]) {
+            for y in 0..ny.min(shape[1]) {
+                let src = nx.min(shape[0]) * (y + shape[1] * z);
+                let row = ((z + 2) * height + (y + 2)) * stride as usize;
+                for x in 0..nx.min(shape[0]) {
+                    let bits = f32_to_f16(values.get(src + x).copied().unwrap_or(0.0));
+                    let at = row + (x + 2) * 2;
+                    padded[at..at + 2].copy_from_slice(&bits.to_le_bytes());
+                }
+            }
+        }
+    }
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        &padded,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(stride),
+            rows_per_image: Some(height as u32),
+        },
+        wgpu::Extent3d {
+            width: width as u32,
+            height: height as u32,
+            depth_or_array_layers: depth as u32,
+        },
+    );
+    Ok(texture)
+}
+
+fn f32_to_f16(value: f32) -> u16 {
+    let bits = value.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let mut mantissa = bits & 0x007f_ffff;
+    let mut exp = ((bits >> 23) & 0xff) as i32 - 127 + 15;
+    if (bits & 0x7fff_ffff) == 0 {
+        return sign;
+    }
+    if ((bits >> 23) & 0xff) == 255 {
+        return sign | 0x7c00 | if mantissa == 0 { 0 } else { 0x200 };
+    }
+    if exp >= 31 {
+        return sign | 0x7c00;
+    }
+    if exp <= 0 {
+        return sign;
+    }
+    let dropped = mantissa & 0x1fff;
+    mantissa >>= 13;
+    if dropped > 0x1000 || (dropped == 0x1000 && mantissa & 1 == 1) {
+        mantissa += 1;
+        if mantissa == 0x400 {
+            mantissa = 0;
+            exp += 1;
+            if exp >= 31 {
+                return sign | 0x7c00;
+            }
+        }
+    }
+    sign | ((exp as u16) << 10) | (mantissa as u16)
+}
+
+fn upload_r32_2d(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    values: &[f32],
+    width: u32,
+    height: u32,
+) -> Result<wgpu::Texture, GpuError> {
+    let width = width.max(1);
+    let height = height.max(1);
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("dose-integral"),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::R32Float,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let stride = (width * 4).next_multiple_of(256);
+    let mut padded = vec![0u8; (stride * height) as usize];
+    for y in 0..height {
+        let row = (y * stride) as usize;
+        for x in 0..width {
+            let value = values.get((x + width * y) as usize).copied().unwrap_or(0.0);
+            let at = row + x as usize * 4;
+            padded[at..at + 4].copy_from_slice(&value.to_le_bytes());
+        }
+    }
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        &padded,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(stride),
+            rows_per_image: Some(height),
+        },
+        wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+    );
+    Ok(texture)
+}
+
+fn upload_r32_3d(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    values: &[f32],
+    shape: [usize; 3],
+) -> Result<wgpu::Texture, GpuError> {
+    let width = shape[0].max(1) as u32;
+    let height = shape[1].max(1) as u32;
+    let depth = shape[2].max(1) as u32;
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("dose-volume"),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: depth,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D3,
+        format: wgpu::TextureFormat::R32Float,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let stride = (width * 4).next_multiple_of(256);
+    let mut padded = vec![0u8; (stride * height * depth) as usize];
+    for z in 0..depth {
+        for y in 0..height {
+            let row = ((z * height + y) * stride) as usize;
+            for x in 0..width {
+                let index =
+                    x as usize + width as usize * (y as usize + height as usize * z as usize);
+                let value = values.get(index).copied().unwrap_or(0.0);
+                let at = row + x as usize * 4;
+                padded[at..at + 4].copy_from_slice(&value.to_le_bytes());
+            }
+        }
+    }
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        &padded,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(stride),
+            rows_per_image: Some(height),
+        },
+        wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: depth,
+        },
+    );
+    Ok(texture)
+}
+
+/// Average voxels by one integer factor on every axis so the grid fits a 3D texture.
+fn pool_volume(volume: &scan_kit_core::Volume, limit: u32) -> scan_kit_core::Volume {
+    let factor = volume
+        .shape
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or(1)
+        .div_ceil(limit.max(1) as usize)
+        .max(1);
+    let shape = [
+        volume.shape[0].div_ceil(factor),
+        volume.shape[1].div_ceil(factor),
+        volume.shape[2].div_ceil(factor),
+    ];
+    let mut values = vec![0.0f32; shape[0] * shape[1] * shape[2]];
+    for z in 0..shape[2] {
+        for y in 0..shape[1] {
+            for x in 0..shape[0] {
+                let mut sum = 0.0f32;
+                let mut count = 0.0f32;
+                for dz in 0..factor {
+                    for dy in 0..factor {
+                        for dx in 0..factor {
+                            let xx = x * factor + dx;
+                            let yy = y * factor + dy;
+                            let zz = z * factor + dz;
+                            if xx < volume.shape[0] && yy < volume.shape[1] && zz < volume.shape[2]
+                            {
+                                sum += volume.get(xx, yy, zz);
+                                count += 1.0;
+                            }
+                        }
+                    }
+                }
+                values[x + shape[0] * (y + shape[1] * z)] =
+                    if count > 0.0 { sum / count } else { 0.0 };
+            }
+        }
+    }
+    scan_kit_core::Volume {
+        origin: volume.origin,
+        shape,
+        voxel: volume.voxel * factor as f32,
+        values,
+    }
 }
 
 fn upload_rgba(
@@ -5014,9 +7089,185 @@ fn axis_close(a0: f32, a1: f32, b0: f32, b1: f32) -> bool {
     ratio <= 3.0 && mid_delta <= a_span.max(b_span)
 }
 
+/// Vispy key name, or the DOM name, to the next azimuth, elevation, fov, and saved perspective fov.
+fn blender_step(
+    azimuth: f32,
+    elevation: f32,
+    fov: f32,
+    persp: f32,
+    key: &str,
+    ctrl: bool,
+) -> Option<(f32, f32, f32, f32)> {
+    let digit = match key {
+        "1" | "Digit1" | "Numpad1" | "End" => '1',
+        "2" | "Digit2" | "Numpad2" | "ArrowDown" | "Down" => '2',
+        "3" | "Digit3" | "Numpad3" | "PageDown" => '3',
+        "4" | "Digit4" | "Numpad4" | "ArrowLeft" | "Left" => '4',
+        "5" | "Digit5" | "Numpad5" | "Clear" => '5',
+        "6" | "Digit6" | "Numpad6" | "ArrowRight" | "Right" => '6',
+        "7" | "Digit7" | "Numpad7" | "Home" => '7',
+        "8" | "Digit8" | "Numpad8" | "ArrowUp" | "Up" => '8',
+        "9" | "Digit9" | "Numpad9" | "PageUp" => '9',
+        _ => return None,
+    };
+    if digit == '5' {
+        return Some(if fov <= 1.0e-4 {
+            (azimuth, elevation, persp.max(1.0e-3), persp)
+        } else {
+            (azimuth, elevation, 0.0, fov)
+        });
+    }
+    if digit == '9' {
+        if elevation.abs() >= 80.0_f32.to_radians() {
+            return Some((azimuth, -elevation, fov, persp));
+        }
+        return Some((
+            (azimuth + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU),
+            elevation,
+            fov,
+            persp,
+        ));
+    }
+    if matches!(digit, '2' | '4' | '6' | '8') && !ctrl {
+        let (daz, del) = match digit {
+            '4' => (ORBIT_STEP, 0.0),
+            '6' => (-ORBIT_STEP, 0.0),
+            '8' => (0.0, ORBIT_STEP),
+            _ => (0.0, -ORBIT_STEP),
+        };
+        return Some((
+            azimuth + daz,
+            (elevation + del).clamp(-std::f32::consts::FRAC_PI_2, std::f32::consts::FRAC_PI_2),
+            fov,
+            persp,
+        ));
+    }
+    let pose = match (digit, ctrl) {
+        ('1', false) => (180.0_f32.to_radians(), 0.0),
+        ('1', true) => (0.0, 0.0),
+        ('3', false) => (90.0_f32.to_radians(), 0.0),
+        ('3', true) => ((-90.0_f32).to_radians(), 0.0),
+        ('7', false) => (0.0, std::f32::consts::FRAC_PI_2),
+        ('7', true) => (0.0, -std::f32::consts::FRAC_PI_2),
+        _ => return None,
+    };
+    Some((pose.0, pose.1, fov, persp))
+}
+
+fn turntable_axes(azimuth: f32, elevation: f32) -> ([f32; 3], [f32; 3]) {
+    let (sa, ca) = azimuth.sin_cos();
+    let (se, ce) = elevation.sin_cos();
+    let look = unit([-ce * sa, ce * ca, -se]);
+    let right = unit([ca, sa, 0.0]);
+    let up = [
+        right[1] * look[2] - right[2] * look[1],
+        right[2] * look[0] - right[0] * look[2],
+        right[0] * look[1] - right[1] * look[0],
+    ];
+    (right, unit(up))
+}
+
+/// Slice index on a new lattice, in the same millimetres as the old one.
+fn carried_cursor(
+    previous: [usize; 3],
+    from_origin: [f32; 3],
+    from_voxel: f32,
+    from_shape: [usize; 3],
+    to_origin: [f32; 3],
+    to_voxel: f32,
+    to_shape: [usize; 3],
+) -> [usize; 3] {
+    let mut cursor = [0; 3];
+    for axis in 0..3 {
+        let next = to_shape[axis];
+        if next == 0 {
+            continue;
+        }
+        let last = next - 1;
+        if from_shape[axis] == 0 || from_voxel <= 0.0 || to_voxel <= 0.0 {
+            cursor[axis] = previous[axis].min(last);
+            continue;
+        }
+        let mm = from_origin[axis] + (previous[axis] as f32 + 0.5) * from_voxel;
+        let index = ((mm - to_origin[axis]) / to_voxel - 0.5).round();
+        cursor[axis] = index.clamp(0.0, last as f32) as usize;
+    }
+    cursor
+}
+
+fn unit(value: [f32; 3]) -> [f32; 3] {
+    let length = (value[0] * value[0] + value[1] * value[1] + value[2] * value[2])
+        .sqrt()
+        .max(1.0e-8);
+    [value[0] / length, value[1] / length, value[2] / length]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blender_keys_match_the_turntable() {
+        let azimuth = 30.0_f32.to_radians();
+        let elevation = 25.0_f32.to_radians();
+        let fov = scan_kit_core::FOV_Y;
+        let (front, flat, same, _) =
+            blender_step(azimuth, elevation, fov, fov, "1", false).unwrap();
+        assert!((front - 180.0_f32.to_radians()).abs() < 1.0e-5);
+        assert!(flat.abs() < 1.0e-5);
+        assert!((same - fov).abs() < 1.0e-5);
+        let (back, _, _, _) = blender_step(azimuth, elevation, fov, fov, "Digit1", true).unwrap();
+        assert!(back.abs() < 1.0e-5);
+        let (_, top, _, _) = blender_step(azimuth, elevation, fov, fov, "Home", false).unwrap();
+        assert!((top - std::f32::consts::FRAC_PI_2).abs() < 1.0e-5);
+        let (turned, _, _, _) = blender_step(0.0, 0.0, fov, fov, "ArrowLeft", false).unwrap();
+        assert!((turned - ORBIT_STEP).abs() < 1.0e-5);
+        let (_, _, ortho, saved) = blender_step(azimuth, elevation, fov, fov, "5", false).unwrap();
+        assert!(ortho.abs() < 1.0e-6);
+        assert!((saved - fov).abs() < 1.0e-5);
+        let (_, _, restored, _) =
+            blender_step(azimuth, elevation, 0.0, saved, "Numpad5", false).unwrap();
+        assert!((restored - fov).abs() < 1.0e-5);
+        assert!(blender_step(azimuth, elevation, fov, fov, "KeyA", false).is_none());
+    }
+
+    #[test]
+    fn a_coarser_slice_lands_on_the_same_depth() {
+        let cursor = carried_cursor(
+            [4, 2, 10],
+            [0.0, 0.0, -40.0],
+            2.0,
+            [8, 4, 20],
+            [0.0, 0.0, -40.0],
+            1.0,
+            [16, 8, 40],
+        );
+        assert_eq!(cursor, [9, 5, 21]);
+        assert_eq!(
+            carried_cursor(
+                [3, 1, 4],
+                [0.0, 0.0, -8.0],
+                1.0,
+                [8, 4, 16],
+                [0.0, 0.0, -8.0],
+                1.0,
+                [8, 4, 16],
+            ),
+            [3, 1, 4]
+        );
+        assert_eq!(
+            carried_cursor(
+                [100, 0, 0],
+                [0.0; 3],
+                1.0,
+                [120, 4, 4],
+                [0.0; 3],
+                1.0,
+                [8, 4, 4],
+            )[0],
+            7
+        );
+    }
 
     fn line_scene() -> PlotScene {
         PlotScene {
@@ -5181,6 +7432,468 @@ mod tests {
         );
         assert_eq!(plot.atlas_stamp(), stamp);
         assert!(plot.cursor[2] > before);
+    }
+
+    #[test]
+    fn the_crosshair_sits_on_the_slice_picture() {
+        let mut scene = line_scene();
+        scene.panels.truncate(1);
+        scene.panels[0].title = "Axial".into();
+        scene.panels[0].equal = false;
+        scene.panels[0].xmin = 0.0;
+        scene.panels[0].xmax = 2.0;
+        scene.panels[0].ymin = 0.0;
+        scene.panels[0].ymax = 2.0;
+        scene.panels[0].series = vec![
+            Series::Heatmap {
+                values: vec![0.0; 4],
+                cols: 2,
+                rows: 2,
+                ramp: 0,
+                color: [1.0; 4],
+                lo: 0.0,
+                hi: 1.0,
+            },
+            Series::Guide {
+                xs: vec![0.0, 2.0, 2.0, 0.0, 0.0],
+                ys: vec![0.0, 0.0, 2.0, 2.0, 0.0],
+                color: [0.95, 0.72, 0.2, 0.9],
+                thickness: 1.0,
+            },
+        ];
+        scene.volume = scan_kit_core::VolumeMark {
+            values: vec![1.0, 0.0, 0.0, 0.0],
+            shape: [2, 2, 1],
+            origin: [0.0, 0.0, 0.0],
+            voxel: 1.0,
+            ..scan_kit_core::VolumeMark::default()
+        };
+        let mut plot = Plot::new(&scene, [0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0, 1.0]);
+        let bounds = [0.0, 2.0, 0.0, 2.0];
+        let volume = &plot.dose.as_ref().unwrap().volume;
+        let x = volume.mm_of(0, plot.cursor[0]);
+        let y = volume.mm_of(1, plot.cursor[1]);
+        let expected = crate::dose::display_mm(x, y, bounds, 0);
+        let cross = plot
+            .live
+            .iter()
+            .find(|cloud| cloud.panel == 0 && cloud.lines.len() == 2)
+            .unwrap();
+        let hit = line_crossing(&cross.lines);
+        assert!((hit[0] - expected[0]).abs() < 1e-3);
+        assert!((hit[1] - expected[1]).abs() < 1e-3);
+        assert!((hit[0] - x).abs() < 1e-3);
+        let guide = plot
+            .live
+            .iter()
+            .find(|cloud| cloud.panel == 0 && cloud.lines.len() > 2)
+            .unwrap();
+        let right = guide
+            .lines
+            .iter()
+            .map(|line| line.a[0].max(line.b[0]))
+            .fold(0.0, f32::max);
+        assert!((right - 2.0 * crate::dose::FILM_X).abs() < 1e-3);
+
+        let layout = plot.layout(200, 200);
+        let cell = &layout[0];
+        let matrix = plot.cameras[0].clip_from_data(cell.plot, 200.0, 200.0);
+        let data_x = 1.5;
+        let data_y = 1.0;
+        let ndc_x = matrix[0] * data_x + matrix[12];
+        let ndc_y = matrix[5] * data_y + matrix[13];
+        plot.apply(
+            200,
+            200,
+            &PlotInput {
+                x: (ndc_x + 1.0) * 0.5 * 200.0,
+                y: (1.0 - ndc_y) * 0.5 * 200.0,
+                drag: true,
+                ..PlotInput::default()
+            },
+        );
+        assert_eq!(plot.cursor[0], 1);
+
+        let x = plot.dose.as_ref().unwrap().volume.mm_of(0, plot.cursor[0]);
+        let y = plot.dose.as_ref().unwrap().volume.mm_of(1, plot.cursor[1]);
+        plot.dose_action(0, "rotate");
+        let expected = crate::dose::display_mm(x, y, bounds, 1);
+        let cross = plot
+            .live
+            .iter()
+            .find(|cloud| cloud.panel == 0 && cloud.lines.len() == 2)
+            .unwrap();
+        let hit = line_crossing(&cross.lines);
+        assert!((hit[0] - expected[0]).abs() < 1e-3);
+        assert!((hit[1] - expected[1]).abs() < 1e-3);
+    }
+
+    #[test]
+    fn an_integrated_profile_stays_in_the_frame() {
+        let mut scene = line_scene();
+        scene.panels.truncate(1);
+        scene.panels[0].title = "Depth dose".into();
+        scene.panels[0].y_label = "Gy".into();
+        scene.panels[0].x_label = String::new();
+        scene.panels[0].series = vec![Series::Polyline {
+            xs: vec![0.0, 1.0],
+            ys: vec![1.0, 4.0],
+            color: [1.0; 4],
+            thickness: 1.5,
+        }];
+        scene.panels[0].xmin = 0.0;
+        scene.panels[0].xmax = 1.0;
+        scene.panels[0].ymin = 1.0;
+        scene.panels[0].ymax = 4.0;
+        scene.volume = scan_kit_core::VolumeMark {
+            values: vec![4.0, 0.0, 1.0, 0.0],
+            shape: [2, 1, 2],
+            origin: [0.0, 0.0, 0.0],
+            voxel: 2.0,
+            ..scan_kit_core::VolumeMark::default()
+        };
+        let mut plot = Plot::new(&scene, [0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0, 1.0]);
+        plot.cameras[0].ymin = 2.0;
+        plot.cameras[0].ymax = 3.5;
+        let before = plot.cameras[0].ymax;
+        plot.dose_action(0, "integral");
+        let top = plot
+            .live
+            .iter()
+            .find(|cloud| cloud.panel == 0)
+            .unwrap()
+            .lines
+            .iter()
+            .map(|line| line.a[1].max(line.b[1]))
+            .fold(f32::MIN, f32::max);
+        assert!(top > before);
+        assert!(plot.cameras[0].ymax + 1e-3 >= top);
+        assert!(plot.cameras[0].ymin - 1e-3 <= 4.0);
+        assert_eq!(plot.panels[0].y_label, "Gy·mm²");
+        let mut again = Plot::new(&scene, [0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0, 1.0]);
+        again.adopt_view(&plot);
+        again.dose_action(0, "integral");
+        assert!((again.cameras[0].ymax - before).abs() < 1e-3);
+        assert!((again.cameras[0].ymin - 2.0).abs() < 1e-3);
+        assert_eq!(again.panels[0].y_label, "Gy");
+        let mut wide = scene.clone();
+        wide.panels[0].ymin = 0.0;
+        wide.panels[0].ymax = 80.0;
+        let mut reloaded = Plot::new(&wide, [0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0, 1.0]);
+        reloaded.adopt_view(&plot);
+        assert_eq!(reloaded.panels[0].y_label, "Gy·mm²");
+        reloaded.dose_action(0, "integral");
+        assert!((reloaded.cameras[0].ymax - 80.0).abs() < 1e-3);
+        assert!((reloaded.cameras[0].ymin).abs() < 1e-3);
+        assert_eq!(reloaded.panels[0].y_label, "Gy");
+        plot.dose_action(0, "integral");
+        assert!((plot.cameras[0].ymax - before).abs() < 1e-3);
+        assert!((plot.cameras[0].ymin - 2.0).abs() < 1e-3);
+        assert_eq!(plot.panels[0].y_label, "Gy");
+    }
+
+    fn line_crossing(lines: &[LineRec]) -> [f32; 2] {
+        let vertical = lines
+            .iter()
+            .find(|line| (line.a[0] - line.b[0]).abs() < 1e-3)
+            .unwrap();
+        let horizontal = lines
+            .iter()
+            .find(|line| (line.a[1] - line.b[1]).abs() < 1e-3)
+            .unwrap();
+        [vertical.a[0], horizontal.a[1]]
+    }
+
+    #[test]
+    fn the_3d_cell_paints_the_dose_box() {
+        let n = 16usize;
+        let mut values = vec![0.0f32; n * n * n];
+        for z in 5..11 {
+            for y in 5..11 {
+                for x in 5..11 {
+                    values[x + n * (y + n * z)] = 4.0;
+                }
+            }
+        }
+        let mut scene = line_scene();
+        scene.panels[0].title = "3D".into();
+        scene.panels[0].equal = true;
+        scene.panels[0].xmin = 0.0;
+        scene.panels[0].xmax = n as f32;
+        scene.panels[0].ymin = 0.0;
+        scene.panels[0].ymax = n as f32;
+        scene.panels[0].series = vec![Series::Heatmap {
+            values: vec![0.0; n * n],
+            cols: n as u32,
+            rows: n as u32,
+            ramp: 1,
+            color: [1.0; 4],
+            lo: 0.0,
+            hi: 4.0,
+        }];
+        scene.volume = scan_kit_core::VolumeMark {
+            values,
+            shape: [n as u32, n as u32, n as u32],
+            origin: [0.0, 0.0, 0.0],
+            voxel: 1.0,
+            ramp: 1,
+            hi: 4.0,
+            mode: 1,
+            ..scan_kit_core::VolumeMark::default()
+        };
+        let expect = scan_kit_core::sample(1, 1.0).map(|channel| (channel * 255.0).round() as u8);
+        for filter in [0u8, 1] {
+            scene.volume.filter = filter;
+            let mut plot = Plot::new(&scene, [0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0, 1.0]);
+            let layout = plot.layout(320, 320);
+            let rect = layout[0].plot;
+            let x = (rect.x + rect.w * 0.5) as u32;
+            let y = (rect.y + rect.h * 0.5) as u32;
+            let cpu = plot.paint_cpu(320, 320, &layout);
+            let cpu_px = &cpu[((y * 320 + x) * 4) as usize..][..3];
+            assert!(
+                cpu_px
+                    .iter()
+                    .zip(expect)
+                    .all(|(got, want)| (*got as i32 - want as i32).abs() <= 2),
+                "cpu filter {filter} {cpu_px:?} expect {expect:?}"
+            );
+            let frame =
+                render_plot(&scene, 320, 320, [0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0, 1.0]).unwrap();
+            if frame.is_empty() {
+                return;
+            }
+            let gpu_px = &frame[((y * 320 + x) * 4) as usize..][..3];
+            assert!(
+                gpu_px
+                    .iter()
+                    .zip(expect)
+                    .all(|(got, want)| (*got as i32 - want as i32).abs() <= 2),
+                "gpu filter {filter} {gpu_px:?} expect {expect:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn dose_views_fill_the_cell_and_the_color_axis_is_numbered() {
+        let (majors, _, labels, offset) = color_axis_ticks(0.0, 4.0, 6);
+        assert!((majors[0]).abs() < 1e-4);
+        assert!((majors[majors.len() - 1] - 4.0).abs() < 1e-4);
+        assert_eq!(labels[0], "0");
+        assert_eq!(labels[labels.len() - 1], "4");
+        assert!(offset.is_empty(), "{offset}");
+        let (crossed, _, _, _) = color_axis_ticks(-1.0, 1.0, 6);
+        assert!(crossed.iter().any(|value| value.abs() < 1e-4));
+        let (_, _, _, offset) = color_axis_ticks(0.0, 1.0e-6, 4);
+        assert!(offset.contains('⁻'), "{offset}");
+        let (_, _, labels, _) = color_axis_ticks(-2.0, 0.0, 4);
+        assert!(labels.iter().any(|label| label.contains('−')), "{labels:?}");
+
+        let mut scene = line_scene();
+        scene.panels[0].title = "Axial".into();
+        scene.panels[0].equal = true;
+        scene.panels[0].x_label = "X (mm)".into();
+        scene.panels[0].y_label = "Y (mm)".into();
+        let axial = Plot::new(&scene, [0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0, 1.0]).layout(400, 160);
+        let cell = &axial[0];
+        assert!(
+            cell.plot.w > cell.plot.h * 1.3,
+            "a wide slice fills the cell, plot {}x{}",
+            cell.plot.w,
+            cell.plot.h
+        );
+        assert!(cell.plot.x > cell.cell.x + 8.0, "y ticks sit on the border");
+
+        scene.panels[0].title = "3D".into();
+        scene.panels[0].x_label.clear();
+        scene.panels[0].y_label.clear();
+        let volume = Plot::new(&scene, [0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0, 1.0]).layout(400, 160);
+        let cell = &volume[0];
+        assert!(cell.plot.x < cell.cell.x + 12.0, "3D has no y axis gutter");
+        assert!(cell.plot.w > cell.cell.w - color_column_width() - 16.0);
+
+        let mut band = Plot::new(&scene, [0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0, 1.0]);
+        let open = band.layout(400, 160);
+        band.set_chrome(40.0);
+        let held = band.layout(400, 160);
+        assert!(
+            held[0].plot.y >= open[0].cell.y + 40.0,
+            "the picture starts under the toolbar"
+        );
+
+        let n = 4usize;
+        scene.panels[0].series = vec![Series::Heatmap {
+            values: vec![0.0; n * n],
+            cols: n as u32,
+            rows: n as u32,
+            ramp: 1,
+            color: [1.0; 4],
+            lo: 0.0,
+            hi: 4.0,
+        }];
+        scene.volume = scan_kit_core::VolumeMark {
+            values: vec![1.0; n * n * n],
+            shape: [n as u32, n as u32, n as u32],
+            origin: [0.0, 0.0, 0.0],
+            voxel: 1.0,
+            ramp: 1,
+            hi: 4.0,
+            mode: 1,
+            unit: "Gy".into(),
+            ..scan_kit_core::VolumeMark::default()
+        };
+        let mut plot = Plot::new(&scene, [0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0, 1.0]);
+        let layout = plot.layout(160, 160);
+        let glyphs = color_axis_glyphs(&plot, &layout[0], 0.0);
+        assert!(glyphs.len() > 4, "tick labels");
+        assert!(
+            glyphs.iter().any(|glyph| glyph.anchor[2] > 0.5),
+            "unit title"
+        );
+        assert!(glyphs
+            .iter()
+            .any(|glyph| glyph.anchor[0] > layout[0].plot.x + layout[0].plot.w));
+        let cpu = plot.paint_cpu(160, 160, &layout);
+        let bar = color_bar_rect(&layout[0]);
+        let x = (bar.x + 2.0) as u32;
+        let y = (bar.y + 2.0) as u32;
+        let t = (1.0 - ((y as f32 + 0.5 - bar.y) / bar.h)).clamp(0.0, 1.0);
+        let expect = scan_kit_core::sample(1, t).map(|channel| (channel * 255.0).round() as u8);
+        let got = &cpu[((y * 160 + x) * 4) as usize..][..3];
+        assert!(
+            got.iter()
+                .zip(expect)
+                .all(|(got, want)| (*got as i32 - want as i32).abs() <= 2),
+            "cpu bar {got:?} expect {expect:?}"
+        );
+        let frame =
+            render_plot(&scene, 160, 160, [0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0, 1.0]).unwrap();
+        if frame.is_empty() {
+            return;
+        }
+        let gpu = &frame[((y * 160 + x) * 4) as usize..][..3];
+        assert!(
+            gpu.iter()
+                .zip(expect)
+                .all(|(got, want)| (*got as i32 - want as i32).abs() <= 2),
+            "gpu bar {gpu:?} expect {expect:?}"
+        );
+    }
+
+    #[test]
+    fn the_integrate_peak_reaches_the_top_of_the_ramp() {
+        let n = 16usize;
+        let mut values = vec![0.0f32; n * n * n];
+        for z in 0..n {
+            let depth = z as f32 / n as f32;
+            let dose = 0.35 + 0.65 * (-((depth - 0.8) / 0.08).powi(2)).exp();
+            for y in 0..n {
+                for x in 0..n {
+                    let dx = x as f32 / n as f32 - 0.5;
+                    let dy = y as f32 / n as f32 - 0.5;
+                    values[x + n * (y + n * z)] = dose * (-(dx * dx + dy * dy) / 0.02).exp();
+                }
+            }
+        }
+        let peak = values.iter().copied().fold(0.0f32, f32::max);
+        let mut scene = line_scene();
+        scene.panels[0].title = "3D".into();
+        scene.panels[0].equal = true;
+        scene.panels[0].xmin = 0.0;
+        scene.panels[0].xmax = n as f32;
+        scene.panels[0].ymin = 0.0;
+        scene.panels[0].ymax = n as f32;
+        scene.panels[0].series = vec![Series::Heatmap {
+            values: vec![0.0; n * n],
+            cols: n as u32,
+            rows: n as u32,
+            ramp: 1,
+            color: [1.0; 4],
+            lo: 0.0,
+            hi: peak,
+        }];
+        scene.volume = scan_kit_core::VolumeMark {
+            values,
+            shape: [n as u32, n as u32, n as u32],
+            voxel: 1.0,
+            ramp: 1,
+            hi: peak,
+            mode: 0,
+            filter: 1,
+            ..scan_kit_core::VolumeMark::default()
+        };
+        let top = scan_kit_core::sample(1, 1.0).map(|channel| (channel * 255.0).round() as u8);
+        let mut plot = Plot::new(&scene, [0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0, 1.0]);
+        let layout = plot.layout(96, 96);
+        let rect = layout[0].plot;
+        let cpu = plot.paint_cpu(96, 96, &layout);
+        assert!(
+            ramp_top_is_in_the_cloud(&cpu, 96, rect, top),
+            "cpu missed the top of the ramp"
+        );
+        let frame =
+            render_plot(&scene, 96, 96, [0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0, 1.0]).unwrap();
+        if frame.is_empty() {
+            return;
+        }
+        assert!(
+            ramp_top_is_in_the_cloud(&frame, 96, rect, top),
+            "gpu missed the top of the ramp"
+        );
+    }
+
+    #[test]
+    fn a_solid_cube_fills_its_projection() {
+        let n = 16usize;
+        let mut scene = line_scene();
+        scene.panels[0].title = "3D".into();
+        scene.panels[0].equal = true;
+        scene.panels[0].xmin = 0.0;
+        scene.panels[0].xmax = n as f32;
+        scene.panels[0].ymin = 0.0;
+        scene.panels[0].ymax = n as f32;
+        scene.panels[0].series = vec![Series::Heatmap {
+            values: vec![0.0; n * n],
+            cols: n as u32,
+            rows: n as u32,
+            ramp: 1,
+            color: [1.0; 4],
+            lo: 0.0,
+            hi: 1.0,
+        }];
+        scene.volume = scan_kit_core::VolumeMark {
+            values: vec![1.0; n * n * n],
+            shape: [n as u32, n as u32, n as u32],
+            voxel: 1.0,
+            ramp: 1,
+            hi: 1.0,
+            mode: 0,
+            filter: 1,
+            ..scan_kit_core::VolumeMark::default()
+        };
+        let mut plot = Plot::new(&scene, [0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0, 1.0]);
+        let layout = plot.layout(96, 96);
+        let rect = layout[0].plot;
+        let cpu = plot.paint_cpu(96, 96, &layout);
+        let cpu_fill = projection_fill(&cpu, 96, rect);
+        assert!(cpu_fill > 0.5, "cpu projection fill {cpu_fill}");
+        let frame =
+            render_plot(&scene, 96, 96, [0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0, 1.0]).unwrap();
+        if frame.is_empty() {
+            return;
+        }
+        let gpu_fill = projection_fill(&frame, 96, rect);
+        assert!(gpu_fill > 0.5, "gpu projection fill {gpu_fill}");
+    }
+
+    #[test]
+    fn half_float_keeps_the_dose_values_we_paint() {
+        assert_eq!(f32_to_f16(0.0), 0);
+        assert_eq!(f32_to_f16(1.0), 0x3c00);
+        assert_eq!(f32_to_f16(-1.0), 0xbc00);
+        assert_eq!(f32_to_f16(0.5), 0x3800);
+        assert_eq!(f32_to_f16(2.0), 0x4000);
+        assert_eq!(f32_to_f16(4.0), 0x4400);
     }
 
     #[test]
@@ -6141,5 +8854,300 @@ mod tests {
             }
         }
         false
+    }
+
+    fn projection_fill(frame: &[u8], width: u32, rect: PlotRect) -> f32 {
+        let x0 = rect.x.floor() as i32;
+        let x1 = (rect.x + rect.w * 0.90).ceil() as i32;
+        let y0 = rect.y.floor() as i32;
+        let y1 = (rect.y + rect.h).ceil() as i32;
+        let mut min_x = i32::MAX;
+        let mut max_x = i32::MIN;
+        let mut min_y = i32::MAX;
+        let mut max_y = i32::MIN;
+        let mut lit = 0i32;
+        for y in y0..y1 {
+            for x in x0..x1 {
+                if x < 0 || y < 0 {
+                    continue;
+                }
+                let index = ((y as u32 * width + x as u32) * 4) as usize;
+                let Some(px) = frame.get(index..index + 3) else {
+                    continue;
+                };
+                if px[0] as u32 + px[1] as u32 + px[2] as u32 <= 24 {
+                    continue;
+                }
+                lit += 1;
+                min_x = min_x.min(x);
+                max_x = max_x.max(x);
+                min_y = min_y.min(y);
+                max_y = max_y.max(y);
+            }
+        }
+        if lit == 0 || max_x < min_x || max_y < min_y {
+            return 0.0;
+        }
+        let area = (max_x - min_x + 1) * (max_y - min_y + 1);
+        lit as f32 / area as f32
+    }
+
+    fn ramp_top_is_in_the_cloud(frame: &[u8], width: u32, rect: PlotRect, top: [u8; 3]) -> bool {
+        let (hot, lit, best) = cloud_top(frame, width, rect, top);
+        // Turbo's red tip is steep, and a pixel center plus the GPU reconstruction
+        // sit a little under the analytic peak ray. A flat field still fails
+        // because the lit cloud would not be several times the hot core.
+        best <= 80 && lit > hot.max(1) * 4
+    }
+
+    fn cloud_top(frame: &[u8], width: u32, rect: PlotRect, top: [u8; 3]) -> (u32, u32, u32) {
+        let x0 = rect.x.floor() as i32;
+        let x1 = (rect.x + rect.w * 0.90).ceil() as i32;
+        let y0 = rect.y.floor() as i32;
+        let y1 = (rect.y + rect.h).ceil() as i32;
+        let mut hot = 0u32;
+        let mut lit = 0u32;
+        let mut best = u32::MAX;
+        for y in y0..y1 {
+            for x in x0..x1 {
+                if x < 0 || y < 0 {
+                    continue;
+                }
+                let index = ((y as u32 * width + x as u32) * 4) as usize;
+                let Some(px) = frame.get(index..index + 3) else {
+                    continue;
+                };
+                let sum = px[0] as u32 + px[1] as u32 + px[2] as u32;
+                if sum < 24 {
+                    continue;
+                }
+                lit += 1;
+                let delta = px
+                    .iter()
+                    .zip(top)
+                    .map(|(got, want)| (*got as i32 - want as i32).unsigned_abs())
+                    .max()
+                    .unwrap_or(255);
+                best = best.min(delta);
+                if delta <= 12 {
+                    hot += 1;
+                }
+            }
+        }
+        (hot, lit, best)
+    }
+
+    fn dose_values(n: usize, dense: bool) -> Vec<f32> {
+        let mut values = vec![0.0; n * n * n];
+        if dense {
+            for z in 0..n {
+                let dz = z as f32 / n as f32;
+                let bragg = (-((dz - 0.72) / 0.08).powi(2)).exp();
+                for y in 0..n {
+                    for x in 0..n {
+                        let dx = x as f32 / n as f32 - 0.5;
+                        let dy = y as f32 / n as f32 - 0.5;
+                        let lateral = (-(dx * dx + dy * dy) / 0.02).exp();
+                        values[x + n * (y + n * z)] = bragg * lateral;
+                    }
+                }
+            }
+            return values;
+        }
+        for (sx, sy, sz) in [(0.3f32, 0.4, 0.7), (0.55, 0.5, 0.6), (0.7, 0.35, 0.8)] {
+            let cx = (sx * n as f32) as i32;
+            let cy = (sy * n as f32) as i32;
+            let cz = (sz * n as f32) as i32;
+            for dz in -2..=2 {
+                for dy in -2..=2 {
+                    for dx in -2..=2 {
+                        let x = cx + dx;
+                        let y = cy + dy;
+                        let z = cz + dz;
+                        if (0..n as i32).contains(&x)
+                            && (0..n as i32).contains(&y)
+                            && (0..n as i32).contains(&z)
+                        {
+                            values[x as usize + n * (y as usize + n * z as usize)] = 1.0;
+                        }
+                    }
+                }
+            }
+        }
+        values
+    }
+
+    fn dose_scene(n: usize, values: Vec<f32>, mode: u8, filter: u8) -> PlotScene {
+        let mut scene = line_scene();
+        let panel = scene.panels.remove(0);
+        for title in [
+            "Axial",
+            "3D",
+            "Coronal",
+            "Sagittal",
+            "Depth dose",
+            "Lateral profile",
+        ] {
+            let mut next = panel.clone();
+            next.title = title.into();
+            next.equal = dose_plane(title).is_some();
+            next.xmin = 0.0;
+            next.xmax = n as f32;
+            next.ymin = 0.0;
+            next.ymax = n as f32;
+            next.series = if dose_plane(title).is_some() {
+                vec![Series::Heatmap {
+                    values: vec![0.0; n * n],
+                    cols: n as u32,
+                    rows: n as u32,
+                    ramp: 1,
+                    color: [1.0; 4],
+                    lo: 0.0,
+                    hi: 1.0,
+                }]
+            } else {
+                Vec::new()
+            };
+            scene.panels.push(next);
+        }
+        scene.columns = 2;
+        scene.row_weights = vec![1.0, 1.0, 1.0];
+        scene.row_splits = vec![1.0; 6];
+        scene.volume = scan_kit_core::VolumeMark {
+            values,
+            shape: [n as u32, n as u32, n as u32],
+            voxel: 1.0,
+            ramp: 1,
+            hi: 1.0,
+            mode,
+            filter,
+            ..scan_kit_core::VolumeMark::default()
+        };
+        scene
+    }
+
+    fn gpu_frame_ms(plot: &mut Plot, width: u32, height: u32, frames: u32) -> f32 {
+        let gpu = crate::native_gpu().expect("gpu");
+        let texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("bench"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&Default::default());
+        for _ in 0..2 {
+            let encoder = plot.record(gpu, &view, width, height).unwrap();
+            gpu.queue.submit(Some(encoder.finish()));
+        }
+        let _ = gpu.device.poll(wgpu::PollType::wait_indefinitely());
+        let start = std::time::Instant::now();
+        for _ in 0..frames {
+            let encoder = plot.record(gpu, &view, width, height).unwrap();
+            gpu.queue.submit(Some(encoder.finish()));
+        }
+        let _ = gpu.device.poll(wgpu::PollType::wait_indefinitely());
+        start.elapsed().as_secs_f32() * 1000.0 / frames as f32
+    }
+
+    #[test]
+    #[ignore = "timing; cargo test -p scan-kit-plot -- --ignored --nocapture dose_view_frame_times"]
+    fn dose_view_frame_times() {
+        for (n, dense) in [(96usize, false), (96, true), (160, true)] {
+            let values = dose_values(n, dense);
+            let kind = if dense { "dense" } else { "sparse" };
+            let volume = scan_kit_core::Volume {
+                origin: [0.0, 0.0, 0.0],
+                shape: [n, n, n],
+                voxel: 1.0,
+                values: values.clone(),
+            };
+            let start = std::time::Instant::now();
+            let scan = scan_kit_core::scan_volume(&volume);
+            eprintln!(
+                "prep {n} {kind} scan {:.1} ms",
+                start.elapsed().as_secs_f32() * 1000.0
+            );
+            let _ = scan.line_scale;
+            let start = std::time::Instant::now();
+            let grid = crate::dose::grid_from(
+                values.clone(),
+                Vec::new(),
+                Vec::new(),
+                [n as u32, n as u32, n as u32],
+                [0.0, 0.0, 0.0],
+                1.0,
+                1,
+                0.0,
+                1.0,
+                1.0,
+                1.0,
+                0,
+                1,
+            )
+            .unwrap();
+            eprintln!(
+                "prep {n} {kind} grid {:.1} ms",
+                start.elapsed().as_secs_f32() * 1000.0
+            );
+            let start = std::time::Instant::now();
+            let _ = crate::dose::atlas_bytes(&grid);
+            eprintln!(
+                "prep {n} {kind} atlas {:.1} ms",
+                start.elapsed().as_secs_f32() * 1000.0
+            );
+            let start = std::time::Instant::now();
+            let _ = grid.volume.integrated_slice(0);
+            eprintln!(
+                "prep {n} {kind} uncached axial {:.1} ms",
+                start.elapsed().as_secs_f32() * 1000.0
+            );
+            let start = std::time::Instant::now();
+            for _ in 0..1000 {
+                let _ = crate::dose::integral_peak(&grid, 0);
+            }
+            eprintln!(
+                "prep {n} {kind} cached integral x1000 {:.3} ms",
+                start.elapsed().as_secs_f32() * 1000.0
+            );
+        }
+        if crate::native_gpu().is_err() {
+            eprintln!("no gpu");
+            return;
+        }
+        let width = 1280u32;
+        let height = 720u32;
+        for (n, dense, mode, filter, label) in [
+            (96usize, false, 0u8, 1u8, "sparse integrate linear"),
+            (96, true, 0, 1, "dense integrate linear"),
+            (96, true, 1, 1, "dense maximum linear"),
+            (96, true, 0, 0, "dense integrate nearest"),
+            (96, true, 2, 1, "dense transparent linear"),
+            (160, true, 0, 1, "160 dense integrate linear"),
+            (160, true, 1, 0, "160 dense maximum nearest"),
+        ] {
+            let scene = dose_scene(n, dose_values(n, dense), mode, filter);
+            let mut plot = Plot::new(&scene, [0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0, 1.0]);
+            let ms = gpu_frame_ms(&mut plot, width, height, 8);
+            eprintln!("gpu {width}x{height} {label}: {ms:.2} ms");
+        }
+        let mut alone = dose_scene(160, dose_values(160, true), 0, 1);
+        alone.panels.swap(0, 1);
+        alone.panels.truncate(1);
+        alone.columns = 1;
+        alone.row_weights.clear();
+        alone.row_splits.clear();
+        let mut plot = Plot::new(&alone, [0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0, 1.0]);
+        for (side_w, side_h) in [(640u32, 480u32), (1280, 960), (1920, 1080)] {
+            let ms = gpu_frame_ms(&mut plot, side_w, side_h, 6);
+            eprintln!("gpu 3d-only {side_w}x{side_h}: {ms:.2} ms");
+        }
     }
 }

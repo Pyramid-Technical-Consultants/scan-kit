@@ -1,6 +1,6 @@
 //! The 2×3 dose workspace: four image cells and two plot cells.
 
-use scan_kit_core::{dvh, field_bounds, Control, Panel, Series, Volume, VolumeMark};
+use scan_kit_core::{dvh, Control, Panel, Series, Volume, VolumeMark};
 
 const MARK: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
 const GUIDE: [f32; 4] = [0.95, 0.72, 0.2, 0.9];
@@ -155,6 +155,10 @@ pub(crate) fn assemble(space: &Workspace) -> (Vec<Panel>, VolumeMark) {
         opacity: space.opacity,
         mode: space.mode,
         filter: space.filter,
+        gantry: 0.0,
+        unit: String::new(),
+        show_phantom: false,
+        field: [0.0; 6],
     };
     (panels, mark)
 }
@@ -231,17 +235,23 @@ fn image_panel(space: &Workspace, cell: CellView) -> Panel {
             });
         }
     }
+    let (x_label, y_label) = match cell {
+        CellView::Axial => ("X (mm)", "Y (mm)"),
+        CellView::Coronal => ("X (mm)", "Z (mm)"),
+        CellView::Sagittal => ("Y (mm)", "Z (mm)"),
+        CellView::Volume => ("", ""),
+    };
     Panel {
         title: title.into(),
-        y_label: String::new(),
-        x_label: String::new(),
+        y_label: y_label.into(),
+        x_label: x_label.into(),
         xmin,
         xmax,
         ymin,
         ymax,
         series,
         x_labels: Vec::new(),
-        equal: true,
+        equal: false,
     }
 }
 
@@ -251,19 +261,22 @@ fn plot_panel(space: &Workspace, kind: PlotKind) -> Panel {
     let (title, series, y_label) = match kind {
         PlotKind::Lateral => (
             "Lateral profile".into(),
-            vec![line(volume.lateral_profile(iy, iz))],
+            vec![line(volume.lateral_profile(ix, iy, iz))],
             space.y_label.clone(),
         ),
         PlotKind::Longitudinal => (
             "Longitudinal profile".into(),
-            vec![line(volume.longitudinal_profile(ix, iz))],
+            vec![line(volume.longitudinal_profile(ix, iy, iz))],
             space.y_label.clone(),
         ),
         PlotKind::Both => (
             "Lateral + longitudinal".into(),
             vec![
-                line(volume.lateral_profile(iy, iz)),
-                line_colored(volume.longitudinal_profile(ix, iz), [0.9, 0.55, 0.2, 1.0]),
+                line(volume.lateral_profile(ix, iy, iz)),
+                line_colored(
+                    volume.longitudinal_profile(ix, iy, iz),
+                    [0.9, 0.55, 0.2, 1.0],
+                ),
             ],
             space.y_label.clone(),
         ),
@@ -279,10 +292,17 @@ fn plot_panel(space: &Workspace, kind: PlotKind) -> Panel {
         ),
     };
     let (xmin, xmax, ymin, ymax) = span(&series);
+    let x_label = match kind {
+        PlotKind::Depth => "Depth from the grid edge (mm)".into(),
+        PlotKind::Lateral => "Across the beam from the crosshair (mm)".into(),
+        PlotKind::Longitudinal => "Along the beam from the crosshair (mm)".into(),
+        PlotKind::Both => "From the crosshair (mm)".into(),
+        PlotKind::Dvh | PlotKind::Gamma => String::new(),
+    };
     Panel {
         title,
         y_label,
-        x_label: String::new(),
+        x_label,
         xmin,
         xmax,
         ymin,
@@ -291,6 +311,18 @@ fn plot_panel(space: &Workspace, kind: PlotKind) -> Panel {
         x_labels: Vec::new(),
         equal: false,
     }
+}
+
+/// TG-218: at least 95% passes, 90% is the action level.
+fn gamma_heading(rate: f32) -> String {
+    let verdict = if rate >= 95.0 {
+        "pass"
+    } else if rate >= 90.0 {
+        "action"
+    } else {
+        "fail"
+    };
+    format!("Gamma histogram  {rate:.0}% {verdict}")
 }
 
 fn gamma_panel(space: &Workspace) -> (String, Vec<Series>) {
@@ -308,7 +340,7 @@ fn gamma_panel(space: &Workspace) -> (String, Vec<Series>) {
     let edges: Vec<f32> = (0..=20).map(|i| i as f32 * 0.1).collect();
     let peak = counts.iter().copied().fold(1.0f32, f32::max);
     (
-        format!("Gamma histogram  {rate:.0}%"),
+        gamma_heading(*rate),
         vec![
             Series::Bars {
                 edges,
@@ -332,50 +364,93 @@ pub(crate) fn dvh_line(volume: &Volume) -> Series {
     line((xs, curve))
 }
 
-pub(crate) fn field_box(volume: &Volume, iz: usize, fraction: f32) -> Option<[f32; 4]> {
-    let image = volume.axial(iz.min(volume.shape[2].saturating_sub(1)));
-    let peak = image.iter().copied().fold(0.0f32, f32::max);
-    field_bounds(
-        &image,
-        volume.shape[0],
-        volume.shape[1],
-        volume.origin[0],
-        volume.origin[1],
-        volume.voxel,
-        fraction * peak,
-    )
-}
-
-pub(crate) fn field_depth(volume: &Volume, fraction: f32) -> f32 {
-    let peak = volume.values.iter().copied().fold(0.0f32, f32::max);
-    let mut z0 = volume.shape[2];
-    let mut z1 = 0usize;
+/// Axis-aligned box of the field, `[x0, x1, y0, y1, z0, z1]` in millimetres.
+///
+/// The reference is the volume peak. With `per_slice`, a depth counts only when
+/// its own maximum reaches that fraction of the peak, and the lateral edge in
+/// that slice is the same fraction of the slice maximum.
+pub(crate) fn field_extent(volume: &Volume, fraction: f32, per_slice: bool) -> Option<[f32; 6]> {
     let [nx, ny, nz] = volume.shape;
-    for z in 0..nz {
-        for y in 0..ny {
-            for x in 0..nx {
-                if volume.get(x, y, z) >= fraction * peak {
-                    z0 = z0.min(z);
-                    z1 = z1.max(z + 1);
+    if nx == 0 || ny == 0 || nz == 0 {
+        return None;
+    }
+    let global = volume.values.iter().copied().fold(0.0f32, f32::max);
+    if !global.is_finite() || global <= 0.0 {
+        return None;
+    }
+    let mut x0 = nx;
+    let mut x1 = 0usize;
+    let mut y0 = ny;
+    let mut y1 = 0usize;
+    let mut z0 = nz;
+    let mut z1 = 0usize;
+    let mut cover = |x: usize, y: usize, z: usize| {
+        x0 = x0.min(x);
+        x1 = x1.max(x + 1);
+        y0 = y0.min(y);
+        y1 = y1.max(y + 1);
+        z0 = z0.min(z);
+        z1 = z1.max(z + 1);
+    };
+    if per_slice {
+        let gate = fraction * global;
+        for z in 0..nz {
+            let mut slice_peak = 0.0f32;
+            for y in 0..ny {
+                for x in 0..nx {
+                    slice_peak = slice_peak.max(volume.get(x, y, z));
+                }
+            }
+            if slice_peak < gate {
+                continue;
+            }
+            let level = fraction * slice_peak;
+            for y in 0..ny {
+                for x in 0..nx {
+                    if volume.get(x, y, z) >= level {
+                        cover(x, y, z);
+                    }
+                }
+            }
+        }
+    } else {
+        let level = fraction * global;
+        for z in 0..nz {
+            for y in 0..ny {
+                for x in 0..nx {
+                    if volume.get(x, y, z) >= level {
+                        cover(x, y, z);
+                    }
                 }
             }
         }
     }
-    if z1 <= z0 {
-        0.0
-    } else {
-        (z1 - z0) as f32 * volume.voxel
+    if x1 <= x0 || y1 <= y0 || z1 <= z0 {
+        return None;
     }
+    let voxel = volume.voxel;
+    let origin = volume.origin;
+    Some([
+        origin[0] + x0 as f32 * voxel,
+        origin[0] + x1 as f32 * voxel,
+        origin[1] + y0 as f32 * voxel,
+        origin[1] + y1 as f32 * voxel,
+        origin[2] + z0 as f32 * voxel,
+        origin[2] + z1 as f32 * voxel,
+    ])
 }
 
 pub(crate) fn cell_control(index: usize, cell: CellView) -> Control {
-    Control::plain(
+    let mut control = Control::plain(
         format!("cell{index}"),
         "View",
         CELL_CHOICES.iter().map(|(_, label)| *label),
         cell_label(cell),
-    )
-    .grouped("Cell")
+    );
+    for (choice, (id, _)) in control.options.iter_mut().zip(CELL_CHOICES) {
+        choice.icon = (*id).to_string();
+    }
+    control.grouped("Cell")
 }
 
 pub(crate) fn plot_control(index: usize, kind: PlotKind) -> Control {
@@ -508,6 +583,13 @@ mod tests {
     }
 
     #[test]
+    fn gamma_heading_uses_the_tolerance_and_action_levels() {
+        assert!(gamma_heading(95.0).ends_with("pass"));
+        assert!(gamma_heading(90.0).ends_with("action"));
+        assert!(gamma_heading(89.9).ends_with("fail"));
+    }
+
+    #[test]
     fn a_loaded_study_starts_on_dvh_and_gamma() {
         assert_eq!(
             plots_from([None, None], true),
@@ -575,6 +657,43 @@ mod tests {
             );
             assert_eq!(mark.values.len(), 8);
             assert!(panels.iter().any(|panel| panel.title.starts_with("3D")));
+            assert_eq!(panels[0].x_label, "X (mm)");
+            assert_eq!(panels[0].y_label, "Y (mm)");
+            assert!(panels[1].x_label.is_empty());
+            assert!(!panels[0].equal);
+            assert!(!panels[1].equal);
+            let view = cell_control(0, CellView::Axial);
+            assert_eq!(
+                view.options
+                    .iter()
+                    .map(|choice| choice.icon.as_str())
+                    .collect::<Vec<_>>(),
+                ["axial", "coronal", "sagittal", "volume"]
+            );
         }
+    }
+
+    #[test]
+    fn a_slice_edge_includes_the_wider_depth_and_a_peak_edge_does_not() {
+        // z = 0 is wider but below half the peak. z = 1 is the peak, one voxel wide.
+        let mut values = vec![0.0; 5];
+        values[1] = 1.5;
+        values[2] = 2.0;
+        values[3] = 1.5;
+        values.push(0.0);
+        values.push(0.0);
+        values.push(4.0);
+        values.push(0.0);
+        values.push(0.0);
+        let volume = Volume {
+            origin: [0.0, 0.0, 0.0],
+            shape: [5, 1, 2],
+            voxel: 1.0,
+            values,
+        };
+        let slice = field_extent(&volume, 0.5, true).unwrap();
+        let peak = field_extent(&volume, 0.5, false).unwrap();
+        assert_eq!(slice, [1.0, 4.0, 0.0, 1.0, 0.0, 2.0]);
+        assert_eq!(peak, [2.0, 3.0, 0.0, 1.0, 0.0, 2.0]);
     }
 }

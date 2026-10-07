@@ -199,7 +199,7 @@ pub struct Control {
     /// Sidebar fieldset. Empty lands in Options.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub group: String,
-    /// `check` is a checkbox. Empty is a select.
+    /// `check` is a checkbox. `radio` is a radio group. Empty is a select.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub kind: String,
 }
@@ -231,6 +231,11 @@ impl Control {
 
     pub fn checked(mut self) -> Self {
         self.kind = "check".to_string();
+        self
+    }
+
+    pub fn radio(mut self) -> Self {
+        self.kind = "radio".to_string();
         self
     }
 
@@ -280,6 +285,18 @@ pub struct VolumeMark {
     /// 0 nearest, 1 linear, 2 cubic.
     #[serde(default)]
     pub filter: u8,
+    /// Degrees about +X. 90 lays beam depth along Y. 0 leaves the lattice as deposited.
+    #[serde(default)]
+    pub gantry: f32,
+    /// Color-bar unit. Empty draws the bar without a title.
+    #[serde(default)]
+    pub unit: String,
+    /// Cyan phantom box in the 3D march.
+    #[serde(default)]
+    pub show_phantom: bool,
+    /// Field box in millimetres: x0, x1, y0, y1, z0, z1. A zero span draws nothing.
+    #[serde(default)]
+    pub field: [f32; 6],
 }
 
 /// What a view workflow returns before pixels are rendered.

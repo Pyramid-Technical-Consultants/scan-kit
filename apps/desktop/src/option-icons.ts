@@ -46,6 +46,9 @@ import {
   Spline,
   Split,
   Square,
+  RectangleHorizontal,
+  RectangleVertical,
+  Box,
   Sun,
   Sunset,
   SwatchBook,
@@ -252,6 +255,14 @@ const ICONS: Record<string, LucideIcon> = {
   spot_no: Hash,
   layer_id: Layers,
   r_ic1_x_confidence: BadgeCheck,
+  axial: Square,
+  Axial: Square,
+  coronal: RectangleHorizontal,
+  Coronal: RectangleHorizontal,
+  sagittal: RectangleVertical,
+  Sagittal: RectangleVertical,
+  volume: Box,
+  "3D": Box,
 };
 
 export function optionIcon(name: string): LucideIcon | undefined {

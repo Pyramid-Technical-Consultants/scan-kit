@@ -39,9 +39,38 @@ vi.mock("@tauri-apps/api/core", () => ({
     }
     const starts = vi.mocked(invoke).mock.calls.filter(([name]) => name === "scan_kit_start");
     const started = starts[starts.length - 1]?.[1] as { view?: string } | undefined;
-    const distribution = (started?.view ?? args?.view) === "distribution";
-    const header = distribution
-      ? {
+    const view = started?.view ?? args?.view;
+    const header =
+      view === "volumetric"
+        ? {
+            title: "Volumetric",
+            controls: [
+              {
+                id: "model",
+                label: "Model",
+                group: "Calculation",
+                kind: "radio",
+                options: [
+                  { id: "analytic", label: "Analytic", detail: "", icon: "" },
+                  { id: "mc", label: "Monte Carlo", detail: "", icon: "" },
+                ],
+                value: "Analytic",
+              },
+              {
+                id: "histories",
+                label: "Histories",
+                group: "Calculation",
+                kind: "radio",
+                options: ["1e6", "3e6", "1e7", "5e7"],
+                value: "1e7",
+              },
+            ],
+            table: null,
+            samples: [],
+            panels: [{}],
+          }
+        : view === "distribution"
+          ? {
           title: "Distribution",
           controls: [
             {
@@ -144,6 +173,7 @@ vi.mock("@/wasm/scan_kit_plot.js", () => ({
       hover: () => null,
       frames: () => "[]",
       dose_action: () => undefined,
+      dose_key: () => false,
       zoom: () => undefined,
       pan: () => undefined,
       reset: () => undefined,
@@ -685,4 +715,44 @@ it("keeps the timeslice picture when the next payload is empty", async () => {
       invokeMock.mockImplementation(original);
     }
   }
+});
+
+it("switches analytic and Monte Carlo with radio groups", async () => {
+  const host = document.createElement("div");
+  document.body.append(host);
+  await act(() => {
+    root = createRoot(host);
+    root.render(
+      <AnalysisView
+        viewId="volumetric"
+        folder="C:/data"
+        sessions={[{ id: "a", note: "" }]}
+        onBack={() => undefined}
+        onOpenView={() => undefined}
+      />,
+    );
+  });
+  await act(async () => {
+    await new Promise((resolve) => setTimeout(resolve, 200));
+  });
+  const groups = [...host.querySelectorAll("[data-slot='radio-group']")];
+  expect(groups).toHaveLength(2);
+  expect(groups[0]?.textContent).toContain("Analytic");
+  expect(groups[0]?.textContent).toContain("Monte Carlo");
+  expect(groups[1]?.textContent).toContain("1e6");
+  expect(groups[1]?.textContent).toContain("5e7");
+  expect(host.querySelector("[data-slot='select-trigger']")).toBeNull();
+  const monteCarlo = [...host.querySelectorAll("[data-slot='radio-group-item']")].find(
+    (node) => node.getAttribute("value") === "Monte Carlo" || node.textContent?.includes("Monte Carlo"),
+  );
+  const label = [...host.querySelectorAll("label")].find((node) => node.textContent?.trim() === "Monte Carlo");
+  await act(async () => {
+    (label ?? monteCarlo)?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+  });
+  await act(async () => {
+    await new Promise((resolve) => setTimeout(resolve, 200));
+  });
+  const starts = vi.mocked(invoke).mock.calls.filter(([name]) => name === "scan_kit_start");
+  const last = starts[starts.length - 1]?.[1] as { options?: { model?: string } } | undefined;
+  expect(last?.options?.model).toBe("Monte Carlo");
 });
