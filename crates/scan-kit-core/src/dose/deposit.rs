@@ -1,6 +1,6 @@
 use super::kernel::{
-    build_kernel, csda_range_mm, depth_sigma_mm, lateral_mm, layer_of, mass_fraction, mcs_along,
-    mcs_at, protons_from_mu, through_wet, LayerKernel,
+    build_kernel, csda_range_mm, depth_sigma_mm, layer_of, mcs_along, mcs_at, protons_from_mu,
+    through_wet, LayerKernel,
 };
 use super::{DoseFrame, Medium, Pencil, Quantity, Volume, MAX_CELLS, MEV_TO_GY_MM3, SIGMA_CUT};
 
@@ -37,7 +37,6 @@ pub(super) fn prepare(
     pencils: &[Pencil],
     quantity: Quantity,
     spread_pct: f64,
-    scatter: bool,
     wet_mm: f64,
     k_mu: f64,
     gap_mm: f64,
@@ -54,12 +53,7 @@ pub(super) fn prepare(
         residual.push(e as f32);
         kept.push(k as f32);
     }
-    let kernel = build_kernel(
-        medium,
-        &residual,
-        spread_pct,
-        scatter && quantity == Quantity::Dose,
-    );
+    let kernel = build_kernel(medium, &residual, spread_pct);
     let mut out = Vec::new();
     for (pencil, (&energy, &factor)) in pencils.iter().zip(residual.iter().zip(&kept)) {
         if energy <= 1.0 || factor <= 0.0 {
@@ -82,12 +76,8 @@ pub(super) fn prepare(
         } else {
             let range = csda_range_mm(medium, f64::from(energy)) as f32;
             let sigma = depth_sigma_mm(medium, f64::from(energy), spread_pct) as f32;
-            let end = if scatter {
-                let (path, var) = mcs_along(medium, f64::from(energy));
-                mcs_at(&path, &var, f64::from(range), f64::from(range)) as f32
-            } else {
-                0.0
-            };
+            let (path, var) = mcs_along(medium, f64::from(energy));
+            let end = mcs_at(&path, &var, f64::from(range), f64::from(range)) as f32;
             let amount = match quantity {
                 Quantity::Mu => pencil.amount * factor,
                 _ => protons as f32,
@@ -183,7 +173,6 @@ pub fn analytic_volume(
     pencils: &[Pencil],
     quantity: Quantity,
     spread_pct: f32,
-    scatter: bool,
     wet_mm: f32,
     phantom_mm: f32,
     voxel_mm: f32,
@@ -191,9 +180,21 @@ pub fn analytic_volume(
     gap_mm: f32,
 ) -> Volume {
     analytic_on(
-        medium, pencils, quantity, spread_pct, scatter, wet_mm, phantom_mm, voxel_mm, k_mu, gap_mm,
-        None, None,
+        medium, pencils, quantity, spread_pct, wet_mm, phantom_mm, voxel_mm, k_mu, gap_mm, None,
+        None,
     )
+}
+
+/// Deepest range plus `margin_sigma` range-spread widths. Python's Auto phantom.
+fn auto_depth_mm(medium: Medium, pencils: &[Pencil], spread_pct: f64, margin_sigma: f64) -> f32 {
+    let mut best = 0.0f64;
+    for pencil in pencils {
+        let energy = f64::from(pencil.energy.max(1.0));
+        let reach = super::kernel::csda_range_mm(medium, energy)
+            + margin_sigma.max(0.0) * super::kernel::depth_sigma_mm(medium, energy, spread_pct);
+        best = best.max(reach);
+    }
+    best as f32
 }
 
 /// Grid, weighted peak, and how many cell updates a full deposit would do.
@@ -202,25 +203,36 @@ pub fn dose_frame(
     pencils: &[Pencil],
     quantity: Quantity,
     spread_pct: f32,
-    scatter: bool,
     wet_mm: f32,
     phantom_mm: f32,
     voxel_mm: f32,
     k_mu: f32,
     gap_mm: f32,
+    margin_sigma: f32,
 ) -> DoseFrame {
     let (kernel, spots) = prepare(
         medium,
         pencils,
         quantity,
         f64::from(spread_pct),
-        scatter,
         f64::from(wet_mm),
         f64::from(k_mu),
         f64::from(gap_mm),
     );
     let dose_mode = quantity == Quantity::Dose;
-    let floor = (phantom_mm > 0.0).then_some(-phantom_mm);
+    let floor = if phantom_mm > 0.0 {
+        Some(-phantom_mm)
+    } else if margin_sigma > 0.0 {
+        let depth = auto_depth_mm(
+            medium,
+            pencils,
+            f64::from(spread_pct),
+            f64::from(margin_sigma),
+        );
+        (depth > 0.0).then_some(-depth)
+    } else {
+        None
+    };
     let (origin, shape) = dose_grid(&spots, voxel_mm, floor);
     let voxel = voxel_mm.clamp(0.25, 10.0);
     let focus = focus_index(&kernel, &spots, origin, shape, voxel, dose_mode);
@@ -242,7 +254,6 @@ pub fn analytic_on(
     pencils: &[Pencil],
     quantity: Quantity,
     spread_pct: f32,
-    scatter: bool,
     wet_mm: f32,
     phantom_mm: f32,
     voxel_mm: f32,
@@ -256,7 +267,6 @@ pub fn analytic_on(
         pencils,
         quantity,
         f64::from(spread_pct),
-        scatter,
         f64::from(wet_mm),
         f64::from(k_mu),
         f64::from(gap_mm),
@@ -280,37 +290,7 @@ pub fn analytic_on(
             accumulate_planes(&kernel, &spots, origin, shape, v, focus, dose_mode);
         scatter_planes(shape, focus, &axial, &coronal, &sagittal)
     } else {
-        let mut values = vec![0.0f32; nx * ny * nz];
-        let mut fx = Vec::new();
-        let mut fy = Vec::new();
-        for spot in &spots {
-            if spot.weight == 0.0 {
-                continue;
-            }
-            let Some((ix0, ix1, iy0, iy1, iz0, iz1)) = spot_box(spot, origin, shape, v, dose_mode)
-            else {
-                continue;
-            };
-            for iz in iz0..iz1 {
-                let z_lo = origin[2] + iz as f32 * v;
-                let (fz, sx, sy) = depth_lateral(&kernel, spot, z_lo, v, dose_mode);
-                if fz == 0.0 {
-                    continue;
-                }
-                normal_row(spot.x, sx, origin[0], ix0, ix1, v, &mut fx);
-                normal_row(spot.y, sy, origin[1], iy0, iy1, v, &mut fy);
-                for (ky, iy) in (iy0..iy1).enumerate() {
-                    let row = spot.weight * fz * fy[ky];
-                    if row == 0.0 {
-                        continue;
-                    }
-                    for (kx, ix) in (ix0..ix1).enumerate() {
-                        values[ix + nx * (iy + ny * iz)] += row * fx[kx];
-                    }
-                }
-            }
-        }
-        values
+        deposit_lattice(&kernel, &spots, origin, shape, v, dose_mode)
     };
     if quantity == Quantity::Dose {
         let scale = 1.0 / (v * v * v);
@@ -323,6 +303,113 @@ pub fn analytic_on(
         shape,
         voxel: v,
         values,
+    }
+}
+
+fn deposit_lattice(
+    kernel: &LayerKernel,
+    spots: &[Prepared],
+    origin: [f32; 3],
+    shape: [usize; 3],
+    voxel: f32,
+    dose_mode: bool,
+) -> Vec<f32> {
+    let [nx, ny, nz] = shape;
+    let mut values = vec![0.0f32; nx.saturating_mul(ny).saturating_mul(nz)];
+    if nx == 0 || ny == 0 || nz == 0 {
+        return values;
+    }
+    let workers = std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(1)
+        .clamp(1, 32);
+    // Each band owns its z slices, so the adds stay in one order and match a
+    // single thread. A short lattice is not worth the spawn.
+    let bands = if nz < 32 || spots.len() < 8 || workers == 1 {
+        1
+    } else {
+        workers.min(nz / 8).max(1)
+    };
+    if bands == 1 {
+        paint_band(
+            kernel,
+            spots,
+            origin,
+            shape,
+            voxel,
+            dose_mode,
+            0,
+            nz,
+            &mut values,
+        );
+        return values;
+    }
+    let stride = nz.div_ceil(bands);
+    std::thread::scope(|scope| {
+        let plane = nx * ny;
+        let mut rest = values.as_mut_slice();
+        let mut z0 = 0usize;
+        while z0 < nz {
+            let z1 = (z0 + stride).min(nz);
+            let take = (z1 - z0) * plane;
+            let (band, tail) = rest.split_at_mut(take);
+            rest = tail;
+            let z_from = z0;
+            scope.spawn(move || {
+                paint_band(
+                    kernel, spots, origin, shape, voxel, dose_mode, z_from, z1, band,
+                );
+            });
+            z0 = z1;
+        }
+    });
+    values
+}
+
+fn paint_band(
+    kernel: &LayerKernel,
+    spots: &[Prepared],
+    origin: [f32; 3],
+    shape: [usize; 3],
+    voxel: f32,
+    dose_mode: bool,
+    z0: usize,
+    z1: usize,
+    values: &mut [f32],
+) {
+    let [nx, ny, _] = shape;
+    let mut fx = Vec::new();
+    let mut fy = Vec::new();
+    for spot in spots {
+        if spot.weight == 0.0 {
+            continue;
+        }
+        let Some((ix0, ix1, iy0, iy1, iz0, iz1)) = spot_box(spot, origin, shape, voxel, dose_mode)
+        else {
+            continue;
+        };
+        let iz0 = iz0.max(z0);
+        let iz1 = iz1.min(z1);
+        for iz in iz0..iz1 {
+            let z_lo = origin[2] + iz as f32 * voxel;
+            let (fz, sx, sy) = depth_lateral(kernel, spot, z_lo, voxel, dose_mode);
+            if fz == 0.0 {
+                continue;
+            }
+            normal_row(spot.x, sx, origin[0], ix0, ix1, voxel, &mut fx);
+            normal_row(spot.y, sy, origin[1], iy0, iy1, voxel, &mut fy);
+            let local = iz - z0;
+            for (ky, iy) in (iy0..iy1).enumerate() {
+                let row = spot.weight * fz * fy[ky];
+                if row == 0.0 {
+                    continue;
+                }
+                let base = nx * (iy + ny * local);
+                for (slot, weight) in values[base + ix0..base + ix1].iter_mut().zip(&fx) {
+                    *slot += row * weight;
+                }
+            }
+        }
     }
 }
 
@@ -438,8 +525,10 @@ pub(super) fn depth_lateral(
     dose_mode: bool,
 ) -> (f32, f32, f32) {
     if dose_mode {
-        let fz = mass_fraction(kernel, spot.energy, z_lo, z_lo + voxel);
-        let mcs = lateral_mm(kernel, spot.energy, z_lo + 0.5 * voxel);
+        let row = layer_of(kernel, spot.energy);
+        let fz = super::kernel::row_at(kernel, row, z_lo + voxel, false)
+            - super::kernel::row_at(kernel, row, z_lo, false);
+        let mcs = super::kernel::row_at(kernel, row, z_lo + 0.5 * voxel, true).max(0.0);
         (fz, hypot(spot.sx, mcs), hypot(spot.sy, mcs))
     } else {
         let mid = 0.5 * (spot.z0 + spot.z1);
@@ -464,10 +553,21 @@ pub(super) fn normal_row(
     out: &mut Vec<f32>,
 ) {
     out.clear();
-    let sig = f64::from(sigma).max(1e-3);
-    for i in i0..i1 {
-        let lo = f64::from(origin + i as f32 * voxel);
-        out.push(normal_mass(f64::from(center), sig, lo, lo + f64::from(voxel)) as f32);
+    let count = i1.saturating_sub(i0);
+    if count == 0 {
+        return;
+    }
+    out.reserve(count);
+    // Adjacent cells share an edge, so one erf covers both sides of that face.
+    let sig = f64::from(sigma).max(1e-3) * std::f64::consts::SQRT_2;
+    let center = f64::from(center);
+    let origin = f64::from(origin);
+    let step = f64::from(voxel);
+    let mut prev = erf_as((origin + i0 as f64 * step - center) / sig);
+    for i in 0..count {
+        let next = erf_as((origin + (i0 + i + 1) as f64 * step - center) / sig);
+        out.push((0.5 * (next - prev)) as f32);
+        prev = next;
     }
 }
 
@@ -484,7 +584,7 @@ pub(super) fn accumulate_planes(
     let workers = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1)
-        .clamp(1, 8);
+        .clamp(1, 32);
     let parts = if spots.len() < 32 || workers == 1 {
         1
     } else {
@@ -675,7 +775,7 @@ pub(super) fn scatter_planes(
 
 #[cfg(test)]
 mod tests {
-    use super::super::{csda_range_mm, Pencil, Quantity, WATER};
+    use super::super::{csda_range_mm, Pencil, Quantity, Volume, WATER};
     use super::{analytic_on, analytic_volume, dose_frame};
 
     #[test]
@@ -692,7 +792,6 @@ mod tests {
             }],
             Quantity::Dose,
             1.0,
-            true,
             0.0,
             0.0,
             1.0,
@@ -720,12 +819,12 @@ mod tests {
             }],
             Quantity::Dose,
             1.0,
-            true,
             0.0,
             0.0,
             1.0,
             2.0e-8,
             10.0,
+            0.0,
         );
         assert!((frame.focus[0] as i32 - ix as i32).abs() <= 2);
         assert!((frame.focus[1] as i32 - iy as i32).abs() <= 2);
@@ -751,7 +850,6 @@ mod tests {
             &[pencil],
             Quantity::Dose,
             1.0,
-            true,
             0.0,
             0.0,
             1.0,
@@ -765,7 +863,6 @@ mod tests {
             &[pencil],
             Quantity::Dose,
             1.0,
-            true,
             0.0,
             0.0,
             1.0,
@@ -815,13 +912,160 @@ mod tests {
             &pencils,
             Quantity::Dose,
             1.0,
-            true,
+            0.0,
+            0.0,
+            1.0,
+            2.0e-8,
+            10.0,
+            0.0,
+        );
+        assert!(frame.planes_only(), "visits {}", frame.visits);
+    }
+
+    #[test]
+    fn split_bands_still_fill_the_depth() {
+        let pencils: Vec<_> = (0..8)
+            .map(|i| Pencil {
+                x: i as f32 * 6.0,
+                y: 0.0,
+                sx: 3.0,
+                sy: 3.0,
+                energy: 140.0,
+                amount: 0.05,
+            })
+            .collect();
+        let volume = analytic_volume(
+            WATER,
+            &pencils,
+            Quantity::Dose,
+            1.0,
             0.0,
             0.0,
             1.0,
             2.0e-8,
             10.0,
         );
-        assert!(frame.planes_only(), "visits {}", frame.visits);
+        let [nx, ny, nz] = volume.shape;
+        let mut first = None;
+        let mut last = None;
+        for z in 0..nz {
+            let hit = (0..ny).any(|y| (0..nx).any(|x| volume.get(x, y, z) > 0.0));
+            if hit {
+                first.get_or_insert(z);
+                last = Some(z);
+            }
+        }
+        let span = last.unwrap_or(0) - first.unwrap_or(0);
+        assert!(span > nz / 3, "dose span {span} of {nz}");
+    }
+
+    #[test]
+    fn split_bands_match_a_single_pass() {
+        let pencils: Vec<_> = (0..8)
+            .map(|i| Pencil {
+                x: i as f32 * 6.0,
+                y: (i as f32 - 3.0) * 4.0,
+                sx: 3.0,
+                sy: 3.0,
+                energy: 140.0,
+                amount: 0.05,
+            })
+            .collect();
+        let (kernel, spots) = super::prepare(WATER, &pencils, Quantity::Dose, 1.0, 0.0, 2e-8, 10.0);
+        let (origin, shape) = super::dose_grid(&spots, 1.0, None);
+        let [nx, ny, nz] = shape;
+        let mut one = vec![0.0f32; nx * ny * nz];
+        super::paint_band(&kernel, &spots, origin, shape, 1.0, true, 0, nz, &mut one);
+        let mid = nz / 2;
+        let mut lo = vec![0.0f32; nx * ny * mid];
+        let mut hi = vec![0.0f32; nx * ny * (nz - mid)];
+        super::paint_band(&kernel, &spots, origin, shape, 1.0, true, 0, mid, &mut lo);
+        super::paint_band(&kernel, &spots, origin, shape, 1.0, true, mid, nz, &mut hi);
+        lo.extend(hi);
+        assert_eq!(lo, one);
+    }
+
+    #[test]
+    fn a_gaussian_row_matches_the_cell_integral() {
+        let mut row = Vec::new();
+        super::normal_row(1.2, 3.0, -4.0, 2, 9, 1.0, &mut row);
+        assert_eq!(row.len(), 7);
+        for (i, weight) in row.iter().enumerate() {
+            let index = 2 + i;
+            let lo = -4.0 + index as f64;
+            let cell = super::normal_mass(1.2, 3.0, lo, lo + 1.0) as f32;
+            assert!((weight - cell).abs() < 1e-6, "{weight} vs {cell}");
+        }
+    }
+
+    #[test]
+    fn auto_margin_is_sigma_past_the_range() {
+        let pencil = Pencil {
+            x: 0.0,
+            y: 0.0,
+            sx: 4.0,
+            sy: 4.0,
+            energy: 100.0,
+            amount: 0.1,
+        };
+        let bare = dose_frame(
+            WATER,
+            &[pencil],
+            Quantity::Dose,
+            1.0,
+            0.0,
+            0.0,
+            1.0,
+            2e-8,
+            10.0,
+            0.0,
+        );
+        let five = dose_frame(
+            WATER,
+            &[pencil],
+            Quantity::Dose,
+            1.0,
+            0.0,
+            0.0,
+            1.0,
+            2e-8,
+            10.0,
+            5.0,
+        );
+        assert_eq!(bare.shape[0], five.shape[0]);
+        assert_eq!(bare.shape[1], five.shape[1]);
+        assert!(five.shape[2] <= bare.shape[2]);
+        assert!(five.shape[2] + 2 >= bare.shape[2]);
+        let tight = dose_frame(
+            WATER,
+            &[pencil],
+            Quantity::Dose,
+            1.0,
+            0.0,
+            0.0,
+            1.0,
+            2e-8,
+            10.0,
+            1.0,
+        );
+        assert!(
+            tight.shape[2] < five.shape[2],
+            "{} vs {}",
+            tight.shape[2],
+            five.shape[2]
+        );
+        let volume = Volume {
+            origin: [-1.0, -1.0, -4.0],
+            shape: [3, 3, 4],
+            voxel: 1.0,
+            values: vec![0.0; 36],
+        };
+        let (depth, _) = volume.depth_profile(1, 1);
+        assert!((depth[0] - 0.5).abs() < 1e-4, "{depth:?}");
+        let (lateral, _) = volume.lateral_profile(1, 1, 1);
+        assert!(lateral[1].abs() < 1e-4, "{lateral:?}");
+        assert!(lateral[0] < 0.0 && lateral[2] > 0.0);
+        let (along, _) = volume.longitudinal_profile(1, 1, 1);
+        assert!((along[0] - 1.0).abs() < 1e-4, "{along:?}");
     }
 }

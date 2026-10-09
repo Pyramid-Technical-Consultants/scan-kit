@@ -5,30 +5,34 @@
 
 mod analysis;
 mod beam;
-mod binned;
+mod bins;
 mod columns;
 mod config;
 mod discover;
-mod dose_view;
 mod histogram;
+mod location;
 mod marks;
 mod mc_tables;
 mod patient_view;
 mod phantom;
+mod remote;
 mod runner;
 mod source;
 mod store;
 mod synthesis;
 mod tables;
+pub mod volumetric;
+mod workspace;
 
 pub use analysis::{analysis_scene, channel_catalog, load_timeslice_columns};
 pub use beam::{beam_record, protons_per_mu, spot_record};
-pub use dose_view::dose_volume;
 pub use mc_tables::mc_tables;
 pub use tables::{
     bind_slice, clear_slice, session_pieces, slice_tail_done, SessionPieces, SliceTake, SLICE_ROWS,
 };
+pub use volumetric::volumetric;
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use scan_kit_core::{
@@ -39,15 +43,16 @@ use serde_json::{json, Value};
 use columns::map_geom_from_spots;
 use discover::Discovered;
 use store::{
-    backfill_blank_notes, canonical_local, default_db_path, last_main_tab, library_rows,
-    prepare_library, record_meta, remember_data_dir, set_last_main_tab, set_note, set_selected,
-    sync_entry, window_geometry, with_store, Cache,
+    backfill_blank_notes, data_dirs, default_db_path, delete_missing, delete_missing_exams,
+    exam_rows, forget_data_dir, last_main_tab, library_id, library_rows, prepare_library,
+    record_meta, remember_data_dir, set_last_main_tab, set_note, set_selected, sync_entry,
+    upsert_exam, window_geometry, with_store, Cache,
 };
 
 const TOOLS: &[ToolSpec] = &[
     ToolSpec {
         name: "scan_kit_open_library",
-        summary: "Discover a data folder, sync the session index, and return the rows.",
+        summary: "Discover a data folder or URL, sync the session index, and return the rows.",
         kind: ToolKind::Workflow,
     },
     ToolSpec {
@@ -58,6 +63,21 @@ const TOOLS: &[ToolSpec] = &[
     ToolSpec {
         name: "scan_kit_select_sessions",
         summary: "Store the selected session ids, at most five.",
+        kind: ToolKind::Granular,
+    },
+    ToolSpec {
+        name: "scan_kit_data_dirs",
+        summary: "List saved data locations in order.",
+        kind: ToolKind::Granular,
+    },
+    ToolSpec {
+        name: "scan_kit_read_catalog",
+        summary: "Return the combined session and exam catalog.",
+        kind: ToolKind::Granular,
+    },
+    ToolSpec {
+        name: "scan_kit_forget_data_dir",
+        summary: "Remove one saved data location from the catalog.",
         kind: ToolKind::Granular,
     },
     ToolSpec {
@@ -72,7 +92,7 @@ const TOOLS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "scan_kit_channel_catalog",
-        summary: "List timeslice channels present for Replay, FFT, and Audio.",
+        summary: "List timeslice channels present for Replay.",
         kind: ToolKind::Granular,
     },
     ToolSpec {
@@ -221,6 +241,22 @@ pub fn tool_input_schema(name: &str) -> Value {
                 "db_path": { "type": "string" }
             },
             "required": ["path", "session_ids"],
+            "additionalProperties": false
+        }),
+        "scan_kit_data_dirs" | "scan_kit_read_catalog" => json!({
+            "type": "object",
+            "properties": {
+                "db_path": { "type": "string" }
+            },
+            "additionalProperties": false
+        }),
+        "scan_kit_forget_data_dir" => json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string" },
+                "db_path": { "type": "string" }
+            },
+            "required": ["path"],
             "additionalProperties": false
         }),
         "scan_kit_load_columns" => json!({
@@ -460,6 +496,26 @@ pub fn invoke(name: &str, input: &Value) -> Result<Value, InvokeError> {
             })
             .map_err(InvokeError::Message)
         }
+        "scan_kit_data_dirs" => {
+            let db = database_path(input)?;
+            with_store(&db, |conn| data_dirs(conn))
+                .map(|dirs| json!(dirs))
+                .map_err(InvokeError::Message)
+        }
+        "scan_kit_read_catalog" => {
+            let db = database_path(input)?;
+            with_store(&db, |conn| publish_catalog(conn)).map_err(InvokeError::Message)
+        }
+        "scan_kit_forget_data_dir" => {
+            let path = required_str(input, "path")?;
+            let db = database_path(input)?;
+            with_store(&db, |conn| {
+                let root = library_root(path)?;
+                forget_data_dir(conn, &root)?;
+                publish_catalog(conn)
+            })
+            .map_err(InvokeError::Message)
+        }
         "scan_kit_load_columns" => {
             let storage = required_str(input, "storage_path")?;
             let session_id = required_str(input, "session_id")?;
@@ -649,18 +705,36 @@ fn open_library_keep(
     data_dir: &Path,
     keep: &mut dyn FnMut(u64, u64, Option<&Value>) -> bool,
 ) -> Result<Value, String> {
-    if !data_dir.is_dir() {
-        return Err(format!("{} is not a directory", data_dir.display()));
-    }
-    let root = canonical_local(data_dir);
+    let spec = data_dir.to_string_lossy();
+    let (root, opened) = location::open_root(&spec)?;
+    let found = match &opened {
+        location::Opened::Local(path) => discover::discover(path)?,
+        location::Opened::Remote(url) => location::discover_remote(url)?,
+    };
+    let places = found
+        .entries
+        .iter()
+        .map(|entry| {
+            (
+                entry.session_id.clone(),
+                entry.storage_path.to_string_lossy().into_owned(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let exams = found.exams;
+    let skipped = found.skipped;
     let tx = conn.transaction().map_err(|err| err.to_string())?;
     let lib_id = prepare_library(&tx, &root)?;
-    let entries = discover::discover_entries(Path::new(&root))?;
-    let total = entries.len() as u64;
+    let ids = places
+        .iter()
+        .map(|(session_id, _)| session_id.clone())
+        .collect::<HashSet<_>>();
+    delete_missing(&tx, lib_id, &ids)?;
+    let total = found.entries.len() as u64;
     if !keep(0, total, None) {
         return Err("cancelled".into());
     }
-    for (index, entry) in entries.into_iter().enumerate() {
+    for (index, entry) in found.entries.into_iter().enumerate() {
         if let Cache::Hydrate = sync_entry(&tx, lib_id, &entry)? {
             let meta = hydrate(&entry);
             record_meta(&tx, lib_id, &entry, meta.as_ref())?;
@@ -675,12 +749,113 @@ fn open_library_keep(
             return Err("cancelled".into());
         }
     }
+    let exam_ids = exams
+        .iter()
+        .map(|exam| exam.study_uid.clone())
+        .collect::<HashSet<_>>();
+    delete_missing_exams(&tx, lib_id, &exam_ids)?;
+    for exam in &exams {
+        upsert_exam(&tx, lib_id, exam)?;
+    }
     remember_data_dir(&tx, &root)?;
     backfill_blank_notes(&tx, lib_id, Path::new(&root))?;
     let rows = library_rows(&tx, lib_id)?;
     let selected = store::selected_session_ids(&tx, lib_id)?;
     tx.commit().map_err(|err| err.to_string())?;
-    Ok(json!({ "root": root, "rows": rows, "selected": selected }))
+    location::replace_sessions(&root, &places);
+    publish_catalog(conn)?;
+    Ok(json!({ "root": root, "rows": rows, "selected": selected, "skipped": skipped }))
+}
+
+fn publish_catalog(conn: &rusqlite::Connection) -> Result<Value, String> {
+    let locations = data_dirs(conn)?;
+    let mut used_sessions = HashSet::new();
+    let mut used_exams = HashSet::new();
+    let mut rows = Vec::new();
+    let mut places = Vec::new();
+    let mut selected = Vec::new();
+    let mut exams = Vec::new();
+    for root in &locations {
+        let Some(lib_id) = library_id(conn, root)? else {
+            continue;
+        };
+        let mut batch = Vec::new();
+        for mut row in library_rows(conn, lib_id)? {
+            let folder_id = row["session_id"].as_str().unwrap_or("").to_owned();
+            let place = row["storage_path"].as_str().unwrap_or("").to_owned();
+            let key = catalog_key(&folder_id, &place, &mut used_sessions);
+            row["folder_id"] = json!(&folder_id);
+            row["library"] = json!(root);
+            row["session_id"] = json!(&key);
+            places.push((key.clone(), root.clone(), place, folder_id.clone()));
+            batch.push((folder_id, key, row));
+        }
+        for id in store::selected_session_ids(conn, lib_id)? {
+            if let Some((_, key, _)) = batch.iter().find(|(folder, _, _)| folder == &id) {
+                selected.push(key.clone());
+            }
+        }
+        for (_, _, row) in batch {
+            rows.push(row);
+        }
+        for exam in exam_rows(conn, lib_id)? {
+            let key = catalog_key(&exam.folder_name, &exam.storage_path, &mut used_exams);
+            exams.push(json!({
+                "exam": key,
+                "patient": exam.patient_name,
+                "patient_id": exam.patient_id,
+                "date": short_study_date(&exam.study_date),
+                "description": exam.study_description,
+                "files": exam.file_count,
+                "library": root,
+            }));
+        }
+    }
+    location::replace_catalog(&places);
+    Ok(json!({
+        "locations": locations,
+        "rows": rows,
+        "exams": exams,
+        "selected": selected,
+    }))
+}
+
+fn catalog_key(name: &str, storage: &str, used: &mut HashSet<String>) -> String {
+    if used.insert(name.to_owned()) {
+        return name.to_owned();
+    }
+    let parent = parent_folder(storage);
+    let mut key = format!("{name} · {parent}");
+    let mut extra = 2u32;
+    while !used.insert(key.clone()) {
+        key = format!("{name} · {parent} ({extra})");
+        extra += 1;
+    }
+    key
+}
+
+fn parent_folder(storage: &str) -> String {
+    let trimmed = storage.trim_end_matches(['/', '\\']);
+    trimmed
+        .rsplit(['/', '\\'])
+        .nth(1)
+        .filter(|name| !name.is_empty())
+        .unwrap_or("location")
+        .to_owned()
+}
+
+fn short_study_date(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    if bytes.len() >= 8 && bytes[..8].iter().all(u8::is_ascii_digit) {
+        format!("{}-{}-{}", &raw[..4], &raw[4..6], &raw[6..8])
+    } else {
+        raw.to_owned()
+    }
+}
+
+/// Remember a password for a remote library. It stays in process memory.
+pub fn remember_password(spec: &str, password: &str) {
+    location::remember_password(spec, password);
 }
 
 fn hydrate(entry: &Discovered) -> Option<SessionMeta> {
@@ -708,11 +883,14 @@ fn geom_incomplete(meta: Option<&SessionMeta>) -> bool {
 }
 
 fn library_root(path: &str) -> Result<String, String> {
+    if location::is_remote_location(path) {
+        return location::canonical_root(path);
+    }
     let path = Path::new(path);
     if !path.is_dir() {
         return Err(format!("{} is not a directory", path.display()));
     }
-    Ok(canonical_local(path))
+    location::canonical_root(&path.to_string_lossy())
 }
 
 fn database_path(input: &Value) -> Result<PathBuf, InvokeError> {
@@ -970,7 +1148,7 @@ Layer delivery: 27/27
         assert!(too_many.is_err());
 
         let conn = rusqlite::Connection::open(&db).unwrap();
-        assert_eq!(store::user_version(&conn).unwrap(), 3);
+        assert_eq!(store::user_version(&conn).unwrap(), 4);
         drop(conn);
         let _ = fs::remove_dir_all(&root);
     }
@@ -1013,7 +1191,7 @@ Layer delivery: 27/27
         drop(conn);
 
         let conn = store::open_connection(&db).unwrap();
-        assert_eq!(store::user_version(&conn).unwrap(), 3);
+        assert_eq!(store::user_version(&conn).unwrap(), 4);
         let extent: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name = 'map_extent_mm'",
@@ -1030,6 +1208,14 @@ Layer delivery: 27/27
             .unwrap();
         assert_eq!(extent, 1);
         assert_eq!(mode, 1);
+        let exams: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'exams'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(exams, 1);
         drop(conn);
         let _ = fs::remove_dir_all(&root);
     }
@@ -1064,6 +1250,285 @@ Layer delivery: 27/27
         let second = columns[1]["values"][1].as_f64().unwrap();
         assert!((first - 1500.0).abs() < 1e-2, "scaled current {first}");
         assert!((second - 2500.0).abs() < 1e-2, "scaled current {second}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_nested_session_is_found_and_a_duplicate_is_named() {
+        let root = workspace("nested");
+        let db = root.join("test.sqlite");
+        let year = root.join("site").join("year");
+        let kept = year.join("kept");
+        fs::create_dir_all(&kept).unwrap();
+        fs::write(kept.join("termination_summary.txt"), KEPT_SUMMARY).unwrap();
+        fs::write(
+            kept.join("input_map.csv"),
+            "energy,X_POSITION,Y_POSITION\n1,0,0\n",
+        )
+        .unwrap();
+        let notes = year.join("notes");
+        fs::create_dir_all(&notes).unwrap();
+        fs::write(notes.join("readme.txt"), b"not a session").unwrap();
+        discover::write_zip(
+            &year.join("bundle.zip"),
+            &[
+                ("input_map.csv", b"energy,X_POSITION,Y_POSITION\n1,0,0\n"),
+                ("termination_summary.txt", KEPT_SUMMARY.as_bytes()),
+            ],
+        )
+        .unwrap();
+        let duplicate = root.join("site").join("z-dup").join("kept");
+        fs::create_dir_all(&duplicate).unwrap();
+        fs::write(duplicate.join("input_map.csv"), b"energy\n1\n").unwrap();
+        fs::write(
+            duplicate.join("termination_summary.txt"),
+            b"Configuration name: dup\n",
+        )
+        .unwrap();
+
+        let before = discover::session_directory(&root, "kept");
+        assert!(!before.join("input_map.csv").is_file());
+
+        let opened = invoke(
+            "scan_kit_open_library",
+            &json!({ "path": root.to_string_lossy(), "db_path": db.to_string_lossy() }),
+        )
+        .unwrap();
+        let ids = opened["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["session_id"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["bundle", "kept"]);
+        let skipped = opened["skipped"].as_array().unwrap();
+        assert!(
+            skipped
+                .iter()
+                .any(|item| item.as_str().unwrap().contains("z-dup")),
+            "{skipped:?}"
+        );
+
+        let found =
+            discover::session_directory(Path::new(opened["root"].as_str().unwrap()), "kept");
+        assert!(found.join("input_map.csv").is_file());
+        assert!(found
+            .to_string_lossy()
+            .replace('\\', "/")
+            .contains("site/year/kept"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_remote_listing_is_cached_when_the_view_opens() {
+        let root = workspace("remote");
+        let db = root.join("test.sqlite");
+        let url = format!(
+            "sftp://scan-kit@example.invalid/data/{}/{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let canonical = location::install_fixture(
+            &url,
+            &[
+                (
+                    "site/year/sess/input_map.csv",
+                    b"energy,X_POSITION,Y_POSITION\n1,0,0\n",
+                ),
+                (
+                    "site/year/sess/termination_summary.txt",
+                    KEPT_SUMMARY.as_bytes(),
+                ),
+                ("site/year/notes/readme.txt", b"not a session"),
+            ],
+            false,
+        )
+        .unwrap();
+        let opened = invoke(
+            "scan_kit_open_library",
+            &json!({ "path": &url, "db_path": db.to_string_lossy() }),
+        )
+        .unwrap();
+        assert_eq!(opened["root"], canonical);
+        let row = opened["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["session_id"] == "sess")
+            .unwrap();
+        assert_eq!(row["config"], "kept-config");
+        assert_eq!(location::fixture_copies(&canonical), 0);
+
+        let dir = discover::session_directory(Path::new(&canonical), "sess");
+        let text = fs::read_to_string(dir.join("input_map.csv")).unwrap();
+        assert!(text.contains("X_POSITION"));
+        assert_eq!(location::fixture_copies(&canonical), 1);
+        let _ = discover::session_directory(Path::new(&canonical), "sess");
+        assert_eq!(location::fixture_copies(&canonical), 1);
+        let _ = fs::remove_dir_all(location::cache_directory(&canonical));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_remote_open_asks_again_when_the_password_is_missing() {
+        let root = workspace("remote-auth");
+        let db = root.join("test.sqlite");
+        let url = format!(
+            "sftp://scan-kit@example.invalid/locked/{}/{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        location::install_fixture(
+            &url,
+            &[
+                ("sess/input_map.csv", b"energy\n1\n"),
+                (
+                    "sess/termination_summary.txt",
+                    b"Configuration name: locked\n",
+                ),
+            ],
+            true,
+        )
+        .unwrap();
+        let err = invoke(
+            "scan_kit_open_library",
+            &json!({ "path": &url, "db_path": db.to_string_lossy() }),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().starts_with("authentication required"),
+            "{err}"
+        );
+        remember_password(&url, "secret");
+        let opened = invoke(
+            "scan_kit_open_library",
+            &json!({ "path": &url, "db_path": db.to_string_lossy() }),
+        )
+        .unwrap();
+        assert!(!opened["root"].as_str().unwrap().contains("secret"));
+        assert!(opened["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["session_id"] == "sess"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn saved_locations_share_one_session_list_and_exams_stay_separate() {
+        let root = workspace("catalog");
+        let db = root.join("test.sqlite");
+        let db_arg = db.to_string_lossy().into_owned();
+        let site_a = root.join("site-a");
+        let site_b = root.join("site-b");
+        write_session(
+            &site_a,
+            "kept",
+            KEPT_SUMMARY,
+            "energy,X_POSITION,Y_POSITION\n1,0,0\n",
+        );
+        write_session(
+            &site_a,
+            "other",
+            KEPT_SUMMARY,
+            "energy,X_POSITION,Y_POSITION\n1,0,0\n",
+        );
+        write_session(
+            &site_b,
+            "kept",
+            KEPT_SUMMARY,
+            "energy,X_POSITION,Y_POSITION\n1,1,1\n",
+        );
+        let exam = site_a.join("study");
+        fs::create_dir_all(&exam).unwrap();
+        let mut stub = vec![0u8; 132];
+        stub[128..132].copy_from_slice(b"DICM");
+        fs::write(exam.join("1.2.3"), &stub).unwrap();
+        let notes = site_a.join("notes").join("deep");
+        fs::create_dir_all(&notes).unwrap();
+        fs::write(notes.join("readme.txt"), b"not dicom").unwrap();
+
+        invoke(
+            "scan_kit_open_library",
+            &json!({ "path": site_a.to_string_lossy(), "db_path": &db_arg }),
+        )
+        .unwrap();
+        invoke(
+            "scan_kit_open_library",
+            &json!({ "path": site_b.to_string_lossy(), "db_path": &db_arg }),
+        )
+        .unwrap();
+        let catalog = invoke("scan_kit_read_catalog", &json!({ "db_path": &db_arg })).unwrap();
+        let locations = catalog["locations"].as_array().unwrap();
+        assert_eq!(locations.len(), 2);
+        let ids: Vec<&str> = catalog["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["session_id"].as_str().unwrap())
+            .collect();
+        assert!(ids.contains(&"kept"), "{ids:?}");
+        assert!(ids.contains(&"other"), "{ids:?}");
+        assert!(ids.contains(&"kept · site-b"), "{ids:?}");
+        let exams = catalog["exams"].as_array().unwrap();
+        assert_eq!(exams.len(), 1);
+        assert_eq!(exams[0]["exam"], "study");
+        assert_eq!(exams[0]["files"], 1);
+        let found =
+            discover::session_directory(Path::new(locations[0].as_str().unwrap()), "kept · site-b");
+        let found_text = found.to_string_lossy().replace('\\', "/");
+        assert!(found_text.contains("site-b/kept"), "{found_text}");
+        assert!(found.join("input_map.csv").is_file());
+
+        invoke(
+            "scan_kit_select_sessions",
+            &json!({
+                "path": locations[1],
+                "db_path": &db_arg,
+                "session_ids": ["kept"]
+            }),
+        )
+        .unwrap();
+        let selected = invoke("scan_kit_read_catalog", &json!({ "db_path": &db_arg })).unwrap();
+        assert!(selected["selected"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|id| id == "kept · site-b"));
+
+        let forgotten = invoke(
+            "scan_kit_forget_data_dir",
+            &json!({ "path": locations[0], "db_path": &db_arg }),
+        )
+        .unwrap();
+        let left: Vec<&str> = forgotten["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["session_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(left, vec!["kept"]);
+        assert!(forgotten["exams"].as_array().unwrap().is_empty());
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        let still: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sessions s JOIN libraries l ON l.id = s.library_id WHERE l.root_path = ?1",
+                [locations[0].as_str().unwrap()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            still >= 1,
+            "the library row stays after the location is removed"
+        );
+        assert_eq!(store::user_version(&conn).unwrap(), 4);
+        drop(conn);
         let _ = fs::remove_dir_all(&root);
     }
 }

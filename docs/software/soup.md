@@ -38,6 +38,12 @@ Versions below are the ones locked for the workspace. Anomaly review for a SOUP 
 | chrono | see `crates/scan-kit-io/Cargo.toml` | Local reading of a UTC file time, matching `mktime(gmtime(...))` for those sidecars |
 | tungstenite | see `crates/scan-kit-io/Cargo.toml` | mpack WebSocket to an RCI. Handshake only, no TLS |
 | rmpv | see `crates/scan-kit-io/Cargo.toml` | MessagePack encode and decode for that session |
+| sha2 | see `crates/scan-kit-io/Cargo.toml` | Name the remote-session cache directory. SK-REQ-004 |
+| ssh2 | see `crates/scan-kit-io/Cargo.toml` | SFTP library open, synchronous, on the blocking path. Windows uses the system crypto library. SK-REQ-004 |
+| suppaftp | see `crates/scan-kit-io/Cargo.toml` | FTP and FTPS library open. SK-REQ-004 |
+| ureq | see `crates/scan-kit-io/Cargo.toml` | Download one `http://` or `https://` archive into the remote cache. SK-REQ-004 |
+| rustls-native-certs | see `crates/scan-kit-io/Cargo.toml` | System certificate store for FTPS. SK-REQ-004 |
+| native-tls | see `crates/scan-kit-io/Cargo.toml` | HTTPS for an archive URL, using the operating system TLS stack. Unix builds its TLS library from source. SK-REQ-004 |
 | wgpu | see `crates/scan-kit-plot/Cargo.toml` and `crates/scan-kit-compute/Cargo.toml` | The only GPU library. The plot crate draws with it natively and in the webview (WebGPU, or WebGL2 through its `webgl` feature). The compute crate runs kernels with it |
 | naga | see `crates/scan-kit-plot/Cargo.toml` and `crates/scan-kit-compute/Cargo.toml` | Compile the plot and compute shaders when no GPU adapter is present |
 | fontdue | see `crates/scan-kit-plot/Cargo.toml` | Rasterize plot labels into one glyph atlas |
@@ -58,6 +64,7 @@ Plot text uses the vendored Source Sans 3 regular face in `crates/scan-kit-plot/
 | `@glideapps/glide-data-grid` | see `apps/desktop/package.json` | Session list and later column views |
 | `@tauri-apps/plugin-dialog` | see `apps/desktop/package.json` | Open Data Folder dialog |
 | vitest | see `apps/desktop/package.json` | Desktop UI checks. Not linked into the product binary |
+| @vitest/coverage-v8 | see `apps/desktop/package.json` | Line coverage for those checks. Not linked into the product binary |
 | happy-dom | see `apps/desktop/package.json` | DOM for those checks. Not linked into the product binary |
 | oxlint | see `apps/desktop/package.json` | Desktop correctness lint, including React hooks. Not linked into the product binary |
 | knip | see `apps/desktop/package.json` | Unused desktop files, exports, and npm dependencies. Not linked into the product binary |

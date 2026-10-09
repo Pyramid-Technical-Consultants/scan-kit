@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { createElement, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Box,
   Bug,
@@ -7,6 +7,9 @@ import {
   Eye,
   FolderOpen,
   Info,
+  Plus,
+  Trash2,
+  Loader2,
   LogOut,
   Play,
   Redo2,
@@ -28,19 +31,24 @@ import "@glideapps/glide-data-grid/dist/index.css";
 import { gridTheme } from "@/grid-theme";
 import {
   Dialog,
+  DialogClose,
   DialogContent,
   DialogDescription,
+  DialogFooter,
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import { Input } from "@/components/ui/input";
 import { AnalysisIcon, AnalysisMenu, PRIMARY_ANALYSES, analysisId } from "@/analysis-menu";
+import { optionIcon } from "@/option-icons";
 import { Button } from "@/components/ui/button";
+import { ButtonSegmentGroup } from "@/components/button-segment-group";
+import { ExamTable, type ExamRow } from "@/ExamTable";
 import { DebugLog } from "@/DebugLog";
 import { installDebugLog } from "@/debug-log";
 import { dismissNotice, logError, notify, notifyError } from "@/notify";
 import { usePageLoad } from "@/page-load";
 import { driveTask, type Report } from "@/task-client";
-import { selectionFromLibrary } from "@/session-colors";
 import { type CheckPaint } from "@/session-checkbox";
 import { SessionContextMenu } from "@/session-menu";
 import {
@@ -66,6 +74,7 @@ import {
   MenubarItem,
   MenubarMenu,
   MenubarSeparator,
+  MenubarShortcut,
   MenubarTrigger,
 } from "@/components/ui/menubar";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
@@ -75,6 +84,35 @@ import { ConfigTuning } from "@/ConfigTuning";
 import { PhantomSynthesis } from "@/PhantomSynthesis";
 import { PlanRunner } from "@/PlanRunner";
 import { PlanSynthesis } from "@/PlanSynthesis";
+
+function typingTarget(target: EventTarget | null): boolean {
+  return (
+    target instanceof HTMLElement &&
+    (target.isContentEditable ||
+      target.tagName === "INPUT" ||
+      target.tagName === "TEXTAREA" ||
+      target.tagName === "SELECT")
+  );
+}
+
+function layerOpen(target: EventTarget | null): boolean {
+  if (
+    target instanceof Element &&
+    target.closest("[role='dialog'], [role='menu'], [role='listbox']") != null
+  ) {
+    return true;
+  }
+  return (
+    document.querySelector(
+      "[role='dialog'][data-open], [role='menu'][data-open], [role='listbox'][data-open]",
+    ) != null
+  );
+}
+
+function authenticationRequired(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.startsWith("authentication required");
+}
 
 const TAB_ICONS: Record<string, LucideIcon> = {
   "Data Analysis": Table2,
@@ -155,6 +193,52 @@ function geometryOnScreen(
   });
 }
 
+function emptyCatalogMessage(catalog: "Sessions" | "Exams", locations: number): string {
+  if (locations === 0) {
+    return catalog === "Sessions"
+      ? "Add a data location to list sessions."
+      : "Add a data location to list exams.";
+  }
+  return catalog === "Sessions"
+    ? "No sessions in the saved locations."
+    : "No DICOM exams in the saved locations.";
+}
+
+function CatalogPending({ name }: { name: "Sessions" | "Exams" }) {
+  return (
+    <div className="absolute inset-0 flex items-center justify-center" role="status">
+      <Loader2 className="text-muted-foreground size-8 animate-spin" />
+      <span className="sr-only">Loading {name.toLowerCase()}</span>
+    </div>
+  );
+}
+
+function CatalogEmpty({
+  name,
+  message,
+  onLocations,
+}: {
+  name: "Sessions" | "Exams";
+  message: string;
+  onLocations: () => void;
+}) {
+  const icon = optionIcon(name);
+  return (
+    <div className="absolute inset-0 flex items-center justify-center p-6">
+      <div className="flex max-w-sm flex-col items-center gap-3 text-center">
+        {icon == null
+          ? null
+          : createElement(icon, { className: "text-muted-foreground size-8" })}
+        <p className="text-muted-foreground text-sm">{message}</p>
+        <Button onClick={onLocations}>
+          <FolderOpen />
+          Locations
+        </Button>
+      </div>
+    </div>
+  );
+}
+
 function TabIcon({ name }: { name: string }) {
   const Icon = TAB_ICONS[name];
   if (Icon == null) {
@@ -163,9 +247,24 @@ function TabIcon({ name }: { name: string }) {
   return <Icon className="size-4" />;
 }
 
+type CatalogPayload = {
+  locations: string[];
+  rows: LibraryRow[];
+  exams: ExamRow[];
+  selected: string[];
+};
+
 export default function App() {
-  const [folder, setFolder] = useState<string | null>(null);
+  const [locations, setLocations] = useState<string[]>([]);
+  const [locationsKnown, setLocationsKnown] = useState(false);
+  const [locationDraft, setLocationDraft] = useState("");
+  const [locationsOpen, setLocationsOpen] = useState(false);
+  const [catalog, setCatalog] = useState<"Sessions" | "Exams">("Sessions");
+  const [passwordFor, setPasswordFor] = useState<string | null>(null);
+  const [password, setPassword] = useState("");
   const [rows, setRows] = useState<LibraryRow[]>([]);
+  const [exams, setExams] = useState<ExamRow[]>([]);
+  const folder = locations[0] ?? null;
   const [sort, setSort] = useState<Sort>({ key: "date", direction: "desc" });
   const [about, setAbout] = useState<About | null>(null);
   const [aboutOpen, setAboutOpen] = useState(false);
@@ -183,8 +282,15 @@ export default function App() {
   const [libraryLoading, setLibraryLoading] = useState(false);
   usePageLoad(libraryLoading, libraryReport?.done ?? 0, libraryReport?.total ?? 0);
   const libraryToken = useRef<object>({});
+  const loadDepth = useRef(0);
+  const noteBusy = useRef(false);
+  const pendingLocations = useRef<string[]>([]);
   const selectedIds = selectionOrder;
   const canAnalyze = folder != null && selectedIds.length >= 1 && selectedIds.length <= MAX_SELECTED;
+  const noRows = catalog === "Sessions" ? rows.length === 0 : exams.length === 0;
+  const catalogWaiting = noRows && (!locationsKnown || libraryLoading);
+  const emptyMessage =
+    catalogWaiting || !noRows ? null : emptyCatalogMessage(catalog, locations.length);
   const host = useRef<HTMLDivElement>(null);
 
   const order = useMemo(() => {
@@ -202,54 +308,149 @@ export default function App() {
     [order, rows],
   );
 
-  const loadFolder = useCallback(async (path: string) => {
-    const mine = {};
-    libraryToken.current = mine;
+  const beginCatalogLoad = useCallback(() => {
+    loadDepth.current += 1;
     setLibraryLoading(true);
-    try {
-      await driveTask(
-        {
-          view: "library",
-          path,
-          sessionIds: [],
-          options: {},
-          background: [],
-          foreground: [],
-          palette: [],
-        },
-        (report, payload) => {
-          if (libraryToken.current !== mine) {
-            return;
-          }
-          setLibraryReport(report.finished ? null : report);
-          if (payload == null) {
-            return;
-          }
-          const opened = JSON.parse(new TextDecoder().decode(payload)) as {
-            root: string;
-            rows: LibraryRow[];
-            selected?: string[];
-          };
-          if (report.finished) {
-            setFolder(opened.root);
-            setRows(opened.rows);
-            setSelectionOrder(selectionFromLibrary(opened.rows, opened.selected));
-            dismissNotice();
-            setUndo([]);
-            setRedo([]);
-          } else if (opened.rows.length > 0) {
-            setFolder(opened.root);
-            setRows(opened.rows);
-          }
-        },
-        () => libraryToken.current !== mine,
-      );
-    } finally {
-      if (libraryToken.current === mine) {
-        setLibraryLoading(false);
-      }
+  }, []);
+
+  const endCatalogLoad = useCallback(() => {
+    loadDepth.current -= 1;
+    if (loadDepth.current <= 0) {
+      loadDepth.current = 0;
+      setLibraryLoading(false);
     }
   }, []);
+
+  const loadFolder = useCallback(
+    async (path: string) => {
+      const mine = {};
+      libraryToken.current = mine;
+      beginCatalogLoad();
+      try {
+        await driveTask(
+          {
+            view: "library",
+            path,
+            sessionIds: [],
+            options: {},
+            background: [],
+            foreground: [],
+            palette: [],
+          },
+          (report) => {
+            if (libraryToken.current !== mine) {
+              return;
+            }
+            setLibraryReport(report.finished ? null : report);
+          },
+          () => libraryToken.current !== mine,
+        );
+      } finally {
+        endCatalogLoad();
+      }
+    },
+    [beginCatalogLoad, endCatalogLoad],
+  );
+
+  const applyCatalog = useCallback((payload: CatalogPayload) => {
+    setLocations(payload.locations);
+    setRows(payload.rows);
+    setExams(payload.exams);
+    setSelectionOrder(payload.selected);
+  }, []);
+
+  const pullCatalog = useCallback(async () => {
+    applyCatalog(await invoke<CatalogPayload>("scan_kit_read_catalog"));
+  }, [applyCatalog]);
+
+  const indexLocation = useCallback(
+    async (path: string): Promise<"ok" | "auth" | "error"> => {
+      try {
+        await loadFolder(path);
+        return "ok";
+      } catch (error: unknown) {
+        if (authenticationRequired(error)) {
+          setPassword("");
+          setPasswordFor(path);
+          return "auth";
+        }
+        notifyError(error);
+        return "error";
+      }
+    },
+    [loadFolder],
+  );
+
+  const openLocation = useCallback(
+    async (path: string) => {
+      beginCatalogLoad();
+      try {
+        const result = await indexLocation(path);
+        if (result !== "ok") {
+          return;
+        }
+        try {
+          await pullCatalog();
+          dismissNotice();
+          setUndo([]);
+          setRedo([]);
+          setLocationDraft("");
+        } catch (error: unknown) {
+          notifyError(error);
+        }
+      } finally {
+        endCatalogLoad();
+      }
+    },
+    [beginCatalogLoad, endCatalogLoad, indexLocation, pullCatalog],
+  );
+
+  const indexMany = useCallback(
+    async (roots: string[]) => {
+      beginCatalogLoad();
+      let stopped = -1;
+      try {
+        for (let index = 0; index < roots.length; index += 1) {
+          const root = roots[index];
+          if (root == null) {
+            continue;
+          }
+          const result = await indexLocation(root);
+          if (result === "auth") {
+            stopped = index;
+            break;
+          }
+        }
+        pendingLocations.current = stopped >= 0 ? roots.slice(stopped + 1) : [];
+        try {
+          await pullCatalog();
+          dismissNotice();
+          setUndo([]);
+          setRedo([]);
+        } catch (error: unknown) {
+          notifyError(error);
+        }
+      } finally {
+        endCatalogLoad();
+      }
+    },
+    [beginCatalogLoad, endCatalogLoad, indexLocation, pullCatalog],
+  );
+
+  const refreshLocations = useCallback(async () => {
+    await indexMany(locations);
+  }, [indexMany, locations]);
+
+  const removeLocation = useCallback(
+    async (path: string) => {
+      try {
+        applyCatalog(await invoke<CatalogPayload>("scan_kit_forget_data_dir", { path }));
+      } catch (error: unknown) {
+        notifyError(error);
+      }
+    },
+    [applyCatalog],
+  );
 
   useEffect(() => {
     installDebugLog();
@@ -284,15 +485,21 @@ export default function App() {
           logError(error);
         }
       });
-    invoke<string | null>("scan_kit_last_data_dir")
-      .then((path) => {
-        if (active && path) {
-          return loadFolder(path);
+    invoke<string[]>("scan_kit_data_dirs")
+      .then(async (roots) => {
+        if (!active) {
+          return;
         }
-        return undefined;
+        setLocations(roots);
+        setLocationsKnown(true);
+        if (roots.length === 0) {
+          return;
+        }
+        await indexMany(roots);
       })
       .catch((error: unknown) => {
         if (active) {
+          setLocationsKnown(true);
           notifyError(error);
         }
       });
@@ -301,7 +508,7 @@ export default function App() {
       libraryToken.current = {};
       cancelAnimationFrame(frame);
     };
-  }, [loadFolder]);
+  }, [indexMany]);
 
   useEffect(() => {
     const node = host.current;
@@ -400,6 +607,88 @@ export default function App() {
     });
   }, []);
 
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (event.defaultPrevented || layerOpen(event.target)) {
+        return;
+      }
+      const key = event.key.toLowerCase();
+      const ctrl = event.ctrlKey;
+      const typing = typingTarget(event.target);
+      if (event.key === "Escape") {
+        if (event.repeat || typing) {
+          return;
+        }
+        event.preventDefault();
+        void getCurrentWindow()
+          .close()
+          .catch((error: unknown) => notifyError(error));
+        return;
+      }
+      if (key === "f5") {
+        if (event.repeat || typing) {
+          return;
+        }
+        event.preventDefault();
+        if (folder != null) {
+          void openLocation(folder);
+        }
+        return;
+      }
+      if (!ctrl || typing) {
+        return;
+      }
+      if (key === "o") {
+        if (event.repeat) {
+          return;
+        }
+        event.preventDefault();
+        void chooseFolder();
+        return;
+      }
+      if (key === "q") {
+        if (event.repeat) {
+          return;
+        }
+        event.preventDefault();
+        void getCurrentWindow()
+          .close()
+          .catch((error: unknown) => notifyError(error));
+        return;
+      }
+      if (key === "1" && !event.shiftKey) {
+        if (!event.repeat) {
+          selectTab("Data Analysis");
+        }
+        event.preventDefault();
+        return;
+      }
+      if (key === "6") {
+        if (!event.repeat) {
+          selectTab("Debug");
+        }
+        event.preventDefault();
+        return;
+      }
+      if (key === "z" && event.shiftKey) {
+        redoNote();
+        event.preventDefault();
+        return;
+      }
+      if (key === "y") {
+        redoNote();
+        event.preventDefault();
+        return;
+      }
+      if (key === "z") {
+        undoNote();
+        event.preventDefault();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  });
+
   const openAnalysis = useCallback(
     (name: string) => {
       const id = analysisId(name);
@@ -413,7 +702,7 @@ export default function App() {
   );
 
   const commitSelection = useCallback((next: { ids: string[]; capped: boolean }) => {
-    if (folder == null) {
+    if (locations.length === 0) {
       return;
     }
     const same =
@@ -425,19 +714,27 @@ export default function App() {
       }
       return;
     }
-    void invoke("scan_kit_select_sessions", { path: folder, sessionIds: next.ids })
-      .then(() => {
-        const chosen = new Set(next.ids);
-        setSelectionOrder(next.ids);
-        setRows((items) => items.map((item) => ({ ...item, selected: chosen.has(item.session_id) })));
-        if (next.capped) {
-          notify("At most five sessions can be selected.", "selection");
-        } else {
-          dismissNotice("selection");
-        }
-      })
-      .catch((error: unknown) => notifyError(error));
-  }, [folder, selectionOrder]);
+    void (async () => {
+      for (const root of locations) {
+        const sessionIds = next.ids.flatMap((id) => {
+          const row = rows.find((item) => item.session_id === id);
+          if ((row?.library ?? locations[0]) !== root) {
+            return [];
+          }
+          return [row?.folder_id ?? id];
+        });
+        await invoke("scan_kit_select_sessions", { path: root, sessionIds });
+      }
+      const chosen = new Set(next.ids);
+      setSelectionOrder(next.ids);
+      setRows((items) => items.map((item) => ({ ...item, selected: chosen.has(item.session_id) })));
+      if (next.capped) {
+        notify("At most five sessions can be selected.", "selection");
+      } else {
+        dismissNotice("selection");
+      }
+    })().catch((error: unknown) => notifyError(error));
+  }, [locations, rows, selectionOrder]);
 
   const onRowCheck = useCallback(
     (sessionId: string, checked: boolean) => {
@@ -458,14 +755,16 @@ export default function App() {
   }, [commitSelection, displayIds, rows.length, selectedIds]);
 
   const writeNote = useCallback(async (sessionId: string, note: string) => {
-    if (folder == null) {
+    const row = rows.find((item) => item.session_id === sessionId);
+    const path = row?.library ?? locations[0];
+    if (path == null) {
       return;
     }
-    await invoke("scan_kit_set_note", { path: folder, sessionId, note });
+    await invoke("scan_kit_set_note", { path, sessionId: row?.folder_id ?? sessionId, note });
     setRows((current) =>
-      current.map((row) => (row.session_id === sessionId ? { ...row, note } : row)),
+      current.map((item) => (item.session_id === sessionId ? { ...item, note } : item)),
     );
-  }, [folder]);
+  }, [locations, rows]);
 
   const commitNote = useCallback(
     (edit: NoteEdit) => {
@@ -496,7 +795,7 @@ export default function App() {
         title: "Open Data Folder",
       });
       if (typeof selected === "string") {
-        await loadFolder(selected);
+        await openLocation(selected);
       }
     } catch (error) {
       notifyError(error);
@@ -505,6 +804,40 @@ export default function App() {
 
   async function applyNote(edit: NoteEdit, note: string) {
     await writeNote(edit.sessionId, note);
+  }
+
+  function undoNote() {
+    const edit = undo[undo.length - 1];
+    if (edit == null || noteBusy.current) {
+      return;
+    }
+    noteBusy.current = true;
+    void applyNote(edit, edit.before)
+      .then(() => {
+        setUndo((stack) => stack.slice(0, -1));
+        setRedo((stack) => [...stack, edit]);
+      })
+      .catch((error: unknown) => notifyError(error))
+      .finally(() => {
+        noteBusy.current = false;
+      });
+  }
+
+  function redoNote() {
+    const edit = redo[redo.length - 1];
+    if (edit == null || noteBusy.current) {
+      return;
+    }
+    noteBusy.current = true;
+    void applyNote(edit, edit.after)
+      .then(() => {
+        setRedo((stack) => stack.slice(0, -1));
+        setUndo((stack) => [...stack, edit]);
+      })
+      .catch((error: unknown) => notifyError(error))
+      .finally(() => {
+        noteBusy.current = false;
+      });
   }
 
   return (
@@ -529,18 +862,20 @@ export default function App() {
             <MenubarItem className="whitespace-nowrap" onClick={() => void chooseFolder()}>
               <FolderOpen />
               Open Data Folder
+              <MenubarShortcut>Ctrl+O</MenubarShortcut>
             </MenubarItem>
             <MenubarItem
               className="whitespace-nowrap"
               disabled={folder == null}
               onClick={() => {
                 if (folder != null) {
-                  void loadFolder(folder).catch((error: unknown) => notifyError(error));
+                  void openLocation(folder);
                 }
               }}
             >
               <RefreshCw />
               Refresh Sessions
+              <MenubarShortcut>F5</MenubarShortcut>
             </MenubarItem>
             <MenubarSeparator />
             <MenubarItem
@@ -553,6 +888,7 @@ export default function App() {
             >
               <LogOut />
               Exit
+              <MenubarShortcut>Ctrl+Q</MenubarShortcut>
             </MenubarItem>
           </MenubarContent>
         </MenubarMenu>
@@ -562,41 +898,15 @@ export default function App() {
             Edit
           </MenubarTrigger>
           <MenubarContent className="w-max">
-            <MenubarItem
-              disabled={undo.length === 0}
-              onClick={() => {
-                const edit = undo[undo.length - 1];
-                if (edit == null) {
-                  return;
-                }
-                void applyNote(edit, edit.before)
-                  .then(() => {
-                    setUndo((stack) => stack.slice(0, -1));
-                    setRedo((stack) => [...stack, edit]);
-                  })
-                  .catch((error: unknown) => notifyError(error));
-              }}
-            >
+            <MenubarItem disabled={undo.length === 0} onClick={undoNote}>
               <Undo2 />
               Undo
+              <MenubarShortcut>Ctrl+Z</MenubarShortcut>
             </MenubarItem>
-            <MenubarItem
-              disabled={redo.length === 0}
-              onClick={() => {
-                const edit = redo[redo.length - 1];
-                if (edit == null) {
-                  return;
-                }
-                void applyNote(edit, edit.after)
-                  .then(() => {
-                    setRedo((stack) => stack.slice(0, -1));
-                    setUndo((stack) => [...stack, edit]);
-                  })
-                  .catch((error: unknown) => notifyError(error));
-              }}
-            >
+            <MenubarItem disabled={redo.length === 0} onClick={redoNote}>
               <Redo2 />
               Redo
+              <MenubarShortcut>Ctrl+Y</MenubarShortcut>
             </MenubarItem>
           </MenubarContent>
         </MenubarMenu>
@@ -619,6 +929,8 @@ export default function App() {
               >
                 <TabIcon name={name} />
                 {name}
+                {name === "Data Analysis" ? <MenubarShortcut>Ctrl+1</MenubarShortcut> : null}
+                {name === "Debug" ? <MenubarShortcut>Ctrl+6</MenubarShortcut> : null}
               </MenubarCheckboxItem>
             ))}
           </MenubarContent>
@@ -675,28 +987,45 @@ export default function App() {
             <Button
               variant="outline"
               size="sm"
-              disabled={folder == null}
+              disabled={locations.length === 0}
               onClick={() => {
-                if (folder != null) {
-                  void loadFolder(folder).catch((error: unknown) => notifyError(error));
-                }
+                void refreshLocations();
               }}
             >
               <RefreshCw />
               Refresh
             </Button>
+            <Button variant="outline" size="sm" onClick={() => setLocationsOpen(true)}>
+              <FolderOpen />
+              Locations
+            </Button>
+            <ButtonSegmentGroup
+              label="Catalog"
+              className="w-fit shrink-0"
+              options={["Sessions", "Exams"]}
+              value={catalog}
+              onChange={(value) => {
+                if (value === "Sessions" || value === "Exams") {
+                  setCatalog(value);
+                }
+              }}
+            />
             <div className="ml-auto flex items-center gap-2">
-              {PRIMARY_ANALYSES.map((name) => (
-                <Button key={name} size="sm" disabled={!canAnalyze} onClick={() => openAnalysis(name)}>
-                  <AnalysisIcon name={name} />
-                  {name}
-                </Button>
-              ))}
-              <AnalysisMenu
-                disabled={!canAnalyze}
-                omit={PRIMARY_ANALYSES}
-                onOpen={openAnalysis}
-              />
+              {catalog === "Sessions"
+                ? PRIMARY_ANALYSES.map((name) => (
+                    <Button key={name} size="sm" disabled={!canAnalyze} onClick={() => openAnalysis(name)}>
+                      <AnalysisIcon name={name} />
+                      {name}
+                    </Button>
+                  ))
+                : null}
+              {catalog === "Sessions" ? (
+                <AnalysisMenu
+                  disabled={!canAnalyze}
+                  omit={PRIMARY_ANALYSES}
+                  onOpen={openAnalysis}
+                />
+              ) : null}
             </div>
           </div>
           <div
@@ -704,7 +1033,7 @@ export default function App() {
             className="relative min-h-0 flex-1 overflow-hidden"
             onContextMenu={(event) => event.preventDefault()}
           >
-            {theme != null && size.width > 0 && size.height > 0 ? (
+            {!catalogWaiting && emptyMessage == null && theme != null && size.width > 0 && size.height > 0 && catalog === "Sessions" ? (
               <LibraryTable
                 rows={rows}
                 order={order}
@@ -725,14 +1054,18 @@ export default function App() {
                 onOpenMenu={setSessionMenu}
               />
             ) : null}
-            {rows.length === 0 ? (
-              <p className="text-muted-foreground pointer-events-none absolute inset-x-0 top-12 text-center text-sm">
-                {folder == null
-                  ? "Open a data folder to list sessions."
-                  : "No sessions in this folder."}
-              </p>
+            {!catalogWaiting && emptyMessage == null && theme != null && size.width > 0 && size.height > 0 && catalog === "Exams" ? (
+              <ExamTable rows={exams} theme={theme} width={size.width} height={size.height} />
             ) : null}
-            {sessionMenu != null ? (
+            {catalogWaiting ? <CatalogPending name={catalog} /> : null}
+            {emptyMessage != null ? (
+              <CatalogEmpty
+                name={catalog}
+                message={emptyMessage}
+                onLocations={() => setLocationsOpen(true)}
+              />
+            ) : null}
+            {catalog === "Sessions" && sessionMenu != null ? (
               <SessionContextMenu
                 sessionId={sessionMenu.sessionId}
                 x={sessionMenu.x}
@@ -836,6 +1169,119 @@ export default function App() {
               </p>
             </div>
           ) : null}
+        </DialogContent>
+      </Dialog>
+      <Dialog open={locationsOpen} onOpenChange={setLocationsOpen}>
+        <DialogContent className="sm:max-w-3xl">
+          <DialogHeader>
+            <DialogTitle>Locations</DialogTitle>
+            <DialogDescription>
+              Sessions and exams from every location are listed together.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="flex max-h-60 flex-col gap-2 overflow-auto">
+            {locations.length === 0 ? (
+              <p className="text-muted-foreground text-sm">No saved locations.</p>
+            ) : (
+              locations.map((root) => (
+                <div key={root} className="flex items-center gap-2">
+                  <span className="min-w-0 flex-1 truncate text-sm" title={root}>
+                    {root}
+                  </span>
+                  <Button variant="outline" size="sm" onClick={() => void removeLocation(root)}>
+                    <Trash2 />
+                    Remove
+                  </Button>
+                </div>
+              ))
+            )}
+          </div>
+          <form
+            className="flex items-center gap-2"
+            onSubmit={(event) => {
+              event.preventDefault();
+              const spec = locationDraft.trim();
+              if (spec.length > 0) {
+                void openLocation(spec);
+              }
+            }}
+          >
+            <Input
+              value={locationDraft}
+              placeholder="Folder, UNC, or sftp://user@host/path"
+              aria-label="Folder, UNC, or sftp://user@host/path"
+              onChange={(event) => setLocationDraft(event.target.value)}
+            />
+            <Button type="submit">
+              <Plus />
+              Add
+            </Button>
+          </form>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => void chooseFolder()}>
+              <FolderOpen />
+              Folder
+            </Button>
+            <DialogClose render={<Button variant="outline" />}>
+              <X />
+              Close
+            </DialogClose>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+      <Dialog
+        open={passwordFor != null}
+        onOpenChange={(open) => {
+          if (!open) {
+            setPasswordFor(null);
+            setPassword("");
+          }
+        }}
+      >
+        <DialogContent>
+          <form
+            className="grid gap-4"
+            onSubmit={(event) => {
+              event.preventDefault();
+              if (passwordFor == null) {
+                return;
+              }
+              const spec = passwordFor;
+              void invoke("scan_kit_remember_password", { path: spec, password })
+                .then(() => {
+                  setPassword("");
+                  setPasswordFor(null);
+                  const rest = pendingLocations.current;
+                  pendingLocations.current = [];
+                  return indexMany([spec, ...rest]);
+                })
+                .catch((error: unknown) => notifyError(error));
+            }}
+          >
+            <DialogHeader>
+              <DialogTitle>Password</DialogTitle>
+              <DialogDescription>
+                {passwordFor} needs a password. It stays in memory for this session.
+              </DialogDescription>
+            </DialogHeader>
+            <Input
+              type="password"
+              autoComplete="off"
+              aria-label="Password"
+              value={password}
+              onChange={(event) => setPassword(event.target.value)}
+            />
+            <DialogFooter>
+              <DialogClose render={<Button variant="outline" />}>
+                <X />
+                Cancel
+              </DialogClose>
+              <Button type="submit">
+                <FolderOpen />
+                Open
+              </Button>
+            </DialogFooter>
+          </form>
         </DialogContent>
       </Dialog>
       <Toaster />

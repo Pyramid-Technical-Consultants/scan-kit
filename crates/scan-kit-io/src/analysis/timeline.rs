@@ -1,229 +1,327 @@
 use std::path::Path;
 
 use scan_kit_core::{
-    arc_fit, arc_predict, beam_angle_mrad, beam_off_edges, beam_on_mask, density_counts, fit_decay,
-    hv_capacitance_pf, hv_delta_v, hv_expected_pf, hv_firmware_flags, hv_step_window, linear_fit,
-    settled_after_step, Panel, PlotScene, Series,
+    hv_capacitance_pf, hv_delta_v, hv_expected_pf, hv_firmware_flags, hv_step_window,
+    robust_limits, row_mask, scrub_control, scrub_limits, segments_control, segments_from,
+    time_end, time_window, welch_psd, BeamGate, Panel, PlotScene, Rank, Segment, Series,
 };
 use serde_json::Value;
 
 use super::{
-    col, drew_line, finite_col, finite_names, load_csv, panel, percentile_sorted, placed, scene,
-    session_text, span, spot_table, stroke, timeline, timeslice_metric, MARK,
+    col, control, drew_line, flag, load_csv, panel, placed, scene, session_text, span, stroke, MARK,
 };
 
 /// Timeslice rows are 1 ms apart.
 const SAMPLE_S: f32 = 0.001;
 
-pub(super) fn replay(root: &Path, session_ids: &[String], options: &Value) -> PlotScene {
-    let tables = timeline(root, session_ids);
-    let owned = finite_names(session_ids, &tables);
+pub(super) fn timeline(root: &Path, session_ids: &[String], options: &Value) -> PlotScene {
+    let options = default_metric(options);
+    let owned: Vec<(String, Vec<String>)> = session_ids
+        .iter()
+        .map(|id| (id.clone(), crate::tables::grain_columns(root, id, true)))
+        .collect();
     let headers: Vec<crate::source::SessionCols<'_>> = owned
         .iter()
         .map(|(name, columns)| crate::source::SessionCols { name, columns })
         .collect();
-    let picked = crate::source::select(crate::source::Shape::Y, false, true, &headers, options);
-    let channel = picked.y.clone();
-    let label = crate::source::channel_text(&channel);
-    let mut series = Vec::new();
-    let mut xmax = SAMPLE_S;
-    let mut ymin = f32::MAX;
-    let mut ymax = f32::MIN;
-    for columns in &tables {
-        let Some(samples) = columns.get(&channel) else {
-            continue;
-        };
-        if samples.is_empty() {
-            continue;
-        }
-        xmax = xmax.max(samples.len().saturating_sub(1) as f32 * SAMPLE_S);
-        if let Some((lo, hi)) = robust_span(samples) {
-            ymin = ymin.min(lo);
-            ymax = ymax.max(hi);
-        }
-        let (xs, ys) = trace(samples);
-        series.push(stroke(xs, ys, false));
-    }
+    let picked =
+        crate::source::select(crate::source::Shape::YAndX, false, true, &headers, &options);
+    let (quantity, channels) = crate::bins::channels_for(&picked.y);
+    let grain = replay_grain(&picked.y, picked.frame);
+    let keys: Vec<&str> = channels.iter().map(|series| series.key).collect();
+    let tables = crate::tables::map_sessions(session_ids, |session| {
+        crate::tables::session_columns(root, session, grain, &keys)
+    });
+    let segments = segments_from(
+        &options,
+        &[
+            Segment::Beam {
+                state: BeamGate::Both,
+            },
+            Segment::Rank { which: Rank::All },
+        ],
+    );
+    // Time traces keep every beam-gated sample. Playback slides a camera across
+    // them and draws the playhead slice. Scatter, contour, and density keep
+    // those samples too. Scatter draws a slice of the point buffer. Contour and
+    // density rebin that same slice. Confidence, coverage, and the spectrum
+    // still use the playhead, and catch up once it settles.
+    let trace_segments: Vec<Segment> = segments
+        .iter()
+        .filter(|item| !matches!(item, Segment::Range { column, .. } if column == "time_s"))
+        .cloned()
+        .collect();
+    let window = scrub_limits(&options);
+    let end = time_end(
+        tables
+            .iter()
+            .filter_map(|table| table.get("time_s").map(Vec::as_slice)),
+    );
+    let masks: Vec<Vec<bool>> = tables
+        .iter()
+        .map(|table| row_mask(table, &trace_segments, &keys))
+        .collect();
+    let show_fft = flag(&options, "fft", false);
+    let fft_masks: Vec<Vec<bool>> = if show_fft {
+        tables
+            .iter()
+            .map(|table| row_mask(table, &segments, &keys))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let mut x_lo = f32::MAX;
+    let mut x_hi = f32::MIN;
     let mut panels = Vec::new();
-    if drew_line(&series) {
+    for series in channels {
+        if !flag(&options, &channel_id(series.key), true) {
+            continue;
+        }
+        let mut drawn = Vec::new();
+        let mut ymin = f32::MAX;
+        let mut ymax = f32::MIN;
+        for (table, keep) in tables.iter().zip(&masks) {
+            let Some(samples) = table.get(series.key) else {
+                continue;
+            };
+            let samples = gated(samples, keep);
+            if let Some((lo, hi)) = robust_span(&axis_samples(&samples, window)) {
+                ymin = ymin.min(lo);
+                ymax = ymax.max(hi);
+            }
+            if let Some((lo, hi)) = finite_window(&samples, window) {
+                x_lo = x_lo.min(lo);
+                x_hi = x_hi.max(hi);
+            }
+            let (xs, ys) = trace(&samples);
+            drawn.push(stroke(xs, ys, false));
+        }
+        if !drew_line(&drawn) {
+            continue;
+        }
         if ymin > ymax {
             ymin = 0.0;
             ymax = 1.0;
         }
-        panels.push(time_panel(&label, series, xmax, ymin, ymax, &label));
+        panels.push(time_panel(
+            drawn,
+            ymin,
+            ymax,
+            &crate::bins::axis_label(series.label, quantity),
+        ));
+        if show_fft {
+            let columns: Vec<Vec<f32>> = tables
+                .iter()
+                .zip(&fft_masks)
+                .filter_map(|(table, keep)| {
+                    table.get(series.key).map(|samples| gated(samples, keep))
+                })
+                .collect();
+            panels.push(spectrum_panel(&columns));
+        }
     }
-    let mut scene = scene("Timeslice Replay", panels, picked.controls);
-    scene.columns = 1;
+    let time_count = if show_fft {
+        panels.len() / 2
+    } else {
+        panels.len()
+    };
+    fit_time_axis(&mut panels, x_lo, x_hi, show_fft);
+    let layers = crate::tables::timeline_layers(root, session_ids, true);
+    let show_scatter = flag(&options, "scatter", false);
+    if show_scatter {
+        let query = scatter_query(&options);
+        let scatter_owned: Vec<(String, Vec<String>)> = session_ids
+            .iter()
+            .map(|id| (id.clone(), crate::tables::grain_columns(root, id, true)))
+            .collect();
+        let scatter_headers: Vec<crate::source::SessionCols<'_>> = scatter_owned
+            .iter()
+            .map(|(name, columns)| crate::source::SessionCols { name, columns })
+            .collect();
+        let scatter = crate::source::select(
+            crate::source::Shape::Xy,
+            false,
+            true,
+            &scatter_headers,
+            &query,
+        );
+        let windowed = super::distribution::scatter_uses_playhead_window(scatter.xy, &options);
+        let filter = if windowed { &segments } else { &trace_segments };
+        let (side, side_controls) = super::distribution::scatter_panels(
+            root,
+            session_ids,
+            scatter.xy,
+            scatter.grain,
+            filter,
+            &options,
+            !windowed,
+        );
+        panels.extend(side);
+        let mut controls = time_controls(
+            &picked.controls,
+            channels,
+            &options,
+            &segments,
+            end,
+            &layers,
+        );
+        controls.push(scatter_toggle(true));
+        controls.extend(scatter.controls.into_iter().map(scatter_control));
+        controls.extend(side_controls);
+        return finish(panels, controls, time_count, show_fft);
+    }
+    let mut controls = time_controls(
+        &picked.controls,
+        channels,
+        &options,
+        &segments,
+        end,
+        &layers,
+    );
+    controls.push(scatter_toggle(false));
+    finish(panels, controls, time_count, show_fft)
+}
+
+fn finish(
+    panels: Vec<Panel>,
+    controls: Vec<scan_kit_core::Control>,
+    time_count: usize,
+    fft: bool,
+) -> PlotScene {
+    let rows = if fft {
+        time_count.saturating_mul(2)
+    } else {
+        time_count
+    };
+    let side = panels.len().saturating_sub(rows);
+    let mut scene = scene("Timeline", panels, controls);
+    if fft && time_count > 0 && side > 0 {
+        scene.columns = 2;
+        scene.column_weights = vec![3.0, 1.4, 1.4];
+        scene.side = side as u32;
+    } else if fft && time_count > 0 {
+        scene.columns = 2;
+        scene.column_weights = vec![3.0, 1.4];
+    } else if side > 0 && time_count > 0 {
+        scene.columns = 2;
+        scene.column_weights = vec![3.0, 1.4];
+        scene.side = side as u32;
+    } else {
+        scene.columns = 1;
+    }
     scene
 }
 
-pub(super) fn rampdown(root: &Path, session_ids: &[String]) -> PlotScene {
-    let mut panels = Vec::new();
-    for (label, key) in [
-        ("IC1", "ic1_current"),
-        ("IC2", "ic2_current"),
-        ("IC3", "ic3_current"),
-    ] {
-        let tables = crate::tables::map_sessions(session_ids, |session| {
-            timeslice_metric(root, session, "ic_current")
-        });
-        let mut series = Vec::new();
-        let mut windows_panels = Vec::new();
-        for (session, table) in session_ids.iter().zip(tables) {
-            let Some(samples) = col(&table, key) else {
-                continue;
-            };
-            let mut edges = beam_off_edges(samples);
-            if edges.is_empty() {
-                let on = col(&table, "beam_on")
-                    .map(beam_on_mask)
-                    .unwrap_or_else(|| vec![true; samples.len()]);
-                if let Some(end) = on.iter().rposition(|flag| *flag) {
-                    edges.push(end);
-                }
-            }
-            let mut windows = Vec::new();
-            for edge in edges {
-                if let Some(window) = ramp_window(samples, edge) {
-                    windows.push(window);
-                }
-            }
-            if windows.is_empty() {
-                continue;
-            }
-            let width = windows.iter().map(Vec::len).max().unwrap_or(0);
-            let mut xs = Vec::new();
-            let mut ys = Vec::new();
-            let mut heat = vec![0.0f32; width * windows.len()];
-            for (row, window) in windows.iter().enumerate() {
-                if !xs.is_empty() {
-                    xs.push(f32::NAN);
-                    ys.push(f32::NAN);
-                }
-                for (i, value) in window.iter().enumerate() {
-                    xs.push(i as f32);
-                    ys.push(*value);
-                    heat[i + width * row] = *value;
-                }
-            }
-            series.push(stroke(xs, ys, false));
-            let time: Vec<f32> = (0..width).map(|i| i as f32).collect();
-            let mean = mean_window(&windows, width);
-            if let Some((amp, tau)) = fit_decay(&time, &mean) {
-                let fit: Vec<f32> = time.iter().map(|t| amp * (-t / tau).exp()).collect();
-                series.push(stroke(time, fit, true));
-            }
-            windows_panels.push(panel(
-                format!("{session} {label} Windows"),
-                0.0,
-                width as f32,
-                0.0,
-                windows.len() as f32,
-                vec![Series::heatmap(heat, width as u32, windows.len() as u32)],
-            ));
-        }
-        if drew_line(&series) {
-            panels.push(placed(label.into(), series));
-        }
-        panels.extend(windows_panels);
+fn time_controls(
+    source: &[scan_kit_core::Control],
+    channels: &[crate::bins::YSeries],
+    options: &Value,
+    segments: &[Segment],
+    end: f32,
+    layers: &[f32],
+) -> Vec<scan_kit_core::Control> {
+    let mut controls: Vec<_> = source
+        .iter()
+        .filter(|item| item.id != "x")
+        .cloned()
+        .collect();
+    for series in channels {
+        let on = flag(options, &channel_id(series.key), true);
+        controls.push(
+            control(
+                &channel_id(series.key),
+                series.label,
+                &["Off", "On"],
+                on_off(on),
+            )
+            .grouped("Data Source")
+            .checked(),
+        );
     }
-    scene("Beam-Off Ramp-Down", panels, Vec::new())
+    controls.push(segments_control(
+        segments,
+        &[("beam", "Beam"), ("rank", "Rank")],
+    ));
+    controls.push(fft_toggle(flag(options, "fft", false)));
+    controls.push(scrub_control(options, end, layers));
+    controls
 }
 
-pub(super) fn amplifier(root: &Path, session_ids: &[String]) -> PlotScene {
-    let mut panels = Vec::new();
-    for (title, cmd_key, read_key) in [
-        ("X", "amp_cmd_x", "amp_read_x"),
-        ("Y", "amp_cmd_y", "amp_read_y"),
-    ] {
-        let tables = crate::tables::map_sessions(session_ids, |session| {
-            timeslice_metric(root, session, "amplifier_error")
-        });
-        let spots = crate::tables::map_sessions(session_ids, |session| spot_table(root, session));
-        let mut series = Vec::new();
-        let mut arcs = Vec::new();
-        for ((session, table), spots) in session_ids.iter().zip(tables).zip(spots) {
-            let Some(cmd) = col(&table, cmd_key) else {
-                continue;
-            };
-            let Some(readback) = col(&table, read_key) else {
-                continue;
-            };
-            let n = cmd.len().min(readback.len()).min(2000);
-            if n == 0 {
-                continue;
-            }
-            let mask = settled_after_step(&cmd[..n], 3, 0.05);
-            let mut xs = Vec::new();
-            let mut ys = Vec::new();
-            for i in 0..n {
-                if mask[i] && cmd[i].is_finite() && readback[i].is_finite() {
-                    xs.push(cmd[i]);
-                    ys.push(readback[i]);
-                }
-            }
-            if xs.len() < 2 {
-                xs.clear();
-                ys.clear();
-                for i in 0..n {
-                    if cmd[i].is_finite() && readback[i].is_finite() {
-                        xs.push(cmd[i]);
-                        ys.push(readback[i]);
-                    }
-                }
-            }
-            if xs.len() < 2 {
-                continue;
-            }
-            let (xmin, xmax) = span(&xs);
-            series.push(Series::Points {
-                xs: xs.clone(),
-                ys: ys.clone(),
-                color: MARK,
-                radius: 1.5,
-            });
-            if let Some((slope, intercept)) = linear_fit(&xs, &ys) {
-                series.push(stroke(
-                    vec![xmin, xmax],
-                    vec![intercept + slope * xmin, intercept + slope * xmax],
-                    true,
-                ));
-            }
-            if let Some((counts, x0, x1, y0, y1)) = density_counts(&xs, &ys, 24) {
-                panels.push(panel(
-                    format!("{session} {title} Density"),
-                    x0,
-                    x1,
-                    y0,
-                    y1,
-                    vec![Series::heatmap(counts, 24, 24)],
-                ));
-            }
-            let ic1 = finite_col(&spots, "ic1_x");
-            let ic2 = finite_col(&spots, "ic2_x");
-            if let (Some(ic1), Some(ic2)) = (ic1, ic2) {
-                let n = ic1.len().min(ic2.len()).min(cmd.len());
-                let angle: Vec<f32> = (0..n).map(|i| beam_angle_mrad(ic1[i], ic2[i])).collect();
-                if let Some(fit) = arc_fit(&cmd[..n], &angle) {
-                    let mut curve_x = Vec::new();
-                    let mut curve_y = Vec::new();
-                    for step in 0..40 {
-                        let field = xmin + (xmax - xmin) * step as f32 / 39.0;
-                        curve_x.push(field);
-                        curve_y.push(arc_predict(fit, field));
-                    }
-                    arcs.push(stroke(curve_x, curve_y, false));
-                }
-            }
-        }
-        if !series.is_empty() {
-            panels.insert(0, placed(title.into(), series));
-        }
-        if drew_line(&arcs) {
-            panels.push(placed(format!("{title} Arc"), arcs));
-        }
+fn fft_toggle(on: bool) -> scan_kit_core::Control {
+    control("fft", "FFT", &["Off", "On"], on_off(on))
+        .grouped("FFT")
+        .checked()
+}
+
+fn scatter_toggle(on: bool) -> scan_kit_core::Control {
+    control("scatter", "Distribution", &["Off", "On"], on_off(on))
+        .grouped("Distribution")
+        .checked()
+}
+
+fn scatter_control(mut control: scan_kit_core::Control) -> scan_kit_core::Control {
+    if control.id == "xy" {
+        control.id = "scatter_xy".to_string();
     }
-    scene("Amplifier Command Correlations", panels, Vec::new())
+    control.group = "Distribution".to_string();
+    control
+}
+
+fn scatter_query(options: &Value) -> Value {
+    let mut query = serde_json::Map::new();
+    if let Some(value) = options.get("scatter_xy") {
+        query.insert("xy".into(), value.clone());
+    }
+    Value::Object(query)
+}
+
+fn default_metric(options: &Value) -> Value {
+    let mut copy = options.clone();
+    let Some(object) = copy.as_object_mut() else {
+        return serde_json::json!({"y": "ic_current"});
+    };
+    let missing = object.get("y").and_then(Value::as_str).is_none()
+        && object.get("metric").and_then(Value::as_str).is_none();
+    if missing {
+        object.insert("y".into(), Value::String("ic_current".into()));
+    }
+    copy
+}
+
+fn replay_grain(metric: &str, frame: &str) -> crate::tables::Grain {
+    if metric == "current_ratio" {
+        crate::tables::Grain::Layer
+    } else if frame == "chamber" {
+        crate::tables::Grain::SampleChamber
+    } else {
+        crate::tables::Grain::Sample
+    }
+}
+
+fn channel_id(key: &str) -> String {
+    format!("ch_{key}")
+}
+
+fn on_off(on: bool) -> &'static str {
+    if on {
+        "On"
+    } else {
+        "Off"
+    }
+}
+
+fn gated(samples: &[f32], keep: &[bool]) -> Vec<f32> {
+    samples
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            if keep.get(index).copied().unwrap_or(true) {
+                *value
+            } else {
+                f32::NAN
+            }
+        })
+        .collect()
 }
 
 pub(super) fn hv_transient(root: &Path, session_ids: &[String]) -> PlotScene {
@@ -306,17 +404,107 @@ fn line_panel(title: String, xs: &[f32], ys: &[f32], color: [f32; 4]) -> Panel {
     )
 }
 
-fn time_panel(
-    title: &str,
-    series: Vec<Series>,
-    xmax: f32,
-    ymin: f32,
-    ymax: f32,
-    y_label: &str,
-) -> Panel {
-    let mut panel = panel(title.into(), 0.0, xmax, ymin, ymax, series);
+/// Welch spectrum of the samples this row draws, 1 Hz to 500 Hz.
+///
+/// ponytail: a beam-off gap is dropped, not written as a zero, so the frequency
+/// axis is the 1 ms clock of the kept samples. Zero-fill at that clock if a
+/// notch from the gate starts to matter.
+fn spectrum_panel(columns: &[Vec<f32>]) -> Panel {
+    let mut series = Vec::new();
+    for samples in columns {
+        let kept: Vec<f32> = samples
+            .iter()
+            .copied()
+            .filter(|value| value.is_finite())
+            .collect();
+        if kept.len() < 16 {
+            continue;
+        }
+        let (freqs, psd) = welch_psd(&kept, 1.0 / SAMPLE_S, 4096, 0.5);
+        let mut xs = Vec::new();
+        let mut ys = Vec::new();
+        for (freq, power) in freqs.iter().zip(&psd) {
+            if (1.0..=500.0).contains(freq) {
+                xs.push(*freq);
+                ys.push(if power.is_finite() && *power > 0.0 {
+                    power.log10()
+                } else {
+                    f32::NAN
+                });
+            }
+        }
+        if ys.iter().any(|value| value.is_finite()) {
+            series.push(stroke(xs, ys, false));
+        }
+    }
+    let mut panel = if series.is_empty() {
+        panel(String::new(), 1.0, 500.0, 0.0, 1.0, series)
+    } else {
+        let mut panel = placed(String::new(), series);
+        panel.xmin = 1.0;
+        panel.xmax = 500.0;
+        panel
+    };
+    panel.x_label = "Hz".into();
+    panel.y_label = "log10 PSD".into();
+    panel
+}
+
+fn time_panel(series: Vec<Series>, ymin: f32, ymax: f32, y_label: &str) -> Panel {
+    let mut panel = panel(String::new(), 0.0, 1.0, ymin, ymax, series);
+    // `panel` turns a tiny span into +1. A flat trace should stay near its value.
+    panel.ymin = ymin;
+    panel.ymax = if ymax > ymin { ymax } else { ymin + 1.0e-6 };
     panel.y_label = y_label.to_owned();
     panel
+}
+
+/// Shared time window of the finite samples, with a small margin.
+fn fit_time_axis(panels: &mut [Panel], x_lo: f32, x_hi: f32, fft: bool) {
+    if x_lo > x_hi {
+        return;
+    }
+    let (xmin, xmax) = time_window(x_lo, x_hi);
+    let step = if fft { 2 } else { 1 };
+    for item in panels.iter_mut().step_by(step) {
+        item.xmin = xmin;
+        item.xmax = xmax;
+    }
+}
+
+fn axis_samples(samples: &[f32], window: Option<(f32, f32)>) -> Vec<f32> {
+    samples
+        .iter()
+        .enumerate()
+        .filter_map(|(index, value)| {
+            if !value.is_finite() || !inside(index, window) {
+                return None;
+            }
+            Some(*value)
+        })
+        .collect()
+}
+
+fn finite_window(samples: &[f32], window: Option<(f32, f32)>) -> Option<(f32, f32)> {
+    let mut lo = f32::MAX;
+    let mut hi = f32::MIN;
+    for (index, value) in samples.iter().enumerate() {
+        if !value.is_finite() || !inside(index, window) {
+            continue;
+        }
+        let t = index as f32 * SAMPLE_S;
+        lo = lo.min(t);
+        hi = hi.max(t);
+    }
+    (lo <= hi).then_some((lo, hi))
+}
+
+fn inside(index: usize, window: Option<(f32, f32)>) -> bool {
+    let Some((lo, hi)) = window else {
+        return true;
+    };
+    let t = index as f32 * SAMPLE_S;
+    t >= lo && t <= hi
 }
 
 /// One point per sample. Time is the row index, so a gap stays where the file has one.
@@ -329,63 +517,10 @@ pub(super) fn trace(samples: &[f32]) -> (Vec<f32>, Vec<f32>) {
     )
 }
 
-/// 0.5% tails. One ADC spike was setting the axis and the trace sat on the frame.
+/// 0.5% tails, then a slim margin. One ADC spike must not set the axis, and a
+/// flat trace stays near its value instead of gaining an empty unit of range.
 pub(super) fn robust_span(samples: &[f32]) -> Option<(f32, f32)> {
-    let mut values: Vec<f32> = samples
-        .iter()
-        .copied()
-        .filter(|value| value.is_finite())
-        .collect();
-    if values.len() < 2 {
-        return None;
-    }
-    values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let lo = percentile_sorted(&values, 0.005);
-    let hi = percentile_sorted(&values, 0.995);
-    let pad = ((hi - lo) * 0.06).max(1.0e-4);
-    Some((lo - pad, hi + pad))
-}
-
-fn ramp_window(samples: &[f32], edge: usize) -> Option<Vec<f32>> {
-    let start = edge.saturating_sub(2);
-    let stop = (edge + 9).min(samples.len());
-    if stop <= start {
-        return None;
-    }
-    let window = &samples[start..stop];
-    let peak = window
-        .iter()
-        .copied()
-        .filter(|value| value.is_finite())
-        .fold(0.0f32, f32::max);
-    if peak < 1e-6 {
-        return None;
-    }
-    Some(
-        window
-            .iter()
-            .map(|value| if value.is_finite() { value / peak } else { 0.0 })
-            .collect(),
-    )
-}
-
-fn mean_window(windows: &[Vec<f32>], width: usize) -> Vec<f32> {
-    let mut mean = vec![0.0f32; width];
-    let mut count = vec![0.0f32; width];
-    for window in windows {
-        for (i, value) in window.iter().enumerate() {
-            if value.is_finite() {
-                mean[i] += value;
-                count[i] += 1.0;
-            }
-        }
-    }
-    for i in 0..width {
-        if count[i] > 0.0 {
-            mean[i] /= count[i];
-        }
-    }
-    mean
+    robust_limits(samples)
 }
 
 fn hv_config_text(root: &Path, session: &str, device: &str) -> Option<String> {

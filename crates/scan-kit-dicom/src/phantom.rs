@@ -1,7 +1,7 @@
 //! Synthetic water-box study: CT, RTSTRUCT, and one RT Ion beam.
 //!
 //! The Monte Carlo reference RTDOSE stays on the Python writer. This file is
-//! what Dose Volume loads.
+//! what Volumetric loads.
 
 use std::fs;
 use std::path::Path;

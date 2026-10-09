@@ -2,16 +2,17 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use scan_kit_core::{
-    coverage_percent, row_mask, segments_control, segments_from, BeamGate, Family, Panel,
-    PlotScene, Segment, Series, SESSION,
+    cloud_series, coverage_percent, percentile_nearest, row_mask, scrub_control, segments_control,
+    segments_from, time_end, BeamGate, CloudDraw, Family, Panel, PlotScene, Segment, Series,
+    SESSION,
 };
 use serde_json::Value;
 
 use crate::histogram::{bin_button, hist_bin_count, histogram_panel, BIN_CHOICES};
 
 use super::{
-    col, contour_bands, control, drew_line, finite_col, flag, guide, labeled, panel, pick, placed,
-    scene, slice_table, spot_table, stroke, text, timeslice_metric, MARK,
+    col, control, drew_line, finite_col, flag, guide, labeled, panel, pick, placed, scene,
+    slice_table, spot_table, stroke, text, timeslice_metric, MARK,
 };
 
 const DRAW_CHOICES: &[(&str, &str)] = &[
@@ -20,7 +21,6 @@ const DRAW_CHOICES: &[(&str, &str)] = &[
     ("density", "Density"),
 ];
 const CUTOFF_CHOICES: &[(&str, &str)] = &[("0", "0"), ("5", "5"), ("10", "10"), ("20", "20")];
-const DENSITY_BINS: usize = 80;
 
 pub(super) fn distribution(root: &Path, session_ids: &[String], options: &Value) -> PlotScene {
     let timeslice = crate::source::wants_timeslice(crate::source::Shape::Xy, options);
@@ -43,11 +43,7 @@ pub(super) fn distribution(root: &Path, session_ids: &[String], options: &Value)
     let segments = segments_from(
         options,
         &[Segment::Beam {
-            state: if grain == "timeslice" || matches!(mode, "amplifier" | "probe") {
-                BeamGate::On
-            } else {
-                BeamGate::Both
-            },
+            state: BeamGate::Both,
         }],
     );
     let draw = pick(options, "draw", "scatter", DRAW_CHOICES);
@@ -59,13 +55,21 @@ pub(super) fn distribution(root: &Path, session_ids: &[String], options: &Value)
     );
     let cutoff_id = pick(options, "cutoff", "5", CUTOFF_CHOICES);
     let cutoff = cutoff_id.parse::<f32>().unwrap_or(5.0);
-    let chambers = matches!(mode, "position" | "position_error" | "sigma");
-    let cloud = chambers || matches!(mode, "amplifier" | "probe");
+    let chambers = matches!(
+        mode,
+        "position" | "position_error" | "position_error_rel" | "sigma"
+    );
+    let cloud = chambers || matches!(mode, "amplifier" | "amplifier_voltage" | "probe");
     let show_ic1 = flag(options, "ic1", true);
     let show_ic2 = flag(options, "ic2", true);
     let show_plan = flag(options, "plan", true);
     let hist_raw = text(options, "hist_bins", "Auto");
     let bins = hist_bin_count(hist_raw);
+    let timeslice_clock = grain == "timeslice"
+        || matches!(
+            mode,
+            "amplifier" | "amplifier_voltage" | "probe" | "confidence" | "coverage"
+        );
     let (panels, columns, has_plan) = if mode == "confidence" {
         (
             confidence_scene(root, session_ids, &segments, draw, ramp, cutoff),
@@ -88,47 +92,28 @@ pub(super) fn distribution(root: &Path, session_ids: &[String], options: &Value)
             show_ic2,
             show_plan,
             bins,
+            true,
+            timeslice_clock,
         )
     };
     let mut controls = picked.controls;
     if chambers {
-        if mode == "position" && has_plan {
-            controls.push(
-                control("plan", "Plan", &["Off", "On"], on_off(show_plan))
-                    .grouped("Data Source")
-                    .checked(),
-            );
-        }
-        controls.push(
-            control("ic1", "IC1", &["Off", "On"], on_off(show_ic1))
-                .grouped("Data Source")
-                .checked(),
-        );
-        controls.push(
-            control("ic2", "IC2", &["Off", "On"], on_off(show_ic2))
-                .grouped("Data Source")
-                .checked(),
-        );
+        controls.extend(chamber_controls(
+            mode,
+            has_plan,
+            show_plan,
+            show_ic1,
+            show_ic2,
+            "Data Source",
+        ));
     }
     if mode != "coverage" {
-        controls.push(labeled("draw", "Style", DRAW_CHOICES, draw).grouped("Plot Style"));
-        if draw == "density" && session_ids.len() == 1 {
-            controls.push(
-                labeled(
-                    "ramp",
-                    "Ramp",
-                    scan_kit_core::choices(Family::Sequential),
-                    ramp,
-                )
-                .grouped("Plot Style"),
-            );
-        }
-        if draw == "contour" {
-            controls.push(
-                labeled("cutoff", "Contour Cutoff", CUTOFF_CHOICES, cutoff_id)
-                    .grouped("Plot Style"),
-            );
-        }
+        controls.extend(style_controls(
+            options,
+            session_ids.len(),
+            draw,
+            "Plot Style",
+        ));
     }
     if cloud {
         controls.push(
@@ -136,7 +121,12 @@ pub(super) fn distribution(root: &Path, session_ids: &[String], options: &Value)
         );
     }
     controls.push(segments_control(&segments, &[("beam", "Beam")]));
-    let mut scene = scene("Distribution Explorer", panels, controls);
+    controls.push(scrub_control(
+        options,
+        clock_end(root, session_ids, mode, grain),
+        &crate::tables::timeline_layers(root, session_ids, timeslice_clock),
+    ));
+    let mut scene = scene("Distribution", panels, controls);
     scene.columns = columns;
     if columns > 0 && scene.panels.len() == columns as usize * 3 {
         scene.row_weights = vec![2.0, 1.0, 1.0];
@@ -161,26 +151,36 @@ fn kept_pairs(
     x_key: &str,
     y_key: &str,
     segments: &[Segment],
-) -> (Vec<f32>, Vec<f32>) {
+    live: bool,
+) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
     let keep = row_mask(table, segments, &[x_key, y_key]);
-    masked_pairs(
-        table.get(x_key).map(Vec::as_slice).unwrap_or(&[]),
-        table.get(y_key).map(Vec::as_slice).unwrap_or(&[]),
-        &keep,
-    )
+    let xs = table.get(x_key).map(Vec::as_slice).unwrap_or(&[]);
+    let ys = table.get(y_key).map(Vec::as_slice).unwrap_or(&[]);
+    let clock = table.get("time_s").map(Vec::as_slice).unwrap_or(&[]);
+    let timed = live && !clock.is_empty();
+    let mut ox = Vec::new();
+    let mut oy = Vec::new();
+    let mut ot = Vec::new();
+    for (index, (x, y)) in xs.iter().zip(ys).enumerate() {
+        if !keep.get(index).copied().unwrap_or(true) || !x.is_finite() || !y.is_finite() {
+            continue;
+        }
+        if timed {
+            let time = clock.get(index).copied().unwrap_or(f32::NAN);
+            if !time.is_finite() {
+                continue;
+            }
+            ot.push(time);
+        }
+        ox.push(*x);
+        oy.push(*y);
+    }
+    (ox, oy, ot)
 }
 
-/// Same index `percentile_sorted` would pick, without sorting the whole cloud.
-fn percentile_at(values: &mut [f32], p: f32) -> f32 {
-    if values.is_empty() {
-        return 0.0;
-    }
-    let index = ((values.len() - 1) as f32 * p).round() as usize;
-    let index = index.min(values.len() - 1);
-    values.select_nth_unstable_by(index, |left, right| {
-        left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal)
-    });
-    values[index]
+/// Nearest-rank percentile without sorting the whole cloud.
+fn percentile_at(values: &mut [f32], portion: f32) -> f32 {
+    percentile_nearest(values, portion)
 }
 
 pub(super) fn distribution_limits(mode: &str, samples: &[f32]) -> (f32, f32) {
@@ -192,7 +192,7 @@ pub(super) fn distribution_limits(mode: &str, samples: &[f32]) -> (f32, f32) {
             .collect();
         let hi = percentile_at(&mut positive, 0.9995).max(1.0);
         (0.0, hi)
-    } else if mode == "position_error" {
+    } else if mode == "position_error" || mode == "position_error_rel" {
         let mut abs: Vec<f32> = samples
             .iter()
             .copied()
@@ -233,8 +233,9 @@ fn on_off(on: bool) -> &'static str {
 fn axis_name(column: &str, axis: &str, mode: &str) -> String {
     match mode {
         "amplifier" => format!("{axis} Error (V)"),
+        "amplifier_voltage" => format!("{column} {axis} (V)"),
         "probe" => format!("{axis} (G)"),
-        "position_error" => format!("{column} {axis} Error (mm)"),
+        "position_error" | "position_error_rel" => format!("{column} {axis} Error (mm)"),
         "sigma" => format!("{column} {axis} Sigma (mm)"),
         _ => format!("{column} {axis} (mm)"),
     }
@@ -243,7 +244,7 @@ fn axis_name(column: &str, axis: &str, mode: &str) -> String {
 fn limit_kind(mode: &str) -> &'static str {
     match mode {
         "sigma" => "sigma",
-        "position_error" | "amplifier" => "position_error",
+        "position_error" | "position_error_rel" | "amplifier" => "position_error",
         _ => "position",
     }
 }
@@ -256,6 +257,27 @@ fn grain_table(root: &Path, session: &str, grain: &str) -> super::super::tables:
     }
 }
 
+fn clock_end(root: &Path, session_ids: &[String], mode: &str, grain: &str) -> f32 {
+    let tables = if mode == "confidence" {
+        crate::tables::map_sessions(session_ids, |session| {
+            timeslice_metric(root, session, "peak_amplitude")
+        })
+    } else if mode == "coverage" {
+        crate::tables::map_sessions(session_ids, |session| {
+            timeslice_metric(root, session, "fit_confidence")
+        })
+    } else {
+        crate::tables::map_sessions(session_ids, |session| {
+            session_table(root, session, mode, grain)
+        })
+    };
+    time_end(
+        tables
+            .iter()
+            .filter_map(|table| table.get("time_s").map(Vec::as_slice)),
+    )
+}
+
 fn session_table(
     root: &Path,
     session: &str,
@@ -263,7 +285,7 @@ fn session_table(
     grain: &str,
 ) -> super::super::tables::Table {
     match mode {
-        "amplifier" => timeslice_metric(root, session, "amplifier_error"),
+        "amplifier" | "amplifier_voltage" => timeslice_metric(root, session, "amplifier_error"),
         "probe" => timeslice_metric(root, session, "probe_field"),
         _ => grain_table(root, session, grain),
     }
@@ -278,37 +300,21 @@ fn heat_ramp(sessions: usize, ramp: &str) -> u8 {
     }
 }
 
-fn density_map(values: Vec<f32>, ramp: u8) -> Series {
-    let bins = DENSITY_BINS as u32;
-    Series::Heatmap {
-        values,
-        cols: bins,
-        rows: bins,
-        ramp,
-        color: if scan_kit_core::is_session(ramp) {
-            MARK
-        } else {
-            [1.0, 1.0, 1.0, 1.0]
-        },
-        lo: 0.0,
-        hi: 0.0,
+fn heat_color(ramp: u8) -> [f32; 4] {
+    if scan_kit_core::is_session(ramp) {
+        MARK
+    } else {
+        [1.0, 1.0, 1.0, 1.0]
     }
 }
 
-fn density_grid(xs: &[f32], ys: &[f32], x0: f32, x1: f32, y0: f32, y1: f32) -> Vec<f32> {
-    let bins = DENSITY_BINS;
-    let mut counts = vec![0.0f32; bins * bins];
-    let dx = (x1 - x0).max(1e-6);
-    let dy = (y1 - y0).max(1e-6);
-    for (x, y) in xs.iter().zip(ys) {
-        if !x.is_finite() || !y.is_finite() || *x < x0 || *x > x1 || *y < y0 || *y > y1 {
-            continue;
-        }
-        let ix = (((x - x0) / dx) * bins as f32) as usize;
-        let iy = (((y - y0) / dy) * bins as f32) as usize;
-        counts[ix.min(bins - 1) + bins * iy.min(bins - 1)] += 1.0;
-    }
-    counts
+/// Beam filters stay. The playhead window does not, so a live cloud can slice it.
+fn without_playhead(segments: &[Segment]) -> Vec<Segment> {
+    segments
+        .iter()
+        .filter(|item| !matches!(item, Segment::Range { column, .. } if column == "time_s"))
+        .cloned()
+        .collect()
 }
 
 pub(super) fn reference_ring() -> Series {
@@ -341,7 +347,9 @@ fn padded_span(values: &[f32]) -> (f32, f32) {
 
 struct DrawnColumn {
     name: &'static str,
-    clouds: Vec<(Vec<f32>, Vec<f32>)>,
+    clouds: Vec<(Vec<f32>, Vec<f32>, Vec<f32>)>,
+    /// Marginal histograms of the playhead window. Empty uses `clouds`.
+    windowed: Vec<(Vec<f32>, Vec<f32>)>,
 }
 
 fn column_specs(
@@ -352,12 +360,22 @@ fn column_specs(
 ) -> Vec<(&'static str, &'static str, &'static str)> {
     let mut pairs = Vec::new();
     match mode {
-        "position_error" => {
+        "position_error" | "position_error_rel" => {
+            let (x1, y1, x2, y2) = if mode == "position_error_rel" {
+                (
+                    "ic1_x_err_rel",
+                    "ic1_y_err_rel",
+                    "ic2_x_err_rel",
+                    "ic2_y_err_rel",
+                )
+            } else {
+                ("ic1_x_err", "ic1_y_err", "ic2_x_err", "ic2_y_err")
+            };
             if ic1 {
-                pairs.push(("IC1", "ic1_x_err", "ic1_y_err"));
+                pairs.push(("IC1", x1, y1));
             }
             if ic2 {
-                pairs.push(("IC2", "ic2_x_err", "ic2_y_err"));
+                pairs.push(("IC2", x2, y2));
             }
         }
         "sigma" => {
@@ -369,6 +387,10 @@ fn column_specs(
             }
         }
         "amplifier" => pairs.push(("Amplifier", "amp_x", "amp_y")),
+        "amplifier_voltage" => {
+            pairs.push(("Command", "amp_cmd_x", "amp_cmd_y"));
+            pairs.push(("Readback", "amp_read_x", "amp_read_y"));
+        }
         "probe" => pairs.push(("Probe", "field_x", "field_y")),
         _ => {
             if plan {
@@ -385,6 +407,148 @@ fn column_specs(
     pairs
 }
 
+/// Timeline's side column is the distribution cloud: the same columns and
+/// scatter / contour / density style, without the marginal histograms.
+/// A live cloud keeps a time on each sample. Scatter draws a slice of that
+/// buffer. Contour and density rebin the same slice.
+pub(super) fn scatter_panels(
+    root: &Path,
+    session_ids: &[String],
+    mode: &str,
+    grain: &str,
+    segments: &[Segment],
+    options: &Value,
+    live: bool,
+) -> (Vec<Panel>, Vec<scan_kit_core::Control>) {
+    let draw = pick(options, "draw", "scatter", DRAW_CHOICES);
+    let ramp = pick(
+        options,
+        "ramp",
+        "turbo",
+        scan_kit_core::choices(Family::Sequential),
+    );
+    let cutoff = pick(options, "cutoff", "5", CUTOFF_CHOICES)
+        .parse::<f32>()
+        .unwrap_or(5.0);
+    let chambers = matches!(
+        mode,
+        "position" | "position_error" | "position_error_rel" | "sigma"
+    );
+    let show_ic1 = flag(options, "ic1", true);
+    let show_ic2 = flag(options, "ic2", true);
+    let show_plan = flag(options, "plan", true);
+    let mut controls = Vec::new();
+    let panels = if mode == "confidence" {
+        confidence_scene(root, session_ids, segments, draw, ramp, cutoff)
+    } else if mode == "coverage" {
+        coverage_scene(root, session_ids, segments)
+    } else {
+        let (panels, _, has_plan) = column_scene(
+            root,
+            session_ids,
+            mode,
+            grain,
+            segments,
+            draw,
+            ramp,
+            cutoff,
+            show_ic1,
+            show_ic2,
+            show_plan,
+            1,
+            false,
+            live,
+        );
+        if chambers {
+            controls.extend(chamber_controls(
+                mode,
+                has_plan,
+                show_plan,
+                show_ic1,
+                show_ic2,
+                "Distribution",
+            ));
+        }
+        panels
+    };
+    if mode != "coverage" {
+        controls.extend(style_controls(
+            options,
+            session_ids.len(),
+            draw,
+            "Distribution",
+        ));
+    }
+    (panels, controls)
+}
+
+/// Confidence and coverage are aggregates of the playhead window.
+/// Scatter, contour, and density carry the full timed cloud and follow in the plot.
+pub(super) fn scatter_uses_playhead_window(mode: &str, _options: &Value) -> bool {
+    matches!(mode, "confidence" | "coverage")
+}
+
+fn style_controls(
+    options: &Value,
+    sessions: usize,
+    draw: &str,
+    group: &str,
+) -> Vec<scan_kit_core::Control> {
+    let mut controls = vec![labeled("draw", "Style", DRAW_CHOICES, draw).grouped(group)];
+    if draw == "density" && sessions == 1 {
+        let ramp = pick(
+            options,
+            "ramp",
+            "turbo",
+            scan_kit_core::choices(Family::Sequential),
+        );
+        controls.push(
+            labeled(
+                "ramp",
+                "Ramp",
+                scan_kit_core::choices(Family::Sequential),
+                ramp,
+            )
+            .grouped(group),
+        );
+    }
+    if draw == "contour" {
+        let cutoff_id = pick(options, "cutoff", "5", CUTOFF_CHOICES);
+        controls
+            .push(labeled("cutoff", "Contour Cutoff", CUTOFF_CHOICES, cutoff_id).grouped(group));
+    }
+    controls
+}
+
+fn chamber_controls(
+    mode: &str,
+    has_plan: bool,
+    show_plan: bool,
+    show_ic1: bool,
+    show_ic2: bool,
+    group: &str,
+) -> Vec<scan_kit_core::Control> {
+    let mut controls = Vec::new();
+    if mode == "position" && has_plan {
+        controls.push(
+            control("plan", "Plan", &["Off", "On"], on_off(show_plan))
+                .grouped(group)
+                .checked(),
+        );
+    }
+    controls.push(
+        control("ic1", "IC1", &["Off", "On"], on_off(show_ic1))
+            .grouped(group)
+            .checked(),
+    );
+    controls.push(
+        control("ic2", "IC2", &["Off", "On"], on_off(show_ic2))
+            .grouped(group)
+            .checked(),
+    );
+    controls
+}
+
 fn column_scene(
     root: &Path,
     session_ids: &[String],
@@ -398,6 +562,8 @@ fn column_scene(
     ic2: bool,
     plan: bool,
     bins: usize,
+    histograms: bool,
+    live: bool,
 ) -> (Vec<Panel>, u32, bool) {
     let tables = crate::tables::map_sessions(session_ids, |session| {
         session_table(root, session, mode, grain)
@@ -406,17 +572,39 @@ fn column_scene(
         .iter()
         .any(|table| finite_col(table, "plan_x").is_some());
     let drawn_plan = mode == "position" && plan && has_plan;
+    let stripped = live.then(|| without_playhead(segments));
     let mut columns = Vec::new();
     for (name, x_key, y_key) in column_specs(mode, ic1, ic2, drawn_plan) {
         let mut clouds = Vec::new();
+        let mut windowed = Vec::new();
         for table in &tables {
-            let (xs, ys) = kept_pairs(table, x_key, y_key, segments);
-            if !xs.is_empty() {
-                clouds.push((xs, ys));
+            let (xs, ys, times) = if let Some(full) = stripped.as_deref() {
+                let timed = kept_pairs(table, x_key, y_key, full, true);
+                if timed.2.is_empty() {
+                    kept_pairs(table, x_key, y_key, segments, false)
+                } else {
+                    timed
+                }
+            } else {
+                kept_pairs(table, x_key, y_key, segments, false)
+            };
+            if xs.is_empty() {
+                continue;
             }
+            if histograms && !times.is_empty() {
+                let (hx, hy, _) = kept_pairs(table, x_key, y_key, segments, false);
+                if !hx.is_empty() {
+                    windowed.push((hx, hy));
+                }
+            }
+            clouds.push((xs, ys, times));
         }
         if !clouds.is_empty() {
-            columns.push(DrawnColumn { name, clouds });
+            columns.push(DrawnColumn {
+                name,
+                clouds,
+                windowed,
+            });
         }
     }
     if columns.is_empty() {
@@ -435,13 +623,13 @@ fn column_scene(
     }
     let mut samples = Vec::new();
     for column in &columns {
-        for (xs, ys) in &column.clouds {
+        for (xs, ys, _) in &column.clouds {
             samples.extend(xs.iter().copied());
             samples.extend(ys.iter().copied());
         }
     }
     let (lo, hi) = distribution_limits(limit_kind(mode), &samples);
-    let hist_guides: Vec<f32> = if mode == "position_error" {
+    let hist_guides: Vec<f32> = if mode == "position_error" || mode == "position_error_rel" {
         vec![0.0, 1.0, -1.0, 2.0, -2.0, 3.0, -3.0]
     } else {
         Vec::new()
@@ -450,67 +638,99 @@ fn column_scene(
     let mut x_hists = Vec::new();
     let mut y_hists = Vec::new();
     let ramp_id = heat_ramp(session_ids.len(), ramp);
+    let kind = match draw {
+        "density" => CloudDraw::Density {
+            ramp: ramp_id,
+            color: heat_color(ramp_id),
+            x0: lo,
+            x1: hi,
+            y0: lo,
+            y1: hi,
+        },
+        "contour" => CloudDraw::Contour { cutoff },
+        _ => CloudDraw::Scatter {
+            color: MARK,
+            radius: 2.0,
+        },
+    };
     for column in &columns {
         let mut series = Vec::new();
-        if matches!(mode, "position" | "position_error" | "amplifier" | "probe") {
+        if matches!(
+            mode,
+            "position"
+                | "position_error"
+                | "position_error_rel"
+                | "amplifier"
+                | "amplifier_voltage"
+                | "probe"
+        ) {
             series.push(guide(vec![lo, hi], vec![0.0, 0.0]));
             series.push(guide(vec![0.0, 0.0], vec![lo, hi]));
         }
-        if mode == "position_error" && column.name != "Plan" {
+        if (mode == "position_error" || mode == "position_error_rel") && column.name != "Plan" {
             series.push(reference_ring());
         }
         if mode == "sigma" {
             series.push(guide(vec![lo, hi], vec![lo, hi]));
         }
-        match draw {
-            "density" => {
-                for (xs, ys) in &column.clouds {
-                    series.push(density_map(density_grid(xs, ys, lo, hi, lo, hi), ramp_id));
-                }
-            }
-            "contour" => {
-                for (xs, ys) in &column.clouds {
-                    series.extend(contour_bands(xs, ys, cutoff));
-                }
-            }
-            _ => {
-                for (xs, ys) in &column.clouds {
-                    series.push(Series::Points {
-                        xs: xs.clone(),
-                        ys: ys.clone(),
-                        color: MARK,
-                        radius: 2.0,
-                    });
-                }
-            }
+        for (xs, ys, times) in &column.clouds {
+            series.extend(cloud_series(xs, ys, times, kind));
         }
         let mut top = panel(String::new(), lo, hi, lo, hi, series);
         top.equal = true;
         top.x_label = axis_name(column.name, "X", mode);
         top.y_label = axis_name(column.name, "Y", mode);
         tops.push(top);
-        let xs: Vec<&[f32]> = column.clouds.iter().map(|(xs, _)| xs.as_slice()).collect();
-        let ys: Vec<&[f32]> = column.clouds.iter().map(|(_, ys)| ys.as_slice()).collect();
-        x_hists.push(histogram_panel(
-            &axis_name(column.name, "X", mode),
-            &xs,
-            bins,
-            true,
-            Some((lo, hi)),
-            &hist_guides,
-        ));
-        y_hists.push(histogram_panel(
-            &axis_name(column.name, "Y", mode),
-            &ys,
-            bins,
-            true,
-            Some((lo, hi)),
-            &hist_guides,
-        ));
+        let xs: Vec<&[f32]> = if column.windowed.is_empty() {
+            column
+                .clouds
+                .iter()
+                .map(|(xs, _, _)| xs.as_slice())
+                .collect()
+        } else {
+            column
+                .windowed
+                .iter()
+                .map(|(xs, _)| xs.as_slice())
+                .collect()
+        };
+        let ys: Vec<&[f32]> = if column.windowed.is_empty() {
+            column
+                .clouds
+                .iter()
+                .map(|(_, ys, _)| ys.as_slice())
+                .collect()
+        } else {
+            column
+                .windowed
+                .iter()
+                .map(|(_, ys)| ys.as_slice())
+                .collect()
+        };
+        if histograms {
+            x_hists.push(histogram_panel(
+                &axis_name(column.name, "X", mode),
+                &xs,
+                bins,
+                true,
+                Some((lo, hi)),
+                &hist_guides,
+            ));
+            y_hists.push(histogram_panel(
+                &axis_name(column.name, "Y", mode),
+                &ys,
+                bins,
+                true,
+                Some((lo, hi)),
+                &hist_guides,
+            ));
+        }
     }
     let count = tops.len() as u32;
-    tops.extend(x_hists);
-    tops.extend(y_hists);
+    if histograms {
+        tops.extend(x_hists);
+        tops.extend(y_hists);
+    }
     (tops, count, has_plan)
 }
 
@@ -564,31 +784,40 @@ fn confidence_scene(
             }
             let (x0, x1) = padded_span(&all_x);
             let (y0, y1) = padded_span(&all_y);
-            let series = if draw == "density" {
-                let ramp_id = heat_ramp(session_ids.len(), ramp);
-                clouds
-                    .iter()
-                    .map(|(xs, ys)| density_map(density_grid(xs, ys, x0, x1, y0, y1), ramp_id))
-                    .collect()
-            } else {
-                let mut series = Vec::new();
-                for (xs, ys) in &clouds {
-                    series.extend(contour_bands(xs, ys, cutoff));
+            let ramp_id = heat_ramp(session_ids.len(), ramp);
+            let kind = if draw == "density" {
+                CloudDraw::Density {
+                    ramp: ramp_id,
+                    color: heat_color(ramp_id),
+                    x0,
+                    x1,
+                    y0,
+                    y1,
                 }
-                series
+            } else {
+                CloudDraw::Contour { cutoff }
             };
+            let series = clouds
+                .iter()
+                .flat_map(|(xs, ys)| cloud_series(xs, ys, &[], kind))
+                .collect::<Vec<_>>();
             if !series.is_empty() {
                 panels.push(panel(title.to_owned(), x0, x1, y0, y1, series));
             }
             continue;
         }
         let series = clouds
-            .into_iter()
-            .map(|(xs, ys)| Series::Points {
-                xs,
-                ys,
-                color: MARK,
-                radius: 2.0,
+            .iter()
+            .flat_map(|(xs, ys)| {
+                cloud_series(
+                    xs,
+                    ys,
+                    &[],
+                    CloudDraw::Scatter {
+                        color: MARK,
+                        radius: 2.0,
+                    },
+                )
             })
             .collect();
         panels.push(placed(title.to_owned(), series));

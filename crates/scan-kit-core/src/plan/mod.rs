@@ -15,9 +15,6 @@ pub use pld::parse_pld;
 use weight::spot_weights;
 
 pub const PREVIEW_CAP: usize = 5_000;
-/// ponytail: a larger request is refused so one call cannot allocate hundreds of megabytes.
-/// Raise this if a real template needs more spots.
-pub(super) const MAX_SPOTS: usize = 1_000_000;
 pub(super) const DEFAULT_CURRENT_A: f64 = 1e-9;
 pub(super) const DEFAULT_BEAM_SIZE_MM: f64 = 3.61;
 pub(super) const DELIVERY_MU_PER_S: f64 = 0.4;
@@ -224,12 +221,6 @@ pub fn build_plan(
         },
         _ => return Err("Unknown plan template.".into()),
     };
-    if rows.len() > MAX_SPOTS {
-        return Err(format!(
-            "The plan has {} spots, above the {MAX_SPOTS} spot limit.",
-            rows.len()
-        ));
-    }
     Ok(document(template, params, dicom_label, rows))
 }
 
@@ -980,7 +971,7 @@ fn spot_order_choices() -> Value {
 #[cfg(test)]
 mod tests {
     use super::field::grid_positions;
-    use super::weight::{even_total, layer_even, random_total};
+    use super::weight::{apply_remainder, even_total, layer_even, random_total, spot_weights};
     use super::*;
 
     fn params(value: Value) -> Value {
@@ -1134,6 +1125,79 @@ mod tests {
         let even = even_total(4, 1.0).unwrap();
         let random = random_total(4, 1.0, 0.0).unwrap();
         assert_eq!(even, random);
+    }
+
+    #[test]
+    fn shuffled_layers_and_a_random_total_stay_positive() {
+        let rows = vec![
+            Draft {
+                energy: 250.0,
+                layer: 3,
+                x: 0.0,
+                y: 0.0,
+            },
+            Draft {
+                energy: 250.0,
+                layer: 3,
+                x: 1.0,
+                y: 0.0,
+            },
+            Draft {
+                energy: 247.5,
+                layer: 4,
+                x: 0.0,
+                y: 0.0,
+            },
+        ];
+        let shuffled = layer_even(&rows, 0.01, 0.04, true);
+        let mut layer: Vec<f64> = shuffled.iter().take(2).copied().collect();
+        layer.sort_by(|left, right| left.partial_cmp(right).unwrap());
+        assert!((layer[0] - 0.01).abs() < 1e-9);
+        assert!((layer[1] - 0.04).abs() < 1e-9);
+        assert!((shuffled[2] - 0.01).abs() < 1e-9);
+        let random = random_total(5, 1.0, 10.0).unwrap();
+        let sum: f64 = random.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-6);
+        assert!(random.iter().all(|weight| *weight > 0.0));
+        assert!(even_total(0, 1.0).unwrap().is_empty());
+        assert!(random_total(0, 1.0, 10.0).unwrap().is_empty());
+        assert!(even_total(2, 0.0).is_err());
+        assert!(random_total(3, 0.0, 10.0).is_err());
+        // 0.0002 MU across 5 spots rounds to 0 except the remainder on the last spot.
+        assert!(even_total(5, 0.0002).is_err());
+        assert!(random_total(5, 0.0002, 0.0).is_err());
+        apply_remainder(&mut [], 1.0);
+        let mut exact = vec![0.5, 0.5];
+        apply_remainder(&mut exact, 1.0);
+        assert_eq!(exact, vec![0.5, 0.5]);
+        assert!(spot_weights(&rows, &json!({"spot_weight_method": "nope"})).is_err());
+        let fixed = spot_weights(
+            &rows,
+            &json!({"spot_weight_method": "fixed", "spot_weight_mu": 0.02}),
+        )
+        .unwrap();
+        assert!(fixed.iter().all(|weight| (*weight - 0.02).abs() < 1e-9));
+        let ranged = spot_weights(
+            &rows,
+            &json!({
+                "spot_weight_method": "random_range",
+                "spot_weight_min_mu": 0.01,
+                "spot_weight_max_mu": 0.03
+            }),
+        )
+        .unwrap();
+        assert!(ranged.iter().all(|weight| (0.01..=0.0301).contains(weight)));
+        let layered = spot_weights(
+            &rows,
+            &json!({
+                "spot_weight_method": "layer_even_range",
+                "spot_weight_min_mu": 0.01,
+                "spot_weight_max_mu": 0.04,
+                "spot_weight_layer_shuffle": true
+            }),
+        )
+        .unwrap();
+        assert_eq!(layered.len(), rows.len());
     }
 
     #[test]

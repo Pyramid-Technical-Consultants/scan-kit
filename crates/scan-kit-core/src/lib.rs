@@ -4,6 +4,7 @@
 //! implement the operations themselves. Session files live in `scan-kit-io`.
 //! GPU work lives in `scan-kit-compute`.
 
+mod cloud;
 mod config;
 mod dose;
 mod geometry;
@@ -16,27 +17,31 @@ mod segment;
 mod session;
 mod session_log;
 mod signal;
+mod stats;
 mod task;
 mod tune;
 mod xml_dom;
 
+pub use cloud::{
+    cloud_series, contour_bands, contour_in_frame, count_grid, scatter_cloud, CloudDraw, CLOUD_BINS,
+};
 pub use config::{apply_form, config_form};
 pub use dose::{
-    analytic_on, analytic_volume, bragg_idd, csda_range_mm, dose_frame, field_bounds, medium,
-    protons_from_mu, robust_high, through_wet, water, DoseFrame, McJob, McResult, Medium,
-    PatientRequest, Pencil, Quantity, SlabRequest, Volume,
+    analytic_on, analytic_volume, bragg_idd, brick_grid, csda_range_mm, dose_film_open,
+    dose_film_uv, dose_frame, field_bounds, film_height, gantry_extent, line_scale, medium,
+    painted_unit, protons_from_mu, ray_rgba, ray_value, raymarch, robust_high, sample_index,
+    sample_mm, scan_volume, through_wet, trim_number, view_ray_scale, wash_of, water, DoseFrame,
+    LevelSpan, McJob, McResult, Medium, PaintChoice, PatientRequest, Pencil, Quantity, RayView,
+    SlabRequest, Volume, VolumeScan, Wash, BRICK, FOV_Y,
 };
-pub use geometry::{
-    beam_angle_mrad, fit_iso_plane, fit_line, magnet_pivot_z, parse_ic_geometry, IcGeometry,
-    IC1_Z_MM, IC2_Z_MM, IC_SEP_MM,
-};
+pub use geometry::{IC1_Z_MM, IC2_Z_MM, IC_SEP_MM};
 pub use plan::{
     build_plan, dicom_beam_size, parse_pld, plan_catalog, standard_energies, validate_plan,
     ImportSpot, PlanDocument, PlanSource,
 };
 pub use plot::{
-    apply_clip, format_tick, map_span, project, ticks, Camera, Choice, Control, DataTable, Panel,
-    PlotRect, PlotScene, Series,
+    apply_clip, format_tick, map_span, project, ticks, Camera, Choice, CloudStyle, Control,
+    DataTable, Panel, PlotRect, PlotScene, Series, SessionDose, VolumeMark,
 };
 pub use ramp::{choices, index, is_session, resolve, sample, session, Family, SESSION, VIRIDIS};
 pub use runner::{
@@ -48,15 +53,18 @@ pub use runner::{
 };
 pub use session_log::{compare_templates, parse_session_log, LayerEvent, SessionLog};
 pub use signal::{
-    arc_fit, arc_predict, assign_bin_centers, beam_off_edges, beam_on_mask, box_stats,
-    calibration_factor, coverage_percent, cumsum, density_counts, dose_error_pct, dose_ratio_pct,
-    dvh, fit_decay, g2_ic2_mm, gamma_index, histogram, hv_capacitance_pf, hv_delta_v,
-    hv_expected_pf, hv_firmware_flags, hv_step_window, linear_fit, median_finite, mip_xy,
-    quantile_edges, remap, remap_g2_raw, remap_g2_raw_reversed, remap_g3_raw,
-    remap_g3_raw_reversed, resample_nearest, scale_column, settled_after_step, sliding_background,
-    spill_segments, splat_gaussians, sums_by_spot_id, sums_by_spot_run, trapz, welch_psd, ArcFit,
-    BoxStats, G2_MM_PER_STRIP, G2_STRIP_CENTER, G3_STRIP_CENTER, G3_STRIP_PITCH_MM,
-    MIN_SPILL_GAP_MS,
+    assign_bin_centers, beam_on_mask, box_stats, calibration_factor, coverage_percent,
+    dose_error_pct, dose_per_mu, dose_ratio_pct, dvh, g2_ic2_mm, gamma_index, histogram,
+    hv_capacitance_pf, hv_delta_v, hv_expected_pf, hv_firmware_flags, hv_step_window, linear_fit,
+    median_finite, mip_xy, quantile_edges, radial_mm, remap, remap_g2_raw, remap_g2_raw_reversed,
+    remap_g3_raw, remap_g3_raw_reversed, remove_mean, resample_nearest, robust_limits,
+    scale_column, sigma_error_pct, splat_gaussians, sums_by_spot_id, sums_by_spot_run, time_window,
+    trapz, welch_psd, BoxStats, G2_MM_PER_STRIP, G2_STRIP_CENTER, G3_STRIP_CENTER,
+    G3_STRIP_PITCH_MM,
+};
+pub use stats::{
+    finite_minmax, mean_finite, median_unstable, percentile_linear, percentile_nearest,
+    reduce_finite, select_ranks, FiniteReduce,
 };
 pub use tune::{run_tune, tune_catalog, TuneSpots};
 pub use xml_dom::{parse_xml, write_xml, Elem};
@@ -68,8 +76,8 @@ pub use schema::{
     IC3_QUAD_ZERO_FILL, POSITION_KEY_G2_RAW, POSITION_KEY_G3_RAW,
 };
 pub use segment::{
-    apply_mask, parse_segments, row_mask, segments_control, segments_from, segments_json, BeamGate,
-    CompareOp, Rank, Segment,
+    apply_mask, layer_edges, parse_segments, row_mask, scrub_control, scrub_limits,
+    segments_control, segments_from, segments_json, time_end, BeamGate, CompareOp, Rank, Segment,
 };
 pub use session::{merge_session_geom, parse_termination_summary_text, SessionMeta, SummaryDate};
 pub use task::{
@@ -126,7 +134,7 @@ const TOOLS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "scan_kit_beam_mask",
-        summary: "Beam-on mask and spill segments from a gate column.",
+        summary: "Beam-on mask from a gate column.",
         kind: ToolKind::Granular,
     },
     ToolSpec {
@@ -142,11 +150,6 @@ const TOOLS: &[ToolSpec] = &[
     ToolSpec {
         name: "scan_kit_welch",
         summary: "Welch power spectrum of a 1 kHz timeslice signal.",
-        kind: ToolKind::Granular,
-    },
-    ToolSpec {
-        name: "scan_kit_fit_decay",
-        summary: "Single-exponential decay fit of a ramp-down curve.",
         kind: ToolKind::Granular,
     },
 ];
@@ -193,15 +196,6 @@ pub fn tool_input_schema(name: &str) -> Value {
                 "bins": { "type": "integer" }
             },
             "required": ["values"],
-            "additionalProperties": false
-        }),
-        "scan_kit_fit_decay" => json!({
-            "type": "object",
-            "properties": {
-                "time": { "type": "array", "items": { "type": "number" } },
-                "values": { "type": "array", "items": { "type": "number" } }
-            },
-            "required": ["time", "values"],
             "additionalProperties": false
         }),
         _ => json!({ "type": "object", "additionalProperties": false }),
@@ -332,11 +326,7 @@ pub fn invoke(name: &str, input: &Value) -> Result<Value, InvokeError> {
         }
         "scan_kit_beam_mask" => {
             let gate = f32_array(input, "gate")?;
-            let on = beam_on_mask(&gate);
-            json!({
-                "beam_on": on,
-                "spills": spill_segments(&on, signal::MIN_SPILL_GAP_MS, 2)
-            })
+            json!({ "beam_on": beam_on_mask(&gate) })
         }
         "scan_kit_bin_edges" => {
             let values = f32_array(input, "values")?;
@@ -353,14 +343,6 @@ pub fn invoke(name: &str, input: &Value) -> Result<Value, InvokeError> {
             let values = f32_array(input, "values")?;
             let (freqs, psd) = welch_psd(&values, 1000.0, 4096, 0.5);
             json!({ "freqs": freqs, "psd": psd })
-        }
-        "scan_kit_fit_decay" => {
-            let time = f32_array(input, "time")?;
-            let values = f32_array(input, "values")?;
-            match fit_decay(&time, &values) {
-                Some((amplitude, tau)) => json!({ "amplitude": amplitude, "tau": tau }),
-                None => json!({ "amplitude": null, "tau": null }),
-            }
         }
         _ => {
             return Err(InvokeError::UnknownTool {

@@ -6,5 +6,9 @@
     "src/components/ui/**"
   ],
   // The wasm script calls the Rust wasm-bindgen CLI pinned in Cargo.lock, not an npm package.
-  "ignoreBinaries": ["wasm-bindgen"]
+  "ignoreBinaries": ["wasm-bindgen"],
+  // scripts/tauri.mjs spawns this package's tauri.js by path, so the bin is unused.
+  "ignoreDependencies": [
+    "@tauri-apps/cli"
+  ]
 }

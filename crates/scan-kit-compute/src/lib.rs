@@ -4,6 +4,8 @@
 mod kernels;
 mod mc;
 mod present;
+#[cfg(test)]
+mod stats_time;
 mod task;
 
 pub use mc::run_mc;

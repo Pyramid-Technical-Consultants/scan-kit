@@ -18,8 +18,16 @@ macro_rules! forward {
 }
 
 forward!(scan_kit_open_library(path: String));
+
+#[tauri::command]
+fn scan_kit_remember_password(path: String, password: String) {
+    scan_kit_io::remember_password(&path, &password);
+}
 forward!(scan_kit_set_note(path: String, session_id: String, note: String));
 forward!(scan_kit_select_sessions(path: String, session_ids: Vec<String>));
+forward!(scan_kit_data_dirs);
+forward!(scan_kit_read_catalog);
+forward!(scan_kit_forget_data_dir(path: String));
 forward!(scan_kit_plan_catalog);
 forward!(scan_kit_config_catalog);
 forward!(scan_kit_config_form(path: String));
@@ -340,8 +348,12 @@ pub fn run() {
             version,
             scan_kit_about,
             scan_kit_open_library,
+            scan_kit_remember_password,
             scan_kit_set_note,
             scan_kit_select_sessions,
+            scan_kit_data_dirs,
+            scan_kit_read_catalog,
+            scan_kit_forget_data_dir,
             scan_kit_last_data_dir,
             scan_kit_window_geometry,
             scan_kit_set_window_geometry,

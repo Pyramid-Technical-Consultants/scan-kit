@@ -8,13 +8,13 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, UNIX_EPOCH};
 
 use scan_kit_core::{encode_poll, Cancel, McJob, McResult, Phase, PlotScene, Poll, Report, Volume};
-use scan_kit_plot::encode_plot_quality;
+use scan_kit_plot::encode_plot_reusing;
 use serde_json::{json, Value};
 
 use crate::mc::McRun;
@@ -280,7 +280,7 @@ fn build_stage(
 }
 
 fn wants_mc(view: &str, options: &Value) -> bool {
-    if view != "dose_volume" {
+    if view != "volumetric" {
         return false;
     }
     let model = options.get("model").and_then(Value::as_str).unwrap_or("");
@@ -297,6 +297,17 @@ fn ended(task: u64, generation: u64, phase: Phase, note: &str) -> Report {
         total: 0,
         note: note.into(),
     }
+}
+
+fn held_lines(options: &Value) -> Option<&str> {
+    options
+        .get("_lines")
+        .and_then(|value| value.as_str())
+        .filter(|text| !text.is_empty())
+}
+
+fn requested_voxel(options: &Value) -> f32 {
+    scan_kit_io::volumetric::voxel_spacing(options)
 }
 
 fn report_at(phase: Phase, done: usize, total: usize) -> Report {
@@ -336,6 +347,10 @@ struct SessionStage {
     plan: Vec<SessionPlan>,
     /// Windows of 4096 rows to pull into the next picture. Doubles after a timed poll.
     blocks: u32,
+    /// 0 until a volumetric picture has been published. A file that is still
+    /// arriving may show a coarser cube first. The finished picture uses the
+    /// requested spacing.
+    lattice: u8,
     report: Report,
 }
 
@@ -381,6 +396,7 @@ impl SessionStage {
             loaded: 0,
             plan: Vec::new(),
             blocks: 1,
+            lattice: 0,
             report: report_at(Phase::Chrome, 0, sessions.len()),
         }
     }
@@ -465,8 +481,18 @@ impl SessionStage {
     }
 
     fn load_scene(&self, ids: &[String]) -> Result<PlotScene, String> {
-        let mut scene = if self.view == "dose_volume" {
-            scan_kit_io::dose_volume(&self.root, ids, &self.options, None)
+        self.open_scene(ids, false)
+    }
+
+    fn open_scene(&self, ids: &[String], preview: bool) -> Result<PlotScene, String> {
+        let mut scene = if self.view == "volumetric" {
+            if preview {
+                let mut options = self.options.clone();
+                options["_preview"] = Value::Bool(true);
+                scan_kit_io::volumetric::volumetric(&self.root, ids, &options, None)
+            } else {
+                scan_kit_io::volumetric::volumetric(&self.root, ids, &self.options, None)
+            }
         } else {
             scan_kit_io::analysis_scene(&self.view, &self.root, ids, &self.options)?
         };
@@ -474,13 +500,52 @@ impl SessionStage {
         Ok(scene)
     }
 
+    fn coarse_preview(&self, scene: &PlotScene) -> bool {
+        scene.volume.values.len() > 1 && scene.volume.voxel > requested_voxel(&self.options) + 0.05
+    }
+
     fn pack(&self, scene: &PlotScene, partial: bool) -> Result<Vec<u8>, String> {
         let quality = if partial { "partial" } else { "final" };
-        encode_plot_quality(scene, self.background, self.foreground, quality)
+        encode_plot_reusing(
+            scene,
+            self.background,
+            self.foreground,
+            quality,
+            held_lines(&self.options),
+        )
     }
 
     fn encode(&self, ids: &[String], partial: bool) -> Result<Vec<u8>, String> {
         self.pack(&self.load_scene(ids)?, partial)
+    }
+
+    fn publish_volume_preview(&mut self) -> Poll<Vec<u8>> {
+        self.lattice = 1;
+        let ids = self.sessions.clone();
+        let scene = match self.open_scene(&ids, false) {
+            Ok(scene) => scene,
+            Err(message) => {
+                self.report.phase = Phase::Failed;
+                self.report.note = message.clone();
+                return Poll::Failed(message);
+            }
+        };
+        // A cached session is already on disk. This picture is the requested
+        // spacing. Reporting a second deposit left the hairline at 50%.
+        match self.pack(&scene, false) {
+            Ok(bytes) => {
+                remember_stamps(&self.stamps);
+                self.loaded = self.sessions.len();
+                let total = self.sessions.len();
+                self.report = report_at(Phase::Done, total, total);
+                Poll::Ready(bytes)
+            }
+            Err(message) => {
+                self.report.phase = Phase::Failed;
+                self.report.note = message.clone();
+                Poll::Failed(message)
+            }
+        }
     }
 }
 
@@ -508,6 +573,9 @@ impl Stage for SessionStage {
                     Poll::Failed(message)
                 }
             };
+        }
+        if self.cached && self.view == "volumetric" && !unlimited && self.lattice == 0 {
+            return self.publish_volume_preview();
         }
         if unlimited || self.cached {
             self.loaded = total;
@@ -581,7 +649,15 @@ impl Stage for SessionStage {
             scan_kit_io::SliceTake::Spot { rows }
         };
         scan_kit_io::bind_slice(&session.id, take);
-        let scene = self.load_scene(&ids);
+        let preview = self.view == "volumetric" && self.lattice == 0 && !unlimited;
+        if preview {
+            self.lattice = 1;
+        }
+        let scene = if preview {
+            self.open_scene(&ids, true)
+        } else {
+            self.load_scene(&ids)
+        };
         let tail_done = scan_kit_io::slice_tail_done();
         scan_kit_io::clear_slice();
         self.settle(at, tail_done);
@@ -593,7 +669,42 @@ impl Stage for SessionStage {
                 return Poll::Failed(message);
             }
         };
+        // A coarse cube while a file is still arriving. The finished picture
+        // deposits again at the requested spacing.
+        if preview && self.coarse_preview(&scene) && self.done_units() < self.units() {
+            return match self.pack(&scene, true) {
+                Ok(bytes) => {
+                    let phase = if self.loaded <= 1 {
+                        Phase::Parse
+                    } else {
+                        Phase::Scene
+                    };
+                    self.report = report_at(phase, self.done_units(), self.units().max(1));
+                    Poll::Pending {
+                        report: self.report.clone(),
+                        preview: Some(bytes),
+                    }
+                }
+                Err(message) => {
+                    self.report.phase = Phase::Failed;
+                    self.report.note = message.clone();
+                    Poll::Failed(message)
+                }
+            };
+        }
         if self.done_units() >= self.units() && tail_done {
+            let scene = if preview && self.coarse_preview(&scene) {
+                match self.open_scene(&ids, false) {
+                    Ok(scene) => scene,
+                    Err(message) => {
+                        self.report.phase = Phase::Failed;
+                        self.report.note = message.clone();
+                        return Poll::Failed(message);
+                    }
+                }
+            } else {
+                scene
+            };
             return match self.pack(&scene, false) {
                 Ok(bytes) => {
                     remember_stamps(&self.stamps);
@@ -651,6 +762,22 @@ impl Stage for SessionStage {
     }
 }
 
+/// Dose snapshots from the transport thread. The poll thread paints one while
+/// the transport keeps adding histories.
+struct McLive {
+    done: AtomicU64,
+    total: AtomicU64,
+    stop: AtomicBool,
+    target: AtomicU32,
+    /// 0 until a cube has been copied. Release-stored after `preview` is written.
+    preview_seq: AtomicU64,
+    ready_flag: AtomicBool,
+    note: Mutex<String>,
+    preview: Mutex<Option<McResult>>,
+    ready: Mutex<Option<McResult>>,
+    error: Mutex<Option<String>>,
+}
+
 struct McPlotStage {
     root: PathBuf,
     sessions: Vec<String>,
@@ -658,9 +785,99 @@ struct McPlotStage {
     background: [f32; 4],
     foreground: [f32; 4],
     palette: Vec<[f32; 4]>,
-    run: Option<McRun>,
     job: Option<McJob>,
+    shared: Arc<McLive>,
+    worker: Option<JoinHandle<()>>,
+    worker_cancel: Cancel,
+    /// Preview sequence already painted. 0 means the view has not seen a cube.
+    seen: u64,
     report: Report,
+}
+
+fn mc_live() -> McLive {
+    McLive {
+        done: AtomicU64::new(0),
+        total: AtomicU64::new(0),
+        stop: AtomicBool::new(false),
+        target: AtomicU32::new(0),
+        preview_seq: AtomicU64::new(0),
+        ready_flag: AtomicBool::new(false),
+        note: Mutex::new(String::new()),
+        preview: Mutex::new(None),
+        ready: Mutex::new(None),
+        error: Mutex::new(None),
+    }
+}
+
+fn job_histories(job: &McJob) -> u32 {
+    match job {
+        McJob::Slab(request) => request.histories,
+        McJob::Patient(request) => request.histories,
+    }
+}
+
+fn mc_transport(job: McJob, shared: Arc<McLive>, cancel: Cancel) {
+    let mut run = match McRun::open(&job) {
+        Ok(run) => run,
+        Err(ComputeError::NoAdapter) => {
+            *locked(&shared.error) = Some("no GPU adapter".into());
+            return;
+        }
+        Err(err) => {
+            *locked(&shared.error) = Some(err.to_string());
+            return;
+        }
+    };
+    loop {
+        if shared.stop.load(Ordering::SeqCst) || cancel.is_cancelled() {
+            return;
+        }
+        let target = shared.target.load(Ordering::Relaxed);
+        if target > 0 {
+            let _ = run.extend(target);
+        }
+        match run.poll(POLL_BUDGET, &cancel) {
+            Poll::Pending { report, preview } => {
+                shared.done.store(report.done, Ordering::Relaxed);
+                shared.total.store(report.total, Ordering::Relaxed);
+                *locked(&shared.note) = report.note;
+                if let Some(result) = preview {
+                    let seq = shared.preview_seq.load(Ordering::Relaxed) + 1;
+                    *locked(&shared.preview) = Some(result);
+                    shared.preview_seq.store(seq, Ordering::Release);
+                }
+            }
+            Poll::Ready(result) => {
+                shared.done.store(
+                    shared.total.load(Ordering::Relaxed).max(1),
+                    Ordering::Relaxed,
+                );
+                *locked(&shared.ready) = Some(result);
+                shared.ready_flag.store(true, Ordering::Release);
+                loop {
+                    if shared.stop.load(Ordering::SeqCst) || cancel.is_cancelled() {
+                        return;
+                    }
+                    let target = shared.target.load(Ordering::Relaxed);
+                    if run.extend(target) && run.progress() < 1.0 {
+                        shared.ready_flag.store(false, Ordering::Release);
+                        *locked(&shared.ready) = None;
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }
+            Poll::Cancelled => return,
+            Poll::Failed(message) => {
+                *locked(&shared.error) = Some(message);
+                return;
+            }
+        }
+    }
+}
+
+fn locked<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|err| err.into_inner())
 }
 
 impl McPlotStage {
@@ -679,19 +896,28 @@ impl McPlotStage {
             background,
             foreground,
             palette: palette.to_vec(),
-            run: None,
             job: None,
+            shared: Arc::new(mc_live()),
+            worker: None,
+            worker_cancel: Cancel::new(),
+            seen: 0,
             report: report_at(Phase::Chrome, 0, 0),
         }
     }
 
     fn pack(&self, scene: &mut PlotScene, quality: &str) -> Result<Vec<u8>, String> {
         apply_palette(scene, &self.palette);
-        encode_plot_quality(scene, self.background, self.foreground, quality)
+        encode_plot_reusing(
+            scene,
+            self.background,
+            self.foreground,
+            quality,
+            held_lines(&self.options),
+        )
     }
 
     fn paint(&self, result: &McResult, quality: &str) -> Result<Vec<u8>, String> {
-        let mut scene = scan_kit_io::dose_volume(
+        let mut scene = scan_kit_io::volumetric::volumetric(
             &self.root,
             &self.sessions,
             &self.options,
@@ -706,35 +932,135 @@ impl McPlotStage {
         Poll::Failed(message)
     }
 
-    fn advance(&mut self, budget: Duration, cancel: &Cancel) -> Poll<Vec<u8>> {
-        let Some(run) = self.run.as_mut() else {
-            return self.fail("monte carlo is not open".into());
-        };
-        match run.poll(budget, cancel) {
-            Poll::Pending { report, preview } => {
-                self.report = report;
-                match preview {
-                    Some(result) => match self.paint(&result, "partial") {
-                        Ok(bytes) => Poll::Pending {
-                            report: self.report.clone(),
-                            preview: Some(bytes),
-                        },
-                        Err(message) => self.fail(message),
-                    },
-                    None => Poll::Pending {
+    fn shutdown(&mut self) {
+        self.worker_cancel.cancel();
+        self.shared.stop.store(true, Ordering::SeqCst);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+
+    fn sync_report(&mut self, phase: Phase) {
+        self.report.phase = phase;
+        self.report.done = self.shared.done.load(Ordering::Relaxed);
+        self.report.total = self.shared.total.load(Ordering::Relaxed);
+        let note = locked(&self.shared.note).clone();
+        if !note.is_empty() {
+            self.report.note = note;
+        }
+    }
+
+    /// Paint `result` into the view. `finished` is the last cube.
+    fn publish(&mut self, result: &McResult, seq: u64, finished: bool) -> Poll<Vec<u8>> {
+        let quality = if finished { "final" } else { "partial" };
+        match self.paint(result, quality) {
+            Ok(bytes) => {
+                self.seen = seq;
+                if finished {
+                    self.report.phase = Phase::Done;
+                    self.report.done = self.report.total.max(self.report.done);
+                    Poll::Ready(bytes)
+                } else {
+                    self.report.phase = Phase::Preview;
+                    Poll::Pending {
                         report: self.report.clone(),
-                        preview: None,
-                    },
+                        preview: Some(bytes),
+                    }
                 }
             }
-            Poll::Ready(result) => match self.paint(&result, "final") {
+            Err(message) => self.fail(message),
+        }
+    }
+
+    fn paint_progress(&mut self) -> Poll<Vec<u8>> {
+        let message = locked(&self.shared.error).clone();
+        if let Some(message) = message {
+            return self.fail(message);
+        }
+        self.sync_report(Phase::Compute);
+        let seq = self.shared.preview_seq.load(Ordering::Acquire);
+        let finished = self.shared.ready_flag.load(Ordering::Acquire);
+        // The first picture is a rough cube, including when the run has already
+        // reached the last history before this poll.
+        if self.seen == 0 && seq > 0 {
+            let result = locked(&self.shared.preview).clone();
+            if let Some(result) = result {
+                return self.publish(&result, seq, false);
+            }
+        }
+        if finished {
+            let result = locked(&self.shared.ready).clone();
+            if let Some(result) = result {
+                return self.publish(&result, seq.max(self.seen), true);
+            }
+        }
+        if seq > self.seen {
+            let result = locked(&self.shared.preview).clone();
+            if let Some(result) = result {
+                return self.publish(&result, seq, false);
+            }
+        }
+        Poll::Pending {
+            report: self.report.clone(),
+            preview: None,
+        }
+    }
+
+    fn follow(&mut self) -> Poll<Vec<u8>> {
+        if self.worker.is_some() {
+            return self.paint_progress();
+        }
+        let (mut scene, job) = capture_job(&self.root, &self.sessions, &self.options);
+        let Some(job) = job else {
+            return match self.pack(&mut scene, "final") {
                 Ok(bytes) => {
-                    self.report.phase = Phase::Done;
-                    self.report.done = self.report.total;
+                    self.report = report_at(Phase::Done, 1, 1);
                     Poll::Ready(bytes)
                 }
                 Err(message) => self.fail(message),
-            },
+            };
+        };
+        let histories = job_histories(&job);
+        self.shared
+            .total
+            .store(u64::from(histories.max(1)), Ordering::Relaxed);
+        self.shared.target.store(histories, Ordering::Relaxed);
+        *locked(&self.shared.note) = "0%".into();
+        self.job = Some(job.clone());
+        let shared = Arc::clone(&self.shared);
+        let cancel = self.worker_cancel.clone();
+        self.worker = Some(std::thread::spawn(move || {
+            mc_transport(job, shared, cancel)
+        }));
+        // The blank capture is not a picture. The view keeps the last cube until
+        // the first histories land, then each later copy replaces it.
+        self.sync_report(Phase::Compute);
+        Poll::Pending {
+            report: self.report.clone(),
+            preview: None,
+        }
+    }
+
+    fn drain(&mut self, cancel: &Cancel) -> Poll<Vec<u8>> {
+        let (mut scene, job) = capture_job(&self.root, &self.sessions, &self.options);
+        let Some(job) = job else {
+            return match self.pack(&mut scene, "final") {
+                Ok(bytes) => {
+                    self.report = report_at(Phase::Done, 1, 1);
+                    Poll::Ready(bytes)
+                }
+                Err(message) => self.fail(message),
+            };
+        };
+        self.job = Some(job.clone());
+        let mut run = match McRun::open(&job) {
+            Ok(run) => run,
+            Err(ComputeError::NoAdapter) => return self.fail("no GPU adapter".into()),
+            Err(err) => return self.fail(err.to_string()),
+        };
+        match run.poll(DRAIN, cancel) {
+            Poll::Ready(result) => self.publish(&result, 1, true),
+            Poll::Pending { .. } => self.fail("monte carlo did not finish".into()),
             Poll::Cancelled => {
                 self.report.phase = Phase::Cancelled;
                 Poll::Cancelled
@@ -744,13 +1070,19 @@ impl McPlotStage {
     }
 }
 
+impl Drop for McPlotStage {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
 impl Stage for McPlotStage {
     fn report(&self) -> Report {
         self.report.clone()
     }
 
     fn retarget(&mut self, options: &Value, palette: &[[f32; 4]]) -> bool {
-        if self.run.is_none() {
+        if self.worker.is_none() {
             return false;
         }
         let (_scene, job) = capture_job(&self.root, &self.sessions, options);
@@ -761,19 +1093,11 @@ impl Stage for McPlotStage {
         if !same {
             return false;
         }
-        let histories = match &job {
-            McJob::Slab(request) => request.histories,
-            McJob::Patient(request) => request.histories,
-        };
-        if let Some(run) = self.run.as_mut() {
-            if run.extend(histories) {
-                let fraction = run.progress();
-                self.report.total = u64::from(histories.max(1));
-                self.report.done = (fraction * self.report.total as f64) as u64;
-                let pct = (fraction * 100.0).round() as u32;
-                self.report.note = format!("{pct}%");
-            }
-        }
+        let histories = job_histories(&job);
+        self.shared.target.store(histories, Ordering::Relaxed);
+        self.shared
+            .total
+            .store(u64::from(histories.max(1)), Ordering::Relaxed);
         self.job = Some(job);
         self.options = options.clone();
         self.palette = palette.to_vec();
@@ -782,57 +1106,21 @@ impl Stage for McPlotStage {
 
     fn poll(&mut self, budget: Duration, cancel: &Cancel) -> Poll<Vec<u8>> {
         if cancel.is_cancelled() {
+            self.shutdown();
             self.report.phase = Phase::Cancelled;
             return Poll::Cancelled;
         }
-        if self.run.is_none() {
-            let (mut scene, job) = capture_job(&self.root, &self.sessions, &self.options);
-            let Some(job) = job else {
-                return match self.pack(&mut scene, "final") {
-                    Ok(bytes) => {
-                        self.report = report_at(Phase::Done, 1, 1);
-                        Poll::Ready(bytes)
-                    }
-                    Err(message) => self.fail(message),
-                };
-            };
-            let histories = match &job {
-                McJob::Slab(request) => request.histories,
-                McJob::Patient(request) => request.histories,
-            };
-            let run = match McRun::open(&job) {
-                Ok(run) => run,
-                Err(ComputeError::NoAdapter) => return self.fail("no GPU adapter".into()),
-                Err(err) => return self.fail(err.to_string()),
-            };
-            self.job = Some(job);
-            self.run = Some(run);
-            if budget >= DRAIN {
-                return self.advance(budget, cancel);
-            }
-            self.report = Report {
-                task: 0,
-                generation: 0,
-                phase: Phase::Chrome,
-                done: 0,
-                total: u64::from(histories),
-                note: "0%".into(),
-            };
-            return match self.pack(&mut scene, "partial") {
-                Ok(bytes) => Poll::Pending {
-                    report: self.report.clone(),
-                    preview: Some(bytes),
-                },
-                Err(message) => self.fail(message),
-            };
+        if budget >= DRAIN {
+            self.shutdown();
+            return self.drain(cancel);
         }
-        self.advance(budget, cancel)
+        self.follow()
     }
 }
 
 fn capture_job(root: &Path, sessions: &[String], options: &Value) -> (PlotScene, Option<McJob>) {
     let job = std::cell::RefCell::new(None);
-    let scene = scan_kit_io::dose_volume(
+    let scene = scan_kit_io::volumetric::volumetric(
         root,
         sessions,
         options,
@@ -859,6 +1147,7 @@ fn blank_result(job: &McJob) -> McResult {
         },
         uncertainty: 0.0,
         ledger: [0.0; 6],
+        let_d: Vec::new(),
     }
 }
 
@@ -891,6 +1180,7 @@ fn same_phantom(left: &McJob, right: &McJob) -> bool {
                 && left.shape == right.shape
                 && left.seed == right.seed
                 && left.dose_to_water == right.dose_to_water
+                && left.score_let == right.score_let
         }
         _ => false,
     }
@@ -1207,9 +1497,96 @@ mod tests {
         .unwrap();
     }
 
+    #[test]
+    fn a_small_volume_opens_as_the_final_picture() {
+        let root = scratch();
+        write_session(&root, "sess");
+        let mut stage = SessionStage::new(
+            "volumetric",
+            &root,
+            &["sess".into()],
+            &json!({}),
+            [0.1, 0.1, 0.1, 1.0],
+            [0.9, 0.9, 0.9, 1.0],
+            &[[0.2, 0.4, 0.8, 1.0]],
+        );
+        let cancel = Cancel::new();
+        match stage.poll(Duration::from_millis(12), &cancel) {
+            Poll::Ready(bytes) => {
+                let header = scan_kit_plot::plot_header(&bytes).unwrap();
+                assert_eq!(header.quality, "final");
+                assert_eq!(header.title, "Volumetric");
+            }
+            Poll::Pending { .. } => panic!("a two-spot field should not wait on a coarser cube"),
+            Poll::Failed(message) => panic!("{message}"),
+            Poll::Cancelled => panic!("cancelled"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_heavy_volume_finishes_on_the_requested_spacing() {
+        let root = scratch();
+        let session = root.join("sess");
+        std::fs::create_dir_all(&session).unwrap();
+        let mut map = String::from("energy,charge_req,position_x,position_y\n");
+        let mut spots = String::from("ic1_total_dose,ic2_total_dose,position_x,position_y\n");
+        for i in 0..40 {
+            let x = i * 5;
+            map.push_str(&format!("180,0.05,{x},0\n"));
+            spots.push_str(&format!("0.05,0.05,{x},0\n"));
+        }
+        std::fs::write(session.join("input_map.csv"), map).unwrap();
+        std::fs::write(session.join("spot_data.csv"), spots).unwrap();
+        let mut stage = SessionStage::new(
+            "volumetric",
+            &root,
+            &["sess".into()],
+            &json!({}),
+            [0.1, 0.1, 0.1, 1.0],
+            [0.9, 0.9, 0.9, 1.0],
+            &[[0.2, 0.4, 0.8, 1.0]],
+        );
+        let cancel = Cancel::new();
+        match stage.poll(Duration::from_millis(12), &cancel) {
+            Poll::Ready(bytes) => {
+                let header = scan_kit_plot::plot_header(&bytes).unwrap();
+                assert_eq!(header.quality, "final");
+                assert_eq!(stage.report.done, stage.report.total);
+            }
+            Poll::Pending { report, .. } => {
+                panic!("stuck at {}/{}", report.done, report.total)
+            }
+            Poll::Failed(message) => panic!("{message}"),
+            Poll::Cancelled => panic!("cancelled"),
+        }
+        let mut again = SessionStage::new(
+            "volumetric",
+            &root,
+            &["sess".into()],
+            &json!({}),
+            [0.1, 0.1, 0.1, 1.0],
+            [0.9, 0.9, 0.9, 1.0],
+            &[[0.2, 0.4, 0.8, 1.0]],
+        );
+        assert!(again.cached);
+        match again.poll(Duration::from_millis(12), &cancel) {
+            Poll::Ready(bytes) => {
+                let header = scan_kit_plot::plot_header(&bytes).unwrap();
+                assert_eq!(header.quality, "final");
+            }
+            Poll::Pending { report, .. } => {
+                panic!("reopen stuck at {}/{}", report.done, report.total)
+            }
+            Poll::Failed(message) => panic!("{message}"),
+            Poll::Cancelled => panic!("cancelled"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     fn session_stage(root: &Path, sessions: &[&str]) -> SessionStage {
         SessionStage::new(
-            "dose_accumulation",
+            "timeline",
             root,
             &sessions
                 .iter()
@@ -1244,7 +1621,7 @@ mod tests {
                 Poll::Ready(bytes) => {
                     let header = scan_kit_plot::plot_header(&bytes).unwrap();
                     assert_eq!(header.quality, "final");
-                    assert_eq!(header.title, "Dose Accumulation");
+                    assert_eq!(header.title, "Timeline");
                     saw_final = true;
                     break;
                 }
@@ -1297,7 +1674,7 @@ mod tests {
             std::fs::write(&file, format!("r_ic1_current_dose\n{layer}\n")).unwrap();
         }
         let mut stage = SessionStage::new(
-            "timeslice_replay",
+            "timeline",
             &streamed,
             &["layers".into()],
             &json!({}),
@@ -1346,7 +1723,7 @@ mod tests {
             std::fs::write(&file, format!("r_ic1_current_dose\n{layer}\n")).unwrap();
         }
         let mut stage = SessionStage::new(
-            "timeslice_replay",
+            "timeline",
             &tight,
             &["layers".into()],
             &json!({}),
@@ -1390,7 +1767,7 @@ mod tests {
             std::fs::write(&file, format!("r_ic1_current_dose\n{sample}\n")).unwrap();
         }
         let mut stage = SessionStage::new(
-            "timeslice_replay",
+            "timeline",
             &sliced,
             &["wide".into()],
             &json!({}),
@@ -1451,6 +1828,72 @@ mod tests {
             Poll::Cancelled
         ));
         assert_eq!(stage.loaded, 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn mc_view_paints_a_rough_cube_before_the_finished_one() {
+        let root = scratch();
+        write_session(&root, "sess");
+        let options = json!({
+            "model": "mc",
+            "histories": "40000",
+            "voxel": "4",
+        });
+        let mut stage = McPlotStage::new(
+            &root,
+            &["sess".into()],
+            &options,
+            [0.1, 0.1, 0.1, 1.0],
+            [0.9, 0.9, 0.9, 1.0],
+            &[[0.2, 0.4, 0.8, 1.0]],
+        );
+        let cancel = Cancel::new();
+        let started = std::time::Instant::now();
+        let mut rough = false;
+        loop {
+            if started.elapsed() > Duration::from_secs(60) {
+                panic!("monte carlo view did not finish");
+            }
+            match stage.poll(Duration::from_millis(12), &cancel) {
+                Poll::Pending { preview, .. } => {
+                    let Some(bytes) = preview else {
+                        continue;
+                    };
+                    let header = scan_kit_plot::plot_header(&bytes).expect("header");
+                    assert_eq!(header.quality, "partial");
+                    assert!(
+                        header
+                            .panels
+                            .iter()
+                            .any(|panel| panel.title.starts_with("3D")),
+                        "the rough cube should already show dose"
+                    );
+                    rough = true;
+                }
+                Poll::Ready(bytes) => {
+                    let header = scan_kit_plot::plot_header(&bytes).expect("header");
+                    assert_eq!(header.quality, "final");
+                    assert!(
+                        header
+                            .panels
+                            .iter()
+                            .any(|panel| panel.title.starts_with("3D")),
+                        "the finished cube should show dose"
+                    );
+                    break;
+                }
+                Poll::Failed(message) if message.contains("GPU") => {
+                    let _ = std::fs::remove_dir_all(&root);
+                    return;
+                }
+                other => panic!("monte carlo view failed: {other:?}"),
+            }
+        }
+        assert!(
+            rough,
+            "the view never showed a cube before the run finished"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }

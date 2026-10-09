@@ -1,17 +1,17 @@
-//! Binned Summary, matching the 1.8 metric groups, binning, and glyphs.
+//! Bins, matching the 1.8 metric groups, binning, and glyphs.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
 use scan_kit_core::{
-    assign_bin_centers, quantile_edges, row_mask, segments_control, segments_from, segments_json,
-    BeamGate, Control, Panel, PlotScene, Rank, Segment, Series,
+    assign_bin_centers, quantile_edges, row_mask, scrub_control, segments_control, segments_from,
+    segments_json, time_end, BeamGate, Control, Panel, PlotScene, Rank, Segment, Series,
 };
 use serde_json::Value;
 
 use super::discover;
 use super::histogram::{bin_button, bin_share, hist_bin_count, share_key, BinShare, BIN_CHOICES};
-use super::marks::{contour_bands, control, flag, labeled, pick, text};
+use super::marks::{control, flag, labeled, pick, text};
 mod glyphs;
 
 use super::tables::{median, same, session_columns, span, timeslice_energy_only, Grain};
@@ -25,9 +25,9 @@ const BOX_WIDTH: f32 = 0.3;
 const VIOLIN_WIDTH: f32 = 0.65;
 const GATE_ABS_MU: f64 = 0.002;
 
-struct YSeries {
-    key: &'static str,
-    label: &'static str,
+pub(crate) struct YSeries {
+    pub key: &'static str,
+    pub label: &'static str,
 }
 
 struct YGroup {
@@ -105,6 +105,44 @@ const POSITION: &[YSeries] = &[
         label: "IC2 Y",
     },
 ];
+const POSITION_REL: &[YSeries] = &[
+    YSeries {
+        key: "ic1_x_err_rel",
+        label: "IC1 X",
+    },
+    YSeries {
+        key: "ic1_y_err_rel",
+        label: "IC1 Y",
+    },
+    YSeries {
+        key: "ic2_x_err_rel",
+        label: "IC2 X",
+    },
+    YSeries {
+        key: "ic2_y_err_rel",
+        label: "IC2 Y",
+    },
+];
+const POSITION_R: &[YSeries] = &[
+    YSeries {
+        key: "ic1_r_err",
+        label: "IC1",
+    },
+    YSeries {
+        key: "ic2_r_err",
+        label: "IC2",
+    },
+];
+const POSITION_R_REL: &[YSeries] = &[
+    YSeries {
+        key: "ic1_r_err_rel",
+        label: "IC1",
+    },
+    YSeries {
+        key: "ic2_r_err_rel",
+        label: "IC2",
+    },
+];
 const SIGMA: &[YSeries] = &[
     YSeries {
         key: "ic1_sig_x",
@@ -139,6 +177,38 @@ const SIGMA_ERR: &[YSeries] = &[
     YSeries {
         key: "ic2_sig_y_err",
         label: "IC2 SY ERR",
+    },
+];
+const SIGMA_ERR_PCT: &[YSeries] = &[
+    YSeries {
+        key: "ic1_sig_x_err_pct",
+        label: "IC1 SX",
+    },
+    YSeries {
+        key: "ic1_sig_y_err_pct",
+        label: "IC1 SY",
+    },
+    YSeries {
+        key: "ic2_sig_x_err_pct",
+        label: "IC2 SX",
+    },
+    YSeries {
+        key: "ic2_sig_y_err_pct",
+        label: "IC2 SY",
+    },
+];
+const DOSE_PER_MU: &[YSeries] = &[
+    YSeries {
+        key: "ic1_dose_per_mu",
+        label: "IC1",
+    },
+    YSeries {
+        key: "ic2_dose_per_mu",
+        label: "IC2",
+    },
+    YSeries {
+        key: "ic3_dose_per_mu",
+        label: "IC3",
     },
 ];
 const IC12: &[YSeries] = &[
@@ -232,6 +302,14 @@ const GROUPS: &[YGroup] = &[
         timeslice: false,
     },
     YGroup {
+        id: "dose_per_mu",
+        label: "Dose per MU",
+        series: DOSE_PER_MU,
+        zero: false,
+        filter: true,
+        timeslice: false,
+    },
+    YGroup {
         id: "dose_ratio",
         label: "Dose Ratios",
         series: DOSE_RATIO,
@@ -304,6 +382,30 @@ const GROUPS: &[YGroup] = &[
         timeslice: false,
     },
     YGroup {
+        id: "position_error_rel",
+        label: "Relative Position Error (mm)",
+        series: POSITION_REL,
+        zero: true,
+        filter: true,
+        timeslice: false,
+    },
+    YGroup {
+        id: "distance_error",
+        label: "Distance Error (mm)",
+        series: POSITION_R,
+        zero: true,
+        filter: true,
+        timeslice: false,
+    },
+    YGroup {
+        id: "distance_error_rel",
+        label: "Relative Distance Error (mm)",
+        series: POSITION_R_REL,
+        zero: true,
+        filter: true,
+        timeslice: false,
+    },
+    YGroup {
         id: "sigma",
         label: "Sigma (mm)",
         series: SIGMA,
@@ -315,6 +417,14 @@ const GROUPS: &[YGroup] = &[
         id: "sigma_error",
         label: "Sigma Error (mm)",
         series: SIGMA_ERR,
+        zero: true,
+        filter: true,
+        timeslice: false,
+    },
+    YGroup {
+        id: "sigma_error_pct",
+        label: "Sigma Error (%)",
+        series: SIGMA_ERR_PCT,
         zero: true,
         filter: true,
         timeslice: false,
@@ -350,11 +460,20 @@ const SOURCE_CHOICES: &[(&str, &str)] = &[
     ("timeslice_iso", "Timeslice — Isocenter"),
     ("timeslice_chamber", "Timeslice — Chamber"),
 ];
+/// Series of one Y quantity, in the same order Bins draws them.
+pub(crate) fn channels_for(metric: &str) -> (&'static str, &'static [YSeries]) {
+    match GROUPS.iter().find(|group| group.id == metric) {
+        Some(group) => (group.label, group.series),
+        None => ("", &[]),
+    }
+}
+
 fn sources_for(metric: &str) -> &'static [(&'static str, &'static str)] {
     match metric {
         "current_ratio" | "ic_current" | "fit_confidence" | "peak_amplitude"
         | "amplifier_error" | "probe_field" => &SOURCE_CHOICES[2..3],
-        "position_error" | "sigma" | "sigma_error" => &SOURCE_CHOICES[..3],
+        "position_error" | "position_error_rel" | "distance_error" | "distance_error_rel"
+        | "sigma" | "sigma_error" | "sigma_error_pct" => &SOURCE_CHOICES[..3],
         "ic12_pos_diff" => SOURCE_CHOICES,
         _ => &SOURCE_CHOICES[..1],
     }
@@ -417,6 +536,7 @@ struct Prepared {
     x_column: String,
     raw_x: bool,
     series: Vec<PreparedSeries>,
+    end: f32,
 }
 
 #[derive(Clone)]
@@ -504,7 +624,7 @@ fn mtime_ns(path: &Path) -> u128 {
         .unwrap_or(0)
 }
 
-pub(crate) fn binned_summary(root: &Path, session_ids: &[String], options: &Value) -> PlotScene {
+pub(crate) fn bins(root: &Path, session_ids: &[String], options: &Value) -> PlotScene {
     let timeslice = crate::source::wants_timeslice(crate::source::Shape::YAndX, options);
     let owned: Vec<(String, Vec<String>)> = session_ids
         .iter()
@@ -538,11 +658,7 @@ pub(crate) fn binned_summary(root: &Path, session_ids: &[String], options: &Valu
         options,
         &[
             Segment::Beam {
-                state: if coarse == "timeslice" {
-                    BeamGate::On
-                } else {
-                    BeamGate::Both
-                },
+                state: BeamGate::Both,
             },
             Segment::Rank { which: Rank::All },
         ],
@@ -573,13 +689,27 @@ pub(crate) fn binned_summary(root: &Path, session_ids: &[String], options: &Valu
     let geometry = matches!(source, "timeslice_iso" | "timeslice_chamber")
         && matches!(
             group.id,
-            "position_error" | "sigma" | "sigma_error" | "ic12_pos_diff"
+            "position_error"
+                | "position_error_rel"
+                | "distance_error"
+                | "distance_error_rel"
+                | "sigma"
+                | "sigma_error"
+                | "sigma_error_pct"
+                | "ic12_pos_diff"
         );
     let energy_only = geometry || timeslice_energy_only(group.id);
     let chamber = source == "chamber"
         && matches!(
             group.id,
-            "position_error" | "sigma" | "sigma_error" | "ic12_pos_diff"
+            "position_error"
+                | "position_error_rel"
+                | "distance_error"
+                | "distance_error_rel"
+                | "sigma"
+                | "sigma_error"
+                | "sigma_error_pct"
+                | "ic12_pos_diff"
         );
     let x_id = if energy_only { "energy" } else { x_id };
     if !interlock_ok(group.id, x_id, glyph) {
@@ -631,32 +761,42 @@ pub(crate) fn binned_summary(root: &Path, session_ids: &[String], options: &Valu
             } else {
                 Grain::Spot
             };
-            let mut names: Vec<&str> = group.series.iter().map(|series| series.key).collect();
+            let metric: Vec<&str> = group.series.iter().map(|series| series.key).collect();
+            let mut names = metric.clone();
             names.push(x_column);
             let loaded = session_columns(root, session, grain, &names);
+            let clock = time_end(loaded.get("time_s").map(Vec::as_slice));
             let loaded = if group.id == "dose_rate" {
                 std::sync::Arc::new(dose_rate_table(loaded.as_ref()))
             } else {
                 loaded
             };
-            plotted_columns(loaded.as_ref(), &names, &segments, group.filter)
+            (
+                plotted_columns(loaded.as_ref(), &names, &metric, &segments, group.filter),
+                clock,
+            )
         };
         // A handful of sessions, one thread each. The spot cache covers a repeat open.
-        let mut tables = if session_ids.len() < 2 {
+        let pairs = if session_ids.len() < 2 {
             session_ids.iter().map(load_one).collect::<Vec<_>>()
         } else {
-            let mut tables = Vec::with_capacity(session_ids.len());
             std::thread::scope(|scope| {
                 let mut joins = Vec::with_capacity(session_ids.len());
                 for session in session_ids {
                     joins.push(scope.spawn(|| load_one(session)));
                 }
-                for join in joins {
-                    tables.push(join.join().unwrap());
-                }
-            });
-            tables
+                joins
+                    .into_iter()
+                    .map(|join| join.join().unwrap())
+                    .collect::<Vec<_>>()
+            })
         };
+        let mut end = 0.0f32;
+        let mut tables = Vec::with_capacity(pairs.len());
+        for (table, clock) in pairs {
+            end = end.max(clock);
+            tables.push(table);
+        }
         let (categories, stable_bins) = if raw_x {
             (Vec::new(), false)
         } else {
@@ -765,6 +905,7 @@ pub(crate) fn binned_summary(root: &Path, session_ids: &[String], options: &Valu
             x_column: x_column.to_string(),
             raw_x,
             series,
+            end,
         }
     });
 
@@ -806,7 +947,14 @@ pub(crate) fn binned_summary(root: &Path, session_ids: &[String], options: &Valu
                     hist_bins,
                     share == BinShare::Plot,
                     page,
-                    interlock && group.id == "position_error",
+                    interlock
+                        && matches!(
+                            group.id,
+                            "position_error"
+                                | "position_error_rel"
+                                | "distance_error"
+                                | "distance_error_rel"
+                        ),
                 ));
             }
             if let Some((left, right)) = pairs.get(index) {
@@ -822,26 +970,36 @@ pub(crate) fn binned_summary(root: &Path, session_ids: &[String], options: &Valu
     PlotScene {
         title: format!("{} vs {}", group.label, x_label(x_column)),
         panels,
-        controls: controls(
-            source_controls,
-            group.id,
-            x_id,
-            glyph,
-            &segments,
-            trend,
-            hist,
-            corr,
-            interlock,
-            &bin_label(&bins),
-            &hist_label,
-            share,
-            cutoff,
-        ),
+        controls: {
+            let mut controls = controls(
+                source_controls,
+                group.id,
+                x_id,
+                glyph,
+                &segments,
+                trend,
+                hist,
+                corr,
+                interlock,
+                &bin_label(&bins),
+                &hist_label,
+                share,
+                cutoff,
+            );
+            controls.push(scrub_control(
+                options,
+                prepared.end,
+                &crate::tables::timeline_layers(root, session_ids, coarse == "timeslice"),
+            ));
+            controls
+        },
         table: None,
-        samples: Vec::new(),
         columns: 1 + side,
         column_weights: weights,
         row_weights: Vec::new(),
+        side: 0,
+        row_splits: Vec::new(),
+        volume: scan_kit_core::VolumeMark::default(),
     }
 }
 
@@ -860,6 +1018,12 @@ fn correlation_slots<'a>(metric: &str, present: &[&'a YSeries]) -> Vec<(&'a YSer
             ("ic1_x_err", "ic1_y_err"),
             ("ic2_x_err", "ic2_y_err"),
         ][..],
+        "position_error_rel" => &[
+            ("ic1_x_err_rel", "ic2_x_err_rel"),
+            ("ic1_y_err_rel", "ic2_y_err_rel"),
+            ("ic1_x_err_rel", "ic1_y_err_rel"),
+            ("ic2_x_err_rel", "ic2_y_err_rel"),
+        ][..],
         "sigma" => &[
             ("ic1_sig_x", "ic2_sig_x"),
             ("ic1_sig_y", "ic2_sig_y"),
@@ -871,6 +1035,12 @@ fn correlation_slots<'a>(metric: &str, present: &[&'a YSeries]) -> Vec<(&'a YSer
             ("ic1_sig_y_err", "ic2_sig_y_err"),
             ("ic1_sig_x_err", "ic1_sig_y_err"),
             ("ic2_sig_x_err", "ic2_sig_y_err"),
+        ][..],
+        "sigma_error_pct" => &[
+            ("ic1_sig_x_err_pct", "ic2_sig_x_err_pct"),
+            ("ic1_sig_y_err_pct", "ic2_sig_y_err_pct"),
+            ("ic1_sig_x_err_pct", "ic1_sig_y_err_pct"),
+            ("ic2_sig_x_err_pct", "ic2_sig_y_err_pct"),
         ][..],
         "fit_confidence" => &[
             ("ic1_x_confidence", "ic2_x_confidence"),
@@ -1013,7 +1183,7 @@ fn assemble_panel(
     }
 }
 
-fn axis_label(series: &str, group: &str) -> String {
+pub(crate) fn axis_label(series: &str, group: &str) -> String {
     let Some(unit) = group
         .rfind('(')
         .zip(group.rfind(')'))
@@ -1149,9 +1319,11 @@ fn controls(
 
 fn interlock_ok(metric: &str, x: &str, glyph: &str) -> bool {
     match metric {
-        "position_error" => true,
+        "position_error" | "position_error_rel" | "distance_error" | "distance_error_rel" => true,
         "dose_error" => x == "target_mu",
-        "sigma" | "sigma_error" => x == "energy" && !matches!(glyph, "scatter" | "contour"),
+        "sigma" | "sigma_error" | "sigma_error_pct" => {
+            x == "energy" && !matches!(glyph, "scatter" | "contour")
+        }
         _ => false,
     }
 }
@@ -1285,20 +1457,34 @@ fn unique_values(tables: &[BTreeMap<String, Vec<f32>>], key: &str) -> Vec<f32> {
 
 /// Copy the columns this glyph reads and apply the mask there.
 ///
-/// The session table stays shared. `beam_on`, `expected_sigma`, and
+/// Rank looks at the metric columns only. The bin axis is copied so the groups
+/// still exist, and a high energy is not treated as an outlier of position or
+/// current. The session table stays shared. `beam_on`, `expected_sigma`, and
 /// `session_avg_rate` stay finite, matching `apply_mask`.
 fn plotted_columns(
     loaded: &BTreeMap<String, Vec<f32>>,
     names: &[&str],
+    rank_on: &[&str],
     segments: &[Segment],
     filter: bool,
 ) -> BTreeMap<String, Vec<f32>> {
-    let keys: Vec<&str> = names
+    let rank_on: Vec<&str> = rank_on
         .iter()
         .copied()
         .filter(|name| loaded.contains_key(*name))
         .collect();
-    let mask = filter.then(|| row_mask(loaded, segments, &keys));
+    let time_only: Vec<Segment> = segments
+        .iter()
+        .filter(|item| matches!(item, Segment::Range { column, .. } if column == "time_s"))
+        .cloned()
+        .collect();
+    let mask = if filter {
+        Some(row_mask(loaded, segments, &rank_on))
+    } else if time_only.is_empty() {
+        None
+    } else {
+        Some(row_mask(loaded, &time_only, &rank_on))
+    };
     let mut want: Vec<&str> = names.to_vec();
     for item in segments {
         match item {
@@ -1349,6 +1535,9 @@ fn dose_rate_table(table: &BTreeMap<String, Vec<f32>>) -> BTreeMap<String, Vec<f
     if let Some(avg) = table.get("session_avg_rate") {
         out.insert("session_avg_rate".to_string(), avg.clone());
     }
+    if let Some(time) = table.get("time_s") {
+        out.insert("time_s".to_string(), time.clone());
+    }
     out
 }
 
@@ -1398,7 +1587,7 @@ mod tests {
     use scan_kit_core::{apply_mask, parse_segments, BeamGate, Rank, Segment};
 
     use super::{
-        assign_x, axis_label, binned_summary, binned_trend, scatter_series, violin_series,
+        assign_x, axis_label, binned_trend, bins, plotted_columns, scatter_series, violin_series,
         BinChoice, Trend,
     };
 
@@ -1418,7 +1607,11 @@ mod tests {
         }) else {
             return;
         };
-        let scene = binned_summary(&root, &[session], &serde_json::json!({}));
+        let scene = bins(
+            &root,
+            &[session],
+            &serde_json::json!({"metric": "Dose Error (%)"}),
+        );
         assert!(
             scene
                 .panels
@@ -1460,14 +1653,18 @@ mod tests {
         )
         .unwrap();
         let ids = ["sess".to_string()];
-        let scatter = binned_summary(&root, &ids, &serde_json::json!({"glyph": "Scatter"}));
+        let scatter = bins(
+            &root,
+            &ids,
+            &serde_json::json!({"glyph": "Scatter", "metric": "Dose Error (%)"}),
+        );
         let dose = scatter
             .panels
             .iter()
             .find(|panel| panel.title.starts_with("IC1"))
             .unwrap();
         assert!(dose.xmin > 50.0, "scatter x is energy in MeV");
-        let position = binned_summary(
+        let position = bins(
             &root,
             &ids,
             &serde_json::json!({"metric": "Position Error (mm)"}),
@@ -1479,7 +1676,7 @@ mod tests {
             .unwrap();
         let marks = rect_ys(xerr);
         assert!(marks.iter().any(|value| (*value - 1.0).abs() < 1e-3));
-        let rate = binned_summary(
+        let rate = bins(
             &root,
             &ids,
             &serde_json::json!({"metric": "Dose Rate (MU/s)"}),
@@ -1505,7 +1702,7 @@ mod tests {
             "ic1_total_dose_spot,r_ic1_x_spot_sigma\n1,3\n",
         )
         .unwrap();
-        let scene = binned_summary(
+        let scene = bins(
             &root,
             &["sess".to_string()],
             &serde_json::json!({"metric": "Sigma (mm)"}),
@@ -1538,7 +1735,7 @@ mod tests {
         )
         .unwrap();
         let ids = ["sess".to_string()];
-        let iso = binned_summary(
+        let iso = bins(
             &root,
             &ids,
             &serde_json::json!({"metric": "Position Error (mm)"}),
@@ -1551,7 +1748,7 @@ mod tests {
         assert!(rect_ys(iso_x)
             .iter()
             .any(|value| (*value - 5.0).abs() < 1e-3));
-        let chamber = binned_summary(
+        let chamber = bins(
             &root,
             &ids,
             &serde_json::json!({"metric": "Position Error (mm)", "source": "chamber"}),
@@ -1581,7 +1778,7 @@ mod tests {
             "layer_id,ic1_total_dose_spot,time_s,time_ns\n1,1,1,0\n",
         )
         .unwrap();
-        let scene = binned_summary(
+        let scene = bins(
             &root,
             &["sess".to_string()],
             &serde_json::json!({"metric": "Spot Delivery Time"}),
@@ -1618,7 +1815,7 @@ mod tests {
             "spot_no,layer_id,point_time(ms)\n4,7,12.5\n",
         )
         .unwrap();
-        let scene = binned_summary(
+        let scene = bins(
             &root,
             &["sess".to_string()],
             &serde_json::json!({"metric": "Spot Delivery Time"}),
@@ -1647,7 +1844,7 @@ mod tests {
             "layer_id,rci_in_trigger,r_ic1_x_sigma,r_ic1_x_spot_error_code\n1,1,4,0\n1,1,30,0\n",
         )
         .unwrap();
-        let scene = binned_summary(
+        let scene = bins(
             &root,
             &["sess".to_string()],
             &serde_json::json!({"metric": "Sigma (mm)", "source": "timeslice_iso"}),
@@ -1688,7 +1885,7 @@ mod tests {
             "layer_id,spot_no,rci_in_trigger,r_ic1_x_position\n1,5,1,25\n",
         )
         .unwrap();
-        let scene = binned_summary(
+        let scene = bins(
             &root,
             &["sess".to_string()],
             &serde_json::json!({"metric": "Position Error (mm)", "source": "Timeslice — Isocenter"}),
@@ -1727,7 +1924,7 @@ mod tests {
             "layer_id,spot_no,rci_in_trigger,r_ic1_x_spot_position\n1,5,1,25\n",
         )
         .unwrap();
-        let scene = binned_summary(
+        let scene = bins(
             &root,
             &["sess".to_string()],
             &serde_json::json!({"metric": "Position Error (mm)", "source": "Timeslice — Isocenter"}),
@@ -1753,7 +1950,7 @@ mod tests {
             "layer_id,ic1_primary_channel,ic3_current_A\n1,12,3\n",
         )
         .unwrap();
-        let scene = binned_summary(
+        let scene = bins(
             &root,
             &["sess".to_string()],
             &serde_json::json!({"metric": "IC Current (nA)"}),
@@ -1795,7 +1992,7 @@ mod tests {
             "layer_id,ic1_primary_channel\n9,22\n",
         )
         .unwrap();
-        let scene = binned_summary(
+        let scene = bins(
             &root,
             &["sess".to_string()],
             &serde_json::json!({"metric": "IC Current (nA)", "glyph": "Scatter"}),
@@ -1846,7 +2043,7 @@ mod tests {
             "layer_id,spot_no,spot_no,spot_no,rci_in_trigger,r_ic2_x_position\n1,0,1,5,1,25\n",
         )
         .unwrap();
-        let scene = binned_summary(
+        let scene = bins(
             &root,
             &["sess".to_string()],
             &serde_json::json!({"metric": "Position Error (mm)", "source": "timeslice_iso"}),
@@ -1873,7 +2070,7 @@ mod tests {
             "layer_id,rci_in_trigger,r_ic1_x_sigma,r_ic1_x_confidence,ic1_x_fit_ok,r_ic1_x_spot_error_code\n1,1,4,50,1,0\n",
         )
         .unwrap();
-        let scene = binned_summary(
+        let scene = bins(
             &root,
             &["sess".to_string()],
             &serde_json::json!({"metric": "sigma", "source": "timeslice_iso"}),
@@ -1899,7 +2096,7 @@ mod tests {
             "layer_id,spot_no,rci_in_trigger,r_ic1_x_position,r_ic2_x_position\n1,1,1,70,60\n",
         )
         .unwrap();
-        let scene = binned_summary(
+        let scene = bins(
             &root,
             &["sess".to_string()],
             &serde_json::json!({"metric": "ic12_pos_diff", "source": "timeslice_chamber"}),
@@ -1917,7 +2114,7 @@ mod tests {
 
     #[test]
     fn spot_timeslice_switch_follows_the_metric_list() {
-        let spot = binned_summary(
+        let spot = bins(
             std::path::Path::new("."),
             &[],
             &serde_json::json!({"metric": "Dose Error (%)"}),
@@ -1952,13 +2149,13 @@ mod tests {
             .options
             .iter()
             .all(|option| option != "Fit Confidence"));
-        let bins = spot
+        let count = spot
             .controls
             .iter()
             .find(|control| control.id == "bins")
             .unwrap();
-        assert_eq!(bins.value, "Auto");
-        assert_eq!(bins.labels(), vec!["Auto", "8", "16", "32", "64"]);
+        assert_eq!(count.value, "Auto");
+        assert_eq!(count.labels(), vec!["Auto", "8", "16", "32", "64"]);
         let hist = spot
             .controls
             .iter()
@@ -1981,7 +2178,7 @@ mod tests {
         assert_eq!(trend.labels(), vec!["Off", "Linear", "Polynomial"]);
         assert!(spot.controls.iter().all(|control| control.id != "fliers"));
         assert!(spot.controls.iter().all(|control| control.id != "cutoff"));
-        let position = binned_summary(
+        let position = bins(
             std::path::Path::new("."),
             &[],
             &serde_json::json!({"metric": "position_error"}),
@@ -1995,7 +2192,7 @@ mod tests {
         assert_eq!(interlock.value, "Off");
         assert_eq!(interlock.labels(), vec!["Off", "On"]);
 
-        let switched = binned_summary(
+        let switched = bins(
             std::path::Path::new("."),
             &[],
             &serde_json::json!({"metric": "Dose Error (%)", "source": "Timeslice"}),
@@ -2005,7 +2202,7 @@ mod tests {
             .iter()
             .find(|control| control.id == "y")
             .unwrap();
-        assert_eq!(metric.value, "Current Ratios (%)");
+        assert_eq!(metric.value, "Position Error (mm)");
         for label in [
             "Fit Confidence",
             "Peak Amplitude",
@@ -2018,7 +2215,7 @@ mod tests {
                 "{label}"
             );
         }
-        let fit = binned_summary(
+        let fit = bins(
             std::path::Path::new("."),
             &[],
             &serde_json::json!({"metric": "Fit Confidence", "source": "Timeslice", "x": "Target MU"}),
@@ -2043,7 +2240,7 @@ mod tests {
             .iter()
             .all(|option| option != "Position Error (mm) (Chamber)"));
 
-        let position = binned_summary(
+        let position = bins(
             std::path::Path::new("."),
             &[],
             &serde_json::json!({"metric": "Position Error (mm) (Chamber)", "source": "Spot"}),
@@ -2061,7 +2258,7 @@ mod tests {
             .controls
             .iter()
             .all(|control| control.id != "frame"));
-        let slice = binned_summary(
+        let slice = bins(
             std::path::Path::new("."),
             &[],
             &serde_json::json!({"metric": "Position Error (mm)", "source": "Timeslice", "frame": "Chamber"}),
@@ -2078,7 +2275,7 @@ mod tests {
         assert!(slice.controls.iter().any(|control| control.id == "bins"));
         assert!(slice.controls.iter().all(|control| control.id != "frame"));
 
-        let current = binned_summary(
+        let current = bins(
             std::path::Path::new("."),
             &[],
             &serde_json::json!({"metric": "IC Current (nA)"}),
@@ -2109,11 +2306,15 @@ mod tests {
             .unwrap();
         }
         let ids = ["a".to_string(), "b".to_string()];
-        let own = binned_summary(&root, &ids, &serde_json::json!({"hist": "On"}));
-        let shared = binned_summary(
+        let own = bins(
             &root,
             &ids,
-            &serde_json::json!({"hist": "On", "shared": "On"}),
+            &serde_json::json!({"hist": "On", "metric": "Dose Error (%)"}),
+        );
+        let shared = bins(
+            &root,
+            &ids,
+            &serde_json::json!({"hist": "On", "shared": "On", "metric": "Dose Error (%)"}),
         );
         let hist = own
             .panels
@@ -2147,15 +2348,15 @@ mod tests {
         )
         .unwrap();
         let ids = ["a".to_string()];
-        let plot = binned_summary(
+        let plot = bins(
             &root,
             &ids,
-            &serde_json::json!({"hist": "On", "share": "Plot"}),
+            &serde_json::json!({"hist": "On", "share": "Plot", "metric": "Dose Error (%)"}),
         );
-        let page = binned_summary(
+        let page = bins(
             &root,
             &ids,
-            &serde_json::json!({"hist": "On", "share": "Page"}),
+            &serde_json::json!({"hist": "On", "share": "Page", "metric": "Dose Error (%)"}),
         );
         let plot_spans = probability_spans(&plot);
         let page_spans = probability_spans(&page);
@@ -2304,6 +2505,27 @@ mod tests {
         );
         assert_eq!(finite(&mad), vec![1000.0]);
 
+        let mut mixed = BTreeMap::new();
+        mixed.insert("ic1_x_err".to_string(), vec![0.2, 0.2, 0.2, 8.0, 0.2]);
+        mixed.insert("energy".to_string(), vec![70.0, 100.0, 150.0, 70.0, 230.0]);
+        let ranked = plotted_columns(
+            &mixed,
+            &["ic1_x_err", "energy"],
+            &["ic1_x_err"],
+            &[Segment::Rank {
+                which: Rank::Lower95,
+            }],
+            true,
+        );
+        assert!(
+            ranked["energy"].contains(&230.0),
+            "the high energy stays {ranked:?}"
+        );
+        assert!(
+            !ranked["ic1_x_err"].contains(&8.0),
+            "the position outlier goes {ranked:?}"
+        );
+
         let mut off = fresh();
         apply_mask(
             &mut off,
@@ -2332,7 +2554,7 @@ mod tests {
         assert!(!kept.contains(&0.0));
         assert!(kept.contains(&1000.0));
 
-        let dose = binned_summary(
+        let dose = bins(
             std::path::Path::new("."),
             &[],
             &serde_json::json!({"metric": "dose_error"}),
@@ -2352,7 +2574,7 @@ mod tests {
             ]
         );
         assert_eq!(listed.labels(), vec!["Beam", "Rank"]);
-        let current = binned_summary(
+        let current = bins(
             std::path::Path::new("."),
             &[],
             &serde_json::json!({"metric": "ic_current"}),
@@ -2369,10 +2591,10 @@ mod tests {
         assert!(current_list.iter().any(|item| matches!(
             item,
             Segment::Beam {
-                state: BeamGate::On
+                state: BeamGate::Both
             }
         )));
-        let rate = binned_summary(
+        let rate = bins(
             std::path::Path::new("."),
             &[],
             &serde_json::json!({"metric": "dose_rate"}),
@@ -2430,7 +2652,7 @@ mod tests {
         assert_eq!(axis_label("IC1 X", "Fit Confidence"), "IC1 X");
         assert_eq!(axis_label("X", "Amplifier Error (V)"), "X (V)");
         assert_eq!(axis_label("Y", "Probe Field (G)"), "Y (G)");
-        let scene = binned_summary(
+        let scene = bins(
             std::path::Path::new("."),
             &[],
             &serde_json::json!({"hist": "On", "corr": "On"}),
@@ -2603,7 +2825,7 @@ mod tests {
         let header = "ic1_total_dose_spot,r_ic1_x_spot_position,r_ic1_y_spot_position,r_ic2_x_spot_position,r_ic2_y_spot_position\n";
         write_position_session(&root, "a", &format!("{header}1,1,0,2,1\n1,2,3,6,4\n"));
         write_position_session(&root, "b", &format!("{header}1,3,1,0,2\n1,5,2,2,3\n"));
-        let scene = binned_summary(
+        let scene = bins(
             &root,
             &["a".to_string(), "b".to_string()],
             &serde_json::json!({"metric": "Position Error (mm)", "corr": "On"}),

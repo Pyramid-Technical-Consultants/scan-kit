@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Mutex, OnceLock};
 
-use scan_kit_core::{box_stats, linear_fit, Panel, Series};
+use scan_kit_core::{box_stats, cloud_series, linear_fit, scatter_cloud, CloudDraw, Panel, Series};
 
 use crate::histogram::histogram_panel;
 
@@ -260,6 +260,7 @@ pub(super) fn mean_series(
             ys: ys.clone(),
             color,
             radius: 3.5,
+            times: Vec::new(),
         },
         Series::Polyline {
             xs: curve.0,
@@ -285,12 +286,7 @@ pub(super) fn scatter_series(
             ys.push(*y);
         }
     }
-    Series::Points {
-        xs,
-        ys,
-        color,
-        radius: 2.5,
-    }
+    scatter_cloud(xs, ys, Vec::new(), color, 2.5)
 }
 
 pub(super) fn contour_series(
@@ -305,7 +301,12 @@ pub(super) fn contour_series(
             continue;
         };
         let Some(ys) = table.get(key) else { continue };
-        drawn.extend(contour_bands(xs, ys, cutoff_pct));
+        drawn.extend(cloud_series(
+            xs,
+            ys,
+            &[],
+            CloudDraw::Contour { cutoff: cutoff_pct },
+        ));
     }
     drawn
 }
@@ -532,12 +533,25 @@ pub(super) fn hist_panel(
         .filter_map(|table| table.get(series.key).map(Vec::as_slice))
         .filter(|column| column.iter().any(|value| value.is_finite()))
         .collect();
-    let guides: Vec<f32> = if position_guides
-        && matches!(
-            series.key,
-            "ic1_x_err" | "ic1_y_err" | "ic2_x_err" | "ic2_y_err"
-        ) {
+    let guides: Vec<f32> = if !position_guides {
+        Vec::new()
+    } else if matches!(
+        series.key,
+        "ic1_x_err"
+            | "ic1_y_err"
+            | "ic2_x_err"
+            | "ic2_y_err"
+            | "ic1_x_err_rel"
+            | "ic1_y_err_rel"
+            | "ic2_x_err_rel"
+            | "ic2_y_err_rel"
+    ) {
         vec![1.0, 2.0, 3.0, -1.0, -2.0, -3.0]
+    } else if matches!(
+        series.key,
+        "ic1_r_err" | "ic2_r_err" | "ic1_r_err_rel" | "ic2_r_err_rel"
+    ) {
+        vec![1.0, 2.0, 3.0]
     } else {
         Vec::new()
     };
@@ -577,6 +591,7 @@ pub(super) fn corr_panel(
             ys: ys.clone(),
             color: [0.8, 0.8, 0.8, 0.45],
             radius: 2.0,
+            times: Vec::new(),
         });
         if let Some((slope, intercept)) = linear_fit(&xs, &ys) {
             let (x0, x1) = span(&xs);
@@ -622,7 +637,10 @@ pub(super) fn interlock_guides(
     xmax: f32,
 ) -> Vec<Series> {
     let mut guides = Vec::new();
-    if metric == "position_error" || metric == "ic12_pos_diff" {
+    if matches!(
+        metric,
+        "position_error" | "position_error_rel" | "ic12_pos_diff"
+    ) {
         for (level, color) in [
             (1.0, [0.35, 0.75, 0.4, 0.85]),
             (2.0, [0.9, 0.6, 0.2, 0.85]),
@@ -630,6 +648,15 @@ pub(super) fn interlock_guides(
         ] {
             guides.push(hline(xmin, xmax, level, color));
             guides.push(hline(xmin, xmax, -level, color));
+        }
+    }
+    if matches!(metric, "distance_error" | "distance_error_rel") {
+        for (level, color) in [
+            (1.0, [0.35, 0.75, 0.4, 0.85]),
+            (2.0, [0.9, 0.6, 0.2, 0.85]),
+            (3.0, [0.85, 0.3, 0.25, 0.85]),
+        ] {
+            guides.push(hline(xmin, xmax, level, color));
         }
     }
     if metric == "dose_error" && x_column == "target_mu" {

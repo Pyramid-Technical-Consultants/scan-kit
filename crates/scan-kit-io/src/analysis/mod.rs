@@ -4,18 +4,15 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use scan_kit_core::{resolve_concept_column, Control, Panel, PlotScene, Series};
+use scan_kit_core::{finite_minmax, resolve_concept_column, Control, Panel, PlotScene, Series};
 use serde_json::{json, Value};
 
 pub(super) use super::discover;
-pub(super) use super::marks::{contour_bands, control, flag, labeled, pick, text};
+pub(super) use super::marks::{control, flag, labeled, pick, text};
 pub(super) use super::tables::{slice_table, spot_table, timeslice_metric, timeslice_signals};
 mod distribution;
-mod lines;
 mod session_log;
-mod spectrum;
 mod timeline;
-mod trajectory;
 
 /// A session series. `apply_palette` replaces the RGB and keeps this alpha.
 const MARK: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
@@ -36,20 +33,12 @@ pub fn analysis_scene(
         return Err("at most five sessions can be selected".to_owned());
     }
     match view {
-        "dose_accumulation" => Ok(lines::dose_accumulation(root, session_ids, options)),
-        "ic_peak_amplitude_beam_off" => Ok(lines::peak_amplitude(root, session_ids, options)),
-        "beam_motion_energy" => Ok(lines::beam_motion(root, session_ids)),
         "distribution" => Ok(distribution::distribution(root, session_ids, options)),
-        "binned_summary" => Ok(binned_summary(root, session_ids, options)),
-        "timeslice_replay" => Ok(timeline::replay(root, session_ids, options)),
-        "ic_fft_analysis" => Ok(spectrum::fft_view(root, session_ids, options)),
-        "ic_audio_player" => Ok(spectrum::audio_view(root, session_ids, options)),
-        "beam_off_rampdown" => Ok(timeline::rampdown(root, session_ids)),
-        "amplifier_correlation" => Ok(timeline::amplifier(root, session_ids)),
+        "bins" => Ok(super::bins::bins(root, session_ids, options)),
+        "timeline" => Ok(timeline::timeline(root, session_ids, options)),
         "ic_hv_transient" => Ok(timeline::hv_transient(root, session_ids)),
         "session_log_compare" => Ok(session_log::session_log(root, session_ids)),
-        "trajectory" => Ok(trajectory::trajectory(root, session_ids, options)),
-        "dose_volume" => Ok(crate::dose_view::dose_volume(
+        "volumetric" => Ok(crate::volumetric::volumetric(
             root,
             session_ids,
             options,
@@ -81,20 +70,18 @@ pub fn load_timeslice_columns(root: &Path, session_id: &str) -> Value {
     })
 }
 
-fn binned_summary(root: &Path, session_ids: &[String], options: &Value) -> PlotScene {
-    super::binned::binned_summary(root, session_ids, options)
-}
-
 fn scene(title: &str, panels: Vec<Panel>, controls: Vec<Control>) -> PlotScene {
     PlotScene {
         title: title.into(),
         panels,
         controls,
         table: None,
-        samples: Vec::new(),
         columns: 0,
         column_weights: Vec::new(),
         row_weights: Vec::new(),
+        side: 0,
+        row_splits: Vec::new(),
+        volume: scan_kit_core::VolumeMark::default(),
     }
 }
 
@@ -157,15 +144,10 @@ fn finite_col<'a>(table: &'a BTreeMap<String, Vec<f32>>, key: &str) -> Option<&'
 }
 
 fn span(values: &[f32]) -> (f32, f32) {
-    let mut lo = f32::MAX;
-    let mut hi = f32::MIN;
-    for value in values.iter().copied().filter(|v| v.is_finite()) {
-        lo = lo.min(value);
-        hi = hi.max(value);
-    }
-    if !lo.is_finite() {
-        (0.0, 1.0)
-    } else if (hi - lo).abs() < 1e-4 {
+    let Some((lo, hi)) = finite_minmax(values) else {
+        return (0.0, 1.0);
+    };
+    if (hi - lo).abs() < 1e-4 {
         (lo - 0.5, hi + 0.5)
     } else {
         (lo, hi)
@@ -213,41 +195,8 @@ fn session_channels(root: &Path, session: &str) -> super::tables::Table {
     timeslice_signals(root, session)
 }
 
-fn timeline(root: &Path, session_ids: &[String]) -> Vec<super::tables::Table> {
-    super::tables::map_sessions(session_ids, |session| session_channels(root, session))
-}
-
 pub(super) fn channel_key(name: &str) -> bool {
     !matches!(name, "energy" | "beam_on" | "beam_on_time" | "spot_time")
-}
-
-pub(super) fn finite_names(
-    session_ids: &[String],
-    tables: &[super::tables::Table],
-) -> Vec<(String, Vec<String>)> {
-    session_ids
-        .iter()
-        .zip(tables)
-        .map(|(id, table)| {
-            let mut columns: Vec<String> = table
-                .iter()
-                .filter(|(name, values)| {
-                    channel_key(name) && values.iter().any(|value| value.is_finite())
-                })
-                .map(|(name, _)| name.clone())
-                .collect();
-            columns.sort();
-            (id.clone(), columns)
-        })
-        .collect()
-}
-
-fn percentile_sorted(values: &[f32], p: f32) -> f32 {
-    if values.is_empty() {
-        return 0.0;
-    }
-    let index = ((values.len() - 1) as f32 * p).round() as usize;
-    values[index.min(values.len() - 1)]
 }
 
 fn series_span(series: &[Series]) -> (f32, f32, f32, f32) {
@@ -279,7 +228,7 @@ fn series_span(series: &[Series]) -> (f32, f32, f32, f32) {
 }
 #[cfg(test)]
 mod tests {
-    use scan_kit_core::{Family, SESSION};
+    use scan_kit_core::{CloudStyle, Family, SESSION};
 
     use super::distribution::{distribution_limits, reference_ring};
     use super::timeline::{robust_span, trace};
@@ -335,21 +284,6 @@ mod tests {
     }
 
     #[test]
-    fn sk_req_012_dose_accumulation_scene_has_cumulative_lines() {
-        let root = std::env::temp_dir().join(format!("scan-kit-view-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        write_session(&root);
-        let scene =
-            analysis_scene("dose_accumulation", &root, &["sess".into()], &json!({})).unwrap();
-        assert!(scene.panels.iter().any(|panel| panel.series.iter().any(|series| matches!(series, Series::Polyline { ys, .. } if ys.iter().any(|y| y.is_finite())))));
-        assert!(scene
-            .controls
-            .iter()
-            .any(|control| control.id == "calibrate"));
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
     fn sk_req_011_timeslice_load_reports_columns() {
         let root = std::env::temp_dir().join(format!("scan-kit-ts-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -374,10 +308,19 @@ mod tests {
     }
 
     fn scene_of(view: &str) -> PlotScene {
-        let root = std::env::temp_dir().join(format!("scan-kit-{view}-{}", std::process::id()));
+        opened(view, view, &json!({}))
+    }
+
+    fn opened(view: &str, tag: &str, options: &Value) -> PlotScene {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        // Parallel tests share a process id, so the folder also needs a call counter.
+        static SCENE: AtomicU64 = AtomicU64::new(0);
+        let n = SCENE.fetch_add(1, Ordering::Relaxed);
+        let root =
+            std::env::temp_dir().join(format!("scan-kit-{view}-{tag}-{n}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         write_session(&root);
-        let scene = analysis_scene(view, &root, &["sess".into()], &json!({})).unwrap();
+        let scene = analysis_scene(view, &root, &["sess".into()], options).unwrap();
         let _ = std::fs::remove_dir_all(&root);
         scene
     }
@@ -396,16 +339,6 @@ mod tests {
                 )
             })
         })
-    }
-
-    #[test]
-    fn sk_req_013_peak_amplitude_is_beam_off_bars() {
-        assert!(has_kind(&scene_of("ic_peak_amplitude_beam_off"), "bars"));
-    }
-
-    #[test]
-    fn sk_req_014_beam_motion_draws_spill_paths() {
-        assert!(has_kind(&scene_of("beam_motion_energy"), "line"));
     }
 
     #[test]
@@ -581,7 +514,7 @@ mod tests {
                         matches!(
                             item,
                             scan_kit_core::Segment::Beam {
-                                state: scan_kit_core::BeamGate::On
+                                state: scan_kit_core::BeamGate::Both
                             }
                         )
                     })
@@ -591,7 +524,7 @@ mod tests {
             "distribution",
             &root,
             &["sess".into()],
-            &json!({"mode": "Amplifier"}),
+            &json!({"mode": "amplifier"}),
         )
         .unwrap();
         assert!(amplifier.panels.iter().any(|panel| {
@@ -605,6 +538,68 @@ mod tests {
                     .iter()
                     .any(|series| matches!(series, Series::Bars { .. }))
         }));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn cloud(scene: &PlotScene, x_label: &str) -> (Vec<f32>, Vec<f32>) {
+        let panel = scene
+            .panels
+            .iter()
+            .find(|panel| panel.equal && panel.x_label == x_label)
+            .unwrap_or_else(|| panic!("missing {x_label}"));
+        let mut xs = Vec::new();
+        let mut ys = Vec::new();
+        for series in &panel.series {
+            if let Series::Points { xs: px, ys: py, .. } = series {
+                xs.extend(px.iter().copied());
+                ys.extend(py.iter().copied());
+            }
+        }
+        (xs, ys)
+    }
+
+    fn near(got: &[f32], expect: &[f32]) {
+        assert_eq!(got.len(), expect.len());
+        for (left, right) in got.iter().zip(expect) {
+            assert!((left - right).abs() < 1.0e-4, "{left} vs {right}");
+        }
+    }
+
+    #[test]
+    fn sk_req_034_amplifier_voltage_is_not_the_error() {
+        let root = std::env::temp_dir().join(format!("scan-kit-amp-v-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let session = root.join("sess");
+        std::fs::create_dir_all(&session).unwrap();
+        std::fs::write(session.join("input_map.csv"), "energy\n70\n").unwrap();
+        std::fs::write(
+            session.join("000_timeslice_data_device_units.csv"),
+            "rci_in_trigger,c_x,c_y,r_xV,r_yV\n1,1,2,1.2,2.4\n1,1,2,1.1,2.3\n",
+        )
+        .unwrap();
+        let voltage = analysis_scene(
+            "distribution",
+            &root,
+            &["sess".into()],
+            &json!({"xy": "Amplifier (V)"}),
+        )
+        .unwrap();
+        let (command_x, command_y) = cloud(&voltage, "Command X (V)");
+        near(&command_x, &[1.0, 1.0]);
+        near(&command_y, &[2.0, 2.0]);
+        let (read_x, read_y) = cloud(&voltage, "Readback X (V)");
+        near(&read_x, &[1.2, 1.1]);
+        near(&read_y, &[2.4, 2.3]);
+        let error = analysis_scene(
+            "distribution",
+            &root,
+            &["sess".into()],
+            &json!({"xy": "Amplifier Error (V)"}),
+        )
+        .unwrap();
+        let (error_x, error_y) = cloud(&error, "X Error (V)");
+        near(&error_x, &[0.2, 0.1]);
+        near(&error_y, &[0.4, 0.3]);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -718,8 +713,8 @@ mod tests {
     }
 
     #[test]
-    fn sk_req_017_binned_summary_and_replay_share_the_session() {
-        let binned = scene_of("binned_summary");
+    fn sk_req_017_bins_and_timeline_share_the_session() {
+        let binned = opened("bins", "bins", &json!({"metric": "Dose Error (%)"}));
         assert!(has_kind(&binned, "triangles"));
         assert!(binned
             .controls
@@ -739,20 +734,382 @@ mod tests {
             _ => false,
         }));
         assert!(ic1.x_labels.iter().any(|label| label == "70"));
-        let replay = scene_of("timeslice_replay");
+        let replay = scene_of("timeline");
         assert!(has_kind(&replay, "line"));
         assert_eq!(replay.columns, 1);
-        assert_eq!(replay.panels.len(), 1);
-        let Series::Polyline { xs, .. } = &replay.panels[0].series[0] else {
-            panic!("replay should be one trace");
-        };
-        assert_eq!(xs.len(), 32);
-        assert!(replay.panels.iter().all(|panel| panel.xmax < 1.0));
+        assert_eq!(replay.side, 0);
+        let y = replay
+            .controls
+            .iter()
+            .find(|control| control.id == "y")
+            .unwrap();
+        assert_eq!(y.value, "IC Current (nA)");
+        assert!(y.labels().contains(&"Amplifier Error (V)"));
+        assert!(replay.controls.iter().any(|control| {
+            control.id == "ch_ic1_current" && control.kind == "check" && control.value == "On"
+        }));
+        assert!(replay
+            .controls
+            .iter()
+            .any(|control| control.id == "segments"));
         assert!(replay
             .panels
             .iter()
-            .any(|panel| panel.y_label == "IC1 Current (nA)"));
-        assert!(replay.controls.iter().all(|control| control.id != "scrub"));
+            .any(|panel| panel.title.is_empty() && panel.y_label == "IC1 (nA)"));
+        let Series::Polyline { xs, ys, .. } = &replay.panels[0].series[0] else {
+            panic!("replay should be one trace");
+        };
+        assert_eq!(xs.len(), 32);
+        let kept: Vec<f32> = ys
+            .iter()
+            .copied()
+            .filter(|value| value.is_finite())
+            .collect();
+        assert_eq!(kept.len(), 32, "the default beam filter keeps on and off");
+        let on_only = scan_kit_core::segments_json(&[
+            scan_kit_core::Segment::Beam {
+                state: scan_kit_core::BeamGate::On,
+            },
+            scan_kit_core::Segment::Rank {
+                which: scan_kit_core::Rank::All,
+            },
+        ]);
+        let gated = opened("timeline", "beam-on", &json!({ "segments": on_only }));
+        let (xmin, xmax, y_span) = {
+            let time = &gated.panels[0];
+            (time.xmin, time.xmax, time.ymax - time.ymin)
+        };
+        let Series::Polyline { ys, .. } = &gated.panels[0].series[0] else {
+            panic!("replay should be one trace");
+        };
+        assert!(xmin > 0.004 && xmin < 0.009, "{xmin}");
+        assert!(xmax > 0.022 && xmax < 0.028, "{xmax}");
+        let on: Vec<f32> = ys
+            .iter()
+            .copied()
+            .filter(|value| value.is_finite())
+            .collect();
+        assert_eq!(on.len(), 16, "beam-on rows stay, beam-off rows drop out");
+        assert!(y_span < on[0].abs().max(1.0e-6) * 0.2, "{y_span}");
+        assert!(on
+            .iter()
+            .all(|value| (*value - on[0]).abs() <= on[0].abs() * 1e-4));
+        let scrub = replay
+            .controls
+            .iter()
+            .find(|control| control.id == "scrub")
+            .unwrap();
+        assert_eq!(scrub.kind, "scrub");
+        let scrub_value: serde_json::Value = serde_json::from_str(&scrub.value).unwrap();
+        assert_eq!(scrub_value["on"], false);
+        assert_eq!(scrub_value["speed"], 1.0);
+        assert_eq!(scrub_value["window"], "second");
+        assert!(replay.controls.iter().all(|control| control.id != "x"));
+    }
+
+    fn finite_ys(scene: &PlotScene) -> Vec<f32> {
+        let mut kept = Vec::new();
+        for panel in &scene.panels {
+            for series in &panel.series {
+                let ys = match series {
+                    Series::Polyline { ys, .. } | Series::Points { ys, .. } => ys,
+                    _ => continue,
+                };
+                kept.extend(ys.iter().copied().filter(|value| value.is_finite()));
+            }
+        }
+        kept
+    }
+
+    #[test]
+    fn scrub_drops_rows_past_the_playhead() {
+        let scrub = r#"{"on":true,"at":0.01,"speed":1,"window":"before"}"#;
+        let replay = opened("timeline", "scrub", &json!({ "scrub": scrub }));
+        let Series::Polyline { ys, .. } = &replay.panels[0].series[0] else {
+            panic!("replay should be one trace");
+        };
+        let kept = ys.iter().filter(|value| value.is_finite()).count();
+        assert_eq!(kept, 32, "time traces keep every sample");
+        assert!(replay.panels[0].xmax < 0.015, "{}", replay.panels[0].xmax);
+        assert!(replay.panels[0].xmin < 0.002, "{}", replay.panels[0].xmin);
+        assert!(ys[8].is_finite());
+        assert!(
+            ys[23].is_finite(),
+            "rows past the playhead stay in the trace"
+        );
+
+        let full = opened(
+            "bins",
+            "scrub-full",
+            &json!({ "y": "IC Current (nA)", "glyph": "Scatter" }),
+        );
+        let cut = opened(
+            "bins",
+            "scrub-cut",
+            &json!({ "y": "IC Current (nA)", "glyph": "Scatter", "scrub": scrub }),
+        );
+        let full_n = finite_ys(&full).len();
+        let cut_n = finite_ys(&cut).len();
+        assert!(full_n > cut_n, "{full_n} vs {cut_n}");
+        assert!(cut_n > 0);
+
+        let spread = opened("distribution", "scrub-full", &json!({ "xy": "probe" }));
+        let window = opened(
+            "distribution",
+            "scrub-cut",
+            &json!({ "xy": "probe", "scrub": scrub }),
+        );
+        let spread_n = finite_ys(&spread).len();
+        let window_n = finite_ys(&window).len();
+        assert!(spread_n > window_n, "{spread_n} vs {window_n}");
+        assert!(window_n > 0);
+        for scene in [&replay, &cut, &window] {
+            let listed = scene
+                .controls
+                .iter()
+                .find(|control| control.id == "segments")
+                .unwrap();
+            assert!(
+                !listed.value.contains("time_s"),
+                "the playhead is not a sidebar segment"
+            );
+        }
+    }
+
+    #[test]
+    fn replay_filters_beam_off_and_draws_amplifier_with_a_scatter() {
+        let off = scan_kit_core::segments_json(&[scan_kit_core::Segment::Beam {
+            state: scan_kit_core::BeamGate::Off,
+        }]);
+        let filtered = opened("timeline", "beam-off", &json!({ "segments": off }));
+        let Series::Polyline { ys, .. } = &filtered.panels[0].series[0] else {
+            panic!("replay should be one trace");
+        };
+        let off_rows: Vec<f32> = ys
+            .iter()
+            .copied()
+            .filter(|value| value.is_finite())
+            .collect();
+        assert_eq!(off_rows.len(), 16);
+        assert!(off_rows
+            .windows(2)
+            .any(|pair| (pair[0] - pair[1]).abs() > 1.0));
+
+        let root = std::env::temp_dir().join(format!("scan-kit-replay-amp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let session = root.join("sess");
+        std::fs::create_dir_all(&session).unwrap();
+        std::fs::write(
+            session.join("input_map.csv"),
+            "energy,charge_req,position_x,position_y\n70,1,0,0\n",
+        )
+        .unwrap();
+        std::fs::write(
+            session.join("000_timeslice_data_device_units.csv"),
+            "rci_in_trigger,c_x,r_xV,c_y,r_yV\n1,1.0,1.5,2.0,2.4\n1,1.1,1.6,2.1,2.5\n1,1.2,1.7,2.2,2.6\n1,1.3,1.8,2.3,2.7\n",
+        )
+        .unwrap();
+        let amp = analysis_scene(
+            "timeline",
+            &root,
+            &["sess".into()],
+            &json!({"y": "amplifier_error"}),
+        )
+        .unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(amp.panels.iter().all(|panel| panel.title.is_empty()));
+        let labels: Vec<&str> = amp
+            .panels
+            .iter()
+            .map(|panel| panel.y_label.as_str())
+            .collect();
+        assert_eq!(labels, vec!["X (V)", "Y (V)"]);
+
+        let scatter = opened("timeline", "scatter", &json!({ "scatter": "On" }));
+        let distribution = opened(
+            "distribution",
+            "scatter-source",
+            &json!({ "source": "Timeslice" }),
+        );
+        assert!(scatter.side >= 1);
+        assert_eq!(scatter.columns, 2);
+        assert_eq!(scatter.column_weights, vec![3.0, 1.4]);
+        assert!(scatter
+            .controls
+            .iter()
+            .all(|control| control.id != "scatter_source"));
+        let scatter_xy = scatter
+            .controls
+            .iter()
+            .find(|control| control.id == "scatter_xy")
+            .unwrap();
+        let distribution_xy = distribution
+            .controls
+            .iter()
+            .find(|control| control.id == "xy")
+            .unwrap();
+        assert_eq!(scatter_xy.labels(), distribution_xy.labels());
+    }
+
+    #[test]
+    fn timeline_scatter_keeps_rows_past_the_playhead() {
+        let scrub = r#"{"on":true,"at":0.01,"speed":1,"window":"before"}"#;
+        let scene = opened(
+            "timeline",
+            "scatter-live",
+            &json!({ "scatter": "On", "scatter_xy": "probe", "scrub": scrub }),
+        );
+        let Some(Series::Points { xs, times, .. }) = scene
+            .panels
+            .iter()
+            .flat_map(|panel| &panel.series)
+            .find(|series| matches!(series, Series::Points { times, .. } if !times.is_empty()))
+        else {
+            panic!("scatter should keep a time on every point");
+        };
+        assert_eq!(xs.len(), times.len());
+        assert!(
+            times.iter().any(|time| *time > 0.02),
+            "rows past the playhead stay in the cloud {times:?}"
+        );
+        assert!(times.iter().any(|time| *time <= 0.01));
+    }
+
+    #[test]
+    fn timeline_distribution_switches_scatter_contour_and_density() {
+        let off = scene_of("timeline");
+        assert_eq!(
+            off.controls
+                .iter()
+                .find(|control| control.id == "scatter")
+                .unwrap()
+                .label,
+            "Distribution"
+        );
+        assert!(off.controls.iter().all(|control| control.id != "draw"));
+
+        let scatter = opened(
+            "timeline",
+            "dist-scatter",
+            &json!({ "scatter": "On", "scatter_xy": "probe", "draw": "Scatter" }),
+        );
+        let style = scatter
+            .controls
+            .iter()
+            .find(|control| control.id == "draw")
+            .unwrap();
+        assert_eq!(style.labels(), vec!["Scatter", "Contour", "Density"]);
+        assert_eq!(style.value, "Scatter");
+        assert_eq!(style.group, "Distribution");
+        assert!(scatter
+            .controls
+            .iter()
+            .filter(|control| { matches!(control.id.as_str(), "scatter" | "scatter_xy" | "draw") })
+            .all(|control| control.group == "Distribution"));
+        assert!(scatter
+            .controls
+            .iter()
+            .all(|control| control.id != "hist_bins"));
+        assert!(has_kind(&scatter, "points"));
+        assert!(!has_kind(&scatter, "bars"));
+        assert!(!has_kind(&scatter, "heat"));
+
+        let density = opened(
+            "timeline",
+            "dist-density",
+            &json!({ "scatter": "On", "scatter_xy": "probe", "draw": "Density" }),
+        );
+        assert_eq!(
+            density
+                .controls
+                .iter()
+                .find(|control| control.id == "draw")
+                .unwrap()
+                .value,
+            "Density"
+        );
+        assert!(density
+            .controls
+            .iter()
+            .any(|control| { control.id == "ramp" && control.group == "Distribution" }));
+        assert!(has_kind(&density, "heat"));
+        assert!(!has_kind(&density, "bars"));
+        assert!(!density.panels.iter().any(|panel| {
+            panel
+                .series
+                .iter()
+                .any(|series| matches!(series, Series::Points { .. }))
+        }));
+        assert!(density.panels.iter().any(|panel| {
+            panel.series.iter().any(|series| {
+                matches!(
+                    series,
+                    Series::Cloud {
+                        times,
+                        style: CloudStyle::Density,
+                        ..
+                    } if !times.is_empty()
+                )
+            })
+        }));
+        let scrub = r#"{"on":true,"at":0.01,"speed":1,"window":"before"}"#;
+        let scrubbed = opened(
+            "timeline",
+            "dist-density-live",
+            &json!({ "scatter": "On", "scatter_xy": "probe", "draw": "Density", "scrub": scrub }),
+        );
+        let Some(Series::Cloud { times, .. }) = scrubbed
+            .panels
+            .iter()
+            .flat_map(|panel| &panel.series)
+            .find(|series| {
+                matches!(
+                    series,
+                    Series::Cloud {
+                        style: CloudStyle::Density,
+                        ..
+                    }
+                )
+            })
+        else {
+            panic!("a scrubbed density keeps the timed cloud");
+        };
+        assert!(
+            times.iter().any(|time| *time > 0.02),
+            "rows past the playhead stay in the density cloud {times:?}"
+        );
+
+        let contour = opened(
+            "timeline",
+            "dist-contour",
+            &json!({ "scatter": "On", "scatter_xy": "probe", "draw": "Contour" }),
+        );
+        assert_eq!(
+            contour
+                .controls
+                .iter()
+                .find(|control| control.id == "draw")
+                .unwrap()
+                .value,
+            "Contour"
+        );
+        assert!(contour.controls.iter().any(|control| {
+            control.id == "cutoff" && control.value == "5" && control.group == "Distribution"
+        }));
+        assert!(has_kind(&contour, "triangles"));
+        assert!(!has_kind(&contour, "bars"));
+        assert!(contour.panels.iter().any(|panel| {
+            panel.series.iter().any(|series| {
+                matches!(
+                    series,
+                    Series::Cloud {
+                        times,
+                        style: CloudStyle::Contour,
+                        ..
+                    } if !times.is_empty()
+                )
+            })
+        }));
     }
 
     #[test]
@@ -775,44 +1132,77 @@ mod tests {
     }
 
     #[test]
-    fn sk_req_018_fft_and_audio_share_the_spectrum() {
-        let fft = scene_of("ic_fft_analysis");
-        assert!(has_kind(&fft, "line"));
-        assert!(fft.panels.iter().any(|panel| panel.y_label == "log10 PSD"));
-        let audio = scene_of("ic_audio_player");
-        assert!(!audio.samples.is_empty());
-        assert_eq!(audio.title, "Audio Explorer");
+    fn sk_req_018_fft_draws_a_spectrum() {
+        let fft = opened("timeline", "fft", &json!({ "fft": "On", "beam": "Both" }));
+        assert_eq!(fft.title, "Timeline");
+        assert_eq!(fft.columns, 2);
+        assert_eq!(fft.side, 0);
+        assert_eq!(fft.column_weights, vec![3.0, 1.4]);
+        assert!(fft.panels.len() >= 2 && fft.panels.len().is_multiple_of(2));
+        for pair in fft.panels.chunks(2) {
+            assert_eq!(pair[1].y_label, "log10 PSD");
+            assert_eq!(pair[1].x_label, "Hz");
+            assert_eq!(pair[1].xmin, 1.0);
+            assert_eq!(pair[1].xmax, 500.0);
+            assert!(pair[1].series.iter().any(|series| {
+                matches!(series, Series::Polyline { ys, .. } if ys.iter().any(|value| value.is_finite()))
+            }));
+        }
+        let off = scene_of("timeline");
+        assert!(off.panels.iter().all(|panel| panel.y_label != "log10 PSD"));
+        assert!(off.controls.iter().any(|control| control.id == "fft"));
+
+        let both = opened(
+            "timeline",
+            "fft-scatter",
+            &json!({ "fft": "On", "scatter": "On" }),
+        );
+        assert_eq!(both.columns, 2);
+        assert_eq!(both.column_weights, vec![3.0, 1.4, 1.4]);
+        assert!(both.side >= 1);
+        let main = both.panels.len() - both.side as usize;
+        assert_eq!(main % 2, 0);
+        assert_eq!(both.panels[1].y_label, "log10 PSD");
     }
 
     #[test]
-    fn sk_req_022_rampdown_amplifier_and_hv() {
-        assert!(has_kind(&scene_of("beam_off_rampdown"), "line"));
-        assert!(has_kind(&scene_of("amplifier_correlation"), "points"));
+    fn sk_req_022_hv_draws_the_current() {
         assert!(has_kind(&scene_of("ic_hv_transient"), "line"));
     }
 
     #[test]
-    fn sk_req_026_trajectory_projects_a_path() {
-        assert!(has_kind(&scene_of("trajectory"), "line"));
-    }
-
-    #[test]
-    fn sk_req_028_dose_volume_has_slices_dvh_and_gamma() {
-        let scene = scene_of("dose_volume");
+    fn sk_req_028_volumetric_has_slices_dvh_and_gamma() {
+        let scene = opened(
+            "volumetric",
+            "req-028",
+            &json!({"plot0": "DVH", "plot1": "Gamma histogram"}),
+        );
+        assert_eq!(scene.columns, 2);
+        assert_eq!(scene.panels.len(), 6);
         assert!(has_kind(&scene, "heat"));
         assert!(scene.panels.iter().any(|panel| panel.title.contains("DVH")));
         assert!(scene
             .panels
             .iter()
-            .any(|panel| panel.title.contains("gamma")));
+            .any(|panel| panel.title.contains("Gamma") && panel.title.contains('%')));
         assert!(scene
             .panels
             .iter()
-            .any(|panel| panel.title.contains("sagittal")));
+            .any(|panel| panel.title.contains("Sagittal")));
         assert!(scene
             .panels
             .iter()
-            .any(|panel| panel.title.contains("coronal")));
+            .any(|panel| panel.title.contains("Coronal")));
+        assert!(scene.panels.iter().any(|panel| panel.title == "3D"));
+        let defaults = scene_of("volumetric");
+        assert!(defaults
+            .panels
+            .iter()
+            .any(|panel| panel.title.contains("Depth")));
+        assert!(defaults
+            .panels
+            .iter()
+            .any(|panel| panel.title.contains("Lateral")));
         assert!(scene.panels.iter().any(|panel| {
             panel.series.iter().any(|series| {
                 matches!(
@@ -829,15 +1219,15 @@ mod tests {
     }
 
     #[test]
-    fn dose_volume_difference_drops_a_sequential_scale() {
+    fn volumetric_difference_drops_a_sequential_scale() {
         let root = std::env::temp_dir().join(format!("scan-kit-dose-diff-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         write_session(&root);
         let scene = analysis_scene(
-            "dose_volume",
+            "volumetric",
             &root,
             &["sess".into()],
-            &json!({"compare": "Difference", "scale": "Turbo"}),
+            &json!({"compare": "Difference", "scale": "Turbo", "plot1": "Gamma histogram"}),
         )
         .unwrap();
         let _ = std::fs::remove_dir_all(&root);
@@ -856,7 +1246,7 @@ mod tests {
         assert!(scene
             .panels
             .iter()
-            .any(|panel| panel.title.contains("gamma") && panel.title.contains('%')));
+            .any(|panel| panel.title.contains("Gamma") && panel.title.contains('%')));
     }
 
     #[test]
@@ -867,7 +1257,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         write_session(&root);
         scan_kit_dicom::write_water_study(&study).unwrap();
-        let scene = crate::dose_volume(
+        let scene = crate::volumetric::volumetric(
             &root,
             &["sess".into()],
             &serde_json::json!({"study": study.display().to_string(), "model": "Monte Carlo"}),
@@ -876,6 +1266,7 @@ mod tests {
                     return Err("expected a patient job".into());
                 };
                 assert!(request.dose_to_water);
+                assert!(!request.score_let);
                 assert_eq!(request.seed, 1);
                 assert_eq!(request.material.len(), 32);
                 assert!(request.protons.iter().any(|weight| *weight > 0.0));
@@ -888,6 +1279,7 @@ mod tests {
                     },
                     uncertainty: 0.0,
                     ledger: [1.0, 1.0, 0.0, 0.0, 0.0, 0.0],
+                    let_d: Vec::new(),
                 })
             }),
         );
@@ -900,14 +1292,14 @@ mod tests {
         assert!(scene
             .panels
             .iter()
-            .any(|panel| panel.title.contains("gamma") && panel.title.contains('%')));
+            .any(|panel| panel.title.contains("Gamma") && panel.title.contains('%')));
         assert!(scene.table.as_ref().is_some_and(|table| {
             table.rows.iter().any(|row| {
                 row.iter()
                     .any(|cell| cell.contains("Gamma") || cell.contains("PTV"))
             })
         }));
-        let plain = scene_of("dose_volume");
+        let plain = scene_of("volumetric");
         assert!(plain
             .controls
             .iter()
@@ -950,7 +1342,7 @@ mod tests {
         assert!(names.contains(&"r_ic1_current_dose"));
         assert!(!names.contains(&"only_sibling"));
         assert_eq!(loaded["energy_layers"], 1);
-        let scene = analysis_scene("binned_summary", &root, &["a".into()], &json!({})).unwrap();
+        let scene = analysis_scene("bins", &root, &["a".into()], &json!({})).unwrap();
         assert!(scene
             .panels
             .iter()

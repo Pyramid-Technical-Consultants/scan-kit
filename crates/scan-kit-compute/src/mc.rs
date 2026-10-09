@@ -3,6 +3,7 @@
 //! [`McRun`] is the sliced form of the same transport. [`run_mc`] drains it.
 
 use std::future::Future;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use scan_kit_core::{
@@ -47,6 +48,9 @@ fn main(@builtin(global_invocation_id) g: vec3u, @builtin(num_workgroups) nwg: v
     if (P.mode == 1) { dose_out[i] = s * P.gain; }
 }
 "#;
+
+/// How often a running transport copies the cube for the view.
+const PREVIEW_GAP: Duration = Duration::from_millis(200);
 
 const QUANTUM_MEV: f64 = 1e-4;
 const MEV_TO_J: f64 = 1.602176634e-13;
@@ -209,6 +213,8 @@ struct Live {
     previews: u32,
     last_preview: Instant,
     cached: Option<McResult>,
+    score_let: bool,
+    let_buf: wgpu::Buffer,
 }
 
 fn slab_launch(request: &SlabRequest) -> Result<Launch, ComputeError> {
@@ -321,7 +327,7 @@ fn patient_launch(request: &PatientRequest) -> Result<Launch, ComputeError> {
         spots: kept_spots,
         protons,
         mode: 1,
-        flags: if request.dose_to_water { 1 } else { 0 },
+        flags: u32::from(request.dose_to_water) | (u32::from(request.score_let) * 2),
         origin_cm: request.origin_mm.map(|mm| mm / 10.0),
         spacing_cm: spacing,
         shape: request.shape,
@@ -354,22 +360,39 @@ fn empty_result(launch: &Launch) -> McResult {
         },
         uncertainty: 0.0,
         ledger: [0.0; 6],
+        let_d: Vec::new(),
     }
 }
 
-async fn prepare(launch: Launch) -> Result<Live, ComputeError> {
-    let [nx, ny, nz] = launch.shape;
-    let nvox = nx.saturating_mul(ny).saturating_mul(nz).max(1);
-    let (device, queue) = mc_device().await?;
-    let tables = mc_tables();
-    let histories = batch_count(launch.histories);
-    let per_batch = (histories / 10).clamp(1, 100_000);
-    let histories = histories / per_batch * per_batch;
-    let volume_cm3 = f64::from(launch.spacing_cm[0])
-        * f64::from(launch.spacing_cm[1])
-        * f64::from(launch.spacing_cm[2]);
-    let scale = (QUANTUM_MEV * launch.protons * MEV_TO_J / (volume_cm3 * 1e-3)) as f32;
+struct McGpu {
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    transport_layout: wgpu::BindGroupLayout,
+    fold_layout: wgpu::BindGroupLayout,
+    transport_pipe: wgpu::ComputePipeline,
+    fold_pipe: wgpu::ComputePipeline,
+}
 
+/// One device and one compiled transport for the process. Opening a device and
+/// the transport shader is the slow part of switching into Monte Carlo.
+/// ponytail: one shared queue. Two runs at once interleave submits on it.
+async fn shared_gpu() -> Result<Arc<McGpu>, ComputeError> {
+    static GPU: Mutex<Option<Arc<McGpu>>> = Mutex::new(None);
+    if let Some(gpu) = GPU
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .as_ref()
+        .map(Arc::clone)
+    {
+        return Ok(gpu);
+    }
+    let gpu = Arc::new(open_gpu().await?);
+    *GPU.lock().unwrap_or_else(|err| err.into_inner()) = Some(Arc::clone(&gpu));
+    Ok(gpu)
+}
+
+async fn open_gpu() -> Result<McGpu, ComputeError> {
+    let (device, queue) = mc_device().await?;
     let transport = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("mc transport"),
         source: wgpu::ShaderSource::Wgsl(TRANSPORT.into()),
@@ -403,8 +426,34 @@ async fn prepare(launch: Launch) -> Result<Live, ComputeError> {
             uniform(),
         ],
     );
-    let transport_pipe = pipeline(&device, &transport_layout, &transport);
-    let fold_pipe = pipeline(&device, &fold_layout, &fold);
+    Ok(McGpu {
+        transport_pipe: pipeline(&device, &transport_layout, &transport),
+        fold_pipe: pipeline(&device, &fold_layout, &fold),
+        device,
+        queue,
+        transport_layout,
+        fold_layout,
+    })
+}
+
+async fn prepare(launch: Launch) -> Result<Live, ComputeError> {
+    let [nx, ny, nz] = launch.shape;
+    let nvox = nx.saturating_mul(ny).saturating_mul(nz).max(1);
+    let gpu = shared_gpu().await?;
+    let device = gpu.device.clone();
+    let queue = gpu.queue.clone();
+    let transport_layout = gpu.transport_layout.clone();
+    let fold_layout = gpu.fold_layout.clone();
+    let transport_pipe = gpu.transport_pipe.clone();
+    let fold_pipe = gpu.fold_pipe.clone();
+    let tables = mc_tables();
+    let histories = batch_count(launch.histories);
+    let per_batch = (histories / 10).clamp(1, 100_000);
+    let histories = histories / per_batch * per_batch;
+    let volume_cm3 = f64::from(launch.spacing_cm[0])
+        * f64::from(launch.spacing_cm[1])
+        * f64::from(launch.spacing_cm[2]);
+    let scale = (QUANTUM_MEV * launch.protons * MEV_TO_J / (volume_cm3 * 1e-3)) as f32;
 
     let spots = storage_init(&device, &f32_bytes(&launch.spots));
     let floats = storage_init(&device, &f32_bytes(&tables.floats));
@@ -414,7 +463,8 @@ async fn prepare(launch: Launch) -> Result<Live, ComputeError> {
     let params = uniform_buf(&device, 80);
     let material = storage_init(&device, &u32_bytes(&launch.material));
     let density = storage_init(&device, &f32_bytes(&launch.density));
-    let let_tally = storage_zero(&device, 4);
+    let score_let = launch.flags & 2 != 0;
+    let let_buf = storage_zero(&device, if score_let { (nvox * 16) as u64 } else { 4 });
     let beams = storage_init(&device, &f32_bytes(&launch.beams));
     let sum = storage_zero(&device, (nvox * 4) as u64);
     let sq = storage_zero(&device, (nvox * 4) as u64);
@@ -425,8 +475,7 @@ async fn prepare(launch: Launch) -> Result<Live, ComputeError> {
         &device,
         &transport_layout,
         &[
-            &spots, &floats, &ints, &tally, &ledger, &params, &material, &density, &let_tally,
-            &beams,
+            &spots, &floats, &ints, &tally, &ledger, &params, &material, &density, &let_buf, &beams,
         ],
     );
     let fold_group = bind(
@@ -456,9 +505,7 @@ async fn prepare(launch: Launch) -> Result<Live, ComputeError> {
         out,
         sum,
         sq,
-        kept: vec![
-            spots, floats, ints, tally, material, density, let_tally, beams,
-        ],
+        kept: vec![spots, floats, ints, tally, material, density, beams],
         base,
         next: 0,
         histories,
@@ -476,6 +523,8 @@ async fn prepare(launch: Launch) -> Result<Live, ComputeError> {
         previews: 0,
         last_preview: Instant::now(),
         cached: None,
+        score_let,
+        let_buf,
     })
 }
 
@@ -514,6 +563,7 @@ impl Live {
                 ComputeError::Message("monte carlo finished without a dose".into())
             })?));
         }
+        let mut published = None;
         if self.inflight {
             let blocked = self.wait_fence()?;
             self.inflight = false;
@@ -521,12 +571,15 @@ impl Live {
             if cancel.is_cancelled() {
                 return Ok(Slice::Cancelled);
             }
-            if self.next > 0
-                && (self.previews == 0 || self.last_preview.elapsed() >= Duration::from_millis(100))
-            {
+            // The first chunk is the rough cube. Later copies are a few times a
+            // second, so the view can sharpen while the next chunk is in flight.
+            let fresh =
+                self.next > 0 && (self.previews == 0 || self.last_preview.elapsed() >= PREVIEW_GAP);
+            if fresh {
                 self.cached = Some(self.preview()?);
                 self.last_preview = Instant::now();
                 self.previews += 1;
+                published = self.cached.clone();
             }
             if self.next >= self.histories {
                 let result = self.finish()?;
@@ -540,7 +593,9 @@ impl Live {
         let end = self.next.saturating_add(self.chunk).min(self.histories);
         self.submit_until(end);
         self.inflight = true;
-        Ok(Slice::Pending(self.cached.clone()))
+        // A stale picture is not copied again. The view paints the last copy
+        // while the next chunk keeps running.
+        Ok(Slice::Pending(published))
     }
 
     fn submit_until(&mut self, end: u32) {
@@ -643,6 +698,11 @@ impl Live {
             let quanta = ((hi << 32) | lo) as i64;
             ledger_mev[i] = (quanta as f64 * QUANTUM_MEV / f64::from(histories)) as f32;
         }
+        let let_d = if self.score_let {
+            read_let(&self.device, &self.queue, &self.let_buf, self.nvox)?
+        } else {
+            Vec::new()
+        };
         Ok(McResult {
             volume: Volume {
                 origin: self.origin,
@@ -652,6 +712,7 @@ impl Live {
             },
             uncertainty: uncertainty(&dose_sum, &dose_sq, histories / self.per_batch.max(1)),
             ledger: ledger_mev,
+            let_d,
         })
     }
 }
@@ -915,6 +976,32 @@ fn read_f32(
         .collect())
 }
 
+fn pack_i64(lo: u32, hi: u32) -> i64 {
+    let mut bytes = [0u8; 8];
+    bytes[..4].copy_from_slice(&lo.to_le_bytes());
+    bytes[4..].copy_from_slice(&hi.to_le_bytes());
+    i64::from_le_bytes(bytes)
+}
+
+/// Dose-weighted LET, keV/µm. Each voxel is two little-endian i64 quanta: E×LET, then E.
+fn read_let(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    buffer: &wgpu::Buffer,
+    nvox: usize,
+) -> Result<Vec<f32>, ComputeError> {
+    let raw = read_u32(device, queue, buffer, nvox * 4)?;
+    let mut out = vec![0.0f32; nvox];
+    for (i, slot) in out.iter_mut().enumerate() {
+        let den = pack_i64(raw[i * 4 + 2], raw[i * 4 + 3]);
+        if den > 0 {
+            let num = pack_i64(raw[i * 4], raw[i * 4 + 1]);
+            *slot = (num as f64 / den as f64) as f32;
+        }
+    }
+    Ok(out)
+}
+
 fn read_u32(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -1067,6 +1154,7 @@ mod tests {
                     "ledger {incident} vs accounted {accounted} {:?}",
                     result.ledger
                 );
+                assert!(result.let_d.is_empty());
             }
         }
     }
@@ -1089,6 +1177,7 @@ mod tests {
             histories: 4_000,
             seed: 1,
             dose_to_water: true,
+            score_let: true,
         };
         match run_mc(&McJob::Patient(request)) {
             Err(ComputeError::NoAdapter) => {}
@@ -1124,6 +1213,17 @@ mod tests {
                     (incident - accounted).abs() / incident < 0.15,
                     "ledger {incident} vs accounted {accounted} {:?}",
                     result.ledger
+                );
+                assert_eq!(result.let_d.len(), nx * ny * nz);
+                let mut let_peak = 0.0f32;
+                for value in &result.let_d {
+                    if *value > let_peak {
+                        let_peak = *value;
+                    }
+                }
+                assert!(
+                    (0.2..200.0).contains(&let_peak),
+                    "peak LETd {let_peak} keV/um is outside the proton range"
                 );
             }
         }
@@ -1172,10 +1272,14 @@ mod tests {
         let mut sliced = McRun::open(&job).expect("adapter");
         let cancel = Cancel::new();
         let mut saw_dose = false;
+        let mut quiet = 0u32;
         let ready = loop {
             match sliced.poll(Duration::from_micros(100), &cancel) {
                 Poll::Pending { preview, report } => {
                     assert!(report.done <= report.total);
+                    if preview.is_none() {
+                        quiet += 1;
+                    }
                     if preview
                         .as_ref()
                         .is_some_and(|result| result.volume.values.iter().any(|value| *value > 0.0))
@@ -1189,6 +1293,7 @@ mod tests {
             }
         };
         assert!(saw_dose, "a sliced run never published a dose");
+        assert!(quiet > 0, "every poll republished the cube");
         assert_eq!(ready.volume.values, one.volume.values);
         assert_eq!(ready.ledger, one.ledger);
     }

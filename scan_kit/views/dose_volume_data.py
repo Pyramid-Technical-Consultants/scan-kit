@@ -226,24 +226,6 @@ def concat_clouds(clouds: Sequence[SplatCloud]) -> SplatCloud | None:
     )
 
 
-def apply_splat_cap(cloud: SplatCloud, cap: int) -> SplatCloud:
-    n = int(cloud.x.size)
-    if cap <= 0 or n <= cap:
-        return cloud
-    stride = int(np.ceil(n / cap))
-    sl = slice(None, None, stride)
-    return SplatCloud(
-        x=cloud.x[sl],
-        y=cloud.y[sl],
-        sx=cloud.sx[sl],
-        sy=cloud.sy[sl],
-        energy=cloud.energy[sl],
-        weight=cloud.weight[sl],
-        k_mu=cloud.k_mu,
-        dose=None if cloud.dose is None else cloud.dose[sl],
-    )
-
-
 def _sanitize_xy(arr) -> np.ndarray:
     out = np.asarray(arr, dtype=float).reshape(-1)
     out = out.copy()
@@ -925,7 +907,7 @@ def build_view_batches(
     config: SplatConfig,
     base_dir: str,
 ) -> tuple[SplatBatch | None, SplatBatch | None, DepthAxis, int]:
-    """Measured and plan spots of *session_ids*, each capped at ``config.splat_cap``, and the raw count."""
+    """Measured and plan spots of *session_ids*, and the raw count."""
     measured_clouds: list[SplatCloud] = []
     plan_clouds: list[SplatCloud] = []
     n_raw = 0
@@ -949,7 +931,7 @@ def build_view_batches(
         cloud = concat_clouds(clouds)
         if cloud is None:
             return None
-        out = cloud_to_batch(apply_splat_cap(cloud, config.splat_cap), axis, config.smear_axis_units)
+        out = cloud_to_batch(cloud, axis, config.smear_axis_units)
         return out if out.center.size else None
 
     return batch(measured_clouds), batch(plan_clouds), axis, n_raw

@@ -2,13 +2,14 @@
 //! and tests. Built for `wasm32`, the desktop webview draws the same marks into
 //! its canvas with WebGPU or WebGL2.
 
+mod dose;
 mod payload;
 mod render;
 mod text;
 #[cfg(target_arch = "wasm32")]
 mod web;
 
-pub use payload::{encode_plot, encode_plot_quality, plot_header, PlotHeader};
+pub use payload::{encode_plot, encode_plot_quality, encode_plot_reusing, plot_header, PlotHeader};
 #[cfg(not(target_arch = "wasm32"))]
 pub use render::render_plot;
 pub use render::{compile_plot_shader, plot_shader_source, Plot, PlotFrame, PlotInput};
@@ -40,8 +41,16 @@ pub async fn request_device() -> Result<(wgpu::Device, wgpu::Queue), GpuError> {
             wgpu::RequestAdapterError::NotFound { .. } => GpuError::NoAdapter,
             other => GpuError::Message(other.to_string()),
         })?;
+    let mut limits = wgpu::Limits::default();
+    let reported = adapter.limits().max_texture_dimension_3d;
+    if reported > limits.max_texture_dimension_3d {
+        limits.max_texture_dimension_3d = reported;
+    }
     adapter
-        .request_device(&wgpu::DeviceDescriptor::default())
+        .request_device(&wgpu::DeviceDescriptor {
+            required_limits: limits,
+            ..Default::default()
+        })
         .await
         .map_err(|err| GpuError::Message(err.to_string()))
 }

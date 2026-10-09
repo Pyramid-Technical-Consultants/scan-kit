@@ -2,7 +2,7 @@ import { segmentChoices } from "@/CatalogField";
 
 export type ControlSlot = {
   id: string;
-  kind: "select" | "check" | "segments";
+  kind: "select" | "check" | "segments" | "range" | "text" | "radio" | "number";
 };
 
 export type SegmentItem = {
@@ -31,11 +31,26 @@ type SectionControl = {
 export function controlSections(controls: readonly SectionControl[]): ControlSection[] {
   const sections: ControlSection[] = [];
   for (const control of controls) {
+    if (control.kind === "scrub") {
+      continue;
+    }
     const title = control.group != null && control.group.length > 0 ? control.group : "Options";
     const slot: ControlSlot = {
       id: control.id,
       kind:
-        control.kind === "check" ? "check" : control.kind === "segments" ? "segments" : "select",
+        control.kind === "check"
+          ? "check"
+          : control.kind === "segments"
+            ? "segments"
+            : control.kind === "range"
+              ? "range"
+              : control.kind === "text"
+                ? "text"
+                : control.kind === "radio"
+                  ? "radio"
+                  : control.kind === "number"
+                    ? "number"
+                    : "select",
     };
     const last = sections[sections.length - 1];
     if (last != null && last.title === title) {
@@ -50,6 +65,21 @@ export function controlSections(controls: readonly SectionControl[]): ControlSec
 export { segmentChoices };
 
 const GRAIN_FIELDS = ["y", "x", "xy"] as const;
+
+/**
+ * Timeline playback follows scatter, contour, and density in the plot. A settled
+ * playhead still rebuilds the picture when the spectrum, confidence, or coverage
+ * depends on that window.
+ */
+export function playheadReplay(options: Readonly<Record<string, string>>): boolean {
+  if (options.fft === "On") {
+    return true;
+  }
+  if (options.scatter !== "On") {
+    return false;
+  }
+  return options.scatter_xy === "Confidence" || options.scatter_xy === "Coverage (%)";
+}
 
 export type GrainMemory = {
   spot?: Record<string, string>;
@@ -107,7 +137,7 @@ export function applyOption(
 }
 
 const FRESH_SEGMENT: Record<string, SegmentItem> = {
-  beam: { kind: "beam", state: "on" },
+  beam: { kind: "beam", state: "both" },
   rank: { kind: "rank", which: "all" },
   range: { kind: "range", column: "energy", lo: 0, hi: 0 },
   compare: { kind: "compare", column: "", op: "abs_gt", threshold: 1 },
@@ -157,6 +187,48 @@ export function replaceSegment(
   next: SegmentItem,
 ): SegmentItem[] {
   return items.map((item, itemIndex) => (itemIndex === index ? next : item));
+}
+
+const DOSE_PAINT_IDS = ["scale", "auto", "level", "error", "ray", "sample"] as const;
+
+/** Depth and lateral curves are rows of the cube already on screen. */
+export function localLinePlot(value: string): boolean {
+  const name = value.trim().toLowerCase();
+  return name.startsWith("depth") || (name.startsWith("lateral") && !name.includes("+"));
+}
+
+/**
+ * Options that rebuild the dose. Color, window, ray mode, sampling, and the
+ * line-plot picker are not in here. DVH and gamma still go through the view
+ * task, because those series are not in the cube.
+ */
+export function sceneOptions(options: Readonly<Record<string, string>>): Record<string, string> {
+  const rest: Record<string, string> = {};
+  for (const [key, value] of Object.entries(options)) {
+    if ((DOSE_PAINT_IDS as readonly string[]).includes(key) || key === "plot0" || key === "plot1") {
+      continue;
+    }
+    rest[key] = value;
+  }
+  return rest;
+}
+
+/**
+ * Picture settings for the plot already on screen. Empty when the view has none yet.
+ * Level is sent only after the user moves it. The gain default of 1 is not a window.
+ */
+export function paintSpec(
+  resolved: Readonly<Record<string, string>>,
+  options: Readonly<Record<string, string>>,
+): string {
+  const spec: Record<string, string> = {};
+  for (const id of DOSE_PAINT_IDS) {
+    const value = id === "level" ? options[id] : resolved[id];
+    if (value != null && value.length > 0) {
+      spec[id] = value;
+    }
+  }
+  return Object.keys(spec).length === 0 ? "" : JSON.stringify(spec);
 }
 
 /** Histogram bins follow the show-panel checkbox. X bins apply to every axis. */
