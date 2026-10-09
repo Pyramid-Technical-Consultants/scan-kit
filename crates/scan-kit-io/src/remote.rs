@@ -836,6 +836,37 @@ mod net {
             .next()
             .ok_or_else(|| format!("could not resolve {text}"))
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn listing_facts_and_base64_cover_the_helpers() {
+            let dir = stat_mlst("type=dir;size=4;modify=19700101000000; name");
+            assert!(dir.dir);
+            assert_eq!(dir.size, 4);
+            assert_eq!(dir.mtime_ns, 0);
+            let file = stat_mlst("type=file;size=12;modify=not-a-time; junk");
+            assert!(!file.dir);
+            assert_eq!(file.size, 12);
+            assert_eq!(modify_ns("short"), 0);
+            assert_eq!(
+                modify_ns("20200102150403"),
+                days_from_civil(2020, 1, 2) * 86_400 * 1_000_000_000
+                    + (15 * 3_600 + 4 * 60 + 3) * 1_000_000_000
+            );
+            assert_eq!(days_from_civil(1970, 1, 1), 0);
+            assert!(days_from_civil(1969, 12, 31) < 0);
+            assert_eq!(resolve("127.0.0.1", 9).unwrap().port(), 9);
+            assert_eq!(resolve("[::1]", 9).unwrap().port(), 9);
+            assert!(tls_config().is_ok());
+            assert_eq!(base64(b"a"), "YQ==");
+            assert_eq!(base64(b"ab"), "YWI=");
+            assert_eq!(base64(b"abc"), "YWJj");
+            assert!(basic_auth("ada", "secret").starts_with("Basic "));
+        }
+    }
 }
 
 fn copy_file_to(dest: &Path, bytes: &[u8]) -> Result<(), String> {
@@ -845,4 +876,122 @@ fn copy_file_to(dest: &Path, bytes: &[u8]) -> Result<(), String> {
     let mut file = File::create(dest).map_err(|err| err.to_string())?;
     file.write_all(bytes).map_err(|err| err.to_string())?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::location::Scheme;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+
+    fn remote(
+        canonical: &str,
+        scheme: Scheme,
+        host: &str,
+        port: Option<u16>,
+    ) -> crate::location::Remote {
+        crate::location::Remote {
+            canonical: canonical.to_owned(),
+            scheme,
+            username: String::new(),
+            password: None,
+            host: host.to_owned(),
+            port,
+            path: "/root".into(),
+        }
+    }
+
+    fn serve(status: &'static [u8]) -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        thread::spawn(move || {
+            for _ in 0..8 {
+                let Ok((mut sock, _)) = listener.accept() else {
+                    break;
+                };
+                let mut buf = [0u8; 2048];
+                let _ = sock.read(&mut buf);
+                let _ = sock.write_all(status);
+            }
+        });
+        port
+    }
+
+    #[test]
+    fn a_memory_tree_lists_reads_and_copies() {
+        let canonical = format!("fixture://memory/{}", std::process::id());
+        install_fixture(
+            &canonical,
+            "/root",
+            &[("a.txt", b"hello"), ("dir/b.txt", b"yo")],
+            true,
+        );
+        let spec = remote(&canonical, Scheme::Http, "", None);
+        assert!(connect(&spec, "").is_err());
+        let mut fs = connect(&spec, "secret").unwrap();
+        let names = fs.list("/root").unwrap();
+        assert!(names.iter().any(|item| item.name == "a.txt" && !item.dir));
+        assert!(names.iter().any(|item| item.name == "dir" && item.dir));
+        assert_eq!(fs.read("/root/a.txt").unwrap().unwrap(), b"hello");
+        assert!(fs.read("/root/missing").unwrap().is_none());
+        assert_eq!(fs.read_prefix("/root/a.txt", 2).unwrap().unwrap(), b"he");
+        assert!(fs.read_prefix("/root/missing", 2).unwrap().is_none());
+        let file = fs.stat("/root/a.txt").unwrap().unwrap();
+        assert!(!file.dir && file.size == 5);
+        assert!(fs.stat("/root").unwrap().unwrap().dir);
+        assert!(fs.stat("/root/missing").unwrap().is_none());
+        let dest = std::env::temp_dir().join(format!("scan-kit-remote-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dest);
+        fs.copy_to("/root/a.txt", &dest.join("a.txt")).unwrap();
+        assert_eq!(fs::read(dest.join("a.txt")).unwrap(), b"hello");
+        fs.copy_to("/root", &dest.join("tree")).unwrap();
+        assert_eq!(fs::read(dest.join("tree/dir/b.txt")).unwrap(), b"yo");
+        assert!(fs.copy_to("/root/absent", &dest.join("absent")).is_err());
+        assert!(fixture_copies(&canonical) >= 2);
+        let mut child = spec.clone();
+        child.canonical = format!("{canonical}/nested");
+        assert!(connect(&child, "secret").is_ok());
+        let smb = remote("smb://share", Scheme::Smb, "share", None);
+        match connect(&smb, "") {
+            Err(message) => assert!(message.contains("UNC")),
+            Ok(_) => panic!("an smb url is a local path"),
+        }
+        let _ = fs::remove_dir_all(&dest);
+    }
+
+    #[test]
+    fn an_http_archive_reads_stats_and_copies() {
+        let ok = b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\ndata";
+        let port = serve(ok);
+        let url = format!("http://127.0.0.1:{port}/archive.bin");
+        let mut spec = remote(&url, Scheme::Http, "127.0.0.1", Some(port));
+        spec.username = "ada".into();
+        let mut fs = connect(&spec, "secret").unwrap();
+        match fs.list("/") {
+            Err(message) => assert!(message.contains("one archive")),
+            Ok(_) => panic!("http is one archive"),
+        }
+        assert_eq!(fs.read("/").unwrap().unwrap(), b"data");
+        assert_eq!(fs.read_prefix("/", 2).unwrap().unwrap(), b"da");
+        let stat = fs.stat("/").unwrap().unwrap();
+        assert!(!stat.dir && stat.size == 4);
+        let dest = std::env::temp_dir().join(format!("scan-kit-http-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dest);
+        fs.copy_to("/", &dest.join("nested/archive.bin")).unwrap();
+        assert_eq!(fs::read(dest.join("nested/archive.bin")).unwrap(), b"data");
+        let denied = serve(b"HTTP/1.1 401 NO\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        let denied_url = format!("http://127.0.0.1:{denied}/archive.bin");
+        let denied_spec = remote(&denied_url, Scheme::Https, "127.0.0.1", Some(denied));
+        let mut denied_fs = connect(&denied_spec, "").unwrap();
+        assert!(denied_fs.read("/").unwrap_err().contains("password"));
+        let head = serve(b"HTTP/1.1 405 NO\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        let head_url = format!("http://127.0.0.1:{head}/archive.bin");
+        let head_spec = remote(&head_url, Scheme::Http, "127.0.0.1", Some(head));
+        let mut head_fs = connect(&head_spec, "").unwrap();
+        let missing = head_fs.stat("/").unwrap().unwrap();
+        assert_eq!(missing.size, 0);
+        let _ = fs::remove_dir_all(&dest);
+    }
 }

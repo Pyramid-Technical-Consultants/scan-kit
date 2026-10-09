@@ -1,4 +1,19 @@
-import { ChartColumn, Columns2, LayoutGrid, Box, RectangleHorizontal, RectangleVertical, Spline, Square } from "lucide-react";
+import {
+  Blend,
+  Box,
+  ChartArea,
+  ChartColumn,
+  ChartLine,
+  ChartSpline,
+  Columns2,
+  Grid3x3,
+  LayoutGrid,
+  RectangleHorizontal,
+  RectangleVertical,
+  Spline,
+  Square,
+  TrendingUp,
+} from "lucide-react";
 import { expect, it } from "vitest";
 
 import {
@@ -10,6 +25,7 @@ import {
   paintSpec,
   playheadReplay,
   removeSegment,
+  localLinePlot,
   sceneOptions,
   segmentChoices,
   segmentsText,
@@ -45,6 +61,17 @@ it("keeps color settings off the dose rebuild", () => {
   expect(paintSpec({ scale: "Turbo", auto: "On", level: "1" }, {})).not.toContain("level");
   expect(paintSpec({ auto: "Off" }, { level: "1.5" })).toContain("1.5");
   expect(paintSpec({}, {})).toBe("");
+  const cube = { voxel: "1 mm" };
+  expect(JSON.stringify(sceneOptions({ ...cube, plot0: "Depth Dose", plot1: "Lateral Profile" }))).toBe(
+    JSON.stringify(sceneOptions({ ...cube, plot0: "Lateral Profile", plot1: "DVH" })),
+  );
+  expect(localLinePlot("Depth Dose")).toBe(true);
+  expect(localLinePlot("Lateral Profile")).toBe(true);
+  expect(localLinePlot("DVH")).toBe(false);
+  expect(localLinePlot("Gamma Histogram")).toBe(false);
+  expect(controlSections([{ id: "voxel", group: "Picture", kind: "number" }])[0]?.slots[0]?.kind).toBe(
+    "number",
+  );
 });
 
 it("rebuilds a settled playhead for the spectrum and the reduced distributions", () => {
@@ -118,7 +145,21 @@ it("keeps a joined button row for two or three short names", () => {
   expect(optionIcon("sagittal")).toBe(RectangleVertical);
   expect(optionIcon("volume")).toBe(Box);
   expect(optionIcon("3D")).toBe(Box);
+  expect(optionIcon("depth")).toBe(ChartSpline);
+  expect(optionIcon("Depth Dose")).toBe(ChartSpline);
+  expect(optionIcon("lateral")).toBe(ChartLine);
+  expect(optionIcon("Lateral Profile")).toBe(ChartLine);
+  expect(optionIcon("dvh")).toBe(ChartArea);
+  expect(optionIcon("DVH")).toBe(ChartArea);
+  expect(optionIcon("gamma_hist")).toBe(ChartColumn);
+  expect(optionIcon("Gamma Histogram")).toBe(ChartColumn);
   expect(optionIcon("analytic")).toBe(Spline);
+  expect(optionIcon("nearest")).toBe(Grid3x3);
+  expect(optionIcon("Nearest")).toBe(Grid3x3);
+  expect(optionIcon("linear")).toBe(Blend);
+  expect(optionIcon("Linear")).toBe(TrendingUp);
+  expect(optionIcon("cubic")).toBe(Spline);
+  expect(optionIcon("Cubic")).toBe(Spline);
   expect(optionIcon("Monte Carlo")).toBeTruthy();
   expect(optionIcon("1e7")).toBeTruthy();
   expect(

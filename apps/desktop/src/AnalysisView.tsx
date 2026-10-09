@@ -15,6 +15,7 @@ import {
   applyOption,
   controlDisabled,
   controlSections,
+  localLinePlot,
   paintSpec,
   parseSegments,
   playheadReplay,
@@ -28,6 +29,7 @@ import { AnalysisMenu, analysisId, analysisName } from "@/analysis-menu";
 import { ButtonSegmentGroup } from "@/components/button-segment-group";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
+import { Input } from "@/components/ui/input";
 import { Slider } from "@/components/ui/slider";
 import { Textarea } from "@/components/ui/textarea";
 import { Field, FieldLabel, FieldLegend, FieldSet } from "@/components/ui/field";
@@ -46,6 +48,7 @@ import { sessionColor, shownSessionIds } from "@/session-colors";
 import { acceptReport, bytesOf, parsePoll, type Report } from "@/task-client";
 import { dismissNotice, notifyError } from "@/notify";
 import { ScrubBar, useScrub, type Scrub } from "@/scrub-bar";
+import { DoseBoard } from "@/DoseBoard";
 import { SidePane } from "@/SidePane";
 import {
   Select,
@@ -63,27 +66,6 @@ function paintPlot(plot: Plotter, spec: string): string {
   return typeof raw === "string" ? raw : "";
 }
 
-type DoseFrame = {
-  x: number;
-  y: number;
-  w: number;
-  h: number;
-  plotX: number;
-  plotY: number;
-  plotW: number;
-  plotH: number;
-};
-
-function isDoseFrame(value: unknown): value is DoseFrame {
-  if (typeof value !== "object" || value == null) {
-    return false;
-  }
-  const frame = value as DoseFrame;
-  return [frame.x, frame.y, frame.w, frame.h, frame.plotX, frame.plotY, frame.plotW, frame.plotH].every(
-    (item) => typeof item === "number" && Number.isFinite(item),
-  );
-}
-
 function rangeBound(
   options: readonly { id: string; label: string }[],
   id: string,
@@ -92,6 +74,102 @@ function rangeBound(
   const found = options.find((option) => option.id === id);
   const value = Number(found?.label);
   return Number.isFinite(value) ? value : fallback;
+}
+
+function formatMm(value: number): string {
+  return value
+    .toFixed(4)
+    .replace(/0+$/, "")
+    .replace(/\.$/, "");
+}
+
+function NumberField({
+  label,
+  value,
+  min,
+  max,
+  step,
+  quick,
+  disabled,
+  onApply,
+}: {
+  label: string;
+  value: string;
+  min: number;
+  max: number;
+  step: number;
+  quick: string | null;
+  disabled: boolean;
+  onApply: (value: string) => void;
+}) {
+  const [draft, setDraft] = useState(value);
+  const [from, setFrom] = useState(value);
+  if (from !== value) {
+    setFrom(value);
+    setDraft(value);
+  }
+  const commit = (raw: string) => {
+    const parsed = Number(raw);
+    if (!Number.isFinite(parsed)) {
+      setDraft(value);
+      return;
+    }
+    const text = formatMm(Math.min(max, Math.max(min, parsed)));
+    setDraft(text);
+    if (text !== value) {
+      onApply(text);
+    }
+  };
+  return (
+    <Field orientation="horizontal" className={disabled ? "opacity-50" : undefined}>
+      <FieldLabel className="flex-none! shrink-0 whitespace-nowrap">{label}</FieldLabel>
+      <Input
+        type="number"
+        className="w-24 flex-none"
+        min={min}
+        max={max}
+        step={step}
+        value={draft}
+        disabled={disabled}
+        aria-label={label}
+        onChange={(event) => {
+          const next = event.target.value;
+          const parsed = Number(next);
+          const previous = Number(draft);
+          setDraft(next);
+          if (
+            Number.isFinite(parsed) &&
+            Number.isFinite(previous) &&
+            Math.abs(Math.abs(parsed - previous) - step) < 1e-4
+          ) {
+            commit(next);
+          }
+        }}
+        onBlur={(event) => commit(event.target.value)}
+        onKeyDown={(event) => {
+          if (event.key === "Enter") {
+            commit(event.currentTarget.value);
+          }
+        }}
+      />
+      {quick != null ? (
+        <Button
+          type="button"
+          variant="outline"
+          size="sm"
+          disabled={disabled}
+          onClick={() => {
+            setDraft(quick);
+            if (quick !== value) {
+              onApply(quick);
+            }
+          }}
+        >
+          {quick} mm
+        </Button>
+      ) : null}
+    </Field>
+  );
 }
 
 function escapeHtml(text: string): string {
@@ -136,112 +214,34 @@ function exportStudyReport(table: { columns: readonly string[]; rows: readonly (
   downloadText("scan-kit-dvh.csv", `${lines.join("\n")}\n`, "text/csv");
 }
 
-function canvasScale(node: HTMLCanvasElement | null): { sx: number; sy: number } {
-  if (node == null) {
-    return { sx: 1, sy: 1 };
-  }
-  const rect = node.getBoundingClientRect();
-  return {
-    sx: rect.width > 0 ? node.width / rect.width : 1,
-    sy: rect.height > 0 ? node.height / rect.height : 1,
-  };
-}
-
-function DoseChrome({
-  controls,
-  frames,
-  scale,
-  resolved,
-  onChange,
-  onAction,
-}: {
-  controls: readonly ViewControl[];
-  frames: readonly DoseFrame[];
-  scale: { sx: number; sy: number };
-  resolved: Readonly<Record<string, string>>;
-  onChange: (id: string, value: string) => void;
-  onAction: (panel: number, action: string) => void;
-}) {
-  const sx = scale.sx > 0 ? scale.sx : 1;
-  const sy = scale.sy > 0 ? scale.sy : 1;
-  const items = [
-    { id: "cell0", panel: 0, kind: "cell" },
-    { id: "cell1", panel: 1, kind: "cell" },
-    { id: "cell2", panel: 2, kind: "cell" },
-    { id: "cell3", panel: 3, kind: "cell" },
-    { id: "plot0", panel: 4, kind: "plot" },
-    { id: "plot1", panel: 5, kind: "plot" },
-  ] as const;
-  return (
-    <>
-      {items.map((item) => {
-        const control = controls.find((entry) => entry.id === item.id);
-        const frame = frames[item.panel];
-        if (control == null || frame == null || frame.w < 8 || frame.h < 8) {
-          return null;
-        }
-        const value = resolved[item.id] ?? control.value;
-        const slice = item.kind === "cell" && value !== "3D";
-        const profile = item.kind === "plot" && value !== "DVH" && value !== "Gamma histogram";
-        const band = Math.max(0, (frame.plotY - frame.y) / sy);
-        return (
-          <div
-            key={item.id}
-            className="pointer-events-none absolute flex items-center justify-end"
-            style={{
-              left: frame.x / sx,
-              top: frame.y / sy,
-              width: frame.w / sx,
-              height: band,
-            }}
-          >
-            <div className="pointer-events-auto flex items-center gap-1 pr-1">
-              {slice ? (
-                <Button
-                  type="button"
-                  size="sm"
-                  variant="outline"
-                  aria-label="Rotate 90 degrees"
-                  onClick={() => onAction(item.panel, "rotate")}
-                >
-                  90°
-                </Button>
-              ) : null}
-              {slice || profile ? (
-                <Button
-                  type="button"
-                  size="sm"
-                  variant="outline"
-                  aria-label="Integral"
-                  onClick={() => onAction(item.panel, "integral")}
-                >
-                  ∫
-                </Button>
-              ) : null}
-              <ChoiceSelect
-                control={control}
-                value={value}
-                disabled={false}
-                fit
-                onChange={(next) => onChange(item.id, next)}
-              />
-            </div>
-          </div>
-        );
-      })}
-    </>
-  );
-}
-
 // A canvas keeps the first context it is given, and StrictMode mounts twice,
 // so each canvas gets one WebPlot for its lifetime.
 const plotters = new WeakMap<HTMLCanvasElement, Promise<Plotter>>();
 
+// The generated glue has one set of exports. Calling its init once per canvas,
+// in parallel, builds six modules and the last one replaces the others, so
+// every plot draws into a heap that is already gone.
+let plotModule: Promise<typeof import("@/wasm/scan_kit_plot.js")> | null = null;
+
+function loadPlotModule(): Promise<typeof import("@/wasm/scan_kit_plot.js")> {
+  if (plotModule == null) {
+    plotModule = import("@/wasm/scan_kit_plot.js")
+      .then(async (wasm) => {
+        await wasm.default();
+        return wasm;
+      })
+      .catch((error: unknown) => {
+        plotModule = null;
+        throw error;
+      });
+  }
+  return plotModule;
+}
+
 function plotterFor(node: HTMLCanvasElement): Promise<Plotter> {
   let pending = plotters.get(node);
   if (pending == null) {
-    pending = import("@/wasm/scan_kit_plot.js").then(async (wasm) => {
-      await wasm.default();
+    pending = loadPlotModule().then(async (wasm) => {
       const plot = await wasm.WebPlot.create(node);
       console.info(`scan-kit plot backend: ${plot.backend()}`);
       return plot;
@@ -378,8 +378,8 @@ export function AnalysisView({
   const hold = useRef(0);
   const taskId = useRef(0);
   const [taskReport, setTaskReport] = useState<Report | null>(null);
-  const [loading, setLoading] = useState(true);
-  usePageLoad(loading, taskReport?.done ?? 0, taskReport?.total ?? 0);
+  const [arrivedKey, setArrivedKey] = useState<string | null>(null);
+  const [opening, setOpening] = useState(false);
   const frame = useRef(0);
   const openSeq = useRef(0);
   const [options, setOptions] = useState<Record<string, string>>({});
@@ -389,6 +389,7 @@ export function AnalysisView({
   const lineToken = useRef("");
   const nextToken = useRef("");
   const [lineEpoch, setLineEpoch] = useState(0);
+  const [plotHost, setPlotHost] = useState(0);
   const grains = useRef<GrainMemory>({});
   const [hidden, setHidden] = useState<string[]>([]);
   const [meta, setMeta] = useState<PlotHeader | null>(null);
@@ -416,10 +417,10 @@ export function AnalysisView({
   const [studyPath, setStudyPath] = useState<string | null>(null);
   const [study, setStudy] = useState<string | null>(null);
   const [size, setSize] = useState({ width: 960, height: 640 });
-  const [frames, setFrames] = useState<DoseFrame[]>([]);
-  const [frameScale, setFrameScale] = useState({ sx: 1, sy: 1 });
   const shown = (meta?.panels.length ?? 0) > 0;
   const viewRef = useRef(viewId);
+  const dosePlots = useRef<(Plotter | null)[]>([null, null, null, null, null, null]);
+  const picture = useRef<Uint8Array | null>(null);
 
   const requestDraw = () => {
     if (frame.current !== 0) {
@@ -427,10 +428,18 @@ export function AnalysisView({
     }
     frame.current = requestAnimationFrame(() => {
       frame.current = 0;
-      try {
-        plotter.current?.render();
-      } catch (reason) {
-        notifyError(messageOf(reason), "analysis");
+      const plots =
+        viewRef.current === "volumetric"
+          ? dosePlots.current.filter((plot): plot is Plotter => plot != null)
+          : plotter.current == null
+            ? []
+            : [plotter.current];
+      for (const plot of plots) {
+        try {
+          plot.render();
+        } catch (reason) {
+          notifyError(messageOf(reason), "analysis");
+        }
       }
     });
   };
@@ -443,18 +452,52 @@ export function AnalysisView({
     const rect = node.getBoundingClientRect();
     const next = backingSize(rect.width, rect.height, window.devicePixelRatio);
     // The plotter configures the drawing buffer. Assigning width here resets it.
-    if (
-      plotter.current == null &&
-      (node.width !== next.width || node.height !== next.height)
-    ) {
+    if (plotter.current == null && (node.width !== next.width || node.height !== next.height)) {
       node.width = next.width;
       node.height = next.height;
     }
-    plotter.current?.set_chrome(
-      viewRef.current === "volumetric" ? Math.ceil(36 * window.devicePixelRatio) : 0,
-    );
     plotter.current?.resize(next.width, next.height);
     requestDraw();
+  };
+
+  const afterDoseInput = (index: number) => {
+    const source = dosePlots.current[index];
+    if (source == null) {
+      return;
+    }
+    const cursor = Array.from(source.dose_cursor());
+    let shared = false;
+    if (cursor.length === 3) {
+      for (let otherIndex = 0; otherIndex < dosePlots.current.length; otherIndex += 1) {
+        if (otherIndex === index) {
+          continue;
+        }
+        const other = dosePlots.current[otherIndex];
+        if (other == null) {
+          continue;
+        }
+        const had = Array.from(other.dose_cursor());
+        if (
+          had.length === 3 &&
+          had[0] === cursor[0] &&
+          had[1] === cursor[1] &&
+          had[2] === cursor[2]
+        ) {
+          continue;
+        }
+        other.set_dose_cursor(cursor[0] ?? 0, cursor[1] ?? 0, cursor[2] ?? 0);
+        shared = true;
+      }
+    }
+    if (shared) {
+      requestDraw();
+      return;
+    }
+    try {
+      source.render();
+    } catch (reason) {
+      notifyError(messageOf(reason), "analysis");
+    }
   };
 
   useEffect(() => {
@@ -483,25 +526,34 @@ export function AnalysisView({
     };
   }, [viewId]);
 
-  const loadPayload = (): string => {
-    const plot = plotter.current;
-    const bytes = payload.current;
-    if (plot == null || bytes == null) {
-      return "";
+  const loadPlot = (plot: Plotter, index: number | null): { painted: string; stop: boolean } => {
+    const bytes = payload.current ?? picture.current;
+    if (bytes == null) {
+      return { painted: "", stop: true };
     }
-    payload.current = null;
+    picture.current = bytes;
     try {
       plot.load(bytes);
+      const chosen = optionsRef.current;
+      if ((index == null || index === 4) && localLinePlot(chosen.plot0 ?? "")) {
+        plot.set_line(4, chosen.plot0);
+      }
+      if ((index == null || index === 5) && localLinePlot(chosen.plot1 ?? "")) {
+        plot.set_line(5, chosen.plot1);
+      }
       const painted = paintRef.current.length > 0 ? paintPlot(plot, paintRef.current) : "";
       if (nextToken.current !== "") {
         lineToken.current = nextToken.current;
       }
-      if (playhead.current.on) {
+      if (index == null && playhead.current.on) {
         slideRef.current(playhead.current, false);
       }
-      fitCanvas();
+      if (index == null) {
+        fitCanvas();
+      }
       plot.render();
-      return painted;
+      payload.current = null;
+      return { painted, stop: false };
     } catch (reason) {
       // The picture kept its lines, but this payload left them out. Ask again
       // with the full traces.
@@ -509,11 +561,40 @@ export function AnalysisView({
         lineToken.current = "";
         nextToken.current = "";
         setLineEpoch((epoch) => epoch + 1);
-        return "";
+        return { painted: "", stop: true };
       }
       notifyError(messageOf(reason), "analysis");
+      return { painted: "", stop: true };
+    }
+  };
+
+  const loadPayload = (): string => {
+    if (payload.current != null) {
+      picture.current = payload.current;
+    }
+    if (picture.current == null) {
       return "";
     }
+    const jobs: [Plotter, number | null][] =
+      viewRef.current === "volumetric"
+        ? dosePlots.current.flatMap((plot, index) => (plot == null ? [] : [[plot, index] as [Plotter, number]]))
+        : plotter.current == null
+          ? []
+          : [[plotter.current, null]];
+    if (jobs.length === 0) {
+      return "";
+    }
+    let painted = "";
+    for (const [plot, index] of jobs) {
+      const loaded = loadPlot(plot, index);
+      if (loaded.painted.length > 0) {
+        painted = loaded.painted;
+      }
+      if (loaded.stop) {
+        return painted;
+      }
+    }
+    return painted;
   };
 
   useEffect(() => {
@@ -535,6 +616,9 @@ export function AnalysisView({
   }, []);
 
   useEffect(() => {
+    if (viewId === "volumetric") {
+      return;
+    }
     const node = canvas.current;
     // The canvas stays in the tree while hidden. A surface created at that
     // 0×0 box, then resized, drops the only frame and the view stays black.
@@ -563,7 +647,7 @@ export function AnalysisView({
       cancelAnimationFrame(frame.current);
       frame.current = 0;
     };
-  }, [shown]);
+  }, [shown, viewId]);
 
   useEffect(() => {
     viewRef.current = viewId;
@@ -575,6 +659,18 @@ export function AnalysisView({
   const orderKey = sessions.map((session) => session.id).join("\0");
   const hiddenKey = hidden.join("\0");
   const sceneKey = viewId === "volumetric" ? JSON.stringify(sceneOptions(options)) : options;
+  const requestKey = JSON.stringify([
+    viewId,
+    folder,
+    orderKey,
+    hiddenKey,
+    sceneKey,
+    studyPath ?? "",
+    lineEpoch,
+    plotHost,
+  ]);
+  const loading = arrivedKey !== requestKey || opening;
+  usePageLoad(loading, taskReport?.done ?? 0, taskReport?.total ?? 0);
   useEffect(() => {
     optionsRef.current = options;
   }, [options]);
@@ -586,7 +682,6 @@ export function AnalysisView({
     const order = orderKey === "" ? [] : orderKey.split("\0");
     const shown = shownSessionIds(order, hiddenKey === "" ? [] : hiddenKey.split("\0"));
     let stop = false;
-    let reveal = 0;
     const timer = window.setTimeout(() => {
       if (stop) {
         return;
@@ -608,17 +703,9 @@ export function AnalysisView({
       if (lineToken.current !== "") {
         plotOptions._lines = lineToken.current;
       }
-      const picture = (metaRef.current?.panels.length ?? 0) > 0;
-      if (!picture) {
+      if ((metaRef.current?.panels.length ?? 0) === 0) {
         setQuiet(null);
       }
-      // A picture already on screen stays up. The hairline waits so a fast
-      // refresh, such as a playhead step, does not flash over it.
-      reveal = window.setTimeout(() => {
-        if (!stop && openSeq.current === ticket) {
-          setLoading(true);
-        }
-      }, picture ? 250 : 0);
       setPlotError(null);
       void (async () => {
         const started = await invoke<{ task: number; generation: number }>("scan_kit_start", {
@@ -631,19 +718,16 @@ export function AnalysisView({
           palette: palette(order, shown),
         });
         if (stop || openSeq.current !== ticket) {
-          window.clearTimeout(reveal);
           await invoke("scan_kit_cancel", { task: started.task });
           return;
         }
         taskId.current = started.task;
         for (;;) {
           if (stop || openSeq.current !== ticket) {
-            window.clearTimeout(reveal);
             return;
           }
           const raw = await invoke<ArrayBuffer | Uint8Array>("scan_kit_poll", { task: started.task });
           if (stop || openSeq.current !== ticket) {
-            window.clearTimeout(reveal);
             return;
           }
           const parsed = parsePoll(bytesOf(raw));
@@ -652,8 +736,7 @@ export function AnalysisView({
           }
           setTaskReport(parsed.report.finished ? null : parsed.report);
           if (parsed.report.finished && openSeq.current === ticket) {
-            window.clearTimeout(reveal);
-            setLoading(false);
+            setArrivedKey(requestKey);
             setSettled((count) => count + 1);
           }
           if (parsed.payload != null) {
@@ -693,10 +776,9 @@ export function AnalysisView({
           }
         }
       })().catch((reason: unknown) => {
-        window.clearTimeout(reveal);
         if (openSeq.current === ticket) {
           const message = messageOf(reason);
-          setLoading(false);
+          setArrivedKey(requestKey);
           setSettled((count) => count + 1);
           setPlotError(message);
           notifyError(message, "analysis");
@@ -705,7 +787,6 @@ export function AnalysisView({
     }, 150);
     return () => {
       stop = true;
-      window.clearTimeout(reveal);
       window.clearTimeout(timer);
       const id = taskId.current;
       queueMicrotask(() => {
@@ -715,9 +796,12 @@ export function AnalysisView({
         }
       });
     };
-  }, [viewId, folder, orderKey, hiddenKey, sceneKey, studyPath, lineEpoch]);
+  }, [viewId, folder, orderKey, hiddenKey, sceneKey, studyPath, lineEpoch, plotHost, requestKey]);
 
   useEffect(() => {
+    if (viewId === "volumetric") {
+      return;
+    }
     const node = canvas.current;
     if (node == null) {
       return;
@@ -797,25 +881,7 @@ export function AnalysisView({
       node.removeEventListener("keydown", onKey);
       node.removeEventListener("contextmenu", onMenu);
     };
-  }, []);
-
-  useEffect(() => {
-    const plot = plotter.current;
-    const node = canvas.current;
-    if (node != null) {
-      setFrameScale(canvasScale(node));
-    }
-    if (viewId !== "volumetric" || plot == null) {
-      setFrames([]);
-      return;
-    }
-    try {
-      const parsed: unknown = JSON.parse(plot.frames());
-      setFrames(Array.isArray(parsed) ? parsed.filter(isDoseFrame) : []);
-    } catch {
-      setFrames([]);
-    }
-  }, [meta, size, viewId, settled]);
+  }, [viewId, shown]);
 
   const controls = meta?.controls ?? [];
   const resolved: Record<string, string> = {};
@@ -828,6 +894,12 @@ export function AnalysisView({
     if (control.kind === "range") {
       const numeric = Number(stored);
       resolved[control.id] = stored != null && Number.isFinite(numeric) ? stored : control.value;
+      continue;
+    }
+    if (control.kind === "number") {
+      const numeric = Number(String(stored ?? "").replace(/mm/gi, "").trim());
+      resolved[control.id] =
+        stored != null && Number.isFinite(numeric) ? formatMm(numeric) : control.value;
       continue;
     }
     if (control.kind === "text") {
@@ -845,11 +917,22 @@ export function AnalysisView({
     if (dosePaint.length === 0) {
       return;
     }
-    const plot = plotter.current;
-    if (plot == null) {
+    const plots =
+      viewRef.current === "volumetric"
+        ? dosePlots.current.filter((plot): plot is Plotter => plot != null)
+        : plotter.current == null
+          ? []
+          : [plotter.current];
+    if (plots.length === 0) {
       return;
     }
-    const raw = paintPlot(plot, dosePaint);
+    let raw = "";
+    for (const plot of plots) {
+      const next = paintPlot(plot, dosePaint);
+      if (next.length > 0) {
+        raw = next;
+      }
+    }
     requestDraw();
     setMeta((current) => {
       const next = applyLevelPaint(current, raw);
@@ -864,7 +947,21 @@ export function AnalysisView({
     (section) => viewId !== "volumetric" || (section.title !== "Cell" && section.title !== "Plot"),
   );
   const apply = (id: string, value: string) => {
-    setOptions((current) => applyOption(current, resolved, grains.current, id, value));
+    const next = applyOption(optionsRef.current, resolved, grains.current, id, value);
+    optionsRef.current = next;
+    setOptions(next);
+    const panel = id === "plot0" ? 4 : id === "plot1" ? 5 : -1;
+    if (panel >= 0 && localLinePlot(value)) {
+      const plot = viewId === "volumetric" ? dosePlots.current[panel] : plotter.current;
+      const swapped = plot?.set_line(panel, value) ?? false;
+      if (swapped) {
+        plot?.render();
+      } else {
+        setPlotHost((epoch) => epoch + 1);
+      }
+    } else if (panel >= 0) {
+      setPlotHost((epoch) => epoch + 1);
+    }
   };
 
   const table = meta?.table;
@@ -924,6 +1021,22 @@ export function AnalysisView({
             }}
           />
         </Field>
+      );
+    }
+    if (slot.kind === "number") {
+      const quick = control.options.find((option) => option.id === "quick")?.label ?? null;
+      return (
+        <NumberField
+          key={slot.id}
+          label={label}
+          value={value}
+          min={rangeBound(control.options, "min", 0.25)}
+          max={rangeBound(control.options, "max", 10)}
+          step={rangeBound(control.options, "step", 0.1)}
+          quick={quick}
+          disabled={disabled}
+          onApply={(next) => apply(slot.id, next)}
+        />
       );
     }
     if (slot.kind === "text") {
@@ -1032,22 +1145,46 @@ export function AnalysisView({
             {plotError ?? quiet ?? "Loading plot…"}
           </div>
         )}
-        <div className={shown ? "relative min-h-0 flex-1" : "hidden"}>
-          <canvas ref={canvas} tabIndex={0} className="absolute inset-0 h-full w-full touch-none" />
-          {viewId === "volumetric" ? (
-            <DoseChrome
-              controls={controls}
-              frames={frames}
-              scale={frameScale}
-              resolved={resolved}
-              onChange={apply}
-              onAction={(panel, action) => {
-                plotter.current?.dose_action(panel, action);
-                plotter.current?.render();
-              }}
-            />
-          ) : null}
-        </div>
+        {viewId === "volumetric" ? (
+          <DoseBoard
+            shown={shown}
+            controls={controls}
+            resolved={resolved}
+            plots={dosePlots}
+            acquire={plotterFor}
+            onChange={apply}
+            onAction={(panel, action) => {
+              dosePlots.current[panel]?.dose_action(panel, action);
+              afterDoseInput(panel);
+            }}
+            onReady={(index) => {
+              const plot = dosePlots.current[index];
+              if (plot == null) {
+                return;
+              }
+              const loaded = loadPlot(plot, index);
+              if (loaded.painted.length === 0) {
+                return;
+              }
+              setMeta((current) => {
+                const next = applyLevelPaint(current, loaded.painted);
+                if (next !== current) {
+                  metaRef.current = next;
+                }
+                return next;
+              });
+            }}
+            onInput={afterDoseInput}
+            onError={(reason) => notifyError(messageOf(reason), "analysis")}
+            renderChoice={(control, value, change) => (
+              <ChoiceSelect control={control} value={value} disabled={false} fit onChange={change} />
+            )}
+          />
+        ) : (
+          <div className={shown ? "relative min-h-0 flex-1" : "hidden"}>
+            <canvas ref={canvas} tabIndex={0} className="absolute inset-0 h-full w-full touch-none" />
+          </div>
+        )}
         {playback.shown ? (
           <ScrubBar
             scrub={playback.scrub}
@@ -1118,14 +1255,15 @@ export function AnalysisView({
                 if (typeof selected !== "string") {
                   return;
                 }
-                setLoading(true);
+                setOpening(true);
                 void invoke<{ report: string }>("scan_kit_open_study", { path: selected })
                   .then((opened) => {
                     setStudyPath(selected);
                     setStudy(opened.report);
+                    setOpening(false);
                   })
                   .catch((reason: unknown) => {
-                    setLoading(false);
+                    setOpening(false);
                     notifyError(reason);
                   });
               });

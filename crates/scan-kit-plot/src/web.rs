@@ -12,6 +12,8 @@ pub struct WebPlot {
     config: wgpu::SurfaceConfiguration,
     backend: String,
     plot: Option<Plot>,
+    /// Panel that fills this canvas. The shell owns the grid.
+    panel: Option<u32>,
 }
 
 #[wasm_bindgen]
@@ -94,6 +96,7 @@ impl WebPlot {
             config,
             backend,
             plot: None,
+            panel: None,
         })
     }
 
@@ -123,9 +126,35 @@ impl WebPlot {
                 "plot lines are not in the previous picture",
             ));
         }
+        if let Some(panel) = self.panel {
+            plot.set_solo(Some(panel as usize));
+        }
         plot.apply(self.config.width, self.config.height, &PlotInput::default());
         self.plot = Some(plot);
         Ok(())
+    }
+
+    /// Draw this one panel across the canvas. The shell lays the other cells out.
+    pub fn solo(&mut self, panel: u32) {
+        self.panel = Some(panel);
+        if let Some(plot) = self.plot.as_mut() {
+            plot.set_solo(Some(panel as usize));
+        }
+    }
+
+    /// Crosshair voxel, or empty when the picture has no dose.
+    pub fn dose_cursor(&self) -> Vec<u32> {
+        self.plot
+            .as_ref()
+            .map(|plot| plot.dose_cursor())
+            .unwrap_or_default()
+    }
+
+    /// Same voxel on every cell, so a slice drag moves the other profiles.
+    pub fn set_dose_cursor(&mut self, x: u32, y: u32, z: u32) {
+        if let Some(plot) = self.plot.as_mut() {
+            plot.set_dose_cursor([x as usize, y as usize, z as usize]);
+        }
     }
 
     /// Height of the dose toolbar, in framebuffer pixels. The picture starts below it.
@@ -206,6 +235,13 @@ impl WebPlot {
         if let Some(plot) = self.plot.as_mut() {
             plot.dose_action(panel as usize, action);
         }
+    }
+
+    /// Depth or lateral on the loaded cube. False when the picture has no dose yet.
+    pub fn set_line(&mut self, panel: u32, label: &str) -> bool {
+        self.plot
+            .as_mut()
+            .is_some_and(|plot| plot.set_line(panel as usize, label))
     }
 
     pub fn reset(&mut self) {

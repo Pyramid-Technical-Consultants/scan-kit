@@ -1,6 +1,6 @@
 use super::kernel::{
-    build_kernel, csda_range_mm, depth_sigma_mm, lateral_mm, layer_of, mass_fraction, mcs_along,
-    mcs_at, protons_from_mu, through_wet, LayerKernel,
+    build_kernel, csda_range_mm, depth_sigma_mm, layer_of, mcs_along, mcs_at, protons_from_mu,
+    through_wet, LayerKernel,
 };
 use super::{DoseFrame, Medium, Pencil, Quantity, Volume, MAX_CELLS, MEV_TO_GY_MM3, SIGMA_CUT};
 
@@ -322,7 +322,7 @@ fn deposit_lattice(
     let workers = std::thread::available_parallelism()
         .map(|count| count.get())
         .unwrap_or(1)
-        .clamp(1, 8);
+        .clamp(1, 32);
     // Each band owns its z slices, so the adds stay in one order and match a
     // single thread. A short lattice is not worth the spawn.
     let bands = if nz < 32 || spots.len() < 8 || workers == 1 {
@@ -404,8 +404,9 @@ fn paint_band(
                 if row == 0.0 {
                     continue;
                 }
-                for (kx, ix) in (ix0..ix1).enumerate() {
-                    values[ix + nx * (iy + ny * local)] += row * fx[kx];
+                let base = nx * (iy + ny * local);
+                for (slot, weight) in values[base + ix0..base + ix1].iter_mut().zip(&fx) {
+                    *slot += row * weight;
                 }
             }
         }
@@ -524,8 +525,10 @@ pub(super) fn depth_lateral(
     dose_mode: bool,
 ) -> (f32, f32, f32) {
     if dose_mode {
-        let fz = mass_fraction(kernel, spot.energy, z_lo, z_lo + voxel);
-        let mcs = lateral_mm(kernel, spot.energy, z_lo + 0.5 * voxel);
+        let row = layer_of(kernel, spot.energy);
+        let fz = super::kernel::row_at(kernel, row, z_lo + voxel, false)
+            - super::kernel::row_at(kernel, row, z_lo, false);
+        let mcs = super::kernel::row_at(kernel, row, z_lo + 0.5 * voxel, true).max(0.0);
         (fz, hypot(spot.sx, mcs), hypot(spot.sy, mcs))
     } else {
         let mid = 0.5 * (spot.z0 + spot.z1);
@@ -550,10 +553,21 @@ pub(super) fn normal_row(
     out: &mut Vec<f32>,
 ) {
     out.clear();
-    let sig = f64::from(sigma).max(1e-3);
-    for i in i0..i1 {
-        let lo = f64::from(origin + i as f32 * voxel);
-        out.push(normal_mass(f64::from(center), sig, lo, lo + f64::from(voxel)) as f32);
+    let count = i1.saturating_sub(i0);
+    if count == 0 {
+        return;
+    }
+    out.reserve(count);
+    // Adjacent cells share an edge, so one erf covers both sides of that face.
+    let sig = f64::from(sigma).max(1e-3) * std::f64::consts::SQRT_2;
+    let center = f64::from(center);
+    let origin = f64::from(origin);
+    let step = f64::from(voxel);
+    let mut prev = erf_as((origin + i0 as f64 * step - center) / sig);
+    for i in 0..count {
+        let next = erf_as((origin + (i0 + i + 1) as f64 * step - center) / sig);
+        out.push((0.5 * (next - prev)) as f32);
+        prev = next;
     }
 }
 
@@ -570,7 +584,7 @@ pub(super) fn accumulate_planes(
     let workers = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1)
-        .clamp(1, 8);
+        .clamp(1, 32);
     let parts = if spots.len() < 32 || workers == 1 {
         1
     } else {
@@ -969,6 +983,19 @@ mod tests {
         super::paint_band(&kernel, &spots, origin, shape, 1.0, true, mid, nz, &mut hi);
         lo.extend(hi);
         assert_eq!(lo, one);
+    }
+
+    #[test]
+    fn a_gaussian_row_matches_the_cell_integral() {
+        let mut row = Vec::new();
+        super::normal_row(1.2, 3.0, -4.0, 2, 9, 1.0, &mut row);
+        assert_eq!(row.len(), 7);
+        for (i, weight) in row.iter().enumerate() {
+            let index = 2 + i;
+            let lo = -4.0 + index as f64;
+            let cell = super::normal_mass(1.2, 3.0, lo, lo + 1.0) as f32;
+            assert!((weight - cell).abs() < 1e-6, "{weight} vs {cell}");
+        }
     }
 
     #[test]

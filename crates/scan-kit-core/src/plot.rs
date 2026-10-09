@@ -320,7 +320,8 @@ pub struct VolumeMark {
     #[serde(default)]
     pub session_focus: u32,
     /// Plan dose for each session, same order as `sessions` (or one entry when
-    /// the image is the only cube). Empty `values` skips the dashed line.
+    /// the image is the only cube). Empty `values` skips the line. The plan is
+    /// dashed on the same samples as the measurement.
     #[serde(default)]
     pub plans: Vec<SessionDose>,
     /// The other chamber in independent mode. Empty in the combined calculation.

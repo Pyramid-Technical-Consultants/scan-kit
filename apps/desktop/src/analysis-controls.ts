@@ -2,7 +2,7 @@ import { segmentChoices } from "@/CatalogField";
 
 export type ControlSlot = {
   id: string;
-  kind: "select" | "check" | "segments" | "range" | "text" | "radio";
+  kind: "select" | "check" | "segments" | "range" | "text" | "radio" | "number";
 };
 
 export type SegmentItem = {
@@ -48,7 +48,9 @@ export function controlSections(controls: readonly SectionControl[]): ControlSec
                 ? "text"
                 : control.kind === "radio"
                   ? "radio"
-                  : "select",
+                  : control.kind === "number"
+                    ? "number"
+                    : "select",
     };
     const last = sections[sections.length - 1];
     if (last != null && last.title === title) {
@@ -189,13 +191,24 @@ export function replaceSegment(
 
 const DOSE_PAINT_IDS = ["scale", "auto", "level", "error", "ray", "sample"] as const;
 
-/** Options that rebuild the dose. Color, window, ray mode, and sampling are not in here. */
+/** Depth and lateral curves are rows of the cube already on screen. */
+export function localLinePlot(value: string): boolean {
+  const name = value.trim().toLowerCase();
+  return name.startsWith("depth") || (name.startsWith("lateral") && !name.includes("+"));
+}
+
+/**
+ * Options that rebuild the dose. Color, window, ray mode, sampling, and the
+ * line-plot picker are not in here. DVH and gamma still go through the view
+ * task, because those series are not in the cube.
+ */
 export function sceneOptions(options: Readonly<Record<string, string>>): Record<string, string> {
   const rest: Record<string, string> = {};
   for (const [key, value] of Object.entries(options)) {
-    if (!(DOSE_PAINT_IDS as readonly string[]).includes(key)) {
-      rest[key] = value;
+    if ((DOSE_PAINT_IDS as readonly string[]).includes(key) || key === "plot0" || key === "plot1") {
+      continue;
     }
+    rest[key] = value;
   }
   return rest;
 }

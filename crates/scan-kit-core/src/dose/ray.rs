@@ -53,6 +53,8 @@ pub struct VolumeScan {
     pub brick_shape: [usize; 3],
     pub line_scale: f32,
     pub peak: f32,
+    /// Max |dose|. The slice atlas stores a signed window around this.
+    pub abs_peak: f32,
     pub peak_at: [usize; 3],
     /// Sum through z, y, and x, in dose × mm. Axial, coronal, sagittal.
     pub integrals: [Vec<f32>; 3],
@@ -86,6 +88,7 @@ pub fn scan_volume(volume: &Volume) -> VolumeScan {
     let mut sagittal = vec![0.0f32; ny.saturating_mul(nz)];
     let mut x_best = 0.0f32;
     let mut peak = 0.0f32;
+    let mut abs_peak = 0.0f32;
     let mut peak_at = [0usize; 3];
     let values = &volume.values;
     if nx > 0 && ny > 0 && nz > 0 && values.len() >= nx * ny * nz {
@@ -97,6 +100,7 @@ pub fn scan_volume(volume: &Volume) -> VolumeScan {
                 for x in 0..nx {
                     let value = values[base + x];
                     let mag = value.abs();
+                    abs_peak = abs_peak.max(mag);
                     along_x += mag;
                     signed_x += value;
                     y_sum[x + nx * z] += mag;
@@ -133,6 +137,7 @@ pub fn scan_volume(volume: &Volume) -> VolumeScan {
         brick_shape,
         line_scale: (x_best.max(y_best).max(z_best) * voxel).max(1e-6),
         peak: peak.max(0.0),
+        abs_peak,
         peak_at,
         integrals: [axial, coronal, sagittal],
         integral_peaks,
@@ -503,7 +508,7 @@ struct Frame {
 fn camera(volume: &Volume, view: RayView) -> Frame {
     let lattice = lattice_extent(volume);
     let extent = if view.gantry.abs() > 1e-3 {
-        view_extent(lattice, view.gantry)
+        gantry_extent(lattice, view.gantry)
     } else {
         lattice
     };
@@ -651,8 +656,9 @@ fn lattice_center(volume: &Volume) -> [f32; 3] {
     ]
 }
 
-/// Axis-aligned box of the lattice after a rotation about +X through its center.
-fn view_extent(extent: [f32; 3], degrees: f32) -> [f32; 3] {
+/// Axis-aligned size of `extent` after a rotation about +X through its center.
+/// 90° swaps Y and Z: depth, which is lattice Z, lies along world Y.
+pub fn gantry_extent(extent: [f32; 3], degrees: f32) -> [f32; 3] {
     let (s, c) = degrees.to_radians().sin_cos();
     let (c, s) = (c.abs(), s.abs());
     [
@@ -674,7 +680,7 @@ fn view_box(volume: &Volume, degrees: f32) -> ([f32; 3], [f32; 3]) {
             ],
         );
     }
-    let extent = view_extent(lattice_extent(volume), degrees);
+    let extent = gantry_extent(lattice_extent(volume), degrees);
     let center = lattice_center(volume);
     (
         [

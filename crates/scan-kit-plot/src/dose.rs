@@ -54,7 +54,7 @@ pub struct DoseGrid {
     pub session_focus: usize,
     /// Second chamber. `None` skips the line.
     pub companions: Vec<Option<Volume>>,
-    /// Plan dose. `None` skips the dashed line.
+    /// Plan dose. `None` skips the line. Drawn dashed on the measured samples.
     pub plans: Vec<Option<Volume>>,
 }
 
@@ -104,12 +104,7 @@ pub fn grid_from(
         values,
     };
     let scan = scan_volume(&volume);
-    let span = volume
-        .values
-        .iter()
-        .copied()
-        .fold(0.0f32, |best, value| best.max(value.abs()))
-        .max(1e-6);
+    let span = scan.abs_peak.max(1e-6);
     Some(DoseGrid {
         atlas_shape: fit_shape(shape_us),
         volume,

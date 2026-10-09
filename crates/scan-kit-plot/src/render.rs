@@ -17,17 +17,25 @@
 //! A dose slice fills its cell. The window grows on the longer side so a
 //! millimetre has the same pixel length on both axes, including after a
 //! quarter turn. That window is the ramp's zero. The volume stays on its
-//! own bounds, and the crosshair runs out to the window. Slice axes sit on
-//! that border. The 3D cell keeps its axes in the volume and leaves the
-//! border clear. Tick marks and their numbers hang off the three edges that
-//! meet at the entrance corner, on the side facing the camera, and the text
-//! turns to follow the edge. The titles are X (mm), Y (mm), and Depth (mm).
+//! own bounds, and the crosshair runs out to the window. A slice reads the
+//! deposited lattice, so nearest blocks are those voxels. The atlas may be
+//! coarser so the tiled slices fit 2048; it keeps the ramp and any CT. Slice axes sit on
+//! that border. The 3D cell keeps its axes in the volume and draws the same
+//! 1px border. A gantry near 90° opens looking across the beam, so depth runs
+//! across the picture and Y is up. Tick marks and their numbers hang off the
+//! three edges that meet at the entrance corner, on the side facing the camera,
+//! and the text turns to follow the edge. The titles are X (mm), Y (mm), and
+//! Depth (mm).
 //! The field box is an amber rectangle on each slice and an amber wireframe
-//! through the volume. The wire is a pixel and a half wide on that picture,
-//! at the edge's own depth, so orbit and zoom do not drop it. Dose line plots
-//! draw every loaded session in that session's color. A second chamber uses
-//! that color at reduced alpha. The plan is a dashed stroke in the same color.
-//! A toolbar band names the plot, so the canvas title stays off.
+//! through the volume. The 3D wire is the same 1px stroke as every other line:
+//! the edge is projected onto the picture and covered with that filter, so a
+//! diagonal still lights its nearest pixel. Dose line plots draw every loaded
+//! session in that session's color. A second chamber uses that color at reduced
+//! alpha. The plan is the same stroke, dashed in the fragment shader, so it
+//! stays on the measured samples. A dot pattern uses the same path.
+//! A dose workspace cell is one panel filling its canvas. The shell owns the
+//! six-cell grid and the toolbar, so that panel draws no title and ignores the
+//! grid gaps.
 //! Color gain, window, opacity, ray mode, and the sample filter are uniforms.
 //! A color-scale change rewrites the 256 ramp pixels on the last atlas row.
 //! Neither rebuilds the volume.
@@ -177,6 +185,9 @@ struct LineOut {
     @location(1) @interpolate(flat) a: vec2<f32>,
     @location(2) @interpolate(flat) b: vec2<f32>,
     @location(3) @interpolate(flat) radius: f32,
+    // x is the pattern (0 solid, 1 dash, 2 dot). y is the pixel distance
+    // along the polyline at this segment's start.
+    @location(4) @interpolate(flat) dash: vec2<f32>,
 }
 
 @vertex
@@ -217,7 +228,31 @@ fn vs_line(
     out.a = pa;
     out.b = pb;
     out.radius = radius;
+    out.dash = vec2<f32>(a.w, b.w);
     return out;
+}
+
+// Dash and dot are measured along the stroke in picture pixels. `along` is the
+// distance from the start of the polyline. The on/off edges are filtered so a
+// dash ends in the pixel instead of on a sample.
+fn stroke_coverage(dist: f32, radius: f32, along: f32, pattern: f32) -> f32 {
+    let body = clamp(radius + 0.5 - dist, 0.0, 1.0);
+    if (pattern < 0.5) {
+        return body;
+    }
+    if (pattern > 1.5) {
+        let period = 5.0;
+        let u = along - period * floor(along / period);
+        let along_d = min(u, period - u);
+        let dot = max(radius, 1.25);
+        return clamp(dot + 0.5 - length(vec2<f32>(along_d, dist)), 0.0, 1.0);
+    }
+    let on = 8.0;
+    let period = 12.0;
+    let u = along - period * floor(along / period);
+    let edge = 0.65;
+    let gate = smoothstep(0.0, edge, u) * (1.0 - smoothstep(on - edge, on, u));
+    return body * gate;
 }
 
 @fragment
@@ -225,9 +260,10 @@ fn fs_line(in: LineOut) -> @location(0) vec4<f32> {
     let p = in.clip.xy;
     let ab = in.b - in.a;
     let len2 = max(dot(ab, ab), 0.0001);
+    let len = sqrt(len2);
     let t = clamp(dot(p - in.a, ab) / len2, 0.0, 1.0);
     let dist = length(p - (in.a + ab * t));
-    let coverage = clamp(in.radius + 0.5 - dist, 0.0, 1.0);
+    let coverage = stroke_coverage(dist, in.radius, in.dash.y + t * len, in.dash.x);
     return shade(in.color.rgb, in.color.a, coverage);
 }
 
@@ -467,10 +503,6 @@ fn catmull(d: f32) -> f32 {
     return (1.5 * x - 2.5) * x * x + 1.0;
 }
 
-fn atlas_dose(sample: f32) -> f32 {
-    return (sample - 0.5) * 2.0 * u.dose1.w;
-}
-
 fn sample_grid(x: f32, y: f32, z: f32) -> vec4<f32> {
     let sampling = u32(u.dose3.y + 0.5);
     if (sampling == 0u) {
@@ -532,9 +564,6 @@ fn dose_fragment(uv: vec2<f32>, coverage: f32, plot_h: f32) -> vec4<f32> {
         return shade(marched.rgb, marched.a, coverage);
     }
     let film = turned_uv(uv, u32(u.dose0.z + 0.5));
-    let nx = max(u.dose1.x, 1.0);
-    let ny = max(u.dose1.y, 1.0);
-    let nz = max(u.dose1.z, 1.0);
     var raw = 0.0;
     var under = vec3<f32>(0.0);
     var has_ct = false;
@@ -552,21 +581,39 @@ fn dose_fragment(uv: vec2<f32>, coverage: f32, plot_h: f32) -> vec4<f32> {
     }
     // Axial is X across and Y up. Coronal is X across and depth up.
     // Sagittal is Y across and depth up, the same axes as the field box.
-    var vx = film.x * nx - 0.5;
-    var vy = (1.0 - film.y) * ny - 0.5;
-    var vz = u.dose0.y;
+    // Two voxels of padding sit outside the lattice. dose0.y is a lattice index.
+    let lattice = max(vec3<f32>(textureDimensions(dose_vol)) - vec3<f32>(4.0), vec3<f32>(1.0));
+    let slice = u.dose0.y;
+    var vx = film.x * lattice.x - 0.5;
+    var vy = (1.0 - film.y) * lattice.y - 0.5;
+    var vz = slice;
     if (plane == 1u) {
-        vy = u.dose0.y;
-        vz = (1.0 - film.y) * nz - 0.5;
+        vy = slice;
+        vz = (1.0 - film.y) * lattice.z - 0.5;
     } else if (plane == 2u) {
-        vx = u.dose0.y;
-        vy = film.x * ny - 0.5;
-        vz = (1.0 - film.y) * nz - 0.5;
+        vx = slice;
+        vy = film.x * lattice.y - 0.5;
+        vz = (1.0 - film.y) * lattice.z - 0.5;
     }
-    let texel = sample_grid(vx, vy, vz);
-    raw = atlas_dose(texel.r);
-    has_ct = texel.b > 0.5;
-    under = vec3<f32>(texel.g);
+    let voxel = max(u.dose5.w, 0.000001);
+    let p = u.dose4.xyz + (vec3<f32>(vx, vy, vz) + vec3<f32>(0.5)) * voxel;
+    raw = vol_sample(p);
+    if (u.dose6.w > 0.5) {
+        var cx = film.x * u.dose1.x - 0.5;
+        var cy = (1.0 - film.y) * u.dose1.y - 0.5;
+        var cz = u.dose6.x;
+        if (plane == 1u) {
+            cy = u.dose6.x;
+            cz = (1.0 - film.y) * u.dose1.z - 0.5;
+        } else if (plane == 2u) {
+            cx = u.dose6.x;
+            cy = film.x * u.dose1.y - 0.5;
+            cz = (1.0 - film.y) * u.dose1.z - 0.5;
+        }
+        let texel = sample_grid(cx, cy, cz);
+        has_ct = texel.b > 0.5;
+        under = vec3<f32>(texel.g);
+    }
     let color = wash(raw, u.dose2.x, u.dose2.y, under, has_ct);
     return shade(color.rgb, color.a, coverage);
 }
@@ -777,29 +824,6 @@ fn to_view_pt(q: vec3<f32>, origin: vec3<f32>, extent: vec3<f32>) -> vec3<f32> {
     return center + vec3<f32>(d.x, cs.x * d.y - cs.y * d.z, cs.y * d.y + cs.x * d.z);
 }
 
-fn nearer(eye: vec3<f32>, dir: vec3<f32>, a: vec3<f32>, b: vec3<f32>, best: vec2<f32>) -> vec2<f32> {
-    let v = b - a;
-    let w = eye - a;
-    let bv = dot(dir, v);
-    let c = max(dot(v, v), 0.00000001);
-    let d = dot(dir, w);
-    let e = dot(v, w);
-    let denom = c - bv * bv;
-    var s = 0.0;
-    if (abs(denom) > 0.00001) {
-        s = clamp((e - bv * d) / denom, 0.0, 1.0);
-    } else {
-        s = clamp(dot(eye - a, v) / c, 0.0, 1.0);
-    }
-    let q = a + v * s;
-    let t = dot(q - eye, dir);
-    let gap = length((eye + dir * t) - q);
-    if (gap < best.y) {
-        return vec2<f32>(t, gap);
-    }
-    return best;
-}
-
 fn lattice_corner(lo: vec3<f32>, hi: vec3<f32>, bits: i32, origin: vec3<f32>, extent: vec3<f32>) -> vec3<f32> {
     let x = select(lo.x, hi.x, (bits & 1) == 1);
     let y = select(lo.y, hi.y, (bits & 2) == 2);
@@ -807,8 +831,96 @@ fn lattice_corner(lo: vec3<f32>, hi: vec3<f32>, bits: i32, origin: vec3<f32>, ex
     return to_view_pt(vec3<f32>(x, y, z), origin, extent);
 }
 
-fn box_near(eye: vec3<f32>, dir: vec3<f32>, lo: vec3<f32>, hi: vec3<f32>, origin: vec3<f32>, extent: vec3<f32>) -> vec2<f32> {
-    var best = vec2<f32>(0.0, 1e30);
+// The volume camera. `film` is pixel ndc x, pixel ndc y, aspect, picture height.
+// `lens` is tan(fov/2), ortho half-height, 1 when orthographic.
+struct RayCam {
+    eye: vec3<f32>,
+    dir: vec3<f32>,
+    look: vec3<f32>,
+    right: vec3<f32>,
+    up: vec3<f32>,
+    film: vec4<f32>,
+    lens: vec4<f32>,
+}
+
+// Pixel offset of a view-space point from this fragment. z is depth along look;
+// negative means the point is behind the camera.
+fn project_delta(cam: RayCam, p: vec3<f32>) -> vec3<f32> {
+    let rel = p - cam.eye;
+    let depth = dot(rel, cam.look);
+    let aspect = max(cam.film.z, 0.001);
+    let plot_h = max(cam.film.w, 1.0);
+    var nx: f32;
+    var ny: f32;
+    if (cam.lens.z > 0.5) {
+        let half_y = max(cam.lens.y, 0.001);
+        nx = dot(rel, cam.right) / (aspect * half_y);
+        ny = dot(rel, cam.up) / half_y;
+    } else {
+        if (depth < 0.001) {
+            return vec3<f32>(0.0, 0.0, -1.0);
+        }
+        let tan_y = max(cam.lens.x, 0.001);
+        nx = dot(rel, cam.right) / (depth * aspect * tan_y) - cam.film.x;
+        ny = dot(rel, cam.up) / (depth * tan_y) - cam.film.y;
+    }
+    let scale = plot_h * 0.5;
+    return vec3<f32>(nx * aspect * scale, ny * scale, depth);
+}
+
+// Coverage of a 1px stroke, matching `fs_line`, and the ray parameter of the
+// covered point. An edge that crosses the camera is clipped to the near plane
+// before it is projected, so the line stays a line.
+fn edge_px(cam: RayCam, a: vec3<f32>, b: vec3<f32>) -> vec2<f32> {
+    var da = project_delta(cam, a);
+    var db = project_delta(cam, b);
+    var pa = a;
+    var pb = b;
+    if (da.z < 0.001 && db.z < 0.001) {
+        return vec2<f32>(0.0, 0.0);
+    }
+    if (da.z < 0.001) {
+        let u = (0.001 - da.z) / (db.z - da.z);
+        pa = mix(a, b, u);
+        da = project_delta(cam, pa);
+    } else if (db.z < 0.001) {
+        let u = (0.001 - db.z) / (da.z - db.z);
+        pb = mix(b, a, u);
+        db = project_delta(cam, pb);
+    }
+    let ab = db.xy - da.xy;
+    let len2 = max(dot(ab, ab), 0.0001);
+    let s = clamp(dot(-da.xy, ab) / len2, 0.0, 1.0);
+    let dist = length(da.xy + ab * s);
+    let coverage = clamp(1.0 - dist, 0.0, 1.0);
+    // Depth is the ray parameter of the closest point on the edge, the same
+    // quantity the march uses. Screen-space interpolation of that parameter
+    // runs long when a vertex is near the camera and hides the edge.
+    let v = pb - pa;
+    let w = cam.eye - pa;
+    let bv = dot(cam.dir, v);
+    let c = max(dot(v, v), 0.00000001);
+    let denom = c - bv * bv;
+    var along = 0.0;
+    if (abs(denom) > 0.00001) {
+        along = clamp((dot(v, w) - bv * dot(cam.dir, w)) / denom, 0.0, 1.0);
+    } else {
+        along = clamp(dot(w, v) / c, 0.0, 1.0);
+    }
+    let q = pa + v * along;
+    return vec2<f32>(coverage, dot(q - cam.eye, cam.dir));
+}
+
+// best.xyz is ink. best.w is coverage.
+fn consider(best: vec4<f32>, sample: vec2<f32>, ink: vec3<f32>, t_lo: f32, t_hi: f32) -> vec4<f32> {
+    if (sample.x <= best.w || sample.y < t_lo || sample.y > t_hi) {
+        return best;
+    }
+    return vec4<f32>(ink, sample.x);
+}
+
+fn cover_box(best: vec4<f32>, cam: RayCam, lo: vec3<f32>, hi: vec3<f32>, origin: vec3<f32>, extent: vec3<f32>, ink: vec3<f32>, t_lo: f32, t_hi: f32) -> vec4<f32> {
+    var nearest = best;
     var axis = 0;
     loop {
         if (axis >= 3) { break; }
@@ -828,12 +940,13 @@ fn box_near(eye: vec3<f32>, dir: vec3<f32>, lo: vec3<f32>, hi: vec3<f32>, origin
                 let zb = i / 2;
                 low = xb + zb * 4;
             }
-            best = nearer(eye, dir, lattice_corner(lo, hi, low, origin, extent), lattice_corner(lo, hi, low + bit, origin, extent), best);
+            let sample = edge_px(cam, lattice_corner(lo, hi, low, origin, extent), lattice_corner(lo, hi, low + bit, origin, extent));
+            nearest = consider(nearest, sample, ink, t_lo, t_hi);
             i = i + 1;
         }
         axis = axis + 1;
     }
-    return best;
+    return nearest;
 }
 
 fn label_every(count: f32) -> f32 {
@@ -859,7 +972,7 @@ fn edge_root(axis: i32, mark: f32, origin: vec3<f32>, z1: f32) -> vec3<f32> {
     return vec3<f32>(origin.x, origin.y, mark);
 }
 
-fn hang_ticks(best: vec2<f32>, eye: vec3<f32>, dir: vec3<f32>, origin: vec3<f32>, extent: vec3<f32>, axis: i32, out: vec3<f32>, stub: f32) -> vec2<f32> {
+fn hang_ticks(best: vec4<f32>, cam: RayCam, origin: vec3<f32>, extent: vec3<f32>, axis: i32, out: vec3<f32>, stub: f32, ink: vec3<f32>, t_lo: f32, t_hi: f32) -> vec4<f32> {
     var nearest = best;
     let z1 = origin.z + extent.z;
     var lo = origin.x;
@@ -881,17 +994,20 @@ fn hang_ticks(best: vec2<f32>, eye: vec3<f32>, dir: vec3<f32>, origin: vec3<f32>
         let mark = k * 10.0;
         let len = select(stub * 0.55, stub, tick_major(k, every, k0, k1));
         let root = edge_root(axis, mark, origin, z1);
-        nearest = nearer(eye, dir, to_view_pt(root, origin, extent), to_view_pt(root + out * len, origin, extent), nearest);
+        let sample = edge_px(cam, to_view_pt(root, origin, extent), to_view_pt(root + out * len, origin, extent));
+        nearest = consider(nearest, sample, ink, t_lo, t_hi);
         k = k + 1.0;
         n = n + 1;
     }
     if (k1 < k0 || abs(lo - k0 * 10.0) > 0.05) {
         let root = edge_root(axis, lo, origin, z1);
-        nearest = nearer(eye, dir, to_view_pt(root, origin, extent), to_view_pt(root + out * stub, origin, extent), nearest);
+        let sample = edge_px(cam, to_view_pt(root, origin, extent), to_view_pt(root + out * stub, origin, extent));
+        nearest = consider(nearest, sample, ink, t_lo, t_hi);
     }
     if (k1 < k0 || abs(hi - k1 * 10.0) > 0.05) {
         let root = edge_root(axis, hi, origin, z1);
-        nearest = nearer(eye, dir, to_view_pt(root, origin, extent), to_view_pt(root + out * stub, origin, extent), nearest);
+        let sample = edge_px(cam, to_view_pt(root, origin, extent), to_view_pt(root + out * stub, origin, extent));
+        nearest = consider(nearest, sample, ink, t_lo, t_hi);
     }
     return nearest;
 }
@@ -899,16 +1015,16 @@ fn hang_ticks(best: vec2<f32>, eye: vec3<f32>, dir: vec3<f32>, origin: vec3<f32>
 // Centimetre ticks on the three edges that meet at the entrance corner.
 // dose6.w bits 0..2 pick EDGE_OUT's second direction for X, Y, and depth.
 // Numbered ticks are the long ones; they match axis_ticks.
-fn tick_near(eye: vec3<f32>, dir: vec3<f32>, origin: vec3<f32>, extent: vec3<f32>) -> vec2<f32> {
+fn cover_ticks(best: vec4<f32>, cam: RayCam, origin: vec3<f32>, extent: vec3<f32>, t_lo: f32, t_hi: f32) -> vec4<f32> {
     let stub = clamp(0.02 * max(extent.x, max(extent.y, extent.z)), 1.5, 6.0);
     let code = u32(u.dose6.w + 0.5);
-    var best = vec2<f32>(0.0, 1e30);
+    let ink = vec3<f32>(0.62, 0.66, 0.7);
     let x_out = select(vec3<f32>(0.0, -1.0, 0.0), vec3<f32>(0.0, 0.0, 1.0), (code & 1u) == 1u);
     let y_out = select(vec3<f32>(-1.0, 0.0, 0.0), vec3<f32>(0.0, 0.0, 1.0), (code & 2u) == 2u);
     let z_out = select(vec3<f32>(-1.0, 0.0, 0.0), vec3<f32>(0.0, -1.0, 0.0), (code & 4u) == 4u);
-    best = hang_ticks(best, eye, dir, origin, extent, 0, x_out, stub);
-    best = hang_ticks(best, eye, dir, origin, extent, 1, y_out, stub);
-    return hang_ticks(best, eye, dir, origin, extent, 2, z_out, stub);
+    var nearest = hang_ticks(best, cam, origin, extent, 0, x_out, stub, ink, t_lo, t_hi);
+    nearest = hang_ticks(nearest, cam, origin, extent, 1, y_out, stub, ink, t_lo, t_hi);
+    return hang_ticks(nearest, cam, origin, extent, 2, z_out, stub, ink, t_lo, t_hi);
 }
 
 fn clip_box(eye: vec3<f32>, dir: vec3<f32>, bmin: vec3<f32>, bmax: vec3<f32>) -> vec3<f32> {
@@ -930,34 +1046,34 @@ fn world_per_pixel(t: f32, fy: f32, plot_h: f32) -> f32 {
     return max(t, 0.001) * 2.0 * tan(fov * 0.5) / span;
 }
 
-// best.xyz is ink. best.w is the gap, or 1e30 when nothing has hit.
-fn keep_guide(best: vec4<f32>, t: f32, gap: f32, ink: vec3<f32>, t_lo: f32, t_hi: f32, fy: f32, plot_h: f32) -> vec4<f32> {
-    let px = 1.5 * world_per_pixel(t, fy, plot_h);
-    if (t < t_lo - px || t > t_hi + px || gap > px || gap >= best.w) {
-        return best;
+// One picture pixel of ray travel. An edge that lies on the dose surface sits a
+// fraction past the hit, and a hard test drops it. This is depth bias, not width.
+fn pixel_world(cam: RayCam, t: f32) -> f32 {
+    let span = max(cam.film.w, 1.0);
+    if (cam.lens.z > 0.5) {
+        return max(cam.lens.y, 0.001) * 2.0 / span;
     }
-    return vec4<f32>(ink, gap);
+    return max(t, 0.001) * 2.0 * max(cam.lens.x, 0.001) / span;
 }
 
-fn over_guides(color: vec4<f32>, eye: vec3<f32>, dir: vec3<f32>, origin: vec3<f32>, extent: vec3<f32>, hit_t: f32, t0: f32, t1: f32, fy: f32, plot_h: f32) -> vec4<f32> {
+fn over_guides(color: vec4<f32>, cam: RayCam, origin: vec3<f32>, extent: vec3<f32>, hit_t: f32) -> vec4<f32> {
     var box_ink = vec3<f32>(0.55, 0.58, 0.62);
     if (u.dose9.w > 0.5) {
         box_ink = vec3<f32>(0.25, 0.8, 0.85);
     }
-    var best = vec4<f32>(0.0, 0.0, 0.0, 1e30);
-    let lattice = box_near(eye, dir, origin, origin + extent, origin, extent);
-    best = keep_guide(best, lattice.x, lattice.y, box_ink, t0, hit_t, fy, plot_h);
-    let ticks = tick_near(eye, dir, origin, extent);
-    best = keep_guide(best, ticks.x, ticks.y, vec3<f32>(0.62, 0.66, 0.7), t0, hit_t, fy, plot_h);
+    let slop = 1.5 * pixel_world(cam, hit_t);
+    var best = vec4<f32>(0.0);
+    best = cover_box(best, cam, origin, origin + extent, origin, extent, box_ink, 0.0, hit_t + slop);
+    best = cover_ticks(best, cam, origin, extent, 0.0, hit_t + slop);
     if (u.dose8.w > 0.5) {
-        let field = box_near(eye, dir, u.dose8.xyz, u.dose9.xyz, origin, extent);
-        // Through the slab. A nearer lattice edge that the dose hides must not erase it.
-        best = keep_guide(best, field.x, field.y, vec3<f32>(0.86, 0.68, 0.22), t0, t1, fy, plot_h);
+        // The field wire is drawn through the dose. A hidden box edge does not erase it,
+        // because each edge keeps its own coverage.
+        best = cover_box(best, cam, u.dose8.xyz, u.dose9.xyz, origin, extent, vec3<f32>(0.86, 0.68, 0.22), 0.0, 1e20);
     }
-    if (best.w < 1e20) {
-        return vec4<f32>(best.xyz, 1.0);
+    if (best.w < 0.004) {
+        return color;
     }
-    return color;
+    return vec4<f32>(mix(color.rgb, best.xyz, best.w), max(color.a, best.w));
 }
 
 fn march_color(uv: vec2<f32>, plot_h: f32) -> vec4<f32> {
@@ -999,11 +1115,19 @@ fn march_color(uv: vec2<f32>, plot_h: f32) -> vec4<f32> {
         eye = center - look * distance;
         dir = normalize(look + right * x * aspect * tan_y + up * y * tan_y);
     }
+    var cam: RayCam;
+    cam.eye = eye;
+    cam.dir = dir;
+    cam.look = look;
+    cam.right = right;
+    cam.up = up;
+    cam.film = vec4<f32>(x, y, aspect, plot_h);
+    cam.lens = vec4<f32>(tan(fov * 0.5), fy * 0.5, select(0.0, 1.0, fov <= 0.0001), 0.0);
     let bmax = box_o + box_e;
-    // Ticks stick out, and half of a silhouette stroke sits outside the cube.
-    // Test that shell before giving up, so a miss still draws the wire.
+    // Ticks stick out by up to 6 mm. The 1px stroke also covers the pixel just
+    // outside the cube, so that fringe is inside the shell too.
     let reach = distance + length(box_e);
-    let shell = max(6.0, 2.0 * world_per_pixel(reach, fy, plot_h));
+    let shell = max(6.0, 1.5 * world_per_pixel(reach, fy, plot_h));
     let wide = clip_box(eye, dir, box_o - vec3<f32>(shell), bmax + vec3<f32>(shell));
     if (wide.z < 0.5 || wide.y < 0.0) { return zero_color(); }
     let clip = clip_box(eye, dir, box_o, bmax);
@@ -1011,7 +1135,7 @@ fn march_color(uv: vec2<f32>, plot_h: f32) -> vec4<f32> {
     let t1 = clip.y;
     let dist = t1 - t0;
     if (clip.z < 0.5 || dist < 0.001) {
-        return over_guides(zero_color(), eye, dir, origin, extent, wide.y, 0.0, wide.y, fy, plot_h);
+        return over_guides(zero_color(), cam, origin, extent, wide.y);
     }
     let nstep = i32(clamp(ceil(dist / voxel), 1.0, 1024.0));
     let entry = eye + dir * t0;
@@ -1095,7 +1219,7 @@ fn march_color(uv: vec2<f32>, plot_h: f32) -> vec4<f32> {
             hit_t = t1;
         }
     }
-    return over_guides(color, eye, dir, origin, extent, hit_t, t0, t1, fy, plot_h);
+    return over_guides(color, cam, origin, extent, hit_t);
 }
 "#;
 
@@ -1163,7 +1287,15 @@ pub(crate) struct LineRec {
     pub color: [f32; 4],
     pub thickness: f32,
     pub id: u32,
+    /// 0 solid, 1 dash, 2 dot. The fragment shader patterns the stroke.
+    pub pattern: u8,
+    /// Pixel distance along the polyline at `a`. Stamped for the current camera.
+    pub phase: f32,
 }
+
+const LINE_SOLID: u8 = 0;
+const LINE_DASH: u8 = 1;
+const LINE_DOT: u8 = 2;
 
 #[derive(Clone, Debug)]
 pub(crate) struct PointRec {
@@ -1330,6 +1462,28 @@ const UNIFORM_BYTES: usize = 240;
 /// Vispy turntable home: azimuth 30°, elevation 25°, 45° vertical field of view.
 const HOME_AZIMUTH: f32 = 30.0 * std::f32::consts::PI / 180.0;
 const HOME_ELEVATION: f32 = 25.0 * std::f32::consts::PI / 180.0;
+
+/// Azimuth 0 looks along +Y. Gantry 90° and 270° lay the beam on that axis.
+/// A pure side view flattens the cube, so this keeps the vispy 30° corner and
+/// aims it across the beam: depth runs left to right, and lattice Y is up at 90°.
+fn opening_azimuth(gantry_deg: f32) -> f32 {
+    let s = gantry_deg.to_radians().sin();
+    if s > 0.5 {
+        std::f32::consts::FRAC_PI_2 - HOME_AZIMUTH
+    } else if s < -0.5 {
+        -std::f32::consts::FRAC_PI_2 + HOME_AZIMUTH
+    } else {
+        HOME_AZIMUTH
+    }
+}
+
+fn opening_pose(plot: &Plot, gantry_deg: f32) -> bool {
+    (plot.azimuth - opening_azimuth(gantry_deg)).abs() < 1.0e-4
+        && (plot.elevation - HOME_ELEVATION).abs() < 1.0e-4
+        && (plot.orbit_zoom - 1.0).abs() < 1.0e-4
+        && plot.pan.iter().all(|axis| axis.abs() < 1.0e-4)
+        && (plot.fov - scan_kit_core::FOV_Y).abs() < 1.0e-4
+}
 const ORBIT_STEP: f32 = 15.0 * std::f32::consts::PI / 180.0;
 pub(crate) const POINT_STRIDE: u64 = 48;
 pub(crate) const QUAD_STRIDE: u64 = 64;
@@ -1419,6 +1573,8 @@ pub struct Plot {
     size: (u32, u32),
     /// Toolbar band above a dose cell, in framebuffer pixels. Zero leaves the title gutter alone.
     chrome: f32,
+    /// One panel fills the canvas. The shell owns the grid and the toolbar.
+    solo: Option<usize>,
     #[cfg(not(target_arch = "wasm32"))]
     offscreen: Option<Offscreen>,
     #[cfg(not(target_arch = "wasm32"))]
@@ -1509,6 +1665,7 @@ impl Plot {
             mark_uploads: 0,
             size: (0, 0),
             chrome: 0.0,
+            solo: None,
             #[cfg(not(target_arch = "wasm32"))]
             offscreen: None,
             #[cfg(not(target_arch = "wasm32"))]
@@ -1602,6 +1759,7 @@ impl Plot {
                 self.marks.panels[index].line_count = 0;
             }
         }
+        self.azimuth = opening_azimuth(mark.gantry);
         self.dose = Some(grid);
         self.dose_atlas = Some(atlas);
         self.ramp_dirty = false;
@@ -1655,24 +1813,44 @@ impl Plot {
             return [[0.0; 4]; 10];
         };
         let [nx, ny, nz] = grid.atlas_shape;
-        let (second, third, integral) = if plane == 3 {
-            (self.azimuth, self.elevation, 0.0)
+        let (origin, march_voxel, axis_line) = self
+            .volume_draw
+            .as_ref()
+            .map(|draw| (draw.origin, draw.voxel, draw.line_scale))
+            .unwrap_or((grid.volume.origin, grid.volume.voxel, grid.line_scale));
+        let march_shape = self.volume_draw.as_ref().map(|draw| draw.shape).unwrap_or([
+            grid.volume.shape[0] as f32,
+            grid.volume.shape[1] as f32,
+            grid.volume.shape[2] as f32,
+        ]);
+        // dose0.y is an index in the uploaded lattice. The atlas index stays in
+        // dose6.x for CT, which can be coarser than the deposited voxels.
+        let (second, third, integral, atlas_slice, ct_on) = if plane == 3 {
+            (self.azimuth, self.elevation, 0.0, 0.0, 0.0)
         } else {
-            let (full, full_n, atlas_n) = match plane {
-                1 => (self.cursor[1], grid.volume.shape[1], ny),
-                2 => (self.cursor[0], grid.volume.shape[0], nx),
-                _ => (self.cursor[2], grid.volume.shape[2], nz),
+            let (full, full_n, atlas_n, shown) = match plane {
+                1 => (self.cursor[1], grid.volume.shape[1], ny, march_shape[1]),
+                2 => (self.cursor[0], grid.volume.shape[0], nx, march_shape[0]),
+                _ => (self.cursor[2], grid.volume.shape[2], nz, march_shape[2]),
             };
-            let mapped = if full_n == atlas_n {
+            let shown_n = shown.round().max(0.0) as usize;
+            let lattice = if shown_n == full_n || shown_n == 0 {
+                full as f32
+            } else {
+                (full as f32 * shown_n as f32 / full_n.max(1) as f32).floor()
+            };
+            let atlas_slice = if full_n == atlas_n {
                 full as f32
             } else {
                 full as f32 * atlas_n as f32 / full_n.max(1) as f32
             };
             let on = self.integral.get(panel).copied().unwrap_or(false);
             (
-                mapped,
+                lattice,
                 self.turns.get(panel).copied().unwrap_or(0) as f32,
                 if on { 1.0 } else { 0.0 },
+                atlas_slice,
+                if grid.ct.is_empty() { 0.0 } else { 1.0 },
             )
         };
         let integral_peak = if integral > 0.0 {
@@ -1687,11 +1865,6 @@ impl Plot {
         } else {
             (0.0, grid.peak)
         };
-        let (origin, march_voxel, axis_line) = self
-            .volume_draw
-            .as_ref()
-            .map(|draw| (draw.origin, draw.voxel, draw.line_scale))
-            .unwrap_or((grid.volume.origin, grid.volume.voxel, grid.line_scale));
         // Integrate colors against the brightest ray in this view: Python's auto window.
         let line = if plane == 3 && grid.mode == 0 {
             viewed
@@ -1699,11 +1872,6 @@ impl Plot {
             axis_line
         };
         let typical = lo.abs().max(hi.abs()).max(1e-6);
-        let march_shape = self.volume_draw.as_ref().map(|draw| draw.shape).unwrap_or([
-            grid.volume.shape[0] as f32,
-            grid.volume.shape[1] as f32,
-            grid.volume.shape[2] as f32,
-        ]);
         let [full_nx, full_ny, full_nz] = grid.volume.shape;
         let dose6 = if plane == 3 {
             let sides = axis_sides(&grid.volume, dose_ray(self, grid, aspect));
@@ -1725,7 +1893,7 @@ impl Plot {
                 _ => [full_nx as f32, full_ny as f32, 0.0, 0.0],
             }
         } else {
-            [0.0; 4]
+            [atlas_slice, 0.0, 0.0, ct_on]
         };
         let field_on = if plane == 3
             && grid.field[1] > grid.field[0]
@@ -1831,6 +1999,8 @@ impl Plot {
                             color: structure_color(id),
                             thickness: 1.5,
                             id: 0,
+                            pattern: LINE_SOLID,
+                            phase: 0.0,
                         });
                     }
                     if !lines.is_empty() {
@@ -1852,6 +2022,8 @@ impl Plot {
                             color: line.color,
                             thickness: line.thickness,
                             id: line.id,
+                            pattern: LINE_SOLID,
+                            phase: 0.0,
                         });
                     }
                     if !lines.is_empty() {
@@ -1957,6 +2129,63 @@ impl Plot {
         self.refresh_dose_overlay();
     }
 
+    /// Swap a profile cell between depth and lateral on the cube already loaded.
+    /// The same choice leaves a zoom alone. DVH and gamma stay with the host.
+    pub fn set_line(&mut self, panel: usize, label: &str) -> bool {
+        if self.dose.is_none() || panel >= self.panels.len() {
+            return false;
+        }
+        let Some(kind) = profile_kind(label) else {
+            return false;
+        };
+        if profile_kind(&self.panels[panel].title) == Some(kind) {
+            return true;
+        }
+        let (title, x_label) = if kind == 0 {
+            ("Depth Dose", "Depth from the grid edge (mm)")
+        } else {
+            ("Lateral Profile", "Across the beam from the crosshair (mm)")
+        };
+        let y_label = profile_quantity(self, panel);
+        {
+            let item = &mut self.panels[panel];
+            item.title = title.into();
+            item.x_label = x_label.into();
+            item.y_label = y_label;
+        }
+        if let Some(batch) = self.marks.panels.get_mut(panel) {
+            batch.line_count = 0;
+            batch.point_count = 0;
+            batch.quad_count = 0;
+            batch.heats.clear();
+            batch.line_runs.clear();
+            batch.point_runs.clear();
+            batch.clouds.clear();
+        }
+        if let Some(slot) = self.profile_window.get_mut(panel) {
+            *slot = None;
+        }
+        self.refresh_dose_overlay();
+        let (xmin, xmax, ymin, ymax) = profile_span(self, panel);
+        if let Some(item) = self.panels.get_mut(panel) {
+            item.xmin = xmin;
+            item.xmax = xmax;
+            item.ymin = ymin;
+            item.ymax = ymax;
+        }
+        let camera = Camera::new(xmin, xmax, ymin, ymax);
+        if let Some(slot) = self.cameras.get_mut(panel) {
+            *slot = camera;
+        }
+        if let Some(slot) = self.home.get_mut(panel) {
+            *slot = camera;
+        }
+        if self.profile_integral.get(panel).copied().unwrap_or(false) {
+            self.fit_integral_profile(panel);
+        }
+        true
+    }
+
     /// The integral is Gy·mm² (or the quantity times mm²). Fit y to every row of
     /// that projection so paging cannot push the curve out of the frame.
     fn fit_integral_profile(&mut self, panel: usize) {
@@ -1994,12 +2223,17 @@ impl Plot {
 
     /// Blender numpad orbit for the 3D dose cell. Number-row keys match vispy's emulate-numpad.
     pub fn dose_key(&mut self, key: &str, ctrl: bool) -> bool {
-        if self.dose.is_none()
-            || !self
+        let shows_turntable = match self.solo {
+            Some(panel) => self
+                .panels
+                .get(panel)
+                .is_some_and(|item| dose_plane(&item.title) == Some(3)),
+            None => self
                 .panels
                 .iter()
-                .any(|panel| dose_plane(&panel.title) == Some(3))
-        {
+                .any(|panel| dose_plane(&panel.title) == Some(3)),
+        };
+        if self.dose.is_none() || !shows_turntable {
             return false;
         }
         let Some((azimuth, elevation, fov, persp)) = blender_step(
@@ -2020,23 +2254,24 @@ impl Plot {
     }
 
     fn pan_volume(&mut self, cell: &Cell, dx: f32, dy: f32) {
-        let extent = {
-            let Some(grid) = self.dose.as_ref() else {
-                return;
-            };
-            let voxel = grid.volume.voxel;
-            [
-                grid.volume.shape[0] as f32 * voxel,
-                grid.volume.shape[1] as f32 * voxel,
-                grid.volume.shape[2] as f32 * voxel,
-            ]
+        let Some(grid) = self.dose.as_ref() else {
+            return;
         };
+        let voxel = grid.volume.voxel;
+        let lattice = [
+            grid.volume.shape[0] as f32 * voxel,
+            grid.volume.shape[1] as f32 * voxel,
+            grid.volume.shape[2] as f32 * voxel,
+        ];
+        let extent = scan_kit_core::gantry_extent(lattice, grid.gantry);
         let aspect = cell.plot.w / cell.plot.h.max(1.0);
         let fy = scan_kit_core::film_height(extent, aspect, self.orbit_zoom);
         let scale = fy / cell.plot.h.max(1.0);
         let (right, up) = turntable_axes(self.azimuth, self.elevation);
+        // Screen Y is down. World +up is screen up, so a downward drag moves
+        // the look-at along +up and the dose follows the pointer.
         for axis in 0..3 {
-            self.pan[axis] -= (right[axis] * dx + up[axis] * dy) * scale;
+            self.pan[axis] -= (right[axis] * dx - up[axis] * dy) * scale;
         }
     }
 
@@ -2060,6 +2295,35 @@ impl Plot {
     #[cfg_attr(not(any(test, target_arch = "wasm32")), allow(dead_code))]
     pub(crate) fn set_chrome(&mut self, px: f32) {
         self.chrome = px.max(0.0);
+    }
+
+    /// Draw one panel across the whole canvas. `None` is the grid.
+    #[cfg_attr(not(any(test, target_arch = "wasm32")), allow(dead_code))]
+    pub(crate) fn set_solo(&mut self, panel: Option<usize>) {
+        self.solo = panel;
+    }
+
+    /// Voxel under the crosshair. Empty when this picture has no dose.
+    #[cfg_attr(not(any(test, target_arch = "wasm32")), allow(dead_code))]
+    pub(crate) fn dose_cursor(&self) -> Vec<u32> {
+        if self.dose.is_none() {
+            return Vec::new();
+        }
+        self.cursor.into_iter().map(|index| index as u32).collect()
+    }
+
+    /// Move the crosshair and the profiles that read it. The same voxel is a no-op.
+    #[cfg_attr(not(any(test, target_arch = "wasm32")), allow(dead_code))]
+    pub(crate) fn set_dose_cursor(&mut self, cursor: [usize; 3]) {
+        if self.dose.is_none() || self.cursor == cursor {
+            return;
+        }
+        self.cursor = cursor;
+        self.refresh_dose_overlay();
+    }
+
+    fn names_the_panel(&self) -> bool {
+        self.chrome <= 0.0 && self.solo.is_none()
     }
 
     /// Window, gain, opacity, ray mode, sample filter, and color scale.
@@ -2152,6 +2416,7 @@ impl Plot {
     #[cfg_attr(not(any(test, target_arch = "wasm32")), allow(dead_code))]
     pub(crate) fn adopt_view(&mut self, previous: &Plot) {
         self.chrome = previous.chrome;
+        self.solo = previous.solo;
         if self.panels.len() == previous.panels.len()
             && self.row_splits.len() == previous.row_splits.len()
             && !previous.row_splits.is_empty()
@@ -2181,12 +2446,27 @@ impl Plot {
                 } else {
                     previous.cursor
                 };
-            self.azimuth = previous.azimuth;
-            self.elevation = previous.elevation;
-            self.orbit_zoom = previous.orbit_zoom;
-            self.fov = previous.fov;
-            self.persp_fov = previous.persp_fov;
-            self.pan = previous.pan;
+            let next = self.dose.as_ref().map(|grid| grid.gantry).unwrap_or(0.0);
+            let prev = previous
+                .dose
+                .as_ref()
+                .map(|grid| grid.gantry)
+                .unwrap_or(0.0);
+            if (next - prev).abs() > 0.5 && opening_pose(previous, prev) {
+                self.azimuth = opening_azimuth(next);
+                self.elevation = HOME_ELEVATION;
+                self.orbit_zoom = 1.0;
+                self.fov = scan_kit_core::FOV_Y;
+                self.persp_fov = scan_kit_core::FOV_Y;
+                self.pan = [0.0; 3];
+            } else {
+                self.azimuth = previous.azimuth;
+                self.elevation = previous.elevation;
+                self.orbit_zoom = previous.orbit_zoom;
+                self.fov = previous.fov;
+                self.persp_fov = previous.persp_fov;
+                self.pan = previous.pan;
+            }
             if previous.turns.len() == self.panels.len() {
                 self.turns.clone_from(&previous.turns);
             }
@@ -2438,7 +2718,8 @@ impl Plot {
         self.size = (width, height);
         if input.reset {
             self.cameras.clone_from(&self.home);
-            self.azimuth = HOME_AZIMUTH;
+            let gantry = self.dose.as_ref().map(|grid| grid.gantry).unwrap_or(0.0);
+            self.azimuth = opening_azimuth(gantry);
             self.elevation = HOME_ELEVATION;
             self.orbit_zoom = 1.0;
             self.fov = scan_kit_core::FOV_Y;
@@ -2656,20 +2937,18 @@ impl Plot {
         let Some(index) = hit_cell(&layout, input.x, input.y) else {
             return;
         };
+        let panel = layout[index].panel;
         let plot = layout[index].plot;
         if input.drag {
-            self.cameras[index].pan_pixels(input.dx, input.dy, plot);
+            if let Some(camera) = self.cameras.get_mut(panel) {
+                camera.pan_pixels(input.dx, input.dy, plot);
+            }
         }
         if input.wheel != 0.0 {
-            let factor = (-input.wheel * 0.0015).exp();
-            self.cameras[index].zoom_at_pixel(
-                input.x,
-                input.y,
-                plot,
-                width as f32,
-                height as f32,
-                factor,
-            );
+            if let Some(camera) = self.cameras.get_mut(panel) {
+                let factor = (-input.wheel * 0.0015).exp();
+                camera.zoom_at_pixel(input.x, input.y, plot, width as f32, height as f32, factor);
+            }
         }
     }
 
@@ -2772,6 +3051,9 @@ impl Plot {
     /// A drag that starts in a gap resizes that row or that row's columns.
     /// The scene is not rebuilt; the weights live on this plot.
     fn drag_split(&mut self, width: u32, height: u32, input: &PlotInput) -> bool {
+        if self.solo.is_some() {
+            return false;
+        }
         if !row_split_layout(
             self.panels.len(),
             self.columns,
@@ -2834,30 +3116,45 @@ impl Plot {
     }
 
     fn layout(&self, width: u32, height: u32) -> Vec<Cell> {
-        let rects = panel_rects(
-            self.panels.len(),
-            width,
-            height,
-            self.columns,
-            &self.weights,
-            &self.row_weights,
-            &self.row_splits,
-            self.side,
-        );
-        let font = atlas();
-        rects
+        let placed: Vec<(usize, PlotRect)> = match self.solo {
+            Some(panel) if panel < self.panels.len() => vec![(
+                panel,
+                PlotRect {
+                    x: 0.0,
+                    y: 0.0,
+                    w: width as f32,
+                    h: height as f32,
+                },
+            )],
+            Some(_) => Vec::new(),
+            None => panel_rects(
+                self.panels.len(),
+                width,
+                height,
+                self.columns,
+                &self.weights,
+                &self.row_weights,
+                &self.row_splits,
+                self.side,
+            )
             .into_iter()
             .enumerate()
-            .map(|(index, cell)| {
-                let camera = self.cameras[index];
-                let panel = &self.panels[index];
+            .collect(),
+        };
+        let font = atlas();
+        let titled = self.names_the_panel();
+        placed
+            .into_iter()
+            .filter_map(|(index, cell)| {
+                let camera = *self.cameras.get(index)?;
+                let panel = self.panels.get(index)?;
                 let plane = dose_plane(&panel.title);
                 let edge = font.line_height * 0.5 + 4.0;
                 let (mut left, top, bottom, right) = if plane == Some(3) {
                     (4.0, edge, edge, color_column_width())
                 } else {
                     let left = axis_name_width(&panel.y_label) + y_tick_width(&camera) + 8.0;
-                    let top = if shows_title(panel) {
+                    let top = if titled && shows_title(panel) {
                         font.line_height + 8.0
                     } else {
                         6.0
@@ -2881,7 +3178,7 @@ impl Plot {
                 } else {
                     right
                 };
-                // The view picker and its slice buttons live in this band, so the picture starts below them.
+                // `chrome` is a band the shell reserved inside one shared canvas.
                 let top = top.max(self.chrome);
                 let mut plot = snap_plot(PlotRect {
                     x: cell.x + left,
@@ -2906,11 +3203,11 @@ impl Plot {
                 if panel.equal && plane.is_none() {
                     plot = snap_plot(equal_scale(plot, &camera));
                 }
-                Cell {
+                Some(Cell {
                     plot,
                     cell,
                     panel: index,
-                }
+                })
             })
             .collect()
     }
@@ -2987,6 +3284,7 @@ impl Plot {
         for cell in layout {
             let camera = self.view_camera(cell.panel, &cell.plot);
             let matrix = camera.clip_from_data(cell.plot, width as f32, height as f32);
+            stamp_panel_dashes(&mut self.live, cell.panel, matrix, width, height);
             let batch = &self.marks.panels[cell.panel];
             let scale = self.integrate_scale(cell.panel, cell.plot.w / cell.plot.h.max(1.0));
             let (grid, border) = panel_frame(self, cell);
@@ -3113,7 +3411,7 @@ impl Plot {
                     &camera,
                     cell,
                     self.foreground,
-                    self.chrome <= 0.0,
+                    self.names_the_panel(),
                 )
             };
             glyphs.extend(dose_chrome(self, cell));
@@ -3205,7 +3503,7 @@ impl Plot {
         self.flush_ramp(&gpu.queue);
         self.ensure_volume(gpu)?;
         self.sync_heatmaps(&gpu.queue);
-        let (cloud_quad_span, cloud_line_span, grounds) = self.upload_live(gpu);
+        let (cloud_quad_span, cloud_line_span, grounds) = self.upload_live(gpu, width, height);
         self.ensure_uniforms(gpu, layout.len());
         let window = self.time_window;
         let line_draws = self.line_draw_ranges();
@@ -3243,7 +3541,7 @@ impl Plot {
                         &self.view_camera(cell.panel, &cell.plot),
                         cell,
                         self.foreground,
-                        self.chrome <= 0.0,
+                        self.names_the_panel(),
                     )
                 };
                 glyphs.extend(dose_chrome(self, cell));
@@ -3714,7 +4012,21 @@ impl Plot {
         self.heat_uploaded = self.heat_revision;
     }
 
-    fn upload_live(&mut self, gpu: &PlotGpu) -> (Vec<(u64, u64)>, Vec<(u64, u64)>, Vec<u64>) {
+    fn upload_live(
+        &mut self,
+        gpu: &PlotGpu,
+        width: u32,
+        height: u32,
+    ) -> (Vec<(u64, u64)>, Vec<(u64, u64)>, Vec<u64>) {
+        let layout = self.layout(width, height);
+        for cell in &layout {
+            let matrix = self.view_camera(cell.panel, &cell.plot).clip_from_data(
+                cell.plot,
+                width as f32,
+                height as f32,
+            );
+            stamp_panel_dashes(&mut self.live, cell.panel, matrix, width, height);
+        }
         let panels = self.marks.panels.len();
         let mut quad_span = vec![(0u64, 0u64); panels];
         let mut line_span = vec![(0u64, 0u64); panels];
@@ -4916,6 +5228,8 @@ fn push_polyline(
                 color,
                 thickness: thickness.max(1.0),
                 id,
+                pattern: LINE_SOLID,
+                phase: 0.0,
             });
         }
         prev = Some(point);
@@ -5141,6 +5455,8 @@ fn axis_line(a: [f32; 3], b: [f32; 3], color: [f32; 4], thickness: f32) -> LineR
         color,
         thickness,
         id: 0,
+        pattern: LINE_SOLID,
+        phase: 0.0,
     }
 }
 
@@ -5177,7 +5493,6 @@ fn cell_plane(plot: &Plot, cell: &Cell) -> Option<u8> {
 fn panel_frame(plot: &Plot, cell: &Cell) -> (Vec<LineRec>, Vec<LineRec>) {
     let camera = plot.view_camera(cell.panel, &cell.plot);
     match cell_plane(plot, cell) {
-        Some(3) => (Vec::new(), Vec::new()),
         Some(_) => (
             Vec::new(),
             border_lines(&camera, &cell.plot, plot.foreground),
@@ -6272,30 +6587,6 @@ fn cached_lateral_integral(
     (xs, dose)
 }
 
-fn cached_longitudinal_integral(
-    grid: &crate::dose::DoseGrid,
-    y: usize,
-    z: usize,
-) -> (Vec<f32>, Vec<f32>) {
-    let [_, ny, nz] = grid.volume.shape;
-    let y = y.min(ny.saturating_sub(1));
-    let z = z.min(nz.saturating_sub(1));
-    let voxel = grid.volume.voxel;
-    let z0 = grid.volume.origin[2] + (z as f32 + 0.5) * voxel;
-    let mut xs = Vec::with_capacity(nz);
-    let mut dose = Vec::with_capacity(nz);
-    for depth in 0..nz {
-        let z_mm = grid.volume.origin[2] + (depth as f32 + 0.5) * voxel;
-        xs.push(z0 - z_mm);
-        let sum = grid.integrals[2]
-            .get(y + ny * depth)
-            .copied()
-            .unwrap_or(0.0);
-        dose.push(sum * voxel);
-    }
-    (xs, dose)
-}
-
 fn integral_profile_axis(grid: &crate::dose::DoseGrid, kind: u8) -> (f32, f32) {
     let voxel = grid.volume.voxel;
     let mut lo = 0.0f32;
@@ -6319,11 +6610,7 @@ fn integral_profile_axis(grid: &crate::dose::DoseGrid, kind: u8) -> (f32, f32) {
     };
     match kind {
         1 => fold(&grid.integrals[1], &mut lo, &mut hi, &mut any),
-        0 | 2 => fold(&grid.integrals[2], &mut lo, &mut hi, &mut any),
-        _ => {
-            fold(&grid.integrals[1], &mut lo, &mut hi, &mut any);
-            fold(&grid.integrals[2], &mut lo, &mut hi, &mut any);
-        }
+        _ => fold(&grid.integrals[2], &mut lo, &mut hi, &mut any),
     }
     for volume in grid
         .sessions
@@ -6350,15 +6637,63 @@ fn profile_kind(title: &str) -> Option<u8> {
     let title = title.to_ascii_lowercase();
     if title.starts_with("depth") {
         Some(0)
-    } else if title.starts_with("lateral +") || title.starts_with("lateral+") {
-        Some(3)
     } else if title.starts_with("lateral") {
         Some(1)
-    } else if title.starts_with("longitudinal") {
-        Some(2)
     } else {
         None
     }
+}
+
+fn bare_quantity(label: &str) -> &str {
+    label.strip_suffix("·mm²").unwrap_or(label).trim()
+}
+
+fn profile_quantity(plot: &Plot, panel: usize) -> String {
+    if profile_kind(&plot.panels[panel].title).is_some() {
+        return bare_quantity(&plot.panels[panel].y_label).to_string();
+    }
+    plot.panels
+        .iter()
+        .find_map(|item| {
+            let label = bare_quantity(&item.y_label);
+            let name = label.to_ascii_lowercase();
+            (name.starts_with("gy") || name.starts_with("mu") || name.starts_with("proton"))
+                .then(|| label.to_string())
+        })
+        .unwrap_or_else(|| "Gy".to_string())
+}
+
+fn profile_span(plot: &Plot, panel: usize) -> (f32, f32, f32, f32) {
+    let mut xmin = f32::MAX;
+    let mut xmax = f32::MIN;
+    let mut ymin = f32::MAX;
+    let mut ymax = f32::MIN;
+    for cloud in plot
+        .live
+        .iter()
+        .filter(|cloud| cloud.panel == panel && cloud.dose && !cloud.crosshair)
+    {
+        for line in &cloud.lines {
+            for point in [line.a, line.b] {
+                xmin = xmin.min(point[0]);
+                xmax = xmax.max(point[0]);
+                ymin = ymin.min(point[1]);
+                ymax = ymax.max(point[1]);
+            }
+        }
+    }
+    if !xmin.is_finite() || !xmax.is_finite() {
+        return (0.0, 1.0, 0.0, 1.0);
+    }
+    if (xmax - xmin).abs() < 1.0e-4 {
+        xmin -= 0.5;
+        xmax += 0.5;
+    }
+    if !ymin.is_finite() || !ymax.is_finite() || (ymax - ymin).abs() < 1.0e-4 {
+        ymin = if ymin.is_finite() { ymin - 0.5 } else { 0.0 };
+        ymax = if ymax.is_finite() { ymax + 0.5 } else { 1.0 };
+    }
+    (xmin, xmax, ymin, ymax)
 }
 
 fn cursor_index(plane: u8, cursor: [usize; 3]) -> usize {
@@ -6422,7 +6757,7 @@ fn fold_cube(volume: &scan_kit_core::Volume, kind: u8, lo: &mut f32, hi: &mut f3
         }
     };
     let sum_x = kind != 1;
-    let sum_y = kind == 1 || kind >= 3;
+    let sum_y = kind == 1;
     if sum_x {
         for y in 0..ny {
             for z in 0..nz {
@@ -6461,24 +6796,9 @@ fn profile_curves(
         0 if integrate && own => series.push(cached_depth_integral(grid, iy)),
         0 if integrate => series.push(volume.depth_integral(iy)),
         0 => series.push(volume.depth_profile(ix, iy)),
-        1 if integrate && own => series.push(cached_lateral_integral(grid, ix, iz)),
-        1 if integrate => series.push(volume.lateral_integral(ix, iz)),
-        1 => series.push(volume.lateral_profile(ix, iy, iz)),
-        2 if integrate && own => series.push(cached_longitudinal_integral(grid, iy, iz)),
-        2 if integrate => series.push(volume.longitudinal_integral(iy, iz)),
-        2 => series.push(volume.longitudinal_profile(ix, iy, iz)),
-        _ if integrate && own => {
-            series.push(cached_lateral_integral(grid, ix, iz));
-            series.push(cached_longitudinal_integral(grid, iy, iz));
-        }
-        _ if integrate => {
-            series.push(volume.lateral_integral(ix, iz));
-            series.push(volume.longitudinal_integral(iy, iz));
-        }
-        _ => {
-            series.push(volume.lateral_profile(ix, iy, iz));
-            series.push(volume.longitudinal_profile(ix, iy, iz));
-        }
+        _ if integrate && own => series.push(cached_lateral_integral(grid, ix, iz)),
+        _ if integrate => series.push(volume.lateral_integral(ix, iz)),
+        _ => series.push(volume.lateral_profile(ix, iy, iz)),
     }
     series
 }
@@ -6523,7 +6843,8 @@ fn profile_lines(
             integrate,
             color,
             1.0,
-            false,
+            1.5,
+            LINE_SOLID,
         );
         if let Some(extra) = grid.companions.get(index).and_then(|slot| slot.as_ref()) {
             push_profile_curves(
@@ -6536,7 +6857,8 @@ fn profile_lines(
                 integrate,
                 color,
                 0.55,
-                false,
+                1.5,
+                LINE_SOLID,
             );
         }
         if let Some(extra) = grid.plans.get(index).and_then(|slot| slot.as_ref()) {
@@ -6550,7 +6872,8 @@ fn profile_lines(
                 integrate,
                 color,
                 1.0,
-                true,
+                1.5,
+                LINE_DASH,
             );
         }
     }
@@ -6575,7 +6898,8 @@ fn push_profile_curves(
     integrate: bool,
     color: [f32; 4],
     fade: f32,
-    dashed: bool,
+    thickness: f32,
+    pattern: u8,
 ) {
     for (curve, (xs, ys)) in profile_curves(grid, volume, own, kind, at, integrate)
         .into_iter()
@@ -6587,7 +6911,7 @@ fn push_profile_curves(
             [color[0], color[1], color[2], color[3] * 0.55]
         };
         ink[3] *= fade;
-        stroke_profile(lines, xs, ys, ink, dashed);
+        stroke_profile(lines, xs, ys, ink, thickness, pattern);
     }
 }
 
@@ -6596,10 +6920,10 @@ fn stroke_profile(
     xs: Vec<f32>,
     ys: Vec<f32>,
     color: [f32; 4],
-    dashed: bool,
+    thickness: f32,
+    pattern: u8,
 ) {
     let mut prev: Option<[f32; 3]> = None;
-    let mut step = 0u32;
     for (x, y) in xs.into_iter().zip(ys) {
         if !x.is_finite() || !y.is_finite() {
             prev = None;
@@ -6607,19 +6931,15 @@ fn stroke_profile(
         }
         let point = [x, y, 0.0];
         if let Some(start) = prev {
-            // ponytail: 3 samples on, 2 off. A shader dash is a line attribute,
-            // which means changing LINE_STRIDE with the encoder and the WGSL inputs.
-            let draw = !dashed || step % 5 < 3;
-            if draw {
-                lines.push(LineRec {
-                    a: start,
-                    b: point,
-                    color,
-                    thickness: 1.5,
-                    id: 0,
-                });
-            }
-            step += 1;
+            lines.push(LineRec {
+                a: start,
+                b: point,
+                color,
+                thickness,
+                id: 0,
+                pattern,
+                phase: 0.0,
+            });
         }
         prev = Some(point);
     }
@@ -6651,6 +6971,8 @@ fn field_lines(field: [f32; 6], plane: u8, bounds: [f32; 4], turns: u8) -> Vec<L
                 color: FIELD_INK,
                 thickness: 1.5,
                 id: 0,
+                pattern: LINE_SOLID,
+                phase: 0.0,
             }
         })
         .collect()
@@ -6683,6 +7005,8 @@ fn crosshair_lines(
             color: ink,
             thickness: 1.0,
             id: 0,
+            pattern: LINE_SOLID,
+            phase: 0.0,
         },
         LineRec {
             a: end(xmin, y),
@@ -6690,6 +7014,8 @@ fn crosshair_lines(
             color: ink,
             thickness: 1.0,
             id: 0,
+            pattern: LINE_SOLID,
+            phase: 0.0,
         },
     ]
 }
@@ -7077,8 +7403,41 @@ fn fill_quad_cpu(
     }
 }
 
+fn stamp_panel_dashes(
+    live: &mut [LiveCloud],
+    panel: usize,
+    matrix: [f32; 16],
+    width: u32,
+    height: u32,
+) {
+    for cloud in live.iter_mut().filter(|cloud| cloud.panel == panel) {
+        stamp_dash(&mut cloud.lines, matrix, width, height);
+    }
+}
+
+/// Pixel phase along each patterned polyline, for the camera that is about to draw.
+fn stamp_dash(lines: &mut [LineRec], matrix: [f32; 16], width: u32, height: u32) {
+    let mut prev: Option<[f32; 3]> = None;
+    let mut acc = 0.0f32;
+    for line in lines.iter_mut() {
+        let joins = prev.is_some_and(|point| point == line.a);
+        if !joins || line.pattern == LINE_SOLID {
+            acc = 0.0;
+        }
+        if line.pattern == LINE_SOLID {
+            line.phase = 0.0;
+        } else {
+            line.phase = acc;
+            let mut pa = project(matrix, line.a, width as f32, height as f32);
+            let mut pb = project(matrix, line.b, width as f32, height as f32);
+            snap_hairline(&mut pa, &mut pb);
+            acc += (pb[0] - pa[0]).hypot(pb[1] - pa[1]);
+        }
+        prev = Some(line.b);
+    }
+}
+
 /// Same rule as `vs_line`: an axis-aligned stroke moves onto one pixel center.
-#[cfg(not(target_arch = "wasm32"))]
 fn snap_hairline(pa: &mut [f32; 2], pb: &mut [f32; 2]) {
     let dx = (pa[0] - pb[0]).abs();
     let dy = (pa[1] - pb[1]).abs();
@@ -7106,19 +7465,96 @@ fn stroke_cpu(
     let mut pb = project(*matrix, line.b, width as f32, height as f32);
     snap_hairline(&mut pa, &mut pb);
     let radius = line.thickness.max(1.0) * 0.5;
-    let steps = ((pa[0] - pb[0]).abs().max((pa[1] - pb[1]).abs()) as i32).max(1);
-    for step in 0..=steps {
-        let t = step as f32 / steps as f32;
-        disc_cpu(
-            frame,
-            width,
-            height,
-            [pa[0] + (pb[0] - pa[0]) * t, pa[1] + (pb[1] - pa[1]) * t],
-            radius,
-            line.color,
-            plot,
-        );
+    if line.pattern == LINE_SOLID {
+        let steps = ((pa[0] - pb[0]).abs().max((pa[1] - pb[1]).abs()) as i32).max(1);
+        for step in 0..=steps {
+            let t = step as f32 / steps as f32;
+            disc_cpu(
+                frame,
+                width,
+                height,
+                [pa[0] + (pb[0] - pa[0]) * t, pa[1] + (pb[1] - pa[1]) * t],
+                radius,
+                line.color,
+                plot,
+            );
+        }
+        return;
     }
+    let ab = [pb[0] - pa[0], pb[1] - pa[1]];
+    let len2 = ab[0] * ab[0] + ab[1] * ab[1];
+    let len = len2.sqrt().max(0.001);
+    let pad = radius + 1.5;
+    let x0 = (pa[0].min(pb[0]) - pad).floor() as i32;
+    let y0 = (pa[1].min(pb[1]) - pad).floor() as i32;
+    let x1 = (pa[0].max(pb[0]) + pad).ceil() as i32;
+    let y1 = (pa[1].max(pb[1]) + pad).ceil() as i32;
+    for y in y0..=y1 {
+        for x in x0..=x1 {
+            let point = [x as f32 + 0.5, y as f32 + 0.5];
+            let t = if len2 < 1.0e-6 {
+                0.0
+            } else {
+                (((point[0] - pa[0]) * ab[0] + (point[1] - pa[1]) * ab[1]) / len2).clamp(0.0, 1.0)
+            };
+            let q = [pa[0] + ab[0] * t, pa[1] + ab[1] * t];
+            let dist = (point[0] - q[0]).hypot(point[1] - q[1]);
+            let coverage = pattern_coverage(dist, radius, line.phase + t * len, line.pattern);
+            if coverage <= 0.0 {
+                continue;
+            }
+            let mut ink = line.color;
+            ink[3] *= coverage;
+            blend(frame, width, height, x, y, ink, Some(plot));
+        }
+    }
+}
+
+fn pattern_code(pattern: u8) -> f32 {
+    match pattern {
+        LINE_DASH => 1.0,
+        LINE_DOT => 2.0,
+        _ => 0.0,
+    }
+}
+
+/// Same filter as `stroke_coverage` in the plot shader.
+#[cfg(not(target_arch = "wasm32"))]
+fn pattern_coverage(dist: f32, radius: f32, along: f32, pattern: u8) -> f32 {
+    let body = (radius + 0.5 - dist).clamp(0.0, 1.0);
+    match pattern {
+        LINE_DOT => {
+            let period = 5.0;
+            let u = along - period * (along / period).floor();
+            let along_d = u.min(period - u);
+            let dot = radius.max(1.25);
+            (dot + 0.5 - along_d.hypot(dist)).clamp(0.0, 1.0)
+        }
+        LINE_DASH => {
+            let on = 8.0;
+            let period = 12.0;
+            let u = along - period * (along / period).floor();
+            let edge = 0.65;
+            let gate = smoothstep(0.0, edge, u) * (1.0 - smoothstep(on - edge, on, u));
+            body * gate
+        }
+        _ => body,
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
+    let span = edge1 - edge0;
+    let t = if span.abs() < 1.0e-6 {
+        if x < edge0 {
+            0.0
+        } else {
+            1.0
+        }
+    } else {
+        ((x - edge0) / span).clamp(0.0, 1.0)
+    };
+    t * t * (3.0 - 2.0 * t)
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -7243,8 +7679,11 @@ fn blend(
 pub(crate) fn encode_lines(lines: &[LineRec]) -> Vec<u8> {
     let mut out = Vec::with_capacity(lines.len() * LINE_STRIDE as usize);
     for line in lines {
-        push4(&mut out, [line.a[0], line.a[1], line.a[2], 0.0]);
-        push4(&mut out, [line.b[0], line.b[1], line.b[2], 0.0]);
+        push4(
+            &mut out,
+            [line.a[0], line.a[1], line.a[2], pattern_code(line.pattern)],
+        );
+        push4(&mut out, [line.b[0], line.b[1], line.b[2], line.phase]);
         push4(&mut out, line.color);
         push_f32(&mut out, line.thickness);
         push_u32(&mut out, line.id);
@@ -7265,6 +7704,8 @@ pub(crate) fn decode_lines(bytes: &[u8]) -> Vec<LineRec> {
             color: f32x4_at(chunk, 8),
             thickness: f32_at(chunk, 12),
             id: u32_at(chunk, 13),
+            pattern: f32_at(chunk, 3) as u8,
+            phase: f32_at(chunk, 7),
         })
         .collect()
 }
@@ -8416,6 +8857,74 @@ mod tests {
     }
 
     #[test]
+    fn a_solo_cell_fills_its_canvas_and_ignores_the_grid_gap() {
+        let mut scene = line_scene();
+        let panel = scene.panels[0].clone();
+        while scene.panels.len() < 6 {
+            scene.panels.push(panel.clone());
+        }
+        scene.columns = 2;
+        scene.row_weights = vec![1.35, 1.35, 1.0];
+        scene.row_splits = vec![1.0; 6];
+        let mut plot = Plot::new(&scene, [0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0, 1.0]);
+        assert!(plot.dose_cursor().is_empty());
+        plot.set_dose_cursor([1, 2, 3]);
+        assert!(plot.dose_cursor().is_empty());
+        plot.set_solo(Some(4));
+        let layout = plot.layout(600, 480);
+        assert_eq!(layout.len(), 1);
+        assert_eq!(layout[0].panel, 4);
+        assert_eq!(
+            layout[0].cell,
+            PlotRect {
+                x: 0.0,
+                y: 0.0,
+                w: 600.0,
+                h: 480.0
+            }
+        );
+        let splits = plot.row_splits.clone();
+        let weights = plot.row_weights.clone();
+        let home = plot.cameras[0];
+        let line = plot.cameras[4];
+        plot.apply(
+            600,
+            480,
+            &PlotInput {
+                x: 300.0,
+                y: 240.0,
+                dx: 40.0,
+                dy: 12.0,
+                drag: true,
+                ..PlotInput::default()
+            },
+        );
+        assert_eq!(plot.row_splits, splits);
+        assert_eq!(plot.row_weights, weights);
+        assert_eq!(plot.cameras[0], home);
+        assert_ne!(plot.cameras[4], line);
+    }
+
+    #[test]
+    fn a_solo_cell_paints_its_picture() {
+        let scene = dose_scene(4, vec![1.0; 64], 1, 0);
+        let (width, height) = (240u32, 180u32);
+        for panel in [0usize, 1] {
+            let mut plot = Plot::new(&scene, [0.05, 0.05, 0.05, 1.0], [0.92, 0.92, 0.92, 1.0]);
+            plot.set_solo(Some(panel));
+            let layout = plot.layout(width, height);
+            assert_eq!(layout.len(), 1, "panel {panel}");
+            assert_eq!(layout[0].panel, panel);
+            let frame = plot.paint_cpu(width, height, &layout);
+            let ink = frame
+                .chunks(4)
+                .filter(|px| px[0] > 40 || px[1] > 40 || px[2] > 40)
+                .count();
+            assert!(ink > 20, "panel {panel} painted {ink} pixels");
+        }
+    }
+
+    #[test]
     fn paging_a_slice_does_not_upload_the_volume_again() {
         let mut scene = line_scene();
         let panel = scene.panels[0].clone();
@@ -8459,6 +8968,60 @@ mod tests {
         );
         assert_eq!(plot.atlas_stamp(), stamp);
         assert!(plot.cursor[2] > before);
+    }
+
+    #[test]
+    fn switching_a_line_plot_does_not_rebuild_the_volume() {
+        let mut scene = line_scene();
+        let panel = scene.panels[0].clone();
+        scene.panels.clear();
+        for title in [
+            "Axial",
+            "3D",
+            "Coronal",
+            "Sagittal",
+            "Depth dose",
+            "Lateral profile",
+        ] {
+            let mut next = panel.clone();
+            next.title = title.into();
+            next.y_label = "Gy".into();
+            scene.panels.push(next);
+        }
+        scene.columns = 2;
+        scene.row_weights = vec![1.0, 1.0, 1.0];
+        scene.row_splits = vec![1.0; 6];
+        scene.volume = scan_kit_core::VolumeMark {
+            values: vec![2.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            shape: [2, 2, 2],
+            origin: [0.0, 0.0, 0.0],
+            voxel: 1.0,
+            ..scan_kit_core::VolumeMark::default()
+        };
+        let mut plot = Plot::new(&scene, [0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0, 1.0]);
+        let stamp = plot.atlas_stamp();
+        let ptr = plot.dose.as_ref().unwrap().volume.values.as_ptr();
+        assert!(plot.set_line(4, "Lateral Profile"));
+        assert_eq!(plot.panels[4].title, "Lateral Profile");
+        assert_eq!(
+            plot.panels[4].x_label,
+            "Across the beam from the crosshair (mm)"
+        );
+        assert!(
+            plot.cameras[4].xmin.abs() < 1.0e-3,
+            "{}",
+            plot.cameras[4].xmin
+        );
+        assert_eq!(plot.atlas_stamp(), stamp);
+        assert_eq!(plot.dose.as_ref().unwrap().volume.values.as_ptr(), ptr);
+        let held = plot.cameras[4].ymax;
+        plot.cameras[4].ymax = held + 10.0;
+        assert!(plot.set_line(4, "Lateral profile"));
+        assert!((plot.cameras[4].ymax - (held + 10.0)).abs() < 1.0e-4);
+        assert!(plot.set_line(4, "Depth Dose"));
+        assert!(plot.cameras[4].xmin > 0.2, "{}", plot.cameras[4].xmin);
+        assert!(!plot.set_line(4, "DVH"));
+        assert_eq!(plot.panels[4].title, "Depth Dose");
     }
 
     #[test]
@@ -8657,58 +9220,320 @@ mod tests {
         (p[0] - q[0]).hypot(p[1] - q[1])
     }
 
-    /// Pixels about a picture-pixel off the projected edge. That is where a stroke
-    /// sized to the whole canvas used to disappear.
+    /// `(crisp, fat, sample)`. A station on the edge whose nearest pixel is the
+    /// stroke, and whose inward neighbor is the empty picture. Ticks hang outward.
+    /// An occluded edge never lights a pixel, so it counts as neither.
     fn wires_near(
         frame: &[u8],
         width: u32,
         plot: &PlotRect,
         edges: &[([f32; 2], [f32; 2])],
         avoid: &[([f32; 2], [f32; 2])],
-        field: bool,
-    ) -> (usize, [u8; 3]) {
+        toward: [f32; 2],
+        background: [u8; 3],
+    ) -> (usize, usize, [u8; 3]) {
         let height = frame.len() / 4 / width as usize;
-        let mut hits = 0usize;
+        let mut crisp = 0usize;
+        let mut fat = 0usize;
         let mut sample = [0u8; 3];
+        let rgb_at = |x: i32, y: i32| -> Option<[u8; 3]> {
+            if x < 0 || y < 0 || x >= width as i32 || y >= height as i32 {
+                return None;
+            }
+            let index = (y as usize * width as usize + x as usize) * 4;
+            Some([frame[index], frame[index + 1], frame[index + 2]])
+        };
+        let contrast = |rgb: [u8; 3]| {
+            rgb.iter()
+                .zip(background)
+                .map(|(got, bg)| (*got as i32 - bg as i32).abs())
+                .max()
+                .unwrap_or(0)
+        };
+        let inside = |center: [f32; 2]| {
+            center[0] > plot.x + 1.0
+                && center[0] < plot.x + plot.w - 1.0
+                && center[1] > plot.y + 1.0
+                && center[1] < plot.y + plot.h - 1.0
+        };
         for &(a, b) in edges {
-            for step in [0.3_f32, 0.5, 0.7] {
-                let mid = [a[0] + (b[0] - a[0]) * step, a[1] + (b[1] - a[1]) * step];
-                let x0 = (mid[0].floor() as i32 - 3).max(0);
-                let y0 = (mid[1].floor() as i32 - 3).max(0);
-                let x1 = (mid[0].ceil() as i32 + 3).min(width as i32 - 1);
-                let y1 = (mid[1].ceil() as i32 + 3).min(height as i32 - 1);
+            let mut lo = None;
+            let mut hi = None;
+            for i in 0..=16 {
+                let t = i as f32 / 16.0;
+                let p = [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t];
+                if inside(p) {
+                    if lo.is_none() {
+                        lo = Some(p);
+                    }
+                    hi = Some(p);
+                }
+            }
+            let (Some(a), Some(b)) = (lo, hi) else {
+                continue;
+            };
+            if (a[0] - b[0]).hypot(a[1] - b[1]) < 8.0 {
+                continue;
+            }
+            let mut saw_line = false;
+            let mut saw_fat = false;
+            for step in [0.35_f32, 0.5, 0.65] {
+                let at = [a[0] + (b[0] - a[0]) * step, a[1] + (b[1] - a[1]) * step];
+                let x0 = (at[0].floor() as i32 - 2).max(0);
+                let y0 = (at[1].floor() as i32 - 2).max(0);
+                let x1 = (at[0].ceil() as i32 + 2).min(width as i32 - 1);
+                let y1 = (at[1].ceil() as i32 + 2).min(height as i32 - 1);
+                let mut best_d = f32::MAX;
+                let mut best = background;
                 for y in y0..=y1 {
                     for x in x0..=x1 {
                         let center = [x as f32 + 0.5, y as f32 + 0.5];
-                        if center[0] < plot.x + 1.0 || center[0] > plot.x + plot.w - 1.0 {
-                            continue;
-                        }
-                        if center[1] < plot.y + 1.0 || center[1] > plot.y + plot.h - 1.0 {
+                        if !inside(center) {
                             continue;
                         }
                         let dist = seg_dist(center, a, b);
-                        if !(0.7..=1.2).contains(&dist) {
-                            continue;
-                        }
-                        if field && avoid.iter().any(|&(c, d)| seg_dist(center, c, d) < 4.0) {
-                            continue;
-                        }
-                        let index = (y as usize * width as usize + x as usize) * 4;
-                        let rgb = [frame[index], frame[index + 1], frame[index + 2]];
-                        sample = rgb;
-                        let ink = if field {
-                            rgb[0] > 190 && rgb[1] > 120 && rgb[2] < 100
-                        } else {
-                            rgb[1] > 100 && rgb[2] > 120 && rgb[0] < 190
-                        };
-                        if ink {
-                            hits += 1;
+                        if dist < best_d {
+                            best_d = dist;
+                            best = rgb_at(x, y).unwrap_or(best);
                         }
                     }
                 }
+                if best_d > 0.9 || contrast(best) < 40 {
+                    continue;
+                }
+                saw_line = true;
+                sample = best;
+                let inward = [toward[0] - at[0], toward[1] - at[1]];
+                let span = inward[0].hypot(inward[1]);
+                if span < 6.0 {
+                    continue;
+                }
+                let probe = [
+                    at[0] + inward[0] / span * 2.5,
+                    at[1] + inward[1] / span * 2.5,
+                ];
+                if !inside(probe) {
+                    continue;
+                }
+                let crowded = edges
+                    .iter()
+                    .chain(avoid)
+                    .any(|&(c, d)| seg_dist(probe, c, d) < 1.6);
+                if crowded {
+                    continue;
+                }
+                let Some(far) = rgb_at(probe[0] as i32, probe[1] as i32) else {
+                    continue;
+                };
+                let same = best
+                    .iter()
+                    .zip(far)
+                    .all(|(near, away)| (*near as i32 - away as i32).abs() < 28);
+                if contrast(far) >= 20 && same {
+                    saw_fat = true;
+                }
+            }
+            if saw_fat {
+                fat += 1;
+            } else if saw_line {
+                crisp += 1;
             }
         }
-        (hits, sample)
+        (crisp, fat, sample)
+    }
+
+    fn beam_scene(gantry: f32) -> PlotScene {
+        let mut scene = dose_scene(2, vec![0.0; 2 * 2 * 16], 1, 0);
+        scene.volume.shape = [2, 2, 16];
+        scene.volume.origin = [0.0, 0.0, -16.0];
+        scene.volume.gantry = gantry;
+        scene
+    }
+
+    #[test]
+    fn dose_view_opens_across_the_beam() {
+        let background = [0.0, 0.0, 0.0, 1.0];
+        let foreground = [1.0, 1.0, 1.0, 1.0];
+        let sky = Plot::new(&beam_scene(0.0), background, foreground);
+        assert!((sky.azimuth - HOME_AZIMUTH).abs() < 1.0e-5);
+        for gantry in [90.0_f32, 270.0] {
+            let mut plot = Plot::new(&beam_scene(gantry), background, foreground);
+            let (width, height) = (640u32, 480u32);
+            let layout = plot.layout(width, height);
+            let cell = layout
+                .iter()
+                .find(|cell| plot.panels[cell.panel].title == "3D")
+                .expect("3D cell");
+            let aspect = cell.plot.w / cell.plot.h.max(1.0);
+            let (entrance, distal, low, high, x_lo, x_hi) = {
+                let grid = plot.dose.as_ref().expect("volume");
+                let view = dose_ray(&plot, grid, aspect);
+                let film = |point: [f32; 3]| {
+                    scan_kit_core::dose_film_open(&grid.volume, view, point).expect("on film")
+                };
+                (
+                    film([1.0, 1.0, 0.0]),
+                    film([1.0, 1.0, -16.0]),
+                    film([1.0, 0.0, -8.0]),
+                    film([1.0, 2.0, -8.0]),
+                    film([0.0, 1.0, -8.0]),
+                    film([2.0, 1.0, -8.0]),
+                )
+            };
+            for uv in [entrance, distal, low, high, x_lo, x_hi] {
+                assert!(
+                    (0.02..0.98).contains(&uv[0]) && (0.02..0.98).contains(&uv[1]),
+                    "gantry {gantry}: the volume should sit inside the picture, uv {uv:?}"
+                );
+            }
+            let depth_x = distal[0] - entrance[0];
+            let depth_y = (distal[1] - entrance[1]).abs();
+            assert!(
+                depth_x > 0.5,
+                "gantry {gantry}: depth should cross the picture, span {depth_x}"
+            );
+            assert!(
+                depth_x > depth_y * 2.0,
+                "gantry {gantry}: depth should lie across the view ({depth_x} vs {depth_y})"
+            );
+            if gantry == 90.0 {
+                assert!(high[1] < low[1], "Y should point up the picture");
+                let dx = [x_hi[0] - x_lo[0], x_hi[1] - x_lo[1]];
+                let dy = [high[0] - low[0], high[1] - low[1]];
+                let nx = dx[0].hypot(dx[1]).max(1.0e-6);
+                let ny = dy[0].hypot(dy[1]).max(1.0e-6);
+                let cross = (dx[0] / nx) * (dy[1] / ny) - (dx[1] / nx) * (dy[0] / ny);
+                assert!(
+                    cross.abs() > 0.2,
+                    "the opening view should show the corner, not a flat side ({cross})"
+                );
+            }
+            plot.azimuth = 0.2;
+            plot.apply(
+                width,
+                height,
+                &PlotInput {
+                    reset: true,
+                    ..PlotInput::default()
+                },
+            );
+            assert!((plot.azimuth - opening_azimuth(gantry)).abs() < 1.0e-5);
+            let mut reframed = Plot::new(&beam_scene(0.0), background, foreground);
+            reframed.adopt_view(&Plot::new(&beam_scene(gantry), background, foreground));
+            assert!(
+                (reframed.azimuth - HOME_AZIMUTH).abs() < 1.0e-4,
+                "changing gantry from the opening view reframes the beam"
+            );
+            let mut orbited = Plot::new(&beam_scene(gantry), background, foreground);
+            orbited.azimuth = 0.4;
+            let mut kept = Plot::new(&beam_scene(gantry), background, foreground);
+            kept.adopt_view(&orbited);
+            assert!((kept.azimuth - 0.4).abs() < 1.0e-5);
+        }
+    }
+
+    #[test]
+    fn dose_view_drag_follows_the_pointer() {
+        let mut plot = Plot::new(&beam_scene(90.0), [0.0; 4], [1.0; 4]);
+        let (width, height) = (640u32, 480u32);
+        let layout = plot.layout(width, height);
+        let cell = layout
+            .iter()
+            .find(|cell| plot.panels[cell.panel].title == "3D")
+            .expect("3D cell");
+        let x = cell.plot.x + cell.plot.w * 0.5;
+        let y = cell.plot.y + cell.plot.h * 0.5;
+        let aspect = cell.plot.w / cell.plot.h.max(1.0);
+        let point = [1.0, 1.0, -8.0];
+        let before = {
+            let grid = plot.dose.as_ref().expect("volume");
+            scan_kit_core::dose_film_open(&grid.volume, dose_ray(&plot, grid, aspect), point)
+                .expect("before")
+        };
+        let (dx, dy) = (24.0_f32, 40.0_f32);
+        plot.apply(
+            width,
+            height,
+            &PlotInput {
+                x,
+                y,
+                dx,
+                dy,
+                drag: true,
+                shift: true,
+                buttons: 1,
+                ..PlotInput::default()
+            },
+        );
+        let after = {
+            let grid = plot.dose.as_ref().expect("volume");
+            scan_kit_core::dose_film_open(&grid.volume, dose_ray(&plot, grid, aspect), point)
+                .expect("after")
+        };
+        assert!(
+            after[0] > before[0] + 0.01,
+            "drag right moves the dose right"
+        );
+        assert!(
+            after[1] > before[1] + 0.01,
+            "drag down moves the dose down ({before:?} -> {after:?})"
+        );
+        let lattice = [2.0, 2.0, 16.0];
+        let turned = scan_kit_core::gantry_extent(lattice, 90.0);
+        let fy = scan_kit_core::film_height(turned, aspect, 1.0);
+        let flat = scan_kit_core::film_height(lattice, aspect, 1.0);
+        assert!(
+            (fy - flat).abs() > 1.0,
+            "pan scale has to use the gantry box"
+        );
+        let scale = fy / cell.plot.h.max(1.0);
+        let (right, up) = turntable_axes(plot.azimuth, plot.elevation);
+        for axis in 0..3 {
+            let expected = -(right[axis] * dx - up[axis] * dy) * scale;
+            assert!(
+                (plot.pan[axis] - expected).abs() < 1.0e-3,
+                "axis {axis}: pan {} expected {expected}",
+                plot.pan[axis]
+            );
+        }
+    }
+
+    #[test]
+    fn dose_view_plot_has_a_border() {
+        let mut scene = dose_scene(2, vec![0.0; 8], 1, 0);
+        scene.panels.retain(|panel| panel.title == "3D");
+        scene.columns = 1;
+        scene.row_weights = vec![1.0];
+        scene.row_splits = vec![1.0];
+        let mut plot = Plot::new(&scene, [0.05, 0.05, 0.05, 1.0], [0.92, 0.92, 0.92, 1.0]);
+        let (width, height) = (240u32, 180u32);
+        let layout = plot.layout(width, height);
+        let frame = plot.paint_cpu(width, height, &layout);
+        let rect = layout[0].plot;
+        let luma = |x: u32, y: u32| {
+            let index = ((y * width + x) * 4) as usize;
+            frame[index].max(frame[index + 1]).max(frame[index + 2])
+        };
+        let x0 = rect.x as u32;
+        let y0 = rect.y as u32;
+        let x1 = x0 + rect.w as u32 - 1;
+        let y1 = y0 + rect.h as u32 - 1;
+        let mid_x = x0 + rect.w as u32 / 2;
+        let mid_y = y0 + rect.h as u32 / 2;
+        for (edge, inward) in [
+            ((mid_x, y0), (mid_x, y0 + 1)),
+            ((mid_x, y1), (mid_x, y1 - 1)),
+            ((x0, mid_y), (x0 + 1, mid_y)),
+            ((x1, mid_y), (x1 - 1, mid_y)),
+        ] {
+            let on = luma(edge.0, edge.1);
+            let inside = luma(inward.0, inward.1);
+            assert!(on > 40, "missing frame pixel {edge:?} luma {on}");
+            assert!(
+                on > inside + 15,
+                "frame at {edge:?} is not a 1px stroke ({on} vs {inside})"
+            );
+        }
     }
 
     #[test]
@@ -8765,16 +9590,35 @@ mod tests {
             };
             let lattice_px: Vec<_> = lattice.iter().copied().filter_map(on_film).collect();
             let field_px: Vec<_> = field.iter().copied().filter_map(on_film).collect();
-            let (gray, gray_at) = wires_near(&frame, width, &cell.plot, &lattice_px, &[], false);
-            let (amber, amber_at) =
-                wires_near(&frame, width, &cell.plot, &field_px, &lattice_px, true);
-            assert!(
-                gray >= 4,
-                "{name}: bounding box {gray} px, sample {gray_at:?}"
+            let center = project([4.0, 4.0, 4.0]).expect("cube center");
+            let bg_index =
+                ((cell.plot.y as u32 + 4) * width + (cell.plot.x as u32 + 4)) as usize * 4;
+            let background = [frame[bg_index], frame[bg_index + 1], frame[bg_index + 2]];
+            let (box_crisp, box_fat, box_at) = wires_near(
+                &frame,
+                width,
+                &cell.plot,
+                &lattice_px,
+                &[],
+                center,
+                background,
+            );
+            let (field_crisp, field_fat, field_at) = wires_near(
+                &frame,
+                width,
+                &cell.plot,
+                &field_px,
+                &lattice_px,
+                center,
+                background,
             );
             assert!(
-                amber >= 4,
-                "{name}: field bounds {amber} px, sample {amber_at:?}"
+                box_crisp >= 3 && box_fat == 0,
+                "{name}: bounding box crisp {box_crisp} fat {box_fat} sample {box_at:?}"
+            );
+            assert!(
+                field_crisp >= 2 && field_fat == 0,
+                "{name}: field bounds crisp {field_crisp} fat {field_fat} sample {field_at:?}"
             );
         }
     }
@@ -8908,7 +9752,7 @@ mod tests {
     }
 
     #[test]
-    fn a_plan_is_dashed_in_the_session_color() {
+    fn a_plan_is_dashed_on_the_measured_samples() {
         let mut scene = line_scene();
         scene.panels[0].title = "Depth dose".into();
         scene.panels[0].series.clear();
@@ -8941,15 +9785,149 @@ mod tests {
             .filter(|cloud| cloud.panel == 0)
             .flat_map(|cloud| cloud.lines.iter())
             .collect();
-        let full = lines.iter().filter(|line| line.color[3] > 0.9).count();
-        let faded = lines.iter().filter(|line| line.color[3] < 0.7).count();
-        // 7 solid samples, and 5 of the 7 plan samples (3 on, 2 off).
-        assert_eq!(full, 12);
-        assert_eq!(faded, 7);
-        assert!(lines.iter().all(|line| line.color[2] > 0.5));
-        assert!(lines
+        let measured: Vec<_> = lines
             .iter()
-            .all(|line| (line.color[0] - color[0]).abs() < 1e-3));
+            .filter(|line| line.pattern == LINE_SOLID && line.color[3] > 0.9)
+            .collect();
+        let plan: Vec<_> = lines
+            .iter()
+            .filter(|line| line.pattern == LINE_DASH)
+            .collect();
+        let faded = lines.iter().filter(|line| line.color[3] < 0.7).count();
+        assert_eq!(measured.len(), 7);
+        assert_eq!(plan.len(), 7);
+        assert_eq!(faded, 7);
+        assert!(measured.iter().all(|line| line.color == color));
+        assert!(plan
+            .iter()
+            .all(|line| line.color == color && line.thickness == 1.5));
+        assert!(plan.iter().zip(measured.iter()).all(|(plan, measured)| {
+            (plan.a[0] - measured.a[0]).abs() < 1.0e-4
+                && (plan.b[0] - measured.b[0]).abs() < 1.0e-4
+                && (plan.a[1] - measured.a[1]).abs() > 0.1
+        }));
+        let first_dash = lines
+            .iter()
+            .position(|line| line.pattern == LINE_DASH)
+            .unwrap();
+        let last_measured = lines
+            .iter()
+            .rposition(|line| line.pattern == LINE_SOLID && line.color[3] > 0.9)
+            .unwrap();
+        assert!(first_dash > last_measured);
+    }
+
+    #[test]
+    fn a_dash_and_a_dot_follow_the_stroke() {
+        let camera = scan_kit_core::Camera::new(0.0, 80.0, 0.0, 24.0);
+        let plot = PlotRect {
+            x: 0.0,
+            y: 0.0,
+            w: 80.0,
+            h: 24.0,
+        };
+        let matrix = camera.clip_from_data(plot, 80.0, 24.0);
+        let paint = |pattern: u8, points: &[[f32; 3]]| {
+            let mut lines = Vec::new();
+            for pair in points.windows(2) {
+                lines.push(LineRec {
+                    a: pair[0],
+                    b: pair[1],
+                    color: [0.0, 1.0, 0.0, 1.0],
+                    thickness: 1.5,
+                    id: 0,
+                    pattern,
+                    phase: 0.0,
+                });
+            }
+            stamp_dash(&mut lines, matrix, 80, 24);
+            let mut frame = vec![0u8; 80 * 24 * 4];
+            for line in &lines {
+                stroke_cpu(&mut frame, 80, 24, &matrix, line, plot);
+            }
+            (lines, frame)
+        };
+        let row = |frame: &[u8], x: i32| {
+            let index = (12usize * 80 + x as usize) * 4;
+            frame[index + 1]
+        };
+        let (solid_lines, solid) = paint(LINE_SOLID, &[[4.0, 12.0, 0.0], [76.0, 12.0, 0.0]]);
+        assert_eq!(solid_lines[0].phase, 0.0);
+        let (dash_lines, dash) = paint(
+            LINE_DASH,
+            &[[4.0, 12.0, 0.0], [14.0, 12.0, 0.0], [76.0, 12.0, 0.0]],
+        );
+        assert!((dash_lines[1].phase - 10.0).abs() < 0.6);
+        let mut on = 0usize;
+        let mut off = 0usize;
+        for x in 8..72 {
+            assert!(row(&solid, x) > 200, "solid {x}");
+            if row(&dash, x) > 200 {
+                on += 1;
+            } else {
+                off += 1;
+            }
+        }
+        assert!(on > 20, "dash on {on}");
+        assert!(off > 10, "dash off {off}");
+        // Period is 12px with 8px on. along 10 sits in the gap, so a restarted
+        // pattern would light the joint and a continuous one leaves it open.
+        assert!(row(&dash, 14) < 40, "joint {}", row(&dash, 14));
+        assert!(row(&dash, 6) > 200);
+        let (_, dots) = paint(LINE_DOT, &[[4.0, 12.0, 0.0], [76.0, 12.0, 0.0]]);
+        let dot_on = (8..72).filter(|x| row(&dots, *x) > 200).count();
+        assert!(dot_on < on, "dots {dot_on} dashes {on}");
+        assert!(dot_on > 4, "dots {dot_on}");
+    }
+
+    #[test]
+    fn the_shader_dash_opens_gaps_on_the_stroke() {
+        let Ok(gpu) = crate::native_gpu() else {
+            return;
+        };
+        let mut scene = line_scene();
+        scene.panels[0].series.clear();
+        scene.panels[0].xmin = 0.0;
+        scene.panels[0].xmax = 80.0;
+        scene.panels[0].ymin = 0.0;
+        scene.panels[0].ymax = 24.0;
+        let mut plot = Plot::new(&scene, [0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0, 1.0]);
+        plot.live.push(LiveCloud {
+            panel: 0,
+            quads: Vec::new(),
+            lines: vec![LineRec {
+                a: [4.0, 12.0, 0.0],
+                b: [76.0, 12.0, 0.0],
+                color: [0.0, 1.0, 0.0, 1.0],
+                thickness: 2.0,
+                id: 0,
+                pattern: LINE_DASH,
+                phase: 0.0,
+            }],
+            dose: false,
+            crosshair: false,
+        });
+        let (width, height) = (160u32, 80u32);
+        let frame = plot.paint_offscreen(gpu, width, height).expect("dash");
+        let a = plot.project_data(0, 4.0, 12.0, width, height);
+        let b = plot.project_data(0, 76.0, 12.0, width, height);
+        let mut on = 0usize;
+        let mut off = 0usize;
+        for step in 1..48 {
+            let t = step as f32 / 48.0;
+            let x = (a[0] + (b[0] - a[0]) * t).floor() as i32;
+            let y = (a[1] + (b[1] - a[1]) * t).floor() as i32;
+            if x < 1 || y < 1 || x >= width as i32 - 1 || y >= height as i32 - 1 {
+                continue;
+            }
+            let index = (y as usize * width as usize + x as usize) * 4;
+            if frame[index + 1] > 180 && frame[index] < 80 {
+                on += 1;
+            } else {
+                off += 1;
+            }
+        }
+        assert!(on > 8 && off > 4, "shader dash on {on} off {off}");
     }
 
     #[test]
@@ -10623,10 +11601,11 @@ mod tests {
     }
 
     fn projection_fill(frame: &[u8], width: u32, rect: PlotRect) -> f32 {
-        let x0 = rect.x.floor() as i32;
+        // Skip the 1px plot frame. It would make the measured box the whole cell.
+        let x0 = rect.x.floor() as i32 + 2;
         let x1 = (rect.x + rect.w * 0.90).ceil() as i32;
-        let y0 = rect.y.floor() as i32;
-        let y1 = (rect.y + rect.h).ceil() as i32;
+        let y0 = rect.y.floor() as i32 + 2;
+        let y1 = (rect.y + rect.h - 2.0).ceil() as i32;
         let mut min_x = i32::MAX;
         let mut max_x = i32::MIN;
         let mut min_y = i32::MAX;
@@ -10821,6 +11800,100 @@ mod tests {
         }
         let _ = gpu.device.poll(wgpu::PollType::wait_indefinitely());
         start.elapsed().as_secs_f32() * 1000.0 / frames as f32
+    }
+
+    #[test]
+    fn nearest_slice_keeps_deposited_voxels_when_the_atlas_is_coarser() {
+        let nx = 300usize;
+        let ny = 8usize;
+        let nz = 64usize;
+        let fitted = crate::dose::fit_shape([nx, ny, nz]);
+        assert!(
+            fitted[0] < nx,
+            "this lattice has to overflow the 2048 atlas, got {fitted:?}"
+        );
+        let mut values = vec![0.0; nx * ny * nz];
+        for z in 0..nz {
+            for y in 0..ny {
+                for x in 0..nx {
+                    if x % 2 == 0 {
+                        values[x + nx * (y + ny * z)] = 1.0;
+                    }
+                }
+            }
+        }
+        let mut scene = line_scene();
+        scene.panels[0].title = "Axial".into();
+        scene.panels[0].equal = true;
+        scene.panels[0].xmin = 0.0;
+        scene.panels[0].xmax = nx as f32;
+        scene.panels[0].ymin = 0.0;
+        scene.panels[0].ymax = ny as f32;
+        scene.panels[0].series = vec![Series::Heatmap {
+            values: vec![0.0],
+            cols: 1,
+            rows: 1,
+            ramp: 1,
+            color: [1.0; 4],
+            lo: 0.0,
+            hi: 1.0,
+        }];
+        scene.columns = 1;
+        scene.volume = scan_kit_core::VolumeMark {
+            values,
+            shape: [nx as u32, ny as u32, nz as u32],
+            voxel: 1.0,
+            ramp: 1,
+            hi: 1.0,
+            filter: 0,
+            ..scan_kit_core::VolumeMark::default()
+        };
+        let Ok(gpu) = crate::native_gpu() else {
+            return;
+        };
+        let mut plot = Plot::new(&scene, [0.1, 0.1, 0.1, 1.0], [1.0, 1.0, 1.0, 1.0]);
+        let width = 960u32;
+        let height = 240u32;
+        let frame = plot.paint_offscreen(gpu, width, height).unwrap();
+        let at = plot.project_data(0, 10.5, 3.5, width, height);
+        let y = (at[1].round() as i64).clamp(0, i64::from(height) - 1) as usize;
+        let pixel = |x: usize| {
+            let index = (y * width as usize + x) * 4;
+            [frame[index], frame[index + 1], frame[index + 2]]
+        };
+        let apart = |a: [u8; 3], b: [u8; 3]| {
+            a.iter()
+                .zip(b)
+                .map(|(left, right)| left.abs_diff(right))
+                .max()
+                .unwrap_or(0)
+        };
+        // Turbo ends. A halved atlas keeps only the even samples, so the row is one color.
+        let hot = [122u8, 4, 3];
+        let cold = [48u8, 18, 59];
+        let mut runs = 0u32;
+        let mut previous = 2u8;
+        for x in 0..width as usize {
+            let color = pixel(x);
+            let kind = if apart(color, hot) <= 24 {
+                1
+            } else if apart(color, cold) <= 24 {
+                0
+            } else {
+                2
+            };
+            if kind < 2 && kind != previous {
+                runs += 1;
+            }
+            if kind < 2 {
+                previous = kind;
+            }
+        }
+        let stripes = nx as u32;
+        assert!(
+            runs > stripes * 3 / 4 && runs < stripes + stripes / 4,
+            "nearest should show one stripe per deposited voxel, got {runs} for {stripes}"
+        );
     }
 
     #[test]

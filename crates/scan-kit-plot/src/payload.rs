@@ -204,13 +204,12 @@ pub fn encode_plot_reusing(
         * scene.volume.shape[1] as usize
         * scene.volume.shape[2] as usize;
     if voxels > 0 && scene.volume.values.len() >= voxels {
-        for value in scene.volume.values.iter().take(voxels) {
-            out.extend_from_slice(&value.to_le_bytes());
-        }
+        write_f32s(&mut out, &scene.volume.values[..voxels]);
         if !scene.volume.ct.is_empty() {
-            for value in scene.volume.ct.iter().take(voxels) {
-                out.extend_from_slice(&value.to_le_bytes());
-            }
+            write_f32s(
+                &mut out,
+                &scene.volume.ct[..voxels.min(scene.volume.ct.len())],
+            );
         }
         if !scene.volume.labels.is_empty() {
             out.extend_from_slice(&scene.volume.labels[..voxels.min(scene.volume.labels.len())]);
@@ -270,8 +269,27 @@ fn write_session(out: &mut Vec<u8>, session: &scan_kit_core::SessionDose) {
     out.extend_from_slice(&session.voxel.to_le_bytes());
     let count = session.values.len() as u32;
     out.extend_from_slice(&count.to_le_bytes());
-    for value in &session.values {
-        out.extend_from_slice(&value.to_le_bytes());
+    write_f32s(out, &session.values);
+}
+
+fn write_f32s(out: &mut Vec<u8>, values: &[f32]) {
+    #[cfg(target_endian = "little")]
+    {
+        // SAFETY: `f32` is 4 bytes with no padding, and this host stores them
+        // little-endian, which is the byte order `to_le_bytes` writes.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                values.as_ptr().cast::<u8>(),
+                values.len().checked_mul(4).expect("f32 byte length"),
+            )
+        };
+        out.extend_from_slice(bytes);
+    }
+    #[cfg(target_endian = "big")]
+    {
+        for value in values {
+            out.extend_from_slice(&value.to_le_bytes());
+        }
     }
 }
 

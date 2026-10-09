@@ -405,6 +405,31 @@ fn reduce_shader_parses() {
 }
 
 #[test]
+fn a_short_column_matches_the_cpu_reduction() {
+    assert_eq!(group_count(1), 1);
+    assert_eq!(group_count(256), 1);
+    assert_eq!(group_count(257), 2);
+    assert_eq!(group_count(256 * 400), 256);
+    let elapsed = best_of(1, || {});
+    assert!(elapsed < std::time::Duration::from_secs(2));
+    let gpu = match block_on(crate::request_device()) {
+        Ok((device, queue)) => Reducer::new(device, queue),
+        Err(crate::ComputeError::NoAdapter) => return,
+        Err(error) => panic!("{error}"),
+    };
+    let data: Vec<f32> = (0..300).map(|index| index as f32 - 40.0).collect();
+    let bytes: Vec<u8> = data.iter().flat_map(|value| value.to_le_bytes()).collect();
+    let job = gpu.job(bytes.len() as u64, group_count(data.len()));
+    let check = gpu.execute(&job, &bytes).expect("reduce");
+    let want = reduce_finite(&data);
+    assert_eq!(check.count, want.count);
+    assert_eq!(check.min, want.min);
+    assert_eq!(check.max, want.max);
+    let scale = want.sum.abs().max(1.0);
+    assert!((check.sum - want.sum).abs() / scale < 1.0e-4);
+}
+
+#[test]
 #[ignore = "release timing; cargo test -p scan-kit-compute --release -- --ignored --nocapture stats_cpu_vs_gpu"]
 fn stats_cpu_vs_gpu_reduction() {
     parse_shader(INPUT_SHADER).expect("input shader");

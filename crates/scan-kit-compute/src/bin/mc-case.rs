@@ -207,3 +207,108 @@ fn store_f32(path: &Path, values: &[f32]) -> Result<(), String> {
     }
     fs::write(path, bytes).map_err(|err| err.to_string())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use scan_kit_core::{McJob, Volume};
+
+    fn sample_result(let_d: Vec<f32>) -> scan_kit_core::McResult {
+        scan_kit_core::McResult {
+            volume: Volume {
+                origin: [0.0, 0.0, 0.0],
+                shape: [1, 2, 3],
+                voxel: 1.0,
+                values: vec![1.0, 2.0],
+            },
+            uncertainty: 0.25,
+            ledger: [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+            let_d,
+        }
+    }
+
+    #[test]
+    fn a_slab_request_keeps_the_grid_and_rejects_a_bad_shape() {
+        let request = serde_json::json!({
+            "x": [0.0],
+            "y": [1.0, null],
+            "sx": [2.0],
+            "sy": [3.0],
+            "energy": [100.0],
+            "protons": [1.0],
+            "histories": 10,
+            "seed": 1,
+            "spread_pct": 0.0,
+            "wet_mm": 0.0,
+            "depth_mm": 40.0,
+            "voxel_mm": 1.0,
+            "origin": [0.0, 0.0, 0.0],
+            "shape": [2, 2, 2]
+        });
+        let McJob::Slab(job) = slab_job(&request).unwrap() else {
+            panic!("slab");
+        };
+        assert_eq!(job.medium, "water");
+        assert_eq!(job.shape, [2, 2, 2]);
+        assert_eq!(job.histories, 10);
+        assert!(job.y[1].is_nan());
+        assert!(slab_job(&serde_json::json!({})).is_err());
+        assert!(shape_of(&serde_json::json!({"shape": [1, 2]})).is_err());
+        assert!(shape_of(&serde_json::json!({"shape": [1, 2, "a"]})).is_err());
+        assert!(vec3(&serde_json::json!({"origin": [1, 2]}), "origin").is_err());
+        assert!(vec3(&serde_json::json!({"origin": [1, "a", 3]}), "origin").is_err());
+        assert!(number(&serde_json::json!({}), "histories").is_err());
+        assert!(floats(&serde_json::json!({}), "x").is_err());
+        report(&sample_result(vec![0.5]), true);
+        report(&sample_result(Vec::new()), false);
+    }
+
+    #[test]
+    fn a_patient_request_reads_the_raw_grids() {
+        let dir = std::env::temp_dir().join(format!("mc-case-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        store_f32(&dir.join("spots.f32"), &[1.0, 2.0]).unwrap();
+        store_f32(&dir.join("protons.f32"), &[3.0]).unwrap();
+        store_f32(&dir.join("beams.f32"), &[4.0]).unwrap();
+        store_f32(&dir.join("density.f32"), &[1.0, 1.0]).unwrap();
+        fs::write(dir.join("material.u8"), [0u8, 1]).unwrap();
+        fs::write(dir.join("bad.f32"), [1u8, 2, 3]).unwrap();
+        assert!(load_f32(&dir.join("bad.f32")).is_err());
+        assert!(load_f32(&dir.join("missing.f32")).is_err());
+        assert_eq!(load_f32(&dir.join("spots.f32")).unwrap(), vec![1.0, 2.0]);
+        assert!(store_f32(&dir, &[1.0]).is_err());
+        let request = serde_json::json!({
+            "spots": "spots.f32",
+            "protons": "protons.f32",
+            "beams": "beams.f32",
+            "material": "material.u8",
+            "density": "density.f32",
+            "spacing_mm": [1.0, 1.0, 1.0],
+            "origin_mm": [0.0, 0.0, 0.0],
+            "shape": [2, 1, 1],
+            "histories": 4,
+            "seed": 2,
+            "dose_to_water": false
+        });
+        let McJob::Patient(job) = patient_job(&request, &dir).unwrap() else {
+            panic!("patient");
+        };
+        assert_eq!(job.material, vec![0, 1]);
+        assert!(!job.dose_to_water);
+        assert!(job.score_let);
+        let mut mismatch = request.clone();
+        mismatch["density"] = serde_json::json!("protons.f32");
+        assert!(patient_job(&mismatch, &dir)
+            .unwrap_err()
+            .contains("do not match"));
+        let mut water = request.clone();
+        water.as_object_mut().unwrap().remove("dose_to_water");
+        let McJob::Patient(defaulted) = patient_job(&water, &dir).unwrap() else {
+            panic!("patient");
+        };
+        assert!(defaulted.dose_to_water);
+        assert!(name_of(&serde_json::json!({}), "spots").is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+}

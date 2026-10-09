@@ -163,14 +163,7 @@ pub fn volumetric(
         .unwrap_or("");
 
     let mat = medium(medium_key);
-    let voxel_mm = pick(
-        options,
-        "voxel",
-        "1",
-        &[("0.5", "0.5 mm"), ("1", "1 mm"), ("2", "2 mm")],
-    )
-    .parse::<f32>()
-    .unwrap_or(1.0);
+    let voxel_mm = voxel_spacing(options);
     let gap_mm = pick(
         options,
         "gap",
@@ -797,6 +790,17 @@ pub fn volumetric(
     }
 }
 
+/// Spacing in mm. Accepts `1`, `1.5`, and `2 mm`. Outside 0.25–10 mm clamps, matching the Python spin box.
+pub fn voxel_spacing(options: &Value) -> f32 {
+    let raw = options.get("voxel").and_then(Value::as_str).unwrap_or("1");
+    let text = raw.trim().trim_end_matches("mm").trim();
+    let value = text.parse::<f32>().unwrap_or(1.0);
+    if !value.is_finite() {
+        return 1.0;
+    }
+    value.clamp(0.25, 10.0)
+}
+
 fn range_control(
     id: &str,
     label: &str,
@@ -922,22 +926,22 @@ fn push_picture_controls(
                 ],
             ),
         )
+        .icons(&["nearest", "linear", "cubic"])
         .grouped("Picture"),
     );
-    controls.push(
-        labeled(
-            "voxel",
-            "Voxel",
-            &[("0.5", "0.5 mm"), ("1", "1 mm"), ("2", "2 mm")],
-            pick(
-                options,
-                "voxel",
-                "1",
-                &[("0.5", "0.5 mm"), ("1", "1 mm"), ("2", "2 mm")],
-            ),
-        )
-        .grouped("Picture"),
+    let mut voxel = range_control(
+        "voxel",
+        "Voxel",
+        0.25,
+        10.0,
+        0.1,
+        &trim_number(voxel_spacing(options)),
     );
+    voxel.kind = "number".into();
+    voxel
+        .options
+        .push(scan_kit_core::Choice::full("quick", "1", "", ""));
+    controls.push(voxel.grouped("Picture"));
     let mut grid = format!("{} × {} × {}", mark.shape[0], mark.shape[1], mark.shape[2]);
     if model == "mc" {
         grid.push_str(" · MC");
@@ -1068,6 +1072,17 @@ fn fill(
     grid: Option<([f32; 3], [usize; 3], f32)>,
     planes: Option<[usize; 3]>,
 ) -> (Volume, Option<McResult>) {
+    if pencils.is_empty() {
+        return (
+            Volume {
+                origin: [0.0; 3],
+                shape: [0, 0, 0],
+                voxel: 1.0,
+                values: Vec::new(),
+            },
+            None,
+        );
+    }
     if model == "mc" {
         if let Some(run) = mc {
             if let Some((origin, shape, voxel)) = grid {
@@ -1841,6 +1856,73 @@ mod tests {
         };
         let (_, passed, scored) = super::gamma_with(&measured, &plan, 3.0, 2.0, 10.0);
         assert_eq!((scored, passed), (1, 1));
+    }
+
+    #[test]
+    fn the_voxel_box_uses_the_requested_spacing() {
+        let root = std::env::temp_dir().join(format!(
+            "scan-kit-voxel-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let session = root.join("sess");
+        std::fs::create_dir_all(&session).unwrap();
+        std::fs::write(
+            session.join("input_map.csv"),
+            "energy,charge_req,position_x,position_y\n180,0.05,0,0\n",
+        )
+        .unwrap();
+        std::fs::write(session.join("spot_data.csv"), "ic1_total_dose\n0.05\n").unwrap();
+        let cube = |voxel: &str| {
+            super::volumetric(
+                &root,
+                &["sess".into()],
+                &serde_json::json!({ "voxel": voxel }),
+                None,
+            )
+        };
+        let spacing = |voxel: &str| cube(voxel).volume.voxel;
+        let cells = |voxel: &str| {
+            let shape = cube(voxel).volume.shape;
+            shape[0] * shape[1] * shape[2]
+        };
+        assert!((spacing("1") - 1.0).abs() < 1e-3);
+        assert!((spacing("2 mm") - 2.0).abs() < 1e-3);
+        assert!((spacing("1.5") - 1.5).abs() < 1e-3);
+        assert!((spacing("0.1") - 0.25).abs() < 1e-3);
+        assert!((spacing("40") - 10.0).abs() < 1e-3);
+        assert!(cells("2 mm") < cells("1"));
+        let scene = cube("");
+        let control = scene
+            .controls
+            .iter()
+            .find(|control| control.id == "voxel")
+            .unwrap();
+        assert_eq!(control.kind, "number");
+        assert_eq!(control.value, "1");
+        assert!(control
+            .options
+            .iter()
+            .any(|choice| choice.id == "quick" && choice.label == "1"));
+        assert_eq!(
+            scene
+                .controls
+                .iter()
+                .find(|control| control.id == "sample")
+                .map(|control| {
+                    control
+                        .options
+                        .iter()
+                        .map(|choice| choice.icon.as_str())
+                        .collect::<Vec<_>>()
+                }),
+            Some(vec!["nearest", "linear", "cubic"])
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

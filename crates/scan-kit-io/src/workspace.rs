@@ -17,8 +17,6 @@ pub(crate) enum CellView {
 pub(crate) enum PlotKind {
     Depth,
     Lateral,
-    Longitudinal,
-    Both,
     Dvh,
     Gamma,
 }
@@ -31,12 +29,10 @@ const CELL_CHOICES: &[(&str, &str)] = &[
 ];
 
 const PLOT_CHOICES: &[(&str, &str)] = &[
-    ("depth", "Depth dose"),
-    ("lateral", "Lateral profile"),
-    ("longitudinal", "Longitudinal profile"),
-    ("lat_long", "Lateral + longitudinal"),
+    ("depth", "Depth Dose"),
+    ("lateral", "Lateral Profile"),
     ("dvh", "DVH"),
-    ("gamma_hist", "Gamma histogram"),
+    ("gamma_hist", "Gamma Histogram"),
 ];
 
 pub(crate) fn assign_cell(cells: &mut [CellView; 4], index: usize, next: CellView) {
@@ -92,12 +88,10 @@ pub(crate) fn plots_from(raw: [Option<&str>; 2], study: bool) -> [PlotKind; 2] {
 
 fn plot_kind(value: &str) -> Option<PlotKind> {
     Some(match value {
-        "depth" | "Depth dose" => PlotKind::Depth,
-        "lateral" | "Lateral profile" => PlotKind::Lateral,
-        "longitudinal" | "Longitudinal profile" => PlotKind::Longitudinal,
-        "lat_long" | "Lateral + longitudinal" => PlotKind::Both,
+        "depth" | "Depth dose" | "Depth Dose" => PlotKind::Depth,
+        "lateral" | "Lateral profile" | "Lateral Profile" => PlotKind::Lateral,
         "dvh" | "DVH" => PlotKind::Dvh,
-        "gamma_hist" | "Gamma histogram" => PlotKind::Gamma,
+        "gamma_hist" | "Gamma histogram" | "Gamma Histogram" => PlotKind::Gamma,
         _ => return None,
     })
 }
@@ -175,13 +169,14 @@ pub(crate) fn layout() -> (u32, Vec<f32>, Vec<f32>, Vec<f32>) {
 fn image_panel(space: &Workspace, cell: CellView) -> Panel {
     let volume = &space.dose;
     let [nx, ny, nz] = volume.shape;
-    let [ix, iy, iz] = space.cursor;
+    // The dose plot retargets this quad at the volume atlas. A full slice here
+    // is encoded and then dropped.
     let (title, values, cols, rows, xmin, xmax, ymin, ymax) = match cell {
         CellView::Coronal => (
             "Coronal",
-            volume.coronal(iy.min(ny - 1)),
-            nx,
-            nz,
+            vec![0.0],
+            1,
+            1,
             volume.origin[0],
             volume.origin[0] + nx as f32 * volume.voxel,
             volume.origin[2],
@@ -189,32 +184,29 @@ fn image_panel(space: &Workspace, cell: CellView) -> Panel {
         ),
         CellView::Sagittal => (
             "Sagittal",
-            volume.sagittal(ix.min(nx - 1)),
-            ny,
-            nz,
+            vec![0.0],
+            1,
+            1,
             volume.origin[1],
             volume.origin[1] + ny as f32 * volume.voxel,
             volume.origin[2],
             volume.origin[2] + nz as f32 * volume.voxel,
         ),
-        CellView::Volume => {
-            let image = mip(volume);
-            (
-                "3D",
-                image,
-                nx,
-                ny,
-                volume.origin[0],
-                volume.origin[0] + nx as f32 * volume.voxel,
-                volume.origin[1],
-                volume.origin[1] + ny as f32 * volume.voxel,
-            )
-        }
+        CellView::Volume => (
+            "3D",
+            vec![0.0],
+            1,
+            1,
+            volume.origin[0],
+            volume.origin[0] + nx as f32 * volume.voxel,
+            volume.origin[1],
+            volume.origin[1] + ny as f32 * volume.voxel,
+        ),
         CellView::Axial => (
             "Axial",
-            volume.axial(iz.min(nz - 1)),
-            nx,
-            ny,
+            vec![0.0],
+            1,
+            1,
             volume.origin[0],
             volume.origin[0] + nx as f32 * volume.voxel,
             volume.origin[1],
@@ -255,24 +247,8 @@ fn plot_panel(space: &Workspace, kind: PlotKind) -> Panel {
     let [ix, iy, iz] = space.cursor;
     let (title, series, y_label) = match kind {
         PlotKind::Lateral => (
-            "Lateral profile".into(),
+            "Lateral Profile".into(),
             vec![line(volume.lateral_profile(ix, iy, iz))],
-            space.y_label.clone(),
-        ),
-        PlotKind::Longitudinal => (
-            "Longitudinal profile".into(),
-            vec![line(volume.longitudinal_profile(ix, iy, iz))],
-            space.y_label.clone(),
-        ),
-        PlotKind::Both => (
-            "Lateral + longitudinal".into(),
-            vec![
-                line(volume.lateral_profile(ix, iy, iz)),
-                line_colored(
-                    volume.longitudinal_profile(ix, iy, iz),
-                    [0.9, 0.55, 0.2, 1.0],
-                ),
-            ],
             space.y_label.clone(),
         ),
         PlotKind::Dvh => ("DVH".into(), space.dvh.clone(), "Volume".into()),
@@ -285,7 +261,7 @@ fn plot_panel(space: &Workspace, kind: PlotKind) -> Panel {
             (title, series, y_label)
         }
         PlotKind::Depth => (
-            "Depth dose".into(),
+            "Depth Dose".into(),
             vec![line(volume.depth_profile(ix, iy))],
             space.y_label.clone(),
         ),
@@ -294,8 +270,6 @@ fn plot_panel(space: &Workspace, kind: PlotKind) -> Panel {
     let x_label = match kind {
         PlotKind::Depth => "Depth from the grid edge (mm)".into(),
         PlotKind::Lateral => "Across the beam from the crosshair (mm)".into(),
-        PlotKind::Longitudinal => "Along the beam from the crosshair (mm)".into(),
-        PlotKind::Both => "From the crosshair (mm)".into(),
         PlotKind::Dvh | PlotKind::Gamma => String::new(),
     };
     Panel {
@@ -324,12 +298,12 @@ fn gamma_verdict(rate: f32) -> &'static str {
 }
 
 fn gamma_heading(rate: f32) -> String {
-    format!("Gamma histogram  {rate:.0}% {}", gamma_verdict(rate))
+    format!("Gamma Histogram  {rate:.0}% {}", gamma_verdict(rate))
 }
 
 fn gamma_panel(space: &Workspace) -> (String, Vec<Series>) {
     let Some((gamma, rate)) = &space.gamma else {
-        return ("Gamma histogram".into(), Vec::new());
+        return ("Gamma Histogram".into(), Vec::new());
     };
     let counts = gamma_counts(gamma);
     let edges: Vec<f32> = (0..=20).map(|i| i as f32 * 0.1).collect();
@@ -449,13 +423,16 @@ pub(crate) fn cell_control(index: usize, cell: CellView) -> Control {
 }
 
 pub(crate) fn plot_control(index: usize, kind: PlotKind) -> Control {
-    Control::plain(
+    let mut control = Control::plain(
         format!("plot{index}"),
         "Plot",
         PLOT_CHOICES.iter().map(|(_, label)| *label),
         plot_label(kind),
-    )
-    .grouped("Plot")
+    );
+    for (choice, (id, _)) in control.options.iter_mut().zip(PLOT_CHOICES) {
+        choice.icon = (*id).to_string();
+    }
+    control.grouped("Plot")
 }
 
 fn cell_label(cell: CellView) -> &'static str {
@@ -469,27 +446,11 @@ fn cell_label(cell: CellView) -> &'static str {
 
 fn plot_label(kind: PlotKind) -> &'static str {
     match kind {
-        PlotKind::Depth => "Depth dose",
-        PlotKind::Lateral => "Lateral profile",
-        PlotKind::Longitudinal => "Longitudinal profile",
-        PlotKind::Both => "Lateral + longitudinal",
+        PlotKind::Depth => "Depth Dose",
+        PlotKind::Lateral => "Lateral Profile",
         PlotKind::Dvh => "DVH",
-        PlotKind::Gamma => "Gamma histogram",
+        PlotKind::Gamma => "Gamma Histogram",
     }
-}
-
-fn mip(volume: &Volume) -> Vec<f32> {
-    let [nx, ny, nz] = volume.shape;
-    let mut image = vec![0.0; nx * ny];
-    for z in 0..nz {
-        for y in 0..ny {
-            for x in 0..nx {
-                let slot = &mut image[x + nx * y];
-                *slot = f32::max(*slot, volume.get(x, y, z));
-            }
-        }
-    }
-    image
 }
 
 fn line(pair: (Vec<f32>, Vec<f32>)) -> Series {
@@ -570,14 +531,6 @@ fn profile_series<'a>(
         match kind {
             PlotKind::Depth => series.push(line(volume.depth_profile(ix, iy))),
             PlotKind::Lateral => series.push(line(volume.lateral_profile(ix, iy, iz))),
-            PlotKind::Longitudinal => series.push(line(volume.longitudinal_profile(ix, iy, iz))),
-            PlotKind::Both => {
-                series.push(line(volume.lateral_profile(ix, iy, iz)));
-                series.push(line_colored(
-                    volume.longitudinal_profile(ix, iy, iz),
-                    [0.0, 0.0, 0.0, 0.0],
-                ));
-            }
             PlotKind::Dvh | PlotKind::Gamma => {}
         }
     }
@@ -623,12 +576,8 @@ pub(crate) fn widen_profiles(panel: &mut Panel, volumes: &[&Volume], at: [f32; 3
     let title = panel.title.to_ascii_lowercase();
     let kind = if title.starts_with("depth") {
         PlotKind::Depth
-    } else if title.starts_with("lateral +") || title.starts_with("lateral+") {
-        PlotKind::Both
     } else if title.starts_with("lateral") {
         PlotKind::Lateral
-    } else if title.starts_with("longitudinal") {
-        PlotKind::Longitudinal
     } else {
         return;
     };
@@ -655,14 +604,8 @@ pub(crate) fn overlay_sessions(
     if title.starts_with("depth") {
         panel.series = profile_series(PlotKind::Depth, volumes.iter(), at);
         fit_panel(panel);
-    } else if title.starts_with("lateral +") || title.starts_with("lateral+") {
-        panel.series = profile_series(PlotKind::Both, volumes.iter(), at);
-        fit_panel(panel);
     } else if title.starts_with("lateral") {
         panel.series = profile_series(PlotKind::Lateral, volumes.iter(), at);
-        fit_panel(panel);
-    } else if title.starts_with("longitudinal") {
-        panel.series = profile_series(PlotKind::Longitudinal, volumes.iter(), at);
         fit_panel(panel);
     } else if title.starts_with("dvh") {
         panel.series = volumes.iter().map(dvh_line).collect();
@@ -734,7 +677,7 @@ mod tests {
             values: vec![2.0, 8.0],
         };
         let mut panel = Panel {
-            title: "Depth dose".into(),
+            title: "Depth Dose".into(),
             y_label: "Gy".into(),
             x_label: String::new(),
             xmin: 0.0,
@@ -765,7 +708,7 @@ mod tests {
             values: vec![1.0, 9.0],
         };
         let mut panel = Panel {
-            title: "Depth dose".into(),
+            title: "Depth Dose".into(),
             y_label: "Gy".into(),
             x_label: String::new(),
             xmin: 0.0,
@@ -808,8 +751,6 @@ mod tests {
         for kind in [
             PlotKind::Depth,
             PlotKind::Lateral,
-            PlotKind::Longitudinal,
-            PlotKind::Both,
             PlotKind::Dvh,
             PlotKind::Gamma,
         ] {
@@ -859,6 +800,18 @@ mod tests {
                     .map(|choice| choice.icon.as_str())
                     .collect::<Vec<_>>(),
                 ["axial", "coronal", "sagittal", "volume"]
+            );
+            let plot = plot_control(0, PlotKind::Depth);
+            assert_eq!(
+                plot.labels(),
+                ["Depth Dose", "Lateral Profile", "DVH", "Gamma Histogram"]
+            );
+            assert_eq!(
+                plot.options
+                    .iter()
+                    .map(|choice| choice.icon.as_str())
+                    .collect::<Vec<_>>(),
+                ["depth", "lateral", "dvh", "gamma_hist"]
             );
         }
     }

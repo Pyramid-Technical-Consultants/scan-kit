@@ -64,6 +64,7 @@ Plot text uses the vendored Source Sans 3 regular face in `crates/scan-kit-plot/
 | `@glideapps/glide-data-grid` | see `apps/desktop/package.json` | Session list and later column views |
 | `@tauri-apps/plugin-dialog` | see `apps/desktop/package.json` | Open Data Folder dialog |
 | vitest | see `apps/desktop/package.json` | Desktop UI checks. Not linked into the product binary |
+| @vitest/coverage-v8 | see `apps/desktop/package.json` | Line coverage for those checks. Not linked into the product binary |
 | happy-dom | see `apps/desktop/package.json` | DOM for those checks. Not linked into the product binary |
 | oxlint | see `apps/desktop/package.json` | Desktop correctness lint, including React hooks. Not linked into the product binary |
 | knip | see `apps/desktop/package.json` | Unused desktop files, exports, and npm dependencies. Not linked into the product binary |

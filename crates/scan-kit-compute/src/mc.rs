@@ -3,6 +3,7 @@
 //! [`McRun`] is the sliced form of the same transport. [`run_mc`] drains it.
 
 use std::future::Future;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use scan_kit_core::{
@@ -47,6 +48,9 @@ fn main(@builtin(global_invocation_id) g: vec3u, @builtin(num_workgroups) nwg: v
     if (P.mode == 1) { dose_out[i] = s * P.gain; }
 }
 "#;
+
+/// How often a running transport copies the cube for the view.
+const PREVIEW_GAP: Duration = Duration::from_millis(200);
 
 const QUANTUM_MEV: f64 = 1e-4;
 const MEV_TO_J: f64 = 1.602176634e-13;
@@ -360,19 +364,35 @@ fn empty_result(launch: &Launch) -> McResult {
     }
 }
 
-async fn prepare(launch: Launch) -> Result<Live, ComputeError> {
-    let [nx, ny, nz] = launch.shape;
-    let nvox = nx.saturating_mul(ny).saturating_mul(nz).max(1);
-    let (device, queue) = mc_device().await?;
-    let tables = mc_tables();
-    let histories = batch_count(launch.histories);
-    let per_batch = (histories / 10).clamp(1, 100_000);
-    let histories = histories / per_batch * per_batch;
-    let volume_cm3 = f64::from(launch.spacing_cm[0])
-        * f64::from(launch.spacing_cm[1])
-        * f64::from(launch.spacing_cm[2]);
-    let scale = (QUANTUM_MEV * launch.protons * MEV_TO_J / (volume_cm3 * 1e-3)) as f32;
+struct McGpu {
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    transport_layout: wgpu::BindGroupLayout,
+    fold_layout: wgpu::BindGroupLayout,
+    transport_pipe: wgpu::ComputePipeline,
+    fold_pipe: wgpu::ComputePipeline,
+}
 
+/// One device and one compiled transport for the process. Opening a device and
+/// the transport shader is the slow part of switching into Monte Carlo.
+/// ponytail: one shared queue. Two runs at once interleave submits on it.
+async fn shared_gpu() -> Result<Arc<McGpu>, ComputeError> {
+    static GPU: Mutex<Option<Arc<McGpu>>> = Mutex::new(None);
+    if let Some(gpu) = GPU
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .as_ref()
+        .map(Arc::clone)
+    {
+        return Ok(gpu);
+    }
+    let gpu = Arc::new(open_gpu().await?);
+    *GPU.lock().unwrap_or_else(|err| err.into_inner()) = Some(Arc::clone(&gpu));
+    Ok(gpu)
+}
+
+async fn open_gpu() -> Result<McGpu, ComputeError> {
+    let (device, queue) = mc_device().await?;
     let transport = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("mc transport"),
         source: wgpu::ShaderSource::Wgsl(TRANSPORT.into()),
@@ -406,8 +426,34 @@ async fn prepare(launch: Launch) -> Result<Live, ComputeError> {
             uniform(),
         ],
     );
-    let transport_pipe = pipeline(&device, &transport_layout, &transport);
-    let fold_pipe = pipeline(&device, &fold_layout, &fold);
+    Ok(McGpu {
+        transport_pipe: pipeline(&device, &transport_layout, &transport),
+        fold_pipe: pipeline(&device, &fold_layout, &fold),
+        device,
+        queue,
+        transport_layout,
+        fold_layout,
+    })
+}
+
+async fn prepare(launch: Launch) -> Result<Live, ComputeError> {
+    let [nx, ny, nz] = launch.shape;
+    let nvox = nx.saturating_mul(ny).saturating_mul(nz).max(1);
+    let gpu = shared_gpu().await?;
+    let device = gpu.device.clone();
+    let queue = gpu.queue.clone();
+    let transport_layout = gpu.transport_layout.clone();
+    let fold_layout = gpu.fold_layout.clone();
+    let transport_pipe = gpu.transport_pipe.clone();
+    let fold_pipe = gpu.fold_pipe.clone();
+    let tables = mc_tables();
+    let histories = batch_count(launch.histories);
+    let per_batch = (histories / 10).clamp(1, 100_000);
+    let histories = histories / per_batch * per_batch;
+    let volume_cm3 = f64::from(launch.spacing_cm[0])
+        * f64::from(launch.spacing_cm[1])
+        * f64::from(launch.spacing_cm[2]);
+    let scale = (QUANTUM_MEV * launch.protons * MEV_TO_J / (volume_cm3 * 1e-3)) as f32;
 
     let spots = storage_init(&device, &f32_bytes(&launch.spots));
     let floats = storage_init(&device, &f32_bytes(&tables.floats));
@@ -517,6 +563,7 @@ impl Live {
                 ComputeError::Message("monte carlo finished without a dose".into())
             })?));
         }
+        let mut published = None;
         if self.inflight {
             let blocked = self.wait_fence()?;
             self.inflight = false;
@@ -524,12 +571,15 @@ impl Live {
             if cancel.is_cancelled() {
                 return Ok(Slice::Cancelled);
             }
-            if self.next > 0
-                && (self.previews == 0 || self.last_preview.elapsed() >= Duration::from_millis(100))
-            {
+            // The first chunk is the rough cube. Later copies are a few times a
+            // second, so the view can sharpen while the next chunk is in flight.
+            let fresh =
+                self.next > 0 && (self.previews == 0 || self.last_preview.elapsed() >= PREVIEW_GAP);
+            if fresh {
                 self.cached = Some(self.preview()?);
                 self.last_preview = Instant::now();
                 self.previews += 1;
+                published = self.cached.clone();
             }
             if self.next >= self.histories {
                 let result = self.finish()?;
@@ -543,7 +593,9 @@ impl Live {
         let end = self.next.saturating_add(self.chunk).min(self.histories);
         self.submit_until(end);
         self.inflight = true;
-        Ok(Slice::Pending(self.cached.clone()))
+        // A stale picture is not copied again. The view paints the last copy
+        // while the next chunk keeps running.
+        Ok(Slice::Pending(published))
     }
 
     fn submit_until(&mut self, end: u32) {
@@ -1220,10 +1272,14 @@ mod tests {
         let mut sliced = McRun::open(&job).expect("adapter");
         let cancel = Cancel::new();
         let mut saw_dose = false;
+        let mut quiet = 0u32;
         let ready = loop {
             match sliced.poll(Duration::from_micros(100), &cancel) {
                 Poll::Pending { preview, report } => {
                     assert!(report.done <= report.total);
+                    if preview.is_none() {
+                        quiet += 1;
+                    }
                     if preview
                         .as_ref()
                         .is_some_and(|result| result.volume.values.iter().any(|value| *value > 0.0))
@@ -1237,6 +1293,7 @@ mod tests {
             }
         };
         assert!(saw_dose, "a sliced run never published a dose");
+        assert!(quiet > 0, "every poll republished the cube");
         assert_eq!(ready.volume.values, one.volume.values);
         assert_eq!(ready.ledger, one.ledger);
     }

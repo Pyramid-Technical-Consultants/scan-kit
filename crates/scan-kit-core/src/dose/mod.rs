@@ -17,9 +17,9 @@ pub use gamma::{field_bounds, gamma_index, robust_high};
 pub use kernel::{bragg_idd, csda_range_mm, protons_from_mu, through_wet};
 pub use paint::{painted_unit, trim_number, wash_of, LevelSpan, PaintChoice, Wash};
 pub use ray::{
-    brick_grid, dose_film_open, dose_film_uv, film_height, line_scale, ray_rgba, ray_value,
-    raymarch, sample_index, sample_mm, scan_volume, view_ray_scale, RayView, VolumeScan, BRICK,
-    FOV_Y,
+    brick_grid, dose_film_open, dose_film_uv, film_height, gantry_extent, line_scale, ray_rgba,
+    ray_value, raymarch, sample_index, sample_mm, scan_volume, view_ray_scale, RayView, VolumeScan,
+    BRICK, FOV_Y,
 };
 
 pub(super) const K_BETHE: f64 = 0.307075;
@@ -348,24 +348,6 @@ impl Volume {
                 sum += self.get(column, y, z);
             }
             xs.push(self.origin[0] + (column as f32 + 0.5) * self.voxel - x0);
-            dose.push(sum * area);
-        }
-        (xs, dose)
-    }
-
-    pub fn longitudinal_integral(&self, y: usize, z: usize) -> (Vec<f32>, Vec<f32>) {
-        let [nx, _, nz] = self.shape;
-        let area = self.voxel * self.voxel;
-        let z0 = self.origin[2] + (z as f32 + 0.5) * self.voxel;
-        let mut xs = Vec::with_capacity(nz);
-        let mut dose = Vec::with_capacity(nz);
-        for depth in 0..nz {
-            let mut sum = 0.0;
-            for x in 0..nx {
-                sum += self.get(x, y, depth);
-            }
-            let z_mm = self.origin[2] + (depth as f32 + 0.5) * self.voxel;
-            xs.push(z0 - z_mm);
             dose.push(sum * area);
         }
         (xs, dose)

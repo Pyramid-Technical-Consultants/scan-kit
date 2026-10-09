@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::sync::OnceLock;
 
 use super::{
@@ -269,6 +270,7 @@ pub(super) fn mcs_at(path: &[f64], var: &[f64], depth_mm: f64, r0: f64) -> f64 {
     lerp(z, path, var).max(0.0).sqrt()
 }
 
+#[derive(Clone)]
 pub(super) struct LayerKernel {
     pub(super) energies: Vec<f32>,
     pub(super) zmin: Vec<f32>,
@@ -277,6 +279,19 @@ pub(super) struct LayerKernel {
     pub(super) energy_dep: Vec<f32>,
     pub(super) mcs_max: Vec<f32>,
     pub(super) nodes: usize,
+}
+
+struct CachedKernel {
+    medium: &'static str,
+    spread: u64,
+    energies: Vec<f32>,
+    kernel: LayerKernel,
+}
+
+thread_local! {
+    // ponytail: one kernel per thread. The frame, the deposit, and a matching
+    // plan share layers; a different energy list replaces this entry.
+    static LAST_KERNEL: RefCell<Option<CachedKernel>> = const { RefCell::new(None) };
 }
 
 pub(super) fn layer_energies(energy: &[f32]) -> Vec<f32> {
@@ -306,45 +321,43 @@ pub(super) fn layer_energies(energy: &[f32]) -> Vec<f32> {
 
 pub(super) fn build_kernel(medium: Medium, energy: &[f32], spread_pct: f64) -> LayerKernel {
     let energies = layer_energies(energy);
+    let spread = spread_pct.to_bits();
+    let cached = LAST_KERNEL.with(|slot| {
+        slot.borrow().as_ref().and_then(|cached| {
+            (cached.medium == medium.key && cached.spread == spread && cached.energies == energies)
+                .then(|| cached.kernel.clone())
+        })
+    });
+    if let Some(kernel) = cached {
+        return kernel;
+    }
+    let kernel = assemble_kernel(medium, energies.clone(), spread_pct);
+    LAST_KERNEL.with(|slot| {
+        *slot.borrow_mut() = Some(CachedKernel {
+            medium: medium.key,
+            spread,
+            energies,
+            kernel: kernel.clone(),
+        });
+    });
+    kernel
+}
+
+fn assemble_kernel(medium: Medium, energies: Vec<f32>, spread_pct: f64) -> LayerKernel {
     let nodes = LAYER_NODES;
-    let n = energies.len();
-    let mut cdf = vec![0.0f32; n * nodes];
-    let mut mcs = vec![0.0f32; n * nodes];
-    let mut zmin = vec![0.0f32; n];
-    let mut dep = vec![0.0f32; n];
-    let mut mcs_max = vec![0.0f32; n];
-    for (i, &e0) in energies.iter().enumerate() {
-        let e = f64::from(e0);
-        let r0 = csda_range_mm(medium, e);
-        let sig = depth_sigma_mm(medium, e, spread_pct);
-        let dmax = r0 + 5.0 * sig;
-        let mut idd = vec![0.0; nodes];
-        for k in 0..nodes {
-            let depth = dmax * (nodes - 1 - k) as f64 / (nodes - 1) as f64;
-            idd[k] = bragg_idd(medium, e, spread_pct, depth);
-        }
-        // idd[0] is the deep end, idd[last] is the surface. Integrate from deep to surface
-        // so the CDF rises toward z = 0, matching the Python table.
-        let step = dmax / (nodes - 1) as f64;
-        let mut acc = vec![0.0; nodes];
-        for k in 1..nodes {
-            acc[k] = acc[k - 1] + 0.5 * (idd[k] + idd[k - 1]) * step;
-        }
-        let total = acc[nodes - 1].max(1e-30);
-        dep[i] = total as f32;
-        for k in 0..nodes {
-            cdf[i * nodes + k] = (acc[k] / total) as f32;
-        }
-        zmin[i] = -dmax as f32;
-        let (path, var) = mcs_along(medium, e);
-        let mut peak = 0.0f32;
-        for k in 0..nodes {
-            let depth = dmax * (nodes - 1 - k) as f64 / (nodes - 1) as f64;
-            let w = mcs_at(&path, &var, depth, r0) as f32;
-            mcs[i * nodes + k] = w;
-            peak = peak.max(w);
-        }
-        mcs_max[i] = peak;
+    let rows = layer_rows(medium, &energies, spread_pct, nodes);
+    let n = rows.len();
+    let mut cdf = Vec::with_capacity(n * nodes);
+    let mut mcs = Vec::with_capacity(n * nodes);
+    let mut zmin = Vec::with_capacity(n);
+    let mut dep = Vec::with_capacity(n);
+    let mut mcs_max = Vec::with_capacity(n);
+    for (cdf_row, mcs_row, z, deposited, peak) in rows {
+        cdf.extend(cdf_row);
+        mcs.extend(mcs_row);
+        zmin.push(z);
+        dep.push(deposited);
+        mcs_max.push(peak);
     }
     LayerKernel {
         energies,
@@ -355,6 +368,78 @@ pub(super) fn build_kernel(medium: Medium, energy: &[f32], spread_pct: f64) -> L
         mcs_max,
         nodes,
     }
+}
+
+fn layer_rows(
+    medium: Medium,
+    energies: &[f32],
+    spread_pct: f64,
+    nodes: usize,
+) -> Vec<(Vec<f32>, Vec<f32>, f32, f32, f32)> {
+    let workers = std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(1)
+        .clamp(1, 32);
+    if energies.len() < 4 || workers == 1 {
+        return energies
+            .iter()
+            .map(|&energy| one_layer(medium, energy, spread_pct, nodes))
+            .collect();
+    }
+    let parts = workers.min(energies.len());
+    let size = energies.len().div_ceil(parts);
+    let chunks: Vec<&[f32]> = energies.chunks(size.max(1)).collect();
+    std::thread::scope(|scope| {
+        let mut joins = Vec::with_capacity(chunks.len());
+        for chunk in chunks {
+            joins.push(scope.spawn(move || {
+                chunk
+                    .iter()
+                    .map(|&energy| one_layer(medium, energy, spread_pct, nodes))
+                    .collect::<Vec<_>>()
+            }));
+        }
+        joins
+            .into_iter()
+            .flat_map(|join| join.join().expect("dose layer"))
+            .collect()
+    })
+}
+
+fn one_layer(
+    medium: Medium,
+    energy: f32,
+    spread_pct: f64,
+    nodes: usize,
+) -> (Vec<f32>, Vec<f32>, f32, f32, f32) {
+    let e = f64::from(energy);
+    let r0 = csda_range_mm(medium, e);
+    let sig = depth_sigma_mm(medium, e, spread_pct);
+    let dmax = r0 + 5.0 * sig;
+    let mut idd = vec![0.0; nodes];
+    for k in 0..nodes {
+        let depth = dmax * (nodes - 1 - k) as f64 / (nodes - 1) as f64;
+        idd[k] = bragg_idd(medium, e, spread_pct, depth);
+    }
+    // idd[0] is the deep end, idd[last] is the surface. Integrate from deep to surface
+    // so the CDF rises toward z = 0, matching the Python table.
+    let step = dmax / (nodes - 1) as f64;
+    let mut acc = vec![0.0; nodes];
+    for k in 1..nodes {
+        acc[k] = acc[k - 1] + 0.5 * (idd[k] + idd[k - 1]) * step;
+    }
+    let total = acc[nodes - 1].max(1e-30);
+    let cdf: Vec<f32> = acc.iter().map(|sample| (sample / total) as f32).collect();
+    let (path, var) = mcs_along(medium, e);
+    let mut mcs = vec![0.0f32; nodes];
+    let mut peak = 0.0f32;
+    for k in 0..nodes {
+        let depth = dmax * (nodes - 1 - k) as f64 / (nodes - 1) as f64;
+        let w = mcs_at(&path, &var, depth, r0) as f32;
+        mcs[k] = w;
+        peak = peak.max(w);
+    }
+    (cdf, mcs, -dmax as f32, total as f32, peak)
 }
 
 pub(super) fn layer_of(kernel: &LayerKernel, energy: f32) -> usize {
@@ -393,15 +478,6 @@ pub(super) fn row_at(kernel: &LayerKernel, row: usize, at: f32, mcs: bool) -> f3
         }
     };
     sample(k) + f * (sample(k + 1) - sample(k))
-}
-
-pub(super) fn mass_fraction(kernel: &LayerKernel, energy: f32, z_lo: f32, z_hi: f32) -> f32 {
-    let row = layer_of(kernel, energy);
-    row_at(kernel, row, z_hi, false) - row_at(kernel, row, z_lo, false)
-}
-
-pub(super) fn lateral_mm(kernel: &LayerKernel, energy: f32, z: f32) -> f32 {
-    row_at(kernel, layer_of(kernel, energy), z, true).max(0.0)
 }
 
 pub(super) fn lerp(x: f64, xp: &[f64], fp: &[f64]) -> f64 {
@@ -448,7 +524,7 @@ pub fn protons_from_mu(mu: f64, energy: f64, gap_mm: f64, k_mu: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::super::WATER;
-    use super::{bragg_idd, csda_range_mm};
+    use super::{bragg_idd, build_kernel, csda_range_mm};
 
     #[test]
     fn water_bragg_matches_the_python_table() {
@@ -467,5 +543,14 @@ mod tests {
             let rel = (got - expect).abs() / expect;
             assert!(rel < 0.01, "E {energy} d {depth}: {got} vs {expect}");
         }
+    }
+
+    #[test]
+    fn a_second_spread_does_not_reuse_the_first_kernel() {
+        let narrow = build_kernel(WATER, &[150.0], 0.0);
+        let wide = build_kernel(WATER, &[150.0], 5.0);
+        let again = build_kernel(WATER, &[150.0], 0.0);
+        assert_ne!(narrow.zmin, wide.zmin);
+        assert_eq!(narrow.cdf, again.cdf);
     }
 }

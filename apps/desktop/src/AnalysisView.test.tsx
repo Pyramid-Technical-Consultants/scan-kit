@@ -4,16 +4,48 @@ import { afterEach, expect, it, vi } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
 
 import { AnalysisView } from "./AnalysisView";
+import { PageLoad } from "./page-load";
 import { sessionColor } from "./session-colors";
 
-const { followPlot, paintPlot } = vi.hoisted(() => ({
-  followPlot: vi.fn(),
-  paintPlot: vi.fn((spec: string) =>
-    spec.includes('"Off"')
-      ? JSON.stringify({ label: "Window", min: "0", max: "8", step: "0.08", value: "4" })
-      : "",
-  ),
-}));
+const { followPlot, paintPlot, plotFrames, plotGate, plotInits, plotRecords } = vi.hoisted(() => {
+  let ready: Promise<void> = Promise.resolve();
+  let release: () => void = () => {};
+  return {
+    followPlot: vi.fn(),
+    paintPlot: vi.fn((spec: string) =>
+      spec.includes('"Off"')
+        ? JSON.stringify({ label: "Window", min: "0", max: "8", step: "0.08", value: "4" })
+        : "",
+    ),
+    plotFrames: vi.fn(() => "[]"),
+    plotInits: { count: 0 },
+    plotRecords: [] as {
+      width: number;
+      height: number;
+      panel: number;
+      loads: number;
+      renders: number;
+      bytes: number;
+      cursor: number[];
+    }[],
+    plotGate: {
+      wait: () => ready,
+      hold: () => {
+        ready = new Promise<void>((resolve) => {
+          release = () => {
+            resolve();
+          };
+        });
+      },
+      release: () => release(),
+      reset: () => {
+        release();
+        ready = Promise.resolve();
+        release = () => {};
+      },
+    },
+  };
+});
 
 function pollFrame(payload: Uint8Array): Uint8Array {
   const report = {
@@ -190,23 +222,54 @@ vi.mock("@tauri-apps/api/core", () => ({
 }));
 
 vi.mock("@/wasm/scan_kit_plot.js", () => ({
-  default: async () => undefined,
+  default: async () => {
+    plotInits.count += 1;
+  },
   WebPlot: {
-    create: async () => ({
-      backend: () => "test",
-      load: () => undefined,
-      render: () => undefined,
-      resize: () => undefined,
-      hover: () => null,
-      frames: () => "[]",
-      dose_action: () => undefined,
-      dose_key: () => false,
-      zoom: () => undefined,
-      pan: () => undefined,
-      reset: () => undefined,
-      follow: (...args: unknown[]) => followPlot(...args),
-      paint: (spec: string) => paintPlot(spec),
-    }),
+    create: async (node: HTMLCanvasElement) => {
+      const record = {
+        width: node.width,
+        height: node.height,
+        panel: -1,
+        loads: 0,
+        renders: 0,
+        bytes: 0,
+        cursor: [] as number[],
+      };
+      plotRecords.push(record);
+      await plotGate.wait();
+      return {
+        backend: () => "test",
+        load: (bytes: Uint8Array) => {
+          record.loads += 1;
+          record.bytes = bytes.byteLength;
+        },
+        render: () => {
+          record.renders += 1;
+        },
+        resize: () => undefined,
+        set_chrome: () => undefined,
+        hover: () => null,
+        frames: () => plotFrames(),
+        dose_action: () => undefined,
+        set_line: () => true,
+        solo: (panel: number) => {
+          record.panel = panel;
+        },
+        dose_cursor: () => record.cursor,
+        set_dose_cursor: (x: number, y: number, z: number) => {
+          record.cursor = [x, y, z];
+        },
+        dose_key: () => false,
+        zoom: () => undefined,
+        pan: () => {
+          record.cursor = [3, 4, 5];
+        },
+        reset: () => undefined,
+        follow: (...args: unknown[]) => followPlot(...args),
+        paint: (spec: string) => paintPlot(spec),
+      };
+    },
   },
 }));
 
@@ -220,7 +283,32 @@ afterEach(() => {
   document.body.replaceChildren();
   followPlot.mockClear();
   paintPlot.mockClear();
+  plotRecords.splice(0);
+  plotFrames.mockReset();
+  plotFrames.mockReturnValue("[]");
+  plotGate.reset();
 });
+
+function canvasBox(width: number, height: number): () => void {
+  const previous = HTMLCanvasElement.prototype.getBoundingClientRect;
+  HTMLCanvasElement.prototype.getBoundingClientRect = () =>
+    ({
+      x: 0,
+      y: 0,
+      left: 0,
+      top: 0,
+      right: width,
+      bottom: height,
+      width,
+      height,
+      toJSON() {
+        return {};
+      },
+    }) as DOMRect;
+  return () => {
+    HTMLCanvasElement.prototype.getBoundingClientRect = previous;
+  };
+}
 
 it("puts grouped controls on the right and returns to sessions", async () => {
   const onBack = vi.fn();
@@ -788,36 +876,260 @@ it("switches analytic and Monte Carlo with radio groups", async () => {
   expect(last?.options?.model).toBe("Monte Carlo");
 });
 
-it("changes color gain without rebuilding the dose", async () => {
+it("shows the progress bar as soon as the model changes", async () => {
   const host = document.createElement("div");
   document.body.append(host);
   await act(() => {
     root = createRoot(host);
     root.render(
-      <AnalysisView
-        viewId="volumetric"
-        folder="C:/data"
-        sessions={[{ id: "a", note: "" }]}
-        onBack={() => undefined}
-        onOpenView={() => undefined}
-      />,
+      <PageLoad>
+        <AnalysisView
+          viewId="volumetric"
+          folder="C:/data"
+          sessions={[{ id: "a", note: "" }]}
+          onBack={() => undefined}
+          onOpenView={() => undefined}
+        />
+      </PageLoad>,
     );
   });
   await act(async () => {
     await new Promise((resolve) => setTimeout(resolve, 200));
   });
-  const starts = () => vi.mocked(invoke).mock.calls.filter(([name]) => name === "scan_kit_start").length;
-  const before = starts();
-  expect(before).toBeGreaterThan(0);
-  expect(paintPlot).toHaveBeenCalled();
-  paintPlot.mockClear();
+  expect(host.querySelector(".fixed.inset-x-0")).toBeNull();
+  const monteCarlo = [...host.querySelectorAll("button")].find((node) =>
+    node.textContent?.includes("Monte Carlo"),
+  );
   await act(async () => {
-    host.querySelector("#analysis-auto")?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    monteCarlo?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
   });
+  expect(host.querySelector(".fixed.inset-x-0")).not.toBeNull();
   await act(async () => {
-    await new Promise((resolve) => setTimeout(resolve, 400));
+    await new Promise((resolve) => setTimeout(resolve, 200));
   });
-  expect(starts()).toBe(before);
-  expect(paintPlot).toHaveBeenCalled();
-  expect(host.textContent).toContain("Window");
+});
+
+it("changes color gain without rebuilding the dose", async () => {
+  const restore = canvasBox(400, 300);
+  const host = document.createElement("div");
+  document.body.append(host);
+  try {
+    await act(() => {
+      root = createRoot(host);
+      root.render(
+        <AnalysisView
+          viewId="volumetric"
+          folder="C:/data"
+          sessions={[{ id: "a", note: "" }]}
+          onBack={() => undefined}
+          onOpenView={() => undefined}
+        />,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 200));
+    });
+    const starts = () => vi.mocked(invoke).mock.calls.filter(([name]) => name === "scan_kit_start").length;
+    const before = starts();
+    expect(before).toBeGreaterThan(0);
+    expect(paintPlot).toHaveBeenCalled();
+    paintPlot.mockClear();
+    await act(async () => {
+      host.querySelector("#analysis-auto")?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 400));
+    });
+    expect(starts()).toBe(before);
+    expect(paintPlot).toHaveBeenCalled();
+    expect(host.textContent).toContain("Window");
+  } finally {
+    restore();
+  }
+});
+
+it("shows a toolbar on each dose canvas before the plotter is ready", async () => {
+  plotGate.hold();
+  const invokeMock = vi.mocked(invoke);
+  const original = invokeMock.getMockImplementation();
+  invokeMock.mockImplementation(async (command: string) => {
+    if (command === "scan_kit_cancel") {
+      return null;
+    }
+    if (command === "scan_kit_start") {
+      return { task: 1, generation: 1 };
+    }
+    if (command !== "scan_kit_poll") {
+      throw new Error(command);
+    }
+    const header = {
+      title: "Volumetric",
+      controls: [
+        { id: "cell0", label: "View", group: "Cell", options: ["Axial", "3D"], value: "Axial" },
+        { id: "cell1", label: "View", group: "Cell", options: ["Coronal", "3D"], value: "Coronal" },
+        { id: "cell2", label: "View", group: "Cell", options: ["Sagittal", "3D"], value: "Sagittal" },
+        { id: "cell3", label: "View", group: "Cell", options: ["Axial", "3D"], value: "3D" },
+        { id: "plot0", label: "Plot", group: "Plot", options: ["Depth Dose", "DVH"], value: "Depth Dose" },
+        { id: "plot1", label: "Plot", group: "Plot", options: ["Lateral Profile", "DVH"], value: "Lateral Profile" },
+      ],
+      table: null,
+      samples: [],
+      panels: [{}],
+    };
+    const json = new TextEncoder().encode(JSON.stringify(header));
+    const bytes = new Uint8Array(4 + json.length);
+    new DataView(bytes.buffer).setUint32(0, json.length, true);
+    bytes.set(json, 4);
+    return pollFrame(bytes);
+  });
+  try {
+    const host = document.createElement("div");
+    document.body.append(host);
+    await act(() => {
+      root = createRoot(host);
+      root.render(
+        <AnalysisView
+          viewId="volumetric"
+          folder="C:/data"
+          sessions={[{ id: "a", note: "" }]}
+          onBack={() => undefined}
+          onOpenView={() => undefined}
+        />,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 400));
+    });
+    const main = host.firstElementChild?.children[0];
+    expect(main?.querySelectorAll("canvas")).toHaveLength(6);
+    expect(main?.querySelectorAll("[aria-label='Resize column']")).toHaveLength(3);
+    expect(main?.querySelectorAll("[aria-label='Resize row']")).toHaveLength(2);
+    expect(host.querySelector("[aria-label='Resize configuration']")).not.toBeNull();
+    const bars = [...(main?.querySelectorAll("[data-slot='select-trigger']") ?? [])].map((node) =>
+      node.textContent?.replace("▼", "").trim(),
+    );
+    expect(bars).toEqual(["Axial", "Coronal", "Sagittal", "3D", "Depth Dose", "Lateral Profile"]);
+    expect(main?.querySelectorAll("[aria-label='Rotate 90 degrees']")).toHaveLength(3);
+    expect(main?.querySelectorAll("[aria-label='Integral']")).toHaveLength(5);
+    expect(main?.querySelector("[data-slot='select-trigger']")?.closest(".absolute")).toBeNull();
+
+    await act(async () => {
+      plotGate.release();
+      await plotGate.wait();
+    });
+    expect(main?.querySelectorAll("canvas")).toHaveLength(6);
+    expect(main?.querySelectorAll("[data-slot='select-trigger']")).toHaveLength(6);
+  } finally {
+    plotGate.reset();
+    if (original != null) {
+      invokeMock.mockImplementation(original);
+    }
+  }
+});
+
+it("draws each dose cell from one plot module once the canvas has a size", async () => {
+  const box = { width: 0, height: 0 };
+  const previousRect = HTMLCanvasElement.prototype.getBoundingClientRect;
+  HTMLCanvasElement.prototype.getBoundingClientRect = () =>
+    ({
+      x: 0,
+      y: 0,
+      left: 0,
+      top: 0,
+      right: box.width,
+      bottom: box.height,
+      width: box.width,
+      height: box.height,
+      toJSON() {
+        return {};
+      },
+    }) as DOMRect;
+  const previousRatio = window.devicePixelRatio;
+  Object.defineProperty(window, "devicePixelRatio", { configurable: true, value: 1 });
+  const queued: ResizeObserverCallback[] = [];
+  const PreviousObserver = globalThis.ResizeObserver;
+  class RecordingObserver {
+    constructor(callback: ResizeObserverCallback) {
+      queued.push(callback);
+    }
+    observe() {}
+    unobserve() {}
+    disconnect() {}
+  }
+  globalThis.ResizeObserver = RecordingObserver as unknown as typeof ResizeObserver;
+  const host = document.createElement("div");
+  document.body.append(host);
+  try {
+    await act(() => {
+      root = createRoot(host);
+      root.render(
+        <AnalysisView
+          viewId="volumetric"
+          folder="C:/data"
+          sessions={[{ id: "a", note: "" }]}
+          onBack={() => undefined}
+          onOpenView={() => undefined}
+        />,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 400));
+    });
+    expect(host.querySelectorAll("canvas")).toHaveLength(6);
+    expect(plotRecords).toHaveLength(0);
+
+    box.width = 400;
+    box.height = 300;
+    await act(async () => {
+      for (const callback of queued) {
+        callback([], {} as ResizeObserver);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    });
+    // Every canvas in the file shares one wasm init. Six cells must not start six.
+    expect(plotInits.count).toBe(1);
+    expect(plotRecords).toHaveLength(6);
+    expect(plotRecords.map((record) => [record.width, record.height])).toEqual([
+      [400, 300],
+      [400, 300],
+      [400, 300],
+      [400, 300],
+      [400, 300],
+      [400, 300],
+    ]);
+    expect(plotRecords.map((record) => record.panel).sort((left, right) => left - right)).toEqual([
+      0, 1, 2, 3, 4, 5,
+    ]);
+    expect(plotRecords.every((record) => record.loads === 1 && record.renders === 1 && record.bytes > 0)).toBe(
+      true,
+    );
+    const canvas = host.querySelector("canvas");
+    await act(async () => {
+      canvas?.dispatchEvent(
+        new PointerEvent("pointerdown", { bubbles: true, pointerId: 1, clientX: 20, clientY: 20 }),
+      );
+      canvas?.dispatchEvent(
+        new PointerEvent("pointermove", {
+          bubbles: true,
+          pointerId: 1,
+          clientX: 28,
+          clientY: 24,
+          movementX: 8,
+          movementY: 4,
+        }),
+      );
+    });
+    expect(plotRecords.map((record) => record.cursor)).toEqual([
+      [3, 4, 5],
+      [3, 4, 5],
+      [3, 4, 5],
+      [3, 4, 5],
+      [3, 4, 5],
+      [3, 4, 5],
+    ]);
+  } finally {
+    HTMLCanvasElement.prototype.getBoundingClientRect = previousRect;
+    Object.defineProperty(window, "devicePixelRatio", { configurable: true, value: previousRatio });
+    globalThis.ResizeObserver = PreviousObserver;
+  }
 });
