@@ -189,7 +189,7 @@ export function replaceSegment(
   return items.map((item, itemIndex) => (itemIndex === index ? next : item));
 }
 
-const DOSE_PAINT_IDS = ["scale", "auto", "level", "error", "ray", "sample"] as const;
+const DOSE_PAINT_IDS = ["scale", "auto", "level", "error", "ray", "sample", "field"] as const;
 
 /** Depth and lateral curves are rows of the cube already on screen. */
 export function localLinePlot(value: string): boolean {
@@ -198,9 +198,9 @@ export function localLinePlot(value: string): boolean {
 }
 
 /**
- * Options that rebuild the dose. Color, window, ray mode, sampling, and the
- * line-plot picker are not in here. DVH and gamma still go through the view
- * task, because those series are not in the cube.
+ * Options that rebuild the dose. Color, window, ray mode, sampling, the field
+ * box, and the line-plot picker are not in here. DVH and gamma still go through
+ * the view task, because those series are not in the cube.
  */
 export function sceneOptions(options: Readonly<Record<string, string>>): Record<string, string> {
   const rest: Record<string, string> = {};

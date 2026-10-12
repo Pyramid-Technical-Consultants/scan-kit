@@ -57,6 +57,10 @@ it("keeps color settings off the dose rebuild", () => {
   expect(JSON.stringify(sceneOptions(base))).not.toBe(
     JSON.stringify(sceneOptions({ ...base, voxel: "2 mm" })),
   );
+  expect(JSON.stringify(sceneOptions(base))).toBe(
+    JSON.stringify(sceneOptions({ ...base, field: "Off" })),
+  );
+  expect(paintSpec({ field: "Off" }, {})).toContain('"field":"Off"');
   expect(paintSpec({ scale: "Turbo", auto: "On", level: "1" }, {})).toContain("Turbo");
   expect(paintSpec({ scale: "Turbo", auto: "On", level: "1" }, {})).not.toContain("level");
   expect(paintSpec({ auto: "Off" }, { level: "1.5" })).toContain("1.5");
@@ -232,6 +236,8 @@ it("groups dose volume by the order a user sets it up", () => {
     { id: "xy", group: "Dose" },
     { id: "quantity", group: "Dose" },
     { id: "compare", group: "Dose" },
+    { id: "voxel", group: "Calculation", kind: "number" },
+    { id: "grid", group: "Calculation" },
     { id: "model", group: "Calculation", kind: "radio" },
     { id: "histories", group: "Calculation", kind: "radio" },
     { id: "spread", group: "Calculation" },
@@ -252,7 +258,13 @@ it("groups dose volume by the order a user sets it up", () => {
     "Picture",
   ]);
   expect(sections[0]?.slots.map((slot) => slot.id)).toEqual(["source", "xy", "quantity", "compare"]);
-  expect(sections[1]?.slots.map((slot) => slot.id)).toEqual(["model", "histories", "spread"]);
+  expect(sections[1]?.slots.map((slot) => slot.id)).toEqual([
+    "voxel",
+    "grid",
+    "model",
+    "histories",
+    "spread",
+  ]);
   expect(sections[1]?.slots.filter((slot) => slot.kind === "radio").map((slot) => slot.id)).toEqual([
     "model",
     "histories",

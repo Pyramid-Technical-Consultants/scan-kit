@@ -98,7 +98,7 @@ function NumberField({
   min: number;
   max: number;
   step: number;
-  quick: string | null;
+  quick: readonly string[];
   disabled: boolean;
   onApply: (value: string) => void;
 }) {
@@ -152,22 +152,23 @@ function NumberField({
           }
         }}
       />
-      {quick != null ? (
+      {quick.map((preset) => (
         <Button
+          key={preset}
           type="button"
           variant="outline"
           size="sm"
           disabled={disabled}
           onClick={() => {
-            setDraft(quick);
-            if (quick !== value) {
-              onApply(quick);
+            setDraft(preset);
+            if (preset !== value) {
+              onApply(preset);
             }
           }}
         >
-          {quick} mm
+          {preset} mm
         </Button>
-      ) : null}
+      ))}
     </Field>
   );
 }
@@ -1024,7 +1025,9 @@ export function AnalysisView({
       );
     }
     if (slot.kind === "number") {
-      const quick = control.options.find((option) => option.id === "quick")?.label ?? null;
+      const quick = control.options
+        .filter((option) => option.id === "quick")
+        .map((option) => option.label);
       return (
         <NumberField
           key={slot.id}

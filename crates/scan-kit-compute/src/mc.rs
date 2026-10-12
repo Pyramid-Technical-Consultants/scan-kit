@@ -52,6 +52,14 @@ fn main(@builtin(global_invocation_id) g: vec3u, @builtin(num_workgroups) nwg: v
 /// How often a running transport copies the cube for the view.
 const PREVIEW_GAP: Duration = Duration::from_millis(200);
 
+/// The suite shares one device. A test holds this for its whole body so two
+/// polls never overlap; an overlapping read made a voxel change look stuck.
+#[cfg(test)]
+pub(crate) fn hold_gpu() -> std::sync::MutexGuard<'static, ()> {
+    static HELD: Mutex<()> = Mutex::new(());
+    HELD.lock().unwrap_or_else(|err| err.into_inner())
+}
+
 const QUANTUM_MEV: f64 = 1e-4;
 const MEV_TO_J: f64 = 1.602176634e-13;
 
@@ -552,7 +560,7 @@ impl Live {
     /// The original one-shot loop: every history, then the store fold.
     fn drain(&mut self) -> Result<McResult, ComputeError> {
         let _kept = self.kept.len();
-        self.submit_until(self.histories);
+        self.submit_until(self.histories, None);
         self.finish()
     }
 
@@ -565,12 +573,16 @@ impl Live {
         }
         let mut published = None;
         if self.inflight {
-            let blocked = self.wait_fence()?;
+            if cancel.is_cancelled() {
+                self.inflight = false;
+                return Ok(Slice::Cancelled);
+            }
+            let blocked = self.wait_fence(cancel)?;
             self.inflight = false;
-            self.chunk = adapt_chunk(self.chunk, self.floor, self.cap, blocked, budget);
             if cancel.is_cancelled() {
                 return Ok(Slice::Cancelled);
             }
+            self.chunk = adapt_chunk(self.chunk, self.floor, self.cap, blocked, budget);
             // The first chunk is the rough cube. Later copies are a few times a
             // second, so the view can sharpen while the next chunk is in flight.
             let fresh =
@@ -591,15 +603,21 @@ impl Live {
             return Ok(Slice::Cancelled);
         }
         let end = self.next.saturating_add(self.chunk).min(self.histories);
-        self.submit_until(end);
+        self.submit_until(end, Some(cancel));
+        if cancel.is_cancelled() {
+            return Ok(Slice::Cancelled);
+        }
         self.inflight = true;
         // A stale picture is not copied again. The view paints the last copy
         // while the next chunk keeps running.
         Ok(Slice::Pending(published))
     }
 
-    fn submit_until(&mut self, end: u32) {
+    fn submit_until(&mut self, end: u32, cancel: Option<&Cancel>) {
         while self.next < end {
+            if cancel.is_some_and(Cancel::is_cancelled) {
+                return;
+            }
             let count = (self.per_batch - self.next % self.per_batch)
                 .min(100_000)
                 .min(end - self.next);
@@ -636,12 +654,23 @@ impl Live {
         }
     }
 
-    fn wait_fence(&self) -> Result<Duration, ComputeError> {
+    fn wait_fence(&self, cancel: &Cancel) -> Result<Duration, ComputeError> {
         let started = Instant::now();
-        self.device
-            .poll(wgpu::PollType::wait_indefinitely())
-            .map_err(|err| ComputeError::Message(err.to_string()))?;
-        Ok(started.elapsed())
+        loop {
+            if cancel.is_cancelled() {
+                return Ok(started.elapsed());
+            }
+            // A short wait so a new voxel size can abandon this chunk instead of
+            // sitting behind the rest of the histories already queued.
+            match self.device.poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: Some(Duration::from_millis(50)),
+            }) {
+                Ok(_) => return Ok(started.elapsed()),
+                Err(wgpu::PollError::Timeout) => continue,
+                Err(err) => return Err(ComputeError::Message(err.to_string())),
+            }
+        }
     }
 
     fn preview(&self) -> Result<McResult, ComputeError> {
@@ -1038,9 +1067,18 @@ fn read_bytes(
         .map_async(wgpu::MapMode::Read, move |result| {
             let _ = sender.send(result);
         });
-    device
-        .poll(wgpu::PollType::wait_indefinitely())
-        .map_err(|err| ComputeError::Message(err.to_string()))?;
+    // Short waits, same as a running chunk. An indefinite poll holds the shared
+    // device, so a new voxel size cannot cancel until that read finishes.
+    loop {
+        match device.poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: Some(Duration::from_millis(50)),
+        }) {
+            Ok(_) => break,
+            Err(wgpu::PollError::Timeout) => continue,
+            Err(err) => return Err(ComputeError::Message(err.to_string())),
+        }
+    }
     receiver
         .recv()
         .map_err(|err| ComputeError::Message(err.to_string()))?
@@ -1105,6 +1143,7 @@ mod tests {
 
     #[test]
     fn slab_deposits_in_the_bragg_region_and_closes_the_ledger() {
+        let _gpu = super::hold_gpu();
         let request = SlabRequest {
             medium: "water".into(),
             x: vec![0.0],
@@ -1161,6 +1200,7 @@ mod tests {
 
     #[test]
     fn patient_box_deposits_downstream_and_closes_the_ledger() {
+        let _gpu = super::hold_gpu();
         let spot = scan_kit_io::spot_record(100.0, 0.0, 0.0, 0.0, 0.0, f32::NAN).expect("spot");
         let beam = scan_kit_io::beam_record(0.0, 0.0, "HFS", [0.0, 0.0, 0.0]).expect("beam");
         let shape = [16usize, 50, 16];
@@ -1263,6 +1303,7 @@ mod tests {
 
     #[test]
     fn sliced_run_matches_one_shot() {
+        let _gpu = super::hold_gpu();
         let job = McJob::Slab(slab(60_000));
         let one = match run_mc(&job) {
             Err(ComputeError::NoAdapter) => return,
@@ -1300,6 +1341,7 @@ mod tests {
 
     #[test]
     fn raised_target_resumes_a_finished_run() {
+        let _gpu = super::hold_gpu();
         let mut run = match McRun::open(&McJob::Slab(slab(30_000))) {
             Err(ComputeError::NoAdapter) => return,
             Err(err) => panic!("{err}"),
@@ -1336,6 +1378,7 @@ mod tests {
 
     #[test]
     fn cancel_after_a_preview_publishes_nothing_further() {
+        let _gpu = super::hold_gpu();
         let mut run = match McRun::open(&McJob::Slab(slab(8_000))) {
             Err(ComputeError::NoAdapter) => return,
             Err(err) => panic!("{err}"),

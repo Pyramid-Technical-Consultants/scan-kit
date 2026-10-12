@@ -30,6 +30,11 @@ trait Stage: Send {
     fn retarget(&mut self, _options: &Value, _palette: &[[f32; 4]]) -> bool {
         false
     }
+
+    /// The desktop calls this with the task cancel token before the stage can
+    /// start work. A later cancel reaches a running worker even while a poll
+    /// is painting and the stage is not in the driver.
+    fn bind_cancel(&mut self, _cancel: Cancel) {}
 }
 
 struct Running {
@@ -131,9 +136,11 @@ pub fn start_task(
         }
     }
     driver.take(&slot);
-    let stage = build_stage(
+    let mut stage = build_stage(
         view, path, sessions, options, background, foreground, palette,
     );
+    let cancel = Cancel::new();
+    stage.bind_cancel(cancel.clone());
     let id = driver.next;
     driver.next = driver.next.saturating_add(1);
     driver.set_slot(&slot, Some(id));
@@ -141,7 +148,7 @@ pub fn start_task(
         id,
         Running {
             generation: 1,
-            cancel: Cancel::new(),
+            cancel,
             stage: Some(stage),
         },
     );
@@ -1081,8 +1088,17 @@ impl Stage for McPlotStage {
         self.report.clone()
     }
 
+    fn bind_cancel(&mut self, cancel: Cancel) {
+        self.worker_cancel = cancel;
+    }
+
     fn retarget(&mut self, options: &Value, palette: &[[f32; 4]]) -> bool {
         if self.worker.is_none() {
+            return false;
+        }
+        // A new grid cannot keep the tallies. Bail out before building that
+        // grid so the replacement does not wait on the scene it is about to throw away.
+        if geometry_changed(&self.options, options) {
             return false;
         }
         let (_scene, job) = capture_job(&self.root, &self.sessions, options);
@@ -1149,6 +1165,14 @@ fn blank_result(job: &McJob) -> McResult {
         ledger: [0.0; 6],
         let_d: Vec::new(),
     }
+}
+
+fn geometry_changed(old: &Value, new: &Value) -> bool {
+    [
+        "voxel", "medium", "spread", "wet", "phantom", "gantry", "margin", "gap", "model", "study",
+    ]
+    .into_iter()
+    .any(|key| old.get(key) != new.get(key))
 }
 
 fn same_phantom(left: &McJob, right: &McJob) -> bool {
@@ -1833,6 +1857,7 @@ mod tests {
 
     #[test]
     fn mc_view_paints_a_rough_cube_before_the_finished_one() {
+        let _gpu = crate::mc::hold_gpu();
         let root = scratch();
         write_session(&root, "sess");
         let options = json!({
@@ -1894,6 +1919,47 @@ mod tests {
             rough,
             "the view never showed a cube before the run finished"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_voxel_change_replaces_the_monte_carlo_without_waiting_it_out() {
+        let _gpu = crate::mc::hold_gpu();
+        let root = scratch();
+        write_session(&root, "sess");
+        let background = [0.1, 0.1, 0.1, 1.0];
+        let foreground = [0.9, 0.9, 0.9, 1.0];
+        let palette = [[0.2, 0.4, 0.8, 1.0]];
+        let first = start_task(
+            "volumetric",
+            &root,
+            &["sess".into()],
+            &json!({"model": "mc", "histories": "2000000", "voxel": "4"}),
+            background,
+            foreground,
+            &palette,
+        )
+        .unwrap();
+        let id = first["task"].as_u64().unwrap();
+        let _ = poll_task(id);
+        let started = std::time::Instant::now();
+        let second = start_task(
+            "volumetric",
+            &root,
+            &["sess".into()],
+            &json!({"model": "mc", "histories": "2000000", "voxel": "1"}),
+            background,
+            foreground,
+            &palette,
+        )
+        .unwrap();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "the new voxel size waited on the old monte carlo"
+        );
+        let next = second["task"].as_u64().unwrap();
+        assert_ne!(next, id);
+        cancel_task(next);
         let _ = std::fs::remove_dir_all(&root);
     }
 }

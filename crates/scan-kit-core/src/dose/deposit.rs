@@ -380,36 +380,69 @@ fn paint_band(
     let [nx, ny, _] = shape;
     let mut fx = Vec::new();
     let mut fy = Vec::new();
-    for spot in spots {
-        if spot.weight == 0.0 {
-            continue;
-        }
-        let Some((ix0, ix1, iy0, iy1, iz0, iz1)) = spot_box(spot, origin, shape, voxel, dose_mode)
-        else {
-            continue;
-        };
-        let iz0 = iz0.max(z0);
-        let iz1 = iz1.min(z1);
-        for iz in iz0..iz1 {
-            let z_lo = origin[2] + iz as f32 * voxel;
-            let (fz, sx, sy) = depth_lateral(kernel, spot, z_lo, voxel, dose_mode);
-            if fz == 0.0 {
-                continue;
+    let boxes: Vec<Option<(usize, usize, usize, usize, usize, usize)>> = spots
+        .iter()
+        .map(|spot| {
+            if spot.weight == 0.0 {
+                None
+            } else {
+                spot_box(spot, origin, shape, voxel, dose_mode)
             }
-            normal_row(spot.x, sx, origin[0], ix0, ix1, voxel, &mut fx);
-            normal_row(spot.y, sy, origin[1], iy0, iy1, voxel, &mut fy);
-            let local = iz - z0;
-            for (ky, iy) in (iy0..iy1).enumerate() {
-                let row = spot.weight * fz * fy[ky];
-                if row == 0.0 {
+        })
+        .collect();
+    // One depth slice is nx by ny. Applying every spot before the next slice
+    // keeps those adds in cache. The old spot-major walk reloaded the slice
+    // once per pencil, and a 0.5 mm grid made that the whole job. A slice that
+    // does not fit is split into row bands; a spot on the seam is painted once
+    // on each side.
+    let y_tile = slice_tile_rows(nx, ny);
+    for iz in z0..z1 {
+        let z_lo = origin[2] + iz as f32 * voxel;
+        let local = iz - z0;
+        for y_from in (0..ny).step_by(y_tile) {
+            let y_to = (y_from + y_tile).min(ny);
+            for (spot, bbox) in spots.iter().zip(&boxes) {
+                let Some((ix0, ix1, iy0, iy1, iz0, iz1)) = *bbox else {
+                    continue;
+                };
+                if iz < iz0 || iz >= iz1 {
                     continue;
                 }
-                let base = nx * (iy + ny * local);
-                for (slot, weight) in values[base + ix0..base + ix1].iter_mut().zip(&fx) {
-                    *slot += row * weight;
+                let iy0 = iy0.max(y_from);
+                let iy1 = iy1.min(y_to);
+                if ix0 >= ix1 || iy0 >= iy1 {
+                    continue;
+                }
+                let (fz, sx, sy) = depth_lateral(kernel, spot, z_lo, voxel, dose_mode);
+                if fz == 0.0 {
+                    continue;
+                }
+                normal_row(spot.x, sx, origin[0], ix0, ix1, voxel, &mut fx);
+                normal_row(spot.y, sy, origin[1], iy0, iy1, voxel, &mut fy);
+                for (ky, iy) in (iy0..iy1).enumerate() {
+                    let row = spot.weight * fz * fy[ky];
+                    if row == 0.0 {
+                        continue;
+                    }
+                    let base = nx * (iy + ny * local);
+                    for (slot, weight) in values[base + ix0..base + ix1].iter_mut().zip(&fx) {
+                        *slot += row * weight;
+                    }
                 }
             }
         }
+    }
+}
+
+/// Rows of one depth slice to paint before moving down. A whole slice stays
+/// together until it is bigger than a typical per-core cache.
+fn slice_tile_rows(nx: usize, ny: usize) -> usize {
+    const SLICE_BYTES: usize = 512 * 1024;
+    let slice_bytes = nx.saturating_mul(ny).saturating_mul(4);
+    if slice_bytes <= SLICE_BYTES || nx == 0 {
+        ny.max(1)
+    } else {
+        (SLICE_BYTES / nx.saturating_mul(4).max(1)).clamp(1, ny.max(1))
     }
 }
 
@@ -891,6 +924,73 @@ mod tests {
                 let a = full.get(ix, y, z);
                 let b = cross.get(ix, y, z);
                 assert!((a - b).abs() <= 1e-4 * a.abs().max(1.0), "sagittal {y},{z}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_spot_on_the_slice_seam_matches_one_pass() {
+        let pencil = Pencil {
+            x: 40.0,
+            y: 0.0,
+            sx: 4.0,
+            sy: 4.0,
+            energy: 160.0,
+            amount: 0.05,
+        };
+        let natural = analytic_volume(
+            WATER,
+            &[pencil],
+            Quantity::Dose,
+            1.0,
+            0.0,
+            0.0,
+            1.0,
+            2.0e-8,
+            10.0,
+        );
+        let nz = natural.shape[2];
+        let z0 = natural.origin[2];
+        let nx = 128usize;
+        let y_tile = super::slice_tile_rows(nx, 4096);
+        assert!(y_tile < 4096, "this grid has to split");
+        assert_eq!(super::slice_tile_rows(nx, y_tile + 80), y_tile);
+        let wide = analytic_on(
+            WATER,
+            &[pencil],
+            Quantity::Dose,
+            1.0,
+            0.0,
+            0.0,
+            1.0,
+            2.0e-8,
+            10.0,
+            Some(([0.0, -(y_tile as f32), z0], [nx, y_tile + 80, nz], 1.0)),
+            None,
+        );
+        let small = analytic_on(
+            WATER,
+            &[pencil],
+            Quantity::Dose,
+            1.0,
+            0.0,
+            0.0,
+            1.0,
+            2.0e-8,
+            10.0,
+            Some(([0.0, -64.0, z0], [nx, 128, nz], 1.0)),
+            None,
+        );
+        assert!(
+            super::slice_tile_rows(nx, 128) == 128,
+            "the reference slice stays whole"
+        );
+        let shift = y_tile - 64;
+        for z in 0..nz {
+            for y in 0..128 {
+                for x in 0..nx {
+                    assert_eq!(small.get(x, y, z), wide.get(x, y + shift, z));
+                }
             }
         }
     }

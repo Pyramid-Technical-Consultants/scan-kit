@@ -27,7 +27,7 @@
 //! and the text turns to follow the edge. The titles are X (mm), Y (mm), and
 //! Depth (mm).
 //! The field box is an amber rectangle on each slice and an amber wireframe
-//! through the volume. The 3D wire is the same 1px stroke as every other line:
+//! through the volume. The bounds switch hides that box without a new cube. The 3D wire is the same 1px stroke as every other line:
 //! the edge is projected onto the picture and covered with that filter, so a
 //! diagonal still lights its nearest pixel. Dose line plots draw every loaded
 //! session in that session's color. A second chamber uses that color at reduced
@@ -1716,6 +1716,7 @@ impl Plot {
         grid.gantry = mark.gantry;
         grid.unit = mark.unit.clone();
         grid.show_phantom = mark.show_phantom;
+        grid.show_field = true;
         grid.field = mark.field;
         grid.session_colors = mark.session_colors.clone();
         grid.session_focus = mark.session_focus as usize;
@@ -1896,6 +1897,7 @@ impl Plot {
             [atlas_slice, 0.0, 0.0, ct_on]
         };
         let field_on = if plane == 3
+            && grid.show_field
             && grid.field[1] > grid.field[0]
             && grid.field[3] > grid.field[2]
             && grid.field[5] > grid.field[4]
@@ -2035,7 +2037,11 @@ impl Plot {
                             crosshair: false,
                         });
                     }
-                    let lines = field_lines(grid.field, plane, bounds, turns);
+                    let lines = if grid.show_field {
+                        field_lines(grid.field, plane, bounds, turns)
+                    } else {
+                        Vec::new()
+                    };
                     if !lines.is_empty() {
                         extra.push(LiveCloud {
                             panel: index,
@@ -2396,15 +2402,26 @@ impl Plot {
                 }
             }
         }
-        let grid = self.dose.as_mut().unwrap();
-        grid.lo = wash.lo;
-        grid.hi = wash.hi;
-        grid.gain = wash.gain;
-        grid.opacity = wash.opacity;
-        grid.ramp = ramp;
-        grid.mode = wash.mode;
-        grid.filter = wash.filter;
-        grid.unit = unit;
+        let mut field_changed = false;
+        {
+            let grid = self.dose.as_mut().unwrap();
+            grid.lo = wash.lo;
+            grid.hi = wash.hi;
+            grid.gain = wash.gain;
+            grid.opacity = wash.opacity;
+            grid.ramp = ramp;
+            grid.mode = wash.mode;
+            grid.filter = wash.filter;
+            grid.unit = unit;
+            if let Some(text) = spec.get("field").and_then(|value| value.as_str()) {
+                let show = matches!(text, "on" | "On" | "true" | "1");
+                field_changed = grid.show_field != show;
+                grid.show_field = show;
+            }
+        }
+        if field_changed {
+            self.refresh_dose_overlay();
+        }
         wash.level
             .map(scan_kit_core::LevelSpan::json)
             .unwrap_or_default()
@@ -5703,7 +5720,10 @@ fn color_axis_ticks(lo: f32, hi: f32, nbins: i32) -> (Vec<f32>, Vec<f32>, Vec<St
 
 fn tick_row(value: f32, lo: f32, hi: f32, bar: &PlotRect) -> f32 {
     let span = (hi - lo).max(1e-12);
-    (bar.y + (hi - value) / span * bar.h).round()
+    let t = (hi - value) / span;
+    // The 1px tick covers the pixel that shows this value. The bar's last
+    // pixel is one row above bar.y + bar.h, so the bottom tick sits there.
+    (bar.y + t * (bar.h - 1.0).max(0.0)).round()
 }
 
 fn major_tick_length(value: f32, span: f32, labeled: bool) -> f32 {
@@ -9180,6 +9200,35 @@ mod tests {
         assert_eq!(uniform[8][3], 1.0);
         assert_eq!(uniform[8][..3], [1.0, 0.0, 4.0]);
         assert_eq!(uniform[9][..3], [3.0, 2.0, 6.0]);
+        let mut plot = plot;
+        let ptr = plot.dose.as_ref().unwrap().volume.values.as_ptr();
+        plot.paint(r#"{"field":"Off"}"#);
+        assert_eq!(plot.dose.as_ref().unwrap().volume.values.as_ptr(), ptr);
+        assert_eq!(plot.dose_uniform(3, 1.0, 0.0)[8][3], 0.0);
+        for panel in 0..3 {
+            let amber = plot
+                .live
+                .iter()
+                .filter(|cloud| cloud.panel == panel)
+                .any(|cloud| {
+                    cloud.lines.iter().any(|line| {
+                        line.color[0] > 0.9 && line.color[1] > 0.6 && line.color[2] < 0.4
+                    })
+                });
+            assert!(!amber, "panel {panel}");
+        }
+        plot.paint(r#"{"field":"On"}"#);
+        assert_eq!(plot.dose.as_ref().unwrap().volume.values.as_ptr(), ptr);
+        assert_eq!(plot.dose_uniform(3, 1.0, 0.0)[8][3], 1.0);
+        assert_eq!(
+            plot.live
+                .iter()
+                .filter(|cloud| cloud.panel == 0)
+                .flat_map(|cloud| &cloud.lines)
+                .filter(|line| line.color[0] > 0.9 && line.color[1] > 0.6 && line.color[2] < 0.4)
+                .count(),
+            4
+        );
     }
 
     fn box_edges(lo: [f32; 3], hi: [f32; 3]) -> [([f32; 3], [f32; 3]); 12] {
@@ -10490,6 +10539,17 @@ mod tests {
         let layout = plot.layout(160, 160);
         let glyphs = color_axis_glyphs(&plot, &layout[0], 0.0);
         assert!(glyphs.len() > 4, "tick labels");
+        let (_, ticks) = color_axis_quads(&plot, &layout[0], 0.0);
+        let bar = color_bar_rect(&layout[0]);
+        let lowest = ticks
+            .iter()
+            .map(|tick| tick.a[1].max(tick.b[1]))
+            .fold(bar.y, f32::max);
+        assert!(
+            (lowest - (bar.y + bar.h)).abs() < 1e-3,
+            "the bottom tick ends at {lowest}, the bar at {}",
+            bar.y + bar.h
+        );
         assert!(
             glyphs.iter().any(|glyph| glyph.anchor[2] > 0.5),
             "unit title"

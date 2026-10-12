@@ -47,6 +47,8 @@ pub struct DoseGrid {
     pub gantry: f32,
     pub unit: String,
     pub show_phantom: bool,
+    /// The field rectangle stays stored. This hides it without a new cube.
+    pub show_field: bool,
     pub field: [f32; 6],
     /// Selection order. `None` is `volume`.
     pub sessions: Vec<Option<Volume>>,
@@ -140,6 +142,7 @@ pub fn grid_from(
         gantry: 0.0,
         unit: String::new(),
         show_phantom: false,
+        show_field: true,
         field: [0.0; 6],
         sessions: Vec::new(),
         session_colors: Vec::new(),

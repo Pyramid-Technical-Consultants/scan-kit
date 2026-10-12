@@ -463,7 +463,6 @@ pub fn volumetric(
                 .contains(&crate::workspace::PlotKind::Gamma)
                 .then(|| gamma_fields.get(session_at).cloned())
                 .flatten();
-            let show_field = super::marks::flag(options, "field", true);
             let field_dose = if field_from_plan {
                 plans.get(session_at)
             } else {
@@ -497,11 +496,9 @@ pub fn volumetric(
             mark.base_hi = hi;
             mark.gantry = gantry;
             mark.show_phantom = phantom_shown(options);
-            mark.field = if show_field {
-                extent.unwrap_or([0.0; 6])
-            } else {
-                [0.0; 6]
-            };
+            // The bounds switch hides this box on the plot. The extent stays so
+            // that switch does not start another calculation.
+            mark.field = extent.unwrap_or([0.0; 6]);
             mark.unit = volume_unit(quantity, mode, compare).into();
             panels = built;
             if let Some(view) = panels
@@ -649,6 +646,36 @@ pub fn volumetric(
             "Spots", "spots", &spot_note, "Dose",
         ));
     }
+    if has_dose {
+        let mut voxel = range_control(
+            "voxel",
+            "Voxel",
+            0.25,
+            10.0,
+            0.1,
+            &trim_number(voxel_spacing(options)),
+        );
+        voxel.kind = "number".into();
+        for label in ["1", "2", "3"] {
+            voxel
+                .options
+                .push(scan_kit_core::Choice::full("quick", label, "", ""));
+        }
+        controls.push(voxel.grouped("Calculation"));
+        let mut grid = format!(
+            "{} × {} × {}",
+            volume_mark.shape[0], volume_mark.shape[1], volume_mark.shape[2]
+        );
+        if model == "mc" {
+            grid.push_str(" · MC");
+        }
+        controls.push(crate::workspace::readout(
+            "Grid",
+            "grid",
+            &grid,
+            "Calculation",
+        ));
+    }
     controls.push(
         labeled("model", "Model", MODEL, model)
             .grouped("Calculation")
@@ -763,8 +790,6 @@ pub fn volumetric(
         push_picture_controls(
             &mut controls,
             options,
-            &volume_mark,
-            model,
             compare,
             session_ids.len(),
             scale,
@@ -827,8 +852,6 @@ fn session_at(options: &Value, ids: &[String]) -> usize {
 fn push_picture_controls(
     controls: &mut Vec<scan_kit_core::Control>,
     options: &Value,
-    mark: &scan_kit_core::VolumeMark,
-    model: &str,
     compare: &str,
     sessions: usize,
     scale: &str,
@@ -929,24 +952,6 @@ fn push_picture_controls(
         .icons(&["nearest", "linear", "cubic"])
         .grouped("Picture"),
     );
-    let mut voxel = range_control(
-        "voxel",
-        "Voxel",
-        0.25,
-        10.0,
-        0.1,
-        &trim_number(voxel_spacing(options)),
-    );
-    voxel.kind = "number".into();
-    voxel
-        .options
-        .push(scan_kit_core::Choice::full("quick", "1", "", ""));
-    controls.push(voxel.grouped("Picture"));
-    let mut grid = format!("{} × {} × {}", mark.shape[0], mark.shape[1], mark.shape[2]);
-    if model == "mc" {
-        grid.push_str(" · MC");
-    }
-    controls.push(crate::workspace::readout("Grid", "grid", &grid, "Picture"));
     if compare == "gamma" {
         controls.push(
             labeled(
@@ -1903,11 +1908,41 @@ mod tests {
             .find(|control| control.id == "voxel")
             .unwrap();
         assert_eq!(control.kind, "number");
+        assert_eq!(control.group, "Calculation");
         assert_eq!(control.value, "1");
-        assert!(control
-            .options
+        let ids: Vec<&str> = scene
+            .controls
             .iter()
-            .any(|choice| choice.id == "quick" && choice.label == "1"));
+            .map(|control| control.id.as_str())
+            .collect();
+        let voxel_at = ids.iter().position(|id| *id == "voxel").unwrap();
+        let model_at = ids.iter().position(|id| *id == "model").unwrap();
+        assert!(voxel_at < model_at);
+        assert_eq!(
+            scene
+                .controls
+                .iter()
+                .find(|control| control.id == "grid")
+                .map(|control| control.group.as_str()),
+            Some("Calculation")
+        );
+        let hidden = super::volumetric(
+            &root,
+            &["sess".into()],
+            &serde_json::json!({ "field": "Off" }),
+            None,
+        );
+        assert_eq!(scene.volume.field, hidden.volume.field);
+        assert!(scene.volume.field[1] > scene.volume.field[0]);
+        assert_eq!(
+            control
+                .options
+                .iter()
+                .filter(|choice| choice.id == "quick")
+                .map(|choice| choice.label.as_str())
+                .collect::<Vec<_>>(),
+            vec!["1", "2", "3"]
+        );
         assert_eq!(
             scene
                 .controls
