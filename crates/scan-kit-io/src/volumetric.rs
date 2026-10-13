@@ -293,7 +293,12 @@ pub fn volumetric(
     let mut companions = Vec::new();
     let mut plans = Vec::new();
     let mut mc_note = None;
-    for cloud in &clouds {
+    // One transport: the focused session's measured spots. The plan and the
+    // other chamber stay analytic, otherwise the last fill replaces the job and
+    // every cube is that same result.
+    let focus = session_at(options, session_ids);
+    for (index, cloud) in clouds.iter().enumerate() {
+        let runner = if index == focus { mc } else { None };
         let (volume, ran) = fill(
             mat,
             &cloud.pencils,
@@ -306,7 +311,7 @@ pub fn volumetric(
             model,
             histories,
             medium_key,
-            mc,
+            runner,
             grid,
             planes,
         );
@@ -332,7 +337,7 @@ pub fn volumetric(
                 model,
                 histories,
                 medium_key,
-                mc,
+                None,
                 grid,
                 planes,
             );
@@ -350,7 +355,7 @@ pub fn volumetric(
             model,
             histories,
             medium_key,
-            mc,
+            None,
             grid,
             planes,
         );
@@ -1595,6 +1600,11 @@ fn window(volumes: &[Volume], compare: &str) -> (f32, f32) {
     if compare == "gamma" {
         return (0.0, 2.0);
     }
+    // One session is the usual voxel change. `robust_high` already keeps the
+    // positive samples, so copying them into `flat` first walks the cube twice.
+    if volumes.len() == 1 && compare != "difference" {
+        return (0.0, robust_high(&volumes[0].values));
+    }
     let mut flat = Vec::new();
     for volume in volumes {
         if compare == "difference" {
@@ -1682,7 +1692,7 @@ fn trim_num(value: f32) -> String {
 
 #[cfg(test)]
 mod tests {
-    use scan_kit_core::{dose_frame, water, Pencil, Quantity, Volume};
+    use scan_kit_core::{dose_frame, water, McResult, Pencil, Quantity, Volume};
 
     use super::{lattice_planes, next_preview_voxel};
 
@@ -1787,6 +1797,74 @@ mod tests {
             })
             .count();
         assert!(off > 100, "off-plane voxels {off}");
+    }
+
+    #[test]
+    fn monte_carlo_transports_the_measured_spots() {
+        let root = std::env::temp_dir().join(format!(
+            "scan-kit-mc-measured-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let session = root.join("sess");
+        std::fs::create_dir_all(&session).unwrap();
+        std::fs::write(
+            session.join("input_map.csv"),
+            "energy,charge_req,position_x,position_y\n150,0.05,40,0\n",
+        )
+        .unwrap();
+        std::fs::write(
+            session.join("spot_data.csv"),
+            "ic1_total_dose,ic1_x_spot,ic1_y_spot\n0.05,0,0\n",
+        )
+        .unwrap();
+        let xs = std::cell::RefCell::new(Vec::new());
+        let scene = super::volumetric(
+            &root,
+            &["sess".into()],
+            &serde_json::json!({ "model": "mc", "voxel": "4" }),
+            Some(&|job| {
+                let scan_kit_core::McJob::Slab(request) = job else {
+                    return Err("patient job".into());
+                };
+                xs.borrow_mut().push(request.x.clone());
+                let n = request.shape.iter().product();
+                Ok(McResult {
+                    volume: Volume {
+                        origin: request.origin,
+                        shape: request.shape,
+                        voxel: request.voxel_mm,
+                        values: vec![7.0; n],
+                    },
+                    uncertainty: 0.0,
+                    ledger: [0.0; 6],
+                    let_d: Vec::new(),
+                })
+            }),
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        let xs = xs.borrow();
+        assert_eq!(
+            xs.len(),
+            1,
+            "plan and chamber fills must not start a transport"
+        );
+        assert!(
+            xs[0].iter().all(|x| x.abs() < 1.0),
+            "transported x {xs:?}, the plan sits at 40 mm"
+        );
+        assert!(
+            scene
+                .volume
+                .values
+                .iter()
+                .any(|value| (*value - 7.0).abs() < 1e-6),
+            "the picture is not the measured transport"
+        );
     }
 
     #[test]

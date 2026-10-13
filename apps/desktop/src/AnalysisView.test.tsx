@@ -7,7 +7,7 @@ import { AnalysisView } from "./AnalysisView";
 import { PageLoad } from "./page-load";
 import { sessionColor } from "./session-colors";
 
-const { followPlot, paintPlot, plotFrames, plotGate, plotInits, plotRecords } = vi.hoisted(() => {
+const { followPlot, paintPlot, plotFail, plotFrames, plotGate, plotInits, plotRecords } = vi.hoisted(() => {
   let ready: Promise<void> = Promise.resolve();
   let release: () => void = () => {};
   return {
@@ -28,6 +28,7 @@ const { followPlot, paintPlot, plotFrames, plotGate, plotInits, plotRecords } = 
       bytes: number;
       cursor: number[];
     }[],
+    plotFail: { at: 0, loads: 0 },
     plotGate: {
       wait: () => ready,
       hold: () => {
@@ -243,6 +244,10 @@ vi.mock("@/wasm/scan_kit_plot.js", () => ({
         load: (bytes: Uint8Array) => {
           record.loads += 1;
           record.bytes = bytes.byteLength;
+          plotFail.loads += 1;
+          if (plotFail.at > 0 && plotFail.loads >= plotFail.at) {
+            throw new Error("plot lines are not in the previous picture");
+          }
         },
         render: () => {
           record.renders += 1;
@@ -284,6 +289,8 @@ afterEach(() => {
   followPlot.mockClear();
   paintPlot.mockClear();
   plotRecords.splice(0);
+  plotFail.at = 0;
+  plotFail.loads = 0;
   plotFrames.mockReset();
   plotFrames.mockReturnValue("[]");
   plotGate.reset();
@@ -907,6 +914,268 @@ it("shows the progress bar as soon as the model changes", async () => {
   await act(async () => {
     await new Promise((resolve) => setTimeout(resolve, 200));
   });
+});
+
+it("keeps the replacement calculation when an older start finishes late", async () => {
+  const host = document.createElement("div");
+  document.body.append(host);
+  const invokeMock = vi.mocked(invoke);
+  const original = invokeMock.getMockImplementation();
+  const waiters: Array<() => void> = [];
+  try {
+    await act(() => {
+      root = createRoot(host);
+      root.render(
+        <AnalysisView
+          viewId="volumetric"
+          folder="C:/data"
+          sessions={[{ id: "a", note: "" }]}
+          onBack={() => undefined}
+          onOpenView={() => undefined}
+        />,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 200));
+    });
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === "scan_kit_cancel") {
+        return null;
+      }
+      if (command === "scan_kit_start") {
+        await new Promise<void>((resolve) => {
+          waiters.push(resolve);
+        });
+        return { task: 7, generation: 1 };
+      }
+      if (command === "scan_kit_poll") {
+        const report = {
+          task: 7,
+          generation: 1,
+          phase: "done",
+          done: 1,
+          total: 1,
+          note: "",
+          finished: true,
+        };
+        const json = new TextEncoder().encode(JSON.stringify(report));
+        const out = new Uint8Array(4 + json.length);
+        new DataView(out.buffer).setUint32(0, json.length, true);
+        out.set(json, 4);
+        return out;
+      }
+      return original?.call(invokeMock, command);
+    });
+    invokeMock.mockClear();
+    const monteCarlo = [...host.querySelectorAll("button")].find((node) =>
+      node.textContent?.includes("Monte Carlo"),
+    );
+    const histories = [...host.querySelectorAll("button")].find((node) => node.textContent === "5e7");
+    await act(async () => {
+      monteCarlo?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 200));
+    });
+    await act(async () => {
+      histories?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 200));
+    });
+    expect(waiters).toHaveLength(2);
+    await act(async () => {
+      waiters[0]?.();
+      waiters[1]?.();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    const cancels = invokeMock.mock.calls.filter(([name]) => name === "scan_kit_cancel");
+    expect(cancels).toEqual([]);
+    expect(invokeMock.mock.calls.some(([name]) => name === "scan_kit_poll")).toBe(true);
+  } finally {
+    if (original != null) {
+      invokeMock.mockImplementation(original);
+    }
+  }
+});
+
+it("does not queue another calculation for the choice already showing", async () => {
+  const host = document.createElement("div");
+  document.body.append(host);
+  await act(() => {
+    root = createRoot(host);
+    root.render(
+      <AnalysisView
+        viewId="volumetric"
+        folder="C:/data"
+        sessions={[{ id: "a", note: "" }]}
+        onBack={() => undefined}
+        onOpenView={() => undefined}
+      />,
+    );
+  });
+  await act(async () => {
+    await new Promise((resolve) => setTimeout(resolve, 200));
+  });
+  const starts = () => vi.mocked(invoke).mock.calls.filter(([name]) => name === "scan_kit_start").length;
+  const before = starts();
+  expect(before).toBeGreaterThan(0);
+  const analytic = [...host.querySelectorAll("button")].find((node) =>
+    node.textContent?.includes("Analytic"),
+  );
+  expect(analytic).toBeTruthy();
+  await act(async () => {
+    analytic?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    await new Promise((resolve) => setTimeout(resolve, 400));
+  });
+  expect(starts()).toBe(before);
+});
+
+it("stops the dose bar on the first picture instead of queuing another load", async () => {
+  const invokeMock = vi.mocked(invoke);
+  const original = invokeMock.getMockImplementation();
+  let polls = 0;
+  invokeMock.mockImplementation(async (command: string) => {
+    if (command === "scan_kit_cancel") {
+      return null;
+    }
+    if (command === "scan_kit_start") {
+      return { task: 1, generation: 1 };
+    }
+    if (command !== "scan_kit_poll") {
+      throw new Error(command);
+    }
+    polls += 1;
+    const finished = polls > 1;
+    const report = {
+      task: 1,
+      generation: 1,
+      phase: finished ? "done" : "preview",
+      done: finished ? 4 : 1,
+      total: 4,
+      note: "",
+      finished,
+    };
+    const header = {
+      title: "Volumetric",
+      controls: [],
+      table: null,
+      samples: [],
+      panels: [{}],
+      line_token: "9",
+    };
+    const body = new TextEncoder().encode(JSON.stringify(header));
+    const reportBytes = new TextEncoder().encode(JSON.stringify(report));
+    const out = new Uint8Array(4 + reportBytes.length + (finished ? 0 : body.length));
+    new DataView(out.buffer).setUint32(0, reportBytes.length, true);
+    out.set(reportBytes, 4);
+    if (!finished) {
+      out.set(body, 4 + reportBytes.length);
+    }
+    return out;
+  });
+  const host = document.createElement("div");
+  document.body.append(host);
+  try {
+    await act(() => {
+      root = createRoot(host);
+      root.render(
+        <PageLoad>
+          <AnalysisView
+            viewId="volumetric"
+            folder="C:/data"
+            sessions={[{ id: "a", note: "" }]}
+            onBack={() => undefined}
+            onOpenView={() => undefined}
+          />
+        </PageLoad>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    });
+    expect(host.querySelector(".fixed.inset-x-0")).toBeNull();
+    const starts = () => invokeMock.mock.calls.filter(([name]) => name === "scan_kit_start").length;
+    const settled = starts();
+    expect(settled).toBe(1);
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 400));
+    });
+    expect(starts()).toBe(settled);
+  } finally {
+    if (original != null) {
+      invokeMock.mockImplementation(original);
+    }
+  }
+});
+
+it("asks once for missing plot lines and then lets the bar settle", async () => {
+  const restore = canvasBox(400, 300);
+  plotFail.at = 2;
+  const invokeMock = vi.mocked(invoke);
+  const original = invokeMock.getMockImplementation();
+  invokeMock.mockImplementation(async (command: string) => {
+    if (command === "scan_kit_cancel") {
+      return null;
+    }
+    if (command === "scan_kit_start") {
+      return { task: 1, generation: 1 };
+    }
+    if (command !== "scan_kit_poll") {
+      throw new Error(command);
+    }
+    const header = {
+      title: "Volumetric",
+      controls: [],
+      table: null,
+      samples: [],
+      panels: [{}],
+      line_token: "4",
+    };
+    const json = new TextEncoder().encode(JSON.stringify(header));
+    const bytes = new Uint8Array(4 + json.length);
+    new DataView(bytes.buffer).setUint32(0, json.length, true);
+    bytes.set(json, 4);
+    return pollFrame(bytes);
+  });
+  const host = document.createElement("div");
+  document.body.append(host);
+  try {
+    await act(() => {
+      root = createRoot(host);
+      root.render(
+        <AnalysisView
+          viewId="volumetric"
+          folder="C:/data"
+          sessions={[{ id: "a", note: "" }]}
+          onBack={() => undefined}
+          onOpenView={() => undefined}
+        />,
+      );
+    });
+    const starts = () => invokeMock.mock.calls.filter(([name]) => name === "scan_kit_start").length;
+    await act(async () => {
+      for (let i = 0; i < 40 && plotFail.loads < 2; i += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 400));
+    });
+    expect(plotFail.loads).toBeGreaterThan(1);
+    const settled = starts();
+    expect(settled).toBeGreaterThan(0);
+    expect(settled).toBeLessThanOrEqual(2);
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 800));
+    });
+    expect(starts()).toBe(settled);
+  } finally {
+    restore();
+    if (original != null) {
+      invokeMock.mockImplementation(original);
+    }
+  }
 });
 
 it("changes color gain without rebuilding the dose", async () => {

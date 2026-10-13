@@ -18,8 +18,8 @@ pub use kernel::{bragg_idd, csda_range_mm, protons_from_mu, through_wet};
 pub use paint::{painted_unit, trim_number, wash_of, LevelSpan, PaintChoice, Wash};
 pub use ray::{
     brick_grid, dose_film_open, dose_film_uv, film_height, gantry_extent, line_scale, ray_rgba,
-    ray_value, raymarch, sample_index, sample_mm, scan_volume, view_ray_scale, RayView, VolumeScan,
-    BRICK, FOV_Y,
+    ray_value, raymarch, sample_index, sample_mm, scan_grid, scan_volume, view_ray_scale, RayView,
+    VolumeScan, BRICK, FOV_Y,
 };
 
 pub(super) const K_BETHE: f64 = 0.307075;
@@ -227,20 +227,20 @@ impl Volume {
 
     pub fn peak_index(&self) -> (usize, usize, usize) {
         let [nx, ny, nz] = self.shape;
+        if nx == 0 || ny == 0 || nz == 0 {
+            return (0, 0, 0);
+        }
         let mut best = 0.0f32;
-        let mut at = (0, 0, 0);
-        for z in 0..nz {
-            for y in 0..ny {
-                for x in 0..nx {
-                    let v = self.get(x, y, z);
-                    if v > best {
-                        best = v;
-                        at = (x, y, z);
-                    }
-                }
+        let mut at = 0usize;
+        for (index, value) in self.values[..nx * ny * nz].iter().copied().enumerate() {
+            if value > best {
+                best = value;
+                at = index;
             }
         }
-        at
+        let x = at % nx;
+        let plane = at / nx;
+        (x, plane % ny, plane / ny)
     }
 
     pub fn axial(&self, z: usize) -> Vec<f32> {

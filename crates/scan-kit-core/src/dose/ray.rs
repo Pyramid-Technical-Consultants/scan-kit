@@ -73,8 +73,12 @@ pub fn line_scale(volume: &Volume) -> f32 {
 }
 
 pub fn scan_volume(volume: &Volume) -> VolumeScan {
-    let [nx, ny, nz] = volume.shape;
-    let voxel = volume.voxel.max(1e-6);
+    scan_grid(&volume.values, volume.shape, volume.voxel)
+}
+
+pub fn scan_grid(values: &[f32], shape: [usize; 3], voxel: f32) -> VolumeScan {
+    let [nx, ny, nz] = shape;
+    let voxel = voxel.max(1e-6);
     let brick_shape = [
         nx.div_ceil(BRICK).max(1),
         ny.div_ceil(BRICK).max(1),
@@ -90,7 +94,6 @@ pub fn scan_volume(volume: &Volume) -> VolumeScan {
     let mut peak = 0.0f32;
     let mut abs_peak = 0.0f32;
     let mut peak_at = [0usize; 3];
-    let values = &volume.values;
     if nx > 0 && ny > 0 && nz > 0 && values.len() >= nx * ny * nz {
         for z in 0..nz {
             for y in 0..ny {

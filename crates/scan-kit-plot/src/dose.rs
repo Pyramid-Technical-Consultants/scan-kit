@@ -6,7 +6,7 @@
 //! `0.5 + 0.5 * dose/span` (zero at mid-grey). G is the CT window, B is 1 when
 //! a CT sample is present.
 
-use scan_kit_core::{index, robust_high, sample, scan_volume, Volume};
+use scan_kit_core::{index, robust_high, sample, scan_volume, Volume, BRICK};
 #[cfg(not(target_arch = "wasm32"))]
 use scan_kit_core::{ray_rgba, RayView};
 
@@ -77,6 +77,23 @@ pub struct ViewSample {
     pub center: [f32; 3],
 }
 
+fn scan_fits(scan: &scan_kit_core::VolumeScan, shape: [usize; 3]) -> bool {
+    let [nx, ny, nz] = shape;
+    let expect = [
+        nx.div_ceil(BRICK).max(1),
+        ny.div_ceil(BRICK).max(1),
+        nz.div_ceil(BRICK).max(1),
+    ];
+    let bricks = expect[0]
+        .saturating_mul(expect[1])
+        .saturating_mul(expect[2]);
+    scan.brick_shape == expect
+        && scan.bricks.len() == bricks
+        && scan.integrals[0].len() == nx.saturating_mul(ny)
+        && scan.integrals[1].len() == nx.saturating_mul(nz)
+        && scan.integrals[2].len() == ny.saturating_mul(nz)
+}
+
 pub fn grid_from(
     values: Vec<f32>,
     ct: Vec<f32>,
@@ -91,6 +108,7 @@ pub fn grid_from(
     opacity: f32,
     mode: u8,
     filter: u8,
+    scan: Option<scan_kit_core::VolumeScan>,
 ) -> Option<DoseGrid> {
     let shape_us = [shape[0] as usize, shape[1] as usize, shape[2] as usize];
     let n = shape_us[0] * shape_us[1] * shape_us[2];
@@ -105,7 +123,10 @@ pub fn grid_from(
         voxel: voxel.max(1e-3),
         values,
     };
-    let scan = scan_volume(&volume);
+    let scan = match scan {
+        Some(scan) if scan_fits(&scan, shape_us) => scan,
+        _ => scan_volume(&volume),
+    };
     let span = scan.abs_peak.max(1e-6);
     Some(DoseGrid {
         atlas_shape: fit_shape(shape_us),
@@ -117,12 +138,16 @@ pub fn grid_from(
         integrals: scan.integrals,
         integral_peaks: scan.integral_peaks,
         ct: if ct.len() >= n {
-            ct[..n].to_vec()
+            let mut ct = ct;
+            ct.truncate(n);
+            ct
         } else {
             Vec::new()
         },
         labels: if labels.len() >= n {
-            labels[..n].to_vec()
+            let mut labels = labels;
+            labels.truncate(n);
+            labels
         } else {
             Vec::new()
         },
@@ -771,6 +796,7 @@ mod tests {
             1.0,
             0,
             0,
+            None,
         )
         .unwrap();
         let (pixels, width, height) = atlas_bytes(&grid);
@@ -798,6 +824,7 @@ mod tests {
             1.0,
             0,
             0,
+            None,
         )
         .unwrap();
         let (signed, signed_width, _) = atlas_bytes(&cold);
@@ -843,6 +870,7 @@ mod tests {
             1.0,
             0,
             0,
+            None,
         )
         .unwrap();
         let view = ViewSample {
@@ -902,6 +930,7 @@ mod tests {
             1.0,
             0,
             0,
+            None,
         )
         .unwrap();
         let (lo, hi) = integral_limits(&grid, 0);

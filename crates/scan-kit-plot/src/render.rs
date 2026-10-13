@@ -1687,15 +1687,19 @@ impl Plot {
             background,
             foreground,
         );
-        plot.attach_volume(&scene.volume);
+        plot.attach_volume(scene.volume.clone(), None);
         plot
     }
 
-    pub(crate) fn attach_volume(&mut self, mark: &scan_kit_core::VolumeMark) {
+    pub(crate) fn attach_volume(
+        &mut self,
+        mark: scan_kit_core::VolumeMark,
+        scan: Option<scan_kit_core::VolumeScan>,
+    ) {
         let Some(mut grid) = crate::dose::grid_from(
-            mark.values.clone(),
-            mark.ct.clone(),
-            mark.labels.clone(),
+            mark.values,
+            mark.ct,
+            mark.labels,
             mark.shape,
             mark.origin,
             mark.voxel,
@@ -1710,19 +1714,20 @@ impl Plot {
             },
             mark.mode,
             mark.filter,
+            scan,
         ) else {
             return;
         };
         grid.gantry = mark.gantry;
-        grid.unit = mark.unit.clone();
+        grid.unit = mark.unit;
         grid.show_phantom = mark.show_phantom;
         grid.show_field = true;
         grid.field = mark.field;
-        grid.session_colors = mark.session_colors.clone();
+        grid.session_colors = mark.session_colors;
         grid.session_focus = mark.session_focus as usize;
-        grid.sessions = mark.sessions.iter().map(session_volume).collect();
-        grid.companions = mark.companions.iter().map(session_volume).collect();
-        grid.plans = mark.plans.iter().map(session_volume).collect();
+        grid.sessions = mark.sessions.into_iter().map(session_volume).collect();
+        grid.companions = mark.companions.into_iter().map(session_volume).collect();
+        grid.plans = mark.plans.into_iter().map(session_volume).collect();
         crate::dose::remember_window(&mut grid, mark.base_lo, mark.base_hi);
         let (pixels, cols, rows) = crate::dose::atlas_bytes(&grid);
         let atlas = self.marks.heatmaps.len();
@@ -6734,7 +6739,7 @@ fn structure_color(id: u8) -> [f32; 4] {
     INK[(id as usize).saturating_sub(1) % INK.len()]
 }
 
-fn session_volume(dose: &scan_kit_core::SessionDose) -> Option<scan_kit_core::Volume> {
+fn session_volume(dose: scan_kit_core::SessionDose) -> Option<scan_kit_core::Volume> {
     if dose.values.is_empty() {
         return None;
     }
@@ -6747,7 +6752,7 @@ fn session_volume(dose: &scan_kit_core::SessionDose) -> Option<scan_kit_core::Vo
     if n == 0 || dose.values.len() < n {
         return None;
     }
-    let mut values = dose.values.clone();
+    let mut values = dose.values;
     values.truncate(n);
     Some(scan_kit_core::Volume {
         origin: dose.origin,
@@ -8173,15 +8178,18 @@ fn upload_dose_f16(
     let stride = ((width * 2) as u32).next_multiple_of(256);
     let mut padded = vec![0u8; stride as usize * height * depth];
     if shape[0] > 0 && shape[1] > 0 && shape[2] > 0 {
-        for z in 0..nz.min(shape[2]) {
-            for y in 0..ny.min(shape[1]) {
-                let src = nx.min(shape[0]) * (y + shape[1] * z);
-                let row = ((z + 2) * height + (y + 2)) * stride as usize;
-                for x in 0..nx.min(shape[0]) {
-                    let bits = f32_to_f16(values.get(src + x).copied().unwrap_or(0.0));
-                    let at = row + (x + 2) * 2;
-                    padded[at..at + 2].copy_from_slice(&bits.to_le_bytes());
+        for z in 0..nz {
+            for y in 0..ny {
+                let src = nx * (y + ny * z);
+                if src >= values.len() {
+                    continue;
                 }
+                let count = nx.min(values.len() - src);
+                let row_at = ((z + 2) * height + (y + 2)) * stride as usize + 4;
+                write_f16_row(
+                    &values[src..src + count],
+                    &mut padded[row_at..row_at + count * 2],
+                );
             }
         }
     }
@@ -8207,6 +8215,15 @@ fn upload_dose_f16(
     Ok(texture)
 }
 
+#[inline(always)]
+fn write_f16_row(src: &[f32], dst: &mut [u8]) {
+    let (slots, _) = dst.as_chunks_mut::<2>();
+    for (slot, value) in slots.iter_mut().zip(src) {
+        *slot = f32_to_f16(*value).to_le_bytes();
+    }
+}
+
+#[inline(always)]
 fn f32_to_f16(value: f32) -> u16 {
     let bits = value.to_bits();
     let sign = ((bits >> 16) & 0x8000) as u16;
@@ -11990,6 +12007,7 @@ mod tests {
                 1.0,
                 0,
                 1,
+                None,
             )
             .unwrap();
             eprintln!(

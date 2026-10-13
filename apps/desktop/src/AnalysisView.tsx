@@ -389,6 +389,9 @@ export function AnalysisView({
   const [plotEpoch, setPlotEpoch] = useState(0);
   const lineToken = useRef("");
   const nextToken = useRef("");
+  // One missing-line retry per picture. A later failure must not start another calculation.
+  const lineGaveUp = useRef(false);
+  const askedLines = useRef(false);
   const [lineEpoch, setLineEpoch] = useState(0);
   const [plotHost, setPlotHost] = useState(0);
   const grains = useRef<GrainMemory>({});
@@ -556,9 +559,12 @@ export function AnalysisView({
       payload.current = null;
       return { painted, stop: false };
     } catch (reason) {
-      // The picture kept its lines, but this payload left them out. Ask again
-      // with the full traces.
-      if (lineToken.current !== "") {
+      // The picture kept its lines, but this payload left them out. Ask once
+      // for the full traces. Asking again queues another calculation forever.
+      const missing = messageOf(reason).includes("plot lines are not in the previous picture");
+      if (missing && lineToken.current !== "" && !lineGaveUp.current) {
+        lineGaveUp.current = true;
+        askedLines.current = true;
         lineToken.current = "";
         nextToken.current = "";
         setLineEpoch((epoch) => epoch + 1);
@@ -660,21 +666,24 @@ export function AnalysisView({
   const orderKey = sessions.map((session) => session.id).join("\0");
   const hiddenKey = hidden.join("\0");
   const sceneKey = viewId === "volumetric" ? JSON.stringify(sceneOptions(options)) : options;
-  const requestKey = JSON.stringify([
+  const pictureKey = JSON.stringify([
     viewId,
     folder,
     orderKey,
     hiddenKey,
     sceneKey,
     studyPath ?? "",
-    lineEpoch,
     plotHost,
   ]);
+  const requestKey = JSON.stringify([pictureKey, lineEpoch]);
   const loading = arrivedKey !== requestKey || opening;
   usePageLoad(loading, taskReport?.done ?? 0, taskReport?.total ?? 0);
   useEffect(() => {
     optionsRef.current = options;
   }, [options]);
+  useEffect(() => {
+    lineGaveUp.current = false;
+  }, [pictureKey]);
   useEffect(() => {
     const mine = hold.current + 1;
     hold.current = mine;
@@ -719,10 +728,19 @@ export function AnalysisView({
           palette: palette(order, shown),
         });
         if (stop || openSeq.current !== ticket) {
-          await invoke("scan_kit_cancel", { task: started.task });
+          const id = started.task;
+          // The replacement start may already have retargeted this same task.
+          // Cancelling now would drop that calculation and leave the bar idle.
+          queueMicrotask(() => {
+            if (taskId.current === id) {
+              return;
+            }
+            void invoke("scan_kit_cancel", { task: id });
+          });
           return;
         }
         taskId.current = started.task;
+        let misses = 0;
         for (;;) {
           if (stop || openSeq.current !== ticket) {
             return;
@@ -733,20 +751,31 @@ export function AnalysisView({
           }
           const parsed = parsePoll(bytesOf(raw));
           if (!acceptReport(parsed.report, started.task, started.generation)) {
-            continue;
+            // A removed task comes back under another generation. Polling it
+            // again fills memory and the bar never settles.
+            misses += 1;
+            if (!parsed.report.finished && misses < 8) {
+              await new Promise((resolve) => window.setTimeout(resolve, 40));
+              continue;
+            }
+            if (openSeq.current === ticket) {
+              setTaskReport(null);
+              setArrivedKey(requestKey);
+              setSettled((count) => count + 1);
+            }
+            return;
           }
-          setTaskReport(parsed.report.finished ? null : parsed.report);
-          if (parsed.report.finished && openSeq.current === ticket) {
-            setArrivedKey(requestKey);
-            setSettled((count) => count + 1);
-          }
+          misses = 0;
+          let showed = false;
           if (parsed.payload != null) {
             setPlotError(null);
             const parsedHeader = plotHeader(parsed.payload);
             nextToken.current = parsedHeader.lineToken;
             if (parsedHeader.panels.length > 0) {
               payload.current = parsed.payload;
+              askedLines.current = false;
               const header = applyLevelPaint(parsedHeader, loadPayload()) ?? parsedHeader;
+              showed = !askedLines.current;
               const chosen = shownHeader(metaRef.current, header);
               if (chosen !== metaRef.current) {
                 metaRef.current = chosen;
@@ -767,6 +796,26 @@ export function AnalysisView({
               }
             }
           }
+          // A dose preview is the picture for this request. Later sharpening
+          // must not keep the bar up as if another calculation were queued.
+          const pictured = viewId === "volumetric" && showed;
+          if ((parsed.report.finished || pictured) && openSeq.current === ticket) {
+            setTaskReport(null);
+            setArrivedKey(requestKey);
+            if (parsed.report.finished) {
+              setSettled((count) => count + 1);
+            }
+          } else if (!parsed.report.finished) {
+            setTaskReport((current) =>
+              current != null &&
+              current.done === parsed.report.done &&
+              current.total === parsed.report.total &&
+              current.phase === parsed.report.phase &&
+              current.note === parsed.report.note
+                ? current
+                : parsed.report,
+            );
+          }
           if (parsed.report.finished) {
             if (parsed.report.phase === "failed") {
               const message = parsed.report.note.length > 0 ? parsed.report.note : "The plot failed.";
@@ -775,6 +824,7 @@ export function AnalysisView({
             }
             return;
           }
+          await new Promise((resolve) => window.setTimeout(resolve, parsed.payload == null ? 40 : 0));
         }
       })().catch((reason: unknown) => {
         if (openSeq.current === ticket) {
@@ -948,6 +998,12 @@ export function AnalysisView({
     (section) => viewId !== "volumetric" || (section.title !== "Cell" && section.title !== "Plot"),
   );
   const apply = (id: string, value: string) => {
+    const held = optionsRef.current[id];
+    // The control echoes the value already on screen when its header arrives.
+    // Writing that back starts the calculation again.
+    if (held === value || (held == null && resolved[id] === value)) {
+      return;
+    }
     const next = applyOption(optionsRef.current, resolved, grains.current, id, value);
     optionsRef.current = next;
     setOptions(next);
@@ -1016,9 +1072,10 @@ export function AnalysisView({
             aria-label={label}
             onValueChange={(next) => {
               const level = Array.isArray(next) ? next[0] : next;
-              if (typeof level === "number") {
-                apply(slot.id, String(level));
+              if (typeof level !== "number" || Math.abs(level - current) <= 1e-4) {
+                return;
               }
+              apply(slot.id, String(level));
             }}
           />
         </Field>

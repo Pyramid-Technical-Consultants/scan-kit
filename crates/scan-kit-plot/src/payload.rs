@@ -214,6 +214,20 @@ pub fn encode_plot_reusing(
         if !scene.volume.labels.is_empty() {
             out.extend_from_slice(&scene.volume.labels[..voxels.min(scene.volume.labels.len())]);
         }
+        let shape = [
+            scene.volume.shape[0] as usize,
+            scene.volume.shape[1] as usize,
+            scene.volume.shape[2] as usize,
+        ];
+        // The view would otherwise scan this cube again on the UI thread.
+        write_scan(
+            &mut out,
+            &scan_kit_core::scan_grid(
+                &scene.volume.values[..voxels],
+                shape,
+                scene.volume.voxel.max(1e-3),
+            ),
+        );
     }
     for session in scene
         .volume
@@ -245,10 +259,7 @@ fn read_sessions(
         ];
         let voxel = f32::from_le_bytes(reader.take(4)?.try_into().unwrap());
         let n = u32::from_le_bytes(reader.take(4)?.try_into().unwrap()) as usize;
-        let mut values = Vec::with_capacity(n);
-        for _ in 0..n {
-            values.push(f32::from_le_bytes(reader.take(4)?.try_into().unwrap()));
-        }
+        let values = read_f32s(reader, n)?;
         doses.push(scan_kit_core::SessionDose {
             values,
             shape,
@@ -270,6 +281,102 @@ fn write_session(out: &mut Vec<u8>, session: &scan_kit_core::SessionDose) {
     let count = session.values.len() as u32;
     out.extend_from_slice(&count.to_le_bytes());
     write_f32s(out, &session.values);
+}
+
+fn read_f32s(reader: &mut Reader<'_>, count: usize) -> Result<Vec<f32>, String> {
+    let bytes = count.checked_mul(4).ok_or("plot payload is truncated")?;
+    let raw = reader.take(bytes)?;
+    #[cfg(target_endian = "little")]
+    {
+        let mut values = vec![0.0f32; count];
+        if count > 0 {
+            // SAFETY: `raw` is `count * 4` bytes. `f32` is 4 bytes with no padding,
+            // and this host is little-endian, which is the order `write_f32s`
+            // stored. The JSON header can leave `raw` unaligned, so the bytes are
+            // copied into the aligned `values` allocation instead of being cast.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    raw.as_ptr(),
+                    values.as_mut_ptr().cast::<u8>(),
+                    bytes,
+                );
+            }
+        }
+        Ok(values)
+    }
+    #[cfg(target_endian = "big")]
+    {
+        let mut values = Vec::with_capacity(count);
+        for chunk in raw.chunks_exact(4) {
+            values.push(f32::from_le_bytes(chunk.try_into().unwrap()));
+        }
+        Ok(values)
+    }
+}
+
+fn write_scan(out: &mut Vec<u8>, scan: &scan_kit_core::VolumeScan) {
+    for value in scan.brick_shape {
+        out.extend_from_slice(&(value as u32).to_le_bytes());
+    }
+    for value in scan.peak_at {
+        out.extend_from_slice(&(value as u32).to_le_bytes());
+    }
+    for value in [scan.line_scale, scan.peak, scan.abs_peak] {
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+    for value in scan.integral_peaks {
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+    write_f32s(out, &scan.bricks);
+    for plane in &scan.integrals {
+        write_f32s(out, plane);
+    }
+}
+
+fn read_scan(
+    reader: &mut Reader<'_>,
+    shape: [usize; 3],
+) -> Result<scan_kit_core::VolumeScan, String> {
+    let brick_shape = [
+        read_u32(reader)? as usize,
+        read_u32(reader)? as usize,
+        read_u32(reader)? as usize,
+    ];
+    let peak_at = [
+        read_u32(reader)? as usize,
+        read_u32(reader)? as usize,
+        read_u32(reader)? as usize,
+    ];
+    let line_scale = read_f32(reader)?;
+    let peak = read_f32(reader)?;
+    let abs_peak = read_f32(reader)?;
+    let integral_peaks = [read_f32(reader)?, read_f32(reader)?, read_f32(reader)?];
+    let [nx, ny, nz] = shape;
+    let bricks = brick_shape[0]
+        .saturating_mul(brick_shape[1])
+        .saturating_mul(brick_shape[2]);
+    Ok(scan_kit_core::VolumeScan {
+        bricks: read_f32s(reader, bricks)?,
+        brick_shape,
+        line_scale,
+        peak,
+        abs_peak,
+        peak_at,
+        integrals: [
+            read_f32s(reader, nx.saturating_mul(ny))?,
+            read_f32s(reader, nx.saturating_mul(nz))?,
+            read_f32s(reader, ny.saturating_mul(nz))?,
+        ],
+        integral_peaks,
+    })
+}
+
+fn read_u32(reader: &mut Reader<'_>) -> Result<u32, String> {
+    Ok(u32::from_le_bytes(reader.take(4)?.try_into().unwrap()))
+}
+
+fn read_f32(reader: &mut Reader<'_>) -> Result<f32, String> {
+    Ok(f32::from_le_bytes(reader.take(4)?.try_into().unwrap()))
 }
 
 fn write_f32s(out: &mut Vec<u8>, values: &[f32]) {
@@ -294,7 +401,7 @@ fn write_f32s(out: &mut Vec<u8>, values: &[f32]) {
 }
 
 pub fn plot_header(bytes: &[u8]) -> Result<PlotHeader, String> {
-    decode_plot(bytes).map(|(header, _, _, _)| header)
+    decode_plot(bytes).map(|(header, _, _, _, _)| header)
 }
 
 /// GPU bytes already packed by [`encode_plot_quality`]. Uploading these skips a
@@ -307,7 +414,16 @@ pub(crate) struct EncodedMarks {
 
 pub(crate) fn decode_plot(
     bytes: &[u8],
-) -> Result<(PlotHeader, Marks, EncodedMarks, VolumeMark), String> {
+) -> Result<
+    (
+        PlotHeader,
+        Marks,
+        EncodedMarks,
+        VolumeMark,
+        Option<scan_kit_core::VolumeScan>,
+    ),
+    String,
+> {
     let mut reader = Reader { bytes, at: 0 };
     let json_len = u32::from_le_bytes(reader.take(4)?.try_into().unwrap()) as usize;
     let header: PlotHeader =
@@ -364,24 +480,23 @@ pub(crate) fn decode_plot(
         session_focus: header.volume_session_focus,
         ..VolumeMark::default()
     };
+    let mut scan = None;
     if voxels > 0 {
-        let mut values = Vec::with_capacity(voxels);
-        for _ in 0..voxels {
-            let bytes = reader.take(4)?;
-            values.push(f32::from_le_bytes(bytes.try_into().unwrap()));
-        }
-        volume.values = values;
+        volume.values = read_f32s(&mut reader, voxels)?;
         if header.volume_ct {
-            let mut ct = Vec::with_capacity(voxels);
-            for _ in 0..voxels {
-                let bytes = reader.take(4)?;
-                ct.push(f32::from_le_bytes(bytes.try_into().unwrap()));
-            }
-            volume.ct = ct;
+            volume.ct = read_f32s(&mut reader, voxels)?;
         }
         if header.volume_labels {
             volume.labels = reader.take(voxels)?.to_vec();
         }
+        scan = Some(read_scan(
+            &mut reader,
+            [
+                header.volume_shape[0] as usize,
+                header.volume_shape[1] as usize,
+                header.volume_shape[2] as usize,
+            ],
+        )?);
     }
     volume.sessions = read_sessions(&mut reader, header.volume_sessions)?;
     volume.plans = read_sessions(&mut reader, header.volume_plans)?;
@@ -395,12 +510,13 @@ pub(crate) fn decode_plot(
             quads: quad_bytes,
         },
         volume,
+        scan,
     ))
 }
 
 impl Plot {
     pub fn from_payload(bytes: &[u8]) -> Result<Self, String> {
-        let (header, marks, encoded, volume) = decode_plot(bytes)?;
+        let (header, marks, encoded, volume, scan) = decode_plot(bytes)?;
         let mut plot = Self::from_parts(
             header.panels,
             header.columns,
@@ -413,7 +529,7 @@ impl Plot {
             header.foreground,
         );
         plot.encoded = Some(encoded);
-        plot.attach_volume(&volume);
+        plot.attach_volume(volume, scan);
         plot.carry_lines(
             header.line_token.parse::<u64>().unwrap_or(0),
             header.reuse_lines,
@@ -507,7 +623,7 @@ mod tests {
             volume: scan_kit_core::VolumeMark::default(),
         };
         let bytes = encode_plot(&scene, [0.1, 0.1, 0.1, 1.0], [0.9, 0.9, 0.9, 1.0]).unwrap();
-        let (header, marks, _, _) = decode_plot(&bytes).unwrap();
+        let (header, marks, _, _, _) = decode_plot(&bytes).unwrap();
         assert_eq!(marks, build_marks(&scene.panels));
         assert_eq!(header.panels, header_panels(&scene.panels));
         assert_eq!(header.column_weights, vec![2.0, 1.0]);
@@ -557,6 +673,8 @@ mod tests {
             },
         };
         scene.volume.gain = 1.0;
+        scene.volume.ct = vec![12.0];
+        scene.volume.labels = vec![3];
         scene.volume.session_colors = vec![[0.2, 0.3, 0.8, 1.0]];
         scene.volume.session_focus = 1;
         scene.volume.sessions = vec![scan_kit_core::SessionDose {
@@ -578,7 +696,12 @@ mod tests {
             voxel: 1.0,
         }];
         let bytes = encode_plot(&scene, [0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0, 1.0]).unwrap();
-        let (_, _, _, volume) = decode_plot(&bytes).unwrap();
+        let (_, _, _, volume, scan) = decode_plot(&bytes).unwrap();
+        let fresh = scan_kit_core::scan_grid(&volume.values, [1, 1, 1], volume.voxel.max(1e-3));
+        let scan = scan.expect("a dose cube ships its scan");
+        assert_eq!(scan.peak_at, fresh.peak_at);
+        assert_eq!(scan.bricks, fresh.bricks);
+        assert_eq!(scan.integrals, fresh.integrals);
         assert!((volume.gantry - 90.0).abs() < 1e-4);
         assert_eq!(volume.session_focus, 1);
         assert_eq!(volume.session_colors, vec![[0.2, 0.3, 0.8, 1.0]]);
@@ -593,13 +716,15 @@ mod tests {
         assert!((volume.base_hi - 4.0).abs() < 1e-4);
         assert!((volume.hi - 1.5).abs() < 1e-4);
         assert_eq!(volume.values, vec![1.0]);
+        assert_eq!(volume.ct, vec![12.0]);
+        assert_eq!(volume.labels, vec![3]);
     }
 
     #[test]
     fn a_settled_playhead_omits_trace_lines_the_plot_already_has() {
         let scene = trace_and_guide(0.0);
         let bytes = encode_plot(&scene, [0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0, 1.0]).unwrap();
-        let (header, _, _, _) = decode_plot(&bytes).unwrap();
+        let (header, _, _, _, _) = decode_plot(&bytes).unwrap();
         assert!(!header.reuse_lines);
         assert!(header.line_prefix > 1);
         let moved = trace_and_guide(0.4);
@@ -611,7 +736,7 @@ mod tests {
             Some(&header.line_token),
         )
         .unwrap();
-        let (next, _, _, _) = decode_plot(&again).unwrap();
+        let (next, _, _, _, _) = decode_plot(&again).unwrap();
         assert!(next.reuse_lines);
         assert_eq!(next.line_token, header.line_token);
         assert_eq!(next.lines, 1, "only the guide tail is in the payload");

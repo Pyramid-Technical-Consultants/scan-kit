@@ -290,9 +290,17 @@ pub fn analytic_on(
             accumulate_planes(&kernel, &spots, origin, shape, v, focus, dose_mode);
         scatter_planes(shape, focus, &axial, &coronal, &sagittal)
     } else {
-        deposit_lattice(&kernel, &spots, origin, shape, v, dose_mode)
+        deposit_lattice(
+            &kernel,
+            &spots,
+            origin,
+            shape,
+            v,
+            dose_mode,
+            (quantity == Quantity::Dose).then_some(1.0 / (v * v * v)),
+        )
     };
-    if quantity == Quantity::Dose {
+    if quantity == Quantity::Dose && planes.is_some() {
         let scale = 1.0 / (v * v * v);
         for value in &mut values {
             *value *= scale;
@@ -313,18 +321,20 @@ fn deposit_lattice(
     shape: [usize; 3],
     voxel: f32,
     dose_mode: bool,
+    scale: Option<f32>,
 ) -> Vec<f32> {
     let [nx, ny, nz] = shape;
     let mut values = vec![0.0f32; nx.saturating_mul(ny).saturating_mul(nz)];
     if nx == 0 || ny == 0 || nz == 0 {
         return values;
     }
+    let plan = axis_plan(kernel, spots, origin, shape, voxel, dose_mode);
     let workers = std::thread::available_parallelism()
         .map(|count| count.get())
         .unwrap_or(1)
         .clamp(1, 32);
-    // Each band owns its z slices, so the adds stay in one order and match a
-    // single thread. A short lattice is not worth the spawn.
+    // Each band owns a contiguous run of z slices, so the adds stay in one
+    // order and match a single thread. A short lattice is not worth the spawn.
     let bands = if nz < 32 || spots.len() < 8 || workers == 1 {
         1
     } else {
@@ -338,13 +348,16 @@ fn deposit_lattice(
             shape,
             voxel,
             dose_mode,
+            &plan,
             0,
             nz,
             &mut values,
+            scale,
         );
         return values;
     }
     let stride = nz.div_ceil(bands);
+    let plan = &plan;
     std::thread::scope(|scope| {
         let plane = nx * ny;
         let mut rest = values.as_mut_slice();
@@ -357,13 +370,318 @@ fn deposit_lattice(
             let z_from = z0;
             scope.spawn(move || {
                 paint_band(
-                    kernel, spots, origin, shape, voxel, dose_mode, z_from, z1, band,
+                    kernel, spots, origin, shape, voxel, dose_mode, plan, z_from, z1, band, scale,
                 );
             });
             z0 = z1;
         }
     });
     values
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum AxisKey {
+    Dose {
+        layer: u32,
+        width: u32,
+        phase: u64,
+    },
+    Stopping {
+        width: u32,
+        grow: u32,
+        z0: u32,
+        z1: u32,
+        phase: u64,
+    },
+}
+
+struct AxisGroup {
+    repr: usize,
+    center: f32,
+    /// First cell of the shared row, in the representative spot's index.
+    rel0: isize,
+    rel1: isize,
+    at: usize,
+    len: usize,
+    z0: usize,
+    z1: usize,
+}
+
+struct SpotUse {
+    weight: f32,
+    ix0: usize,
+    ix1: usize,
+    iy0: usize,
+    iy1: usize,
+    iz0: usize,
+    iz1: usize,
+    x_group: usize,
+    y_group: usize,
+    x_at: usize,
+    y_at: usize,
+}
+
+struct Column {
+    x_group: usize,
+    x_at: usize,
+    ix0: usize,
+    ix1: usize,
+    z0: usize,
+    z1: usize,
+    spots: Vec<usize>,
+}
+
+struct AxisPlan {
+    x_groups: Vec<AxisGroup>,
+    y_groups: Vec<AxisGroup>,
+    spots: Vec<SpotUse>,
+    columns: Vec<Column>,
+    x_len: usize,
+    y_len: usize,
+}
+
+fn axis_phase(center: f32, origin: f32, voxel: f32) -> u64 {
+    let step = f64::from(voxel);
+    let t = (f64::from(center) - f64::from(origin)) / step;
+    let frac = t - t.floor();
+    if frac == 0.0 {
+        0
+    } else {
+        frac.to_bits()
+    }
+}
+
+fn axis_key(
+    spot: &Prepared,
+    layer: usize,
+    width: f32,
+    center: f32,
+    origin: f32,
+    voxel: f32,
+    dose_mode: bool,
+) -> AxisKey {
+    let phase = axis_phase(center, origin, voxel);
+    let width = width.to_bits();
+    if dose_mode {
+        // Sigma at depth comes from the layer and this width. The center's
+        // fractional cell is `phase`, so a whole spot map shares one row.
+        AxisKey::Dose {
+            layer: layer as u32,
+            width,
+            phase,
+        }
+    } else {
+        AxisKey::Stopping {
+            width,
+            grow: spot.grow.to_bits(),
+            z0: spot.z0.to_bits(),
+            z1: spot.z1.to_bits(),
+            phase,
+        }
+    }
+}
+
+fn voxel_shift(center: f32, repr: f32, voxel: f32) -> isize {
+    let delta = (f64::from(center) - f64::from(repr)) / f64::from(voxel);
+    let shift = delta.round();
+    debug_assert!((delta - shift).abs() < 1e-8);
+    shift as isize
+}
+
+fn enroll(
+    groups: &mut Vec<AxisGroup>,
+    map: &mut std::collections::HashMap<AxisKey, usize>,
+    key: AxisKey,
+    repr: usize,
+    center: f32,
+    i0: usize,
+    i1: usize,
+    iz0: usize,
+    iz1: usize,
+    voxel: f32,
+) -> usize {
+    if let Some(&id) = map.get(&key) {
+        let shift = voxel_shift(center, groups[id].center, voxel);
+        let rel0 = i0 as isize - shift;
+        let rel1 = i1 as isize - shift;
+        let group = &mut groups[id];
+        group.rel0 = group.rel0.min(rel0);
+        group.rel1 = group.rel1.max(rel1);
+        group.z0 = group.z0.min(iz0);
+        group.z1 = group.z1.max(iz1);
+        id
+    } else {
+        let id = groups.len();
+        groups.push(AxisGroup {
+            repr,
+            center,
+            rel0: i0 as isize,
+            rel1: i1 as isize,
+            at: 0,
+            len: 0,
+            z0: iz0,
+            z1: iz1,
+        });
+        map.insert(key, id);
+        id
+    }
+}
+
+fn pack_groups(groups: &mut [AxisGroup]) -> usize {
+    let mut cursor = 0usize;
+    for group in groups.iter_mut() {
+        group.at = cursor;
+        group.len = (group.rel1 - group.rel0).max(0) as usize;
+        cursor += group.len;
+    }
+    cursor
+}
+
+fn axis_plan(
+    kernel: &LayerKernel,
+    spots: &[Prepared],
+    origin: [f32; 3],
+    shape: [usize; 3],
+    voxel: f32,
+    dose_mode: bool,
+) -> AxisPlan {
+    let mut x_groups = Vec::new();
+    let mut y_groups = Vec::new();
+    let mut x_map = std::collections::HashMap::new();
+    let mut y_map = std::collections::HashMap::new();
+    let mut raw = Vec::new();
+    for (index, spot) in spots.iter().enumerate() {
+        if spot.weight == 0.0 {
+            continue;
+        }
+        let Some((ix0, ix1, iy0, iy1, iz0, iz1)) = spot_box(spot, origin, shape, voxel, dose_mode)
+        else {
+            continue;
+        };
+        let layer = layer_of(kernel, spot.energy);
+        let x_group = enroll(
+            &mut x_groups,
+            &mut x_map,
+            axis_key(spot, layer, spot.sx, spot.x, origin[0], voxel, dose_mode),
+            index,
+            spot.x,
+            ix0,
+            ix1,
+            iz0,
+            iz1,
+            voxel,
+        );
+        let y_group = enroll(
+            &mut y_groups,
+            &mut y_map,
+            axis_key(spot, layer, spot.sy, spot.y, origin[1], voxel, dose_mode),
+            index,
+            spot.y,
+            iy0,
+            iy1,
+            iz0,
+            iz1,
+            voxel,
+        );
+        raw.push((index, ix0, ix1, iy0, iy1, iz0, iz1, x_group, y_group));
+    }
+    let x_len = pack_groups(&mut x_groups);
+    let y_len = pack_groups(&mut y_groups);
+    let uses: Vec<SpotUse> = raw
+        .into_iter()
+        .map(|(index, ix0, ix1, iy0, iy1, iz0, iz1, x_group, y_group)| {
+            let spot = &spots[index];
+            let shift_x = voxel_shift(spot.x, x_groups[x_group].center, voxel);
+            let shift_y = voxel_shift(spot.y, y_groups[y_group].center, voxel);
+            let x_at = (ix0 as isize - shift_x - x_groups[x_group].rel0) as usize;
+            let y_at = (iy0 as isize - shift_y - y_groups[y_group].rel0) as usize;
+            debug_assert!(x_at + ix1 - ix0 <= x_groups[x_group].len);
+            debug_assert!(y_at + iy1 - iy0 <= y_groups[y_group].len);
+            SpotUse {
+                weight: spot.weight,
+                ix0,
+                ix1,
+                iy0,
+                iy1,
+                iz0,
+                iz1,
+                x_group,
+                y_group,
+                x_at,
+                y_at,
+            }
+        })
+        .collect();
+    let columns = columns_of(&uses);
+    AxisPlan {
+        x_groups,
+        y_groups,
+        spots: uses,
+        columns,
+        x_len,
+        y_len,
+    }
+}
+
+fn columns_of(spots: &[SpotUse]) -> Vec<Column> {
+    let mut map = std::collections::HashMap::<(usize, usize, usize, usize), usize>::new();
+    let mut columns: Vec<Column> = Vec::new();
+    for (index, spot) in spots.iter().enumerate() {
+        let key = (spot.x_group, spot.x_at, spot.ix0, spot.ix1);
+        if let Some(&id) = map.get(&key) {
+            let column = &mut columns[id];
+            column.z0 = column.z0.min(spot.iz0);
+            column.z1 = column.z1.max(spot.iz1);
+            column.spots.push(index);
+        } else {
+            map.insert(key, columns.len());
+            columns.push(Column {
+                x_group: spot.x_group,
+                x_at: spot.x_at,
+                ix0: spot.ix0,
+                ix1: spot.ix1,
+                z0: spot.iz0,
+                z1: spot.iz1,
+                spots: vec![index],
+            });
+        }
+    }
+    columns
+}
+
+fn write_group_rows(
+    groups: &[AxisGroup],
+    spots: &[Prepared],
+    kernel: &LayerKernel,
+    rows: &mut [f32],
+    mut fz: Option<&mut [f32]>,
+    origin_axis: f32,
+    z_lo: f32,
+    voxel: f32,
+    dose_mode: bool,
+    iz: usize,
+    horizontal: bool,
+) {
+    for (index, group) in groups.iter().enumerate() {
+        if iz < group.z0 || iz >= group.z1 || group.len == 0 {
+            continue;
+        }
+        let (mass, sx, sy) = depth_lateral(kernel, &spots[group.repr], z_lo, voxel, dose_mode);
+        if let Some(slot) = fz.as_deref_mut() {
+            slot[index] = mass;
+        }
+        if mass == 0.0 {
+            continue;
+        }
+        fill_normal(
+            group.center,
+            if horizontal { sx } else { sy },
+            origin_axis,
+            group.rel0,
+            voxel,
+            &mut rows[group.at..group.at + group.len],
+        );
+    }
 }
 
 fn paint_band(
@@ -373,77 +691,175 @@ fn paint_band(
     shape: [usize; 3],
     voxel: f32,
     dose_mode: bool,
+    plan: &AxisPlan,
     z0: usize,
     z1: usize,
     values: &mut [f32],
+    dose_scale: Option<f32>,
 ) {
     let [nx, ny, _] = shape;
-    let mut fx = Vec::new();
-    let mut fy = Vec::new();
-    let boxes: Vec<Option<(usize, usize, usize, usize, usize, usize)>> = spots
-        .iter()
-        .map(|spot| {
-            if spot.weight == 0.0 {
-                None
-            } else {
-                spot_box(spot, origin, shape, voxel, dose_mode)
-            }
-        })
-        .collect();
-    // One depth slice is nx by ny. Applying every spot before the next slice
-    // keeps those adds in cache. The old spot-major walk reloaded the slice
-    // once per pencil, and a 0.5 mm grid made that the whole job. A slice that
-    // does not fit is split into row bands; a spot on the seam is painted once
-    // on each side.
-    let y_tile = slice_tile_rows(nx, ny);
+    let mut x_rows = vec![0.0f32; plan.x_len];
+    let mut y_rows = vec![0.0f32; plan.y_len];
+    let mut x_fz = vec![0.0f32; plan.x_groups.len()];
+    // One scratch slice, so a column can apply its x profile down the whole
+    // depth row in one tight loop. The volume is stored after that.
+    let mut col_y = vec![0.0f32; plan.columns.len().saturating_mul(ny)];
+    let mut span = vec![(ny, 0usize); plan.columns.len()];
+    let mut scratch = vec![0.0f32; nx.saturating_mul(ny)];
     for iz in z0..z1 {
         let z_lo = origin[2] + iz as f32 * voxel;
         let local = iz - z0;
-        for y_from in (0..ny).step_by(y_tile) {
-            let y_to = (y_from + y_tile).min(ny);
-            for (spot, bbox) in spots.iter().zip(&boxes) {
-                let Some((ix0, ix1, iy0, iy1, iz0, iz1)) = *bbox else {
-                    continue;
-                };
-                if iz < iz0 || iz >= iz1 {
-                    continue;
-                }
-                let iy0 = iy0.max(y_from);
-                let iy1 = iy1.min(y_to);
-                if ix0 >= ix1 || iy0 >= iy1 {
-                    continue;
-                }
-                let (fz, sx, sy) = depth_lateral(kernel, spot, z_lo, voxel, dose_mode);
-                if fz == 0.0 {
-                    continue;
-                }
-                normal_row(spot.x, sx, origin[0], ix0, ix1, voxel, &mut fx);
-                normal_row(spot.y, sy, origin[1], iy0, iy1, voxel, &mut fy);
-                for (ky, iy) in (iy0..iy1).enumerate() {
-                    let row = spot.weight * fz * fy[ky];
-                    if row == 0.0 {
-                        continue;
-                    }
-                    let base = nx * (iy + ny * local);
-                    for (slot, weight) in values[base + ix0..base + ix1].iter_mut().zip(&fx) {
-                        *slot += row * weight;
-                    }
-                }
+        x_fz.fill(0.0);
+        span.fill((ny, 0));
+        write_group_rows(
+            &plan.x_groups,
+            spots,
+            kernel,
+            &mut x_rows,
+            Some(&mut x_fz),
+            origin[0],
+            z_lo,
+            voxel,
+            dose_mode,
+            iz,
+            true,
+        );
+        write_group_rows(
+            &plan.y_groups,
+            spots,
+            kernel,
+            &mut y_rows,
+            None,
+            origin[1],
+            z_lo,
+            voxel,
+            dose_mode,
+            iz,
+            false,
+        );
+        let mut y0 = ny;
+        let mut y1 = 0usize;
+        for (c, column) in plan.columns.iter().enumerate() {
+            if iz < column.z0 || iz >= column.z1 {
+                continue;
             }
+            let fz = x_fz[column.x_group];
+            if fz == 0.0 || column.ix0 >= column.ix1 {
+                continue;
+            }
+            let acc = &mut col_y[c * ny..(c + 1) * ny];
+            let (lo, hi) = column_weights(plan, column, &y_rows, iz, fz, acc);
+            span[c] = (lo, hi);
+            y0 = y0.min(lo);
+            y1 = y1.max(hi);
+        }
+        let mut x_lo = nx;
+        let mut x_hi = 0usize;
+        for (c, column) in plan.columns.iter().enumerate() {
+            let (lo, hi) = span[c];
+            if lo >= hi || column.ix0 >= column.ix1 {
+                continue;
+            }
+            let x_at = plan.x_groups[column.x_group].at + column.x_at;
+            let fx = &x_rows[x_at..x_at + (column.ix1 - column.ix0)];
+            paint_column(
+                &mut scratch,
+                nx,
+                column.ix0,
+                fx,
+                &mut col_y[c * ny..(c + 1) * ny],
+                lo,
+                hi,
+            );
+            x_lo = x_lo.min(column.ix0);
+            x_hi = x_hi.max(column.ix1);
+        }
+        if x_lo >= x_hi {
+            continue;
+        }
+        let width = x_hi - x_lo;
+        for iy in y0..y1 {
+            let base = nx * (iy + ny * local) + x_lo;
+            flush_row(
+                &mut values[base..base + width],
+                &mut scratch[iy * nx + x_lo..iy * nx + x_hi],
+                dose_scale,
+            );
         }
     }
 }
 
-/// Rows of one depth slice to paint before moving down. A whole slice stays
-/// together until it is bigger than a typical per-core cache.
-fn slice_tile_rows(nx: usize, ny: usize) -> usize {
-    const SLICE_BYTES: usize = 512 * 1024;
-    let slice_bytes = nx.saturating_mul(ny).saturating_mul(4);
-    if slice_bytes <= SLICE_BYTES || nx == 0 {
-        ny.max(1)
-    } else {
-        (SLICE_BYTES / nx.saturating_mul(4).max(1)).clamp(1, ny.max(1))
+/// Apply one column's x profile down its y weights. Kept separate so the
+/// multiply is a small loop the compiler will vectorize.
+#[inline(never)]
+fn paint_column(
+    scratch: &mut [f32],
+    nx: usize,
+    ix0: usize,
+    fx: &[f32],
+    weights: &mut [f32],
+    y0: usize,
+    y1: usize,
+) {
+    let width = fx.len();
+    for iy in y0..y1 {
+        let row = weights[iy];
+        weights[iy] = 0.0;
+        if row == 0.0 {
+            continue;
+        }
+        let start = iy * nx + ix0;
+        for (slot, weight) in scratch[start..start + width].iter_mut().zip(fx) {
+            *slot += row * weight;
+        }
     }
+}
+
+#[inline(never)]
+fn flush_row(dst: &mut [f32], src: &mut [f32], dose_scale: Option<f32>) {
+    if let Some(scale) = dose_scale {
+        for (slot, part) in dst.iter_mut().zip(src.iter()) {
+            *slot += *part * scale;
+        }
+    } else {
+        for (slot, part) in dst.iter_mut().zip(src.iter()) {
+            *slot += *part;
+        }
+    }
+    src.fill(0.0);
+}
+
+/// Sum the y profiles of one column into `acc`. The caller clears what this writes.
+fn column_weights(
+    plan: &AxisPlan,
+    column: &Column,
+    y_rows: &[f32],
+    iz: usize,
+    fz: f32,
+    acc: &mut [f32],
+) -> (usize, usize) {
+    let mut ymin = acc.len();
+    let mut ymax = 0usize;
+    for &index in &column.spots {
+        let spot = &plan.spots[index];
+        if iz < spot.iz0 || iz >= spot.iz1 {
+            continue;
+        }
+        let y0 = spot.iy0;
+        let y1 = spot.iy1;
+        if y0 >= y1 {
+            continue;
+        }
+        let y_at = plan.y_groups[spot.y_group].at + spot.y_at;
+        let fy = &y_rows[y_at..y_at + (y1 - y0)];
+        let scale = spot.weight * fz;
+        for (ky, iy) in (y0..y1).enumerate() {
+            acc[iy] += scale * fy[ky];
+        }
+        ymin = ymin.min(y0);
+        ymax = ymax.max(y1);
+    }
+    (ymin, ymax)
 }
 
 pub(super) fn spot_box(
@@ -590,16 +1006,25 @@ pub(super) fn normal_row(
     if count == 0 {
         return;
     }
-    out.reserve(count);
+    out.resize(count, 0.0);
+    fill_normal(center, sigma, origin, i0 as isize, voxel, out);
+}
+
+/// Cell integrals of one Gaussian. `i0` is the first cell and may sit left of the grid.
+fn fill_normal(center: f32, sigma: f32, origin: f32, i0: isize, voxel: f32, out: &mut [f32]) {
+    if out.is_empty() {
+        return;
+    }
     // Adjacent cells share an edge, so one erf covers both sides of that face.
     let sig = f64::from(sigma).max(1e-3) * std::f64::consts::SQRT_2;
     let center = f64::from(center);
     let origin = f64::from(origin);
     let step = f64::from(voxel);
     let mut prev = erf_as((origin + i0 as f64 * step - center) / sig);
-    for i in 0..count {
-        let next = erf_as((origin + (i0 + i + 1) as f64 * step - center) / sig);
-        out.push((0.5 * (next - prev)) as f32);
+    for (i, slot) in out.iter_mut().enumerate() {
+        let edge = i0 + i as isize + 1;
+        let next = erf_as((origin + edge as f64 * step - center) / sig);
+        *slot = (0.5 * (next - prev)) as f32;
         prev = next;
     }
 }
@@ -929,7 +1354,7 @@ mod tests {
     }
 
     #[test]
-    fn a_spot_on_the_slice_seam_matches_one_pass() {
+    fn overlapping_grids_match() {
         let pencil = Pencil {
             x: 40.0,
             y: 0.0,
@@ -952,9 +1377,6 @@ mod tests {
         let nz = natural.shape[2];
         let z0 = natural.origin[2];
         let nx = 128usize;
-        let y_tile = super::slice_tile_rows(nx, 4096);
-        assert!(y_tile < 4096, "this grid has to split");
-        assert_eq!(super::slice_tile_rows(nx, y_tile + 80), y_tile);
         let wide = analytic_on(
             WATER,
             &[pencil],
@@ -965,7 +1387,7 @@ mod tests {
             1.0,
             2.0e-8,
             10.0,
-            Some(([0.0, -(y_tile as f32), z0], [nx, y_tile + 80, nz], 1.0)),
+            Some(([0.0, -1024.0, z0], [nx, 1104, nz], 1.0)),
             None,
         );
         let small = analytic_on(
@@ -981,11 +1403,7 @@ mod tests {
             Some(([0.0, -64.0, z0], [nx, 128, nz], 1.0)),
             None,
         );
-        assert!(
-            super::slice_tile_rows(nx, 128) == 128,
-            "the reference slice stays whole"
-        );
-        let shift = y_tile - 64;
+        let shift = 1024 - 64;
         for z in 0..nz {
             for y in 0..128 {
                 for x in 0..nx {
@@ -1074,13 +1492,20 @@ mod tests {
         let (kernel, spots) = super::prepare(WATER, &pencils, Quantity::Dose, 1.0, 0.0, 2e-8, 10.0);
         let (origin, shape) = super::dose_grid(&spots, 1.0, None);
         let [nx, ny, nz] = shape;
+        let plan = super::axis_plan(&kernel, &spots, origin, shape, 1.0, true);
         let mut one = vec![0.0f32; nx * ny * nz];
-        super::paint_band(&kernel, &spots, origin, shape, 1.0, true, 0, nz, &mut one);
+        super::paint_band(
+            &kernel, &spots, origin, shape, 1.0, true, &plan, 0, nz, &mut one, None,
+        );
         let mid = nz / 2;
         let mut lo = vec![0.0f32; nx * ny * mid];
         let mut hi = vec![0.0f32; nx * ny * (nz - mid)];
-        super::paint_band(&kernel, &spots, origin, shape, 1.0, true, 0, mid, &mut lo);
-        super::paint_band(&kernel, &spots, origin, shape, 1.0, true, mid, nz, &mut hi);
+        super::paint_band(
+            &kernel, &spots, origin, shape, 1.0, true, &plan, 0, mid, &mut lo, None,
+        );
+        super::paint_band(
+            &kernel, &spots, origin, shape, 1.0, true, &plan, mid, nz, &mut hi, None,
+        );
         lo.extend(hi);
         assert_eq!(lo, one);
     }
@@ -1167,5 +1592,139 @@ mod tests {
         assert!(lateral[0] < 0.0 && lateral[2] > 0.0);
         let (along, _) = volume.longitudinal_profile(1, 1, 1);
         assert!((along[0] - 1.0).abs() < 1e-4, "{along:?}");
+    }
+
+    #[test]
+    fn a_spot_lattice_shares_one_lateral_row() {
+        let pencils: Vec<_> = (0..4)
+            .flat_map(|iy| {
+                (0..4).map(move |ix| Pencil {
+                    x: ix as f32 * 5.0,
+                    y: iy as f32 * 5.0,
+                    sx: 4.0,
+                    sy: 4.0,
+                    energy: 140.0,
+                    amount: 0.02,
+                })
+            })
+            .collect();
+        let (kernel, spots) = super::prepare(WATER, &pencils, Quantity::Dose, 1.0, 0.0, 2e-8, 10.0);
+        let (origin, shape) = super::dose_grid(&spots, 1.0, None);
+        let plan = super::axis_plan(&kernel, &spots, origin, shape, 1.0, true);
+        assert_eq!(plan.spots.len(), 16);
+        assert_eq!(plan.x_groups.len(), 1);
+        assert_eq!(plan.y_groups.len(), 1);
+        assert_eq!(plan.columns.len(), 4);
+        assert!(plan.columns.iter().all(|column| column.spots.len() == 4));
+    }
+
+    #[test]
+    fn shared_rows_match_adding_each_spot() {
+        let pencils = [
+            Pencil {
+                x: 0.0,
+                y: 0.0,
+                sx: 4.0,
+                sy: 4.0,
+                energy: 120.0,
+                amount: 0.02,
+            },
+            Pencil {
+                x: 5.0,
+                y: 10.0,
+                sx: 4.0,
+                sy: 4.0,
+                energy: 120.0,
+                amount: 0.03,
+            },
+            Pencil {
+                x: 1.7,
+                y: -2.4,
+                sx: 4.0,
+                sy: 6.0,
+                energy: 120.0,
+                amount: 0.01,
+            },
+            Pencil {
+                x: -8.0,
+                y: 4.0,
+                sx: 5.0,
+                sy: 5.0,
+                energy: 160.0,
+                amount: 0.04,
+            },
+        ];
+        for (quantity, dose_mode) in [(Quantity::Dose, true), (Quantity::Mu, false)] {
+            let (kernel, spots) = super::prepare(WATER, &pencils, quantity, 1.0, 0.0, 2e-8, 10.0);
+            let (origin, shape) = super::dose_grid(&spots, 1.0, None);
+            let whole =
+                super::deposit_lattice(&kernel, &spots, origin, shape, 1.0, dose_mode, None);
+            let mut acc = vec![0.0f32; whole.len()];
+            for spot in &spots {
+                let one = super::deposit_lattice(
+                    &kernel,
+                    std::slice::from_ref(spot),
+                    origin,
+                    shape,
+                    1.0,
+                    dose_mode,
+                    None,
+                );
+                for (sum, part) in acc.iter_mut().zip(&one) {
+                    *sum += *part;
+                }
+            }
+            assert_eq!(acc, whole);
+        }
+    }
+
+    #[test]
+    fn a_column_stays_close_to_adding_each_spot() {
+        let mut pencils = Vec::new();
+        for energy in [110.0f32, 150.0] {
+            for iy in 0..8 {
+                for ix in 0..2 {
+                    pencils.push(Pencil {
+                        x: ix as f32 * 8.0,
+                        y: iy as f32 * 5.0 - 20.0,
+                        sx: 4.0,
+                        sy: 4.0,
+                        energy,
+                        amount: 0.01 * (1.0 + iy as f32),
+                    });
+                }
+            }
+        }
+        for (quantity, dose_mode) in [(Quantity::Dose, true), (Quantity::Mu, false)] {
+            let (kernel, spots) = super::prepare(WATER, &pencils, quantity, 1.0, 0.0, 2e-8, 10.0);
+            let (origin, shape) = super::dose_grid(&spots, 2.0, None);
+            let whole =
+                super::deposit_lattice(&kernel, &spots, origin, shape, 2.0, dose_mode, None);
+            let mut acc = vec![0.0f32; whole.len()];
+            for spot in &spots {
+                let one = super::deposit_lattice(
+                    &kernel,
+                    std::slice::from_ref(spot),
+                    origin,
+                    shape,
+                    2.0,
+                    dose_mode,
+                    None,
+                );
+                for (sum, part) in acc.iter_mut().zip(&one) {
+                    *sum += *part;
+                }
+            }
+            let mut peak = 0.0f32;
+            let mut worst = 0.0f32;
+            for (got, separate) in whole.iter().zip(&acc) {
+                peak = peak.max(got.abs()).max(separate.abs());
+                worst = worst.max((got - separate).abs());
+            }
+            assert!(
+                worst <= 1e-5 * peak.max(1e-6),
+                "worst {worst} peak {peak} mode {dose_mode}"
+            );
+        }
     }
 }

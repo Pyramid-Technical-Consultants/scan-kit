@@ -343,10 +343,8 @@ pub(crate) fn field_extent(volume: &Volume, fraction: f32, per_slice: bool) -> O
     if nx == 0 || ny == 0 || nz == 0 {
         return None;
     }
-    let global = volume.values.iter().copied().fold(0.0f32, f32::max);
-    if !global.is_finite() || global <= 0.0 {
-        return None;
-    }
+    let plane = nx * ny;
+    let values = &volume.values[..plane * nz];
     let mut x0 = nx;
     let mut x1 = 0usize;
     let mut y0 = ny;
@@ -362,32 +360,57 @@ pub(crate) fn field_extent(volume: &Volume, fraction: f32, per_slice: bool) -> O
         z1 = z1.max(z + 1);
     };
     if per_slice {
+        let mut slice_peak = vec![0.0f32; nz];
+        let mut global = 0.0f32;
+        for (z, peak) in slice_peak.iter_mut().enumerate() {
+            let found = values[z * plane..(z + 1) * plane]
+                .iter()
+                .copied()
+                .fold(0.0f32, f32::max);
+            *peak = found;
+            global = global.max(found);
+        }
+        if volume.values.len() > plane * nz {
+            global = volume.values[plane * nz..]
+                .iter()
+                .copied()
+                .fold(global, f32::max);
+        }
+        if !global.is_finite() || global <= 0.0 {
+            return None;
+        }
         let gate = fraction * global;
-        for z in 0..nz {
-            let mut slice_peak = 0.0f32;
-            for y in 0..ny {
-                for x in 0..nx {
-                    slice_peak = slice_peak.max(volume.get(x, y, z));
-                }
-            }
-            if slice_peak < gate {
+        for (z, peak) in slice_peak.into_iter().enumerate() {
+            if peak < gate {
                 continue;
             }
-            let level = fraction * slice_peak;
+            let level = fraction * peak;
+            let slice = &values[z * plane..(z + 1) * plane];
             for y in 0..ny {
-                for x in 0..nx {
-                    if volume.get(x, y, z) >= level {
+                for (x, value) in slice[y * nx..(y + 1) * nx].iter().copied().enumerate() {
+                    if value >= level {
                         cover(x, y, z);
                     }
                 }
             }
         }
     } else {
+        let mut global = values.iter().copied().fold(0.0f32, f32::max);
+        if volume.values.len() > plane * nz {
+            global = volume.values[plane * nz..]
+                .iter()
+                .copied()
+                .fold(global, f32::max);
+        }
+        if !global.is_finite() || global <= 0.0 {
+            return None;
+        }
         let level = fraction * global;
         for z in 0..nz {
+            let slice = &values[z * plane..(z + 1) * plane];
             for y in 0..ny {
-                for x in 0..nx {
-                    if volume.get(x, y, z) >= level {
+                for (x, value) in slice[y * nx..(y + 1) * nx].iter().copied().enumerate() {
+                    if value >= level {
                         cover(x, y, z);
                     }
                 }

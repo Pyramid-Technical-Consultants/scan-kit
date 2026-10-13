@@ -584,7 +584,9 @@ impl Stage for SessionStage {
         if self.cached && self.view == "volumetric" && !unlimited && self.lattice == 0 {
             return self.publish_volume_preview();
         }
-        if unlimited || self.cached {
+        // Dose is one picture. A window per poll deposited the cube again, so
+        // the bar looked like a queue that never cleared.
+        if unlimited || self.cached || self.view == "volumetric" {
             self.loaded = total;
             let ids = self.sessions.clone();
             return match self.encode(&ids, false) {
@@ -1601,6 +1603,48 @@ mod tests {
             }
             Poll::Pending { report, .. } => {
                 panic!("reopen stuck at {}/{}", report.done, report.total)
+            }
+            Poll::Failed(message) => panic!("{message}"),
+            Poll::Cancelled => panic!("cancelled"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_long_spot_file_is_one_picture() {
+        let root = scratch();
+        let session = root.join("wide");
+        std::fs::create_dir_all(&session).unwrap();
+        let pad = "x".repeat(64);
+        let mut map = String::from("energy,charge_req,position_x,position_y,note\n");
+        let mut spots = String::from("ic1_total_dose,ic2_total_dose,position_x,position_y,note\n");
+        for _ in 0..4_200 {
+            map.push_str(&format!("180,0,0,0,{pad}\n"));
+            spots.push_str(&format!("0,0,0,0,{pad}\n"));
+        }
+        std::fs::write(session.join("input_map.csv"), map).unwrap();
+        std::fs::write(session.join("spot_data.csv"), &spots).unwrap();
+        // Wider than one 4096-row window, so the old per-window deposit would
+        // still be pending after this poll.
+        assert!(spots.len() > 300_000);
+        let mut stage = SessionStage::new(
+            "volumetric",
+            &root,
+            &["wide".into()],
+            &json!({}),
+            [0.1, 0.1, 0.1, 1.0],
+            [0.9, 0.9, 0.9, 1.0],
+            &[[0.2, 0.4, 0.8, 1.0]],
+        );
+        let cancel = Cancel::new();
+        match stage.poll(Duration::from_millis(12), &cancel) {
+            Poll::Ready(bytes) => {
+                let header = scan_kit_plot::plot_header(&bytes).unwrap();
+                assert_eq!(header.quality, "final");
+                assert_eq!(stage.report.done, stage.report.total);
+            }
+            Poll::Pending { report, .. } => {
+                panic!("queued another picture at {}/{}", report.done, report.total)
             }
             Poll::Failed(message) => panic!("{message}"),
             Poll::Cancelled => panic!("cancelled"),
