@@ -223,12 +223,14 @@ const plotters = new WeakMap<HTMLCanvasElement, Promise<Plotter>>();
 // in parallel, builds six modules and the last one replaces the others, so
 // every plot draws into a heap that is already gone.
 let plotModule: Promise<typeof import("@/wasm/scan_kit_plot.js")> | null = null;
+let plotWasm: typeof import("@/wasm/scan_kit_plot.js") | null = null;
 
 function loadPlotModule(): Promise<typeof import("@/wasm/scan_kit_plot.js")> {
   if (plotModule == null) {
     plotModule = import("@/wasm/scan_kit_plot.js")
       .then(async (wasm) => {
         await wasm.default();
+        plotWasm = wasm;
         return wasm;
       })
       .catch((error: unknown) => {
@@ -425,6 +427,16 @@ export function AnalysisView({
   const viewRef = useRef(viewId);
   const dosePlots = useRef<(Plotter | null)[]>([null, null, null, null, null, null]);
   const picture = useRef<Uint8Array | null>(null);
+  const decoded = useRef<{ bytes: Uint8Array; payload: import("@/wasm/scan_kit_plot.js").PlotPayload } | null>(
+    null,
+  );
+  useEffect(
+    () => () => {
+      decoded.current?.payload.free();
+      decoded.current = null;
+    },
+    [viewId],
+  );
 
   const requestDraw = () => {
     if (frame.current !== 0) {
@@ -537,7 +549,17 @@ export function AnalysisView({
     }
     picture.current = bytes;
     try {
-      plot.load(bytes);
+      if (index == null || plotWasm == null) {
+        plot.load(bytes);
+      } else {
+        // The dose cells read one decode, so the cubes sit in wasm once.
+        if (decoded.current?.bytes !== bytes) {
+          decoded.current?.payload.free();
+          decoded.current = null;
+          decoded.current = { bytes, payload: new plotWasm.PlotPayload(bytes) };
+        }
+        plot.load_shared(decoded.current.payload);
+      }
       const chosen = optionsRef.current;
       if ((index == null || index === 4) && localLinePlot(chosen.plot0 ?? "")) {
         plot.set_line(4, chosen.plot0);

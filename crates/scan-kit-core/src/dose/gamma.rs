@@ -1,15 +1,34 @@
+/// The 99.9th percentile of the positive finite samples.
 pub fn robust_high(values: &[f32]) -> f32 {
-    let mut kept: Vec<f32> = values
-        .iter()
-        .copied()
-        .filter(|v| v.is_finite() && *v > 0.0)
-        .collect();
-    if kept.is_empty() {
+    // Positive finite floats sort as their bits. Count the high 16 bits, then
+    // select only inside the bin that holds the rank, not a copy of the cube.
+    let bin =
+        |value: f32| (value.is_finite() && value > 0.0).then(|| (value.to_bits() >> 16) as usize);
+    let mut bins = vec![0usize; 1 << 16];
+    for at in values.iter().filter_map(|value| bin(*value)) {
+        bins[at] += 1;
+    }
+    let count: usize = bins.iter().sum();
+    if count == 0 {
         return 1.0;
     }
-    let last = kept.len() - 1;
-    let index = ((last as f64) * 0.999) as usize;
-    crate::stats::select_rank(&mut kept, index.min(last)).max(1e-6)
+    let last = count - 1;
+    let index = (((last as f64) * 0.999) as usize).min(last);
+    let mut below = 0;
+    let mut chosen = 0;
+    for (at, n) in bins.iter().enumerate() {
+        if below + n > index {
+            chosen = at;
+            break;
+        }
+        below += n;
+    }
+    let mut inside: Vec<f32> = values
+        .iter()
+        .copied()
+        .filter(|value| bin(*value) == Some(chosen))
+        .collect();
+    crate::stats::select_rank(&mut inside, index - below).max(1e-6)
 }
 
 /// Bounding box of samples at or above `threshold`, in the same coordinates as the slice axes.
@@ -248,7 +267,37 @@ pub(super) fn sample_linear(vol: &[f32], shape: [usize; 3], x: f32, y: f32, z: f
 
 #[cfg(test)]
 mod tests {
-    use super::gamma_index;
+    use super::{gamma_index, robust_high};
+
+    #[test]
+    fn the_robust_high_matches_a_sorted_rank() {
+        let sorted = |values: &[f32]| {
+            let mut kept: Vec<f32> = values
+                .iter()
+                .copied()
+                .filter(|v| v.is_finite() && *v > 0.0)
+                .collect();
+            if kept.is_empty() {
+                return 1.0;
+            }
+            kept.sort_by(f32::total_cmp);
+            kept[((kept.len() - 1) as f64 * 0.999) as usize].max(1e-6)
+        };
+        let mut seed = 7u32;
+        let mut next = || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            seed
+        };
+        let mut skewed: Vec<f32> = (0..40_000)
+            .map(|_| (next() >> 8) as f32 / 65_536.0)
+            .map(|v| v * v * v)
+            .collect();
+        skewed.extend([0.0, -3.0, f32::NAN, f32::INFINITY, 1e-30]);
+        let ties = vec![2.5f32; 3000];
+        for values in [skewed, ties, vec![0.0, -1.0], vec![4.0], Vec::new()] {
+            assert_eq!(robust_high(&values).to_bits(), sorted(&values).to_bits());
+        }
+    }
 
     #[test]
     fn a_shift_along_depth_within_dta_passes() {

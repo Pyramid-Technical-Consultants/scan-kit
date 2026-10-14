@@ -278,7 +278,7 @@ pub(crate) fn scene(
         ],
         true,
     );
-    let (panels, mut volume) = crate::workspace::assemble(&crate::workspace::Workspace {
+    let (panels, mut volume) = crate::workspace::assemble(crate::workspace::Workspace {
         dose,
         ct: study.ct.hu.clone(),
         labels,

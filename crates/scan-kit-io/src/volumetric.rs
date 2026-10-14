@@ -485,7 +485,7 @@ pub fn volumetric(
             let mode = wash.mode;
             let filter = wash.filter;
             let (lo_paint, hi_paint, gain, opacity) = (wash.lo, wash.hi, wash.gain, wash.opacity);
-            let (built, mut mark) = crate::workspace::assemble(&crate::workspace::Workspace {
+            let (built, mut mark) = crate::workspace::assemble(crate::workspace::Workspace {
                 dose: volume.clone(),
                 ct: Vec::new(),
                 labels: Vec::new(),
@@ -1142,12 +1142,63 @@ fn fill(
             }
         }
     }
+    let mut key: Vec<u32> = pencils
+        .iter()
+        .flat_map(|p| [p.x, p.y, p.sx, p.sy, p.energy, p.amount])
+        .chain([spread, wet_mm, phantom_mm, k_mu, gap_mm])
+        .map(f32::to_bits)
+        .collect();
+    key.push(quantity as u32);
+    if let Some((origin, shape, voxel)) = grid {
+        key.extend(origin.iter().chain([&voxel]).map(|value| value.to_bits()));
+        key.extend(shape.map(|n| n as u32));
+    }
+    if let Some(focus) = planes {
+        key.extend(focus.map(|n| n as u32));
+    }
     (
-        analytic_on(
-            mat, pencils, quantity, spread, wet_mm, phantom_mm, 1.0, k_mu, gap_mm, grid, planes,
-        ),
+        analytic_cached(mat, key, || {
+            analytic_on(
+                mat, pencils, quantity, spread, wet_mm, phantom_mm, 1.0, k_mu, gap_mm, grid, planes,
+            )
+        }),
         None,
     )
+}
+
+/// A scene that only changes the compare, window, or cells, and every Monte
+/// Carlo preview, reuses the plan and chamber deposits instead of painting
+/// them again. `key` holds every input of the deposit.
+// ponytail: three cubes (one session's measured, companion, and plan) stay
+// resident. Several sessions at once miss; raise the count if that matters.
+fn analytic_cached(
+    mat: scan_kit_core::Medium,
+    key: Vec<u32>,
+    deposit: impl FnOnce() -> Volume,
+) -> Volume {
+    const KEEP: usize = 3;
+    type Kept = Vec<((&'static str, Vec<u32>), Volume)>;
+    static LAST: std::sync::Mutex<Kept> = std::sync::Mutex::new(Vec::new());
+    let key = (mat.key, key);
+    let held = |kept: &mut Kept| {
+        let at = kept.iter().position(|(seen, _)| *seen == key)?;
+        let hit = kept.remove(at);
+        let volume = hit.1.clone();
+        kept.push(hit);
+        Some(volume)
+    };
+    if let Some(volume) = held(&mut LAST.lock().unwrap_or_else(|err| err.into_inner())) {
+        return volume;
+    }
+    let volume = deposit();
+    let mut kept = LAST.lock().unwrap_or_else(|err| err.into_inner());
+    if held(&mut kept).is_none() {
+        if kept.len() >= KEEP {
+            kept.remove(0);
+        }
+        kept.push((key, volume.clone()));
+    }
+    volume
 }
 
 fn session_dose(volume: &Volume, blank: bool) -> scan_kit_core::SessionDose {
@@ -1581,10 +1632,14 @@ fn gamma_with(
     distance_mm: f32,
     cutoff_pct: f32,
 ) -> (Vec<f32>, u32, u32) {
-    let n = measured.values.len().min(plan.values.len());
+    // A session without a plan has an empty cube. Its gamma stays unscored on
+    // the measured lattice, so the image keeps the shape the cells index.
+    if plan.values.len() != measured.values.len() {
+        return (vec![0.0; measured.values.len()], 0, 0);
+    }
     gamma_index(
-        &measured.values[..n],
-        &plan.values[..n],
+        &measured.values,
+        &plan.values,
         measured.shape,
         dose_percent,
         distance_mm,
@@ -1731,6 +1786,50 @@ mod tests {
         assert_eq!(next_preview_voxel(1.0, frame.visits), Some(2.0));
         assert_eq!(next_preview_voxel(1.0, 1_000), None);
         assert_eq!(next_preview_voxel(4.0, frame.visits), None);
+    }
+
+    #[test]
+    fn a_repeated_deposit_matches_and_a_changed_input_repaints() {
+        let pencils = [Pencil {
+            x: 0.0,
+            y: 0.0,
+            sx: 4.0,
+            sy: 4.0,
+            energy: 120.0,
+            amount: 0.05,
+        }];
+        let fill = |pencils: &[Pencil], spread: f32| {
+            super::fill(
+                water(),
+                pencils,
+                Quantity::Dose,
+                spread,
+                0.0,
+                0.0,
+                2.0e-8,
+                10.0,
+                "analytic",
+                0,
+                "water",
+                None,
+                None,
+                None,
+            )
+            .0
+        };
+        let fill = |pencils: &[Pencil], spread: f32| {
+            let volume = fill(pencils, spread);
+            (volume.origin, volume.values)
+        };
+        let first = fill(&pencils, 1.0);
+        assert_eq!(fill(&pencils, 1.0), first);
+        assert_ne!(fill(&pencils, 2.0), first);
+        let moved = [Pencil {
+            x: 1.0,
+            ..pencils[0]
+        }];
+        assert_ne!(fill(&moved, 1.0), first);
+        assert_eq!(fill(&pencils, 1.0), first);
     }
 
     #[test]
@@ -1945,6 +2044,17 @@ mod tests {
         };
         let (_, passed, scored) = super::gamma_with(&measured, &plan, 3.0, 2.0, 10.0);
         assert_eq!((scored, passed), (1, 1));
+        let no_plan = Volume {
+            shape: [0, 0, 0],
+            values: Vec::new(),
+            ..measured.clone()
+        };
+        let (values, passed, scored) = super::gamma_with(&measured, &no_plan, 3.0, 2.0, 10.0);
+        assert_eq!((scored, passed), (0, 0));
+        assert_eq!(
+            super::gamma_image(&measured, &values).peak_index(),
+            (0, 0, 0)
+        );
     }
 
     #[test]

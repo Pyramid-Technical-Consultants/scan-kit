@@ -92,7 +92,11 @@ function DoseCell({
             plots.current[panel] = created;
             readyRef.current(panel);
           })
-          .catch((reason: unknown) => errorRef.current(reason));
+          .catch((reason: unknown) => {
+            // The next resize tries this canvas again instead of leaving it blank.
+            opening = false;
+            errorRef.current(reason);
+          });
         return;
       }
       plot.resize(next.width, next.height);

@@ -115,25 +115,25 @@ pub(crate) struct Workspace {
     pub gamma: Option<(Volume, f32)>,
 }
 
-pub(crate) fn assemble(space: &Workspace) -> (Vec<Panel>, VolumeMark) {
+pub(crate) fn assemble(space: Workspace) -> (Vec<Panel>, VolumeMark) {
     let mut panels = Vec::with_capacity(6);
     for cell in space.cells {
-        panels.push(image_panel(space, cell));
+        panels.push(image_panel(&space, cell));
     }
     for kind in space.plots {
-        panels.push(plot_panel(space, kind));
+        panels.push(plot_panel(&space, kind));
     }
     let n = space.dose.values.len();
     let [nx, ny, nz] = space.dose.shape;
     let mark = VolumeMark {
-        values: space.dose.values.clone(),
+        values: space.dose.values,
         ct: if space.ct.len() == n {
-            space.ct.clone()
+            space.ct
         } else {
             Vec::new()
         },
         labels: if space.labels.len() == n {
-            space.labels.clone()
+            space.labels
         } else {
             Vec::new()
         },
@@ -344,7 +344,7 @@ pub(crate) fn field_extent(volume: &Volume, fraction: f32, per_slice: bool) -> O
         return None;
     }
     let plane = nx * ny;
-    let values = &volume.values[..plane * nz];
+    let values = volume.values.get(..plane * nz)?;
     let mut x0 = nx;
     let mut x1 = 0usize;
     let mut y0 = ny;
@@ -803,7 +803,7 @@ mod tests {
                 dvh: vec![dvh_line(&volume)],
                 gamma: Some((gamma.clone(), 95.0)),
             };
-            let (panels, mark) = assemble(&space);
+            let (panels, mark) = assemble(space);
             assert_eq!(panels.len(), 6, "{kind:?}");
             assert!(
                 !panels[4].series.is_empty() || kind == PlotKind::Gamma,
@@ -861,5 +861,10 @@ mod tests {
         let peak = field_extent(&volume, 0.5, false).unwrap();
         assert_eq!(slice, [1.0, 4.0, 0.0, 1.0, 0.0, 2.0]);
         assert_eq!(peak, [2.0, 3.0, 0.0, 1.0, 0.0, 2.0]);
+        let short = Volume {
+            shape: [5, 1, 3],
+            ..volume
+        };
+        assert_eq!(field_extent(&short, 0.5, true), None);
     }
 }

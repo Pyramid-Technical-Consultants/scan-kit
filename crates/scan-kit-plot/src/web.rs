@@ -16,6 +16,20 @@ pub struct WebPlot {
     panel: Option<u32>,
 }
 
+/// A payload decoded once. Each dose cell loads it without copying the cubes.
+#[wasm_bindgen]
+pub struct PlotPayload(crate::payload::Decoded);
+
+#[wasm_bindgen]
+impl PlotPayload {
+    #[wasm_bindgen(constructor)]
+    pub fn new(bytes: &[u8]) -> Result<PlotPayload, JsValue> {
+        crate::payload::Decoded::new(bytes)
+            .map(PlotPayload)
+            .map_err(|err| JsValue::from_str(&err))
+    }
+}
+
 #[wasm_bindgen]
 #[derive(Clone, Copy)]
 pub struct Hover {
@@ -113,7 +127,16 @@ impl WebPlot {
 
     /// Replace the scene with a payload from `scan_kit_open_plot`.
     pub fn load(&mut self, bytes: &[u8]) -> Result<(), JsValue> {
-        let mut plot = Plot::from_payload(bytes).map_err(|err| JsValue::from_str(&err))?;
+        let plot = Plot::from_payload(bytes).map_err(|err| JsValue::from_str(&err))?;
+        self.install(plot)
+    }
+
+    /// Same as [`WebPlot::load`], reading a payload that other cells share.
+    pub fn load_shared(&mut self, payload: &PlotPayload) -> Result<(), JsValue> {
+        self.install(Plot::from_decoded(payload.0.clone()))
+    }
+
+    fn install(&mut self, mut plot: Plot) -> Result<(), JsValue> {
         if let Some(mut previous) = self.plot.take() {
             if let Err(err) = plot.adopt_lines(&mut previous, &self.gpu.device, &self.gpu.queue) {
                 self.plot = Some(previous);

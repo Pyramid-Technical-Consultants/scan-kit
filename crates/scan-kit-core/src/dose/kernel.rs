@@ -2,9 +2,9 @@ use std::cell::RefCell;
 use std::sync::OnceLock;
 
 use super::{
-    Medium, A150, ALUMINUM, COPPER, E_CHARGE_C, E_SCATTER, K_BETHE, LAYER_NODES, LAYER_STEP,
-    MAX_LAYERS, ME, MP, NUCLEAR_LOCAL, PMMA, POLYETHYLENE, POLYSTYRENE, PSTAR_E, PSTAR_EXP,
-    PSTAR_S70, RHO_AIR, TABLE_N, WATER, W_AIR_EV,
+    Medium, A150, AIR, ALUMINUM, COPPER, E_CHARGE_C, E_SCATTER, K_BETHE, LAYER_NODES, LAYER_STEP,
+    MAX_LAYERS, ME, MP, NUCLEAR_LOCAL, PMMA, POLYETHYLENE, POLYSTYRENE, RHO_AIR, TABLE_N, WATER,
+    W_AIR_EV,
 };
 
 pub(super) struct RangeTable {
@@ -515,7 +515,7 @@ pub fn through_wet(energy_mev: f64, wet_mm: f64) -> (f64, f64) {
 
 pub fn protons_from_mu(mu: f64, energy: f64, gap_mm: f64, k_mu: f64) -> f64 {
     let gap_cm = gap_mm.max(1e-6) / 10.0;
-    let stop = PSTAR_S70 * (energy.max(1.0) / PSTAR_E).powf(PSTAR_EXP);
+    let stop = mass_stopping(AIR, energy.max(1.0));
     let de = stop * RHO_AIR * gap_cm;
     let q = (de / (W_AIR_EV * 1e-6)) * E_CHARGE_C;
     mu * k_mu / q.max(1e-40)
@@ -524,7 +524,36 @@ pub fn protons_from_mu(mu: f64, energy: f64, gap_mm: f64, k_mu: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::super::WATER;
-    use super::{bragg_idd, build_kernel, csda_range_mm};
+    use super::{bragg_idd, build_kernel, csda_range_mm, mcs_along, mcs_at, protons_from_mu};
+
+    #[test]
+    fn protons_per_mu_follow_the_commissioned_beam_data() {
+        // MeanEnergy and ProtonsMU from BDL_default_UN.txt.
+        let bdl = [
+            (100.533, 95_212_461.7),
+            (150.911, 127_460_953.6),
+            (201.163, 155_609_781.6),
+            (225.915, 166_576_491.6),
+        ];
+        let (e0, n0) = bdl[0];
+        let base = protons_from_mu(1.0, e0, 10.0, 1.0);
+        for (energy, protons) in bdl {
+            let got = protons_from_mu(1.0, energy, 10.0, 1.0) / base;
+            let want = protons / n0;
+            assert!((got / want - 1.0).abs() < 0.01, "{energy}: {got} vs {want}");
+        }
+    }
+
+    #[test]
+    fn end_of_range_width_matches_preston_koehler() {
+        for energy in [70.0, 150.0, 230.0] {
+            let range = csda_range_mm(WATER, energy);
+            let (path, var) = mcs_along(WATER, energy);
+            let got = mcs_at(&path, &var, range, range);
+            let want = 0.294 * (range / 10.0).powf(0.896);
+            assert!((got / want - 1.0).abs() < 0.09, "{energy}: {got} vs {want}");
+        }
+    }
 
     #[test]
     fn water_bragg_matches_the_python_table() {
