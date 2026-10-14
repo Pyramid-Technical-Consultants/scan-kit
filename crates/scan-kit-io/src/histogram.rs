@@ -1,4 +1,4 @@
-//! Outlined histograms shared by the distribution view and the binned summary.
+//! Outlined histograms shared by Distribution and Bins.
 //!
 //! Each session is a translucent bar series plus a polyline around those bars.
 //! The outline's alpha is 0 so palette assignment keeps the previous series' color.

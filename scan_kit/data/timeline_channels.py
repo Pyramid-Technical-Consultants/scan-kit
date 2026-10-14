@@ -1,7 +1,7 @@
-"""Shared timeslice channel catalog for FFT Explorer and Timeslice Replay.
+"""Shared timeslice channel catalog for Timeslice Replay.
 
-Channel keys and availability rules live here; each view adds presentation
-metadata (colors, PSD units, presets) via thin adapters.
+Channel keys and availability rules live here; the replay adds presentation
+metadata (colors, presets) via thin adapters.
 """
 
 from __future__ import annotations
@@ -81,7 +81,6 @@ class TimelineChannelSpec:
     replay_linewidth: float = 0.5
     beam_off_edges: bool = False
     replay_visible: bool = True
-    fft_visible: bool = True
     extract: ChannelExtract | None = None
 
     def resolved_extract(self) -> ChannelExtract:
@@ -103,7 +102,6 @@ def _spec(
     replay_linewidth: float = 0.5,
     beam_off_edges: bool = False,
     replay_visible: bool = True,
-    fft_visible: bool = True,
     extract: ChannelExtract | None = None,
 ) -> TimelineChannelSpec:
     return TimelineChannelSpec(
@@ -119,7 +117,6 @@ def _spec(
         replay_linewidth=replay_linewidth,
         beam_off_edges=beam_off_edges,
         replay_visible=replay_visible,
-        fft_visible=fft_visible,
     )
 
 
@@ -212,43 +209,43 @@ TIMELINE_CHANNEL_SPECS: tuple[TimelineChannelSpec, ...] = (
     _spec("ic2_y", "IC2 Y (mm)", FAMILY_POSITION, psd_unit="mm", replay_color="#ff9896"),
     _spec(
         "ic1_x_err", "IC1 X err (mm)", FAMILY_POSITION_ERROR,
-        psd_unit="mm", replay_color="#1f77b4", fft_visible=False,
+        psd_unit="mm", replay_color="#1f77b4",
     ),
     _spec(
         "ic1_y_err", "IC1 Y err (mm)", FAMILY_POSITION_ERROR,
-        psd_unit="mm", replay_color="#aec7e8", fft_visible=False,
+        psd_unit="mm", replay_color="#aec7e8",
     ),
     _spec(
         "ic2_x_err", "IC2 X err (mm)", FAMILY_POSITION_ERROR,
-        psd_unit="mm", replay_color="#d62728", fft_visible=False,
+        psd_unit="mm", replay_color="#d62728",
     ),
     _spec(
         "ic2_y_err", "IC2 Y err (mm)", FAMILY_POSITION_ERROR,
-        psd_unit="mm", replay_color="#ff9896", fft_visible=False,
+        psd_unit="mm", replay_color="#ff9896",
     ),
     _spec(
         "sigma_ic1_x_err", "IC1 σx err (mm)", FAMILY_SIGMA_ERROR,
-        psd_unit="mm", replay_color="#1f77b4", fft_visible=False,
+        psd_unit="mm", replay_color="#1f77b4",
     ),
     _spec(
         "sigma_ic1_y_err", "IC1 σy err (mm)", FAMILY_SIGMA_ERROR,
-        psd_unit="mm", replay_color="#aec7e8", fft_visible=False,
+        psd_unit="mm", replay_color="#aec7e8",
     ),
     _spec(
         "sigma_ic2_x_err", "IC2 σx err (mm)", FAMILY_SIGMA_ERROR,
-        psd_unit="mm", replay_color="#d62728", fft_visible=False,
+        psd_unit="mm", replay_color="#d62728",
     ),
     _spec(
         "sigma_ic2_y_err", "IC2 σy err (mm)", FAMILY_SIGMA_ERROR,
-        psd_unit="mm", replay_color="#ff9896", fft_visible=False,
+        psd_unit="mm", replay_color="#ff9896",
     ),
     _spec(
         "ic12_x_diff", "ΔX (mm)", FAMILY_IC12_POS_DIFF,
-        psd_unit="mm", replay_color="#1f77b4", fft_visible=False,
+        psd_unit="mm", replay_color="#1f77b4",
     ),
     _spec(
         "ic12_y_diff", "ΔY (mm)", FAMILY_IC12_POS_DIFF,
-        psd_unit="mm", replay_color="#d62728", fft_visible=False,
+        psd_unit="mm", replay_color="#d62728",
     ),
     _spec(
         "ic1_x_peak", "IC1 X Fit Peak", FAMILY_PEAK,
@@ -282,10 +279,6 @@ TIMELINE_CHANNEL_BY_KEY: dict[str, TimelineChannelSpec] = {
 
 REPLAY_CHANNEL_SPECS: tuple[TimelineChannelSpec, ...] = tuple(
     spec for spec in TIMELINE_CHANNEL_SPECS if spec.replay_visible
-)
-
-FFT_CHANNEL_SPECS: tuple[TimelineChannelSpec, ...] = tuple(
-    spec for spec in TIMELINE_CHANNEL_SPECS if spec.fft_visible
 )
 
 AMPLIFIER_CHANNEL_CONCEPTS: dict[str, str] = {
@@ -337,9 +330,3 @@ def available_channel_keys(session_data: dict[str, TimelineBundle]) -> set[str]:
                 available.add(spec.key)
     return available
 
-
-def fft_label(spec: TimelineChannelSpec) -> str:
-    """Short label for FFT channel pickers (strip trailing units when present)."""
-    if spec.label.endswith("(mm)") or spec.label.endswith("(G)"):
-        return spec.label.rsplit(" (", 1)[0]
-    return spec.label

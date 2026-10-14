@@ -62,6 +62,8 @@ export function clickEditsNote(column: number): boolean {
 
 export type LibraryRow = {
   session_id: string;
+  folder_id?: string;
+  library?: string;
   storage_path: string;
   selected: boolean;
   note: string;

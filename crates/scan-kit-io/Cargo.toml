@@ -25,3 +25,18 @@ md-5 = "0.10"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 rmpv = "1"
 tungstenite = { version = "0.27", default-features = false, features = ["handshake"] }
+sha2 = "0.10"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+suppaftp = { version = "10.0.2", default-features = false, features = ["rustls-ring"] }
+ureq = { version = "2", default-features = false, features = ["native-tls"] }
+native-tls = "0.2"
+rustls-native-certs = "0.8"
+
+# Windows libssh2 uses WinCNG. Unix builds OpenSSL from source; that needs Perl.
+[target.'cfg(all(not(target_arch = "wasm32"), windows))'.dependencies]
+ssh2 = "0.9.6"
+
+[target.'cfg(all(not(target_arch = "wasm32"), unix))'.dependencies]
+ssh2 = { version = "0.9.6", features = ["vendored-openssl"] }
+native-tls = { version = "0.2", features = ["vendored"] }

@@ -252,7 +252,7 @@ def layer_energies(energy) -> np.ndarray:
 
 
 def build_layer_tables(
-    medium: Medium, energy, spread_pct: float, nodes: int = LAYER_NODES, scatter: bool = True,
+    medium: Medium, energy, spread_pct: float, nodes: int = LAYER_NODES,
 ) -> LayerTables:
     layers = layer_energies(energy)
     n = int(nodes)
@@ -273,8 +273,7 @@ def build_layer_tables(
         dep[i] = total
         cdf[i] = acc / max(total, 1e-30)
         peak[i] = float(np.max(idd)) / max(total, 1e-30)
-        if scatter:
-            mcs[i] = mcs_sigma_mm(medium, e0, depth)
+        mcs[i] = mcs_sigma_mm(medium, e0, depth)
         zmin[i] = -dmax
     return LayerTables(
         energies=layers,
@@ -358,17 +357,17 @@ def end_scatter_mm(medium: Medium, energy) -> np.ndarray:
 
 @functools.lru_cache(maxsize=8)
 def _cached_kernel(
-    key: str, layers: tuple[float, ...], spread_pct: float, scatter: bool,
+    key: str, layers: tuple[float, ...], spread_pct: float,
 ) -> LayerDoseKernel:
     return LayerDoseKernel(
-        build_layer_tables(medium_for(key), np.array(layers), spread_pct, scatter=scatter),
+        build_layer_tables(medium_for(key), np.array(layers), spread_pct),
     )
 
 
-def layer_kernel(key: str, energy, spread_pct: float, scatter: bool = True) -> LayerDoseKernel:
+def layer_kernel(key: str, energy, spread_pct: float) -> LayerDoseKernel:
     """Depth-dose kernel for the energies present; reused while layers and σE are unchanged."""
     layers = tuple(float(e) for e in layer_energies(energy))
-    return _cached_kernel(key, layers, round(float(spread_pct), 4), bool(scatter))
+    return _cached_kernel(key, layers, round(float(spread_pct), 4))
 
 
 def dose_weights(kernel: LayerDoseKernel, protons, energy, medium: Medium) -> np.ndarray:

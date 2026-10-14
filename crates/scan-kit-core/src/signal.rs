@@ -9,10 +9,6 @@ pub const G2_MM_PER_STRIP: f32 = 256.0 / 127.0;
 /// G3 strip channel 64.5 maps to 0 mm at a 2 mm pitch.
 pub const G3_STRIP_CENTER: f32 = 64.5;
 pub const G3_STRIP_PITCH_MM: f32 = 2.0;
-
-pub const MS_PER_SLICE: f32 = 1.0;
-pub const MIN_SPILL_GAP_MS: f32 = 500.0;
-
 /// Linear remap. `in_max == in_min` returns `out_min`.
 pub fn remap(x: f32, in_min: f32, in_max: f32, out_min: f32, out_max: f32) -> f32 {
     let span = in_max - in_min;
@@ -54,8 +50,8 @@ pub fn g2_ic2_mm(ic1_mm: &[f32], raw_ic2: &[f32]) -> Vec<f32> {
         if vals.is_empty() {
             return f32::MAX;
         }
-        vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        vals[vals.len() / 2]
+        let mid = vals.len() / 2;
+        crate::stats::select_rank(&mut vals, mid)
     };
     if err(&fwd, true) < err(&fwd, false) {
         raw_ic2.iter().copied().map(remap_g2_raw_reversed).collect()
@@ -111,61 +107,89 @@ pub fn dose_error_pct(delivered: &[f32], target: &[f32]) -> Vec<f32> {
         .collect()
 }
 
-pub fn cumsum(values: &[f32]) -> Vec<f32> {
-    let mut total = 0.0f32;
-    values
+/// `delivered / target`. A non-finite value or a zero target becomes NaN.
+pub fn dose_per_mu(delivered: &[f32], target: &[f32]) -> Vec<f32> {
+    delivered
         .iter()
-        .map(|value| {
-            if value.is_finite() {
-                total += value;
+        .zip(target)
+        .map(|(d, t)| {
+            if d.is_finite() && t.is_finite() && t.abs() > 1e-15 {
+                d / t
+            } else {
+                f32::NAN
             }
-            total
         })
         .collect()
 }
 
+/// Distance from the origin. A non-finite axis becomes NaN.
+pub fn radial_mm(x: &[f32], y: &[f32]) -> Vec<f32> {
+    x.iter()
+        .zip(y)
+        .map(|(x, y)| {
+            if x.is_finite() && y.is_finite() {
+                x.hypot(*y)
+            } else {
+                f32::NAN
+            }
+        })
+        .collect()
+}
+
+/// Subtract the mean of the finite samples. A non-finite sample stays NaN.
+///
+/// ponytail: each row weighs the same, so a long timeslice spot outweighs a short
+/// one. The upgrade is a mean of per-spot centroids.
+pub fn remove_mean(values: &[f32]) -> Vec<f32> {
+    let mut sum = 0.0f64;
+    let mut count = 0u32;
+    for value in values {
+        if value.is_finite() {
+            sum += f64::from(*value);
+            count += 1;
+        }
+    }
+    if count == 0 {
+        return vec![f32::NAN; values.len()];
+    }
+    let mean = (sum / f64::from(count)) as f32;
+    values
+        .iter()
+        .map(|value| {
+            if value.is_finite() {
+                value - mean
+            } else {
+                f32::NAN
+            }
+        })
+        .collect()
+}
+
+/// Error as a percent of the expected width. Expected width is `measured - error`.
+pub fn sigma_error_pct(measured: &[f32], error_mm: &[f32]) -> Vec<f32> {
+    measured
+        .iter()
+        .zip(error_mm)
+        .map(|(measured, error)| {
+            if measured.is_finite() && error.is_finite() {
+                let expected = measured - error;
+                if expected > 1.0e-6 {
+                    error / expected * 100.0
+                } else {
+                    f32::NAN
+                }
+            } else {
+                f32::NAN
+            }
+        })
+        .collect()
+}
 /// Gate is on when the column is non-zero. An empty column is all off.
 pub fn beam_on_mask(gate: &[f32]) -> Vec<bool> {
     gate.iter()
         .map(|value| *value != 0.0 && value.is_finite())
         .collect()
 }
-
-/// Half-open spill ranges. Off gaps shorter than `gap_ms` stay inside the spill.
-pub fn spill_segments(beam_on: &[bool], gap_ms: f32, min_on_slices: usize) -> Vec<(usize, usize)> {
-    if beam_on.is_empty() {
-        return Vec::new();
-    }
-    let gap = ((gap_ms / MS_PER_SLICE).round() as usize).max(1);
-    let mut segments = Vec::new();
-    let mut in_spill = false;
-    let mut start = 0usize;
-    let mut off_count = 0usize;
-    for (i, is_on) in beam_on.iter().copied().enumerate() {
-        if is_on {
-            if !in_spill {
-                start = i;
-                in_spill = true;
-            }
-            off_count = 0;
-        } else if in_spill {
-            off_count += 1;
-            if off_count >= gap {
-                let end = i - off_count + 1;
-                if end - start >= min_on_slices {
-                    segments.push((start, end));
-                }
-                in_spill = false;
-                off_count = 0;
-            }
-        }
-    }
-    if in_spill && beam_on.len() - start >= min_on_slices {
-        segments.push((start, beam_on.len()));
-    }
-    segments
-}
-
 /// Quantile bin edges. A single finite value becomes a unit-width bin around it.
 pub fn quantile_edges(values: &[f32], n_bins: usize) -> Vec<f32> {
     let mut finite: Vec<f32> = values
@@ -176,34 +200,21 @@ pub fn quantile_edges(values: &[f32], n_bins: usize) -> Vec<f32> {
     if finite.is_empty() {
         return vec![0.0, 1.0];
     }
-    finite.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let n_bins = n_bins.max(1);
-    if finite.first() == finite.last() {
+    if finite.iter().all(|value| *value == finite[0]) {
         let lo = finite[0];
         return vec![lo - 0.5, lo + 0.5];
     }
-    let mut edges = Vec::with_capacity(n_bins + 1);
-    for i in 0..=n_bins {
-        let q = i as f32 / n_bins as f32;
-        edges.push(quantile_sorted(&finite, q));
-    }
+    let qs: Vec<f32> = (0..=n_bins)
+        .map(|step| step as f32 / n_bins as f32)
+        .collect();
+    let mut edges = crate::stats::quantiles_at(&mut finite, &qs);
     edges.dedup_by(|a, b| (*a - *b).abs() < 1e-6);
     if edges.len() < 2 {
-        let lo = finite[0];
+        let lo = edges.first().copied().unwrap_or(0.0);
         return vec![lo - 0.5, lo + 0.5];
     }
     edges
-}
-
-fn quantile_sorted(sorted: &[f32], q: f32) -> f32 {
-    if sorted.is_empty() {
-        return f32::NAN;
-    }
-    let pos = q.clamp(0.0, 1.0) * (sorted.len() - 1) as f32;
-    let lo = pos.floor() as usize;
-    let hi = pos.ceil() as usize;
-    let t = pos - lo as f32;
-    sorted[lo] * (1.0 - t) + sorted[hi] * t
 }
 
 /// Map each value to the center of its quantile bin. Out of range is NaN.
@@ -254,10 +265,8 @@ pub fn box_stats(values: &[f32]) -> Option<BoxStats> {
     if sorted.is_empty() {
         return None;
     }
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let q1 = quantile_sorted(&sorted, 0.25);
-    let median = quantile_sorted(&sorted, 0.5);
-    let q3 = quantile_sorted(&sorted, 0.75);
+    let quartiles = crate::stats::quantiles_at(&mut sorted, &[0.25, 0.5, 0.75]);
+    let [q1, median, q3] = [quartiles[0], quartiles[1], quartiles[2]];
     let iqr = q3 - q1;
     let fence_lo = q1 - 1.5 * iqr;
     let fence_hi = q3 + 1.5 * iqr;
@@ -322,7 +331,10 @@ pub fn histogram(values: &[f32], bins: usize) -> (Vec<f32>, Vec<f32>) {
     (edges, counts)
 }
 
-/// Welch PSD. `seg_len` 4096, overlap 0.5, and `fs` 1000 match FFT Explorer.
+/// Welch PSD. Timeline asks for 4096-sample segments, 50% overlap, and `fs` 1000.
+///
+/// The segment length is a power of two. A shorter trace uses the largest such
+/// length that fits, and at least 16 samples.
 pub fn welch_psd(
     signal: &[f32],
     fs: f32,
@@ -335,35 +347,37 @@ pub fn welch_psd(
         .map(|value| if value.is_finite() { value - mean } else { 0.0 })
         .collect();
     if centered.len() < seg_len {
-        seg_len = centered.len().max(16);
+        seg_len = centered.len();
+    }
+    if !seg_len.is_power_of_two() {
+        seg_len = seg_len.next_power_of_two() / 2;
+    }
+    if seg_len < 16 {
+        return (Vec::new(), Vec::new());
     }
     let step = ((seg_len as f32) * (1.0 - overlap)).round().max(1.0) as usize;
     let window = hanning(seg_len);
     let win_power: f32 = window.iter().map(|w| w * w).sum();
-    let mut accum: Option<Vec<f32>> = None;
+    let mut windowed = vec![0.0f32; seg_len];
+    let mut psd = vec![0.0f32; seg_len / 2 + 1];
     let mut count = 0usize;
     let mut start = 0usize;
     while start + seg_len <= centered.len() {
-        let mut segment: Vec<f32> = centered[start..start + seg_len]
-            .iter()
-            .zip(&window)
-            .map(|(sample, w)| sample * w)
-            .collect();
-        let power = rfft_power(&mut segment);
-        match &mut accum {
-            None => accum = Some(power),
-            Some(sum) => {
-                for (bin, value) in sum.iter_mut().zip(power) {
-                    *bin += value;
-                }
-            }
+        for (out, (sample, weight)) in windowed
+            .iter_mut()
+            .zip(centered[start..start + seg_len].iter().zip(&window))
+        {
+            *out = sample * weight;
+        }
+        for (bin, power) in psd.iter_mut().zip(rfft_power(&windowed)) {
+            *bin += power;
         }
         count += 1;
         start += step;
     }
-    let Some(mut psd) = accum else {
+    if count == 0 {
         return (Vec::new(), Vec::new());
-    };
+    }
     let scale = (count as f32) * win_power.max(1e-12);
     let last = psd.len().saturating_sub(1);
     for (i, bin) in psd.iter_mut().enumerate() {
@@ -403,57 +417,59 @@ fn hanning(n: usize) -> Vec<f32> {
         .collect()
 }
 
-/// Real FFT power `|rfft|^2`. Length may be any n ≥ 1.
-fn rfft_power(segment: &mut [f32]) -> Vec<f32> {
-    let n = segment.len();
-    (0..n / 2 + 1)
-        .map(|k| {
-            let mut re = 0.0f32;
-            let mut im = 0.0f32;
-            let angle = -2.0 * std::f32::consts::PI * k as f32 / n as f32;
-            for (t, sample) in segment.iter().copied().enumerate() {
-                let phase = angle * t as f32;
-                re += sample * phase.cos();
-                im += sample * phase.sin();
-            }
-            re * re + im * im
-        })
-        .collect()
-}
-
-/// Single exponential `a * exp(-t / tau)` fit on positive samples. Returns `(a, tau)`.
-pub fn fit_decay(time: &[f32], values: &[f32]) -> Option<(f32, f32)> {
-    let mut n = 0.0f64;
-    let mut sx = 0.0f64;
-    let mut sy = 0.0f64;
-    let mut sxx = 0.0f64;
-    let mut sxy = 0.0f64;
-    for (t, y) in time.iter().zip(values) {
-        if t.is_finite() && y.is_finite() && *y > 0.0 {
-            let x = f64::from(*t);
-            let ly = (f64::from(*y)).ln();
-            n += 1.0;
-            sx += x;
-            sy += ly;
-            sxx += x * x;
-            sxy += x * ly;
+/// One-sided power `|DFT|^2` for a power-of-two length. The sign is the analysis transform.
+fn rfft_power(samples: &[f32]) -> Vec<f32> {
+    let n = samples.len();
+    debug_assert!(n.is_power_of_two() && n >= 2);
+    let mut re = samples.to_vec();
+    let mut im = vec![0.0f32; n];
+    let bits = n.trailing_zeros();
+    for i in 0..n {
+        let j = i.reverse_bits() >> (usize::BITS - bits);
+        if i < j {
+            re.swap(i, j);
+            im.swap(i, j);
         }
     }
-    if n < 2.0 {
-        return None;
+    let mut tw_re = vec![0.0f32; n / 2];
+    let mut tw_im = vec![0.0f32; n / 2];
+    let mut len = 2usize;
+    while len <= n {
+        let half = len / 2;
+        let turn = -2.0 * std::f64::consts::PI / len as f64;
+        let step_re = turn.cos();
+        let step_im = turn.sin();
+        tw_re[0] = 1.0;
+        tw_im[0] = 0.0;
+        let mut w_re = 1.0f64;
+        let mut w_im = 0.0f64;
+        for k in 1..half {
+            let next_re = w_re * step_re - w_im * step_im;
+            w_im = w_re * step_im + w_im * step_re;
+            w_re = next_re;
+            tw_re[k] = w_re as f32;
+            tw_im[k] = w_im as f32;
+        }
+        let mut i = 0usize;
+        while i < n {
+            for k in 0..half {
+                let v_re = re[i + k + half] * tw_re[k] - im[i + k + half] * tw_im[k];
+                let v_im = re[i + k + half] * tw_im[k] + im[i + k + half] * tw_re[k];
+                let u_re = re[i + k];
+                let u_im = im[i + k];
+                re[i + k] = u_re + v_re;
+                im[i + k] = u_im + v_im;
+                re[i + k + half] = u_re - v_re;
+                im[i + k + half] = u_im - v_im;
+            }
+            i += len;
+        }
+        len <<= 1;
     }
-    let denom = n * sxx - sx * sx;
-    if denom.abs() < 1e-18 {
-        return None;
-    }
-    let slope = (n * sxy - sx * sy) / denom;
-    let intercept = (sy - slope * sx) / n;
-    if slope >= 0.0 {
-        return None;
-    }
-    Some((intercept.exp() as f32, (-1.0 / slope) as f32))
+    (0..n / 2 + 1)
+        .map(|k| re[k] * re[k] + im[k] * im[k])
+        .collect()
 }
-
 /// Deposit isotropic Gaussians onto a regular grid. `spots` are `(x, y, z, weight, sigma)`.
 pub fn splat_gaussians(
     spots: &[[f32; 5]],
@@ -542,23 +558,6 @@ pub fn gamma_index(
         cutoff_pct,
     )
 }
-
-/// True once a sample is `settle` steps after the last change larger than `tol`.
-pub fn settled_after_step(samples: &[f32], settle: usize, tol: f32) -> Vec<bool> {
-    if settle == 0 {
-        return vec![true; samples.len()];
-    }
-    let mut start = 0usize;
-    let mut mask = vec![false; samples.len()];
-    for index in 0..samples.len() {
-        if index > 0 && (samples[index] - samples[index - 1]).abs() > tol {
-            start = index;
-        }
-        mask[index] = index >= start + settle;
-    }
-    mask
-}
-
 /// Least-squares line. `None` when fewer than two finite points share an x span.
 pub fn linear_fit(xs: &[f32], ys: &[f32]) -> Option<(f32, f32)> {
     let mut n = 0.0f32;
@@ -647,131 +646,33 @@ pub fn sums_by_spot_run(spot: &[f32], current: &[f32]) -> Vec<f32> {
     out
 }
 
-/// Counts of finite pairs on a `bins` by `bins` grid. `(counts, xmin, xmax, ymin, ymax)`.
-pub fn density_counts(
-    xs: &[f32],
-    ys: &[f32],
-    bins: usize,
-) -> Option<(Vec<f32>, f32, f32, f32, f32)> {
-    let bins = bins.max(2);
-    let mut xmin = f32::MAX;
-    let mut xmax = f32::MIN;
-    let mut ymin = f32::MAX;
-    let mut ymax = f32::MIN;
-    let mut pairs = 0usize;
-    for (x, y) in xs.iter().zip(ys) {
-        if x.is_finite() && y.is_finite() {
-            xmin = xmin.min(*x);
-            xmax = xmax.max(*x);
-            ymin = ymin.min(*y);
-            ymax = ymax.max(*y);
-            pairs += 1;
-        }
-    }
-    if pairs == 0 {
+/// 0.5% tails, then a slim margin. One spike does not set the axis, and a flat
+/// trace stays near its value.
+pub fn robust_limits(samples: &[f32]) -> Option<(f32, f32)> {
+    let mut values: Vec<f32> = samples
+        .iter()
+        .copied()
+        .filter(|value| value.is_finite())
+        .collect();
+    if values.is_empty() {
         return None;
     }
-    if (xmax - xmin).abs() < 1e-6 {
-        xmax = xmin + 1.0;
-    }
-    if (ymax - ymin).abs() < 1e-6 {
-        ymax = ymin + 1.0;
-    }
-    let mut counts = vec![0.0f32; bins * bins];
-    let dx = xmax - xmin;
-    let dy = ymax - ymin;
-    for (x, y) in xs.iter().zip(ys) {
-        if x.is_finite() && y.is_finite() {
-            let ix = (((x - xmin) / dx) * bins as f32) as usize;
-            let iy = (((y - ymin) / dy) * bins as f32) as usize;
-            let ix = ix.min(bins - 1);
-            let iy = iy.min(bins - 1);
-            counts[ix + bins * iy] += 1.0;
-        }
-    }
-    Some((counts, xmin, xmax, ymin, ymax))
+    let (lo, hi) = if values.len() == 1 {
+        (values[0], values[0])
+    } else {
+        let last = values.len() - 1;
+        let rank = |portion: f32| ((last as f32) * portion).round() as usize;
+        crate::stats::select_ranks(&mut values, rank(0.005).min(last), rank(0.995).min(last))
+    };
+    let scale = hi.abs().max(lo.abs());
+    let pad = ((hi - lo) * 0.02).max(scale * 0.02).max(1.0e-6);
+    Some((lo - pad, hi + pad))
 }
 
-/// Odd circular-arc fit `sin θ = c0 + c1·B + c3·B³`, with θ in mrad.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct ArcFit {
-    pub c0: f32,
-    pub c1: f32,
-    pub c3: f32,
-}
-
-pub fn arc_fit(field: &[f32], angle_mrad: &[f32]) -> Option<ArcFit> {
-    let mut ata = [[0.0f64; 3]; 3];
-    let mut aty = [0.0f64; 3];
-    let mut n = 0usize;
-    let mut lo = f32::MAX;
-    let mut hi = f32::MIN;
-    for (b, angle) in field.iter().zip(angle_mrad) {
-        if !b.is_finite() || !angle.is_finite() {
-            continue;
-        }
-        let y = (angle / 1000.0).sin() * 1000.0;
-        if !y.is_finite() {
-            continue;
-        }
-        lo = lo.min(*b);
-        hi = hi.max(*b);
-        let basis = [1.0, f64::from(*b), f64::from(b.powi(3))];
-        for i in 0..3 {
-            aty[i] += basis[i] * f64::from(y);
-            for j in 0..3 {
-                ata[i][j] += basis[i] * basis[j];
-            }
-        }
-        n += 1;
-    }
-    if n < 12 || hi <= lo {
-        return None;
-    }
-    let coef = solve3(ata, aty)?;
-    Some(ArcFit {
-        c0: coef[0] as f32,
-        c1: coef[1] as f32,
-        c3: coef[2] as f32,
-    })
-}
-
-pub fn arc_predict(fit: ArcFit, field: f32) -> f32 {
-    let sin_scaled = fit.c0 + fit.c1 * field + fit.c3 * field.powi(3);
-    (sin_scaled / 1000.0).clamp(-1.0, 1.0).asin() * 1000.0
-}
-
-fn solve3(mut a: [[f64; 3]; 3], mut b: [f64; 3]) -> Option<[f64; 3]> {
-    for col in 0..3 {
-        let mut pivot = col;
-        for row in col + 1..3 {
-            if a[row][col].abs() > a[pivot][col].abs() {
-                pivot = row;
-            }
-        }
-        if a[pivot][col].abs() < 1e-12 {
-            return None;
-        }
-        a.swap(col, pivot);
-        b.swap(col, pivot);
-        let div = a[col][col];
-        for value in &mut a[col][col..] {
-            *value /= div;
-        }
-        b[col] /= div;
-        let pivot_row = a[col];
-        for row in 0..3 {
-            if row == col {
-                continue;
-            }
-            let factor = a[row][col];
-            for (value, pivot) in a[row][col..].iter_mut().zip(&pivot_row[col..]) {
-                *value -= factor * pivot;
-            }
-            b[row] -= factor * b[col];
-        }
-    }
-    Some(b)
+/// Time span plus a small margin. The floor is one 1 ms sample, and the start stays at 0.
+pub fn time_window(lo: f32, hi: f32) -> (f32, f32) {
+    let pad = ((hi - lo) * 0.02).max(0.001);
+    ((lo - pad).max(0.0), hi + pad)
 }
 
 pub fn median_finite(values: &[f32]) -> Option<f32> {
@@ -779,13 +680,7 @@ pub fn median_finite(values: &[f32]) -> Option<f32> {
     if kept.is_empty() {
         return None;
     }
-    kept.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let n = kept.len();
-    if n % 2 == 1 {
-        Some(kept[n / 2])
-    } else {
-        Some((kept[n / 2 - 1] + kept[n / 2]) * 0.5)
-    }
+    Some(crate::stats::median_unstable(&mut kept))
 }
 
 pub fn trapz(time: &[f32], values: &[f32]) -> f32 {
@@ -869,172 +764,6 @@ pub fn hv_capacitance_pf(
     }
     Some(trapz(&tt, &yy) / delta_v)
 }
-
-/// Per-sample background from off-beam samples, plus the global background and peak.
-///
-/// A short or flat trace keeps a constant background. Otherwise the background
-/// is a median filter of the off-beam samples, interpolated across the trace.
-pub fn sliding_background(
-    signal: &[f32],
-    threshold_frac: f32,
-    rolling_window: usize,
-) -> (Vec<f32>, f32, f32) {
-    let finite: Vec<f32> = signal
-        .iter()
-        .copied()
-        .filter(|value| value.is_finite())
-        .collect();
-    if finite.is_empty() {
-        return (vec![0.0; signal.len()], 0.0, 0.0);
-    }
-    let low_edge = percentile(&finite, 0.25);
-    let low: Vec<f32> = finite
-        .into_iter()
-        .filter(|value| *value <= low_edge)
-        .collect();
-    let bg_global = median_finite(&low).unwrap_or(low_edge);
-    let peak = percentile(
-        &signal
-            .iter()
-            .copied()
-            .filter(|value| value.is_finite())
-            .collect::<Vec<_>>(),
-        0.99,
-    );
-    let flat = vec![bg_global; signal.len()];
-    if peak - bg_global < 1.0 || rolling_window < 3 {
-        return (flat, bg_global, peak);
-    }
-    let thresh = threshold_frac * (peak - bg_global);
-    let mut off_x = Vec::new();
-    let mut off_y = Vec::new();
-    for (i, value) in signal.iter().enumerate() {
-        if value.is_finite() && *value - bg_global <= thresh {
-            off_x.push(i as f32);
-            off_y.push(*value);
-        }
-    }
-    if off_x.len() < rolling_window {
-        return (flat, bg_global, peak);
-    }
-    let smoothed = median_filter_reflect(&off_y, rolling_window);
-    (
-        interp_clamped(&off_x, &smoothed, signal.len()),
-        bg_global,
-        peak,
-    )
-}
-
-/// Falling-edge indices where the signal stays on for 2 samples and off for 9.
-pub fn beam_off_edges(signal: &[f32]) -> Vec<usize> {
-    const MIN_ON: usize = 2;
-    const POST: usize = 9;
-    const MIN_SPAN: f32 = 1e-4;
-    let finite: Vec<f32> = signal
-        .iter()
-        .copied()
-        .filter(|value| value.is_finite())
-        .collect();
-    if finite.len() < MIN_ON + POST {
-        return Vec::new();
-    }
-    let fill = median_finite(&finite).unwrap_or(0.0);
-    let clean: Vec<f32> = signal
-        .iter()
-        .map(|value| if value.is_finite() { *value } else { fill })
-        .collect();
-    let (bg, bg_global, peak) = sliding_background(&clean, 0.10, 200);
-    if peak - bg_global < MIN_SPAN {
-        return Vec::new();
-    }
-    let thresh = 0.10 * (peak - bg_global);
-    let on: Vec<bool> = clean
-        .iter()
-        .zip(&bg)
-        .map(|(value, base)| value - base > thresh)
-        .collect();
-    let mut edges = Vec::new();
-    for idx in 1..on.len() {
-        if on[idx - 1] && !on[idx] {
-            if idx < MIN_ON || idx + POST > on.len() {
-                continue;
-            }
-            if on[idx - MIN_ON..idx].iter().any(|flag| !*flag) {
-                continue;
-            }
-            if on[idx..idx + POST].iter().any(|flag| *flag) {
-                continue;
-            }
-            edges.push(idx);
-        }
-    }
-    edges
-}
-
-fn median_filter_reflect(values: &[f32], size: usize) -> Vec<f32> {
-    let n = values.len();
-    if n == 0 || size <= 1 {
-        return values.to_vec();
-    }
-    let half = size / 2;
-    let mut window = Vec::with_capacity(size);
-    let mut out = Vec::with_capacity(n);
-    for i in 0..n {
-        window.clear();
-        let start = i as isize - half as isize;
-        for step in 0..size {
-            window.push(values[reflect_index(start + step as isize, n)]);
-        }
-        out.push(median_finite(&window).unwrap_or(0.0));
-    }
-    out
-}
-
-fn reflect_index(mut index: isize, n: usize) -> usize {
-    if n <= 1 {
-        return 0;
-    }
-    let len = n as isize;
-    for _ in 0..8 {
-        if index < 0 {
-            index = -index;
-        } else if index >= len {
-            index = 2 * len - 2 - index;
-        } else {
-            break;
-        }
-    }
-    index.clamp(0, len - 1) as usize
-}
-
-fn interp_clamped(xs: &[f32], ys: &[f32], n: usize) -> Vec<f32> {
-    if xs.is_empty() || ys.is_empty() {
-        return vec![0.0; n];
-    }
-    let mut out = Vec::with_capacity(n);
-    let mut j = 0usize;
-    for i in 0..n {
-        let x = i as f32;
-        if x <= xs[0] {
-            out.push(ys[0]);
-            continue;
-        }
-        if x >= xs[xs.len() - 1] {
-            out.push(ys[ys.len() - 1]);
-            continue;
-        }
-        while j + 1 < xs.len() && xs[j + 1] < x {
-            j += 1;
-        }
-        let x0 = xs[j];
-        let x1 = xs[j + 1];
-        let span = (x1 - x0).max(1e-6);
-        let t = (x - x0) / span;
-        out.push(ys[j] + t * (ys[j + 1] - ys[j]));
-    }
-    out
-}
-
 /// Percent of finite metrics at or above each threshold.
 pub fn coverage_percent(metrics: &[f32], thresholds: &[f32]) -> Vec<f32> {
     let total = metrics.len();
@@ -1052,14 +781,6 @@ pub fn coverage_percent(metrics: &[f32], thresholds: &[f32]) -> Vec<f32> {
         })
         .collect()
 }
-
-fn percentile(values: &[f32], p: f32) -> f32 {
-    let mut sorted = values.to_vec();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let index = ((sorted.len() - 1) as f32 * p).round() as usize;
-    sorted[index.min(sorted.len() - 1)]
-}
-
 /// `(overall pass/fail, per-channel flags)` from a firmware result JSON.
 pub fn hv_firmware_flags(text: &str) -> (Option<String>, Vec<String>) {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
@@ -1196,6 +917,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn sk_req_035_relative_position_radius_sigma_percent_and_dose_per_mu() {
+        let per_mu = dose_per_mu(&[2.0, 1.0], &[1.0, 0.0]);
+        assert!((per_mu[0] - 2.0).abs() < 1e-5);
+        assert!(per_mu[1].is_nan());
+        let radius = radial_mm(&[3.0, f32::NAN], &[4.0, 1.0]);
+        assert!((radius[0] - 5.0).abs() < 1e-5);
+        assert!(radius[1].is_nan());
+        let residual = remove_mean(&[1.0, 3.0, f32::NAN]);
+        assert!((residual[0] + 1.0).abs() < 1e-5);
+        assert!((residual[1] - 1.0).abs() < 1e-5);
+        assert!(residual[2].is_nan());
+        assert!(remove_mean(&[f32::NAN]).iter().all(|value| value.is_nan()));
+        let percent = sigma_error_pct(&[11.0, 5.0], &[1.0, f32::NAN]);
+        assert!((percent[0] - 10.0).abs() < 1e-4);
+        assert!(percent[1].is_nan());
+    }
+
+    #[test]
     fn sk_req_010_remap_calibration_and_beam_mask() {
         assert!((remap(64.5, 1.0, 128.0, -128.0, 128.0)).abs() < 1.0);
         assert!((remap_g2_raw(64.5)).abs() < 1e-3);
@@ -1208,8 +947,10 @@ mod tests {
         assert!((err[0] - 10.0).abs() < 1e-4);
         let ratio = dose_ratio_pct(&[1.1], &[1.0]);
         assert!((ratio[0] - 10.0).abs() < 1e-3);
-        let mask = beam_on_mask(&[0.0, 1.0, 0.0, 1.0, 1.0]);
-        assert_eq!(spill_segments(&mask, 1.0, 2), vec![(3, 5)]);
+        assert_eq!(
+            beam_on_mask(&[0.0, 1.0, 0.0, 1.0, 1.0]),
+            vec![false, true, false, true, true]
+        );
         let mut filtered = std::collections::BTreeMap::from([
             ("y".to_owned(), vec![1.0, 2.0]),
             ("beam_on".to_owned(), vec![1.0, 0.0]),
@@ -1225,12 +966,7 @@ mod tests {
     }
 
     #[test]
-    fn sk_req_023_settled_mask_waits_out_a_command_step() {
-        let cmd = [0.0, 1.0, 1.0, 1.0, 1.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0];
-        assert_eq!(
-            settled_after_step(&cmd, 3, 1e-6),
-            vec![false, false, false, false, true, false, false, false, true, true, true]
-        );
+    fn sk_req_023_line_fit_returns_slope_and_intercept() {
         let (slope, intercept) = linear_fit(&[0.0, 1.0, 2.0], &[1.0, 3.0, 5.0]).unwrap();
         assert!((slope - 2.0).abs() < 1e-4);
         assert!((intercept - 1.0).abs() < 1e-4);
@@ -1247,6 +983,29 @@ mod tests {
     }
 
     #[test]
+    fn a_power_of_two_fft_matches_the_summed_dft() {
+        let samples: Vec<f32> = (0..32).map(|i| (i as f32 * 0.37).sin() + 0.2).collect();
+        let fast = rfft_power(&samples);
+        let n = samples.len();
+        for (k, power) in fast.iter().enumerate() {
+            let mut re = 0.0f32;
+            let mut im = 0.0f32;
+            let angle = -2.0 * std::f32::consts::PI * k as f32 / n as f32;
+            for (t, sample) in samples.iter().copied().enumerate() {
+                let phase = angle * t as f32;
+                re += sample * phase.cos();
+                im += sample * phase.sin();
+            }
+            let expected = re * re + im * im;
+            let tol = 1e-3 * expected.abs().max(1.0);
+            assert!(
+                (power - expected).abs() < tol,
+                "bin {k}: {power} vs {expected}"
+            );
+        }
+    }
+
+    #[test]
     fn sk_req_019_welch_sees_a_tone() {
         let fs = 1000.0f32;
         let signal: Vec<f32> = (0..256)
@@ -1260,14 +1019,6 @@ mod tests {
             .unwrap()
             .0;
         assert!((freqs[peak] - 50.0).abs() < 12.0);
-    }
-
-    #[test]
-    fn sk_req_021_decay_fit_recovers_tau() {
-        let time: Vec<f32> = (0..20).map(|i| i as f32).collect();
-        let values: Vec<f32> = time.iter().map(|t| 4.0 * (-t / 5.0).exp()).collect();
-        let (_a, tau) = fit_decay(&time, &values).unwrap();
-        assert!((tau - 5.0).abs() < 0.2);
     }
 
     #[test]
@@ -1322,39 +1073,17 @@ mod tests {
     }
 
     #[test]
-    fn sk_req_033_spot_sums_arc_hv_and_ramp_edges() {
+    fn sk_req_033_spot_sums_hv_and_coverage() {
         assert_eq!(
             sums_by_spot_run(&[1.0, 1.0, 2.0, 2.0], &[1.0, 2.0, 3.0, 4.0]),
             vec![3.0, 7.0]
         );
-        let field: Vec<f32> = (-6..=6).map(|v| v as f32).collect();
-        let angle: Vec<f32> = field
-            .iter()
-            .map(|b| (b / 1000.0).clamp(-1.0, 1.0).asin() * 1000.0)
-            .collect();
-        let fit = arc_fit(&field, &angle).unwrap();
-        assert!(fit.c0.abs() < 1e-3);
-        assert!((fit.c1 - 1.0).abs() < 1e-3);
-        assert!(fit.c3.abs() < 1e-4);
-        assert!((arc_predict(fit, 2.0) - (0.002f32).asin() * 1000.0).abs() < 1e-2);
-
         let time = [0.0, 1.0, 2.0];
         let current = [0.0, 2.0, 0.0];
         let pf = hv_capacitance_pf(&time, &current, -1.0, 3.0, 2.0).unwrap();
         assert!((pf - 1.0).abs() < 1e-3);
         let window = hv_step_window(&time, &current).unwrap();
         assert!(window.0 < 1.0 && window.1 > 1.0);
-
-        let mut pulse = vec![1.0f32; 20];
-        pulse.extend(std::iter::repeat_n(0.0, 20));
-        assert_eq!(beam_off_edges(&pulse), vec![20]);
-        let mut drifted: Vec<f32> = (0..800).map(|i| i as f32 * 0.02).collect();
-        for sample in &mut drifted[500..530] {
-            *sample += 50.0;
-        }
-        assert!(beam_off_edges(&drifted)
-            .iter()
-            .any(|edge| (520..545).contains(edge)));
         assert_eq!(
             sums_by_spot_id(&[1.0, 2.0, 1.0], &[1.0, 10.0, 2.0]),
             vec![3.0, 10.0]
@@ -1388,5 +1117,19 @@ mod tests {
         assert!((centers[3] - 15.0).abs() < 1e-4);
         assert!(centers[4].is_nan());
         assert!(centers[5].is_nan());
+    }
+
+    #[test]
+    fn robust_limits_drop_one_spike_and_non_finite() {
+        let mut samples = vec![1.0; 400];
+        samples.push(f32::NAN);
+        samples.push(100.0);
+        let (lo, hi) = robust_limits(&samples).unwrap();
+        assert!(hi < 2.0, "{hi}");
+        assert!(lo > 0.5 && lo < 1.5, "{lo}");
+        let (lo, hi) = robust_limits(&[2.0]).unwrap();
+        assert!((lo - 1.96).abs() < 1e-3, "{lo}");
+        assert!((hi - 2.04).abs() < 1e-3, "{hi}");
+        assert!(robust_limits(&[f32::NAN]).is_none());
     }
 }

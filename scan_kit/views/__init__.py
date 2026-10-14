@@ -23,11 +23,11 @@ def view_description(entry: ViewEntry) -> str:
 
 # Analysis views run in the Rust shell. These lists stay empty so the Qt launcher
 # no longer imports the deleted windows.
-_UNIFIED_VIEWS: list[ViewEntry] = []
+_CORE_ANALYSES: list[ViewEntry] = []
 _SPECIALIZED_VIEWS: list[ViewEntry] = []
 
 VIEW_GROUPS: list[tuple[str, list[ViewEntry]]] = [
-    ("Unified Views", _UNIFIED_VIEWS),
+    ("Core Analysis", _CORE_ANALYSES),
     ("Specialized Analysis", _SPECIALIZED_VIEWS),
 ]
 

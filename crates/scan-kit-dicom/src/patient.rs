@@ -225,6 +225,60 @@ pub fn gantry_to_patient(
     Ok(mul(support, mul(couch, gantry)))
 }
 
+const WATER_DENSITY: &str = include_str!(
+    "../../../scan_kit/assets/mcsquare/Scanners/Water_Phantom/HU_Density_Conversion.txt"
+);
+const WATER_MATERIAL: &str = include_str!(
+    "../../../scan_kit/assets/mcsquare/Scanners/Water_Phantom/HU_Material_Conversion.txt"
+);
+const SOLID_DENSITY: &str = include_str!(
+    "../../../scan_kit/assets/mcsquare/Scanners/SolidWater_Phantom/HU_Density_Conversion.txt"
+);
+const SOLID_MATERIAL: &str = include_str!(
+    "../../../scan_kit/assets/mcsquare/Scanners/SolidWater_Phantom/HU_Material_Conversion.txt"
+);
+
+/// Density from a named scanner curve. `default` keeps the built-in table.
+pub fn scanner_density(scanner: &str, hu: f32) -> f32 {
+    match scanner {
+        "water" => density_from(&pairs(WATER_DENSITY), hu),
+        "solid" => density_from(&pairs(SOLID_DENSITY), hu),
+        _ => hu_density(hu),
+    }
+}
+
+/// Material id from a named scanner curve. `default` keeps the built-in table.
+pub fn scanner_label(scanner: &str, hu: f32) -> i32 {
+    match scanner {
+        "water" => label_from(&pairs(WATER_MATERIAL), hu),
+        "solid" => label_from(&pairs(SOLID_MATERIAL), hu),
+        _ => hu_label(hu),
+    }
+}
+
+fn density_from(table: &(Vec<f32>, Vec<f32>), hu: f32) -> f32 {
+    if table.0.len() < 2 {
+        return hu_density(hu);
+    }
+    let i = below(&table.0, hu).clamp(0, table.0.len() - 2);
+    let (x0, x1) = (table.0[i], table.0[i + 1]);
+    let (y0, y1) = (table.1[i], table.1[i + 1]);
+    let density = (y1 - y0) / (x1 - x0).max(1e-6) * (hu - x0) + y0;
+    if density <= 0.0 {
+        1e-6
+    } else {
+        density
+    }
+}
+
+fn label_from(table: &(Vec<f32>, Vec<f32>), hu: f32) -> i32 {
+    if table.0.is_empty() {
+        return hu_label(hu);
+    }
+    let i = below(&table.0, hu).clamp(0, table.1.len() - 1);
+    table.1[i] as i32
+}
+
 pub fn hu_density(hu: f32) -> f32 {
     let table = density_table();
     let i = below(&table.0, hu).clamp(0, table.0.len() - 2);
@@ -970,6 +1024,8 @@ mod tests {
     #[test]
     fn water_hu_is_unit_density() {
         assert!((hu_density(0.0) - 1.0).abs() < 1e-3);
+        assert!((scanner_density("default", 0.0) - hu_density(0.0)).abs() < 1e-6);
+        assert!((scanner_density("water", 0.0) - 1.0).abs() < 1e-3);
         assert_eq!(hu_label(0.0), hu_label(0.0));
         assert!(hu_label(-2000.0) != hu_label(0.0));
     }

@@ -13,8 +13,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use super::discover;
 use scan_kit_core::{
-    column_scale_factor, dose_error_pct, dose_ratio_pct, g2_ic2_mm, linear_fit, remap,
-    remap_g2_raw, remap_g3_raw, scale_column,
+    column_scale_factor, dose_error_pct, dose_per_mu, dose_ratio_pct, finite_minmax, g2_ic2_mm,
+    linear_fit, median_unstable, percentile_linear, radial_mm, remap, remap_g2_raw, remap_g3_raw,
+    remove_mean, scale_column, sigma_error_pct,
 };
 
 #[derive(Clone)]
@@ -155,7 +156,9 @@ impl Drop for QuietTail {
     }
 }
 
-fn mark_tail_done() {
+/// Publish only for the bound session. A parallel load of another session
+/// finishes its own file and must not move this flag.
+fn set_tail_done(done: bool, belongs: impl FnOnce(&str) -> bool) {
     if !PUBLISH_TAIL.with(Cell::get) {
         return;
     }
@@ -164,21 +167,14 @@ fn mark_tail_done() {
         .unwrap_or_else(|err| err.into_inner())
         .as_mut()
     {
-        bound.tail_done = true;
+        if belongs(&bound.session) {
+            bound.tail_done = done;
+        }
     }
 }
 
-fn forget_tail_done() {
-    if !PUBLISH_TAIL.with(Cell::get) {
-        return;
-    }
-    if let Some(bound) = bound_slice()
-        .lock()
-        .unwrap_or_else(|err| err.into_inner())
-        .as_mut()
-    {
-        bound.tail_done = false;
-    }
+fn path_has_session(path: &Path, session: &str) -> bool {
+    path.components().any(|part| part.as_os_str() == session)
 }
 
 pub(crate) type Table = std::sync::Arc<BTreeMap<String, Vec<f32>>>;
@@ -337,6 +333,14 @@ fn sample_fill(name: &str) -> u8 {
             | "ic1_y_err"
             | "ic2_x_err"
             | "ic2_y_err"
+            | "ic1_x_err_rel"
+            | "ic1_y_err_rel"
+            | "ic2_x_err_rel"
+            | "ic2_y_err_rel"
+            | "ic1_r_err"
+            | "ic1_r_err_rel"
+            | "ic2_r_err"
+            | "ic2_r_err_rel"
             | "ic1_sig_x"
             | "ic1_sig_y"
             | "ic2_sig_x"
@@ -345,6 +349,10 @@ fn sample_fill(name: &str) -> u8 {
             | "ic1_sig_y_err"
             | "ic2_sig_x_err"
             | "ic2_sig_y_err"
+            | "ic1_sig_x_err_pct"
+            | "ic1_sig_y_err_pct"
+            | "ic2_sig_x_err_pct"
+            | "ic2_sig_y_err_pct"
             | "ic12_x_diff"
             | "ic12_y_diff"
     ) {
@@ -630,7 +638,10 @@ fn cached_timeslice(
                     Arc::new(extra)
                 } else {
                     let mut table = previous.table;
-                    extend_columns(Arc::make_mut(&mut table), extra);
+                    let grown = Arc::make_mut(&mut table);
+                    extend_columns(grown, extra);
+                    // The tail's clock starts at 0. The combined table counts from its first row.
+                    restamp_sample_time(grown);
                     table
                 };
                 store_growth(&dir, kind, files, tail_rows, Arc::clone(&table));
@@ -811,7 +822,7 @@ fn frames_limited(
     }
     let listed = discover::list_timeslice_paths(&dir);
     if listed.is_empty() {
-        mark_tail_done();
+        set_tail_done(true, |name| name == session);
         return None;
     }
     let map = map_sheet(root, session);
@@ -840,7 +851,7 @@ fn frames_limited(
         (sheets, layers)
     });
     if no_tail && full >= listed.len() {
-        mark_tail_done();
+        set_tail_done(true, |name| name == session);
     }
     Some(Arc::new(Frames {
         energies,
@@ -940,7 +951,7 @@ fn build_spot(
         Arc::new(read_sheet(&bytes))
     } else {
         if rows.is_some() {
-            mark_tail_done();
+            set_tail_done(true, |name| name == session);
         }
         return BTreeMap::new();
     };
@@ -1004,6 +1015,10 @@ fn build_spot(
     for values in &mask_pos {
         mask_cols.push(*values);
     }
+    // Same row rule as the Python loader: a NaN, -1, or -10000 in sigma drops the spot.
+    for (_, values) in &sigma {
+        mask_cols.push(*values);
+    }
     let keep = keep_mask(&mask_cols, n);
     if !keep.iter().any(|row| *row) {
         return BTreeMap::new();
@@ -1039,6 +1054,9 @@ fn build_spot(
         ),
         ("ic2_dose_err_pct", "ic2_dose", "target_mu", dose_error_pct),
         ("ic3_dose_err_pct", "ic3_dose", "target_mu", dose_error_pct),
+        ("ic1_dose_per_mu", "ic1_dose", "target_mu", dose_per_mu),
+        ("ic2_dose_per_mu", "ic2_dose", "target_mu", dose_per_mu),
+        ("ic3_dose_per_mu", "ic3_dose", "target_mu", dose_per_mu),
     ] {
         if let Some(values) = paired(&table, left, right, combine) {
             derived.push((out, values));
@@ -1133,7 +1151,48 @@ fn build_spot(
             table.insert("beam_on".to_string(), take_kept(beam, &keep));
         }
     }
+    if let Some(layer) = spot.num.get("layer_id").filter(|values| values.len() >= n) {
+        let kept = take_kept(layer, &keep);
+        if kept.len() == table.get("energy").map(Vec::len).unwrap_or(0) {
+            table.insert("layer_id".to_string(), kept);
+        }
+    }
+    stamp_spot_clock(&mut table, &spot, n, &keep);
     table
+}
+
+/// Seconds from the first finite wall stamp. A missing stamp leaves the column out.
+fn stamp_spot_clock(table: &mut BTreeMap<String, Vec<f32>>, spot: &Sheet, n: usize, keep: &[bool]) {
+    let rows = table.get("energy").map(Vec::len).unwrap_or(0);
+    if rows == 0 {
+        return;
+    }
+    let Some(stamps) = wall_time(spot, n) else {
+        return;
+    };
+    let kept = take_kept(&stamps, keep);
+    if kept.len() != rows {
+        return;
+    }
+    if let Some(elapsed) = elapsed_seconds(&kept) {
+        table.insert("time_s".to_string(), elapsed);
+    }
+}
+
+fn elapsed_seconds(stamps: &[f64]) -> Option<Vec<f32>> {
+    let origin = stamps.iter().copied().find(|value| value.is_finite())?;
+    Some(
+        stamps
+            .iter()
+            .map(|value| {
+                if value.is_finite() {
+                    (*value - origin) as f32
+                } else {
+                    f32::NAN
+                }
+            })
+            .collect(),
+    )
 }
 
 fn spot_time_ms(spot: &Sheet, n: usize) -> Option<Vec<f64>> {
@@ -1264,6 +1323,59 @@ fn store_positions(table: &mut BTreeMap<String, Vec<f32>>, mm: [Option<Vec<f32>>
     }
     if !y_diff.is_empty() {
         table.insert("ic12_y_diff".to_string(), y_diff);
+    }
+    attach_position_derived(table);
+}
+
+/// Radial plan-frame error, and the same axes with one nozzle offset removed.
+///
+/// The offset is the mean of the finite samples on that chamber and axis.
+fn attach_position_derived(table: &mut BTreeMap<String, Vec<f32>>) {
+    for (x_key, y_key, radial, x_rel, y_rel, radial_rel) in [
+        (
+            "ic1_x_err",
+            "ic1_y_err",
+            "ic1_r_err",
+            "ic1_x_err_rel",
+            "ic1_y_err_rel",
+            "ic1_r_err_rel",
+        ),
+        (
+            "ic2_x_err",
+            "ic2_y_err",
+            "ic2_r_err",
+            "ic2_x_err_rel",
+            "ic2_y_err_rel",
+            "ic2_r_err_rel",
+        ),
+    ] {
+        let (Some(x), Some(y)) = (table.get(x_key).cloned(), table.get(y_key).cloned()) else {
+            continue;
+        };
+        table.insert(radial.to_string(), radial_mm(&x, &y));
+        let x_residual = remove_mean(&x);
+        let y_residual = remove_mean(&y);
+        table.insert(radial_rel.to_string(), radial_mm(&x_residual, &y_residual));
+        table.insert(x_rel.to_string(), x_residual);
+        table.insert(y_rel.to_string(), y_residual);
+    }
+}
+
+fn attach_sigma_percent(table: &mut BTreeMap<String, Vec<f32>>) {
+    let mut made = Vec::new();
+    for (measured, error, out) in [
+        ("ic1_sig_x", "ic1_sig_x_err", "ic1_sig_x_err_pct"),
+        ("ic1_sig_y", "ic1_sig_y_err", "ic1_sig_y_err_pct"),
+        ("ic2_sig_x", "ic2_sig_x_err", "ic2_sig_x_err_pct"),
+        ("ic2_sig_y", "ic2_sig_y_err", "ic2_sig_y_err_pct"),
+    ] {
+        let (Some(measured), Some(error)) = (table.get(measured), table.get(error)) else {
+            continue;
+        };
+        made.push((out, sigma_error_pct(measured, error)));
+    }
+    for (key, values) in made {
+        table.insert(key.to_string(), values);
     }
 }
 
@@ -1517,6 +1629,7 @@ fn add_sigma_error(table: &mut BTreeMap<String, Vec<f32>>, xml: &str) {
     if !pairs.is_empty() {
         table.insert("expected_sigma".to_string(), pairs);
     }
+    attach_sigma_percent(table);
 }
 
 fn add_dose_rate(table: &mut BTreeMap<String, Vec<f32>>, time: &[f64]) {
@@ -1823,6 +1936,9 @@ fn build_slice_metric(
         table.insert("plan_x".to_string(), plan_xs);
         table.insert("plan_y".to_string(), plan_ys);
     }
+    attach_position_derived(&mut table);
+    attach_sigma_percent(&mut table);
+    stamp_sample_time(&mut table);
     remember_pos(root, session, chamber, samples, axes, shifts);
     table
 }
@@ -2871,6 +2987,7 @@ fn signal_rows(
             table.insert((*key).to_string(), (*values).clone());
         }
     }
+    stamp_sample_time(&mut table);
     table
 }
 
@@ -2917,8 +3034,102 @@ fn current_from(
             table.insert("ic3_current".to_string(), ic3);
         }
         table.insert("beam_on".to_string(), beam);
+        stamp_sample_time(&mut table);
     }
     table
+}
+
+/// Timeslice rows are 1 ms apart, the same clock Timeline draws.
+const SAMPLE_S: f32 = 0.001;
+
+fn stamp_sample_time(table: &mut BTreeMap<String, Vec<f32>>) {
+    let Some(n) = table.get("energy").map(Vec::len).filter(|n| *n > 0) else {
+        return;
+    };
+    table.insert(
+        "time_s".to_string(),
+        (0..n).map(|index| index as f32 * SAMPLE_S).collect(),
+    );
+}
+
+fn restamp_sample_time(table: &mut BTreeMap<String, Vec<f32>>) {
+    if table.contains_key("time_s") {
+        stamp_sample_time(table);
+    }
+}
+
+/// Layer-change times for the scrubber. Timeslice uses the 1 ms file clock.
+/// Spot rows use the wall clock already stored on `time_s`.
+pub(crate) fn timeline_layers(root: &Path, sessions: &[String], timeslice: bool) -> Vec<f32> {
+    let mut marks = Vec::new();
+    for session in sessions {
+        if timeslice {
+            marks.extend(timeslice_layer_marks(root, session));
+        } else {
+            marks.extend(spot_layer_marks(root, session));
+        }
+    }
+    marks.sort_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal));
+    marks.dedup_by(|left, right| left.to_bits() == right.to_bits());
+    marks
+}
+
+fn spot_layer_marks(root: &Path, session: &str) -> Vec<f32> {
+    let table = load_spot(root, session, false, false, false);
+    scan_kit_core::layer_edges(
+        table.get("time_s").map(Vec::as_slice).unwrap_or(&[]),
+        table.get("layer_id").map(Vec::as_slice).unwrap_or(&[]),
+    )
+}
+
+fn timeslice_layer_marks(root: &Path, session: &str) -> Vec<f32> {
+    let Some(frames) = open_frames(root, session, Family::Current) else {
+        return Vec::new();
+    };
+    let mut marks = Vec::new();
+    let mut cursor = 0.0f32;
+    let mut previous: Option<i64> = None;
+    for (index, sheet) in frames.sheets.iter().enumerate() {
+        let rows = clock_rows(sheet);
+        let folder = frames.layers.get(index).copied().unwrap_or(-1);
+        let column = sheet
+            .num
+            .get("layer_id")
+            .filter(|values| values.iter().any(|value| value.is_finite()));
+        if let Some(ids) = column {
+            for row in 0..rows {
+                let Some(id) = ids.get(row).copied().filter(|value| value.is_finite()) else {
+                    continue;
+                };
+                note_layer(
+                    &mut marks,
+                    &mut previous,
+                    id as i64,
+                    cursor + row as f32 * SAMPLE_S,
+                );
+            }
+        } else if folder >= 0 && rows > 0 {
+            note_layer(&mut marks, &mut previous, folder, cursor);
+        }
+        cursor += rows as f32 * SAMPLE_S;
+    }
+    marks
+}
+
+fn clock_rows(sheet: &Sheet) -> usize {
+    let triggered = sample_len(sheet, &[]);
+    if triggered > 0 {
+        triggered
+    } else {
+        sheet.num.values().map(Vec::len).max().unwrap_or(0)
+    }
+}
+
+fn note_layer(marks: &mut Vec<f32>, previous: &mut Option<i64>, id: i64, at: f32) {
+    if previous.is_some_and(|seen| seen != id) && at > 0.0 {
+        marks.push(at);
+    }
+    *previous = Some(id);
 }
 
 fn current_ratio_from(
@@ -2930,6 +3141,8 @@ fn current_ratio_from(
     let mut ic21 = Vec::new();
     let mut ic31 = Vec::new();
     let mut ic32 = Vec::new();
+    let mut clock = Vec::new();
+    let mut cursor = 0.0f32;
     let mut any_ic3 = false;
     for (index, sheet) in sheets.iter().enumerate() {
         let tag = frame_energy(energies, layers.get(index).copied().unwrap_or(-1), index);
@@ -2941,6 +3154,9 @@ fn current_ratio_from(
         let left = plateau(&a);
         let right = plateau(&b);
         let third = plateau(&c);
+        let n = sample_len(sheet, &[a.as_slice(), b.as_slice(), c.as_slice()]);
+        cursor += n as f32 * SAMPLE_S;
+        clock.push(cursor);
         out_energy.push(tag);
         ic21.push(sym_pct(right, left));
         if third.is_finite() {
@@ -2954,6 +3170,7 @@ fn current_ratio_from(
         let rows = out_energy.len();
         table.insert("energy".to_string(), out_energy);
         table.insert("beam_on".to_string(), vec![1.0; rows]);
+        table.insert("time_s".to_string(), clock);
         table.insert("ic21_ratio".to_string(), ic21);
         if any_ic3 {
             table.insert("ic31_ratio".to_string(), ic31);
@@ -2977,9 +3194,7 @@ fn plateau_mean(values: &[f32], gate: Option<&[f32]>) -> f32 {
     if on.len() < 10 {
         return f32::NAN;
     }
-    let mut sorted = on.clone();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let p95 = percentile(&sorted, 0.95);
+    let p95 = percentile(&on, 0.95);
     let floor = 5.0f32.max(0.75 * p95);
     let kept: Vec<f32> = on.into_iter().filter(|value| *value >= floor).collect();
     if kept.len() < 3 {
@@ -3104,19 +3319,9 @@ pub(crate) fn same(a: f32, b: f32) -> bool {
 }
 
 pub(crate) fn span(values: &[f32]) -> (f32, f32) {
-    let mut lo = f32::MAX;
-    let mut hi = f32::MIN;
-    let mut any = false;
-    for value in values {
-        if value.is_finite() {
-            any = true;
-            lo = lo.min(*value);
-            hi = hi.max(*value);
-        }
-    }
-    if !any {
+    let Some((lo, hi)) = finite_minmax(values) else {
         return (0.0, 1.0);
-    }
+    };
     if (hi - lo).abs() < 1e-6 {
         return (lo - 1.0, hi + 1.0);
     }
@@ -3125,27 +3330,13 @@ pub(crate) fn span(values: &[f32]) -> (f32, f32) {
 }
 
 pub(crate) fn median(values: &[f32]) -> f32 {
-    let mut sorted = values.to_vec();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let mid = sorted.len() / 2;
-    if sorted.len().is_multiple_of(2) {
-        (sorted[mid - 1] + sorted[mid]) * 0.5
-    } else {
-        sorted[mid]
-    }
+    let mut values = values.to_vec();
+    median_unstable(&mut values)
 }
 
 pub(crate) fn percentile(sorted_or_not: &[f32], q: f64) -> f32 {
-    let mut sorted = sorted_or_not.to_vec();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    if sorted.is_empty() {
-        return f32::NAN;
-    }
-    let pos = q * (sorted.len() - 1) as f64;
-    let lo = pos.floor() as usize;
-    let hi = pos.ceil().min((sorted.len() - 1) as f64) as usize;
-    let frac = (pos - lo as f64) as f32;
-    sorted[lo] * (1.0 - frac) + sorted[hi] * frac
+    let mut values = sorted_or_not.to_vec();
+    percentile_linear(&mut values, q)
 }
 
 fn unique_seen(values: &[f32]) -> Vec<f32> {
@@ -3790,7 +3981,7 @@ fn sheet_from_window(
         if hit.stamp == stamp && hit.rows == window.rows {
             let have = finished_rows(&hit.sheet);
             if window.done && want >= have {
-                mark_tail_done();
+                set_tail_done(true, |name| path_has_session(path, name));
             }
             return Some(shared_rows(&hit.sheet, want.min(have), have));
         }
@@ -3800,7 +3991,7 @@ fn sheet_from_window(
     if window.done {
         store_sheet(sheet_key(path, stamp, keep), &sheet);
         if want >= have {
-            mark_tail_done();
+            set_tail_done(true, |name| path_has_session(path, name));
         }
     } else {
         let mut cache = parsed_windows()
@@ -3959,13 +4150,13 @@ fn pull_window(
 
 fn sheet_rows(path: &Path, keep: Keep, pred: fn(&str) -> bool, want: usize) -> Arc<Sheet> {
     // An earlier file in this same picture may have hit EOF. Only this file's end counts.
-    forget_tail_done();
+    set_tail_done(false, |name| path_has_session(path, name));
     let stamp = discover::meta_stamp(path);
     let key = sheet_key(path, stamp, keep);
     if let Some(hit) = cached_sheet(&key) {
         let rows = finished_rows(&hit);
         if want >= rows {
-            mark_tail_done();
+            set_tail_done(true, |name| path_has_session(path, name));
             return hit;
         }
         return Arc::new(clip_sheet(&hit, want));
@@ -3987,7 +4178,7 @@ fn sheet_rows(path: &Path, keep: Keep, pred: fn(&str) -> bool, want: usize) -> A
         let sheet = read_and_cache(path, stamp, keep, pred);
         let have = finished_rows(&sheet);
         if want >= have {
-            mark_tail_done();
+            set_tail_done(true, |name| path_has_session(path, name));
             return sheet;
         }
         return Arc::new(clip_sheet(&sheet, want));
@@ -4040,7 +4231,7 @@ fn sheet_rows(path: &Path, keep: Keep, pred: fn(&str) -> bool, want: usize) -> A
         if tail.pieces.len() == 1 {
             remember_window(path, stamp, Arc::clone(&tail.pieces[0]), tail.rows, true);
         }
-        mark_tail_done();
+        set_tail_done(true, |name| path_has_session(path, name));
         tail.file = None;
         let finished = Arc::clone(&tail.sheet);
         let have = tail.rows;
@@ -4752,6 +4943,12 @@ pub(crate) fn days_from_civil(mut year: i32, month: u32, day: u32) -> Option<i64
 mod tests {
     use super::*;
 
+    /// `bind_slice` is one process-wide slot. The tests that use it take turns.
+    fn slice_gate() -> &'static Mutex<()> {
+        static GATE: OnceLock<Mutex<()>> = OnceLock::new();
+        GATE.get_or_init(|| Mutex::new(()))
+    }
+
     #[test]
     fn civil_1970_is_unix_zero() {
         assert_eq!(days_from_civil(1970, 1, 1), Some(0));
@@ -4925,10 +5122,51 @@ mod tests {
         assert!(near(table.get("ic1_y_err").unwrap()));
         assert!(near(table.get("ic2_x_err").unwrap()));
         assert!(near(table.get("ic2_y_err").unwrap()));
+        assert!(near(table.get("ic1_x_err_rel").unwrap()));
+        assert!(near(table.get("ic1_r_err").unwrap()));
+        assert!(near(table.get("ic2_r_err_rel").unwrap()));
         let plan_x = table.get("plan_x").unwrap();
         let plan_y = table.get("plan_y").unwrap();
         assert!((plan_x[5] - 5.0).abs() < 1e-3);
         assert!((plan_y[5] - 2.5).abs() < 1e-3);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn sk_req_035_spot_table_removes_one_nozzle_offset() {
+        let root = std::env::temp_dir().join(format!(
+            "scan-kit-nozzle-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let session = root.join("sess");
+        std::fs::create_dir_all(&session).unwrap();
+        std::fs::write(
+            session.join("input_map.csv"),
+            "energy,charge_req,position_x,position_y\n70,1,0,0\n70,2,0,0\n",
+        )
+        .unwrap();
+        std::fs::write(
+            session.join("spot_data.csv"),
+            "ic1_total_dose,ic1_x_spot_position,ic1_y_spot_position\n1,1,0\n2,3,0\n",
+        )
+        .unwrap();
+        let table = load_spot(&root, "sess", false, false, false);
+        let near = |values: &[f32], expected: &[f32]| {
+            assert_eq!(values.len(), expected.len());
+            for (value, expected) in values.iter().zip(expected) {
+                assert!((value - expected).abs() < 1e-4, "{value} {expected}");
+            }
+        };
+        near(table.get("ic1_x_err").unwrap(), &[1.0, 3.0]);
+        near(table.get("ic1_x_err_rel").unwrap(), &[-1.0, 1.0]);
+        near(table.get("ic1_y_err_rel").unwrap(), &[0.0, 0.0]);
+        near(table.get("ic1_r_err").unwrap(), &[1.0, 3.0]);
+        near(table.get("ic1_r_err_rel").unwrap(), &[1.0, 1.0]);
+        near(table.get("ic1_dose_per_mu").unwrap(), &[1.0, 1.0]);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -4959,7 +5197,83 @@ mod tests {
     }
 
     #[test]
+    fn sample_spot_and_layer_clocks_start_where_the_playhead_does() {
+        let root = std::env::temp_dir().join(format!(
+            "scan-kit-clock-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let session = root.join("sess");
+        std::fs::create_dir_all(session.join("layer-0/run-0")).unwrap();
+        std::fs::create_dir_all(session.join("layer-1/run-0")).unwrap();
+        std::fs::write(
+            session.join("input_map.csv"),
+            "energy,charge_req,position_x,position_y,layer_id\n70,1,0,0,1\n90,2,1,0,1\n",
+        )
+        .unwrap();
+        std::fs::write(
+            session.join("layer-0/run-0/timeslice_data_device_units.csv"),
+            "r_ic1_current_dose,rci_in_trigger\n1,1\n1,1\n1,1\n1,1\n",
+        )
+        .unwrap();
+        std::fs::write(
+            session.join("layer-1/run-0/timeslice_data_device_units.csv"),
+            "r_ic1_current_dose,rci_in_trigger\n1,1\n1,1\n",
+        )
+        .unwrap();
+        let samples = load_timeslice(&root, "sess", "ic_current");
+        let time = samples.get("time_s").unwrap();
+        assert_eq!(time.len(), 6);
+        assert_eq!(time[0], 0.0);
+        assert!((time[5] - 0.005).abs() < 1e-6);
+
+        let layers = load_timeslice(&root, "sess", "current_ratio");
+        let layer_time = layers.get("time_s").unwrap();
+        assert_eq!(layer_time.len(), 2);
+        assert!((layer_time[0] - 0.004).abs() < 1e-6);
+        assert!((layer_time[1] - 0.006).abs() < 1e-6);
+
+        std::fs::write(
+            session.join("spot_data.csv"),
+            "ic1_total_dose,timestamp,layer_id\n1,1000,1\n2,2500,2\n",
+        )
+        .unwrap();
+        let spots = load_spot(&root, "sess", false, false, false);
+        let spot_time = spots.get("time_s").unwrap();
+        assert_eq!(spot_time.len(), 2);
+        assert_eq!(spot_time[0], 0.0);
+        assert!((spot_time[1] - 1.5).abs() < 1e-4);
+        let slice_marks = timeslice_layer_marks(&root, "sess");
+        assert_eq!(slice_marks.len(), 1);
+        assert!((slice_marks[0] - 0.004).abs() < 1e-6);
+        let spot_marks = spot_layer_marks(&root, "sess");
+        assert_eq!(spot_marks.len(), 1);
+        assert!((spot_marks[0] - 1.5).abs() < 1e-4);
+
+        let bare = root.join("nostamp");
+        std::fs::create_dir_all(&bare).unwrap();
+        std::fs::write(
+            bare.join("input_map.csv"),
+            "energy,charge_req,position_x,position_y,layer_id\n70,1,0,0,1\n90,2,1,0,1\n",
+        )
+        .unwrap();
+        std::fs::write(
+            bare.join("spot_data.csv"),
+            "ic1_total_dose,layer_id\n1,1\n2,1\n",
+        )
+        .unwrap();
+        let untimed = load_spot(&root, "nostamp", false, false, false);
+        assert!(untimed.get("energy").is_some());
+        assert!(untimed.get("time_s").is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn a_slice_keeps_a_prefix_then_the_rest_of_the_file() {
+        let _gate = slice_gate().lock().unwrap_or_else(|err| err.into_inner());
         let root = std::env::temp_dir().join(format!(
             "scan-kit-slice-{}-{}",
             std::process::id(),
@@ -4968,7 +5282,8 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        let session = root.join("sess");
+        // Other tests load a session named "sess" and would publish this slice's tail.
+        let session = root.join("slice");
         std::fs::create_dir_all(&session).unwrap();
         std::fs::write(
             session.join("input_map.csv"),
@@ -4980,13 +5295,13 @@ mod tests {
             "ic1_total_dose,ic2_total_dose,position_x,position_y\n1,1,0,0\n2,2,4,1\n3,3,8,2\n",
         )
         .unwrap();
-        bind_slice("sess", SliceTake::Spot { rows: 2 });
-        let prefix = load_spot(&root, "sess", false, false, false);
+        bind_slice("slice", SliceTake::Spot { rows: 2 });
+        let prefix = load_spot(&root, "slice", false, false, false);
         assert_eq!(prefix.get("ic1_dose").map(Vec::len), Some(2));
         assert!(!slice_tail_done());
         clear_slice();
-        bind_slice("sess", SliceTake::Spot { rows: 8 });
-        let rest = load_spot(&root, "sess", false, false, false);
+        bind_slice("slice", SliceTake::Spot { rows: 8 });
+        let rest = load_spot(&root, "slice", false, false, false);
         assert_eq!(
             rest.get("ic1_dose").map(Vec::as_slice),
             Some([1.0, 2.0, 3.0].as_slice())
@@ -4998,6 +5313,7 @@ mod tests {
 
     #[test]
     fn a_growing_timeslice_matches_the_full_table() {
+        let _gate = slice_gate().lock().unwrap_or_else(|err| err.into_inner());
         let root = std::env::temp_dir().join(format!(
             "scan-kit-grow-{}-{}",
             std::process::id(),

@@ -43,6 +43,46 @@ it("opens the session menu without throwing", async () => {
   const item = document.querySelector("[data-slot=dropdown-menu-item]");
   expect(item).toBeInstanceOf(HTMLElement);
   expect((item as HTMLElement).className).toContain("whitespace-nowrap");
+  const copied: string[] = [];
+  const tuned: number[] = [];
+  const toggled: number[] = [];
+  let closed = 0;
+  await act(async () => {
+    root.render(
+      <SessionContextMenu
+        sessionId="1022244633"
+        x={12}
+        y={24}
+        rowIds={["1022244633", "1022244634"]}
+        rowsSelected
+        onClose={() => {
+          closed += 1;
+        }}
+        onCopy={(id) => copied.push(id)}
+        onTune={() => tuned.push(1)}
+        onToggleRows={() => toggled.push(1)}
+      />,
+    );
+  });
+  expect(document.body.textContent).toContain("Deselect Rows");
+  const click = (selector: string) => {
+    const node = document.querySelector(selector);
+    expect(node).toBeInstanceOf(HTMLElement);
+    (node as HTMLElement).dispatchEvent(new MouseEvent("click", { bubbles: true }));
+  };
+  await act(async () => {
+    click("[data-slot=dropdown-menu-checkbox-item]");
+    click("[data-slot=dropdown-menu-item]");
+  });
+  const items = [...document.querySelectorAll("[data-slot=dropdown-menu-item]")];
+  const tune = items.find((node) => node.textContent?.includes("Config Tuning"));
+  await act(async () => {
+    tune?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+  });
+  expect(copied).toEqual(["1022244633"]);
+  expect(toggled).toEqual([1]);
+  expect(tuned).toEqual([1]);
+  expect(closed).toBeGreaterThanOrEqual(3);
   await act(async () => {
     root.unmount();
   });

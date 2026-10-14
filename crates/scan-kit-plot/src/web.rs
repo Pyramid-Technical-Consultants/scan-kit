@@ -12,6 +12,8 @@ pub struct WebPlot {
     config: wgpu::SurfaceConfiguration,
     backend: String,
     plot: Option<Plot>,
+    /// Panel that fills this canvas. The shell owns the grid.
+    panel: Option<u32>,
 }
 
 #[wasm_bindgen]
@@ -94,6 +96,7 @@ impl WebPlot {
             config,
             backend,
             plot: None,
+            panel: None,
         })
     }
 
@@ -101,16 +104,64 @@ impl WebPlot {
         self.backend.clone()
     }
 
+    /// Move time-panel cameras to the playhead window. `force` replaces a zoom.
+    pub fn follow(&mut self, on: bool, lo: f32, hi: f32, force: bool) {
+        if let Some(plot) = self.plot.as_mut() {
+            plot.follow_time(on, lo, hi, force);
+        }
+    }
+
     /// Replace the scene with a payload from `scan_kit_open_plot`.
     pub fn load(&mut self, bytes: &[u8]) -> Result<(), JsValue> {
         let mut plot = Plot::from_payload(bytes).map_err(|err| JsValue::from_str(&err))?;
-        if let Some(previous) = self.plot.take() {
+        if let Some(mut previous) = self.plot.take() {
+            if let Err(err) = plot.adopt_lines(&mut previous, &self.gpu.device, &self.gpu.queue) {
+                self.plot = Some(previous);
+                return Err(JsValue::from_str(&err));
+            }
             plot.adopt_view(&previous);
             plot.keep_heatmaps(previous);
+        } else if plot.needs_cached_lines() {
+            return Err(JsValue::from_str(
+                "plot lines are not in the previous picture",
+            ));
+        }
+        if let Some(panel) = self.panel {
+            plot.set_solo(Some(panel as usize));
         }
         plot.apply(self.config.width, self.config.height, &PlotInput::default());
         self.plot = Some(plot);
         Ok(())
+    }
+
+    /// Draw this one panel across the canvas. The shell lays the other cells out.
+    pub fn solo(&mut self, panel: u32) {
+        self.panel = Some(panel);
+        if let Some(plot) = self.plot.as_mut() {
+            plot.set_solo(Some(panel as usize));
+        }
+    }
+
+    /// Crosshair voxel, or empty when the picture has no dose.
+    pub fn dose_cursor(&self) -> Vec<u32> {
+        self.plot
+            .as_ref()
+            .map(|plot| plot.dose_cursor())
+            .unwrap_or_default()
+    }
+
+    /// Same voxel on every cell, so a slice drag moves the other profiles.
+    pub fn set_dose_cursor(&mut self, x: u32, y: u32, z: u32) {
+        if let Some(plot) = self.plot.as_mut() {
+            plot.set_dose_cursor([x as usize, y as usize, z as usize]);
+        }
+    }
+
+    /// Height of the dose toolbar, in framebuffer pixels. The picture starts below it.
+    pub fn set_chrome(&mut self, px: f32) {
+        if let Some(plot) = self.plot.as_mut() {
+            plot.set_chrome(px);
+        }
     }
 
     /// Canvas backing size in device pixels.
@@ -131,13 +182,15 @@ impl WebPlot {
         self.input(PlotInput::default());
     }
 
-    pub fn pan(&mut self, x: f32, y: f32, dx: f32, dy: f32) {
+    pub fn pan(&mut self, x: f32, y: f32, dx: f32, dy: f32, buttons: u32, shift: bool) {
         self.input(PlotInput {
             x,
             y,
             dx,
             dy,
             drag: true,
+            buttons: buttons as u8,
+            shift,
             ..PlotInput::default()
         });
     }
@@ -149,6 +202,46 @@ impl WebPlot {
             wheel,
             ..PlotInput::default()
         });
+    }
+
+    /// Panel rectangles in framebuffer pixels, for the cell and plot pickers.
+    pub fn frames(&self) -> String {
+        self.plot
+            .as_ref()
+            .map(|plot| {
+                let (width, height) = (self.config.width, self.config.height);
+                plot.frames_json(width, height)
+            })
+            .unwrap_or_else(|| "[]".into())
+    }
+
+    /// Blender numpad view for the dose turntable. `true` when the key was used.
+    pub fn dose_key(&mut self, key: &str, ctrl: bool) -> bool {
+        self.plot
+            .as_mut()
+            .is_some_and(|plot| plot.dose_key(key, ctrl))
+    }
+
+    /// Window, gain, color scale, ray mode, and sampling. Returns the level slider, or empty.
+    pub fn paint(&mut self, spec: &str) -> String {
+        self.plot
+            .as_mut()
+            .map(|plot| plot.paint(spec))
+            .unwrap_or_default()
+    }
+
+    /// `rotate` turns a slice. `integral` sums through its plane or along a profile.
+    pub fn dose_action(&mut self, panel: u32, action: &str) {
+        if let Some(plot) = self.plot.as_mut() {
+            plot.dose_action(panel as usize, action);
+        }
+    }
+
+    /// Depth or lateral on the loaded cube. False when the picture has no dose yet.
+    pub fn set_line(&mut self, panel: u32, label: &str) -> bool {
+        self.plot
+            .as_mut()
+            .is_some_and(|plot| plot.set_line(panel as usize, label))
     }
 
     pub fn reset(&mut self) {

@@ -755,7 +755,13 @@ fn http(url: &str, method: &str, body: Option<&[u8]>) -> Result<Vec<u8>, String>
     {
         decode_chunks(body)
     } else if let Some(length) = content_length(&header) {
-        Ok(body.get(..length).unwrap_or(body).to_vec())
+        if body.len() < length {
+            return Err(format!(
+                "the device closed {path} after {} of {length} bytes",
+                body.len()
+            ));
+        }
+        Ok(body[..length].to_vec())
     } else {
         Ok(body.to_vec())
     }
@@ -779,7 +785,7 @@ fn decode_chunks(mut data: &[u8]) -> Result<Vec<u8>, String> {
             .windows(2)
             .position(|window| window == b"\r\n")
             .ok_or("truncated chunk")?;
-        let line = std::str::from_utf8(&data[..end]).unwrap_or("0");
+        let line = std::str::from_utf8(&data[..end]).map_err(|_| "truncated chunk".to_string())?;
         let size = usize::from_str_radix(line.split(';').next().unwrap_or("0").trim(), 16)
             .map_err(|err| err.to_string())?;
         data = data.get(end + 2..).unwrap_or(&[]);
@@ -1186,5 +1192,264 @@ mod tests {
         assert!(archive.by_name("sess/session_info.json").is_ok());
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_file(&zip_path);
+    }
+
+    #[test]
+    fn codecs_round_trip_scalars_blobs_and_chunked_bodies() {
+        assert_eq!(display_io(&json!("RCI")), "RCI");
+        assert_eq!(display_io(&json!(3)), "3");
+        assert_eq!(display_io(&Value::Null), "");
+        assert!(display_io(&json!({"a": 1})).contains('a'));
+        let body = connected_body("192.168.1.2", &json!(7), &Value::Null, "/sessions");
+        assert_eq!(body["host"], "192.168.1.2");
+        assert_eq!(body["version"], "7");
+        assert_eq!(body["device_type"], "");
+        assert!(matches!(config_body(), rmpv::Value::Map(_)));
+
+        let packed = rmp_from_json(&json!({
+            "flag": true,
+            "n": -2,
+            "f": 1.5,
+            "s": "spot",
+            "a": [null],
+            "o": {"k": 1}
+        }));
+        let restored = json_of(&packed);
+        assert_eq!(restored["flag"], true);
+        assert_eq!(restored["n"], -2);
+        assert_eq!(restored["s"], "spot");
+        assert_eq!(json_of(&rmpv::Value::F32(1.25)), json!(1.25));
+        let wide = json_of(&rmpv::Value::from(u64::MAX));
+        assert!(wide.as_u64().is_some() || wide.as_f64().is_some());
+        assert_eq!(json_of(&rmpv::Value::Binary(vec![9, 8])), json!([9, 8]));
+        assert_eq!(json_of(&rmpv::Value::Ext(-1, vec![4])), json!([4]));
+        assert_eq!(message_event(&rmpv::Value::Nil), "");
+        assert!(message_data(&rmpv::Value::Nil).is_none());
+        assert!(map_get(&rmpv::Value::Map(vec![]), "event").is_none());
+
+        let f32_blob = 1.5f32.to_le_bytes().to_vec();
+        let f64_blob = 2.5f64.to_le_bytes().to_vec();
+        let times = 0u64.to_le_bytes().to_vec();
+        let history = rmpv::Value::Map(vec![
+            (rmpv::Value::from("$t"), rmpv::Value::from(1i64)),
+            (
+                rmpv::Value::from("$d"),
+                rmpv::Value::Binary(f32_blob.clone()),
+            ),
+            (rmpv::Value::from("$ts"), rmpv::Value::Binary(times.clone())),
+        ]);
+        assert_eq!(json_of(&unwrap_update(&history)), json!(1.5));
+        let short = rmpv::Value::Map(vec![
+            (rmpv::Value::from("$t"), rmpv::Value::from(2i64)),
+            (
+                rmpv::Value::from("$d"),
+                rmpv::Value::Binary(f64_blob.clone()),
+            ),
+            (rmpv::Value::from("$ts"), rmpv::Value::Binary(vec![0])),
+        ]);
+        assert!(history_last(&short).is_none());
+        assert!(history_last(&rmpv::Value::Nil).is_none());
+        let decoded = decode_blobs(&rmpv::Value::Map(vec![
+            (rmpv::Value::from("$t"), rmpv::Value::from(2i64)),
+            (rmpv::Value::from("$d"), rmpv::Value::Binary(f64_blob)),
+            (rmpv::Value::from("nested"), rmpv::Value::from("x")),
+        ]));
+        assert!(matches!(decoded, rmpv::Value::Array(_)));
+        let nested = decode_blobs(&rmpv::Value::Array(vec![rmpv::Value::from(3)]));
+        assert!(matches!(nested, rmpv::Value::Array(_)));
+        let walked = decode_blobs(&rmpv::Value::Map(vec![(
+            rmpv::Value::from("child"),
+            rmpv::Value::from(1),
+        )]));
+        assert!(matches!(walked, rmpv::Value::Map(_)));
+        assert!(unpack_blob(None, &[]).is_none());
+        assert!(unpack_blob(Some(9), &[0, 0, 0, 0]).is_none());
+        assert_eq!(
+            unwrap_update(&rmpv::Value::Array(vec![])),
+            rmpv::Value::Array(vec![])
+        );
+        let inner = rmpv::Value::Array(vec![
+            rmpv::Value::Array(vec![rmpv::Value::from(1)]),
+            rmpv::Value::Array(vec![rmpv::Value::from(4)]),
+        ]);
+        assert_eq!(json_of(&unwrap_update(&inner)), json!(4));
+        assert_eq!(
+            json_of(&unwrap_update(&rmpv::Value::from("plain"))),
+            json!("plain")
+        );
+
+        assert_eq!(content_length("Host: x\r\nContent-Length: 4\r\n"), Some(4));
+        assert_eq!(content_length("Host: x"), None);
+        assert_eq!(decode_chunks(b"5\r\nhello\r\n0\r\n\r\n").unwrap(), b"hello");
+        assert!(decode_chunks(b"zz").is_err());
+        assert!(decode_chunks(b"5\r\nhi").is_err());
+        assert!(decode_chunks(b"5\r\nhello\r\n\xff\r\n").is_err());
+        assert_eq!(csv_cell("a,b"), "\"a,b\"");
+        assert_eq!(csv_cell("say \"hi\""), "\"say \"\"hi\"\"\"");
+        assert_eq!(csv_cell("plain"), "plain");
+        assert!(read_csv(Path::new("missing-scan-kit.csv")).is_none());
+
+        let dir = std::env::temp_dir().join(format!("scan-kit-codec-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("empty.csv"), "spot_no\n").unwrap();
+        assert!(read_csv(&dir.join("empty.csv")).is_none());
+        ensure_session_info(&dir, "sess").unwrap();
+        ensure_session_info(&dir, "sess").unwrap();
+        ensure_spot_data(&dir).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let port = serve_http(|request| {
+            if request.starts_with("PUT") {
+                return http_response(204, "NO", b"");
+            }
+            if request.to_ascii_lowercase().contains("chunked-path") {
+                return b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\nhello\r\n0\r\n\r\n".to_vec();
+            }
+            if request.contains("missing-header") {
+                return b"not-http".to_vec();
+            }
+            if request.contains("/io/") {
+                return http_response(200, "OK", b"{\"n\":1}");
+            }
+            if request.contains("input_map.csv") {
+                return http_response(200, "OK", b"x");
+            }
+            if request.contains("fail") {
+                return http_response(500, "NO", b"");
+            }
+            if request.contains("short-body") {
+                return b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nxy"
+                    .to_vec();
+            }
+            http_response(404, "NO", b"")
+        });
+        let host = format!("127.0.0.1:{port}");
+        let value = http_json(&host, "admin/version").unwrap();
+        assert_eq!(value["n"], 1);
+        let chunked = http(&format!("http://{host}/chunked-path"), "GET", None).unwrap();
+        assert_eq!(chunked, b"hello");
+        assert!(http(&format!("http://{host}/fail"), "GET", None).is_err());
+        assert!(http(&format!("http://{host}/missing-header"), "GET", None).is_err());
+        let short = http(&format!("http://{host}/short-body"), "GET", None).unwrap_err();
+        assert!(short.contains("2 of 4"));
+        assert!(http("http://not a host/x", "GET", None).is_err());
+
+        let files = std::env::temp_dir().join(format!("scan-kit-dl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&files);
+        let err = download_files(&host, "session", &files, &mut |_, _| false).unwrap_err();
+        assert!(err.contains("cancelled"));
+        let count = download_files(&host, "session", &files, &mut |_, _| true).unwrap();
+        assert!(count >= 1);
+        assert!(files.join("input_map.csv").is_file());
+        let _ = std::fs::remove_dir_all(&files);
+        let refused = open_socket("127.0.0.1:1").unwrap_err();
+        assert!(!refused.is_empty());
+    }
+
+    #[test]
+    fn a_local_mpack_socket_delivers_one_update() {
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut socket = accept_mpack(stream);
+            for _ in 0..8 {
+                let Ok(Message::Binary(_)) = socket.read() else {
+                    break;
+                };
+                let reply = rmpv::Value::Map(vec![
+                    (rmpv::Value::from("event"), rmpv::Value::from("update")),
+                    (
+                        rmpv::Value::from("data"),
+                        rmpv::Value::Map(vec![
+                            (rmpv::Value::from(1), rmpv::Value::from(0)),
+                            (
+                                rmpv::Value::from("/status/value"),
+                                rmpv::Value::Array(vec![
+                                    rmpv::Value::from("ready"),
+                                    rmpv::Value::from(1),
+                                ]),
+                            ),
+                        ]),
+                    ),
+                ]);
+                let mut bytes = Vec::new();
+                rmpv::encode::write_value(&mut bytes, &reply).unwrap();
+                if socket.send(Message::Binary(bytes.into())).is_err() {
+                    break;
+                }
+            }
+        });
+        let mut socket = dial(&format!("127.0.0.1:{port}")).unwrap();
+        send(&mut socket, "config", Some(config_body())).unwrap();
+        set_field(&mut socket, "status", &json!(true)).unwrap();
+        let value = read_one(&mut socket, "status", Duration::from_secs(2)).unwrap();
+        assert_eq!(value, json!("ready"));
+        let _ = recv(&mut socket, Duration::from_millis(50));
+    }
+
+    fn accept_mpack(mut stream: TcpStream) -> WebSocket<TcpStream> {
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 1024];
+        loop {
+            let count = stream.read(&mut tmp).unwrap();
+            if count == 0 {
+                break;
+            }
+            buf.extend_from_slice(&tmp[..count]);
+            if buf.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+        let header = String::from_utf8_lossy(&buf);
+        let key = header
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("sec-websocket-key")
+                    .then(|| value.trim())
+            })
+            .expect("websocket key");
+        let accept = tungstenite::handshake::derive_accept_key(key.as_bytes());
+        let response = format!(
+            "HTTP/1.1 101 Switching Protocols\r\n\
+             Upgrade: websocket\r\n\
+             Connection: Upgrade\r\n\
+             Sec-WebSocket-Accept: {accept}\r\n\
+             Sec-WebSocket-Protocol: mpack.v2\r\n\
+             \r\n"
+        );
+        stream.write_all(response.as_bytes()).unwrap();
+        WebSocket::from_raw_socket(stream, tungstenite::protocol::Role::Server, None)
+    }
+
+    fn http_response(status: u16, text: &str, body: &[u8]) -> Vec<u8> {
+        let mut bytes = format!(
+            "HTTP/1.1 {status} {text}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        bytes.extend_from_slice(body);
+        bytes
+    }
+
+    fn serve_http(handler: impl Fn(&str) -> Vec<u8> + Send + 'static) -> u16 {
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        thread::spawn(move || {
+            for _ in 0..80 {
+                let Ok((mut sock, _)) = listener.accept() else {
+                    break;
+                };
+                let mut buf = [0u8; 4096];
+                let count = sock.read(&mut buf).unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..count]).to_string();
+                let _ = sock.write_all(&handler(&request));
+            }
+        });
+        port
     }
 }

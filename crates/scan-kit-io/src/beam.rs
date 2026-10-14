@@ -4,8 +4,21 @@ use scan_kit_dicom::gantry_to_patient;
 
 use super::mc_tables::mc_tables;
 
-const BDL: &str =
+const BDL_UN_RS: &str =
     include_str!("../../../scan_kit/assets/mcsquare/BDL/BDL_default_UN_RangeShifter.txt");
+const BDL_UN: &str = include_str!("../../../scan_kit/assets/mcsquare/BDL/BDL_default_UN.txt");
+const BDL_DN: &str = include_str!("../../../scan_kit/assets/mcsquare/BDL/BDL_default_DN.txt");
+const BDL_DN_RS: &str =
+    include_str!("../../../scan_kit/assets/mcsquare/BDL/BDL_default_DN_RangeShifter.txt");
+
+fn bdl_text(name: &str) -> &'static str {
+    match name {
+        "un" => BDL_UN,
+        "dn" => BDL_DN,
+        "dn_rs" => BDL_DN_RS,
+        _ => BDL_UN_RS,
+    }
+}
 
 struct Model {
     nozzle: f32,
@@ -23,17 +36,7 @@ pub fn beam_record(
     position: &str,
     isocenter_mm: [f32; 3],
 ) -> Result<[f32; 16], String> {
-    let model = model();
-    let rotation = gantry_to_patient(gantry, couch, position)?;
-    let mut rec = [0.0; 16];
-    rec[..9].copy_from_slice(&rotation);
-    rec[9] = isocenter_mm[0] / 10.0;
-    rec[10] = isocenter_mm[1] / 10.0;
-    rec[11] = isocenter_mm[2] / 10.0;
-    rec[12] = model.nozzle;
-    rec[13] = model.smx;
-    rec[14] = model.smy;
-    Ok(rec)
+    beam_record_bdl(gantry, couch, position, isocenter_mm, "un_rs")
 }
 
 /// One kernel spot. `wet_mm` of 0 leaves the range shifter out; NaN uses the library thickness.
@@ -45,7 +48,18 @@ pub fn spot_record(
     wet_mm: f32,
     distance_mm: f32,
 ) -> Result<[f32; 40], String> {
-    let model = model();
+    spot_record_bdl(energy, x, y, beam, wet_mm, distance_mm, "un_rs")
+}
+
+fn fill_spot(
+    model: &Model,
+    energy: f32,
+    x: f32,
+    y: f32,
+    beam: f32,
+    wet_mm: f32,
+    distance_mm: f32,
+) -> Result<[f32; 40], String> {
     let mut rec = [0.0f32; 40];
     rec[0] = x;
     rec[1] = y;
@@ -111,10 +125,46 @@ pub fn spot_record(
 }
 
 pub fn protons_per_mu(energy: f32) -> f32 {
-    column(&model().rows, 3, energy)
+    protons_per_mu_bdl(energy, "un_rs")
 }
 
-fn model() -> Model {
+pub(crate) fn beam_record_bdl(
+    gantry: f32,
+    couch: f32,
+    position: &str,
+    isocenter_mm: [f32; 3],
+    bdl: &str,
+) -> Result<[f32; 16], String> {
+    let model = model_of(bdl);
+    let rotation = gantry_to_patient(gantry, couch, position)?;
+    let mut rec = [0.0; 16];
+    rec[..9].copy_from_slice(&rotation);
+    rec[9] = isocenter_mm[0] / 10.0;
+    rec[10] = isocenter_mm[1] / 10.0;
+    rec[11] = isocenter_mm[2] / 10.0;
+    rec[12] = model.nozzle;
+    rec[13] = model.smx;
+    rec[14] = model.smy;
+    Ok(rec)
+}
+
+pub(crate) fn spot_record_bdl(
+    energy: f32,
+    x: f32,
+    y: f32,
+    beam: f32,
+    wet_mm: f32,
+    distance_mm: f32,
+    bdl: &str,
+) -> Result<[f32; 40], String> {
+    fill_spot(&model_of(bdl), energy, x, y, beam, wet_mm, distance_mm)
+}
+
+pub(crate) fn protons_per_mu_bdl(energy: f32, bdl: &str) -> f32 {
+    column(&model_of(bdl).rows, 3, energy)
+}
+
+fn model_of(name: &str) -> Model {
     let mut nozzle = 0.0;
     let mut smx = 0.0;
     let mut smy = 0.0;
@@ -122,7 +172,7 @@ fn model() -> Model {
     let mut shifter_density = 0.0;
     let mut shifter_wet = 0.0;
     let mut rows = Vec::new();
-    let mut lines = BDL.lines();
+    let mut lines = bdl_text(name).lines();
     while let Some(line) = lines.next() {
         let head = line.trim();
         if head == "Nozzle exit to Isocenter distance" {
@@ -239,5 +289,8 @@ mod tests {
         assert!(shifted[32] > 0.0);
         assert!((shifted[35] - 1.19).abs() < 1e-3);
         assert!(protons_per_mu(100.0) > 1.0e7);
+        let downstream = spot_record_bdl(100.0, 0.0, 0.0, 0.0, 0.0, f32::NAN, "dn").unwrap();
+        assert_eq!(downstream[32], 0.0);
+        assert!(protons_per_mu_bdl(100.0, "dn").is_finite());
     }
 }

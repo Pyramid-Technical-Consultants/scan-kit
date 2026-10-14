@@ -65,7 +65,7 @@ pub fn write(parent: &Path, params: &Value, db: &Path) -> Result<Value, String> 
         "note": note,
         "summary": phantom_summary(params)?,
         "status": format!(
-            "Wrote {note} to {text}. Dose Volume's Open Study starts here next."
+            "Wrote {note} to {text}. Volumetric's Open Study starts here next."
         )
     }))
 }

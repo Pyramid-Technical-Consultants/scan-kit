@@ -2,6 +2,14 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Density or contour built from a timed cloud.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CloudStyle {
+    Density,
+    Contour,
+}
+
 /// One drawable series in data coordinates.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -17,6 +25,11 @@ pub enum Series {
         ys: Vec<f32>,
         color: [f32; 4],
         radius: f32,
+        /// Sample time, one entry per point. Empty means the point is always drawn.
+        /// A live scatter fills this so playback can hide rows outside the playhead
+        /// without building the cloud again.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        times: Vec<f32>,
     },
     Bars {
         edges: Vec<f32>,
@@ -59,6 +72,21 @@ pub enum Series {
         ys: Vec<f32>,
         color: [f32; 4],
         thickness: f32,
+    },
+    /// Timed samples a density or contour was counted from. The plot does not
+    /// draw these as dots. A playhead step counts the visible window into the
+    /// heatmap or contour that precedes this series.
+    Cloud {
+        xs: Vec<f32>,
+        ys: Vec<f32>,
+        times: Vec<f32>,
+        x0: f32,
+        x1: f32,
+        y0: f32,
+        y1: f32,
+        style: CloudStyle,
+        #[serde(default)]
+        cutoff: f32,
     },
 }
 
@@ -171,7 +199,7 @@ pub struct Control {
     /// Sidebar fieldset. Empty lands in Options.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub group: String,
-    /// `check` is a checkbox. Empty is a select.
+    /// `check` is a checkbox. `radio` is an exclusive button group. Empty is a select.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub kind: String,
 }
@@ -206,6 +234,18 @@ impl Control {
         self
     }
 
+    pub fn radio(mut self) -> Self {
+        self.kind = "radio".to_string();
+        self
+    }
+
+    pub fn icons(mut self, icons: &[&str]) -> Self {
+        for (choice, icon) in self.options.iter_mut().zip(icons) {
+            choice.icon = (*icon).to_string();
+        }
+        self
+    }
+
     pub fn labels(&self) -> Vec<&str> {
         self.options
             .iter()
@@ -221,6 +261,83 @@ pub struct DataTable {
     pub rows: Vec<Vec<String>>,
 }
 
+/// Dose grid the plot uploads once. Slice and 3D cells sample it locally.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct VolumeMark {
+    /// Dose samples, x-fastest.
+    pub values: Vec<f32>,
+    /// CT samples under the wash. Empty leaves the wash on its own.
+    #[serde(default)]
+    pub ct: Vec<f32>,
+    /// Structure id per voxel. `0` is outside every outline.
+    #[serde(default)]
+    pub labels: Vec<u8>,
+    pub shape: [u32; 3],
+    pub origin: [f32; 3],
+    pub voxel: f32,
+    #[serde(default)]
+    pub ramp: u8,
+    #[serde(default)]
+    pub lo: f32,
+    #[serde(default)]
+    pub hi: f32,
+    /// Dose window before gain or a manual window. Both zero means the plot measures the cube.
+    #[serde(default)]
+    pub base_lo: f32,
+    #[serde(default)]
+    pub base_hi: f32,
+    /// 0 is treated as 1 when the plot attaches the grid.
+    #[serde(default)]
+    pub gain: f32,
+    #[serde(default)]
+    pub opacity: f32,
+    /// 0 integrate, 1 maximum, 2 transparent.
+    #[serde(default)]
+    pub mode: u8,
+    /// 0 nearest, 1 linear, 2 cubic.
+    #[serde(default)]
+    pub filter: u8,
+    /// Degrees about +X. 90 lays beam depth along Y. 0 leaves the lattice as deposited.
+    #[serde(default)]
+    pub gantry: f32,
+    /// Color-bar unit. Empty draws the bar without a title.
+    #[serde(default)]
+    pub unit: String,
+    /// Cyan phantom box in the 3D march.
+    #[serde(default)]
+    pub show_phantom: bool,
+    /// Field box in millimetres: x0, x1, y0, y1, z0, z1. A zero span draws nothing.
+    #[serde(default)]
+    pub field: [f32; 6],
+    /// Other loaded sessions, in selection order. An empty `values` buffer is the
+    /// cube in `values` above (`session_focus`). Line plots draw every entry.
+    #[serde(default)]
+    pub sessions: Vec<SessionDose>,
+    /// Palette ink for `sessions`, same order. Empty keeps the foreground.
+    #[serde(default)]
+    pub session_colors: Vec<[f32; 4]>,
+    /// Which `sessions` entry is the cube shown in the image cells.
+    #[serde(default)]
+    pub session_focus: u32,
+    /// Plan dose for each session, same order as `sessions` (or one entry when
+    /// the image is the only cube). Empty `values` skips the line. The plan is
+    /// dashed on the same samples as the measurement.
+    #[serde(default)]
+    pub plans: Vec<SessionDose>,
+    /// The other chamber in independent mode. Empty in the combined calculation.
+    #[serde(default)]
+    pub companions: Vec<SessionDose>,
+}
+
+/// One session cube for the dose line plots. Empty `values` means the main cube.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct SessionDose {
+    pub values: Vec<f32>,
+    pub shape: [u32; 3],
+    pub origin: [f32; 3],
+    pub voxel: f32,
+}
+
 /// What a view workflow returns before pixels are rendered.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PlotScene {
@@ -228,14 +345,23 @@ pub struct PlotScene {
     pub panels: Vec<Panel>,
     pub controls: Vec<Control>,
     pub table: Option<DataTable>,
-    /// Audio samples at 1 kHz, when the view is Audio Explorer.
-    pub samples: Vec<f32>,
     /// Columns in the panel grid. `0` packs panels into a square.
     pub columns: u32,
     /// Relative column widths. Empty means equal columns.
     pub column_weights: Vec<f32>,
     /// Relative row heights. Empty means equal rows.
     pub row_weights: Vec<f32>,
+    /// Panels at the end of `panels` that fill the right column.
+    /// `0` keeps the row-major grid.
+    #[serde(default)]
+    pub side: u32,
+    /// Left and right weight of every row when `columns` is 2 and this holds
+    /// one pair per panel. Empty shares [`Self::column_weights`] across rows.
+    #[serde(default)]
+    pub row_splits: Vec<f32>,
+    /// Volume sampled by the dose workspace. Empty for every other view.
+    #[serde(default)]
+    pub volume: VolumeMark,
 }
 
 impl PlotScene {
@@ -245,10 +371,12 @@ impl PlotScene {
             panels: Vec::new(),
             controls: Vec::new(),
             table: None,
-            samples: Vec::new(),
             columns: 0,
             column_weights: Vec::new(),
             row_weights: Vec::new(),
+            side: 0,
+            row_splits: Vec::new(),
+            volume: VolumeMark::default(),
         }
     }
 }

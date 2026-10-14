@@ -42,7 +42,7 @@ Tools:
 - `scan_kit_load_timeslice` and `scan_kit_channel_catalog`, granular
 - `scan_kit_analysis_scene`, workflow, builds one view scene from the selected sessions
 - `scan_kit_run_view`, workflow, paints that scene to one RGBA frame for MCP and tests
-- `scan_kit_calibrate`, `scan_kit_dose_error`, `scan_kit_beam_mask`, `scan_kit_bin_edges`, `scan_kit_histogram`, `scan_kit_welch`, and `scan_kit_fit_decay`, granular
+- `scan_kit_calibrate`, `scan_kit_dose_error`, `scan_kit_beam_mask`, `scan_kit_bin_edges`, `scan_kit_histogram`, and `scan_kit_welch`, granular
 - `scan_kit_open_study` and `scan_kit_clinical_goal`, the DICOM study index and a dose-volume goal
 - `scan_kit_plan_catalog`, granular, lists the four plan templates and their parameter specs
 - `scan_kit_synthesize_plan`, workflow, builds an input map CSV from one of those templates
@@ -81,11 +81,11 @@ Chrome uses shadcn semantic tokens (`bg-background`, `text-foreground`, `bg-card
 
 Tabular data, including the session list and Session Log Compare, is drawn by [Glide Data Grid](https://grid.glideapps.com/). The grid theme is filled from the stock tokens (background, card, foreground, muted foreground, border, accent, and the Geist font). Those tokens are not edited. A DOM table, including a shadcn Table, is not used for data.
 
-The Analysis menu opens a view when one to five sessions are selected. Controls are shadcn components added with `shadcn add` (Select and Field for choices), not native form elements. A control change calls `scan_kit_open_plot`, which returns one binary payload: a JSON header (controls, table, samples, panel frames) and the encoded marks. The webview loads that payload into `scan-kit-plot` built for wasm32 and draws on the canvas with WebGPU, or WebGL2 where WebGPU is missing. Wheel, drag, hover, and resize stay in the webview. No frame crosses the Tauri bridge. `scan_kit_run_view` renders the same `Plot` offscreen and returns one base64 frame for MCP and tests, colored from the stock tokens. Audio Explorer plays and exports the open plot's samples with Web Audio. Dose Volume can open a DICOM folder through `scan_kit_open_study`.
+The Analysis menu opens a view when one to five sessions are selected. Controls are shadcn components added with `shadcn add` (Select and Field for choices), not native form elements. A control change calls `scan_kit_open_plot`, which returns one binary payload: a JSON header (controls, table, panel frames) and the encoded marks. The webview loads that payload into `scan-kit-plot` built for wasm32 and draws on the canvas with WebGPU, or WebGL2 where WebGPU is missing. Wheel, drag, hover, and resize stay in the webview. No frame crosses the Tauri bridge. `scan_kit_run_view` renders the same `Plot` offscreen and returns one base64 frame for MCP and tests, colored from the stock tokens. Volumetric can open a DICOM folder through `scan_kit_open_study`.
 
 A plotted series contains every sample that passed the view's filters. Nothing drops rows before the camera exists: no fixed stride, bucket count, or point cap on a line or a scatter. Histograms, contours, and spectra still reduce the samples, and they count every sample that passed the filter. The renderer may later simplify a stroke for the current camera when several samples fall in one pixel. That simplification keeps the extrema in the pixel, and a camera that gives a sample its own pixel draws the sample. Zoom and pan stay in the webview, so a thinned payload can never grow back.
 
-Row filters are one segment list, combined with AND, and the mask is computed once per table. Beam, rank, a column range, and a threshold compare are kinds of that list. A later cut, including energy, time, and a dose threshold, is another kind. Playback writes the time range; it does not grow a second filter.
+Row filters are one segment list, combined with AND, and the mask is computed once per table. Beam, rank, a column range, and a threshold compare are kinds of that list. A later cut, including energy, time, and a dose threshold, is another kind. Playback writes the time range; it does not grow a second filter. A timed scatter, contour, or density keeps every sample and its time, on the timeline side column and on the distribution view. The playhead slices the scatter buffer, and counts that same slice into the density texture or contour mesh. Time traces stay the full stroke, and the playhead draws each monotonic stroke as that same kind of buffer range. Moving the playhead does not upload the cloud or the traces again. Confidence, coverage, and the spectrum still reduce on the playhead, so those catch up once the playhead settles.
 
 No custom CSS for color, radius, type, or spacing. A unique visual style, when it exists, is a deliberate change to the shadcn theme, not one-off overrides in a feature change.
 
@@ -99,13 +99,13 @@ A view that takes long enough to block the window runs as a task: one bounded sl
 
 ## Session data
 
-The database path, table names, and `user_version` 3 match the Python store: `~/.scan-kit/scan-kit.sqlite`, tables `prefs`, `libraries`, and `sessions`, WAL, foreign keys. An existing file opens as-is. This window uses the last data folder and the window geometry prefs. Sqlite is the library index, not the sample store.
+The database path is `~/.scan-kit/scan-kit.sqlite`, with tables `prefs`, `libraries`, `sessions`, and `exams`, `user_version` 4, WAL, and foreign keys. Rust writes that version. The Python store stays at version 3 and only migrates a file when its version is older. An existing file opens as-is. This window uses the saved data locations and the window geometry prefs. Sqlite is the library index, not the sample store.
 
 A loaded session keeps one in-memory column table per grain: one row per spot record, one row per timeslice trigger, and one row per timeslice file. Each column has one producer. A view asks for columns by name. A slice window is read once, and a later view decodes any headers it still needs from those bytes.
 
-Discovery reads a local directory of session folders and `.zip`, `.tar`, `.tar.gz`, `.tgz`, `.tar.bz2`, and `.tar.xz`. It reads `termination_summary.txt` out of a folder or archive and does not unpack the archive. Unpacked folders win over an archive with the same id. The sqlite index skips re-parsing when size and mtime match. Map extent is filled from spot positions only when the cached row does not already have it.
+Discovery reads session folders and `.zip`, `.tar`, `.tar.gz`, `.tgz`, `.tar.bz2`, and `.tar.xz`. It reads `termination_summary.txt` out of a folder or archive and does not unpack the archive. Unpacked folders win over an archive with the same id. The sqlite index skips re-parsing when size and mtime match. Map extent is filled from spot positions only when the cached row does not already have it.
 
-SFTP and SMB are not in this phase. A normal path, including a Windows UNC path, needs no extra crate.
+A library root is a local path, a Windows UNC path, or an `sftp://`, `smb://`, `ftp://`, or `http://` URL. `ssh` and `scp` open as SFTP, and `ftps` and `https` are included. The password stays in process memory. UNC and `smb://` are read through the operating system. SFTP uses `ssh2`, FTP uses `suppaftp`, and an http URL is one archive downloaded with `ureq`. The first view of a remote session copies it into `~/.scan-kit/remote-cache`. Discovery walks nested folders that are not themselves sessions, to eight levels, and does not follow symlinks. The same walk records a DICOM exam folder in `exams` and does not walk inside it. Saved locations are one search set. The session catalog is one list, and a repeated folder name is disambiguated with its parent folder.
 
 ## Where not to put logic
 

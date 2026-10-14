@@ -46,6 +46,7 @@ export async function driveTask(
     await invoke("scan_kit_cancel", { task: started.task });
     return;
   }
+  let misses = 0;
   for (;;) {
     if (stop()) {
       await invoke("scan_kit_cancel", { task: started.task });
@@ -54,8 +55,14 @@ export async function driveTask(
     const raw = await invoke<ArrayBuffer | Uint8Array>("scan_kit_poll", { task: started.task });
     const parsed = parsePoll(bytesOf(raw));
     if (!acceptReport(parsed.report, started.task, started.generation)) {
-      continue;
+      misses += 1;
+      if (!parsed.report.finished && misses < 8) {
+        await new Promise((resolve) => window.setTimeout(resolve, 40));
+        continue;
+      }
+      return;
     }
+    misses = 0;
     if (stop()) {
       await invoke("scan_kit_cancel", { task: started.task });
       return;

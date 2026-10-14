@@ -17,7 +17,7 @@
 
 <p align="center">
   <a href="#the-launcher">
-    <img src="docs/images/launcher-data-analysis.png" alt="Scan Kit Data Analysis launcher showing session browser and unified analysis views" width="920">
+    <img src="docs/images/launcher-data-analysis.png" alt="Scan Kit Data Analysis launcher showing session browser and core analysis views" width="920">
   </a>
   <br>
   <sub><em>Session browser, plot calibration, and one-click access to every analysis view.</em></sub>
@@ -51,11 +51,13 @@ Beyond plotting, Scan Kit helps you:
 | **Session comparison** | Overlay multiple sessions in the same view with distinct colors |
 | **Interactive replay** | Scrub timeslice channels (IC, dDose/dt, sigma, field) in one Qt viewer |
 | **Plan authoring** | Generate `input_map.csv` from templates, DICOM RT Ion plans, or IBA PLD files |
-| **Patient QA** | In **Dose Volume**, recalculate a DICOM RT Ion plan and its logged deliveries on the planning CT with the GPU Monte Carlo, with DVHs, clinical goals, gamma against the TPS dose and an RTDOSE/HTML report |
+| **Patient QA** | In **Volumetric**, recalculate a DICOM RT Ion plan and its logged deliveries on the planning CT with the GPU Monte Carlo, with DVHs, clinical goals, gamma against the TPS dose and an RTDOSE/HTML report |
 | **Plan delivery** | Upload a plan to an RCI, run it, and download the session as a G3 zip |
 | **Config editing** | Browse and edit map2map XML with forms, integrity checks, and auto-tuning |
 
 Scan Kit reads standard DCS session exports (unpacked directories or common archive formats) and works with both G2 and G3 data layouts.
+
+Machine-QA coverage against AAPM TG-224 is described in [docs/quality/tg-224.md](docs/quality/tg-224.md). Scan Kit is not cleared for clinical use. Treatment-release judgment stays outside its specified use.
 
 ## Get started
 
@@ -108,37 +110,35 @@ On a dev install, the default data source is the bundled `test_data/` folder.
 | Upload a plan to an RCI and download the session | Edit `devices.xml` and run auto-tuning |
 
 <p align="center">
-  <img src="docs/images/view-distribution-explorer.png" alt="Distribution Explorer showing planned and measured spot positions" width="780">
+  <img src="docs/images/view-distribution-explorer.png" alt="Distribution showing planned and measured spot positions" width="780">
   &nbsp;&nbsp;
-  <img src="docs/images/view-sigma-energy.png" alt="Binned Summary sigma vs energy violins for IC1 and IC2" width="780">
+  <img src="docs/images/view-sigma-energy.png" alt="Bins sigma vs energy violins for IC1 and IC2" width="780">
   <br>
-  <sub><em>Distribution Explorer (spot positions) and Binned Summary (sigma vs energy), each with a live side panel.</em></sub>
+  <sub><em>Distribution (spot positions) and Bins (sigma vs energy), each with a live side panel.</em></sub>
 </p>
 
 <p align="center">
-  <img src="docs/images/view-dose-ratios-energy.png" alt="Binned Summary dose ratios vs energy with correlation panels" width="920">
+  <img src="docs/images/view-dose-ratios-energy.png" alt="Bins dose ratios vs energy with correlation panels" width="920">
   <br>
-  <sub><em>Binned Summary: dose ratios vs energy, with optional correlation panels for multi-session overlay.</em></sub>
+  <sub><em>Bins: dose ratios vs energy, with optional correlation panels for multi-session overlay.</em></sub>
 </p>
 
 <p align="center">
-  <img src="docs/images/view-dose-volume.png" alt="Dose Volume showing a ray-marched measured dose with field bounds and the control sidebar" width="920">
+  <img src="docs/images/view-dose-volume.png" alt="Volumetric showing a ray-marched measured dose with field bounds and the control sidebar" width="920">
   <br>
-  <sub><em>Dose Volume: measured dose in the phantom, with field bounds and the comparison sidebar.</em></sub>
+  <sub><em>Volumetric: measured dose in the phantom, with field bounds and the comparison sidebar.</em></sub>
 </p>
 
 <p align="center">
-  <img src="docs/images/view-ic-timeslice-replay.png" alt="Timeslice Replay viewer with signal-source controls and timeline brush" width="920">
+  <img src="docs/images/view-ic-timeslice-replay.png" alt="Timeline viewer with signal-source controls and timeline brush" width="920">
   <br>
-  <sub><em>Timeslice Replay: pick a signal source, tick channels, and scrub the timeline brush.</em></sub>
+  <sub><em>Timeline: pick a signal source, tick channels, and scrub the timeline brush.</em></sub>
 </p>
 
 <p align="center">
-  <img src="docs/images/view-magnetic-field-replay.png" alt="Magnetic field timeslice replay with Bx and By traces" width="460">
-  &nbsp;
-  <img src="docs/images/view-fft-explorer.png" alt="FFT Explorer line spectra for IC currents" width="460">
+  <img src="docs/images/view-magnetic-field-replay.png" alt="Magnetic field timeslice replay with Bx and By traces" width="920">
   <br>
-  <sub><em>Magnetic field replay (G3 hall probes) and FFT Explorer spectra.</em></sub>
+  <sub><em>Timeline of the magnetic field, with Bx and By traces.</em></sub>
 </p>
 
 <p align="center">
@@ -196,32 +196,28 @@ Settings persist in `~/.scan-kit/scan-kit.sqlite` and propagate to views that ar
 
 ### 5. Open analysis views
 
-Click any button in the right-hand panel, or use **Analysis** in the menu bar. **Unified Views** and **Specialized Analysis** are the two launcher groups. Each view runs in a background subprocess; a warm worker pool makes the first click feel snappy.
+Click any button in the right-hand panel, or use **Analysis** in the menu bar. **Core Analysis** and **Specialized Analysis** are the two launcher groups. Each view runs in a background subprocess; a warm worker pool makes the first click feel snappy.
 
 ## Analysis views
 
-Views are organized in the launcher as **Unified Views** (configurable explorers with a side panel of metrics and filters) and **Specialized Analysis** (focused plots not yet folded into a unified shell).
+Views are organized in the launcher as **Core Analysis** (configurable explorers with a side panel of metrics and filters) and **Specialized Analysis** (focused plots not yet folded into a core analysis view).
 
-### Unified views
+### Core analysis
 
 Configurable Qt shells for the metrics most sessions need day to day.
 
 | View | Summary |
 |------|---------|
-| Binned Summary | Box / violin / mean / scatter / contour summary. Pick **Y metric** (dose error, dose ratios, dose rate, current ratios, IC current, position error, sigma, sigma error, IC2-IC1 position, spot time) and **X parameter** (energy, target MU, spot time, beam radius). **Filter Data** includes beam on/off/both plus All Data / Within Lower 95% / Upper 5% Only / MAD Outliers. Optional interlock-threshold overlay on dose-vs-MU plots. |
-| Distribution Explorer | Density contours or scatter of position, position error, sigma, sigma error, IC2-IC1 position, confidence correlations, and Gaussian filter coverage, at spot or timeslice grain. |
-| Timeslice Replay | Interactive multi-channel timeslice viewer. See [details](#interactive-replay-views) |
-| FFT Explorer | Frequency-domain line spectra for timeslice IC current, dDose/dt, source beam current, chamber position, sigma, G3 Gaussian peak, magnetic field, and amplifier command/readback. |
-| Audio Explorer | Listen to the same timeslice families, with transport, a live playhead FFT, and **Save WAV** *(needs a working audio device / PortAudio)* |
-| IC Beam Trajectory (3D) | Per-spot IC beam paths in 3D with plan overlay, dipole pivots, and iso/IC planes (visPy) |
-| Dose Volume | Axial, coronal and sagittal slices, a ray-marched 3D volume, and two plots. The logged sessions build the dose from IC, ISO-ray, or plan spots in water, plastic, or metal. A loaded DICOM study's plan and the selected sessions are recalculated by the Monte Carlo on the planning CT (with contours, DVHs, clinical goals, gamma against the TPS, and report export) or in a phantom. See [details](#dose-volume) |
-| Session Log Compare | Layer timings, grouped errors, event browser, two-session diff. See [details](#session-log-compare) |
+| Timeline | Interactive multi-channel timeslice viewer, with an optional spectrum beside each channel. See [details](#timeline) |
+| Bins | Box / violin / mean / scatter / contour summary. Pick **Y metric** (dose error, dose ratios, dose rate, current ratios, IC current, position error, sigma, sigma error, IC2-IC1 position, spot time) and **X parameter** (energy, target MU, spot time, beam radius). **Filter Data** includes beam on/off/both plus All Data / Within Lower 95% / Upper 5% Only / MAD Outliers. Optional interlock-threshold overlay on dose-vs-MU plots. |
+| Distribution | Density contours or scatter of position, position error, sigma, sigma error, IC2-IC1 position, confidence correlations, and Gaussian filter coverage, at spot or timeslice grain. |
+| Volumetric | Axial, coronal and sagittal slices, a ray-marched 3D volume, and two plots. The logged sessions build the dose from IC, ISO-ray, or plan spots in water, plastic, or metal. A loaded DICOM study's plan and the selected sessions are recalculated by the Monte Carlo on the planning CT (with contours, DVHs, clinical goals, gamma against the TPS, and report export) or in a phantom. See [details](#volumetric) |
 
-For position scatter, position-error outliers, beam-on/off IC current histograms, and most dose/position/sigma summaries, start with **Binned Summary** or **Distribution Explorer** instead of opening a dedicated legacy plot.
+For position scatter, position-error outliers, beam-on/off IC current histograms, and most dose/position/sigma summaries, start with **Bins** or **Distribution** instead of opening a dedicated legacy plot.
 
-### Dose Volume
+### Volumetric
 
-The left side is a 2×2 grid over a row of two plots. The grid starts with the axial slice and the 3D volume, then the coronal and sagittal slices. The picker in the top right corner of each cell sets what it shows, independently of the others: two cells can show the same plane. There is one 3D view, so picking it in a cell hands the old cell that cell's plane. Each view's own settings sit in its header, left of the picker. A slice can turn a quarter turn (**⟲ 90°**) or show the whole volume summed through the plane (**∫**) instead of one slice. The 3D view sets whether a ray integrates, keeps its maximum or fades, and nearest, linear or cubic sampling. Slices have mm axes in the frame's coordinates, a box around the grid, and their own color bar. They take the 3D view's color scale and window, except for Integrate rays and percent windows, which are per ray and not per voxel. A summed slice scales to its own range, in Gy·mm. Click a slice to move the crosshair, and scroll to page through slices. Each plot has a picker: **Depth dose** along the beam from the grid edge, **Lateral profile** across the beam and **Longitudinal profile** along it through the crosshair, **Lateral + longitudinal** together, **DVH**, or **Gamma histogram**. A profile's **∫** sums the dose over each plane across the line, in Gy·mm², so a depth dose becomes an integrated depth dose. There are no modes to switch. Two settings pick what runs: **Compare → Plan** and **Phantom → Medium**.
+The left side is a 2×3 grid. Drag the gaps to resize a row or that row's two cells. The grid starts with the axial slice and the 3D volume, then the coronal and sagittal slices, then two plots. The picker in the top right corner of each cell sets what it shows, independently of the others: two cells can show the same plane. There is one 3D view, so picking it in a cell hands the old cell that cell's plane. The dose grid is uploaded once; paging, rotating, and orbiting stay in the view. A loaded planning CT draws on this same grid, with the CT under the dose wash and structure outlines, and the two plots start as a DVH and a gamma histogram. Each view's own settings sit in its header, left of the picker. A slice can turn a quarter turn (**⟲ 90°**) or show the whole volume summed through the plane (**∫**) instead of one slice. The 3D view sets whether a ray integrates, keeps its maximum or fades, and nearest, linear or cubic sampling. Slices have mm axes in the frame's coordinates, a box around the grid, and their own color bar. They take the 3D view's color scale and window, except for Integrate rays and percent windows, which are per ray and not per voxel. A summed slice scales to its own range, in Gy·mm. Click a slice to move the crosshair, and scroll to page through slices. Each plot has a picker: **Depth dose** along the beam from the grid edge, **Lateral profile** across the beam and **Longitudinal profile** along it through the crosshair, **Lateral + longitudinal** together, **DVH**, or **Gamma histogram**. A profile's **∫** sums the dose over each plane across the line, in Gy·mm², so a depth dose becomes an integrated depth dose. There are no modes to switch. Two settings pick what runs: **Compare → Plan** and **Phantom → Medium**.
 - **Session log** measures the logged spots against the session's own plan spots in a phantom. The Sessions section below covers it.
 - **DICOM plan** runs the loaded study's RT Ion Plan, and its matched logged fractions, through the Monte Carlo.
 - **Medium** picks where the beam goes: a uniform phantom, or the study's **Planning CT**. Loading a study with a plan selects the planning CT.
@@ -233,9 +229,9 @@ The left side is a 2×2 grid over a row of two plots. The grid starts with the a
 
 Builds a 1 mm dose volume from the measured spot or timeslice Gaussians and ray-marches it. Position can come from IC1, IC2, the ISO ray between them, or the plan. When a plan is loaded, **Show** switches among the measured volume, measured minus plan, and a 3D gamma map scored the AAPM TG-218 way. **Quantity** is dose in Gy along the Bragg curve, or where monitor units or protons stop.
 
-**Model** picks how each spot deposits dose. **Analytic** is the fast Gaussian fill. **Monte Carlo** transports proton histories on the GPU with the physics of [MCsquare](https://gitlab.com/openmcsquare/MCsquare) (Class II condensed history, energy-loss straggling, multiple Coulomb scattering, nuclear elastic, inelastic and proton–proton interactions, secondary protons transported). It runs through WebGPU, so it needs a GPU with Vulkan, Metal or Direct3D 12. It is offered for **Dose** in water, PMMA, polystyrene, aluminum and copper, the media with MCsquare stopping and nuclear data. **Histories** sets the total simulated for the volume. More histories take longer but are less noisy. The volume fills in progressively. A noisy first picture appears at once and sharpens as histories add up, and you can rotate and zoom the view throughout. A thin bar across the top of the view shows how far the run has got. Raising Histories carries on from the histories already run, while lowering it below what's done starts over. Gamma and the field bounds wait for the finished run. The note under the view gives the ± statistical uncertainty in the high-dose region and the share of energy that left the grid, so widen the grid if that share is large. Measured and plan are simulated with the same random numbers, so their difference and gamma show the delivery rather than the noise. The Monte Carlo already includes scatter in the phantom, so the **Scatter** option is disabled in that mode.
+**Model** picks how each spot deposits dose. **Analytic** is the fast Gaussian fill. **Monte Carlo** transports proton histories on the GPU with the physics of [MCsquare](https://gitlab.com/openmcsquare/MCsquare) (Class II condensed history, energy-loss straggling, multiple Coulomb scattering, nuclear elastic, inelastic and proton–proton interactions, secondary protons transported). It runs through WebGPU, so it needs a GPU with Vulkan, Metal or Direct3D 12. It is offered for **Dose** in water, PMMA, polystyrene, aluminum and copper, the media with MCsquare stopping and nuclear data. **Histories** sets the total simulated for the volume. More histories take longer but are less noisy. The volume fills in progressively. A noisy first picture appears at once and sharpens as histories add up, and you can rotate and zoom the view throughout. A thin bar across the top of the view shows how far the run has got. Raising Histories carries on from the histories already run, while lowering it below what's done starts over. Gamma and the field bounds wait for the finished run. The note under the view gives the ± statistical uncertainty in the high-dose region and the share of energy that left the grid, so widen the grid if that share is large. Measured and plan are simulated with the same random numbers, so their difference and gamma show the delivery rather than the noise. Multiple Coulomb scattering in the phantom is part of the analytic fill. Monte Carlo transports that scattering with the histories.
 
-**Beam** sets the energy spread and the plan spot size: this session per layer, another loaded session, or the interlock. Measured spots keep the logged chamber σ. Scatter in the phantom widens measured and plan together. **Phantom** picks the medium (water, PMMA, polystyrene, polyethylene, A-150, aluminum, or copper), the thickness, and any entrance water-equivalent thickness. **Field Bounds** reports the field size, by default the lateral 50% edge on each slice (ICRU 78), with options for the high-dose core and the planned 90% volume. **View** sets the gantry angle, the voxel size, and the spot cap. See the [screenshot](#screenshots).
+**Beam** sets the energy spread and the plan spot size: this session per layer, another loaded session, or the interlock. Measured spots keep the logged chamber σ. Multiple Coulomb scattering in the phantom widens measured and plan together. **Phantom** picks the medium (water, PMMA, polystyrene, polyethylene, A-150, aluminum, or copper), the thickness, and any entrance water-equivalent thickness. **Field Bounds** reports the field size, by default the lateral 50% edge on each slice (ICRU 78), with options for the high-dose core and the planned 90% volume. **View** sets the gantry angle and the voxel size. See the [screenshot](#screenshots).
 
 #### DICOM study
 
@@ -257,57 +253,22 @@ The sessions selected in the launcher are the logged deliveries:
 
 DVHs (the picked dose bright, the other faded) and **Clinical goals** are for the whole course. The selected dose is scaled to the plan's fraction count. Write one goal per line, like `PTV: D95% >= 95%`, `Cord: Dmax < 45 Gy`, `Lung: V20Gy < 30%` or `Heart: D0.03cc < 30 Gy`. Dose percentages are of **Rx**, which defaults to the plan's target prescription.
 
-**RBE** sets how the shown dose, DVHs and goals are weighted. **Constant 1.1** is the clinical convention and the default. The variable models weight each voxel by its LETd, and all except Unkelbach also by the dose per fraction and **(α/β)x**:
+**RBE** weights the shown dose, DVHs, and clinical goals by 1.0 or 1.1. Gamma against the TPS stays on physical dose.
 
-- **McNamara 2015**: fitted to the largest in vitro dataset. The Dutch proton centres report with it at (α/β)x = 2 Gy, the default here.
-- **Wedenberg 2013** and **Carabe 2012**: the earlier linear-quadratic models.
-- **Unkelbach 2016**: 1 + 0.04 µm/keV × LETd, with no dose or tissue dependence.
-
-LETd is scored in every run, dose-averaged over primary and secondary protons, in water at unit density, as the EPTN consensus recommends. The RBE group lists each checked structure's dose-weighted LETd and RBE, and the report adds both columns to its dose statistics. Changing the model or (α/β)x reweights the finished doses without another Monte Carlo run. Gamma against the TPS always compares physical dose, whatever the model. One (α/β)x applies to every voxel.
-
-**Export report…** writes three kinds of file:
-
-- An RTDOSE for each dose, in the CT's study and frame of reference, holding the raw calculation. Its Image Comments hold the provenance as JSON: input UIDs, calibration and beam-model digests, engine version, GPU, seed, histories and statistical uncertainty.
-- An HTML report with the figure, the delivery table, gamma, the goals and dose statistics.
-- The DVHs as CSV.
+**Export report** writes the study table (frame, beams, uncertainty, clinical goals, and the gamma pass rate) as a text file.
 
 Scan Kit is a research tool, not a medical device. Don't use its dose for clinical decisions.
 
 ### Specialized analysis
 
-Focused plots that still use standalone matplotlib windows:
-
 | View | Summary |
 |------|---------|
-| Beam Error Motion vs Energy | Per-energy position-error spill paths (IC1 solid, IC2 dotted) |
-| Dose Accumulation | Expected vs measured cumulative dose per chamber |
-| Beam-Off Ramp-Down | Beam-off current ramp-down curves (IC1/IC2/IC3) |
+| Session Log Compare | Layer timings, grouped errors, event browser, two-session diff. See [details](#session-log-compare) |
 | IC HV Transient Test | IC high-voltage toggle transients with capacitance re-derived from waveforms |
-| Amplifier Command Correlations | Settled amplifier command vs readback, field, and IC iso position. See [details](#amplifier-command-correlations) |
-| IC Peak Amplitude - Beam-Off (G3) | G3 beam-off peak amplitude distributions |
 
-### Interactive replay views
+### Timeline
 
-**Timeslice Replay** opens a plot with a **Signal Source** list (same metric names and isocenter/chamber variants as Binned Summary and Distribution Explorer where applicable). Sources include **IC current**, **dDose/dt**, **sigma**, **sigma error**, **position**, **position error**, **IC2-IC1 position**, and **magnetic field**. Pick channels within the selected source from the checklist below. Detail traces sit above a compressed timeline brush. See the [screenshots](#screenshots) for examples.
-
-1. Select session(s) and open **Timeslice Replay**.
-2. Choose a signal source from the list, then tick the channels to plot.
-3. Drag the bottom timeline brush to set the detail window (scroll to zoom).
-
-Layer boundaries appear as annotated vertical lines. Multiple sessions overlay with distinct colors. Large windows are auto-decimated so scrubbing stays smooth.
-
-Optional toggles: background subtract, peer overlay (single-session), beam-off edges, digital lanes, and beam-current twin axis.
-
-**Magnetic field** channels plot scan-magnet probes in gauss:
-
-- **G3:** `r_tx2_probe_x` / `r_tx2_probe_y` (TX2 hall probes)
-- **G2:** `field_c_x` / `field_c_y` (correcting-coil readback)
-
-Selecting field channels shows a Bx-vs-By scatter panel (colored by energy) beside the timeline.
-
-### Amplifier command correlations
-
-For G2 correcting-coil sessions, this view plots beam-on samples where amplifier commands have reached a settled plateau. Scatter panels relate command to readback, magnetic field, and IC iso position, useful for diagnosing steering-chain consistency end to end.
+Timeline stacks every channel of one timeslice source from the shared Y menu. Channel checkboxes start on. Beam and rank filters use the same segment list as Bins. The timeline along the bottom is off until its checkbox is enabled: play, pause, skip to either end, 1/10×, 1×, or 10×, and either the previous one second or every row at or before the playhead. Layer changes are hairlines on that slider. Playback slides that window across the time traces already on screen. The spectrum and scatter take the window when the playhead settles. FFT draws a Welch spectrum from 1 Hz to 500 Hz to the right of each channel. An optional side scatter draws timeslice rows, with the Distribution XY list.
 
 ### Session log compare
 
@@ -338,13 +299,13 @@ Pick a template, set parameters, preview the spot table, and export. Suggested f
 
 ## Phantom Synthesis
 
-The Scan Kit 2 **Phantom Synthesis** tab writes a synthetic patient study as real DICOM, so you can try **Dose Volume**'s DICOM study source without patient data. The study has three parts:
+The Scan Kit 2 **Phantom Synthesis** tab writes a synthetic patient study as real DICOM, so you can try **Volumetric**'s DICOM study source without patient data. The study has three parts:
 
 - **CT:** a 120 mm water box in air, with bone and lung slabs, only one of them, or neither.
 - **RTSTRUCT:** BODY, the PTV behind the slabs, a ring with a hole, and each slab.
 - **RT Ion Plan:** one pencil-beam field over the PTV.
 
-Set the patient position, CT spacing, energies, gantry and couch angles, spot pitch, range shifter, MU and fractions. The summary line reports the CT size, the layer count, and the MU per fraction. **Write DICOM** writes the study into a new folder under the one you pick. Dose Volume's **Open Study** starts in that folder next time.
+Set the patient position, CT spacing, energies, gantry and couch angles, spot pitch, range shifter, MU and fractions. The summary line reports the CT size, the layer count, and the MU per fraction. **Write DICOM** writes the study into a new folder under the one you pick. Volumetric's **Open Study** starts in that folder next time.
 
 ## Plan Runner
 
@@ -464,7 +425,7 @@ Screenshots in `docs/images/` are captured from real session data with:
 python scripts/capture_doc_screenshots.py
 ```
 
-Requires a local `test_data/` folder (not shipped with the repo). The script grabs launcher tabs and unified view windows off-screen (dark theme for the grab only; it does not persist **View → Theme**) and renders the remaining specialized matplotlib view headlessly.
+Requires a local `test_data/` folder (not shipped with the repo). The script grabs launcher tabs and core analysis windows off-screen (dark theme for the grab only; it does not persist **View → Theme**) and renders the remaining specialized matplotlib view headlessly.
 
 </details>
 
@@ -498,13 +459,13 @@ git submodule update --init third_party/MCsquare
 - `tests/test_dose_mc.py` covers tables, energy bookkeeping, determinism, spot placement, and range against its own stopping powers.
 - `tests/test_qa.py` covers the patient path on a synthetic DICOM study. It checks the beam model, the IEC chain against MCsquare's, energy closure on the CT, delivery matching, DVHs, goals and gamma.
 
-These tests need a hardware WebGPU adapter and skip without one. MCsquare agreement lives in `validation/mcsquare_validate.py`, which you run by hand after changing the Monte Carlo physics, the CT calibration or the beam model. It has three suites:
+These tests need a hardware WebGPU adapter and skip without one. MCsquare agreement lives in `validation/mcsquare_validate.py`, which you run by hand after changing the Monte Carlo physics, the CT calibration or the beam model. The slab suites and the patient suite both run the Rust engine in `scan-kit-compute` (they build `mc-case` if it is missing). The patient suite also checks dose-weighted LETd. It has three suites:
 
 - **fast** (about 30 s): five small, awkward cases at 1e6 GPU histories with looser tolerances. They cover a 1 mm spot, copper at 70 MeV, a water-to-aluminum interface, nuclear build-up at 180 MeV, and three off-axis spots of mixed energy and weight in PMMA.
 - **full** (about 10 min): the fast cases plus water from 70 to 230 MeV at two spot sizes, each other Monte Carlo medium, an entrance WET and a 245-spot field, all at 1e7 histories. The field runs 4× the histories because it spreads them over far more voxels.
 - **patient** (about 1 min): CTs through MCsquare's `default` scanner calibration and `BDL_default_DN_RangeShifter` beam model, at 1e7 histories. It covers a tissue phantom with a bone slab and with a lung slab, a range shifter, an oblique gantry at 45° with couch rotation, and MCsquare's sample CT with three fields. Each case reports 3D gamma at 2 %/2 mm, Dmean, D95, D2 and dose-weighted LETd, over voxels of at least 0.1 g/cm³.
 
-Each case reports the integrated depth dose, R80, lateral σ at three depths, total energy, dose centroid and a 3D gamma. A check runs only the GPU. MCsquare's result for every case is cached in `validation/goldens/` as its summaries plus the dose around the beam.
+Each case reports the integrated depth dose, R80, lateral σ at three depths, total energy, dose centroid and a 3D gamma. A check runs only that engine. MCsquare's result for every case is cached in `validation/goldens/` as its summaries plus the dose around the beam.
 
 ```bash
 python validation/mcsquare_validate.py fast

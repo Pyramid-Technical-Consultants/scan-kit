@@ -33,7 +33,7 @@ type Catalog = {
 };
 
 const IDLE =
-  "Synthetic studies carry no patient data. Open one in Dose Volume with Open Study.";
+  "Synthetic studies carry no patient data. Open one in Volumetric with Open Study.";
 
 export function PhantomSynthesis() {
   const [catalog, setCatalog] = useState<Catalog | null>(null);

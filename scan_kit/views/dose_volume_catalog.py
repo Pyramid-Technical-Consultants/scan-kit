@@ -24,7 +24,6 @@ PLAN_SIGMA_INTERLOCK = "interlock"
 PlanSigmaKind = Literal["measured", "reference", "interlock"]
 DEFAULT_PLAN_SIGMA = PLAN_SIGMA_MEASURED
 
-DEFAULT_SPOT_CAP = 1_000_000
 DEFAULT_GAIN = 1.0
 # Beam energy spread σE in % of E; range straggling is added on top.
 DEFAULT_ENERGY_SPREAD_PCT = 1.0
@@ -186,13 +185,10 @@ class DoseVolumeConfig:
     overlay_plan: bool = False
     plan_sigma: PlanSigmaKind = DEFAULT_PLAN_SIGMA
     plan_sigma_ref: str = ""
-    # Multiple Coulomb scattering in the phantom, applied to measured and plan alike.
-    scatter: bool = True
     show_phantom: bool = False
     show_field: bool = True
     gain: float = DEFAULT_GAIN
     smear_axis_units: float = DEFAULT_ENERGY_SPREAD_PCT
-    splat_cap: int = DEFAULT_SPOT_CAP
     gantry_deg: float = DEFAULT_GANTRY_DEG
     medium: MediumKind = DEFAULT_MEDIUM
     phantom_mm: float = DEFAULT_PHANTOM_MM

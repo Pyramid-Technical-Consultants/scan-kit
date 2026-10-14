@@ -70,7 +70,7 @@ pub(super) fn even_total(n: usize, target: f64) -> Result<Vec<f64>, String> {
     }
     let mut weights = vec![round4(target / n as f64); n];
     apply_remainder(&mut weights, target);
-    if weights.last().copied().unwrap_or(0.0) <= 0.0 {
+    if weights.iter().any(|weight| *weight <= 0.0) {
         return Err(format!(
             "Target Total Weight (MU) is too small to assign a positive weight to each of {n} spots."
         ));
@@ -98,7 +98,7 @@ pub(super) fn random_total(n: usize, target: f64, variance_pct: f64) -> Result<V
     let scale = target / scaled_total;
     let mut weights: Vec<f64> = raw.into_iter().map(|value| round4(value * scale)).collect();
     apply_remainder(&mut weights, target);
-    if weights.last().copied().unwrap_or(0.0) <= 0.0 {
+    if weights.iter().any(|weight| *weight <= 0.0) {
         return Err(format!(
             "Target Total Weight (MU) is too small to assign a positive weight to each of {n} spots at {variance_pct}% variance."
         ));

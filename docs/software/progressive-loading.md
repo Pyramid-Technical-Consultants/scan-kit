@@ -136,7 +136,7 @@ One hook, `useTask`, owns start, poll, cancel, and the generation check. A view 
 
 | View | First paint | Later slices | Face |
 |---|---|---|---|
-| Binned, distribution, timeline, trajectory, spectrum | Controls, then the first session | The other sessions on the same axes | Hairline, "2 of 5" |
+| Binned, distribution, timeline | Controls, then the first session | The other sessions on the same axes | Hairline, "2 of 5" |
 | Timeslice files | First file's rows | The rest, by bytes read | Hairline, determinate |
 | Dose, analytic | Coarse grid or the first spots | The remaining spots, same axes | Hairline |
 | Dose, Monte Carlo | Empty grid after setup | Preview dose and uncertainty | Histories, "40% · ±1.4%" |
