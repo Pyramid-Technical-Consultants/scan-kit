@@ -202,10 +202,19 @@ export function localLinePlot(value: string): boolean {
  * box, and the line-plot picker are not in here. DVH and gamma still go through
  * the view task, because those series are not in the cube.
  */
+function monteCarloModel(model: string | undefined): boolean {
+  return model === "mc" || model === "Monte Carlo";
+}
+
 export function sceneOptions(options: Readonly<Record<string, string>>): Record<string, string> {
   const rest: Record<string, string> = {};
+  const transport = monteCarloModel(options.model);
   for (const [key, value] of Object.entries(options)) {
     if ((DOSE_PAINT_IDS as readonly string[]).includes(key) || key === "plot0" || key === "plot1") {
+      continue;
+    }
+    // Analytic dose ignores the history count. Keep the choice without rebuilding the cube.
+    if (key === "histories" && !transport) {
       continue;
     }
     rest[key] = value;

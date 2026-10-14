@@ -25,6 +25,12 @@ const MC_SEED: u32 = 1;
 const CHAMBERS: &[(&str, &str)] = &[("independent", "Independent"), ("combined", "Combined")];
 const QUANTITY: &[(&str, &str)] = &[("dose", "Dose"), ("mu", "MU"), ("protons", "Protons")];
 const MODEL: &[(&str, &str)] = &[("analytic", "Analytic"), ("mc", "Monte Carlo")];
+
+/// `mc` and the `Monte Carlo` label are the same choice.
+pub fn model_is_monte_carlo(options: &Value) -> bool {
+    pick(options, "model", "analytic", MODEL) == "mc"
+}
+
 const HISTORIES: &[(&str, &str)] = &[
     ("1000000", "1e6"),
     ("3000000", "3e6"),
@@ -687,14 +693,14 @@ pub fn volumetric(
             .radio()
             .icons(&["analytic", "mc"]),
     );
-    if model != "analytic" {
-        controls.push(
-            labeled("histories", "Histories", HISTORIES, &histories.to_string())
-                .grouped("Calculation")
-                .radio()
-                .icons(&["1e6", "3e6", "1e7", "5e7"]),
-        );
-    }
+    // Histories is the Monte Carlo count. It stays selectable in analytic mode
+    // so the next transport uses the count the user already picked.
+    controls.push(
+        labeled("histories", "Histories", HISTORIES, &histories.to_string())
+            .grouped("Calculation")
+            .radio()
+            .icons(&["1e6", "3e6", "1e7", "5e7"]),
+    );
     controls
         .push(labeled("spread", "Energy spread", SPREAD, &trim_num(spread)).grouped("Calculation"));
     if quantity_id != "mu" {
@@ -2183,13 +2189,46 @@ mod tests {
                 .controls
                 .iter()
                 .find(|control| control.id == "model")
-                .map(|control| control.kind.as_str()),
-            Some("radio")
+                .map(|control| {
+                    (
+                        control.kind.as_str(),
+                        control
+                            .options
+                            .iter()
+                            .map(|choice| choice.id.as_str())
+                            .collect::<Vec<_>>(),
+                    )
+                }),
+            Some(("radio", vec!["analytic", "mc"]))
         );
-        assert!(scene
-            .controls
-            .iter()
-            .all(|control| control.id != "histories" && control.id != "scatter"));
+        assert!(scene.controls.iter().all(|control| control.id != "scatter"));
+        assert_eq!(
+            scene
+                .controls
+                .iter()
+                .find(|control| control.id == "histories")
+                .map(|control| {
+                    (
+                        control.kind.as_str(),
+                        control.value.as_str(),
+                        control
+                            .options
+                            .iter()
+                            .map(|choice| (choice.id.as_str(), choice.icon.as_str()))
+                            .collect::<Vec<_>>(),
+                    )
+                }),
+            Some((
+                "radio",
+                "1e7",
+                vec![
+                    ("1000000", "1e6"),
+                    ("3000000", "3e6"),
+                    ("10000000", "1e7"),
+                    ("50000000", "5e7")
+                ]
+            ))
+        );
         let mc = super::volumetric(
             &root,
             &["sess".into()],

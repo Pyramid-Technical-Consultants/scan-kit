@@ -290,9 +290,10 @@ fn wants_mc(view: &str, options: &Value) -> bool {
     if view != "volumetric" {
         return false;
     }
-    let model = options.get("model").and_then(Value::as_str).unwrap_or("");
     let study = options.get("study").and_then(Value::as_str).unwrap_or("");
-    model == "mc" || !study.trim().is_empty()
+    // The button writes `mc`. An older build wrote the label `Monte Carlo`.
+    // Either one has to leave the analytic stage, or the fill draws that cube.
+    scan_kit_io::volumetric::model_is_monte_carlo(options) || !study.trim().is_empty()
 }
 
 fn ended(task: u64, generation: u64, phase: Phase, note: &str) -> Report {
@@ -1897,6 +1898,15 @@ mod tests {
         ));
         assert_eq!(stage.loaded, 1);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_monte_carlo_button_starts_monte_carlo() {
+        assert!(wants_mc("volumetric", &json!({ "model": "Monte Carlo" })));
+        assert!(wants_mc("volumetric", &json!({ "model": "mc" })));
+        assert!(!wants_mc("volumetric", &json!({ "model": "Analytic" })));
+        assert!(!wants_mc("volumetric", &json!({})));
+        assert!(!wants_mc("timeline", &json!({ "model": "Monte Carlo" })));
     }
 
     #[test]

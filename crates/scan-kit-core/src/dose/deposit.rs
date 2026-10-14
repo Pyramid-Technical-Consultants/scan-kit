@@ -354,28 +354,29 @@ fn deposit_lattice(
             &mut values,
             scale,
         );
-        return values;
+    } else {
+        let stride = nz.div_ceil(bands);
+        let plan = &plan;
+        std::thread::scope(|scope| {
+            let plane = nx * ny;
+            let mut rest = values.as_mut_slice();
+            let mut z0 = 0usize;
+            while z0 < nz {
+                let z1 = (z0 + stride).min(nz);
+                let take = (z1 - z0) * plane;
+                let (band, tail) = rest.split_at_mut(take);
+                rest = tail;
+                let z_from = z0;
+                scope.spawn(move || {
+                    paint_band(
+                        kernel, spots, origin, shape, voxel, dose_mode, plan, z_from, z1, band,
+                        scale,
+                    );
+                });
+                z0 = z1;
+            }
+        });
     }
-    let stride = nz.div_ceil(bands);
-    let plan = &plan;
-    std::thread::scope(|scope| {
-        let plane = nx * ny;
-        let mut rest = values.as_mut_slice();
-        let mut z0 = 0usize;
-        while z0 < nz {
-            let z1 = (z0 + stride).min(nz);
-            let take = (z1 - z0) * plane;
-            let (band, tail) = rest.split_at_mut(take);
-            rest = tail;
-            let z_from = z0;
-            scope.spawn(move || {
-                paint_band(
-                    kernel, spots, origin, shape, voxel, dose_mode, plan, z_from, z1, band, scale,
-                );
-            });
-            z0 = z1;
-        }
-    });
     values
 }
 
@@ -789,8 +790,7 @@ fn paint_band(
     }
 }
 
-/// Apply one column's x profile down its y weights. Kept separate so the
-/// multiply is a small loop the compiler will vectorize.
+/// Apply one column's x profile down its y weights.
 #[inline(never)]
 fn paint_column(
     scratch: &mut [f32],
@@ -801,6 +801,12 @@ fn paint_column(
     y0: usize,
     y1: usize,
 ) {
+    #[cfg(target_arch = "x86_64")]
+    if std::is_x86_feature_detected!("avx2") {
+        // SAFETY: the runtime check above is the avx2 gate this function requires.
+        unsafe { paint_column_avx2(scratch, nx, ix0, fx, weights, y0, y1) };
+        return;
+    }
     let width = fx.len();
     for iy in y0..y1 {
         let row = weights[iy];
@@ -809,9 +815,78 @@ fn paint_column(
             continue;
         }
         let start = iy * nx + ix0;
-        for (slot, weight) in scratch[start..start + width].iter_mut().zip(fx) {
-            *slot += row * weight;
+        scale_span(&mut scratch[start..start + width], fx, row);
+    }
+}
+
+/// # Safety
+/// The CPU supports AVX2. `fx` does not alias `scratch` or `weights`, and
+/// `y0..y1` is inside `weights`. When `fx` is non-empty, every painted row
+/// `iy * nx + ix0 .. + fx.len()` is inside `scratch`.
+#[cfg(target_arch = "x86_64")]
+#[inline(never)]
+#[target_feature(enable = "avx2")]
+unsafe fn paint_column_avx2(
+    scratch: &mut [f32],
+    nx: usize,
+    ix0: usize,
+    fx: &[f32],
+    weights: &mut [f32],
+    y0: usize,
+    y1: usize,
+) {
+    use std::arch::x86_64::{
+        _mm256_add_ps, _mm256_loadu_ps, _mm256_mul_ps, _mm256_set1_ps, _mm256_storeu_ps,
+    };
+    if y0 >= y1 {
+        return;
+    }
+    assert!(y1 <= weights.len(), "y weights");
+    let width = fx.len();
+    if width > 0 {
+        let end = (y1 - 1)
+            .checked_mul(nx)
+            .and_then(|base| base.checked_add(ix0))
+            .and_then(|start| start.checked_add(width))
+            .expect("column span");
+        assert!(end <= scratch.len(), "scratch span");
+    }
+    let src = fx.as_ptr();
+    let scratch_ptr = scratch.as_mut_ptr();
+    let weights_ptr = weights.as_mut_ptr();
+    for iy in y0..y1 {
+        let row = *weights_ptr.add(iy);
+        *weights_ptr.add(iy) = 0.0;
+        if row == 0.0 {
+            continue;
         }
+        let dst = scratch_ptr.add(iy * nx + ix0);
+        let scale_v = _mm256_set1_ps(row);
+        let mut i = 0usize;
+        let chunks = width / 8;
+        while i < chunks {
+            let off = i * 8;
+            let acc = _mm256_loadu_ps(dst.add(off));
+            let weight = _mm256_loadu_ps(src.add(off));
+            _mm256_storeu_ps(
+                dst.add(off),
+                _mm256_add_ps(acc, _mm256_mul_ps(weight, scale_v)),
+            );
+            i += 1;
+        }
+        i = chunks * 8;
+        while i < width {
+            *dst.add(i) += row * *src.add(i);
+            i += 1;
+        }
+    }
+}
+
+#[inline(always)]
+fn scale_span(dst: &mut [f32], src: &[f32], scale: f32) {
+    let n = dst.len().min(src.len());
+    for (slot, weight) in dst[..n].iter_mut().zip(&src[..n]) {
+        *slot += scale * *weight;
     }
 }
 
@@ -853,9 +928,7 @@ fn column_weights(
         let y_at = plan.y_groups[spot.y_group].at + spot.y_at;
         let fy = &y_rows[y_at..y_at + (y1 - y0)];
         let scale = spot.weight * fz;
-        for (ky, iy) in (y0..y1).enumerate() {
-            acc[iy] += scale * fy[ky];
-        }
+        scale_span(&mut acc[y0..y1], fy, scale);
         ymin = ymin.min(y0);
         ymax = ymax.max(y1);
     }
@@ -1010,12 +1083,55 @@ pub(super) fn normal_row(
     fill_normal(center, sigma, origin, i0 as isize, voxel, out);
 }
 
+/// One cell of [`fill_normal`], so a plane sample matches the volume row.
+fn normal_at(center: f32, sigma: f32, origin: f32, index: usize, voxel: f32) -> f32 {
+    let mut cell = [0.0f32];
+    fill_normal(center, sigma, origin, index as isize, voxel, &mut cell);
+    cell[0]
+}
+
 /// Cell integrals of one Gaussian. `i0` is the first cell and may sit left of the grid.
+///
+/// A fine voxel uses a two-point rule and a running ratio, so a long row is a
+/// multiply per sample instead of an `erf` per edge. Against the edge integral
+/// that is about 0.001% of the peak cell at a 1 mm voxel and a 3 mm spot, and
+/// smaller as the voxel shrinks. A coarse voxel keeps the edge integral; that
+/// row is only a few cells.
 fn fill_normal(center: f32, sigma: f32, origin: f32, i0: isize, voxel: f32, out: &mut [f32]) {
     if out.is_empty() {
         return;
     }
-    // Adjacent cells share an edge, so one erf covers both sides of that face.
+    let sigma64 = f64::from(sigma).max(1e-3);
+    let step = f64::from(voxel);
+    if step > 0.75 * sigma64 {
+        fill_normal_edges(center, sigma, origin, i0, voxel, out);
+        return;
+    }
+    let center64 = f64::from(center);
+    let origin64 = f64::from(origin);
+    let du = step / sigma64;
+    let decay = (-du * du).exp();
+    let half = 0.5 * step;
+    let offset = half / 3.0f64.sqrt();
+    let scale = half / (sigma64 * (2.0 * std::f64::consts::PI).sqrt());
+    let left = origin64 + i0 as f64 * step + half;
+    let (mut lo, mut lo_step) = gauss_step(left - offset, center64, sigma64, du);
+    let (mut hi, mut hi_step) = gauss_step(left + offset, center64, sigma64, du);
+    for slot in out {
+        *slot = ((lo + hi) * scale) as f32;
+        lo *= lo_step;
+        hi *= hi_step;
+        lo_step *= decay;
+        hi_step *= decay;
+    }
+}
+
+fn gauss_step(x: f64, center: f64, sigma: f64, du: f64) -> (f64, f64) {
+    let u = (x - center) / sigma;
+    ((-0.5 * u * u).exp(), (-u * du - 0.5 * du * du).exp())
+}
+
+fn fill_normal_edges(center: f32, sigma: f32, origin: f32, i0: isize, voxel: f32, out: &mut [f32]) {
     let sig = f64::from(sigma).max(1e-3) * std::f64::consts::SQRT_2;
     let center = f64::from(center);
     let origin = f64::from(origin);
@@ -1161,13 +1277,7 @@ pub(super) fn paint_planes(
                 }
             }
             if hit_y {
-                let y_lo = origin[1] + fy as f32 * voxel;
-                let fy1 = normal_mass(
-                    f64::from(spot.y),
-                    f64::from(sy).max(1e-3),
-                    f64::from(y_lo),
-                    f64::from(y_lo + voxel),
-                ) as f32;
+                let fy1 = normal_at(spot.y, sy, origin[1], fy, voxel);
                 let row = spot.weight * mass * fy1;
                 if row != 0.0 {
                     for (kx, ix) in (ix0..ix1).enumerate() {
@@ -1176,13 +1286,7 @@ pub(super) fn paint_planes(
                 }
             }
             if hit_x {
-                let x_lo = origin[0] + fx as f32 * voxel;
-                let fx1 = normal_mass(
-                    f64::from(spot.x),
-                    f64::from(sx).max(1e-3),
-                    f64::from(x_lo),
-                    f64::from(x_lo + voxel),
-                ) as f32;
+                let fx1 = normal_at(spot.x, sx, origin[0], fx, voxel);
                 let row = spot.weight * mass * fx1;
                 if row != 0.0 {
                     for (ky, iy) in (iy0..iy1).enumerate() {
@@ -1516,11 +1620,36 @@ mod tests {
         super::normal_row(1.2, 3.0, -4.0, 2, 9, 1.0, &mut row);
         assert_eq!(row.len(), 7);
         for (i, weight) in row.iter().enumerate() {
-            let index = 2 + i;
-            let lo = -4.0 + index as f64;
-            let cell = super::normal_mass(1.2, 3.0, lo, lo + 1.0) as f32;
-            assert!((weight - cell).abs() < 1e-6, "{weight} vs {cell}");
+            let lo = -4.0 + (2 + i) as f64;
+            let edge = super::normal_mass(1.2, 3.0, lo, lo + 1.0) as f32;
+            let quad = two_point(1.2, 3.0, lo, 1.0);
+            assert!((weight - edge).abs() < 5e-6, "{weight} vs edge {edge}");
+            assert!((weight - quad).abs() < 1e-6, "{weight} vs quad {quad}");
         }
+        super::normal_row(0.3, 8.0, -40.0, 0, 80, 1.0, &mut row);
+        for (i, weight) in row.iter().enumerate() {
+            let lo = -40.0 + i as f64;
+            let quad = two_point(0.3, 8.0, lo, 1.0);
+            assert!((weight - quad).abs() < 1e-6, "long {i}: {weight} vs {quad}");
+        }
+        super::normal_row(1.2, 3.0, -8.0, 0, 5, 4.0, &mut row);
+        for (i, weight) in row.iter().enumerate() {
+            let lo = -8.0 + i as f64 * 4.0;
+            let edge = super::normal_mass(1.2, 3.0, lo, lo + 4.0) as f32;
+            assert!((weight - edge).abs() < 1e-6, "coarse {weight} vs {edge}");
+        }
+    }
+
+    fn two_point(center: f64, sigma: f64, lo: f64, voxel: f64) -> f32 {
+        let scale = voxel * 0.5 / (sigma * (2.0 * std::f64::consts::PI).sqrt());
+        let h = voxel * 0.5 / 3.0f64.sqrt();
+        let mid = lo + 0.5 * voxel;
+        let mut sum = 0.0;
+        for x in [mid - h, mid + h] {
+            let z = (x - center) / sigma;
+            sum += (-0.5 * z * z).exp();
+        }
+        (sum * scale) as f32
     }
 
     #[test]

@@ -60,6 +60,12 @@ it("keeps color settings off the dose rebuild", () => {
   expect(JSON.stringify(sceneOptions(base))).toBe(
     JSON.stringify(sceneOptions({ ...base, field: "Off" })),
   );
+  expect(JSON.stringify(sceneOptions(base))).toBe(
+    JSON.stringify(sceneOptions({ ...base, histories: "5e7" })),
+  );
+  expect(JSON.stringify(sceneOptions({ ...base, model: "mc" }))).not.toBe(
+    JSON.stringify(sceneOptions({ ...base, model: "mc", histories: "5e7" })),
+  );
   expect(paintSpec({ field: "Off" }, {})).toContain('"field":"Off"');
   expect(paintSpec({ scale: "Turbo", auto: "On", level: "1" }, {})).toContain("Turbo");
   expect(paintSpec({ scale: "Turbo", auto: "On", level: "1" }, {})).not.toContain("level");

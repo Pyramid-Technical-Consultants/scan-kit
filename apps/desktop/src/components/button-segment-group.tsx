@@ -3,10 +3,25 @@ import { cn } from "cn";
 import { optionIcon } from "@/option-icons";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 
-type SegmentOption = string | { label: string; icon?: string; detail?: string; iconOnly?: boolean };
+type SegmentOption = string | {
+  id?: string;
+  label: string;
+  icon?: string;
+  detail?: string;
+  iconOnly?: boolean;
+};
 
 function optionText(option: SegmentOption): string {
   return typeof option === "string" ? option : option.label;
+}
+
+function sameChoice(option: SegmentOption, value: string): boolean {
+  if (typeof option === "string") {
+    return option === value;
+  }
+  return (
+    option.label === value || (option.id != null && option.id.length > 0 && option.id === value)
+  );
 }
 
 function optionGlyph(option: SegmentOption) {
@@ -33,7 +48,8 @@ export function ButtonSegmentGroup({
   onChange: (value: string) => void;
 }) {
   const labels = options.map(optionText);
-  const selected = labels.includes(value) ? value : labels[0];
+  const matched = options.find((option) => sameChoice(option, value));
+  const selected = matched == null ? labels[0] : optionText(matched);
   return (
     <ToggleGroup
       variant="outline"
@@ -63,11 +79,11 @@ export function ButtonSegmentGroup({
             title={detail.length > 0 ? detail : iconOnly ? label : undefined}
             className={cn(
               "shrink cursor-pointer text-sm group-data-horizontal/toggle-group:data-[spacing=0]:first:rounded-l-[min(var(--radius-md),10px)] group-data-horizontal/toggle-group:data-[spacing=0]:last:rounded-r-[min(var(--radius-md),10px)] [&_svg:not([class*='size-'])]:size-4",
-              iconOnly ? "w-7 flex-none px-0" : "min-w-0 flex-1",
+              iconOnly ? "w-7 flex-none px-0" : "min-w-0 flex-1 overflow-hidden",
             )}
           >
             {Icon == null ? null : <Icon />}
-            {iconOnly ? null : label}
+            {iconOnly ? null : <span className="truncate">{label}</span>}
           </ToggleGroupItem>
         );
       })}

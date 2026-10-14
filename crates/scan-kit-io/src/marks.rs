@@ -9,12 +9,16 @@ pub(crate) fn labeled(id: &str, label: &str, pairs: &[(&str, &str)], current: &s
         .find(|(key, _)| *key == current)
         .map(|(_, label)| *label)
         .unwrap_or(current);
-    control(
+    let mut control = control(
         id,
         label,
         &pairs.iter().map(|(_, label)| *label).collect::<Vec<_>>(),
         value,
-    )
+    );
+    for (choice, (key, _)) in control.options.iter_mut().zip(pairs) {
+        choice.id = (*key).to_string();
+    }
+    control
 }
 
 pub(crate) fn control(id: &str, label: &str, options: &[&str], value: &str) -> Control {

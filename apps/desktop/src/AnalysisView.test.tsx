@@ -880,7 +880,11 @@ it("switches analytic and Monte Carlo with radio groups", async () => {
   });
   const starts = vi.mocked(invoke).mock.calls.filter(([name]) => name === "scan_kit_start");
   const last = starts[starts.length - 1]?.[1] as { options?: { model?: string } } | undefined;
-  expect(last?.options?.model).toBe("Monte Carlo");
+  expect(last?.options?.model).toBe("mc");
+  const pressed = [...host.querySelectorAll("button")].find((node) =>
+    node.textContent?.includes("Monte Carlo"),
+  );
+  expect(pressed?.getAttribute("aria-pressed")).toBe("true");
 });
 
 it("shows the progress bar as soon as the model changes", async () => {

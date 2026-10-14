@@ -957,8 +957,11 @@ export function AnalysisView({
       resolved[control.id] = stored != null && stored.trim().length > 0 ? stored : control.value;
       continue;
     }
-    const known = control.options.some((option) => option.label === stored);
-    resolved[control.id] = stored != null && known ? stored : control.value;
+    const match =
+      stored == null
+        ? undefined
+        : control.options.find((option) => option.label === stored || option.id === stored);
+    resolved[control.id] = match != null ? match.label : control.value;
   }
   const dosePaint = viewId === "volumetric" ? paintSpec(resolved, options) : "";
   useEffect(() => {
@@ -1120,13 +1123,23 @@ export function AnalysisView({
           className={disabled ? "opacity-50" : undefined}
         >
           <FieldLabel className="flex-none! shrink-0 whitespace-nowrap">{label}</FieldLabel>
-          <ButtonSegmentGroup
-            options={control.options}
-            value={value}
-            disabled={disabled}
-            label={label}
-            onChange={(next) => apply(slot.id, next)}
-          />
+          <div className="min-w-0 flex-1">
+            <ButtonSegmentGroup
+              options={control.options}
+              value={value}
+              disabled={disabled}
+              label={label}
+              onChange={(next) => {
+                if (next === value) {
+                  return;
+                }
+                const choice = control.options.find(
+                  (option) => option.label === next || option.id === next,
+                );
+                apply(slot.id, choice != null && choice.id.length > 0 ? choice.id : next);
+              }}
+            />
+          </div>
         </Field>
       );
     }
