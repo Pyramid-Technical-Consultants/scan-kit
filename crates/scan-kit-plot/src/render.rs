@@ -6683,6 +6683,7 @@ fn integral_profile_axis(grid: &crate::dose::DoseGrid, kind: u8) -> (f32, f32) {
         }
     };
     match kind {
+        _ if grid.gamma => fold_cube(&grid.volume, kind, &mut lo, &mut hi, &mut any),
         1 => fold(&grid.integrals[1], &mut lo, &mut hi, &mut any),
         _ => fold(&grid.integrals[2], &mut lo, &mut hi, &mut any),
     }
@@ -6867,10 +6868,11 @@ fn profile_curves(
     let [ix, iy, iz] = at;
     let mut series = Vec::new();
     match kind {
-        0 if integrate && own => series.push(cached_depth_integral(grid, iy)),
+        // A gamma grid's cached planes are 2D gamma, not sums of this cube.
+        0 if integrate && own && !grid.gamma => series.push(cached_depth_integral(grid, iy)),
         0 if integrate => series.push(volume.depth_integral(iy)),
         0 => series.push(volume.depth_profile(ix, iy)),
-        _ if integrate && own => series.push(cached_lateral_integral(grid, ix, iz)),
+        _ if integrate && own && !grid.gamma => series.push(cached_lateral_integral(grid, ix, iz)),
         _ if integrate => series.push(volume.lateral_integral(ix, iz)),
         _ => series.push(volume.lateral_profile(ix, iy, iz)),
     }

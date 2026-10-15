@@ -13,7 +13,7 @@ mod paint;
 mod ray;
 
 pub use deposit::{analytic_on, analytic_volume, dose_frame};
-pub use gamma::{field_bounds, gamma_index, robust_high};
+pub use gamma::{field_bounds, gamma_index, projected_gamma, robust_high};
 pub use kernel::{bragg_idd, csda_range_mm, protons_from_mu, through_wet};
 pub use paint::{painted_unit, trim_number, wash_of, LevelSpan, PaintChoice, Wash};
 pub use ray::{

@@ -299,9 +299,10 @@ pub fn volumetric(
     let mut companions = Vec::new();
     let mut plans = Vec::new();
     let mut mc_note = None;
-    // One transport: the focused session's measured spots. The plan and the
-    // other chamber stay analytic, otherwise the last fill replaces the job and
-    // every cube is that same result.
+    // The focused session's measured, second-chamber, and plan cubes all come
+    // from the chosen model, so gamma and the overlays never compare two dose
+    // engines. The runner sees one job per fill, in that order. Other sessions
+    // stay analytic on every cube.
     let focus = session_at(options, session_ids);
     for (index, cloud) in clouds.iter().enumerate() {
         let runner = if index == focus { mc } else { None };
@@ -343,7 +344,7 @@ pub fn volumetric(
                 model,
                 histories,
                 medium_key,
-                None,
+                runner,
                 grid,
                 planes,
             );
@@ -361,7 +362,7 @@ pub fn volumetric(
             model,
             histories,
             medium_key,
-            None,
+            runner,
             grid,
             planes,
         );
@@ -455,6 +456,7 @@ pub fn volumetric(
     }
 
     let mut volume_mark = scan_kit_core::VolumeMark::default();
+    let mut integral_rates: Option<[f32; 3]> = None;
     let mut field_size: Option<String> = None;
     let session_at = session_at(options, session_ids).min(shown.len().saturating_sub(1));
     if has_dose {
@@ -580,6 +582,15 @@ pub fn volumetric(
                     .collect();
                 for panel in &mut panels {
                     crate::workspace::widen_profiles(panel, &extras, at);
+                }
+            }
+            if compare == "gamma" {
+                if let (Some(got), Some(plan)) = (measured.get(session_at), plans.get(session_at)) {
+                    if plan.shape == got.shape && plan.values.len() == got.values.len() {
+                        let planes = scan_kit_core::projected_gamma(got, plan, dd, dta, cutoff);
+                        integral_rates = Some(planes.each_ref().map(|(_, rate)| *rate));
+                        mark.integrals = planes.into_iter().map(|(gamma, _)| gamma).collect();
+                    }
                 }
             }
             volume_mark = mark;
@@ -806,6 +817,14 @@ pub fn volumetric(
             scale,
             wash.level.as_ref(),
         );
+        if let Some([axial, coronal, sagittal]) = integral_rates {
+            controls.push(crate::workspace::readout(
+                "Integral",
+                "gamma_integral",
+                &format!("Axial {axial:.0}% · Coronal {coronal:.0}% · Sagittal {sagittal:.0}%"),
+                "Gamma",
+            ));
+        }
     }
     let layout = if has_dose {
         crate::workspace::layout()
@@ -1169,14 +1188,16 @@ fn fill(
 /// A scene that only changes the compare, window, or cells, and every Monte
 /// Carlo preview, reuses the plan and chamber deposits instead of painting
 /// them again. `key` holds every input of the deposit.
-// ponytail: three cubes (one session's measured, companion, and plan) stay
-// resident. Several sessions at once miss; raise the count if that matters.
+// ponytail: a 256 MB budget. Several large 1 mm sessions still miss; raise it
+// or key a disk cache if that matters.
 fn analytic_cached(
     mat: scan_kit_core::Medium,
     key: Vec<u32>,
     deposit: impl FnOnce() -> Volume,
 ) -> Volume {
+    // Three cubes always stay. Past that, keep cubes up to 64M voxels (256 MB).
     const KEEP: usize = 3;
+    const BUDGET: usize = 64 << 20;
     type Kept = Vec<((&'static str, Vec<u32>), Volume)>;
     static LAST: std::sync::Mutex<Kept> = std::sync::Mutex::new(Vec::new());
     let key = (mat.key, key);
@@ -1193,10 +1214,15 @@ fn analytic_cached(
     let volume = deposit();
     let mut kept = LAST.lock().unwrap_or_else(|err| err.into_inner());
     if held(&mut kept).is_none() {
-        if kept.len() >= KEEP {
+        kept.push((key, volume.clone()));
+        let total = |kept: &Kept| {
+            kept.iter()
+                .map(|(_, cube)| cube.values.len())
+                .sum::<usize>()
+        };
+        while kept.len() > KEEP && total(&kept) > BUDGET {
             kept.remove(0);
         }
-        kept.push((key, volume.clone()));
     }
     volume
 }
@@ -1637,7 +1663,37 @@ fn gamma_with(
     if plan.values.len() != measured.values.len() {
         return (vec![0.0; measured.values.len()], 0, 0);
     }
-    gamma_index(
+    // A compare, plot, or cell change rebuilds the scene on the same cubes.
+    // Matching the cubes exactly is one pass over each, far below a search.
+    // ponytail: two pairs stay resident, about three cubes each. More loaded
+    // sessions search again on every rebuild.
+    const KEEP: usize = 2;
+    type Kept = Vec<([f32; 3], Volume, Volume, (Vec<f32>, u32, u32))>;
+    static LAST: std::sync::Mutex<Kept> = std::sync::Mutex::new(Vec::new());
+    let criteria = [dose_percent, distance_mm, cutoff_pct];
+    let same = |a: &Volume, b: &Volume| {
+        a.shape == b.shape
+            && a.origin == b.origin
+            && a.voxel == b.voxel
+            && a.values.len() == b.values.len()
+            && a.values
+                .iter()
+                .zip(&b.values)
+                .all(|(x, y)| x.to_bits() == y.to_bits())
+    };
+    {
+        let mut kept = LAST.lock().unwrap_or_else(|err| err.into_inner());
+        if let Some(at) = kept
+            .iter()
+            .position(|(c, m, p, _)| *c == criteria && same(m, measured) && same(p, plan))
+        {
+            let hit = kept.remove(at);
+            let result = hit.3.clone();
+            kept.push(hit);
+            return result;
+        }
+    }
+    let result = gamma_index(
         &measured.values,
         &plan.values,
         measured.shape,
@@ -1645,7 +1701,17 @@ fn gamma_with(
         distance_mm,
         [measured.voxel, measured.voxel, measured.voxel],
         cutoff_pct,
-    )
+    );
+    // A blank Monte Carlo capture scores nothing and is instant; keeping it
+    // would push out a real pair.
+    if result.2 > 0 {
+        let mut kept = LAST.lock().unwrap_or_else(|err| err.into_inner());
+        if kept.len() >= KEEP {
+            kept.remove(0);
+        }
+        kept.push((criteria, measured.clone(), plan.clone(), result.clone()));
+    }
+    result
 }
 
 fn gamma_image(template: &Volume, values: &[f32]) -> Volume {
@@ -1905,7 +1971,24 @@ mod tests {
     }
 
     #[test]
-    fn monte_carlo_transports_the_measured_spots() {
+    fn a_kept_gamma_follows_its_cubes() {
+        let cube = |value: f32| Volume {
+            origin: [0.0; 3],
+            shape: [4, 4, 4],
+            voxel: 2.0,
+            values: vec![value; 64],
+        };
+        let (measured, near, far) = (cube(1.0), cube(1.01), cube(1.04));
+        let first = super::gamma_with(&measured, &near, 3.0, 2.0, 10.0);
+        assert_eq!(super::gamma_with(&measured, &near, 3.0, 2.0, 10.0), first);
+        let changed = super::gamma_with(&measured, &far, 3.0, 2.0, 10.0);
+        assert!(changed.1 < first.1, "a new plan reused the old gamma");
+        let looser = super::gamma_with(&measured, &far, 5.0, 2.0, 10.0);
+        assert_ne!(looser.0, changed.0, "new criteria reused the old gamma");
+    }
+
+    #[test]
+    fn monte_carlo_transports_the_measured_spots_and_the_plan() {
         let root = std::env::temp_dir().join(format!(
             "scan-kit-mc-measured-{}-{}",
             std::process::id(),
@@ -1953,14 +2036,14 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&root);
         let xs = xs.borrow();
-        assert_eq!(
-            xs.len(),
-            1,
-            "plan and chamber fills must not start a transport"
-        );
+        assert_eq!(xs.len(), 2, "measured and plan each transport: {xs:?}");
         assert!(
             xs[0].iter().all(|x| x.abs() < 1.0),
-            "transported x {xs:?}, the plan sits at 40 mm"
+            "first transport x {xs:?}, the measured spot sits at 0 mm"
+        );
+        assert!(
+            xs[1].iter().all(|x| (x - 40.0).abs() < 1.0),
+            "second transport x {xs:?}, the plan sits at 40 mm"
         );
         assert!(
             scene
@@ -2276,6 +2359,17 @@ mod tests {
                 "Gamma"
             ]
         );
+        let [nx, ny, nz] = gamma.volume.shape.map(|n| n as usize);
+        let sizes: Vec<usize> = gamma.volume.integrals.iter().map(Vec::len).collect();
+        assert_eq!(
+            sizes,
+            [nx * ny, nx * nz, ny * nz],
+            "integral views carry 2D gamma planes"
+        );
+        assert!(gamma
+            .controls
+            .iter()
+            .any(|control| control.id == "gamma_integral" && control.value.contains("Axial")));
         assert!(gamma
             .controls
             .iter()

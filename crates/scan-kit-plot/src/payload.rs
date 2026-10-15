@@ -220,14 +220,24 @@ pub fn encode_plot_reusing(
             scene.volume.shape[2] as usize,
         ];
         // The view would otherwise scan this cube again on the UI thread.
-        write_scan(
-            &mut out,
-            &scan_kit_core::scan_grid(
-                &scene.volume.values[..voxels],
-                shape,
-                scene.volume.voxel.max(1e-3),
-            ),
+        let mut scan = scan_kit_core::scan_grid(
+            &scene.volume.values[..voxels],
+            shape,
+            scene.volume.voxel.max(1e-3),
         );
+        let given = &scene.volume.integrals;
+        if given.len() == 3
+            && given
+                .iter()
+                .zip(&scan.integrals)
+                .all(|(a, b)| a.len() == b.len())
+        {
+            for (plane, values) in given.iter().enumerate() {
+                scan.integral_peaks[plane] = values.iter().copied().fold(1e-6, f32::max);
+                scan.integrals[plane].clone_from(values);
+            }
+        }
+        write_scan(&mut out, &scan);
     }
     for session in scene
         .volume

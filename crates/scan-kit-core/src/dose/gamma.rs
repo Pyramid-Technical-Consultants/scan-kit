@@ -1,3 +1,5 @@
+use super::Volume;
+
 /// The 99.9th percentile of the positive finite samples.
 pub fn robust_high(values: &[f32]) -> f32 {
     // Positive finite floats sort as their bits. Count the high 16 bits, then
@@ -112,9 +114,44 @@ pub fn gamma_index(
     if mask.is_empty() {
         return (gamma, 0, 0);
     }
-    let offsets = gamma_offsets(spacing, distance_mm.max(1e-3), cap);
+    let mut offsets = gamma_offsets(spacing, distance_mm.max(1e-3), cap);
+    // A one-voxel axis is a plane. Stepping off it blends in the zeros outside,
+    // which a hot evaluated plane would score as a match.
+    offsets.retain(|o| (0..3).all(|axis| shape[axis] > 1 || o[axis] == 0.0));
     let cap2 = cap * cap;
-    let scores = score_mask(reference, evaluated, shape, &mask, &offsets, dd, cap2);
+    // Most voxels of a smooth pair settle within a millimetre. Only a noisy
+    // cube leaves enough behind to pay for the local dose range.
+    let split = offsets.partition_point(|o| o[3] <= 0.25);
+    let start = vec![cap2; mask.len()];
+    let none = vec![0.0; mask.len()];
+    let near = &offsets[..split];
+    let mut scores = score_mask(reference, evaluated, shape, &mask, &none, &start, near, dd);
+    if let Some(next) = offsets.get(split) {
+        let left: Vec<usize> = (0..mask.len())
+            .filter(|&slot| scores[slot] > next[3])
+            .collect();
+        if !left.is_empty() {
+            let rest: Vec<_> = left.iter().map(|&slot| mask[slot]).collect();
+            let from: Vec<f32> = left.iter().map(|&slot| scores[slot]).collect();
+            let floors: Vec<f32> = if len == n && left.len() * 20 > mask.len() {
+                let radius: [usize; 3] = std::array::from_fn(|axis| {
+                    let reach = offsets.iter().fold(0.0f32, |m, o| m.max(o[axis].abs()));
+                    reach.ceil() as usize + 1
+                });
+                let (lo, hi) = local_range(&evaluated[..n], shape, radius);
+                rest.iter()
+                    .map(|&(_, _, _, i)| dose_floor(reference[i], lo[i], hi[i], dd))
+                    .collect()
+            } else {
+                vec![0.0; rest.len()]
+            };
+            let far = &offsets[split..];
+            let more = score_mask(reference, evaluated, shape, &rest, &floors, &from, far, dd);
+            for (slot, g2) in left.into_iter().zip(more) {
+                scores[slot] = g2;
+            }
+        }
+    }
     let mut passed = 0u32;
     for (&(_, _, _, i), g2) in mask.iter().zip(scores) {
         let g = g2.sqrt();
@@ -126,6 +163,42 @@ pub fn gamma_index(
     (gamma, passed, mask.len() as u32)
 }
 
+/// 2D gamma of the doses summed through z, y, and x: axial, coronal, sagittal.
+/// Each plane is its own global gamma in dose × mm, normalized and cut off at
+/// that plane's maximum, with the search kept inside the plane. Returns the γ
+/// planes and each plane's pass percent.
+pub fn projected_gamma(
+    reference: &Volume,
+    evaluated: &Volume,
+    dose_percent: f32,
+    distance_mm: f32,
+    cutoff_pct: f32,
+) -> [(Vec<f32>, f32); 3] {
+    let [nx, ny, nz] = reference.shape;
+    let voxel = reference.voxel.max(1e-6);
+    let sums =
+        |volume: &Volume| super::ray::scan_grid(&volume.values, volume.shape, voxel).integrals;
+    let (got, want) = (sums(reference), sums(evaluated));
+    let planes = [[nx, ny, 1], [nx, nz, 1], [ny, nz, 1]];
+    std::array::from_fn(|plane| {
+        let (gamma, passed, scored) = gamma_index(
+            &got[plane],
+            &want[plane],
+            planes[plane],
+            dose_percent,
+            distance_mm,
+            [voxel; 3],
+            cutoff_pct,
+        );
+        let rate = if scored == 0 {
+            0.0
+        } else {
+            100.0 * passed as f32 / scored as f32
+        };
+        (gamma, rate)
+    })
+}
+
 /// γ² at each masked voxel. Bands own disjoint voxels, so a large field still
 /// searches the whole box instead of three planes.
 fn score_mask(
@@ -133,9 +206,10 @@ fn score_mask(
     evaluated: &[f32],
     shape: [usize; 3],
     mask: &[(usize, usize, usize, usize)],
+    floors: &[f32],
+    from: &[f32],
     offsets: &[[f32; 4]],
     dd: f32,
-    cap2: f32,
 ) -> Vec<f32> {
     let workers = std::thread::available_parallelism()
         .map(|count| count.get())
@@ -147,17 +221,19 @@ fn score_mask(
         workers.min(mask.len() / 512).max(1)
     };
     if bands == 1 {
-        return score_chunk(reference, evaluated, shape, mask, offsets, dd, cap2);
+        return score_chunk(reference, evaluated, shape, mask, floors, from, offsets, dd);
     }
     let chunk = mask.len().div_ceil(bands);
     std::thread::scope(|scope| {
         let mut joins = Vec::new();
-        for band in mask.chunks(chunk) {
-            joins.push(
-                scope.spawn(move || {
-                    score_chunk(reference, evaluated, shape, band, offsets, dd, cap2)
-                }),
-            );
+        let parts = mask
+            .chunks(chunk)
+            .zip(floors.chunks(chunk))
+            .zip(from.chunks(chunk));
+        for ((band, floor), start) in parts {
+            joins.push(scope.spawn(move || {
+                score_chunk(reference, evaluated, shape, band, floor, start, offsets, dd)
+            }));
         }
         joins
             .into_iter()
@@ -171,18 +247,23 @@ fn score_chunk(
     evaluated: &[f32],
     shape: [usize; 3],
     mask: &[(usize, usize, usize, usize)],
+    floors: &[f32],
+    from: &[f32],
     offsets: &[[f32; 4]],
     dd: f32,
-    cap2: f32,
 ) -> Vec<f32> {
-    let mut best = vec![cap2; mask.len()];
-    let mut worst = cap2;
+    let mut best = from.to_vec();
+    // Offsets run nearest first, and no sample can beat a voxel's dose floor,
+    // so a voxel stops once its γ² is at or below this offset's distance term
+    // plus that floor. A noisy voxel no longer searches the whole sphere.
+    let mut active: Vec<usize> = (0..mask.len()).collect();
     for offset in offsets {
-        if offset[3] >= worst {
+        active.retain(|&slot| best[slot] > offset[3] + floors[slot]);
+        if active.is_empty() {
             break;
         }
-        let mut next = 0.0f32;
-        for (slot, &(x, y, z, i)) in mask.iter().enumerate() {
+        for &slot in &active {
+            let (x, y, z, i) = mask[slot];
             let sample = sample_linear(
                 evaluated,
                 shape,
@@ -195,11 +276,84 @@ fn score_chunk(
             if g2 < best[slot] {
                 best[slot] = g2;
             }
-            next = next.max(best[slot]);
         }
-        worst = next;
     }
     best
+}
+
+/// Smallest dose term any sample in `[lo, hi]` can give, shaved so float
+/// rounding in the trilinear sample cannot dip under it.
+fn dose_floor(reference: f32, lo: f32, hi: f32, dd: f32) -> f32 {
+    let gap = (lo - reference).max(reference - hi);
+    if gap.is_nan() || gap <= 0.0 {
+        return 0.0;
+    }
+    let slack = 1e-5 * reference.abs().max(lo.abs()).max(hi.abs());
+    let gap = (gap - slack).max(0.0) / dd;
+    gap * gap * (1.0 - 1e-5)
+}
+
+/// Min and max of `values` over a box of `radius` voxels on each axis. Samples
+/// outside the grid read as zero, as in `sample_linear`.
+fn local_range(values: &[f32], shape: [usize; 3], radius: [usize; 3]) -> (Vec<f32>, Vec<f32>) {
+    let mut lo = values.to_vec();
+    let mut hi = values.to_vec();
+    let [nx, ny, nz] = shape;
+    let strides = [1, nx, nx * ny];
+    for axis in 0..3 {
+        let n = shape[axis];
+        let r = radius[axis];
+        let w = 2 * r + 1;
+        let stride = strides[axis];
+        let mut line_lo = vec![0.0f32; n + 2 * r];
+        let mut line_hi = vec![0.0f32; n + 2 * r];
+        let (mut g, mut h) = (vec![0.0f32; n + 2 * r], vec![0.0f32; n + 2 * r]);
+        for start in 0..nx * ny * nz {
+            if (start / stride) % n != 0 {
+                continue;
+            }
+            for k in 0..n {
+                line_lo[r + k] = lo[start + k * stride];
+                line_hi[r + k] = hi[start + k * stride];
+            }
+            window(&line_lo, w, &mut g, &mut h, f32::min, |k, value| {
+                lo[start + k * stride] = value;
+            });
+            window(&line_hi, w, &mut g, &mut h, f32::max, |k, value| {
+                hi[start + k * stride] = value;
+            });
+        }
+    }
+    (lo, hi)
+}
+
+/// van Herk / Gil–Werman running min or max over windows of `w` samples.
+fn window(
+    line: &[f32],
+    w: usize,
+    g: &mut [f32],
+    h: &mut [f32],
+    op: fn(f32, f32) -> f32,
+    mut put: impl FnMut(usize, f32),
+) {
+    let m = line.len();
+    for i in 0..m {
+        g[i] = if i % w == 0 {
+            line[i]
+        } else {
+            op(g[i - 1], line[i])
+        };
+    }
+    for i in (0..m).rev() {
+        h[i] = if i % w == w - 1 || i == m - 1 {
+            line[i]
+        } else {
+            op(h[i + 1], line[i])
+        };
+    }
+    for j in 0..=m - w {
+        put(j, op(h[j], g[j + w - 1]));
+    }
 }
 
 pub(super) fn gamma_offsets(spacing: [f32; 3], dta: f32, cap: f32) -> Vec<[f32; 4]> {
@@ -267,7 +421,61 @@ pub(super) fn sample_linear(vol: &[f32], shape: [usize; 3], x: f32, y: f32, z: f
 
 #[cfg(test)]
 mod tests {
-    use super::{gamma_index, robust_high};
+    use super::{gamma_index, gamma_offsets, projected_gamma, robust_high, sample_linear, Volume};
+
+    #[test]
+    fn a_noisy_reference_matches_a_full_search() {
+        let shape = [12usize, 10, 9];
+        let n = shape[0] * shape[1] * shape[2];
+        let mut seed = 11u32;
+        let mut next = || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (seed >> 8) as f32 / 16_777_216.0
+        };
+        let evaluated: Vec<f32> = (0..n)
+            .map(|i| 1.0 + 0.2 * ((i % 12) as f32 / 12.0) + 0.1 * next())
+            .collect();
+        // Heavy noise builds the local dose range. Light noise settles near and skips it.
+        for spread in [0.6f32, 0.02] {
+            let reference: Vec<f32> = evaluated
+                .iter()
+                .map(|v| v * (1.0 - spread / 2.0 + spread * next()))
+                .collect();
+            matches_a_full_search(&reference, &evaluated, shape);
+        }
+    }
+
+    fn matches_a_full_search(reference: &[f32], evaluated: &[f32], shape: [usize; 3]) {
+        let n = reference.len();
+        let spacing = [1.0, 1.0, 1.0];
+        let (gamma, _, scored) = gamma_index(reference, evaluated, shape, 3.0, 2.0, spacing, 10.0);
+        assert_eq!(scored as usize, n);
+        let offsets = gamma_offsets(spacing, 2.0, 2.0);
+        let norm = evaluated.iter().copied().fold(0.0f32, f32::max);
+        let dd = 0.03 * norm;
+        for z in 0..shape[2] {
+            for y in 0..shape[1] {
+                for x in 0..shape[0] {
+                    let i = x + shape[0] * (y + shape[1] * z);
+                    let full = offsets
+                        .iter()
+                        .map(|o| {
+                            let s = sample_linear(
+                                evaluated,
+                                shape,
+                                x as f32 + o[0],
+                                y as f32 + o[1],
+                                z as f32 + o[2],
+                            );
+                            o[3] + ((s - reference[i]) / dd).powi(2)
+                        })
+                        .fold(4.0f32, f32::min)
+                        .sqrt();
+                    assert_eq!(gamma[i].to_bits(), full.to_bits(), "voxel {i}");
+                }
+            }
+        }
+    }
 
     #[test]
     fn the_robust_high_matches_a_sorted_rank() {
@@ -331,5 +539,44 @@ mod tests {
             gamma_index(&dose, &dose, shape, 3.0, 2.0, [1.0, 1.0, 1.0], 10.0);
         assert_eq!((scored, passed), (n as u32, n as u32));
         assert!(gamma.iter().all(|value| *value <= 1e-4));
+    }
+
+    #[test]
+    fn a_plane_does_not_search_off_itself() {
+        // 14% hot fails in the plane. Half a millimetre off a 4 mm plane blends
+        // in 12.5% of the zeros outside, which would land on the reference.
+        let shape = [8usize, 8, 1];
+        let reference = vec![1.0f32; 64];
+        let evaluated = vec![1.14f32; 64];
+        let (gamma, _, scored) =
+            gamma_index(&reference, &evaluated, shape, 3.0, 2.0, [4.0; 3], 10.0);
+        assert_eq!(scored, 64);
+        let inside = (1..7).flat_map(|y| (1..7).map(move |x| x + 8 * y));
+        assert!(inside.map(|i| gamma[i]).all(|g| g > 1.0), "{gamma:?}");
+    }
+
+    #[test]
+    fn projected_gamma_scores_each_summed_plane() {
+        let shape = [6usize, 5, 4];
+        let values: Vec<f32> = (0..120).map(|i| 1.0 + (i % 7) as f32 * 0.1).collect();
+        let volume = Volume {
+            origin: [0.0; 3],
+            shape,
+            voxel: 2.0,
+            values,
+        };
+        let planes = projected_gamma(&volume, &volume, 3.0, 2.0, 10.0);
+        let sizes = planes.each_ref().map(|(gamma, _)| gamma.len());
+        assert_eq!(sizes, [30, 24, 20]);
+        assert!(planes.iter().all(|(_, rate)| (*rate - 100.0).abs() < 1e-4));
+        let hot = Volume {
+            values: volume.values.iter().map(|value| value * 1.2).collect(),
+            ..volume.clone()
+        };
+        let planes = projected_gamma(&volume, &hot, 3.0, 2.0, 10.0);
+        assert!(
+            planes.iter().all(|(_, rate)| *rate < 50.0),
+            "20% hot passed"
+        );
     }
 }

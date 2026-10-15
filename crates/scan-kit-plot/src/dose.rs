@@ -440,7 +440,7 @@ pub fn shade_uv(
     let filter = if view.integral { 0 } else { grid.filter };
     let dose = image_sample(&image.values, image.cols, image.rows, x, y, filter);
     let (lo, hi) = if image.own {
-        integral_limits_of(&image.values)
+        integral_limits(grid, view.plane)
     } else {
         window(grid)
     };
@@ -455,8 +455,16 @@ pub fn integral_peak(grid: &DoseGrid, plane: u8) -> f32 {
 }
 
 /// Color window for one plane integral. A positive projection sits on `0..peak`.
-/// A difference keeps its sign, with zero in the middle of the ramp.
+/// A difference keeps its sign, with zero in the middle of the ramp. A gamma
+/// plane is already γ, so it keeps the γ window.
 pub fn integral_limits(grid: &DoseGrid, plane: u8) -> (f32, f32) {
+    if grid.gamma {
+        return if grid.hi > grid.lo {
+            (grid.lo, grid.hi)
+        } else {
+            (0.0, 2.0)
+        };
+    }
     integral_limits_of(&grid.integrals[(plane as usize).min(2)])
 }
 
@@ -966,6 +974,16 @@ mod tests {
         assert!(
             (color[0] - floor[0]).abs() + (color[1] - floor[1]).abs() + (color[2] - floor[2]).abs()
                 > 0.05
+        );
+        let mut gamma = grid;
+        gamma.unit = "γ".into();
+        remember_window(&mut gamma, 0.0, 2.0);
+        (gamma.lo, gamma.hi) = (0.0, 2.0);
+        gamma.integrals[0] = vec![0.5, 1.5, 3.0];
+        assert_eq!(
+            integral_limits(&gamma, 0),
+            (0.0, 2.0),
+            "γ = 1 stays mid-ramp"
         );
     }
 }
