@@ -13,7 +13,7 @@ mod paint;
 mod ray;
 
 pub use deposit::{analytic_on, analytic_volume, dose_frame};
-pub use gamma::{field_bounds, gamma_index, robust_high};
+pub use gamma::{field_bounds, gamma_index, projected_gamma, robust_high};
 pub use kernel::{bragg_idd, csda_range_mm, protons_from_mu, through_wet};
 pub use paint::{painted_unit, trim_number, wash_of, LevelSpan, PaintChoice, Wash};
 pub use ray::{
@@ -26,6 +26,9 @@ pub(super) const K_BETHE: f64 = 0.307075;
 pub(super) const ME: f64 = 0.51099895;
 pub(super) const MP: f64 = 938.27208816;
 pub(super) const NUCLEAR_LOCAL: f64 = 0.6;
+// ponytail: Fermi–Eyges without Highland's log term. 13 MeV keeps the
+// end-of-range width in water within 9% of Preston–Koehler from 70 to 230 MeV,
+// narrow at low energy and wide at high. Highland's log term would close that.
 pub(super) const E_SCATTER: f64 = 13.0;
 pub(super) const MEV_TO_GY_MM3: f64 = 1.602176634e-7;
 pub(super) const LAYER_NODES: usize = 512;
@@ -38,12 +41,11 @@ pub(super) const MAX_CELLS: usize = 512;
 // view does not: that lattice raymarches as a cross.
 pub(super) const PLANE_VISITS: u64 = 8_000_000;
 pub(super) const TABLE_N: usize = 4000;
-pub(super) const W_AIR_EV: f64 = 33.97;
+/// Mean energy per ion pair in dry air for protons, IAEA TRS-398 Rev. 1 (ICRU 90).
+/// 33.97 eV is the electron value.
+pub(super) const W_AIR_EV: f64 = 34.44;
 pub(super) const E_CHARGE_C: f64 = 1.602176634e-19;
 pub(super) const RHO_AIR: f64 = 1.205e-3;
-pub(super) const PSTAR_S70: f64 = 9.20;
-pub(super) const PSTAR_E: f64 = 70.0;
-pub(super) const PSTAR_EXP: f64 = -0.643;
 
 /// What a spot's `amount` means.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -126,6 +128,16 @@ pub(super) const ALUMINUM: Medium = Medium {
     rho: 2.699,
     x0_g_cm2: 24.01,
     nuclear_cm2_g: 0.008,
+};
+/// Dry air in the monitor chamber gap. `I` follows ICRU 90. Only its stopping
+/// power is used.
+pub(super) const AIR: Medium = Medium {
+    key: "air",
+    z_over_a: 0.49919,
+    i_ev: 85.7,
+    rho: RHO_AIR,
+    x0_g_cm2: 36.62,
+    nuclear_cm2_g: 0.012,
 };
 pub(super) const COPPER: Medium = Medium {
     key: "copper",

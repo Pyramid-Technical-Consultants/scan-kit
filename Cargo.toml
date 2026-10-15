@@ -17,6 +17,27 @@ opt-level = 3
 panic = "abort"
 strip = true
 
+# `tauri dev` runs the dev profile. Unoptimized, a dose scene took 38 s instead
+# of 1.3 s, so the numeric crates and every dependency build optimized. The
+# desktop and MCP glue stay unoptimized for quick rebuilds.
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.dev.package.scan-kit-core]
+opt-level = 3
+
+[profile.dev.package.scan-kit-io]
+opt-level = 3
+
+[profile.dev.package.scan-kit-compute]
+opt-level = 3
+
+[profile.dev.package.scan-kit-plot]
+opt-level = 3
+
+[profile.dev.package.scan-kit-dicom]
+opt-level = 3
+
 [workspace.package]
 version = "2.0.0-dev"
 edition = "2021"

@@ -63,6 +63,7 @@
 
 use std::collections::HashSet;
 use std::num::NonZeroU64;
+use std::sync::Arc;
 
 use scan_kit_core::{
     contour_in_frame, count_grid, format_tick, project, robust_limits, ticks, time_window, Camera,
@@ -1419,7 +1420,7 @@ pub(crate) struct PanelBatch {
     pub clouds: Vec<CloudBatch>,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Marks {
     pub lines: Vec<LineRec>,
     pub points: Vec<PointRec>,
@@ -1696,40 +1697,17 @@ impl Plot {
         mark: scan_kit_core::VolumeMark,
         scan: Option<scan_kit_core::VolumeScan>,
     ) {
-        let Some(mut grid) = crate::dose::grid_from(
-            mark.values,
-            mark.ct,
-            mark.labels,
-            mark.shape,
-            mark.origin,
-            mark.voxel,
-            mark.ramp,
-            mark.lo,
-            mark.hi,
-            if mark.gain == 0.0 { 1.0 } else { mark.gain },
-            if mark.opacity == 0.0 {
-                1.0
-            } else {
-                mark.opacity
-            },
-            mark.mode,
-            mark.filter,
-            scan,
-        ) else {
-            return;
-        };
-        grid.gantry = mark.gantry;
-        grid.unit = mark.unit;
-        grid.show_phantom = mark.show_phantom;
-        grid.show_field = true;
-        grid.field = mark.field;
-        grid.session_colors = mark.session_colors;
-        grid.session_focus = mark.session_focus as usize;
-        grid.sessions = mark.sessions.into_iter().map(session_volume).collect();
-        grid.companions = mark.companions.into_iter().map(session_volume).collect();
-        grid.plans = mark.plans.into_iter().map(session_volume).collect();
-        crate::dose::remember_window(&mut grid, mark.base_lo, mark.base_hi);
-        let (pixels, cols, rows) = crate::dose::atlas_bytes(&grid);
+        if let Some(parts) = dose_parts(mark, scan) {
+            self.attach_parts(parts);
+        }
+    }
+
+    pub(crate) fn attach_parts(&mut self, parts: DoseParts) {
+        let DoseParts {
+            grid,
+            atlas: pixels,
+            atlas_size: (cols, rows),
+        } = parts;
         let atlas = self.marks.heatmaps.len();
         self.marks.heatmaps.push(pixels);
         self.marks.heatmap_size.push((cols, rows));
@@ -1765,7 +1743,7 @@ impl Plot {
                 self.marks.panels[index].line_count = 0;
             }
         }
-        self.azimuth = opening_azimuth(mark.gantry);
+        self.azimuth = opening_azimuth(grid.gantry);
         self.dose = Some(grid);
         self.dose_atlas = Some(atlas);
         self.ramp_dirty = false;
@@ -1777,7 +1755,60 @@ impl Plot {
         }
         self.refresh_dose_overlay();
     }
+}
 
+/// The dose grid and its slice atlas, built once from a payload.
+#[derive(Clone)]
+pub(crate) struct DoseParts {
+    grid: crate::dose::DoseGrid,
+    atlas: Vec<u8>,
+    atlas_size: (u32, u32),
+}
+
+pub(crate) fn dose_parts(
+    mark: scan_kit_core::VolumeMark,
+    scan: Option<scan_kit_core::VolumeScan>,
+) -> Option<DoseParts> {
+    let mut grid = crate::dose::grid_from(
+        mark.values,
+        mark.ct,
+        mark.labels,
+        mark.shape,
+        mark.origin,
+        mark.voxel,
+        mark.ramp,
+        mark.lo,
+        mark.hi,
+        if mark.gain == 0.0 { 1.0 } else { mark.gain },
+        if mark.opacity == 0.0 {
+            1.0
+        } else {
+            mark.opacity
+        },
+        mark.mode,
+        mark.filter,
+        scan,
+    )?;
+    grid.gantry = mark.gantry;
+    grid.unit = mark.unit;
+    grid.show_phantom = mark.show_phantom;
+    grid.show_field = true;
+    grid.field = mark.field;
+    grid.session_colors = mark.session_colors;
+    grid.session_focus = mark.session_focus as usize;
+    grid.sessions = mark.sessions.into_iter().map(session_volume).collect();
+    grid.companions = mark.companions.into_iter().map(session_volume).collect();
+    grid.plans = mark.plans.into_iter().map(session_volume).collect();
+    crate::dose::remember_window(&mut grid, mark.base_lo, mark.base_hi);
+    let (atlas, cols, rows) = crate::dose::atlas_bytes(&grid);
+    Some(DoseParts {
+        grid,
+        atlas,
+        atlas_size: (cols, rows),
+    })
+}
+
+impl Plot {
     fn integrate_scale(&self, panel: usize, aspect: f32) -> f32 {
         let Some(grid) = &self.dose else {
             return 0.0;
@@ -2326,7 +2357,14 @@ impl Plot {
     /// Move the crosshair and the profiles that read it. The same voxel is a no-op.
     #[cfg_attr(not(any(test, target_arch = "wasm32")), allow(dead_code))]
     pub(crate) fn set_dose_cursor(&mut self, cursor: [usize; 3]) {
-        if self.dose.is_none() || self.cursor == cursor {
+        // Another cell can still hold a different lattice, so its voxel may be
+        // outside this one.
+        let Some(grid) = self.dose.as_ref() else {
+            return;
+        };
+        let shape = grid.volume.shape;
+        let cursor = std::array::from_fn(|axis| cursor[axis].min(shape[axis].saturating_sub(1)));
+        if self.cursor == cursor {
             return;
         }
         self.cursor = cursor;
@@ -3523,7 +3561,14 @@ impl Plot {
         self.fit_slice_chrome(&layout);
         self.ensure_uploaded(gpu)?;
         self.flush_ramp(&gpu.queue);
-        self.ensure_volume(gpu)?;
+        // A profile cell reads the cubes on the CPU, so it uploads no lattice.
+        if layout.iter().any(|cell| {
+            self.panels
+                .get(cell.panel)
+                .is_some_and(|panel| dose_plane(&panel.title).is_some())
+        }) {
+            self.ensure_volume(gpu)?;
+        }
         self.sync_heatmaps(&gpu.queue);
         let (cloud_quad_span, cloud_line_span, grounds) = self.upload_live(gpu, width, height);
         self.ensure_uniforms(gpu, layout.len());
@@ -3946,12 +3991,10 @@ impl Plot {
         let grid = self.dose.as_ref().unwrap();
         let max_axis = grid.volume.shape.iter().copied().max().unwrap_or(1) as u32;
         let (dose_tex, brick_tex, origin, voxel, line_scale, shape) = if max_axis <= limit {
-            let dose_tex = upload_dose_f16(
-                &gpu.device,
-                &gpu.queue,
-                &grid.volume.values,
-                grid.volume.shape,
-            )?;
+            let lattice = grid
+                .lattice_f16
+                .get_or_init(|| f16_lattice(&grid.volume.values, grid.volume.shape));
+            let dose_tex = upload_dose_f16(&gpu.device, &gpu.queue, lattice, grid.volume.shape)?;
             let brick_tex = upload_r32_3d(&gpu.device, &gpu.queue, &grid.bricks, grid.brick_shape)?;
             (
                 dose_tex,
@@ -3968,7 +4011,12 @@ impl Plot {
         } else {
             let pooled = pool_volume(&grid.volume, limit);
             let scan = scan_kit_core::scan_volume(&pooled);
-            let dose_tex = upload_dose_f16(&gpu.device, &gpu.queue, &pooled.values, pooled.shape)?;
+            let dose_tex = upload_dose_f16(
+                &gpu.device,
+                &gpu.queue,
+                &f16_lattice(&pooled.values, pooled.shape),
+                pooled.shape,
+            )?;
             let brick_tex = upload_r32_3d(&gpu.device, &gpu.queue, &scan.bricks, scan.brick_shape)?;
             (
                 dose_tex,
@@ -4384,7 +4432,8 @@ impl PlotGpu {
         let white = upload_r8(&device, &queue, &[255], 1, 1)?;
         let atlas_group = textured_group(&device, &textured_layout, &atlas_tex, &sampler);
         let white_group = textured_group(&device, &textured_layout, &white, &sampler);
-        let empty_dose = upload_dose_f16(&device, &queue, &[0.0], [1, 1, 1])?;
+        let empty_dose =
+            upload_dose_f16(&device, &queue, &f16_lattice(&[0.0], [1, 1, 1]), [1, 1, 1])?;
         let empty_brick = upload_r32_3d(&device, &queue, &[0.0], [1, 1, 1])?;
         let empty_integral = upload_r32_2d(&device, &queue, &[0.0], 1, 1)?;
         let empty_volume = volume_group(
@@ -6634,6 +6683,7 @@ fn integral_profile_axis(grid: &crate::dose::DoseGrid, kind: u8) -> (f32, f32) {
         }
     };
     match kind {
+        _ if grid.gamma => fold_cube(&grid.volume, kind, &mut lo, &mut hi, &mut any),
         1 => fold(&grid.integrals[1], &mut lo, &mut hi, &mut any),
         _ => fold(&grid.integrals[2], &mut lo, &mut hi, &mut any),
     }
@@ -6739,7 +6789,7 @@ fn structure_color(id: u8) -> [f32; 4] {
     INK[(id as usize).saturating_sub(1) % INK.len()]
 }
 
-fn session_volume(dose: scan_kit_core::SessionDose) -> Option<scan_kit_core::Volume> {
+fn session_volume(dose: scan_kit_core::SessionDose) -> Option<Arc<scan_kit_core::Volume>> {
     if dose.values.is_empty() {
         return None;
     }
@@ -6754,12 +6804,12 @@ fn session_volume(dose: scan_kit_core::SessionDose) -> Option<scan_kit_core::Vol
     }
     let mut values = dose.values;
     values.truncate(n);
-    Some(scan_kit_core::Volume {
+    Some(Arc::new(scan_kit_core::Volume {
         origin: dose.origin,
         shape,
         voxel: dose.voxel.max(1e-3),
         values,
-    })
+    }))
 }
 
 fn fold_cube(volume: &scan_kit_core::Volume, kind: u8, lo: &mut f32, hi: &mut f32, any: &mut bool) {
@@ -6818,10 +6868,11 @@ fn profile_curves(
     let [ix, iy, iz] = at;
     let mut series = Vec::new();
     match kind {
-        0 if integrate && own => series.push(cached_depth_integral(grid, iy)),
+        // A gamma grid's cached planes are 2D gamma, not sums of this cube.
+        0 if integrate && own && !grid.gamma => series.push(cached_depth_integral(grid, iy)),
         0 if integrate => series.push(volume.depth_integral(iy)),
         0 => series.push(volume.depth_profile(ix, iy)),
-        _ if integrate && own => series.push(cached_lateral_integral(grid, ix, iz)),
+        _ if integrate && own && !grid.gamma => series.push(cached_lateral_integral(grid, ix, iz)),
         _ if integrate => series.push(volume.lateral_integral(ix, iz)),
         _ => series.push(volume.lateral_profile(ix, iy, iz)),
     }
@@ -8149,10 +8200,43 @@ fn integral_planes(grid: &crate::dose::DoseGrid) -> (Vec<f32>, u32, u32) {
 
 /// Two zero voxels on every side, so linear and cubic taps that fall outside
 /// the box read 0. The march box stays the unpadded shape.
+/// Half-float rows of the lattice with a 2-voxel zero border, padded to the copy stride.
+pub(crate) fn f16_lattice(values: &[f32], shape: [usize; 3]) -> Vec<u8> {
+    let nx = shape[0].max(1);
+    let ny = shape[1].max(1);
+    let nz = shape[2].max(1);
+    let height = ny + 4;
+    let depth = nz + 4;
+    let stride = f16_stride(nx);
+    let mut padded = vec![0u8; stride * height * depth];
+    if shape[0] > 0 && shape[1] > 0 && shape[2] > 0 {
+        for z in 0..nz {
+            for y in 0..ny {
+                let src = nx * (y + ny * z);
+                if src >= values.len() {
+                    continue;
+                }
+                let count = nx.min(values.len() - src);
+                let row_at = ((z + 2) * height + (y + 2)) * stride + 4;
+                write_f16_row(
+                    &values[src..src + count],
+                    &mut padded[row_at..row_at + count * 2],
+                );
+            }
+        }
+    }
+    padded
+}
+
+fn f16_stride(nx: usize) -> usize {
+    ((nx.max(1) + 4) * 2).next_multiple_of(256)
+}
+
+/// `padded` is [`f16_lattice`] of a cube with this `shape`.
 fn upload_dose_f16(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
-    values: &[f32],
+    padded: &[u8],
     shape: [usize; 3],
 ) -> Result<wgpu::Texture, GpuError> {
     let nx = shape[0].max(1);
@@ -8175,24 +8259,7 @@ fn upload_dose_f16(
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     });
-    let stride = ((width * 2) as u32).next_multiple_of(256);
-    let mut padded = vec![0u8; stride as usize * height * depth];
-    if shape[0] > 0 && shape[1] > 0 && shape[2] > 0 {
-        for z in 0..nz {
-            for y in 0..ny {
-                let src = nx * (y + ny * z);
-                if src >= values.len() {
-                    continue;
-                }
-                let count = nx.min(values.len() - src);
-                let row_at = ((z + 2) * height + (y + 2)) * stride as usize + 4;
-                write_f16_row(
-                    &values[src..src + count],
-                    &mut padded[row_at..row_at + count * 2],
-                );
-            }
-        }
-    }
+    let stride = f16_stride(nx) as u32;
     queue.write_texture(
         wgpu::TexelCopyTextureInfo {
             texture: &texture,
@@ -8200,7 +8267,7 @@ fn upload_dose_f16(
             origin: wgpu::Origin3d::ZERO,
             aspect: wgpu::TextureAspect::All,
         },
-        &padded,
+        padded,
         wgpu::TexelCopyBufferLayout {
             offset: 0,
             bytes_per_row: Some(stride),
@@ -9414,6 +9481,52 @@ mod tests {
         scene.volume.origin = [0.0, 0.0, -16.0];
         scene.volume.gantry = gantry;
         scene
+    }
+
+    #[test]
+    fn dose_cells_from_one_decode_share_the_cube() {
+        let mut scene = beam_scene(90.0);
+        scene.volume.values[5] = 2.0;
+        scene.volume.plans = vec![scan_kit_core::SessionDose {
+            values: vec![1.0; 2 * 2 * 16],
+            shape: [2, 2, 16],
+            origin: [0.0, 0.0, -16.0],
+            voxel: 1.0,
+        }];
+        let bytes = crate::encode_plot(&scene, [0.0; 4], [1.0; 4]).unwrap();
+        let decoded = crate::payload::Decoded::new(&bytes).unwrap();
+        let mut one = Plot::from_decoded(decoded.clone());
+        let mut two = Plot::from_decoded(decoded.clone());
+        let alone = Plot::from_payload(&bytes).unwrap();
+        if crate::native_gpu().is_ok() {
+            let mut profile = Plot::from_decoded(decoded);
+            profile.set_solo(Some(4));
+            profile.draw(64, 64, &PlotInput::default()).unwrap();
+            assert!(profile.volume_draw.is_none());
+            for plot in [&mut one, &mut two] {
+                plot.set_solo(Some(0));
+                plot.draw(64, 64, &PlotInput::default()).unwrap();
+                assert!(plot.volume_draw.is_some());
+            }
+            let lattice = &one.dose.as_ref().unwrap().lattice_f16;
+            assert!(lattice.get().is_some());
+            assert!(Arc::ptr_eq(
+                lattice,
+                &profile.dose.as_ref().unwrap().lattice_f16
+            ));
+        }
+        let (a, b) = (one.dose.as_ref().unwrap(), two.dose.as_ref().unwrap());
+        assert!(Arc::ptr_eq(&a.volume, &b.volume));
+        assert!(Arc::ptr_eq(
+            a.plans[0].as_ref().unwrap(),
+            b.plans[0].as_ref().unwrap()
+        ));
+        assert_eq!(a.volume.values, alone.dose.as_ref().unwrap().volume.values);
+        assert_eq!(one.marks, alone.marks);
+        assert_eq!(one.cursor, alone.cursor);
+        assert!((one.azimuth - alone.azimuth).abs() < 1.0e-6);
+        one.set_dose_cursor([9, 0, 40]);
+        assert_eq!(one.cursor, [1, 0, 15]);
     }
 
     #[test]

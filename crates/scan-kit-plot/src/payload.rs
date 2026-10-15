@@ -204,7 +204,7 @@ pub fn encode_plot_reusing(
         * scene.volume.shape[1] as usize
         * scene.volume.shape[2] as usize;
     if voxels > 0 && scene.volume.values.len() >= voxels {
-        write_f32s(&mut out, &scene.volume.values[..voxels]);
+        write_cube(&mut out, &scene.volume.values[..voxels]);
         if !scene.volume.ct.is_empty() {
             write_f32s(
                 &mut out,
@@ -220,14 +220,24 @@ pub fn encode_plot_reusing(
             scene.volume.shape[2] as usize,
         ];
         // The view would otherwise scan this cube again on the UI thread.
-        write_scan(
-            &mut out,
-            &scan_kit_core::scan_grid(
-                &scene.volume.values[..voxels],
-                shape,
-                scene.volume.voxel.max(1e-3),
-            ),
+        let mut scan = scan_kit_core::scan_grid(
+            &scene.volume.values[..voxels],
+            shape,
+            scene.volume.voxel.max(1e-3),
         );
+        let given = &scene.volume.integrals;
+        if given.len() == 3
+            && given
+                .iter()
+                .zip(&scan.integrals)
+                .all(|(a, b)| a.len() == b.len())
+        {
+            for (plane, values) in given.iter().enumerate() {
+                scan.integral_peaks[plane] = values.iter().copied().fold(1e-6, f32::max);
+                scan.integrals[plane].clone_from(values);
+            }
+        }
+        write_scan(&mut out, &scan);
     }
     for session in scene
         .volume
@@ -245,7 +255,7 @@ fn read_sessions(
     reader: &mut Reader<'_>,
     count: u32,
 ) -> Result<Vec<scan_kit_core::SessionDose>, String> {
-    let mut doses = Vec::with_capacity(count as usize);
+    let mut doses = Vec::new();
     for _ in 0..count {
         let shape = [
             u32::from_le_bytes(reader.take(4)?.try_into().unwrap()),
@@ -259,7 +269,7 @@ fn read_sessions(
         ];
         let voxel = f32::from_le_bytes(reader.take(4)?.try_into().unwrap());
         let n = u32::from_le_bytes(reader.take(4)?.try_into().unwrap()) as usize;
-        let values = read_f32s(reader, n)?;
+        let values = read_cube(reader, n)?;
         doses.push(scan_kit_core::SessionDose {
             values,
             shape,
@@ -280,37 +290,87 @@ fn write_session(out: &mut Vec<u8>, session: &scan_kit_core::SessionDose) {
     out.extend_from_slice(&session.voxel.to_le_bytes());
     let count = session.values.len() as u32;
     out.extend_from_slice(&count.to_le_bytes());
-    write_f32s(out, &session.values);
+    write_cube(out, &session.values);
+}
+
+/// Shortest `+0.0` run that ends a literal block. A block header is 8 bytes.
+const ZERO_RUN: usize = 8;
+
+/// A dose cube is a third zeros or more outside the field. It is stored as
+/// blocks of `u32` zero count, `u32` literal count, then the literal floats.
+/// Only `+0.0` bits count as zero, so every value round-trips exactly.
+fn write_cube(out: &mut Vec<u8>, values: &[f32]) {
+    let mut at = 0;
+    while at < values.len() {
+        let zeros = values[at..]
+            .iter()
+            .take_while(|value| value.to_bits() == 0)
+            .count();
+        let start = at + zeros;
+        let mut end = values.len();
+        let mut run = 0;
+        for (index, value) in values[start..].iter().enumerate() {
+            run = if value.to_bits() == 0 { run + 1 } else { 0 };
+            if run == ZERO_RUN {
+                end = start + index + 1 - ZERO_RUN;
+                break;
+            }
+        }
+        out.extend_from_slice(&(zeros as u32).to_le_bytes());
+        out.extend_from_slice(&((end - start) as u32).to_le_bytes());
+        write_f32s(out, &values[start..end]);
+        at = end;
+    }
+}
+
+fn read_cube(reader: &mut Reader<'_>, count: usize) -> Result<Vec<f32>, String> {
+    // Walk the blocks first, so a bad count fails before the cube is allocated.
+    let mut walk = Reader {
+        bytes: reader.bytes,
+        at: reader.at,
+    };
+    let mut blocks = Vec::new();
+    let mut at = 0;
+    while at < count {
+        let zeros = read_u32(&mut walk)? as usize;
+        let literal = read_u32(&mut walk)? as usize;
+        let start = at.saturating_add(zeros);
+        let end = start.saturating_add(literal);
+        if end > count || end == at {
+            return Err("plot payload cube is malformed".into());
+        }
+        blocks.push((start, end, walk.take(literal * 4)?));
+        at = end;
+    }
+    let mut values = vec![0.0f32; count];
+    for (start, end, raw) in blocks {
+        copy_le(raw, &mut values[start..end]);
+    }
+    reader.at = walk.at;
+    Ok(values)
 }
 
 fn read_f32s(reader: &mut Reader<'_>, count: usize) -> Result<Vec<f32>, String> {
     let bytes = count.checked_mul(4).ok_or("plot payload is truncated")?;
-    let raw = reader.take(bytes)?;
+    let mut values = vec![0.0f32; count];
+    copy_le(reader.take(bytes)?, &mut values);
+    Ok(values)
+}
+
+/// `raw` is `values.len() * 4` little-endian bytes.
+fn copy_le(raw: &[u8], values: &mut [f32]) {
+    assert_eq!(raw.len(), values.len() * 4, "f32 byte length");
     #[cfg(target_endian = "little")]
-    {
-        let mut values = vec![0.0f32; count];
-        if count > 0 {
-            // SAFETY: `raw` is `count * 4` bytes. `f32` is 4 bytes with no padding,
-            // and this host is little-endian, which is the order `write_f32s`
-            // stored. The JSON header can leave `raw` unaligned, so the bytes are
-            // copied into the aligned `values` allocation instead of being cast.
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    raw.as_ptr(),
-                    values.as_mut_ptr().cast::<u8>(),
-                    bytes,
-                );
-            }
-        }
-        Ok(values)
+    // SAFETY: the lengths match above. `f32` is 4 bytes with no padding, and
+    // this host is little-endian, which is the order `write_f32s` stored. The
+    // JSON header can leave `raw` unaligned, so the bytes are copied into the
+    // aligned `values` instead of being cast.
+    unsafe {
+        std::ptr::copy_nonoverlapping(raw.as_ptr(), values.as_mut_ptr().cast::<u8>(), raw.len());
     }
     #[cfg(target_endian = "big")]
-    {
-        let mut values = Vec::with_capacity(count);
-        for chunk in raw.chunks_exact(4) {
-            values.push(f32::from_le_bytes(chunk.try_into().unwrap()));
-        }
-        Ok(values)
+    for (slot, bytes) in values.iter_mut().zip(raw.chunks_exact(4)) {
+        *slot = f32::from_le_bytes(bytes.try_into().unwrap());
     }
 }
 
@@ -406,6 +466,7 @@ pub fn plot_header(bytes: &[u8]) -> Result<PlotHeader, String> {
 
 /// GPU bytes already packed by [`encode_plot_quality`]. Uploading these skips a
 /// second pass through the mark structs.
+#[derive(Clone)]
 pub(crate) struct EncodedMarks {
     pub lines: Vec<u8>,
     pub points: Vec<u8>,
@@ -456,9 +517,11 @@ pub(crate) fn decode_plot(
     if marks.panels.len() != header.panels.len() {
         return Err("plot payload panel count mismatch".into());
     }
-    let voxels = header.volume_shape[0] as usize
-        * header.volume_shape[1] as usize
-        * header.volume_shape[2] as usize;
+    let voxels = header
+        .volume_shape
+        .iter()
+        .try_fold(1usize, |total, axis| total.checked_mul(*axis as usize))
+        .ok_or("plot payload volume is too large")?;
     let mut volume = VolumeMark {
         shape: header.volume_shape,
         origin: header.volume_origin,
@@ -482,7 +545,7 @@ pub(crate) fn decode_plot(
     };
     let mut scan = None;
     if voxels > 0 {
-        volume.values = read_f32s(&mut reader, voxels)?;
+        volume.values = read_cube(&mut reader, voxels)?;
         if header.volume_ct {
             volume.ct = read_f32s(&mut reader, voxels)?;
         }
@@ -514,9 +577,40 @@ pub(crate) fn decode_plot(
     ))
 }
 
+/// One decoded payload. A clone shares the dose cubes, so every dose cell of a
+/// scene builds its plot from one decode.
+#[derive(Clone)]
+pub struct Decoded {
+    header: PlotHeader,
+    marks: Marks,
+    encoded: EncodedMarks,
+    dose: Option<crate::render::DoseParts>,
+}
+
+impl Decoded {
+    pub fn new(bytes: &[u8]) -> Result<Self, String> {
+        let (header, marks, encoded, volume, scan) = decode_plot(bytes)?;
+        Ok(Self {
+            header,
+            marks,
+            encoded,
+            dose: crate::render::dose_parts(volume, scan),
+        })
+    }
+}
+
 impl Plot {
     pub fn from_payload(bytes: &[u8]) -> Result<Self, String> {
-        let (header, marks, encoded, volume, scan) = decode_plot(bytes)?;
+        Decoded::new(bytes).map(Self::from_decoded)
+    }
+
+    pub fn from_decoded(decoded: Decoded) -> Self {
+        let Decoded {
+            header,
+            marks,
+            encoded,
+            dose,
+        } = decoded;
         let mut plot = Self::from_parts(
             header.panels,
             header.columns,
@@ -529,13 +623,15 @@ impl Plot {
             header.foreground,
         );
         plot.encoded = Some(encoded);
-        plot.attach_volume(volume, scan);
+        if let Some(parts) = dose {
+            plot.attach_parts(parts);
+        }
         plot.carry_lines(
             header.line_token.parse::<u64>().unwrap_or(0),
             header.reuse_lines,
             header.line_prefix,
         );
-        Ok(plot)
+        plot
     }
 }
 
@@ -631,6 +727,44 @@ mod tests {
         assert_eq!(header.side, 1);
         assert!(marks.quads.iter().any(|quad| quad.heatmap == Some(0)));
         assert!(decode_plot(&bytes[..bytes.len() - 1]).is_err());
+    }
+
+    #[test]
+    fn a_cube_round_trips_every_bit() {
+        let mut edge = vec![0.0f32; 3];
+        edge.extend([1.0, -0.0, f32::NAN, 2.0]);
+        edge.extend([0.0; ZERO_RUN - 1]);
+        edge.push(3.0);
+        edge.extend([0.0; ZERO_RUN]);
+        edge.extend([4.0, f32::MIN_POSITIVE]);
+        edge.extend([0.0; 40]);
+        for values in [edge, vec![0.0; 50], vec![5.0; 9], Vec::new()] {
+            let mut out = Vec::new();
+            write_cube(&mut out, &values);
+            let mut reader = Reader { bytes: &out, at: 0 };
+            let back = read_cube(&mut reader, values.len()).unwrap();
+            assert_eq!(reader.at, out.len());
+            let bits = |cube: &[f32]| cube.iter().map(|value| value.to_bits()).collect::<Vec<_>>();
+            assert_eq!(bits(&back), bits(&values));
+        }
+        let mut out = Vec::new();
+        write_cube(&mut out, &[0.0; 1000]);
+        assert_eq!(out.len(), 8);
+        let stuck = [0u8; 8];
+        assert!(read_cube(
+            &mut Reader {
+                bytes: &stuck,
+                at: 0
+            },
+            4
+        )
+        .is_err());
+        let short = [5u8, 0, 0, 0, 0, 0, 0, 0];
+        let mut reader = Reader {
+            bytes: &short,
+            at: 0,
+        };
+        assert!(read_cube(&mut reader, 1 << 40).is_err());
     }
 
     #[test]

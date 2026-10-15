@@ -783,8 +783,9 @@ struct McLive {
     preview_seq: AtomicU64,
     ready_flag: AtomicBool,
     note: Mutex<String>,
-    preview: Mutex<Option<McResult>>,
-    ready: Mutex<Option<McResult>>,
+    /// One cube per job, in the order the scene asked for them.
+    preview: Mutex<Option<Vec<McResult>>>,
+    ready: Mutex<Option<Vec<McResult>>>,
     error: Mutex<Option<String>>,
 }
 
@@ -795,7 +796,7 @@ struct McPlotStage {
     background: [f32; 4],
     foreground: [f32; 4],
     palette: Vec<[f32; 4]>,
-    job: Option<McJob>,
+    jobs: Vec<McJob>,
     shared: Arc<McLive>,
     worker: Option<JoinHandle<()>>,
     worker_cancel: Cancel,
@@ -826,62 +827,91 @@ fn job_histories(job: &McJob) -> u32 {
     }
 }
 
-fn mc_transport(job: McJob, shared: Arc<McLive>, cancel: Cancel) {
-    let mut run = match McRun::open(&job) {
-        Ok(run) => run,
-        Err(ComputeError::NoAdapter) => {
-            *locked(&shared.error) = Some("no GPU adapter".into());
-            return;
+/// Transport every job side by side. A preview or the finished picture holds
+/// one cube per job, so measured and plan always carry similar histories.
+fn mc_transport(jobs: Vec<McJob>, shared: Arc<McLive>, cancel: Cancel) {
+    let mut runs = Vec::with_capacity(jobs.len());
+    for job in &jobs {
+        match McRun::open(job) {
+            Ok(run) => runs.push(run),
+            Err(ComputeError::NoAdapter) => {
+                *locked(&shared.error) = Some("no GPU adapter".into());
+                return;
+            }
+            Err(err) => {
+                *locked(&shared.error) = Some(err.to_string());
+                return;
+            }
         }
-        Err(err) => {
-            *locked(&shared.error) = Some(err.to_string());
-            return;
-        }
-    };
+    }
+    let count = runs.len().max(1);
+    let budget = POLL_BUDGET / count as u32;
+    let mut latest: Vec<Option<McResult>> = vec![None; runs.len()];
+    let mut finished: Vec<Option<McResult>> = vec![None; runs.len()];
+    let mut done = vec![0u64; runs.len()];
+    let mut total = vec![1u64; runs.len()];
     loop {
         if shared.stop.load(Ordering::SeqCst) || cancel.is_cancelled() {
             return;
         }
         let target = shared.target.load(Ordering::Relaxed);
-        if target > 0 {
-            let _ = run.extend(target);
+        let mut fresh = false;
+        for (k, run) in runs.iter_mut().enumerate() {
+            if target > 0 && run.extend(target) && finished[k].is_some() && run.progress() < 1.0 {
+                finished[k] = None;
+                shared.ready_flag.store(false, Ordering::Release);
+                *locked(&shared.ready) = None;
+            }
+            if finished[k].is_some() {
+                continue;
+            }
+            match run.poll(budget, &cancel) {
+                Poll::Pending { report, preview } => {
+                    done[k] = report.done;
+                    total[k] = report.total.max(1);
+                    if let Some(result) = preview {
+                        latest[k] = Some(result);
+                        fresh = true;
+                    }
+                }
+                Poll::Ready(result) => {
+                    done[k] = total[k];
+                    latest[k] = Some(result.clone());
+                    finished[k] = Some(result);
+                    fresh = true;
+                }
+                Poll::Cancelled => return,
+                Poll::Failed(message) => {
+                    *locked(&shared.error) = Some(message);
+                    return;
+                }
+            }
         }
-        match run.poll(POLL_BUDGET, &cancel) {
-            Poll::Pending { report, preview } => {
-                shared.done.store(report.done, Ordering::Relaxed);
-                shared.total.store(report.total, Ordering::Relaxed);
-                *locked(&shared.note) = report.note;
-                if let Some(result) = preview {
-                    let seq = shared.preview_seq.load(Ordering::Relaxed) + 1;
-                    *locked(&shared.preview) = Some(result);
-                    shared.preview_seq.store(seq, Ordering::Release);
+        let (all_done, all_total) = (done.iter().sum::<u64>(), total.iter().sum::<u64>());
+        shared.done.store(all_done, Ordering::Relaxed);
+        shared.total.store(all_total, Ordering::Relaxed);
+        *locked(&shared.note) = format!("{}%", 100 * all_done / all_total.max(1));
+        if finished.iter().all(Option::is_some) {
+            if !shared.ready_flag.load(Ordering::Acquire) {
+                let results: Vec<McResult> = finished.iter().flatten().cloned().collect();
+                let mut reached = jobs.clone();
+                for job in &mut reached {
+                    match job {
+                        McJob::Slab(request) => request.histories = request.histories.max(target),
+                        McJob::Patient(request) => {
+                            request.histories = request.histories.max(target)
+                        }
+                    }
                 }
-            }
-            Poll::Ready(result) => {
-                shared.done.store(
-                    shared.total.load(Ordering::Relaxed).max(1),
-                    Ordering::Relaxed,
-                );
-                *locked(&shared.ready) = Some(result);
+                keep_runs(&reached, &results);
+                *locked(&shared.ready) = Some(results);
                 shared.ready_flag.store(true, Ordering::Release);
-                loop {
-                    if shared.stop.load(Ordering::SeqCst) || cancel.is_cancelled() {
-                        return;
-                    }
-                    let target = shared.target.load(Ordering::Relaxed);
-                    if run.extend(target) && run.progress() < 1.0 {
-                        shared.ready_flag.store(false, Ordering::Release);
-                        *locked(&shared.ready) = None;
-                        break;
-                    }
-                    std::thread::sleep(Duration::from_millis(20));
-                }
             }
-            Poll::Cancelled => return,
-            Poll::Failed(message) => {
-                *locked(&shared.error) = Some(message);
-                return;
-            }
+            std::thread::sleep(Duration::from_millis(20));
+        } else if fresh && latest.iter().all(Option::is_some) {
+            let seq = shared.preview_seq.load(Ordering::Relaxed) + 1;
+            *locked(&shared.preview) = latest.iter().cloned().collect();
+            shared.preview_seq.store(seq, Ordering::Release);
         }
     }
 }
@@ -906,7 +936,7 @@ impl McPlotStage {
             background,
             foreground,
             palette: palette.to_vec(),
-            job: None,
+            jobs: Vec::new(),
             shared: Arc::new(mc_live()),
             worker: None,
             worker_cancel: Cancel::new(),
@@ -926,12 +956,21 @@ impl McPlotStage {
         )
     }
 
-    fn paint(&self, result: &McResult, quality: &str) -> Result<Vec<u8>, String> {
+    /// The scene asks for its jobs in the same order `capture_job` saw them.
+    fn paint(&self, results: &[McResult], quality: &str) -> Result<Vec<u8>, String> {
+        let next = std::cell::Cell::new(0usize);
         let mut scene = scan_kit_io::volumetric::volumetric(
             &self.root,
             &self.sessions,
             &self.options,
-            Some(&|_| Ok(result.clone())),
+            Some(&|job| {
+                let at = next.get();
+                next.set(at + 1);
+                results
+                    .get(at)
+                    .cloned()
+                    .map_or_else(|| Ok(blank_result(job)), Ok)
+            }),
         );
         self.pack(&mut scene, quality)
     }
@@ -960,10 +999,10 @@ impl McPlotStage {
         }
     }
 
-    /// Paint `result` into the view. `finished` is the last cube.
-    fn publish(&mut self, result: &McResult, seq: u64, finished: bool) -> Poll<Vec<u8>> {
+    /// Paint `results` into the view. `finished` is the last set of cubes.
+    fn publish(&mut self, results: &[McResult], seq: u64, finished: bool) -> Poll<Vec<u8>> {
         let quality = if finished { "final" } else { "partial" };
-        match self.paint(result, quality) {
+        match self.paint(results, quality) {
             Ok(bytes) => {
                 self.seen = seq;
                 if finished {
@@ -1020,8 +1059,8 @@ impl McPlotStage {
         if self.worker.is_some() {
             return self.paint_progress();
         }
-        let (mut scene, job) = capture_job(&self.root, &self.sessions, &self.options);
-        let Some(job) = job else {
+        let (mut scene, jobs) = capture_job(&self.root, &self.sessions, &self.options);
+        if jobs.is_empty() {
             return match self.pack(&mut scene, "final") {
                 Ok(bytes) => {
                     self.report = report_at(Phase::Done, 1, 1);
@@ -1029,18 +1068,23 @@ impl McPlotStage {
                 }
                 Err(message) => self.fail(message),
             };
-        };
-        let histories = job_histories(&job);
+        }
+        if let Some(results) = kept_results(&jobs) {
+            self.jobs = jobs;
+            self.report = report_at(Phase::Done, 1, 1);
+            return self.publish(&results, 1, true);
+        }
+        let histories = job_histories(&jobs[0]);
         self.shared
             .total
-            .store(u64::from(histories.max(1)), Ordering::Relaxed);
+            .store(all_histories(&jobs), Ordering::Relaxed);
         self.shared.target.store(histories, Ordering::Relaxed);
         *locked(&self.shared.note) = "0%".into();
-        self.job = Some(job.clone());
+        self.jobs = jobs.clone();
         let shared = Arc::clone(&self.shared);
         let cancel = self.worker_cancel.clone();
         self.worker = Some(std::thread::spawn(move || {
-            mc_transport(job, shared, cancel)
+            mc_transport(jobs, shared, cancel)
         }));
         // The blank capture is not a picture. The view keeps the last cube until
         // the first histories land, then each later copy replaces it.
@@ -1052,8 +1096,8 @@ impl McPlotStage {
     }
 
     fn drain(&mut self, cancel: &Cancel) -> Poll<Vec<u8>> {
-        let (mut scene, job) = capture_job(&self.root, &self.sessions, &self.options);
-        let Some(job) = job else {
+        let (mut scene, jobs) = capture_job(&self.root, &self.sessions, &self.options);
+        if jobs.is_empty() {
             return match self.pack(&mut scene, "final") {
                 Ok(bytes) => {
                     self.report = report_at(Phase::Done, 1, 1);
@@ -1061,22 +1105,30 @@ impl McPlotStage {
                 }
                 Err(message) => self.fail(message),
             };
-        };
-        self.job = Some(job.clone());
-        let mut run = match McRun::open(&job) {
-            Ok(run) => run,
-            Err(ComputeError::NoAdapter) => return self.fail("no GPU adapter".into()),
-            Err(err) => return self.fail(err.to_string()),
-        };
-        match run.poll(DRAIN, cancel) {
-            Poll::Ready(result) => self.publish(&result, 1, true),
-            Poll::Pending { .. } => self.fail("monte carlo did not finish".into()),
-            Poll::Cancelled => {
-                self.report.phase = Phase::Cancelled;
-                Poll::Cancelled
-            }
-            Poll::Failed(message) => self.fail(message),
         }
+        self.jobs = jobs.clone();
+        if let Some(results) = kept_results(&jobs) {
+            return self.publish(&results, 1, true);
+        }
+        let mut results = Vec::with_capacity(jobs.len());
+        for job in &jobs {
+            let mut run = match McRun::open(job) {
+                Ok(run) => run,
+                Err(ComputeError::NoAdapter) => return self.fail("no GPU adapter".into()),
+                Err(err) => return self.fail(err.to_string()),
+            };
+            match run.poll(DRAIN, cancel) {
+                Poll::Ready(result) => results.push(result),
+                Poll::Pending { .. } => return self.fail("monte carlo did not finish".into()),
+                Poll::Cancelled => {
+                    self.report.phase = Phase::Cancelled;
+                    return Poll::Cancelled;
+                }
+                Poll::Failed(message) => return self.fail(message),
+            }
+        }
+        keep_runs(&jobs, &results);
+        self.publish(&results, 1, true)
     }
 }
 
@@ -1104,20 +1156,22 @@ impl Stage for McPlotStage {
         if geometry_changed(&self.options, options) {
             return false;
         }
-        let (_scene, job) = capture_job(&self.root, &self.sessions, options);
-        let Some(job) = job else {
-            return false;
-        };
-        let same = self.job.as_ref().is_some_and(|old| same_phantom(&job, old));
+        let (_scene, jobs) = capture_job(&self.root, &self.sessions, options);
+        let same = !jobs.is_empty()
+            && jobs.len() == self.jobs.len()
+            && jobs
+                .iter()
+                .zip(&self.jobs)
+                .all(|(new, old)| same_phantom(new, old));
         if !same {
             return false;
         }
-        let histories = job_histories(&job);
+        let histories = job_histories(&jobs[0]);
         self.shared.target.store(histories, Ordering::Relaxed);
         self.shared
             .total
-            .store(u64::from(histories.max(1)), Ordering::Relaxed);
-        self.job = Some(job);
+            .store(all_histories(&jobs), Ordering::Relaxed);
+        self.jobs = jobs;
         self.options = options.clone();
         self.palette = palette.to_vec();
         true
@@ -1137,18 +1191,49 @@ impl Stage for McPlotStage {
     }
 }
 
-fn capture_job(root: &Path, sessions: &[String], options: &Value) -> (PlotScene, Option<McJob>) {
-    let job = std::cell::RefCell::new(None);
+fn capture_job(root: &Path, sessions: &[String], options: &Value) -> (PlotScene, Vec<McJob>) {
+    let jobs = std::cell::RefCell::new(Vec::new());
     let scene = scan_kit_io::volumetric::volumetric(
         root,
         sessions,
         options,
         Some(&|incoming| {
-            *job.borrow_mut() = Some(incoming.clone());
+            jobs.borrow_mut().push(incoming.clone());
             Ok(blank_result(incoming))
         }),
     );
-    (scene, job.into_inner())
+    (scene, jobs.into_inner())
+}
+
+/// The last finished transport. A compare, plot, or cell change opens a new
+/// stage on the same jobs, and that stage paints these cubes instead of
+/// transporting again. A run with at least the requested histories counts.
+// ponytail: one scene's cubes stay resident. Flipping between two geometries
+// transports again; keep more sets if that becomes common.
+fn kept_runs() -> &'static Mutex<Option<(Vec<McJob>, Vec<McResult>)>> {
+    static KEPT: OnceLock<Mutex<Option<(Vec<McJob>, Vec<McResult>)>>> = OnceLock::new();
+    KEPT.get_or_init(|| Mutex::new(None))
+}
+
+fn keep_runs(jobs: &[McJob], results: &[McResult]) {
+    *locked(kept_runs()) = Some((jobs.to_vec(), results.to_vec()));
+}
+
+fn kept_results(jobs: &[McJob]) -> Option<Vec<McResult>> {
+    let kept = locked(kept_runs());
+    let (seen, results) = kept.as_ref()?;
+    let covers = seen.len() == jobs.len()
+        && seen
+            .iter()
+            .zip(jobs)
+            .all(|(old, new)| same_phantom(old, new) && job_histories(old) >= job_histories(new));
+    covers.then(|| results.clone())
+}
+
+fn all_histories(jobs: &[McJob]) -> u64 {
+    jobs.iter()
+        .map(|job| u64::from(job_histories(job).max(1)))
+        .sum()
 }
 
 fn blank_result(job: &McJob) -> McResult {
@@ -1898,6 +1983,39 @@ mod tests {
         ));
         assert_eq!(stage.loaded, 1);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_finished_transport_covers_the_same_jobs() {
+        let _gpu = crate::mc::hold_gpu();
+        let job = |histories: u32, energy: f32| {
+            McJob::Slab(scan_kit_core::SlabRequest {
+                medium: "water".into(),
+                x: vec![0.0],
+                y: vec![0.0],
+                sx: vec![3.0],
+                sy: vec![3.0],
+                energy: vec![energy],
+                protons: vec![1.0e6],
+                histories,
+                seed: 7,
+                spread_pct: 1.0,
+                wet_mm: 0.0,
+                depth_mm: 100.0,
+                voxel_mm: 4.0,
+                origin: [0.0; 3],
+                shape: [2, 2, 2],
+            })
+        };
+        let jobs = [job(1_000_000, 150.0), job(1_000_000, 120.0)];
+        let results: Vec<McResult> = jobs.iter().map(blank_result).collect();
+        keep_runs(&jobs, &results);
+        assert!(kept_results(&jobs).is_some());
+        assert!(kept_results(&[job(10_000, 150.0), job(10_000, 120.0)]).is_some());
+        assert!(kept_results(&[job(2_000_000, 150.0), job(2_000_000, 120.0)]).is_none());
+        assert!(kept_results(&[job(1_000_000, 150.0), job(1_000_000, 121.0)]).is_none());
+        assert!(kept_results(&jobs[..1]).is_none());
+        *locked(kept_runs()) = None;
     }
 
     #[test]

@@ -18,7 +18,7 @@ const { followPlot, paintPlot, plotFail, plotFrames, plotGate, plotInits, plotRe
         : "",
     ),
     plotFrames: vi.fn(() => "[]"),
-    plotInits: { count: 0 },
+    plotInits: { count: 0, decodes: 0 },
     plotRecords: [] as {
       width: number;
       height: number;
@@ -226,6 +226,14 @@ vi.mock("@/wasm/scan_kit_plot.js", () => ({
   default: async () => {
     plotInits.count += 1;
   },
+  PlotPayload: class {
+    bytes: Uint8Array;
+    constructor(bytes: Uint8Array) {
+      this.bytes = bytes;
+      plotInits.decodes += 1;
+    }
+    free() {}
+  },
   WebPlot: {
     create: async (node: HTMLCanvasElement) => {
       const record = {
@@ -239,16 +247,18 @@ vi.mock("@/wasm/scan_kit_plot.js", () => ({
       };
       plotRecords.push(record);
       await plotGate.wait();
+      const load = (bytes: Uint8Array) => {
+        record.loads += 1;
+        record.bytes = bytes.byteLength;
+        plotFail.loads += 1;
+        if (plotFail.at > 0 && plotFail.loads >= plotFail.at) {
+          throw new Error("plot lines are not in the previous picture");
+        }
+      };
       return {
         backend: () => "test",
-        load: (bytes: Uint8Array) => {
-          record.loads += 1;
-          record.bytes = bytes.byteLength;
-          plotFail.loads += 1;
-          if (plotFail.at > 0 && plotFail.loads >= plotFail.at) {
-            throw new Error("plot lines are not in the previous picture");
-          }
-        },
+        load,
+        load_shared: (payload: { bytes: Uint8Array }) => load(payload.bytes),
         render: () => {
           record.renders += 1;
         },
@@ -1350,6 +1360,7 @@ it("draws each dose cell from one plot module once the canvas has a size", async
     });
     expect(host.querySelectorAll("canvas")).toHaveLength(6);
     expect(plotRecords).toHaveLength(0);
+    const decodes = plotInits.decodes;
 
     box.width = 400;
     box.height = 300;
@@ -1376,6 +1387,8 @@ it("draws each dose cell from one plot module once the canvas has a size", async
     expect(plotRecords.every((record) => record.loads === 1 && record.renders === 1 && record.bytes > 0)).toBe(
       true,
     );
+    // The six cells read one decoded payload.
+    expect(plotInits.decodes - decodes).toBe(1);
     const canvas = host.querySelector("canvas");
     await act(async () => {
       canvas?.dispatchEvent(

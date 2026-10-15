@@ -6,14 +6,17 @@
 //! `0.5 + 0.5 * dose/span` (zero at mid-grey). G is the CT window, B is 1 when
 //! a CT sample is present.
 
+use std::sync::{Arc, OnceLock};
+
 use scan_kit_core::{index, robust_high, sample, scan_volume, Volume, BRICK};
 #[cfg(not(target_arch = "wasm32"))]
 use scan_kit_core::{ray_rgba, RayView};
 
 /// Display state copied from the scene. The plot owns it after the upload.
+/// The cubes are shared, so every dose cell of one scene reads one copy.
 #[derive(Clone, Debug)]
 pub struct DoseGrid {
-    pub volume: Volume,
+    pub volume: Arc<Volume>,
     pub ct: Vec<f32>,
     pub labels: Vec<u8>,
     pub peak: f32,
@@ -51,13 +54,16 @@ pub struct DoseGrid {
     pub show_field: bool,
     pub field: [f32; 6],
     /// Selection order. `None` is `volume`.
-    pub sessions: Vec<Option<Volume>>,
+    pub sessions: Vec<Option<Arc<Volume>>>,
     pub session_colors: Vec<[f32; 4]>,
     pub session_focus: usize,
     /// Second chamber. `None` skips the line.
-    pub companions: Vec<Option<Volume>>,
+    pub companions: Vec<Option<Arc<Volume>>>,
     /// Plan dose. `None` skips the line. Drawn dashed on the measured samples.
-    pub plans: Vec<Option<Volume>>,
+    pub plans: Vec<Option<Arc<Volume>>>,
+    /// Half-float upload bytes of `volume`. The first cell to draw fills it, and
+    /// the other cells of the scene upload the same bytes.
+    pub lattice_f16: Arc<OnceLock<Vec<u8>>>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -130,7 +136,7 @@ pub fn grid_from(
     let span = scan.abs_peak.max(1e-6);
     Some(DoseGrid {
         atlas_shape: fit_shape(shape_us),
-        volume,
+        volume: Arc::new(volume),
         bricks: scan.bricks,
         brick_shape: scan.brick_shape,
         line_scale: scan.line_scale,
@@ -174,6 +180,7 @@ pub fn grid_from(
         session_focus: 0,
         companions: Vec::new(),
         plans: Vec::new(),
+        lattice_f16: Arc::default(),
     })
 }
 
@@ -433,7 +440,7 @@ pub fn shade_uv(
     let filter = if view.integral { 0 } else { grid.filter };
     let dose = image_sample(&image.values, image.cols, image.rows, x, y, filter);
     let (lo, hi) = if image.own {
-        integral_limits_of(&image.values)
+        integral_limits(grid, view.plane)
     } else {
         window(grid)
     };
@@ -448,8 +455,16 @@ pub fn integral_peak(grid: &DoseGrid, plane: u8) -> f32 {
 }
 
 /// Color window for one plane integral. A positive projection sits on `0..peak`.
-/// A difference keeps its sign, with zero in the middle of the ramp.
+/// A difference keeps its sign, with zero in the middle of the ramp. A gamma
+/// plane is already γ, so it keeps the γ window.
 pub fn integral_limits(grid: &DoseGrid, plane: u8) -> (f32, f32) {
+    if grid.gamma {
+        return if grid.hi > grid.lo {
+            (grid.lo, grid.hi)
+        } else {
+            (0.0, 2.0)
+        };
+    }
     integral_limits_of(&grid.integrals[(plane as usize).min(2)])
 }
 
@@ -959,6 +974,16 @@ mod tests {
         assert!(
             (color[0] - floor[0]).abs() + (color[1] - floor[1]).abs() + (color[2] - floor[2]).abs()
                 > 0.05
+        );
+        let mut gamma = grid;
+        gamma.unit = "γ".into();
+        remember_window(&mut gamma, 0.0, 2.0);
+        (gamma.lo, gamma.hi) = (0.0, 2.0);
+        gamma.integrals[0] = vec![0.5, 1.5, 3.0];
+        assert_eq!(
+            integral_limits(&gamma, 0),
+            (0.0, 2.0),
+            "γ = 1 stays mid-ramp"
         );
     }
 }

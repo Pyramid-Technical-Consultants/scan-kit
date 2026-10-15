@@ -327,6 +327,11 @@ pub struct VolumeMark {
     /// The other chamber in independent mode. Empty in the combined calculation.
     #[serde(default)]
     pub companions: Vec<SessionDose>,
+    /// Axial, coronal, and sagittal pictures for the integral view. Empty sums
+    /// `values` through each plane. A gamma cube cannot be summed, so gamma ships
+    /// the 2D gamma of the summed doses here.
+    #[serde(default)]
+    pub integrals: Vec<Vec<f32>>,
 }
 
 /// One session cube for the dose line plots. Empty `values` means the main cube.
