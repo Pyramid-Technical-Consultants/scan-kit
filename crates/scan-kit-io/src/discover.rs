@@ -434,7 +434,10 @@ fn zip_session_dir(path: &Path) -> Option<String> {
         let Ok(entry) = archive.by_index(index) else {
             continue;
         };
-        let name = normalize_member(entry.name());
+        let Ok(name) = entry.name() else {
+            continue;
+        };
+        let name = normalize_member(&name);
         let Some((top, _)) = name.split_once('/') else {
             continue;
         };
@@ -681,7 +684,7 @@ fn read_zip(path: &Path, want: &dyn Fn(&str) -> bool) -> Result<Vec<(String, Vec
         if entry.is_dir() {
             continue;
         }
-        let name = entry.name().to_owned();
+        let name = entry.name().map_err(|err| err.to_string())?.into_owned();
         if !want(&name) {
             continue;
         }
