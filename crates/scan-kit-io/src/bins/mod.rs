@@ -10,7 +10,7 @@ use scan_kit_core::{
 use serde_json::Value;
 
 use super::discover;
-use super::histogram::{bin_button, bin_share, hist_bin_count, share_key, BinShare, BIN_CHOICES};
+use super::histogram::{bin_button, bin_share, bins_control, hist_bin_count, share_key, BinShare};
 use super::marks::{control, flag, labeled, pick, text};
 mod glyphs;
 
@@ -1270,7 +1270,7 @@ fn controls(
     cutoff: f32,
 ) -> Vec<Control> {
     let on = |value: bool| if value { "On" } else { "Off" };
-    controls.push(control("bins", "Bins", BIN_CHOICES, bins).grouped("Data Source"));
+    controls.push(bins_control("bins", bins).grouped("Data Source"));
     controls.push(labeled("glyph", "Glyph", GLYPH_CHOICES, glyph).grouped("Plot Style"));
     controls.push(
         control(
@@ -1304,7 +1304,7 @@ fn controls(
             .grouped("Histogram")
             .checked(),
     );
-    controls.push(control("hist_bins", "Bins", BIN_CHOICES, hist_bins).grouped("Histogram"));
+    controls.push(bins_control("hist_bins", hist_bins).grouped("Histogram"));
     controls.push(
         labeled(
             "share",
@@ -2175,6 +2175,11 @@ mod tests {
             .unwrap();
         assert_eq!(count.value, "Auto");
         assert_eq!(count.labels(), vec!["Auto", "8", "16", "32", "64"]);
+        let auto = &count.options[0];
+        assert!(auto.icon_only);
+        assert_eq!(auto.icon, "auto");
+        assert!(!auto.detail.is_empty());
+        assert!(count.options[1..].iter().all(|option| !option.icon_only));
         let hist = spot
             .controls
             .iter()

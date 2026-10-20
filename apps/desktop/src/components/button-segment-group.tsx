@@ -86,7 +86,7 @@ export function ButtonSegmentGroup({
                 ? "w-7 flex-none px-0"
                 : orientation === "vertical"
                   ? "w-full min-w-0 flex-none justify-start overflow-hidden"
-                  : "min-w-0 flex-1 overflow-hidden",
+                  : "min-w-0 flex-auto overflow-hidden",
             )}
           >
             {Icon == null ? null : <Icon />}

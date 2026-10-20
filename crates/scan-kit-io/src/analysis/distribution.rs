@@ -8,7 +8,7 @@ use scan_kit_core::{
 };
 use serde_json::Value;
 
-use crate::histogram::{bin_button, hist_bin_count, histogram_panel, BIN_CHOICES};
+use crate::histogram::{bin_button, bins_control, hist_bin_count, histogram_panel};
 
 use super::{
     col, control, drew_line, finite_col, flag, guide, labeled, panel, pick, placed, scene,
@@ -131,9 +131,7 @@ pub(super) fn distribution(root: &Path, session_ids: &[String], options: &Value)
         ));
     }
     if cloud {
-        controls.push(
-            control("hist_bins", "Bins", BIN_CHOICES, &bin_button(hist_raw)).grouped("Histogram"),
-        );
+        controls.push(bins_control("hist_bins", &bin_button(hist_raw)).grouped("Histogram"));
     }
     controls.push(segments_control(&segments, &[("beam", "Beam")]));
     controls.push(scrub_control(

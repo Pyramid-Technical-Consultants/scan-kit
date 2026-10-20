@@ -3,9 +3,22 @@
 //! Each session is a translucent bar series plus a polyline around those bars.
 //! The outline's alpha is 0 so palette assignment keeps the previous series' color.
 
-use scan_kit_core::{histogram, Panel, Series};
+use scan_kit_core::{histogram, Control, Panel, Series};
+
+use crate::marks::control;
 
 pub(crate) const BIN_CHOICES: &[&str] = &["Auto", "8", "16", "32", "64"];
+
+/// The bins picker: `Auto` renders icon-only with a tooltip so the row stays
+/// compact; the counts keep their labels.
+pub(crate) fn bins_control(id: &str, value: &str) -> Control {
+    let mut control = control(id, "Bins", BIN_CHOICES, value);
+    let auto = &mut control.options[0];
+    auto.detail = "Pick a bin count automatically from the data".to_owned();
+    auto.icon = "auto".to_owned();
+    auto.icon_only = true;
+    control
+}
 
 const BIN_STEPS: [usize; 4] = [8, 16, 32, 64];
 

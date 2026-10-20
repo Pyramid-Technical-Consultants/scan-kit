@@ -3,6 +3,7 @@ type ViewChoice = {
   label: string;
   detail: string;
   icon: string;
+  iconOnly: boolean;
 };
 
 export type ViewControl = {
@@ -35,12 +36,18 @@ function text(value: unknown): string {
 
 function viewChoice(raw: unknown): ViewChoice | null {
   if (typeof raw === "string") {
-    return raw.length === 0 ? null : { id: raw, label: raw, detail: "", icon: "" };
+    return raw.length === 0 ? null : { id: raw, label: raw, detail: "", icon: "", iconOnly: false };
   }
   if (raw == null || typeof raw !== "object") {
     return null;
   }
-  const row = raw as { id?: unknown; label?: unknown; detail?: unknown; icon?: unknown };
+  const row = raw as {
+    id?: unknown;
+    label?: unknown;
+    detail?: unknown;
+    icon?: unknown;
+    iconOnly?: unknown;
+  };
   const label = text(row.label);
   if (label.length === 0) {
     return null;
@@ -51,6 +58,7 @@ function viewChoice(raw: unknown): ViewChoice | null {
     label,
     detail: text(row.detail),
     icon: text(row.icon),
+    iconOnly: row.iconOnly === true,
   };
 }
 
@@ -176,7 +184,7 @@ export function applyLevelPaint(header: PlotHeader | null, raw: string): PlotHea
     ["step", spec.step],
   ] as const) {
     if (!options.some((option) => option.id === id)) {
-      options = [...options, { id, label, detail: "", icon: "" }];
+      options = [...options, { id, label, detail: "", icon: "", iconOnly: false }];
     }
   }
   const controls = header.controls.slice();

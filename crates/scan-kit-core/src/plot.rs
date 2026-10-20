@@ -139,6 +139,13 @@ pub struct Choice {
     pub detail: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub icon: String,
+    /// Draw the icon without the label; `detail` becomes the tooltip.
+    #[serde(
+        default,
+        rename = "iconOnly",
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    pub icon_only: bool,
 }
 
 impl Choice {
@@ -148,6 +155,7 @@ impl Choice {
             label: text.to_string(),
             detail: String::new(),
             icon: String::new(),
+            icon_only: false,
         }
     }
 
@@ -157,6 +165,7 @@ impl Choice {
             label: label.to_string(),
             detail: detail.into(),
             icon: icon.to_string(),
+            icon_only: false,
         }
     }
 }

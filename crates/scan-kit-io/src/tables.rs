@@ -998,7 +998,26 @@ fn build_spot(
             doses.push((key, values));
         }
     }
-    let (mask_pos, mm_pos) = spot_positions(&spot, chamber, n, plan_lookup.as_ref());
+    // Commanded strip per axis, recovered from the control-point tolerance
+    // bands: a symmetric band centres on the command. The same midpoints give
+    // `spot_positions` a same-frame reference for unit detection and give
+    // `store_positions` a plan substitute when no plan map was logged.
+    let strip_mid: [Option<Vec<f32>>; 4] = std::array::from_fn(|index| {
+        let (ic, letter) = [("ic1", "b"), ("ic1", "a"), ("ic2", "b"), ("ic2", "a")][index];
+        let lo = column(&map, &format!("{ic}_position_{letter}_min"), &[]);
+        let hi = column(&map, &format!("{ic}_position_{letter}_max"), &[]);
+        if lo.len() < n || hi.len() < n {
+            return None;
+        }
+        Some(
+            lo[..n]
+                .iter()
+                .zip(&hi[..n])
+                .map(|(lo, hi)| (lo + hi) * 0.5)
+                .collect(),
+        )
+    });
+    let (mask_pos, mm_pos) = spot_positions(&spot, chamber, n, plan_lookup.as_ref(), &strip_mid);
     let sigma = spot_sigma(&spot, raw_sigma || chamber, n);
     let mut mask_cols: Vec<&[f32]> = vec![energy];
     if target.len() >= n {
@@ -1115,7 +1134,14 @@ fn build_spot(
         table.insert(key.to_string(), values);
     }
     let mm = mm_pos.map(|column| column.map(|column| take_kept(column.as_slice(), &keep)));
-    store_positions(&mut table, mm);
+    // The tolerance bands are channel counts, so they move through the same
+    // strip-to-mm map as the measured axis before standing in for the plan.
+    let strip_plan: [Option<Vec<f32>>; 4] = std::array::from_fn(|index| {
+        strip_mid[index]
+            .as_ref()
+            .map(|target| take_kept(&g3_mm(target, AXIS_REVERSED[index]), &keep))
+    });
+    store_positions(&mut table, mm, &strip_plan);
     for (key, values) in sigma {
         table.insert(
             key.to_string(),
@@ -1375,7 +1401,11 @@ fn plan_fit_axis(
     (slope.abs() > 0.5 && slope.abs() < 10.0).then_some((slope, intercept))
 }
 
-fn store_positions(table: &mut BTreeMap<String, Vec<f32>>, mm: [Option<Vec<f32>>; 4]) {
+fn store_positions(
+    table: &mut BTreeMap<String, Vec<f32>>,
+    mm: [Option<Vec<f32>>; 4],
+    strip_plan: &[Option<Vec<f32>>; 4],
+) {
     let keys = [
         ("ic1_x", "ic1_x_err", "plan_x"),
         ("ic1_y", "ic1_y_err", "plan_y"),
@@ -1383,11 +1413,15 @@ fn store_positions(table: &mut BTreeMap<String, Vec<f32>>, mm: [Option<Vec<f32>>
         ("ic2_y", "ic2_y_err", "plan_y"),
     ];
     let mut errors = Vec::new();
-    for ((_, err_key, plan_key), measured) in keys.into_iter().zip(mm.iter()) {
+    for (index, ((_, err_key, plan_key), measured)) in keys.into_iter().zip(mm.iter()).enumerate() {
         let Some(measured) = measured else {
             continue;
         };
-        let Some(plan) = table.get(plan_key) else {
+        let plan = table
+            .get(plan_key)
+            .map(Vec::as_slice)
+            .or(strip_plan[index].as_deref());
+        let Some(plan) = plan else {
             continue;
         };
         if plan.len() == measured.len() {
@@ -1479,21 +1513,79 @@ fn attach_sigma_percent(table: &mut BTreeMap<String, Vec<f32>>) {
     }
 }
 
+/// Strip sign per axis in `g3_mm`: ic1 x and ic2 y run with the strip index,
+/// the other two run against it. Shared by the chamber frame and the iso
+/// fallback so both agree on direction.
+const AXIS_REVERSED: [bool; 4] = [false, true, true, false];
+
+/// Channel counts or millimetres: the control-point bands name the commanded
+/// strip in the chamber's own channel frame, so a measured axis that tracks
+/// them one-to-one is in channels while a slope near the 2 mm pitch is
+/// already millimetres. Without a trustworthy reference, signed or
+/// out-of-register values must be millimetres — channel counts stay in 1–128.
+fn axis_in_mm(measured: &[f32], target: &[f32]) -> bool {
+    let mut xs = Vec::new();
+    let mut ys = Vec::new();
+    for (m, t) in measured.iter().zip(target) {
+        if row_ok(*m) && t.is_finite() {
+            xs.push(*t);
+            ys.push(*m);
+        }
+    }
+    if xs.len() >= 10 {
+        if let Some((slope, intercept)) = linear_fit(&xs, &ys) {
+            let rms = (xs
+                .iter()
+                .zip(&ys)
+                .map(|(x, y)| {
+                    let err = y - (slope * x + intercept);
+                    err * err
+                })
+                .sum::<f32>()
+                / xs.len() as f32)
+                .sqrt();
+            if rms < 1.5 {
+                if (slope.abs() - 1.0).abs() < 0.25 {
+                    return false;
+                }
+                if (slope.abs() - 2.0).abs() < 0.6 {
+                    return true;
+                }
+            }
+        }
+    }
+    measured
+        .iter()
+        .any(|value| row_ok(*value) && (*value < 0.0 || *value > 129.0))
+}
+
+/// Measured axis in chamber mm: raw channel counts go through the strip
+/// pitch; a rack that already reports millimetres is kept as read.
+fn axis_measured<'a>(raw: &'a [f32], target: Option<&[f32]>, index: usize) -> Measured<'a> {
+    if axis_in_mm(raw, target.unwrap_or(&[])) {
+        Measured::Same(raw)
+    } else {
+        Measured::Owned(g3_mm(raw, AXIS_REVERSED[index]))
+    }
+}
+
 /// Columns that participate in the row mask, plus mm positions when the frame resolves.
 fn spot_positions<'a>(
     spot: &'a Sheet,
     chamber: bool,
     n: usize,
     plan: Option<&SpotPlan<'_>>,
+    strip_mid: &[Option<Vec<f32>>; 4],
 ) -> (Vec<&'a [f32]>, [Option<Measured<'a>>; 4]) {
     if chamber {
         if let Some(raw) = four_slices(spot, "spot_position_raw", n) {
-            let mm = [
-                Some(Measured::Owned(g3_mm(raw[0], false))),
-                Some(Measured::Owned(g3_mm(raw[1], true))),
-                Some(Measured::Owned(g3_mm(raw[2], true))),
-                Some(Measured::Owned(g3_mm(raw[3], false))),
-            ];
+            let mm = std::array::from_fn(|index| {
+                Some(axis_measured(
+                    raw[index],
+                    strip_mid[index].as_deref(),
+                    index,
+                ))
+            });
             return (raw.to_vec(), mm);
         }
         if let Some(raw) = four_slices(spot, "spot_raw", n) {
@@ -1529,23 +1621,27 @@ fn spot_positions<'a>(
         }
         // Raw-only sessions have strips, not millimetres: fit them against the
         // plan so the iso-frame quantities still resolve.
-        let (Some(raw), Some(plan)) = (column_suffix(spot, ic, axis, &["spot_position_raw"]), plan)
-        else {
+        let Some(raw) = column_suffix(spot, ic, axis, &["spot_position_raw"]) else {
             continue;
         };
         if raw.len() < n {
             continue;
         }
-        let Some((slope, intercept)) = plan_fit_axis(raw, spot, plan, axis == "x", n) else {
-            continue;
-        };
         mask.push(&raw[..n]);
-        mm[index] = Some(Measured::Owned(
-            raw[..n]
-                .iter()
-                .map(|value| slope * value + intercept)
-                .collect(),
-        ));
+        if let Some((slope, intercept)) =
+            plan.and_then(|plan| plan_fit_axis(raw, spot, plan, axis == "x", n))
+        {
+            mm[index] = Some(Measured::Owned(
+                raw[..n]
+                    .iter()
+                    .map(|value| slope * value + intercept)
+                    .collect(),
+            ));
+        } else {
+            // No plan to fit against: normalise the reported frame instead —
+            // channels go through the strip pitch, millimetres stay as read.
+            mm[index] = Some(axis_measured(&raw[..n], strip_mid[index].as_deref(), index));
+        }
     }
     (mask, mm)
 }
@@ -5340,6 +5436,132 @@ mod tests {
         near(table.get("ic1_r_err").unwrap(), &[1.0, 3.0]);
         near(table.get("ic1_r_err_rel").unwrap(), &[1.0, 1.0]);
         near(table.get("ic1_dose_per_mu").unwrap(), &[1.0, 1.0]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn raw_only_spots_fall_back_to_chamber_millimetres() {
+        let root = std::env::temp_dir().join(format!(
+            "scan-kit-raw-pos-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let session = root.join("sess");
+        std::fs::create_dir_all(&session).unwrap();
+        // Live-capture shape: strip positions and sigmas, no processed mm, no
+        // plan positions in the map. The control-point bands still carry the
+        // commanded strip as a symmetric tolerance midpoint.
+        std::fs::write(
+            session.join("input_map.csv"),
+            concat!(
+                "energy,spot_no,layer_id,",
+                "ic1_position_b_min,ic1_position_b_max,",
+                "ic1_position_a_min,ic1_position_a_max,",
+                "ic2_position_b_min,ic2_position_b_max,",
+                "ic2_position_a_min,ic2_position_a_max\n",
+                "165,1,1,49.0,50.8,48.6,50.2,77.4,79.0,77.6,79.0\n",
+                "165,2,1,50.9,52.7,48.6,50.2,75.6,77.3,77.6,79.0\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            session.join("spot_data.csv"),
+            concat!(
+                "ic1_total_dose_spot_raw,spot_no,layer_id,",
+                "r_ic1_x_spot_position_raw,r_ic1_x_spot_sigma_raw,",
+                "r_ic1_y_spot_position_raw,r_ic1_y_spot_sigma_raw,",
+                "r_ic2_x_spot_position_raw,r_ic2_x_spot_sigma_raw,",
+                "r_ic2_y_spot_position_raw,r_ic2_y_spot_sigma_raw\n",
+                "0.4,1,1,49.9,1.59,113.4,1.56,78.2,1.51,78.3,1.48\n",
+                "0.4,2,1,50.0,1.60,113.4,1.57,78.3,1.50,78.4,1.49\n"
+            ),
+        )
+        .unwrap();
+        let table = load_spot(&root, "sess", false, false, false);
+        let near = |values: &[f32], expected: &[f32]| {
+            assert_eq!(values.len(), expected.len());
+            for (value, expected) in values.iter().zip(expected) {
+                assert!((value - expected).abs() < 1e-4, "{value} {expected}");
+            }
+        };
+        let mm = |value: f32, reversed: bool| g3_mm(&[value], reversed)[0];
+        near(
+            table.get("ic1_x").unwrap(),
+            &[mm(49.9, false), mm(50.0, false)],
+        );
+        near(
+            table.get("ic1_y").unwrap(),
+            &[mm(113.4, true), mm(113.4, true)],
+        );
+        near(
+            table.get("ic2_x").unwrap(),
+            &[mm(78.2, true), mm(78.3, true)],
+        );
+        near(
+            table.get("ic2_y").unwrap(),
+            &[mm(78.3, false), mm(78.4, false)],
+        );
+        near(
+            table.get("ic12_x_diff").unwrap(),
+            &[
+                mm(78.2, true) - mm(49.9, false),
+                mm(78.3, true) - mm(50.0, false),
+            ],
+        );
+        near(table.get("ic1_sig_x").unwrap(), &[3.18, 3.20]);
+        // The tolerance-band midpoints stand in for the command: b tracks it
+        // (≈0 err), the stuck a-axis reads ~64 strips high (≈-129 mm err).
+        let x_err = [
+            mm(49.9, false) - mm(49.9, false),
+            mm(50.0, false) - mm(51.8, false),
+        ];
+        let y_err = [mm(113.4, true) - mm(49.4, true); 2];
+        near(table.get("ic1_x_err").unwrap(), &x_err);
+        near(table.get("ic1_y_err").unwrap(), &y_err);
+        near(
+            table.get("ic1_r_err").unwrap(),
+            &[x_err[0].hypot(y_err[0]), x_err[1].hypot(y_err[1])],
+        );
+        // A strip sentinel still drops the row instead of plotting -1 mm.
+        std::fs::write(
+            session.join("spot_data.csv"),
+            concat!(
+                "ic1_total_dose_spot_raw,spot_no,layer_id,",
+                "r_ic1_x_spot_position_raw,r_ic1_x_spot_sigma_raw,",
+                "r_ic1_y_spot_position_raw,r_ic1_y_spot_sigma_raw,",
+                "r_ic2_x_spot_position_raw,r_ic2_x_spot_sigma_raw,",
+                "r_ic2_y_spot_position_raw,r_ic2_y_spot_sigma_raw\n",
+                "0.4,1,1,-1,1.59,113.4,1.56,78.2,1.51,78.3,1.48\n"
+            ),
+        )
+        .unwrap();
+        let table = load_spot(&root, "sess", false, false, false);
+        assert!(table.is_empty());
+        // A rack that already reports millimetres: the values track the same
+        // commands at the 2 mm pitch with a signed range, so they pass
+        // through instead of taking the channel conversion a second time.
+        std::fs::write(
+            session.join("spot_data.csv"),
+            concat!(
+                "ic1_total_dose_spot_raw,spot_no,layer_id,",
+                "r_ic1_x_spot_position_raw,r_ic1_x_spot_sigma_raw,",
+                "r_ic1_y_spot_position_raw,r_ic1_y_spot_sigma_raw,",
+                "r_ic2_x_spot_position_raw,r_ic2_x_spot_sigma_raw,",
+                "r_ic2_y_spot_position_raw,r_ic2_y_spot_sigma_raw\n",
+                "0.4,1,1,-29.2,1.59,-30.4,1.56,-27.4,1.51,27.6,1.48\n",
+                "0.4,2,1,-25.4,1.60,-30.4,1.57,-23.9,1.50,27.6,1.49\n"
+            ),
+        )
+        .unwrap();
+        let table = load_spot(&root, "sess", false, false, false);
+        near(table.get("ic1_x").unwrap(), &[-29.2, -25.4]);
+        near(
+            table.get("ic1_x_err").unwrap(),
+            &[-29.2 - mm(49.9, false), -25.4 - mm(51.8, false)],
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
