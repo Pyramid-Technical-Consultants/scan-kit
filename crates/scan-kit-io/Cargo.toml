@@ -15,7 +15,7 @@ scan-kit-core = { workspace = true }
 scan-kit-dicom = { workspace = true }
 serde_json = { workspace = true }
 rusqlite = { version = "0.37", features = ["bundled"] }
-zip = "2"
+zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
 tar = "0.4"
 flate2 = "1"
 bzip2 = "0.5"

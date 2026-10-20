@@ -132,8 +132,8 @@ fn read_npz(bytes: &[u8]) -> Result<BTreeMap<String, Npy>, String> {
     let mut files = BTreeMap::new();
     for index in 0..archive.len() {
         let mut file = archive.by_index(index).map_err(|err| err.to_string())?;
-        let name = file
-            .name()
+        let name = file.name().map_err(|err| err.to_string())?;
+        let name = name
             .rsplit(['/', '\\'])
             .next()
             .unwrap_or("")
