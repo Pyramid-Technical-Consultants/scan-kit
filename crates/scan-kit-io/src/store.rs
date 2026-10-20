@@ -220,6 +220,21 @@ pub fn set_runner_file_dir(conn: &Connection, dir: &str) -> Result<(), String> {
     set_runner_pref(conn, "last_plan_runner_file_dir", dir)
 }
 
+/// The plan CSV last uploaded to the controller; the session capture reuses it
+/// as the packaged `input_map.csv`.
+pub fn runner_plan_path(conn: &Connection) -> Result<Option<String>, String> {
+    let settings = prefs_get(conn, PREF_APP_SETTINGS)?.unwrap_or_else(|| json!({}));
+    Ok(settings
+        .get("last_plan_runner_plan_path")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned))
+}
+
+pub fn set_runner_plan_path(conn: &Connection, path: &str) -> Result<(), String> {
+    set_runner_pref(conn, "last_plan_runner_plan_path", path)
+}
+
 fn set_runner_pref(conn: &Connection, key: &str, value: &str) -> Result<(), String> {
     let mut settings = prefs_get(conn, PREF_APP_SETTINGS)?
         .and_then(|value| value.as_object().cloned())

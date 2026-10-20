@@ -17,6 +17,7 @@ mod patient_view;
 mod phantom;
 mod remote;
 mod runner;
+mod session_capture;
 mod source;
 mod store;
 mod synthesis;
@@ -139,6 +140,11 @@ const TOOLS: &[ToolSpec] = &[
         name: "scan_kit_config_tune",
         summary: "Apply one devices.xml tuner to the selected sessions.",
         kind: ToolKind::Workflow,
+    },
+    ToolSpec {
+        name: "scan_kit_config_diff",
+        summary: "Diff the loaded config tree against each selected session's config/.",
+        kind: ToolKind::Granular,
     },
     ToolSpec {
         name: "scan_kit_config_integrity",
@@ -353,6 +359,19 @@ pub fn tool_input_schema(name: &str) -> Value {
                 "db_path": { "type": "string" }
             },
             "required": ["workflow", "xml", "data_dir", "session_ids"],
+            "additionalProperties": false
+        }),
+        "scan_kit_config_diff" => json!({
+            "type": "object",
+            "properties": {
+                "config_dir": { "type": "string" },
+                "file": { "type": "string" },
+                "xml": { "type": "string" },
+                "form": { "type": "object" },
+                "data_dir": { "type": "string" },
+                "session_ids": { "type": "array", "items": { "type": "string" } }
+            },
+            "required": ["config_dir", "data_dir", "session_ids"],
             "additionalProperties": false
         }),
         "scan_kit_config_hide" => json!({
@@ -583,6 +602,7 @@ pub fn invoke(name: &str, input: &Value) -> Result<Value, InvokeError> {
             let db = database_path(input)?;
             config::tune(input, &db).map_err(InvokeError::Message)
         }
+        "scan_kit_config_diff" => config::diff(input).map_err(InvokeError::Message),
         "scan_kit_config_integrity" => {
             let path = required_str(input, "path")?;
             Ok(config::integrity(Path::new(path)))

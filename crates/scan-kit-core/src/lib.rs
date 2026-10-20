@@ -46,10 +46,10 @@ pub use plot::{
 pub use ramp::{choices, index, is_session, resolve, sample, session, Family, SESSION, VIRIDIS};
 pub use runner::{
     control_button, default_session_zip_path, device_file_url, field_subscribe_key, io_bool,
-    io_number, io_url, normalize_host, parse_host, resolve_session_download, runner_view,
-    session_download_hint, DEFAULT_CONTROL_POINTS, DEFAULT_SESSION_ROOT, LOAD_STATE_SUCCESS,
-    POINTS_LOAD_STATE, POINTS_UPLOAD, POINTS_UPLOAD_TARGET, POINTS_VALID, SESSION_DIRECTORY,
-    STATUS_PATHS,
+    io_number, io_text, io_url, normalize_host, parse_host, runner_view, session_download_hint,
+    session_zip_dest, COMBINED_STATE, CONTROL_POINT_COUNT, DEFAULT_CONTROL_POINTS,
+    DEFAULT_SESSION_ROOT, LOAD_STATE_SUCCESS, POINTS_LOAD_STATE, POINTS_UPLOAD,
+    POINTS_UPLOAD_TARGET, POINTS_VALID, SESSION_DIRECTORY, STATE, STATUS_PATHS, TIME_ELAPSED,
 };
 pub use session_log::{compare_templates, parse_session_log, LayerEvent, SessionLog};
 pub use signal::{

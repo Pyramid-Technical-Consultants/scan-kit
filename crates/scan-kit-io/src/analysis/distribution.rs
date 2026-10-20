@@ -23,7 +23,16 @@ const DRAW_CHOICES: &[(&str, &str)] = &[
 const CUTOFF_CHOICES: &[(&str, &str)] = &[("0", "0"), ("5", "5"), ("10", "10"), ("20", "20")];
 
 pub(super) fn distribution(root: &Path, session_ids: &[String], options: &Value) -> PlotScene {
-    let timeslice = crate::source::wants_timeslice(crate::source::Shape::Xy, options);
+    let allow_spot = session_ids.is_empty()
+        || session_ids
+            .iter()
+            .any(|id| crate::tables::grain_present(root, id, false));
+    let allow_slice = session_ids.is_empty()
+        || session_ids
+            .iter()
+            .any(|id| crate::tables::grain_present(root, id, true));
+    let timeslice =
+        crate::source::wants_timeslice(crate::source::Shape::Xy, allow_spot, allow_slice, options);
     let owned: Vec<(String, Vec<String>)> = session_ids
         .iter()
         .map(|id| {
@@ -37,7 +46,13 @@ pub(super) fn distribution(root: &Path, session_ids: &[String], options: &Value)
         .iter()
         .map(|(name, columns)| crate::source::SessionCols { name, columns })
         .collect();
-    let picked = crate::source::select(crate::source::Shape::Xy, true, true, &headers, options);
+    let picked = crate::source::select(
+        crate::source::Shape::Xy,
+        allow_spot,
+        allow_slice,
+        &headers,
+        options,
+    );
     let mode = picked.xy;
     let grain = picked.grain;
     let segments = segments_from(

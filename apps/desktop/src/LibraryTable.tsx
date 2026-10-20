@@ -10,6 +10,7 @@ import {
   type Theme,
 } from "@glideapps/glide-data-grid";
 
+import { useResizableColumns } from "@/grid-theme";
 import { selectedSessionIds, selectWholeRows } from "@/grid-selection";
 import { sessionColor } from "@/session-colors";
 import { drawSessionCheckbox, type CheckPaint } from "@/session-checkbox";
@@ -210,7 +211,8 @@ export function LibraryTable({
   onOpenMenu: (menu: SessionMenu) => void;
 }) {
   const lastRowToggle = useRef<{ row: number; at: number } | null>(null);
-  const columns = useMemo(() => libraryColumns(sort), [sort]);
+  const baseColumns = useMemo(() => libraryColumns(sort), [sort]);
+  const { columns, onColumnResize } = useResizableColumns(baseColumns);
   const changeSelection = useCallback(
     (next: GridSelection) => {
       onGridSelectionChange(selectWholeRows(next, columns.length));
@@ -382,6 +384,7 @@ export function LibraryTable({
       rowMarkers="none"
       smoothScrollX
       smoothScrollY
+      onColumnResize={onColumnResize}
     />
   );
 }

@@ -9,7 +9,7 @@ import {
   type GridColumn,
   type Item,
 } from "@glideapps/glide-data-grid";
-import { gridTheme, tokenColor } from "@/grid-theme";
+import { gridTheme, tokenColor, useResizableColumns } from "@/grid-theme";
 
 import {
   applyOption,
@@ -1048,8 +1048,9 @@ export function AnalysisView({
 
   const table = meta?.table;
   const gridRows = (table?.rows ?? []).filter((row) => row[0] !== "DVH" && row[0] !== "curve");
-  const columns: GridColumn[] =
+  const baseColumns: GridColumn[] =
     table?.columns.map((title) => ({ title, width: 180 })) ?? [];
+  const { columns, onColumnResize } = useResizableColumns(baseColumns);
   const getCellContent = ([col, row]: Item): GridCell => ({
     kind: GridCellKind.Text,
     data: gridRows[row]?.[col] ?? "",
@@ -1233,6 +1234,7 @@ export function AnalysisView({
             getCellContent={getCellContent}
             theme={gridTheme()}
             rowMarkers="none"
+            onColumnResize={onColumnResize}
           />
         ) : null}
         {shown || gridRows.length > 0 ? null : (

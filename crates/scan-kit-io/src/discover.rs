@@ -305,20 +305,25 @@ pub fn read_session_file(storage: &Path, session_id: &str, filename: &str) -> Op
         return fs::read(root.join(filename)).ok();
     }
     let primary = format!("{session_id}/{filename}");
+    let suffix = format!("/{filename}");
     let members = archive_members(storage, &|name| {
         let name = normalize_member(name);
-        name == primary || name == filename
+        name == primary || name == filename || name.ends_with(&suffix)
     })
     .ok()?;
-    if let Some((_, bytes)) = members
-        .iter()
-        .find(|(name, _)| normalize_member(name) == primary)
-    {
-        return Some(bytes.clone());
+    for want in [&primary, &filename.to_owned()] {
+        if let Some((_, bytes)) = members
+            .iter()
+            .find(|(name, _)| normalize_member(name) == **want)
+        {
+            return Some(bytes.clone());
+        }
     }
+    // A wrapped archive whose folder name was not picked up as the session id
+    // (tars keep the zip filename) still resolves by the inner path suffix.
     members
         .into_iter()
-        .find(|(name, _)| normalize_member(name) == filename)
+        .find(|(name, _)| normalize_member(name).ends_with(&suffix))
         .map(|(_, bytes)| bytes)
 }
 
@@ -405,7 +410,46 @@ pub(crate) fn archive_kind(name: &str) -> Option<(String, &'static str)> {
 }
 
 fn archive_identity(path: &Path) -> Option<(String, &'static str)> {
-    archive_kind(&file_name(path)?)
+    let (stem, kind) = archive_kind(&file_name(path)?)?;
+    // The zip filename is whatever the user typed (`session.zip`); the real
+    // session id is the folder wrapped inside. Peeking at a zip's central
+    // directory is cheap — a tar would stream the whole archive, so tars
+    // keep the filename stem.
+    if kind == "zip" {
+        if let Some(id) = zip_session_dir(path) {
+            return Some((id, kind));
+        }
+    }
+    Some((stem, kind))
+}
+
+/// The session folder wrapped inside a zip: the single top-level directory,
+/// or the one holding a session marker when extra entries are present.
+fn zip_session_dir(path: &Path) -> Option<String> {
+    let file = File::open(path).ok()?;
+    let mut archive = zip::ZipArchive::new(file).ok()?;
+    let mut tops = std::collections::HashSet::new();
+    let mut markers = std::collections::HashSet::new();
+    for index in 0..archive.len() {
+        let Ok(entry) = archive.by_index(index) else {
+            continue;
+        };
+        let name = normalize_member(entry.name());
+        let Some((top, _)) = name.split_once('/') else {
+            continue;
+        };
+        tops.insert(top.to_owned());
+        if name.ends_with("/input_map.csv") || name.ends_with("/termination_summary.txt") {
+            markers.insert(top.to_owned());
+        }
+    }
+    if markers.len() == 1 {
+        return markers.into_iter().next();
+    }
+    if tops.len() == 1 {
+        return tops.into_iter().next();
+    }
+    None
 }
 
 fn file_name(path: &Path) -> Option<String> {
@@ -739,6 +783,44 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(ids.contains(&"seen".to_owned()), "{ids:?}");
         assert!(!ids.contains(&"miss".to_owned()), "{ids:?}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_zip_named_session_takes_the_wrapped_session_id() {
+        let root = std::env::temp_dir().join(format!(
+            "scan-kit-zipid-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        write_zip(
+            &root.join("session.zip"),
+            &[
+                ("2131261153/input_map.csv", b"energy\n70\n"),
+                (
+                    "2131261153/termination_summary.txt",
+                    b"Primary total dose: 5.0\n",
+                ),
+            ],
+        )
+        .unwrap();
+
+        let found = discover(&root).unwrap();
+        assert_eq!(found.entries.len(), 1);
+        let entry = &found.entries[0];
+        assert_eq!(entry.session_id, "2131261153");
+        let summary = read_session_file(
+            &entry.storage_path,
+            &entry.session_id,
+            "termination_summary.txt",
+        )
+        .unwrap();
+        assert!(summary.starts_with(b"Primary total dose"));
         let _ = fs::remove_dir_all(&root);
     }
 }

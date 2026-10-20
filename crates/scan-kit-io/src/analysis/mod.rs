@@ -1343,10 +1343,15 @@ mod tests {
         assert!(!names.contains(&"only_sibling"));
         assert_eq!(loaded["energy_layers"], 1);
         let scene = analysis_scene("bins", &root, &["a".into()], &json!({})).unwrap();
-        assert!(scene
-            .panels
+        // Spot data is absent, so the default grain is timeslice and the
+        // available current column draws instead of an empty spot plot.
+        let y = scene
+            .controls
             .iter()
-            .any(|panel| panel.title.contains("No finite values")));
+            .find(|control| control.id == "y")
+            .unwrap();
+        assert_eq!(y.value, "IC Current (nA)");
+        assert!(scene.panels.iter().any(|panel| panel.title == "IC1"));
         let _ = std::fs::remove_dir_all(&root);
     }
 

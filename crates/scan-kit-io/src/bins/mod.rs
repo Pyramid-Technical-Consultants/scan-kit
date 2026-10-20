@@ -625,7 +625,20 @@ fn mtime_ns(path: &Path) -> u128 {
 }
 
 pub(crate) fn bins(root: &Path, session_ids: &[String], options: &Value) -> PlotScene {
-    let timeslice = crate::source::wants_timeslice(crate::source::Shape::YAndX, options);
+    let allow_spot = session_ids.is_empty()
+        || session_ids
+            .iter()
+            .any(|id| super::tables::grain_present(root, id, false));
+    let allow_slice = session_ids.is_empty()
+        || session_ids
+            .iter()
+            .any(|id| super::tables::grain_present(root, id, true));
+    let timeslice = crate::source::wants_timeslice(
+        crate::source::Shape::YAndX,
+        allow_spot,
+        allow_slice,
+        options,
+    );
     let owned: Vec<(String, Vec<String>)> = session_ids
         .iter()
         .map(|id| {
@@ -639,7 +652,13 @@ pub(crate) fn bins(root: &Path, session_ids: &[String], options: &Value) -> Plot
         .iter()
         .map(|(name, columns)| crate::source::SessionCols { name, columns })
         .collect();
-    let picked = crate::source::select(crate::source::Shape::YAndX, true, true, &headers, options);
+    let picked = crate::source::select(
+        crate::source::Shape::YAndX,
+        allow_spot,
+        allow_slice,
+        &headers,
+        options,
+    );
     let crate::source::Picked {
         y,
         frame,

@@ -305,41 +305,41 @@ pub fn runner_view(status: &Value, connected: bool, has_plan: bool) -> Value {
     })
 }
 
-pub fn resolve_session_download(dest: &str, remote_root: &str) -> Option<(String, String)> {
+/// A session download is a local .zip path; remote folders are gone — the
+/// capture reads live device tables instead of an on-disk session tree.
+pub fn session_zip_dest(dest: &str) -> Option<String> {
     let dest = dest.trim();
     if dest.is_empty() || dest.starts_with("/root/") || !dest.to_ascii_lowercase().ends_with(".zip")
     {
         return None;
     }
-    let root = remote_root.trim_end_matches('/');
-    Some((format!("{root}/{}", zip_stem(dest)), dest.to_owned()))
+    Some(dest.to_owned())
 }
 
-pub fn default_session_zip_path(current: &str, last_folder: &str) -> String {
+pub fn default_session_zip_path(current: &str, last_folder: &str, session_id: &str) -> String {
+    let stem = if session_id.trim().is_empty() {
+        "session"
+    } else {
+        session_id.trim()
+    };
+    let name = format!("{stem}.zip");
     let current = current.trim();
     let folder = last_folder.trim();
-    if current.starts_with("/root/") {
-        let name = format!("{}.zip", file_name(current));
-        return join_folder(folder, &name);
-    }
     if current.to_ascii_lowercase().ends_with(".zip") {
         return current.to_owned();
     }
     if !current.is_empty() {
-        return join_folder(current, "session.zip");
+        return join_folder(current, &name);
     }
-    join_folder(folder, "session.zip")
+    join_folder(folder, &name)
 }
 
-pub fn session_download_hint(dest: &str, remote_root: &str) -> String {
-    let dest = dest.trim();
-    let root = remote_root.trim_end_matches('/');
-    if dest.to_ascii_lowercase().ends_with(".zip") {
-        format!("Downloads {root}/{}", zip_stem(dest))
-    } else if dest.starts_with("/root/") {
-        format!("Remote folder {}", dest.trim_end_matches('/'))
+pub fn session_download_hint(session_id: &str) -> String {
+    let id = session_id.trim();
+    if id.is_empty() {
+        "Captures the last session's live device tables into a zip.".into()
     } else {
-        format!("Zip name is the folder under {root}/")
+        format!("Captures session {id} — live tables from the RCI and its devices.")
     }
 }
 
@@ -365,24 +365,6 @@ fn display_count(value: &Value) -> Option<String> {
         Some(_) => Some(io_text(raw)),
         None => Some(io_text(raw)),
     }
-}
-
-fn zip_stem(path: &str) -> String {
-    let name = file_name(path);
-    if let Some(dot) = name.rfind('.') {
-        if name[dot..].eq_ignore_ascii_case(".zip") {
-            return name[..dot].to_owned();
-        }
-    }
-    name
-}
-
-fn file_name(path: &str) -> String {
-    path.trim_end_matches(['/', '\\'])
-        .rsplit(['/', '\\'])
-        .next()
-        .unwrap_or(path)
-        .to_owned()
 }
 
 fn join_folder(folder: &str, name: &str) -> String {
@@ -477,16 +459,19 @@ mod tests {
             &json!({POINTS_VALID: true, READY_PERMIT: false, READY_PERMIT_REASON: ["Door open", 1.0]})
         )
         .contains("Door open"));
-        let remote =
-            resolve_session_download(r"C:\data\abc.zip", "/root/reports/session/").unwrap();
-        assert_eq!(remote.0, "/root/reports/session/abc");
-        assert!(
-            resolve_session_download("/root/reports/session/abc", "/root/reports/session")
-                .is_none()
+        assert_eq!(
+            session_zip_dest(r"C:\data\abc.zip").unwrap(),
+            r"C:\data\abc.zip"
         );
-        assert_eq!(default_session_zip_path("", ""), "session.zip");
-        assert!(
-            session_download_hint(r"C:\data\abc.zip", "/root/reports/session").contains("/abc")
+        assert!(session_zip_dest("/root/reports/session/abc").is_none());
+        assert!(session_zip_dest(r"C:\data\abc").is_none());
+        assert_eq!(default_session_zip_path("", "", ""), "session.zip");
+        assert_eq!(default_session_zip_path("", "", "2131"), "2131.zip");
+        assert_eq!(
+            default_session_zip_path(r"C:\data", r"C:\folder", "42"),
+            r"C:\data\42.zip"
         );
+        assert!(session_download_hint("42").contains("42"));
+        assert!(!session_download_hint("").contains("session "));
     }
 }

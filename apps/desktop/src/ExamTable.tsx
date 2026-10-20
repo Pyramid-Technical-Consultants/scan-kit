@@ -8,6 +8,8 @@ import {
   type Theme,
 } from "@glideapps/glide-data-grid";
 
+import { useResizableColumns } from "@/grid-theme";
+
 export type ExamRow = {
   exam: string;
   patient: string;
@@ -58,12 +60,13 @@ export function ExamTable({
     });
     return indexes;
   }, [rows, sort]);
-  const columns: GridColumn[] = COLUMNS.map((column, index) => ({
+  const baseColumns: GridColumn[] = COLUMNS.map((column, index) => ({
     title: sort.key === column.key ? `${column.title} ${sort.direction === "desc" ? "↓" : "↑"}` : column.title,
     id: column.key,
     width: index === 4 ? 220 : 140,
     grow: index === 4 ? 1 : 0,
   }));
+  const { columns, onColumnResize } = useResizableColumns(baseColumns);
   const getCellContent = ([col, row]: readonly [number, number]): GridCell => {
     const source = order[row];
     const item = source == null ? undefined : rows[source];
@@ -105,6 +108,7 @@ export function ExamTable({
       rowMarkers="none"
       smoothScrollX
       smoothScrollY
+      onColumnResize={onColumnResize}
     />
   );
 }

@@ -426,8 +426,13 @@ const XY_MODE: &[XyMode] = &[
     },
 ];
 
-pub(crate) fn wants_timeslice(shape: Shape, options: &Value) -> bool {
-    grain_of(shape, true, true, options) == "timeslice"
+pub(crate) fn wants_timeslice(
+    shape: Shape,
+    allow_spot: bool,
+    allow_slice: bool,
+    options: &Value,
+) -> bool {
+    grain_of(shape, allow_spot, allow_slice, options) == "timeslice"
 }
 
 pub(crate) fn select(
