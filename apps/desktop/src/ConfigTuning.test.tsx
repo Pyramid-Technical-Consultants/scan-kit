@@ -20,7 +20,8 @@ vi.mock("@tauri-apps/api/core", () => ({
           {
             id: "sigma_tuning",
             name: "Sigma Tuning",
-            description: "IC1/IC2 σ K0 to fit ±tolerance band",
+            description: "Fit spot-size factors to session data",
+            sessions: true,
             params: [
               {
                 key: "sigma_tolerance_percent",
@@ -29,6 +30,14 @@ vi.mock("@tauri-apps/api/core", () => ({
                 default: 20,
               },
             ],
+          },
+          {
+            id: "config_diff",
+            name: "Config Diff",
+            description: "Diff all config files against selected sessions",
+            sessions: true,
+            diff: true,
+            params: [],
           },
         ],
       };
@@ -81,6 +90,42 @@ vi.mock("@tauri-apps/api/core", () => ({
         },
       };
     }
+    if (command === "scan_kit_config_diff") {
+      return {
+        base: "C:/config",
+        edited: "map2map/devices.xml",
+        summary: "sess: 1 of 2 differ",
+        warnings: [],
+        sessions: [
+          {
+            id: "sess",
+            root: "C:/data/sess/config",
+            files: [
+              {
+                rel: "map2map/devices.xml",
+                status: "changed",
+                edited: true,
+                adds: 1,
+                dels: 1,
+                lines: [
+                  { kind: "del", old_no: 1, text: "<a/>" },
+                  { kind: "add", new_no: 1, text: "<b/>" },
+                ],
+              },
+              { rel: "nozzle/n.json", status: "same", adds: 0, dels: 0, lines: [] },
+            ],
+          },
+          {
+            id: "other",
+            warning: "No config/ tree in session other.",
+            files: [],
+          },
+        ],
+        changed: false,
+        columns: [],
+        rows: [],
+      };
+    }
     if (command === "scan_kit_config_tune") {
       return {
         xml: "<devices/>",
@@ -88,7 +133,7 @@ vi.mock("@tauri-apps/api/core", () => ({
         summary: "Updated 1 beam_sigma band(s) from sess. Save the configuration to write devices.xml.",
         warnings: [],
         columns: ["Device", "K0 After"],
-        rows: [["IC_1_X", "5.05"]],
+        rows: [[{ text: "IC_1_X" }, { text: "5.05", tone: "change" }]],
         changed: true,
       };
     }
@@ -116,9 +161,11 @@ it("previews a tune, then applies it after confirmation", async () => {
   document.body.append(host);
   await act(async () => {
     root = createRoot(host);
-    root.render(<ConfigTuning folder="C:/data" selectedIds={["sess"]} />);
+    root.render(
+      <ConfigTuning folder="C:/data" sessions={[{ id: "sess", note: "" }]} selectedIds={["sess"]} />,
+    );
   });
-  expect(document.body.textContent).toContain("IC1/IC2");
+  expect(document.body.textContent).toContain("Fit spot-size factors");
   expect(document.querySelector("[aria-label='No .md5 sidecar']")).toBeTruthy();
   const version = [...document.querySelectorAll("[data-slot=field]")].find((node) =>
     node.textContent?.includes("Version"),
@@ -149,12 +196,15 @@ it("previews a tune, then applies it after confirmation", async () => {
   );
   expect(document.body.textContent).toContain("Updated 1 beam_sigma");
   const handle = document.querySelector("[aria-label='Resize configuration']");
+  const previewHandle = document.querySelector("[aria-label='Resize preview']");
   const apply = [...document.body.querySelectorAll("button")].find((item) => item.textContent === "Apply");
   const save = document.querySelector("[aria-label='Save folder']");
   expect(apply).toBeTruthy();
   expect(handle?.previousElementSibling?.contains(save ?? null)).toBe(true);
-  expect(handle?.nextElementSibling?.contains(apply ?? null)).toBe(true);
   expect(handle?.nextElementSibling?.contains(save ?? null)).toBe(false);
+  expect(handle?.nextElementSibling?.contains(apply ?? null)).toBe(false);
+  expect(previewHandle?.nextElementSibling?.contains(apply ?? null)).toBe(true);
+  expect(previewHandle?.previousElementSibling?.contains(apply ?? null)).toBe(false);
   const tuneCalls = vi.mocked(invoke).mock.calls.filter((call) => call[0] === "scan_kit_config_tune").length;
   await act(async () => {
     apply?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
@@ -162,6 +212,47 @@ it("previews a tune, then applies it after confirmation", async () => {
   expect(confirm).toHaveBeenCalledWith(expect.stringContaining("beam sigma K0"));
   expect(vi.mocked(invoke).mock.calls.filter((call) => call[0] === "scan_kit_config_tune").length).toBe(tuneCalls);
   expect(document.body.textContent).not.toContain("Version");
+  vi.useRealTimers();
+});
+
+it("diffs the loaded config against each selected session", async () => {
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+  const host = document.createElement("div");
+  document.body.append(host);
+  await act(async () => {
+    root = createRoot(host);
+    root.render(
+      <ConfigTuning
+        folder="C:/data"
+        sessions={[{ id: "sess", note: "" }, { id: "other", note: "" }]}
+        selectedIds={["sess", "other"]}
+      />,
+    );
+  });
+  const diff = [...document.body.querySelectorAll("button")].find((item) =>
+    item.textContent?.includes("Config Diff"),
+  );
+  await act(async () => {
+    diff?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    await vi.advanceTimersByTimeAsync(200);
+  });
+  expect(invoke).toHaveBeenCalledWith(
+    "scan_kit_config_diff",
+    expect.objectContaining({
+      configDir: "C:/config",
+      file: "devices.xml",
+      dataDir: "C:/data",
+      sessionIds: ["sess", "other"],
+    }),
+  );
+  expect(document.body.textContent).toContain("sess: 1 of 2 differ");
+  expect(document.body.textContent).toContain("map2map/devices.xml");
+  expect(document.body.textContent).toContain("Modified");
+  expect(document.body.textContent).toContain("unsaved");
+  expect(document.body.textContent).toContain("<b/>");
+  expect(document.body.textContent).toContain("1 identical file");
+  expect(document.body.textContent).toContain("No config/ tree in session other.");
+  expect([...document.body.querySelectorAll("button")].some((item) => item.textContent === "Apply")).toBe(false);
   vi.useRealTimers();
 });
 

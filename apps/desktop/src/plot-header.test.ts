@@ -51,7 +51,7 @@ it("reads a string option and a noted option", () => {
   );
   expect(header.controls[0]?.group).toBe("Data Source");
   expect(header.controls[0]?.kind).toBe("");
-  expect(header.controls[0]?.options[0]).toEqual({ id: "Energy", label: "Energy", detail: "", icon: "" });
+  expect(header.controls[0]?.options[0]).toEqual({ id: "Energy", label: "Energy", detail: "", icon: "", iconOnly: false });
   expect(header.controls[0]?.options[1]?.detail).toBe("Measured against target");
   expect(header.controls[0]?.options[1]?.icon).toBe("dose_error");
 });

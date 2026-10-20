@@ -39,6 +39,7 @@ Versions below are the ones locked for the workspace. Anomaly review for a SOUP 
 | tungstenite | see `crates/scan-kit-io/Cargo.toml` | mpack WebSocket to an RCI. Handshake only, no TLS |
 | rmpv | see `crates/scan-kit-io/Cargo.toml` | MessagePack encode and decode for that session |
 | sha2 | see `crates/scan-kit-io/Cargo.toml` | Name the remote-session cache directory. SK-REQ-004 |
+| similar | see `crates/scan-kit-io/Cargo.toml` | Line diffs between the loaded configuration tree and session `config/` trees |
 | ssh2 | see `crates/scan-kit-io/Cargo.toml` | SFTP library open, synchronous, on the blocking path. Windows uses the system crypto library. SK-REQ-004 |
 | suppaftp | see `crates/scan-kit-io/Cargo.toml` | FTP and FTPS library open. SK-REQ-004 |
 | ureq | see `crates/scan-kit-io/Cargo.toml` | Download one `http://` or `https://` archive into the remote cache. SK-REQ-004 |

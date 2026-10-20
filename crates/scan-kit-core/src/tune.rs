@@ -25,7 +25,8 @@ pub fn tune_catalog() -> Value {
             {
                 "id": "sigma_tuning",
                 "name": "Sigma Tuning",
-                "description": "IC1/IC2 σ K0 to fit ±tolerance band",
+                "description": "Fit spot-size factors to session data",
+                "sessions": true,
                 "params": [
                     hint(
                         spec_float("sigma_tolerance_percent", "Sigma Tolerance", 20.0, 0.0, 0.1),
@@ -35,14 +36,15 @@ pub fn tune_catalog() -> Value {
                     hint(
                         spec_float("sigma_lower_headroom_percent", "Lower Headroom", 1.0, 0.0, 0.1),
                         "%",
-                        "Extra margin added above the smallest observed sigma before fitting the tolerance band, so K0 does not sit flush against the measured minimum."
+                        "Extra margin below the smallest observed sigma, covering hypothetical smaller spots the sessions did not sample."
                     )
                 ]
             },
             {
                 "id": "position_offset_tuning",
                 "name": "Position Offset Tuning",
-                "description": "IC1/IC2 zero offset at iso mm from session(s)",
+                "description": "Correct chamber zero offsets from position error",
+                "sessions": true,
                 "params": [
                     spec_choice("optimize_method", "Optimize Using", "median", json!([
                         choice("median", "Median", "Robust median of position errors across all samples."),
@@ -58,13 +60,15 @@ pub fn tune_catalog() -> Value {
             {
                 "id": "ic_distance_tuning",
                 "name": "IC Distance Tuning",
-                "description": "IC1/IC2 source to device distance and zero offset. Review the change, then re-run Sigma Tuning.",
+                "description": "Fit source distance per chamber — re-run Sigma Tuning after",
+                "sessions": true,
                 "params": []
             },
             {
                 "id": "kmu_tuning",
                 "name": "Dose Calibration",
-                "description": "Secondary IC K_MU to match primary (optional primary rescale)",
+                "description": "Match secondary K_MU to the primary IC",
+                "sessions": true,
                 "params": [
                     spec_choice("primary_ic", "Primary IC", "ic1", json!([
                         choice("ic1", "IC1", "Beam-terminator chamber. Left unchanged unless you rescale it below."),
@@ -79,7 +83,7 @@ pub fn tune_catalog() -> Value {
                     hint(
                         spec_float_when("known_mu", "Known MU", 0.0, 0.0, 0.1, "primary_mode", "known_mu"),
                         "MU",
-                        "Total MU at isocenter for the selected sessions combined."
+                        "Total MU at isocenter for the selected sessions combined. Defaults to the primary IC total."
                     ),
                     hint(
                         spec_float_when("percent", "Percent", 0.0, -99.0, 0.1, "primary_mode", "percent"),
@@ -113,7 +117,7 @@ pub fn run_tune(
         xml.to_owned()
     };
     let form = config_form(&xml)?;
-    Ok(json!({
+    let mut body = json!({
         "xml": xml,
         "form": form,
         "summary": summary,
@@ -121,7 +125,15 @@ pub fn run_tune(
         "columns": columns,
         "rows": rows,
         "changed": changed,
-    }))
+    });
+    if workflow == "kmu_tuning" {
+        body["mu_totals"] = json!(spots
+            .mu
+            .iter()
+            .map(|mu| sum_positive(mu))
+            .collect::<Vec<_>>());
+    }
+    Ok(body)
 }
 
 fn spec_float(key: &str, label: &str, default: f64, min: f64, step: f64) -> Value {
@@ -171,91 +183,252 @@ fn hint(mut spec: Value, suffix: &str, tooltip: &str) -> Value {
     spec
 }
 
+/// Preview cell. `tone` is the verdict the grid color-codes: "good" improves or
+/// holds tolerance, "warn" needs review, "bad" is a downgrade, "change" marks a
+/// value that will be rewritten.
+fn cell(text: impl Into<String>, tone: Option<&'static str>) -> Value {
+    match tone {
+        Some(tone) => json!({ "text": text.into(), "tone": tone }),
+        None => json!({ "text": text.into() }),
+    }
+}
+
 fn tune_sigma(
     root: &mut Elem,
     spots: &TuneSpots,
     params: &Value,
     session_label: &str,
-) -> Result<(String, Vec<String>, Vec<String>, Vec<Vec<String>>, bool), String> {
+) -> Result<(String, Vec<String>, Vec<String>, Vec<Vec<Value>>, bool), String> {
     let tolerance = number(params, "sigma_tolerance_percent", 20.0).max(0.0);
     let headroom = number(params, "sigma_lower_headroom_percent", 1.0).max(0.0);
     let mut warnings = Vec::new();
     let mut rows = Vec::new();
     let mut updates = 0;
-    let mut max_extreme = 0.0_f64;
-    for (index, device) in DEVICES.iter().enumerate() {
-        let Some(chamber) = find_chamber(root, device) else {
-            continue;
-        };
-        let sigmas = &spots.sigma[index];
-        if sigmas.is_empty() {
-            warnings.push(format!("No session sigma data for {device}."));
-            continue;
-        }
-        let bands: Vec<usize> = chamber
-            .children
-            .iter()
-            .enumerate()
-            .filter(|(_, child)| is_sigma_band(child))
-            .map(|(index, _)| index)
-            .collect();
-        for band_index in bands {
-            let band = &chamber.children[band_index];
-            let (min_e, max_e, k1, k2, k3, old) = match band_coeffs(band) {
-                Some(values) => values,
-                None => continue,
+    let mut processed = 0;
+    let mut min_inside = f64::INFINITY;
+    for (ic, axis_indexes) in [("IC_1", [0_usize, 1_usize]), ("IC_2", [2_usize, 3_usize])] {
+        // X and Y bands for the same chamber share a row; each side is
+        // collected separately, then merged on (min_e, max_e).
+        let mut sides: [Vec<((f64, f64), SigmaBand)>; 2] = [Vec::new(), Vec::new()];
+        for (side, index) in axis_indexes.into_iter().enumerate() {
+            let device = DEVICES[index];
+            let Some(chamber) = find_chamber(root, device) else {
+                continue;
             };
-            if k1.abs() > 1e-12 || k2.abs() > 1e-12 || k3.abs() > 1e-12 {
+            let sigmas = &spots.sigma[index];
+            if sigmas.is_empty() {
+                warnings.push(format!("No session sigma data for {device}."));
                 continue;
             }
-            let samples = paired(&spots.energy, sigmas, min_e, max_e);
-            if samples.is_empty() {
-                continue;
+            let bands: Vec<usize> = chamber
+                .children
+                .iter()
+                .enumerate()
+                .filter(|(_, child)| is_sigma_band(child))
+                .map(|(index, _)| index)
+                .collect();
+            for band_index in bands {
+                let band = &chamber.children[band_index];
+                let (min_e, max_e, k1, k2, k3, old) = match band_coeffs(band) {
+                    Some(values) => values,
+                    None => continue,
+                };
+                if k1.abs() > 1e-12 || k2.abs() > 1e-12 || k3.abs() > 1e-12 {
+                    continue;
+                }
+                let samples = paired(&spots.energy, sigmas, min_e, max_e);
+                if samples.is_empty() {
+                    continue;
+                }
+                let new_k0 = band_k0(&samples, tolerance, headroom);
+                if !new_k0.is_finite() {
+                    continue;
+                }
+                let inside_after = inside_fraction(&samples, new_k0, tolerance);
+                let inside_before = inside_fraction(&samples, old, tolerance);
+                if inside_after < min_inside {
+                    min_inside = inside_after;
+                }
+                let before = format_k0(old);
+                let after = format_k0(new_k0);
+                let differs = after != before;
+                processed += 1;
+                if differs {
+                    chamber.children[band_index].set_attr("K0", &after);
+                    updates += 1;
+                }
+                // inside_fraction() returns NaN when there is no valid old K0
+                // baseline; NaN comparisons are all false, so the After cell
+                // lands on the warn/neutral branches instead of good/bad.
+                // NaN comparisons are false, so a missing old-K0 baseline
+                // stays neutral.
+                let before_tone = if inside_before < 0.90 {
+                    "bad"
+                } else if inside_before < 1.0 {
+                    "warn"
+                } else {
+                    ""
+                };
+                let after_tone = if inside_after >= 1.0 {
+                    "good"
+                } else if inside_after < inside_before {
+                    "bad"
+                } else if inside_after > inside_before {
+                    "warn"
+                } else {
+                    ""
+                };
+                let after_text = if differs && old.is_finite() && old != 0.0 {
+                    format!("{after} ({:+.1}%)", 100.0 * (new_k0 - old) / old.abs())
+                } else {
+                    after.clone()
+                };
+                sides[side].push((
+                    (min_e, max_e),
+                    SigmaBand {
+                        samples: samples.len(),
+                        before,
+                        after_text,
+                        differs,
+                        variance: variance(&samples),
+                        inside_before,
+                        inside_after,
+                        before_tone,
+                        after_tone,
+                    },
+                ));
             }
-            let new_k0 = band_k0(&samples, tolerance, headroom);
-            if !new_k0.is_finite() {
-                continue;
+        }
+        let mut keys: Vec<(f64, f64)> = Vec::new();
+        for side in &sides {
+            for (key, _) in side {
+                if !keys.contains(key) {
+                    keys.push(*key);
+                }
             }
-            let (extreme, observed, kind) = excursion(&samples, new_k0, tolerance);
-            if extreme > max_extreme {
-                max_extreme = extreme;
-            }
-            chamber.children[band_index].set_attr("K0", &format_k0(new_k0));
-            updates += 1;
-            rows.push(vec![
-                (*device).to_owned(),
-                format!("{min_e}–{max_e}"),
-                samples.len().to_string(),
-                format_k0(old),
-                format_k0(new_k0),
-                format!("{:.4}", variance(&samples)),
-                format!("{extreme:.2} {kind} ({observed:.3} mm)"),
-            ]);
+        }
+        for (min_e, max_e) in keys {
+            let x = band_at(&sides[0], min_e, max_e);
+            let y = band_at(&sides[1], min_e, max_e);
+            rows.push(sigma_row(ic, min_e, max_e, x, y));
         }
     }
-    if updates == 0 && warnings.is_empty() {
+    if processed == 0 && warnings.is_empty() {
         warnings.push("No beam_sigma_conversions bands matched session energies.".into());
     }
     let summary = if updates == 0 {
         "No sigma bands were updated.".to_owned()
     } else {
-        format!("{updates} energy band(s) will be updated from {session_label}. Max OOB: {max_extreme:.1}%.")
+        format!(
+            "{updates} energy band(s) will be updated from {session_label}. Min inside tolerance: {:.0}%.",
+            min_inside * 100.0
+        )
     };
     Ok((
         summary,
         warnings,
         vec![
-            "Device".into(),
+            "IC".into(),
             "Energy (MeV)".into(),
             "Spots".into(),
-            "K0 Before".into(),
-            "K0 After".into(),
-            "Variance".into(),
-            "Extreme".into(),
+            "X K0 Before".into(),
+            "X K0 After".into(),
+            "X Coverage Before (%)".into(),
+            "X Coverage After (%)".into(),
+            "Y K0 Before".into(),
+            "Y K0 After".into(),
+            "Y Coverage Before (%)".into(),
+            "Y Coverage After (%)".into(),
+            "Variance (mm²)".into(),
         ],
         rows,
         updates > 0,
     ))
+}
+
+struct SigmaBand {
+    samples: usize,
+    before: String,
+    after_text: String,
+    differs: bool,
+    variance: f64,
+    inside_before: f64,
+    inside_after: f64,
+    before_tone: &'static str,
+    after_tone: &'static str,
+}
+
+fn band_at(side: &[((f64, f64), SigmaBand)], min_e: f64, max_e: f64) -> Option<&SigmaBand> {
+    side.iter()
+        .find(|(key, _)| *key == (min_e, max_e))
+        .map(|(_, band)| band)
+}
+
+// One preview row per IC and energy band: X and Y columns side by side, "—"
+// for an axis with no matching band.
+fn sigma_row(
+    ic: &str,
+    min_e: f64,
+    max_e: f64,
+    x: Option<&SigmaBand>,
+    y: Option<&SigmaBand>,
+) -> Vec<Value> {
+    let spots = match (x, y) {
+        (Some(x), Some(y)) => format!("{} / {}", x.samples, y.samples),
+        (Some(x), None) => format!("{} / —", x.samples),
+        (None, Some(y)) => format!("— / {}", y.samples),
+        (None, None) => "—".into(),
+    };
+    let spread = match (x, y) {
+        (Some(x), Some(y)) => format!("{:.4} / {:.4}", x.variance, y.variance),
+        (Some(x), None) => format!("{:.4} / —", x.variance),
+        (None, Some(y)) => format!("— / {:.4}", y.variance),
+        (None, None) => "—".into(),
+    };
+    let inside_text = |fraction: f64| -> String {
+        if fraction.is_finite() {
+            format!("{:.1}%", fraction * 100.0)
+        } else {
+            "—".into()
+        }
+    };
+    let side = |band: Option<&SigmaBand>| -> Vec<Value> {
+        match band {
+            Some(band) => vec![
+                cell(band.before.clone(), None),
+                cell(
+                    band.after_text.clone(),
+                    if band.differs { Some("change") } else { None },
+                ),
+                cell(
+                    inside_text(band.inside_before),
+                    if band.before_tone.is_empty() {
+                        None
+                    } else {
+                        Some(band.before_tone)
+                    },
+                ),
+                cell(
+                    inside_text(band.inside_after),
+                    if band.after_tone.is_empty() {
+                        None
+                    } else {
+                        Some(band.after_tone)
+                    },
+                ),
+            ],
+            None => vec![cell("—", None); 4],
+        }
+    };
+    let mut row = vec![
+        cell(ic.to_owned(), None),
+        cell(format!("{min_e}–{max_e}"), None),
+        cell(spots, None),
+    ];
+    row.extend(side(x));
+    row.extend(side(y));
+    row.push(cell(spread, None));
+    row
 }
 
 fn tune_offset(
@@ -263,11 +436,12 @@ fn tune_offset(
     spots: &TuneSpots,
     params: &Value,
     session_label: &str,
-) -> Result<(String, Vec<String>, Vec<String>, Vec<Vec<String>>, bool), String> {
+) -> Result<(String, Vec<String>, Vec<String>, Vec<Vec<Value>>, bool), String> {
     let mode = text(params, "optimize_method", "median");
     let mut warnings = Vec::new();
     let mut rows = Vec::new();
     let mut updates = 0;
+    let mut processed = 0;
     let mut max_correction = 0.0_f64;
     for (index, device) in DEVICES.iter().enumerate() {
         let Some(chamber) = find_chamber(root, device) else {
@@ -283,7 +457,8 @@ fn tune_offset(
             continue;
         };
         let errors = axis_errors(spots, index);
-        if errors.is_empty() {
+        let samples = errors.iter().filter(|value| value.is_finite()).count();
+        if samples == 0 {
             warnings.push(format!("No session position data for {device}."));
             continue;
         }
@@ -301,18 +476,31 @@ fn tune_offset(
         if correction.abs() > max_correction {
             max_correction = correction.abs();
         }
-        chamber.children[offset_index].text = format_k0(new_offset);
-        updates += 1;
+        let before = format_k0(old);
+        let after = format_k0(new_offset);
+        let differs = after != before;
+        processed += 1;
+        if differs {
+            chamber.children[offset_index].text = after.clone();
+            updates += 1;
+        }
+        let correction_tone = if correction.abs() > 1.0 {
+            Some("warn")
+        } else if correction.abs() >= 0.05 {
+            Some("good")
+        } else {
+            None
+        };
         rows.push(vec![
-            (*device).to_owned(),
-            errors.len().to_string(),
-            format_k0(old),
-            format_k0(new_offset),
-            format!("{correction:.4}"),
-            format!("{:.4}", variance(&errors)),
+            cell((*device).to_owned(), None),
+            cell(samples.to_string(), None),
+            cell(before, None),
+            cell(after, if differs { Some("change") } else { None }),
+            cell(format!("{correction:.4}"), correction_tone),
+            cell(format!("{:.4}", variance(&errors)), None),
         ]);
     }
-    if updates == 0 && warnings.is_empty() {
+    if processed == 0 && warnings.is_empty() {
         warnings.push("No zero_offset_at_iso_mm elements matched session data.".into());
     }
     let summary = if updates == 0 {
@@ -328,10 +516,10 @@ fn tune_offset(
         vec![
             "Device".into(),
             "Samples".into(),
-            "Offset Before".into(),
-            "Offset After".into(),
-            "Correction".into(),
-            "Variance".into(),
+            "Offset Before (mm)".into(),
+            "Offset After (mm)".into(),
+            "Correction (mm)".into(),
+            "Variance (mm²)".into(),
         ],
         rows,
         updates > 0,
@@ -342,10 +530,11 @@ fn tune_distance(
     root: &mut Elem,
     spots: &TuneSpots,
     session_label: &str,
-) -> Result<(String, Vec<String>, Vec<String>, Vec<Vec<String>>, bool), String> {
+) -> Result<(String, Vec<String>, Vec<String>, Vec<Vec<Value>>, bool), String> {
     let mut warnings = Vec::new();
     let mut rows = Vec::new();
     let mut updates = 0;
+    let mut processed = 0;
     let mut largest: (String, f64, f64) = (String::new(), 0.0, 0.0);
     let mut best_removed = (String::new(), 0.0);
     for (index, device) in DEVICES.iter().enumerate() {
@@ -407,7 +596,7 @@ fn tune_distance(
         } else {
             (fit.gain - 1.0).abs() / fit.gain_stderr
         };
-        if significance < 3.0 {
+        if significance.is_nan() || significance < 3.0 {
             warnings.push(format!(
                 "{device}: distance change {delta_mm:+.2} mm is within the fit's own uncertainty."
             ));
@@ -417,24 +606,90 @@ fn tune_distance(
                 "{device}: source_to_device_distance_mm moves {delta_mm:+.2} mm ({delta_pct:+.2}%). This is a surveyed distance."
             ));
         }
-        chamber.children[sdd_index].text = format_distance(new_sdd);
-        chamber.children[offset_index].text = format_k0(new_offset);
-        updates += 1;
+        let sdd_before = format_distance(old_sdd);
+        let sdd_after = format_distance(new_sdd);
+        let off_before = format_k0(old_offset);
+        let off_after = format_k0(new_offset);
+        let off_text =
+            if off_after != off_before && old_offset.is_finite() && new_offset.is_finite() {
+                format!("{off_after} ({:+.3})", new_offset - old_offset)
+            } else {
+                off_after.clone()
+            };
+        processed += 1;
+        if sdd_after != sdd_before || off_after != off_before {
+            chamber.children[sdd_index].text = sdd_after.clone();
+            chamber.children[offset_index].text = off_after.clone();
+            updates += 1;
+        }
         if delta_pct.abs() > largest.2.abs() {
             largest = ((*device).to_owned(), delta_mm, delta_pct);
         }
         if fit.systematic > best_removed.1 {
             best_removed = ((*device).to_owned(), fit.systematic);
         }
+        let sdd_tone = if delta_pct.abs() > 1.0 {
+            Some("warn")
+        } else if sdd_after != sdd_before {
+            Some("change")
+        } else {
+            None
+        };
+        let off_tone = if off_after != off_before {
+            Some("change")
+        } else {
+            None
+        };
+        let gain_tone = if significance.is_nan() || significance < 3.0 {
+            Some("warn")
+        } else {
+            Some("good")
+        };
+        let sig_text = if significance.is_infinite() {
+            "∞".into()
+        } else if significance.is_nan() {
+            "—".into()
+        } else {
+            format!("{significance:.1}σ")
+        };
+        let spots = if fit.n_samples < fit.n_total {
+            format!("{} / {}", fit.n_samples, fit.n_total)
+        } else {
+            fit.n_samples.to_string()
+        };
+        let delta = if delta_pct.is_finite() {
+            format!("{delta_mm:+.2} ({delta_pct:+.1}%)")
+        } else {
+            format!("{delta_mm:+.2} (—%)")
+        };
         rows.push(vec![
-            (*device).to_owned(),
-            fit.n_samples.to_string(),
-            format_distance(old_sdd),
-            format_distance(new_sdd),
-            format_k0(old_offset),
-            format_k0(new_offset),
-            format!("{:.4}", fit.gain),
-            format!("{:.3}", fit.systematic),
+            cell((*device).to_owned(), None),
+            cell(spots, None),
+            cell(sdd_before, None),
+            cell(sdd_after, sdd_tone),
+            cell(
+                delta,
+                if delta_pct.abs() > 1.0 {
+                    Some("warn")
+                } else {
+                    None
+                },
+            ),
+            cell(off_before, None),
+            cell(off_text, off_tone),
+            cell(
+                format!("{:.4} ±{:.4} ({sig_text})", fit.gain, fit.gain_stderr),
+                gain_tone,
+            ),
+            cell(format!("{:.3}", fit.rms_before), None),
+            cell(
+                format!("{:.3}", fit.rms_after),
+                if fit.rms_after + 1e-9 < fit.rms_before {
+                    Some("good")
+                } else {
+                    None
+                },
+            ),
         ]);
     }
     if updates > 0 {
@@ -443,7 +698,7 @@ fn tune_distance(
                 .into(),
         );
     }
-    if updates == 0 && warnings.is_empty() {
+    if processed == 0 && warnings.is_empty() {
         warnings.push("No ion chamber matched the session data.".into());
     }
     let summary = if updates == 0 {
@@ -460,13 +715,15 @@ fn tune_distance(
         warnings,
         vec![
             "Device".into(),
-            "Samples".into(),
-            "SDD Before".into(),
-            "SDD After".into(),
-            "Offset Before".into(),
-            "Offset After".into(),
+            "Spots".into(),
+            "SDD Before (mm)".into(),
+            "SDD After (mm)".into(),
+            "Δ SDD (mm %)".into(),
+            "Offset Before (mm)".into(),
+            "Offset After (mm)".into(),
             "Gain".into(),
-            "Systematic (mm)".into(),
+            "Err Before (mm)".into(),
+            "Err After (mm)".into(),
         ],
         rows,
         updates > 0,
@@ -478,7 +735,7 @@ fn tune_kmu(
     spots: &TuneSpots,
     params: &Value,
     session_label: &str,
-) -> Result<(String, Vec<String>, Vec<String>, Vec<Vec<String>>, bool), String> {
+) -> Result<(String, Vec<String>, Vec<String>, Vec<Vec<Value>>, bool), String> {
     let primary = match text(params, "primary_ic", "ic1").as_str() {
         "ic2" => 1,
         "ic3" => 2,
@@ -507,10 +764,13 @@ fn tune_kmu(
     }
     let target = match mode.as_str() {
         "known_mu" => {
-            if !(known.is_finite() && known > 0.0) {
-                warnings.push("Enter a known MU at isocenter greater than 0.".into());
-                return empty_kmu(warnings);
-            }
+            // 0 or empty means "use the primary IC total", which the desktop
+            // pre-fills from the preview's mu_totals once sessions are loaded.
+            let known = if known.is_finite() && known > 0.0 {
+                known
+            } else {
+                sum_pri
+            };
             let mismatch = pct(known, sum_pri).abs();
             if mismatch > 20.0 {
                 warnings.push(format!(
@@ -528,10 +788,15 @@ fn tune_kmu(
         }
         _ => sum_pri,
     };
+    let sums = [
+        sum_positive(&spots.mu[0]),
+        sum_positive(&spots.mu[1]),
+        sum_positive(&spots.mu[2]),
+    ];
     let mut scales = [f64::NAN; 3];
     let mut write = [false; 3];
     for family in 0..3 {
-        let sum_ic = sum_positive(&spots.mu[family]);
+        let sum_ic = sums[family];
         let n = spots.mu[family]
             .iter()
             .filter(|value| value.is_finite() && **value > 0.0)
@@ -575,28 +840,99 @@ fn tune_kmu(
         } else {
             (old * scale, scale)
         };
-        if write[family] {
+        let before = format_k0(old);
+        let after = format_k0(new_kmu);
+        let written = write[family] && after != before;
+        if written {
             let delta = (applied - 1.0).abs() * 100.0;
             if delta > max_delta {
                 max_delta = delta;
             }
             if let Some(elem) = root.at_mut(&path) {
-                elem.set_attr(&attr, &format_k0(new_kmu));
+                elem.set_attr(&attr, &after);
                 updates += 1;
             }
         }
         let device = device_on_path(root, &path);
-        rows.push(vec![
-            device,
-            if family == primary {
-                "primary".into()
+        let scale_pct = (applied - 1.0).abs() * 100.0;
+        let scale_tone = if applied == 1.0 {
+            None
+        } else if scale_pct > 5.0 {
+            Some("warn")
+        } else if written {
+            Some("change")
+        } else {
+            None
+        };
+        let sum_ic = sums[family];
+        // The primary ends at `target` in every mode: written to it, or left
+        // at sum_pri == target when the mode is "unchanged".
+        let agree_before = sum_ic / sum_pri * 100.0;
+        let agree_after = if applied.is_finite() && applied != 0.0 {
+            sum_ic / applied / target * 100.0
+        } else {
+            f64::NAN
+        };
+        let agree_tone = |agree: f64| {
+            if !agree.is_finite() {
+                None
+            } else if (agree - 100.0).abs() <= 1.0 {
+                Some("good")
+            } else if (agree - 100.0).abs() <= 5.0 {
+                Some("warn")
             } else {
-                "secondary".into()
-            },
-            format_k0(old),
-            format_k0(new_kmu),
-            format!("{applied:.4}"),
-            if write[family] { "yes" } else { "no" }.into(),
+                Some("bad")
+            }
+        };
+        let improve_tone = if agree_before.is_finite()
+            && agree_after.is_finite()
+            && (agree_after - 100.0).abs() < (agree_before - 100.0).abs() - 1e-9
+        {
+            Some("good")
+        } else {
+            None
+        };
+        let fmt_agree = |agree: f64| {
+            if agree.is_finite() {
+                format!("{agree:.1}%")
+            } else {
+                "—".into()
+            }
+        };
+        rows.push(vec![
+            cell(device, None),
+            cell(
+                if family == primary {
+                    "primary"
+                } else {
+                    "secondary"
+                },
+                None,
+            ),
+            cell(before, None),
+            cell(after, if written { Some("change") } else { None }),
+            cell(format!("{:+.2}%", (applied - 1.0) * 100.0), scale_tone),
+            cell(format!("{sum_ic:.2}"), None),
+            cell(fmt_agree(agree_before), None),
+            cell(fmt_agree(agree_after), agree_tone(agree_after)),
+            cell(
+                if agree_before.is_finite() && agree_after.is_finite() {
+                    format!("{:+.1}%", agree_after - agree_before)
+                } else {
+                    "—".into()
+                },
+                improve_tone,
+            ),
+            cell(
+                if written {
+                    "yes"
+                } else if write[family] {
+                    "same"
+                } else {
+                    "no"
+                },
+                None,
+            ),
         ]);
     }
     if rows.is_empty() && warnings.is_empty() {
@@ -617,7 +953,11 @@ fn tune_kmu(
             "Role".into(),
             "K_MU Before".into(),
             "K_MU After".into(),
-            "Scale".into(),
+            "Δ K_MU (%)".into(),
+            "Σ MU".into(),
+            "Agree Before (%)".into(),
+            "Agree After (%)".into(),
+            "Δ Agree (%)".into(),
             "Write".into(),
         ],
         rows,
@@ -627,7 +967,7 @@ fn tune_kmu(
 
 fn empty_kmu(
     warnings: Vec<String>,
-) -> Result<(String, Vec<String>, Vec<String>, Vec<Vec<String>>, bool), String> {
+) -> Result<(String, Vec<String>, Vec<String>, Vec<Vec<Value>>, bool), String> {
     Ok((
         "No K_MU values were updated.".into(),
         warnings,
@@ -636,7 +976,11 @@ fn empty_kmu(
             "Role".into(),
             "K_MU Before".into(),
             "K_MU After".into(),
-            "Scale".into(),
+            "Δ K_MU (%)".into(),
+            "Σ MU".into(),
+            "Agree Before (%)".into(),
+            "Agree After (%)".into(),
+            "Δ Agree (%)".into(),
             "Write".into(),
         ],
         Vec::new(),
@@ -803,7 +1147,10 @@ fn band_k0(sigmas: &[f64], tolerance: f64, headroom: f64) -> f64 {
     if !min.is_finite() {
         return f64::NAN;
     }
-    let adjusted = min * (1.0 + headroom / 100.0);
+    // The band floor sits `headroom`% below the smallest observed sigma, so
+    // hypothetical smaller spots the sessions did not sample still fit; the
+    // remaining tolerance is spent covering the large end.
+    let adjusted = min * (1.0 - headroom / 100.0).max(0.01);
     let fraction = tolerance / 100.0;
     if fraction <= 0.0 || fraction >= 1.0 {
         adjusted
@@ -812,42 +1159,38 @@ fn band_k0(sigmas: &[f64], tolerance: f64, headroom: f64) -> f64 {
     }
 }
 
-fn excursion(sigmas: &[f64], k0: f64, tolerance: f64) -> (f64, f64, &'static str) {
+/// Fraction of finite sigmas inside the K0 tolerance band, 0.0–1.0. NaN when
+/// there is no usable K0 or no samples, so before/after comparisons fall
+/// through to the neutral branches.
+fn inside_fraction(sigmas: &[f64], k0: f64, tolerance: f64) -> f64 {
     if !k0.is_finite() || k0 == 0.0 {
-        return (0.0, 0.0, "inside");
+        return f64::NAN;
     }
     let lower = (k0 * (1.0 - tolerance / 100.0)).max(0.0);
     let upper = (k0 * (1.0 + tolerance / 100.0)).max(0.0);
-    let mut worst = 0.0;
-    let mut observed = 0.0;
-    let mut kind = "inside";
+    let mut inside = 0usize;
+    let mut total = 0usize;
     for sigma in sigmas {
         if !sigma.is_finite() {
             continue;
         }
-        let (pct, which) = if *sigma < lower {
-            (100.0 * (lower - sigma) / k0.abs(), "below")
-        } else if *sigma > upper {
-            (100.0 * (sigma - upper) / k0.abs(), "above")
-        } else {
-            continue;
-        };
-        if pct > worst {
-            worst = pct;
-            observed = *sigma;
-            kind = which;
+        total += 1;
+        if *sigma >= lower && *sigma <= upper {
+            inside += 1;
         }
     }
-    (worst, observed, kind)
+    if total == 0 {
+        f64::NAN
+    } else {
+        inside as f64 / total as f64
+    }
 }
 
+// Keep NaN slots: the reduce() weighted path zips these against per-spot
+// weights, so indices must stay aligned with the spot rows.
 fn axis_errors(spots: &TuneSpots, index: usize) -> Vec<f64> {
-    if !spots.error[index].is_empty() {
-        return spots.error[index]
-            .iter()
-            .copied()
-            .filter(|value| value.is_finite())
-            .collect();
+    if spots.error[index].iter().any(|value| value.is_finite()) {
+        return spots.error[index].clone();
     }
     let plan = if index.is_multiple_of(2) {
         &spots.plan_x
@@ -857,7 +1200,6 @@ fn axis_errors(spots: &TuneSpots, index: usize) -> Vec<f64> {
     spots.measured[index]
         .iter()
         .zip(plan)
-        .filter(|(measured, plan)| measured.is_finite() && plan.is_finite())
         .map(|(measured, plan)| measured - plan)
         .collect()
 }
@@ -925,7 +1267,12 @@ struct ScaleFit {
     bias: f64,
     gain_stderr: f64,
     n_samples: usize,
+    n_total: usize,
     systematic: f64,
+    /// RMS of (measured − plan) over kept samples: the raw position error.
+    rms_before: f64,
+    /// RMS of the fit residual over kept samples: error left after correction.
+    rms_after: f64,
 }
 
 fn fit_scale(plan: &[f64], measured: &[f64], weights: &[f64]) -> Option<ScaleFit> {
@@ -952,28 +1299,28 @@ fn fit_scale(plan: &[f64], measured: &[f64], weights: &[f64]) -> Option<ScaleFit
         vec![1.0; plan.len()]
     };
     let mut fit = line_fit(plan, measured, &sample_weights)?;
-    let mut n_rejected = 0;
+    let mut keep = vec![true; plan.len()];
     let residual: Vec<f64> = measured
         .iter()
         .zip(plan)
         .map(|(measured, plan)| measured - (fit.0 * plan + fit.1))
         .collect();
-    if let Some(keep) = outlier_mask(&residual) {
+    if let Some(mask) = outlier_mask(&residual) {
         let kept_plan: Vec<f64> = plan
             .iter()
-            .zip(&keep)
+            .zip(&mask)
             .filter(|(_, keep)| **keep)
             .map(|(value, _)| *value)
             .collect();
         let kept_measured: Vec<f64> = measured
             .iter()
-            .zip(&keep)
+            .zip(&mask)
             .filter(|(_, keep)| **keep)
             .map(|(value, _)| *value)
             .collect();
         let kept_weights: Vec<f64> = sample_weights
             .iter()
-            .zip(&keep)
+            .zip(&mask)
             .filter(|(_, keep)| **keep)
             .map(|(value, _)| *value)
             .collect();
@@ -982,21 +1329,48 @@ fn fit_scale(plan: &[f64], measured: &[f64], weights: &[f64]) -> Option<ScaleFit
         if kept_plan.len() >= 8 && kept_span >= 20.0 {
             if let Some(refit) = line_fit(&kept_plan, &kept_measured, &kept_weights) {
                 fit = refit;
-                n_rejected = keep.iter().filter(|keep| !**keep).count();
+                keep = mask;
             }
         }
     }
+    let n_rejected = keep.iter().filter(|keep| !**keep).count();
     let (gain, bias, stderr) = fit;
+    let plan_min = plan.iter().copied().fold(f64::INFINITY, f64::min);
+    let plan_max = plan.iter().copied().fold(f64::NEG_INFINITY, f64::max);
     let edges = [
-        (gain - 1.0) * plan.iter().copied().fold(f64::INFINITY, f64::min) + bias,
-        (gain - 1.0) * plan.iter().copied().fold(f64::NEG_INFINITY, f64::max) + bias,
+        (gain - 1.0) * plan_min + bias,
+        (gain - 1.0) * plan_max + bias,
     ];
+    let mut total_weight = 0.0;
+    let mut sq_before = 0.0;
+    let mut sq_after = 0.0;
+    for (((plan, measured), weight), kept) in
+        plan.iter().zip(measured).zip(&sample_weights).zip(&keep)
+    {
+        if !kept {
+            continue;
+        }
+        let residual = measured - (gain * plan + bias);
+        total_weight += weight;
+        sq_before += weight * (measured - plan).powi(2);
+        sq_after += weight * residual * residual;
+    }
+    let rms = |sq: f64| {
+        if total_weight > 0.0 {
+            (sq / total_weight).sqrt()
+        } else {
+            f64::NAN
+        }
+    };
     Some(ScaleFit {
         gain,
         bias,
         gain_stderr: stderr,
         n_samples: plan.len() - n_rejected,
+        n_total: plan.len(),
         systematic: edges[0].abs().max(edges[1].abs()),
+        rms_before: rms(sq_before),
+        rms_after: rms(sq_after),
     })
 }
 
@@ -1133,6 +1507,9 @@ fn format_k0(value: f64) -> String {
 }
 
 fn format_distance(value: f64) -> String {
+    if !value.is_finite() {
+        return "0".into();
+    }
     let text = format!("{value:.4}");
     let trimmed = text.trim_end_matches('0').trim_end_matches('.');
     if trimmed.is_empty() {
@@ -1185,10 +1562,54 @@ mod tests {
         assert_eq!(result["changed"], true);
         let summary = result["summary"].as_str().unwrap();
         assert!(summary.contains("from one session"));
-        assert!(summary.contains("Max OOB"));
+        assert!(summary.contains("Min inside tolerance"));
         let xml = result["xml"].as_str().unwrap();
         assert!(xml.contains("K0=\""));
         assert!(!xml.contains("K0=\"1\""));
+    }
+
+    #[test]
+    fn sigma_noop_does_not_report_changes() {
+        // Sigmas sit at 4.0 = K0 * (1 - 20%), so band_k0 reproduces the
+        // existing 5: nothing should count as a pending write.
+        let xml = r#"
+            <devices><ion_chamber>
+              <device name="IC_1_X"/>
+              <beam_sigma_conversions in_units="MEV" out_units="mm" min_energy="70" max_energy="250" K0="5" K1="0" K2="0" K3="0"/>
+            </ion_chamber></devices>
+        "#;
+        let spots = TuneSpots {
+            energy: vec![100.0, 100.0],
+            weight: vec![],
+            plan_x: vec![],
+            plan_y: vec![],
+            measured: [vec![], vec![], vec![], vec![]],
+            error: [vec![], vec![], vec![], vec![]],
+            sigma: [vec![4.0, 4.0], vec![], vec![], vec![]],
+            mu: [vec![], vec![], vec![]],
+            charge: vec![],
+        };
+        let result = run_tune(
+            "sigma_tuning",
+            xml,
+            &spots,
+            &json!({
+                "sigma_tolerance_percent": 20.0,
+                "sigma_lower_headroom_percent": 0.0
+            }),
+            "one session",
+        )
+        .unwrap();
+        assert_eq!(result["changed"], false);
+        assert_eq!(
+            result["summary"].as_str().unwrap(),
+            "No sigma bands were updated."
+        );
+        // The row still renders, but K0 After carries no change tone.
+        let row = &result["rows"][0];
+        assert_eq!(row[3]["text"], "5");
+        assert_eq!(row[4]["text"], "5");
+        assert!(row[4].get("tone").is_none());
     }
 
     #[test]

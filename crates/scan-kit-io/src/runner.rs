@@ -4,7 +4,7 @@
 //! stops after 64 MiB. A device that streams a larger session file needs a
 //! ranged or streaming reader.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use scan_kit_core::{
     control_button, device_file_url, field_subscribe_key, io_bool, io_number, io_url,
-    normalize_host, parse_host, resolve_session_download, runner_view, DEFAULT_CONTROL_POINTS,
+    normalize_host, parse_host, runner_view, session_zip_dest, DEFAULT_CONTROL_POINTS,
     DEFAULT_SESSION_ROOT, LOAD_STATE_SUCCESS, POINTS_LOAD_STATE, POINTS_UPLOAD,
     POINTS_UPLOAD_TARGET, POINTS_VALID, SESSION_DIRECTORY, STATUS_PATHS,
 };
@@ -23,11 +23,10 @@ use tungstenite::client::{client, IntoClientRequest};
 use tungstenite::http::HeaderValue;
 use tungstenite::{Message, WebSocket};
 
+use crate::session_capture;
 use crate::store::{self, with_store};
 
 const MAX_BODY: usize = 64 * 1024 * 1024;
-const MAX_LAYER: usize = 128;
-const MAX_RUN: usize = 4;
 
 struct Live {
     host: String,
@@ -36,6 +35,8 @@ struct Live {
     version: Value,
     device_type: Value,
     session_directory: String,
+    session_id: String,
+    plan_path: Option<PathBuf>,
 }
 
 static LIVE: Mutex<Option<Live>> = Mutex::new(None);
@@ -44,11 +45,19 @@ pub fn catalog(db: &Path) -> Value {
     let (host, file_dir) = with_store(db, |conn| store::runner_settings(conn))
         .ok()
         .unwrap_or((None, None));
+    let session_id = lock()
+        .as_ref()
+        .map(|live| live.session_id.clone())
+        .unwrap_or_default();
     let connected = live();
     let mut body = json!({
         "host": host,
         "file_dir": file_dir,
-        "dest": scan_kit_core::default_session_zip_path("", file_dir.as_deref().unwrap_or("")),
+        "dest": scan_kit_core::default_session_zip_path(
+            "",
+            file_dir.as_deref().unwrap_or(""),
+            &session_id,
+        ),
         "connected": connected,
         "view": runner_view(&json!({}), false, false),
     });
@@ -72,6 +81,12 @@ pub fn connect(db: &Path, host: &str) -> Result<Value, String> {
     let session_directory = http_json(&host, SESSION_DIRECTORY)
         .and_then(|value| value.as_str().map(str::to_owned))
         .unwrap_or_else(|| DEFAULT_SESSION_ROOT.into());
+    let session_id = session_capture::live_session_id(&host).unwrap_or_default();
+    let plan_path = with_store(db, |conn| store::runner_plan_path(conn))
+        .ok()
+        .flatten()
+        .map(PathBuf::from)
+        .filter(|path| path.is_file());
     {
         let mut guard = lock();
         *guard = Some(Live {
@@ -81,6 +96,8 @@ pub fn connect(db: &Path, host: &str) -> Result<Value, String> {
             version: version.clone(),
             device_type: device_type.clone(),
             session_directory: session_directory.clone(),
+            session_id: session_id.clone(),
+            plan_path,
         });
     }
     let _ = with_store(db, |conn| store::set_runner_host(conn, &host));
@@ -89,6 +106,7 @@ pub fn connect(db: &Path, host: &str) -> Result<Value, String> {
         &version,
         &device_type,
         &session_directory,
+        &session_id,
     ))
 }
 
@@ -155,11 +173,13 @@ pub fn upload(db: &Path, csv_path: &Path) -> Result<Value, String> {
             return Err("points_valid is false after upload".into());
         }
         live.status.insert(POINTS_VALID.to_owned(), valid);
+        live.plan_path = Some(csv_path.to_owned());
         target
     };
     if let Some(parent) = csv_path.parent() {
         let _ = with_store(db, |conn| {
-            store::set_runner_file_dir(conn, &parent.display().to_string())
+            store::set_runner_file_dir(conn, &parent.display().to_string())?;
+            store::set_runner_plan_path(conn, &csv_path.display().to_string())
         });
     }
     let mut body = read_status(true, "")?;
@@ -192,53 +212,54 @@ pub fn download_with(
     dest: &str,
     keep: &mut dyn FnMut(u64, u64) -> bool,
 ) -> Result<Value, String> {
-    let (host, root) = {
+    let (host, status, plan_path) = {
         let guard = lock();
         let live = guard.as_ref().ok_or("not connected")?;
-        (live.host.clone(), live.session_directory.clone())
+        (
+            live.host.clone(),
+            live.status.clone(),
+            live.plan_path.clone(),
+        )
     };
-    let (remote, zip_path) =
-        resolve_session_download(dest, &root).ok_or("Choose a local .zip path for the session.")?;
+    let zip_path = session_zip_dest(dest).ok_or("Choose a local .zip path for the session.")?;
     let staging = PathBuf::from(&zip_path)
         .parent()
         .unwrap_or(Path::new("."))
-        .join(format!(
-            ".{}_staging",
-            Path::new(&remote)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("session")
-        ));
-    let session_name = Path::new(&remote)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("session");
-    let session_dir = staging.join(session_name);
+        .join(".session_staging");
+    let session_dir = staging.join("session");
     let _ = std::fs::remove_dir_all(&staging);
     std::fs::create_dir_all(&session_dir).map_err(|err| err.to_string())?;
     let result = (|| {
-        let count = download_files(&host, &remote, &session_dir, keep)?;
-        if !keep(count as u64, count as u64) {
+        let report =
+            session_capture::capture(&host, &status, plan_path.as_deref(), &session_dir, keep)?;
+        if !keep(report.files as u64, report.files as u64) {
             return Err("cancelled".into());
         }
-        if count == 0 {
-            return Err(format!("no session files found under {remote}"));
-        }
-        ensure_spot_data(&session_dir)?;
-        ensure_session_info(&session_dir, session_name)?;
-        package_zip(&session_dir, Path::new(&zip_path), session_name)?;
-        Ok(zip_path.clone())
+        package_zip(&session_dir, Path::new(&zip_path), &report.session_id)?;
+        Ok::<(String, session_capture::CaptureResult), String>((zip_path.clone(), report))
     })();
     let _ = std::fs::remove_dir_all(&staging);
-    let zip_path = result?;
+    let (zip_path, report) = result?;
     if let Some(parent) = Path::new(&zip_path).parent() {
         let _ = with_store(db, |conn| {
             store::set_runner_file_dir(conn, &parent.display().to_string())
         });
     }
+    let detail = if report.warnings.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " ({} warnings: {})",
+            report.warnings.len(),
+            report.warnings.join("; ")
+        )
+    };
     Ok(json!({
         "path": zip_path,
-        "message": format!("Session saved to {zip_path}"),
+        "session_id": report.session_id,
+        "files": report.files,
+        "warnings": report.warnings,
+        "message": format!("Session {} saved to {zip_path}{detail}", report.session_id),
     }))
 }
 
@@ -247,6 +268,7 @@ fn connected_body(
     version: &Value,
     device_type: &Value,
     session_directory: &str,
+    session_id: &str,
 ) -> Value {
     let guard = lock();
     let status = guard
@@ -258,19 +280,18 @@ fn connected_body(
     view["version"] = json!(display_io(version));
     view["device_type"] = json!(display_io(device_type));
     view["session_directory"] = json!(session_directory);
+    view["session_id"] = json!(session_id);
     view
 }
 
-fn view_of(live: &Live, has_plan: bool, dest: &str) -> Value {
+fn view_of(live: &Live, has_plan: bool, _dest: &str) -> Value {
     let mut view = runner_view(&Value::Object(live.status.clone()), true, has_plan);
     view["host"] = json!(live.host);
     view["version"] = json!(display_io(&live.version));
     view["device_type"] = json!(display_io(&live.device_type));
     view["session_directory"] = json!(live.session_directory);
-    view["hint"] = json!(scan_kit_core::session_download_hint(
-        dest,
-        &live.session_directory
-    ));
+    view["session_id"] = json!(live.session_id);
+    view["hint"] = json!(scan_kit_core::session_download_hint(&live.session_id));
     view
 }
 
@@ -284,6 +305,9 @@ fn display_io(value: &Value) -> String {
 }
 
 fn refresh(live: &mut Live, timeout: Duration) -> Result<(), String> {
+    if let Some(id) = session_capture::live_session_id(&live.host) {
+        live.session_id = id;
+    }
     subscribe_status(&mut live.socket)?;
     let updates = poll_keys(
         &mut live.socket,
@@ -682,7 +706,11 @@ fn rmp_from_json(value: &Value) -> rmpv::Value {
 }
 
 fn http_json(host: &str, path: &str) -> Option<Value> {
-    let url = io_url(host, path, "value.json").ok()?;
+    http_json_file(host, path, "value.json")
+}
+
+pub(crate) fn http_json_file(host: &str, path: &str, file_name: &str) -> Option<Value> {
+    let url = io_url(host, path, file_name).ok()?;
     let body = http(&url, "GET", None).ok()?;
     serde_json::from_slice(&body).ok()
 }
@@ -693,7 +721,7 @@ fn http_put(host: &str, device_path: &str, body: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-fn http(url: &str, method: &str, body: Option<&[u8]>) -> Result<Vec<u8>, String> {
+pub(crate) fn http(url: &str, method: &str, body: Option<&[u8]>) -> Result<Vec<u8>, String> {
     let rest = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
     let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
     let path = format!("/{path}");
@@ -804,271 +832,6 @@ fn decode_chunks(mut data: &[u8]) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
-fn download_files(
-    host: &str,
-    remote: &str,
-    dest: &Path,
-    keep: &mut dyn FnMut(u64, u64) -> bool,
-) -> Result<usize, String> {
-    let mut count = 0;
-    let mut tick = |count: usize| -> Result<(), String> {
-        if keep(count as u64, 0) {
-            Ok(())
-        } else {
-            Err("cancelled".into())
-        }
-    };
-    tick(count)?;
-    for name in [
-        "input_map.csv",
-        "spot_data.csv",
-        "termination_summary.txt",
-        "session_info.json",
-        "session_meta.json",
-        "SessionLogFile.log",
-    ] {
-        if fetch(host, &format!("{remote}/{name}"), &dest.join(name))? {
-            count += 1;
-            tick(count)?;
-        }
-    }
-    for rel in [
-        "config/map2map/devices.xml",
-        "config/map2map/Output.xml",
-        "config/map2map/Input.xml",
-        "config/map2map/Database.xml",
-        "config/map2map/Report.xml",
-        "config/map2map/tolerances.xml",
-        "config/map2map/scan_dose_system.xml",
-    ] {
-        if fetch(host, &format!("{remote}/{rel}"), &dest.join(rel))? {
-            count += 1;
-            tick(count)?;
-        }
-    }
-    let mut empty_layers = 0;
-    for layer in 0..MAX_LAYER {
-        tick(count)?;
-        let mut layer_hits = 0;
-        for run in 0..MAX_RUN {
-            let mut run_hits = 0;
-            let prefix = format!("layer-{layer}/run-{run}");
-            for name in [
-                "timeslice_data_device_units.csv",
-                "timeslice_data.csv",
-                "FX4_spot_data.csv",
-                "IX256_1_spot_data.csv",
-                "IX256_2_spot_data.csv",
-                "RCI_spot_data.csv",
-                "RCI_map.csv",
-                "TX2_spot_data.csv",
-            ] {
-                if fetch(
-                    host,
-                    &format!("{remote}/{prefix}/{name}"),
-                    &dest.join(&prefix).join(name),
-                )? {
-                    count += 1;
-                    tick(count)?;
-                    run_hits += 1;
-                    layer_hits += 1;
-                }
-            }
-            if run_hits == 0 && run > 0 {
-                break;
-            }
-        }
-        if layer_hits == 0 {
-            empty_layers += 1;
-            if empty_layers >= 2 {
-                break;
-            }
-        } else {
-            empty_layers = 0;
-        }
-    }
-    Ok(count)
-}
-
-fn fetch(host: &str, remote: &str, dest: &Path) -> Result<bool, String> {
-    let url = match device_file_url(host, remote) {
-        Ok(url) => url,
-        Err(_) => return Ok(false),
-    };
-    let Ok(bytes) = http(&url, "GET", None) else {
-        return Ok(false);
-    };
-    if bytes.is_empty() {
-        return Ok(false);
-    }
-    if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent).map_err(|err| err.to_string())?;
-    }
-    std::fs::write(dest, bytes).map_err(|err| err.to_string())?;
-    Ok(true)
-}
-
-fn ensure_session_info(dir: &Path, session_id: &str) -> Result<(), String> {
-    let dest = dir.join("session_info.json");
-    if dest.is_file() && dest.metadata().map(|meta| meta.len() > 0).unwrap_or(false) {
-        return Ok(());
-    }
-    let payload = json!({
-        "DCSState": "FnStateMapComplete",
-        "LayerID": "0",
-        "Run": "0",
-        "SessionID": session_id,
-    });
-    std::fs::write(dest, format!("{payload:#}\n")).map_err(|err| err.to_string())
-}
-
-fn ensure_spot_data(dir: &Path) -> Result<(), String> {
-    let dest = dir.join("spot_data.csv");
-    if dest.is_file() && dest.metadata().map(|meta| meta.len() > 0).unwrap_or(false) {
-        return Ok(());
-    }
-    // ponytail: joins the device spot files when the RCI omitted spot_data.csv.
-    // Iso conversion from devices.xml stays with the Python session builder.
-    let Some(table) = merge_spot_files(dir) else {
-        return Ok(());
-    };
-    std::fs::write(dest, table).map_err(|err| err.to_string())
-}
-
-fn merge_spot_files(dir: &Path) -> Option<String> {
-    let sources = [
-        ("IX256_1_spot_data.csv", IX1),
-        ("IX256_2_spot_data.csv", IX2),
-        ("FX4_spot_data.csv", FX4),
-        ("RCI_spot_data.csv", RCI),
-    ];
-    let mut rows: BTreeMap<(String, String), BTreeMap<String, String>> = BTreeMap::new();
-    let mut columns = Vec::new();
-    for layer in 0..MAX_LAYER {
-        for run in 0..MAX_RUN {
-            let run_dir = dir
-                .join(format!("layer-{layer}"))
-                .join(format!("run-{run}"));
-            if !run_dir.is_dir() {
-                continue;
-            }
-            for (name, rename) in sources {
-                let Some(table) = read_csv(&run_dir.join(name)) else {
-                    continue;
-                };
-                for record in table {
-                    let spot = record.get("spot_no")?.clone();
-                    let layer_id = record.get("layer_id")?.clone();
-                    let entry = rows.entry((layer_id.clone(), spot.clone())).or_default();
-                    entry.entry("layer_id".into()).or_insert(layer_id);
-                    entry.entry("spot_no".into()).or_insert(spot);
-                    for (src, dst) in rename {
-                        let Some(value) = record.get(*src) else {
-                            continue;
-                        };
-                        if !columns.contains(&(*dst).to_owned())
-                            && *dst != "spot_no"
-                            && *dst != "layer_id"
-                        {
-                            columns.push((*dst).to_owned());
-                        }
-                        entry
-                            .entry((*dst).to_owned())
-                            .or_insert_with(|| value.clone());
-                    }
-                }
-            }
-        }
-    }
-    if rows.is_empty() {
-        return None;
-    }
-    let mut header = vec!["layer_id".to_owned(), "spot_no".to_owned()];
-    header.extend(columns);
-    let mut out = header.join(",");
-    out.push('\n');
-    for row in rows.values() {
-        let cells: Vec<String> = header
-            .iter()
-            .map(|name| csv_cell(row.get(name).map(String::as_str).unwrap_or("")))
-            .collect();
-        out.push_str(&cells.join(","));
-        out.push('\n');
-    }
-    Some(out)
-}
-
-fn read_csv(path: &Path) -> Option<Vec<HashMap<String, String>>> {
-    let mut reader = csv::ReaderBuilder::new()
-        .trim(csv::Trim::All)
-        .from_path(path)
-        .ok()?;
-    let headers = reader.headers().ok()?.clone();
-    let mut rows = Vec::new();
-    for record in reader.records() {
-        let record = record.ok()?;
-        let mut row = HashMap::new();
-        for (index, name) in headers.iter().enumerate() {
-            row.insert(name.to_owned(), record.get(index).unwrap_or("").to_owned());
-        }
-        rows.push(row);
-    }
-    if rows.is_empty() {
-        None
-    } else {
-        Some(rows)
-    }
-}
-
-fn csv_cell(value: &str) -> String {
-    if value.contains([',', '"', '\n']) {
-        format!("\"{}\"", value.replace('"', "\"\""))
-    } else {
-        value.to_owned()
-    }
-}
-
-const IX1: &[(&str, &str)] = &[
-    ("spot_no", "spot_no"),
-    ("layer_id", "layer_id"),
-    ("timeslice_number", "timesliceNumber"),
-    ("timeslice_timestamp(ms)", "timestamp"),
-    ("point_time(ms)", "point_time(ms)"),
-    ("ic1_position_measured_b", "r_ic1_x_spot_position_raw"),
-    ("ic1_position_measured_a", "r_ic1_y_spot_position_raw"),
-    ("ic1_sigma_measured_b(mm)", "r_ic1_x_spot_sigma_raw"),
-    ("ic1_sigma_measured_a(mm)", "r_ic1_y_spot_sigma_raw"),
-    ("total_dose(nC)", "ic1_total_dose_spot_raw"),
-];
-const IX2: &[(&str, &str)] = &[
-    ("spot_no", "spot_no"),
-    ("layer_id", "layer_id"),
-    ("timeslice_number", "timesliceNumber"),
-    ("timeslice_timestamp(ms)", "timestamp"),
-    ("point_time(ms)", "point_time(ms)"),
-    ("ic2_position_measured_b", "r_ic2_x_spot_position_raw"),
-    ("ic2_position_measured_a", "r_ic2_y_spot_position_raw"),
-    ("ic2_sigma_measured_b(mm)", "r_ic2_x_spot_sigma_raw"),
-    ("ic2_sigma_measured_a(mm)", "r_ic2_y_spot_sigma_raw"),
-    ("total_dose(nC)", "ic2_total_dose_spot_raw"),
-];
-const FX4: &[(&str, &str)] = &[
-    ("spot_no", "spot_no"),
-    ("layer_id", "layer_id"),
-    ("timeslice_number", "timesliceNumber"),
-    ("timeslice_timestamp(ms)", "timestamp"),
-    ("point_time(ms)", "point_time(ms)"),
-    ("total_dose(nC)", "r_ic3_total_dose_spot_raw"),
-];
-const RCI: &[(&str, &str)] = &[
-    ("spot_no", "spot_no"),
-    ("layer_id", "layer_id"),
-    ("timeslice_number", "timesliceNumber"),
-    ("timeslice_timestamp(ms)", "timestamp"),
-    ("point_time(ms)", "point_time(ms)"),
-    ("beam_current_command", "c_current_rci"),
-];
-
 fn package_zip(dir: &Path, zip_path: &Path, session_id: &str) -> Result<(), String> {
     if let Some(parent) = zip_path.parent() {
         std::fs::create_dir_all(parent).map_err(|err| err.to_string())?;
@@ -1162,7 +925,7 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_spot_file_is_joined_and_zipped() {
+    fn a_session_dir_is_zipped_under_the_session_id() {
         let dir = std::env::temp_dir().join(format!("scan-kit-spots-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let run = dir.join("layer-0").join("run-0");
@@ -1172,23 +935,15 @@ mod tests {
             "spot_no,layer_id,total_dose(nC)\n1,0,3.5\n",
         )
         .unwrap();
-        std::fs::write(
-            run.join("RCI_spot_data.csv"),
-            "spot_no,layer_id,beam_current_command\n1,0,9\n",
-        )
-        .unwrap();
-        ensure_spot_data(&dir).unwrap();
-        ensure_session_info(&dir, "sess").unwrap();
-        let text = std::fs::read_to_string(dir.join("spot_data.csv")).unwrap();
-        assert!(text.contains("ic1_total_dose_spot_raw"));
-        assert!(text.contains("c_current_rci"));
-        assert!(text.contains("3.5"));
+        std::fs::write(dir.join("session_info.json"), "{}\n").unwrap();
         let zip_path =
             std::env::temp_dir().join(format!("scan-kit-spots-{}.zip", std::process::id()));
         package_zip(&dir, &zip_path, "sess").unwrap();
         let file = std::fs::File::open(&zip_path).unwrap();
         let mut archive = zip::ZipArchive::new(file).unwrap();
-        assert!(archive.by_name("sess/spot_data.csv").is_ok());
+        assert!(archive
+            .by_name("sess/layer-0/run-0/IX256_1_spot_data.csv")
+            .is_ok());
         assert!(archive.by_name("sess/session_info.json").is_ok());
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_file(&zip_path);
@@ -1200,7 +955,7 @@ mod tests {
         assert_eq!(display_io(&json!(3)), "3");
         assert_eq!(display_io(&Value::Null), "");
         assert!(display_io(&json!({"a": 1})).contains('a'));
-        let body = connected_body("192.168.1.2", &json!(7), &Value::Null, "/sessions");
+        let body = connected_body("192.168.1.2", &json!(7), &Value::Null, "/sessions", "42");
         assert_eq!(body["host"], "192.168.1.2");
         assert_eq!(body["version"], "7");
         assert_eq!(body["device_type"], "");
@@ -1284,21 +1039,6 @@ mod tests {
         assert!(decode_chunks(b"zz").is_err());
         assert!(decode_chunks(b"5\r\nhi").is_err());
         assert!(decode_chunks(b"5\r\nhello\r\n\xff\r\n").is_err());
-        assert_eq!(csv_cell("a,b"), "\"a,b\"");
-        assert_eq!(csv_cell("say \"hi\""), "\"say \"\"hi\"\"\"");
-        assert_eq!(csv_cell("plain"), "plain");
-        assert!(read_csv(Path::new("missing-scan-kit.csv")).is_none());
-
-        let dir = std::env::temp_dir().join(format!("scan-kit-codec-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("empty.csv"), "spot_no\n").unwrap();
-        assert!(read_csv(&dir.join("empty.csv")).is_none());
-        ensure_session_info(&dir, "sess").unwrap();
-        ensure_session_info(&dir, "sess").unwrap();
-        ensure_spot_data(&dir).unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
-
         let port = serve_http(|request| {
             if request.starts_with("PUT") {
                 return http_response(204, "NO", b"");
@@ -1311,9 +1051,6 @@ mod tests {
             }
             if request.contains("/io/") {
                 return http_response(200, "OK", b"{\"n\":1}");
-            }
-            if request.contains("input_map.csv") {
-                return http_response(200, "OK", b"x");
             }
             if request.contains("fail") {
                 return http_response(500, "NO", b"");
@@ -1334,15 +1071,6 @@ mod tests {
         let short = http(&format!("http://{host}/short-body"), "GET", None).unwrap_err();
         assert!(short.contains("2 of 4"));
         assert!(http("http://not a host/x", "GET", None).is_err());
-
-        let files = std::env::temp_dir().join(format!("scan-kit-dl-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&files);
-        let err = download_files(&host, "session", &files, &mut |_, _| false).unwrap_err();
-        assert!(err.contains("cancelled"));
-        let count = download_files(&host, "session", &files, &mut |_, _| true).unwrap();
-        assert!(count >= 1);
-        assert!(files.join("input_map.csv").is_file());
-        let _ = std::fs::remove_dir_all(&files);
         let refused = open_socket("127.0.0.1:1").unwrap_err();
         assert!(!refused.is_empty());
     }

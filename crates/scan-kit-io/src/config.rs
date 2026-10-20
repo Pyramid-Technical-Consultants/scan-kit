@@ -10,6 +10,7 @@ use chrono::{Local, TimeZone};
 use md5::{Digest, Md5};
 use scan_kit_core::{apply_form, config_form, run_tune, tune_catalog, TuneSpots};
 use serde_json::{json, Value};
+use similar::{ChangeTag, TextDiff};
 
 use crate::discover;
 use crate::store::{self, with_store};
@@ -27,6 +28,16 @@ pub fn catalog(db: &Path) -> Value {
         .unwrap_or((None, false));
     body["config_dir"] = json!(dir);
     body["hide_unused"] = json!(hide);
+    if let Some(workflows) = body["workflows"].as_array_mut() {
+        workflows.push(json!({
+            "id": "config_diff",
+            "name": "Config Diff",
+            "description": "Diff all config files against selected sessions",
+            "sessions": true,
+            "diff": true,
+            "params": [],
+        }));
+    }
     body
 }
 
@@ -194,6 +205,293 @@ pub fn tune(input: &Value, _db: &Path) -> Result<Value, String> {
         }
     }
     Ok(result)
+}
+
+/// Read-only whole-tree diff: the loaded config folder vs each selected
+/// session's `config/` tree (map2map, dcs, nozzle), one column per session.
+pub fn diff(input: &Value) -> Result<Value, String> {
+    let config_dir = text(input, "config_dir").unwrap_or("").trim();
+    if config_dir.is_empty() {
+        return Err("Open a configuration folder.".into());
+    }
+    let loaded_dir = Path::new(config_dir);
+    if !loaded_dir.is_dir() {
+        return Err(format!(
+            "Configuration folder is not a directory: {}",
+            loaded_dir.display()
+        ));
+    }
+    let data_dir = text(input, "data_dir").unwrap_or("").trim().to_owned();
+    let session_ids = strings(input, "session_ids");
+    if session_ids.is_empty() {
+        return Err("Select at least one session.".into());
+    }
+    let root = Path::new(&data_dir);
+    if data_dir.is_empty() || !root.is_dir() {
+        return Err("Session data folder is not a directory.".into());
+    }
+    let mut warnings = Vec::new();
+    let mut found = Vec::new();
+    for session_id in &session_ids {
+        if session_present(root, session_id) {
+            found.push(session_id.clone());
+        } else {
+            warnings.push(format!(
+                "Session {session_id} was not found under {data_dir}."
+            ));
+        }
+    }
+    if found.is_empty() {
+        return Err(format!("No selected sessions were found under {data_dir}."));
+    }
+    let base_root = diff_root(loaded_dir);
+    let mut base_files = walk_files(&base_root)?;
+    // The open file diffs its in-memory text (form edits applied) so pending
+    // changes are visible; every other file diffs on disk.
+    let mut edited = String::new();
+    let file_rel = text(input, "file").unwrap_or("").trim();
+    if !file_rel.is_empty() {
+        if let Some(xml) = input
+            .get("xml")
+            .and_then(Value::as_str)
+            .filter(|xml| !xml.is_empty())
+        {
+            let mut text = xml.to_owned();
+            if let Some(form) = input.get("form") {
+                text = apply_form(&text, form)?;
+            }
+            let rel = match loaded_dir.strip_prefix(&base_root) {
+                Ok(sub) if !sub.as_os_str().is_empty() => {
+                    format!("{}/{file_rel}", relative(&base_root, loaded_dir))
+                }
+                _ => file_rel.to_owned(),
+            };
+            let bytes = text.into_bytes();
+            if base_files.get(&rel) != Some(&bytes) {
+                base_files.insert(rel.clone(), bytes);
+                edited = rel;
+            }
+        }
+    }
+    let base_key = folder_key(&base_root);
+    let mut sessions = Vec::new();
+    let mut summary_parts = Vec::new();
+    for session_id in &found {
+        let session_root = discover::session_directory(root, session_id).join("config");
+        // With pending edits the self column still shows the unsaved changes.
+        if edited.is_empty() && session_root.is_dir() && folder_key(&session_root) == base_key {
+            sessions.push(json!({
+                "id": session_id,
+                "self": true,
+                "files": [],
+            }));
+            summary_parts.push(format!("{session_id}: its own config"));
+            continue;
+        }
+        if !session_root.is_dir() {
+            sessions.push(json!({
+                "id": session_id,
+                "warning": format!("No config/ tree in session {session_id}."),
+                "files": [],
+            }));
+            summary_parts.push(format!("{session_id}: no config"));
+            continue;
+        }
+        let session_files = walk_files(&session_root)?;
+        let files = diff_trees(&base_files, &session_files, &edited);
+        let changed = files.iter().filter(|file| file["status"] != "same").count();
+        let total = files.len();
+        summary_parts.push(format!("{session_id}: {changed} of {total} differ"));
+        sessions.push(json!({
+            "id": session_id,
+            "root": session_root.to_string_lossy(),
+            "files": files,
+        }));
+    }
+    Ok(json!({
+        "base": base_root.to_string_lossy(),
+        "edited": edited,
+        "summary": summary_parts.join(" · "),
+        "warnings": warnings,
+        "sessions": sessions,
+        "changed": false,
+        "columns": [],
+        "rows": [],
+    }))
+}
+
+/// The innermost `config/` ancestor of the loaded folder, so a loaded
+/// `config/map2map` diffs the whole `config/` tree. A folder outside any
+/// `config/` tree diffs as-is (a plain copy still path-matches session trees).
+fn diff_root(dir: &Path) -> PathBuf {
+    for ancestor in dir.ancestors().skip(1) {
+        if ancestor.file_name().is_some_and(|name| name == "config") {
+            return ancestor.to_path_buf();
+        }
+    }
+    dir.to_path_buf()
+}
+
+fn walk_files(root: &Path) -> Result<BTreeMap<String, Vec<u8>>, String> {
+    let mut files = BTreeMap::new();
+    walk_files_at(root, root, &mut files)?;
+    Ok(files)
+}
+
+fn walk_files_at(
+    root: &Path,
+    dir: &Path,
+    files: &mut BTreeMap<String, Vec<u8>>,
+) -> Result<(), String> {
+    for entry in fs::read_dir(dir).map_err(|err| err.to_string())? {
+        let entry = entry.map_err(|err| err.to_string())?;
+        let path = entry.path();
+        if path.is_dir() {
+            walk_files_at(root, &path, files)?;
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+        if name.ends_with(".md5") {
+            continue;
+        }
+        if let Ok(bytes) = fs::read(&path) {
+            files.insert(relative(root, &path), bytes);
+        }
+    }
+    Ok(())
+}
+
+const DIFF_MAX_BYTES: usize = 1_500_000;
+const DIFF_MAX_LINES: usize = 2_000;
+const DIFF_CONTEXT: usize = 3;
+
+/// Flat line rows for the diff view: "context" | "add" | "del" carry `old_no`
+/// and `new_no` (1-based) plus `text`; "gap" carries `count` of folded lines.
+fn diff_trees(
+    base: &BTreeMap<String, Vec<u8>>,
+    theirs: &BTreeMap<String, Vec<u8>>,
+    edited: &str,
+) -> Vec<Value> {
+    let paths: std::collections::BTreeSet<&String> = base.keys().chain(theirs.keys()).collect();
+    let mut files: Vec<(u8, Value)> = Vec::new();
+    for rel in paths {
+        let ours = base.get(rel);
+        let other = theirs.get(rel);
+        let (status, lines) = match (ours, other) {
+            (None, Some(bytes)) => ("added", whole_file(bytes, "add")),
+            (Some(bytes), None) => ("removed", whole_file(bytes, "del")),
+            (Some(ours), Some(other)) if ours == other => ("same", Vec::new()),
+            (Some(ours), Some(other)) => match diff_lines(ours, other) {
+                Some(emitted) => ("changed", emitted),
+                None if ours.len() > DIFF_MAX_BYTES || other.len() > DIFF_MAX_BYTES => {
+                    ("large", Vec::new())
+                }
+                None => ("binary", Vec::new()),
+            },
+            (None, None) => continue,
+        };
+        let rank = match status {
+            "changed" => 0,
+            "added" => 1,
+            "removed" => 2,
+            "same" => 4,
+            _ => 3,
+        };
+        files.push((
+            rank,
+            json!({
+                "rel": rel,
+                "status": status,
+                "edited": rel == edited,
+                "adds": lines.iter().filter(|line| line["kind"] == "add").count(),
+                "dels": lines.iter().filter(|line| line["kind"] == "del").count(),
+                "lines": lines,
+            }),
+        ));
+    }
+    files.sort_by(|(a, left), (b, right)| {
+        a.cmp(b).then(
+            left["rel"]
+                .as_str()
+                .unwrap_or("")
+                .cmp(right["rel"].as_str().unwrap_or("")),
+        )
+    });
+    files.into_iter().map(|(_, file)| file).collect()
+}
+
+fn text_lines(bytes: &[u8]) -> Option<String> {
+    if bytes.len() > DIFF_MAX_BYTES || bytes[..bytes.len().min(8192)].contains(&0) {
+        return None;
+    }
+    Some(String::from_utf8_lossy(bytes).into_owned())
+}
+
+fn whole_file(bytes: &[u8], kind: &str) -> Vec<Value> {
+    let Some(text) = text_lines(bytes) else {
+        return Vec::new();
+    };
+    let mut lines = Vec::new();
+    for (index, text) in text.lines().enumerate() {
+        if index >= DIFF_MAX_LINES {
+            return Vec::new();
+        }
+        let no = index + 1;
+        lines.push(if kind == "add" {
+            json!({ "kind": kind, "new_no": no, "text": text })
+        } else {
+            json!({ "kind": kind, "old_no": no, "text": text })
+        });
+    }
+    lines
+}
+
+fn diff_lines(ours: &[u8], theirs: &[u8]) -> Option<Vec<Value>> {
+    let old = text_lines(ours)?;
+    let new = text_lines(theirs)?;
+    let diff = TextDiff::from_lines(&old, &new);
+    let mut lines = Vec::new();
+    let mut previous_old = 0_usize;
+    for (hunk_index, hunk) in diff.grouped_ops(DIFF_CONTEXT).iter().enumerate() {
+        if hunk_index > 0 {
+            if let Some(first) = hunk.first() {
+                let gap = first.as_tag_tuple().1.start.saturating_sub(previous_old);
+                if gap > 0 {
+                    lines.push(json!({ "kind": "gap", "count": gap }));
+                }
+            }
+        }
+        for op in hunk {
+            for change in diff.iter_changes(op) {
+                let text = change.value().trim_end_matches(['\n', '\r']);
+                match change.tag() {
+                    ChangeTag::Equal => lines.push(json!({
+                        "kind": "context",
+                        "old_no": change.old_index().map(|n| n + 1),
+                        "new_no": change.new_index().map(|n| n + 1),
+                        "text": text,
+                    })),
+                    ChangeTag::Delete => lines.push(json!({
+                        "kind": "del",
+                        "old_no": change.old_index().map(|n| n + 1),
+                        "text": text,
+                    })),
+                    ChangeTag::Insert => lines.push(json!({
+                        "kind": "add",
+                        "new_no": change.new_index().map(|n| n + 1),
+                        "text": text,
+                    })),
+                }
+                if lines.len() > DIFF_MAX_LINES {
+                    return None;
+                }
+            }
+        }
+        if let Some(last) = hunk.last() {
+            previous_old = last.as_tag_tuple().1.end;
+        }
+    }
+    Some(lines)
 }
 
 pub fn integrity(path: &Path) -> Value {
@@ -613,6 +911,16 @@ mod tests {
         assert_eq!(result["changed"], true);
         assert!(result["summary"].as_str().unwrap().contains("from sess"));
         assert!(!result["xml"].as_str().unwrap().contains("K0=\"1\""));
+        let cells = preview_row(&result, "IC_1", "70").as_array().unwrap();
+        // K0 rewrites (change); the new band holds 2 of 3 samples (the largest
+        // escapes past the top edge), up from 0 of 3 — improved but below
+        // 100%, so warn.
+        assert_eq!(cells[4]["tone"], "change");
+        assert_eq!(cells[5]["text"], "0.0%");
+        assert_eq!(cells[5]["tone"], "bad");
+        assert_eq!(cells[6]["text"], "66.7%");
+        assert_eq!(cells[6]["tone"], "warn");
+        assert!(cells[3].get("tone").is_none());
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -644,10 +952,10 @@ mod tests {
             &root.join("unused.sqlite"),
         )
         .unwrap();
-        let after = preview_number(&result, "IC_1_X", "70", 4);
-        // raw 1.4 mm ×2, then the ±20% band with 1% lower headroom.
+        let after = preview_number(&result, "IC_1", "70", 4);
+        // raw 1.4 mm ×2 = 2.8 min; 1% headroom below it, then the ±20% band.
         assert!(
-            (after - 3.535).abs() < 0.02,
+            (after - 3.465).abs() < 0.02,
             "K0 {after} followed the processed sigma column"
         );
         let _ = fs::remove_dir_all(&root);
@@ -694,7 +1002,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(sigma["changed"], true, "{sigma}");
-        let k0 = preview_number(&sigma, "IC_1_X", "179.5", 4);
+        let k0 = preview_number(&sigma, "IC_1", "179.5", 4);
         assert!(
             (2.0..6.0).contains(&k0),
             "180 MeV K0 {k0} is outside the raw-sigma band"
@@ -760,21 +1068,140 @@ mod tests {
         }
     }
 
-    fn preview_number(result: &Value, device: &str, energy: &str, column: usize) -> f64 {
-        let rows = result["rows"].as_array().expect("preview rows");
-        let row = rows
+    #[test]
+    fn a_config_diff_covers_the_whole_config_tree() {
+        let root = std::env::temp_dir().join(format!("scan-kit-diff-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let loaded = root.join("loaded/config/map2map");
+        fs::create_dir_all(&loaded).unwrap();
+        fs::write(loaded.join("devices.xml"), "<devices><a/></devices>\n").unwrap();
+        fs::write(loaded.join("devices.xml.md5"), b"sidecar").unwrap();
+        fs::write(root.join("loaded/config/extra.xml"), "<extra/>\n").unwrap();
+        fs::create_dir_all(root.join("loaded/config/nozzle")).unwrap();
+        fs::write(root.join("loaded/config/nozzle/n.json"), "{\"a\":1}\n").unwrap();
+        let session = root.join("sess");
+        fs::create_dir_all(session.join("config/dcs")).unwrap();
+        fs::create_dir_all(session.join("config/map2map")).unwrap();
+        fs::create_dir_all(session.join("config/nozzle")).unwrap();
+        fs::write(session.join("input_map.csv"), "energy\n100\n").unwrap();
+        fs::write(
+            session.join("config/map2map/devices.xml"),
+            "<devices><b/></devices>\n",
+        )
+        .unwrap();
+        fs::write(session.join("config/dcs/x.xml"), "<x/>\n").unwrap();
+        fs::write(session.join("config/nozzle/n.json"), "{\"a\":1}\n").unwrap();
+
+        let result = diff(&json!({
+            "config_dir": loaded.to_string_lossy(),
+            "file": "devices.xml",
+            "xml": "<devices><edited/></devices>\n",
+            "data_dir": root.to_string_lossy(),
+            "session_ids": ["sess"],
+        }))
+        .unwrap();
+
+        assert!(result["base"]
+            .as_str()
+            .unwrap()
+            .replace('\\', "/")
+            .ends_with("loaded/config"));
+        assert_eq!(result["edited"], "map2map/devices.xml");
+        let files = result["sessions"][0]["files"].as_array().unwrap();
+        let status = |rel: &str| {
+            files
+                .iter()
+                .find(|file| file["rel"] == rel)
+                .unwrap_or_else(|| panic!("no {rel} in {files:?}"))
+        };
+        assert_eq!(status("map2map/devices.xml")["status"], "changed");
+        assert_eq!(status("map2map/devices.xml")["edited"], true);
+        assert!(status("map2map/devices.xml")["lines"]
+            .as_array()
+            .unwrap()
             .iter()
+            .any(|line| line["kind"] == "del" && line["text"] == "<devices><edited/></devices>"));
+        assert_eq!(status("dcs/x.xml")["status"], "added");
+        assert_eq!(status("extra.xml")["status"], "removed");
+        assert_eq!(status("nozzle/n.json")["status"], "same");
+        assert!(files
+            .iter()
+            .all(|file| file["rel"] != "map2map/devices.xml.md5"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_missing_session_config_is_a_warning_not_an_error() {
+        let root = std::env::temp_dir().join(format!("scan-kit-diff-miss-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let loaded = root.join("loaded/map2map");
+        fs::create_dir_all(&loaded).unwrap();
+        fs::write(loaded.join("devices.xml"), "<devices/>\n").unwrap();
+        let session = root.join("sess");
+        fs::create_dir_all(&session).unwrap();
+        fs::write(session.join("input_map.csv"), "energy\n100\n").unwrap();
+
+        let result = diff(&json!({
+            "config_dir": loaded.to_string_lossy(),
+            "file": "",
+            "data_dir": root.to_string_lossy(),
+            "session_ids": ["sess"],
+        }))
+        .unwrap();
+        assert!(result["sessions"][0]["warning"]
+            .as_str()
+            .unwrap()
+            .contains("No config/"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_diff_against_the_owning_session_is_flagged_self() {
+        let root = std::env::temp_dir().join(format!("scan-kit-diff-self-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let loaded = root.join("sess/config/map2map");
+        fs::create_dir_all(&loaded).unwrap();
+        fs::write(loaded.join("devices.xml"), "<devices/>\n").unwrap();
+        fs::write(root.join("sess/input_map.csv"), "energy\n100\n").unwrap();
+
+        // The desktop always sends the open file's text; identical content
+        // must not defeat the self check.
+        let result = diff(&json!({
+            "config_dir": loaded.to_string_lossy(),
+            "file": "devices.xml",
+            "xml": "<devices/>\n",
+            "data_dir": root.to_string_lossy(),
+            "session_ids": ["sess"],
+        }))
+        .unwrap();
+        assert_eq!(result["sessions"][0]["self"], true);
+        assert!(result["sessions"][0]["files"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    fn preview_row<'a>(result: &'a Value, device: &str, energy: &str) -> &'a Value {
+        let rows = result["rows"].as_array().expect("preview rows");
+        rows.iter()
             .find(|row| {
                 let cells = row.as_array().expect("row");
-                cells.first().and_then(Value::as_str) == Some(device)
+                cells.first().and_then(|cell| cell["text"].as_str()) == Some(device)
                     && cells
                         .get(1)
-                        .and_then(Value::as_str)
+                        .and_then(|cell| cell["text"].as_str())
                         .is_some_and(|text| text.starts_with(energy))
             })
-            .unwrap_or_else(|| panic!("no {device} row starting {energy} in {result}"));
-        row.as_array().unwrap()[column]
+            .unwrap_or_else(|| panic!("no {device} row starting {energy} in {result}"))
+    }
+
+    fn preview_number(result: &Value, device: &str, energy: &str, column: usize) -> f64 {
+        preview_row(result, device, energy).as_array().unwrap()[column]["text"]
             .as_str()
+            .unwrap()
+            .split(' ')
+            .next()
             .unwrap()
             .parse()
             .unwrap()

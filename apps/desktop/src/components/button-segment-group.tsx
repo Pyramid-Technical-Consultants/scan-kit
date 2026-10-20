@@ -38,6 +38,7 @@ export function ButtonSegmentGroup({
   disabled,
   label,
   className,
+  orientation = "horizontal",
   onChange,
 }: {
   options: readonly SegmentOption[];
@@ -45,6 +46,7 @@ export function ButtonSegmentGroup({
   disabled?: boolean;
   label?: string;
   className?: string;
+  orientation?: "horizontal" | "vertical";
   onChange: (value: string) => void;
 }) {
   const labels = options.map(optionText);
@@ -57,6 +59,7 @@ export function ButtonSegmentGroup({
       size="sm"
       disabled={disabled}
       aria-label={label}
+      orientation={orientation}
       className={cn("w-full", className)}
       value={selected == null ? [] : [selected]}
       onValueChange={(next) => {
@@ -79,11 +82,24 @@ export function ButtonSegmentGroup({
             title={detail.length > 0 ? detail : iconOnly ? label : undefined}
             className={cn(
               "shrink cursor-pointer text-sm group-data-horizontal/toggle-group:data-[spacing=0]:first:rounded-l-[min(var(--radius-md),10px)] group-data-horizontal/toggle-group:data-[spacing=0]:last:rounded-r-[min(var(--radius-md),10px)] [&_svg:not([class*='size-'])]:size-4",
-              iconOnly ? "w-7 flex-none px-0" : "min-w-0 flex-1 overflow-hidden",
+              iconOnly
+                ? "w-7 flex-none px-0"
+                : orientation === "vertical"
+                  ? "w-full min-w-0 flex-none justify-start overflow-hidden"
+                  : "min-w-0 flex-auto overflow-hidden",
             )}
           >
             {Icon == null ? null : <Icon />}
-            {iconOnly ? null : <span className="truncate">{label}</span>}
+            {iconOnly ? null : (
+              <span className={cn("min-w-0 truncate", orientation === "vertical" && "max-w-full shrink-0")}>
+                {label}
+              </span>
+            )}
+            {orientation === "vertical" && !iconOnly && detail.length > 0 ? (
+              <span className="text-muted-foreground ml-auto min-w-0 truncate pl-4 text-right font-normal">
+                {detail}
+              </span>
+            ) : null}
           </ToggleGroupItem>
         );
       })}

@@ -329,9 +329,17 @@ pub fn column_scale_factor(raw_name: &str) -> Option<f64> {
 }
 
 pub fn normalize_column_name(name: &str) -> String {
+    let name = name.trim();
+    // A trailing `(unit)` is display metadata, not part of the name:
+    // `r_ic1_x(ch)` is the same column as `r_ic1_x`.
+    let name = if name.ends_with(')') {
+        name.rfind('(').map(|index| &name[..index]).unwrap_or(name)
+    } else {
+        name
+    };
     let mut out = String::new();
     let mut pending_break = false;
-    for ch in name.trim().chars() {
+    for ch in name.chars() {
         if ch.is_ascii_alphanumeric() {
             if pending_break && !out.is_empty() {
                 out.push('_');
@@ -449,6 +457,9 @@ mod tests {
         assert_eq!(column_scale_factor("ic1_primary_channel"), None);
         assert_eq!(DERIVED_SUMS[0].scale, 1e12);
 
+        assert_eq!(normalize_column_name("r_ic1_x(ch)"), "r_ic1_x");
+        assert_eq!(normalize_column_name("timestamp(ms)"), "timestamp");
+        assert_eq!(normalize_column_name("X_POSITION(mm)"), "x_position");
         let headers = vec!["r_ic1_current_dose".to_owned(), "ENERGY".to_owned()];
         assert_eq!(
             resolve_concept_column(&headers, "ic1_current"),

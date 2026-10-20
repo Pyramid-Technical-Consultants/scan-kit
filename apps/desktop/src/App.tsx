@@ -1105,7 +1105,14 @@ export default function App() {
           <PlanRunner />
         </TabsContent>
         <TabsContent value="Configuration Tuning" className="flex min-h-0 flex-col overflow-hidden">
-          <ConfigTuning folder={folder ?? ""} selectedIds={selectedIds} />
+          <ConfigTuning
+            folder={folder ?? ""}
+            sessions={selectedIds.map((id) => ({
+              id,
+              note: rows.find((row) => row.session_id === id)?.note ?? "",
+            }))}
+            selectedIds={selectedIds}
+          />
         </TabsContent>
         {LAUNCHER_VIEWS.filter((name) => name !== "Data Analysis" && name !== "Debug" && name !== "Plan Synthesis" && name !== "Phantom Synthesis" && name !== "Configuration Tuning" && name !== "Plan Runner").map((name) => (
           <TabsContent key={name} value={name}>

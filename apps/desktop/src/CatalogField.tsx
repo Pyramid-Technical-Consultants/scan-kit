@@ -205,34 +205,47 @@ export function CatalogField({
       />
     );
   }
+  const control = (
+    <div className="flex min-w-0 flex-1 items-center gap-2">
+      <Input
+        type="number"
+        inputMode={finiteOnly ? undefined : "decimal"}
+        min={param.minimum}
+        max={param.maximum}
+        step={param.step ?? (finiteOnly ? undefined : "any")}
+        title={param.tooltip}
+        value={value == null || (typeof value === "number" && !Number.isFinite(value)) ? "" : String(value)}
+        onChange={(event) => {
+          const text = event.target.value;
+          const number = Number(text);
+          if (finiteOnly) {
+            if (Number.isFinite(number)) {
+              onChange(number);
+            }
+            return;
+          }
+          onChange(Number.isFinite(number) && text.trim() !== "" ? number : text);
+        }}
+      />
+      {param.suffix != null && param.suffix.length > 0 ? (
+        <span className="text-muted-foreground text-sm">{param.suffix}</span>
+      ) : null}
+    </div>
+  );
+  if (beside) {
+    return (
+      <Field orientation="horizontal">
+        <FieldLabel className={BESIDE_LABEL} title={param.tooltip}>
+          {param.label}
+        </FieldLabel>
+        {control}
+      </Field>
+    );
+  }
   return (
     <Field>
       <FieldLabel title={param.tooltip}>{param.label}</FieldLabel>
-      <div className="flex items-center gap-2">
-        <Input
-          type="number"
-          inputMode={finiteOnly ? undefined : "decimal"}
-          min={param.minimum}
-          max={param.maximum}
-          step={param.step ?? (finiteOnly ? undefined : "any")}
-          title={param.tooltip}
-          value={value == null || (typeof value === "number" && !Number.isFinite(value)) ? "" : String(value)}
-          onChange={(event) => {
-            const text = event.target.value;
-            const number = Number(text);
-            if (finiteOnly) {
-              if (Number.isFinite(number)) {
-                onChange(number);
-              }
-              return;
-            }
-            onChange(Number.isFinite(number) && text.trim() !== "" ? number : text);
-          }}
-        />
-        {param.suffix != null && param.suffix.length > 0 ? (
-          <span className="text-muted-foreground text-sm">{param.suffix}</span>
-        ) : null}
-      </div>
+      {control}
     </Field>
   );
 }

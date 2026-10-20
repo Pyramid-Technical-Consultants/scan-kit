@@ -13,7 +13,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Field, FieldLabel } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
-import { gridTheme } from "@/grid-theme";
+import { gridTheme, useResizableColumns } from "@/grid-theme";
 
 type FormField = {
   id: string;
@@ -73,7 +73,7 @@ export function fieldBoxClass(field: { kind: string; value: string }): string {
   return "w-36";
 }
 
-export function gridHeight(rows: number): number {
+function gridHeight(rows: number): number {
   return Math.min(360, 36 + Math.max(rows, 1) * 28);
 }
 
@@ -288,7 +288,7 @@ function XmlGrid({
         .filter((item) => !(hideUnused && item.column.dead)),
     [columns, hideUnused],
   );
-  const gridColumns = useMemo<GridColumn[]>(
+  const baseColumns = useMemo<GridColumn[]>(
     () =>
       shown.map((item) => ({
         title: item.column.label,
@@ -297,6 +297,7 @@ function XmlGrid({
       })),
     [shown],
   );
+  const { columns: gridColumns, onColumnResize } = useResizableColumns(baseColumns);
   useEffect(() => {
     const node = host.current;
     if (node == null) {
@@ -338,6 +339,7 @@ function XmlGrid({
             theme={theme}
             rowMarkers="number"
             scrollToActiveCell={false}
+            onColumnResize={onColumnResize}
             onCellEdited={(cell, value) => {
               if (value.kind === GridCellKind.Text) {
                 const source = sourceColumn(columns, cell[0], hideUnused);

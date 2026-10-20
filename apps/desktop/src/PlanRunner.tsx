@@ -1,12 +1,41 @@
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open, save } from "@tauri-apps/plugin-dialog";
+import {
+  CircleCheck,
+  Download,
+  FolderOpen,
+  Pause,
+  Play,
+  RotateCcw,
+  Square,
+  Unplug,
+  Upload,
+} from "lucide-react";
 
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Field, FieldLabel } from "@/components/ui/field";
-import { Input } from "@/components/ui/input";
+import {
+  Card,
+  CardAction,
+  CardContent,
+  CardDescription,
+  CardFooter,
+  CardHeader,
+  CardTitle,
+} from "@/components/ui/card";
+import { Field, FieldDescription, FieldLabel, FieldLegend, FieldSet } from "@/components/ui/field";
+import {
+  InputGroup,
+  InputGroupAddon,
+  InputGroupButton,
+  InputGroupInput,
+} from "@/components/ui/input-group";
+import { Progress, ProgressLabel, ProgressValue } from "@/components/ui/progress";
+import { Separator } from "@/components/ui/separator";
 import { notify, notifyError, notifySaved } from "@/notify";
 import { usePageLoad } from "@/page-load";
+import { SidePane } from "@/SidePane";
 import { driveTask, type Report } from "@/task-client";
 
 type Enables = { start: boolean; pause: boolean; stop: boolean; reset: boolean };
@@ -28,6 +57,7 @@ type RunnerView = {
   host?: string;
   version?: string;
   device_type?: string;
+  session_id?: string;
   hint?: string;
   message?: string;
 };
@@ -197,9 +227,11 @@ export function PlanRunner() {
   }
 
   async function browseZip() {
+    const stem = view.session_id && view.session_id.length > 0 ? view.session_id : "session";
+    const fallback = fileDir != null ? `${fileDir}/${stem}.zip` : `${stem}.zip`;
     const selected = await save({
       title: "Session zip",
-      defaultPath: dest || (fileDir != null ? `${fileDir}/session.zip` : "session.zip"),
+      defaultPath: dest || fallback,
       filters: [{ name: "Zip", extensions: ["zip"] }],
     });
     if (typeof selected !== "string") {
@@ -261,147 +293,299 @@ export function PlanRunner() {
     }
   }
 
-  const identity = view.connected
-    ? view.device_type && view.device_type.length > 0
-      ? view.device_type
-      : "IGX"
-    : "Not connected";
-  const detail = view.connected
-    ? [view.host, view.version].filter((part) => part && part.length > 0).join("  ·  ")
-    : "Enter an RCI IP or URL";
+  const connected = view.connected;
+  const device = view.device_type && view.device_type.length > 0 ? view.device_type : "IGX";
+  const detail = [view.host, view.version].filter((part) => part && part.length > 0).join("  ·  ");
   const csvName = csvPath.length > 0 ? fileName(csvPath) : "No plan selected";
+  const pointsReady = connected && view.points === "Valid";
+  const copyPercent =
+    copyReport != null && copyReport.total > 0
+      ? Math.min(100, (100 * copyReport.done) / copyReport.total)
+      : null;
 
   return (
-    <div className="relative flex min-h-0 flex-1 flex-col gap-4 overflow-auto p-4">
-      <div className="flex max-w-3xl flex-col gap-3">
-        <Field>
-          <FieldLabel>RCI host</FieldLabel>
-          <div className="flex gap-2">
-            <Input
-              value={host}
-              placeholder="RCI IP — 192.168.100.184"
-              onChange={(event) => setHost(event.target.value)}
-              onKeyDown={(event) => {
-                if (event.key === "Enter") {
-                  void connect();
-                }
-              }}
-            />
-            <Button type="button" onClick={() => void connect()} disabled={busy || view.connected}>
-              Connect
-            </Button>
+    <SidePane
+      main={
+        <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-y-auto p-4">
+          <Card className="mx-auto w-full max-w-3xl">
+            <CardHeader className="border-b">
+              <CardTitle className="flex items-center gap-2.5 text-lg">
+                {connected ? view.state : "Offline"}
+                <Badge variant={stateVariant(view)}>{connected ? "Live" : "Offline"}</Badge>
+              </CardTitle>
+              <CardDescription>{view.subtitle}</CardDescription>
+              <CardAction>
+                <Badge variant={connected ? "secondary" : "outline"} title={detail || undefined}>
+                  {connected ? device : "Not connected"}
+                </Badge>
+              </CardAction>
+            </CardHeader>
+            <CardContent className="flex flex-col gap-5">
+              <div className="flex flex-wrap gap-2" role="group" aria-label="Run controls">
+                <Button
+                  type="button"
+                  size="lg"
+                  onClick={() => void press("start")}
+                  disabled={busy || !view.enables.start}
+                >
+                  <Play />
+                  Start
+                </Button>
+                <Button
+                  type="button"
+                  size="lg"
+                  variant="secondary"
+                  onClick={() => void press("pause")}
+                  disabled={busy || !view.enables.pause}
+                >
+                  <Pause />
+                  Pause
+                </Button>
+                <Button
+                  type="button"
+                  size="lg"
+                  variant="destructive"
+                  onClick={() => void press("stop")}
+                  disabled={busy || !view.enables.stop}
+                >
+                  <Square />
+                  Stop
+                </Button>
+                <Button
+                  type="button"
+                  size="lg"
+                  variant="outline"
+                  onClick={() => void press("reset")}
+                  disabled={busy || !view.enables.reset}
+                >
+                  <RotateCcw />
+                  Reset
+                </Button>
+              </div>
+              <Separator />
+              <div className="grid gap-4 sm:grid-cols-2">
+                <Progress value={view.progress}>
+                  <ProgressLabel>Overall</ProgressLabel>
+                  <ProgressValue>{(formatted) => formatted ?? "—"}</ProgressValue>
+                </Progress>
+                <Progress value={view.point_progress}>
+                  <ProgressLabel>Point</ProgressLabel>
+                  <ProgressValue>{(formatted) => formatted ?? "—"}</ProgressValue>
+                </Progress>
+              </div>
+              <dl className="grid grid-cols-2 gap-x-6 gap-y-3 text-sm sm:grid-cols-3">
+                <Metric label="Control point" value={view.point} />
+                <Metric label="Energy" value={view.energy} />
+                <Metric label="Layer" value={view.layer} />
+                <Metric label="Elapsed" value={view.elapsed} />
+                <Metric label="Start permit">
+                  <Badge variant={view.permit === "Granted" ? "default" : "outline"}>
+                    {view.permit}
+                  </Badge>
+                </Metric>
+                <Metric label="Points">
+                  <Badge variant={view.points === "Valid" ? "secondary" : "outline"}>
+                    {view.points}
+                  </Badge>
+                </Metric>
+              </dl>
+            </CardContent>
+            <CardFooter className="text-muted-foreground text-sm">{view.coach}</CardFooter>
+          </Card>
+        </div>
+      }
+      side={
+        <div className="flex min-h-0 min-w-0 flex-1 flex-col gap-3 overflow-x-hidden overflow-y-auto p-3">
+          <FieldSet className="gap-3 rounded-lg border border-border p-3">
+            <FieldLegend variant="label" className="w-full">
+              <span className="flex items-center justify-between gap-2">
+                Controller
+                {connected ? (
+                  <Badge variant="secondary">
+                    <CircleCheck data-icon="inline-start" />
+                    Connected
+                  </Badge>
+                ) : (
+                  <Badge variant="outline">Step 1</Badge>
+                )}
+              </span>
+            </FieldLegend>
+            <Field>
+              <FieldLabel>RCI host</FieldLabel>
+              <InputGroup>
+                <InputGroupInput
+                  value={host}
+                  placeholder="192.168.100.184"
+                  disabled={connected}
+                  onChange={(event) => setHost(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") {
+                      void connect();
+                    }
+                  }}
+                />
+                <InputGroupAddon align="inline-end">
+                  <InputGroupButton
+                    variant="secondary"
+                    onClick={() => void connect()}
+                    disabled={busy || connected}
+                  >
+                    Connect
+                  </InputGroupButton>
+                </InputGroupAddon>
+              </InputGroup>
+              <FieldDescription>
+                IP address or the controller URL, such as http://192.168.100.184/io/
+              </FieldDescription>
+            </Field>
+            {connected ? (
+              <div className="flex items-center gap-2">
+                <p className="min-w-0 flex-1 truncate text-sm" title={`${device} ${detail}`}>
+                  <span className="font-medium">{device}</span>{" "}
+                  <span className="text-muted-foreground">{detail}</span>
+                </p>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  onClick={() => void disconnect()}
+                  disabled={busy}
+                >
+                  <Unplug />
+                  Disconnect
+                </Button>
+              </div>
+            ) : null}
+          </FieldSet>
+
+          <FieldSet className="gap-3 rounded-lg border border-border p-3">
+            <FieldLegend variant="label" className="w-full">
+              <span className="flex items-center justify-between gap-2">
+                Plan
+                {pointsReady ? (
+                  <Badge variant="secondary">
+                    <CircleCheck data-icon="inline-start" />
+                    Loaded
+                  </Badge>
+                ) : (
+                  <Badge variant="outline">Step 2</Badge>
+                )}
+              </span>
+            </FieldLegend>
+            <div className="flex items-center gap-2">
+              <p
+                className={`min-w-0 flex-1 truncate text-sm ${csvPath.length > 0 ? "" : "text-muted-foreground"}`}
+                title={csvPath.length > 0 ? csvPath : undefined}
+              >
+                {csvName}
+              </p>
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                onClick={() => void browsePlan()}
+                disabled={busy}
+              >
+                <FolderOpen />
+                Browse
+              </Button>
+            </div>
             <Button
               type="button"
-              variant="outline"
-              onClick={() => void disconnect()}
-              disabled={busy || !view.connected}
+              onClick={() => void upload()}
+              disabled={busy || !connected || csvPath.length === 0}
             >
-              Disconnect
+              <Upload />
+              Upload to RCI
             </Button>
-          </div>
-        </Field>
-        <p className="text-sm">
-          <span className="font-medium">{identity}</span>
-          <span className="text-muted-foreground"> {detail}</span>
-        </p>
-      </div>
+            {connected ? (
+              <p className="text-muted-foreground flex items-center gap-2 text-sm">
+                Points on controller
+                <Badge variant={pointsReady ? "secondary" : "outline"}>{view.points}</Badge>
+              </p>
+            ) : null}
+          </FieldSet>
 
-      <div className="flex max-w-3xl flex-wrap items-center gap-2">
-        <p className="min-w-40 flex-1 text-sm">{csvName}</p>
-        <Button type="button" variant="outline" onClick={() => void browsePlan()} disabled={busy}>
-          Browse
-        </Button>
-        <Button
-          type="button"
-          onClick={() => void upload()}
-          disabled={busy || !view.connected || csvPath.length === 0}
-        >
-          Upload to RCI
-        </Button>
-      </div>
-
-      <div className="flex flex-wrap gap-2">
-        <Button type="button" onClick={() => void press("start")} disabled={busy || !view.enables.start}>
-          Start
-        </Button>
-        <Button
-          type="button"
-          variant="outline"
-          onClick={() => void press("pause")}
-          disabled={busy || !view.enables.pause}
-        >
-          Pause
-        </Button>
-        <Button
-          type="button"
-          variant="outline"
-          onClick={() => void press("stop")}
-          disabled={busy || !view.enables.stop}
-        >
-          Stop
-        </Button>
-        <Button
-          type="button"
-          variant="outline"
-          onClick={() => void press("reset")}
-          disabled={busy || !view.enables.reset}
-        >
-          Reset
-        </Button>
-      </div>
-
-      <div className="flex max-w-3xl flex-col gap-2">
-        <Field>
-          <FieldLabel>Session zip</FieldLabel>
-          <div className="flex gap-2">
-            <Input value={dest} placeholder="session.zip" onChange={(event) => setDest(event.target.value)} />
-            <Button type="button" variant="outline" onClick={() => void browseZip()} disabled={busy}>
-              Browse
-            </Button>
+          <FieldSet className="gap-3 rounded-lg border border-border p-3">
+            <FieldLegend variant="label" className="w-full">
+              <span className="flex items-center justify-between gap-2">
+                Session
+                <Badge variant="outline">Step 3</Badge>
+              </span>
+            </FieldLegend>
+            <Field>
+              <FieldLabel>
+              Session zip
+              {view.session_id ? ` · ${view.session_id}` : ""}
+            </FieldLabel>
+              <InputGroup>
+                <InputGroupInput
+                  value={dest}
+                  placeholder={
+                    view.session_id && view.session_id.length > 0
+                      ? `${view.session_id}.zip`
+                      : "session.zip"
+                  }
+                  onChange={(event) => setDest(event.target.value)}
+                />
+                <InputGroupAddon align="inline-end">
+                  <InputGroupButton onClick={() => void browseZip()} disabled={busy}>
+                    Browse
+                  </InputGroupButton>
+                </InputGroupAddon>
+              </InputGroup>
+              <FieldDescription>
+                {view.hint ?? "After the run, download the session folder as a zip."}
+              </FieldDescription>
+            </Field>
+            {copyReport != null ? (
+              <Progress value={copyPercent}>
+                <ProgressLabel>Downloading</ProgressLabel>
+                <ProgressValue />
+              </Progress>
+            ) : null}
             <Button
               type="button"
               onClick={() => void download()}
-              disabled={busy || !view.connected || !dest.toLowerCase().endsWith(".zip")}
+              disabled={busy || !connected || !dest.toLowerCase().endsWith(".zip")}
             >
+              <Download />
               Download
             </Button>
-          </div>
-        </Field>
-        {view.hint ? <p className="text-muted-foreground text-sm">{view.hint}</p> : null}
-      </div>
-
-      <div className="flex max-w-3xl flex-col gap-3">
-        <div>
-          <p className="text-lg font-medium">{view.state}</p>
-          <p className="text-muted-foreground text-sm">{view.subtitle}</p>
+          </FieldSet>
         </div>
-        <label className="flex flex-col gap-1 text-sm">
-          Overall
-          <progress max={100} value={view.progress ?? 0} />
-        </label>
-        <label className="flex flex-col gap-1 text-sm">
-          Point
-          <progress max={100} value={view.point_progress ?? 0} />
-        </label>
-        <dl className="grid grid-cols-2 gap-x-6 gap-y-2 text-sm sm:grid-cols-3">
-          <Metric label="Control point" value={view.point} />
-          <Metric label="Energy" value={view.energy} />
-          <Metric label="Layer" value={view.layer} />
-          <Metric label="Elapsed" value={view.elapsed} />
-          <Metric label="Start permit" value={view.permit} />
-          <Metric label="Points" value={view.points} />
-        </dl>
-        <p className="text-sm">{view.coach}</p>
-      </div>
-    </div>
+      }
+    />
   );
 }
 
-function Metric({ label, value }: { label: string; value: string }) {
+function stateVariant(view: RunnerView): "default" | "secondary" | "destructive" | "outline" {
+  if (!view.connected) {
+    return "outline";
+  }
+  const state = view.state.toLowerCase();
+  if (state.includes("fault") || state.includes("error")) {
+    return "destructive";
+  }
+  if (["dosing", "active", "running", "completed"].includes(state)) {
+    return "default";
+  }
+  return "secondary";
+}
+
+function Metric({
+  label,
+  value,
+  children,
+}: {
+  label: string;
+  value?: string;
+  children?: React.ReactNode;
+}) {
   return (
     <div>
       <dt className="text-muted-foreground">{label}</dt>
-      <dd>{value}</dd>
+      <dd className="mt-0.5">{children ?? <span className="tabular-nums">{value}</span>}</dd>
     </div>
   );
 }

@@ -269,6 +269,32 @@ fn scan_kit_config_tune(
 }
 
 #[tauri::command]
+fn scan_kit_config_diff(
+    config_dir: String,
+    file: Option<String>,
+    xml: Option<String>,
+    form: Option<Value>,
+    data_dir: String,
+    session_ids: Vec<String>,
+) -> Result<Value, String> {
+    let mut body = json!({
+        "config_dir": config_dir,
+        "data_dir": data_dir,
+        "session_ids": session_ids,
+    });
+    if let Some(file) = file.filter(|text| !text.is_empty()) {
+        body["file"] = json!(file);
+    }
+    if let Some(xml) = xml.filter(|text| !text.is_empty()) {
+        body["xml"] = json!(xml);
+    }
+    if let Some(form) = form {
+        body["form"] = form;
+    }
+    scan_kit_io::invoke("scan_kit_config_diff", &body).map_err(|err| err.to_string())
+}
+
+#[tauri::command]
 fn scan_kit_runner_status(has_plan: Option<bool>, dest: Option<String>) -> Result<Value, String> {
     scan_kit_io::invoke(
         "scan_kit_runner_status",
@@ -373,6 +399,7 @@ pub fn run() {
             scan_kit_config_apply,
             scan_kit_config_save,
             scan_kit_config_tune,
+            scan_kit_config_diff,
             scan_kit_config_hide,
             scan_kit_phantom_catalog,
             scan_kit_phantom_preview,

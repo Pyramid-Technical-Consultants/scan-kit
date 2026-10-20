@@ -385,5 +385,9 @@ fn parse_cell(text: &str) -> Option<f64> {
     if text.is_empty() {
         return None;
     }
-    text.parse().ok()
+    match text {
+        "true" | "True" | "TRUE" => Some(1.0),
+        "false" | "False" | "FALSE" => Some(0.0),
+        _ => text.parse().ok(),
+    }
 }

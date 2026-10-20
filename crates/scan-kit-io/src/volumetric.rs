@@ -121,7 +121,21 @@ pub fn volumetric(
             return super::patient_view::scene(root, session_ids, options, mc);
         }
     }
-    let picked = crate::source::select(crate::source::Shape::Source, true, true, &[], options);
+    let allow_spot = session_ids.is_empty()
+        || session_ids
+            .iter()
+            .any(|id| crate::tables::grain_present(root, id, false));
+    let allow_slice = session_ids.is_empty()
+        || session_ids
+            .iter()
+            .any(|id| crate::tables::grain_present(root, id, true));
+    let picked = crate::source::select(
+        crate::source::Shape::Source,
+        allow_spot,
+        allow_slice,
+        &[],
+        options,
+    );
     let grain = picked.grain;
     let chambers = chamber_mode(options);
     let quantity_id = pick(options, "quantity", "dose", QUANTITY);

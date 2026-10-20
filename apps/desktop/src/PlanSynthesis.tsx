@@ -9,11 +9,8 @@ import {
   ArrowUpRight,
   Combine,
   CornerUpLeft,
-  Crosshair,
   Dices,
   Download,
-  File,
-  FileText,
   FolderOpen,
   Hash,
   Layers,
@@ -27,7 +24,6 @@ import {
   Rows3,
   Scale,
   Shuffle,
-  Square,
   type LucideIcon,
 } from "lucide-react";
 import {
@@ -37,7 +33,7 @@ import {
   type GridColumn,
   type Item,
 } from "@glideapps/glide-data-grid";
-import { gridTheme } from "@/grid-theme";
+import { gridTheme, useResizableColumns } from "@/grid-theme";
 import "@glideapps/glide-data-grid/dist/index.css";
 
 import { Button } from "@/components/ui/button";
@@ -60,7 +56,7 @@ import {
 } from "@/components/ui/input-group";
 import { optionIcon } from "@/option-icons";
 import { CatalogField, catalogShown } from "@/CatalogField";
-import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
+import { ButtonSegmentGroup } from "@/components/button-segment-group";
 import { notifyError, notifySaved } from "@/notify";
 import { usePageLoad } from "@/page-load";
 import { SidePane } from "@/SidePane";
@@ -134,13 +130,6 @@ const ENERGY_PRESETS: Record<string, { label: string; title: string; icon: Lucid
   "Whole MeV Steps": { label: "Whole MeV", title: "Integer MeV layers", icon: Hash },
   "10 MeV Steps": { label: "10 MeV", title: "Every 10 MeV", icon: Rows3 },
   "Clear All": { label: "None", title: "Clear the selection", icon: ListX },
-};
-
-const TEMPLATE_ICONS: Record<string, LucideIcon> = {
-  zero_field: Crosshair,
-  rectangular_field: Square,
-  dicom_rt_plan: FileText,
-  iba_pld_plan: File,
 };
 
 function defaultsOf(template: Template): Record<string, unknown> {
@@ -255,10 +244,11 @@ export function PlanSynthesis() {
     return () => observer.disconnect();
   }, [plan]);
 
-  const columns = useMemo<GridColumn[]>(
+  const baseColumns = useMemo<GridColumn[]>(
     () => (plan?.columns ?? []).map((title) => ({ title, id: title, width: 130 })),
     [plan],
   );
+  const { columns, onColumnResize } = useResizableColumns(baseColumns);
   const theme = useMemo(() => (plan == null ? null : gridTheme()), [plan]);
 
   function setValue(key: string, value: unknown) {
@@ -358,41 +348,22 @@ export function PlanSynthesis() {
           <div className="flex min-h-0 min-w-0 flex-1 flex-col gap-3 overflow-x-hidden overflow-y-auto p-3">
             <FieldSet className="min-w-0 gap-2 rounded-lg border border-border p-3">
               <FieldLegend variant="label">Template</FieldLegend>
-              <ToggleGroup
-                variant="outline"
+              <ButtonSegmentGroup
                 orientation="vertical"
-                spacing={2}
-                className="w-full min-w-0 flex-col items-stretch"
-                value={[template.id]}
-                onValueChange={(next) => {
-                  const picked = next.find((item) => item !== template.id) ?? next[0];
-                  if (picked != null) {
-                    selectTemplate(picked);
+                label="Template"
+                options={catalog.templates.map((item) => ({
+                  id: item.id,
+                  label: item.name,
+                  detail: item.description,
+                }))}
+                value={template.id}
+                onChange={(name) => {
+                  const next = catalog.templates.find((item) => item.name === name);
+                  if (next != null) {
+                    selectTemplate(next.id);
                   }
                 }}
-              >
-                {catalog.templates.map((item) => {
-                  const Icon = TEMPLATE_ICONS[item.id];
-                  return (
-                    <ToggleGroupItem
-                      key={item.id}
-                      value={item.id}
-                      className="w-full min-w-0 justify-start gap-3 overflow-hidden px-2.5 font-normal"
-                    >
-                      <span className="flex shrink-0 items-center gap-1.5 font-medium">
-                        {Icon == null ? null : <Icon />}
-                        {item.name}
-                      </span>
-                      <span
-                        className="text-muted-foreground ml-auto min-w-0 flex-1 truncate text-right font-normal"
-                        title={item.description}
-                      >
-                        {item.description}
-                      </span>
-                    </ToggleGroupItem>
-                  );
-                })}
-              </ToggleGroup>
+              />
             </FieldSet>
             {FIELD_SETS.map(([setId, title]) => {
               const params = template.params.filter(
@@ -478,6 +449,7 @@ export function PlanSynthesis() {
                     headerHeight={32}
                     getCellContent={getCellContent}
                     theme={theme}
+                    onColumnResize={onColumnResize}
                   />
                 ) : null}
               </div>

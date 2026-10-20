@@ -1,4 +1,6 @@
 import { useRef, type KeyboardEvent, type PointerEvent as ReactPointerEvent } from "react";
+import { GripHorizontal, GripVertical } from "lucide-react";
+import { cn } from "cn";
 
 export function Splitter({
   orientation,
@@ -51,6 +53,7 @@ export function Splitter({
     onMove(step);
   };
   const vertical = orientation === "vertical";
+  const Grip = vertical ? GripVertical : GripHorizontal;
   return (
     <div
       role="separator"
@@ -59,13 +62,29 @@ export function Splitter({
       aria-valuemin={min}
       aria-valuenow={Math.round(now)}
       tabIndex={0}
-      className={
-        vertical
-          ? "bg-border w-1.5 shrink-0 cursor-col-resize touch-none focus-visible:bg-ring"
-          : "bg-border h-1.5 shrink-0 cursor-row-resize touch-none focus-visible:bg-ring"
-      }
+      className={cn(
+        "group relative flex shrink-0 touch-none items-center justify-center outline-none",
+        "focus-visible:ring-ring focus-visible:ring-1 focus-visible:ring-offset-1",
+        vertical ? "w-2 cursor-col-resize" : "h-2 cursor-row-resize",
+      )}
       onPointerDown={onPointerDown}
       onKeyDown={onKeyDown}
-    />
+    >
+      <div
+        className={cn(
+          "bg-border transition-colors group-hover:bg-ring/50 group-active:bg-ring",
+          vertical ? "h-full w-px" : "h-px w-full",
+        )}
+      />
+      <div
+        className={cn(
+          "bg-background border-border text-muted-foreground absolute z-10 flex items-center justify-center rounded-sm border transition-colors",
+          "group-hover:border-ring/50 group-hover:text-foreground group-active:border-ring",
+          vertical ? "h-4 w-3" : "h-3 w-4",
+        )}
+      >
+        <Grip className="size-2.5" />
+      </div>
+    </div>
   );
 }
