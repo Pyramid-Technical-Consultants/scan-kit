@@ -21,22 +21,22 @@ const SEED: u32 = 1;
 
 /// Everything `options` resolves into for a patient run: the loaded study,
 /// the fraction/delivery selection, the calibration, and the dose model.
-struct PatientInputs {
-    study: PatientStudy,
-    segment: &'static str,
-    fraction: String,
-    deliveries: Vec<Delivery>,
-    groups: Vec<Vec<usize>>,
-    names: Vec<String>,
-    beam_filter: Option<usize>,
-    bdl: &'static str,
-    histories: u32,
-    calibration: CtCalibration,
-    rbe_model: Option<RbeModel>,
-    rbe_key: &'static str,
-    alpha_beta: f64,
-    scanner: String,
-    registered: Vec<(String, String)>,
+pub struct PatientInputs {
+    pub study: PatientStudy,
+    pub segment: &'static str,
+    pub fraction: String,
+    pub deliveries: Vec<Delivery>,
+    pub groups: Vec<Vec<usize>>,
+    pub names: Vec<String>,
+    pub beam_filter: Option<usize>,
+    pub bdl: &'static str,
+    pub histories: u32,
+    pub calibration: CtCalibration,
+    pub rbe_model: Option<RbeModel>,
+    pub rbe_key: &'static str,
+    pub alpha_beta: f64,
+    pub scanner: String,
+    pub registered: Vec<(String, String)>,
 }
 
 const RBE_PAIRS: &[(&str, &str)] = &[
@@ -60,7 +60,7 @@ const SCANNER_PAIRS: &[(&str, &str)] = &[
     ("solid", "Solid water"),
 ];
 
-fn patient_inputs(
+pub fn patient_inputs(
     root: &Path,
     session_ids: &[String],
     options: &Value,
@@ -195,14 +195,14 @@ fn patient_inputs(
 
 /// What one transport produced: the dose on the CT grid, the physical dose
 /// when a variable RBE rewrote it, and whether the effective label applies.
-struct Transport {
-    ran: Option<McResult>,
-    dose: Volume,
-    physical: Option<Vec<f32>>,
-    effective: bool,
+pub struct Transport {
+    pub ran: Option<McResult>,
+    pub dose: Volume,
+    pub physical: Option<Vec<f32>>,
+    pub effective: bool,
 }
 
-fn transport(inputs: &PatientInputs, mc: Option<McRunner<'_>>) -> Transport {
+pub fn transport(inputs: &PatientInputs, mc: Option<McRunner<'_>>) -> Transport {
     let score_let = inputs.rbe_model.is_some_and(RbeModel::uses_let);
     let (spots, protons, beams) = records(
         &inputs.study,
@@ -321,7 +321,12 @@ pub fn dose_export(
 }
 
 /// What an exported dose came from — `scan_kit.qa.analysis.provenance`.
-fn provenance(inputs: &PatientInputs, result: &McResult, sessions: &[String], gpu: &str) -> Value {
+pub fn provenance(
+    inputs: &PatientInputs,
+    result: &McResult,
+    sessions: &[String],
+    gpu: &str,
+) -> Value {
     let study = &inputs.study;
     json!({
         "inputs": {
@@ -371,162 +376,100 @@ fn digest16(bytes: &[u8]) -> String {
         .collect()
 }
 
-pub(crate) fn scene(
-    root: &Path,
-    session_ids: &[String],
-    options: &Value,
-    mc: Option<McRunner<'_>>,
-) -> PlotScene {
-    let inputs = match patient_inputs(root, session_ids, options) {
-        Ok(inputs) => inputs,
-        Err(err) => return note_scene(&err),
-    };
-    let run = transport(&inputs, mc);
-    let PatientInputs {
-        study,
-        segment,
-        fraction,
-        deliveries,
-        groups,
-        names,
-        beam_filter,
-        bdl,
-        histories,
-        rbe_model,
-        rbe_key,
-        alpha_beta,
-        scanner,
-        registered,
-        ..
-    } = inputs;
-    let Transport {
-        ran,
-        dose,
-        physical,
-        effective,
-    } = run;
+/// The display name of the RBE model `key` selects.
+pub fn rbe_label(key: &str) -> &'static str {
+    RBE_PAIRS
+        .iter()
+        .find(|(k, _)| *k == key)
+        .map(|(_, label)| *label)
+        .unwrap_or("1.1")
+}
+
+/// Everything the patient scene and the QA report need once the dose landed:
+/// delivery matches, per-structure DVH/goals/LET, and the TPS gamma.
+pub struct PatientMetrics {
+    /// Delivery index and its match for the chosen fraction's group.
+    pub matches: Vec<(usize, DeliveryMatch)>,
+    pub structures: Vec<StructureMetric>,
+    pub gamma: Option<GammaMetric>,
+}
+
+pub struct StructureMetric {
+    /// Index into `study.structures` — the label mark is `id + 1`.
+    pub id: usize,
+    pub name: String,
+    pub mask: Vec<bool>,
+    pub dvh: Dvh,
+    /// Parsed goal and its `(measured, passed)` outcome or the check error.
+    pub goals: Vec<(Goal, Result<(f32, bool), String>)>,
+    /// Dose-weighted LETd (keV/µm) and RBE, when the run scored LET.
+    pub let_stats: Option<(f64, f64)>,
+}
+
+pub struct GammaMetric {
+    /// Gamma indices on the dose grid, for the overlay.
+    pub display: Volume,
+    /// Passing fraction 0–100.
+    pub rate: f32,
+    pub passed: u32,
+    pub scored: u32,
+    pub dose_pct: f32,
+    pub dta_mm: f32,
+    pub cutoff_pct: f32,
+}
+
+/// Compute the analysis behind the scene and the QA report — `scene` renders
+/// it into rows and series, the report into document sections.
+pub fn metrics(inputs: &PatientInputs, run: &Transport, options: &Value) -> PatientMetrics {
+    let study = &inputs.study;
     let [nx, ny, nz] = study.ct.shape;
     let nvox = nx * ny * nz;
-    let let_d = ran
+    let dose = &run.dose;
+    let mut matches = Vec::new();
+    if inputs.fraction != "Plan" {
+        let chosen = inputs
+            .fraction
+            .parse::<usize>()
+            .unwrap_or(1)
+            .saturating_sub(1);
+        for hit in inputs.groups.get(chosen).into_iter().flatten() {
+            matches.push((*hit, inputs.deliveries[*hit].matched.clone()));
+        }
+    }
+    let goals_text = goal_text(options, study);
+    let voxel_cc = study.ct.spacing.iter().product::<f32>() / 1000.0;
+    let let_d = run
+        .ran
         .as_ref()
         .map(|result| result.let_d.as_slice())
         .filter(|letd| letd.len() == nvox);
-    let (cx, cy, cz) = dose.peak_index();
-    let mut labels = vec![0u8; nvox];
-    let mut dvh_lines = Vec::new();
-    let mut rows = vec![
-        vec!["Frame".into(), study.frame.clone()],
-        vec!["Beams".into(), study.beams.len().to_string()],
-    ];
-    if let Some(result) = &ran {
-        let incident = result.ledger[0];
-        let left = if incident > 0.0 {
-            100.0 * (result.ledger[2] + result.ledger[3]) / incident
-        } else {
-            0.0
-        };
-        rows.push(vec![
-            "Uncertainty".into(),
-            format!("{:.1}%", result.uncertainty * 100.0),
-        ]);
-        rows.push(vec!["Left grid".into(), format!("{left:.1}%")]);
-    }
-    if fraction != "Plan" {
-        let chosen = fraction.parse::<usize>().unwrap_or(1).saturating_sub(1);
-        for hit in groups.get(chosen).into_iter().flatten() {
-            let delivery = &deliveries[*hit];
-            let matched = &delivery.matched;
-            let label = format!("Beam {} delivered", matched.beam + 1);
-            rows.push(vec![
-                label.clone(),
-                format!("{:.1} / {:.1} MU", matched.delivered_mu, matched.planned_mu),
-            ]);
-            rows.push(vec![
-                format!("{label} unmatched"),
-                matched.unmatched.to_string(),
-            ]);
-            rows.push(vec![
-                format!("{label} energy error"),
-                format!("{:.2} MeV", matched.energy_error),
-            ]);
-            rows.push(vec![
-                format!("{label} position RMS"),
-                format!("{:.2} mm", matched.position_rms),
-            ]);
-            let ratios: Vec<f32> = matched
-                .layer_mu_ratio
-                .iter()
-                .copied()
-                .filter(|value| value.is_finite())
-                .collect();
-            if !ratios.is_empty() {
-                let low = ratios.iter().copied().fold(f32::INFINITY, f32::min);
-                let high = ratios.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-                rows.push(vec![
-                    format!("{label} MU ratio"),
-                    format!("{low:.2} – {high:.2}"),
-                ]);
-            }
-        }
-    }
-    let goals_text = goal_text(options, &study);
-    let voxel_cc = study.ct.spacing.iter().product::<f32>() / 1000.0;
+    let mut structures = Vec::new();
     for (id, structure) in study.structures.iter().enumerate() {
         if !structure_on(options, id, &structure.name) {
             continue;
         }
-        let mark = (id + 1) as u8;
         let mut mask = vec![false; nvox];
         for index in 0..nvox {
             let x = index % nx;
             let y = (index / nx) % ny;
             let z = index / (nx * ny);
-            if inside_structure(&study, structure, x, y, z) {
-                mask[index] = true;
-                if labels[index] == 0 {
-                    labels[index] = mark;
-                }
-            }
+            mask[index] = inside_structure(study, structure, x, y, z);
         }
         if !mask.iter().any(|keep| *keep) {
             continue;
         }
-        let (edges, curve) = dvh(&dose.values, &mask, 16);
-        let xs = edges.iter().take(curve.len()).copied().collect();
-        dvh_lines.push(scan_kit_core::Series::Polyline {
-            xs,
-            ys: curve.clone(),
-            color: MARK,
-            thickness: 1.5,
-        });
         let structure_dvh = Dvh::of(&dose.values, &mask, voxel_cc);
         let rx = study.prescription.is_finite().then_some(study.prescription);
-        for line in goals_text.lines() {
-            let goal = match Goal::parse(line) {
-                Ok(goal) => goal,
-                Err(_) => continue,
-            };
-            if !structure.name.eq_ignore_ascii_case(&goal.roi) {
-                continue;
-            }
-            let body = match goal.check(&structure_dvh, rx) {
-                Ok((measured, pass)) => verdict(
-                    pass,
-                    format!("{} {measured:.2} {}", goal.metric_text, goal.unit),
-                ),
-                Err(err) => format!("fail {err}"),
-            };
-            rows.push(vec![structure.name.clone(), body]);
-        }
-        rows.push(vec![
-            format!("{} mean", structure.name),
-            format!("{:.2} Gy", structure_dvh.mean()),
-        ]);
-        rows.push(vec![
-            format!("{} volume", structure.name),
-            format!("{:.1} cc", structure_dvh.volume_cc()),
-        ]);
-        if let (Some(letd), Some(phys)) = (let_d, physical.as_ref()) {
+        let goals = goals_text
+            .lines()
+            .filter_map(|line| Goal::parse(line).ok())
+            .filter(|goal| structure.name.eq_ignore_ascii_case(&goal.roi))
+            .map(|goal| {
+                let check = goal.check(&structure_dvh, rx);
+                (goal, check)
+            })
+            .collect();
+        let let_stats = if let (Some(letd), Some(phys)) = (let_d, run.physical.as_ref()) {
             let mut dep = 0.0f64;
             let mut del = 0.0f64;
             let mut deff = 0.0f64;
@@ -538,26 +481,20 @@ pub(crate) fn scene(
                     deff += f64::from(dose.values[index]);
                 }
             }
-            if dep > 0.0 {
-                rows.push(vec![
-                    format!("{} LETd", structure.name),
-                    format!("{:.2} keV/µm", del / dep),
-                ]);
-                rows.push(vec![
-                    format!("{} RBE", structure.name),
-                    format!("{:.3}", deff / dep),
-                ]);
-            }
-        }
-        rows.push(vec!["DVH".into(), structure.name.clone()]);
-        for (edge, volume) in edges.iter().zip(&curve) {
-            rows.push(vec!["curve".into(), format!("{edge:.4},{volume:.4}")]);
-        }
+            (dep > 0.0).then_some((del / dep, deff / dep))
+        } else {
+            None
+        };
+        structures.push(StructureMetric {
+            id,
+            name: structure.name.clone(),
+            mask,
+            dvh: structure_dvh,
+            goals,
+            let_stats,
+        });
     }
-    if dvh_lines.is_empty() {
-        dvh_lines.push(crate::workspace::dvh_line(&dose));
-    }
-    let gamma = ran.as_ref().and_then(|_| {
+    let gamma = run.ran.as_ref().and_then(|_| {
         let tps = study.tps.as_ref()?;
         let (dd, dta, cutoff) = gamma_criteria(options);
         // The TPS dose for one fraction, searched in the MC dose resampled to
@@ -572,7 +509,11 @@ pub(crate) fn scene(
             RBE_CONSTANT as f32
         } else {
             1.0
-        }) / (if effective { RBE_CONSTANT as f32 } else { 1.0 });
+        }) / (if run.effective {
+            RBE_CONSTANT as f32
+        } else {
+            1.0
+        });
         let same_grid = tps.shape == study.ct.shape
             && tps.spacing == study.ct.spacing
             && tps.origin == study.ct.origin;
@@ -607,7 +548,6 @@ pub(crate) fn scene(
         } else {
             100.0 * passed as f32 / scored as f32
         };
-        rows.push(vec!["Gamma".into(), format!("{rate:.0}%")]);
         // The overlay draws on the dose grid; the score stays on the TPS grid.
         let display = if same_grid {
             values
@@ -622,13 +562,168 @@ pub(crate) fn scene(
                 study.ct.shape,
             )
         };
-        Some((
-            Volume {
+        Some(GammaMetric {
+            display: Volume {
                 values: display,
                 ..dose.clone()
             },
             rate,
-        ))
+            passed,
+            scored,
+            dose_pct: dd,
+            dta_mm: dta,
+            cutoff_pct: cutoff,
+        })
+    });
+    PatientMetrics {
+        matches,
+        structures,
+        gamma,
+    }
+}
+
+pub(crate) fn scene(
+    root: &Path,
+    session_ids: &[String],
+    options: &Value,
+    mc: Option<McRunner<'_>>,
+) -> PlotScene {
+    let inputs = match patient_inputs(root, session_ids, options) {
+        Ok(inputs) => inputs,
+        Err(err) => return note_scene(&err),
+    };
+    let run = transport(&inputs, mc);
+    let computed = metrics(&inputs, &run, options);
+    let PatientInputs {
+        study,
+        segment,
+        fraction,
+        names,
+        beam_filter,
+        bdl,
+        histories,
+        rbe_model,
+        rbe_key,
+        alpha_beta,
+        scanner,
+        registered,
+        ..
+    } = inputs;
+    let Transport {
+        ran,
+        dose,
+        effective,
+        ..
+    } = run;
+    let [nx, ny, nz] = study.ct.shape;
+    let nvox = nx * ny * nz;
+    let (cx, cy, cz) = dose.peak_index();
+    let mut labels = vec![0u8; nvox];
+    let mut dvh_lines = Vec::new();
+    let mut rows = vec![
+        vec!["Frame".into(), study.frame.clone()],
+        vec!["Beams".into(), study.beams.len().to_string()],
+    ];
+    if let Some(result) = &ran {
+        let incident = result.ledger[0];
+        let left = if incident > 0.0 {
+            100.0 * (result.ledger[2] + result.ledger[3]) / incident
+        } else {
+            0.0
+        };
+        rows.push(vec![
+            "Uncertainty".into(),
+            format!("{:.1}%", result.uncertainty * 100.0),
+        ]);
+        rows.push(vec!["Left grid".into(), format!("{left:.1}%")]);
+    }
+    for (_, matched) in &computed.matches {
+        let label = format!("Beam {} delivered", matched.beam + 1);
+        rows.push(vec![
+            label.clone(),
+            format!("{:.1} / {:.1} MU", matched.delivered_mu, matched.planned_mu),
+        ]);
+        rows.push(vec![
+            format!("{label} unmatched"),
+            matched.unmatched.to_string(),
+        ]);
+        rows.push(vec![
+            format!("{label} energy error"),
+            format!("{:.2} MeV", matched.energy_error),
+        ]);
+        rows.push(vec![
+            format!("{label} position RMS"),
+            format!("{:.2} mm", matched.position_rms),
+        ]);
+        let ratios: Vec<f32> = matched
+            .layer_mu_ratio
+            .iter()
+            .copied()
+            .filter(|value| value.is_finite())
+            .collect();
+        if !ratios.is_empty() {
+            let low = ratios.iter().copied().fold(f32::INFINITY, f32::min);
+            let high = ratios.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            rows.push(vec![
+                format!("{label} MU ratio"),
+                format!("{low:.2} – {high:.2}"),
+            ]);
+        }
+    }
+    for structure in &computed.structures {
+        let mark = (structure.id + 1) as u8;
+        for index in 0..nvox {
+            if structure.mask[index] && labels[index] == 0 {
+                labels[index] = mark;
+            }
+        }
+        let (edges, curve) = dvh(&dose.values, &structure.mask, 16);
+        let xs = edges.iter().take(curve.len()).copied().collect();
+        dvh_lines.push(scan_kit_core::Series::Polyline {
+            xs,
+            ys: curve.clone(),
+            color: MARK,
+            thickness: 1.5,
+        });
+        for (goal, check) in &structure.goals {
+            let body = match check {
+                Ok((measured, pass)) => verdict(
+                    *pass,
+                    format!("{} {measured:.2} {}", goal.metric_text, goal.unit),
+                ),
+                Err(err) => format!("fail {err}"),
+            };
+            rows.push(vec![structure.name.clone(), body]);
+        }
+        rows.push(vec![
+            format!("{} mean", structure.name),
+            format!("{:.2} Gy", structure.dvh.mean()),
+        ]);
+        rows.push(vec![
+            format!("{} volume", structure.name),
+            format!("{:.1} cc", structure.dvh.volume_cc()),
+        ]);
+        if let Some((letd, rbe)) = structure.let_stats {
+            rows.push(vec![
+                format!("{} LETd", structure.name),
+                format!("{:.2} keV/µm", letd),
+            ]);
+            rows.push(vec![
+                format!("{} RBE", structure.name),
+                format!("{:.3}", rbe),
+            ]);
+        }
+        rows.push(vec!["DVH".into(), structure.name.clone()]);
+        for (edge, volume) in edges.iter().zip(&curve) {
+            rows.push(vec!["curve".into(), format!("{edge:.4},{volume:.4}")]);
+        }
+    }
+    if dvh_lines.is_empty() {
+        dvh_lines.push(crate::workspace::dvh_line(&dose));
+    }
+    let gamma = computed.gamma.map(|metric| {
+        rows.push(vec!["Gamma".into(), format!("{:.0}%", metric.rate)]);
+        (metric.display, metric.rate)
     });
     let cells = crate::workspace::cells_from(&[
         options.get("cell0").and_then(Value::as_str),
@@ -808,7 +903,8 @@ pub(crate) fn scene(
 /// One measured spot snapped to its planned layer: the layer's nominal energy
 /// and shifter settings, the measured isocenter-plane position, and the MU the
 /// chambers counted.
-struct MatchedSpot {
+#[derive(Clone)]
+pub struct MatchedSpot {
     energy: f32,
     x: f32,
     y: f32,
@@ -818,19 +914,20 @@ struct MatchedSpot {
 }
 
 /// How one delivered beam strayed from its plan, in plan terms.
-struct DeliveryMatch {
-    beam: usize,
+#[derive(Clone)]
+pub struct DeliveryMatch {
+    pub beam: usize,
     spots: Vec<MatchedSpot>,
-    planned_mu: f32,
-    delivered_mu: f32,
-    unmatched: usize,
-    energy_error: f32,
-    position_rms: f32,
-    layer_mu_ratio: Vec<f32>,
+    pub planned_mu: f32,
+    pub delivered_mu: f32,
+    pub unmatched: usize,
+    pub energy_error: f32,
+    pub position_rms: f32,
+    pub layer_mu_ratio: Vec<f32>,
 }
 
-struct Delivery {
-    matched: DeliveryMatch,
+pub struct Delivery {
+    pub matched: DeliveryMatch,
 }
 
 const ENERGY_TOL: f32 = 0.5;
@@ -1229,8 +1326,8 @@ const DVH_BINS: usize = 4096;
 
 /// Cumulative dose-volume histogram for one structure: `counts[i]` voxels sit
 /// in `edges[i]..edges[i+1]` Gy, `voxel_cc` is one voxel's volume.
-struct Dvh {
-    edges: Vec<f32>,
+pub struct Dvh {
+    pub edges: Vec<f32>,
     counts: Vec<f64>,
     voxel_cc: f32,
     dmax: f32,
@@ -1239,7 +1336,7 @@ struct Dvh {
 
 impl Dvh {
     /// Histogram of `dose` inside `mask`, bins up to the whole-volume peak.
-    fn of(dose: &[f32], mask: &[bool], voxel_cc: f32) -> Dvh {
+    pub(crate) fn of(dose: &[f32], mask: &[bool], voxel_cc: f32) -> Dvh {
         let peak = dose.iter().copied().fold(0.0f32, f32::max);
         let hi = if peak > 0.0 { peak * (1.0 + 1e-6) } else { 1.0 };
         let edges: Vec<f32> = (0..=DVH_BINS)
@@ -1274,12 +1371,12 @@ impl Dvh {
         self.counts.iter().sum()
     }
 
-    fn volume_cc(&self) -> f32 {
+    pub fn volume_cc(&self) -> f32 {
         self.voxels() as f32 * self.voxel_cc
     }
 
     /// Volume fraction receiving at least `edges[i]`, one entry past the last.
-    fn cumulative(&self) -> Vec<f32> {
+    pub fn cumulative(&self) -> Vec<f32> {
         let n = (self.voxels() as f32).max(1.0);
         let mut out = vec![0.0f32; self.edges.len()];
         let mut acc = 0.0f64;
@@ -1290,7 +1387,7 @@ impl Dvh {
         out
     }
 
-    fn mean(&self) -> f32 {
+    pub fn mean(&self) -> f32 {
         let n = (self.voxels() as f32).max(1.0);
         let sum: f64 = self
             .counts
@@ -1303,7 +1400,7 @@ impl Dvh {
 
     /// D at a volume fraction (0.95 for D95%): the dose that much of the
     /// structure reaches.
-    fn dose_at(&self, fraction: f32) -> f32 {
+    pub fn dose_at(&self, fraction: f32) -> f32 {
         if fraction <= 0.0 {
             return self.dmax;
         }
@@ -1313,7 +1410,7 @@ impl Dvh {
         dose_at_volume(&self.edges, &self.cumulative(), fraction)
     }
 
-    fn dose_at_cc(&self, cc: f32) -> f32 {
+    pub fn dose_at_cc(&self, cc: f32) -> f32 {
         if self.volume_cc() > 0.0 {
             self.dose_at(cc / self.volume_cc())
         } else {
@@ -1354,17 +1451,18 @@ enum GoalMetric {
 /// A clinical goal like `PTV: D95% >= 95%`, `Cord: Dmax < 45 Gy` or
 /// `Lung: V20Gy < 30%`. Dose values in % are of the prescription; V goals in %
 /// are of the structure's volume.
-struct Goal {
-    roi: String,
+#[derive(Clone)]
+pub struct Goal {
+    pub roi: String,
     metric: GoalMetric,
-    metric_text: String,
-    op: String,
-    value: f32,
-    unit: String,
+    pub metric_text: String,
+    pub op: String,
+    pub value: f32,
+    pub unit: String,
 }
 
 impl Goal {
-    fn parse(text: &str) -> Result<Goal, String> {
+    pub(crate) fn parse(text: &str) -> Result<Goal, String> {
         let (roi, rest) = text
             .split_once(':')
             .ok_or_else(|| format!("not a goal: {text:?}"))?;

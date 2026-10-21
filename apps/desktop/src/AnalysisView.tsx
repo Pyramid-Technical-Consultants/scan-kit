@@ -173,48 +173,6 @@ function NumberField({
   );
 }
 
-function escapeHtml(text: string): string {
-  return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-}
-
-function downloadText(name: string, text: string, type: string) {
-  const blob = new Blob([text], { type });
-  const url = URL.createObjectURL(blob);
-  const link = document.createElement("a");
-  link.href = url;
-  link.download = name;
-  link.click();
-  URL.revokeObjectURL(url);
-}
-
-function exportStudyReport(table: { columns: readonly string[]; rows: readonly (readonly string[])[] }) {
-  const summary = table.rows.filter((row) => row[0] !== "DVH" && row[0] !== "curve");
-  const body = summary
-    .map((row) => `<tr><td>${escapeHtml(row[0] ?? "")}</td><td>${escapeHtml(row[1] ?? "")}</td></tr>`)
-    .join("\n");
-  downloadText(
-    "scan-kit-report.html",
-    `<!DOCTYPE html>\n<meta charset="utf-8">\n<title>Scan Kit dose report</title>\n<table>\n<tr><th>Item</th><th>Value</th></tr>\n${body}\n</table>\n`,
-    "text/html",
-  );
-  const curves = table.rows.filter((row) => row[0] === "DVH" || row[0] === "curve");
-  if (curves.length === 0) {
-    return;
-  }
-  const lines = ["structure,dose_gy,volume"];
-  let name = "";
-  for (const row of curves) {
-    if (row[0] === "DVH") {
-      name = row[1] ?? "";
-      continue;
-    }
-    const [dose, volume] = (row[1] ?? "").split(",");
-    const cell = name.includes(",") || name.includes('"') ? `"${name.replace(/"/g, '""')}"` : name;
-    lines.push(`${cell},${dose ?? ""},${volume ?? ""}`);
-  }
-  downloadText("scan-kit-dvh.csv", `${lines.join("\n")}\n`, "text/csv");
-}
-
 // A canvas keeps the first context it is given, and StrictMode mounts twice,
 // so each canvas gets one WebPlot for its lifetime.
 const plotters = new WeakMap<HTMLCanvasElement, Promise<Plotter>>();
@@ -1416,8 +1374,33 @@ export function AnalysisView({
             Register scanner
           </Button>
         ) : null}
-        {viewId === "volumetric" && study != null && table != null && table.rows.length > 0 ? (
-          <Button variant="outline" onClick={() => exportStudyReport(table)}>
+        {viewId === "volumetric" && studyPath != null ? (
+          <Button
+            variant="outline"
+            onClick={() => {
+              void open({
+                defaultPath: "qa.pdf",
+                filters: [{ name: "PDF report", extensions: ["pdf"] }],
+              }).then((selected) => {
+                if (typeof selected !== "string") {
+                  return;
+                }
+                void invoke("scan_kit_write_report", {
+                  path: folder,
+                  sessionIds: shownSessionIds(
+                    sessions.map((session) => session.id),
+                    hidden,
+                  ),
+                  options: {
+                    ...optionsRef.current,
+                    study: studyPath,
+                    scanners: JSON.stringify(scanners),
+                  },
+                  dest: selected,
+                }).catch((reason: unknown) => notifyError(reason));
+              });
+            }}
+          >
             Export report
           </Button>
         ) : null}

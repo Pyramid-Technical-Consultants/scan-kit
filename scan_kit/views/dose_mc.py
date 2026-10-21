@@ -334,9 +334,8 @@ class McRun:
         cls, spots: np.ndarray, protons, beams: np.ndarray, material: np.ndarray, density: np.ndarray,
         spacing_mm, *, histories: int, seed: int, dose_to_water: bool = True, let: bool | str = False,
     ) -> McRun:
-        """BDL spot records (:meth:`~scan_kit.qa.beam_model.BeamModel.spot_records`) carrying
-        *protons* each, through a ``(nz, ny, nx)`` volume of per-voxel medium and density,
-        scored on its own grid.
+        """BDL spot records carrying *protons* each, through a ``(nz, ny, nx)``
+        volume of per-voxel medium and density, scored on its own grid.
 
         *let* scores LETd: ``True`` in the medium, as MCsquare does; :data:`LET_WATER` in water
         at unit density, the quantity RBE models and the EPTN reporting consensus use.

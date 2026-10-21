@@ -18,6 +18,7 @@ mod mc_tables;
 pub mod patient_view;
 mod phantom;
 mod remote;
+pub mod report;
 mod runner;
 mod session_capture;
 mod source;
