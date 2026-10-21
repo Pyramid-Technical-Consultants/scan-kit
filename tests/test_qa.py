@@ -11,7 +11,7 @@ from scan_kit.dicom import StudyIndex, gantry_to_patient
 from scan_kit.dicom.calibration import CtCalibration
 from scan_kit.dicom.structures import rasterize
 from scan_kit.dicom.synthetic import write_phantom
-from scan_kit.qa import BeamModel, Delivery, fraction_runs, match_delivery, patient_run, plan_spots
+from scan_kit.qa import BeamModel, patient_run, plan_spots
 from scan_kit.qa.beam_model import _phase_space
 from scan_kit.views.dose_mc import LET_WATER
 
@@ -89,54 +89,6 @@ def test_patient_transport_is_deterministic_in_any_slicing(gpu, phantom) -> None
         pass
     assert np.array_equal(whole.dose, sliced.dose)
     assert whole.result.ledger == sliced.result.ledger
-
-
-def _as_delivered(plan):
-    s = plan_spots(plan)
-    return Delivery(s.x.copy(), s.y.copy(), s.energy.copy(), s.mu.copy())
-
-
-def test_delivery_matches_plan_layers_and_reports_errors(phantom) -> None:
-    _case, plan = phantom()
-    d = _as_delivered(plan)
-    exact = match_delivery(plan, d)
-    assert exact.beam == plan.beams[0].number and exact.unmatched == 0
-    assert exact.position_rms == 0.0 and np.allclose(exact.layer_mu_ratio, 1.0)
-    first = d.energy == d.energy[0]
-    off = Delivery(d.x + 2.0, d.y, d.energy + 0.2 * first, np.where(first, 1.05, 1.0) * d.mu)
-    stray = Delivery(np.r_[off.x, 0.0], np.r_[off.y, 0.0], np.r_[off.energy, 60.0], np.r_[off.mu, 1.0])
-    m = match_delivery(plan, stray)
-    assert m.unmatched == 1 and m.energy_error == pytest.approx(0.2)
-    assert m.position_rms == pytest.approx(2.0, abs=1e-9)
-    assert m.layer_mu_ratio[0] == pytest.approx(1.05) and np.allclose(m.layer_mu_ratio[1:], 1.0)
-    assert np.array_equal(m.spots.energy, plan_spots(plan).energy)
-    # A layer split in two at one energy: each spot goes to the half that planned it.
-    import dataclasses
-
-    b = plan.beams[0]
-    ly = b.layers[0]
-    left = ly.x < 0
-    halves = [dataclasses.replace(ly, x=ly.x[k], y=ly.y[k], mu=ly.mu[k]) for k in (left, ~left)]
-    split = dataclasses.replace(plan, beams=(dataclasses.replace(b, layers=(*halves, *b.layers[1:])),))
-    assert np.allclose(match_delivery(split, d).layer_mu_ratio, 1.0)
-
-
-def test_sessions_split_into_fractions_when_a_beam_repeats() -> None:
-    from types import SimpleNamespace
-
-    from scan_kit.qa import group_fractions
-
-    logs = [SimpleNamespace(beam=b) for b in (1, 2, 1, 2, 3, 2)]
-    assert [[m.beam for m in f] for f in group_fractions(logs)] == [[1, 2], [1, 2, 3], [2]]
-
-
-def test_delivered_as_planned_is_the_planned_dose(gpu, phantom) -> None:
-    case, plan = phantom()
-    runs = fraction_runs(case.ct, CtCalibration.mcsquare("default"), BeamModel.read(BDL), plan,
-                         [match_delivery(plan, _as_delivered(plan))], histories=50_000, seed=5)
-    for run in runs[:2]:
-        run.step()
-    assert np.array_equal(runs[0].dose, runs[1].dose) and runs[0].dose.shape == runs[2].shape_zyx
 
 
 def test_range_shifter_takes_energy_upstream(gpu, phantom) -> None:

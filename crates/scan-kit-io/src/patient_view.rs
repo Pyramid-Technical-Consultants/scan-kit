@@ -43,7 +43,12 @@ pub(crate) fn scene(
     .parse::<u32>()
     .unwrap_or(10_000_000);
     let deliveries = deliveries(root, session_ids, &study);
-    let groups = group_fractions(&deliveries.iter().map(|hit| hit.beam).collect::<Vec<_>>());
+    let groups = group_fractions(
+        &deliveries
+            .iter()
+            .map(|hit| hit.matched.beam)
+            .collect::<Vec<_>>(),
+    );
     let mut names = vec!["Plan".into()];
     for index in 1..=groups.len() {
         names.push(index.to_string());
@@ -125,15 +130,7 @@ pub(crate) fn scene(
     let alpha_beta = pick(options, "alpha_beta", "2", AB_PAIRS)
         .parse::<f64>()
         .unwrap_or(DEFAULT_ALPHA_BETA);
-    let (spots, protons, beams) = records(
-        &study,
-        root,
-        fraction,
-        &deliveries,
-        &groups,
-        beam_filter,
-        bdl,
-    );
+    let (spots, protons, beams) = records(&study, fraction, &deliveries, &groups, beam_filter, bdl);
     let tables = mc_tables();
     let [nx, ny, nz] = study.ct.shape;
     let nvox = nx * ny * nz;
@@ -216,6 +213,44 @@ pub(crate) fn scene(
             format!("{:.1}%", result.uncertainty * 100.0),
         ]);
         rows.push(vec!["Left grid".into(), format!("{left:.1}%")]);
+    }
+    if fraction != "Plan" {
+        let chosen = fraction.parse::<usize>().unwrap_or(1).saturating_sub(1);
+        for hit in groups.get(chosen).into_iter().flatten() {
+            let delivery = &deliveries[*hit];
+            let matched = &delivery.matched;
+            let label = format!("Beam {} delivered", matched.beam + 1);
+            rows.push(vec![
+                label.clone(),
+                format!("{:.1} / {:.1} MU", matched.delivered_mu, matched.planned_mu),
+            ]);
+            rows.push(vec![
+                format!("{label} unmatched"),
+                matched.unmatched.to_string(),
+            ]);
+            rows.push(vec![
+                format!("{label} energy error"),
+                format!("{:.2} MeV", matched.energy_error),
+            ]);
+            rows.push(vec![
+                format!("{label} position RMS"),
+                format!("{:.2} mm", matched.position_rms),
+            ]);
+            let ratios: Vec<f32> = matched
+                .layer_mu_ratio
+                .iter()
+                .copied()
+                .filter(|value| value.is_finite())
+                .collect();
+            if !ratios.is_empty() {
+                let low = ratios.iter().copied().fold(f32::INFINITY, f32::min);
+                let high = ratios.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                rows.push(vec![
+                    format!("{label} MU ratio"),
+                    format!("{low:.2} – {high:.2}"),
+                ]);
+            }
+        }
     }
     let goals_text = goal_text(options, &study);
     for (id, structure) in study.structures.iter().enumerate() {
@@ -499,12 +534,49 @@ pub(crate) fn scene(
     }
 }
 
-struct Delivery {
-    session: String,
+/// One measured spot snapped to its planned layer: the layer's nominal energy
+/// and shifter settings, the measured isocenter-plane position, and the MU the
+/// chambers counted.
+struct MatchedSpot {
+    energy: f32,
+    x: f32,
+    y: f32,
+    mu: f32,
+    wet: f32,
+    distance: f32,
+}
+
+/// How one delivered beam strayed from its plan, in plan terms.
+struct DeliveryMatch {
     beam: usize,
+    spots: Vec<MatchedSpot>,
+    planned_mu: f32,
+    delivered_mu: f32,
+    unmatched: usize,
+    energy_error: f32,
+    position_rms: f32,
+    layer_mu_ratio: Vec<f32>,
+}
+
+struct Delivery {
+    matched: DeliveryMatch,
 }
 
 const ENERGY_TOL: f32 = 0.5;
+
+/// Plan spots at one nominal energy, in plan order. Control points that share
+/// an energy (split or repainted layers) join one group; the measured spot
+/// then finds its nearest planned spot inside it.
+fn energy_layers(beam: &scan_kit_dicom::Beam) -> Vec<(f32, Vec<usize>)> {
+    let mut layers: Vec<(f32, Vec<usize>)> = Vec::new();
+    for (index, spot) in beam.spots.iter().enumerate() {
+        match layers.iter_mut().find(|(energy, _)| *energy == spot.energy) {
+            Some((_, spots)) => spots.push(index),
+            None => layers.push((spot.energy, vec![index])),
+        }
+    }
+    layers
+}
 
 fn deliveries(root: &Path, sessions: &[String], study: &PatientStudy) -> Vec<Delivery> {
     sessions
@@ -512,38 +584,138 @@ fn deliveries(root: &Path, sessions: &[String], study: &PatientStudy) -> Vec<Del
         .filter_map(|session| {
             let table = spot_table(root, session);
             let energy = table.get("energy").cloned().unwrap_or_default();
-            let beam = best_beam(study, &energy)?;
-            Some(Delivery {
-                session: session.clone(),
-                beam,
-            })
+            if energy.is_empty() {
+                return None;
+            }
+            // Measured positions on the IC2 -> IC1 ray at the isocenter plane.
+            let (x, y) = super::volumetric::iso_positions(&table);
+            let mu = table
+                .get("ic1_dose")
+                .cloned()
+                .filter(|values| values.iter().any(|value| value.is_finite()))
+                .or_else(|| table.get("ic2_dose").cloned())
+                .unwrap_or_default();
+            let beam = pick_beam(&study.beams, &energy, &mu)?;
+            let matched = match_delivery(beam, &study.beams[beam], &energy, &x, &y, &mu);
+            Some(Delivery { matched })
         })
         .collect()
 }
 
-fn best_beam(study: &PatientStudy, energy: &[f32]) -> Option<usize> {
-    let mut best = None;
-    for (index, beam) in study.beams.iter().enumerate() {
+/// The beam whose layers explain the most delivered spots (then the closest
+/// total MU).
+fn pick_beam(beams: &[scan_kit_dicom::Beam], energy: &[f32], mu: &[f32]) -> Option<usize> {
+    let delivered_mu: f32 = mu.iter().filter(|value| value.is_finite()).copied().sum();
+    let mut best: Option<(usize, usize, f32)> = None;
+    for (index, beam) in beams.iter().enumerate() {
+        let energies = energy_layers(beam);
         let hits = energy
             .iter()
-            .filter(|value| nearest_spot(beam, **value).is_some())
+            .filter(|value| {
+                energies
+                    .iter()
+                    .any(|(layer, _)| (**value - layer).abs() <= ENERGY_TOL)
+            })
             .count();
-        if hits > 0 && best.is_none_or(|(_, count)| hits > count) {
-            best = Some((index, hits));
+        let planned_mu: f32 = beam.spots.iter().map(|spot| spot.mu).sum();
+        let mu_gap = (planned_mu - delivered_mu).abs();
+        if hits > 0
+            && best.is_none_or(|(_, count, gap)| hits > count || (hits == count && mu_gap < gap))
+        {
+            best = Some((index, hits, mu_gap));
         }
     }
-    best.map(|(index, _)| index)
+    best.map(|(index, _, _)| index)
 }
 
-fn nearest_spot(beam: &scan_kit_dicom::Beam, energy: f32) -> Option<&scan_kit_dicom::Spot> {
-    beam.spots
+/// Snap each measured spot to the plan layer nearest in energy, within
+/// tolerance. A matched spot transports with the layer's nominal energy and
+/// the nearest planned spot's range shifter settings; a spot no layer's energy
+/// reaches within `ENERGY_TOL`, or whose measured position or MU is missing,
+/// is dropped and counted as unmatched.
+fn match_delivery(
+    beam_index: usize,
+    beam: &scan_kit_dicom::Beam,
+    energy: &[f32],
+    x: &[f32],
+    y: &[f32],
+    mu: &[f32],
+) -> DeliveryMatch {
+    let layers = energy_layers(beam);
+    let mut delivered = vec![0.0f32; layers.len()];
+    let mut spots = Vec::new();
+    let mut unmatched = 0usize;
+    let mut energy_error = f32::NAN;
+    let mut misses = Vec::new();
+    for index in 0..energy.len() {
+        let (mx, my, mm) = (
+            x.get(index).copied().unwrap_or(f32::NAN),
+            y.get(index).copied().unwrap_or(f32::NAN),
+            mu.get(index).copied().unwrap_or(f32::NAN),
+        );
+        let nearest = layers
+            .iter()
+            .enumerate()
+            .map(|(layer, (e, _))| (layer, (energy[index] - e).abs()))
+            .min_by(|a, b| a.1.total_cmp(&b.1));
+        let usable = mx.is_finite() && my.is_finite() && mm.is_finite() && mm > 0.0;
+        match nearest {
+            Some((layer, gap)) if usable && gap <= ENERGY_TOL => {
+                let near = layers[layer]
+                    .1
+                    .iter()
+                    .map(|&spot| {
+                        let planned = &beam.spots[spot];
+                        (spot, (planned.x - mx).hypot(planned.y - my))
+                    })
+                    .min_by(|a, b| a.1.total_cmp(&b.1))
+                    .unwrap();
+                misses.push(near.1);
+                let planned = &beam.spots[near.0];
+                spots.push(MatchedSpot {
+                    energy: layers[layer].0,
+                    x: mx,
+                    y: my,
+                    mu: mm,
+                    wet: planned.wet_mm,
+                    distance: planned.shifter_distance_mm,
+                });
+                delivered[layer] += mm;
+                energy_error = if energy_error.is_nan() {
+                    gap
+                } else {
+                    energy_error.max(gap)
+                };
+            }
+            _ => unmatched += 1,
+        }
+    }
+    let layer_mu_ratio = layers
         .iter()
-        .filter(|spot| (spot.energy - energy).abs() <= ENERGY_TOL)
-        .min_by(|a, b| {
-            (a.energy - energy)
-                .abs()
-                .total_cmp(&(b.energy - energy).abs())
+        .enumerate()
+        .map(|(layer, (_, indices))| {
+            let planned: f32 = indices.iter().map(|&spot| beam.spots[spot].mu).sum();
+            if delivered[layer] > 0.0 {
+                delivered[layer] / planned
+            } else {
+                f32::NAN
+            }
         })
+        .collect();
+    DeliveryMatch {
+        beam: beam_index,
+        planned_mu: beam.spots.iter().map(|spot| spot.mu).sum(),
+        delivered_mu: spots.iter().map(|spot| spot.mu).sum(),
+        spots,
+        unmatched,
+        energy_error,
+        position_rms: if misses.is_empty() {
+            f32::NAN
+        } else {
+            (misses.iter().map(|d| d * d).sum::<f32>() / misses.len() as f32).sqrt()
+        },
+        layer_mu_ratio,
+    }
 }
 
 /// Beam deliveries in order. A beam that appears again starts the next fraction.
@@ -563,7 +735,6 @@ fn group_fractions(beams: &[usize]) -> Vec<Vec<usize>> {
 
 fn records(
     study: &PatientStudy,
-    root: &Path,
     fraction: &str,
     deliveries: &[Delivery],
     groups: &[Vec<usize>],
@@ -603,36 +774,20 @@ fn records(
         let chosen = fraction.parse::<usize>().unwrap_or(1).saturating_sub(1);
         for hit in groups.get(chosen).into_iter().flatten() {
             let delivery = &deliveries[*hit];
-            if beam_filter.is_some_and(|chosen| chosen != delivery.beam) {
+            if beam_filter.is_some_and(|chosen| chosen != delivery.matched.beam) {
                 continue;
             }
-            let beam = &study.beams[delivery.beam];
-            let table = spot_table(root, &delivery.session);
-            let energy = table.get("energy").cloned().unwrap_or_default();
-            let x = table.get("plan_x").cloned().unwrap_or_default();
-            let y = table.get("plan_y").cloned().unwrap_or_default();
-            let measured = table.get("ic1_dose").cloned().unwrap_or_default();
-            let target = table.get("target_mu").cloned().unwrap_or_default();
-            for i in 0..energy.len() {
-                let Some(plan_spot) = nearest_spot(beam, energy[i]) else {
-                    continue;
-                };
-                let mu = measured
-                    .get(i)
-                    .copied()
-                    .filter(|value| value.is_finite() && *value > 0.0)
-                    .or_else(|| target.get(i).copied())
-                    .unwrap_or(0.0);
+            for spot in &delivery.matched.spots {
                 push_spot(
                     &mut spots,
                     &mut protons,
-                    plan_spot.energy,
-                    x.get(i).copied().unwrap_or(plan_spot.x),
-                    y.get(i).copied().unwrap_or(plan_spot.y),
-                    mu,
-                    delivery.beam,
-                    plan_spot.wet_mm,
-                    plan_spot.shifter_distance_mm,
+                    spot.energy,
+                    spot.x,
+                    spot.y,
+                    spot.mu,
+                    delivery.matched.beam,
+                    spot.wet,
+                    spot.distance,
                     bdl,
                 );
             }
@@ -941,6 +1096,12 @@ mod tests {
         assert_eq!(group_fractions(&[0, 1]), vec![vec![0, 1]]);
         assert_eq!(group_fractions(&[0, 0]), vec![vec![0], vec![1]]);
         assert_eq!(group_fractions(&[0, 1, 0]), vec![vec![0, 1], vec![2]]);
+        // Beams 0,1,0,1,2,1: the beam-0 repeat opens fraction two, the beam-1
+        // repeat inside it opens a third holding only its own delivery.
+        assert_eq!(
+            group_fractions(&[0, 1, 0, 1, 2, 1]),
+            vec![vec![0, 1], vec![2, 3, 4], vec![5]]
+        );
     }
 
     #[test]
@@ -965,5 +1126,114 @@ mod tests {
         assert!(dose[1] > dose[0]);
         // Zero dose takes RBEmax but stays zero.
         assert_eq!(dose[2], 0.0);
+    }
+
+    fn plan_spot(energy: f32, x: f32, y: f32, mu: f32) -> scan_kit_dicom::Spot {
+        scan_kit_dicom::Spot {
+            energy,
+            x,
+            y,
+            mu,
+            shifter: String::new(),
+            wet_mm: 0.0,
+            shifter_distance_mm: 0.0,
+            spot_size_mm: 0.0,
+        }
+    }
+
+    fn plan_beam(spots: Vec<scan_kit_dicom::Spot>) -> scan_kit_dicom::Beam {
+        scan_kit_dicom::Beam {
+            number: 1,
+            name: "beam".into(),
+            gantry: 0.0,
+            couch: 0.0,
+            isocenter: [0.0; 3],
+            position: "HFS".into(),
+            meterset: spots.iter().map(|spot| spot.mu).sum(),
+            spots,
+        }
+    }
+
+    // Two layers: three spots at 100 MeV, two at 150.
+    fn plan() -> scan_kit_dicom::Beam {
+        plan_beam(vec![
+            plan_spot(100.0, -10.0, 0.0, 1.0),
+            plan_spot(100.0, 0.0, 0.0, 1.0),
+            plan_spot(100.0, 10.0, 0.0, 1.0),
+            plan_spot(150.0, -5.0, 5.0, 2.0),
+            plan_spot(150.0, 5.0, 5.0, 2.0),
+        ])
+    }
+
+    #[test]
+    fn an_exact_delivery_matches_every_layer() {
+        let beam = plan();
+        let energy: Vec<f32> = beam.spots.iter().map(|spot| spot.energy).collect();
+        let x: Vec<f32> = beam.spots.iter().map(|spot| spot.x).collect();
+        let y: Vec<f32> = beam.spots.iter().map(|spot| spot.y).collect();
+        let mu: Vec<f32> = beam.spots.iter().map(|spot| spot.mu).collect();
+        let matched = super::match_delivery(0, &beam, &energy, &x, &y, &mu);
+        assert_eq!(matched.unmatched, 0);
+        assert_eq!(matched.position_rms, 0.0);
+        assert_eq!(matched.energy_error, 0.0);
+        assert!(matched.layer_mu_ratio.iter().all(|r| *r == 1.0));
+        assert_eq!(matched.spots.len(), 5);
+        assert_eq!(matched.delivered_mu, matched.planned_mu);
+        // Matched spots carry the layer's nominal energy, not the measured one.
+        assert!(matched
+            .spots
+            .iter()
+            .map(|spot| spot.energy)
+            .eq([100.0, 100.0, 100.0, 150.0, 150.0]));
+    }
+
+    #[test]
+    fn a_shifted_delivery_reports_its_errors() {
+        let beam = plan();
+        let mut energy: Vec<f32> = beam.spots.iter().map(|spot| spot.energy).collect();
+        let mut x: Vec<f32> = beam.spots.iter().map(|spot| spot.x).collect();
+        let y: Vec<f32> = beam.spots.iter().map(|spot| spot.y).collect();
+        let mut mu: Vec<f32> = beam.spots.iter().map(|spot| spot.mu).collect();
+        for i in 0..3 {
+            energy[i] += 0.2;
+            x[i] += 2.0;
+            mu[i] *= 1.05;
+        }
+        for i in 3..5 {
+            x[i] += 2.0;
+        }
+        // A stray spot no layer reaches within 0.5 MeV.
+        energy.push(60.0);
+        x.push(0.0);
+        let mut y = y;
+        y.push(0.0);
+        mu.push(1.0);
+        let matched = super::match_delivery(0, &beam, &energy, &x, &y, &mu);
+        assert_eq!(matched.unmatched, 1);
+        assert!((matched.energy_error - 0.2).abs() < 1e-4);
+        assert!((matched.position_rms - 2.0).abs() < 1e-6);
+        assert!((matched.layer_mu_ratio[0] - 1.05).abs() < 1e-4);
+        assert!(matched.layer_mu_ratio[1..].iter().all(|r| *r == 1.0));
+    }
+
+    #[test]
+    fn a_spot_with_no_measured_mu_is_unmatched() {
+        let beam = plan();
+        let energy: Vec<f32> = beam.spots.iter().map(|spot| spot.energy).collect();
+        let x: Vec<f32> = beam.spots.iter().map(|spot| spot.x).collect();
+        let y: Vec<f32> = beam.spots.iter().map(|spot| spot.y).collect();
+        let mut mu: Vec<f32> = beam.spots.iter().map(|spot| spot.mu).collect();
+        mu[0] = 0.0;
+        let matched = super::match_delivery(0, &beam, &energy, &x, &y, &mu);
+        assert_eq!(matched.unmatched, 1);
+        assert!((matched.layer_mu_ratio[0] - 2.0 / 3.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn the_closer_mu_breaks_a_beam_tie() {
+        // Two beams share layer energies; the delivered MU sits nearer beam 1's plan.
+        let a = plan_beam(vec![plan_spot(100.0, 0.0, 0.0, 1.0)]);
+        let b = plan_beam(vec![plan_spot(100.0, 0.0, 0.0, 4.0)]);
+        assert_eq!(super::pick_beam(&[a, b], &[100.0], &[3.5]), Some(1));
     }
 }

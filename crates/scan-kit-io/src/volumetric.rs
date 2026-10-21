@@ -1540,7 +1540,11 @@ fn axis_iso_z(near: &[f32], far: &[f32], plan: &[f32]) -> Option<f32> {
     }
 }
 
-fn iso_positions(table: &std::collections::BTreeMap<String, Vec<f32>>) -> (Vec<f32>, Vec<f32>) {
+/// Measured spot positions projected to the isocenter plane on the IC2->IC1
+/// ray, for delivered-dose matching and the combined chamber view.
+pub(crate) fn iso_positions(
+    table: &std::collections::BTreeMap<String, Vec<f32>>,
+) -> (Vec<f32>, Vec<f32>) {
     let x2 = col(table, "ic2_x");
     let x1 = col(table, "ic1_x");
     let y2 = col(table, "ic2_y");
