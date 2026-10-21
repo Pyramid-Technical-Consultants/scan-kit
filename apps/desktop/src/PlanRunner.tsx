@@ -25,6 +25,7 @@ import {
   CardTitle,
 } from "@/components/ui/card";
 import { Field, FieldDescription, FieldLabel, FieldLegend, FieldSet } from "@/components/ui/field";
+import { DevicePicker } from "@/components/device-picker";
 import {
   InputGroup,
   InputGroupAddon,
@@ -412,30 +413,16 @@ export function PlanRunner() {
             </FieldLegend>
             <Field>
               <FieldLabel>RCI host</FieldLabel>
-              <InputGroup>
-                <InputGroupInput
-                  value={host}
-                  placeholder="192.168.100.184"
-                  disabled={connected}
-                  onChange={(event) => setHost(event.target.value)}
-                  onKeyDown={(event) => {
-                    if (event.key === "Enter") {
-                      void connect();
-                    }
-                  }}
-                />
-                <InputGroupAddon align="inline-end">
-                  <InputGroupButton
-                    variant="secondary"
-                    onClick={() => void connect()}
-                    disabled={busy || connected}
-                  >
-                    Connect
-                  </InputGroupButton>
-                </InputGroupAddon>
-              </InputGroup>
+              <DevicePicker
+                value={host}
+                onChange={setHost}
+                onConnect={() => void connect()}
+                disabled={connected}
+                busy={busy}
+              />
               <FieldDescription>
-                IP address or the controller URL, such as http://192.168.100.184/io/
+                IP address or the controller URL, such as http://192.168.100.184/io/ — or scan
+                the network to find a device.
               </FieldDescription>
             </Field>
             {connected ? (
