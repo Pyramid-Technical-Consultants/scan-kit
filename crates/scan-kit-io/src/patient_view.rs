@@ -1139,7 +1139,8 @@ impl Goal {
             .split_once(':')
             .ok_or_else(|| format!("not a goal: {text:?}"))?;
         let rest = rest.trim();
-        let boundary = rest.find(['<', '>'])
+        let boundary = rest
+            .find(['<', '>'])
             .ok_or_else(|| format!("not a goal: {text:?}"))?;
         let metric_text = rest[..boundary].trim();
         let metric = parse_metric(metric_text).ok_or_else(|| format!("not a goal: {text:?}"))?;
