@@ -3,8 +3,8 @@
 use std::path::Path;
 
 use scan_kit_core::{
-    dvh, gamma_index, index, rbe, DataTable, McJob, Panel, PatientRequest, PlotScene, RbeModel,
-    Volume, DEFAULT_ALPHA_BETA, RBE_CONSTANT,
+    dvh, gamma_index_norm, index, rbe, resample_linear, DataTable, McJob, Panel, PatientRequest,
+    PlotScene, RbeModel, Volume, DEFAULT_ALPHA_BETA, RBE_CONSTANT,
 };
 use scan_kit_dicom::{inside_structure, load_study, scanner_density, scanner_label, PatientStudy};
 use serde_json::Value;
@@ -175,20 +175,17 @@ pub(crate) fn scene(
         Some(model) if model.uses_let() && let_d.is_some() => Some(dose.values.clone()),
         _ => None,
     };
-    let rbe_factor = match rbe_model {
-        None => 1.0f32,
+    match rbe_model {
+        None => {}
         Some(RbeModel::Constant) => {
             for value in &mut dose.values {
                 *value *= RBE_CONSTANT as f32;
             }
-            RBE_CONSTANT as f32
         }
         Some(model) => {
             if let Some(letd) = let_d {
                 apply_rbe(model, &mut dose.values, letd, alpha_beta);
             }
-            // A physical TPS dose is scaled to Gy(RBE) at the clinical constant.
-            RBE_CONSTANT as f32
         }
     };
     // The RBE-weighted label only applies when the weighting actually ran.
@@ -253,6 +250,7 @@ pub(crate) fn scene(
         }
     }
     let goals_text = goal_text(options, &study);
+    let voxel_cc = study.ct.spacing.iter().product::<f32>() / 1000.0;
     for (id, structure) in study.structures.iter().enumerate() {
         if !structure_on(options, id, &structure.name) {
             continue;
@@ -281,34 +279,33 @@ pub(crate) fn scene(
             color: MARK,
             thickness: 1.5,
         });
-        let reference = study
-            .tps
-            .as_ref()
-            .map(|tps| {
-                tps.hu
-                    .iter()
-                    .zip(&mask)
-                    .filter_map(|(value, keep)| keep.then_some(*value))
-                    .fold(0.0f32, f32::max)
-            })
-            .filter(|value| *value > 0.0)
-            .map(|peak| peak * rbe_factor)
-            .unwrap_or_else(|| {
-                dose.values
-                    .iter()
-                    .zip(&mask)
-                    .filter_map(|(value, keep)| keep.then_some(*value))
-                    .fold(0.0f32, f32::max)
-            });
-        for (name, body) in parse_goals(&goals_text) {
-            if !structure.name.eq_ignore_ascii_case(&name) {
+        let structure_dvh = Dvh::of(&dose.values, &mask, voxel_cc);
+        let rx = study.prescription.is_finite().then_some(study.prescription);
+        for line in goals_text.lines() {
+            let goal = match Goal::parse(line) {
+                Ok(goal) => goal,
+                Err(_) => continue,
+            };
+            if !structure.name.eq_ignore_ascii_case(&goal.roi) {
                 continue;
             }
-            rows.push(vec![
-                structure.name.clone(),
-                eval_goal(&body, &dose.values, &mask, reference),
-            ]);
+            let body = match goal.check(&structure_dvh, rx) {
+                Ok((measured, pass)) => verdict(
+                    pass,
+                    format!("{} {measured:.2} {}", goal.metric_text, goal.unit),
+                ),
+                Err(err) => format!("fail {err}"),
+            };
+            rows.push(vec![structure.name.clone(), body]);
         }
+        rows.push(vec![
+            format!("{} mean", structure.name),
+            format!("{:.2} Gy", structure_dvh.mean()),
+        ]);
+        rows.push(vec![
+            format!("{} volume", structure.name),
+            format!("{:.1} cc", structure_dvh.volume_cc()),
+        ]);
         if let (Some(letd), Some(phys)) = (let_d, physical.as_ref()) {
             let mut dep = 0.0f64;
             let mut del = 0.0f64;
@@ -340,20 +337,50 @@ pub(crate) fn scene(
     if dvh_lines.is_empty() {
         dvh_lines.push(crate::workspace::dvh_line(&dose));
     }
-    let gamma = ran.as_ref().and_then(|result| {
+    let gamma = ran.as_ref().and_then(|_| {
         let tps = study.tps.as_ref()?;
-        if tps.shape != dose.shape || tps.hu.len() != result.volume.values.len() {
-            return None;
-        }
         let (dd, dta, cutoff) = gamma_criteria(options);
-        let (values, passed, scored) = gamma_index(
-            &tps.hu,
-            &dose.values,
-            dose.shape,
+        // The TPS dose for one fraction, searched in the MC dose resampled to
+        // its grid and expressed in the TPS dose's DoseType.
+        let reference = tps_per_fraction(&tps.hu, &tps.summation, study.fractions);
+        let norm = reference
+            .iter()
+            .copied()
+            .filter(|value| value.is_finite())
+            .fold(0.0f32, f32::max);
+        let scale = (if tps.dose_type.eq_ignore_ascii_case("effective") {
+            RBE_CONSTANT as f32
+        } else {
+            1.0
+        }) / (if effective { RBE_CONSTANT as f32 } else { 1.0 });
+        let same_grid = tps.shape == study.ct.shape
+            && tps.spacing == study.ct.spacing
+            && tps.origin == study.ct.origin;
+        let evaluated: Vec<f32> = if same_grid {
+            dose.values.iter().map(|value| value * scale).collect()
+        } else {
+            resample_linear(
+                &dose.values,
+                study.ct.origin,
+                study.ct.spacing,
+                study.ct.shape,
+                tps.origin,
+                tps.spacing,
+                tps.shape,
+            )
+            .into_iter()
+            .map(|value| value * scale)
+            .collect()
+        };
+        let (values, passed, scored) = gamma_index_norm(
+            &reference,
+            &evaluated,
+            tps.shape,
             dd,
             dta,
-            study.ct.spacing,
+            tps.spacing,
             cutoff,
+            norm,
         );
         let rate = if scored == 0 {
             0.0
@@ -361,9 +388,23 @@ pub(crate) fn scene(
             100.0 * passed as f32 / scored as f32
         };
         rows.push(vec!["Gamma".into(), format!("{rate:.0}%")]);
+        // The overlay draws on the dose grid; the score stays on the TPS grid.
+        let display = if same_grid {
+            values
+        } else {
+            resample_linear(
+                &values,
+                tps.origin,
+                tps.spacing,
+                tps.shape,
+                study.ct.origin,
+                study.ct.spacing,
+                study.ct.shape,
+            )
+        };
         Some((
             Volume {
-                values,
+                values: display,
                 ..dose.clone()
             },
             rate,
@@ -918,18 +959,6 @@ fn default_goals(study: &PatientStudy) -> String {
     }
 }
 
-fn parse_goals(text: &str) -> Vec<(String, String)> {
-    text.lines()
-        .filter_map(|line| {
-            let line = line.trim();
-            let (name, rest) = line.split_once(':')?;
-            let name = name.trim();
-            let rest = rest.trim();
-            (!name.is_empty() && !rest.is_empty()).then(|| (name.to_string(), rest.to_string()))
-        })
-        .collect()
-}
-
 fn gamma_control(
     id: &str,
     label: &str,
@@ -966,41 +995,285 @@ fn gamma_criteria(options: &Value) -> (f32, f32, f32) {
     )
 }
 
-fn eval_goal(body: &str, dose: &[f32], mask: &[bool], reference: f32) -> String {
-    let compact: String = body
-        .chars()
-        .filter(|c| !c.is_whitespace())
-        .collect::<String>()
-        .to_ascii_lowercase();
-    if let Some(rest) = compact.strip_prefix("dmax") {
-        let (op, rest) = split_cmp(rest);
-        let (limit, _) = take_number(rest);
-        let max = masked_max(dose, mask);
-        return verdict(compare(max, op, limit), format!("Dmax {max:.2} Gy"));
+const DVH_BINS: usize = 4096;
+
+/// Cumulative dose-volume histogram for one structure: `counts[i]` voxels sit
+/// in `edges[i]..edges[i+1]` Gy, `voxel_cc` is one voxel's volume.
+struct Dvh {
+    edges: Vec<f32>,
+    counts: Vec<f64>,
+    voxel_cc: f32,
+    dmax: f32,
+    dmin: f32,
+}
+
+impl Dvh {
+    /// Histogram of `dose` inside `mask`, bins up to the whole-volume peak.
+    fn of(dose: &[f32], mask: &[bool], voxel_cc: f32) -> Dvh {
+        let peak = dose.iter().copied().fold(0.0f32, f32::max);
+        let hi = if peak > 0.0 { peak * (1.0 + 1e-6) } else { 1.0 };
+        let edges: Vec<f32> = (0..=DVH_BINS)
+            .map(|i| hi * i as f32 / DVH_BINS as f32)
+            .collect();
+        let mut counts = vec![0.0f64; DVH_BINS];
+        let mut dmax = 0.0f32;
+        let mut dmin = f32::NAN;
+        for (value, keep) in dose.iter().zip(mask) {
+            if !keep {
+                continue;
+            }
+            let bin = ((*value / hi * DVH_BINS as f32) as usize).min(DVH_BINS - 1);
+            counts[bin] += 1.0;
+            dmax = dmax.max(*value);
+            dmin = if dmin.is_nan() {
+                *value
+            } else {
+                dmin.min(*value)
+            };
+        }
+        Dvh {
+            edges,
+            counts,
+            voxel_cc,
+            dmax,
+            dmin: if dmin.is_nan() { 0.0 } else { dmin },
+        }
     }
-    if let Some(rest) = compact.strip_prefix('v') {
-        let (gy, rest) = take_number(rest);
-        let rest = rest.trim_start_matches("gy");
-        let (op, rest) = split_cmp(rest);
-        let (pct, _) = take_number(rest);
-        let got = volume_above(dose, mask, gy) * 100.0;
-        return verdict(compare(got, op, pct), format!("V{gy:.0} {got:.0}%"));
+
+    fn voxels(&self) -> f64 {
+        self.counts.iter().sum()
     }
-    if let Some(rest) = compact.strip_prefix('d') {
-        let (vol, rest) = take_number(rest);
-        let rest = rest.trim_start_matches('%');
-        let (op, rest) = split_cmp(rest);
-        let (limit, unit) = take_number(rest);
-        let (edges, curve) = dvh(dose, mask, 32);
-        let got = dose_at_volume(&edges, &curve, vol / 100.0);
-        let want = if unit.contains("gy") {
-            limit
+
+    fn volume_cc(&self) -> f32 {
+        self.voxels() as f32 * self.voxel_cc
+    }
+
+    /// Volume fraction receiving at least `edges[i]`, one entry past the last.
+    fn cumulative(&self) -> Vec<f32> {
+        let n = (self.voxels() as f32).max(1.0);
+        let mut out = vec![0.0f32; self.edges.len()];
+        let mut acc = 0.0f64;
+        for i in (0..self.edges.len() - 1).rev() {
+            acc += self.counts[i];
+            out[i] = (acc / f64::from(n)) as f32;
+        }
+        out
+    }
+
+    fn mean(&self) -> f32 {
+        let n = (self.voxels() as f32).max(1.0);
+        let sum: f64 = self
+            .counts
+            .iter()
+            .enumerate()
+            .map(|(i, count)| 0.5 * f64::from(self.edges[i + 1] + self.edges[i]) * count)
+            .sum();
+        (sum / f64::from(n)) as f32
+    }
+
+    /// D at a volume fraction (0.95 for D95%): the dose that much of the
+    /// structure reaches.
+    fn dose_at(&self, fraction: f32) -> f32 {
+        if fraction <= 0.0 {
+            return self.dmax;
+        }
+        if fraction >= 1.0 {
+            return self.dmin;
+        }
+        dose_at_volume(&self.edges, &self.cumulative(), fraction)
+    }
+
+    fn dose_at_cc(&self, cc: f32) -> f32 {
+        if self.volume_cc() > 0.0 {
+            self.dose_at(cc / self.volume_cc())
         } else {
-            reference * limit / 100.0
-        };
-        return verdict(compare(got, op, want), format!("D{vol:.0}% {got:.2} Gy"));
+            0.0
+        }
     }
-    "unparsed".into()
+
+    /// V at `dose` Gy, as a fraction of the structure.
+    fn volume_at(&self, dose: f32) -> f32 {
+        let curve = self.cumulative();
+        let last = self.edges.len() - 1;
+        if dose <= self.edges[0] {
+            return curve[0];
+        }
+        if dose >= self.edges[last] {
+            return curve[last];
+        }
+        let span = (self.edges[last] - self.edges[0]).max(1e-9);
+        let pos = (dose - self.edges[0]) / span * last as f32;
+        let i = (pos.floor() as usize).min(last - 1);
+        let t = pos - i as f32;
+        curve[i] + t * (curve[i + 1] - curve[i])
+    }
+}
+
+/// One term of a clinical goal: `D95%`, `Dmax`, `D2cc`, `V20Gy`, `V50%`.
+#[derive(Clone, Copy)]
+enum GoalMetric {
+    Mean,
+    Max,
+    Min,
+    DoseAt(f32),
+    DoseCc(f32),
+    VolumeGy(f32),
+    VolumePct(f32),
+}
+
+/// A clinical goal like `PTV: D95% >= 95%`, `Cord: Dmax < 45 Gy` or
+/// `Lung: V20Gy < 30%`. Dose values in % are of the prescription; V goals in %
+/// are of the structure's volume.
+struct Goal {
+    roi: String,
+    metric: GoalMetric,
+    metric_text: String,
+    op: String,
+    value: f32,
+    unit: String,
+}
+
+impl Goal {
+    fn parse(text: &str) -> Result<Goal, String> {
+        let (roi, rest) = text
+            .split_once(':')
+            .ok_or_else(|| format!("not a goal: {text:?}"))?;
+        let rest = rest.trim();
+        let boundary = rest
+            .find(['<', '>'])
+            .ok_or_else(|| format!("not a goal: {text:?}"))?;
+        let metric_text = rest[..boundary].trim();
+        let metric = parse_metric(metric_text).ok_or_else(|| format!("not a goal: {text:?}"))?;
+        let rest = rest[boundary..].trim_start();
+        let (op, rest) = ["<=", ">=", "<", ">"]
+            .iter()
+            .find_map(|op| rest.strip_prefix(op).map(|rest| (*op, rest)))
+            .ok_or_else(|| format!("not a goal: {text:?}"))?;
+        let rest = rest.trim_start();
+        let (value, tail) = take_number(rest);
+        let mut unit = tail.trim().to_string();
+        if unit.is_empty() {
+            unit = if matches!(metric, GoalMetric::VolumeGy(_) | GoalMetric::VolumePct(_)) {
+                "%".into()
+            } else {
+                "Gy".into()
+            };
+        }
+        let unit = match unit.to_ascii_lowercase().as_str() {
+            "gy" => "Gy",
+            "%" => "%",
+            "cc" => "cc",
+            _ => return Err(format!("not a goal: {text:?}")),
+        };
+        let volume = matches!(metric, GoalMetric::VolumeGy(_) | GoalMetric::VolumePct(_));
+        if (volume && unit == "Gy") || (!volume && unit == "cc") {
+            return Err(format!(
+                "{text:?}: a {} goal can't be in {unit}",
+                if volume { "volume" } else { "dose" }
+            ));
+        }
+        Ok(Goal {
+            roi: roi.trim().to_string(),
+            metric,
+            metric_text: metric_text.to_string(),
+            op: op.to_string(),
+            value,
+            unit: unit.to_string(),
+        })
+    }
+
+    /// The metric in the goal's own unit.
+    fn measure(&self, dvh: &Dvh, rx: Option<f32>) -> Result<f32, String> {
+        let need_rx = || {
+            rx.filter(|value| value.is_finite() && *value > 0.0)
+                .ok_or_else(|| format!("{} needs the prescription dose", self.metric_text))
+        };
+        match self.metric {
+            GoalMetric::VolumeGy(level) => {
+                let frac = dvh.volume_at(level);
+                Ok(if self.unit == "cc" {
+                    frac * dvh.volume_cc()
+                } else {
+                    frac * 100.0
+                })
+            }
+            GoalMetric::VolumePct(pct) => {
+                let frac = dvh.volume_at(pct / 100.0 * need_rx()?);
+                Ok(if self.unit == "cc" {
+                    frac * dvh.volume_cc()
+                } else {
+                    frac * 100.0
+                })
+            }
+            _ => {
+                let gy = match self.metric {
+                    GoalMetric::Mean => dvh.mean(),
+                    GoalMetric::Max => dvh.dmax,
+                    GoalMetric::Min => dvh.dmin,
+                    GoalMetric::DoseCc(cc) => dvh.dose_at_cc(cc),
+                    GoalMetric::DoseAt(fraction) => dvh.dose_at(fraction),
+                    GoalMetric::VolumeGy(_) | GoalMetric::VolumePct(_) => unreachable!(),
+                };
+                Ok(if self.unit == "%" {
+                    100.0 * gy / need_rx()?
+                } else {
+                    gy
+                })
+            }
+        }
+    }
+
+    fn check(&self, dvh: &Dvh, rx: Option<f32>) -> Result<(f32, bool), String> {
+        let measured = self.measure(dvh, rx)?;
+        Ok((measured, compare(measured, &self.op, self.value)))
+    }
+}
+
+fn parse_metric(text: &str) -> Option<GoalMetric> {
+    let low = text.to_ascii_lowercase();
+    match low.as_str() {
+        "dmean" => return Some(GoalMetric::Mean),
+        "dmax" => return Some(GoalMetric::Max),
+        "dmin" => return Some(GoalMetric::Min),
+        _ => {}
+    }
+    if low.is_empty() {
+        return None;
+    }
+    let (kind, rest) = low.split_at(1);
+    let end = rest
+        .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .unwrap_or(rest.len());
+    let (number, unit) = rest.split_at(end);
+    let level: f32 = number.parse().ok()?;
+    match (kind, unit) {
+        ("d", "%") => Some(GoalMetric::DoseAt(level / 100.0)),
+        ("d", "cc") => Some(GoalMetric::DoseCc(level)),
+        ("v", "gy") => Some(GoalMetric::VolumeGy(level)),
+        ("v", "%") => Some(GoalMetric::VolumePct(level)),
+        _ => None,
+    }
+}
+
+/// Summation types covering every fraction (PS3.3 C.8.8.3): the dose divides
+/// by the fraction count. The *_SESSION types and CONTROL_POINT are per
+/// fraction already.
+const COURSE_SUMMATIONS: &[&str] = &[
+    "PLAN",
+    "MULTI_PLAN",
+    "PLAN_OVERVIEW",
+    "FRACTION",
+    "BEAM",
+    "BRACHY",
+];
+
+/// The TPS dose for one fraction.
+fn tps_per_fraction(dose: &[f32], summation: &str, fractions: i32) -> Vec<f32> {
+    let course = COURSE_SUMMATIONS
+        .iter()
+        .any(|kind| kind.eq_ignore_ascii_case(summation.trim()));
+    let scale = if course { fractions.max(1) as f32 } else { 1.0 };
+    dose.iter().map(|value| value / scale).collect()
 }
 
 /// Weight each voxel's physical dose by the variable-RBE model's LETd response.
@@ -1029,15 +1302,6 @@ fn dose_at_volume(edges: &[f32], curve: &[f32], fraction: f32) -> f32 {
     }
 }
 
-fn split_cmp(text: &str) -> (&str, &str) {
-    for op in [">=", "<=", ">", "<"] {
-        if let Some(rest) = text.strip_prefix(op) {
-            return (op, rest);
-        }
-    }
-    (">=", text)
-}
-
 fn take_number(text: &str) -> (f32, &str) {
     let end = text
         .find(|c: char| !(c.is_ascii_digit() || c == '.' || c == '-'))
@@ -1060,36 +1324,11 @@ fn verdict(passed: bool, detail: String) -> String {
     format!("{} {detail}", if passed { "pass" } else { "fail" })
 }
 
-fn masked_max(dose: &[f32], mask: &[bool]) -> f32 {
-    dose.iter()
-        .zip(mask)
-        .filter_map(|(value, keep)| keep.then_some(*value))
-        .fold(0.0f32, f32::max)
-}
-
-fn volume_above(dose: &[f32], mask: &[bool], gy: f32) -> f32 {
-    let mut hit = 0.0;
-    let mut total = 0.0;
-    for (value, keep) in dose.iter().zip(mask) {
-        if *keep {
-            total += 1.0;
-            if *value >= gy {
-                hit += 1.0;
-            }
-        }
-    }
-    if total == 0.0 {
-        0.0
-    } else {
-        hit / total
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use scan_kit_core::RbeModel;
 
-    use super::{apply_rbe, eval_goal, group_fractions, parse_goals};
+    use super::{apply_rbe, group_fractions, tps_per_fraction, Dvh, Goal};
 
     #[test]
     fn a_repeated_beam_starts_another_fraction() {
@@ -1108,13 +1347,45 @@ mod tests {
     fn a_flat_dose_meets_d95_and_fails_a_tight_maximum() {
         let dose = vec![2.0; 8];
         let mask = vec![true; 8];
-        let pass = eval_goal("D95% >= 95%", &dose, &mask, 2.0);
-        assert!(pass.starts_with("pass"), "{pass}");
-        let fail = eval_goal("Dmax < 1 Gy", &dose, &mask, 2.0);
-        assert!(fail.starts_with("fail"), "{fail}");
-        let volume = eval_goal("V20Gy < 30%", &dose, &mask, 2.0);
-        assert!(volume.starts_with("pass"), "{volume}");
-        assert_eq!(parse_goals("PTV: D95% >= 95%").len(), 1);
+        let dvh = Dvh::of(&dose, &mask, 0.001);
+        let check = |text: &str, rx| {
+            Goal::parse(text)
+                .and_then(|goal| goal.check(&dvh, rx))
+                .map(|(_, pass)| pass)
+        };
+        assert_eq!(check("PTV: D95% >= 95%", Some(2.0)), Ok(true));
+        assert_eq!(check("Cord: Dmax < 1 Gy", None), Ok(false));
+        assert_eq!(check("Lung: V20Gy < 30%", None), Ok(true));
+        // V just under the flat dose is the whole structure; V at it bins to the edge.
+        assert_eq!(check("PTV: V1.9Gy >= 99%", None), Ok(true));
+        assert_eq!(check("PTV: V2Gy >= 99%", None), Ok(false));
+        // Percent metrics read the prescription, cc metrics read the volume.
+        assert_eq!(check("PTV: Dmean >= 99%", Some(2.0)), Ok(true));
+        assert_eq!(check("PTV: Dmean >= 60 Gy", Some(2.0)), Ok(false));
+        let (got, _) = Goal::parse("PTV: V1.9Gy >= 0.008 cc")
+            .unwrap()
+            .check(&dvh, None)
+            .unwrap();
+        assert!((got - 0.008).abs() < 1e-6, "{got}");
+        // A % goal without a prescription reports the missing input.
+        assert!(Goal::parse("PTV: D95% >= 95%")
+            .unwrap()
+            .check(&dvh, None)
+            .is_err());
+        // The grammar's own rules: unit mismatches and malformed lines.
+        assert!(Goal::parse("PTV: V20Gy < 30 Gy").is_err());
+        assert!(Goal::parse("PTV: Dmax < 45 cc").is_err());
+        assert!(Goal::parse("no goal here").is_err());
+    }
+
+    #[test]
+    fn a_course_summation_divides_by_the_fractions() {
+        let dose = vec![30.0f32; 4];
+        assert_eq!(tps_per_fraction(&dose, "FRACTION", 30), vec![1.0; 4]);
+        assert_eq!(tps_per_fraction(&dose, "PLAN", 30), vec![1.0; 4]);
+        // One fraction's dose and an unknown summation pass through unchanged.
+        assert_eq!(tps_per_fraction(&dose, "FRACTION_SESSION", 30), dose);
+        assert_eq!(tps_per_fraction(&dose, "", 30), dose);
     }
 
     #[test]
