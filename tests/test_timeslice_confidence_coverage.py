@@ -7,7 +7,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from scan_kit.common.timeslice_confidence_coverage import (
+from scan_kit.common.timeslice_gaussian_fit_filter_coverage import (
     compute_session_confidence_coverage,
     resolve_timeslice_confidence_coverage_source,
 )
