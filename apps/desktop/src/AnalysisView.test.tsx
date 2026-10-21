@@ -502,14 +502,21 @@ it("hides an unchecked session and keeps the other session's color", async () =>
     first?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     await new Promise((resolve) => setTimeout(resolve, 200));
   });
-  const calls = vi
-    .mocked(invoke)
-    .mock.calls.filter(([command]) => command === "scan_kit_start")
-    .map(([, args]) => args as { sessionIds: string[]; palette: number[][] });
-  const last = calls[calls.length - 1];
-  expect(last?.sessionIds).toEqual(["b"]);
+  const calls = () =>
+    vi
+      .mocked(invoke)
+      .mock.calls.filter(([command]) => command === "scan_kit_start")
+      .map(([, args]) => args as { sessionIds: string[]; palette: number[][] });
+  // scan_kit_start sits behind a 150 ms debounce; poll until the toggle's
+  // call lands instead of racing a fixed sleep.
+  await vi.waitFor(() => {
+    const latest = calls();
+    expect(latest[latest.length - 1]?.sessionIds).toEqual(["b"]);
+  });
+  const latest = calls();
+  const last = latest[latest.length - 1];
+  const original = latest[0]?.palette[1];
   const kept = last?.palette[0];
-  const original = calls[0]?.palette[1];
   expect(kept).toEqual(original);
 });
 
@@ -588,8 +595,17 @@ it("adds and removes a segment through the plot options", async () => {
       .mocked(invoke)
       .mock.calls.filter(([command]) => command === "scan_kit_start")
       .map(([, args]) => args as { options?: { segments?: string } });
-  const dropped = JSON.parse(starts()[starts().length - 1]?.options?.segments ?? "null") as { kind: string }[];
-  expect(dropped.map((item) => item.kind)).toEqual(["beam"]);
+  const kinds = () => {
+    const latest = starts();
+    return (
+      JSON.parse(latest[latest.length - 1]?.options?.segments ?? "null") as { kind: string }[]
+    ).map((item) => item.kind);
+  };
+  // scan_kit_start sits behind a 150 ms debounce; poll until the click's
+  // call lands instead of racing a fixed sleep.
+  await vi.waitFor(() => {
+    expect(kinds()).toEqual(["beam"]);
+  });
   const add = [...host.querySelectorAll("button")].find(
     (button) => button.getAttribute("aria-label") === "Add segment",
   );
@@ -597,8 +613,9 @@ it("adds and removes a segment through the plot options", async () => {
     add?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     await new Promise((resolve) => setTimeout(resolve, 200));
   });
-  const restored = JSON.parse(starts()[starts().length - 1]?.options?.segments ?? "null") as { kind: string }[];
-  expect(restored.map((item) => item.kind)).toEqual(["beam", "rank"]);
+  await vi.waitFor(() => {
+    expect(kinds()).toEqual(["beam", "rank"]);
+  });
 });
 
 it("keeps the playback bar on one row and arms it from the checkbox", async () => {
@@ -735,8 +752,10 @@ it("plays the timeslice window without reloading each step", async () => {
     bar?.querySelector("[data-slot='checkbox']")?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     await new Promise((resolve) => setTimeout(resolve, 400));
   });
+  await vi.waitFor(() => {
+    expect(starts()).toBeGreaterThan(1);
+  });
   const armed = starts();
-  expect(armed).toBeGreaterThan(1);
   expect(followPlot).toHaveBeenCalledWith(true, 0, 0, true);
 
   const queued: FrameRequestCallback[] = [];
@@ -888,9 +907,11 @@ it("switches analytic and Monte Carlo with radio groups", async () => {
   await act(async () => {
     await new Promise((resolve) => setTimeout(resolve, 200));
   });
-  const starts = vi.mocked(invoke).mock.calls.filter(([name]) => name === "scan_kit_start");
-  const last = starts[starts.length - 1]?.[1] as { options?: { model?: string } } | undefined;
-  expect(last?.options?.model).toBe("mc");
+  await vi.waitFor(() => {
+    const starts = vi.mocked(invoke).mock.calls.filter(([name]) => name === "scan_kit_start");
+    const last = starts[starts.length - 1]?.[1] as { options?: { model?: string } } | undefined;
+    expect(last?.options?.model).toBe("mc");
+  });
   const pressed = [...host.querySelectorAll("button")].find((node) =>
     node.textContent?.includes("Monte Carlo"),
   );
@@ -1032,8 +1053,10 @@ it("does not queue another calculation for the choice already showing", async ()
     await new Promise((resolve) => setTimeout(resolve, 200));
   });
   const starts = () => vi.mocked(invoke).mock.calls.filter(([name]) => name === "scan_kit_start").length;
+  await vi.waitFor(() => {
+    expect(starts()).toBeGreaterThan(0);
+  });
   const before = starts();
-  expect(before).toBeGreaterThan(0);
   const analytic = [...host.querySelectorAll("button")].find((node) =>
     node.textContent?.includes("Analytic"),
   );
@@ -1213,8 +1236,10 @@ it("changes color gain without rebuilding the dose", async () => {
       await new Promise((resolve) => setTimeout(resolve, 200));
     });
     const starts = () => vi.mocked(invoke).mock.calls.filter(([name]) => name === "scan_kit_start").length;
+    await vi.waitFor(() => {
+      expect(starts()).toBeGreaterThan(0);
+    });
     const before = starts();
-    expect(before).toBeGreaterThan(0);
     expect(paintPlot).toHaveBeenCalled();
     paintPlot.mockClear();
     await act(async () => {
