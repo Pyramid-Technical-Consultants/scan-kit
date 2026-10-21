@@ -202,6 +202,9 @@ pub struct PatientRequest {
     pub dose_to_water: bool,
     /// MCsquare's medium LETd. Off leaves `McResult::let_d` empty.
     pub score_let: bool,
+    /// LETd in water at unit density (EPTN) instead of the medium. Needs
+    /// `score_let`; it is what the variable-RBE models were fitted to.
+    pub let_water: bool,
 }
 
 #[derive(Clone, Debug)]

@@ -335,7 +335,9 @@ fn patient_launch(request: &PatientRequest) -> Result<Launch, ComputeError> {
         spots: kept_spots,
         protons,
         mode: 1,
-        flags: u32::from(request.dose_to_water) | (u32::from(request.score_let) * 2),
+        flags: u32::from(request.dose_to_water)
+            | (u32::from(request.score_let) * 2)
+            | (u32::from(request.let_water) * 4),
         origin_cm: request.origin_mm.map(|mm| mm / 10.0),
         spacing_cm: spacing,
         shape: request.shape,
@@ -1218,6 +1220,7 @@ mod tests {
             seed: 1,
             dose_to_water: true,
             score_let: true,
+            let_water: false,
         };
         match run_mc(&McJob::Patient(request)) {
             Err(ComputeError::NoAdapter) => {}

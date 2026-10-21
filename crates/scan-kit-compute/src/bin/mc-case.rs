@@ -125,6 +125,10 @@ fn patient_job(request: &Value, dir: &Path) -> Result<McJob, String> {
             .and_then(Value::as_bool)
             .unwrap_or(true),
         score_let: true,
+        let_water: request
+            .get("let_water")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
     }))
 }
 

@@ -11,6 +11,7 @@ mod geometry;
 mod plan;
 mod plot;
 mod ramp;
+mod rbe;
 mod runner;
 mod schema;
 mod segment;
@@ -44,6 +45,7 @@ pub use plot::{
     DataTable, Panel, PlotRect, PlotScene, Series, SessionDose, VolumeMark,
 };
 pub use ramp::{choices, index, is_session, resolve, sample, session, Family, SESSION, VIRIDIS};
+pub use rbe::{rbe, rbe_limits, RbeModel, DEFAULT_ALPHA_BETA, RBE_CONSTANT, UNKELBACH_C};
 pub use runner::{
     control_button, default_session_zip_path, device_file_url, field_subscribe_key, io_bool,
     io_number, io_text, io_url, normalize_host, parse_host, runner_view, session_download_hint,
