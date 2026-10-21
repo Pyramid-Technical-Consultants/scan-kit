@@ -65,7 +65,6 @@ _app_datas = [(str(_assets_dir), "scan_kit/assets")]
 _scan_kit_hiddenimports = collect_submodules("scan_kit.data")
 _scan_kit_hiddenimports += collect_submodules("scan_kit.views")
 _scan_kit_hiddenimports += collect_submodules("scan_kit.common")
-_scan_kit_hiddenimports += collect_submodules("scan_kit.igx")
 _fsspec_hiddenimports = collect_submodules("fsspec")
 _paramiko_hiddenimports = collect_submodules("paramiko")
 _smb_hiddenimports = collect_submodules("smbprotocol")

@@ -8,6 +8,7 @@ mod beam;
 mod bins;
 mod columns;
 mod config;
+mod device_scan;
 mod discover;
 mod histogram;
 mod location;
@@ -209,6 +210,11 @@ const TOOLS: &[ToolSpec] = &[
     ToolSpec {
         name: "scan_kit_runner_remember",
         summary: "Remember the folder used to browse plan and session files.",
+        kind: ToolKind::Granular,
+    },
+    ToolSpec {
+        name: "scan_kit_discover_subnet",
+        summary: "Scan a CIDR subnet for reachable IGX devices.",
         kind: ToolKind::Granular,
     },
 ];
@@ -463,6 +469,14 @@ pub fn tool_input_schema(name: &str) -> Value {
             "required": ["file_dir"],
             "additionalProperties": false
         }),
+        "scan_kit_discover_subnet" => json!({
+            "type": "object",
+            "properties": {
+                "subnet": { "type": "string" }
+            },
+            "required": ["subnet"],
+            "additionalProperties": false
+        }),
         _ => json!({ "type": "object", "additionalProperties": false }),
     }
 }
@@ -669,6 +683,10 @@ pub fn invoke(name: &str, input: &Value) -> Result<Value, InvokeError> {
             let db = database_path(input)?;
             let dir = required_str(input, "file_dir")?;
             runner::remember_dir(&db, dir).map_err(InvokeError::Message)
+        }
+        "scan_kit_discover_subnet" => {
+            let subnet = required_str(input, "subnet")?;
+            device_scan::scan_subnet(subnet).map_err(InvokeError::Message)
         }
         _ => Err(InvokeError::UnknownTool {
             name: name.to_owned(),

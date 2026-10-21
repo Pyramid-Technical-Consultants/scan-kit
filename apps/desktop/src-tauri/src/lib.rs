@@ -43,6 +43,7 @@ forward!(scan_kit_runner_upload(path: String));
 forward!(scan_kit_runner_control(action: String));
 forward!(scan_kit_runner_download(dest: String));
 forward!(scan_kit_runner_remember(file_dir: String));
+forward!(scan_kit_discover_subnet(subnet: String));
 
 #[tauri::command]
 fn version() -> &'static str {
@@ -412,6 +413,7 @@ pub fn run() {
             scan_kit_runner_control,
             scan_kit_runner_download,
             scan_kit_runner_remember,
+            scan_kit_discover_subnet,
             scan_kit_reveal
         ])
         .run(tauri::generate_context!())

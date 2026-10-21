@@ -709,6 +709,13 @@ fn http_json(host: &str, path: &str) -> Option<Value> {
     http_json_file(host, path, "value.json")
 }
 
+/// JSON read on a short deadline, for subnet discovery probes.
+pub(crate) fn http_json_timed(host: &str, path: &str, timeout: Duration) -> Option<Value> {
+    let url = io_url(host, path, "value.json").ok()?;
+    let body = http_tuned(&url, "GET", None, timeout, timeout).ok()?;
+    serde_json::from_slice(&body).ok()
+}
+
 pub(crate) fn http_json_file(host: &str, path: &str, file_name: &str) -> Option<Value> {
     let url = io_url(host, path, file_name).ok()?;
     let body = http(&url, "GET", None).ok()?;
@@ -722,6 +729,23 @@ fn http_put(host: &str, device_path: &str, body: &[u8]) -> Result<(), String> {
 }
 
 pub(crate) fn http(url: &str, method: &str, body: Option<&[u8]>) -> Result<Vec<u8>, String> {
+    http_tuned(
+        url,
+        method,
+        body,
+        Duration::from_secs(3),
+        Duration::from_secs(30),
+    )
+}
+
+/// `http` with caller-set connect and read deadlines, for fast probes.
+pub(crate) fn http_tuned(
+    url: &str,
+    method: &str,
+    body: Option<&[u8]>,
+    connect_timeout: Duration,
+    read_timeout: Duration,
+) -> Result<Vec<u8>, String> {
     let rest = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
     let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
     let path = format!("/{path}");
@@ -731,9 +755,9 @@ pub(crate) fn http(url: &str, method: &str, body: Option<&[u8]>) -> Result<Vec<u
         .next()
         .ok_or_else(|| format!("invalid host: {authority}"))?;
     let mut stream =
-        TcpStream::connect_timeout(&addr, Duration::from_secs(3)).map_err(|err| err.to_string())?;
-    stream.set_read_timeout(Some(Duration::from_secs(30))).ok();
-    stream.set_write_timeout(Some(Duration::from_secs(30))).ok();
+        TcpStream::connect_timeout(&addr, connect_timeout).map_err(|err| err.to_string())?;
+    stream.set_read_timeout(Some(read_timeout)).ok();
+    stream.set_write_timeout(Some(read_timeout)).ok();
     let mut head = format!(
         "{method} {path} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\nAccept: */*\r\n"
     );
