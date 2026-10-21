@@ -422,6 +422,7 @@ export function AnalysisView({
   const [quiet, setQuiet] = useState<string | null>(null);
   const [studyPath, setStudyPath] = useState<string | null>(null);
   const [study, setStudy] = useState<string | null>(null);
+  const [scanners, setScanners] = useState<{ label: string; folder: string }[]>([]);
   const [size, setSize] = useState({ width: 960, height: 640 });
   const shown = (meta?.panels.length ?? 0) > 0;
   const viewRef = useRef(viewId);
@@ -437,6 +438,17 @@ export function AnalysisView({
     },
     [viewId],
   );
+
+  useEffect(() => {
+    if (viewId !== "volumetric") {
+      return;
+    }
+    void invoke<{ scanners: { label: string; folder: string }[] }>("scan_kit_scanners", {
+      action: "list",
+    })
+      .then((listed) => setScanners(listed.scanners))
+      .catch(() => setScanners([]));
+  }, [viewId]);
 
   const requestDraw = () => {
     if (frame.current !== 0) {
@@ -695,6 +707,7 @@ export function AnalysisView({
     hiddenKey,
     sceneKey,
     studyPath ?? "",
+    scanners,
     plotHost,
   ]);
   const requestKey = JSON.stringify([pictureKey, lineEpoch]);
@@ -731,6 +744,7 @@ export function AnalysisView({
       }
       if (viewId === "volumetric" && studyPath != null) {
         plotOptions.study = studyPath;
+        plotOptions.scanners = JSON.stringify(scanners);
       }
       if (lineToken.current !== "") {
         plotOptions._lines = lineToken.current;
@@ -869,7 +883,7 @@ export function AnalysisView({
         }
       });
     };
-  }, [viewId, folder, orderKey, hiddenKey, sceneKey, studyPath, lineEpoch, plotHost, requestKey]);
+  }, [viewId, folder, orderKey, hiddenKey, sceneKey, studyPath, scanners, lineEpoch, plotHost, requestKey]);
 
   useEffect(() => {
     if (viewId === "volumetric") {
@@ -1380,9 +1394,62 @@ export function AnalysisView({
             Close Study
           </Button>
         ) : null}
+        {viewId === "volumetric" ? (
+          <Button
+            variant="outline"
+            onClick={() => {
+              void open({ directory: true, title: "MCsquare scanner folder" }).then(
+                (selected) => {
+                  if (typeof selected !== "string") {
+                    return;
+                  }
+                  void invoke<{ scanners: { label: string; folder: string }[] }>(
+                    "scan_kit_scanners",
+                    { action: "add", folder: selected },
+                  )
+                    .then((listed) => setScanners(listed.scanners))
+                    .catch((reason: unknown) => notifyError(reason));
+                },
+              );
+            }}
+          >
+            Register scanner
+          </Button>
+        ) : null}
         {viewId === "volumetric" && study != null && table != null && table.rows.length > 0 ? (
           <Button variant="outline" onClick={() => exportStudyReport(table)}>
             Export report
+          </Button>
+        ) : null}
+        {viewId === "volumetric" && studyPath != null ? (
+          <Button
+            variant="outline"
+            onClick={() => {
+              void open({
+                defaultPath: "dose.dcm",
+                filters: [{ name: "DICOM dose", extensions: ["dcm"] }],
+              }).then((selected) => {
+                if (typeof selected !== "string") {
+                  return;
+                }
+                void invoke("scan_kit_write_dose", {
+                  path: folder,
+                  sessionIds: shownSessionIds(
+                    sessions.map((session) => session.id),
+                    hidden,
+                  ),
+                  options: {
+                    ...optionsRef.current,
+                    study: studyPath,
+                    scanners: JSON.stringify(scanners),
+                  },
+                  dest: selected,
+                  description: "scan-kit MC",
+                }).catch((reason: unknown) => notifyError(reason));
+              });
+            }}
+          >
+            Export dose
           </Button>
         ) : null}
         {study != null ? <pre className="text-muted-foreground text-xs whitespace-pre-wrap">{study}</pre> : null}
