@@ -9,7 +9,7 @@ from pathlib import Path
 
 import numpy as np
 
-from ..dicom.dose import DISCLAIMER
+DISCLAIMER = "scan-kit research dose, not for clinical use"
 
 
 def _table(head, rows) -> str:

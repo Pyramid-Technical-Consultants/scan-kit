@@ -11,11 +11,18 @@ use serde_json::{json, Value};
 
 use scan_kit_plot::{Plot, PlotInput};
 
-const TOOLS: &[ToolSpec] = &[ToolSpec {
-    name: "scan_kit_run_view",
-    summary: "Build an analysis view and return one RGBA frame plus its controls.",
-    kind: ToolKind::Workflow,
-}];
+const TOOLS: &[ToolSpec] = &[
+    ToolSpec {
+        name: "scan_kit_run_view",
+        summary: "Build an analysis view and return one RGBA frame plus its controls.",
+        kind: ToolKind::Workflow,
+    },
+    ToolSpec {
+        name: "scan_kit_write_dose",
+        summary: "Run the patient Monte Carlo and write the dose as an RTDOSE with provenance.",
+        kind: ToolKind::Workflow,
+    },
+];
 
 pub fn tools() -> &'static [ToolSpec] {
     TOOLS
@@ -37,6 +44,18 @@ pub fn tool_input_schema(name: &str) -> Value {
                 "palette": { "type": "array", "items": { "type": "array", "items": { "type": "number" } } }
             },
             "required": ["view", "path", "session_ids"],
+            "additionalProperties": false
+        }),
+        "scan_kit_write_dose" => json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string" },
+                "session_ids": { "type": "array", "items": { "type": "string" } },
+                "options": { "type": "object" },
+                "dest": { "type": "string" },
+                "description": { "type": "string" }
+            },
+            "required": ["path", "session_ids", "dest"],
             "additionalProperties": false
         }),
         _ => json!({ "type": "object", "additionalProperties": false }),
@@ -65,6 +84,25 @@ pub fn invoke(name: &str, input: &Value) -> Result<Value, String> {
                 background,
                 foreground,
                 &palette,
+            )
+        }
+        "scan_kit_write_dose" => {
+            let path = text(input, "path")?;
+            let session_ids = strings(input, "session_ids")?;
+            let options = input.get("options").cloned().unwrap_or_else(|| json!({}));
+            let dest = text(input, "dest")?;
+            let description = input
+                .get("description")
+                .and_then(Value::as_str)
+                .unwrap_or("scan-kit MC");
+            scan_kit_io::patient_view::dose_export(
+                Path::new(path),
+                &session_ids,
+                &options,
+                dest,
+                description,
+                &crate::mc::adapter_info(),
+                &|job| crate::mc::run_mc(job).map_err(|err| err.to_string()),
             )
         }
         _ => Err(format!("unknown tool {name}")),

@@ -44,6 +44,7 @@ forward!(scan_kit_runner_control(action: String));
 forward!(scan_kit_runner_download(dest: String));
 forward!(scan_kit_runner_remember(file_dir: String));
 forward!(scan_kit_discover_subnet(subnet: String));
+forward!(scan_kit_scanners(action: String, folder: Option<String>));
 
 #[tauri::command]
 fn version() -> &'static str {
@@ -109,6 +110,31 @@ fn scan_kit_run_view(
         foreground,
         &palette,
     )
+}
+
+/// Run the patient transport and write the dose as an RTDOSE.
+#[tauri::command]
+async fn scan_kit_write_dose(
+    path: String,
+    session_ids: Vec<String>,
+    options: Value,
+    dest: String,
+    description: Option<String>,
+) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        scan_kit_compute::invoke(
+            "scan_kit_write_dose",
+            &serde_json::json!({
+                "path": path,
+                "session_ids": session_ids,
+                "options": options,
+                "dest": dest,
+                "description": description,
+            }),
+        )
+    })
+    .await
+    .map_err(|err| err.to_string())?
 }
 
 /// Start a progressive task. The webview polls it and draws each payload itself.
@@ -414,6 +440,8 @@ pub fn run() {
             scan_kit_runner_download,
             scan_kit_runner_remember,
             scan_kit_discover_subnet,
+            scan_kit_scanners,
+            scan_kit_write_dose,
             scan_kit_reveal
         ])
         .run(tauri::generate_context!())

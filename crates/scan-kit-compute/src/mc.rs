@@ -83,6 +83,20 @@ struct Launch {
     voxel_mm: f32,
 }
 
+/// GPU identity for dose provenance — `scan_kit.gpu.adapter_info`.
+pub fn adapter_info() -> String {
+    block_on(async {
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions::default())
+            .await
+            .ok()?;
+        let info = adapter.get_info();
+        Some(format!("{} / {:?}", info.name, info.backend))
+    })
+    .unwrap_or_default()
+}
+
 pub fn run_mc(job: &McJob) -> Result<McResult, ComputeError> {
     let mut run = McRun::open(job)?;
     match run.poll(Duration::MAX, &Cancel::new()) {

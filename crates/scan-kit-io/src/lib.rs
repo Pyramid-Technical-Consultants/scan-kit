@@ -6,6 +6,7 @@
 mod analysis;
 mod beam;
 mod bins;
+pub mod calibration;
 mod columns;
 mod config;
 mod device_scan;
@@ -14,7 +15,7 @@ mod histogram;
 mod location;
 mod marks;
 mod mc_tables;
-mod patient_view;
+pub mod patient_view;
 mod phantom;
 mod remote;
 mod runner;
@@ -215,6 +216,11 @@ const TOOLS: &[ToolSpec] = &[
     ToolSpec {
         name: "scan_kit_discover_subnet",
         summary: "Scan a CIDR subnet for reachable IGX devices.",
+        kind: ToolKind::Granular,
+    },
+    ToolSpec {
+        name: "scan_kit_scanners",
+        summary: "List, register, or remove MCsquare CT-calibration scanner folders.",
         kind: ToolKind::Granular,
     },
 ];
@@ -477,6 +483,16 @@ pub fn tool_input_schema(name: &str) -> Value {
             "required": ["subnet"],
             "additionalProperties": false
         }),
+        "scan_kit_scanners" => json!({
+            "type": "object",
+            "properties": {
+                "db": { "type": "string" },
+                "action": { "type": "string", "enum": ["list", "add", "remove"] },
+                "folder": { "type": "string" }
+            },
+            "required": ["action"],
+            "additionalProperties": false
+        }),
         _ => json!({ "type": "object", "additionalProperties": false }),
     }
 }
@@ -688,10 +704,50 @@ pub fn invoke(name: &str, input: &Value) -> Result<Value, InvokeError> {
             let subnet = required_str(input, "subnet")?;
             device_scan::scan_subnet(subnet).map_err(InvokeError::Message)
         }
+        "scan_kit_scanners" => {
+            let db = database_path(input)?;
+            let action = required_str(input, "action")?;
+            scanners(&db, action, input.get("folder").and_then(Value::as_str))
+                .map_err(InvokeError::Message)
+        }
         _ => Err(InvokeError::UnknownTool {
             name: name.to_owned(),
         }),
     }
+}
+
+fn scanners(db: &Path, action: &str, folder: Option<&str>) -> Result<Value, String> {
+    store::with_store(db, |conn| {
+        match action {
+            "add" => {
+                let folder = folder.ok_or("scanner folder required")?;
+                let calibration = calibration::CtCalibration::resolve(folder)?;
+                let mut list = store::scanners(conn)?;
+                if !list.iter().any(|(_, existing)| existing == folder) {
+                    list.push((calibration.name.clone(), folder.to_owned()));
+                }
+                store::set_scanners(conn, &list)?;
+            }
+            "remove" => {
+                let folder = folder.ok_or("scanner folder required")?;
+                let list: Vec<(String, String)> = store::scanners(conn)?
+                    .into_iter()
+                    .filter(|(_, existing)| existing != folder)
+                    .collect();
+                store::set_scanners(conn, &list)?;
+            }
+            "list" => {}
+            other => return Err(format!("unknown scanners action {other}")),
+        }
+        let mut entries = Vec::new();
+        for (label, folder) in store::scanners(conn)? {
+            let digest = calibration::CtCalibration::resolve(&folder)
+                .map(|calibration| calibration.digest())
+                .unwrap_or_default();
+            entries.push(json!({ "label": label, "folder": folder, "digest": digest }));
+        }
+        Ok(json!({ "scanners": entries }))
+    })
 }
 
 /// Copy the connected session into `dest`, calling `keep` after each file.

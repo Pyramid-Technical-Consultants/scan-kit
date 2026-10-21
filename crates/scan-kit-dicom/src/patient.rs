@@ -1,7 +1,7 @@
 //! CT, RTSTRUCT, RT Ion Plan, and RTDOSE. One frame of reference, or the load fails.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 const DENSITY: &str =
     include_str!("../../../scan_kit/assets/mcsquare/Scanners/default/HU_Density_Conversion.txt");
@@ -21,6 +21,14 @@ pub struct CtVolume {
     pub dose_type: String,
     /// RTDOSE DoseSummationType (3004,000A); empty on a CT volume.
     pub summation: String,
+    /// Patient/study identity of the source study; RTDOSE written against the
+    /// CT repeats it so the dose lands in the same study.
+    pub patient_id: String,
+    pub patient_name: String,
+    pub study_uid: String,
+    /// Series UID and per-slice SOP UIDs of the source CT, for provenance.
+    pub series_uid: String,
+    pub sop_uids: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -80,6 +88,11 @@ pub struct PatientStudy {
     pub structures: Vec<Structure>,
     pub tps: Option<CtVolume>,
     pub prescription: f32,
+    /// SOP Instance UID and label of the RTPLAN the beams came from, if any.
+    pub plan_uid: String,
+    pub plan_label: String,
+    /// SOP Instance UID of the RTSTRUCT the structures came from, if any.
+    pub structures_uid: String,
 }
 
 struct Elem {
@@ -95,6 +108,12 @@ pub fn load_study(path: &Path) -> Result<PatientStudy, String> {
     let mut summation = String::new();
     let mut plan = None;
     let mut structures = Vec::new();
+    let mut patient_id = String::new();
+    let mut patient_name = String::new();
+    let mut study_uid = String::new();
+    let mut series_uid = String::new();
+    let mut sop_uids = Vec::new();
+    let mut structures_uid = String::new();
     for item in fs::read_dir(path).map_err(|err| err.to_string())? {
         let file = item.map_err(|err| err.to_string())?.path();
         let bytes = fs::read(&file).unwrap_or_default();
@@ -105,12 +124,23 @@ pub fn load_study(path: &Path) -> Result<PatientStudy, String> {
         let class = text_tag(&elems, tag(0x0008, 0x0016));
         let frame = text_tag(&elems, tag(0x0020, 0x0052));
         if class.contains("1.2.840.10008.5.1.4.1.1.2") {
+            if patient_id.is_empty() {
+                patient_id = text_tag(&elems, tag(0x0010, 0x0020));
+                patient_name = text_tag(&elems, tag(0x0010, 0x0010));
+                study_uid = text_tag(&elems, tag(0x0020, 0x000D));
+                series_uid = text_tag(&elems, tag(0x0020, 0x000E));
+            }
+            sop_uids.push(text_tag(&elems, tag(0x0008, 0x0018)));
             for slice in image_slices(&elems, 1.0)? {
                 ct_slices.push((frame.clone(), slice));
             }
         } else if class.contains("1.2.840.10008.5.1.4.1.1.481.8") {
-            plan = Some(read_plan(&elems, frame)?);
+            let sop_uid = text_tag(&elems, tag(0x0008, 0x0018));
+            let mut parsed = read_plan(&elems, frame)?;
+            parsed.sop_uid = sop_uid;
+            plan = Some(parsed);
         } else if class.contains("1.2.840.10008.5.1.4.1.1.481.3") {
+            structures_uid = text_tag(&elems, tag(0x0008, 0x0018));
             structures = read_structures(&elems);
         } else if class.contains("1.2.840.10008.5.1.4.1.1.481.2") {
             let scale = float_tag(&elems, tag(0x3004, 0x000E)).unwrap_or(1.0);
@@ -130,16 +160,27 @@ pub fn load_study(path: &Path) -> Result<PatientStudy, String> {
     if frame.is_empty() || ct_slices.iter().any(|(got, _)| got != &frame) {
         return Err("CT slices do not share one frame of reference".into());
     }
-    let (beams, fractions, prescription, plan_frame) =
-        plan.unwrap_or((Vec::new(), 1, f32::NAN, frame.clone()));
-    if plan_frame != frame {
+    let plan = plan.unwrap_or(Plan {
+        beams: Vec::new(),
+        fractions: 1,
+        prescription: f32::NAN,
+        frame: frame.clone(),
+        sop_uid: String::new(),
+        label: String::new(),
+    });
+    if plan.frame != frame {
         return Err("the plan frame of reference does not match the CT".into());
     }
     if dose_slices.iter().any(|(got, _)| got != &frame) {
         return Err("the dose frame of reference does not match the CT".into());
     }
     let mut slices: Vec<_> = ct_slices.into_iter().map(|(_, slice)| slice).collect();
-    let ct = stack(&mut slices)?;
+    let mut ct = stack(&mut slices)?;
+    ct.patient_id = patient_id;
+    ct.patient_name = patient_name;
+    ct.study_uid = study_uid;
+    ct.series_uid = series_uid;
+    ct.sop_uids = sop_uids;
     let tps = if dose_slices.is_empty() {
         None
     } else {
@@ -152,11 +193,14 @@ pub fn load_study(path: &Path) -> Result<PatientStudy, String> {
     Ok(PatientStudy {
         frame,
         ct,
-        beams,
-        fractions,
+        beams: plan.beams,
+        fractions: plan.fractions,
         structures,
         tps,
-        prescription,
+        prescription: plan.prescription,
+        plan_uid: plan.sop_uid,
+        plan_label: plan.label,
+        structures_uid,
     })
 }
 
@@ -451,13 +495,26 @@ fn image_slices(elems: &[Elem], scale: f32) -> Result<Vec<Slice>, String> {
     if rows == 0 || cols == 0 || origin.len() < 3 || spacing.len() < 2 {
         return Err("CT geometry is incomplete".into());
     }
-    let stored: Vec<f32> = pixels
-        .bytes
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|chunk| (u16::from_le_bytes(*chunk) as f32 * slope + intercept) * scale)
-        .collect();
+    let bits = int_tag(elems, tag(0x0028, 0x0100)).unwrap_or(16);
+    let stored: Vec<f32> = if bits > 16 {
+        pixels
+            .bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|chunk| {
+                (u32::from_le_bytes(*chunk) as f64 * slope as f64 + intercept as f64) as f32 * scale
+            })
+            .collect()
+    } else {
+        pixels
+            .bytes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|chunk| (u16::from_le_bytes(*chunk) as f32 * slope + intercept) * scale)
+            .collect()
+    };
     let plane = rows * cols;
     if stored.len() < plane {
         return Err("pixel data is short".into());
@@ -510,10 +567,24 @@ fn stack(slices: &mut [Slice]) -> Result<CtVolume, String> {
         position: "HFS".into(),
         dose_type: String::new(),
         summation: String::new(),
+        patient_id: String::new(),
+        patient_name: String::new(),
+        study_uid: String::new(),
+        series_uid: String::new(),
+        sop_uids: Vec::new(),
     })
 }
 
-fn read_plan(elems: &[Elem], frame: String) -> Result<(Vec<Beam>, i32, f32, String), String> {
+struct Plan {
+    beams: Vec<Beam>,
+    fractions: i32,
+    prescription: f32,
+    frame: String,
+    sop_uid: String,
+    label: String,
+}
+
+fn read_plan(elems: &[Elem], frame: String) -> Result<Plan, String> {
     let mut setups = Vec::new();
     for item in seq(elems, tag(0x300A, 0x0180)) {
         setups.push((
@@ -653,7 +724,14 @@ fn read_plan(elems: &[Elem], frame: String) -> Result<(Vec<Beam>, i32, f32, Stri
             spots,
         });
     }
-    Ok((beams, fractions, f32::NAN, frame))
+    Ok(Plan {
+        beams,
+        fractions,
+        prescription: f32::NAN,
+        frame,
+        sop_uid: String::new(),
+        label: text_tag(elems, tag(0x300A, 0x0002)),
+    })
 }
 
 fn read_structures(elems: &[Elem]) -> Vec<Structure> {
@@ -1027,6 +1105,193 @@ pub(crate) fn sq(bytes: &mut Vec<u8>, group: u16, element: u16, items: &[Vec<u8>
     push_elem(bytes, group, element, b"SQ", &body);
 }
 
+fn ul(bytes: &mut Vec<u8>, group: u16, element: u16, value: u32) {
+    push_elem(bytes, group, element, b"UL", &value.to_le_bytes());
+}
+
+fn ob(bytes: &mut Vec<u8>, group: u16, element: u16, data: &[u8]) {
+    push_elem(bytes, group, element, b"OB", data);
+}
+
+fn lt(bytes: &mut Vec<u8>, group: u16, element: u16, text: &str) {
+    push_elem(bytes, group, element, b"LT", &even(text));
+}
+
+fn at(bytes: &mut Vec<u8>, group: u16, element: u16, at_group: u16, at_element: u16) {
+    let mut value = at_group.to_le_bytes().to_vec();
+    value.extend_from_slice(&at_element.to_le_bytes());
+    push_elem(bytes, group, element, b"AT", &value);
+}
+
+fn ow32(bytes: &mut Vec<u8>, group: u16, element: u16, values: &[u32]) {
+    let raw: Vec<u8> = values
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect();
+    push_elem(bytes, group, element, b"OW", &raw);
+}
+
+const RT_DOSE_CLASS: &str = "1.2.840.10008.5.1.4.1.1.481.2";
+const RT_ION_PLAN_CLASS: &str = "1.2.840.10008.5.1.4.1.1.481.8";
+const EXPLICIT_LE: &str = "1.2.840.10008.1.2.1";
+/// scan-kit's implementation root — a fixed uuid5, like pydicom's root.
+const IMPL_UID: &str = "2.25.89062982513270078006766796370322763075";
+const DOSE_DISCLAIMER: &str = "scan-kit research dose, not for clinical use";
+
+/// A DICOM UID: the 2.25 arc (uuid-as-integer) over clock + pid + counter.
+fn uid() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .map(|span| span.as_nanos())
+        .unwrap_or(0);
+    let raw = nanos.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        ^ ((std::process::id() as u128) << 96)
+        ^ NEXT.fetch_add(1, Ordering::Relaxed) as u128;
+    format!("2.25.{raw}")
+}
+
+/// YYYYMMDD and HHMMSS from the wall clock, for instance/content timestamps.
+fn stamp() -> (String, String) {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .map(|span| span.as_secs())
+        .unwrap_or(0);
+    let days = (secs / 86_400) as i64;
+    let tod = secs % 86_400;
+    // Civil date from day count (Hinnant).
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if month <= 2 { y + 1 } else { y };
+    (
+        format!("{year:04}{month:02}{day:02}"),
+        format!("{:02}{:02}{:02}", tod / 3_600, tod % 3_600 / 60, tod % 60),
+    )
+}
+
+/// Write `dose` (Gy, `(nz, ny, nx)` row-major on the CT grid) as an RTDOSE in
+/// the CT's study and frame of reference — `scan_kit.dicom.dose.write_dose`.
+/// `comment` carries the provenance JSON; `plan_uid` adds a plan reference.
+/// `dose_type` is PHYSICAL or EFFECTIVE — EFFECTIVE marks an RBE-weighted dose.
+pub fn write_rtdose(
+    path: &Path,
+    dose: &[f32],
+    ct: &CtVolume,
+    plan_uid: &str,
+    summation: &str,
+    dose_type: &str,
+    description: &str,
+    comment: &str,
+) -> Result<PathBuf, String> {
+    let [nx, ny, nz] = ct.shape;
+    if dose.len() != nx * ny * nz {
+        return Err(format!(
+            "dose is {} voxels, the grid wants {}",
+            dose.len(),
+            nx * ny * nz
+        ));
+    }
+    if ct.frame.is_empty() {
+        return Err("the dose grid and CT are in different frames of reference".into());
+    }
+    let peak = dose.iter().fold(0.0f64, |peak, &v| {
+        peak.max(if v.is_nan() { 0.0 } else { v as f64 })
+    });
+    let scale = if peak > 0.0 { peak / 4.0e9 } else { 1.0 };
+    let pixels: Vec<u32> = dose
+        .iter()
+        .map(|&v| {
+            let value = if v.is_nan() { 0.0 } else { v as f64 };
+            (value.max(0.0) / scale).round_ties_even() as u32
+        })
+        .collect();
+    let sop_uid = uid();
+    let (date, time) = stamp();
+
+    let mut bytes = preamble();
+    let mut meta = Vec::new();
+    ob(&mut meta, 0x0002, 0x0001, &[0, 1]);
+    ui(&mut meta, 0x0002, 0x0002, RT_DOSE_CLASS);
+    ui(&mut meta, 0x0002, 0x0003, &sop_uid);
+    ui(&mut meta, 0x0002, 0x0010, EXPLICIT_LE);
+    ui(&mut meta, 0x0002, 0x0012, IMPL_UID);
+    sh(&mut meta, 0x0002, 0x0013, "SCAN-KIT");
+    ul(&mut bytes, 0x0002, 0x0000, meta.len() as u32);
+    bytes.extend_from_slice(&meta);
+
+    push_elem(&mut bytes, 0x0008, 0x0012, b"DA", &even(&date));
+    push_elem(&mut bytes, 0x0008, 0x0013, b"TM", &even(&time));
+    ui(&mut bytes, 0x0008, 0x0016, RT_DOSE_CLASS);
+    ui(&mut bytes, 0x0008, 0x0018, &sop_uid);
+    push_elem(&mut bytes, 0x0008, 0x0023, b"DA", &even(&date));
+    push_elem(&mut bytes, 0x0008, 0x0033, b"TM", &even(&time));
+    cs(&mut bytes, 0x0008, 0x0060, "RTDOSE");
+    lo(&mut bytes, 0x0008, 0x0070, "Pyramid Technical Consultants");
+    let series_description = format!("{description} (research only)");
+    lo(
+        &mut bytes,
+        0x0008,
+        0x103E,
+        &series_description[..series_description.len().min(64)],
+    );
+    pn(&mut bytes, 0x0010, 0x0010, &ct.patient_name);
+    lo(&mut bytes, 0x0010, 0x0020, &ct.patient_id);
+    ds(&mut bytes, 0x0018, 0x0050, &[ct.spacing[2]]);
+    lo(
+        &mut bytes,
+        0x0018,
+        0x1020,
+        &format!("scan-kit {}", env!("CARGO_PKG_VERSION")),
+    );
+    ui(&mut bytes, 0x0020, 0x000D, &ct.study_uid);
+    ui(&mut bytes, 0x0020, 0x000E, &uid());
+    ds(&mut bytes, 0x0020, 0x0032, &ct.origin);
+    ds(&mut bytes, 0x0020, 0x0037, &[1.0, 0.0, 0.0, 0.0, 1.0, 0.0]);
+    ui(&mut bytes, 0x0020, 0x0052, &ct.frame);
+    lt(&mut bytes, 0x0020, 0x4000, comment);
+    us(&mut bytes, 0x0028, 0x0002, 1);
+    cs(&mut bytes, 0x0028, 0x0004, "MONOCHROME2");
+    is(&mut bytes, 0x0028, 0x0008, nz as i32);
+    at(&mut bytes, 0x0028, 0x0009, 0x3004, 0x000C);
+    us(&mut bytes, 0x0028, 0x0010, ny as u16);
+    us(&mut bytes, 0x0028, 0x0011, nx as u16);
+    ds(&mut bytes, 0x0028, 0x0030, &[ct.spacing[1], ct.spacing[0]]);
+    us(&mut bytes, 0x0028, 0x0100, 32);
+    us(&mut bytes, 0x0028, 0x0101, 32);
+    us(&mut bytes, 0x0028, 0x0102, 31);
+    us(&mut bytes, 0x0028, 0x0103, 0);
+    cs(&mut bytes, 0x3004, 0x0002, "GY");
+    cs(&mut bytes, 0x3004, 0x0004, dose_type);
+    lt(&mut bytes, 0x3004, 0x0006, DOSE_DISCLAIMER);
+    cs(&mut bytes, 0x3004, 0x000A, summation);
+    let offsets: Vec<f32> = (0..nz).map(|k| k as f32 * ct.spacing[2]).collect();
+    ds(&mut bytes, 0x3004, 0x000C, &offsets);
+    push_elem(
+        &mut bytes,
+        0x3004,
+        0x000E,
+        b"DS",
+        &even(&format!("{scale:.10e}")),
+    );
+    if !plan_uid.is_empty() {
+        let mut item = Vec::new();
+        ui(&mut item, 0x0008, 0x1150, RT_ION_PLAN_CLASS);
+        ui(&mut item, 0x0008, 0x1155, plan_uid);
+        sq(&mut bytes, 0x300C, 0x0060, &[item]);
+    }
+    ow32(&mut bytes, 0x7FE0, 0x0010, &pixels);
+    fs::write(path, &bytes).map_err(|err| err.to_string())?;
+    Ok(path.to_path_buf())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1133,20 +1398,122 @@ mod tests {
 
     #[test]
     fn an_in_range_shifter_keeps_its_wet_and_a_second_one_fails() {
-        let (beams, _, _, _) =
-            read_plan(&plan_with_shifter(&[(1, "IN", Some(40.0))]), "f".into()).unwrap();
-        let spot = &beams[0].spots[0];
+        let plan = read_plan(&plan_with_shifter(&[(1, "IN", Some(40.0))]), "f".into()).unwrap();
+        let spot = &plan.beams[0].spots[0];
         assert_eq!(spot.shifter, "RS1");
         assert!((spot.wet_mm - 40.0).abs() < 1e-3);
         assert!((spot.shifter_distance_mm - 300.0).abs() < 1e-3);
         let bare = read_plan(&plan_with_shifter(&[(1, "IN", None)]), "f".into()).unwrap();
-        assert!(bare.0[0].spots[0].wet_mm.is_nan());
+        assert!(bare.beams[0].spots[0].wet_mm.is_nan());
         assert!(read_plan(
             &plan_with_shifter(&[(1, "IN", Some(40.0)), (2, "IN", Some(20.0))]),
             "f".into()
         )
         .is_err());
         assert!(read_plan(&plan_with_shifter(&[(3, "IN", Some(40.0))]), "f".into()).is_err());
+    }
+
+    #[test]
+    fn rtdose_round_trips_through_the_reader() {
+        let dir = std::env::temp_dir().join(format!("scan-kit-rtdose-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let ct = CtVolume {
+            frame: "1.2.3.4.5".into(),
+            origin: [10.0, 20.0, -5.0],
+            spacing: [2.0, 3.0, 4.0],
+            shape: [4, 3, 2],
+            hu: Vec::new(),
+            position: "HFS".into(),
+            dose_type: String::new(),
+            summation: String::new(),
+            patient_id: "P42".into(),
+            patient_name: "Doe^Jane".into(),
+            study_uid: "1.2.3".into(),
+            series_uid: "1.2.3.1".into(),
+            sop_uids: vec!["1.2.3.1.1".into(), "1.2.3.1.2".into()],
+        };
+        let dose: Vec<f32> = (0..24).map(|i| i as f32 * 0.5).collect();
+        let path = write_rtdose(
+            &dir.join("dose.dcm"),
+            &dose,
+            &ct,
+            "9.8.7.6",
+            "FRACTION",
+            "PHYSICAL",
+            "test dose",
+            r#"{"beam":"a"}"#,
+        )
+        .unwrap();
+        let bytes = fs::read(&path).unwrap();
+        assert_eq!(&bytes[128..132], b"DICM");
+        let elems = parse_dataset(&bytes[132..]).unwrap();
+        assert_eq!(text_tag(&elems, tag(0x0008, 0x0016)), RT_DOSE_CLASS);
+        assert_eq!(text_tag(&elems, tag(0x0008, 0x0060)), "RTDOSE");
+        assert_eq!(text_tag(&elems, tag(0x0010, 0x0020)), "P42");
+        assert_eq!(text_tag(&elems, tag(0x0010, 0x0010)), "Doe^Jane");
+        assert_eq!(text_tag(&elems, tag(0x0020, 0x000D)), "1.2.3");
+        assert_eq!(text_tag(&elems, tag(0x0020, 0x0052)), "1.2.3.4.5");
+        assert_eq!(text_tag(&elems, tag(0x3004, 0x0002)), "GY");
+        assert_eq!(text_tag(&elems, tag(0x3004, 0x0004)), "PHYSICAL");
+        assert_eq!(text_tag(&elems, tag(0x3004, 0x000A)), "FRACTION");
+        assert_eq!(text_tag(&elems, tag(0x3004, 0x0006)), DOSE_DISCLAIMER);
+        assert_eq!(text_tag(&elems, tag(0x0020, 0x4000)), r#"{"beam":"a"}"#);
+        assert_eq!(text_tag(&elems, tag(0x0028, 0x0008)), "2");
+        let plan_item = &seq(&elems, tag(0x300C, 0x0060))[0];
+        assert_eq!(text_tag(plan_item, tag(0x0008, 0x1150)), RT_ION_PLAN_CLASS);
+        assert_eq!(text_tag(plan_item, tag(0x0008, 0x1155)), "9.8.7.6");
+        // The dose reader reconstructs Gy from the scaled u32 pixels.
+        let scale = float_tag(&elems, tag(0x3004, 0x000E)).unwrap();
+        assert!(scale > 0.0);
+        let slices = image_slices(&elems, scale).unwrap();
+        assert_eq!(slices.len(), 2);
+        assert!((slices[1].origin[2] - (-1.0)).abs() < 1e-3);
+        for (z, slice) in slices.iter().enumerate() {
+            for (i, &got) in slice.values.iter().enumerate() {
+                let index = i + 12 * z;
+                // One stored count plus the DS/f32 scaling precision.
+                assert!(
+                    (got - dose[index]).abs() <= dose[index].abs() * 1e-5 + scale,
+                    "voxel {index}: {got} vs {}",
+                    dose[index]
+                );
+            }
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rtdose_rejects_a_wrong_sized_dose() {
+        let ct = CtVolume {
+            frame: "f".into(),
+            origin: [0.0; 3],
+            spacing: [1.0; 3],
+            shape: [2, 2, 2],
+            hu: Vec::new(),
+            position: String::new(),
+            dose_type: String::new(),
+            summation: String::new(),
+            patient_id: String::new(),
+            patient_name: String::new(),
+            study_uid: String::new(),
+            series_uid: String::new(),
+            sop_uids: Vec::new(),
+        };
+        assert!(write_rtdose(
+            Path::new("x"),
+            &[0.0; 4],
+            &ct,
+            "",
+            "PLAN",
+            "PHYSICAL",
+            "d",
+            ""
+        )
+        .is_err());
+        let out = std::env::temp_dir().join(format!("scan-kit-rtdose-bad-{}", std::process::id()));
+        assert!(write_rtdose(&out, &[0.0; 8], &ct, "", "PLAN", "PHYSICAL", "d", "").is_ok());
+        let _ = fs::remove_file(&out);
     }
 
     fn plan_with_shifter(settings: &[(i32, &str, Option<f32>)]) -> Vec<Elem> {

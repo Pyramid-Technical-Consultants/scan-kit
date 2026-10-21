@@ -11,7 +11,16 @@ const BDL_DN: &str = include_str!("../../../scan_kit/assets/mcsquare/BDL/BDL_def
 const BDL_DN_RS: &str =
     include_str!("../../../scan_kit/assets/mcsquare/BDL/BDL_default_DN_RangeShifter.txt");
 
-fn bdl_text(name: &str) -> &'static str {
+pub(crate) fn bdl_name(name: &str) -> &'static str {
+    match name {
+        "un" => "BDL_default_UN",
+        "dn" => "BDL_default_DN",
+        "dn_rs" => "BDL_default_DN_RangeShifter",
+        _ => "BDL_default_UN_RangeShifter",
+    }
+}
+
+pub(crate) fn bdl_text(name: &str) -> &'static str {
     match name {
         "un" => BDL_UN,
         "dn" => BDL_DN,

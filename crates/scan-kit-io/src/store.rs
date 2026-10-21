@@ -243,6 +243,34 @@ fn set_runner_pref(conn: &Connection, key: &str, value: &str) -> Result<(), Stri
     prefs_set(conn, PREF_APP_SETTINGS, &Value::Object(settings))
 }
 
+/// User-registered MCsquare scanner folders, `[{label, folder}]`.
+pub fn scanners(conn: &Connection) -> Result<Vec<(String, String)>, String> {
+    let settings = prefs_get(conn, PREF_APP_SETTINGS)?.unwrap_or_else(|| json!({}));
+    Ok(settings
+        .get("scanners")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| {
+            let label = entry.get("label").and_then(Value::as_str)?;
+            let folder = entry.get("folder").and_then(Value::as_str)?;
+            Some((label.to_owned(), folder.to_owned()))
+        })
+        .collect())
+}
+
+pub fn set_scanners(conn: &Connection, scanners: &[(String, String)]) -> Result<(), String> {
+    let mut settings = prefs_get(conn, PREF_APP_SETTINGS)?
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    let list: Vec<Value> = scanners
+        .iter()
+        .map(|(label, folder)| json!({ "label": label, "folder": folder }))
+        .collect();
+    settings.insert("scanners".to_owned(), Value::Array(list));
+    prefs_set(conn, PREF_APP_SETTINGS, &Value::Object(settings))
+}
+
 pub fn set_note(conn: &Connection, root: &str, session_id: &str, text: &str) -> Result<(), String> {
     let lib_id = ensure_library(conn, root)?;
     import_legacy(conn, lib_id, Path::new(root))?;

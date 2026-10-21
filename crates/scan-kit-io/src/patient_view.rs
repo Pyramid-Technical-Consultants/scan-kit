@@ -3,32 +3,70 @@
 use std::path::Path;
 
 use scan_kit_core::{
-    dvh, gamma_index_norm, index, rbe, resample_linear, DataTable, McJob, Panel, PatientRequest,
-    PlotScene, RbeModel, Volume, DEFAULT_ALPHA_BETA, RBE_CONSTANT,
+    dvh, gamma_index_norm, index, rbe, resample_linear, DataTable, McJob, McResult, Panel,
+    PatientRequest, PlotScene, RbeModel, Volume, DEFAULT_ALPHA_BETA, RBE_CONSTANT,
 };
-use scan_kit_dicom::{inside_structure, load_study, scanner_density, scanner_label, PatientStudy};
-use serde_json::Value;
+use scan_kit_dicom::{inside_structure, load_study, write_rtdose, PatientStudy};
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 use super::beam::{beam_record_bdl, protons_per_mu_bdl, spot_record_bdl};
-use super::marks::pick;
-use super::mc_tables::mc_tables;
+use super::calibration::CtCalibration;
+use super::marks::{pick, pick_in, text};
 use super::tables::spot_table;
 use super::volumetric::McRunner;
 
 const MARK: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
 const SEED: u32 = 1;
 
-pub(crate) fn scene(
+/// Everything `options` resolves into for a patient run: the loaded study,
+/// the fraction/delivery selection, the calibration, and the dose model.
+struct PatientInputs {
+    study: PatientStudy,
+    segment: &'static str,
+    fraction: String,
+    deliveries: Vec<Delivery>,
+    groups: Vec<Vec<usize>>,
+    names: Vec<String>,
+    beam_filter: Option<usize>,
+    bdl: &'static str,
+    histories: u32,
+    calibration: CtCalibration,
+    rbe_model: Option<RbeModel>,
+    rbe_key: &'static str,
+    alpha_beta: f64,
+    scanner: String,
+    registered: Vec<(String, String)>,
+}
+
+const RBE_PAIRS: &[(&str, &str)] = &[
+    ("1", "1.0"),
+    ("1.1", "1.1"),
+    ("mcnamara", "McNamara 2015"),
+    ("wedenberg", "Wedenberg 2013"),
+    ("carabe", "Carabe 2012"),
+    ("unkelbach", "Unkelbach 2016"),
+];
+const AB_PAIRS: &[(&str, &str)] = &[
+    ("1.5", "1.5 Gy"),
+    ("2", "2 Gy"),
+    ("3", "3 Gy"),
+    ("5", "5 Gy"),
+    ("10", "10 Gy"),
+];
+const SCANNER_PAIRS: &[(&str, &str)] = &[
+    ("default", "Default"),
+    ("water", "Water"),
+    ("solid", "Solid water"),
+];
+
+fn patient_inputs(
     root: &Path,
     session_ids: &[String],
     options: &Value,
-    mc: Option<McRunner<'_>>,
-) -> PlotScene {
+) -> Result<PatientInputs, String> {
     let path = options.get("study").and_then(Value::as_str).unwrap_or("");
-    let study = match load_study(Path::new(path)) {
-        Ok(study) => study,
-        Err(err) => return note_scene(&err),
-    };
+    let study = load_study(Path::new(path))?;
     let histories = pick(
         options,
         "histories",
@@ -75,7 +113,8 @@ pub(crate) fn scene(
         "Plan"
     } else {
         "1"
-    };
+    }
+    .to_owned();
     let beam_filter = options
         .get("beams")
         .and_then(Value::as_str)
@@ -95,62 +134,96 @@ pub(crate) fn scene(
             ("dn", "DN"),
         ],
     );
-    let scanner = pick(
-        options,
-        "scanner",
-        "default",
-        &[
-            ("default", "Default"),
-            ("water", "Water"),
-            ("solid", "Solid water"),
-        ],
-    );
-    const RBE_PAIRS: &[(&str, &str)] = &[
-        ("1", "1.0"),
-        ("1.1", "1.1"),
-        ("mcnamara", "McNamara 2015"),
-        ("wedenberg", "Wedenberg 2013"),
-        ("carabe", "Carabe 2012"),
-        ("unkelbach", "Unkelbach 2016"),
-    ];
-    const AB_PAIRS: &[(&str, &str)] = &[
-        ("1.5", "1.5 Gy"),
-        ("2", "2 Gy"),
-        ("3", "3 Gy"),
-        ("5", "5 Gy"),
-        ("10", "10 Gy"),
-    ];
+    // `scanners` is the caller's list of user-registered MCsquare scanner
+    // folders: [{label, folder}]. A `scanner` value matching a label resolves
+    // to that folder; a builtin id/label or a bare folder path work too.
+    let scanner_entries = match options.get("scanners") {
+        Some(Value::String(raw)) => serde_json::from_str::<Vec<Value>>(raw).unwrap_or_default(),
+        Some(Value::Array(list)) => list.clone(),
+        _ => Vec::new(),
+    };
+    let registered: Vec<(String, String)> = scanner_entries
+        .iter()
+        .filter_map(|entry| {
+            let label = entry.get("label").and_then(Value::as_str)?;
+            let folder = entry.get("folder").and_then(Value::as_str)?;
+            Some((label.to_owned(), folder.to_owned()))
+        })
+        .collect();
+    let scanner = pick_in(options, "scanner", SCANNER_PAIRS)
+        .map(str::to_owned)
+        .or_else(|| {
+            let shown = text(options, "scanner", "");
+            registered
+                .iter()
+                .find(|(label, folder)| label == shown || folder == shown)
+                .map(|(_, folder)| folder.clone())
+        })
+        .or_else(|| {
+            let shown = text(options, "scanner", "");
+            (!shown.is_empty() && shown != "Default").then(|| shown.to_owned())
+        })
+        .unwrap_or_else(|| "default".to_owned());
+    let calibration = CtCalibration::resolve(&scanner)?;
     let rbe_key = pick(options, "rbe", "1.1", RBE_PAIRS);
     let rbe_model = if rbe_key == "1" || rbe_key == "1.0" {
         None
     } else {
         Some(RbeModel::parse(rbe_key))
     };
-    let score_let = rbe_model.is_some_and(RbeModel::uses_let);
     let alpha_beta = pick(options, "alpha_beta", "2", AB_PAIRS)
         .parse::<f64>()
         .unwrap_or(DEFAULT_ALPHA_BETA);
-    let (spots, protons, beams) = records(&study, fraction, &deliveries, &groups, beam_filter, bdl);
-    let tables = mc_tables();
-    let [nx, ny, nz] = study.ct.shape;
-    let nvox = nx * ny * nz;
-    let mut material = vec![0u8; nvox];
-    let mut density = vec![0.0f32; nvox];
-    for (index, hu) in study.ct.hu.iter().enumerate() {
-        let label = scanner_label(scanner, *hu);
-        material[index] = tables.ids.iter().position(|id| *id == label).unwrap_or(0) as u8;
-        density[index] = scanner_density(scanner, *hu);
-    }
+    Ok(PatientInputs {
+        study,
+        segment,
+        fraction,
+        deliveries,
+        groups,
+        names,
+        beam_filter,
+        bdl,
+        histories,
+        calibration,
+        rbe_model,
+        rbe_key,
+        alpha_beta,
+        scanner,
+        registered,
+    })
+}
+
+/// What one transport produced: the dose on the CT grid, the physical dose
+/// when a variable RBE rewrote it, and whether the effective label applies.
+struct Transport {
+    ran: Option<McResult>,
+    dose: Volume,
+    physical: Option<Vec<f32>>,
+    effective: bool,
+}
+
+fn transport(inputs: &PatientInputs, mc: Option<McRunner<'_>>) -> Transport {
+    let score_let = inputs.rbe_model.is_some_and(RbeModel::uses_let);
+    let (spots, protons, beams) = records(
+        &inputs.study,
+        &inputs.fraction,
+        &inputs.deliveries,
+        &inputs.groups,
+        inputs.beam_filter,
+        inputs.bdl,
+    );
+    let (material, density) = inputs.calibration.voxels(&inputs.study.ct.hu);
+    let nvox = inputs.study.ct.shape.iter().product();
     let request = PatientRequest {
         spots,
         protons,
         beams,
         material,
         density,
-        spacing_mm: study.ct.spacing,
-        origin_mm: study.ct.origin,
-        shape: study.ct.shape,
-        histories,
+        spacing_mm: inputs.study.ct.spacing,
+        origin_mm: inputs.study.ct.origin,
+        shape: inputs.study.ct.shape,
+        histories: inputs.histories,
         seed: SEED,
         dose_to_water: true,
         score_let,
@@ -161,9 +234,9 @@ pub(crate) fn scene(
         .as_ref()
         .map(|result| result.volume.clone())
         .unwrap_or(Volume {
-            origin: study.ct.origin,
-            shape: study.ct.shape,
-            voxel: study.ct.spacing[0],
+            origin: inputs.study.ct.origin,
+            shape: inputs.study.ct.shape,
+            voxel: inputs.study.ct.spacing[0],
             values: vec![0.0; nvox],
         });
     let let_d = ran
@@ -171,11 +244,11 @@ pub(crate) fn scene(
         .map(|result| result.let_d.as_slice())
         .filter(|letd| letd.len() == nvox);
     // The physical dose stays for dose-weighted LETd and RBE statistics.
-    let physical = match rbe_model {
+    let physical = match inputs.rbe_model {
         Some(model) if model.uses_let() && let_d.is_some() => Some(dose.values.clone()),
         _ => None,
     };
-    match rbe_model {
+    match inputs.rbe_model {
         None => {}
         Some(RbeModel::Constant) => {
             for value in &mut dose.values {
@@ -184,13 +257,160 @@ pub(crate) fn scene(
         }
         Some(model) => {
             if let Some(letd) = let_d {
-                apply_rbe(model, &mut dose.values, letd, alpha_beta);
+                apply_rbe(model, &mut dose.values, letd, inputs.alpha_beta);
             }
         }
     };
     // The RBE-weighted label only applies when the weighting actually ran.
-    let effective = matches!(rbe_model, Some(RbeModel::Constant))
-        || (rbe_model.is_some_and(RbeModel::uses_let) && let_d.is_some());
+    let effective = matches!(inputs.rbe_model, Some(RbeModel::Constant))
+        || (inputs.rbe_model.is_some_and(RbeModel::uses_let) && let_d.is_some());
+    Transport {
+        ran,
+        dose,
+        physical,
+        effective,
+    }
+}
+
+/// Run the patient pipeline and write the dose as an RTDOSE — the export
+/// `scan_kit.dicom.dose.write_dose` served. `gpu` is the caller's adapter
+/// label for provenance. The session ids are the delivery inputs.
+pub fn dose_export(
+    root: &Path,
+    session_ids: &[String],
+    options: &Value,
+    dest: &str,
+    description: &str,
+    gpu: &str,
+    mc: McRunner<'_>,
+) -> Result<Value, String> {
+    let inputs = patient_inputs(root, session_ids, options)?;
+    let run = transport(&inputs, Some(mc));
+    let Some(result) = &run.ran else {
+        return Err("the Monte Carlo transport did not run".into());
+    };
+    let provenance = provenance(&inputs, result, session_ids, gpu);
+    let summation = if inputs.segment == "plan" {
+        "PLAN"
+    } else {
+        "FRACTION"
+    };
+    let dose_type = if run.effective {
+        "EFFECTIVE"
+    } else {
+        "PHYSICAL"
+    };
+    let comment = serde_json::to_string(&provenance).unwrap_or_default();
+    let path = write_rtdose(
+        Path::new(dest),
+        &run.dose.values,
+        &inputs.study.ct,
+        &inputs.study.plan_uid,
+        summation,
+        dose_type,
+        description,
+        &comment,
+    )?;
+    Ok(json!({
+        "path": path.display().to_string(),
+        "voxels": run.dose.values.len(),
+        "summation": summation,
+        "dose_type": dose_type,
+        "provenance": provenance,
+    }))
+}
+
+/// What an exported dose came from — `scan_kit.qa.analysis.provenance`.
+fn provenance(inputs: &PatientInputs, result: &McResult, sessions: &[String], gpu: &str) -> Value {
+    let study = &inputs.study;
+    json!({
+        "inputs": {
+            "frame": study.frame,
+            "ct_series": study.ct.series_uid,
+            "ct_images": study.ct.sop_uids.len(),
+            "ct_sop_digest": digest16(study.ct.sop_uids.join("\\").as_bytes()),
+            "structures": study.structures_uid,
+        },
+        "kind": "patient",
+        "engine": format!(
+            "scan-kit {} GPU Monte Carlo (WebGPU port of MCsquare)",
+            env!("CARGO_PKG_VERSION")
+        ),
+        "gpu": gpu,
+        "plan": {
+            "uid": study.plan_uid,
+            "label": study.plan_label,
+            "fractions": study.fractions,
+        },
+        "calibration": {
+            "name": inputs.calibration.name,
+            "digest": inputs.calibration.digest(),
+        },
+        "beam_model": {
+            "name": super::beam::bdl_name(inputs.bdl),
+            "digest": digest16(super::beam::bdl_text(inputs.bdl).as_bytes()),
+        },
+        "histories": inputs.histories,
+        "seed": SEED,
+        "uncertainty": result.uncertainty,
+        "deliveries": sessions,
+        "dose": "dose-to-water, Gy per fraction",
+        "rbe": inputs.rbe_key,
+    })
+}
+
+fn digest16(bytes: &[u8]) -> String {
+    let mut hash = Sha256::new();
+    hash.update(bytes);
+    hash.finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>()
+        .chars()
+        .take(16)
+        .collect()
+}
+
+pub(crate) fn scene(
+    root: &Path,
+    session_ids: &[String],
+    options: &Value,
+    mc: Option<McRunner<'_>>,
+) -> PlotScene {
+    let inputs = match patient_inputs(root, session_ids, options) {
+        Ok(inputs) => inputs,
+        Err(err) => return note_scene(&err),
+    };
+    let run = transport(&inputs, mc);
+    let PatientInputs {
+        study,
+        segment,
+        fraction,
+        deliveries,
+        groups,
+        names,
+        beam_filter,
+        bdl,
+        histories,
+        rbe_model,
+        rbe_key,
+        alpha_beta,
+        scanner,
+        registered,
+        ..
+    } = inputs;
+    let Transport {
+        ran,
+        dose,
+        physical,
+        effective,
+    } = run;
+    let [nx, ny, nz] = study.ct.shape;
+    let nvox = nx * ny * nz;
+    let let_d = ran
+        .as_ref()
+        .map(|result| result.let_d.as_slice())
+        .filter(|letd| letd.len() == nvox);
     let (cx, cy, cz) = dose.peak_index();
     let mut labels = vec![0u8; nvox];
     let mut dvh_lines = Vec::new();
@@ -475,12 +695,22 @@ pub(crate) fn scene(
         scan_kit_core::Control::plain(
             "scanner",
             "Scanner",
-            ["Default", "Water", "Solid water"],
-            match scanner {
-                "water" => "Water",
-                "solid" => "Solid water",
-                _ => "Default",
-            },
+            SCANNER_PAIRS
+                .iter()
+                .map(|(_, label)| (*label).to_owned())
+                .chain(registered.iter().map(|(label, _)| label.clone()))
+                .collect::<Vec<_>>(),
+            SCANNER_PAIRS
+                .iter()
+                .find(|(id, _)| *id == scanner)
+                .map(|(_, label)| *label)
+                .or_else(|| {
+                    registered
+                        .iter()
+                        .find(|(_, folder)| *folder == scanner)
+                        .map(|(label, _)| label.as_str())
+                })
+                .unwrap_or_else(|| text(options, "scanner", "Default")),
         )
         .grouped("Study"),
         scan_kit_core::Control::plain(
