@@ -27,6 +27,8 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 rmpv = "1"
 tungstenite = { version = "0.27", default-features = false, features = ["handshake"] }
 sha2 = "0.10"
+krilla = "0.8.2"
+fontdue = "0.9"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 suppaftp = { version = "10.0.2", default-features = false, features = ["rustls-ring"] }

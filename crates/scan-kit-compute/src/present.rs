@@ -22,6 +22,11 @@ const TOOLS: &[ToolSpec] = &[
         summary: "Run the patient Monte Carlo and write the dose as an RTDOSE with provenance.",
         kind: ToolKind::Workflow,
     },
+    ToolSpec {
+        name: "scan_kit_write_report",
+        summary: "Run the patient Monte Carlo and write the QA report as a PDF with a DVH CSV.",
+        kind: ToolKind::Workflow,
+    },
 ];
 
 pub fn tools() -> &'static [ToolSpec] {
@@ -54,6 +59,17 @@ pub fn tool_input_schema(name: &str) -> Value {
                 "options": { "type": "object" },
                 "dest": { "type": "string" },
                 "description": { "type": "string" }
+            },
+            "required": ["path", "session_ids", "dest"],
+            "additionalProperties": false
+        }),
+        "scan_kit_write_report" => json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string" },
+                "session_ids": { "type": "array", "items": { "type": "string" } },
+                "options": { "type": "object" },
+                "dest": { "type": "string" }
             },
             "required": ["path", "session_ids", "dest"],
             "additionalProperties": false
@@ -103,6 +119,19 @@ pub fn invoke(name: &str, input: &Value) -> Result<Value, String> {
                 description,
                 &crate::mc::adapter_info(),
                 &|job| crate::mc::run_mc(job).map_err(|err| err.to_string()),
+            )
+        }
+        "scan_kit_write_report" => {
+            let path = text(input, "path")?;
+            let session_ids = strings(input, "session_ids")?;
+            let options = input.get("options").cloned().unwrap_or_else(|| json!({}));
+            let dest = text(input, "dest")?;
+            write_patient_report(
+                Path::new(path),
+                &session_ids,
+                &options,
+                dest,
+                &crate::mc::adapter_info(),
             )
         }
         _ => Err(format!("unknown tool {name}")),
@@ -215,6 +244,108 @@ pub(crate) fn apply_palette(scene: &mut scan_kit_core::PlotScene, palette: &[[f3
     if !palette.is_empty() && !scene.volume.values.is_empty() {
         scene.volume.session_colors = palette.to_vec();
     }
+}
+
+/// `scan_kit_write_report`: the QA report `scan_kit.qa.report.write_report`
+/// produced — the patient pipeline's metrics as a PDF, with the DVH curves in
+/// a `*_dvh.csv` sidecar.
+pub fn write_patient_report(
+    root: &Path,
+    session_ids: &[String],
+    options: &Value,
+    dest: &str,
+    gpu: &str,
+) -> Result<Value, String> {
+    let inputs = scan_kit_io::patient_view::patient_inputs(root, session_ids, options)?;
+    let run = scan_kit_io::patient_view::transport(
+        &inputs,
+        Some(&|job| crate::mc::run_mc(job).map_err(|err| err.to_string())),
+    );
+    let Some(result) = &run.ran else {
+        return Err("the Monte Carlo transport did not run".into());
+    };
+    let provenance = scan_kit_io::patient_view::provenance(&inputs, result, session_ids, gpu);
+    let metrics = scan_kit_io::patient_view::metrics(&inputs, &run, options);
+    let title = format!("Patient QA — {}", inputs.study.plan_label);
+    let rbe = scan_kit_io::patient_view::rbe_label(inputs.rbe_key);
+    let (report, curves) = scan_kit_io::report::patient_report(
+        &title,
+        &metrics,
+        rbe,
+        dvh_figure(&metrics),
+        provenance,
+    );
+    let dest = Path::new(dest);
+    let pdf = scan_kit_io::report::write_pdf(&report, dest)?;
+    let csv_path = dest.with_file_name(format!(
+        "{}_dvh.csv",
+        dest.file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("report")
+    ));
+    let csv = scan_kit_io::report::dvh_csv(&curves);
+    if !csv.is_empty() {
+        std::fs::write(&csv_path, csv).map_err(|err| format!("{}: {err}", csv_path.display()))?;
+    }
+    Ok(json!({
+        "pdf": pdf.display().to_string(),
+        "dvh_csv": csv_path.display().to_string(),
+        "provenance": report.provenance,
+    }))
+}
+
+/// The DVH panel rendered for the report — white paper, dark ink. The caption
+/// names each curve's color because the plot has no legend.
+fn dvh_figure(
+    metrics: &scan_kit_io::patient_view::PatientMetrics,
+) -> Option<scan_kit_io::report::Figure> {
+    const COLORS: &[([f32; 4], &str)] = &[
+        ([0.12, 0.47, 0.71, 1.0], "blue"),
+        ([1.0, 0.50, 0.05, 1.0], "orange"),
+        ([0.17, 0.63, 0.17, 1.0], "green"),
+        ([0.84, 0.15, 0.16, 1.0], "red"),
+        ([0.58, 0.40, 0.74, 1.0], "purple"),
+        ([0.55, 0.34, 0.29, 1.0], "brown"),
+    ];
+    if metrics.structures.is_empty() {
+        return None;
+    }
+    let mut scene = scan_kit_core::PlotScene::empty("DVH");
+    let mut series = Vec::new();
+    let mut names = Vec::new();
+    let mut xmax = 0.0f32;
+    for (index, structure) in metrics.structures.iter().enumerate() {
+        let (color, name) = COLORS[index % COLORS.len()];
+        names.push(format!("{} ({name})", structure.name));
+        let cumulative = structure.dvh.cumulative();
+        xmax = structure.dvh.edges.iter().copied().fold(xmax, f32::max);
+        series.push(Series::Polyline {
+            xs: structure.dvh.edges.to_vec(),
+            ys: cumulative,
+            color,
+            thickness: 1.5,
+        });
+    }
+    scene.panels.push(scan_kit_core::Panel {
+        title: "DVH".into(),
+        y_label: "Volume (fraction)".into(),
+        x_label: "Dose (Gy(RBE))".into(),
+        xmin: 0.0,
+        xmax,
+        ymin: 0.0,
+        ymax: 1.0,
+        series,
+        x_labels: Vec::new(),
+        equal: false,
+    });
+    let rgba =
+        crate::render_plot(&scene, 880, 420, [1.0, 1.0, 1.0, 1.0], [0.1, 0.1, 0.1, 1.0]).ok()?;
+    Some(scan_kit_io::report::Figure {
+        rgba,
+        width: 880,
+        height: 420,
+        caption: format!("DVH curves: {}", names.join(", ")),
+    })
 }
 
 fn text<'a>(input: &'a Value, key: &str) -> Result<&'a str, String> {

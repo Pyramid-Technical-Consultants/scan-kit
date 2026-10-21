@@ -137,6 +137,29 @@ async fn scan_kit_write_dose(
     .map_err(|err| err.to_string())?
 }
 
+/// Run the patient transport and write the QA report as a PDF with its DVH CSV.
+#[tauri::command]
+async fn scan_kit_write_report(
+    path: String,
+    session_ids: Vec<String>,
+    options: Value,
+    dest: String,
+) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        scan_kit_compute::invoke(
+            "scan_kit_write_report",
+            &serde_json::json!({
+                "path": path,
+                "session_ids": session_ids,
+                "options": options,
+                "dest": dest,
+            }),
+        )
+    })
+    .await
+    .map_err(|err| err.to_string())?
+}
+
 /// Start a progressive task. The webview polls it and draws each payload itself.
 #[tauri::command]
 async fn scan_kit_start(
@@ -442,6 +465,7 @@ pub fn run() {
             scan_kit_discover_subnet,
             scan_kit_scanners,
             scan_kit_write_dose,
+            scan_kit_write_report,
             scan_kit_reveal
         ])
         .run(tauri::generate_context!())
