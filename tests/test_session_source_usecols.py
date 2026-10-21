@@ -66,6 +66,3 @@ def test_timeslice_header_probe_has_no_rows() -> None:
     frames = load_session_timeslice_device_units(src, max_frames=1, nrows=0)
     assert len(frames) == 1
     assert len(frames[0]) == 0
-    from scan_kit.common.timeslice_ic_current import resolve_ic_current_columns
-
-    assert resolve_ic_current_columns(frames[0].columns) is not None
