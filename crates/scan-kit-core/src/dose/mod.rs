@@ -11,9 +11,10 @@ mod gamma;
 mod kernel;
 mod paint;
 mod ray;
+mod resample;
 
 pub use deposit::{analytic_on, analytic_volume, dose_frame};
-pub use gamma::{field_bounds, gamma_index, projected_gamma, robust_high};
+pub use gamma::{field_bounds, gamma_index, gamma_index_norm, projected_gamma, robust_high};
 pub use kernel::{bragg_idd, csda_range_mm, protons_from_mu, through_wet};
 pub use paint::{painted_unit, trim_number, wash_of, LevelSpan, PaintChoice, Wash};
 pub use ray::{
@@ -21,6 +22,7 @@ pub use ray::{
     ray_value, raymarch, sample_index, sample_mm, scan_grid, scan_volume, view_ray_scale, RayView,
     VolumeScan, BRICK, FOV_Y,
 };
+pub use resample::resample_linear;
 
 pub(super) const K_BETHE: f64 = 0.307075;
 pub(super) const ME: f64 = 0.51099895;

@@ -80,14 +80,41 @@ pub fn gamma_index(
     spacing: [f32; 3],
     cutoff_pct: f32,
 ) -> (Vec<f32>, u32, u32) {
+    gamma_index_norm(
+        reference,
+        evaluated,
+        shape,
+        dose_percent,
+        distance_mm,
+        spacing,
+        cutoff_pct,
+        0.0,
+    )
+}
+
+/// `gamma_index` with an explicit normalization dose: `dose_percent` and
+/// `cutoff_pct` are percents of `norm` (the TPS maximum for a patient-QA
+/// comparison). A `norm` <= 0 falls back to the evaluated maximum.
+pub fn gamma_index_norm(
+    reference: &[f32],
+    evaluated: &[f32],
+    shape: [usize; 3],
+    dose_percent: f32,
+    distance_mm: f32,
+    spacing: [f32; 3],
+    cutoff_pct: f32,
+    norm: f32,
+) -> (Vec<f32>, u32, u32) {
     let [nx, ny, nz] = shape;
     let n = nx * ny * nz;
     let len = n.min(reference.len()).min(evaluated.len());
     let mut gamma = vec![0.0f32; len];
-    let mut norm = 0.0f32;
-    for value in evaluated.iter().take(len) {
-        if value.is_finite() {
-            norm = norm.max(*value);
+    let mut norm = norm.max(0.0);
+    if norm <= 0.0 {
+        for value in evaluated.iter().take(len) {
+            if value.is_finite() {
+                norm = norm.max(*value);
+            }
         }
     }
     if norm <= 0.0 {

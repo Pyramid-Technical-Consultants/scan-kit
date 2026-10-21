@@ -16,6 +16,11 @@ pub struct CtVolume {
     pub shape: [usize; 3],
     pub hu: Vec<f32>,
     pub position: String,
+    /// RTDOSE DoseType (3004,0004) — "EFFECTIVE" values are already Gy(RBE).
+    /// Empty on a CT volume.
+    pub dose_type: String,
+    /// RTDOSE DoseSummationType (3004,000A); empty on a CT volume.
+    pub summation: String,
 }
 
 #[derive(Clone, Debug)]
@@ -86,6 +91,8 @@ struct Elem {
 pub fn load_study(path: &Path) -> Result<PatientStudy, String> {
     let mut ct_slices = Vec::new();
     let mut dose_slices = Vec::new();
+    let mut dose_type = String::new();
+    let mut summation = String::new();
     let mut plan = None;
     let mut structures = Vec::new();
     for item in fs::read_dir(path).map_err(|err| err.to_string())? {
@@ -107,6 +114,10 @@ pub fn load_study(path: &Path) -> Result<PatientStudy, String> {
             structures = read_structures(&elems);
         } else if class.contains("1.2.840.10008.5.1.4.1.1.481.2") {
             let scale = float_tag(&elems, tag(0x3004, 0x000E)).unwrap_or(1.0);
+            if dose_type.is_empty() {
+                dose_type = text_tag(&elems, tag(0x3004, 0x0004));
+                summation = text_tag(&elems, tag(0x3004, 0x000A));
+            }
             for slice in image_slices(&elems, scale)? {
                 dose_slices.push((frame.clone(), slice));
             }
@@ -133,7 +144,10 @@ pub fn load_study(path: &Path) -> Result<PatientStudy, String> {
         None
     } else {
         let mut slices: Vec<_> = dose_slices.into_iter().map(|(_, slice)| slice).collect();
-        Some(stack(&mut slices)?)
+        let mut volume = stack(&mut slices)?;
+        volume.dose_type = dose_type;
+        volume.summation = summation;
+        Some(volume)
     };
     Ok(PatientStudy {
         frame,
@@ -494,6 +508,8 @@ fn stack(slices: &mut [Slice]) -> Result<CtVolume, String> {
         shape: [first.cols, first.rows, slices.len()],
         hu,
         position: "HFS".into(),
+        dose_type: String::new(),
+        summation: String::new(),
     })
 }
 
