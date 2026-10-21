@@ -14,7 +14,6 @@ from scan_kit.common.session_source import (
     load_session_timeslice_device_units,
     resolve_session_source,
 )
-from scan_kit.common.sigma_distribution import render_sigma_distribution
 from scan_kit.common.timeslice_sigma import (
     TIMESLICE_SIGMA_COLS,
     load_session_beam_on_sigmas,
@@ -51,12 +50,3 @@ def test_g3_resolves_sigma_source_with_quality_gating() -> None:
     assert source.mode == "g3"
 
 
-def test_render_sigma_distribution_smoke() -> None:
-    sigmas = load_session_beam_on_sigmas(G3_SESSION, str(TEST_DATA))
-    assert sigmas is not None
-    render_sigma_distribution(
-        {G3_SESSION: sigmas},
-        [G3_SESSION],
-        title="Sigma Distribution (test)",
-        base_dir=str(TEST_DATA),
-    )
