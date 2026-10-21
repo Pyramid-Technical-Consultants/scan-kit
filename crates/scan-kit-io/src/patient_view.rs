@@ -3,7 +3,8 @@
 use std::path::Path;
 
 use scan_kit_core::{
-    dvh, gamma_index, index, DataTable, McJob, Panel, PatientRequest, PlotScene, Volume,
+    dvh, gamma_index, index, rbe, DataTable, McJob, Panel, PatientRequest, PlotScene, RbeModel,
+    Volume, DEFAULT_ALPHA_BETA, RBE_CONSTANT,
 };
 use scan_kit_dicom::{inside_structure, load_study, scanner_density, scanner_label, PatientStudy};
 use serde_json::Value;
@@ -99,6 +100,31 @@ pub(crate) fn scene(
             ("solid", "Solid water"),
         ],
     );
+    const RBE_PAIRS: &[(&str, &str)] = &[
+        ("1", "1.0"),
+        ("1.1", "1.1"),
+        ("mcnamara", "McNamara 2015"),
+        ("wedenberg", "Wedenberg 2013"),
+        ("carabe", "Carabe 2012"),
+        ("unkelbach", "Unkelbach 2016"),
+    ];
+    const AB_PAIRS: &[(&str, &str)] = &[
+        ("1.5", "1.5 Gy"),
+        ("2", "2 Gy"),
+        ("3", "3 Gy"),
+        ("5", "5 Gy"),
+        ("10", "10 Gy"),
+    ];
+    let rbe_key = pick(options, "rbe", "1.1", RBE_PAIRS);
+    let rbe_model = if rbe_key == "1" || rbe_key == "1.0" {
+        None
+    } else {
+        Some(RbeModel::parse(rbe_key))
+    };
+    let score_let = rbe_model.is_some_and(RbeModel::uses_let);
+    let alpha_beta = pick(options, "alpha_beta", "2", AB_PAIRS)
+        .parse::<f64>()
+        .unwrap_or(DEFAULT_ALPHA_BETA);
     let (spots, protons, beams) = records(
         &study,
         root,
@@ -130,7 +156,8 @@ pub(crate) fn scene(
         histories,
         seed: SEED,
         dose_to_water: true,
-        score_let: false,
+        score_let,
+        let_water: score_let,
     };
     let ran = mc.and_then(|run| run(&McJob::Patient(request)).ok());
     let mut dose = ran
@@ -142,15 +169,34 @@ pub(crate) fn scene(
             voxel: study.ct.spacing[0],
             values: vec![0.0; nvox],
         });
-    let rbe = match pick(options, "rbe", "1.1", &[("1", "1.0"), ("1.1", "1.1")]) {
-        "1" | "1.0" => 1.0f32,
-        _ => 1.1,
+    let let_d = ran
+        .as_ref()
+        .map(|result| result.let_d.as_slice())
+        .filter(|letd| letd.len() == nvox);
+    // The physical dose stays for dose-weighted LETd and RBE statistics.
+    let physical = match rbe_model {
+        Some(model) if model.uses_let() && let_d.is_some() => Some(dose.values.clone()),
+        _ => None,
     };
-    if (rbe - 1.0).abs() > 1e-3 {
-        for value in &mut dose.values {
-            *value *= rbe;
+    let rbe_factor = match rbe_model {
+        None => 1.0f32,
+        Some(RbeModel::Constant) => {
+            for value in &mut dose.values {
+                *value *= RBE_CONSTANT as f32;
+            }
+            RBE_CONSTANT as f32
         }
-    }
+        Some(model) => {
+            if let Some(letd) = let_d {
+                apply_rbe(model, &mut dose.values, letd, alpha_beta);
+            }
+            // A physical TPS dose is scaled to Gy(RBE) at the clinical constant.
+            RBE_CONSTANT as f32
+        }
+    };
+    // The RBE-weighted label only applies when the weighting actually ran.
+    let effective = matches!(rbe_model, Some(RbeModel::Constant))
+        || (rbe_model.is_some_and(RbeModel::uses_let) && let_d.is_some());
     let (cx, cy, cz) = dose.peak_index();
     let mut labels = vec![0u8; nvox];
     let mut dvh_lines = Vec::new();
@@ -211,7 +257,7 @@ pub(crate) fn scene(
                     .fold(0.0f32, f32::max)
             })
             .filter(|value| *value > 0.0)
-            .map(|peak| peak * rbe)
+            .map(|peak| peak * rbe_factor)
             .unwrap_or_else(|| {
                 dose.values
                     .iter()
@@ -227,6 +273,29 @@ pub(crate) fn scene(
                 structure.name.clone(),
                 eval_goal(&body, &dose.values, &mask, reference),
             ]);
+        }
+        if let (Some(letd), Some(phys)) = (let_d, physical.as_ref()) {
+            let mut dep = 0.0f64;
+            let mut del = 0.0f64;
+            let mut deff = 0.0f64;
+            for index in 0..nvox {
+                if mask[index] {
+                    let d = f64::from(phys[index]);
+                    dep += d;
+                    del += d * f64::from(letd[index]);
+                    deff += f64::from(dose.values[index]);
+                }
+            }
+            if dep > 0.0 {
+                rows.push(vec![
+                    format!("{} LETd", structure.name),
+                    format!("{:.2} keV/µm", del / dep),
+                ]);
+                rows.push(vec![
+                    format!("{} RBE", structure.name),
+                    format!("{:.3}", deff / dep),
+                ]);
+            }
         }
         rows.push(vec!["DVH".into(), structure.name.clone()]);
         for (edge, volume) in edges.iter().zip(&curve) {
@@ -244,7 +313,7 @@ pub(crate) fn scene(
         let (dd, dta, cutoff) = gamma_criteria(options);
         let (values, passed, scored) = gamma_index(
             &tps.hu,
-            &result.volume.values,
+            &dose.values,
             dose.shape,
             dd,
             dta,
@@ -296,7 +365,7 @@ pub(crate) fn scene(
         dvh: dvh_lines,
         gamma,
     });
-    volume.unit = if (rbe - 1.0).abs() > 1e-3 {
+    volume.unit = if effective {
         "Gy(RBE)".into()
     } else {
         "Gy".into()
@@ -319,12 +388,12 @@ pub(crate) fn scene(
         scan_kit_core::Control::plain(
             "rbe",
             "RBE",
-            ["1.0", "1.1"],
-            if (rbe - 1.0).abs() < 1e-3 {
-                "1.0"
-            } else {
-                "1.1"
-            },
+            RBE_PAIRS.iter().map(|(_, label)| *label),
+            RBE_PAIRS
+                .iter()
+                .find(|(key, _)| *key == rbe_key)
+                .map(|(_, label)| *label)
+                .unwrap_or("1.1"),
         )
         .grouped("Study"),
         scan_kit_core::Control::plain(
@@ -373,6 +442,23 @@ pub(crate) fn scene(
             options,
         ),
     ];
+    if rbe_model.is_some_and(RbeModel::uses_alpha_beta) {
+        let at = controls.iter().position(|c| c.id == "rbe").unwrap_or(0) + 1;
+        controls.insert(
+            at,
+            scan_kit_core::Control::plain(
+                "alpha_beta",
+                "(α/β)x",
+                AB_PAIRS.iter().map(|(_, label)| *label),
+                AB_PAIRS
+                    .iter()
+                    .find(|(key, _)| key.parse::<f64>() == Ok(alpha_beta))
+                    .map(|(_, label)| *label)
+                    .unwrap_or("2 Gy"),
+            )
+            .grouped("Study"),
+        );
+    }
     let goals_value = goal_text(options, &study);
     let mut goals =
         scan_kit_core::Control::plain("goals", "Goals", Vec::<&str>::new(), &goals_value);
@@ -762,6 +848,14 @@ fn eval_goal(body: &str, dose: &[f32], mask: &[bool], reference: f32) -> String 
     "unparsed".into()
 }
 
+/// Weight each voxel's physical dose by the variable-RBE model's LETd response.
+fn apply_rbe(model: RbeModel, dose: &mut [f32], letd: &[f32], alpha_beta: f64) {
+    for (value, &let_v) in dose.iter_mut().zip(letd.iter()) {
+        *value = (f64::from(*value) * rbe(model, f64::from(*value), f64::from(let_v), alpha_beta))
+            as f32;
+    }
+}
+
 fn dose_at_volume(edges: &[f32], curve: &[f32], fraction: f32) -> f32 {
     if curve.is_empty() {
         return 0.0;
@@ -838,7 +932,9 @@ fn volume_above(dose: &[f32], mask: &[bool], gy: f32) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{eval_goal, group_fractions, parse_goals};
+    use scan_kit_core::RbeModel;
+
+    use super::{apply_rbe, eval_goal, group_fractions, parse_goals};
 
     #[test]
     fn a_repeated_beam_starts_another_fraction() {
@@ -858,5 +954,16 @@ mod tests {
         let volume = eval_goal("V20Gy < 30%", &dose, &mask, 2.0);
         assert!(volume.starts_with("pass"), "{volume}");
         assert_eq!(parse_goals("PTV: D95% >= 95%").len(), 1);
+    }
+
+    #[test]
+    fn a_variable_model_weights_each_voxel_by_its_let() {
+        let mut dose = vec![2.0f32, 2.0, 0.0];
+        apply_rbe(RbeModel::McNamara, &mut dose, &[2.0, 8.0, 0.0], 2.0);
+        // 2 Gy at LETd 2 is near the clinical constant; LETd 8 is hotter.
+        assert!(dose[0] > 2.0 && dose[0] < 3.0, "{}", dose[0]);
+        assert!(dose[1] > dose[0]);
+        // Zero dose takes RBEmax but stays zero.
+        assert_eq!(dose[2], 0.0);
     }
 }
