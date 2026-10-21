@@ -62,8 +62,7 @@ _app_datas = [(str(_assets_dir), "scan_kit/assets")]
 # ---------------------------------------------------------------------------
 # scan_kit submodules imported dynamically (--run-view, warm worker, registry).
 # ---------------------------------------------------------------------------
-_scan_kit_hiddenimports = collect_submodules("scan_kit.data")
-_scan_kit_hiddenimports += collect_submodules("scan_kit.views")
+_scan_kit_hiddenimports = collect_submodules("scan_kit.views")
 _scan_kit_hiddenimports += collect_submodules("scan_kit.common")
 _fsspec_hiddenimports = collect_submodules("fsspec")
 _paramiko_hiddenimports = collect_submodules("paramiko")

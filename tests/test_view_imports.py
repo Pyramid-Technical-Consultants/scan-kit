@@ -1,30 +1,10 @@
-"""Smoke tests that launcher view modules and heavy deps import cleanly.
+"""Smoke tests that heavy deps and their data bundles are present.
 
 These catch missing PyInstaller hiddenimports / data bundles before a frozen
-release (e.g. vispy GLSL shaders, data registry sources).
+release (e.g. vispy GLSL shaders).
 """
 
 from __future__ import annotations
-
-from scan_kit.data.registry import REGISTRY
-
-
-def test_data_registry_registers_all_builtin_sources() -> None:
-    import scan_kit.data  # noqa: F401 — populates REGISTRY
-
-    expected = {
-        "confidence",
-        "current_ratio",
-        "dose_rate",
-        "gaussian_fit_filter",
-        "ic12_pos_diff",
-        "ic_current",
-        "position",
-        "position_error",
-        "sigma",
-        "sigma_error",
-    }
-    assert expected <= set(REGISTRY.keys())
 
 
 def test_vispy_glsl_tree_is_discoverable() -> None:

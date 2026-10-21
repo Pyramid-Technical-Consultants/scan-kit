@@ -110,9 +110,11 @@ CASES = (
 
 
 def _tables() -> dict:
-    from scan_kit.views.dose_mc import load_tables
+    from importlib import resources
 
-    return load_tables()
+    path = resources.files("scan_kit") / "assets" / "mc_materials.npz"
+    with resources.as_file(path) as p, np.load(p) as z:
+        return {k: z[k] for k in z.files}
 
 
 def medium_rho(medium: str) -> float:
@@ -380,20 +382,21 @@ def load_golden(case: Case) -> dict:
 
 # ---- GPU
 
-def rust_mc() -> Path:
-    """Release binary of the app's Monte Carlo. Built when the sources are newer."""
-    name = "mc-case.exe" if os.name == "nt" else "mc-case"
-    path = ROOT / "target" / "release" / name
+def rust_bin(name: str) -> Path:
+    """Release build of a validation binary. Built when the sources are newer."""
+    exe = name + (".exe" if os.name == "nt" else "")
+    path = ROOT / "target" / "release" / exe
     sources = (
-        ROOT / "crates" / "scan-kit-compute" / "src" / "bin" / "mc-case.rs",
+        ROOT / "crates" / "scan-kit-compute" / "src" / "bin" / f"{name}.rs",
         ROOT / "crates" / "scan-kit-compute" / "src" / "mc.rs",
         ROOT / "crates" / "scan-kit-compute" / "src" / "mc_transport.wgsl",
         ROOT / "crates" / "scan-kit-core" / "src" / "dose" / "mod.rs",
+        ROOT / "crates" / "scan-kit-core" / "src" / "dose" / "gamma.rs",
     )
     built = path.is_file() and path.stat().st_mtime
     if not path.is_file() or any(src.stat().st_mtime > built for src in sources):
         subprocess.run(
-            ["cargo", "build", "--release", "-p", "scan-kit-compute", "--bin", "mc-case"],
+            ["cargo", "build", "--release", "-p", "scan-kit-compute", "--bin", name],
             cwd=ROOT,
             check=True,
         )
@@ -430,7 +433,7 @@ def run_gpu(case: Case, histories: int, seed: int = SEED):
         out = work / "dose.f32"
         req.write_text(json.dumps(request))
         done = subprocess.run(
-            [str(rust_mc()), str(req), str(out)],
+            [str(rust_bin("mc-case")), str(req), str(out)],
             capture_output=True,
             text=True,
             check=False,
@@ -442,12 +445,37 @@ def run_gpu(case: Case, histories: int, seed: int = SEED):
     return dose, None
 
 
-def gamma_rate(ref: np.ndarray, evl: np.ndarray, dose_pct: float, spacing_mm=1.0) -> float:
-    """Global gamma pass rate, dose_pct / 1 mm, 10 % cutoff, of *evl* against *ref*."""
-    from scan_kit.gpu.gamma import gamma_volume
-    from scan_kit.views.dose_volume_physics import GammaCriteria
-
-    _gam, passed, evaluated = gamma_volume(ref, evl, spacing_mm, GammaCriteria(dose_pct, 1.0, 10.0))
+def gamma_rate(
+    ref: np.ndarray, evl: np.ndarray, dose_pct: float, spacing_mm=1.0, dta_mm=1.0, cutoff_pct=10.0
+) -> float:
+    """Global gamma pass rate, dose_pct / dta_mm, cutoff_pct % cutoff, of *evl* against *ref*."""
+    spacing = np.broadcast_to(np.asarray(spacing_mm, dtype=float), (3,))
+    nz, ny, nx = ref.shape
+    with tempfile.TemporaryDirectory(prefix="gamma_case_") as tmp:
+        work = Path(tmp)
+        ref_f, evl_f = work / "ref.f32", work / "evl.f32"
+        ref.astype("<f4").tofile(ref_f)
+        evl.astype("<f4").tofile(evl_f)
+        done = subprocess.run(
+            [
+                str(rust_bin("gamma-case")),
+                str(ref_f),
+                str(evl_f),
+                str(nx),
+                str(ny),
+                str(nz),
+                *(f"{s:g}" for s in spacing),
+                f"{dose_pct:g}",
+                f"{dta_mm:g}",
+                f"{cutoff_pct:g}",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if done.returncode != 0:
+            raise RuntimeError(done.stderr[-2000:] or "gamma-case failed")
+        passed, evaluated = (int(part) for part in done.stdout.split())
     return passed / evaluated if evaluated else float("nan")
 
 
@@ -642,6 +670,9 @@ def run_gpu_patient(work: Path, histories: int, seed: int = SEED):
     The beam records and the CT calibration stay in Python. Transport, dose and
     LETd are the engine the app runs.
     """
+    # ponytail: patient suite is dormant — scan_kit.dicom/qa/dose_mc were
+    # retired into the Rust workspace; reviving it needs mc-case to take
+    # Plan.txt + BDL + CT.mhd and do the beam/CT prep in Rust.
     from scan_kit.dicom import gantry_to_patient
     from scan_kit.dicom.calibration import CtCalibration
     from scan_kit.qa import BeamModel
@@ -695,7 +726,7 @@ def run_gpu_patient(work: Path, histories: int, seed: int = SEED):
     let_path = case / "let.f32"
     req.write_text(json.dumps(request))
     done = subprocess.run(
-        [str(rust_mc()), str(req), str(dose_path), str(let_path)],
+        [str(rust_bin("mc-case")), str(req), str(dose_path), str(let_path)],
         capture_output=True,
         text=True,
         check=False,
@@ -776,11 +807,7 @@ def check_patient(case: PatientCase, histories: int, tol: dict) -> tuple[bool, s
     evl = np.where(body, dose[box], 0.0).astype(np.float32)
     ref_let = gold["let"].astype(np.float32)
 
-    from scan_kit.gpu.gamma import gamma_volume
-    from scan_kit.views.dose_volume_physics import GammaCriteria
-
-    _g, passed, evaluated = gamma_volume(ref, evl, spacing, GammaCriteria(tol["gamma_pct"], tol["gamma_mm"], 10.0))
-    gamma = passed / evaluated if evaluated else float("nan")
+    gamma = gamma_rate(ref, evl, tol["gamma_pct"], spacing, tol["gamma_mm"], 10.0)
     region = ref >= TARGET_FRAC * ref.max()
     a, b = dvh_metrics(ref, region), dvh_metrics(evl, region)
     diff = {k: b[k] / a[k] - 1.0 for k in a}
