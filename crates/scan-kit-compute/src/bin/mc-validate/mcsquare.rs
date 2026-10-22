@@ -448,7 +448,9 @@ pub fn crop_box(
     }
     for a in 0..3 {
         lo[a] = lo[a].saturating_sub(margin);
-        hi[a] = (hi[a] + margin).min([nz, ny, nx][a]);
+        // A volume with no voxel >= level (all NaN) leaves hi at 0 — keep
+        // the box empty rather than letting hi - lo underflow downstream.
+        hi[a] = (hi[a] + margin).min([nz, ny, nx][a]).max(lo[a]);
     }
     (lo, hi)
 }
@@ -456,6 +458,18 @@ pub fn crop_box(
 /// Copy the `lo..hi` box out of a `(nz, ny, nx)` volume.
 pub fn crop_vol(vol: &[f32], ny: usize, nx: usize, lo: [usize; 3], hi: [usize; 3]) -> Vec<f32> {
     let plane = ny * nx;
+    if plane == 0 {
+        return Vec::new();
+    }
+    let nz = vol.len() / plane;
+    // A box from a golden can disagree with this run's volume — clamp
+    // rather than index out of bounds.
+    let lo = [lo[0].min(nz), lo[1].min(ny), lo[2].min(nx)];
+    let hi = [
+        hi[0].clamp(lo[0], nz),
+        hi[1].clamp(lo[1], ny),
+        hi[2].clamp(lo[2], nx),
+    ];
     let mut out = Vec::with_capacity((hi[0] - lo[0]) * (hi[1] - lo[1]) * (hi[2] - lo[2]));
     for z in lo[0]..hi[0] {
         for y in lo[1]..hi[1] {

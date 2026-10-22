@@ -211,11 +211,14 @@ fn load_golden(case: &Case) -> Result<Golden, String> {
     let scale = get("dose_scale")?.scalar_f64()? as f32;
     let dose: Vec<f32> = get("dose")?.f16s()?.iter().map(|v| v * scale).collect();
     let crop = get("crop")?.i64s()?;
-    if crop.len() != 6 {
+    if crop.len() != 6 || crop.iter().any(|&v| v < 0) {
         return Err(format!("{}: bad crop", case.name));
     }
     let lo = [crop[0] as usize, crop[1] as usize, crop[2] as usize];
     let hi = [crop[3] as usize, crop[4] as usize, crop[5] as usize];
+    if lo.iter().zip(&hi).any(|(lo, hi)| lo > hi) {
+        return Err(format!("{}: bad crop", case.name));
+    }
     let nan = f64::NAN;
     Ok(Golden {
         dose,
