@@ -44,6 +44,7 @@ pub fn parse_xml(input: &str) -> Result<Elem, String> {
     let mut parser = Parser {
         bytes: input.as_bytes(),
         index: 0,
+        depth: 0,
     };
     parser.skip_misc()?;
     if parser.done() {
@@ -117,9 +118,15 @@ fn escape_attr(value: &str) -> String {
     out
 }
 
+/// Device configs are a few levels deep; nesting past this is corruption or
+/// hostility, and unbounded recursion here overflows the stack — an abort, not
+/// a catchable error.
+const MAX_DEPTH: usize = 256;
+
 struct Parser<'a> {
     bytes: &'a [u8],
     index: usize,
+    depth: usize,
 }
 
 impl Parser<'_> {
@@ -250,7 +257,12 @@ impl Parser<'_> {
                 continue;
             }
             if self.peek() == Some(b'<') {
+                self.depth += 1;
+                if self.depth > MAX_DEPTH {
+                    return Err("XML is nested too deeply".into());
+                }
                 children.push(self.element()?);
+                self.depth -= 1;
                 continue;
             }
             text.push_str(&self.text_run()?);
@@ -382,5 +394,13 @@ mod tests {
     #[test]
     fn a_broken_tag_is_rejected() {
         assert!(parse_xml("<unclosed>").is_err());
+    }
+
+    #[test]
+    fn deep_nesting_errors_instead_of_blowing_the_stack() {
+        let deep = format!("{}oops{}", "<a>".repeat(300), "</a>".repeat(300));
+        assert!(parse_xml(&deep).unwrap_err().contains("deeply"));
+        let flat = format!("<root>{}</root>", "<a/>".repeat(3000));
+        assert!(parse_xml(&flat).is_ok());
     }
 }
