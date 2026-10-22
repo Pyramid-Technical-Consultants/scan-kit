@@ -134,6 +134,16 @@ const LAUNCHER_VIEWS = [
 
 type LauncherView = (typeof LAUNCHER_VIEWS)[number];
 
+/** Mirror of `location::is_remote_location`: URI scheme >1 char, not `file`. */
+function isRemoteSpec(spec: string): boolean {
+  const match = /^([A-Za-z][A-Za-z0-9+.-]*):/.exec(spec.trim());
+  if (match == null) {
+    return false;
+  }
+  const scheme = match[1].toLowerCase();
+  return scheme.length > 1 && scheme !== "file";
+}
+
 function isLauncherView(value: string): value is LauncherView {
   return (LAUNCHER_VIEWS as readonly string[]).includes(value);
 }
@@ -701,6 +711,70 @@ export default function App() {
     [selectTab],
   );
 
+  const [trashConfirm, setTrashConfirm] = useState<{
+    sessionId: string;
+    library: string;
+    remote: boolean;
+    paths: string[];
+  } | null>(null);
+
+  const requestTrash = useCallback(
+    async (sessionId: string) => {
+      const row = rows.find((item) => item.session_id === sessionId);
+      const library = row?.library ?? locations[0];
+      if (library == null) {
+        return;
+      }
+      try {
+        const result = await invoke<{ paths: string[] }>("scan_kit_session_storage_paths", {
+          path: library,
+          sessionId: row?.folder_id ?? sessionId,
+        });
+        if (result.paths.length === 0) {
+          notify(`Nothing on disk for session ${sessionId}`);
+          return;
+        }
+        setTrashConfirm({
+          sessionId,
+          library,
+          remote: isRemoteSpec(library),
+          paths: result.paths,
+        });
+      } catch (error) {
+        notifyError(error);
+      }
+    },
+    [rows, locations],
+  );
+
+  const confirmTrash = useCallback(async () => {
+    const pending = trashConfirm;
+    if (pending == null) {
+      return;
+    }
+    setTrashConfirm(null);
+    try {
+      const row = rows.find((item) => item.session_id === pending.sessionId);
+      const result = await invoke<{ removed: number; errors: string[] }>(
+        "scan_kit_trash_session",
+        { path: pending.library, sessionId: row?.folder_id ?? pending.sessionId },
+      );
+      setRows((items) => items.filter((item) => item.session_id !== pending.sessionId));
+      setSelectionOrder((ids) => ids.filter((id) => id !== pending.sessionId));
+      if (result.errors.length > 0) {
+        notifyError(`Some session files could not be removed:\n${result.errors.join("\n")}`);
+      } else {
+        notify(
+          pending.remote
+            ? `Deleted session ${pending.sessionId}`
+            : `Moved session ${pending.sessionId} to the Recycle Bin`,
+        );
+      }
+    } catch (error) {
+      notifyError(error);
+    }
+  }, [trashConfirm, rows]);
+
   const commitSelection = useCallback((next: { ids: string[]; capped: boolean }) => {
     if (locations.length === 0) {
       return;
@@ -1075,6 +1149,11 @@ export default function App() {
                   sessionMenu.rowIds.length > 0 &&
                   sessionMenu.rowIds.every((id) => selectedIds.includes(id))
                 }
+                remote={isRemoteSpec(
+                  rows.find((item) => item.session_id === sessionMenu.sessionId)?.library ??
+                    locations[0] ??
+                    "",
+                )}
                 onClose={() => setSessionMenu(null)}
                 onCopy={(id) => {
                   void navigator.clipboard.writeText(id).then(
@@ -1086,6 +1165,7 @@ export default function App() {
                 onToggleRows={() => {
                   commitSelection(toggleListedSessions(selectedIds, sessionMenu.rowIds));
                 }}
+                onTrash={() => void requestTrash(sessionMenu.sessionId)}
               />
             ) : null}
           </div>
@@ -1176,6 +1256,47 @@ export default function App() {
               </p>
             </div>
           ) : null}
+        </DialogContent>
+      </Dialog>
+      <Dialog open={trashConfirm != null} onOpenChange={(open) => !open && setTrashConfirm(null)}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>
+              {trashConfirm?.remote ? "Delete remote session" : "Move session to Recycle Bin"}
+            </DialogTitle>
+            <DialogDescription>
+              {trashConfirm?.remote
+                ? `Permanently delete session ${trashConfirm.sessionId} from the remote host?`
+                : `Move session ${trashConfirm?.sessionId} to the Recycle Bin?`}
+            </DialogDescription>
+          </DialogHeader>
+          {trashConfirm != null ? (
+            <div className="flex flex-col gap-2 text-sm">
+              <p>These items will be removed:</p>
+              <ul className="max-h-40 overflow-y-auto font-mono text-xs">
+                {trashConfirm.paths.map((path) => (
+                  <li key={path}>{path}</li>
+                ))}
+              </ul>
+              <p>
+                {trashConfirm.remote
+                  ? "They are not sent to the Recycle Bin."
+                  : "You can restore them from the Recycle Bin if needed."}
+              </p>
+              {selectedIds.includes(trashConfirm.sessionId) ? (
+                <p>
+                  This session is currently selected for analysis. Open plot windows may fail
+                  after the files are removed.
+                </p>
+              ) : null}
+            </div>
+          ) : null}
+          <DialogFooter>
+            <DialogClose render={<Button variant="outline" />}>Cancel</DialogClose>
+            <Button variant="destructive" onClick={() => void confirmTrash()}>
+              {trashConfirm?.remote ? "Delete" : "Move to Recycle Bin"}
+            </Button>
+          </DialogFooter>
         </DialogContent>
       </Dialog>
       <Dialog open={locationsOpen} onOpenChange={setLocationsOpen}>

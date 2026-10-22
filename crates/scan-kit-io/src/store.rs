@@ -912,6 +912,27 @@ pub(crate) fn delete_missing(
     Ok(())
 }
 
+/// Remove a session row and drop it from the selection (session files are
+/// removed by the caller — trash or remote delete).
+pub fn delete_session(conn: &Connection, lib_id: i64, session_id: &str) -> Result<(), String> {
+    conn.execute(
+        "DELETE FROM sessions WHERE library_id = ?1 AND session_id = ?2",
+        params![lib_id, session_id],
+    )
+    .map_err(|err| err.to_string())?;
+    let selected: Vec<String> = selected_list(conn, lib_id)?
+        .into_iter()
+        .filter(|id| id != session_id)
+        .collect();
+    let encoded = serde_json::to_string(&selected).map_err(|err| err.to_string())?;
+    conn.execute(
+        "UPDATE libraries SET selected_sessions = ?1 WHERE id = ?2",
+        params![encoded, lib_id],
+    )
+    .map_err(|err| err.to_string())?;
+    Ok(())
+}
+
 pub(crate) fn selected_session_ids(conn: &Connection, lib_id: i64) -> Result<Vec<String>, String> {
     selected_list(conn, lib_id)
 }

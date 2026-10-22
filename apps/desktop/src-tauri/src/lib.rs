@@ -24,6 +24,8 @@ fn scan_kit_remember_password(path: String, password: String) {
     scan_kit_io::remember_password(&path, &password);
 }
 forward!(scan_kit_set_note(path: String, session_id: String, note: String));
+forward!(scan_kit_session_storage_paths(path: String, session_id: String));
+forward!(scan_kit_trash_session(path: String, session_id: String));
 forward!(scan_kit_select_sessions(path: String, session_ids: Vec<String>));
 forward!(scan_kit_data_dirs);
 forward!(scan_kit_read_catalog);
@@ -426,6 +428,8 @@ pub fn run() {
             scan_kit_open_library,
             scan_kit_remember_password,
             scan_kit_set_note,
+            scan_kit_session_storage_paths,
+            scan_kit_trash_session,
             scan_kit_select_sessions,
             scan_kit_data_dirs,
             scan_kit_read_catalog,

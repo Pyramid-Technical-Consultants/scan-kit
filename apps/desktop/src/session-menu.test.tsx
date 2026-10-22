@@ -24,6 +24,8 @@ it("opens the session menu without throwing", async () => {
         onCopy={() => {}}
         onTune={() => {}}
         onToggleRows={() => {}}
+        onTrash={() => {}}
+        remote={false}
       />,
     );
   });
@@ -36,6 +38,7 @@ it("opens the session menu without throwing", async () => {
   expect(document.body.textContent).toContain("Select Row");
   expect(document.body.textContent).toContain("Copy Session ID");
   expect(document.body.textContent).toContain("Open in Config Tuning");
+  expect(document.body.textContent).toContain("Move to Recycle Bin");
   const content = document.querySelector("[data-slot=dropdown-menu-content]");
   expect(content).toBeInstanceOf(HTMLElement);
   expect((content as HTMLElement).className).toContain("w-max");
@@ -61,6 +64,8 @@ it("opens the session menu without throwing", async () => {
         onCopy={(id) => copied.push(id)}
         onTune={() => tuned.push(1)}
         onToggleRows={() => toggled.push(1)}
+        onTrash={() => {}}
+        remote={false}
       />,
     );
   });

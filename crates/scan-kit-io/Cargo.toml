@@ -35,6 +35,7 @@ suppaftp = { version = "10.0.2", default-features = false, features = ["rustls-r
 ureq = { version = "2", default-features = false, features = ["native-tls"] }
 native-tls = "0.2"
 rustls-native-certs = "0.8"
+trash = "5.2.9"
 
 # Windows libssh2 uses WinCNG. Unix builds OpenSSL from source; that needs Perl.
 [target.'cfg(all(not(target_arch = "wasm32"), windows))'.dependencies]

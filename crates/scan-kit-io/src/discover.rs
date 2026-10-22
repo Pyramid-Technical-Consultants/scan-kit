@@ -13,7 +13,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
-const ARCHIVE_SUFFIXES: &[(&str, &str)] = &[
+pub(crate) const ARCHIVE_SUFFIXES: &[(&str, &str)] = &[
     (".tar.gz", "tar"),
     (".tar.bz2", "tar"),
     (".tar.xz", "tar"),

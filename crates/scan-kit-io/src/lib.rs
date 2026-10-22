@@ -536,6 +536,28 @@ pub fn invoke(name: &str, input: &Value) -> Result<Value, InvokeError> {
             .map_err(InvokeError::Message)?;
             Ok(json!({ "session_id": session_id, "note": note.trim() }))
         }
+        "scan_kit_session_storage_paths" => {
+            let path = required_str(input, "path")?;
+            let session_id = required_str(input, "session_id")?;
+            let root = library_root(path).map_err(InvokeError::Message)?;
+            let paths =
+                location::session_storage_paths(&root, session_id).map_err(InvokeError::Message)?;
+            Ok(json!({ "paths": paths }))
+        }
+        "scan_kit_trash_session" => {
+            let path = required_str(input, "path")?;
+            let session_id = required_str(input, "session_id")?;
+            let db = database_path(input)?;
+            with_store(&db, |conn| {
+                let root = library_root(path)?;
+                let paths = location::session_storage_paths(&root, session_id)?;
+                let errors = location::delete_storage(&root, &paths)?;
+                let lib_id = store::prepare_library(conn, &root)?;
+                store::delete_session(conn, lib_id, session_id)?;
+                Ok(json!({ "removed": paths.len() - errors.len(), "errors": errors }))
+            })
+            .map_err(InvokeError::Message)
+        }
         "scan_kit_select_sessions" => {
             let path = required_str(input, "path")?;
             let session_ids = required_strings(input, "session_ids")?;
@@ -1626,5 +1648,85 @@ Layer delivery: 27/27
         assert_eq!(store::user_version(&conn).unwrap(), 4);
         drop(conn);
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_local_session_moves_to_the_trash() {
+        let root = workspace("trash");
+        let db = root.join("test.sqlite");
+        fs::create_dir_all(root.join("sess")).unwrap();
+        fs::write(root.join("sess/input_map.csv"), b"energy\n1\n").unwrap();
+        fs::write(root.join("sess.zip"), b"zip").unwrap();
+        let listed = invoke(
+            "scan_kit_session_storage_paths",
+            &json!({ "path": root.to_string_lossy(), "session_id": "sess" }),
+        )
+        .unwrap();
+        assert_eq!(listed["paths"].as_array().unwrap().len(), 2);
+        let result = invoke(
+            "scan_kit_trash_session",
+            &json!({
+                "path": root.to_string_lossy(),
+                "session_id": "sess",
+                "db_path": db.to_string_lossy(),
+            }),
+        )
+        .unwrap();
+        assert_eq!(result["errors"].as_array().unwrap().len(), 0);
+        assert!(!root.join("sess").exists());
+        assert!(!root.join("sess.zip").exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_remote_session_is_deleted_in_place() {
+        let root = workspace("remote-trash");
+        let db = root.join("test.sqlite");
+        let url = format!(
+            "sftp://scan-kit@example.invalid/trash/{}/{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let canonical = location::install_fixture(
+            &url,
+            &[
+                ("sess/input_map.csv", b"energy\n1\n"),
+                (
+                    "sess/termination_summary.txt",
+                    b"Configuration name: trashme\n",
+                ),
+                ("sess.zip", b"zip"),
+                ("keep.txt", b"keep"),
+            ],
+            false,
+        )
+        .unwrap();
+        let listed = invoke(
+            "scan_kit_session_storage_paths",
+            &json!({ "path": &url, "session_id": "sess" }),
+        )
+        .unwrap();
+        let paths = listed["paths"].as_array().unwrap();
+        assert_eq!(paths.len(), 2);
+        assert!(paths
+            .iter()
+            .all(|p| p.as_str().unwrap().starts_with(&canonical)));
+        let result = invoke(
+            "scan_kit_trash_session",
+            &json!({ "path": &url, "session_id": "sess", "db_path": db.to_string_lossy() }),
+        )
+        .unwrap();
+        assert_eq!(result["errors"].as_array().unwrap().len(), 0);
+        let remote = location::require_remote(&canonical).unwrap();
+        let mut fs = remote::connect(&remote, "").unwrap();
+        let base = remote.path.trim_end_matches('/');
+        assert!(fs.stat(&format!("{base}/sess")).unwrap().is_none());
+        assert!(fs.stat(&format!("{base}/sess.zip")).unwrap().is_none());
+        assert!(fs.stat(&format!("{base}/keep.txt")).unwrap().is_some());
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(location::cache_directory(&canonical));
     }
 }
