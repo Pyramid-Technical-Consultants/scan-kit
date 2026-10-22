@@ -142,6 +142,35 @@ npm run tauri dev
   <sub><em>Amplifier command correlations (G2 steering chain) and Session Log Compare.</em></sub>
 </p>
 
+<details><summary>Regenerating README screenshots</summary>
+
+The images above are produced by
+`apps/desktop/scripts/capture-doc-screenshots.mjs`, which launches the desktop
+app, drives it through the WebView2 remote-debugging protocol, and captures each
+launcher tab and analysis view. To regenerate:
+
+1. Build the frontend and desktop once:
+
+   ```cmd
+   cd apps\desktop
+   npm run build
+   npm run tauri build
+   ```
+
+2. Capture all shots (fixture sessions under `test_data\logs`):
+
+   ```cmd
+   npm run capture:screenshots -- --exe ..\..\target\release\scan-kit-desktop.exe
+   ```
+
+3. Review `docs\images\` and commit the updated PNGs.
+
+`--list` prints the shot table, `--only <name>` reruns a single shot, and
+`--probe <view-id>` lists an analysis view's control options so new screenshots
+can be added as controls evolve.
+
+</details>
+
 ## The desktop app
 
 Scan Kit is a single desktop application built on Tauri with a Rust core. Its launcher view lists the analysis views below; sessions are opened from a folder, a UNC share, or a remote URL (`sftp://`, `smb://`, `ftp://`, `ssh://`/`scp://` as SFTP aliases, `http(s)://` for a single archive).

@@ -11,7 +11,8 @@
     "test": "vitest run && node --test scripts/keep-up.test.mjs",
     "lint": "oxlint",
     "knip": "knip",
-    "tauri": "node scripts/tauri.mjs"
+    "tauri": "node scripts/tauri.mjs",
+    "screenshots": "node scripts/capture-doc-screenshots.mjs"
   },
   "dependencies": {
     "@base-ui/react": "^1.8.0",
