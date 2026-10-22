@@ -52,6 +52,13 @@ pub fn write(parent: &Path, params: &Value, db: &Path) -> Result<Value, String> 
         .get("phantom")
         .and_then(Value::as_str)
         .unwrap_or("slabs");
+    // The name lands in the folder path, so it is validated before the join
+    // rather than relying on write_phantom_study's own check ordering.
+    if !matches!(phantom, "slabs" | "bone" | "lung" | "water") {
+        return Err(format!(
+            "unknown phantom '{phantom}'; choose from slabs, bone, lung, water"
+        ));
+    }
     let stamp = Local::now().format("%Y%m%d_%H%M%S");
     let folder = parent.join(format!("synthetic_{phantom}_{stamp}"));
     if folder.exists() {
@@ -75,6 +82,24 @@ mod tests {
     use std::fs;
 
     use super::*;
+
+    #[test]
+    fn a_traversal_phantom_name_is_rejected() {
+        let parent =
+            std::env::temp_dir().join(format!("scan-kit-phantom-traversal-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&parent);
+        fs::create_dir_all(&parent).unwrap();
+        let db = parent.join("scan-kit.sqlite");
+        let err = write(&parent, &serde_json::json!({ "phantom": "../escape" }), &db).unwrap_err();
+        assert!(err.contains("unknown phantom"));
+        assert!(
+            fs::read_dir(&parent).unwrap().next().is_none()
+                || fs::read_dir(&parent)
+                    .unwrap()
+                    .all(|entry| entry.unwrap().file_name() == "scan-kit.sqlite")
+        );
+        let _ = fs::remove_dir_all(&parent);
+    }
 
     #[test]
     fn a_study_lands_in_a_stamped_folder() {
