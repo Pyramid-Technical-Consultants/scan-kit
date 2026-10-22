@@ -43,6 +43,7 @@ Versions below are the ones locked for the workspace. Anomaly review for a SOUP 
 | ssh2 | see `crates/scan-kit-io/Cargo.toml` | SFTP library open, synchronous, on the blocking path. Windows uses the system crypto library. SK-REQ-004 |
 | suppaftp | see `crates/scan-kit-io/Cargo.toml` | FTP and FTPS library open. SK-REQ-004 |
 | ureq | see `crates/scan-kit-io/Cargo.toml` | Download one `http://` or `https://` archive into the remote cache. SK-REQ-004 |
+| trash | see `crates/scan-kit-io/Cargo.toml` | Move a session folder or archive to the operating system trash (Recycle Bin, macOS Trash, freedesktop) |
 | krilla | see `crates/scan-kit-io/Cargo.toml` | PDF writer for the patient QA report — text shaping and font subsetting |
 | rustls-native-certs | see `crates/scan-kit-io/Cargo.toml` | System certificate store for FTPS. SK-REQ-004 |
 | native-tls | see `crates/scan-kit-io/Cargo.toml` | HTTPS for an archive URL, using the operating system TLS stack. Unix builds its TLS library from source. SK-REQ-004 |

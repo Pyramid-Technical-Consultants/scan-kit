@@ -568,7 +568,7 @@ fn archive_name(path: &str) -> bool {
     discover::archive_kind(name).is_some()
 }
 
-fn require_remote(spec: &str) -> Result<Remote, String> {
+pub(crate) fn require_remote(spec: &str) -> Result<Remote, String> {
     match classify(spec.trim())? {
         Kind::Remote(remote) => Ok(remote),
         Kind::Local(path) => Err(format!("{} is not a remote URL", path.display())),
@@ -996,6 +996,77 @@ fn add_windows_connection(share: &str, username: &str, password: &str) -> Result
 
 pub(crate) fn connect_timeout() -> Duration {
     CONNECT_TIMEOUT
+}
+
+/// Folder and leftover archives for `session_id` under the opened library
+/// `root` — remote specs for a remote root, local paths otherwise.
+pub(crate) fn session_storage_paths(root: &str, session_id: &str) -> Result<Vec<String>, String> {
+    let mut names = vec![session_id.to_string()];
+    for (suffix, _) in discover::ARCHIVE_SUFFIXES {
+        names.push(format!("{session_id}{suffix}"));
+    }
+    if is_remote_location(root) {
+        let remote = require_remote(root)?;
+        let mut fs = crate::remote::connect(&remote, &password_of(&remote))?;
+        let base = remote.path.trim_end_matches('/');
+        let mut found = Vec::new();
+        for name in names {
+            if fs.stat(&format!("{base}/{name}"))?.is_some() {
+                found.push(format!("{}/{name}", remote.canonical.trim_end_matches('/')));
+            }
+        }
+        return Ok(found);
+    }
+    let base = Path::new(root);
+    Ok(names
+        .into_iter()
+        .filter_map(|name| {
+            let path = base.join(&name);
+            let hit = if name == session_id {
+                path.exists()
+            } else {
+                path.is_file()
+            };
+            hit.then(|| path.to_string_lossy().into_owned())
+        })
+        .collect())
+}
+
+/// Remove `paths` — OS trash locally, permanent recursive delete on remote
+/// hosts. Returns per-path errors; empty means everything was removed.
+pub(crate) fn delete_storage(root: &str, paths: &[String]) -> Result<Vec<String>, String> {
+    let mut errors = Vec::new();
+    if is_remote_location(root) {
+        let remote = require_remote(root)?;
+        let mut fs = crate::remote::connect(&remote, &password_of(&remote))?;
+        for spec in paths {
+            match require_remote(spec) {
+                Ok(child) => {
+                    if let Err(err) = fs.remove(&child.path) {
+                        errors.push(format!("{spec}: {err}"));
+                    }
+                }
+                Err(err) => errors.push(format!("{spec}: {err}")),
+            }
+        }
+        return Ok(errors);
+    }
+    for path in paths {
+        if let Err(err) = trash_path(path) {
+            errors.push(format!("{path}: {err}"));
+        }
+    }
+    Ok(errors)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn trash_path(path: &str) -> Result<(), String> {
+    trash::delete(path).map_err(|err| err.to_string())
+}
+
+#[cfg(target_arch = "wasm32")]
+fn trash_path(_path: &str) -> Result<(), String> {
+    Err("the system trash is not available in this build".into())
 }
 
 #[cfg(test)]

@@ -28,6 +28,10 @@ pub(crate) trait Fs {
     fn stat(&mut self, path: &str) -> Result<Option<Stat>, String>;
     fn copy_to(&mut self, path: &str, dest: &Path) -> Result<(), String>;
 
+    /// Delete the object at `path`, recursing into directories. Remote
+    /// deletes are permanent — there is no trash on a remote host.
+    fn remove(&mut self, path: &str) -> Result<(), String>;
+
     /// ponytail: FTP and HTTP download the object and then keep `max` bytes.
     /// SFTP overrides this and stops the read at `max`.
     fn read_prefix(&mut self, path: &str, max: usize) -> Result<Option<Vec<u8>>, String> {
@@ -177,6 +181,19 @@ impl Fs for MemoryFs {
         if !wrote {
             return Err(format!("nothing to copy from {path}"));
         }
+        Ok(())
+    }
+
+    fn remove(&mut self, path: &str) -> Result<(), String> {
+        let mut map = fixtures().lock().unwrap_or_else(|err| err.into_inner());
+        let fixture = map
+            .get_mut(&self.key)
+            .ok_or_else(|| "the remote fixture is gone".to_owned())?;
+        let path = path.trim_end_matches('/');
+        let prefix = format!("{path}/");
+        fixture
+            .files
+            .retain(|key, _| key != path && !key.starts_with(&prefix));
         Ok(())
     }
 }
@@ -385,6 +402,18 @@ mod net {
                 copy_file_to(dest, &bytes)
             }
         }
+
+        fn remove(&mut self, path: &str) -> Result<(), String> {
+            let stat = self.stat(path)?.ok_or_else(|| format!("missing {path}"))?;
+            if stat.dir {
+                for item in self.list(path)? {
+                    self.remove(&format!("{}/{}", path.trim_end_matches('/'), item.name))?;
+                }
+                self.sftp()?.rmdir(Path::new(path)).map_err(map_sftp)
+            } else {
+                self.sftp()?.unlink(Path::new(path)).map_err(map_sftp)
+            }
+        }
     }
 
     fn copy_sftp_dir(fs: &mut SftpFs, path: &str, dest: &Path, depth: u32) -> Result<(), String> {
@@ -543,6 +572,26 @@ mod net {
             } else {
                 let bytes = self.read(path)?.ok_or_else(|| format!("missing {path}"))?;
                 copy_file_to(dest, &bytes)
+            }
+        }
+
+        fn remove(&mut self, path: &str) -> Result<(), String> {
+            let stat = self.stat(path)?.ok_or_else(|| format!("missing {path}"))?;
+            if stat.dir {
+                for item in self.list(path)? {
+                    self.remove(&format!("{}/{}", path.trim_end_matches('/'), item.name))?;
+                }
+                match &mut self.client {
+                    FtpClient::Plain(ftp) => ftp.rmdir(path),
+                    FtpClient::Tls(ftp) => ftp.rmdir(path),
+                }
+                .map_err(map_ftp)
+            } else {
+                match &mut self.client {
+                    FtpClient::Plain(ftp) => ftp.rm(path),
+                    FtpClient::Tls(ftp) => ftp.rm(path),
+                }
+                .map_err(map_ftp)
             }
         }
     }
@@ -720,6 +769,10 @@ mod net {
         fn copy_to(&mut self, _path: &str, dest: &Path) -> Result<(), String> {
             let bytes = http_get(&self.url, &self.username, &self.password)?;
             copy_file_to(dest, &bytes)
+        }
+
+        fn remove(&mut self, _path: &str) -> Result<(), String> {
+            Err("an http location is read-only".into())
         }
     }
 

@@ -1,4 +1,4 @@
-import { Copy, SlidersHorizontal } from "lucide-react";
+import { Copy, SlidersHorizontal, Trash2 } from "lucide-react";
 
 import {
   DropdownMenu,
@@ -25,20 +25,24 @@ export function SessionContextMenu({
   y,
   rowIds,
   rowsSelected,
+  remote,
   onClose,
   onCopy,
   onTune,
   onToggleRows,
+  onTrash,
 }: {
   sessionId: string;
   x: number;
   y: number;
   rowIds: readonly string[];
   rowsSelected: boolean;
+  remote: boolean;
   onClose: () => void;
   onCopy: (sessionId: string) => void;
   onTune: () => void;
   onToggleRows: () => void;
+  onTrash: () => void;
 }) {
   const rowLabel = rowIds.length === 1 ? "Row" : "Rows";
   return (
@@ -86,6 +90,16 @@ export function SessionContextMenu({
           >
             <SlidersHorizontal />
             Open in Config Tuning…
+          </DropdownMenuItem>
+          <DropdownMenuItem
+            className="whitespace-nowrap"
+            onClick={() => {
+              onClose();
+              onTrash();
+            }}
+          >
+            <Trash2 />
+            {remote ? "Delete from remote host…" : "Move to Recycle Bin…"}
           </DropdownMenuItem>
         </DropdownMenuGroup>
       </DropdownMenuContent>
