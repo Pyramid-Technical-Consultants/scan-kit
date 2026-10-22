@@ -77,6 +77,24 @@ jobs:
           npm run lint
           npm run knip
 
+  # The branch ruleset requires a check literally named "Test". This gate
+  # keeps that name reporting until the ruleset is updated to the job names
+  # above; it only passes when the real check jobs do.
+  test:
+    needs: [rust, plot-wasm]
+    if: always()
+    runs-on: ubuntu-22.04
+    name: Test
+
+    steps:
+      - name: Require the real checks to pass
+        run: |
+          RESULTS='${{ toJSON(needs.*.result) }}'
+          echo "$RESULTS"
+          if echo "$RESULTS" | grep -qE '"(failure|cancelled)"'; then
+            exit 1
+          fi
+
   build:
     needs: [rust, plot-wasm]
     if: github.event_name != 'pull_request'
