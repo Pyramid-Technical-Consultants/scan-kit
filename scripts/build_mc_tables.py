@@ -1,5 +1,5 @@
-"""Pack MCsquare material data into ``scan_kit/assets/mc_materials.npz`` and copy its
-scanner calibrations and beam models to ``scan_kit/assets/mcsquare``.
+"""Pack MCsquare material data into ``assets/mc_materials.npz`` and copy its
+scanner calibrations and beam models to ``assets/mcsquare``.
 
 Reproduces MCsquare's own preprocessing (``data_materials.c``, ``data_nuclear.c``,
 ``data_Stop_Pow.c``) for the media the GPU Monte Carlo supports, so the shader
@@ -22,7 +22,7 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[1]
 MCSQUARE = ROOT / "third_party" / "MCsquare"
 MATERIALS = MCSQUARE / "Materials"
-OUT = ROOT / "scan_kit" / "assets" / "mc_materials.npz"
+OUT = ROOT / "assets" / "mc_materials.npz"
 
 # scan-kit slab medium key -> MCsquare material name; these keep the first rows.
 SLAB_MEDIA = {
@@ -337,7 +337,7 @@ def main() -> int:
     print(f"wrote {OUT.relative_to(ROOT)}: media={list(tables['media'])} elements={list(tables['elements'])}")
     for data in ("Scanners", "BDL"):
         shutil.copytree(MCSQUARE / data, OUT.parent / "mcsquare" / data, dirs_exist_ok=True)
-    print("copied the MCsquare scanner calibrations and beam models to scan_kit/assets/mcsquare")
+    print("copied the MCsquare scanner calibrations and beam models to assets/mcsquare")
     return 0
 
 

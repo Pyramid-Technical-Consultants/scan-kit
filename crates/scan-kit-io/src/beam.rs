@@ -7,11 +7,11 @@ use scan_kit_dicom::gantry_to_patient;
 use super::mc_tables::mc_tables;
 
 const BDL_UN_RS: &str =
-    include_str!("../../../scan_kit/assets/mcsquare/BDL/BDL_default_UN_RangeShifter.txt");
-const BDL_UN: &str = include_str!("../../../scan_kit/assets/mcsquare/BDL/BDL_default_UN.txt");
-const BDL_DN: &str = include_str!("../../../scan_kit/assets/mcsquare/BDL/BDL_default_DN.txt");
+    include_str!("../../../assets/mcsquare/BDL/BDL_default_UN_RangeShifter.txt");
+const BDL_UN: &str = include_str!("../../../assets/mcsquare/BDL/BDL_default_UN.txt");
+const BDL_DN: &str = include_str!("../../../assets/mcsquare/BDL/BDL_default_DN.txt");
 const BDL_DN_RS: &str =
-    include_str!("../../../scan_kit/assets/mcsquare/BDL/BDL_default_DN_RangeShifter.txt");
+    include_str!("../../../assets/mcsquare/BDL/BDL_default_DN_RangeShifter.txt");
 
 pub(crate) fn bdl_name(name: &str) -> &'static str {
     match name {

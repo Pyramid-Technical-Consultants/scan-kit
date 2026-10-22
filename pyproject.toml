@@ -49,9 +49,6 @@ version = {attr = "scan_kit.__version__"}
 include = ["scan_kit*"]
 exclude = ["test_data*"]
 
-[tool.setuptools.package-data]
-scan_kit = ["assets/*", "assets/mcsquare/*/*", "assets/mcsquare/*/*/*"]
-
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = [

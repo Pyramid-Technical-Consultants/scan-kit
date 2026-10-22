@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="scan_kit/assets/icon.png" alt="Scan Kit" width="96">
+  <img src="assets/icon.png" alt="Scan Kit" width="96">
 </p>
 
 <h1 align="center">Scan Kit</h1>
@@ -452,7 +452,7 @@ MCsquare is the only reference for the GPU Monte Carlo. Its source and material 
 git submodule update --init third_party/MCsquare
 ```
 
-`scan_kit/assets/mc_materials.npz` packs the stopping-power, scattering and nuclear tables that the shader reads from `third_party/MCsquare/Materials`. It holds the phantom media and every material that an MCsquare scanner calibration or beam-model range shifter names. The same script copies the scanner calibrations and beam models to `scan_kit/assets/mcsquare/`, so the app and the executable don't need the submodule. After the submodule changes, rebuild them with `python scripts/build_mc_tables.py`.
+`assets/mc_materials.npz` packs the stopping-power, scattering and nuclear tables that the shader reads from `third_party/MCsquare/Materials`. It holds the phantom media and every material that an MCsquare scanner calibration or beam-model range shifter names. The same script copies the scanner calibrations and beam models to `assets/mcsquare/`, so the app and the executable don't need the submodule. After the submodule changes, rebuild them with `python scripts/build_mc_tables.py`.
 
 The engine's unit coverage — tables, energy bookkeeping, determinism, spot placement, beam model, IEC chain, CT calibration, delivery matching, DVHs, goals and gamma — lives in the Rust workspace tests (`cargo test`).
 
@@ -527,4 +527,4 @@ CI verifies the tag matches `__version__` before publishing. The project follows
 
 [MIT](LICENSE). Copyright (c) 2026 Pyramid Technical Consultants
 
-The Monte Carlo physics and material data are ported from [MCsquare](https://gitlab.com/openmcsquare/MCsquare), Université catholique de Louvain, under the Apache License 2.0 ([`scan_kit/assets/MCsquare_LICENSE.txt`](scan_kit/assets/MCsquare_LICENSE.txt)).
+The Monte Carlo physics and material data are ported from [MCsquare](https://gitlab.com/openmcsquare/MCsquare), Université catholique de Louvain, under the Apache License 2.0 ([`assets/MCsquare_LICENSE.txt`](assets/MCsquare_LICENSE.txt)).

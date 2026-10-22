@@ -56,7 +56,7 @@ _opengl_datas, _opengl_binaries, _opengl_hiddenimports = collect_all("OpenGL")
 
 _mpl_datas = collect_data_files("matplotlib", includes=["**/mpl-data/**"])
 
-_assets_dir = ROOT / "scan_kit" / "assets"
+_assets_dir = ROOT / "assets"
 _app_datas = [(str(_assets_dir), "scan_kit/assets")]
 
 # ---------------------------------------------------------------------------
