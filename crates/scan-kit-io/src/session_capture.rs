@@ -141,19 +141,35 @@ fn devices(rci_host: &str, warnings: &mut Vec<String>) -> Vec<CaptureDevice> {
             warnings.push(format!("{client} has no device address — skipped"));
             continue;
         }
+        // The name lands in capture file paths (x_spot_data.csv, x.log, the
+        // nozzle folder) — a device client key is untrusted text, so keep it
+        // to filename characters only.
+        let name = client_name(client);
+        if name.is_empty() {
+            warnings.push(format!("{client} has no usable device name — skipped"));
+            continue;
+        }
         out.push(CaptureDevice {
-            name: client
-                .strip_prefix("device_")
-                .unwrap_or(client)
-                .strip_suffix("_client")
-                .unwrap_or(client)
-                .to_ascii_uppercase(),
+            name,
             io_root,
             host,
             config_target: field("configuration_upload/target"),
         });
     }
     out
+}
+
+/// Device client key → filename-safe name (`device_ic1_client` → `IC1`).
+fn client_name(client: &str) -> String {
+    client
+        .strip_prefix("device_")
+        .unwrap_or(client)
+        .strip_suffix("_client")
+        .unwrap_or(client)
+        .to_ascii_uppercase()
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '_' || *ch == '-')
+        .collect()
 }
 
 fn table_io(host: &str, io_root: &str, table: &str, io: &str) -> Option<Value> {
@@ -1207,6 +1223,7 @@ fn fetch_aux(
                         let name = PathBuf::from(&device.config_target)
                             .file_name()
                             .and_then(|name| name.to_str())
+                            .filter(|name| *name != "." && *name != "..")
                             .unwrap_or(&device.name)
                             .to_owned();
                         write_bytes(&dir.join("config").join("dcs").join(name), &bytes)?;
@@ -1244,6 +1261,14 @@ mod tests {
             .iter()
             .map(|(device, sheet)| (device, (*sheet).clone()))
             .collect::<Vec<(&CaptureDevice, Sheet)>>()
+    }
+
+    #[test]
+    fn client_names_cannot_escape_the_capture_dir() {
+        assert_eq!(client_name("device_ic1_client"), "IC1");
+        assert_eq!(client_name("device_../../evil_client"), "EVIL");
+        assert_eq!(client_name("device_.._client"), "");
+        assert_eq!(client_name("odd"), "ODD");
     }
 
     #[test]
