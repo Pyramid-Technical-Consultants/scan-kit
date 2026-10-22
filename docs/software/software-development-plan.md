@@ -11,9 +11,9 @@ Git history is the revision record for this document and for the rest of the sof
 
 ## Scope
 
-This plan covers Scan Kit 2, the Rust and Tauri replacement of the Python application, developed in this repository. Phase 1 establishes the workspace, the desktop shell, the MCP server, and these planning records. Later changes port behavior into Rust and delete the Python that only that behavior needed.
+This plan covers Scan Kit 2, the Rust and Tauri application developed in this repository. The Python application it replaced is fully retired: behavior was ported into Rust change by change, and the last of `scan_kit/`, `tests/`, and the Python packaging was deleted when its final capability landed in Rust.
 
-`scan_kit/__init__.py` remains the version of the released Python product until `develop` is promoted to `main` as 2.0. The Rust workspace version is `2.0.0-dev` until that promotion. `main` keeps the last complete 1.x line. After the first port change deletes Python, a `develop` build is no longer a full 1.x application.
+The Rust workspace version in `Cargo.toml` (`[workspace.package]`) is the single version source; the desktop `package.json` and `tauri.conf.json` carry the same string. `main` keeps the last complete 1.x line until `develop` is promoted.
 
 ## Safety class
 
@@ -28,7 +28,7 @@ A change that adds or alters behavior:
 1. States or updates a software requirement in [requirements.md](requirements.md) with an id `SK-REQ-###`.
 2. Implements the behavior once, in `scan-kit-core`, and registers it in the tool catalog. The desktop shell and the MCP server call that function. They do not grow a second implementation.
 3. Verifies it with a unit test named or commented with the requirement id, and records the link in [traceability.md](traceability.md).
-4. Deletes the Python modules and tests that exist only for the ported behavior, in the same change. A Python module that unported code still imports stays until its last caller is gone. The Python tree is the unported backlog. There is no second status list and no PyO3 bridge.
+4. Removes the superseded implementation of that behavior, if one exists, in the same change. The repository holds one implementation of a capability and no PyO3 bridge.
 
 The engineering rules for crates, tools, and the user interface are in [architecture.md](architecture.md). That guide is not an IEC 62304 architectural design deliverable. Class A does not require one.
 
@@ -42,7 +42,7 @@ IEC 62304 activities that apply to Class A, and how this repository meets them:
 | 5.2 Software requirements analysis | [requirements.md](requirements.md), updated as behavior is added |
 | 5.5 Software unit implementation | Rust functions in the workspace crates |
 | 5.7 Software system testing | The desktop and MCP binaries build in CI. System tests grow when ported behavior has a user-visible flow |
-| 5.8 Software release | Tag-driven GitHub Release. Python-only until the last Python application code is removed, then the Rust artifacts |
+| 5.8 Software release | Tag-driven GitHub Release publishing the Rust desktop artifacts |
 | 6 Software maintenance | This plan remains in force after the first 2.0 release. Fixes follow the same change path |
 | 7 Software risk management | [safety-classification.md](safety-classification.md) |
 | 8 Software configuration management | Git, pull requests, and CI, as below |
@@ -58,10 +58,10 @@ The configuration items are the files in this git repository, including requirem
 - Identity of a change is the git commit. Identity of a release is the `v*` tag.
 - A pull request is the review and approval of a change before it merges.
 - CI on the pull request must pass before merge.
-- The repository holds one implementation of a capability. Porting retires the Python implementation in the same pull request.
+- The repository holds one implementation of a capability.
 - Direct dependencies are recorded in [soup.md](soup.md) in the same change that adds them. Lockfiles pin the versions CI builds.
 
-Build outputs (`target/`, `node_modules/`, `dist/`, Python `dist/`) are not configuration items.
+Build outputs (`target/`, `node_modules/`, `dist/`) are not configuration items.
 
 ## Verification
 
@@ -77,25 +77,21 @@ Pull requests to `develop` or `main` run:
 
 `cargo deny` and `cargo machete` are development tools installed in the Rust job. They are not linked into the binaries. The command list an agent runs is the same one, in [.cursor/skills/static-analysis/SKILL.md](../../.cursor/skills/static-analysis/SKILL.md).
 
-Pushes to `develop` or `main` also upload preview desktop and MCP binaries. Those artifacts are not a GitHub Release.
-
-Python tests keep running against whatever `scan_kit/` and `tests/` remain. A port change deletes the tests that only covered the removed modules, and the remaining Python tests must pass.
+Pushes to `develop` or `main` also upload preview desktop bundles. Those artifacts are not a GitHub Release.
 
 ## Release
 
-Until the Python application is gone, a `v*` tag publishes the Python executables only, and the tag must match `__version__` in `scan_kit/__init__.py`. The Rust workspace version is not that release.
-
-The change that deletes the last of the Python application also removes the Python release job and points tag-driven releases at the Rust desktop artifacts. That change updates this plan and the version source of truth in the same pull request.
+A `v*` tag publishes the Rust desktop artifacts, and the tag must match the workspace version in `Cargo.toml`.
 
 Known residual anomalies at release are the open GitHub issues labeled for that release.
 
 ## Problem resolution
 
-Problems are GitHub issues in this repository. An issue that reports a software defect states what happened, what was expected, and the version (Python `__version__` or the Rust workspace version). The fixing change links the issue. Closing the issue is the record that it was resolved. Pull requests are not a second problem log.
+Problems are GitHub issues in this repository. An issue that reports a software defect states what happened, what was expected, and the workspace version. The fixing change links the issue. Closing the issue is the record that it was resolved. Pull requests are not a second problem log.
 
 ## Maintenance
 
-After 2.0 is released, fixes, environmental changes, and SOUP updates use the same pull-request path, requirements, tests, and SOUP list. Behavior that is still Python is unported, not a maintained second product.
+After 2.0 is released, fixes, environmental changes, and SOUP updates use the same pull-request path, requirements, tests, and SOUP list.
 
 ## SOUP
 
