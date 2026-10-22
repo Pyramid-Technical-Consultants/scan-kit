@@ -23,7 +23,7 @@ import {
 } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { PhysicalPosition, PhysicalSize } from "@tauri-apps/api/dpi";
-import { availableMonitors, getCurrentWindow } from "@tauri-apps/api/window";
+import { LogicalSize, availableMonitors, getCurrentWindow } from "@tauri-apps/api/window";
 import { open } from "@tauri-apps/plugin-dialog";
 import { emptyGridSelection, type GridSelection, type Theme } from "@glideapps/glide-data-grid";
 import "@glideapps/glide-data-grid/dist/index.css";
@@ -827,6 +827,32 @@ export default function App() {
       ),
     );
   }, [commitSelection, displayIds, rows.length, selectedIds]);
+
+  // Automation surface for scripts/capture-doc-screenshots.mjs (CDP-driven doc shots).
+  // The container outlives re-renders; AnalysisView parks its own `view` entry in it.
+  useEffect(() => {
+    const win = window as unknown as { __scanKitShots?: Record<string, unknown> };
+    win.__scanKitShots ??= {};
+    return () => {
+      delete win.__scanKitShots;
+    };
+  }, []);
+  useEffect(() => {
+    const win = window as unknown as { __scanKitShots?: Record<string, unknown> };
+    const shots = (win.__scanKitShots ??= {});
+    Object.assign(shots, {
+      invoke,
+      openLocation,
+      openAnalysis,
+      back: () => setAnalysis(null),
+      selectTab,
+      selectSessions: (ids: string[]) =>
+        commitSelection({ ids: ids.slice(0, MAX_SELECTED), capped: false }),
+      sessionIds: () => rows.map((row) => row.session_id),
+      setSize: (width: number, height: number) =>
+        void getCurrentWindow().setSize(new LogicalSize(width, height)),
+    });
+  }, [openLocation, openAnalysis, selectTab, commitSelection, rows]);
 
   const writeNote = useCallback(async (sessionId: string, note: string) => {
     const row = rows.find((item) => item.session_id === sessionId);

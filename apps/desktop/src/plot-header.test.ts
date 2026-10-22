@@ -123,3 +123,19 @@ it("keeps the picture when the next payload has no panels", () => {
   expect(shownHeader(empty, frame)?.panels).toHaveLength(1);
   expect(shownHeader(current, { ...empty, title: "Volumetric" })).toBe(current);
 });
+
+it("shows a table-only scene with no panels", () => {
+  // Session Log Compare reports a table and zero panels; it must still land.
+  const tabled = plotHeader(
+    payload(
+      {
+        title: "Session Log Compare",
+        controls: [],
+        table: { columns: ["Aspect"], rows: [["Dose-up"]] },
+        panels: [],
+      },
+      [],
+    ).subarray(0),
+  );
+  expect(shownHeader(null, tabled)).toBe(tabled);
+});

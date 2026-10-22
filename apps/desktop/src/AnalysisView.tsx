@@ -765,7 +765,7 @@ export function AnalysisView({
             setPlotError(null);
             const parsedHeader = plotHeader(parsed.payload);
             nextToken.current = parsedHeader.lineToken;
-            if (parsedHeader.panels.length > 0) {
+            if (parsedHeader.panels.length > 0 || parsedHeader.table != null) {
               payload.current = parsed.payload;
               askedLines.current = false;
               const header = applyLevelPaint(parsedHeader, loadPayload()) ?? parsedHeader;
@@ -780,7 +780,9 @@ export function AnalysisView({
             } else if (parsed.report.finished && parsed.report.phase === "done") {
               const current = metaRef.current;
               const sameView =
-                current != null && current.panels.length > 0 && current.title === parsedHeader.title;
+                current != null &&
+                (current.panels.length > 0 || current.table != null) &&
+                current.title === parsedHeader.title;
               if (!sameView) {
                 if (current != null) {
                   metaRef.current = null;
@@ -1017,6 +1019,34 @@ export function AnalysisView({
       setPlotHost((epoch) => epoch + 1);
     }
   };
+
+  // View-level automation for scripts/capture-doc-screenshots.mjs.
+  const automation = useRef({ controls, apply, shown, quiet, plotError });
+  useEffect(() => {
+    automation.current = { controls, apply, shown, quiet, plotError };
+  });
+  useEffect(() => {
+    const win = window as unknown as { __scanKitShots?: Record<string, unknown> };
+    const shots = (win.__scanKitShots ??= {});
+    shots.view = {
+      controls: () =>
+        automation.current.controls.map((control) => ({
+          id: control.id,
+          label: control.label,
+          options: control.options.map((option) => option.id),
+        })),
+      apply: (id: string, value: string) => automation.current.apply(id, value),
+      ready: () => {
+        const { shown, quiet, plotError } = automation.current;
+        return (
+          shown || quiet != null || plotError != null || (metaRef.current?.table?.rows?.length ?? 0) > 0
+        );
+      },
+    };
+    return () => {
+      delete shots.view;
+    };
+  }, []);
 
   const table = meta?.table;
   const gridRows = (table?.rows ?? []).filter((row) => row[0] !== "DVH" && row[0] !== "curve");

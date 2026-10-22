@@ -197,7 +197,7 @@ export function applyLevelPaint(header: PlotHeader | null, raw: string): PlotHea
  * up. A blank header does not swallow the first frame that actually has panels.
  */
 export function shownHeader(current: PlotHeader | null, incoming: PlotHeader): PlotHeader | null {
-  if (incoming.panels.length === 0) {
+  if (incoming.panels.length === 0 && incoming.table == null) {
     return current;
   }
   if (current == null || current.panels.length === 0) {

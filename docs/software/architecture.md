@@ -4,7 +4,7 @@ This is a project guide for people and agents changing the repository. It is not
 
 ## Product shape
 
-Scan Kit 2.0 replaces the Python, Qt, and VisPy application with Rust libraries and a Tauri 2 desktop shell. Domain behavior lives in Rust. The desktop UI, the MCP server, and tests call the same functions.
+Scan Kit 2.0 replaced the Python, Qt, and VisPy application with Rust libraries and a Tauri 2 desktop shell. Domain behavior lives in Rust. The desktop UI, the MCP server, and tests call the same functions.
 
 ```text
 Cargo.toml                      workspace
@@ -107,5 +107,4 @@ A library root is a local path, a Windows UNC path, or an `sftp://`, `smb://`, `
 
 - Not in the React components, except rendering and calls to Tauri commands.
 - Not in `scan-kit-mcp`, except protocol registration and transport.
-- Not in a new Python module.
 - Not in a second GPU stack, a dataframe crate, or an ORM.

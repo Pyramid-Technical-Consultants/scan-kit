@@ -4,7 +4,7 @@ This is the engineering design for keeping the desktop responsive while session 
 
 ## What is slow today
 
-`scan_kit_open_plot` builds the whole scene on one blocking thread and returns one payload. The webview drops a late response with `openSeq`, but the work still runs to the end. Monte Carlo in `scan-kit-compute` waits until every history is folded. The Python `McRun` already does the useful version of this: `step(budget)` queues a slice and returns while the GPU runs it, `preview` reads the mean dose so far, `extend` keeps the tallies, and the next slice grows or shrinks from how long the last wait blocked the caller. A sliced run matches a one-shot run because the tallies are integers and the fold gain is `1 / histories`.
+`scan_kit_open_plot` builds the whole scene on one blocking thread and returns one payload. The webview drops a late response with `openSeq`, but the work still runs to the end. Monte Carlo in `scan-kit-compute` waits until every history is folded. The retired Python `McRun` did the useful version of this: `step(budget)` queues a slice and returns while the GPU runs it, `preview` reads the mean dose so far, `extend` keeps the tallies, and the next slice grows or shrinks from how long the last wait blocked the caller. A sliced run matches a one-shot run because the tallies are integers and the fold gain is `1 / histories`.
 
 ## What this is
 
@@ -17,7 +17,7 @@ MCP and tests drain the same task to the end and still get one answer. `scan_kit
 - Not a job database, actor runtime, or thread-pool crate. One driver thread, `std::thread` joins, and the `wgpu` queue that compute already owns.
 - Not streaming CSV into the webview. Partial results are plot payloads.
 - Not a change to tally math. Slice size must not change the dose.
-- Not a PyO3 bridge. The Python `McRun` stays until the dose view is ported, and the Rust task copies its contract.
+- Not a PyO3 bridge. The retired Python `McRun` defined this contract; the Rust task copies it.
 
 ## Types
 
@@ -116,7 +116,7 @@ Switching Spot and Timeslice, or changing a control, starts a new generation and
 - `extend` keeps the buffers when the grid, seed, and spots match and the new history count is higher. Progress becomes `already_done / new_total`. A lower target does nothing. A different phantom cancels and starts over.
 - Closing the view or replacing the generation drops the buffers.
 
-The Rust test that guards this is the Python one: a sliced 60k-history run equals a one-shot run of the same seed; raising 30k to 60k resumes at 0.5 and finishes on the same ledger.
+The Rust test that guards this is the one the Python suite had: a sliced 60k-history run equals a one-shot run of the same seed; raising 30k to 60k resumes at 0.5 and finishes on the same ledger.
 
 ## Commands
 
