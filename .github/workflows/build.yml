@@ -60,6 +60,7 @@ jobs:
         run: cargo clippy -p scan-kit-plot --no-deps --target wasm32-unknown-unknown -- -D warnings
 
       - name: Install the wasm-bindgen CLI that matches Cargo.lock
+        shell: bash
         run: |
           VERSION=$(cargo metadata --format-version 1 --locked | jq -r '.packages[] | select(.name == "wasm-bindgen") | .version')
           cargo install wasm-bindgen-cli --locked --version "$VERSION"
@@ -120,6 +121,7 @@ jobs:
           targets: wasm32-unknown-unknown
 
       - name: Install the wasm-bindgen CLI that matches Cargo.lock
+        shell: bash
         run: |
           VERSION=$(cargo metadata --format-version 1 --locked | jq -r '.packages[] | select(.name == "wasm-bindgen") | .version')
           cargo install wasm-bindgen-cli --locked --version "$VERSION"
