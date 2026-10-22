@@ -141,7 +141,7 @@ pub fn gamma_index_norm(
     if mask.is_empty() {
         return (gamma, 0, 0);
     }
-    let mut offsets = gamma_offsets(spacing, distance_mm.max(1e-3), cap);
+    let mut offsets = gamma_offsets(spacing, distance_mm.max(1e-3), cap, shape);
     // A one-voxel axis is a plane. Stepping off it blends in the zeros outside,
     // which a hot evaluated plane would score as a match.
     offsets.retain(|o| (0..3).all(|axis| shape[axis] > 1 || o[axis] == 0.0));
@@ -383,12 +383,28 @@ fn window(
     }
 }
 
-pub(super) fn gamma_offsets(spacing: [f32; 3], dta: f32, cap: f32) -> Vec<[f32; 4]> {
+pub(super) fn gamma_offsets(
+    spacing: [f32; 3],
+    dta: f32,
+    cap: f32,
+    shape: [usize; 3],
+) -> Vec<[f32; 4]> {
+    if !dta.is_finite()
+        || dta <= 0.0
+        || !cap.is_finite()
+        || cap <= 0.0
+        || spacing.iter().any(|v| !v.is_finite() || *v <= 0.0)
+    {
+        return Vec::new();
+    }
     let reach = cap * dta;
     let mut axes = Vec::new();
-    for v in spacing {
+    for (axis, &v) in spacing.iter().enumerate() {
         let step = v / (v / (dta / 4.0)).ceil().max(1.0);
-        let n = (reach / step).ceil() as i32;
+        // A shift past the grid's own extent in this axis can never land on
+        // another voxel — and it keeps a silly dta from looping forever.
+        let limit = shape[axis] as f64 * v as f64 / step as f64;
+        let n = ((reach as f64 / step as f64).ceil() as i64).clamp(0, limit.ceil() as i64 + 1);
         let mut axis = Vec::new();
         for i in -n..=n {
             axis.push(i as f32 * step);
@@ -477,7 +493,7 @@ mod tests {
         let spacing = [1.0, 1.0, 1.0];
         let (gamma, _, scored) = gamma_index(reference, evaluated, shape, 3.0, 2.0, spacing, 10.0);
         assert_eq!(scored as usize, n);
-        let offsets = gamma_offsets(spacing, 2.0, 2.0);
+        let offsets = gamma_offsets(spacing, 2.0, 2.0, shape);
         let norm = evaluated.iter().copied().fold(0.0f32, f32::max);
         let dd = 0.03 * norm;
         for z in 0..shape[2] {
@@ -566,6 +582,18 @@ mod tests {
             gamma_index(&dose, &dose, shape, 3.0, 2.0, [1.0, 1.0, 1.0], 10.0);
         assert_eq!((scored, passed), (n as u32, n as u32));
         assert!(gamma.iter().all(|value| *value <= 1e-4));
+    }
+
+    #[test]
+    fn offsets_stay_bounded_by_the_grid() {
+        // A 1 km dta asks for shifts far wider than the grid; anything past the
+        // extent can never land on a voxel, so the set stays small.
+        let offsets = gamma_offsets([1.0, 1.0, 1.0], 1e6, 2.0, [10, 10, 10]);
+        assert!(offsets.iter().all(|o| (0..3).all(|a| o[a].abs() <= 12.0)));
+        for dta in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+            assert!(gamma_offsets([1.0; 3], dta, 2.0, [10, 10, 10]).is_empty());
+        }
+        assert!(gamma_offsets([0.0; 3], 2.0, 2.0, [10, 10, 10]).is_empty());
     }
 
     #[test]
