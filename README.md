@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="scan_kit/assets/icon.png" alt="Scan Kit" width="96">
+  <img src="assets/icon.png" alt="Scan Kit" width="96">
 </p>
 
 <h1 align="center">Scan Kit</h1>
@@ -30,10 +30,11 @@
 - [What Scan Kit does](#what-scan-kit-does)
 - [Get started](#get-started)
 - [Screenshots](#screenshots)
-- [The launcher](#the-launcher)
+- [The desktop app](#the-desktop-app)
 - [Data Analysis](#data-analysis)
 - [Analysis views](#analysis-views)
 - [Plan Synthesis](#plan-synthesis)
+- [Phantom Synthesis](#phantom-synthesis)
 - [Plan Runner](#plan-runner)
 - [Configuration Tuning](#configuration-tuning)
 - [Session data layout](#session-data-layout)
@@ -49,7 +50,7 @@ Beyond plotting, Scan Kit helps you:
 | Capability | What you get |
 |------------|--------------|
 | **Session comparison** | Overlay multiple sessions in the same view with distinct colors |
-| **Interactive replay** | Scrub timeslice channels (IC, dDose/dt, sigma, field) in one Qt viewer |
+| **Interactive replay** | Scrub timeslice channels (IC, dDose/dt, sigma, field) in one viewer |
 | **Plan authoring** | Generate `input_map.csv` from templates, DICOM RT Ion plans, or IBA PLD files |
 | **Patient QA** | In **Volumetric**, recalculate a DICOM RT Ion plan and its logged deliveries on the planning CT with the GPU Monte Carlo, with DVHs, clinical goals, gamma against the TPS dose and an RTDOSE/HTML report |
 | **Plan delivery** | Upload a plan to an RCI, run it, and download the session as a G3 zip |
@@ -160,7 +161,7 @@ Scan Kit is a single desktop application built on Tauri with a Rust core. Its la
 
 Paste a folder, Windows UNC share (`\\server\share\...`), or URL such as `sftp://user@host/var/log/ptc_ex` into the path field (placeholder: *Folder, UNC, or sftp://user@host/path*). **Browse...** can pick local and UNC/Network folders; on Linux desktops whose file dialogs speak GVfs/KIO it can pick `sftp://` and `smb://` too. Windows Explorer does not speak SFTP, so those URLs are still pasted. Press **Enter**, click away, or hit **↻** / **File → Refresh Sessions** to rediscover.
 
-SFTP uses SSH keys or the agent first. If those fail, Scan Kit prompts for a password and keeps it in memory until the app exits (never sqlite). Opening a remote session copies it into `~/.scan-kit/remote-cache`; **File → Clear Remote Cache…** (and Debug) shows the size and deletes that folder. List/open failures show under the path field and in Debug. The last location is remembered in `~/.scan-kit`. When running a frozen executable with no remembered folder, the default is the folder that contains the executable.
+SFTP uses SSH keys or the agent first. If those fail, Scan Kit prompts for a password and keeps it in memory until the app exits (never sqlite). Opening a remote session copies it into `~/.scan-kit/remote-cache`. List/open failures show under the path field and in Debug. The last location is remembered in `~/.scan-kit`. When running a frozen executable with no remembered folder, the default is the folder that contains the executable.
 
 ### 2. Select sessions
 
@@ -175,22 +176,11 @@ Remote deletes are permanent (no recycle bin on the host). Local sessions go to 
 
 ### 3. Annotate sessions (optional)
 
-Double-click (or press **F2** on) the **Note** column to add free-text notes. **Edit → Undo / Redo** covers note edits. Notes, plot settings, window geometry, theme, and the last data folder are stored in `~/.scan-kit/scan-kit.sqlite` so they survive app updates and do not depend on where Scan Kit is installed. Older `app_settings.json`, `session_notes.json`, and `<data_source>/settings.json` files are imported once, then left as a snapshot.
+Click the **Note** column to add free-text notes in place. **Edit → Undo / Redo** (Ctrl+Z / Ctrl+Y) covers note edits. Notes, plot settings, window geometry, and the last data folder are stored in `~/.scan-kit/scan-kit.sqlite` so they survive app updates and do not depend on where Scan Kit is installed. Older `app_settings.json`, `session_notes.json`, and `<data_source>/settings.json` files are imported once, then left as a snapshot.
 
-### 4. Tune global settings
+### 4. Open analysis views
 
-Two controls affect most dose-related views:
-
-| Setting | Options |
-|---------|---------|
-| **BG Subtraction** | Off / On |
-| **Calibration** | Off · Per-Session · Constrained |
-
-Settings persist in `~/.scan-kit/scan-kit.sqlite` and propagate to views that are already open. These plot-calibration modes never write `devices.xml`. That is **Dose Calibration** on the Configuration Tuning tab.
-
-### 5. Open analysis views
-
-Click any button in the right-hand panel, or use **Analysis** in the menu bar. **Core Analysis** and **Specialized Analysis** are the two launcher groups. Each view runs in a background subprocess; a warm worker pool makes the first click feel snappy.
+With sessions selected, the toolbar above the table shows buttons for the primary views plus a dropdown with the rest. **Core Analysis** and **Specialized Analysis** are the two groups. Views load progressively in-process — the plot appears while the heavy data is still streaming in.
 
 ## Analysis views
 
@@ -198,7 +188,7 @@ Views are organized in the launcher as **Core Analysis** (configurable explorers
 
 ### Core analysis
 
-Configurable Qt shells for the metrics most sessions need day to day.
+Interactive views for the metrics most sessions need day to day.
 
 | View | Summary |
 |------|---------|
@@ -310,7 +300,7 @@ The Scan Kit 2 **Plan Runner** tab is the operator console for an RCI:
 3. **Start** / **Pause** / **Stop** / **Reset** follow the controller ready permit. Start enables when the RCI grants the permit.
 4. After the run, **Download** saves the session zip. The remote folder is the session id under `/root/reports/session/` (or the controller's session directory). Data Analysis opens that zip like any other session.
 
-Live tiles show control point, energy, layer, elapsed time, start permit, and whether the uploaded points were accepted. If the controller omitted `spot_data.csv`, the download joins the device spot files. Iso conversion of those positions stays with the Python session builder.
+Live tiles show control point, energy, layer, elapsed time, start permit, and whether the uploaded points were accepted. If the controller omitted `spot_data.csv`, the download joins the device spot files. The packed session keeps the raw device files and the map2map device config, so analysis converts strip positions to isocenter coordinates when that config is present and keeps raw positions when it is not.
 
 <p align="center">
   <img src="docs/images/launcher-plan-runner.png" alt="Plan Runner tab before connecting to an RCI" width="720">
@@ -508,4 +498,4 @@ CI verifies the tag matches the workspace version before publishing. The project
 
 [MIT](LICENSE). Copyright (c) 2026 Pyramid Technical Consultants
 
-The Monte Carlo physics and material data are ported from [MCsquare](https://gitlab.com/openmcsquare/MCsquare), Université catholique de Louvain, under the Apache License 2.0 ([`scan_kit/assets/MCsquare_LICENSE.txt`](scan_kit/assets/MCsquare_LICENSE.txt)).
+The Monte Carlo physics and material data are ported from [MCsquare](https://gitlab.com/openmcsquare/MCsquare), Université catholique de Louvain, under the Apache License 2.0 ([`assets/MCsquare_LICENSE.txt`](assets/MCsquare_LICENSE.txt)).

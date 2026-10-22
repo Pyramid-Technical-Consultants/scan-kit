@@ -1,7 +1,6 @@
 //! Column aliases and the G2 current scale.
 //!
-//! The tables match `scan_kit/common/schema.py`. That module stays until the
-//! Qt app no longer imports it.
+//! The tables match the retired `scan_kit/common/schema.py`.
 
 pub const POSITION_KEY_G2_RAW: &str = "spot_raw";
 pub const POSITION_KEY_G3_RAW: &str = "spot_position_raw";
