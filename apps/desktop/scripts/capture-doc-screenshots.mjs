@@ -287,9 +287,6 @@ async function main() {
         label: `${args.probe} controls`,
       });
       console.log(JSON.stringify(await shots("view.controls()"), null, 2));
-      cdp.close();
-      if (!args.keepOpen) child.kill("SIGTERM");
-      if (devServer != null) spawn("taskkill", ["/pid", String(devServer.pid), "/T", "/F"], { stdio: "ignore" });
       return;
     }
 

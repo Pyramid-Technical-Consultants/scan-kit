@@ -780,7 +780,9 @@ export function AnalysisView({
             } else if (parsed.report.finished && parsed.report.phase === "done") {
               const current = metaRef.current;
               const sameView =
-                current != null && current.panels.length > 0 && current.title === parsedHeader.title;
+                current != null &&
+                (current.panels.length > 0 || current.table != null) &&
+                current.title === parsedHeader.title;
               if (!sameView) {
                 if (current != null) {
                   metaRef.current = null;
