@@ -315,6 +315,16 @@ impl WebPlot {
     }
 }
 
+impl Drop for WebPlot {
+    /// Free the GPU device when the wrapper drops. Without this the D3D12
+    /// device and its command queue stay alive until the browser collects the
+    /// `GPUDevice` object, which lags far enough behind view switching to hit
+    /// `E_OUTOFMEMORY` creating the next queue.
+    fn drop(&mut self) {
+        self.gpu.device.destroy();
+    }
+}
+
 fn js(err: impl std::fmt::Display) -> JsValue {
     JsValue::from_str(&err.to_string())
 }

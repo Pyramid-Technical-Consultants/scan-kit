@@ -184,10 +184,11 @@ pub(crate) fn read_remote_session_file(
     }
     let mut fs = crate::remote::connect(&remote, &password_of(&remote)).ok()?;
     let base = remote.path.trim_end_matches('/');
-    for path in [
-        format!("{base}/{filename}"),
-        format!("{base}/{session_id}/{filename}"),
-    ] {
+    let mut candidates = vec![format!("{base}/{filename}")];
+    if discover::valid_session_id(session_id) {
+        candidates.push(format!("{base}/{session_id}/{filename}"));
+    }
+    for path in candidates {
         if let Ok(Some(bytes)) = fs.read(&path) {
             return Some(bytes);
         }
@@ -202,7 +203,9 @@ pub(crate) fn remote_fingerprint(session_url: &str, session_id: &str) -> Option<
     let mut candidates = vec![base.to_owned()];
     if !archive_name(&remote.path) {
         candidates.insert(0, format!("{base}/termination_summary.txt"));
-        candidates.insert(1, format!("{base}/{session_id}/termination_summary.txt"));
+        if discover::valid_session_id(session_id) {
+            candidates.insert(1, format!("{base}/{session_id}/termination_summary.txt"));
+        }
     }
     for path in candidates {
         let stat = fs.stat(&path).ok()??;
@@ -360,6 +363,9 @@ fn relative_remote(library_canonical: &str, session: &Remote) -> String {
 }
 
 fn resolve_container(container: &Path, session_id: &str) -> PathBuf {
+    if !discover::valid_session_id(session_id) {
+        return container.to_path_buf();
+    }
     let inner = container.join(session_id);
     if inner.join("input_map.csv").is_file() {
         return inner;
@@ -1001,6 +1007,9 @@ pub(crate) fn connect_timeout() -> Duration {
 /// Folder and leftover archives for `session_id` under the opened library
 /// `root` — remote specs for a remote root, local paths otherwise.
 pub(crate) fn session_storage_paths(root: &str, session_id: &str) -> Result<Vec<String>, String> {
+    if !discover::valid_session_id(session_id) {
+        return Err(format!("invalid session id {session_id:?}"));
+    }
     let mut names = vec![session_id.to_string()];
     for (suffix, _) in discover::ARCHIVE_SUFFIXES {
         names.push(format!("{session_id}{suffix}"));

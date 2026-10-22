@@ -857,6 +857,13 @@ fn decode_chunks(mut data: &[u8]) -> Result<Vec<u8>, String> {
 }
 
 fn package_zip(dir: &Path, zip_path: &Path, session_id: &str) -> Result<(), String> {
+    // The id comes from the device's file_header_meta — a hostile or broken
+    // table must not write `../` members into the archive.
+    let session_id = if crate::discover::valid_session_id(session_id) {
+        session_id
+    } else {
+        "session"
+    };
     if let Some(parent) = zip_path.parent() {
         std::fs::create_dir_all(parent).map_err(|err| err.to_string())?;
     }

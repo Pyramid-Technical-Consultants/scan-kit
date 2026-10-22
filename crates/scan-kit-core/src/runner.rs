@@ -317,10 +317,11 @@ pub fn session_zip_dest(dest: &str) -> Option<String> {
 }
 
 pub fn default_session_zip_path(current: &str, last_folder: &str, session_id: &str) -> String {
-    let stem = if session_id.trim().is_empty() {
-        "session"
+    let stem = session_id.trim();
+    let stem = if crate::session::valid_session_id(stem) {
+        stem
     } else {
-        session_id.trim()
+        "session"
     };
     let name = format!("{stem}.zip");
     let current = current.trim();

@@ -82,7 +82,9 @@ pub use segment::{
     apply_mask, layer_edges, parse_segments, row_mask, scrub_control, scrub_limits,
     segments_control, segments_from, segments_json, time_end, BeamGate, CompareOp, Rank, Segment,
 };
-pub use session::{merge_session_geom, parse_termination_summary_text, SessionMeta, SummaryDate};
+pub use session::{
+    merge_session_geom, parse_termination_summary_text, valid_session_id, SessionMeta, SummaryDate,
+};
 pub use task::{
     adapt_chunk, decode_poll, encode_poll, generation_matches, settle, Cancel, Phase, Poll, Report,
 };

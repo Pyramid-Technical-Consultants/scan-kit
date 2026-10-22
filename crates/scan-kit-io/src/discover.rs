@@ -275,7 +275,11 @@ pub fn storage_fingerprint(storage: &Path, session_id: &str) -> Option<(i64, i64
     }
     let target = if storage.is_dir() {
         let outer = storage.join("termination_summary.txt");
-        let inner = storage.join(session_id).join("termination_summary.txt");
+        let inner = if valid_session_id(session_id) {
+            storage.join(session_id).join("termination_summary.txt")
+        } else {
+            storage.join("termination_summary.txt")
+        };
         if outer.is_file() {
             outer
         } else if inner.is_file() {
@@ -371,6 +375,9 @@ fn is_unpacked_session(folder: &Path) -> bool {
 /// `library/<id>/<id>/input_map.csv`. A miss stays on that session folder.
 /// It does not fall back to the library, which would read every other session.
 pub fn session_directory(library: &Path, session_id: &str) -> PathBuf {
+    if !valid_session_id(session_id) {
+        return library.to_path_buf();
+    }
     let nested = library.join(session_id).join(session_id);
     if nested.join("input_map.csv").is_file() {
         return nested;
@@ -400,7 +407,7 @@ pub(crate) fn archive_kind(name: &str) -> Option<(String, &'static str)> {
     for (suffix, kind) in ARCHIVE_SUFFIXES {
         if lower.ends_with(suffix) {
             let session_id = name[..name.len() - suffix.len()].to_owned();
-            if session_id.is_empty() {
+            if !valid_session_id(&session_id) {
                 return None;
             }
             return Some((session_id, *kind));
@@ -441,6 +448,9 @@ fn zip_session_dir(path: &Path) -> Option<String> {
         let Some((top, _)) = name.split_once('/') else {
             continue;
         };
+        if !valid_session_id(top) {
+            continue;
+        }
         tops.insert(top.to_owned());
         if name.ends_with("/input_map.csv") || name.ends_with("/termination_summary.txt") {
             markers.insert(top.to_owned());
@@ -459,6 +469,8 @@ fn file_name(path: &Path) -> Option<String> {
     path.file_name()
         .map(|name| name.to_string_lossy().into_owned())
 }
+
+pub(crate) use scan_kit_core::valid_session_id;
 
 fn is_timeslice(name: &str) -> bool {
     normalize_member(name).ends_with("timeslice_data_device_units.csv")
@@ -825,5 +837,40 @@ mod tests {
         .unwrap();
         assert!(summary.starts_with(b"Primary total dose"));
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn traversal_members_do_not_become_the_session_id() {
+        let root = std::env::temp_dir().join(format!(
+            "scan-kit-ziptrav-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        write_zip(
+            &root.join("bundle.zip"),
+            &[("../../evil/input_map.csv", b"energy\n70\n")],
+        )
+        .unwrap();
+
+        let found = discover(&root).unwrap();
+        assert_eq!(found.entries.len(), 1);
+        assert_eq!(found.entries[0].session_id, "bundle");
+        assert!(crate::location::session_storage_paths(&root.to_string_lossy(), "..").is_err());
+        assert_eq!(session_directory(&root, ".."), root);
+        assert_eq!(session_directory(&root, "."), root);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_dot_prefixed_archive_is_not_a_session() {
+        assert_eq!(archive_kind("..zip"), None);
+        assert_eq!(archive_kind(".zip"), None);
+        assert_eq!(archive_kind("..tar.bz2"), None);
+        assert_eq!(archive_kind("logs.zip"), Some(("logs".to_owned(), "zip")));
     }
 }

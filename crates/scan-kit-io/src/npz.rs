@@ -19,9 +19,16 @@ impl Npy {
     }
 
     pub fn count(&self) -> Result<usize, String> {
-        let n = self.shape.iter().copied().product::<usize>().max(1);
-        let size = self.itemsize()?;
-        if self.data.len() < n * size {
+        let n = self
+            .shape
+            .iter()
+            .copied()
+            .try_fold(1usize, |acc, dim| acc.checked_mul(dim))
+            .ok_or("npy shape overflows")?;
+        let need = n
+            .checked_mul(self.itemsize()?)
+            .ok_or("npy shape overflows")?;
+        if self.data.len() < need {
             return Err(format!("npy {} is short", self.descr));
         }
         Ok(n)
@@ -428,6 +435,24 @@ mod tests {
         assert_eq!(files["f16s"].f16s().unwrap(), vec![0.5, 1.5]);
         assert_eq!(files["text"].strings().unwrap(), vec!["water"]);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_overflowing_shape_errors_instead_of_panicking() {
+        let npy = Npy {
+            descr: "<f8".into(),
+            shape: vec![usize::MAX / 8 + 2],
+            data: vec![0; 8],
+        };
+        assert!(npy.count().is_err());
+        assert!(npy.f64s().is_err());
+        let npy = Npy {
+            descr: "<f8".into(),
+            shape: vec![usize::MAX / 8 + 1],
+            data: vec![0; 8],
+        };
+        // n * size wraps past the short-data check — must not reach the reads.
+        assert!(npy.f64s().is_err());
     }
 
     /// What `np.savez_compressed` wrote, `load_npz` must read back.
