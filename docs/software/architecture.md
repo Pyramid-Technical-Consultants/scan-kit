@@ -21,7 +21,7 @@ apps/desktop/src-tauri/         Tauri 2 shell
 
 `scan-kit-core` does not depend on Tauri, the MCP SDK, sqlite, or `wgpu`. `scan-kit-io` and `scan-kit-compute` depend on core. `scan-kit-plot` depends on core. `scan-kit-compute` also depends on `scan-kit-io` so one function can load a view, and on `scan-kit-plot` to paint it. Only `scan-kit-plot` and `scan-kit-compute` link `wgpu`. `scan-kit-mcp` registers the concatenation of each crate's tool list and dispatches to that crate. It does not reimplement an operation. The Tauri shell calls the same functions through commands.
 
-`scan-kit-dicom` reads an explicit little-endian DICOM folder. The Monte Carlo transport shader lives in `scan-kit-compute`. The material tables stay under `scan_kit/assets/`.
+`scan-kit-dicom` reads an explicit little-endian DICOM folder. The Monte Carlo transport shader lives in `scan-kit-compute`. The material tables stay under `assets/`.
 
 ## MCP first
 

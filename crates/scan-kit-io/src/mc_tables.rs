@@ -4,7 +4,7 @@ use std::sync::OnceLock;
 
 use crate::npz::read_npz;
 
-const NPZ: &[u8] = include_bytes!("../../../scan_kit/assets/mc_materials.npz");
+const NPZ: &[u8] = include_bytes!("../../../assets/mc_materials.npz");
 
 #[derive(Clone, Debug)]
 pub struct McTables {

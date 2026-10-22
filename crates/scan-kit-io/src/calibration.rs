@@ -33,20 +33,20 @@ const BUILTINS: &[(&str, &str, &str, &str)] = &[
     (
         "default",
         "Default",
-        include_str!("../../../scan_kit/assets/mcsquare/Scanners/default/HU_Density_Conversion.txt"),
-        include_str!("../../../scan_kit/assets/mcsquare/Scanners/default/HU_Material_Conversion.txt"),
+        include_str!("../../../assets/mcsquare/Scanners/default/HU_Density_Conversion.txt"),
+        include_str!("../../../assets/mcsquare/Scanners/default/HU_Material_Conversion.txt"),
     ),
     (
         "water",
         "Water phantom",
-        include_str!("../../../scan_kit/assets/mcsquare/Scanners/Water_Phantom/HU_Density_Conversion.txt"),
-        include_str!("../../../scan_kit/assets/mcsquare/Scanners/Water_Phantom/HU_Material_Conversion.txt"),
+        include_str!("../../../assets/mcsquare/Scanners/Water_Phantom/HU_Density_Conversion.txt"),
+        include_str!("../../../assets/mcsquare/Scanners/Water_Phantom/HU_Material_Conversion.txt"),
     ),
     (
         "solid",
         "Solid phantom",
-        include_str!("../../../scan_kit/assets/mcsquare/Scanners/SolidWater_Phantom/HU_Density_Conversion.txt"),
-        include_str!("../../../scan_kit/assets/mcsquare/Scanners/SolidWater_Phantom/HU_Material_Conversion.txt"),
+        include_str!("../../../assets/mcsquare/Scanners/SolidWater_Phantom/HU_Density_Conversion.txt"),
+        include_str!("../../../assets/mcsquare/Scanners/SolidWater_Phantom/HU_Material_Conversion.txt"),
     ),
 ];
 

@@ -4,9 +4,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 const DENSITY: &str =
-    include_str!("../../../scan_kit/assets/mcsquare/Scanners/default/HU_Density_Conversion.txt");
+    include_str!("../../../assets/mcsquare/Scanners/default/HU_Density_Conversion.txt");
 const MATERIALS: &str =
-    include_str!("../../../scan_kit/assets/mcsquare/Scanners/default/HU_Material_Conversion.txt");
+    include_str!("../../../assets/mcsquare/Scanners/default/HU_Material_Conversion.txt");
 
 #[derive(Clone, Debug)]
 pub struct CtVolume {
@@ -284,16 +284,16 @@ pub fn gantry_to_patient(
 }
 
 const WATER_DENSITY: &str = include_str!(
-    "../../../scan_kit/assets/mcsquare/Scanners/Water_Phantom/HU_Density_Conversion.txt"
+    "../../../assets/mcsquare/Scanners/Water_Phantom/HU_Density_Conversion.txt"
 );
 const WATER_MATERIAL: &str = include_str!(
-    "../../../scan_kit/assets/mcsquare/Scanners/Water_Phantom/HU_Material_Conversion.txt"
+    "../../../assets/mcsquare/Scanners/Water_Phantom/HU_Material_Conversion.txt"
 );
 const SOLID_DENSITY: &str = include_str!(
-    "../../../scan_kit/assets/mcsquare/Scanners/SolidWater_Phantom/HU_Density_Conversion.txt"
+    "../../../assets/mcsquare/Scanners/SolidWater_Phantom/HU_Density_Conversion.txt"
 );
 const SOLID_MATERIAL: &str = include_str!(
-    "../../../scan_kit/assets/mcsquare/Scanners/SolidWater_Phantom/HU_Material_Conversion.txt"
+    "../../../assets/mcsquare/Scanners/SolidWater_Phantom/HU_Material_Conversion.txt"
 );
 
 /// Density from a named scanner curve. `default` keeps the built-in table.

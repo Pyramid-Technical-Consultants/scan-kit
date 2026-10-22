@@ -11,8 +11,7 @@ from PySide6.QtGui import QIcon
 
 from .win_identity import prepare_windows_app_identity
 
-_PACKAGE_DIR = Path(__file__).resolve().parent.parent
-_ASSETS_DIR = _PACKAGE_DIR / "assets"
+_ASSETS_DIR = Path(__file__).resolve().parents[2] / "assets"
 _SVG_NAME = "scan-kit-icon.svg"
 _PNG_NAME = "icon.png"
 _ICO_NAME = "icon.ico"
@@ -35,7 +34,7 @@ def desktop_file_name() -> str:
 
 
 def asset_path(name: str) -> Path:
-    """Return the path to a file under ``scan_kit/assets/``."""
+    """Return the path to a file under ``assets/``."""
     if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
         return Path(sys._MEIPASS) / "scan_kit" / "assets" / name
     return _ASSETS_DIR / name
