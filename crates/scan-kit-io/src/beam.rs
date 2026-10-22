@@ -1,5 +1,7 @@
 //! UPenn double-Gaussian beam model. Records match the transport shader's stride of 40.
 
+use std::path::Path;
+
 use scan_kit_dicom::gantry_to_patient;
 
 use super::mc_tables::mc_tables;
@@ -29,14 +31,112 @@ pub(crate) fn bdl_text(name: &str) -> &'static str {
     }
 }
 
-struct Model {
-    nozzle: f32,
-    smx: f32,
-    smy: f32,
+/// A parsed BDL machine: nozzle optics, energy rows, range-shifter defaults.
+pub struct BeamModel {
+    pub nozzle: f32,
+    pub smx: f32,
+    pub smy: f32,
     rows: Vec<[f32; 18]>,
     shifter_material: i32,
     shifter_density: f32,
     shifter_wet: f32,
+}
+
+impl BeamModel {
+    /// A BDL `.txt` on disk — the validator's `third_party/MCsquare/BDL` files.
+    pub fn read(path: &Path) -> Result<BeamModel, String> {
+        let text = std::fs::read_to_string(path).map_err(|err| format!("{path:?}: {err}"))?;
+        Ok(BeamModel::parse(&text))
+    }
+
+    fn parse(text: &str) -> BeamModel {
+        let mut nozzle = 0.0;
+        let mut smx = 0.0;
+        let mut smy = 0.0;
+        let mut shifter_material = 0;
+        let mut shifter_density = 0.0;
+        let mut shifter_wet = 0.0;
+        let mut rows = Vec::new();
+        let mut lines = text.lines();
+        while let Some(line) = lines.next() {
+            let head = line.trim();
+            if head == "Nozzle exit to Isocenter distance" {
+                nozzle = number(lines.next().unwrap_or(""));
+            } else if head == "SMX to Isocenter distance" {
+                smx = number(lines.next().unwrap_or(""));
+            } else if head == "SMY to Isocenter distance" {
+                smy = number(lines.next().unwrap_or(""));
+            } else if head == "Range Shifter parameters" {
+                for line in lines.by_ref() {
+                    if !line.contains('=') {
+                        break;
+                    }
+                    let (key, value) = line.split_once('=').unwrap_or(("", ""));
+                    let value = value.split('#').next().unwrap_or("").trim();
+                    match key.trim() {
+                        "RS_material" => shifter_material = value.parse().unwrap_or(0),
+                        "RS_density" => shifter_density = value.parse().unwrap_or(0.0),
+                        "RS_WET" => shifter_wet = value.parse().unwrap_or(0.0),
+                        _ => {}
+                    }
+                }
+            } else if head == "Beam parameters" {
+                let _count = lines.next();
+                let _header = lines.next();
+                for line in lines.by_ref() {
+                    let values: Vec<f32> = line
+                        .split_whitespace()
+                        .filter_map(|v| v.parse().ok())
+                        .collect();
+                    if values.len() == 18 {
+                        let mut row = [0.0; 18];
+                        row.copy_from_slice(&values);
+                        rows.push(row);
+                    }
+                }
+            }
+        }
+        BeamModel {
+            nozzle,
+            smx,
+            smy,
+            rows,
+            shifter_material,
+            shifter_density,
+            shifter_wet,
+        }
+    }
+
+    /// Kernel beam record: *rotation* takes the beam frame to the volume frame,
+    /// where the isocenter sits at *isocenter_mm*.
+    pub fn beam_record(&self, rotation: &[f32; 9], isocenter_mm: [f32; 3]) -> [f32; 16] {
+        let mut rec = [0.0; 16];
+        rec[..9].copy_from_slice(rotation);
+        rec[9] = isocenter_mm[0] / 10.0;
+        rec[10] = isocenter_mm[1] / 10.0;
+        rec[11] = isocenter_mm[2] / 10.0;
+        rec[12] = self.nozzle;
+        rec[13] = self.smx;
+        rec[14] = self.smy;
+        rec
+    }
+
+    /// Kernel spot record through this machine (stride 40).
+    pub fn spot_record(
+        &self,
+        energy: f32,
+        x: f32,
+        y: f32,
+        beam: f32,
+        wet_mm: f32,
+        distance_mm: f32,
+    ) -> Result<[f32; 40], String> {
+        fill_spot(self, energy, x, y, beam, wet_mm, distance_mm)
+    }
+
+    pub fn protons_per_mu(&self, energy: f32) -> f32 {
+        column(&self.rows, 3, energy)
+    }
 }
 
 pub fn beam_record(
@@ -61,7 +161,7 @@ pub fn spot_record(
 }
 
 fn fill_spot(
-    model: &Model,
+    model: &BeamModel,
     energy: f32,
     x: f32,
     y: f32,
@@ -173,62 +273,8 @@ pub(crate) fn protons_per_mu_bdl(energy: f32, bdl: &str) -> f32 {
     column(&model_of(bdl).rows, 3, energy)
 }
 
-fn model_of(name: &str) -> Model {
-    let mut nozzle = 0.0;
-    let mut smx = 0.0;
-    let mut smy = 0.0;
-    let mut shifter_material = 0;
-    let mut shifter_density = 0.0;
-    let mut shifter_wet = 0.0;
-    let mut rows = Vec::new();
-    let mut lines = bdl_text(name).lines();
-    while let Some(line) = lines.next() {
-        let head = line.trim();
-        if head == "Nozzle exit to Isocenter distance" {
-            nozzle = number(lines.next().unwrap_or(""));
-        } else if head == "SMX to Isocenter distance" {
-            smx = number(lines.next().unwrap_or(""));
-        } else if head == "SMY to Isocenter distance" {
-            smy = number(lines.next().unwrap_or(""));
-        } else if head == "Range Shifter parameters" {
-            for line in lines.by_ref() {
-                if !line.contains('=') {
-                    break;
-                }
-                let (key, value) = line.split_once('=').unwrap_or(("", ""));
-                let value = value.split('#').next().unwrap_or("").trim();
-                match key.trim() {
-                    "RS_material" => shifter_material = value.parse().unwrap_or(0),
-                    "RS_density" => shifter_density = value.parse().unwrap_or(0.0),
-                    "RS_WET" => shifter_wet = value.parse().unwrap_or(0.0),
-                    _ => {}
-                }
-            }
-        } else if head == "Beam parameters" {
-            let _count = lines.next();
-            let _header = lines.next();
-            for line in lines.by_ref() {
-                let values: Vec<f32> = line
-                    .split_whitespace()
-                    .filter_map(|v| v.parse().ok())
-                    .collect();
-                if values.len() == 18 {
-                    let mut row = [0.0; 18];
-                    row.copy_from_slice(&values);
-                    rows.push(row);
-                }
-            }
-        }
-    }
-    Model {
-        nozzle,
-        smx,
-        smy,
-        rows,
-        shifter_material,
-        shifter_density,
-        shifter_wet,
-    }
+fn model_of(name: &str) -> BeamModel {
+    BeamModel::parse(bdl_text(name))
 }
 
 fn number(line: &str) -> f32 {

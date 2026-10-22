@@ -1,8 +1,8 @@
 //! MCsquare material tables. The transport shader's baked offsets assume this packing.
 
-use std::collections::BTreeMap;
-use std::io::{Cursor, Read};
 use std::sync::OnceLock;
+
+use crate::npz::read_npz;
 
 const NPZ: &[u8] = include_bytes!("../../../scan_kit/assets/mc_materials.npz");
 
@@ -13,14 +13,16 @@ pub struct McTables {
     pub media: Vec<String>,
     /// MCsquare material labels, one per medium, in table order.
     pub ids: Vec<i32>,
+    /// MCsquare material names (`mcsquare_names`), in table order.
+    pub mcsquare_names: Vec<String>,
     /// Mass stopping power over water at 100 MeV.
     pub spr: Vec<f32>,
-}
-
-struct Npy {
-    descr: String,
-    shape: Vec<usize>,
-    data: Vec<u8>,
+    /// Physical density (g/cm³), one per medium, in table order.
+    pub rho: Vec<f64>,
+    /// Mass stopping power rows (MeV·cm²/g over `stop_energies`), per medium.
+    pub stop: Vec<Vec<f64>>,
+    /// Energy grid the `stop` rows are tabulated on (MeV).
+    pub stop_energies: Vec<f64>,
 }
 
 pub fn mc_tables() -> &'static McTables {
@@ -30,13 +32,13 @@ pub fn mc_tables() -> &'static McTables {
 
 fn pack() -> Result<McTables, String> {
     let files = read_npz(NPZ)?;
-    let media = strings(files.get("media").ok_or("media")?)?;
-    let props = f64s(files.get("m_props").ok_or("m_props")?)?;
-    let frac = f64s(files.get("m_frac").ok_or("m_frac")?)?;
-    let stop = f64s(files.get("m_stop").ok_or("m_stop")?)?;
-    let nuc = f64s(files.get("m_nuc").ok_or("m_nuc")?)?;
-    let comp = i32s(files.get("m_comp").ok_or("m_comp")?)?;
-    let kind = i32s(files.get("m_type").ok_or("m_type")?)?;
+    let media = files.get("media").ok_or("media")?.strings()?;
+    let props = files.get("m_props").ok_or("m_props")?.f64s()?;
+    let frac = files.get("m_frac").ok_or("m_frac")?.f64s()?;
+    let stop = files.get("m_stop").ok_or("m_stop")?.f64s()?;
+    let nuc = files.get("m_nuc").ok_or("m_nuc")?.f64s()?;
+    let comp = files.get("m_comp").ok_or("m_comp")?.i32s()?;
+    let kind = files.get("m_type").ok_or("m_type")?.i32s()?;
     let nm = media.len();
     let width = files.get("m_comp").ok_or("m_comp")?.shape[1];
     let stop_bins = files.get("m_stop").ok_or("m_stop")?.shape[1];
@@ -74,7 +76,7 @@ fn pack() -> Result<McTables, String> {
         "sec_cD",
         "sec_cDD",
     ] {
-        push_f64(&mut floats, &f64s(files.get(key).ok_or(key)?)?);
+        push_f64(&mut floats, &files.get(key).ok_or(key)?.f64s()?);
     }
 
     let mut m_int = vec![0i32; nm * (2 + width)];
@@ -91,9 +93,9 @@ fn pack() -> Result<McTables, String> {
         }
         m_int[base + 1] = ncomp;
     }
-    let e_type = i32s(files.get("e_type").ok_or("e_type")?)?;
-    let el_start = i32s(files.get("el_start").ok_or("el_start")?)?;
-    let in_start = i32s(files.get("in_start").ok_or("in_start")?)?;
+    let e_type = files.get("e_type").ok_or("e_type")?.i32s()?;
+    let el_start = files.get("el_start").ok_or("el_start")?.i32s()?;
+    let in_start = files.get("in_start").ok_or("in_start")?.i32s()?;
     let ne = e_type.len();
     let mut el = vec![0i32; ne * 5];
     for e in 0..ne {
@@ -106,9 +108,13 @@ fn pack() -> Result<McTables, String> {
     let mut ints = Vec::new();
     ints.extend_from_slice(&m_int);
     ints.extend_from_slice(&el);
-    ints.extend_from_slice(&i32s(files.get("in_rows_start").ok_or("in_rows_start")?)?);
-    ints.extend_from_slice(&i32s(files.get("in_rows_n").ok_or("in_rows_n")?)?);
-    let ids = i32s(files.get("mcsquare_ids").ok_or("mcsquare_ids")?)?;
+    ints.extend_from_slice(&files.get("in_rows_start").ok_or("in_rows_start")?.i32s()?);
+    ints.extend_from_slice(&files.get("in_rows_n").ok_or("in_rows_n")?.i32s()?);
+    let ids = files.get("mcsquare_ids").ok_or("mcsquare_ids")?.i32s()?;
+    let mcsquare_names = files
+        .get("mcsquare_names")
+        .ok_or("mcsquare_names")?
+        .strings()?;
     let bin = (100.0f64 / 0.5).round() as usize;
     let water = stop[bin];
     let spr = (0..nm)
@@ -119,163 +125,67 @@ fn pack() -> Result<McTables, String> {
         ints,
         media,
         ids,
+        mcsquare_names,
         spr,
+        rho: (0..nm).map(|m| props[m * 3]).collect(),
+        stop: (0..nm)
+            .map(|m| stop[m * stop_bins..(m + 1) * stop_bins].to_vec())
+            .collect(),
+        stop_energies: (0..stop_bins).map(|i| i as f64 * 0.5).collect(),
     })
+}
+
+/// Physical density (g/cm³) of a table medium.
+pub fn medium_rho(medium: &str) -> Result<f64, String> {
+    let tables = mc_tables();
+    let m = tables
+        .media
+        .iter()
+        .position(|name| name == medium)
+        .ok_or_else(|| format!("medium {medium}"))?;
+    Ok(tables.rho[m])
+}
+
+/// CSDA range (mm) of a proton in *medium* from MCsquare's stopping powers
+/// (0.5 MeV bins from 0, trapezoid on a fine grid like the Python validator).
+pub fn csda_range_mm(medium: &str, energy: f64) -> Result<f64, String> {
+    let tables = mc_tables();
+    let m = tables
+        .media
+        .iter()
+        .position(|name| name == medium)
+        .ok_or_else(|| format!("medium {medium}"))?;
+    let stop = tables.stop[m]
+        .iter()
+        .map(|s| s * tables.rho[m] / 1e6)
+        .collect::<Vec<_>>(); // MeV/cm
+    let energies = &tables.stop_energies;
+    let dx = (energy - 0.5) / 1999.0;
+    let mut area = 0.0;
+    let mut prev = 1.0 / interp_lin(0.5, energies, &stop);
+    for i in 1..2000 {
+        let e = 0.5 + (energy - 0.5) * i as f64 / 1999.0;
+        let inv = 1.0 / interp_lin(e, energies, &stop);
+        area += 0.5 * (prev + inv) * dx;
+        prev = inv;
+    }
+    Ok(area * 10.0)
+}
+
+fn interp_lin(x: f64, xs: &[f64], ys: &[f64]) -> f64 {
+    if x <= xs[0] {
+        return ys[0];
+    }
+    if x >= xs[xs.len() - 1] {
+        return ys[ys.len() - 1];
+    }
+    let i = xs.partition_point(|&v| v < x) - 1;
+    let t = (x - xs[i]) / (xs[i + 1] - xs[i]);
+    ys[i] + t * (ys[i + 1] - ys[i])
 }
 
 fn push_f64(out: &mut Vec<f32>, values: &[f64]) {
     out.extend(values.iter().map(|value| *value as f32));
-}
-
-fn read_npz(bytes: &[u8]) -> Result<BTreeMap<String, Npy>, String> {
-    let mut archive = zip::ZipArchive::new(Cursor::new(bytes)).map_err(|err| err.to_string())?;
-    let mut files = BTreeMap::new();
-    for index in 0..archive.len() {
-        let mut file = archive.by_index(index).map_err(|err| err.to_string())?;
-        let name = file.name().map_err(|err| err.to_string())?;
-        let name = name
-            .rsplit(['/', '\\'])
-            .next()
-            .unwrap_or("")
-            .trim_end_matches(".npy")
-            .to_owned();
-        if name.is_empty() {
-            continue;
-        }
-        let mut raw = Vec::new();
-        file.read_to_end(&mut raw).map_err(|err| err.to_string())?;
-        files.insert(name, parse_npy(&raw)?);
-    }
-    Ok(files)
-}
-
-fn parse_npy(bytes: &[u8]) -> Result<Npy, String> {
-    if bytes.len() < 10 || &bytes[..6] != b"\x93NUMPY" {
-        return Err("not an npy array".into());
-    }
-    let (header_len, header_at) = if bytes[6] == 1 {
-        (u16::from_le_bytes([bytes[8], bytes[9]]) as usize, 10)
-    } else {
-        (
-            u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]) as usize,
-            12,
-        )
-    };
-    let header = std::str::from_utf8(
-        bytes
-            .get(header_at..header_at + header_len)
-            .ok_or("npy header")?,
-    )
-    .map_err(|err| err.to_string())?;
-    if header.contains("fortran_order': True") {
-        return Err("fortran npy".into());
-    }
-    let descr = quoted(header, "descr")?;
-    let shape = shape_of(&quoted_or_tuple(header, "shape")?)?;
-    let data = bytes[header_at + header_len..].to_vec();
-    Ok(Npy { descr, shape, data })
-}
-
-fn quoted(header: &str, key: &str) -> Result<String, String> {
-    let needle = format!("'{key}':");
-    let rest = header
-        .split_once(&needle)
-        .ok_or_else(|| format!("npy {key}"))?
-        .1
-        .trim_start();
-    let rest = rest
-        .strip_prefix('\'')
-        .ok_or_else(|| format!("npy {key}"))?;
-    Ok(rest.split('\'').next().unwrap_or("").to_owned())
-}
-
-fn quoted_or_tuple(header: &str, key: &str) -> Result<String, String> {
-    let needle = format!("'{key}':");
-    let rest = header
-        .split_once(&needle)
-        .ok_or_else(|| format!("npy {key}"))?
-        .1
-        .trim_start();
-    if let Some(inner) = rest.strip_prefix('(') {
-        let body = inner.split(')').next().unwrap_or("");
-        return Ok(format!("({body})"));
-    }
-    quoted(header, key)
-}
-
-fn shape_of(text: &str) -> Result<Vec<usize>, String> {
-    let body = text.trim().trim_matches(|c| c == '(' || c == ')');
-    if body.trim().is_empty() {
-        return Ok(vec![]);
-    }
-    body.split(',')
-        .filter(|part| !part.trim().is_empty())
-        .map(|part| part.trim().parse().map_err(|_| format!("npy shape {text}")))
-        .collect()
-}
-
-fn itemsize(descr: &str) -> Result<usize, String> {
-    if let Some(width) = descr.strip_prefix("<U") {
-        return width
-            .parse::<usize>()
-            .map(|n| n * 4)
-            .map_err(|err| err.to_string());
-    }
-    match descr {
-        "<f8" | "<i8" => Ok(8),
-        "<f4" | "<i4" | "<u4" => Ok(4),
-        other => Err(format!("npy dtype {other}")),
-    }
-}
-
-fn count(array: &Npy) -> Result<usize, String> {
-    let n = array.shape.iter().copied().product::<usize>().max(1);
-    let size = itemsize(&array.descr)?;
-    if array.data.len() < n * size {
-        return Err(format!("npy {} is short", array.descr));
-    }
-    Ok(n)
-}
-
-fn f64s(array: &Npy) -> Result<Vec<f64>, String> {
-    let n = count(array)?;
-    if array.descr != "<f8" {
-        return Err(format!("expected f64, got {}", array.descr));
-    }
-    Ok((0..n)
-        .map(|i| f64::from_le_bytes(array.data[i * 8..i * 8 + 8].try_into().unwrap()))
-        .collect())
-}
-
-fn i32s(array: &Npy) -> Result<Vec<i32>, String> {
-    let n = count(array)?;
-    if array.descr != "<i4" {
-        return Err(format!("expected i32, got {}", array.descr));
-    }
-    Ok((0..n)
-        .map(|i| i32::from_le_bytes(array.data[i * 4..i * 4 + 4].try_into().unwrap()))
-        .collect())
-}
-
-fn strings(array: &Npy) -> Result<Vec<String>, String> {
-    let n = count(array)?;
-    let width = itemsize(&array.descr)?;
-    let mut out = Vec::with_capacity(n);
-    for i in 0..n {
-        let bytes = &array.data[i * width..(i + 1) * width];
-        let mut chars = Vec::new();
-        for chunk in bytes.chunks(4) {
-            let unit = u32::from_le_bytes(chunk.try_into().unwrap());
-            if unit == 0 {
-                break;
-            }
-            if let Some(ch) = char::from_u32(unit) {
-                chars.push(ch);
-            }
-        }
-        out.push(chars.into_iter().collect());
-    }
-    Ok(out)
 }
 
 #[cfg(test)]

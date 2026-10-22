@@ -58,7 +58,7 @@ pub struct DvhCurve {
 }
 
 /// `%.6g`, the format the Python sidecar used.
-fn sig6(value: f64) -> String {
+pub fn sig6(value: f64) -> String {
     if value == 0.0 {
         return "0".into();
     }
