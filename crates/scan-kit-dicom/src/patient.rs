@@ -283,18 +283,14 @@ pub fn gantry_to_patient(
     Ok(mul(support, mul(couch, gantry)))
 }
 
-const WATER_DENSITY: &str = include_str!(
-    "../../../assets/mcsquare/Scanners/Water_Phantom/HU_Density_Conversion.txt"
-);
-const WATER_MATERIAL: &str = include_str!(
-    "../../../assets/mcsquare/Scanners/Water_Phantom/HU_Material_Conversion.txt"
-);
-const SOLID_DENSITY: &str = include_str!(
-    "../../../assets/mcsquare/Scanners/SolidWater_Phantom/HU_Density_Conversion.txt"
-);
-const SOLID_MATERIAL: &str = include_str!(
-    "../../../assets/mcsquare/Scanners/SolidWater_Phantom/HU_Material_Conversion.txt"
-);
+const WATER_DENSITY: &str =
+    include_str!("../../../assets/mcsquare/Scanners/Water_Phantom/HU_Density_Conversion.txt");
+const WATER_MATERIAL: &str =
+    include_str!("../../../assets/mcsquare/Scanners/Water_Phantom/HU_Material_Conversion.txt");
+const SOLID_DENSITY: &str =
+    include_str!("../../../assets/mcsquare/Scanners/SolidWater_Phantom/HU_Density_Conversion.txt");
+const SOLID_MATERIAL: &str =
+    include_str!("../../../assets/mcsquare/Scanners/SolidWater_Phantom/HU_Material_Conversion.txt");
 
 /// Density from a named scanner curve. `default` keeps the built-in table.
 pub fn scanner_density(scanner: &str, hu: f32) -> f32 {

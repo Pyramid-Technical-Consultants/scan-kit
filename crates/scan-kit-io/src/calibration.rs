@@ -45,8 +45,12 @@ const BUILTINS: &[(&str, &str, &str, &str)] = &[
     (
         "solid",
         "Solid phantom",
-        include_str!("../../../assets/mcsquare/Scanners/SolidWater_Phantom/HU_Density_Conversion.txt"),
-        include_str!("../../../assets/mcsquare/Scanners/SolidWater_Phantom/HU_Material_Conversion.txt"),
+        include_str!(
+            "../../../assets/mcsquare/Scanners/SolidWater_Phantom/HU_Density_Conversion.txt"
+        ),
+        include_str!(
+            "../../../assets/mcsquare/Scanners/SolidWater_Phantom/HU_Material_Conversion.txt"
+        ),
     ),
 ];
 

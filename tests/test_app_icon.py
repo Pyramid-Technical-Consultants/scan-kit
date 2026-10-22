@@ -21,7 +21,7 @@ def test_asset_path_resolves_bundled_icon_files() -> None:
     assert png.is_file()
     assert ico.is_file()
     assert svg.is_file()
-    assert png.parent == Path(__file__).resolve().parent.parent / "scan_kit" / "assets"
+    assert png.parent == Path(__file__).resolve().parent.parent / "assets"
 
 
 def test_load_app_icon_finds_png(qapp) -> None:
