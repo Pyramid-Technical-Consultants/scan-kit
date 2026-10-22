@@ -170,6 +170,14 @@ pub fn npy_f64(shape: &[usize], data: &[f64]) -> Npy {
     }
 }
 
+pub fn npy_i32(shape: &[usize], data: &[i32]) -> Npy {
+    Npy {
+        descr: "<i4".into(),
+        shape: shape.to_vec(),
+        data: data.iter().flat_map(|v| v.to_le_bytes()).collect(),
+    }
+}
+
 pub fn npy_i64(shape: &[usize], data: &[i64]) -> Npy {
     Npy {
         descr: "<i8".into(),
