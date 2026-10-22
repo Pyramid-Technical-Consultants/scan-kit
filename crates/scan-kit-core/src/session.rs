@@ -1,7 +1,6 @@
 //! `termination_summary.txt` metadata.
 //!
-//! The field rules match `scan_kit/common/session_meta.py`. The Python module
-//! stays until the Qt app no longer imports it.
+//! The field rules match the retired `scan_kit/common/session_meta.py`.
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct SessionMeta {

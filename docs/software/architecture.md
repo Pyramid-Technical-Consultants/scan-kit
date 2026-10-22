@@ -21,7 +21,7 @@ apps/desktop/src-tauri/         Tauri 2 shell
 
 `scan-kit-core` does not depend on Tauri, the MCP SDK, sqlite, or `wgpu`. `scan-kit-io` and `scan-kit-compute` depend on core. `scan-kit-plot` depends on core. `scan-kit-compute` also depends on `scan-kit-io` so one function can load a view, and on `scan-kit-plot` to paint it. Only `scan-kit-plot` and `scan-kit-compute` link `wgpu`. `scan-kit-mcp` registers the concatenation of each crate's tool list and dispatches to that crate. It does not reimplement an operation. The Tauri shell calls the same functions through commands.
 
-`scan-kit-dicom` reads an explicit little-endian DICOM folder. The Monte Carlo transport shader lives in `scan-kit-compute`. The material tables stay under `assets/`.
+`scan-kit-dicom` reads an explicit little-endian DICOM folder. The Monte Carlo transport shader lives in `scan-kit-compute`. The material tables live under `assets/` at the repository root.
 
 ## MCP first
 
@@ -61,17 +61,13 @@ Agents in this repository launch the server with `.cursor/mcp.json` (`cargo run 
 
 ## One implementation
 
-There is no PyO3 bridge and no second copy of a ported behavior.
-
-The Python tree is the unported backlog. A port change implements the capability in the owning crate, adds the tool, adds the Tauri surface when the capability had a user interface, and deletes the Python modules and tests that exist only for it. A module that unported code still imports stays until its last caller is gone. If a file is still under `scan_kit/` or `tests/`, it is not ported.
-
-The Qt app still imports the session store, discovery, and schema modules, so this phase does not delete them. The Rust copies are the ones the new shell calls.
+There is no PyO3 bridge and no second copy of a ported behavior. The Python application is fully retired: the repository is the Rust workspace and the TypeScript desktop frontend.
 
 ## Versions and branches
 
-`scan_kit/__init__.py` is the released Python version until 2.0 is promoted. The Rust workspace version is `2.0.0-dev`. Do not bump the Python version to 2.0 to match the workspace.
+The Rust workspace version in `Cargo.toml` (`[workspace.package]`) is the single version source; `apps/desktop/package.json` and `apps/desktop/src-tauri/tauri.conf.json` carry the same string.
 
-Day-to-day pull requests target `develop`. `main` is the release branch. After the first deletion of ported Python, `develop` is no longer a full 1.x application. User-facing releases wait for the promotion of `develop` to `main`.
+Day-to-day pull requests target `develop`. `main` is the release branch. User-facing releases wait for the promotion of `develop` to `main`.
 
 ## User interface
 
@@ -99,7 +95,7 @@ A view that takes long enough to block the window runs as a task: one bounded sl
 
 ## Session data
 
-The database path is `~/.scan-kit/scan-kit.sqlite`, with tables `prefs`, `libraries`, `sessions`, and `exams`, `user_version` 4, WAL, and foreign keys. Rust writes that version. The Python store stays at version 3 and only migrates a file when its version is older. An existing file opens as-is. This window uses the saved data locations and the window geometry prefs. Sqlite is the library index, not the sample store.
+The database path is `~/.scan-kit/scan-kit.sqlite`, with tables `prefs`, `libraries`, `sessions`, and `exams`, `user_version` 4, WAL, and foreign keys. Rust writes that version. A store file left by the 1.x Python application stays at version 3 and opens as-is; only an older file is migrated forward. This window uses the saved data locations and the window geometry prefs. Sqlite is the library index, not the sample store.
 
 A loaded session keeps one in-memory column table per grain: one row per spot record, one row per timeslice trigger, and one row per timeslice file. Each column has one producer. A view asks for columns by name. A slice window is read once, and a later view decodes any headers it still needs from those bytes.
 

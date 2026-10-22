@@ -15,7 +15,7 @@ Phase 1 requirements are the seams of the replacement. They do not restate the P
 
 The software reports a single version string.
 
-The Rust workspace version is that string. The desktop shell and the `scan_kit_version` tool both return it. The Python package version is a different product identity and is not this string.
+The Rust workspace version is that string. The desktop shell and the `scan_kit_version` tool both return it.
 
 ## SK-REQ-002
 
@@ -47,7 +47,7 @@ Sessions from every saved location are one list. The catalog key is the folder n
 
 Session notes and the selected session ids are stored in the existing sqlite file.
 
-The file is `~/.scan-kit/scan-kit.sqlite` with `user_version` 4 and the `prefs`, `libraries`, `sessions`, and `exams` tables. `exams` stores `study_uid`, `folder_name`, `storage_path`, `patient_name`, `patient_id`, `study_date`, `study_description`, and `file_count`, unique on library and study uid, and is removed with that library. A file written at an older `user_version` is migrated forward. The Python store stays at version 3 and only migrates a file when its version is older, so it leaves `exams` in place. `scan_kit_set_note` and `scan_kit_select_sessions` are granular tools. At most five sessions are selected. The saved data locations, the last data folder, and the window geometry are prefs in that same file.
+The file is `~/.scan-kit/scan-kit.sqlite` with `user_version` 4 and the `prefs`, `libraries`, `sessions`, and `exams` tables. `exams` stores `study_uid`, `folder_name`, `storage_path`, `patient_name`, `patient_id`, `study_date`, `study_description`, and `file_count`, unique on library and study uid, and is removed with that library. A file written at an older `user_version` is migrated forward. A store file written by the 1.x Python application stays at version 3, which leaves `exams` in place. `scan_kit_set_note` and `scan_kit_select_sessions` are granular tools. At most five sessions are selected. The saved data locations, the last data folder, and the window geometry are prefs in that same file.
 
 ## SK-REQ-006
 

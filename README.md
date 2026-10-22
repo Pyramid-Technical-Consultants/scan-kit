@@ -12,7 +12,7 @@
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License"></a>
   <a href="https://github.com/Pyramid-Technical-Consultants/scan-kit/releases/latest"><img src="https://img.shields.io/github/v/release/Pyramid-Technical-Consultants/scan-kit?label=release" alt="Latest release"></a>
-  <img src="https://img.shields.io/badge/python-3.10%2B-blue.svg" alt="Python 3.10+">
+  <img src="https://img.shields.io/badge/rust-stable-orange.svg" alt="Rust stable">
 </p>
 
 <p align="center">
@@ -63,39 +63,31 @@ Machine-QA coverage against AAPM TG-224 is described in [docs/quality/tg-224.md]
 
 ### Download a release (recommended)
 
-Pre-built executables are published on [**GitHub Releases**](https://github.com/Pyramid-Technical-Consultants/scan-kit/releases/latest). No Python install required.
+Pre-built installers are published on [**GitHub Releases**](https://github.com/Pyramid-Technical-Consultants/scan-kit/releases/latest).
 
 | Platform | Download |
 |----------|----------|
-| **Windows** | `scan-kit-windows-{version}.exe` |
-| **Linux** (x86-64) | `scan-kit-linux-amd64-{version}.AppImage` |
+| **Windows** | `scan-kit-windows-{version}-setup.exe` |
+| **Linux** (x86-64) | `scan-kit-linux-amd64-{version}.AppImage` or `scan-kit-linux-amd64-{version}.deb` |
 
-**Linux:** download the `.AppImage`, mark it executable (`chmod +x`), then double-click it (Ubuntu may ask you to trust/launch it once). On first launch it registers itself in your applications menu with the correct icon.
+**Windows:** run the NSIS installer. **Linux:** download the `.AppImage`, mark it executable (`chmod +x`), then double-click it — or install the `.deb` for a menu entry.
 
-> **Trying the latest `main` or `develop` branch?** CI builds release-candidate artifacts on every merge to those branches (not on open pull requests):
-> `scan-kit-windows-{version}-rc.exe` and `scan-kit-linux-amd64-{version}-rc.AppImage`.
-> Download them from the **Artifacts** section of the corresponding [GitHub Actions](https://github.com/Pyramid-Technical-Consultants/scan-kit/actions) workflow run.
+> **Trying the latest `main` or `develop` branch?** CI builds bundles on every merge to those branches (not on open pull requests). Download them from the **Artifacts** section of the corresponding [GitHub Actions](https://github.com/Pyramid-Technical-Consultants/scan-kit/actions) workflow run.
 
-### Install from source
+### Run from source
 
-Requires **Python 3.10+**.
+Requires a **stable Rust toolchain** (with the `wasm32-unknown-unknown` target and `wasm-bindgen-cli`) and **Node.js 22**.
 
 ```bash
 git clone https://github.com/Pyramid-Technical-Consultants/scan-kit.git
 cd scan-kit
-pip install .          # standard install
-# pip install -e .     # editable install for development
+git submodule update --init third_party/MCsquare   # only needed for MC validation
+cd apps/desktop
+npm ci
+npm run tauri dev
 ```
 
-Launch:
-
-```bash
-scan-kit
-# or: python -m scan_kit
-scan-kit --version     # print installed version
-```
-
-On a dev install, the default data source is the bundled `test_data/` folder.
+`npm run tauri build` produces a platform installer under `target/release/bundle/`.
 
 ## Screenshots
 
@@ -149,16 +141,18 @@ On a dev install, the default data source is the bundled `test_data/` folder.
   <sub><em>Amplifier command correlations (G2 steering chain) and Session Log Compare.</em></sub>
 </p>
 
-## The launcher
+## The desktop app
 
-Scan Kit opens a single window with two tabs. **View** switches tabs and sets **Theme** (System / Light / Dark). **Analysis** opens the same views as the Data Analysis buttons. **File** opens or refreshes the session folder. **Esc** or **Ctrl+Q** quits. Plan Synthesis, Phantom Synthesis, Configuration Tuning, and Plan Runner live in the Scan Kit 2 desktop app.
+Scan Kit is a single desktop application built on Tauri with a Rust core. Its launcher view lists the analysis views below; sessions are opened from a folder, a UNC share, or a remote URL (`sftp://`, `smb://`, `ftp://`, `ssh://`/`scp://` as SFTP aliases, `http(s)://` for a single archive).
 
-| Tab | Shortcut | Use it to |
-|-----|----------|-----------|
-| **Data Analysis** | `Ctrl+1` | Browse sessions, adjust global plot settings, and open analysis views |
-| **Debug** | `Ctrl+6` | Live launcher and view-process logs, with Copy / Clear for support |
-
-Plot windows open separately. Close them when you are done. The launcher keeps running.
+| View | Use it to |
+|------|-----------|
+| **Data Analysis** | Browse sessions across every configured location, select up to five, and open analysis views |
+| **Plan Synthesis** | Write treatment plans |
+| **Phantom Synthesis** | Generate QA phantom definitions |
+| **Plan Runner** | Drive a live delivery and download the resulting session |
+| **Configuration Tuning** | Tune scanner and delivery configuration |
+| **Debug** | Live application logs, with Copy / Clear for support |
 
 ## Data Analysis
 
@@ -417,29 +411,16 @@ Day-to-day work merges into **`develop`**. `main` is the release line. Open pull
 CI fails feature PRs that target `main`.
 
 <details>
-<summary><strong>Regenerating README screenshots</strong></summary>
-
-Screenshots in `docs/images/` are captured from real session data with:
-
-```bash
-python scripts/capture_doc_screenshots.py
-```
-
-Requires a local `test_data/` folder (not shipped with the repo). The script grabs launcher tabs and core analysis windows off-screen (dark theme for the grab only; it does not persist **View → Theme**) and renders the remaining specialized matplotlib view headlessly.
-
-</details>
-
-<details>
 <summary><strong>Running tests</strong></summary>
 
 ```bash
-pip install -e ".[build,dev]"
-pytest
+cargo test --workspace --exclude scan-kit-desktop --locked
+cd apps/desktop && npm test
 ```
 
-Tests live in `tests/` and use fixtures from `test_data/` (included in dev installs, excluded from the published package). The suite runs headless (Agg matplotlib backend, no Qt windows). Default `pytest` skips `@pytest.mark.slow` tests; `pytest -m slow` runs the heavy session/Qt cases.
+The Rust workspace tests cover the domain logic, session parsing, store, MC engine, DICOM chain, and PDF report. The desktop frontend tests (vitest) cover the views and invoke plumbing.
 
-App preferences (window geometry, last data directory, plot settings, session notes, theme) persist in `~/.scan-kit/scan-kit.sqlite`.
+App preferences (window geometry, last data directory, plot settings, session notes) persist in `~/.scan-kit/scan-kit.sqlite`.
 
 </details>
 
@@ -485,15 +466,15 @@ Deliberate MCsquare 1.1 behaviours kept in the port:
 </details>
 
 <details>
-<summary><strong>Building an executable locally</strong></summary>
+<summary><strong>Building an installer locally</strong></summary>
 
 ```bash
-pip install -e ".[build]"
-python build.py --clean      # single-file executable → dist/
-python build.py --onedir     # faster one-directory bundle for iteration
+cd apps/desktop
+npm ci
+npm run tauri build
 ```
 
-Output: `dist/scan-kit` (Linux) or `dist/scan-kit.exe` (Windows). Local builds keep these generic names; CI release assets include the version suffix.
+Output lands in `target/release/bundle/` — `nsis/` on Windows, `appimage/` and `deb/` on Linux (or `--bundles <list>` to pick). On Linux, install the WebKitGTK development packages first (`libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf`).
 
 </details>
 
@@ -502,7 +483,7 @@ Output: `dist/scan-kit` (Linux) or `dist/scan-kit.exe` (Windows). Local builds k
 
 Releases are automated via [`.github/workflows/build.yml`](.github/workflows/build.yml).
 
-1. Bump `__version__` in `scan_kit/__init__.py`, the single source of truth, also read by `pyproject.toml` and the window title.
+1. Bump `version` in `Cargo.toml` (`[workspace.package]`, the canonical source), `apps/desktop/package.json`, and `apps/desktop/src-tauri/tauri.conf.json` — the three must agree.
 2. Commit: `Release vX.Y.Z`, merge to `develop`, then promote `develop` → `main` (or release directly from `main` once aligned).
 3. Tag and push:
 
@@ -513,13 +494,13 @@ git push origin vX.Y.Z
 
 | Trigger | CI output |
 |---------|-----------|
-| Pull request to `main` or `develop` | Tests only (no executable build) |
-| Push to `main` or `develop`, manual dispatch | Tests, then `-rc` artifacts (`scan-kit-windows-X.Y.Z-rc.exe`, etc.) |
-| `v*` tag push | Tests, build, and GitHub Release with `scan-kit-windows-X.Y.Z.exe` and `scan-kit-linux-amd64-X.Y.Z.AppImage` |
+| Pull request to `main` or `develop` | Checks only (no bundle build) |
+| Push to `main` or `develop`, manual dispatch | Checks, then Tauri bundle artifacts (`Scan Kit_X.Y.Z_x64-setup.exe`, `Scan Kit_X.Y.Z_amd64.AppImage`, `scan-kit_X.Y.Z_amd64.deb`) |
+| `v*` tag push | Checks, build, and GitHub Release with `scan-kit-windows-X.Y.Z-setup.exe`, `scan-kit-linux-amd64-X.Y.Z.AppImage`, and `scan-kit-linux-amd64-X.Y.Z.deb` |
 
 Day-to-day work merges feature branches into **`develop`** first; `main` tracks released (or release-ready) history. Open a pull request against `develop`, not `main`, unless you are promoting a release.
 
-CI verifies the tag matches `__version__` before publishing. The project follows [Semantic Versioning](https://semver.org/).
+CI verifies the tag matches the workspace version before publishing. The project follows [Semantic Versioning](https://semver.org/).
 
 </details>
 
