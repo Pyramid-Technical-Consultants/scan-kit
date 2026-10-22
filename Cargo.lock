@@ -3567,9 +3567,11 @@ version = "2.0.0-dev"
 dependencies = [
  "naga",
  "scan-kit-core",
+ "scan-kit-dicom",
  "scan-kit-io",
  "scan-kit-plot",
  "serde_json",
+ "sha2",
  "tokio",
  "wgpu",
 ]

@@ -15,6 +15,7 @@ mod histogram;
 mod location;
 mod marks;
 mod mc_tables;
+pub mod npz;
 pub mod patient_view;
 mod phantom;
 mod remote;
@@ -29,8 +30,8 @@ pub mod volumetric;
 mod workspace;
 
 pub use analysis::{analysis_scene, channel_catalog, load_timeslice_columns};
-pub use beam::{beam_record, protons_per_mu, spot_record};
-pub use mc_tables::mc_tables;
+pub use beam::{beam_record, protons_per_mu, spot_record, BeamModel};
+pub use mc_tables::{csda_range_mm, mc_tables, medium_rho};
 pub use tables::{
     bind_slice, clear_slice, session_pieces, slice_tail_done, SessionPieces, SliceTake, SLICE_ROWS,
 };
