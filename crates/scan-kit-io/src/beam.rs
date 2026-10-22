@@ -46,7 +46,13 @@ impl BeamModel {
     /// A BDL `.txt` on disk — the validator's `third_party/MCsquare/BDL` files.
     pub fn read(path: &Path) -> Result<BeamModel, String> {
         let text = std::fs::read_to_string(path).map_err(|err| format!("{path:?}: {err}"))?;
-        Ok(BeamModel::parse(&text))
+        let model = BeamModel::parse(&text);
+        if model.rows.len() < 2 {
+            return Err(format!(
+                "{path:?} has fewer than 2 energy rows — not a usable BDL file"
+            ));
+        }
+        Ok(model)
     }
 
     fn parse(text: &str) -> BeamModel {
@@ -285,6 +291,9 @@ fn number(line: &str) -> f32 {
 }
 
 fn column(rows: &[[f32; 18]], col: usize, energy: f32) -> f32 {
+    if rows.len() < 2 {
+        return rows.first().map(|row| row[col]).unwrap_or(0.0);
+    }
     let index = rows
         .partition_point(|row| row[0] < energy)
         .saturating_sub(1);
@@ -334,6 +343,20 @@ fn eigen(a: f32, b: f32, c: f32, lambda: f32) -> [f32; 2] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_bdl_without_energy_rows_errors_instead_of_panicking() {
+        let dir = std::env::temp_dir().join(format!("scan-kit-bdl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("empty.txt");
+        std::fs::write(&file, "Nozzle exit to Isocenter distance\n300\n").unwrap();
+        let err = BeamModel::read(&file).err().unwrap();
+        assert!(err.contains("energy rows"));
+        // column() itself stays safe even on a degenerate model.
+        assert_eq!(BeamModel::parse("").protons_per_mu(100.0), 0.0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn a_hundred_mev_spot_uses_the_library_and_can_insert_the_shifter() {

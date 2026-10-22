@@ -94,6 +94,15 @@ impl CtCalibration {
                 "scanner {name}: HU columns must be strictly increasing"
             ));
         }
+        // A 'nan' token parses fine and would poison every interpolation
+        // downstream — including a usize underflow in interp's partition.
+        if densities
+            .iter()
+            .chain(&label_f)
+            .any(|value| !value.is_finite())
+        {
+            return Err(format!("scanner {name}: table values must be finite"));
+        }
         let labels: Vec<i32> = label_f.iter().map(|value| *value as i32).collect();
         let ids = &mc_tables().ids;
         let mut media = Vec::with_capacity(labels.len());
@@ -288,13 +297,19 @@ fn pairs(text: &str) -> (Vec<f64>, Vec<f64>) {
 /// `np.interp(x, xp, fp)` on a non-decreasing `xp`: linear inside, clamped to
 /// the ends. Flat runs return the left edge, matching numpy.
 fn interp(x: f64, xp: &[f64], fp: &[f64]) -> f64 {
+    if !x.is_finite() || xp.len() < 2 {
+        return fp.first().copied().unwrap_or(0.0);
+    }
     if x <= xp[0] {
         return fp[0];
     }
     if x >= xp[xp.len() - 1] {
         return fp[fp.len() - 1];
     }
-    let i = (xp.partition_point(|&value| value <= x) - 1).min(xp.len() - 2);
+    let i = xp
+        .partition_point(|&value| value <= x)
+        .saturating_sub(1)
+        .min(xp.len() - 2);
     let (x0, x1) = (xp[i], xp[i + 1]);
     if x1 == x0 {
         return fp[i];
@@ -323,6 +338,18 @@ mod tests {
     fn a_missing_scanner_folder_reports_the_path() {
         let err = CtCalibration::resolve("no/such/scanner").unwrap_err();
         assert!(err.contains("no/such/scanner"), "{err}");
+    }
+
+    #[test]
+    fn nan_table_values_and_queries_are_rejected_or_safe() {
+        let density = "-1000 0.001\n0 nan\n2000 2\n";
+        let material = "-1000 0\n2000 1\n";
+        let err = CtCalibration::parse("bad", density, material).unwrap_err();
+        assert!(err.contains("finite"), "{err}");
+        // And a NaN query against a good table clamps instead of panicking.
+        let calibration = default_calibration();
+        let (media, _) = calibration.from_density(f64::NAN);
+        assert_eq!(media, calibration.media[0]);
     }
 
     #[test]
