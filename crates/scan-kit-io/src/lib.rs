@@ -583,7 +583,8 @@ pub fn invoke(name: &str, input: &Value) -> Result<Value, InvokeError> {
             let path = required_str(input, "path")?;
             let db = database_path(input)?;
             with_store(&db, |conn| {
-                let root = library_root(path)?;
+                // canonical_root, not library_root: forgetting a dead path is the point.
+                let root = location::canonical_root(path)?;
                 forget_data_dir(conn, &root)?;
                 publish_catalog(conn)
             })
@@ -1647,6 +1648,37 @@ Layer delivery: 27/27
         );
         assert_eq!(store::user_version(&conn).unwrap(), 4);
         drop(conn);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_deleted_data_dir_can_still_be_forgotten() {
+        let root = workspace("forget-dead");
+        let db = root.join("test.sqlite");
+        let db_arg = db.to_string_lossy().into_owned();
+        let site = root.join("site");
+        write_session(
+            &site,
+            "kept",
+            KEPT_SUMMARY,
+            "energy,X_POSITION,Y_POSITION\n1,0,0\n",
+        );
+        invoke(
+            "scan_kit_open_library",
+            &json!({ "path": site.to_string_lossy(), "db_path": &db_arg }),
+        )
+        .unwrap();
+        let catalog = invoke("scan_kit_read_catalog", &json!({ "db_path": &db_arg })).unwrap();
+        let stored = catalog["locations"][0].as_str().unwrap().to_owned();
+        fs::remove_dir_all(&site).unwrap();
+        let forgotten = invoke(
+            "scan_kit_forget_data_dir",
+            &json!({ "path": stored, "db_path": &db_arg }),
+        )
+        .unwrap();
+        assert!(forgotten["locations"].as_array().unwrap().is_empty());
+        let dirs = invoke("scan_kit_data_dirs", &json!({ "db_path": &db_arg })).unwrap();
+        assert!(dirs.as_array().unwrap().is_empty());
         let _ = fs::remove_dir_all(&root);
     }
 
