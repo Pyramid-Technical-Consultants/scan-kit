@@ -344,10 +344,10 @@ fn walk_files_at(
     depth: usize,
     files: &mut BTreeMap<String, Vec<u8>>,
 ) -> Result<(), String> {
-    if depth > MAX_XML_WALK_DEPTH {
+    if depth > MAX_WALK_DEPTH {
         return Err(format!(
             "config tree is deeper than {} levels under {}",
-            MAX_XML_WALK_DEPTH,
+            MAX_WALK_DEPTH,
             root.display()
         ));
     }
@@ -603,7 +603,7 @@ fn session_present(root: &Path, session_id: &str) -> bool {
             .is_file()
 }
 
-const MAX_XML_WALK_DEPTH: usize = 32;
+const MAX_WALK_DEPTH: usize = 32;
 
 fn list_xml(root: &Path) -> Result<Vec<String>, String> {
     let mut files = Vec::new();
@@ -613,11 +613,11 @@ fn list_xml(root: &Path) -> Result<Vec<String>, String> {
 }
 
 fn walk_xml(root: &Path, dir: &Path, depth: usize, files: &mut Vec<String>) -> Result<(), String> {
-    if depth > MAX_XML_WALK_DEPTH {
+    if depth > MAX_WALK_DEPTH {
         // is_dir() follows symlinks — a config tree could carry a loop.
         return Err(format!(
             "config tree is deeper than {} levels under {}",
-            MAX_XML_WALK_DEPTH,
+            MAX_WALK_DEPTH,
             root.display()
         ));
     }
@@ -801,11 +801,11 @@ fn folder_key(path: &Path) -> String {
 }
 
 fn copy_tree(source: &Path, dest: &Path, depth: usize) -> Result<(), String> {
-    if depth > MAX_XML_WALK_DEPTH {
+    if depth > MAX_WALK_DEPTH {
         // is_dir() follows symlinks — a config tree could carry a loop.
         return Err(format!(
             "config tree is deeper than {} levels under {}",
-            MAX_XML_WALK_DEPTH,
+            MAX_WALK_DEPTH,
             source.display()
         ));
     }

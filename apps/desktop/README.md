@@ -1,7 +1,14 @@
-# Tauri + React + Typescript
+# Scan Kit desktop
 
-This template should help get you started developing with Tauri, React and Typescript in Vite.
+The Tauri 2 desktop shell for Scan Kit. React + TypeScript in `src/`, the
+Rust side in `src-tauri/`. Plot drawing lives in `scan-kit-plot` (wasm) — do
+not draw plots in TypeScript.
 
-## Recommended IDE Setup
+```bash
+npm ci
+npm run dev      # vite dev server for `npm run tauri dev`
+npm test         # vitest + keep-up node tests
+npm run build    # typecheck + wasm + production bundle
+```
 
-- [VS Code](https://code.visualstudio.com/) + [Tauri](https://marketplace.visualstudio.com/items?itemName=tauri-apps.tauri-vscode) + [rust-analyzer](https://marketplace.visualstudio.com/items?itemName=rust-lang.rust-analyzer)
+See the repo-root `README.md` for the product overview.
