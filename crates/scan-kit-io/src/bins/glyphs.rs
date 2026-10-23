@@ -705,6 +705,11 @@ pub(super) fn dose_gates(categories: &[f32], glyph: &str, xmin: f32, xmax: f32) 
                 index as f32
             };
             let gate = ((GATE_ABS_MU + frac * f64::from(*mu)) / f64::from(*mu) * 100.0) as f32;
+            // mu = 0 (or NaN) makes the gate infinite/NaN — a guide at ±inf
+            // would poison the panel's y-range, so skip it.
+            if !gate.is_finite() {
+                continue;
+            }
             xs.push(x);
             hi.push(gate);
             lo.push(-gate);

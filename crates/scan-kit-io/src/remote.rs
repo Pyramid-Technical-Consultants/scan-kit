@@ -404,10 +404,24 @@ mod net {
         }
 
         fn remove(&mut self, path: &str) -> Result<(), String> {
+            self.remove_depth(path, 0)
+        }
+    }
+
+    impl SftpFs {
+        fn remove_depth(&mut self, path: &str, depth: u32) -> Result<(), String> {
+            if depth > COPY_DEPTH {
+                return Err(format!(
+                    "remote tree deeper than {COPY_DEPTH} levels: {path}"
+                ));
+            }
             let stat = self.stat(path)?.ok_or_else(|| format!("missing {path}"))?;
             if stat.dir {
                 for item in self.list(path)? {
-                    self.remove(&format!("{}/{}", path.trim_end_matches('/'), item.name))?;
+                    self.remove_depth(
+                        &format!("{}/{}", path.trim_end_matches('/'), item.name),
+                        depth + 1,
+                    )?;
                 }
                 self.sftp()?.rmdir(Path::new(path)).map_err(map_sftp)
             } else {
@@ -422,6 +436,12 @@ mod net {
         }
         fs::create_dir_all(dest).map_err(|err| err.to_string())?;
         for item in fs.list(path)? {
+            // A remote name is one entry on the server but can hold
+            // characters that are path separators locally — `..\x` is a
+            // legal unix filename and a traversal on Windows.
+            if item.name.contains(['/', '\\']) {
+                continue;
+            }
             let remote = format!("{}/{}", path.trim_end_matches('/'), item.name);
             let local = dest.join(&item.name);
             if item.dir {
@@ -576,10 +596,24 @@ mod net {
         }
 
         fn remove(&mut self, path: &str) -> Result<(), String> {
+            self.remove_depth(path, 0)
+        }
+    }
+
+    impl FtpFs {
+        fn remove_depth(&mut self, path: &str, depth: u32) -> Result<(), String> {
+            if depth > COPY_DEPTH {
+                return Err(format!(
+                    "remote tree deeper than {COPY_DEPTH} levels: {path}"
+                ));
+            }
             let stat = self.stat(path)?.ok_or_else(|| format!("missing {path}"))?;
             if stat.dir {
                 for item in self.list(path)? {
-                    self.remove(&format!("{}/{}", path.trim_end_matches('/'), item.name))?;
+                    self.remove_depth(
+                        &format!("{}/{}", path.trim_end_matches('/'), item.name),
+                        depth + 1,
+                    )?;
                 }
                 match &mut self.client {
                     FtpClient::Plain(ftp) => ftp.rmdir(path),
@@ -602,6 +636,9 @@ mod net {
         }
         fs::create_dir_all(dest).map_err(|err| err.to_string())?;
         for item in fs.list(path)? {
+            if item.name.contains(['/', '\\']) {
+                continue;
+            }
             let remote = format!("{}/{}", path.trim_end_matches('/'), item.name);
             let local = dest.join(&item.name);
             if item.dir {

@@ -23,6 +23,8 @@ jobs:
         with:
           components: rustfmt, clippy
 
+      - uses: Swatinem/rust-cache@v2
+
       - name: Check formatting
         run: cargo fmt --all --check
 
@@ -35,9 +37,9 @@ jobs:
         run: cargo test --workspace --exclude scan-kit-desktop --locked
 
       - name: Install cargo-deny and cargo-machete
-        run: |
-          cargo install cargo-deny --locked --version 0.20.2
-          cargo install cargo-machete --locked --version 0.9.2
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny@0.20.2,cargo-machete@0.9.2
 
       - name: Check advisories, licenses, sources, and unused dependencies
         run: |
@@ -56,18 +58,25 @@ jobs:
           targets: wasm32-unknown-unknown
           components: clippy
 
+      - uses: Swatinem/rust-cache@v2
+
       - name: Lint the plot crate for wasm32
         run: cargo clippy -p scan-kit-plot --no-deps --target wasm32-unknown-unknown -- -D warnings
 
+      - name: Resolve the wasm-bindgen CLI version from Cargo.lock
+        id: bindgen
+        run: echo "version=$(cargo metadata --format-version 1 --locked | jq -r '.packages[] | select(.name == "wasm-bindgen") | .version')" >> "$GITHUB_OUTPUT"
+
       - name: Install the wasm-bindgen CLI that matches Cargo.lock
-        shell: bash
-        run: |
-          VERSION=$(cargo metadata --format-version 1 --locked | jq -r '.packages[] | select(.name == "wasm-bindgen") | .version')
-          cargo install wasm-bindgen-cli --locked --version "$VERSION"
+        uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen-cli@${{ steps.bindgen.outputs.version }}
 
       - uses: actions/setup-node@v5
         with:
           node-version: 22
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
 
       - name: Build and test the desktop frontend
         working-directory: apps/desktop
@@ -120,15 +129,22 @@ jobs:
         with:
           targets: wasm32-unknown-unknown
 
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Resolve the wasm-bindgen CLI version from Cargo.lock
+        id: bindgen
+        run: echo "version=$(cargo metadata --format-version 1 --locked | jq -r '.packages[] | select(.name == "wasm-bindgen") | .version')" >> "$GITHUB_OUTPUT"
+
       - name: Install the wasm-bindgen CLI that matches Cargo.lock
-        shell: bash
-        run: |
-          VERSION=$(cargo metadata --format-version 1 --locked | jq -r '.packages[] | select(.name == "wasm-bindgen") | .version')
-          cargo install wasm-bindgen-cli --locked --version "$VERSION"
+        uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen-cli@${{ steps.bindgen.outputs.version }}
 
       - uses: actions/setup-node@v5
         with:
           node-version: 22
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
 
       - name: Install frontend dependencies
         working-directory: apps/desktop

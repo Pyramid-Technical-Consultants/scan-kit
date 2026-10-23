@@ -533,14 +533,20 @@ fn image_slices(elems: &[Elem], scale: f32) -> Result<Vec<Slice>, String> {
 }
 
 fn stack(slices: &mut [Slice]) -> Result<CtVolume, String> {
-    slices.sort_by(|a, b| a.origin[2].partial_cmp(&b.origin[2]).unwrap());
+    // A malformed position tag ("nan" parses as f32::NAN) must not crash a
+    // study load; equal order keeps the row and the dz check reports it.
+    slices.sort_by(|a, b| {
+        a.origin[2]
+            .partial_cmp(&b.origin[2])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     let first = &slices[0];
     let dz = if slices.len() == 1 {
         1.0
     } else {
         slices[1].origin[2] - slices[0].origin[2]
     };
-    if dz <= 0.0 {
+    if dz <= 0.0 || dz.is_nan() {
         return Err("CT slice spacing is not uniform".into());
     }
     let mut hu = vec![0.0; first.cols * first.rows * slices.len()];
@@ -1291,6 +1297,29 @@ pub fn write_rtdose(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn slice(z: f32) -> Slice {
+        Slice {
+            origin: [0.0, 0.0, z],
+            spacing_x: 1.0,
+            spacing_y: 1.0,
+            cols: 2,
+            rows: 2,
+            values: vec![0.0; 4],
+        }
+    }
+
+    #[test]
+    fn a_nan_slice_position_errors_instead_of_panicking() {
+        // "nan" in a position tag parses as f32::NAN; the sort used to unwrap.
+        for slices in [
+            vec![slice(0.0), slice(f32::NAN), slice(1.0)],
+            vec![slice(f32::NAN), slice(1.0)],
+        ] {
+            let mut slices = slices;
+            assert!(stack(&mut slices).is_err());
+        }
+    }
 
     #[test]
     fn hfs_gantry_zero_is_the_support_matrix() {

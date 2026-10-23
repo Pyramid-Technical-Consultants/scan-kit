@@ -82,7 +82,9 @@ pub use segment::{
     apply_mask, layer_edges, parse_segments, row_mask, scrub_control, scrub_limits,
     segments_control, segments_from, segments_json, time_end, BeamGate, CompareOp, Rank, Segment,
 };
-pub use session::{merge_session_geom, parse_termination_summary_text, SessionMeta, SummaryDate};
+pub use session::{
+    merge_session_geom, parse_termination_summary_text, valid_session_id, SessionMeta, SummaryDate,
+};
 pub use task::{
     adapt_chunk, decode_poll, encode_poll, generation_matches, settle, Cancel, Phase, Poll, Report,
 };
@@ -262,6 +264,16 @@ pub struct AboutReport {
     pub license_lead: &'static str,
     pub license_label: &'static str,
     pub license_url: &'static str,
+    /// Third-party data and assets compiled into the binary. Full license
+    /// texts install alongside the app under `licenses/`.
+    pub third_party: Vec<ThirdParty>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ThirdParty {
+    pub name: &'static str,
+    pub license: &'static str,
+    pub attribution: &'static str,
 }
 
 /// Granular tool `scan_kit_about`. Same sentences as the Python About dialog.
@@ -283,6 +295,23 @@ pub fn scan_kit_about() -> AboutReport {
         license_lead: "Released under the",
         license_label: "MIT License",
         license_url: "https://github.com/Pyramid-Technical-Consultants/scan-kit/blob/main/LICENSE",
+        third_party: vec![
+            ThirdParty {
+                name: "MCsquare — Monte Carlo material, beam, and scanner data",
+                license: "Apache-2.0",
+                attribution: "© Université catholique de Louvain (UCLouvain), Kevin Souris and IBA s.a.",
+            },
+            ThirdParty {
+                name: "Source Sans 3 — plot and report typeface",
+                license: "SIL OFL-1.1",
+                attribution: "© 2023 Adobe, Reserved Font Name “Source”",
+            },
+            ThirdParty {
+                name: "Geist — interface typeface",
+                license: "SIL OFL-1.1",
+                attribution: "© 2024 The Geist Project Authors",
+            },
+        ],
     }
 }
 

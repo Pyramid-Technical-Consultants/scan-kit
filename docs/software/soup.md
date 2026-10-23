@@ -57,15 +57,31 @@ Versions below are the ones locked for the workspace. Anomaly review for a SOUP 
 
 Plot text uses the vendored Source Sans 3 regular face in `crates/scan-kit-plot/assets/SourceSans3-Regular.ttf` (SIL Open Font License, Latin 400 from fontsource 5.2.8). It is compiled into the plot crate with `include_bytes`. It is not a Cargo dependency.
 
+MCsquare Monte Carlo data ships inside the binary: `assets/mc_materials.npz` (`include_bytes` in `crates/scan-kit-io/src/mc_tables.rs`), the BDL beam models under `assets/mcsquare/BDL/`, and the scanner calibration tables under `assets/mcsquare/Scanners/` (`include_str` in `beam.rs` and `calibration.rs`). The upstream source is the `third_party/MCsquare` submodule (<https://gitlab.com/openmcsquare/MCsquare.git>), Apache-2.0 with a UCLouvain attribution requirement — see `licenses/`. None of it is a Cargo dependency.
+
 ## Desktop frontend
 
 | SOUP | Version | Purpose |
 |---|---|---|
 | React | see `apps/desktop/package.json` | User interface |
+| react-dom | see `apps/desktop/package.json` | DOM renderer for React |
 | Tailwind CSS | see `apps/desktop/package.json` | shadcn theme utilities |
+| `@tailwindcss/vite` | see `apps/desktop/package.json` | Compiles the Tailwind theme during the desktop build |
 | Base UI (`@base-ui/react`) | see `apps/desktop/package.json` | Behavior of shadcn components |
 | `@glideapps/glide-data-grid` | see `apps/desktop/package.json` | Session list and later column views |
+| `@tauri-apps/api` | see `apps/desktop/package.json` | Invoke bridge to the Tauri commands |
 | `@tauri-apps/plugin-dialog` | see `apps/desktop/package.json` | Open Data Folder dialog |
+| `@fontsource-variable/geist` | see `apps/desktop/package.json` | Geist variable font bundled into the app (SIL OFL, see `licenses/`) |
+| `class-variance-authority` | see `apps/desktop/package.json` | Variant styling helper used by copied shadcn components |
+| `cn` | see `apps/desktop/package.json` | Class-name merge helper used by copied shadcn components |
+| `lucide-react` | see `apps/desktop/package.json` | Icon set for the desktop chrome |
+| `tw-animate-css` | see `apps/desktop/package.json` | Animation utilities for shadcn components |
+| vite | see `apps/desktop/package.json` | Desktop bundler. Not linked into the product binary |
+| `@vitejs/plugin-react` | see `apps/desktop/package.json` | React transform for that build. Not linked into the product binary |
+| typescript | see `apps/desktop/package.json` | Type-checks the desktop sources. Not linked into the product binary |
+| `@tauri-apps/cli` | see `apps/desktop/package.json` | Drives `tauri dev` and `tauri build`. Not linked into the product binary |
+| `shadcn` | see `apps/desktop/package.json` | Scaffolds shadcn components into `src/components/ui/`. Not linked into the product binary |
+| `@types/*` | see `apps/desktop/package.json` | Type declarations for the desktop build. Not linked into the product binary |
 | vitest | see `apps/desktop/package.json` | Desktop UI checks. Not linked into the product binary |
 | @vitest/coverage-v8 | see `apps/desktop/package.json` | Line coverage for those checks. Not linked into the product binary |
 | happy-dom | see `apps/desktop/package.json` | DOM for those checks. Not linked into the product binary |

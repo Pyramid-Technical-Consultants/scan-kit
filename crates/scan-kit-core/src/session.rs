@@ -24,6 +24,13 @@ pub struct SummaryDate {
     pub second: u32,
 }
 
+/// A session id becomes a path component under the library and inside zip
+/// archives, so `.`, `..`, and separators are not ids — they are traversals.
+/// Ids minted from zip member names or device tables are checked with this too.
+pub fn valid_session_id(id: &str) -> bool {
+    !id.is_empty() && id != "." && id != ".." && !id.contains(['/', '\\'])
+}
+
 impl SessionMeta {
     pub fn empty() -> Self {
         Self {
