@@ -27,6 +27,7 @@ use crate::session_capture;
 use crate::store::{self, with_store};
 
 const MAX_BODY: usize = 64 * 1024 * 1024;
+const MAX_ZIP_WALK_DEPTH: usize = 32;
 
 struct Live {
     host: String,
@@ -872,7 +873,7 @@ fn package_zip(dir: &Path, zip_path: &Path, session_id: &str) -> Result<(), Stri
     let options = zip::write::SimpleFileOptions::default()
         .compression_method(zip::CompressionMethod::Deflated);
     let mut files = Vec::new();
-    collect_files(dir, &mut files)?;
+    collect_files(dir, 0, &mut files)?;
     files.sort();
     for path in files {
         let rel = path.strip_prefix(dir).map_err(|err| err.to_string())?;
@@ -886,11 +887,19 @@ fn package_zip(dir: &Path, zip_path: &Path, session_id: &str) -> Result<(), Stri
     Ok(())
 }
 
-fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
+fn collect_files(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) -> Result<(), String> {
+    if depth > MAX_ZIP_WALK_DEPTH {
+        // is_dir() follows symlinks — a captured tree could carry a loop.
+        return Err(format!(
+            "session tree is deeper than {} levels under {}",
+            MAX_ZIP_WALK_DEPTH,
+            dir.display()
+        ));
+    }
     for item in std::fs::read_dir(dir).map_err(|err| err.to_string())? {
         let path = item.map_err(|err| err.to_string())?.path();
         if path.is_dir() {
-            collect_files(&path, out)?;
+            collect_files(&path, depth + 1, out)?;
         } else if path.is_file() {
             out.push(path);
         }
