@@ -32,7 +32,7 @@ pub(crate) enum Scheme {
     Https,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(crate) struct Remote {
     pub canonical: String,
     pub scheme: Scheme,
@@ -41,6 +41,21 @@ pub(crate) struct Remote {
     pub host: String,
     pub port: Option<u16>,
     pub path: String,
+}
+
+// The derived Debug would dump the password into any future {remote:?} error.
+impl std::fmt::Debug for Remote {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Remote")
+            .field("canonical", &self.canonical)
+            .field("scheme", &self.scheme)
+            .field("username", &self.username)
+            .field("password", &self.password.as_ref().map(|_| "…"))
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("path", &self.path)
+            .finish()
+    }
 }
 
 enum Kind {
@@ -788,7 +803,7 @@ fn expand_user(text: &str) -> PathBuf {
     PathBuf::from(text)
 }
 
-fn home_dir() -> PathBuf {
+pub(crate) fn home_dir() -> PathBuf {
     for key in ["USERPROFILE", "HOME"] {
         if let Ok(path) = std::env::var(key) {
             if !path.is_empty() {
@@ -1114,6 +1129,13 @@ mod tests {
         assert!(is_remote_location("ftps://host.invalid/data"));
         assert!(is_remote_location("http://host.invalid/session.zip"));
         assert!(is_remote_location("https://host.invalid/session.zip"));
+
+        let remote = match classify("sftp://pyramid:secret@192.168.101.206/data").unwrap() {
+            Kind::Remote(remote) => remote,
+            Kind::Local(_) => panic!("sftp is remote"),
+        };
+        let debug = format!("{remote:?}");
+        assert!(!debug.contains("secret"), "{debug}");
         assert!(!is_remote_location(r"\\192.168.101.206\share\ptc_ex"));
         assert!(!is_remote_location(r"C:\data"));
         assert!(!is_remote_location("C://data"));

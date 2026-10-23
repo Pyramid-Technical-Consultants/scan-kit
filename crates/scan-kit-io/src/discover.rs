@@ -700,11 +700,10 @@ fn read_zip(path: &Path, want: &dyn Fn(&str) -> bool) -> Result<Vec<(String, Vec
         if !want(&name) {
             continue;
         }
-        let mut bytes = Vec::new();
-        entry
-            .read_to_end(&mut bytes)
-            .map_err(|err| err.to_string())?;
-        out.push((name, bytes));
+        out.push((
+            name.clone(),
+            read_capped(&mut entry, &name, MAX_MEMBER_BYTES)?,
+        ));
     }
     Ok(out)
 }
@@ -734,13 +733,28 @@ fn read_tar(path: &Path, want: &dyn Fn(&str) -> bool) -> Result<Vec<(String, Vec
         if !want(&name) {
             continue;
         }
-        let mut bytes = Vec::new();
-        entry
-            .read_to_end(&mut bytes)
-            .map_err(|err| err.to_string())?;
-        out.push((name, bytes));
+        out.push((
+            name.clone(),
+            read_capped(&mut entry, &name, MAX_MEMBER_BYTES)?,
+        ));
     }
     Ok(out)
+}
+
+/// Session members are CSV/XML/JSON — none legitimately approach this. A
+/// crafted archive inflating past it is a decompression bomb, not a session.
+const MAX_MEMBER_BYTES: u64 = 4 << 30;
+
+fn read_capped(member: &mut impl Read, name: &str, max: u64) -> Result<Vec<u8>, String> {
+    let mut bytes = Vec::new();
+    member
+        .take(max + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|err| err.to_string())?;
+    if bytes.len() as u64 > max {
+        return Err(format!("{name} expands past {max} bytes"));
+    }
+    Ok(bytes)
 }
 
 #[cfg(test)]
@@ -763,6 +777,16 @@ pub fn write_zip(path: &Path, members: &[(&str, &[u8])]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_over_cap_member_errors_instead_of_eating_memory() {
+        let payload = vec![b'x'; 16];
+        let mut reader = std::io::Cursor::new(payload.clone());
+        assert_eq!(read_capped(&mut reader, "m.csv", 16).unwrap(), payload);
+        let mut reader = std::io::Cursor::new(payload);
+        let err = read_capped(&mut reader, "m.csv", 15).unwrap_err();
+        assert!(err.contains("expands past"), "{err}");
+    }
 
     #[test]
     fn a_walk_stops_at_eight_levels() {

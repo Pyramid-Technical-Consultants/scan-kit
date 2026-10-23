@@ -78,8 +78,12 @@ pub fn parse_host(host: &str) -> Result<String, String> {
     } else {
         text.split('/').next().unwrap_or(text)
     };
-    if authority.is_empty() {
-        return Err(format!("invalid host: {host}"));
+    if authority.is_empty()
+        || authority
+            .bytes()
+            .any(|byte| byte.is_ascii_control() || byte == b' ')
+    {
+        return Err(format!("invalid host: {host:?}"));
     }
     Ok(authority.to_owned())
 }
@@ -94,6 +98,16 @@ pub fn normalize_host(host: &str) -> Result<String, String> {
 }
 
 pub fn io_url(host: &str, path: &str, file_name: &str) -> Result<String, String> {
+    // Both parts land verbatim in the HTTP request line — device-supplied
+    // text with CR/LF or a space would inject headers past it.
+    for part in [path, file_name] {
+        if part
+            .bytes()
+            .any(|byte| byte.is_ascii_control() || byte == b' ')
+        {
+            return Err(format!("invalid device path: {part:?}"));
+        }
+    }
     let base = format!("http://{}/io", normalize_host(host)?);
     let path = path.trim_matches('/');
     if path.is_empty() {
@@ -104,6 +118,14 @@ pub fn io_url(host: &str, path: &str, file_name: &str) -> Result<String, String>
 }
 
 pub fn device_file_url(host: &str, device_path: &str) -> Result<String, String> {
+    // The path lands verbatim in the HTTP request line — device-supplied
+    // text with CR/LF or a space would inject headers past it.
+    if device_path
+        .bytes()
+        .any(|byte| byte.is_ascii_control() || byte == b' ')
+    {
+        return Err(format!("invalid device path: {device_path:?}"));
+    }
     let path = if device_path.starts_with('/') {
         device_path.to_owned()
     } else {
@@ -405,6 +427,17 @@ mod tests {
             "http://10.0.0.1:80/root/config/control_points.csv"
         );
         assert_eq!(field_subscribe_key("admin/version"), "/admin/version/value");
+    }
+
+    #[test]
+    fn device_text_cannot_inject_into_the_request_line() {
+        for bad in ["/a\r\nInjected: 1", "/a\n\nGET /x", "/a b", "/a\u{7}"] {
+            assert!(device_file_url("10.0.0.1", bad).is_err(), "{bad:?}");
+            assert!(io_url("10.0.0.1", bad, "value.json").is_err(), "{bad:?}");
+        }
+        for bad in ["10.0.0.1\r\nX: 1", "10.0 .0.1", "10.0.0.1\u{7}"] {
+            assert!(parse_host(bad).is_err(), "{bad:?}");
+        }
     }
 
     #[test]
