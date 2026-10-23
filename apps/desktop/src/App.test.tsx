@@ -37,6 +37,9 @@ vi.mock("@tauri-apps/api/core", () => ({
         license_url: "https://example.com",
         version: "2.0.0-dev",
         commit: "",
+        third_party: [
+          { name: "MCsquare — data", license: "Apache-2.0", attribution: "© UCLouvain" },
+        ],
       };
     }
     return null;
@@ -143,8 +146,16 @@ it("mounts the data view that opens every analysis plot", async () => {
     });
     await windowHooks.closeRequest?.({ preventDefault() {} });
   });
-  const about = [...document.body.querySelectorAll("button")].find((item) => item.textContent?.includes("About"));
+  const help = [...document.body.querySelectorAll("button")].find((item) => item.textContent?.includes("Help"));
+  await act(async () => {
+    help?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+  });
+  const about = [...document.body.querySelectorAll("[role='menuitem'], [role='menu'] *")].find((item) =>
+    item.textContent?.includes("About"),
+  );
   await act(async () => {
     about?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
   });
+  expect(document.body.textContent).toContain("Third-party software and data");
+  expect(document.body.textContent).toContain("MCsquare — data");
 });

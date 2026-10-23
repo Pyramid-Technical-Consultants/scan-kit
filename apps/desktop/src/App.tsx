@@ -164,6 +164,13 @@ type About = {
   license_lead: string;
   license_label: string;
   license_url: string;
+  third_party: ThirdParty[];
+};
+
+type ThirdParty = {
+  name: string;
+  license: string;
+  attribution: string;
 };
 
 type Geometry = {
@@ -1280,6 +1287,21 @@ export default function App() {
                 </a>
                 .
               </p>
+              {(about.third_party?.length ?? 0) > 0 ? (
+                <div>
+                  <p className="font-medium">Third-party software and data</p>
+                  <ul className="list-disc pl-5 text-muted-foreground">
+                    {(about.third_party ?? []).map((item) => (
+                      <li key={item.name}>
+                        {item.name} — {item.license}. {item.attribution}.
+                      </li>
+                    ))}
+                  </ul>
+                  <p className="mt-1 text-muted-foreground">
+                    Full license texts install alongside the app in the <code>licenses</code> folder.
+                  </p>
+                </div>
+              ) : null}
             </div>
           ) : null}
         </DialogContent>
