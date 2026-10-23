@@ -652,6 +652,14 @@ fn parse_remote(scheme: Scheme, rest: &str) -> Result<Remote, String> {
     }
     let host = host.to_ascii_lowercase();
     let mut path = percent_decode(raw_path);
+    // Decoded control chars would land verbatim in the canonical key, which
+    // is persisted and logged — CR/LF forges fake log lines.
+    if path.bytes().any(|byte| byte.is_ascii_control())
+        || username.bytes().any(|byte| byte.is_ascii_control())
+        || query.bytes().any(|byte| byte.is_ascii_control())
+    {
+        return Err("the URL holds control characters".into());
+    }
     if !path.starts_with('/') {
         path.insert(0, '/');
     }
@@ -1141,6 +1149,14 @@ mod tests {
         assert!(!is_remote_location("C://data"));
         assert!(!is_remote_location("file:///C:/data"));
         assert!(canonical_root("nfs://host/data").is_err());
+        for bad in [
+            "sftp://user@host/data%0aforged",
+            "sftp://user@host/data%0d",
+            "sftp://u%09ser@host/data",
+            "sftp://user@host/data?\tforged",
+        ] {
+            assert!(canonical_root(bad).is_err(), "{bad}");
+        }
         assert_eq!(
             Path::new("sftp://pyramid@192.168.101.206/var/log/ptc_ex").to_string_lossy(),
             "sftp://pyramid@192.168.101.206/var/log/ptc_ex"

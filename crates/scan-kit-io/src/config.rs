@@ -121,7 +121,7 @@ pub fn save_folder(
         if dest_key.starts_with(&format!("{source_key}/")) {
             return Err("Save the configuration beside the source folder, not inside it.".into());
         }
-        copy_tree(source, dest)?;
+        copy_tree(source, dest, 0)?;
     } else if !dest.exists() {
         fs::create_dir_all(dest).map_err(|err| err.to_string())?;
     }
@@ -334,20 +334,28 @@ fn diff_root(dir: &Path) -> PathBuf {
 
 fn walk_files(root: &Path) -> Result<BTreeMap<String, Vec<u8>>, String> {
     let mut files = BTreeMap::new();
-    walk_files_at(root, root, &mut files)?;
+    walk_files_at(root, root, 0, &mut files)?;
     Ok(files)
 }
 
 fn walk_files_at(
     root: &Path,
     dir: &Path,
+    depth: usize,
     files: &mut BTreeMap<String, Vec<u8>>,
 ) -> Result<(), String> {
+    if depth > MAX_XML_WALK_DEPTH {
+        return Err(format!(
+            "config tree is deeper than {} levels under {}",
+            MAX_XML_WALK_DEPTH,
+            root.display()
+        ));
+    }
     for entry in fs::read_dir(dir).map_err(|err| err.to_string())? {
         let entry = entry.map_err(|err| err.to_string())?;
         let path = entry.path();
         if path.is_dir() {
-            walk_files_at(root, &path, files)?;
+            walk_files_at(root, &path, depth + 1, files)?;
             continue;
         }
         let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
@@ -595,19 +603,29 @@ fn session_present(root: &Path, session_id: &str) -> bool {
             .is_file()
 }
 
+const MAX_XML_WALK_DEPTH: usize = 32;
+
 fn list_xml(root: &Path) -> Result<Vec<String>, String> {
     let mut files = Vec::new();
-    walk_xml(root, root, &mut files)?;
+    walk_xml(root, root, 0, &mut files)?;
     files.sort();
     Ok(files)
 }
 
-fn walk_xml(root: &Path, dir: &Path, files: &mut Vec<String>) -> Result<(), String> {
+fn walk_xml(root: &Path, dir: &Path, depth: usize, files: &mut Vec<String>) -> Result<(), String> {
+    if depth > MAX_XML_WALK_DEPTH {
+        // is_dir() follows symlinks — a config tree could carry a loop.
+        return Err(format!(
+            "config tree is deeper than {} levels under {}",
+            MAX_XML_WALK_DEPTH,
+            root.display()
+        ));
+    }
     for entry in fs::read_dir(dir).map_err(|err| err.to_string())? {
         let entry = entry.map_err(|err| err.to_string())?;
         let path = entry.path();
         if path.is_dir() {
-            walk_xml(root, &path, files)?;
+            walk_xml(root, &path, depth + 1, files)?;
             continue;
         }
         let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
@@ -782,14 +800,22 @@ fn folder_key(path: &Path) -> String {
         .to_owned()
 }
 
-fn copy_tree(source: &Path, dest: &Path) -> Result<(), String> {
+fn copy_tree(source: &Path, dest: &Path, depth: usize) -> Result<(), String> {
+    if depth > MAX_XML_WALK_DEPTH {
+        // is_dir() follows symlinks — a config tree could carry a loop.
+        return Err(format!(
+            "config tree is deeper than {} levels under {}",
+            MAX_XML_WALK_DEPTH,
+            source.display()
+        ));
+    }
     fs::create_dir_all(dest).map_err(|err| err.to_string())?;
     for entry in fs::read_dir(source).map_err(|err| err.to_string())? {
         let entry = entry.map_err(|err| err.to_string())?;
         let from = entry.path();
         let to = dest.join(entry.file_name());
         if from.is_dir() {
-            copy_tree(&from, &to)?;
+            copy_tree(&from, &to, depth + 1)?;
         } else {
             fs::copy(&from, &to)
                 .map_err(|err| format!("Could not copy {}: {err}", from.display()))?;
