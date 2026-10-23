@@ -1683,6 +1683,40 @@ Layer delivery: 27/27
     }
 
     #[test]
+    fn an_unreachable_remote_data_dir_can_still_be_forgotten() {
+        let root = workspace("forget-remote");
+        let db = root.join("test.sqlite");
+        let db_arg = db.to_string_lossy().into_owned();
+        let url = "sftp://scan-kit@example.invalid/dead-lib";
+        let canonical = location::canonical_root(url).unwrap();
+        with_store(&db, |conn| store::remember_data_dir(conn, &canonical)).unwrap();
+        let forgotten = invoke(
+            "scan_kit_forget_data_dir",
+            &json!({ "path": url, "db_path": &db_arg }),
+        )
+        .unwrap();
+        assert!(forgotten["locations"].as_array().unwrap().is_empty());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_missing_data_dir_errors_instead_of_indexing_nothing() {
+        let root = workspace("open-dead");
+        let db = root.join("test.sqlite");
+        let db_arg = db.to_string_lossy().into_owned();
+        let gone = root.join("gone");
+        // Opening a dead path must stay an error: a silent success would let
+        // delete_missing wipe the recorded sessions for that root.
+        let err = invoke(
+            "scan_kit_open_library",
+            &json!({ "path": gone.to_string_lossy(), "db_path": &db_arg }),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("not a directory"), "{err}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn a_local_session_moves_to_the_trash() {
         let root = workspace("trash");
         let db = root.join("test.sqlite");
