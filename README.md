@@ -527,7 +527,7 @@ CI verifies the tag matches the workspace version before publishing. The project
 
 [MIT](LICENSE). Copyright (c) 2026 Pyramid Technical Consultants
 
-The Monte Carlo physics and material data are ported from [MCsquare](https://gitlab.com/openmcsquare/MCsquare), Université catholique de Louvain, under the Apache License 2.0 ([`assets/MCsquare_LICENSE.txt`](assets/MCsquare_LICENSE.txt)).
+The Monte Carlo physics and material data are ported from [MCsquare](https://gitlab.com/openmcsquare/MCsquare), Université catholique de Louvain, under the Apache License 2.0 ([`licenses/MCsquare.txt`](licenses/MCsquare.txt)).
 
 Bundled fonts are under the SIL Open Font License 1.1: Source Sans 3 (© 2023 Adobe, Reserved Font Name "Source") renders plot and report text, and Geist (© 2024 The Geist Project Authors) is the desktop UI face.
 
