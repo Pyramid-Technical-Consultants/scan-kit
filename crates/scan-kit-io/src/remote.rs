@@ -268,6 +268,10 @@ mod net {
     use super::{copy_file_to, Fs, Item, Stat, COPY_DEPTH};
     use crate::location::{self, Remote, Scheme};
 
+    /// A session archive is at most gigabytes. Anything bigger is a hostile
+    /// server trying to exhaust memory, not a session.
+    const MAX_OBJECT_BYTES: u64 = 4 << 30;
+
     pub(super) fn connect(remote: &Remote, password: &str) -> Result<Box<dyn Fs>, String> {
         match remote.scheme {
             Scheme::Sftp => Ok(Box::new(SftpFs::connect(remote, password)?)),
@@ -298,6 +302,7 @@ mod net {
             session.set_timeout(20_000);
             session.set_tcp_stream(tcp);
             session.handshake().map_err(|err| err.to_string())?;
+            check_host_key(&session, &remote.host, port)?;
             let user = if remote.username.is_empty() {
                 "anonymous"
             } else {
@@ -314,6 +319,52 @@ mod net {
 
         fn sftp(&self) -> Result<ssh2::Sftp, String> {
             self.session.sftp().map_err(|err| err.to_string())
+        }
+    }
+
+    /// Trust-on-first-use against `~/.ssh/known_hosts`, checked before the
+    /// password goes out. An unknown host is learned; a changed key refuses —
+    /// that is the MITM case worth failing closed for.
+    fn check_host_key(session: &ssh2::Session, host: &str, port: u16) -> Result<(), String> {
+        let Some((key, key_type)) = session.host_key() else {
+            return Err("the sftp server presented no host key".into());
+        };
+        let mut known_hosts = session.known_hosts().map_err(|err| err.to_string())?;
+        let file = location::home_dir().join(".ssh").join("known_hosts");
+        if file.is_file() {
+            known_hosts
+                .read_file(&file, ssh2::KnownHostFileKind::OpenSSH)
+                .map_err(|err| format!("{}: {err}", file.display()))?;
+        }
+        let result = if port == 22 {
+            known_hosts.check(host, key)
+        } else {
+            known_hosts.check_port(host, port, key)
+        };
+        match result {
+            ssh2::CheckResult::Match => Ok(()),
+            ssh2::CheckResult::NotFound => {
+                let name = if port == 22 {
+                    host.to_owned()
+                } else {
+                    format!("[{host}]:{port}")
+                };
+                known_hosts
+                    .add(&name, key, "scan-kit", key_type.into())
+                    .map_err(|err| err.to_string())?;
+                if let Some(parent) = file.parent() {
+                    fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+                }
+                known_hosts
+                    .write_file(&file, ssh2::KnownHostFileKind::OpenSSH)
+                    .map_err(|err| format!("{}: {err}", file.display()))
+            }
+            ssh2::CheckResult::Mismatch => Err(format!(
+                "the host key for {host} changed — refusing to connect; \
+                 remove the stale entry from {}",
+                file.display()
+            )),
+            ssh2::CheckResult::Failure => Err("the known-hosts check failed".into()),
         }
     }
 
@@ -339,8 +390,12 @@ mod net {
                     return Ok(Some(bytes));
                 }
                 let mut bytes = Vec::new();
-                file.read_to_end(&mut bytes)
+                file.take(MAX_OBJECT_BYTES + 1)
+                    .read_to_end(&mut bytes)
                     .map_err(|err| err.to_string())?;
+                if bytes.len() as u64 > MAX_OBJECT_BYTES {
+                    return Err(format!("{path} is bigger than {MAX_OBJECT_BYTES} bytes"));
+                }
                 Ok(Some(bytes))
             }
             Err(err) if missing_sftp(&err) => Ok(None),
@@ -562,15 +617,33 @@ mod net {
         }
 
         fn read(&mut self, path: &str) -> Result<Option<Vec<u8>>, String> {
-            let result = match &mut self.client {
-                FtpClient::Plain(ftp) => ftp.retr_as_buffer(path),
-                FtpClient::Tls(ftp) => ftp.retr_as_buffer(path),
+            let mut stream: Box<dyn Read> = match &mut self.client {
+                FtpClient::Plain(ftp) => match ftp.retr_as_stream(path) {
+                    Ok(stream) => Box::new(stream),
+                    Err(err) if missing_ftp(&err) => return Ok(None),
+                    Err(err) => return Err(map_ftp(err)),
+                },
+                FtpClient::Tls(ftp) => match ftp.retr_as_stream(path) {
+                    Ok(stream) => Box::new(stream),
+                    Err(err) if missing_ftp(&err) => return Ok(None),
+                    Err(err) => return Err(map_ftp(err)),
+                },
             };
-            match result {
-                Ok(cursor) => Ok(Some(cursor.into_inner())),
-                Err(err) if missing_ftp(&err) => Ok(None),
-                Err(err) => Err(map_ftp(err)),
+            let mut bytes = Vec::new();
+            let read = stream
+                .by_ref()
+                .take(MAX_OBJECT_BYTES + 1)
+                .read_to_end(&mut bytes);
+            let finalize = match &mut self.client {
+                FtpClient::Plain(ftp) => ftp.finalize_retr_stream(stream),
+                FtpClient::Tls(ftp) => ftp.finalize_retr_stream(stream),
+            };
+            read.map_err(|err| err.to_string())?;
+            finalize.map_err(map_ftp)?;
+            if bytes.len() as u64 > MAX_OBJECT_BYTES {
+                return Err(format!("{path} is bigger than {MAX_OBJECT_BYTES} bytes"));
             }
+            Ok(Some(bytes))
         }
 
         fn stat(&mut self, path: &str) -> Result<Option<Stat>, String> {
@@ -830,8 +903,12 @@ mod net {
         let mut bytes = Vec::new();
         response
             .into_reader()
+            .take(MAX_OBJECT_BYTES + 1)
             .read_to_end(&mut bytes)
             .map_err(|err| err.to_string())?;
+        if bytes.len() as u64 > MAX_OBJECT_BYTES {
+            return Err(format!("{url} is bigger than {MAX_OBJECT_BYTES} bytes"));
+        }
         Ok(bytes)
     }
 
