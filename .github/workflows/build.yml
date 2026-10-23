@@ -65,6 +65,9 @@ jobs:
 
       - name: Resolve the wasm-bindgen CLI version from Cargo.lock
         id: bindgen
+        # windows-latest defaults to pwsh, where $(...) is not command
+        # substitution and jq is not on PATH -- Git Bash has both.
+        shell: bash
         run: echo "version=$(cargo metadata --format-version 1 --locked | jq -r '.packages[] | select(.name == "wasm-bindgen") | .version')" >> "$GITHUB_OUTPUT"
 
       - name: Install the wasm-bindgen CLI that matches Cargo.lock
@@ -142,6 +145,9 @@ jobs:
 
       - name: Resolve the wasm-bindgen CLI version from Cargo.lock
         id: bindgen
+        # windows-latest defaults to pwsh, where $(...) is not command
+        # substitution and jq is not on PATH -- Git Bash has both.
+        shell: bash
         run: echo "version=$(cargo metadata --format-version 1 --locked | jq -r '.packages[] | select(.name == "wasm-bindgen") | .version')" >> "$GITHUB_OUTPUT"
 
       - name: Install the wasm-bindgen CLI that matches Cargo.lock
