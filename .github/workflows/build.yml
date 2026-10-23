@@ -68,9 +68,18 @@ jobs:
         run: echo "version=$(cargo metadata --format-version 1 --locked | jq -r '.packages[] | select(.name == "wasm-bindgen") | .version')" >> "$GITHUB_OUTPUT"
 
       - name: Install the wasm-bindgen CLI that matches Cargo.lock
+        id: bindgen-install
         uses: taiki-e/install-action@v2
+        continue-on-error: true
         with:
           tool: wasm-bindgen-cli@${{ steps.bindgen.outputs.version }}
+
+      # install-action intermittently dies on the windows runner's bash
+      # startup (actions/partner-runner-images#169); building the CLI from
+      # source is slow but always works.
+      - name: Fall back to cargo install for wasm-bindgen
+        if: steps.bindgen-install.outcome != 'success'
+        run: cargo install wasm-bindgen-cli --locked --version "${{ steps.bindgen.outputs.version }}"
 
       - uses: actions/setup-node@v5
         with:
@@ -136,9 +145,15 @@ jobs:
         run: echo "version=$(cargo metadata --format-version 1 --locked | jq -r '.packages[] | select(.name == "wasm-bindgen") | .version')" >> "$GITHUB_OUTPUT"
 
       - name: Install the wasm-bindgen CLI that matches Cargo.lock
+        id: bindgen-install
         uses: taiki-e/install-action@v2
+        continue-on-error: true
         with:
           tool: wasm-bindgen-cli@${{ steps.bindgen.outputs.version }}
+
+      - name: Fall back to cargo install for wasm-bindgen
+        if: steps.bindgen-install.outcome != 'success'
+        run: cargo install wasm-bindgen-cli --locked --version "${{ steps.bindgen.outputs.version }}"
 
       - uses: actions/setup-node@v5
         with:
