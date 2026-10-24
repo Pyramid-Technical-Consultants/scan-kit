@@ -1,0 +1,250 @@
+import { segmentChoices } from "@/CatalogField";
+
+export type ControlSlot = {
+  id: string;
+  kind: "select" | "check" | "segments" | "range" | "text" | "radio" | "number";
+};
+
+export type SegmentItem = {
+  kind: string;
+  state?: string;
+  which?: string;
+  column?: string;
+  lo?: number;
+  hi?: number;
+  op?: string;
+  threshold?: number;
+};
+
+export type ControlSection = {
+  title: string;
+  slots: ControlSlot[];
+};
+
+type SectionControl = {
+  id: string;
+  group?: string;
+  kind?: string;
+};
+
+/** One fieldset per group, in the order the plot sent the controls. */
+export function controlSections(controls: readonly SectionControl[]): ControlSection[] {
+  const sections: ControlSection[] = [];
+  for (const control of controls) {
+    if (control.kind === "scrub") {
+      continue;
+    }
+    const title = control.group != null && control.group.length > 0 ? control.group : "Options";
+    const slot: ControlSlot = {
+      id: control.id,
+      kind:
+        control.kind === "check"
+          ? "check"
+          : control.kind === "segments"
+            ? "segments"
+            : control.kind === "range"
+              ? "range"
+              : control.kind === "text"
+                ? "text"
+                : control.kind === "radio"
+                  ? "radio"
+                  : control.kind === "number"
+                    ? "number"
+                    : "select",
+    };
+    const last = sections[sections.length - 1];
+    if (last != null && last.title === title) {
+      last.slots.push(slot);
+    } else {
+      sections.push({ title, slots: [slot] });
+    }
+  }
+  return sections;
+}
+
+export { segmentChoices };
+
+const GRAIN_FIELDS = ["y", "x", "xy"] as const;
+
+/**
+ * Timeline playback follows scatter, contour, and density in the plot. A settled
+ * playhead still rebuilds the picture when the spectrum, confidence, or coverage
+ * depends on that window.
+ */
+export function playheadReplay(options: Readonly<Record<string, string>>): boolean {
+  if (options.fft === "On") {
+    return true;
+  }
+  if (options.scatter !== "On") {
+    return false;
+  }
+  return options.scatter_xy === "Confidence" || options.scatter_xy === "Coverage (%)";
+}
+
+export type GrainMemory = {
+  spot?: Record<string, string>;
+  timeslice?: Record<string, string>;
+};
+
+function grainName(source: string): "spot" | "timeslice" | "" {
+  const lower = source.trim().toLowerCase();
+  if (lower.includes("time")) {
+    return "timeslice";
+  }
+  if (lower.includes("spot")) {
+    return "spot";
+  }
+  return "";
+}
+
+/**
+ * Spot and Timeslice keep their own Y, X, and XY choices. The first visit to a
+ * grain keeps the current choice so a shared quantity can carry over.
+ */
+export function applyOption(
+  options: Record<string, string>,
+  resolved: Readonly<Record<string, string>>,
+  memory: GrainMemory,
+  id: string,
+  value: string,
+): Record<string, string> {
+  if (id !== "source") {
+    return { ...options, [id]: value };
+  }
+  const from = grainName(resolved.source ?? options.source ?? "");
+  if (from !== "") {
+    const snapshot: Record<string, string> = {};
+    for (const key of GRAIN_FIELDS) {
+      const shown = resolved[key];
+      if (shown != null && shown.length > 0) {
+        snapshot[key] = shown;
+      }
+    }
+    memory[from] = snapshot;
+  }
+  const next: Record<string, string> = { ...options, source: value };
+  const to = grainName(value);
+  const saved = to === "" ? undefined : memory[to];
+  if (saved != null) {
+    for (const key of GRAIN_FIELDS) {
+      const remembered = saved[key];
+      if (remembered != null) {
+        next[key] = remembered;
+      }
+    }
+  }
+  return next;
+}
+
+const FRESH_SEGMENT: Record<string, SegmentItem> = {
+  beam: { kind: "beam", state: "both" },
+  rank: { kind: "rank", which: "all" },
+  range: { kind: "range", column: "energy", lo: 0, hi: 0 },
+  compare: { kind: "compare", column: "", op: "abs_gt", threshold: 1 },
+};
+
+export function parseSegments(value: string): SegmentItem[] | null {
+  try {
+    const parsed: unknown = JSON.parse(value);
+    if (!Array.isArray(parsed)) {
+      return null;
+    }
+    const items: SegmentItem[] = [];
+    for (const item of parsed) {
+      if (item == null || typeof item !== "object" || !("kind" in item)) {
+        return null;
+      }
+      const row = item as { kind?: unknown };
+      if (typeof row.kind !== "string") {
+        return null;
+      }
+      items.push(item as SegmentItem);
+    }
+    return items;
+  } catch {
+    return null;
+  }
+}
+
+export function segmentsText(items: readonly SegmentItem[]): string {
+  return JSON.stringify(items);
+}
+
+export function addSegment(items: readonly SegmentItem[], kind: string): SegmentItem[] {
+  if (items.some((item) => item.kind === kind)) {
+    return [...items];
+  }
+  return [...items, FRESH_SEGMENT[kind] ?? { kind }];
+}
+
+export function removeSegment(items: readonly SegmentItem[], index: number): SegmentItem[] {
+  return items.filter((_, item) => item !== index);
+}
+
+export function replaceSegment(
+  items: readonly SegmentItem[],
+  index: number,
+  next: SegmentItem,
+): SegmentItem[] {
+  return items.map((item, itemIndex) => (itemIndex === index ? next : item));
+}
+
+const DOSE_PAINT_IDS = ["scale", "auto", "level", "error", "ray", "sample", "field"] as const;
+
+/** Depth and lateral curves are rows of the cube already on screen. */
+export function localLinePlot(value: string): boolean {
+  const name = value.trim().toLowerCase();
+  return name.startsWith("depth") || (name.startsWith("lateral") && !name.includes("+"));
+}
+
+/**
+ * Options that rebuild the dose. Color, window, ray mode, sampling, the field
+ * box, and the line-plot picker are not in here. DVH and gamma still go through
+ * the view task, because those series are not in the cube.
+ */
+function monteCarloModel(model: string | undefined): boolean {
+  return model === "mc" || model === "Monte Carlo";
+}
+
+export function sceneOptions(options: Readonly<Record<string, string>>): Record<string, string> {
+  const rest: Record<string, string> = {};
+  const transport = monteCarloModel(options.model);
+  for (const [key, value] of Object.entries(options)) {
+    if ((DOSE_PAINT_IDS as readonly string[]).includes(key) || key === "plot0" || key === "plot1") {
+      continue;
+    }
+    // Analytic dose ignores the history count. Keep the choice without rebuilding the cube.
+    if (key === "histories" && !transport) {
+      continue;
+    }
+    rest[key] = value;
+  }
+  return rest;
+}
+
+/**
+ * Picture settings for the plot already on screen. Empty when the view has none yet.
+ * Level is sent only after the user moves it. The gain default of 1 is not a window.
+ */
+export function paintSpec(
+  resolved: Readonly<Record<string, string>>,
+  options: Readonly<Record<string, string>>,
+): string {
+  const spec: Record<string, string> = {};
+  for (const id of DOSE_PAINT_IDS) {
+    const value = id === "level" ? options[id] : resolved[id];
+    if (value != null && value.length > 0) {
+      spec[id] = value;
+    }
+  }
+  return Object.keys(spec).length === 0 ? "" : JSON.stringify(spec);
+}
+
+/** Histogram bins follow the show-panel checkbox. X bins apply to every axis. */
+export function controlDisabled(id: string, values: Readonly<Record<string, string>>): boolean {
+  return (
+    (id === "hist_bins" || id === "share" || id === "shared") &&
+    values.hist != null &&
+    values.hist !== "On"
+  );
+}

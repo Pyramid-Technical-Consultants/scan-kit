@@ -4,10 +4,10 @@
     {
       "label": "Run Scan Kit",
       "type": "shell",
-      "command": "python",
-      "args": ["-m", "scan_kit"],
+      "command": "npm",
+      "args": ["run", "tauri", "dev"],
       "options": {
-        "cwd": "${workspaceFolder}"
+        "cwd": "${workspaceFolder}/apps/desktop"
       },
       "group": {
         "kind": "build",
@@ -22,10 +22,10 @@
       "problemMatcher": []
     },
     {
-      "label": "Run Tests (fast)",
+      "label": "Run Tests (cargo)",
       "type": "shell",
-      "command": "python",
-      "args": ["-m", "pytest"],
+      "command": "cargo",
+      "args": ["test", "--workspace", "--exclude", "scan-kit-desktop", "--locked"],
       "options": {
         "cwd": "${workspaceFolder}"
       },
@@ -42,10 +42,10 @@
       "problemMatcher": []
     },
     {
-      "label": "Run Tests (full)",
+      "label": "MC Validate (fast)",
       "type": "shell",
-      "command": "python",
-      "args": ["-m", "pytest", "-o", "addopts=-ra"],
+      "command": "cargo",
+      "args": ["run", "-p", "scan-kit-compute", "--bin", "mc-validate", "--", "fast"],
       "options": {
         "cwd": "${workspaceFolder}"
       },
@@ -59,45 +59,12 @@
       "problemMatcher": []
     },
     {
-      "label": "Run Tests (parallel)",
+      "label": "Build Installer",
       "type": "shell",
-      "command": "python",
-      "args": ["-m", "pytest", "-n", "auto", "--dist", "loadscope"],
+      "command": "npm",
+      "args": ["run", "tauri", "build"],
       "options": {
-        "cwd": "${workspaceFolder}"
-      },
-      "group": "test",
-      "presentation": {
-        "reveal": "always",
-        "panel": "shared",
-        "focus": true,
-        "clear": true
-      },
-      "problemMatcher": []
-    },
-    {
-      "label": "Install (editable)",
-      "type": "shell",
-      "command": "python",
-      "args": ["-m", "pip", "install", "-e", ".[build,dev]"],
-      "options": {
-        "cwd": "${workspaceFolder}"
-      },
-      "presentation": {
-        "reveal": "always",
-        "panel": "shared",
-        "focus": true,
-        "clear": true
-      },
-      "problemMatcher": []
-    },
-    {
-      "label": "Build Executable",
-      "type": "shell",
-      "command": "python",
-      "args": ["build.py", "--clean"],
-      "options": {
-        "cwd": "${workspaceFolder}"
+        "cwd": "${workspaceFolder}/apps/desktop"
       },
       "presentation": {
         "reveal": "always",

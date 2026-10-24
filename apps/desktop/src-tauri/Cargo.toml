@@ -1,0 +1,31 @@
+[package]
+name = "scan-kit-desktop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+authors.workspace = true
+description = "Scan Kit desktop shell"
+
+[lib]
+name = "scan_kit_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+# `tauri_build::build()` lives in build.rs. cargo-machete does not see that file.
+[package.metadata.cargo-machete]
+ignored = ["tauri-build"]
+
+[lints]
+workspace = true
+
+[dependencies]
+scan-kit-compute = { workspace = true }
+scan-kit-core = { workspace = true }
+scan-kit-dicom = { workspace = true }
+scan-kit-io = { workspace = true }
+serde_json = { workspace = true }
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"

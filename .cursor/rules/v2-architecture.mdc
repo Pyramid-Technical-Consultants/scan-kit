@@ -1,0 +1,16 @@
+---
+description: Scan Kit 2 architecture, MCP-first tools, delete-on-port, and stock shadcn dark UI
+alwaysApply: true
+---
+
+# Scan Kit 2
+
+Follow [docs/software/architecture.md](docs/software/architecture.md) and [docs/software/software-development-plan.md](docs/software/software-development-plan.md).
+
+- Domain behavior lives in `scan-kit-core` once. Session files and the sqlite store live in `scan-kit-io`. GPU work uses `wgpu` only. Plot drawing lives in `scan-kit-plot`, which also builds to wasm32 for the webview. Do not draw plots in TypeScript or ship frames over the Tauri bridge. Compute kernels live in `scan-kit-compute`. Register each operation on that crate's tool catalog. `scan-kit-mcp` and Tauri commands call that function. They do not reimplement it.
+- Workflow tools call granular functions in process.
+- Desktop chrome stays on the stock shadcn dark theme from [ui.shadcn.com](https://ui.shadcn.com/) (`base-nova`, Base UI). Tabular data uses Glide Data Grid, themed from the stock tokens. Add chrome with `npx shadcn add <name>` in `apps/desktop` and use that file as written. Do not hand-write a select, input, button, checkbox, dialog, menu, tabs, or label, and do not restyle a copied component. Do not edit theme tokens, add custom color, radius, type, or spacing CSS, or add another component library for chrome. Do not add a shadcn Table for data.
+- Pull requests target `develop`.
+- A new direct dependency updates [docs/software/soup.md](docs/software/soup.md) in the same change.
+- Before handing back Rust or desktop work, run the checks in [.cursor/skills/static-analysis/SKILL.md](.cursor/skills/static-analysis/SKILL.md). Do not silence a lint with `#[allow]` or an Oxlint disable, and do not skip a failing test to get green.
+- A plot change reads the module docs at the top of `crates/scan-kit-plot/src/render.rs` first: paint order is shared by the GPU pass, the CPU fallback, and hover, and a mark's byte layout is spread across its stride, attributes, encoder, decoder, and WGSL inputs.

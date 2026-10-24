@@ -1,19 +1,19 @@
 ---
 name: release-version
-description: Bump the scan-kit version and cut a release. Covers updating __version__, committing, tagging vX.Y.Z, and pushing to trigger the GitHub Actions build/release. Use when the user asks to bump the version, prepare or cut a release, or tag a new version.
+description: Bump the scan-kit version and cut a release. Covers updating the version fields, committing, tagging vX.Y.Z, and pushing to trigger the GitHub Actions build/release. Use when the user asks to bump the version, prepare or cut a release, or tag a new version.
 ---
 
 # Releasing scan-kit
 
-## Single source of truth
+## Where the version lives
 
-The version lives in **one** place — `scan_kit/__init__.py`:
+The version is the Rust workspace version, declared in three files that must agree:
 
-```python
-__version__ = "1.4.0"
-```
+- `Cargo.toml` — `[workspace.package] version` (the canonical source; the release job verifies the tag against this one)
+- `apps/desktop/package.json` — `version` (npm metadata)
+- `apps/desktop/src-tauri/tauri.conf.json` — `version` (what the installer/bundle stamps)
 
-`pyproject.toml` reads it dynamically (`version = {attr = "scan_kit.__version__"}`), and the launcher window title (`Scan Kit v{__version__}`) picks it up automatically. **Never** hard-code the version anywhere else.
+Bump all three together. **Never** hard-code the version anywhere else.
 
 ## Choosing the bump (semver)
 
@@ -25,15 +25,15 @@ If unsure, ask the user which bump they want.
 
 ## Release workflow
 
-1. **Bump** `__version__` in `scan_kit/__init__.py` (this is the only file to edit).
+1. **Bump** `version` in the three files above.
 2. **Commit** with a message matching the repo convention `Release vX.Y.Z`:
 
 ```bash
-git add scan_kit/__init__.py
+git add Cargo.toml apps/desktop/package.json apps/desktop/src-tauri/tauri.conf.json
 git commit -m "Release vX.Y.Z"
 ```
 
-3. **Tag** the commit (the tag name must be `v` + the version, e.g. `v1.4.0`):
+3. **Tag** the commit (the tag name must be `v` + the version, e.g. `v2.0.0`):
 
 ```bash
 git tag vX.Y.Z
@@ -69,25 +69,25 @@ on:
 
 What this means in practice:
 
-- Pull requests run **tests only**; executable builds run on pushes to `main` or `develop`, manual dispatch, and `v*` tags.
-- The `build` job only **builds** artifacts; it does **not** release unless the ref is a `v*` tag.
-- The `release` job runs **only** when the pushed ref is a tag starting with `v` (`refs/tags/v*`). This is the single gate that publishes the GitHub Release and attaches the Windows/Linux binaries.
-- Therefore a release happens **only** when you push a tag whose name starts with `v`. Pushing the commit alone, or a tag named without the `v` prefix (e.g. `1.4.0`), will build but **never release**.
+- Pull requests run **checks only**; bundle builds run on pushes to `main` or `develop`, manual dispatch, and `v*` tags.
+- The `build` job only **builds** the Tauri bundles; it does **not** release unless the ref is a `v*` tag.
+- The `release` job runs **only** when the pushed ref is a tag starting with `v` (`refs/tags/v*`). This is the single gate that publishes the GitHub Release and attaches the Windows/Linux installers.
+- Therefore a release happens **only** when you push a tag whose name starts with `v`. Pushing the commit alone, or a tag named without the `v` prefix (e.g. `2.0.0`), will build but **never release**.
 
 Requirements for the trigger to fire correctly:
 
-1. **Tag name starts with `v`** and matches the version, e.g. `v1.4.0`. The glob is `v*`, so `v1.4.0` matches; `1.4.0` does not.
-2. **The tag is pushed to the remote.** `git push` does *not* push tags by default — you must push the tag explicitly (`git push origin v1.4.0`) or use `git push --follow-tags`.
-3. **The tagged commit already bumped `__version__`.** CI builds the code *at the tag*, so the binary's version comes from whatever the tag points at. Bump first, then tag that commit. The release job fails if the tag and `__version__` disagree.
+1. **Tag name starts with `v`** and matches the version, e.g. `v2.0.0`. The glob is `v*`, so `v2.0.0` matches; `2.0.0` does not.
+2. **The tag is pushed to the remote.** `git push` does *not* push tags by default — you must push the tag explicitly (`git push origin v2.0.0`) or use `git push --follow-tags`.
+3. **The tagged commit already bumped the workspace version.** CI builds the code *at the tag*, so the binary's version comes from whatever the tag points at. Bump first, then tag that commit. The release job fails if the tag and `Cargo.toml` disagree.
 
 ### Release asset filenames
 
 | Build type | Windows | Linux |
 |------------|---------|-------|
-| Tagged release | `scan-kit-windows-X.Y.Z.exe` | `scan-kit-linux-amd64-X.Y.Z.AppImage` |
-| Non-tagged CI (`main` / `develop` push) | `scan-kit-windows-X.Y.Z-rc.exe` | `scan-kit-linux-amd64-X.Y.Z-rc.AppImage` |
+| Tagged release | `scan-kit-windows-X.Y.Z-setup.exe` | `scan-kit-linux-amd64-X.Y.Z.AppImage`, `scan-kit-linux-amd64-X.Y.Z.deb` |
+| Non-tagged CI (`main` / `develop` push) | `Scan Kit_X.Y.Z_x64-setup.exe` | `Scan Kit_X.Y.Z_amd64.AppImage`, `scan-kit_X.Y.Z_amd64.deb` |
 
-`X.Y.Z` comes from `__version__` for `-rc` builds and from the git tag (without `v`) for releases. No changelog file is maintained; GitHub auto-generates release notes.
+Tagged releases are renamed to the `scan-kit-…` names by the release job; untagged builds keep the Tauri bundle names in the workflow artifact. `X.Y.Z` comes from the workspace version. No changelog file is maintained; GitHub auto-generates release notes.
 
 ## Fixing or re-doing a release
 
@@ -104,16 +104,15 @@ Deleting a tag does not delete an already-published GitHub Release — remove th
 
 ## Verification checklist
 
-- [ ] README / `docs/images/` regenerated if the UI changed (`python scripts/capture_doc_screenshots.py`).
-- [ ] `__version__` updated and is the only changed line for the bump.
+- [ ] `version` updated in `Cargo.toml` (`[workspace.package]`), `apps/desktop/package.json`, and `apps/desktop/src-tauri/tauri.conf.json`, and the three agree.
 - [ ] Commit message is `Release vX.Y.Z`.
-- [ ] Tag name exactly matches `vX.Y.Z` (same as `__version__`, prefixed with `v`).
+- [ ] Tag name exactly matches `vX.Y.Z` (same as the workspace version, prefixed with `v`).
 - [ ] Tag points at the release commit and was pushed.
-- [ ] CI release job passes the tag/`__version__` sanity check and publishes both platform binaries.
+- [ ] CI release job passes the tag/`Cargo.toml` sanity check and publishes the Windows installer and the Linux AppImage + deb.
 
 ## Notes
 
 - Only create the tag/push when the user explicitly wants to release. If they just want the number bumped (e.g. inside an in-progress PR), do step 1 only and skip tagging.
 - If this is part of a PR that isn't merged yet, prefer bumping on the PR branch; the tag is usually created after merge to `develop` and promotion to `main`.
-- Merges to `develop` or `main` produce `-rc` artifacts in the Actions run for pre-release testing; they do not create a GitHub Release. Pull requests run tests only.
+- Merges to `develop` or `main` produce bundle artifacts in the Actions run for pre-release testing; they do not create a GitHub Release. Pull requests run checks only.
 - **Never open a feature PR against `main`.** `gh pr create` needs `--base develop`. The only `main` PR is promoting `develop` for a release.

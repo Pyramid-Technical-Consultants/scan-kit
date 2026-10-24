@@ -1,0 +1,91 @@
+# Software of unknown provenance
+
+| | |
+|---|---|
+| Document | SK-SOUP |
+| Standard | IEC 62304:2006+AMD1:2015 |
+| Safety class | A |
+| Product | Scan Kit 2 |
+
+Git history is the revision record.
+
+SOUP is every direct dependency this project does not develop and that is linked into, or required to build, the Scan Kit 2 binaries. Transitive dependencies are pinned by the lockfiles (`Cargo.lock`, `apps/desktop/package-lock.json`) and are not repeated here.
+
+## Rule
+
+A change that adds a direct dependency updates this list in the same change, with the version, the purpose, and where the requirement comes from (Cargo.toml, package.json, or the Rust toolchain file). Removing a direct dependency removes its row in that same change.
+
+Versions below are the ones locked for the workspace. Anomaly review for a SOUP upgrade is the pull request that bumps the lockfile: the author records any known defect that affects Scan Kit in the pull request, or states that they found none that affect the used interface.
+
+## Rust workspace
+
+| SOUP | Version | Purpose |
+|---|---|---|
+| Rust | stable, pinned by `rust-toolchain.toml` | Language and standard library |
+| tokio | see `Cargo.toml` | Async runtime for the MCP server, plot-frame readback, and the compute test |
+| serde / serde_json | see `Cargo.toml` | Tool input and output |
+| rmcp | see `crates/scan-kit-mcp/Cargo.toml` | MCP protocol and stdio transport |
+| tauri | see `apps/desktop/src-tauri/Cargo.toml` | Desktop shell |
+| tauri-plugin-dialog | see `apps/desktop/src-tauri/Cargo.toml` | Open Data Folder dialog |
+| rusqlite (bundled SQLite) | see `crates/scan-kit-io/Cargo.toml` | Existing `~/.scan-kit/scan-kit.sqlite` file |
+| zip | see `crates/scan-kit-io/Cargo.toml` | `.zip` session archives, read without unpacking |
+| tar | see `crates/scan-kit-io/Cargo.toml` | `.tar` session archives, read without unpacking |
+| flate2 | see `crates/scan-kit-io/Cargo.toml` | `.tar.gz` and `.tgz` session archives |
+| bzip2 | see `crates/scan-kit-io/Cargo.toml` | `.tar.bz2` session archives |
+| xz2 | see `crates/scan-kit-io/Cargo.toml` | `.tar.xz` session archives |
+| csv | see `crates/scan-kit-io/Cargo.toml` | Quoted fields and header drift in session files |
+| md-5 | see `crates/scan-kit-io/Cargo.toml` | MD5 digest inside Pyramid `.md5` configuration sidecars |
+| chrono | see `crates/scan-kit-io/Cargo.toml` | Local reading of a UTC file time, matching `mktime(gmtime(...))` for those sidecars |
+| tungstenite | see `crates/scan-kit-io/Cargo.toml` | mpack WebSocket to an RCI. Handshake only, no TLS |
+| rmpv | see `crates/scan-kit-io/Cargo.toml` | MessagePack encode and decode for that session |
+| sha2 | see `crates/scan-kit-io/Cargo.toml`, `crates/scan-kit-compute/Cargo.toml` | Name the remote-session cache directory. SK-REQ-004; digest of the patient-validation golden inputs |
+| similar | see `crates/scan-kit-io/Cargo.toml` | Line diffs between the loaded configuration tree and session `config/` trees |
+| ssh2 | see `crates/scan-kit-io/Cargo.toml` | SFTP library open, synchronous, on the blocking path. Windows uses the system crypto library. SK-REQ-004 |
+| suppaftp | see `crates/scan-kit-io/Cargo.toml` | FTP and FTPS library open. SK-REQ-004 |
+| ureq | see `crates/scan-kit-io/Cargo.toml` | Download one `http://` or `https://` archive into the remote cache. SK-REQ-004 |
+| trash | see `crates/scan-kit-io/Cargo.toml` | Move a session folder or archive to the operating system trash (Recycle Bin, macOS Trash, freedesktop) |
+| krilla | see `crates/scan-kit-io/Cargo.toml` | PDF writer for the patient QA report — text shaping and font subsetting |
+| rustls-native-certs | see `crates/scan-kit-io/Cargo.toml` | System certificate store for FTPS. SK-REQ-004 |
+| native-tls | see `crates/scan-kit-io/Cargo.toml` | HTTPS for an archive URL, using the operating system TLS stack. Unix builds its TLS library from source. SK-REQ-004 |
+| wgpu | see `crates/scan-kit-plot/Cargo.toml` and `crates/scan-kit-compute/Cargo.toml` | The only GPU library. The plot crate draws with it natively and in the webview (WebGPU, or WebGL2 through its `webgl` feature). The compute crate runs kernels with it |
+| naga | see `crates/scan-kit-plot/Cargo.toml` and `crates/scan-kit-compute/Cargo.toml` | Compile the plot and compute shaders when no GPU adapter is present |
+| fontdue | see `crates/scan-kit-plot/Cargo.toml` and `crates/scan-kit-io/Cargo.toml` | Rasterize plot labels into one glyph atlas; measure text for report layout |
+| wasm-bindgen | see `crates/scan-kit-plot/Cargo.toml` | JavaScript bindings for the plot renderer built for `wasm32-unknown-unknown` |
+| wasm-bindgen-futures | see `crates/scan-kit-plot/Cargo.toml` | Await the browser GPU adapter and device from the wasm renderer |
+| web-sys | see `crates/scan-kit-plot/Cargo.toml` | The `HtmlCanvasElement` the wasm renderer draws into |
+| wasm-bindgen-cli | the `wasm-bindgen` version in `Cargo.lock` | Build tool. Generates `apps/desktop/src/wasm` from the plot crate. Not linked into the product binary |
+
+Plot text uses the vendored Source Sans 3 regular face in `crates/scan-kit-plot/assets/SourceSans3-Regular.ttf` (SIL Open Font License, Latin 400 from fontsource 5.2.8). It is compiled into the plot crate with `include_bytes`. It is not a Cargo dependency.
+
+MCsquare Monte Carlo data ships inside the binary: `assets/mc_materials.npz` (`include_bytes` in `crates/scan-kit-io/src/mc_tables.rs`), the BDL beam models under `assets/mcsquare/BDL/`, and the scanner calibration tables under `assets/mcsquare/Scanners/` (`include_str` in `beam.rs` and `calibration.rs`). The upstream source is the `third_party/MCsquare` submodule (<https://gitlab.com/openmcsquare/MCsquare.git>), Apache-2.0 with a UCLouvain attribution requirement — see `licenses/`. None of it is a Cargo dependency.
+
+## Desktop frontend
+
+| SOUP | Version | Purpose |
+|---|---|---|
+| React | see `apps/desktop/package.json` | User interface |
+| react-dom | see `apps/desktop/package.json` | DOM renderer for React |
+| Tailwind CSS | see `apps/desktop/package.json` | shadcn theme utilities |
+| `@tailwindcss/vite` | see `apps/desktop/package.json` | Compiles the Tailwind theme during the desktop build |
+| Base UI (`@base-ui/react`) | see `apps/desktop/package.json` | Behavior of shadcn components |
+| `@glideapps/glide-data-grid` | see `apps/desktop/package.json` | Session list and later column views |
+| `@tauri-apps/api` | see `apps/desktop/package.json` | Invoke bridge to the Tauri commands |
+| `@tauri-apps/plugin-dialog` | see `apps/desktop/package.json` | Open Data Folder dialog |
+| `@fontsource-variable/geist` | see `apps/desktop/package.json` | Geist variable font bundled into the app (SIL OFL, see `licenses/`) |
+| `class-variance-authority` | see `apps/desktop/package.json` | Variant styling helper used by copied shadcn components |
+| `cn` | see `apps/desktop/package.json` | Class-name merge helper used by copied shadcn components |
+| `lucide-react` | see `apps/desktop/package.json` | Icon set for the desktop chrome |
+| `tw-animate-css` | see `apps/desktop/package.json` | Animation utilities for shadcn components |
+| vite | see `apps/desktop/package.json` | Desktop bundler. Not linked into the product binary |
+| `@vitejs/plugin-react` | see `apps/desktop/package.json` | React transform for that build. Not linked into the product binary |
+| typescript | see `apps/desktop/package.json` | Type-checks the desktop sources. Not linked into the product binary |
+| `@tauri-apps/cli` | see `apps/desktop/package.json` | Drives `tauri dev` and `tauri build`. Not linked into the product binary |
+| `shadcn` | see `apps/desktop/package.json` | Scaffolds shadcn components into `src/components/ui/`. Not linked into the product binary |
+| `@types/*` | see `apps/desktop/package.json` | Type declarations for the desktop build. Not linked into the product binary |
+| vitest | see `apps/desktop/package.json` | Desktop UI checks. Not linked into the product binary |
+| @vitest/coverage-v8 | see `apps/desktop/package.json` | Line coverage for those checks. Not linked into the product binary |
+| happy-dom | see `apps/desktop/package.json` | DOM for those checks. Not linked into the product binary |
+| oxlint | see `apps/desktop/package.json` | Desktop correctness lint, including React hooks. Not linked into the product binary |
+| knip | see `apps/desktop/package.json` | Unused desktop files, exports, and npm dependencies. Not linked into the product binary |
+
+shadcn component source copied into `apps/desktop/src/components/ui/` is project software, not SOUP. The packages those components import are SOUP and are listed through `package.json`.
