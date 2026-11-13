@@ -1,6 +1,6 @@
 # Progressive loading
 
-This is the engineering design for keeping the desktop responsive while session parses and GPU work finish. It is not an IEC 62304 architectural design. The crate rules in [architecture.md](architecture.md) still apply.
+This is the engineering design for keeping the desktop responsive while session parses and GPU work finish. The crate rules in [architecture.md](architecture.md) still apply.
 
 ## What is slow today
 

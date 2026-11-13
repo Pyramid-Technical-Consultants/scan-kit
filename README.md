@@ -43,7 +43,7 @@
 
 ## What Scan Kit does
 
-Scan Kit is a desktop toolkit for reviewing PBS treatment and QA sessions. Point it at a folder of session data, select up to five sessions, and launch analysis views, each in its own process so the launcher stays responsive.
+Scan Kit is a desktop toolkit for reviewing PBS treatment and QA sessions. Point it at a folder of session data, select up to five sessions, and launch analysis views. Long loads and GPU work run in the background, so the window stays responsive.
 
 Beyond plotting, Scan Kit helps you:
 
@@ -400,7 +400,7 @@ HCC and strip devices in one IC family keep their relative `K_MU` and all move b
 
 ## Session data layout
 
-Scan Kit discovers sessions from a single data-source folder. That can be a local directory, a UNC share, or an fsspec URL (`sftp://`, `smb://`, `ftp://`, `ssh://`/`scp://` as SFTP aliases, ...). Supported layouts:
+Scan Kit discovers sessions in every saved data location. Each one can be a local directory, a UNC share, or a remote URL (`sftp://`, `smb://`, `ftp://`, `ssh://`/`scp://` as SFTP aliases, `http(s)://` for a single archive). Supported layouts:
 
 **Unpacked directories**
 
