@@ -59,6 +59,8 @@ Tools:
 
 Agents in this repository launch the server with `.cursor/mcp.json` (`cargo run -p scan-kit-mcp --quiet` on stdio).
 
+By default the server lists and runs only the tools in `READ_ONLY` in `crates/scan-kit-mcp/src/main.rs`. Tools that write files to a chosen path, drive an RCI or the network, register scanners, or remove a data location need `--allow-effects`, because an agent reads untrusted session text through the same server. A new tool stays hidden until it is added to that list.
+
 ## One implementation
 
 There is no PyO3 bridge and no second copy of a ported behavior. The Python application is fully retired: the repository is the Rust workspace and the TypeScript desktop frontend.

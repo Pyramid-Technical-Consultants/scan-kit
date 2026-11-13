@@ -14,8 +14,57 @@ use rmcp::{
 };
 use serde_json::{Map, Value};
 
-#[derive(Clone)]
-struct ScanKit;
+/// Tools an agent gets without `--allow-effects`. Every other tool writes outside the
+/// session index, drives a device or the network, or changes reference configuration,
+/// so a prompt injected through session data cannot reach it. A new tool stays hidden
+/// until it is listed here.
+const READ_ONLY: &[&str] = &[
+    "scan_kit_version",
+    "scan_kit_health",
+    "scan_kit_about",
+    "scan_kit_calibrate",
+    "scan_kit_dose_error",
+    "scan_kit_beam_mask",
+    "scan_kit_bin_edges",
+    "scan_kit_histogram",
+    "scan_kit_welch",
+    "scan_kit_open_library",
+    "scan_kit_set_note",
+    "scan_kit_select_sessions",
+    "scan_kit_data_dirs",
+    "scan_kit_read_catalog",
+    "scan_kit_load_columns",
+    "scan_kit_load_timeslice",
+    "scan_kit_channel_catalog",
+    "scan_kit_analysis_scene",
+    "scan_kit_plan_catalog",
+    "scan_kit_synthesize_plan",
+    "scan_kit_config_catalog",
+    "scan_kit_config_open",
+    "scan_kit_config_form",
+    "scan_kit_config_apply",
+    "scan_kit_config_tune",
+    "scan_kit_config_diff",
+    "scan_kit_config_integrity",
+    "scan_kit_config_hide",
+    "scan_kit_phantom_catalog",
+    "scan_kit_phantom_preview",
+    "scan_kit_runner_catalog",
+    "scan_kit_run_view",
+    "scan_kit_open_study",
+    "scan_kit_clinical_goal",
+];
+
+#[derive(Clone, Default)]
+struct ScanKit {
+    effects: bool,
+}
+
+impl ScanKit {
+    fn allows(&self, name: &str) -> bool {
+        self.effects || READ_ONLY.contains(&name)
+    }
+}
 
 fn schema_object(value: Value) -> Arc<Map<String, Value>> {
     let Value::Object(schema) = value else {
@@ -64,9 +113,10 @@ fn dispatch(name: &str, input: &Value) -> Result<Value, String> {
     }
 }
 
-fn catalog_tools() -> Vec<Tool> {
+fn catalog_tools(server: &ScanKit) -> Vec<Tool> {
     catalog_specs()
         .into_iter()
+        .filter(|spec| server.allows(spec.name))
         .map(|spec| {
             Tool::new_with_raw(
                 spec.name,
@@ -87,7 +137,9 @@ impl ServerHandler for ScanKit {
     }
 
     fn get_tool(&self, name: &str) -> Option<Tool> {
-        catalog_tools().into_iter().find(|tool| tool.name == name)
+        catalog_tools(self)
+            .into_iter()
+            .find(|tool| tool.name == name)
     }
 
     async fn list_tools(
@@ -95,7 +147,7 @@ impl ServerHandler for ScanKit {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
-        Ok(ListToolsResult::with_all_items(catalog_tools()))
+        Ok(ListToolsResult::with_all_items(catalog_tools(self)))
     }
 
     async fn call_tool(
@@ -107,7 +159,14 @@ impl ServerHandler for ScanKit {
             None => Value::Null,
             Some(arguments) => Value::Object(arguments),
         };
-        let result = dispatch(&request.name, &input);
+        let result = if self.allows(&request.name) {
+            dispatch(&request.name, &input)
+        } else {
+            Err(format!(
+                "{} changes files, devices, or reference configuration; start the server with --allow-effects to use it",
+                request.name
+            ))
+        };
         match result {
             Ok(value) => Ok(CallToolResult::structured(value).into()),
             Err(error) => Ok(CallToolResult::error(vec![ContentBlock::text(error)]).into()),
@@ -117,7 +176,8 @@ impl ServerHandler for ScanKit {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let server = ScanKit.serve(stdio()).await?;
+    let effects = std::env::args().any(|arg| arg == "--allow-effects");
+    let server = ScanKit { effects }.serve(stdio()).await?;
     server.waiting().await?;
     Ok(())
 }
@@ -134,7 +194,7 @@ mod tests {
     async fn sk_req_002_mcp_lists_and_calls_version_and_health() {
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
         let server = tokio::spawn(async move {
-            let running = ScanKit.serve(server_io).await.expect("server");
+            let running = ScanKit::default().serve(server_io).await.expect("server");
             running.waiting().await.expect("server wait");
         });
 
@@ -180,7 +240,7 @@ mod tests {
     async fn sk_req_003_mcp_calls_about() {
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
         let server = tokio::spawn(async move {
-            let running = ScanKit.serve(server_io).await.expect("server");
+            let running = ScanKit::default().serve(server_io).await.expect("server");
             running.waiting().await.expect("server wait");
         });
         let client = ().serve(client_io).await.expect("client");
@@ -232,7 +292,7 @@ mod tests {
 
         let (client_io, server_io) = tokio::io::duplex(256 * 1024);
         let server = tokio::spawn(async move {
-            let running = ScanKit.serve(server_io).await.expect("server");
+            let running = ScanKit::default().serve(server_io).await.expect("server");
             running.waiting().await.expect("server wait");
         });
         let client = ().serve(client_io).await.expect("client");
@@ -254,5 +314,52 @@ mod tests {
         client.cancel().await.expect("cancel");
         server.await.expect("server task");
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    async fn listed_and_control(effects: bool) -> (Vec<String>, bool) {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let server = tokio::spawn(async move {
+            let running = ScanKit { effects }.serve(server_io).await.expect("server");
+            running.waiting().await.expect("server wait");
+        });
+        let client = ().serve(client_io).await.expect("client");
+        let listed = client.list_tools(None).await.expect("list tools");
+        let names = listed
+            .tools
+            .iter()
+            .map(|tool| tool.name.to_string())
+            .collect();
+        let mut request = CallToolRequestParams::new("scan_kit_runner_control");
+        request.arguments = arguments(json!({ "action": "start" }));
+        let refused = client
+            .call_tool(request)
+            .await
+            .expect("call")
+            .content
+            .iter()
+            .any(|block| format!("{block:?}").contains("--allow-effects"));
+        client.cancel().await.expect("cancel");
+        server.await.expect("server task");
+        (names, refused)
+    }
+
+    #[tokio::test]
+    async fn device_and_write_tools_need_allow_effects() {
+        let (names, refused) = listed_and_control(false).await;
+        assert!(names.iter().any(|name| name == "scan_kit_run_view"));
+        for gated in [
+            "scan_kit_runner_control",
+            "scan_kit_runner_upload",
+            "scan_kit_config_save",
+            "scan_kit_write_report",
+            "scan_kit_discover_subnet",
+        ] {
+            assert!(!names.iter().any(|name| name == gated), "{gated} is listed");
+        }
+        assert!(refused);
+
+        let (names, refused) = listed_and_control(true).await;
+        assert!(names.iter().any(|name| name == "scan_kit_runner_control"));
+        assert!(!refused);
     }
 }
