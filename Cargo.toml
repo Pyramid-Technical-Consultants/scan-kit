@@ -14,7 +14,6 @@ members = [
 codegen-units = 1
 lto = true
 opt-level = 3
-panic = "abort"
 strip = true
 
 # `tauri dev` runs the dev profile. Unoptimized, a dose scene took 38 s instead

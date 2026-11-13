@@ -780,6 +780,11 @@ pub fn copy_runner(dest: &str, keep: &mut dyn FnMut(u64, u64) -> bool) -> Result
     runner::download_with(&default_db_path(), dest, keep)
 }
 
+/// Where the desktop shell appends panics, beside the store.
+pub fn crash_log_path() -> PathBuf {
+    default_db_path().with_file_name("crash.log")
+}
+
 pub fn read_last_data_dir() -> Result<Option<String>, String> {
     with_store(&default_db_path(), |conn| store::last_data_dir(conn))
 }

@@ -418,8 +418,33 @@ fn color4(values: &[f32], fallback: [f32; 4]) -> [f32; 4] {
     out
 }
 
+/// Release builds have no console, so a panic is appended to the crash log for support.
+fn log_panics() {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let path = scan_kit_io::crash_log_path();
+        let seconds = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_secs());
+        let entry = format!(
+            "unix {seconds}, Scan Kit {}: {info}\n",
+            scan_kit_core::version()
+        );
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .and_then(|mut file| std::io::Write::write_all(&mut file, entry.as_bytes()));
+        default(info);
+    }));
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    log_panics();
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
@@ -494,5 +519,23 @@ mod reveal_tests {
                 .to_string_lossy()
                 .starts_with("/select,"));
         }
+    }
+}
+
+#[cfg(test)]
+mod crash_log_tests {
+    #[test]
+    fn a_panic_is_appended_to_the_crash_log() {
+        let home = std::env::temp_dir().join("scan-kit-crash-log-test");
+        let _ = std::fs::remove_dir_all(&home);
+        std::env::set_var("USERPROFILE", &home);
+        std::env::set_var("HOME", &home);
+        super::log_panics();
+        assert!(std::panic::catch_unwind(|| panic!("probe panic")).is_err());
+        let _ = std::panic::take_hook();
+        let text = std::fs::read_to_string(scan_kit_io::crash_log_path()).unwrap();
+        assert!(text.contains("probe panic"));
+        assert!(text.contains(scan_kit_core::version()));
+        let _ = std::fs::remove_dir_all(&home);
     }
 }
