@@ -235,6 +235,25 @@ jobs:
           mv artifacts/scan-kit-linux/*.AppImage "artifacts/scan-kit-linux-amd64-${VERSION}.AppImage"
           mv artifacts/scan-kit-linux/*.deb "artifacts/scan-kit-linux-amd64-${VERSION}.deb"
 
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-cyclonedx@0.5.10
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+
+      - name: Generate CycloneDX SBOMs
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          cargo cyclonedx -f json --spec-version 1.5 --no-build-deps \
+            --manifest-path apps/desktop/src-tauri/Cargo.toml --override-filename sbom
+          mv apps/desktop/src-tauri/sbom.json "artifacts/scan-kit-${VERSION}-rust.cdx.json"
+          (cd apps/desktop && npm sbom --package-lock-only --omit dev --sbom-format cyclonedx) \
+            > "artifacts/scan-kit-${VERSION}-webview.cdx.json"
+
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -248,4 +267,6 @@ jobs:
             --title "$GITHUB_REF_NAME" \
             "artifacts/scan-kit-windows-${VERSION}-setup.exe" \
             "artifacts/scan-kit-linux-amd64-${VERSION}.AppImage" \
-            "artifacts/scan-kit-linux-amd64-${VERSION}.deb"
+            "artifacts/scan-kit-linux-amd64-${VERSION}.deb" \
+            "artifacts/scan-kit-${VERSION}-rust.cdx.json" \
+            "artifacts/scan-kit-${VERSION}-webview.cdx.json"
