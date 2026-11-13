@@ -159,7 +159,7 @@ const TOOLS: &[ToolSpec] = &[
     },
 ];
 
-/// SK-REQ-001. The single Rust version string.
+/// The single Rust version string.
 pub fn version() -> &'static str {
     VERSION
 }
