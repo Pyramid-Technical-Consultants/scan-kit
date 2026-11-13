@@ -17,7 +17,7 @@ jobs:
     name: Rust format, lint, and test
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -51,7 +51,7 @@ jobs:
     name: Plot wasm and desktop frontend
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -84,7 +84,7 @@ jobs:
         if: steps.bindgen-install.outcome != 'success'
         run: cargo install wasm-bindgen-cli --locked --version "${{ steps.bindgen.outputs.version }}"
 
-      - uses: actions/setup-node@v5
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: npm
@@ -135,7 +135,7 @@ jobs:
     name: Build (${{ matrix.os }})
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -161,7 +161,7 @@ jobs:
         if: steps.bindgen-install.outcome != 'success'
         run: cargo install wasm-bindgen-cli --locked --version "${{ steps.bindgen.outputs.version }}"
 
-      - uses: actions/setup-node@v5
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: npm
@@ -213,9 +213,9 @@ jobs:
       contents: write
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@v8
         with:
           path: artifacts
 
@@ -241,7 +241,7 @@ jobs:
         with:
           tool: cargo-cyclonedx@0.5.10
 
-      - uses: actions/setup-node@v5
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
 
