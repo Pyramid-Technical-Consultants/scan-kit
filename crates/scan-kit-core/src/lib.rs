@@ -92,8 +92,8 @@ pub use task::{
 use serde::Serialize;
 use serde_json::{json, Value};
 
-/// Workspace version. The released Python package version is a different identity.
-pub const VERSION: &str = "2.0.0-dev";
+/// Workspace version from `Cargo.toml`.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Whether a tool is a single operation or a composition of those operations.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -159,7 +159,7 @@ const TOOLS: &[ToolSpec] = &[
     },
 ];
 
-/// SK-REQ-001. The single Rust version string.
+/// The single Rust version string.
 pub fn version() -> &'static str {
     VERSION
 }

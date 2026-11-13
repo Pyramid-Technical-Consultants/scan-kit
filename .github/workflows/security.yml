@@ -1,0 +1,40 @@
+name: Security
+
+# Advisories are published against code that has not changed, so pull-request
+# checks alone miss them. Scan both branches every day and on demand.
+on:
+  schedule:
+    - cron: "17 10 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  advisories:
+    strategy:
+      fail-fast: false
+      matrix:
+        ref: [develop, main]
+    runs-on: ubuntu-22.04
+    name: Advisories (${{ matrix.ref }})
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ matrix.ref }}
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny@0.20.2
+
+      - name: Rust advisories
+        run: cargo deny check advisories
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+
+      - name: Shipped npm advisories
+        working-directory: apps/desktop
+        run: npm audit --omit=dev

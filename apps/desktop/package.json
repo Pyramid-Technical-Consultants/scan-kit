@@ -1,7 +1,7 @@
 {
   "name": "scan-kit-desktop",
   "private": true,
-  "version": "2.0.0-dev",
+  "version": "2.0.0",
   "type": "module",
   "scripts": {
     "wasm": "cargo build -p scan-kit-plot --target wasm32-unknown-unknown --release && wasm-bindgen --target web --out-dir src/wasm ../../target/wasm32-unknown-unknown/release/scan_kit_plot.wasm",
@@ -43,5 +43,8 @@
     "typescript": "~6.0.3",
     "vite": "^8.0.16",
     "vitest": "^5.0.3"
+  },
+  "overrides": {
+    "minimatch": "^11.0.8"
   }
 }

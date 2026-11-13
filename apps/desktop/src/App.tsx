@@ -1227,11 +1227,6 @@ export default function App() {
             selectedIds={selectedIds}
           />
         </TabsContent>
-        {LAUNCHER_VIEWS.filter((name) => name !== "Data Analysis" && name !== "Debug" && name !== "Plan Synthesis" && name !== "Phantom Synthesis" && name !== "Configuration Tuning" && name !== "Plan Runner").map((name) => (
-          <TabsContent key={name} value={name}>
-            <p className="text-muted-foreground px-3 py-2">{name} is not in this preview yet.</p>
-          </TabsContent>
-        ))}
       </Tabs>
 
       <Dialog open={aboutOpen} onOpenChange={setAboutOpen}>

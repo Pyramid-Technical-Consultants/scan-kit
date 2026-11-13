@@ -14,7 +14,6 @@ members = [
 codegen-units = 1
 lto = true
 opt-level = 3
-panic = "abort"
 strip = true
 
 # `tauri dev` runs the dev profile. Unoptimized, a dose scene took 38 s instead
@@ -39,7 +38,7 @@ opt-level = 3
 opt-level = 3
 
 [workspace.package]
-version = "2.0.0-dev"
+version = "2.0.0"
 edition = "2021"
 license = "MIT"
 publish = false

@@ -4,6 +4,9 @@ on:
   pull_request:
     types: [opened, edited, reopened, synchronize]
 
+permissions:
+  contents: read
+
 jobs:
   develop-not-main:
     if: github.base_ref == 'main' && github.head_ref != 'develop'

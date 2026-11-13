@@ -1,6 +1,6 @@
 # Scan Kit 2 engineering guide
 
-This is a project guide for people and agents changing the repository. It is not an IEC 62304 architectural design deliverable. Class A does not require one. The development plan is [software-development-plan.md](software-development-plan.md).
+This is a project guide for people and agents changing the repository. Quality records (intended use, safety classification, requirements, hazards, traceability, the development plan, and the SOUP list) live in Pliant under product SK, not in this repository.
 
 ## Product shape
 
@@ -33,7 +33,7 @@ The shell gets data through a Tauri command that calls the same function.
 
 Tools:
 
-- `scan_kit_version`, granular, returns the workspace version `2.0.0-dev`
+- `scan_kit_version`, granular, returns the workspace version
 - `scan_kit_health`, workflow, calls the version function and reports that the catalog is non-empty
 - `scan_kit_about`, granular, returns the About dialog text and the workspace version
 - `scan_kit_open_library`, workflow, discovers a local data folder, syncs the sqlite index, and returns the session rows
@@ -58,6 +58,8 @@ Tools:
 - `scan_kit_runner_disconnect` and `scan_kit_runner_remember`, granular
 
 Agents in this repository launch the server with `.cursor/mcp.json` (`cargo run -p scan-kit-mcp --quiet` on stdio).
+
+By default the server lists and runs only the tools in `READ_ONLY` in `crates/scan-kit-mcp/src/main.rs`. Tools that write files to a chosen path, drive an RCI or the network, register scanners, or remove a data location need `--allow-effects`, because an agent reads untrusted session text through the same server. `scan_kit_synthesize_plan` stays listed, and saving its CSV still needs the flag. A new tool stays hidden until it is added to that list.
 
 ## One implementation
 
