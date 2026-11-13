@@ -61,8 +61,25 @@ struct ScanKit {
 }
 
 impl ScanKit {
+    /// `None` when the call may run. Plan synthesis stays listed either way: building
+    /// the CSV is read-only, and only saving it to `path` is an effect.
+    fn blocked<'a>(&self, name: &'a str, input: &Value) -> Option<&'a str> {
+        if self.effects {
+            return None;
+        }
+        if !READ_ONLY.contains(&name) {
+            return Some(name);
+        }
+        let saves = name == "scan_kit_synthesize_plan"
+            && input
+                .get("path")
+                .and_then(Value::as_str)
+                .is_some_and(|path| !path.trim().is_empty());
+        saves.then_some(name)
+    }
+
     fn allows(&self, name: &str) -> bool {
-        self.effects || READ_ONLY.contains(&name)
+        self.blocked(name, &Value::Null).is_none()
     }
 }
 
@@ -159,13 +176,11 @@ impl ServerHandler for ScanKit {
             None => Value::Null,
             Some(arguments) => Value::Object(arguments),
         };
-        let result = if self.allows(&request.name) {
-            dispatch(&request.name, &input)
-        } else {
-            Err(format!(
-                "{} changes files, devices, or reference configuration; start the server with --allow-effects to use it",
-                request.name
-            ))
+        let result = match self.blocked(&request.name, &input) {
+            Some(name) => Err(format!(
+                "{name} changes files, devices, or reference configuration; start the server with --allow-effects to use it"
+            )),
+            None => dispatch(&request.name, &input),
         };
         match result {
             Ok(value) => Ok(CallToolResult::structured(value).into()),
@@ -316,7 +331,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    async fn listed_and_control(effects: bool) -> (Vec<String>, bool) {
+    async fn listed_and_control(effects: bool) -> (Vec<String>, bool, bool) {
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
         let server = tokio::spawn(async move {
             let running = ScanKit { effects }.serve(server_io).await.expect("server");
@@ -338,15 +353,35 @@ mod tests {
             .content
             .iter()
             .any(|block| format!("{block:?}").contains("--allow-effects"));
+        let plan = std::env::temp_dir().join(format!(
+            "scan-kit-mcp-plan-{}-{effects}.csv",
+            std::process::id()
+        ));
+        let mut save = CallToolRequestParams::new("scan_kit_synthesize_plan");
+        save.arguments = arguments(json!({
+            "template": "zero_field",
+            "params": {},
+            "path": plan,
+        }));
+        let save_refused = client
+            .call_tool(save)
+            .await
+            .expect("save")
+            .content
+            .iter()
+            .any(|block| format!("{block:?}").contains("--allow-effects"));
         client.cancel().await.expect("cancel");
         server.await.expect("server task");
-        (names, refused)
+        let _ = std::fs::remove_file(plan);
+        (names, refused, save_refused)
     }
 
     #[tokio::test]
     async fn device_and_write_tools_need_allow_effects() {
-        let (names, refused) = listed_and_control(false).await;
+        let (names, refused, save_refused) = listed_and_control(false).await;
         assert!(names.iter().any(|name| name == "scan_kit_run_view"));
+        assert!(names.iter().any(|name| name == "scan_kit_synthesize_plan"));
+        assert!(save_refused);
         for gated in [
             "scan_kit_runner_control",
             "scan_kit_runner_upload",
@@ -358,8 +393,9 @@ mod tests {
         }
         assert!(refused);
 
-        let (names, refused) = listed_and_control(true).await;
+        let (names, refused, save_refused) = listed_and_control(true).await;
         assert!(names.iter().any(|name| name == "scan_kit_runner_control"));
         assert!(!refused);
+        assert!(!save_refused);
     }
 }

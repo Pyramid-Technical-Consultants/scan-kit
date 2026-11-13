@@ -59,7 +59,7 @@ Tools:
 
 Agents in this repository launch the server with `.cursor/mcp.json` (`cargo run -p scan-kit-mcp --quiet` on stdio).
 
-By default the server lists and runs only the tools in `READ_ONLY` in `crates/scan-kit-mcp/src/main.rs`. Tools that write files to a chosen path, drive an RCI or the network, register scanners, or remove a data location need `--allow-effects`, because an agent reads untrusted session text through the same server. A new tool stays hidden until it is added to that list.
+By default the server lists and runs only the tools in `READ_ONLY` in `crates/scan-kit-mcp/src/main.rs`. Tools that write files to a chosen path, drive an RCI or the network, register scanners, or remove a data location need `--allow-effects`, because an agent reads untrusted session text through the same server. `scan_kit_synthesize_plan` stays listed, and saving its CSV still needs the flag. A new tool stays hidden until it is added to that list.
 
 ## One implementation
 
