@@ -115,7 +115,7 @@ Deleting a tag does not delete an already-published GitHub Release — remove th
 
 After the release job finishes, rewrite the body with `gh release edit vX.Y.Z --title "Scan Kit X.Y.Z" --notes-file <file>`.
 
-Write a changelog. One sentence on what the release is, then bullets under **Added**, **Changed**, **Fixed**, and **Removed**, one change per bullet, against the previous release. Put install files, warnings, and ship limits under **Upgrade**. End with the compare link for that previous version, even when the tag is not its ancestor (2.0.0's draft started at 1.7.0 for that reason). Leave out pull-request titles, CI fixes, and refactors.
+Write a changelog. One sentence on what the release is, then bullets under **Added**, **Changed**, **Fixed**, and **Removed**, one change per bullet, against the previous release. A major release opens with **Highlights**: a few bullets for the changes worth leading with, such as a rewrite or a new renderer. Put install files, warnings, and ship limits under **Upgrade**. End with the compare link for that previous version, even when the tag is not its ancestor (2.0.0's draft started at 1.7.0 for that reason). Leave out pull-request titles, CI fixes, and refactors.
 
 ## Notes
 
