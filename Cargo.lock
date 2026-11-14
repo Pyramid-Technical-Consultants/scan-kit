@@ -3686,7 +3686,6 @@ dependencies = [
  "fontdue",
  "krilla",
  "md-5",
- "native-tls",
  "rmpv",
  "rusqlite",
  "rustls-native-certs",

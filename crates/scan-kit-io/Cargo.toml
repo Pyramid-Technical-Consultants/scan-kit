@@ -33,7 +33,6 @@ fontdue = "0.9"
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 suppaftp = { version = "10.0.2", default-features = false, features = ["rustls-ring"] }
 ureq = { version = "3", default-features = false, features = ["native-tls"] }
-native-tls = "0.2"
 rustls-native-certs = "0.8"
 trash = "5.2.9"
 
@@ -42,5 +41,5 @@ trash = "5.2.9"
 ssh2 = "0.9.6"
 
 [target.'cfg(all(not(target_arch = "wasm32"), unix))'.dependencies]
+ureq = { version = "3", default-features = false, features = ["vendored"] }
 ssh2 = { version = "0.9.6", features = ["vendored-openssl"] }
-native-tls = { version = "0.2", features = ["vendored"] }

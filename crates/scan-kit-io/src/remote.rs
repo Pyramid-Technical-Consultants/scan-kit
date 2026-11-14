@@ -887,22 +887,29 @@ mod net {
     }
 
     fn http_agent() -> Result<ureq::Agent, String> {
-        let connector = native_tls::TlsConnector::new().map_err(|err| err.to_string())?;
-        Ok(ureq::AgentBuilder::new()
-            .timeout_connect(location::connect_timeout())
-            .timeout_read(location::connect_timeout())
-            .timeout_write(location::connect_timeout())
-            .tls_connector(std::sync::Arc::new(connector))
-            .build())
+        let timeout = Some(location::connect_timeout());
+        let config = ureq::Agent::config_builder()
+            .timeout_connect(timeout)
+            .timeout_send_request(timeout)
+            .timeout_recv_response(timeout)
+            .timeout_recv_body(timeout)
+            .tls_config(
+                ureq::tls::TlsConfig::builder()
+                    .provider(ureq::tls::TlsProvider::NativeTls)
+                    .build(),
+            )
+            .build();
+        Ok(config.into())
     }
 
     fn http_get(url: &str, username: &str, password: &str) -> Result<Vec<u8>, String> {
-        let response = authed(http_agent()?.get(url), username, password)
+        let mut response = authed(http_agent()?.get(url), username, password)
             .call()
             .map_err(map_http)?;
         let mut bytes = Vec::new();
         response
-            .into_reader()
+            .body_mut()
+            .as_reader()
             .take(MAX_OBJECT_BYTES + 1)
             .read_to_end(&mut bytes)
             .map_err(|err| err.to_string())?;
@@ -916,10 +923,10 @@ mod net {
         // ponytail: a server that rejects HEAD keeps a zero stamp, so the cached
         // archive is reused until the process forgets it. A Content-Length change
         // still downloads again.
-        let response = authed(http_agent()?.request("HEAD", url), username, password).call();
+        let response = authed(http_agent()?.head(url), username, password).call();
         let response = match response {
             Ok(response) => response,
-            Err(ureq::Error::Status(405, _)) => {
+            Err(ureq::Error::StatusCode(405)) => {
                 return Ok(Stat {
                     dir: false,
                     size: 0,
@@ -929,7 +936,9 @@ mod net {
             Err(err) => return Err(map_http(err)),
         };
         let size = response
-            .header("content-length")
+            .headers()
+            .get("content-length")
+            .and_then(|value| value.to_str().ok())
             .and_then(|text| text.parse().ok())
             .unwrap_or(0);
         Ok(Stat {
@@ -939,11 +948,15 @@ mod net {
         })
     }
 
-    fn authed(request: ureq::Request, username: &str, password: &str) -> ureq::Request {
+    fn authed<B>(
+        request: ureq::RequestBuilder<B>,
+        username: &str,
+        password: &str,
+    ) -> ureq::RequestBuilder<B> {
         if username.is_empty() && password.is_empty() {
             return request;
         }
-        request.set("Authorization", &basic_auth(username, password))
+        request.header("Authorization", &basic_auth(username, password))
     }
 
     fn basic_auth(username: &str, password: &str) -> String {
@@ -984,7 +997,7 @@ mod net {
 
     fn map_http(err: ureq::Error) -> String {
         match err {
-            ureq::Error::Status(code, _) if code == 401 || code == 403 => {
+            ureq::Error::StatusCode(code) if code == 401 || code == 403 => {
                 location::auth_error("the archive URL refused the password")
             }
             other => other.to_string(),
