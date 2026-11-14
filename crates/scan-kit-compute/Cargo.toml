@@ -11,7 +11,7 @@ description = "Scan Kit wgpu compute"
 workspace = true
 
 [dependencies]
-naga = "27"
+naga = "30"
 scan-kit-core = { workspace = true }
 scan-kit-dicom = { workspace = true }
 scan-kit-io = { workspace = true }
@@ -19,7 +19,7 @@ scan-kit-plot = { workspace = true }
 serde_json = { workspace = true }
 sha2 = "0.10"
 tokio = { workspace = true }
-wgpu = "27"
+wgpu = "30"
 
 [dev-dependencies]
 tokio = { workspace = true }

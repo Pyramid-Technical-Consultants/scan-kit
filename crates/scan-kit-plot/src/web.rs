@@ -45,11 +45,9 @@ impl WebPlot {
     pub async fn create(canvas: web_sys::HtmlCanvasElement) -> Result<WebPlot, JsValue> {
         let width = canvas.width().clamp(MIN_SIDE, MAX_SIDE);
         let height = canvas.height().clamp(MIN_SIDE, MAX_SIDE);
-        let instance = wgpu::util::new_instance_with_webgpu_detection(&wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::BROWSER_WEBGPU | wgpu::Backends::GL,
-            ..Default::default()
-        })
-        .await;
+        let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
+        desc.backends = wgpu::Backends::BROWSER_WEBGPU | wgpu::Backends::GL;
+        let instance = wgpu::util::new_instance_with_webgpu_detection(desc).await;
         let surface = instance
             .create_surface(wgpu::SurfaceTarget::Canvas(canvas))
             .map_err(js)?;
@@ -87,6 +85,7 @@ impl WebPlot {
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format,
+            color_space: wgpu::SurfaceColorSpace::Auto,
             width,
             height,
             present_mode: wgpu::PresentMode::Fifo,
@@ -288,14 +287,26 @@ impl WebPlot {
             return Ok(());
         }
         let frame = match self.surface.get_current_texture() {
-            Ok(frame) => frame,
+            wgpu::CurrentSurfaceTexture::Success(frame)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
+            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
+                return Ok(())
+            }
             // A resize leaves the first acquire outdated. Reconfigure and take
             // the next one; giving up here leaves the canvas at its default black.
-            Err(wgpu::SurfaceError::Outdated | wgpu::SurfaceError::Lost) => {
+            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
                 self.surface.configure(&self.gpu.device, &self.config);
-                self.surface.get_current_texture().map_err(js)?
+                match self.surface.get_current_texture() {
+                    wgpu::CurrentSurfaceTexture::Success(frame)
+                    | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
+                    wgpu::CurrentSurfaceTexture::Timeout
+                    | wgpu::CurrentSurfaceTexture::Occluded => return Ok(()),
+                    other => {
+                        return Err(JsValue::from_str(&format!("plot surface: {other:?}")));
+                    }
+                }
             }
-            Err(err) => return Err(js(err)),
+            other => return Err(JsValue::from_str(&format!("plot surface: {other:?}"))),
         };
         let encoder = {
             let view = frame.texture.create_view(&Default::default());
@@ -303,7 +314,7 @@ impl WebPlot {
                 .map_err(js)?
         };
         self.gpu.queue.submit(Some(encoder.finish()));
-        frame.present();
+        self.gpu.queue.present(frame);
         Ok(())
     }
 
