@@ -25,7 +25,7 @@ md-5 = "0.10"
 similar = "2.7"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 rmpv = "1"
-tungstenite = { version = "0.27", default-features = false, features = ["handshake"] }
+tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
 sha2 = "0.10"
 krilla = "0.8.2"
 fontdue = "0.9"
