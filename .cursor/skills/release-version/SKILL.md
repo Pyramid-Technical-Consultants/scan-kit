@@ -87,7 +87,7 @@ Requirements for the trigger to fire correctly:
 | Tagged release | `scan-kit-windows-X.Y.Z-setup.exe` | `scan-kit-linux-amd64-X.Y.Z.AppImage`, `scan-kit-linux-amd64-X.Y.Z.deb` |
 | Non-tagged CI (`main` / `develop` push) | `Scan Kit_X.Y.Z_x64-setup.exe` | `Scan Kit_X.Y.Z_amd64.AppImage`, `scan-kit_X.Y.Z_amd64.deb` |
 
-Tagged releases are renamed to the `scan-kit-…` names by the release job; untagged builds keep the Tauri bundle names in the workflow artifact. `X.Y.Z` comes from the workspace version. No changelog file is maintained; GitHub auto-generates release notes.
+Tagged releases are renamed to the `scan-kit-…` names by the release job; untagged builds keep the Tauri bundle names in the workflow artifact. `X.Y.Z` comes from the workspace version. No changelog file is maintained. The release job publishes with `--generate-notes`, which lists pull requests back to the previous tag on that history. That list is a draft. Replace it before announcing the release (see [Release notes](#release-notes)).
 
 ## Fixing or re-doing a release
 
@@ -109,6 +109,13 @@ Deleting a tag does not delete an already-published GitHub Release — remove th
 - [ ] Tag name exactly matches `vX.Y.Z` (same as the workspace version, prefixed with `v`).
 - [ ] Tag points at the release commit and was pushed.
 - [ ] CI release job passes the tag/`Cargo.toml` sanity check and publishes the Windows installer and the Linux AppImage + deb.
+- [ ] The generated release notes have been replaced with a changelog. The GitHub Release title is `Scan Kit X.Y.Z`.
+
+## Release notes
+
+After the release job finishes, rewrite the body with `gh release edit vX.Y.Z --title "Scan Kit X.Y.Z" --notes-file <file>`.
+
+Write a changelog. One sentence on what the release is, then bullets under **Added**, **Changed**, **Fixed**, and **Removed**, one change per bullet, against the previous release. A major release opens with **Highlights**: a few bullets for the changes worth leading with, such as a rewrite or a new renderer. Put install files, warnings, and ship limits under **Upgrade**. End with the compare link for that previous version, even when the tag is not its ancestor (2.0.0's draft started at 1.7.0 for that reason). Leave out pull-request titles, CI fixes, and refactors.
 
 ## Notes
 
