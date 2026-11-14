@@ -109,13 +109,13 @@ Deleting a tag does not delete an already-published GitHub Release — remove th
 - [ ] Tag name exactly matches `vX.Y.Z` (same as the workspace version, prefixed with `v`).
 - [ ] Tag points at the release commit and was pushed.
 - [ ] CI release job passes the tag/`Cargo.toml` sanity check and publishes the Windows installer and the Linux AppImage + deb.
-- [ ] The generated release notes have been replaced with the user-facing summary. The GitHub Release title is `Scan Kit X.Y.Z`.
+- [ ] The generated release notes have been replaced with a changelog. The GitHub Release title is `Scan Kit X.Y.Z`.
 
 ## Release notes
 
 After the release job finishes, rewrite the body with `gh release edit vX.Y.Z --title "Scan Kit X.Y.Z" --notes-file <file>`.
 
-Write for someone who used the previous release. The compare link is that version, even when it is not an ancestor of the tag (that is why 2.0.0's draft started at 1.7.0). Cover install, what they will notice, data that carries over, and anything that will surprise them (a warning, a separate install, a limit you decided to ship). Leave out pull-request titles, CI fixes, and refactors.
+Write a changelog. One sentence on what the release is, then bullets under **Added**, **Changed**, **Fixed**, and **Removed**, one change per bullet, against the previous release. Put install files, warnings, and ship limits under **Upgrade**. End with the compare link for that previous version, even when the tag is not its ancestor (2.0.0's draft started at 1.7.0 for that reason). Leave out pull-request titles, CI fixes, and refactors.
 
 ## Notes
 
