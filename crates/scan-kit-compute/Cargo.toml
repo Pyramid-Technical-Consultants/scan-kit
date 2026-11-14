@@ -19,7 +19,7 @@ scan-kit-plot = { workspace = true }
 serde_json = { workspace = true }
 sha2 = "0.10"
 tokio = { workspace = true }
-wgpu = "27"
+wgpu = "30"
 
 [dev-dependencies]
 tokio = { workspace = true }
