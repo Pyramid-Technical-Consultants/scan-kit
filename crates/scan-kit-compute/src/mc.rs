@@ -86,7 +86,7 @@ struct Launch {
 /// GPU identity for dose provenance — `scan_kit.gpu.adapter_info`.
 pub fn adapter_info() -> String {
     block_on(async {
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions::default())
             .await
@@ -916,8 +916,8 @@ fn pipeline(
 ) -> wgpu::ComputePipeline {
     let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: None,
-        bind_group_layouts: &[layout],
-        push_constant_ranges: &[],
+        bind_group_layouts: &[Some(layout)],
+        immediate_size: 0,
     });
     device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
         label: None,
@@ -939,8 +939,11 @@ fn storage_init(device: &wgpu::Device, bytes: &[u8]) -> wgpu::Buffer {
         mapped_at_creation: true,
     });
     {
-        let mut mapped = buffer.slice(..).get_mapped_range_mut();
-        mapped[..bytes.len()].copy_from_slice(bytes);
+        let mut mapped = buffer
+            .slice(..)
+            .get_mapped_range_mut()
+            .expect("storage buffer mapped at creation");
+        mapped.slice(..bytes.len()).copy_from_slice(bytes);
     }
     buffer.unmap();
     buffer
@@ -1099,7 +1102,10 @@ fn read_bytes(
         .recv()
         .map_err(|err| ComputeError::Message(err.to_string()))?
         .map_err(|err| ComputeError::Message(err.to_string()))?;
-    let mapped = staging.slice(..).get_mapped_range();
+    let mapped = staging
+        .slice(..)
+        .get_mapped_range()
+        .map_err(|err| ComputeError::Message(err.to_string()))?;
     let out = mapped.to_vec();
     drop(mapped);
     staging.unmap();
@@ -1107,7 +1113,7 @@ fn read_bytes(
 }
 
 async fn mc_device() -> Result<(wgpu::Device, wgpu::Queue), ComputeError> {
-    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
     let adapter = instance
         .request_adapter(&wgpu::RequestAdapterOptions::default())
         .await

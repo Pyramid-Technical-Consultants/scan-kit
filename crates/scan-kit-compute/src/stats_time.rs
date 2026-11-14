@@ -303,7 +303,11 @@ impl Reducer {
             .recv()
             .map_err(|err| err.to_string())?
             .map_err(|err| err.to_string())?;
-        let mapped = job.staging.slice(..).get_mapped_range();
+        let mapped = job
+            .staging
+            .slice(..)
+            .get_mapped_range()
+            .map_err(|err| err.to_string())?;
         let ends = Ends {
             min: f32::from_le_bytes(mapped[0..4].try_into().unwrap()),
             max: f32::from_le_bytes(mapped[4..8].try_into().unwrap()),
@@ -375,8 +379,8 @@ fn pipeline(
 ) -> wgpu::ComputePipeline {
     let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: None,
-        bind_group_layouts: &[group],
-        push_constant_ranges: &[],
+        bind_group_layouts: &[Some(group)],
+        immediate_size: 0,
     });
     device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
         label: Some(entry),

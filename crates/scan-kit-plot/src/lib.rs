@@ -33,7 +33,7 @@ impl std::error::Error for GpuError {}
 
 /// Default adapter and device. Kernels and the offscreen plot both use it.
 pub async fn request_device() -> Result<(wgpu::Device, wgpu::Queue), GpuError> {
-    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
     let adapter = instance
         .request_adapter(&wgpu::RequestAdapterOptions::default())
         .await

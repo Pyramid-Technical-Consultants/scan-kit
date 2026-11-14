@@ -3678,6 +3678,7 @@ impl Plot {
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
                 occlusion_query_set: None,
+                multiview_mask: None,
             });
             // WebGL2 has no base instance, so each range binds a slice and starts at 0.
             let mut frame_cursor = 0u64;
@@ -4354,13 +4355,13 @@ impl PlotGpu {
         });
         let line_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("lines"),
-            bind_group_layouts: &[&uniform_layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&uniform_layout)],
+            immediate_size: 0,
         });
         let shaded_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("shaded"),
-            bind_group_layouts: &[&uniform_layout, &textured_layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&uniform_layout), Some(&textured_layout)],
+            immediate_size: 0,
         });
         let volume_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("dose-volume"),
@@ -4405,14 +4406,18 @@ impl PlotGpu {
         });
         let quad_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("quads"),
-            bind_group_layouts: &[&uniform_layout, &textured_layout, &volume_layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[
+                Some(&uniform_layout),
+                Some(&textured_layout),
+                Some(&volume_layout),
+            ],
+            immediate_size: 0,
         });
         let make = |layout: &wgpu::PipelineLayout,
                     vs: &str,
                     fs: &str,
                     buffer: wgpu::VertexBufferLayout<'_>| {
-            pipeline(&device, &shader, layout, vs, fs, &[buffer], format)
+            pipeline(&device, &shader, layout, vs, fs, &[Some(buffer)], format)
         };
         let line_pipeline = make(&line_layout, "vs_line", "fs_line", line_vertex());
         let point_pipeline = make(&line_layout, "vs_point", "fs_point", point_vertex());
@@ -4471,7 +4476,7 @@ fn pipeline(
     layout: &wgpu::PipelineLayout,
     vs: &str,
     fs: &str,
-    buffers: &[wgpu::VertexBufferLayout<'_>],
+    buffers: &[Option<wgpu::VertexBufferLayout<'_>>],
     format: wgpu::TextureFormat,
 ) -> wgpu::RenderPipeline {
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -4496,7 +4501,7 @@ fn pipeline(
         primitive: wgpu::PrimitiveState::default(),
         depth_stencil: None,
         multisample: wgpu::MultisampleState::default(),
-        multiview: None,
+        multiview_mask: None,
         cache: None,
     })
 }
@@ -8630,7 +8635,9 @@ fn read_buffer(
         .recv()
         .map_err(|err| GpuError::Message(err.to_string()))?
         .map_err(|err| GpuError::Message(err.to_string()))?;
-    let mapped = slice.get_mapped_range();
+    let mapped = slice
+        .get_mapped_range()
+        .map_err(|err| GpuError::Message(err.to_string()))?;
     let mut frame = Vec::with_capacity((width * height * 4) as usize);
     for row in 0..height {
         let start = (row * padded) as usize;

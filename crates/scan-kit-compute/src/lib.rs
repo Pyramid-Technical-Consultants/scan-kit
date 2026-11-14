@@ -66,7 +66,10 @@ pub async fn round_trip_add_one(input: &[f32]) -> Result<Vec<f32>, ComputeError>
         mapped_at_creation: true,
     });
     {
-        let mut mapped = buffer.slice(..).get_mapped_range_mut();
+        let mut mapped = buffer
+            .slice(..)
+            .get_mapped_range_mut()
+            .map_err(|err| ComputeError::Message(err.to_string()))?;
         mapped.copy_from_slice(&bytes);
     }
     buffer.unmap();
@@ -86,8 +89,8 @@ pub async fn round_trip_add_one(input: &[f32]) -> Result<Vec<f32>, ComputeError>
     });
     let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: None,
-        bind_group_layouts: &[&layout],
-        push_constant_ranges: &[],
+        bind_group_layouts: &[Some(&layout)],
+        immediate_size: 0,
     });
     let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
         label: None,
@@ -134,7 +137,10 @@ pub async fn round_trip_add_one(input: &[f32]) -> Result<Vec<f32>, ComputeError>
         .recv()
         .map_err(|err| ComputeError::Message(err.to_string()))?
         .map_err(|err| ComputeError::Message(err.to_string()))?;
-    let mapped = staging.slice(..).get_mapped_range();
+    let mapped = staging
+        .slice(..)
+        .get_mapped_range()
+        .map_err(|err| ComputeError::Message(err.to_string()))?;
     let output = mapped
         .as_chunks::<4>()
         .0
