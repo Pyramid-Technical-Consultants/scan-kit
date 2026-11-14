@@ -32,8 +32,7 @@ fontdue = "0.9"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 suppaftp = { version = "10.0.2", default-features = false, features = ["rustls-ring"] }
-ureq = { version = "2", default-features = false, features = ["native-tls"] }
-native-tls = "0.2"
+ureq = { version = "3", default-features = false, features = ["native-tls-no-default"] }
 rustls-native-certs = "0.8"
 trash = "5.2.9"
 
@@ -42,5 +41,9 @@ trash = "5.2.9"
 ssh2 = "0.9.6"
 
 [target.'cfg(all(not(target_arch = "wasm32"), unix))'.dependencies]
-ssh2 = { version = "0.9.6", features = ["vendored-openssl"] }
+# Feature unification only: vendored OpenSSL for ureq. The code does not call this crate.
 native-tls = { version = "0.2", features = ["vendored"] }
+ssh2 = { version = "0.9.6", features = ["vendored-openssl"] }
+
+[package.metadata.cargo-machete]
+ignored = ["native-tls"]
