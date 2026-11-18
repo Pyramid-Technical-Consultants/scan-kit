@@ -9,14 +9,11 @@ const dir = path.dirname(fileURLToPath(import.meta.url));
 const tauriJs = path.join(dir, "../node_modules/@tauri-apps/cli/tauri.js");
 const args = process.argv.slice(2);
 
-// Tauri copies binaries/scan-kit-mcp-<host> into the installer. The file is
-// a build output, so `npm run tauri build` produces it and dev does not.
-function stageMcpSidecar() {
+// Tauri's build script copies binaries/scan-kit-mcp-<host> next to the app for
+// both `tauri dev` and `tauri build`. The file is a build output. Dev keeps a
+// debug binary once it exists; a bundle always restages the release binary.
+function stageMcpSidecar(release) {
   const repo = path.resolve(dir, "../../..");
-  execFileSync("cargo", ["build", "--release", "--locked", "-p", "scan-kit-mcp"], {
-    cwd: repo,
-    stdio: "inherit",
-  });
   const host = /^host: (.+)$/m
     .exec(execFileSync("rustc", ["-vV"], { encoding: "utf8" }))?.[1]
     ?.trim();
@@ -25,18 +22,28 @@ function stageMcpSidecar() {
   }
   const ext = process.platform === "win32" ? ".exe" : "";
   const destDir = path.join(dir, "../src-tauri/binaries");
+  const dest = path.join(destDir, `scan-kit-mcp-${host}${ext}`);
+  if (!release && fs.existsSync(dest)) {
+    return;
+  }
+  execFileSync(
+    "cargo",
+    ["build", "--locked", "-p", "scan-kit-mcp", ...(release ? ["--release"] : [])],
+    { cwd: repo, stdio: "inherit" },
+  );
   fs.mkdirSync(destDir, { recursive: true });
   fs.copyFileSync(
-    path.join(repo, "target", "release", `scan-kit-mcp${ext}`),
-    path.join(destDir, `scan-kit-mcp-${host}${ext}`),
+    path.join(repo, "target", release ? "release" : "debug", `scan-kit-mcp${ext}`),
+    dest,
   );
 }
 
 if (args[0] === "build") {
-  stageMcpSidecar();
+  stageMcpSidecar(true);
 }
 
 if (args[0] === "dev") {
+  stageMcpSidecar(false);
   await keepUp(process.execPath, [tauriJs, ...args], { name: "Tauri dev" });
 } else {
   const child = spawn(process.execPath, [tauriJs, ...args], { stdio: "inherit" });

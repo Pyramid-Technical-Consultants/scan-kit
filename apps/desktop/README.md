@@ -11,6 +11,6 @@ npm test         # vitest + keep-up node tests
 npm run build    # typecheck + wasm + production bundle
 ```
 
-`npm run tauri build` compiles `scan-kit-mcp` and packs it beside the desktop executable.
+`npm run tauri build` compiles `scan-kit-mcp` and packs it beside the desktop executable. `npm run tauri dev` compiles a debug copy the first time, because the app build looks for that file.
 
 See the repo-root `README.md` for the product overview.
