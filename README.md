@@ -52,7 +52,7 @@ Beyond plotting, Scan Kit helps you:
 | **Session comparison** | Overlay multiple sessions in the same view with distinct colors |
 | **Interactive replay** | Scrub timeslice channels (IC, dDose/dt, sigma, field) in one viewer |
 | **Plan authoring** | Generate `input_map.csv` from templates, DICOM RT Ion plans, or IBA PLD files |
-| **Patient QA** | In **Volumetric**, recalculate a DICOM RT Ion plan and its logged deliveries on the planning CT with the GPU Monte Carlo, with DVHs, clinical goals, gamma against the TPS dose and an RTDOSE/HTML report |
+| **Patient QA** | In **Volumetric**, recalculate a DICOM RT Ion plan and its logged deliveries on the planning CT with the GPU Monte Carlo, with DVHs, clinical goals, gamma against the TPS dose, a PDF report, a DVH CSV, and an RTDOSE export |
 | **Plan delivery** | Upload a plan to an RCI, run it, and download the session as a G3 zip |
 | **Config editing** | Browse and edit map2map XML with forms, integrity checks, and auto-tuning |
 
@@ -270,7 +270,7 @@ DVHs (the picked dose bright, the other faded) and **Clinical goals** are for th
 
 **RBE** weights the shown dose, DVHs, and clinical goals by 1.0 or 1.1. Gamma against the TPS stays on physical dose.
 
-**Export report** writes the study table (frame, beams, uncertainty, clinical goals, and the gamma pass rate) as a text file.
+**Export report** writes the study table (frame, beams, uncertainty, clinical goals, and the gamma pass rate) as a PDF, and writes the DVH curves to a CSV beside it. **Export dose** writes the recalculated dose as an RTDOSE.
 
 Scan Kit is a research tool, not a medical device. Don't use its dose for clinical decisions.
 
