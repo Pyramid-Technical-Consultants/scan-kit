@@ -5,8 +5,8 @@
     // Generated src/wasm is gitignored, which Knip already skips.
     "src/components/ui/**"
   ],
-  // The wasm script calls the Rust wasm-bindgen CLI pinned in Cargo.lock, not an npm package.
-  "ignoreBinaries": ["wasm-bindgen"],
+  // wasm-bindgen is the CLI pinned in Cargo.lock. rustc reports the host triple for the MCP sidecar.
+  "ignoreBinaries": ["wasm-bindgen", "rustc"],
   // scripts/tauri.mjs spawns this package's tauri.js by path, so the bin is unused.
   "ignoreDependencies": [
     "@tauri-apps/cli"

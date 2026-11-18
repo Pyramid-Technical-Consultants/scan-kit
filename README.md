@@ -73,6 +73,8 @@ Pre-built installers are published on [**GitHub Releases**](https://github.com/P
 
 **Windows:** run the NSIS installer. **Linux:** download the `.AppImage`, mark it executable (`chmod +x`), then double-click it — or install the `.deb` for a menu entry.
 
+The installer includes `scan-kit-mcp` beside the Scan Kit executable. That server is read-only until it is started with `--allow-effects`. Point an agent at that file. Agents in this repository still use `cargo run -p scan-kit-mcp`.
+
 > **Trying the latest `main` or `develop` branch?** CI builds bundles on every merge to those branches (not on open pull requests). Download them from the **Artifacts** section of the corresponding [GitHub Actions](https://github.com/Pyramid-Technical-Consultants/scan-kit/actions) workflow run.
 
 ### Run from source
