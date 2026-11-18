@@ -24,6 +24,7 @@ function stageMcpSidecar(release) {
   const destDir = path.join(dir, "../src-tauri/binaries");
   const dest = path.join(destDir, `scan-kit-mcp-${host}${ext}`);
   if (!release && fs.existsSync(dest)) {
+    markExecutable(dest);
     return;
   }
   execFileSync(
@@ -36,6 +37,14 @@ function stageMcpSidecar(release) {
     path.join(repo, "target", release ? "release" : "debug", `scan-kit-mcp${ext}`),
     dest,
   );
+  markExecutable(dest);
+}
+
+// copyFileSync does not keep the cargo binary's executable bit.
+function markExecutable(file) {
+  if (process.platform !== "win32") {
+    fs.chmodSync(file, 0o755);
+  }
 }
 
 if (args[0] === "build") {
