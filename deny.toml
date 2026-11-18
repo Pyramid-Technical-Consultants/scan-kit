@@ -17,6 +17,8 @@ ignore = [
     { id = "RUSTSEC-2026-0192", reason = "transitive via fontdue; no upgrade" },
     # krilla 0.8 shapes report text with rustybuzz; no krilla release switches to harfrust yet.
     { id = "RUSTSEC-2026-0206", reason = "transitive via krilla; no upgrade" },
+    # chrono 0.4 is unmaintained. scan-kit-io calls it, and rmcp, suppaftp, and trash still require it.
+    { id = "RUSTSEC-2026-0543", reason = "direct and transitive; no upgrade" },
 ]
 
 [licenses]
