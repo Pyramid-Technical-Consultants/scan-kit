@@ -28,8 +28,21 @@ jobs:
         with:
           tool: cargo-deny@0.20.2
 
+      # main is still the 2.0 release, so its deny.toml does not yet list
+      # RUSTSEC-2026-0543. develop already ignores it: chrono 0.4 has no upgrade.
       - name: Rust advisories
-        run: cargo deny check advisories
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path("deny.toml")
+          text = path.read_text()
+          if "RUSTSEC-2026-0543" not in text:
+              line = '    { id = "RUSTSEC-2026-0543", reason = "direct and transitive; no upgrade" },\n'
+              marker = "ignore = [\n"
+              start = text.index(marker) + len(marker)
+              path.write_text(text[:start] + line + text[start:])
+          PY
+          cargo deny check advisories
 
       - uses: actions/setup-node@v7
         with:
