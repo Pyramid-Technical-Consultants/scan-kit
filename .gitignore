@@ -17,6 +17,7 @@ test_data/
 
 # CI bundle staging (do not re-commit frozen binaries)
 *.exe
+apps/desktop/src-tauri/binaries/
 scan-kit-windows/
 scan-kit-linux/
 
