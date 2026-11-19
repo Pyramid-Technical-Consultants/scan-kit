@@ -491,7 +491,16 @@ fn image_slices(elems: &[Elem], scale: f32) -> Result<Vec<Slice>, String> {
     if rows == 0 || cols == 0 || origin.len() < 3 || spacing.len() < 2 {
         return Err("CT geometry is incomplete".into());
     }
+    if !(spacing[0].is_finite() && spacing[1].is_finite() && spacing[0] > 0.0 && spacing[1] > 0.0) {
+        return Err("CT pixel spacing is not positive".into());
+    }
+    if origin.iter().any(|value| !value.is_finite()) {
+        return Err("CT image position is not finite".into());
+    }
     let bits = int_tag(elems, tag(0x0028, 0x0100)).unwrap_or(16);
+    // Pixel Representation 1 stores two's-complement samples. Reading those as
+    // unsigned turns a negative HU into a huge positive one.
+    let signed = int_tag(elems, tag(0x0028, 0x0103)).unwrap_or(0) == 1;
     let stored: Vec<f32> = if bits > 16 {
         pixels
             .bytes
@@ -499,7 +508,12 @@ fn image_slices(elems: &[Elem], scale: f32) -> Result<Vec<Slice>, String> {
             .0
             .iter()
             .map(|chunk| {
-                (u32::from_le_bytes(*chunk) as f64 * slope as f64 + intercept as f64) as f32 * scale
+                let raw = if signed {
+                    i32::from_le_bytes(*chunk) as f64
+                } else {
+                    u32::from_le_bytes(*chunk) as f64
+                };
+                (raw * slope as f64 + intercept as f64) as f32 * scale
             })
             .collect()
     } else {
@@ -508,7 +522,14 @@ fn image_slices(elems: &[Elem], scale: f32) -> Result<Vec<Slice>, String> {
             .as_chunks::<2>()
             .0
             .iter()
-            .map(|chunk| (u16::from_le_bytes(*chunk) as f32 * slope + intercept) * scale)
+            .map(|chunk| {
+                let raw = if signed {
+                    i16::from_le_bytes(*chunk) as f32
+                } else {
+                    u16::from_le_bytes(*chunk) as f32
+                };
+                (raw * slope + intercept) * scale
+            })
             .collect()
     };
     let plane = rows * cols;
@@ -517,9 +538,16 @@ fn image_slices(elems: &[Elem], scale: f32) -> Result<Vec<Slice>, String> {
     }
     let frames = stored.len() / plane;
     let offsets = floats_tag(elems, tag(0x3004, 0x000C));
+    let thickness = float_tag(elems, tag(0x0018, 0x0050))
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .unwrap_or(1.0);
     let mut slices = Vec::new();
     for frame in 0..frames {
-        let z = origin[2] + offsets.get(frame).copied().unwrap_or(frame as f32);
+        let z = origin[2]
+            + offsets
+                .get(frame)
+                .copied()
+                .unwrap_or(frame as f32 * thickness);
         slices.push(Slice {
             origin: [origin[0], origin[1], z],
             spacing_x: spacing[1],
@@ -533,6 +561,9 @@ fn image_slices(elems: &[Elem], scale: f32) -> Result<Vec<Slice>, String> {
 }
 
 fn stack(slices: &mut [Slice]) -> Result<CtVolume, String> {
+    if slices.is_empty() {
+        return Err("the study has no slices".into());
+    }
     // A malformed position tag ("nan" parses as f32::NAN) must not crash a
     // study load; equal order keeps the row and the dz check reports it.
     slices.sort_by(|a, b| {
@@ -546,8 +577,20 @@ fn stack(slices: &mut [Slice]) -> Result<CtVolume, String> {
     } else {
         slices[1].origin[2] - slices[0].origin[2]
     };
-    if dz <= 0.0 || dz.is_nan() {
+    // 0.01 mm is tighter than a real slice gap and looser than DICOM DS rounding.
+    let uniform = slices.windows(2).all(|pair| {
+        let step = pair[1].origin[2] - pair[0].origin[2];
+        (step - dz).abs() <= 0.01
+    });
+    let spacing_matches = slices.iter().all(|slice| {
+        (slice.spacing_x - first.spacing_x).abs() <= 0.01
+            && (slice.spacing_y - first.spacing_y).abs() <= 0.01
+    });
+    if dz <= 0.0 || dz.is_nan() || !uniform {
         return Err("CT slice spacing is not uniform".into());
+    }
+    if !spacing_matches {
+        return Err("CT slices differ in pixel spacing".into());
     }
     let mut hu = vec![0.0; first.cols * first.rows * slices.len()];
     for (z, slice) in slices.iter().enumerate() {
@@ -1319,6 +1362,51 @@ mod tests {
             let mut slices = slices;
             assert!(stack(&mut slices).is_err());
         }
+    }
+
+    #[test]
+    fn uneven_slice_spacing_is_rejected() {
+        let mut gap = vec![slice(0.0), slice(1.0), slice(3.0)];
+        assert!(stack(&mut gap).is_err());
+        let mut mismatched = vec![slice(0.0), slice(1.0)];
+        mismatched[1].spacing_x = 2.0;
+        assert!(stack(&mut mismatched).is_err());
+        let mut even = vec![slice(0.0), slice(2.5), slice(5.0)];
+        let volume = stack(&mut even).unwrap();
+        assert!((volume.spacing[2] - 2.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_signed_ct_pixel_stays_negative() {
+        let mut bytes = Vec::new();
+        us(&mut bytes, 0x0028, 0x0010, 1);
+        us(&mut bytes, 0x0028, 0x0011, 1);
+        ds(&mut bytes, 0x0028, 0x0030, &[1.0, 2.0]);
+        ds(&mut bytes, 0x0020, 0x0032, &[0.0, 0.0, 10.0]);
+        us(&mut bytes, 0x0028, 0x0100, 16);
+        us(&mut bytes, 0x0028, 0x0103, 1);
+        ds(&mut bytes, 0x0028, 0x1052, &[0.0]);
+        ds(&mut bytes, 0x0028, 0x1053, &[1.0]);
+        ds(&mut bytes, 0x0018, 0x0050, &[2.5]);
+        ow(&mut bytes, 0x7FE0, 0x0010, &[(-1000i16) as u16, 0]);
+        let elems = parse_dataset(&bytes).unwrap();
+        let slices = image_slices(&elems, 1.0).unwrap();
+        assert_eq!(slices.len(), 2);
+        assert!((slices[0].values[0] + 1000.0).abs() < 1e-3);
+        assert!((slices[0].spacing_x - 2.0).abs() < 1e-4);
+        assert!((slices[1].origin[2] - 12.5).abs() < 1e-3);
+    }
+
+    #[test]
+    fn a_zero_pixel_spacing_is_rejected() {
+        let mut bytes = Vec::new();
+        us(&mut bytes, 0x0028, 0x0010, 1);
+        us(&mut bytes, 0x0028, 0x0011, 1);
+        ds(&mut bytes, 0x0028, 0x0030, &[0.0, 1.0]);
+        ds(&mut bytes, 0x0020, 0x0032, &[0.0, 0.0, 0.0]);
+        ow(&mut bytes, 0x7FE0, 0x0010, &[0]);
+        let elems = parse_dataset(&bytes).unwrap();
+        assert!(image_slices(&elems, 1.0).is_err());
     }
 
     #[test]

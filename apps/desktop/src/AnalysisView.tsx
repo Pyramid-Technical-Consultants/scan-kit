@@ -1365,7 +1365,8 @@ export function AnalysisView({
                     setOpening(false);
                     notifyError(reason);
                   });
-              });
+              })
+                .catch((reason: unknown) => notifyError(reason));
             }}
           >
             Open Study
@@ -1398,7 +1399,8 @@ export function AnalysisView({
                     .then((listed) => setScanners(listed.scanners))
                     .catch((reason: unknown) => notifyError(reason));
                 },
-              );
+              )
+                .catch((reason: unknown) => notifyError(reason));
             }}
           >
             Register scanner
@@ -1428,7 +1430,8 @@ export function AnalysisView({
                   },
                   dest: selected,
                 }).catch((reason: unknown) => notifyError(reason));
-              });
+              })
+                .catch((reason: unknown) => notifyError(reason));
             }}
           >
             Export report
@@ -1459,7 +1462,8 @@ export function AnalysisView({
                   dest: selected,
                   description: "scan-kit MC",
                 }).catch((reason: unknown) => notifyError(reason));
-              });
+              })
+                .catch((reason: unknown) => notifyError(reason));
             }}
           >
             Export dose

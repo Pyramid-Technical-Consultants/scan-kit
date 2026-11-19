@@ -62,6 +62,10 @@ pub fn sig6(value: f64) -> String {
     if value == 0.0 {
         return "0".into();
     }
+    // `{:.5e}` of a non-finite value has no exponent, so splitting on `e` would panic.
+    if !value.is_finite() {
+        return value.to_string();
+    }
     let exponent = value.abs().log10().floor() as i32;
     // printf %g prints scientific outside [1e-4, 1e6).
     if !(-4..6).contains(&exponent) {
@@ -761,5 +765,8 @@ mod tests {
         assert_eq!(sig6(12.345678), "12.3457");
         assert_eq!(sig6(1234567.0), "1.23457e6");
         assert_eq!(sig6(0.00123), "0.00123");
+        assert_eq!(sig6(f64::NAN), "NaN");
+        assert_eq!(sig6(f64::INFINITY), "inf");
+        assert_eq!(sig6(f64::NEG_INFINITY), "-inf");
     }
 }
