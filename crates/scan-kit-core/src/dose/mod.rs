@@ -197,6 +197,8 @@ pub struct PatientRequest {
     pub material: Vec<u8>,
     pub density: Vec<f32>,
     pub spacing_mm: [f32; 3],
+    /// Corner of voxel 0, in millimetres. A DICOM image position is the center
+    /// of that voxel, so the caller subtracts half the spacing.
     pub origin_mm: [f32; 3],
     pub shape: [usize; 3],
     pub histories: u32,
@@ -232,6 +234,8 @@ pub struct McResult {
 /// than its pixels, and depth, gamma, and the picture use each axis.
 #[derive(Clone, Debug)]
 pub struct Volume {
+    /// Corner of voxel `(0, 0, 0)`, in millimetres. Voxel `i` is centered at
+    /// `origin + (i + 0.5) * spacing`.
     pub origin: [f32; 3],
     pub shape: [usize; 3],
     pub spacing: [f32; 3],

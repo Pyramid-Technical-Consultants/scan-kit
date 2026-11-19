@@ -202,6 +202,11 @@ pub struct Transport {
     pub effective: bool,
 }
 
+/// Corner of the first CT voxel. Image position is that voxel's center.
+fn dose_corner(center: [f32; 3], spacing: [f32; 3]) -> [f32; 3] {
+    std::array::from_fn(|axis| center[axis] - 0.5 * spacing[axis])
+}
+
 pub fn transport(inputs: &PatientInputs, mc: Option<McRunner<'_>>) -> Transport {
     let score_let = inputs.rbe_model.is_some_and(RbeModel::uses_let);
     let (spots, protons, beams) = records(
@@ -214,6 +219,10 @@ pub fn transport(inputs: &PatientInputs, mc: Option<McRunner<'_>>) -> Transport 
     );
     let (material, density) = inputs.calibration.voxels(&inputs.study.ct.hu);
     let nvox = inputs.study.ct.shape.iter().product();
+    // Image position is the center of the first voxel. The kernel bins with
+    // floor((x - origin) / spacing) and the picture centers voxel i at
+    // origin + (i + 0.5) * spacing, so both want the corner.
+    let origin_mm = dose_corner(inputs.study.ct.origin, inputs.study.ct.spacing);
     let request = PatientRequest {
         spots,
         protons,
@@ -221,7 +230,7 @@ pub fn transport(inputs: &PatientInputs, mc: Option<McRunner<'_>>) -> Transport 
         material,
         density,
         spacing_mm: inputs.study.ct.spacing,
-        origin_mm: inputs.study.ct.origin,
+        origin_mm,
         shape: inputs.study.ct.shape,
         histories: inputs.histories,
         seed: SEED,
@@ -234,7 +243,7 @@ pub fn transport(inputs: &PatientInputs, mc: Option<McRunner<'_>>) -> Transport 
         .as_ref()
         .map(|result| result.volume.clone())
         .unwrap_or(Volume {
-            origin: inputs.study.ct.origin,
+            origin: origin_mm,
             shape: inputs.study.ct.shape,
             spacing: inputs.study.ct.spacing,
             values: vec![0.0; nvox],
@@ -1656,7 +1665,31 @@ fn verdict(passed: bool, detail: String) -> String {
 mod tests {
     use scan_kit_core::RbeModel;
 
-    use super::{apply_rbe, group_fractions, tps_per_fraction, Dvh, Goal};
+    use super::{apply_rbe, dose_corner, group_fractions, tps_per_fraction, Dvh, Goal};
+
+    #[test]
+    fn a_ct_voxel_center_is_the_dose_voxel_center() {
+        let center = [10.0, -4.0, 2.5];
+        let spacing = [1.0, 1.0, 2.5];
+        let origin = dose_corner(center, spacing);
+        let volume = scan_kit_core::Volume {
+            origin,
+            shape: [4, 4, 4],
+            spacing,
+            values: Vec::new(),
+        };
+        // The transport kernel bins with floor((x - origin) / spacing). A
+        // point in the first half of a CT voxel used to fall in the previous
+        // bin when the image position was used as that corner.
+        for axis in 0..3 {
+            let bin = |at: f32| ((at - origin[axis]) / spacing[axis]).floor();
+            assert_eq!(bin(center[axis] - 0.25 * spacing[axis]), 0.0);
+            assert_eq!(bin(center[axis] + 0.75 * spacing[axis]), 1.0);
+            let at = center[axis] + 3.0 * spacing[axis];
+            assert_eq!(bin(at), 3.0);
+            assert!((volume.mm_of(axis, 3) - at).abs() < 1e-4);
+        }
+    }
 
     #[test]
     fn a_repeated_beam_starts_another_fraction() {
