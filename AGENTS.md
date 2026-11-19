@@ -1,13 +1,15 @@
-# Agent notes
+# Working in this repository
 
-## Working alongside other agents
+## Parallel checkouts and worktrees
 
-- When another agent may be editing the same checkout, do work in a `git
-  worktree` and let it use its own `target/` (the default). Never point
-  `CARGO_TARGET_DIR` at another checkout's `target/`: cargo does not
-  distinguish same-name path dependencies across worktrees, so concurrent
-  builds overwrite each other's rlibs and produce phantom compile errors.
-- A fresh worktree pays one cold dependency build. After that,
-  `cargo test -p <crate>` is incremental and fast; reserve
-  `cargo test --workspace` and clippy for handback per
-  `.cursor/skills/static-analysis/SKILL.md`.
+Multiple checkouts of this workspace — for example, `git worktree`s used for
+parallel work — must not share a Cargo target directory. Cargo's build
+fingerprints do not account for the checkout location of path dependencies,
+so concurrent builds in a shared `target/` overwrite each other's artifacts
+and produce confusing compile errors. Leave `CARGO_TARGET_DIR` unset so each
+checkout builds into its own `target/`.
+
+A fresh checkout pays one full dependency build; subsequent builds are
+incremental. During development, prefer `cargo test -p <crate>` for the
+crate you are changing, and run the full workspace checks before submitting —
+see `.cursor/skills/static-analysis/SKILL.md`.
