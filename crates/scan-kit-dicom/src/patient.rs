@@ -59,7 +59,9 @@ pub struct Beam {
 #[derive(Clone, Debug)]
 pub struct Structure {
     pub name: String,
-    pub contour: Vec<[f32; 3]>,
+    /// One closed contour per planar item. Slices stay separate so a voxel is
+    /// tested against the contour on its own plane.
+    pub contour: Vec<Vec<[f32; 3]>>,
 }
 
 /// One control-point spot from an RT Ion plan, with the raw meterset weight.
@@ -497,6 +499,11 @@ fn image_slices(elems: &[Elem], scale: f32) -> Result<Vec<Slice>, String> {
     if origin.iter().any(|value| !value.is_finite()) {
         return Err("CT image position is not finite".into());
     }
+    // Image Orientation is the direction of increasing column, then increasing
+    // row. The dose grid is patient +X along columns and +Y along rows, so an
+    // axial prone or feet-first image is flipped into that order here.
+    let (column_sign, row_sign) = axial_signs(elems)?;
+    let normal_sign = column_sign * row_sign;
     let bits = int_tag(elems, tag(0x0028, 0x0100)).unwrap_or(16);
     // Pixel Representation 1 stores two's-complement samples. Reading those as
     // unsigned turns a negative HU into a huge positive one.
@@ -543,18 +550,28 @@ fn image_slices(elems: &[Elem], scale: f32) -> Result<Vec<Slice>, String> {
         .unwrap_or(1.0);
     let mut slices = Vec::new();
     for frame in 0..frames {
-        let z = origin[2]
-            + offsets
-                .get(frame)
-                .copied()
-                .unwrap_or(frame as f32 * thickness);
+        let along = offsets
+            .get(frame)
+            .copied()
+            .unwrap_or(frame as f32 * thickness);
+        let mut values = stored[frame * plane..(frame + 1) * plane].to_vec();
+        let mut x = origin[0];
+        let mut y = origin[1];
+        if column_sign < 0.0 {
+            reverse_columns(&mut values, cols, rows);
+            x += (cols - 1) as f32 * column_sign * spacing[1];
+        }
+        if row_sign < 0.0 {
+            reverse_rows(&mut values, cols, rows);
+            y += (rows - 1) as f32 * row_sign * spacing[0];
+        }
         slices.push(Slice {
-            origin: [origin[0], origin[1], z],
+            origin: [x, y, origin[2] + along * normal_sign],
             spacing_x: spacing[1],
             spacing_y: spacing[0],
             cols,
             rows,
-            values: stored[frame * plane..(frame + 1) * plane].to_vec(),
+            values,
         });
     }
     Ok(slices)
@@ -585,12 +602,14 @@ fn stack(slices: &mut [Slice]) -> Result<CtVolume, String> {
     let spacing_matches = slices.iter().all(|slice| {
         (slice.spacing_x - first.spacing_x).abs() <= 0.01
             && (slice.spacing_y - first.spacing_y).abs() <= 0.01
+            && (slice.origin[0] - first.origin[0]).abs() <= 0.1
+            && (slice.origin[1] - first.origin[1]).abs() <= 0.1
     });
     if dz <= 0.0 || dz.is_nan() || !uniform {
         return Err("CT slice spacing is not uniform".into());
     }
     if !spacing_matches {
-        return Err("CT slices differ in pixel spacing".into());
+        return Err("CT slices differ in pixel spacing or in-plane origin".into());
     }
     let mut hu = vec![0.0; first.cols * first.rows * slices.len()];
     for (z, slice) in slices.iter().enumerate() {
@@ -798,10 +817,13 @@ fn read_structures(elems: &[Elem]) -> Vec<Structure> {
         let mut contour = Vec::new();
         for item in seq(roi, tag(0x3006, 0x0040)) {
             let data = floats_tag(item, tag(0x3006, 0x0050));
-            for point in data.chunks(3) {
-                if point.len() == 3 {
-                    contour.push([point[0], point[1], point[2]]);
-                }
+            let plane: Vec<[f32; 3]> = data
+                .chunks(3)
+                .filter(|point| point.len() == 3)
+                .map(|point| [point[0], point[1], point[2]])
+                .collect();
+            if !plane.is_empty() {
+                contour.push(plane);
             }
         }
         if !contour.is_empty() {
@@ -825,23 +847,77 @@ pub fn inside_structure(
         ct.origin[1] + y as f32 * ct.spacing[1],
         ct.origin[2] + z as f32 * ct.spacing[2],
     ];
-    let z0 = structure.contour[0][2];
-    if (center[2] - z0).abs() > ct.spacing[2] * 0.6 {
-        return false;
-    }
     let mut hits = 0;
-    let n = structure.contour.len();
-    for i in 0..n {
-        let a = structure.contour[i];
-        let b = structure.contour[(i + 1) % n];
-        if (a[1] > center[1]) != (b[1] > center[1]) {
-            let t = (center[1] - a[1]) / (b[1] - a[1]);
-            if a[0] + t * (b[0] - a[0]) > center[0] {
-                hits += 1;
+    let mut on_plane = false;
+    for contour in &structure.contour {
+        let Some(z0) = contour.first().map(|point| point[2]) else {
+            continue;
+        };
+        if (center[2] - z0).abs() > ct.spacing[2] * 0.6 {
+            continue;
+        }
+        on_plane = true;
+        let n = contour.len();
+        for i in 0..n {
+            let a = contour[i];
+            let b = contour[(i + 1) % n];
+            if (a[1] > center[1]) != (b[1] > center[1]) {
+                let t = (center[1] - a[1]) / (b[1] - a[1]);
+                if a[0] + t * (b[0] - a[0]) > center[0] {
+                    hits += 1;
+                }
             }
         }
     }
-    hits % 2 == 1
+    on_plane && hits % 2 == 1
+}
+
+/// Column sign, then row sign, for an axial image. Missing orientation is the
+/// identity used by files written before the tag was filled in.
+fn axial_signs(elems: &[Elem]) -> Result<(f32, f32), String> {
+    let orientation = floats_tag(elems, tag(0x0020, 0x0037));
+    if orientation.is_empty() {
+        return Ok((1.0, 1.0));
+    }
+    if orientation.len() < 6 {
+        return Err("CT orientation is not axial".into());
+    }
+    let column = unit_axis(&orientation[..3])?;
+    let row = unit_axis(&orientation[3..6])?;
+    if column.0 != 0 || row.0 != 1 {
+        return Err("CT orientation is not axial".into());
+    }
+    Ok((column.1, row.1))
+}
+
+fn unit_axis(cosine: &[f32]) -> Result<(usize, f32), String> {
+    let mut found = None;
+    for (axis, component) in cosine.iter().enumerate() {
+        if component.abs() < 1.0e-3 {
+            continue;
+        }
+        if found.is_some() || (component.abs() - 1.0).abs() > 1.0e-3 {
+            return Err("CT orientation is not axial".into());
+        }
+        found = Some((axis, component.signum()));
+    }
+    found.ok_or_else(|| "CT orientation is not axial".into())
+}
+
+fn reverse_columns(values: &mut [f32], cols: usize, rows: usize) {
+    for row in 0..rows {
+        values[row * cols..(row + 1) * cols].reverse();
+    }
+}
+
+fn reverse_rows(values: &mut [f32], cols: usize, rows: usize) {
+    for row in 0..rows / 2 {
+        let low = row * cols;
+        let high = (rows - 1 - row) * cols;
+        for col in 0..cols {
+            values.swap(low + col, high + col);
+        }
+    }
 }
 
 fn density_table() -> (Vec<f32>, Vec<f32>) {
@@ -1395,6 +1471,132 @@ mod tests {
         assert!((slices[0].values[0] + 1000.0).abs() < 1e-3);
         assert!((slices[0].spacing_x - 2.0).abs() < 1e-4);
         assert!((slices[1].origin[2] - 12.5).abs() < 1e-3);
+    }
+
+    #[test]
+    fn a_prone_image_is_stored_in_patient_axes() {
+        let mut bytes = Vec::new();
+        us(&mut bytes, 0x0028, 0x0010, 2);
+        us(&mut bytes, 0x0028, 0x0011, 2);
+        ds(&mut bytes, 0x0028, 0x0030, &[2.0, 2.0]);
+        ds(&mut bytes, 0x0020, 0x0032, &[2.0, 2.0, 0.0]);
+        ds(
+            &mut bytes,
+            0x0020,
+            0x0037,
+            &[-1.0, 0.0, 0.0, 0.0, -1.0, 0.0],
+        );
+        us(&mut bytes, 0x0028, 0x0100, 16);
+        ds(&mut bytes, 0x0028, 0x1052, &[0.0]);
+        ds(&mut bytes, 0x0028, 0x1053, &[1.0]);
+        ow(&mut bytes, 0x7FE0, 0x0010, &[10, 20, 30, 40]);
+        let slices = image_slices(&parse_dataset(&bytes).unwrap(), 1.0).unwrap();
+        assert_eq!(slices.len(), 1);
+        assert!((slices[0].origin[0]).abs() < 1e-4);
+        assert!((slices[0].origin[1]).abs() < 1e-4);
+        assert_eq!(slices[0].values, vec![40.0, 30.0, 20.0, 10.0]);
+    }
+
+    #[test]
+    fn feet_first_frame_offsets_step_toward_the_feet() {
+        let mut bytes = Vec::new();
+        us(&mut bytes, 0x0028, 0x0010, 1);
+        us(&mut bytes, 0x0028, 0x0011, 1);
+        ds(&mut bytes, 0x0028, 0x0030, &[1.0, 1.0]);
+        ds(&mut bytes, 0x0020, 0x0032, &[0.0, 0.0, 10.0]);
+        ds(&mut bytes, 0x0020, 0x0037, &[-1.0, 0.0, 0.0, 0.0, 1.0, 0.0]);
+        ds(&mut bytes, 0x3004, 0x000C, &[0.0, 2.5]);
+        us(&mut bytes, 0x0028, 0x0100, 16);
+        ow(&mut bytes, 0x7FE0, 0x0010, &[1, 2]);
+        let slices = image_slices(&parse_dataset(&bytes).unwrap(), 1.0).unwrap();
+        let mut z: Vec<f32> = slices.iter().map(|slice| slice.origin[2]).collect();
+        z.sort_by(f32::total_cmp);
+        assert!((z[0] - 7.5).abs() < 1e-3);
+        assert!((z[1] - 10.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn an_oblique_orientation_is_rejected() {
+        let mut bytes = Vec::new();
+        us(&mut bytes, 0x0028, 0x0010, 1);
+        us(&mut bytes, 0x0028, 0x0011, 1);
+        ds(&mut bytes, 0x0028, 0x0030, &[1.0, 1.0]);
+        ds(&mut bytes, 0x0020, 0x0032, &[0.0, 0.0, 0.0]);
+        ds(&mut bytes, 0x0020, 0x0037, &[1.0, 0.0, 0.0, 0.0, 0.7, 0.7]);
+        ow(&mut bytes, 0x7FE0, 0x0010, &[0]);
+        match image_slices(&parse_dataset(&bytes).unwrap(), 1.0) {
+            Err(err) => assert!(err.contains("not axial")),
+            Ok(_) => panic!("an oblique image was accepted"),
+        }
+    }
+
+    #[test]
+    fn each_contour_slice_is_tested_on_its_own_plane() {
+        let study = PatientStudy {
+            frame: String::new(),
+            ct: CtVolume {
+                frame: String::new(),
+                origin: [0.0, 0.0, 0.0],
+                spacing: [1.0, 1.0, 1.0],
+                shape: [4, 4, 2],
+                hu: vec![0.0; 32],
+                position: "HFS".into(),
+                dose_type: String::new(),
+                summation: String::new(),
+                patient_id: String::new(),
+                patient_name: String::new(),
+                study_uid: String::new(),
+                series_uid: String::new(),
+                sop_uids: Vec::new(),
+            },
+            beams: Vec::new(),
+            fractions: 1,
+            structures: Vec::new(),
+            tps: None,
+            prescription: f32::NAN,
+            plan_uid: String::new(),
+            plan_label: String::new(),
+            structures_uid: String::new(),
+        };
+        let structure = Structure {
+            name: "PTV".into(),
+            contour: vec![
+                vec![
+                    [0.0, 0.0, 0.0],
+                    [4.0, 0.0, 0.0],
+                    [4.0, 4.0, 0.0],
+                    [0.0, 4.0, 0.0],
+                ],
+                vec![
+                    [2.0, 2.0, 1.0],
+                    [4.0, 2.0, 1.0],
+                    [4.0, 4.0, 1.0],
+                    [2.0, 4.0, 1.0],
+                ],
+            ],
+        };
+        assert!(inside_structure(&study, &structure, 1, 1, 0));
+        assert!(!inside_structure(&study, &structure, 1, 1, 1));
+        assert!(inside_structure(&study, &structure, 3, 3, 1));
+        let ring = Structure {
+            name: "RING".into(),
+            contour: vec![
+                vec![
+                    [0.0, 0.0, 0.0],
+                    [4.0, 0.0, 0.0],
+                    [4.0, 4.0, 0.0],
+                    [0.0, 4.0, 0.0],
+                ],
+                vec![
+                    [1.2, 1.2, 0.0],
+                    [2.8, 1.2, 0.0],
+                    [2.8, 2.8, 0.0],
+                    [1.2, 2.8, 0.0],
+                ],
+            ],
+        };
+        assert!(inside_structure(&study, &ring, 0, 2, 0));
+        assert!(!inside_structure(&study, &ring, 2, 2, 0));
     }
 
     #[test]
