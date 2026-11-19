@@ -1387,9 +1387,10 @@ pub fn write_rtdose(
     us(&mut bytes, 0x0028, 0x0011, nx as u16);
     ds(&mut bytes, 0x0028, 0x0030, &[ct.spacing[1], ct.spacing[0]]);
     us(&mut bytes, 0x0028, 0x0100, 32);
+    // Stored counts reach ~4e9, which needs all 32 bits; High Bit is the
+    // zero-based index of the top stored bit.
     us(&mut bytes, 0x0028, 0x0101, 32);
-    // Stored counts reach ~4e9, which needs all 32 bits.
-    us(&mut bytes, 0x0028, 0x0102, 32);
+    us(&mut bytes, 0x0028, 0x0102, 31);
     us(&mut bytes, 0x0028, 0x0103, 0);
     cs(&mut bytes, 0x3004, 0x0002, "GY");
     cs(&mut bytes, 0x3004, 0x0004, dose_type);
@@ -1838,7 +1839,8 @@ mod tests {
         let written = text_tag(&elems, tag(0x0008, 0x103E));
         assert_eq!(written.chars().count(), 64);
         assert!(written.starts_with('x'));
-        assert_eq!(int_tag(&elems, tag(0x0028, 0x0102)), Some(32));
+        assert_eq!(int_tag(&elems, tag(0x0028, 0x0101)), Some(32));
+        assert_eq!(int_tag(&elems, tag(0x0028, 0x0102)), Some(31));
         let _ = fs::remove_dir_all(&dir);
     }
 
