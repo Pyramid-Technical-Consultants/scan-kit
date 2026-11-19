@@ -103,6 +103,19 @@ struct Uniforms {
 }
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
+
+fn grid_spacing() -> vec3<f32> {
+    let sx = max(u.dose5.w, 0.000001);
+    // pad holds Y and Z. A zero pad is the older cubic grid.
+    let sy = select(sx, u.pad.x, u.pad.x > 0.0);
+    let sz = select(sx, u.pad.y, u.pad.y > 0.0);
+    return vec3<f32>(sx, sy, sz);
+}
+
+fn march_step() -> f32 {
+    let s = grid_spacing();
+    return min(s.x, min(s.y, s.z));
+}
 @group(1) @binding(0) var mark_tex: texture_2d<f32>;
 @group(1) @binding(1) var mark_samp: sampler;
 @group(2) @binding(0) var dose_vol: texture_3d<f32>;
@@ -596,8 +609,7 @@ fn dose_fragment(uv: vec2<f32>, coverage: f32, plot_h: f32) -> vec4<f32> {
         vy = film.x * lattice.y - 0.5;
         vz = (1.0 - film.y) * lattice.z - 0.5;
     }
-    let voxel = max(u.dose5.w, 0.000001);
-    let p = u.dose4.xyz + (vec3<f32>(vx, vy, vz) + vec3<f32>(0.5)) * voxel;
+    let p = u.dose4.xyz + (vec3<f32>(vx, vy, vz) + vec3<f32>(0.5)) * grid_spacing();
     raw = vol_sample(p);
     if (u.dose6.w > 0.5) {
         var cx = film.x * u.dose1.x - 0.5;
@@ -630,8 +642,7 @@ fn vol_at(ix: i32, iy: i32, iz: i32) -> f32 {
 
 fn vol_hw(p: vec3<f32>) -> f32 {
     let dims = vec3<f32>(textureDimensions(dose_vol));
-    let voxel = max(u.dose5.w, 0.000001);
-    let cell = (p - u.dose4.xyz) / voxel;
+    let cell = (p - u.dose4.xyz) / grid_spacing();
     let uv = (cell + vec3<f32>(2.0)) / dims;
     return textureSampleLevel(dose_vol, dose_samp, uv, 0.0).r;
 }
@@ -653,8 +664,7 @@ fn vol_cubic(q: vec3<f32>) -> f32 {
 }
 
 fn vol_sample(p: vec3<f32>) -> f32 {
-    let voxel = max(u.dose5.w, 0.000001);
-    let q = (p - u.dose4.xyz) / voxel - 0.5;
+    let q = (p - u.dose4.xyz) / grid_spacing() - 0.5;
     let sampling = u32(u.dose3.y + 0.5);
     if (sampling == 0u) {
         // Python nearest is floor(cell). q is cell - 0.5.
@@ -687,12 +697,12 @@ fn axis_step(cell: f32, dir_mm: f32, voxel: f32, best: f32) -> f32 {
     return best;
 }
 
-fn steps_to_leave(cell: vec3<f32>, dir: vec3<f32>, voxel: f32) -> i32 {
+fn steps_to_leave(cell: vec3<f32>, dir: vec3<f32>, spacing: vec3<f32>, step: f32) -> i32 {
     var delta = 1e30;
-    delta = axis_step(cell.x, dir.x, voxel, delta);
-    delta = axis_step(cell.y, dir.y, voxel, delta);
-    delta = axis_step(cell.z, dir.z, voxel, delta);
-    let steps = ceil(delta / voxel);
+    delta = axis_step(cell.x, dir.x, spacing.x, delta);
+    delta = axis_step(cell.y, dir.y, spacing.y, delta);
+    delta = axis_step(cell.z, dir.z, spacing.z, delta);
+    let steps = ceil(delta / step);
     if (steps < 1.0 || steps > 1e8) { return 1; }
     return i32(steps);
 }
@@ -1078,9 +1088,10 @@ fn over_guides(color: vec4<f32>, cam: RayCam, origin: vec3<f32>, extent: vec3<f3
 }
 
 fn march_color(uv: vec2<f32>, plot_h: f32) -> vec4<f32> {
-    let voxel = max(u.dose5.w, 0.000001);
+    let spacing = grid_spacing();
+    let voxel = march_step();
     let dims = max(u.dose6.xyz, vec3<f32>(1.0));
-    let extent = dims * voxel;
+    let extent = dims * spacing;
     let origin = u.dose4.xyz;
     let gantry = u.dose3.w;
     var box_o = origin;
@@ -1163,10 +1174,10 @@ fn march_color(uv: vec2<f32>, plot_h: f32) -> vec4<f32> {
             q = to_lattice(p, origin, extent);
             step_dir = lattice_direction(dir);
         }
-        let cell = (q - origin) / voxel;
+        let cell = (q - origin) / spacing;
         let occupancy = brick_of(cell);
         if (occupancy <= 0.0 || (mode == 1u && occupancy <= peak)) {
-            i = i + steps_to_leave(cell, step_dir, voxel);
+            i = i + steps_to_leave(cell, step_dir, spacing, voxel);
         } else {
             let dose = vol_sample(q);
             let t_here = t0 + voxel * (f32(i) + 0.5);
@@ -1499,7 +1510,7 @@ pub(crate) const MAX_SIDE: u32 = 8192;
 struct VolumeDraw {
     group: wgpu::BindGroup,
     origin: [f32; 3],
-    voxel: f32,
+    spacing: [f32; 3],
     line_scale: f32,
     shape: [f32; 3],
 }
@@ -1769,13 +1780,14 @@ pub(crate) fn dose_parts(
     mark: scan_kit_core::VolumeMark,
     scan: Option<scan_kit_core::VolumeScan>,
 ) -> Option<DoseParts> {
+    let spacing = mark.axes();
     let mut grid = crate::dose::grid_from(
         mark.values,
         mark.ct,
         mark.labels,
         mark.shape,
         mark.origin,
-        mark.voxel,
+        spacing,
         mark.ramp,
         mark.lo,
         mark.hi,
@@ -1853,8 +1865,8 @@ impl Plot {
         let (origin, march_voxel, axis_line) = self
             .volume_draw
             .as_ref()
-            .map(|draw| (draw.origin, draw.voxel, draw.line_scale))
-            .unwrap_or((grid.volume.origin, grid.volume.voxel, grid.line_scale));
+            .map(|draw| (draw.origin, draw.spacing[0], draw.line_scale))
+            .unwrap_or((grid.volume.origin, grid.volume.spacing[0], grid.line_scale));
         let march_shape = self.volume_draw.as_ref().map(|draw| draw.shape).unwrap_or([
             grid.volume.shape[0] as f32,
             grid.volume.shape[1] as f32,
@@ -1954,7 +1966,7 @@ impl Plot {
             [
                 grid.mode as f32,
                 grid.filter as f32,
-                grid.volume.voxel,
+                grid.volume.spacing[0],
                 if plane == 3 {
                     grid.gantry
                 } else {
@@ -2299,12 +2311,7 @@ impl Plot {
         let Some(grid) = self.dose.as_ref() else {
             return;
         };
-        let voxel = grid.volume.voxel;
-        let lattice = [
-            grid.volume.shape[0] as f32 * voxel,
-            grid.volume.shape[1] as f32 * voxel,
-            grid.volume.shape[2] as f32 * voxel,
-        ];
+        let lattice = grid.volume.extent();
         let extent = scan_kit_core::gantry_extent(lattice, grid.gantry);
         let aspect = cell.plot.w / cell.plot.h.max(1.0);
         let fy = scan_kit_core::film_height(extent, aspect, self.orbit_zoom);
@@ -2497,10 +2504,10 @@ impl Plot {
                     carried_cursor(
                         previous.cursor,
                         before.volume.origin,
-                        before.volume.voxel,
+                        before.volume.spacing,
                         before.volume.shape,
                         after.volume.origin,
-                        after.volume.voxel,
+                        after.volume.spacing,
                         after.volume.shape,
                     )
                 } else {
@@ -3652,6 +3659,12 @@ impl Plot {
                 width as f32,
                 height as f32,
             );
+            let spacing = self
+                .volume_draw
+                .as_ref()
+                .map(|draw| draw.spacing)
+                .or_else(|| self.dose.as_ref().map(|grid| grid.volume.spacing))
+                .unwrap_or([1.0; 3]);
             let bytes = encode_uniform(
                 matrix,
                 width as f32,
@@ -3661,6 +3674,7 @@ impl Plot {
                     cell.plot.w / cell.plot.h.max(1.0),
                     scales[index],
                 ),
+                [spacing[1], spacing[2]],
             );
             gpu.queue
                 .write_buffer(uniform, (index * 256) as u64, &bytes);
@@ -3991,7 +4005,7 @@ impl Plot {
         let limit = gpu.device.limits().max_texture_dimension_3d.max(1);
         let grid = self.dose.as_ref().unwrap();
         let max_axis = grid.volume.shape.iter().copied().max().unwrap_or(1) as u32;
-        let (dose_tex, brick_tex, origin, voxel, line_scale, shape) = if max_axis <= limit {
+        let (dose_tex, brick_tex, origin, spacing, line_scale, shape) = if max_axis <= limit {
             let lattice = grid
                 .lattice_f16
                 .get_or_init(|| f16_lattice(&grid.volume.values, grid.volume.shape));
@@ -4001,7 +4015,7 @@ impl Plot {
                 dose_tex,
                 brick_tex,
                 grid.volume.origin,
-                grid.volume.voxel,
+                grid.volume.spacing,
                 grid.line_scale,
                 [
                     grid.volume.shape[0] as f32,
@@ -4023,7 +4037,7 @@ impl Plot {
                 dose_tex,
                 brick_tex,
                 pooled.origin,
-                pooled.voxel,
+                pooled.spacing,
                 scan.line_scale,
                 [
                     pooled.shape[0] as f32,
@@ -4045,7 +4059,7 @@ impl Plot {
         self.volume_draw = Some(VolumeDraw {
             group,
             origin,
-            voxel,
+            spacing,
             line_scale,
             shape,
         });
@@ -6099,13 +6113,7 @@ fn dose_ray(plot: &Plot, grid: &crate::dose::DoseGrid, aspect: f32) -> scan_kit_
 }
 
 fn lattice_box(volume: &scan_kit_core::Volume) -> ([f32; 3], [f32; 3]) {
-    let voxel = volume.voxel.max(1e-6);
-    let extent = [
-        volume.shape[0] as f32 * voxel,
-        volume.shape[1] as f32 * voxel,
-        volume.shape[2] as f32 * voxel,
-    ];
-    (volume.origin, extent)
+    (volume.origin, volume.extent())
 }
 
 fn edge_point(axis: usize, mark: f32, origin: [f32; 3], extent: [f32; 3]) -> [f32; 3] {
@@ -6631,14 +6639,14 @@ fn dose_plane(title: &str) -> Option<u8> {
 fn cached_depth_integral(grid: &crate::dose::DoseGrid, y: usize) -> (Vec<f32>, Vec<f32>) {
     let [_, ny, nz] = grid.volume.shape;
     let y = y.min(ny.saturating_sub(1));
-    let voxel = grid.volume.voxel;
-    let face = grid.volume.origin[2] + nz as f32 * voxel;
+    let dz = grid.volume.axis(2);
+    let face = grid.volume.origin[2] + nz as f32 * dz;
     let mut depth = Vec::with_capacity(nz);
     let mut dose = Vec::with_capacity(nz);
     for z in (0..nz).rev() {
-        depth.push(face - (grid.volume.origin[2] + (z as f32 + 0.5) * voxel));
+        depth.push(face - (grid.volume.origin[2] + (z as f32 + 0.5) * dz));
         let sum = grid.integrals[2].get(y + ny * z).copied().unwrap_or(0.0);
-        dose.push(sum * voxel);
+        dose.push(sum * grid.volume.axis(1));
     }
     (depth, dose)
 }
@@ -6651,32 +6659,36 @@ fn cached_lateral_integral(
     let [nx, _, nz] = grid.volume.shape;
     let x = x.min(nx.saturating_sub(1));
     let z = z.min(nz.saturating_sub(1));
-    let voxel = grid.volume.voxel;
-    let x0 = grid.volume.origin[0] + (x as f32 + 0.5) * voxel;
+    let dx = grid.volume.axis(0);
+    let x0 = grid.volume.origin[0] + (x as f32 + 0.5) * dx;
     let mut xs = Vec::with_capacity(nx);
     let mut dose = Vec::with_capacity(nx);
     for column in 0..nx {
-        xs.push(grid.volume.origin[0] + (column as f32 + 0.5) * voxel - x0);
+        xs.push(grid.volume.origin[0] + (column as f32 + 0.5) * dx - x0);
         let sum = grid.integrals[1]
             .get(column + nx * z)
             .copied()
             .unwrap_or(0.0);
-        dose.push(sum * voxel);
+        dose.push(sum * grid.volume.axis(2));
     }
     (xs, dose)
 }
 
 fn integral_profile_axis(grid: &crate::dose::DoseGrid, kind: u8) -> (f32, f32) {
-    let voxel = grid.volume.voxel;
     let mut lo = 0.0f32;
     let mut hi = 0.0f32;
     let mut any = false;
+    let extra = if kind == 1 {
+        grid.volume.axis(2)
+    } else {
+        grid.volume.axis(1)
+    };
     let fold = |values: &[f32], lo: &mut f32, hi: &mut f32, any: &mut bool| {
         for value in values {
             if !value.is_finite() {
                 continue;
             }
-            let shown = value * voxel;
+            let shown = value * extra;
             if *any {
                 *lo = lo.min(shown);
                 *hi = hi.max(shown);
@@ -6812,7 +6824,7 @@ fn session_volume(dose: scan_kit_core::SessionDose) -> Option<Arc<scan_kit_core:
     Some(Arc::new(scan_kit_core::Volume {
         origin: dose.origin,
         shape,
-        voxel: dose.voxel.max(1e-3),
+        spacing: [dose.voxel.max(1e-3); 3],
         values,
     }))
 }
@@ -6822,7 +6834,8 @@ fn fold_cube(volume: &scan_kit_core::Volume, kind: u8, lo: &mut f32, hi: &mut f3
     if nx == 0 || ny == 0 || nz == 0 {
         return;
     }
-    let area = volume.voxel * volume.voxel;
+    let along_x = volume.axis(1) * volume.axis(2);
+    let along_y = volume.axis(0) * volume.axis(2);
     let mut touch = |sum: f32| {
         if !sum.is_finite() {
             return;
@@ -6845,7 +6858,7 @@ fn fold_cube(volume: &scan_kit_core::Volume, kind: u8, lo: &mut f32, hi: &mut f3
                 for x in 0..nx {
                     sum += volume.get(x, y, z);
                 }
-                touch(sum * area);
+                touch(sum * along_x);
             }
         }
     }
@@ -6856,7 +6869,7 @@ fn fold_cube(volume: &scan_kit_core::Volume, kind: u8, lo: &mut f32, hi: &mut f3
                 for y in 0..ny {
                     sum += volume.get(x, y, z);
                 }
-                touch(sum * area);
+                touch(sum * along_y);
             }
         }
     }
@@ -7900,6 +7913,7 @@ fn encode_uniform(
     width: f32,
     height: f32,
     dose: [[f32; 4]; 10],
+    spacing_yz: [f32; 2],
 ) -> [u8; UNIFORM_BYTES] {
     let mut out = [0u8; UNIFORM_BYTES];
     for (index, value) in matrix.iter().enumerate() {
@@ -7907,6 +7921,8 @@ fn encode_uniform(
     }
     out[64..68].copy_from_slice(&width.to_le_bytes());
     out[68..72].copy_from_slice(&height.to_le_bytes());
+    out[72..76].copy_from_slice(&spacing_yz[0].to_le_bytes());
+    out[76..80].copy_from_slice(&spacing_yz[1].to_le_bytes());
     for (index, row) in dose.iter().enumerate() {
         for (lane, value) in row.iter().enumerate() {
             let at = 80 + (index * 4 + lane) * 4;
@@ -8485,7 +8501,7 @@ fn pool_volume(volume: &scan_kit_core::Volume, limit: u32) -> scan_kit_core::Vol
     scan_kit_core::Volume {
         origin: volume.origin,
         shape,
-        voxel: volume.voxel * factor as f32,
+        spacing: volume.spacing.map(|mm| mm * factor as f32),
         values,
     }
 }
@@ -8750,10 +8766,10 @@ fn turntable_axes(azimuth: f32, elevation: f32) -> ([f32; 3], [f32; 3]) {
 fn carried_cursor(
     previous: [usize; 3],
     from_origin: [f32; 3],
-    from_voxel: f32,
+    from_spacing: [f32; 3],
     from_shape: [usize; 3],
     to_origin: [f32; 3],
-    to_voxel: f32,
+    to_spacing: [f32; 3],
     to_shape: [usize; 3],
 ) -> [usize; 3] {
     let mut cursor = [0; 3];
@@ -8763,12 +8779,12 @@ fn carried_cursor(
             continue;
         }
         let last = next - 1;
-        if from_shape[axis] == 0 || from_voxel <= 0.0 || to_voxel <= 0.0 {
+        if from_shape[axis] == 0 || from_spacing[axis] <= 0.0 || to_spacing[axis] <= 0.0 {
             cursor[axis] = previous[axis].min(last);
             continue;
         }
-        let mm = from_origin[axis] + (previous[axis] as f32 + 0.5) * from_voxel;
-        let index = ((mm - to_origin[axis]) / to_voxel - 0.5).round();
+        let mm = from_origin[axis] + (previous[axis] as f32 + 0.5) * from_spacing[axis];
+        let index = ((mm - to_origin[axis]) / to_spacing[axis] - 0.5).round();
         cursor[axis] = index.clamp(0.0, last as f32) as usize;
     }
     cursor
@@ -8815,10 +8831,10 @@ mod tests {
         let cursor = carried_cursor(
             [4, 2, 10],
             [0.0, 0.0, -40.0],
-            2.0,
+            [2.0, 2.0, 2.0],
             [8, 4, 20],
             [0.0, 0.0, -40.0],
-            1.0,
+            [1.0, 1.0, 1.0],
             [16, 8, 40],
         );
         assert_eq!(cursor, [9, 5, 21]);
@@ -8826,10 +8842,10 @@ mod tests {
             carried_cursor(
                 [3, 1, 4],
                 [0.0, 0.0, -8.0],
-                1.0,
+                [1.0, 1.0, 1.0],
                 [8, 4, 16],
                 [0.0, 0.0, -8.0],
-                1.0,
+                [1.0, 1.0, 1.0],
                 [8, 4, 16],
             ),
             [3, 1, 4]
@@ -8838,10 +8854,10 @@ mod tests {
             carried_cursor(
                 [100, 0, 0],
                 [0.0; 3],
-                1.0,
+                [1.0, 1.0, 1.0],
                 [120, 4, 4],
                 [0.0; 3],
-                1.0,
+                [1.0, 1.0, 1.0],
                 [8, 4, 4],
             )[0],
             7
@@ -12102,7 +12118,7 @@ mod tests {
             let volume = scan_kit_core::Volume {
                 origin: [0.0, 0.0, 0.0],
                 shape: [n, n, n],
-                voxel: 1.0,
+                spacing: [1.0; 3],
                 values: values.clone(),
             };
             let start = std::time::Instant::now();
@@ -12119,7 +12135,7 @@ mod tests {
                 Vec::new(),
                 [n as u32, n as u32, n as u32],
                 [0.0, 0.0, 0.0],
-                1.0,
+                [1.0, 1.0, 1.0],
                 1,
                 0.0,
                 1.0,

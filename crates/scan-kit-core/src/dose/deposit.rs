@@ -309,7 +309,7 @@ pub fn analytic_on(
     Volume {
         origin,
         shape,
-        voxel: v,
+        spacing: [v; 3],
         values,
     }
 }
@@ -1361,9 +1361,9 @@ mod tests {
             10.0,
         );
         let (ix, iy, iz) = volume.peak_index();
-        let x = volume.origin[0] + (ix as f32 + 0.5) * volume.voxel;
-        let y = volume.origin[1] + (iy as f32 + 0.5) * volume.voxel;
-        let depth = -(volume.origin[2] + (iz as f32 + 0.5) * volume.voxel);
+        let x = volume.origin[0] + (ix as f32 + 0.5) * volume.axis(0);
+        let y = volume.origin[1] + (iy as f32 + 0.5) * volume.axis(1);
+        let depth = -(volume.origin[2] + (iz as f32 + 0.5) * volume.axis(2));
         let range = csda_range_mm(WATER, 100.0) as f32;
         assert!((x - 5.0).abs() < 1.5, "{x}");
         assert!((y + 3.0).abs() < 1.5, "{y}");
@@ -1419,7 +1419,7 @@ mod tests {
             10.0,
         );
         let (ix, iy, iz) = full.peak_index();
-        let grid = Some((full.origin, full.shape, full.voxel));
+        let grid = Some((full.origin, full.shape, full.axis(0)));
         let cross = analytic_on(
             WATER,
             &[pencil],
@@ -1711,7 +1711,7 @@ mod tests {
         let volume = Volume {
             origin: [-1.0, -1.0, -4.0],
             shape: [3, 3, 4],
-            voxel: 1.0,
+            spacing: [1.0; 3],
             values: vec![0.0; 36],
         };
         let (depth, _) = volume.depth_profile(1, 1);

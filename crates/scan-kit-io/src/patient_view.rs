@@ -236,7 +236,7 @@ pub fn transport(inputs: &PatientInputs, mc: Option<McRunner<'_>>) -> Transport 
         .unwrap_or(Volume {
             origin: inputs.study.ct.origin,
             shape: inputs.study.ct.shape,
-            voxel: inputs.study.ct.spacing[0],
+            spacing: inputs.study.ct.spacing,
             values: vec![0.0; nvox],
         });
     let let_d = ran

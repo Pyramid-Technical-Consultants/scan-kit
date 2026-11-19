@@ -284,6 +284,9 @@ pub struct VolumeMark {
     pub shape: [u32; 3],
     pub origin: [f32; 3],
     pub voxel: f32,
+    /// Millimetres along X, Y, and Z. Zero keeps a cube of `voxel`.
+    #[serde(default)]
+    pub spacing: [f32; 3],
     #[serde(default)]
     pub ramp: u8,
     #[serde(default)]
@@ -341,6 +344,18 @@ pub struct VolumeMark {
     /// the 2D gamma of the summed doses here.
     #[serde(default)]
     pub integrals: Vec<Vec<f32>>,
+}
+
+impl VolumeMark {
+    /// Voxel size along X, Y, and Z. A missing spacing is the old cubic grid.
+    pub fn axes(&self) -> [f32; 3] {
+        if self.spacing.iter().all(|mm| *mm > 0.0) {
+            self.spacing
+        } else {
+            let step = self.voxel.max(1e-3);
+            [step, step, step]
+        }
+    }
 }
 
 /// One session cube for the dose line plots. Empty `values` means the main cube.

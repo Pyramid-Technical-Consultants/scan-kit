@@ -80,7 +80,6 @@ struct Launch {
     density: Vec<f32>,
     beams: Vec<f32>,
     origin_mm: [f32; 3],
-    voxel_mm: f32,
 }
 
 /// GPU identity for dose provenance — `scan_kit.gpu.adapter_info`.
@@ -229,7 +228,7 @@ struct Live {
     scale: f32,
     shape: [usize; 3],
     origin: [f32; 3],
-    voxel: f32,
+    spacing: [f32; 3],
     inflight: bool,
     finished: bool,
     previews: u32,
@@ -306,7 +305,6 @@ fn slab_launch(request: &SlabRequest) -> Result<Launch, ComputeError> {
         density: vec![0.0],
         beams: vec![0.0; 16],
         origin_mm: request.origin,
-        voxel_mm: voxel,
     })
 }
 
@@ -368,7 +366,6 @@ fn patient_launch(request: &PatientRequest) -> Result<Launch, ComputeError> {
             request.beams.clone()
         },
         origin_mm: request.origin_mm,
-        voxel_mm: request.spacing_mm[0].max(0.25),
     })
 }
 
@@ -379,7 +376,7 @@ fn empty_result(launch: &Launch) -> McResult {
         volume: Volume {
             origin: launch.origin_mm,
             shape: [nx.max(1), ny.max(1), nz.max(1)],
-            voxel: launch.voxel_mm,
+            spacing: launch.spacing_cm.map(|cm| cm * 10.0),
             values: vec![0.0; nvox],
         },
         uncertainty: 0.0,
@@ -541,7 +538,7 @@ async fn prepare(launch: Launch) -> Result<Live, ComputeError> {
         scale,
         shape: [nx, ny, nz],
         origin: launch.origin_mm,
-        voxel: launch.voxel_mm,
+        spacing: launch.spacing_cm.map(|cm| cm * 10.0),
         inflight: false,
         finished: false,
         previews: 0,
@@ -752,7 +749,7 @@ impl Live {
             volume: Volume {
                 origin: self.origin,
                 shape: self.shape,
-                voxel: self.voxel,
+                spacing: self.spacing,
                 values: dose,
             },
             uncertainty: uncertainty(&dose_sum, &dose_sq, histories / self.per_batch.max(1)),
@@ -1199,7 +1196,7 @@ mod tests {
                         peak_z = z;
                     }
                 }
-                let depth = -volume.origin[2] - (peak_z as f32 + 0.5) * volume.voxel;
+                let depth = -volume.origin[2] - (peak_z as f32 + 0.5) * volume.axis(2);
                 assert!(peak > 0.0, "no dose");
                 assert!(
                     (30.0..50.0).contains(&depth),
@@ -1262,7 +1259,7 @@ mod tests {
                     .max_by(|a, b| a.1.total_cmp(&b.1))
                     .unwrap();
                 let from_iso =
-                    result.volume.origin[1] + (peak_y as f32 + 0.5) * result.volume.voxel;
+                    result.volume.origin[1] + (peak_y as f32 + 0.5) * result.volume.axis(1);
                 assert!(peak > 0.0, "no dose");
                 assert!(
                     (40.0..110.0).contains(&from_iso),

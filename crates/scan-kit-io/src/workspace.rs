@@ -139,7 +139,8 @@ pub(crate) fn assemble(space: Workspace) -> (Vec<Panel>, VolumeMark) {
         },
         shape: [nx as u32, ny as u32, nz as u32],
         origin: space.dose.origin,
-        voxel: space.dose.voxel,
+        voxel: space.dose.spacing[0],
+        spacing: space.dose.spacing,
         ramp: space.ramp,
         lo: space.lo,
         hi: space.hi,
@@ -179,9 +180,9 @@ fn image_panel(space: &Workspace, cell: CellView) -> Panel {
             1,
             1,
             volume.origin[0],
-            volume.origin[0] + nx as f32 * volume.voxel,
+            volume.origin[0] + nx as f32 * volume.axis(0),
             volume.origin[2],
-            volume.origin[2] + nz as f32 * volume.voxel,
+            volume.origin[2] + nz as f32 * volume.axis(2),
         ),
         CellView::Sagittal => (
             "Sagittal",
@@ -189,9 +190,9 @@ fn image_panel(space: &Workspace, cell: CellView) -> Panel {
             1,
             1,
             volume.origin[1],
-            volume.origin[1] + ny as f32 * volume.voxel,
+            volume.origin[1] + ny as f32 * volume.axis(1),
             volume.origin[2],
-            volume.origin[2] + nz as f32 * volume.voxel,
+            volume.origin[2] + nz as f32 * volume.axis(2),
         ),
         CellView::Volume => (
             "3D",
@@ -199,9 +200,9 @@ fn image_panel(space: &Workspace, cell: CellView) -> Panel {
             1,
             1,
             volume.origin[0],
-            volume.origin[0] + nx as f32 * volume.voxel,
+            volume.origin[0] + nx as f32 * volume.axis(0),
             volume.origin[1],
-            volume.origin[1] + ny as f32 * volume.voxel,
+            volume.origin[1] + ny as f32 * volume.axis(1),
         ),
         CellView::Axial => (
             "Axial",
@@ -209,9 +210,9 @@ fn image_panel(space: &Workspace, cell: CellView) -> Panel {
             1,
             1,
             volume.origin[0],
-            volume.origin[0] + nx as f32 * volume.voxel,
+            volume.origin[0] + nx as f32 * volume.axis(0),
             volume.origin[1],
-            volume.origin[1] + ny as f32 * volume.voxel,
+            volume.origin[1] + ny as f32 * volume.axis(1),
         ),
     };
     let series = vec![Series::Heatmap {
@@ -421,15 +422,14 @@ pub(crate) fn field_extent(volume: &Volume, fraction: f32, per_slice: bool) -> O
     if x1 <= x0 || y1 <= y0 || z1 <= z0 {
         return None;
     }
-    let voxel = volume.voxel;
     let origin = volume.origin;
     Some([
-        origin[0] + x0 as f32 * voxel,
-        origin[0] + x1 as f32 * voxel,
-        origin[1] + y0 as f32 * voxel,
-        origin[1] + y1 as f32 * voxel,
-        origin[2] + z0 as f32 * voxel,
-        origin[2] + z1 as f32 * voxel,
+        origin[0] + x0 as f32 * volume.axis(0),
+        origin[0] + x1 as f32 * volume.axis(0),
+        origin[1] + y0 as f32 * volume.axis(1),
+        origin[1] + y1 as f32 * volume.axis(1),
+        origin[2] + z0 as f32 * volume.axis(2),
+        origin[2] + z1 as f32 * volume.axis(2),
     ])
 }
 
@@ -691,13 +691,13 @@ mod tests {
         let low = Volume {
             origin: [0.0; 3],
             shape: [1, 1, 2],
-            voxel: 1.0,
+            spacing: [1.0; 3],
             values: vec![1.0, 3.0],
         };
         let high = Volume {
             origin: [0.0; 3],
             shape: [1, 1, 2],
-            voxel: 1.0,
+            spacing: [1.0; 3],
             values: vec![2.0, 8.0],
         };
         let mut panel = Panel {
@@ -722,13 +722,13 @@ mod tests {
         let measured = Volume {
             origin: [0.0; 3],
             shape: [1, 1, 2],
-            voxel: 1.0,
+            spacing: [1.0; 3],
             values: vec![1.0, 3.0],
         };
         let plan = Volume {
             origin: [0.0; 3],
             shape: [1, 1, 2],
-            voxel: 1.0,
+            spacing: [1.0; 3],
             values: vec![1.0, 9.0],
         };
         let mut panel = Panel {
@@ -765,7 +765,7 @@ mod tests {
         let volume = Volume {
             origin: [0.0, 0.0, -4.0],
             shape: [2, 2, 2],
-            voxel: 1.0,
+            spacing: [1.0; 3],
             values: vec![0.0, 1.0, 0.2, 0.4, 0.1, 0.3, 0.5, 2.0],
         };
         let gamma = Volume {
@@ -855,7 +855,7 @@ mod tests {
         let volume = Volume {
             origin: [0.0, 0.0, 0.0],
             shape: [5, 1, 2],
-            voxel: 1.0,
+            spacing: [1.0; 3],
             values,
         };
         let slice = field_extent(&volume, 0.5, true).unwrap();

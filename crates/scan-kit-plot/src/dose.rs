@@ -106,7 +106,7 @@ pub fn grid_from(
     labels: Vec<u8>,
     shape: [u32; 3],
     origin: [f32; 3],
-    voxel: f32,
+    spacing: [f32; 3],
     ramp: u8,
     lo: f32,
     hi: f32,
@@ -126,7 +126,7 @@ pub fn grid_from(
     let volume = Volume {
         origin,
         shape: shape_us,
-        voxel: voxel.max(1e-3),
+        spacing: spacing.map(|mm| mm.max(1e-3)),
         values,
     };
     let scan = match scan {
@@ -513,7 +513,7 @@ pub fn outlines(grid: &DoseGrid, plane: u8, index: usize) -> Vec<(u8, [f32; 2], 
     };
     let mut lines = Vec::new();
     let origin = grid.volume.origin;
-    let voxel = grid.volume.voxel;
+    let (across, up_step) = plane_steps(plane, grid.volume.spacing);
     for row in 0..rows {
         for col in 0..cols {
             let id = grid.labels.get(label_at(col, row)).copied().unwrap_or(0);
@@ -536,32 +536,38 @@ pub fn outlines(grid: &DoseGrid, plane: u8, index: usize) -> Vec<(u8, [f32; 2], 
             } else {
                 0
             };
-            let (x0, y0) = plane_mm(plane, origin, voxel, col, row);
+            let (x0, y0) = plane_mm(plane, origin, across, up_step, col, row);
             if right != id && lines.len() < 4000 {
-                lines.push((id, [x0 + voxel, y0], [x0 + voxel, y0 + voxel]));
+                lines.push((id, [x0 + across, y0], [x0 + across, y0 + up_step]));
             }
             if up != id && lines.len() < 4000 {
-                lines.push((id, [x0, y0 + voxel], [x0 + voxel, y0 + voxel]));
+                lines.push((id, [x0, y0 + up_step], [x0 + across, y0 + up_step]));
             }
         }
     }
     lines
 }
 
-fn plane_mm(plane: u8, origin: [f32; 3], voxel: f32, col: usize, row: usize) -> (f32, f32) {
+fn plane_steps(plane: u8, spacing: [f32; 3]) -> (f32, f32) {
     match plane {
-        1 => (
-            origin[0] + col as f32 * voxel,
-            origin[2] + row as f32 * voxel,
-        ),
-        2 => (
-            origin[1] + col as f32 * voxel,
-            origin[2] + row as f32 * voxel,
-        ),
-        _ => (
-            origin[0] + col as f32 * voxel,
-            origin[1] + row as f32 * voxel,
-        ),
+        1 => (spacing[0], spacing[2]),
+        2 => (spacing[1], spacing[2]),
+        _ => (spacing[0], spacing[1]),
+    }
+}
+
+fn plane_mm(
+    plane: u8,
+    origin: [f32; 3],
+    across: f32,
+    up: f32,
+    col: usize,
+    row: usize,
+) -> (f32, f32) {
+    match plane {
+        1 => (origin[0] + col as f32 * across, origin[2] + row as f32 * up),
+        2 => (origin[1] + col as f32 * across, origin[2] + row as f32 * up),
+        _ => (origin[0] + col as f32 * across, origin[1] + row as f32 * up),
     }
 }
 
@@ -803,7 +809,7 @@ mod tests {
             Vec::new(),
             [2, 1, 2],
             [0.0, 0.0, 0.0],
-            1.0,
+            [1.0, 1.0, 1.0],
             0,
             0.0,
             2.0,
@@ -831,7 +837,7 @@ mod tests {
             Vec::new(),
             [2, 1, 1],
             [0.0, 0.0, 0.0],
-            1.0,
+            [1.0, 1.0, 1.0],
             0,
             -2.0,
             2.0,
@@ -877,7 +883,7 @@ mod tests {
             Vec::new(),
             [2, 1, 1],
             [0.0, 0.0, 0.0],
-            1.0,
+            [1.0, 1.0, 1.0],
             1,
             0.0,
             10.0,
@@ -937,7 +943,7 @@ mod tests {
             Vec::new(),
             [3, 1, 1],
             [0.0, 0.0, 0.0],
-            1.0,
+            [1.0, 1.0, 1.0],
             1,
             -4.0,
             4.0,

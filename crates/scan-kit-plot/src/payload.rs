@@ -58,6 +58,9 @@ pub struct PlotHeader {
     volume_origin: [f32; 3],
     #[serde(default)]
     volume_voxel: f32,
+    /// X, Y, Z millimetres. Zero keeps the cube described by `volume_voxel`.
+    #[serde(default)]
+    volume_spacing: [f32; 3],
     #[serde(default)]
     volume_ramp: u8,
     #[serde(default)]
@@ -163,6 +166,7 @@ pub fn encode_plot_reusing(
         volume_shape: scene.volume.shape,
         volume_origin: scene.volume.origin,
         volume_voxel: scene.volume.voxel,
+        volume_spacing: scene.volume.spacing,
         volume_ramp: scene.volume.ramp,
         volume_lo: scene.volume.lo,
         volume_hi: scene.volume.hi,
@@ -220,11 +224,8 @@ pub fn encode_plot_reusing(
             scene.volume.shape[2] as usize,
         ];
         // The view would otherwise scan this cube again on the UI thread.
-        let mut scan = scan_kit_core::scan_grid(
-            &scene.volume.values[..voxels],
-            shape,
-            scene.volume.voxel.max(1e-3),
-        );
+        let mut scan =
+            scan_kit_core::scan_spacing(&scene.volume.values[..voxels], shape, scene.volume.axes());
         let given = &scene.volume.integrals;
         if given.len() == 3
             && given
@@ -526,6 +527,7 @@ pub(crate) fn decode_plot(
         shape: header.volume_shape,
         origin: header.volume_origin,
         voxel: header.volume_voxel,
+        spacing: header.volume_spacing,
         ramp: header.volume_ramp,
         lo: header.volume_lo,
         hi: header.volume_hi,
