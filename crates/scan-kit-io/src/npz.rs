@@ -261,10 +261,11 @@ fn parse_npy(bytes: &[u8]) -> Result<Npy, String> {
     let (header_len, header_at) = if bytes[6] == 1 {
         (u16::from_le_bytes([bytes[8], bytes[9]]) as usize, 10)
     } else {
-        (
-            u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]) as usize,
-            12,
-        )
+        let header_len = bytes
+            .get(8..12)
+            .map(|raw| u32::from_le_bytes(raw.try_into().unwrap()))
+            .ok_or("npy header")?;
+        (header_len as usize, 12)
     };
     let header = std::str::from_utf8(
         bytes
@@ -453,6 +454,16 @@ mod tests {
         };
         // n * size wraps past the short-data check — must not reach the reads.
         assert!(npy.f64s().is_err());
+    }
+
+    #[test]
+    fn a_truncated_v2_header_errors_instead_of_panicking() {
+        // 10 and 11 bytes reach the v2 u32 header-length read short.
+        for len in [10usize, 11] {
+            let mut bytes = b"\x93NUMPY\x02\x00".to_vec();
+            bytes.extend_from_slice(&[0, 0, 0, 0, 0][..len - 8]);
+            assert!(parse_npy(&bytes).is_err(), "len {len}");
+        }
     }
 
     /// What `np.savez_compressed` wrote, `load_npz` must read back.
