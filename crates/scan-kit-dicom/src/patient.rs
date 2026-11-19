@@ -737,7 +737,9 @@ fn read_plan(elems: &[Elem], frame: String) -> Result<Plan, String> {
                     in_shifters.retain(|(id, _, _)| *id != shifter_number);
                 }
             }
-            let n = int_tag(cp, tag(0x300A, 0x0392)).unwrap_or(0) as usize;
+            // A negative or huge count must not hang the load; spots past the
+            // position pairs have no x/y and would pile up at the origin.
+            let n = int_tag(cp, tag(0x300A, 0x0392)).unwrap_or(0).max(0) as usize;
             let xy = floats_tag(cp, tag(0x300A, 0x0394));
             let weights = floats_tag(cp, tag(0x300A, 0x0396));
             let spot_size_mm = scanning_spot_mm(cp);
@@ -761,7 +763,7 @@ fn read_plan(elems: &[Elem], frame: String) -> Result<Plan, String> {
                 ),
                 None => (String::new(), 0.0, f32::NAN),
             };
-            for i in 0..n {
+            for i in 0..n.min(xy.len() / 2) {
                 let mu = weights.get(i).copied().unwrap_or(0.0) * meterset / final_weight;
                 if mu > 0.0 {
                     spots.push(Spot {
@@ -1356,13 +1358,12 @@ pub fn write_rtdose(
     push_elem(&mut bytes, 0x0008, 0x0033, b"TM", &even(&time));
     cs(&mut bytes, 0x0008, 0x0060, "RTDOSE");
     lo(&mut bytes, 0x0008, 0x0070, "Pyramid Technical Consultants");
-    let series_description = format!("{description} (research only)");
-    lo(
-        &mut bytes,
-        0x0008,
-        0x103E,
-        &series_description[..series_description.len().min(64)],
-    );
+    // LO holds 64 characters; a byte slice would panic inside a multi-byte char.
+    let series_description: String = format!("{description} (research only)")
+        .chars()
+        .take(64)
+        .collect();
+    lo(&mut bytes, 0x0008, 0x103E, &series_description);
     pn(&mut bytes, 0x0010, 0x0010, &ct.patient_name);
     lo(&mut bytes, 0x0010, 0x0020, &ct.patient_id);
     ds(&mut bytes, 0x0018, 0x0050, &[ct.spacing[2]]);
@@ -1387,7 +1388,8 @@ pub fn write_rtdose(
     ds(&mut bytes, 0x0028, 0x0030, &[ct.spacing[1], ct.spacing[0]]);
     us(&mut bytes, 0x0028, 0x0100, 32);
     us(&mut bytes, 0x0028, 0x0101, 32);
-    us(&mut bytes, 0x0028, 0x0102, 31);
+    // Stored counts reach ~4e9, which needs all 32 bits.
+    us(&mut bytes, 0x0028, 0x0102, 32);
     us(&mut bytes, 0x0028, 0x0103, 0);
     cs(&mut bytes, 0x3004, 0x0002, "GY");
     cs(&mut bytes, 0x3004, 0x0004, dose_type);
@@ -1799,6 +1801,48 @@ mod tests {
     }
 
     #[test]
+    fn rtdose_keeps_a_non_ascii_description_and_declares_32_stored_bits() {
+        let dir = std::env::temp_dir().join(format!("scan-kit-rtdose-desc-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let ct = CtVolume {
+            frame: "f".into(),
+            origin: [0.0; 3],
+            spacing: [1.0; 3],
+            shape: [1, 1, 1],
+            hu: Vec::new(),
+            position: "HFS".into(),
+            dose_type: String::new(),
+            summation: String::new(),
+            patient_id: String::new(),
+            patient_name: String::new(),
+            study_uid: String::new(),
+            series_uid: String::new(),
+            sop_uids: Vec::new(),
+        };
+        // "x" + 60 é's is 77 characters and puts a two-byte char across the
+        // old 64-byte cut.
+        let description = format!("x{}", "é".repeat(60));
+        let path = write_rtdose(
+            &dir.join("dose.dcm"),
+            &[0.5],
+            &ct,
+            "",
+            "PLAN",
+            "PHYSICAL",
+            &description,
+            "",
+        )
+        .unwrap();
+        let elems = parse_dataset(&fs::read(&path).unwrap()[132..]).unwrap();
+        let written = text_tag(&elems, tag(0x0008, 0x103E));
+        assert_eq!(written.chars().count(), 64);
+        assert!(written.starts_with('x'));
+        assert_eq!(int_tag(&elems, tag(0x0028, 0x0102)), Some(32));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn rtdose_rejects_a_wrong_sized_dose() {
         let ct = CtVolume {
             frame: "f".into(),
@@ -1867,6 +1911,52 @@ mod tests {
         is(&mut beam, 0x300A, 0x00C0, 1);
         ds(&mut beam, 0x300A, 0x010E, &[1.0]);
         sq(&mut beam, 0x300A, 0x0314, &shifters);
+        sq(&mut beam, 0x300A, 0x03A8, &[cp]);
+        let mut plan = Vec::new();
+        sq(&mut plan, 0x300A, 0x0070, &[group]);
+        sq(&mut plan, 0x300A, 0x03A2, &[beam]);
+        parse_dataset(&plan).unwrap()
+    }
+
+    #[test]
+    fn a_short_position_list_does_not_invent_spots_at_the_origin() {
+        let plan = read_plan(&plan_with_spot_count(3, 2), "f".into()).unwrap();
+        let spots = &plan.beams[0].spots;
+        assert_eq!(spots.len(), 2);
+        assert!((spots[0].x - 1.0).abs() < 1e-4);
+        assert!((spots[1].x - 2.0).abs() < 1e-4);
+        // A negative count parses as zero spots instead of hanging the load.
+        let plan = read_plan(&plan_with_spot_count(-4, 2), "f".into()).unwrap();
+        assert!(plan.beams[0].spots.is_empty());
+    }
+
+    fn plan_with_spot_count(declared: i32, pairs: usize) -> Vec<Elem> {
+        let mut ref_beam = Vec::new();
+        is(&mut ref_beam, 0x300A, 0x00C0, 1);
+        ds(&mut ref_beam, 0x300A, 0x0086, &[10.0]);
+        let mut group = Vec::new();
+        is(&mut group, 0x300A, 0x0078, 1);
+        sq(&mut group, 0x300C, 0x0004, &[ref_beam]);
+        let mut cp = Vec::new();
+        ds(&mut cp, 0x300A, 0x0114, &[100.0]);
+        ds(&mut cp, 0x300A, 0x011E, &[0.0]);
+        ds(&mut cp, 0x300A, 0x0122, &[0.0]);
+        ds(&mut cp, 0x300A, 0x012C, &[0.0, 0.0, 0.0]);
+        is(&mut cp, 0x300A, 0x0392, declared);
+        let xy: Vec<f32> = (0..pairs)
+            .flat_map(|i| [(i + 1) as f32, -((i + 1) as f32)])
+            .collect();
+        ds(&mut cp, 0x300A, 0x0394, &xy);
+        ds(
+            &mut cp,
+            0x300A,
+            0x0396,
+            &vec![1.0; declared.max(0) as usize],
+        );
+        let mut beam = Vec::new();
+        is(&mut beam, 0x300A, 0x00C0, 1);
+        ds(&mut beam, 0x300A, 0x010E, &[1.0]);
+        is(&mut beam, 0x300C, 0x006A, 1);
         sq(&mut beam, 0x300A, 0x03A8, &[cp]);
         let mut plan = Vec::new();
         sq(&mut plan, 0x300A, 0x0070, &[group]);
