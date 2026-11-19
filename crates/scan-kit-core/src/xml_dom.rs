@@ -138,6 +138,33 @@ impl Parser<'_> {
         self.bytes.get(self.index).copied()
     }
 
+    /// `first` is already consumed. Bytes at or above 0x80 are a UTF-8 sequence,
+    /// not a Latin-1 character. Casting each byte to `char` corrupts the text.
+    fn push_utf8(&mut self, first: u8, out: &mut String) -> Result<(), String> {
+        if first < 0x80 {
+            out.push(first as char);
+            return Ok(());
+        }
+        let width = match first {
+            0xC2..=0xDF => 2,
+            0xE0..=0xEF => 3,
+            0xF0..=0xF4 => 4,
+            _ => return Err("invalid UTF-8 in XML".into()),
+        };
+        let mut buf = [0u8; 4];
+        buf[0] = first;
+        for slot in 1..width {
+            let next = self.bump()?;
+            if !(0x80..0xC0).contains(&next) {
+                return Err("invalid UTF-8 in XML".into());
+            }
+            buf[slot] = next;
+        }
+        let text = std::str::from_utf8(&buf[..width]).map_err(|_| "invalid UTF-8 in XML")?;
+        out.push_str(text);
+        Ok(())
+    }
+
     fn bump(&mut self) -> Result<u8, String> {
         let byte = self
             .peek()
@@ -317,7 +344,7 @@ impl Parser<'_> {
                 out.push(self.entity()?);
                 continue;
             }
-            out.push(byte as char);
+            self.push_utf8(byte, &mut out)?;
         }
     }
 
@@ -331,7 +358,7 @@ impl Parser<'_> {
             if byte == b'&' {
                 out.push(self.entity()?);
             } else {
-                out.push(byte as char);
+                self.push_utf8(byte, &mut out)?;
             }
         }
         Ok(out)
@@ -389,6 +416,17 @@ mod tests {
         let again = parse_xml(&write_xml(&root)).unwrap();
         assert_eq!(again.attr("b"), Some("&"));
         assert_eq!(again.children[0].attr("c"), Some("x"));
+    }
+
+    #[test]
+    fn non_ascii_text_and_attributes_round_trip() {
+        let xml = "<device name=\"café\">µSv</device>";
+        let root = parse_xml(xml).unwrap();
+        assert_eq!(root.attr("name"), Some("café"));
+        assert_eq!(root.text.trim(), "µSv");
+        let again = parse_xml(&write_xml(&root)).unwrap();
+        assert_eq!(again.attr("name"), Some("café"));
+        assert_eq!(again.text.trim(), "µSv");
     }
 
     #[test]

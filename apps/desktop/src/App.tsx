@@ -67,6 +67,7 @@ import {
   type Sort,
   type SortKey,
 } from "@/LibraryTable";
+import { withoutEdit } from "@/note-history";
 import {
   Menubar,
   MenubarCheckboxItem,
@@ -921,7 +922,7 @@ export default function App() {
     noteBusy.current = true;
     void applyNote(edit, edit.before)
       .then(() => {
-        setUndo((stack) => stack.slice(0, -1));
+        setUndo((stack) => withoutEdit(stack, edit));
         setRedo((stack) => [...stack, edit]);
       })
       .catch((error: unknown) => notifyError(error))
@@ -938,7 +939,7 @@ export default function App() {
     noteBusy.current = true;
     void applyNote(edit, edit.after)
       .then(() => {
-        setRedo((stack) => stack.slice(0, -1));
+        setRedo((stack) => withoutEdit(stack, edit));
         setUndo((stack) => [...stack, edit]);
       })
       .catch((error: unknown) => notifyError(error))
