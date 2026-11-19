@@ -439,6 +439,8 @@ cargo test --workspace --exclude scan-kit-desktop --locked
 cd apps/desktop && npm test
 ```
 
+While editing one crate, `cargo test -p <package> --locked` is the loop. The workspace command is what CI runs, and it is the check before a pull request.
+
 The Rust workspace tests cover the domain logic, session parsing, store, MC engine, DICOM chain, and PDF report. The desktop frontend tests (vitest) cover the views and invoke plumbing.
 
 App preferences (window geometry, last data directory, plot settings, session notes) persist in `~/.scan-kit/scan-kit.sqlite`.
