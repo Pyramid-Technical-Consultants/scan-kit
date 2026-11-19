@@ -103,24 +103,22 @@ pub fn write_phantom_study(dir: &Path, params: &Value) -> Result<String, String>
     let study = uid();
     let frame = uid();
     let ct_series = uid();
-    let flip = if request.position.to_ascii_uppercase().ends_with('P') {
-        -1.0
-    } else {
-        1.0
-    };
+    // Stored order follows the axial Image Orientation for this position.
+    // The reader turns that back into patient +X columns and +Y rows.
+    let (column_sign, row_sign) = image_signs(&request.position);
     let dx = request.pixel;
     let dy = request.pixel;
     let dz = request.slice;
-    let x0 = -flip * (request.nx as f64 - 1.0) * dx / 2.0;
-    let y0 = -flip * (request.ny as f64 - 1.0) * dy / 2.0;
+    let x0 = -column_sign * (request.nx as f64 - 1.0) * dx / 2.0;
+    let y0 = -row_sign * (request.ny as f64 - 1.0) * dy / 2.0;
     let inserts = inserts(&request.phantom);
     for k in 0..request.nz {
         let z = (k as f64 - (request.nz as f64 - 1.0) / 2.0) * dz;
         let mut pixels = Vec::with_capacity(request.nx * request.ny);
         for row in 0..request.ny {
-            let y = y0 + flip * row as f64 * dy;
+            let y = y0 + row_sign * row as f64 * dy;
             for col in 0..request.nx {
-                let x = x0 + flip * col as f64 * dx;
+                let x = x0 + column_sign * col as f64 * dx;
                 pixels.push(stored_hu(hu_at(x, y, z, &inserts)));
             }
         }
@@ -146,7 +144,7 @@ pub fn write_phantom_study(dir: &Path, params: &Value) -> Result<String, String>
             &mut bytes,
             0x0020,
             0x0037,
-            &[flip as f32, 0.0, 0.0, 0.0, flip as f32, 0.0],
+            &[column_sign as f32, 0.0, 0.0, 0.0, row_sign as f32, 0.0],
         );
         patient::ui(&mut bytes, 0x0020, 0x0052, &frame);
         patient::us(&mut bytes, 0x0028, 0x0002, 1);
@@ -430,6 +428,16 @@ fn write_plan(dir: &Path, request: &Request, study: &str, frame: &str) -> Result
     };
     patient::sq(&mut bytes, 0x300A, 0x03A2, &[beam]);
     fs::write(dir.join("RP_synthetic.dcm"), bytes).map_err(|err| err.to_string())
+}
+
+/// Column sign, then row sign, for the four axial patient positions.
+fn image_signs(position: &str) -> (f64, f64) {
+    match position.to_ascii_uppercase().as_str() {
+        "HFP" => (-1.0, -1.0),
+        "FFS" => (-1.0, 1.0),
+        "FFP" => (1.0, -1.0),
+        _ => (1.0, 1.0),
+    }
 }
 
 fn slices_where(
@@ -746,6 +754,45 @@ mod tests {
         assert!((study.beams[0].gantry - 90.0).abs() < 0.01);
         assert_eq!(study.beams[0].spots[0].shifter, "RS1");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prone_and_feet_first_inserts_stay_at_their_patient_coordinates() {
+        for position in ["HFP", "FFS"] {
+            let dir = std::env::temp_dir().join(format!(
+                "scan-kit-phantom-{position}-{}",
+                std::process::id()
+            ));
+            let _ = fs::remove_dir_all(&dir);
+            write_phantom_study(
+                &dir,
+                &json!({
+                    "phantom": "slabs",
+                    "position": position,
+                    "pixel": 10.0,
+                    "slice": 10.0,
+                    "energies": [120.0]
+                }),
+            )
+            .unwrap();
+            let study = load_study(&dir).unwrap();
+            assert!(
+                (hu_at_mm(&study.ct, 5.0, -15.0, -5.0) - 700.0).abs() < 1.0,
+                "{position} bone"
+            );
+            assert!(
+                (hu_at_mm(&study.ct, 5.0, 5.0, -5.0) + 750.0).abs() < 1.0,
+                "{position} lung"
+            );
+            let _ = fs::remove_dir_all(&dir);
+        }
+    }
+
+    fn hu_at_mm(ct: &crate::patient::CtVolume, x: f32, y: f32, z: f32) -> f32 {
+        let ix = ((x - ct.origin[0]) / ct.spacing[0]).round() as usize;
+        let iy = ((y - ct.origin[1]) / ct.spacing[1]).round() as usize;
+        let iz = ((z - ct.origin[2]) / ct.spacing[2]).round() as usize;
+        ct.hu[ix + ct.shape[0] * (iy + ct.shape[1] * iz)]
     }
 
     #[test]
