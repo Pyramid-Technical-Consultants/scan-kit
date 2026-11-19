@@ -660,9 +660,17 @@ fn visit_files(
     children.sort_by_key(|entry| entry.file_name());
     for child in children {
         let path = child.path();
-        if path.is_dir() {
+        // `is_dir`/`is_file` follow links; the library walk does not. A session
+        // symlink must not pull timeslice files in from outside the session.
+        let Ok(kind) = child.file_type() else {
+            continue;
+        };
+        if kind.is_symlink() {
+            continue;
+        }
+        if kind.is_dir() {
             visit_files(root, &path, depth + 1, want, visit);
-        } else if path.is_file() {
+        } else if kind.is_file() {
             let name = path
                 .strip_prefix(root)
                 .unwrap_or(&path)
@@ -896,5 +904,48 @@ mod tests {
         assert_eq!(archive_kind(".zip"), None);
         assert_eq!(archive_kind("..tar.bz2"), None);
         assert_eq!(archive_kind("logs.zip"), Some(("logs".to_owned(), "zip")));
+    }
+
+    #[test]
+    fn a_session_walk_does_not_follow_symlinked_dirs() {
+        let root = std::env::temp_dir().join(format!(
+            "scan-kit-symlink-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let session = root.join("sess");
+        let outside = root.join("outside");
+        fs::create_dir_all(session.join("layer-0")).unwrap();
+        fs::create_dir_all(outside.join("layer-9")).unwrap();
+        fs::write(
+            session.join("layer-0/timeslice_data_device_units.csv"),
+            b"a\n",
+        )
+        .unwrap();
+        fs::write(
+            outside.join("layer-9/timeslice_data_device_units.csv"),
+            b"b\n",
+        )
+        .unwrap();
+        // Symlink creation needs extra privilege on Windows; skip when refused.
+        #[cfg(unix)]
+        let linked = std::os::unix::fs::symlink(&outside, session.join("linked"));
+        #[cfg(windows)]
+        let linked = std::os::windows::fs::symlink_dir(&outside, session.join("linked"));
+        #[cfg(not(any(unix, windows)))]
+        let linked: std::io::Result<()> = Ok(());
+        let Ok(()) = linked else {
+            let _ = fs::remove_dir_all(&root);
+            return;
+        };
+
+        let frames = read_timeslice_frames(&session);
+        assert_eq!(frames.len(), 1, "{frames:?}");
+        assert_eq!(frames[0].0, 0);
+        let _ = fs::remove_dir_all(&root);
     }
 }
