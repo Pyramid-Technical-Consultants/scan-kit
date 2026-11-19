@@ -102,12 +102,13 @@ pub fn median_unstable(values: &mut [f32]) -> f32 {
     }
 }
 
-/// Linear blend of the floor and ceil ranks. An empty slice returns NaN.
+/// Linear blend of the floor and ceil ranks. `q` is clamped to `[0, 1]`,
+/// matching [`quantiles_at`]. An empty slice returns NaN.
 pub fn percentile_linear(values: &mut [f32], q: f64) -> f32 {
     if values.is_empty() {
         return f32::NAN;
     }
-    let pos = q * (values.len() - 1) as f64;
+    let pos = q.clamp(0.0, 1.0) * (values.len() - 1) as f64;
     let lo = pos.floor() as usize;
     let hi = pos.ceil().min((values.len() - 1) as f64) as usize;
     let frac = (pos - lo as f64) as f32;
@@ -189,6 +190,14 @@ mod tests {
         assert!((reduced.max - 4.0).abs() < 1e-6);
         assert!(finite_minmax(&[f32::NAN]).is_none());
         assert!((mean_finite(&[1.0, 3.0, f32::NAN]).unwrap() - 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn an_out_of_range_quantile_clamps_instead_of_panicking() {
+        let mut values = [3.0, 1.0, 4.0, 1.0, 5.0];
+        assert_eq!(percentile_linear(&mut values, 1.5), 5.0);
+        assert_eq!(percentile_linear(&mut values, -0.5), 1.0);
+        assert_eq!(percentile_linear(&mut values, f64::INFINITY), 5.0);
     }
 
     fn quantiles_by_sort(values: &mut [f32], qs: &[f32]) -> Vec<f32> {
