@@ -73,12 +73,20 @@ pub fn line_scale(volume: &Volume) -> f32 {
 }
 
 pub fn scan_volume(volume: &Volume) -> VolumeScan {
-    scan_grid(&volume.values, volume.shape, volume.voxel)
+    scan_axes(&volume.values, volume.shape, volume.spacing)
 }
 
 pub fn scan_grid(values: &[f32], shape: [usize; 3], voxel: f32) -> VolumeScan {
+    scan_axes(values, shape, [voxel, voxel, voxel])
+}
+
+pub fn scan_spacing(values: &[f32], shape: [usize; 3], spacing: [f32; 3]) -> VolumeScan {
+    scan_axes(values, shape, spacing)
+}
+
+fn scan_axes(values: &[f32], shape: [usize; 3], spacing: [f32; 3]) -> VolumeScan {
     let [nx, ny, nz] = shape;
-    let voxel = voxel.max(1e-6);
+    let spacing = spacing.map(|mm| mm.max(1e-6));
     let brick_shape = [
         nx.div_ceil(BRICK).max(1),
         ny.div_ceil(BRICK).max(1),
@@ -127,8 +135,15 @@ pub fn scan_grid(values: &[f32], shape: [usize; 3], voxel: f32) -> VolumeScan {
     }
     let y_best = y_sum.into_iter().fold(0.0f32, f32::max);
     let z_best = z_sum.into_iter().fold(0.0f32, f32::max);
-    for sample in axial.iter_mut().chain(&mut coronal).chain(&mut sagittal) {
-        *sample *= voxel;
+    // Axial sums through Z, coronal through Y, sagittal through X.
+    for sample in &mut axial {
+        *sample *= spacing[2];
+    }
+    for sample in &mut coronal {
+        *sample *= spacing[1];
+    }
+    for sample in &mut sagittal {
+        *sample *= spacing[0];
     }
     let integral_peaks = [
         axial.iter().copied().fold(0.0f32, f32::max).max(1e-6),
@@ -138,7 +153,10 @@ pub fn scan_grid(values: &[f32], shape: [usize; 3], voxel: f32) -> VolumeScan {
     VolumeScan {
         bricks: dilate_bricks(&raw, brick_shape),
         brick_shape,
-        line_scale: (x_best.max(y_best).max(z_best) * voxel).max(1e-6),
+        line_scale: (x_best * spacing[0])
+            .max(y_best * spacing[1])
+            .max(z_best * spacing[2])
+            .max(1e-6),
         peak: peak.max(0.0),
         abs_peak,
         peak_at,
@@ -281,11 +299,10 @@ pub fn view_ray_scale(
     let [nx, ny, nz] = volume.shape;
     if nx > 0 && ny > 0 && nz > 0 {
         let (ix, iy, iz) = volume.peak_index();
-        let voxel = volume.voxel.max(1e-6);
         let point = [
-            volume.origin[0] + (ix as f32 + 0.5) * voxel,
-            volume.origin[1] + (iy as f32 + 0.5) * voxel,
-            volume.origin[2] + (iz as f32 + 0.5) * voxel,
+            volume.mm_of(0, ix),
+            volume.mm_of(1, iy),
+            volume.mm_of(2, iz),
         ];
         if let Some(uv) = film_uv(volume, view, point) {
             consider(uv);
@@ -366,14 +383,15 @@ fn march(
     let Some((eye, dir, t0, t1)) = cast(volume, view, uv) else {
         return (0.0, [0.0; 4]);
     };
-    let voxel = volume.voxel.max(1e-6);
+    let spacing = [volume.axis(0), volume.axis(1), volume.axis(2)];
+    let step = spacing[0].min(spacing[1]).min(spacing[2]);
     let dist = t1 - t0;
     if dist < 1e-3 {
         return (0.0, [0.0; 4]);
     }
-    let nstep = ((dist / voxel).ceil() as usize).clamp(1, MAX_STEPS);
+    let nstep = ((dist / step).ceil() as usize).clamp(1, MAX_STEPS);
     let entry = add(eye, scale(dir, t0));
-    let step_v = scale(dir, voxel);
+    let step_v = scale(dir, step);
     let typical = view.hi.abs().max(view.lo.abs()).max(1e-6);
     let mut integ = 0.0f32;
     let mut peak = 0.0f32;
@@ -394,20 +412,20 @@ fn march(
             dir
         };
         let cell = [
-            (q[0] - volume.origin[0]) / voxel,
-            (q[1] - volume.origin[1]) / voxel,
-            (q[2] - volume.origin[2]) / voxel,
+            (q[0] - volume.origin[0]) / spacing[0],
+            (q[1] - volume.origin[1]) / spacing[1],
+            (q[2] - volume.origin[2]) / spacing[2],
         ];
         let occupancy = brick_at(bricks, brick_shape, cell);
         if occupancy <= 0.0 || (view.mode == 1 && occupancy <= peak) {
-            i += steps_to_leave(cell, step_dir, voxel).max(1);
+            i += steps_to_leave(cell, step_dir, spacing, step).max(1);
             continue;
         }
         let dose = sample_mm(volume, q, view.filter);
         match view.mode {
             1 => peak = peak.max(dose),
             2 => {
-                let (rgb, alpha) = fog(view, dose, voxel, typical);
+                let (rgb, alpha) = fog(view, dose, step, typical);
                 for channel in 0..3 {
                     col[channel] += trans * rgb[channel] * alpha;
                 }
@@ -416,7 +434,7 @@ fn march(
                     break;
                 }
             }
-            _ => integ += dose * voxel,
+            _ => integ += dose * step,
         }
         i += 1;
     }
@@ -642,12 +660,7 @@ fn film_uv(volume: &Volume, view: RayView, point: [f32; 3]) -> Option<[f32; 2]> 
 
 /// Vispy turntable, +z up. Azimuth 0 and elevation 0 look along +y.
 fn lattice_extent(volume: &Volume) -> [f32; 3] {
-    let voxel = volume.voxel.max(1e-6);
-    [
-        volume.shape[0] as f32 * voxel,
-        volume.shape[1] as f32 * voxel,
-        volume.shape[2] as f32 * voxel,
-    ]
+    volume.extent()
 }
 
 fn lattice_center(volume: &Volume) -> [f32; 3] {
@@ -792,10 +805,10 @@ fn brick_at(bricks: &[f32], shape: [usize; 3], cell: [f32; 3]) -> f32 {
         .unwrap_or(0.0)
 }
 
-fn steps_to_leave(cell: [f32; 3], dir: [f32; 3], voxel: f32) -> usize {
+fn steps_to_leave(cell: [f32; 3], dir: [f32; 3], spacing: [f32; 3], step: f32) -> usize {
     let mut delta = f32::MAX;
     for axis in 0..3 {
-        let dir_i = dir[axis] / voxel;
+        let dir_i = dir[axis] / spacing[axis];
         if dir_i.abs() < 1e-8 {
             continue;
         }
@@ -805,12 +818,12 @@ fn steps_to_leave(cell: [f32; 3], dir: [f32; 3], voxel: f32) -> usize {
         } else {
             brick
         };
-        let step = (bound - cell[axis]) / dir_i;
-        if step > 1e-4 {
-            delta = delta.min(step);
+        let along = (bound - cell[axis]) / dir_i;
+        if along > 1e-4 {
+            delta = delta.min(along);
         }
     }
-    let steps = (delta / voxel).ceil();
+    let steps = (delta / step).ceil();
     if !steps.is_finite() {
         return 1;
     }
@@ -834,12 +847,11 @@ fn cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
 }
 
 pub fn sample_mm(volume: &Volume, mm: [f32; 3], filter: u8) -> f32 {
-    let voxel = volume.voxel.max(1e-6);
     sample_index(
         volume,
-        (mm[0] - volume.origin[0]) / voxel - 0.5,
-        (mm[1] - volume.origin[1]) / voxel - 0.5,
-        (mm[2] - volume.origin[2]) / voxel - 0.5,
+        (mm[0] - volume.origin[0]) / volume.axis(0) - 0.5,
+        (mm[1] - volume.origin[1]) / volume.axis(1) - 0.5,
+        (mm[2] - volume.origin[2]) / volume.axis(2) - 0.5,
         filter,
     )
 }
@@ -950,7 +962,7 @@ mod tests {
         Volume {
             origin: [0.0, 0.0, 0.0],
             shape: [3, 3, 3],
-            voxel: 1.0,
+            spacing: [1.0; 3],
             values,
         }
     }
@@ -1016,7 +1028,7 @@ mod tests {
         let volume = Volume {
             origin: [0.0, 0.0, 0.0],
             shape: [64, 64, 64],
-            voxel: 1.0,
+            spacing: [1.0; 3],
             values,
         };
         let (bricks, shape) = brick_grid(&volume);
@@ -1040,7 +1052,7 @@ mod tests {
         let volume = Volume {
             origin: [0.0, 0.0, 0.0],
             shape: [8, 8, 8],
-            voxel: 1.0,
+            spacing: [1.0; 3],
             values: vec![1.0; 512],
         };
         let shown = ray_value(
@@ -1060,7 +1072,7 @@ mod tests {
         let volume = Volume {
             origin: [0.0, 0.0, 0.0],
             shape: [4, 4, 4],
-            voxel: 1.0,
+            spacing: [1.0; 3],
             values: vec![3.0; 64],
         };
         let shown = ray_value(
@@ -1088,7 +1100,7 @@ mod tests {
         let volume = Volume {
             origin: [0.0, 0.0, 0.0],
             shape: [4, 3, 2],
-            voxel: 2.0,
+            spacing: [2.0; 3],
             values,
         };
         let scan = scan_volume(&volume);
@@ -1101,13 +1113,13 @@ mod tests {
         let (_, dose) = volume.depth_integral(1);
         let ny = volume.shape[1];
         for (index, z) in (0..volume.shape[2]).rev().enumerate() {
-            let cached = scan.integrals[2][1 + ny * z] * volume.voxel;
+            let cached = scan.integrals[2][1 + ny * z] * volume.spacing[1];
             assert!((dose[index] - cached).abs() < 1e-3);
         }
         let z = 1usize;
         let (_, lateral) = volume.lateral_integral(0, z);
         for (x, value) in lateral.iter().enumerate() {
-            let cached = scan.integrals[1][x + volume.shape[0] * z] * volume.voxel;
+            let cached = scan.integrals[1][x + volume.shape[0] * z] * volume.spacing[2];
             assert!((value - cached).abs() < 1e-3);
         }
     }
@@ -1117,7 +1129,7 @@ mod tests {
         let volume = Volume {
             origin: [0.0, 0.0, 0.0],
             shape: [2, 1, 1],
-            voxel: 1.0,
+            spacing: [1.0; 3],
             values: vec![0.0, 4.0],
         };
         let mid = sample_index(&volume, 0.5, 0.0, 0.0, 1);
@@ -1129,7 +1141,7 @@ mod tests {
         let volume = Volume {
             origin: [0.0, 0.0, 0.0],
             shape: [2, 1, 1],
-            voxel: 1.0,
+            spacing: [1.0; 3],
             values: vec![1.0, 4.0],
         };
         // cell 0.2 is inside voxel 0. cell -0.1 is outside.
@@ -1144,7 +1156,7 @@ mod tests {
         let volume = Volume {
             origin: [0.0, 0.0, 0.0],
             shape: [n, n, n],
-            voxel: 1.0,
+            spacing: [1.0; 3],
             values: vec![1.0; n * n * n],
         };
         let scan = scan_volume(&volume);
@@ -1177,7 +1189,7 @@ mod tests {
         let volume = Volume {
             origin: [0.0, 0.0, 0.0],
             shape: [n, n, n],
-            voxel: 1.0,
+            spacing: [1.0; 3],
             values,
         };
         let scan = scan_volume(&volume);
@@ -1242,7 +1254,7 @@ mod tests {
         let volume = Volume {
             origin: [0.0, 0.0, 0.0],
             shape: [n, n, n],
-            voxel: 1.0,
+            spacing: [1.0; 3],
             values,
         };
         let scan = scan_volume(&volume);
@@ -1279,12 +1291,35 @@ mod tests {
         let volume = Volume {
             origin: [0.0, 0.0, -10.0],
             shape: [2, 2, 10],
-            voxel: 1.0,
+            spacing: [1.0; 3],
             values: vec![0.0; 40],
         };
         let (bmin, bmax) = view_box(&volume, 90.0);
         let extent = [bmax[0] - bmin[0], bmax[1] - bmin[1], bmax[2] - bmin[2]];
         assert!((extent[1] - 10.0).abs() < 1e-4, "{extent:?}");
         assert!((extent[2] - 2.0).abs() < 1e-4, "{extent:?}");
+    }
+
+    #[test]
+    fn a_thick_slice_keeps_its_depth() {
+        let mut values = vec![0.0; 8];
+        values[4] = 1.0;
+        let volume = Volume {
+            origin: [0.0, 10.0, 20.0],
+            shape: [2, 2, 2],
+            spacing: [1.0, 1.0, 2.5],
+            values,
+        };
+        assert!((volume.mm_of(0, 1) - 1.5).abs() < 1e-4);
+        assert!((volume.mm_of(2, 1) - 23.75).abs() < 1e-4);
+        assert_eq!(volume.index_of(2, 23.75), 1);
+        let (depth, dose) = volume.depth_profile(0, 0);
+        assert!((depth[0] - 1.25).abs() < 1e-4, "{depth:?}");
+        assert!((dose[0] - 1.0).abs() < 1e-6);
+        let (axial, _, _) = volume.integrated_slice(0);
+        assert!((axial[0] - 2.5).abs() < 1e-4, "{axial:?}");
+        let at = sample_mm(&volume, [0.5, 10.5, 23.75], 0);
+        assert!((at - 1.0).abs() < 1e-4, "{at}");
+        assert!((volume.extent()[2] - 5.0).abs() < 1e-4);
     }
 }

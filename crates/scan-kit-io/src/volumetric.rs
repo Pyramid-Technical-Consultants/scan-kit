@@ -342,7 +342,7 @@ pub fn volumetric(
             companions.push(Volume {
                 origin: [0.0; 3],
                 shape: [0, 0, 0],
-                voxel: 1.0,
+                spacing: [1.0; 3],
                 values: Vec::new(),
             });
         } else {
@@ -779,11 +779,12 @@ pub fn volumetric(
     );
     if has_dose {
         let sizing = if phantom_mm <= 0.0 { " auto" } else { "" };
+        let axes = volume_mark.axes();
         let phantom = format!(
             "{:.0} × {:.0} × {:.0} mm{sizing}",
-            volume_mark.shape[0] as f32 * volume_mark.voxel,
-            volume_mark.shape[1] as f32 * volume_mark.voxel,
-            volume_mark.shape[2] as f32 * volume_mark.voxel
+            volume_mark.shape[0] as f32 * axes[0],
+            volume_mark.shape[1] as f32 * axes[1],
+            volume_mark.shape[2] as f32 * axes[2]
         );
         controls.push(crate::workspace::readout(
             "Size",
@@ -1126,7 +1127,7 @@ fn fill(
             Volume {
                 origin: [0.0; 3],
                 shape: [0, 0, 0],
-                voxel: 1.0,
+                spacing: [1.0; 3],
                 values: Vec::new(),
             },
             None,
@@ -1259,7 +1260,7 @@ fn session_dose(volume: &Volume, blank: bool) -> scan_kit_core::SessionDose {
             volume.shape[2] as u32,
         ],
         origin: volume.origin,
-        voxel: volume.voxel,
+        voxel: volume.spacing[0],
     }
 }
 
@@ -1639,7 +1640,7 @@ fn difference(measured: &Volume, plan: &Volume) -> Volume {
         values,
         origin: measured.origin,
         shape: measured.shape,
-        voxel: measured.voxel,
+        spacing: measured.spacing,
     }
 }
 
@@ -1692,7 +1693,7 @@ fn gamma_with(
     let same = |a: &Volume, b: &Volume| {
         a.shape == b.shape
             && a.origin == b.origin
-            && a.voxel == b.voxel
+            && a.spacing == b.spacing
             && a.values.len() == b.values.len()
             && a.values
                 .iter()
@@ -1717,7 +1718,7 @@ fn gamma_with(
         measured.shape,
         dose_percent,
         distance_mm,
-        [measured.voxel, measured.voxel, measured.voxel],
+        measured.spacing,
         cutoff_pct,
     );
     // A blank Monte Carlo capture scores nothing and is instant; keeping it
@@ -1736,7 +1737,7 @@ fn gamma_image(template: &Volume, values: &[f32]) -> Volume {
     Volume {
         origin: template.origin,
         shape: template.shape,
-        voxel: template.voxel,
+        spacing: template.spacing,
         values: values.to_vec(),
     }
 }
@@ -1993,7 +1994,7 @@ mod tests {
         let cube = |value: f32| Volume {
             origin: [0.0; 3],
             shape: [4, 4, 4],
-            voxel: 2.0,
+            spacing: [2.0; 3],
             values: vec![value; 64],
         };
         let (measured, near, far) = (cube(1.0), cube(1.01), cube(1.04));
@@ -2043,7 +2044,7 @@ mod tests {
                     volume: Volume {
                         origin: request.origin,
                         shape: request.shape,
-                        voxel: request.voxel_mm,
+                        spacing: [request.voxel_mm; 3],
                         values: vec![7.0; n],
                     },
                     uncertainty: 0.0,
@@ -2136,7 +2137,7 @@ mod tests {
         let measured = Volume {
             origin: [0.0, 0.0, 0.0],
             shape: [2, 2, 1],
-            voxel: 1.0,
+            spacing: [1.0; 3],
             values: vec![1.0, 0.0, 0.0, 0.0],
         };
         let plan = Volume {

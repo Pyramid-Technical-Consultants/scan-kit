@@ -202,11 +202,17 @@ pub fn projected_gamma(
     cutoff_pct: f32,
 ) -> [(Vec<f32>, f32); 3] {
     let [nx, ny, nz] = reference.shape;
-    let voxel = reference.voxel.max(1e-6);
-    let sums =
-        |volume: &Volume| super::ray::scan_grid(&volume.values, volume.shape, voxel).integrals;
+    let sums = |volume: &Volume| super::ray::scan_volume(volume).integrals;
     let (got, want) = (sums(reference), sums(evaluated));
     let planes = [[nx, ny, 1], [nx, nz, 1], [ny, nz, 1]];
+    // Axial is X-Y, coronal is X-Z, sagittal is Y-Z. The flat axis is only
+    // there because gamma wants a volume, and it keeps the old cubic search.
+    let pad = reference.axis(0);
+    let spacing = [
+        [reference.axis(0), reference.axis(1), pad],
+        [reference.axis(0), reference.axis(2), pad],
+        [reference.axis(1), reference.axis(2), pad],
+    ];
     std::array::from_fn(|plane| {
         let (gamma, passed, scored) = gamma_index(
             &got[plane],
@@ -214,7 +220,7 @@ pub fn projected_gamma(
             planes[plane],
             dose_percent,
             distance_mm,
-            [voxel; 3],
+            spacing[plane],
             cutoff_pct,
         );
         let rate = if scored == 0 {
@@ -617,7 +623,7 @@ mod tests {
         let volume = Volume {
             origin: [0.0; 3],
             shape,
-            voxel: 2.0,
+            spacing: [2.0; 3],
             values,
         };
         let planes = projected_gamma(&volume, &volume, 3.0, 2.0, 10.0);

@@ -1274,7 +1274,7 @@ mod tests {
                     volume: scan_kit_core::Volume {
                         origin: request.origin_mm,
                         shape: request.shape,
-                        voxel: request.spacing_mm[0],
+                        spacing: request.spacing_mm,
                         values: vec![1.0; request.material.len()],
                     },
                     uncertainty: 0.0,

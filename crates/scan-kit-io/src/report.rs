@@ -701,7 +701,7 @@ mod tests {
                 display: scan_kit_core::Volume {
                     origin: [0.0; 3],
                     shape: [1, 1, 1],
-                    voxel: 1.0,
+                    spacing: [1.0; 3],
                     values: vec![0.5],
                 },
                 rate: 98.5,

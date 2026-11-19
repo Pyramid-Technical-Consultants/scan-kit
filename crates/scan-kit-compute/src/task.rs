@@ -1237,16 +1237,20 @@ fn all_histories(jobs: &[McJob]) -> u64 {
 }
 
 fn blank_result(job: &McJob) -> McResult {
-    let (origin, shape, voxel) = match job {
-        McJob::Slab(request) => (request.origin, request.shape, request.voxel_mm),
-        McJob::Patient(request) => (request.origin_mm, request.shape, request.spacing_mm[0]),
+    let (origin, shape, spacing) = match job {
+        McJob::Slab(request) => (request.origin, request.shape, [request.voxel_mm; 3]),
+        McJob::Patient(request) => (
+            request.origin_mm,
+            request.shape,
+            request.spacing_mm.map(|mm| mm.max(0.25)),
+        ),
     };
     let count = shape[0].saturating_mul(shape[1]).saturating_mul(shape[2]);
     McResult {
         volume: Volume {
             origin,
             shape,
-            voxel,
+            spacing,
             values: vec![0.0; count],
         },
         uncertainty: 0.0,
