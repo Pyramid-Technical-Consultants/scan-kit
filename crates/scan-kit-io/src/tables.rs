@@ -4991,8 +4991,26 @@ fn cell_owned(line: &str, start: usize, end: usize) -> String {
     }
 }
 
+/// Drop the surrounding quotes and keep a doubled quote as one quote.
+/// `replace('"', "")` deleted the quotes a name is allowed to contain.
 fn strip_quotes(cell: &str) -> String {
-    cell.replace('"', "")
+    let mut chars = cell.chars();
+    if chars.next() != Some('"') {
+        return cell.to_string();
+    }
+    let mut out = String::with_capacity(cell.len().saturating_sub(2));
+    while let Some(ch) = chars.next() {
+        if ch == '"' {
+            if chars.as_str().starts_with('"') {
+                chars.next();
+                out.push('"');
+                continue;
+            }
+            break;
+        }
+        out.push(ch);
+    }
+    out
 }
 
 fn push_cell(slot: &mut Slot, line: &str, start: usize, end: usize) {
@@ -5264,6 +5282,8 @@ mod tests {
         assert!((quoted.num["dose"][0] - 2.0).abs() < 1e-6);
         assert!((quoted.num["energy"][1] - 3.0).abs() < 1e-6);
         assert!(quoted.num["dose"][1].is_nan());
+        let (names, _, _) = header_schema(r#""spot ""A""",dose"#, &|_| true);
+        assert_eq!(names[0].as_deref(), Some(r#"spot "A""#));
     }
 
     #[test]

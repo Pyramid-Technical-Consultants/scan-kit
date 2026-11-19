@@ -435,6 +435,8 @@ fn range_keep(column: Option<&[f32]>, lo: f32, hi: f32, keep: &mut [bool]) {
     let Some(column) = column else {
         return;
     };
+    // The form does not force the lower box to stay below the upper one.
+    let (lo, hi) = if lo <= hi { (lo, hi) } else { (hi, lo) };
     for (slot, value) in keep.iter_mut().zip(column) {
         *slot = *slot && value.is_finite() && *value >= lo && *value <= hi;
     }
@@ -613,6 +615,20 @@ mod tests {
         assert!(energy["energy"][0].is_nan());
         assert!((energy["energy"][1] - 90.0).abs() < 1e-6);
         assert!(energy["energy"][2].is_nan());
+
+        let mut swapped = BTreeMap::from([("energy".to_owned(), vec![70.0, 90.0, 110.0])]);
+        apply_mask(
+            &mut swapped,
+            &[Segment::Range {
+                column: "energy".to_owned(),
+                lo: 100.0,
+                hi: 80.0,
+            }],
+            &[],
+        );
+        assert!(swapped["energy"][0].is_nan());
+        assert!((swapped["energy"][1] - 90.0).abs() < 1e-6);
+        assert!(swapped["energy"][2].is_nan());
 
         let mut dose = BTreeMap::from([("dose_error".to_owned(), vec![0.2, -1.5, 0.4])]);
         apply_mask(
