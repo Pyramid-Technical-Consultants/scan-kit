@@ -322,6 +322,11 @@ pub(crate) fn fixture_copies(spec: &str) -> u32 {
 fn materialize(library_canonical: &str, session_url: &str) -> Result<PathBuf, String> {
     let session = require_remote(session_url)?;
     let relative = relative_remote(library_canonical, &session);
+    // A `..` segment — typed in the URL or carried by a server-side name —
+    // would let the cache write outside its own directory.
+    if relative.split(['/', '\\']).any(|part| part == "..") {
+        return Err("remote session path escapes the cache directory".into());
+    }
     let dest = cache_directory(library_canonical).join(&relative);
     let stamp_text = remote_stamp(&session)?;
     let stamp_path = stamp_file(&dest);
@@ -362,10 +367,12 @@ fn relative_remote(library_canonical: &str, session: &Remote) -> String {
         .unwrap_or_default();
     let path = session.path.trim_end_matches('/');
     let lib = lib_path.trim_end_matches('/');
-    let rel = path
+    // `strip_prefix` is a string match: `/a/bcd` starts with `/a/b` but is not
+    // inside it. Only a segment boundary counts as the library prefix.
+    let child = path
         .strip_prefix(lib)
-        .unwrap_or(path)
-        .trim_start_matches('/');
+        .filter(|rest| rest.is_empty() || rest.starts_with('/'));
+    let rel = child.unwrap_or(path).trim_start_matches('/');
     if rel.is_empty() {
         path.rsplit('/')
             .next()
@@ -1160,6 +1167,22 @@ mod tests {
         assert_eq!(
             Path::new("sftp://pyramid@192.168.101.206/var/log/ptc_ex").to_string_lossy(),
             "sftp://pyramid@192.168.101.206/var/log/ptc_ex"
+        );
+    }
+
+    #[test]
+    fn a_session_cache_path_stays_inside_the_library() {
+        let library = require_remote("sftp://u@h/a/b").unwrap();
+        let child = require_remote("sftp://u@h/a/b/c/d").unwrap();
+        assert_eq!(relative_remote(&library.canonical, &child), "c/d");
+        // `/a/bcd` shares the `/a/b` string prefix without being inside it.
+        let sibling = require_remote("sftp://u@h/a/bcd/x").unwrap();
+        assert_eq!(relative_remote(&library.canonical, &sibling), "a/bcd/x");
+        let climbing = require_remote("sftp://u@h/a/b/../evil").unwrap();
+        let relative = relative_remote(&library.canonical, &climbing);
+        assert!(
+            relative.split(['/', '\\']).any(|part| part == ".."),
+            "{relative}"
         );
     }
 }
