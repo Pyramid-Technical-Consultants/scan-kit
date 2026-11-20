@@ -110,3 +110,9 @@ A library root is a local path, a Windows UNC path, or an `sftp://`, `smb://`, `
 - Not in the React components, except rendering and calls to Tauri commands.
 - Not in `scan-kit-mcp`, except protocol registration and transport.
 - Not in a second GPU stack, a dataframe crate, or an ORM.
+
+## Dependencies
+
+Write a behavior here when it is small enough to read and test. The standard library and code already in the workspace come first. A crate copied into the tree is still third-party software until this project maintains it, so registry crates are not vendored, and git dependencies are not added. crates.io and `Cargo.lock` are the source. `deny.toml` checks advisories, the license list, yanked crates, and that crates.io is the only registry.
+
+Serialization, the GPU stack (`wgpu`, `naga`), Tauri, SQLite, TLS, archive formats, and the desktop shadcn packages stay dependencies. A pull request that adds a direct dependency names what it replaces and why writing that code is worse. Adding or removing one updates the SOUP list in Pliant (SK-DOC-3) in the same change. An ignored advisory in `deny.toml` keeps its reason until an upgrade removes it.

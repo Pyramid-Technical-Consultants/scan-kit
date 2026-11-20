@@ -1,0 +1,16 @@
+---
+description: Prefer owned code over a new dependency, and keep the SOUP list current
+alwaysApply: true
+---
+
+# Dependencies
+
+Write the behavior in this repository when it is small enough to read and test. The standard library and code already in the workspace come first.
+
+A crate copied into the tree is still third-party software. Do not vendor a registry crate, and do not add a git dependency. crates.io and the lockfile are the only source. `deny.toml` enforces that, the license list, and yanked crates.
+
+These stay dependencies: serde and serde_json, tokio, wgpu and naga, Tauri and its dialog plugin, rusqlite, the archive crates, sha2, the desktop shadcn and Glide packages, and the TLS stacks already in use. Do not replace them with a handwritten version.
+
+A pull request that adds a direct dependency names the code it replaces and why writing that code is worse. Adding or removing one updates the SOUP list in Pliant (SK-DOC-3) in the same change.
+
+An ignored advisory in `deny.toml` keeps its reason. Remove the ignore when an upgrade exists.
