@@ -116,13 +116,21 @@ pub fn load_study(path: &Path) -> Result<PatientStudy, String> {
     let mut series_uid = String::new();
     let mut sop_uids = Vec::new();
     let mut structures_uid = String::new();
-    for item in fs::read_dir(path).map_err(|err| err.to_string())? {
-        let file = item.map_err(|err| err.to_string())?.path();
+    for file in crate::dicom_files(path) {
         let bytes = fs::read(&file).unwrap_or_default();
         if bytes.len() < 132 || &bytes[128..132] != b"DICM" {
             continue;
         }
-        let elems = parse_dataset(&bytes[132..])?;
+        // A meta that names a class we never read (treatment records, display
+        // objects) skips the dataset parse entirely — those datasets can carry
+        // encodings this reader deliberately rejects, and skipping is cheaper.
+        if let Some(class) = crate::meta_sop_class(&bytes) {
+            let wanted = [crate::CT, crate::RT_STRUCT, crate::RT_PLAN, crate::RT_DOSE];
+            if !wanted.iter().any(|uid| class.contains(uid)) {
+                continue;
+            }
+        }
+        let elems = parse_file(&bytes)?;
         let class = text_tag(&elems, tag(0x0008, 0x0016));
         let frame = text_tag(&elems, tag(0x0020, 0x0052));
         if class.contains("1.2.840.10008.5.1.4.1.1.2") {
@@ -215,7 +223,7 @@ pub fn read_ion_plan(path: &Path) -> Result<IonPlan, String> {
             path.display()
         ));
     }
-    let elems = parse_dataset(&bytes[132..])?;
+    let elems = parse_file(&bytes)?;
     let label = text_tag(&elems, tag(0x300A, 0x0002));
     let mut spots = Vec::new();
     let mut plan_index = 0i32;
@@ -388,7 +396,7 @@ pub fn write_water_study(dir: &Path) -> Result<(), String> {
     sq(&mut plan, 0x300A, 0x0180, &[setup]);
     let referenced = {
         let mut item = Vec::new();
-        is(&mut item, 0x300A, 0x00C0, 1);
+        is(&mut item, 0x300C, 0x0006, 1);
         ds(&mut item, 0x300A, 0x0086, &[1.0]);
         item
     };
@@ -662,13 +670,18 @@ fn read_plan(elems: &[Elem], frame: String) -> Result<Plan, String> {
         fractions = int_tag(group, tag(0x300A, 0x0078)).unwrap_or(1);
         for beam in seq(group, tag(0x300C, 0x0004)) {
             metersets.push((
-                int_tag(beam, tag(0x300A, 0x00C0)).unwrap_or(0),
+                int_tag(beam, tag(0x300C, 0x0006)).unwrap_or(0),
                 float_tag(beam, tag(0x300A, 0x0086)).unwrap_or(0.0),
             ));
         }
     }
     let mut beams = Vec::new();
     for beam in seq(elems, tag(0x300A, 0x03A2)) {
+        // SETUP beams are imaging or verification fields — they carry no dose
+        // and no meterset, so a plan with setup fields would fail its check.
+        if text_tag(beam, tag(0x300A, 0x00CE)) == "SETUP" {
+            continue;
+        }
         let number = int_tag(beam, tag(0x300A, 0x00C0)).unwrap_or(0);
         let meterset = metersets
             .iter()
@@ -982,31 +995,61 @@ fn tag(group: u16, element: u16) -> u32 {
     (u32::from(group) << 16) | u32::from(element)
 }
 
+fn parse_file(bytes: &[u8]) -> Result<Vec<Elem>, String> {
+    let (offset, implicit) = crate::dataset_offset(bytes);
+    parse_dataset_mode(&bytes[offset..], implicit)
+}
+
+#[cfg(test)]
 fn parse_dataset(bytes: &[u8]) -> Result<Vec<Elem>, String> {
+    parse_dataset_mode(bytes, false)
+}
+
+fn parse_dataset_mode(bytes: &[u8], implicit: bool) -> Result<Vec<Elem>, String> {
     let mut elems = Vec::new();
     let mut cursor = 0;
     while cursor + 8 <= bytes.len() {
         let group = u16::from_le_bytes([bytes[cursor], bytes[cursor + 1]]);
         let element = u16::from_le_bytes([bytes[cursor + 2], bytes[cursor + 3]]);
-        let vr = &bytes[cursor + 4..cursor + 6];
-        let long = matches!(
-            vr,
-            b"OB" | b"OW" | b"OF" | b"SQ" | b"UT" | b"UN" | b"OD" | b"OL" | b"OV"
-        );
-        let (length, header) = if long {
-            if cursor + 12 > bytes.len() {
-                break;
-            }
-            let length = u32::from_le_bytes([
-                bytes[cursor + 8],
-                bytes[cursor + 9],
-                bytes[cursor + 10],
-                bytes[cursor + 11],
-            ]);
-            (length, 12)
+        // Implicit VR writes a 4-byte length where explicit writes VR+length;
+        // sequences are only known by the item marker their value starts with.
+        let (length, header, is_seq) = if implicit {
+            (
+                u32::from_le_bytes([
+                    bytes[cursor + 4],
+                    bytes[cursor + 5],
+                    bytes[cursor + 6],
+                    bytes[cursor + 7],
+                ]),
+                8usize,
+                false,
+            )
         } else {
-            let length = u16::from_le_bytes([bytes[cursor + 6], bytes[cursor + 7]]) as u32;
-            (length, 8)
+            let vr = &bytes[cursor + 4..cursor + 6];
+            let long = matches!(
+                vr,
+                b"OB" | b"OW" | b"OF" | b"SQ" | b"UT" | b"UN" | b"OD" | b"OL" | b"OV"
+            );
+            let (length, header) = if long {
+                if cursor + 12 > bytes.len() {
+                    break;
+                }
+                (
+                    u32::from_le_bytes([
+                        bytes[cursor + 8],
+                        bytes[cursor + 9],
+                        bytes[cursor + 10],
+                        bytes[cursor + 11],
+                    ]),
+                    12usize,
+                )
+            } else {
+                (
+                    u16::from_le_bytes([bytes[cursor + 6], bytes[cursor + 7]]) as u32,
+                    8usize,
+                )
+            };
+            (length, header, vr == b"SQ")
         };
         if length == u32::MAX {
             return Err("undefined-length DICOM sequences are not read".into());
@@ -1017,26 +1060,35 @@ fn parse_dataset(bytes: &[u8]) -> Result<Vec<Elem>, String> {
             break;
         }
         let value = &bytes[start..end];
-        let items = if vr == b"SQ" {
-            parse_items(value)?
+        // An implicit-VR sequence is only recognizable by the FFFE,E000 item
+        // tag at the head of its value; a failed parse means the value is
+        // plain bytes that happen to share the marker.
+        let (items, seq) = if !implicit && is_seq {
+            (parse_items(value, false)?, true)
+        } else if implicit && looks_like_items(value) {
+            match parse_items(value, true) {
+                Ok(items) => (items, true),
+                Err(_) => (Vec::new(), false),
+            }
         } else {
-            Vec::new()
+            (Vec::new(), false)
         };
         elems.push(Elem {
             tag: tag(group, element),
             items,
-            bytes: if vr == b"SQ" {
-                Vec::new()
-            } else {
-                value.to_vec()
-            },
+            bytes: if seq { Vec::new() } else { value.to_vec() },
         });
         cursor = end;
     }
     Ok(elems)
 }
 
-fn parse_items(bytes: &[u8]) -> Result<Vec<Vec<Elem>>, String> {
+/// First four bytes of a defined-length sequence value: the FFFE,E000 Item tag.
+fn looks_like_items(value: &[u8]) -> bool {
+    value.len() >= 8 && value[..4] == [0xFE, 0xFF, 0x00, 0xE0]
+}
+
+fn parse_items(bytes: &[u8], implicit: bool) -> Result<Vec<Vec<Elem>>, String> {
     let mut items = Vec::new();
     let mut cursor = 0;
     while cursor + 8 <= bytes.len() {
@@ -1062,7 +1114,7 @@ fn parse_items(bytes: &[u8]) -> Result<Vec<Vec<Elem>>, String> {
         if end > bytes.len() {
             return Err("a sequence item is short".into());
         }
-        items.push(parse_dataset(&bytes[start..end])?);
+        items.push(parse_dataset_mode(&bytes[start..end], implicit)?);
         cursor = end;
     }
     Ok(items)
@@ -1629,6 +1681,69 @@ mod tests {
         assert!(hu_label(-2000.0) != hu_label(0.0));
     }
 
+    fn iv(bytes: &mut Vec<u8>, group: u16, element: u16, value: &[u8]) {
+        bytes.extend_from_slice(&group.to_le_bytes());
+        bytes.extend_from_slice(&element.to_le_bytes());
+        bytes.extend_from_slice(&(value.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(value);
+    }
+
+    fn iv_sq(bytes: &mut Vec<u8>, group: u16, element: u16, items: &[Vec<u8>]) {
+        let mut body = Vec::new();
+        for item in items {
+            body.extend_from_slice(&0xFFFEu16.to_le_bytes());
+            body.extend_from_slice(&0xE000u16.to_le_bytes());
+            body.extend_from_slice(&(item.len() as u32).to_le_bytes());
+            body.extend_from_slice(item);
+        }
+        iv(bytes, group, element, &body);
+    }
+
+    #[test]
+    fn a_nested_study_loads_from_its_root() {
+        let root = std::env::temp_dir().join(format!("scan-kit-nested-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        write_water_study(&root.join("study").join("series")).unwrap();
+        let study = load_study(&root).unwrap();
+        assert_eq!(study.ct.shape, [4, 4, 2]);
+        let entries = crate::index_study(&root).unwrap();
+        assert!(entries.iter().any(|entry| entry.modality == "CT"));
+        assert!(entries.iter().any(|entry| entry.modality == "RTPLAN"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_implicit_vr_plan_parses_and_setup_beams_are_skipped() {
+        let mut ref_beam = Vec::new();
+        iv(&mut ref_beam, 0x300C, 0x0006, &even("1"));
+        iv(&mut ref_beam, 0x300A, 0x0086, &even("10"));
+        let mut group = Vec::new();
+        iv(&mut group, 0x300A, 0x0078, &even("1"));
+        iv_sq(&mut group, 0x300C, 0x0004, &[ref_beam]);
+        let mut cp = Vec::new();
+        iv(&mut cp, 0x300A, 0x0114, &even("100"));
+        iv(&mut cp, 0x300A, 0x012C, &even("0\\0\\0"));
+        iv(&mut cp, 0x300A, 0x0392, &even("1"));
+        iv(&mut cp, 0x300A, 0x0394, &even("0\\0"));
+        iv(&mut cp, 0x300A, 0x0396, &even("1"));
+        let mut treatment = Vec::new();
+        iv(&mut treatment, 0x300A, 0x00C0, &even("1"));
+        iv(&mut treatment, 0x300A, 0x00CE, &even("TREATMENT"));
+        iv(&mut treatment, 0x300A, 0x010E, &even("1"));
+        iv(&mut treatment, 0x300C, 0x006A, &even("1"));
+        iv_sq(&mut treatment, 0x300A, 0x03A8, &[cp]);
+        let mut setup = Vec::new();
+        iv(&mut setup, 0x300A, 0x00C0, &even("2"));
+        iv(&mut setup, 0x300A, 0x00CE, &even("SETUP"));
+        let mut bytes = preamble();
+        ui(&mut bytes, 0x0002, 0x0010, "1.2.840.10008.1.2");
+        iv_sq(&mut bytes, 0x300A, 0x0070, &[group]);
+        iv_sq(&mut bytes, 0x300A, 0x03A2, &[treatment, setup]);
+        let plan = read_plan(&parse_file(&bytes).unwrap(), "f".into()).unwrap();
+        assert_eq!(plan.beams.len(), 1);
+        assert!((plan.beams[0].meterset - 10.0).abs() < 1e-4);
+    }
+
     #[test]
     fn one_frame_loads_and_a_second_frame_fails() {
         let root = std::env::temp_dir().join(format!("scan-kit-patient-{}", std::process::id()));
@@ -1879,7 +1994,7 @@ mod tests {
 
     fn plan_with_shifter(settings: &[(i32, &str, Option<f32>)]) -> Vec<Elem> {
         let mut ref_beam = Vec::new();
-        is(&mut ref_beam, 0x300A, 0x00C0, 1);
+        is(&mut ref_beam, 0x300C, 0x0006, 1);
         ds(&mut ref_beam, 0x300A, 0x0086, &[10.0]);
         let mut group = Vec::new();
         is(&mut group, 0x300A, 0x0078, 1);
@@ -1934,7 +2049,7 @@ mod tests {
 
     fn plan_with_spot_count(declared: i32, pairs: usize) -> Vec<Elem> {
         let mut ref_beam = Vec::new();
-        is(&mut ref_beam, 0x300A, 0x00C0, 1);
+        is(&mut ref_beam, 0x300C, 0x0006, 1);
         ds(&mut ref_beam, 0x300A, 0x0086, &[10.0]);
         let mut group = Vec::new();
         is(&mut group, 0x300A, 0x0078, 1);
