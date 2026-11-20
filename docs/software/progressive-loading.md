@@ -79,25 +79,25 @@ Views do not implement that trait in React. Each heavy operation exposes one con
 
 ## Slice rules
 
-Monte Carlo still grows its dispatch with the Python `McRun.step` rule. An analysis load keeps publishing a picture on every poll. The first picture is one window. Each later picture doubles that window, and each window reads only the bytes it adds.
+Monte Carlo still grows its dispatch with the Python `McRun.step` rule. An analysis load publishes a picture on every poll until that picture passes four windows. The first picture is one window. Each later picture doubles that window, and each window reads only the bytes it adds. The poll that crosses four windows reads the rest of the file and publishes the final picture.
 
 - The UI poll budget is 12 ms of CPU time. A GPU submit returns without waiting.
 - A Monte Carlo poll waits for the previous GPU fence. If that wait took more than half the budget, the next chunk is halved, down to a floor. If it took less than a tenth, the next chunk doubles, up to a cap. The floor and cap stay the ones already in the transport (dispatch size and in-flight depth).
-- A CPU stage's first timed poll publishes one timeslice file, or 4096 rows of a long file, and reads only that window. A spot file uses the same row window. Each later timed poll publishes again, with twice as many of those windows as the last picture, up to 128. The hairline and the plot both advance on every poll, and a window does not read the file again from the start. A zero budget still publishes one window per poll. Workers for one task are joined on cancel and on `Ready`. No detached pool.
+- A CPU stage's first timed poll publishes one timeslice file, or 4096 rows of a long file, and reads only that window. A spot file uses the same row window. Each later timed poll publishes again, with twice as many of those windows as the last picture, up to 128, until the picture passes four windows. That poll reads the remainder once and publishes the final picture. The hairline and the plot both advance on every poll until then, and a window does not read the file again from the start. A zero budget still publishes one window per poll. Workers for one task are joined on cancel and on `Ready`. No detached pool.
 - A preview readback happens only when at least 100 ms have passed since the last one, and only after at least one unit of work. Readback is the expensive part; the submit is not.
 - One device queue. Two GPU tasks do not submit together. A plot rebuild waits for the current MC slice fence, or cancels that task when the user left the view.
 - Panic or device loss ends the task as `Failed`. The last good payload stays on screen. The next `start` creates the device again. A slice does not retry on its own.
 
 ## What the user sees first
 
-A cache hit (the existing length and mtime stamp) skips to the final payload. A miss draws the first file, or the first 4096 rows of a long file, on the first poll, without reading the rest of that file. Later polls keep drawing a larger picture. The picture already on screen stays up, and can be zoomed or panned, while the next window is read. An untouched view refits as those windows arrive, so a later session stays inside the window. A zoom or pan the user already made is kept when the axes are still the same quantity and a close span.
+A cache hit on the session file length and mtime skips to the final payload. The stamp is the files, so the next view of that session is a hit even when the picture is different. A miss draws the first file, or the first 4096 rows of a long file, on the first poll, without reading the rest of that file. Later polls keep drawing a larger picture until four windows, then one final picture. The picture already on screen stays up, and can be zoomed or panned, while the next window is read. An untouched view refits as those windows arrive, so a later session stays inside the window. A zoom or pan the user already made is kept when the axes are still the same quantity and a close span.
 
 Order for an analysis view:
 
 1. `Chrome` — controls from the catalog or the last header cache.
 2. `Read` — stamps. Cache hit jumps to `Done`.
 3. `Parse` — one timeslice file, or 4096 rows when that file is long. A spot file uses the same row blocks. Emit the scene built from the rows in hand so the plot can be zoomed while the rest arrives.
-4. `Scene` — each later poll appends a doubled window and publishes again.
+4. `Scene` — each later poll appends a doubled window and publishes again, until the picture passes four windows. The next poll reads the remainder and finishes.
 5. `Compute` — gamma, DVH, splat, or transport, if this view has any.
 6. `Done` — the same panel labels, `quality: final`.
 

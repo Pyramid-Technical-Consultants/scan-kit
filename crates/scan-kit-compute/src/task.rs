@@ -1,10 +1,10 @@
 //! One driver for every long desktop task.
 //!
 //! A poll publishes one picture and may return a plot payload. The first timed
-//! poll is one window. Each later timed poll doubles that window, still
-//! publishing every time, and reads only the new bytes. `open_plot` drains the
-//! same stage with an unlimited budget, so a one-shot call still returns the
-//! scene it returns today.
+//! poll is one window. Each later timed poll doubles that window and reads only
+//! the new bytes, until the picture passes four windows. That poll reads the
+//! rest once. `open_plot` drains the same stage with an unlimited budget, so a
+//! one-shot call still returns the scene it returns today.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -23,6 +23,11 @@ use crate::ComputeError;
 
 const POLL_BUDGET: Duration = Duration::from_millis(12);
 const DRAIN: Duration = Duration::from_secs(30);
+/// Estimated rows already in the picture. Past four windows the next partial
+/// is most of the final trace, so the rest of the file is read once.
+/// ponytail: a live tail that still wants pictures after this waits for the
+/// next open. Raise the cap if a session must keep streaming past it.
+const PARTIAL_ROW_CAP: usize = 4 * scan_kit_io::SLICE_ROWS;
 
 trait Stage: Send {
     fn poll(&mut self, budget: Duration, cancel: &Cancel) -> Poll<Vec<u8>>;
@@ -384,7 +389,7 @@ impl SessionStage {
     ) -> Self {
         let stamps: Vec<_> = sessions
             .iter()
-            .map(|session| stamp_key(view, root, session))
+            .map(|session| stamp_key(root, session))
             .collect();
         let cached = !stamps.is_empty() && {
             let seen = seen_stamps();
@@ -477,6 +482,14 @@ impl SessionStage {
                 .saturating_mul(2)
                 .max(file.filled.saturating_add(1));
         }
+    }
+
+    fn covered_rows(&self) -> usize {
+        self.plan
+            .iter()
+            .flat_map(|session| session.files.iter())
+            .map(|file| file.filled.saturating_mul(scan_kit_io::SLICE_ROWS))
+            .sum()
     }
 
     fn included(&self) -> Vec<String> {
@@ -606,7 +619,7 @@ impl Stage for SessionStage {
         self.ensure_plan();
         // A zero budget stays on one window, so a test can see every step.
         // A timed poll pulls several windows into one picture, then doubles
-        // that count. The picture and the hairline still advance every poll.
+        // that count, until the picture passes four windows.
         let quota = if budget.is_zero() {
             1
         } else {
@@ -630,6 +643,32 @@ impl Stage for SessionStage {
                 }
                 None => break,
             }
+        }
+        // Encoding this prefix and then the rest walks the trace twice.
+        if !budget.is_zero()
+            && self.covered_rows() > PARTIAL_ROW_CAP
+            && self.done_units() < self.units()
+        {
+            for session in &mut self.plan {
+                for file in &mut session.files {
+                    file.filled = file.chunks;
+                }
+            }
+            let units = self.units();
+            let ids = self.sessions.clone();
+            return match self.encode(&ids, false) {
+                Ok(bytes) => {
+                    remember_stamps(&self.stamps);
+                    self.loaded = total;
+                    self.report = report_at(Phase::Done, units, units);
+                    Poll::Ready(bytes)
+                }
+                Err(message) => {
+                    self.report.phase = Phase::Failed;
+                    self.report.note = message.clone();
+                    Poll::Failed(message)
+                }
+            };
         }
         let Some(at) = at else {
             let ids = self.sessions.clone();
@@ -1560,10 +1599,12 @@ fn remember_stamps(stamps: &[String]) {
     seen.extend(stamps.iter().cloned());
 }
 
-fn stamp_key(view: &str, root: &Path, session: &str) -> String {
+/// Length and mtime of the session files. The view is not part of the key:
+/// timeline, bins, and the other pictures read the same files.
+fn stamp_key(root: &Path, session: &str) -> String {
     let dir = root.join(session);
     format!(
-        "{view}\n{}\n{session}\n{}\n{}",
+        "{}\n{session}\n{}\n{}",
         root.display(),
         file_stamp(&dir.join("spot_data.csv")),
         file_stamp(&dir.join("input_map.csv")),
@@ -1986,6 +2027,85 @@ mod tests {
             Poll::Cancelled
         ));
         assert_eq!(stage.loaded, 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_next_view_reuses_a_session_already_read() {
+        let root = scratch();
+        write_session(&root, "sess");
+        let cancel = Cancel::new();
+        let mut timeline = session_stage(&root, &["sess"]);
+        assert!(!timeline.cached);
+        let mut finished = false;
+        for _ in 0..4 {
+            if matches!(timeline.poll(Duration::ZERO, &cancel), Poll::Ready(_)) {
+                finished = true;
+                break;
+            }
+        }
+        assert!(finished, "timeline did not finish");
+        let mut bins = SessionStage::new(
+            "bins",
+            &root,
+            &["sess".into()],
+            &json!({}),
+            [0.1, 0.1, 0.1, 1.0],
+            [0.9, 0.9, 0.9, 1.0],
+            &[[0.2, 0.4, 0.8, 1.0]],
+        );
+        assert!(bins.cached);
+        match bins.poll(Duration::ZERO, &cancel) {
+            Poll::Ready(bytes) => {
+                assert_eq!(scan_kit_plot::plot_header(&bytes).unwrap().quality, "final");
+            }
+            other => panic!("a view of a session already read should be one picture: {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_long_file_finishes_instead_of_repainting_the_trace() {
+        let root = scratch();
+        let session = root.join("wide");
+        std::fs::create_dir_all(&session).unwrap();
+        std::fs::write(
+            session.join("input_map.csv"),
+            "energy,charge_req,position_x,position_y\n180,0,0,0\n",
+        )
+        .unwrap();
+        let line = format!("0,0,0,0,{}\n", "x".repeat(64));
+        let mut spots = String::with_capacity(line.len() * 40_000 + 80);
+        spots.push_str("ic1_total_dose,ic2_total_dose,position_x,position_y,note\n");
+        for _ in 0..40_000 {
+            spots.push_str(&line);
+        }
+        // Wider than seven windows, so the third timed poll is not the end of the file.
+        assert!(spots.len() > 1_400_000);
+        std::fs::write(session.join("spot_data.csv"), spots).unwrap();
+        let mut stage = session_stage(&root, &["wide"]);
+        let cancel = Cancel::new();
+        let mut partials = 0;
+        let mut ready = false;
+        for _ in 0..6 {
+            match stage.poll(Duration::from_secs(1), &cancel) {
+                Poll::Pending {
+                    preview: Some(_), ..
+                } => partials += 1,
+                Poll::Pending { preview: None, .. } => {}
+                Poll::Ready(bytes) => {
+                    assert_eq!(scan_kit_plot::plot_header(&bytes).unwrap().quality, "final");
+                    ready = true;
+                    break;
+                }
+                other => panic!("a long file should publish or finish: {other:?}"),
+            }
+        }
+        assert!(ready);
+        assert_eq!(
+            partials, 2,
+            "two pictures, then the rest of the file in one"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
