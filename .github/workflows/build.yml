@@ -23,7 +23,12 @@ jobs:
         with:
           components: rustfmt, clippy
 
+      # rust-cache ignores a virtual workspace's root Cargo.toml, and an exact
+      # hit never saves again. Key on that file so a profile edit cannot keep
+      # restoring stale artifacts.
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: "${{ hashFiles('Cargo.toml') }}"
 
       - name: Check formatting
         run: cargo fmt --all --check
@@ -58,7 +63,12 @@ jobs:
           targets: wasm32-unknown-unknown
           components: clippy
 
+      # rust-cache ignores a virtual workspace's root Cargo.toml, and an exact
+      # hit never saves again. Key on that file so a profile edit cannot keep
+      # restoring stale artifacts.
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: "${{ hashFiles('Cargo.toml') }}"
 
       - name: Lint the plot crate for wasm32
         run: cargo clippy -p scan-kit-plot --no-deps --target wasm32-unknown-unknown -- -D warnings
@@ -141,7 +151,12 @@ jobs:
         with:
           targets: wasm32-unknown-unknown
 
+      # rust-cache ignores a virtual workspace's root Cargo.toml, and an exact
+      # hit never saves again. Key on that file so a profile edit cannot keep
+      # restoring stale artifacts.
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: "${{ hashFiles('Cargo.toml') }}"
 
       - name: Resolve the wasm-bindgen CLI version from Cargo.lock
         id: bindgen
