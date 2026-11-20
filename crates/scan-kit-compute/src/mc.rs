@@ -756,7 +756,7 @@ impl Live {
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
                 pass.set_pipeline(&self.transport_pipe);
                 pass.set_bind_group(0, &self.transport_group, &[]);
-                pass.dispatch_workgroups(count.div_ceil(64), 1, 1);
+                pass.dispatch_workgroups(count.div_ceil(128), 1, 1);
                 if fold {
                     pass.set_pipeline(&self.fold_pipe);
                     pass.set_bind_group(0, &self.fold_group, &[]);

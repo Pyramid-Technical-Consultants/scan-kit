@@ -383,7 +383,7 @@ fn main_slab(args: &Args) -> Result<i32, String> {
             failed.push(case.name.clone());
         }
         println!(
-            "{:24} {:6.2}% {:+6.2}mm {:6.2}% {:+6.2}% {:5.2}mm {:6.2}%  {:4.0}  {}",
+            "{:24} {:6.2}% {:+6.2}mm {:6.2}% {:+6.2}% {:5.2}mm {:6.2}%  {:4.1}  {}",
             case.name,
             100.0 * diff.idd,
             diff.r80,

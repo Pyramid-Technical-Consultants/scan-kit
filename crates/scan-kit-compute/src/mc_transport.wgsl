@@ -173,9 +173,22 @@ fn gauss() -> f32 {
 // Both Box-Muller components — two normals for the price of one.
 fn gauss2() -> vec2f {
     let a = urand();
-    let r = sqrt(-2.0 * log(a));
+    let r = sqrt(-2.0 * flog(a));
     let t = 2.0 * PI * urand();
     return vec2f(r * cos(t), r * sin(t));
+}
+
+// ln(x), x > 0, to ~1e-7: exponent/atanh-series on a mantissa centered at 1, so
+// |t| <= 0.172 and four terms converge hard. Feeds cross-sections and majorants —
+// its error is far below the MC noise there.
+fn flog(x: f32) -> f32 {
+    let b = bitcast<u32>(x);
+    var e = f32(i32(b >> 23u) - 127);
+    var m = bitcast<f32>((b & 0x7FFFFFu) | 0x3F800000u);
+    if (m > 1.41421356) { m *= 0.5; e += 1.0; }
+    let t = (m - 1.0) / (m + 1.0);
+    let t2 = t * t;
+    return e * 0.69314718 + 2.0 * t * (1.0 + t2 * (0.33333333 + t2 * (0.2 + t2 * 0.14285714)));
 }
 
 fn quanta(e_ev: f32) -> i32 {
@@ -389,12 +402,6 @@ fn deposit(idx: i32, e_ev: f32, w: f32) {
     }
 }
 
-fn lattice_dist(x: f32, o: f32, v: f32, u: f32) -> f32 {
-    if (abs(u) < 1e-12) { return 1e30; }
-    let f = (x - o) / v;
-    return abs(((floor(f) + select(0.0, 1.0, u > 0.0)) * v + o - x) / u);
-}
-
 fn plane_dist(z: f32, w: f32, p: f32) -> f32 {
     let d = (p - z) / w;
     return select(1e30, d, d > 0.0);
@@ -409,12 +416,14 @@ const CROSS_CM: f32 = 1e-5;
 fn dist_to_interface(x: vec3f, d: vec3f) -> f32 {
     // SemiInfiniteSlab_step: height above the exit face, whatever the direction.
     if (g_geom == GEOM_SHIFTER) { return max(x.z - g_rs_lo + 1e-4, 0.0); }
-    var s = lattice_dist(x.x, P.ox, P.vx, d.x);
+    let o = vec3f(P.ox, P.oy, P.oz);
+    let v = vec3f(P.vx, P.vy, P.vz);
+    let face = (floor((x - o) / v) + select(vec3f(0.0), vec3f(1.0), d > vec3f(0.0))) * v + o;
+    let dd = select(abs((face - x) / d), vec3f(1e30), abs(d) < vec3f(1e-12));
+    var s = dd.x;
     var u = abs(d.x);
-    let sy = lattice_dist(x.y, P.oy, P.vy, d.y);
-    if (sy < s) { s = sy; u = abs(d.y); }
-    let sz = lattice_dist(x.z, P.oz, P.vz, d.z);
-    if (sz < s) { s = sz; u = abs(d.z); }
+    if (dd.y < s) { s = dd.y; u = abs(d.y); }
+    if (dd.z < s) { s = dd.z; u = abs(d.z); }
     if (g_geom == GEOM_SLAB && abs(d.z) >= 1e-12) {
         var pz = min(plane_dist(x.z, d.z, 0.0), plane_dist(x.z, d.z, -P.depth));
         if (P.wet > 0.0) { pz = min(pz, plane_dist(x.z, d.z, P.wet)); }
@@ -443,7 +452,7 @@ fn stop_pow(mb: i32, T: f32, mass: f32) -> f32 {
 fn sigma_ion(nel: f32, z2: f32, k: vec4f) -> f32 {
     if (k.w <= TE_MIN) { return 0.0; }
     return TWO_PI_RE2_MC2 * nel * z2
-        * ((1.0 / TE_MIN - 1.0 / k.w) - (k.z / k.w) * log(k.w / TE_MIN) + (k.w - TE_MIN) / (2.0 * k.x * k.x))
+        * ((1.0 / TE_MIN - 1.0 / k.w) - (k.z / k.w) * flog(k.w / TE_MIN) + (k.w - TE_MIN) / (2.0 * k.x * k.x))
         / k.z;
 }
 
@@ -462,7 +471,7 @@ fn compute_L(nel: f32, rho: f32, z2: f32, sp: f32, k: vec4f) -> f32 {
     var m: f32 = 0.0;
     if (k.w > TE_MIN) {
         m = (TWO_PI_RE2_MC2 * nel * z2 / k.z)
-            * (log(k.w / TE_MIN) - (k.w - TE_MIN) * k.z / k.w + (k.w * k.w - TE_MIN * TE_MIN) / (4.0 * k.x * k.x));
+            * (flog(k.w / TE_MIN) - (k.w - TE_MIN) * k.z / k.w + (k.w * k.w - TE_MIN * TE_MIN) / (4.0 * k.x * k.x));
     }
     return rho * z2 * sp - m;
 }
@@ -498,7 +507,32 @@ fn rotate(d: vec3f, theta: f32, phi: f32) -> vec3f {
         o.y = sT * sP;
         if (d.z > 0.0) { o.x = sT * cP; o.z = cT; } else { o.x = -sT * cP; o.z = -cT; }
     }
-    return o / length(o);
+    // One Newton pass for 1/|o| — o is a rotated unit vector, |o| ≈ 1 ± 1e-6.
+    return o * (1.5 - 0.5 * dot(o, o));
+}
+
+// Update_direction for multiple scatter: theta is milliradians, so sin θ ≈ θ and
+// cos θ ≈ 1 − θ²/2; the rare gaussian tail past ~0.15 rad uses the exact rotation.
+fn rotate_ms(d: vec3f, theta: f32, phi: f32) -> vec3f {
+    var cT = 1.0 - 0.5 * theta * theta;
+    var sT = theta;
+    if (abs(theta) > 0.15) {
+        cT = cos(theta);
+        sT = sin(theta);
+    }
+    let cP = cos(phi);
+    let sP = sin(phi);
+    var o: vec3f;
+    if (abs(d.z) < 0.999999) {
+        let r = sqrt(1.0 - d.z * d.z);
+        o.x = d.x * cT + (sT / r) * (d.x * d.z * cP - d.y * sP);
+        o.y = d.y * cT + (sT / r) * (d.y * d.z * cP + d.x * sP);
+        o.z = d.z * cT - r * sT * cP;
+    } else {
+        o.y = sT * sP;
+        if (d.z > 0.0) { o.x = sT * cP; o.z = cT; } else { o.x = -sT * cP; o.z = -cT; }
+    }
+    return o * (1.5 - 0.5 * dot(o, o));
 }
 
 // Compute_Ionization_Energy.
@@ -759,19 +793,24 @@ fn hadron_step(pp: ptr<function, Particle>, wp: ptr<function, Where>) -> bool {
     let step_max = min(min(dist_to_interface(p.x, p.d), D_MAX), EPS_MAX * p.T / S);
     let dE_max = step_max * S;
 
-    // Total_Hard_Cross_Section
-    var sig = sigma_ion(nel, z2, k) + sigma_nuc(mb, p.T, rho);
+    // Total_Hard_Cross_Section. sigma_ion falls with energy above its ~47 MeV
+    // peak, so over the step its bound is at the lower energy then — but below
+    // ~60 MeV the rising edge and delta-ray cutoff make it non-monotone, and
+    // both endpoints must be checked. sigma_nuc peaks at an end of the
+    // (piecewise-linear table) interval.
     var T2 = p.T - dE_max;
     if (T2 <= 0.0) { T2 = p.T; }
     let k2 = kin(T2, p.mass);
-    sig = max(sig, sigma_ion(nel, z2, k2) + sigma_nuc(mb, T2, rho));
+    var s_ion = sigma_ion(nel, z2, k2);
+    if (T2 < 60e6 * p.mass) { s_ion = max(s_ion, sigma_ion(nel, z2, k)); }
+    var sig = s_ion + max(sigma_nuc(mb, p.T, rho), sigma_nuc(mb, T2, rho));
     sig = (sig + 1e-10) * 1.017;
 
     // Dose-to-water: medium over water mass stopping power at the start of the step.
     var spr: f32 = 1.0;
     if (to_water) { spr = sp / stop_pow(mbase(WATER_MEDIUM), p.T, p.mass); }
 
-    var step = -log(urand()) / sig;
+    var step = -flog(urand()) / sig;
     if (step > step_max) { step = step_max; }
     let mean_dE = compute_dE2(mb, nel, rho, z2, p.T, p.mass, sp, k, step);
     let strag = sqrt(TWO_PI_RE2_MC2 * nel * z2 * step * min(TE_MIN, k.w) * (1.0 - 0.5 * k.z) / k.z);
@@ -792,7 +831,7 @@ fn hadron_step(pp: ptr<function, Particle>, wp: ptr<function, Where>) -> bool {
     if (!alive) { return false; }
 
     let there = locate(p.x);
-    p.d = rotate(p.d, theta, phi);
+    p.d = rotate_ms(p.d, theta, phi);
     if (there.reg < 0) {
         if (g_geom == GEOM_SHIFTER && p.x.z < g_rs_lo) {
             if (g_nexit < EXITS) {
@@ -807,11 +846,10 @@ fn hadron_step(pp: ptr<function, Particle>, wp: ptr<function, Where>) -> bool {
         }
         return false;
     }
-    k = kin(p.T, p.mass);
-
     // get_interaction_type, with the start-of-step material and majorant.
     var itype = 0;
     if (step != step_max) {
+        k = kin(p.T, p.mass);
         let r = urand();
         let si = sigma_ion(nel, z2, k) / sig;
         if (r <= si) { itype = 1; } else if (r <= si + sigma_nuc(mb, p.T, rho) / sig) { itype = 2; }
@@ -1065,7 +1103,7 @@ fn transport_loop() {
     atomicMax(&ledger[15], u32(longest));
 }
 
-@compute @workgroup_size(64)
+@compute @workgroup_size(128)
 fn main(@builtin(local_invocation_index) lid: u32) {
     if (lid == 0u) {
         atomicStore(&w_init, 0u);
