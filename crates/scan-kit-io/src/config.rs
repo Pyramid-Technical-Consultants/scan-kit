@@ -10,7 +10,6 @@ use chrono::{Local, TimeZone};
 use md5::{Digest, Md5};
 use scan_kit_core::{apply_form, config_form, run_tune, tune_catalog, TuneSpots};
 use serde_json::{json, Value};
-use similar::{ChangeTag, TextDiff};
 
 use crate::discover;
 use crate::store::{self, with_store};
@@ -462,52 +461,206 @@ fn whole_file(bytes: &[u8], kind: &str) -> Vec<Value> {
     lines
 }
 
+enum LineOp {
+    Equal { old: usize, new: usize },
+    Delete { old: usize },
+    Insert { new: usize },
+}
+
 fn diff_lines(ours: &[u8], theirs: &[u8]) -> Option<Vec<Value>> {
     let old = text_lines(ours)?;
     let new = text_lines(theirs)?;
-    let diff = TextDiff::from_lines(&old, &new);
-    let mut lines = Vec::new();
-    let mut previous_old = 0_usize;
-    for (hunk_index, hunk) in diff.grouped_ops(DIFF_CONTEXT).iter().enumerate() {
-        if hunk_index > 0 {
-            if let Some(first) = hunk.first() {
-                let gap = first.as_tag_tuple().1.start.saturating_sub(previous_old);
-                if gap > 0 {
-                    lines.push(json!({ "kind": "gap", "count": gap }));
-                }
+    let old_lines: Vec<&str> = old.lines().collect();
+    let new_lines: Vec<&str> = new.lines().collect();
+    let ops = line_ops(&old_lines, &new_lines)?;
+    hunk_lines(&ops, &old_lines, &new_lines)
+}
+
+/// Shortest line edit script. `ponytail:` aborts past 2_000 edits (the diff
+/// view already refuses a longer row list). A longer config with a small edit
+/// still returns; a full rewrite comes back as binary.
+fn line_ops(old: &[&str], new: &[&str]) -> Option<Vec<LineOp>> {
+    let n = old.len() as isize;
+    let m = new.len() as isize;
+    if n == 0 && m == 0 {
+        return Some(Vec::new());
+    }
+    let limit = (n + m).min(DIFF_MAX_LINES as isize);
+    let offset = limit + 1;
+    let idx = |k: isize| (k + offset) as usize;
+    let mut frontier = vec![0isize; (2 * limit + 3) as usize];
+    let mut trace = Vec::new();
+    for d in 0..=limit {
+        let mut k = -d;
+        while k <= d {
+            let mut x = if k == -d || (k != d && frontier[idx(k - 1)] < frontier[idx(k + 1)]) {
+                frontier[idx(k + 1)]
+            } else {
+                frontier[idx(k - 1)] + 1
+            };
+            let mut y = x - k;
+            while x < n && y < m && old[x as usize] == new[y as usize] {
+                x += 1;
+                y += 1;
+            }
+            frontier[idx(k)] = x;
+            if x >= n && y >= m {
+                trace.push(frontier.clone());
+                return Some(backtrack(&trace, n, m, offset));
+            }
+            k += 2;
+        }
+        trace.push(frontier.clone());
+    }
+    None
+}
+
+fn backtrack(trace: &[Vec<isize>], n: isize, m: isize, offset: isize) -> Vec<LineOp> {
+    let idx = |k: isize| (k + offset) as usize;
+    let mut x = n;
+    let mut y = m;
+    let mut out = Vec::new();
+    for d in (0..trace.len()).rev() {
+        let frontier = &trace[d];
+        let d = d as isize;
+        let k = x - y;
+        let prev_k = if k == -d || (k != d && frontier[idx(k - 1)] < frontier[idx(k + 1)]) {
+            k + 1
+        } else {
+            k - 1
+        };
+        let prev_x = frontier[idx(prev_k)];
+        let prev_y = prev_x - prev_k;
+        while x > prev_x && y > prev_y {
+            x -= 1;
+            y -= 1;
+            out.push(LineOp::Equal {
+                old: x as usize,
+                new: y as usize,
+            });
+        }
+        if d > 0 {
+            if x == prev_x {
+                y -= 1;
+                out.push(LineOp::Insert { new: y as usize });
+            } else {
+                x -= 1;
+                out.push(LineOp::Delete { old: x as usize });
             }
         }
-        for op in hunk {
-            for change in diff.iter_changes(op) {
-                let text = change.value().trim_end_matches(['\n', '\r']);
-                match change.tag() {
-                    ChangeTag::Equal => lines.push(json!({
-                        "kind": "context",
-                        "old_no": change.old_index().map(|n| n + 1),
-                        "new_no": change.new_index().map(|n| n + 1),
-                        "text": text,
-                    })),
-                    ChangeTag::Delete => lines.push(json!({
-                        "kind": "del",
-                        "old_no": change.old_index().map(|n| n + 1),
-                        "text": text,
-                    })),
-                    ChangeTag::Insert => lines.push(json!({
-                        "kind": "add",
-                        "new_no": change.new_index().map(|n| n + 1),
-                        "text": text,
-                    })),
-                }
+    }
+    out.reverse();
+    out
+}
+
+fn hunk_lines(ops: &[LineOp], old: &[&str], new: &[&str]) -> Option<Vec<Value>> {
+    if ops.iter().all(|op| matches!(op, LineOp::Equal { .. })) {
+        return Some(Vec::new());
+    }
+    let mut ranges = Vec::new();
+    let mut cursor = 0;
+    while cursor < ops.len() {
+        if matches!(ops[cursor], LineOp::Equal { .. }) {
+            cursor += 1;
+            continue;
+        }
+        let mut start = cursor;
+        let mut before = 0;
+        while start > 0 && before < DIFF_CONTEXT && matches!(ops[start - 1], LineOp::Equal { .. }) {
+            start -= 1;
+            before += 1;
+        }
+        let mut end = cursor;
+        loop {
+            while end < ops.len() && !matches!(ops[end], LineOp::Equal { .. }) {
+                end += 1;
+            }
+            let equals_at = end;
+            let mut equals = 0;
+            while end + equals < ops.len()
+                && matches!(ops[end + equals], LineOp::Equal { .. })
+                && equals <= DIFF_CONTEXT * 2
+            {
+                equals += 1;
+            }
+            let next = end + equals;
+            if equals <= DIFF_CONTEXT * 2 && next < ops.len() {
+                end = next;
+                continue;
+            }
+            end = equals_at + equals.min(DIFF_CONTEXT);
+            break;
+        }
+        if let Some((_, last_end)) = ranges.last_mut() {
+            if start <= *last_end {
+                *last_end = (*last_end).max(end);
+                cursor = *last_end;
+                continue;
+            }
+        }
+        ranges.push((start, end));
+        cursor = end;
+    }
+
+    let mut lines = Vec::new();
+    let mut previous_old = 0usize;
+    for (hunk_index, (start, end)) in ranges.iter().copied().enumerate() {
+        let old_start = old_pos(ops, start, old.len());
+        if hunk_index > 0 {
+            let gap = old_start.saturating_sub(previous_old);
+            if gap > 0 {
+                lines.push(json!({ "kind": "gap", "count": gap }));
                 if lines.len() > DIFF_MAX_LINES {
                     return None;
                 }
             }
         }
-        if let Some(last) = hunk.last() {
-            previous_old = last.as_tag_tuple().1.end;
+        for op in &ops[start..end] {
+            lines.push(match *op {
+                LineOp::Equal {
+                    old: old_at,
+                    new: new_at,
+                } => json!({
+                    "kind": "context",
+                    "old_no": old_at + 1,
+                    "new_no": new_at + 1,
+                    "text": old[old_at],
+                }),
+                LineOp::Delete { old: old_at } => json!({
+                    "kind": "del",
+                    "old_no": old_at + 1,
+                    "text": old[old_at],
+                }),
+                LineOp::Insert { new: new_at } => json!({
+                    "kind": "add",
+                    "new_no": new_at + 1,
+                    "text": new[new_at],
+                }),
+            });
+            if lines.len() > DIFF_MAX_LINES {
+                return None;
+            }
         }
+        previous_old = ops[start..end]
+            .iter()
+            .rev()
+            .find_map(|op| match op {
+                LineOp::Equal { old, .. } | LineOp::Delete { old } => Some(old + 1),
+                LineOp::Insert { .. } => None,
+            })
+            .unwrap_or(old_start);
     }
     Some(lines)
+}
+
+fn old_pos(ops: &[LineOp], index: usize, old_len: usize) -> usize {
+    ops[index..]
+        .iter()
+        .find_map(|op| match op {
+            LineOp::Equal { old, .. } | LineOp::Delete { old } => Some(*old),
+            LineOp::Insert { .. } => None,
+        })
+        .unwrap_or(old_len)
 }
 
 pub fn integrity(path: &Path) -> Value {
@@ -1264,6 +1417,67 @@ mod tests {
             .unwrap()
             .is_empty());
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_line_diff_keeps_three_lines_of_context_and_folds_the_middle() {
+        let old = (0..20).map(|i| format!("l{i}\n")).collect::<String>();
+        let new = (0..20)
+            .map(|i| {
+                if i == 1 || i == 12 {
+                    format!("x{i}\n")
+                } else {
+                    format!("l{i}\n")
+                }
+            })
+            .collect::<String>();
+        let lines = super::diff_lines(old.as_bytes(), new.as_bytes()).unwrap();
+        assert_eq!(
+            lines
+                .iter()
+                .map(|row| row["kind"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            [
+                "context", "del", "add", "context", "context", "context", "gap", "context",
+                "context", "context", "del", "add", "context", "context", "context",
+            ]
+        );
+        assert_eq!(lines[1]["text"], "l1");
+        assert_eq!(lines[1]["old_no"], 2);
+        assert_eq!(lines[2]["text"], "x1");
+        assert_eq!(lines[2]["new_no"], 2);
+        assert_eq!(lines[6]["count"], 4);
+        assert_eq!(lines[10]["old_no"], 13);
+        assert_eq!(lines[11]["new_no"], 13);
+    }
+
+    #[test]
+    fn a_line_diff_numbers_inserts_deletes_and_an_empty_side() {
+        let edited = super::diff_lines(b"a\nb\nc\n", b"a\nx\nb\n").unwrap();
+        assert_eq!(edited[0]["kind"], "context");
+        assert_eq!(edited[0]["old_no"], 1);
+        assert_eq!(edited[0]["new_no"], 1);
+        assert_eq!(edited[1]["kind"], "add");
+        assert_eq!(edited[1]["text"], "x");
+        assert_eq!(edited[1]["new_no"], 2);
+        assert_eq!(edited[2]["text"], "b");
+        assert_eq!(edited[2]["old_no"], 2);
+        assert_eq!(edited[2]["new_no"], 3);
+        assert_eq!(edited[3]["kind"], "del");
+        assert_eq!(edited[3]["text"], "c");
+        assert_eq!(edited[3]["old_no"], 3);
+
+        let added = super::diff_lines(b"", b"a\nb\n").unwrap();
+        assert_eq!(added.len(), 2);
+        assert_eq!(added[0]["kind"], "add");
+        assert_eq!(added[0]["new_no"], 1);
+        assert_eq!(added[1]["text"], "b");
+
+        let removed = super::diff_lines(b"a\nb\n", b"").unwrap();
+        assert_eq!(removed.len(), 2);
+        assert_eq!(removed[0]["kind"], "del");
+        assert_eq!(removed[1]["old_no"], 2);
+        assert_eq!(removed[1]["text"], "b");
     }
 
     fn preview_row<'a>(result: &'a Value, device: &str, energy: &str) -> &'a Value {
