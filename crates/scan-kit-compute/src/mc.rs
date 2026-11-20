@@ -26,6 +26,9 @@ struct Fold {
 @group(0) @binding(2) var<storage, read_write> dose_sq: array<f32>;
 @group(0) @binding(3) var<storage, read_write> dose_out: array<f32>;
 @group(0) @binding(4) var<uniform> P: Fold;
+// stats: 0 dose_sum peak bits, 1-2 rel sum (u64, 1e-6 quanta), 3 rel count,
+// 4 batch count written by the host. Reduces what the CPU used to read back.
+@group(0) @binding(5) var<storage, read_write> stats: array<atomic<u32>>;
 
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) g: vec3u, @builtin(num_workgroups) nwg: vec3u) {
@@ -46,6 +49,64 @@ fn main(@builtin(global_invocation_id) g: vec3u, @builtin(num_workgroups) nwg: v
     dose_sum[i] = s;
     dose_sq[i] += b * b;
     if (P.mode == 1) { dose_out[i] = s * P.gain; }
+}
+
+var<workgroup> red_s: array<f32, 256>;
+var<workgroup> red_c: array<u32, 256>;
+
+// stats_peak then stats_rel in the same pass: peak of dose_sum, then the relative
+// spread of voxels above half of it, so the host reads 16 bytes, not 2 cubes.
+@compute @workgroup_size(256)
+fn stats_peak(
+    @builtin(global_invocation_id) g: vec3u,
+    @builtin(num_workgroups) nwg: vec3u,
+    @builtin(local_invocation_index) lid: u32,
+) {
+    let i = g.x + g.y * nwg.x * 256u;
+    var v = 0.0;
+    if (i < P.n) { v = dose_sum[i]; }
+    red_s[lid] = v;
+    workgroupBarrier();
+    for (var s = 128u; s > 0u; s >>= 1u) {
+        if (lid < s) { red_s[lid] = max(red_s[lid], red_s[lid + s]); }
+        workgroupBarrier();
+    }
+    if (lid == 0u) { atomicMax(&stats[0u], bitcast<u32>(red_s[0])); }
+}
+
+@compute @workgroup_size(256)
+fn stats_rel(
+    @builtin(global_invocation_id) g: vec3u,
+    @builtin(num_workgroups) nwg: vec3u,
+    @builtin(local_invocation_index) lid: u32,
+) {
+    let i = g.x + g.y * nwg.x * 256u;
+    let n = f32(atomicLoad(&stats[4u]));
+    var acc = 0.0;
+    var cnt = 0u;
+    if (i < P.n && n > 0.0) {
+        let dose = dose_sum[i];
+        if (dose > 0.5 * bitcast<f32>(atomicLoad(&stats[0u]))) {
+            acc = sqrt(max(n * (dose_sq[i] * n / (dose * dose) - 1.0), 0.0)) / n;
+            cnt = 1u;
+        }
+    }
+    red_s[lid] = acc;
+    red_c[lid] = cnt;
+    workgroupBarrier();
+    for (var s = 128u; s > 0u; s >>= 1u) {
+        if (lid < s) {
+            red_s[lid] += red_s[lid + s];
+            red_c[lid] += red_c[lid + s];
+        }
+        workgroupBarrier();
+    }
+    if (lid == 0u) {
+        let q = u32(red_s[0] * 1e6);
+        let old = atomicAdd(&stats[1u], q);
+        if (old + q < old) { atomicAdd(&stats[2u], 1u); }
+        atomicAdd(&stats[3u], red_c[0]);
+    }
 }
 "#;
 
@@ -202,19 +263,29 @@ enum Slice {
     Cancelled,
 }
 
+struct ReadTicket {
+    index: wgpu::SubmissionIndex,
+    /// One buffer per read: a dropped ticket can never leave a later read's
+    /// staging mid-map.
+    staging: wgpu::Buffer,
+    receiver: std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>,
+    histories: u32,
+}
+
 struct Live {
     device: wgpu::Device,
     queue: wgpu::Queue,
     transport_pipe: wgpu::ComputePipeline,
     transport_group: wgpu::BindGroup,
     fold_pipe: wgpu::ComputePipeline,
+    stats_peak_pipe: wgpu::ComputePipeline,
+    stats_rel_pipe: wgpu::ComputePipeline,
     fold_group: wgpu::BindGroup,
     params: wgpu::Buffer,
     ledger: wgpu::Buffer,
     fold_params: wgpu::Buffer,
     out: wgpu::Buffer,
-    sum: wgpu::Buffer,
-    sq: wgpu::Buffer,
+    stats: wgpu::Buffer,
     /// Buffers the bind groups borrow. Read so the field is not dead.
     kept: Vec<wgpu::Buffer>,
     base: [u8; 80],
@@ -392,6 +463,8 @@ struct McGpu {
     fold_layout: wgpu::BindGroupLayout,
     transport_pipe: wgpu::ComputePipeline,
     fold_pipe: wgpu::ComputePipeline,
+    stats_peak_pipe: wgpu::ComputePipeline,
+    stats_rel_pipe: wgpu::ComputePipeline,
 }
 
 /// One device and one compiled transport for the process. Opening a device and
@@ -445,11 +518,14 @@ async fn open_gpu() -> Result<McGpu, ComputeError> {
             store(false),
             store(false),
             uniform(),
+            store(false),
         ],
     );
     Ok(McGpu {
-        transport_pipe: pipeline(&device, &transport_layout, &transport),
-        fold_pipe: pipeline(&device, &fold_layout, &fold),
+        transport_pipe: pipeline(&device, &transport_layout, &transport, "main"),
+        fold_pipe: pipeline(&device, &fold_layout, &fold, "main"),
+        stats_peak_pipe: pipeline(&device, &fold_layout, &fold, "stats_peak"),
+        stats_rel_pipe: pipeline(&device, &fold_layout, &fold, "stats_rel"),
         device,
         queue,
         transport_layout,
@@ -467,6 +543,8 @@ async fn prepare(launch: Launch) -> Result<Live, ComputeError> {
     let fold_layout = gpu.fold_layout.clone();
     let transport_pipe = gpu.transport_pipe.clone();
     let fold_pipe = gpu.fold_pipe.clone();
+    let stats_peak_pipe = gpu.stats_peak_pipe.clone();
+    let stats_rel_pipe = gpu.stats_rel_pipe.clone();
     let tables = mc_tables();
     let histories = batch_count(launch.histories);
     let per_batch = (histories / 10).clamp(1, 100_000);
@@ -491,6 +569,7 @@ async fn prepare(launch: Launch) -> Result<Live, ComputeError> {
     let sq = storage_zero(&device, (nvox * 4) as u64);
     let out = storage_zero(&device, (nvox * 4) as u64);
     let fold_params = uniform_buf(&device, 16);
+    let stats = storage_zero(&device, 32);
 
     let transport_group = bind(
         &device,
@@ -502,7 +581,7 @@ async fn prepare(launch: Launch) -> Result<Live, ComputeError> {
     let fold_group = bind(
         &device,
         &fold_layout,
-        &[&tally, &sum, &sq, &out, &fold_params],
+        &[&tally, &sum, &sq, &out, &fold_params, &stats],
     );
 
     let mut base = [0u8; 80];
@@ -519,14 +598,17 @@ async fn prepare(launch: Launch) -> Result<Live, ComputeError> {
         transport_pipe,
         transport_group,
         fold_pipe,
+        stats_peak_pipe,
+        stats_rel_pipe,
         fold_group,
         params,
         ledger,
         fold_params,
         out,
-        sum,
-        sq,
-        kept: vec![spots, floats, ints, tally, material, density, beams],
+        stats,
+        kept: vec![
+            spots, floats, ints, tally, material, density, beams, sum, sq,
+        ],
         base,
         next: 0,
         histories,
@@ -584,7 +666,7 @@ impl Live {
                 ComputeError::Message("monte carlo finished without a dose".into())
             })?));
         }
-        let mut published = None;
+        let mut ticket = None;
         if self.inflight {
             if cancel.is_cancelled() {
                 self.inflight = false;
@@ -596,20 +678,24 @@ impl Live {
                 return Ok(Slice::Cancelled);
             }
             self.chunk = adapt_chunk(self.chunk, self.floor, self.cap, blocked, budget);
+            if self.next >= self.histories {
+                let result = self.finish()?;
+                self.finished = true;
+                return Ok(Slice::Ready(result));
+            }
             // The first chunk is the rough cube. Later copies are a few times a
             // second, so the view can sharpen while the next chunk is in flight.
             let fresh =
                 self.next > 0 && (self.previews == 0 || self.last_preview.elapsed() >= PREVIEW_GAP);
             if fresh {
-                self.cached = Some(self.preview()?);
-                self.last_preview = Instant::now();
-                self.previews += 1;
-                published = self.cached.clone();
-            }
-            if self.next >= self.histories {
-                let result = self.finish()?;
-                self.finished = true;
-                return Ok(Slice::Ready(result));
+                // The copies land before the next chunk's submission, so the map
+                // resolves while the GPU is already back on transport.
+                ticket = Some(self.begin_read(
+                    2,
+                    1.0 / (self.next.max(1) as f32),
+                    self.next / self.per_batch.max(1),
+                    self.next.max(1),
+                )?);
             }
         }
         if cancel.is_cancelled() {
@@ -617,6 +703,19 @@ impl Live {
         }
         let end = self.next.saturating_add(self.chunk).min(self.histories);
         self.submit_until(end, Some(cancel));
+        let mut published = None;
+        if let Some(ticket) = ticket {
+            // A cancelled collect abandons the ticket; its buffer drops with it.
+            let result = match self.collect_read(&ticket, cancel) {
+                Ok(result) => result,
+                Err(_) if cancel.is_cancelled() => return Ok(Slice::Cancelled),
+                Err(err) => return Err(err),
+            };
+            self.cached = Some(result.clone());
+            self.last_preview = Instant::now();
+            self.previews += 1;
+            published = Some(result);
+        }
         if cancel.is_cancelled() {
             return Ok(Slice::Cancelled);
         }
@@ -639,31 +738,34 @@ impl Live {
             self.queue.write_buffer(&self.params, 0, &self.base);
             self.queue
                 .write_buffer(&self.ledger, 56, &0u32.to_le_bytes());
-            dispatch(
-                &self.device,
-                &self.queue,
-                &self.transport_pipe,
-                &self.transport_group,
-                count.div_ceil(64),
-                1,
-            );
-            self.next += count;
-            if self.next.is_multiple_of(self.per_batch) {
+            let fold = self
+                .next
+                .saturating_add(count)
+                .is_multiple_of(self.per_batch);
+            if fold {
                 self.queue.write_buffer(
                     &self.fold_params,
                     0,
                     &fold_bytes(self.nvox as u32, 0, self.scale, 1.0),
                 );
-                let (x, y) = fold_groups(self.nvox);
-                dispatch(
-                    &self.device,
-                    &self.queue,
-                    &self.fold_pipe,
-                    &self.fold_group,
-                    x,
-                    y,
-                );
             }
+            let mut encoder = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
+                pass.set_pipeline(&self.transport_pipe);
+                pass.set_bind_group(0, &self.transport_group, &[]);
+                pass.dispatch_workgroups(count.div_ceil(64), 1, 1);
+                if fold {
+                    pass.set_pipeline(&self.fold_pipe);
+                    pass.set_bind_group(0, &self.fold_group, &[]);
+                    let (x, y) = fold_groups(self.nvox);
+                    pass.dispatch_workgroups(x, y, 1);
+                }
+            }
+            self.queue.submit(Some(encoder.finish()));
+            self.next += count;
         }
     }
 
@@ -686,65 +788,134 @@ impl Live {
         }
     }
 
-    fn preview(&self) -> Result<McResult, ComputeError> {
-        let gain = 1.0 / (self.next.max(1) as f32);
+    /// Fold + stats + one staged copy of everything a result needs, submitted
+    /// as a single command buffer. The returned ticket's map completes once
+    /// that submission retires — later submissions may still be running.
+    fn begin_read(
+        &self,
+        mode: i32,
+        gain: f32,
+        batches: u32,
+        histories: u32,
+    ) -> Result<ReadTicket, ComputeError> {
         self.queue.write_buffer(
             &self.fold_params,
             0,
-            &fold_bytes(self.nvox as u32, 2, self.scale, gain),
+            &fold_bytes(self.nvox as u32, mode, self.scale, gain),
         );
-        let (x, y) = fold_groups(self.nvox);
-        dispatch(
-            &self.device,
-            &self.queue,
-            &self.fold_pipe,
-            &self.fold_group,
-            x,
-            y,
-        );
-        self.read_result(self.next.max(1))
+        let mut stat_words = [0u8; 20];
+        stat_words[16..20].copy_from_slice(&batches.to_le_bytes());
+        self.queue.write_buffer(&self.stats, 0, &stat_words);
+        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: (self.nvox * 4 + 80 + if self.score_let { self.nvox * 16 } else { 0 }) as u64,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
+            let (x, y) = fold_groups(self.nvox);
+            pass.set_pipeline(&self.fold_pipe);
+            pass.set_bind_group(0, &self.fold_group, &[]);
+            pass.dispatch_workgroups(x, y, 1);
+            pass.set_pipeline(&self.stats_peak_pipe);
+            pass.dispatch_workgroups(x, y, 1);
+            pass.set_pipeline(&self.stats_rel_pipe);
+            pass.dispatch_workgroups(x, y, 1);
+        }
+        let nvox4 = (self.nvox * 4) as u64;
+        encoder.copy_buffer_to_buffer(&self.out, 0, &staging, 0, nvox4);
+        encoder.copy_buffer_to_buffer(&self.stats, 0, &staging, nvox4, 16);
+        encoder.copy_buffer_to_buffer(&self.ledger, 0, &staging, nvox4 + 16, 64);
+        if self.score_let {
+            encoder.copy_buffer_to_buffer(
+                &self.let_buf,
+                0,
+                &staging,
+                nvox4 + 80,
+                (self.nvox * 16) as u64,
+            );
+        }
+        let index = self.queue.submit(Some(encoder.finish()));
+        let (sender, receiver) = std::sync::mpsc::channel();
+        staging
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, move |result| {
+                let _ = sender.send(result);
+            });
+        Ok(ReadTicket {
+            index,
+            staging,
+            receiver,
+            histories,
+        })
     }
 
-    fn finish(&mut self) -> Result<McResult, ComputeError> {
-        let gain = 1.0 / (self.histories.max(1) as f32);
-        self.queue.write_buffer(
-            &self.fold_params,
-            0,
-            &fold_bytes(self.nvox as u32, 1, self.scale, gain),
-        );
-        let (x, y) = fold_groups(self.nvox);
-        dispatch(
-            &self.device,
-            &self.queue,
-            &self.fold_pipe,
-            &self.fold_group,
-            x,
-            y,
-        );
-        let result = self.read_result(self.histories.max(1))?;
-        self.cached = Some(result.clone());
-        self.finished = true;
-        Ok(result)
-    }
-
-    fn read_result(&self, histories: u32) -> Result<McResult, ComputeError> {
-        let dose = read_f32(&self.device, &self.queue, &self.out, self.nvox)?;
-        let dose_sum = read_f32(&self.device, &self.queue, &self.sum, self.nvox)?;
-        let dose_sq = read_f32(&self.device, &self.queue, &self.sq, self.nvox)?;
-        let raw = read_u32(&self.device, &self.queue, &self.ledger, 16)?;
-        let histories = histories.max(1);
+    fn collect_read(&self, ticket: &ReadTicket, cancel: &Cancel) -> Result<McResult, ComputeError> {
+        // Only the copy submission is awaited: a transport chunk submitted
+        // after it keeps the GPU busy while the dose is on its way back.
+        loop {
+            if cancel.is_cancelled() {
+                return Err(ComputeError::Message("cancelled".into()));
+            }
+            match self.device.poll(wgpu::PollType::Wait {
+                submission_index: Some(ticket.index.clone()),
+                timeout: Some(Duration::from_millis(50)),
+            }) {
+                Ok(_) | Err(wgpu::PollError::Timeout) => {}
+                Err(err) => return Err(ComputeError::Message(err.to_string())),
+            }
+            match ticket.receiver.try_recv() {
+                Ok(result) => {
+                    result.map_err(|err| ComputeError::Message(err.to_string()))?;
+                    break;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => continue,
+                Err(err) => return Err(ComputeError::Message(err.to_string())),
+            }
+        }
+        let mapped = ticket
+            .staging
+            .slice(..)
+            .get_mapped_range()
+            .map_err(|err| ComputeError::Message(err.to_string()))?;
+        let nvox4 = self.nvox * 4;
+        let dose: Vec<f32> = mapped[..nvox4]
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|chunk| f32::from_le_bytes(*chunk))
+            .collect();
+        let stat = &mapped[nvox4..nvox4 + 16];
+        let rel_sum =
+            (u64::from(u32_le(stat, 1)) | (u64::from(u32_le(stat, 2)) << 32)) as f64 / 1e6;
+        let rel_count = u64::from(u32_le(stat, 3));
+        let raw = &mapped[nvox4 + 16..nvox4 + 80];
         let mut ledger_mev = [0.0f32; 6];
         for i in 0..6 {
-            let lo = u64::from(raw[i * 2]);
-            let hi = u64::from(raw[i * 2 + 1]);
-            let quanta = ((hi << 32) | lo) as i64;
-            ledger_mev[i] = (quanta as f64 * QUANTUM_MEV / f64::from(histories)) as f32;
+            let quanta = pack_i64(u32_le(raw, i * 2), u32_le(raw, i * 2 + 1));
+            ledger_mev[i] = (quanta as f64 * QUANTUM_MEV / f64::from(ticket.histories)) as f32;
         }
         let let_d = if self.score_let {
-            read_let(&self.device, &self.queue, &self.let_buf, self.nvox)?
+            let region = &mapped[nvox4 + 80..nvox4 + 80 + self.nvox * 16];
+            let mut out = vec![0.0f32; self.nvox];
+            for (i, slot) in out.iter_mut().enumerate() {
+                let words = &region[i * 16..i * 16 + 16];
+                let den = pack_i64(u32_le(words, 2), u32_le(words, 3));
+                if den > 0 {
+                    let num = pack_i64(u32_le(words, 0), u32_le(words, 1));
+                    *slot = (num as f64 / den as f64) as f32;
+                }
+            }
+            out
         } else {
             Vec::new()
         };
+        drop(mapped);
+        ticket.staging.unmap();
         Ok(McResult {
             volume: Volume {
                 origin: self.origin,
@@ -752,10 +923,27 @@ impl Live {
                 spacing: self.spacing,
                 values: dose,
             },
-            uncertainty: uncertainty(&dose_sum, &dose_sq, histories / self.per_batch.max(1)),
+            uncertainty: if rel_count == 0 {
+                0.0
+            } else {
+                (rel_sum / rel_count as f64) as f32
+            },
             ledger: ledger_mev,
             let_d,
         })
+    }
+
+    fn finish(&mut self) -> Result<McResult, ComputeError> {
+        let ticket = self.begin_read(
+            1,
+            1.0 / (self.histories.max(1) as f32),
+            self.histories.max(1) / self.per_batch.max(1),
+            self.histories.max(1),
+        )?;
+        let result = self.collect_read(&ticket, &Cancel::new())?;
+        self.cached = Some(result.clone());
+        self.finished = true;
+        Ok(result)
     }
 }
 
@@ -773,28 +961,6 @@ fn history_note(done: u32, total: u32, uncertainty: f32) -> String {
 
 fn batch_count(histories: u32) -> u32 {
     histories.max(10)
-}
-
-fn uncertainty(sum: &[f32], sq: &[f32], batches: u32) -> f32 {
-    let peak = sum.iter().copied().fold(0.0f32, f32::max);
-    if peak <= 0.0 || batches == 0 {
-        return 0.0;
-    }
-    let n = batches as f32;
-    let mut total = 0.0f64;
-    let mut count = 0u32;
-    for (dose, square) in sum.iter().zip(sq) {
-        if *dose > 0.5 * peak {
-            let rel = (n * (square * n / (dose * dose) - 1.0)).max(0.0).sqrt() / n;
-            total += f64::from(rel);
-            count += 1;
-        }
-    }
-    if count == 0 {
-        0.0
-    } else {
-        (total / f64::from(count)) as f32
-    }
 }
 
 fn write_params(bytes: &mut [u8], launch: &Launch, nspots: usize) {
@@ -910,6 +1076,7 @@ fn pipeline(
     device: &wgpu::Device,
     layout: &wgpu::BindGroupLayout,
     module: &wgpu::ShaderModule,
+    entry: &str,
 ) -> wgpu::ComputePipeline {
     let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: None,
@@ -920,7 +1087,7 @@ fn pipeline(
         label: None,
         layout: Some(&pipeline_layout),
         module,
-        entry_point: Some("main"),
+        entry_point: Some(entry),
         compilation_options: Default::default(),
         cache: None,
     })
@@ -988,37 +1155,12 @@ fn bind(
     })
 }
 
-fn dispatch(
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
-    pipeline: &wgpu::ComputePipeline,
-    group: &wgpu::BindGroup,
-    x: u32,
-    y: u32,
-) {
-    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-    {
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
-        pass.set_pipeline(pipeline);
-        pass.set_bind_group(0, group, &[]);
-        pass.dispatch_workgroups(x.max(1), y.max(1), 1);
-    }
-    queue.submit(Some(encoder.finish()));
-}
-
-fn read_f32(
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
-    buffer: &wgpu::Buffer,
-    count: usize,
-) -> Result<Vec<f32>, ComputeError> {
-    let bytes = read_bytes(device, queue, buffer, count * 4)?;
-    Ok(bytes
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|chunk| f32::from_le_bytes(*chunk))
-        .collect())
+fn u32_le(bytes: &[u8], index: usize) -> u32 {
+    u32::from_le_bytes(
+        bytes[index * 4..index * 4 + 4]
+            .try_into()
+            .expect("u32 word"),
+    )
 }
 
 fn pack_i64(lo: u32, hi: u32) -> i64 {
@@ -1026,87 +1168,6 @@ fn pack_i64(lo: u32, hi: u32) -> i64 {
     bytes[..4].copy_from_slice(&lo.to_le_bytes());
     bytes[4..].copy_from_slice(&hi.to_le_bytes());
     i64::from_le_bytes(bytes)
-}
-
-/// Dose-weighted LET, keV/µm. Each voxel is two little-endian i64 quanta: E×LET, then E.
-fn read_let(
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
-    buffer: &wgpu::Buffer,
-    nvox: usize,
-) -> Result<Vec<f32>, ComputeError> {
-    let raw = read_u32(device, queue, buffer, nvox * 4)?;
-    let mut out = vec![0.0f32; nvox];
-    for (i, slot) in out.iter_mut().enumerate() {
-        let den = pack_i64(raw[i * 4 + 2], raw[i * 4 + 3]);
-        if den > 0 {
-            let num = pack_i64(raw[i * 4], raw[i * 4 + 1]);
-            *slot = (num as f64 / den as f64) as f32;
-        }
-    }
-    Ok(out)
-}
-
-fn read_u32(
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
-    buffer: &wgpu::Buffer,
-    count: usize,
-) -> Result<Vec<u32>, ComputeError> {
-    let bytes = read_bytes(device, queue, buffer, count * 4)?;
-    Ok(bytes
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|chunk| u32::from_le_bytes(*chunk))
-        .collect())
-}
-
-fn read_bytes(
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
-    buffer: &wgpu::Buffer,
-    size: usize,
-) -> Result<Vec<u8>, ComputeError> {
-    let staging = device.create_buffer(&wgpu::BufferDescriptor {
-        label: None,
-        size: size as u64,
-        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-    encoder.copy_buffer_to_buffer(buffer, 0, &staging, 0, size as u64);
-    queue.submit(Some(encoder.finish()));
-    let (sender, receiver) = std::sync::mpsc::channel();
-    staging
-        .slice(..)
-        .map_async(wgpu::MapMode::Read, move |result| {
-            let _ = sender.send(result);
-        });
-    // Short waits, same as a running chunk. An indefinite poll holds the shared
-    // device, so a new voxel size cannot cancel until that read finishes.
-    loop {
-        match device.poll(wgpu::PollType::Wait {
-            submission_index: None,
-            timeout: Some(Duration::from_millis(50)),
-        }) {
-            Ok(_) => break,
-            Err(wgpu::PollError::Timeout) => continue,
-            Err(err) => return Err(ComputeError::Message(err.to_string())),
-        }
-    }
-    receiver
-        .recv()
-        .map_err(|err| ComputeError::Message(err.to_string()))?
-        .map_err(|err| ComputeError::Message(err.to_string()))?;
-    let mapped = staging
-        .slice(..)
-        .get_mapped_range()
-        .map_err(|err| ComputeError::Message(err.to_string()))?;
-    let out = mapped.to_vec();
-    drop(mapped);
-    staging.unmap();
-    Ok(out)
 }
 
 async fn mc_device() -> Result<(wgpu::Device, wgpu::Queue), ComputeError> {
@@ -1357,6 +1418,12 @@ mod tests {
         assert!(quiet > 0, "every poll republished the cube");
         assert_eq!(ready.volume.values, one.volume.values);
         assert_eq!(ready.ledger, one.ledger);
+        assert_eq!(ready.uncertainty, one.uncertainty);
+        assert!(
+            (0.0..0.5).contains(&one.uncertainty),
+            "uncertainty {} out of range",
+            one.uncertainty
+        );
     }
 
     #[test]
