@@ -160,6 +160,7 @@ pub(crate) fn assemble(space: Workspace) -> (Vec<Panel>, VolumeMark) {
         plans: Vec::new(),
         companions: Vec::new(),
         integrals: Vec::new(),
+        prepared: None,
     };
     (panels, mark)
 }

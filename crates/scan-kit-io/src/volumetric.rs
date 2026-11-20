@@ -475,7 +475,8 @@ pub fn volumetric(
     let session_at = session_at(options, session_ids).min(shown.len().saturating_sub(1));
     if has_dose {
         if let Some(volume) = shown.get(session_at) {
-            let (ix, iy, iz) = volume.peak_index();
+            let scan = scan_kit_core::scan_volume(volume);
+            let [ix, iy, iz] = scan.peak_at;
             let cells = crate::workspace::cells_from(&[
                 options.get("cell0").and_then(Value::as_str),
                 options.get("cell1").and_then(Value::as_str),
@@ -527,6 +528,9 @@ pub fn volumetric(
             // that switch does not start another calculation.
             mark.field = extent.unwrap_or([0.0; 6]);
             mark.unit = volume_unit(quantity, mode, compare).into();
+            if volume.spacing.iter().all(|mm| *mm > 0.0) {
+                mark.prepared = Some(scan);
+            }
             panels = built;
             if let Some(view) = panels
                 .iter_mut()

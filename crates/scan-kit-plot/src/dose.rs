@@ -8,7 +8,7 @@
 
 use std::sync::{Arc, OnceLock};
 
-use scan_kit_core::{index, robust_high, sample, scan_volume, Volume, BRICK};
+use scan_kit_core::{index, robust_high, sample, scan_volume, Volume};
 #[cfg(not(target_arch = "wasm32"))]
 use scan_kit_core::{ray_rgba, RayView};
 
@@ -84,20 +84,7 @@ pub struct ViewSample {
 }
 
 fn scan_fits(scan: &scan_kit_core::VolumeScan, shape: [usize; 3]) -> bool {
-    let [nx, ny, nz] = shape;
-    let expect = [
-        nx.div_ceil(BRICK).max(1),
-        ny.div_ceil(BRICK).max(1),
-        nz.div_ceil(BRICK).max(1),
-    ];
-    let bricks = expect[0]
-        .saturating_mul(expect[1])
-        .saturating_mul(expect[2]);
-    scan.brick_shape == expect
-        && scan.bricks.len() == bricks
-        && scan.integrals[0].len() == nx.saturating_mul(ny)
-        && scan.integrals[1].len() == nx.saturating_mul(nz)
-        && scan.integrals[2].len() == ny.saturating_mul(nz)
+    scan.covers(shape)
 }
 
 pub fn grid_from(
