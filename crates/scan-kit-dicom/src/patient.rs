@@ -1143,7 +1143,25 @@ fn text_tag(elems: &[Elem], tag: u32) -> String {
 }
 
 fn floats_tag(elems: &[Elem], tag: u32) -> Vec<f32> {
-    text_tag(elems, tag)
+    let Some(elem) = elem(elems, tag) else {
+        return Vec::new();
+    };
+    // OF payloads are raw little-endian f32 whatever the transfer syntax —
+    // a value with a non-text byte decodes as floats, not ASCII.
+    if elem
+        .bytes
+        .iter()
+        .any(|byte| !(byte.is_ascii_graphic() || *byte == b' '))
+    {
+        return elem
+            .bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|chunk| f32::from_le_bytes(*chunk))
+            .collect();
+    }
+    text_of(&elem.bytes)
         .split('\\')
         .filter_map(|part| part.trim().parse().ok())
         .collect()
@@ -1724,8 +1742,14 @@ mod tests {
         iv(&mut cp, 0x300A, 0x0114, &even("100"));
         iv(&mut cp, 0x300A, 0x012C, &even("0\\0\\0"));
         iv(&mut cp, 0x300A, 0x0392, &even("1"));
-        iv(&mut cp, 0x300A, 0x0394, &even("0\\0"));
-        iv(&mut cp, 0x300A, 0x0396, &even("1"));
+        // Spot position and weight arrays ride as raw f32 (OF) in real plans.
+        let mut positions = Vec::new();
+        positions.extend_from_slice(&1.5f32.to_le_bytes());
+        positions.extend_from_slice(&(-2.0f32).to_le_bytes());
+        iv(&mut cp, 0x300A, 0x0394, &positions);
+        let mut weights = Vec::new();
+        weights.extend_from_slice(&0.25f32.to_le_bytes());
+        iv(&mut cp, 0x300A, 0x0396, &weights);
         let mut treatment = Vec::new();
         iv(&mut treatment, 0x300A, 0x00C0, &even("1"));
         iv(&mut treatment, 0x300A, 0x00CE, &even("TREATMENT"));
@@ -1742,6 +1766,10 @@ mod tests {
         let plan = read_plan(&parse_file(&bytes).unwrap(), "f".into()).unwrap();
         assert_eq!(plan.beams.len(), 1);
         assert!((plan.beams[0].meterset - 10.0).abs() < 1e-4);
+        let spots = &plan.beams[0].spots;
+        assert_eq!(spots.len(), 1);
+        assert!((spots[0].x - 1.5).abs() < 1e-4);
+        assert!((spots[0].y + 2.0).abs() < 1e-4);
     }
 
     #[test]
