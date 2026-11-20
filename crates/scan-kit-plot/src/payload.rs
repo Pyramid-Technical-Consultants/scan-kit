@@ -9,8 +9,8 @@ use scan_kit_core::{Control, DataTable, Panel, PlotScene, VolumeMark};
 use serde::{Deserialize, Serialize};
 
 use crate::render::{
-    build_marks, build_marks_without_polylines, decode_lines, decode_points, decode_quads,
-    encode_lines, encode_points, encode_quads, header_panels, line_stamp, Marks, PanelBatch, Plot,
+    build_marks_without_polylines, decode_lines, decode_points, decode_quads, encode_lines,
+    encode_points, encode_quads, header_panels, line_stamp, write_strokes, Marks, PanelBatch, Plot,
     LINE_STRIDE, POINT_STRIDE, QUAD_STRIDE,
 };
 
@@ -137,10 +137,12 @@ pub fn encode_plot_reusing(
     let stamp = line_stamp(&scene.panels);
     let held = held_lines.and_then(|text| text.parse::<u64>().ok());
     let reuse = stamp.reusable && held == Some(stamp.token);
-    let marks = if reuse {
-        build_marks_without_polylines(&scene.panels)
+    // Traces are counted here and written once into the finished picture.
+    let marks = build_marks_without_polylines(&scene.panels);
+    let line_count: u32 = if reuse {
+        marks.lines.len() as u32
     } else {
-        build_marks(&scene.panels)
+        marks.panels.iter().map(|batch| batch.line_count).sum()
     };
     let header = PlotHeader {
         title: scene.title.clone(),
@@ -160,7 +162,7 @@ pub fn encode_plot_reusing(
         line_prefix: stamp.prefix,
         batches: marks.panels.clone(),
         heatmap_size: marks.heatmap_size.clone(),
-        lines: marks.lines.len() as u32,
+        lines: line_count,
         points: marks.points.len() as u32,
         quads: marks.quads.len() as u32,
         volume_shape: scene.volume.shape,
@@ -191,14 +193,23 @@ pub fn encode_plot_reusing(
     let json = serde_json::to_vec(&header).map_err(|err| err.to_string())?;
     let mut out = Vec::with_capacity(
         4 + json.len()
-            + marks.lines.len() * LINE_STRIDE as usize
+            + line_count as usize * LINE_STRIDE as usize
             + marks.points.len() * POINT_STRIDE as usize
             + marks.quads.len() * QUAD_STRIDE as usize
             + marks.heatmaps.iter().map(Vec::len).sum::<usize>(),
     );
     out.extend_from_slice(&(json.len() as u32).to_le_bytes());
     out.extend_from_slice(&json);
-    out.extend_from_slice(&encode_lines(&marks.lines));
+    if reuse {
+        out.extend_from_slice(&encode_lines(&marks.lines));
+    } else {
+        let before = out.len();
+        write_strokes(&scene.panels, &mut out);
+        debug_assert_eq!(
+            (out.len() - before) / LINE_STRIDE as usize,
+            line_count as usize
+        );
+    }
     out.extend_from_slice(&encode_points(&marks.points));
     out.extend_from_slice(&encode_quads(&marks.quads));
     for pixels in &marks.heatmaps {
@@ -673,6 +684,7 @@ mod tests {
     use scan_kit_core::Series;
 
     use super::*;
+    use crate::render::build_marks;
 
     #[test]
     fn payload_round_trips_marks_and_panel_frames() {
@@ -1003,5 +1015,56 @@ mod tests {
         let again = encode_plot(&scene, [0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0, 1.0]).unwrap();
         let (_, _, _, _, fresh) = decode_plot(&again).unwrap();
         assert_eq!(fresh.expect("fresh scan").peak_at, [1, 0, 0]);
+    }
+
+    #[test]
+    fn a_gapped_polyline_packs_the_same_line_bytes() {
+        let mut ys = vec![1.0f32; 64];
+        ys[10] = f32::NAN;
+        ys[11] = f32::NAN;
+        ys[40] = 3.5;
+        let xs: Vec<f32> = (0..ys.len()).map(|index| index as f32 * 0.001).collect();
+        let mut scene = PlotScene::empty("timeline");
+        scene.panels = vec![Panel {
+            title: String::new(),
+            y_label: "nA".into(),
+            x_label: String::new(),
+            xmin: 0.0,
+            xmax: xs[xs.len() - 1],
+            ymin: 0.0,
+            ymax: 4.0,
+            series: vec![
+                Series::Polyline {
+                    xs: (0..50_001).map(|index| index as f32).collect(),
+                    ys: vec![0.25; 50_001],
+                    color: [0.1, 0.6, 0.3, 1.0],
+                    thickness: 2.0,
+                },
+                Series::Polyline {
+                    xs,
+                    ys,
+                    color: [0.2, 0.4, 0.8, 1.0],
+                    thickness: 1.5,
+                },
+                Series::Guide {
+                    xs: vec![0.0, 0.02],
+                    ys: vec![0.5, 0.5],
+                    color: [0.9, 0.2, 0.1, 1.0],
+                    thickness: 1.0,
+                },
+            ],
+            x_labels: Vec::new(),
+            equal: false,
+        }];
+        let packed = encode_plot(&scene, [0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0, 1.0]).unwrap();
+        let marks = build_marks(&scene.panels);
+        let classic = encode_lines(&marks.lines);
+        let (header, decoded, _, _, _) = decode_plot(&packed).unwrap();
+        assert_eq!(header.lines as usize, marks.lines.len());
+        assert_eq!(decoded.lines, marks.lines);
+        let json_len = u32::from_le_bytes(packed[..4].try_into().unwrap()) as usize;
+        let start = 4 + json_len;
+        let end = start + classic.len();
+        assert_eq!(&packed[start..end], classic.as_slice());
     }
 }

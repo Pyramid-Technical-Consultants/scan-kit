@@ -2,7 +2,7 @@ use std::path::Path;
 
 use scan_kit_core::{
     hv_capacitance_pf, hv_delta_v, hv_expected_pf, hv_firmware_flags, hv_step_window,
-    robust_limits, row_mask, scrub_control, scrub_limits, segments_control, segments_from,
+    robust_limits_finite, row_mask, scrub_control, scrub_limits, segments_control, segments_from,
     time_end, time_window, welch_psd, BeamGate, Panel, PlotScene, Rank, Segment, Series,
 };
 use serde_json::Value;
@@ -57,10 +57,16 @@ pub(super) fn timeline(root: &Path, session_ids: &[String], options: &Value) -> 
             .iter()
             .filter_map(|table| table.get("time_s").map(Vec::as_slice)),
     );
-    let masks: Vec<Vec<bool>> = tables
-        .iter()
-        .map(|table| row_mask(table, &trace_segments, &keys))
-        .collect();
+    // Beam Both and Rank All keep every row, so the trace is the column itself.
+    let filter_rows = !keeps_every_row(&trace_segments);
+    let masks: Vec<Vec<bool>> = if filter_rows {
+        tables
+            .iter()
+            .map(|table| row_mask(table, &trace_segments, &keys))
+            .collect()
+    } else {
+        Vec::new()
+    };
     let show_fft = flag(&options, "fft", false);
     let fft_masks: Vec<Vec<bool>> = if show_fft {
         tables
@@ -80,20 +86,20 @@ pub(super) fn timeline(root: &Path, session_ids: &[String], options: &Value) -> 
         let mut drawn = Vec::new();
         let mut ymin = f32::MAX;
         let mut ymax = f32::MIN;
-        for (table, keep) in tables.iter().zip(&masks) {
+        for (table_index, table) in tables.iter().enumerate() {
             let Some(samples) = table.get(series.key) else {
                 continue;
             };
-            let samples = gated(samples, keep);
-            if let Some((lo, hi)) = robust_span(&axis_samples(&samples, window)) {
+            let keep = filter_rows.then(|| masks[table_index].as_slice());
+            let (xs, ys, xspan, yspan) = drawn_trace(samples, keep, window);
+            if let Some((lo, hi)) = yspan {
                 ymin = ymin.min(lo);
                 ymax = ymax.max(hi);
             }
-            if let Some((lo, hi)) = finite_window(&samples, window) {
+            if let Some((lo, hi)) = xspan {
                 x_lo = x_lo.min(lo);
                 x_hi = x_hi.max(hi);
             }
-            let (xs, ys) = trace(&samples);
             drawn.push(stroke(xs, ys, false));
         }
         if !drew_line(&drawn) {
@@ -310,6 +316,59 @@ fn on_off(on: bool) -> &'static str {
     }
 }
 
+fn keeps_every_row(segments: &[Segment]) -> bool {
+    segments.iter().all(|item| {
+        matches!(
+            item,
+            Segment::Beam {
+                state: BeamGate::Both
+            } | Segment::Rank { which: Rank::All }
+        )
+    })
+}
+
+/// One walk: the stroke, the finite time span inside `window`, and that window's axis.
+pub(super) fn drawn_trace(
+    samples: &[f32],
+    keep: Option<&[bool]>,
+    window: Option<(f32, f32)>,
+) -> (Vec<f32>, Vec<f32>, Option<(f32, f32)>, Option<(f32, f32)>) {
+    let owned = keep.map(|keep| gated(samples, keep));
+    trace_span(owned.as_deref().unwrap_or(samples), window)
+}
+
+fn trace_span(
+    samples: &[f32],
+    window: Option<(f32, f32)>,
+) -> (Vec<f32>, Vec<f32>, Option<(f32, f32)>, Option<(f32, f32)>) {
+    let n = samples.len();
+    let mut xs = Vec::with_capacity(n);
+    let mut ys = Vec::with_capacity(n);
+    let mut finite = Vec::new();
+    if window.is_none() {
+        finite.reserve(n);
+    }
+    let mut x_lo = f32::MAX;
+    let mut x_hi = f32::MIN;
+    for (index, value) in samples.iter().enumerate() {
+        let t = index as f32 * SAMPLE_S;
+        xs.push(t);
+        ys.push(*value);
+        if !value.is_finite() || !inside(index, window) {
+            continue;
+        }
+        x_lo = x_lo.min(t);
+        x_hi = x_hi.max(t);
+        finite.push(*value);
+    }
+    (
+        xs,
+        ys,
+        (x_lo <= x_hi).then_some((x_lo, x_hi)),
+        robust_limits_finite(&mut finite),
+    )
+}
+
 fn gated(samples: &[f32], keep: &[bool]) -> Vec<f32> {
     samples
         .iter()
@@ -472,55 +531,12 @@ fn fit_time_axis(panels: &mut [Panel], x_lo: f32, x_hi: f32, fft: bool) {
     }
 }
 
-fn axis_samples(samples: &[f32], window: Option<(f32, f32)>) -> Vec<f32> {
-    samples
-        .iter()
-        .enumerate()
-        .filter_map(|(index, value)| {
-            if !value.is_finite() || !inside(index, window) {
-                return None;
-            }
-            Some(*value)
-        })
-        .collect()
-}
-
-fn finite_window(samples: &[f32], window: Option<(f32, f32)>) -> Option<(f32, f32)> {
-    let mut lo = f32::MAX;
-    let mut hi = f32::MIN;
-    for (index, value) in samples.iter().enumerate() {
-        if !value.is_finite() || !inside(index, window) {
-            continue;
-        }
-        let t = index as f32 * SAMPLE_S;
-        lo = lo.min(t);
-        hi = hi.max(t);
-    }
-    (lo <= hi).then_some((lo, hi))
-}
-
 fn inside(index: usize, window: Option<(f32, f32)>) -> bool {
     let Some((lo, hi)) = window else {
         return true;
     };
     let t = index as f32 * SAMPLE_S;
     t >= lo && t <= hi
-}
-
-/// One point per sample. Time is the row index, so a gap stays where the file has one.
-pub(super) fn trace(samples: &[f32]) -> (Vec<f32>, Vec<f32>) {
-    (
-        (0..samples.len())
-            .map(|index| index as f32 * SAMPLE_S)
-            .collect(),
-        samples.to_vec(),
-    )
-}
-
-/// 0.5% tails, then a slim margin. One ADC spike must not set the axis, and a
-/// flat trace stays near its value instead of gaining an empty unit of range.
-pub(super) fn robust_span(samples: &[f32]) -> Option<(f32, f32)> {
-    robust_limits(samples)
 }
 
 fn hv_config_text(root: &Path, session: &str, device: &str) -> Option<String> {
@@ -536,4 +552,76 @@ fn hv_config_text(root: &Path, session: &str, device: &str) -> Option<String> {
             .join("config.json"),
     )
     .ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use scan_kit_core::robust_limits;
+
+    use super::*;
+
+    #[test]
+    fn an_open_trace_keeps_every_sample_and_the_robust_axis() {
+        let mut samples = vec![1.0f32; 400];
+        samples[3] = 10_000.0;
+        samples[10] = f32::NAN;
+        let (xs, ys, xspan, yspan) = drawn_trace(&samples, None, None);
+        assert_eq!(ys.len(), samples.len());
+        assert_eq!(xs.len(), samples.len());
+        assert!(ys[10].is_nan());
+        assert_eq!(ys[3], 10_000.0);
+        assert_eq!(ys[0], 1.0);
+        assert!((xs[10] - 0.010).abs() < 1e-6);
+        let (lo, hi) = yspan.unwrap();
+        let (want_lo, want_hi) = robust_limits(&samples).unwrap();
+        assert_eq!(lo, want_lo);
+        assert_eq!(hi, want_hi);
+        assert!(hi < 10.0, "{hi}");
+        let (x0, x1) = xspan.unwrap();
+        assert_eq!(x0, 0.0);
+        assert!((x1 - 0.399).abs() < 1e-5);
+    }
+
+    #[test]
+    fn a_playhead_window_limits_the_axis_and_keeps_the_trace() {
+        let samples: Vec<f32> = (0..3_000)
+            .map(|index| if index == 2_500 { 80.0 } else { 1.0 })
+            .collect();
+        let (xs, ys, xspan, yspan) = drawn_trace(&samples, None, Some((0.0, 1.0)));
+        assert_eq!(ys.len(), 3_000);
+        assert_eq!(ys[2_500], 80.0);
+        let (lo, hi) = yspan.unwrap();
+        assert!(lo > 0.9 && hi < 1.1, "{lo} {hi}");
+        let (x0, x1) = xspan.unwrap();
+        assert_eq!(x0, 0.0);
+        assert!((x1 - 1.0).abs() < 1e-5, "{x1}");
+        assert!((xs[1_000] - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_beam_mask_blanks_dropped_rows_before_the_axis() {
+        let samples = vec![1.0f32, 4.0, 9.0, 16.0];
+        let keep = [true, false, true, false];
+        let (_, ys, xspan, yspan) = drawn_trace(&samples, Some(&keep), None);
+        assert!(ys[1].is_nan());
+        assert!(ys[3].is_nan());
+        assert_eq!(ys[0], 1.0);
+        assert_eq!(ys[2], 9.0);
+        let (x0, x1) = xspan.unwrap();
+        assert_eq!(x0, 0.0);
+        assert!((x1 - 0.002).abs() < 1e-6);
+        let (lo, hi) = yspan.unwrap();
+        let (want_lo, want_hi) = robust_limits(&[1.0, 9.0]).unwrap();
+        assert_eq!(lo, want_lo);
+        assert_eq!(hi, want_hi);
+        assert!(keeps_every_row(&[
+            Segment::Beam {
+                state: BeamGate::Both
+            },
+            Segment::Rank { which: Rank::All },
+        ]));
+        assert!(!keeps_every_row(&[Segment::Beam {
+            state: BeamGate::On
+        }]));
+    }
 }

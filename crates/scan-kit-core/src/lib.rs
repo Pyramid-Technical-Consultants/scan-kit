@@ -61,9 +61,9 @@ pub use signal::{
     hv_capacitance_pf, hv_delta_v, hv_expected_pf, hv_firmware_flags, hv_step_window, linear_fit,
     median_finite, mip_xy, quantile_edges, radial_mm, remap, remap_g2_raw, remap_g2_raw_reversed,
     remap_g3_raw, remap_g3_raw_reversed, remove_mean, resample_nearest, robust_limits,
-    scale_column, sigma_error_pct, splat_gaussians, sums_by_spot_id, sums_by_spot_run, time_window,
-    trapz, welch_psd, BoxStats, G2_MM_PER_STRIP, G2_STRIP_CENTER, G3_STRIP_CENTER,
-    G3_STRIP_PITCH_MM,
+    robust_limits_finite, scale_column, sigma_error_pct, splat_gaussians, sums_by_spot_id,
+    sums_by_spot_run, time_window, trapz, welch_psd, BoxStats, G2_MM_PER_STRIP, G2_STRIP_CENTER,
+    G3_STRIP_CENTER, G3_STRIP_PITCH_MM,
 };
 pub use stats::{
     finite_minmax, mean_finite, median_unstable, percentile_linear, percentile_nearest,

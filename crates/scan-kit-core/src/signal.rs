@@ -654,6 +654,11 @@ pub fn robust_limits(samples: &[f32]) -> Option<(f32, f32)> {
         .copied()
         .filter(|value| value.is_finite())
         .collect();
+    robust_limits_finite(&mut values)
+}
+
+/// Same margins as [`robust_limits`]. `values` are already finite, and this reorders them.
+pub fn robust_limits_finite(values: &mut [f32]) -> Option<(f32, f32)> {
     if values.is_empty() {
         return None;
     }
@@ -662,7 +667,7 @@ pub fn robust_limits(samples: &[f32]) -> Option<(f32, f32)> {
     } else {
         let last = values.len() - 1;
         let rank = |portion: f32| ((last as f32) * portion).round() as usize;
-        crate::stats::select_ranks(&mut values, rank(0.005).min(last), rank(0.995).min(last))
+        crate::stats::select_ranks(values, rank(0.005).min(last), rank(0.995).min(last))
     };
     let scale = hi.abs().max(lo.abs());
     let pad = ((hi - lo) * 0.02).max(scale * 0.02).max(1.0e-6);
