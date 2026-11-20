@@ -353,8 +353,16 @@ fn walk_files_at(
     }
     for entry in fs::read_dir(dir).map_err(|err| err.to_string())? {
         let entry = entry.map_err(|err| err.to_string())?;
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        // file_type() does not follow symlinks — a linked directory would pull
+        // files from outside the config tree into the diff.
+        if kind.is_symlink() {
+            continue;
+        }
         let path = entry.path();
-        if path.is_dir() {
+        if kind.is_dir() {
             walk_files_at(root, &path, depth + 1, files)?;
             continue;
         }
@@ -614,7 +622,6 @@ fn list_xml(root: &Path) -> Result<Vec<String>, String> {
 
 fn walk_xml(root: &Path, dir: &Path, depth: usize, files: &mut Vec<String>) -> Result<(), String> {
     if depth > MAX_WALK_DEPTH {
-        // is_dir() follows symlinks — a config tree could carry a loop.
         return Err(format!(
             "config tree is deeper than {} levels under {}",
             MAX_WALK_DEPTH,
@@ -623,8 +630,16 @@ fn walk_xml(root: &Path, dir: &Path, depth: usize, files: &mut Vec<String>) -> R
     }
     for entry in fs::read_dir(dir).map_err(|err| err.to_string())? {
         let entry = entry.map_err(|err| err.to_string())?;
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        // file_type() does not follow symlinks — a linked directory could also
+        // loop the walk or list files from outside the config tree.
+        if kind.is_symlink() {
+            continue;
+        }
         let path = entry.path();
-        if path.is_dir() {
+        if kind.is_dir() {
             walk_xml(root, &path, depth + 1, files)?;
             continue;
         }
@@ -802,7 +817,6 @@ fn folder_key(path: &Path) -> String {
 
 fn copy_tree(source: &Path, dest: &Path, depth: usize) -> Result<(), String> {
     if depth > MAX_WALK_DEPTH {
-        // is_dir() follows symlinks — a config tree could carry a loop.
         return Err(format!(
             "config tree is deeper than {} levels under {}",
             MAX_WALK_DEPTH,
@@ -812,9 +826,17 @@ fn copy_tree(source: &Path, dest: &Path, depth: usize) -> Result<(), String> {
     fs::create_dir_all(dest).map_err(|err| err.to_string())?;
     for entry in fs::read_dir(source).map_err(|err| err.to_string())? {
         let entry = entry.map_err(|err| err.to_string())?;
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        // file_type() does not follow symlinks — copying a link's target would
+        // pull outside content into the saved tree and a link loop recurses.
+        if kind.is_symlink() {
+            continue;
+        }
         let from = entry.path();
         let to = dest.join(entry.file_name());
-        if from.is_dir() {
+        if kind.is_dir() {
             copy_tree(&from, &to, depth + 1)?;
         } else {
             fs::copy(&from, &to)
@@ -902,6 +924,42 @@ mod tests {
         assert!(dest.join("map2map/other.xml.md5").is_file());
         assert_eq!(verify_file(&dest.join("map2map/devices.xml")).0, "OK");
         assert_eq!(saved["sidecars"], 2);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_config_walk_does_not_follow_symlinked_dirs() {
+        let root = std::env::temp_dir().join(format!(
+            "scan-kit-cfglink-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let source = root.join("source");
+        let outside = root.join("outside");
+        fs::create_dir_all(source.join("map2map")).unwrap();
+        fs::create_dir_all(outside.join("secret")).unwrap();
+        fs::write(source.join("map2map/devices.xml"), b"<devices/>\n").unwrap();
+        fs::write(outside.join("secret/leak.xml"), b"<leak/>\n").unwrap();
+        // Symlink creation needs extra privilege on Windows; skip when refused.
+        #[cfg(unix)]
+        let linked = std::os::unix::fs::symlink(&outside, source.join("linked"));
+        #[cfg(windows)]
+        let linked = std::os::windows::fs::symlink_dir(&outside, source.join("linked"));
+        #[cfg(not(any(unix, windows)))]
+        let linked: std::io::Result<()> = Ok(());
+        let Ok(()) = linked else {
+            let _ = fs::remove_dir_all(&root);
+            return;
+        };
+
+        assert_eq!(list_xml(&source).unwrap(), ["map2map/devices.xml"]);
+        assert_eq!(walk_files(&source).unwrap().len(), 1);
+        copy_tree(&source, &root.join("dest"), 0).unwrap();
+        assert!(!root.join("dest/linked/secret/leak.xml").exists());
         let _ = fs::remove_dir_all(&root);
     }
 
