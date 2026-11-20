@@ -123,6 +123,11 @@ pub fn patient_inputs(
                 .ok()
                 .and_then(|index| index.checked_sub(1))
         });
+    // An out-of-range beam silently filters every spot — an all-zero dose
+    // reads as a finished export.
+    if beam_filter.is_some_and(|index| index >= study.beams.len()) {
+        return Err("the selected beam is not in the plan".into());
+    }
     let bdl = pick(
         options,
         "bdl",
@@ -1751,6 +1756,25 @@ mod tests {
         // One fraction's dose and an unknown summation pass through unchanged.
         assert_eq!(tps_per_fraction(&dose, "FRACTION_SESSION", 30), dose);
         assert_eq!(tps_per_fraction(&dose, "", 30), dose);
+    }
+
+    #[test]
+    fn a_beam_pick_outside_the_plan_errors_instead_of_exporting_zeros() {
+        let root = std::env::temp_dir().join(format!("scan-kit-beams-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        scan_kit_dicom::write_water_study(&root).unwrap();
+        let one_beam = |beams: &str| {
+            super::patient_inputs(
+                &root,
+                &[],
+                &serde_json::json!({"study": root.to_string_lossy(), "beams": beams}),
+            )
+        };
+        assert!(one_beam("1").is_ok());
+        assert!(one_beam("0").is_ok());
+        assert!(one_beam("2").is_err());
+        assert!(one_beam("99").is_err());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
