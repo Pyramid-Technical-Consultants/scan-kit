@@ -1847,6 +1847,7 @@ impl Plot {
             self.fov,
             self.pan,
             grid.gantry,
+            grid.peak_at,
         )
     }
 
