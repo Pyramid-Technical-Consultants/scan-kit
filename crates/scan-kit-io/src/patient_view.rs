@@ -626,7 +626,8 @@ pub(crate) fn scene(
     } = run;
     let [nx, ny, nz] = study.ct.shape;
     let nvox = nx * ny * nz;
-    let (cx, cy, cz) = dose.peak_index();
+    let scan = scan_kit_core::scan_volume(&dose);
+    let [cx, cy, cz] = scan.peak_at;
     let mut labels = vec![0u8; nvox];
     let mut dvh_lines = Vec::new();
     let mut rows = vec![
@@ -770,6 +771,9 @@ pub(crate) fn scene(
     } else {
         "Gy".into()
     };
+    if volume.spacing.iter().all(|mm| *mm > 0.0) {
+        volume.prepared = Some(scan);
+    }
     let (columns, column_weights, row_weights, row_splits) = crate::workspace::layout();
     let mut controls = vec![
         scan_kit_core::Control::plain(

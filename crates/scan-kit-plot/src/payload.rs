@@ -224,8 +224,20 @@ pub fn encode_plot_reusing(
             scene.volume.shape[2] as usize,
         ];
         // The view would otherwise scan this cube again on the UI thread.
-        let mut scan =
-            scan_kit_core::scan_spacing(&scene.volume.values[..voxels], shape, scene.volume.axes());
+        // A scene that already scanned the cube hands that result over.
+        let mut scan = match scene
+            .volume
+            .prepared
+            .as_ref()
+            .filter(|scan| scan.covers(shape))
+        {
+            Some(ready) => ready.clone(),
+            None => scan_kit_core::scan_spacing(
+                &scene.volume.values[..voxels],
+                shape,
+                scene.volume.axes(),
+            ),
+        };
         let given = &scene.volume.integrals;
         if given.len() == 3
             && given
@@ -950,5 +962,46 @@ mod tests {
             row_splits: Vec::new(),
             volume: scan_kit_core::VolumeMark::default(),
         }
+    }
+
+    #[test]
+    fn a_prepared_scan_is_the_one_the_picture_ships() {
+        let scanned = scan_kit_core::Volume {
+            origin: [0.0; 3],
+            shape: [2, 2, 1],
+            spacing: [1.0; 3],
+            values: vec![5.0, 0.0, 0.0, 0.0],
+        };
+        let scan = scan_kit_core::scan_volume(&scanned);
+        let mut scene = PlotScene {
+            title: "dose".into(),
+            panels: Vec::new(),
+            controls: Vec::new(),
+            table: None,
+            columns: 1,
+            column_weights: Vec::new(),
+            row_weights: Vec::new(),
+            side: 0,
+            row_splits: Vec::new(),
+            volume: scan_kit_core::VolumeMark {
+                values: vec![0.0, 4.0, 0.0, 0.0],
+                shape: [2, 2, 1],
+                origin: [0.0; 3],
+                voxel: 1.0,
+                spacing: [1.0; 3],
+                prepared: Some(scan.clone()),
+                ..scan_kit_core::VolumeMark::default()
+            },
+        };
+        let bytes = encode_plot(&scene, [0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0, 1.0]).unwrap();
+        let (_, _, _, volume, shipped) = decode_plot(&bytes).unwrap();
+        let shipped = shipped.expect("scan");
+        assert_eq!(volume.values, vec![0.0, 4.0, 0.0, 0.0]);
+        assert_eq!(shipped.peak_at, scan.peak_at);
+        assert_eq!(shipped.peak_at, [0, 0, 0]);
+        scene.volume.prepared = None;
+        let again = encode_plot(&scene, [0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0, 1.0]).unwrap();
+        let (_, _, _, _, fresh) = decode_plot(&again).unwrap();
+        assert_eq!(fresh.expect("fresh scan").peak_at, [1, 0, 0]);
     }
 }

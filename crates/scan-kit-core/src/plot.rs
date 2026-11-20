@@ -344,6 +344,10 @@ pub struct VolumeMark {
     /// the 2D gamma of the summed doses here.
     #[serde(default)]
     pub integrals: Vec<Vec<f32>>,
+    /// Occupancy, peak, and plane sums for `values`. The payload sends this
+    /// instead of walking the cube again. Empty scans at encode time.
+    #[serde(skip)]
+    pub prepared: Option<crate::dose::VolumeScan>,
 }
 
 impl VolumeMark {

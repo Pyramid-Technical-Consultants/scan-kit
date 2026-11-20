@@ -48,6 +48,7 @@ pub struct RayView {
 
 /// One read of the volume: brick occupancy, the integrate window, and the three
 /// plane integrals. Built when the dose grid is attached, then reused.
+#[derive(Clone, Debug, PartialEq)]
 pub struct VolumeScan {
     pub bricks: Vec<f32>,
     pub brick_shape: [usize; 3],
@@ -59,6 +60,25 @@ pub struct VolumeScan {
     /// Sum through z, y, and x, in dose × mm. Axial, coronal, sagittal.
     pub integrals: [Vec<f32>; 3],
     pub integral_peaks: [f32; 3],
+}
+
+impl VolumeScan {
+    /// True when this scan is the occupancy and plane sums of a cube with `shape`.
+    pub fn covers(&self, shape: [usize; 3]) -> bool {
+        let expect = [
+            shape[0].div_ceil(BRICK).max(1),
+            shape[1].div_ceil(BRICK).max(1),
+            shape[2].div_ceil(BRICK).max(1),
+        ];
+        let bricks = expect[0]
+            .saturating_mul(expect[1])
+            .saturating_mul(expect[2]);
+        self.brick_shape == expect
+            && self.bricks.len() == bricks
+            && self.integrals[0].len() == shape[0].saturating_mul(shape[1])
+            && self.integrals[1].len() == shape[0].saturating_mul(shape[2])
+            && self.integrals[2].len() == shape[1].saturating_mul(shape[2])
+    }
 }
 
 /// Max |dose| in each 8³ brick, dilated by one brick. Zeros are safe to leap.
@@ -86,7 +106,202 @@ pub fn scan_spacing(values: &[f32], shape: [usize; 3], spacing: [f32; 3]) -> Vol
 
 fn scan_axes(values: &[f32], shape: [usize; 3], spacing: [f32; 3]) -> VolumeScan {
     let [nx, ny, nz] = shape;
-    let spacing = spacing.map(|mm| mm.max(1e-6));
+    let voxels = nx.saturating_mul(ny).saturating_mul(nz);
+    let brick_z = nz.div_ceil(BRICK).max(1);
+    let workers = std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(1)
+        .clamp(1, 32);
+    // A short cube is one pass. Past that, z bands own whole bricks so the
+    // occupancy max needs no merge, and the plane sums add in z order.
+    let bands = if voxels < 250_000 || workers == 1 || brick_z < 2 {
+        1
+    } else {
+        workers.min(brick_z)
+    };
+    if bands == 1 {
+        return scan_axes_serial(values, shape, spacing);
+    }
+    let per = brick_z.div_ceil(bands);
+    let mut ranges = Vec::new();
+    let mut band = 0;
+    while band * per * BRICK < nz {
+        let z0 = band * per * BRICK;
+        let z1 = ((band + 1) * per * BRICK).min(nz);
+        ranges.push((z0, z1));
+        band += 1;
+    }
+    let parts = std::thread::scope(|scope| {
+        let mut joins = Vec::with_capacity(ranges.len());
+        for (z0, z1) in ranges {
+            joins.push(scope.spawn(move || accumulate_z(values, shape, z0, z1)));
+        }
+        joins
+            .into_iter()
+            .map(|join| join.join().expect("scan band"))
+            .collect::<Vec<_>>()
+    });
+    let mut y_sum = vec![0.0f32; nx.saturating_mul(nz)];
+    let mut coronal = vec![0.0f32; nx.saturating_mul(nz)];
+    let mut sagittal = vec![0.0f32; ny.saturating_mul(nz)];
+    let brick_shape = [
+        nx.div_ceil(BRICK).max(1),
+        ny.div_ceil(BRICK).max(1),
+        brick_z,
+    ];
+    let mut raw = vec![0.0f32; brick_shape[0] * brick_shape[1] * brick_shape[2]];
+    let mut axial = vec![0.0f32; nx.saturating_mul(ny)];
+    let mut z_sum = vec![0.0f32; nx.saturating_mul(ny)];
+    let mut x_best = 0.0f32;
+    let mut peak = 0.0f32;
+    let mut abs_peak = 0.0f32;
+    let mut peak_at = [0usize; 3];
+    let plane = brick_shape[0] * brick_shape[1];
+    for part in parts {
+        if part.peak > peak {
+            peak = part.peak;
+            peak_at = part.peak_at;
+        }
+        abs_peak = abs_peak.max(part.abs_peak);
+        x_best = x_best.max(part.x_best);
+        for (slot, value) in axial.iter_mut().zip(&part.axial) {
+            *slot += *value;
+        }
+        for (slot, value) in z_sum.iter_mut().zip(&part.z_sum) {
+            *slot += *value;
+        }
+        for (index, value) in part.y_sum.into_iter().enumerate() {
+            let z = part.z0 + index / nx.max(1);
+            let x = index % nx.max(1);
+            if z < nz {
+                y_sum[x + nx * z] = value;
+            }
+        }
+        for (index, value) in part.coronal.into_iter().enumerate() {
+            let z = part.z0 + index / nx.max(1);
+            let x = index % nx.max(1);
+            if z < nz {
+                coronal[x + nx * z] = value;
+            }
+        }
+        for (index, value) in part.sagittal.into_iter().enumerate() {
+            let z = part.z0 + index / ny.max(1);
+            let y = index % ny.max(1);
+            if z < nz {
+                sagittal[y + ny * z] = value;
+            }
+        }
+        let brick0 = part.z0 / BRICK;
+        for (index, value) in part.bricks.into_iter().enumerate() {
+            let at = brick0 * plane + index;
+            if at < raw.len() {
+                raw[at] = value;
+            }
+        }
+    }
+    finish_scan(
+        spacing,
+        brick_shape,
+        raw,
+        axial,
+        coronal,
+        sagittal,
+        x_best,
+        y_sum,
+        z_sum,
+        peak,
+        abs_peak,
+        peak_at,
+    )
+}
+
+struct ZPart {
+    z0: usize,
+    abs_peak: f32,
+    peak: f32,
+    peak_at: [usize; 3],
+    x_best: f32,
+    axial: Vec<f32>,
+    z_sum: Vec<f32>,
+    y_sum: Vec<f32>,
+    coronal: Vec<f32>,
+    sagittal: Vec<f32>,
+    bricks: Vec<f32>,
+}
+
+fn accumulate_z(values: &[f32], shape: [usize; 3], z0: usize, z1: usize) -> ZPart {
+    let [nx, ny, nz] = shape;
+    let brick_shape = [
+        nx.div_ceil(BRICK).max(1),
+        ny.div_ceil(BRICK).max(1),
+        nz.div_ceil(BRICK).max(1),
+    ];
+    let z_count = z1.saturating_sub(z0);
+    let brick0 = z0 / BRICK;
+    let brick1 = if z_count == 0 {
+        brick0
+    } else {
+        (z1 - 1) / BRICK + 1
+    };
+    let mut y_sum = vec![0.0f32; nx.saturating_mul(z_count)];
+    let mut coronal = vec![0.0f32; nx.saturating_mul(z_count)];
+    let mut sagittal = vec![0.0f32; ny.saturating_mul(z_count)];
+    let mut axial = vec![0.0f32; nx.saturating_mul(ny)];
+    let mut z_sum = vec![0.0f32; nx.saturating_mul(ny)];
+    let mut bricks = vec![0.0f32; brick_shape[0] * brick_shape[1] * brick1.saturating_sub(brick0)];
+    let mut x_best = 0.0f32;
+    let mut peak = 0.0f32;
+    let mut abs_peak = 0.0f32;
+    let mut peak_at = [0usize; 3];
+    if nx > 0 && ny > 0 && z0 < z1 && values.len() >= nx * ny * nz {
+        for z in z0..z1 {
+            for y in 0..ny {
+                let base = nx * (y + ny * z);
+                let mut along_x = 0.0f32;
+                let mut signed_x = 0.0f32;
+                for x in 0..nx {
+                    let value = values[base + x];
+                    let mag = value.abs();
+                    abs_peak = abs_peak.max(mag);
+                    along_x += mag;
+                    signed_x += value;
+                    y_sum[x + nx * (z - z0)] += mag;
+                    z_sum[x + nx * y] += mag;
+                    axial[x + nx * y] += value;
+                    coronal[x + nx * (z - z0)] += value;
+                    if mag > 0.0 {
+                        let brick = (x / BRICK)
+                            + brick_shape[0]
+                                * ((y / BRICK) + brick_shape[1] * (z / BRICK - brick0));
+                        bricks[brick] = bricks[brick].max(mag);
+                    }
+                    if value > peak {
+                        peak = value;
+                        peak_at = [x, y, z];
+                    }
+                }
+                x_best = x_best.max(along_x);
+                sagittal[y + ny * (z - z0)] = signed_x;
+            }
+        }
+    }
+    ZPart {
+        z0,
+        abs_peak,
+        peak,
+        peak_at,
+        x_best,
+        axial,
+        z_sum,
+        y_sum,
+        coronal,
+        sagittal,
+        bricks,
+    }
+}
+
+fn scan_axes_serial(values: &[f32], shape: [usize; 3], spacing: [f32; 3]) -> VolumeScan {
+    let [nx, ny, nz] = shape;
     let brick_shape = [
         nx.div_ceil(BRICK).max(1),
         ny.div_ceil(BRICK).max(1),
@@ -133,6 +348,37 @@ fn scan_axes(values: &[f32], shape: [usize; 3], spacing: [f32; 3]) -> VolumeScan
             }
         }
     }
+    finish_scan(
+        spacing,
+        brick_shape,
+        raw,
+        axial,
+        coronal,
+        sagittal,
+        x_best,
+        y_sum,
+        z_sum,
+        peak,
+        abs_peak,
+        peak_at,
+    )
+}
+
+fn finish_scan(
+    spacing: [f32; 3],
+    brick_shape: [usize; 3],
+    raw: Vec<f32>,
+    mut axial: Vec<f32>,
+    mut coronal: Vec<f32>,
+    mut sagittal: Vec<f32>,
+    x_best: f32,
+    y_sum: Vec<f32>,
+    z_sum: Vec<f32>,
+    peak: f32,
+    abs_peak: f32,
+    peak_at: [usize; 3],
+) -> VolumeScan {
+    let spacing = spacing.map(|mm| mm.max(1e-6));
     let y_best = y_sum.into_iter().fold(0.0f32, f32::max);
     let z_best = z_sum.into_iter().fold(0.0f32, f32::max);
     // Axial sums through Z, coronal through Y, sagittal through X.
@@ -1345,5 +1591,41 @@ mod tests {
         let at = sample_mm(&volume, [0.5, 10.5, 23.75], 0);
         assert!((at - 1.0).abs() < 1e-4, "{at}");
         assert!((volume.extent()[2] - 5.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn a_large_lattice_matches_one_thread() {
+        let (nx, ny, nz) = (48usize, 40usize, 160usize);
+        let mut values = vec![0.0f32; nx * ny * nz];
+        for z in 0..nz {
+            values[7 + nx * (9 + ny * z)] = 0.1 + 0.01 * (z as f32);
+            if z % 8 == 3 {
+                values[20 + nx * (15 + ny * z)] = -0.4;
+            }
+        }
+        values[4 + nx * (6 + ny * 2)] = 1.25;
+        values[30 + nx * (22 + ny * 150)] = 6.5;
+        let volume = Volume {
+            origin: [0.0; 3],
+            shape: [nx, ny, nz],
+            spacing: [1.0, 1.5, 2.0],
+            values,
+        };
+        let serial = scan_axes_serial(&volume.values, volume.shape, volume.spacing);
+        let scan = scan_volume(&volume);
+        assert!(scan.covers(volume.shape));
+        assert_eq!(scan.peak_at, serial.peak_at);
+        assert_eq!(scan.peak.to_bits(), serial.peak.to_bits());
+        assert_eq!(scan.abs_peak.to_bits(), serial.abs_peak.to_bits());
+        assert_eq!(scan.bricks, serial.bricks);
+        assert_eq!(scan.brick_shape, serial.brick_shape);
+        for plane in 0..3 {
+            for (got, want) in scan.integrals[plane].iter().zip(&serial.integrals[plane]) {
+                let tol = 1.0e-4 * want.abs().max(1.0e-4);
+                assert!((got - want).abs() <= tol, "plane {plane} {got} vs {want}");
+            }
+        }
+        let scale = serial.line_scale.max(1.0e-4);
+        assert!((scan.line_scale - serial.line_scale).abs() <= 1.0e-4 * scale);
     }
 }
