@@ -251,6 +251,10 @@ pub fn ray_value(
 
 /// Brightest |line integral| on this view, in dose × mm.
 ///
+/// `peak_at` is the voxel `scan_volume` already found. The 16×16 probe can miss
+/// that ray, and walking the lattice again to find it costs more than the probe
+/// on a sparse beam.
+///
 /// Python's auto window puts that ray at the top of the colormap and zero at
 /// the bottom. The axis integral is a different direction, so a side view of a
 /// deep beam stays dark when the window is the axis sum.
@@ -266,6 +270,7 @@ pub fn view_ray_scale(
     fov: f32,
     center: [f32; 3],
     gantry: f32,
+    peak_at: [usize; 3],
 ) -> f32 {
     let view = RayView {
         azimuth,
@@ -297,8 +302,8 @@ pub fn view_ray_scale(
         }
     }
     let [nx, ny, nz] = volume.shape;
-    if nx > 0 && ny > 0 && nz > 0 {
-        let (ix, iy, iz) = volume.peak_index();
+    let [ix, iy, iz] = peak_at;
+    if ix < nx && iy < ny && iz < nz {
         let point = [
             volume.mm_of(0, ix),
             volume.mm_of(1, iy),
@@ -1207,7 +1212,25 @@ mod tests {
             FOV_Y,
             [0.0; 3],
             0.0,
+            scan.peak_at,
         );
+        let (px, py, pz) = volume.peak_index();
+        assert_eq!(scan.peak_at, [px, py, pz]);
+        let corner = view_ray_scale(
+            &volume,
+            &scan.bricks,
+            scan.brick_shape,
+            azimuth,
+            elevation,
+            1.0,
+            1.0,
+            1,
+            FOV_Y,
+            [0.0; 3],
+            0.0,
+            [0, 0, 0],
+        );
+        assert!(scale > corner, "peak ray {scale} corner ray {corner}");
         // Home looks mostly across the beam, so the view ray is shorter than the depth sum.
         assert!(
             scale < scan.line_scale * 0.9,
@@ -1271,6 +1294,7 @@ mod tests {
             FOV_Y,
             [0.0; 3],
             0.0,
+            scan.peak_at,
         );
         let ms = start.elapsed().as_secs_f32() * 1000.0;
         assert!(scale > 1.0, "{scale}");
