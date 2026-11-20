@@ -346,7 +346,7 @@ fn write_plan(dir: &Path, request: &Request, study: &str, frame: &str) -> Result
     let cum = (n * request.energies.len()) as f32;
     let referenced = {
         let mut item = Vec::new();
-        patient::is(&mut item, 0x300A, 0x00C0, 1);
+        patient::is(&mut item, 0x300C, 0x0006, 1);
         patient::ds(&mut item, 0x300A, 0x0086, &[cum * request.mu as f32]);
         item
     };

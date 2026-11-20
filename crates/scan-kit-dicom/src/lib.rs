@@ -1,6 +1,7 @@
-//! Explicit little-endian DICOM: a study index, and CT, structure, ion-plan, and dose reads.
+//! Little-endian DICOM — explicit and implicit VR: a study index, and CT,
+//! structure, ion-plan, and dose reads.
 //!
-//! ponytail: implicit VR and undefined-length sequences are rejected. Compressed
+//! ponytail: undefined-length sequences are rejected. Compressed
 //! pixel data is not decoded.
 
 mod patient;
@@ -86,9 +87,7 @@ pub fn index_study(path: &Path) -> Result<Vec<DicomEntry>, String> {
         return Err(format!("{} is not a directory", path.display()));
     }
     let mut entries = Vec::new();
-    for item in fs::read_dir(path).map_err(|err| err.to_string())? {
-        let item = item.map_err(|err| err.to_string())?;
-        let file = item.path();
+    for file in dicom_files(path) {
         if file
             .extension()
             .and_then(|ext| ext.to_str())
@@ -195,6 +194,109 @@ fn is_dicom(bytes: &[u8]) -> bool {
     bytes.len() > 132 && &bytes[128..132] == b"DICM"
 }
 
+/// Implicit VR Little Endian transfer syntax (no VR codes in the dataset).
+pub(crate) const IMPLICIT_VR_LE: &str = "1.2.840.10008.1.2";
+
+/// Where the post-meta dataset starts, and whether it is implicit VR.
+///
+/// The group-0002 file meta is always explicit VR LE; its (0002,0010)
+/// Transfer Syntax UID names the encoding that follows. A file whose first
+/// tag is not group 0002 is sniffed instead: two ASCII uppercase letters in
+/// the VR slot mean explicit, anything else reads as an implicit length.
+pub(crate) fn dataset_offset(bytes: &[u8]) -> (usize, bool) {
+    let mut cursor = 132usize;
+    let mut syntax_seen = false;
+    let mut implicit = false;
+    while cursor + 8 <= bytes.len() {
+        let group = u16::from_le_bytes([bytes[cursor], bytes[cursor + 1]]);
+        if group != 0x0002 {
+            break;
+        }
+        let element = u16::from_le_bytes([bytes[cursor + 2], bytes[cursor + 3]]);
+        let vr = &bytes[cursor + 4..cursor + 6];
+        let Some((length, header)) = value_length(vr, &bytes[cursor + 6..]) else {
+            break;
+        };
+        let start = cursor + 6 + header;
+        let Some(end) = start.checked_add(length) else {
+            break;
+        };
+        if end > bytes.len() {
+            break;
+        }
+        if element == 0x0010 {
+            syntax_seen = true;
+            implicit = dicom_text(&bytes[start..end]) == IMPLICIT_VR_LE;
+        }
+        cursor = end;
+    }
+    if !syntax_seen && cursor + 8 <= bytes.len() {
+        implicit = !bytes[cursor + 4..cursor + 6]
+            .iter()
+            .all(|byte| byte.is_ascii_uppercase());
+    }
+    (cursor.min(bytes.len()), implicit)
+}
+
+/// Media Storage SOP Class UID from the always-explicit group-0002 meta, when
+/// the file carries one. Lets `load_study` skip object classes it never reads
+/// (treatment records, presentation states) without parsing their datasets.
+pub(crate) fn meta_sop_class(bytes: &[u8]) -> Option<String> {
+    let mut cursor = 132usize;
+    while cursor + 8 <= bytes.len() {
+        let group = u16::from_le_bytes([bytes[cursor], bytes[cursor + 1]]);
+        if group != 0x0002 {
+            return None;
+        }
+        let element = u16::from_le_bytes([bytes[cursor + 2], bytes[cursor + 3]]);
+        let vr = &bytes[cursor + 4..cursor + 6];
+        let (length, header) = value_length(vr, &bytes[cursor + 6..])?;
+        let start = cursor + 6 + header;
+        let end = start.checked_add(length)?;
+        if end > bytes.len() {
+            return None;
+        }
+        if element == 0x0002 {
+            return Some(dicom_text(&bytes[start..end]));
+        }
+        cursor = end;
+    }
+    None
+}
+
+/// `.dcm` and `DICM` files under `root`, walking the Study/Series nesting
+/// PACS and machine exports use. Symlinks are not followed, and the list is
+/// sorted so "last plan read wins" is deterministic.
+pub(crate) fn dicom_files(root: &Path) -> Vec<std::path::PathBuf> {
+    const MAX_DEPTH: usize = 6;
+    fn visit(dir: &Path, depth: usize, out: &mut Vec<std::path::PathBuf>) {
+        if depth == 0 {
+            return;
+        }
+        let Ok(items) = fs::read_dir(dir) else {
+            return;
+        };
+        for item in items.flatten() {
+            let Ok(kind) = item.file_type() else {
+                continue;
+            };
+            if kind.is_symlink() {
+                continue;
+            }
+            let path = item.path();
+            if kind.is_dir() {
+                visit(&path, depth - 1, out);
+            } else if kind.is_file() {
+                out.push(path);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    visit(root, MAX_DEPTH, &mut out);
+    out.sort();
+    out
+}
+
 const PEEK_CAP: usize = 4 * 1024 * 1024;
 
 /// Header fields read from one file, stopping at the pixel-data tag.
@@ -220,21 +322,14 @@ pub fn peek_study(bytes: &[u8]) -> StudyPeek {
         return out;
     }
     let limit = bytes.len().min(PEEK_CAP);
-    let mut cursor = 132usize;
+    let (mut cursor, implicit) = dataset_offset(&bytes[..limit]);
     while cursor + 8 <= limit {
         let group = u16::from_le_bytes([bytes[cursor], bytes[cursor + 1]]);
         let element = u16::from_le_bytes([bytes[cursor + 2], bytes[cursor + 3]]);
         if group == 0x7FE0 && element == 0x0010 {
             break;
         }
-        let vr = &bytes[cursor + 4..cursor + 6];
-        let Some((length, header)) = value_length(vr, &bytes[cursor + 6..]) else {
-            break;
-        };
-        let Some(start) = cursor.checked_add(6 + header) else {
-            break;
-        };
-        let Some(end) = start.checked_add(length) else {
+        let Some((start, end)) = element_span(bytes, cursor, implicit) else {
             break;
         };
         if end > limit {
@@ -295,7 +390,7 @@ fn read_entry(path: &Path) -> Option<DicomEntry> {
     if !is_dicom(&bytes) {
         return None;
     }
-    let mut cursor = 132usize;
+    let (mut cursor, implicit) = dataset_offset(&bytes);
     let mut sop_class = String::new();
     let mut modality = String::new();
     let mut study_uid = String::new();
@@ -306,10 +401,9 @@ fn read_entry(path: &Path) -> Option<DicomEntry> {
         if group == 0x7FE0 && element == 0x0010 {
             break;
         }
-        let vr = &bytes[cursor + 4..cursor + 6];
-        let (length, header) = value_length(vr, &bytes[cursor + 6..])?;
-        let start = cursor + 6 + header;
-        let end = start + length;
+        let Some((start, end)) = element_span(&bytes, cursor, implicit) else {
+            break;
+        };
         if end > bytes.len() {
             break;
         }
@@ -335,6 +429,31 @@ fn read_entry(path: &Path) -> Option<DicomEntry> {
         study_uid,
         series_uid,
     })
+}
+
+/// Value span of the element at `cursor`, in the file's VR mode. `None` on a
+/// truncated header or an undefined length (not read).
+fn element_span(bytes: &[u8], cursor: usize, implicit: bool) -> Option<(usize, usize)> {
+    if implicit {
+        if cursor + 8 > bytes.len() {
+            return None;
+        }
+        let length = u32::from_le_bytes([
+            bytes[cursor + 4],
+            bytes[cursor + 5],
+            bytes[cursor + 6],
+            bytes[cursor + 7],
+        ]) as usize;
+        if length == u32::MAX as usize {
+            return None;
+        }
+        let start = cursor + 8;
+        return Some((start, start.checked_add(length)?));
+    }
+    let vr = bytes.get(cursor + 4..cursor + 6)?;
+    let (length, header) = value_length(vr, bytes.get(cursor + 6..)?)?;
+    let start = cursor + 6 + header;
+    Some((start, start.checked_add(length)?))
 }
 
 fn value_length(vr: &[u8], rest: &[u8]) -> Option<(usize, usize)> {
