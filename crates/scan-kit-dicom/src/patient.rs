@@ -186,6 +186,7 @@ pub fn load_study(path: &Path) -> Result<PatientStudy, String> {
     }
     let mut slices: Vec<_> = ct_slices.into_iter().map(|(_, slice)| slice).collect();
     let mut ct = stack(&mut slices)?;
+    ct.frame = frame.clone();
     ct.patient_id = patient_id;
     ct.patient_name = patient_name;
     ct.study_uid = study_uid;
@@ -196,6 +197,7 @@ pub fn load_study(path: &Path) -> Result<PatientStudy, String> {
     } else {
         let mut slices: Vec<_> = dose_slices.into_iter().map(|(_, slice)| slice).collect();
         let mut volume = stack(&mut slices)?;
+        volume.frame = frame.clone();
         volume.dose_type = dose_type;
         volume.summation = summation;
         Some(volume)
@@ -1783,6 +1785,8 @@ mod tests {
         assert_eq!(study.beams[0].spots.len(), 1);
         assert_eq!(study.structures.len(), 1);
         assert!(study.tps.is_some());
+        assert_eq!(study.ct.frame, "1.2.3.4.5");
+        assert_eq!(study.tps.as_ref().unwrap().frame, "1.2.3.4.5");
         assert!(inside_structure(&study, &study.structures[0], 1, 1, 0));
         let mut extra = preamble();
         ui(&mut extra, 0x0008, 0x0016, "1.2.840.10008.5.1.4.1.1.2");
