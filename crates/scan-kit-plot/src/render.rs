@@ -5297,6 +5297,145 @@ fn point_cell(value: f32, origin: f32, span: f32) -> u32 {
     ((t * POINT_CELLS as f32) as u32).min(POINT_CELLS - 1)
 }
 
+/// Polyline and guide strokes, in series order, appended in the line-instance layout.
+pub(crate) fn write_strokes(panels: &[Panel], out: &mut Vec<u8>) {
+    let mut next_id = 1u32;
+    for panel in panels {
+        let hidden = hides_polylines(panel);
+        for series in &panel.series {
+            let id = next_id;
+            next_id = next_id.saturating_add(1);
+            match series {
+                Series::Polyline {
+                    xs,
+                    ys,
+                    color,
+                    thickness,
+                } if !hidden => {
+                    write_polyline(out, xs, ys, *color, *thickness, id);
+                }
+                Series::Guide {
+                    xs,
+                    ys,
+                    color,
+                    thickness,
+                } => {
+                    write_polyline(out, xs, ys, *color, *thickness, id);
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// Same segments as `push_polyline`, in the line-instance layout.
+fn write_polyline(
+    out: &mut Vec<u8>,
+    xs: &[f32],
+    ys: &[f32],
+    color: [f32; 4],
+    thickness: f32,
+    id: u32,
+) -> u32 {
+    let n = xs.len().min(ys.len());
+    let thick = thickness.max(1.0);
+    if n >= 2
+        && xs[..n]
+            .iter()
+            .zip(&ys[..n])
+            .all(|(x, y)| x.is_finite() && y.is_finite())
+    {
+        return write_solid_run(out, &xs[..n], &ys[..n], color, thick, id);
+    }
+    let mut previous: Option<[f32; 2]> = None;
+    let mut added = 0u32;
+    out.reserve(n.saturating_sub(1) * LINE_STRIDE as usize);
+    for (x, y) in xs[..n].iter().zip(&ys[..n]) {
+        if !x.is_finite() || !y.is_finite() {
+            previous = None;
+            continue;
+        }
+        let point = [*x, *y];
+        if let Some(start) = previous {
+            push_line_word(
+                out,
+                &LineRec {
+                    a: [start[0], start[1], 0.0],
+                    b: [point[0], point[1], 0.0],
+                    color,
+                    thickness: thick,
+                    id,
+                    pattern: LINE_SOLID,
+                    phase: 0.0,
+                },
+            );
+            added = added.saturating_add(1);
+        }
+        previous = Some(point);
+    }
+    added
+}
+
+/// One solid segment per consecutive pair. `xs` and `ys` are finite and the same length.
+fn write_solid_run(
+    out: &mut Vec<u8>,
+    xs: &[f32],
+    ys: &[f32],
+    color: [f32; 4],
+    thickness: f32,
+    id: u32,
+) -> u32 {
+    let count = xs.len() - 1;
+    let stride = LINE_STRIDE as usize;
+    let start = out.len();
+    out.resize(start + count * stride, 0);
+    let dest = &mut out[start..];
+    let workers = stroke_workers(count);
+    if workers == 1 {
+        fill_solid(dest, xs, ys, color, thickness, id);
+        return count as u32;
+    }
+    let chunk = count.div_ceil(workers);
+    std::thread::scope(|scope| {
+        for (index, part) in dest.chunks_mut(chunk * stride).enumerate() {
+            let begin = index * chunk;
+            let segs = part.len() / stride;
+            let xs = &xs[begin..begin + segs + 1];
+            let ys = &ys[begin..begin + segs + 1];
+            scope.spawn(move || fill_solid(part, xs, ys, color, thickness, id));
+        }
+    });
+    count as u32
+}
+
+fn stroke_workers(count: usize) -> usize {
+    // Past a handful of writers the bytes are waiting on memory, not the CPU.
+    if count < 50_000 {
+        return 1;
+    }
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    workers.clamp(1, 8).min(count)
+}
+
+fn fill_solid(part: &mut [u8], xs: &[f32], ys: &[f32], color: [f32; 4], thickness: f32, id: u32) {
+    for (index, word) in part.chunks_mut(LINE_STRIDE as usize).enumerate() {
+        store_line(
+            word,
+            &LineRec {
+                a: [xs[index], ys[index], 0.0],
+                b: [xs[index + 1], ys[index + 1], 0.0],
+                color,
+                thickness,
+                id,
+                pattern: LINE_SOLID,
+                phase: 0.0,
+            },
+        );
+    }
+}
+
 fn push_polyline(
     lines: &mut Vec<LineRec>,
     xs: &[f32],
@@ -7774,19 +7913,44 @@ fn blend(
 pub(crate) fn encode_lines(lines: &[LineRec]) -> Vec<u8> {
     let mut out = Vec::with_capacity(lines.len() * LINE_STRIDE as usize);
     for line in lines {
-        push4(
-            &mut out,
-            [line.a[0], line.a[1], line.a[2], pattern_code(line.pattern)],
-        );
-        push4(&mut out, [line.b[0], line.b[1], line.b[2], line.phase]);
-        push4(&mut out, line.color);
-        push_f32(&mut out, line.thickness);
-        push_u32(&mut out, line.id);
-        push_u32(&mut out, 0);
-        push_u32(&mut out, 0);
+        push_line_word(&mut out, line);
     }
     debug_assert_eq!(out.len(), lines.len() * LINE_STRIDE as usize);
     out
+}
+
+fn push_line_word(out: &mut Vec<u8>, line: &LineRec) {
+    let mut word = [0u8; LINE_STRIDE as usize];
+    store_line(&mut word, line);
+    out.extend_from_slice(&word);
+}
+
+fn store_line(word: &mut [u8], line: &LineRec) {
+    word.fill(0);
+    store_f32(word, 0, line.a[0]);
+    store_f32(word, 1, line.a[1]);
+    store_f32(word, 2, line.a[2]);
+    store_f32(word, 3, pattern_code(line.pattern));
+    store_f32(word, 4, line.b[0]);
+    store_f32(word, 5, line.b[1]);
+    store_f32(word, 6, line.b[2]);
+    store_f32(word, 7, line.phase);
+    store_f32(word, 8, line.color[0]);
+    store_f32(word, 9, line.color[1]);
+    store_f32(word, 10, line.color[2]);
+    store_f32(word, 11, line.color[3]);
+    store_f32(word, 12, line.thickness);
+    store_u32(word, 13, line.id);
+}
+
+fn store_f32(word: &mut [u8], index: usize, value: f32) {
+    let start = index * 4;
+    word[start..start + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+fn store_u32(word: &mut [u8], index: usize, value: u32) {
+    let start = index * 4;
+    word[start..start + 4].copy_from_slice(&value.to_le_bytes());
 }
 
 pub(crate) fn decode_lines(bytes: &[u8]) -> Vec<LineRec> {
