@@ -170,6 +170,14 @@ fn gauss() -> f32 {
     return sqrt(-2.0 * log(a)) * cos(2.0 * PI * urand());
 }
 
+// Both Box-Muller components — two normals for the price of one.
+fn gauss2() -> vec2f {
+    let a = urand();
+    let r = sqrt(-2.0 * log(a));
+    let t = 2.0 * PI * urand();
+    return vec2f(r * cos(t), r * sin(t));
+}
+
 fn quanta(e_ev: f32) -> i32 {
     return i32(floor(e_ev / QUANTUM + urand() - 1e-7));
 }
@@ -196,6 +204,98 @@ fn add_ledger(slot: u32, v: i32) {
     let old = atomicAdd(&ledger[slot], lo);
     if (old + lo < old) { hi += 1u; }
     if (hi != 0u) { atomicAdd(&ledger[slot + 1u], hi); }
+}
+
+// ---------------------------------------------------------------- workgroup dose staging
+// A lane's voxel pools used to flush straight to the global tally: one or two global
+// atomics per step, all of a beam's lanes on the same few words. They stage here instead —
+// a hashed slot per hot voxel in workgroup memory, claimed on first touch — and each slot
+// reaches the global tally once, when the workgroup retires. A slot also carries the
+// voxel's two LET accumulators, so scored runs share the claim.
+const W_SLOTS: u32 = 512u;
+// Words after the keys: dose pair, LET-numerator pair, LET-denominator pair.
+const W_ACC: u32 = 3072u;
+var<workgroup> w_key: array<atomic<u32>, 512>;
+var<workgroup> w_acc: array<atomic<u32>, 3072>;
+// Slot claims for init and drain. Lanes grab them, so any workgroup size works.
+var<workgroup> w_init: atomic<u32>;
+var<workgroup> w_drain: atomic<u32>;
+
+fn staged_pair(base: u32, v: i32) {
+    let lo = u32(v);
+    var hi = select(0u, 0xFFFFFFFFu, v < 0);
+    let old = atomicAdd(&w_acc[base], lo);
+    if (old + lo < old) { hi += 1u; }
+    if (hi != 0u) { atomicAdd(&w_acc[base + 1u], hi); }
+}
+
+// The voxel's slot, claimed if free; -1 when the probe runs out.
+fn stage_claim(idx: i32) -> i32 {
+    let key = u32(idx) + 1u;
+    var slot = (key * 2654435761u) >> 23u;
+    for (var t = 0u; t < 4u; t++) {
+        let seen = atomicLoad(&w_key[slot]);
+        if (seen == key) { return i32(slot); }
+        if (seen == 0u) {
+            let cas = atomicCompareExchangeWeak(&w_key[slot], 0u, key);
+            if (cas.exchanged || cas.old_value == key) { return i32(slot); }
+            if (cas.old_value == 0u) { continue; }
+        }
+        slot = (slot + 1u) & (W_SLOTS - 1u);
+    }
+    return -1;
+}
+
+fn stage_add(idx: i32, v: i32) {
+    if (v == 0) { return; }
+    let s = stage_claim(idx);
+    if (s < 0) {
+        add_tally(2u * u32(idx), v);
+        return;
+    }
+    staged_pair(2u * u32(s), v);
+}
+
+fn stage_add_let(idx: i32, qn: i32, qd: i32) {
+    if (qn == 0 && qd == 0) { return; }
+    let s = stage_claim(idx);
+    if (s < 0) {
+        if (qn != 0) { add_let(4u * u32(idx), qn); }
+        if (qd != 0) { add_let(4u * u32(idx) + 2u, qd); }
+        return;
+    }
+    let b = 2u * u32(s);
+    if (qn != 0) { staged_pair(1024u + b, qn); }
+    if (qd != 0) { staged_pair(2048u + b, qd); }
+}
+
+fn drain_pair(slot: u32, lo: u32, hi: u32) {
+    let old = atomicAdd(&tally[slot], lo);
+    var carry = hi;
+    if (old + lo < old) { carry += 1u; }
+    if (carry != 0u) { atomicAdd(&tally[slot + 1u], carry); }
+}
+
+fn drain_let(slot: u32, lo: u32, hi: u32) {
+    let old = atomicAdd(&let_tally[slot], lo);
+    var carry = hi;
+    if (old + lo < old) { carry += 1u; }
+    if (carry != 0u) { atomicAdd(&let_tally[slot + 1u], carry); }
+}
+
+fn drain_slot(s: u32) {
+    let key = atomicLoad(&w_key[s]);
+    if (key == 0u) { return; }
+    let idx = key - 1u;
+    let lo = atomicLoad(&w_acc[2u * s]);
+    let hi = atomicLoad(&w_acc[2u * s + 1u]);
+    if ((lo | hi) != 0u) { drain_pair(2u * idx, lo, hi); }
+    let nlo = atomicLoad(&w_acc[1024u + 2u * s]);
+    let nhi = atomicLoad(&w_acc[1024u + 2u * s + 1u]);
+    if ((nlo | nhi) != 0u) { drain_let(4u * idx, nlo, nhi); }
+    let dlo = atomicLoad(&w_acc[2048u + 2u * s]);
+    let dhi = atomicLoad(&w_acc[2048u + 2u * s + 1u]);
+    if ((dlo | dhi) != 0u) { drain_let(4u * idx + 2u, dlo, dhi); }
 }
 
 // ---------------------------------------------------------------- tables
@@ -245,8 +345,9 @@ fn locate(x: vec3f) -> Where {
     return Where(-1, WATER_MEDIUM, 1.0, -1);
 }
 
-// A lane's deposits pool while they land in one voxel and go to the tally, one atomic, when
-// the next lands elsewhere: the atomics, not the physics, bound a CT's speed.
+// A lane's deposits pool while they land in one voxel and flush to the workgroup
+// table, one probe, when the next lands elsewhere: the atomics, not the physics,
+// bound a CT's speed.
 var<private> g_dose_idx: i32 = -1;
 var<private> g_dose_e: f32 = 0.0;
 var<private> g_let_idx: i32 = -1;
@@ -256,7 +357,7 @@ var<private> g_let_d: f32 = 0.0;
 fn flush_dose() {
     if (g_dose_idx < 0) { return; }
     let q = quanta(g_dose_e);
-    if (q != 0) { add_tally(2u * u32(g_dose_idx), q); }
+    if (q != 0) { stage_add(g_dose_idx, q); }
     g_dose_idx = -1;
     g_dose_e = 0.0;
 }
@@ -265,8 +366,7 @@ fn flush_let() {
     if (g_let_idx < 0) { return; }
     let qn = quanta(g_let_n);
     let qd = quanta(g_let_d);
-    if (qn != 0) { add_let(4u * u32(g_let_idx), qn); }
-    if (qd != 0) { add_let(4u * u32(g_let_idx) + 2u, qd); }
+    stage_add_let(g_let_idx, qn, qd);
     g_let_idx = -1;
     g_let_n = 0.0;
     g_let_d = 0.0;
@@ -675,9 +775,10 @@ fn hadron_step(pp: ptr<function, Particle>, wp: ptr<function, Where>) -> bool {
     if (step > step_max) { step = step_max; }
     let mean_dE = compute_dE2(mb, nel, rho, z2, p.T, p.mass, sp, k, step);
     let strag = sqrt(TWO_PI_RE2_MC2 * nel * z2 * step * min(TE_MIN, k.w) * (1.0 - 0.5 * k.z) / k.z);
-    var dE = mean_dE + strag * gauss();
+    let g = gauss2();
+    var dE = mean_dE + strag * g.x;
     let X0 = F[mb + M_X0] / rho;
-    let theta = (CONST_MS * UMEV * p.charge / (k.z * k.y * MC2_PRO)) * sqrt(step / X0) * gauss();
+    let theta = (CONST_MS * UMEV * p.charge / (k.z * k.y * MC2_PRO)) * sqrt(step / X0) * g.y;
     let phi = 2.0 * PI * urand();
 
     let hinge = here.idx;
@@ -921,8 +1022,7 @@ fn close_history() {
 // ledger[14]. So a subgroup's lanes never idle through each other's secondaries, and the
 // resident lanes keep taking histories while later workgroups find none left. The order
 // within a history, and so every random number, is that of transport-then-drain recursion.
-@compute @workgroup_size(64)
-fn main() {
+fn transport_loop() {
     var p: Particle;
     var w: Where;
     var busy = false;
@@ -963,4 +1063,26 @@ fn main() {
     if (g_overflow != 0u) { atomicAdd(&ledger[12], g_overflow); }
     atomicMax(&ledger[13], u32(g_deepest));
     atomicMax(&ledger[15], u32(longest));
+}
+
+@compute @workgroup_size(64)
+fn main(@builtin(local_invocation_index) lid: u32) {
+    if (lid == 0u) {
+        atomicStore(&w_init, 0u);
+        atomicStore(&w_drain, 0u);
+    }
+    workgroupBarrier();
+    loop {
+        let s = atomicAdd(&w_init, 1u);
+        if (s >= W_SLOTS + W_ACC) { break; }
+        if (s < W_SLOTS) { atomicStore(&w_key[s], 0u); } else { atomicStore(&w_acc[s - W_SLOTS], 0u); }
+    }
+    workgroupBarrier();
+    transport_loop();
+    workgroupBarrier();
+    loop {
+        let s = atomicAdd(&w_drain, 1u);
+        if (s >= W_SLOTS) { break; }
+        drain_slot(s);
+    }
 }
