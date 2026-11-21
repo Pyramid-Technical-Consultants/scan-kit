@@ -212,7 +212,9 @@ fn dose_corner(center: [f32; 3], spacing: [f32; 3]) -> [f32; 3] {
     std::array::from_fn(|axis| center[axis] - 0.5 * spacing[axis])
 }
 
-pub fn transport(inputs: &PatientInputs, mc: Option<McRunner<'_>>) -> Transport {
+/// The GPU request one patient transport submits. A task stage drives the run
+/// in slices and finishes the dose with `dose_from_result` afterwards.
+pub fn patient_request(inputs: &PatientInputs) -> PatientRequest {
     let score_let = inputs.rbe_model.is_some_and(RbeModel::uses_let);
     let (spots, protons, beams) = records(
         &inputs.study,
@@ -223,12 +225,11 @@ pub fn transport(inputs: &PatientInputs, mc: Option<McRunner<'_>>) -> Transport 
         inputs.bdl,
     );
     let (material, density) = inputs.calibration.voxels(&inputs.study.ct.hu);
-    let nvox = inputs.study.ct.shape.iter().product();
     // Image position is the center of the first voxel. The kernel bins with
     // floor((x - origin) / spacing) and the picture centers voxel i at
     // origin + (i + 0.5) * spacing, so both want the corner.
     let origin_mm = dose_corner(inputs.study.ct.origin, inputs.study.ct.spacing);
-    let request = PatientRequest {
+    PatientRequest {
         spots,
         protons,
         beams,
@@ -242,8 +243,14 @@ pub fn transport(inputs: &PatientInputs, mc: Option<McRunner<'_>>) -> Transport 
         dose_to_water: true,
         score_let,
         let_water: score_let,
-    };
-    let ran = mc.and_then(|run| run(&McJob::Patient(request)).ok());
+    }
+}
+
+/// The dose a finished transport produced: RBE weighting and the LET scoring
+/// applied on top of the raw cube.
+pub fn dose_from_result(inputs: &PatientInputs, ran: Option<McResult>) -> Transport {
+    let nvox = inputs.study.ct.shape.iter().product();
+    let origin_mm = dose_corner(inputs.study.ct.origin, inputs.study.ct.spacing);
     let mut dose = ran
         .as_ref()
         .map(|result| result.volume.clone())
@@ -286,24 +293,27 @@ pub fn transport(inputs: &PatientInputs, mc: Option<McRunner<'_>>) -> Transport 
     }
 }
 
-/// Run the patient pipeline and write the dose as an RTDOSE — the export
-/// `scan_kit.dicom.dose.write_dose` served. `gpu` is the caller's adapter
-/// label for provenance. The session ids are the delivery inputs.
-pub fn dose_export(
-    root: &Path,
+pub fn transport(inputs: &PatientInputs, mc: Option<McRunner<'_>>) -> Transport {
+    let request = patient_request(inputs);
+    let ran = mc.and_then(|run| run(&McJob::Patient(request)).ok());
+    dose_from_result(inputs, ran)
+}
+
+/// Write a finished transport's dose as an RTDOSE — the tail of
+/// `scan_kit.dicom.dose.write_dose`, after the task stage ran the transport.
+/// `gpu` is the caller's adapter label for provenance.
+pub fn write_patient_dose(
+    inputs: &PatientInputs,
+    run: &Transport,
     session_ids: &[String],
-    options: &Value,
     dest: &str,
     description: &str,
     gpu: &str,
-    mc: McRunner<'_>,
 ) -> Result<Value, String> {
-    let inputs = patient_inputs(root, session_ids, options)?;
-    let run = transport(&inputs, Some(mc));
     let Some(result) = &run.ran else {
         return Err("the Monte Carlo transport did not run".into());
     };
-    let provenance = provenance(&inputs, result, session_ids, gpu);
+    let provenance = provenance(inputs, result, session_ids, gpu);
     let summation = if inputs.segment == "plan" {
         "PLAN"
     } else {

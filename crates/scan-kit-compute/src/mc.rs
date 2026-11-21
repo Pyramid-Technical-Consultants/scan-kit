@@ -2,6 +2,7 @@
 //!
 //! [`McRun`] is the sliced form of the same transport. [`run_mc`] drains it.
 
+use std::collections::VecDeque;
 use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -112,6 +113,9 @@ fn stats_rel(
 
 /// How often a running transport copies the cube for the view.
 const PREVIEW_GAP: Duration = Duration::from_millis(200);
+/// Transport chunks a run keeps queued before its step paces on the oldest.
+/// Deep enough that sibling polls and preview copies never find the GPU dry.
+const MAX_INFLIGHT: usize = 8;
 
 /// The suite shares one device. A test holds this for its whole body so two
 /// polls never overlap; an overlapping read made a voxel change look stuck.
@@ -300,11 +304,20 @@ struct Live {
     shape: [usize; 3],
     origin: [f32; 3],
     spacing: [f32; 3],
-    inflight: bool,
+    /// Transport submissions queued but not yet known retired. A step only
+    /// waits on the oldest once the window fills, so the GPU keeps a few
+    /// chunks deep — the shared queue never drains dry between worker polls.
+    inflight: VecDeque<wgpu::SubmissionIndex>,
+    /// A preview copy already submitted. Its map lands whenever the copy
+    /// retires — collecting it never blocks a step.
+    pending_read: Option<ReadTicket>,
     finished: bool,
     previews: u32,
     last_preview: Instant,
     cached: Option<McResult>,
+    /// The last readback's uncertainty for the report — cloning a whole cube
+    /// per preview just for this f32 was the cost before.
+    cached_uncertainty: f32,
     score_let: bool,
     let_buf: wgpu::Buffer,
 }
@@ -621,11 +634,13 @@ async fn prepare(launch: Launch) -> Result<Live, ComputeError> {
         shape: [nx, ny, nz],
         origin: launch.origin_mm,
         spacing: launch.spacing_cm.map(|cm| cm * 10.0),
-        inflight: false,
+        inflight: VecDeque::new(),
+        pending_read: None,
         finished: false,
         previews: 0,
         last_preview: Instant::now(),
         cached: None,
+        cached_uncertainty: 0.0,
         score_let,
         let_buf,
     })
@@ -633,11 +648,7 @@ async fn prepare(launch: Launch) -> Result<Live, ComputeError> {
 
 impl Live {
     fn report(&self, preview: bool) -> Report {
-        let uncertainty = self
-            .cached
-            .as_ref()
-            .map(|result| result.uncertainty)
-            .unwrap_or(0.0);
+        let uncertainty = self.cached_uncertainty;
         Report {
             task: 0,
             generation: 0,
@@ -666,60 +677,81 @@ impl Live {
                 ComputeError::Message("monte carlo finished without a dose".into())
             })?));
         }
-        let mut ticket = None;
-        if self.inflight {
+        let mut published = None;
+        // A parked preview copy publishes whenever its map has landed. The
+        // step never waits on it — sibling runs on the shared queue keep
+        // submitting while the readback is in flight.
+        if let Some(ticket) = &self.pending_read {
+            let _ = self.device.poll(wgpu::PollType::Poll);
+            match ticket.receiver.try_recv() {
+                Ok(Ok(())) => {
+                    let result = self.unpack_read(ticket)?;
+                    self.cached_uncertainty = result.uncertainty;
+                    self.last_preview = Instant::now();
+                    self.previews += 1;
+                    published = Some(result);
+                    self.pending_read = None;
+                }
+                Ok(Err(err)) => {
+                    self.pending_read = None;
+                    return Err(ComputeError::Message(err.to_string()));
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(err) => {
+                    self.pending_read = None;
+                    return Err(ComputeError::Message(err.to_string()));
+                }
+            }
+        }
+        if cancel.is_cancelled() {
+            self.inflight.clear();
+            return Ok(Slice::Cancelled);
+        }
+        if self.next >= self.histories {
+            // finish()'s staged copy sits behind every queued chunk — its map
+            // landing certifies all transport retired.
+            self.inflight.clear();
+            self.pending_read = None;
+            let result = self.finish()?;
+            self.finished = true;
+            return Ok(Slice::Ready(result));
+        }
+        // Pace the queue: wait on the oldest submission only once the window
+        // is full. Younger chunks stay in flight so a sibling run's poll
+        // always finds GPU work queued.
+        let mut blocked = Duration::ZERO;
+        while self.inflight.len() >= MAX_INFLIGHT {
+            blocked += self.wait_fence(cancel)?;
             if cancel.is_cancelled() {
-                self.inflight = false;
+                self.inflight.clear();
                 return Ok(Slice::Cancelled);
             }
-            let blocked = self.wait_fence(cancel)?;
-            self.inflight = false;
-            if cancel.is_cancelled() {
-                return Ok(Slice::Cancelled);
-            }
-            self.chunk = adapt_chunk(self.chunk, self.floor, self.cap, blocked, budget);
-            if self.next >= self.histories {
-                let result = self.finish()?;
-                self.finished = true;
-                return Ok(Slice::Ready(result));
-            }
-            // The first chunk is the rough cube. Later copies are a few times a
-            // second, so the view can sharpen while the next chunk is in flight.
-            let fresh =
-                self.next > 0 && (self.previews == 0 || self.last_preview.elapsed() >= PREVIEW_GAP);
-            if fresh {
-                // The copies land before the next chunk's submission, so the map
-                // resolves while the GPU is already back on transport.
-                ticket = Some(self.begin_read(
-                    2,
-                    1.0 / (self.next.max(1) as f32),
-                    self.next / self.per_batch.max(1),
-                    self.next.max(1),
-                )?);
-            }
+        }
+        self.chunk = adapt_chunk(self.chunk, self.floor, self.cap, blocked, budget);
+        // The first chunk is the rough cube. Later copies are a few times a
+        // second, so the view can sharpen while the next chunk is in flight.
+        let fresh = self.next > 0
+            && self.pending_read.is_none()
+            && (self.previews == 0 || self.last_preview.elapsed() >= PREVIEW_GAP);
+        if fresh {
+            // The copies land before the next chunk's submission, so the map
+            // resolves while the GPU is already back on transport. The
+            // ticket parks — a later step collects it without waiting.
+            self.pending_read = Some(self.begin_read(
+                2,
+                1.0 / (self.next.max(1) as f32),
+                self.next / self.per_batch.max(1),
+                self.next.max(1),
+            )?);
         }
         if cancel.is_cancelled() {
             return Ok(Slice::Cancelled);
         }
         let end = self.next.saturating_add(self.chunk).min(self.histories);
         self.submit_until(end, Some(cancel));
-        let mut published = None;
-        if let Some(ticket) = ticket {
-            // A cancelled collect abandons the ticket; its buffer drops with it.
-            let result = match self.collect_read(&ticket, cancel) {
-                Ok(result) => result,
-                Err(_) if cancel.is_cancelled() => return Ok(Slice::Cancelled),
-                Err(err) => return Err(err),
-            };
-            self.cached = Some(result.clone());
-            self.last_preview = Instant::now();
-            self.previews += 1;
-            published = Some(result);
-        }
         if cancel.is_cancelled() {
             return Ok(Slice::Cancelled);
         }
-        self.inflight = true;
         // A stale picture is not copied again. The view paints the last copy
         // while the next chunk keeps running.
         Ok(Slice::Pending(published))
@@ -764,21 +796,29 @@ impl Live {
                     pass.dispatch_workgroups(x, y, 1);
                 }
             }
-            self.queue.submit(Some(encoder.finish()));
+            self.inflight
+                .push_back(self.queue.submit(Some(encoder.finish())));
             self.next += count;
         }
     }
 
-    fn wait_fence(&self, cancel: &Cancel) -> Result<Duration, ComputeError> {
+    /// Wait on the oldest in-flight submission and pop it. Callers bound the
+    /// window before calling, so the queue keeps the rest of the chunks.
+    fn wait_fence(&mut self, cancel: &Cancel) -> Result<Duration, ComputeError> {
+        let Some(index) = self.inflight.pop_front() else {
+            return Ok(Duration::ZERO);
+        };
         let started = Instant::now();
         loop {
             if cancel.is_cancelled() {
                 return Ok(started.elapsed());
             }
             // A short wait so a new voxel size can abandon this chunk instead of
-            // sitting behind the rest of the histories already queued.
+            // sitting behind the rest of the histories already queued. Only
+            // this run's submission is awaited — a sibling run's queued chunk
+            // must not stall this step.
             match self.device.poll(wgpu::PollType::Wait {
-                submission_index: None,
+                submission_index: Some(index.clone()),
                 timeout: Some(Duration::from_millis(50)),
             }) {
                 Ok(_) => return Ok(started.elapsed()),
@@ -877,6 +917,12 @@ impl Live {
                 Err(err) => return Err(ComputeError::Message(err.to_string())),
             }
         }
+        self.unpack_read(ticket)
+    }
+
+    /// The mapped staging buffer becomes the result: dose cube, uncertainty,
+    /// ledger, LET — then unmapped. Only called after the map has landed.
+    fn unpack_read(&self, ticket: &ReadTicket) -> Result<McResult, ComputeError> {
         let mapped = ticket
             .staging
             .slice(..)
@@ -941,6 +987,7 @@ impl Live {
             self.histories.max(1),
         )?;
         let result = self.collect_read(&ticket, &Cancel::new())?;
+        self.cached_uncertainty = result.uncertainty;
         self.cached = Some(result.clone());
         self.finished = true;
         Ok(result)
