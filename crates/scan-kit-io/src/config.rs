@@ -861,7 +861,11 @@ fn hex_digest(bytes: &[u8], salt: i32) -> String {
     let mut hasher = Md5::new();
     hasher.update(bytes);
     hasher.update(salt.to_string().as_bytes());
-    format!("{:x}", hasher.finalize())
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 fn pack_sidecar(digest: &str, salt: i32, mtime: i64) -> Result<Vec<u8>, String> {

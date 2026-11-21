@@ -1162,7 +1162,12 @@ fn write_termination(
     write_text(&dir.join("termination_summary.txt"), &text)?;
     let mut hasher = Md5::new();
     hasher.update(text.as_bytes());
-    let digest = format!("{:x}\n", hasher.finalize());
+    let digest = hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>()
+        + "\n";
     write_text(&dir.join("termination_summary.txt.md5"), &digest)?;
     Ok(2)
 }
