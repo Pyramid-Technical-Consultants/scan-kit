@@ -17,7 +17,7 @@ scan-kit-dicom = { workspace = true }
 scan-kit-io = { workspace = true }
 scan-kit-plot = { workspace = true }
 serde_json = { workspace = true }
-sha2 = "0.10"
+sha2 = "0.11"
 tokio = { workspace = true }
 wgpu = "30"
 

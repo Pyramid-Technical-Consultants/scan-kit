@@ -3680,7 +3680,7 @@ dependencies = [
  "scan-kit-io",
  "scan-kit-plot",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.1",
  "tokio",
  "wgpu",
 ]
@@ -3734,7 +3734,7 @@ dependencies = [
  "scan-kit-core",
  "scan-kit-dicom",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.1",
  "ssh2",
  "suppaftp",
  "tar",
