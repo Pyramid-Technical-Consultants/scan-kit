@@ -255,12 +255,17 @@ pub(crate) fn drain_plot(
     let mut stage = build_stage(
         view, root, sessions, options, background, foreground, palette,
     );
-    match stage.poll(Duration::MAX, &Cancel::new()) {
-        Poll::Ready(bytes) => Ok(bytes),
-        Poll::Failed(message) => Err(message),
-        Poll::Cancelled => Err("cancelled".into()),
-        Poll::Pending { .. } => Err("plot did not finish".into()),
+    // A stage may spend its first poll on setup and report Pending even with
+    // an unlimited budget — keep driving until it reaches a terminal state.
+    for _ in 0..64 {
+        match stage.poll(Duration::MAX, &Cancel::new()) {
+            Poll::Ready(bytes) => return Ok(bytes),
+            Poll::Failed(message) => return Err(message),
+            Poll::Cancelled => return Err("cancelled".into()),
+            Poll::Pending { .. } => {}
+        }
     }
+    Err("plot did not finish".into())
 }
 
 /// The non-plot tasks (`write_dose`, `write_report`) drained in one call for
@@ -1750,13 +1755,6 @@ impl Stage for ExportStage {
                 Ok(run) => Some(run),
                 Err(err) => return self.fail(err.to_string()),
             };
-            self.report.phase = Phase::Compute;
-            self.report.total = u64::from(inputs.histories);
-            self.report.note = "Transport".into();
-            return Poll::Pending {
-                report: self.report.clone(),
-                preview: None,
-            };
         }
         match self.run.as_mut().expect("transport").poll(budget, cancel) {
             Poll::Pending { report, .. } => {
@@ -2662,5 +2660,22 @@ mod tests {
             std::thread::sleep(Duration::from_millis(100));
         }
         cancel_task(id);
+    }
+
+    #[test]
+    fn drain_task_drives_the_stage_to_a_terminal_error() {
+        let root = scratch();
+        let message = drain_task(
+            "write_dose",
+            &root,
+            &[],
+            &json!({
+                "study": root.join("missing").display().to_string(),
+                "dest": root.join("dose.dcm").display().to_string(),
+            }),
+        )
+        .expect_err("a missing study cannot export");
+        assert_ne!(message, "plot did not finish");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

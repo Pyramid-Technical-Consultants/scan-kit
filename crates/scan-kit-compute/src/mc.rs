@@ -681,16 +681,24 @@ impl Live {
         // A parked preview copy publishes whenever its map has landed. The
         // step never waits on it — sibling runs on the shared queue keep
         // submitting while the readback is in flight.
-        if let Some(ticket) = &self.pending_read {
+        if self.pending_read.is_some() {
             let _ = self.device.poll(wgpu::PollType::Poll);
-            match ticket.receiver.try_recv() {
+            match self
+                .pending_read
+                .as_ref()
+                .expect("parked read")
+                .receiver
+                .try_recv()
+            {
                 Ok(Ok(())) => {
-                    let result = self.unpack_read(ticket)?;
+                    // Take before unpacking so an unpack error cannot leave a
+                    // consumed ticket parked and previews disabled for the run.
+                    let ticket = self.pending_read.take().expect("parked read");
+                    let result = self.unpack_read(&ticket)?;
                     self.cached_uncertainty = result.uncertainty;
                     self.last_preview = Instant::now();
                     self.previews += 1;
                     published = Some(result);
-                    self.pending_read = None;
                 }
                 Ok(Err(err)) => {
                     self.pending_read = None;
@@ -705,6 +713,7 @@ impl Live {
         }
         if cancel.is_cancelled() {
             self.inflight.clear();
+            self.pending_read = None;
             return Ok(Slice::Cancelled);
         }
         if self.next >= self.histories {
@@ -724,6 +733,7 @@ impl Live {
             blocked += self.wait_fence(cancel)?;
             if cancel.is_cancelled() {
                 self.inflight.clear();
+                self.pending_read = None;
                 return Ok(Slice::Cancelled);
             }
         }
@@ -745,11 +755,14 @@ impl Live {
             )?);
         }
         if cancel.is_cancelled() {
+            self.pending_read = None;
             return Ok(Slice::Cancelled);
         }
         let end = self.next.saturating_add(self.chunk).min(self.histories);
         self.submit_until(end, Some(cancel));
         if cancel.is_cancelled() {
+            self.inflight.clear();
+            self.pending_read = None;
             return Ok(Slice::Cancelled);
         }
         // A stale picture is not copied again. The view paints the last copy
