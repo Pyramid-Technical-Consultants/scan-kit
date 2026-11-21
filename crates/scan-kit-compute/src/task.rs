@@ -32,7 +32,13 @@ const PARTIAL_ROW_CAP: usize = 4 * scan_kit_io::SLICE_ROWS;
 trait Stage: Send {
     fn poll(&mut self, budget: Duration, cancel: &Cancel) -> Poll<Vec<u8>>;
     fn report(&self) -> Report;
-    fn retarget(&mut self, _options: &Value, _palette: &[[f32; 4]]) -> bool {
+    fn retarget(
+        &mut self,
+        _root: &Path,
+        _sessions: &[String],
+        _options: &Value,
+        _palette: &[[f32; 4]],
+    ) -> bool {
         false
     }
 
@@ -114,15 +120,13 @@ impl Driver {
         }
     }
 
-    fn take(&mut self, slot: &Slot) {
-        let Some(id) = self.slot_id(slot) else {
-            return;
-        };
+    fn take(&mut self, slot: &Slot) -> Option<Running> {
+        let id = self.slot_id(slot)?;
         if let Some(task) = self.tasks.get(&id) {
             task.cancel.cancel();
         }
-        self.tasks.remove(&id);
         self.set_slot(slot, None);
+        self.tasks.remove(&id)
     }
 }
 
@@ -141,7 +145,9 @@ pub fn start_task(
         if let Some(id) = driver.plot {
             if let Some(task) = driver.tasks.get_mut(&id) {
                 if let Some(stage) = task.stage.as_mut() {
-                    if !task.cancel.is_cancelled() && stage.retarget(options, palette) {
+                    if !task.cancel.is_cancelled()
+                        && stage.retarget(path, sessions, options, palette)
+                    {
                         task.generation = task.generation.saturating_add(1);
                         return Ok(json!({ "task": id, "generation": task.generation }));
                     }
@@ -149,7 +155,7 @@ pub fn start_task(
             }
         }
     }
-    driver.take(&slot);
+    let replaced = driver.take(&slot);
     let mut stage = build_stage(
         view, path, sessions, options, background, foreground, palette,
     );
@@ -166,6 +172,10 @@ pub fn start_task(
             stage: Some(stage),
         },
     );
+    // Joining the replaced worker can wait on its GPU drain — that must not
+    // happen under the driver lock, or every poll/cancel stalls behind it.
+    drop(driver);
+    drop(replaced);
     Ok(json!({ "task": id, "generation": 1 }))
 }
 
@@ -184,7 +194,12 @@ pub fn poll_task(id: u64) -> Result<Vec<u8>, String> {
         };
         (stage, task.cancel.clone(), task.generation)
     };
-    let outcome = stage.poll(POLL_BUDGET, &cancel);
+    // A panicking poll must still reach the removal path — otherwise the task
+    // is left half-registered and answers Pending forever.
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        stage.poll(POLL_BUDGET, &cancel)
+    }))
+    .unwrap_or_else(|_| Poll::Failed("task panicked".into()));
     let mut report = stage.report();
     report.task = id;
     report.generation = generation;
@@ -235,12 +250,16 @@ pub fn poll_task(id: u64) -> Result<Vec<u8>, String> {
 }
 
 pub fn cancel_task(id: u64) {
-    let mut driver = lock();
-    if let Some(task) = driver.tasks.get(&id) {
-        task.cancel.cancel();
-    }
-    driver.tasks.remove(&id);
-    driver.clear(id);
+    // Same rule as start_task: the stage drop may join a worker mid-drain.
+    let removed = {
+        let mut driver = lock();
+        if let Some(task) = driver.tasks.get(&id) {
+            task.cancel.cancel();
+        }
+        driver.clear(id);
+        driver.tasks.remove(&id)
+    };
+    drop(removed);
 }
 
 pub(crate) fn drain_plot(
@@ -1227,8 +1246,19 @@ impl Stage for McPlotStage {
         self.worker_cancel = cancel;
     }
 
-    fn retarget(&mut self, options: &Value, palette: &[[f32; 4]]) -> bool {
+    fn retarget(
+        &mut self,
+        root: &Path,
+        sessions: &[String],
+        options: &Value,
+        palette: &[[f32; 4]],
+    ) -> bool {
         if self.worker.is_none() {
+            return false;
+        }
+        // The reused run still belongs to its own session set — a different
+        // session that produces an identical job must get a fresh task.
+        if root != self.root || sessions != self.sessions {
             return false;
         }
         // A new grid cannot keep the tallies. Bail out before building that
@@ -2709,5 +2739,39 @@ mod tests {
         }
         assert!(!root.join("out.dcm").exists());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_panicking_poll_ends_the_task_instead_of_parking_it() {
+        // Without catch_unwind the checked-out stage is lost mid-unwind and the
+        // task answers Pending forever with its slot still held.
+        struct Panic;
+        impl Stage for Panic {
+            fn poll(&mut self, _budget: Duration, _cancel: &Cancel) -> Poll<Vec<u8>> {
+                panic!("inside the stage");
+            }
+            fn report(&self) -> Report {
+                report_at(Phase::Scene, 0, 1)
+            }
+        }
+        let id = {
+            let mut driver = lock();
+            let id = driver.next;
+            driver.next = driver.next.saturating_add(1);
+            driver.tasks.insert(
+                id,
+                Running {
+                    generation: 1,
+                    cancel: Cancel::new(),
+                    stage: Some(Box::new(Panic)),
+                },
+            );
+            id
+        };
+        let report = poll_report(&poll_task(id).unwrap());
+        assert_eq!(report["phase"], "failed");
+        assert_eq!(report["finished"], true);
+        let driver = lock();
+        assert!(!driver.tasks.contains_key(&id));
     }
 }

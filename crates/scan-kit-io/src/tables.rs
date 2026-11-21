@@ -5,7 +5,7 @@
 //! the spot-file strip-to-mm fit when the device file is missing. A repeated
 //! `spot_no` starts that controller's own block, and the `.1` suffix matches pandas.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -83,45 +83,43 @@ struct BoundSlice {
     tail_done: bool,
 }
 
-fn bound_slice() -> &'static Mutex<Option<BoundSlice>> {
-    static BOUND: OnceLock<Mutex<Option<BoundSlice>>> = OnceLock::new();
-    BOUND.get_or_init(|| Mutex::new(None))
+// The binding is the reader's own context: a stage binds, reads, and clears on
+// one thread per poll, so a process-global would let a concurrent stage clobber
+// the window (or leak it into another caller's drain). One binding per thread.
+thread_local! {
+    static BOUND: RefCell<Option<BoundSlice>> = const { RefCell::new(None) };
 }
 
 pub fn bind_slice(session: &str, take: SliceTake) {
-    *bound_slice().lock().unwrap_or_else(|err| err.into_inner()) = Some(BoundSlice {
-        session: session.to_owned(),
-        take,
-        tail_done: false,
+    BOUND.with(|bound| {
+        *bound.borrow_mut() = Some(BoundSlice {
+            session: session.to_owned(),
+            take,
+            tail_done: false,
+        });
     });
 }
 
 pub fn clear_slice() {
-    *bound_slice().lock().unwrap_or_else(|err| err.into_inner()) = None;
+    BOUND.with(|bound| *bound.borrow_mut() = None);
 }
 
 pub fn slice_tail_done() -> bool {
-    bound_slice()
-        .lock()
-        .unwrap_or_else(|err| err.into_inner())
-        .as_ref()
-        .is_some_and(|bound| bound.tail_done)
+    BOUND.with(|bound| bound.borrow().as_ref().is_some_and(|bound| bound.tail_done))
 }
 
 pub(crate) fn slice_is_bound() -> bool {
-    bound_slice()
-        .lock()
-        .unwrap_or_else(|err| err.into_inner())
-        .is_some()
+    BOUND.with(|bound| bound.borrow().is_some())
 }
 
 fn slice_for(session: &str) -> Option<SliceTake> {
-    bound_slice()
-        .lock()
-        .unwrap_or_else(|err| err.into_inner())
-        .as_ref()
-        .filter(|bound| bound.session == session)
-        .map(|bound| bound.take)
+    BOUND.with(|bound| {
+        bound
+            .borrow()
+            .as_ref()
+            .filter(|bound| bound.session == session)
+            .map(|bound| bound.take)
+    })
 }
 
 thread_local! {
@@ -162,15 +160,13 @@ fn set_tail_done(done: bool, belongs: impl FnOnce(&str) -> bool) {
     if !PUBLISH_TAIL.with(Cell::get) {
         return;
     }
-    if let Some(bound) = bound_slice()
-        .lock()
-        .unwrap_or_else(|err| err.into_inner())
-        .as_mut()
-    {
-        if belongs(&bound.session) {
-            bound.tail_done = done;
+    BOUND.with(|bound| {
+        if let Some(bound) = bound.borrow_mut().as_mut() {
+            if belongs(&bound.session) {
+                bound.tail_done = done;
+            }
         }
-    }
+    });
 }
 
 fn path_has_session(path: &Path, session: &str) -> bool {
