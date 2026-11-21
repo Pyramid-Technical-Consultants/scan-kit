@@ -207,7 +207,7 @@ impl McRun {
             return Poll::Failed("monte carlo has no buffers".into());
         };
         if budget >= Duration::from_secs(30) {
-            return match live.drain() {
+            return match live.drain(cancel) {
                 Ok(result) => {
                     self.done = Some(result.clone());
                     Poll::Ready(result)
@@ -485,6 +485,18 @@ struct McGpu {
 /// ponytail: one shared queue. Two runs at once interleave submits on it.
 async fn shared_gpu() -> Result<Arc<McGpu>, ComputeError> {
     static GPU: Mutex<Option<Arc<McGpu>>> = Mutex::new(None);
+    static OPENING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    if let Some(gpu) = GPU
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .as_ref()
+        .map(Arc::clone)
+    {
+        return Ok(gpu);
+    }
+    // Two cold-start opens on different worker threads would each build a
+    // device — serialize the slow path, then check once more.
+    let _opening = OPENING.lock().await;
     if let Some(gpu) = GPU
         .lock()
         .unwrap_or_else(|err| err.into_inner())
@@ -664,10 +676,10 @@ impl Live {
     }
 
     /// The original one-shot loop: every history, then the store fold.
-    fn drain(&mut self) -> Result<McResult, ComputeError> {
+    fn drain(&mut self, cancel: &Cancel) -> Result<McResult, ComputeError> {
         let _kept = self.kept.len();
-        self.submit_until(self.histories, None);
-        self.finish()
+        self.submit_until(self.histories, Some(cancel));
+        self.finish(cancel)
     }
 
     fn step(&mut self, budget: Duration, cancel: &Cancel) -> Result<Slice, ComputeError> {
@@ -721,7 +733,7 @@ impl Live {
             // landing certifies all transport retired.
             self.inflight.clear();
             self.pending_read = None;
-            let result = self.finish()?;
+            let result = self.finish(cancel)?;
             self.finished = true;
             return Ok(Slice::Ready(result));
         }
@@ -992,14 +1004,14 @@ impl Live {
         })
     }
 
-    fn finish(&mut self) -> Result<McResult, ComputeError> {
+    fn finish(&mut self, cancel: &Cancel) -> Result<McResult, ComputeError> {
         let ticket = self.begin_read(
             1,
             1.0 / (self.histories.max(1) as f32),
             self.histories.max(1) / self.per_batch.max(1),
             self.histories.max(1),
         )?;
-        let result = self.collect_read(&ticket, &Cancel::new())?;
+        let result = self.collect_read(&ticket, cancel)?;
         self.cached_uncertainty = result.uncertainty;
         self.cached = Some(result.clone());
         self.finished = true;

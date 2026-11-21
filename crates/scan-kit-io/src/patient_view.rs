@@ -101,28 +101,29 @@ pub fn patient_inputs(
         },
         &[("plan", "Plan"), ("delivered", "Delivered")],
     );
-    let sent = options
-        .get("fraction")
-        .and_then(Value::as_str)
-        .unwrap_or("Plan");
-    let fraction = if segment == "plan" {
-        "Plan"
-    } else if names.iter().any(|name| name == sent) && sent != "Plan" {
-        sent
-    } else if groups.is_empty() {
+    let sent = options.get("fraction").and_then(Value::as_str);
+    let fraction = if segment == "plan" || groups.is_empty() {
         "Plan"
     } else {
-        "1"
+        // "Plan" is the unset default, not a fraction name — an explicit name
+        // the plan doesn't have must error rather than widen the export.
+        match sent {
+            None | Some("Plan") => "1",
+            Some(name) if names.iter().any(|candidate| *candidate == name) => name,
+            Some(name) => return Err(format!("the fraction {name:?} is not in the plan")),
+        }
     }
     .to_owned();
-    let beam_filter = options
-        .get("beams")
-        .and_then(Value::as_str)
-        .and_then(|text| {
+    let beam_filter = match options.get("beams").and_then(Value::as_str) {
+        None => None,
+        Some("all") | Some("All") | Some("") | Some("0") => None,
+        Some(text) => Some(
             text.parse::<usize>()
                 .ok()
                 .and_then(|index| index.checked_sub(1))
-        });
+                .ok_or_else(|| format!("the beam {text:?} is not in the plan"))?,
+        ),
+    };
     // An out-of-range beam silently filters every spot — an all-zero dose
     // reads as a finished export.
     if beam_filter.is_some_and(|index| index >= study.beams.len()) {
@@ -214,7 +215,7 @@ fn dose_corner(center: [f32; 3], spacing: [f32; 3]) -> [f32; 3] {
 
 /// The GPU request one patient transport submits. A task stage drives the run
 /// in slices and finishes the dose with `dose_from_result` afterwards.
-pub fn patient_request(inputs: &PatientInputs) -> PatientRequest {
+pub fn patient_request(inputs: &PatientInputs) -> Result<PatientRequest, String> {
     let score_let = inputs.rbe_model.is_some_and(RbeModel::uses_let);
     let (spots, protons, beams) = records(
         &inputs.study,
@@ -223,13 +224,13 @@ pub fn patient_request(inputs: &PatientInputs) -> PatientRequest {
         &inputs.groups,
         inputs.beam_filter,
         inputs.bdl,
-    );
+    )?;
     let (material, density) = inputs.calibration.voxels(&inputs.study.ct.hu);
     // Image position is the center of the first voxel. The kernel bins with
     // floor((x - origin) / spacing) and the picture centers voxel i at
     // origin + (i + 0.5) * spacing, so both want the corner.
     let origin_mm = dose_corner(inputs.study.ct.origin, inputs.study.ct.spacing);
-    PatientRequest {
+    Ok(PatientRequest {
         spots,
         protons,
         beams,
@@ -243,7 +244,7 @@ pub fn patient_request(inputs: &PatientInputs) -> PatientRequest {
         dose_to_water: true,
         score_let,
         let_water: score_let,
-    }
+    })
 }
 
 /// The dose a finished transport produced: RBE weighting and the LET scoring
@@ -294,8 +295,10 @@ pub fn dose_from_result(inputs: &PatientInputs, ran: Option<McResult>) -> Transp
 }
 
 pub fn transport(inputs: &PatientInputs, mc: Option<McRunner<'_>>) -> Transport {
-    let request = patient_request(inputs);
-    let ran = mc.and_then(|run| run(&McJob::Patient(request)).ok());
+    let request = patient_request(inputs).ok();
+    let ran = request
+        .as_ref()
+        .and_then(|request| mc.and_then(|run| run(&McJob::Patient(request.clone())).ok()));
     dose_from_result(inputs, ran)
 }
 
@@ -1139,16 +1142,15 @@ fn records(
     groups: &[Vec<usize>],
     beam_filter: Option<usize>,
     bdl: &str,
-) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>), String> {
     let mut spots = Vec::new();
     let mut protons = Vec::new();
     let mut beams = Vec::new();
     for (index, beam) in study.beams.iter().enumerate() {
-        if let Ok(record) =
-            beam_record_bdl(beam.gantry, beam.couch, &beam.position, beam.isocenter, bdl)
-        {
-            beams.extend_from_slice(&record);
-        }
+        // Spots index this array by study position — a skipped record would
+        // shift every later beam's rotation lookup.
+        let record = beam_record_bdl(beam.gantry, beam.couch, &beam.position, beam.isocenter, bdl)?;
+        beams.extend_from_slice(&record);
         if fraction == "Plan" {
             if beam_filter.is_some_and(|chosen| chosen != index) {
                 continue;
@@ -1192,7 +1194,7 @@ fn records(
             }
         }
     }
-    (spots, protons, beams)
+    Ok((spots, protons, beams))
 }
 
 fn push_spot(

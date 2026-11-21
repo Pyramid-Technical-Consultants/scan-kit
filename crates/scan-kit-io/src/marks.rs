@@ -50,6 +50,24 @@ pub(crate) fn pick_in<'a>(
         .map(|(id, _)| *id)
 }
 
+/// Normalize an options object at the trust boundary: JSON numbers and
+/// booleans become their string form because every option read is `as_str`,
+/// and `_`-prefixed internals (`_preview`) are removed so a caller cannot
+/// set knobs the stages write for themselves.
+pub fn normalize_options(options: &mut Value) {
+    let Some(map) = options.as_object_mut() else {
+        return;
+    };
+    map.retain(|key, _| !key.starts_with('_'));
+    for value in map.values_mut() {
+        match value.clone() {
+            Value::Number(number) => *value = Value::String(number.to_string()),
+            Value::Bool(flag) => *value = Value::String(flag.to_string()),
+            _ => {}
+        }
+    }
+}
+
 pub(crate) fn flag(options: &Value, key: &str, default_on: bool) -> bool {
     match text(options, key, if default_on { "On" } else { "Off" }) {
         "off" | "Off" | "false" | "0" => false,

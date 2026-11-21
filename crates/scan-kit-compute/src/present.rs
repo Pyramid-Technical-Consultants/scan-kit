@@ -281,14 +281,15 @@ pub(crate) fn finish_patient_report(
             .unwrap_or("report")
     ));
     let csv = scan_kit_io::report::dvh_csv(&curves);
+    let mut out = json!({
+        "pdf": pdf.display().to_string(),
+        "provenance": report.provenance,
+    });
     if !csv.is_empty() {
         std::fs::write(&csv_path, csv).map_err(|err| format!("{}: {err}", csv_path.display()))?;
+        out["dvh_csv"] = json!(csv_path.display().to_string());
     }
-    Ok(json!({
-        "pdf": pdf.display().to_string(),
-        "dvh_csv": csv_path.display().to_string(),
-        "provenance": report.provenance,
-    }))
+    Ok(out)
 }
 
 /// The DVH panel rendered for the report — white paper, dark ink. The caption

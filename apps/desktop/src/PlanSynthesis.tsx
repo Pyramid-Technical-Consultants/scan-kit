@@ -301,7 +301,7 @@ export function PlanSynthesis() {
   }
 
   async function savePlan() {
-    if (plan == null || template == null) {
+    if (busy || plan == null || template == null) {
       return;
     }
     const selected = await save({
@@ -419,7 +419,7 @@ export function PlanSynthesis() {
                 type="button"
                 variant="outline"
                 className="min-w-0 flex-1"
-                disabled={plan == null}
+                disabled={busy || plan == null}
                 onClick={() => void savePlan()}
               >
                 <Download />
