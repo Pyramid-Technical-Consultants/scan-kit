@@ -15,7 +15,7 @@ path = "src/main.rs"
 workspace = true
 
 [dependencies]
-rmcp = { version = "3.5.0", features = ["server", "transport-io", "transport-worker", "client"] }
+rmcp = { version = "3.11.0", features = ["server", "transport-io", "transport-worker", "client"] }
 scan-kit-compute = { workspace = true }
 scan-kit-core = { workspace = true }
 scan-kit-dicom = { workspace = true }
