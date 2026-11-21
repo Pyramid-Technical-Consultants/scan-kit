@@ -847,13 +847,17 @@ fn open_library_keep(
         .collect::<Vec<_>>();
     let exams = found.exams;
     let skipped = found.skipped;
+    let walk_failed = found.walk_failed;
     let tx = conn.transaction().map_err(|err| err.to_string())?;
     let lib_id = prepare_library(&tx, &root)?;
     let ids = places
         .iter()
         .map(|(session_id, _)| session_id.clone())
         .collect::<HashSet<_>>();
-    delete_missing(&tx, lib_id, &ids)?;
+    if !walk_failed {
+        // A partial listing must not look like every session was deleted.
+        delete_missing(&tx, lib_id, &ids)?;
+    }
     let total = found.entries.len() as u64;
     if !keep(0, total, None) {
         return Err("cancelled".into());
@@ -877,7 +881,9 @@ fn open_library_keep(
         .iter()
         .map(|exam| exam.study_uid.clone())
         .collect::<HashSet<_>>();
-    delete_missing_exams(&tx, lib_id, &exam_ids)?;
+    if !walk_failed {
+        delete_missing_exams(&tx, lib_id, &exam_ids)?;
+    }
     for exam in &exams {
         upsert_exam(&tx, lib_id, exam)?;
     }
@@ -888,7 +894,9 @@ fn open_library_keep(
     tx.commit().map_err(|err| err.to_string())?;
     location::replace_sessions(&root, &places);
     publish_catalog(conn)?;
-    Ok(json!({ "root": root, "rows": rows, "selected": selected, "skipped": skipped }))
+    Ok(
+        json!({ "root": root, "rows": rows, "selected": selected, "skipped": skipped, "walk_failed": walk_failed }),
+    )
 }
 
 fn publish_catalog(conn: &rusqlite::Connection) -> Result<Value, String> {

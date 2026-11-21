@@ -145,6 +145,7 @@ pub(crate) fn discover_remote(canonical: &str) -> Result<Found, String> {
     let mut skipped = Vec::new();
     let mut archives = Vec::new();
     let mut exams = Vec::new();
+    let mut walk_failed = false;
     let root_name = remote
         .path
         .trim_end_matches('/')
@@ -176,6 +177,7 @@ pub(crate) fn discover_remote(canonical: &str) -> Result<Found, String> {
             &mut skipped,
             &mut archives,
             &mut exams,
+            &mut walk_failed,
         )?;
     }
     discover::add_archives(&mut entries, &mut skipped, archives);
@@ -184,6 +186,7 @@ pub(crate) fn discover_remote(canonical: &str) -> Result<Found, String> {
         entries,
         skipped,
         exams,
+        walk_failed,
     })
 }
 
@@ -416,6 +419,7 @@ fn http_archive(remote: &Remote) -> Result<Found, String> {
         }],
         skipped: Vec::new(),
         exams: Vec::new(),
+        walk_failed: false,
     })
 }
 
@@ -429,6 +433,7 @@ fn walk_remote(
     skipped: &mut Vec<String>,
     archives: &mut Vec<(Discovered, String)>,
     exams: &mut Vec<discover::ExamHit>,
+    walk_failed: &mut bool,
 ) -> Result<(), String> {
     if depth >= NEST_DEPTH {
         return Ok(());
@@ -441,6 +446,7 @@ fn walk_remote(
         Ok(items) => items,
         Err(err) if depth == 0 => return Err(err),
         Err(_) => {
+            *walk_failed = true;
             skipped.push(rel.to_owned());
             return Ok(());
         }
@@ -477,7 +483,10 @@ fn walk_remote(
                 sessions.push(name.clone());
             }
             Ok(false) => {}
-            Err(_) => skipped.push(child_rel.clone()),
+            Err(_) => {
+                *walk_failed = true;
+                skipped.push(child_rel.clone());
+            }
         }
     }
     for name in &files {
@@ -509,6 +518,7 @@ fn walk_remote(
             }
             Ok(None) => {}
             Err(_) => {
+                *walk_failed = true;
                 skipped.push(child_rel);
                 continue;
             }
@@ -523,6 +533,7 @@ fn walk_remote(
             skipped,
             archives,
             exams,
+            walk_failed,
         )?;
     }
     Ok(())

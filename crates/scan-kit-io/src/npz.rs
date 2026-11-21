@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::{Cursor, Read, Write};
+use std::io::{Cursor, Write};
 use std::path::Path;
 
 /// One `.npy` array: dtype string, C-order shape, raw little-endian payload.
@@ -139,8 +139,8 @@ pub fn read_npz(bytes: &[u8]) -> Result<BTreeMap<String, Npy>, String> {
         if name.is_empty() {
             continue;
         }
-        let mut raw = Vec::new();
-        file.read_to_end(&mut raw).map_err(|err| err.to_string())?;
+        let raw =
+            crate::discover::read_capped(&mut file, &name, crate::discover::MAX_MEMBER_BYTES)?;
         files.insert(name, parse_npy(&raw)?);
     }
     Ok(files)
