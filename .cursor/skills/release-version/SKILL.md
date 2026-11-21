@@ -25,21 +25,22 @@ If unsure, ask the user which bump they want.
 
 ## Release workflow
 
-1. **Bump** `version` in the three files above.
-2. **Commit** with a message matching the repo convention `Release vX.Y.Z`:
+1. **Refresh the SOUP list in Pliant (SK-DOC-3, or the product SBOM once imported).** Dependency changes are not recorded per pull request — reconcile every direct dependency added, removed, or version-bumped since the last release here, in one pass.
+2. **Bump** `version` in the three files above.
+3. **Commit** with a message matching the repo convention `Release vX.Y.Z`:
 
 ```bash
 git add Cargo.toml apps/desktop/package.json apps/desktop/src-tauri/tauri.conf.json
 git commit -m "Release vX.Y.Z"
 ```
 
-3. **Tag** the commit (the tag name must be `v` + the version, e.g. `v2.0.0`):
+4. **Tag** the commit (the tag name must be `v` + the version, e.g. `v2.0.0`):
 
 ```bash
 git tag vX.Y.Z
 ```
 
-4. **Push** the branch and the tag. Pushing the `v*` tag is what triggers the release (see [How the tag triggers a release](#how-the-tag-triggers-a-release-ci-mechanics)):
+5. **Push** the branch and the tag. Pushing the `v*` tag is what triggers the release (see [How the tag triggers a release](#how-the-tag-triggers-a-release-ci-mechanics)):
 
 ```bash
 git push
