@@ -4,15 +4,25 @@ use serde_json::{json, Value};
 macro_rules! forward {
     ($name:ident) => {
         #[tauri::command]
-        fn $name() -> Result<Value, String> {
-            scan_kit_io::invoke(stringify!($name), &json!({})).map_err(|err| err.to_string())
+        async fn $name() -> Result<Value, String> {
+            // Sync commands run inline on the wry main thread — spawn_blocking
+            // keeps network and file IO off the event loop.
+            tauri::async_runtime::spawn_blocking(|| {
+                scan_kit_io::invoke(stringify!($name), &json!({})).map_err(|err| err.to_string())
+            })
+            .await
+            .map_err(|err| err.to_string())?
         }
     };
     ($name:ident ( $($arg:ident : $ty:ty),+ $(,)? )) => {
         #[tauri::command]
-        fn $name($($arg: $ty),+) -> Result<Value, String> {
-            scan_kit_io::invoke(stringify!($name), &json!({ $(stringify!($arg): $arg),+ }))
-                .map_err(|err| err.to_string())
+        async fn $name($($arg: $ty),+) -> Result<Value, String> {
+            tauri::async_runtime::spawn_blocking(move || {
+                scan_kit_io::invoke(stringify!($name), &json!({ $(stringify!($arg): $arg),+ }))
+                    .map_err(|err| err.to_string())
+            })
+            .await
+            .map_err(|err| err.to_string())?
         }
     };
 }
@@ -84,7 +94,7 @@ fn scan_kit_set_last_main_tab(tab: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn scan_kit_run_view(
+async fn scan_kit_run_view(
     view: String,
     path: String,
     session_ids: Vec<String>,
@@ -101,17 +111,21 @@ fn scan_kit_run_view(
         .iter()
         .map(|row| color4(row, [0.9, 0.9, 0.9, 1.0]))
         .collect();
-    scan_kit_compute::run_view(
-        &view,
-        std::path::Path::new(&path),
-        &session_ids,
-        &options,
-        width,
-        height,
-        background,
-        foreground,
-        &palette,
-    )
+    tauri::async_runtime::spawn_blocking(move || {
+        scan_kit_compute::run_view(
+            &view,
+            std::path::Path::new(&path),
+            &session_ids,
+            &options,
+            width,
+            height,
+            background,
+            foreground,
+            &palette,
+        )
+    })
+    .await
+    .map_err(|err| err.to_string())?
 }
 
 // The dose/report exports run as `write_dose`/`write_report` tasks so the
@@ -200,62 +214,78 @@ async fn scan_kit_open_plot(
 }
 
 #[tauri::command]
-fn scan_kit_open_study(path: String) -> Result<Value, String> {
-    scan_kit_dicom::invoke("scan_kit_open_study", &json!({ "path": path }))
+async fn scan_kit_open_study(path: String) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        scan_kit_dicom::invoke("scan_kit_open_study", &json!({ "path": path }))
+    })
+    .await
+    .map_err(|err| err.to_string())?
 }
 
 #[tauri::command]
-fn scan_kit_synthesize_plan(
+async fn scan_kit_synthesize_plan(
     template: String,
     params: Value,
     path: Option<String>,
     csv: Option<String>,
 ) -> Result<Value, String> {
-    let mut body = json!({ "template": template, "params": params });
-    if let Some(path) = path {
-        body["path"] = json!(path);
-    }
-    if let Some(csv) = csv {
-        body["csv"] = json!(csv);
-    }
-    scan_kit_io::invoke("scan_kit_synthesize_plan", &body).map_err(|err| err.to_string())
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut body = json!({ "template": template, "params": params });
+        if let Some(path) = path {
+            body["path"] = json!(path);
+        }
+        if let Some(csv) = csv {
+            body["csv"] = json!(csv);
+        }
+        scan_kit_io::invoke("scan_kit_synthesize_plan", &body).map_err(|err| err.to_string())
+    })
+    .await
+    .map_err(|err| err.to_string())?
 }
 
 #[tauri::command]
-fn scan_kit_config_open(
+async fn scan_kit_config_open(
     path: Option<String>,
     data_dir: Option<String>,
     session_id: Option<String>,
 ) -> Result<Value, String> {
-    let mut body = json!({});
-    if let Some(path) = path.filter(|text| !text.is_empty()) {
-        body["path"] = json!(path);
-    }
-    if let Some(data_dir) = data_dir.filter(|text| !text.is_empty()) {
-        body["data_dir"] = json!(data_dir);
-    }
-    if let Some(session_id) = session_id.filter(|text| !text.is_empty()) {
-        body["session_id"] = json!(session_id);
-    }
-    scan_kit_io::invoke("scan_kit_config_open", &body).map_err(|err| err.to_string())
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut body = json!({});
+        if let Some(path) = path.filter(|text| !text.is_empty()) {
+            body["path"] = json!(path);
+        }
+        if let Some(data_dir) = data_dir.filter(|text| !text.is_empty()) {
+            body["data_dir"] = json!(data_dir);
+        }
+        if let Some(session_id) = session_id.filter(|text| !text.is_empty()) {
+            body["session_id"] = json!(session_id);
+        }
+        scan_kit_io::invoke("scan_kit_config_open", &body).map_err(|err| err.to_string())
+    })
+    .await
+    .map_err(|err| err.to_string())?
 }
 
 #[tauri::command]
-fn scan_kit_config_save(
+async fn scan_kit_config_save(
     source: String,
     dest: String,
     files: Value,
     hide_unused: Option<bool>,
 ) -> Result<Value, String> {
-    let mut body = json!({ "source": source, "dest": dest, "files": files });
-    if let Some(hide_unused) = hide_unused {
-        body["hide_unused"] = json!(hide_unused);
-    }
-    scan_kit_io::invoke("scan_kit_config_save", &body).map_err(|err| err.to_string())
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut body = json!({ "source": source, "dest": dest, "files": files });
+        if let Some(hide_unused) = hide_unused {
+            body["hide_unused"] = json!(hide_unused);
+        }
+        scan_kit_io::invoke("scan_kit_config_save", &body).map_err(|err| err.to_string())
+    })
+    .await
+    .map_err(|err| err.to_string())?
 }
 
 #[tauri::command]
-fn scan_kit_config_tune(
+async fn scan_kit_config_tune(
     workflow: String,
     xml: String,
     form: Option<Value>,
@@ -263,21 +293,25 @@ fn scan_kit_config_tune(
     session_ids: Vec<String>,
     params: Value,
 ) -> Result<Value, String> {
-    let mut body = json!({
-        "workflow": workflow,
-        "xml": xml,
-        "data_dir": data_dir,
-        "session_ids": session_ids,
-        "params": params,
-    });
-    if let Some(form) = form {
-        body["form"] = form;
-    }
-    scan_kit_io::invoke("scan_kit_config_tune", &body).map_err(|err| err.to_string())
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut body = json!({
+            "workflow": workflow,
+            "xml": xml,
+            "data_dir": data_dir,
+            "session_ids": session_ids,
+            "params": params,
+        });
+        if let Some(form) = form {
+            body["form"] = form;
+        }
+        scan_kit_io::invoke("scan_kit_config_tune", &body).map_err(|err| err.to_string())
+    })
+    .await
+    .map_err(|err| err.to_string())?
 }
 
 #[tauri::command]
-fn scan_kit_config_diff(
+async fn scan_kit_config_diff(
     config_dir: String,
     file: Option<String>,
     xml: Option<String>,
@@ -285,30 +319,41 @@ fn scan_kit_config_diff(
     data_dir: String,
     session_ids: Vec<String>,
 ) -> Result<Value, String> {
-    let mut body = json!({
-        "config_dir": config_dir,
-        "data_dir": data_dir,
-        "session_ids": session_ids,
-    });
-    if let Some(file) = file.filter(|text| !text.is_empty()) {
-        body["file"] = json!(file);
-    }
-    if let Some(xml) = xml.filter(|text| !text.is_empty()) {
-        body["xml"] = json!(xml);
-    }
-    if let Some(form) = form {
-        body["form"] = form;
-    }
-    scan_kit_io::invoke("scan_kit_config_diff", &body).map_err(|err| err.to_string())
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut body = json!({
+            "config_dir": config_dir,
+            "data_dir": data_dir,
+            "session_ids": session_ids,
+        });
+        if let Some(file) = file.filter(|text| !text.is_empty()) {
+            body["file"] = json!(file);
+        }
+        if let Some(xml) = xml.filter(|text| !text.is_empty()) {
+            body["xml"] = json!(xml);
+        }
+        if let Some(form) = form {
+            body["form"] = form;
+        }
+        scan_kit_io::invoke("scan_kit_config_diff", &body).map_err(|err| err.to_string())
+    })
+    .await
+    .map_err(|err| err.to_string())?
 }
 
 #[tauri::command]
-fn scan_kit_runner_status(has_plan: Option<bool>, dest: Option<String>) -> Result<Value, String> {
-    scan_kit_io::invoke(
-        "scan_kit_runner_status",
-        &json!({ "has_plan": has_plan.unwrap_or(false), "dest": dest.unwrap_or_default() }),
-    )
-    .map_err(|err| err.to_string())
+async fn scan_kit_runner_status(
+    has_plan: Option<bool>,
+    dest: Option<String>,
+) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        scan_kit_io::invoke(
+            "scan_kit_runner_status",
+            &json!({ "has_plan": has_plan.unwrap_or(false), "dest": dest.unwrap_or_default() }),
+        )
+        .map_err(|err| err.to_string())
+    })
+    .await
+    .map_err(|err| err.to_string())?
 }
 
 #[tauri::command]

@@ -80,7 +80,13 @@ impl ScanKit {
                 .get("path")
                 .and_then(Value::as_str)
                 .is_some_and(|path| !path.trim().is_empty());
-        saves.then_some(name)
+        // A caller-chosen store is outside the index the sandbox covers —
+        // it creates directories, sqlite files, and migrates foreign schemas.
+        let foreign_db = input
+            .get("db_path")
+            .and_then(Value::as_str)
+            .is_some_and(|path| !path.trim().is_empty());
+        (saves || foreign_db).then_some(name)
     }
 
     fn allows(&self, name: &str) -> bool {
@@ -181,11 +187,25 @@ impl ServerHandler for ScanKit {
             None => Value::Null,
             Some(arguments) => Value::Object(arguments),
         };
-        let result = match self.blocked(&request.name, &input) {
+        let name = request.name.clone();
+        let result = match self.blocked(&name, &input) {
             Some(name) => Err(format!(
                 "{name} changes files, devices, or reference configuration; start the server with --allow-effects to use it"
             )),
-            None => dispatch(&request.name, &input),
+            None => {
+                if !catalog_specs().iter().any(|tool| tool.name == name) {
+                    return Err(McpError::invalid_params(
+                        format!("unknown tool {name}"),
+                        None,
+                    ));
+                }
+                // dispatch blocks on file IO, remote connect timeouts, and GPU
+                // waits — pinning a tokio worker starves every other request.
+                match tokio::task::spawn_blocking(move || dispatch(&name, &input)).await {
+                    Ok(inner) => inner,
+                    Err(err) => Err(err.to_string()),
+                }
+            }
         };
         match result {
             Ok(value) => Ok(CallToolResult::structured(value).into()),
@@ -312,7 +332,10 @@ mod tests {
 
         let (client_io, server_io) = tokio::io::duplex(256 * 1024);
         let server = tokio::spawn(async move {
-            let running = ScanKit::default().serve(server_io).await.expect("server");
+            let running = ScanKit { effects: true }
+                .serve(server_io)
+                .await
+                .expect("server");
             running.waiting().await.expect("server wait");
         });
         let client = ().serve(client_io).await.expect("client");
