@@ -11,6 +11,6 @@ A crate copied into the tree is still third-party software. Do not vendor a regi
 
 These stay dependencies: serde and serde_json, tokio, wgpu and naga, Tauri and its dialog plugin, rusqlite, the archive crates, sha2, the desktop shadcn and Glide packages, and the TLS stacks already in use. Do not replace them with a handwritten version.
 
-A pull request that adds a direct dependency names the code it replaces and why writing that code is worse. Adding or removing one updates the SOUP list in Pliant (SK-DOC-3) in the same change.
+A pull request that adds a direct dependency names the code it replaces and why writing that code is worse. Do not update the SOUP list in Pliant (SK-DOC-3) per change — it is refreshed all at once when a release is cut (see the release-version skill).
 
 An ignored advisory in `deny.toml` keeps its reason. Remove the ignore when an upgrade exists.
