@@ -752,7 +752,7 @@ export default function App() {
         notifyError(error);
       }
     },
-    [rows, locations],
+    [rows, locations, setTrashConfirm],
   );
 
   const confirmTrash = useCallback(async () => {
@@ -781,7 +781,7 @@ export default function App() {
     } catch (error) {
       notifyError(error);
     }
-  }, [trashConfirm, rows]);
+  }, [trashConfirm, rows, setTrashConfirm]);
 
   const commitSelection = useCallback((next: { ids: string[]; capped: boolean }) => {
     if (locations.length === 0) {
