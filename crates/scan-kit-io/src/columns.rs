@@ -26,9 +26,12 @@ pub fn load_columns(
     let timeslices = discover::read_timeslices(storage);
     let map = discover::read_session_file(storage, session_id, "input_map.csv");
     let spots = discover::read_session_file(storage, session_id, "spot_data.csv");
+    // Score the union of timeslice headers — a column that only appears in a
+    // later file must not route the load to a table that lacks it.
     let timeslice_score = timeslices
-        .first()
+        .iter()
         .map(|bytes| score(bytes, requested))
+        .max()
         .unwrap_or(0);
     let map_score = map
         .as_ref()
@@ -168,20 +171,12 @@ fn score(bytes: &[u8], requested: &[String]) -> usize {
 }
 
 fn project_files(files: &[Vec<u8>], requested: &[String]) -> Result<Value, String> {
-    let Some(first) = files.first() else {
-        return Err("no session csv contained the requested columns".to_owned());
-    };
-    let headers = header_of(first)?;
-    let sources: Vec<Source> = requested
-        .iter()
-        .map(|name| source_for(&headers, name))
-        .collect();
-    if sources
-        .iter()
-        .all(|source| matches!(source, Source::Missing))
-    {
+    if files.is_empty() {
         return Err("no session csv contained the requested columns".to_owned());
     }
+    // Headers differ between files — a column is missing only when every
+    // file lacks it, not just the first.
+    let mut seen = vec![false; requested.len()];
     let mut series = vec![Vec::new(); requested.len()];
     for file in files {
         let file_headers = header_of(file)?;
@@ -189,6 +184,11 @@ fn project_files(files: &[Vec<u8>], requested: &[String]) -> Result<Value, Strin
             .iter()
             .map(|name| source_for(&file_headers, name))
             .collect();
+        for (column, source) in file_sources.iter().enumerate() {
+            if !matches!(source, Source::Missing) {
+                seen[column] = true;
+            }
+        }
         let mut indexes = Vec::new();
         for source in &file_sources {
             if let Some(list) = source.indexes() {
@@ -216,10 +216,13 @@ fn project_files(files: &[Vec<u8>], requested: &[String]) -> Result<Value, Strin
             }
         }
     }
+    if seen.iter().all(|present| !present) {
+        return Err("no session csv contained the requested columns".to_owned());
+    }
     let mut columns = Vec::new();
     let mut missing = Vec::new();
     for (index, name) in requested.iter().enumerate() {
-        if matches!(sources[index], Source::Missing) {
+        if !seen[index] {
             missing.push(name.clone());
             continue;
         }

@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -63,9 +64,13 @@ pub fn catalog(db: &Path) -> Value {
         "view": runner_view(&json!({}), false, false),
     });
     if connected {
-        if let Ok(view) = read_status(false, "") {
-            body["view"] = view;
-            body["connected"] = json!(true);
+        match read_status(false, "") {
+            Ok(view) => {
+                body["view"] = view;
+                body["connected"] = json!(true);
+            }
+            // A dead socket is not "connected" even while live() still lists it.
+            Err(_) => body["connected"] = json!(false),
         }
     }
     body
@@ -223,10 +228,17 @@ pub fn download_with(
         )
     };
     let zip_path = session_zip_dest(dest).ok_or("Choose a local .zip path for the session.")?;
+    // Unique per call — two overlapping downloads to the same folder must not
+    // delete each other's staging tree mid-capture.
+    static NEXT_STAGING: AtomicU64 = AtomicU64::new(0);
     let staging = PathBuf::from(&zip_path)
         .parent()
         .unwrap_or(Path::new("."))
-        .join(".session_staging");
+        .join(format!(
+            ".session_staging-{}-{}",
+            std::process::id(),
+            NEXT_STAGING.fetch_add(1, Ordering::Relaxed)
+        ));
     let session_dir = staging.join("session");
     let _ = std::fs::remove_dir_all(&staging);
     std::fs::create_dir_all(&session_dir).map_err(|err| err.to_string())?;
@@ -784,7 +796,11 @@ pub(crate) fn http_tuned(
         match stream.read(&mut chunk) {
             Ok(0) => break,
             Ok(count) => raw.extend_from_slice(&chunk[..count]),
-            Err(err) if err.kind() == std::io::ErrorKind::TimedOut && !raw.is_empty() => break,
+            // A stall mid-body is truncation, not EOF — surface it rather than
+            // handing a partial response to the parser.
+            Err(err) if err.kind() == std::io::ErrorKind::TimedOut => {
+                return Err("the device stopped responding mid-response".into());
+            }
             Err(err) => return Err(err.to_string()),
         }
     }

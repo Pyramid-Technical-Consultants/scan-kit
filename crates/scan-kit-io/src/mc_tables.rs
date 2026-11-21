@@ -160,6 +160,9 @@ pub fn csda_range_mm(medium: &str, energy: f64) -> Result<f64, String> {
         .map(|s| s * tables.rho[m] / 1e6)
         .collect::<Vec<_>>(); // MeV/cm
     let energies = &tables.stop_energies;
+    // Below the 0.5 MeV table floor the integral goes negative — clamp like
+    // the kernel-side csda_range_mm does.
+    let energy = energy.max(0.5);
     let dx = (energy - 0.5) / 1999.0;
     let mut area = 0.0;
     let mut prev = 1.0 / interp_lin(0.5, energies, &stop);

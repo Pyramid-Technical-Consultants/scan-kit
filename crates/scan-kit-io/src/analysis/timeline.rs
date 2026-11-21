@@ -403,8 +403,12 @@ pub(super) fn hv_transient(root: &Path, session_ids: &[String]) -> PlotScene {
                 time.last().copied().unwrap_or(0.0),
             ));
             let config = hv_config_text(root, session, device);
-            let delta_v = config.as_deref().and_then(hv_delta_v).unwrap_or(80.0);
-            let measured = hv_capacitance_pf(&time, current, t0, t1, delta_v).unwrap_or(0.0);
+            // Without the nozzle config's step voltages there is no measured
+            // capacitance — don't fabricate one from an assumed 80 V step.
+            let measured = config
+                .as_deref()
+                .and_then(hv_delta_v)
+                .and_then(|delta_v| hv_capacitance_pf(&time, current, t0, t1, delta_v));
             let expected = config.as_deref().and_then(hv_expected_pf);
             let result = session_text(root, session, &format!("ic_hv_toggle/{device}_result.json"));
             let (overall, flags) = hv_firmware_flags(&result);
@@ -416,15 +420,16 @@ pub(super) fn hv_transient(root: &Path, session_ids: &[String]) -> PlotScene {
                 current,
                 MARK,
             ));
-            let mut counts = vec![measured];
-            let mut edges = vec![0.0, 1.0];
+            let mut counts = measured.iter().copied().collect::<Vec<_>>();
             if let Some(expected) = expected {
                 counts.push(expected);
-                edges.push(2.0);
             }
+            let edges: Vec<f32> = (0..=counts.len()).map(|i| i as f32).collect();
             let ymax = counts.iter().copied().fold(1.0f32, f32::max);
             panels.push(panel(
-                format!("{device} {measured:.1} pF fails {fails}"),
+                measured
+                    .map(|measured| format!("{device} {measured:.1} pF fails {fails}"))
+                    .unwrap_or_else(|| format!("{device} capacitance not measured, fails {fails}")),
                 0.0,
                 (counts.len()) as f32,
                 0.0,

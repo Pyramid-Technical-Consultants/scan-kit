@@ -110,6 +110,7 @@ pub fn load_study(path: &Path) -> Result<PatientStudy, String> {
     let mut summation = String::new();
     let mut plan = None;
     let mut structures = Vec::new();
+    let mut structures_frame = String::new();
     let mut patient_id = String::new();
     let mut patient_name = String::new();
     let mut study_uid = String::new();
@@ -133,7 +134,7 @@ pub fn load_study(path: &Path) -> Result<PatientStudy, String> {
         let elems = parse_file(&bytes)?;
         let class = text_tag(&elems, tag(0x0008, 0x0016));
         let frame = text_tag(&elems, tag(0x0020, 0x0052));
-        if class.contains("1.2.840.10008.5.1.4.1.1.2") {
+        if class == "1.2.840.10008.5.1.4.1.1.2" {
             if patient_id.is_empty() {
                 patient_id = text_tag(&elems, tag(0x0010, 0x0020));
                 patient_name = text_tag(&elems, tag(0x0010, 0x0010));
@@ -144,15 +145,16 @@ pub fn load_study(path: &Path) -> Result<PatientStudy, String> {
             for slice in image_slices(&elems, 1.0)? {
                 ct_slices.push((frame.clone(), slice));
             }
-        } else if class.contains("1.2.840.10008.5.1.4.1.1.481.8") {
+        } else if class == "1.2.840.10008.5.1.4.1.1.481.8" {
             let sop_uid = text_tag(&elems, tag(0x0008, 0x0018));
             let mut parsed = read_plan(&elems, frame)?;
             parsed.sop_uid = sop_uid;
             plan = Some(parsed);
-        } else if class.contains("1.2.840.10008.5.1.4.1.1.481.3") {
+        } else if class == "1.2.840.10008.5.1.4.1.1.481.3" {
             structures_uid = text_tag(&elems, tag(0x0008, 0x0018));
+            structures_frame = frame.clone();
             structures = read_structures(&elems);
-        } else if class.contains("1.2.840.10008.5.1.4.1.1.481.2") {
+        } else if class == "1.2.840.10008.5.1.4.1.1.481.2" {
             let scale = float_tag(&elems, tag(0x3004, 0x000E)).unwrap_or(1.0);
             if dose_type.is_empty() {
                 dose_type = text_tag(&elems, tag(0x3004, 0x0004));
@@ -183,6 +185,9 @@ pub fn load_study(path: &Path) -> Result<PatientStudy, String> {
     }
     if dose_slices.iter().any(|(got, _)| got != &frame) {
         return Err("the dose frame of reference does not match the CT".into());
+    }
+    if !structures_frame.is_empty() && structures_frame != frame {
+        return Err("the structures frame of reference does not match the CT".into());
     }
     let mut slices: Vec<_> = ct_slices.into_iter().map(|(_, slice)| slice).collect();
     let mut ct = stack(&mut slices)?;
@@ -230,6 +235,9 @@ pub fn read_ion_plan(path: &Path) -> Result<IonPlan, String> {
     let mut spots = Vec::new();
     let mut plan_index = 0i32;
     for beam in seq(&elems, tag(0x300A, 0x03A2)) {
+        if text_tag(beam, tag(0x300A, 0x00CE)) == "SETUP" {
+            continue;
+        }
         let mut energy = 0.0f32;
         for cp in seq(beam, tag(0x300A, 0x03A8)) {
             energy = float_tag(cp, tag(0x300A, 0x0114)).unwrap_or(energy);
@@ -255,7 +263,10 @@ pub fn read_ion_plan(path: &Path) -> Result<IonPlan, String> {
                 };
                 let index = plan_index;
                 plan_index += 1;
-                if has_weights && (!mu.is_finite() || mu <= 0.0) {
+                if (has_weights && (!mu.is_finite() || mu <= 0.0))
+                    || !energy.is_finite()
+                    || energy <= 0.0
+                {
                     continue;
                 }
                 spots.push(IonPlanSpot {
@@ -485,6 +496,7 @@ pub fn write_water_study(dir: &Path) -> Result<(), String> {
 
 struct Slice {
     origin: [f32; 3],
+    thickness: f32,
     spacing_x: f32,
     spacing_y: f32,
     cols: usize,
@@ -577,6 +589,7 @@ fn image_slices(elems: &[Elem], scale: f32) -> Result<Vec<Slice>, String> {
         }
         slices.push(Slice {
             origin: [x, y, origin[2] + along * normal_sign],
+            thickness,
             spacing_x: spacing[1],
             spacing_y: spacing[0],
             cols,
@@ -600,7 +613,7 @@ fn stack(slices: &mut [Slice]) -> Result<CtVolume, String> {
     });
     let first = &slices[0];
     let dz = if slices.len() == 1 {
-        1.0
+        slices[0].thickness
     } else {
         slices[1].origin[2] - slices[0].origin[2]
     };
@@ -668,8 +681,11 @@ fn read_plan(elems: &[Elem], frame: String) -> Result<Plan, String> {
     }
     let mut fractions = 1;
     let mut metersets = Vec::new();
-    if let Some(group) = seq(elems, tag(0x300A, 0x0070)).first() {
-        fractions = int_tag(group, tag(0x300A, 0x0078)).unwrap_or(1);
+    // ponytail: beams in later fraction groups share this fraction count.
+    for group in seq(elems, tag(0x300A, 0x0070)) {
+        if metersets.is_empty() {
+            fractions = int_tag(group, tag(0x300A, 0x0078)).unwrap_or(1);
+        }
         for beam in seq(group, tag(0x300C, 0x0004)) {
             metersets.push((
                 int_tag(beam, tag(0x300C, 0x0006)).unwrap_or(0),
@@ -1030,7 +1046,17 @@ fn parse_dataset_mode(bytes: &[u8], implicit: bool) -> Result<Vec<Elem>, String>
             let vr = &bytes[cursor + 4..cursor + 6];
             let long = matches!(
                 vr,
-                b"OB" | b"OW" | b"OF" | b"SQ" | b"UT" | b"UN" | b"OD" | b"OL" | b"OV"
+                b"OB"
+                    | b"OW"
+                    | b"OF"
+                    | b"SQ"
+                    | b"UT"
+                    | b"UN"
+                    | b"OD"
+                    | b"OL"
+                    | b"OV"
+                    | b"UC"
+                    | b"UR"
             );
             let (length, header) = if long {
                 if cursor + 12 > bytes.len() {
@@ -1149,11 +1175,16 @@ fn floats_tag(elems: &[Elem], tag: u32) -> Vec<f32> {
         return Vec::new();
     };
     // OF payloads are raw little-endian f32 whatever the transfer syntax —
-    // a value with a non-text byte decodes as floats, not ASCII.
-    if elem
-        .bytes
-        .iter()
-        .any(|byte| !(byte.is_ascii_graphic() || *byte == b' '))
+    // a value with a non-text byte decodes as floats, not ASCII. Trailing
+    // NULs are DS padding, not a binary marker.
+    let mut end = elem.bytes.len();
+    while end > 0 && elem.bytes[end - 1] == 0 {
+        end -= 1;
+    }
+    if (end == 0 && !elem.bytes.is_empty())
+        || elem.bytes[..end]
+            .iter()
+            .any(|byte| !(byte.is_ascii_graphic() || *byte == b' '))
     {
         return elem
             .bytes
@@ -1227,7 +1258,9 @@ fn push_elem(bytes: &mut Vec<u8>, group: u16, slot: u16, vr: &[u8], value: &[u8]
         bytes.extend_from_slice(&[0, 0]);
         bytes.extend_from_slice(&(value.len() as u32).to_le_bytes());
     } else {
-        bytes.extend_from_slice(&(value.len() as u16).to_le_bytes());
+        // A short-VR length field is u16 — writers keep values far under it.
+        let len = u16::try_from(value.len()).expect("short VR over 64 KiB");
+        bytes.extend_from_slice(&len.to_le_bytes());
     }
     bytes.extend_from_slice(value);
 }
@@ -1273,12 +1306,13 @@ pub(crate) fn us(bytes: &mut Vec<u8>, group: u16, element: u16, value: u16) {
     push_elem(bytes, group, element, b"US", &value.to_le_bytes());
 }
 
-pub(crate) fn us_list(bytes: &mut Vec<u8>, group: u16, element: u16, values: &[u16]) {
-    let mut raw = Vec::with_capacity(values.len() * 2);
-    for value in values {
-        raw.extend_from_slice(&value.to_le_bytes());
-    }
-    push_elem(bytes, group, element, b"US", &raw);
+pub(crate) fn is_list(bytes: &mut Vec<u8>, group: u16, element: u16, values: &[u16]) {
+    let text = values
+        .iter()
+        .map(u16::to_string)
+        .collect::<Vec<_>>()
+        .join("\\");
+    push_elem(bytes, group, element, b"IS", &even(&text));
 }
 
 pub(crate) fn ow(bytes: &mut Vec<u8>, group: u16, element: u16, values: &[u16]) {
@@ -1495,6 +1529,7 @@ mod tests {
     fn slice(z: f32) -> Slice {
         Slice {
             origin: [0.0, 0.0, z],
+            thickness: 1.0,
             spacing_x: 1.0,
             spacing_y: 1.0,
             cols: 2,

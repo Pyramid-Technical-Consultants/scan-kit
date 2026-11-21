@@ -233,8 +233,8 @@ fn lay_out(report: &Report) -> Vec<Vec<Op>> {
                     .fold(0.0f32, f32::max)
                     .min(200.0);
                 for (key, value) in pairs {
+                    text(&mut ops, MARGIN, y + 9.0, 10.0, Ink::Faint, key);
                     for line in wrap(value, 10.0, TEXT_W - key_w - 8.0) {
-                        text(&mut ops, MARGIN, y + 9.0, 10.0, Ink::Faint, key);
                         text(
                             &mut ops,
                             MARGIN + key_w + 8.0,
@@ -456,7 +456,7 @@ pub fn patient_report(
                 "Delivered MU",
                 "Ratio",
                 "Unmatched spots",
-                "Worst energy (MeV)",
+                "Worst energy err (MeV)",
                 "Position RMS (mm)",
             ]
             .iter()
@@ -476,8 +476,16 @@ pub fn patient_report(
                             String::new()
                         },
                         m.unmatched.to_string(),
-                        format!("{:.2}", m.energy_error),
-                        format!("{:.2}", m.position_rms),
+                        if m.energy_error.is_finite() {
+                            format!("{:.2}", m.energy_error)
+                        } else {
+                            String::new()
+                        },
+                        if m.position_rms.is_finite() {
+                            format!("{:.2}", m.position_rms)
+                        } else {
+                            String::new()
+                        },
                     ]
                 })
                 .collect(),
