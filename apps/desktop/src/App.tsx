@@ -300,6 +300,7 @@ export default function App() {
   const [libraryLoading, setLibraryLoading] = useState(false);
   usePageLoad(libraryLoading, libraryReport?.done ?? 0, libraryReport?.total ?? 0);
   const libraryToken = useRef<object>({});
+  const catalogEpoch = useRef(0);
   const loadDepth = useRef(0);
   const noteBusy = useRef(false);
   const pendingLocations = useRef<string[]>([]);
@@ -401,6 +402,9 @@ export default function App() {
 
   const openLocation = useCallback(
     async (path: string) => {
+      // Newest action wins — a running indexMany stops at the next root
+      // instead of reclaiming the token and cancelling this load.
+      catalogEpoch.current += 1;
       beginCatalogLoad();
       try {
         const result = await indexLocation(path);
@@ -425,6 +429,7 @@ export default function App() {
 
   const indexMany = useCallback(
     async (roots: string[]) => {
+      const epoch = ++catalogEpoch.current;
       beginCatalogLoad();
       let stopped = -1;
       try {
@@ -432,6 +437,9 @@ export default function App() {
           const root = roots[index];
           if (root == null) {
             continue;
+          }
+          if (catalogEpoch.current !== epoch) {
+            break;
           }
           const result = await indexLocation(root);
           if (result === "auth") {
@@ -796,6 +804,12 @@ export default function App() {
       }
       return;
     }
+    // Apply before the invokes so a second check computes from this set, not
+    // stale state; the remote write catches up and a failure rolls back.
+    const before = selectionOrder;
+    const chosen = new Set(next.ids);
+    setSelectionOrder(next.ids);
+    setRows((items) => items.map((item) => ({ ...item, selected: chosen.has(item.session_id) })));
     void (async () => {
       for (const root of locations) {
         const sessionIds = next.ids.flatMap((id) => {
@@ -807,15 +821,19 @@ export default function App() {
         });
         await invoke("scan_kit_select_sessions", { path: root, sessionIds });
       }
-      const chosen = new Set(next.ids);
-      setSelectionOrder(next.ids);
-      setRows((items) => items.map((item) => ({ ...item, selected: chosen.has(item.session_id) })));
       if (next.capped) {
         notify("At most five sessions can be selected.", "selection");
       } else {
         dismissNotice("selection");
       }
-    })().catch((error: unknown) => notifyError(error));
+    })().catch((error: unknown) => {
+      const restore = new Set(before);
+      setSelectionOrder(before);
+      setRows((items) =>
+        items.map((item) => ({ ...item, selected: restore.has(item.session_id) })),
+      );
+      notifyError(error);
+    });
   }, [locations, rows, selectionOrder]);
 
   const onRowCheck = useCallback(

@@ -339,10 +339,16 @@ export function AnalysisView({
   const hold = useRef(0);
   const taskId = useRef(0);
   const [taskReport, setTaskReport] = useState<Report | null>(null);
+  const [exportBusy, setExportBusy] = useState(false);
+  const [exportReport, setExportReport] = useState<Report | null>(null);
   const [arrivedKey, setArrivedKey] = useState<string | null>(null);
   const [opening, setOpening] = useState(false);
   const frame = useRef(0);
   const openSeq = useRef(0);
+  // spawn_blocking start order is not FIFO — serialize the invokes so the
+  // backend takes/creates tasks in the order the tickets were issued.
+  const startChain = useRef<Promise<unknown>>(Promise.resolve());
+  const issuedSeq = useRef(0);
   const [options, setOptions] = useState<Record<string, string>>({});
   const optionsRef = useRef(options);
   const paintRef = useRef("");
@@ -671,6 +677,45 @@ export function AnalysisView({
   const requestKey = JSON.stringify([pictureKey, lineEpoch]);
   const loading = arrivedKey !== requestKey || opening;
   usePageLoad(loading, taskReport?.done ?? 0, taskReport?.total ?? 0);
+  // Export progress is its own hairline entry — sharing taskReport would let an
+  // export overwrite (or erase) the plot task's reported progress.
+  usePageLoad(exportBusy, exportReport?.done ?? 0, exportReport?.total ?? 0);
+  const runExport = (
+    view: "write_dose" | "write_report",
+    dest: string,
+    extra?: Record<string, string>,
+  ) => {
+    // Both exports share one backend slot — a second start cancels the first
+    // silently, so the buttons are gated on exportBusy instead.
+    setExportBusy(true);
+    void driveTask(
+      {
+        view,
+        path: folder,
+        sessionIds: shownSessionIds(
+          sessions.map((session) => session.id),
+          hidden,
+        ),
+        options: {
+          ...optionsRef.current,
+          study: studyPath,
+          scanners: JSON.stringify(scanners),
+          dest,
+          ...extra,
+        },
+        background: [],
+        foreground: [],
+        palette: [],
+      },
+      (report) => setExportReport(report.finished ? null : report),
+      () => false,
+    )
+      .catch((reason: unknown) => {
+        setExportReport(null);
+        notifyError(reason);
+      })
+      .finally(() => setExportBusy(false));
+  };
   useEffect(() => {
     optionsRef.current = options;
   }, [options]);
@@ -712,21 +757,31 @@ export function AnalysisView({
       }
       setPlotError(null);
       void (async () => {
-        const started = await invoke<{ task: number; generation: number }>("scan_kit_start", {
-          view: viewId,
-          path: folder,
-          sessionIds: shown,
-          options: plotOptions,
-          background: parseColor(tokenColor("--background")),
-          foreground: parseColor(tokenColor("--foreground")),
-          palette: palette(order, shown),
-        });
+        issuedSeq.current = ticket;
+        const run = () =>
+          invoke<{ task: number; generation: number }>("scan_kit_start", {
+            view: viewId,
+            path: folder,
+            sessionIds: shown,
+            options: plotOptions,
+            background: parseColor(tokenColor("--background")),
+            foreground: parseColor(tokenColor("--foreground")),
+            palette: palette(order, shown),
+          });
+        startChain.current = startChain.current.then(run, run);
+        const started = (await startChain.current) as {
+          task: number;
+          generation: number;
+        };
         if (stop || openSeq.current !== ticket) {
           const id = started.task;
-          // The replacement start may already have retargeted this same task.
-          // Cancelling now would drop that calculation and leave the bar idle.
+          // The replacement start may already have retargeted this same task —
+          // and when a newer start was issued, its own backend start will
+          // replace the slot, so a client cancel here can only kill work it
+          // would have kept. Cancelling now would drop that calculation and
+          // leave the bar idle.
           queueMicrotask(() => {
-            if (taskId.current === id) {
+            if (taskId.current === id || issuedSeq.current > ticket) {
               return;
             }
             void invoke("scan_kit_cancel", { task: id });
@@ -1409,6 +1464,7 @@ export function AnalysisView({
         {viewId === "volumetric" && studyPath != null ? (
           <Button
             variant="outline"
+            disabled={exportBusy}
             onClick={() => {
               void open({
                 defaultPath: "qa.pdf",
@@ -1417,30 +1473,7 @@ export function AnalysisView({
                 if (typeof selected !== "string") {
                   return;
                 }
-                void driveTask(
-                  {
-                    view: "write_report",
-                    path: folder,
-                    sessionIds: shownSessionIds(
-                      sessions.map((session) => session.id),
-                      hidden,
-                    ),
-                    options: {
-                      ...optionsRef.current,
-                      study: studyPath,
-                      scanners: JSON.stringify(scanners),
-                      dest: selected,
-                    },
-                    background: [],
-                    foreground: [],
-                    palette: [],
-                  },
-                  (report) => setTaskReport(report.finished ? null : report),
-                  () => false,
-                ).catch((reason: unknown) => {
-                  setTaskReport(null);
-                  notifyError(reason);
-                });
+                runExport("write_report", selected);
               })
                 .catch((reason: unknown) => notifyError(reason));
             }}
@@ -1451,6 +1484,7 @@ export function AnalysisView({
         {viewId === "volumetric" && studyPath != null ? (
           <Button
             variant="outline"
+            disabled={exportBusy}
             onClick={() => {
               void open({
                 defaultPath: "dose.dcm",
@@ -1459,30 +1493,8 @@ export function AnalysisView({
                 if (typeof selected !== "string") {
                   return;
                 }
-                void driveTask(
-                  {
-                    view: "write_dose",
-                    path: folder,
-                    sessionIds: shownSessionIds(
-                      sessions.map((session) => session.id),
-                      hidden,
-                    ),
-                    options: {
-                      ...optionsRef.current,
-                      study: studyPath,
-                      scanners: JSON.stringify(scanners),
-                      dest: selected,
-                      description: "scan-kit MC",
-                    },
-                    background: [],
-                    foreground: [],
-                    palette: [],
-                  },
-                  (report) => setTaskReport(report.finished ? null : report),
-                  () => false,
-                ).catch((reason: unknown) => {
-                  setTaskReport(null);
-                  notifyError(reason);
+                runExport("write_dose", selected, {
+                  description: "scan-kit MC",
                 });
               })
                 .catch((reason: unknown) => notifyError(reason));

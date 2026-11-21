@@ -1018,9 +1018,15 @@ it("keeps the replacement calculation when an older start finishes late", async 
     await act(async () => {
       await new Promise((resolve) => setTimeout(resolve, 200));
     });
-    expect(waiters).toHaveLength(2);
+    // Starts are serialized — the second invoke does not go out until the
+    // first resolves, so the backend can never reorder them.
+    expect(waiters).toHaveLength(1);
     await act(async () => {
       waiters[0]?.();
+      await new Promise((resolve) => setTimeout(resolve, 200));
+    });
+    expect(waiters).toHaveLength(2);
+    await act(async () => {
       waiters[1]?.();
       await new Promise((resolve) => setTimeout(resolve, 0));
     });
