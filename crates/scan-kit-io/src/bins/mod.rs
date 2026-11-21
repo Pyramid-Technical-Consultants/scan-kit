@@ -881,10 +881,12 @@ pub(crate) fn bins(root: &Path, session_ids: &[String], options: &Value) -> Plot
                             },
                         ];
                         match glyph {
-                            "mean" => mean_series(table, y, &categories, index, color),
+                            "mean" => {
+                                mean_series(table, y, &categories, index, tables.len(), color)
+                            }
                             "scatter" => vec![scatter_series(table, y, x_column, color)],
                             "contour" => Vec::new(),
-                            "box" => box_series(table, y, &categories, index, color),
+                            "box" => box_series(table, y, &categories, index, tables.len(), color),
                             _ if grow => grown_violin(
                                 &format!("{grow_key}|{}|{index}", series.key),
                                 table.get("_bin").map(Vec::as_slice).unwrap_or(&[]),
@@ -1132,6 +1134,7 @@ fn assemble_panel(
                 y,
                 &prepared.categories,
                 session,
+                prepared.tables.len(),
                 prepared.xmin,
                 prepared.xmax,
                 trend,
@@ -2435,6 +2438,7 @@ mod tests {
             &table["y"],
             &[10.0, 20.0, 30.0],
             0,
+            1,
             -0.6,
             2.6,
             Trend::Linear,
@@ -2450,12 +2454,22 @@ mod tests {
         curved.insert("_bin".to_string(), vec![0.0, 1.0, 2.0]);
         curved.insert("y".to_string(), vec![0.0, 1.0, 0.0]);
         let y_at_middle = |mode: Trend| {
-            let line =
-                binned_trend(&curved, &curved["y"], &[0.0, 1.0, 2.0], 0, -0.6, 2.6, mode).unwrap();
+            let line = binned_trend(
+                &curved,
+                &curved["y"],
+                &[0.0, 1.0, 2.0],
+                0,
+                1,
+                -0.6,
+                2.6,
+                mode,
+            )
+            .unwrap();
             let Series::Polyline { xs, ys, .. } = line else {
                 panic!("trend is a polyline");
             };
-            let middle = 1.0 + (0.0 - 0.5) * super::OFFSET;
+            // One session dodges to the category center.
+            let middle = 1.0;
             let (mut best, mut y) = (f32::MAX, 0.0);
             for (x, value) in xs.iter().zip(&ys) {
                 let distance = (x - middle).abs();

@@ -489,6 +489,9 @@ fn format_delivery(seconds: f64) -> String {
     let total_minutes = (seconds / 60.0).floor() as i64;
     if total_minutes < 60 {
         let rem = (seconds % 60.0).round() as i64;
+        if rem == 60 {
+            return format!("{} min", total_minutes + 1);
+        }
         if rem == 0 {
             return format!("{total_minutes} min");
         }

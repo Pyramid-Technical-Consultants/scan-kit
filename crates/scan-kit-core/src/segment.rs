@@ -367,7 +367,8 @@ fn beam_keep(gate: Option<&[f32]>, state: BeamGate, keep: &mut [bool]) {
         return;
     };
     for (slot, value) in keep.iter_mut().zip(gate) {
-        let on = !value.is_finite() || *value > 0.5;
+        // Same gate as beam_on_mask / plateau_mean: unknown (non-finite) is off.
+        let on = value.is_finite() && *value > 0.5;
         let pass = match state {
             BeamGate::Off => !on,
             BeamGate::On => on,

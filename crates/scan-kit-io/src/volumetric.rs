@@ -1683,7 +1683,7 @@ fn gamma_with(
 ) -> (Vec<f32>, u32, u32) {
     // A session without a plan has an empty cube. Its gamma stays unscored on
     // the measured lattice, so the image keeps the shape the cells index.
-    if plan.values.len() != measured.values.len() {
+    if plan.values.len() != measured.values.len() || plan.shape != measured.shape {
         return (vec![0.0; measured.values.len()], 0, 0);
     }
     // A compare, plot, or cell change rebuilds the scene on the same cubes.
