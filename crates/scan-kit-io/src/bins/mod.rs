@@ -1348,9 +1348,7 @@ fn interlock_ok(metric: &str, x: &str, glyph: &str) -> bool {
     match metric {
         "position_error" | "position_error_rel" | "distance_error" | "distance_error_rel" => true,
         "dose_error" => x == "target_mu",
-        "sigma" | "sigma_error" | "sigma_error_pct" => {
-            x == "energy" && !matches!(glyph, "scatter" | "contour")
-        }
+        "sigma" | "sigma_error" => x == "energy" && !matches!(glyph, "scatter" | "contour"),
         _ => false,
     }
 }

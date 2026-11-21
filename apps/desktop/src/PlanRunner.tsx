@@ -101,6 +101,7 @@ export function PlanRunner() {
   const copyToken = useRef<object>({});
   const busyRef = useRef(false);
   const inflight = useRef(false);
+  const statusFailures = useRef(0);
   const hasPlan = useRef(false);
   const destRef = useRef("");
 
@@ -148,12 +149,18 @@ export function PlanRunner() {
       })
         .then((next) => {
           if (!stop) {
+            statusFailures.current = 0;
             setView(next);
           }
         })
         .catch((reason: unknown) => {
           if (!stop) {
-            setView((current) => ({ ...current, connected: false }));
+            // One transient status error is not a disconnect — only drop the
+            // view after a few consecutive failures.
+            statusFailures.current += 1;
+            if (statusFailures.current >= 3) {
+              setView((current) => ({ ...current, connected: false }));
+            }
             notifyError(reason, "runner-status");
           }
         })

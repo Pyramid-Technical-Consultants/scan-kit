@@ -751,15 +751,13 @@ pub(super) fn sigma_bands(expected: &[f32], categories: &[f32], absolute: bool) 
         let mut hi = Vec::new();
         let mut lo = Vec::new();
         for (index, energy) in categories.iter().enumerate() {
-            let Some(mm) = expected.iter().copied().find(|value| same(*value, *energy)) else {
-                // expected is stored as parallel (energy, mm) pairs: energy, mm, energy, mm
+            // expected is stored as parallel (energy, mm) pairs.
+            let Some(center) = expected_at(expected, *energy) else {
                 continue;
             };
-            let _ = mm;
             xs.push(index as f32);
-            let band = expected_at(expected, *energy).unwrap_or(0.0) * frac;
+            let band = center * frac;
             if absolute {
-                let center = expected_at(expected, *energy).unwrap_or(0.0);
                 hi.push(center + band);
                 lo.push((center - band).max(0.0));
             } else {

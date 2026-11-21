@@ -90,7 +90,7 @@ export function DevicePicker({
           disabled={disabled}
           onChange={(event) => onChange(event.target.value)}
           onKeyDown={(event) => {
-            if (event.key === "Enter") {
+            if (event.key === "Enter" && !busy) {
               onConnect();
             }
           }}
@@ -123,7 +123,7 @@ export function DevicePicker({
               placeholder="192.168.100.0/24"
               onChange={(event) => setSubnet(event.target.value)}
               onKeyDown={(event) => {
-                if (event.key === "Enter") {
+                if (event.key === "Enter" && !scanning) {
                   void scan();
                 }
               }}

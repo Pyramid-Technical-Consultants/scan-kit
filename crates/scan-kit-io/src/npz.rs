@@ -83,12 +83,19 @@ impl Npy {
     pub fn strings(&self) -> Result<Vec<String>, String> {
         let n = self.count()?;
         let width = self.itemsize()?;
+        if !self.descr.starts_with("<U") {
+            return Err(format!("npz strings need <U, got {}", self.descr));
+        }
         let mut out = Vec::with_capacity(n);
         for i in 0..n {
             let bytes = &self.data[i * width..(i + 1) * width];
             let mut chars = Vec::new();
             for chunk in bytes.chunks(4) {
-                let unit = u32::from_le_bytes(chunk.try_into().unwrap());
+                let unit = u32::from_le_bytes(
+                    chunk
+                        .try_into()
+                        .map_err(|_| "npz string width is not a u32 multiple")?,
+                );
                 if unit == 0 {
                     break;
                 }

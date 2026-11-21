@@ -222,10 +222,13 @@ pub fn volumetric(
             )
         })
         .collect();
-    let k_mu = session_ids
-        .first()
+    // K_MU is per session — a recalibrated machine or different units means
+    // each cloud needs its own MU->protons factor, not the first session's.
+    let k_mus: Vec<f32> = session_ids
+        .iter()
         .map(|session| read_kmu(root, session))
-        .unwrap_or(FALLBACK_KMU);
+        .collect();
+    let k_mu = k_mus.first().copied().unwrap_or(FALLBACK_KMU);
 
     let plots = crate::workspace::plots_from(
         [
@@ -320,6 +323,7 @@ pub fn volumetric(
     let focus = session_at(options, session_ids);
     for (index, cloud) in clouds.iter().enumerate() {
         let runner = if index == focus { mc } else { None };
+        let k_mu = k_mus.get(index).copied().unwrap_or(k_mu);
         let (volume, ran) = fill(
             mat,
             &cloud.pencils,
@@ -1636,6 +1640,10 @@ fn attr<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
 }
 
 fn difference(measured: &Volume, plan: &Volume) -> Volume {
+    debug_assert_eq!(measured.shape, plan.shape, "differing lattices");
+    if measured.shape != plan.shape || measured.values.len() != plan.values.len() {
+        return measured.clone();
+    }
     let mut values = measured.values.clone();
     for (slot, plan) in values.iter_mut().zip(&plan.values) {
         *slot -= *plan;

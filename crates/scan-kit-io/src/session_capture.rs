@@ -210,7 +210,7 @@ fn parse_sheet(bytes: &[u8]) -> Option<Sheet> {
         .collect();
     let mut rows = Vec::new();
     for record in reader.records() {
-        let Ok(record) = record else { return None };
+        let Ok(record) = record else { break };
         rows.push(
             record
                 .iter()
@@ -231,12 +231,13 @@ fn parse_sheet(bytes: &[u8]) -> Option<Sheet> {
 ///
 /// ponytail: an interleaved layer sequence becomes extra runs — real
 /// deliveries keep layers contiguous.
-fn blocks(sheet: &Sheet) -> Vec<Block> {
+// `layer_of` is shared across every sheet in one capture: the layer_id ->
+// folder ordinal map must be global, or a device whose table is missing the
+// first layer mis-files its rows into layer-0.
+fn blocks(sheet: &Sheet, layer_of: &mut HashMap<String, usize>) -> Vec<Block> {
     let Some(column) = sheet.column("layer_id") else {
         return Vec::new();
     };
-    let mut order: Vec<String> = Vec::new();
-    let mut layer_of: HashMap<String, usize> = HashMap::new();
     let mut runs_of: HashMap<String, usize> = HashMap::new();
     let mut out = Vec::new();
     let mut start = 0usize;
@@ -258,12 +259,10 @@ fn blocks(sheet: &Sheet) -> Vec<Block> {
         } else {
             cell
         };
-        if row > 0 && id != prev {
+        if row > 0 && (row == sheet.rows.len() || id != prev) {
             let prev_id = prev.unwrap_or("").to_owned();
-            let layer = *layer_of.entry(prev_id.clone()).or_insert_with(|| {
-                order.push(prev_id.clone());
-                order.len() - 1
-            });
+            let next = layer_of.len();
+            let layer = *layer_of.entry(prev_id.clone()).or_insert(next);
             let run = runs_of.entry(prev_id).or_insert(0);
             out.push(Block {
                 layer,
@@ -377,8 +376,9 @@ pub fn capture(
         (usize, usize),
         (Vec<(&CaptureDevice, Sheet)>, Vec<(&CaptureDevice, Sheet)>),
     > = BTreeMap::new();
+    let mut layer_of: HashMap<String, usize> = HashMap::new();
     for (device, sheet) in &spots {
-        for block in blocks(sheet) {
+        for block in blocks(sheet, &mut layer_of) {
             hits.entry((block.layer, block.run))
                 .or_default()
                 .0
@@ -386,7 +386,7 @@ pub fn capture(
         }
     }
     for (device, sheet) in &slices {
-        for block in blocks(sheet) {
+        for block in blocks(sheet, &mut layer_of) {
             hits.entry((block.layer, block.run))
                 .or_default()
                 .1
@@ -1291,14 +1291,14 @@ mod tests {
     #[test]
     fn blocks_group_contiguous_layers_into_runs() {
         let table = sheet("spot_no,layer_id\n1,7\n2,7\n3,9\n4,7\n");
-        let got = blocks(&table);
+        let got = blocks(&table, &mut HashMap::new());
         assert_eq!(
             got.iter()
                 .map(|block| (block.layer, block.run, block.start, block.end))
                 .collect::<Vec<_>>(),
             vec![(0, 0, 0, 2), (1, 0, 2, 3), (0, 1, 3, 4)]
         );
-        assert!(blocks(&sheet("spot_no\n1\n")).is_empty());
+        assert!(blocks(&sheet("spot_no\n1\n"), &mut HashMap::new()).is_empty());
     }
 
     #[test]
@@ -1306,7 +1306,7 @@ mod tests {
         // Row `2` has no layer_id cell — it must not open a phantom "" block
         // that consumes an ordinal and mis-tags every later layer.
         let table = sheet("spot_no,layer_id\n1,7\n2\n3,9\n4,9\n");
-        let got = blocks(&table);
+        let got = blocks(&table, &mut HashMap::new());
         assert_eq!(
             got.iter()
                 .map(|block| (block.layer, block.run, block.start, block.end))

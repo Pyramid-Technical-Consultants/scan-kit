@@ -210,7 +210,7 @@ export function LibraryTable({
   onCommitNote: (edit: NoteEdit) => void;
   onOpenMenu: (menu: SessionMenu) => void;
 }) {
-  const lastRowToggle = useRef<{ row: number; at: number } | null>(null);
+  const lastRowToggle = useRef<{ row: string; at: number } | null>(null);
   const baseColumns = useMemo(() => libraryColumns(sort), [sort]);
   const { columns, onColumnResize } = useResizableColumns(baseColumns);
   const changeSelection = useCallback(
@@ -339,13 +339,17 @@ export function LibraryTable({
           return;
         }
         const recent = lastRowToggle.current;
+        // A re-sorted table reuses the index for a different row — key on the
+        // session id so a different session's double-click is not eaten.
         const justToggled =
-          recent != null && recent.row === rowIndex && performance.now() - recent.at < 500;
+          recent != null &&
+          recent.row === row.session_id &&
+          performance.now() - recent.at < 500;
         if (event.isDoubleClick) {
           event.preventDefault();
         }
         if (shouldToggleRow(col, event.isDoubleClick === true, justToggled)) {
-          lastRowToggle.current = { row: rowIndex, at: performance.now() };
+          lastRowToggle.current = { row: row.session_id, at: performance.now() };
           onRowCheck(row.session_id, !selectedIds.includes(row.session_id));
         }
       }}

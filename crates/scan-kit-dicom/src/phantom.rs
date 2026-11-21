@@ -308,7 +308,7 @@ fn push_roi(
         }
     }
     let mut contour = Vec::new();
-    patient::us_list(&mut contour, 0x3006, 0x002A, &color.map(u16::from));
+    patient::is_list(&mut contour, 0x3006, 0x002A, &color.map(u16::from));
     patient::is(&mut contour, 0x3006, 0x0084, number);
     patient::sq(&mut contour, 0x3006, 0x0040, &drawn);
     contours.push(contour);

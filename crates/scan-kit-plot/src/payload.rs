@@ -165,7 +165,19 @@ pub fn encode_plot_reusing(
         lines: line_count,
         points: marks.points.len() as u32,
         quads: marks.quads.len() as u32,
-        volume_shape: scene.volume.shape,
+        volume_shape: if scene.volume.values.len()
+            >= scene
+                .volume
+                .shape
+                .iter()
+                .map(|axis| *axis as usize)
+                .product::<usize>()
+        {
+            scene.volume.shape
+        } else {
+            // A shape the values don't fill would desync the decoder.
+            [0, 0, 0]
+        },
         volume_origin: scene.volume.origin,
         volume_voxel: scene.volume.voxel,
         volume_spacing: scene.volume.spacing,
@@ -182,8 +194,20 @@ pub fn encode_plot_reusing(
         volume_unit: scene.volume.unit.clone(),
         volume_phantom: scene.volume.show_phantom,
         volume_field: scene.volume.field,
-        volume_ct: !scene.volume.ct.is_empty(),
-        volume_labels: !scene.volume.labels.is_empty(),
+        volume_ct: scene.volume.ct.len()
+            >= scene
+                .volume
+                .shape
+                .iter()
+                .map(|axis| *axis as usize)
+                .product::<usize>(),
+        volume_labels: scene.volume.labels.len()
+            >= scene
+                .volume
+                .shape
+                .iter()
+                .map(|axis| *axis as usize)
+                .product::<usize>(),
         volume_sessions: scene.volume.sessions.len() as u32,
         volume_plans: scene.volume.plans.len() as u32,
         volume_companions: scene.volume.companions.len() as u32,
@@ -220,14 +244,11 @@ pub fn encode_plot_reusing(
         * scene.volume.shape[2] as usize;
     if voxels > 0 && scene.volume.values.len() >= voxels {
         write_cube(&mut out, &scene.volume.values[..voxels]);
-        if !scene.volume.ct.is_empty() {
-            write_f32s(
-                &mut out,
-                &scene.volume.ct[..voxels.min(scene.volume.ct.len())],
-            );
+        if scene.volume.ct.len() >= voxels {
+            write_f32s(&mut out, &scene.volume.ct[..voxels]);
         }
-        if !scene.volume.labels.is_empty() {
-            out.extend_from_slice(&scene.volume.labels[..voxels.min(scene.volume.labels.len())]);
+        if scene.volume.labels.len() >= voxels {
+            out.extend_from_slice(&scene.volume.labels[..voxels]);
         }
         let shape = [
             scene.volume.shape[0] as usize,
@@ -363,8 +384,17 @@ fn read_cube(reader: &mut Reader<'_>, count: usize) -> Result<Vec<f32>, String> 
         if end > count || end == at {
             return Err("plot payload cube is malformed".into());
         }
-        blocks.push((start, end, walk.take(literal * 4)?));
+        let bytes = literal
+            .checked_mul(4)
+            .ok_or("plot payload cube is malformed")?;
+        blocks.push((start, end, walk.take(bytes)?));
         at = end;
+    }
+    // ponytail: hard cap so a crafted header cannot force a giant alloc.
+    // A real dose grid is far under 2^26 voxels; beyond that the payload is
+    // rejected rather than swapped/oomed (4 GiB on wasm32).
+    if count > 1 << 26 {
+        return Err("plot payload volume is too large".into());
     }
     let mut values = vec![0.0f32; count];
     for (start, end, raw) in blocks {

@@ -1512,7 +1512,7 @@ impl Goal {
             .find_map(|op| rest.strip_prefix(op).map(|rest| (*op, rest)))
             .ok_or_else(|| format!("not a goal: {text:?}"))?;
         let rest = rest.trim_start();
-        let (value, tail) = take_number(rest);
+        let (value, tail) = take_number(rest).ok_or_else(|| format!("not a goal: {text:?}"))?;
         let mut unit = tail.trim().to_string();
         if unit.is_empty() {
             unit = if matches!(metric, GoalMetric::VolumeGy(_) | GoalMetric::VolumePct(_)) {
@@ -1664,12 +1664,12 @@ fn dose_at_volume(edges: &[f32], curve: &[f32], fraction: f32) -> f32 {
     }
 }
 
-fn take_number(text: &str) -> (f32, &str) {
+fn take_number(text: &str) -> Option<(f32, &str)> {
     let end = text
         .find(|c: char| !(c.is_ascii_digit() || c == '.' || c == '-'))
         .unwrap_or(text.len());
     let (head, rest) = text.split_at(end);
-    (head.parse().unwrap_or(0.0), rest)
+    head.parse().ok().map(|value| (value, rest))
 }
 
 fn compare(got: f32, op: &str, want: f32) -> bool {

@@ -307,6 +307,7 @@ export default function App() {
   const selectionLive = useRef<string[]>([]);
   const loadDepth = useRef(0);
   const noteBusy = useRef(false);
+  const trashing = useRef(false);
   const pendingLocations = useRef<string[]>([]);
   const selectedIds = selectionOrder;
   const canAnalyze = folder != null && selectedIds.length >= 1 && selectedIds.length <= MAX_SELECTED;
@@ -774,9 +775,10 @@ export default function App() {
 
   const confirmTrash = useCallback(async () => {
     const pending = trashConfirm;
-    if (pending == null) {
+    if (pending == null || trashing.current) {
       return;
     }
+    trashing.current = true;
     setTrashConfirm(null);
     try {
       const row = rows.find((item) => item.session_id === pending.sessionId);
@@ -797,6 +799,8 @@ export default function App() {
       }
     } catch (error) {
       notifyError(error);
+    } finally {
+      trashing.current = false;
     }
   }, [trashConfirm, rows, setTrashConfirm]);
 
