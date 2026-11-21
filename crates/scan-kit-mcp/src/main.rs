@@ -67,8 +67,13 @@ impl ScanKit {
         if self.effects {
             return None;
         }
+        // Unknown names fall through to `dispatch`, which reports `unknown tool`
+        // — don't claim an unlisted typo needs --allow-effects.
         if !READ_ONLY.contains(&name) {
-            return Some(name);
+            return catalog_specs()
+                .iter()
+                .any(|tool| tool.name == name)
+                .then_some(name);
         }
         let saves = name == "scan_kit_synthesize_plan"
             && input
