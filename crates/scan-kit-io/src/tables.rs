@@ -9,6 +9,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use super::discover;
@@ -77,17 +78,40 @@ fn file_len(path: &Path) -> u64 {
         .max(1)
 }
 
-struct BoundSlice {
+#[derive(Clone)]
+pub(crate) struct BoundSlice {
     session: String,
     take: SliceTake,
-    tail_done: bool,
+    tail_done: Arc<AtomicBool>,
 }
 
 // The binding is the reader's own context: a stage binds, reads, and clears on
 // one thread per poll, so a process-global would let a concurrent stage clobber
-// the window (or leak it into another caller's drain). One binding per thread.
+// the window (or leak it into another caller's drain). One binding per thread;
+// scoped workers inherit a copy inside the bound window and share its EOF flag.
 thread_local! {
     static BOUND: RefCell<Option<BoundSlice>> = const { RefCell::new(None) };
+}
+
+/// Snapshot of the bound slice for a scoped worker to install.
+pub(crate) fn inherit_slice() -> Option<BoundSlice> {
+    BOUND.with(|bound| bound.borrow().clone())
+}
+
+/// Installs an inherited binding on a scoped worker, restoring on drop. The
+/// tail_done flag is shared, so the worker's EOF publish reaches the binder.
+pub(crate) struct BoundScope(Option<BoundSlice>);
+
+impl BoundScope {
+    pub(crate) fn install(bound: BoundSlice) -> Self {
+        Self(BOUND.with(|cell| cell.borrow_mut().replace(bound)))
+    }
+}
+
+impl Drop for BoundScope {
+    fn drop(&mut self) {
+        BOUND.with(|cell| *cell.borrow_mut() = self.0.take());
+    }
 }
 
 pub fn bind_slice(session: &str, take: SliceTake) {
@@ -95,7 +119,7 @@ pub fn bind_slice(session: &str, take: SliceTake) {
         *bound.borrow_mut() = Some(BoundSlice {
             session: session.to_owned(),
             take,
-            tail_done: false,
+            tail_done: Arc::new(AtomicBool::new(false)),
         });
     });
 }
@@ -105,7 +129,12 @@ pub fn clear_slice() {
 }
 
 pub fn slice_tail_done() -> bool {
-    BOUND.with(|bound| bound.borrow().as_ref().is_some_and(|bound| bound.tail_done))
+    BOUND.with(|bound| {
+        bound
+            .borrow()
+            .as_ref()
+            .is_some_and(|bound| bound.tail_done.load(Ordering::Relaxed))
+    })
 }
 
 pub(crate) fn slice_is_bound() -> bool {
@@ -161,9 +190,9 @@ fn set_tail_done(done: bool, belongs: impl FnOnce(&str) -> bool) {
         return;
     }
     BOUND.with(|bound| {
-        if let Some(bound) = bound.borrow_mut().as_mut() {
+        if let Some(bound) = bound.borrow().as_ref() {
             if belongs(&bound.session) {
-                bound.tail_done = done;
+                bound.tail_done.store(done, Ordering::Relaxed);
             }
         }
     });
@@ -183,9 +212,14 @@ pub(crate) fn map_sessions<T: Send>(
         return session_ids.iter().map(|id| load(id)).collect();
     }
     std::thread::scope(|scope| {
+        let load = &load;
         let mut joins = Vec::with_capacity(session_ids.len());
         for session in session_ids {
-            joins.push(scope.spawn(|| load(session)));
+            let inherit = inherit_slice();
+            joins.push(scope.spawn(move || {
+                let _slice = inherit.map(BoundScope::install);
+                load(session)
+            }));
         }
         joins.into_iter().map(|join| join.join().unwrap()).collect()
     })
@@ -829,9 +863,13 @@ fn frames_limited(
     let no_tail = tail.is_none();
     let (sheets, layers) = std::thread::scope(|scope| {
         let tail_job = tail.map(|(index, path)| {
+            let inherit = inherit_slice();
             (
                 index,
-                scope.spawn(move || sheet_rows(&path, kind, keep, tail_rows)),
+                scope.spawn(move || {
+                    let _slice = inherit.map(BoundScope::install);
+                    sheet_rows(&path, kind, keep, tail_rows)
+                }),
             )
         });
         let mut sheets = if full == 0 {
@@ -5226,7 +5264,7 @@ pub(crate) fn days_from_civil(mut year: i32, month: u32, day: u32) -> Option<i64
 mod tests {
     use super::*;
 
-    /// `bind_slice` is one process-wide slot. The tests that use it take turns.
+    /// `bind_slice` is one slot per thread. The tests that use it take turns.
     fn slice_gate() -> &'static Mutex<()> {
         static GATE: OnceLock<Mutex<()>> = OnceLock::new();
         GATE.get_or_init(|| Mutex::new(()))
@@ -5775,6 +5813,66 @@ mod tests {
         assert!(same(signals.as_ref(), full_signals.as_ref()));
         assert!(same(position.as_ref(), full_position.as_ref()));
         assert_eq!(full.get("ic1_current").map(Vec::len), Some(8));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_scoped_tail_job_publishes_end_of_file() {
+        let _gate = slice_gate().lock().unwrap_or_else(|err| err.into_inner());
+        let root = std::env::temp_dir().join(format!(
+            "scan-kit-tail-job-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let session = root.join("tailjob");
+        std::fs::create_dir_all(session.join("layer-0/run-0")).unwrap();
+        std::fs::create_dir_all(session.join("layer-1/run-0")).unwrap();
+        std::fs::write(
+            session.join("input_map.csv"),
+            "energy
+70
+90
+",
+        )
+        .unwrap();
+        for (layer, values) in [
+            (
+                0, "1
+2
+",
+            ),
+            (
+                1, "3
+4
+",
+            ),
+        ] {
+            std::fs::write(
+                session.join(format!(
+                    "layer-{layer}/run-0/timeslice_data_device_units.csv"
+                )),
+                format!(
+                    "r_ic1_current_dose
+{values}"
+                ),
+            )
+            .unwrap();
+        }
+        // files=1 parses one boundary file in-process and runs the tail file on
+        // a scoped worker — the EOF publish must still reach the binder.
+        bind_slice(
+            "tailjob",
+            SliceTake::Timeslice {
+                files: 1,
+                tail_rows: 2,
+            },
+        );
+        let _ = load_timeslice(&root, "tailjob", "ic_current");
+        assert!(slice_tail_done());
+        clear_slice();
         let _ = std::fs::remove_dir_all(&root);
     }
 

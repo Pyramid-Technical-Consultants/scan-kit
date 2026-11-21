@@ -296,11 +296,15 @@ export default function App() {
   const [analysis, setAnalysis] = useState<string | null>(null);
   const [sessionMenu, setSessionMenu] = useState<SessionMenu | null>(null);
   const [selectionOrder, setSelectionOrder] = useState<string[]>([]);
+  useEffect(() => {
+    selectionLive.current = selectionOrder;
+  }, [selectionOrder]);
   const [libraryReport, setLibraryReport] = useState<Report | null>(null);
   const [libraryLoading, setLibraryLoading] = useState(false);
   usePageLoad(libraryLoading, libraryReport?.done ?? 0, libraryReport?.total ?? 0);
   const libraryToken = useRef<object>({});
   const catalogEpoch = useRef(0);
+  const selectionLive = useRef<string[]>([]);
   const loadDepth = useRef(0);
   const noteBusy = useRef(false);
   const pendingLocations = useRef<string[]>([]);
@@ -827,11 +831,18 @@ export default function App() {
         dismissNotice("selection");
       }
     })().catch((error: unknown) => {
-      const restore = new Set(before);
-      setSelectionOrder(before);
-      setRows((items) =>
-        items.map((item) => ({ ...item, selected: restore.has(item.session_id) })),
-      );
+      // Roll back only if nothing newer landed — a second check or a catalog
+      // pull between apply and failure must keep its selection.
+      const live = selectionLive.current;
+      const stillMine =
+        live.length === next.ids.length && live.every((id, index) => id === next.ids[index]);
+      if (stillMine) {
+        const restore = new Set(before);
+        setSelectionOrder(before);
+        setRows((items) =>
+          items.map((item) => ({ ...item, selected: restore.has(item.session_id) })),
+        );
+      }
       notifyError(error);
     });
   }, [locations, rows, selectionOrder]);
