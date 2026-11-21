@@ -85,8 +85,10 @@ pub fn invoke(name: &str, input: &Value) -> Result<Value, String> {
             let path = text(input, "path")?;
             let session_ids = strings(input, "session_ids")?;
             let options = input.get("options").cloned().unwrap_or_else(|| json!({}));
-            let width = input.get("width").and_then(Value::as_u64).unwrap_or(960) as u32;
-            let height = input.get("height").and_then(Value::as_u64).unwrap_or(640) as u32;
+            let width = u32::try_from(input.get("width").and_then(Value::as_u64).unwrap_or(960))
+                .unwrap_or(960);
+            let height = u32::try_from(input.get("height").and_then(Value::as_u64).unwrap_or(640))
+                .unwrap_or(640);
             let background = color4(input.get("background"), [0.11, 0.11, 0.12, 1.0]);
             let foreground = color4(input.get("foreground"), [0.92, 0.92, 0.93, 1.0]);
             let palette = palette_of(input.get("palette"));
@@ -173,6 +175,16 @@ pub fn open_plot(
     foreground: [f32; 4],
     palette: &[[f32; 4]],
 ) -> Result<Vec<u8>, String> {
+    // Task views never produce plot bytes — and ExportStage/CopyStage write files
+    // as a side effect, so letting `scan_kit_run_view` (a READ_ONLY MCP tool)
+    // forward them here would bypass the --allow-effects gate. The desktop
+    // exports reach the same stages through `start_task` instead.
+    if matches!(
+        view,
+        "library" | "runner_copy" | "write_dose" | "write_report"
+    ) {
+        return Err(format!("{view} is a task view, not a plot"));
+    }
     crate::task::drain_plot(
         view,
         root,
@@ -334,10 +346,11 @@ fn dvh_figure(
 }
 
 fn text<'a>(input: &'a Value, key: &str) -> Result<&'a str, String> {
-    input
-        .get(key)
-        .and_then(Value::as_str)
-        .ok_or_else(|| format!("{key} is required"))
+    match input.get(key) {
+        Some(Value::String(value)) => Ok(value),
+        Some(_) => Err(format!("{key} must be a string")),
+        None => Err(format!("{key} is required")),
+    }
 }
 
 fn strings(input: &Value, key: &str) -> Result<Vec<String>, String> {

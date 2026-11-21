@@ -541,7 +541,13 @@ impl SessionStage {
     fn open_scene(&self, ids: &[String], preview: bool) -> Result<PlotScene, String> {
         let mut scene = if self.view == "volumetric" {
             if preview {
-                let mut options = self.options.clone();
+                // `_preview` is written by key, so a non-object options value
+                // would panic — normalize it away.
+                let mut options = if self.options.is_object() {
+                    self.options.clone()
+                } else {
+                    json!({})
+                };
                 options["_preview"] = Value::Bool(true);
                 scan_kit_io::volumetric::volumetric(&self.root, ids, &options, None)
             } else {
@@ -2676,6 +2682,32 @@ mod tests {
         )
         .expect_err("a missing study cannot export");
         assert_ne!(message, "plot did not finish");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_plot_api_rejects_task_views_without_writing() {
+        // `scan_kit_run_view` is a READ_ONLY MCP tool, so task views that write
+        // files must fail here before a stage runs — the desktop reaches the
+        // same stages through `start_task` instead.
+        let root = scratch();
+        for view in ["write_dose", "write_report", "library", "runner_copy"] {
+            let message = crate::present::open_plot(
+                view,
+                &root,
+                &[],
+                &json!({
+                    "study": root.join("missing").display().to_string(),
+                    "dest": root.join("out.dcm").display().to_string(),
+                }),
+                [0.0; 4],
+                [0.0; 4],
+                &[],
+            )
+            .expect_err("task views never produce plot bytes");
+            assert!(message.contains("not a plot"), "{view}: {message}");
+        }
+        assert!(!root.join("out.dcm").exists());
         let _ = std::fs::remove_dir_all(&root);
     }
 }
