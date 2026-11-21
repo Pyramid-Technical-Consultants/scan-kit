@@ -239,7 +239,13 @@ fn column_json(name: &str, integer: bool, values: &[Option<f64>]) -> Value {
             "name": name,
             "dtype": "i32",
             "values": values.iter().map(|value| {
-                value.and_then(|number| i32::try_from(number as i64).ok()).map(|number| json!(number)).unwrap_or(Value::Null)
+                value.and_then(|number| {
+                    if number.is_finite() {
+                        i32::try_from(number as i64).ok()
+                    } else {
+                        None
+                    }
+                }).map(|number| json!(number)).unwrap_or(Value::Null)
             }).collect::<Vec<_>>(),
         })
     } else {
@@ -389,5 +395,16 @@ fn parse_cell(text: &str) -> Option<f64> {
         "true" | "True" | "TRUE" => Some(1.0),
         "false" | "False" | "FALSE" => Some(0.0),
         _ => text.parse().ok(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_integer_column_keeps_nan_null_instead_of_reporting_zero() {
+        let column = column_json("spot_no", true, &[Some(3.0), Some(f64::NAN), None]);
+        assert_eq!(column["values"], json!([3, null, null]));
     }
 }

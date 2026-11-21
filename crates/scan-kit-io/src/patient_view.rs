@@ -696,7 +696,10 @@ pub(crate) fn scene(
         }
     }
     for structure in &computed.structures {
-        let mark = (structure.id + 1) as u8;
+        // ponytail: labels are u8 end-to-end (plot wire format + wasm), so a
+        // study with 255+ structures shares mark 255 — still distinct from
+        // background. Widening means a wire + GPU format change.
+        let mark = u8::try_from(structure.id + 1).unwrap_or(u8::MAX);
         for index in 0..nvox {
             if structure.mask[index] && labels[index] == 0 {
                 labels[index] = mark;

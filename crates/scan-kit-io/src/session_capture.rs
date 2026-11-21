@@ -241,16 +241,23 @@ fn blocks(sheet: &Sheet) -> Vec<Block> {
     let mut out = Vec::new();
     let mut start = 0usize;
     for row in 0..=sheet.rows.len() {
-        let id = sheet
-            .rows
-            .get(row)
-            .and_then(|cells| cells.get(column))
-            .map(String::as_str);
         let prev = row
             .checked_sub(1)
             .and_then(|i| sheet.rows.get(i))
             .and_then(|cells| cells.get(column))
             .map(String::as_str);
+        let cell = sheet
+            .rows
+            .get(row)
+            .and_then(|cells| cells.get(column))
+            .map(String::as_str);
+        // A ragged row missing the id cell stays in the current run instead of
+        // opening a phantom "" block that shifts every later layer ordinal.
+        let id = if row < sheet.rows.len() && cell.is_none_or(|id| id.is_empty()) {
+            prev
+        } else {
+            cell
+        };
         if row > 0 && id != prev {
             let prev_id = prev.unwrap_or("").to_owned();
             let layer = *layer_of.entry(prev_id.clone()).or_insert_with(|| {
@@ -846,8 +853,13 @@ fn write_input_map(
                 .unwrap_or_default();
             if let (Some(spot), false) = (rci_spot, extra.is_empty()) {
                 let names: Vec<String> = extra.iter().map(|i| spot.header[*i].clone()).collect();
+                // Pad short rows first — flexible parsing leaves them under the
+                // header length, and pushing the new cells there would land them
+                // in the wrong columns.
+                let columns = sheet.header.len();
                 sheet.header.extend(names);
                 for (index, row) in sheet.rows.iter_mut().enumerate() {
+                    row.resize(columns, String::new());
                     for col in &extra {
                         row.push(
                             spot.rows
@@ -1287,6 +1299,20 @@ mod tests {
             vec![(0, 0, 0, 2), (1, 0, 2, 3), (0, 1, 3, 4)]
         );
         assert!(blocks(&sheet("spot_no\n1\n")).is_empty());
+    }
+
+    #[test]
+    fn a_ragged_row_stays_in_its_run_instead_of_shifting_later_layers() {
+        // Row `2` has no layer_id cell — it must not open a phantom "" block
+        // that consumes an ordinal and mis-tags every later layer.
+        let table = sheet("spot_no,layer_id\n1,7\n2\n3,9\n4,9\n");
+        let got = blocks(&table);
+        assert_eq!(
+            got.iter()
+                .map(|block| (block.layer, block.run, block.start, block.end))
+                .collect::<Vec<_>>(),
+            vec![(0, 0, 0, 2), (1, 0, 2, 4)]
+        );
     }
 
     #[test]
