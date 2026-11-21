@@ -45,6 +45,9 @@ pub(crate) struct Found {
     pub entries: Vec<Discovered>,
     pub skipped: Vec<String>,
     pub exams: Vec<ExamHit>,
+    /// Some directories could not be listed — the index must not treat the
+    /// missing entries as deleted.
+    pub walk_failed: bool,
 }
 
 pub(crate) fn discover(root: &Path) -> Result<Found, String> {
@@ -56,6 +59,7 @@ pub(crate) fn discover(root: &Path) -> Result<Found, String> {
     let mut skipped = Vec::new();
     let mut archives = Vec::new();
     let mut exams = Vec::new();
+    let mut walk_failed = false;
     if is_unpacked_session(root) {
         if let Some(session_id) = file_name(root) {
             add_directory(
@@ -80,6 +84,7 @@ pub(crate) fn discover(root: &Path) -> Result<Found, String> {
             &mut skipped,
             &mut archives,
             &mut exams,
+            &mut walk_failed,
         );
     }
     add_archives(&mut entries, &mut skipped, archives);
@@ -88,6 +93,7 @@ pub(crate) fn discover(root: &Path) -> Result<Found, String> {
         entries,
         skipped,
         exams,
+        walk_failed,
     })
 }
 
@@ -99,11 +105,16 @@ fn walk_local(
     skipped: &mut Vec<String>,
     archives: &mut Vec<(Discovered, String)>,
     exams: &mut Vec<ExamHit>,
+    walk_failed: &mut bool,
 ) {
     if depth >= crate::location::NEST_DEPTH {
         return;
     }
     let Ok(read) = fs::read_dir(dir) else {
+        // An unreadable dir is not an empty one — a partial listing must not
+        // look like "every session was deleted" to delete_missing.
+        *walk_failed = true;
+        skipped.push(relative(library, dir));
         return;
     };
     let mut children: Vec<_> = read.filter_map(|entry| entry.ok()).collect();
@@ -171,11 +182,45 @@ fn walk_local(
             add_exam(exams, skipped, exam, &relative(library, &path));
             continue;
         }
-        walk_local(library, &path, depth + 1, entries, skipped, archives, exams);
+        walk_local(
+            library,
+            &path,
+            depth + 1,
+            entries,
+            skipped,
+            archives,
+            exams,
+            walk_failed,
+        );
     }
 }
 
+/// True when an unpacked session lives anywhere below `dir` within the
+/// discovery depth — such a directory is a container, never an exam.
+fn holds_session(dir: &Path, depth: u32) -> bool {
+    if depth >= crate::location::NEST_DEPTH {
+        return false;
+    }
+    if is_unpacked_session(dir) {
+        return true;
+    }
+    let Ok(read) = fs::read_dir(dir) else {
+        return false;
+    };
+    read.flatten().any(|entry| {
+        entry
+            .file_type()
+            .is_ok_and(|kind| kind.is_dir() && !kind.is_symlink())
+            && holds_session(&entry.path(), depth + 1)
+    })
+}
+
 fn exam_in(dir: &Path) -> Option<ExamHit> {
+    // A stray .dcm beside session folders does not make this an exam — the
+    // walk must keep descending or the nested sessions disappear.
+    if holds_session(dir, 0) {
+        return None;
+    }
     let folder_name = file_name(dir)?;
     let mut files = Vec::new();
     let mut count = 0i64;
@@ -186,8 +231,8 @@ fn exam_in(dir: &Path) -> Option<ExamHit> {
         if kind.is_symlink() {
             continue;
         }
-        count += 1;
         if kind.is_file() {
+            count += 1;
             files.push(entry.path());
         }
     }
@@ -285,7 +330,8 @@ pub fn storage_fingerprint(storage: &Path, session_id: &str) -> Option<(i64, i64
         } else if inner.is_file() {
             inner
         } else {
-            storage.to_path_buf()
+            // Still capturing: the inner session dir changes, the outer does not.
+            session_directory(storage, session_id)
         }
     } else {
         storage.to_path_buf()
@@ -579,10 +625,10 @@ fn refresh_slice(storage: &Path) -> u128 {
     let mut found = Vec::new();
     let mut dirs = vec![(storage.to_path_buf(), meta_stamp(storage))];
     visit_files(storage, storage, 0, &is_timeslice, &mut |name, path| {
-        if let Some(parent) = path.parent() {
-            let parent = parent.to_path_buf();
-            if dirs.iter().all(|(have, _)| have != &parent) {
-                dirs.push((parent.clone(), meta_stamp(&parent)));
+        for dir in path.ancestors().skip(1).take_while(|dir| *dir != storage) {
+            let dir = dir.to_path_buf();
+            if dirs.iter().all(|(have, _)| have != &dir) {
+                dirs.push((dir.clone(), meta_stamp(&dir)));
             }
         }
         found.push((name.to_string(), path.to_path_buf(), meta_stamp(path)));
@@ -751,9 +797,9 @@ fn read_tar(path: &Path, want: &dyn Fn(&str) -> bool) -> Result<Vec<(String, Vec
 
 /// Session members are CSV/XML/JSON — none legitimately approach this. A
 /// crafted archive inflating past it is a decompression bomb, not a session.
-const MAX_MEMBER_BYTES: u64 = 4 << 30;
+pub(crate) const MAX_MEMBER_BYTES: u64 = 4 << 30;
 
-fn read_capped(member: &mut impl Read, name: &str, max: u64) -> Result<Vec<u8>, String> {
+pub(crate) fn read_capped(member: &mut impl Read, name: &str, max: u64) -> Result<Vec<u8>, String> {
     let mut bytes = Vec::new();
     member
         .take(max + 1)

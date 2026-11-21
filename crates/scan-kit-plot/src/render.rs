@@ -2910,7 +2910,9 @@ impl Plot {
                 let center = project(matrix, point.p, w, h);
                 let reach = point.radius.max(1.0) + 0.5;
                 if (center[0] - x).powi(2) + (center[1] - y).powi(2) <= reach * reach {
-                    return hit(point.id);
+                    if let Some(series) = hit(point.id) {
+                        return Some(series);
+                    }
                 }
             }
         }
@@ -2918,13 +2920,15 @@ impl Plot {
             .live
             .iter()
             .rev()
-            .filter(|cloud| cloud.panel == cell.panel)
+            .filter(|cloud| cloud.panel == cell.panel && !cloud.crosshair)
         {
             for line in cloud.lines.iter().rev() {
                 let a = project(matrix, line.a, w, h);
                 let b = project(matrix, line.b, w, h);
                 if segment_distance(a, b, [x, y]) <= line.thickness.max(1.0) * 0.5 + 0.5 {
-                    return hit(line.id);
+                    if let Some(series) = hit(line.id) {
+                        return Some(series);
+                    }
                 }
             }
         }
@@ -2947,7 +2951,9 @@ impl Plot {
                 let a = project(matrix, line.a, w, h);
                 let b = project(matrix, line.b, w, h);
                 if segment_distance(a, b, [x, y]) <= line.thickness.max(1.0) * 0.5 + 0.5 {
-                    return hit(line.id);
+                    if let Some(series) = hit(line.id) {
+                        return Some(series);
+                    }
                 }
             }
         }
@@ -2967,16 +2973,20 @@ impl Plot {
             .live
             .iter()
             .rev()
-            .filter(|cloud| cloud.panel == cell.panel)
+            .filter(|cloud| cloud.panel == cell.panel && !cloud.crosshair)
         {
             if let Some(quad) = cloud.quads.iter().rev().find(|quad| covers(quad)) {
-                return hit(quad.id);
+                if let Some(series) = hit(quad.id) {
+                    return Some(series);
+                }
             }
         }
         for (index, _) in batch.heats.iter().rev() {
             let quad = &self.marks.quads[*index as usize];
             if covers(quad) {
-                return hit(quad.id);
+                if let Some(series) = hit(quad.id) {
+                    return Some(series);
+                }
             }
         }
         let quads = &self.marks.quads
@@ -3330,12 +3340,21 @@ impl Plot {
             center: self.pan,
         };
         let prepared = crate::dose::prepare_plane(grid, &view);
-        for y in top.floor() as i32..=bottom.ceil() as i32 {
-            for x in left.floor() as i32..=right.ceil() as i32 {
+        let (x_lo, y_lo, x_hi, y_hi) = clip_pixels(cell.plot, width, height);
+        for y in (top.floor() as i64).max(y_lo)..=(bottom.ceil() as i64).min(y_hi) {
+            for x in (left.floor() as i64).max(x_lo)..=(right.ceil() as i64).min(x_hi) {
                 let u = ((x as f32 - left) / span_x).clamp(0.0, 1.0);
                 let v = ((y as f32 - top) / span_y).clamp(0.0, 1.0);
                 let color = crate::dose::shade_uv(grid, &view, prepared.as_ref(), [u, v]);
-                blend(frame, width, height, x, y, color, Some(cell.plot));
+                blend(
+                    frame,
+                    width,
+                    height,
+                    x as i32,
+                    y as i32,
+                    color,
+                    Some(cell.plot),
+                );
             }
         }
     }
@@ -4657,10 +4676,13 @@ fn build_marks_inner(panels: &[Panel], skip_polylines: bool) -> Marks {
                     };
                     cursor = cursor.saturating_add(added);
                     if added > 0 {
+                        // `start` addresses the full buffer (prefix included),
+                        // so test the source x order instead of the records.
+                        let monotonic = xs.windows(2).all(|pair| pair[0] <= pair[1]);
                         line_runs.push(LineRun {
                             start,
                             count: added,
-                            monotonic: true,
+                            monotonic,
                         });
                     }
                 }
@@ -7557,6 +7579,18 @@ fn scissor(plot: PlotRect, width: u32, height: u32) -> (u32, u32, u32, u32) {
     (x, y, w, h)
 }
 
+/// Inclusive pixel bounds of the scissor, in i64 so clamped loops can't wrap.
+#[cfg(not(target_arch = "wasm32"))]
+fn clip_pixels(plot: PlotRect, width: u32, height: u32) -> (i64, i64, i64, i64) {
+    let (sx, sy, sw, sh) = scissor(plot, width, height);
+    (
+        sx as i64,
+        sy as i64,
+        sx as i64 + sw as i64 - 1,
+        sy as i64 + sh as i64 - 1,
+    )
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 fn fill_quad_cpu(
     frame: &mut [u8],
@@ -7582,14 +7616,23 @@ fn fill_quad_cpu(
         );
         let p2 = project(*matrix, [c[0], c[1], 0.0], width as f32, height as f32);
         let pts = [p0, p1, p2];
-        let min_x = pts.iter().map(|p| p[0]).fold(f32::MAX, f32::min).floor() as i32;
-        let max_x = pts.iter().map(|p| p[0]).fold(f32::MIN, f32::max).ceil() as i32;
-        let min_y = pts.iter().map(|p| p[1]).fold(f32::MAX, f32::min).floor() as i32;
-        let max_y = pts.iter().map(|p| p[1]).fold(f32::MIN, f32::max).ceil() as i32;
-        for y in min_y..=max_y {
-            for x in min_x..=max_x {
+        let (x_lo, y_lo, x_hi, y_hi) = clip_pixels(plot, width, height);
+        let min_x = pts.iter().map(|p| p[0]).fold(f32::MAX, f32::min).floor() as i64;
+        let max_x = pts.iter().map(|p| p[0]).fold(f32::MIN, f32::max).ceil() as i64;
+        let min_y = pts.iter().map(|p| p[1]).fold(f32::MAX, f32::min).floor() as i64;
+        let max_y = pts.iter().map(|p| p[1]).fold(f32::MIN, f32::max).ceil() as i64;
+        for y in min_y.max(y_lo)..=max_y.min(y_hi) {
+            for x in min_x.max(x_lo)..=max_x.min(x_hi) {
                 if owns_pixel_px([x as f32 + 0.5, y as f32 + 0.5], pts[0], pts[1], pts[2]) {
-                    blend(frame, width, height, x, y, quad.color, Some(plot));
+                    blend(
+                        frame,
+                        width,
+                        height,
+                        x as i32,
+                        y as i32,
+                        quad.color,
+                        Some(plot),
+                    );
                 }
             }
         }
@@ -7613,8 +7656,11 @@ fn fill_quad_cpu(
     let bottom = p0[1].max(p1[1]);
     let span_x = (right - left).max(1.0);
     let span_y = (bottom - top).max(1.0);
-    for y in top.floor() as i32..=bottom.ceil() as i32 {
-        for x in left.floor() as i32..=right.ceil() as i32 {
+    let (x_lo, y_lo, x_hi, y_hi) = clip_pixels(plot, width, height);
+    for y in (top.floor() as i64).max(y_lo)..=(bottom.ceil() as i64).min(y_hi) {
+        for x in (left.floor() as i64).max(x_lo)..=(right.ceil() as i64).min(x_hi) {
+            let x = x as i32;
+            let y = y as i32;
             let color = if let Some(index) = quad.heatmap {
                 let u = ((x as f32 - left) / span_x).clamp(0.0, 0.999);
                 let v = ((y as f32 - top) / span_y).clamp(0.0, 0.999);
@@ -7700,14 +7746,45 @@ fn stroke_cpu(
     snap_hairline(&mut pa, &mut pb);
     let radius = line.thickness.max(1.0) * 0.5;
     if line.pattern == LINE_SOLID {
-        let steps = ((pa[0] - pb[0]).abs().max((pa[1] - pb[1]).abs()) as i32).max(1);
+        // Clip to the padded scissor first — a far-offscreen endpoint saturates
+        // project() to i32::MAX and would be a multi-billion-step walk.
+        let (x_lo, y_lo, x_hi, y_hi) = clip_pixels(plot, width, height);
+        let pad = radius + 2.0;
+        let (bx_lo, by_lo) = (x_lo as f32 - pad, y_lo as f32 - pad);
+        let (bx_hi, by_hi) = (x_hi as f32 + pad, y_hi as f32 + pad);
+        let d = [pb[0] - pa[0], pb[1] - pa[1]];
+        let (mut t0, mut t1) = (0.0f32, 1.0f32);
+        for (p, q) in [
+            (-d[0], pa[0] - bx_lo),
+            (d[0], bx_hi - pa[0]),
+            (-d[1], pa[1] - by_lo),
+            (d[1], by_hi - pa[1]),
+        ] {
+            if p == 0.0 {
+                if q < 0.0 {
+                    return;
+                }
+            } else {
+                let r = q / p;
+                if p < 0.0 {
+                    t0 = t0.max(r);
+                } else {
+                    t1 = t1.min(r);
+                }
+                if t0 > t1 {
+                    return;
+                }
+            }
+        }
+        let span = ((d[0].abs().max(d[1].abs())) * (t1 - t0)) as i32;
+        let steps = span.max(1);
         for step in 0..=steps {
-            let t = step as f32 / steps as f32;
+            let t = t0 + (t1 - t0) * step as f32 / steps as f32;
             disc_cpu(
                 frame,
                 width,
                 height,
-                [pa[0] + (pb[0] - pa[0]) * t, pa[1] + (pb[1] - pa[1]) * t],
+                [pa[0] + d[0] * t, pa[1] + d[1] * t],
                 radius,
                 line.color,
                 plot,
@@ -7719,10 +7796,11 @@ fn stroke_cpu(
     let len2 = ab[0] * ab[0] + ab[1] * ab[1];
     let len = len2.sqrt().max(0.001);
     let pad = radius + 1.5;
-    let x0 = (pa[0].min(pb[0]) - pad).floor() as i32;
-    let y0 = (pa[1].min(pb[1]) - pad).floor() as i32;
-    let x1 = (pa[0].max(pb[0]) + pad).ceil() as i32;
-    let y1 = (pa[1].max(pb[1]) + pad).ceil() as i32;
+    let (x_lo, y_lo, x_hi, y_hi) = clip_pixels(plot, width, height);
+    let x0 = ((pa[0].min(pb[0]) - pad).floor() as i64).max(x_lo);
+    let y0 = ((pa[1].min(pb[1]) - pad).floor() as i64).max(y_lo);
+    let x1 = ((pa[0].max(pb[0]) + pad).ceil() as i64).min(x_hi);
+    let y1 = ((pa[1].max(pb[1]) + pad).ceil() as i64).min(y_hi);
     for y in y0..=y1 {
         for x in x0..=x1 {
             let point = [x as f32 + 0.5, y as f32 + 0.5];
@@ -7739,7 +7817,7 @@ fn stroke_cpu(
             }
             let mut ink = line.color;
             ink[3] *= coverage;
-            blend(frame, width, height, x, y, ink, Some(plot));
+            blend(frame, width, height, x as i32, y as i32, ink, Some(plot));
         }
     }
 }
@@ -7801,11 +7879,17 @@ fn disc_cpu(
     color: [f32; 4],
     plot: PlotRect,
 ) {
-    let r = radius.ceil() as i32 + 1;
-    let cx = center[0].round() as i32;
-    let cy = center[1].round() as i32;
-    for y in cy - r..=cy + r {
-        for x in cx - r..=cx + r {
+    let (x_lo, y_lo, x_hi, y_hi) = clip_pixels(plot, width, height);
+    let r = radius.ceil() as i64 + 1;
+    let cx = center[0].round() as i64;
+    let cy = center[1].round() as i64;
+    let (y0, y1) = ((cy - r).max(y_lo), (cy + r).min(y_hi));
+    let (x0, x1) = ((cx - r).max(x_lo), (cx + r).min(x_hi));
+    if x0 > x1 || y0 > y1 {
+        return;
+    }
+    for y in y0..=y1 {
+        for x in x0..=x1 {
             let dx = x as f32 + 0.5 - center[0];
             let dy = y as f32 + 0.5 - center[1];
             let dist = (dx * dx + dy * dy).sqrt();
@@ -7815,7 +7899,7 @@ fn disc_cpu(
             }
             let mut ink = color;
             ink[3] *= coverage;
-            blend(frame, width, height, x, y, ink, Some(plot));
+            blend(frame, width, height, x as i32, y as i32, ink, Some(plot));
         }
     }
 }
@@ -11600,6 +11684,42 @@ mod tests {
         }
         let share = differ as f32 / (width * height) as f32;
         assert!(share < 0.001, "{:.2}% of pixels differ", share * 100.0);
+    }
+
+    #[test]
+    fn the_ground_quad_does_not_swallow_the_hover() {
+        let mut scene = line_scene();
+        scene.panels.truncate(1);
+        scene.panels[0].title = "Axial".into();
+        scene.panels[0].equal = false;
+        scene.panels[0].xmin = 0.0;
+        scene.panels[0].xmax = 2.0;
+        scene.panels[0].ymin = 0.0;
+        scene.panels[0].ymax = 2.0;
+        scene.panels[0].series = vec![Series::Heatmap {
+            values: vec![0.0; 4],
+            cols: 2,
+            rows: 2,
+            ramp: 0,
+            color: [1.0; 4],
+            lo: 0.0,
+            hi: 1.0,
+        }];
+        scene.volume = scan_kit_core::VolumeMark {
+            values: vec![1.0, 0.0, 0.0, 0.0],
+            shape: [2, 2, 1],
+            origin: [0.0, 0.0, 0.0],
+            voxel: 1.0,
+            ..scan_kit_core::VolumeMark::default()
+        };
+        let mut plot = Plot::new(&scene, [0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0, 1.0]);
+        plot.apply(200, 160, &PlotInput::default());
+        let center = plot.project_data(0, 1.0, 1.0, 200, 160);
+        assert_eq!(
+            plot.hover(center[0], center[1]).3,
+            Some(0),
+            "the slice heatmap under the crosshair ground quad"
+        );
     }
 
     #[test]

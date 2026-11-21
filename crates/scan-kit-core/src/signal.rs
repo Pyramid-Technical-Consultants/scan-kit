@@ -184,10 +184,11 @@ pub fn sigma_error_pct(measured: &[f32], error_mm: &[f32]) -> Vec<f32> {
         })
         .collect()
 }
-/// Gate is on when the column is non-zero. An empty column is all off.
+/// Gate is on when the column clears half scale, like beam_keep and
+/// plateau_mean. A non-finite or fractional-low sample is off.
 pub fn beam_on_mask(gate: &[f32]) -> Vec<bool> {
     gate.iter()
-        .map(|value| *value != 0.0 && value.is_finite())
+        .map(|value| value.is_finite() && *value > 0.5)
         .collect()
 }
 /// Quantile bin edges. A single finite value becomes a unit-width bin around it.

@@ -376,8 +376,9 @@ fn read_cube(reader: &mut Reader<'_>, count: usize) -> Result<Vec<f32>, String> 
 
 fn read_f32s(reader: &mut Reader<'_>, count: usize) -> Result<Vec<f32>, String> {
     let bytes = count.checked_mul(4).ok_or("plot payload is truncated")?;
+    let raw = reader.take(bytes)?;
     let mut values = vec![0.0f32; count];
-    copy_le(reader.take(bytes)?, &mut values);
+    copy_le(raw, &mut values);
     Ok(values)
 }
 
@@ -513,22 +514,30 @@ pub(crate) fn decode_plot(
     let json_len = u32::from_le_bytes(reader.take(4)?.try_into().unwrap()) as usize;
     let header: PlotHeader =
         serde_json::from_slice(reader.take(json_len)?).map_err(|err| err.to_string())?;
-    let line_bytes = reader
-        .take(header.lines as usize * LINE_STRIDE as usize)?
-        .to_vec();
-    let point_bytes = reader
-        .take(header.points as usize * POINT_STRIDE as usize)?
-        .to_vec();
-    let quad_bytes = reader
-        .take(header.quads as usize * QUAD_STRIDE as usize)?
-        .to_vec();
+    let mut take_marks = |count: u32, stride: u64| -> Result<&[u8], String> {
+        let bytes = (count as u64)
+            .checked_mul(stride)
+            .and_then(|bytes| usize::try_from(bytes).ok())
+            .ok_or_else(|| "plot payload marks are too large".to_string())?;
+        reader.take(bytes)
+    };
+    let line_bytes = take_marks(header.lines, LINE_STRIDE)?.to_vec();
+    let point_bytes = take_marks(header.points, POINT_STRIDE)?.to_vec();
+    let quad_bytes = take_marks(header.quads, QUAD_STRIDE)?.to_vec();
     let lines = decode_lines(&line_bytes);
     let points = decode_points(&point_bytes);
     let quads = decode_quads(&quad_bytes);
     let heatmaps = header
         .heatmap_size
         .iter()
-        .map(|(cols, rows)| reader.take((cols * rows * 4) as usize).map(<[u8]>::to_vec))
+        .map(|(cols, rows)| {
+            let bytes = (*cols as u64)
+                .checked_mul(*rows as u64)
+                .and_then(|texels| texels.checked_mul(4))
+                .and_then(|bytes| usize::try_from(bytes).ok())
+                .ok_or_else(|| "plot payload heatmap is too large".to_string())?;
+            reader.take(bytes).map(<[u8]>::to_vec)
+        })
         .collect::<Result<Vec<_>, _>>()?;
     let marks = Marks {
         lines,
@@ -540,6 +549,43 @@ pub(crate) fn decode_plot(
     };
     if marks.panels.len() != header.panels.len() {
         return Err("plot payload panel count mismatch".into());
+    }
+    let fits = |start: u32, count: u32, len: usize| {
+        (start as usize)
+            .checked_add(count as usize)
+            .is_some_and(|end| end <= len)
+    };
+    // Line ranges address the full logical buffer: this payload's records
+    // after the `line_prefix` records an earlier payload already stored.
+    let line_len = (header.line_prefix as usize).saturating_add(marks.lines.len());
+    for batch in &marks.panels {
+        if !fits(batch.line_start, batch.line_count, line_len)
+            || !fits(batch.point_start, batch.point_count, marks.points.len())
+            || !fits(batch.quad_start, batch.quad_count, marks.quads.len())
+            || batch.heats.iter().any(|(quad, texture)| {
+                *quad as usize >= marks.quads.len() || *texture >= marks.heatmaps.len()
+            })
+            || batch
+                .line_runs
+                .iter()
+                .any(|run| !fits(run.start, run.count, line_len))
+            || batch
+                .point_runs
+                .iter()
+                .any(|run| !fits(run.start, run.count, marks.points.len()))
+            || batch
+                .clouds
+                .iter()
+                .any(|cloud| !fits(cloud.start, cloud.count, marks.points.len()))
+        {
+            return Err("plot payload index out of range".into());
+        }
+    }
+    if marks.quads.iter().any(|quad| {
+        quad.heatmap
+            .is_some_and(|index| index >= marks.heatmaps.len())
+    }) {
+        return Err("plot payload heatmap index out of range".into());
     }
     let voxels = header
         .volume_shape
@@ -753,6 +799,67 @@ mod tests {
         assert_eq!(header.side, 1);
         assert!(marks.quads.iter().any(|quad| quad.heatmap == Some(0)));
         assert!(decode_plot(&bytes[..bytes.len() - 1]).is_err());
+    }
+
+    #[test]
+    fn a_payload_with_an_out_of_range_batch_is_rejected() {
+        let scene = PlotScene {
+            title: "t".into(),
+            panels: vec![Panel {
+                title: String::new(),
+                y_label: String::new(),
+                x_label: String::new(),
+                xmin: 0.0,
+                xmax: 4.0,
+                ymin: 0.0,
+                ymax: 4.0,
+                series: vec![Series::Polyline {
+                    xs: vec![0.0, 1.0],
+                    ys: vec![0.0, 1.0],
+                    color: [1.0; 4],
+                    thickness: 1.0,
+                }],
+                x_labels: Vec::new(),
+                equal: false,
+            }],
+            controls: Vec::new(),
+            table: None,
+            columns: 1,
+            column_weights: vec![1.0],
+            row_weights: vec![1.0],
+            side: 0,
+            row_splits: Vec::new(),
+            volume: scan_kit_core::VolumeMark::default(),
+        };
+        let bytes = encode_plot(&scene, [0.0; 4], [1.0; 4]).unwrap();
+        let tamper = |field: &str, value: serde_json::Value| -> Vec<u8> {
+            let json_len = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
+            let mut header: serde_json::Value =
+                serde_json::from_slice(&bytes[4..4 + json_len]).unwrap();
+            header["batches"][0][field] = value;
+            let json = serde_json::to_vec(&header).unwrap();
+            let mut out = (json.len() as u32).to_le_bytes().to_vec();
+            out.extend(&json);
+            out.extend(&bytes[4 + json_len..]);
+            out
+        };
+        for (field, value) in [
+            ("quad_start", serde_json::json!(4_000_000_000u64)),
+            ("line_count", serde_json::json!(u32::MAX)),
+        ] {
+            assert!(decode_plot(&tamper(field, value)).is_err(), "{field}");
+        }
+        // A heatmap texture index past the texture list is caught too.
+        let mut header: serde_json::Value = {
+            let json_len = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
+            serde_json::from_slice(&bytes[4..4 + json_len]).unwrap()
+        };
+        header["batches"][0]["heats"] = serde_json::json!([[0, 9]]);
+        let json = serde_json::to_vec(&header).unwrap();
+        let mut out = (json.len() as u32).to_le_bytes().to_vec();
+        out.extend(&json);
+        out.extend(&bytes[4 + u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize..]);
+        assert!(decode_plot(&out).is_err());
     }
 
     #[test]

@@ -180,11 +180,18 @@ fn violin_marks(shapes: &[Vec<(f32, f32)>], color: [f32; 4]) -> Vec<Series> {
     ]
 }
 
+/// Sideways offset for one session's marks inside a category. The group is
+/// centered on the tick: n sessions spread over (n-1) * OFFSET.
+fn dodge(session: usize, sessions: usize) -> f32 {
+    (session as f32 + 0.5 - sessions as f32 * 0.5) * OFFSET
+}
+
 pub(super) fn box_series(
     table: &BTreeMap<String, Vec<f32>>,
     y: &[f32],
     categories: &[f32],
     session: usize,
+    sessions: usize,
     color: [f32; 4],
 ) -> Vec<Series> {
     let bins = table.get("_bin");
@@ -199,7 +206,7 @@ pub(super) fn box_series(
         let Some(stats) = box_stats(samples) else {
             continue;
         };
-        let center = index as f32 + (session as f32 - 0.5) * OFFSET;
+        let center = index as f32 + dodge(session, sessions);
         let left = center - BOX_WIDTH * 0.5;
         x.push(left);
         bottom.push(stats.q1);
@@ -240,6 +247,7 @@ pub(super) fn mean_series(
     y: &[f32],
     categories: &[f32],
     session: usize,
+    sessions: usize,
     color: [f32; 4],
 ) -> Vec<Series> {
     let bins = table.get("_bin");
@@ -250,7 +258,7 @@ pub(super) fn mean_series(
         if samples.is_empty() {
             continue;
         }
-        xs.push(index as f32 + (session as f32 - 0.5) * OFFSET);
+        xs.push(index as f32 + dodge(session, sessions));
         ys.push(samples.iter().sum::<f32>() / samples.len() as f32);
     }
     let curve = pchip(&xs, &ys);
@@ -316,6 +324,7 @@ pub(super) fn binned_trend(
     y: &[f32],
     categories: &[f32],
     session: usize,
+    sessions: usize,
     xmin: f32,
     xmax: f32,
     trend: Trend,
@@ -336,10 +345,10 @@ pub(super) fn binned_trend(
     }
     let coef = fit_trend(&phys, &medians, trend == Trend::Polynomial)?;
     let knots: Vec<f32> = (0..categories.len())
-        .map(|index| index as f32 + (session as f32 - 0.5) * OFFSET)
+        .map(|index| index as f32 + dodge(session, sessions))
         .collect();
     curve_across(xmin, xmax, &knots, coef[2] != 0.0, |plot_x| {
-        eval_trend(coef, phys_at_plot_x(plot_x, categories, session))
+        eval_trend(coef, phys_at_plot_x(plot_x, categories, session, sessions))
     })
 }
 
@@ -452,8 +461,13 @@ pub(super) fn eval_trend(coef: [f64; 3], x: f32) -> f32 {
     (coef[0] + coef[1] * x + coef[2] * x * x) as f32
 }
 
-pub(super) fn phys_at_plot_x(plot_x: f32, categories: &[f32], session: usize) -> f32 {
-    let index = plot_x - (session as f32 - 0.5) * OFFSET;
+pub(super) fn phys_at_plot_x(
+    plot_x: f32,
+    categories: &[f32],
+    session: usize,
+    sessions: usize,
+) -> f32 {
+    let index = plot_x - dodge(session, sessions);
     let n = categories.len();
     if n == 0 {
         return index;

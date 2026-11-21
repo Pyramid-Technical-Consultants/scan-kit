@@ -52,8 +52,15 @@ export async function driveTask(
       await invoke("scan_kit_cancel", { task: started.task });
       return;
     }
-    const raw = await invoke<ArrayBuffer | Uint8Array>("scan_kit_poll", { task: started.task });
-    const parsed = parsePoll(bytesOf(raw));
+    let parsed;
+    try {
+      const raw = await invoke<ArrayBuffer | Uint8Array>("scan_kit_poll", { task: started.task });
+      parsed = parsePoll(bytesOf(raw));
+    } catch (reason) {
+      // The backend task keeps running without a poller — cancel it, then propagate.
+      await invoke("scan_kit_cancel", { task: started.task }).catch(() => {});
+      throw reason;
+    }
     if (!acceptReport(parsed.report, started.task, started.generation)) {
       misses += 1;
       if (!parsed.report.finished && misses < 8) {
@@ -67,7 +74,13 @@ export async function driveTask(
       await invoke("scan_kit_cancel", { task: started.task });
       return;
     }
-    onUpdate(parsed.report, parsed.payload);
+    try {
+      onUpdate(parsed.report, parsed.payload);
+    } catch (reason) {
+      // Same shape as a poll error — do not leave the backend task running.
+      await invoke("scan_kit_cancel", { task: started.task }).catch(() => {});
+      throw reason;
+    }
     if (parsed.report.finished) {
       if (parsed.report.phase === "failed") {
         throw new Error(parsed.report.note.length > 0 ? parsed.report.note : "failed");

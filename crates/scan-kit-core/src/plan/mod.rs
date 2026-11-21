@@ -483,12 +483,16 @@ fn unique_energies(rows: &[Row]) -> usize {
 }
 
 fn format_delivery(seconds: f64) -> String {
-    if seconds < 60.0 {
+    // Anything that rounds to 60 s reads better as a minute.
+    if seconds < 59.95 {
         return format!("{seconds:.1} s");
     }
     let total_minutes = (seconds / 60.0).floor() as i64;
     if total_minutes < 60 {
         let rem = (seconds % 60.0).round() as i64;
+        if rem == 60 {
+            return format!("{} min", total_minutes + 1);
+        }
         if rem == 0 {
             return format!("{total_minutes} min");
         }

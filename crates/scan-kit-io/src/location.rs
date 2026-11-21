@@ -145,6 +145,7 @@ pub(crate) fn discover_remote(canonical: &str) -> Result<Found, String> {
     let mut skipped = Vec::new();
     let mut archives = Vec::new();
     let mut exams = Vec::new();
+    let mut walk_failed = false;
     let root_name = remote
         .path
         .trim_end_matches('/')
@@ -176,6 +177,7 @@ pub(crate) fn discover_remote(canonical: &str) -> Result<Found, String> {
             &mut skipped,
             &mut archives,
             &mut exams,
+            &mut walk_failed,
         )?;
     }
     discover::add_archives(&mut entries, &mut skipped, archives);
@@ -184,6 +186,7 @@ pub(crate) fn discover_remote(canonical: &str) -> Result<Found, String> {
         entries,
         skipped,
         exams,
+        walk_failed,
     })
 }
 
@@ -416,6 +419,7 @@ fn http_archive(remote: &Remote) -> Result<Found, String> {
         }],
         skipped: Vec::new(),
         exams: Vec::new(),
+        walk_failed: false,
     })
 }
 
@@ -429,6 +433,7 @@ fn walk_remote(
     skipped: &mut Vec<String>,
     archives: &mut Vec<(Discovered, String)>,
     exams: &mut Vec<discover::ExamHit>,
+    walk_failed: &mut bool,
 ) -> Result<(), String> {
     if depth >= NEST_DEPTH {
         return Ok(());
@@ -441,6 +446,7 @@ fn walk_remote(
         Ok(items) => items,
         Err(err) if depth == 0 => return Err(err),
         Err(_) => {
+            *walk_failed = true;
             skipped.push(rel.to_owned());
             return Ok(());
         }
@@ -477,7 +483,10 @@ fn walk_remote(
                 sessions.push(name.clone());
             }
             Ok(false) => {}
-            Err(_) => skipped.push(child_rel.clone()),
+            Err(_) => {
+                *walk_failed = true;
+                skipped.push(child_rel.clone());
+            }
         }
     }
     for name in &files {
@@ -509,6 +518,7 @@ fn walk_remote(
             }
             Ok(None) => {}
             Err(_) => {
+                *walk_failed = true;
                 skipped.push(child_rel);
                 continue;
             }
@@ -523,6 +533,7 @@ fn walk_remote(
             skipped,
             archives,
             exams,
+            walk_failed,
         )?;
     }
     Ok(())
@@ -535,13 +546,16 @@ fn remote_exam(
     storage_url: &str,
 ) -> Result<Option<discover::ExamHit>, String> {
     let mut files = Vec::new();
+    let mut dirs = Vec::new();
     let mut count = 0i64;
     for item in fs.list(path)? {
         if item.name.is_empty() || item.name == "." || item.name == ".." {
             continue;
         }
         count += 1;
-        if !item.dir {
+        if item.dir {
+            dirs.push(item.name);
+        } else {
             files.push(item.name);
         }
     }
@@ -557,6 +571,14 @@ fn remote_exam(
     let Some(sample) = sample else {
         return Ok(None);
     };
+    // A stray .dcm beside session folders does not make this an exam — the
+    // walk must keep descending or the nested sessions disappear.
+    for name in &dirs {
+        let child = join_path(path, name);
+        if is_remote_session(fs, &child, name)? {
+            return Ok(None);
+        }
+    }
     let bytes = fs
         .read_prefix(&sample, 4 * 1024 * 1024)?
         .unwrap_or_default();
@@ -1092,7 +1114,11 @@ pub(crate) fn session_storage_paths(root: &str, session_id: &str) -> Result<Vec<
         let mut found = Vec::new();
         for name in names {
             if fs.stat(&format!("{base}/{name}"))?.is_some() {
-                found.push(format!("{}/{name}", remote.canonical.trim_end_matches('/')));
+                found.push(format!(
+                    "{}/{}",
+                    remote.canonical.trim_end_matches('/'),
+                    encode_path(&name)
+                ));
             }
         }
         return Ok(found);

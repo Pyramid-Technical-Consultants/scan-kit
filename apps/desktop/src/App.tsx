@@ -369,6 +369,11 @@ export default function App() {
           () => libraryToken.current !== mine,
         );
       } finally {
+        // A failed load throws out of driveTask — drop its last fraction so
+        // the next load does not open on the previous one's progress.
+        if (libraryToken.current === mine) {
+          setLibraryReport(null);
+        }
         endCatalogLoad();
       }
     },

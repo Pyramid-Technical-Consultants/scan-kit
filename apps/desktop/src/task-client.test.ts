@@ -52,6 +52,9 @@ it("polls the next slice without waiting for a paint", async () => {
     if (command === "scan_kit_start") {
       return { task: 1, generation: 1 };
     }
+    if (command !== "scan_kit_poll") {
+      throw new Error(`unexpected invoke ${command}`);
+    }
     polls += 1;
     return frame(report(1, polls > 1), new Uint8Array([polls]));
   });
@@ -65,6 +68,46 @@ it("polls the next slice without waiting for a paint", async () => {
   );
   expect(seen).toEqual([1, 2]);
   expect(polls).toBe(2);
+  expect(invoke).toHaveBeenCalledWith("scan_kit_poll", { task: 1 });
+});
+
+it("cancels the backend task when the stop predicate fires", async () => {
+  vi.mocked(invoke).mockImplementation(async (command: string) => {
+    if (command === "scan_kit_start") {
+      return { task: 1, generation: 1 };
+    }
+    if (command === "scan_kit_poll") {
+      return frame(report(1, false), new Uint8Array([1]));
+    }
+    if (command === "scan_kit_cancel") {
+      return null;
+    }
+    throw new Error(`unexpected invoke ${command}`);
+  });
+  let checks = 0;
+  await driveTask(
+    {},
+    () => {},
+    () => checks++ !== 0,
+  );
+  expect(invoke).toHaveBeenCalledWith("scan_kit_cancel", { task: 1 });
+});
+
+it("cancels the backend task when a poll fails instead of abandoning it", async () => {
+  vi.mocked(invoke).mockImplementation(async (command: string) => {
+    if (command === "scan_kit_start") {
+      return { task: 1, generation: 1 };
+    }
+    if (command === "scan_kit_poll") {
+      throw new Error("poll blew up");
+    }
+    if (command === "scan_kit_cancel") {
+      return null;
+    }
+    throw new Error(`unexpected invoke ${command}`);
+  });
+  await expect(driveTask({}, () => {}, () => false)).rejects.toThrow("poll blew up");
+  expect(invoke).toHaveBeenCalledWith("scan_kit_cancel", { task: 1 });
 });
 
 it("the hairline sweeps when the length is unknown and fills a fraction", () => {
