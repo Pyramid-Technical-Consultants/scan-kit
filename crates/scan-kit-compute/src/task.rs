@@ -199,7 +199,12 @@ pub fn poll_task(id: u64) -> Result<Vec<u8>, String> {
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         stage.poll(POLL_BUDGET, &cancel)
     }))
-    .unwrap_or_else(|_| Poll::Failed("task panicked".into()));
+    .unwrap_or_else(|_| {
+        // The unwind skipped clear_slice — drop the stale binding or this pool
+        // thread keeps truncating same-named tables under other roots.
+        scan_kit_io::clear_slice();
+        Poll::Failed("task panicked".into())
+    });
     let mut report = stage.report();
     report.task = id;
     report.generation = generation;

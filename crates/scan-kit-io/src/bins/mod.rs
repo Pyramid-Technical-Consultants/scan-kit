@@ -800,9 +800,14 @@ pub(crate) fn bins(root: &Path, session_ids: &[String], options: &Value) -> Plot
             session_ids.iter().map(load_one).collect::<Vec<_>>()
         } else {
             std::thread::scope(|scope| {
+                let load_one = &load_one;
                 let mut joins = Vec::with_capacity(session_ids.len());
                 for session in session_ids {
-                    joins.push(scope.spawn(|| load_one(session)));
+                    let inherit = crate::tables::inherit_slice();
+                    joins.push(scope.spawn(move || {
+                        let _slice = inherit.map(crate::tables::BoundScope::install);
+                        load_one(session)
+                    }));
                 }
                 joins
                     .into_iter()
