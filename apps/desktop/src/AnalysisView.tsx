@@ -45,7 +45,7 @@ import {
 } from "@/plot-header";
 import { usePageLoad } from "@/page-load";
 import { sessionColor, shownSessionIds } from "@/session-colors";
-import { acceptReport, bytesOf, parsePoll, type Report } from "@/task-client";
+import { acceptReport, bytesOf, driveTask, parsePoll, type Report } from "@/task-client";
 import { dismissNotice, notifyError } from "@/notify";
 import { ScrubBar, useScrub, type Scrub } from "@/scrub-bar";
 import { DoseBoard } from "@/DoseBoard";
@@ -1417,19 +1417,30 @@ export function AnalysisView({
                 if (typeof selected !== "string") {
                   return;
                 }
-                void invoke("scan_kit_write_report", {
-                  path: folder,
-                  sessionIds: shownSessionIds(
-                    sessions.map((session) => session.id),
-                    hidden,
-                  ),
-                  options: {
-                    ...optionsRef.current,
-                    study: studyPath,
-                    scanners: JSON.stringify(scanners),
+                void driveTask(
+                  {
+                    view: "write_report",
+                    path: folder,
+                    sessionIds: shownSessionIds(
+                      sessions.map((session) => session.id),
+                      hidden,
+                    ),
+                    options: {
+                      ...optionsRef.current,
+                      study: studyPath,
+                      scanners: JSON.stringify(scanners),
+                      dest: selected,
+                    },
+                    background: [],
+                    foreground: [],
+                    palette: [],
                   },
-                  dest: selected,
-                }).catch((reason: unknown) => notifyError(reason));
+                  (report) => setTaskReport(report.finished ? null : report),
+                  () => false,
+                ).catch((reason: unknown) => {
+                  setTaskReport(null);
+                  notifyError(reason);
+                });
               })
                 .catch((reason: unknown) => notifyError(reason));
             }}
@@ -1448,20 +1459,31 @@ export function AnalysisView({
                 if (typeof selected !== "string") {
                   return;
                 }
-                void invoke("scan_kit_write_dose", {
-                  path: folder,
-                  sessionIds: shownSessionIds(
-                    sessions.map((session) => session.id),
-                    hidden,
-                  ),
-                  options: {
-                    ...optionsRef.current,
-                    study: studyPath,
-                    scanners: JSON.stringify(scanners),
+                void driveTask(
+                  {
+                    view: "write_dose",
+                    path: folder,
+                    sessionIds: shownSessionIds(
+                      sessions.map((session) => session.id),
+                      hidden,
+                    ),
+                    options: {
+                      ...optionsRef.current,
+                      study: studyPath,
+                      scanners: JSON.stringify(scanners),
+                      dest: selected,
+                      description: "scan-kit MC",
+                    },
+                    background: [],
+                    foreground: [],
+                    palette: [],
                   },
-                  dest: selected,
-                  description: "scan-kit MC",
-                }).catch((reason: unknown) => notifyError(reason));
+                  (report) => setTaskReport(report.finished ? null : report),
+                  () => false,
+                ).catch((reason: unknown) => {
+                  setTaskReport(null);
+                  notifyError(reason);
+                });
               })
                 .catch((reason: unknown) => notifyError(reason));
             }}

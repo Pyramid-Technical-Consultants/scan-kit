@@ -102,37 +102,26 @@ pub fn invoke(name: &str, input: &Value) -> Result<Value, String> {
                 &palette,
             )
         }
-        "scan_kit_write_dose" => {
+        "scan_kit_write_dose" | "scan_kit_write_report" => {
             let path = text(input, "path")?;
             let session_ids = strings(input, "session_ids")?;
-            let options = input.get("options").cloned().unwrap_or_else(|| json!({}));
-            let dest = text(input, "dest")?;
-            let description = input
+            let mut options = input
+                .get("options")
+                .cloned()
+                .filter(|options| options.is_object())
+                .unwrap_or_else(|| json!({}));
+            options["dest"] = json!(text(input, "dest")?);
+            options["description"] = json!(input
                 .get("description")
                 .and_then(Value::as_str)
-                .unwrap_or("scan-kit MC");
-            scan_kit_io::patient_view::dose_export(
-                Path::new(path),
-                &session_ids,
-                &options,
-                dest,
-                description,
-                &crate::mc::adapter_info(),
-                &|job| crate::mc::run_mc(job).map_err(|err| err.to_string()),
-            )
-        }
-        "scan_kit_write_report" => {
-            let path = text(input, "path")?;
-            let session_ids = strings(input, "session_ids")?;
-            let options = input.get("options").cloned().unwrap_or_else(|| json!({}));
-            let dest = text(input, "dest")?;
-            write_patient_report(
-                Path::new(path),
-                &session_ids,
-                &options,
-                dest,
-                &crate::mc::adapter_info(),
-            )
+                .unwrap_or("scan-kit MC"));
+            let view = if name == "scan_kit_write_dose" {
+                "write_dose"
+            } else {
+                "write_report"
+            };
+            let bytes = crate::task::drain_task(view, Path::new(path), &session_ids, &options)?;
+            serde_json::from_slice(&bytes).map_err(|err| format!("export result: {err}"))
         }
         _ => Err(format!("unknown tool {name}")),
     }
@@ -248,24 +237,20 @@ pub(crate) fn apply_palette(scene: &mut scan_kit_core::PlotScene, palette: &[[f3
 
 /// `scan_kit_write_report`: the QA report `scan_kit.qa.report.write_report`
 /// produced — the patient pipeline's metrics as a PDF, with the DVH curves in
-/// a `*_dvh.csv` sidecar.
-pub fn write_patient_report(
-    root: &Path,
+/// a `*_dvh.csv` sidecar. The task stage runs the transport; this is the tail.
+pub(crate) fn finish_patient_report(
+    inputs: &scan_kit_io::patient_view::PatientInputs,
+    run: &scan_kit_io::patient_view::Transport,
     session_ids: &[String],
     options: &Value,
     dest: &str,
     gpu: &str,
 ) -> Result<Value, String> {
-    let inputs = scan_kit_io::patient_view::patient_inputs(root, session_ids, options)?;
-    let run = scan_kit_io::patient_view::transport(
-        &inputs,
-        Some(&|job| crate::mc::run_mc(job).map_err(|err| err.to_string())),
-    );
     let Some(result) = &run.ran else {
         return Err("the Monte Carlo transport did not run".into());
     };
-    let provenance = scan_kit_io::patient_view::provenance(&inputs, result, session_ids, gpu);
-    let metrics = scan_kit_io::patient_view::metrics(&inputs, &run, options);
+    let provenance = scan_kit_io::patient_view::provenance(inputs, result, session_ids, gpu);
+    let metrics = scan_kit_io::patient_view::metrics(inputs, run, options);
     let title = format!("Patient QA — {}", inputs.study.plan_label);
     let rbe = scan_kit_io::patient_view::rbe_label(inputs.rbe_key);
     let (report, curves) = scan_kit_io::report::patient_report(

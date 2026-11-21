@@ -56,6 +56,7 @@ struct Driver {
     plot: Option<u64>,
     library: Option<u64>,
     copy: Option<u64>,
+    export: Option<u64>,
     tasks: HashMap<u64, Running>,
 }
 
@@ -77,6 +78,7 @@ enum Slot {
     Plot,
     Library,
     Copy,
+    Export,
 }
 
 impl Driver {
@@ -85,6 +87,7 @@ impl Driver {
             Slot::Plot => self.plot,
             Slot::Library => self.library,
             Slot::Copy => self.copy,
+            Slot::Export => self.export,
         }
     }
 
@@ -93,12 +96,18 @@ impl Driver {
             Slot::Plot => &mut self.plot,
             Slot::Library => &mut self.library,
             Slot::Copy => &mut self.copy,
+            Slot::Export => &mut self.export,
         };
         *cell = id;
     }
 
     fn clear(&mut self, id: u64) {
-        for cell in [&mut self.plot, &mut self.library, &mut self.copy] {
+        for cell in [
+            &mut self.plot,
+            &mut self.library,
+            &mut self.copy,
+            &mut self.export,
+        ] {
             if *cell == Some(id) {
                 *cell = None;
             }
@@ -246,18 +255,36 @@ pub(crate) fn drain_plot(
     let mut stage = build_stage(
         view, root, sessions, options, background, foreground, palette,
     );
-    match stage.poll(Duration::MAX, &Cancel::new()) {
-        Poll::Ready(bytes) => Ok(bytes),
-        Poll::Failed(message) => Err(message),
-        Poll::Cancelled => Err("cancelled".into()),
-        Poll::Pending { .. } => Err("plot did not finish".into()),
+    // A stage may spend its first poll on setup and report Pending even with
+    // an unlimited budget — keep driving until it reaches a terminal state.
+    for _ in 0..64 {
+        match stage.poll(Duration::MAX, &Cancel::new()) {
+            Poll::Ready(bytes) => return Ok(bytes),
+            Poll::Failed(message) => return Err(message),
+            Poll::Cancelled => return Err("cancelled".into()),
+            Poll::Pending { .. } => {}
+        }
     }
+    Err("plot did not finish".into())
+}
+
+/// The non-plot tasks (`write_dose`, `write_report`) drained in one call for
+/// callers that have no progress surface — the MCP bridge. The stage is the
+/// same one the desktop polls; the payload is the result JSON.
+pub(crate) fn drain_task(
+    view: &str,
+    root: &Path,
+    sessions: &[String],
+    options: &Value,
+) -> Result<Vec<u8>, String> {
+    drain_plot(view, root, sessions, options, [0.0; 4], [0.0; 4], &[])
 }
 
 fn slot_of(view: &str) -> Slot {
     match view {
         "library" => Slot::Library,
         "runner_copy" => Slot::Copy,
+        "write_dose" | "write_report" => Slot::Export,
         _ => Slot::Plot,
     }
 }
@@ -282,6 +309,12 @@ fn build_stage(
                 .unwrap_or_else(|| path.display().to_string());
             Box::new(CopyStage::new(dest))
         }
+        "write_dose" | "write_report" => Box::new(ExportStage::new(
+            view == "write_dose",
+            path,
+            sessions,
+            options,
+        )),
         _ if wants_mc(view, options) => Box::new(McPlotStage::new(
             path, sessions, options, background, foreground, palette,
         )),
@@ -883,8 +916,10 @@ fn mc_transport(jobs: Vec<McJob>, shared: Arc<McLive>, cancel: Cancel) {
             }
         }
     }
-    let count = runs.len().max(1);
-    let budget = POLL_BUDGET / count as u32;
+    // Every run sees the full budget: a step's wait already includes the
+    // sibling chunks queued ahead of its own, so adapt_chunk balances the
+    // combined queue to roughly the budget.
+    let budget = POLL_BUDGET;
     let mut latest: Vec<Option<McResult>> = vec![None; runs.len()];
     let mut finished: Vec<Option<McResult>> = vec![None; runs.len()];
     let mut done = vec![0u64; runs.len()];
@@ -1336,6 +1371,7 @@ fn same_phantom(left: &McJob, right: &McJob) -> bool {
                 && left.seed == right.seed
                 && left.dose_to_water == right.dose_to_water
                 && left.score_let == right.score_let
+                && left.let_water == right.let_water
         }
         _ => false,
     }
@@ -1585,6 +1621,155 @@ impl Stage for CopyStage {
                 self.report.note = "session copy panicked".into();
                 Poll::Failed(self.report.note.clone())
             }
+        }
+    }
+}
+
+/// A `write_dose`/`write_report` task. The patient transport runs through the
+/// same sliced `McRun` the volumetric view uses, so each poll reports history
+/// progress and a cancel lands mid-run instead of after it. No worker thread:
+/// `McRun::poll` already splits the run into budget-sized submits.
+struct ExportStage {
+    dose: bool,
+    root: PathBuf,
+    sessions: Vec<String>,
+    options: Value,
+    dest: String,
+    description: String,
+    report: Report,
+    job: Option<McJob>,
+    inputs: Option<Box<scan_kit_io::patient_view::PatientInputs>>,
+    run: Option<McRun>,
+}
+
+impl ExportStage {
+    fn new(dose: bool, root: &Path, sessions: &[String], options: &Value) -> Self {
+        Self {
+            dose,
+            root: root.to_path_buf(),
+            sessions: sessions.to_vec(),
+            options: options.clone(),
+            dest: options
+                .get("dest")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned(),
+            description: options
+                .get("description")
+                .and_then(Value::as_str)
+                .unwrap_or("scan-kit MC")
+                .to_owned(),
+            report: Report {
+                task: 0,
+                generation: 0,
+                phase: Phase::Read,
+                done: 0,
+                total: 0,
+                note: "Loading study".into(),
+            },
+            job: None,
+            inputs: None,
+            run: None,
+        }
+    }
+
+    fn fail(&mut self, message: String) -> Poll<Vec<u8>> {
+        self.report.phase = Phase::Failed;
+        self.report.note = message.clone();
+        Poll::Failed(message)
+    }
+
+    /// The transport finished: weight the dose, write the file, and keep the
+    /// cube so a following view or export opens instantly.
+    fn finish(&mut self, result: McResult) -> Poll<Vec<u8>> {
+        let Some(inputs) = self.inputs.as_ref() else {
+            return self.fail("the export has no patient inputs".into());
+        };
+        if let Some(job) = &self.job {
+            keep_runs(std::slice::from_ref(job), std::slice::from_ref(&result));
+        }
+        self.report.done = self.report.total;
+        let run = scan_kit_io::patient_view::dose_from_result(inputs, Some(result));
+        let gpu = crate::mc::adapter_info();
+        let outcome = if self.dose {
+            scan_kit_io::patient_view::write_patient_dose(
+                inputs,
+                &run,
+                &self.sessions,
+                &self.dest,
+                &self.description,
+                &gpu,
+            )
+        } else {
+            crate::present::finish_patient_report(
+                inputs,
+                &run,
+                &self.sessions,
+                &self.options,
+                &self.dest,
+                &gpu,
+            )
+        };
+        match outcome {
+            Ok(value) => match serde_json::to_vec(&value) {
+                Ok(bytes) => Poll::Ready(bytes),
+                Err(err) => self.fail(err.to_string()),
+            },
+            Err(message) => self.fail(message),
+        }
+    }
+}
+
+impl Stage for ExportStage {
+    fn report(&self) -> Report {
+        self.report.clone()
+    }
+
+    fn poll(&mut self, budget: Duration, cancel: &Cancel) -> Poll<Vec<u8>> {
+        if cancel.is_cancelled() {
+            self.report.phase = Phase::Cancelled;
+            return Poll::Cancelled;
+        }
+        if self.run.is_none() {
+            if self.inputs.is_none() {
+                match scan_kit_io::patient_view::patient_inputs(
+                    &self.root,
+                    &self.sessions,
+                    &self.options,
+                ) {
+                    Ok(inputs) => self.inputs = Some(Box::new(inputs)),
+                    Err(message) => return self.fail(message),
+                }
+            }
+            let inputs = self.inputs.as_ref().expect("patient inputs");
+            let job = McJob::Patient(scan_kit_io::patient_view::patient_request(inputs));
+            // The volumetric view may have already transported this request;
+            // paint that cube instead of running the histories again.
+            if let Some(mut results) = kept_results(std::slice::from_ref(&job)) {
+                self.report.total = u64::from(inputs.histories);
+                self.job = Some(job);
+                return self.finish(results.swap_remove(0));
+            }
+            self.job = Some(job.clone());
+            self.run = match McRun::open(&job) {
+                Ok(run) => Some(run),
+                Err(err) => return self.fail(err.to_string()),
+            };
+        }
+        match self.run.as_mut().expect("transport").poll(budget, cancel) {
+            Poll::Pending { report, .. } => {
+                self.report = report;
+                Poll::Pending {
+                    report: self.report.clone(),
+                    preview: None,
+                }
+            }
+            Poll::Ready(result) => self.finish(result),
+            Poll::Cancelled => {
+                self.report.phase = Phase::Cancelled;
+                Poll::Cancelled
+            }
+            Poll::Failed(message) => self.fail(message),
         }
     }
 }
@@ -2256,6 +2441,241 @@ mod tests {
         let next = second["task"].as_u64().unwrap();
         assert_ne!(next, id);
         cancel_task(next);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn poll_report(bytes: &[u8]) -> Value {
+        let length = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
+        serde_json::from_slice(&bytes[4..4 + length]).unwrap()
+    }
+
+    #[test]
+    fn an_export_fails_on_a_missing_study_and_clears_the_task() {
+        let root = scratch();
+        let started = start_task(
+            "write_dose",
+            &root,
+            &[],
+            &json!({
+                "study": root.join("missing").display().to_string(),
+                "dest": root.join("dose.dcm").display().to_string(),
+            }),
+            [0.0; 4],
+            [0.0; 4],
+            &[],
+        )
+        .unwrap();
+        let id = started["task"].as_u64().unwrap();
+        let report = poll_report(&poll_task(id).unwrap());
+        assert_eq!(report["phase"], "failed");
+        assert_eq!(report["finished"], true);
+        // The failed task is gone, not parked in the export slot.
+        let driver = lock();
+        assert!(driver.export.is_none());
+        assert!(!driver.tasks.contains_key(&id));
+        drop(driver);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_second_export_replaces_the_first_and_leaves_the_plot_slot() {
+        let root = scratch();
+        let options = json!({
+            "study": root.join("missing").display().to_string(),
+            "dest": root.join("out").display().to_string(),
+        });
+        let first =
+            start_task("write_dose", &root, &[], &options, [0.0; 4], [0.0; 4], &[]).unwrap();
+        let second = start_task(
+            "write_report",
+            &root,
+            &[],
+            &options,
+            [0.0; 4],
+            [0.0; 4],
+            &[],
+        )
+        .unwrap();
+        assert_ne!(first["task"], second["task"]);
+        let driver = lock();
+        assert!(!driver.tasks.contains_key(&first["task"].as_u64().unwrap()));
+        assert!(driver.tasks.contains_key(&second["task"].as_u64().unwrap()));
+        assert!(driver.plot.is_none());
+        drop(driver);
+        cancel_task(second["task"].as_u64().unwrap());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // Diagnostic, not a test: prints the session's uncertainty vs histories.
+    #[test]
+    #[ignore]
+    fn session_uncertainty_curve() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test_data/logs/1241407101/1241407101/input_map.csv");
+        let text = std::fs::read_to_string(path).unwrap();
+        let mut energy = Vec::new();
+        let mut x = Vec::new();
+        let mut y = Vec::new();
+        let mut sx = Vec::new();
+        let mut sy = Vec::new();
+        let mut protons = Vec::new();
+        for line in text.lines().skip(1) {
+            let cols: Vec<&str> = line.split(',').collect();
+            if cols.len() < 6 {
+                continue;
+            }
+            energy.push(cols[0].trim().parse::<f32>().unwrap());
+            sx.push(cols[2].trim().parse::<f32>().unwrap());
+            sy.push(cols[3].trim().parse::<f32>().unwrap());
+            x.push(cols[4].trim().parse::<f32>().unwrap());
+            y.push(cols[5].trim().parse::<f32>().unwrap());
+            protons.push(cols[6].trim().parse::<f32>().unwrap().max(1e-6));
+        }
+        let job = McJob::Slab(scan_kit_core::SlabRequest {
+            medium: "water".into(),
+            x,
+            y,
+            sx,
+            sy,
+            energy,
+            protons,
+            histories: 10_000_000,
+            seed: 1,
+            spread_pct: 0.0,
+            wet_mm: 0.0,
+            depth_mm: 400.0,
+            voxel_mm: 2.0,
+            origin: [-130.0, -130.0, -410.0],
+            shape: [130, 130, 205],
+        });
+        let mut run = McRun::open(&job).unwrap();
+        let cancel = Cancel::new();
+        let start = std::time::Instant::now();
+        loop {
+            match run.poll(Duration::from_millis(200), &cancel) {
+                Poll::Pending { report, .. } => {
+                    println!("{:>6.1}s {}", start.elapsed().as_secs_f64(), report.note);
+                }
+                Poll::Ready(result) => {
+                    println!(
+                        "READY {:.1}s ±{:.2}%",
+                        start.elapsed().as_secs_f64(),
+                        result.uncertainty * 100.0
+                    );
+                    break;
+                }
+                Poll::Cancelled => panic!("cancelled"),
+                Poll::Failed(m) => panic!("{m}"),
+            }
+        }
+    }
+
+    // Diagnostic, not a test: dumps the real McJobs a session view builds.
+    #[test]
+    #[ignore]
+    fn session_job_dump() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../test_data/logs/1241407101");
+        let (_scene, jobs) = capture_job(
+            &root,
+            &["1241407101".into()],
+            &json!({"model": "mc", "voxel": "2"}),
+        );
+        println!("{} jobs", jobs.len());
+        for job in &jobs {
+            let McJob::Slab(r) = job else { continue };
+            let total: f64 = r.protons.iter().map(|&p| f64::from(p)).sum();
+            let mean_e: f64 = r
+                .energy
+                .iter()
+                .zip(&r.protons)
+                .map(|(&e, &p)| f64::from(e) * f64::from(p))
+                .sum::<f64>()
+                / total.max(1e-30);
+            let e_max = r.energy.iter().cloned().fold(0.0f32, f32::max);
+            println!(
+                "spots={} histories={} voxel={} shape={:?} depth={} wet={} spread={} meanE={:.0} maxE={:.0}",
+                r.energy.len(), r.histories, r.voxel_mm, r.shape, r.depth_mm, r.wet_mm, r.spread_pct, mean_e, e_max
+            );
+            let cancel = Cancel::new();
+            let mut run = McRun::open(job).unwrap();
+            let start = std::time::Instant::now();
+            loop {
+                match run.poll(Duration::from_millis(500), &cancel) {
+                    Poll::Pending { report, .. } => {
+                        println!("  {:>6.1}s {}", start.elapsed().as_secs_f64(), report.note);
+                    }
+                    Poll::Ready(result) => {
+                        println!(
+                            "  READY {:.1}s ±{:.2}%",
+                            start.elapsed().as_secs_f64(),
+                            result.uncertainty * 100.0
+                        );
+                        break;
+                    }
+                    Poll::Cancelled => panic!("cancelled"),
+                    Poll::Failed(m) => panic!("{m}"),
+                }
+            }
+        }
+    }
+
+    // Diagnostic, not a test: times each phase of the volumetric task on a
+    // real multi-spot session to find where the wall time goes.
+    #[test]
+    #[ignore]
+    fn session_task_phase_timing() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../test_data/logs/1241407101");
+        let started = start_task(
+            "volumetric",
+            &root,
+            &["1241407101".into()],
+            &json!({"model": "mc", "histories": "10000000", "voxel": "2"}),
+            [0.1, 0.1, 0.1, 1.0],
+            [0.9, 0.9, 0.9, 1.0],
+            &[[0.2, 0.4, 0.8, 1.0]],
+        )
+        .unwrap();
+        let id = started["task"].as_u64().unwrap();
+        let start = std::time::Instant::now();
+        let mut last = String::new();
+        for _ in 0..3600 {
+            let bytes = poll_task(id).unwrap();
+            let length = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
+            let report: Value = serde_json::from_slice(&bytes[4..4 + length]).unwrap();
+            let line = format!(
+                "{} {} {}/{} {}",
+                report["phase"],
+                report["finished"],
+                report["done"],
+                report["total"],
+                report["note"]
+            );
+            if line != last {
+                println!("{:>7.1}s {line}", start.elapsed().as_secs_f64());
+                last = line;
+            }
+            if report["finished"].as_bool().unwrap_or(false) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        cancel_task(id);
+    }
+
+    #[test]
+    fn drain_task_drives_the_stage_to_a_terminal_error() {
+        let root = scratch();
+        let message = drain_task(
+            "write_dose",
+            &root,
+            &[],
+            &json!({
+                "study": root.join("missing").display().to_string(),
+                "dest": root.join("dose.dcm").display().to_string(),
+            }),
+        )
+        .expect_err("a missing study cannot export");
+        assert_ne!(message, "plot did not finish");
         let _ = std::fs::remove_dir_all(&root);
     }
 }
