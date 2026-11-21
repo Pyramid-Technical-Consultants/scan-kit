@@ -304,15 +304,16 @@ export function PlanSynthesis() {
     if (busy || plan == null || template == null) {
       return;
     }
+    setBusy(true);
     const selected = await save({
       title: "Save Input Map",
       defaultPath: joinPath(saveDir, plan.filename),
       filters: [{ name: "Input map", extensions: ["csv"] }],
     });
     if (typeof selected !== "string") {
+      setBusy(false);
       return;
     }
-    setBusy(true);
     try {
       await invoke("scan_kit_synthesize_plan", {
         template: template.id,

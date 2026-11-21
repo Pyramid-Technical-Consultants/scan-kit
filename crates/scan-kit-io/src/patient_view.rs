@@ -294,12 +294,10 @@ pub fn dose_from_result(inputs: &PatientInputs, ran: Option<McResult>) -> Transp
     }
 }
 
-pub fn transport(inputs: &PatientInputs, mc: Option<McRunner<'_>>) -> Transport {
-    let request = patient_request(inputs).ok();
-    let ran = request
-        .as_ref()
-        .and_then(|request| mc.and_then(|run| run(&McJob::Patient(request.clone())).ok()));
-    dose_from_result(inputs, ran)
+pub fn transport(inputs: &PatientInputs, mc: Option<McRunner<'_>>) -> Result<Transport, String> {
+    let request = patient_request(inputs)?;
+    let ran = mc.and_then(|run| run(&McJob::Patient(request.clone())).ok());
+    Ok(dose_from_result(inputs, ran))
 }
 
 /// Write a finished transport's dose as an RTDOSE — the tail of
@@ -619,7 +617,10 @@ pub(crate) fn scene(
         Ok(inputs) => inputs,
         Err(err) => return note_scene(&err),
     };
-    let run = transport(&inputs, mc);
+    let run = match transport(&inputs, mc) {
+        Ok(run) => run,
+        Err(err) => return note_scene(&err),
+    };
     let computed = metrics(&inputs, &run, options);
     let PatientInputs {
         study,

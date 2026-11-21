@@ -52,13 +52,13 @@ pub(crate) fn pick_in<'a>(
 
 /// Normalize an options object at the trust boundary: JSON numbers and
 /// booleans become their string form because every option read is `as_str`,
-/// and `_`-prefixed internals (`_preview`) are removed so a caller cannot
-/// set knobs the stages write for themselves.
+/// and `_preview` is removed so a caller cannot set a knob the stage writes
+/// for itself (`_lines` is a legitimate client key and stays).
 pub fn normalize_options(options: &mut Value) {
     let Some(map) = options.as_object_mut() else {
         return;
     };
-    map.retain(|key, _| !key.starts_with('_'));
+    map.remove("_preview");
     for value in map.values_mut() {
         match value.clone() {
             Value::Number(number) => *value = Value::String(number.to_string()),

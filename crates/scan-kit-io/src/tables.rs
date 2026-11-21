@@ -974,7 +974,9 @@ pub(crate) fn load_spot(
     let key = (rows.is_none() && spot_path.is_file() && map_path.is_file()).then(|| SpotCacheKey {
         spot_stamp: discover::meta_stamp(&spot_path),
         map_stamp: discover::meta_stamp(&map_path),
-        device_stamp: discover::meta_stamp(&dir.join("config/map2map/devices.xml")),
+        device_stamp: discover::meta_stamp(&dir.join("config/map2map/devices.xml")).wrapping_add(
+            discover::meta_stamp(&dir.join("config/map2map/scan_dose_system.xml")),
+        ),
         point_stamp: point_time_stamp(&dir),
         dir,
         chamber,
@@ -1794,23 +1796,37 @@ fn lookup_point_time(dir: &Path, spot_no: &[f32], layer: &[f32]) -> Vec<f32> {
 /// in the layer tree so a changed file or a new layer invalidates the cache.
 fn point_time_stamp(dir: &Path) -> u128 {
     let mut stamp = 0u128;
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return 0;
-    };
-    for entry in entries.flatten() {
-        let layer = entry.path();
-        let is_layer = layer
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.starts_with("layer-"));
-        if !is_layer {
-            continue;
-        }
-        let Ok(runs) = std::fs::read_dir(&layer) else {
-            continue;
-        };
-        for run in runs.flatten() {
-            if let Some(path) = point_time_file(&run.path()) {
+    let mut layers: Vec<PathBuf> = std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| {
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.starts_with("layer-"))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    layers.sort();
+    for layer in layers {
+        let mut runs: Vec<PathBuf> = std::fs::read_dir(&layer)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .map(|entry| entry.path())
+                    .filter(|path| {
+                        path.file_name()
+                            .and_then(|name| name.to_str())
+                            .is_some_and(|name| name.starts_with("run-"))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        runs.sort();
+        for run in runs {
+            if let Some(path) = point_time_file(&run) {
                 stamp = stamp.wrapping_add(discover::meta_stamp(&path));
                 break;
             }
