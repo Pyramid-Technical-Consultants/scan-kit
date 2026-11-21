@@ -109,6 +109,11 @@ pub fn gamma_index_norm(
     let n = nx * ny * nz;
     let len = n.min(reference.len()).min(evaluated.len());
     let mut gamma = vec![0.0f32; len];
+    // Scoring samples evaluated by `shape` up to n - 1 — a short operand
+    // stays unscored rather than index out of bounds.
+    if evaluated.len() < n {
+        return (gamma, 0, 0);
+    }
     let mut norm = norm.max(0.0);
     if norm <= 0.0 {
         for value in evaluated.iter().take(len) {

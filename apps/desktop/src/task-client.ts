@@ -74,7 +74,13 @@ export async function driveTask(
       await invoke("scan_kit_cancel", { task: started.task });
       return;
     }
-    onUpdate(parsed.report, parsed.payload);
+    try {
+      onUpdate(parsed.report, parsed.payload);
+    } catch (reason) {
+      // Same shape as a poll error — do not leave the backend task running.
+      await invoke("scan_kit_cancel", { task: started.task }).catch(() => {});
+      throw reason;
+    }
     if (parsed.report.finished) {
       if (parsed.report.phase === "failed") {
         throw new Error(parsed.report.note.length > 0 ? parsed.report.note : "failed");

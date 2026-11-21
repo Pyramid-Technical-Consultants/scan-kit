@@ -376,8 +376,9 @@ fn read_cube(reader: &mut Reader<'_>, count: usize) -> Result<Vec<f32>, String> 
 
 fn read_f32s(reader: &mut Reader<'_>, count: usize) -> Result<Vec<f32>, String> {
     let bytes = count.checked_mul(4).ok_or("plot payload is truncated")?;
+    let raw = reader.take(bytes)?;
     let mut values = vec![0.0f32; count];
-    copy_le(reader.take(bytes)?, &mut values);
+    copy_le(raw, &mut values);
     Ok(values)
 }
 

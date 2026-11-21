@@ -2910,7 +2910,9 @@ impl Plot {
                 let center = project(matrix, point.p, w, h);
                 let reach = point.radius.max(1.0) + 0.5;
                 if (center[0] - x).powi(2) + (center[1] - y).powi(2) <= reach * reach {
-                    return hit(point.id);
+                    if let Some(series) = hit(point.id) {
+                        return Some(series);
+                    }
                 }
             }
         }
@@ -2918,13 +2920,15 @@ impl Plot {
             .live
             .iter()
             .rev()
-            .filter(|cloud| cloud.panel == cell.panel)
+            .filter(|cloud| cloud.panel == cell.panel && !cloud.crosshair)
         {
             for line in cloud.lines.iter().rev() {
                 let a = project(matrix, line.a, w, h);
                 let b = project(matrix, line.b, w, h);
                 if segment_distance(a, b, [x, y]) <= line.thickness.max(1.0) * 0.5 + 0.5 {
-                    return hit(line.id);
+                    if let Some(series) = hit(line.id) {
+                        return Some(series);
+                    }
                 }
             }
         }
@@ -2980,7 +2984,9 @@ impl Plot {
         for (index, _) in batch.heats.iter().rev() {
             let quad = &self.marks.quads[*index as usize];
             if covers(quad) {
-                return hit(quad.id);
+                if let Some(series) = hit(quad.id) {
+                    return Some(series);
+                }
             }
         }
         let quads = &self.marks.quads
@@ -3334,12 +3340,21 @@ impl Plot {
             center: self.pan,
         };
         let prepared = crate::dose::prepare_plane(grid, &view);
-        for y in top.floor() as i32..=bottom.ceil() as i32 {
-            for x in left.floor() as i32..=right.ceil() as i32 {
+        let (x_lo, y_lo, x_hi, y_hi) = clip_pixels(cell.plot, width, height);
+        for y in (top.floor() as i64).max(y_lo)..=(bottom.ceil() as i64).min(y_hi) {
+            for x in (left.floor() as i64).max(x_lo)..=(right.ceil() as i64).min(x_hi) {
                 let u = ((x as f32 - left) / span_x).clamp(0.0, 1.0);
                 let v = ((y as f32 - top) / span_y).clamp(0.0, 1.0);
                 let color = crate::dose::shade_uv(grid, &view, prepared.as_ref(), [u, v]);
-                blend(frame, width, height, x, y, color, Some(cell.plot));
+                blend(
+                    frame,
+                    width,
+                    height,
+                    x as i32,
+                    y as i32,
+                    color,
+                    Some(cell.plot),
+                );
             }
         }
     }

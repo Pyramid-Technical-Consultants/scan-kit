@@ -546,13 +546,16 @@ fn remote_exam(
     storage_url: &str,
 ) -> Result<Option<discover::ExamHit>, String> {
     let mut files = Vec::new();
+    let mut dirs = Vec::new();
     let mut count = 0i64;
     for item in fs.list(path)? {
         if item.name.is_empty() || item.name == "." || item.name == ".." {
             continue;
         }
         count += 1;
-        if !item.dir {
+        if item.dir {
+            dirs.push(item.name);
+        } else {
             files.push(item.name);
         }
     }
@@ -568,6 +571,14 @@ fn remote_exam(
     let Some(sample) = sample else {
         return Ok(None);
     };
+    // A stray .dcm beside session folders does not make this an exam — the
+    // walk must keep descending or the nested sessions disappear.
+    for name in &dirs {
+        let child = join_path(path, name);
+        if is_remote_session(fs, &child, name)? {
+            return Ok(None);
+        }
+    }
     let bytes = fs
         .read_prefix(&sample, 4 * 1024 * 1024)?
         .unwrap_or_default();
@@ -1103,7 +1114,11 @@ pub(crate) fn session_storage_paths(root: &str, session_id: &str) -> Result<Vec<
         let mut found = Vec::new();
         for name in names {
             if fs.stat(&format!("{base}/{name}"))?.is_some() {
-                found.push(format!("{}/{name}", remote.canonical.trim_end_matches('/')));
+                found.push(format!(
+                    "{}/{}",
+                    remote.canonical.trim_end_matches('/'),
+                    encode_path(&name)
+                ));
             }
         }
         return Ok(found);
