@@ -31,6 +31,7 @@ mod workspace;
 
 pub use analysis::{analysis_scene, channel_catalog, load_timeslice_columns};
 pub use beam::{beam_record, protons_per_mu, spot_record, BeamModel};
+pub use marks::normalize_options;
 pub use mc_tables::{csda_range_mm, mc_tables, medium_rho};
 pub use tables::{
     bind_slice, clear_slice, session_pieces, slice_tail_done, SessionPieces, SliceTake, SLICE_ROWS,

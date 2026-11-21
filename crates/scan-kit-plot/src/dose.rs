@@ -477,7 +477,7 @@ pub fn page(grid: &DoseGrid, plane: u8, index: usize, delta: i32) -> usize {
         2 => grid.volume.shape[0],
         _ => grid.volume.shape[2],
     };
-    (index as i32 + delta).clamp(0, n.saturating_sub(1) as i32) as usize
+    (index as i64 + delta as i64).clamp(0, n.saturating_sub(1) as i64) as usize
 }
 
 /// Boundary segments of each structure on this slice, in millimetres.

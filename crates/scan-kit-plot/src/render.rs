@@ -4024,8 +4024,10 @@ impl Plot {
         }
         let limit = gpu.device.limits().max_texture_dimension_3d.max(1);
         let grid = self.dose.as_ref().unwrap();
-        let max_axis = grid.volume.shape.iter().copied().max().unwrap_or(1) as u32;
-        let (dose_tex, brick_tex, origin, spacing, line_scale, shape) = if max_axis <= limit {
+        let max_axis = grid.volume.shape.iter().copied().max().unwrap_or(1);
+        let (dose_tex, brick_tex, origin, spacing, line_scale, shape) = if max_axis
+            <= limit as usize
+        {
             let lattice = grid
                 .lattice_f16
                 .get_or_init(|| f16_lattice(&grid.volume.values, grid.volume.shape));

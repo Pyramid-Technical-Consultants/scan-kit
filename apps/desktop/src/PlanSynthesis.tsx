@@ -301,18 +301,19 @@ export function PlanSynthesis() {
   }
 
   async function savePlan() {
-    if (plan == null || template == null) {
+    if (busy || plan == null || template == null) {
       return;
     }
+    setBusy(true);
     const selected = await save({
       title: "Save Input Map",
       defaultPath: joinPath(saveDir, plan.filename),
       filters: [{ name: "Input map", extensions: ["csv"] }],
     });
     if (typeof selected !== "string") {
+      setBusy(false);
       return;
     }
-    setBusy(true);
     try {
       await invoke("scan_kit_synthesize_plan", {
         template: template.id,
@@ -419,7 +420,7 @@ export function PlanSynthesis() {
                 type="button"
                 variant="outline"
                 className="min-w-0 flex-1"
-                disabled={plan == null}
+                disabled={busy || plan == null}
                 onClick={() => void savePlan()}
               >
                 <Download />

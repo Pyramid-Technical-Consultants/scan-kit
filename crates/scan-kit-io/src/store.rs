@@ -885,9 +885,6 @@ pub(crate) fn delete_missing(
         .collect::<Result<Vec<_>, _>>()
         .map_err(|err| err.to_string())?;
     let gone: Vec<_> = ids.into_iter().filter(|id| !found.contains(id)).collect();
-    if gone.is_empty() {
-        return Ok(());
-    }
     for session_id in &gone {
         conn.execute(
             "DELETE FROM sessions WHERE library_id = ?1 AND session_id = ?2",
@@ -895,6 +892,7 @@ pub(crate) fn delete_missing(
         )
         .map_err(|err| err.to_string())?;
     }
+    // last_scan_at marks the last scan, not the last scan that deleted a row.
     let selected = selected_list(conn, lib_id)?
         .into_iter()
         .filter(|id| found.contains(id))

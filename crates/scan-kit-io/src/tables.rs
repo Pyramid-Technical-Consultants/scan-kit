@@ -81,6 +81,7 @@ fn file_len(path: &Path) -> u64 {
 #[derive(Clone)]
 pub(crate) struct BoundSlice {
     session: String,
+    dir: PathBuf,
     take: SliceTake,
     tail_done: Arc<AtomicBool>,
 }
@@ -114,10 +115,12 @@ impl Drop for BoundScope {
     }
 }
 
-pub fn bind_slice(session: &str, take: SliceTake) {
+pub fn bind_slice(root: &Path, session: &str, take: SliceTake) {
+    let dir = crate::discover::session_directory(root, session);
     BOUND.with(|bound| {
         *bound.borrow_mut() = Some(BoundSlice {
             session: session.to_owned(),
+            dir,
             take,
             tail_done: Arc::new(AtomicBool::new(false)),
         });
@@ -185,21 +188,20 @@ impl Drop for QuietTail {
 
 /// Publish only for the bound session. A parallel load of another session
 /// finishes its own file and must not move this flag.
-fn set_tail_done(done: bool, belongs: impl FnOnce(&str) -> bool) {
+/// Publish only for the bound session's own files. Matching on the session
+/// directory instead of a name component — a session named `run-0` must not
+/// take the EOF of another session's `layer-0/run-0` file.
+fn set_tail_done(done: bool, path: &Path) {
     if !PUBLISH_TAIL.with(Cell::get) {
         return;
     }
     BOUND.with(|bound| {
         if let Some(bound) = bound.borrow().as_ref() {
-            if belongs(&bound.session) {
+            if path.starts_with(&bound.dir) {
                 bound.tail_done.store(done, Ordering::Relaxed);
             }
         }
     });
-}
-
-fn path_has_session(path: &Path, session: &str) -> bool {
-    path.components().any(|part| part.as_os_str() == session)
 }
 
 pub(crate) type Table = std::sync::Arc<BTreeMap<String, Vec<f32>>>;
@@ -524,9 +526,8 @@ pub(crate) fn session_columns(root: &Path, session: &str, grain: Grain, names: &
     Arc::clone(&held.merged)
 }
 
-// ponytail: keyed by spot/map length and mtime. devices.xml and per-layer
-// point-time files stay stale until the spot csv changes. Past 16 entries the
-// map is cleared. A same-size rewrite in the same timestamp tick is missed.
+// ponytail: keyed by spot/map length and mtime. Past 16 entries the map is
+// cleared. A same-size rewrite in the same timestamp tick is missed.
 const SPOT_CACHE_CAP: usize = 16;
 
 #[derive(Hash, PartialEq, Eq)]
@@ -535,6 +536,8 @@ struct SpotCacheKey {
     chamber: bool,
     spot_stamp: u128,
     map_stamp: u128,
+    device_stamp: u128,
+    point_stamp: u128,
     points: bool,
     raw_sigma: bool,
 }
@@ -651,8 +654,13 @@ fn cached_timeslice(
         }
     }
     let dir = discover::session_directory(root, session);
+    let spot_stamp = if spot {
+        discover::meta_stamp(&dir.join("spot_data.csv"))
+    } else {
+        0
+    };
     if let Some((files, tail_rows)) = partial {
-        match take_grown(&dir, kind, files, tail_rows) {
+        match take_grown(&dir, kind, files, tail_rows, spot_stamp) {
             GrownHit::Same(table) => return table,
             GrownHit::More(previous) => {
                 let _ = take_full_table();
@@ -674,7 +682,7 @@ fn cached_timeslice(
                     restamp_sample_time(grown);
                     table
                 };
-                store_growth(&dir, kind, files, tail_rows, Arc::clone(&table));
+                store_growth(&dir, kind, files, tail_rows, spot_stamp, Arc::clone(&table));
                 return table;
             }
             GrownHit::Miss => {}
@@ -688,7 +696,7 @@ fn cached_timeslice(
     );
     let _ = take_full_table();
     if let Some((files, tail_rows)) = partial {
-        store_growth(&dir, kind, files, tail_rows, Arc::clone(&table));
+        store_growth(&dir, kind, files, tail_rows, spot_stamp, Arc::clone(&table));
         return table;
     }
     let mut cache = table_cache().lock().unwrap_or_else(|err| err.into_inner());
@@ -703,6 +711,7 @@ fn cached_timeslice(
 struct Grown {
     files: usize,
     tail_rows: usize,
+    spot_stamp: u128,
     table: Table,
 }
 
@@ -729,12 +738,22 @@ enum GrownHit {
     Miss,
 }
 
-fn take_grown(dir: &Path, kind: &str, files: usize, tail_rows: usize) -> GrownHit {
+fn take_grown(
+    dir: &Path,
+    kind: &str,
+    files: usize,
+    tail_rows: usize,
+    spot_stamp: u128,
+) -> GrownHit {
     let key = (dir.to_path_buf(), kind.to_string());
     let mut cache = growth_cache().lock().unwrap_or_else(|err| err.into_inner());
     let Some(have) = cache.get(&key) else {
         return GrownHit::Miss;
     };
+    if have.spot_stamp != spot_stamp {
+        cache.remove(&key);
+        return GrownHit::Miss;
+    }
     if have.files == files && have.tail_rows == tail_rows {
         return GrownHit::Same(Arc::clone(&have.table));
     }
@@ -748,7 +767,14 @@ fn take_grown(dir: &Path, kind: &str, files: usize, tail_rows: usize) -> GrownHi
         .unwrap_or(GrownHit::Miss)
 }
 
-fn store_growth(dir: &Path, kind: &str, files: usize, tail_rows: usize, table: Table) {
+fn store_growth(
+    dir: &Path,
+    kind: &str,
+    files: usize,
+    tail_rows: usize,
+    spot_stamp: u128,
+    table: Table,
+) {
     let mut cache = growth_cache().lock().unwrap_or_else(|err| err.into_inner());
     if cache.len() >= TABLE_CACHE_CAP {
         evict_one(&mut cache);
@@ -758,6 +784,7 @@ fn store_growth(dir: &Path, kind: &str, files: usize, tail_rows: usize, table: T
         Grown {
             files,
             tail_rows,
+            spot_stamp,
             table,
         },
     );
@@ -773,9 +800,9 @@ fn extend_columns(base: &mut BTreeMap<String, Vec<f32>>, extra: BTreeMap<String,
             let mut padded = vec![f32::NAN; width];
             padded.extend(values);
             base.insert(key, padded);
-        } else {
-            base.insert(key, values);
         }
+        // A column whose length matches neither base nor extra can't be
+        // aligned to either — leave it out rather than misalign rows.
     }
 }
 
@@ -852,7 +879,7 @@ fn frames_limited(
     }
     let listed = discover::list_timeslice_paths(&dir);
     if listed.is_empty() {
-        set_tail_done(true, |name| name == session);
+        set_tail_done(true, &dir);
         return None;
     }
     let map = map_sheet(root, session);
@@ -885,7 +912,7 @@ fn frames_limited(
         (sheets, layers)
     });
     if no_tail && full >= listed.len() {
-        set_tail_done(true, |name| name == session);
+        set_tail_done(true, &dir);
     }
     Some(Arc::new(Frames {
         energies,
@@ -947,6 +974,10 @@ pub(crate) fn load_spot(
     let key = (rows.is_none() && spot_path.is_file() && map_path.is_file()).then(|| SpotCacheKey {
         spot_stamp: discover::meta_stamp(&spot_path),
         map_stamp: discover::meta_stamp(&map_path),
+        device_stamp: discover::meta_stamp(&dir.join("config/map2map/devices.xml")).wrapping_add(
+            discover::meta_stamp(&dir.join("config/map2map/scan_dose_system.xml")),
+        ),
+        point_stamp: point_time_stamp(&dir),
         dir,
         chamber,
         points,
@@ -985,7 +1016,7 @@ fn build_spot(
         Arc::new(read_sheet(&bytes))
     } else {
         if rows.is_some() {
-            set_tail_done(true, |name| name == session);
+            set_tail_done(true, &dir);
         }
         return BTreeMap::new();
     };
@@ -1096,9 +1127,12 @@ fn build_spot(
             values = column(&map, &named, &[]);
         }
         let scale = if values.len() >= n {
-            table
-                .get(dose_key)
-                .map(|dose| dose_unit_scale(dose, values))
+            // The measured dose columns are still in `doses` — they enter the
+            // table below this loop.
+            doses
+                .iter()
+                .find(|(key, _)| *key == dose_key)
+                .map(|(_, dose)| dose_unit_scale(dose, values))
                 .unwrap_or(1.0)
         } else if target.len() >= n {
             values = target;
@@ -1756,6 +1790,49 @@ fn lookup_point_time(dir: &Path, spot_no: &[f32], layer: &[f32]) -> Vec<f32> {
                 .unwrap_or(f32::NAN)
         })
         .collect()
+}
+
+/// Stamp over the point-time files the spot build reads, keyed by position
+/// in the layer tree so a changed file or a new layer invalidates the cache.
+fn point_time_stamp(dir: &Path) -> u128 {
+    let mut stamp = 0u128;
+    let mut layers: Vec<PathBuf> = std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| {
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.starts_with("layer-"))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    layers.sort();
+    for layer in layers {
+        let mut runs: Vec<PathBuf> = std::fs::read_dir(&layer)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .map(|entry| entry.path())
+                    .filter(|path| {
+                        path.file_name()
+                            .and_then(|name| name.to_str())
+                            .is_some_and(|name| name.starts_with("run-"))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        runs.sort();
+        for run in runs {
+            if let Some(path) = point_time_file(&run) {
+                stamp = stamp.wrapping_add(discover::meta_stamp(&path));
+                break;
+            }
+        }
+    }
+    stamp
 }
 
 fn layer_point_times(dir: &Path) -> HashMap<(u32, u32), f32> {
@@ -4272,7 +4349,7 @@ fn sheet_from_window(
         if hit.stamp == stamp && hit.rows == window.rows {
             let have = finished_rows(&hit.sheet);
             if window.done && want >= have {
-                set_tail_done(true, |name| path_has_session(path, name));
+                set_tail_done(true, path);
             }
             return Some(shared_rows(&hit.sheet, want.min(have), have));
         }
@@ -4282,7 +4359,7 @@ fn sheet_from_window(
     if window.done {
         store_sheet(sheet_key(path, stamp, keep), &sheet);
         if want >= have {
-            set_tail_done(true, |name| path_has_session(path, name));
+            set_tail_done(true, path);
         }
     } else {
         let mut cache = parsed_windows()
@@ -4441,13 +4518,13 @@ fn pull_window(
 
 fn sheet_rows(path: &Path, keep: Keep, pred: fn(&str) -> bool, want: usize) -> Arc<Sheet> {
     // An earlier file in this same picture may have hit EOF. Only this file's end counts.
-    set_tail_done(false, |name| path_has_session(path, name));
+    set_tail_done(false, path);
     let stamp = discover::meta_stamp(path);
     let key = sheet_key(path, stamp, keep);
     if let Some(hit) = cached_sheet(&key) {
         let rows = finished_rows(&hit);
         if want >= rows {
-            set_tail_done(true, |name| path_has_session(path, name));
+            set_tail_done(true, path);
             return hit;
         }
         return Arc::new(clip_sheet(&hit, want));
@@ -4469,7 +4546,7 @@ fn sheet_rows(path: &Path, keep: Keep, pred: fn(&str) -> bool, want: usize) -> A
         let sheet = read_and_cache(path, stamp, keep, pred);
         let have = finished_rows(&sheet);
         if want >= have {
-            set_tail_done(true, |name| path_has_session(path, name));
+            set_tail_done(true, path);
             return sheet;
         }
         return Arc::new(clip_sheet(&sheet, want));
@@ -4522,7 +4599,7 @@ fn sheet_rows(path: &Path, keep: Keep, pred: fn(&str) -> bool, want: usize) -> A
         if tail.pieces.len() == 1 {
             remember_window(path, stamp, Arc::clone(&tail.pieces[0]), tail.rows, true);
         }
-        set_tail_done(true, |name| path_has_session(path, name));
+        set_tail_done(true, path);
         tail.file = None;
         let finished = Arc::clone(&tail.sheet);
         let have = tail.rows;
@@ -5744,12 +5821,12 @@ mod tests {
             "ic1_total_dose,ic2_total_dose,position_x,position_y\n1,1,0,0\n2,2,4,1\n3,3,8,2\n",
         )
         .unwrap();
-        bind_slice("slice", SliceTake::Spot { rows: 2 });
+        bind_slice(&root, "slice", SliceTake::Spot { rows: 2 });
         let prefix = load_spot(&root, "slice", false, false, false);
         assert_eq!(prefix.get("ic1_dose").map(Vec::len), Some(2));
         assert!(!slice_tail_done());
         clear_slice();
-        bind_slice("slice", SliceTake::Spot { rows: 8 });
+        bind_slice(&root, "slice", SliceTake::Spot { rows: 8 });
         let rest = load_spot(&root, "slice", false, false, false);
         assert_eq!(
             rest.get("ic1_dose").map(Vec::as_slice),
@@ -5785,7 +5862,7 @@ mod tests {
             .unwrap();
         }
         for (files, tail_rows) in [(0, 2), (0, 4), (1, 2), (2, 1)] {
-            bind_slice("grow", SliceTake::Timeslice { files, tail_rows });
+            bind_slice(&root, "grow", SliceTake::Timeslice { files, tail_rows });
             let _ = load_timeslice(&root, "grow", "ic_current");
             let _ = timeslice_signals(&root, "grow");
             let _ = load_slice_metric(&root, "grow", "position_error", false);
@@ -5864,6 +5941,7 @@ mod tests {
         // files=1 parses one boundary file in-process and runs the tail file on
         // a scoped worker — the EOF publish must still reach the binder.
         bind_slice(
+            &root,
             "tailjob",
             SliceTake::Timeslice {
                 files: 1,

@@ -17,10 +17,21 @@ export function formatLogLine(
 const lines: string[] = [];
 const listeners = new Set<() => void>();
 
+let notified = false;
+
+// A log written while another component renders must not set state inside
+// that render — batch subscribers onto the microtask queue instead.
 function notify(): void {
-  for (const listener of listeners) {
-    listener();
+  if (notified) {
+    return;
   }
+  notified = true;
+  queueMicrotask(() => {
+    notified = false;
+    for (const listener of listeners) {
+      listener();
+    }
+  });
 }
 
 export function logLines(): readonly string[] {

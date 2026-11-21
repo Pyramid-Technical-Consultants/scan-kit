@@ -38,6 +38,8 @@ trait Stage: Send {
         _sessions: &[String],
         _options: &Value,
         _palette: &[[f32; 4]],
+        _background: [f32; 4],
+        _foreground: [f32; 4],
     ) -> bool {
         false
     }
@@ -54,6 +56,9 @@ struct Running {
     /// Taken out for the duration of a poll so cancel and a new start do not
     /// wait on the encode.
     stage: Option<Box<dyn Stage>>,
+    /// Last report the stage produced. A poll that arrives while another
+    /// holds the stage answers with this instead of a fabricated phase.
+    last_report: Option<Report>,
 }
 
 #[derive(Default)]
@@ -139,6 +144,9 @@ pub fn start_task(
     foreground: [f32; 4],
     palette: &[[f32; 4]],
 ) -> Result<Value, String> {
+    let mut normalized = options.clone();
+    scan_kit_io::normalize_options(&mut normalized);
+    let options = &normalized;
     let mut driver = lock();
     let slot = slot_of(view);
     if matches!(slot, Slot::Plot) {
@@ -146,7 +154,7 @@ pub fn start_task(
             if let Some(task) = driver.tasks.get_mut(&id) {
                 if let Some(stage) = task.stage.as_mut() {
                     if !task.cancel.is_cancelled()
-                        && stage.retarget(path, sessions, options, palette)
+                        && stage.retarget(path, sessions, options, palette, background, foreground)
                     {
                         task.generation = task.generation.saturating_add(1);
                         return Ok(json!({ "task": id, "generation": task.generation }));
@@ -170,6 +178,7 @@ pub fn start_task(
             generation: 1,
             cancel,
             stage: Some(stage),
+            last_report: None,
         },
     );
     // Joining the replaced worker can wait on its GPU drain — that must not
@@ -186,11 +195,11 @@ pub fn poll_task(id: u64) -> Result<Vec<u8>, String> {
             return Ok(encode_poll(&ended(id, 0, Phase::Cancelled, ""), None, true));
         };
         let Some(stage) = task.stage.take() else {
-            return Ok(encode_poll(
-                &ended(id, task.generation, Phase::Scene, ""),
-                None,
-                false,
-            ));
+            let report = task
+                .last_report
+                .clone()
+                .unwrap_or_else(|| ended(id, task.generation, Phase::Scene, ""));
+            return Ok(encode_poll(&report, None, false));
         };
         (stage, task.cancel.clone(), task.generation)
     };
@@ -221,9 +230,7 @@ pub fn poll_task(id: u64) -> Result<Vec<u8>, String> {
         }
         Poll::Failed(message) => {
             report.phase = Phase::Failed;
-            if report.note.is_empty() {
-                report.note = message;
-            }
+            report.note = message;
             (true, None, true)
         }
     };
@@ -237,6 +244,7 @@ pub fn poll_task(id: u64) -> Result<Vec<u8>, String> {
     };
     if current != generation {
         if let Some(task) = driver.tasks.get_mut(&id) {
+            task.last_report = Some(report.clone());
             task.stage = Some(stage);
         }
         return Ok(encode_poll(
@@ -249,6 +257,7 @@ pub fn poll_task(id: u64) -> Result<Vec<u8>, String> {
         driver.tasks.remove(&id);
         driver.clear(id);
     } else if let Some(task) = driver.tasks.get_mut(&id) {
+        task.last_report = Some(report.clone());
         task.stage = Some(stage);
     }
     Ok(encode_poll(&report, payload.as_deref(), finished))
@@ -276,8 +285,10 @@ pub(crate) fn drain_plot(
     foreground: [f32; 4],
     palette: &[[f32; 4]],
 ) -> Result<Vec<u8>, String> {
+    let mut options = options.clone();
+    scan_kit_io::normalize_options(&mut options);
     let mut stage = build_stage(
-        view, root, sessions, options, background, foreground, palette,
+        view, root, sessions, &options, background, foreground, palette,
     );
     // A stage may spend its first poll on setup and report Pending even with
     // an unlimited budget — keep driving until it reaches a terminal state.
@@ -760,7 +771,7 @@ impl Stage for SessionStage {
         } else {
             scan_kit_io::SliceTake::Spot { rows }
         };
-        scan_kit_io::bind_slice(&session.id, take);
+        scan_kit_io::bind_slice(&self.root, &session.id, take);
         let preview = self.view == "volumetric" && self.lattice == 0 && !unlimited;
         if preview {
             self.lattice = 1;
@@ -887,7 +898,9 @@ struct McLive {
     note: Mutex<String>,
     /// One cube per job, in the order the scene asked for them.
     preview: Mutex<Option<Vec<McResult>>>,
-    ready: Mutex<Option<Vec<McResult>>>,
+    /// `(histories the cubes satisfy, cubes)` — a retarget upward invalidates
+    /// a published cube before the worker's next loop can retract it.
+    ready: Mutex<Option<(u32, Vec<McResult>)>>,
     error: Mutex<Option<String>>,
 }
 
@@ -1008,7 +1021,8 @@ fn mc_transport(jobs: Vec<McJob>, shared: Arc<McLive>, cancel: Cancel) {
                     }
                 }
                 keep_runs(&reached, &results);
-                *locked(&shared.ready) = Some(results);
+                let satisfied = total.iter().copied().min().unwrap_or(0) as u32;
+                *locked(&shared.ready) = Some((satisfied, results));
                 shared.ready_flag.store(true, Ordering::Release);
             }
             std::thread::sleep(Duration::from_millis(20));
@@ -1126,6 +1140,22 @@ impl McPlotStage {
     }
 
     fn paint_progress(&mut self) -> Poll<Vec<u8>> {
+        // A panicked worker unwinds without touching shared.error — join it
+        // and fail instead of polling Pending forever.
+        if self
+            .worker
+            .as_ref()
+            .is_some_and(|worker| worker.is_finished())
+        {
+            if let Some(worker) = self.worker.take() {
+                let _ = worker.join();
+                if !self.shared.ready_flag.load(Ordering::Acquire)
+                    && locked(&self.shared.error).is_none()
+                {
+                    return self.fail("monte carlo worker stopped".into());
+                }
+            }
+        }
         let message = locked(&self.shared.error).clone();
         if let Some(message) = message {
             return self.fail(message);
@@ -1143,8 +1173,10 @@ impl McPlotStage {
         }
         if finished {
             let result = locked(&self.shared.ready).clone();
-            if let Some(result) = result {
-                return self.publish(&result, seq.max(self.seen), true);
+            if let Some((satisfied, result)) = result {
+                if satisfied >= self.shared.target.load(Ordering::Relaxed) {
+                    return self.publish(&result, seq.max(self.seen), true);
+                }
             }
         }
         if seq > self.seen {
@@ -1257,6 +1289,8 @@ impl Stage for McPlotStage {
         sessions: &[String],
         options: &Value,
         palette: &[[f32; 4]],
+        background: [f32; 4],
+        foreground: [f32; 4],
     ) -> bool {
         if self.worker.is_none() {
             return false;
@@ -1283,12 +1317,16 @@ impl Stage for McPlotStage {
         }
         let histories = job_histories(&jobs[0]);
         self.shared.target.store(histories, Ordering::Relaxed);
+        // Runs cannot shrink — a lower request still transports the old
+        // count, so total never drops below what the worker reports.
         self.shared
             .total
-            .store(all_histories(&jobs), Ordering::Relaxed);
+            .fetch_max(all_histories(&jobs), Ordering::Relaxed);
         self.jobs = jobs;
         self.options = options.clone();
         self.palette = palette.to_vec();
+        self.background = background;
+        self.foreground = foreground;
         true
     }
 
@@ -1783,7 +1821,10 @@ impl Stage for ExportStage {
                 }
             }
             let inputs = self.inputs.as_ref().expect("patient inputs");
-            let job = McJob::Patient(scan_kit_io::patient_view::patient_request(inputs));
+            let job = match scan_kit_io::patient_view::patient_request(inputs) {
+                Ok(request) => McJob::Patient(request),
+                Err(message) => return self.fail(message),
+            };
             // The volumetric view may have already transported this request;
             // paint that cube instead of running the histories again.
             if let Some(mut results) = kept_results(std::slice::from_ref(&job)) {
@@ -2768,6 +2809,7 @@ mod tests {
                 Running {
                     generation: 1,
                     cancel: Cancel::new(),
+                    last_report: None,
                     stage: Some(Box::new(Panic)),
                 },
             );
