@@ -482,7 +482,11 @@ pub fn patient_hash(work: &Path) -> Result<String, String> {
     ] {
         h.update(fs::read(&p).map_err(|err| format!("{p:?}: {err}"))?);
     }
-    Ok(format!("{:x}", h.finalize())[..16].to_string())
+    Ok(h.finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>()[..16]
+        .to_string())
 }
 
 /// `(lo, hi)` crop + f16 dose/let + metadata, like `write_patient_golden`.
