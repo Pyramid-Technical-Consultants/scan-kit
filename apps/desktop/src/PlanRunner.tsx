@@ -273,7 +273,13 @@ export function PlanRunner() {
           }
         },
         () => copyToken.current !== mine,
-      );
+      ).finally(() => {
+        // A failed copy throws out of driveTask — without this the bar and
+        // hairline keep reporting the last fraction forever.
+        if (copyToken.current === mine) {
+          setCopyReport(null);
+        }
+      });
       if (copyToken.current !== mine) {
         return;
       }

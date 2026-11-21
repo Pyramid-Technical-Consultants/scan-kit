@@ -268,6 +268,9 @@ export function ConfigTuning({
     const sessionId = sessionKey.split("|")[0] ?? "";
     void (async () => {
       if (dirtyRef.current && !window.confirm("Discard unsaved edits in this file?")) {
+        // The seq bump already superseded any in-flight loadFile, whose
+        // cancelled finally skips clearing — this effect owns the flag now.
+        setOpening(false);
         return;
       }
       setOpening(true);

@@ -7,7 +7,7 @@ import { PlanRunner } from "./PlanRunner";
 
 vi.mock("@tauri-apps/plugin-dialog", () => ({
   open: vi.fn(async () => "C:/plans/input_map.csv"),
-  save: vi.fn(async () => null),
+  save: vi.fn(async () => "C:/out/session.zip"),
 }));
 
 vi.mock("@tauri-apps/api/core", () => ({
@@ -95,6 +95,28 @@ vi.mock("@tauri-apps/api/core", () => ({
         device_type: "",
       };
     }
+    if (command === "scan_kit_start") {
+      return { task: 1, generation: 1 };
+    }
+    if (command === "scan_kit_poll") {
+      const report = {
+        task: 1,
+        generation: 1,
+        phase: "done",
+        done: 1,
+        total: 1,
+        note: "done",
+        finished: true,
+      };
+      const json = new TextEncoder().encode(JSON.stringify(report));
+      const out = new Uint8Array(4 + json.length);
+      new DataView(out.buffer).setUint32(0, json.length, true);
+      out.set(json, 4);
+      return out;
+    }
+    if (command === "scan_kit_cancel") {
+      return null;
+    }
     if (command === "scan_kit_runner_disconnect") {
       return {
         host: "192.168.100.184",
@@ -174,6 +196,10 @@ it("connects with the remembered host and shows the controller state", async () 
   await act(async () => {
     download?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
   });
+  expect(invoke).toHaveBeenCalledWith(
+    "scan_kit_start",
+    expect.objectContaining({ view: "runner_copy", options: { dest: "C:/out/session.zip" } }),
+  );
   await click("Disconnect");
   expect(document.body.textContent).toContain("Disconnected.");
   expect(invoke).toHaveBeenCalledWith("scan_kit_runner_upload", { path: "C:/plans/input_map.csv" });
