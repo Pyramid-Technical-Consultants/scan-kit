@@ -139,14 +139,18 @@ pub fn save_folder(
             return Err("Save the configuration beside the source folder, not inside it.".into());
         }
         // Without this the copy merges into whatever is already at dest —
-        // stale configs survive with fresh sidecars. Scoped to config files.
-        for rel in list_xml(dest).unwrap_or_default() {
-            if let Ok(stale) = under(dest, &rel) {
+        // stale configs survive with fresh sidecars. The removal runs after
+        // the copy succeeds so a copy failure never deletes destination files.
+        let stale = list_xml(dest).unwrap_or_default();
+        let kept: std::collections::HashSet<String> =
+            list_xml(source).unwrap_or_default().into_iter().collect();
+        copy_tree(source, dest, 0)?;
+        for rel in stale.iter().filter(|rel| !kept.contains(*rel)) {
+            if let Ok(stale) = under(dest, rel) {
                 let _ = fs::remove_file(&stale);
                 let _ = fs::remove_file(sidecar_path(&stale));
             }
         }
-        copy_tree(source, dest, 0)?;
     } else if !dest.exists() {
         fs::create_dir_all(dest).map_err(|err| err.to_string())?;
     }
