@@ -241,26 +241,22 @@ fn blocks(sheet: &Sheet, layer_of: &mut HashMap<String, usize>) -> Vec<Block> {
     let mut runs_of: HashMap<String, usize> = HashMap::new();
     let mut out = Vec::new();
     let mut start = 0usize;
+    // prev_eff is the open run's effective id — a ragged row inherits it
+    // rather than the previous row's raw (possibly absent) cell.
+    let mut prev_eff: Option<&str> = None;
     for row in 0..=sheet.rows.len() {
-        let prev = row
-            .checked_sub(1)
-            .and_then(|i| sheet.rows.get(i))
-            .and_then(|cells| cells.get(column))
-            .map(String::as_str);
         let cell = sheet
             .rows
             .get(row)
             .and_then(|cells| cells.get(column))
             .map(String::as_str);
-        // A ragged row missing the id cell stays in the current run instead of
-        // opening a phantom "" block that shifts every later layer ordinal.
         let id = if row < sheet.rows.len() && cell.is_none_or(|id| id.is_empty()) {
-            prev
+            prev_eff
         } else {
             cell
         };
-        if row > 0 && (row == sheet.rows.len() || id != prev) {
-            let prev_id = prev.unwrap_or("").to_owned();
+        if row > 0 && (row == sheet.rows.len() || id != prev_eff) {
+            let prev_id = prev_eff.unwrap_or("").to_owned();
             let next = layer_of.len();
             let layer = *layer_of.entry(prev_id.clone()).or_insert(next);
             let run = runs_of.entry(prev_id).or_insert(0);
@@ -273,6 +269,7 @@ fn blocks(sheet: &Sheet, layer_of: &mut HashMap<String, usize>) -> Vec<Block> {
             *run += 1;
             start = row;
         }
+        prev_eff = id;
     }
     out
 }

@@ -182,6 +182,7 @@ export function PlanRunner() {
     }
     await run(async () => {
       const next = await invoke<RunnerView>("scan_kit_runner_connect", { host: text });
+      statusFailures.current = 0;
       setView(next);
       if (next.host) {
         setHost(next.host);
@@ -192,6 +193,7 @@ export function PlanRunner() {
   async function disconnect() {
     await run(async () => {
       const next = await invoke<Catalog>("scan_kit_runner_disconnect");
+      statusFailures.current = 0;
       setView(next.view);
     });
   }

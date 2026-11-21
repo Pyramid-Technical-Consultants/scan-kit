@@ -263,7 +263,10 @@ pub fn read_ion_plan(path: &Path) -> Result<IonPlan, String> {
                 };
                 let index = plan_index;
                 plan_index += 1;
-                if (has_weights && (!mu.is_finite() || mu <= 0.0)) || energy <= 0.0 {
+                if (has_weights && (!mu.is_finite() || mu <= 0.0))
+                    || !energy.is_finite()
+                    || energy <= 0.0
+                {
                     continue;
                 }
                 spots.push(IonPlanSpot {
@@ -1178,9 +1181,10 @@ fn floats_tag(elems: &[Elem], tag: u32) -> Vec<f32> {
     while end > 0 && elem.bytes[end - 1] == 0 {
         end -= 1;
     }
-    if elem.bytes[..end]
-        .iter()
-        .any(|byte| !(byte.is_ascii_graphic() || *byte == b' '))
+    if (end == 0 && !elem.bytes.is_empty())
+        || elem.bytes[..end]
+            .iter()
+            .any(|byte| !(byte.is_ascii_graphic() || *byte == b' '))
     {
         return elem
             .bytes

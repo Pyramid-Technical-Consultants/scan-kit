@@ -391,9 +391,9 @@ fn read_cube(reader: &mut Reader<'_>, count: usize) -> Result<Vec<f32>, String> 
         at = end;
     }
     // ponytail: hard cap so a crafted header cannot force a giant alloc.
-    // A real dose grid is far under 2^26 voxels; beyond that the payload is
-    // rejected rather than swapped/oomed (4 GiB on wasm32).
-    if count > 1 << 26 {
+    // Real patient scenes ship the full CT grid (512^2 x ~300 slices is
+    // routine); 2^28 voxels is ~1 GiB of f32 and still bounded for wasm32.
+    if count > 1 << 28 {
         return Err("plot payload volume is too large".into());
     }
     let mut values = vec![0.0f32; count];

@@ -1640,7 +1640,6 @@ fn attr<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
 }
 
 fn difference(measured: &Volume, plan: &Volume) -> Volume {
-    debug_assert_eq!(measured.shape, plan.shape, "differing lattices");
     if measured.shape != plan.shape || measured.values.len() != plan.values.len() {
         return measured.clone();
     }

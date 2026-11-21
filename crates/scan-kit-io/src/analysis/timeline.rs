@@ -421,15 +421,10 @@ pub(super) fn hv_transient(root: &Path, session_ids: &[String]) -> PlotScene {
                 MARK,
             ));
             let mut counts = measured.iter().copied().collect::<Vec<_>>();
-            let mut edges = if counts.is_empty() {
-                Vec::new()
-            } else {
-                vec![0.0, 1.0]
-            };
             if let Some(expected) = expected {
                 counts.push(expected);
-                edges.push(2.0);
             }
+            let edges: Vec<f32> = (0..=counts.len()).map(|i| i as f32).collect();
             let ymax = counts.iter().copied().fold(1.0f32, f32::max);
             panels.push(panel(
                 measured
