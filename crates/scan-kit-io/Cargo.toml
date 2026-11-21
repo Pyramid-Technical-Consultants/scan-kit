@@ -30,19 +30,19 @@ krilla = "0.8.2"
 fontdue = "0.9"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-suppaftp = { version = "10.0.2", default-features = false, features = ["rustls-ring"] }
+suppaftp = { version = "13.0.0", default-features = false, features = ["rustls-ring"] }
 ureq = { version = "3", default-features = false, features = ["native-tls-no-default"] }
 rustls-native-certs = "0.8"
-trash = "5.2.9"
+trash = "5.4.0"
 
 # Windows libssh2 uses WinCNG. Unix builds OpenSSL from source; that needs Perl.
 [target.'cfg(all(not(target_arch = "wasm32"), windows))'.dependencies]
-ssh2 = "0.9.6"
+ssh2 = "0.9.7"
 
 [target.'cfg(all(not(target_arch = "wasm32"), unix))'.dependencies]
 # Feature unification only: vendored OpenSSL for ureq. The code does not call this crate.
 native-tls = { version = "0.2", features = ["vendored"] }
-ssh2 = { version = "0.9.6", features = ["vendored-openssl"] }
+ssh2 = { version = "0.9.7", features = ["vendored-openssl"] }
 
 [package.metadata.cargo-machete]
 ignored = ["native-tls"]

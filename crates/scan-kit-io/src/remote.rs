@@ -617,29 +617,24 @@ mod net {
         }
 
         fn read(&mut self, path: &str) -> Result<Option<Vec<u8>>, String> {
-            let mut stream: Box<dyn Read> = match &mut self.client {
-                FtpClient::Plain(ftp) => match ftp.retr_as_stream(path) {
-                    Ok(stream) => Box::new(stream),
-                    Err(err) if missing_ftp(&err) => return Ok(None),
-                    Err(err) => return Err(map_ftp(err)),
-                },
-                FtpClient::Tls(ftp) => match ftp.retr_as_stream(path) {
-                    Ok(stream) => Box::new(stream),
-                    Err(err) if missing_ftp(&err) => return Ok(None),
-                    Err(err) => return Err(map_ftp(err)),
-                },
-            };
             let mut bytes = Vec::new();
-            let read = stream
-                .by_ref()
-                .take(MAX_OBJECT_BYTES + 1)
-                .read_to_end(&mut bytes);
-            let finalize = match &mut self.client {
-                FtpClient::Plain(ftp) => ftp.finalize_retr_stream(stream),
-                FtpClient::Tls(ftp) => ftp.finalize_retr_stream(stream),
+            let mut read_all = |reader: &mut dyn Read| {
+                reader
+                    .take(MAX_OBJECT_BYTES + 1)
+                    .read_to_end(&mut bytes)
+                    .map_err(suppaftp::FtpError::ConnectionError)
             };
-            read.map_err(|err| err.to_string())?;
-            finalize.map_err(map_ftp)?;
+            // retr reads the stream and finishes the transfer in one call,
+            // reporting the reader's error before the finalize's.
+            let result = match &mut self.client {
+                FtpClient::Plain(ftp) => ftp.retr(path, &mut read_all),
+                FtpClient::Tls(ftp) => ftp.retr(path, &mut read_all),
+            };
+            match result {
+                Ok(_) => {}
+                Err(err) if missing_ftp(&err) => return Ok(None),
+                Err(err) => return Err(map_ftp(err)),
+            }
             if bytes.len() as u64 > MAX_OBJECT_BYTES {
                 return Err(format!("{path} is bigger than {MAX_OBJECT_BYTES} bytes"));
             }
