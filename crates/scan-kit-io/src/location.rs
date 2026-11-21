@@ -322,9 +322,12 @@ pub(crate) fn fixture_copies(spec: &str) -> u32 {
 fn materialize(library_canonical: &str, session_url: &str) -> Result<PathBuf, String> {
     let session = require_remote(session_url)?;
     let relative = relative_remote(library_canonical, &session);
-    // A `..` segment — typed in the URL or carried by a server-side name —
-    // would let the cache write outside its own directory.
-    if relative.split(['/', '\\']).any(|part| part == "..") {
+    // Only plain relative segments may join the cache — a `..` escapes it, and
+    // on Windows `join("C:/evil")` discards the base entirely.
+    if !Path::new(&relative)
+        .components()
+        .all(|part| matches!(part, std::path::Component::Normal(_)))
+    {
         return Err("remote session path escapes the cache directory".into());
     }
     let dest = cache_directory(library_canonical).join(&relative);
@@ -432,7 +435,17 @@ fn walk_remote(
     }
     let mut dirs = Vec::new();
     let mut files = Vec::new();
-    for item in fs.list(path)? {
+    // The library root itself must list; an unreadable child matches the local
+    // walk — skip it instead of failing the whole discovery.
+    let items = match fs.list(path) {
+        Ok(items) => items,
+        Err(err) if depth == 0 => return Err(err),
+        Err(_) => {
+            skipped.push(rel.to_owned());
+            return Ok(());
+        }
+    };
+    for item in items {
         if item.name.is_empty() || item.name == "." || item.name == ".." {
             continue;
         }
@@ -448,19 +461,23 @@ fn walk_remote(
     for name in &dirs {
         let child = join_path(path, name);
         let child_rel = join_rel(rel, name);
-        if is_remote_session(fs, &child, name)? {
-            let url = join_rel(library_url, &child_rel);
-            discover::add_directory(
-                entries,
-                skipped,
-                Discovered {
-                    session_id: name.clone(),
-                    storage_path: PathBuf::from(&url),
-                    kind: "directory",
-                },
-                &child_rel,
-            );
-            sessions.push(name.clone());
+        match is_remote_session(fs, &child, name) {
+            Ok(true) => {
+                let url = join_rel(library_url, &encode_path(&child_rel));
+                discover::add_directory(
+                    entries,
+                    skipped,
+                    Discovered {
+                        session_id: name.clone(),
+                        storage_path: PathBuf::from(&url),
+                        kind: "directory",
+                    },
+                    &child_rel,
+                );
+                sessions.push(name.clone());
+            }
+            Ok(false) => {}
+            Err(_) => skipped.push(child_rel.clone()),
         }
     }
     for name in &files {
@@ -468,7 +485,7 @@ fn walk_remote(
             continue;
         };
         let child_rel = join_rel(rel, name);
-        let url = join_rel(library_url, &child_rel);
+        let url = join_rel(library_url, &encode_path(&child_rel));
         archives.push((
             Discovered {
                 session_id,
@@ -484,10 +501,17 @@ fn walk_remote(
         }
         let child = join_path(path, name);
         let child_rel = join_rel(rel, name);
-        let url = join_rel(library_url, &child_rel);
-        if let Some(exam) = remote_exam(fs, &child, name, &url)? {
-            discover::add_exam(exams, skipped, exam, &child_rel);
-            continue;
+        let url = join_rel(library_url, &encode_path(&child_rel));
+        match remote_exam(fs, &child, name, &url) {
+            Ok(Some(exam)) => {
+                discover::add_exam(exams, skipped, exam, &child_rel);
+                continue;
+            }
+            Ok(None) => {}
+            Err(_) => {
+                skipped.push(child_rel);
+                continue;
+            }
         }
         walk_remote(
             fs,
@@ -694,7 +718,7 @@ fn canonical_url(remote: &Remote, query: &str) -> String {
         host_text(&remote.host),
         port_text(remote.port)
     );
-    url.push_str(&remote.path);
+    url.push_str(&encode_path(&remote.path));
     if !query.is_empty() {
         url.push('?');
         url.push_str(query);
@@ -850,11 +874,28 @@ fn percent_decode(text: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+// The decoded path carries real `?`/`#`/`%` bytes that would reparse into a
+// different URL — the canonical form must be a faithful encoding.
+fn encode_path(text: &str) -> String {
+    let mut out = String::new();
+    for byte in text.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'/' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char)
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
 fn encode_user(text: &str) -> String {
     let mut out = String::new();
     for byte in text.bytes() {
         match byte {
-            b'@' | b':' | b'/' | b'%' | b'?' | b'#' | b' ' => {
+            // `byte as char` on a UTF-8 byte above 0x7F emits mojibake — encode
+            // non-ASCII so the reparsed username is byte-identical.
+            b'@' | b':' | b'/' | b'%' | b'?' | b'#' | b' ' | 0x80.. => {
                 out.push_str(&format!("%{byte:02X}"));
             }
             _ => out.push(byte as char),
@@ -1168,6 +1209,27 @@ mod tests {
             Path::new("sftp://pyramid@192.168.101.206/var/log/ptc_ex").to_string_lossy(),
             "sftp://pyramid@192.168.101.206/var/log/ptc_ex"
         );
+    }
+
+    #[test]
+    fn the_canonical_url_reparses_to_the_same_path_and_user() {
+        // A decoded `?`/`%`/`#` in the path used to reparse as structure —
+        // the canonical must round-trip byte-identically.
+        let canonical = canonical_root("sftp://host.invalid/data%3Fsub/x%25y").unwrap();
+        let remote = match classify(&canonical).unwrap() {
+            Kind::Remote(remote) => remote,
+            Kind::Local(_) => panic!("sftp is remote"),
+        };
+        assert_eq!(remote.path, "/data?sub/x%y");
+        assert_eq!(remote.canonical, canonical);
+
+        let canonical = canonical_root("sftp://jos%C3%A9@host.invalid/lib").unwrap();
+        let remote = match classify(&canonical).unwrap() {
+            Kind::Remote(remote) => remote,
+            Kind::Local(_) => panic!("sftp is remote"),
+        };
+        assert_eq!(remote.username, "josé");
+        assert_eq!(remote.canonical, canonical);
     }
 
     #[test]

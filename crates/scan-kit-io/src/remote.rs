@@ -14,6 +14,8 @@ use crate::location::{self, Remote};
 pub(crate) struct Item {
     pub name: String,
     pub dir: bool,
+    pub size: u64,
+    pub mtime_ns: i64,
 }
 
 pub(crate) struct Stat {
@@ -233,7 +235,12 @@ fn list_memory(files: &BTreeMap<String, Vec<u8>>, dir: &str) -> Vec<Item> {
             .or_insert(dir);
     }
     seen.into_iter()
-        .map(|(name, dir)| Item { name, dir })
+        .map(|(name, dir)| Item {
+            name,
+            dir,
+            size: 0,
+            mtime_ns: 0,
+        })
         .collect()
 }
 
@@ -421,6 +428,10 @@ mod net {
                 items.push(Item {
                     name: name.to_owned(),
                     dir: stat.is_dir(),
+                    size: stat.size.unwrap_or(0),
+                    mtime_ns: i64::try_from(stat.mtime.unwrap_or(0))
+                        .unwrap_or(0)
+                        .saturating_mul(1_000_000_000),
                 });
             }
             Ok(items)
@@ -441,7 +452,9 @@ mod net {
                 Ok(stat) => Ok(Some(Stat {
                     dir: stat.is_dir(),
                     size: stat.size.unwrap_or(0),
-                    mtime_ns: i64::try_from(stat.mtime.unwrap_or(0)).unwrap_or(0) * 1_000_000_000,
+                    mtime_ns: i64::try_from(stat.mtime.unwrap_or(0))
+                        .unwrap_or(0)
+                        .saturating_mul(1_000_000_000),
                 })),
                 Err(err) if missing_sftp(&err) => Ok(None),
                 Err(err) => Err(map_sftp(err)),
@@ -545,28 +558,47 @@ mod net {
             } else {
                 password
             };
+            // connect_timeout only bounds the handshake — without socket
+            // timeouts a silent or stalled server hangs every command and
+            // transfer forever. Same pattern as SftpFs::connect.
+            let control =
+                std::net::TcpStream::connect_timeout(&address, location::connect_timeout())
+                    .map_err(|err| err.to_string())?;
+            let _ = control.set_read_timeout(Some(location::connect_timeout()));
+            let _ = control.set_write_timeout(Some(location::connect_timeout()));
+            let data = |addr: std::net::SocketAddr| {
+                let socket =
+                    std::net::TcpStream::connect_timeout(&addr, location::connect_timeout())
+                        .map_err(suppaftp::FtpError::ConnectionError)?;
+                let _ = socket.set_read_timeout(Some(location::connect_timeout()));
+                let _ = socket.set_write_timeout(Some(location::connect_timeout()));
+                Ok(socket)
+            };
             let client = if tls {
                 let config = tls_config()?;
-                let stream = suppaftp::RustlsFtpStream::connect_timeout(
-                    address,
-                    location::connect_timeout(),
-                )
-                .map_err(map_ftp)?
-                .into_secure(
-                    suppaftp::RustlsConnector::from(Arc::new(config)),
-                    remote.host.trim_matches(['[', ']']),
-                )
-                .map_err(map_ftp)?;
-                let mut stream = stream;
+                let mut stream = suppaftp::RustlsFtpStream::connect_with_stream(control)
+                    .map_err(map_ftp)?
+                    .passive_stream_builder(data)
+                    .into_secure(
+                        suppaftp::RustlsConnector::from(Arc::new(config)),
+                        remote.host.trim_matches(['[', ']']),
+                    )
+                    .map_err(map_ftp)?;
                 login_tls(&mut stream, user, secret)?;
-                let _ = stream.transfer_type(suppaftp::types::FileType::Binary);
+                // Refusing TYPE I would leave downloads in ASCII mode, where the
+                // server rewrites line endings and corrupts the payload.
+                stream
+                    .transfer_type(suppaftp::types::FileType::Binary)
+                    .map_err(map_ftp)?;
                 FtpClient::Tls(stream)
             } else {
-                let mut stream =
-                    suppaftp::FtpStream::connect_timeout(address, location::connect_timeout())
-                        .map_err(map_ftp)?;
+                let mut stream = suppaftp::FtpStream::connect_with_stream(control)
+                    .map_err(map_ftp)?
+                    .passive_stream_builder(data);
                 login_plain(&mut stream, user, secret)?;
-                let _ = stream.transfer_type(suppaftp::types::FileType::Binary);
+                stream
+                    .transfer_type(suppaftp::types::FileType::Binary)
+                    .map_err(map_ftp)?;
                 FtpClient::Plain(stream)
             };
             Ok(Self { client })
@@ -604,13 +636,21 @@ mod net {
                 if file.is_symlink() {
                     continue;
                 }
-                let name = file.name().trim();
+                // Leading/trailing spaces are legal in FTP names — trimming
+                // would silently rename the entry the server reported.
+                let name = file.name();
                 if name.is_empty() || name == "." || name == ".." {
                     continue;
                 }
                 items.push(Item {
                     name: name.to_owned(),
                     dir: file.is_directory(),
+                    size: file.size() as u64,
+                    mtime_ns: file
+                        .modified()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|span| i64::try_from(span.as_nanos()).unwrap_or(i64::MAX))
+                        .unwrap_or(0),
                 });
             }
             Ok(items)
@@ -720,6 +760,13 @@ mod net {
 
     fn stat_from_list(fs: &mut FtpFs, path: &str) -> Result<Option<Stat>, String> {
         let path = path.trim_end_matches('/');
+        if path.is_empty() {
+            return Ok(Some(Stat {
+                dir: true,
+                size: 0,
+                mtime_ns: 0,
+            }));
+        }
         let Some((parent, name)) = path.rfind('/').map(|index| {
             let parent = if index == 0 { "/" } else { &path[..index] };
             (parent, &path[index + 1..])
@@ -730,8 +777,8 @@ mod net {
             if item.name == name {
                 return Ok(Some(Stat {
                     dir: item.dir,
-                    size: 0,
-                    mtime_ns: 0,
+                    size: item.size,
+                    mtime_ns: item.mtime_ns,
                 }));
             }
         }
@@ -775,7 +822,8 @@ mod net {
         let minute: i64 = text[10..12].parse().unwrap_or(0);
         let second: i64 = text[12..14].parse().unwrap_or(0);
         let days = days_from_civil(year, month, day);
-        (days * 86_400 + hour * 3_600 + minute * 60 + second) * 1_000_000_000
+        // A server-supplied modify year can overflow the nanosecond multiply.
+        (days * 86_400 + hour * 3_600 + minute * 60 + second).saturating_mul(1_000_000_000)
     }
 
     fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
@@ -790,8 +838,10 @@ mod net {
 
     fn missing_ftp(err: &suppaftp::FtpError) -> bool {
         match err {
+            // 450 is a transient "file busy" — treating it as missing makes a
+            // locked file silently vanish from discovery.
             suppaftp::FtpError::UnexpectedResponse(response) => {
-                matches!(response.status as u32, 450 | 550)
+                matches!(response.status as u32, 550)
             }
             _ => false,
         }
@@ -815,8 +865,10 @@ mod net {
 
     fn ftp_auth(err: &suppaftp::FtpError) -> bool {
         match err {
+            // 421 is "service not available" (a busy/restarting server), not a
+            // credential failure — mapping it to an auth prompt can never win.
             suppaftp::FtpError::UnexpectedResponse(response) => {
-                matches!(response.status as u32, 332 | 421 | 530)
+                matches!(response.status as u32, 332 | 530)
             }
             _ => {
                 let text = err.to_string().to_ascii_lowercase();

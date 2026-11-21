@@ -114,18 +114,10 @@ pub fn save_folder(
             source.display()
         ));
     }
-    let source_key = folder_key(source);
-    let dest_key = folder_key(dest);
-    if source_key != dest_key {
-        if dest_key.starts_with(&format!("{source_key}/")) {
-            return Err("Save the configuration beside the source folder, not inside it.".into());
-        }
-        copy_tree(source, dest, 0)?;
-    } else if !dest.exists() {
-        fs::create_dir_all(dest).map_err(|err| err.to_string())?;
-    }
-    let written = files.as_array().ok_or("files must be a list")?;
-    for file in written {
+    // Validate every write up front — a malformed save must not leave a
+    // half-copied destination behind.
+    let mut writes = Vec::new();
+    for file in files.as_array().ok_or("files must be a list")? {
         let rel = file
             .get("rel")
             .and_then(Value::as_str)
@@ -137,6 +129,28 @@ pub fn save_folder(
         if !xml.trim_start().starts_with('<') {
             return Err(format!("{rel} is not XML"));
         }
+        under(dest, rel)?;
+        writes.push((rel, xml));
+    }
+    let source_key = folder_key(source);
+    let dest_key = folder_key(dest);
+    if source_key != dest_key {
+        if dest_key.starts_with(&format!("{source_key}/")) {
+            return Err("Save the configuration beside the source folder, not inside it.".into());
+        }
+        // Without this the copy merges into whatever is already at dest —
+        // stale configs survive with fresh sidecars. Scoped to config files.
+        for rel in list_xml(dest).unwrap_or_default() {
+            if let Ok(stale) = under(dest, &rel) {
+                let _ = fs::remove_file(&stale);
+                let _ = fs::remove_file(sidecar_path(&stale));
+            }
+        }
+        copy_tree(source, dest, 0)?;
+    } else if !dest.exists() {
+        fs::create_dir_all(dest).map_err(|err| err.to_string())?;
+    }
+    for (rel, xml) in &writes {
         let target = under(dest, rel)?;
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent).map_err(|err| err.to_string())?;
