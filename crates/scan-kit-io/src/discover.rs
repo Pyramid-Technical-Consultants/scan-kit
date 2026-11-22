@@ -1045,6 +1045,9 @@ mod tests {
             b"a,b\n1,2\n",
         )
         .unwrap();
+        // The watch is mtime-based — outlast coarse-granularity filesystems so
+        // the new run directory's timestamp visibly differs.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
         assert_ne!(timeslice_stamp(&storage), first);
         assert_eq!(list_timeslice_paths(&storage).len(), 1);
         let _ = fs::remove_dir_all(&root);

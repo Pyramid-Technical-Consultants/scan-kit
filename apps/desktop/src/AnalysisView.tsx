@@ -670,7 +670,7 @@ export function AnalysisView({
 
   const orderKey = sessions.map((session) => session.id).join("\0");
   const hiddenKey = hidden.join("\0");
-  const sceneKey = viewId === "volumetric" ? JSON.stringify(sceneOptions(options)) : options;
+  const sceneKey = viewId === "volumetric" ? JSON.stringify(sceneOptions(options, studyPath != null)) : options;
   const pictureKey = JSON.stringify([
     viewId,
     folder,

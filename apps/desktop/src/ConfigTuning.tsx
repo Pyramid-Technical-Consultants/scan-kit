@@ -284,6 +284,7 @@ export function ConfigTuning({
         }
         setConfigDir(opened.path);
         setFiles(opened.files);
+        clearEditor();
         const preferred = opened.files.find((name) => name.endsWith("devices.xml")) ?? opened.files[0];
         if (preferred != null) {
           if (await loadFile(joinPath(opened.path, preferred), () => cancel || seq !== openSeq.current)) {
@@ -291,7 +292,7 @@ export function ConfigTuning({
           }
         }
       } finally {
-        if (!cancel) {
+        if (!cancel && seq === openSeq.current) {
           setOpening(false);
         }
       }
@@ -372,6 +373,15 @@ export function ConfigTuning({
     };
   }, [previewRequest]);
 
+  function clearEditor() {
+    setXml("");
+    setForm(null);
+    setIntegrity(null);
+    setFile("");
+    setDirty(false);
+    setPreview(null);
+  }
+
   async function loadFile(path: string, cancelled: () => boolean = () => false): Promise<boolean> {
     setOpening(true);
     try {
@@ -413,6 +423,7 @@ export function ConfigTuning({
       }
       setConfigDir(opened.path ?? "");
       setFiles(opened.files);
+      clearEditor();
       const preferred = opened.files.find((name) => name.endsWith("devices.xml")) ?? opened.files[0] ?? "";
       if (preferred.length > 0 && opened.path != null) {
         if (await loadFile(joinPath(opened.path, preferred), () => seq !== openSeq.current)) {

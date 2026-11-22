@@ -84,7 +84,7 @@ export function PhantomSynthesis() {
             setPreviewing(false);
           }
         });
-    }, 0);
+    }, 250);
     return () => {
       cancel = true;
       window.clearTimeout(arm);

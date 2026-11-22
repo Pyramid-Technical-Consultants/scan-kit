@@ -65,6 +65,10 @@ it("writes a phantom study from the catalog defaults", async () => {
     root = createRoot(host);
     root.render(<PhantomSynthesis />);
   });
+  // The preview is debounced — let the timer fire before asserting.
+  await act(async () => {
+    await new Promise((resolve) => setTimeout(resolve, 300));
+  });
   expect(document.body.textContent).toContain("CT 80×80×70");
   expect(document.body.textContent).toContain("Water box, bone and lung slabs");
   const button = [...document.body.querySelectorAll("button")].find((item) => item.textContent === "Write DICOM");

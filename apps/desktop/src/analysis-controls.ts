@@ -206,9 +206,14 @@ function monteCarloModel(model: string | undefined): boolean {
   return model === "mc" || model === "Monte Carlo";
 }
 
-export function sceneOptions(options: Readonly<Record<string, string>>): Record<string, string> {
+export function sceneOptions(
+  options: Readonly<Record<string, string>>,
+  studyTransport = false,
+): Record<string, string> {
   const rest: Record<string, string> = {};
-  const transport = monteCarloModel(options.model);
+  // Patient volumetric views carry no `model` control — their transport is MC
+  // whenever a study is open, so the caller passes that in.
+  const transport = monteCarloModel(options.model) || studyTransport;
   for (const [key, value] of Object.entries(options)) {
     if ((DOSE_PAINT_IDS as readonly string[]).includes(key) || key === "plot0" || key === "plot1") {
       continue;
