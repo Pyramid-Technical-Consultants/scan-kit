@@ -86,7 +86,7 @@ fn lock() -> std::sync::MutexGuard<'static, Driver> {
     driver().lock().unwrap_or_else(|err| err.into_inner())
 }
 
-enum Slot {
+pub(crate) enum Slot {
     Plot,
     Library,
     Copy,
@@ -360,7 +360,7 @@ pub(crate) fn drain_task(
     drain_plot(view, root, sessions, options, [0.0; 4], [0.0; 4], &[])
 }
 
-fn slot_of(view: &str) -> Slot {
+pub(crate) fn slot_of(view: &str) -> Slot {
     match view {
         "library" => Slot::Library,
         "runner_copy" => Slot::Copy,
@@ -1857,6 +1857,11 @@ impl Stage for ExportStage {
             self.report.phase = Phase::Cancelled;
             return Poll::Cancelled;
         }
+        if self.run.is_none() && self.inputs.is_none() && self.dest.trim().is_empty() {
+            // Fail before patient_inputs walks the study and McRun burns the
+            // transport — the missing dest can only fail at write time.
+            return self.fail("dest is required".into());
+        }
         if self.run.is_none() {
             if self.inputs.is_none() {
                 match scan_kit_io::patient_view::patient_inputs(
@@ -2825,6 +2830,16 @@ mod tests {
         )
         .expect_err("a missing study cannot export");
         assert_ne!(message, "plot did not finish");
+    }
+
+    #[test]
+    fn an_export_without_dest_fails_before_the_transport() {
+        // The Tauri surface can start an export with no dest — it used to
+        // run the whole Monte Carlo and only then fail on an empty path.
+        let root = scratch();
+        let message = drain_task("write_dose", &root, &[], &json!({}))
+            .expect_err("a missing dest cannot export");
+        assert!(message.contains("dest is required"), "{message}");
         let _ = std::fs::remove_dir_all(&root);
     }
 
