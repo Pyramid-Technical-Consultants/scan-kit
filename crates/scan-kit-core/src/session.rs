@@ -125,6 +125,14 @@ impl SummaryDate {
             return None;
         }
         let second: u32 = second_text.split('.').next()?.parse().ok()?;
+        if !(1..=12).contains(&month)
+            || !(1..=31).contains(&day)
+            || hour > 23
+            || minute > 59
+            || second > 60
+        {
+            return None;
+        }
         Some(Self {
             year,
             month,
@@ -177,11 +185,11 @@ pub fn parse_termination_summary_text(text: &str) -> SessionMeta {
             }
         } else if line.starts_with("Treatment time:") {
             if let Some(parsed) = labeled_number(line, "Treatment time") {
-                treatment_s = Some(parsed as i32);
+                treatment_s = i32::try_from(parsed as i64).ok();
             }
         } else if line.starts_with("Room number:") {
             if let Some(parsed) = labeled_number(line, "Room number") {
-                room_number = Some(parsed as i32);
+                room_number = i32::try_from(parsed as i64).ok();
             }
         } else if let Some(rest) = labeled(line, "Configuration name") {
             let name = rest.trim();
@@ -240,7 +248,7 @@ fn parse_layer_delivery(line: &str) -> Option<i32> {
     if let Some((_, planned)) = rest.split_once('/') {
         rest = planned.trim();
     }
-    Some(leading_number(rest)? as i32)
+    i32::try_from(leading_number(rest)? as i64).ok()
 }
 
 fn leading_number(text: &str) -> Option<f64> {
@@ -269,6 +277,20 @@ fn leading_number(text: &str) -> Option<f64> {
     }
     if !saw_digit {
         return None;
+    }
+    if index < bytes.len() && matches!(bytes[index], b'e' | b'E') {
+        let mantissa = index;
+        index += 1;
+        if index < bytes.len() && matches!(bytes[index], b'+' | b'-') {
+            index += 1;
+        }
+        let digits = index;
+        while index < bytes.len() && bytes[index].is_ascii_digit() {
+            index += 1;
+        }
+        if index == digits {
+            index = mantissa;
+        }
     }
     text[..index].parse().ok()
 }
@@ -457,5 +479,18 @@ Configuration name: working_no_hvttt_new_cal
         for bad in ["", ".", "..", "a/b", "a\\b", "C:victim", "d:"] {
             assert!(!valid_session_id(bad), "{bad:?} must not be a session id");
         }
+    }
+
+    #[test]
+    fn parse_iso_rejects_out_of_range_fields() {
+        assert!(SummaryDate::parse_iso("2024-13-45T25:61:99").is_none());
+        assert!(SummaryDate::parse_iso("2024-12-31T23:59:59").is_some());
+    }
+
+    #[test]
+    fn leading_number_keeps_the_exponent() {
+        assert_eq!(leading_number("1.2e2"), Some(120.0));
+        assert_eq!(leading_number("1.2e"), Some(1.2));
+        assert_eq!(leading_number("1.2e-2"), Some(0.012));
     }
 }

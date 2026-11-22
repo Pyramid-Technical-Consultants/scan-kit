@@ -244,7 +244,11 @@ impl Parser<'_> {
                     self.expect(b'=')?;
                     self.skip_ws();
                     let value = self.quoted()?;
-                    attrs.push((key, value));
+                    if let Some(slot) = attrs.iter_mut().find(|(have, _)| *have == key) {
+                        slot.1 = value;
+                    } else {
+                        attrs.push((key, value));
+                    }
                 }
                 None => return Err("unterminated XML start tag".into()),
             }
@@ -440,5 +444,13 @@ mod tests {
         assert!(parse_xml(&deep).unwrap_err().contains("deeply"));
         let flat = format!("<root>{}</root>", "<a/>".repeat(3000));
         assert!(parse_xml(&flat).is_ok());
+    }
+
+    #[test]
+    fn a_duplicate_attribute_keeps_the_last_value() {
+        let elem = parse_xml("<e a=\"1\" a=\"2\"/>").unwrap();
+        assert_eq!(elem.attr("a"), Some("2"));
+        let out = write_xml(&elem);
+        assert_eq!(out.matches("a=").count(), 1);
     }
 }

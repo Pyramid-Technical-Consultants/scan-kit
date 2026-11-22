@@ -241,7 +241,7 @@ fn tune_sigma(
                     continue;
                 }
                 let new_k0 = band_k0(&samples, tolerance, headroom);
-                if !new_k0.is_finite() {
+                if !new_k0.is_finite() || new_k0 <= 0.0 {
                     continue;
                 }
                 let inside_after = inside_fraction(&samples, new_k0, tolerance);
@@ -467,11 +467,12 @@ fn tune_offset(
             warnings.push(format!("Could not compute offset correction for {device}."));
             continue;
         }
-        let old = chamber.children[offset_index]
-            .text
-            .trim()
-            .parse::<f64>()
-            .unwrap_or(0.0);
+        let Ok(old) = chamber.children[offset_index].text.trim().parse::<f64>() else {
+            warnings.push(format!(
+                "{device}: unreadable stored offset, left unchanged."
+            ));
+            continue;
+        };
         let new_offset = old - correction;
         if correction.abs() > max_correction {
             max_correction = correction.abs();
@@ -617,9 +618,24 @@ fn tune_distance(
                 off_after.clone()
             };
         processed += 1;
-        if sdd_after != sdd_before || off_after != off_before {
+        let mut wrote = false;
+        if !old_sdd.is_finite() {
+            warnings.push(format!(
+                "{device}: unreadable source_to_device_distance_mm, left unchanged."
+            ));
+        } else if sdd_after != sdd_before {
             chamber.children[sdd_index].text = sdd_after.clone();
+            wrote = true;
+        }
+        if !old_offset.is_finite() {
+            warnings.push(format!(
+                "{device}: unreadable zero_offset_at_iso_mm, left unchanged."
+            ));
+        } else if off_after != off_before {
             chamber.children[offset_index].text = off_after.clone();
+            wrote = true;
+        }
+        if wrote {
             updates += 1;
         }
         if delta_pct.abs() > largest.2.abs() {
@@ -1047,15 +1063,14 @@ fn mu_gain(chamber: &Elem) -> Option<(Vec<usize>, String, f64)> {
 
 fn family_of(name: &str) -> Option<usize> {
     let upper = name.trim().to_ascii_uppercase();
-    if upper.starts_with("IC_1") {
-        Some(0)
-    } else if upper.starts_with("IC_2") {
-        Some(1)
-    } else if upper.starts_with("IC_3") {
-        Some(2)
-    } else {
-        None
+    for (index, prefix) in ["IC_1", "IC_2", "IC_3"].iter().enumerate() {
+        if let Some(rest) = upper.strip_prefix(prefix) {
+            if rest.is_empty() || rest.starts_with('_') {
+                return Some(index);
+            }
+        }
     }
+    None
 }
 
 fn device_on_path(root: &Elem, path: &[usize]) -> String {
@@ -1142,7 +1157,7 @@ fn band_k0(sigmas: &[f64], tolerance: f64, headroom: f64) -> f64 {
     let min = sigmas
         .iter()
         .copied()
-        .filter(|value| value.is_finite())
+        .filter(|value| value.is_finite() && *value > 0.0)
         .fold(f64::INFINITY, f64::min);
     if !min.is_finite() {
         return f64::NAN;
@@ -1642,5 +1657,19 @@ mod tests {
         let summary = result["summary"].as_str().unwrap();
         assert!(summary.contains("Max correction: 0.400 mm"));
         assert!(result["xml"].as_str().unwrap().contains("0.6"));
+    }
+
+    #[test]
+    fn family_of_requires_a_name_boundary() {
+        assert_eq!(family_of("IC_1_X"), Some(0));
+        assert_eq!(family_of("IC_2_HCC"), Some(1));
+        assert_eq!(family_of("IC_10_X"), None);
+        assert_eq!(family_of("IC_1X"), None);
+    }
+
+    #[test]
+    fn band_k0_ignores_nonpositive_samples() {
+        assert!(band_k0(&[0.0, -1.0], 20.0, 5.0).is_nan());
+        assert!(band_k0(&[0.0, 4.0], 20.0, 5.0).is_finite());
     }
 }
