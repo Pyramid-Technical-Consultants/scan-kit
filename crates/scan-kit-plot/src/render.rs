@@ -2676,6 +2676,7 @@ impl Plot {
                             cloud.y0,
                             cloud.y1,
                             cloud.cols.max(1) as usize,
+                            cloud.rows.max(1) as usize,
                         );
                         let pixels = heatmap_bytes(
                             &counts,
@@ -3356,12 +3357,13 @@ impl Plot {
             center: self.pan,
         };
         let prepared = crate::dose::prepare_plane(grid, &view);
+        let limits = crate::dose::integral_limits(grid, view.plane);
         let (x_lo, y_lo, x_hi, y_hi) = clip_pixels(cell.plot, width, height);
         for y in (top.floor() as i64).max(y_lo)..=(bottom.ceil() as i64).min(y_hi) {
             for x in (left.floor() as i64).max(x_lo)..=(right.ceil() as i64).min(x_hi) {
                 let u = ((x as f32 - left) / span_x).clamp(0.0, 1.0);
                 let v = ((y as f32 - top) / span_y).clamp(0.0, 1.0);
-                let color = crate::dose::shade_uv(grid, &view, prepared.as_ref(), [u, v]);
+                let color = crate::dose::shade_uv(grid, &view, prepared.as_ref(), limits, [u, v]);
                 blend(
                     frame,
                     width,
@@ -9100,7 +9102,13 @@ fn carried_cursor(
         }
         let mm = from_origin[axis] + (previous[axis] as f32 + 0.5) * from_spacing[axis];
         let index = ((mm - to_origin[axis]) / to_spacing[axis] - 0.5).round();
-        cursor[axis] = index.clamp(0.0, last as f32) as usize;
+        // NaN payload origins reach here — clamp panics on NaN, so fall back
+        // to the previous cursor like the non-positive spacing arm does.
+        cursor[axis] = if index.is_finite() {
+            index.clamp(0.0, last as f32) as usize
+        } else {
+            previous[axis].min(last)
+        };
     }
     cursor
 }
@@ -9110,6 +9118,27 @@ fn unit(value: [f32; 3]) -> [f32; 3] {
         .sqrt()
         .max(1.0e-8);
     [value[0] / length, value[1] / length, value[2] / length]
+}
+
+#[cfg(test)]
+mod cursor_tests {
+    use super::carried_cursor;
+
+    #[test]
+    fn a_nan_target_origin_keeps_the_previous_cursor() {
+        // `NaN as usize` is 0 — the carried cursor would snap to the first
+        // slice instead of staying where the user left it.
+        let cursor = carried_cursor(
+            [5, 7, 9],
+            [0.0, 0.0, 0.0],
+            [1.0, 1.0, 1.0],
+            [10, 10, 10],
+            [f32::NAN, 0.0, 0.0],
+            [1.0, 1.0, 1.0],
+            [10, 10, 10],
+        );
+        assert_eq!(cursor, [5, 7, 9]);
+    }
 }
 
 #[cfg(test)]

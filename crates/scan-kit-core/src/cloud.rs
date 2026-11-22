@@ -74,7 +74,7 @@ pub fn cloud_series(xs: &[f32], ys: &[f32], times: &[f32], draw: CloudDraw) -> V
             y0,
             y1,
         } => {
-            let values = count_grid(xs, ys, x0, x1, y0, y1, CLOUD_BINS);
+            let values = count_grid(xs, ys, x0, x1, y0, y1, CLOUD_BINS, CLOUD_BINS);
             let mut drawn = vec![Series::Heatmap {
                 values,
                 cols: CLOUD_BINS as u32,
@@ -146,7 +146,7 @@ pub fn contour_in_frame(
     if inside < 20 {
         return Vec::new();
     }
-    let counts = count_grid(xs, ys, x0, x1, y0, y1, CLOUD_BINS);
+    let counts = count_grid(xs, ys, x0, x1, y0, y1, CLOUD_BINS, CLOUD_BINS);
     let dx = (x1 - x0) / CLOUD_BINS as f32;
     let dy = (y1 - y0) / CLOUD_BINS as f32;
     contour_marks(&counts, CLOUD_BINS, cutoff_pct, x0, y0, dx, dy)
@@ -160,10 +160,11 @@ pub fn count_grid(
     x1: f32,
     y0: f32,
     y1: f32,
-    bins: usize,
+    cols: usize,
+    rows: usize,
 ) -> Vec<f32> {
-    let mut counts = vec![0.0f32; bins.saturating_mul(bins)];
-    if bins == 0 {
+    let mut counts = vec![0.0f32; cols.saturating_mul(rows)];
+    if cols == 0 || rows == 0 {
         return counts;
     }
     let dx = x1 - x0;
@@ -174,9 +175,9 @@ pub fn count_grid(
         if !x.is_finite() || !y.is_finite() || *x < x0 || *x > x1 || *y < y0 || *y > y1 {
             continue;
         }
-        let ix = (((x - x0) / dx) * bins as f32) as usize;
-        let iy = (((y - y0) / dy) * bins as f32) as usize;
-        counts[ix.min(bins - 1) + bins * iy.min(bins - 1)] += 1.0;
+        let ix = (((x - x0) / dx) * cols as f32) as usize;
+        let iy = (((y - y0) / dy) * rows as f32) as usize;
+        counts[ix.min(cols - 1) + cols * iy.min(rows - 1)] += 1.0;
     }
     counts
 }
@@ -573,8 +574,12 @@ mod tests {
             xs.push(index as f32);
             ys.push((index % 5) as f32);
         }
-        let grid = count_grid(&xs, &ys, 0.0, 40.0, 0.0, 5.0, 8);
+        let grid = count_grid(&xs, &ys, 0.0, 40.0, 0.0, 5.0, 8, 8);
         assert_eq!(grid.iter().sum::<f32>(), 40.0);
+        // A non-square frame keeps its dimensions — one index per (col, row).
+        let wide = count_grid(&xs, &ys, 0.0, 40.0, 0.0, 5.0, 8, 4);
+        assert_eq!(wide.len(), 32);
+        assert_eq!(wide.iter().sum::<f32>(), 40.0);
         let Series::Heatmap { values, cols, .. } = &cloud_series(
             &xs,
             &ys,
