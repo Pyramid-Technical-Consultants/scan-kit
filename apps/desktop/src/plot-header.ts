@@ -233,7 +233,7 @@ function sameTable(left: ViewTable | null, right: ViewTable | null): boolean {
   return true;
 }
 
-/** `scan_kit_open_plot` bytes: a little-endian `u32` JSON length, the JSON header, then marks. */
+/** `scan_kit_poll` task bytes: a little-endian `u32` JSON length, the JSON header, then marks. */
 export function plotHeader(bytes: Uint8Array): PlotHeader {
   if (bytes.byteLength < 4) {
     throw new Error("plot payload is empty");

@@ -113,10 +113,12 @@ pub fn invoke(name: &str, input: &Value) -> Result<Value, String> {
                 .filter(|options| options.is_object())
                 .unwrap_or_else(|| json!({}));
             options["dest"] = json!(text(input, "dest")?);
-            options["description"] = json!(input
-                .get("description")
-                .and_then(Value::as_str)
-                .unwrap_or("scan-kit MC"));
+            if name == "scan_kit_write_dose" {
+                options["description"] = json!(input
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .unwrap_or("scan-kit MC"));
+            }
             let view = if name == "scan_kit_write_dose" {
                 "write_dose"
             } else {
