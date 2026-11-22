@@ -39,7 +39,12 @@ pub(crate) fn count_choice(raw: &str) -> Option<usize> {
     if raw.is_empty() || raw.eq_ignore_ascii_case("auto") || raw.eq_ignore_ascii_case("automatic") {
         None
     } else {
-        let parsed = raw.parse::<usize>().unwrap_or(32);
+        // JSON callers send 16.0 for 16 â€” parse as float too instead of
+        // silently snapping to 32.
+        let parsed = raw
+            .parse::<usize>()
+            .or_else(|_| raw.parse::<f64>().map(|value| value.round() as usize))
+            .unwrap_or(32);
         Some(
             BIN_STEPS
                 .into_iter()
@@ -278,5 +283,13 @@ mod tests {
         assert_eq!(bin_share("", true), BinShare::Plot);
         assert_eq!(bin_share("", false), BinShare::Own);
         assert_eq!(share_key(BinShare::Page), "page");
+    }
+
+    #[test]
+    fn a_json_float_count_still_snaps_to_the_nearest_step() {
+        // MCP callers send 16.0 for 16 — it must not fall back to 32.
+        assert_eq!(super::count_choice("16.0"), Some(16));
+        assert_eq!(super::count_choice("20.0"), Some(16));
+        assert_eq!(super::count_choice("64"), Some(64));
     }
 }

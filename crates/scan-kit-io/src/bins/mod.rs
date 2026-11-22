@@ -705,6 +705,8 @@ pub(crate) fn bins(root: &Path, session_ids: &[String], options: &Value) -> Plot
     let hist_bins = hist_bin_count(&hist_label);
     let cutoff = text(options, "cutoff", "5")
         .parse::<f32>()
+        .ok()
+        .filter(|value| value.is_finite())
         .unwrap_or(5.0)
         .clamp(0.0, 90.0);
     let source = sources_for(group.id)
@@ -1451,6 +1453,9 @@ fn quantized_levels(
             if levels.iter().any(|have| same(*have, *value)) {
                 continue;
             }
+            // Fewer than `limit` distinct values stay categorical — at the
+            // limit the axis regroups into quantile bins instead of drawing
+            // one single-element category per value.
             if levels.len() + 1 >= limit {
                 return None;
             }

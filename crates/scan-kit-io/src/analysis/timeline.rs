@@ -356,9 +356,19 @@ fn trace_span(
     let mut x_lo = f32::MAX;
     let mut x_hi = f32::MIN;
     for (index, value) in samples.iter().enumerate() {
+        // A short clock column continues from its last real timestamp —
+        // index*1ms can fabricate times *before* the true last sample.
         let t = clock
             .and_then(|clock| clock.get(index).copied())
-            .unwrap_or(index as f32 * SAMPLE_S);
+            .unwrap_or_else(|| {
+                clock
+                    .and_then(|clock| {
+                        clock
+                            .last()
+                            .map(|last| last + (index + 1 - clock.len()) as f32 * SAMPLE_S)
+                    })
+                    .unwrap_or(index as f32 * SAMPLE_S)
+            });
         xs.push(t);
         ys.push(*value);
         if !value.is_finite() || !inside(t, window) {
@@ -396,9 +406,17 @@ pub(super) fn hv_transient(root: &Path, session_ids: &[String]) -> PlotScene {
         for device in ["IC1", "IC2", "IC3"] {
             let path = format!("ic_hv_toggle/{device}_HCC.csv");
             let columns = load_csv(root, session, &path);
+            // Prefer the exact "current" column — a file carrying e.g.
+            // charge_current and ic_current would otherwise bind whichever
+            // sorts first alphabetically.
             let Some((_, current)) = columns
                 .iter()
-                .find(|(name, _)| name.to_ascii_lowercase().contains("current"))
+                .find(|(name, _)| name.eq_ignore_ascii_case("current"))
+                .or_else(|| {
+                    columns
+                        .iter()
+                        .find(|(name, _)| name.to_ascii_lowercase().contains("current"))
+                })
             else {
                 continue;
             };

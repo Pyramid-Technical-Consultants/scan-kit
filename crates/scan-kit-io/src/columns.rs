@@ -247,7 +247,9 @@ fn column_json(name: &str, integer: bool, values: &[Option<f64>]) -> Value {
             "dtype": "i32",
             "values": values.iter().map(|value| {
                 value.and_then(|number| {
-                    if number.is_finite() {
+                    // A fractional value in an integer column is malformed
+                    // input — null it rather than silently flooring a join key.
+                    if number.is_finite() && number.fract() == 0.0 {
                         i32::try_from(number as i64).ok()
                     } else {
                         None
@@ -413,5 +415,11 @@ mod tests {
     fn an_integer_column_keeps_nan_null_instead_of_reporting_zero() {
         let column = column_json("spot_no", true, &[Some(3.0), Some(f64::NAN), None]);
         assert_eq!(column["values"], json!([3, null, null]));
+    }
+
+    #[test]
+    fn a_fractional_value_in_an_integer_column_is_null_not_floored() {
+        let column = column_json("spot_no", true, &[Some(3.7), Some(-3.7), Some(4.0)]);
+        assert_eq!(column["values"], serde_json::json!([null, null, 4]));
     }
 }
