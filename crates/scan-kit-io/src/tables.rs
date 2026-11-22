@@ -1136,14 +1136,19 @@ fn build_spot(
     let (mask_pos, mm_pos) = spot_positions(&spot, chamber, n, plan_lookup.as_ref(), &strip_mid);
     let sigma = spot_sigma(&spot, raw_sigma || chamber, n);
     let mut mask_cols: Vec<&[f32]> = vec![energy];
+    let mut finite_cols: Vec<&[f32]> = Vec::new();
     if target.len() >= n {
         mask_cols.push(target);
     }
+    // Commanded millimetre positions can legitimately read -1.0 — the
+    // -1/-10000 sentinel rule belongs to device readings, not plan
+    // coordinates. Measured positions stay in the sentinel mask: a raw -1
+    // strip reading is itself the sentinel.
     if plan_x.len() >= n {
-        mask_cols.push(plan_x);
+        finite_cols.push(plan_x);
     }
     if plan_y.len() >= n {
-        mask_cols.push(plan_y);
+        finite_cols.push(plan_y);
     }
     for (_, values) in &doses {
         mask_cols.push(*values);
@@ -1156,6 +1161,12 @@ fn build_spot(
         mask_cols.push(*values);
     }
     let keep = keep_mask(&mask_cols, n);
+    let keep_finite = keep_mask_finite(&finite_cols, n);
+    let keep: Vec<bool> = keep
+        .iter()
+        .zip(&keep_finite)
+        .map(|(a, b)| *a && *b)
+        .collect();
     if !keep.iter().any(|row| *row) {
         return BTreeMap::new();
     }
@@ -1402,6 +1413,23 @@ fn spot_time_ms(spot: &Sheet, n: usize) -> Option<Vec<f64>> {
 
 fn row_ok(value: f32) -> bool {
     value.is_finite() && value != -1.0 && value != -10000.0
+}
+
+/// Finite-only variant of `keep_mask` for columns where -1/-10000 are real
+/// values (millimetre positions), not device sentinels.
+fn keep_mask_finite(columns: &[&[f32]], n: usize) -> Vec<bool> {
+    let mut keep = vec![true; n];
+    for column in columns {
+        if column.len() < n {
+            continue;
+        }
+        for (slot, value) in keep.iter_mut().zip(*column) {
+            if !value.is_finite() {
+                *slot = false;
+            }
+        }
+    }
+    keep
 }
 
 fn keep_mask(columns: &[&[f32]], n: usize) -> Vec<bool> {
@@ -2536,7 +2564,9 @@ fn sheet_metric(
     gains: [f32; 4],
     start: usize,
 ) -> Option<SheetMetric> {
-    let trigger = num_col(sheet, "rci_in_trigger").or_else(|| num_col(sheet, "r_beamOk"))?;
+    let trigger = num_col(sheet, "rci_in_trigger")
+        .or_else(|| num_col(sheet, "r_beamOk"))
+        .or_else(|| num_col(sheet, "beam_on"))?;
     let n = trigger.len();
     if start >= n {
         return None;
@@ -3358,7 +3388,7 @@ fn column_diff(command: &[f32], readback: &[f32]) -> Vec<f32> {
 
 /// Trigger length, or the longest requested column when the file has no trigger.
 fn sample_len(sheet: &Sheet, columns: &[&[f32]]) -> usize {
-    column_any(sheet, &["rci_in_trigger", "r_beamOk"])
+    column_any(sheet, &["rci_in_trigger", "r_beamOk", "beam_on"])
         .map(|values| values.len())
         .filter(|n| *n > 0)
         .unwrap_or_else(|| columns.iter().map(|column| column.len()).max().unwrap_or(0))
@@ -4147,6 +4177,7 @@ fn tails() -> &'static Mutex<HashMap<(PathBuf, Keep), Arc<Mutex<Tail>>>> {
 }
 
 const FILE_SHEET_CAP: usize = 64;
+const TAIL_CAP: usize = 256;
 
 fn sheet_key(path: &Path, stamp: u128, keep: Keep) -> SheetKey {
     SheetKey {
@@ -4214,6 +4245,9 @@ fn sheet_all(path: &Path, keep: Keep, pred: fn(&str) -> bool) -> Arc<Sheet> {
             tail.stamp == stamp && !tail.done && tail.rows > 0
         });
     if resume {
+        // This read serves a different grain than the bound take — publishing
+        // tail_done here would settle the bound family's tail file early.
+        let _quiet = QuietTail::suppress();
         return sheet_rows(path, keep, pred, usize::MAX);
     }
     read_and_cache(path, stamp, keep, pred).unwrap_or_else(|| Arc::new(read_sheet_where(&[], pred)))
@@ -4528,7 +4562,10 @@ fn read_more(file: &mut std::fs::File, newlines: usize, bytes_per_row: usize) ->
     if buf.is_empty() {
         return (buf, !failed);
     }
-    if nth_newline(&buf, newlines).is_some() || buf.len() < cover || cover == remain {
+    // A short fill is not the end of the file — a transient short read or a
+    // partial fill before an error must fall through and keep reading, or the
+    // truncated table gets cached as complete.
+    if nth_newline(&buf, newlines).is_some() {
         return trim_newlines(file, buf, newlines);
     }
     let mut tmp = vec![0u8; 8 * 1024 * 1024];
@@ -4619,6 +4656,17 @@ fn sheet_rows(path: &Path, keep: Keep, pred: fn(&str) -> bool, want: usize) -> A
     // other sessions read at the same time.
     let slot = {
         let mut held = tails().lock().unwrap_or_else(|err| err.into_inner());
+        if !held.contains_key(&map_key) && held.len() >= TAIL_CAP {
+            // Only a finished tail is safe to drop — its parsed sheet lives
+            // on in file_sheets. Evicting a live one loses the read position.
+            if let Some((key, _)) = held
+                .iter()
+                .find(|(_, tail)| tail.lock().map(|tail| tail.done).unwrap_or(true))
+                .map(|(key, tail)| (key.clone(), Arc::clone(tail)))
+            {
+                held.remove(&key);
+            }
+        }
         Arc::clone(
             held.entry(map_key)
                 .or_insert_with(|| Arc::new(Mutex::new(empty_tail(stamp)))),
@@ -5400,6 +5448,18 @@ pub(crate) fn days_from_civil(mut year: i32, month: u32, day: u32) -> Option<i64
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_minus_one_millimetre_position_survives_the_row_mask() {
+        // The -1/-10000 sentinels belong to channel readings — a real plan
+        // coordinate of -1.0 mm must not drop the row.
+        let positions = [-1.0f32, -10000.0, 3.5, 0.0];
+        let channel = [-1.0f32, 5.0, 6.0, -10000.0];
+        let finite = keep_mask_finite(&[&positions[..]], 4);
+        assert_eq!(finite, [true, true, true, true]);
+        let sentinel = keep_mask(&[&channel[..]], 4);
+        assert_eq!(sentinel, [false, true, true, false]);
+    }
 
     /// `bind_slice` is one slot per thread. The tests that use it take turns.
     fn slice_gate() -> &'static Mutex<()> {

@@ -223,6 +223,9 @@ pub(crate) fn remote_fingerprint(session_url: &str, session_id: &str) -> Option<
         candidates.insert(0, format!("{base}/termination_summary.txt"));
         if discover::valid_session_id(session_id) {
             candidates.insert(1, format!("{base}/{session_id}/termination_summary.txt"));
+            // Still-capturing nested sessions have no summary yet — the
+            // inner dir's mtime tracks the capture; the container's froze.
+            candidates.insert(2, format!("{base}/{session_id}"));
         }
     }
     let mut dir_stat = None;
@@ -374,6 +377,9 @@ fn materialize(library_canonical: &str, session_url: &str) -> Result<PathBuf, St
         fs::create_dir_all(parent).map_err(|err| err.to_string())?;
     }
     let mut fs = crate::remote::connect(&session, &password_of(&session))?;
+    // Files the remote tree lost must not survive in the cache — replace the
+    // copy, never merge over it (a dir↔file flip would wedge every retry).
+    let _ = fs::remove_dir_all(&dest);
     fs.copy_to(&session.path, &dest)?;
     if let Some(parent) = stamp_path.parent() {
         fs::create_dir_all(parent).map_err(|err| err.to_string())?;
@@ -384,6 +390,19 @@ fn materialize(library_canonical: &str, session_url: &str) -> Result<PathBuf, St
 
 fn remote_stamp(session: &Remote) -> Result<String, String> {
     let mut fs = crate::remote::connect(session, &password_of(session))?;
+    // The directory's mtime only moves on entry add/remove — a file rewritten
+    // in place needs the marker's stat or the cache never refreshes.
+    let base = session.path.trim_end_matches('/');
+    for marker in [
+        format!("{base}/termination_summary.txt"),
+        format!("{base}/input_map.csv"),
+    ] {
+        if let Some(stat) = fs.stat(&marker)? {
+            if !stat.dir {
+                return Ok(format!("{}\n{}", stat.mtime_ns, stat.size));
+            }
+        }
+    }
     let stat = fs.stat(&session.path)?.unwrap_or(crate::remote::Stat {
         dir: true,
         size: 0,
@@ -1166,25 +1185,32 @@ pub(crate) fn session_storage_paths(root: &str, session_id: &str) -> Result<Vec<
     for (suffix, _) in discover::ARCHIVE_SUFFIXES {
         names.push(format!("{session_id}{suffix}"));
     }
-    if is_remote_location(root) {
-        let remote = require_remote(root)?;
-        let mut fs = crate::remote::connect(&remote, &password_of(&remote))?;
-        let base = remote.path.trim_end_matches('/');
-        for name in names {
-            if fs.stat(&format!("{base}/{name}"))?.is_some() {
-                let place = format!(
-                    "{}/{}",
-                    remote.canonical.trim_end_matches('/'),
-                    encode_path(&name)
-                );
-                if !found.contains(&place) {
-                    found.push(place);
+    let root = match require_remote(root).ok() {
+        // smb opens as a UNC path — remote::connect errors on it, so storage
+        // paths and deletes resolve locally instead.
+        Some(remote) if remote.scheme == Scheme::Smb => {
+            connect_smb(&remote)?.to_string_lossy().into_owned()
+        }
+        Some(remote) => {
+            let mut fs = crate::remote::connect(&remote, &password_of(&remote))?;
+            let base = remote.path.trim_end_matches('/');
+            for name in names {
+                if fs.stat(&format!("{base}/{name}"))?.is_some() {
+                    let place = format!(
+                        "{}/{}",
+                        remote.canonical.trim_end_matches('/'),
+                        encode_path(&name)
+                    );
+                    if !found.contains(&place) {
+                        found.push(place);
+                    }
                 }
             }
+            return Ok(found);
         }
-        return Ok(found);
-    }
-    let base = Path::new(root);
+        None => root.to_owned(),
+    };
+    let base = Path::new(&root);
     for name in names {
         let path = base.join(&name);
         let hit = if name == session_id {
@@ -1206,6 +1232,20 @@ pub(crate) fn delete_storage(root: &str, paths: &[String]) -> Result<Vec<String>
     let mut errors = Vec::new();
     if is_remote_location(root) {
         let remote = require_remote(root)?;
+        if remote.scheme == Scheme::Smb {
+            // smb opens as a UNC path — remote::connect errors on it.
+            let unc = connect_smb(&remote)?;
+            for spec in paths {
+                let local = spec
+                    .strip_prefix(remote.canonical.as_str())
+                    .map(|rel| unc.join(rel.trim_start_matches('/')))
+                    .unwrap_or_else(|| Path::new(spec).to_path_buf());
+                if let Err(err) = trash_path(&local.to_string_lossy()) {
+                    errors.push(format!("{spec}: {err}"));
+                }
+            }
+            return Ok(errors);
+        }
         let mut fs = crate::remote::connect(&remote, &password_of(&remote))?;
         for spec in paths {
             match require_remote(spec) {
@@ -1222,7 +1262,9 @@ pub(crate) fn delete_storage(root: &str, paths: &[String]) -> Result<Vec<String>
                                 .components()
                                 .all(|part| matches!(part, std::path::Component::Normal(_)));
                         if safe {
-                            let _ = std::fs::remove_dir_all(cache_directory(root).join(&relative));
+                            let cached = cache_directory(root).join(&relative);
+                            let _ = std::fs::remove_dir_all(&cached);
+                            let _ = std::fs::remove_file(stamp_file(&cached));
                         }
                     }
                 }

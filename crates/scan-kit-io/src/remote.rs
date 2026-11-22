@@ -333,6 +333,11 @@ mod net {
     /// password goes out. An unknown host is learned; a changed key refuses —
     /// that is the MITM case worth failing closed for.
     fn check_host_key(session: &ssh2::Session, host: &str, port: u16) -> Result<(), String> {
+        // The read-add-write of known_hosts is not atomic — serialize it or
+        // two concurrent connects clobber each other's learned keys.
+        // ponytail: cross-process lost updates remain possible.
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = LOCK.lock().unwrap_or_else(|err| err.into_inner());
         let Some((key, key_type)) = session.host_key() else {
             return Err("the sftp server presented no host key".into());
         };
@@ -362,9 +367,12 @@ mod net {
                 if let Some(parent) = file.parent() {
                     fs::create_dir_all(parent).map_err(|err| err.to_string())?;
                 }
+                let tmp = file.with_extension("tmp");
                 known_hosts
-                    .write_file(&file, ssh2::KnownHostFileKind::OpenSSH)
-                    .map_err(|err| format!("{}: {err}", file.display()))
+                    .write_file(&tmp, ssh2::KnownHostFileKind::OpenSSH)
+                    .map_err(|err| format!("{}: {err}", tmp.display()))?;
+                fs::rename(&tmp, &file).map_err(|err| format!("{}: {err}", file.display()))?;
+                Ok(())
             }
             ssh2::CheckResult::Mismatch => Err(format!(
                 "the host key for {host} changed — refusing to connect; \
@@ -692,7 +700,7 @@ mod net {
                 FtpClient::Tls(ftp) => ftp.mlst(Some(path)),
             };
             match listed {
-                Ok(line) => Ok(Some(stat_mlst(&line))),
+                Ok(line) => Ok(stat_mlst(&line)),
                 Err(err) if missing_ftp(&err) => Ok(None),
                 Err(_) => stat_from_list(self, path),
             }
@@ -795,7 +803,8 @@ mod net {
         Ok(None)
     }
 
-    fn stat_mlst(line: &str) -> Stat {
+    /// `None` for a symlink — not a plain file this connector may read.
+    fn stat_mlst(line: &str) -> Option<Stat> {
         let mut dir = false;
         let mut size = 0u64;
         let mut mtime_ns = 0i64;
@@ -811,20 +820,22 @@ mod net {
             };
             match key.trim().to_ascii_lowercase().as_str() {
                 "type" => {
-                    dir = value.eq_ignore_ascii_case("dir")
-                        || value.eq_ignore_ascii_case("cdir")
-                        || value.eq_ignore_ascii_case("pdir")
+                    let kind = value.trim().to_ascii_lowercase();
+                    dir = kind == "dir" || kind == "cdir" || kind == "pdir";
+                    if kind.starts_with("os.unix=slink") || kind == "slink" {
+                        return None;
+                    }
                 }
                 "size" => size = value.trim().parse().unwrap_or(0),
                 "modify" => mtime_ns = modify_ns(value.trim()),
                 _ => {}
             }
         }
-        Stat {
+        Some(Stat {
             dir,
             size,
             mtime_ns,
-        }
+        })
     }
 
     fn modify_ns(text: &str) -> i64 {
@@ -1087,16 +1098,19 @@ mod net {
 
         #[test]
         fn listing_facts_and_base64_cover_the_helpers() {
-            let dir = stat_mlst("type=dir;size=4;modify=19700101000000; name");
+            let dir = stat_mlst("type=dir;size=4;modify=19700101000000; name").unwrap();
             assert!(dir.dir);
             assert_eq!(dir.size, 4);
             assert_eq!(dir.mtime_ns, 0);
-            let file = stat_mlst("type=file;size=12;modify=not-a-time; junk");
+            let file = stat_mlst("type=file;size=12;modify=not-a-time; junk").unwrap();
             assert!(!file.dir);
             assert_eq!(file.size, 12);
             // A filename containing ";type=dir" must not inject a fact.
-            let inject = stat_mlst("type=file;size=4;modify=20200102150403; a;type=dir");
+            let inject = stat_mlst("type=file;size=4;modify=20200102150403; a;type=dir").unwrap();
             assert!(!inject.dir);
+            // A symlink is absent to this connector — RETR would follow it
+            // to an arbitrary target on the server.
+            assert!(stat_mlst("type=OS.unix=slink:/etc/passwd;size=1; name").is_none());
             assert_eq!(modify_ns("short"), 0);
             assert_eq!(
                 modify_ns("20200102150403"),
