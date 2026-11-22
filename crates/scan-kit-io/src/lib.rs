@@ -882,8 +882,8 @@ fn open_library_keep(
     }
     for (index, entry) in found.entries.into_iter().enumerate() {
         if let Cache::Hydrate = sync_entry(&tx, lib_id, &entry)? {
-            let meta = hydrate(&entry);
-            record_meta(&tx, lib_id, &entry, meta.as_ref())?;
+            let (meta, readable) = hydrate(&entry);
+            record_meta(&tx, lib_id, &entry, meta.as_ref(), readable)?;
         }
         let done = (index as u64) + 1;
         // library_rows lists everything indexed so far — per entry that is
@@ -1015,7 +1015,7 @@ pub fn remember_password(spec: &str, password: &str) {
     location::remember_password(spec, password);
 }
 
-fn hydrate(entry: &Discovered) -> Option<SessionMeta> {
+fn hydrate(entry: &Discovered) -> (Option<SessionMeta>, bool) {
     let mut meta = discover::read_session_file(
         &entry.storage_path,
         &entry.session_id,
@@ -1029,7 +1029,12 @@ fn hydrate(entry: &Discovered) -> Option<SessionMeta> {
         let (extent, layers) = map_geom_from_spots(entry);
         meta = merge_session_geom(meta, extent, layers);
     }
-    meta
+    // A None meta is ambiguous: a reachable storage path without a summary is
+    // a legitimate absence, but an unreachable one is a transient failure —
+    // the fingerprint stat is the same probe sync_entry already pays for.
+    let readable = meta.is_some()
+        || discover::storage_fingerprint(&entry.storage_path, &entry.session_id).is_some();
+    (meta, readable)
 }
 
 fn geom_incomplete(meta: Option<&SessionMeta>) -> bool {

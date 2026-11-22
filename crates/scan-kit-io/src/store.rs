@@ -381,6 +381,7 @@ pub fn record_meta(
     lib_id: i64,
     entry: &Discovered,
     meta: Option<&SessionMeta>,
+    checked: bool,
 ) -> Result<(), String> {
     // The UPDATE below leaves size/mtime_ns alone: sync_entry stamps them
     // before hydrate reads any bytes, and restatting now would certify
@@ -393,12 +394,16 @@ pub fn record_meta(
     };
     let path = entry.storage_path.to_string_lossy().to_string();
     let date = meta.and_then(SessionMeta::date_iso);
+    // A meta=None row only seals (checked=1) when hydrate found the storage
+    // readable — otherwise the NULLs were a transient failure and the row
+    // must stay retryable on the next scan.
+    let checked = i32::from(checked);
     conn.execute(
         "INSERT INTO sessions(
             library_id, session_id, storage_path, kind, size, mtime_ns,
             date, primary_mu, treatment_time_s, room_number, config_name,
             map_extent_mm, layer_count, map_geom_checked, note
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 1, '')
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, '')
          ON CONFLICT(library_id, session_id) DO UPDATE SET
             storage_path = excluded.storage_path,
             kind = excluded.kind,
@@ -409,7 +414,7 @@ pub fn record_meta(
             config_name = excluded.config_name,
             map_extent_mm = excluded.map_extent_mm,
             layer_count = excluded.layer_count,
-            map_geom_checked = 1",
+            map_geom_checked = excluded.map_geom_checked",
         params![
             lib_id,
             entry.session_id,
@@ -424,6 +429,7 @@ pub fn record_meta(
             meta.and_then(|item| item.config_name.clone()),
             meta.and_then(|item| item.map_extent_mm),
             meta.and_then(|item| item.layer_count),
+            checked,
         ],
     )
     .map_err(|err| err.to_string())?;
@@ -955,7 +961,13 @@ fn import_app_settings_once(conn: &Connection, db_path: &Path) -> Result<(), Str
         .parent()
         .unwrap_or(Path::new("."))
         .join("app_settings.json");
-    if let Some(value) = read_json(path).filter(|value| value.is_object()) {
+    if path.exists() {
+        let Some(value) = read_json(path.clone()).filter(|value| value.is_object()) else {
+            // A corrupt file is not an empty one — retry the import on the
+            // next open instead of stamping the flag and losing the data
+            // forever (same rule as import_legacy).
+            return Ok(());
+        };
         prefs_set(conn, PREF_APP_SETTINGS, &value)?;
     }
     prefs_set(conn, PREF_APP_SETTINGS_IMPORTED, &json!(true))
@@ -1003,22 +1015,27 @@ pub(crate) fn delete_missing(
 /// Remove a session row and drop it from the selection (session files are
 /// removed by the caller — trash or remote delete).
 pub fn delete_session(conn: &Connection, lib_id: i64, session_id: &str) -> Result<(), String> {
-    conn.execute(
+    // The session's files are already gone when this runs — a mid-call
+    // failure must not leave a deleted id inside selected_sessions.
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|err| err.to_string())?;
+    tx.execute(
         "DELETE FROM sessions WHERE library_id = ?1 AND session_id = ?2",
         params![lib_id, session_id],
     )
     .map_err(|err| err.to_string())?;
-    let selected: Vec<String> = selected_list(conn, lib_id)?
+    let selected: Vec<String> = selected_list(&tx, lib_id)?
         .into_iter()
         .filter(|id| id != session_id)
         .collect();
     let encoded = serde_json::to_string(&selected).map_err(|err| err.to_string())?;
-    conn.execute(
+    tx.execute(
         "UPDATE libraries SET selected_sessions = ?1 WHERE id = ?2",
         params![encoded, lib_id],
     )
     .map_err(|err| err.to_string())?;
-    Ok(())
+    tx.commit().map_err(|err| err.to_string())
 }
 
 pub(crate) fn selected_session_ids(conn: &Connection, lib_id: i64) -> Result<Vec<String>, String> {
@@ -1279,5 +1296,104 @@ mod tests {
         assert!(set_window_geometry(&conn, 0, 600, 0, 0).is_err());
         assert!(set_window_geometry(&conn, 800, -1, 0, 0).is_err());
         assert!(set_window_geometry(&conn, 800, 600, 0, 0).is_ok());
+    }
+
+    #[test]
+    fn a_corrupt_settings_file_is_retried_not_stamped() {
+        let path = temp_db("corrupt_settings");
+        let settings = path.parent().unwrap().join("app_settings.json");
+        std::fs::write(&settings, "{not json").unwrap();
+        let conn = open_connection(&path).unwrap();
+        // The corrupt file must not stamp the import flag — fixing the file
+        // should import on the next pass.
+        assert!(prefs_get(&conn, PREF_APP_SETTINGS_IMPORTED)
+            .unwrap()
+            .is_none());
+        std::fs::write(&settings, r#"{"config_dir":"legacy"}"#).unwrap();
+        import_app_settings_once(&conn, &path).unwrap();
+        assert_eq!(
+            prefs_get(&conn, PREF_APP_SETTINGS).unwrap(),
+            Some(json!({"config_dir": "legacy"}))
+        );
+        let _ = std::fs::remove_file(&settings);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_failed_hydrate_stays_retryable() {
+        let path = temp_db("meta_checked");
+        let root = path.with_file_name("lib");
+        std::fs::create_dir_all(&root).unwrap();
+        let conn = open_connection(&path).unwrap();
+        let lib_id = prepare_library(&conn, &root.to_string_lossy()).unwrap();
+        let entry = Discovered {
+            session_id: "s1".to_owned(),
+            storage_path: path.with_file_name("no-such-session.zip"),
+            kind: "zip",
+        };
+        // checked=false: the storage was unreachable, so NULL meta is a
+        // transient failure, not an absence — the next scan retries.
+        record_meta(&conn, lib_id, &entry, None, false).unwrap();
+        let checked: i64 = conn
+            .query_row(
+                "SELECT map_geom_checked FROM sessions
+                 WHERE library_id = ?1 AND session_id = 's1'",
+                params![lib_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(checked, 0);
+        // checked=true: readable storage without meta — seal so scans skip it.
+        record_meta(&conn, lib_id, &entry, None, true).unwrap();
+        let checked: i64 = conn
+            .query_row(
+                "SELECT map_geom_checked FROM sessions
+                 WHERE library_id = ?1 AND session_id = 's1'",
+                params![lib_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(checked, 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn delete_session_drops_the_selection_entry() {
+        let path = temp_db("del_session");
+        let root = path.with_file_name("lib");
+        std::fs::create_dir_all(&root).unwrap();
+        let conn = open_connection(&path).unwrap();
+        let lib_id = prepare_library(&conn, &root.to_string_lossy()).unwrap();
+        let entry = Discovered {
+            session_id: "keep".to_owned(),
+            storage_path: root.join("keep.zip"),
+            kind: "zip",
+        };
+        record_meta(&conn, lib_id, &entry, None, true).unwrap();
+        let entry = Discovered {
+            session_id: "drop".to_owned(),
+            storage_path: root.join("drop.zip"),
+            kind: "zip",
+        };
+        record_meta(&conn, lib_id, &entry, None, true).unwrap();
+        conn.execute(
+            "UPDATE libraries SET selected_sessions = ?1 WHERE id = ?2",
+            params![r#"["keep","drop"]"#, lib_id],
+        )
+        .unwrap();
+        delete_session(&conn, lib_id, "drop").unwrap();
+        assert_eq!(
+            selected_list(&conn, lib_id).unwrap(),
+            vec!["keep".to_owned()]
+        );
+        let count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sessions WHERE library_id = ?1 AND session_id = 'drop'",
+                params![lib_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+        let _ = std::fs::remove_file(&path);
     }
 }
