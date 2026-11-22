@@ -137,11 +137,13 @@ pub fn load_study(path: &Path) -> Result<PatientStudy, String> {
         std::io::Read::take(&mut source, 256 * 1024 * 1024 + 1)
             .read_to_end(&mut bytes)
             .map_err(|err| format!("{}: {err}", file.display()))?;
-        if bytes.len() > 256 * 1024 * 1024 {
-            return Err(format!("{} exceeds 256 MiB", file.display()));
-        }
         if bytes.len() < 132 || &bytes[128..132] != b"DICM" {
             continue;
+        }
+        // The cap applies to DICOM payloads — an oversized non-DICOM file in
+        // the folder is skipped on the magic check, not a hard failure.
+        if bytes.len() > 256 * 1024 * 1024 {
+            return Err(format!("{} exceeds 256 MiB", file.display()));
         }
         // A meta that names a class we never read (treatment records, display
         // objects) skips the dataset parse entirely — those datasets can carry
@@ -1331,15 +1333,26 @@ fn floats_tag(elems: &[Elem], tag: u32) -> Vec<f32> {
     let Some(elem) = elem(elems, tag) else {
         return Vec::new();
     };
-    // Known binary VRs decode as little-endian f32s on the VR, not on the
+    // Known binary VRs decode as little-endian floats on the VR, not on the
     // payload's byte shape — an "AAAA" OF would otherwise read as DS text.
-    if matches!(&elem.vr, b"FL" | b"OF" | b"OD") {
+    if matches!(&elem.vr, b"FL" | b"OF") {
         return elem
             .bytes
             .as_chunks::<4>()
             .0
             .iter()
             .map(|chunk| f32::from_le_bytes(*chunk))
+            .collect();
+    }
+    // FD/OD are the doubles — 300A spot position/meterset maps are spec'd
+    // FD, so an explicit-VR plan reads f64s, not pairs of garbage f32s.
+    if matches!(&elem.vr, b"FD" | b"OD") {
+        return elem
+            .bytes
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|chunk| f64::from_le_bytes(*chunk) as f32)
             .collect();
     }
     let ds = |bytes: &[u8]| {
@@ -2488,6 +2501,29 @@ mod tests {
         // runs past EOF; returning the prefix would silently drop every tag.
         bytes.extend_from_slice(&[0x28, 0x00, 0x11, 0x00, b'U', b'S', 0x04, 0x00]);
         assert!(parse_dataset(&bytes).is_err());
+    }
+
+    #[test]
+    fn fd_and_od_values_decode_as_doubles() {
+        // FD is the spec VR for the 300A spot position/meterset maps — each
+        // 8-byte double must not split into two f32s or text-parse to empty.
+        let doubles = [1.5f64, -2.25, 3.0];
+        let raw: Vec<u8> = doubles
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect();
+        let mut bytes = Vec::new();
+        push_elem(&mut bytes, 0x300A, 0x0394, b"FD", &raw).unwrap();
+        push_elem(&mut bytes, 0x3004, 0x000C, b"OD", &raw).unwrap();
+        let elems = parse_dataset(&bytes).unwrap();
+        assert_eq!(
+            floats_tag(&elems, tag(0x300A, 0x0394)),
+            vec![1.5, -2.25, 3.0]
+        );
+        assert_eq!(
+            floats_tag(&elems, tag(0x3004, 0x000C)),
+            vec![1.5, -2.25, 3.0]
+        );
     }
 
     #[test]

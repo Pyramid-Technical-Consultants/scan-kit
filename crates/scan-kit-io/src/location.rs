@@ -419,11 +419,14 @@ fn remote_stamp(session: &Remote) -> Result<String, String> {
     let base = session.path.trim_end_matches('/');
     let leaf = base.rsplit('/').next().unwrap_or(base);
     let mut dir_stat = None;
+    // Flat markers first, mirroring remote_fingerprint and the local
+    // storage_fingerprint — disagreeing orders would record one stat at
+    // fingerprint time and another at materialize time, a perpetual re-copy.
     for marker in [
-        format!("{base}/{leaf}/termination_summary.txt"),
         format!("{base}/termination_summary.txt"),
-        format!("{base}/{leaf}/input_map.csv"),
+        format!("{base}/{leaf}/termination_summary.txt"),
         format!("{base}/input_map.csv"),
+        format!("{base}/{leaf}/input_map.csv"),
         format!("{base}/{leaf}"),
         base.to_owned(),
     ] {
@@ -1663,5 +1666,34 @@ mod tests {
             stamp,
             format!("1000000000\n{}", "Configuration name: x\n".len())
         );
+    }
+
+    #[test]
+    fn flat_and_nested_markers_stamp_the_same_one_they_fingerprint() {
+        // Both markers present: fingerprint and stamp must pick the same one
+        // (flat first, like storage_fingerprint) or every scan re-copies.
+        let url = format!(
+            "sftp://u@host.invalid/both/{}/{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let canonical = install_fixture(
+            &format!("{url}/sess"),
+            &[
+                ("input_map.csv", b"energy\n70\n"),
+                ("termination_summary.txt", b"flat\n"),
+                ("sess/input_map.csv", b"energy\n70\n"),
+                ("sess/termination_summary.txt", b"nested-marker\n"),
+            ],
+            false,
+        )
+        .unwrap();
+        let (mtime, size) = remote_fingerprint(&canonical, "sess").unwrap();
+        assert_eq!((mtime, size), (1_000_000_000, 5)); // "flat\n"
+        let remote = require_remote(&canonical).unwrap();
+        assert_eq!(remote_stamp(&remote).unwrap(), "1000000000\n5");
     }
 }
