@@ -67,6 +67,9 @@ pub struct CaptureDevice {
 pub struct Sheet {
     pub header: Vec<String>,
     pub rows: Vec<Vec<String>>,
+    /// A mid-file CSV error ended the parse — the kept prefix is usable but
+    /// the table is incomplete, so callers should surface it.
+    pub truncated: bool,
 }
 
 impl Sheet {
@@ -209,8 +212,12 @@ fn parse_sheet(bytes: &[u8]) -> Option<Sheet> {
         })
         .collect();
     let mut rows = Vec::new();
+    let mut truncated = false;
     for record in reader.records() {
-        let Ok(record) = record else { break };
+        let Ok(record) = record else {
+            truncated = true;
+            break;
+        };
         rows.push(
             record
                 .iter()
@@ -221,7 +228,11 @@ fn parse_sheet(bytes: &[u8]) -> Option<Sheet> {
     if rows.is_empty() {
         None
     } else {
-        Some(Sheet { header, rows })
+        Some(Sheet {
+            header,
+            rows,
+            truncated,
+        })
     }
 }
 
@@ -278,6 +289,7 @@ fn slice(sheet: &Sheet, block: &Block) -> Sheet {
     Sheet {
         header: sheet.header.clone(),
         rows: sheet.rows[block.start..block.end].to_vec(),
+        truncated: sheet.truncated,
     }
 }
 
@@ -350,12 +362,28 @@ pub fn capture(
     let mut slices: Vec<(&CaptureDevice, Sheet)> = Vec::new();
     for device in &devices {
         match fetch_sheet(&device.host, &device.io_root, "table") {
-            Some(sheet) => spots.push((device, sheet)),
+            Some(sheet) => {
+                if sheet.truncated {
+                    warnings.push(format!(
+                        "{}: control-point table truncated mid-file",
+                        device.name
+                    ));
+                }
+                spots.push((device, sheet));
+            }
             None => warnings.push(format!("{}: no control-point table", device.name)),
         }
         tick(count, keep)?;
         match fetch_sheet(&device.host, &device.io_root, "timeslice_table") {
-            Some(sheet) => slices.push((device, sheet)),
+            Some(sheet) => {
+                if sheet.truncated {
+                    warnings.push(format!(
+                        "{}: timeslice table truncated mid-file",
+                        device.name
+                    ));
+                }
+                slices.push((device, sheet));
+            }
             None => warnings.push(format!("{}: no timeslice table", device.name)),
         }
         tick(count, keep)?;
@@ -660,12 +688,12 @@ fn quoted(cell: &str) -> String {
 fn join_spot_data(spots: &[(&CaptureDevice, Sheet)]) -> Option<String> {
     struct Part {
         dest: Vec<String>,
-        rows: BTreeMap<(String, String), Vec<String>>,
+        rows: BTreeMap<(String, String, usize), Vec<String>>,
     }
     let mut parts = Vec::new();
-    let mut order: Vec<(String, String)> = Vec::new();
-    let mut seen_order: HashSet<(String, String)> = HashSet::new();
-    let mut states: HashMap<(String, String), String> = HashMap::new();
+    let mut order: Vec<(String, String, usize)> = Vec::new();
+    let mut seen_order: HashSet<(String, String, usize)> = HashSet::new();
+    let mut states: HashMap<(String, String, usize), String> = HashMap::new();
     for (device, sheet) in spots {
         let Some(spot_i) = sheet.column("spot_no") else {
             continue;
@@ -680,14 +708,25 @@ fn join_spot_data(spots: &[(&CaptureDevice, Sheet)]) -> Option<String> {
             dest,
             rows: BTreeMap::new(),
         };
+        // A re-delivered layer repeats a (layer, spot) pair in the same sheet;
+        // occurrence keeps deliveries distinct instead of the last row
+        // silently overwriting the first while its state survives.
+        let mut occurrences: HashMap<(String, String), usize> = HashMap::new();
         for row in &sheet.rows {
-            let key = (
+            let base = (
                 row.get(layer_i).cloned().unwrap_or_default(),
                 row.get(spot_i).cloned().unwrap_or_default(),
             );
-            if key.1.is_empty() {
+            if base.1.is_empty() {
                 continue;
             }
+            let n = occurrences.entry(base).or_insert(0);
+            let key = (
+                row.get(layer_i).cloned().unwrap_or_default(),
+                row.get(spot_i).cloned().unwrap_or_default(),
+                *n,
+            );
+            *n += 1;
             // Spot order follows the RCI table first; a device-only spot still
             // joins in encounter order rather than being dropped.
             if seen_order.insert(key.clone()) {
@@ -835,6 +874,9 @@ fn write_input_map(
     if let Some(path) = plan_path.filter(|path| path.is_file()) {
         let bytes = std::fs::read(path).map_err(|err| err.to_string())?;
         if let Some(mut sheet) = parse_sheet(&bytes) {
+            if sheet.truncated {
+                return Err(format!("{}: plan table truncated mid-file", path.display()));
+            }
             sheet.header = sheet
                 .header
                 .iter()
@@ -1583,5 +1625,29 @@ mod tests {
             }
         });
         host
+    }
+
+    #[test]
+    fn spot_join_keeps_each_delivery_of_a_repeated_spot() {
+        let rci = sheet(
+            "spot_no,layer_id,timeslice_number,timeslice_timestamp(ms),beam_current_command\n1,0,1,10,9\n1,0,2,30,8\n",
+        );
+        let ic = sheet(
+            "spot_no,layer_id,timeslice_number,timeslice_timestamp(ms),point_time(ms),point_dose(nC),total_dose(nC),ic1_dose_target,ic1_position_measured_b,ic1_position_measured_a,ic1_sigma_measured_b(mm),ic1_sigma_measured_a(mm)\n1,0,1,10,5,0.4,3.5,4e-10,11,12,0.1,0.2\n1,0,2,30,6,0.5,7.0,4e-10,21,22,0.3,0.4\n",
+        );
+        let parts = vec![(device("RCI"), rci), (device("IX256_1"), ic)];
+        let text = join_spot_data(&refs(&parts)).unwrap();
+        let rows: Vec<&str> = text.lines().skip(1).collect();
+        assert_eq!(rows.len(), 2, "both deliveries survive the join");
+        assert_ne!(rows[0], rows[1]);
+    }
+
+    #[test]
+    fn a_sheet_flags_a_truncated_parse() {
+        let good = parse_sheet(b"a,b\n1,2\n").unwrap();
+        assert!(!good.truncated);
+        let bad = parse_sheet(b"a,b\n1,2\n\xff\xfe,9\n").unwrap();
+        assert!(bad.truncated);
+        assert_eq!(bad.rows.len(), 1);
     }
 }

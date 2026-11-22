@@ -789,7 +789,13 @@ mod net {
         let mut dir = false;
         let mut size = 0u64;
         let mut mtime_ns = 0i64;
-        for fact in line.split(';') {
+        // RFC 3659: "fact=v;…; SP name" — facts end at the first space, so a
+        // name containing ";type=dir" must not be parsed as a fact.
+        let head = line
+            .trim_start()
+            .split_once(' ')
+            .map_or(line, |(head, _)| head);
+        for fact in head.split(';') {
             let Some((key, value)) = fact.split_once('=') else {
                 continue;
             };
@@ -1078,6 +1084,9 @@ mod net {
             let file = stat_mlst("type=file;size=12;modify=not-a-time; junk");
             assert!(!file.dir);
             assert_eq!(file.size, 12);
+            // A filename containing ";type=dir" must not inject a fact.
+            let inject = stat_mlst("type=file;size=4;modify=20200102150403; a;type=dir");
+            assert!(!inject.dir);
             assert_eq!(modify_ns("short"), 0);
             assert_eq!(
                 modify_ns("20200102150403"),
