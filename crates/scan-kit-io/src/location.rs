@@ -378,8 +378,16 @@ fn materialize(library_canonical: &str, session_url: &str) -> Result<PathBuf, St
     }
     let mut fs = crate::remote::connect(&session, &password_of(&session))?;
     // Files the remote tree lost must not survive in the cache — replace the
-    // copy, never merge over it (a dir↔file flip would wedge every retry).
-    let _ = fs::remove_dir_all(&dest);
+    // copy, never merge over it. A failed clear must error out here: merging
+    // over a surviving tree and then stamping it would pin stale files in
+    // the cache permanently.
+    if let Err(err) = fs::remove_dir_all(&dest) {
+        // A first materialize has nothing to clear; a removal that left any
+        // of the tree behind must not be stamped over.
+        if dest.exists() {
+            return Err(err.to_string());
+        }
+    }
     fs.copy_to(&session.path, &dest)?;
     if let Some(parent) = stamp_path.parent() {
         fs::create_dir_all(parent).map_err(|err| err.to_string())?;

@@ -739,6 +739,12 @@ impl Live {
                     .min(self.histories),
                 Some(cancel),
             );
+            // submit_until early-returns on cancel without advancing next —
+            // without this check the loop spins at 100% CPU forever.
+            if cancel.is_cancelled() {
+                self.inflight.clear();
+                return Err(ComputeError::Message("cancelled".into()));
+            }
         }
         self.finish(cancel)
     }
