@@ -6,7 +6,7 @@
 //! rest once. `open_plot` drains the same stage with an unlimited budget, so a
 //! one-shot call still returns the scene it returns today.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -701,7 +701,10 @@ impl Stage for SessionStage {
                 .collect();
             let seen = seen_stamps();
             let seen = seen.lock().unwrap_or_else(|err| err.into_inner());
-            self.cached = self.stamps.iter().all(|stamp| seen.contains(stamp));
+            self.cached = self
+                .stamps
+                .iter()
+                .all(|stamp| seen.get(stamp_id(stamp)).is_some_and(|have| have == stamp));
         }
         let total = self.sessions.len();
         let unlimited = budget >= DRAIN;
@@ -1901,14 +1904,26 @@ impl Stage for ExportStage {
     }
 }
 
-fn seen_stamps() -> &'static Mutex<HashSet<String>> {
-    static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
-    SEEN.get_or_init(|| Mutex::new(HashSet::new()))
+/// Latest seen stamp per session — a HashSet of raw stamps grew by one
+/// permanent entry per file mtime change; keying by session identity keeps
+/// it bounded by session count with the same "already read this state"
+/// semantics.
+fn seen_stamps() -> &'static Mutex<HashMap<String, String>> {
+    static SEEN: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+    SEEN.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The `{root}\n{session}` identity prefix of a `stamp_key` — everything
+/// after the second newline is the file-stamp portion.
+fn stamp_id(stamp: &str) -> &str {
+    stamp.rsplitn(3, '\n').nth(2).unwrap_or(stamp)
 }
 
 fn remember_stamps(stamps: &[String]) {
     let mut seen = seen_stamps().lock().unwrap_or_else(|err| err.into_inner());
-    seen.extend(stamps.iter().cloned());
+    for stamp in stamps {
+        seen.insert(stamp_id(stamp).to_owned(), stamp.clone());
+    }
 }
 
 /// Length and mtime of the session files. The view is not part of the key:
@@ -2872,5 +2887,22 @@ mod tests {
         assert_eq!(report["finished"], true);
         let driver = lock();
         assert!(!driver.tasks.contains_key(&id));
+    }
+
+    #[test]
+    fn the_stamp_cache_keeps_one_entry_per_session() {
+        let first = "/root\nsess\n1:100\n2:200";
+        let second = "/root\nsess\n3:300\n4:400";
+        assert_eq!(stamp_id(first), "/root\nsess");
+        remember_stamps(&[first.to_owned()]);
+        {
+            let seen = seen_stamps().lock().unwrap_or_else(|err| err.into_inner());
+            assert!(seen.get(stamp_id(first)) == Some(&first.to_owned()));
+        }
+        // A newer stamp replaces, not accumulates.
+        remember_stamps(&[second.to_owned()]);
+        let seen = seen_stamps().lock().unwrap_or_else(|err| err.into_inner());
+        assert_eq!(seen.get(stamp_id(first)), Some(&second.to_owned()));
+        assert_eq!(seen.len(), 1);
     }
 }

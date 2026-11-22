@@ -128,8 +128,22 @@ pub fn disconnect() {
 }
 
 pub fn read_status(has_plan: bool, dest: &str) -> Result<Value, String> {
+    // The session-id fetch is a plain HTTP GET — it must not run under LIVE,
+    // which serializes disconnect/control/upload. A stalled file server would
+    // otherwise block even disconnecting for the full request timeout.
+    let host = {
+        let guard = lock();
+        guard.as_ref().ok_or("not connected")?.host.clone()
+    };
+    let session_id = session_capture::live_session_id(&host);
     let mut guard = lock();
     let live = guard.as_mut().ok_or("not connected")?;
+    // A disconnect/reconnect between the two locks could change the device.
+    if live.host == host {
+        if let Some(id) = session_id {
+            live.session_id = id;
+        }
+    }
     refresh(live, Duration::from_millis(500))?;
     Ok(view_of(live, has_plan, dest))
 }
@@ -350,9 +364,6 @@ fn display_io(value: &Value) -> String {
 }
 
 fn refresh(live: &mut Live, timeout: Duration) -> Result<(), String> {
-    if let Some(id) = session_capture::live_session_id(&live.host) {
-        live.session_id = id;
-    }
     subscribe_status(&mut live.socket)?;
     let updates = poll_keys(
         &mut live.socket,
@@ -484,6 +495,10 @@ fn dial(endpoint: &str) -> Result<WebSocket<TcpStream>, String> {
     let stream = TcpStream::connect_timeout(&addr, Duration::from_secs(10))
         .map_err(|err| err.to_string())?;
     stream.set_nodelay(true).ok();
+    // The upgrade handshake reads the 101 response on the bare stream —
+    // without a read deadline a peer that accepts but never upgrades
+    // wedges connect() forever. recv() re-arms per call afterward.
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
     let mut request = format!("ws://{endpoint}")
         .into_client_request()
@@ -685,21 +700,33 @@ fn decode_blobs(value: &rmpv::Value) -> rmpv::Value {
 }
 
 fn unpack_blob(dtype: Option<i64>, data: &[u8]) -> Option<Vec<f64>> {
+    // A partial trailing element means a corrupt frame — refuse rather than
+    // silently drop it and hand a plausible-but-short array downstream.
     match dtype? {
-        1 => Some(
-            data.as_chunks::<4>()
-                .0
-                .iter()
-                .map(|chunk| f64::from(f32::from_le_bytes(*chunk)))
-                .collect(),
-        ),
-        2 => Some(
-            data.as_chunks::<8>()
-                .0
-                .iter()
-                .map(|chunk| f64::from_le_bytes(*chunk))
-                .collect(),
-        ),
+        1 => {
+            let (chunks, tail) = data.as_chunks::<4>();
+            if !tail.is_empty() {
+                return None;
+            }
+            Some(
+                chunks
+                    .iter()
+                    .map(|chunk| f64::from(f32::from_le_bytes(*chunk)))
+                    .collect(),
+            )
+        }
+        2 => {
+            let (chunks, tail) = data.as_chunks::<8>();
+            if !tail.is_empty() {
+                return None;
+            }
+            Some(
+                chunks
+                    .iter()
+                    .map(|chunk| f64::from_le_bytes(*chunk))
+                    .collect(),
+            )
+        }
         _ => None,
     }
 }
@@ -829,9 +856,15 @@ pub(crate) fn http_tuned(
     }
     let mut raw = Vec::new();
     let mut chunk = [0u8; 16 * 1024];
+    // read_timeout is per read() — a peer trickling one byte per interval
+    // would otherwise keep the request open for as long as it likes.
+    let deadline = Instant::now() + read_timeout * 4;
     loop {
         if raw.len() > MAX_BODY + 4096 {
             return Err("the device response is larger than 64 MiB".into());
+        }
+        if Instant::now() >= deadline {
+            return Err("the device response did not complete in time".into());
         }
         match stream.read(&mut chunk) {
             Ok(0) => break,
@@ -901,11 +934,14 @@ fn decode_chunks(mut data: &[u8]) -> Result<Vec<u8>, String> {
         if size == 0 {
             break;
         }
-        if data.len() < size {
+        if data.len() < size + 2 {
             return Err("truncated chunk".into());
         }
+        if &data[size..size + 2] != b"\r\n" {
+            return Err("malformed chunk".into());
+        }
         out.extend_from_slice(&data[..size]);
-        data = data.get(size + 2..).unwrap_or(&[]);
+        data = &data[size + 2..];
         if out.len() > MAX_BODY {
             return Err("the device response is larger than 64 MiB".into());
         }
@@ -978,6 +1014,11 @@ fn collect_files(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) -> Result<(),
     }
     for item in std::fs::read_dir(dir).map_err(|err| err.to_string())? {
         let path = item.map_err(|err| err.to_string())?.path();
+        // is_dir() follows symlinks — skip them entirely so a link inside
+        // the captured tree can't pull outside files into the zip.
+        if path.is_symlink() {
+            continue;
+        }
         if path.is_dir() {
             collect_files(&path, depth + 1, out)?;
         } else if path.is_file() {
@@ -1315,5 +1356,20 @@ mod tests {
             panic!("a blob decodes to the whole array");
         };
         assert_eq!(items.len(), 3);
+    }
+
+    #[test]
+    fn a_malformed_chunk_terminator_errors_instead_of_desyncing() {
+        // Two non-CRLF bytes after the payload must not be skipped over.
+        assert!(decode_chunks(b"3\r\nabcXY0\r\n\r\n").is_err());
+        assert_eq!(decode_chunks(b"3\r\nabc\r\n0\r\n\r\n").unwrap(), b"abc");
+    }
+
+    #[test]
+    fn a_blob_with_a_partial_tail_decodes_to_nothing() {
+        // 10 bytes is not a whole number of f32s or f64s.
+        assert_eq!(unpack_blob(Some(1), &[0u8; 10]), None);
+        assert_eq!(unpack_blob(Some(2), &[0u8; 10]), None);
+        assert_eq!(unpack_blob(Some(1), &[0, 0, 128, 63]), Some(vec![1.0]));
     }
 }
