@@ -1071,6 +1071,13 @@ fn transport_loop() {
     var next_exit = 0;
     loop {
         while (!busy) {
+            if (g_sp > 0 && pops >= 4096) {
+                while (g_sp > 0) {
+                    g_sp -= 1;
+                    let s = g_stack[g_sp];
+                    g_lost += s.M * s.T;
+                }
+            }
             if (g_sp > 0 && pops < 4096) {
                 g_sp -= 1;
                 pops += 1;
@@ -1096,7 +1103,11 @@ fn transport_loop() {
         if (!busy) { break; }
         if (steps == 0) { w = locate(p.x); }
         steps += 1;
-        busy = hadron_step(&p, &w) && steps < 100000;
+        busy = hadron_step(&p, &w);
+        if (busy && steps >= 100000) {
+            g_lost += p.M * p.T;
+            busy = false;
+        }
     }
     if (g_overflow != 0u) { atomicAdd(&ledger[12], g_overflow); }
     atomicMax(&ledger[13], u32(g_deepest));

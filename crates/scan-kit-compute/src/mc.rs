@@ -65,7 +65,7 @@ fn stats_peak(
 ) {
     let i = g.x + g.y * nwg.x * 256u;
     var v = 0.0;
-    if (i < P.n) { v = dose_sum[i]; }
+    if (i < P.n) { v = max(dose_sum[i], 0.0); }
     red_s[lid] = v;
     workgroupBarrier();
     for (var s = 128u; s > 0u; s >>= 1u) {
@@ -401,12 +401,30 @@ fn patient_launch(request: &PatientRequest) -> Result<Launch, ComputeError> {
     if request.material.len() != nvox || request.density.len() != nvox {
         return Err(ComputeError::Message("material and density differ".into()));
     }
+    let media = mc_tables().media.len();
+    if request.material.iter().any(|&m| m as usize >= media) {
+        return Err(ComputeError::Message("material index out of range".into()));
+    }
+    if request.density.iter().any(|d| !d.is_finite() || *d < 0.0) {
+        return Err(ComputeError::Message(
+            "density must be finite and nonnegative".into(),
+        ));
+    }
+    if !request.beams.len().is_multiple_of(16) {
+        return Err(ComputeError::Message(
+            "beams must be whole 16-float records".into(),
+        ));
+    }
     let mut kept_spots = Vec::new();
     let mut weights = Vec::new();
     let rows = request.spots.len() / 40;
     for row in 0..rows {
         let weight = request.protons.get(row).copied().unwrap_or(0.0);
         if weight.is_finite() && weight > 0.0 {
+            let beam = request.spots[row * 40 + 6];
+            if !beam.is_finite() || beam < 0.0 || beam as usize >= request.beams.len() / 16 {
+                return Err(ComputeError::Message("spot beam index out of range".into()));
+            }
             kept_spots.extend_from_slice(&request.spots[row * 40..(row + 1) * 40]);
             weights.push(f64::from(weight));
         }
@@ -1596,5 +1614,45 @@ mod tests {
         });
         let [nx, ny, nz] = result.volume.shape;
         assert_eq!(result.volume.values.len(), nx * ny * nz);
+    }
+
+    #[test]
+    fn patient_launch_rejects_bad_payloads() {
+        fn request() -> PatientRequest {
+            PatientRequest {
+                spots: vec![0.0; 40],
+                protons: vec![1.0],
+                beams: vec![0.0; 16],
+                material: vec![0; 8],
+                density: vec![1.0; 8],
+                spacing_mm: [1.0, 1.0, 1.0],
+                origin_mm: [0.0, 0.0, 0.0],
+                shape: [2, 2, 2],
+                histories: 1,
+                seed: 1,
+                dose_to_water: false,
+                score_let: false,
+                let_water: false,
+            }
+        }
+        let mut bad = request();
+        bad.material[0] = 250;
+        assert!(patient_launch(&bad).is_err());
+        let mut bad = request();
+        bad.density[0] = -1.0;
+        assert!(patient_launch(&bad).is_err());
+        let mut bad = request();
+        bad.density[0] = f32::NAN;
+        assert!(patient_launch(&bad).is_err());
+        let mut bad = request();
+        bad.spots[6] = 2.0;
+        assert!(patient_launch(&bad).is_err());
+        let mut bad = request();
+        bad.beams = Vec::new();
+        assert!(patient_launch(&bad).is_err());
+        let mut bad = request();
+        bad.beams = vec![0.0; 8];
+        assert!(patient_launch(&bad).is_err());
+        assert!(patient_launch(&request()).is_ok());
     }
 }
