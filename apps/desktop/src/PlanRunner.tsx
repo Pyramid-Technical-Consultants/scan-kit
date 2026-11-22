@@ -102,6 +102,9 @@ export function PlanRunner() {
   const busyRef = useRef(false);
   const inflight = useRef(false);
   const statusFailures = useRef(0);
+  // Bumped by every control/connect action — a status poll issued before the
+  // action must not overwrite the action's fresher view when it lands late.
+  const viewSeq = useRef(0);
   const hasPlan = useRef(false);
   const destRef = useRef("");
 
@@ -112,8 +115,12 @@ export function PlanRunner() {
   }, []);
 
   useEffect(() => {
+    let live = true;
     void invoke<Catalog>("scan_kit_runner_catalog")
       .then((next) => {
+        if (!live) {
+          return;
+        }
         setHost(next.host ?? "");
         setFileDir(next.file_dir);
         if (next.dest) {
@@ -123,9 +130,15 @@ export function PlanRunner() {
         setWaiting(false);
       })
       .catch((reason: unknown) => {
+        if (!live) {
+          return;
+        }
         setWaiting(false);
         notifyError(reason);
       });
+    return () => {
+      live = false;
+    };
   }, []);
 
   useEffect(() => {
@@ -143,12 +156,13 @@ export function PlanRunner() {
         return;
       }
       inflight.current = true;
+      const seq = viewSeq.current;
       void invoke<RunnerView>("scan_kit_runner_status", {
         hasPlan: hasPlan.current,
         dest: destRef.current,
       })
         .then((next) => {
-          if (!stop) {
+          if (!stop && seq === viewSeq.current) {
             statusFailures.current = 0;
             setView(next);
           }
@@ -308,6 +322,7 @@ export function PlanRunner() {
     if (busyRef.current) {
       return;
     }
+    viewSeq.current += 1;
     busyRef.current = true;
     setBusy(true);
     try {
