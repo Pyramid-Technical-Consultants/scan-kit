@@ -92,34 +92,40 @@ impl ScanKit {
         // is_remote_location only sees scheme-prefixed specs — a UNC share
         // or file://host reaches the same wire through plain filesystem
         // calls, so the gate checks for those spellings itself.
-        let remote = [
-            "path",
-            "storage_path",
-            "data_dir",
-            "config_dir",
-            "file",
-            "file_dir",
-            "folder",
-            "dest",
-            "source",
-        ]
-        .iter()
-        .filter_map(|key| input.get(key).and_then(Value::as_str))
-        .any(|spec| {
-            let spec = spec.trim();
-            if scan_kit_io::is_remote_location(spec)
-                || spec.starts_with("\\\\")
-                || spec.starts_with("//")
-            {
-                return true;
-            }
-            // file://host/path rewrites to a UNC share — only a leading /
-            // (file:///…) is local.
-            spec.get(..7)
-                .is_some_and(|head| head.eq_ignore_ascii_case("file://"))
-                && !spec[7..].starts_with('/')
-        });
+        // Nested containers (params.dicom_path, options.study/scanners…) also
+        // carry caller-chosen paths, so every string anywhere in the input is
+        // checked — enumerating nested keys would just rot again.
+        let remote = Self::remote_in(input);
         (saves || foreign_db || remote).then_some(name)
+    }
+
+    /// True when a string looks like a network-reachable location: a remote
+    /// scheme, a UNC share, or a file://host URI (file:/// is local).
+    fn remote_spec(spec: &str) -> bool {
+        let spec = spec.trim();
+        if scan_kit_io::is_remote_location(spec) || spec.starts_with("\\") || spec.starts_with("//")
+        {
+            return true;
+        }
+        spec.get(..7)
+            .is_some_and(|head| head.eq_ignore_ascii_case("file://"))
+            && !spec[7..].starts_with('/')
+    }
+
+    /// Walks every string in the input; a JSON-in-JSON value such as
+    /// options.scanners (a string carrying an array) is walked too.
+    fn remote_in(value: &Value) -> bool {
+        match value {
+            Value::String(spec) => {
+                Self::remote_spec(spec)
+                    || serde_json::from_str::<Value>(spec)
+                        .ok()
+                        .is_some_and(|parsed| Self::remote_in(&parsed))
+            }
+            Value::Array(items) => items.iter().any(Self::remote_in),
+            Value::Object(map) => map.values().any(Self::remote_in),
+            _ => false,
+        }
     }
 
     fn allows(&self, name: &str) -> bool {
@@ -435,6 +441,43 @@ mod tests {
             kit.blocked("scan_kit_open_library", &hosted),
             Some("scan_kit_open_library")
         );
+    }
+
+    #[test]
+    fn nested_remote_locations_count_as_effects() {
+        let kit = ScanKit { effects: false };
+        // params.dicom_path / params.pld_path feed plain filesystem reads in
+        // synthesize_plan — a UNC share reaches the wire through them.
+        let params = serde_json::json!({
+            "template": "iba_pld_plan",
+            "params": { "pld_path": "\\\\evil\\share\\x.pld" }
+        });
+        assert_eq!(
+            kit.blocked("scan_kit_synthesize_plan", &params),
+            Some("scan_kit_synthesize_plan")
+        );
+        // options.study / options.scanner short-circuit volumetric into a
+        // folder walk and a calibration lookup before sessions are touched.
+        let study = serde_json::json!({ "options": { "study": "\\\\evil\\share\\dicom" } });
+        assert_eq!(
+            kit.blocked("scan_kit_run_view", &study),
+            Some("scan_kit_run_view")
+        );
+        // options.scanners is a JSON string carrying an array — the nested
+        // document is walked too.
+        let scanners = serde_json::json!({
+            "options": { "scanners": "[{\"label\":\"x\",\"folder\":\"\\\\\\\\evil\\\\share\"}]" }
+        });
+        assert_eq!(
+            kit.blocked("scan_kit_run_view", &scanners),
+            Some("scan_kit_run_view")
+        );
+        // Honest nested local paths still pass.
+        let local = serde_json::json!({
+            "params": { "dicom_path": "C:\\dicom\\study" },
+            "options": { "study": "D:\\data", "scanner": "default" }
+        });
+        assert_eq!(kit.blocked("scan_kit_run_view", &local), None);
     }
 
     async fn listed_and_control(effects: bool) -> (Vec<String>, bool, bool) {
