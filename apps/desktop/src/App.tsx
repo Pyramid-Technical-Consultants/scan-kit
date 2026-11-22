@@ -1287,16 +1287,16 @@ export default function App() {
         <TabsContent value="Debug" className="flex min-h-0 flex-col overflow-hidden">
           <DebugLog />
         </TabsContent>
-        <TabsContent value="Plan Synthesis" className="flex min-h-0 flex-col overflow-hidden">
+        <TabsContent value="Plan Synthesis" keepMounted className="flex min-h-0 flex-col overflow-hidden">
           <PlanSynthesis />
         </TabsContent>
-        <TabsContent value="Phantom Synthesis" className="flex min-h-0 flex-col overflow-hidden">
+        <TabsContent value="Phantom Synthesis" keepMounted className="flex min-h-0 flex-col overflow-hidden">
           <PhantomSynthesis />
         </TabsContent>
-        <TabsContent value="Plan Runner" className="flex min-h-0 flex-col overflow-hidden">
+        <TabsContent value="Plan Runner" keepMounted className="flex min-h-0 flex-col overflow-hidden">
           <PlanRunner />
         </TabsContent>
-        <TabsContent value="Configuration Tuning" className="flex min-h-0 flex-col overflow-hidden">
+        <TabsContent value="Configuration Tuning" keepMounted className="flex min-h-0 flex-col overflow-hidden">
           <ConfigTuning
             folder={folder ?? ""}
             sessions={selectedIds.map((id) => ({

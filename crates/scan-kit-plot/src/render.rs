@@ -4327,8 +4327,9 @@ fn owns_pixel_px(p: [f32; 2], a: [f32; 2], b: [f32; 2], c: [f32; 2]) -> bool {
 
 fn point_in_triangle(p: [f32; 2], a: [f32; 2], b: [f32; 2], c: [f32; 2]) -> bool {
     // Same rejection as owns_pixel_px: a degenerate or NaN quad paints
-    // nothing, so it must not mask the series it hovers above.
-    let area = orient_px(a, b, c);
+    // nothing, so it must not mask the series it hovers above. orient_px is
+    // CPU-only, so the area is computed inline.
+    let area = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
     if area == 0.0 || !area.is_finite() {
         return false;
     }
