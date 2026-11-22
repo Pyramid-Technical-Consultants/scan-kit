@@ -609,7 +609,14 @@ fn prepared_key(
 fn session_stamp(root: &Path, session: &str) -> u128 {
     let dir = discover::session_directory(root, session);
     let mut stamp = mtime_ns(&dir);
-    for name in ["spot_data.csv", "input_map.csv"] {
+    // devices.xml / scan_dose_system.xml / point times feed the spot fills a
+    // prepared table can be built from — in-place rewrites must invalidate.
+    for name in [
+        "spot_data.csv",
+        "input_map.csv",
+        "config/map2map/devices.xml",
+        "config/map2map/scan_dose_system.xml",
+    ] {
         stamp ^= discover::meta_stamp(&dir.join(name));
     }
     // A same-length timeslice rewrite leaves the row-count keys unchanged —

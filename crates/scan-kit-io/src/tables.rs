@@ -464,9 +464,17 @@ pub(crate) fn session_columns(root: &Path, session: &str, grain: Grain, names: &
     let points = matches!(grain, Grain::Spot | Grain::SpotChamber) && wants_point_time(names);
     let span = span_of(session);
     let dir = discover::session_directory(root, session);
+    // device/point files feed spot and geometry builds — the inner cache
+    // keys watch them but are unreachable while this gate passes.
     let stamp = discover::meta_stamp(&dir.join("spot_data.csv"))
         ^ discover::meta_stamp(&dir.join("input_map.csv")).rotate_left(64)
-        ^ discover::timeslice_stamp(&dir).rotate_left(32);
+        ^ discover::timeslice_stamp(&dir).rotate_left(32)
+        ^ discover::meta_stamp(&dir.join("config/map2map/devices.xml"))
+            .wrapping_add(discover::meta_stamp(
+                &dir.join("config/map2map/scan_dose_system.xml"),
+            ))
+            .rotate_left(16)
+        ^ point_time_stamp(&dir).rotate_left(48);
     let key = (dir, grain);
     let mut produced = Vec::new();
     {
@@ -1304,7 +1312,7 @@ fn build_spot(
     if let (Some(time), Some(layer)) = (time_ms.as_ref(), layer.filter(|v| v.len() >= n)) {
         let ms = spot_delivery_ms(&take_kept(time, &keep), &take_kept(layer, &keep));
         table.insert("spot_time".to_string(), ms);
-        let point = ["point_time", "point_time_ms", "point_time(ms)"]
+        let point = ["point_time(ms)", "point_time_ms", "point_time"]
             .iter()
             .find_map(|name| spot.num.get(*name))
             .filter(|values| values.len() >= n)
@@ -3807,6 +3815,7 @@ pub(crate) fn spot_delivery_ms(timestamp: &[f64], layer: &[f32]) -> Vec<f32> {
     let n = timestamp.len().min(layer.len());
     let mut out = vec![f32::NAN; n];
     let mut groups: BTreeMap<i64, Vec<usize>> = BTreeMap::new();
+    let mut previous: Option<f64> = None;
     for index in 0..n {
         if timestamp[index].is_finite() && layer[index].is_finite() {
             groups
@@ -3824,10 +3833,15 @@ pub(crate) fn spot_delivery_ms(timestamp: &[f64], layer: &[f32]) -> Vec<f32> {
         if indices.is_empty() {
             continue;
         }
-        out[indices[0]] = timestamp[indices[0]] as f32;
+        let first = timestamp[indices[0]];
+        out[indices[0]] = match previous {
+            Some(last) => (first - last) as f32,
+            None => first as f32,
+        };
         for pair in indices.windows(2) {
             out[pair[1]] = (timestamp[pair[1]] - timestamp[pair[0]]) as f32;
         }
+        previous = indices.last().map(|&last| timestamp[last]);
     }
     out
 }
@@ -4682,7 +4696,18 @@ fn sheet_rows(path: &Path, keep: Keep, pred: fn(&str) -> bool, want: usize) -> A
             // stay unfinished and the next call retries.
             if let Ok(mut file) = std::fs::File::open(path) {
                 note_disk_read(path);
-                if tail.cursor == 0 || file.seek(SeekFrom::Start(tail.cursor as u64)).is_ok() {
+                let swapped = tail.cursor > 0
+                    && tail.pieces.first().is_some_and(|head| {
+                        let n = head.len().min(512);
+                        let mut probe = vec![0u8; n];
+                        file.read_exact(&mut probe)
+                            .map(|_| probe != head[..n])
+                            .unwrap_or(true)
+                    });
+                if swapped {
+                    *tail = empty_tail(stamp);
+                }
+                if file.seek(SeekFrom::Start(tail.cursor as u64)).is_ok() {
                     tail.file = Some(file);
                 }
             }
@@ -6295,5 +6320,13 @@ mod tests {
         assert!(held.get(&(path.clone(), Keep::Geometry)).is_none());
         drop(held);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn the_first_spot_of_a_layer_measures_the_gap() {
+        // An absolute clock at every layer boundary read as a giant overhead
+        // outlier — the column must stay a delivery gap end to end.
+        let ms = spot_delivery_ms(&[1000.0, 1100.0, 5000.0], &[0.0, 0.0, 1.0]);
+        assert_eq!(ms, vec![1000.0, 100.0, 3900.0]);
     }
 }
