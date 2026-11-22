@@ -372,6 +372,13 @@ pub fn welch_psd(
     if seg_len < 16 {
         return (Vec::new(), Vec::new());
     }
+    // overlap >= 1 (or NaN) would collapse the step to one sample and turn
+    // the loop quadratic — clamp it into the range the API promises.
+    let overlap = if overlap.is_finite() {
+        overlap.clamp(0.0, 0.99)
+    } else {
+        0.0
+    };
     let step = ((seg_len as f32) * (1.0 - overlap)).round().max(1.0) as usize;
     let window = hanning(seg_len);
     let win_power: f32 = window.iter().map(|w| w * w).sum();
@@ -557,7 +564,10 @@ pub fn splat_gaussians(
 /// Maximum-intensity projection along Z.
 pub fn mip_xy(grid: &[f32], shape: [usize; 3]) -> Vec<f32> {
     let [nx, ny, nz] = shape;
-    let mut image = vec![0.0f32; nx.saturating_mul(ny)];
+    let Some(pixels) = nx.checked_mul(ny) else {
+        return Vec::new();
+    };
+    let mut image = vec![0.0f32; pixels];
     // A grid shorter than shape promises returns zeros, matching the
     // accumulate_z/scan_axes length checks.
     if grid.len() < nx.saturating_mul(ny).saturating_mul(nz) {
@@ -945,7 +955,10 @@ fn find_suffix(node: &serde_json::Value, suffix: &str) -> Option<f32> {
 pub fn resample_nearest(source: &[f32], shape: [usize; 3], out_shape: [usize; 3]) -> Vec<f32> {
     let [nx, ny, nz] = shape;
     let [ox, oy, oz] = out_shape;
-    let mut out = vec![0.0f32; ox * oy * oz];
+    let Some(cells) = ox.checked_mul(oy).and_then(|n| n.checked_mul(oz)) else {
+        return Vec::new();
+    };
+    let mut out = vec![0.0f32; cells];
     if nx == 0 || ny == 0 || nz == 0 {
         return out;
     }
@@ -1320,5 +1333,22 @@ mod tests {
             sums_by_spot_run(&[3.0e9, 4.0e9, 4.0e9], &[1.0, 2.0, 3.0]),
             vec![1.0, 5.0]
         );
+    }
+
+    #[test]
+    fn a_huge_declared_shape_returns_an_empty_projection() {
+        assert!(mip_xy(&[1.0f32], [usize::MAX, 2, 1]).is_empty());
+        assert!(resample_nearest(&[], [1, 1, 1], [usize::MAX, 2, 2]).is_empty());
+    }
+
+    #[test]
+    fn an_out_of_range_overlap_cannot_collapse_the_stride() {
+        // overlap >= 1 or NaN would leave step = 1 — a quadratic walk over the
+        // whole signal for every segment.
+        let signal = vec![1.0f32; 256];
+        let (freqs, psd) = welch_psd(&signal, 100.0, 64, 1.5);
+        assert!(!freqs.is_empty() || psd.is_empty());
+        let (_, psd_nan) = welch_psd(&signal, 100.0, 64, f32::NAN);
+        assert_eq!(psd.len(), psd_nan.len());
     }
 }

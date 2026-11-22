@@ -111,7 +111,24 @@ pub fn scan_spacing(values: &[f32], shape: [usize; 3], spacing: [f32; 3]) -> Vol
 
 fn scan_axes(values: &[f32], shape: [usize; 3], spacing: [f32; 3]) -> VolumeScan {
     let [nx, ny, nz] = shape;
-    let voxels = nx.saturating_mul(ny).saturating_mul(nz);
+    // Every buffer below is a pair or triple product of the pub shape, so a
+    // malformed shape must fail before the vec! allocations, not inside them.
+    let pairs = [nx.checked_mul(ny), nx.checked_mul(nz), ny.checked_mul(nz)];
+    let voxels = pairs[0]
+        .and_then(|plane| plane.checked_mul(nz))
+        .filter(|_| pairs.iter().all(Option::is_some));
+    let Some(voxels) = voxels else {
+        return VolumeScan {
+            bricks: Vec::new(),
+            brick_shape: [1, 1, 1],
+            line_scale: 1.0,
+            peak: 0.0,
+            abs_peak: 0.0,
+            peak_at: [0, 0, 0],
+            integrals: [Vec::new(), Vec::new(), Vec::new()],
+            integral_peaks: [0.0; 3],
+        };
+    };
     let brick_z = nz.div_ceil(BRICK).max(1);
     let workers = std::thread::available_parallelism()
         .map(|count| count.get())
@@ -477,7 +494,10 @@ pub fn raymarch(
     let rows = rows.max(1);
     let scan = scan_volume(volume);
     let view = plain_view(volume, azimuth, elevation, mode, filter, scan.line_scale);
-    let mut image = vec![0.0; cols * rows];
+    let mut image = vec![0.0; cols.checked_mul(rows).unwrap_or(0)];
+    if image.len() < cols.saturating_mul(rows) {
+        return image;
+    }
     for row in 0..rows {
         for col in 0..cols {
             let u = (col as f32 + 0.5) / cols as f32;
@@ -1668,5 +1688,28 @@ mod tests {
         assert!(scan.covers(shape));
         scan.peak_at = [usize::MAX, 0, 0];
         assert!(!scan.covers(shape));
+    }
+
+    #[test]
+    fn a_huge_declared_shape_returns_an_empty_scan() {
+        // The pub shape can promise more cells than usize can index — every
+        // buffer is a pair or triple product that must fail before vec![].
+        let scan = scan_grid(&[0.0f32; 1], [usize::MAX, 2, 1], 1.0);
+        assert!(scan.bricks.is_empty());
+        assert!(scan.integrals.iter().all(|plane| plane.is_empty()));
+        assert!(scan_grid(&[0.0f32; 1], [usize::MAX, usize::MAX, 0], 1.0)
+            .bricks
+            .is_empty());
+    }
+
+    #[test]
+    fn a_huge_raymarch_size_returns_empty() {
+        let volume = Volume {
+            origin: [0.0; 3],
+            spacing: [1.0; 3],
+            shape: [2, 2, 2],
+            values: vec![1.0f32; 8],
+        };
+        assert!(raymarch(&volume, 0.0, 0.0, 0, 0, usize::MAX, 2).is_empty());
     }
 }

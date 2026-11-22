@@ -362,16 +362,26 @@ fn rows_from_import(spots: &[ImportSpot], params: &Value) -> Result<Vec<Row>, St
     let current = DEFAULT_CURRENT_A;
     let mut rows: Vec<Row> = ordered
         .into_iter()
+        // A spot the file left without a real charge would write 0/NaN into
+        // CHARGE_REQ — the control-point table uploaded to the device.
+        .filter(|spot| spot.charge.is_finite() && spot.charge > 0.0)
         .map(|spot| Row {
             energy: spot.energy,
             x: spot.x,
             y: spot.y,
             charge: spot.charge,
             current,
-            beam_size: spot.beam_size,
+            beam_size: if spot.beam_size.is_finite() {
+                spot.beam_size
+            } else {
+                DEFAULT_BEAM_SIZE_MM
+            },
             velocity: 0.0,
         })
         .collect();
+    if rows.is_empty() {
+        return Err("No planned spots with positive MU found in plan file".into());
+    }
     sort_rows(&mut rows);
     Ok(rows)
 }
@@ -1611,5 +1621,44 @@ Element,10,0,5,0.0
                     "spot_weight_method": "fixed", "spot_weight_mu": 0.02}),
         );
         assert!(floats.iter().any(|error| error.contains("budget")));
+    }
+
+    #[test]
+    fn a_spot_without_a_real_charge_is_not_exported() {
+        // A missing meterset-weights tag used to write 0/NaN into CHARGE_REQ —
+        // the file uploaded to the delivery system.
+        let bad = ImportSpot {
+            x: 0.0,
+            y: 0.0,
+            energy: 100.0,
+            charge: f64::NAN,
+            beam_size: 3.61,
+            plan_index: 0,
+        };
+        let err = build_plan(
+            "dicom_rt_plan",
+            &json!({"use_dicom_beam_size": true, "spot_order": "plan_order"}),
+            PlanSource::Ion(std::slice::from_ref(&bad)),
+            None,
+        )
+        .unwrap_err();
+        assert!(err.contains("positive MU"), "{err}");
+        let good = ImportSpot {
+            x: 0.0,
+            y: 0.0,
+            energy: 100.0,
+            charge: 2.0,
+            beam_size: f64::NAN,
+            plan_index: 0,
+        };
+        let doc = build_plan(
+            "dicom_rt_plan",
+            &json!({"use_dicom_beam_size": true, "spot_order": "plan_order"}),
+            PlanSource::Ion(&[bad, good]),
+            None,
+        )
+        .unwrap();
+        assert_eq!(doc.preview.len(), 1, "{:?}", doc.preview);
+        assert!(!doc.csv.contains("NaN"), "{}", doc.csv);
     }
 }
