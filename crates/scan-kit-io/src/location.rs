@@ -359,11 +359,12 @@ fn materialize(library_canonical: &str, session_url: &str) -> Result<PathBuf, St
     let session = require_remote(session_url)?;
     let relative = relative_remote(library_canonical, &session);
     // Only plain relative segments may join the cache — a `..` escapes it, and
-    // on Windows `join("C:/evil")` discards the base entirely.
-    if !Path::new(&relative)
-        .components()
-        .all(|part| matches!(part, std::path::Component::Normal(_)))
-    {
+    // on Windows `join("C:/evil")` discards the base entirely. A name that can
+    // never exist locally (illegal char, DOS stem) fails the copy every time.
+    if !Path::new(&relative).components().all(|part| {
+        matches!(part, std::path::Component::Normal(name)
+            if !crate::remote::unsafe_local_name(&name.to_string_lossy()))
+    }) {
         return Err("remote session path escapes the cache directory".into());
     }
     let dest = cache_directory(library_canonical).join(&relative);
@@ -1311,7 +1312,22 @@ pub(crate) fn delete_storage(root: &str, paths: &[String]) -> Result<Vec<String>
 
 #[cfg(not(target_arch = "wasm32"))]
 fn trash_path(path: &str) -> Result<(), String> {
-    trash::delete(path).map_err(|err| err.to_string())
+    match trash::delete(path) {
+        Ok(()) => Ok(()),
+        // There is no recycle bin for network shares — a UNC delete falls back
+        // to a permanent removal, the same as the remote drivers perform.
+        Err(err) if path.starts_with("\\\\") => {
+            let target = Path::new(path);
+            let meta = fs::symlink_metadata(target).map_err(|err| err.to_string())?;
+            let result = if meta.is_dir() && !meta.file_type().is_symlink() {
+                fs::remove_dir_all(target)
+            } else {
+                fs::remove_file(target)
+            };
+            result.map_err(|_| err.to_string())
+        }
+        Err(err) => Err(err.to_string()),
+    }
 }
 
 #[cfg(target_arch = "wasm32")]

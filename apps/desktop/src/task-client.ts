@@ -87,5 +87,9 @@ export async function driveTask(
       }
       return;
     }
+    // An unpaced loop spins thousands of IPC round-trips per second for the
+    // task's whole duration — each one serializes a report and schedules a
+    // setState. 40 ms keeps progress live without saturating the bridge.
+    await new Promise((resolve) => window.setTimeout(resolve, 40));
   }
 }

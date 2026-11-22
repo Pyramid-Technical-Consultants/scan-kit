@@ -53,14 +53,17 @@ pub fn scatter_cloud(
 pub fn cloud_series(xs: &[f32], ys: &[f32], times: &[f32], draw: CloudDraw) -> Vec<Series> {
     match draw {
         CloudDraw::Scatter { color, radius } => {
-            let times = if times.len() == xs.len() {
-                times.to_vec()
+            // A ragged ys would reach the payload as a mismatched pair — the
+            // encoders truncate anyway, so do it here and keep times aligned.
+            let n = xs.len().min(ys.len());
+            let times = if times.len() >= n {
+                times[..n].to_vec()
             } else {
                 Vec::new()
             };
             vec![scatter_cloud(
-                xs.to_vec(),
-                ys.to_vec(),
+                xs[..n].to_vec(),
+                ys[..n].to_vec(),
                 times,
                 color,
                 radius,
@@ -607,7 +610,7 @@ mod tests {
 
     #[test]
     fn a_ragged_ys_does_not_panic() {
-        let _ = cloud_series(
+        let series = cloud_series(
             &[1.0, 2.0, 3.0],
             &[1.0],
             &[0.0, 1.0, 2.0],
@@ -616,6 +619,10 @@ mod tests {
                 radius: 1.0,
             },
         );
+        let Series::Points { xs, ys, .. } = &series[0] else {
+            panic!("scatter is points");
+        };
+        assert_eq!(xs.len(), ys.len());
     }
 
     #[test]

@@ -1567,9 +1567,14 @@ impl Stage for LibraryStage {
                     shared.done.store(done, Ordering::Relaxed);
                     shared.total.store(total, Ordering::Relaxed);
                     if let Some(preview) = preview {
-                        if let Ok(bytes) = serde_json::to_vec(preview) {
-                            *shared.preview.lock().unwrap_or_else(|err| err.into_inner()) =
-                                Some(bytes);
+                        let mut slot = shared.preview.lock().unwrap_or_else(|err| err.into_inner());
+                        // The row set grows as indexing runs — serializing it
+                        // per entry is O(n²). Skip while the last preview is
+                        // still unconsumed.
+                        if slot.is_none() {
+                            if let Ok(bytes) = serde_json::to_vec(preview) {
+                                *slot = Some(bytes);
+                            }
                         }
                     }
                     !shared.stop.load(Ordering::SeqCst)
@@ -1595,7 +1600,7 @@ impl Stage for LibraryStage {
                     .preview
                     .lock()
                     .unwrap_or_else(|err| err.into_inner())
-                    .clone()
+                    .take()
             } else {
                 None
             };
@@ -2518,7 +2523,7 @@ mod tests {
                     );
                     break;
                 }
-                Poll::Failed(message) if message.contains("GPU") => {
+                Poll::Failed(message) if message.contains("no GPU adapter") => {
                     let _ = std::fs::remove_dir_all(&root);
                     return;
                 }

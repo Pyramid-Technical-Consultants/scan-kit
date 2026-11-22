@@ -178,7 +178,7 @@ fn devices(rci_host: &str, warnings: &mut Vec<String>) -> Vec<CaptureDevice> {
 
 /// Device client key → filename-safe name (`device_ic1_client` → `IC1`).
 fn client_name(client: &str) -> String {
-    client
+    let name: String = client
         .strip_prefix("device_")
         .unwrap_or(client)
         .strip_suffix("_client")
@@ -186,7 +186,15 @@ fn client_name(client: &str) -> String {
         .to_ascii_uppercase()
         .chars()
         .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '_' || *ch == '-')
-        .collect()
+        .collect();
+    // A bare DOS device stem (`CON.log`, `NUL_spot_data.csv`) fails every
+    // write on Windows — the charset filter alone lets it through.
+    match name.as_str() {
+        "CON" | "PRN" | "AUX" | "NUL" | "COM1" | "COM2" | "COM3" | "COM4" | "COM5" | "COM6"
+        | "COM7" | "COM8" | "COM9" | "LPT1" | "LPT2" | "LPT3" | "LPT4" | "LPT5" | "LPT6"
+        | "LPT7" | "LPT8" | "LPT9" => format!("DEVICE_{name}"),
+        _ => name,
+    }
 }
 
 fn table_io(host: &str, io_root: &str, table: &str, io: &str) -> Option<Value> {
@@ -331,10 +339,13 @@ fn join_key(text: &str) -> String {
 fn join_cells<'a>(cells: impl Iterator<Item = &'a str>) -> String {
     cells
         .map(|cell| {
-            if cell.contains([',', '"', '\n']) {
-                format!("\"{}\"", cell.replace('"', "\"\""))
+            // The fast table reader is line-based — a quoted newline is valid
+            // RFC CSV to it, just split into a phantom row. Flatten instead.
+            let flat = cell.replace(['\r', '\n'], " ");
+            if flat.contains([',', '"']) {
+                format!("\"{}\"", flat.replace('"', "\"\""))
             } else {
-                cell.to_owned()
+                flat
             }
         })
         .collect::<Vec<_>>()
@@ -703,10 +714,11 @@ fn dest_name(name: &str) -> String {
 }
 
 fn quoted(cell: &str) -> String {
-    if cell.contains([',', '"', '\n']) {
-        format!("\"{}\"", cell.replace('"', "\"\""))
+    let flat = cell.replace(['\r', '\n'], " ");
+    if flat.contains([',', '"']) {
+        format!("\"{}\"", flat.replace('"', "\"\""))
     } else {
-        cell.to_owned()
+        flat
     }
 }
 
@@ -961,12 +973,21 @@ fn write_input_map(
             .filter_map(|name| sheet.column(name))
             .collect();
         if !keep.is_empty() {
-            let mut text = join_cells(keep.iter().map(|i| sheet.header[*i].as_str()));
+            // Same normalization the plan path applies — a suffixed header
+            // would write `spot_no(x)` for a column readers look up as
+            // `spot_no`.
+            let mut text = join_cells(keep.iter().map(|i| {
+                sheet.header[*i]
+                    .split('(')
+                    .next()
+                    .unwrap_or(sheet.header[*i].as_str())
+                    .trim()
+            }));
             text.push('\n');
             for row in &sheet.rows {
                 text.push_str(&join_cells(
                     keep.iter()
-                        .map(|i| row.get(*i).map(String::as_str).unwrap_or("")),
+                        .map(|i| row.get(*i).map(|cell| clean(cell)).unwrap_or("")),
                 ));
                 text.push('\n');
             }
@@ -1719,5 +1740,18 @@ mod tests {
         assert_eq!(join_key("1.0"), "1");
         assert_eq!(join_key("03"), "3");
         assert_eq!(join_key("run-2"), "run-2");
+    }
+    #[test]
+    fn embedded_newlines_flatten_instead_of_writing_multiline_cells() {
+        let line = join_cells(
+            ["a\nb".to_owned(), "c\rd".to_owned()]
+                .iter()
+                .map(String::as_str),
+        );
+        assert_eq!(line, "a b,c d");
+        // The fast reader is line-based — an embedded line break would read
+        // back as an extra row.
+        assert_eq!(line.lines().count(), 1);
+        assert_eq!(quoted("x\ny"), "x y");
     }
 }

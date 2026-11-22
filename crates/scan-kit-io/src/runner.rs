@@ -958,7 +958,12 @@ fn package_zip(dir: &Path, zip_path: &Path, session_id: &str) -> Result<(), Stri
         let _ = std::fs::remove_file(&part);
     }
     result?;
-    std::fs::rename(&part, zip_path).map_err(|err| err.to_string())?;
+    // A dest held open by another process fails the rename on Windows — the
+    // finished part file must not be left behind on that path too.
+    if let Err(err) = std::fs::rename(&part, zip_path) {
+        let _ = std::fs::remove_file(&part);
+        return Err(err.to_string());
+    }
     Ok(())
 }
 

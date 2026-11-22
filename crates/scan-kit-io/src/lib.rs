@@ -878,12 +878,19 @@ fn open_library_keep(
             record_meta(&tx, lib_id, &entry, meta.as_ref())?;
         }
         let done = (index as u64) + 1;
-        let preview = json!({
-            "root": root,
-            "rows": library_rows(&tx, lib_id)?,
-            "selected": [],
-        });
-        if !keep(done, total, Some(&preview)) {
+        // library_rows lists everything indexed so far — per entry that is
+        // O(n²). Refresh the preview on a stride; progress still ticks every
+        // entry and the final result carries the full row set.
+        let preview = if index % 16 == 0 {
+            Some(json!({
+                "root": root,
+                "rows": library_rows(&tx, lib_id)?,
+                "selected": [],
+            }))
+        } else {
+            None
+        };
+        if !keep(done, total, preview.as_ref()) {
             return Err("cancelled".into());
         }
     }

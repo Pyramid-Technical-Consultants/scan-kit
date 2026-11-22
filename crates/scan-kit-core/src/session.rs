@@ -28,7 +28,43 @@ pub struct SummaryDate {
 /// archives, so `.`, `..`, and separators are not ids — they are traversals.
 /// Ids minted from zip member names or device tables are checked with this too.
 pub fn valid_session_id(id: &str) -> bool {
-    !id.is_empty() && id != "." && id != ".." && !id.contains(['/', '\\', ':'])
+    if id.is_empty()
+        || id != id.trim_end_matches(['.', ' '])
+        || id.contains(['/', '\\', ':', '?', '*', '"', '<', '>', '|'])
+    {
+        return false;
+    }
+    // Windows refuses DOS device stems even with an extension (`nul.txt`) —
+    // an id minted from an archive or table must not name one.
+    !matches!(
+        id.split('.')
+            .next()
+            .unwrap_or(id)
+            .to_ascii_lowercase()
+            .as_str(),
+        "con"
+            | "prn"
+            | "aux"
+            | "nul"
+            | "com1"
+            | "com2"
+            | "com3"
+            | "com4"
+            | "com5"
+            | "com6"
+            | "com7"
+            | "com8"
+            | "com9"
+            | "lpt1"
+            | "lpt2"
+            | "lpt3"
+            | "lpt4"
+            | "lpt5"
+            | "lpt6"
+            | "lpt7"
+            | "lpt8"
+            | "lpt9"
+    )
 }
 
 impl SessionMeta {
@@ -479,6 +515,15 @@ Configuration name: working_no_hvttt_new_cal
         for bad in ["", ".", "..", "a/b", "a\\b", "C:victim", "d:"] {
             assert!(!valid_session_id(bad), "{bad:?} must not be a session id");
         }
+        // Windows filename rules — the id becomes a path component there.
+        for bad in [
+            "a?b", "x*y", "a<b", "p|q", "foo ", "foo.", "nul", "NUL.txt", "con", "COM1", "lpt9",
+            "aux",
+        ] {
+            assert!(!valid_session_id(bad), "{bad:?} must not be a session id");
+        }
+        assert!(valid_session_id("annulus_run"));
+        assert!(valid_session_id("null-2024"));
     }
 
     #[test]

@@ -356,7 +356,9 @@ pub fn read_session_file(storage: &Path, session_id: &str, filename: &str) -> Op
     }
     if storage.is_dir() {
         let root = directory_session_root(storage, session_id);
-        return fs::read(root.join(filename)).ok();
+        return fs::File::open(root.join(filename))
+            .ok()
+            .and_then(|mut file| read_capped(&mut file, filename, MAX_MEMBER_BYTES).ok());
     }
     let primary = format!("{session_id}/{filename}");
     let suffix = format!("/{filename}");
@@ -418,6 +420,13 @@ fn marker_file(path: &Path) -> bool {
     path.symlink_metadata().is_ok_and(|meta| meta.is_file())
 }
 
+/// `is_dir` without following links — a junction'd session dir resolves to
+/// files outside the library root, so it is not a session dir.
+fn unlinked_dir(path: &Path) -> bool {
+    path.symlink_metadata()
+        .is_ok_and(|meta| meta.is_dir() && !meta.file_type().is_symlink())
+}
+
 fn is_unpacked_session(folder: &Path) -> bool {
     let Some(name) = folder.file_name() else {
         return false;
@@ -435,12 +444,15 @@ pub fn session_directory(library: &Path, session_id: &str) -> PathBuf {
     if !valid_session_id(session_id) {
         return library.to_path_buf();
     }
-    let nested = library.join(session_id).join(session_id);
-    if marker_file(&nested.join("input_map.csv")) {
+    let flat = library.join(session_id);
+    // A junction at `flat` escapes the library — its leaf metadata is fine, so
+    // both levels are checked without following links.
+    let flat_dir = unlinked_dir(&flat);
+    let nested = flat.join(session_id);
+    if flat_dir && unlinked_dir(&nested) && marker_file(&nested.join("input_map.csv")) {
         return nested;
     }
-    let flat = library.join(session_id);
-    if marker_file(&flat.join("input_map.csv")) || flat.is_dir() {
+    if flat_dir {
         return flat;
     }
     if marker_file(&library.join("input_map.csv")) {
@@ -564,13 +576,23 @@ fn walk_files(
     want: &dyn Fn(&str) -> bool,
     out: &mut Vec<(String, Vec<u8>)>,
 ) {
+    // The archive branch caps members and the aggregate; a local session tree
+    // is the same trust boundary — bound both before the bytes land.
+    let mut total = 0u64;
     visit_files(
         root,
         dir,
         depth,
         want,
         &mut |name, path| {
-            if let Ok(bytes) = fs::read(path) {
+            if total >= MAX_MEMBER_BYTES {
+                return;
+            }
+            let Ok(mut file) = fs::File::open(path) else {
+                return;
+            };
+            if let Ok(bytes) = read_capped(&mut file, name, MAX_MEMBER_BYTES - total) {
+                total += bytes.len() as u64;
                 out.push((name.to_string(), bytes));
             }
         },

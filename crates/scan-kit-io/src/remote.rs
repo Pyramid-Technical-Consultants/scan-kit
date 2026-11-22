@@ -46,6 +46,47 @@ pub(crate) trait Fs {
 
 /// ponytail: a session deeper than this is not fully copied. Raise the constant.
 const COPY_DEPTH: u32 = 32;
+
+/// Total bytes one remote session copy may write. Per-file reads are capped
+/// already; without an aggregate bound a deep listing still fills the disk.
+const MAX_COPY_BYTES: u64 = 4 << 30;
+
+/// A remote entry name that cannot become a Windows file or dir: illegal
+/// characters, DOS device stems, and trailing dots/spaces. Skipping mirrors
+/// the separator guard — the alternative is a create that can only fail.
+pub(crate) fn unsafe_local_name(name: &str) -> bool {
+    name.contains(['/', '\\', ':', '?', '*', '"', '<', '>', '|'])
+        || name != name.trim_end_matches(['.', ' '])
+        || matches!(
+            name.split('.')
+                .next()
+                .unwrap_or(name)
+                .to_ascii_lowercase()
+                .as_str(),
+            "con"
+                | "prn"
+                | "aux"
+                | "nul"
+                | "com1"
+                | "com2"
+                | "com3"
+                | "com4"
+                | "com5"
+                | "com6"
+                | "com7"
+                | "com8"
+                | "com9"
+                | "lpt1"
+                | "lpt2"
+                | "lpt3"
+                | "lpt4"
+                | "lpt5"
+                | "lpt6"
+                | "lpt7"
+                | "lpt8"
+                | "lpt9"
+        )
+}
 const FAKE_MTIME_NS: i64 = 1_000_000_000;
 
 struct Fixture {
@@ -472,7 +513,7 @@ mod net {
         fn copy_to(&mut self, path: &str, dest: &Path) -> Result<(), String> {
             let stat = self.stat(path)?.ok_or_else(|| format!("missing {path}"))?;
             if stat.dir {
-                copy_sftp_dir(self, path, dest, 0)
+                copy_sftp_dir(self, path, dest, 0, &mut 0)
             } else {
                 let bytes = self.read(path)?.ok_or_else(|| format!("missing {path}"))?;
                 copy_file_to(dest, &bytes)
@@ -511,7 +552,13 @@ mod net {
         }
     }
 
-    fn copy_sftp_dir(fs: &mut SftpFs, path: &str, dest: &Path, depth: u32) -> Result<(), String> {
+    fn copy_sftp_dir(
+        fs: &mut SftpFs,
+        path: &str,
+        dest: &Path,
+        depth: u32,
+        total: &mut u64,
+    ) -> Result<(), String> {
         if depth > COPY_DEPTH {
             return Ok(());
         }
@@ -520,14 +567,21 @@ mod net {
             // A remote name is one entry on the server but can hold
             // characters that are path separators locally — `..\x` is a
             // legal unix filename and a traversal on Windows.
-            if item.name.contains(['/', '\\']) {
+            if super::unsafe_local_name(&item.name) {
                 continue;
             }
             let remote = format!("{}/{}", path.trim_end_matches('/'), item.name);
             let local = dest.join(&item.name);
             if item.dir {
-                copy_sftp_dir(fs, &remote, &local, depth + 1)?;
+                copy_sftp_dir(fs, &remote, &local, depth + 1, total)?;
             } else if let Some(bytes) = fs.read(&remote)? {
+                *total = total.saturating_add(bytes.len() as u64);
+                if *total > super::MAX_COPY_BYTES {
+                    return Err(format!(
+                        "remote copy of {path} exceeds {} bytes",
+                        super::MAX_COPY_BYTES
+                    ));
+                }
                 copy_file_to(&local, &bytes)?;
             }
         }
@@ -709,7 +763,7 @@ mod net {
         fn copy_to(&mut self, path: &str, dest: &Path) -> Result<(), String> {
             let stat = self.stat(path)?.ok_or_else(|| format!("missing {path}"))?;
             if stat.dir {
-                copy_ftp_dir(self, path, dest, 0)
+                copy_ftp_dir(self, path, dest, 0, &mut 0)
             } else {
                 let bytes = self.read(path)?.ok_or_else(|| format!("missing {path}"))?;
                 copy_file_to(dest, &bytes)
@@ -756,20 +810,33 @@ mod net {
         }
     }
 
-    fn copy_ftp_dir(fs: &mut FtpFs, path: &str, dest: &Path, depth: u32) -> Result<(), String> {
+    fn copy_ftp_dir(
+        fs: &mut FtpFs,
+        path: &str,
+        dest: &Path,
+        depth: u32,
+        total: &mut u64,
+    ) -> Result<(), String> {
         if depth > COPY_DEPTH {
             return Ok(());
         }
         fs::create_dir_all(dest).map_err(|err| err.to_string())?;
         for item in fs.list(path)? {
-            if item.name.contains(['/', '\\']) {
+            if super::unsafe_local_name(&item.name) {
                 continue;
             }
             let remote = format!("{}/{}", path.trim_end_matches('/'), item.name);
             let local = dest.join(&item.name);
             if item.dir {
-                copy_ftp_dir(fs, &remote, &local, depth + 1)?;
+                copy_ftp_dir(fs, &remote, &local, depth + 1, total)?;
             } else if let Some(bytes) = fs.read(&remote)? {
+                *total = total.saturating_add(bytes.len() as u64);
+                if *total > super::MAX_COPY_BYTES {
+                    return Err(format!(
+                        "remote copy of {path} exceeds {} bytes",
+                        super::MAX_COPY_BYTES
+                    ));
+                }
                 copy_file_to(&local, &bytes)?;
             }
         }
@@ -1146,6 +1213,18 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::thread;
+
+    #[test]
+    fn windows_unsafe_remote_names_are_rejected() {
+        for bad in [
+            "a?b", "x:y", "con", "NUL.txt", "com1", "lpt9", "trail ", "trail.", "a/b", "a\\b",
+        ] {
+            assert!(crate::remote::unsafe_local_name(bad), "{bad}");
+        }
+        for ok in ["spot_data.csv", "layer-0", "run_1", "annulus"] {
+            assert!(!crate::remote::unsafe_local_name(ok), "{ok}");
+        }
+    }
 
     fn remote(
         canonical: &str,

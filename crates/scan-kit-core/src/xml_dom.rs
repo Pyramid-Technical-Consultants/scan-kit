@@ -220,7 +220,10 @@ impl Parser<'_> {
             return Err("expected an XML element".into());
         }
         let name = self.name()?;
-        let mut attrs = Vec::new();
+        let mut attrs: Vec<(String, String)> = Vec::new();
+        // A linear find per attribute is O(n²) — crafted XML with thousands of
+        // attributes on one element is a CPU bomb. Index the seen names.
+        let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
         loop {
             self.skip_ws();
             match self.peek() {
@@ -244,9 +247,10 @@ impl Parser<'_> {
                     self.expect(b'=')?;
                     self.skip_ws();
                     let value = self.quoted()?;
-                    if let Some(slot) = attrs.iter_mut().find(|(have, _)| *have == key) {
-                        slot.1 = value;
+                    if let Some(&slot) = seen.get(&key) {
+                        attrs[slot].1 = value;
                     } else {
+                        seen.insert(key.clone(), attrs.len());
                         attrs.push((key, value));
                     }
                 }

@@ -321,6 +321,9 @@ struct HeldColumns {
     points: bool,
 }
 
+/// ponytail: retained (session × grain) column tables grow unbounded — an
+/// eviction here would drop accumulated `parts` mid-fill and break the Arc
+/// sharing callers rely on, so a cap is the bigger hazard, not a fix.
 fn column_store() -> &'static Mutex<HashMap<(PathBuf, Grain), HeldColumns>> {
     static STORE: OnceLock<Mutex<HashMap<(PathBuf, Grain), HeldColumns>>> = OnceLock::new();
     STORE.get_or_init(|| Mutex::new(HashMap::new()))
@@ -3154,12 +3157,24 @@ fn read_grain_headers(dir: &Path, timeslice: bool) -> (Vec<String>, Vec<(PathBuf
     let mut watched = Vec::new();
     let mut cacheable = true;
     if timeslice {
-        if let Some(path) = first_named(dir, |name| {
+        let (files, dirs) = named_files(dir, &|name| {
             name.ends_with("timeslice_data_device_units.csv")
-        }) {
-            names.extend(header_columns(&path));
-            watched.push(watch(&path));
-        } else {
+        });
+        for path in &files {
+            for name in header_columns(path) {
+                if !names.contains(&name) {
+                    names.push(name);
+                }
+            }
+            watched.push(watch(path));
+        }
+        // A later device's file lands under one of these dirs — watching them
+        // makes a late arrival invalidate the cached header set instead of
+        // hiding its columns.
+        for sub in dirs {
+            watched.push(watch(&sub));
+        }
+        if files.is_empty() {
             cacheable = false;
         }
     } else {
@@ -3211,10 +3226,13 @@ fn first_named(dir: &Path, pred: impl Fn(&str) -> bool) -> Option<PathBuf> {
         let mut files = Vec::new();
         let mut dirs = Vec::new();
         for entry in std::fs::read_dir(dir).ok()?.flatten() {
+            // file_type does not follow links — matching the session walk's
+            // symlink/junction refusal.
+            let kind = entry.file_type();
             let path = entry.path();
-            if path.is_file() {
+            if kind.as_ref().is_ok_and(|kind| kind.is_file()) {
                 files.push(path);
-            } else if path.is_dir() && depth < 4 {
+            } else if kind.is_ok_and(|kind| kind.is_dir()) && depth < 4 {
                 dirs.push(path);
             }
         }
@@ -3236,6 +3254,47 @@ fn first_named(dir: &Path, pred: impl Fn(&str) -> bool) -> Option<PathBuf> {
         None
     }
     walk(dir, &pred, 0)
+}
+
+/// Every file matching `pred` under `dir` (depth ≤ 4) plus every directory
+/// visited — callers watch the dirs so a file landing later invalidates.
+fn named_files(dir: &Path, pred: &impl Fn(&str) -> bool) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    fn walk(
+        dir: &Path,
+        pred: &impl Fn(&str) -> bool,
+        depth: u8,
+        files: &mut Vec<PathBuf>,
+        dirs: &mut Vec<PathBuf>,
+    ) {
+        dirs.push(dir.to_path_buf());
+        let Some(read) = std::fs::read_dir(dir).ok() else {
+            return;
+        };
+        let mut found = Vec::new();
+        let mut children = Vec::new();
+        for entry in read.flatten() {
+            let kind = entry.file_type();
+            let path = entry.path();
+            if kind.as_ref().is_ok_and(|kind| kind.is_file()) {
+                found.push(path);
+            } else if kind.is_ok_and(|kind| kind.is_dir()) && depth < 4 {
+                children.push(path);
+            }
+        }
+        found.sort();
+        files.extend(found.into_iter().filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(pred)
+        }));
+        for child in children {
+            walk(&child, pred, depth + 1, files, dirs);
+        }
+    }
+    let mut files = Vec::new();
+    let mut dirs = Vec::new();
+    walk(dir, pred, 0, &mut files, &mut dirs);
+    (files, dirs)
 }
 
 pub(crate) fn timeslice_energy_only(metric: &str) -> bool {
