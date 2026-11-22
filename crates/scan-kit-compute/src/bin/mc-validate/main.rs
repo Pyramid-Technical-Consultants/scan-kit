@@ -79,11 +79,15 @@ fn parse_args() -> Result<Args, String> {
             }
             "--write-goldens" => args.write_goldens = true,
             "--golden-primaries" => {
-                args.golden_primaries = it
+                let value: f64 = it
                     .next()
                     .ok_or("--golden-primaries needs a value")?
                     .parse()
                     .map_err(|_| "bad --golden-primaries")?;
+                if !value.is_finite() || value <= 0.0 {
+                    return Err("--golden-primaries must be a positive number".into());
+                }
+                args.golden_primaries = value;
             }
             "-h" | "--help" => {
                 println!("{}", std::env!("CARGO_PKG_NAME"));

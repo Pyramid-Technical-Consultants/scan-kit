@@ -382,11 +382,21 @@ pub fn run_mcsquare_patient(
     if !done.status.success() || !out.join("Dose.mhd").is_file() {
         let stdout = String::from_utf8_lossy(&done.stdout);
         let stderr = String::from_utf8_lossy(&done.stderr);
+        // Byte-slicing a String mid-char panics — tail on char boundaries.
+        let tail = |text: &str| -> String {
+            text.chars()
+                .rev()
+                .take(2000)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect()
+        };
         return Err(format!(
             "MCsquare failed on {}:\n{}\n{}",
             case.name,
-            &stdout[stdout.len().saturating_sub(2000)..],
-            &stderr[stderr.len().saturating_sub(2000)..]
+            tail(&stdout),
+            tail(&stderr)
         ));
     }
     let model = BeamModel::read(&patient_bdl())?;

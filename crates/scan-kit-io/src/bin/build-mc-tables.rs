@@ -211,14 +211,26 @@ fn read_properties(materials: &Path, name: &str) -> Result<Props, String> {
             "Electron_Density" => p.electron_density = f64v(&t, 1),
             "Radiation_Length" => p.x0 = f64v(&t, 1),
             "Nuclear_Data" => {
-                p.mtype = match t[1].as_str() {
+                p.mtype = match t
+                    .get(1)
+                    .map(String::as_str)
+                    .ok_or_else(|| format!("{name}: short Nuclear_Data row"))?
+                {
                     "Mixture" => TYPE_MIXTURE,
                     "ICRU" => TYPE_ICRU,
                     "proton-proton" => TYPE_PP,
                     other => return Err(format!("{name}: unknown Nuclear_Data {other}")),
                 }
             }
-            "Mixture_Component" => p.components.push((t[2].clone(), f64v(&t, 3) / 100.0)),
+            "Mixture_Component" => {
+                let (Some(element), Some(fraction)) = (t.get(2), t.get(3)) else {
+                    return Err(format!("{name}: short Mixture_Component row"));
+                };
+                p.components.push((
+                    element.clone(),
+                    fraction.parse().unwrap_or(f64::NAN) / 100.0,
+                ));
+            }
             _ => {}
         }
     }
@@ -265,8 +277,11 @@ fn read_elastic(
                 let mut cdf = [0.0f64; 36];
                 for k in 0..36 {
                     i += 1;
-                    let angle = f64v(&lines[i], 0);
-                    let value = f64v(&lines[i], 1);
+                    let line = lines
+                        .get(i)
+                        .ok_or_else(|| format!("{name}: truncated cross-section table"))?;
+                    let angle = f64v(line, 0);
+                    let value = f64v(line, 1);
                     if angle != (k + 1) as f64 * 5.0 {
                         return Err(format!("{name}: elastic angle {angle} at row {k}"));
                     }
@@ -343,13 +358,23 @@ fn read_inelastic(materials: &Path, name: &str, a: f64) -> Result<Vec<InelasticR
                 }
             }
             "Differential_cross_section" => {
-                let s = SPECIES.iter().position(|&x| x == t[1]).unwrap_or(0);
-                let n: usize = t[2].parse().unwrap_or(0);
+                let s = SPECIES
+                    .iter()
+                    .position(|&x| x == t.get(1).map_or("", String::as_str))
+                    .ok_or_else(|| {
+                        format!(
+                            "{name}: unknown species {}",
+                            t.get(1).map_or("<missing>", String::as_str)
+                        )
+                    })?;
+                let n: usize = t.get(2).and_then(|v| v.parse().ok()).unwrap_or(0);
                 let mut e = Vec::with_capacity(n);
                 let mut d = Vec::with_capacity(n);
                 let mut dd = Vec::with_capacity(n);
                 for r in 0..n {
-                    let row = &lines[i + 1 + r];
+                    let row = lines
+                        .get(i + 1 + r)
+                        .ok_or_else(|| format!("{name}: truncated inelastic block"))?;
                     e.push(f64v(row, 0));
                     d.push(f64v(row, 1));
                     let mut accum = [0.0f64; 13];
@@ -547,8 +572,13 @@ fn run() -> Result<(), String> {
         .iter()
         .map(|(_, n)| read_stop_pow(&materials, n))
         .collect::<Result<_, _>>()?;
-    let m_stop: Vec<f64> = stops.iter().flatten().copied().collect();
     let n_stop = stops.first().map(|s| s.len()).unwrap_or(0);
+    if stops.iter().any(|s| s.len() != n_stop) {
+        // m_stop is stored [nm, n_stop] flat — a divergent row length would
+        // silently misalign every later medium.
+        return Err("stopping-power files do not share a row count".into());
+    }
+    let m_stop: Vec<f64> = stops.iter().flatten().copied().collect();
     let m_nuc: Vec<f64> = media_props
         .iter()
         .flat_map(|p| interp_total(p, &elements))
