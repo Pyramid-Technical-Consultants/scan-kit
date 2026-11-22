@@ -487,7 +487,7 @@ fn parse(params: &Value) -> Result<Request, String> {
             let mut energies = Vec::new();
             for value in values {
                 let energy = value.as_f64().ok_or("energies must be numbers")?;
-                if energy.is_finite() && (0.0..=330.0).contains(&energy) {
+                if energy.is_finite() && (f64::EPSILON..=330.0).contains(&energy) {
                     energies.push(energy);
                 }
             }
@@ -863,5 +863,11 @@ mod tests {
             .unwrap();
         assert!(s40 < s84); // (3006,0040) < (3006,0084)
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn zero_is_not_an_energy() {
+        assert!(parse(&json!({ "energies": [0.0] })).is_err());
+        assert!(parse(&json!({ "energies": [100.0] })).is_ok());
     }
 }

@@ -509,7 +509,14 @@ fn walk_remote(
         }
     };
     for item in items {
-        if item.name.is_empty() || item.name == "." || item.name == ".." {
+        // Same guard as copy_sftp_dir: a hostile or buggy server can return
+        // a name holding separators — splicing one in walks and later
+        // deletes outside the configured root.
+        if item.name.is_empty()
+            || item.name == "."
+            || item.name == ".."
+            || item.name.contains(['/', '\\'])
+        {
             continue;
         }
         if item.dir {
@@ -606,7 +613,11 @@ fn remote_exam(
     let mut dirs = Vec::new();
     let mut count = 0i64;
     for item in fs.list(path)? {
-        if item.name.is_empty() || item.name == "." || item.name == ".." {
+        if item.name.is_empty()
+            || item.name == "."
+            || item.name == ".."
+            || item.name.contains(['/', '\\'])
+        {
             continue;
         }
         if item.dir {
@@ -682,7 +693,12 @@ fn remote_holds_session(
         return Ok(true);
     }
     for item in fs.list(path)? {
-        if item.dir && !item.name.is_empty() && item.name != "." && item.name != ".." {
+        if item.dir
+            && !item.name.is_empty()
+            && item.name != "."
+            && item.name != ".."
+            && !item.name.contains(['/', '\\'])
+        {
             let child = join_path(path, &item.name);
             if remote_holds_session(fs, &child, depth + 1)? {
                 return Ok(true);

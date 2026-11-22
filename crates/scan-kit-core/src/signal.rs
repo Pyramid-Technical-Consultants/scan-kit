@@ -352,6 +352,9 @@ pub fn welch_psd(
     mut seg_len: usize,
     overlap: f32,
 ) -> (Vec<f32>, Vec<f32>) {
+    if !fs.is_finite() || fs <= 0.0 {
+        return (Vec::new(), Vec::new());
+    }
     let mean = finite_mean(signal);
     let centered: Vec<f32> = signal
         .iter()
@@ -1236,5 +1239,13 @@ mod tests {
             [4, 4, 4],
         );
         assert!(grid.iter().all(|v| *v == 0.0));
+    }
+
+    #[test]
+    fn a_nonpositive_sample_rate_returns_no_psd() {
+        let (freqs, psd) = welch_psd(&[1.0; 64], 0.0, 16, 0.5);
+        assert!(freqs.is_empty() && psd.is_empty());
+        let (freqs, psd) = welch_psd(&[1.0; 64], f32::NAN, 16, 0.5);
+        assert!(freqs.is_empty() && psd.is_empty());
     }
 }

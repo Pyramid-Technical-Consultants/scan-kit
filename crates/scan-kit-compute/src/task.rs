@@ -864,34 +864,11 @@ impl Stage for SessionStage {
                 }
             };
         }
-        if self.done_units() >= self.units() && tail_done {
-            let scene = if preview && self.coarse_preview(&scene) {
-                match self.open_scene(&ids, false) {
-                    Ok(scene) => scene,
-                    Err(message) => {
-                        self.report.phase = Phase::Failed;
-                        self.report.note = message.clone();
-                        return Poll::Failed(message);
-                    }
-                }
-            } else {
-                scene
-            };
-            return match self.pack(&scene, false) {
-                Ok(bytes) => {
-                    remember_stamps(&self.stamps);
-                    self.loaded = total;
-                    self.report = report_at(Phase::Done, self.units(), self.units());
-                    Poll::Ready(bytes)
-                }
-                Err(message) => {
-                    self.report.phase = Phase::Failed;
-                    self.report.note = message.clone();
-                    Poll::Failed(message)
-                }
-            };
-        }
         if self.done_units() >= self.units() {
+            // The bound scene's file window was fixed at ensure_plan — a
+            // file or session that arrived mid-load would be sealed out of
+            // the "final" payload forever. Encode unbound so the last read
+            // picks up arrivals, like the !tail_done path always did.
             scan_kit_io::clear_slice();
             return match self.encode(&self.sessions.clone(), false) {
                 Ok(bytes) => {
@@ -1932,7 +1909,12 @@ fn remember_stamps(stamps: &[String]) {
 /// Length and mtime of the session files. The view is not part of the key:
 /// timeline, bins, and the other pictures read the same files.
 fn stamp_key(root: &Path, session: &str) -> String {
-    let dir = root.join(session);
+    // session_directory resolves nested layouts — root.join would stamp a
+    // directory that never exists and freeze the "cached" flag on.
+    // ponytail: timeslice-dir growth is deliberately excluded — stamping it
+    // would invalidate the slice on every append and force a full reload per
+    // poll; a timeslice-only session just keeps "cached" off.
+    let dir = scan_kit_io::session_directory(root, session);
     format!(
         "{}\n{session}\n{}\n{}",
         root.display(),

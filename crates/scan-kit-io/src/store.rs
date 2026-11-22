@@ -735,27 +735,33 @@ fn migrate(conn: &Connection) -> Result<(), String> {
             .map_err(|err| err.to_string())?;
         return Ok(());
     }
+    // Steps run inside one transaction, and each column is added only when
+    // absent — a mid-upgrade kill (or a foreign tool's partial migration)
+    // used to leave a versioned-but-half-altered DB that bricked every
+    // later open with duplicate-column errors.
     if version < 2 {
-        conn.execute_batch(
-            "
-            ALTER TABLE libraries ADD COLUMN bg_subtract INTEGER NOT NULL DEFAULT 0;
-            ALTER TABLE libraries ADD COLUMN calibration_mode TEXT NOT NULL DEFAULT 'off';
-            ALTER TABLE libraries ADD COLUMN contour_cutoff_percentile REAL NOT NULL DEFAULT 5.0;
-            ALTER TABLE libraries ADD COLUMN view_settings_imported INTEGER NOT NULL DEFAULT 0;
-            ALTER TABLE libraries ADD COLUMN view_settings_rev INTEGER NOT NULL DEFAULT 0;
-            ",
-        )
-        .map_err(|err| err.to_string())?;
+        migrate_columns(
+            conn,
+            "libraries",
+            &[
+                ("bg_subtract", "INTEGER NOT NULL DEFAULT 0"),
+                ("calibration_mode", "TEXT NOT NULL DEFAULT 'off'"),
+                ("contour_cutoff_percentile", "REAL NOT NULL DEFAULT 5.0"),
+                ("view_settings_imported", "INTEGER NOT NULL DEFAULT 0"),
+                ("view_settings_rev", "INTEGER NOT NULL DEFAULT 0"),
+            ],
+        )?;
     }
     if version < 3 {
-        conn.execute_batch(
-            "
-            ALTER TABLE sessions ADD COLUMN map_extent_mm REAL;
-            ALTER TABLE sessions ADD COLUMN layer_count INTEGER;
-            ALTER TABLE sessions ADD COLUMN map_geom_checked INTEGER NOT NULL DEFAULT 0;
-            ",
-        )
-        .map_err(|err| err.to_string())?;
+        migrate_columns(
+            conn,
+            "sessions",
+            &[
+                ("map_extent_mm", "REAL"),
+                ("layer_count", "INTEGER"),
+                ("map_geom_checked", "INTEGER NOT NULL DEFAULT 0"),
+            ],
+        )?;
     }
     if version < 4 {
         conn.execute_batch(EXAMS_TABLE)
@@ -766,6 +772,34 @@ fn migrate(conn: &Connection) -> Result<(), String> {
             .map_err(|err| err.to_string())?;
     }
     Ok(())
+}
+
+/// Table and column names are compile-time constants — never interpolated
+/// input — so the ALTER text can be formatted safely.
+fn migrate_columns(conn: &Connection, table: &str, columns: &[(&str, &str)]) -> Result<(), String> {
+    conn.execute_batch("BEGIN IMMEDIATE")
+        .map_err(|err| err.to_string())?;
+    let result = (|| -> Result<(), String> {
+        let existing: HashSet<String> = conn
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .map_err(|err| err.to_string())?
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(|err| err.to_string())?
+            .collect::<Result<_, _>>()
+            .map_err(|err| err.to_string())?;
+        for (name, def) in columns {
+            if !existing.contains(*name) {
+                conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {name} {def}"))
+                    .map_err(|err| err.to_string())?;
+            }
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = conn.execute_batch("ROLLBACK");
+        return result;
+    }
+    conn.execute_batch("COMMIT").map_err(|err| err.to_string())
 }
 
 fn ensure_library(conn: &Connection, root: &str) -> Result<i64, String> {
@@ -869,7 +903,17 @@ fn import_legacy(conn: &Connection, lib_id: i64, base: &Path) -> Result<(), Stri
 }
 
 fn import_app_settings_once(conn: &Connection, db_path: &Path) -> Result<(), String> {
-    if prefs_get(conn, PREF_APP_SETTINGS_IMPORTED)?.is_some() {
+    // Read the raw value — prefs_get maps corrupt JSON to None, which would
+    // re-import the legacy file and revert every setting on a bad row.
+    let marked: Option<String> = conn
+        .query_row(
+            "SELECT value FROM prefs WHERE key = ?1",
+            params![PREF_APP_SETTINGS_IMPORTED],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|err| err.to_string())?;
+    if marked.is_some() {
         return Ok(());
     }
     // The legacy file sits beside the database — a custom db imports its own
@@ -1078,4 +1122,65 @@ fn normalize_lexically(path: &Path) -> PathBuf {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_db(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("sk_store_{tag}_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("store.db")
+    }
+
+    #[test]
+    fn a_partly_migrated_schema_recovers() {
+        let path = temp_db("migrate");
+        let conn = open_connection(&path).unwrap();
+        // Simulate a kill that left version 1 with one v2 column applied.
+        conn.execute_batch(
+            "ALTER TABLE libraries DROP COLUMN view_settings_rev;
+             PRAGMA user_version = 1;",
+        )
+        .unwrap();
+        drop(conn);
+        let conn = open_connection(&path).unwrap();
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION as i64);
+        let count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM pragma_table_info('libraries')
+                 WHERE name = 'view_settings_rev'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_corrupt_import_flag_does_not_reimport() {
+        let path = temp_db("import");
+        let conn = open_connection(&path).unwrap();
+        // A row exists but holds non-JSON — prefs_get reads None, the raw
+        // check must still see it.
+        conn.execute(
+            "INSERT OR REPLACE INTO prefs(key, value) VALUES (?1, 'not json')",
+            params![PREF_APP_SETTINGS_IMPORTED],
+        )
+        .unwrap();
+        std::fs::write(
+            path.parent().unwrap().join("app_settings.json"),
+            r#"{"config_dir":"legacy"}"#,
+        )
+        .unwrap();
+        import_app_settings_once(&conn, &path).unwrap();
+        assert!(prefs_get(&conn, PREF_APP_SETTINGS).unwrap().is_none());
+        let _ = std::fs::remove_file(path.parent().unwrap().join("app_settings.json"));
+        let _ = std::fs::remove_file(&path);
+    }
 }

@@ -220,10 +220,13 @@ pub fn load_study(path: &Path) -> Result<PatientStudy, String> {
         sop_uid: String::new(),
         label: String::new(),
     });
-    if plan.frame != frame {
+    if !plan.frame.is_empty() && plan.frame != frame {
         return Err("the plan frame of reference does not match the CT".into());
     }
-    if dose_slices.iter().any(|(got, _)| got != &frame) {
+    if dose_slices
+        .iter()
+        .any(|(got, _)| !got.is_empty() && got != &frame)
+    {
         return Err("the dose frame of reference does not match the CT".into());
     }
     if !structures_frame.is_empty() && structures_frame != frame {
@@ -564,6 +567,9 @@ fn image_slices(elems: &[Elem], scale: f32) -> Result<Vec<Slice>, String> {
     if origin.iter().any(|value| !value.is_finite()) {
         return Err("CT image position is not finite".into());
     }
+    if !slope.is_finite() || !intercept.is_finite() {
+        return Err("CT rescale slope/intercept is not finite".into());
+    }
     // Image Orientation is the direction of increasing column, then increasing
     // row. The dose grid is patient +X along columns and +Y along rows, so an
     // axial prone or feet-first image is flipped into that order here.
@@ -573,7 +579,20 @@ fn image_slices(elems: &[Elem], scale: f32) -> Result<Vec<Slice>, String> {
     // Pixel Representation 1 stores two's-complement samples. Reading those as
     // unsigned turns a negative HU into a huge positive one.
     let signed = int_tag(elems, tag(0x0028, 0x0103)).unwrap_or(0) == 1;
-    let stored: Vec<f32> = if bits > 16 {
+    let stored: Vec<f32> = if bits == 8 {
+        pixels
+            .bytes
+            .iter()
+            .map(|byte| {
+                let raw = if signed {
+                    i8::from_le_bytes([*byte]) as f32
+                } else {
+                    *byte as f32
+                };
+                (raw * slope + intercept) * scale
+            })
+            .collect()
+    } else if bits > 16 {
         pixels
             .bytes
             .as_chunks::<4>()
@@ -1072,15 +1091,15 @@ fn tag(group: u16, element: u16) -> u32 {
 
 fn parse_file(bytes: &[u8]) -> Result<Vec<Elem>, String> {
     let (offset, implicit) = crate::dataset_offset(bytes);
-    parse_dataset_mode(&bytes[offset..], implicit?)
+    parse_dataset_mode(&bytes[offset..], implicit?, 0)
 }
 
 #[cfg(test)]
 fn parse_dataset(bytes: &[u8]) -> Result<Vec<Elem>, String> {
-    parse_dataset_mode(bytes, false)
+    parse_dataset_mode(bytes, false, 0)
 }
 
-fn parse_dataset_mode(bytes: &[u8], implicit: bool) -> Result<Vec<Elem>, String> {
+fn parse_dataset_mode(bytes: &[u8], implicit: bool, depth: u32) -> Result<Vec<Elem>, String> {
     let mut elems = Vec::new();
     let mut cursor = 0;
     while cursor + 8 <= bytes.len() {
@@ -1149,9 +1168,9 @@ fn parse_dataset_mode(bytes: &[u8], implicit: bool) -> Result<Vec<Elem>, String>
         // tag at the head of its value; a failed parse means the value is
         // plain bytes that happen to share the marker.
         let (items, seq) = if !implicit && is_seq {
-            (parse_items(value, false)?, true)
+            (parse_items(value, false, depth + 1)?, true)
         } else if implicit && looks_like_items(value) {
-            match parse_items(value, true) {
+            match parse_items(value, true, depth + 1) {
                 Ok(items) => (items, true),
                 Err(err) => {
                     // A first item whose length is undefined or fits inside
@@ -1182,7 +1201,13 @@ fn looks_like_items(value: &[u8]) -> bool {
     value.len() >= 8 && value[..4] == [0xFE, 0xFF, 0x00, 0xE0]
 }
 
-fn parse_items(bytes: &[u8], implicit: bool) -> Result<Vec<Vec<Elem>>, String> {
+fn parse_items(bytes: &[u8], implicit: bool, depth: u32) -> Result<Vec<Vec<Elem>>, String> {
+    // Defined-length SQs nest ~20 bytes per level — a hostile file can
+    // recurse tens of thousands deep and overflow the stack before any
+    // recoverable Err. Same ceiling as xml_dom.
+    if depth > 256 {
+        return Err("sequence nesting is too deep".into());
+    }
     let mut items = Vec::new();
     let mut cursor = 0;
     while cursor + 8 <= bytes.len() {
@@ -1208,7 +1233,7 @@ fn parse_items(bytes: &[u8], implicit: bool) -> Result<Vec<Vec<Elem>>, String> {
         if end > bytes.len() {
             return Err("a sequence item is short".into());
         }
-        items.push(parse_dataset_mode(&bytes[start..end], implicit)?);
+        items.push(parse_dataset_mode(&bytes[start..end], implicit, depth)?);
         cursor = end;
     }
     Ok(items)
@@ -2309,5 +2334,28 @@ mod tests {
             bytes: vec![0x32, 0x00],
         };
         assert_eq!(int_tag(&[elem], tag(0x0028, 0x0010)), Some(50));
+    }
+
+    #[test]
+    fn sequence_nesting_has_a_ceiling() {
+        // 300 nested defined-length sequences — explicit VR element +
+        // item wrapper per level — must Err, not overflow the stack.
+        let mut inner: Vec<u8> = Vec::new();
+        for _ in 0..300 {
+            let mut level = Vec::new();
+            level.extend_from_slice(&[0x0A, 0x30, 0xB0, 0x00]); // tag
+            level.extend_from_slice(b"SQ\x00\x00"); // VR + reserved
+            let item_len = inner.len() as u32;
+            level.extend_from_slice(&(8 + item_len).to_le_bytes());
+            level.extend_from_slice(&[0xFE, 0xFF, 0x00, 0xE0]); // item tag
+            level.extend_from_slice(&item_len.to_le_bytes());
+            level.extend_from_slice(&inner);
+            inner = level;
+        }
+        let err = match parse_dataset_mode(&inner, false, 0) {
+            Err(err) => err,
+            Ok(_) => panic!("nesting must fail past the depth cap"),
+        };
+        assert!(err.contains("deep"), "{err}");
     }
 }

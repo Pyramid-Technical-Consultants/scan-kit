@@ -745,7 +745,9 @@ fn load_spots(
         }
         extend_column(&mut spots.energy, &table, "energy", n);
         extend_column(&mut spots.weight, &table, "target_mu", n);
-        extend_column(&mut spots.charge, &table, "target_mu", n);
+        // Delivered charge is not commanded MU — no table column carries it,
+        // so NaN rather than a wrong-semantics duplicate.
+        extend_named(&mut spots.charge, &table, "charge", n);
         extend_column(&mut spots.plan_x, &table, "plan_x", n);
         extend_column(&mut spots.plan_y, &table, "plan_y", n);
         for index in 0..4 {

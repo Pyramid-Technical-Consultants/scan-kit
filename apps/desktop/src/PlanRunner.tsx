@@ -303,6 +303,11 @@ export function PlanRunner() {
   }
 
   async function run(action: () => Promise<void>) {
+    // busy state hasn't flushed for a same-frame second click — the ref is
+    // synchronous, so check it, not busy.
+    if (busyRef.current) {
+      return;
+    }
     busyRef.current = true;
     setBusy(true);
     try {

@@ -111,8 +111,11 @@ fn tokens(path: &Path) -> Result<Vec<Vec<String>>, String> {
     Ok(out)
 }
 
-fn f64v(t: &[String], i: usize) -> f64 {
-    t[i].parse().unwrap_or(f64::NAN)
+fn f64v(t: &[String], i: usize) -> Result<f64, String> {
+    Ok(t.get(i)
+        .ok_or_else(|| format!("expected field {i}: {t:?}"))?
+        .parse()
+        .unwrap_or(f64::NAN))
 }
 
 /// MCsquare material name -> label, from `Materials/list.dat`.
@@ -206,19 +209,31 @@ fn read_properties(materials: &Path, name: &str) -> Result<Props, String> {
     };
     for t in tokens(&materials.join(name).join("Material_Properties.dat"))? {
         match t[0].as_str() {
-            "Atomic_Weight" | "Molecular_Weight" => p.a = f64v(&t, 1),
-            "Density" => p.density = f64v(&t, 1),
-            "Electron_Density" => p.electron_density = f64v(&t, 1),
-            "Radiation_Length" => p.x0 = f64v(&t, 1),
+            "Atomic_Weight" | "Molecular_Weight" => p.a = f64v(&t, 1)?,
+            "Density" => p.density = f64v(&t, 1)?,
+            "Electron_Density" => p.electron_density = f64v(&t, 1)?,
+            "Radiation_Length" => p.x0 = f64v(&t, 1)?,
             "Nuclear_Data" => {
-                p.mtype = match t[1].as_str() {
+                p.mtype = match t
+                    .get(1)
+                    .map(String::as_str)
+                    .ok_or_else(|| format!("{name}: short Nuclear_Data row"))?
+                {
                     "Mixture" => TYPE_MIXTURE,
                     "ICRU" => TYPE_ICRU,
                     "proton-proton" => TYPE_PP,
                     other => return Err(format!("{name}: unknown Nuclear_Data {other}")),
                 }
             }
-            "Mixture_Component" => p.components.push((t[2].clone(), f64v(&t, 3) / 100.0)),
+            "Mixture_Component" => {
+                let (Some(element), Some(fraction)) = (t.get(2), t.get(3)) else {
+                    return Err(format!("{name}: short Mixture_Component row"));
+                };
+                p.components.push((
+                    element.clone(),
+                    fraction.parse().unwrap_or(f64::NAN) / 100.0,
+                ));
+            }
             _ => {}
         }
     }
@@ -259,14 +274,17 @@ fn read_elastic(
     let mut i = 0;
     while i < lines.len() {
         match lines[i][0].as_str() {
-            "Energy" => energies.push(f64v(&lines[i], 1)),
-            "Cross_section" => sigma.push(N_AVO * f64v(&lines[i], 1) * 1e-24 / a),
+            "Energy" => energies.push(f64v(&lines[i], 1)?),
+            "Cross_section" => sigma.push(N_AVO * f64v(&lines[i], 1)? * 1e-24 / a),
             "Differential_cross_section" => {
                 let mut cdf = [0.0f64; 36];
                 for k in 0..36 {
                     i += 1;
-                    let angle = f64v(&lines[i], 0);
-                    let value = f64v(&lines[i], 1);
+                    let line = lines
+                        .get(i)
+                        .ok_or_else(|| format!("{name}: truncated cross-section table"))?;
+                    let angle = f64v(line, 0)?;
+                    let value = f64v(line, 1)?;
                     if angle != (k + 1) as f64 * 5.0 {
                         return Err(format!("{name}: elastic angle {angle} at row {k}"));
                     }
@@ -281,6 +299,9 @@ fn read_elastic(
                     cdf[k] = (if k > 0 { cdf[k - 1] } else { 0.0 }) + value * w;
                 }
                 let total = cdf[35];
+                if !total.is_finite() || total <= 0.0 {
+                    return Err(format!("{name}: zero total cross section"));
+                }
                 cdfs.push(cdf.map(|c| c / total));
             }
             _ => {}
@@ -322,39 +343,49 @@ fn read_inelastic(materials: &Path, name: &str, a: f64) -> Result<Vec<InelasticR
         let t = &lines[i];
         match t[0].as_str() {
             "Energy" => records.push(InelasticRecord {
-                e: f64v(t, 1),
+                e: f64v(t, 1)?,
                 ..Default::default()
             }),
             "Cross_section" => {
                 if let Some(r) = records.last_mut() {
-                    r.sigma = N_AVO * f64v(t, 1) * 1e-24 / a;
+                    r.sigma = N_AVO * f64v(t, 1)? * 1e-24 / a;
                 }
             }
             "Multiplicity" => {
                 if let Some(r) = records.last_mut() {
                     if let Some(s) = SPECIES.iter().position(|&x| x == t[1]) {
-                        r.mult[s] = f64v(t, 2);
+                        r.mult[s] = f64v(t, 2)?;
                     }
                 }
             }
             "Energy_fraction_recoils" => {
                 if let Some(r) = records.last_mut() {
-                    r.recoil = f64v(t, 1);
+                    r.recoil = f64v(t, 1)?;
                 }
             }
             "Differential_cross_section" => {
-                let s = SPECIES.iter().position(|&x| x == t[1]).unwrap_or(0);
-                let n: usize = t[2].parse().unwrap_or(0);
+                let s = SPECIES
+                    .iter()
+                    .position(|&x| x == t.get(1).map_or("", String::as_str))
+                    .ok_or_else(|| {
+                        format!(
+                            "{name}: unknown species {}",
+                            t.get(1).map_or("<missing>", String::as_str)
+                        )
+                    })?;
+                let n: usize = t.get(2).and_then(|v| v.parse().ok()).unwrap_or(0);
                 let mut e = Vec::with_capacity(n);
                 let mut d = Vec::with_capacity(n);
                 let mut dd = Vec::with_capacity(n);
                 for r in 0..n {
-                    let row = &lines[i + 1 + r];
-                    e.push(f64v(row, 0));
-                    d.push(f64v(row, 1));
+                    let row = lines
+                        .get(i + 1 + r)
+                        .ok_or_else(|| format!("{name}: truncated inelastic block"))?;
+                    e.push(f64v(row, 0)?);
+                    d.push(f64v(row, 1)?);
                     let mut accum = [0.0f64; 13];
                     for k in 0..13 {
-                        accum[k] = f64v(row, 2 + k) * weights[k];
+                        accum[k] = f64v(row, 2 + k)? * weights[k];
                     }
                     dd.push(accum);
                 }
@@ -513,7 +544,14 @@ fn run() -> Result<(), String> {
 
     let nm = media.len();
     let ne = element_names.len();
-    let mcsquare_ids: Vec<i32> = media.iter().map(|(_, n)| ids[n]).collect();
+    let mcsquare_ids: Vec<i32> = media
+        .iter()
+        .map(|(_, n)| {
+            ids.get(n)
+                .copied()
+                .ok_or_else(|| format!("{n}: missing from list.dat"))
+        })
+        .collect::<Result<_, String>>()?;
     let m_props: Vec<f64> = media_props
         .iter()
         .flat_map(|p| [p.density, p.electron_density / p.density, p.x0])
@@ -539,7 +577,11 @@ fn run() -> Result<(), String> {
             vec![(p.name.clone(), 1.0)]
         };
         for (k, (n, f)) in comps.iter().enumerate() {
-            m_comp[m * width + k] = element_names.iter().position(|x| x == n).unwrap() as i32;
+            m_comp[m * width + k] = element_names
+                .iter()
+                .position(|x| x == n)
+                .ok_or_else(|| format!("{n}: component not an element"))?
+                as i32;
             m_frac[m * width + k] = *f;
         }
     }
@@ -547,8 +589,13 @@ fn run() -> Result<(), String> {
         .iter()
         .map(|(_, n)| read_stop_pow(&materials, n))
         .collect::<Result<_, _>>()?;
-    let m_stop: Vec<f64> = stops.iter().flatten().copied().collect();
     let n_stop = stops.first().map(|s| s.len()).unwrap_or(0);
+    if stops.iter().any(|s| s.len() != n_stop) {
+        // m_stop is stored [nm, n_stop] flat — a divergent row length would
+        // silently misalign every later medium.
+        return Err("stopping-power files do not share a row count".into());
+    }
+    let m_stop: Vec<f64> = stops.iter().flatten().copied().collect();
     let m_nuc: Vec<f64> = media_props
         .iter()
         .flat_map(|p| interp_total(p, &elements))
