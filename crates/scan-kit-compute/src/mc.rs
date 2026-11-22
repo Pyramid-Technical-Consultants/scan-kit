@@ -212,6 +212,9 @@ impl McRun {
                     self.done = Some(result.clone());
                     Poll::Ready(result)
                 }
+                // A cancel landing inside the drain aborts it — that is a
+                // cancellation, not a failure.
+                Err(_) if cancel.is_cancelled() => Poll::Cancelled,
                 Err(err) => Poll::Failed(err.to_string()),
             };
         }
@@ -234,7 +237,7 @@ impl McRun {
         let Some(live) = self.live.as_mut() else {
             return false;
         };
-        let target = (histories / live.per_batch).max(1) * live.per_batch;
+        let target = histories.div_ceil(live.per_batch).max(1) * live.per_batch;
         if target < live.next {
             return false;
         }
@@ -455,11 +458,13 @@ fn patient_launch(request: &PatientRequest) -> Result<Launch, ComputeError> {
 
 fn empty_result(launch: &Launch) -> McResult {
     let [nx, ny, nz] = launch.shape;
-    let nvox = nx.saturating_mul(ny).saturating_mul(nz).max(1);
+    let shape = [nx.max(1), ny.max(1), nz.max(1)];
+    // Size values from the clamped shape so product(shape) == values.len().
+    let nvox = shape[0].saturating_mul(shape[1]).saturating_mul(shape[2]);
     McResult {
         volume: Volume {
             origin: launch.origin_mm,
-            shape: [nx.max(1), ny.max(1), nz.max(1)],
+            shape,
             spacing: launch.spacing_cm.map(|cm| cm * 10.0),
             values: vec![0.0; nvox],
         },
@@ -573,7 +578,9 @@ async fn prepare(launch: Launch) -> Result<Live, ComputeError> {
     let tables = mc_tables();
     let histories = batch_count(launch.histories);
     let per_batch = (histories / 10).clamp(1, 100_000);
-    let histories = histories / per_batch * per_batch;
+    // Round up, not down: satisfied must reach the requested target when the
+    // run finishes — a floored count leaves paint_progress Pending forever.
+    let histories = histories.div_ceil(per_batch) * per_batch;
     let volume_cm3 = f64::from(launch.spacing_cm[0])
         * f64::from(launch.spacing_cm[1])
         * f64::from(launch.spacing_cm[2]);
@@ -1563,5 +1570,31 @@ mod tests {
             run.poll(Duration::from_micros(100), &cancel),
             Poll::Cancelled
         ));
+    }
+
+    #[test]
+    fn an_empty_result_matches_its_volume_shape() {
+        // A zero axis is clamped per-dimension — values must follow the
+        // clamped shape, not the raw product (was 16 voxels with len 1).
+        let result = empty_result(&Launch {
+            spots: Vec::new(),
+            protons: 0.0,
+            mode: 0,
+            flags: 0,
+            origin_cm: [0.0; 3],
+            spacing_cm: [1.0; 3],
+            shape: [4, 0, 4],
+            depth_cm: 0.0,
+            wet_cm: 0.0,
+            medium: 0,
+            histories: 0,
+            seed: 0,
+            material: Vec::new(),
+            density: Vec::new(),
+            beams: Vec::new(),
+            origin_mm: [0.0; 3],
+        });
+        let [nx, ny, nz] = result.volume.shape;
+        assert_eq!(result.volume.values.len(), nx * ny * nz);
     }
 }
