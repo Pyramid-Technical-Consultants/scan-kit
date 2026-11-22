@@ -417,6 +417,9 @@ export function ConfigTuning({
       return;
     }
     const seq = ++openSeq.current;
+    // Superseding an in-flight auto-open transfers the opening flag here —
+    // its finally defers to the seq owner, so clear it or it never falls.
+    setOpening(false);
     setBusy(true);
     try {
       const opened = await invoke<Opened>("scan_kit_config_open", { path: selected });
@@ -507,6 +510,10 @@ export function ConfigTuning({
     if (configDir.length === 0 || file.length === 0) {
       return;
     }
+    // A loadFile already in flight would resolve under the new configDir and
+    // restore the previous folder's XML — it must not outlive this save.
+    ++openSeq.current;
+    setOpening(false);
     const selected = await open({
       directory: true,
       multiple: false,
