@@ -103,6 +103,16 @@ fn listed_segments(options: &Value, defaults: &[Segment]) -> Vec<Segment> {
         if let Ok(items) = parse_segments(text) {
             return without_playhead(items);
         }
+        // One malformed item must not discard the whole list.
+        if let Ok(values) = serde_json::from_str::<Vec<Value>>(text) {
+            let items: Vec<Segment> = values
+                .iter()
+                .filter_map(|item| serde_json::from_value(item.clone()).ok())
+                .collect();
+            if !items.is_empty() {
+                return without_playhead(items);
+            }
+        }
     }
     let beam = options.get("beam").and_then(Value::as_str);
     let domain = options.get("domain").and_then(Value::as_str);
@@ -234,7 +244,7 @@ fn beam_gate(raw: &str) -> BeamGate {
         "beam_on" | "Beam On" | "on" | "On" => BeamGate::On,
         "beam_off" | "Beam Off" | "off" | "Off" => BeamGate::Off,
         "beam_both" | "Both" | "both" => BeamGate::Both,
-        _ => BeamGate::On,
+        _ => BeamGate::Both,
     }
 }
 
@@ -836,5 +846,24 @@ mod tests {
 
     fn table_time(index: i32) -> f32 {
         index as f32 * 0.001
+    }
+
+    #[test]
+    fn an_unknown_beam_gate_filters_nothing() {
+        assert!(matches!(beam_gate("nonsense"), BeamGate::Both));
+    }
+
+    #[test]
+    fn one_bad_segment_does_not_drop_the_rest() {
+        let options = serde_json::json!({
+            "segments": r#"[{"kind":"beam","state":"on"},{"kind":"nope"}]"#
+        });
+        let items = listed_segments(&options, &[]);
+        assert!(items.iter().any(|item| matches!(
+            item,
+            Segment::Beam {
+                state: BeamGate::On
+            }
+        )));
     }
 }

@@ -194,11 +194,19 @@ pub fn tool_input_schema(name: &str) -> Value {
             "required": ["gate"],
             "additionalProperties": false
         }),
-        "scan_kit_bin_edges" | "scan_kit_histogram" | "scan_kit_welch" => json!({
+        "scan_kit_bin_edges" | "scan_kit_histogram" => json!({
             "type": "object",
             "properties": {
                 "values": { "type": "array", "items": { "type": "number" } },
                 "bins": { "type": "integer" }
+            },
+            "required": ["values"],
+            "additionalProperties": false
+        }),
+        "scan_kit_welch" => json!({
+            "type": "object",
+            "properties": {
+                "values": { "type": "array", "items": { "type": "number" } }
             },
             "required": ["values"],
             "additionalProperties": false

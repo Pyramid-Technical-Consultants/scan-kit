@@ -530,23 +530,36 @@ pub fn metrics(inputs: &PatientInputs, run: &Transport, options: &Value) -> Pati
             .copied()
             .filter(|value| value.is_finite())
             .fold(0.0f32, f32::max);
-        let scale = (if tps.dose_type.eq_ignore_ascii_case("effective") {
-            RBE_CONSTANT as f32
+        // A PHYSICAL TPS dose compares against the pre-RBE physical dose; the
+        // constant scale only undoes the constant-RBE model, not a per-voxel
+        // variable-RBE weighting.
+        let physical_tps = !tps.dose_type.eq_ignore_ascii_case("effective");
+        let source: &[f32] = if physical_tps {
+            run.physical.as_deref().unwrap_or(&dose.values)
         } else {
+            &dose.values
+        };
+        let scale = if physical_tps && run.physical.is_some() {
             1.0
-        }) / (if run.effective {
-            RBE_CONSTANT as f32
         } else {
-            1.0
-        });
+            (if tps.dose_type.eq_ignore_ascii_case("effective") {
+                RBE_CONSTANT as f32
+            } else {
+                1.0
+            }) / (if run.effective {
+                RBE_CONSTANT as f32
+            } else {
+                1.0
+            })
+        };
         let same_grid = tps.shape == study.ct.shape
             && tps.spacing == study.ct.spacing
             && tps.origin == study.ct.origin;
         let evaluated: Vec<f32> = if same_grid {
-            dose.values.iter().map(|value| value * scale).collect()
+            source.iter().map(|value| value * scale).collect()
         } else {
             resample_linear(
-                &dose.values,
+                source,
                 study.ct.origin,
                 study.ct.spacing,
                 study.ct.shape,
@@ -1168,7 +1181,7 @@ fn records(
                     spot.wet_mm,
                     spot.shifter_distance_mm,
                     bdl,
-                );
+                )?;
             }
         }
     }
@@ -1191,7 +1204,7 @@ fn records(
                     spot.wet,
                     spot.distance,
                     bdl,
-                );
+                )?;
             }
         }
     }
@@ -1209,11 +1222,11 @@ fn push_spot(
     wet: f32,
     distance: f32,
     bdl: &str,
-) {
-    if let Ok(record) = spot_record_bdl(energy, x, y, beam as f32, wet, distance, bdl) {
-        spots.extend_from_slice(&record);
-        protons.push(mu * protons_per_mu_bdl(energy, bdl));
-    }
+) -> Result<(), String> {
+    let record = spot_record_bdl(energy, x, y, beam as f32, wet, distance, bdl)?;
+    spots.extend_from_slice(&record);
+    protons.push(mu * protons_per_mu_bdl(energy, bdl));
+    Ok(())
 }
 
 fn beam_control(study: &PatientStudy, chosen: Option<usize>) -> scan_kit_core::Control {

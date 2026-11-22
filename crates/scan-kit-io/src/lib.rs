@@ -331,7 +331,6 @@ pub fn tool_input_schema(name: &str) -> Value {
         "scan_kit_config_catalog" => json!({
             "type": "object",
             "properties": {
-                "path": { "type": "string" },
                 "db_path": { "type": "string" }
             },
             "additionalProperties": false
@@ -381,8 +380,7 @@ pub fn tool_input_schema(name: &str) -> Value {
                 "form": { "type": "object" },
                 "data_dir": { "type": "string" },
                 "session_ids": { "type": "array", "items": { "type": "string" } },
-                "params": { "type": "object" },
-                "db_path": { "type": "string" }
+                "params": { "type": "object" }
             },
             "required": ["workflow", "xml", "data_dir", "session_ids"],
             "additionalProperties": false
@@ -448,8 +446,7 @@ pub fn tool_input_schema(name: &str) -> Value {
             "type": "object",
             "properties": {
                 "has_plan": { "type": "boolean" },
-                "dest": { "type": "string" },
-                "db_path": { "type": "string" }
+                "dest": { "type": "string" }
             },
             "additionalProperties": false
         }),
@@ -465,8 +462,7 @@ pub fn tool_input_schema(name: &str) -> Value {
         "scan_kit_runner_control" => json!({
             "type": "object",
             "properties": {
-                "action": { "type": "string" },
-                "db_path": { "type": "string" }
+                "action": { "type": "string" }
             },
             "required": ["action"],
             "additionalProperties": false
@@ -1040,8 +1036,8 @@ fn library_root(path: &str) -> Result<String, String> {
 
 fn database_path(input: &Value) -> Result<PathBuf, InvokeError> {
     match input.get("db_path").and_then(Value::as_str) {
-        Some(path) => Ok(PathBuf::from(path)),
-        None => Ok(default_db_path()),
+        Some(path) if !path.trim().is_empty() => Ok(PathBuf::from(path)),
+        _ => Ok(default_db_path()),
     }
 }
 
@@ -1820,5 +1816,13 @@ Layer delivery: 27/27
         assert!(fs.stat(&format!("{base}/keep.txt")).unwrap().is_some());
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(location::cache_directory(&canonical));
+    }
+
+    #[test]
+    fn a_blank_db_path_means_the_default_store() {
+        let path = database_path(&json!({"db_path": ""})).unwrap();
+        assert_eq!(path, default_db_path());
+        let path = database_path(&json!({"db_path": "  "})).unwrap();
+        assert_eq!(path, default_db_path());
     }
 }

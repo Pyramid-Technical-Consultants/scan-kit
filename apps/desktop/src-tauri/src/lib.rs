@@ -27,8 +27,6 @@ macro_rules! forward {
     };
 }
 
-forward!(scan_kit_open_library(path: String));
-
 #[tauri::command]
 fn scan_kit_remember_password(path: String, password: String) {
     scan_kit_io::remember_password(&path, &password);
@@ -53,15 +51,9 @@ forward!(scan_kit_runner_connect(host: String));
 forward!(scan_kit_runner_disconnect);
 forward!(scan_kit_runner_upload(path: String));
 forward!(scan_kit_runner_control(action: String));
-forward!(scan_kit_runner_download(dest: String));
 forward!(scan_kit_runner_remember(file_dir: String));
 forward!(scan_kit_discover_subnet(subnet: String));
 forward!(scan_kit_scanners(action: String, folder: Option<String>));
-
-#[tauri::command]
-fn version() -> &'static str {
-    scan_kit_core::version()
-}
 
 #[tauri::command]
 fn scan_kit_about() -> Result<Value, String> {
@@ -110,41 +102,6 @@ async fn scan_kit_set_last_main_tab(tab: String) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || scan_kit_io::write_last_main_tab(&tab))
         .await
         .map_err(|err| err.to_string())?
-}
-
-#[tauri::command]
-async fn scan_kit_run_view(
-    view: String,
-    path: String,
-    session_ids: Vec<String>,
-    options: Value,
-    width: u32,
-    height: u32,
-    background: Vec<f32>,
-    foreground: Vec<f32>,
-    palette: Vec<Vec<f32>>,
-) -> Result<Value, String> {
-    let background = color4(&background, [0.11, 0.11, 0.12, 1.0]);
-    let foreground = color4(&foreground, [0.92, 0.92, 0.93, 1.0]);
-    let palette: Vec<[f32; 4]> = palette
-        .iter()
-        .map(|row| color4(row, [0.9, 0.9, 0.9, 1.0]))
-        .collect();
-    tauri::async_runtime::spawn_blocking(move || {
-        scan_kit_compute::run_view(
-            &view,
-            std::path::Path::new(&path),
-            &session_ids,
-            &options,
-            width,
-            height,
-            background,
-            foreground,
-            &palette,
-        )
-    })
-    .await
-    .map_err(|err| err.to_string())?
 }
 
 // The dose/report exports run as `write_dose`/`write_report` tasks so the
@@ -197,39 +154,6 @@ async fn scan_kit_cancel(task: u64) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || scan_kit_compute::cancel_task(task))
         .await
         .map_err(|err| err.to_string())
-}
-
-/// The packed scene for the webview's wasm plot. Pan, zoom, and hover stay in the webview.
-#[tauri::command]
-async fn scan_kit_open_plot(
-    view: String,
-    path: String,
-    session_ids: Vec<String>,
-    options: Value,
-    background: Vec<f32>,
-    foreground: Vec<f32>,
-    palette: Vec<Vec<f32>>,
-) -> Result<tauri::ipc::Response, String> {
-    let background = color4(&background, [0.11, 0.11, 0.12, 1.0]);
-    let foreground = color4(&foreground, [0.92, 0.92, 0.93, 1.0]);
-    let palette: Vec<[f32; 4]> = palette
-        .iter()
-        .map(|row| color4(row, [0.9, 0.9, 0.9, 1.0]))
-        .collect();
-    let bytes = tauri::async_runtime::spawn_blocking(move || {
-        scan_kit_compute::open_plot(
-            &view,
-            std::path::Path::new(&path),
-            &session_ids,
-            &options,
-            background,
-            foreground,
-            &palette,
-        )
-    })
-    .await
-    .map_err(|err| err.to_string())??;
-    Ok(tauri::ipc::Response::new(bytes))
 }
 
 #[tauri::command]
@@ -472,9 +396,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
-            version,
             scan_kit_about,
-            scan_kit_open_library,
             scan_kit_remember_password,
             scan_kit_set_note,
             scan_kit_session_storage_paths,
@@ -488,11 +410,9 @@ pub fn run() {
             scan_kit_set_window_geometry,
             scan_kit_last_main_tab,
             scan_kit_set_last_main_tab,
-            scan_kit_run_view,
             scan_kit_start,
             scan_kit_poll,
             scan_kit_cancel,
-            scan_kit_open_plot,
             scan_kit_open_study,
             scan_kit_plan_catalog,
             scan_kit_synthesize_plan,
@@ -513,7 +433,6 @@ pub fn run() {
             scan_kit_runner_status,
             scan_kit_runner_upload,
             scan_kit_runner_control,
-            scan_kit_runner_download,
             scan_kit_runner_remember,
             scan_kit_discover_subnet,
             scan_kit_scanners,
@@ -532,6 +451,24 @@ mod reveal_tests {
         let file = std::env::temp_dir().join("scan-kit-not-a-dir.csv");
         assert!(!reveal_args(&file).is_empty());
         assert!(!reveal_args(&std::env::temp_dir()).is_empty());
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            // xdg-open cannot select; it opens the containing folder.
+            let file_arg = reveal_args(&file)[0].to_string_lossy().into_owned();
+            assert_eq!(file_arg, file.parent().unwrap().display().to_string());
+            let dir_arg = reveal_args(&std::env::temp_dir())[0]
+                .to_string_lossy()
+                .into_owned();
+            assert_eq!(
+                dir_arg,
+                std::env::temp_dir().parent().unwrap().display().to_string()
+            );
+        }
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(reveal_args(&file)[0].to_string_lossy(), "-R");
+            assert_eq!(reveal_args(&file)[1].as_os_str(), file.as_os_str());
+        }
         #[cfg(windows)]
         {
             let file_arg = reveal_args(&file)[0].to_string_lossy().into_owned();
@@ -550,6 +487,8 @@ mod crash_log_tests {
     fn a_panic_is_appended_to_the_crash_log() {
         let home = std::env::temp_dir().join("scan-kit-crash-log-test");
         let _ = std::fs::remove_dir_all(&home);
+        let saved_userprofile = std::env::var_os("USERPROFILE");
+        let saved_home = std::env::var_os("HOME");
         std::env::set_var("USERPROFILE", &home);
         std::env::set_var("HOME", &home);
         super::log_panics();
@@ -559,5 +498,13 @@ mod crash_log_tests {
         assert!(text.contains("probe panic"));
         assert!(text.contains(scan_kit_core::version()));
         let _ = std::fs::remove_dir_all(&home);
+        match saved_userprofile {
+            Some(value) => std::env::set_var("USERPROFILE", value),
+            None => std::env::remove_var("USERPROFILE"),
+        }
+        match saved_home {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
     }
 }

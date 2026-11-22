@@ -90,7 +90,10 @@ pub fn parse_host(host: &str) -> Result<String, String> {
 
 pub fn normalize_host(host: &str) -> Result<String, String> {
     let host = parse_host(host)?;
-    if host.contains(':') {
+    if host.matches(':').count() > 1 {
+        // An IPv6 literal needs brackets in a URL authority.
+        Ok(format!("[{host}]"))
+    } else if host.contains(':') {
         Ok(host)
     } else {
         Ok(format!("{host}:80"))
@@ -233,6 +236,9 @@ pub fn format_elapsed(value: &Value) -> String {
     }
     if seconds < 60.0 {
         return format!("{seconds:.1} s");
+    }
+    if !(seconds.is_finite() && seconds < 1e9) {
+        return "—".to_owned();
     }
     let total = seconds as u64;
     let hours = total / 3600;

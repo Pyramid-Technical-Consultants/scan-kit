@@ -33,6 +33,8 @@ export function notifyError(error: unknown, id?: string): void {
   if (key == null || !logged.has(key)) {
     if (key != null) {
       logged.add(key);
+      // The dedup entry dies with the toast; a recurring failure logs again.
+      setTimeout(() => logged.delete(key), 8000);
     }
     appendLog("ERROR", "app", text);
   }

@@ -137,9 +137,9 @@ export function useScrub(
       end: scrub.end,
       speed: scrub.speed,
       window: scrub.window,
-      layers: scrubRef.current.layers,
+      layers: scrub.layers,
     };
-  }, [scrub.on, scrub.at, scrub.end, scrub.speed, scrub.window]);
+  }, [scrub.on, scrub.at, scrub.end, scrub.speed, scrub.window, scrub.layers]);
 
   useEffect(() => {
     pending.current = false;

@@ -309,8 +309,8 @@ fn push_roi(
     }
     let mut contour = Vec::new();
     patient::is_list(&mut contour, 0x3006, 0x002A, &color.map(u16::from))?;
-    patient::is(&mut contour, 0x3006, 0x0084, number)?;
     patient::sq(&mut contour, 0x3006, 0x0040, &drawn)?;
+    patient::is(&mut contour, 0x3006, 0x0084, number)?;
     contours.push(contour);
     Ok(())
 }
@@ -338,17 +338,16 @@ fn write_plan(dir: &Path, request: &Request, study: &str, frame: &str) -> Result
     patient::sq(&mut bytes, 0x300A, 0x0010, &[dose_ref])?;
     let setup = {
         let mut item = Vec::new();
-        patient::is(&mut item, 0x300A, 0x0182, 1)?;
         patient::cs(&mut item, 0x0018, 0x5100, &request.position)?;
+        patient::is(&mut item, 0x300A, 0x0182, 1)?;
         item
     };
-    patient::sq(&mut bytes, 0x300A, 0x0180, &[setup])?;
     let n = request.spots.len();
     let cum = (n * request.energies.len()) as f32;
     let referenced = {
         let mut item = Vec::new();
-        patient::is(&mut item, 0x300C, 0x0006, 1)?;
         patient::ds(&mut item, 0x300A, 0x0086, &[cum * request.mu as f32])?;
+        patient::is(&mut item, 0x300C, 0x0006, 1)?;
         item
     };
     let fraction = {
@@ -360,6 +359,7 @@ fn write_plan(dir: &Path, request: &Request, study: &str, frame: &str) -> Result
         item
     };
     patient::sq(&mut bytes, 0x300A, 0x0070, &[fraction])?;
+    patient::sq(&mut bytes, 0x300A, 0x0180, &[setup])?;
     let mut cps = Vec::new();
     let mut weight = 0.0f32;
     let mut first = true;
@@ -376,17 +376,19 @@ fn write_plan(dir: &Path, request: &Request, study: &str, frame: &str) -> Result
                     0x012C,
                     &[0.0, ((PTV.y0 + PTV.y1) / 2.0) as f32, 0.0],
                 )?;
+                patient::ds(&mut cp, 0x300A, 0x0134, &[weight])?;
                 patient::ds(&mut cp, 0x300A, 0x030D, &[300.0])?;
                 if request.wet > 0.0 {
                     let mut setting = Vec::new();
-                    patient::is(&mut setting, 0x300C, 0x0100, 1)?;
                     patient::cs(&mut setting, 0x300A, 0x0362, "IN")?;
                     patient::ds(&mut setting, 0x300A, 0x0364, &[300.0])?;
                     patient::ds(&mut setting, 0x300A, 0x0366, &[request.wet as f32])?;
+                    patient::is(&mut setting, 0x300C, 0x0100, 1)?;
                     patient::sq(&mut cp, 0x300A, 0x0360, &[setting])?;
                 }
+            } else {
+                patient::ds(&mut cp, 0x300A, 0x0134, &[weight])?;
             }
-            patient::ds(&mut cp, 0x300A, 0x0134, &[weight])?;
             patient::sh(&mut cp, 0x300A, 0x0390, "3.0")?;
             patient::is(&mut cp, 0x300A, 0x0392, n as i32)?;
             let mut xy = Vec::with_capacity(n * 2);
@@ -406,13 +408,13 @@ fn write_plan(dir: &Path, request: &Request, study: &str, frame: &str) -> Result
     }
     let beam = {
         let mut item = Vec::new();
+        patient::lo(&mut item, 0x300A, 0x00B2, "SYNTH")?;
         patient::is(&mut item, 0x300A, 0x00C0, 1)?;
         patient::lo(&mut item, 0x300A, 0x00C2, "B1")?;
         patient::cs(&mut item, 0x300A, 0x00C6, "PROTON")?;
         patient::cs(&mut item, 0x300A, 0x00CE, "TREATMENT")?;
-        patient::lo(&mut item, 0x300A, 0x00B2, "SYNTH")?;
-        patient::is(&mut item, 0x300A, 0x0110, cps.len() as i32)?;
         patient::ds(&mut item, 0x300A, 0x010E, &[weight])?;
+        patient::is(&mut item, 0x300A, 0x0110, cps.len() as i32)?;
         patient::cs(&mut item, 0x300A, 0x0308, "MODULATED")?;
         patient::ds(&mut item, 0x300A, 0x030A, &[2000.0, 2000.0])?;
         if request.wet > 0.0 {
@@ -423,8 +425,8 @@ fn write_plan(dir: &Path, request: &Request, study: &str, frame: &str) -> Result
             patient::cs(&mut shifter, 0x300A, 0x0320, "BINARY")?;
             patient::sq(&mut item, 0x300A, 0x0314, &[shifter])?;
         }
-        patient::is(&mut item, 0x300C, 0x006A, 1)?;
         patient::sq(&mut item, 0x300A, 0x03A8, &cps)?;
+        patient::is(&mut item, 0x300C, 0x006A, 1)?;
         item
     };
     patient::sq(&mut bytes, 0x300A, 0x03A2, &[beam])?;
@@ -474,8 +476,8 @@ fn parse(params: &Value) -> Result<Request, String> {
     }
     let pixel = number(params, "pixel", 2.0)?;
     let slice = number(params, "slice", 2.0)?;
-    if pixel <= 0.0 || slice <= 0.0 {
-        return Err("Pixel spacing and slice thickness must be positive.".into());
+    if !(0.0..=100.0).contains(&pixel) || !(0.0..=100.0).contains(&slice) {
+        return Err("Pixel spacing and slice thickness must be from 0 to 100 mm.".into());
     }
     let mut energies = match params.get("energies").and_then(Value::as_array) {
         Some(values) if values.is_empty() => {
@@ -485,7 +487,7 @@ fn parse(params: &Value) -> Result<Request, String> {
             let mut energies = Vec::new();
             for value in values {
                 let energy = value.as_f64().ok_or("energies must be numbers")?;
-                if energy.is_finite() && energy > 0.0 {
+                if energy.is_finite() && (0.0..=330.0).contains(&energy) {
                     energies.push(energy);
                 }
             }
@@ -499,6 +501,9 @@ fn parse(params: &Value) -> Result<Request, String> {
     energies.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let gantry = number(params, "gantry", 0.0)?;
     let couch = number(params, "couch", 0.0)?;
+    if !(-360.0..=360.0).contains(&gantry) || !(-360.0..=360.0).contains(&couch) {
+        return Err("Gantry and couch angles must be from -360 to 360 degrees.".into());
+    }
     let pitch = number(params, "spot_pitch", 6.0)?;
     if !(1.0..=12.0).contains(&pitch) {
         return Err("Spot pitch (mm) must be from 1 to 12.".into());
@@ -822,5 +827,41 @@ mod tests {
         assert!(study.ct.hu.iter().all(|value| *value <= 0.1));
         assert!(study.ct.hu.iter().all(|value| (*value + 750.0).abs() > 1.0));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn out_of_range_params_are_rejected() {
+        assert!(parse(&json!({"energies": [1e40]})).is_err());
+        assert!(parse(&json!({"gantry": 500.0})).is_err());
+        assert!(parse(&json!({"couch": -500.0})).is_err());
+        assert!(parse(&json!({"pixel": 1e40})).is_err());
+        assert!(parse(&json!({"slice": 0.0})).is_err());
+        assert!(parse(&json!({})).is_ok());
+    }
+
+    #[test]
+    fn written_tags_ascend_within_each_dataset() {
+        let dir = std::env::temp_dir().join(format!("scan-kit-tag-order-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        write_phantom_study(&dir, &json!({"range_shifter_wet": 30.0})).unwrap();
+        let plan = std::fs::read(dir.join("RP_synthetic.dcm")).unwrap();
+        let find = |needle: [u8; 4]| plan.windows(4).position(|w| w == needle).unwrap();
+        assert!(find([0x0A, 0x30, 0x70, 0x00]) < find([0x0A, 0x30, 0x80, 0x01])); // 0070 < 0180
+        assert!(find([0x0A, 0x30, 0xB2, 0x00]) < find([0x0A, 0x30, 0xC0, 0x00])); // 00B2 < 00C0
+        assert!(find([0x0A, 0x30, 0x0E, 0x01]) < find([0x0A, 0x30, 0x10, 0x01])); // 010E < 0110
+        assert!(find([0x0A, 0x30, 0x34, 0x01]) < find([0x0A, 0x30, 0x0D, 0x03])); // 0134 < 030D
+        assert!(find([0x0A, 0x30, 0xA8, 0x03]) < find([0x0C, 0x30, 0x6A, 0x00])); // 03A8 < 300C,006A
+        let rs = std::fs::read(dir.join("RS_synthetic.dcm")).unwrap();
+        let s40 = rs
+            .windows(4)
+            .position(|w| w == [0x06, 0x30, 0x40, 0x00])
+            .unwrap();
+        let s84 = rs
+            .windows(4)
+            .position(|w| w == [0x06, 0x30, 0x84, 0x00])
+            .unwrap();
+        assert!(s40 < s84); // (3006,0040) < (3006,0084)
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

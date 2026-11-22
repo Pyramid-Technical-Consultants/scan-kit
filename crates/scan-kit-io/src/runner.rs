@@ -297,13 +297,14 @@ fn connected_body(
     view
 }
 
-fn view_of(live: &Live, has_plan: bool, _dest: &str) -> Value {
+fn view_of(live: &Live, has_plan: bool, dest: &str) -> Value {
     let mut view = runner_view(&Value::Object(live.status.clone()), true, has_plan);
     view["host"] = json!(live.host);
     view["version"] = json!(display_io(&live.version));
     view["device_type"] = json!(display_io(&live.device_type));
     view["session_directory"] = json!(live.session_directory);
     view["session_id"] = json!(live.session_id);
+    view["dest"] = json!(session_zip_dest(dest));
     view["hint"] = json!(scan_kit_core::session_download_hint(&live.session_id));
     view
 }

@@ -312,6 +312,9 @@ const FILL_SPOT: u8 = 16;
 
 struct HeldColumns {
     span: (u8, usize, usize),
+    /// Governing-file fingerprint; an unbound slice never changes `span`, so
+    /// the merged columns must still re-check the files behind them.
+    stamp: u128,
     parts: Vec<(u8, Table)>,
     merged: Table,
     /// Spot delivery time was included. A later ask can reuse this table.
@@ -461,13 +464,20 @@ pub(crate) fn session_columns(root: &Path, session: &str, grain: Grain, names: &
     let points = matches!(grain, Grain::Spot | Grain::SpotChamber) && wants_point_time(names);
     let span = span_of(session);
     let dir = discover::session_directory(root, session);
+    let stamp = discover::meta_stamp(&dir.join("spot_data.csv"))
+        ^ discover::meta_stamp(&dir.join("input_map.csv")).rotate_left(64)
+        ^ discover::timeslice_stamp(&dir).rotate_left(32);
     let key = (dir, grain);
     let mut produced = Vec::new();
     {
         let store = column_store().lock().unwrap_or_else(|err| err.into_inner());
         if let Some(held) = store.get(&key) {
             let have = held.parts.iter().fold(0u8, |bits, (fill, _)| bits | fill);
-            if held.span == span && (have & need) == need && (!points || held.points) {
+            if held.span == span
+                && held.stamp == stamp
+                && (have & need) == need
+                && (!points || held.points)
+            {
                 return Arc::clone(&held.merged);
             }
         }
@@ -487,12 +497,14 @@ pub(crate) fn session_columns(root: &Path, session: &str, grain: Grain, names: &
     let mut store = column_store().lock().unwrap_or_else(|err| err.into_inner());
     let held = store.entry(key).or_insert_with(|| HeldColumns {
         span,
+        stamp,
         parts: Vec::new(),
         merged: Arc::new(BTreeMap::new()),
         points: false,
     });
-    if held.span != span {
+    if held.span != span || held.stamp != stamp {
         held.span = span;
+        held.stamp = stamp;
         held.parts.clear();
         held.merged = Arc::new(BTreeMap::new());
         held.points = false;
@@ -631,6 +643,8 @@ fn cached_timeslice(
     build: impl FnOnce(&Frames) -> BTreeMap<String, Vec<f32>>,
 ) -> Table {
     let frames = frame_key(root, session, family);
+    let map_stamp = frames.map_stamp;
+    let slice_stamp = frames.slice_stamp;
     let key = TableKey {
         spot_stamp: if spot {
             discover::meta_stamp(&frames.dir.join("spot_data.csv"))
@@ -660,7 +674,15 @@ fn cached_timeslice(
         0
     };
     if let Some((files, tail_rows)) = partial {
-        match take_grown(&dir, kind, files, tail_rows, spot_stamp) {
+        match take_grown(
+            &dir,
+            kind,
+            files,
+            tail_rows,
+            spot_stamp,
+            map_stamp,
+            slice_stamp,
+        ) {
             GrownHit::Same(table) => return table,
             GrownHit::More(previous) => {
                 let _ = take_full_table();
@@ -682,7 +704,16 @@ fn cached_timeslice(
                     restamp_sample_time(grown);
                     table
                 };
-                store_growth(&dir, kind, files, tail_rows, spot_stamp, Arc::clone(&table));
+                store_growth(
+                    &dir,
+                    kind,
+                    files,
+                    tail_rows,
+                    spot_stamp,
+                    map_stamp,
+                    slice_stamp,
+                    Arc::clone(&table),
+                );
                 return table;
             }
             GrownHit::Miss => {}
@@ -696,7 +727,16 @@ fn cached_timeslice(
     );
     let _ = take_full_table();
     if let Some((files, tail_rows)) = partial {
-        store_growth(&dir, kind, files, tail_rows, spot_stamp, Arc::clone(&table));
+        store_growth(
+            &dir,
+            kind,
+            files,
+            tail_rows,
+            spot_stamp,
+            map_stamp,
+            slice_stamp,
+            Arc::clone(&table),
+        );
         return table;
     }
     let mut cache = table_cache().lock().unwrap_or_else(|err| err.into_inner());
@@ -712,6 +752,8 @@ struct Grown {
     files: usize,
     tail_rows: usize,
     spot_stamp: u128,
+    map_stamp: u128,
+    slice_stamp: u128,
     table: Table,
 }
 
@@ -744,13 +786,18 @@ fn take_grown(
     files: usize,
     tail_rows: usize,
     spot_stamp: u128,
+    map_stamp: u128,
+    slice_stamp: u128,
 ) -> GrownHit {
     let key = (dir.to_path_buf(), kind.to_string());
     let mut cache = growth_cache().lock().unwrap_or_else(|err| err.into_inner());
     let Some(have) = cache.get(&key) else {
         return GrownHit::Miss;
     };
-    if have.spot_stamp != spot_stamp {
+    if have.spot_stamp != spot_stamp
+        || have.map_stamp != map_stamp
+        || have.slice_stamp != slice_stamp
+    {
         cache.remove(&key);
         return GrownHit::Miss;
     }
@@ -773,6 +820,8 @@ fn store_growth(
     files: usize,
     tail_rows: usize,
     spot_stamp: u128,
+    map_stamp: u128,
+    slice_stamp: u128,
     table: Table,
 ) {
     let mut cache = growth_cache().lock().unwrap_or_else(|err| err.into_inner());
@@ -785,6 +834,8 @@ fn store_growth(
             files,
             tail_rows,
             spot_stamp,
+            map_stamp,
+            slice_stamp,
             table,
         },
     );
@@ -4121,28 +4172,31 @@ fn store_sheet(key: SheetKey, sheet: &Arc<Sheet>) {
     cache.insert(key, Arc::clone(sheet));
 }
 
-fn read_and_cache(path: &Path, stamp: u128, keep: Keep, pred: fn(&str) -> bool) -> Arc<Sheet> {
+fn read_and_cache(
+    path: &Path,
+    stamp: u128,
+    keep: Keep,
+    pred: fn(&str) -> bool,
+) -> Option<Arc<Sheet>> {
     let key = sheet_key(path, stamp, keep);
     if let Some(hit) = cached_sheet(&key) {
-        return hit;
+        return Some(hit);
     }
     let (bytes, fresh) = if let Some(window) = window_of(path, stamp).filter(|window| window.done) {
         (window.bytes, false)
     } else {
-        (
-            {
-                note_disk_read(path);
-                Arc::new(std::fs::read(path).unwrap_or_default())
-            },
-            true,
-        )
+        note_disk_read(path);
+        match std::fs::read(path) {
+            Ok(bytes) => (Arc::new(bytes), true),
+            Err(_) => return None,
+        }
     };
     let sheet = Arc::new(read_sheet_where(&bytes, pred));
     if fresh {
         remember_window(path, stamp, Arc::clone(&bytes), finished_rows(&sheet), true);
     }
     store_sheet(key, &sheet);
-    sheet
+    Some(sheet)
 }
 
 fn sheet_all(path: &Path, keep: Keep, pred: fn(&str) -> bool) -> Arc<Sheet> {
@@ -4162,7 +4216,7 @@ fn sheet_all(path: &Path, keep: Keep, pred: fn(&str) -> bool) -> Arc<Sheet> {
     if resume {
         return sheet_rows(path, keep, pred, usize::MAX);
     }
-    read_and_cache(path, stamp, keep, pred)
+    read_and_cache(path, stamp, keep, pred).unwrap_or_else(|| Arc::new(read_sheet_where(&[], pred)))
 }
 
 /// `want` rows already cover this file.
@@ -4458,16 +4512,21 @@ fn read_more(file: &mut std::fs::File, newlines: usize, bytes_per_row: usize) ->
     .min(remain);
     let mut buf = vec![0u8; cover];
     let mut filled = 0usize;
+    let mut failed = false;
     while filled < buf.len() {
         match file.read(&mut buf[filled..]) {
             Ok(0) => break,
             Ok(count) => filled += count,
-            Err(_) => break,
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => {
+                failed = true;
+                break;
+            }
         }
     }
     buf.truncate(filled);
     if buf.is_empty() {
-        return (buf, true);
+        return (buf, !failed);
     }
     if nth_newline(&buf, newlines).is_some() || buf.len() < cover || cover == remain {
         return trim_newlines(file, buf, newlines);
@@ -4475,7 +4534,9 @@ fn read_more(file: &mut std::fs::File, newlines: usize, bytes_per_row: usize) ->
     let mut tmp = vec![0u8; 8 * 1024 * 1024];
     loop {
         match file.read(&mut tmp) {
-            Ok(0) | Err(_) => return (buf, true),
+            Ok(0) => return (buf, true),
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return (buf, false),
             Ok(count) => buf.extend_from_slice(&tmp[..count]),
         }
         if nth_newline(&buf, newlines).is_some() {
@@ -4543,7 +4604,9 @@ fn sheet_rows(path: &Path, keep: Keep, pred: fn(&str) -> bool, want: usize) -> A
     // A 128-window picture is wider than one timeslice file. Parse it like a
     // one-shot read instead of pulling it through the row window.
     if !resume && file_fits_window(path, want) {
-        let sheet = read_and_cache(path, stamp, keep, pred);
+        let Some(sheet) = read_and_cache(path, stamp, keep, pred) else {
+            return Arc::new(read_sheet_where(&[], pred));
+        };
         let have = finished_rows(&sheet);
         if want >= have {
             set_tail_done(true, path);
@@ -4567,16 +4630,13 @@ fn sheet_rows(path: &Path, keep: Keep, pred: fn(&str) -> bool, want: usize) -> A
     }
     if !tail.done && tail.rows < want {
         if tail.file.is_none() {
-            match std::fs::File::open(path) {
-                Ok(mut file) => {
-                    note_disk_read(path);
-                    if tail.cursor > 0 && file.seek(SeekFrom::Start(tail.cursor as u64)).is_err() {
-                        tail.done = true;
-                    } else {
-                        tail.file = Some(file);
-                    }
+            // An open/seek failure leaves the tail undecided: the partial rows
+            // stay unfinished and the next call retries.
+            if let Ok(mut file) = std::fs::File::open(path) {
+                note_disk_read(path);
+                if tail.cursor == 0 || file.seek(SeekFrom::Start(tail.cursor as u64)).is_ok() {
+                    tail.file = Some(file);
                 }
-                Err(_) => tail.done = true,
             }
         }
         if !tail.done {

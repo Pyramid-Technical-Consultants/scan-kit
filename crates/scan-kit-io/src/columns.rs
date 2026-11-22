@@ -28,11 +28,15 @@ pub fn load_columns(
     let spots = discover::read_session_file(storage, session_id, "spot_data.csv");
     // Score the union of timeslice headers — a column that only appears in a
     // later file must not route the load to a table that lacks it.
-    let timeslice_score = timeslices
+    let timeslice_score = requested
         .iter()
-        .map(|bytes| score(bytes, requested))
-        .max()
-        .unwrap_or(0);
+        .filter(|name| {
+            timeslices.iter().any(|bytes| {
+                header_of(bytes)
+                    .is_ok_and(|headers| !matches!(source_for(&headers, name), Source::Missing))
+            })
+        })
+        .count();
     let map_score = map
         .as_ref()
         .map(|bytes| score(bytes, requested))
