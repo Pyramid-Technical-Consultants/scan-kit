@@ -1012,6 +1012,13 @@ fn folder_key(path: &Path) -> String {
     } else {
         path.to_path_buf()
     };
+    // A relative tail keeps the key relative and slips past the
+    // source-inside-dest prefix checks — anchor it at the cwd.
+    let normalized = if normalized.is_absolute() {
+        normalized
+    } else {
+        std::env::current_dir().unwrap_or_default().join(normalized)
+    };
     normalized
         .to_string_lossy()
         .replace('\\', "/")

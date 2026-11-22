@@ -165,7 +165,13 @@ pub fn start_task(
         }
     };
     if let Some((id, mut stage)) = checked_out {
-        if stage.retarget(path, sessions, options, palette, background, foreground) {
+        // retarget runs the same fallible call tree poll wraps in
+        // catch_unwind — a panic must not leave task.stage None forever.
+        let retargeted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            stage.retarget(path, sessions, options, palette, background, foreground)
+        }))
+        .unwrap_or(false);
+        if retargeted {
             let mut driver = lock();
             // The task may have been cancelled or replaced while the stage
             // was checked out — only adopt when it is still parked for us.

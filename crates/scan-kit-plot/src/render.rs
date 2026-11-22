@@ -6333,11 +6333,12 @@ fn axis_ticks(lo: f32, hi: f32) -> Vec<(f32, bool)> {
     const MAX_TICKS: usize = 96;
     let k0 = (lo / STEP - 1e-9).ceil() as i64;
     let k1 = (hi / STEP + 1e-9).floor() as i64;
-    let count = if k1 >= k0 {
-        (k1 - k0 + 1).min(MAX_TICKS as i64) as usize
-    } else {
-        0
-    };
+    // One-sided saturation (lo = f32::MIN, hi normal) overflows k1 - k0 + 1 —
+    // saturate the subtraction before the cap, not after.
+    let count = k1
+        .saturating_sub(k0)
+        .saturating_add(1)
+        .clamp(0, MAX_TICKS as i64) as usize;
     let every = [1i64, 2, 5, 10, 20, 50, 100]
         .into_iter()
         .find(|step| count <= *step as usize * 8)
@@ -7921,8 +7922,16 @@ fn disc_cpu(
     let r = radius.min(width.max(height) as f32 + 4.0).ceil() as i64 + 1;
     let cx = center[0].round() as i64;
     let cy = center[1].round() as i64;
-    let (y0, y1) = ((cy - r).max(y_lo), (cy + r).min(y_hi));
-    let (x0, x1) = ((cx - r).max(x_lo), (cx + r).min(x_hi));
+    // Extreme payload centers saturate the cast — saturate the bounding box
+    // the same way so cx + r can't wrap back inside the clip window.
+    let (y0, y1) = (
+        cy.saturating_sub(r).max(y_lo),
+        cy.saturating_add(r).min(y_hi),
+    );
+    let (x0, x1) = (
+        cx.saturating_sub(r).max(x_lo),
+        cx.saturating_add(r).min(x_hi),
+    );
     if x0 > x1 || y0 > y1 {
         return;
     }
