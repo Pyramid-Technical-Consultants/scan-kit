@@ -276,6 +276,11 @@ fn parse_npy(bytes: &[u8]) -> Result<Npy, String> {
     if bytes.len() < 10 || &bytes[..6] != b"\x93NUMPY" {
         return Err("not an npy array".into());
     }
+    // Versions 1-3 are the only published layouts (1 uses a u16 header, 2
+    // and 3 share the u32 header) — anything newer must not be assumed.
+    if !matches!(bytes[6], 1..=3) {
+        return Err(format!("unsupported npy version {}", bytes[6]));
+    }
     let (header_len, header_at) = if bytes[6] == 1 {
         (u16::from_le_bytes([bytes[8], bytes[9]]) as usize, 10)
     } else {
@@ -494,14 +499,10 @@ mod tests {
     /// What `np.savez_compressed` wrote, `load_npz` must read back.
     #[test]
     fn reads_a_python_npz() {
-        let goldens = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../validation/goldens");
-        if !goldens.is_dir() {
-            return;
-        }
-        let path = goldens.join("aluminum_100_s4.npz");
-        if !path.is_file() {
-            return;
-        }
+        // The golden is committed — a missing fixture must fail loudly, not
+        // quietly report a pass.
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../validation/goldens/aluminum_100_s4.npz");
         let files = load_npz(&path).unwrap();
         assert_eq!(files["medium"].scalar_string().unwrap(), "aluminum");
         assert_eq!(files["dose"].shape.len(), 3);
@@ -558,5 +559,16 @@ mod tests {
             "{'descr': '<f8', 'fortran_order': False, 'shape': (2, 2), }"
         ))
         .is_ok());
+    }
+
+    #[test]
+    fn an_unknown_npy_version_is_rejected() {
+        // Versions past 3 have no published layout — assuming the v2 header
+        // shape on a future file reads its header bytes as data.
+        let mut bytes = b"\x93NUMPY".to_vec();
+        bytes.extend_from_slice(&[4, 0]);
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        let err = parse_npy(&bytes).unwrap_err();
+        assert!(err.contains("version"), "{err}");
     }
 }

@@ -149,8 +149,9 @@ impl BeamModel {
         fill_spot(self, energy, x, y, beam, wet_mm, distance_mm)
     }
 
-    pub fn protons_per_mu(&self, energy: f32) -> f32 {
-        column(&self.rows, 3, energy)
+    pub fn protons_per_mu(&self, energy: f32) -> Result<f32, String> {
+        check_energy(&self.rows, energy)?;
+        Ok(column(&self.rows, 3, energy))
     }
 }
 
@@ -184,6 +185,7 @@ fn fill_spot(
     wet_mm: f32,
     distance_mm: f32,
 ) -> Result<[f32; 40], String> {
+    check_energy(&model.rows, energy)?;
     let mut rec = [0.0f32; 40];
     rec[0] = x;
     rec[1] = y;
@@ -257,7 +259,7 @@ fn fill_spot(
     Ok(rec)
 }
 
-pub fn protons_per_mu(energy: f32) -> f32 {
+pub fn protons_per_mu(energy: f32) -> Result<f32, String> {
     protons_per_mu_bdl(energy, "un_rs")
 }
 
@@ -293,8 +295,27 @@ pub(crate) fn spot_record_bdl(
     fill_spot(&model_of(bdl), energy, x, y, beam, wet_mm, distance_mm)
 }
 
-pub(crate) fn protons_per_mu_bdl(energy: f32, bdl: &str) -> f32 {
-    column(&model_of(bdl).rows, 3, energy)
+pub(crate) fn protons_per_mu_bdl(energy: f32, bdl: &str) -> Result<f32, String> {
+    let model = model_of(bdl);
+    check_energy(&model.rows, energy)?;
+    Ok(column(&model.rows, 3, energy))
+}
+
+/// `column` extrapolates with the edge slope outside the table — a plan
+/// authored for another machine, or a corrupt energy field, must fail here
+/// instead of producing physics the model never promised. A half-MeV
+/// tolerance covers float-representation fuzz on the discrete energies.
+fn check_energy(rows: &[[f32; 18]], energy: f32) -> Result<(), String> {
+    let (Some(first), Some(last)) = (rows.first(), rows.last()) else {
+        return Err("the beam model has no energy rows".into());
+    };
+    if !energy.is_finite() || energy < first[0] - 0.5 || energy > last[0] + 0.5 {
+        return Err(format!(
+            "energy {energy} MeV is outside the beam model's {}-{} MeV range",
+            first[0], last[0]
+        ));
+    }
+    Ok(())
 }
 
 fn model_of(name: &str) -> BeamModel {
@@ -372,7 +393,7 @@ mod tests {
         let err = BeamModel::read(&file).err().unwrap();
         assert!(err.contains("energy rows"));
         // column() itself stays safe even on a degenerate model.
-        assert_eq!(BeamModel::parse("").protons_per_mu(100.0), 0.0);
+        assert!(BeamModel::parse("").protons_per_mu(100.0).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -384,10 +405,10 @@ mod tests {
         let shifted = spot_record(100.0, 0.0, 0.0, 0.0, f32::NAN, f32::NAN).unwrap();
         assert!(shifted[32] > 0.0);
         assert!((shifted[35] - 1.19).abs() < 1e-3);
-        assert!(protons_per_mu(100.0) > 1.0e7);
+        assert!(protons_per_mu(100.0).unwrap() > 1.0e7);
         let downstream = spot_record_bdl(100.0, 0.0, 0.0, 0.0, 0.0, f32::NAN, "dn").unwrap();
         assert_eq!(downstream[32], 0.0);
-        assert!(protons_per_mu_bdl(100.0, "dn").is_finite());
+        assert!(protons_per_mu_bdl(100.0, "dn").unwrap().is_finite());
     }
 
     #[test]
@@ -450,5 +471,16 @@ h
         std::fs::write(&file, &good).unwrap();
         assert!(BeamModel::read(&file).is_ok());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_energy_outside_the_model_range_errors() {
+        // Outside the tabulated rows the model would silently extrapolate —
+        // a corrupt or foreign plan's energy must fail, not invent physics.
+        assert!(protons_per_mu(1.0).is_err());
+        assert!(protons_per_mu(1000.0).is_err());
+        assert!(protons_per_mu(f32::NAN).is_err());
+        assert!(protons_per_mu(f32::INFINITY).is_err());
+        assert!(protons_per_mu(100.0).is_ok());
     }
 }

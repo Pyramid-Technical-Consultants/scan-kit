@@ -318,7 +318,9 @@ pub fn volumetric(
     // from the chosen model, so gamma and the overlays never compare two dose
     // engines. The runner sees one job per fill, in that order. Other sessions
     // stay analytic on every cube.
-    let focus = session_at(options, session_ids);
+    // An unmatched session option leaves no focus — the MC run must not
+    // silently land on session 0 (scenes are infallible; no Err channel).
+    let focus = session_at(options, session_ids).unwrap_or(usize::MAX);
     for (index, cloud) in clouds.iter().enumerate() {
         let runner = if index == focus { mc } else { None };
         let k_mu = k_mus.get(index).copied().unwrap_or(k_mu);
@@ -474,7 +476,9 @@ pub fn volumetric(
     let mut volume_mark = scan_kit_core::VolumeMark::default();
     let mut integral_rates: Option<[f32; 3]> = None;
     let mut field_size: Option<String> = None;
-    let session_at = session_at(options, session_ids).min(shown.len().saturating_sub(1));
+    let session_at = session_at(options, session_ids)
+        .unwrap_or(0)
+        .min(shown.len().saturating_sub(1));
     if has_dose {
         if let Some(volume) = shown.get(session_at) {
             let scan = scan_kit_core::scan_volume(volume);
@@ -896,9 +900,16 @@ fn range_control(
     control
 }
 
-fn session_at(options: &Value, ids: &[String]) -> usize {
+fn session_at(options: &Value, ids: &[String]) -> Result<usize, String> {
     let raw = options.get("session").and_then(Value::as_str).unwrap_or("");
-    ids.iter().position(|id| id == raw).unwrap_or(0)
+    if raw.is_empty() {
+        return Ok(0);
+    }
+    // A miss must not silently focus session 0 — the MC runner and every
+    // overlay would apply to the wrong session's data.
+    ids.iter()
+        .position(|id| id == raw)
+        .ok_or_else(|| format!("session option {raw} is not a loaded session"))
 }
 
 fn push_picture_controls(
@@ -2588,6 +2599,19 @@ mod tests {
             .all(|dose| dose.values.is_empty()));
         assert!(ray.volume.plans.iter().any(|dose| !dose.values.is_empty()));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_unknown_focus_session_is_an_error() {
+        // A miss used to silently focus session 0 — the MC run and every
+        // overlay would then target the wrong session's data.
+        assert_eq!(super::session_at(&serde_json::json!({}), &[]).unwrap(), 0);
+        let ids = vec!["a".to_string(), "b".to_string()];
+        assert_eq!(
+            super::session_at(&serde_json::json!({ "session": "b" }), &ids).unwrap(),
+            1
+        );
+        assert!(super::session_at(&serde_json::json!({ "session": "zzz" }), &ids).is_err());
     }
 
     fn fieldsets(controls: &[scan_kit_core::Control]) -> Vec<&str> {
