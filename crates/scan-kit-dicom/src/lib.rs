@@ -350,15 +350,14 @@ pub fn peek_study(bytes: &[u8]) -> StudyPeek {
 }
 
 pub fn peek_file(path: &Path) -> StudyPeek {
-    let mut file = match File::open(path) {
+    let file = match File::open(path) {
         Ok(file) => file,
         Err(_) => return StudyPeek::default(),
     };
-    let mut bytes = vec![0u8; PEEK_CAP];
-    let Ok(read) = file.read(&mut bytes) else {
+    let mut bytes = Vec::new();
+    if file.take(PEEK_CAP as u64).read_to_end(&mut bytes).is_err() {
         return StudyPeek::default();
-    };
-    bytes.truncate(read);
+    }
     peek_study(&bytes)
 }
 
@@ -504,7 +503,11 @@ fn push_ui(bytes: &mut Vec<u8>, group: u16, element: u16, text: &str) {
     bytes.extend_from_slice(&group.to_le_bytes());
     bytes.extend_from_slice(&element.to_le_bytes());
     bytes.extend_from_slice(b"UI");
-    bytes.extend_from_slice(&(value.len() as u16).to_le_bytes());
+    bytes.extend_from_slice(
+        &u16::try_from(value.len())
+            .expect("UI value exceeds the 16-bit length field")
+            .to_le_bytes(),
+    );
     bytes.extend(value);
 }
 
