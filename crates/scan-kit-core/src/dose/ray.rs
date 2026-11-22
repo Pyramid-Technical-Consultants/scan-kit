@@ -1075,10 +1075,13 @@ fn steps_to_leave(cell: [f32; 3], dir: [f32; 3], spacing: [f32; 3], step: f32) -
         }
     }
     let steps = (delta / step).ceil();
+    // delta can stay f32::MAX when every axis is within tolerance of a brick
+    // bound — finite, but saturates `as usize` to usize::MAX and wraps the
+    // caller's `i +=`. Leaving a brick never needs more than the march cap.
     if !steps.is_finite() {
         return 1;
     }
-    (steps as usize).max(1)
+    (steps as usize).clamp(1, MAX_STEPS)
 }
 
 fn add(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
@@ -1627,5 +1630,13 @@ mod tests {
         }
         let scale = serial.line_scale.max(1.0e-4);
         assert!((scan.line_scale - serial.line_scale).abs() <= 1.0e-4 * scale);
+    }
+    #[test]
+    fn steps_to_leave_stays_bounded_at_a_brick_edge() {
+        // Every axis within tolerance of a bound leaves delta = f32::MAX —
+        // finite but usize::MAX after the cast. The march cap bounds it.
+        let steps = steps_to_leave([8.0 - 6e-5, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0; 3], 1.0);
+        assert!(steps <= MAX_STEPS, "{steps}");
+        assert!(steps >= 1);
     }
 }
