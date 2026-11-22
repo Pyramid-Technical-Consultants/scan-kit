@@ -164,6 +164,7 @@ pub fn start_task(
             None
         }
     };
+    let checked_id = checked_out.as_ref().map(|(id, _)| *id);
     if let Some((id, mut stage)) = checked_out {
         // retarget runs the same fallible call tree poll wraps in
         // catch_unwind — a panic must not leave task.stage None forever.
@@ -185,6 +186,14 @@ pub fn start_task(
         }
     }
     let mut driver = lock();
+    // This start ran its retarget off-lock; if a newer start claimed the slot
+    // meanwhile it owns the slot — report it rather than evicting it.
+    if checked_id.is_some() {
+        if let Some(owner) = driver.plot.filter(|o| checked_id != Some(*o)) {
+            let generation = driver.tasks.get(&owner).map(|t| t.generation).unwrap_or(0);
+            return Ok(json!({ "task": owner, "generation": generation }));
+        }
+    }
     let replaced = driver.take(&slot);
     let mut stage = build_stage(
         view, path, sessions, options, background, foreground, palette,
@@ -1006,6 +1015,10 @@ fn mc_transport(jobs: Vec<McJob>, shared: Arc<McLive>, cancel: Cancel) {
                 *locked(&shared.ready) = None;
             }
             if finished[k].is_some() {
+                // extend() is false on a run with no live work — its old total
+                // must not pin satisfied below a retargeted target forever.
+                total[k] = total[k].max(u64::from(target));
+                done[k] = done[k].max(total[k]);
                 continue;
             }
             match run.poll(budget, &cancel) {
@@ -1367,7 +1380,9 @@ impl Stage for McPlotStage {
         }
         if budget >= DRAIN {
             self.shutdown();
-            return self.drain(cancel);
+            // worker_cancel is bound to `cancel`; drain with a fresh token or a
+            // bound stage reports Cancelled instead of draining.
+            return self.drain(&Cancel::new());
         }
         self.follow()
     }

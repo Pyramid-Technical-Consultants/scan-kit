@@ -237,7 +237,10 @@ impl McRun {
         let Some(live) = self.live.as_mut() else {
             return false;
         };
-        let target = histories.div_ceil(live.per_batch).max(1) * live.per_batch;
+        let target = histories
+            .div_ceil(live.per_batch)
+            .max(1)
+            .saturating_mul(live.per_batch);
         if target < live.next {
             return false;
         }
@@ -598,7 +601,7 @@ async fn prepare(launch: Launch) -> Result<Live, ComputeError> {
     let per_batch = (histories / 10).clamp(1, 100_000);
     // Round up, not down: satisfied must reach the requested target when the
     // run finishes — a floored count leaves paint_progress Pending forever.
-    let histories = histories.div_ceil(per_batch) * per_batch;
+    let histories = histories.div_ceil(per_batch).saturating_mul(per_batch);
     let volume_cm3 = f64::from(launch.spacing_cm[0])
         * f64::from(launch.spacing_cm[1])
         * f64::from(launch.spacing_cm[2]);
@@ -863,6 +866,11 @@ impl Live {
             if cancel.is_cancelled() {
                 return Ok(started.elapsed());
             }
+            if started.elapsed() > Duration::from_secs(30) {
+                return Err(ComputeError::Message(
+                    "GPU submission did not retire".into(),
+                ));
+            }
             // A short wait so a new voxel size can abandon this chunk instead of
             // sitting behind the rest of the histories already queued. Only
             // this run's submission is awaited — a sibling run's queued chunk
@@ -947,9 +955,15 @@ impl Live {
     fn collect_read(&self, ticket: &ReadTicket, cancel: &Cancel) -> Result<McResult, ComputeError> {
         // Only the copy submission is awaited: a transport chunk submitted
         // after it keeps the GPU busy while the dose is on its way back.
+        let started = Instant::now();
         loop {
             if cancel.is_cancelled() {
                 return Err(ComputeError::Message("cancelled".into()));
+            }
+            if started.elapsed() > Duration::from_secs(30) {
+                return Err(ComputeError::Message(
+                    "GPU submission did not retire".into(),
+                ));
             }
             match self.device.poll(wgpu::PollType::Wait {
                 submission_index: Some(ticket.index.clone()),
