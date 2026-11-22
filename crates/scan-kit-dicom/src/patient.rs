@@ -381,90 +381,90 @@ pub fn write_water_study(dir: &Path) -> Result<(), String> {
     let frame = "1.2.3.4.5";
     for (index, z) in [0.0f32, 1.0].into_iter().enumerate() {
         let mut bytes = preamble();
-        ui(&mut bytes, 0x0008, 0x0016, "1.2.840.10008.5.1.4.1.1.2");
-        ui(&mut bytes, 0x0008, 0x0060, "CT");
-        ui(&mut bytes, 0x0020, 0x000D, "1.2.3");
-        ui(&mut bytes, 0x0020, 0x000E, "1.2.3.1");
-        ui(&mut bytes, 0x0020, 0x0052, frame);
-        us(&mut bytes, 0x0028, 0x0010, 4);
-        us(&mut bytes, 0x0028, 0x0011, 4);
-        ds(&mut bytes, 0x0028, 0x0030, &[1.0, 1.0]);
-        ds(&mut bytes, 0x0020, 0x0032, &[0.0, 0.0, z]);
-        ds(&mut bytes, 0x0020, 0x0037, &[1.0, 0.0, 0.0, 0.0, 1.0, 0.0]);
-        ds(&mut bytes, 0x0028, 0x1053, &[1.0]);
-        ds(&mut bytes, 0x0028, 0x1052, &[0.0]);
-        ow(&mut bytes, 0x7FE0, 0x0010, &[0u16; 16]);
+        ui(&mut bytes, 0x0008, 0x0016, "1.2.840.10008.5.1.4.1.1.2")?;
+        ui(&mut bytes, 0x0008, 0x0060, "CT")?;
+        ui(&mut bytes, 0x0020, 0x000D, "1.2.3")?;
+        ui(&mut bytes, 0x0020, 0x000E, "1.2.3.1")?;
+        ui(&mut bytes, 0x0020, 0x0052, frame)?;
+        us(&mut bytes, 0x0028, 0x0010, 4)?;
+        us(&mut bytes, 0x0028, 0x0011, 4)?;
+        ds(&mut bytes, 0x0028, 0x0030, &[1.0, 1.0])?;
+        ds(&mut bytes, 0x0020, 0x0032, &[0.0, 0.0, z])?;
+        ds(&mut bytes, 0x0020, 0x0037, &[1.0, 0.0, 0.0, 0.0, 1.0, 0.0])?;
+        ds(&mut bytes, 0x0028, 0x1053, &[1.0])?;
+        ds(&mut bytes, 0x0028, 0x1052, &[0.0])?;
+        ow(&mut bytes, 0x7FE0, 0x0010, &[0u16; 16])?;
         fs::write(dir.join(format!("ct{index}.dcm")), bytes).map_err(|err| err.to_string())?;
     }
     let mut plan = preamble();
-    ui(&mut plan, 0x0008, 0x0016, "1.2.840.10008.5.1.4.1.1.481.8");
-    ui(&mut plan, 0x0008, 0x0060, "RTPLAN");
-    ui(&mut plan, 0x0020, 0x0052, frame);
+    ui(&mut plan, 0x0008, 0x0016, "1.2.840.10008.5.1.4.1.1.481.8")?;
+    ui(&mut plan, 0x0008, 0x0060, "RTPLAN")?;
+    ui(&mut plan, 0x0020, 0x0052, frame)?;
     let setup = {
         let mut item = Vec::new();
-        is(&mut item, 0x300A, 0x0182, 1);
-        cs(&mut item, 0x0018, 0x5100, "HFS");
+        is(&mut item, 0x300A, 0x0182, 1)?;
+        cs(&mut item, 0x0018, 0x5100, "HFS")?;
         item
     };
-    sq(&mut plan, 0x300A, 0x0180, &[setup]);
+    sq(&mut plan, 0x300A, 0x0180, &[setup])?;
     let referenced = {
         let mut item = Vec::new();
-        is(&mut item, 0x300C, 0x0006, 1);
-        ds(&mut item, 0x300A, 0x0086, &[1.0]);
+        is(&mut item, 0x300C, 0x0006, 1)?;
+        ds(&mut item, 0x300A, 0x0086, &[1.0])?;
         item
     };
     let fraction = {
         let mut item = Vec::new();
-        is(&mut item, 0x300A, 0x0078, 1);
-        sq(&mut item, 0x300C, 0x0004, &[referenced]);
+        is(&mut item, 0x300A, 0x0078, 1)?;
+        sq(&mut item, 0x300C, 0x0004, &[referenced])?;
         item
     };
-    sq(&mut plan, 0x300A, 0x0070, &[fraction]);
+    sq(&mut plan, 0x300A, 0x0070, &[fraction])?;
     let control = {
         let mut item = Vec::new();
-        ds(&mut item, 0x300A, 0x0114, &[100.0]);
-        ds(&mut item, 0x300A, 0x011E, &[0.0]);
-        ds(&mut item, 0x300A, 0x0122, &[0.0]);
-        ds(&mut item, 0x300A, 0x012C, &[1.5, 1.5, 0.5]);
-        is(&mut item, 0x300A, 0x0392, 1);
-        ds(&mut item, 0x300A, 0x0394, &[0.0, 0.0]);
-        ds(&mut item, 0x300A, 0x0396, &[1.0]);
+        ds(&mut item, 0x300A, 0x0114, &[100.0])?;
+        ds(&mut item, 0x300A, 0x011E, &[0.0])?;
+        ds(&mut item, 0x300A, 0x0122, &[0.0])?;
+        ds(&mut item, 0x300A, 0x012C, &[1.5, 1.5, 0.5])?;
+        is(&mut item, 0x300A, 0x0392, 1)?;
+        ds(&mut item, 0x300A, 0x0394, &[0.0, 0.0])?;
+        ds(&mut item, 0x300A, 0x0396, &[1.0])?;
         item
     };
     let beam = {
         let mut item = Vec::new();
-        is(&mut item, 0x300A, 0x00C0, 1);
-        lo(&mut item, 0x300A, 0x00C2, "B1");
-        cs(&mut item, 0x300A, 0x00CE, "TREATMENT");
-        cs(&mut item, 0x300A, 0x0308, "MODULATED");
-        ds(&mut item, 0x300A, 0x010E, &[1.0]);
-        is(&mut item, 0x300C, 0x006A, 1);
-        sq(&mut item, 0x300A, 0x03A8, &[control]);
+        is(&mut item, 0x300A, 0x00C0, 1)?;
+        lo(&mut item, 0x300A, 0x00C2, "B1")?;
+        cs(&mut item, 0x300A, 0x00CE, "TREATMENT")?;
+        cs(&mut item, 0x300A, 0x0308, "MODULATED")?;
+        ds(&mut item, 0x300A, 0x010E, &[1.0])?;
+        is(&mut item, 0x300C, 0x006A, 1)?;
+        sq(&mut item, 0x300A, 0x03A8, &[control])?;
         item
     };
-    sq(&mut plan, 0x300A, 0x03A2, &[beam]);
+    sq(&mut plan, 0x300A, 0x03A2, &[beam])?;
     fs::write(dir.join("plan.dcm"), plan).map_err(|err| err.to_string())?;
     let roi = {
         let mut item = Vec::new();
-        is(&mut item, 0x3006, 0x0022, 1);
-        lo(&mut item, 0x3006, 0x0026, "PTV");
+        is(&mut item, 0x3006, 0x0022, 1)?;
+        lo(&mut item, 0x3006, 0x0026, "PTV")?;
         item
     };
     let contour = {
         let mut item = Vec::new();
-        is(&mut item, 0x3006, 0x0046, 4);
+        is(&mut item, 0x3006, 0x0046, 4)?;
         ds(
             &mut item,
             0x3006,
             0x0050,
             &[0.0, 0.0, 0.5, 4.0, 0.0, 0.5, 4.0, 4.0, 0.5, 0.0, 4.0, 0.5],
-        );
+        )?;
         item
     };
     let roi_contour = {
         let mut item = Vec::new();
-        is(&mut item, 0x3006, 0x0084, 1);
-        sq(&mut item, 0x3006, 0x0040, &[contour]);
+        is(&mut item, 0x3006, 0x0084, 1)?;
+        sq(&mut item, 0x3006, 0x0040, &[contour])?;
         item
     };
     let mut structures = preamble();
@@ -473,23 +473,23 @@ pub fn write_water_study(dir: &Path) -> Result<(), String> {
         0x0008,
         0x0016,
         "1.2.840.10008.5.1.4.1.1.481.3",
-    );
-    ui(&mut structures, 0x0020, 0x0052, frame);
-    sq(&mut structures, 0x3006, 0x0020, &[roi]);
-    sq(&mut structures, 0x3006, 0x0039, &[roi_contour]);
+    )?;
+    ui(&mut structures, 0x0020, 0x0052, frame)?;
+    sq(&mut structures, 0x3006, 0x0020, &[roi])?;
+    sq(&mut structures, 0x3006, 0x0039, &[roi_contour])?;
     fs::write(dir.join("struct.dcm"), structures).map_err(|err| err.to_string())?;
     let mut dose = preamble();
-    ui(&mut dose, 0x0008, 0x0016, "1.2.840.10008.5.1.4.1.1.481.2");
-    ui(&mut dose, 0x0008, 0x0060, "RTDOSE");
-    ui(&mut dose, 0x0020, 0x0052, frame);
-    us(&mut dose, 0x0028, 0x0010, 4);
-    us(&mut dose, 0x0028, 0x0011, 4);
-    ds(&mut dose, 0x0028, 0x0030, &[1.0, 1.0]);
-    ds(&mut dose, 0x0020, 0x0032, &[0.0, 0.0, 0.0]);
-    ds(&mut dose, 0x0020, 0x0037, &[1.0, 0.0, 0.0, 0.0, 1.0, 0.0]);
-    ds(&mut dose, 0x3004, 0x000C, &[0.0, 1.0]);
-    ds(&mut dose, 0x3004, 0x000E, &[0.01]);
-    ow(&mut dose, 0x7FE0, 0x0010, &[100u16; 32]);
+    ui(&mut dose, 0x0008, 0x0016, "1.2.840.10008.5.1.4.1.1.481.2")?;
+    ui(&mut dose, 0x0008, 0x0060, "RTDOSE")?;
+    ui(&mut dose, 0x0020, 0x0052, frame)?;
+    us(&mut dose, 0x0028, 0x0010, 4)?;
+    us(&mut dose, 0x0028, 0x0011, 4)?;
+    ds(&mut dose, 0x0028, 0x0030, &[1.0, 1.0])?;
+    ds(&mut dose, 0x0020, 0x0032, &[0.0, 0.0, 0.0])?;
+    ds(&mut dose, 0x0020, 0x0037, &[1.0, 0.0, 0.0, 0.0, 1.0, 0.0])?;
+    ds(&mut dose, 0x3004, 0x000C, &[0.0, 1.0])?;
+    ds(&mut dose, 0x3004, 0x000E, &[0.01])?;
+    ow(&mut dose, 0x7FE0, 0x0010, &[100u16; 32])?;
     fs::write(dir.join("dose.dcm"), dose).map_err(|err| err.to_string())?;
     Ok(())
 }
@@ -1249,7 +1249,13 @@ fn even(text: &str) -> Vec<u8> {
     bytes
 }
 
-fn push_elem(bytes: &mut Vec<u8>, group: u16, slot: u16, vr: &[u8], value: &[u8]) {
+fn push_elem(
+    bytes: &mut Vec<u8>,
+    group: u16,
+    slot: u16,
+    vr: &[u8],
+    value: &[u8],
+) -> Result<(), String> {
     bytes.extend_from_slice(&group.to_le_bytes());
     bytes.extend_from_slice(&slot.to_le_bytes());
     bytes.extend_from_slice(vr);
@@ -1258,72 +1264,93 @@ fn push_elem(bytes: &mut Vec<u8>, group: u16, slot: u16, vr: &[u8], value: &[u8]
         bytes.extend_from_slice(&[0, 0]);
         bytes.extend_from_slice(&(value.len() as u32).to_le_bytes());
     } else {
-        // A short-VR length field is u16 — writers keep values far under it.
-        let len = u16::try_from(value.len()).expect("short VR over 64 KiB");
+        let len = u16::try_from(value.len())
+            .map_err(|_| format!("{group:04X},{slot:04X} value over 64 KiB"))?;
         bytes.extend_from_slice(&len.to_le_bytes());
     }
     bytes.extend_from_slice(value);
+    Ok(())
 }
 
-pub(crate) fn ui(bytes: &mut Vec<u8>, group: u16, element: u16, text: &str) {
+pub(crate) fn ui(bytes: &mut Vec<u8>, group: u16, element: u16, text: &str) -> Result<(), String> {
     let mut value = text.as_bytes().to_vec();
     if value.len() % 2 == 1 {
         value.push(0);
     }
-    push_elem(bytes, group, element, b"UI", &value);
+    push_elem(bytes, group, element, b"UI", &value)
 }
 
-pub(crate) fn cs(bytes: &mut Vec<u8>, group: u16, element: u16, text: &str) {
-    push_elem(bytes, group, element, b"CS", &even(text));
+pub(crate) fn cs(bytes: &mut Vec<u8>, group: u16, element: u16, text: &str) -> Result<(), String> {
+    push_elem(bytes, group, element, b"CS", &even(text))
 }
 
-pub(crate) fn lo(bytes: &mut Vec<u8>, group: u16, element: u16, text: &str) {
-    push_elem(bytes, group, element, b"LO", &even(text));
+pub(crate) fn lo(bytes: &mut Vec<u8>, group: u16, element: u16, text: &str) -> Result<(), String> {
+    push_elem(bytes, group, element, b"LO", &even(text))
 }
 
-pub(crate) fn pn(bytes: &mut Vec<u8>, group: u16, element: u16, text: &str) {
-    push_elem(bytes, group, element, b"PN", &even(text));
+pub(crate) fn pn(bytes: &mut Vec<u8>, group: u16, element: u16, text: &str) -> Result<(), String> {
+    push_elem(bytes, group, element, b"PN", &even(text))
 }
 
-pub(crate) fn sh(bytes: &mut Vec<u8>, group: u16, element: u16, text: &str) {
-    push_elem(bytes, group, element, b"SH", &even(text));
+pub(crate) fn sh(bytes: &mut Vec<u8>, group: u16, element: u16, text: &str) -> Result<(), String> {
+    push_elem(bytes, group, element, b"SH", &even(text))
 }
 
-pub(crate) fn ds(bytes: &mut Vec<u8>, group: u16, element: u16, values: &[f32]) {
+pub(crate) fn ds(
+    bytes: &mut Vec<u8>,
+    group: u16,
+    element: u16,
+    values: &[f32],
+) -> Result<(), String> {
     let text = values
         .iter()
         .map(|value| format!("{value:.6}"))
         .collect::<Vec<_>>()
         .join("\\");
-    push_elem(bytes, group, element, b"DS", &even(&text));
+    push_elem(bytes, group, element, b"DS", &even(&text))
 }
 
-pub(crate) fn is(bytes: &mut Vec<u8>, group: u16, element: u16, value: i32) {
-    push_elem(bytes, group, element, b"IS", &even(&value.to_string()));
+pub(crate) fn is(bytes: &mut Vec<u8>, group: u16, element: u16, value: i32) -> Result<(), String> {
+    push_elem(bytes, group, element, b"IS", &even(&value.to_string()))
 }
 
-pub(crate) fn us(bytes: &mut Vec<u8>, group: u16, element: u16, value: u16) {
-    push_elem(bytes, group, element, b"US", &value.to_le_bytes());
+pub(crate) fn us(bytes: &mut Vec<u8>, group: u16, element: u16, value: u16) -> Result<(), String> {
+    push_elem(bytes, group, element, b"US", &value.to_le_bytes())
 }
 
-pub(crate) fn is_list(bytes: &mut Vec<u8>, group: u16, element: u16, values: &[u16]) {
+pub(crate) fn is_list(
+    bytes: &mut Vec<u8>,
+    group: u16,
+    element: u16,
+    values: &[u16],
+) -> Result<(), String> {
     let text = values
         .iter()
         .map(u16::to_string)
         .collect::<Vec<_>>()
         .join("\\");
-    push_elem(bytes, group, element, b"IS", &even(&text));
+    push_elem(bytes, group, element, b"IS", &even(&text))
 }
 
-pub(crate) fn ow(bytes: &mut Vec<u8>, group: u16, element: u16, values: &[u16]) {
+pub(crate) fn ow(
+    bytes: &mut Vec<u8>,
+    group: u16,
+    element: u16,
+    values: &[u16],
+) -> Result<(), String> {
     let raw: Vec<u8> = values
         .iter()
         .flat_map(|value| value.to_le_bytes())
         .collect();
-    push_elem(bytes, group, element, b"OW", &raw);
+    push_elem(bytes, group, element, b"OW", &raw)
 }
 
-pub(crate) fn sq(bytes: &mut Vec<u8>, group: u16, element: u16, items: &[Vec<u8>]) {
+pub(crate) fn sq(
+    bytes: &mut Vec<u8>,
+    group: u16,
+    element: u16,
+    items: &[Vec<u8>],
+) -> Result<(), String> {
     let mut body = Vec::new();
     for item in items {
         body.extend_from_slice(&0xFFFEu16.to_le_bytes());
@@ -1331,33 +1358,39 @@ pub(crate) fn sq(bytes: &mut Vec<u8>, group: u16, element: u16, items: &[Vec<u8>
         body.extend_from_slice(&(item.len() as u32).to_le_bytes());
         body.extend_from_slice(item);
     }
-    push_elem(bytes, group, element, b"SQ", &body);
+    push_elem(bytes, group, element, b"SQ", &body)
 }
 
-fn ul(bytes: &mut Vec<u8>, group: u16, element: u16, value: u32) {
-    push_elem(bytes, group, element, b"UL", &value.to_le_bytes());
+fn ul(bytes: &mut Vec<u8>, group: u16, element: u16, value: u32) -> Result<(), String> {
+    push_elem(bytes, group, element, b"UL", &value.to_le_bytes())
 }
 
-fn ob(bytes: &mut Vec<u8>, group: u16, element: u16, data: &[u8]) {
-    push_elem(bytes, group, element, b"OB", data);
+fn ob(bytes: &mut Vec<u8>, group: u16, element: u16, data: &[u8]) -> Result<(), String> {
+    push_elem(bytes, group, element, b"OB", data)
 }
 
-fn lt(bytes: &mut Vec<u8>, group: u16, element: u16, text: &str) {
-    push_elem(bytes, group, element, b"LT", &even(text));
+fn lt(bytes: &mut Vec<u8>, group: u16, element: u16, text: &str) -> Result<(), String> {
+    push_elem(bytes, group, element, b"LT", &even(text))
 }
 
-fn at(bytes: &mut Vec<u8>, group: u16, element: u16, at_group: u16, at_element: u16) {
+fn at(
+    bytes: &mut Vec<u8>,
+    group: u16,
+    element: u16,
+    at_group: u16,
+    at_element: u16,
+) -> Result<(), String> {
     let mut value = at_group.to_le_bytes().to_vec();
     value.extend_from_slice(&at_element.to_le_bytes());
-    push_elem(bytes, group, element, b"AT", &value);
+    push_elem(bytes, group, element, b"AT", &value)
 }
 
-fn ow32(bytes: &mut Vec<u8>, group: u16, element: u16, values: &[u32]) {
+fn ow32(bytes: &mut Vec<u8>, group: u16, element: u16, values: &[u32]) -> Result<(), String> {
     let raw: Vec<u8> = values
         .iter()
         .flat_map(|value| value.to_le_bytes())
         .collect();
-    push_elem(bytes, group, element, b"OW", &raw);
+    push_elem(bytes, group, element, b"OW", &raw)
 }
 
 const RT_DOSE_CLASS: &str = "1.2.840.10008.5.1.4.1.1.481.2";
@@ -1447,77 +1480,77 @@ pub fn write_rtdose(
 
     let mut bytes = preamble();
     let mut meta = Vec::new();
-    ob(&mut meta, 0x0002, 0x0001, &[0, 1]);
-    ui(&mut meta, 0x0002, 0x0002, RT_DOSE_CLASS);
-    ui(&mut meta, 0x0002, 0x0003, &sop_uid);
-    ui(&mut meta, 0x0002, 0x0010, EXPLICIT_LE);
-    ui(&mut meta, 0x0002, 0x0012, IMPL_UID);
-    sh(&mut meta, 0x0002, 0x0013, "SCAN-KIT");
-    ul(&mut bytes, 0x0002, 0x0000, meta.len() as u32);
+    ob(&mut meta, 0x0002, 0x0001, &[0, 1])?;
+    ui(&mut meta, 0x0002, 0x0002, RT_DOSE_CLASS)?;
+    ui(&mut meta, 0x0002, 0x0003, &sop_uid)?;
+    ui(&mut meta, 0x0002, 0x0010, EXPLICIT_LE)?;
+    ui(&mut meta, 0x0002, 0x0012, IMPL_UID)?;
+    sh(&mut meta, 0x0002, 0x0013, "SCAN-KIT")?;
+    ul(&mut bytes, 0x0002, 0x0000, meta.len() as u32)?;
     bytes.extend_from_slice(&meta);
 
-    push_elem(&mut bytes, 0x0008, 0x0012, b"DA", &even(&date));
-    push_elem(&mut bytes, 0x0008, 0x0013, b"TM", &even(&time));
-    ui(&mut bytes, 0x0008, 0x0016, RT_DOSE_CLASS);
-    ui(&mut bytes, 0x0008, 0x0018, &sop_uid);
-    push_elem(&mut bytes, 0x0008, 0x0023, b"DA", &even(&date));
-    push_elem(&mut bytes, 0x0008, 0x0033, b"TM", &even(&time));
-    cs(&mut bytes, 0x0008, 0x0060, "RTDOSE");
-    lo(&mut bytes, 0x0008, 0x0070, "Pyramid Technical Consultants");
+    push_elem(&mut bytes, 0x0008, 0x0012, b"DA", &even(&date))?;
+    push_elem(&mut bytes, 0x0008, 0x0013, b"TM", &even(&time))?;
+    ui(&mut bytes, 0x0008, 0x0016, RT_DOSE_CLASS)?;
+    ui(&mut bytes, 0x0008, 0x0018, &sop_uid)?;
+    push_elem(&mut bytes, 0x0008, 0x0023, b"DA", &even(&date))?;
+    push_elem(&mut bytes, 0x0008, 0x0033, b"TM", &even(&time))?;
+    cs(&mut bytes, 0x0008, 0x0060, "RTDOSE")?;
+    lo(&mut bytes, 0x0008, 0x0070, "Pyramid Technical Consultants")?;
     // LO holds 64 characters; a byte slice would panic inside a multi-byte char.
     let series_description: String = format!("{description} (research only)")
         .chars()
         .take(64)
         .collect();
-    lo(&mut bytes, 0x0008, 0x103E, &series_description);
-    pn(&mut bytes, 0x0010, 0x0010, &ct.patient_name);
-    lo(&mut bytes, 0x0010, 0x0020, &ct.patient_id);
-    ds(&mut bytes, 0x0018, 0x0050, &[ct.spacing[2]]);
+    lo(&mut bytes, 0x0008, 0x103E, &series_description)?;
+    pn(&mut bytes, 0x0010, 0x0010, &ct.patient_name)?;
+    lo(&mut bytes, 0x0010, 0x0020, &ct.patient_id)?;
+    ds(&mut bytes, 0x0018, 0x0050, &[ct.spacing[2]])?;
     lo(
         &mut bytes,
         0x0018,
         0x1020,
         &format!("scan-kit {}", env!("CARGO_PKG_VERSION")),
-    );
-    ui(&mut bytes, 0x0020, 0x000D, &ct.study_uid);
-    ui(&mut bytes, 0x0020, 0x000E, &uid());
-    ds(&mut bytes, 0x0020, 0x0032, &ct.origin);
-    ds(&mut bytes, 0x0020, 0x0037, &[1.0, 0.0, 0.0, 0.0, 1.0, 0.0]);
-    ui(&mut bytes, 0x0020, 0x0052, &ct.frame);
-    lt(&mut bytes, 0x0020, 0x4000, comment);
-    us(&mut bytes, 0x0028, 0x0002, 1);
-    cs(&mut bytes, 0x0028, 0x0004, "MONOCHROME2");
-    is(&mut bytes, 0x0028, 0x0008, nz as i32);
-    at(&mut bytes, 0x0028, 0x0009, 0x3004, 0x000C);
-    us(&mut bytes, 0x0028, 0x0010, ny as u16);
-    us(&mut bytes, 0x0028, 0x0011, nx as u16);
-    ds(&mut bytes, 0x0028, 0x0030, &[ct.spacing[1], ct.spacing[0]]);
-    us(&mut bytes, 0x0028, 0x0100, 32);
+    )?;
+    ui(&mut bytes, 0x0020, 0x000D, &ct.study_uid)?;
+    ui(&mut bytes, 0x0020, 0x000E, &uid())?;
+    ds(&mut bytes, 0x0020, 0x0032, &ct.origin)?;
+    ds(&mut bytes, 0x0020, 0x0037, &[1.0, 0.0, 0.0, 0.0, 1.0, 0.0])?;
+    ui(&mut bytes, 0x0020, 0x0052, &ct.frame)?;
+    lt(&mut bytes, 0x0020, 0x4000, comment)?;
+    us(&mut bytes, 0x0028, 0x0002, 1)?;
+    cs(&mut bytes, 0x0028, 0x0004, "MONOCHROME2")?;
+    is(&mut bytes, 0x0028, 0x0008, nz as i32)?;
+    at(&mut bytes, 0x0028, 0x0009, 0x3004, 0x000C)?;
+    us(&mut bytes, 0x0028, 0x0010, ny as u16)?;
+    us(&mut bytes, 0x0028, 0x0011, nx as u16)?;
+    ds(&mut bytes, 0x0028, 0x0030, &[ct.spacing[1], ct.spacing[0]])?;
+    us(&mut bytes, 0x0028, 0x0100, 32)?;
     // Stored counts reach ~4e9, which needs all 32 bits; High Bit is the
     // zero-based index of the top stored bit.
-    us(&mut bytes, 0x0028, 0x0101, 32);
-    us(&mut bytes, 0x0028, 0x0102, 31);
-    us(&mut bytes, 0x0028, 0x0103, 0);
-    cs(&mut bytes, 0x3004, 0x0002, "GY");
-    cs(&mut bytes, 0x3004, 0x0004, dose_type);
-    lt(&mut bytes, 0x3004, 0x0006, DOSE_DISCLAIMER);
-    cs(&mut bytes, 0x3004, 0x000A, summation);
+    us(&mut bytes, 0x0028, 0x0101, 32)?;
+    us(&mut bytes, 0x0028, 0x0102, 31)?;
+    us(&mut bytes, 0x0028, 0x0103, 0)?;
+    cs(&mut bytes, 0x3004, 0x0002, "GY")?;
+    cs(&mut bytes, 0x3004, 0x0004, dose_type)?;
+    lt(&mut bytes, 0x3004, 0x0006, DOSE_DISCLAIMER)?;
+    cs(&mut bytes, 0x3004, 0x000A, summation)?;
     let offsets: Vec<f32> = (0..nz).map(|k| k as f32 * ct.spacing[2]).collect();
-    ds(&mut bytes, 0x3004, 0x000C, &offsets);
+    ds(&mut bytes, 0x3004, 0x000C, &offsets)?;
     push_elem(
         &mut bytes,
         0x3004,
         0x000E,
         b"DS",
         &even(&format!("{scale:.10e}")),
-    );
+    )?;
     if !plan_uid.is_empty() {
         let mut item = Vec::new();
-        ui(&mut item, 0x0008, 0x1150, RT_ION_PLAN_CLASS);
-        ui(&mut item, 0x0008, 0x1155, plan_uid);
-        sq(&mut bytes, 0x300C, 0x0060, &[item]);
+        ui(&mut item, 0x0008, 0x1150, RT_ION_PLAN_CLASS)?;
+        ui(&mut item, 0x0008, 0x1155, plan_uid)?;
+        sq(&mut bytes, 0x300C, 0x0060, &[item])?;
     }
-    ow32(&mut bytes, 0x7FE0, 0x0010, &pixels);
+    ow32(&mut bytes, 0x7FE0, 0x0010, &pixels)?;
     fs::write(path, &bytes).map_err(|err| err.to_string())?;
     Ok(path.to_path_buf())
 }
@@ -1565,16 +1598,16 @@ mod tests {
     #[test]
     fn a_signed_ct_pixel_stays_negative() {
         let mut bytes = Vec::new();
-        us(&mut bytes, 0x0028, 0x0010, 1);
-        us(&mut bytes, 0x0028, 0x0011, 1);
-        ds(&mut bytes, 0x0028, 0x0030, &[1.0, 2.0]);
-        ds(&mut bytes, 0x0020, 0x0032, &[0.0, 0.0, 10.0]);
-        us(&mut bytes, 0x0028, 0x0100, 16);
-        us(&mut bytes, 0x0028, 0x0103, 1);
-        ds(&mut bytes, 0x0028, 0x1052, &[0.0]);
-        ds(&mut bytes, 0x0028, 0x1053, &[1.0]);
-        ds(&mut bytes, 0x0018, 0x0050, &[2.5]);
-        ow(&mut bytes, 0x7FE0, 0x0010, &[(-1000i16) as u16, 0]);
+        us(&mut bytes, 0x0028, 0x0010, 1).unwrap();
+        us(&mut bytes, 0x0028, 0x0011, 1).unwrap();
+        ds(&mut bytes, 0x0028, 0x0030, &[1.0, 2.0]).unwrap();
+        ds(&mut bytes, 0x0020, 0x0032, &[0.0, 0.0, 10.0]).unwrap();
+        us(&mut bytes, 0x0028, 0x0100, 16).unwrap();
+        us(&mut bytes, 0x0028, 0x0103, 1).unwrap();
+        ds(&mut bytes, 0x0028, 0x1052, &[0.0]).unwrap();
+        ds(&mut bytes, 0x0028, 0x1053, &[1.0]).unwrap();
+        ds(&mut bytes, 0x0018, 0x0050, &[2.5]).unwrap();
+        ow(&mut bytes, 0x7FE0, 0x0010, &[(-1000i16) as u16, 0]).unwrap();
         let elems = parse_dataset(&bytes).unwrap();
         let slices = image_slices(&elems, 1.0).unwrap();
         assert_eq!(slices.len(), 2);
@@ -1586,20 +1619,21 @@ mod tests {
     #[test]
     fn a_prone_image_is_stored_in_patient_axes() {
         let mut bytes = Vec::new();
-        us(&mut bytes, 0x0028, 0x0010, 2);
-        us(&mut bytes, 0x0028, 0x0011, 2);
-        ds(&mut bytes, 0x0028, 0x0030, &[2.0, 2.0]);
-        ds(&mut bytes, 0x0020, 0x0032, &[2.0, 2.0, 0.0]);
+        us(&mut bytes, 0x0028, 0x0010, 2).unwrap();
+        us(&mut bytes, 0x0028, 0x0011, 2).unwrap();
+        ds(&mut bytes, 0x0028, 0x0030, &[2.0, 2.0]).unwrap();
+        ds(&mut bytes, 0x0020, 0x0032, &[2.0, 2.0, 0.0]).unwrap();
         ds(
             &mut bytes,
             0x0020,
             0x0037,
             &[-1.0, 0.0, 0.0, 0.0, -1.0, 0.0],
-        );
-        us(&mut bytes, 0x0028, 0x0100, 16);
-        ds(&mut bytes, 0x0028, 0x1052, &[0.0]);
-        ds(&mut bytes, 0x0028, 0x1053, &[1.0]);
-        ow(&mut bytes, 0x7FE0, 0x0010, &[10, 20, 30, 40]);
+        )
+        .unwrap();
+        us(&mut bytes, 0x0028, 0x0100, 16).unwrap();
+        ds(&mut bytes, 0x0028, 0x1052, &[0.0]).unwrap();
+        ds(&mut bytes, 0x0028, 0x1053, &[1.0]).unwrap();
+        ow(&mut bytes, 0x7FE0, 0x0010, &[10, 20, 30, 40]).unwrap();
         let slices = image_slices(&parse_dataset(&bytes).unwrap(), 1.0).unwrap();
         assert_eq!(slices.len(), 1);
         assert!((slices[0].origin[0]).abs() < 1e-4);
@@ -1610,14 +1644,14 @@ mod tests {
     #[test]
     fn feet_first_frame_offsets_step_toward_the_feet() {
         let mut bytes = Vec::new();
-        us(&mut bytes, 0x0028, 0x0010, 1);
-        us(&mut bytes, 0x0028, 0x0011, 1);
-        ds(&mut bytes, 0x0028, 0x0030, &[1.0, 1.0]);
-        ds(&mut bytes, 0x0020, 0x0032, &[0.0, 0.0, 10.0]);
-        ds(&mut bytes, 0x0020, 0x0037, &[-1.0, 0.0, 0.0, 0.0, 1.0, 0.0]);
-        ds(&mut bytes, 0x3004, 0x000C, &[0.0, 2.5]);
-        us(&mut bytes, 0x0028, 0x0100, 16);
-        ow(&mut bytes, 0x7FE0, 0x0010, &[1, 2]);
+        us(&mut bytes, 0x0028, 0x0010, 1).unwrap();
+        us(&mut bytes, 0x0028, 0x0011, 1).unwrap();
+        ds(&mut bytes, 0x0028, 0x0030, &[1.0, 1.0]).unwrap();
+        ds(&mut bytes, 0x0020, 0x0032, &[0.0, 0.0, 10.0]).unwrap();
+        ds(&mut bytes, 0x0020, 0x0037, &[-1.0, 0.0, 0.0, 0.0, 1.0, 0.0]).unwrap();
+        ds(&mut bytes, 0x3004, 0x000C, &[0.0, 2.5]).unwrap();
+        us(&mut bytes, 0x0028, 0x0100, 16).unwrap();
+        ow(&mut bytes, 0x7FE0, 0x0010, &[1, 2]).unwrap();
         let slices = image_slices(&parse_dataset(&bytes).unwrap(), 1.0).unwrap();
         let mut z: Vec<f32> = slices.iter().map(|slice| slice.origin[2]).collect();
         z.sort_by(f32::total_cmp);
@@ -1628,12 +1662,12 @@ mod tests {
     #[test]
     fn an_oblique_orientation_is_rejected() {
         let mut bytes = Vec::new();
-        us(&mut bytes, 0x0028, 0x0010, 1);
-        us(&mut bytes, 0x0028, 0x0011, 1);
-        ds(&mut bytes, 0x0028, 0x0030, &[1.0, 1.0]);
-        ds(&mut bytes, 0x0020, 0x0032, &[0.0, 0.0, 0.0]);
-        ds(&mut bytes, 0x0020, 0x0037, &[1.0, 0.0, 0.0, 0.0, 0.7, 0.7]);
-        ow(&mut bytes, 0x7FE0, 0x0010, &[0]);
+        us(&mut bytes, 0x0028, 0x0010, 1).unwrap();
+        us(&mut bytes, 0x0028, 0x0011, 1).unwrap();
+        ds(&mut bytes, 0x0028, 0x0030, &[1.0, 1.0]).unwrap();
+        ds(&mut bytes, 0x0020, 0x0032, &[0.0, 0.0, 0.0]).unwrap();
+        ds(&mut bytes, 0x0020, 0x0037, &[1.0, 0.0, 0.0, 0.0, 0.7, 0.7]).unwrap();
+        ow(&mut bytes, 0x7FE0, 0x0010, &[0]).unwrap();
         match image_slices(&parse_dataset(&bytes).unwrap(), 1.0) {
             Err(err) => assert!(err.contains("not axial")),
             Ok(_) => panic!("an oblique image was accepted"),
@@ -1712,11 +1746,11 @@ mod tests {
     #[test]
     fn a_zero_pixel_spacing_is_rejected() {
         let mut bytes = Vec::new();
-        us(&mut bytes, 0x0028, 0x0010, 1);
-        us(&mut bytes, 0x0028, 0x0011, 1);
-        ds(&mut bytes, 0x0028, 0x0030, &[0.0, 1.0]);
-        ds(&mut bytes, 0x0020, 0x0032, &[0.0, 0.0, 0.0]);
-        ow(&mut bytes, 0x7FE0, 0x0010, &[0]);
+        us(&mut bytes, 0x0028, 0x0010, 1).unwrap();
+        us(&mut bytes, 0x0028, 0x0011, 1).unwrap();
+        ds(&mut bytes, 0x0028, 0x0030, &[0.0, 1.0]).unwrap();
+        ds(&mut bytes, 0x0020, 0x0032, &[0.0, 0.0, 0.0]).unwrap();
+        ow(&mut bytes, 0x7FE0, 0x0010, &[0]).unwrap();
         let elems = parse_dataset(&bytes).unwrap();
         assert!(image_slices(&elems, 1.0).is_err());
     }
@@ -1797,7 +1831,7 @@ mod tests {
         iv(&mut setup, 0x300A, 0x00C0, &even("2"));
         iv(&mut setup, 0x300A, 0x00CE, &even("SETUP"));
         let mut bytes = preamble();
-        ui(&mut bytes, 0x0002, 0x0010, "1.2.840.10008.1.2");
+        ui(&mut bytes, 0x0002, 0x0010, "1.2.840.10008.1.2").unwrap();
         iv_sq(&mut bytes, 0x300A, 0x0070, &[group]);
         iv_sq(&mut bytes, 0x300A, 0x03A2, &[treatment, setup]);
         let plan = read_plan(&parse_file(&bytes).unwrap(), "f".into()).unwrap();
@@ -1824,13 +1858,13 @@ mod tests {
         assert_eq!(study.tps.as_ref().unwrap().frame, "1.2.3.4.5");
         assert!(inside_structure(&study, &study.structures[0], 1, 1, 0));
         let mut extra = preamble();
-        ui(&mut extra, 0x0008, 0x0016, "1.2.840.10008.5.1.4.1.1.2");
-        ui(&mut extra, 0x0020, 0x0052, "9.9.9");
-        us(&mut extra, 0x0028, 0x0010, 1);
-        us(&mut extra, 0x0028, 0x0011, 1);
-        ds(&mut extra, 0x0028, 0x0030, &[1.0, 1.0]);
-        ds(&mut extra, 0x0020, 0x0032, &[0.0, 0.0, 5.0]);
-        ow(&mut extra, 0x7FE0, 0x0010, &[0]);
+        ui(&mut extra, 0x0008, 0x0016, "1.2.840.10008.5.1.4.1.1.2").unwrap();
+        ui(&mut extra, 0x0020, 0x0052, "9.9.9").unwrap();
+        us(&mut extra, 0x0028, 0x0010, 1).unwrap();
+        us(&mut extra, 0x0028, 0x0011, 1).unwrap();
+        ds(&mut extra, 0x0028, 0x0030, &[1.0, 1.0]).unwrap();
+        ds(&mut extra, 0x0020, 0x0032, &[0.0, 0.0, 5.0]).unwrap();
+        ow(&mut extra, 0x7FE0, 0x0010, &[0]).unwrap();
         std::fs::write(root.join("other.dcm"), extra).unwrap();
         assert!(load_study(&root).is_err());
         let _ = std::fs::remove_dir_all(&root);
@@ -1839,17 +1873,17 @@ mod tests {
     #[test]
     fn an_ion_plan_keeps_raw_weights_and_the_scanning_spot_size() {
         let mut cp = Vec::new();
-        ds(&mut cp, 0x300A, 0x0114, &[100.0]);
-        is(&mut cp, 0x300A, 0x0392, 2);
-        ds(&mut cp, 0x300A, 0x0394, &[1.0, 2.0, 3.0, 4.0]);
-        ds(&mut cp, 0x300A, 0x0396, &[0.5, 0.25]);
-        ds(&mut cp, 0x300A, 0x0398, &[4.0, 6.0]);
+        ds(&mut cp, 0x300A, 0x0114, &[100.0]).unwrap();
+        is(&mut cp, 0x300A, 0x0392, 2).unwrap();
+        ds(&mut cp, 0x300A, 0x0394, &[1.0, 2.0, 3.0, 4.0]).unwrap();
+        ds(&mut cp, 0x300A, 0x0396, &[0.5, 0.25]).unwrap();
+        ds(&mut cp, 0x300A, 0x0398, &[4.0, 6.0]).unwrap();
         let mut beam = Vec::new();
-        sq(&mut beam, 0x300A, 0x03A8, &[cp]);
+        sq(&mut beam, 0x300A, 0x03A8, &[cp]).unwrap();
         let mut bytes = preamble();
-        ui(&mut bytes, 0x0008, 0x0016, "1.2.840.10008.5.1.4.1.1.481.8");
-        lo(&mut bytes, 0x300A, 0x0002, "TESTPLAN");
-        sq(&mut bytes, 0x300A, 0x03A2, &[beam]);
+        ui(&mut bytes, 0x0008, 0x0016, "1.2.840.10008.5.1.4.1.1.481.8").unwrap();
+        lo(&mut bytes, 0x300A, 0x0002, "TESTPLAN").unwrap();
+        sq(&mut bytes, 0x300A, 0x03A2, &[beam]).unwrap();
         let path = std::env::temp_dir().join(format!("scan-kit-ion-{}.dcm", std::process::id()));
         std::fs::write(&path, bytes).unwrap();
         let plan = read_ion_plan(&path).unwrap();
@@ -2061,44 +2095,44 @@ mod tests {
 
     fn plan_with_shifter(settings: &[(i32, &str, Option<f32>)]) -> Vec<Elem> {
         let mut ref_beam = Vec::new();
-        is(&mut ref_beam, 0x300C, 0x0006, 1);
-        ds(&mut ref_beam, 0x300A, 0x0086, &[10.0]);
+        is(&mut ref_beam, 0x300C, 0x0006, 1).unwrap();
+        ds(&mut ref_beam, 0x300A, 0x0086, &[10.0]).unwrap();
         let mut group = Vec::new();
-        is(&mut group, 0x300A, 0x0078, 1);
-        sq(&mut group, 0x300C, 0x0004, &[ref_beam]);
+        is(&mut group, 0x300A, 0x0078, 1).unwrap();
+        sq(&mut group, 0x300C, 0x0004, &[ref_beam]).unwrap();
         let mut shifters = Vec::new();
         for number in [1, 2] {
             let mut item = Vec::new();
-            is(&mut item, 0x300A, 0x0316, number);
-            lo(&mut item, 0x300A, 0x0318, &format!("RS{number}"));
+            is(&mut item, 0x300A, 0x0316, number).unwrap();
+            lo(&mut item, 0x300A, 0x0318, &format!("RS{number}")).unwrap();
             shifters.push(item);
         }
         let mut setting_items = Vec::new();
         for (number, mode, wet) in settings {
             let mut item = Vec::new();
-            is(&mut item, 0x300C, 0x0100, *number);
-            cs(&mut item, 0x300A, 0x0362, mode);
-            ds(&mut item, 0x300A, 0x0364, &[300.0]);
+            is(&mut item, 0x300C, 0x0100, *number).unwrap();
+            cs(&mut item, 0x300A, 0x0362, mode).unwrap();
+            ds(&mut item, 0x300A, 0x0364, &[300.0]).unwrap();
             if let Some(wet) = wet {
-                ds(&mut item, 0x300A, 0x0366, &[*wet]);
+                ds(&mut item, 0x300A, 0x0366, &[*wet]).unwrap();
             }
             setting_items.push(item);
         }
         let mut cp = Vec::new();
-        ds(&mut cp, 0x300A, 0x0114, &[100.0]);
-        ds(&mut cp, 0x300A, 0x012C, &[0.0, 0.0, 0.0]);
-        sq(&mut cp, 0x300A, 0x0360, &setting_items);
-        is(&mut cp, 0x300A, 0x0392, 1);
-        ds(&mut cp, 0x300A, 0x0394, &[1.0, -2.0]);
-        ds(&mut cp, 0x300A, 0x0396, &[1.0]);
+        ds(&mut cp, 0x300A, 0x0114, &[100.0]).unwrap();
+        ds(&mut cp, 0x300A, 0x012C, &[0.0, 0.0, 0.0]).unwrap();
+        sq(&mut cp, 0x300A, 0x0360, &setting_items).unwrap();
+        is(&mut cp, 0x300A, 0x0392, 1).unwrap();
+        ds(&mut cp, 0x300A, 0x0394, &[1.0, -2.0]).unwrap();
+        ds(&mut cp, 0x300A, 0x0396, &[1.0]).unwrap();
         let mut beam = Vec::new();
-        is(&mut beam, 0x300A, 0x00C0, 1);
-        ds(&mut beam, 0x300A, 0x010E, &[1.0]);
-        sq(&mut beam, 0x300A, 0x0314, &shifters);
-        sq(&mut beam, 0x300A, 0x03A8, &[cp]);
+        is(&mut beam, 0x300A, 0x00C0, 1).unwrap();
+        ds(&mut beam, 0x300A, 0x010E, &[1.0]).unwrap();
+        sq(&mut beam, 0x300A, 0x0314, &shifters).unwrap();
+        sq(&mut beam, 0x300A, 0x03A8, &[cp]).unwrap();
         let mut plan = Vec::new();
-        sq(&mut plan, 0x300A, 0x0070, &[group]);
-        sq(&mut plan, 0x300A, 0x03A2, &[beam]);
+        sq(&mut plan, 0x300A, 0x0070, &[group]).unwrap();
+        sq(&mut plan, 0x300A, 0x03A2, &[beam]).unwrap();
         parse_dataset(&plan).unwrap()
     }
 
@@ -2116,35 +2150,44 @@ mod tests {
 
     fn plan_with_spot_count(declared: i32, pairs: usize) -> Vec<Elem> {
         let mut ref_beam = Vec::new();
-        is(&mut ref_beam, 0x300C, 0x0006, 1);
-        ds(&mut ref_beam, 0x300A, 0x0086, &[10.0]);
+        is(&mut ref_beam, 0x300C, 0x0006, 1).unwrap();
+        ds(&mut ref_beam, 0x300A, 0x0086, &[10.0]).unwrap();
         let mut group = Vec::new();
-        is(&mut group, 0x300A, 0x0078, 1);
-        sq(&mut group, 0x300C, 0x0004, &[ref_beam]);
+        is(&mut group, 0x300A, 0x0078, 1).unwrap();
+        sq(&mut group, 0x300C, 0x0004, &[ref_beam]).unwrap();
         let mut cp = Vec::new();
-        ds(&mut cp, 0x300A, 0x0114, &[100.0]);
-        ds(&mut cp, 0x300A, 0x011E, &[0.0]);
-        ds(&mut cp, 0x300A, 0x0122, &[0.0]);
-        ds(&mut cp, 0x300A, 0x012C, &[0.0, 0.0, 0.0]);
-        is(&mut cp, 0x300A, 0x0392, declared);
+        ds(&mut cp, 0x300A, 0x0114, &[100.0]).unwrap();
+        ds(&mut cp, 0x300A, 0x011E, &[0.0]).unwrap();
+        ds(&mut cp, 0x300A, 0x0122, &[0.0]).unwrap();
+        ds(&mut cp, 0x300A, 0x012C, &[0.0, 0.0, 0.0]).unwrap();
+        is(&mut cp, 0x300A, 0x0392, declared).unwrap();
         let xy: Vec<f32> = (0..pairs)
             .flat_map(|i| [(i + 1) as f32, -((i + 1) as f32)])
             .collect();
-        ds(&mut cp, 0x300A, 0x0394, &xy);
+        ds(&mut cp, 0x300A, 0x0394, &xy).unwrap();
         ds(
             &mut cp,
             0x300A,
             0x0396,
             &vec![1.0; declared.max(0) as usize],
-        );
+        )
+        .unwrap();
         let mut beam = Vec::new();
-        is(&mut beam, 0x300A, 0x00C0, 1);
-        ds(&mut beam, 0x300A, 0x010E, &[1.0]);
-        is(&mut beam, 0x300C, 0x006A, 1);
-        sq(&mut beam, 0x300A, 0x03A8, &[cp]);
+        is(&mut beam, 0x300A, 0x00C0, 1).unwrap();
+        ds(&mut beam, 0x300A, 0x010E, &[1.0]).unwrap();
+        is(&mut beam, 0x300C, 0x006A, 1).unwrap();
+        sq(&mut beam, 0x300A, 0x03A8, &[cp]).unwrap();
         let mut plan = Vec::new();
-        sq(&mut plan, 0x300A, 0x0070, &[group]);
-        sq(&mut plan, 0x300A, 0x03A2, &[beam]);
+        sq(&mut plan, 0x300A, 0x0070, &[group]).unwrap();
+        sq(&mut plan, 0x300A, 0x03A2, &[beam]).unwrap();
         parse_dataset(&plan).unwrap()
+    }
+
+    #[test]
+    fn an_oversized_short_vr_errors_instead_of_panicking() {
+        let mut bytes = Vec::new();
+        let huge: Vec<f32> = vec![0.0; 9000]; // ~90 KB of DS text
+        assert!(ds(&mut bytes, 0x3004, 0x000C, &huge).is_err());
+        assert!(ds(&mut bytes, 0x3004, 0x000C, &[1.0]).is_ok());
     }
 }

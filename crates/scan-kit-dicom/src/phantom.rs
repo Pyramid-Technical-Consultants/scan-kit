@@ -124,41 +124,41 @@ pub fn write_phantom_study(dir: &Path, params: &Value) -> Result<String, String>
         }
         let sop = uid();
         let mut bytes = patient::preamble();
-        patient::ui(&mut bytes, 0x0008, 0x0016, CT);
-        patient::ui(&mut bytes, 0x0008, 0x0018, &sop);
-        patient::cs(&mut bytes, 0x0008, 0x0060, "CT");
-        patient::pn(&mut bytes, 0x0010, 0x0010, "Phantom^Synthetic");
-        patient::lo(&mut bytes, 0x0010, 0x0020, "SYNTH-0001");
-        patient::ds(&mut bytes, 0x0018, 0x0050, &[dz as f32]);
-        patient::cs(&mut bytes, 0x0018, 0x5100, &request.position);
-        patient::ui(&mut bytes, 0x0020, 0x000D, &study);
-        patient::ui(&mut bytes, 0x0020, 0x000E, &ct_series);
-        patient::is(&mut bytes, 0x0020, 0x0013, k as i32 + 1);
+        patient::ui(&mut bytes, 0x0008, 0x0016, CT)?;
+        patient::ui(&mut bytes, 0x0008, 0x0018, &sop)?;
+        patient::cs(&mut bytes, 0x0008, 0x0060, "CT")?;
+        patient::pn(&mut bytes, 0x0010, 0x0010, "Phantom^Synthetic")?;
+        patient::lo(&mut bytes, 0x0010, 0x0020, "SYNTH-0001")?;
+        patient::ds(&mut bytes, 0x0018, 0x0050, &[dz as f32])?;
+        patient::cs(&mut bytes, 0x0018, 0x5100, &request.position)?;
+        patient::ui(&mut bytes, 0x0020, 0x000D, &study)?;
+        patient::ui(&mut bytes, 0x0020, 0x000E, &ct_series)?;
+        patient::is(&mut bytes, 0x0020, 0x0013, k as i32 + 1)?;
         patient::ds(
             &mut bytes,
             0x0020,
             0x0032,
             &[x0 as f32, y0 as f32, z as f32],
-        );
+        )?;
         patient::ds(
             &mut bytes,
             0x0020,
             0x0037,
             &[column_sign as f32, 0.0, 0.0, 0.0, row_sign as f32, 0.0],
-        );
-        patient::ui(&mut bytes, 0x0020, 0x0052, &frame);
-        patient::us(&mut bytes, 0x0028, 0x0002, 1);
-        patient::cs(&mut bytes, 0x0028, 0x0004, "MONOCHROME2");
-        patient::us(&mut bytes, 0x0028, 0x0010, request.ny as u16);
-        patient::us(&mut bytes, 0x0028, 0x0011, request.nx as u16);
-        patient::ds(&mut bytes, 0x0028, 0x0030, &[dy as f32, dx as f32]);
-        patient::us(&mut bytes, 0x0028, 0x0100, 16);
-        patient::us(&mut bytes, 0x0028, 0x0101, 16);
-        patient::us(&mut bytes, 0x0028, 0x0102, 15);
-        patient::us(&mut bytes, 0x0028, 0x0103, 1);
-        patient::ds(&mut bytes, 0x0028, 0x1052, &[-1024.0]);
-        patient::ds(&mut bytes, 0x0028, 0x1053, &[1.0]);
-        patient::ow(&mut bytes, 0x7FE0, 0x0010, &pixels);
+        )?;
+        patient::ui(&mut bytes, 0x0020, 0x0052, &frame)?;
+        patient::us(&mut bytes, 0x0028, 0x0002, 1)?;
+        patient::cs(&mut bytes, 0x0028, 0x0004, "MONOCHROME2")?;
+        patient::us(&mut bytes, 0x0028, 0x0010, request.ny as u16)?;
+        patient::us(&mut bytes, 0x0028, 0x0011, request.nx as u16)?;
+        patient::ds(&mut bytes, 0x0028, 0x0030, &[dy as f32, dx as f32])?;
+        patient::us(&mut bytes, 0x0028, 0x0100, 16)?;
+        patient::us(&mut bytes, 0x0028, 0x0101, 16)?;
+        patient::us(&mut bytes, 0x0028, 0x0102, 15)?;
+        patient::us(&mut bytes, 0x0028, 0x0103, 1)?;
+        patient::ds(&mut bytes, 0x0028, 0x1052, &[-1024.0])?;
+        patient::ds(&mut bytes, 0x0028, 0x1053, &[1.0])?;
+        patient::ow(&mut bytes, 0x7FE0, 0x0010, &pixels)?;
         let name = format!("CT_{}.dcm", &sop[sop.len().saturating_sub(12)..]);
         fs::write(dir.join(name), bytes).map_err(|err| err.to_string())?;
     }
@@ -194,7 +194,7 @@ fn write_struct(
             |z| z.abs() < half,
             |z| vec![square(-half, half, -half, half, z)],
         ),
-    );
+    )?;
     number += 1;
     push_roi(
         &mut rois,
@@ -209,7 +209,7 @@ fn write_struct(
             |z| (PTV.z0..PTV.z1).contains(&z),
             |z| vec![square(PTV.x0, PTV.x1, PTV.y0, PTV.y1, z)],
         ),
-    );
+    )?;
     number += 1;
     push_roi(
         &mut rois,
@@ -229,7 +229,7 @@ fn write_struct(
                 ]
             },
         ),
-    );
+    )?;
     for insert in inserts(&request.phantom) {
         number += 1;
         let insert = *insert;
@@ -246,36 +246,36 @@ fn write_struct(
                 move |z| (insert.z0..insert.z1).contains(&z),
                 move |z| vec![square(insert.x0, insert.x1, insert.y0, insert.y1, z)],
             ),
-        );
+        )?;
     }
     let mut bytes = patient::preamble();
-    patient::ui(&mut bytes, 0x0008, 0x0016, RT_STRUCT);
-    patient::ui(&mut bytes, 0x0008, 0x0018, &uid());
-    patient::cs(&mut bytes, 0x0008, 0x0060, "RTSTRUCT");
-    patient::pn(&mut bytes, 0x0010, 0x0010, "Phantom^Synthetic");
-    patient::lo(&mut bytes, 0x0010, 0x0020, "SYNTH-0001");
-    patient::ui(&mut bytes, 0x0020, 0x000D, study);
-    patient::ui(&mut bytes, 0x0020, 0x000E, &uid());
-    patient::ui(&mut bytes, 0x0020, 0x0052, frame);
-    patient::lo(&mut bytes, 0x3006, 0x0002, "Synthetic");
-    let referenced = referenced_frame(frame, study, ct_series);
-    patient::sq(&mut bytes, 0x3006, 0x0010, &[referenced]);
-    patient::sq(&mut bytes, 0x3006, 0x0020, &rois);
-    patient::sq(&mut bytes, 0x3006, 0x0039, &contours);
+    patient::ui(&mut bytes, 0x0008, 0x0016, RT_STRUCT)?;
+    patient::ui(&mut bytes, 0x0008, 0x0018, &uid())?;
+    patient::cs(&mut bytes, 0x0008, 0x0060, "RTSTRUCT")?;
+    patient::pn(&mut bytes, 0x0010, 0x0010, "Phantom^Synthetic")?;
+    patient::lo(&mut bytes, 0x0010, 0x0020, "SYNTH-0001")?;
+    patient::ui(&mut bytes, 0x0020, 0x000D, study)?;
+    patient::ui(&mut bytes, 0x0020, 0x000E, &uid())?;
+    patient::ui(&mut bytes, 0x0020, 0x0052, frame)?;
+    patient::lo(&mut bytes, 0x3006, 0x0002, "Synthetic")?;
+    let referenced = referenced_frame(frame, study, ct_series)?;
+    patient::sq(&mut bytes, 0x3006, 0x0010, &[referenced])?;
+    patient::sq(&mut bytes, 0x3006, 0x0020, &rois)?;
+    patient::sq(&mut bytes, 0x3006, 0x0039, &contours)?;
     fs::write(dir.join("RS_synthetic.dcm"), bytes).map_err(|err| err.to_string())
 }
 
-fn referenced_frame(frame: &str, study: &str, ct_series: &str) -> Vec<u8> {
+fn referenced_frame(frame: &str, study: &str, ct_series: &str) -> Result<Vec<u8>, String> {
     let mut series = Vec::new();
-    patient::ui(&mut series, 0x0020, 0x000E, ct_series);
+    patient::ui(&mut series, 0x0020, 0x000E, ct_series)?;
     let mut study_item = Vec::new();
-    patient::ui(&mut study_item, 0x0008, 0x1150, "1.2.840.10008.3.1.2.3.1");
-    patient::ui(&mut study_item, 0x0008, 0x1155, study);
-    patient::sq(&mut study_item, 0x3006, 0x0014, &[series]);
+    patient::ui(&mut study_item, 0x0008, 0x1150, "1.2.840.10008.3.1.2.3.1")?;
+    patient::ui(&mut study_item, 0x0008, 0x1155, study)?;
+    patient::sq(&mut study_item, 0x3006, 0x0014, &[series])?;
     let mut item = Vec::new();
-    patient::ui(&mut item, 0x0020, 0x0052, frame);
-    patient::sq(&mut item, 0x3006, 0x0012, &[study_item]);
-    item
+    patient::ui(&mut item, 0x0020, 0x0052, frame)?;
+    patient::sq(&mut item, 0x3006, 0x0012, &[study_item])?;
+    Ok(item)
 }
 
 fn push_roi(
@@ -287,115 +287,116 @@ fn push_roi(
     kind: &str,
     color: [u8; 3],
     planes: Vec<Vec<Vec<f32>>>,
-) {
+) -> Result<(), String> {
     if planes.is_empty() {
-        return;
+        return Ok(());
     }
     let mut roi = Vec::new();
-    patient::is(&mut roi, 0x3006, 0x0022, number);
-    patient::ui(&mut roi, 0x3006, 0x0024, frame);
-    patient::lo(&mut roi, 0x3006, 0x0026, name);
-    patient::cs(&mut roi, 0x3006, 0x00A4, kind);
+    patient::is(&mut roi, 0x3006, 0x0022, number)?;
+    patient::ui(&mut roi, 0x3006, 0x0024, frame)?;
+    patient::lo(&mut roi, 0x3006, 0x0026, name)?;
+    patient::cs(&mut roi, 0x3006, 0x00A4, kind)?;
     rois.push(roi);
     let mut drawn = Vec::new();
     for plane in planes {
         for points in plane {
             let mut item = Vec::new();
-            patient::cs(&mut item, 0x3006, 0x0042, "CLOSED_PLANAR");
-            patient::is(&mut item, 0x3006, 0x0046, (points.len() / 3) as i32);
-            patient::ds(&mut item, 0x3006, 0x0050, &points);
+            patient::cs(&mut item, 0x3006, 0x0042, "CLOSED_PLANAR")?;
+            patient::is(&mut item, 0x3006, 0x0046, (points.len() / 3) as i32)?;
+            patient::ds(&mut item, 0x3006, 0x0050, &points)?;
             drawn.push(item);
         }
     }
     let mut contour = Vec::new();
-    patient::is_list(&mut contour, 0x3006, 0x002A, &color.map(u16::from));
-    patient::is(&mut contour, 0x3006, 0x0084, number);
-    patient::sq(&mut contour, 0x3006, 0x0040, &drawn);
+    patient::is_list(&mut contour, 0x3006, 0x002A, &color.map(u16::from))?;
+    patient::is(&mut contour, 0x3006, 0x0084, number)?;
+    patient::sq(&mut contour, 0x3006, 0x0040, &drawn)?;
     contours.push(contour);
+    Ok(())
 }
 
 fn write_plan(dir: &Path, request: &Request, study: &str, frame: &str) -> Result<(), String> {
     let mut bytes = patient::preamble();
-    patient::ui(&mut bytes, 0x0008, 0x0016, RT_PLAN);
-    patient::ui(&mut bytes, 0x0008, 0x0018, &uid());
-    patient::cs(&mut bytes, 0x0008, 0x0060, "RTPLAN");
-    patient::pn(&mut bytes, 0x0010, 0x0010, "Phantom^Synthetic");
-    patient::lo(&mut bytes, 0x0010, 0x0020, "SYNTH-0001");
-    patient::ui(&mut bytes, 0x0020, 0x000D, study);
-    patient::ui(&mut bytes, 0x0020, 0x000E, &uid());
-    patient::ui(&mut bytes, 0x0020, 0x0052, frame);
-    patient::lo(&mut bytes, 0x300A, 0x0002, "SYNTH");
-    patient::cs(&mut bytes, 0x300A, 0x000C, "PATIENT");
+    patient::ui(&mut bytes, 0x0008, 0x0016, RT_PLAN)?;
+    patient::ui(&mut bytes, 0x0008, 0x0018, &uid())?;
+    patient::cs(&mut bytes, 0x0008, 0x0060, "RTPLAN")?;
+    patient::pn(&mut bytes, 0x0010, 0x0010, "Phantom^Synthetic")?;
+    patient::lo(&mut bytes, 0x0010, 0x0020, "SYNTH-0001")?;
+    patient::ui(&mut bytes, 0x0020, 0x000D, study)?;
+    patient::ui(&mut bytes, 0x0020, 0x000E, &uid())?;
+    patient::ui(&mut bytes, 0x0020, 0x0052, frame)?;
+    patient::lo(&mut bytes, 0x300A, 0x0002, "SYNTH")?;
+    patient::cs(&mut bytes, 0x300A, 0x000C, "PATIENT")?;
     let dose_ref = {
         let mut item = Vec::new();
-        patient::is(&mut item, 0x300A, 0x0012, 1);
-        patient::cs(&mut item, 0x300A, 0x0014, "SITE");
-        patient::cs(&mut item, 0x300A, 0x0020, "TARGET");
-        patient::ds(&mut item, 0x300A, 0x0026, &[2.0]);
+        patient::is(&mut item, 0x300A, 0x0012, 1)?;
+        patient::cs(&mut item, 0x300A, 0x0014, "SITE")?;
+        patient::cs(&mut item, 0x300A, 0x0020, "TARGET")?;
+        patient::ds(&mut item, 0x300A, 0x0026, &[2.0])?;
         item
     };
-    patient::sq(&mut bytes, 0x300A, 0x0010, &[dose_ref]);
+    patient::sq(&mut bytes, 0x300A, 0x0010, &[dose_ref])?;
     let setup = {
         let mut item = Vec::new();
-        patient::is(&mut item, 0x300A, 0x0182, 1);
-        patient::cs(&mut item, 0x0018, 0x5100, &request.position);
+        patient::is(&mut item, 0x300A, 0x0182, 1)?;
+        patient::cs(&mut item, 0x0018, 0x5100, &request.position)?;
         item
     };
-    patient::sq(&mut bytes, 0x300A, 0x0180, &[setup]);
+    patient::sq(&mut bytes, 0x300A, 0x0180, &[setup])?;
     let n = request.spots.len();
     let cum = (n * request.energies.len()) as f32;
     let referenced = {
         let mut item = Vec::new();
-        patient::is(&mut item, 0x300C, 0x0006, 1);
-        patient::ds(&mut item, 0x300A, 0x0086, &[cum * request.mu as f32]);
+        patient::is(&mut item, 0x300C, 0x0006, 1)?;
+        patient::ds(&mut item, 0x300A, 0x0086, &[cum * request.mu as f32])?;
         item
     };
     let fraction = {
         let mut item = Vec::new();
-        patient::is(&mut item, 0x300A, 0x0071, 1);
-        patient::is(&mut item, 0x300A, 0x0078, request.fractions);
-        patient::is(&mut item, 0x300A, 0x0080, 1);
-        patient::sq(&mut item, 0x300C, 0x0004, &[referenced]);
+        patient::is(&mut item, 0x300A, 0x0071, 1)?;
+        patient::is(&mut item, 0x300A, 0x0078, request.fractions)?;
+        patient::is(&mut item, 0x300A, 0x0080, 1)?;
+        patient::sq(&mut item, 0x300C, 0x0004, &[referenced])?;
         item
     };
-    patient::sq(&mut bytes, 0x300A, 0x0070, &[fraction]);
+    patient::sq(&mut bytes, 0x300A, 0x0070, &[fraction])?;
     let mut cps = Vec::new();
     let mut weight = 0.0f32;
     let mut first = true;
     for energy in &request.energies {
         for last in [false, true] {
             let mut cp = Vec::new();
-            patient::ds(&mut cp, 0x300A, 0x0114, &[*energy as f32]);
+            patient::ds(&mut cp, 0x300A, 0x0114, &[*energy as f32])?;
             if first {
-                patient::ds(&mut cp, 0x300A, 0x011E, &[request.gantry as f32]);
-                patient::ds(&mut cp, 0x300A, 0x0122, &[request.couch as f32]);
+                patient::ds(&mut cp, 0x300A, 0x011E, &[request.gantry as f32])?;
+                patient::ds(&mut cp, 0x300A, 0x0122, &[request.couch as f32])?;
                 patient::ds(
                     &mut cp,
                     0x300A,
                     0x012C,
                     &[0.0, ((PTV.y0 + PTV.y1) / 2.0) as f32, 0.0],
-                );
-                patient::ds(&mut cp, 0x300A, 0x030D, &[300.0]);
+                )?;
+                patient::ds(&mut cp, 0x300A, 0x030D, &[300.0])?;
                 if request.wet > 0.0 {
                     let mut setting = Vec::new();
-                    patient::is(&mut setting, 0x300C, 0x0100, 1);
-                    patient::cs(&mut setting, 0x300A, 0x0362, "IN");
-                    patient::ds(&mut setting, 0x300A, 0x0364, &[300.0]);
-                    patient::ds(&mut setting, 0x300A, 0x0366, &[request.wet as f32]);
-                    patient::sq(&mut cp, 0x300A, 0x0360, &[setting]);
+                    patient::is(&mut setting, 0x300C, 0x0100, 1)?;
+                    patient::cs(&mut setting, 0x300A, 0x0362, "IN")?;
+                    patient::ds(&mut setting, 0x300A, 0x0364, &[300.0])?;
+                    patient::ds(&mut setting, 0x300A, 0x0366, &[request.wet as f32])?;
+                    patient::sq(&mut cp, 0x300A, 0x0360, &[setting])?;
                 }
             }
-            patient::ds(&mut cp, 0x300A, 0x0134, &[weight]);
-            patient::sh(&mut cp, 0x300A, 0x0390, "3.0");
-            patient::is(&mut cp, 0x300A, 0x0392, n as i32);
+            patient::ds(&mut cp, 0x300A, 0x0134, &[weight])?;
+            patient::sh(&mut cp, 0x300A, 0x0390, "3.0")?;
+            patient::is(&mut cp, 0x300A, 0x0392, n as i32)?;
             let mut xy = Vec::with_capacity(n * 2);
             for (x, y) in &request.spots {
                 xy.push(*x);
                 xy.push(*y);
             }
-            patient::ds(&mut cp, 0x300A, 0x0394, &xy);
+            patient::ds(&mut cp, 0x300A, 0x0394, &xy)?;
             let spot_weight = if last { 0.0 } else { 1.0 };
-            patient::ds(&mut cp, 0x300A, 0x0396, &vec![spot_weight; n]);
+            patient::ds(&mut cp, 0x300A, 0x0396, &vec![spot_weight; n])?;
             if !last {
                 weight += n as f32;
             }
@@ -405,28 +406,28 @@ fn write_plan(dir: &Path, request: &Request, study: &str, frame: &str) -> Result
     }
     let beam = {
         let mut item = Vec::new();
-        patient::is(&mut item, 0x300A, 0x00C0, 1);
-        patient::lo(&mut item, 0x300A, 0x00C2, "B1");
-        patient::cs(&mut item, 0x300A, 0x00C6, "PROTON");
-        patient::cs(&mut item, 0x300A, 0x00CE, "TREATMENT");
-        patient::lo(&mut item, 0x300A, 0x00B2, "SYNTH");
-        patient::is(&mut item, 0x300A, 0x0110, cps.len() as i32);
-        patient::ds(&mut item, 0x300A, 0x010E, &[weight]);
-        patient::cs(&mut item, 0x300A, 0x0308, "MODULATED");
-        patient::ds(&mut item, 0x300A, 0x030A, &[2000.0, 2000.0]);
+        patient::is(&mut item, 0x300A, 0x00C0, 1)?;
+        patient::lo(&mut item, 0x300A, 0x00C2, "B1")?;
+        patient::cs(&mut item, 0x300A, 0x00C6, "PROTON")?;
+        patient::cs(&mut item, 0x300A, 0x00CE, "TREATMENT")?;
+        patient::lo(&mut item, 0x300A, 0x00B2, "SYNTH")?;
+        patient::is(&mut item, 0x300A, 0x0110, cps.len() as i32)?;
+        patient::ds(&mut item, 0x300A, 0x010E, &[weight])?;
+        patient::cs(&mut item, 0x300A, 0x0308, "MODULATED")?;
+        patient::ds(&mut item, 0x300A, 0x030A, &[2000.0, 2000.0])?;
         if request.wet > 0.0 {
-            patient::is(&mut item, 0x300A, 0x0312, 1);
+            patient::is(&mut item, 0x300A, 0x0312, 1)?;
             let mut shifter = Vec::new();
-            patient::is(&mut shifter, 0x300A, 0x0316, 1);
-            patient::sh(&mut shifter, 0x300A, 0x0318, "RS1");
-            patient::cs(&mut shifter, 0x300A, 0x0320, "BINARY");
-            patient::sq(&mut item, 0x300A, 0x0314, &[shifter]);
+            patient::is(&mut shifter, 0x300A, 0x0316, 1)?;
+            patient::sh(&mut shifter, 0x300A, 0x0318, "RS1")?;
+            patient::cs(&mut shifter, 0x300A, 0x0320, "BINARY")?;
+            patient::sq(&mut item, 0x300A, 0x0314, &[shifter])?;
         }
-        patient::is(&mut item, 0x300C, 0x006A, 1);
-        patient::sq(&mut item, 0x300A, 0x03A8, &cps);
+        patient::is(&mut item, 0x300C, 0x006A, 1)?;
+        patient::sq(&mut item, 0x300A, 0x03A8, &cps)?;
         item
     };
-    patient::sq(&mut bytes, 0x300A, 0x03A2, &[beam]);
+    patient::sq(&mut bytes, 0x300A, 0x03A2, &[beam])?;
     fs::write(dir.join("RP_synthetic.dcm"), bytes).map_err(|err| err.to_string())
 }
 
