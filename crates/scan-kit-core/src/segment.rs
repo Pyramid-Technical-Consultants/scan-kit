@@ -157,7 +157,7 @@ pub fn scrub_limits(options: &Value) -> Option<(f32, f32)> {
     if value.get("on").and_then(Value::as_bool) != Some(true) {
         return None;
     }
-    let at = finite_f32(value.get("at")).unwrap_or(0.0);
+    let at = finite_f32(value.get("at")).unwrap_or(0.0).max(0.0);
     let before = value.get("window").and_then(Value::as_str) == Some("before");
     let lo = if before { f32::NEG_INFINITY } else { at - 1.0 };
     Some((lo, at))
@@ -865,5 +865,11 @@ mod tests {
                 state: BeamGate::On
             }
         )));
+    }
+
+    #[test]
+    fn a_negative_playhead_clamps_to_zero() {
+        let options = serde_json::json!({ "scrub": "{ \"on\": true, \"at\": -5.0 }" });
+        assert_eq!(scrub_limits(&options), Some((-1.0, 0.0)));
     }
 }

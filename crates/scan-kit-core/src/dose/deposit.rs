@@ -59,12 +59,10 @@ pub(super) fn prepare(
         if energy <= 1.0 || factor <= 0.0 {
             continue;
         }
-        let protons = match quantity {
-            Quantity::Protons => f64::from(pencil.amount),
-            Quantity::Dose | Quantity::Mu => {
-                protons_from_mu(f64::from(pencil.amount), f64::from(energy), gap_mm, k_mu)
-            }
-        } * f64::from(factor);
+        // amount is always a MU/charge reading — the Protons map needs the
+        // energy-dependent proton count like Dose does, not the raw MU.
+        let protons = protons_from_mu(f64::from(pencil.amount), f64::from(energy), gap_mm, k_mu)
+            * f64::from(factor);
         // The Mu deposit weights by amount*factor — the charge conversion is
         // not part of it, so a zero/negative k_mu must not zero the map.
         // For the other quantities protons <= 0 (negative k_mu) would deposit
@@ -150,6 +148,9 @@ pub(super) fn dose_grid(
     for i in 0..3 {
         shape[i] = (hi_i[i] - lo_i[i]).round().max(1.0) as usize;
         if shape[i] > MAX_CELLS {
+            // ponytail: a span wider than MAX_CELLS recenters on the
+            // midpoint and drops out-of-window dose rather than coarsening
+            // the voxel — the GPU texture budget fixes the side.
             let mid = 0.5 * (lo_i[i] + hi_i[i]);
             lo_i[i] = (mid - MAX_CELLS as f32 / 2.0).floor();
             shape[i] = MAX_CELLS;

@@ -96,8 +96,9 @@ pub fn parse_host(host: &str) -> Result<String, String> {
 
 pub fn normalize_host(host: &str) -> Result<String, String> {
     let host = parse_host(host)?;
-    if host.matches(':').count() > 1 {
-        // An IPv6 literal needs brackets in a URL authority.
+    if host.matches(':').count() > 1 && !host.starts_with('[') {
+        // An IPv6 literal needs brackets in a URL authority — one that
+        // already wears them must not get a second pair.
         Ok(format!("[{host}]"))
     } else if host.contains(':') {
         Ok(host)
@@ -528,5 +529,11 @@ mod tests {
             "10.0.0.1:8500"
         );
         assert_eq!(parse_host("user@host").unwrap(), "host");
+    }
+
+    #[test]
+    fn a_bracketed_ipv6_host_stays_bracketed() {
+        assert_eq!(normalize_host("[::1]").unwrap(), "[::1]");
+        assert_eq!(normalize_host("::1").unwrap(), "[::1]");
     }
 }
