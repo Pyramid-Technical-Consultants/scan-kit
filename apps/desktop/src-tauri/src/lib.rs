@@ -68,29 +68,48 @@ fn scan_kit_about() -> Result<Value, String> {
     scan_kit_core::invoke("scan_kit_about", &Value::Null).map_err(|err| err.to_string())
 }
 
+// These look trivial but every one blocks on the store lock — which a
+// library index holds for seconds — so they must not run on the main thread.
 #[tauri::command]
-fn scan_kit_last_data_dir() -> Result<Option<String>, String> {
-    scan_kit_io::read_last_data_dir()
+async fn scan_kit_last_data_dir() -> Result<Option<String>, String> {
+    tauri::async_runtime::spawn_blocking(scan_kit_io::read_last_data_dir)
+        .await
+        .map_err(|err| err.to_string())?
 }
 
 #[tauri::command]
-fn scan_kit_window_geometry() -> Result<Value, String> {
-    scan_kit_io::read_window_geometry()
+async fn scan_kit_window_geometry() -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(scan_kit_io::read_window_geometry)
+        .await
+        .map_err(|err| err.to_string())?
 }
 
 #[tauri::command]
-fn scan_kit_set_window_geometry(width: i32, height: i32, x: i32, y: i32) -> Result<(), String> {
-    scan_kit_io::write_window_geometry(width, height, x, y)
+async fn scan_kit_set_window_geometry(
+    width: i32,
+    height: i32,
+    x: i32,
+    y: i32,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        scan_kit_io::write_window_geometry(width, height, x, y)
+    })
+    .await
+    .map_err(|err| err.to_string())?
 }
 
 #[tauri::command]
-fn scan_kit_last_main_tab() -> Result<Option<String>, String> {
-    scan_kit_io::read_last_main_tab()
+async fn scan_kit_last_main_tab() -> Result<Option<String>, String> {
+    tauri::async_runtime::spawn_blocking(scan_kit_io::read_last_main_tab)
+        .await
+        .map_err(|err| err.to_string())?
 }
 
 #[tauri::command]
-fn scan_kit_set_last_main_tab(tab: String) -> Result<(), String> {
-    scan_kit_io::write_last_main_tab(&tab)
+async fn scan_kit_set_last_main_tab(tab: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || scan_kit_io::write_last_main_tab(&tab))
+        .await
+        .map_err(|err| err.to_string())?
 }
 
 #[tauri::command]
@@ -357,17 +376,21 @@ async fn scan_kit_runner_status(
 }
 
 #[tauri::command]
-fn scan_kit_reveal(path: String) -> Result<(), String> {
-    let target = std::path::PathBuf::from(&path);
-    if !target.exists() {
-        return Err(format!("Nothing at {path}"));
-    }
-    // explorer.exe often exits nonzero after the window is already open.
-    std::process::Command::new(reveal_program())
-        .args(reveal_args(&target))
-        .spawn()
-        .map(|_| ())
-        .map_err(|err| err.to_string())
+async fn scan_kit_reveal(path: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let target = std::path::PathBuf::from(&path);
+        if !target.exists() {
+            return Err(format!("Nothing at {path}"));
+        }
+        // explorer.exe often exits nonzero after the window is already open.
+        std::process::Command::new(reveal_program())
+            .args(reveal_args(&target))
+            .spawn()
+            .map(|_| ())
+            .map_err(|err| err.to_string())
+    })
+    .await
+    .map_err(|err| err.to_string())?
 }
 
 fn reveal_program() -> &'static str {

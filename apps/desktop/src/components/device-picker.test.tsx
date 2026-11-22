@@ -20,7 +20,7 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 
-function render(onChange = vi.fn()) {
+function render(onChange = vi.fn(), onConnect = vi.fn()) {
   const host = document.createElement("div");
   document.body.append(host);
   act(() => {
@@ -29,11 +29,11 @@ function render(onChange = vi.fn()) {
       <DevicePicker
         value="192.168.100.184"
         onChange={onChange}
-        onConnect={() => undefined}
+        onConnect={onConnect}
       />,
     );
   });
-  return { host, onChange };
+  return { host, onChange, onConnect };
 }
 
 function button(host: HTMLElement, label: string | RegExp) {
@@ -42,11 +42,20 @@ function button(host: HTMLElement, label: string | RegExp) {
   );
 }
 
-it("types a host and connects", () => {
-  const { host } = render();
+it("types a host and connects", async () => {
+  const { host, onChange, onConnect } = render();
   const input = host.querySelector("input");
   expect(input?.placeholder).toBe("192.168.100.184");
-  expect(button(host, "Connect")).toBeTruthy();
+  const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+  await act(async () => {
+    setter?.call(input, "192.168.100.9");
+    input?.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  expect(onChange).toHaveBeenCalledWith("192.168.100.9");
+  await act(async () => {
+    button(host, "Connect")?.click();
+  });
+  expect(onConnect).toHaveBeenCalled();
 });
 
 it("opens the scan panel with a subnet derived from the host", async () => {

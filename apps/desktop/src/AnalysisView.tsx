@@ -878,6 +878,12 @@ export function AnalysisView({
           await new Promise((resolve) => window.setTimeout(resolve, parsed.payload == null ? 40 : 0));
         }
       })().catch((reason: unknown) => {
+        // A poll rejection leaves the task registered — cancel it so the
+        // backend does not keep working a job nobody is polling.
+        const stale = taskId.current;
+        if (stale != null) {
+          void invoke("scan_kit_cancel", { task: stale }).catch(() => {});
+        }
         if (openSeq.current === ticket) {
           const message = messageOf(reason);
           setArrivedKey(requestKey);

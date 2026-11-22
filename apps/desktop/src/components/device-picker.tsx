@@ -121,7 +121,13 @@ export function DevicePicker({
             <InputGroupInput
               value={subnet}
               placeholder="192.168.100.0/24"
-              onChange={(event) => setSubnet(event.target.value)}
+              onChange={(event) => {
+                setSubnet(event.target.value);
+                // Hits belong to the subnet that produced them — drop them
+                // when it changes so stale results aren't listed under a
+                // new (or still scanning) range.
+                setHits(null);
+              }}
               onKeyDown={(event) => {
                 if (event.key === "Enter" && !scanning) {
                   void scan();

@@ -357,7 +357,7 @@ export function ConfigTuning({
           if (!cancel) {
             const message = caught instanceof Error ? caught.message : String(caught);
             setError(message);
-            notifyError(caught);
+            notifyError(caught, "config-tune-preview");
           }
         })
         .finally(() => {
@@ -383,6 +383,7 @@ export function ConfigTuning({
       setForm(loaded.form);
       setIntegrity(loaded.integrity);
       setDirty(false);
+      autoMu.current = null;
       setPreview(null);
       return true;
     } finally {
@@ -457,9 +458,9 @@ export function ConfigTuning({
   }
 
   async function toggleHide(next: boolean) {
-    setHideUnused(next);
     try {
       await invoke("scan_kit_config_hide", { hideUnused: next });
+      setHideUnused(next);
     } catch (caught) {
       notifyError(caught);
     }
@@ -734,6 +735,7 @@ export function ConfigTuning({
                 }
                 setWorkflowId(next.id);
                 setParams(defaultsOf(next));
+                autoMu.current = null;
                 setPreview(null);
               }}
             />
