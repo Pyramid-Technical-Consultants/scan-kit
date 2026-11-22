@@ -172,6 +172,9 @@ pub fn load_study(path: &Path) -> Result<PatientStudy, String> {
             }
             dose_seen = true;
             let scale = float_tag(&elems, tag(0x3004, 0x000E)).unwrap_or(1.0);
+            if !scale.is_finite() {
+                return Err("dose grid scaling is not finite".into());
+            }
             if dose_type.is_empty() {
                 dose_type = text_tag(&elems, tag(0x3004, 0x0004));
                 summation = text_tag(&elems, tag(0x3004, 0x000A));
@@ -652,6 +655,9 @@ fn image_slices(elems: &[Elem], scale: f32) -> Result<Vec<Slice>, String> {
             .get(frame)
             .copied()
             .unwrap_or(frame as f32 * thickness);
+        if !along.is_finite() {
+            return Err("frame offset is not finite".into());
+        }
         let mut values = stored[frame * plane..(frame + 1) * plane].to_vec();
         let mut x = origin[0];
         let mut y = origin[1];
@@ -962,7 +968,7 @@ pub fn inside_structure(
         let Some(z0) = contour.first().map(|point| point[2]) else {
             continue;
         };
-        if (center[2] - z0).abs() > ct.spacing[2] * 0.6 {
+        if !z0.is_finite() || (center[2] - z0).abs() > ct.spacing[2] * 0.6 {
             continue;
         }
         on_plane = true;

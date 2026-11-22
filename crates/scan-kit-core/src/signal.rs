@@ -327,13 +327,16 @@ pub fn histogram(values: &[f32], bins: usize) -> (Vec<f32>, Vec<f32>) {
         lo -= 0.5;
         hi += 0.5;
     }
+    // Span math in f64: a column can legitimately span more than f32::MAX,
+    // which would turn every edge NaN and pile all counts into bin 0.
+    let span = f64::from(hi) - f64::from(lo);
     let mut edges = Vec::with_capacity(bins + 1);
     for i in 0..=bins {
-        edges.push(lo + (hi - lo) * i as f32 / bins as f32);
+        edges.push((f64::from(lo) + span * i as f64 / bins as f64) as f32);
     }
     let mut counts = vec![0.0f32; bins];
     for value in finite {
-        let mut index = ((value - lo) / (hi - lo) * bins as f32) as usize;
+        let mut index = ((f64::from(value) - f64::from(lo)) / span * bins as f64) as usize;
         if index >= bins {
             index = bins - 1;
         }
@@ -500,7 +503,13 @@ pub fn splat_gaussians(
     }
     for spot in spots {
         let [x, y, z, weight, sigma] = *spot;
-        if !sigma.is_finite() || sigma <= 0.0 || !weight.is_finite() {
+        if !x.is_finite()
+            || !y.is_finite()
+            || !z.is_finite()
+            || !sigma.is_finite()
+            || sigma <= 0.0
+            || !weight.is_finite()
+        {
             continue;
         }
         // 3σ in millimetres, converted to voxels per axis — spacing < 1 mm
@@ -599,7 +608,7 @@ pub fn linear_fit(xs: &[f32], ys: &[f32]) -> Option<(f32, f32)> {
         }
     }
     let den = n * sxx - sx * sx;
-    if n < 2.0 || den.abs() < 1e-12 {
+    if n < 2.0 || !den.is_finite() || den.abs() < 1e-12 {
         return None;
     }
     let slope = (n * sxy - sx * sy) / den;
@@ -1247,5 +1256,19 @@ mod tests {
         assert!(freqs.is_empty() && psd.is_empty());
         let (freqs, psd) = welch_psd(&[1.0; 64], f32::NAN, 16, 0.5);
         assert!(freqs.is_empty() && psd.is_empty());
+    }
+
+    #[test]
+    fn a_span_wider_than_f32_still_bins() {
+        let (edges, counts) = histogram(&[-2.0e38, 0.0, 2.0e38], 3);
+        assert!(edges.iter().all(|edge| edge.is_finite()));
+        assert_eq!(counts, vec![1.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn a_nan_fit_denominator_returns_none() {
+        // sxx and sx*sx both overflow to inf for 2e38 inputs — den is NaN,
+        // which must not slip the near-zero guard into Some((NaN, NaN)).
+        assert_eq!(linear_fit(&[2.0e38, 2.0e38], &[1.0, 2.0]), None);
     }
 }

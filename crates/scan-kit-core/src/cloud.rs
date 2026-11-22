@@ -169,6 +169,9 @@ pub fn count_grid(
     }
     let dx = x1 - x0;
     let dy = y1 - y0;
+    if !dx.is_finite() || !dy.is_finite() {
+        return counts;
+    }
     let dx = if dx > 0.0 { dx } else { 1e-6 };
     let dy = if dy > 0.0 { dy } else { 1e-6 };
     for (x, y) in xs.iter().zip(ys) {
@@ -270,6 +273,9 @@ fn density_range(values: &[f32]) -> (f32, f32) {
     for value in values {
         lo = lo.min(*value);
         hi = hi.max(*value);
+    }
+    if !(hi - lo).is_finite() {
+        return (0.0, 0.0);
     }
     if hi <= lo {
         (lo - 0.5, hi + 0.5)
@@ -610,5 +616,13 @@ mod tests {
                 radius: 1.0,
             },
         );
+    }
+
+    #[test]
+    fn non_finite_bounds_count_nothing() {
+        let xs = vec![0.0f32, 1.0, 2.0];
+        let ys = vec![0.0f32, 1.0, 2.0];
+        let counts = count_grid(&xs, &ys, f32::NEG_INFINITY, f32::INFINITY, 0.0, 1.0, 4, 4);
+        assert!(counts.iter().all(|count| *count == 0.0));
     }
 }
