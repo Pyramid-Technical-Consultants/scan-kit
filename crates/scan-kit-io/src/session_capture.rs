@@ -99,12 +99,26 @@ pub struct CaptureResult {
     pub session_id: String,
 }
 
+/// First `|` field of `file_header_meta` — device text, so strip control
+/// characters before it lands in termination_summary where a newline would
+/// forge a record line.
+fn meta_id(meta: &str) -> String {
+    meta.split('|')
+        .next()
+        .unwrap_or("")
+        .chars()
+        .filter(|ch| !ch.is_control())
+        .collect::<String>()
+        .trim()
+        .to_owned()
+}
+
 /// Read the current session id from the RCI's timeslice table metadata.
 /// `None` when the device has never run a session.
 pub fn live_session_id(host: &str) -> Option<String> {
     table_io(host, "rci", "timeslice_table", "file_header_meta")
         .and_then(|value| value.as_str().map(str::to_owned))
-        .map(|meta| meta.split('|').next().unwrap_or("").trim().to_owned())
+        .map(|meta| meta_id(&meta))
         .filter(|id| !id.is_empty())
 }
 
@@ -499,7 +513,7 @@ fn session_id(devices: &[CaptureDevice], warnings: &mut Vec<String>) -> Option<S
             "file_header_meta",
         )
         .and_then(|value| value.as_str().map(str::to_owned))
-        .map(|meta| meta.split('|').next().unwrap_or("").trim().to_owned())
+        .map(|meta| meta_id(&meta))
         .unwrap_or_default();
         if id.is_empty() {
             continue;
@@ -1652,5 +1666,12 @@ mod tests {
         let bad = parse_sheet(b"a,b\n1,2\n\xff\xfe,9\n").unwrap();
         assert!(bad.truncated);
         assert_eq!(bad.rows.len(), 1);
+    }
+    #[test]
+    fn a_session_id_drops_control_characters() {
+        // Device text lands raw in termination_summary — a newline in it
+        // would forge a record line on re-ingest.
+        assert_eq!(meta_id("x\nError code: 9|rest"), "xError code: 9");
+        assert_eq!(meta_id("a\rb"), "ab");
     }
 }

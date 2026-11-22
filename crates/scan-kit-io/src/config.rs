@@ -138,6 +138,12 @@ pub fn save_folder(
         if dest_key.starts_with(&format!("{source_key}/")) {
             return Err("Save the configuration beside the source folder, not inside it.".into());
         }
+        // The stale-file pass below lists dest relative to dest — when source
+        // sits inside dest, the source's own files are listed as "stale" and
+        // deleted by the act of saving them.
+        if source_key.starts_with(&format!("{dest_key}/")) {
+            return Err("Save the configuration beside the source folder, not around it.".into());
+        }
         // Without this the copy merges into whatever is already at dest —
         // stale configs survive with fresh sidecars. The removal runs after
         // the copy succeeds so a copy failure never deletes destination files.
@@ -349,9 +355,15 @@ fn diff_root(dir: &Path) -> PathBuf {
     dir.to_path_buf()
 }
 
+// A config tree is XML/MD5 sidecars — nothing in it legitimately approaches
+// 64 MiB per file or 256 MiB total. The caps keep `config_diff` pointed at a
+// session tree or home directory from buffering gigabytes into memory.
+const MAX_FILE_BYTES: u64 = 64 << 20;
+const MAX_WALK_BYTES: u64 = 256 << 20;
+
 fn walk_files(root: &Path) -> Result<BTreeMap<String, Vec<u8>>, String> {
     let mut files = BTreeMap::new();
-    walk_files_at(root, root, 0, &mut files)?;
+    walk_files_at(root, root, 0, &mut files, &mut 0)?;
     Ok(files)
 }
 
@@ -360,6 +372,7 @@ fn walk_files_at(
     dir: &Path,
     depth: usize,
     files: &mut BTreeMap<String, Vec<u8>>,
+    total: &mut u64,
 ) -> Result<(), String> {
     if depth > MAX_WALK_DEPTH {
         return Err(format!(
@@ -380,14 +393,28 @@ fn walk_files_at(
         }
         let path = entry.path();
         if kind.is_dir() {
-            walk_files_at(root, &path, depth + 1, files)?;
+            walk_files_at(root, &path, depth + 1, files, total)?;
             continue;
         }
         let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
         if name.ends_with(".md5") {
             continue;
         }
+        let over = entry
+            .metadata()
+            .map(|meta| meta.len() > MAX_FILE_BYTES)
+            .unwrap_or(false);
+        if over {
+            continue;
+        }
         if let Ok(bytes) = fs::read(&path) {
+            *total = total.saturating_add(bytes.len() as u64);
+            if *total > MAX_WALK_BYTES {
+                return Err(format!(
+                    "config tree under {} exceeds the walk cap",
+                    root.display()
+                ));
+            }
             files.insert(relative(root, &path), bytes);
         }
     }
@@ -1555,5 +1582,28 @@ mod tests {
                     .iter()
                     .any(|child| form_has(child, title, collapsible))
             })
+    }
+    #[test]
+    fn saving_into_a_parent_of_the_source_is_rejected() {
+        // The stale-file pass lists dest-relative paths — with source inside
+        // dest the source's own files were listed as stale and deleted.
+        let root = std::env::temp_dir().join(format!("scan-kit-cfg-anc-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let source = root.join("cfg");
+        fs::create_dir_all(source.join("map2map")).unwrap();
+        fs::write(
+            source.join("map2map/devices.xml"),
+            b"<devices/>
+",
+        )
+        .unwrap();
+        let db = root.join("test.sqlite");
+        let result = save_folder(&db, &source, &root, &json!([]), None);
+        assert!(result.is_err(), "source inside dest must not be saved");
+        assert!(
+            source.join("map2map/devices.xml").exists(),
+            "source survived"
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 }

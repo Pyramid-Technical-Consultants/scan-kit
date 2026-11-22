@@ -226,7 +226,11 @@ pub(crate) fn remote_fingerprint(session_url: &str, session_id: &str) -> Option<
         }
     }
     for path in candidates {
-        let stat = fs.stat(&path).ok()??;
+        // A miss on one candidate must not end the search — the nested
+        // session layout stores the marker under {base}/{id}/{id}/.
+        let Ok(Some(stat)) = fs.stat(&path) else {
+            continue;
+        };
         if archive_name(&remote.path) || !stat.dir {
             return Some((stat.mtime_ns, i64::try_from(stat.size).ok()?));
         }
@@ -294,6 +298,15 @@ pub(crate) fn replace_sessions(library: &str, places: &[(String, String)]) {
     for (session_id, place) in places {
         map.insert((library.to_owned(), session_id.clone()), place.clone());
     }
+}
+
+/// Drop every recorded session binding for a forgotten library — otherwise a
+/// "forgotten" root still resolves and re-downloads remote sessions.
+pub(crate) fn drop_sessions(library: &str) {
+    sessions()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .retain(|(root, _), _| root != library);
 }
 
 pub(crate) fn cache_directory(library_canonical: &str) -> PathBuf {
@@ -1150,6 +1163,18 @@ pub(crate) fn delete_storage(root: &str, paths: &[String]) -> Result<Vec<String>
                 Ok(child) => {
                     if let Err(err) = fs.remove(&child.path) {
                         errors.push(format!("{spec}: {err}"));
+                    } else {
+                        // Materialized copies outlive the remote session —
+                        // drop the local cache subtree with it. Same escape
+                        // guard as materialize: only plain segments join.
+                        let relative = relative_remote(root, &child);
+                        let safe = !relative.is_empty()
+                            && Path::new(&relative)
+                                .components()
+                                .all(|part| matches!(part, std::path::Component::Normal(_)));
+                        if safe {
+                            let _ = std::fs::remove_dir_all(cache_directory(root).join(&relative));
+                        }
                     }
                 }
                 Err(err) => errors.push(format!("{spec}: {err}")),
@@ -1272,5 +1297,12 @@ mod tests {
             relative.split(['/', '\\']).any(|part| part == ".."),
             "{relative}"
         );
+    }
+    #[test]
+    fn forgetting_a_library_drops_its_recorded_sessions() {
+        replace_sessions("a-test-lib", &[("sess".to_owned(), "place".to_owned())]);
+        assert!(recorded("a-test-lib", "sess").is_some());
+        drop_sessions("a-test-lib");
+        assert!(recorded("a-test-lib", "sess").is_none());
     }
 }
