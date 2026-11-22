@@ -57,15 +57,18 @@ export function DevicePicker({
   const [scanOpen, setScanOpen] = useState(false);
   const [subnet, setSubnet] = useState(() => defaultSubnet(value));
   const [scanning, setScanning] = useState(false);
-  const [hits, setHits] = useState<DiscoveredDevice[] | null>(null);
+  const [hits, setHits] = useState<{ subnet: string; devices: DiscoveredDevice[] } | null>(null);
 
   async function scan() {
     setScanning(true);
+    const scanned = subnet.trim();
     try {
       const result = await invoke<{ devices: DiscoveredDevice[] }>("scan_kit_discover_subnet", {
-        subnet: subnet.trim(),
+        subnet: scanned,
       });
-      setHits(result.devices);
+      // Remember which subnet produced these — a scan resolving after the
+      // field was edited must not list hits under the new range.
+      setHits({ subnet: scanned, devices: result.devices });
     } catch (error) {
       setHits(null);
       notifyError(error);
@@ -140,12 +143,12 @@ export function DevicePicker({
               </InputGroupButton>
             </InputGroupAddon>
           </InputGroup>
-          {hits !== null ? (
-            hits.length === 0 ? (
+          {hits !== null && hits.subnet === subnet.trim() ? (
+            hits.devices.length === 0 ? (
               <p className="px-1 text-sm text-muted-foreground">No devices found on {subnet}.</p>
             ) : (
               <ul className="flex flex-col">
-                {hits.map((hit) => {
+                {hits.devices.map((hit) => {
                   const detail = [label(hit.device_type), label(hit.version)]
                     .filter(Boolean)
                     .join(" · ");

@@ -294,6 +294,9 @@ export function PlanSynthesis() {
         param.key === "pld_path"
           ? [{ name: "IBA PLD", extensions: ["pld"] }]
           : [{ name: "RT Ion DICOM", extensions: ["dcm"] }],
+    }).catch((reason: unknown) => {
+      notifyError(reason);
+      return null;
     });
     if (typeof selected === "string") {
       setValue(param.key, selected);
@@ -305,16 +308,15 @@ export function PlanSynthesis() {
       return;
     }
     setBusy(true);
-    const selected = await save({
-      title: "Save Input Map",
-      defaultPath: joinPath(saveDir, plan.filename),
-      filters: [{ name: "Input map", extensions: ["csv"] }],
-    });
-    if (typeof selected !== "string") {
-      setBusy(false);
-      return;
-    }
     try {
+      const selected = await save({
+        title: "Save Input Map",
+        defaultPath: joinPath(saveDir, plan.filename),
+        filters: [{ name: "Input map", extensions: ["csv"] }],
+      });
+      if (typeof selected !== "string") {
+        return;
+      }
       await invoke("scan_kit_synthesize_plan", {
         template: template.id,
         params: values,

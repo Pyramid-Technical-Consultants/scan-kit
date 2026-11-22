@@ -394,7 +394,10 @@ export function ConfigTuning({
   }
 
   async function browse() {
-    const selected = await open({ directory: true, multiple: false, title: "Configuration folder" });
+    const selected = await open({ directory: true, multiple: false, title: "Configuration folder" }).catch((reason: unknown) => {
+      notifyError(reason);
+      return null;
+    });
     if (typeof selected !== "string") {
       return;
     }
@@ -488,6 +491,9 @@ export function ConfigTuning({
       multiple: false,
       title: "Save configuration folder",
       defaultPath: configDir,
+    }).catch((reason: unknown) => {
+      notifyError(reason);
+      return null;
     });
     if (typeof selected !== "string") {
       return;

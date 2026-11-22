@@ -95,7 +95,9 @@ function DoseCell({
           .catch((reason: unknown) => {
             // The next resize tries this canvas again instead of leaving it blank.
             opening = false;
-            errorRef.current(reason);
+            if (live) {
+              errorRef.current(reason);
+            }
           });
         return;
       }

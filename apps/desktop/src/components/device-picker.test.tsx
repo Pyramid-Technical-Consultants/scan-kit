@@ -97,3 +97,36 @@ it("scans and picks a discovered device", async () => {
   });
   expect(onChange).toHaveBeenCalledWith("192.168.100.184");
 });
+
+it("ignores a scan that resolves after the subnet changed", async () => {
+  let resolve: ((value: { devices: unknown[] }) => void) | null = null;
+  vi.mocked(invoke).mockImplementationOnce(
+    () =>
+      new Promise((pending) => {
+        resolve = pending;
+      }),
+  );
+  const { host } = render();
+  await act(async () => {
+    host
+      .querySelector("button[aria-expanded]")
+      ?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+  });
+  await act(async () => {
+    button(host, "Scan")?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+  });
+  // Edit the subnet while the first scan is still in flight.
+  const subnet = [...host.querySelectorAll("input")].find(
+    (el) => el.value === "192.168.100.0/24",
+  );
+  const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+  await act(async () => {
+    setter?.call(subnet, "10.0.0.0/24");
+    subnet?.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  // The old subnet's hits arrive — they must not be listed under the new range.
+  await act(async () => {
+    resolve?.({ devices: [{ host: "10.0.0.7", version: "3.2.1" }] });
+  });
+  expect(host.textContent).not.toContain("10.0.0.7");
+});
