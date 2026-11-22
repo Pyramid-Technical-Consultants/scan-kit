@@ -237,10 +237,8 @@ pub fn validate_plan(template: &str, params: &Value) -> Vec<String> {
             // is not: 100k × 76 rows is a ~GB-sized document from one call.
             errors.extend(validate_spot_budget(
                 params,
-                params
-                    .get("spots_per_layer")
-                    .and_then(Value::as_i64)
-                    .unwrap_or(0),
+                // as_int (not as_i64): the generators accept integral floats.
+                params.get("spots_per_layer").and_then(as_int).unwrap_or(0),
             ));
             errors.extend(validate_weights(params));
             errors
@@ -284,8 +282,8 @@ pub fn validate_plan(template: &str, params: &Value) -> Vec<String> {
                 errors
                     .push("Layer transition must be Reset to Corner or Continue from End.".into());
             }
-            let per_layer = params.get("spots_x").and_then(Value::as_i64).unwrap_or(0)
-                * params.get("spots_y").and_then(Value::as_i64).unwrap_or(0);
+            let per_layer = params.get("spots_x").and_then(as_int).unwrap_or(0)
+                * params.get("spots_y").and_then(as_int).unwrap_or(0);
             errors.extend(validate_spot_budget(params, per_layer));
             errors.extend(validate_weights(params));
             errors
@@ -1604,5 +1602,14 @@ Element,10,0,5,0.0
                     "spot_weight_method": "fixed", "spot_weight_mu": 0.02}),
         );
         assert!(ok.is_empty(), "{ok:?}");
+        // Integral floats take the same path the generators accept — the
+        // budget must not skip them (json! renders these as f64).
+        let floats = validate_plan(
+            "rectangular_field",
+            &json!({"selected_energies": [250.0], "spots_x": 20000.0, "spots_y": 20000.0,
+                    "field_width_mm": 100.0, "field_height_mm": 100.0,
+                    "spot_weight_method": "fixed", "spot_weight_mu": 0.02}),
+        );
+        assert!(floats.iter().any(|error| error.contains("budget")));
     }
 }

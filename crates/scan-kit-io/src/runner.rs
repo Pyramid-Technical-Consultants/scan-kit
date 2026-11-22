@@ -934,10 +934,14 @@ fn decode_chunks(mut data: &[u8]) -> Result<Vec<u8>, String> {
         if size == 0 {
             break;
         }
-        if data.len() < size + 2 {
+        // size is attacker-controlled hex — the +2 can overflow usize.
+        let Some(need) = size.checked_add(2) else {
+            return Err("truncated chunk".into());
+        };
+        if data.len() < need {
             return Err("truncated chunk".into());
         }
-        if &data[size..size + 2] != b"\r\n" {
+        if &data[size..need] != b"\r\n" {
             return Err("malformed chunk".into());
         }
         out.extend_from_slice(&data[..size]);
@@ -1363,6 +1367,8 @@ mod tests {
         // Two non-CRLF bytes after the payload must not be skipped over.
         assert!(decode_chunks(b"3\r\nabcXY0\r\n\r\n").is_err());
         assert_eq!(decode_chunks(b"3\r\nabc\r\n0\r\n\r\n").unwrap(), b"abc");
+        // usize::MAX chunk size — the +2 length check must not wrap or panic.
+        assert!(decode_chunks(b"ffffffffffffffff\r\n").is_err());
     }
 
     #[test]
