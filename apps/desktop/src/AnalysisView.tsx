@@ -208,6 +208,13 @@ function plotterFor(node: HTMLCanvasElement): Promise<Plotter> {
       return plot;
     });
     plotters.set(node, pending);
+    // A rejected create (lost GL context, init failure) must not stay cached —
+    // every later caller would get the same rejection and never recover.
+    pending.catch(() => {
+      if (plotters.get(node) === pending) {
+        plotters.delete(node);
+      }
+    });
   }
   return pending;
 }

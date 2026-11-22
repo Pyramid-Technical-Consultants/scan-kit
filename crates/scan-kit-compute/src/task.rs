@@ -147,22 +147,44 @@ pub fn start_task(
     let mut normalized = options.clone();
     scan_kit_io::normalize_options(&mut normalized);
     let options = &normalized;
-    let mut driver = lock();
     let slot = slot_of(view);
-    if matches!(slot, Slot::Plot) {
-        if let Some(id) = driver.plot {
+    // Take the stage out so the retarget's scene build runs off the driver
+    // lock — it does file IO, and every other poll/cancel waits behind it.
+    let checked_out = {
+        let mut driver = lock();
+        if matches!(slot, Slot::Plot) {
+            driver.plot.and_then(|id| {
+                driver.tasks.get_mut(&id).and_then(|task| {
+                    (!task.cancel.is_cancelled())
+                        .then(|| task.stage.take().map(|stage| (id, stage)))
+                        .flatten()
+                })
+            })
+        } else {
+            None
+        }
+    };
+    if let Some((id, mut stage)) = checked_out {
+        // retarget runs the same fallible call tree poll wraps in
+        // catch_unwind — a panic must not leave task.stage None forever.
+        let retargeted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            stage.retarget(path, sessions, options, palette, background, foreground)
+        }))
+        .unwrap_or(false);
+        if retargeted {
+            let mut driver = lock();
+            // The task may have been cancelled or replaced while the stage
+            // was checked out — only adopt when it is still parked for us.
             if let Some(task) = driver.tasks.get_mut(&id) {
-                if let Some(stage) = task.stage.as_mut() {
-                    if !task.cancel.is_cancelled()
-                        && stage.retarget(path, sessions, options, palette, background, foreground)
-                    {
-                        task.generation = task.generation.saturating_add(1);
-                        return Ok(json!({ "task": id, "generation": task.generation }));
-                    }
+                if task.stage.is_none() && !task.cancel.is_cancelled() {
+                    task.stage = Some(stage);
+                    task.generation = task.generation.saturating_add(1);
+                    return Ok(json!({ "task": id, "generation": task.generation }));
                 }
             }
         }
     }
+    let mut driver = lock();
     let replaced = driver.take(&slot);
     let mut stage = build_stage(
         view, path, sessions, options, background, foreground, palette,
@@ -996,6 +1018,9 @@ fn mc_transport(jobs: Vec<McJob>, shared: Arc<McLive>, cancel: Cancel) {
                     }
                 }
                 Poll::Ready(result) => {
+                    // A job that opens already-done never reported a total —
+                    // its sentinel 1 must not drag satisfied below target.
+                    total[k] = total[k].max(u64::from(job_histories(&jobs[k])));
                     done[k] = total[k];
                     latest[k] = Some(result.clone());
                     finished[k] = Some(result);

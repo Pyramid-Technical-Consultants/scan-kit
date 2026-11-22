@@ -884,22 +884,33 @@ fn package_zip(dir: &Path, zip_path: &Path, session_id: &str) -> Result<(), Stri
     if let Some(parent) = zip_path.parent() {
         std::fs::create_dir_all(parent).map_err(|err| err.to_string())?;
     }
-    let file = std::fs::File::create(zip_path).map_err(|err| err.to_string())?;
-    let mut zip = zip::ZipWriter::new(file);
-    let options = zip::write::SimpleFileOptions::default()
-        .compression_method(zip::CompressionMethod::Deflated);
-    let mut files = Vec::new();
-    collect_files(dir, 0, &mut files)?;
-    files.sort();
-    for path in files {
-        let rel = path.strip_prefix(dir).map_err(|err| err.to_string())?;
-        let name = format!("{session_id}/{}", rel.to_string_lossy().replace('\\', "/"));
-        zip.start_file(name, options)
-            .map_err(|err| err.to_string())?;
-        let bytes = std::fs::read(&path).map_err(|err| err.to_string())?;
-        std::io::Write::write_all(&mut zip, &bytes).map_err(|err| err.to_string())?;
+    // Write beside the destination and rename at the end — a mid-write
+    // failure must not truncate a previous good download at zip_path.
+    let part = zip_path.with_extension("part");
+    let result = (|| {
+        let file = std::fs::File::create(&part).map_err(|err| err.to_string())?;
+        let mut zip = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        let mut files = Vec::new();
+        collect_files(dir, 0, &mut files)?;
+        files.sort();
+        for path in files {
+            let rel = path.strip_prefix(dir).map_err(|err| err.to_string())?;
+            let name = format!("{session_id}/{}", rel.to_string_lossy().replace('\\', "/"));
+            zip.start_file(name, options)
+                .map_err(|err| err.to_string())?;
+            let bytes = std::fs::read(&path).map_err(|err| err.to_string())?;
+            std::io::Write::write_all(&mut zip, &bytes).map_err(|err| err.to_string())?;
+        }
+        zip.finish().map_err(|err| err.to_string())?;
+        Ok::<(), String>(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&part);
     }
-    zip.finish().map_err(|err| err.to_string())?;
+    result?;
+    std::fs::rename(&part, zip_path).map_err(|err| err.to_string())?;
     Ok(())
 }
 

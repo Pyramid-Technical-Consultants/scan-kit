@@ -598,6 +598,7 @@ pub fn invoke(name: &str, input: &Value) -> Result<Value, InvokeError> {
                 // canonical_root, not library_root: forgetting a dead path is the point.
                 let root = location::canonical_root(path)?;
                 forget_data_dir(conn, &root)?;
+                location::drop_sessions(&root);
                 publish_catalog(conn)
             })
             .map_err(InvokeError::Message)

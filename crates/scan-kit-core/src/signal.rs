@@ -192,7 +192,12 @@ pub fn beam_on_mask(gate: &[f32]) -> Vec<bool> {
         .collect()
 }
 /// Quantile bin edges. A single finite value becomes a unit-width bin around it.
+// Callers hand us bins from tool arguments — an unclamped count is an
+// unbounded allocation. 1M bins is already far past any meaningful plot.
+const MAX_BINS: usize = 1 << 20;
+
 pub fn quantile_edges(values: &[f32], n_bins: usize) -> Vec<f32> {
+    let n_bins = n_bins.min(MAX_BINS);
     let mut finite: Vec<f32> = values
         .iter()
         .copied()
@@ -298,6 +303,7 @@ pub fn box_stats(values: &[f32]) -> Option<BoxStats> {
 
 /// Histogram counts and edges covering the finite values.
 pub fn histogram(values: &[f32], bins: usize) -> (Vec<f32>, Vec<f32>) {
+    let bins = bins.min(MAX_BINS);
     let finite: Vec<f32> = values
         .iter()
         .copied()
@@ -1155,5 +1161,13 @@ mod tests {
         assert!((lo - 1.96).abs() < 1e-3, "{lo}");
         assert!((hi - 2.04).abs() < 1e-3, "{hi}");
         assert!(robust_limits(&[f32::NAN]).is_none());
+    }
+    #[test]
+    fn a_huge_bin_request_is_capped() {
+        // bins arrives from tool arguments — unclamped it is an unbounded
+        // allocation. The cap keeps the request finite.
+        let (_edges, counts) = histogram(&[1.0, 2.0, 3.0], usize::MAX);
+        assert_eq!(counts.len(), MAX_BINS);
+        assert!(quantile_edges(&[1.0, 2.0], usize::MAX).len() <= MAX_BINS + 1);
     }
 }

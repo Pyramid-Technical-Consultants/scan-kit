@@ -593,7 +593,9 @@ export default function App() {
         const save = () => {
           window.clearTimeout(timer);
           timer = window.setTimeout(() => {
-            void persistGeometry();
+            // Geometry persistence is best-effort — a rejection (teardown,
+            // absent plugin) must not land as an unhandled rejection.
+            void persistGeometry().catch(() => {});
           }, 400);
         };
         const geometry = await invoke<Geometry>("scan_kit_window_geometry");
@@ -610,10 +612,10 @@ export default function App() {
           window.clearTimeout(timer);
           try {
             await persistGeometry();
+            await win.destroy();
           } catch {
             // A failed geometry write still lets the window close.
           }
-          await win.destroy();
         });
         if (active) {
           unlisten = [resized, moved, closing];

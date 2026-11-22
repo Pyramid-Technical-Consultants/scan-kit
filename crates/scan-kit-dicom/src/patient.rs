@@ -505,8 +505,11 @@ struct Slice {
 }
 
 fn image_slices(elems: &[Elem], scale: f32) -> Result<Vec<Slice>, String> {
-    let rows = int_tag(elems, tag(0x0028, 0x0010)).unwrap_or(0) as usize;
-    let cols = int_tag(elems, tag(0x0028, 0x0011)).unwrap_or(0) as usize;
+    // int_tag can text-parse a 2-byte US payload whose bytes spell an ASCII
+    // number (e.g. value 12589 = "-1") — reject non-positive results rather
+    // than casting them to usize::MAX.
+    let rows = int_tag(elems, tag(0x0028, 0x0010)).unwrap_or(0).max(0) as usize;
+    let cols = int_tag(elems, tag(0x0028, 0x0011)).unwrap_or(0).max(0) as usize;
     let spacing = floats_tag(elems, tag(0x0028, 0x0030));
     let origin = floats_tag(elems, tag(0x0020, 0x0032));
     let slope = float_tag(elems, tag(0x0028, 0x1053)).unwrap_or(1.0);
@@ -561,6 +564,9 @@ fn image_slices(elems: &[Elem], scale: f32) -> Result<Vec<Slice>, String> {
             })
             .collect()
     };
+    if rows == 0 || cols == 0 {
+        return Err("missing pixel dimensions".into());
+    }
     let plane = rows * cols;
     if stored.len() < plane {
         return Err("pixel data is short".into());
@@ -2189,5 +2195,23 @@ mod tests {
         let huge: Vec<f32> = vec![0.0; 9000]; // ~90 KB of DS text
         assert!(ds(&mut bytes, 0x3004, 0x000C, &huge).is_err());
         assert!(ds(&mut bytes, 0x3004, 0x000C, &[1.0]).is_ok());
+    }
+    #[test]
+    fn a_text_shaped_us_dimension_is_rejected_instead_of_wrapping() {
+        // US bytes "-1" text-parse to -1, which used to wrap to usize::MAX
+        // and panic in stack() — or pass 0 into a divide-by-zero.
+        let elems = vec![
+            Elem {
+                tag: tag(0x0028, 0x0010),
+                items: Vec::new(),
+                bytes: b"-1".to_vec(),
+            },
+            Elem {
+                tag: tag(0x0028, 0x0011),
+                items: Vec::new(),
+                bytes: b"-1".to_vec(),
+            },
+        ];
+        assert!(image_slices(&elems, 1.0).is_err());
     }
 }

@@ -203,6 +203,9 @@ export function PlanRunner() {
       title: "input_map.csv",
       defaultPath: fileDir ?? undefined,
       filters: [{ name: "CSV", extensions: ["csv"] }],
+    }).catch((reason: unknown) => {
+      notifyError(reason);
+      return null;
     });
     if (typeof selected !== "string") {
       return;
@@ -243,6 +246,9 @@ export function PlanRunner() {
       title: "Session zip",
       defaultPath: dest || fallback,
       filters: [{ name: "Zip", extensions: ["zip"] }],
+    }).catch((reason: unknown) => {
+      notifyError(reason);
+      return null;
     });
     if (typeof selected !== "string") {
       return;

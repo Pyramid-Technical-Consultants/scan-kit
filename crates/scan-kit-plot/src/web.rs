@@ -85,6 +85,11 @@ impl WebPlot {
                 .copied()
                 .unwrap_or(wgpu::CompositeAlphaMode::Auto)
         };
+        // Same clamp resize() applies — a canvas wider than the adapter's
+        // texture limit (2048 on many WebGL2 stacks) fails configure outright.
+        let limit = device.limits().max_texture_dimension_2d.min(MAX_SIDE);
+        let width = width.min(limit);
+        let height = height.min(limit);
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format,

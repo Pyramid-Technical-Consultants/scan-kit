@@ -27,7 +27,9 @@ export function DebugLog() {
           variant="outline"
           size="sm"
           onClick={() => {
-            void navigator.clipboard.writeText(lines.join("\n"));
+            // The clipboard rejects without focus/permission — don't let that
+            // land in the log being copied.
+            void navigator.clipboard.writeText(lines.join("\n")).catch(() => {});
           }}
         >
           <Copy />

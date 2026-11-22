@@ -106,6 +106,9 @@ export function PhantomSynthesis() {
       directory: true,
       title: "Folder for the synthetic study",
       defaultPath: parentDir(catalog?.save_dir ?? null),
+    }).catch((reason: unknown) => {
+      notifyError(reason);
+      return null;
     });
     if (typeof selectedDir !== "string") {
       return;

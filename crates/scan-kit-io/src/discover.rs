@@ -745,6 +745,7 @@ fn read_zip(path: &Path, want: &dyn Fn(&str) -> bool) -> Result<Vec<(String, Vec
     let file = File::open(path).map_err(|err| err.to_string())?;
     let mut archive = zip::ZipArchive::new(file).map_err(|err| err.to_string())?;
     let mut out = Vec::new();
+    let mut total = 0u64;
     for index in 0..archive.len() {
         let mut entry = archive.by_index(index).map_err(|err| err.to_string())?;
         if entry.is_dir() {
@@ -754,10 +755,12 @@ fn read_zip(path: &Path, want: &dyn Fn(&str) -> bool) -> Result<Vec<(String, Vec
         if !want(&name) {
             continue;
         }
-        out.push((
-            name.clone(),
-            read_capped(&mut entry, &name, MAX_MEMBER_BYTES)?,
-        ));
+        let bytes = read_capped(&mut entry, &name, MAX_MEMBER_BYTES)?;
+        total = total.saturating_add(bytes.len() as u64);
+        if total > MAX_MEMBER_BYTES {
+            return Err("archive members exceed the aggregate cap".into());
+        }
+        out.push((name.clone(), bytes));
     }
     Ok(out)
 }
@@ -776,6 +779,7 @@ fn read_tar(path: &Path, want: &dyn Fn(&str) -> bool) -> Result<Vec<(String, Vec
     };
     let mut archive = tar::Archive::new(decoder);
     let mut out = Vec::new();
+    let mut total = 0u64;
     let entries = archive.entries().map_err(|err| err.to_string())?;
     for entry in entries {
         let mut entry = entry.map_err(|err| err.to_string())?;
@@ -787,10 +791,12 @@ fn read_tar(path: &Path, want: &dyn Fn(&str) -> bool) -> Result<Vec<(String, Vec
         if !want(&name) {
             continue;
         }
-        out.push((
-            name.clone(),
-            read_capped(&mut entry, &name, MAX_MEMBER_BYTES)?,
-        ));
+        let bytes = read_capped(&mut entry, &name, MAX_MEMBER_BYTES)?;
+        total = total.saturating_add(bytes.len() as u64);
+        if total > MAX_MEMBER_BYTES {
+            return Err("archive members exceed the aggregate cap".into());
+        }
+        out.push((name.clone(), bytes));
     }
     Ok(out)
 }
