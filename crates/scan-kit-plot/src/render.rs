@@ -8990,7 +8990,12 @@ fn read_buffer(
             timeout: Some(std::time::Duration::from_millis(50)),
         }) {
             Ok(_) | Err(wgpu::PollError::Timeout) => {}
-            Err(err) => return Err(GpuError::Message(err.to_string())),
+            Err(err) => {
+                // readback may be a persistent stage buffer — unmap aborts the
+                // pending map so a later frame can reuse it.
+                readback.unmap();
+                return Err(GpuError::Message(err.to_string()));
+            }
         }
         match receiver.try_recv() {
             Ok(result) => {
@@ -8998,9 +9003,13 @@ fn read_buffer(
                 break;
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {}
-            Err(err) => return Err(GpuError::Message(err.to_string())),
+            Err(err) => {
+                readback.unmap();
+                return Err(GpuError::Message(err.to_string()));
+            }
         }
         if started.elapsed() > std::time::Duration::from_secs(30) {
+            readback.unmap();
             return Err(GpuError::Message("GPU readback timed out".into()));
         }
     }

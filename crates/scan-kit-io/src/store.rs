@@ -880,8 +880,13 @@ fn import_legacy(conn: &Connection, lib_id: i64, base: &Path) -> Result<(), Stri
             })
             .unwrap_or_default();
         let encoded = serde_json::to_string(&selected).map_err(|err| err.to_string())?;
+        // Don't clobber a live selection when the legacy file was absent.
         conn.execute(
-            "UPDATE libraries SET selected_sessions = ?1, notes_imported = 1 WHERE id = ?2",
+            "UPDATE libraries SET
+                selected_sessions = CASE WHEN selected_sessions IS NULL OR selected_sessions = '[]'
+                    THEN ?1 ELSE selected_sessions END,
+                notes_imported = 1
+             WHERE id = ?2",
             params![encoded, lib_id],
         )
         .map_err(|err| err.to_string())?;
@@ -1043,7 +1048,8 @@ fn prefs_patch(conn: &Connection, key: &str, patch: &Value) -> Result<(), String
     let raw = serde_json::to_string(patch).map_err(|err| err.to_string())?;
     conn.execute(
         "INSERT INTO prefs(key, value) VALUES (?1, ?2)
-         ON CONFLICT(key) DO UPDATE SET value = json_patch(value, ?2)",
+         ON CONFLICT(key) DO UPDATE SET value =
+            json_patch(CASE WHEN json_valid(value) THEN value ELSE '{}' END, ?2)",
         params![key, raw],
     )
     .map_err(|err| err.to_string())?;

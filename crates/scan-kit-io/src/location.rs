@@ -1091,8 +1091,11 @@ fn query_of(remote: &Remote) -> String {
     if let Some(query) = map.get(&remote.canonical) {
         return query.clone();
     }
+    // Longest ancestor wins — HashMap order is arbitrary, and a nested
+    // stored root must not lose to a shallower one.
     map.iter()
-        .find(|(key, _)| remote.canonical.starts_with(&format!("{key}/")))
+        .filter(|(key, _)| remote.canonical.starts_with(&format!("{key}/")))
+        .max_by_key(|(key, _)| key.len())
         .map(|(_, query)| query.clone())
         .unwrap_or_default()
 }

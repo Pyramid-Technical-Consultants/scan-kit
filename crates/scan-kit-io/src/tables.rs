@@ -5517,7 +5517,11 @@ pub(crate) fn parse_datetime(text: &str) -> Option<f64> {
     let (date, time) = text.split_once(['T', ' ']).unwrap_or((text, "00:00:00"));
     // A tz suffix ("Z", "+02:00", "-05:00") reads as naive local — without
     // the strip it corrupts the seconds field to 0.
-    let time = time.split(['Z', 'z', '+', '-']).next().unwrap_or(time);
+    let time = time
+        .split(['Z', 'z', '+', '-'])
+        .next()
+        .unwrap_or(time)
+        .trim();
     let mut date_parts = date.split('-');
     let year: i32 = date_parts.next()?.parse().ok()?;
     let month: u32 = date_parts.next()?.parse().ok()?;
