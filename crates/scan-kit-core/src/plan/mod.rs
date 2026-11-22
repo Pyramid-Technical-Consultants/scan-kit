@@ -233,6 +233,13 @@ pub fn validate_plan(template: &str, params: &Value) -> Vec<String> {
                 "Spots per Layer (spots)",
                 100_000,
             ));
+            // spots_per_layer and energies are each bounded — their product
+            // is not: 100k × 76 rows is a ~GB-sized document from one call.
+            errors.extend(validate_spot_budget(
+                params,
+                // as_int (not as_i64): the generators accept integral floats.
+                params.get("spots_per_layer").and_then(as_int).unwrap_or(0),
+            ));
             errors.extend(validate_weights(params));
             errors
         }
@@ -275,6 +282,9 @@ pub fn validate_plan(template: &str, params: &Value) -> Vec<String> {
                 errors
                     .push("Layer transition must be Reset to Corner or Continue from End.".into());
             }
+            let per_layer = params.get("spots_x").and_then(as_int).unwrap_or(0)
+                * params.get("spots_y").and_then(as_int).unwrap_or(0);
+            errors.extend(validate_spot_budget(params, per_layer));
             errors.extend(validate_weights(params));
             errors
         }
@@ -656,6 +666,20 @@ fn validate_positive_float(value: Option<&Value>, label: &str) -> Vec<String> {
         return vec![format!("{label} must be greater than zero.")];
     }
     Vec::new()
+}
+
+/// Per-layer spots times energy layers — each input is bounded on its own,
+/// but their product is the document's row count.
+fn validate_spot_budget(params: &Value, per_layer: i64) -> Vec<String> {
+    const MAX_SPOTS: i64 = 1_000_000;
+    let layers = selected_energies(params).len() as i64;
+    if per_layer > 0 && layers > 0 && per_layer.saturating_mul(layers) > MAX_SPOTS {
+        vec![format!(
+            "{per_layer} spots over {layers} energy layers exceeds the {MAX_SPOTS} spot budget."
+        )]
+    } else {
+        Vec::new()
+    }
 }
 
 fn validate_positive_int(value: Option<&Value>, label: &str, max: i64) -> Vec<String> {
@@ -1551,5 +1575,41 @@ Element,10,0,5,0.0
             .unwrap()
             .iter()
             .any(|spec| spec["key"] == "spot_weight_method"));
+    }
+
+    #[test]
+    fn a_spot_times_layer_product_over_budget_is_rejected() {
+        // 100k spots is a legal per-layer value and 76 energies is legal —
+        // their product is a ~GB-sized document.
+        let all: Vec<f64> = STANDARD_ENERGIES_MEV.to_vec();
+        let errors = validate_plan(
+            "zero_field",
+            &json!({"selected_energies": all, "spots_per_layer": 100000,
+                    "spot_weight_method": "fixed", "spot_weight_mu": 0.02}),
+        );
+        assert!(errors.iter().any(|error| error.contains("budget")));
+        let grid = validate_plan(
+            "rectangular_field",
+            &json!({"selected_energies": all, "spots_x": 1000, "spots_y": 1000,
+                    "field_width_mm": 100.0, "field_height_mm": 100.0,
+                    "spot_weight_method": "fixed", "spot_weight_mu": 0.02}),
+        );
+        assert!(grid.iter().any(|error| error.contains("budget")));
+        // A sane product still validates.
+        let ok = validate_plan(
+            "zero_field",
+            &json!({"selected_energies": [250.0], "spots_per_layer": 100,
+                    "spot_weight_method": "fixed", "spot_weight_mu": 0.02}),
+        );
+        assert!(ok.is_empty(), "{ok:?}");
+        // Integral floats take the same path the generators accept — the
+        // budget must not skip them (json! renders these as f64).
+        let floats = validate_plan(
+            "rectangular_field",
+            &json!({"selected_energies": [250.0], "spots_x": 20000.0, "spots_y": 20000.0,
+                    "field_width_mm": 100.0, "field_height_mm": 100.0,
+                    "spot_weight_method": "fixed", "spot_weight_mu": 0.02}),
+        );
+        assert!(floats.iter().any(|error| error.contains("budget")));
     }
 }

@@ -102,9 +102,9 @@ impl Npy {
                 if unit == 0 {
                     break;
                 }
-                if let Some(ch) = char::from_u32(unit) {
-                    chars.push(ch);
-                }
+                // An invalid code unit (surrogate, >0x10FFFF) means a corrupt
+                // payload — mark it rather than silently shortening the name.
+                chars.push(char::from_u32(unit).unwrap_or(char::REPLACEMENT_CHARACTER));
             }
             out.push(chars.into_iter().collect());
         }
@@ -140,6 +140,11 @@ pub fn read_npz(bytes: &[u8]) -> Result<BTreeMap<String, Npy>, String> {
     for index in 0..archive.len() {
         let mut file = archive.by_index(index).map_err(|err| err.to_string())?;
         let name = file.name().map_err(|err| err.to_string())?;
+        // Metadata-fork members (__MACOSX/x.npy) flatten to the same basename
+        // as the real array — skip them before they collide or win.
+        if name.split(['/', '\\']).any(|part| part == "__MACOSX") {
+            continue;
+        }
         let base = name.rsplit(['/', '\\']).next().unwrap_or("");
         // np.load only exposes .npy members — a stray note.txt or __MACOSX
         // entry must not fail the whole archive.
@@ -286,8 +291,14 @@ fn parse_npy(bytes: &[u8]) -> Result<Npy, String> {
             .ok_or("npy header")?,
     )
     .map_err(|err| err.to_string())?;
-    if header.contains("fortran_order': True") {
-        return Err("fortran npy".into());
+    // Anchor on the key, not one exact serialization — a non-NumPy writer
+    // may emit `"fortran_order": True` or `'fortran_order' : True`, and a
+    // Fortran-order array read as C-order is a silent transposition.
+    if let Some((_, rest)) = header.split_once("fortran_order") {
+        let value = rest.trim_start_matches(['\'', '"', ' ', ':']);
+        if value.starts_with("True") || value.starts_with("true") {
+            return Err("fortran npy".into());
+        }
     }
     let descr = quoted(header, "descr")?;
     let shape = shape_of(&quoted_or_tuple(header, "shape")?)?;
@@ -524,5 +535,28 @@ mod tests {
         let files = read_npz(&buf).unwrap();
         assert_eq!(files["ok"].f64s().unwrap(), vec![1.0]);
         assert!(!files.contains_key("note.txt"));
+    }
+
+    #[test]
+    fn a_nonstandard_fortran_header_still_errors() {
+        let make = |header: &str| {
+            let mut bytes = b"\x93NUMPY\x01\x00".to_vec();
+            bytes.extend_from_slice(&(header.len() as u16).to_le_bytes());
+            bytes.extend_from_slice(header.as_bytes());
+            bytes.extend_from_slice(&[0u8; 16]);
+            bytes
+        };
+        assert!(parse_npy(&make(
+            "{'descr': '<f8', 'fortran_order':True, 'shape': (2, 2), }"
+        ))
+        .is_err());
+        assert!(parse_npy(&make(
+            "{\"descr\": \"<f8\", \"fortran_order\": true, \"shape\": (2, 2), }"
+        ))
+        .is_err());
+        assert!(parse_npy(&make(
+            "{'descr': '<f8', 'fortran_order': False, 'shape': (2, 2), }"
+        ))
+        .is_ok());
     }
 }

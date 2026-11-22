@@ -149,6 +149,17 @@ fn devices(
         })
         .unwrap_or_default();
     names.sort_unstable();
+    // The device list is remote-supplied and each client costs ~13 HTTP
+    // requests — cap it so a malfunctioning RCI can't turn a download into
+    // hours of sequential fetches. A real controller has a handful.
+    const MAX_DEVICES: usize = 64;
+    if names.len() > MAX_DEVICES {
+        warnings.push(format!(
+            "map_manager listed {} device clients — capturing the first {MAX_DEVICES}",
+            names.len()
+        ));
+        names.truncate(MAX_DEVICES);
+    }
     for client in names {
         let base = format!("rci/map_manager/{client}");
         let field = |leaf: &str| {

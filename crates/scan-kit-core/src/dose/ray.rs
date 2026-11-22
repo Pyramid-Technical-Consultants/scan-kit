@@ -425,9 +425,11 @@ fn dilate_bricks(raw: &[f32], shape: [usize; 3]) -> Vec<f32> {
                 for dz in -1..=1 {
                     for dy in -1..=1 {
                         for dx in -1..=1 {
-                            let xx = x as i32 + dx;
-                            let yy = y as i32 + dy;
-                            let zz = z as i32 + dz;
+                            // `as i32` saturates on absurd coords — the add
+                            // must not overflow in a debug build.
+                            let xx = (x as i32).saturating_add(dx);
+                            let yy = (y as i32).saturating_add(dy);
+                            let zz = (z as i32).saturating_add(dz);
                             if xx < 0
                                 || yy < 0
                                 || zz < 0
@@ -1167,9 +1169,9 @@ fn linear(volume: &Volume, x: f32, y: f32, z: f32) -> f32 {
                     * (if dz == 0 { 1.0 - tz } else { tz });
                 acc += w * at(
                     volume,
-                    (x0 as i32 + dx) as usize,
-                    (y0 as i32 + dy) as usize,
-                    (z0 as i32 + dz) as usize,
+                    (x0 as i32).saturating_add(dx) as usize,
+                    (y0 as i32).saturating_add(dy) as usize,
+                    (z0 as i32).saturating_add(dz) as usize,
                 );
             }
         }
@@ -1190,9 +1192,9 @@ fn cubic(volume: &Volume, x: f32, y: f32, z: f32) -> f32 {
                     * catmull(z - (z0 + dz) as f32);
                 acc += w * at(
                     volume,
-                    (x0 + dx) as usize,
-                    (y0 + dy) as usize,
-                    (z0 + dz) as usize,
+                    x0.saturating_add(dx) as usize,
+                    y0.saturating_add(dy) as usize,
+                    z0.saturating_add(dz) as usize,
                 );
             }
         }

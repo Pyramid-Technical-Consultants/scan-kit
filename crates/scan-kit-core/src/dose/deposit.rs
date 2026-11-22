@@ -142,6 +142,12 @@ pub(super) fn dose_grid(
         lo[2] = lo[2].min(spot.z0);
         hi[2] = hi[2].max(spot.z1);
     }
+    // Every spot skipped as non-finite leaves lo/hi at the sentinels —
+    // floor(MAX) / ceil(MIN) would emit an inf origin instead of an
+    // empty grid like the no-spots case above.
+    if lo[0] == f32::MAX {
+        return ([0.0, 0.0, 0.0], [1, 1, 1]);
+    }
     let mut lo_i = [
         (lo[0] / v).floor(),
         (lo[1] / v).floor(),
@@ -1914,5 +1920,29 @@ mod tests {
             10.0,
         );
         assert!(volume.values.iter().all(|v| *v >= 0.0));
+    }
+
+    #[test]
+    fn an_all_nonfinite_spot_list_returns_an_empty_grid_not_inf() {
+        let volume = analytic_volume(
+            WATER,
+            &[Pencil {
+                x: f32::NAN,
+                y: 0.0,
+                sx: 3.0,
+                sy: 3.0,
+                energy: 100.0,
+                amount: 1.0,
+            }],
+            Quantity::Dose,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+            1.0,
+            0.0,
+        );
+        assert!(volume.origin.iter().all(|value| value.is_finite()));
+        assert_eq!(volume.shape, [1, 1, 1]);
     }
 }

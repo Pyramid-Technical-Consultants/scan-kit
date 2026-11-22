@@ -115,20 +115,25 @@ impl ScanKit {
     /// Walks every string in the input; a JSON-in-JSON value such as
     /// options.scanners (a string carrying an array) is walked too.
     fn remote_in(value: &Value) -> bool {
+        Self::remote_in_at(value, true)
+    }
+
+    fn remote_in_at(value: &Value, top: bool) -> bool {
         match value {
             Value::String(spec) => {
                 Self::remote_spec(spec)
                     || serde_json::from_str::<Value>(spec)
                         .ok()
-                        .is_some_and(|parsed| Self::remote_in(&parsed))
+                        .is_some_and(|parsed| Self::remote_in_at(&parsed, false))
             }
-            Value::Array(items) => items.iter().any(Self::remote_in),
+            Value::Array(items) => items.iter().any(|item| Self::remote_in_at(item, false)),
             // `note` is the one free-text field in the tool surface — a note
-            // that *is* a URL must not trip the path gate. Path-carrying
-            // keys still check out via their string values.
+            // that *is* a URL must not trip the path gate. The exemption is
+            // top-level only: a nested `note` key carrying a location would
+            // otherwise walk straight past the gate.
             Value::Object(map) => map
                 .iter()
-                .any(|(key, value)| key != "note" && Self::remote_in(value)),
+                .any(|(key, value)| !(top && key == "note") && Self::remote_in_at(value, false)),
             _ => false,
         }
     }
@@ -551,5 +556,20 @@ mod tests {
         assert!(names.iter().any(|name| name == "scan_kit_runner_control"));
         assert!(!refused);
         assert!(!save_refused);
+    }
+
+    #[test]
+    fn a_nested_note_key_does_not_skip_the_gate() {
+        let kit = ScanKit { effects: false };
+        // Top-level `note` is the free-text exemption.
+        let top = serde_json::json!({ "note": "\\\\filer\\share\\x" });
+        assert_eq!(kit.blocked("scan_kit_run_view", &top), None);
+        // A `note` key at any deeper level is just a string — and must not
+        // smuggle a remote spec past the gate.
+        let nested = serde_json::json!({ "options": { "note": "\\\\filer\\share\\x" } });
+        assert_eq!(
+            kit.blocked("scan_kit_run_view", &nested),
+            Some("scan_kit_run_view")
+        );
     }
 }

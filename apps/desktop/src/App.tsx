@@ -427,11 +427,13 @@ export default function App() {
     async (path: string) => {
       // Newest action wins — a running indexMany stops at the next root
       // instead of reclaiming the token and cancelling this load.
-      catalogEpoch.current += 1;
+      const epoch = ++catalogEpoch.current;
       beginCatalogLoad();
       try {
         const result = await indexLocation(path);
-        if (result !== "ok") {
+        // A superseding open/indexMany must not let this stale pull
+        // overwrite the newer catalog.
+        if (result !== "ok" || catalogEpoch.current !== epoch) {
           return;
         }
         try {
@@ -470,13 +472,15 @@ export default function App() {
           }
         }
         pendingLocations.current = stopped >= 0 ? roots.slice(stopped + 1) : [];
-        try {
-          await pullCatalog();
-          dismissNotice();
-          setUndo([]);
-          setRedo([]);
-        } catch (error: unknown) {
-          notifyError(error);
+        if (catalogEpoch.current === epoch) {
+          try {
+            await pullCatalog();
+            dismissNotice();
+            setUndo([]);
+            setRedo([]);
+          } catch (error: unknown) {
+            notifyError(error);
+          }
         }
       } finally {
         endCatalogLoad();

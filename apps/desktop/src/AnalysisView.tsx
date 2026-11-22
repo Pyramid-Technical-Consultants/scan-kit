@@ -380,7 +380,15 @@ export function AnalysisView({
     scrubControl?.value,
     settled,
     (text) => {
-      setOptions((current) => (current.scrub === text ? current : { ...current, scrub: text }));
+      setOptions((current) => {
+        if (current.scrub === text) {
+          // Same text means no task runs to bump settled — release
+          // useScrub's pending here or every later commit is dropped.
+          setSettled((count) => count + 1);
+          return current;
+        }
+        return { ...current, scrub: text };
+      });
     },
     viewId === "timeline" || viewId === "distribution",
     (next) => {
@@ -575,6 +583,9 @@ export function AnalysisView({
         setLineEpoch((epoch) => epoch + 1);
         return { painted: "", stop: true };
       }
+      // Drop the bad bytes — each DoseCell's onReady retries this paint, and
+      // keeping the payload would re-throw (and re-toast) per cell.
+      payload.current = null;
       notifyError(messageOf(reason), "analysis");
       return { painted: "", stop: true };
     }
@@ -887,6 +898,11 @@ export function AnalysisView({
           await new Promise((resolve) => window.setTimeout(resolve, parsed.payload == null ? 40 : 0));
         }
       })().catch((reason: unknown) => {
+        // Unmounted/superseded — the cleanup already cancelled; a late
+        // rejection is not an error worth toasting.
+        if (stop) {
+          return;
+        }
         // A poll rejection leaves the task registered — cancel the task this
         // chain was polling, but only while it still owns the slot: the plot
         // slot reuses task ids on retarget, so a superseded ticket's cancel

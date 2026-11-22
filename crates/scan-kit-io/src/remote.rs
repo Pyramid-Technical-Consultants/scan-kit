@@ -409,10 +409,14 @@ mod net {
                     fs::create_dir_all(parent).map_err(|err| err.to_string())?;
                 }
                 let tmp = file.with_extension("tmp");
-                known_hosts
-                    .write_file(&tmp, ssh2::KnownHostFileKind::OpenSSH)
-                    .map_err(|err| format!("{}: {err}", tmp.display()))?;
-                fs::rename(&tmp, &file).map_err(|err| format!("{}: {err}", file.display()))?;
+                if let Err(err) = known_hosts.write_file(&tmp, ssh2::KnownHostFileKind::OpenSSH) {
+                    let _ = fs::remove_file(&tmp);
+                    return Err(format!("{}: {err}", tmp.display()));
+                }
+                if let Err(err) = fs::rename(&tmp, &file) {
+                    let _ = fs::remove_file(&tmp);
+                    return Err(format!("{}: {err}", file.display()));
+                }
                 Ok(())
             }
             ssh2::CheckResult::Mismatch => Err(format!(

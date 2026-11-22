@@ -116,6 +116,10 @@ pub fn set_window_geometry(
     x: i32,
     y: i32,
 ) -> Result<(), String> {
+    // Untrusted invoke args — don't persist dimensions a platform can't show.
+    if !(1..=32768).contains(&width) || !(1..=32768).contains(&height) {
+        return Err(format!("invalid window size {width}x{height}"));
+    }
     prefs_patch(
         conn,
         PREF_APP_SETTINGS,
@@ -1265,5 +1269,13 @@ mod tests {
         assert!(prefs_get(&conn, PREF_APP_SETTINGS).unwrap().is_none());
         let _ = std::fs::remove_file(path.parent().unwrap().join("app_settings.json"));
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_nonpositive_window_size_is_rejected() {
+        let conn = open_connection(&temp_db("geometry")).unwrap();
+        assert!(set_window_geometry(&conn, 0, 600, 0, 0).is_err());
+        assert!(set_window_geometry(&conn, 800, -1, 0, 0).is_err());
+        assert!(set_window_geometry(&conn, 800, 600, 0, 0).is_ok());
     }
 }

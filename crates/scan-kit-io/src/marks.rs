@@ -70,8 +70,17 @@ pub fn normalize_options(options: &mut Value) {
 
 pub(crate) fn flag(options: &Value, key: &str, default_on: bool) -> bool {
     match text(options, key, if default_on { "On" } else { "Off" }) {
-        "off" | "Off" | "false" | "0" => false,
-        "on" | "On" | "true" | "1" => true,
+        // MCP callers hand us "False"/"TRUE" — match case-insensitively
+        // rather than silently falling back to the default.
+        raw if raw.eq_ignore_ascii_case("off")
+            || raw.eq_ignore_ascii_case("false")
+            || raw == "0" =>
+        {
+            false
+        }
+        raw if raw.eq_ignore_ascii_case("on") || raw.eq_ignore_ascii_case("true") || raw == "1" => {
+            true
+        }
         _ => default_on,
     }
 }
@@ -135,5 +144,15 @@ rci_in_trigger,r_ic1_x_confidence,r_ic1_x_peak_amplitude,c_x,r_xV,r_tx2_probe_x
         close(&field["field_x"][..3], &[30.0, -10.0, 5.0]);
         assert!(field["field_x"][3].is_nan());
         assert!(!field.contains_key("field_y"));
+    }
+
+    #[test]
+    fn flag_reads_title_and_upper_case_booleans() {
+        use serde_json::json;
+        let options = json!({"a": "False", "b": "TRUE", "c": "OFF", "d": "On"});
+        assert!(!super::flag(&options, "a", true));
+        assert!(super::flag(&options, "b", false));
+        assert!(!super::flag(&options, "c", true));
+        assert!(super::flag(&options, "d", false));
     }
 }

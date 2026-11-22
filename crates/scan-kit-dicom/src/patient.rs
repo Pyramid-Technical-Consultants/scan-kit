@@ -644,6 +644,12 @@ fn image_slices(elems: &[Elem], scale: f32) -> Result<Vec<Slice>, String> {
         return Err("pixel data is short".into());
     }
     let frames = stored.len() / plane;
+    // Each frame materializes a Slice + heap Vec — bound the count before
+    // the loop so a 1x1-plane crafted file can't amplify ~50x into OOM.
+    const MAX_SLICES: usize = 100_000;
+    if frames > MAX_SLICES {
+        return Err(format!("pixel data claims {frames} frames"));
+    }
     let declared = int_tag(elems, tag(0x0028, 0x0008))
         .map(|count| count.max(0) as usize)
         .unwrap_or(frames);
@@ -811,7 +817,12 @@ fn read_plan(elems: &[Elem], frame: String) -> Result<Plan, String> {
             .map(|(_, mu)| *mu)
             .unwrap_or(0.0);
         let final_weight = float_tag(beam, tag(0x300A, 0x010E)).unwrap_or(0.0);
-        if meterset <= 0.0 || final_weight <= 0.0 {
+        // is_finite rejects a NaN meterset, which <= 0.0 would let through.
+        if !meterset.is_finite()
+            || meterset <= 0.0
+            || !final_weight.is_finite()
+            || final_weight <= 0.0
+        {
             return Err(format!("beam {number} has no meterset"));
         }
         let setup = int_tag(beam, tag(0x300C, 0x006A)).unwrap_or(1);
@@ -841,11 +852,19 @@ fn read_plan(elems: &[Elem], frame: String) -> Result<Plan, String> {
         let mut in_shifters: Vec<(i32, f32, f32)> = Vec::new();
         let mut spots = Vec::new();
         for cp in seq(beam, tag(0x300A, 0x03A8)) {
-            energy = float_tag(cp, tag(0x300A, 0x0114)).unwrap_or(energy);
-            gantry = float_tag(cp, tag(0x300A, 0x011E)).unwrap_or(gantry);
-            couch = float_tag(cp, tag(0x300A, 0x0122)).unwrap_or(couch);
+            // DS fields can carry "nan" — a non-finite value must not
+            // replace the last good reading.
+            energy = float_tag(cp, tag(0x300A, 0x0114))
+                .filter(|value| value.is_finite())
+                .unwrap_or(energy);
+            gantry = float_tag(cp, tag(0x300A, 0x011E))
+                .filter(|value| value.is_finite())
+                .unwrap_or(gantry);
+            couch = float_tag(cp, tag(0x300A, 0x0122))
+                .filter(|value| value.is_finite())
+                .unwrap_or(couch);
             let iso_raw = floats_tag(cp, tag(0x300A, 0x012C));
-            if iso_raw.len() >= 3 {
+            if iso_raw.len() >= 3 && iso_raw[..3].iter().all(|value| value.is_finite()) {
                 iso = [iso_raw[0], iso_raw[1], iso_raw[2]];
             }
             for setting in seq(cp, tag(0x300A, 0x0360)) {
@@ -1390,7 +1409,10 @@ fn push_elem(
     let long = matches!(vr, b"OW" | b"OB" | b"SQ" | b"OD");
     if long {
         bytes.extend_from_slice(&[0, 0]);
-        bytes.extend_from_slice(&(value.len() as u32).to_le_bytes());
+        // Exactly 2^32 bytes wraps the VL to 0 — a silent empty element.
+        let len = u32::try_from(value.len())
+            .map_err(|_| format!("{group:04X},{slot:04X} value over 4 GiB"))?;
+        bytes.extend_from_slice(&len.to_le_bytes());
     } else {
         let len = u16::try_from(value.len())
             .map_err(|_| format!("{group:04X},{slot:04X} value over 64 KiB"))?;
@@ -1597,6 +1619,12 @@ pub fn write_rtdose(
     comment: &str,
 ) -> Result<PathBuf, String> {
     let [nx, ny, nz] = ct.shape;
+    // Rows/Columns are US fields — a wider frame would write wrapped dims.
+    if nx > u16::MAX as usize || ny > u16::MAX as usize {
+        return Err(format!(
+            "the dose grid {nx}x{ny} does not fit 16-bit rows/columns"
+        ));
+    }
     if dose.len() != nx * ny * nz {
         return Err(format!(
             "dose is {} voxels, the grid wants {}",
