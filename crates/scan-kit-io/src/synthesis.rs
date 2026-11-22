@@ -1,6 +1,7 @@
 //! Plan Synthesis: catalog, generation, and the CSV the user saves.
 
 use std::fs;
+use std::io::Read;
 use std::path::Path;
 
 use scan_kit_core::{
@@ -94,8 +95,16 @@ pub fn synthesize(input: &Value, db: &Path) -> Result<Value, String> {
             build_plan(template, &params, PlanSource::Ion(&spots), label.as_deref())?
         }
         "iba_pld_plan" => {
-            let raw = fs::read_to_string(text(&params, "pld_path"))
+            // A PLD is a text spot table — nothing legitimately near 64 MiB.
+            let mut file = fs::File::open(text(&params, "pld_path"))
                 .map_err(|err| format!("Could not read PLD plan file: {err}"))?;
+            let mut raw = String::new();
+            std::io::Read::take(&mut file, 64 * 1024 * 1024 + 1)
+                .read_to_string(&mut raw)
+                .map_err(|err| format!("Could not read PLD plan file: {err}"))?;
+            if raw.len() > 64 * 1024 * 1024 {
+                return Err("PLD plan file exceeds 64 MiB".into());
+            }
             let text = raw.trim_start_matches('\u{feff}');
             build_plan(template, &params, PlanSource::Pld(text), None)?
         }

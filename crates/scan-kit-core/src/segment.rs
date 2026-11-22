@@ -99,6 +99,15 @@ pub fn segments_from(options: &Value, defaults: &[Segment]) -> Vec<Segment> {
 }
 
 fn listed_segments(options: &Value, defaults: &[Segment]) -> Vec<Segment> {
+    if let Some(values) = options.get("segments").and_then(Value::as_array) {
+        let items: Vec<Segment> = values
+            .iter()
+            .filter_map(|item| serde_json::from_value(item.clone()).ok())
+            .collect();
+        if !items.is_empty() {
+            return without_playhead(items);
+        }
+    }
     if let Some(text) = options.get("segments").and_then(Value::as_str) {
         if let Ok(items) = parse_segments(text) {
             return without_playhead(items);
@@ -173,8 +182,13 @@ fn scrub_range(options: &Value) -> Option<Segment> {
 }
 
 fn scrub_value(options: &Value) -> Option<Value> {
-    let raw = options.get("scrub")?.as_str()?;
-    serde_json::from_str(raw).ok()
+    let raw = options.get("scrub")?;
+    match raw.as_str() {
+        Some(text) => serde_json::from_str(text).ok(),
+        // MCP callers pass the object itself — the frontend wraps it in a
+        // string. Accept both, like `options.scanners` already does.
+        None => Some(raw.clone()),
+    }
 }
 
 fn finite_f32(value: Option<&Value>) -> Option<f32> {
@@ -871,5 +885,20 @@ mod tests {
     fn a_negative_playhead_clamps_to_zero() {
         let options = serde_json::json!({ "scrub": "{ \"on\": true, \"at\": -5.0 }" });
         assert_eq!(scrub_limits(&options), Some((-1.0, 0.0)));
+    }
+    #[test]
+    fn a_real_json_segments_array_is_accepted() {
+        let options = serde_json::json!({
+            "segments": [{"kind": "beam", "state": "on"}],
+        });
+        let items = listed_segments(&options, &[]);
+        assert!(matches!(items.as_slice(), [Segment::Beam { .. }]));
+    }
+
+    #[test]
+    fn a_real_json_scrub_object_is_accepted() {
+        let options = serde_json::json!({"scrub": {"on": true, "at": 1.5, "end": 2.0}});
+        let value = scrub_value(&options).expect("object scrub");
+        assert_eq!(value["on"], serde_json::json!(true));
     }
 }

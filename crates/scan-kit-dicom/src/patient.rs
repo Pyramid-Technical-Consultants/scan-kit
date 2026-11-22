@@ -1,6 +1,7 @@
 //! CT, RTSTRUCT, RT Ion Plan, and RTDOSE. One frame of reference, or the load fails.
 
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 const DENSITY: &str =
@@ -269,7 +270,16 @@ pub fn load_study(path: &Path) -> Result<PatientStudy, String> {
 
 /// Spots from one RT Ion file. Charge is the raw meterset weight, not the scaled MU.
 pub fn read_ion_plan(path: &Path) -> Result<IonPlan, String> {
-    let bytes = fs::read(path).map_err(|err| format!("Could not read DICOM plan file: {err}"))?;
+    // An RT plan is a few MB — bound the read before the Elem tree doubles it.
+    let mut file =
+        fs::File::open(path).map_err(|err| format!("Could not read DICOM plan file: {err}"))?;
+    let mut bytes = Vec::new();
+    std::io::Read::take(&mut file, 256 * 1024 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|err| format!("Could not read DICOM plan file: {err}"))?;
+    if bytes.len() > 256 * 1024 * 1024 {
+        return Err("DICOM plan file exceeds 256 MiB".into());
+    }
     if bytes.len() < 132 || &bytes[128..132] != b"DICM" {
         return Err(format!(
             "Could not read DICOM plan file: {}",
@@ -716,7 +726,19 @@ fn stack(slices: &mut [Slice]) -> Result<CtVolume, String> {
     if !spacing_matches {
         return Err("CT slices differ in pixel spacing or in-plane origin".into());
     }
-    let mut hu = vec![0.0; first.cols * first.rows * slices.len()];
+    // Slices come from the file count — a crafted study dir could ask for a
+    // multi-GB buffer. Bound before allocating.
+    let Some(voxels) = first
+        .cols
+        .checked_mul(first.rows)
+        .and_then(|plane| plane.checked_mul(slices.len()))
+    else {
+        return Err("CT volume is too large".into());
+    };
+    if voxels > (1 << 30) {
+        return Err("CT volume exceeds the voxel bound".into());
+    }
+    let mut hu = vec![0.0; voxels];
     for (z, slice) in slices.iter().enumerate() {
         if slice.cols != first.cols || slice.rows != first.rows {
             return Err("CT slices differ in size".into());

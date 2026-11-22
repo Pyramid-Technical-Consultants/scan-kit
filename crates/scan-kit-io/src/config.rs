@@ -357,7 +357,11 @@ pub fn diff(input: &Value) -> Result<Value, String> {
 /// `config/` tree diffs as-is (a plain copy still path-matches session trees).
 fn diff_root(dir: &Path) -> PathBuf {
     for ancestor in dir.ancestors().skip(1) {
-        if ancestor.file_name().is_some_and(|name| name == "config") {
+        if ancestor
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.eq_ignore_ascii_case("config"))
+        {
             return ancestor.to_path_buf();
         }
     }
@@ -957,6 +961,10 @@ fn parse_sidecar(data: &[u8]) -> Result<(String, i32, i64), String> {
     Ok((digest, salt, mtime))
 }
 
+// ponytail: mirrors the Pyramid .md5 sidecar convention — the stored mtime
+// carries the local offset at commit time, so a DST switch or timezone move
+// re-verifies an untouched file as TIMESTAMP_ERR. Recopying the sidecar heals
+// it; the format is fixed for compatibility.
 fn pyramid_mtime(path: &Path) -> Result<i64, String> {
     let modified = fs::metadata(path)
         .and_then(|meta| meta.modified())
@@ -1014,16 +1022,27 @@ fn under(root: &Path, rel: &str) -> Result<PathBuf, String> {
 }
 
 fn folder_key(path: &Path) -> String {
-    let normalized = if path.exists() {
-        path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
-    } else if let (Some(parent), Some(name)) = (path.parent(), path.file_name()) {
-        parent
-            .canonicalize()
-            .unwrap_or_else(|_| parent.to_path_buf())
-            .join(name)
-    } else {
-        path.to_path_buf()
+    // Canonicalize the deepest existing ancestor — a missing parent leaves a
+    // typed spelling (no verbatim prefix, no on-disk case) that misses the
+    // source-inside-dest checks entirely.
+    let mut probe = path;
+    let mut tail = Vec::new();
+    let normalized = loop {
+        if probe.exists() {
+            break probe.canonicalize().unwrap_or_else(|_| probe.to_path_buf());
+        }
+        match (probe.parent(), probe.file_name()) {
+            (Some(parent), Some(name)) => {
+                tail.push(name.to_os_string());
+                probe = parent;
+            }
+            _ => break probe.to_path_buf(),
+        }
     };
+    let normalized = tail
+        .iter()
+        .rev()
+        .fold(normalized, |acc, name| acc.join(name));
     // A relative tail keeps the key relative and slips past the
     // source-inside-dest prefix checks — anchor it at the cwd.
     let normalized = if normalized.is_absolute() {
@@ -1623,6 +1642,22 @@ mod tests {
             source.join("map2map/devices.xml").exists(),
             "source survived"
         );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn saving_two_levels_under_source_is_rejected() {
+        // The inside-source check must hold when dest's parent does not exist
+        // yet — the typed path alone slips past a plain canonicalize.
+        let root = std::env::temp_dir().join(format!("scan-kit-cfg-deep-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let source = root.join("cfg");
+        fs::create_dir_all(source.join("map2map")).unwrap();
+        fs::write(source.join("map2map/devices.xml"), b"<devices/>\n").unwrap();
+        let db = root.join("test.sqlite");
+        let dest = source.join("a/b");
+        let result = save_folder(&db, &source, &dest, &json!([]), None);
+        assert!(result.is_err(), "dest inside source must not be saved");
         let _ = fs::remove_dir_all(&root);
     }
 }
