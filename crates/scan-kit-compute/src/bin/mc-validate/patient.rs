@@ -354,12 +354,16 @@ pub fn write_patient_inputs(work: &Path, primaries: u64) -> Result<(), String> {
     Ok(())
 }
 
-fn plan_protons(fields: &[PlanField], model: &BeamModel) -> f64 {
+fn plan_protons(fields: &[PlanField], model: &BeamModel) -> Result<f64, String> {
     fields
         .iter()
         .flat_map(|f| f.layers.iter())
         .flat_map(|(e, _, _, spots)| spots.iter().map(move |s| (e, s)))
-        .map(|(e, s)| s[2] * f64::from(model.protons_per_mu(*e as f32)))
+        .map(|(e, s)| {
+            model
+                .protons_per_mu(*e as f32)
+                .map(|rate| s[2] * f64::from(rate))
+        })
         .sum()
 }
 
@@ -401,7 +405,7 @@ pub fn run_mcsquare_patient(
     }
     let model = BeamModel::read(&patient_bdl())?;
     let fields = read_plan(&work.join("Plan.txt"))?;
-    let protons = plan_protons(&fields, &model);
+    let protons = plan_protons(&fields, &model)?;
     let (_, dose) = read_mhd(&out.join("Dose.mhd"))?;
     let (_, let_d) = read_mhd(&out.join("LET.mhd"))?;
     Ok((
@@ -456,7 +460,7 @@ pub fn run_gpu_patient(
                     *wet as f32,
                     *dist as f32,
                 )?);
-                protons.push((s[2] * f64::from(model.protons_per_mu(*energy as f32))) as f32);
+                protons.push((s[2] * f64::from(model.protons_per_mu(*energy as f32)?)) as f32);
             }
         }
     }
@@ -469,7 +473,7 @@ pub fn run_gpu_patient(
         spacing_mm: [spacing[0] as f32, spacing[1] as f32, spacing[2] as f32],
         origin_mm: [0.0, 0.0, 0.0],
         shape: [nx, ny, nz],
-        histories: histories as u32,
+        histories: histories.min(u64::from(u32::MAX)) as u32,
         seed: SEED,
         dose_to_water: true,
         score_let: true,

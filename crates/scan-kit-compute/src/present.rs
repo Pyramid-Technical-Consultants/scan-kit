@@ -230,9 +230,12 @@ pub(crate) fn apply_palette(scene: &mut scan_kit_core::PlotScene, palette: &[[f3
                     let alpha = slot[3];
                     // Alpha 0 keeps the previous series color, so a mean curve and its
                     // trend stay with that session instead of taking the next chart color.
-                    if alpha == 0.0 && index > 0 {
-                        let color = palette[(index - 1) % palette.len()];
+                    if alpha == 0.0 {
+                        let color = palette[index.saturating_sub(1) % palette.len()];
                         *slot = [color[0], color[1], color[2], 1.0];
+                        // A leading alpha-0 series claims palette[0] at full
+                        // alpha — without the advance it would paint 0.05.
+                        index += usize::from(index == 0);
                     } else {
                         *slot = [color[0], color[1], color[2], alpha.max(0.05)];
                         index += 1;
