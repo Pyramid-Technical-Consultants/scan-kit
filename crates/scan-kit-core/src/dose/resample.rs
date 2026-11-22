@@ -46,7 +46,14 @@ pub fn resample_linear(
                             let weight = if dx == 0 { 1.0 - t[0] } else { t[0] }
                                 * if dy == 0 { 1.0 - t[1] } else { t[1] }
                                 * if dz == 0 { 1.0 - t[2] } else { t[2] };
-                            acc += weight * get(base[0] + dx, base[1] + dy, base[2] + dz);
+                            // `as isize` saturates on absurd coords — the
+                            // adds must not overflow in a debug build.
+                            acc += weight
+                                * get(
+                                    base[0].saturating_add(dx),
+                                    base[1].saturating_add(dy),
+                                    base[2].saturating_add(dz),
+                                );
                         }
                     }
                 }

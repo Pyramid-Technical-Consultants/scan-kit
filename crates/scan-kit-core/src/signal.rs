@@ -613,6 +613,10 @@ pub fn linear_fit(xs: &[f32], ys: &[f32]) -> Option<(f32, f32)> {
     }
     let slope = (n * sxy - sx * sy) / den;
     let intercept = (sy - slope * sx) / n;
+    // A huge y can push the numerator to inf while den stays finite.
+    if !slope.is_finite() || !intercept.is_finite() {
+        return None;
+    }
     Some((slope, intercept))
 }
 
@@ -639,13 +643,14 @@ pub fn dvh(dose: &[f32], mask: &[bool], bins: usize) -> (Vec<f32>, Vec<f32>) {
 
 /// Sum `current` for each spot id, in the order each id first appears.
 pub fn sums_by_spot_id(spot: &[f32], current: &[f32]) -> Vec<f32> {
-    let mut index = std::collections::BTreeMap::<i32, usize>::new();
+    // i64: `as i32` saturates, folding every id past ~2.1e9 into one bucket.
+    let mut index = std::collections::BTreeMap::<i64, usize>::new();
     let mut sums = Vec::new();
     for (spot_id, value) in spot.iter().zip(current) {
         if !spot_id.is_finite() || !value.is_finite() {
             continue;
         }
-        let id = spot_id.round() as i32;
+        let id = spot_id.round() as i64;
         if let Some(slot) = index.get(&id) {
             sums[*slot] += value;
         } else {
@@ -662,12 +667,12 @@ pub fn sums_by_spot_run(spot: &[f32], current: &[f32]) -> Vec<f32> {
     let mut out = Vec::new();
     let mut acc = 0.0f32;
     let mut have = false;
-    let mut last = 0i32;
+    let mut last = 0i64;
     for i in 0..n {
         if !spot[i].is_finite() || !current[i].is_finite() {
             continue;
         }
-        let id = spot[i].round() as i32;
+        let id = spot[i].round() as i64;
         if have && id != last {
             out.push(acc);
             acc = 0.0;
@@ -1270,5 +1275,24 @@ mod tests {
         // sxx and sx*sx both overflow to inf for 2e38 inputs — den is NaN,
         // which must not slip the near-zero guard into Some((NaN, NaN)).
         assert_eq!(linear_fit(&[2.0e38, 2.0e38], &[1.0, 2.0]), None);
+    }
+
+    #[test]
+    fn an_infinite_fit_numerator_returns_none() {
+        // den stays finite here — only the numerator overflows.
+        assert_eq!(linear_fit(&[1.0, 2.0], &[3.4e38, 1.0e-3]), None);
+    }
+
+    #[test]
+    fn huge_spot_ids_do_not_merge_into_one_bucket() {
+        // `as i32` would saturate both to i32::MAX and fold them together.
+        assert_eq!(
+            sums_by_spot_id(&[3.0e9, 4.0e9], &[1.0, 2.0]),
+            vec![1.0, 2.0]
+        );
+        assert_eq!(
+            sums_by_spot_run(&[3.0e9, 4.0e9, 4.0e9], &[1.0, 2.0, 3.0]),
+            vec![1.0, 5.0]
+        );
     }
 }

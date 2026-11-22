@@ -406,7 +406,14 @@ fn dicom_text(bytes: &[u8]) -> String {
 }
 
 fn read_entry(path: &Path) -> Option<DicomEntry> {
-    let bytes = fs::read(path).ok()?;
+    // The index only scans header elements (stops at pixel data) — a
+    // whole-file read would let one huge/crafted file OOM the process.
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)
+        .ok()?
+        .take(PEEK_CAP as u64)
+        .read_to_end(&mut bytes)
+        .ok()?;
     if !is_dicom(&bytes) {
         return None;
     }
