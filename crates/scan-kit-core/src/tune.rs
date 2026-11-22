@@ -575,7 +575,7 @@ fn tune_distance(
             ));
             continue;
         };
-        if (fit.gain - 1.0).abs() > 0.25 {
+        if !fit.gain.is_finite() || (fit.gain - 1.0).abs() > 0.25 {
             warnings.push(format!(
                 "{device}: fitted gain {:.4} is too far from 1 to be a distance calibration; left unchanged.",
                 fit.gain

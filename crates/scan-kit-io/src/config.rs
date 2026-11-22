@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use chrono::{Local, TimeZone};
@@ -84,6 +85,7 @@ pub fn set_hide_unused(db: &Path, hide: bool) -> Result<Value, String> {
 }
 
 pub fn read_form(path: &Path) -> Result<Value, String> {
+    let _io = FILE_IO.lock().unwrap_or_else(|err| err.into_inner());
     let xml = fs::read_to_string(path)
         .map_err(|err| format!("Could not read {}: {err}", path.display()))?;
     let form = config_form(&xml)?;
@@ -101,6 +103,12 @@ pub fn apply(xml: &str, form: &Value) -> Result<Value, String> {
     Ok(json!({ "xml": xml, "form": form }))
 }
 
+/// A save writes each XML then re-reads it to hash — a second save interleaved
+/// in that window persists a sidecar for the wrong bytes. integrity reads in
+/// the same window would flag a half-written tree. Serializing both keeps the
+/// xml/.md5 pair consistent.
+static FILE_IO: Mutex<()> = Mutex::new(());
+
 pub fn save_folder(
     db: &Path,
     source: &Path,
@@ -108,6 +116,7 @@ pub fn save_folder(
     files: &Value,
     hide: Option<bool>,
 ) -> Result<Value, String> {
+    let _io = FILE_IO.lock().unwrap_or_else(|err| err.into_inner());
     if !source.is_dir() {
         return Err(format!(
             "Configuration folder is not a directory: {}",
@@ -709,6 +718,7 @@ fn old_pos(ops: &[LineOp], index: usize, old_len: usize) -> usize {
 }
 
 pub fn integrity(path: &Path) -> Value {
+    let _io = FILE_IO.lock().unwrap_or_else(|err| err.into_inner());
     integrity_value(path)
 }
 

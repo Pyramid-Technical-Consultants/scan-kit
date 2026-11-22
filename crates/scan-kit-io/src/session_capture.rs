@@ -319,6 +319,15 @@ fn csv_text(sheet: &Sheet) -> String {
     out
 }
 
+/// Join keys arrive as raw cell text — "1" and "1.0" are the same physical
+/// row across differently-formatted device tables. Numeric keys normalize;
+/// anything else joins on its text.
+fn join_key(text: &str) -> String {
+    text.parse::<f64>()
+        .map(|value| value.to_string())
+        .unwrap_or_else(|_| text.to_owned())
+}
+
 fn join_cells<'a>(cells: impl Iterator<Item = &'a str>) -> String {
     cells
         .map(|cell| {
@@ -592,10 +601,11 @@ fn join_timeslices(parts: &[(&CaptureDevice, Sheet)]) -> Option<String> {
         };
         for row in &sheet.rows {
             let Some(key) = row.get(ts_i) else { continue };
+            let key = join_key(key);
             // Keyed on the timeslice number alone: unlike spot keys, a
             // timeslice number is a per-delivery counter, so re-delivery
             // means the device is replacing that slice, not repeating one.
-            if !part.rows.contains_key(key) {
+            if !part.rows.contains_key(&key) {
                 part.order.push(key.clone());
             }
             part.rows.insert(
@@ -732,19 +742,14 @@ fn join_spot_data(spots: &[(&CaptureDevice, Sheet)]) -> Option<String> {
         // silently overwriting the first while its state survives.
         let mut occurrences: HashMap<(String, String), usize> = HashMap::new();
         for row in &sheet.rows {
-            let base = (
-                row.get(layer_i).cloned().unwrap_or_default(),
-                row.get(spot_i).cloned().unwrap_or_default(),
-            );
-            if base.1.is_empty() {
+            let layer = join_key(&row.get(layer_i).cloned().unwrap_or_default());
+            let spot = join_key(&row.get(spot_i).cloned().unwrap_or_default());
+            if spot.is_empty() {
                 continue;
             }
+            let base = (layer.clone(), spot.clone());
             let n = occurrences.entry(base).or_insert(0);
-            let key = (
-                row.get(layer_i).cloned().unwrap_or_default(),
-                row.get(spot_i).cloned().unwrap_or_default(),
-                *n,
-            );
+            let key = (layer, spot, *n);
             *n += 1;
             // Spot order follows the RCI table first; a device-only spot still
             // joins in encounter order rather than being dropped.
@@ -909,7 +914,16 @@ fn write_input_map(
                         .collect()
                 })
                 .unwrap_or_default();
-            if let (Some(spot), false) = (rci_spot, extra.is_empty()) {
+            // The join is positional — a shorter RCI table means the device
+            // filtered rows, so every pair from the divergence on is a wrong
+            // label. Emit without the extra columns rather than mislabel.
+            // A longer RCI table still joins the first N rows: re-delivered
+            // spots land at the tail, but a mid-table insert would misalign
+            // the same way — there is no key to compare against, so `>=` is
+            // the reachable middle ground.
+            if let Some(spot) =
+                rci_spot.filter(|spot| !extra.is_empty() && spot.rows.len() >= sheet.rows.len())
+            {
                 let names: Vec<String> = extra.iter().map(|i| spot.header[*i].clone()).collect();
                 // Pad short rows first — flexible parsing leaves them under the
                 // header length, and pushing the new cells there would land them
@@ -1697,5 +1711,13 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![(0, 0, 0, 1), (0, 1, 1, 3)]
         );
+    }
+
+    #[test]
+    fn a_join_key_normalizes_numeric_spellings() {
+        assert_eq!(join_key("1"), "1");
+        assert_eq!(join_key("1.0"), "1");
+        assert_eq!(join_key("03"), "3");
+        assert_eq!(join_key("run-2"), "run-2");
     }
 }

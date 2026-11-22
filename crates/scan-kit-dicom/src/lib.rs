@@ -92,7 +92,7 @@ pub fn index_study(path: &Path) -> Result<Vec<DicomEntry>, String> {
             .extension()
             .and_then(|ext| ext.to_str())
             .is_some_and(|ext| ext.eq_ignore_ascii_case("dcm"))
-            || fs::read(&file).ok().as_deref().is_some_and(is_dicom)
+            || file_is_dicom(&file)
         {
             if let Some(entry) = read_entry(&file) {
                 entries.push(entry);
@@ -191,7 +191,7 @@ fn class_name(sop: &str) -> &'static str {
 }
 
 fn is_dicom(bytes: &[u8]) -> bool {
-    bytes.len() > 132 && &bytes[128..132] == b"DICM"
+    bytes.len() >= 132 && &bytes[128..132] == b"DICM"
 }
 
 /// Implicit VR Little Endian transfer syntax (no VR codes in the dataset).

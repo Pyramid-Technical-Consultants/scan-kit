@@ -792,7 +792,7 @@ export function AnalysisView({
             if (taskId.current === id || issuedSeq.current > ticket) {
               return;
             }
-            void invoke("scan_kit_cancel", { task: id });
+            void invoke("scan_kit_cancel", { task: id }).catch(() => {});
           });
           return;
         }
@@ -910,7 +910,7 @@ export function AnalysisView({
       queueMicrotask(() => {
         if (hold.current === mine && id !== 0) {
           taskId.current = 0;
-          void invoke("scan_kit_cancel", { task: id });
+          void invoke("scan_kit_cancel", { task: id }).catch(() => {});
         }
       });
     };

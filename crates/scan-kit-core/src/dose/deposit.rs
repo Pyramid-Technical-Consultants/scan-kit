@@ -125,6 +125,14 @@ pub(super) fn dose_grid(
     let mut lo = [f32::MAX; 3];
     let mut hi = [f32::MIN; 3];
     for spot in spots {
+        if ![
+            spot.x, spot.y, spot.z0, spot.z1, spot.sx, spot.sy, spot.grow,
+        ]
+        .iter()
+        .all(|value| value.is_finite())
+        {
+            continue;
+        }
         let reach_x = SIGMA_CUT as f32 * hypot(spot.sx, spot.grow);
         let reach_y = SIGMA_CUT as f32 * hypot(spot.sy, spot.grow);
         lo[0] = lo[0].min(spot.x - reach_x);
