@@ -455,15 +455,9 @@ impl SessionStage {
         foreground: [f32; 4],
         palette: &[[f32; 4]],
     ) -> Self {
-        let stamps: Vec<_> = sessions
-            .iter()
-            .map(|session| stamp_key(root, session))
-            .collect();
-        let cached = !stamps.is_empty() && {
-            let seen = seen_stamps();
-            let seen = seen.lock().unwrap_or_else(|err| err.into_inner());
-            stamps.iter().all(|stamp| seen.contains(stamp))
-        };
+        // stamps/cached are computed lazily on the first poll: building them
+        // here does per-session fs::metadata under the global driver lock,
+        // which stalls every other task's poll and cancel.
         Self {
             view: view.into(),
             root: root.to_path_buf(),
@@ -472,8 +466,8 @@ impl SessionStage {
             background,
             foreground,
             palette: palette.to_vec(),
-            stamps,
-            cached,
+            stamps: Vec::new(),
+            cached: false,
             loaded: 0,
             plan: Vec::new(),
             blocks: 1,
@@ -653,6 +647,16 @@ impl Stage for SessionStage {
         if cancel.is_cancelled() {
             self.report.phase = Phase::Cancelled;
             return Poll::Cancelled;
+        }
+        if self.stamps.is_empty() && !self.sessions.is_empty() {
+            self.stamps = self
+                .sessions
+                .iter()
+                .map(|session| stamp_key(&self.root, session))
+                .collect();
+            let seen = seen_stamps();
+            let seen = seen.lock().unwrap_or_else(|err| err.into_inner());
+            self.cached = self.stamps.iter().all(|stamp| seen.contains(stamp));
         }
         let total = self.sessions.len();
         let unlimited = budget >= DRAIN;
@@ -1993,9 +1997,11 @@ mod tests {
             [0.9, 0.9, 0.9, 1.0],
             &[[0.2, 0.4, 0.8, 1.0]],
         );
-        assert!(again.cached);
+        // cached is computed on the first poll now — the constructor does no
+        // file IO so it cannot run under the driver lock.
         match again.poll(Duration::from_millis(12), &cancel) {
             Poll::Ready(bytes) => {
+                assert!(again.cached);
                 let header = scan_kit_plot::plot_header(&bytes).unwrap();
                 assert_eq!(header.quality, "final");
             }
@@ -2303,7 +2309,7 @@ mod tests {
         write_session(&root, "sess");
         let cancel = Cancel::new();
         let mut timeline = session_stage(&root, &["sess"]);
-        assert!(!timeline.cached);
+        assert!(!timeline.cached); // no stamps yet — computed on first poll
         let mut finished = false;
         for _ in 0..4 {
             if matches!(timeline.poll(Duration::ZERO, &cancel), Poll::Ready(_)) {
@@ -2321,9 +2327,9 @@ mod tests {
             [0.9, 0.9, 0.9, 1.0],
             &[[0.2, 0.4, 0.8, 1.0]],
         );
-        assert!(bins.cached);
         match bins.poll(Duration::ZERO, &cancel) {
             Poll::Ready(bytes) => {
+                assert!(bins.cached);
                 assert_eq!(scan_kit_plot::plot_header(&bytes).unwrap().quality, "final");
             }
             other => panic!("a view of a session already read should be one picture: {other:?}"),

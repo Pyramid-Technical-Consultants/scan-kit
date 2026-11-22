@@ -31,6 +31,7 @@ mod workspace;
 
 pub use analysis::{analysis_scene, channel_catalog, load_timeslice_columns};
 pub use beam::{beam_record, protons_per_mu, spot_record, BeamModel};
+pub use location::is_remote_location;
 pub use marks::normalize_options;
 pub use mc_tables::{csda_range_mm, mc_tables, medium_rho};
 pub use tables::{
@@ -327,11 +328,21 @@ pub fn tool_input_schema(name: &str) -> Value {
             "required": ["template", "params"],
             "additionalProperties": false
         }),
-        "scan_kit_config_catalog" | "scan_kit_config_open" => json!({
+        "scan_kit_config_catalog" => json!({
             "type": "object",
             "properties": {
                 "path": { "type": "string" },
                 "db_path": { "type": "string" }
+            },
+            "additionalProperties": false
+        }),
+        "scan_kit_config_open" => json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string" },
+                "db_path": { "type": "string" },
+                "data_dir": { "type": "string" },
+                "session_id": { "type": "string" }
             },
             "additionalProperties": false
         }),
@@ -489,7 +500,7 @@ pub fn tool_input_schema(name: &str) -> Value {
         "scan_kit_scanners" => json!({
             "type": "object",
             "properties": {
-                "db": { "type": "string" },
+                "db_path": { "type": "string" },
                 "action": { "type": "string", "enum": ["list", "add", "remove"] },
                 "folder": { "type": "string" }
             },

@@ -756,6 +756,7 @@ export function AnalysisView({
         setQuiet(null);
       }
       setPlotError(null);
+      let polledTask: number | undefined;
       void (async () => {
         issuedSeq.current = ticket;
         const run = () =>
@@ -789,6 +790,7 @@ export function AnalysisView({
           return;
         }
         taskId.current = started.task;
+        polledTask = started.task;
         let misses = 0;
         for (;;) {
           if (stop || openSeq.current !== ticket) {
@@ -878,6 +880,12 @@ export function AnalysisView({
           await new Promise((resolve) => window.setTimeout(resolve, parsed.payload == null ? 40 : 0));
         }
       })().catch((reason: unknown) => {
+        // A poll rejection leaves the task registered — cancel the task this
+        // chain was polling (never taskId.current: a newer ticket may have
+        // already replaced it).
+        if (polledTask != null) {
+          void invoke("scan_kit_cancel", { task: polledTask }).catch(() => {});
+        }
         if (openSeq.current === ticket) {
           const message = messageOf(reason);
           setArrivedKey(requestKey);

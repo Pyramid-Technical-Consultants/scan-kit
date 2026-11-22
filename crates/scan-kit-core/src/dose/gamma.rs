@@ -109,9 +109,11 @@ pub fn gamma_index_norm(
     let n = nx * ny * nz;
     let len = n.min(reference.len()).min(evaluated.len());
     let mut gamma = vec![0.0f32; len];
-    // Scoring samples evaluated by `shape` up to n - 1 — a short operand
-    // stays unscored rather than index out of bounds.
-    if evaluated.len() < n {
+    // Scoring samples both operands by `shape` up to n - 1 — a short operand
+    // stays unscored rather than index out of bounds. Equal-length operands
+    // with a different layout are the caller's contract: shape must describe
+    // both buffers or the γ map scores scrambled positions.
+    if evaluated.len() < n || reference.len() < n {
         return (gamma, 0, 0);
     }
     let mut norm = norm.max(0.0);
@@ -207,6 +209,11 @@ pub fn projected_gamma(
     cutoff_pct: f32,
 ) -> [(Vec<f32>, f32); 3] {
     let [nx, ny, nz] = reference.shape;
+    // The reference's strides drive every index — equal-length volumes with
+    // different dims would score scrambled positions.
+    if evaluated.shape != reference.shape {
+        return [(Vec::new(), 0.0), (Vec::new(), 0.0), (Vec::new(), 0.0)];
+    }
     let sums = |volume: &Volume| super::ray::scan_volume(volume).integrals;
     let (got, want) = (sums(reference), sums(evaluated));
     let planes = [[nx, ny, 1], [nx, nz, 1], [ny, nz, 1]];
@@ -644,5 +651,17 @@ mod tests {
             planes.iter().all(|(_, rate)| *rate < 50.0),
             "20% hot passed"
         );
+    }
+
+    #[test]
+    fn a_short_reference_is_not_scored_with_its_strides() {
+        let shape = [4usize, 3, 2];
+        let n = shape.iter().product::<usize>();
+        let evaluated = vec![1.0f32; n];
+        let reference = vec![1.0f32; n - 1];
+        let (gamma, scored, _) =
+            gamma_index(&reference, &evaluated, shape, 3.0, 2.0, [1.0; 3], 10.0);
+        assert_eq!(scored, 0);
+        assert!(gamma.iter().all(|v| *v == 0.0));
     }
 }

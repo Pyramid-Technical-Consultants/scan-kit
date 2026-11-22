@@ -86,7 +86,14 @@ impl ScanKit {
             .get("db_path")
             .and_then(Value::as_str)
             .is_some_and(|path| !path.trim().is_empty());
-        (saves || foreign_db).then_some(name)
+        // A remote location spec reaches out to the network: SFTP TOFU
+        // writes known_hosts, archives download into the remote cache,
+        // SMB opens sessions, and FTP/HTTP touch any host named.
+        let remote = ["path", "storage_path", "data_dir"]
+            .iter()
+            .filter_map(|key| input.get(key).and_then(Value::as_str))
+            .any(scan_kit_io::is_remote_location);
+        (saves || foreign_db || remote).then_some(name)
     }
 
     fn allows(&self, name: &str) -> bool {
@@ -208,7 +215,17 @@ impl ServerHandler for ScanKit {
             }
         };
         match result {
-            Ok(value) => Ok(CallToolResult::structured(value).into()),
+            Ok(value) => {
+                // structuredContent must be an object on the wire; the one
+                // bare-array tool result (data_dirs) gets wrapped here rather
+                // than changing the shape desktop invoke relies on.
+                let value = if value.is_object() {
+                    value
+                } else {
+                    serde_json::json!({ "result": value })
+                };
+                Ok(CallToolResult::structured(value).into())
+            }
             Err(error) => Ok(CallToolResult::error(vec![ContentBlock::text(error)]).into()),
         }
     }
@@ -357,6 +374,29 @@ mod tests {
         client.cancel().await.expect("cancel");
         server.await.expect("server task");
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn remote_location_args_count_as_effects() {
+        let kit = ScanKit { effects: false };
+        let remote = serde_json::json!({ "path": "sftp://host.example/lib" });
+        assert_eq!(
+            kit.blocked("scan_kit_open_library", &remote),
+            Some("scan_kit_open_library")
+        );
+        let ftp = serde_json::json!({ "storage_path": "ftp://host.example/x.zip" });
+        assert_eq!(
+            kit.blocked("scan_kit_load_timeslice", &ftp),
+            Some("scan_kit_load_timeslice")
+        );
+        let local = serde_json::json!({ "path": "C:\\lib" });
+        assert_eq!(kit.blocked("scan_kit_open_library", &local), None);
+        // A drive-letter scheme is local, not remote — is_remote_location
+        // treats a one-letter scheme as a Windows drive.
+        let drive = serde_json::json!({ "path": "C://lib/data" });
+        assert_eq!(kit.blocked("scan_kit_open_library", &drive), None);
+        let file = serde_json::json!({ "path": "file:///lib" });
+        assert_eq!(kit.blocked("scan_kit_open_library", &file), None);
     }
 
     async fn listed_and_control(effects: bool) -> (Vec<String>, bool, bool) {

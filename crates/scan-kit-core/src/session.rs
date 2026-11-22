@@ -28,7 +28,7 @@ pub struct SummaryDate {
 /// archives, so `.`, `..`, and separators are not ids — they are traversals.
 /// Ids minted from zip member names or device tables are checked with this too.
 pub fn valid_session_id(id: &str) -> bool {
-    !id.is_empty() && id != "." && id != ".." && !id.contains(['/', '\\'])
+    !id.is_empty() && id != "." && id != ".." && !id.contains(['/', '\\', ':'])
 }
 
 impl SessionMeta {
@@ -449,5 +449,13 @@ Configuration name: working_no_hvttt_new_cal
         assert_eq!(filled.map_extent_mm, Some(12.0));
         assert_eq!(filled.layer_count, Some(4));
         assert!(merge_session_geom(None, None, None).is_none());
+    }
+
+    #[test]
+    fn session_ids_reject_windows_prefix_components() {
+        assert!(valid_session_id("2024-01-01_abc"));
+        for bad in ["", ".", "..", "a/b", "a\\b", "C:victim", "d:"] {
+            assert!(!valid_session_id(bad), "{bad:?} must not be a session id");
+        }
     }
 }

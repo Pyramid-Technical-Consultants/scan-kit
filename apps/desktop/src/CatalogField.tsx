@@ -218,12 +218,9 @@ export function CatalogField({
         onChange={(event) => {
           const text = event.target.value;
           const number = Number(text);
-          if (finiteOnly) {
-            if (Number.isFinite(number)) {
-              onChange(number);
-            }
-            return;
-          }
+          // Pass partial text through for finiteOnly too — swallowing a
+          // keystroke in a controlled input reverts it, so "-", "1e", and
+          // clearing the field can never be typed.
           onChange(Number.isFinite(number) && text.trim() !== "" ? number : text);
         }}
       />

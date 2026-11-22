@@ -50,9 +50,9 @@ pub fn with_store<T>(
     path: &Path,
     body: impl FnOnce(&mut Connection) -> Result<T, String>,
 ) -> Result<T, String> {
-    let _guard = STORE_LOCK
-        .lock()
-        .map_err(|_| "the session store lock was poisoned".to_owned())?;
+    // The lock guards no data — a poisoned mutex (a panic inside a callback)
+    // must not wedge every store call for the rest of the process.
+    let _guard = STORE_LOCK.lock().unwrap_or_else(|err| err.into_inner());
     let mut conn = open_connection(path)?;
     body(&mut conn)
 }

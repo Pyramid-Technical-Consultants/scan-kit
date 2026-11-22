@@ -66,12 +66,16 @@ fn parse_args() -> Result<Args, String> {
                 args.case.push(it.next().ok_or("--case needs a value")?);
             }
             "--histories" => {
-                args.histories = Some(
-                    it.next()
-                        .ok_or("--histories needs a value")?
-                        .parse()
-                        .map_err(|_| "bad --histories")?,
-                );
+                let value: f64 = it
+                    .next()
+                    .ok_or("--histories needs a value")?
+                    .parse()
+                    .map_err(|_| "bad --histories")?;
+                // Downstream casts to u32 — reject counts that would wrap.
+                if !value.is_finite() || value < 0.0 || value > u32::MAX as f64 {
+                    return Err("bad --histories".into());
+                }
+                args.histories = Some(value);
             }
             "--write-goldens" => args.write_goldens = true,
             "--golden-primaries" => {
@@ -287,13 +291,14 @@ fn gamma_rate(
     }
 }
 
-fn passes(diff: &metrics::Diff, gamma: f64, tol: &Tolerances) -> bool {
+fn passes(diff: &metrics::Diff, gamma: f64, tol: &Tolerances, ref_sigma_nan: bool) -> bool {
     let ok = diff.idd.abs() <= tol.idd
         && diff.r80.abs() <= tol.r80
         && diff.energy.abs() <= tol.energy
         && diff.centroid.abs() <= tol.centroid;
-    // nan (fields) is not a failure
-    let ok = ok && (diff.sigma <= tol.sigma || diff.sigma.is_nan());
+    // A NaN sigma is excused only when the reference was NaN too (fields);
+    // a NaN GPU sigma against a finite reference is a regression.
+    let ok = ok && (diff.sigma <= tol.sigma || (diff.sigma.is_nan() && ref_sigma_nan));
     ok && gamma >= tol.gamma
 }
 
@@ -363,7 +368,8 @@ fn main_slab(args: &Args) -> Result<i32, String> {
         }
         let gold = load_golden(case)?;
         let t0 = Instant::now();
-        let (vol, nz, ny, nx) = run_gpu(case, (histories * case.scale) as u64)?;
+        let (vol, nz, ny, nx) =
+            run_gpu(case, (histories * case.scale).min(u32::MAX as f64) as u64)?;
         let seconds = t0.elapsed().as_secs_f64();
         let rho = medium_rho(case.medium)?;
         let diff = compare(&gold.summary, &summary(&vol, nz, ny, nx, case, rho));
@@ -378,7 +384,12 @@ fn main_slab(args: &Args) -> Result<i32, String> {
             1.0,
             10.0,
         );
-        let ok = passes(&diff, gamma, &tol);
+        let ok = passes(
+            &diff,
+            gamma,
+            &tol,
+            gold.summary.sigmas.iter().any(|sigma| sigma.is_nan()),
+        );
         if !ok {
             failed.push(case.name.clone());
         }

@@ -485,14 +485,19 @@ pub fn splat_gaussians(
         if !sigma.is_finite() || sigma <= 0.0 || !weight.is_finite() {
             continue;
         }
-        let reach = (3.0 * sigma).ceil() as i32;
+        // 3σ in millimetres, converted to voxels per axis — spacing < 1 mm
+        // needs more voxels to cover the kernel, and clamping to the axis
+        // keeps a huge σ bounded (nothing outside the grid is written).
+        let rx = ((3.0 * sigma / spacing[0]).ceil() as i32).min(nx as i32);
+        let ry = ((3.0 * sigma / spacing[1]).ceil() as i32).min(ny as i32);
+        let rz = ((3.0 * sigma / spacing[2]).ceil() as i32).min(nz as i32);
         let cx = ((x - origin[0]) / spacing[0]).round() as i32;
         let cy = ((y - origin[1]) / spacing[1]).round() as i32;
         let cz = ((z - origin[2]) / spacing[2]).round() as i32;
         let inv = 1.0 / (2.0 * sigma * sigma);
-        for dz in -reach..=reach {
-            for dy in -reach..=reach {
-                for dx in -reach..=reach {
+        for dz in -rz..=rz {
+            for dy in -ry..=ry {
+                for dx in -rx..=rx {
                     let ix = cx + dx;
                     let iy = cy + dy;
                     let iz = cz + dz;
@@ -1039,6 +1044,19 @@ mod tests {
         assert!(center > grid[0]);
         let image = mip_xy(&grid, [3, 3, 1]);
         assert_eq!(image[1 + 3], center);
+    }
+
+    #[test]
+    fn splat_reach_is_in_voxels_not_millimetres() {
+        // sigma 1 mm on a 0.5 mm grid needs ~13 voxels per axis to cover 3
+        // sigma — the old code used the mm reach as a voxel count (~7).
+        let spot = [6.0, 6.0, 6.0, 1.0, 1.0];
+        let wide = splat_gaussians(&[spot], [0.0, 0.0, 0.0], [0.5, 0.5, 0.5], [25, 25, 25]);
+        let nonzero = wide.iter().filter(|v| **v > 0.0).count();
+        assert!(
+            nonzero > 7 * 7 * 7,
+            "3 sigma at 0.5 mm should exceed 7^3: {nonzero}"
+        );
     }
 
     #[test]

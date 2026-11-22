@@ -962,10 +962,12 @@ fn relative(root: &Path, path: &Path) -> String {
 
 fn under(root: &Path, rel: &str) -> Result<PathBuf, String> {
     let path = Path::new(rel);
-    if path.is_absolute()
-        || path
-            .components()
-            .any(|component| matches!(component, Component::ParentDir))
+    // Normal components only: ParentDir escapes, and on Windows a rooted or
+    // prefixed component is not absolute but still replaces the joined root
+    // — the same check materialize uses in location.rs.
+    if !path
+        .components()
+        .all(|component| matches!(component, Component::Normal(_)))
     {
         return Err(format!("config path escapes the folder: {rel}"));
     }
@@ -1525,6 +1527,19 @@ mod tests {
             .unwrap()
             .parse()
             .unwrap()
+    }
+
+    #[test]
+    fn under_rejects_anchored_and_prefixed_paths() {
+        let root = std::path::Path::new(if cfg!(windows) { "C:\\lib" } else { "/lib" });
+        assert!(under(root, "a/b.xml").is_ok());
+        assert!(under(root, "../x.xml").is_err());
+        // Windows-only components: a rooted path and a drive-prefixed one
+        // both replaced the joined root even though neither is_absolute().
+        if cfg!(windows) {
+            assert!(under(root, "\\escape.xml").is_err());
+            assert!(under(root, "C:evil.xml").is_err());
+        }
     }
 
     fn form_has(node: &Value, title: &str, collapsible: bool) -> bool {

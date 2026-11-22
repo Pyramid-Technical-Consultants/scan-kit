@@ -292,7 +292,7 @@ pub fn read_mhd(path: &Path) -> Result<([usize; 3], Vec<f64>), String> {
         .unwrap_or(path)
         .join(head.get("ElementDataFile").ok_or("ElementDataFile")?);
     let raw = fs::read(&raw_path).map_err(|err| format!("{raw_path:?}: {err}"))?;
-    let data = match head.get("ElementType").map(String::as_str) {
+    let data: Vec<f64> = match head.get("ElementType").map(String::as_str) {
         Some("MET_FLOAT") => raw
             .as_chunks::<4>()
             .0
@@ -307,6 +307,16 @@ pub fn read_mhd(path: &Path) -> Result<([usize; 3], Vec<f64>), String> {
             .collect(),
         other => return Err(format!("{path:?}: ElementType {other:?}")),
     };
+    let cells = dims
+        .iter()
+        .try_fold(1usize, |acc, &d| acc.checked_mul(d))
+        .ok_or_else(|| format!("{path:?}: DimSize overflow"))?;
+    if data.len() < cells {
+        return Err(format!(
+            "{raw_path:?}: truncated — {cells} voxels expected, {} present",
+            data.len()
+        ));
+    }
     Ok(([dims[0], dims[1], dims[2]], data))
 }
 
