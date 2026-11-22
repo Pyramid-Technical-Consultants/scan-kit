@@ -65,6 +65,9 @@ pub fn lateral_sigmas(vol: &[f32], nz: usize, ny: usize, nx: usize, depths: &[f6
     depths
         .iter()
         .map(|d| {
+            if !d.is_finite() || nz == 0 {
+                return f64::NAN;
+            }
             let i = (*d as usize).min(nz - 1);
             let z = nz - 1 - i; // surface first
             let profile: Vec<f64> = (0..nx)

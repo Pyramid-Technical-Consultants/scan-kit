@@ -1186,7 +1186,12 @@ fn records(
         }
     }
     if fraction != "Plan" {
-        let chosen = fraction.parse::<usize>().unwrap_or(1).saturating_sub(1);
+        let chosen = fraction
+            .parse::<usize>()
+            .ok()
+            .and_then(|number| number.checked_sub(1))
+            .filter(|index| *index < groups.len())
+            .ok_or_else(|| format!("fraction {fraction} is not a delivered fraction"))?;
         for hit in groups.get(chosen).into_iter().flatten() {
             let delivery = &deliveries[*hit];
             if beam_filter.is_some_and(|chosen| chosen != delivery.matched.beam) {
@@ -1225,7 +1230,7 @@ fn push_spot(
 ) -> Result<(), String> {
     let record = spot_record_bdl(energy, x, y, beam as f32, wet, distance, bdl)?;
     spots.extend_from_slice(&record);
-    protons.push(mu * protons_per_mu_bdl(energy, bdl));
+    protons.push(mu * protons_per_mu_bdl(energy, bdl)?);
     Ok(())
 }
 

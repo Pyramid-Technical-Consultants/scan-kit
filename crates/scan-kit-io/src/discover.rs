@@ -446,7 +446,8 @@ fn is_unpacked_session(folder: &Path) -> bool {
 /// It does not fall back to the library, which would read every other session.
 pub fn session_directory(library: &Path, session_id: &str) -> PathBuf {
     if !valid_session_id(session_id) {
-        return library.to_path_buf();
+        // Never resolve: the library root would read every other session.
+        return library.join("\0invalid");
     }
     let flat = library.join(session_id);
     // A junction at `flat` escapes the library — its leaf metadata is fine, so
@@ -1021,8 +1022,13 @@ mod tests {
         assert_eq!(found.entries.len(), 1);
         assert_eq!(found.entries[0].session_id, "bundle");
         assert!(crate::location::session_storage_paths(&root.to_string_lossy(), "..").is_err());
-        assert_eq!(session_directory(&root, ".."), root);
-        assert_eq!(session_directory(&root, "."), root);
+        // Invalid ids must never resolve to the library root — that would
+        // read every other session.
+        for id in ["..", ".", "a/b", "a\\b"] {
+            let dir = session_directory(&root, id);
+            assert_ne!(dir, root);
+            assert!(!dir.starts_with(&root) || !dir.is_dir());
+        }
         let _ = fs::remove_dir_all(&root);
     }
 

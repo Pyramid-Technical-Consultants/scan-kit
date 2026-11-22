@@ -48,6 +48,14 @@ pub fn compile_shader() -> Result<(), String> {
 
 /// Add one to each element of a storage buffer and read it back.
 pub async fn round_trip_add_one(input: &[f32]) -> Result<Vec<f32>, ComputeError> {
+    // One thread per element — past 65535 workgroups the dispatch fails
+    // validation (a panic), and a zero-size buffer is invalid as well.
+    if input.is_empty() || input.len() > 65535 * 64 {
+        return Err(ComputeError::Message(format!(
+            "input length {} is out of dispatch range",
+            input.len()
+        )));
+    }
     let (device, queue) = request_device().await?;
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("round-trip"),
@@ -187,6 +195,21 @@ mod tests {
             Ok(values) => assert_eq!(values, vec![2.0, 3.0, 4.0, 5.0]),
             Err(ComputeError::NoAdapter) => {}
             Err(error) => panic!("{error}"),
+        }
+    }
+
+    #[test]
+    fn an_oversized_or_empty_dispatch_errors_before_the_device() {
+        // Past 65535 workgroups the dispatch fails validation — an Err must
+        // come back, not a device-side panic, and it must hold with no GPU.
+        let input = vec![0.0f32; 65535 * 64 + 1];
+        match block_on(round_trip_add_one(&input)) {
+            Err(ComputeError::Message(err)) => assert!(err.contains("dispatch"), "{err}"),
+            _ => panic!("an oversized dispatch must fail fast"),
+        }
+        match block_on(round_trip_add_one(&[])) {
+            Err(ComputeError::Message(_)) => {}
+            _ => panic!("an empty dispatch must fail fast"),
         }
     }
 }

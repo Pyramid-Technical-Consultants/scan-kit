@@ -3789,9 +3789,15 @@ impl Plot {
                 }
                 pass.set_pipeline(&gpu.line_pipeline);
                 pass.set_bind_group(0, &self.uniform_groups[index], &[offset]);
+                // An unadopted reuse_lines payload carries ranges past the
+                // suffix buffer — clamp instead of tripping vertex-range
+                // validation (an uncaptured error, a panic on native).
+                let line_records = marks.lines.size() / LINE_STRIDE;
                 for (start, count) in &line_draws[cell.panel] {
-                    pass.set_vertex_buffer(0, marks.lines.slice(u64::from(*start) * LINE_STRIDE..));
-                    pass.draw(0..6, 0..*count);
+                    let start = u64::from(*start).min(line_records);
+                    let count = u64::from(*count).min(line_records - start);
+                    pass.set_vertex_buffer(0, marks.lines.slice(start * LINE_STRIDE..));
+                    pass.draw(0..6, 0..count as u32);
                 }
                 let (line_at, line_count) = cloud_line_span[cell.panel];
                 if let (true, Some(buffer)) = (line_count > 0, self.cloud_lines.as_ref()) {
@@ -4101,6 +4107,18 @@ impl Plot {
                 ],
             )
         };
+        // integral_planes is quadratic in the ORIGINAL shape (the pooled
+        // downsample above doesn't shrink it) — check the 2D limit before
+        // allocating the plane image, not after inside upload_r32_2d.
+        {
+            let [nx, ny, nz] = grid.volume.shape;
+            let limit = gpu.device.limits().max_texture_dimension_2d as usize;
+            if nx.max(ny) > limit || ny + nz + nz > limit {
+                return Err(GpuError::Message(
+                    "the integral plane layout exceeds the 2D texture limit".into(),
+                ));
+            }
+        }
         let (planes, plane_w, plane_h) = integral_planes(grid);
         let integral_tex = upload_r32_2d(&gpu.device, &gpu.queue, &planes, plane_w, plane_h)?;
         let group = volume_group(
@@ -5573,7 +5591,9 @@ fn heatmap_bytes(
     }
     let cols_n = cols as usize;
     let rows_n = rows as usize;
-    if cols_n == 0 || rows_n == 0 {
+    // The decoder enforces the same 4096 bound — the build path needs it
+    // too, or cols*rows*4 overflows usize before the allocation even runs.
+    if cols_n == 0 || rows_n == 0 || cols_n > 4096 || rows_n > 4096 {
         return Vec::new();
     }
     let mut pixels = vec![0u8; cols_n * rows_n * 4];
@@ -9013,9 +9033,15 @@ fn read_buffer(
             return Err(GpuError::Message("GPU readback timed out".into()));
         }
     }
-    let mapped = slice
-        .get_mapped_range()
-        .map_err(|err| GpuError::Message(err.to_string()))?;
+    // readback is a persistent stage buffer — an error without unmap leaves
+    // it pending-mapped and every later frame fails map_async forever.
+    let mapped = match slice.get_mapped_range() {
+        Ok(mapped) => mapped,
+        Err(err) => {
+            readback.unmap();
+            return Err(GpuError::Message(err.to_string()));
+        }
+    };
     let mut frame = Vec::with_capacity((width * height * 4) as usize);
     for row in 0..height {
         let start = (row * padded) as usize;
@@ -12685,5 +12711,14 @@ mod tests {
             [1.0, 1.0]
         ));
         assert!(point_in_triangle(v, [0.0, 0.0], [20.0, 0.0], [0.0, 20.0]));
+    }
+
+    #[test]
+    fn a_heatmap_beyond_the_decoder_bound_is_dropped() {
+        // cols*rows*4 used to allocate before the 4096 check the decoder
+        // enforces — the build path must reject oversized planes first.
+        assert!(heatmap_bytes(&[1.0], 5000, 1, 0, [1.0; 4], 0.0, 2.0).is_empty());
+        assert!(heatmap_bytes(&[1.0], 1, 5000, 0, [1.0; 4], 0.0, 2.0).is_empty());
+        assert!(!heatmap_bytes(&[1.0], 1, 1, 0, [1.0; 4], 0.0, 2.0).is_empty());
     }
 }

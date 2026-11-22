@@ -382,6 +382,10 @@ pub fn record_meta(
     entry: &Discovered,
     meta: Option<&SessionMeta>,
 ) -> Result<(), String> {
+    // The UPDATE below leaves size/mtime_ns alone: sync_entry stamps them
+    // before hydrate reads any bytes, and restatting now would certify
+    // content the row does not hold — a stored fingerprint newer than the
+    // hydrated bytes pins stale meta instead of re-reading it.
     let fingerprint = discover::storage_fingerprint(&entry.storage_path, &entry.session_id);
     let (mtime_ns, size) = match fingerprint {
         Some((mtime, size)) => (Some(mtime), Some(size)),
@@ -398,8 +402,6 @@ pub fn record_meta(
          ON CONFLICT(library_id, session_id) DO UPDATE SET
             storage_path = excluded.storage_path,
             kind = excluded.kind,
-            size = excluded.size,
-            mtime_ns = excluded.mtime_ns,
             date = excluded.date,
             primary_mu = excluded.primary_mu,
             treatment_time_s = excluded.treatment_time_s,

@@ -1424,6 +1424,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "diagnostic: needs test_data/logs, which is not committed"]
     fn modern_sessions_draw_a_millimetre_distribution() {
         let root =
             std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../test_data/logs");

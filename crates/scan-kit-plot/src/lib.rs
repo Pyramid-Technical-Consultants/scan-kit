@@ -60,7 +60,7 @@ pub async fn request_device() -> Result<(wgpu::Device, wgpu::Queue), GpuError> {
 fn native_gpu() -> Result<&'static render::PlotGpu, GpuError> {
     static GPU: std::sync::OnceLock<Option<render::PlotGpu>> = std::sync::OnceLock::new();
     GPU.get_or_init(|| {
-        let (device, queue) = block_on(request_device()).ok()?;
+        let (device, queue) = block_on(request_device()).and_then(|result| result.ok())?;
         render::PlotGpu::new(device, queue, wgpu::TextureFormat::Rgba8Unorm).ok()
     })
     .as_ref()
@@ -68,10 +68,14 @@ fn native_gpu() -> Result<&'static render::PlotGpu, GpuError> {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn block_on<T>(future: impl std::future::Future<Output = T>) -> T {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("tokio runtime")
-        .block_on(future)
+fn block_on<T>(future: impl std::future::Future<Output = T>) -> Option<T> {
+    // A failed runtime build (fd exhaustion) must degrade to the CPU
+    // fallback, not panic inside get_or_init.
+    Some(
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .ok()?
+            .block_on(future),
+    )
 }

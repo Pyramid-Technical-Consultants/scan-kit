@@ -633,6 +633,15 @@ async fn prepare(launch: Launch) -> Result<Live, ComputeError> {
     let shape = [nx.max(1), ny.max(1), nz.max(1)];
     let nvox = shape[0].saturating_mul(shape[1]).saturating_mul(shape[2]);
     let gpu = shared_gpu().await?;
+    // The LET buffer binds nvox*16 bytes — a grid whose largest buffer beats
+    // the storage binding limit fails create_buffer validation as a panic,
+    // so bound it here where the failure is a clean ComputeError.
+    let binding_cap = gpu.device.limits().max_storage_buffer_binding_size as usize;
+    if nvox > binding_cap / 16 {
+        return Err(ComputeError::Message(format!(
+            "voxel grid {nx}x{ny}x{nz} is too large for this GPU"
+        )));
+    }
     let device = gpu.device.clone();
     let queue = gpu.queue.clone();
     let transport_layout = gpu.transport_layout.clone();
@@ -1480,7 +1489,7 @@ mod tests {
         let nvox = shape[0] * shape[1] * shape[2];
         let request = PatientRequest {
             spots: spot.to_vec(),
-            protons: vec![scan_kit_io::protons_per_mu(100.0)],
+            protons: vec![scan_kit_io::protons_per_mu(100.0).expect("protons")],
             beams: beam.to_vec(),
             material: vec![0; nvox],
             density: vec![1.0; nvox],

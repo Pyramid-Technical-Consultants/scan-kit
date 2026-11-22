@@ -13,7 +13,10 @@ struct Grid { origin: vec3<f32>, spacing: vec3<f32>, size: vec3<u32> }
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     if (id.x >= arrayLength(&spots)) { return; }
     let spot = spots[id.x];
-    let reach = u32(ceil(3.0 * spot.sigma / grid.spacing.x));
+    if (!(spot.sigma > 0.0)) { return; }
+    // sigma=inf or spacing=0 would saturate u32() and wrap reach*2 into a
+    // ~4e9-iteration loop; the splat never needs a 64-voxel reach anyway.
+    let reach = min(u32(ceil(3.0 * spot.sigma / grid.spacing.x)), 64u);
     let center = vec3<i32>(vec3<f32>(
         (spot.x - grid.origin.x) / grid.spacing.x,
         (spot.y - grid.origin.y) / grid.spacing.y,
@@ -66,7 +69,7 @@ const GAMMA: &str = r#"
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let i = id.x;
-    if (i >= arrayLength(&reference)) { return; }
+    if (i >= arrayLength(&reference) || i >= arrayLength(&evaluated) || i >= arrayLength(&gamma)) { return; }
     let dose_delta = (evaluated[i] - reference[i]) / max(reference[i], 1e-6);
     gamma[i] = abs(dose_delta);
 }
@@ -79,7 +82,7 @@ const DVH: &str = r#"
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let i = id.x;
-    if (i >= arrayLength(&dose)) { return; }
+    if (i >= arrayLength(&dose) || arrayLength(&hist) == 0u) { return; }
     let bin = min(u32(max(dose[i], 0.0) * 10.0), arrayLength(&hist) - 1u);
     atomicAdd(&hist[bin], 1u);
 }
@@ -94,6 +97,8 @@ struct Shape { src: vec3<u32>, dst: vec3<u32> }
 @compute @workgroup_size(4, 4, 4)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     if (id.x >= shape.dst.x || id.y >= shape.dst.y || id.z >= shape.dst.z) { return; }
+    // src.{x,y,z}-1u wraps on a zero source dim — reject before the sub.
+    if (shape.src.x == 0u || shape.src.y == 0u || shape.src.z == 0u) { return; }
     let sx = min(id.x * shape.src.x / max(shape.dst.x, 1u), shape.src.x - 1u);
     let sy = min(id.y * shape.src.y / max(shape.dst.y, 1u), shape.src.y - 1u);
     let sz = min(id.z * shape.src.z / max(shape.dst.z, 1u), shape.src.z - 1u);
