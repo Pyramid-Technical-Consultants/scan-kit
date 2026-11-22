@@ -5297,11 +5297,14 @@ fn next_cell(line: &str, start: usize) -> Option<(usize, usize, usize)> {
 
 fn cell_owned(line: &str, start: usize, end: usize) -> String {
     let cell = &line[start..end];
-    if cell.as_bytes().first() == Some(&b'"') {
+    // Only headers reach this reader — match clean_header's BOM/trim so an
+    // Excel-saved CSV still lands its first column.
+    let owned = if cell.as_bytes().first() == Some(&b'"') {
         strip_quotes(cell)
     } else {
         cell.to_string()
-    }
+    };
+    owned.trim_start_matches('\u{feff}').trim().to_owned()
 }
 
 /// Drop the surrounding quotes and keep a doubled quote as one quote.
@@ -5512,6 +5515,13 @@ pub(crate) fn parse_datetime(text: &str) -> Option<f64> {
         return None;
     }
     let (date, time) = text.split_once(['T', ' ']).unwrap_or((text, "00:00:00"));
+    // A tz suffix ("Z", "+02:00", "-05:00") reads as naive local — without
+    // the strip it corrupts the seconds field to 0.
+    let time = time
+        .split(['Z', 'z', '+', '-'])
+        .next()
+        .unwrap_or(time)
+        .trim();
     let mut date_parts = date.split('-');
     let year: i32 = date_parts.next()?.parse().ok()?;
     let month: u32 = date_parts.next()?.parse().ok()?;
@@ -5565,6 +5575,28 @@ mod tests {
     fn civil_1970_is_unix_zero() {
         assert_eq!(days_from_civil(1970, 1, 1), Some(0));
         assert!(parse_datetime("1970-01-01 00:00:00").unwrap().abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_tz_suffixed_datetime_keeps_its_seconds() {
+        // Without the strip the suffix corrupts the seconds field to 0.
+        let naive = parse_datetime("2024-03-01 10:20:30").unwrap();
+        assert_eq!(parse_datetime("2024-03-01T10:20:30Z").unwrap(), naive);
+        assert_eq!(parse_datetime("2024-03-01T10:20:30+02:00").unwrap(), naive);
+        assert_eq!(parse_datetime("2024-03-01T10:20:30-05:00").unwrap(), naive);
+        let expect = days_from_civil(2024, 3, 1).unwrap() as f64 * 86400.0
+            + 10.0 * 3600.0
+            + 20.0 * 60.0
+            + 30.0;
+        assert!((naive - expect).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_bom_header_still_names_its_first_column() {
+        let (names, _, _) = header_schema("\u{feff}spot_no,energy\n", &|_| true);
+        assert_eq!(names[0].as_deref(), Some("spot_no"));
+        let (names, _, _) = header_schema(" spot_no ,energy\n", &|_| true);
+        assert_eq!(names[0].as_deref(), Some("spot_no"));
     }
     #[test]
     fn first_spot_in_a_layer_keeps_its_timestamp() {

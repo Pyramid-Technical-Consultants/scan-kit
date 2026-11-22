@@ -296,13 +296,28 @@ impl Reducer {
             .map_async(wgpu::MapMode::Read, move |result| {
                 let _ = sender.send(result);
             });
-        self.device
-            .poll(wgpu::PollType::wait_indefinitely())
-            .map_err(|err| err.to_string())?;
-        receiver
-            .recv()
-            .map_err(|err| err.to_string())?
-            .map_err(|err| err.to_string())?;
+        // Same bound as mc's collect_read — a wedged driver must not hang.
+        let started = std::time::Instant::now();
+        loop {
+            match self.device.poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: Some(std::time::Duration::from_millis(50)),
+            }) {
+                Ok(_) | Err(wgpu::PollError::Timeout) => {}
+                Err(err) => return Err(err.to_string()),
+            }
+            match receiver.try_recv() {
+                Ok(result) => {
+                    result.map_err(|err| err.to_string())?;
+                    break;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(err) => return Err(err.to_string()),
+            }
+            if started.elapsed() > std::time::Duration::from_secs(30) {
+                return Err("GPU readback timed out".into());
+            }
+        }
         let mapped = job
             .staging
             .slice(..)

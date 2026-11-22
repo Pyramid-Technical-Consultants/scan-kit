@@ -183,7 +183,9 @@ export function ConfigTuning({
   const tones = useMemo(() => toneColors(), []);
   useEffect(() => {
     dirtyRef.current = dirty;
-    busyRef.current = busy;
+    // `opening` counts too — an in-flight loadFile clobbers the form when it
+    // resolves, so edits made during the load would be silently discarded.
+    busyRef.current = busy || opening;
   });
   const sessionKey = selectedIds.join("|");
   const workflow = catalog?.workflows.find((item) => item.id === workflowId) ?? catalog?.workflows[0];

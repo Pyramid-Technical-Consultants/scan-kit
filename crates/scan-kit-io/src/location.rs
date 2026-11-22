@@ -35,6 +35,10 @@ pub(crate) enum Scheme {
 #[derive(Clone)]
 pub(crate) struct Remote {
     pub canonical: String,
+    /// Wire-only query (e.g. a presigned-URL signature). It stays out of
+    /// `canonical` so nothing persisted or echoed carries a live credential;
+    /// `connect` reattaches it via `request_url`/`query_of`.
+    pub query: String,
     pub scheme: Scheme,
     pub username: String,
     pub password: Option<String>,
@@ -48,6 +52,7 @@ impl std::fmt::Debug for Remote {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Remote")
             .field("canonical", &self.canonical)
+            .field("query", &if self.query.is_empty() { "" } else { "…" })
             .field("scheme", &self.scheme)
             .field("username", &self.username)
             .field("password", &self.password.as_ref().map(|_| "…"))
@@ -135,7 +140,10 @@ pub(crate) fn open_root(spec: &str) -> Result<(String, Opened), String> {
     }
 }
 
-pub(crate) fn discover_remote(canonical: &str) -> Result<Found, String> {
+pub(crate) fn discover_remote(
+    canonical: &str,
+    keep: &mut dyn FnMut(u64, u64) -> bool,
+) -> Result<Found, String> {
     let remote = require_remote(canonical)?;
     if matches!(remote.scheme, Scheme::Http | Scheme::Https) {
         return http_archive(&remote);
@@ -178,6 +186,7 @@ pub(crate) fn discover_remote(canonical: &str) -> Result<Found, String> {
             &mut archives,
             &mut exams,
             &mut walk_failed,
+            keep,
         )?;
     }
     discover::add_archives(&mut entries, &mut skipped, archives);
@@ -492,7 +501,11 @@ fn walk_remote(
     archives: &mut Vec<(Discovered, String)>,
     exams: &mut Vec<discover::ExamHit>,
     walk_failed: &mut bool,
+    keep: &mut dyn FnMut(u64, u64) -> bool,
 ) -> Result<(), String> {
+    if !keep(0, 0) {
+        return Err("cancelled".into());
+    }
     if depth >= NEST_DEPTH {
         return Ok(());
     }
@@ -599,6 +612,7 @@ fn walk_remote(
             archives,
             exams,
             walk_failed,
+            keep,
         )?;
     }
     Ok(())
@@ -787,17 +801,19 @@ fn parse_remote(scheme: Scheme, rest: &str) -> Result<Remote, String> {
         Some(index) => (Some(&authority[..index]), &authority[index + 1..]),
         None => (None, authority),
     };
+    // Split on the raw ':' first — decoding first lets an encoded ':' in
+    // the username slide the password boundary.
     let (username, password) = match userinfo {
-        Some(info) => {
-            let info = percent_decode(info);
-            match info.split_once(':') {
-                Some((user, password)) => (user.to_owned(), Some(password.to_owned())),
-                None => (info, None),
-            }
-        }
+        Some(info) => match info.split_once(':') {
+            Some((user, password)) => (percent_decode(user), Some(percent_decode(password))),
+            None => (percent_decode(info), None),
+        },
         None => (String::new(), None),
     };
     let (host, port) = split_host_port(hostport)?;
+    // An explicit default port is the same server — normalize so the
+    // canonical and host keys match the unadorned spelling.
+    let port = port.filter(|port| Some(*port) != default_port(scheme));
     if host.is_empty() {
         return Err("the URL needs a host".into());
     }
@@ -823,6 +839,7 @@ fn parse_remote(scheme: Scheme, rest: &str) -> Result<Remote, String> {
     }
     let mut remote = Remote {
         canonical: String::new(),
+        query: query.to_owned(),
         scheme,
         username,
         password,
@@ -830,11 +847,19 @@ fn parse_remote(scheme: Scheme, rest: &str) -> Result<Remote, String> {
         port,
         path,
     };
-    remote.canonical = canonical_url(&remote, query);
+    remote.canonical = canonical_url(&remote);
+    if remote.query.is_empty() {
+        // A persisted spec lost the query (it never carries one) — recover
+        // the wire token the library root stored for this path or an
+        // ancestor.
+        remote.query = query_of(&remote);
+    } else {
+        store_query(&remote);
+    }
     Ok(remote)
 }
 
-fn canonical_url(remote: &Remote, query: &str) -> String {
+fn canonical_url(remote: &Remote) -> String {
     let mut url = format!(
         "{}://{}{}{}",
         scheme_name(remote.scheme),
@@ -843,11 +868,27 @@ fn canonical_url(remote: &Remote, query: &str) -> String {
         port_text(remote.port)
     );
     url.push_str(&encode_path(&remote.path));
-    if !query.is_empty() {
-        url.push('?');
-        url.push_str(query);
-    }
     url
+}
+
+/// The URL requests go to: canonical plus the wire-only query.
+pub(crate) fn request_url(remote: &Remote) -> String {
+    if remote.query.is_empty() {
+        remote.canonical.clone()
+    } else {
+        format!("{}?{}", remote.canonical, remote.query)
+    }
+}
+
+fn default_port(scheme: Scheme) -> Option<u16> {
+    Some(match scheme {
+        Scheme::Sftp => 22,
+        Scheme::Ftp => 21,
+        Scheme::Ftps => 990,
+        Scheme::Smb => 445,
+        Scheme::Http => 80,
+        Scheme::Https => 443,
+    })
 }
 
 fn scheme_name(scheme: Scheme) -> &'static str {
@@ -1036,6 +1077,34 @@ fn hex_sha256(text: &str) -> String {
 
 pub(crate) fn auth_error(detail: &str) -> String {
     format!("{AUTH_REQUIRED}: {detail}")
+}
+
+fn queries() -> &'static Mutex<HashMap<String, String>> {
+    static QUERIES: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+    QUERIES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// A session spec under a queried root inherits the root's wire query,
+/// the same way `password_of` inherits the host credential.
+fn query_of(remote: &Remote) -> String {
+    let map = queries().lock().unwrap_or_else(|err| err.into_inner());
+    if let Some(query) = map.get(&remote.canonical) {
+        return query.clone();
+    }
+    // Longest ancestor wins — HashMap order is arbitrary, and a nested
+    // stored root must not lose to a shallower one.
+    map.iter()
+        .filter(|(key, _)| remote.canonical.starts_with(&format!("{key}/")))
+        .max_by_key(|(key, _)| key.len())
+        .map(|(_, query)| query.clone())
+        .unwrap_or_default()
+}
+
+fn store_query(remote: &Remote) {
+    queries()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .insert(remote.canonical.clone(), remote.query.clone());
 }
 
 fn passwords() -> &'static Mutex<HashMap<String, String>> {
@@ -1476,6 +1545,60 @@ mod tests {
         assert_eq!(catalog_directory(&lib_b, "s · p"), Some(lib_b.join("s")));
         replace_catalog(&[]);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_url_query_stays_off_the_canonical_but_reaches_the_wire() {
+        // A presigned-URL signature is a live credential — it must not land
+        // in the persisted canonical, prefs, or session storage paths.
+        let canonical = canonical_root("https://u:p@files.example/dose.zip?sig=abc&exp=9").unwrap();
+        assert_eq!(canonical, "https://u@files.example/dose.zip");
+        assert!(!canonical.contains("sig"));
+        // The wire form reattaches the query for the same spec — and for a
+        // session URL parked under the root — through the in-memory map.
+        let remote = match classify(&canonical).unwrap() {
+            Kind::Remote(remote) => remote,
+            Kind::Local(_) => panic!("https is remote"),
+        };
+        assert_eq!(
+            request_url(&remote),
+            "https://u@files.example/dose.zip?sig=abc&exp=9"
+        );
+        let child = match classify(&format!("{canonical}/nested")).unwrap() {
+            Kind::Remote(remote) => remote,
+            Kind::Local(_) => panic!("https is remote"),
+        };
+        assert_eq!(
+            request_url(&child),
+            "https://u@files.example/dose.zip/nested?sig=abc&exp=9"
+        );
+    }
+
+    #[test]
+    fn a_default_port_is_normalized_out_of_the_canonical() {
+        assert_eq!(
+            canonical_root("sftp://u@h.example:22/data").unwrap(),
+            "sftp://u@h.example/data"
+        );
+        assert_eq!(
+            canonical_root("https://files.example:443/dose.zip").unwrap(),
+            "https://files.example/dose.zip"
+        );
+        // A non-default port stays.
+        assert_eq!(
+            canonical_root("sftp://u@h.example:2222/data").unwrap(),
+            "sftp://u@h.example:2222/data"
+        );
+    }
+
+    #[test]
+    fn an_encoded_colon_stays_inside_the_username() {
+        let remote = match classify("sftp://u%3Ax:pw@h.example/data").unwrap() {
+            Kind::Remote(remote) => remote,
+            Kind::Local(_) => panic!("sftp is remote"),
+        };
+        assert_eq!(remote.username, "u:x");
+        assert_eq!(remote.password.as_deref(), Some("pw"));
     }
 
     #[test]

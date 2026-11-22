@@ -326,7 +326,7 @@ mod net {
             Scheme::Ftp => Ok(Box::new(FtpFs::connect(remote, password, false)?)),
             Scheme::Ftps => Ok(Box::new(FtpFs::connect(remote, password, true)?)),
             Scheme::Http | Scheme::Https => Ok(Box::new(HttpFs {
-                url: remote.canonical.clone(),
+                url: location::request_url(remote),
                 username: remote.username.clone(),
                 password: password.to_owned(),
             })),
@@ -1234,6 +1234,7 @@ mod tests {
     ) -> crate::location::Remote {
         crate::location::Remote {
             canonical: canonical.to_owned(),
+            query: String::new(),
             scheme,
             username: String::new(),
             password: None,

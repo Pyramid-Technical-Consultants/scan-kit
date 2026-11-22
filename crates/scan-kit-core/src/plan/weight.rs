@@ -152,9 +152,14 @@ impl Rng {
 
 pub(super) fn mix_seed(n: usize, a: f64, b: f64) -> u64 {
     let bits = a.to_bits() ^ b.to_bits().rotate_left(17) ^ (n as u64).wrapping_mul(0x9E37_79B9);
+    // SystemTime::now panics on wasm32 — a constant tick keeps the mixer
+    // deterministic there rather than crashing the caller.
+    #[cfg(not(target_arch = "wasm32"))]
     let tick = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_nanos() as u64)
         .unwrap_or(1);
+    #[cfg(target_arch = "wasm32")]
+    let tick = 1u64;
     bits ^ tick
 }

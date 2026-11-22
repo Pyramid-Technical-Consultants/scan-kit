@@ -50,10 +50,13 @@ pub(crate) struct Found {
     pub walk_failed: bool,
 }
 
-pub(crate) fn discover(root: &Path) -> Result<Found, String> {
+pub(crate) fn discover(
+    root: &Path,
+    keep: &mut dyn FnMut(u64, u64) -> bool,
+) -> Result<Found, String> {
     let text = root.to_string_lossy();
     if crate::location::is_remote_location(&text) {
-        return crate::location::discover_remote(&text);
+        return crate::location::discover_remote(&text, keep);
     }
     let mut entries = Vec::new();
     let mut skipped = Vec::new();
@@ -947,7 +950,7 @@ mod tests {
         fs::create_dir_all(&miss).unwrap();
         fs::write(miss.join("input_map.csv"), b"energy\n1\n").unwrap();
 
-        let ids = discover(&root)
+        let ids = discover(&root, &mut |_, _| true)
             .unwrap()
             .entries
             .into_iter()
@@ -982,7 +985,7 @@ mod tests {
         )
         .unwrap();
 
-        let found = discover(&root).unwrap();
+        let found = discover(&root, &mut |_, _| true).unwrap();
         assert_eq!(found.entries.len(), 1);
         let entry = &found.entries[0];
         assert_eq!(entry.session_id, "2131261153");
@@ -1014,7 +1017,7 @@ mod tests {
         )
         .unwrap();
 
-        let found = discover(&root).unwrap();
+        let found = discover(&root, &mut |_, _| true).unwrap();
         assert_eq!(found.entries.len(), 1);
         assert_eq!(found.entries[0].session_id, "bundle");
         assert!(crate::location::session_storage_paths(&root.to_string_lossy(), "..").is_err());

@@ -1,6 +1,6 @@
 import { createElement, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { open } from "@tauri-apps/plugin-dialog";
+import { open, save } from "@tauri-apps/plugin-dialog";
 import { ArrowLeft } from "lucide-react";
 import {
   DataEditor,
@@ -1489,7 +1489,7 @@ export function AnalysisView({
             variant="outline"
             disabled={exportBusy}
             onClick={() => {
-              void open({
+              void save({
                 defaultPath: "qa.pdf",
                 filters: [{ name: "PDF report", extensions: ["pdf"] }],
               }).then((selected) => {
@@ -1509,7 +1509,7 @@ export function AnalysisView({
             variant="outline"
             disabled={exportBusy}
             onClick={() => {
-              void open({
+              void save({
                 defaultPath: "dose.dcm",
                 filters: [{ name: "DICOM dose", extensions: ["dcm"] }],
               }).then((selected) => {

@@ -17,8 +17,8 @@ use scan_kit_core::{ray_rgba, RayView};
 #[derive(Clone, Debug)]
 pub struct DoseGrid {
     pub volume: Arc<Volume>,
-    pub ct: Vec<f32>,
-    pub labels: Vec<u8>,
+    pub ct: Arc<Vec<f32>>,
+    pub labels: Arc<Vec<u8>>,
     pub peak: f32,
     /// Max |dose|. Slice texels store `0.5 + 0.5 * dose/span`, so a difference keeps its sign.
     pub span: f32,
@@ -38,13 +38,13 @@ pub struct DoseGrid {
     pub filter: u8,
     pub atlas_shape: [usize; 3],
     /// Dilated max-|dose| bricks. A zero is safe to leap in the 3D march.
-    pub bricks: Vec<f32>,
+    pub bricks: Arc<Vec<f32>>,
     pub brick_shape: [usize; 3],
     /// Brightest axis-aligned line integral, dose × mm.
     pub line_scale: f32,
     pub peak_at: [usize; 3],
     /// Axial, coronal, and sagittal integrals in dose × mm.
-    pub integrals: [Vec<f32>; 3],
+    pub integrals: Arc<[Vec<f32>; 3]>,
     pub integral_peaks: [f32; 3],
     /// Degrees about +X. Zero keeps the lattice box.
     pub gantry: f32,
@@ -127,26 +127,26 @@ pub fn grid_from(
     Some(DoseGrid {
         atlas_shape: fit_shape(shape_us),
         volume: Arc::new(volume),
-        bricks: scan.bricks,
+        bricks: Arc::new(scan.bricks),
         brick_shape: scan.brick_shape,
         line_scale: scan.line_scale,
         peak_at: scan.peak_at,
-        integrals: scan.integrals,
+        integrals: Arc::new(scan.integrals),
         integral_peaks: scan.integral_peaks,
-        ct: if ct.len() >= n {
+        ct: Arc::new(if ct.len() >= n {
             let mut ct = ct;
             ct.truncate(n);
             ct
         } else {
             Vec::new()
-        },
-        labels: if labels.len() >= n {
+        }),
+        labels: Arc::new(if labels.len() >= n {
             let mut labels = labels;
             labels.truncate(n);
             labels
         } else {
             Vec::new()
-        },
+        }),
         peak: scan.peak.max(1e-6),
         span,
         ramp,
@@ -548,7 +548,7 @@ fn shade_ray(grid: &DoseGrid, view: &ViewSample, uv: [f32; 2]) -> [f32; 4] {
     let (lo, hi) = window(grid);
     ray_rgba(
         &grid.volume,
-        &grid.bricks,
+        grid.bricks.as_slice(),
         grid.brick_shape,
         RayView {
             azimuth: view.azimuth,
@@ -969,7 +969,7 @@ mod tests {
         gamma.unit = "γ".into();
         remember_window(&mut gamma, 0.0, 2.0);
         (gamma.lo, gamma.hi) = (0.0, 2.0);
-        gamma.integrals[0] = vec![0.5, 1.5, 3.0];
+        gamma.integrals = Arc::new([vec![0.5, 1.5, 3.0], Vec::new(), Vec::new()]);
         assert_eq!(
             integral_limits(&gamma, 0),
             (0.0, 2.0),
