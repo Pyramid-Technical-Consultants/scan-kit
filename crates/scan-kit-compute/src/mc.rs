@@ -228,6 +228,9 @@ impl McRun {
                 Poll::Ready(result)
             }
             Ok(Slice::Cancelled) => Poll::Cancelled,
+            // A cancel landing inside finish()'s read aborts it — same
+            // treatment the drain arm gives the identical error.
+            Err(_) if cancel.is_cancelled() => Poll::Cancelled,
             Err(err) => Poll::Failed(err.to_string()),
         }
     }
@@ -424,11 +427,24 @@ fn patient_launch(request: &PatientRequest) -> Result<Launch, ComputeError> {
     for row in 0..rows {
         let weight = request.protons.get(row).copied().unwrap_or(0.0);
         if weight.is_finite() && weight > 0.0 {
-            let beam = request.spots[row * 40 + 6];
-            if !beam.is_finite() || beam < 0.0 || beam as usize >= request.beams.len() / 16 {
+            let record = &request.spots[row * 40..(row + 1) * 40];
+            if !record.iter().all(|value| value.is_finite()) {
+                return Err(ComputeError::Message(
+                    "spot record holds a non-finite field".into(),
+                ));
+            }
+            let beam = record[6];
+            if beam < 0.0 || beam as usize >= request.beams.len() / 16 {
                 return Err(ComputeError::Message("spot beam index out of range".into()));
             }
-            kept_spots.extend_from_slice(&request.spots[row * 40..(row + 1) * 40]);
+            // spots[32..35] = range shifter (lo, material, rho); a shifted
+            // spot's material indexes mc_tables().media like slab_launch's.
+            if record[32] > 0.0 && !(0.0..media as f32).contains(&record[34]) {
+                return Err(ComputeError::Message(
+                    "spot range-shifter material out of range".into(),
+                ));
+            }
+            kept_spots.extend_from_slice(record);
             weights.push(f64::from(weight));
         }
     }
@@ -706,7 +722,24 @@ impl Live {
     /// The original one-shot loop: every history, then the store fold.
     fn drain(&mut self, cancel: &Cancel) -> Result<McResult, ComputeError> {
         let _kept = self.kept.len();
-        self.submit_until(self.histories, Some(cancel));
+        // Pace like step() does: queueing every history at once puts the
+        // finish read behind the whole run, and collect_read's bound then
+        // fails healthy drains on slower GPUs.
+        while self.next < self.histories {
+            while self.inflight.len() >= MAX_INFLIGHT {
+                self.wait_fence(cancel)?;
+                if cancel.is_cancelled() {
+                    self.inflight.clear();
+                    return Err(ComputeError::Message("cancelled".into()));
+                }
+            }
+            self.submit_until(
+                self.next
+                    .saturating_add(self.chunk.max(1))
+                    .min(self.histories),
+                Some(cancel),
+            );
+        }
         self.finish(cancel)
     }
 
@@ -761,7 +794,12 @@ impl Live {
             // landing certifies all transport retired.
             self.inflight.clear();
             self.pending_read = None;
-            let result = self.finish(cancel)?;
+            let result = match self.finish(cancel) {
+                // A cancel landing mid-read is still a cancel, not a failed
+                // run — the task's cancel flag is the truth.
+                Err(_) if cancel.is_cancelled() => return Ok(Slice::Cancelled),
+                other => other?,
+            };
             self.finished = true;
             return Ok(Slice::Ready(result));
         }
@@ -1666,6 +1704,16 @@ mod tests {
         assert!(patient_launch(&bad).is_err());
         let mut bad = request();
         bad.beams = vec![0.0; 8];
+        assert!(patient_launch(&bad).is_err());
+        // A non-finite field anywhere in the 40-float record fails, not just
+        // the beam index — the shader consumes energy/phase-space fields too.
+        let mut bad = request();
+        bad.spots[20] = f32::INFINITY;
+        assert!(patient_launch(&bad).is_err());
+        // A range-shifter material index past the media table fails.
+        let mut bad = request();
+        bad.spots[32] = 1.0;
+        bad.spots[34] = 99.0;
         assert!(patient_launch(&bad).is_err());
         assert!(patient_launch(&request()).is_ok());
     }
