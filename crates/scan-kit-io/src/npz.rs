@@ -86,6 +86,9 @@ impl Npy {
         if !self.descr.starts_with("<U") {
             return Err(format!("npz strings need <U, got {}", self.descr));
         }
+        if width == 0 {
+            return Err(format!("npz strings need <U1 or wider, got {}", self.descr));
+        }
         let mut out = Vec::with_capacity(n);
         for i in 0..n {
             let bytes = &self.data[i * width..(i + 1) * width];
@@ -148,7 +151,9 @@ pub fn read_npz(bytes: &[u8]) -> Result<BTreeMap<String, Npy>, String> {
         }
         let raw =
             crate::discover::read_capped(&mut file, &name, crate::discover::MAX_MEMBER_BYTES)?;
-        files.insert(name, parse_npy(&raw)?);
+        if files.insert(name.clone(), parse_npy(&raw)?).is_some() {
+            return Err(format!("duplicate npz member {name}"));
+        }
     }
     Ok(files)
 }
@@ -331,8 +336,9 @@ fn itemsize(descr: &str) -> Result<usize, String> {
     if let Some(width) = descr.strip_prefix("<U") {
         return width
             .parse::<usize>()
-            .map(|n| n * 4)
-            .map_err(|err| err.to_string());
+            .ok()
+            .and_then(|n| n.checked_mul(4))
+            .ok_or_else(|| format!("npy itemsize {descr}"));
     }
     match descr {
         "<f8" | "<i8" => Ok(8),
@@ -489,5 +495,15 @@ mod tests {
         assert_eq!(files["dose"].shape.len(), 3);
         assert!(files["dose"].f16s().unwrap().iter().all(|v| v.is_finite()));
         assert_eq!(files["crop"].shape, vec![2, 3]);
+    }
+
+    #[test]
+    fn a_zero_width_unicode_array_errors_instead_of_allocating() {
+        let npy = Npy {
+            descr: "<U0".into(),
+            shape: vec![4_000_000_000],
+            data: Vec::new(),
+        };
+        assert!(npy.strings().is_err());
     }
 }

@@ -486,6 +486,11 @@ mod net {
             let stat = self.stat(path)?.ok_or_else(|| format!("missing {path}"))?;
             if stat.dir {
                 for item in self.list(path)? {
+                    // A hostile or buggy server can return names holding path
+                    // separators — splicing one in deletes outside the tree.
+                    if item.name.contains(['/', '\\']) {
+                        continue;
+                    }
                     self.remove_depth(
                         &format!("{}/{}", path.trim_end_matches('/'), item.name),
                         depth + 1,
@@ -718,6 +723,11 @@ mod net {
             let stat = self.stat(path)?.ok_or_else(|| format!("missing {path}"))?;
             if stat.dir {
                 for item in self.list(path)? {
+                    // A hostile or buggy server can return names holding path
+                    // separators — splicing one in deletes outside the tree.
+                    if item.name.contains(['/', '\\']) {
+                        continue;
+                    }
                     self.remove_depth(
                         &format!("{}/{}", path.trim_end_matches('/'), item.name),
                         depth + 1,

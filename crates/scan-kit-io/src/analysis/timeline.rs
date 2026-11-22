@@ -67,7 +67,9 @@ pub(super) fn timeline(root: &Path, session_ids: &[String], options: &Value) -> 
     } else {
         Vec::new()
     };
-    let show_fft = flag(&options, "fft", false);
+    // Welch needs the 1 ms sample clock; layer rows carry the real layer
+    // clock, so the spectrum is meaningless for layer-grain metrics.
+    let show_fft = flag(&options, "fft", false) && !matches!(grain, crate::tables::Grain::Layer);
     let fft_masks: Vec<Vec<bool>> = if show_fft {
         tables
             .iter()
@@ -91,7 +93,8 @@ pub(super) fn timeline(root: &Path, session_ids: &[String], options: &Value) -> 
                 continue;
             };
             let keep = filter_rows.then(|| masks[table_index].as_slice());
-            let (xs, ys, xspan, yspan) = drawn_trace(samples, keep, window);
+            let clock = table.get("time_s").map(Vec::as_slice);
+            let (xs, ys, xspan, yspan) = drawn_trace(samples, clock, keep, window);
             if let Some((lo, hi)) = yspan {
                 ymin = ymin.min(lo);
                 ymax = ymax.max(hi);
@@ -330,15 +333,17 @@ fn keeps_every_row(segments: &[Segment]) -> bool {
 /// One walk: the stroke, the finite time span inside `window`, and that window's axis.
 pub(super) fn drawn_trace(
     samples: &[f32],
+    clock: Option<&[f32]>,
     keep: Option<&[bool]>,
     window: Option<(f32, f32)>,
 ) -> (Vec<f32>, Vec<f32>, Option<(f32, f32)>, Option<(f32, f32)>) {
     let owned = keep.map(|keep| gated(samples, keep));
-    trace_span(owned.as_deref().unwrap_or(samples), window)
+    trace_span(owned.as_deref().unwrap_or(samples), clock, window)
 }
 
 fn trace_span(
     samples: &[f32],
+    clock: Option<&[f32]>,
     window: Option<(f32, f32)>,
 ) -> (Vec<f32>, Vec<f32>, Option<(f32, f32)>, Option<(f32, f32)>) {
     let n = samples.len();
@@ -351,10 +356,12 @@ fn trace_span(
     let mut x_lo = f32::MAX;
     let mut x_hi = f32::MIN;
     for (index, value) in samples.iter().enumerate() {
-        let t = index as f32 * SAMPLE_S;
+        let t = clock
+            .and_then(|clock| clock.get(index).copied())
+            .unwrap_or(index as f32 * SAMPLE_S);
         xs.push(t);
         ys.push(*value);
-        if !value.is_finite() || !inside(index, window) {
+        if !value.is_finite() || !inside(t, window) {
             continue;
         }
         x_lo = x_lo.min(t);
@@ -536,11 +543,10 @@ fn fit_time_axis(panels: &mut [Panel], x_lo: f32, x_hi: f32, fft: bool) {
     }
 }
 
-fn inside(index: usize, window: Option<(f32, f32)>) -> bool {
+fn inside(t: f32, window: Option<(f32, f32)>) -> bool {
     let Some((lo, hi)) = window else {
         return true;
     };
-    let t = index as f32 * SAMPLE_S;
     t >= lo && t <= hi
 }
 
@@ -570,7 +576,7 @@ mod tests {
         let mut samples = vec![1.0f32; 400];
         samples[3] = 10_000.0;
         samples[10] = f32::NAN;
-        let (xs, ys, xspan, yspan) = drawn_trace(&samples, None, None);
+        let (xs, ys, xspan, yspan) = drawn_trace(&samples, None, None, None);
         assert_eq!(ys.len(), samples.len());
         assert_eq!(xs.len(), samples.len());
         assert!(ys[10].is_nan());
@@ -592,7 +598,7 @@ mod tests {
         let samples: Vec<f32> = (0..3_000)
             .map(|index| if index == 2_500 { 80.0 } else { 1.0 })
             .collect();
-        let (xs, ys, xspan, yspan) = drawn_trace(&samples, None, Some((0.0, 1.0)));
+        let (xs, ys, xspan, yspan) = drawn_trace(&samples, None, None, Some((0.0, 1.0)));
         assert_eq!(ys.len(), 3_000);
         assert_eq!(ys[2_500], 80.0);
         let (lo, hi) = yspan.unwrap();
@@ -607,7 +613,7 @@ mod tests {
     fn a_beam_mask_blanks_dropped_rows_before_the_axis() {
         let samples = vec![1.0f32, 4.0, 9.0, 16.0];
         let keep = [true, false, true, false];
-        let (_, ys, xspan, yspan) = drawn_trace(&samples, Some(&keep), None);
+        let (_, ys, xspan, yspan) = drawn_trace(&samples, None, Some(&keep), None);
         assert!(ys[1].is_nan());
         assert!(ys[3].is_nan());
         assert_eq!(ys[0], 1.0);

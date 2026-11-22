@@ -887,7 +887,10 @@ fn package_zip(dir: &Path, zip_path: &Path, session_id: &str) -> Result<(), Stri
     }
     // Write beside the destination and rename at the end — a mid-write
     // failure must not truncate a previous good download at zip_path.
-    let part = zip_path.with_extension("part");
+    // Unique per-process temp name — two overlapping downloads to the same
+    // dest must not interleave bytes in one staging file (same reasoning as
+    // the staging-dir uniquifier in `download_with`).
+    let part = zip_path.with_extension(format!("part-{}", std::process::id()));
     let result = (|| {
         let file = std::fs::File::create(&part).map_err(|err| err.to_string())?;
         let mut zip = zip::ZipWriter::new(file);
