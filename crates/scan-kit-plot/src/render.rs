@@ -1436,7 +1436,9 @@ pub(crate) struct Marks {
     pub lines: Vec<LineRec>,
     pub points: Vec<PointRec>,
     pub quads: Vec<QuadRec>,
-    pub heatmaps: Vec<Vec<u8>>,
+    // Pixel buffers are shareable — a Decoded clone per dose cell copies
+    // the Arc, and the ramp repaint copy-on-writes through make_mut.
+    pub heatmaps: Vec<Arc<Vec<u8>>>,
     pub heatmap_size: Vec<(u32, u32)>,
     pub panels: Vec<PanelBatch>,
 }
@@ -1773,7 +1775,7 @@ impl Plot {
 #[derive(Clone)]
 pub(crate) struct DoseParts {
     grid: crate::dose::DoseGrid,
-    atlas: Vec<u8>,
+    atlas: Arc<Vec<u8>>,
     atlas_size: (u32, u32),
 }
 
@@ -1816,7 +1818,7 @@ pub(crate) fn dose_parts(
     let (atlas, cols, rows) = crate::dose::atlas_bytes(&grid);
     Some(DoseParts {
         grid,
-        atlas,
+        atlas: Arc::new(atlas),
         atlas_size: (cols, rows),
     })
 }
@@ -1838,7 +1840,7 @@ impl Plot {
         }
         scan_kit_core::view_ray_scale(
             &grid.volume,
-            &grid.bricks,
+            grid.bricks.as_slice(),
             grid.brick_shape,
             self.azimuth,
             self.elevation,
@@ -2450,7 +2452,7 @@ impl Plot {
             if ramp_changed || opacity_changed {
                 let size = self.marks.heatmap_size.get(index).copied();
                 if let (Some((cols, rows)), Some(pixels)) =
-                    (size, self.marks.heatmaps.get_mut(index))
+                    (size, self.marks.heatmaps.get_mut(index).map(Arc::make_mut))
                 {
                     if ramp_changed && !session {
                         crate::dose::paint_ramp_row(pixels, cols, rows, ramp, wash.opacity);
@@ -2723,9 +2725,9 @@ impl Plot {
                 .marks
                 .heatmaps
                 .get(index)
-                .is_some_and(|have| have != &pixels)
+                .is_some_and(|have| have.as_slice() != pixels.as_slice())
             {
-                self.marks.heatmaps[index] = pixels;
+                self.marks.heatmaps[index] = Arc::new(pixels);
                 changed = true;
             }
         }
@@ -4003,7 +4005,8 @@ impl Plot {
                 .iter()
                 .zip(&self.marks.heatmap_size)
                 .map(|(pixels, (cols, rows))| {
-                    let texture = upload_rgba(&gpu.device, &gpu.queue, pixels, *cols, *rows)?;
+                    let texture =
+                        upload_rgba(&gpu.device, &gpu.queue, pixels.as_slice(), *cols, *rows)?;
                     let group =
                         textured_group(&gpu.device, &gpu.textured_layout, &texture, &gpu.sampler);
                     Ok(HeatGpu { group, texture })
@@ -4057,7 +4060,12 @@ impl Plot {
                 .lattice_f16
                 .get_or_init(|| f16_lattice(&grid.volume.values, grid.volume.shape));
             let dose_tex = upload_dose_f16(&gpu.device, &gpu.queue, lattice, grid.volume.shape)?;
-            let brick_tex = upload_r32_3d(&gpu.device, &gpu.queue, &grid.bricks, grid.brick_shape)?;
+            let brick_tex = upload_r32_3d(
+                &gpu.device,
+                &gpu.queue,
+                grid.bricks.as_slice(),
+                grid.brick_shape,
+            )?;
             (
                 dose_tex,
                 brick_tex,
@@ -4124,7 +4132,7 @@ impl Plot {
             .flat_map(|batch| &batch.clouds)
             .filter_map(|cloud| cloud.heatmap.map(|index| index as usize))
             .collect();
-        let jobs: Vec<(usize, Vec<u8>, u32, u32)> = indices
+        let jobs: Vec<(usize, Arc<Vec<u8>>, u32, u32)> = indices
             .into_iter()
             .filter_map(|index| {
                 let pixels = self.marks.heatmaps.get(index)?.clone();
@@ -4139,7 +4147,7 @@ impl Plot {
             let Some(heat) = gpu.heats.get(index) else {
                 continue;
             };
-            write_rgba(queue, &heat.texture, &pixels, cols, rows);
+            write_rgba(queue, &heat.texture, pixels.as_slice(), cols, rows);
         }
         self.heat_uploaded = self.heat_revision;
     }
@@ -4841,7 +4849,7 @@ fn build_marks_inner(panels: &[Panel], skip_polylines: bool) -> Marks {
                         continue;
                     }
                     pending.push((heatmaps.len(), id, 1.0, *color));
-                    heatmaps.push(pixels);
+                    heatmaps.push(Arc::new(pixels));
                     heatmap_size.push((*cols, *rows));
                     last_heat = Some(heatmaps.len() - 1);
                     last_ramp = *ramp;
@@ -8973,13 +8981,29 @@ fn read_buffer(
     slice.map_async(wgpu::MapMode::Read, move |result| {
         let _ = sender.send(result);
     });
-    device
-        .poll(wgpu::PollType::wait_indefinitely())
-        .map_err(|err| GpuError::Message(err.to_string()))?;
-    receiver
-        .recv()
-        .map_err(|err| GpuError::Message(err.to_string()))?
-        .map_err(|err| GpuError::Message(err.to_string()))?;
+    // A wedged driver must not hang the frame read forever — poll in slices
+    // and fail past the same bound collect_read uses.
+    let started = std::time::Instant::now();
+    loop {
+        match device.poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: Some(std::time::Duration::from_millis(50)),
+        }) {
+            Ok(_) | Err(wgpu::PollError::Timeout) => {}
+            Err(err) => return Err(GpuError::Message(err.to_string())),
+        }
+        match receiver.try_recv() {
+            Ok(result) => {
+                result.map_err(|err| GpuError::Message(err.to_string()))?;
+                break;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(err) => return Err(GpuError::Message(err.to_string())),
+        }
+        if started.elapsed() > std::time::Duration::from_secs(30) {
+            return Err(GpuError::Message("GPU readback timed out".into()));
+        }
+    }
     let mapped = slice
         .get_mapped_range()
         .map_err(|err| GpuError::Message(err.to_string()))?;

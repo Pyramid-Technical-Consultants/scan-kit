@@ -123,7 +123,11 @@ pub fn live_session_id(host: &str) -> Option<String> {
 }
 
 /// Enumerate the RCI plus every map-manager device client that has an address.
-fn devices(rci_host: &str, warnings: &mut Vec<String>) -> Vec<CaptureDevice> {
+fn devices(
+    rci_host: &str,
+    warnings: &mut Vec<String>,
+    keep: &mut dyn FnMut(u64, u64) -> bool,
+) -> Result<Vec<CaptureDevice>, String> {
     let mut out = vec![CaptureDevice {
         name: "RCI".into(),
         io_root: "rci".into(),
@@ -133,7 +137,7 @@ fn devices(rci_host: &str, warnings: &mut Vec<String>) -> Vec<CaptureDevice> {
     let Some(children) = runner::http_json_file(rci_host, "rci/map_manager", "children.json")
     else {
         warnings.push("map_manager did not list device clients".into());
-        return out;
+        return Ok(out);
     };
     let mut names: Vec<&str> = children
         .as_object()
@@ -154,6 +158,7 @@ fn devices(rci_host: &str, warnings: &mut Vec<String>) -> Vec<CaptureDevice> {
         };
         let io_root = field("device_path").trim_matches('/').to_owned();
         let host = field("websocket_client/server_ip_address");
+        tick(0, keep)?;
         if io_root.is_empty() || host.trim().is_empty() {
             warnings.push(format!("{client} has no device address — skipped"));
             continue;
@@ -173,7 +178,7 @@ fn devices(rci_host: &str, warnings: &mut Vec<String>) -> Vec<CaptureDevice> {
             config_target: field("configuration_upload/target"),
         });
     }
-    out
+    Ok(out)
 }
 
 /// Device client key → filename-safe name (`device_ic1_client` → `IC1`).
@@ -390,8 +395,8 @@ pub fn capture(
     let mut warnings = Vec::new();
     let mut count = 0usize;
 
-    let devices = devices(rci_host, &mut warnings);
-    let session_id = session_id(&devices, &mut warnings)
+    let devices = devices(rci_host, &mut warnings, keep)?;
+    let session_id = session_id(&devices, &mut warnings, keep)?
         .ok_or("no session on the controller — the devices' tables are empty")?;
 
     let mut spots: Vec<(&CaptureDevice, Sheet)> = Vec::new();
@@ -524,10 +529,15 @@ pub fn capture(
 
 /// The shared session id: first `|` field of each `file_header_meta`.
 /// The RCI's id wins; any disagreement is reported as a warning.
-fn session_id(devices: &[CaptureDevice], warnings: &mut Vec<String>) -> Option<String> {
+fn session_id(
+    devices: &[CaptureDevice],
+    warnings: &mut Vec<String>,
+    keep: &mut dyn FnMut(u64, u64) -> bool,
+) -> Result<Option<String>, String> {
     let mut ids = Vec::new();
     let mut rci = None;
     for (index, device) in devices.iter().enumerate() {
+        tick(0, keep)?;
         let id = table_io(
             &device.host,
             &device.io_root,
@@ -557,7 +567,7 @@ fn session_id(devices: &[CaptureDevice], warnings: &mut Vec<String>) -> Option<S
                 .join(", ")
         ));
     }
-    rci.or_else(|| ids.into_iter().next())
+    Ok(rci.or_else(|| ids.into_iter().next()))
 }
 
 fn tick(count: usize, keep: &mut dyn FnMut(u64, u64) -> bool) -> Result<(), String> {
@@ -1294,6 +1304,7 @@ fn fetch_aux(
     for device in devices {
         let nozzle = dir.join("config").join("nozzle").join(&device.name);
         for file in NOZZLE_FILES {
+            tick(count, keep)?;
             let remote = format!("/root/config/{file}");
             if let Ok(url) = device_file_url(&device.host, &remote) {
                 if let Ok(bytes) = runner::http(&url, "GET", None) {
@@ -1304,6 +1315,7 @@ fn fetch_aux(
                 }
             }
         }
+        tick(count, keep)?;
         if let Ok(url) = device_file_url(&device.host, "/root/config/calibration.json") {
             if let Ok(bytes) = runner::http(&url, "GET", None) {
                 if !bytes.is_empty() {
@@ -1317,6 +1329,7 @@ fn fetch_aux(
                 }
             }
         }
+        tick(count, keep)?;
         if let Ok(url) = io_url(&device.host, "log", "data.txt") {
             if let Ok(bytes) = runner::http(&url, "GET", None) {
                 if !bytes.is_empty() {
@@ -1333,6 +1346,7 @@ fn fetch_aux(
         }
         // Channel-map XMLs live on the RCI under /root/config/control/.
         if !device.config_target.is_empty() {
+            tick(count, keep)?;
             if let Ok(url) = device_file_url(rci_host, &device.config_target) {
                 if let Ok(bytes) = runner::http(&url, "GET", None) {
                     if !bytes.is_empty() {

@@ -72,7 +72,8 @@ pub fn parse_host(host: &str) -> Result<String, String> {
     let authority = if let Some((_, rest)) = text.split_once("://") {
         let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
         if authority.is_empty() {
-            return Err(format!("invalid host: {host}"));
+            // Never echo the input — it may carry user:password@ userinfo.
+            return Err("invalid host".into());
         }
         authority.rsplit('@').next().unwrap_or(authority)
     } else {
@@ -89,7 +90,7 @@ pub fn parse_host(host: &str) -> Result<String, String> {
             .bytes()
             .any(|byte| byte.is_ascii_control() || byte == b' ')
     {
-        return Err(format!("invalid host: {host:?}"));
+        return Err("invalid host".into());
     }
     Ok(authority.to_owned())
 }

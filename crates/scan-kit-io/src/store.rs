@@ -116,14 +116,16 @@ pub fn set_window_geometry(
     x: i32,
     y: i32,
 ) -> Result<(), String> {
-    let mut settings = prefs_get(conn, PREF_APP_SETTINGS)?
-        .and_then(|value| value.as_object().cloned())
-        .unwrap_or_default();
-    settings.insert("window_width".to_owned(), json!(width));
-    settings.insert("window_height".to_owned(), json!(height));
-    settings.insert("window_x".to_owned(), json!(x));
-    settings.insert("window_y".to_owned(), json!(y));
-    prefs_set(conn, PREF_APP_SETTINGS, &Value::Object(settings))
+    prefs_patch(
+        conn,
+        PREF_APP_SETTINGS,
+        &json!({
+            "window_width": width,
+            "window_height": height,
+            "window_x": x,
+            "window_y": y,
+        }),
+    )
 }
 
 pub fn last_main_tab(conn: &Connection) -> Result<Option<String>, String> {
@@ -135,11 +137,7 @@ pub fn last_main_tab(conn: &Connection) -> Result<Option<String>, String> {
 }
 
 pub fn set_last_main_tab(conn: &Connection, tab: &str) -> Result<(), String> {
-    let mut settings = prefs_get(conn, PREF_APP_SETTINGS)?
-        .and_then(|value| value.as_object().cloned())
-        .unwrap_or_default();
-    settings.insert("last_main_tab".to_owned(), json!(tab));
-    prefs_set(conn, PREF_APP_SETTINGS, &Value::Object(settings))
+    prefs_patch(conn, PREF_APP_SETTINGS, &json!({ "last_main_tab": tab }))
 }
 
 pub fn last_plan_save_dir(conn: &Connection) -> Result<Option<String>, String> {
@@ -170,16 +168,14 @@ pub fn set_config_settings(
     dir: Option<&str>,
     hide: Option<bool>,
 ) -> Result<(), String> {
-    let mut settings = prefs_get(conn, PREF_APP_SETTINGS)?
-        .and_then(|value| value.as_object().cloned())
-        .unwrap_or_default();
+    let mut patch = serde_json::Map::new();
     if let Some(dir) = dir {
-        settings.insert("config_dir".to_owned(), json!(dir));
+        patch.insert("config_dir".to_owned(), json!(dir));
     }
     if let Some(hide) = hide {
-        settings.insert("hide_unused_map2map_xml".to_owned(), json!(hide));
+        patch.insert("hide_unused_map2map_xml".to_owned(), json!(hide));
     }
-    prefs_set(conn, PREF_APP_SETTINGS, &Value::Object(settings))
+    prefs_patch(conn, PREF_APP_SETTINGS, &Value::Object(patch))
 }
 
 pub fn last_dicom_dir(conn: &Connection) -> Result<Option<String>, String> {
@@ -193,11 +189,11 @@ pub fn set_last_dicom_dir(conn: &Connection, dir: &str) -> Result<(), String> {
 }
 
 pub fn set_last_plan_save_dir(conn: &Connection, dir: &str) -> Result<(), String> {
-    let mut settings = prefs_get(conn, PREF_APP_SETTINGS)?
-        .and_then(|value| value.as_object().cloned())
-        .unwrap_or_default();
-    settings.insert("last_plan_synthesis_save_dir".to_owned(), json!(dir));
-    prefs_set(conn, PREF_APP_SETTINGS, &Value::Object(settings))
+    prefs_patch(
+        conn,
+        PREF_APP_SETTINGS,
+        &json!({ "last_plan_synthesis_save_dir": dir }),
+    )
 }
 
 pub fn runner_settings(conn: &Connection) -> Result<(Option<String>, Option<String>), String> {
@@ -236,11 +232,7 @@ pub fn set_runner_plan_path(conn: &Connection, path: &str) -> Result<(), String>
 }
 
 fn set_runner_pref(conn: &Connection, key: &str, value: &str) -> Result<(), String> {
-    let mut settings = prefs_get(conn, PREF_APP_SETTINGS)?
-        .and_then(|value| value.as_object().cloned())
-        .unwrap_or_default();
-    settings.insert(key.to_owned(), json!(value));
-    prefs_set(conn, PREF_APP_SETTINGS, &Value::Object(settings))
+    prefs_patch(conn, PREF_APP_SETTINGS, &json!({ key: value }))
 }
 
 /// User-registered MCsquare scanner folders, `[{label, folder}]`.
@@ -260,15 +252,11 @@ pub fn scanners(conn: &Connection) -> Result<Vec<(String, String)>, String> {
 }
 
 pub fn set_scanners(conn: &Connection, scanners: &[(String, String)]) -> Result<(), String> {
-    let mut settings = prefs_get(conn, PREF_APP_SETTINGS)?
-        .and_then(|value| value.as_object().cloned())
-        .unwrap_or_default();
     let list: Vec<Value> = scanners
         .iter()
         .map(|(label, folder)| json!({ "label": label, "folder": folder }))
         .collect();
-    settings.insert("scanners".to_owned(), Value::Array(list));
-    prefs_set(conn, PREF_APP_SETTINGS, &Value::Object(settings))
+    prefs_patch(conn, PREF_APP_SETTINGS, &json!({ "scanners": list }))
 }
 
 pub fn set_note(conn: &Connection, root: &str, session_id: &str, text: &str) -> Result<(), String> {
@@ -542,7 +530,8 @@ pub fn remember_data_dir(conn: &Connection, root: &str) -> Result<(), String> {
 
 /// Saved roots in order. The first read of an older store turns the last folder into a one-item list.
 pub fn data_dirs(conn: &Connection) -> Result<Vec<String>, String> {
-    if let Some(value) = prefs_get(conn, PREF_DATA_DIRS)? {
+    // A valid-but-wrong-shape value must not mask the legacy fallback.
+    if let Some(value) = prefs_get(conn, PREF_DATA_DIRS)?.filter(|value| value.is_array()) {
         return Ok(string_list(&value));
     }
     let Some(last) = last_data_dir(conn)?.filter(|dir| !dir.is_empty()) else {
@@ -688,6 +677,11 @@ pub(crate) fn delete_missing_exams(
 
 fn migrate(conn: &Connection) -> Result<(), String> {
     let version = user_version(conn)?;
+    if version > SCHEMA_VERSION {
+        return Err(format!(
+            "this library was written by a newer Scan Kit (schema v{version}); upgrade to open it"
+        ));
+    }
     if version < 1 {
         conn.execute_batch(
             "
@@ -731,6 +725,28 @@ fn migrate(conn: &Connection) -> Result<(), String> {
         .map_err(|err| err.to_string())?;
         conn.execute_batch(EXAMS_TABLE)
             .map_err(|err| err.to_string())?;
+        // Tables that predate version stamping keep their older shape —
+        // heal the later columns the same way a versioned DB does.
+        migrate_columns(
+            conn,
+            "libraries",
+            &[
+                ("bg_subtract", "INTEGER NOT NULL DEFAULT 0"),
+                ("calibration_mode", "TEXT NOT NULL DEFAULT 'off'"),
+                ("contour_cutoff_percentile", "REAL NOT NULL DEFAULT 5.0"),
+                ("view_settings_imported", "INTEGER NOT NULL DEFAULT 0"),
+                ("view_settings_rev", "INTEGER NOT NULL DEFAULT 0"),
+            ],
+        )?;
+        migrate_columns(
+            conn,
+            "sessions",
+            &[
+                ("map_extent_mm", "REAL"),
+                ("layer_count", "INTEGER"),
+                ("map_geom_checked", "INTEGER NOT NULL DEFAULT 0"),
+            ],
+        )?;
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)
             .map_err(|err| err.to_string())?;
         return Ok(());
@@ -827,11 +843,17 @@ fn import_legacy(conn: &Connection, lib_id: i64, base: &Path) -> Result<(), Stri
     if notes_done && views_done {
         return Ok(());
     }
-    let settings = read_json(base.join("settings.json")).unwrap_or_else(|| json!({}));
-    if !notes_done {
-        if let Some(notes) =
-            read_json(base.join("session_notes.json")).and_then(|value| value.as_object().cloned())
-        {
+    let settings_path = base.join("settings.json");
+    let settings_raw = read_json(settings_path.clone());
+    // A corrupt legacy file is not an empty one — retry the import on the
+    // next open instead of stamping the flag and losing the data forever.
+    let settings_ok = settings_raw.is_some() || !settings_path.exists();
+    let notes_path = base.join("session_notes.json");
+    let notes_raw = read_json(notes_path.clone());
+    let notes_ok = notes_raw.is_some() || !notes_path.exists();
+    let settings = settings_raw.unwrap_or_else(|| json!({}));
+    if !notes_done && notes_ok && settings_ok {
+        if let Some(notes) = notes_raw.and_then(|value| value.as_object().cloned()) {
             for (session_id, text) in notes {
                 let Some(text) = text.as_str() else {
                     continue;
@@ -864,7 +886,7 @@ fn import_legacy(conn: &Connection, lib_id: i64, base: &Path) -> Result<(), Stri
         )
         .map_err(|err| err.to_string())?;
     }
-    if !views_done {
+    if !views_done && settings_ok {
         let bg_subtract = settings
             .get("bg_subtract")
             .and_then(Value::as_bool)
@@ -1015,6 +1037,19 @@ fn prefs_get(conn: &Connection, key: &str) -> Result<Option<Value>, String> {
     Ok(raw.and_then(|text| serde_json::from_str(&text).ok()))
 }
 
+/// Merge keys into a JSON pref inside one statement — a read-modify-write
+/// outside the row loses sibling keys another writer set in between.
+fn prefs_patch(conn: &Connection, key: &str, patch: &Value) -> Result<(), String> {
+    let raw = serde_json::to_string(patch).map_err(|err| err.to_string())?;
+    conn.execute(
+        "INSERT INTO prefs(key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = json_patch(value, ?2)",
+        params![key, raw],
+    )
+    .map_err(|err| err.to_string())?;
+    Ok(())
+}
+
 fn prefs_set(conn: &Connection, key: &str, value: &Value) -> Result<(), String> {
     let raw = serde_json::to_string(value).map_err(|err| err.to_string())?;
     conn.execute(
@@ -1132,6 +1167,48 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("sk_store_{tag}_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir.join("store.db")
+    }
+
+    #[test]
+    fn a_settings_patch_merges_instead_of_replacing() {
+        let path = temp_db("patch");
+        let conn = open_connection(&path).unwrap();
+        set_scanners(&conn, &[("label".into(), "folder".into())]).unwrap();
+        set_window_geometry(&conn, 800, 600, 1, 2).unwrap();
+        // The second write must not drop the first write's key.
+        assert_eq!(
+            scanners(&conn).unwrap(),
+            vec![("label".to_owned(), "folder".to_owned())]
+        );
+        let geo = window_geometry(&conn).unwrap();
+        assert_eq!(geo["width"], json!(800));
+        set_last_main_tab(&conn, "library").unwrap();
+        assert_eq!(scanners(&conn).unwrap().len(), 1);
+        assert_eq!(geo["height"], json!(600));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_non_array_data_dirs_value_falls_back_to_last_dir() {
+        let path = temp_db("dirs");
+        let conn = open_connection(&path).unwrap();
+        prefs_set(&conn, PREF_LAST_DATA_DIR, &json!("C:\\data")).unwrap();
+        // A valid-but-wrong-shape value must not mask the legacy fallback.
+        prefs_set(&conn, PREF_DATA_DIRS, &json!("not-an-array")).unwrap();
+        assert_eq!(data_dirs(&conn).unwrap(), vec!["C:\\data".to_owned()]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_newer_schema_is_refused() {
+        let path = temp_db("future");
+        let conn = open_connection(&path).unwrap();
+        conn.pragma_update(None, "user_version", SCHEMA_VERSION + 1)
+            .unwrap();
+        drop(conn);
+        let err = open_connection(&path).unwrap_err();
+        assert!(err.contains("newer Scan Kit"), "{err}");
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

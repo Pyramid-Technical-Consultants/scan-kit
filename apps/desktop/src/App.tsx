@@ -801,11 +801,15 @@ export default function App() {
         "scan_kit_trash_session",
         { path: pending.library, sessionId: row?.folder_id ?? pending.sessionId },
       );
-      setRows((items) => items.filter((item) => item.session_id !== pending.sessionId));
-      setSelectionOrder((ids) => ids.filter((id) => id !== pending.sessionId));
       if (result.errors.length > 0) {
+        // Files remain on disk — the catalog row stays (and keeps its
+        // note/selection) so a later retry sees the same session.
         notifyError(`Some session files could not be removed:\n${result.errors.join("\n")}`);
+      } else if (result.removed === 0) {
+        notify(`No files found for session ${pending.sessionId}`);
       } else {
+        setRows((items) => items.filter((item) => item.session_id !== pending.sessionId));
+        setSelectionOrder((ids) => ids.filter((id) => id !== pending.sessionId));
         notify(
           pending.remote
             ? `Deleted session ${pending.sessionId}`
@@ -1512,7 +1516,7 @@ export default function App() {
             <DialogHeader>
               <DialogTitle>Password</DialogTitle>
               <DialogDescription>
-                {passwordFor} needs a password. It stays in memory for this session.
+                {passwordFor?.replace(/^([a-z][a-z0-9+.-]*:\/\/)[^@/]*@/i, "$1") ?? ""} needs a password. It stays in memory for this session.
               </DialogDescription>
             </DialogHeader>
             <Input

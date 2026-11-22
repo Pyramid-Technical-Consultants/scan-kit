@@ -5,6 +5,8 @@
 //! RGBA pixels. The shell reads the header for its controls. The wasm plot uploads
 //! the rest without parsing series again.
 
+use std::sync::Arc;
+
 use scan_kit_core::{Control, DataTable, Panel, PlotScene, VolumeMark};
 use serde::{Deserialize, Serialize};
 
@@ -144,6 +146,13 @@ pub fn encode_plot_reusing(
     } else {
         marks.panels.iter().map(|batch| batch.line_count).sum()
     };
+    // Saturating: the decoder's checked_mul rejects the same overflow, so
+    // a wrapping product here would only desync the two sides.
+    let voxels = scene
+        .volume
+        .shape
+        .iter()
+        .fold(1usize, |acc, axis| acc.saturating_mul(*axis as usize));
     let header = PlotHeader {
         title: scene.title.clone(),
         controls: scene.controls.clone(),
@@ -165,14 +174,7 @@ pub fn encode_plot_reusing(
         lines: line_count,
         points: marks.points.len() as u32,
         quads: marks.quads.len() as u32,
-        volume_shape: if scene.volume.values.len()
-            >= scene
-                .volume
-                .shape
-                .iter()
-                .map(|axis| *axis as usize)
-                .product::<usize>()
-        {
+        volume_shape: if scene.volume.values.len() >= voxels {
             scene.volume.shape
         } else {
             // A shape the values don't fill would desync the decoder.
@@ -194,20 +196,8 @@ pub fn encode_plot_reusing(
         volume_unit: scene.volume.unit.clone(),
         volume_phantom: scene.volume.show_phantom,
         volume_field: scene.volume.field,
-        volume_ct: scene.volume.ct.len()
-            >= scene
-                .volume
-                .shape
-                .iter()
-                .map(|axis| *axis as usize)
-                .product::<usize>(),
-        volume_labels: scene.volume.labels.len()
-            >= scene
-                .volume
-                .shape
-                .iter()
-                .map(|axis| *axis as usize)
-                .product::<usize>(),
+        volume_ct: scene.volume.ct.len() >= voxels,
+        volume_labels: scene.volume.labels.len() >= voxels,
         volume_sessions: scene.volume.sessions.len() as u32,
         volume_plans: scene.volume.plans.len() as u32,
         volume_companions: scene.volume.companions.len() as u32,
@@ -220,7 +210,11 @@ pub fn encode_plot_reusing(
             + line_count as usize * LINE_STRIDE as usize
             + marks.points.len() * POINT_STRIDE as usize
             + marks.quads.len() * QUAD_STRIDE as usize
-            + marks.heatmaps.iter().map(Vec::len).sum::<usize>(),
+            + marks
+                .heatmaps
+                .iter()
+                .map(|pixels| pixels.len())
+                .sum::<usize>(),
     );
     out.extend_from_slice(&(json.len() as u32).to_le_bytes());
     out.extend_from_slice(&json);
@@ -237,12 +231,9 @@ pub fn encode_plot_reusing(
     out.extend_from_slice(&encode_points(&marks.points));
     out.extend_from_slice(&encode_quads(&marks.quads));
     for pixels in &marks.heatmaps {
-        out.extend_from_slice(pixels);
+        out.extend_from_slice(pixels.as_slice());
     }
-    let voxels = scene.volume.shape[0] as usize
-        * scene.volume.shape[1] as usize
-        * scene.volume.shape[2] as usize;
-    if voxels > 0 && scene.volume.values.len() >= voxels {
+    if voxels > 0 && voxels != usize::MAX && scene.volume.values.len() >= voxels {
         write_cube(&mut out, &scene.volume.values[..voxels]);
         if scene.volume.ct.len() >= voxels {
             write_f32s(&mut out, &scene.volume.ct[..voxels]);
@@ -581,7 +572,7 @@ pub(crate) fn decode_plot(
                 .and_then(|texels| texels.checked_mul(4))
                 .and_then(|bytes| usize::try_from(bytes).ok())
                 .ok_or_else(|| "plot payload heatmap is too large".to_string())?;
-            reader.take(bytes).map(<[u8]>::to_vec)
+            reader.take(bytes).map(|bytes| Arc::new(bytes.to_vec()))
         })
         .collect::<Result<Vec<_>, _>>()?;
     let marks = Marks {

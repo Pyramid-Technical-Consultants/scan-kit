@@ -561,8 +561,12 @@ pub fn invoke(name: &str, input: &Value) -> Result<Value, InvokeError> {
                 let root = library_root(path)?;
                 let paths = location::session_storage_paths(&root, session_id)?;
                 let errors = location::delete_storage(&root, &paths)?;
-                let lib_id = store::prepare_library(conn, &root)?;
-                store::delete_session(conn, lib_id, session_id)?;
+                // A session whose files are still on disk keeps its row —
+                // note/selection/hidden survive the failed delete.
+                if errors.is_empty() {
+                    let lib_id = store::prepare_library(conn, &root)?;
+                    store::delete_session(conn, lib_id, session_id)?;
+                }
                 Ok(json!({ "removed": paths.len() - errors.len(), "errors": errors }))
             })
             .map_err(InvokeError::Message)
@@ -842,8 +846,12 @@ fn open_library_keep(
     let spec = data_dir.to_string_lossy();
     let (root, opened) = location::open_root(&spec)?;
     let found = match &opened {
-        location::Opened::Local(path) => discover::discover(path)?,
-        location::Opened::Remote(url) => location::discover_remote(url)?,
+        location::Opened::Local(path) => {
+            discover::discover(path, &mut |done, total| keep(done, total, None))?
+        }
+        location::Opened::Remote(url) => {
+            location::discover_remote(url, &mut |done, total| keep(done, total, None))?
+        }
     };
     let places = found
         .entries

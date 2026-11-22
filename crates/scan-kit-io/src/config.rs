@@ -157,8 +157,9 @@ pub fn save_folder(
         // stale configs survive with fresh sidecars. The removal runs after
         // the copy succeeds so a copy failure never deletes destination files.
         let stale = list_xml(dest).unwrap_or_default();
-        let kept: std::collections::HashSet<String> =
-            list_xml(source).unwrap_or_default().into_iter().collect();
+        // A failed source list would empty `kept` and delete every file at
+        // dest — fail the save instead.
+        let kept: std::collections::HashSet<String> = list_xml(source)?.into_iter().collect();
         copy_tree(source, dest, 0)?;
         for rel in stale.iter().filter(|rel| !kept.contains(*rel)) {
             if let Ok(stale) = under(dest, rel) {
