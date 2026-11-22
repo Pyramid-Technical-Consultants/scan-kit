@@ -92,7 +92,7 @@ impl ScanKit {
         let remote = ["path", "storage_path", "data_dir"]
             .iter()
             .filter_map(|key| input.get(key).and_then(Value::as_str))
-            .any(|spec| spec.contains("://") && !spec.starts_with("file://"));
+            .any(scan_kit_io::is_remote_location);
         (saves || foreign_db || remote).then_some(name)
     }
 
@@ -391,6 +391,10 @@ mod tests {
         );
         let local = serde_json::json!({ "path": "C:\\lib" });
         assert_eq!(kit.blocked("scan_kit_open_library", &local), None);
+        // A drive-letter scheme is local, not remote — is_remote_location
+        // treats a one-letter scheme as a Windows drive.
+        let drive = serde_json::json!({ "path": "C://lib/data" });
+        assert_eq!(kit.blocked("scan_kit_open_library", &drive), None);
         let file = serde_json::json!({ "path": "file:///lib" });
         assert_eq!(kit.blocked("scan_kit_open_library", &file), None);
     }

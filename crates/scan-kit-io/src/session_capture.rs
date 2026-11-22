@@ -576,6 +576,9 @@ fn join_timeslices(parts: &[(&CaptureDevice, Sheet)]) -> Option<String> {
         };
         for row in &sheet.rows {
             let Some(key) = row.get(ts_i) else { continue };
+            // Keyed on the timeslice number alone: unlike spot keys, a
+            // timeslice number is a per-delivery counter, so re-delivery
+            // means the device is replacing that slice, not repeating one.
             if !part.rows.contains_key(key) {
                 part.order.push(key.clone());
             }

@@ -70,7 +70,10 @@ pub(super) fn prepare(
         // For the other quantities protons <= 0 (negative k_mu) would deposit
         // a uniformly negative map; skipping is the same answer as zero.
         if quantity == Quantity::Mu {
-            if !pencil.amount.is_finite() || pencil.amount <= 0.0 {
+            // The proton check skipped non-finite factors too — the MU weight
+            // is amount*factor, so gate on that directly.
+            let mu = f64::from(pencil.amount) * f64::from(factor);
+            if !mu.is_finite() || mu <= 0.0 {
                 continue;
             }
         } else if !protons.is_finite() || protons <= 0.0 {
