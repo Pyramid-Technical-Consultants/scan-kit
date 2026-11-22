@@ -327,11 +327,21 @@ pub fn tool_input_schema(name: &str) -> Value {
             "required": ["template", "params"],
             "additionalProperties": false
         }),
-        "scan_kit_config_catalog" | "scan_kit_config_open" => json!({
+        "scan_kit_config_catalog" => json!({
             "type": "object",
             "properties": {
                 "path": { "type": "string" },
                 "db_path": { "type": "string" }
+            },
+            "additionalProperties": false
+        }),
+        "scan_kit_config_open" => json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string" },
+                "db_path": { "type": "string" },
+                "data_dir": { "type": "string" },
+                "session_id": { "type": "string" }
             },
             "additionalProperties": false
         }),
@@ -489,7 +499,7 @@ pub fn tool_input_schema(name: &str) -> Value {
         "scan_kit_scanners" => json!({
             "type": "object",
             "properties": {
-                "db": { "type": "string" },
+                "db_path": { "type": "string" },
                 "action": { "type": "string", "enum": ["list", "add", "remove"] },
                 "folder": { "type": "string" }
             },
