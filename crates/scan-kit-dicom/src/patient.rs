@@ -104,7 +104,7 @@ struct Elem {
 }
 
 pub fn load_study(path: &Path) -> Result<PatientStudy, String> {
-    let mut ct_by_series: std::collections::BTreeMap<String, Vec<(String, Slice)>> =
+    let mut ct_by_series: std::collections::BTreeMap<String, (Vec<String>, Vec<(String, Slice)>)> =
         std::collections::BTreeMap::new();
     let mut dose_slices = Vec::new();
     let mut dose_seen = false;
@@ -143,12 +143,12 @@ pub fn load_study(path: &Path) -> Result<PatientStudy, String> {
                 study_uid = text_tag(&elems, tag(0x0020, 0x000D));
                 series_uid = text_tag(&elems, tag(0x0020, 0x000E));
             }
-            sop_uids.push(text_tag(&elems, tag(0x0008, 0x0018)));
             // A study can carry several CT series over one frame of
             // reference — merging them stacks two reconstructions into one
             // volume. Bucket by SeriesInstanceUID and keep the largest below.
             let uid = text_tag(&elems, tag(0x0020, 0x000E));
-            let bucket = ct_by_series.entry(uid).or_default();
+            let (sops, bucket) = ct_by_series.entry(uid).or_default();
+            sops.push(text_tag(&elems, tag(0x0008, 0x0018)));
             for slice in image_slices(&elems, 1.0)? {
                 bucket.push((frame.clone(), slice));
             }
@@ -183,16 +183,18 @@ pub fn load_study(path: &Path) -> Result<PatientStudy, String> {
     }
     // A CT file without a SeriesInstanceUID cannot be isolated — treat it as
     // part of the chosen series so a frame-of-reference conflict still fails.
-    let orphans = ct_by_series.remove("").unwrap_or_default();
+    let (orphan_sops, orphans) = ct_by_series.remove("").unwrap_or_default();
     let mut ct_slices = Vec::new();
     let mut best = 0usize;
-    for (uid, slices) in ct_by_series {
+    for (uid, (sops, slices)) in ct_by_series {
         if slices.len() > best {
             best = slices.len();
             series_uid = uid;
+            sop_uids = sops;
             ct_slices = slices;
         }
     }
+    sop_uids.extend(orphan_sops);
     ct_slices.extend(orphans);
     if ct_slices.is_empty() {
         return Err("the study has no CT".into());

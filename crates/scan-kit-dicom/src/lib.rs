@@ -197,8 +197,11 @@ fn is_dicom(bytes: &[u8]) -> bool {
 /// Implicit VR Little Endian transfer syntax (no VR codes in the dataset).
 pub(crate) const IMPLICIT_VR_LE: &str = "1.2.840.10008.1.2";
 
-/// Explicit VR Little Endian — the other syntax this crate reads.
-pub(crate) const EXPLICIT_VR_LE: &str = "1.2.840.10008.1.2.1";
+/// Transfer syntaxes that change the *dataset* encoding, not just the pixel
+/// data — deflated explicit LE and big-endian explicit. Encapsulated
+/// (JPEG/RLE) syntaxes keep an explicit-LE dataset and parse normally; only
+/// their pixel element is unreadable, which fails on its own.
+const UNREADABLE_DATASET: [&str; 2] = ["1.2.840.10008.1.2.1.99", "1.2.840.10008.1.2.2"];
 
 /// Where the post-meta dataset starts, and whether it is implicit VR.
 ///
@@ -240,9 +243,11 @@ pub(crate) fn dataset_offset(bytes: &[u8]) -> (usize, Result<bool, String>) {
             .iter()
             .all(|byte| byte.is_ascii_uppercase());
     }
-    // A declared syntax we cannot decode (deflated, big-endian, encapsulated
-    // JPEG) must not be parsed as explicit LE garbage.
-    if syntax_seen && !syntax.is_empty() && syntax != IMPLICIT_VR_LE && syntax != EXPLICIT_VR_LE {
+    // A syntax that re-encodes the dataset itself (deflate, big-endian) must
+    // not be parsed as explicit LE garbage. Encapsulated-pixel syntaxes keep
+    // an explicit-LE dataset — RTPLAN/RTSTRUCT with no pixels read fine, and
+    // a pixel element fails on its own undefined-length items.
+    if UNREADABLE_DATASET.contains(&syntax.as_str()) {
         return (
             cursor.min(bytes.len()),
             Err(format!("unsupported transfer syntax {syntax}")),
