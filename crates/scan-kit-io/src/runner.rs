@@ -522,8 +522,10 @@ impl std::io::Read for DeadlineStream {
             ));
         };
         // Without the cap a fragment arriving just before the deadline would
-        // let the last syscall block a full read-timeout past it.
-        self.stream.set_read_timeout(Some(remaining))?;
+        // let the last syscall block a full read-timeout past it. The floor
+        // keeps a sub-millisecond remainder from erroring the socket call.
+        self.stream
+            .set_read_timeout(Some(remaining.max(Duration::from_millis(1))))?;
         self.stream.read(buf)
     }
 }

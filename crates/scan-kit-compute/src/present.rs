@@ -388,12 +388,20 @@ fn strings(input: &Value, key: &str) -> Result<Vec<String>, String> {
 
 fn dim(input: &Value, key: &str, fallback: u32) -> Result<u32, String> {
     match input.get(key) {
-        Some(value) => u32::try_from(
-            value
-                .as_u64()
-                .ok_or_else(|| format!("{key} must be an integer"))?,
-        )
-        .map_err(|_| format!("{key} is out of range")),
+        Some(value) => {
+            let dim = u32::try_from(
+                value
+                    .as_u64()
+                    .ok_or_else(|| format!("{key} must be an integer"))?,
+            )
+            .map_err(|_| format!("{key} is out of range"))?;
+            // The same bound Plot::apply clamps to — a huge dim would ask the
+            // renderer for an oversized frame buffer.
+            if dim > 8192 {
+                return Err(format!("{key} is out of range"));
+            }
+            Ok(dim)
+        }
         None => Ok(fallback),
     }
 }
@@ -477,6 +485,7 @@ mod tests {
         let base = json!({"view": "bins", "path": ".", "session_ids": []});
         for (key, value) in [
             ("width", json!("640")),
+            ("width", json!(65536)),
             ("height", json!(true)),
             ("options", json!(5)),
             ("background", json!("red")),

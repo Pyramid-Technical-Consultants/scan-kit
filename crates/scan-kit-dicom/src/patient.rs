@@ -1717,9 +1717,10 @@ pub fn write_rtdose(
     let peak = dose.iter().fold(0.0f64, |peak, &v| {
         peak.max(if v.is_nan() { 0.0 } else { v as f64 })
     });
-    if !peak.is_finite() {
+    if !peak.is_finite() || dose.contains(&f32::NEG_INFINITY) {
         // An infinite voxel would quantize every value to 0 and write an
-        // "inf" DoseGridScaling the reader itself rejects.
+        // "inf" DoseGridScaling the reader itself rejects — and -inf never
+        // raises the peak, so it needs its own check.
         return Err("the dose contains non-finite values".into());
     }
     let scale = if peak > 0.0 { peak / 4.0e9 } else { 1.0 };
@@ -2632,6 +2633,18 @@ mod tests {
         assert!(write_rtdose(
             &path,
             &[1.0, f32::INFINITY, 0.0, 0.0],
+            &ct,
+            "",
+            "PLAN",
+            "PHYSICAL",
+            "d",
+            ""
+        )
+        .is_err());
+        // -inf never raises the peak — it needs its own rejection.
+        assert!(write_rtdose(
+            &path,
+            &[1.0, f32::NEG_INFINITY, 0.0, 0.0],
             &ct,
             "",
             "PLAN",
