@@ -4326,6 +4326,12 @@ fn owns_pixel_px(p: [f32; 2], a: [f32; 2], b: [f32; 2], c: [f32; 2]) -> bool {
 }
 
 fn point_in_triangle(p: [f32; 2], a: [f32; 2], b: [f32; 2], c: [f32; 2]) -> bool {
+    // Same rejection as owns_pixel_px: a degenerate or NaN quad paints
+    // nothing, so it must not mask the series it hovers above.
+    let area = orient_px(a, b, c);
+    if area == 0.0 || !area.is_finite() {
+        return false;
+    }
     let sign = |p: [f32; 2], a: [f32; 2], b: [f32; 2]| {
         (p[0] - b[0]) * (a[1] - b[1]) - (a[0] - b[0]) * (p[1] - b[1])
     };
@@ -7392,7 +7398,9 @@ fn panel_rects(
     let cols = if columns == 0 {
         (count as f32).sqrt().ceil() as usize
     } else {
-        columns.max(1) as usize
+        // Columns beyond the panel count are meaningless — an unvalidated
+        // header value would size the weight/layout vectors into an abort.
+        (columns.max(1) as usize).min(count.max(1))
     };
     let rows = count.div_ceil(cols);
     let gap = 12.0f32;
@@ -12626,5 +12634,19 @@ mod tests {
             "manual window applies: {}",
             grid.hi
         );
+    }
+
+    #[test]
+    fn a_degenerate_triangle_covers_nothing() {
+        let v = [10.0f32, 10.0];
+        assert!(!point_in_triangle(v, v, v, v));
+        assert!(!point_in_triangle(v, v, v, [20.0, 20.0]));
+        assert!(!point_in_triangle(
+            v,
+            [f32::NAN, 0.0],
+            [0.0, 0.0],
+            [1.0, 1.0]
+        ));
+        assert!(point_in_triangle(v, [0.0, 0.0], [20.0, 0.0], [0.0, 20.0]));
     }
 }

@@ -75,6 +75,11 @@ impl VolumeScan {
             .saturating_mul(expect[2]);
         self.brick_shape == expect
             && self.bricks.len() == bricks
+            && self
+                .peak_at
+                .iter()
+                .zip(shape.iter())
+                .all(|(&peak, &side)| peak < side)
             && self.integrals[0].len() == shape[0].saturating_mul(shape[1])
             && self.integrals[1].len() == shape[0].saturating_mul(shape[2])
             && self.integrals[2].len() == shape[1].saturating_mul(shape[2])
@@ -1638,5 +1643,14 @@ mod tests {
         let steps = steps_to_leave([8.0 - 6e-5, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0; 3], 1.0);
         assert!(steps <= MAX_STEPS, "{steps}");
         assert!(steps >= 1);
+    }
+
+    #[test]
+    fn an_out_of_bounds_peak_does_not_cover() {
+        let shape = [4usize, 4, 4];
+        let mut scan = scan_grid(&vec![1.0; 64], shape, 1.0);
+        assert!(scan.covers(shape));
+        scan.peak_at = [usize::MAX, 0, 0];
+        assert!(!scan.covers(shape));
     }
 }
