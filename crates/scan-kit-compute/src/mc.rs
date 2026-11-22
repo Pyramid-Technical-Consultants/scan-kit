@@ -421,9 +421,19 @@ fn patient_launch(request: &PatientRequest) -> Result<Launch, ComputeError> {
             "beams must be whole 16-float records".into(),
         ));
     }
+    if !request.spots.len().is_multiple_of(40) {
+        return Err(ComputeError::Message(
+            "spots must be whole 40-float records".into(),
+        ));
+    }
     let mut kept_spots = Vec::new();
     let mut weights = Vec::new();
     let rows = request.spots.len() / 40;
+    if request.protons.len() != rows {
+        return Err(ComputeError::Message(
+            "protons must carry one weight per spot record".into(),
+        ));
+    }
     for row in 0..rows {
         let weight = request.protons.get(row).copied().unwrap_or(0.0);
         if weight.is_finite() && weight > 0.0 {
@@ -434,15 +444,22 @@ fn patient_launch(request: &PatientRequest) -> Result<Launch, ComputeError> {
                 ));
             }
             let beam = record[6];
-            if beam < 0.0 || beam as usize >= request.beams.len() / 16 {
+            if beam < 0.0 || beam.fract() != 0.0 || beam as usize >= request.beams.len() / 16 {
                 return Err(ComputeError::Message("spot beam index out of range".into()));
             }
             // spots[32..35] = range shifter (lo, material, rho); a shifted
             // spot's material indexes mc_tables().media like slab_launch's.
-            if record[32] > 0.0 && !(0.0..media as f32).contains(&record[34]) {
-                return Err(ComputeError::Message(
-                    "spot range-shifter material out of range".into(),
-                ));
+            if record[32] > 0.0 {
+                if !(0.0..media as f32).contains(&record[34]) || record[34].fract() != 0.0 {
+                    return Err(ComputeError::Message(
+                        "spot range-shifter material out of range".into(),
+                    ));
+                }
+                if record[35] <= 0.0 {
+                    return Err(ComputeError::Message(
+                        "spot range-shifter density must be positive".into(),
+                    ));
+                }
             }
             kept_spots.extend_from_slice(record);
             weights.push(f64::from(weight));
@@ -525,8 +542,15 @@ struct McGpu {
 /// One device and one compiled transport for the process. Opening a device and
 /// the transport shader is the slow part of switching into Monte Carlo.
 /// ponytail: one shared queue. Two runs at once interleave submits on it.
+static GPU: Mutex<Option<Arc<McGpu>>> = Mutex::new(None);
+
+/// A wedged or lost device would otherwise poison every future run — drop the
+/// cache so the next open builds a fresh device instead of cloning a dead one.
+fn gpu_lost() {
+    *GPU.lock().unwrap_or_else(|err| err.into_inner()) = None;
+}
+
 async fn shared_gpu() -> Result<Arc<McGpu>, ComputeError> {
-    static GPU: Mutex<Option<Arc<McGpu>>> = Mutex::new(None);
     static OPENING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
     if let Some(gpu) = GPU
         .lock()
@@ -687,7 +711,7 @@ async fn prepare(launch: Launch) -> Result<Live, ComputeError> {
         cap,
         nvox,
         scale,
-        shape: [nx, ny, nz],
+        shape: [nx.max(1), ny.max(1), nz.max(1)],
         origin: launch.origin_mm,
         spacing: launch.spacing_cm.map(|cm| cm * 10.0),
         inflight: VecDeque::new(),
@@ -911,6 +935,7 @@ impl Live {
                 return Ok(started.elapsed());
             }
             if started.elapsed() > Duration::from_secs(30) {
+                gpu_lost();
                 return Err(ComputeError::Message(
                     "GPU submission did not retire".into(),
                 ));
@@ -925,7 +950,10 @@ impl Live {
             }) {
                 Ok(_) => return Ok(started.elapsed()),
                 Err(wgpu::PollError::Timeout) => continue,
-                Err(err) => return Err(ComputeError::Message(err.to_string())),
+                Err(err) => {
+                    gpu_lost();
+                    return Err(ComputeError::Message(err.to_string()));
+                }
             }
         }
     }
@@ -1005,6 +1033,7 @@ impl Live {
                 return Err(ComputeError::Message("cancelled".into()));
             }
             if started.elapsed() > Duration::from_secs(30) {
+                gpu_lost();
                 return Err(ComputeError::Message(
                     "GPU submission did not retire".into(),
                 ));
@@ -1014,7 +1043,10 @@ impl Live {
                 timeout: Some(Duration::from_millis(50)),
             }) {
                 Ok(_) | Err(wgpu::PollError::Timeout) => {}
-                Err(err) => return Err(ComputeError::Message(err.to_string())),
+                Err(err) => {
+                    gpu_lost();
+                    return Err(ComputeError::Message(err.to_string()));
+                }
             }
             match ticket.receiver.try_recv() {
                 Ok(result) => {
