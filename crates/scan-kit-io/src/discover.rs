@@ -277,6 +277,10 @@ pub(crate) fn add_directory(
     entry: Discovered,
     rel: &str,
 ) {
+    if !valid_session_id(&entry.session_id) {
+        skipped.push(format!("{} ({rel})", entry.session_id));
+        return;
+    }
     if entries
         .iter()
         .any(|have| have.session_id == entry.session_id)
@@ -861,6 +865,26 @@ pub fn write_zip(path: &Path, members: &[(&str, &[u8])]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_directory_with_an_invalid_session_id_is_skipped() {
+        // An id that fails valid_session_id could never be trashed or deleted
+        // — browsing it would trap the row in the catalog.
+        let mut entries = Vec::new();
+        let mut skipped = Vec::new();
+        add_directory(
+            &mut entries,
+            &mut skipped,
+            Discovered {
+                session_id: "not:a:session".into(),
+                storage_path: PathBuf::from("/lib/not:a:session"),
+                kind: "directory",
+            },
+            "not:a:session",
+        );
+        assert!(entries.is_empty());
+        assert_eq!(skipped.len(), 1);
+    }
 
     #[test]
     fn an_over_cap_member_errors_instead_of_eating_memory() {

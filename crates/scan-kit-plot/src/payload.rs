@@ -519,6 +519,14 @@ pub fn plot_header(bytes: &[u8]) -> Result<PlotHeader, String> {
     decode_plot(bytes).map(|(header, _, _, _, _)| header)
 }
 
+impl PlotHeader {
+    /// The payload defers its line prefix to the previous plot — a stateless
+    /// decode cannot render it.
+    pub fn reuses_lines(&self) -> bool {
+        self.reuse_lines
+    }
+}
+
 /// GPU bytes already packed by [`encode_plot_quality`]. Uploading these skips a
 /// second pass through the mark structs.
 #[derive(Clone)]

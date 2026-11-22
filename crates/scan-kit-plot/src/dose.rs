@@ -394,6 +394,7 @@ pub fn shade_uv(
     grid: &DoseGrid,
     view: &ViewSample,
     plane: Option<&PlaneImage>,
+    limits: (f32, f32),
     uv: [f32; 2],
 ) -> [f32; 4] {
     if view.plane == 3 {
@@ -412,11 +413,9 @@ pub fn shade_uv(
     // integer depth the shader's z weights collapse onto this slice.
     let filter = if view.integral { 0 } else { grid.filter };
     let dose = image_sample(&image.values, image.cols, image.rows, x, y, filter);
-    let (lo, hi) = if image.own {
-        integral_limits(grid, view.plane)
-    } else {
-        window(grid)
-    };
+    // The caller computes the window once per plane — integral_limits is an
+    // O(voxels) scan that must not run per pixel.
+    let (lo, hi) = if image.own { limits } else { window(grid) };
     let t = ((dose * grid.gain - lo) / (hi - lo).max(1e-6)).clamp(0.0, 1.0);
     let rgb = sample(grid.ramp, t);
     let under = ct_under(grid, view, film);
@@ -884,7 +883,13 @@ mod tests {
         assert_eq!((plane.cols, plane.rows), (2, 1));
         assert_eq!(plane.values[0], 10.0);
         let shown = unturn_uv([0.25, 0.5], 1);
-        let color = shade_uv(&grid, &view, Some(&plane), [shown[0] * FILM_X, shown[1]]);
+        let color = shade_uv(
+            &grid,
+            &view,
+            Some(&plane),
+            integral_limits(&grid, view.plane),
+            [shown[0] * FILM_X, shown[1]],
+        );
         let hot = sample(1, 1.0);
         assert!((color[0] - hot[0]).abs() < 1e-3);
         assert!((color[1] - hot[1]).abs() < 1e-3);
@@ -944,7 +949,13 @@ mod tests {
             center: [0.0; 3],
         };
         let plane = prepare_plane(&grid, &view).unwrap();
-        let color = shade_uv(&grid, &view, Some(&plane), [0.5 * FILM_X, 0.5]);
+        let color = shade_uv(
+            &grid,
+            &view,
+            Some(&plane),
+            integral_limits(&grid, view.plane),
+            [0.5 * FILM_X, 0.5],
+        );
         let expected = sample(1, 0.375);
         assert!((color[0] - expected[0]).abs() < 1e-3);
         assert!((color[1] - expected[1]).abs() < 1e-3);

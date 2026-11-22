@@ -334,6 +334,17 @@ pub fn sync_entry(conn: &Connection, lib_id: i64, entry: &Discovered) -> Result<
 
     let path = entry.storage_path.to_string_lossy().to_string();
     if let Some(existing) = existing {
+        if fingerprint.is_none() {
+            // A transient stat failure (UNC hiccup, locked marker) must not
+            // NULL out the hydrated metadata — keep it and retry next scan.
+            conn.execute(
+                "UPDATE sessions SET storage_path = ?1, kind = ?2
+                 WHERE library_id = ?3 AND session_id = ?4",
+                params![path, entry.kind, lib_id, entry.session_id],
+            )
+            .map_err(|err| err.to_string())?;
+            return Ok(Cache::Ready);
+        }
         if fingerprint.is_some() && existing.size == size && existing.mtime_ns == mtime_ns {
             conn.execute(
                 "UPDATE sessions SET storage_path = ?1, kind = ?2

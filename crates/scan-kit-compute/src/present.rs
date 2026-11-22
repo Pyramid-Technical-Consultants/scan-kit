@@ -153,6 +153,12 @@ pub fn run_view(
         palette,
     )?;
     let header = scan_kit_plot::plot_header(&bytes)?;
+    if header.reuses_lines() {
+        // Reuse payloads carry only the line suffix — the batch indices
+        // address a buffer only the previous plot holds, and this path is
+        // stateless.
+        return Err("payload needs the previous plot's line buffer".into());
+    }
     let mut plot = Plot::from_payload(&bytes)?;
     let frame = plot.draw(width, height, &PlotInput::default())?;
     Ok(json!({
