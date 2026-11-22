@@ -215,7 +215,9 @@ pub fn quantile_edges(values: &[f32], n_bins: usize) -> Vec<f32> {
         .map(|step| step as f32 / n_bins as f32)
         .collect();
     let mut edges = crate::stats::quantiles_at(&mut finite, &qs);
-    edges.dedup_by(|a, b| (*a - *b).abs() < 1e-6);
+    // Relative epsilon — an absolute 1e-6 swallows every edge in a column
+    // whose data lives at a smaller scale (charge integrals, ratios).
+    edges.dedup_by(|a, b| (*a - *b).abs() <= 1e-9 * a.abs().max(*b).max(1e-30));
     if edges.len() < 2 {
         let lo = edges.first().copied().unwrap_or(0.0);
         return vec![lo - 0.5, lo + 0.5];
@@ -319,7 +321,9 @@ pub fn histogram(values: &[f32], bins: usize) -> (Vec<f32>, Vec<f32>) {
         lo = lo.min(*value);
         hi = hi.max(*value);
     }
-    if (hi - lo).abs() < 1e-12 {
+    // "Flat" is relative to the data's scale — an absolute floor calls a
+    // 1e-13-wide column flat and bins every distinct value into one bucket.
+    if (hi - lo).abs() <= 1e-12 * hi.abs().max(lo.abs()).max(1e-30) {
         lo -= 0.5;
         hi += 0.5;
     }
@@ -385,7 +389,9 @@ pub fn welch_psd(
     if count == 0 {
         return (Vec::new(), Vec::new());
     }
-    let scale = (count as f32) * win_power.max(1e-12);
+    // scipy welch divides by fs * sum(w^2) per segment — without fs every
+    // PSD value reads fs times too large.
+    let scale = fs * (count as f32) * win_power.max(1e-12);
     let last = psd.len().saturating_sub(1);
     for (i, bin) in psd.iter_mut().enumerate() {
         *bin /= scale;
@@ -486,6 +492,9 @@ pub fn splat_gaussians(
 ) -> Vec<f32> {
     let [nx, ny, nz] = shape;
     let mut grid = vec![0.0f32; nx * ny * nz];
+    if spacing.iter().any(|s| !s.is_finite() || *s <= 0.0) {
+        return grid;
+    }
     for spot in spots {
         let [x, y, z, weight, sigma] = *spot;
         if !sigma.is_finite() || sigma <= 0.0 || !weight.is_finite() {
@@ -599,7 +608,9 @@ pub fn linear_fit(xs: &[f32], ys: &[f32]) -> Option<(f32, f32)> {
 pub fn dvh(dose: &[f32], mask: &[bool], bins: usize) -> (Vec<f32>, Vec<f32>) {
     let selected: Vec<f32> = dose
         .iter()
-        .zip(mask.iter().chain(std::iter::repeat(&true)))
+        // A mask shorter than the dose means the tail is not selected —
+        // defaulting true silently counted it into the coverage volume.
+        .zip(mask.iter().chain(std::iter::repeat(&false)))
         .filter_map(|(value, keep)| (*keep && value.is_finite() && *value >= 0.0).then_some(*value))
         .collect();
     let (edges, counts) = histogram(&selected, bins);
@@ -1185,5 +1196,45 @@ mod tests {
     fn an_empty_selection_reports_zero_dvh_coverage() {
         let (_, cumulative) = dvh(&[], &[true], 10);
         assert!(cumulative.iter().all(|value| *value == 0.0));
+    }
+
+    #[test]
+    fn quantile_edges_follow_the_data_scale() {
+        let edges = quantile_edges(&[1e-9, 2e-9, 3e-9], 3);
+        assert!(edges.len() >= 2, "{edges:?}");
+        assert!(edges.iter().all(|e| e.abs() < 1e-6), "{edges:?}");
+    }
+
+    #[test]
+    fn histogram_bins_a_column_below_the_absolute_floor() {
+        let (edges, counts) = histogram(&[1e-13, 2e-13, 3e-13], 2);
+        assert!(edges.iter().all(|e| e.abs() < 1e-10), "{edges:?}");
+        assert_eq!(counts.iter().sum::<f32>(), 3.0);
+    }
+
+    #[test]
+    fn welch_psd_normalizes_by_sample_rate() {
+        let signal: Vec<f32> = (0..1024).map(|i| (i as f32 * 0.1).sin()).collect();
+        let (_, fast) = welch_psd(&signal, 1000.0, 256, 0.5);
+        let (_, slow) = welch_psd(&signal, 100.0, 256, 0.5);
+        let peak = |psd: &[f32]| psd.iter().cloned().fold(0.0f32, f32::max);
+        assert!((peak(&slow) / peak(&fast) - 10.0).abs() < 0.5);
+    }
+
+    #[test]
+    fn a_short_mask_does_not_select_the_dvh_tail() {
+        let (_, curve) = dvh(&[0.0, 1.0, 2.0], &[true], 4);
+        assert_eq!(curve, vec![1.0, 1.0, 1.0, 0.0]);
+    }
+
+    #[test]
+    fn zero_spacing_returns_an_empty_grid() {
+        let grid = splat_gaussians(
+            &[[0.0, 0.0, 0.0, 1.0, 1.0]],
+            [0.0; 3],
+            [0.0, 1.0, 1.0],
+            [4, 4, 4],
+        );
+        assert!(grid.iter().all(|v| *v == 0.0));
     }
 }

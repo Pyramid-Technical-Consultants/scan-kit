@@ -89,3 +89,32 @@ it("writes a phantom study from the catalog defaults", async () => {
   );
   expect(document.body.textContent).toContain("Wrote 70 CT slices");
 });
+
+it("a cleared numeric field never ships 0 to the preview", async () => {
+  const host = document.createElement("div");
+  document.body.append(host);
+  await act(async () => {
+    root = createRoot(host);
+    root.render(<PhantomSynthesis />);
+  });
+  await act(async () => {
+    await new Promise((resolve) => setTimeout(resolve, 300));
+  });
+  const label = [...document.body.querySelectorAll("label")].find((item) =>
+    item.textContent?.includes("Pixel Spacing"),
+  );
+  const field = label?.parentElement?.querySelector("input");
+  expect(field).toBeTruthy();
+  const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!;
+  await act(async () => {
+    setter!.call(field, "");
+    field!.dispatchEvent(new Event("input", { bubbles: true }));
+    await new Promise((resolve) => setTimeout(resolve, 300));
+  });
+  const previews = vi
+    .mocked(invoke)
+    .mock.calls.filter(([command]) => command === "scan_kit_phantom_preview")
+    .map(([, args]) => (args as { params: { pixel?: unknown } }).params.pixel);
+  expect(previews.length).toBeGreaterThan(0);
+  expect(previews).not.toContain(0);
+});

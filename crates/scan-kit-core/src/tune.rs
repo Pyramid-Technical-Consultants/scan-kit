@@ -1127,18 +1127,14 @@ fn band_coeffs(elem: &Elem) -> Option<(f64, f64, f64, f64, f64, f64)> {
     if !min_e.is_finite() || !max_e.is_finite() {
         return None;
     }
-    let coeff = |name: &str| {
-        elem.attr(name)
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(0.0)
-    };
+    let coeff = |name: &str| elem.attr(name)?.parse::<f64>().ok();
     Some((
         min_e,
         max_e,
-        coeff("K1"),
-        coeff("K2"),
-        coeff("K3"),
-        coeff("K0"),
+        coeff("K1")?,
+        coeff("K2")?,
+        coeff("K3")?,
+        coeff("K0")?,
     ))
 }
 
@@ -1671,5 +1667,19 @@ mod tests {
     fn band_k0_ignores_nonpositive_samples() {
         assert!(band_k0(&[0.0, -1.0], 20.0, 5.0).is_nan());
         assert!(band_k0(&[0.0, 4.0], 20.0, 5.0).is_finite());
+    }
+
+    #[test]
+    fn a_malformed_coefficient_fails_the_band() {
+        let dom = parse_xml(
+            r#"<devices><band min_energy="70" max_energy="250" K0="5" K1="bad" K2="0" K3="0"/></devices>"#,
+        )
+        .unwrap();
+        assert!(band_coeffs(&dom.children[0]).is_none());
+        let ok = parse_xml(
+            r#"<devices><band min_energy="70" max_energy="250" K0="5" K1="1" K2="0" K3="0"/></devices>"#,
+        )
+        .unwrap();
+        assert!(band_coeffs(&ok.children[0]).is_some());
     }
 }

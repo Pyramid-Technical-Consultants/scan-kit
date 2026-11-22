@@ -569,7 +569,7 @@ pub(super) fn hist_panel(
     } else {
         Vec::new()
     };
-    histogram_panel("", &columns, bins, shared, range, &guides)
+    histogram_panel(series.label, &columns, bins, shared, range, &guides)
 }
 
 pub(super) fn corr_panel(

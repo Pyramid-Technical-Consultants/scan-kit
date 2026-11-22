@@ -14,15 +14,15 @@ type Choice = { value: string; label: string };
 type Params = {
   phantom: string;
   position: string;
-  pixel: number;
-  slice: number;
+  pixel: number | string;
+  slice: number | string;
   energies: number[];
-  gantry: number;
-  couch: number;
-  spot_pitch: number;
-  range_shifter_wet: number;
-  mu_per_spot: number;
-  fractions: number;
+  gantry: number | string;
+  couch: number | string;
+  spot_pitch: number | string;
+  range_shifter_wet: number | string;
+  mu_per_spot: number | string;
+  fractions: number | string;
 };
 type Catalog = {
   phantoms: Choice[];
@@ -156,13 +156,13 @@ export function PhantomSynthesis() {
           param={{ label: "Pixel Spacing (mm)", kind: "float", step: 0.25 }}
           value={params.pixel}
           finiteOnly
-          onChange={(pixel) => setParams({ ...params, pixel: Number(pixel) })}
+          onChange={(pixel) => setParams({ ...params, pixel: pixel as Params["pixel"] })}
         />
         <CatalogField
           param={{ label: "Slice Thickness (mm)", kind: "float", step: 0.5 }}
           value={params.slice}
           finiteOnly
-          onChange={(slice) => setParams({ ...params, slice: Number(slice) })}
+          onChange={(slice) => setParams({ ...params, slice: slice as Params["slice"] })}
         />
         <Field>
           <FieldLabel>Energy Layers (MeV)</FieldLabel>
@@ -220,37 +220,37 @@ export function PhantomSynthesis() {
           param={{ label: "Gantry Angle (°)", kind: "float", step: 15 }}
           value={params.gantry}
           finiteOnly
-          onChange={(gantry) => setParams({ ...params, gantry: Number(gantry) })}
+          onChange={(gantry) => setParams({ ...params, gantry: gantry as Params["gantry"] })}
         />
         <CatalogField
           param={{ label: "Couch Angle (°)", kind: "float", step: 15 }}
           value={params.couch}
           finiteOnly
-          onChange={(couch) => setParams({ ...params, couch: Number(couch) })}
+          onChange={(couch) => setParams({ ...params, couch: couch as Params["couch"] })}
         />
         <CatalogField
           param={{ label: "Spot Pitch (mm)", kind: "float", step: 1 }}
           value={params.spot_pitch}
           finiteOnly
-          onChange={(spot_pitch) => setParams({ ...params, spot_pitch: Number(spot_pitch) })}
+          onChange={(spot_pitch) => setParams({ ...params, spot_pitch: spot_pitch as Params["spot_pitch"] })}
         />
         <CatalogField
           param={{ label: "Range Shifter WET (mm)", kind: "float", step: 5 }}
           value={params.range_shifter_wet}
           finiteOnly
-          onChange={(range_shifter_wet) => setParams({ ...params, range_shifter_wet: Number(range_shifter_wet) })}
+          onChange={(range_shifter_wet) => setParams({ ...params, range_shifter_wet: range_shifter_wet as Params["range_shifter_wet"] })}
         />
         <CatalogField
           param={{ label: "MU per Spot", kind: "float", step: 0.01 }}
           value={params.mu_per_spot}
           finiteOnly
-          onChange={(mu_per_spot) => setParams({ ...params, mu_per_spot: Number(mu_per_spot) })}
+          onChange={(mu_per_spot) => setParams({ ...params, mu_per_spot: mu_per_spot as Params["mu_per_spot"] })}
         />
         <CatalogField
           param={{ label: "Fractions", kind: "float", step: 1 }}
           value={params.fractions}
           finiteOnly
-          onChange={(fractions) => setParams({ ...params, fractions: Number(fractions) })}
+          onChange={(fractions) => setParams({ ...params, fractions: fractions as Params["fractions"] })}
         />
         <Button type="button" disabled={busy} onClick={() => void writeStudy()}>
           Write DICOM

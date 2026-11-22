@@ -193,7 +193,7 @@ fn timed_source(
     style: CloudStyle,
     cutoff: f32,
 ) -> Option<Series> {
-    if times.len() != xs.len() || times.is_empty() {
+    if times.len() != xs.len() || times.is_empty() || ys.len() != xs.len() {
         return None;
     }
     let (xs, ys, times) = sorted_cloud(xs, ys, times);
@@ -597,5 +597,18 @@ mod tests {
         };
         assert_eq!(*cols, CLOUD_BINS as u32);
         assert_eq!(values.iter().sum::<f32>(), 40.0);
+    }
+
+    #[test]
+    fn a_ragged_ys_does_not_panic() {
+        let _ = cloud_series(
+            &[1.0, 2.0, 3.0],
+            &[1.0],
+            &[0.0, 1.0, 2.0],
+            CloudDraw::Scatter {
+                color: [1.0; 4],
+                radius: 1.0,
+            },
+        );
     }
 }

@@ -612,7 +612,9 @@ fn session_stamp(root: &Path, session: &str) -> u128 {
     for name in ["spot_data.csv", "input_map.csv"] {
         stamp ^= discover::meta_stamp(&dir.join(name));
     }
-    stamp
+    // A same-length timeslice rewrite leaves the row-count keys unchanged —
+    // without this the grown violins keep serving the previous distribution.
+    stamp ^ discover::timeslice_stamp(&dir)
 }
 
 fn mtime_ns(path: &Path) -> u128 {
@@ -785,13 +787,25 @@ pub(crate) fn bins(root: &Path, session_ids: &[String], options: &Value) -> Plot
             names.push(x_column);
             let loaded = session_columns(root, session, grain, &names);
             let clock = time_end(loaded.get("time_s").map(Vec::as_slice));
-            let loaded = if group.id == "dose_rate" {
-                std::sync::Arc::new(dose_rate_table(loaded.as_ref()))
+            let (loaded, protect): (_, &[&str]) = if group.id == "dose_rate" {
+                // dose_rate_table aliases the per-layer rate_energy to
+                // energy — protect it from the per-spot time mask too.
+                (
+                    std::sync::Arc::new(dose_rate_table(loaded.as_ref())),
+                    &["energy"],
+                )
             } else {
-                loaded
+                (loaded, &[])
             };
             (
-                plotted_columns(loaded.as_ref(), &names, &metric, &segments, group.filter),
+                plotted_columns(
+                    loaded.as_ref(),
+                    &names,
+                    &metric,
+                    &segments,
+                    group.filter,
+                    protect,
+                ),
                 clock,
             )
         };
@@ -821,6 +835,13 @@ pub(crate) fn bins(root: &Path, session_ids: &[String], options: &Value) -> Plot
             end = end.max(clock);
             tables.push(table);
         }
+        // A menu-offered column the active grain never emits would draw an
+        // empty category axis — fall back to the one column every grain has.
+        let x_column = if tables.iter().all(|table| !table.contains_key(x_column)) {
+            "energy"
+        } else {
+            x_column
+        };
         let (categories, stable_bins) = if raw_x {
             (Vec::new(), false)
         } else {
@@ -994,7 +1015,7 @@ pub(crate) fn bins(root: &Path, session_ids: &[String], options: &Value) -> Plot
     let mut weights = vec![8.0];
     weights.extend(std::iter::repeat_n(1.65, side as usize));
     PlotScene {
-        title: format!("{} vs {}", group.label, x_label(x_column)),
+        title: format!("{} vs {}", group.label, x_label(&prepared.x_column)),
         panels,
         controls: {
             let mut controls = controls(
@@ -1199,7 +1220,10 @@ fn assemble_panel(
     Panel {
         title: item.label.clone(),
         y_label: item.y_label.clone(),
-        x_label: String::new(),
+        // An empty x label is how the renderer recognizes a time panel —
+        // bins panels must carry a real label or a scrub re-fits them to
+        // the seconds window and clips their guides.
+        x_label: x_label(x_column).to_owned(),
         xmin: prepared.xmin,
         xmax: prepared.xmax,
         ymin: item.ymin,
@@ -1492,6 +1516,7 @@ fn plotted_columns(
     rank_on: &[&str],
     segments: &[Segment],
     filter: bool,
+    extra_protect: &[&str],
 ) -> BTreeMap<String, Vec<f32>> {
     let rank_on: Vec<&str> = rank_on
         .iter()
@@ -1536,7 +1561,14 @@ fn plotted_columns(
             continue;
         }
         let mut values = values.clone();
-        let protect = matches!(name, "beam_on" | "expected_sigma" | "session_avg_rate");
+        // rate_energy/mu_rate are per-layer summaries — masking them by
+        // spot-row timestamps misaligns the two row domains. extra_protect
+        // covers caller-renamed columns like the dose-rate table's energy.
+        let protect = extra_protect.contains(&name)
+            || matches!(
+                name,
+                "beam_on" | "expected_sigma" | "session_avg_rate" | "rate_energy" | "mu_rate"
+            );
         if let Some(mask) = &mask {
             if !protect {
                 for (value, keep) in values.iter_mut().zip(mask.iter()) {
@@ -1612,8 +1644,8 @@ mod tests {
     use scan_kit_core::{apply_mask, parse_segments, BeamGate, Rank, Segment};
 
     use super::{
-        assign_x, axis_label, binned_trend, bins, plotted_columns, scatter_series, violin_series,
-        BinChoice, Trend,
+        assign_x, axis_label, binned_trend, bins, dose_rate_table, plotted_columns, scatter_series,
+        violin_series, BinChoice, Trend,
     };
 
     #[test]
@@ -2557,6 +2589,7 @@ mod tests {
                 which: Rank::Lower95,
             }],
             true,
+            &[],
         );
         assert!(
             ranked["energy"].contains(&230.0),
@@ -2903,5 +2936,55 @@ mod tests {
             )));
         }
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn layer_rate_columns_survive_the_spot_time_mask() {
+        // rate_energy/mu_rate index layer rows; the playhead mask indexes
+        // spot rows — masking them positionally was misalignment.
+        let mut loaded = BTreeMap::new();
+        loaded.insert("time_s".to_string(), vec![0.0, 1.0, 2.0]);
+        loaded.insert("rate_energy".to_string(), vec![100.0, 120.0]);
+        loaded.insert("mu_rate".to_string(), vec![5.0, 6.0]);
+        let segments = vec![Segment::Range {
+            column: "time_s".to_string(),
+            lo: 0.5,
+            hi: 2.0,
+        }];
+        let table = plotted_columns(
+            &loaded,
+            &["rate_energy", "mu_rate"],
+            &[],
+            &segments,
+            false,
+            &[],
+        );
+        assert!(table["mu_rate"].iter().all(|v| v.is_finite()));
+        assert!(table["rate_energy"].iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn the_dose_rate_alias_survives_the_spot_time_mask() {
+        // dose_rate_table renames rate_energy to energy — the alias must get
+        // the same per-layer protection or the mask misaligns again.
+        let mut loaded = BTreeMap::new();
+        loaded.insert("time_s".to_string(), vec![0.0, 1.0, 2.0]);
+        loaded.insert("rate_energy".to_string(), vec![100.0, 120.0]);
+        loaded.insert("mu_rate".to_string(), vec![5.0, 6.0]);
+        let aliased = dose_rate_table(&loaded);
+        let segments = vec![Segment::Range {
+            column: "time_s".to_string(),
+            lo: 0.5,
+            hi: 2.0,
+        }];
+        let table = plotted_columns(
+            &aliased,
+            &["energy", "mu_rate"],
+            &[],
+            &segments,
+            false,
+            &["energy"],
+        );
+        assert!(table["energy"].iter().all(|v| v.is_finite()));
     }
 }

@@ -411,9 +411,9 @@ fn patient_launch(request: &PatientRequest) -> Result<Launch, ComputeError> {
     if request.material.iter().any(|&m| m as usize >= media) {
         return Err(ComputeError::Message("material index out of range".into()));
     }
-    if request.density.iter().any(|d| !d.is_finite() || *d < 0.0) {
+    if request.density.iter().any(|d| !d.is_finite() || *d <= 0.0) {
         return Err(ComputeError::Message(
-            "density must be finite and nonnegative".into(),
+            "density must be finite and positive".into(),
         ));
     }
     if !request.beams.len().is_multiple_of(16) {

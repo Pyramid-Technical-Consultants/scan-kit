@@ -943,6 +943,9 @@ export function AnalysisView({
       requestDraw();
     };
     const onDown = (event: PointerEvent) => {
+      if (event.button !== 0) {
+        return;
+      }
       dragging = true;
       node.setPointerCapture(event.pointerId);
       node.focus({ preventScroll: true });
@@ -1413,6 +1416,7 @@ export function AnalysisView({
         {viewId === "volumetric" ? (
           <Button
             variant="outline"
+            disabled={opening}
             onClick={() => {
               void invoke<{ save_dir: string | null }>("scan_kit_phantom_catalog")
                 .catch(() => ({ save_dir: null }))
@@ -1424,7 +1428,7 @@ export function AnalysisView({
                   }),
                 )
                 .then((selected) => {
-                if (typeof selected !== "string") {
+                if (typeof selected !== "string" || opening) {
                   return;
                 }
                 setOpening(true);
@@ -1448,6 +1452,7 @@ export function AnalysisView({
         {viewId === "volumetric" && studyPath != null ? (
           <Button
             variant="outline"
+            disabled={opening}
             onClick={() => {
               setStudyPath(null);
               setStudy(null);
