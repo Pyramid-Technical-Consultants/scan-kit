@@ -564,6 +564,14 @@ fn unwrap_update(value: &rmpv::Value) -> rmpv::Value {
     if let Some(last) = history_last(value) {
         return last;
     }
+    // A {$t,$d} map decodes to the full array — it IS the value. Letting it
+    // fall to the [v, ts] unwrap below collapses every array field to its
+    // first element.
+    if let rmpv::Value::Map(pairs) = value {
+        if pairs.iter().any(|(key, _)| key.as_str() == Some("$d")) {
+            return decode_blobs(value);
+        }
+    }
     let decoded = decode_blobs(value);
     let rmpv::Value::Array(items) = &decoded else {
         return decoded;
@@ -1255,5 +1263,21 @@ mod tests {
             }
         });
         port
+    }
+
+    #[test]
+    fn a_blob_array_update_keeps_every_element() {
+        let blob: Vec<u8> = [1.0f32, 2.0, 3.0]
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect();
+        let update = rmpv::Value::Map(vec![
+            (rmpv::Value::from("$t"), rmpv::Value::from(1i64)),
+            (rmpv::Value::from("$d"), rmpv::Value::Binary(blob)),
+        ]);
+        let rmpv::Value::Array(items) = unwrap_update(&update) else {
+            panic!("a blob decodes to the whole array");
+        };
+        assert_eq!(items.len(), 3);
     }
 }
