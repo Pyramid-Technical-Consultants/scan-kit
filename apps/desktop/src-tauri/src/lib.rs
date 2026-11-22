@@ -306,6 +306,9 @@ async fn scan_kit_reveal(path: String) -> Result<(), String> {
         if !target.exists() {
             return Err(format!("Nothing at {path}"));
         }
+        // Canonicalize so parent() is never "" for a bare relative name —
+        // xdg-open "" would exit nonzero while spawn() still reports Ok.
+        let target = std::fs::canonicalize(&target).unwrap_or(target);
         // explorer.exe often exits nonzero after the window is already open.
         std::process::Command::new(reveal_program())
             .args(reveal_args(&target))
@@ -337,6 +340,11 @@ fn reveal_args(path: &std::path::Path) -> Vec<std::ffi::OsString> {
     {
         if path.is_dir() {
             vec![path.as_os_str().to_os_string()]
+        } else if path.to_string_lossy().contains(',') {
+            // explorer parses commas in /select, as item separators — a
+            // comma path selects nothing, so open the folder instead.
+            let folder = path.parent().unwrap_or(path);
+            vec![folder.as_os_str().to_os_string()]
         } else {
             vec![std::ffi::OsString::from(format!(
                 "/select,{}",

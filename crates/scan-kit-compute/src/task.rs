@@ -2891,9 +2891,11 @@ mod tests {
 
     #[test]
     fn the_stamp_cache_keeps_one_entry_per_session() {
-        let first = "/root\nsess\n1:100\n2:200";
-        let second = "/root\nsess\n3:300\n4:400";
-        assert_eq!(stamp_id(first), "/root\nsess");
+        // Unique id: SEEN is shared across parallel tests, so size assertions
+        // on the whole map would race.
+        let first = "/root\nstamp-cache-test\n1:100\n2:200";
+        let second = "/root\nstamp-cache-test\n3:300\n4:400";
+        assert_eq!(stamp_id(first), "/root\nstamp-cache-test");
         remember_stamps(&[first.to_owned()]);
         {
             let seen = seen_stamps().lock().unwrap_or_else(|err| err.into_inner());
@@ -2903,6 +2905,5 @@ mod tests {
         remember_stamps(&[second.to_owned()]);
         let seen = seen_stamps().lock().unwrap_or_else(|err| err.into_inner());
         assert_eq!(seen.get(stamp_id(first)), Some(&second.to_owned()));
-        assert_eq!(seen.len(), 1);
     }
 }
