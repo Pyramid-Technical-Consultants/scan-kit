@@ -305,6 +305,11 @@ export default function App() {
   const libraryToken = useRef<object>({});
   const catalogEpoch = useRef(0);
   const selectionLive = useRef<string[]>([]);
+  const selectionWrites = useRef(0);
+  // The optimistic set during an in-flight write — a separate ref because
+  // selectionLive is effect-synced, and effect-touched refs may only be
+  // written inside effects.
+  const selectionPending = useRef<string[] | null>(null);
   const loadDepth = useRef(0);
   const noteBusy = useRef(false);
   const trashing = useRef(false);
@@ -383,9 +388,16 @@ export default function App() {
 
   const applyCatalog = useCallback((payload: CatalogPayload) => {
     setLocations(payload.locations);
-    setRows(payload.rows);
     setExams(payload.exams);
-    setSelectionOrder(payload.selected);
+    // A selection write is in flight — its optimistic state is newer than this
+    // payload, so keep it instead of reverting the checkmark mid-write.
+    if (selectionWrites.current > 0) {
+      const live = new Set(selectionPending.current ?? selectionLive.current);
+      setRows(payload.rows.map((item) => ({ ...item, selected: live.has(item.session_id) })));
+    } else {
+      setRows(payload.rows);
+      setSelectionOrder(payload.selected);
+    }
   }, []);
 
   const pullCatalog = useCallback(async () => {
@@ -423,7 +435,6 @@ export default function App() {
         }
         try {
           await pullCatalog();
-          dismissNotice();
           setUndo([]);
           setRedo([]);
           setLocationDraft("");
@@ -823,23 +834,34 @@ export default function App() {
     // stale state; the remote write catches up and a failure rolls back.
     const before = selectionOrder;
     const chosen = new Set(next.ids);
+    // The pull-side guard reads selectionPending synchronously — a passive
+    // effect would leave the old set visible to a catalog that lands mid-write.
+    selectionPending.current = next.ids;
     setSelectionOrder(next.ids);
     setRows((items) => items.map((item) => ({ ...item, selected: chosen.has(item.session_id) })));
     void (async () => {
-      for (const root of locations) {
-        const sessionIds = next.ids.flatMap((id) => {
-          const row = rows.find((item) => item.session_id === id);
-          if ((row?.library ?? locations[0]) !== root) {
-            return [];
-          }
-          return [row?.folder_id ?? id];
-        });
-        await invoke("scan_kit_select_sessions", { path: root, sessionIds });
-      }
-      if (next.capped) {
-        notify("At most five sessions can be selected.", "selection");
-      } else {
-        dismissNotice("selection");
+      selectionWrites.current += 1;
+      try {
+        for (const root of locations) {
+          const sessionIds = next.ids.flatMap((id) => {
+            const row = rows.find((item) => item.session_id === id);
+            if ((row?.library ?? locations[0]) !== root) {
+              return [];
+            }
+            return [row?.folder_id ?? id];
+          });
+          await invoke("scan_kit_select_sessions", { path: root, sessionIds });
+        }
+        if (next.capped) {
+          notify("At most five sessions can be selected.", "selection");
+        } else {
+          dismissNotice("selection");
+        }
+      } finally {
+        selectionWrites.current -= 1;
+        if (selectionWrites.current === 0) {
+          selectionPending.current = null;
+        }
       }
     })().catch((error: unknown) => {
       // Roll back only if nothing newer landed — a second check or a catalog
@@ -1235,7 +1257,12 @@ export default function App() {
                     () => notifyError("Could not copy the session id"),
                   );
                 }}
-                onTune={() => selectTab("Configuration Tuning")}
+                onTune={() => {
+                  if (!sessionMenu.rowIds.every((id) => selectedIds.includes(id))) {
+                    commitSelection(toggleListedSessions(selectedIds, sessionMenu.rowIds));
+                  }
+                  selectTab("Configuration Tuning");
+                }}
                 onToggleRows={() => {
                   commitSelection(toggleListedSessions(selectedIds, sessionMenu.rowIds));
                 }}
@@ -1445,6 +1472,7 @@ export default function App() {
         open={passwordFor != null}
         onOpenChange={(open) => {
           if (!open) {
+            pendingLocations.current = [];
             setPasswordFor(null);
             setPassword("");
           }

@@ -180,7 +180,7 @@ pub fn fit_shape(shape: [usize; 3]) -> [usize; 3] {
         let tiles = tile_count(fitted[2]);
         let tiles_y = fitted[2].div_ceil(tiles.max(1));
         let wide =
-            tiles.saturating_mul(fitted[0]) <= 2048 && tiles_y.saturating_mul(fitted[1]) <= 2048;
+            tiles.saturating_mul(fitted[0]) <= 2048 && tiles_y.saturating_mul(fitted[1]) <= 2047;
         if wide || fitted.iter().all(|axis| *axis <= 8) {
             break;
         }
@@ -318,33 +318,16 @@ fn fill_atlas(
     let [fx, fy, fz] = grid.volume.shape;
     let values = &grid.volume.values;
     let span = grid.span;
-    let x_of: Vec<usize> = (0..nx)
-        .map(|x| {
-            if fx == nx {
-                x
-            } else {
-                (x * fx / nx).min(fx - 1)
-            }
-        })
-        .collect();
-    let y_of: Vec<usize> = (0..ny)
-        .map(|y| {
-            if fy == ny {
-                y
-            } else {
-                (y * fy / ny).min(fy - 1)
-            }
-        })
-        .collect();
-    let z_of: Vec<usize> = (0..nz)
-        .map(|z| {
-            if fz == nz {
-                z
-            } else {
-                (z * fz / nz).min(fz - 1)
-            }
-        })
-        .collect();
+    let scale_map = |i: usize, real: usize, fitted: usize| {
+        if fitted == real {
+            i
+        } else {
+            ((i as u64 * real as u64) / fitted as u64).min(real as u64 - 1) as usize
+        }
+    };
+    let x_of: Vec<usize> = (0..nx).map(|x| scale_map(x, fx, nx)).collect();
+    let y_of: Vec<usize> = (0..ny).map(|y| scale_map(y, fy, ny)).collect();
+    let z_of: Vec<usize> = (0..nz).map(|z| scale_map(z, fz, nz)).collect();
     if grid.ct.is_empty() {
         for z in 0..nz {
             let tx = z % tiles;

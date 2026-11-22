@@ -557,6 +557,13 @@ pub(crate) fn decode_plot(
     let lines = decode_lines(&line_bytes);
     let points = decode_points(&point_bytes);
     let quads = decode_quads(&quad_bytes);
+    if header
+        .heatmap_size
+        .iter()
+        .any(|(cols, rows)| *cols == 0 || *rows == 0 || *cols > 4096 || *rows > 4096)
+    {
+        return Err("plot payload heatmap size out of range".into());
+    }
     let heatmaps = header
         .heatmap_size
         .iter()
@@ -586,8 +593,13 @@ pub(crate) fn decode_plot(
             .is_some_and(|end| end <= len)
     };
     // Line ranges address the full logical buffer: this payload's records
-    // after the `line_prefix` records an earlier payload already stored.
-    let line_len = (header.line_prefix as usize).saturating_add(marks.lines.len());
+    // after the `line_prefix` records an earlier payload already stored. A
+    // non-reuse payload owns the whole buffer — its records ARE the bound.
+    let line_len = if header.reuse_lines {
+        (header.line_prefix as usize).saturating_add(marks.lines.len())
+    } else {
+        marks.lines.len()
+    };
     for batch in &marks.panels {
         if !fits(batch.line_start, batch.line_count, line_len)
             || !fits(batch.point_start, batch.point_count, marks.points.len())
@@ -603,10 +615,12 @@ pub(crate) fn decode_plot(
                 .point_runs
                 .iter()
                 .any(|run| !fits(run.start, run.count, marks.points.len()))
-            || batch
-                .clouds
-                .iter()
-                .any(|cloud| !fits(cloud.start, cloud.count, marks.points.len()))
+            || batch.clouds.iter().any(|cloud| {
+                !fits(cloud.start, cloud.count, marks.points.len())
+                    || cloud.heatmap.is_some_and(|index| {
+                        marks.heatmap_size.get(index as usize) != Some(&(cloud.cols, cloud.rows))
+                    })
+            })
         {
             return Err("plot payload index out of range".into());
         }
@@ -1203,5 +1217,51 @@ mod tests {
         let start = 4 + json_len;
         let end = start + classic.len();
         assert_eq!(&packed[start..end], classic.as_slice());
+    }
+
+    #[test]
+    fn a_prefix_does_not_extend_the_range_of_a_non_reuse_payload() {
+        let scene = PlotScene {
+            title: "t".into(),
+            panels: vec![Panel {
+                title: String::new(),
+                y_label: String::new(),
+                x_label: String::new(),
+                xmin: 0.0,
+                xmax: 4.0,
+                ymin: 0.0,
+                ymax: 4.0,
+                series: vec![Series::Polyline {
+                    xs: vec![0.0, 1.0],
+                    ys: vec![0.0, 1.0],
+                    color: [1.0; 4],
+                    thickness: 1.0,
+                }],
+                x_labels: Vec::new(),
+                equal: false,
+            }],
+            controls: Vec::new(),
+            table: None,
+            columns: 1,
+            column_weights: vec![1.0],
+            row_weights: vec![1.0],
+            side: 0,
+            row_splits: Vec::new(),
+            volume: scan_kit_core::VolumeMark::default(),
+        };
+        let bytes = encode_plot(&scene, [0.0; 4], [1.0; 4]).unwrap();
+        let json_len = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
+        let mut header: serde_json::Value =
+            serde_json::from_slice(&bytes[4..4 + json_len]).unwrap();
+        assert_eq!(header["reuse_lines"], false);
+        // A nonzero prefix with reuse off must not widen the line range —
+        // the GPU would draw past the uploaded buffer.
+        header["line_prefix"] = serde_json::json!(1_000_000u64);
+        header["batches"][0]["line_start"] = serde_json::json!(u32::MAX - 1);
+        let json = serde_json::to_vec(&header).unwrap();
+        let mut out = (json.len() as u32).to_le_bytes().to_vec();
+        out.extend(&json);
+        out.extend(&bytes[4 + json_len..]);
+        assert!(decode_plot(&out).is_err());
     }
 }

@@ -52,6 +52,12 @@ impl BeamModel {
                 "{path:?} has fewer than 2 energy rows — not a usable BDL file"
             ));
         }
+        if !model.rows.windows(2).all(|pair| pair[1][0] > pair[0][0]) {
+            return Err(format!("{path:?} energy rows must be strictly increasing"));
+        }
+        if model.nozzle <= 0.0 || model.smx <= 0.0 || model.smy <= 0.0 {
+            return Err(format!("{path:?} is missing nozzle/SMX/SMY distances"));
+        }
         Ok(model)
     }
 
@@ -90,6 +96,7 @@ impl BeamModel {
                 let _count = lines.next();
                 let _header = lines.next();
                 for line in lines.by_ref() {
+                    let line = line.split('#').next().unwrap_or("");
                     let values: Vec<f32> = line
                         .split_whitespace()
                         .filter_map(|v| v.parse().ok())
@@ -98,6 +105,8 @@ impl BeamModel {
                         let mut row = [0.0; 18];
                         row.copy_from_slice(&values);
                         rows.push(row);
+                    } else if !rows.is_empty() {
+                        break;
                     }
                 }
             }
@@ -208,6 +217,9 @@ fn fill_spot(
     rec[14..20].copy_from_slice(&g1y);
     rec[20..26].copy_from_slice(&g2);
     rec[26..32].copy_from_slice(&g2y);
+    if wet_mm.is_finite() && wet_mm < 0.0 {
+        return Err(format!("negative range shifter thickness {wet_mm}"));
+    }
     if wet_mm > 0.0 || wet_mm.is_nan() {
         let wet = if wet_mm.is_nan() {
             model.shifter_wet
@@ -226,7 +238,13 @@ fn fill_spot(
                 )
             })?;
         let spr = model.shifter_density * tables.spr[medium];
-        let distance = if distance_mm.is_finite() {
+        if !spr.is_finite() || spr <= 0.0 {
+            return Err(format!(
+                "range shifter density {} gives no stopping power",
+                model.shifter_density
+            ));
+        }
+        let distance = if distance_mm.is_finite() && distance_mm > 0.0 {
             distance_mm
         } else {
             400.0
@@ -370,5 +388,67 @@ mod tests {
         let downstream = spot_record_bdl(100.0, 0.0, 0.0, 0.0, 0.0, f32::NAN, "dn").unwrap();
         assert_eq!(downstream[32], 0.0);
         assert!(protons_per_mu_bdl(100.0, "dn").is_finite());
+    }
+
+    #[test]
+    fn unsorted_rows_or_missing_geometry_error() {
+        let row = |first: &str| format!("{first} {}", "0 ".repeat(17));
+        let geometry = "Nozzle exit to Isocenter distance
+100
+            SMX to Isocenter distance
+50
+SMY to Isocenter distance
+50
+";
+        let dir = std::env::temp_dir().join(format!("scan-kit-bdl-sort-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let descending = format!(
+            "{geometry}Beam parameters
+2
+h
+{}
+{}
+",
+            row("200"),
+            row("100")
+        );
+        let file = dir.join("desc.txt");
+        std::fs::write(&file, &descending).unwrap();
+        let err = BeamModel::read(&file).err().unwrap();
+        assert!(err.contains("increasing"), "{err}");
+
+        let missing_smx = format!(
+            "Nozzle exit to Isocenter distance
+100
+Beam parameters
+2
+h
+{}
+{}
+",
+            row("100"),
+            row("200")
+        );
+        let file = dir.join("nogeo.txt");
+        std::fs::write(&file, &missing_smx).unwrap();
+        let err = BeamModel::read(&file).err().unwrap();
+        assert!(err.contains("SMX"), "{err}");
+
+        let good = format!(
+            "{geometry}Beam parameters
+2
+h
+{}
+{}
+",
+            row("100"),
+            row("200")
+        );
+        let file = dir.join("good.txt");
+        std::fs::write(&file, &good).unwrap();
+        assert!(BeamModel::read(&file).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

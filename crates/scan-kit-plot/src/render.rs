@@ -4038,7 +4038,14 @@ impl Plot {
         if self.volume_draw.is_some() || self.dose.is_none() {
             return Ok(());
         }
-        let limit = gpu.device.limits().max_texture_dimension_3d.max(1);
+        // upload_dose_f16 adds a 4-texel border on every axis — the limit
+        // applies to the texture, not the grid.
+        let limit = gpu
+            .device
+            .limits()
+            .max_texture_dimension_3d
+            .saturating_sub(4)
+            .max(1);
         let grid = self.dose.as_ref().unwrap();
         let max_axis = grid.volume.shape.iter().copied().max().unwrap_or(1);
         let (dose_tex, brick_tex, origin, spacing, line_scale, shape) = if max_axis
@@ -8647,6 +8654,12 @@ fn upload_r32_2d(
     width: u32,
     height: u32,
 ) -> Result<wgpu::Texture, GpuError> {
+    let limit = device.limits().max_texture_dimension_2d.max(1);
+    if width > limit || height > limit {
+        return Err(GpuError::Message(format!(
+            "integral image {width}x{height} exceeds the 2D texture limit {limit}"
+        )));
+    }
     let width = width.max(1);
     let height = height.max(1);
     let texture = device.create_texture(&wgpu::TextureDescriptor {
@@ -8809,6 +8822,12 @@ fn upload_rgba(
     cols: u32,
     rows: u32,
 ) -> Result<wgpu::Texture, GpuError> {
+    let limit = device.limits().max_texture_dimension_2d.max(1);
+    if cols > limit || rows > limit {
+        return Err(GpuError::Message(format!(
+            "heatmap {cols}x{rows} exceeds the 2D texture limit {limit}"
+        )));
+    }
     let cols = cols.max(1);
     let rows = rows.max(1);
     let texture = device.create_texture(&wgpu::TextureDescriptor {

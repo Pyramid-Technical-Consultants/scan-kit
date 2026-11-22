@@ -408,11 +408,18 @@ pub fn read_timeslice_frames(storage: &Path) -> Vec<(i64, Vec<u8>)> {
         .collect()
 }
 
+/// `is_file` without following links — the walk refuses symlinks, so a
+/// `input_map.csv -> elsewhere` must not admit a fake session either.
+fn marker_file(path: &Path) -> bool {
+    path.symlink_metadata().is_ok_and(|meta| meta.is_file())
+}
+
 fn is_unpacked_session(folder: &Path) -> bool {
     let Some(name) = folder.file_name() else {
         return false;
     };
-    folder.join(name).join("input_map.csv").is_file() || folder.join("input_map.csv").is_file()
+    marker_file(&folder.join(name).join("input_map.csv"))
+        || marker_file(&folder.join("input_map.csv"))
 }
 
 /// Directory that holds one session's files.
@@ -425,14 +432,14 @@ pub fn session_directory(library: &Path, session_id: &str) -> PathBuf {
         return library.to_path_buf();
     }
     let nested = library.join(session_id).join(session_id);
-    if nested.join("input_map.csv").is_file() {
+    if marker_file(&nested.join("input_map.csv")) {
         return nested;
     }
     let flat = library.join(session_id);
-    if flat.join("input_map.csv").is_file() || flat.is_dir() {
+    if marker_file(&flat.join("input_map.csv")) || flat.is_dir() {
         return flat;
     }
-    if library.join("input_map.csv").is_file() {
+    if marker_file(&library.join("input_map.csv")) {
         return library.to_path_buf();
     }
     if let Some(recorded) = crate::location::recorded_directory(library, session_id) {
@@ -553,11 +560,18 @@ fn walk_files(
     want: &dyn Fn(&str) -> bool,
     out: &mut Vec<(String, Vec<u8>)>,
 ) {
-    visit_files(root, dir, depth, want, &mut |name, path| {
-        if let Ok(bytes) = fs::read(path) {
-            out.push((name.to_string(), bytes));
-        }
-    });
+    visit_files(
+        root,
+        dir,
+        depth,
+        want,
+        &mut |name, path| {
+            if let Ok(bytes) = fs::read(path) {
+                out.push((name.to_string(), bytes));
+            }
+        },
+        &mut |_| {},
+    );
 }
 
 /// Timeslice files in layer/run order, without reading them.
@@ -624,15 +638,23 @@ fn refresh_slice(storage: &Path) -> u128 {
     }
     let mut found = Vec::new();
     let mut dirs = vec![(storage.to_path_buf(), meta_stamp(storage))];
-    visit_files(storage, storage, 0, &is_timeslice, &mut |name, path| {
-        for dir in path.ancestors().skip(1).take_while(|dir| *dir != storage) {
-            let dir = dir.to_path_buf();
-            if dirs.iter().all(|(have, _)| have != &dir) {
-                dirs.push((dir.clone(), meta_stamp(&dir)));
+    // Stamp every directory the walk visits, not just ancestors of matches —
+    // a layer dir created after a poll must itself bump the stamp or a
+    // timeslice written inside it is never noticed.
+    visit_files(
+        storage,
+        storage,
+        0,
+        &is_timeslice,
+        &mut |name, path| {
+            found.push((name.to_string(), path.to_path_buf(), meta_stamp(path)));
+        },
+        &mut |dir| {
+            if dirs.iter().all(|(have, _)| have != dir) {
+                dirs.push((dir.to_path_buf(), meta_stamp(dir)));
             }
-        }
-        found.push((name.to_string(), path.to_path_buf(), meta_stamp(path)));
-    });
+        },
+    );
     found.sort_by_key(|item| timeslice_key(&item.0));
     let paths = found
         .iter()
@@ -695,6 +717,7 @@ fn visit_files(
     depth: u8,
     want: &dyn Fn(&str) -> bool,
     visit: &mut dyn FnMut(&str, &Path),
+    dirs: &mut dyn FnMut(&Path),
 ) {
     if depth > 6 {
         return;
@@ -715,7 +738,8 @@ fn visit_files(
             continue;
         }
         if kind.is_dir() {
-            visit_files(root, &path, depth + 1, want, visit);
+            dirs(&path);
+            visit_files(root, &path, depth + 1, want, visit, dirs);
         } else if kind.is_file() {
             let name = path
                 .strip_prefix(root)
@@ -998,6 +1022,34 @@ mod tests {
         let frames = read_timeslice_frames(&session);
         assert_eq!(frames.len(), 1, "{frames:?}");
         assert_eq!(frames[0].0, 0);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_write_inside_a_previously_empty_layer_dir_bumps_the_stamp() {
+        let root = std::env::temp_dir().join(format!(
+            "scan-kit-slice-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let storage = root.join("sess");
+        fs::create_dir_all(storage.join("layer-0")).unwrap();
+        let first = timeslice_stamp(&storage);
+        fs::create_dir_all(storage.join("layer-0/run-0")).unwrap();
+        fs::write(
+            storage.join("layer-0/run-0/timeslice_data_device_units.csv"),
+            b"a,b\n1,2\n",
+        )
+        .unwrap();
+        // The watch is mtime-based — outlast coarse-granularity filesystems so
+        // the new run directory's timestamp visibly differs.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        assert_ne!(timeslice_stamp(&storage), first);
+        assert_eq!(list_timeslice_paths(&storage).len(), 1);
         let _ = fs::remove_dir_all(&root);
     }
 }
