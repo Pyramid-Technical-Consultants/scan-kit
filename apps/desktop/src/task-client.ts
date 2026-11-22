@@ -43,13 +43,13 @@ export async function driveTask(
 ): Promise<void> {
   const started = await invoke<{ task: number; generation: number }>("scan_kit_start", args);
   if (stop()) {
-    await invoke("scan_kit_cancel", { task: started.task });
+    await invoke("scan_kit_cancel", { task: started.task, generation: started.generation });
     return;
   }
   let misses = 0;
   for (;;) {
     if (stop()) {
-      await invoke("scan_kit_cancel", { task: started.task });
+      await invoke("scan_kit_cancel", { task: started.task, generation: started.generation });
       return;
     }
     let parsed;
@@ -58,7 +58,7 @@ export async function driveTask(
       parsed = parsePoll(bytesOf(raw));
     } catch (reason) {
       // The backend task keeps running without a poller — cancel it, then propagate.
-      await invoke("scan_kit_cancel", { task: started.task }).catch(() => {});
+      await invoke("scan_kit_cancel", { task: started.task, generation: started.generation }).catch(() => {});
       throw reason;
     }
     if (!acceptReport(parsed.report, started.task, started.generation)) {
@@ -71,14 +71,14 @@ export async function driveTask(
     }
     misses = 0;
     if (stop()) {
-      await invoke("scan_kit_cancel", { task: started.task });
+      await invoke("scan_kit_cancel", { task: started.task, generation: started.generation });
       return;
     }
     try {
       onUpdate(parsed.report, parsed.payload);
     } catch (reason) {
       // Same shape as a poll error — do not leave the backend task running.
-      await invoke("scan_kit_cancel", { task: started.task }).catch(() => {});
+      await invoke("scan_kit_cancel", { task: started.task, generation: started.generation }).catch(() => {});
       throw reason;
     }
     if (parsed.report.finished) {

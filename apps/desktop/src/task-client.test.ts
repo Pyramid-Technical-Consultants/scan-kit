@@ -90,7 +90,7 @@ it("cancels the backend task when the stop predicate fires", async () => {
     () => {},
     () => checks++ !== 0,
   );
-  expect(invoke).toHaveBeenCalledWith("scan_kit_cancel", { task: 1 });
+  expect(invoke).toHaveBeenCalledWith("scan_kit_cancel", { task: 1, generation: 1 });
 });
 
 it("cancels the backend task when a poll fails instead of abandoning it", async () => {
@@ -107,7 +107,7 @@ it("cancels the backend task when a poll fails instead of abandoning it", async 
     throw new Error(`unexpected invoke ${command}`);
   });
   await expect(driveTask({}, () => {}, () => false)).rejects.toThrow("poll blew up");
-  expect(invoke).toHaveBeenCalledWith("scan_kit_cancel", { task: 1 });
+  expect(invoke).toHaveBeenCalledWith("scan_kit_cancel", { task: 1, generation: 1 });
 });
 
 it("the hairline sweeps when the length is unknown and fills a fraction", () => {
