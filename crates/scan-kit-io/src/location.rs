@@ -247,7 +247,11 @@ pub(crate) fn remote_fingerprint(session_url: &str, session_id: &str) -> Option<
         if archive_name(&remote.path) || !stat.dir {
             return Some((stat.mtime_ns, i64::try_from(stat.size).ok()?));
         }
-        dir_stat = Some(stat);
+        // First dir hit wins: the inner session dir tracks a live capture's
+        // growth; the container's mtime froze when the session dir was made.
+        if dir_stat.is_none() {
+            dir_stat = Some(stat);
+        }
     }
     // A still-capturing session has no summary yet — its own directory's
     // metadata still distinguishes it from nothing.
@@ -409,19 +413,31 @@ fn materialize(library_canonical: &str, session_url: &str) -> Result<PathBuf, St
 fn remote_stamp(session: &Remote) -> Result<String, String> {
     let mut fs = crate::remote::connect(session, &password_of(session))?;
     // The directory's mtime only moves on entry add/remove — a file rewritten
-    // in place needs the marker's stat or the cache never refreshes.
+    // in place needs the marker's stat or the cache never refreshes. A nested
+    // session keeps its markers under {base}/{id}/; probe both layouts, inner
+    // dir before container — mirroring remote_fingerprint's candidates.
     let base = session.path.trim_end_matches('/');
+    let leaf = base.rsplit('/').next().unwrap_or(base);
+    let mut dir_stat = None;
     for marker in [
+        format!("{base}/{leaf}/termination_summary.txt"),
         format!("{base}/termination_summary.txt"),
+        format!("{base}/{leaf}/input_map.csv"),
         format!("{base}/input_map.csv"),
+        format!("{base}/{leaf}"),
+        base.to_owned(),
     ] {
-        if let Some(stat) = fs.stat(&marker)? {
-            if !stat.dir {
-                return Ok(format!("{}\n{}", stat.mtime_ns, stat.size));
-            }
+        let Some(stat) = fs.stat(&marker)? else {
+            continue;
+        };
+        if !stat.dir {
+            return Ok(format!("{}\n{}", stat.mtime_ns, stat.size));
+        }
+        if dir_stat.is_none() {
+            dir_stat = Some(stat);
         }
     }
-    let stat = fs.stat(&session.path)?.unwrap_or(crate::remote::Stat {
+    let stat = dir_stat.unwrap_or(crate::remote::Stat {
         dir: true,
         size: 0,
         mtime_ns: 0,
@@ -1613,6 +1629,39 @@ mod tests {
         assert_eq!(
             split_host_port("fe80::1").unwrap(),
             ("fe80::1".to_owned(), None)
+        );
+    }
+
+    #[test]
+    fn a_nested_remote_session_fingerprints_the_inner_marker() {
+        // Nested layout: the session's files live under {base}/sess/. The
+        // container dir stat (size 0) must not overwrite the marker's.
+        let url = format!(
+            "sftp://u@host.invalid/nest/{}/{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let canonical = install_fixture(
+            &format!("{url}/sess"),
+            &[
+                ("sess/input_map.csv", b"energy\n70\n"),
+                ("sess/termination_summary.txt", b"Configuration name: x\n"),
+            ],
+            false,
+        )
+        .unwrap();
+        let (mtime, size) = remote_fingerprint(&canonical, "sess").unwrap();
+        assert_eq!(mtime, 1_000_000_000);
+        assert_eq!(size, "Configuration name: x\n".len() as i64);
+
+        let remote = require_remote(&canonical).unwrap();
+        let stamp = remote_stamp(&remote).unwrap();
+        assert_eq!(
+            stamp,
+            format!("1000000000\n{}", "Configuration name: x\n".len())
         );
     }
 }
