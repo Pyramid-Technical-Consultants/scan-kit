@@ -123,8 +123,11 @@ pub fn percentile_nearest(values: &mut [f32], portion: f32) -> f32 {
     if values.is_empty() {
         return 0.0;
     }
+    if !portion.is_finite() {
+        return f32::NAN;
+    }
     let last = values.len() - 1;
-    let index = ((last as f32) * portion).round() as usize;
+    let index = ((last as f32) * portion.clamp(0.0, 1.0)).round() as usize;
     select_rank(values, index.min(last))
 }
 
@@ -232,6 +235,15 @@ mod tests {
         assert!(quantiles_at(&mut [], &qs)
             .iter()
             .all(|value| value.is_nan()));
+    }
+
+    #[test]
+    fn a_non_finite_portion_stays_nan_instead_of_returning_the_min() {
+        assert!(percentile_nearest(&mut [3.0, 1.0, 2.0], f32::NAN).is_nan());
+        assert!(percentile_nearest(&mut [3.0, 1.0, 2.0], f32::INFINITY).is_nan());
+        // Out-of-range portions clamp to the ends rather than wrapping.
+        assert_eq!(percentile_nearest(&mut [3.0, 1.0, 2.0], -0.5), 1.0);
+        assert_eq!(percentile_nearest(&mut [3.0, 1.0, 2.0], 2.0), 3.0);
     }
 
     #[test]

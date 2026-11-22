@@ -35,7 +35,7 @@ struct Live {
     /// disconnect+connect must fail instead of commanding the new device.
     epoch: u64,
     host: String,
-    socket: WebSocket<TcpStream>,
+    socket: WebSocket<DeadlineStream>,
     status: Map<String, Value>,
     version: Value,
     device_type: Value,
@@ -122,7 +122,10 @@ pub fn connect(db: &Path, host: &str) -> Result<Value, String> {
 }
 
 pub fn disconnect() {
-    if let Some(mut live) = lock().take() {
+    // The close frame can block on a half-dead peer for the write timeout —
+    // drop the LIVE guard first or every serialized call stalls behind it.
+    let live = lock().take();
+    if let Some(mut live) = live {
         let _ = live.socket.close(None);
     }
 }
@@ -383,7 +386,7 @@ fn refresh(live: &mut Live, timeout: Duration) -> Result<(), String> {
 }
 
 fn read_paths(
-    socket: &mut WebSocket<TcpStream>,
+    socket: &mut WebSocket<DeadlineStream>,
     paths: &[&str],
     timeout: Duration,
 ) -> Result<Map<String, Value>, String> {
@@ -406,7 +409,7 @@ fn read_paths(
 }
 
 fn read_one(
-    socket: &mut WebSocket<TcpStream>,
+    socket: &mut WebSocket<DeadlineStream>,
     path: &str,
     timeout: Duration,
 ) -> Result<Value, String> {
@@ -419,11 +422,11 @@ fn read_one(
     })
 }
 
-fn subscribe_status(socket: &mut WebSocket<TcpStream>) -> Result<(), String> {
+fn subscribe_status(socket: &mut WebSocket<DeadlineStream>) -> Result<(), String> {
     subscribe(socket, STATUS_PATHS)
 }
 
-fn subscribe(socket: &mut WebSocket<TcpStream>, paths: &[&str]) -> Result<(), String> {
+fn subscribe(socket: &mut WebSocket<DeadlineStream>, paths: &[&str]) -> Result<(), String> {
     let mut pairs = Vec::new();
     for path in paths {
         pairs.push((
@@ -434,7 +437,11 @@ fn subscribe(socket: &mut WebSocket<TcpStream>, paths: &[&str]) -> Result<(), St
     send(socket, "subscribe", Some(rmpv::Value::Map(pairs)))
 }
 
-fn set_field(socket: &mut WebSocket<TcpStream>, path: &str, value: &Value) -> Result<(), String> {
+fn set_field(
+    socket: &mut WebSocket<DeadlineStream>,
+    path: &str,
+    value: &Value,
+) -> Result<(), String> {
     let payload = rmpv::Value::Map(vec![(
         rmpv::Value::from(field_subscribe_key(path)),
         rmp_from_json(value),
@@ -443,7 +450,7 @@ fn set_field(socket: &mut WebSocket<TcpStream>, path: &str, value: &Value) -> Re
 }
 
 fn poll_keys(
-    socket: &mut WebSocket<TcpStream>,
+    socket: &mut WebSocket<DeadlineStream>,
     keys: &[String],
     timeout: Duration,
 ) -> Result<HashMap<String, Value>, String> {
@@ -471,7 +478,7 @@ fn poll_keys(
     Ok(got)
 }
 
-fn open_socket(host: &str) -> Result<WebSocket<TcpStream>, String> {
+fn open_socket(host: &str) -> Result<WebSocket<DeadlineStream>, String> {
     let endpoint = normalize_host(host)?;
     let mut last = "connection failed".to_owned();
     for attempt in 0..2 {
@@ -486,7 +493,54 @@ fn open_socket(host: &str) -> Result<WebSocket<TcpStream>, String> {
     Err(last)
 }
 
-fn dial(endpoint: &str) -> Result<WebSocket<TcpStream>, String> {
+/// A TcpStream whose reads fail once an absolute deadline passes. The
+/// per-syscall read timeout bounds each frame, but tungstenite assembles a
+/// fragmented message inside one `read()` — a peer trickling continuation
+/// frames one timeout apart would otherwise hold LIVE forever.
+#[derive(Debug)]
+struct DeadlineStream {
+    stream: TcpStream,
+    deadline: Instant,
+}
+
+impl DeadlineStream {
+    fn new(stream: TcpStream, deadline: Instant) -> DeadlineStream {
+        DeadlineStream { stream, deadline }
+    }
+
+    fn set_deadline(&mut self, deadline: Instant) {
+        self.deadline = deadline;
+    }
+}
+
+impl std::io::Read for DeadlineStream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let Some(remaining) = self.deadline.checked_duration_since(Instant::now()) else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "websocket message deadline",
+            ));
+        };
+        // Without the cap a fragment arriving just before the deadline would
+        // let the last syscall block a full read-timeout past it. The floor
+        // keeps a sub-millisecond remainder from erroring the socket call.
+        self.stream
+            .set_read_timeout(Some(remaining.max(Duration::from_millis(1))))?;
+        self.stream.read(buf)
+    }
+}
+
+impl std::io::Write for DeadlineStream {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.stream.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.stream.flush()
+    }
+}
+
+fn dial(endpoint: &str) -> Result<WebSocket<DeadlineStream>, String> {
     let addr = endpoint
         .to_socket_addrs()
         .map_err(|err| err.to_string())?
@@ -500,6 +554,7 @@ fn dial(endpoint: &str) -> Result<WebSocket<TcpStream>, String> {
     // wedges connect() forever. recv() re-arms per call afterward.
     let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
+    let stream = DeadlineStream::new(stream, Instant::now() + Duration::from_secs(10));
     let mut request = format!("ws://{endpoint}")
         .into_client_request()
         .map_err(|err| err.to_string())?;
@@ -543,7 +598,7 @@ fn config_body() -> rmpv::Value {
 }
 
 fn send(
-    socket: &mut WebSocket<TcpStream>,
+    socket: &mut WebSocket<DeadlineStream>,
     event: &str,
     data: Option<rmpv::Value>,
 ) -> Result<(), String> {
@@ -560,13 +615,13 @@ fn send(
 }
 
 fn recv(
-    socket: &mut WebSocket<TcpStream>,
+    socket: &mut WebSocket<DeadlineStream>,
     timeout: Duration,
 ) -> Result<Option<rmpv::Value>, String> {
     let stream = socket.get_mut();
-    stream
-        .set_read_timeout(Some(timeout.max(Duration::from_millis(20))))
-        .ok();
+    // The deadline bounds the whole assembled message — each syscall inside
+    // it is capped to whatever time remains.
+    stream.set_deadline(Instant::now() + timeout.max(Duration::from_millis(20)));
     match socket.read() {
         Ok(Message::Binary(bytes)) => {
             let mut cursor = std::io::Cursor::new(bytes.as_ref());
@@ -1067,6 +1122,19 @@ mod tests {
     }
 
     #[test]
+    fn an_elapsed_deadline_stops_the_read_without_a_syscall_wait() {
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        // The peer sends nothing — the socket read itself would block.
+        let _server = listener.accept().unwrap();
+        let mut stream = DeadlineStream::new(client, Instant::now() - Duration::from_millis(1));
+        let mut buf = [0u8; 8];
+        let err = stream.read(&mut buf).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    #[test]
     fn a_pair_update_keeps_the_latest_scalar() {
         let value = rmpv::Value::Array(vec![rmpv::Value::from(42), rmpv::Value::from(1.0)]);
         assert_eq!(json_of(&unwrap_update(&value)), json!(42));
@@ -1283,7 +1351,7 @@ mod tests {
         let _ = recv(&mut socket, Duration::from_millis(50));
     }
 
-    fn accept_mpack(mut stream: TcpStream) -> WebSocket<TcpStream> {
+    fn accept_mpack(mut stream: TcpStream) -> WebSocket<DeadlineStream> {
         let mut buf = Vec::new();
         let mut tmp = [0u8; 1024];
         loop {
@@ -1315,6 +1383,7 @@ mod tests {
              \r\n"
         );
         stream.write_all(response.as_bytes()).unwrap();
+        let stream = DeadlineStream::new(stream, Instant::now() + Duration::from_secs(10));
         WebSocket::from_raw_socket(stream, tungstenite::protocol::Role::Server, None)
     }
 

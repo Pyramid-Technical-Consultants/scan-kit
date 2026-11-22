@@ -106,7 +106,7 @@ pub fn gamma_index_norm(
     norm: f32,
 ) -> (Vec<f32>, u32, u32) {
     let [nx, ny, nz] = shape;
-    let n = nx * ny * nz;
+    let n = nx.saturating_mul(ny).saturating_mul(nz);
     let len = n.min(reference.len()).min(evaluated.len());
     let mut gamma = vec![0.0f32; len];
     // Scoring samples both operands by `shape` up to n - 1 — a short operand

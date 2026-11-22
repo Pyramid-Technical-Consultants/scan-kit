@@ -257,7 +257,12 @@ impl Volume {
 
     pub fn get(&self, x: usize, y: usize, z: usize) -> f32 {
         let [nx, ny, _] = self.shape;
-        self.values[x + nx * (y + ny * z)]
+        // values can be shorter than shape claims — the fields are pub —
+        // and a miss outside the grid is 0.
+        self.values
+            .get(x + nx * (y + ny * z))
+            .copied()
+            .unwrap_or(0.0)
     }
 
     pub fn peak_index(&self) -> (usize, usize, usize) {
@@ -267,7 +272,13 @@ impl Volume {
         }
         let mut best = 0.0f32;
         let mut at = 0usize;
-        for (index, value) in self.values[..nx * ny * nz].iter().copied().enumerate() {
+        for (index, value) in self
+            .values
+            .iter()
+            .copied()
+            .take(nx.saturating_mul(ny).saturating_mul(nz))
+            .enumerate()
+        {
             if value > best {
                 best = value;
                 at = index;
@@ -448,12 +459,14 @@ impl Volume {
     }
 
     pub fn index_of(&self, axis: usize, mm: f32) -> usize {
+        let axis = axis.min(2);
         let n = self.shape[axis].max(1);
         let t = ((mm - self.origin[axis]) / self.axis(axis)).floor();
         (t as isize).clamp(0, n as isize - 1) as usize
     }
 
     pub fn mm_of(&self, axis: usize, index: usize) -> f32 {
+        let axis = axis.min(2);
         self.origin[axis] + (index as f32 + 0.5) * self.axis(axis)
     }
 }
@@ -473,5 +486,28 @@ pub struct DoseFrame {
 impl DoseFrame {
     pub fn planes_only(&self) -> bool {
         self.visits > PLANE_VISITS
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_short_values_vec_reads_as_zeros_and_does_not_panic() {
+        // The fields are pub — a caller can build a Volume whose values are
+        // shorter than shape claims.
+        let volume = Volume {
+            origin: [0.0; 3],
+            shape: [2, 2, 2],
+            spacing: [1.0; 3],
+            values: vec![1.0; 3],
+        };
+        assert_eq!(volume.get(0, 0, 0), 1.0);
+        assert_eq!(volume.get(1, 1, 1), 0.0);
+        assert_eq!(volume.peak_index(), (0, 0, 0));
+        // Out-of-range axes clamp like axis() does instead of panicking.
+        let _ = volume.index_of(5, 0.0);
+        let _ = volume.mm_of(5, 0);
     }
 }

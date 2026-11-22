@@ -46,16 +46,26 @@ export function PhantomSynthesis() {
   usePageLoad(waiting || busy || previewing);
 
   useEffect(() => {
+    let live = true;
     void invoke<Catalog>("scan_kit_phantom_catalog")
       .then((next) => {
+        if (!live) {
+          return;
+        }
         setCatalog(next);
         setParams(next.defaults);
         setWaiting(false);
       })
       .catch((reason: unknown) => {
+        if (!live) {
+          return;
+        }
         setWaiting(false);
         notifyError(reason);
       });
+    return () => {
+      live = false;
+    };
   }, []);
 
   useEffect(() => {

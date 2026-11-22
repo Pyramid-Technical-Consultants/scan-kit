@@ -58,6 +58,11 @@ impl RbeModel {
 ///
 /// `None` for the non-linear-quadratic models, matching the Python `ValueError`.
 pub fn rbe_limits(model: RbeModel, letd: f64, alpha_beta: f64) -> Option<(f64, f64)> {
+    if !alpha_beta.is_finite() || alpha_beta <= 0.0 {
+        // ab <= 0 turns the LQ fits into inf/NaN — the same "not computable"
+        // signal as the non-LQ models.
+        return None;
+    }
     let ab = alpha_beta;
     let (hi, lo) = match model {
         // Fit values as tabulated with their standard errors.
@@ -155,5 +160,14 @@ mod tests {
         assert!((rbe(RbeModel::McNamara, 2.0, 2.0, 10.0) - 1.0663).abs() < 1e-3);
         assert!(rbe_limits(RbeModel::Constant, 1.0, 2.0).is_none());
         assert!(rbe_limits(RbeModel::Unkelbach, 1.0, 2.0).is_none());
+    }
+
+    #[test]
+    fn a_nonpositive_alpha_beta_is_not_computable() {
+        // ab <= 0 used to divide into inf and produce NaN/inf RBE factors.
+        assert!(rbe_limits(RbeModel::McNamara, 1.0, 0.0).is_none());
+        assert!(rbe_limits(RbeModel::McNamara, 1.0, -1.0).is_none());
+        assert!(rbe_limits(RbeModel::McNamara, 1.0, f64::NAN).is_none());
+        assert_eq!(rbe(RbeModel::McNamara, 2.0, 5.0, 0.0), RBE_CONSTANT);
     }
 }

@@ -84,14 +84,20 @@ pub fn invoke(name: &str, input: &Value) -> Result<Value, String> {
             let view = text(input, "view")?;
             let path = text(input, "path")?;
             let session_ids = strings(input, "session_ids")?;
-            let options = input.get("options").cloned().unwrap_or_else(|| json!({}));
-            let width = u32::try_from(input.get("width").and_then(Value::as_u64).unwrap_or(960))
-                .unwrap_or(960);
-            let height = u32::try_from(input.get("height").and_then(Value::as_u64).unwrap_or(640))
-                .unwrap_or(640);
-            let background = color4(input.get("background"), [0.11, 0.11, 0.12, 1.0]);
-            let foreground = color4(input.get("foreground"), [0.92, 0.92, 0.93, 1.0]);
-            let palette = palette_of(input.get("palette"));
+            let options = object_arg(input, "options")?;
+            let width = dim(input, "width", 960)?;
+            let height = dim(input, "height", 640)?;
+            let background = color4(
+                input.get("background"),
+                "background",
+                [0.11, 0.11, 0.12, 1.0],
+            )?;
+            let foreground = color4(
+                input.get("foreground"),
+                "foreground",
+                [0.92, 0.92, 0.93, 1.0],
+            )?;
+            let palette = palette_of(input.get("palette"))?;
             run_view(
                 view,
                 Path::new(path),
@@ -107,17 +113,14 @@ pub fn invoke(name: &str, input: &Value) -> Result<Value, String> {
         "scan_kit_write_dose" | "scan_kit_write_report" => {
             let path = text(input, "path")?;
             let session_ids = strings(input, "session_ids")?;
-            let mut options = input
-                .get("options")
-                .cloned()
-                .filter(|options| options.is_object())
-                .unwrap_or_else(|| json!({}));
+            let mut options = object_arg(input, "options")?;
             options["dest"] = json!(text(input, "dest")?);
             if name == "scan_kit_write_dose" {
-                options["description"] = json!(input
-                    .get("description")
-                    .and_then(Value::as_str)
-                    .unwrap_or("scan-kit MC"));
+                let description = match input.get("description") {
+                    Some(value) => value.as_str().ok_or("description must be a string")?,
+                    None => "scan-kit MC",
+                };
+                options["description"] = json!(description);
             }
             let view = if name == "scan_kit_write_dose" {
                 "write_dose"
@@ -186,11 +189,9 @@ pub fn open_plot(
     // Task views never produce plot bytes — and ExportStage/CopyStage write files
     // as a side effect, so letting `scan_kit_run_view` (a READ_ONLY MCP tool)
     // forward them here would bypass the --allow-effects gate. The desktop
-    // exports reach the same stages through `start_task` instead.
-    if matches!(
-        view,
-        "library" | "runner_copy" | "write_dose" | "write_report"
-    ) {
+    // exports reach the same stages through `start_task` instead. slot_of is
+    // the single taxonomy — a hand-list here would silently drift from it.
+    if !matches!(crate::task::slot_of(view), crate::task::Slot::Plot) {
         return Err(format!("{view} is a task view, not a plot"));
     }
     crate::task::drain_plot(
@@ -297,7 +298,12 @@ pub(crate) fn finish_patient_report(
         "provenance": report.provenance,
     });
     if !csv.is_empty() {
-        std::fs::write(&csv_path, csv).map_err(|err| format!("{}: {err}", csv_path.display()))?;
+        // A failed CSV must not leave the PDF looking like a successful
+        // export — the task reports Err either way.
+        if let Err(err) = std::fs::write(&csv_path, csv) {
+            let _ = std::fs::remove_file(&pdf);
+            return Err(format!("{}: {err}", csv_path.display()));
+        }
         out["dvh_csv"] = json!(csv_path.display().to_string());
     }
     Ok(out)
@@ -380,25 +386,62 @@ fn strings(input: &Value, key: &str) -> Result<Vec<String>, String> {
         .collect()
 }
 
-fn color4(value: Option<&Value>, fallback: [f32; 4]) -> [f32; 4] {
-    let Some(items) = value.and_then(Value::as_array) else {
-        return fallback;
+fn dim(input: &Value, key: &str, fallback: u32) -> Result<u32, String> {
+    match input.get(key) {
+        Some(value) => {
+            let dim = u32::try_from(
+                value
+                    .as_u64()
+                    .ok_or_else(|| format!("{key} must be an integer"))?,
+            )
+            .map_err(|_| format!("{key} is out of range"))?;
+            // The same bound Plot::apply clamps to — a huge dim would ask the
+            // renderer for an oversized frame buffer.
+            if dim > 8192 {
+                return Err(format!("{key} is out of range"));
+            }
+            Ok(dim)
+        }
+        None => Ok(fallback),
+    }
+}
+
+fn object_arg(input: &Value, key: &str) -> Result<Value, String> {
+    match input.get(key) {
+        Some(value) if value.is_object() => Ok(value.clone()),
+        Some(_) => Err(format!("{key} must be an object")),
+        None => Ok(json!({})),
+    }
+}
+
+fn color4(value: Option<&Value>, key: &str, fallback: [f32; 4]) -> Result<[f32; 4], String> {
+    let Some(value) = value else {
+        return Ok(fallback);
     };
+    let items = value
+        .as_array()
+        .ok_or_else(|| format!("{key} must be an array"))?;
     let mut out = fallback;
     for (index, item) in items.iter().take(4).enumerate() {
         if let Some(number) = item.as_f64() {
             out[index] = number as f32;
         }
     }
-    out
+    Ok(out)
 }
 
-fn palette_of(value: Option<&Value>) -> Vec<[f32; 4]> {
-    let Some(rows) = value.and_then(Value::as_array) else {
-        return Vec::new();
+fn palette_of(value: Option<&Value>) -> Result<Vec<[f32; 4]>, String> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
     };
+    let rows = value
+        .as_array()
+        .ok_or_else(|| "palette must be an array".to_owned())?;
+    if rows.iter().any(|row| !row.is_array()) {
+        return Err("palette must contain [r, g, b, a] arrays".into());
+    }
     rows.iter()
-        .map(|row| color4(Some(row), [0.9, 0.9, 0.9, 1.0]))
+        .map(|row| color4(Some(row), "palette", [0.9, 0.9, 0.9, 1.0]))
         .collect()
 }
 
@@ -436,6 +479,31 @@ fn base64(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mistyped_args_error_instead_of_falling_back() {
+        let base = json!({"view": "bins", "path": ".", "session_ids": []});
+        for (key, value) in [
+            ("width", json!("640")),
+            ("width", json!(65536)),
+            ("height", json!(true)),
+            ("options", json!(5)),
+            ("background", json!("red")),
+            ("palette", json!(7)),
+        ] {
+            let mut input = base.clone();
+            input[key] = value;
+            let err = invoke("scan_kit_run_view", &input).unwrap_err();
+            assert!(err.contains(key), "{key}: {err}");
+        }
+        // The write tools apply the same rule to options and description.
+        let err = invoke(
+            "scan_kit_write_dose",
+            &json!({"path": ".", "session_ids": [], "dest": "d.dcm", "description": 5}),
+        )
+        .unwrap_err();
+        assert!(err.contains("description"), "{err}");
+    }
 
     #[test]
     fn sk_req_008_run_view_returns_a_frame_and_controls() {

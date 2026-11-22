@@ -694,7 +694,9 @@ fn uid() -> String {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
         .unwrap_or(0);
-    format!("2.25.{nanos}{tick:04}")
+    // Two processes sharing a clock tick and a counter produce identical
+    // UIDs — fold the pid in like patient::uid does.
+    format!("2.25.{nanos}{}{tick:04}", std::process::id() % 1000)
 }
 
 #[cfg(test)]

@@ -497,7 +497,10 @@ pub fn splat_gaussians(
     shape: [usize; 3],
 ) -> Vec<f32> {
     let [nx, ny, nz] = shape;
-    let mut grid = vec![0.0f32; nx * ny * nz];
+    let Some(len) = nx.checked_mul(ny).and_then(|n| n.checked_mul(nz)) else {
+        return Vec::new();
+    };
+    let mut grid = vec![0.0f32; len];
     if spacing.iter().any(|s| !s.is_finite() || *s <= 0.0) {
         return grid;
     }
@@ -554,7 +557,12 @@ pub fn splat_gaussians(
 /// Maximum-intensity projection along Z.
 pub fn mip_xy(grid: &[f32], shape: [usize; 3]) -> Vec<f32> {
     let [nx, ny, nz] = shape;
-    let mut image = vec![0.0f32; nx * ny];
+    let mut image = vec![0.0f32; nx.saturating_mul(ny)];
+    // A grid shorter than shape promises returns zeros, matching the
+    // accumulate_z/scan_axes length checks.
+    if grid.len() < nx.saturating_mul(ny).saturating_mul(nz) {
+        return image;
+    }
     for z in 0..nz {
         for y in 0..ny {
             for x in 0..nx {
@@ -1281,6 +1289,24 @@ mod tests {
     fn an_infinite_fit_numerator_returns_none() {
         // den stays finite here — only the numerator overflows.
         assert_eq!(linear_fit(&[1.0, 2.0], &[3.4e38, 1.0e-3]), None);
+    }
+
+    #[test]
+    fn a_short_grid_yields_zero_mip() {
+        // A grid shorter than shape promises reads as misses, like
+        // accumulate_z's length check.
+        assert_eq!(mip_xy(&[1.0, 2.0, 3.0], [2, 2, 2]), vec![0.0; 4]);
+    }
+
+    #[test]
+    fn a_splat_shape_product_that_overflows_returns_empty() {
+        let grid = splat_gaussians(
+            &[[0.0, 0.0, 0.0, 1.0, 1.0]],
+            [0.0; 3],
+            [1.0; 3],
+            [usize::MAX, 2, 2],
+        );
+        assert!(grid.is_empty());
     }
 
     #[test]

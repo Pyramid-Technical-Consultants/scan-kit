@@ -83,6 +83,41 @@ function formatMm(value: number): string {
     .replace(/\.$/, "");
 }
 
+function resolveOptions(
+  controls: ViewControl[],
+  options: Record<string, string>,
+): Record<string, string> {
+  const resolved: Record<string, string> = {};
+  for (const control of controls) {
+    const stored = options[control.id];
+    if (control.kind === "segments") {
+      resolved[control.id] = stored != null && parseSegments(stored) != null ? stored : control.value;
+      continue;
+    }
+    if (control.kind === "range") {
+      const numeric = Number(stored);
+      resolved[control.id] = stored != null && Number.isFinite(numeric) ? stored : control.value;
+      continue;
+    }
+    if (control.kind === "number") {
+      const numeric = Number(String(stored ?? "").replace(/mm/gi, "").trim());
+      resolved[control.id] =
+        stored != null && Number.isFinite(numeric) ? formatMm(numeric) : control.value;
+      continue;
+    }
+    if (control.kind === "text") {
+      resolved[control.id] = stored != null && stored.trim().length > 0 ? stored : control.value;
+      continue;
+    }
+    const match =
+      stored == null
+        ? undefined
+        : control.options.find((option) => option.label === stored || option.id === stored);
+    resolved[control.id] = match != null ? match.label : control.value;
+  }
+  return resolved;
+}
+
 function NumberField({
   label,
   value,
@@ -371,6 +406,13 @@ export function AnalysisView({
   const [hidden, setHidden] = useState<string[]>([]);
   const [meta, setMeta] = useState<PlotHeader | null>(null);
   const metaRef = useRef<PlotHeader | null>(null);
+  const liveRef = useRef(true);
+  useEffect(() => {
+    liveRef.current = true;
+    return () => {
+      liveRef.current = false;
+    };
+  }, []);
   const [settled, setSettled] = useState(0);
   const scrubControl = meta?.controls.find((control) => control.kind === "scrub");
   const wasOn = useRef(false);
@@ -422,11 +464,23 @@ export function AnalysisView({
     if (viewId !== "volumetric") {
       return;
     }
+    let live = true;
     void invoke<{ scanners: { label: string; folder: string }[] }>("scan_kit_scanners", {
       action: "list",
     })
-      .then((listed) => setScanners(listed.scanners))
-      .catch(() => setScanners([]));
+      .then((listed) => {
+        if (live) {
+          setScanners(listed.scanners);
+        }
+      })
+      .catch(() => {
+        if (live) {
+          setScanners([]);
+        }
+      });
+    return () => {
+      live = false;
+    };
   }, [viewId]);
 
   const requestDraw = () => {
@@ -1021,34 +1075,7 @@ export function AnalysisView({
   }, [viewId, shown]);
 
   const controls = meta?.controls ?? [];
-  const resolved: Record<string, string> = {};
-  for (const control of controls) {
-    const stored = options[control.id];
-    if (control.kind === "segments") {
-      resolved[control.id] = stored != null && parseSegments(stored) != null ? stored : control.value;
-      continue;
-    }
-    if (control.kind === "range") {
-      const numeric = Number(stored);
-      resolved[control.id] = stored != null && Number.isFinite(numeric) ? stored : control.value;
-      continue;
-    }
-    if (control.kind === "number") {
-      const numeric = Number(String(stored ?? "").replace(/mm/gi, "").trim());
-      resolved[control.id] =
-        stored != null && Number.isFinite(numeric) ? formatMm(numeric) : control.value;
-      continue;
-    }
-    if (control.kind === "text") {
-      resolved[control.id] = stored != null && stored.trim().length > 0 ? stored : control.value;
-      continue;
-    }
-    const match =
-      stored == null
-        ? undefined
-        : control.options.find((option) => option.label === stored || option.id === stored);
-    resolved[control.id] = match != null ? match.label : control.value;
-  }
+  const resolved = resolveOptions(controls, options);
   const dosePaint = viewId === "volumetric" ? paintSpec(resolved, options) : "";
   useEffect(() => {
     paintRef.current = dosePaint;
@@ -1094,7 +1121,10 @@ export function AnalysisView({
       return;
     }
     setOptions((current) => {
-      const next = applyOption(current, resolved, grains.current, id, value);
+      // Two applies batched into one commit: the render-time `resolved`
+      // describes the first apply's options, not `current` — recompute it.
+      const latest = resolveOptions(metaRef.current?.controls ?? [], current);
+      const next = applyOption(current, latest, grains.current, id, value);
       optionsRef.current = next;
       return next;
     });
@@ -1450,11 +1480,17 @@ export function AnalysisView({
                 setOpening(true);
                 void invoke<{ report: string }>("scan_kit_open_study", { path: selected })
                   .then((opened) => {
+                    if (!liveRef.current) {
+                      return;
+                    }
                     setStudyPath(selected);
                     setStudy(opened.report);
                     setOpening(false);
                   })
                   .catch((reason: unknown) => {
+                    if (!liveRef.current) {
+                      return;
+                    }
                     setOpening(false);
                     notifyError(reason);
                   });

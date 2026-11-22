@@ -68,7 +68,9 @@ pub(super) fn order_within_layers(
 ) -> Vec<ImportSpot> {
     let mut energies = Vec::new();
     for spot in spots {
-        if !energies.contains(&spot.energy) {
+        // A NaN energy forms an unreachable layer (`==` never matches); a
+        // NaN coordinate formats the literal "NaN" into the plan CSV.
+        if spot.energy.is_finite() && !energies.contains(&spot.energy) {
             energies.push(spot.energy);
         }
     }
@@ -76,7 +78,7 @@ pub(super) fn order_within_layers(
     for energy in energies {
         let layer: Vec<ImportSpot> = spots
             .iter()
-            .filter(|spot| spot.energy == energy)
+            .filter(|spot| spot.energy == energy && spot.x.is_finite() && spot.y.is_finite())
             .cloned()
             .collect();
         let indices = if order == "minimize_travel" {
@@ -247,4 +249,44 @@ pub(super) fn linspace(start: f64, stop: f64, n: usize) -> Vec<f64> {
     (0..n)
         .map(|index| start + (stop - start) * index as f64 / (n - 1) as f64)
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_nonfinite_spot_is_dropped_instead_of_silently_vanishing() {
+        // A NaN energy formed an unreachable layer (== never matched) and a
+        // NaN coordinate wrote the literal "NaN" into the plan CSV.
+        let spots = vec![
+            ImportSpot {
+                x: f64::NAN,
+                y: 0.0,
+                energy: 100.0,
+                charge: 1.0,
+                beam_size: 1.0,
+                plan_index: 0,
+            },
+            ImportSpot {
+                x: 0.0,
+                y: 0.0,
+                energy: f64::NAN,
+                charge: 1.0,
+                beam_size: 1.0,
+                plan_index: 1,
+            },
+            ImportSpot {
+                x: 1.0,
+                y: 0.0,
+                energy: 100.0,
+                charge: 1.0,
+                beam_size: 1.0,
+                plan_index: 2,
+            },
+        ];
+        let ordered = order_within_layers(&spots, "as_planned", "x");
+        assert_eq!(ordered.len(), 1);
+        assert_eq!(ordered[0].plan_index, 2);
+    }
 }

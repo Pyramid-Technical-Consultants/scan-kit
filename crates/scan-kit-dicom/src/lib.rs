@@ -544,7 +544,7 @@ pub fn write_header(
     let mut bytes = vec![0u8; 128];
     bytes.extend_from_slice(b"DICM");
     push_ui(&mut bytes, 0x0008, 0x0016, sop_class);
-    push_ui(&mut bytes, 0x0008, 0x0060, modality);
+    push_vr(&mut bytes, 0x0008, 0x0060, b"CS", modality);
     push_ui(&mut bytes, 0x0020, 0x000D, study);
     push_ui(&mut bytes, 0x0020, 0x000E, series);
     if let Some(parent) = path.parent() {
@@ -554,16 +554,21 @@ pub fn write_header(
 }
 
 fn push_ui(bytes: &mut Vec<u8>, group: u16, element: u16, text: &str) {
+    push_vr(bytes, group, element, b"UI", text);
+}
+
+fn push_vr(bytes: &mut Vec<u8>, group: u16, element: u16, vr: &[u8; 2], text: &str) {
     let mut value = text.as_bytes().to_vec();
     if value.len() % 2 == 1 {
-        value.push(0);
+        // UI pads with NUL; text VRs pad with a space.
+        value.push(if vr == b"UI" { 0 } else { b' ' });
     }
     bytes.extend_from_slice(&group.to_le_bytes());
     bytes.extend_from_slice(&element.to_le_bytes());
-    bytes.extend_from_slice(b"UI");
+    bytes.extend_from_slice(vr);
     bytes.extend_from_slice(
         &u16::try_from(value.len())
-            .expect("UI value exceeds the 16-bit length field")
+            .expect("value exceeds the 16-bit length field")
             .to_le_bytes(),
     );
     bytes.extend(value);
@@ -660,6 +665,21 @@ mod tests {
         let (offset, implicit) = dataset_offset(&bytes);
         assert_eq!(offset, 132);
         assert!(implicit.unwrap());
+    }
+
+    #[test]
+    fn the_header_writes_modality_as_cs_not_ui() {
+        let dir = std::env::temp_dir().join(format!("scan-kit-hdr-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("ct.dcm");
+        write_header(&path, "1.2.840", "CT", "1.2.3", "1.2.3.1").unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let pos = bytes
+            .windows(4)
+            .position(|w| w == [0x08, 0x00, 0x60, 0x00])
+            .unwrap();
+        assert_eq!(&bytes[pos + 4..pos + 6], b"CS");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn push_tag(bytes: &mut Vec<u8>, group: u16, element: u16, vr: &[u8], text: &str) {
