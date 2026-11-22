@@ -225,6 +225,7 @@ pub(crate) fn remote_fingerprint(session_url: &str, session_id: &str) -> Option<
             candidates.insert(1, format!("{base}/{session_id}/termination_summary.txt"));
         }
     }
+    let mut dir_stat = None;
     for path in candidates {
         // A miss on one candidate must not end the search — the nested
         // session layout stores the marker under {base}/{id}/{id}/.
@@ -234,8 +235,12 @@ pub(crate) fn remote_fingerprint(session_url: &str, session_id: &str) -> Option<
         if archive_name(&remote.path) || !stat.dir {
             return Some((stat.mtime_ns, i64::try_from(stat.size).ok()?));
         }
+        dir_stat = Some(stat);
     }
-    None
+    // A still-capturing session has no summary yet — its own directory's
+    // metadata still distinguishes it from nothing.
+    let stat = dir_stat?;
+    Some((stat.mtime_ns, i64::try_from(stat.size).ok()?))
 }
 
 pub(crate) fn recorded_directory(library: &Path, session_id: &str) -> Option<PathBuf> {
@@ -257,6 +262,9 @@ pub(crate) fn catalog_directory(library: &Path, session_id: &str) -> Option<Path
     let key = library_key(library);
     let hit = {
         let map = catalog().lock().unwrap_or_else(|err| err.into_inner());
+        // Catalog keys are display keys — a disambiguated "name · parent" row
+        // resolves through ITS library's place no matter which open library
+        // the caller passes; the `any` check only requires an open library.
         if !map.values().any(|row| row.library == key) {
             return None;
         }
@@ -336,6 +344,15 @@ pub(crate) fn fixture_copies(spec: &str) -> u32 {
 }
 
 fn materialize(library_canonical: &str, session_url: &str) -> Result<PathBuf, String> {
+    // ponytail: one global lock serializes every remote copy — copies are rare
+    // and a per-dest keyed guard is not worth the bookkeeping. Without it two
+    // copies of one session can interleave: the first writes the stamp, the
+    // second overwrites files under a matching stamp, poisoning the cache.
+    static COPY: OnceLock<Mutex<()>> = OnceLock::new();
+    let _copy = COPY
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
     let session = require_remote(session_url)?;
     let relative = relative_remote(library_canonical, &session);
     // Only plain relative segments may join the cache — a `..` escapes it, and
@@ -565,10 +582,10 @@ fn remote_exam(
         if item.name.is_empty() || item.name == "." || item.name == ".." {
             continue;
         }
-        count += 1;
         if item.dir {
             dirs.push(item.name);
         } else {
+            count += 1;
             files.push(item.name);
         }
     }
@@ -588,7 +605,7 @@ fn remote_exam(
     // walk must keep descending or the nested sessions disappear.
     for name in &dirs {
         let child = join_path(path, name);
-        if is_remote_session(fs, &child, name)? {
+        if remote_holds_session(fs, &child, 0)? {
             return Ok(None);
         }
     }
@@ -622,6 +639,30 @@ fn prefix_dicom(fs: &mut dyn crate::remote::Fs, path: &str) -> Result<bool, Stri
         return Ok(false);
     };
     Ok(scan_kit_dicom::looks_like_dicom(&bytes))
+}
+
+/// Mirror of discover::holds_session — a session anywhere below `path`
+/// within the discovery depth makes the folder a container, not an exam.
+fn remote_holds_session(
+    fs: &mut dyn crate::remote::Fs,
+    path: &str,
+    depth: u32,
+) -> Result<bool, String> {
+    if depth >= NEST_DEPTH {
+        return Ok(false);
+    }
+    if is_file(fs, &join_path(path, "input_map.csv"))? {
+        return Ok(true);
+    }
+    for item in fs.list(path)? {
+        if item.dir && !item.name.is_empty() && item.name != "." && item.name != ".." {
+            let child = join_path(path, &item.name);
+            if remote_holds_session(fs, &child, depth + 1)? {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
 }
 
 fn is_remote_session(
@@ -818,8 +859,9 @@ fn split_host_port(hostport: &str) -> Result<(String, Option<u16>), String> {
         return Ok((host, Some(parse_port(port)?)));
     }
     if let Some((host, port)) = hostport.rsplit_once(':') {
-        if !host.contains(':') && !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit())
-        {
+        if !host.contains(':') {
+            // One colon means host:port — a non-numeric or empty tail is a
+            // mistyped port, not an IPv6 literal (those carry many colons).
             return Ok((host.to_owned(), Some(parse_port(port)?)));
         }
     }
@@ -1116,6 +1158,10 @@ pub(crate) fn session_storage_paths(root: &str, session_id: &str) -> Result<Vec<
     if !discover::valid_session_id(session_id) {
         return Err(format!("invalid session id {session_id:?}"));
     }
+    let mut found = Vec::new();
+    if let Some(place) = recorded(root, session_id) {
+        found.push(place);
+    }
     let mut names = vec![session_id.to_string()];
     for (suffix, _) in discover::ARCHIVE_SUFFIXES {
         names.push(format!("{session_id}{suffix}"));
@@ -1124,31 +1170,34 @@ pub(crate) fn session_storage_paths(root: &str, session_id: &str) -> Result<Vec<
         let remote = require_remote(root)?;
         let mut fs = crate::remote::connect(&remote, &password_of(&remote))?;
         let base = remote.path.trim_end_matches('/');
-        let mut found = Vec::new();
         for name in names {
             if fs.stat(&format!("{base}/{name}"))?.is_some() {
-                found.push(format!(
+                let place = format!(
                     "{}/{}",
                     remote.canonical.trim_end_matches('/'),
                     encode_path(&name)
-                ));
+                );
+                if !found.contains(&place) {
+                    found.push(place);
+                }
             }
         }
         return Ok(found);
     }
     let base = Path::new(root);
-    Ok(names
-        .into_iter()
-        .filter_map(|name| {
-            let path = base.join(&name);
-            let hit = if name == session_id {
-                path.exists()
-            } else {
-                path.is_file()
-            };
-            hit.then(|| path.to_string_lossy().into_owned())
-        })
-        .collect())
+    for name in names {
+        let path = base.join(&name);
+        let hit = if name == session_id {
+            path.exists()
+        } else {
+            path.is_file()
+        };
+        let place = path.to_string_lossy().into_owned();
+        if hit && !found.contains(&place) {
+            found.push(place);
+        }
+    }
+    Ok(found)
 }
 
 /// Remove `paths` — OS trash locally, permanent recursive delete on remote
@@ -1304,5 +1353,57 @@ mod tests {
         assert!(recorded("a-test-lib", "sess").is_some());
         drop_sessions("a-test-lib");
         assert!(recorded("a-test-lib", "sess").is_none());
+    }
+
+    #[test]
+    fn catalog_keys_resolve_through_their_own_library() {
+        let root = std::env::temp_dir().join(format!(
+            "scan-kit-cat-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let lib_a = root.join("a");
+        let lib_b = root.join("b");
+        std::fs::create_dir_all(lib_a.join("s")).unwrap();
+        std::fs::create_dir_all(lib_b.join("s")).unwrap();
+        replace_catalog(&[
+            (
+                "s".to_owned(),
+                library_key(&lib_a),
+                lib_a.join("s").to_string_lossy().into_owned(),
+                "s".to_owned(),
+            ),
+            (
+                "s · p".to_owned(),
+                library_key(&lib_b),
+                lib_b.join("s").to_string_lossy().into_owned(),
+                "s".to_owned(),
+            ),
+        ]);
+        // Display keys are global: "s" names a's row and "s · p" names b's —
+        // either open library resolves both.
+        assert_eq!(catalog_directory(&lib_b, "s"), Some(lib_a.join("s")));
+        assert_eq!(catalog_directory(&lib_b, "s · p"), Some(lib_b.join("s")));
+        replace_catalog(&[]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_non_numeric_port_is_an_error_not_an_ipv6_host() {
+        assert_eq!(
+            split_host_port("host:2222").unwrap(),
+            ("host".to_owned(), Some(2222))
+        );
+        assert!(split_host_port("host:abc").is_err());
+        assert!(split_host_port("host:").is_err());
+        // A multi-colon authority is unbracketed IPv6 — not a port error.
+        assert_eq!(
+            split_host_port("fe80::1").unwrap(),
+            ("fe80::1".to_owned(), None)
+        );
     }
 }

@@ -71,7 +71,7 @@ pub fn open_connection(path: &Path) -> Result<Connection, String> {
     conn.pragma_update(None, "foreign_keys", "ON")
         .map_err(|err| err.to_string())?;
     migrate(&conn)?;
-    import_app_settings_once(&conn)?;
+    import_app_settings_once(&conn, path)?;
     Ok(conn)
 }
 
@@ -857,11 +857,13 @@ fn import_legacy(conn: &Connection, lib_id: i64, base: &Path) -> Result<(), Stri
     Ok(())
 }
 
-fn import_app_settings_once(conn: &Connection) -> Result<(), String> {
+fn import_app_settings_once(conn: &Connection, db_path: &Path) -> Result<(), String> {
     if prefs_get(conn, PREF_APP_SETTINGS_IMPORTED)?.is_some() {
         return Ok(());
     }
-    let path = default_db_path()
+    // The legacy file sits beside the database — a custom db imports its own
+    // profile, not the default one's.
+    let path = db_path
         .parent()
         .unwrap_or(Path::new("."))
         .join("app_settings.json");

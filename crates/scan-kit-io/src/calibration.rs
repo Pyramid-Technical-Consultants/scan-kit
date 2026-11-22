@@ -81,8 +81,10 @@ impl CtCalibration {
     /// `HU <value>`, and the material table's value is an MCsquare material
     /// label (its row in the media table).
     pub fn parse(name: &str, density: &str, material: &str) -> Result<CtCalibration, String> {
-        let (hu_points, densities) = pairs(density);
-        let (hu_thresholds, label_f) = pairs(material);
+        let (hu_points, densities) =
+            pairs(density).map_err(|err| format!("scanner {name}: {err}"))?;
+        let (hu_thresholds, label_f) =
+            pairs(material).map_err(|err| format!("scanner {name}: {err}"))?;
         if hu_points.len() < 2 {
             return Err(format!("scanner {name}: HU density table needs two points"));
         }
@@ -102,6 +104,9 @@ impl CtCalibration {
             .any(|value| !value.is_finite())
         {
             return Err(format!("scanner {name}: table values must be finite"));
+        }
+        if label_f.iter().any(|value| value.fract() != 0.0) {
+            return Err(format!("scanner {name}: material labels must be integers"));
         }
         let labels: Vec<i32> = label_f.iter().map(|value| *value as i32).collect();
         let ids = &mc_tables().ids;
@@ -276,22 +281,28 @@ fn strictly_increasing(xs: &[f64]) -> bool {
     xs.windows(2).all(|pair| pair[1] > pair[0])
 }
 
-fn pairs(text: &str) -> (Vec<f64>, Vec<f64>) {
+fn pairs(text: &str) -> Result<(Vec<f64>, Vec<f64>), String> {
     let mut x = Vec::new();
     let mut y = Vec::new();
     for line in text.lines() {
         let line = line.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
         let mut parts = line.split_whitespace();
-        let Some(a) = parts.next().and_then(|value| value.parse::<f64>().ok()) else {
-            continue;
+        let (Some(a), Some(b)) = (
+            parts.next().and_then(|value| value.parse::<f64>().ok()),
+            parts.next().and_then(|value| value.parse::<f64>().ok()),
+        ) else {
+            return Err(format!("malformed table line {line:?}"));
         };
-        let Some(b) = parts.next().and_then(|value| value.parse::<f64>().ok()) else {
-            continue;
-        };
+        if !a.is_finite() || !b.is_finite() {
+            return Err(format!("non-finite table line {line:?}"));
+        }
         x.push(a);
         y.push(b);
     }
-    (x, y)
+    Ok((x, y))
 }
 
 /// `np.interp(x, xp, fp)` on a non-decreasing `xp`: linear inside, clamped to
@@ -431,5 +442,14 @@ mod tests {
         let (material, density) = calibration.from_spr(1.0);
         assert_eq!(material, 9);
         assert!((density - 0.97378534).abs() < 1e-5);
+    }
+
+    #[test]
+    fn malformed_rows_and_fractional_labels_error() {
+        let density = "-1000 0.001\n0 0.5\n2000 2.0\n";
+        let err = CtCalibration::parse("bad", density, "-950 Lung\n0 1\n").unwrap_err();
+        assert!(err.contains("malformed"), "{err}");
+        let err = CtCalibration::parse("bad", density, "-950 40.5\n0 41\n").unwrap_err();
+        assert!(err.contains("integer"), "{err}");
     }
 }
