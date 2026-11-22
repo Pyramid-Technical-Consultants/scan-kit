@@ -1752,6 +1752,7 @@ impl Plot {
             }
             if profile_kind(&title).is_some() {
                 self.marks.panels[index].line_count = 0;
+                self.marks.panels[index].line_runs.clear();
             }
         }
         self.azimuth = opening_azimuth(grid.gantry);
@@ -2398,9 +2399,18 @@ impl Plot {
                 .and_then(|text| text.parse().ok())
                 .or_else(|| value.as_f64().map(|number| number as f32))
         });
-        let auto = match spec.get("auto").and_then(|value| value.as_str()) {
-            None | Some("") => true,
-            Some(text) => matches!(text, "on" | "On" | "true" | "1"),
+        // Accept the natural JSON bool too — `{"auto": false}` is not a str,
+        // so it used to fall into the default-on arm and invert the request.
+        let auto = match spec.get("auto") {
+            None => true,
+            Some(value) => value
+                .as_bool()
+                .or_else(|| {
+                    value
+                        .as_str()
+                        .map(|text| text.is_empty() || matches!(text, "on" | "On" | "true" | "1"))
+                })
+                .unwrap_or(true),
         };
         let percent = matches!(text("error"), "percent" | "Percent");
         let (base_lo, base_hi, gamma, difference, ramp_now, opacity_now, unit_now) = {
@@ -3130,6 +3140,12 @@ impl Plot {
     /// The scene is not rebuilt; the weights live on this plot.
     fn drag_split(&mut self, width: u32, height: u32, input: &PlotInput) -> bool {
         if self.solo.is_some() {
+            return false;
+        }
+        // hit_split probes the split_rows geometry; a side column switches the
+        // layout to side_column/grid_with_side, which ignores row_splits — the
+        // probes would report grab zones where no split exists.
+        if self.side > 0 {
             return false;
         }
         if !row_split_layout(
@@ -4967,7 +4983,15 @@ fn follow_span(
             while end + 1 < lines.len() && lines[end + 1].id == id {
                 end += 1;
             }
-            absorb(&lines[start..=end]);
+            // window_range binary-searches on x — only valid when the stroke
+            // is sorted, the same gate the runs path applies via run.monotonic.
+            let monotonic = lines[start..=end]
+                .windows(2)
+                .all(|pair| pair[0].a[0] <= pair[1].a[0])
+                && lines[start..=end].iter().all(|line| line.a[0] <= line.b[0]);
+            if monotonic {
+                absorb(&lines[start..=end]);
+            }
             index = end + 1;
         }
     } else {
@@ -5512,7 +5536,9 @@ fn heatmap_bytes(
         }
         (lo, hi)
     };
-    if !lo.is_finite() || !hi.is_finite() {
+    // All-non-finite input leaves lo=f32::MAX, hi=f32::MIN — both finite, so
+    // an `lo > hi` check is the only one that catches "no data".
+    if !lo.is_finite() || !hi.is_finite() || lo > hi {
         return Vec::new();
     }
     if (hi - lo).abs() < 1.0e-8 {
@@ -6301,16 +6327,24 @@ fn mul3(a: [f32; 3], scale: f32) -> [f32; 3] {
 /// per edge; both ends always carry a number.
 fn axis_ticks(lo: f32, hi: f32) -> Vec<(f32, bool)> {
     const STEP: f32 = 10.0;
-    let k0 = (lo / STEP - 1e-9).ceil() as i32;
-    let k1 = (hi / STEP + 1e-9).floor() as i32;
-    let count = if k1 >= k0 { (k1 - k0 + 1) as usize } else { 0 };
-    let every = [1i32, 2, 5, 10, 20, 50, 100]
+    // Payload-driven extents can be astronomical — the i32 casts saturate and
+    // an unbounded count is an unbounded loop. The WGSL hang_ticks caps at 96;
+    // match it here.
+    const MAX_TICKS: usize = 96;
+    let k0 = (lo / STEP - 1e-9).ceil() as i64;
+    let k1 = (hi / STEP + 1e-9).floor() as i64;
+    let count = if k1 >= k0 {
+        (k1 - k0 + 1).min(MAX_TICKS as i64) as usize
+    } else {
+        0
+    };
+    let every = [1i64, 2, 5, 10, 20, 50, 100]
         .into_iter()
         .find(|step| count <= *step as usize * 8)
         .unwrap_or(100);
     let mut ticks = Vec::with_capacity(count + 2);
     for index in 0..count {
-        let k = k0 + index as i32;
+        let k = k0 + index as i64;
         let gap = (k - k0).min(k1 - k);
         let major = index == 0
             || index + 1 == count
@@ -7882,7 +7916,9 @@ fn disc_cpu(
     plot: PlotRect,
 ) {
     let (x_lo, y_lo, x_hi, y_hi) = clip_pixels(plot, width, height);
-    let r = radius.ceil() as i64 + 1;
+    // A payload radius can exceed i64::MAX — a disc bigger than the canvas
+    // covers it anyway, so clamp before the cast, not after.
+    let r = radius.min(width.max(height) as f32 + 4.0).ceil() as i64 + 1;
     let cx = center[0].round() as i64;
     let cy = center[1].round() as i64;
     let (y0, y1) = ((cy - r).max(y_lo), (cy + r).min(y_hi));
@@ -10945,8 +10981,11 @@ mod tests {
         assert!(glyphs.len() > 4, "tick labels");
         let (_, ticks) = color_axis_quads(&plot, &layout[0], 0.0);
         let bar = color_bar_rect(&layout[0]);
+        // The first four quads are the bar frame — including them makes the
+        // fold equal the bound by construction, so skip to the real ticks.
         let lowest = ticks
             .iter()
+            .skip(4)
             .map(|tick| tick.a[1].max(tick.b[1]))
             .fold(bar.y, f32::max);
         assert!(
@@ -12489,5 +12528,46 @@ mod tests {
             let ms = gpu_frame_ms(&mut plot, side_w, side_h, 6);
             eprintln!("gpu 3d-only {side_w}x{side_h}: {ms:.2} ms");
         }
+    }
+    #[test]
+    fn axis_ticks_caps_an_astronomical_range() {
+        // Payload extents can exceed i32 — the cast saturated and the count
+        // wrapped into an unbounded loop.
+        let ticks = axis_ticks(-2.5e10, 2.5e10);
+        assert!(ticks.len() <= 98, "{} ticks", ticks.len());
+    }
+
+    #[test]
+    fn an_all_nan_heatmap_produces_no_pixels() {
+        // lo=f32::MAX and hi=f32::MIN are both finite — the old guard could
+        // never fire and baked an opaque quad.
+        assert!(heatmap_bytes(&[f32::NAN; 4], 2, 2, 0, [1.0; 4], 0.0, 0.0).is_empty());
+    }
+
+    #[test]
+    fn a_false_auto_window_stays_manual() {
+        // {"auto": false} is a JSON bool, not a string — it used to fall into
+        // the default arm and invert to auto.
+        let mut scene = line_scene();
+        let n = 4usize;
+        scene.volume = scan_kit_core::VolumeMark {
+            values: vec![1.0; n * n * n],
+            shape: [n as u32, n as u32, n as u32],
+            origin: [0.0, 0.0, 0.0],
+            voxel: 1.0,
+            ramp: 1,
+            hi: 4.0,
+            mode: 1,
+            unit: "Gy".into(),
+            ..scan_kit_core::VolumeMark::default()
+        };
+        let mut plot = Plot::new(&scene, [0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0, 1.0]);
+        plot.paint(r#"{"auto": false, "level": "2"}"#);
+        let grid = plot.dose.as_ref().unwrap();
+        assert!(
+            (grid.hi - 2.0).abs() < 1e-4,
+            "manual window applies: {}",
+            grid.hi
+        );
     }
 }

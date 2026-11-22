@@ -104,7 +104,10 @@ pub fn grid_from(
     scan: Option<scan_kit_core::VolumeScan>,
 ) -> Option<DoseGrid> {
     let shape_us = [shape[0] as usize, shape[1] as usize, shape[2] as usize];
-    let n = shape_us[0] * shape_us[1] * shape_us[2];
+    // Three u32 axes can overflow usize before the length check sees them.
+    let n = shape_us
+        .iter()
+        .try_fold(1usize, |acc, axis| acc.checked_mul(*axis))?;
     if n == 0 || values.len() < n {
         return None;
     }
@@ -978,5 +981,26 @@ mod tests {
             (0.0, 2.0),
             "γ = 1 stays mid-ramp"
         );
+    }
+    #[test]
+    fn a_shape_product_that_overflows_is_rejected() {
+        // u32::MAX^3 wraps usize before the length check can see it.
+        assert!(grid_from(
+            vec![0.0; 2],
+            Vec::new(),
+            Vec::new(),
+            [u32::MAX; 3],
+            [0.0; 3],
+            [1.0; 3],
+            0,
+            0.0,
+            1.0,
+            1.0,
+            1.0,
+            0,
+            0,
+            None,
+        )
+        .is_none());
     }
 }
