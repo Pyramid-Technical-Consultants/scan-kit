@@ -118,6 +118,11 @@ pub(super) fn dose_grid(
     voxel: f32,
     z_floor: Option<f32>,
 ) -> ([f32; 3], [usize; 3]) {
+    if !voxel.is_finite() {
+        // clamp() passes NaN through — a NaN voxel would fabricate a NaN
+        // origin under a [1,1,1] shape.
+        return ([0.0, 0.0, 0.0], [0, 0, 0]);
+    }
     let v = voxel.clamp(0.25, 10.0);
     if spots.is_empty() {
         return ([0.0, 0.0, 0.0], [1, 1, 1]);
@@ -1333,7 +1338,15 @@ pub(super) fn scatter_planes(
 ) -> Vec<f32> {
     let [nx, ny, nz] = shape;
     let [fx, fy, fz] = focus;
-    let mut values = vec![0.0f32; nx * ny * nz];
+    let Some(len) = nx
+        .checked_mul(ny)
+        .and_then(|n| n.checked_mul(nz))
+        .filter(|&n| n > 0)
+    else {
+        // A zero axis would index into an empty buffer.
+        return Vec::new();
+    };
+    let mut values = vec![0.0f32; len];
     for y in 0..ny {
         for x in 0..nx {
             values[x + nx * (y + ny * fz)] = axial[x + nx * y];
@@ -1364,7 +1377,7 @@ pub(super) fn scatter_planes(
 #[cfg(test)]
 mod tests {
     use super::super::{csda_range_mm, Pencil, Quantity, Volume, WATER};
-    use super::{analytic_on, analytic_volume, dose_frame};
+    use super::{analytic_on, analytic_volume, dose_frame, scatter_planes};
 
     #[test]
     fn deposited_peak_sits_on_the_spot() {
@@ -1944,5 +1957,38 @@ mod tests {
         );
         assert!(volume.origin.iter().all(|value| value.is_finite()));
         assert_eq!(volume.shape, [1, 1, 1]);
+    }
+
+    #[test]
+    fn a_nan_voxel_produces_no_grid() {
+        // clamp() passes NaN through — before the check it built a NaN
+        // origin under a fabricated 1x1x1 shape.
+        let volume = analytic_volume(
+            WATER,
+            &[Pencil {
+                x: 0.0,
+                y: 0.0,
+                sx: 3.0,
+                sy: 3.0,
+                energy: 100.0,
+                amount: 1.0,
+            }],
+            Quantity::Dose,
+            0.0,
+            0.0,
+            0.0,
+            f32::NAN,
+            1.0,
+            0.0,
+        );
+        assert!(volume.origin.iter().all(|value| value.is_finite()));
+        assert_eq!(volume.shape, [0, 0, 0]);
+        assert!(volume.values.is_empty());
+    }
+
+    #[test]
+    fn scatter_on_a_zero_axis_returns_empty() {
+        // values[0] on an empty buffer used to panic.
+        assert!(scatter_planes([0, 2, 2], [0, 0, 0], &[], &[], &[]).is_empty());
     }
 }

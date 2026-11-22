@@ -258,7 +258,7 @@ fn accumulate_z(values: &[f32], shape: [usize; 3], z0: usize, z1: usize) -> ZPar
     let mut peak = 0.0f32;
     let mut abs_peak = 0.0f32;
     let mut peak_at = [0usize; 3];
-    if nx > 0 && ny > 0 && z0 < z1 && values.len() >= nx * ny * nz {
+    if nx > 0 && ny > 0 && z0 < z1 && values.len() >= nx.saturating_mul(ny).saturating_mul(nz) {
         for z in z0..z1 {
             for y in 0..ny {
                 let base = nx * (y + ny * z);
@@ -322,7 +322,7 @@ fn scan_axes_serial(values: &[f32], shape: [usize; 3], spacing: [f32; 3]) -> Vol
     let mut peak = 0.0f32;
     let mut abs_peak = 0.0f32;
     let mut peak_at = [0usize; 3];
-    if nx > 0 && ny > 0 && nz > 0 && values.len() >= nx * ny * nz {
+    if nx > 0 && ny > 0 && nz > 0 && values.len() >= nx.saturating_mul(ny).saturating_mul(nz) {
         for z in 0..nz {
             for y in 0..ny {
                 let base = nx * (y + ny * z);
@@ -1124,6 +1124,10 @@ pub fn sample_index(volume: &Volume, x: f32, y: f32, z: f32, filter: u8) -> f32 
         _ => {
             // Python nearest is floor(cell), and a miss outside the grid is 0.
             // `x` is cell - 0.5, the same coordinate linear interpolation uses.
+            // NaN folds to index 0 through `as i32` — treat it as a miss too.
+            if !(x.is_finite() && y.is_finite() && z.is_finite()) {
+                return 0.0;
+            }
             let [nx, ny, nz] = volume.shape;
             let ix = (x + 0.5).floor() as i32;
             let iy = (y + 0.5).floor() as i32;
@@ -1645,6 +1649,16 @@ mod tests {
         let steps = steps_to_leave([8.0 - 6e-5, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0; 3], 1.0);
         assert!(steps <= MAX_STEPS, "{steps}");
         assert!(steps >= 1);
+    }
+
+    #[test]
+    fn a_nan_sample_is_a_miss_not_the_corner_voxel() {
+        // NaN as i32 is 0 — without the check a NaN coordinate reads the
+        // real value at (0,0,0).
+        let volume = peaked();
+        assert_eq!(sample_index(&volume, f32::NAN, 0.0, 0.0, 0), 0.0);
+        assert_eq!(sample_index(&volume, 0.0, f32::NAN, 0.0, 0), 0.0);
+        assert_eq!(sample_index(&volume, 0.0, 0.0, f32::NAN, 0), 0.0);
     }
 
     #[test]

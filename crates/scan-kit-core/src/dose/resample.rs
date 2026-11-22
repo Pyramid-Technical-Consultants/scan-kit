@@ -25,7 +25,13 @@ pub fn resample_linear(
             .copied()
             .unwrap_or(0.0)
     };
-    let mut out = vec![0.0f32; dst_shape[0] * dst_shape[1] * dst_shape[2]];
+    let Some(len) = dst_shape[0]
+        .checked_mul(dst_shape[1])
+        .and_then(|n| n.checked_mul(dst_shape[2]))
+    else {
+        return Vec::new();
+    };
+    let mut out = vec![0.0f32; len];
     for z in 0..dst_shape[2] {
         for y in 0..dst_shape[1] {
             for x in 0..dst_shape[0] {
@@ -123,5 +129,19 @@ mod tests {
             [1, 1, 1],
         );
         assert_eq!(edge, vec![2.0]);
+    }
+
+    #[test]
+    fn a_dst_shape_product_that_overflows_returns_empty() {
+        let out = resample_linear(
+            &[0.0f32; 8],
+            [0.0; 3],
+            [1.0; 3],
+            [2, 2, 2],
+            [0.0; 3],
+            [1.0; 3],
+            [usize::MAX, 2, 2],
+        );
+        assert!(out.is_empty());
     }
 }
