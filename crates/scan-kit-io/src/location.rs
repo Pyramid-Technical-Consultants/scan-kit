@@ -807,6 +807,9 @@ fn parse_remote(scheme: Scheme, rest: &str) -> Result<Remote, String> {
     if path.bytes().any(|byte| byte.is_ascii_control())
         || host.bytes().any(|byte| byte.is_ascii_control())
         || username.bytes().any(|byte| byte.is_ascii_control())
+        || password
+            .as_deref()
+            .is_some_and(|pass| pass.bytes().any(|byte| byte.is_ascii_control()))
         || query.bytes().any(|byte| byte.is_ascii_control())
     {
         return Err("the URL holds control characters".into());

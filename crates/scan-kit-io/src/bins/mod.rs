@@ -14,7 +14,9 @@ use super::histogram::{bin_button, bin_share, bins_control, hist_bin_count, shar
 use super::marks::{control, flag, labeled, pick, text};
 mod glyphs;
 
-use super::tables::{median, same, session_columns, span, timeslice_energy_only, Grain};
+use super::tables::{
+    median, point_time_stamp, same, session_columns, span, timeslice_energy_only, Grain,
+};
 use glyphs::{
     begin_grown, binned_trend, box_series, contour_series, corr_panel, grown_violin, hist_panel,
     hline, interlock_guides, mean_series, note_panel, scatter_series, scatter_trend, violin_series,
@@ -619,6 +621,9 @@ fn session_stamp(root: &Path, session: &str) -> u128 {
     ] {
         stamp ^= discover::meta_stamp(&dir.join(name));
     }
+    // layer-*/run-* spot files feed point/beam-on times — a rewrite there
+    // must invalidate prepared beam_on/overhead glyphs too.
+    stamp ^= point_time_stamp(&dir);
     // A same-length timeslice rewrite leaves the row-count keys unchanged —
     // without this the grown violins keep serving the previous distribution.
     stamp ^ discover::timeslice_stamp(&dir)

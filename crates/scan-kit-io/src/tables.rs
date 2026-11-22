@@ -1881,7 +1881,7 @@ fn lookup_point_time(dir: &Path, spot_no: &[f32], layer: &[f32]) -> Vec<f32> {
 
 /// Stamp over the point-time files the spot build reads, keyed by position
 /// in the layer tree so a changed file or a new layer invalidates the cache.
-fn point_time_stamp(dir: &Path) -> u128 {
+pub(crate) fn point_time_stamp(dir: &Path) -> u128 {
     let mut stamp = 0u128;
     let mut layers: Vec<PathBuf> = std::fs::read_dir(dir)
         .map(|entries| {

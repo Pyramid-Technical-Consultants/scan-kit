@@ -286,6 +286,7 @@ struct ReadTicket {
 }
 
 struct Live {
+    gpu: Arc<McGpu>,
     device: wgpu::Device,
     queue: wgpu::Queue,
     transport_pipe: wgpu::ComputePipeline,
@@ -546,8 +547,11 @@ static GPU: Mutex<Option<Arc<McGpu>>> = Mutex::new(None);
 
 /// A wedged or lost device would otherwise poison every future run — drop the
 /// cache so the next open builds a fresh device instead of cloning a dead one.
-fn gpu_lost() {
-    *GPU.lock().unwrap_or_else(|err| err.into_inner()) = None;
+fn gpu_lost(gpu: &Arc<McGpu>) {
+    let mut cached = GPU.lock().unwrap_or_else(|err| err.into_inner());
+    if cached.as_ref().is_some_and(|held| Arc::ptr_eq(held, gpu)) {
+        *cached = None;
+    }
 }
 
 async fn shared_gpu() -> Result<Arc<McGpu>, ComputeError> {
@@ -626,7 +630,8 @@ async fn open_gpu() -> Result<McGpu, ComputeError> {
 
 async fn prepare(launch: Launch) -> Result<Live, ComputeError> {
     let [nx, ny, nz] = launch.shape;
-    let nvox = nx.saturating_mul(ny).saturating_mul(nz).max(1);
+    let shape = [nx.max(1), ny.max(1), nz.max(1)];
+    let nvox = shape[0].saturating_mul(shape[1]).saturating_mul(shape[2]);
     let gpu = shared_gpu().await?;
     let device = gpu.device.clone();
     let queue = gpu.queue.clone();
@@ -711,7 +716,8 @@ async fn prepare(launch: Launch) -> Result<Live, ComputeError> {
         cap,
         nvox,
         scale,
-        shape: [nx.max(1), ny.max(1), nz.max(1)],
+        gpu,
+        shape,
         origin: launch.origin_mm,
         spacing: launch.spacing_cm.map(|cm| cm * 10.0),
         inflight: VecDeque::new(),
@@ -935,7 +941,7 @@ impl Live {
                 return Ok(started.elapsed());
             }
             if started.elapsed() > Duration::from_secs(30) {
-                gpu_lost();
+                gpu_lost(&self.gpu);
                 return Err(ComputeError::Message(
                     "GPU submission did not retire".into(),
                 ));
@@ -951,7 +957,7 @@ impl Live {
                 Ok(_) => return Ok(started.elapsed()),
                 Err(wgpu::PollError::Timeout) => continue,
                 Err(err) => {
-                    gpu_lost();
+                    gpu_lost(&self.gpu);
                     return Err(ComputeError::Message(err.to_string()));
                 }
             }
@@ -1033,7 +1039,7 @@ impl Live {
                 return Err(ComputeError::Message("cancelled".into()));
             }
             if started.elapsed() > Duration::from_secs(30) {
-                gpu_lost();
+                gpu_lost(&self.gpu);
                 return Err(ComputeError::Message(
                     "GPU submission did not retire".into(),
                 ));
@@ -1044,7 +1050,7 @@ impl Live {
             }) {
                 Ok(_) | Err(wgpu::PollError::Timeout) => {}
                 Err(err) => {
-                    gpu_lost();
+                    gpu_lost(&self.gpu);
                     return Err(ComputeError::Message(err.to_string()));
                 }
             }

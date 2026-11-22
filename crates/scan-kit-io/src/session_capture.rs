@@ -917,6 +917,10 @@ fn write_input_map(
             // The join is positional — a shorter RCI table means the device
             // filtered rows, so every pair from the divergence on is a wrong
             // label. Emit without the extra columns rather than mislabel.
+            // A longer RCI table still joins the first N rows: re-delivered
+            // spots land at the tail, but a mid-table insert would misalign
+            // the same way — there is no key to compare against, so `>=` is
+            // the reachable middle ground.
             if let Some(spot) =
                 rci_spot.filter(|spot| !extra.is_empty() && spot.rows.len() >= sheet.rows.len())
             {

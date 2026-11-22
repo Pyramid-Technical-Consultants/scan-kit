@@ -123,7 +123,12 @@ impl ScanKit {
                         .is_some_and(|parsed| Self::remote_in(&parsed))
             }
             Value::Array(items) => items.iter().any(Self::remote_in),
-            Value::Object(map) => map.values().any(Self::remote_in),
+            // `note` is the one free-text field in the tool surface — a note
+            // that *is* a URL must not trip the path gate. Path-carrying
+            // keys still check out via their string values.
+            Value::Object(map) => map
+                .iter()
+                .any(|(key, value)| key != "note" && Self::remote_in(value)),
             _ => false,
         }
     }

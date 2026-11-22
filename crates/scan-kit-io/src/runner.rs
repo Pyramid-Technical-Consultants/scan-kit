@@ -31,6 +31,9 @@ const MAX_BODY: usize = 64 * 1024 * 1024;
 const MAX_ZIP_WALK_DEPTH: usize = 32;
 
 struct Live {
+    /// Bumped per connect — an upload window that re-locks LIVE after a
+    /// disconnect+connect must fail instead of commanding the new device.
+    epoch: u64,
     host: String,
     socket: WebSocket<TcpStream>,
     status: Map<String, Value>,
@@ -42,6 +45,7 @@ struct Live {
 }
 
 static LIVE: Mutex<Option<Live>> = Mutex::new(None);
+static EPOCH: AtomicU64 = AtomicU64::new(0);
 
 pub fn catalog(db: &Path) -> Value {
     let (host, file_dir) = with_store(db, |conn| store::runner_settings(conn))
@@ -96,6 +100,7 @@ pub fn connect(db: &Path, host: &str) -> Result<Value, String> {
     {
         let mut guard = lock();
         *guard = Some(Live {
+            epoch: EPOCH.fetch_add(1, Ordering::Relaxed) + 1,
             host: host.clone(),
             socket,
             status,
@@ -137,7 +142,7 @@ pub fn upload(db: &Path, csv_path: &Path) -> Result<Value, String> {
     // Each socket exchange holds LIVE; the HTTP put and the poll sleeps do
     // not need it. Holding it across the whole upload froze status reads and
     // control actions for up to ~40s.
-    let (host, target) = {
+    let (host, epoch, target) = {
         let mut guard = lock();
         let live = guard.as_mut().ok_or("not connected")?;
         set_field(
@@ -157,19 +162,27 @@ pub fn upload(db: &Path, csv_path: &Path) -> Result<Value, String> {
             .filter(|text| !text.is_empty())
             .unwrap_or(DEFAULT_CONTROL_POINTS)
             .to_owned();
-        (live.host.clone(), target)
+        (live.host.clone(), live.epoch, target)
     };
     http_put(&host, &target, &bytes)?;
+    // A disconnect+connect between windows swaps the Live — commanding the
+    // new device with the old one's session is worse than failing.
     {
         let mut guard = lock();
-        let live = guard.as_mut().ok_or("not connected")?;
+        let live = guard
+            .as_mut()
+            .filter(|live| live.epoch == epoch)
+            .ok_or("connection changed")?;
         set_field(&mut live.socket, POINTS_UPLOAD, &json!(true))?;
     }
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let code = {
             let mut guard = lock();
-            let live = guard.as_mut().ok_or("not connected")?;
+            let live = guard
+                .as_mut()
+                .filter(|live| live.epoch == epoch)
+                .ok_or("connection changed")?;
             let state = read_one(&mut live.socket, POINTS_LOAD_STATE, Duration::from_secs(2))?;
             io_number(&state).map(|value| value as i64)
         };
@@ -188,7 +201,10 @@ pub fn upload(db: &Path, csv_path: &Path) -> Result<Value, String> {
     }
     {
         let mut guard = lock();
-        let live = guard.as_mut().ok_or("not connected")?;
+        let live = guard
+            .as_mut()
+            .filter(|live| live.epoch == epoch)
+            .ok_or("connection changed")?;
         let valid = read_one(&mut live.socket, POINTS_VALID, Duration::from_secs(8))?;
         subscribe_status(&mut live.socket)?;
         if !io_bool(&valid) {

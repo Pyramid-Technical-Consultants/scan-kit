@@ -85,6 +85,7 @@ pub fn set_hide_unused(db: &Path, hide: bool) -> Result<Value, String> {
 }
 
 pub fn read_form(path: &Path) -> Result<Value, String> {
+    let _io = FILE_IO.lock().unwrap_or_else(|err| err.into_inner());
     let xml = fs::read_to_string(path)
         .map_err(|err| format!("Could not read {}: {err}", path.display()))?;
     let form = config_form(&xml)?;
