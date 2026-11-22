@@ -1073,9 +1073,11 @@ export function AnalysisView({
     if (held === value || (held == null && resolved[id] === value)) {
       return;
     }
-    const next = applyOption(optionsRef.current, resolved, grains.current, id, value);
-    optionsRef.current = next;
-    setOptions(next);
+    setOptions((current) => {
+      const next = applyOption(current, resolved, grains.current, id, value);
+      optionsRef.current = next;
+      return next;
+    });
     const panel = id === "plot0" ? 4 : id === "plot1" ? 5 : -1;
     if (panel >= 0 && localLinePlot(value)) {
       const plot = viewId === "volumetric" ? dosePlots.current[panel] : plotter.current;

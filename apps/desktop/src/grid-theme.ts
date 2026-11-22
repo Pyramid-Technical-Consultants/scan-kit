@@ -37,14 +37,15 @@ export function useResizableColumns(columns: GridColumn[]): {
   const sized = useMemo(
     () =>
       columns.map((column, index) => {
-        const width = widths[column.id ?? column.title ?? String(index)];
+        const width = widths[column.id ?? `${column.title ?? ""}#${index}`];
         return width == null ? column : { ...column, width };
       }),
     [columns, widths],
   );
   const onColumnResize = useCallback(
     (column: GridColumn, newSize: number, colIndex: number) => {
-      const key = column.id ?? columns[colIndex]?.id ?? column.title ?? String(colIndex);
+      const key =
+        column.id ?? `${column.title ?? columns[colIndex]?.title ?? ""}#${colIndex}`;
       setWidths((current) => ({ ...current, [key]: newSize }));
     },
     [columns],

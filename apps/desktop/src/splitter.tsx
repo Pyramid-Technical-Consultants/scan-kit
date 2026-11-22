@@ -22,6 +22,7 @@ export function Splitter({
   const onPointerDown = (event: ReactPointerEvent<HTMLDivElement>) => {
     event.preventDefault();
     const handle = event.currentTarget;
+    handle.focus();
     handle.setPointerCapture(event.pointerId);
     origin.current = orientation === "vertical" ? event.clientX : event.clientY;
     onStart();
