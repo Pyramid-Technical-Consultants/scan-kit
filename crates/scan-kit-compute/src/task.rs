@@ -270,6 +270,9 @@ pub fn poll_task(id: u64) -> Result<Vec<u8>, String> {
     };
     let mut driver = lock();
     let Some(current) = driver.tasks.get(&id).map(|task| task.generation) else {
+        // Dropping the stage joins its worker — never under the driver lock.
+        drop(driver);
+        drop(stage);
         return Ok(encode_poll(
             &ended(id, generation, Phase::Cancelled, ""),
             None,
@@ -281,6 +284,7 @@ pub fn poll_task(id: u64) -> Result<Vec<u8>, String> {
             task.last_report = Some(report.clone());
             task.stage = Some(stage);
         }
+        drop(driver);
         return Ok(encode_poll(
             &ended(id, generation, Phase::Cancelled, ""),
             None,
@@ -290,9 +294,16 @@ pub fn poll_task(id: u64) -> Result<Vec<u8>, String> {
     if remove {
         driver.tasks.remove(&id);
         driver.clear(id);
-    } else if let Some(task) = driver.tasks.get_mut(&id) {
-        task.last_report = Some(report.clone());
-        task.stage = Some(stage);
+        drop(driver);
+        // The finished stage joins its worker on drop — off the lock, or the
+        // GPU drain stalls every other poll and cancel behind it.
+        drop(stage);
+    } else {
+        if let Some(task) = driver.tasks.get_mut(&id) {
+            task.last_report = Some(report.clone());
+            task.stage = Some(stage);
+        }
+        drop(driver);
     }
     Ok(encode_poll(&report, payload.as_deref(), finished))
 }

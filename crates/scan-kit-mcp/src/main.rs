@@ -89,10 +89,36 @@ impl ScanKit {
         // A remote location spec reaches out to the network: SFTP TOFU
         // writes known_hosts, archives download into the remote cache,
         // SMB opens sessions, and FTP/HTTP touch any host named.
-        let remote = ["path", "storage_path", "data_dir"]
-            .iter()
-            .filter_map(|key| input.get(key).and_then(Value::as_str))
-            .any(scan_kit_io::is_remote_location);
+        // is_remote_location only sees scheme-prefixed specs — a UNC share
+        // or file://host reaches the same wire through plain filesystem
+        // calls, so the gate checks for those spellings itself.
+        let remote = [
+            "path",
+            "storage_path",
+            "data_dir",
+            "config_dir",
+            "file",
+            "file_dir",
+            "folder",
+            "dest",
+            "source",
+        ]
+        .iter()
+        .filter_map(|key| input.get(key).and_then(Value::as_str))
+        .any(|spec| {
+            let spec = spec.trim();
+            if scan_kit_io::is_remote_location(spec)
+                || spec.starts_with("\\\\")
+                || spec.starts_with("//")
+            {
+                return true;
+            }
+            // file://host/path rewrites to a UNC share — only a leading /
+            // (file:///…) is local.
+            spec.get(..7)
+                .is_some_and(|head| head.eq_ignore_ascii_case("file://"))
+                && !spec[7..].starts_with('/')
+        });
         (saves || foreign_db || remote).then_some(name)
     }
 
@@ -397,6 +423,18 @@ mod tests {
         assert_eq!(kit.blocked("scan_kit_open_library", &drive), None);
         let file = serde_json::json!({ "path": "file:///lib" });
         assert_eq!(kit.blocked("scan_kit_open_library", &file), None);
+        // UNC and file://host reach the wire without a scheme the driver
+        // classifier sees — the gate has to catch its own spellings.
+        let unc = serde_json::json!({ "path": "\\\\filer\\share\\lib" });
+        assert_eq!(
+            kit.blocked("scan_kit_open_library", &unc),
+            Some("scan_kit_open_library")
+        );
+        let hosted = serde_json::json!({ "path": "file://filer/share/lib" });
+        assert_eq!(
+            kit.blocked("scan_kit_open_library", &hosted),
+            Some("scan_kit_open_library")
+        );
     }
 
     async fn listed_and_control(effects: bool) -> (Vec<String>, bool, bool) {
