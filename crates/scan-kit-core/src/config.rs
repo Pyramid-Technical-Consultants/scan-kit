@@ -236,8 +236,8 @@ fn apply_nodes(root: &mut Elem, nodes: &[Value]) -> Result<(), String> {
                     .get("id")
                     .and_then(Value::as_str)
                     .ok_or("field id is required")?;
-                let value = field.get("value").and_then(Value::as_str).unwrap_or("");
-                write_field(root, id, value)?;
+                let value = field.get("value").map(cell_text).unwrap_or_default();
+                write_field(root, id, &value)?;
             }
         }
         if node.get("kind").and_then(Value::as_str) == Some("table") {
@@ -247,6 +247,17 @@ fn apply_nodes(root: &mut Elem, nodes: &[Value]) -> Result<(), String> {
     Ok(())
 }
 
+/// Stringify a form/table value the way `normalize_options` does — a JSON
+/// number or bool writes its text form, null writes empty. Coercing silently
+/// to "" would blank the attribute instead.
+fn cell_text(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        Value::Null => String::new(),
+        other => other.to_string(),
+    }
+}
+
 fn write_field(root: &mut Elem, id: &str, value: &str) -> Result<(), String> {
     let (path, which) = split_id(id)?;
     let elem = root
@@ -254,8 +265,12 @@ fn write_field(root: &mut Elem, id: &str, value: &str) -> Result<(), String> {
         .ok_or_else(|| format!("missing XML node {id}"))?;
     if let Some(attr) = which.strip_prefix('@') {
         elem.set_attr(attr, value);
-    } else {
+    } else if which == "#text" {
         elem.text = value.to_owned();
+    } else {
+        // A `#table` id addresses a table node, not a scalar field — writing
+        // element text here would silently corrupt the wrong node.
+        return Err(format!("bad field id {id}"));
     }
     Ok(())
 }
@@ -309,8 +324,7 @@ fn write_table(root: &mut Elem, node: &Value) -> Result<(), String> {
             .get_mut(*index)
             .ok_or_else(|| format!("missing table row {index}"))?;
         for (column, cell) in columns.iter().zip(cells) {
-            let text = cell.as_str().unwrap_or("");
-            child.set_attr(column, text);
+            child.set_attr(column, &cell_text(cell));
         }
     }
     Ok(())
@@ -830,5 +844,24 @@ mod tests {
             None
         }
         walk(form).unwrap()
+    }
+
+    #[test]
+    fn a_table_id_rejected_as_a_scalar_field() {
+        let blank = || Elem {
+            name: String::new(),
+            attrs: Vec::new(),
+            text: String::new(),
+            children: Vec::new(),
+        };
+        let mut root = blank();
+        root.children.push(Elem {
+            name: "table".into(),
+            ..blank()
+        });
+        let err = write_field(&mut root, "0#beam_sigma_conversions", "x").unwrap_err();
+        assert!(err.contains("bad field id"), "{err}");
+        let err = write_field(&mut root, "0#bogus", "x").unwrap_err();
+        assert!(err.contains("bad field id"), "{err}");
     }
 }

@@ -603,11 +603,12 @@ pub fn dvh(dose: &[f32], mask: &[bool], bins: usize) -> (Vec<f32>, Vec<f32>) {
         .filter_map(|(value, keep)| (*keep && value.is_finite() && *value >= 0.0).then_some(*value))
         .collect();
     let (edges, counts) = histogram(&selected, bins);
-    let total = counts.iter().sum::<f32>().max(1.0);
+    let total = counts.iter().sum::<f32>();
     let mut cumulative = Vec::with_capacity(counts.len());
     let mut above = total;
     for count in &counts {
-        cumulative.push(above / total);
+        // An empty selection must not read as 100% coverage.
+        cumulative.push(if total == 0.0 { 0.0 } else { above / total });
         above -= count;
     }
     (edges, cumulative)
@@ -783,7 +784,7 @@ pub fn hv_capacitance_pf(
 }
 /// Percent of finite metrics at or above each threshold.
 pub fn coverage_percent(metrics: &[f32], thresholds: &[f32]) -> Vec<f32> {
-    let total = metrics.len();
+    let total = metrics.iter().filter(|value| value.is_finite()).count();
     thresholds
         .iter()
         .map(|threshold| {
@@ -1169,5 +1170,20 @@ mod tests {
         let (_edges, counts) = histogram(&[1.0, 2.0, 3.0], usize::MAX);
         assert_eq!(counts.len(), MAX_BINS);
         assert!(quantile_edges(&[1.0, 2.0], usize::MAX).len() <= MAX_BINS + 1);
+    }
+
+    #[test]
+    fn coverage_percent_counts_only_finite_metrics() {
+        assert_eq!(coverage_percent(&[10.0, f32::NAN], &[0.0]), vec![100.0]);
+        assert_eq!(
+            coverage_percent(&[10.0, f32::INFINITY, 50.0], &[25.0]),
+            vec![50.0]
+        );
+    }
+
+    #[test]
+    fn an_empty_selection_reports_zero_dvh_coverage() {
+        let (_, cumulative) = dvh(&[], &[true], 10);
+        assert!(cumulative.iter().all(|value| *value == 0.0));
     }
 }

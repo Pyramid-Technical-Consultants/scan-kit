@@ -98,7 +98,9 @@ pub fn median_unstable(values: &mut [f32]) -> f32 {
         select_rank(values, mid)
     } else {
         let (low, high) = select_ranks(values, mid - 1, mid);
-        (low + high) * 0.5
+        // Halve each rank before adding — `low + high` overflows to ±inf
+        // for finite pairs like [3e38, 3e38].
+        low * 0.5 + high * 0.5
     }
 }
 
@@ -230,5 +232,13 @@ mod tests {
         assert!(quantiles_at(&mut [], &qs)
             .iter()
             .all(|value| value.is_nan()));
+    }
+
+    #[test]
+    fn a_median_of_two_large_values_does_not_overflow_to_infinite() {
+        let mut values = [3e38f32, 3e38];
+        assert_eq!(median_unstable(&mut values), 3e38);
+        let mut values = [-3e38f32, -3e38];
+        assert_eq!(median_unstable(&mut values), -3e38);
     }
 }
