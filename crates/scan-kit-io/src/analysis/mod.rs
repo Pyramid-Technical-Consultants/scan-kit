@@ -196,7 +196,10 @@ fn session_channels(root: &Path, session: &str) -> super::tables::Table {
 }
 
 pub(super) fn channel_key(name: &str) -> bool {
-    !matches!(name, "energy" | "beam_on" | "beam_on_time" | "spot_time")
+    !matches!(
+        name,
+        "energy" | "beam_on" | "beam_on_time" | "spot_time" | "time_s"
+    )
 }
 
 fn series_span(series: &[Series]) -> (f32, f32, f32, f32) {

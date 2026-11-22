@@ -612,7 +612,9 @@ fn session_stamp(root: &Path, session: &str) -> u128 {
     for name in ["spot_data.csv", "input_map.csv"] {
         stamp ^= discover::meta_stamp(&dir.join(name));
     }
-    stamp
+    // A same-length timeslice rewrite leaves the row-count keys unchanged —
+    // without this the grown violins keep serving the previous distribution.
+    stamp ^ discover::timeslice_stamp(&dir)
 }
 
 fn mtime_ns(path: &Path) -> u128 {
@@ -821,6 +823,13 @@ pub(crate) fn bins(root: &Path, session_ids: &[String], options: &Value) -> Plot
             end = end.max(clock);
             tables.push(table);
         }
+        // A menu-offered column the active grain never emits would draw an
+        // empty category axis — fall back to the one column every grain has.
+        let x_column = if tables.iter().all(|table| !table.contains_key(x_column)) {
+            "energy"
+        } else {
+            x_column
+        };
         let (categories, stable_bins) = if raw_x {
             (Vec::new(), false)
         } else {
@@ -1199,7 +1208,10 @@ fn assemble_panel(
     Panel {
         title: item.label.clone(),
         y_label: item.y_label.clone(),
-        x_label: String::new(),
+        // An empty x label is how the renderer recognizes a time panel —
+        // bins panels must carry a real label or a scrub re-fits them to
+        // the seconds window and clips their guides.
+        x_label: x_label(x_column).to_owned(),
         xmin: prepared.xmin,
         xmax: prepared.xmax,
         ymin: item.ymin,
@@ -1536,7 +1548,12 @@ fn plotted_columns(
             continue;
         }
         let mut values = values.clone();
-        let protect = matches!(name, "beam_on" | "expected_sigma" | "session_avg_rate");
+        // rate_energy/mu_rate are per-layer summaries — masking them by
+        // spot-row timestamps misaligns the two row domains.
+        let protect = matches!(
+            name,
+            "beam_on" | "expected_sigma" | "session_avg_rate" | "rate_energy" | "mu_rate"
+        );
         if let Some(mask) = &mask {
             if !protect {
                 for (value, keep) in values.iter_mut().zip(mask.iter()) {
@@ -2903,5 +2920,23 @@ mod tests {
             )));
         }
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn layer_rate_columns_survive_the_spot_time_mask() {
+        // rate_energy/mu_rate index layer rows; the playhead mask indexes
+        // spot rows — masking them positionally was misalignment.
+        let mut loaded = BTreeMap::new();
+        loaded.insert("time_s".to_string(), vec![0.0, 1.0, 2.0]);
+        loaded.insert("rate_energy".to_string(), vec![100.0, 120.0]);
+        loaded.insert("mu_rate".to_string(), vec![5.0, 6.0]);
+        let segments = vec![Segment::Range {
+            column: "time_s".to_string(),
+            lo: 0.5,
+            hi: 2.0,
+        }];
+        let table = plotted_columns(&loaded, &["rate_energy", "mu_rate"], &[], &segments, false);
+        assert!(table["mu_rate"].iter().all(|v| v.is_finite()));
+        assert!(table["rate_energy"].iter().all(|v| v.is_finite()));
     }
 }

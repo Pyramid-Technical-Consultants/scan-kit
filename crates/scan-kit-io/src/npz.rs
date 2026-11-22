@@ -140,12 +140,13 @@ pub fn read_npz(bytes: &[u8]) -> Result<BTreeMap<String, Npy>, String> {
     for index in 0..archive.len() {
         let mut file = archive.by_index(index).map_err(|err| err.to_string())?;
         let name = file.name().map_err(|err| err.to_string())?;
-        let name = name
-            .rsplit(['/', '\\'])
-            .next()
-            .unwrap_or("")
-            .trim_end_matches(".npy")
-            .to_owned();
+        let base = name.rsplit(['/', '\\']).next().unwrap_or("");
+        // np.load only exposes .npy members — a stray note.txt or __MACOSX
+        // entry must not fail the whole archive.
+        let Some(name) = base.strip_suffix(".npy") else {
+            continue;
+        };
+        let name = name.to_owned();
         if name.is_empty() {
             continue;
         }
@@ -505,5 +506,23 @@ mod tests {
             data: Vec::new(),
         };
         assert!(npy.strings().is_err());
+    }
+
+    #[test]
+    fn stray_zip_members_are_not_arrays() {
+        let mut buf = Vec::new();
+        {
+            let mut writer = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            let options = zip::write::SimpleFileOptions::default();
+            writer.start_file("note.txt", options).unwrap();
+            std::io::Write::write_all(&mut writer, b"not an array").unwrap();
+            writer.start_file("ok.npy", options).unwrap();
+            std::io::Write::write_all(&mut writer, &serialize_npy(&npy_f64(&[1], &[1.0])).unwrap())
+                .unwrap();
+            writer.finish().unwrap();
+        }
+        let files = read_npz(&buf).unwrap();
+        assert_eq!(files["ok"].f64s().unwrap(), vec![1.0]);
+        assert!(!files.contains_key("note.txt"));
     }
 }

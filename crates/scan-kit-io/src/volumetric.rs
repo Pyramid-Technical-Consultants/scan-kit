@@ -1155,16 +1155,17 @@ fn fill(
                     sx: pencils.iter().map(|p| p.sx).collect(),
                     sy: pencils.iter().map(|p| p.sy).collect(),
                     energy: pencils.iter().map(|p| p.energy).collect(),
+                    // amount is always a MU/charge reading — transport
+                    // wants real proton counts for every quantity.
                     protons: pencils
                         .iter()
-                        .map(|p| match quantity {
-                            Quantity::Protons => p.amount,
-                            _ => protons_from_mu(
+                        .map(|p| {
+                            protons_from_mu(
                                 f64::from(p.amount),
                                 f64::from(p.energy),
                                 f64::from(gap_mm),
                                 f64::from(k_mu),
-                            ) as f32,
+                            ) as f32
                         })
                         .collect(),
                     histories,

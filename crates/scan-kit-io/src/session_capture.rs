@@ -281,7 +281,9 @@ fn blocks(sheet: &Sheet, layer_of: &mut HashMap<String, usize>) -> Vec<Block> {
             cell
         };
         if row > 0 && (row == sheet.rows.len() || id != prev_eff) {
-            let prev_id = prev_eff.unwrap_or("").to_owned();
+            // A leading ragged run has no previous id — it belongs to the
+            // layer that opens it, not a phantom "" layer.
+            let prev_id = prev_eff.or(id).unwrap_or("").to_owned();
             let next = layer_of.len();
             let layer = *layer_of.entry(prev_id.clone()).or_insert(next);
             let run = runs_of.entry(prev_id).or_insert(0);
@@ -1679,5 +1681,21 @@ mod tests {
         // would forge a record line on re-ingest.
         assert_eq!(meta_id("x\nError code: 9|rest"), "xError code: 9");
         assert_eq!(meta_id("a\rb"), "ab");
+    }
+
+    #[test]
+    fn a_leading_ragged_row_joins_the_next_layer() {
+        // Row 0 has no layer_id cell — there is no previous run to inherit,
+        // so the empty leading block must not consume a "" layer ordinal.
+        let table = sheet("spot_no,layer_id\n1\n2,9\n3,9\n");
+        let mut layers = HashMap::new();
+        let got = blocks(&table, &mut layers);
+        assert!(!layers.contains_key(""), "{layers:?}");
+        assert_eq!(
+            got.iter()
+                .map(|block| (block.layer, block.run, block.start, block.end))
+                .collect::<Vec<_>>(),
+            vec![(0, 0, 0, 1), (0, 1, 1, 3)]
+        );
     }
 }
