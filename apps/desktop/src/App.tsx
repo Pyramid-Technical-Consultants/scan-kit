@@ -874,7 +874,9 @@ export default function App() {
     })().catch((error: unknown) => {
       // Roll back only if nothing newer landed — a second check or a catalog
       // pull between apply and failure must keep its selection.
-      const live = selectionLive.current;
+      // A commit that landed between apply and rejection writes pending
+      // synchronously — read it before the effect-synced ref.
+      const live = selectionPending.current ?? selectionLive.current;
       const stillMine =
         live.length === next.ids.length && live.every((id, index) => id === next.ids[index]);
       if (stillMine) {
