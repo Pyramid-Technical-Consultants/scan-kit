@@ -416,13 +416,13 @@ pub fn read_timeslice_frames(storage: &Path) -> Vec<(i64, Vec<u8>)> {
 
 /// `is_file` without following links — the walk refuses symlinks, so a
 /// `input_map.csv -> elsewhere` must not admit a fake session either.
-fn marker_file(path: &Path) -> bool {
+pub(crate) fn marker_file(path: &Path) -> bool {
     path.symlink_metadata().is_ok_and(|meta| meta.is_file())
 }
 
 /// `is_dir` without following links — a junction'd session dir resolves to
 /// files outside the library root, so it is not a session dir.
-fn unlinked_dir(path: &Path) -> bool {
+pub(crate) fn unlinked_dir(path: &Path) -> bool {
     path.symlink_metadata()
         .is_ok_and(|meta| meta.is_dir() && !meta.file_type().is_symlink())
 }
@@ -431,7 +431,8 @@ fn is_unpacked_session(folder: &Path) -> bool {
     let Some(name) = folder.file_name() else {
         return false;
     };
-    marker_file(&folder.join(name).join("input_map.csv"))
+    let nested = folder.join(name);
+    (unlinked_dir(&nested) && marker_file(&nested.join("input_map.csv")))
         || marker_file(&folder.join("input_map.csv"))
 }
 
@@ -578,6 +579,8 @@ fn walk_files(
 ) {
     // The archive branch caps members and the aggregate; a local session tree
     // is the same trust boundary — bound both before the bytes land.
+    // ponytail: a tree over the cap drops the rest silently (the archive path
+    // errors instead) — a tail-truncated session still parses as complete.
     let mut total = 0u64;
     visit_files(
         root,

@@ -3198,7 +3198,10 @@ fn header_columns(path: &Path) -> Vec<String> {
         return Vec::new();
     };
     let mut line = String::new();
-    let Ok(read) = std::io::BufRead::read_line(&mut std::io::BufReader::new(file), &mut line)
+    // A header line is short — cap the read so a crafted unbounded first line
+    // cannot inflate memory.
+    let limited = std::io::Read::take(file, 1 << 20);
+    let Ok(read) = std::io::BufRead::read_line(&mut std::io::BufReader::new(limited), &mut line)
     else {
         return Vec::new();
     };
@@ -3226,13 +3229,16 @@ fn first_named(dir: &Path, pred: impl Fn(&str) -> bool) -> Option<PathBuf> {
         let mut files = Vec::new();
         let mut dirs = Vec::new();
         for entry in std::fs::read_dir(dir).ok()?.flatten() {
-            // file_type does not follow links — matching the session walk's
-            // symlink/junction refusal.
-            let kind = entry.file_type();
+            // file_type only answers the link question — on DT_UNKNOWN
+            // filesystems its is_file/is_dir are both false, so the real type
+            // still goes through a stat. Links are refused either way.
+            if entry.file_type().is_ok_and(|kind| kind.is_symlink()) {
+                continue;
+            }
             let path = entry.path();
-            if kind.as_ref().is_ok_and(|kind| kind.is_file()) {
+            if path.is_file() {
                 files.push(path);
-            } else if kind.is_ok_and(|kind| kind.is_dir()) && depth < 4 {
+            } else if path.is_dir() && depth < 4 {
                 dirs.push(path);
             }
         }
@@ -3273,11 +3279,15 @@ fn named_files(dir: &Path, pred: &impl Fn(&str) -> bool) -> (Vec<PathBuf>, Vec<P
         let mut found = Vec::new();
         let mut children = Vec::new();
         for entry in read.flatten() {
-            let kind = entry.file_type();
+            // Same rule as first_named: file_type answers only the link
+            // question; DT_UNKNOWN filesystems still need the stat.
+            if entry.file_type().is_ok_and(|kind| kind.is_symlink()) {
+                continue;
+            }
             let path = entry.path();
-            if kind.as_ref().is_ok_and(|kind| kind.is_file()) {
+            if path.is_file() {
                 found.push(path);
-            } else if kind.is_ok_and(|kind| kind.is_dir()) && depth < 4 {
+            } else if path.is_dir() && depth < 4 {
                 children.push(path);
             }
         }

@@ -453,7 +453,7 @@ fn resolve_container(container: &Path, session_id: &str) -> PathBuf {
         return container.to_path_buf();
     }
     let inner = container.join(session_id);
-    if inner.join("input_map.csv").is_file() {
+    if discover::unlinked_dir(&inner) && discover::marker_file(&inner.join("input_map.csv")) {
         return inner;
     }
     container.to_path_buf()
@@ -1267,7 +1267,7 @@ pub(crate) fn delete_storage(root: &str, paths: &[String]) -> Result<Vec<String>
             for spec in paths {
                 let local = spec
                     .strip_prefix(remote.canonical.as_str())
-                    .map(|rel| unc.join(rel.trim_start_matches('/')))
+                    .map(|rel| unc.join(percent_decode(rel.trim_start_matches('/'))))
                     .unwrap_or_else(|| Path::new(spec).to_path_buf());
                 if let Err(err) = trash_path(&local.to_string_lossy()) {
                     errors.push(format!("{spec}: {err}"));
@@ -1318,13 +1318,13 @@ fn trash_path(path: &str) -> Result<(), String> {
         // to a permanent removal, the same as the remote drivers perform.
         Err(err) if path.starts_with("\\\\") => {
             let target = Path::new(path);
-            let meta = fs::symlink_metadata(target).map_err(|err| err.to_string())?;
+            let meta = fs::symlink_metadata(target).map_err(|_| err.to_string())?;
             let result = if meta.is_dir() && !meta.file_type().is_symlink() {
                 fs::remove_dir_all(target)
             } else {
                 fs::remove_file(target)
             };
-            result.map_err(|_| err.to_string())
+            result.map_err(|e| format!("{err}; permanent delete also failed: {e}"))
         }
         Err(err) => Err(err.to_string()),
     }
