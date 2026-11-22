@@ -1911,6 +1911,9 @@ fn remember_stamps(stamps: &[String]) {
 fn stamp_key(root: &Path, session: &str) -> String {
     // session_directory resolves nested layouts — root.join would stamp a
     // directory that never exists and freeze the "cached" flag on.
+    // ponytail: timeslice-dir growth is deliberately excluded — stamping it
+    // would invalidate the slice on every append and force a full reload per
+    // poll; a timeslice-only session just keeps "cached" off.
     let dir = scan_kit_io::session_directory(root, session);
     format!(
         "{}\n{session}\n{}\n{}",
