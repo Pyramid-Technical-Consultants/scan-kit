@@ -146,9 +146,17 @@ pub struct Diff {
 pub fn compare(ref_: &Summary, gpu: &Summary) -> Diff {
     let upto = ref_.r90 as usize;
     let n = upto.min(gpu.idd.len()).min(ref_.idd.len());
+    // f64::max drops NaN operands — an all-NaN dose plane would report
+    // idd = 0.0 ("perfect"). Propagate NaN so it fails the tolerance check.
     let idd = (0..n)
         .map(|i| (gpu.idd[i] / ref_.idd[i] - 1.0).abs())
-        .fold(0.0f64, f64::max);
+        .fold(0.0f64, |a, b| {
+            if a.is_nan() || b.is_nan() {
+                f64::NAN
+            } else {
+                a.max(b)
+            }
+        });
     let sig: Vec<f64> = gpu
         .sigmas
         .iter()

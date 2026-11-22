@@ -543,19 +543,31 @@ pub struct PatientGolden {
 pub fn load_patient_golden(path: &Path) -> Result<PatientGolden, String> {
     let files = load_npz(path)?;
     let crop = files.get("crop").ok_or("crop")?.i64s()?;
-    if crop.len() != 6 {
+    if crop.len() != 6 || crop.iter().any(|&v| v < 0) {
         return Err("crop".into());
     }
     let lo = [crop[0] as usize, crop[1] as usize, crop[2] as usize];
     let hi = [crop[3] as usize, crop[4] as usize, crop[5] as usize];
+    if (0..3).any(|a| lo[a] > hi[a]) {
+        return Err("crop lo > hi".into());
+    }
     let shape = [hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]];
+    let cells = shape
+        .iter()
+        .try_fold(1usize, |acc, &d| acc.checked_mul(d))
+        .ok_or("crop shape overflow")?;
+    let dose = files.get("dose").ok_or("dose")?.f16s()?;
+    let let_d = files.get("let").ok_or("let")?.f16s()?;
+    if dose.len() < cells || let_d.len() < cells {
+        return Err("dose/let shorter than crop".into());
+    }
     Ok(PatientGolden {
         inputs: files.get("inputs").ok_or("inputs")?.scalar_string()?,
         crop: (lo, hi),
         dose_scale: files.get("dose_scale").ok_or("dose_scale")?.scalar_f64()?,
         shape,
-        dose: files.get("dose").ok_or("dose")?.f16s()?,
-        let_d: files.get("let").ok_or("let")?.f16s()?,
+        dose,
+        let_d,
     })
 }
 

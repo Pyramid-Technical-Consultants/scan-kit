@@ -119,7 +119,7 @@ pub async fn round_trip_add_one(input: &[f32]) -> Result<Vec<f32>, ComputeError>
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
         pass.set_pipeline(&pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
-        pass.dispatch_workgroups(1, 1, 1);
+        pass.dispatch_workgroups((input.len() as u32).div_ceil(64).max(1), 1, 1);
     }
     encoder.copy_buffer_to_buffer(&buffer, 0, &staging, 0, bytes.len() as u64);
     queue.submit(Some(encoder.finish()));
