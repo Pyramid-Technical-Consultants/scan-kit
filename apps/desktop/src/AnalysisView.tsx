@@ -857,7 +857,10 @@ export function AnalysisView({
             if (taskId.current === id || issuedSeq.current > ticket) {
               return;
             }
-            void invoke("scan_kit_cancel", { task: id }).catch(() => {});
+            void invoke("scan_kit_cancel", {
+              task: id,
+              generation: started.generation,
+            }).catch(() => {});
           });
           return;
         }

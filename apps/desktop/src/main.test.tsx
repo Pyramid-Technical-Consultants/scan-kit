@@ -10,7 +10,28 @@ vi.mock("@tauri-apps/api/core", () => ({
       return null;
     }
     if (command === "scan_kit_about") {
-      return { title: "Scan Kit", version: "2.0.0-dev" };
+      return {
+        title: "Scan Kit",
+        product_line: "Scan Kit",
+        description: "Dose review",
+        source_lead: "",
+        github_label: "Code",
+        github_url: "https://example.com",
+        maintainer: "",
+        website_label: "Web",
+        website_url: "https://example.com",
+        support_lead: "",
+        support_email: "a@example.com",
+        copyright: "2026",
+        license_lead: "",
+        license_label: "MIT",
+        license_url: "https://example.com",
+        version: "2.0.0-dev",
+        commit: "",
+        third_party: [
+          { name: "MCsquare — data", license: "Apache-2.0", attribution: "© UCLouvain" },
+        ],
+      };
     }
     return null;
   }),

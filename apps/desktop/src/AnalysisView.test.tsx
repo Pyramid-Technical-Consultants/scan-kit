@@ -957,6 +957,7 @@ it("keeps the replacement calculation when an older start finishes late", async 
   const invokeMock = vi.mocked(invoke);
   const original = invokeMock.getMockImplementation();
   const waiters: Array<() => void> = [];
+  let next = 6;
   try {
     await act(() => {
       root = createRoot(host);
@@ -973,7 +974,7 @@ it("keeps the replacement calculation when an older start finishes late", async 
     await act(async () => {
       await new Promise((resolve) => setTimeout(resolve, 200));
     });
-    invokeMock.mockImplementation(async (command: string) => {
+    invokeMock.mockImplementation(async (command: string, args?: unknown) => {
       if (command === "scan_kit_cancel") {
         return null;
       }
@@ -981,12 +982,16 @@ it("keeps the replacement calculation when an older start finishes late", async 
         await new Promise<void>((resolve) => {
           waiters.push(resolve);
         });
-        return { task: 7, generation: 1 };
+        // Distinct tickets pin which task is polled — with identical ids a
+        // superseded-task poll would be indistinguishable from a fresh one.
+        next += 1;
+        return { task: next, generation: next };
       }
       if (command === "scan_kit_poll") {
+        const task = (args as { task?: number }).task ?? 0;
         const report = {
-          task: 7,
-          generation: 1,
+          task,
+          generation: task,
           phase: "done",
           done: 1,
           total: 1,

@@ -99,7 +99,7 @@ afterEach(() => {
   root = null;
 });
 
-it("mounts the data view that opens every analysis plot", async () => {
+it("mounts the shell, switches tabs, and opens About", async () => {
   const host = document.createElement("div");
   document.body.append(host);
   root = createRoot(host);

@@ -10,6 +10,11 @@ vi.mock("@tauri-apps/plugin-dialog", () => ({
   save: vi.fn(async () => "C:/out/session.zip"),
 }));
 
+const runnerStatus = vi.hoisted(() => ({
+  defer: false,
+  waiters: [] as Array<(view: unknown) => void>,
+}));
+
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: vi.fn(async (command: string) => {
     if (command === "scan_kit_runner_catalog") {
@@ -117,6 +122,30 @@ vi.mock("@tauri-apps/api/core", () => ({
     if (command === "scan_kit_cancel") {
       return null;
     }
+    if (command === "scan_kit_runner_status") {
+      const view = {
+        connected: true,
+        state: "LIVE",
+        subtitle: "Live status",
+        progress: 0,
+        point_progress: 0,
+        point: "—",
+        energy: "—",
+        layer: "—",
+        elapsed: "—",
+        permit: "Held",
+        points: "Invalid",
+        enables: { start: false, pause: false, stop: false, reset: true },
+        coach: "Live.",
+        host: "192.168.100.184",
+        version: "1.2.3",
+        device_type: "RCI",
+      };
+      if (runnerStatus.defer) {
+        return new Promise((resolve) => runnerStatus.waiters.push(resolve));
+      }
+      return view;
+    }
     if (command === "scan_kit_runner_disconnect") {
       return {
         host: "192.168.100.184",
@@ -154,6 +183,8 @@ afterEach(() => {
   });
   root = null;
   document.body.replaceChildren();
+  runnerStatus.defer = false;
+  runnerStatus.waiters.length = 0;
 });
 
 it("connects with the remembered host and shows the controller state", async () => {
@@ -203,4 +234,61 @@ it("connects with the remembered host and shows the controller state", async () 
   await click("Disconnect");
   expect(document.body.textContent).toContain("Disconnected.");
   expect(invoke).toHaveBeenCalledWith("scan_kit_runner_upload", { path: "C:/plans/input_map.csv" });
+});
+
+it("drops a status poll that resolves after a fresher action", async () => {
+  const host = document.createElement("div");
+  document.body.append(host);
+  await act(async () => {
+    root = createRoot(host);
+    root.render(<PlanRunner />);
+  });
+  // The status interval installs when connect resolves — fake it before the
+  // click or advanceTimersByTimeAsync cannot fire it.
+  runnerStatus.defer = true;
+  vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+  try {
+    const connect = [...document.body.querySelectorAll("button")].find((item) => item.textContent === "Connect");
+    await act(async () => {
+      connect?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    expect(document.body.textContent).toContain("LOCKED");
+
+    // The poll issues and stays pending.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1000);
+    });
+    expect(runnerStatus.waiters.length).toBe(1);
+
+    // A fresher action bumps the view sequence and replaces the view.
+    const reset = [...document.body.querySelectorAll("button")].find((item) => item.textContent === "Reset");
+    await act(async () => {
+      reset?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    expect(document.body.textContent).toContain("Reset");
+
+    // The stale poll resolves last and must be dropped — without the seq
+    // guard this would repaint the card LIVE.
+    await act(async () => {
+      runnerStatus.waiters.shift()?.({
+        connected: true,
+        state: "LIVE",
+        subtitle: "STALE STATUS",
+        progress: 0,
+        point_progress: 0,
+        point: "—",
+        energy: "—",
+        layer: "—",
+        elapsed: "—",
+        permit: "—",
+        points: "—",
+        enables: { start: false, pause: false, stop: false, reset: true },
+        coach: "Live.",
+      });
+    });
+    expect(document.body.textContent).not.toContain("STALE STATUS");
+    expect(document.body.textContent).toContain("Reset");
+  } finally {
+    vi.useRealTimers();
+  }
 });
