@@ -239,9 +239,11 @@ pub(crate) fn dataset_offset(bytes: &[u8]) -> (usize, Result<bool, String>) {
         cursor = end;
     }
     if !syntax_seen && cursor + 8 <= bytes.len() {
-        implicit = !bytes[cursor + 4..cursor + 6]
-            .iter()
-            .all(|byte| byte.is_ascii_uppercase());
+        // Explicit iff bytes 4-5 are a real VR code AND the element's
+        // declared length fits the file — an implicit u32 length whose low
+        // bytes happen to spell a VR ("SQ" = 0x5351) no longer fakes it,
+        // because the element end then blows past the buffer.
+        implicit = !looks_like_explicit_element(&bytes[cursor..]);
     }
     // A syntax that re-encodes the dataset itself (deflate, big-endian) must
     // not be parsed as explicit LE garbage. Encapsulated-pixel syntaxes keep
@@ -486,6 +488,31 @@ fn element_span(bytes: &[u8], cursor: usize, implicit: bool) -> Option<(usize, u
     Some((start, start.checked_add(length)?))
 }
 
+/// Whether the element at `bytes[0]` reads as explicit VR: a known VR code
+/// whose declared length stays inside the buffer. An implicit u32 length
+/// whose low bytes spell a VR code ("SQ" = 0x5351) fails the bounds check —
+/// the bytes it would read as length are the value's own head.
+fn looks_like_explicit_element(bytes: &[u8]) -> bool {
+    const LONG_VR: &[&[u8]] = &[
+        b"OB", b"OW", b"OF", b"SQ", b"UT", b"UN", b"OD", b"OL", b"OV", b"UC", b"UR",
+    ];
+    const SHORT_VR: &[&[u8]] = &[
+        b"AE", b"AS", b"AT", b"CS", b"DA", b"DS", b"DT", b"FD", b"FL", b"IS", b"LO", b"LT", b"PN",
+        b"SH", b"SL", b"SS", b"ST", b"TM", b"UI", b"UL", b"US",
+    ];
+    let vr = &bytes[4..6];
+    if !LONG_VR.contains(&vr) && !SHORT_VR.contains(&vr) {
+        return false;
+    }
+    if LONG_VR.contains(&vr) && bytes[6..8] != [0, 0] {
+        return false; // explicit long VRs reserve two zero bytes
+    }
+    let Some((length, header)) = value_length(vr, &bytes[6..]) else {
+        return false;
+    };
+    6 + header + length <= bytes.len()
+}
+
 fn value_length(vr: &[u8], rest: &[u8]) -> Option<(usize, usize)> {
     let long = matches!(
         vr,
@@ -598,6 +625,41 @@ mod tests {
         assert_eq!(peek.study_uid, "1.2.3");
         assert!(looks_like_dicom(&bytes));
         assert!(!looks_like_dicom(b"nope"));
+    }
+
+    #[test]
+    fn an_unsupported_transfer_syntax_is_not_sniffed_as_data() {
+        // Group-0002 meta declaring deflated explicit VR LE — the dataset is
+        // re-encoded, so parsing it as explicit LE produces garbage tags.
+        let mut bytes = vec![0u8; 128];
+        bytes.extend_from_slice(b"DICM");
+        push_tag(&mut bytes, 0x0002, 0x0010, b"UI", "1.2.840.10008.1.2.1.99");
+        push_tag(
+            &mut bytes,
+            0x0008,
+            0x0016,
+            b"UI",
+            "1.2.840.10008.5.1.4.1.1.2",
+        );
+        let (_, implicit) = dataset_offset(&bytes);
+        assert!(implicit.unwrap_err().contains("unsupported"));
+    }
+
+    #[test]
+    fn an_implicit_length_that_spells_a_vr_is_not_explicit() {
+        // No file meta — the first dataset element is implicit VR with a u32
+        // length whose low bytes read "SQ". The value head then "declares" a
+        // length that runs past the file, so explicit fails the bounds check.
+        let mut bytes = vec![0u8; 128];
+        bytes.extend_from_slice(b"DICM");
+        bytes.extend_from_slice(&0x0008u16.to_le_bytes());
+        bytes.extend_from_slice(&0x0018u16.to_le_bytes());
+        bytes.extend_from_slice(&0x5153u32.to_le_bytes()); // length; low u16 is "SQ"
+        bytes.extend_from_slice(&u32::MAX.to_le_bytes()); // the value's head
+        bytes.extend_from_slice(&[0u8; 20]);
+        let (offset, implicit) = dataset_offset(&bytes);
+        assert_eq!(offset, 132);
+        assert!(implicit.unwrap());
     }
 
     fn push_tag(bytes: &mut Vec<u8>, group: u16, element: u16, vr: &[u8], text: &str) {

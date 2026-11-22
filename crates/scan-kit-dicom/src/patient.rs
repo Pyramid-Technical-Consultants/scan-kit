@@ -100,6 +100,9 @@ pub struct PatientStudy {
 
 struct Elem {
     tag: u32,
+    /// The explicit-VR code, or [0, 0] under implicit VR — the coercion
+    /// helpers route on this before guessing at a value's byte shape.
+    vr: [u8; 2],
     items: Vec<Vec<Elem>>,
     bytes: Vec<u8>,
 }
@@ -120,8 +123,23 @@ pub fn load_study(path: &Path) -> Result<PatientStudy, String> {
     let mut series_uid = String::new();
     let mut sop_uids = Vec::new();
     let mut structures_uid = String::new();
+    // Identity is taken from the winning series below, not the first CT file
+    // in sorted order — a merged folder can hold more than one patient.
+    let mut identities: std::collections::BTreeMap<String, (String, String, String)> =
+        std::collections::BTreeMap::new();
     for file in crate::dicom_files(path) {
-        let bytes = fs::read(&file).unwrap_or_default();
+        // Unreadable files and oversized files are loud failures — an I/O
+        // error that silently skipped a CT slice would drop it from the
+        // volume without a trace. Same per-file ceiling as read_ion_plan.
+        let mut source =
+            fs::File::open(&file).map_err(|err| format!("{}: {err}", file.display()))?;
+        let mut bytes = Vec::new();
+        std::io::Read::take(&mut source, 256 * 1024 * 1024 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|err| format!("{}: {err}", file.display()))?;
+        if bytes.len() > 256 * 1024 * 1024 {
+            return Err(format!("{} exceeds 256 MiB", file.display()));
+        }
         if bytes.len() < 132 || &bytes[128..132] != b"DICM" {
             continue;
         }
@@ -134,20 +152,21 @@ pub fn load_study(path: &Path) -> Result<PatientStudy, String> {
                 continue;
             }
         }
-        let elems = parse_file(&bytes)?;
+        let elems = parse_file(&bytes).map_err(|err| format!("{}: {err}", file.display()))?;
         let class = text_tag(&elems, tag(0x0008, 0x0016));
         let frame = text_tag(&elems, tag(0x0020, 0x0052));
         if class == "1.2.840.10008.5.1.4.1.1.2" {
-            if patient_id.is_empty() {
-                patient_id = text_tag(&elems, tag(0x0010, 0x0020));
-                patient_name = text_tag(&elems, tag(0x0010, 0x0010));
-                study_uid = text_tag(&elems, tag(0x0020, 0x000D));
-                series_uid = text_tag(&elems, tag(0x0020, 0x000E));
-            }
             // A study can carry several CT series over one frame of
             // reference — merging them stacks two reconstructions into one
             // volume. Bucket by SeriesInstanceUID and keep the largest below.
             let uid = text_tag(&elems, tag(0x0020, 0x000E));
+            identities.entry(uid.clone()).or_insert_with(|| {
+                (
+                    text_tag(&elems, tag(0x0010, 0x0020)),
+                    text_tag(&elems, tag(0x0010, 0x0010)),
+                    text_tag(&elems, tag(0x0020, 0x000D)),
+                )
+            });
             let (sops, bucket) = ct_by_series.entry(uid).or_default();
             sops.push(text_tag(&elems, tag(0x0008, 0x0018)));
             for slice in image_slices(&elems, 1.0)? {
@@ -200,6 +219,11 @@ pub fn load_study(path: &Path) -> Result<PatientStudy, String> {
     }
     sop_uids.extend(orphan_sops);
     ct_slices.extend(orphans);
+    if let Some((id, name, study)) = identities.get(&series_uid) {
+        patient_id = id.clone();
+        patient_name = name.clone();
+        study_uid = study.clone();
+    }
     if ct_slices.is_empty() {
         return Err("the study has no CT".into());
     }
@@ -657,6 +681,11 @@ fn image_slices(elems: &[Elem], scale: f32) -> Result<Vec<Slice>, String> {
         return Err("pixel data does not match the declared frame count".into());
     }
     let offsets = floats_tag(elems, tag(0x3004, 0x000C));
+    if frames > 1 && offsets.is_empty() {
+        // SliceThickness is the collimation, not the increment — inventing
+        // frame*thickness positions would stack a plausible but wrong volume.
+        return Err("multi-frame pixel data has no frame offset vector".into());
+    }
     if !offsets.is_empty() && offsets.len() != frames {
         // A short offset vector would mix real positions with fabricated
         // frame*thickness ones.
@@ -1154,7 +1183,7 @@ fn parse_dataset_mode(bytes: &[u8], implicit: bool, depth: u32) -> Result<Vec<El
         let element = u16::from_le_bytes([bytes[cursor + 2], bytes[cursor + 3]]);
         // Implicit VR writes a 4-byte length where explicit writes VR+length;
         // sequences are only known by the item marker their value starts with.
-        let (length, header, is_seq) = if implicit {
+        let (length, header, vr) = if implicit {
             (
                 u32::from_le_bytes([
                     bytes[cursor + 4],
@@ -1163,12 +1192,12 @@ fn parse_dataset_mode(bytes: &[u8], implicit: bool, depth: u32) -> Result<Vec<El
                     bytes[cursor + 7],
                 ]),
                 8usize,
-                false,
+                [0u8; 2],
             )
         } else {
-            let vr = &bytes[cursor + 4..cursor + 6];
+            let vr = [bytes[cursor + 4], bytes[cursor + 5]];
             let long = matches!(
-                vr,
+                &vr,
                 b"OB"
                     | b"OW"
                     | b"OF"
@@ -1183,7 +1212,7 @@ fn parse_dataset_mode(bytes: &[u8], implicit: bool, depth: u32) -> Result<Vec<El
             );
             let (length, header) = if long {
                 if cursor + 12 > bytes.len() {
-                    break;
+                    return Err("the dataset ends inside an element header".into());
                 }
                 (
                     u32::from_le_bytes([
@@ -1200,7 +1229,7 @@ fn parse_dataset_mode(bytes: &[u8], implicit: bool, depth: u32) -> Result<Vec<El
                     8usize,
                 )
             };
-            (length, header, vr == b"SQ")
+            (length, header, vr)
         };
         if length == u32::MAX {
             return Err("undefined-length DICOM sequences are not read".into());
@@ -1208,33 +1237,23 @@ fn parse_dataset_mode(bytes: &[u8], implicit: bool, depth: u32) -> Result<Vec<El
         let start = cursor + header;
         let end = start + length as usize;
         if end > bytes.len() {
-            break;
+            return Err("the dataset ends inside an element".into());
         }
         let value = &bytes[start..end];
-        // An implicit-VR sequence is only recognizable by the FFFE,E000 item
-        // tag at the head of its value; a failed parse means the value is
-        // plain bytes that happen to share the marker.
-        let (items, seq) = if !implicit && is_seq {
+        // Implicit-VR sequences and explicit UN values are only recognizable
+        // by the FFFE,E000 item tag at the head of the value; once the marker
+        // is present a failed parse is a corrupt sequence, not plain bytes
+        // that happen to share it — demoting would silently empty the SQ.
+        let (items, seq) = if !implicit && vr == *b"SQ" {
             (parse_items(value, false, depth + 1)?, true)
-        } else if implicit && looks_like_items(value) {
-            match parse_items(value, true, depth + 1) {
-                Ok(items) => (items, true),
-                Err(err) => {
-                    // A first item whose length is undefined or fits inside
-                    // the value is a real (unreadable or corrupt) sequence,
-                    // not plain bytes sharing the marker — surface it.
-                    let first = u32::from_le_bytes([value[4], value[5], value[6], value[7]]);
-                    if first == u32::MAX || u64::from(first) + 8 <= value.len() as u64 {
-                        return Err(err);
-                    }
-                    (Vec::new(), false)
-                }
-            }
+        } else if (implicit || vr == *b"UN") && looks_like_items(value) {
+            (parse_items(value, implicit, depth + 1)?, true)
         } else {
             (Vec::new(), false)
         };
         elems.push(Elem {
             tag: tag(group, element),
+            vr: if implicit { [0, 0] } else { vr },
             items,
             bytes: if seq { Vec::new() } else { value.to_vec() },
         });
@@ -1312,9 +1331,31 @@ fn floats_tag(elems: &[Elem], tag: u32) -> Vec<f32> {
     let Some(elem) = elem(elems, tag) else {
         return Vec::new();
     };
-    // OF payloads are raw little-endian f32 whatever the transfer syntax —
-    // a value with a non-text byte decodes as floats, not ASCII. Trailing
-    // NULs are DS padding, not a binary marker.
+    // Known binary VRs decode as little-endian f32s on the VR, not on the
+    // payload's byte shape — an "AAAA" OF would otherwise read as DS text.
+    if matches!(&elem.vr, b"FL" | b"OF" | b"OD") {
+        return elem
+            .bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|chunk| f32::from_le_bytes(*chunk))
+            .collect();
+    }
+    let ds = |bytes: &[u8]| {
+        // All-or-nothing: dropping one bad component shifts every later
+        // value a slot — treat the corrupted value as absent instead.
+        text_of(bytes)
+            .split('\\')
+            .map(|part| part.trim().parse().ok())
+            .collect::<Option<Vec<f32>>>()
+            .unwrap_or_default()
+    };
+    if elem.vr != [0, 0] {
+        return ds(&elem.bytes);
+    }
+    // Implicit VR guesses from shape: OF payloads hold non-text bytes;
+    // trailing NULs are DS padding, not a binary marker.
     let mut end = elem.bytes.len();
     while end > 0 && elem.bytes[end - 1] == 0 {
         end -= 1;
@@ -1332,10 +1373,7 @@ fn floats_tag(elems: &[Elem], tag: u32) -> Vec<f32> {
             .map(|chunk| f32::from_le_bytes(*chunk))
             .collect();
     }
-    text_of(&elem.bytes)
-        .split('\\')
-        .filter_map(|part| part.trim().parse().ok())
-        .collect()
+    ds(&elem.bytes)
 }
 
 fn scanning_spot_mm(cp: &[Elem]) -> f32 {
@@ -1360,6 +1398,29 @@ fn float_tag(elems: &[Elem], tag: u32) -> Option<f32> {
 
 fn int_tag(elems: &[Elem], tag: u32) -> Option<i32> {
     let elem = elem(elems, tag)?;
+    // Known integer VRs decode on the VR — a US value of 0x3839 ("98" as
+    // bytes) must not ASCII-parse to 98.
+    match (&elem.vr, elem.bytes.len()) {
+        (b"US", 2) => {
+            return Some(i32::from(u16::from_le_bytes([
+                elem.bytes[0],
+                elem.bytes[1],
+            ])));
+        }
+        (b"SS", 2) => {
+            return Some(i32::from(i16::from_le_bytes([
+                elem.bytes[0],
+                elem.bytes[1],
+            ])));
+        }
+        (b"UL", 4) => {
+            return i32::try_from(u32::from_le_bytes(elem.bytes[..4].try_into().ok()?)).ok();
+        }
+        (b"SL", 4) => {
+            return Some(i32::from_le_bytes(elem.bytes[..4].try_into().ok()?));
+        }
+        _ => {}
+    }
     // A NUL cannot appear in an IS value (IS pads with a space) — a 2-byte
     // payload holding one is binary US; value 50 = [0x32, 0x00] reads as
     // the ASCII digit "2" otherwise.
@@ -1778,6 +1839,7 @@ mod tests {
         ds(&mut bytes, 0x0028, 0x1052, &[0.0]).unwrap();
         ds(&mut bytes, 0x0028, 0x1053, &[1.0]).unwrap();
         ds(&mut bytes, 0x0018, 0x0050, &[2.5]).unwrap();
+        ds(&mut bytes, 0x3004, 0x000C, &[0.0, 2.5]).unwrap();
         ow(&mut bytes, 0x7FE0, 0x0010, &[(-1000i16) as u16, 0]).unwrap();
         let elems = parse_dataset(&bytes).unwrap();
         let slices = image_slices(&elems, 1.0).unwrap();
@@ -2368,11 +2430,13 @@ mod tests {
         let elems = vec![
             Elem {
                 tag: tag(0x0028, 0x0010),
+                vr: [0, 0],
                 items: Vec::new(),
                 bytes: b"-1".to_vec(),
             },
             Elem {
                 tag: tag(0x0028, 0x0011),
+                vr: [0, 0],
                 items: Vec::new(),
                 bytes: b"-1".to_vec(),
             },
@@ -2386,6 +2450,7 @@ mod tests {
         // NUL that no legal IS string can hold.
         let elem = Elem {
             tag: tag(0x0028, 0x0010),
+            vr: [0, 0],
             items: Vec::new(),
             bytes: vec![0x32, 0x00],
         };
@@ -2413,5 +2478,80 @@ mod tests {
             Ok(_) => panic!("nesting must fail past the depth cap"),
         };
         assert!(err.contains("deep"), "{err}");
+    }
+
+    #[test]
+    fn a_truncated_element_fails_the_whole_dataset() {
+        let mut bytes = Vec::new();
+        us(&mut bytes, 0x0028, 0x0010, 1).unwrap();
+        // A full header declaring 4 bytes, then nothing — the declared end
+        // runs past EOF; returning the prefix would silently drop every tag.
+        bytes.extend_from_slice(&[0x28, 0x00, 0x11, 0x00, b'U', b'S', 0x04, 0x00]);
+        assert!(parse_dataset(&bytes).is_err());
+    }
+
+    #[test]
+    fn a_us_value_decodes_from_the_vr_not_the_byte_shape() {
+        // 0x3231 in US bytes is the ASCII text "12" — a byte-shape guess
+        // would read 12 where the VR says binary 12849.
+        let mut bytes = Vec::new();
+        us(&mut bytes, 0x0028, 0x0010, 0x3231).unwrap();
+        let elems = parse_dataset(&bytes).unwrap();
+        assert_eq!(int_tag(&elems, tag(0x0028, 0x0010)), Some(0x3231));
+    }
+
+    #[test]
+    fn an_un_element_with_item_markers_reads_as_a_sequence() {
+        let mut item = Vec::new();
+        us(&mut item, 0x0028, 0x0010, 7).unwrap();
+        let mut body = Vec::new();
+        body.extend_from_slice(&0xFFFEu16.to_le_bytes());
+        body.extend_from_slice(&0xE000u16.to_le_bytes());
+        body.extend_from_slice(&(item.len() as u32).to_le_bytes());
+        body.extend_from_slice(&item);
+        // UN is a long VR — the header is hand-built: tag, "UN", reserved,
+        // u32 length.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&0x300Au16.to_le_bytes());
+        bytes.extend_from_slice(&0x9999u16.to_le_bytes());
+        bytes.extend_from_slice(b"UN");
+        bytes.extend_from_slice(&[0, 0]);
+        bytes.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&body);
+        let elems = parse_dataset(&bytes).unwrap();
+        let un = elem(&elems, tag(0x300A, 0x9999)).unwrap();
+        assert_eq!(un.items.len(), 1);
+        assert_eq!(int_tag(&un.items[0], tag(0x0028, 0x0010)), Some(7));
+
+        // The same tag without the item marker stays opaque bytes.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&0x300Au16.to_le_bytes());
+        bytes.extend_from_slice(&0x9999u16.to_le_bytes());
+        bytes.extend_from_slice(b"UN");
+        bytes.extend_from_slice(&[0, 0]);
+        bytes.extend_from_slice(&4u32.to_le_bytes());
+        bytes.extend_from_slice(&[1, 2, 3, 4]);
+        let elems = parse_dataset(&bytes).unwrap();
+        let un = elem(&elems, tag(0x300A, 0x9999)).unwrap();
+        assert!(un.items.is_empty());
+        assert_eq!(un.bytes, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn a_multiframe_image_without_frame_offsets_fails() {
+        let mut bytes = Vec::new();
+        us(&mut bytes, 0x0028, 0x0010, 1).unwrap();
+        us(&mut bytes, 0x0028, 0x0011, 1).unwrap();
+        ds(&mut bytes, 0x0028, 0x0030, &[1.0, 2.0]).unwrap();
+        ds(&mut bytes, 0x0020, 0x0032, &[0.0, 0.0, 10.0]).unwrap();
+        us(&mut bytes, 0x0028, 0x0100, 16).unwrap();
+        us(&mut bytes, 0x0028, 0x0103, 1).unwrap();
+        ds(&mut bytes, 0x0028, 0x1052, &[0.0]).unwrap();
+        ds(&mut bytes, 0x0028, 0x1053, &[1.0]).unwrap();
+        ds(&mut bytes, 0x0018, 0x0050, &[2.5]).unwrap();
+        ow(&mut bytes, 0x7FE0, 0x0010, &[1, 2]).unwrap();
+        // Two frames and no GridFrameOffsetVector — the old fallback
+        // invented positions at frame * SliceThickness.
+        assert!(image_slices(&parse_dataset(&bytes).unwrap(), 1.0).is_err());
     }
 }
