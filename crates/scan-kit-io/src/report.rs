@@ -97,7 +97,7 @@ pub fn dvh_csv(curves: &[DvhCurve]) -> String {
     let mut out = String::from("dose_gy_rbe");
     for curve in curves {
         out.push(',');
-        out.push_str(&curve.name.replace(',', " "));
+        out.push_str(&curve.name.replace([',', '\n', '\r'], " "));
         out.push_str(" volume %");
     }
     out.push('\n');
@@ -776,5 +776,18 @@ mod tests {
         assert_eq!(sig6(f64::NAN), "NaN");
         assert_eq!(sig6(f64::INFINITY), "inf");
         assert_eq!(sig6(f64::NEG_INFINITY), "-inf");
+    }
+
+    #[test]
+    fn a_structure_name_cannot_break_the_csv_header() {
+        let curves = vec![DvhCurve {
+            name: "PTV\nCord".to_owned(),
+            edges: vec![0.0],
+            cumulative: vec![100.0],
+        }];
+        let csv = dvh_csv(&curves);
+        // An interior newline would add a bogus column row.
+        assert_eq!(csv.lines().count(), 2, "{csv}");
+        assert!(csv.starts_with("dose_gy_rbe,PTV Cord volume %"));
     }
 }

@@ -315,11 +315,9 @@ pub fn write_patient_dose(
         return Err("the Monte Carlo transport did not run".into());
     };
     let provenance = provenance(inputs, result, session_ids, gpu);
-    let summation = if inputs.segment == "plan" {
-        "PLAN"
-    } else {
-        "FRACTION"
-    };
+    // The export is always one fraction's dose — PLAN/FRACTION are
+    // course-covering types the reader divides by the fraction count.
+    let summation = "FRACTION_SESSION";
     let dose_type = if run.effective {
         "EFFECTIVE"
     } else {
@@ -1929,5 +1927,16 @@ mod tests {
         let a = plan_beam(vec![plan_spot(100.0, 0.0, 0.0, 1.0)]);
         let b = plan_beam(vec![plan_spot(100.0, 0.0, 0.0, 4.0)]);
         assert_eq!(super::pick_beam(&[a, b], &[100.0], &[3.5]), Some(1));
+    }
+
+    #[test]
+    fn a_fraction_session_dose_is_not_divided_by_the_fraction_count() {
+        // The export labels per-fraction doses FRACTION_SESSION — a course
+        // type here would silently shrink the dose 30x on re-import.
+        assert_eq!(
+            tps_per_fraction(&[30.0, 60.0], "FRACTION_SESSION", 30),
+            vec![30.0, 60.0]
+        );
+        assert_eq!(tps_per_fraction(&[30.0], "PLAN", 30), vec![1.0]);
     }
 }

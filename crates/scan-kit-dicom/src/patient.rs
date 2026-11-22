@@ -464,35 +464,34 @@ pub fn write_water_study(dir: &Path) -> Result<(), String> {
     for (index, z) in [0.0f32, 1.0].into_iter().enumerate() {
         let mut bytes = preamble();
         ui(&mut bytes, 0x0008, 0x0016, "1.2.840.10008.5.1.4.1.1.2")?;
-        ui(&mut bytes, 0x0008, 0x0060, "CT")?;
+        cs(&mut bytes, 0x0008, 0x0060, "CT")?;
         ui(&mut bytes, 0x0020, 0x000D, "1.2.3")?;
         ui(&mut bytes, 0x0020, 0x000E, "1.2.3.1")?;
+        ds(&mut bytes, 0x0020, 0x0032, &[0.0, 0.0, z])?;
+        ds(&mut bytes, 0x0020, 0x0037, &[1.0, 0.0, 0.0, 0.0, 1.0, 0.0])?;
         ui(&mut bytes, 0x0020, 0x0052, frame)?;
         us(&mut bytes, 0x0028, 0x0010, 4)?;
         us(&mut bytes, 0x0028, 0x0011, 4)?;
         ds(&mut bytes, 0x0028, 0x0030, &[1.0, 1.0])?;
-        ds(&mut bytes, 0x0020, 0x0032, &[0.0, 0.0, z])?;
-        ds(&mut bytes, 0x0020, 0x0037, &[1.0, 0.0, 0.0, 0.0, 1.0, 0.0])?;
-        ds(&mut bytes, 0x0028, 0x1053, &[1.0])?;
         ds(&mut bytes, 0x0028, 0x1052, &[0.0])?;
+        ds(&mut bytes, 0x0028, 0x1053, &[1.0])?;
         ow(&mut bytes, 0x7FE0, 0x0010, &[0u16; 16])?;
         fs::write(dir.join(format!("ct{index}.dcm")), bytes).map_err(|err| err.to_string())?;
     }
     let mut plan = preamble();
     ui(&mut plan, 0x0008, 0x0016, "1.2.840.10008.5.1.4.1.1.481.8")?;
-    ui(&mut plan, 0x0008, 0x0060, "RTPLAN")?;
+    cs(&mut plan, 0x0008, 0x0060, "RTPLAN")?;
     ui(&mut plan, 0x0020, 0x0052, frame)?;
     let setup = {
         let mut item = Vec::new();
-        is(&mut item, 0x300A, 0x0182, 1)?;
         cs(&mut item, 0x0018, 0x5100, "HFS")?;
+        is(&mut item, 0x300A, 0x0182, 1)?;
         item
     };
-    sq(&mut plan, 0x300A, 0x0180, &[setup])?;
     let referenced = {
         let mut item = Vec::new();
-        is(&mut item, 0x300C, 0x0006, 1)?;
         ds(&mut item, 0x300A, 0x0086, &[1.0])?;
+        is(&mut item, 0x300C, 0x0006, 1)?;
         item
     };
     let fraction = {
@@ -502,6 +501,7 @@ pub fn write_water_study(dir: &Path) -> Result<(), String> {
         item
     };
     sq(&mut plan, 0x300A, 0x0070, &[fraction])?;
+    sq(&mut plan, 0x300A, 0x0180, &[setup])?;
     let control = {
         let mut item = Vec::new();
         ds(&mut item, 0x300A, 0x0114, &[100.0])?;
@@ -518,10 +518,10 @@ pub fn write_water_study(dir: &Path) -> Result<(), String> {
         is(&mut item, 0x300A, 0x00C0, 1)?;
         lo(&mut item, 0x300A, 0x00C2, "B1")?;
         cs(&mut item, 0x300A, 0x00CE, "TREATMENT")?;
-        cs(&mut item, 0x300A, 0x0308, "MODULATED")?;
         ds(&mut item, 0x300A, 0x010E, &[1.0])?;
-        is(&mut item, 0x300C, 0x006A, 1)?;
+        cs(&mut item, 0x300A, 0x0308, "MODULATED")?;
         sq(&mut item, 0x300A, 0x03A8, &[control])?;
+        is(&mut item, 0x300C, 0x006A, 1)?;
         item
     };
     sq(&mut plan, 0x300A, 0x03A2, &[beam])?;
@@ -545,8 +545,8 @@ pub fn write_water_study(dir: &Path) -> Result<(), String> {
     };
     let roi_contour = {
         let mut item = Vec::new();
-        is(&mut item, 0x3006, 0x0084, 1)?;
         sq(&mut item, 0x3006, 0x0040, &[contour])?;
+        is(&mut item, 0x3006, 0x0084, 1)?;
         item
     };
     let mut structures = preamble();
@@ -562,13 +562,13 @@ pub fn write_water_study(dir: &Path) -> Result<(), String> {
     fs::write(dir.join("struct.dcm"), structures).map_err(|err| err.to_string())?;
     let mut dose = preamble();
     ui(&mut dose, 0x0008, 0x0016, "1.2.840.10008.5.1.4.1.1.481.2")?;
-    ui(&mut dose, 0x0008, 0x0060, "RTDOSE")?;
+    cs(&mut dose, 0x0008, 0x0060, "RTDOSE")?;
     ui(&mut dose, 0x0020, 0x0052, frame)?;
+    ds(&mut dose, 0x0020, 0x0032, &[0.0, 0.0, 0.0])?;
+    ds(&mut dose, 0x0020, 0x0037, &[1.0, 0.0, 0.0, 0.0, 1.0, 0.0])?;
     us(&mut dose, 0x0028, 0x0010, 4)?;
     us(&mut dose, 0x0028, 0x0011, 4)?;
     ds(&mut dose, 0x0028, 0x0030, &[1.0, 1.0])?;
-    ds(&mut dose, 0x0020, 0x0032, &[0.0, 0.0, 0.0])?;
-    ds(&mut dose, 0x0020, 0x0037, &[1.0, 0.0, 0.0, 0.0, 1.0, 0.0])?;
     ds(&mut dose, 0x3004, 0x000C, &[0.0, 1.0])?;
     ds(&mut dose, 0x3004, 0x000E, &[0.01])?;
     ow(&mut dose, 0x7FE0, 0x0010, &[100u16; 32])?;
@@ -1531,6 +1531,11 @@ pub(crate) fn ds(
         .map(|value| format!("{value:.6}"))
         .collect::<Vec<_>>()
         .join("\\");
+    // A DS value is ≤16 bytes of the decimal grammar — "NaN"/"inf"/"e+20"
+    // or an overlong literal is not encodable.
+    if !values.iter().all(|value| value.is_finite()) || text.len() > 16 * values.len() {
+        return Err(format!("{group:04X},{element:04X} is not encodable as DS"));
+    }
     push_elem(bytes, group, element, b"DS", &even(&text))
 }
 
@@ -1712,7 +1717,17 @@ pub fn write_rtdose(
     let peak = dose.iter().fold(0.0f64, |peak, &v| {
         peak.max(if v.is_nan() { 0.0 } else { v as f64 })
     });
+    if !peak.is_finite() {
+        // An infinite voxel would quantize every value to 0 and write an
+        // "inf" DoseGridScaling the reader itself rejects.
+        return Err("the dose contains non-finite values".into());
+    }
     let scale = if peak > 0.0 { peak / 4.0e9 } else { 1.0 };
+    if !(scale as f32).is_normal() {
+        // A sub-f32 scale underflows to 0 on read, turning the stored cube
+        // silently all-zero — degenerate input, not data to encode.
+        return Err("the dose peak is outside the encodable range".into());
+    }
     let pixels: Vec<u32> = dose
         .iter()
         .map(|&v| {
@@ -2589,5 +2604,91 @@ mod tests {
         // Two frames and no GridFrameOffsetVector — the old fallback
         // invented positions at frame * SliceThickness.
         assert!(image_slices(&parse_dataset(&bytes).unwrap(), 1.0).is_err());
+    }
+
+    #[test]
+    fn a_non_finite_or_unencodable_dose_is_refused() {
+        let dir = std::env::temp_dir().join(format!("scan-kit-rtdose-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ct = CtVolume {
+            frame: "1.2.3.4.5".into(),
+            origin: [0.0; 3],
+            spacing: [1.0; 3],
+            shape: [2, 2, 1],
+            hu: Vec::new(),
+            position: "HFS".into(),
+            dose_type: String::new(),
+            summation: String::new(),
+            patient_id: "P1".into(),
+            patient_name: "A^B".into(),
+            study_uid: "1.2.3".into(),
+            series_uid: "1.2.3.1".into(),
+            sop_uids: vec!["1.2.3.1.1".into()],
+        };
+        let path = dir.join("dose.dcm");
+        // inf used to quantize the whole cube to 0 and write "inf" as the
+        // scaling — a file the reader itself rejects.
+        assert!(write_rtdose(
+            &path,
+            &[1.0, f32::INFINITY, 0.0, 0.0],
+            &ct,
+            "",
+            "PLAN",
+            "PHYSICAL",
+            "d",
+            ""
+        )
+        .is_err());
+        // A peak this small makes DoseGridScaling underflow to 0 on read.
+        assert!(write_rtdose(&path, &[1e-40f32; 4], &ct, "", "PLAN", "PHYSICAL", "d", "").is_err());
+        // The sane path still writes.
+        assert!(write_rtdose(
+            &path,
+            &[0.0f32, 1.0, 2.0, 3.0],
+            &ct,
+            "",
+            "PLAN",
+            "PHYSICAL",
+            "d",
+            ""
+        )
+        .is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ds_refuses_non_finite_and_overlong_values() {
+        let mut bytes = Vec::new();
+        assert!(ds(&mut bytes, 0x0018, 0x0050, &[f32::NAN]).is_err());
+        assert!(ds(&mut bytes, 0x0018, 0x0050, &[f32::INFINITY]).is_err());
+        // 1e10 formats to 18 chars — over the 16-byte DS limit.
+        assert!(ds(&mut bytes, 0x0018, 0x0050, &[1e10]).is_err());
+        assert!(ds(&mut bytes, 0x0018, 0x0050, &[1.5]).is_ok());
+    }
+
+    #[test]
+    fn water_study_tags_ascend_and_modality_is_cs() {
+        let dir = std::env::temp_dir().join(format!("scan-kit-water-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        write_water_study(&dir).unwrap();
+        let ct = std::fs::read(dir.join("ct0.dcm")).unwrap();
+        let find = |hay: &[u8], needle: [u8; 4]| hay.windows(4).position(|w| w == needle).unwrap();
+        // (0020,0032) < (0028,0010) and 1052 < 1053, CT written as CS.
+        assert!(find(&ct, [0x20, 0x00, 0x32, 0x00]) < find(&ct, [0x28, 0x00, 0x10, 0x00]));
+        assert!(find(&ct, [0x28, 0x00, 0x52, 0x10]) < find(&ct, [0x28, 0x00, 0x53, 0x10]));
+        let modality = find(&ct, [0x08, 0x00, 0x60, 0x00]);
+        assert_eq!(&ct[modality + 4..modality + 6], b"CS");
+        let plan = std::fs::read(dir.join("plan.dcm")).unwrap();
+        // (300A,0070) < (300A,0180); inside the beam 010E < 0308 < 03A8 < 300C,006A.
+        assert!(find(&plan, [0x0A, 0x30, 0x70, 0x00]) < find(&plan, [0x0A, 0x30, 0x80, 0x01]));
+        assert!(find(&plan, [0x0A, 0x30, 0x0E, 0x01]) < find(&plan, [0x0A, 0x30, 0x08, 0x03]));
+        assert!(find(&plan, [0x0A, 0x30, 0xA8, 0x03]) < find(&plan, [0x0C, 0x30, 0x6A, 0x00]));
+        let structures = std::fs::read(dir.join("struct.dcm")).unwrap();
+        assert!(
+            find(&structures, [0x06, 0x30, 0x40, 0x00])
+                < find(&structures, [0x06, 0x30, 0x84, 0x00])
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
