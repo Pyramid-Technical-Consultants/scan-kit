@@ -71,9 +71,13 @@ pub fn sig6(value: f64) -> String {
     if !(-4..6).contains(&exponent) {
         let text = format!("{value:.5e}");
         let (mantissa, exp) = text.split_once('e').unwrap();
+        let exp: i32 = exp.parse().unwrap_or(0);
+        // Python %g exponents are signed and at least two digits (e+06/e-05).
         return format!(
-            "{}e{exp}",
-            mantissa.trim_end_matches('0').trim_end_matches('.')
+            "{}e{}{:02}",
+            mantissa.trim_end_matches('0').trim_end_matches('.'),
+            if exp < 0 { '-' } else { '+' },
+            exp.abs()
         );
     }
     let decimals = (5 - exponent).max(0) as usize;
@@ -97,7 +101,9 @@ pub fn dvh_csv(curves: &[DvhCurve]) -> String {
     let mut out = String::from("dose_gy_rbe");
     for curve in curves {
         out.push(',');
-        out.push_str(&curve.name.replace([',', '\n', '\r'], " "));
+        // A stray quote would open a quoted field on re-parse and swallow the
+        // rest of the header line.
+        out.push_str(&curve.name.replace([',', '\n', '\r', '"'], " "));
         out.push_str(" volume %");
     }
     out.push('\n');
@@ -187,7 +193,7 @@ impl Op {
 }
 
 /// Lay `report` out into ops and split them into pages.
-fn lay_out(report: &Report) -> Vec<Vec<Op>> {
+fn lay_out(report: &Report) -> Result<Vec<Vec<Op>>, String> {
     fn text(ops: &mut Vec<Op>, x: f32, baseline: f32, size: f32, ink: Ink, text: &str) {
         ops.push(Op::Text {
             x,
@@ -289,6 +295,12 @@ fn lay_out(report: &Report) -> Vec<Vec<Op>> {
                 width,
                 height,
             } => {
+                if *width == 0
+                    || *height == 0
+                    || rgba.len() != *width as usize * *height as usize * 4
+                {
+                    return Err("a report figure has invalid dimensions".into());
+                }
                 let scale = TEXT_W / *width as f32;
                 let h = *height as f32 * scale;
                 ops.push(Op::Image {
@@ -333,7 +345,7 @@ fn lay_out(report: &Report) -> Vec<Vec<Op>> {
         }
         cursor += PAGE_H - 2.0 * MARGIN;
     }
-    pages
+    Ok(pages)
 }
 
 fn fill(ink: Ink) -> Fill {
@@ -354,7 +366,7 @@ pub fn write_pdf(report: &Report, dest: &Path) -> Result<PathBuf, String> {
     let font = Font::new(FONT.to_vec().into(), 0).ok_or("the report font did not load")?;
     let settings = PageSettings::from_wh(PAGE_W, PAGE_H).unwrap();
     let mut doc = Document::new();
-    for ops in lay_out(report) {
+    for ops in lay_out(report)? {
         let mut page = doc.start_page_with(settings.clone());
         {
             let mut surface = page.surface();
@@ -771,7 +783,7 @@ mod tests {
         assert_eq!(sig6(2.0), "2");
         assert_eq!(sig6(1.99975), "1.99975");
         assert_eq!(sig6(12.345678), "12.3457");
-        assert_eq!(sig6(1234567.0), "1.23457e6");
+        assert_eq!(sig6(1234567.0), "1.23457e+06");
         assert_eq!(sig6(0.00123), "0.00123");
         assert_eq!(sig6(f64::NAN), "NaN");
         assert_eq!(sig6(f64::INFINITY), "inf");
@@ -789,5 +801,45 @@ mod tests {
         // An interior newline would add a bogus column row.
         assert_eq!(csv.lines().count(), 2, "{csv}");
         assert!(csv.starts_with("dose_gy_rbe,PTV Cord volume %"));
+    }
+
+    #[test]
+    fn sig6_matches_the_python_g_format_exponent() {
+        // Python %.6g exponents are signed and at least two digits.
+        assert_eq!(sig6(1234567.0), "1.23457e+06");
+        assert_eq!(sig6(1e-5), "1e-05");
+        assert_eq!(sig6(0.5), "0.5");
+    }
+
+    #[test]
+    fn dvh_csv_keeps_structure_names_inside_the_cell() {
+        let curves = vec![DvhCurve {
+            name: r#""boost" PTV"#.to_owned(),
+            edges: vec![0.0, 1.0],
+            cumulative: vec![100.0, 50.0],
+        }];
+        let csv = dvh_csv(&curves);
+        // A stray quote would open a quoted field on re-parse and swallow the
+        // rest of the header line.
+        assert_eq!(csv.lines().next().unwrap().split(',').count(), 2, "{csv}");
+        assert!(!csv.contains('"'), "{csv}");
+    }
+
+    #[test]
+    fn a_degenerate_figure_errors_instead_of_panicking() {
+        let dir = std::env::temp_dir().join(format!("sk_report_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let report = Report {
+            title: "QA".into(),
+            disclaimer: String::new(),
+            sections: vec![Section::Figure {
+                rgba: Vec::new(),
+                width: 0,
+                height: 0,
+            }],
+            provenance: serde_json::json!({}),
+        };
+        assert!(write_pdf(&report, &dir.join("out.pdf")).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
