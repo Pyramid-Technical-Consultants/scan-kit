@@ -127,6 +127,9 @@ function DoseCell({
     };
     let dragging = false;
     const onDown = (event: PointerEvent) => {
+      if (event.button !== 0) {
+        return;
+      }
       dragging = true;
       node.setPointerCapture(event.pointerId);
       node.focus({ preventScroll: true });

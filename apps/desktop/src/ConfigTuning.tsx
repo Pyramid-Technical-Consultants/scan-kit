@@ -175,6 +175,7 @@ export function ConfigTuning({
   const previewGen = useRef(0);
   const autoMu = useRef<number | null>(null);
   const dirtyRef = useRef(false);
+  const busyRef = useRef(false);
   const leftPane = useRef<HTMLDivElement>(null);
   const previewDrag = useRef(PREVIEW_RATIO);
   const [previewFrac, setPreviewFrac] = useState(PREVIEW_RATIO);
@@ -182,6 +183,7 @@ export function ConfigTuning({
   const tones = useMemo(() => toneColors(), []);
   useEffect(() => {
     dirtyRef.current = dirty;
+    busyRef.current = busy;
   });
   const sessionKey = selectedIds.join("|");
   const workflow = catalog?.workflows.find((item) => item.id === workflowId) ?? catalog?.workflows[0];
@@ -458,11 +460,19 @@ export function ConfigTuning({
   }
 
   function changeField(id: string, value: string) {
+    // A save is in flight — edits landing now would be overwritten by the
+    // saved form and the dirty flag cleared, losing them silently.
+    if (busyRef.current) {
+      return;
+    }
     setForm((current) => (current == null ? current : { ...current, nodes: editField(current.nodes, id, value) }));
     setDirty(true);
   }
 
   function changeCell(id: string, cell: Item, value: string) {
+    if (busyRef.current) {
+      return;
+    }
     setForm((current) =>
       current == null
         ? current

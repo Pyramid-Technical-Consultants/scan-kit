@@ -310,6 +310,7 @@ export default function App() {
   // selectionLive is effect-synced, and effect-touched refs may only be
   // written inside effects.
   const selectionPending = useRef<string[] | null>(null);
+  const selectionSeq = useRef(0);
   const loadDepth = useRef(0);
   const noteBusy = useRef(false);
   const trashing = useRef(false);
@@ -623,9 +624,10 @@ export default function App() {
           window.clearTimeout(timer);
           try {
             await persistGeometry();
-            await win.destroy();
           } catch {
             // A failed geometry write still lets the window close.
+          } finally {
+            await win.destroy().catch(() => {});
           }
         });
         if (active) {
@@ -839,10 +841,16 @@ export default function App() {
     selectionPending.current = next.ids;
     setSelectionOrder(next.ids);
     setRows((items) => items.map((item) => ({ ...item, selected: chosen.has(item.session_id) })));
+    const write = ++selectionSeq.current;
     void (async () => {
       selectionWrites.current += 1;
       try {
         for (const root of locations) {
+          // A newer selection supersedes this loop — stop before the next
+          // root so the last write to land is always the newest.
+          if (selectionSeq.current !== write) {
+            return;
+          }
           const sessionIds = next.ids.flatMap((id) => {
             const row = rows.find((item) => item.session_id === id);
             if ((row?.library ?? locations[0]) !== root) {
@@ -1130,6 +1138,7 @@ export default function App() {
         <TabsContent value="Data Analysis" className="flex min-h-0 flex-col overflow-hidden">
           {analysis != null && folder != null ? (
             <AnalysisView
+              key={analysis}
               viewId={analysis}
               folder={folder}
               sessions={selectedIds.map((id) => ({
