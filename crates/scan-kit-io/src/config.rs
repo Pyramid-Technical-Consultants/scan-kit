@@ -1289,6 +1289,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "diagnostic: needs test_data/logs, which is not committed"]
     fn session_1093436476_tunes_its_map2map_devices() {
         let logs = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../test_data/logs");
         let devices = logs.join("1093436476/1093436476/config/map2map/devices.xml");
@@ -1353,6 +1354,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "diagnostic: needs test_data/, which is not committed"]
     fn known_fixture_digests_match_when_the_files_are_present() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../test_data/1943968267/1943968267/config/map2map");

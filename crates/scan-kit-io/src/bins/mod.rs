@@ -1666,6 +1666,7 @@ mod tests {
     };
 
     #[test]
+    #[ignore = "diagnostic: needs test_data/logs, which is not committed"]
     fn first_log_on_disk_has_finite_dose_error() {
         let root =
             std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../test_data/logs");
@@ -2139,9 +2140,13 @@ mod tests {
         std::fs::create_dir_all(session.join("layer-0/run-0")).unwrap();
         std::fs::write(session.join("input_map.csv"), "energy,layer_id\n70,1\n").unwrap();
         std::fs::write(session.join("spot_data.csv"), "ic1_total_dose_spot\n1\n").unwrap();
+        // Two rows with distinct sigmas: a rejected one (confidence 50,
+        // sigma 30) and an accepted one (confidence 90, sigma 4). Without a
+        // surviving sample a gate rejecting everything would pass vacuously;
+        // without distinct values an under-rejecting gate would slip by.
         std::fs::write(
             session.join("layer-0/run-0/timeslice_data_device_units.csv"),
-            "layer_id,rci_in_trigger,r_ic1_x_sigma,r_ic1_x_confidence,ic1_x_fit_ok,r_ic1_x_spot_error_code\n1,1,4,50,1,0\n",
+            "layer_id,rci_in_trigger,r_ic1_x_sigma,r_ic1_x_confidence,ic1_x_fit_ok,r_ic1_x_spot_error_code\n1,1,30,50,1,0\n1,1,4,90,1,0\n",
         )
         .unwrap();
         let scene = bins(
@@ -2149,7 +2154,14 @@ mod tests {
             &["sess".to_string()],
             &serde_json::json!({"metric": "sigma", "source": "timeslice_iso"}),
         );
-        assert!(scene.panels.iter().all(|panel| panel.title != "IC1 SX"));
+        let panel = scene
+            .panels
+            .iter()
+            .find(|panel| panel.title == "IC1 SX")
+            .expect("the high-confidence row must survive the gate");
+        let marks = rect_ys(panel);
+        assert!(marks.iter().all(|value| (*value - 4.0).abs() < 1e-2));
+        assert!(!marks.is_empty());
         let _ = std::fs::remove_dir_all(&root);
     }
 
