@@ -564,7 +564,9 @@ mod net {
         total: &mut u64,
     ) -> Result<(), String> {
         if depth > COPY_DEPTH {
-            return Ok(());
+            return Err(format!(
+                "remote tree deeper than {COPY_DEPTH} levels: {path}"
+            ));
         }
         fs::create_dir_all(dest).map_err(|err| err.to_string())?;
         for item in fs.list(path)? {
@@ -822,7 +824,9 @@ mod net {
         total: &mut u64,
     ) -> Result<(), String> {
         if depth > COPY_DEPTH {
-            return Ok(());
+            return Err(format!(
+                "remote tree deeper than {COPY_DEPTH} levels: {path}"
+            ));
         }
         fs::create_dir_all(dest).map_err(|err| err.to_string())?;
         for item in fs.list(path)? {
