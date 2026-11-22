@@ -40,7 +40,7 @@ it("reports pointer travel from the drag start", () => {
   if (handle == null) {
     throw new Error("missing splitter");
   }
-  handle.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, clientX: 10, pointerId: 1 }));
+  handle.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, clientX: 10, pointerId: 1, button: 0, isPrimary: true }));
   handle.dispatchEvent(new PointerEvent("pointermove", { bubbles: true, clientX: 26, pointerId: 1 }));
   handle.dispatchEvent(new PointerEvent("pointermove", { bubbles: true, clientX: 18, pointerId: 1 }));
   expect(starts).toBe(1);
@@ -48,6 +48,34 @@ it("reports pointer travel from the drag start", () => {
   expect(handle.getAttribute("aria-orientation")).toBe("vertical");
   expect(handle.getAttribute("aria-valuemin")).toBe("18");
   expect(handle.getAttribute("aria-valuenow")).toBe("50");
+});
+
+it("ignores a non-primary or right-button press", () => {
+  let starts = 0;
+  const host = document.createElement("div");
+  document.body.append(host);
+  act(() => {
+    root = createRoot(host);
+    root.render(
+      <Splitter
+        orientation="vertical"
+        label="Resize column"
+        now={50}
+        min={18}
+        onStart={() => {
+          starts += 1;
+        }}
+        onMove={() => undefined}
+      />,
+    );
+  });
+  const handle = host.querySelector("[role='separator']");
+  if (handle == null) {
+    throw new Error("missing splitter");
+  }
+  handle.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, clientX: 10, pointerId: 1, button: 2, isPrimary: true }));
+  handle.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, clientX: 10, pointerId: 2, button: 0, isPrimary: false }));
+  expect(starts).toBe(0);
 });
 
 it("steps from the keyboard", () => {

@@ -20,6 +20,11 @@ export function Splitter({
 }) {
   const origin = useRef(0);
   const onPointerDown = (event: ReactPointerEvent<HTMLDivElement>) => {
+    // Only a primary left-button press starts a drag — a right-click would
+    // resize (and capture), and a second pointer would clobber origin.
+    if (event.button !== 0 || !event.isPrimary) {
+      return;
+    }
     event.preventDefault();
     const handle = event.currentTarget;
     handle.focus();
