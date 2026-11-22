@@ -65,7 +65,15 @@ pub(super) fn prepare(
                 protons_from_mu(f64::from(pencil.amount), f64::from(energy), gap_mm, k_mu)
             }
         } * f64::from(factor);
-        if !protons.is_finite() || protons == 0.0 {
+        // The Mu deposit weights by amount*factor — the charge conversion is
+        // not part of it, so a zero/negative k_mu must not zero the map.
+        // For the other quantities protons <= 0 (negative k_mu) would deposit
+        // a uniformly negative map; skipping is the same answer as zero.
+        if quantity == Quantity::Mu {
+            if !pencil.amount.is_finite() || pencil.amount <= 0.0 {
+                continue;
+            }
+        } else if !protons.is_finite() || protons <= 0.0 {
             continue;
         }
         let row = layer_of(&kernel, energy);
@@ -1855,5 +1863,44 @@ mod tests {
                 "worst {worst} peak {peak} mode {dose_mode}"
             );
         }
+    }
+
+    #[test]
+    fn mu_deposit_does_not_need_k_mu() {
+        let pencil = Pencil {
+            x: 0.0,
+            y: 0.0,
+            sx: 3.0,
+            sy: 3.0,
+            energy: 100.0,
+            amount: 0.1,
+        };
+        // A zero k_mu zeroed the MU map even though the deposit weights by
+        // pencil MU — no charge calibration involved.
+        let volume = analytic_volume(
+            WATER,
+            &[pencil],
+            Quantity::Mu,
+            1.0,
+            0.0,
+            0.0,
+            1.0,
+            0.0,
+            10.0,
+        );
+        assert!(volume.values.iter().sum::<f32>() > 0.0);
+        // And a negative k_mu must not deposit a negative dose map.
+        let volume = analytic_volume(
+            WATER,
+            &[pencil],
+            Quantity::Dose,
+            1.0,
+            0.0,
+            0.0,
+            1.0,
+            -1.0,
+            10.0,
+        );
+        assert!(volume.values.iter().all(|v| *v >= 0.0));
     }
 }
