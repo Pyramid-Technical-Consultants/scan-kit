@@ -1170,7 +1170,10 @@ fn write_termination(
     let state = status
         .get(scan_kit_core::STATE)
         .map(scan_kit_core::io_text)
-        .unwrap_or_default();
+        .unwrap_or_default()
+        .chars()
+        .filter(|ch| !ch.is_control())
+        .collect::<String>();
     let mut text = format!(
         "Termination status: {}\nDate: {}\nSession ID: {session_id}\nError code: 0\n",
         if state.is_empty() {
@@ -1186,6 +1189,9 @@ fn write_termination(
         ("Tertiary total dose", "ic2"),
     ] {
         if let Some(dose) = last_dose(ic) {
+            // Device text lands raw in this file — a newline would forge a
+            // record line, same as `meta_id` guards above.
+            let dose: String = dose.chars().filter(|ch| !ch.is_control()).collect();
             text.push_str(&format!("{label}: {dose}\n"));
         }
     }

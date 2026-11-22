@@ -888,9 +888,10 @@ export function AnalysisView({
         }
       })().catch((reason: unknown) => {
         // A poll rejection leaves the task registered — cancel the task this
-        // chain was polling (never taskId.current: a newer ticket may have
-        // already replaced it).
-        if (polledTask != null) {
+        // chain was polling, but only while it still owns the slot: the plot
+        // slot reuses task ids on retarget, so a superseded ticket's cancel
+        // would kill its successor's live task.
+        if (polledTask != null && openSeq.current === ticket) {
           void invoke("scan_kit_cancel", { task: polledTask }).catch(() => {});
         }
         if (openSeq.current === ticket) {

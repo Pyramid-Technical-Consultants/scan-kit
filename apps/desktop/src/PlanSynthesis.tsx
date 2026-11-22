@@ -203,6 +203,7 @@ export function PlanSynthesis() {
   const [saveDir, setSaveDir] = useState("");
   const [size, setSize] = useState({ width: 0, height: 0 });
   const host = useRef<HTMLDivElement>(null);
+  const generateSeq = useRef(0);
   const template = catalog?.templates.find((item) => item.id === templateId) ?? catalog?.templates[0];
 
   useEffect(() => {
@@ -252,6 +253,7 @@ export function PlanSynthesis() {
   const theme = useMemo(() => (plan == null ? null : gridTheme()), [plan]);
 
   function setValue(key: string, value: unknown) {
+    generateSeq.current += 1;
     setValues((current) => ({ ...current, [key]: value }));
   }
 
@@ -260,6 +262,7 @@ export function PlanSynthesis() {
     if (found == null) {
       return;
     }
+    generateSeq.current += 1;
     setTemplateId(found.id);
     setValues(defaultsOf(found));
     setPlan(null);
@@ -272,15 +275,22 @@ export function PlanSynthesis() {
     }
     setBusy(true);
     setError(null);
+    // Inputs stay editable while the invoke is in flight — a late result must
+    // not overwrite state cleared by a param edit or template switch.
+    const seq = ++generateSeq.current;
     try {
       const result = await invoke<PlanResult>("scan_kit_synthesize_plan", {
         template: template.id,
         params: values,
       });
-      setPlan(result);
+      if (seq === generateSeq.current) {
+        setPlan(result);
+      }
     } catch (caught) {
-      setPlan(null);
-      setError(caught instanceof Error ? caught.message : String(caught));
+      if (seq === generateSeq.current) {
+        setPlan(null);
+        setError(caught instanceof Error ? caught.message : String(caught));
+      }
     } finally {
       setBusy(false);
     }
@@ -342,6 +352,7 @@ export function PlanSynthesis() {
   }
 
   const applyQuick = (next: Record<string, number>) => {
+    generateSeq.current += 1;
     setValues((current) => ({ ...current, ...next }));
   };
   return (

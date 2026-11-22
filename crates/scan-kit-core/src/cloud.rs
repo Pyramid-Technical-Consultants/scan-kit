@@ -297,14 +297,10 @@ fn contour_marks(
     if z_max <= 0.0 {
         return Vec::new();
     }
-    let lo = cutoff_pct.clamp(0.0, 90.0).min(97.0);
-    let levels: Vec<f32> = if lo >= 97.0 {
-        vec![97.0]
-    } else {
-        (0..6)
-            .map(|step| lo + (97.0 - lo) * step as f32 / 5.0)
-            .collect()
-    };
+    let lo = cutoff_pct.clamp(0.0, 90.0);
+    let levels: Vec<f32> = (0..6)
+        .map(|step| lo + (97.0 - lo) * step as f32 / 5.0)
+        .collect();
     let mut levels: Vec<f32> = levels
         .into_iter()
         .map(|level| {

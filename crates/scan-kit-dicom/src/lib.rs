@@ -197,15 +197,22 @@ fn is_dicom(bytes: &[u8]) -> bool {
 /// Implicit VR Little Endian transfer syntax (no VR codes in the dataset).
 pub(crate) const IMPLICIT_VR_LE: &str = "1.2.840.10008.1.2";
 
+/// Transfer syntaxes that change the *dataset* encoding, not just the pixel
+/// data — deflated explicit LE and big-endian explicit. Encapsulated
+/// (JPEG/RLE) syntaxes keep an explicit-LE dataset and parse normally; only
+/// their pixel element is unreadable, which fails on its own.
+const UNREADABLE_DATASET: [&str; 2] = ["1.2.840.10008.1.2.1.99", "1.2.840.10008.1.2.2"];
+
 /// Where the post-meta dataset starts, and whether it is implicit VR.
 ///
 /// The group-0002 file meta is always explicit VR LE; its (0002,0010)
 /// Transfer Syntax UID names the encoding that follows. A file whose first
 /// tag is not group 0002 is sniffed instead: two ASCII uppercase letters in
 /// the VR slot mean explicit, anything else reads as an implicit length.
-pub(crate) fn dataset_offset(bytes: &[u8]) -> (usize, bool) {
+pub(crate) fn dataset_offset(bytes: &[u8]) -> (usize, Result<bool, String>) {
     let mut cursor = 132usize;
     let mut syntax_seen = false;
+    let mut syntax = String::new();
     let mut implicit = false;
     while cursor + 8 <= bytes.len() {
         let group = u16::from_le_bytes([bytes[cursor], bytes[cursor + 1]]);
@@ -226,7 +233,8 @@ pub(crate) fn dataset_offset(bytes: &[u8]) -> (usize, bool) {
         }
         if element == 0x0010 {
             syntax_seen = true;
-            implicit = dicom_text(&bytes[start..end]) == IMPLICIT_VR_LE;
+            syntax = dicom_text(&bytes[start..end]);
+            implicit = syntax == IMPLICIT_VR_LE;
         }
         cursor = end;
     }
@@ -235,7 +243,17 @@ pub(crate) fn dataset_offset(bytes: &[u8]) -> (usize, bool) {
             .iter()
             .all(|byte| byte.is_ascii_uppercase());
     }
-    (cursor.min(bytes.len()), implicit)
+    // A syntax that re-encodes the dataset itself (deflate, big-endian) must
+    // not be parsed as explicit LE garbage. Encapsulated-pixel syntaxes keep
+    // an explicit-LE dataset — RTPLAN/RTSTRUCT with no pixels read fine, and
+    // a pixel element fails on its own undefined-length items.
+    if UNREADABLE_DATASET.contains(&syntax.as_str()) {
+        return (
+            cursor.min(bytes.len()),
+            Err(format!("unsupported transfer syntax {syntax}")),
+        );
+    }
+    (cursor.min(bytes.len()), Ok(implicit))
 }
 
 /// Media Storage SOP Class UID from the always-explicit group-0002 meta, when
@@ -323,6 +341,9 @@ pub fn peek_study(bytes: &[u8]) -> StudyPeek {
     }
     let limit = bytes.len().min(PEEK_CAP);
     let (mut cursor, implicit) = dataset_offset(&bytes[..limit]);
+    let Ok(implicit) = implicit else {
+        return out;
+    };
     while cursor + 8 <= limit {
         let group = u16::from_le_bytes([bytes[cursor], bytes[cursor + 1]]);
         let element = u16::from_le_bytes([bytes[cursor + 2], bytes[cursor + 3]]);
@@ -390,6 +411,9 @@ fn read_entry(path: &Path) -> Option<DicomEntry> {
         return None;
     }
     let (mut cursor, implicit) = dataset_offset(&bytes);
+    let Ok(implicit) = implicit else {
+        return None;
+    };
     let mut sop_class = String::new();
     let mut modality = String::new();
     let mut study_uid = String::new();

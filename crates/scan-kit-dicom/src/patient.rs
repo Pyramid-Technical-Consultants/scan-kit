@@ -104,8 +104,10 @@ struct Elem {
 }
 
 pub fn load_study(path: &Path) -> Result<PatientStudy, String> {
-    let mut ct_slices = Vec::new();
+    let mut ct_by_series: std::collections::BTreeMap<String, (Vec<String>, Vec<(String, Slice)>)> =
+        std::collections::BTreeMap::new();
     let mut dose_slices = Vec::new();
+    let mut dose_seen = false;
     let mut dose_type = String::new();
     let mut summation = String::new();
     let mut plan = None;
@@ -141,9 +143,14 @@ pub fn load_study(path: &Path) -> Result<PatientStudy, String> {
                 study_uid = text_tag(&elems, tag(0x0020, 0x000D));
                 series_uid = text_tag(&elems, tag(0x0020, 0x000E));
             }
-            sop_uids.push(text_tag(&elems, tag(0x0008, 0x0018)));
+            // A study can carry several CT series over one frame of
+            // reference — merging them stacks two reconstructions into one
+            // volume. Bucket by SeriesInstanceUID and keep the largest below.
+            let uid = text_tag(&elems, tag(0x0020, 0x000E));
+            let (sops, bucket) = ct_by_series.entry(uid).or_default();
+            sops.push(text_tag(&elems, tag(0x0008, 0x0018)));
             for slice in image_slices(&elems, 1.0)? {
-                ct_slices.push((frame.clone(), slice));
+                bucket.push((frame.clone(), slice));
             }
         } else if class == "1.2.840.10008.5.1.4.1.1.481.8" {
             let sop_uid = text_tag(&elems, tag(0x0008, 0x0018));
@@ -151,10 +158,19 @@ pub fn load_study(path: &Path) -> Result<PatientStudy, String> {
             parsed.sop_uid = sop_uid;
             plan = Some(parsed);
         } else if class == "1.2.840.10008.5.1.4.1.1.481.3" {
-            structures_uid = text_tag(&elems, tag(0x0008, 0x0018));
-            structures_frame = frame.clone();
-            structures = read_structures(&elems);
+            if structures_uid.is_empty() {
+                structures_uid = text_tag(&elems, tag(0x0008, 0x0018));
+                structures_frame = frame.clone();
+                structures = read_structures(&elems);
+            }
         } else if class == "1.2.840.10008.5.1.4.1.1.481.2" {
+            if dose_seen {
+                // A standard export holds per-beam plus fraction doses on the
+                // same grid — stacking them either errors on duplicate z or
+                // silently sums the wrong object. Keep the first dose object.
+                continue;
+            }
+            dose_seen = true;
             let scale = float_tag(&elems, tag(0x3004, 0x000E)).unwrap_or(1.0);
             if dose_type.is_empty() {
                 dose_type = text_tag(&elems, tag(0x3004, 0x0004));
@@ -165,11 +181,35 @@ pub fn load_study(path: &Path) -> Result<PatientStudy, String> {
             }
         }
     }
+    // A CT file without a SeriesInstanceUID cannot be isolated — treat it as
+    // part of the chosen series so a frame-of-reference conflict still fails.
+    let (orphan_sops, orphans) = ct_by_series.remove("").unwrap_or_default();
+    let mut ct_slices = Vec::new();
+    let mut best = 0usize;
+    for (uid, (sops, slices)) in ct_by_series {
+        if slices.len() > best {
+            best = slices.len();
+            series_uid = uid;
+            sop_uids = sops;
+            ct_slices = slices;
+        }
+    }
+    sop_uids.extend(orphan_sops);
+    ct_slices.extend(orphans);
     if ct_slices.is_empty() {
         return Err("the study has no CT".into());
     }
-    let frame = ct_slices[0].0.clone();
-    if frame.is_empty() || ct_slices.iter().any(|(got, _)| got != &frame) {
+    // Frame of Reference is Type 2 — legitimately empty. Only a real
+    // conflict between non-empty frames fails the load.
+    let frame = ct_slices
+        .iter()
+        .map(|(frame, _)| frame.clone())
+        .find(|frame| !frame.is_empty())
+        .unwrap_or_default();
+    if ct_slices
+        .iter()
+        .any(|(got, _)| !got.is_empty() && got != &frame)
+    {
         return Err("CT slices do not share one frame of reference".into());
     }
     let plan = plan.unwrap_or(Plan {
@@ -259,7 +299,7 @@ pub fn read_ion_plan(path: &Path) -> Result<IonPlan, String> {
                 let mu = if has_weights {
                     weights.get(i).copied().unwrap_or(f32::NAN)
                 } else {
-                    f32::NAN
+                    0.0
                 };
                 let index = plan_index;
                 plan_index += 1;
@@ -427,8 +467,8 @@ pub fn write_water_study(dir: &Path) -> Result<(), String> {
         ds(&mut item, 0x300A, 0x0122, &[0.0])?;
         ds(&mut item, 0x300A, 0x012C, &[1.5, 1.5, 0.5])?;
         is(&mut item, 0x300A, 0x0392, 1)?;
-        ds(&mut item, 0x300A, 0x0394, &[0.0, 0.0])?;
-        ds(&mut item, 0x300A, 0x0396, &[1.0])?;
+        fl(&mut item, 0x300A, 0x0394, &[0.0, 0.0])?;
+        fl(&mut item, 0x300A, 0x0396, &[1.0])?;
         item
     };
     let beam = {
@@ -572,7 +612,18 @@ fn image_slices(elems: &[Elem], scale: f32) -> Result<Vec<Slice>, String> {
         return Err("pixel data is short".into());
     }
     let frames = stored.len() / plane;
+    let declared = int_tag(elems, tag(0x0028, 0x0008))
+        .map(|count| count.max(0) as usize)
+        .unwrap_or(frames);
+    if declared != frames {
+        return Err("pixel data does not match the declared frame count".into());
+    }
     let offsets = floats_tag(elems, tag(0x3004, 0x000C));
+    if !offsets.is_empty() && offsets.len() != frames {
+        // A short offset vector would mix real positions with fabricated
+        // frame*thickness ones.
+        return Err("frame offsets do not match the frame count".into());
+    }
     let thickness = float_tag(elems, tag(0x0018, 0x0050))
         .filter(|value| value.is_finite() && *value > 0.0)
         .unwrap_or(1.0);
@@ -1021,7 +1072,7 @@ fn tag(group: u16, element: u16) -> u32 {
 
 fn parse_file(bytes: &[u8]) -> Result<Vec<Elem>, String> {
     let (offset, implicit) = crate::dataset_offset(bytes);
-    parse_dataset_mode(&bytes[offset..], implicit)
+    parse_dataset_mode(&bytes[offset..], implicit?)
 }
 
 #[cfg(test)]
@@ -1102,7 +1153,16 @@ fn parse_dataset_mode(bytes: &[u8], implicit: bool) -> Result<Vec<Elem>, String>
         } else if implicit && looks_like_items(value) {
             match parse_items(value, true) {
                 Ok(items) => (items, true),
-                Err(_) => (Vec::new(), false),
+                Err(err) => {
+                    // A first item whose length is undefined or fits inside
+                    // the value is a real (unreadable or corrupt) sequence,
+                    // not plain bytes sharing the marker — surface it.
+                    let first = u32::from_le_bytes([value[4], value[5], value[6], value[7]]);
+                    if first == u32::MAX || u64::from(first) + 8 <= value.len() as u64 {
+                        return Err(err);
+                    }
+                    (Vec::new(), false)
+                }
             }
         } else {
             (Vec::new(), false)
@@ -1228,6 +1288,15 @@ fn float_tag(elems: &[Elem], tag: u32) -> Option<f32> {
 
 fn int_tag(elems: &[Elem], tag: u32) -> Option<i32> {
     let elem = elem(elems, tag)?;
+    // A NUL cannot appear in an IS value (IS pads with a space) — a 2-byte
+    // payload holding one is binary US; value 50 = [0x32, 0x00] reads as
+    // the ASCII digit "2" otherwise.
+    if elem.bytes.len() == 2 && elem.bytes.contains(&0) {
+        return Some(i32::from(u16::from_le_bytes([
+            elem.bytes[0],
+            elem.bytes[1],
+        ])));
+    }
     let text = text_of(&elem.bytes);
     if let Ok(value) = text.parse::<i32>() {
         return Some(value);
@@ -1314,6 +1383,21 @@ pub(crate) fn ds(
         .collect::<Vec<_>>()
         .join("\\");
     push_elem(bytes, group, element, b"DS", &even(&text))
+}
+
+/// 300A spot position/meterset and source-distance tags are FL, not DS —
+/// strict readers reject a DS encoding there.
+pub(crate) fn fl(
+    bytes: &mut Vec<u8>,
+    group: u16,
+    element: u16,
+    values: &[f32],
+) -> Result<(), String> {
+    let mut raw = Vec::with_capacity(values.len() * 4);
+    for value in values {
+        raw.extend_from_slice(&value.to_le_bytes());
+    }
+    push_elem(bytes, group, element, b"FL", &raw)
 }
 
 pub(crate) fn is(bytes: &mut Vec<u8>, group: u16, element: u16, value: i32) -> Result<(), String> {
@@ -2213,5 +2297,17 @@ mod tests {
             },
         ];
         assert!(image_slices(&elems, 1.0).is_err());
+    }
+
+    #[test]
+    fn a_binary_us_dimension_beats_its_ascii_digit_shape() {
+        // US value 50 encodes as [0x32, 0x00] — the ASCII digit "2" plus a
+        // NUL that no legal IS string can hold.
+        let elem = Elem {
+            tag: tag(0x0028, 0x0010),
+            items: Vec::new(),
+            bytes: vec![0x32, 0x00],
+        };
+        assert_eq!(int_tag(&[elem], tag(0x0028, 0x0010)), Some(50));
     }
 }

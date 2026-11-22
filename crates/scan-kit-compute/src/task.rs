@@ -34,6 +34,7 @@ trait Stage: Send {
     fn report(&self) -> Report;
     fn retarget(
         &mut self,
+        _view: &str,
         _root: &Path,
         _sessions: &[String],
         _options: &Value,
@@ -169,7 +170,9 @@ pub fn start_task(
         // retarget runs the same fallible call tree poll wraps in
         // catch_unwind — a panic must not leave task.stage None forever.
         let retargeted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            stage.retarget(path, sessions, options, palette, background, foreground)
+            stage.retarget(
+                view, path, sessions, options, palette, background, foreground,
+            )
         }))
         .unwrap_or(false);
         if retargeted {
@@ -1033,7 +1036,9 @@ fn mc_transport(jobs: Vec<McJob>, shared: Arc<McLive>, cancel: Cancel) {
                 Poll::Ready(result) => {
                     // A job that opens already-done never reported a total —
                     // its sentinel 1 must not drag satisfied below target.
-                    total[k] = total[k].max(u64::from(job_histories(&jobs[k])));
+                    // Floor at the live target, not the spawn-time request —
+                    // a retarget-down delivered fewer histories than it asked.
+                    total[k] = total[k].max(u64::from(target));
                     done[k] = total[k];
                     latest[k] = Some(result.clone());
                     finished[k] = Some(result);
@@ -1054,12 +1059,11 @@ fn mc_transport(jobs: Vec<McJob>, shared: Arc<McLive>, cancel: Cancel) {
             if !shared.ready_flag.load(Ordering::Acquire) {
                 let results: Vec<McResult> = finished.iter().flatten().cloned().collect();
                 let mut reached = jobs.clone();
-                for job in &mut reached {
+                for (job, delivered) in reached.iter_mut().zip(&total) {
+                    let delivered = (*delivered).min(u64::from(u32::MAX)) as u32;
                     match job {
-                        McJob::Slab(request) => request.histories = request.histories.max(target),
-                        McJob::Patient(request) => {
-                            request.histories = request.histories.max(target)
-                        }
+                        McJob::Slab(request) => request.histories = delivered,
+                        McJob::Patient(request) => request.histories = delivered,
                     }
                 }
                 keep_runs(&reached, &results);
@@ -1327,6 +1331,7 @@ impl Stage for McPlotStage {
 
     fn retarget(
         &mut self,
+        view: &str,
         root: &Path,
         sessions: &[String],
         options: &Value,
@@ -1334,6 +1339,9 @@ impl Stage for McPlotStage {
         background: [f32; 4],
         foreground: [f32; 4],
     ) -> bool {
+        if !wants_mc(view, options) {
+            return false;
+        }
         if self.worker.is_none() {
             return false;
         }

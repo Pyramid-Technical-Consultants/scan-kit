@@ -1116,7 +1116,7 @@ mod tests {
     fn replay_axis_ignores_a_single_spike() {
         let mut samples = vec![1.0f32; 400];
         samples[3] = 10_000.0;
-        let (_, _, _, yspan) = drawn_trace(&samples, None, None);
+        let (_, _, _, yspan) = drawn_trace(&samples, None, None, None);
         let (lo, hi) = yspan.unwrap();
         assert!(hi < 10.0, "{hi}");
         assert!(lo < 2.0);
@@ -1126,7 +1126,7 @@ mod tests {
     fn replay_trace_keeps_a_narrow_pulse() {
         let mut samples = vec![0.0f32; 8_001];
         samples[1] = 40.0;
-        let (xs, ys, _, _) = drawn_trace(&samples, None, None);
+        let (xs, ys, _, _) = drawn_trace(&samples, None, None, None);
         assert_eq!(ys.len(), samples.len());
         assert_eq!(ys[1], 40.0);
         assert!((xs[1] - 0.001).abs() < 1e-6);

@@ -1039,15 +1039,15 @@ mod tests {
         let storage = root.join("sess");
         fs::create_dir_all(storage.join("layer-0")).unwrap();
         let first = timeslice_stamp(&storage);
+        // The watch is mtime-based — outlast coarse-granularity filesystems so
+        // the new run directory's timestamp visibly differs from `first`.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
         fs::create_dir_all(storage.join("layer-0/run-0")).unwrap();
         fs::write(
             storage.join("layer-0/run-0/timeslice_data_device_units.csv"),
             b"a,b\n1,2\n",
         )
         .unwrap();
-        // The watch is mtime-based — outlast coarse-granularity filesystems so
-        // the new run directory's timestamp visibly differs.
-        std::thread::sleep(std::time::Duration::from_millis(1100));
         assert_ne!(timeslice_stamp(&storage), first);
         assert_eq!(list_timeslice_paths(&storage).len(), 1);
         let _ = fs::remove_dir_all(&root);

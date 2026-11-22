@@ -1393,7 +1393,7 @@ impl Dvh {
         let mut dmax = 0.0f32;
         let mut dmin = f32::NAN;
         for (value, keep) in dose.iter().zip(mask) {
-            if !keep {
+            if !keep || !value.is_finite() || *value < 0.0 {
                 continue;
             }
             let bin = ((*value / hi * DVH_BINS as f32) as usize).min(DVH_BINS - 1);

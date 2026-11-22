@@ -125,14 +125,12 @@ pub fn volumetric(
         || session_ids
             .iter()
             .any(|id| crate::tables::grain_present(root, id, false));
-    let allow_slice = session_ids.is_empty()
-        || session_ids
-            .iter()
-            .any(|id| crate::tables::grain_present(root, id, true));
+    // Timeslice rows carry no spot geometry (no ic*_x/y, plan_x/y, or dose) —
+    // a timeslice selection can only ever build zero pencils, so don't offer it.
     let picked = crate::source::select(
         crate::source::Shape::Source,
         allow_spot,
-        allow_slice,
+        false,
         &[],
         options,
     );
@@ -734,8 +732,9 @@ pub fn volumetric(
             .radio()
             .icons(&["1e6", "3e6", "1e7", "5e7"]),
     );
-    controls
-        .push(labeled("spread", "Energy spread", SPREAD, &trim_num(spread)).grouped("Calculation"));
+    controls.push(
+        labeled("spread", "Energy spread", SPREAD, &trim_number(spread)).grouped("Calculation"),
+    );
     if quantity_id != "mu" {
         controls.push(
             labeled(
@@ -1620,7 +1619,7 @@ fn read_kmu(root: &Path, session: &str) -> f32 {
             .and_then(|rest| rest.split('"').next())
         {
             if let Ok(value) = k.parse::<f32>() {
-                if value.is_finite() && value != 0.0 {
+                if value.is_finite() && value > 0.0 {
                     if name.eq_ignore_ascii_case("IC_1_HCC") {
                         hcc = Some(value);
                     }
@@ -1834,16 +1833,6 @@ fn y_name(quantity: Quantity) -> &'static str {
         Quantity::Dose => "Gy",
         Quantity::Mu => "MU / mm³",
         Quantity::Protons => "Protons / mm³",
-    }
-}
-
-fn trim_num(value: f32) -> String {
-    if (value - 0.5).abs() < 1e-3 {
-        "0.5".into()
-    } else if (value - 2.0).abs() < 1e-3 {
-        "2".into()
-    } else {
-        "1".into()
     }
 }
 

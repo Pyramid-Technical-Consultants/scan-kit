@@ -76,7 +76,13 @@ pub fn parse_host(host: &str) -> Result<String, String> {
         }
         authority.rsplit('@').next().unwrap_or(authority)
     } else {
-        text.split('/').next().unwrap_or(text)
+        // Strip userinfo the same way the :// branch does.
+        text.split('/')
+            .next()
+            .unwrap_or(text)
+            .rsplit('@')
+            .next()
+            .unwrap_or(text)
     };
     if authority.is_empty()
         || authority
@@ -513,5 +519,14 @@ mod tests {
         );
         assert!(session_download_hint("42").contains("42"));
         assert!(!session_download_hint("").contains("session "));
+    }
+
+    #[test]
+    fn parse_host_strips_bare_userinfo_like_the_scheme_form() {
+        assert_eq!(
+            parse_host("user:pass@10.0.0.1:8500").unwrap(),
+            "10.0.0.1:8500"
+        );
+        assert_eq!(parse_host("user@host").unwrap(), "host");
     }
 }

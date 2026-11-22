@@ -396,9 +396,9 @@ fn write_plan(dir: &Path, request: &Request, study: &str, frame: &str) -> Result
                 xy.push(*x);
                 xy.push(*y);
             }
-            patient::ds(&mut cp, 0x300A, 0x0394, &xy)?;
+            patient::fl(&mut cp, 0x300A, 0x0394, &xy)?;
             let spot_weight = if last { 0.0 } else { 1.0 };
-            patient::ds(&mut cp, 0x300A, 0x0396, &vec![spot_weight; n])?;
+            patient::fl(&mut cp, 0x300A, 0x0396, &vec![spot_weight; n])?;
             if !last {
                 weight += n as f32;
             }
@@ -416,7 +416,7 @@ fn write_plan(dir: &Path, request: &Request, study: &str, frame: &str) -> Result
         patient::ds(&mut item, 0x300A, 0x010E, &[weight])?;
         patient::is(&mut item, 0x300A, 0x0110, cps.len() as i32)?;
         patient::cs(&mut item, 0x300A, 0x0308, "MODULATED")?;
-        patient::ds(&mut item, 0x300A, 0x030A, &[2000.0, 2000.0])?;
+        patient::fl(&mut item, 0x300A, 0x030A, &[2000.0, 2000.0])?;
         if request.wet > 0.0 {
             patient::is(&mut item, 0x300A, 0x0312, 1)?;
             let mut shifter = Vec::new();
