@@ -423,8 +423,17 @@ pub(super) fn gamma_offsets(
         let step = v / (v / (dta / 4.0)).ceil().max(1.0);
         // A shift past the grid's own extent in this axis can never land on
         // another voxel — and it keeps a silly dta from looping forever.
-        let limit = shape[axis] as f64 * v as f64 / step as f64;
-        let n = ((reach as f64 / step as f64).ceil() as i64).clamp(0, limit.ceil() as i64 + 1);
+        // Extreme spacing can collapse step to 0, which makes limit inf -
+        // shifts past the grid extent are useless anyway, so fall back to it.
+        let raw = shape[axis] as f64 * v as f64 / step as f64;
+        let limit = if raw.is_finite() {
+            raw
+        } else {
+            shape[axis] as f64
+        };
+        // The +1 must not wrap the clamp's upper bound below its lower bound.
+        let n = ((reach as f64 / step as f64).ceil() as i64)
+            .clamp(0, (limit.ceil() as i64).saturating_add(1));
         let mut axis = Vec::new();
         for i in -n..=n {
             axis.push(i as f32 * step);
@@ -666,5 +675,20 @@ mod tests {
         assert_eq!(scored, 0);
         // Unscored voxels are NaN so a scored γ = 0 can be told apart.
         assert!(gamma.iter().all(|v| v.is_nan()));
+    }
+
+    #[test]
+    fn extreme_spacing_bounds_the_shift_count() {
+        // spacing huge enough to collapse the sub-voxel step to 0: limit is
+        // inf and reach/step saturates - the shift count must stay bounded.
+        let _ = gamma_index(
+            &[1.0f32; 8],
+            &[1.0; 8],
+            [2, 2, 2],
+            3.0,
+            2.0,
+            [1e30; 3],
+            10.0,
+        );
     }
 }
