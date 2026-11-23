@@ -871,7 +871,14 @@ export function AnalysisView({
         const started = (await startChain.current) as {
           task: number;
           generation: number;
+          superseded?: boolean;
         };
+        // A superseded ticket belongs to another view's task — polling it
+        // would settle this view on unrelated work. It is not ours to
+        // cancel either; the owner is still using it.
+        if (started.superseded) {
+          return;
+        }
         if (stop || openSeq.current !== ticket) {
           const id = started.task;
           // The replacement start may already have retargeted this same task —

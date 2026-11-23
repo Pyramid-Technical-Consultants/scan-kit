@@ -398,7 +398,14 @@ fn materialize(library_canonical: &str, session_url: &str) -> Result<PathBuf, St
     // copy, never merge over it. A failed clear must error out here: merging
     // over a surviving tree and then stamping it would pin stale files in
     // the cache permanently.
-    if let Err(err) = fs::remove_dir_all(&dest) {
+    // The remote's type can flip (a file now sits where a dir was cached) —
+    // remove_dir_all would then error forever and wedge the cache entry.
+    let cleared = if dest.is_dir() {
+        fs::remove_dir_all(&dest)
+    } else {
+        fs::remove_file(&dest)
+    };
+    if let Err(err) = cleared {
         // A first materialize has nothing to clear; a removal that left any
         // of the tree behind must not be stamped over.
         if dest.exists() {
@@ -788,7 +795,9 @@ fn classify(spec: &str) -> Result<Kind, String> {
         return Ok(Kind::Local(expand_user(spec)));
     };
     if scheme.len() == 1 {
-        return Ok(Kind::Local(PathBuf::from(format!("{scheme}:{rest}"))));
+        // `C://data` split as scheme "C" + rest "data" — without the slash
+        // it becomes drive-relative `C:data`, resolved against the cwd.
+        return Ok(Kind::Local(PathBuf::from(format!("{scheme}:/{rest}"))));
     }
     if scheme.eq_ignore_ascii_case("file") {
         return Ok(Kind::Local(file_uri_path(rest)));
@@ -839,7 +848,9 @@ fn parse_remote(scheme: Scheme, rest: &str) -> Result<Remote, String> {
     if host.is_empty() {
         return Err("the URL needs a host".into());
     }
-    let host = host.to_ascii_lowercase();
+    // The path is percent-decoded — the host needs it too, or
+    // `sftp://h%6fst/...` can never resolve.
+    let host = percent_decode(&host).to_ascii_lowercase();
     let mut path = percent_decode(raw_path);
     // Decoded control chars would land verbatim in the canonical key, which
     // is persisted and logged — CR/LF forges fake log lines.
@@ -1023,6 +1034,11 @@ pub fn file_uri_path(rest: &str) -> PathBuf {
         }
         Some((host, path)) if !host.is_empty() => {
             PathBuf::from(format!("\\\\{host}\\{}", path.replace('/', "\\")))
+        }
+        _ if !rest.is_empty() => {
+            // file://nas has no path — a bare authority must not become a
+            // relative directory under the cwd. UNC it: it fails honestly.
+            PathBuf::from(format!("\\\\{rest}"))
         }
         _ => PathBuf::from(rest),
     }
@@ -1220,7 +1236,12 @@ fn connect_smb(remote: &Remote) -> Result<PathBuf, String> {
         Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
             Err(auth_error("the share refused the password"))
         }
-        Err(_) => Err(format!("{} is not a directory", unc.display())),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            Err(format!("{} is not a directory", unc.display()))
+        }
+        // An unreachable host or dead share is not a missing directory —
+        // saying it is sends the user debugging the wrong thing.
+        Err(err) => Err(format!("cannot open {}: {err}", unc.display())),
     }
 }
 
@@ -1337,7 +1358,9 @@ pub(crate) fn session_storage_paths(root: &str, session_id: &str) -> Result<Vec<
     if let Some(place) = recorded(root, session_id) {
         if !is_remote_location(&place) {
             recorded_parent = Path::new(&place).parent().map(|dir| dir.to_path_buf());
-            if Path::new(&place).exists() {
+            // A stale/corrupt recorded binding could point outside the opened
+            // library — delete_storage sends every returned path to trash.
+            if local_under_root(root, &place) && Path::new(&place).exists() {
                 found.push(place);
             }
         }
@@ -1395,10 +1418,11 @@ pub(crate) fn session_storage_paths(root: &str, session_id: &str) -> Result<Vec<
                 if let Ok(child) = require_remote(&place) {
                     let parent_path = child.path.trim_end_matches('/');
                     if let Some((parent, _)) = parent_path.rsplit_once('/') {
-                        let inside = parent == root_path
-                            || parent
-                                .strip_prefix(root_path)
-                                .is_some_and(|rest| rest.starts_with('/'));
+                        let inside = !parent.split('/').any(|part| part == "..")
+                            && (parent == root_path
+                                || parent
+                                    .strip_prefix(root_path)
+                                    .is_some_and(|rest| rest.starts_with('/')));
                         if inside && !bases.contains(&parent.to_string()) {
                             bases.push(parent.to_string());
                         }
@@ -1534,9 +1558,13 @@ pub(crate) fn delete_storage(root: &str, paths: &[String]) -> Result<Vec<String>
                     // corrupt recorded spec must not delete elsewhere on
                     // the server.
                     let root_path = remote.path.trim_end_matches('/');
-                    if !root_path.is_empty()
-                        && !(child.path == root_path
-                            || child.path.starts_with(&format!("{root_path}/")))
+                    // A ".." segment survives percent-decoding and passes the
+                    // prefix check while the server resolves it outside the
+                    // root — reject it before the prefix test.
+                    if child.path.split('/').any(|part| part == "..")
+                        || (!root_path.is_empty()
+                            && !(child.path == root_path
+                                || child.path.starts_with(&format!("{root_path}/"))))
                     {
                         errors.push(format!("{spec}: outside the connected root"));
                         continue;
@@ -1565,6 +1593,13 @@ pub(crate) fn delete_storage(root: &str, paths: &[String]) -> Result<Vec<String>
         return Ok(errors);
     }
     for path in &paths {
+        // Local delete candidates get the same containment rule as remote:
+        // a recorded spec outside the opened root is stale state, not a
+        // delete target.
+        if !is_remote_location(path) && !local_under_root(root, path) {
+            errors.push(format!("{path}: outside the opened root"));
+            continue;
+        }
         if let Err(err) = trash_path(path) {
             errors.push(format!("{path}: {err}"));
         }
@@ -1573,6 +1608,21 @@ pub(crate) fn delete_storage(root: &str, paths: &[String]) -> Result<Vec<String>
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+/// A recorded local path is inside the opened root only when every
+/// component is plain and the root path is a real prefix — `..` segments
+/// pass a string check but escape the library.
+fn local_under_root(root: &str, path: &str) -> bool {
+    let path = Path::new(path);
+    if !path
+        .components()
+        .all(|part| !matches!(part, std::path::Component::ParentDir))
+    {
+        return false;
+    }
+    let root = Path::new(root);
+    path == root || path.starts_with(root)
+}
+
 fn trash_path(path: &str) -> Result<(), String> {
     match trash::delete(path) {
         Ok(()) => Ok(()),
@@ -2014,5 +2064,31 @@ mod tests {
         assert_eq!(password_of(&nested), "a-pw");
         let sibling = require_remote(&format!("sftp://u@{tag}/b/sess1")).unwrap();
         assert_eq!(password_of(&sibling), "root-pw");
+    }
+
+    #[test]
+    fn a_bare_file_authority_is_a_share_not_a_cwd_relative_dir() {
+        // file://nas must not become a relative `nas` under the cwd.
+        let path = file_uri_path("nas");
+        assert!(path.to_string_lossy().starts_with("\\\\"), "{path:?}");
+    }
+
+    #[test]
+    fn a_drive_letter_scheme_keeps_its_root() {
+        // `C://data` without the slash is drive-relative `C:data` — resolved
+        // against the cwd, not C:\.
+        let super::Kind::Local(path) = super::classify("C://data").unwrap() else {
+            panic!("C:// must classify as a local path");
+        };
+        assert_eq!(path, std::path::PathBuf::from("C:/data"));
+    }
+
+    #[test]
+    fn a_recorded_path_outside_the_root_is_not_a_delete_candidate() {
+        // starts_with alone accepts `..` components — the traversal check
+        // must reject them before the prefix test.
+        assert!(local_under_root("C:/lib", "C:/lib/sess"));
+        assert!(!local_under_root("C:/lib", "C:/lib/../victim"));
+        assert!(!local_under_root("C:/lib", "C:/other/sess"));
     }
 }

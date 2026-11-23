@@ -990,12 +990,23 @@ pub fn resample_nearest(source: &[f32], shape: [usize; 3], out_shape: [usize; 3]
     for z in 0..oz {
         for y in 0..oy {
             for x in 0..ox {
-                let sx = (x * nx / ox).min(nx - 1);
-                let sy = (y * ny / oy).min(ny - 1);
-                let sz = (z * nz / oz).min(nz - 1);
-                let from = sx + nx * (sy + ny * sz);
+                // resample_linear's rule: checked index arithmetic — a
+                // wrapped flat index could sample the wrong in-bounds voxel.
+                let Some(sx) = x.checked_mul(nx).map(|v| (v / ox).min(nx - 1)) else {
+                    continue;
+                };
+                let Some(sy) = y.checked_mul(ny).map(|v| (v / oy).min(ny - 1)) else {
+                    continue;
+                };
+                let Some(sz) = z.checked_mul(nz).map(|v| (v / oz).min(nz - 1)) else {
+                    continue;
+                };
+                let from = sy
+                    .checked_add(ny.saturating_mul(sz))
+                    .and_then(|v| nx.checked_mul(v))
+                    .and_then(|v| v.checked_add(sx));
                 let to = x + ox * (y + oy * z);
-                if let Some(value) = source.get(from) {
+                if let Some(value) = from.and_then(|from| source.get(from)) {
                     out[to] = *value;
                 }
             }
@@ -1448,5 +1459,13 @@ mod tests {
         assert!(lo.is_finite() && hi.is_finite());
         let (wlo, whi) = time_window(-f32::MAX, f32::MAX);
         assert!(wlo.is_finite() && whi.is_finite());
+    }
+
+    #[test]
+    fn a_huge_declared_shape_does_not_wrap_the_flat_index() {
+        // x * nx used to overflow before the bounds check — a wrapped index
+        // could land on a valid voxel and sample the wrong one.
+        let out = resample_nearest(&[1.0; 4], [usize::MAX, usize::MAX, usize::MAX], [4, 4, 4]);
+        assert_eq!(out.len(), 64);
     }
 }

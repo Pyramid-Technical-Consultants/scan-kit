@@ -112,12 +112,20 @@ pub fn connect(db: &Path, host: &str) -> Result<Value, String> {
     let mut socket = open_socket(&host)?;
     send(&mut socket, "config", Some(config_body()))?;
     let status = read_paths(&mut socket, STATUS_PATHS, Duration::from_secs(8))?;
+    // Each phase can stall on a trickling peer for a full read deadline —
+    // a disconnect between phases must still be able to abort the connect.
+    if DISCONNECTS.load(Ordering::Acquire) != generation {
+        return Err("connection changed".into());
+    }
     let version = http_json(&host, "admin/version").unwrap_or(Value::Null);
     let device_type = http_json(&host, "admin/device_type").unwrap_or(Value::Null);
     let session_directory = http_json(&host, SESSION_DIRECTORY)
         .and_then(|value| value.as_str().map(str::to_owned))
         .unwrap_or_else(|| DEFAULT_SESSION_ROOT.into());
     let session_id = session_capture::live_session_id(&host).unwrap_or_default();
+    if DISCONNECTS.load(Ordering::Acquire) != generation {
+        return Err("connection changed".into());
+    }
     let plan_path = with_store(db, |conn| store::runner_plan_path(conn))
         .ok()
         .flatten()
@@ -190,13 +198,14 @@ pub fn upload(db: &Path, csv_path: &Path) -> Result<Value, String> {
     }
     // The caller names the file — cap it like the response body so a stray
     // multi-GB path cannot exhaust memory or land on the device as a plan.
-    let size = std::fs::metadata(csv_path)
-        .map_err(|err| err.to_string())?
-        .len();
-    if size > MAX_BODY as u64 {
-        return Err(format!("CSV is too large: {} bytes", size));
+    let mut file = std::fs::File::open(csv_path).map_err(|err| err.to_string())?;
+    let mut bytes = Vec::new();
+    std::io::Read::take(&mut file, MAX_BODY as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|err| err.to_string())?;
+    if bytes.len() > MAX_BODY {
+        return Err(format!("CSV is too large: {} bytes", bytes.len()));
     }
-    let bytes = std::fs::read(csv_path).map_err(|err| err.to_string())?;
     // Each socket exchange holds LIVE; the HTTP put and the poll sleeps do
     // not need it. Holding it across the whole upload froze status reads and
     // control actions for up to ~40s.
@@ -1044,6 +1053,8 @@ pub(crate) fn http_tuned(
     }
     let mut raw = Vec::new();
     let mut chunk = [0u8; 16 * 1024];
+    // (body offset, verified chunked bytes) — see chunked_complete.
+    let mut parsed = (0usize, 0usize);
     loop {
         if raw.len() > MAX_BODY + 4096 {
             return Err("the device response is larger than 64 MiB".into());
@@ -1066,7 +1077,7 @@ pub(crate) fn http_tuned(
                 // A keep-alive peer may hold the socket open past a complete
                 // response — waiting for EOF would read a full timeout and
                 // then error on a perfectly good answer.
-                if response_complete(&raw) {
+                if response_complete(&raw, &mut parsed) {
                     break;
                 }
             }
@@ -1106,10 +1117,15 @@ pub(crate) fn http_tuned(
 
 /// True once the headers and the declared body are all in — Content-Length
 /// reached, or a chunked body carrying its empty terminal chunk.
-fn response_complete(raw: &[u8]) -> bool {
+fn response_complete(raw: &[u8], parsed: &mut (usize, usize)) -> bool {
     let Some((status, head_at, body_at)) = final_response(raw) else {
         return false;
     };
+    // The parsed cursor is relative to this response's body — a different
+    // final response (e.g. after a 1xx preamble) restarts it.
+    if parsed.0 != body_at {
+        *parsed = (body_at, 0);
+    }
     // 1xx/204/304 responses carry no body by definition.
     if matches!(status, 204 | 304) {
         return true;
@@ -1117,7 +1133,7 @@ fn response_complete(raw: &[u8]) -> bool {
     let header = String::from_utf8_lossy(&raw[head_at..body_at - 4]);
     let body = &raw[body_at..];
     if transfer_chunked(&header) {
-        chunked_complete(body)
+        chunked_complete(body, &mut parsed.1)
     } else if let Ok(Some(length)) = content_length(&header) {
         body.len() >= length
     } else {
@@ -1128,7 +1144,11 @@ fn response_complete(raw: &[u8]) -> bool {
 
 /// True only when the buffered chunks end exactly on the terminal 0-size
 /// chunk — a byte-suffix match can fire early on data ending "0\r\n".
-fn chunked_complete(mut data: &[u8]) -> bool {
+fn chunked_complete(data: &[u8], verified: &mut usize) -> bool {
+    // Each verified chunk is self-delimiting — resume at the cursor instead
+    // of re-walking the whole body after every socket read (O(body²) CPU
+    // inside the read deadline otherwise).
+    let mut data = &data[*verified..];
     loop {
         let Some(end) = data.windows(2).position(|window| window == b"\r\n") else {
             return false;
@@ -1156,6 +1176,7 @@ fn chunked_complete(mut data: &[u8]) -> bool {
         if data.len() < next {
             return false;
         }
+        *verified += next;
         data = &data[next..];
     }
 }
@@ -1346,6 +1367,10 @@ fn live() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The busy flags are process statics — tests that acquire them (directly
+    // or via upload()) must not overlap.
+    static FLAG_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn http_get_reads_a_content_length_body() {
@@ -1736,6 +1761,7 @@ mod tests {
     fn busy_flags_reject_a_second_connect_or_upload() {
         // Two concurrent uploads would PUT to the same device path and both
         // report success for different files — the flags must single-flight.
+        let _guard = FLAG_LOCK.lock().unwrap();
         let upload = acquire(&UPLOAD_BUSY, "an upload is already in progress").unwrap();
         assert!(acquire(&UPLOAD_BUSY, "an upload is already in progress").is_err());
         drop(upload);
@@ -1761,36 +1787,37 @@ mod tests {
         };
         // Content-Length: full body buffered.
         let full = header("HTTP/1.1 200 OK\nContent-Length: 3\n\n", b"abc");
-        assert!(response_complete(&full));
-        assert!(!response_complete(&full[..full.len() - 1]));
+        assert!(response_complete(&full, &mut (0, 0)));
+        assert!(!response_complete(&full[..full.len() - 1], &mut (0, 0)));
         // Chunked: only the terminal zero-length chunk closes the stream.
         let open = header(
             "HTTP/1.1 200 OK\nTransfer-Encoding: chunked\n\n",
             b"3\r\nabc\r\n",
         );
-        assert!(!response_complete(&open));
+        assert!(!response_complete(&open, &mut (0, 0)));
         let closed = header(
             "HTTP/1.1 200 OK\nTransfer-Encoding: chunked\n\n",
             b"3\r\nabc\r\n0\r\n\r\n",
         );
-        assert!(response_complete(&closed));
+        assert!(response_complete(&closed, &mut (0, 0)));
         // A chunk whose data ends "0\r\n" produces the same byte suffix
         // as the terminal chunk — the framing scan must not fire early.
         let trap = header(
             "HTTP/1.1 200 OK\nTransfer-Encoding: chunked\n\n",
             b"4\r\na0\r\n\r\n",
         );
-        assert!(!response_complete(&trap));
+        assert!(!response_complete(&trap, &mut (0, 0)));
         // Close-delimited bodies need EOF, so a bare header is incomplete —
         // but a no-body status is complete at the header boundary itself.
         let bare = header("HTTP/1.1 200 OK\n\n", b"");
-        assert!(!response_complete(&bare));
+        assert!(!response_complete(&bare, &mut (0, 0)));
         let no_body = header("HTTP/1.1 204 No Content\n\n", b"");
-        assert!(response_complete(&no_body));
+        assert!(response_complete(&no_body, &mut (0, 0)));
     }
 
     #[test]
     fn an_oversized_upload_is_rejected_before_any_io() {
+        let _guard = FLAG_LOCK.lock().unwrap();
         let dir = std::env::temp_dir().join(format!("sk_r21_up_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let csv = dir.join("big.csv");
@@ -1803,5 +1830,16 @@ mod tests {
         let err = upload(&db, &csv).unwrap_err();
         assert!(err.contains("too large"), "{err}");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_chunked_parse_resumes_at_the_verified_cursor() {
+        // Each socket read used to re-walk the whole body — verified chunks
+        // are skipped on the next pass.
+        let mut verified = 0usize;
+        assert!(!chunked_complete(b"5\r\nhello\r\n", &mut verified));
+        assert_eq!(verified, 10);
+        let body = b"5\r\nhello\r\n0\r\n\r\n";
+        assert!(chunked_complete(body, &mut verified));
     }
 }

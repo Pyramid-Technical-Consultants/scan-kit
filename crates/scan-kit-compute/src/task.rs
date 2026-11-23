@@ -205,7 +205,13 @@ pub fn start_task(
     if checked_id.is_some() {
         if let Some(owner) = driver.plot.filter(|o| checked_id != Some(*o)) {
             let generation = driver.tasks.get(&owner).map(|t| t.generation).unwrap_or(0);
-            return Ok(json!({ "task": owner, "generation": generation }));
+            // This ticket belongs to a different view — mark it so the
+            // caller can tell its own request was superseded.
+            return Ok(json!({
+                "task": owner,
+                "generation": generation,
+                "superseded": true,
+            }));
         }
     }
     let replaced = driver.take(&slot);
@@ -383,11 +389,20 @@ pub(crate) fn drain_plot(
     // A stage may spend its first poll on setup and report Pending even with
     // an unlimited budget — keep driving until it reaches a terminal state.
     for _ in 0..64 {
-        match stage.poll(Duration::MAX, &Cancel::new()) {
-            Poll::Ready(bytes) => return Ok(bytes),
-            Poll::Failed(message) => return Err(message),
-            Poll::Cancelled => return Err("cancelled".into()),
-            Poll::Pending { .. } => {}
+        // poll_task treats the same call tree as panic-capable — an unwind
+        // here would cross invoke() instead of surfacing an Err.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            stage.poll(Duration::MAX, &Cancel::new())
+        }));
+        match result {
+            Ok(Poll::Ready(bytes)) => return Ok(bytes),
+            Ok(Poll::Failed(message)) => return Err(message),
+            Ok(Poll::Cancelled) => return Err("cancelled".into()),
+            Ok(Poll::Pending { .. }) => {}
+            Err(_) => {
+                scan_kit_io::clear_slice();
+                return Err("task panicked".into());
+            }
         }
     }
     Err("plot did not finish".into())

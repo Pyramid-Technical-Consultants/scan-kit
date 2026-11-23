@@ -20,7 +20,7 @@ pub struct SessionLog {
 }
 
 /// `(template, count_a, count_b, a - b)` sorted by the largest absolute delta.
-pub fn compare_templates(a: &SessionLog, b: &SessionLog) -> Vec<(String, usize, usize, i32)> {
+pub fn compare_templates(a: &SessionLog, b: &SessionLog) -> Vec<(String, usize, usize, i64)> {
     let mut keys: Vec<&str> = a
         .templates
         .keys()
@@ -33,7 +33,7 @@ pub fn compare_templates(a: &SessionLog, b: &SessionLog) -> Vec<(String, usize, 
     for key in keys {
         let ca = a.templates.get(key).copied().unwrap_or(0);
         let cb = b.templates.get(key).copied().unwrap_or(0);
-        rows.push((key.to_owned(), ca, cb, ca as i32 - cb as i32));
+        rows.push((key.to_owned(), ca, cb, ca as i64 - cb as i64));
     }
     rows.sort_by(|left, right| {
         right

@@ -280,7 +280,12 @@ pub fn dose_frame(
         None
     };
     let (origin, shape) = dose_grid(&spots, voxel_mm, floor);
-    let voxel = voxel_mm.clamp(0.25, 10.0);
+    // clamp() passes NaN through — mirror dose_grid's finite guard.
+    let voxel = if voxel_mm.is_finite() {
+        voxel_mm.clamp(0.25, 10.0)
+    } else {
+        2.0
+    };
     let focus = focus_index(&kernel, &spots, origin, shape, voxel, dose_mode);
     let visits = visit_count(&spots, origin, shape, voxel, dose_mode);
     DoseFrame {
@@ -330,10 +335,29 @@ pub fn analytic_on(
         } else {
             [0, 0, 0]
         };
-        (origin, shape, voxel.clamp(0.25, 10.0))
+        // Same NaN rule as dose_grid: clamp() passes NaN through.
+        (
+            origin,
+            shape,
+            if voxel.is_finite() {
+                voxel.clamp(0.25, 10.0)
+            } else {
+                2.0
+            },
+        )
     } else {
         let (origin, shape) = dose_grid(&spots, voxel_mm, floor);
-        (origin, shape, voxel_mm.clamp(0.25, 10.0))
+        // dose_grid returns an empty shape for NaN, but clamp() would still
+        // pass it into Volume.spacing.
+        (
+            origin,
+            shape,
+            if voxel_mm.is_finite() {
+                voxel_mm.clamp(0.25, 10.0)
+            } else {
+                2.0
+            },
+        )
     };
     let [nx, ny, nz] = shape;
     let dose_mode = quantity == Quantity::Dose;

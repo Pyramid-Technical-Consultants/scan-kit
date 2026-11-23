@@ -88,7 +88,8 @@ pub(crate) fn discover(
             &mut archives,
             &mut exams,
             &mut walk_failed,
-        );
+            keep,
+        )?;
     }
     add_archives(&mut entries, &mut skipped, archives);
     exams.sort_by(|left, right| left.folder_name.cmp(&right.folder_name));
@@ -109,16 +110,23 @@ fn walk_local(
     archives: &mut Vec<(Discovered, String)>,
     exams: &mut Vec<ExamHit>,
     walk_failed: &mut bool,
-) {
+    keep: &mut dyn FnMut(u64, u64) -> bool,
+) -> Result<(), String> {
     if depth >= crate::location::NEST_DEPTH {
-        return;
+        return Ok(());
+    }
+    // The remote walk honours keep at every recursion — a slow local share
+    // needs the same cancel path. Returning Err matters: a partial Found
+    // would look like mass deletion to delete_missing.
+    if !keep(0, 0) {
+        return Err("cancelled".into());
     }
     let Ok(read) = fs::read_dir(dir) else {
         // An unreadable dir is not an empty one — a partial listing must not
         // look like "every session was deleted" to delete_missing.
         *walk_failed = true;
         skipped.push(relative(library, dir));
-        return;
+        return Ok(());
     };
     // An errored entry or failed file_type() must not look like a deleted
     // session — delete_missing prunes rows for ids absent from the walk.
@@ -209,8 +217,10 @@ fn walk_local(
             archives,
             exams,
             walk_failed,
-        );
+            keep,
+        )?;
     }
+    Ok(())
 }
 
 /// True when an unpacked session lives anywhere below `dir` within the
@@ -910,11 +920,10 @@ fn read_zip(path: &Path, want: &dyn Fn(&str) -> bool) -> Result<Vec<(String, Vec
         if !want(&name) {
             continue;
         }
-        let bytes = read_capped(&mut entry, &name, MAX_MEMBER_BYTES)?;
+        // Bound the allocation by the remaining aggregate budget — reading a
+        // full member first would spend the cap twice over.
+        let bytes = read_capped(&mut entry, &name, MAX_MEMBER_BYTES.saturating_sub(total))?;
         total = total.saturating_add(bytes.len() as u64);
-        if total > MAX_MEMBER_BYTES {
-            return Err("archive members exceed the aggregate cap".into());
-        }
         out.push((name.clone(), bytes));
     }
     Ok(out)
@@ -937,20 +946,24 @@ fn read_tar(path: &Path, want: &dyn Fn(&str) -> bool) -> Result<Vec<(String, Vec
     let mut total = 0u64;
     let entries = archive.entries().map_err(|err| err.to_string())?;
     for entry in entries {
-        let mut entry = entry.map_err(|err| err.to_string())?;
+        // Same rule as the zip reader — one undecodable member must not
+        // brick every read. A failed entry may leave the stream desynced,
+        // so keep what was read and stop; a bad path skips just the member.
+        let Ok(mut entry) = entry else {
+            break;
+        };
         if !entry.header().entry_type().is_file() {
             continue;
         }
-        let path = entry.path().map_err(|err| err.to_string())?;
+        let Ok(path) = entry.path() else {
+            continue;
+        };
         let name = path.to_string_lossy().into_owned();
         if !want(&name) {
             continue;
         }
-        let bytes = read_capped(&mut entry, &name, MAX_MEMBER_BYTES)?;
+        let bytes = read_capped(&mut entry, &name, MAX_MEMBER_BYTES.saturating_sub(total))?;
         total = total.saturating_add(bytes.len() as u64);
-        if total > MAX_MEMBER_BYTES {
-            return Err("archive members exceed the aggregate cap".into());
-        }
         out.push((name.clone(), bytes));
     }
     Ok(out)
@@ -1307,5 +1320,24 @@ mod tests {
         assert_ne!(timeslice_stamp(&storage), first);
         assert_eq!(list_timeslice_paths(&storage).len(), 1);
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_cancelled_local_walk_errors_instead_of_returning_a_partial_listing() {
+        // A partial Found looks like mass deletion to delete_missing —
+        // cancellation must surface as an error, like the remote walk.
+        let root =
+            std::env::temp_dir().join(format!("scan-kit-discover-cancel-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("child")).unwrap();
+        std::fs::write(
+            root.join("child").join("keep.csv"),
+            "a
+",
+        )
+        .unwrap();
+        let err = discover(&root, &mut |_, _| false).err().unwrap();
+        assert!(err.contains("cancelled"), "{err}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

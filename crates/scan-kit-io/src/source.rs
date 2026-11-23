@@ -1133,7 +1133,11 @@ fn without_unit(label: &str) -> &str {
 }
 
 fn channel_key(name: &str) -> bool {
-    !matches!(name, "energy" | "beam_on" | "beam_on_time" | "spot_time")
+    let name = normalize_column_name(name);
+    !matches!(
+        name.as_str(),
+        "energy" | "beam_on" | "beam_on_time" | "spot_time"
+    )
 }
 
 fn channel_geometry(id: &str) -> bool {
@@ -1608,5 +1612,14 @@ mod tests {
         assert_eq!(control.options[0].label, "Energy");
         assert_eq!(control.group, "");
         assert_eq!(control.kind, "");
+    }
+
+    #[test]
+    fn a_data_channel_id_matches_case_insensitively() {
+        // `prepare` normalizes column names — the channel menu must too, or
+        // "Energy" is offered as a selectable data channel.
+        assert!(!channel_key("Energy"));
+        assert!(!channel_key("Beam_On"));
+        assert!(channel_key("ic1_total_dose"));
     }
 }
