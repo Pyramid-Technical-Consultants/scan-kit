@@ -18,7 +18,7 @@ use std::fs::{self, File};
 use std::io::Read;
 use std::path::Path;
 
-use scan_kit_core::{dvh, ToolKind, ToolSpec};
+use scan_kit_core::{ToolKind, ToolSpec};
 use serde::Serialize;
 use serde_json::{json, Value};
 
@@ -104,14 +104,11 @@ pub fn index_study(path: &Path) -> Result<Vec<DicomEntry>, String> {
 }
 
 pub fn clinical_goal(dose: &[f32], goal: f32, min_volume: f32) -> GoalResult {
-    let mask = vec![true; dose.len()];
-    let (_edges, curve) = dvh(dose, &mask, 20);
     let fraction = dose
         .iter()
         .filter(|value| value.is_finite() && **value >= goal)
         .count() as f32
         / (dose.len().max(1) as f32);
-    let _ = curve;
     GoalResult {
         dose: goal,
         volume_fraction: fraction,

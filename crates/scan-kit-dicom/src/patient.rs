@@ -2261,7 +2261,7 @@ mod tests {
         assert!((hu_density(0.0) - 1.0).abs() < 1e-3);
         assert!((scanner_density("default", 0.0) - hu_density(0.0)).abs() < 1e-6);
         assert!((scanner_density("water", 0.0) - 1.0).abs() < 1e-3);
-        assert_eq!(hu_label(0.0), hu_label(0.0));
+        assert_eq!(hu_label(0.0), 44);
         assert!(hu_label(-2000.0) != hu_label(0.0));
     }
 
@@ -3273,7 +3273,10 @@ mod tests {
         let mut bytes = preamble();
         ui(&mut bytes, 0x0008, 0x0016, "1.2.840.10008.5.1.4.1.1.481.2").unwrap();
         std::fs::write(root.join("dose.dcm"), bytes).unwrap();
-        assert!(load_study(&root).is_err());
+        // Assert the guard's own error — a bare is_err() would pass on any
+        // later failure (missing pixels, no CT) even with the check removed.
+        let err = load_study(&root).err().unwrap();
+        assert!(err.contains("dose grid scaling"), "{err}");
         let _ = std::fs::remove_dir_all(&root);
     }
 
