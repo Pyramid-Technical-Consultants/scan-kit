@@ -227,15 +227,17 @@ export function LibraryTable({
     selectedVisible,
   );
 
-  const noteEditId = useRef<string | null>(null);
+  const noteEdit = useRef<{ id: string; note: string } | null>(null);
   const onCellActivated = useCallback(
     (cell: Item) => {
       const [col, rowIndex] = cell;
       const source = order[rowIndex];
       const row = source == null ? undefined : rows[source];
-      // Capture the session when the editor opens — an in-flight catalog
-      // refresh can move a different session into this row before commit.
-      noteEditId.current = clickEditsNote(col) && row != null ? row.session_id : null;
+      // Capture the session and its note when the editor opens — an
+      // in-flight catalog refresh can move a different session into this
+      // row before commit, and undo restores `before` verbatim.
+      noteEdit.current =
+        clickEditsNote(col) && row != null ? { id: row.session_id, note: row.note } : null;
     },
     [order, rows],
   );
@@ -252,10 +254,12 @@ export function LibraryTable({
         onRowCheck(row.session_id, newValue.data === true);
         return;
       }
-      if (clickEditsNote(col) && newValue.kind === GridCellKind.Text && newValue.data !== row.note) {
+      const edit = noteEdit.current;
+      const before = edit?.note ?? row.note;
+      if (clickEditsNote(col) && newValue.kind === GridCellKind.Text && newValue.data !== before) {
         onCommitNote({
-          sessionId: noteEditId.current ?? row.session_id,
-          before: row.note,
+          sessionId: edit?.id ?? row.session_id,
+          before,
           after: newValue.data,
         });
       }

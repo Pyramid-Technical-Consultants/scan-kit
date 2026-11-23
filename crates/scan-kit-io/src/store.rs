@@ -1070,25 +1070,33 @@ pub(crate) fn delete_missing(
 pub fn delete_session(conn: &Connection, lib_id: i64, session_id: &str) -> Result<(), String> {
     // The session's files are already gone when this runs — a mid-call
     // failure must not leave a deleted id inside selected_sessions.
-    let tx = conn
-        .unchecked_transaction()
+    // BEGIN IMMEDIATE — the delete-then-update read-modify-write must not
+    // reopen the cross-process window a deferred BEGIN would.
+    conn.execute_batch("BEGIN IMMEDIATE")
         .map_err(|err| err.to_string())?;
-    tx.execute(
-        "DELETE FROM sessions WHERE library_id = ?1 AND session_id = ?2",
-        params![lib_id, session_id],
-    )
-    .map_err(|err| err.to_string())?;
-    let selected: Vec<String> = selected_list(&tx, lib_id)?
-        .into_iter()
-        .filter(|id| id != session_id)
-        .collect();
-    let encoded = serde_json::to_string(&selected).map_err(|err| err.to_string())?;
-    tx.execute(
-        "UPDATE libraries SET selected_sessions = ?1 WHERE id = ?2",
-        params![encoded, lib_id],
-    )
-    .map_err(|err| err.to_string())?;
-    tx.commit().map_err(|err| err.to_string())
+    let result = (|| {
+        conn.execute(
+            "DELETE FROM sessions WHERE library_id = ?1 AND session_id = ?2",
+            params![lib_id, session_id],
+        )
+        .map_err(|err| err.to_string())?;
+        let selected: Vec<String> = selected_list(conn, lib_id)?
+            .into_iter()
+            .filter(|id| id != session_id)
+            .collect();
+        let encoded = serde_json::to_string(&selected).map_err(|err| err.to_string())?;
+        conn.execute(
+            "UPDATE libraries SET selected_sessions = ?1 WHERE id = ?2",
+            params![encoded, lib_id],
+        )
+        .map_err(|err| err.to_string())?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = conn.execute_batch("ROLLBACK");
+        return result;
+    }
+    conn.execute_batch("COMMIT").map_err(|err| err.to_string())
 }
 
 pub(crate) fn selected_session_ids(conn: &Connection, lib_id: i64) -> Result<Vec<String>, String> {

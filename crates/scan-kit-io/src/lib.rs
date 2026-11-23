@@ -916,7 +916,11 @@ pub fn index_library(
         // process's write (a note, window geometry) would hit busy_timeout.
         // record_meta afterwards autocommits per entry, and a checked=0 row
         // left by a cancel rehydrates on the next sync.
-        let tx = conn.transaction().map_err(|err| err.to_string())?;
+        // Immediate like the scanner paths — a future SELECT-first edit must
+        // not reopen the read-modify-write window this transaction closes.
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|err| err.to_string())?;
         let lib_id = prepare_library(&tx, &root)?;
         let ids = places
             .iter()

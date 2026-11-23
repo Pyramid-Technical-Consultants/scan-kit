@@ -842,7 +842,7 @@ pub fn hv_capacitance_pf(
     }
     // delta_v is |b - a| and a down-step integrates a negative transient —
     // capacitance is unsigned.
-    Some(trapz(&tt, &yy).abs() / delta_v)
+    Some(trapz(&tt, &yy).abs() / delta_v.abs())
 }
 /// Percent of finite metrics at or above each threshold.
 pub fn coverage_percent(metrics: &[f32], thresholds: &[f32]) -> Vec<f32> {
