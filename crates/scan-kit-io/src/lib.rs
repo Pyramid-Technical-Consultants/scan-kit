@@ -1121,7 +1121,7 @@ fn catalog_key(name: &str, storage: &str, used: &mut HashSet<String>) -> String 
     key
 }
 
-fn parent_folder(storage: &str) -> String {
+pub(crate) fn parent_folder(storage: &str) -> String {
     let trimmed = storage.trim_end_matches(['/', '\\']);
     trimmed
         .rsplit(['/', '\\'])

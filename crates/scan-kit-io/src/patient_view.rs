@@ -177,8 +177,18 @@ pub fn patient_inputs(
     } else {
         Some(RbeModel::parse(rbe_key))
     };
+    // An unlisted but physical value ("3.7") is legitimate for a continuum
+    // parameter - only non-numeric or non-positive strings fall back.
     let alpha_beta = pick(options, "alpha_beta", "2", AB_PAIRS)
         .parse::<f64>()
+        .ok()
+        .or_else(|| {
+            options
+                .get("alpha_beta")
+                .and_then(Value::as_str)
+                .and_then(|raw| raw.trim().parse::<f64>().ok())
+        })
+        .filter(|value| value.is_finite() && *value > 0.0)
         .unwrap_or(DEFAULT_ALPHA_BETA);
     Ok(PatientInputs {
         study,
@@ -388,6 +398,10 @@ pub fn provenance(
         "seed": SEED,
         "uncertainty": result.uncertainty,
         "deliveries": sessions,
+        "segment": inputs.segment,
+        "fraction": inputs.fraction,
+        "beams": inputs.beam_filter.map(|index| index.to_string()),
+        "alpha_beta": inputs.alpha_beta,
         "dose": "dose-to-water, Gy per fraction",
         "rbe": inputs.rbe_key,
     })
@@ -462,7 +476,10 @@ pub fn metrics(inputs: &PatientInputs, run: &Transport, options: &Value) -> Pati
             .unwrap_or(1)
             .saturating_sub(1);
         for hit in inputs.groups.get(chosen).into_iter().flatten() {
-            matches.push((*hit, inputs.deliveries[*hit].matched.clone()));
+            let matched = inputs.deliveries[*hit].matched.clone();
+            if inputs.beam_filter.is_none_or(|beam| matched.beam == beam) {
+                matches.push((*hit, matched));
+            }
         }
     }
     let goals_text = goal_text(options, study);
@@ -493,7 +510,10 @@ pub fn metrics(inputs: &PatientInputs, run: &Transport, options: &Value) -> Pati
             continue;
         }
         let structure_dvh = Dvh::of(&dose.values, &mask, voxel_cc);
-        let rx = study.prescription.is_finite().then_some(study.prescription);
+        // The DVH is per-fraction; the prescription is the whole course.
+        // A % goal must compare against the same fraction basis.
+        let rx_fx = study.prescription / study.fractions.max(1) as f32;
+        let rx = rx_fx.is_finite().then_some(rx_fx);
         let goals = goals_text
             .lines()
             .filter_map(|line| Goal::parse(line).ok())
@@ -534,6 +554,10 @@ pub fn metrics(inputs: &PatientInputs, run: &Transport, options: &Value) -> Pati
         });
     }
     let gamma = run.ran.as_ref().and_then(|_| {
+        // A one-beam MC dose cannot be gamma'd against the whole-plan TPS.
+        if inputs.beam_filter.is_some() {
+            return None;
+        }
         let tps = study.tps.as_ref()?;
         let (dd, dta, cutoff) = gamma_criteria(options);
         // The TPS dose for one fraction, searched in the MC dose resampled to
@@ -1021,6 +1045,14 @@ fn deliveries(root: &Path, sessions: &[String], study: &PatientStudy) -> Vec<Del
                 return None;
             }
             // Measured positions on the IC2 -> IC1 ray at the isocenter plane.
+            // iso_positions falls back to the commanded plan positions when
+            // the chamber columns are absent - fine for transport, but the
+            // position-accuracy metric must not report a fabricated 0 mm.
+            let has_ic = ["ic1_x", "ic1_y", "ic2_x", "ic2_y"].iter().all(|key| {
+                table
+                    .get(*key)
+                    .is_some_and(|col| col.iter().any(|v| v.is_finite()))
+            });
             let (x, y) = super::volumetric::iso_positions(&table);
             // Prefer the chamber with more finite readings — a single live
             // ic1 value must not suppress a complete ic2 column.
@@ -1030,7 +1062,10 @@ fn deliveries(root: &Path, sessions: &[String], study: &PatientStudy) -> Vec<Del
             let n2 = ic2.iter().filter(|v| v.is_finite()).count();
             let mu = if n2 > n1 { ic2 } else { ic1 };
             let beam = pick_beam(&study.beams, &energy, &mu)?;
-            let matched = match_delivery(beam, &study.beams[beam], &energy, &x, &y, &mu);
+            let mut matched = match_delivery(beam, &study.beams[beam], &energy, &x, &y, &mu);
+            if !has_ic {
+                matched.position_rms = f32::NAN;
+            }
             Some(Delivery { matched })
         })
         .collect()

@@ -103,7 +103,13 @@ pub(super) fn parse_layer_header(line: &str) -> Result<(f64,), String> {
     if parts.len() < 5 {
         return Err("PLD Layer header is missing required fields".into());
     }
-    Ok((parse_pld_float(parts[2], "layer energy")?,))
+    let energy = parse_pld_float(parts[2], "layer energy")?;
+    // Same bound the DICOM writer enforces - a hand-edited PLD is a trust
+    // boundary too.
+    if !energy.is_finite() || energy <= 0.0 || energy > 330.0 {
+        return Err("PLD layer energy must be from 0 to 330 MeV".into());
+    }
+    Ok((energy,))
 }
 
 pub(super) fn parse_pld_float(value: &str, label: &str) -> Result<f64, String> {

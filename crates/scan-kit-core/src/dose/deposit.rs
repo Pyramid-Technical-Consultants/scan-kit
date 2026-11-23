@@ -197,10 +197,16 @@ pub(super) fn dose_grid(
             // ponytail: a span wider than MAX_CELLS recenters on the
             // midpoint and drops out-of-window dose rather than coarsening
             // the voxel — the GPU texture budget fixes the side.
-            let mid = 0.5 * (lo_i[i] + hi_i[i]);
-            lo_i[i] = (mid - MAX_CELLS as f32 / 2.0).floor();
+            // f64: same-sign f32 extremes overflow a plain (lo + hi) / 2.
+            let mid = (lo_i[i] as f64 + hi_i[i] as f64) * 0.5;
+            lo_i[i] = (mid - MAX_CELLS as f64 / 2.0).floor() as f32;
             shape[i] = MAX_CELLS;
         }
+    }
+    // Recentering an extreme span can still leave a non-finite lo corner -
+    // an inf origin would poison every index_of/sample_mm.
+    if !lo_i.iter().all(|v| v.is_finite()) {
+        return ([0.0, 0.0, 0.0], [1, 1, 1]);
     }
     ([lo_i[0] * v, lo_i[1] * v, lo_i[2] * v], shape)
 }
@@ -2185,5 +2191,34 @@ mod tests {
             10.0,
         );
         assert!(volume.values.iter().all(|v| *v == 0.0));
+    }
+
+    #[test]
+    fn an_extreme_same_sign_span_keeps_a_finite_origin() {
+        // lo/hi around 2.5e38: (lo + hi) / 2 overflows f32, which used to
+        // emit an inf origin and poison every index_of/sample_mm.
+        let volume = analytic_volume(
+            WATER,
+            &[Pencil {
+                x: 2.5e38,
+                y: 0.0,
+                sx: 1.2e37,
+                sy: 3.0,
+                energy: 150.0,
+                amount: 0.1,
+            }],
+            Quantity::Dose,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+            1e-8,
+            10.0,
+        );
+        assert!(
+            volume.origin.iter().all(|v| v.is_finite()),
+            "{:?}",
+            volume.origin
+        );
     }
 }

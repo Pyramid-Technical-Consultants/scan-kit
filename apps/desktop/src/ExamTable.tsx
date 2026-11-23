@@ -50,13 +50,6 @@ export function ExamTable({
     direction: "asc",
   });
   const [gridSelection, setGridSelection] = useState(emptyGridSelection);
-  // Positional selection is meaningless across a rows replacement — adjust
-  // state during render rather than cascading an extra pass from an effect.
-  const [prevRows, setPrevRows] = useState(rows);
-  if (prevRows !== rows) {
-    setPrevRows(rows);
-    setGridSelection(emptyGridSelection);
-  }
   const order = useMemo(() => {
     const indexes = rows.map((_, index) => index);
     indexes.sort((left, right) => {
@@ -71,6 +64,13 @@ export function ExamTable({
     });
     return indexes;
   }, [rows, sort]);
+  // Positional selection is meaningless across a display-order change — a
+  // re-sort permutes order without touching rows, like LibraryTable.
+  const [prevOrder, setPrevOrder] = useState(order);
+  if (prevOrder !== order) {
+    setPrevOrder(order);
+    setGridSelection(emptyGridSelection);
+  }
   const baseColumns: GridColumn[] = COLUMNS.map((column, index) => ({
     title: sort.key === column.key ? `${column.title} ${sort.direction === "desc" ? "↓" : "↑"}` : column.title,
     id: column.key,

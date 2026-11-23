@@ -700,11 +700,10 @@ fn remote_exam(
         return Ok(None);
     };
     let peek = scan_kit_dicom::peek_study(&bytes);
-    let study_uid = if peek.study_uid.is_empty() {
-        folder_name.to_owned()
-    } else {
-        peek.study_uid
-    };
+    if peek.study_uid.is_empty() {
+        return Ok(None);
+    }
+    let study_uid = peek.study_uid;
     Ok(Some(discover::ExamHit {
         study_uid,
         folder_name: folder_name.to_owned(),
@@ -1223,6 +1222,39 @@ fn recorded(library: &str, session_id: &str) -> Option<String> {
         .unwrap_or_else(|err| err.into_inner())
         .get(&(library.to_owned(), session_id.to_owned()))
         .cloned()
+}
+
+/// A disambiguated display id ('name - parent') is recorded under its own
+/// library's key, so a caller holding a different open root never finds it
+/// through 'recorded'. The catalog cache answers that, but a concurrent
+/// refresh can legitimately be mid-swap — fall back to the recorded places,
+/// which are scoped per library and cannot be clobbered by another root.
+pub(crate) fn recorded_anywhere(display: &str) -> Option<PathBuf> {
+    // Display ids are catalog_key output: a base name, middle-dot, parent
+    // folder name, with a " (n)" spillover when the parent name still
+    // collides. A session id containing the separator splits on the last
+    // one; the (n) spillover stays ambiguous and must not resolve.
+    let (base, suffix) = display.rsplit_once(" · ")?;
+    let parent = suffix.split(" (").next().unwrap_or(suffix);
+    let mut candidates = {
+        let map = sessions().lock().unwrap_or_else(|err| err.into_inner());
+        map.iter()
+            .filter(|((_, id), place)| id == base && crate::parent_folder(place) == parent)
+            .map(|(_, place)| place.clone())
+            .collect::<Vec<String>>()
+            .into_iter()
+    };
+    let place = candidates.next()?;
+    if candidates.next().is_some() {
+        // "name - parent" and its " (n)" siblings are indistinguishable
+        // here - returning either guesses at the wrong session.
+        return None;
+    }
+    let local = PathBuf::from(&place);
+    if is_remote_location(&place) || !local.exists() {
+        return None;
+    }
+    Some(resolve_container(&local, base))
 }
 
 #[cfg(not(windows))]

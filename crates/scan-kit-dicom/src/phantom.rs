@@ -494,8 +494,10 @@ fn parse(params: &Value) -> Result<Request, String> {
     }
     let pixel = number(params, "pixel", 2.0)?;
     let slice = number(params, "slice", 2.0)?;
-    if !(0.0..=100.0).contains(&pixel) || !(0.0..=100.0).contains(&slice) {
-        return Err("Pixel spacing and slice thickness must be from 0 to 100 mm.".into());
+    if !(0.0 < pixel && pixel <= 100.0) || !(0.0 < slice && slice <= 100.0) {
+        return Err(
+            "Pixel spacing and slice thickness must be greater than 0 and at most 100 mm.".into(),
+        );
     }
     if let Some(value) = params.get("energies") {
         if !value.is_array() && !value.is_null() {
@@ -510,9 +512,12 @@ fn parse(params: &Value) -> Result<Request, String> {
             let mut energies = Vec::new();
             for value in values {
                 let energy = value.as_f64().ok_or("energies must be numbers")?;
-                if energy.is_finite() && (f64::EPSILON..=330.0).contains(&energy) {
-                    energies.push(energy);
+                // f32::MIN_POSITIVE: a smaller value underflows to a literal 0
+                // nominal energy when written to the control point.
+                if !energy.is_finite() || !(f32::MIN_POSITIVE as f64..=330.0).contains(&energy) {
+                    return Err("energies must be finite and from 0 to 330 MeV".into());
                 }
+                energies.push(energy);
             }
             if energies.is_empty() {
                 return Err("pick at least one energy".into());
@@ -921,5 +926,18 @@ mod tests {
     fn zero_is_not_an_energy() {
         assert!(parse(&json!({ "energies": [0.0] })).is_err());
         assert!(parse(&json!({ "energies": [100.0] })).is_ok());
+    }
+
+    #[test]
+    fn an_out_of_range_energy_errors_instead_of_dropping() {
+        // Dropping silently would write a one-layer study and claim success.
+        assert!(parse(&json!({ "energies": [140.0, 400.0] })).is_err());
+        assert!(parse(&json!({ "energies": [1e-300] })).is_err());
+    }
+
+    #[test]
+    fn zero_spacing_errors_with_the_spacing_message() {
+        let err = parse(&json!({ "pixel": 0.0 })).err().expect("rejected");
+        assert!(err.contains("Pixel spacing"), "{err}");
     }
 }
