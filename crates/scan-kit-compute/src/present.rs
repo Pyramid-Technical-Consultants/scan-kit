@@ -292,7 +292,7 @@ pub(crate) fn finish_patient_report(
             .and_then(|stem| stem.to_str())
             .unwrap_or("report")
     ));
-    let csv = scan_kit_io::report::dvh_csv(&curves);
+    let csv = scan_kit_io::report::dvh_csv(&curves)?;
     let mut out = json!({
         "pdf": pdf.display().to_string(),
         "provenance": report.provenance,

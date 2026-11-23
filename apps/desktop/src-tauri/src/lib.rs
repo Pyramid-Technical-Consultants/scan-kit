@@ -142,10 +142,11 @@ async fn scan_kit_start(
 
 /// One slice of a task: a progress report and, when this slice drew something, its payload.
 #[tauri::command]
-async fn scan_kit_poll(task: u64) -> Result<tauri::ipc::Response, String> {
-    let bytes = tauri::async_runtime::spawn_blocking(move || scan_kit_compute::poll_task(task))
-        .await
-        .map_err(|err| err.to_string())??;
+async fn scan_kit_poll(task: u64, generation: Option<u64>) -> Result<tauri::ipc::Response, String> {
+    let bytes =
+        tauri::async_runtime::spawn_blocking(move || scan_kit_compute::poll_task(task, generation))
+            .await
+            .map_err(|err| err.to_string())??;
     Ok(tauri::ipc::Response::new(bytes))
 }
 

@@ -238,9 +238,21 @@ pub fn start_task(
     Ok(json!({ "task": id, "generation": 1 }))
 }
 
-pub fn poll_task(id: u64) -> Result<Vec<u8>, String> {
+pub fn poll_task(id: u64, expect_generation: Option<u64>) -> Result<Vec<u8>, String> {
     let (mut stage, cancel, generation) = {
         let mut driver = lock();
+        let task_gen = driver.tasks.get(&id).map(|task| task.generation);
+        if let (Some(want), Some(current)) = (expect_generation, task_gen) {
+            if want != current {
+                // A stale poller must not drive or consume the successor
+                // generation's stage (its Ready payload is one-shot).
+                return Ok(encode_poll(
+                    &ended(id, want, Phase::Cancelled, ""),
+                    None,
+                    true,
+                ));
+            }
+        }
         let Some(task) = driver.tasks.get_mut(&id) else {
             let report = driver
                 .ended_tasks
@@ -1112,6 +1124,11 @@ fn mc_transport(jobs: Vec<McJob>, shared: Arc<McLive>, cancel: Cancel) {
         shared.total.store(all_total, Ordering::Relaxed);
         *locked(&shared.note) = format!("{}%", 100 * all_done / all_total.max(1));
         if finished.iter().all(Option::is_some) {
+            // A cancel that landed during the final polls wins over seeding
+            // the shared run cache and publishing readiness.
+            if shared.stop.load(Ordering::SeqCst) || cancel.is_cancelled() {
+                break;
+            }
             if !shared.ready_flag.load(Ordering::Acquire) {
                 let results: Vec<McResult> = finished.iter().flatten().cloned().collect();
                 let mut reached = jobs.clone();
@@ -1888,6 +1905,7 @@ struct ExportStage {
     job: Option<McJob>,
     inputs: Option<Box<scan_kit_io::patient_view::PatientInputs>>,
     run: Option<McRun>,
+    cancel: Cancel,
 }
 
 impl ExportStage {
@@ -1918,6 +1936,7 @@ impl ExportStage {
             job: None,
             inputs: None,
             run: None,
+            cancel: Cancel::new(),
         }
     }
 
@@ -1933,12 +1952,22 @@ impl ExportStage {
         let Some(inputs) = self.inputs.as_ref() else {
             return self.fail("the export has no patient inputs".into());
         };
+        if self.cancel.is_cancelled() {
+            self.report.phase = Phase::Cancelled;
+            return Poll::Cancelled;
+        }
         if let Some(job) = &self.job {
             keep_runs(std::slice::from_ref(job), std::slice::from_ref(&result));
         }
         self.report.done = self.report.total;
         let run = scan_kit_io::patient_view::dose_from_result(inputs, Some(result));
         let gpu = crate::mc::adapter_info();
+        // A cancel landing while the dose was prepared must still win over
+        // the destination write.
+        if self.cancel.is_cancelled() {
+            self.report.phase = Phase::Cancelled;
+            return Poll::Cancelled;
+        }
         let outcome = if self.dose {
             scan_kit_io::patient_view::write_patient_dose(
                 inputs,
@@ -1971,6 +2000,10 @@ impl ExportStage {
 impl Stage for ExportStage {
     fn report(&self) -> Report {
         self.report.clone()
+    }
+
+    fn bind_cancel(&mut self, cancel: Cancel) {
+        self.cancel = cancel;
     }
 
     fn poll(&mut self, budget: Duration, cancel: &Cancel) -> Poll<Vec<u8>> {
@@ -2165,7 +2198,7 @@ mod tests {
                 },
             );
         }
-        let bytes = poll_task(id).unwrap();
+        let bytes = poll_task(id, None).unwrap();
         let (report, _) = scan_kit_core::decode_poll(&bytes).unwrap();
         assert_eq!(report["generation"], 7);
         assert!(!report["finished"].as_bool().unwrap());
@@ -2191,7 +2224,7 @@ mod tests {
             );
         }
         cancel_task(id, None);
-        let bytes = poll_task(id).unwrap();
+        let bytes = poll_task(id, None).unwrap();
         let (report, _) = scan_kit_core::decode_poll(&bytes).unwrap();
         assert_eq!(report["phase"], "cancelled");
         assert_eq!(report["generation"], 3);
@@ -2783,7 +2816,7 @@ mod tests {
         )
         .unwrap();
         let id = first["task"].as_u64().unwrap();
-        let _ = poll_task(id);
+        let _ = poll_task(id, None);
         let started = std::time::Instant::now();
         let second = start_task(
             "volumetric",
@@ -2827,7 +2860,7 @@ mod tests {
         )
         .unwrap();
         let id = started["task"].as_u64().unwrap();
-        let report = poll_report(&poll_task(id).unwrap());
+        let report = poll_report(&poll_task(id, None).unwrap());
         assert_eq!(report["phase"], "failed");
         assert_eq!(report["finished"], true);
         // The failed task is gone, not parked in the export slot.
@@ -3000,7 +3033,7 @@ mod tests {
         let start = std::time::Instant::now();
         let mut last = String::new();
         for _ in 0..3600 {
-            let bytes = poll_task(id).unwrap();
+            let bytes = poll_task(id, None).unwrap();
             let length = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
             let report: Value = serde_json::from_slice(&bytes[4..4 + length]).unwrap();
             let line = format!(
@@ -3104,7 +3137,7 @@ mod tests {
             );
             id
         };
-        let report = poll_report(&poll_task(id).unwrap());
+        let report = poll_report(&poll_task(id, None).unwrap());
         assert_eq!(report["phase"], "failed");
         assert_eq!(report["finished"], true);
         let driver = lock();
@@ -3160,10 +3193,45 @@ mod tests {
             );
             id
         };
-        let report = poll_report(&poll_task(id).unwrap());
+        let report = poll_report(&poll_task(id, None).unwrap());
         assert_eq!(report["phase"], "failed");
         assert_eq!(report["finished"], true);
         assert!(!lock().tasks.contains_key(&id));
+    }
+
+    #[test]
+    fn a_stale_generation_poll_leaves_the_successor_stage_parked() {
+        // A retargeted task bumped its generation; the old poller must not
+        // drive or consume the successor's one-shot Ready payload.
+        struct Ready;
+        impl Stage for Ready {
+            fn poll(&mut self, _budget: Duration, _cancel: &Cancel) -> Poll<Vec<u8>> {
+                Poll::Ready(b"new-payload".to_vec())
+            }
+            fn report(&self) -> Report {
+                report_at(Phase::Scene, 0, 0)
+            }
+        }
+        let id = {
+            let mut driver = lock();
+            let id = driver.next;
+            driver.next = driver.next.saturating_add(1);
+            driver.tasks.insert(
+                id,
+                Running {
+                    generation: 2,
+                    cancel: Cancel::new(),
+                    stage: Some(Box::new(Ready)),
+                    last_report: None,
+                },
+            );
+            id
+        };
+        let report = poll_report(&poll_task(id, Some(1)).unwrap());
+        assert_eq!(report["finished"], true);
+        assert_eq!(report["phase"], "cancelled");
+        // The successor's stage is still parked — nothing was consumed.
+        assert!(lock().tasks.get(&id).unwrap().stage.is_some());
     }
 
     #[test]

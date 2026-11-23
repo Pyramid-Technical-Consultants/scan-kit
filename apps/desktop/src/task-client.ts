@@ -62,7 +62,7 @@ export async function driveTask(
     }
     let parsed;
     try {
-      const raw = await invoke<ArrayBuffer | Uint8Array>("scan_kit_poll", { task: started.task });
+      const raw = await invoke<ArrayBuffer | Uint8Array>("scan_kit_poll", { task: started.task, generation: started.generation });
       parsed = parsePoll(bytesOf(raw));
     } catch (reason) {
       // The backend task keeps running without a poller — cancel it, then propagate.
