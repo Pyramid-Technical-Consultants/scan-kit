@@ -35,6 +35,7 @@ pub use discover::session_directory;
 pub use location::is_remote_location;
 pub use marks::normalize_options;
 pub use mc_tables::{csda_range_mm, mc_tables, medium_rho};
+pub use store::default_db_path;
 pub use tables::{
     bind_slice, clear_slice, session_pieces, slice_tail_done, SessionPieces, SliceTake, SLICE_ROWS,
 };
@@ -51,10 +52,10 @@ use serde_json::{json, Value};
 use columns::map_geom_from_spots;
 use discover::Discovered;
 use store::{
-    backfill_blank_notes, data_dirs, default_db_path, delete_missing, delete_missing_exams,
-    exam_rows, forget_data_dir, last_main_tab, library_id, library_rows, prepare_library,
-    record_meta, remember_data_dir, set_last_main_tab, set_note, set_selected, sync_entry,
-    upsert_exam, window_geometry, with_store, Cache,
+    backfill_blank_notes, data_dirs, delete_missing, delete_missing_exams, exam_rows,
+    forget_data_dir, last_main_tab, library_id, library_rows, prepare_library, record_meta,
+    remember_data_dir, set_last_main_tab, set_note, set_selected, sync_entry, upsert_exam,
+    window_geometry, with_store, Cache,
 };
 
 const TOOLS: &[ToolSpec] = &[
@@ -530,8 +531,7 @@ pub fn invoke(name: &str, input: &Value) -> Result<Value, InvokeError> {
         "scan_kit_open_library" => {
             let path = required_str(input, "path")?;
             let db = database_path(input)?;
-            with_store(&db, |conn| open_library(conn, Path::new(path)))
-                .map_err(InvokeError::Message)
+            open_library(&db, Path::new(path)).map_err(InvokeError::Message)
         }
         "scan_kit_set_note" => {
             let path = required_str(input, "path")?;
@@ -557,19 +557,23 @@ pub fn invoke(name: &str, input: &Value) -> Result<Value, InvokeError> {
             let path = required_str(input, "path")?;
             let session_id = required_str(input, "session_id")?;
             let db = database_path(input)?;
-            with_store(&db, |conn| {
-                let root = library_root(path)?;
-                let paths = location::session_storage_paths(&root, session_id)?;
-                let errors = location::delete_storage(&root, &paths)?;
-                // A session whose files are still on disk keeps its row —
-                // note/selection/hidden survive the failed delete.
-                if errors.is_empty() {
+            // Remote storage IO runs outside STORE_LOCK — the lock covers
+            // only the row removal when the delete succeeds.
+            let root = library_root(path).map_err(InvokeError::Message)?;
+            let paths =
+                location::session_storage_paths(&root, session_id).map_err(InvokeError::Message)?;
+            let errors = location::delete_storage(&root, &paths).map_err(InvokeError::Message)?;
+            // A session whose files are still on disk keeps its row —
+            // note/selection/hidden survive the failed delete.
+            if errors.is_empty() {
+                with_store(&db, |conn| {
                     let lib_id = store::prepare_library(conn, &root)?;
-                    store::delete_session(conn, lib_id, session_id)?;
-                }
-                Ok(json!({ "removed": paths.len() - errors.len(), "errors": errors }))
-            })
-            .map_err(InvokeError::Message)
+                    store::delete_session(conn, lib_id, session_id)
+                })
+                .map_err(InvokeError::Message)?;
+            }
+            Ok(json!({ "removed": paths.len() - errors.len(), "errors": errors }))
+                .map_err(InvokeError::Message)
         }
         "scan_kit_select_sessions" => {
             let path = required_str(input, "path")?;
@@ -756,37 +760,42 @@ pub fn invoke(name: &str, input: &Value) -> Result<Value, InvokeError> {
 }
 
 fn scanners(db: &Path, action: &str, folder: Option<&str>) -> Result<Value, String> {
-    store::with_store(db, |conn| {
-        match action {
-            "add" => {
-                let folder = folder.ok_or("scanner folder required")?;
-                let calibration = calibration::CtCalibration::resolve(folder)?;
+    match action {
+        "add" => {
+            let folder = folder.ok_or("scanner folder required")?;
+            // File IO outside STORE_LOCK — resolve before taking it.
+            let calibration = calibration::CtCalibration::resolve(folder)?;
+            store::with_store(db, |conn| {
                 let mut list = store::scanners(conn)?;
                 if !list.iter().any(|(_, existing)| existing == folder) {
                     list.push((calibration.name.clone(), folder.to_owned()));
                 }
-                store::set_scanners(conn, &list)?;
-            }
-            "remove" => {
-                let folder = folder.ok_or("scanner folder required")?;
+                store::set_scanners(conn, &list)
+            })?;
+        }
+        "remove" => {
+            let folder = folder.ok_or("scanner folder required")?;
+            store::with_store(db, |conn| {
                 let list: Vec<(String, String)> = store::scanners(conn)?
                     .into_iter()
                     .filter(|(_, existing)| existing != folder)
                     .collect();
-                store::set_scanners(conn, &list)?;
-            }
-            "list" => {}
-            other => return Err(format!("unknown scanners action {other}")),
+                store::set_scanners(conn, &list)
+            })?;
         }
-        let mut entries = Vec::new();
-        for (label, folder) in store::scanners(conn)? {
-            let digest = calibration::CtCalibration::resolve(&folder)
-                .map(|calibration| calibration.digest())
-                .unwrap_or_default();
-            entries.push(json!({ "label": label, "folder": folder, "digest": digest }));
-        }
-        Ok(json!({ "scanners": entries }))
-    })
+        "list" => {}
+        other => return Err(format!("unknown scanners action {other}")),
+    }
+    let stored = store::with_store(db, |conn| store::scanners(conn))?;
+    let mut entries = Vec::new();
+    for (label, folder) in stored {
+        // Digest reads files — outside the lock.
+        let digest = calibration::CtCalibration::resolve(&folder)
+            .map(|calibration| calibration.digest())
+            .unwrap_or_default();
+        entries.push(json!({ "label": label, "folder": folder, "digest": digest }));
+    }
+    Ok(json!({ "scanners": entries }))
 }
 
 /// Copy the connected session into `dest`, calling `keep` after each file.
@@ -822,27 +831,21 @@ pub fn write_last_main_tab(tab: &str) -> Result<(), String> {
 }
 
 /// Workflow `scan_kit_open_library`. Discovers, syncs the index, and returns rows.
-pub fn open_library(conn: &mut rusqlite::Connection, data_dir: &Path) -> Result<Value, String> {
-    open_library_keep(conn, data_dir, &mut |_, _, _| true)
+pub fn open_library(db: &Path, data_dir: &Path) -> Result<Value, String> {
+    index_library(db, data_dir, &mut |_, _, _| true)
 }
 
 /// Same index as [`open_library`], publishing `done`, `total`, and the rows so far.
 ///
 /// `keep` returns false to roll the index back. The final value is still the committed rows.
 pub fn index_library(
+    db: &Path,
     data_dir: &Path,
     keep: &mut dyn FnMut(u64, u64, Option<&Value>) -> bool,
 ) -> Result<Value, String> {
-    with_store(&default_db_path(), |conn| {
-        open_library_keep(conn, data_dir, keep)
-    })
-}
-
-fn open_library_keep(
-    conn: &mut rusqlite::Connection,
-    data_dir: &Path,
-    keep: &mut dyn FnMut(u64, u64, Option<&Value>) -> bool,
-) -> Result<Value, String> {
+    // File and network IO run outside STORE_LOCK — a remote library can take
+    // minutes and must not stall every other store call behind it. The lock
+    // covers the short DB sections only.
     let spec = data_dir.to_string_lossy();
     let (root, opened) = location::open_root(&spec)?;
     let found = match &opened {
@@ -853,6 +856,7 @@ fn open_library_keep(
             location::discover_remote(url, &mut |done, total| keep(done, total, None))?
         }
     };
+    let conn = &mut store::open_connection(db)?;
     let places = found
         .entries
         .iter()
@@ -867,7 +871,7 @@ fn open_library_keep(
     let skipped = found.skipped;
     let walk_failed = found.walk_failed;
     let total = found.entries.len() as u64;
-    let (lib_id, pending) = {
+    let (lib_id, pending) = store::locked(|| {
         // Two phases: the write transaction covers the row-sync decisions only.
         // hydrate does file/network IO — inside the transaction a remote
         // library could hold the write lock for minutes and every other
@@ -903,26 +907,30 @@ fn open_library_keep(
             }
         }
         tx.commit().map_err(|err| err.to_string())?;
-        (lib_id, pending)
-    };
+        Ok((lib_id, pending))
+    })?;
     if !keep(0, total, None) {
         return Err("cancelled".into());
     }
     for (index, entry) in found.entries.iter().enumerate() {
         if pending.contains(&index) {
+            // hydrate does file/network IO — outside the lock; the write is
+            // a short autocommit on the shared connection.
             let (meta, readable) = hydrate(entry);
-            record_meta(conn, lib_id, entry, meta.as_ref(), readable)?;
+            store::locked(|| record_meta(conn, lib_id, entry, meta.as_ref(), readable))?;
         }
         let done = (index as u64) + 1;
         // library_rows lists everything indexed so far — per entry that is
         // O(n²). Refresh the preview on a stride; progress still ticks every
         // entry and the final result carries the full row set.
         let preview = if index % 16 == 0 {
-            Some(json!({
-                "root": root,
-                "rows": library_rows(conn, lib_id)?,
-                "selected": [],
-            }))
+            Some(store::locked(|| {
+                Ok(json!({
+                    "root": root,
+                    "rows": library_rows(conn, lib_id)?,
+                    "selected": [],
+                }))
+            })?)
         } else {
             None
         };
@@ -930,10 +938,14 @@ fn open_library_keep(
             return Err("cancelled".into());
         }
     }
-    let rows = library_rows(conn, lib_id)?;
-    let selected = store::selected_session_ids(conn, lib_id)?;
+    let (rows, selected) = store::locked(|| {
+        Ok((
+            library_rows(conn, lib_id)?,
+            store::selected_session_ids(conn, lib_id)?,
+        ))
+    })?;
     location::replace_sessions(&root, &places);
-    publish_catalog(conn)?;
+    store::locked(|| publish_catalog(conn))?;
     Ok(
         json!({ "root": root, "rows": rows, "selected": selected, "skipped": skipped, "walk_failed": walk_failed }),
     )

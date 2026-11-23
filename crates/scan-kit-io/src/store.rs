@@ -57,6 +57,14 @@ pub fn with_store<T>(
     body(&mut conn)
 }
 
+/// Short STORE_LOCK sections on an already-open connection — file and
+/// network IO must run outside the lock, not inside a fresh with_store
+/// per item.
+pub(crate) fn locked<T>(body: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    let _guard = STORE_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+    body()
+}
+
 pub fn open_connection(path: &Path) -> Result<Connection, String> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -116,9 +124,13 @@ pub fn set_window_geometry(
     x: i32,
     y: i32,
 ) -> Result<(), String> {
-    // Untrusted invoke args — don't persist dimensions a platform can't show.
+    // Untrusted invoke args — don't persist dimensions or positions a
+    // platform can't show (an i32::MIN origin restores fully off-screen).
     if !(1..=32768).contains(&width) || !(1..=32768).contains(&height) {
         return Err(format!("invalid window size {width}x{height}"));
+    }
+    if !(-32768..=32768).contains(&x) || !(-32768..=32768).contains(&y) {
+        return Err(format!("invalid window position {x},{y}"));
     }
     prefs_patch(
         conn,
@@ -1423,5 +1435,15 @@ mod tests {
         forget_data_dir(&conn, "/one").unwrap();
         assert!(data_dirs(&conn).unwrap().is_empty());
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn an_off_screen_window_origin_is_rejected() {
+        let path = temp_db("geompos");
+        let conn = open_connection(&path).unwrap();
+        assert!(set_window_geometry(&conn, 800, 600, i32::MIN, 0).is_err());
+        assert!(set_window_geometry(&conn, 800, 600, 0, i32::MAX).is_err());
+        set_window_geometry(&conn, 800, 600, -100, 100).unwrap();
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 }

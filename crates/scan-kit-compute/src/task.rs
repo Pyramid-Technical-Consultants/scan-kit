@@ -1594,22 +1594,27 @@ impl Stage for LibraryStage {
             let path = self.path.clone();
             let shared = Arc::clone(&self.shared);
             self.worker = Some(std::thread::spawn(move || {
-                let value = scan_kit_io::index_library(&path, &mut |done, total, preview| {
-                    shared.done.store(done, Ordering::Relaxed);
-                    shared.total.store(total, Ordering::Relaxed);
-                    if let Some(preview) = preview {
-                        let mut slot = shared.preview.lock().unwrap_or_else(|err| err.into_inner());
-                        // The row set grows as indexing runs — serializing it
-                        // per entry is O(n²). Skip while the last preview is
-                        // still unconsumed.
-                        if slot.is_none() {
-                            if let Ok(bytes) = serde_json::to_vec(preview) {
-                                *slot = Some(bytes);
+                let value = scan_kit_io::index_library(
+                    &scan_kit_io::default_db_path(),
+                    &path,
+                    &mut |done, total, preview| {
+                        shared.done.store(done, Ordering::Relaxed);
+                        shared.total.store(total, Ordering::Relaxed);
+                        if let Some(preview) = preview {
+                            let mut slot =
+                                shared.preview.lock().unwrap_or_else(|err| err.into_inner());
+                            // The row set grows as indexing runs — serializing it
+                            // per entry is O(n²). Skip while the last preview is
+                            // still unconsumed.
+                            if slot.is_none() {
+                                if let Ok(bytes) = serde_json::to_vec(preview) {
+                                    *slot = Some(bytes);
+                                }
                             }
                         }
-                    }
-                    !shared.stop.load(Ordering::SeqCst)
-                })?;
+                        !shared.stop.load(Ordering::SeqCst)
+                    },
+                )?;
                 serde_json::to_vec(&value).map_err(|err| err.to_string())
             }));
         }

@@ -188,6 +188,14 @@ pub fn upload(db: &Path, csv_path: &Path) -> Result<Value, String> {
     if !csv_path.is_file() {
         return Err(format!("CSV not found: {}", csv_path.display()));
     }
+    // The caller names the file — cap it like the response body so a stray
+    // multi-GB path cannot exhaust memory or land on the device as a plan.
+    let size = std::fs::metadata(csv_path)
+        .map_err(|err| err.to_string())?
+        .len();
+    if size > MAX_BODY as u64 {
+        return Err(format!("CSV is too large: {} bytes", size));
+    }
     let bytes = std::fs::read(csv_path).map_err(|err| err.to_string())?;
     // Each socket exchange holds LIVE; the HTTP put and the poll sleeps do
     // not need it. Holding it across the whole upload froze status reads and
@@ -1637,5 +1645,21 @@ mod tests {
         // Close-delimited bodies need EOF, so a bare header is incomplete.
         let bare = header("HTTP/1.1 204 No Content\n\n", b"");
         assert!(!response_complete(&bare));
+    }
+
+    #[test]
+    fn an_oversized_upload_is_rejected_before_any_io() {
+        let dir = std::env::temp_dir().join(format!("sk_r21_up_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let csv = dir.join("big.csv");
+        // Sparse file: the length is set without writing the bytes.
+        std::fs::File::create(&csv)
+            .unwrap()
+            .set_len(MAX_BODY as u64 + 1)
+            .unwrap();
+        let db = dir.join("store.db");
+        let err = upload(&db, &csv).unwrap_err();
+        assert!(err.contains("too large"), "{err}");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
