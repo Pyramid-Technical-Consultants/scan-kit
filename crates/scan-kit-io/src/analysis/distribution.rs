@@ -179,7 +179,17 @@ fn kept_pairs(
             continue;
         }
         if timed {
-            let time = clock.get(index).copied().unwrap_or(f32::NAN);
+            // Same extrapolation as trace_span — rows past a short clock
+            // continue from the last real timestamp at the sample rate.
+            let time = clock
+                .get(index)
+                .copied()
+                .or_else(|| {
+                    clock.last().map(|last| {
+                        last + (index + 1 - clock.len()) as f32 * crate::tables::SAMPLE_S
+                    })
+                })
+                .unwrap_or(f32::NAN);
             if !time.is_finite() {
                 continue;
             }
@@ -201,7 +211,7 @@ pub(super) fn distribution_limits(mode: &str, samples: &[f32]) -> (f32, f32) {
         let mut positive: Vec<f32> = samples
             .iter()
             .copied()
-            .filter(|value| *value > 0.0)
+            .filter(|value| value.is_finite() && *value > 0.0)
             .collect();
         let hi = percentile_at(&mut positive, 0.9995).max(1.0);
         (0.0, hi)
@@ -946,5 +956,19 @@ mod tests {
         assert!(lo.is_finite() && hi.is_finite());
         let (lo, hi) = padded_span(&samples);
         assert!(lo.is_finite() && hi.is_finite());
+    }
+
+    #[test]
+    fn a_short_clock_extrapolates_like_the_trace() {
+        // trace_span continues a short clock at the sample rate — kept_pairs
+        // must land those rows in the same window, not drop them.
+        let mut table = std::collections::BTreeMap::new();
+        table.insert("x".to_string(), vec![1.0, 2.0, 3.0, 4.0]);
+        table.insert("y".to_string(), vec![1.0, 2.0, 3.0, 4.0]);
+        table.insert("time_s".to_string(), vec![0.0, 0.001]);
+        let (ox, _oy, ot) = kept_pairs(&table, "x", "y", &[], true);
+        assert_eq!(ox.len(), 4);
+        assert_eq!(ot.len(), 4);
+        assert!((ot[3] - 0.003).abs() < 1e-6, "{}", ot[3]);
     }
 }

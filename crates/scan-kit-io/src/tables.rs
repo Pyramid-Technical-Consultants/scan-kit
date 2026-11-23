@@ -1387,12 +1387,17 @@ fn stamp_spot_clock(table: &mut BTreeMap<String, Vec<f32>>, spot: &Sheet, n: usi
 }
 
 fn elapsed_seconds(stamps: &[f64]) -> Option<Vec<f32>> {
-    let origin = stamps.iter().copied().find(|value| value.is_finite())?;
+    // A sentinel epoch like an unset RTC's 1970-01-01 parses to a finite 0.0 —
+    // it cannot be the origin or every stamp lands ~5e10 seconds out.
+    let origin = stamps
+        .iter()
+        .copied()
+        .find(|value| value.is_finite() && *value > 0.0)?;
     Some(
         stamps
             .iter()
             .map(|value| {
-                if value.is_finite() {
+                if value.is_finite() && *value > 0.0 {
                     (*value - origin) as f32
                 } else {
                     f32::NAN
@@ -3578,7 +3583,7 @@ fn current_from(
 }
 
 /// Timeslice rows are 1 ms apart, the same clock Timeline draws.
-const SAMPLE_S: f32 = 0.001;
+pub(crate) const SAMPLE_S: f32 = 0.001;
 
 fn stamp_sample_time(table: &mut BTreeMap<String, Vec<f32>>) {
     let Some(n) = table.get("energy").map(Vec::len).filter(|n| *n > 0) else {
@@ -5555,7 +5560,7 @@ pub(crate) fn parse_datetime(text: &str) -> Option<f64> {
 }
 
 pub(crate) fn days_from_civil(mut year: i32, month: u32, day: u32) -> Option<i64> {
-    if !(1..=12).contains(&month) || day == 0 || day > 31 {
+    if !(1..=12).contains(&month) || day == 0 || day > days_in_month(year, month) {
         return None;
     }
     if month <= 2 {
@@ -5567,6 +5572,15 @@ pub(crate) fn days_from_civil(mut year: i32, month: u32, day: u32) -> Option<i64
     let doy = (153 * month_prime + 2) / 5 + day - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     Some(i64::from(era) * 146097 + i64::from(doe) - 719468)
+}
+
+fn days_in_month(year: i32, month: u32) -> u32 {
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    match month {
+        2 => 28 + u32::from(leap),
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    }
 }
 
 #[cfg(test)]
@@ -5594,6 +5608,25 @@ mod tests {
     #[test]
     fn civil_1970_is_unix_zero() {
         assert_eq!(days_from_civil(1970, 1, 1), Some(0));
+    }
+
+    #[test]
+    fn impossible_calendar_days_do_not_parse() {
+        assert_eq!(days_from_civil(2023, 2, 29), None);
+        assert_eq!(days_from_civil(1900, 2, 29), None);
+        assert_eq!(days_from_civil(2023, 4, 31), None);
+        assert_eq!(days_from_civil(2023, 11, 31), None);
+        assert!(days_from_civil(2024, 2, 29).is_some());
+        assert!(days_from_civil(2000, 2, 29).is_some());
+    }
+
+    #[test]
+    fn an_epoch_sentinel_does_not_poison_elapsed_seconds() {
+        // An unset RTC writes epoch 0 — a missing stamp, not the origin.
+        let elapsed = elapsed_seconds(&[0.0, 1_700_000_000.0, 1_700_000_001.5]).unwrap();
+        assert!(elapsed[0].is_nan());
+        assert_eq!(elapsed[1], 0.0);
+        assert!((elapsed[2] - 1.5).abs() < 1e-3);
         assert!(parse_datetime("1970-01-01 00:00:00").unwrap().abs() < 1e-6);
     }
 

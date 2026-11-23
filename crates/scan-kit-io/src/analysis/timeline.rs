@@ -378,6 +378,18 @@ fn trace_span(
         x_hi = x_hi.max(t);
         finite.push(*value);
     }
+    if x_lo > x_hi && window.is_some() {
+        // The window clipped every sample — report the unwindowed span so the
+        // axis still fits the trace instead of the default 0..1 frame.
+        for (index, value) in samples.iter().enumerate() {
+            if value.is_finite() {
+                finite.push(*value);
+                let t = xs[index];
+                x_lo = x_lo.min(t);
+                x_hi = x_hi.max(t);
+            }
+        }
+    }
     (
         xs,
         ys,
@@ -625,6 +637,18 @@ mod tests {
         assert_eq!(x0, 0.0);
         assert!((x1 - 1.0).abs() < 1e-5, "{x1}");
         assert!((xs[1_000] - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_window_past_the_data_falls_back_to_the_full_span() {
+        // A stray playhead past the trace end must not leave panels on the
+        // default 0..1 frame.
+        let samples: Vec<f32> = vec![1.0; 500];
+        let (_, _, xspan, yspan) = drawn_trace(&samples, None, None, Some((9e9, 9e9 + 1.0)));
+        let (x0, x1) = xspan.unwrap();
+        assert_eq!(x0, 0.0);
+        assert!((x1 - 0.499).abs() < 1e-5, "{x1}");
+        assert!(yspan.is_some());
     }
 
     #[test]
