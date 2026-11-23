@@ -37,10 +37,13 @@ export function nextSessionSelection(
     if (!checked) {
       return { ids: [], capped: false };
     }
-    return {
-      ids: idsInOrder.slice(0, MAX_SELECTED),
-      capped: idsInOrder.length > MAX_SELECTED,
-    };
+    // Fill, don't replace — keep the user's existing picks (and their
+    // plot-color order) and append unchecked rows until the cap.
+    const ids = [...selected, ...idsInOrder.filter((id) => !selected.includes(id))].slice(
+      0,
+      MAX_SELECTED,
+    );
+    return { ids, capped: selected.length + idsInOrder.length > MAX_SELECTED };
   }
   if (!checked) {
     return { ids: selected.filter((id) => id !== target), capped: false };

@@ -219,9 +219,12 @@ export function LibraryTable({
     },
     [columns.length, onGridSelectionChange],
   );
+  // Count only visible rows — a selection holding ids outside this list
+  // must not paint the header fully checked.
+  const selectedVisible = rows.filter((row) => selectedIds.includes(row.session_id)).length;
   const { checked: headerChecked, indeterminate: headerMixed } = headerCheck(
     rows.length,
-    selectedIds.length,
+    selectedVisible,
   );
 
   const onCellEdited = useCallback(

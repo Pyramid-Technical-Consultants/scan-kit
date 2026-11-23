@@ -269,7 +269,9 @@ export function ConfigTuning({
   useEffect(() => {
     const seq = ++openSeq.current;
     let cancel = false;
-    const sessionId = sessionKey.split("|")[0] ?? "";
+    // Open the config for a session actually in the run — an excluded
+    // first pick would edit a file the tune ignores.
+    const sessionId = sessionIds[0] ?? "";
     void (async () => {
       if (dirtyRef.current && !window.confirm("Discard unsaved edits in this file?")) {
         // The seq bump already superseded any in-flight loadFile, whose

@@ -499,13 +499,21 @@ function NumberInput({
         aria-label={prefix == null ? undefined : label}
         type="number"
         className="tabular-nums [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
-        value={value == null ? "" : String(value)}
+        value={
+          value == null || (typeof value === "number" && !Number.isFinite(value))
+            ? ""
+            : String(value)
+        }
         min={param.minimum}
         max={param.maximum}
         step={param.step}
         onChange={(event) => {
-          const next = event.target.value;
-          onChange(param.key, next === "" ? "" : Number(next));
+          const text = event.target.value;
+          const number = Number(text);
+          // Pass partial text through like CatalogField — "-", "1e", and a
+          // cleared field are valid intermediate input, and NaN must never
+          // reach params.
+          onChange(param.key, Number.isFinite(number) && text.trim() !== "" ? number : text);
         }}
       />
       {prefix == null || prefix.length === 0 ? null : (

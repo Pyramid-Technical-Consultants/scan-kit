@@ -282,7 +282,6 @@ export default function App() {
   const [password, setPassword] = useState("");
   const [rows, setRows] = useState<LibraryRow[]>([]);
   const [exams, setExams] = useState<ExamRow[]>([]);
-  const folder = locations[0] ?? null;
   const [sort, setSort] = useState<Sort>({ key: "date", direction: "desc" });
   const [about, setAbout] = useState<About | null>(null);
   const [aboutOpen, setAboutOpen] = useState(false);
@@ -316,6 +315,9 @@ export default function App() {
   const trashing = useRef(false);
   const pendingLocations = useRef<string[]>([]);
   const selectedIds = selectionOrder;
+  // Sessions can live in any indexed location — anchor analysis to the
+  // first selected row's own library, not locations[0].
+  const folder = rows.find((row) => selectedIds.includes(row.session_id))?.library ?? locations[0] ?? null;
   const canAnalyze = folder != null && selectedIds.length >= 1 && selectedIds.length <= MAX_SELECTED;
   const noRows = catalog === "Sessions" ? rows.length === 0 : exams.length === 0;
   const catalogWaiting = noRows && (!locationsKnown || libraryLoading);
@@ -685,9 +687,7 @@ export default function App() {
           return;
         }
         event.preventDefault();
-        if (folder != null) {
-          void openLocation(folder);
-        }
+        void refreshLocations();
         return;
       }
       if (!ctrl || typing) {
@@ -911,7 +911,7 @@ export default function App() {
         displayIds,
         selectedIds,
         "all",
-        headerWillFill(rows.length, selectedIds.length),
+        headerWillFill(rows.length, rows.filter((row) => selectedIds.includes(row.session_id)).length),
       ),
     );
   }, [commitSelection, displayIds, rows.length, selectedIds]);
