@@ -856,6 +856,13 @@ pub fn index_library(
             location::discover_remote(url, &mut |done, total| keep(done, total, None))?
         }
     };
+    // Remote fingerprints stat each session over a fresh connection —
+    // compute them before STORE_LOCK so the write tx below stays short.
+    let fingerprints: Vec<Option<(i64, i64)>> = found
+        .entries
+        .iter()
+        .map(|entry| discover::storage_fingerprint(&entry.storage_path, &entry.session_id))
+        .collect();
     let conn = &mut store::open_connection(db)?;
     let places = found
         .entries
@@ -902,7 +909,7 @@ pub fn index_library(
         backfill_blank_notes(&tx, lib_id, Path::new(&root))?;
         let mut pending = HashSet::new();
         for (index, entry) in found.entries.iter().enumerate() {
-            if let Cache::Hydrate = sync_entry(&tx, lib_id, entry)? {
+            if let Cache::Hydrate = sync_entry(&tx, lib_id, entry, fingerprints[index])? {
                 pending.insert(index);
             }
         }
@@ -917,7 +924,16 @@ pub fn index_library(
             // hydrate does file/network IO — outside the lock; the write is
             // a short autocommit on the shared connection.
             let (meta, readable) = hydrate(entry);
-            store::locked(|| record_meta(conn, lib_id, entry, meta.as_ref(), readable))?;
+            store::locked(|| {
+                record_meta(
+                    conn,
+                    lib_id,
+                    entry,
+                    meta.as_ref(),
+                    readable,
+                    fingerprints[index],
+                )
+            })?;
         }
         let done = (index as u64) + 1;
         // library_rows lists everything indexed so far — per entry that is

@@ -1116,23 +1116,9 @@ fn write_termination(
         let sheet = ic_sheet(ic)?;
         let index = sheet.column("total_dose")?;
         let dose: f64 = sheet.rows.last()?.get(index)?.trim().parse().ok()?;
-        // The device logs nC; the summary field is read back as MU. Apply
-        // the same magnitude scale dose_target uses so a C-vs-nC mismatch
-        // can't write a number a million-fold off.
-        let measured: Vec<f32> = column_values(sheet, "total_dose")
-            .iter()
-            .map(|value| *value as f32)
-            .collect();
-        let targets: Vec<f32> = column_values(sheet, &format!("{ic}_dose_target"))
-            .iter()
-            .map(|value| *value as f32)
-            .collect();
-        let scale = if targets.is_empty() {
-            1.0
-        } else {
-            f64::from(tables::dose_unit_scale(&measured, &targets))
-        };
-        Some(num_text(dose / scale))
+        // Summary convention is measured units — "Total dose target" below
+        // scales its C targets INTO nC to sit beside this raw nC total.
+        Some(num_text(dose))
     };
     let input_map = std::fs::read(dir.join("input_map.csv"))
         .ok()
@@ -1450,26 +1436,32 @@ mod tests {
     }
 
     #[test]
-    fn the_termination_summary_scales_device_dose_to_the_target_unit() {
-        // Device logs nanocoulombs; the summary field is read back as MU.
+    fn the_termination_summary_keeps_dose_lines_in_measured_units() {
+        // Device logs nC and the summary's target line is scaled INTO nC —
+        // the primary/secondary totals must emit the same unit.
         let dir = std::env::temp_dir().join(format!("sk_r21_term_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let dev = device("IC");
         let sheet = sheet(
-            "total_dose,ic1_total_dose,ic1_dose_target\n             1.0e8,1.0e8,1.0\n2.0e8,2.0e8,2.0\n",
+            "point_dose,total_dose,ic1_total_dose,ic1_dose_target\n1.0e8,1.0e8,1.0e8,0.1\n2.0e8,2.0e8,2.0e8,0.2\n",
         );
         let spots = vec![(&dev, sheet)];
         let status = Map::new();
         write_termination(&dir, "sess", &status, &spots, &[]).unwrap();
         let text = std::fs::read_to_string(dir.join("termination_summary.txt")).unwrap();
-        // Raw 2.0e8 must not appear as the primary dose — scaled ≈ 2 MU.
         let dose_line = text
             .lines()
-            .find(|line| line.to_ascii_lowercase().contains("total dose"))
+            .find(|line| line.starts_with("Secondary total dose"))
             .unwrap_or("");
+        let target_line = text
+            .lines()
+            .find(|line| line.starts_with("Total dose target"))
+            .unwrap_or("");
+        // Both in nC: the raw 2.0e8 total and 0.3 C of targets x 1e9.
+        assert!(dose_line.contains("200000000"), "dose line: {dose_line}");
         assert!(
-            dose_line.contains('2') && !dose_line.contains("e8") && !dose_line.contains("000000"),
-            "unexpected dose line: {dose_line}"
+            target_line.contains("3000000"),
+            "target line: {target_line}"
         );
         std::fs::remove_dir_all(&dir).ok();
     }

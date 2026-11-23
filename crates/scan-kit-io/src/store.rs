@@ -12,7 +12,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use scan_kit_core::{SessionMeta, SummaryDate};
 use serde_json::{json, Value};
 
-use super::discover::{self, Discovered, ExamHit};
+use super::discover::{Discovered, ExamHit};
 
 const SCHEMA_VERSION: i32 = 4;
 const PREF_LAST_DATA_DIR: &str = "session.last_data_dir";
@@ -314,8 +314,15 @@ pub enum Cache {
     Hydrate,
 }
 
-pub fn sync_entry(conn: &Connection, lib_id: i64, entry: &Discovered) -> Result<Cache, String> {
-    let fingerprint = discover::storage_fingerprint(&entry.storage_path, &entry.session_id);
+/// `fingerprint` comes from `discover::storage_fingerprint` — the caller
+/// computes it BEFORE taking STORE_LOCK because a remote stat is a fresh
+/// connection.
+pub fn sync_entry(
+    conn: &Connection,
+    lib_id: i64,
+    entry: &Discovered,
+    fingerprint: Option<(i64, i64)>,
+) -> Result<Cache, String> {
     let (mtime_ns, size) = match fingerprint {
         Some((mtime, size)) => (Some(mtime), Some(size)),
         None => (None, None),
@@ -388,18 +395,20 @@ pub fn sync_entry(conn: &Connection, lib_id: i64, entry: &Discovered) -> Result<
     Ok(Cache::Hydrate)
 }
 
+/// `fingerprint` comes from `discover::storage_fingerprint` — the caller
+/// computes it before STORE_LOCK; a remote stat is a fresh connection.
 pub fn record_meta(
     conn: &Connection,
     lib_id: i64,
     entry: &Discovered,
     meta: Option<&SessionMeta>,
     checked: bool,
+    fingerprint: Option<(i64, i64)>,
 ) -> Result<(), String> {
     // The UPDATE below leaves size/mtime_ns alone: sync_entry stamps them
     // before hydrate reads any bytes, and restatting now would certify
     // content the row does not hold — a stored fingerprint newer than the
     // hydrated bytes pins stale meta instead of re-reading it.
-    let fingerprint = discover::storage_fingerprint(&entry.storage_path, &entry.session_id);
     let (mtime_ns, size) = match fingerprint {
         Some((mtime, size)) => (Some(mtime), Some(size)),
         None => (None, None),
@@ -1357,7 +1366,7 @@ mod tests {
         };
         // checked=false: the storage was unreachable, so NULL meta is a
         // transient failure, not an absence — the next scan retries.
-        record_meta(&conn, lib_id, &entry, None, false).unwrap();
+        record_meta(&conn, lib_id, &entry, None, false, None).unwrap();
         let checked: i64 = conn
             .query_row(
                 "SELECT map_geom_checked FROM sessions
@@ -1368,7 +1377,7 @@ mod tests {
             .unwrap();
         assert_eq!(checked, 0);
         // checked=true: readable storage without meta — seal so scans skip it.
-        record_meta(&conn, lib_id, &entry, None, true).unwrap();
+        record_meta(&conn, lib_id, &entry, None, true, None).unwrap();
         let checked: i64 = conn
             .query_row(
                 "SELECT map_geom_checked FROM sessions
@@ -1393,13 +1402,13 @@ mod tests {
             storage_path: root.join("keep.zip"),
             kind: "zip",
         };
-        record_meta(&conn, lib_id, &entry, None, true).unwrap();
+        record_meta(&conn, lib_id, &entry, None, true, None).unwrap();
         let entry = Discovered {
             session_id: "drop".to_owned(),
             storage_path: root.join("drop.zip"),
             kind: "zip",
         };
-        record_meta(&conn, lib_id, &entry, None, true).unwrap();
+        record_meta(&conn, lib_id, &entry, None, true, None).unwrap();
         conn.execute(
             "UPDATE libraries SET selected_sessions = ?1 WHERE id = ?2",
             params![r#"["keep","drop"]"#, lib_id],
