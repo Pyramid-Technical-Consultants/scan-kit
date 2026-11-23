@@ -520,9 +520,9 @@ fn modified_z(values: &[f32]) -> Vec<f32> {
         if !value.is_finite() {
             continue;
         }
-        *slot = if mad > 1e-12 {
+        *slot = if mad > 0.0 {
             0.6745 * (value - med) / mad
-        } else if mean_ad > 1e-12 {
+        } else if mean_ad > 0.0 {
             (value - mean) / (1.253314 * mean_ad)
         } else {
             0.0
@@ -535,6 +535,16 @@ fn modified_z(values: &[f32]) -> Vec<f32> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_sub_epsilon_spread_still_scores_the_outlier() {
+        // Device columns live at ~1e-12 coulomb scale - an absolute 1e-12
+        // floor called this column flat and NaN'd the whole rank.
+        let mut column = vec![1e-13f32; 10];
+        column.push(5e-12);
+        let z = modified_z(&column);
+        assert!(z[10] > 3.5, "z={:?}", z[10]);
+    }
 
     #[test]
     fn an_explicit_empty_segments_list_is_not_the_defaults() {

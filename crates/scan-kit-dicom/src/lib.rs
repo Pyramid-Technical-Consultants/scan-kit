@@ -298,9 +298,6 @@ pub(crate) fn meta_sop_class(bytes: &[u8]) -> Option<String> {
 pub(crate) fn dicom_files(root: &Path) -> Result<Vec<std::path::PathBuf>, String> {
     const MAX_DEPTH: usize = 6;
     fn visit(dir: &Path, depth: usize, out: &mut Vec<std::path::PathBuf>) -> Result<(), String> {
-        if depth == 0 {
-            return Ok(());
-        }
         // An unreadable directory entry must not silently drop slices from a
         // volume — load_study makes per-file read errors loud for the same
         // reason.
@@ -315,6 +312,12 @@ pub(crate) fn dicom_files(root: &Path) -> Result<Vec<std::path::PathBuf>, String
                 continue;
             }
             if kind.is_dir() {
+                // A series nested past the cap must not lose tail slices
+                // silently - a geometrically consistent partial volume is
+                // worse than a loud error.
+                if depth == 0 {
+                    return Err(format!("{} is nested too deep to scan", path.display()));
+                }
                 visit(&path, depth - 1, out)?;
             } else if kind.is_file() {
                 out.push(path);
@@ -521,7 +524,11 @@ fn looks_like_explicit_element(bytes: &[u8]) -> bool {
     let Some((length, header)) = value_length(vr, &bytes[6..]) else {
         return false;
     };
-    6 + header + length <= bytes.len()
+    // checked like element_span - on wasm32 a u32 length could wrap the add.
+    6usize
+        .checked_add(header)
+        .and_then(|need| need.checked_add(length))
+        .is_some_and(|need| need <= bytes.len())
 }
 
 fn value_length(vr: &[u8], rest: &[u8]) -> Option<(usize, usize)> {
@@ -595,6 +602,17 @@ fn push_vr(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_study_past_the_scan_depth_errors_instead_of_truncating() {
+        let root = std::env::temp_dir().join(format!("scan-kit-deep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let deep = root.join("a/b/c/d/e/f/g/h");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(deep.join("ct.dcm"), [0u8; 4]).unwrap();
+        assert!(dicom_files(&root).is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn sk_req_032_study_index_goal_and_report() {

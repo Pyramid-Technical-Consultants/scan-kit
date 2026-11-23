@@ -1512,7 +1512,10 @@ fn parse_dataset_mode(bytes: &[u8], implicit: bool, depth: u32) -> Result<Vec<El
         // that happen to share it — demoting would silently empty the SQ.
         let (items, seq) = if !implicit && vr == *b"SQ" {
             (parse_items(value, false, depth + 1)?, true)
-        } else if (implicit || vr == *b"UN") && looks_like_items(value) {
+        } else if (implicit || vr == *b"UN")
+            && tag(group, element) != tag(0x7FE0, 0x0010)
+            && looks_like_items(value)
+        {
             (parse_items(value, implicit, depth + 1)?, true)
         } else {
             (Vec::new(), false)
@@ -2459,6 +2462,20 @@ mod tests {
         assert!(entries.iter().any(|entry| entry.modality == "CT"));
         assert!(entries.iter().any(|entry| entry.modality == "RTPLAN"));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn pixel_data_starting_with_the_item_marker_stays_an_element() {
+        // Little-endian FFFE,E000 is a legal first word pair in a pixel
+        // payload - it must not be read as an implicit sequence.
+        let mut payload = vec![0xFE, 0xFF, 0x00, 0xE0, 0x04, 0x00, 0x00, 0x00];
+        payload.extend_from_slice(&[1u8, 2, 3, 4]);
+        let mut bytes = preamble();
+        ui(&mut bytes, 0x0002, 0x0010, "1.2.840.10008.1.2").unwrap();
+        iv(&mut bytes, 0x7FE0, 0x0010, &payload);
+        let elems = parse_file(&bytes).unwrap();
+        let found = elem(&elems, tag(0x7FE0, 0x0010)).unwrap();
+        assert_eq!(found.bytes, payload);
     }
 
     #[test]

@@ -127,7 +127,7 @@ pub fn percentile_nearest(values: &mut [f32], portion: f32) -> f32 {
         return f32::NAN;
     }
     let last = values.len() - 1;
-    let index = ((last as f32) * portion.clamp(0.0, 1.0)).round() as usize;
+    let index = ((last as f64) * f64::from(portion.clamp(0.0, 1.0))).round() as usize;
     select_rank(values, index.min(last))
 }
 
@@ -148,10 +148,10 @@ pub fn quantiles_at(values: &mut [f32], qs: &[f32]) -> Vec<f32> {
     let last = values.len() - 1;
     qs.iter()
         .map(|q| {
-            let pos = q.clamp(0.0, 1.0) * last as f32;
+            let pos = f64::from(q.clamp(0.0, 1.0)) * last as f64;
             let lo = (pos.floor() as usize).min(last);
             let hi = (pos.ceil() as usize).min(last);
-            let frac = pos - lo as f32;
+            let frac = (pos - lo as f64) as f32;
             values[lo] * (1.0 - frac) + values[hi] * frac
         })
         .collect()
@@ -210,10 +210,10 @@ mod tests {
         let last = values.len() - 1;
         qs.iter()
             .map(|q| {
-                let pos = q.clamp(0.0, 1.0) * last as f32;
+                let pos = f64::from(q.clamp(0.0, 1.0)) * last as f64;
                 let lo = (pos.floor() as usize).min(last);
                 let hi = (pos.ceil() as usize).min(last);
-                let frac = pos - lo as f32;
+                let frac = (pos - lo as f64) as f32;
                 values[lo] * (1.0 - frac) + values[hi] * frac
             })
             .collect()

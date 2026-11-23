@@ -1421,13 +1421,13 @@ fn elapsed_seconds(stamps: &[f64]) -> Option<Vec<f32>> {
 }
 
 fn spot_time_ms(spot: &Sheet, n: usize) -> Option<Vec<f64>> {
-    if let Some(time) = spot.wide.get("timestamp") {
+    if let Some(time) = wide_named(spot, "timestamp").and_then(|key| spot.wide.get(key)) {
         if time.len() >= n && time.iter().take(n).any(|value| value.is_finite()) {
             return Some(time[..n].to_vec());
         }
     }
-    let seconds = spot.wide.get("time_s")?;
-    let nanos = spot.wide.get("time_ns")?;
+    let seconds = wide_named(spot, "time_s").and_then(|key| spot.wide.get(key))?;
+    let nanos = wide_named(spot, "time_ns").and_then(|key| spot.wide.get(key))?;
     if seconds.len() < n || nanos.len() < n {
         return None;
     }
@@ -2186,12 +2186,15 @@ fn add_dose_rate(table: &mut BTreeMap<String, Vec<f32>>, time: &[f64]) {
 }
 
 fn wall_time(spot: &Sheet, n: usize) -> Option<Vec<f64>> {
-    if let Some(stamp) = spot.wide.get("datetime") {
+    if let Some(stamp) = wide_named(spot, "datetime").and_then(|key| spot.wide.get(key)) {
         if stamp.iter().take(n).any(|value| value.is_finite()) {
             return Some(stamp.iter().take(n).copied().collect());
         }
     }
-    if let (Some(seconds), Some(nanos)) = (spot.wide.get("time_s"), spot.wide.get("time_ns")) {
+    if let (Some(seconds), Some(nanos)) = (
+        wide_named(spot, "time_s").and_then(|key| spot.wide.get(key)),
+        wide_named(spot, "time_ns").and_then(|key| spot.wide.get(key)),
+    ) {
         let n = n.min(seconds.len()).min(nanos.len());
         return Some(
             (0..n)
@@ -2199,7 +2202,7 @@ fn wall_time(spot: &Sheet, n: usize) -> Option<Vec<f64>> {
                 .collect(),
         );
     }
-    let stamp = spot.wide.get("timestamp")?;
+    let stamp = wide_named(spot, "timestamp").and_then(|key| spot.wide.get(key))?;
     Some(stamp.iter().take(n).map(|value| value / 1000.0).collect())
 }
 
@@ -2532,6 +2535,18 @@ fn median_abs(values: &[f32]) -> f64 {
     finite[finite.len() / 2]
 }
 
+fn wide_named<'a>(sheet: &'a Sheet, name: &str) -> Option<&'a str> {
+    if let Some((key, _)) = sheet.wide.get_key_value(name) {
+        return Some(key.as_str());
+    }
+    let want = scan_kit_core::normalize_column_name(name);
+    sheet
+        .wide
+        .keys()
+        .find(|key| scan_kit_core::normalize_column_name(key) == want)
+        .map(String::as_str)
+}
+
 fn num_named<'a>(sheet: &'a Sheet, name: &str) -> Option<&'a str> {
     if let Some((key, _)) = sheet.num.get_key_value(name) {
         return Some(key.as_str());
@@ -2638,8 +2653,13 @@ fn sheet_metric(
 ) -> Option<SheetMetric> {
     let trigger = num_col(sheet, "rci_in_trigger")
         .or_else(|| num_col(sheet, "r_beamOk"))
-        .or_else(|| num_col(sheet, "beam_on"))?;
-    let n = trigger.len();
+        .or_else(|| num_col(sheet, "beam_on"));
+    // Trigger-less files still emit geometry - align on the longest column
+    // like sample_len rather than dropping the metric entirely.
+    let n = trigger.map_or_else(
+        || sheet.num.values().map(Vec::len).max().unwrap_or(0),
+        |trigger| trigger.len(),
+    );
     if start >= n {
         return None;
     }
@@ -2662,7 +2682,7 @@ fn sheet_metric(
     // One timeslice spot is thousands of rows. The plan key stays put.
     let mut plan_hit: [Option<(u32, u32, Option<(f32, f32)>)>; 4] = [None; 4];
     for row in start..n {
-        let on = trigger[row] > 0.5;
+        let on = trigger.is_none_or(|trigger| trigger[row] > 0.5);
         beam.push(if on { 1.0 } else { 0.0 });
         energy.push(tagged);
         let ic1 = plan_cached(
@@ -3875,9 +3895,7 @@ fn find_header<'a>(sheet: &'a Sheet, concept: &str, extra: &[&str]) -> Option<&'
             return Some(name);
         }
     }
-    extra
-        .iter()
-        .find_map(|name| sheet.num.get_key_value(*name).map(|(key, _)| key.as_str()))
+    extra.iter().find_map(|name| header_named(sheet, name))
 }
 
 fn header_named<'a>(sheet: &'a Sheet, requested: &str) -> Option<&'a str> {
@@ -4761,7 +4779,21 @@ fn read_more(file: &mut std::fs::File, newlines: usize, bytes_per_row: usize) ->
         match file.read(&mut tmp) {
             Ok(0) => return (buf, true),
             Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(_) => return (buf, false),
+            Err(_) => {
+                // A mid-line read error must not fold the partial tail in as
+                // a row - rewind to the last full line like trim_newlines.
+                let cut = buf
+                    .iter()
+                    .rposition(|byte| *byte == b'\n')
+                    .map(|at| at + 1)
+                    .unwrap_or(0);
+                let extra = buf.len() - cut;
+                buf.truncate(cut);
+                if extra > 0 {
+                    let _ = file.seek(SeekFrom::Current(-(extra as i64)));
+                }
+                return (buf, false);
+            }
             Ok(count) => buf.extend_from_slice(&tmp[..count]),
         }
         if nth_newline(&buf, newlines).is_some() {
@@ -4981,12 +5013,29 @@ fn extend_sheet(dest: &mut Sheet, extra: &Sheet) {
     }
 }
 
-fn header_end(bytes: &[u8]) -> usize {
-    bytes
-        .iter()
-        .position(|byte| *byte == b'\n')
-        .map(|index| index + 1)
-        .unwrap_or(bytes.len())
+// Returns (header line start, body start) - banner or comment lines before
+// the schema are not the header.
+fn header_span(bytes: &[u8]) -> (usize, usize) {
+    let mut at = 0;
+    loop {
+        let end = bytes[at..]
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map(|index| at + index + 1)
+            .unwrap_or(bytes.len());
+        let line = &bytes[at..end.min(bytes.len())];
+        if line
+            .iter()
+            .find(|byte| !byte.is_ascii_whitespace())
+            .is_some_and(|byte| *byte != b'#')
+        {
+            return (at, end);
+        }
+        if end >= bytes.len() {
+            return (end, end);
+        }
+        at = end;
+    }
 }
 
 fn fold_window(tail: &mut Tail, chunk: Vec<u8>, pred: fn(&str) -> bool, file_eof: bool) {
@@ -4995,20 +5044,23 @@ fn fold_window(tail: &mut Tail, chunk: Vec<u8>, pred: fn(&str) -> bool, file_eof
         return;
     }
     tail.joined = None;
-    let end = if tail.cursor == 0 {
-        header_end(&chunk)
+    let end = if tail.header.is_empty() {
+        // A banner longer than the first window puts the header in a later
+        // chunk - keep scanning until the first data line shows.
+        let (start, end) = header_span(&chunk);
+        tail.header = chunk[start..end].to_vec();
+        end
     } else {
         0
     };
-    if tail.cursor == 0 && tail.header.is_empty() {
-        tail.header = chunk[..end].to_vec();
-    }
     let len = chunk.len();
     tail.pieces.push(Arc::new(chunk));
     adopt_layout(tail, pred);
     let Some(layout) = tail.layout.clone() else {
         tail.cursor += len;
-        tail.done = true;
+        // No layout yet means no data line has been seen - done only at EOF,
+        // not because the first chunk was all banner.
+        tail.done = file_eof;
         return;
     };
     let stored = tail.pieces.last().unwrap();
@@ -5055,11 +5107,23 @@ fn read_sheet_where(bytes: &[u8], keep: impl Fn(&str) -> bool + Sync) -> Sheet {
         Ok(text) => std::borrow::Cow::Borrowed(text),
         Err(_) => String::from_utf8_lossy(bytes),
     };
-    let (header, body) = text.split_once('\n').unwrap_or((text.as_ref(), ""));
-    let header = header.trim_end_matches('\r');
-    if header.is_empty() {
-        return empty_sheet();
-    }
+    // The header is the first non-blank, non-"#" line - a banner before the
+    // schema used to read as the schema itself.
+    let (header, body) = {
+        let mut rest = text.as_ref();
+        loop {
+            let (line, tail) = rest.split_once('\n').unwrap_or((rest, ""));
+            let header = line.trim_end_matches('\r');
+            if header.trim().is_empty() || header.trim_start().starts_with('#') {
+                if tail.is_empty() {
+                    return empty_sheet();
+                }
+                rest = tail;
+            } else {
+                break (header, tail);
+            }
+        }
+    };
     let (names, kinds, block) = header_schema(header, &keep);
     sheet_from(names, slots_from_body(body, &kinds), block)
 }
@@ -5680,6 +5744,21 @@ fn days_in_month(year: i32, month: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn banner_lines_before_the_schema_are_not_the_header() {
+        // Files that open with a comment banner used to read the banner as
+        // the column schema and lose every real column.
+        let sheet = read_sheet(
+            b"# recorded on site A
+
+name,x
+a,1
+b,2
+",
+        );
+        assert_eq!(sheet.num.get("x"), Some(&vec![1.0, 2.0]));
+    }
 
     #[test]
     fn a_minus_one_millimetre_position_survives_the_row_mask() {

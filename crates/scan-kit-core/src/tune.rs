@@ -1276,7 +1276,7 @@ fn reduce(values: &[f64], weights: &[f64], mode: &str) -> f64 {
         "min_max_midpoint" => {
             let min = finite.iter().copied().fold(f64::INFINITY, f64::min);
             let max = finite.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-            (min + max) / 2.0
+            min * 0.5 + max * 0.5
         }
         "weighted_average" => {
             let mut num = 0.0;
@@ -1486,7 +1486,7 @@ fn median(values: &[f64]) -> f64 {
     if sorted.len() % 2 == 1 {
         sorted[mid]
     } else {
-        (sorted[mid - 1] + sorted[mid]) / 2.0
+        sorted[mid - 1] * 0.5 + sorted[mid] * 0.5
     }
 }
 
@@ -1575,6 +1575,12 @@ fn text(params: &Value, key: &str, fallback: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_extreme_pair_still_has_a_finite_median() {
+        // low * 0.5 + high * 0.5 survives where (low + high) / 2.0 overflows.
+        assert_eq!(median(&[1e308, 1e308]), 1e308);
+    }
 
     #[test]
     fn a_mistyped_number_errors_instead_of_defaulting() {

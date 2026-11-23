@@ -369,7 +369,13 @@ pub fn sync_entry(
                 params![path, entry.kind, lib_id, entry.session_id],
             )
             .map_err(|err| err.to_string())?;
-            return Ok(Cache::Ready);
+            // A never-hydrated row still needs hydrate() - the stat failure
+            // above is transient, not a reason to stay blank another scan.
+            return Ok(if existing.map_geom_checked != 0 {
+                Cache::Ready
+            } else {
+                Cache::Hydrate
+            });
         }
         if fingerprint.is_some() && existing.size == size && existing.mtime_ns == mtime_ns {
             conn.execute(
@@ -503,7 +509,7 @@ pub fn backfill_blank_notes(conn: &Connection, lib_id: i64, root: &Path) -> Resu
         conn.execute(
             "UPDATE sessions SET note = ?1
              WHERE library_id = ?2 AND session_id = ?3 AND note = ''",
-            params![text, lib_id, session_id],
+            params![text.trim(), lib_id, session_id],
         )
         .map_err(|err| err.to_string())?;
     }
@@ -1071,7 +1077,16 @@ fn import_app_settings_body(conn: &Connection, db_path: &Path) -> Result<(), Str
         // The import fills an empty store — replacing live settings would
         // silently revert window geometry, scanners, and runner prefs to the
         // stale file on any DB that predates the marker.
-        if prefs_get(conn, PREF_APP_SETTINGS)?.is_none() {
+        let settings_empty = conn
+            .query_row(
+                "SELECT value IS NULL FROM prefs WHERE key = ?1",
+                params![PREF_APP_SETTINGS],
+                |row| row.get::<_, bool>(0),
+            )
+            .optional()
+            .map_err(|err| err.to_string())?
+            .unwrap_or(true);
+        if settings_empty {
             prefs_set(conn, PREF_APP_SETTINGS, &value)?;
         }
     }
@@ -1093,6 +1108,49 @@ pub(crate) fn delete_missing(
         .map_err(|err| err.to_string())?;
     let gone: Vec<_> = ids.into_iter().filter(|id| !found.contains(id)).collect();
     for session_id in &gone {
+        // A case-only rename on a case-insensitive filesystem yields a new
+        // id for the same file - rekey the row instead of losing the note.
+        if let Some(renamed) = found
+            .iter()
+            .find(|id| id.eq_ignore_ascii_case(session_id))
+            .cloned()
+        {
+            let survives: bool = conn
+                .query_row(
+                    "SELECT EXISTS(
+                        SELECT 1 FROM sessions
+                        WHERE library_id = ?1 AND session_id = ?2)",
+                    params![lib_id, renamed],
+                    |row| row.get(0),
+                )
+                .map_err(|err| err.to_string())?;
+            if survives {
+                // The new casing already has a row - carry the note over a
+                // blank one and drop the gone row; a blind rekey would hit
+                // UNIQUE(library_id, session_id) and abort the whole sync.
+                conn.execute(
+                    "UPDATE sessions SET note = (
+                        SELECT note FROM sessions
+                        WHERE library_id = ?1 AND session_id = ?2)
+                     WHERE library_id = ?1 AND session_id = ?3 AND note = ''",
+                    params![lib_id, session_id, renamed],
+                )
+                .map_err(|err| err.to_string())?;
+                conn.execute(
+                    "DELETE FROM sessions WHERE library_id = ?1 AND session_id = ?2",
+                    params![lib_id, session_id],
+                )
+                .map_err(|err| err.to_string())?;
+            } else {
+                conn.execute(
+                    "UPDATE sessions SET session_id = ?1
+                     WHERE library_id = ?2 AND session_id = ?3",
+                    params![renamed, lib_id, session_id],
+                )
+                .map_err(|err| err.to_string())?;
+            }
+            continue;
+        }
         conn.execute(
             "DELETE FROM sessions WHERE library_id = ?1 AND session_id = ?2",
             params![lib_id, session_id],
@@ -1100,10 +1158,19 @@ pub(crate) fn delete_missing(
         .map_err(|err| err.to_string())?;
     }
     // last_scan_at marks the last scan, not the last scan that deleted a row.
-    let selected = selected_list(conn, lib_id)?
+    let selected = selected_list(conn, lib_id)?.into_iter().filter_map(|id| {
+        // Case-renamed ids adopt the on-disk casing like the rows above.
+        if found.contains(&id) {
+            Some(id)
+        } else {
+            found.iter().find(|f| f.eq_ignore_ascii_case(&id)).cloned()
+        }
+    });
+    let mut seen = std::collections::HashSet::new();
+    let selected: Vec<String> = selected
         .into_iter()
-        .filter(|id| found.contains(id))
-        .collect::<Vec<_>>();
+        .filter(|id| seen.insert(id.clone()))
+        .collect();
     let encoded = serde_json::to_string(&selected).map_err(|err| err.to_string())?;
     let scanned = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1363,6 +1430,48 @@ mod tests {
             )
             .unwrap();
         assert_eq!(rows, 0);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_case_only_rename_rekeys_the_row_and_keeps_the_note() {
+        // NTFS case-folds: sess.zip -> SESS.zip is a new id for the same
+        // file, and the stored note must follow the rename.
+        let path = temp_db("case_rename");
+        let conn = open_connection(&path).unwrap();
+        let root = std::env::temp_dir()
+            .join("sk_case_root")
+            .to_string_lossy()
+            .to_string();
+        let lib_id = ensure_library(&conn, &root).unwrap();
+        conn.execute(
+            "INSERT INTO sessions(library_id, session_id, note) VALUES (?1, 'sess', 'keep me')",
+            params![lib_id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE libraries SET selected_sessions = '[\"sess\"]' WHERE id = ?1",
+            params![lib_id],
+        )
+        .unwrap();
+        let found: HashSet<String> = ["SESS".to_owned()].into_iter().collect();
+        delete_missing(&conn, lib_id, &found).unwrap();
+        let note: String = conn
+            .query_row(
+                "SELECT note FROM sessions WHERE library_id = ?1 AND session_id = 'SESS'",
+                params![lib_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(note, "keep me");
+        let selected: String = conn
+            .query_row(
+                "SELECT selected_sessions FROM libraries WHERE id = ?1",
+                params![lib_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(selected.contains("SESS"), "selected={selected}");
         let _ = std::fs::remove_file(&path);
     }
 

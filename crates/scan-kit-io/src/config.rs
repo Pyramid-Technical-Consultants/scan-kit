@@ -403,7 +403,20 @@ pub fn diff(input: &Value) -> Result<Value, String> {
             summary_parts.push(format!("{session_id}: no config"));
             continue;
         }
-        let session_files = walk_files(&session_root)?;
+        let session_files = match walk_files(&session_root) {
+            Ok(files) => files,
+            Err(err) => {
+                // One unreadable tree must not sink the other sessions'
+                // columns - same downgrade the missing-tree case applies.
+                sessions.push(json!({
+                    "id": session_id,
+                    "warning": format!("Config tree in session {session_id} could not be read: {err}"),
+                    "files": [],
+                }));
+                summary_parts.push(format!("{session_id}: unreadable"));
+                continue;
+            }
+        };
         let files = diff_trees(&base_files, &session_files, &edited);
         let changed = files.iter().filter(|file| file["status"] != "same").count();
         let total = files.len();
