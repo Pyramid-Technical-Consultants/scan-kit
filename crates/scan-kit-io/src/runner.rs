@@ -570,6 +570,16 @@ impl std::io::Read for DeadlineStream {
 
 impl std::io::Write for DeadlineStream {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        // socket.read() writes internally (auto-pong) — the armed deadline
+        // bounds those writes too.
+        let Some(remaining) = self.deadline.checked_duration_since(Instant::now()) else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "websocket message deadline",
+            ));
+        };
+        self.stream
+            .set_write_timeout(Some(remaining.max(Duration::from_millis(1))))?;
         self.stream.write(buf)
     }
 
@@ -579,13 +589,27 @@ impl std::io::Write for DeadlineStream {
 }
 
 fn dial(endpoint: &str) -> Result<WebSocket<DeadlineStream>, String> {
-    let addr = endpoint
+    let addrs: Vec<_> = endpoint
         .to_socket_addrs()
         .map_err(|err| err.to_string())?
-        .next()
-        .ok_or_else(|| format!("invalid host: {endpoint}"))?;
-    let stream = TcpStream::connect_timeout(&addr, Duration::from_secs(10))
-        .map_err(|err| err.to_string())?;
+        .collect();
+    if addrs.is_empty() {
+        return Err(format!("invalid host: {endpoint}"));
+    }
+    // Every record gets a shot — the first address can be dead while a
+    // sibling A/AAAA record answers.
+    let mut last_err = String::new();
+    let mut stream = None;
+    for addr in addrs {
+        match TcpStream::connect_timeout(&addr, Duration::from_secs(10)) {
+            Ok(found) => {
+                stream = Some(found);
+                break;
+            }
+            Err(err) => last_err = err.to_string(),
+        }
+    }
+    let stream = stream.ok_or(last_err)?;
     stream.set_nodelay(true).ok();
     // The upgrade handshake reads the 101 response on the bare stream —
     // without a read deadline a peer that accepts but never upgrades
@@ -708,6 +732,12 @@ fn unwrap_update(value: &rmpv::Value) -> rmpv::Value {
     // first element.
     if let rmpv::Value::Map(pairs) = value {
         if pairs.iter().any(|(key, _)| key.as_str() == Some("$d")) {
+            // A history map whose $ts blob is too short fell through
+            // history_last — the raw array's first element is the OLDEST
+            // sample, not the current one.
+            if pairs.iter().any(|(key, _)| key.as_str() == Some("$ts")) {
+                return rmpv::Value::Nil;
+            }
             return decode_blobs(value);
         }
     }
@@ -961,7 +991,15 @@ pub(crate) fn http_tuned(
         }
         match stream.read(&mut chunk) {
             Ok(0) => break,
-            Ok(count) => raw.extend_from_slice(&chunk[..count]),
+            Ok(count) => {
+                raw.extend_from_slice(&chunk[..count]);
+                // A keep-alive peer may hold the socket open past a complete
+                // response — waiting for EOF would read a full timeout and
+                // then error on a perfectly good answer.
+                if response_complete(&raw) {
+                    break;
+                }
+            }
             // A stall mid-body is truncation, not EOF — surface it rather than
             // handing a partial response to the parser.
             Err(err) if err.kind() == std::io::ErrorKind::TimedOut => {
@@ -999,6 +1037,56 @@ pub(crate) fn http_tuned(
         Ok(body[..length].to_vec())
     } else {
         Ok(body.to_vec())
+    }
+}
+
+/// True once the headers and the declared body are all in — Content-Length
+/// reached, or a chunked body carrying its empty terminal chunk.
+fn response_complete(raw: &[u8]) -> bool {
+    let Some(split) = raw.windows(4).position(|window| window == b"\r\n\r\n") else {
+        return false;
+    };
+    let header = String::from_utf8_lossy(&raw[..split]);
+    let body = &raw[split + 4..];
+    if header
+        .to_ascii_lowercase()
+        .contains("transfer-encoding: chunked")
+    {
+        chunked_complete(body)
+    } else if let Some(length) = content_length(&header) {
+        body.len() >= length
+    } else {
+        // Close-delimited body — the peer's EOF is the terminator.
+        false
+    }
+}
+
+/// True only when the buffered chunks end exactly on the terminal 0-size
+/// chunk — a byte-suffix match can fire early on data ending "0\r\n".
+fn chunked_complete(mut data: &[u8]) -> bool {
+    loop {
+        let Some(end) = data.windows(2).position(|window| window == b"\r\n") else {
+            return false;
+        };
+        let line = std::str::from_utf8(&data[..end]).unwrap_or("");
+        let Ok(size) = usize::from_str_radix(line.split(';').next().unwrap_or("").trim(), 16)
+        else {
+            return false;
+        };
+        let Some(next) = end
+            .checked_add(2)
+            .and_then(|at| at.checked_add(size))
+            .and_then(|at| at.checked_add(2))
+        else {
+            return false;
+        };
+        if data.len() < next {
+            return false;
+        }
+        if size == 0 {
+            return true;
+        }
+        data = &data[next..];
     }
 }
 
@@ -1303,6 +1391,17 @@ mod tests {
             json_of(&unwrap_update(&rmpv::Value::from("plain"))),
             json!("plain")
         );
+        // A $ts that cannot hold even one timestamp makes the blob invalid —
+        // the update must be dropped, not unwrapped.
+        let bad_ts = rmpv::Value::Map(vec![
+            (rmpv::Value::from("$t"), rmpv::Value::from(1i64)),
+            (
+                rmpv::Value::from("$d"),
+                rmpv::Value::Binary(f32_blob.clone()),
+            ),
+            (rmpv::Value::from("$ts"), rmpv::Value::Binary(vec![0])),
+        ]);
+        assert_eq!(unwrap_update(&bad_ts), rmpv::Value::Nil);
 
         assert_eq!(content_length("Host: x\r\nContent-Length: 4\r\n"), Some(4));
         assert_eq!(content_length("Host: x"), None);
@@ -1505,5 +1604,38 @@ mod tests {
         let before = DISCONNECTS.load(Ordering::Acquire);
         disconnect();
         assert!(DISCONNECTS.load(Ordering::Acquire) > before);
+    }
+    #[test]
+    fn a_response_is_only_complete_with_its_body_or_terminal_chunk() {
+        let header = |head: &str, body: &[u8]| {
+            let mut raw = head.replace("\n", "\r\n").into_bytes();
+            raw.extend_from_slice(body);
+            raw
+        };
+        // Content-Length: full body buffered.
+        let full = header("HTTP/1.1 200 OK\nContent-Length: 3\n\n", b"abc");
+        assert!(response_complete(&full));
+        assert!(!response_complete(&full[..full.len() - 1]));
+        // Chunked: only the terminal zero-length chunk closes the stream.
+        let open = header(
+            "HTTP/1.1 200 OK\nTransfer-Encoding: chunked\n\n",
+            b"3\r\nabc\r\n",
+        );
+        assert!(!response_complete(&open));
+        let closed = header(
+            "HTTP/1.1 200 OK\nTransfer-Encoding: chunked\n\n",
+            b"3\r\nabc\r\n0\r\n\r\n",
+        );
+        assert!(response_complete(&closed));
+        // A chunk whose data ends "0\r\n" produces the same byte suffix
+        // as the terminal chunk — the framing scan must not fire early.
+        let trap = header(
+            "HTTP/1.1 200 OK\nTransfer-Encoding: chunked\n\n",
+            b"4\r\na0\r\n\r\n",
+        );
+        assert!(!response_complete(&trap));
+        // Close-delimited bodies need EOF, so a bare header is incomplete.
+        let bare = header("HTTP/1.1 204 No Content\n\n", b"");
+        assert!(!response_complete(&bare));
     }
 }

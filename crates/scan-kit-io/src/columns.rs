@@ -371,8 +371,16 @@ fn read_indexed(bytes: &[u8], indexes: &[usize]) -> Result<IndexedCsv, String> {
     // The header row is consumed so the records below are data.
     reader.headers().map_err(|err| err.to_string())?;
     let mut columns = vec![Vec::new(); indexes.len()];
+    // A dense 4 GiB CSV expands ~8x into Option<f64> cells — bound the
+    // materialized total before it allocates tens of GB.
+    const MAX_CELLS: usize = 1 << 27;
+    let mut cells = 0usize;
     for record in reader.records() {
         let record = record.map_err(|err| err.to_string())?;
+        cells += indexes.len();
+        if cells > MAX_CELLS {
+            return Err("the table is too large".into());
+        }
         for (slot, index) in indexes.iter().enumerate() {
             let cell = record.get(*index).and_then(parse_cell);
             columns[slot].push(cell);

@@ -341,9 +341,7 @@ mod net {
     impl SftpFs {
         fn connect(remote: &Remote, password: &str) -> Result<Self, String> {
             let port = remote.port.unwrap_or(22);
-            let address = resolve(&remote.host, port)?;
-            let tcp = std::net::TcpStream::connect_timeout(&address, location::connect_timeout())
-                .map_err(|err| err.to_string())?;
+            let tcp = connect_any(&remote.host, port)?;
             let _ = tcp.set_read_timeout(Some(location::connect_timeout()));
             let _ = tcp.set_write_timeout(Some(location::connect_timeout()));
             let mut session = ssh2::Session::new().map_err(|err| err.to_string())?;
@@ -620,7 +618,6 @@ mod net {
     impl FtpFs {
         fn connect(remote: &Remote, password: &str, tls: bool) -> Result<Self, String> {
             let port = remote.port.unwrap_or(21);
-            let address = resolve(&remote.host, port)?;
             let user = if remote.username.is_empty() {
                 "anonymous"
             } else {
@@ -634,9 +631,7 @@ mod net {
             // connect_timeout only bounds the handshake — without socket
             // timeouts a silent or stalled server hangs every command and
             // transfer forever. Same pattern as SftpFs::connect.
-            let control =
-                std::net::TcpStream::connect_timeout(&address, location::connect_timeout())
-                    .map_err(|err| err.to_string())?;
+            let control = connect_any(&remote.host, port)?;
             let _ = control.set_read_timeout(Some(location::connect_timeout()));
             let _ = control.set_write_timeout(Some(location::connect_timeout()));
             let data = |addr: std::net::SocketAddr| {
@@ -1154,17 +1149,34 @@ mod net {
         }
     }
 
-    fn resolve(host: &str, port: u16) -> Result<std::net::SocketAddr, String> {
+    fn resolve(host: &str, port: u16) -> Result<Vec<std::net::SocketAddr>, String> {
         let host = host.trim_matches(['[', ']']);
         let text = if host.contains(':') {
             format!("[{host}]:{port}")
         } else {
             format!("{host}:{port}")
         };
-        text.to_socket_addrs()
+        let addrs: Vec<_> = text
+            .to_socket_addrs()
             .map_err(|err| err.to_string())?
-            .next()
-            .ok_or_else(|| format!("could not resolve {text}"))
+            .collect();
+        if addrs.is_empty() {
+            return Err(format!("could not resolve {text}"));
+        }
+        Ok(addrs)
+    }
+
+    /// Every resolved record gets a shot — a dead first address should not
+    /// wedge the connect when a sibling A/AAAA answers.
+    fn connect_any(host: &str, port: u16) -> Result<std::net::TcpStream, String> {
+        let mut last_err = String::new();
+        for addr in resolve(host, port)? {
+            match std::net::TcpStream::connect_timeout(&addr, location::connect_timeout()) {
+                Ok(tcp) => return Ok(tcp),
+                Err(err) => last_err = err.to_string(),
+            }
+        }
+        Err(last_err)
     }
 
     #[cfg(test)]
@@ -1194,8 +1206,8 @@ mod net {
             );
             assert_eq!(days_from_civil(1970, 1, 1), 0);
             assert!(days_from_civil(1969, 12, 31) < 0);
-            assert_eq!(resolve("127.0.0.1", 9).unwrap().port(), 9);
-            assert_eq!(resolve("[::1]", 9).unwrap().port(), 9);
+            assert_eq!(resolve("127.0.0.1", 9).unwrap()[0].port(), 9);
+            assert_eq!(resolve("[::1]", 9).unwrap()[0].port(), 9);
             assert!(tls_config().is_ok());
             assert_eq!(base64(b"a"), "YQ==");
             assert_eq!(base64(b"ab"), "YWI=");

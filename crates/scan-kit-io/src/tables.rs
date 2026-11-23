@@ -3627,6 +3627,9 @@ fn timeslice_layer_marks(root: &Path, session: &str) -> Vec<f32> {
                 let Some(id) = ids.get(row).copied().filter(|value| value.is_finite()) else {
                     continue;
                 };
+                if id.abs() >= 9e18 {
+                    continue;
+                }
                 note_layer(
                     &mut marks,
                     &mut previous,
@@ -3887,10 +3890,13 @@ pub(crate) fn spot_delivery_ms(timestamp: &[f64], layer: &[f32]) -> Vec<f32> {
     let mut previous: Option<f64> = None;
     for index in 0..n {
         if timestamp[index].is_finite() && layer[index].is_finite() {
-            groups
-                .entry(layer[index].round() as i64)
-                .or_default()
-                .push(index);
+            let rounded = layer[index].round();
+            // A value past i64 range saturates the cast — distinct layers
+            // would merge into one group.
+            if rounded.abs() >= 9e18 {
+                continue;
+            }
+            groups.entry(rounded as i64).or_default().push(index);
         }
     }
     for indices in groups.values_mut() {

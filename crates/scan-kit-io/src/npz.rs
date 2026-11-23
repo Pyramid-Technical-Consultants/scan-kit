@@ -137,6 +137,9 @@ impl Npy {
 pub fn read_npz(bytes: &[u8]) -> Result<BTreeMap<String, Npy>, String> {
     let mut archive = zip::ZipArchive::new(Cursor::new(bytes)).map_err(|err| err.to_string())?;
     let mut files = BTreeMap::new();
+    // Per-member caps still let a crafted archive request N × 4 GiB —
+    // bound the decompressed total like the session readers do.
+    let mut total = 0u64;
     for index in 0..archive.len() {
         let mut file = archive.by_index(index).map_err(|err| err.to_string())?;
         let name = file.name().map_err(|err| err.to_string())?;
@@ -157,6 +160,10 @@ pub fn read_npz(bytes: &[u8]) -> Result<BTreeMap<String, Npy>, String> {
         }
         let raw =
             crate::discover::read_capped(&mut file, &name, crate::discover::MAX_MEMBER_BYTES)?;
+        total = total.saturating_add(raw.len() as u64);
+        if total > crate::discover::MAX_MEMBER_BYTES {
+            return Err("the npz archive is too large".into());
+        }
         if files.insert(name.clone(), parse_npy(&raw)?).is_some() {
             return Err(format!("duplicate npz member {name}"));
         }

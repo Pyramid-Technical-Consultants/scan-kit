@@ -127,7 +127,7 @@ pub fn load_study(path: &Path) -> Result<PatientStudy, String> {
     // in sorted order — a merged folder can hold more than one patient.
     let mut identities: std::collections::BTreeMap<String, (String, String, String)> =
         std::collections::BTreeMap::new();
-    for file in crate::dicom_files(path) {
+    for file in crate::dicom_files(path)? {
         // Unreadable files and oversized files are loud failures — an I/O
         // error that silently skipped a CT slice would drop it from the
         // volume without a trace. Same per-file ceiling as read_ion_plan.
@@ -193,7 +193,10 @@ pub fn load_study(path: &Path) -> Result<PatientStudy, String> {
                 continue;
             }
             dose_seen = true;
-            let scale = float_tag(&elems, tag(0x3004, 0x000E)).unwrap_or(1.0);
+            // Type 1 required — absent means raw stored counts would read
+            // as Gy, off by the scale's ~1e-5.
+            let scale =
+                float_tag(&elems, tag(0x3004, 0x000E)).ok_or("dose grid scaling is missing")?;
             if !scale.is_finite() {
                 return Err("dose grid scaling is not finite".into());
             }
@@ -322,7 +325,9 @@ pub fn read_ion_plan(path: &Path) -> Result<IonPlan, String> {
         }
         let mut energy = 0.0f32;
         for cp in seq(beam, tag(0x300A, 0x03A8)) {
-            energy = float_tag(cp, tag(0x300A, 0x0114)).unwrap_or(energy);
+            energy = float_tag(cp, tag(0x300A, 0x0114))
+                .filter(|value| value.is_finite())
+                .unwrap_or(energy);
             let n = int_tag(cp, tag(0x300A, 0x0392)).unwrap_or(0).max(0) as usize;
             let xy = floats_tag(cp, tag(0x300A, 0x0394));
             if n == 0 || xy.is_empty() {
@@ -337,6 +342,11 @@ pub fn read_ion_plan(path: &Path) -> Result<IonPlan, String> {
                 (f32::NAN, f32::NAN)
             };
             let limit = n.min(xy.len() / 2);
+            // The weights tag must hold one entry per spot position — a
+            // short array would silently drop the tail of the beam.
+            if has_weights && weights.len() < limit {
+                return Err("meterset weights do not match the spot count".into());
+            }
             for i in 0..limit {
                 let mu = if has_weights {
                     weights.get(i).copied().unwrap_or(f32::NAN)
@@ -857,12 +867,19 @@ fn read_plan(elems: &[Elem], frame: String) -> Result<Plan, String> {
             return Err(format!("beam {number} has no meterset"));
         }
         let setup = int_tag(beam, tag(0x300C, 0x006A)).unwrap_or(1);
-        let position = setups
-            .iter()
-            .find(|(id, _)| *id == setup)
-            .map(|(_, name)| name.clone())
-            .filter(|name| !name.is_empty())
-            .unwrap_or_else(|| "HFS".into());
+        // The setup sequence is optional — but when it exists, an
+        // unresolvable or empty position cannot default to "HFS": the
+        // support matrix would mirror the beam geometry of an FFS patient.
+        let position = if setups.is_empty() {
+            "HFS".to_owned()
+        } else {
+            setups
+                .iter()
+                .find(|(id, _)| *id == setup)
+                .map(|(_, name)| name.clone())
+                .filter(|name| !name.is_empty())
+                .ok_or_else(|| format!("beam {number} has no patient position"))?
+        };
         let mut shifter_ids = Vec::new();
         for item in seq(beam, tag(0x300A, 0x0314)) {
             let id = int_tag(item, tag(0x300A, 0x0316)).unwrap_or(0);
@@ -878,8 +895,11 @@ fn read_plan(elems: &[Elem], frame: String) -> Result<Plan, String> {
         }
         let mut energy = f32::NAN;
         let mut gantry = 0.0;
+        let mut gantry_seen = false;
         let mut couch = 0.0;
+        let mut couch_seen = false;
         let mut iso = [0.0f32; 3];
+        let mut iso_seen = false;
         let mut in_shifters: Vec<(i32, f32, f32)> = Vec::new();
         let mut spots = Vec::new();
         for cp in seq(beam, tag(0x300A, 0x03A8)) {
@@ -888,15 +908,18 @@ fn read_plan(elems: &[Elem], frame: String) -> Result<Plan, String> {
             energy = float_tag(cp, tag(0x300A, 0x0114))
                 .filter(|value| value.is_finite())
                 .unwrap_or(energy);
-            gantry = float_tag(cp, tag(0x300A, 0x011E))
-                .filter(|value| value.is_finite())
-                .unwrap_or(gantry);
-            couch = float_tag(cp, tag(0x300A, 0x0122))
-                .filter(|value| value.is_finite())
-                .unwrap_or(couch);
+            if let Some(value) = float_tag(cp, tag(0x300A, 0x011E)).filter(|v| v.is_finite()) {
+                gantry = value;
+                gantry_seen = true;
+            }
+            if let Some(value) = float_tag(cp, tag(0x300A, 0x0122)).filter(|v| v.is_finite()) {
+                couch = value;
+                couch_seen = true;
+            }
             let iso_raw = floats_tag(cp, tag(0x300A, 0x012C));
             if iso_raw.len() >= 3 && iso_raw[..3].iter().all(|value| value.is_finite()) {
                 iso = [iso_raw[0], iso_raw[1], iso_raw[2]];
+                iso_seen = true;
             }
             for setting in seq(cp, tag(0x300A, 0x0360)) {
                 let shifter_number = int_tag(setting, tag(0x300C, 0x0100)).unwrap_or(0);
@@ -927,9 +950,16 @@ fn read_plan(elems: &[Elem], frame: String) -> Result<Plan, String> {
             let n = int_tag(cp, tag(0x300A, 0x0392)).unwrap_or(0).max(0) as usize;
             let xy = floats_tag(cp, tag(0x300A, 0x0394));
             let weights = floats_tag(cp, tag(0x300A, 0x0396));
+            let has_weights = elem(cp, tag(0x300A, 0x0396)).is_some();
             let spot_size_mm = scanning_spot_mm(cp);
             if n == 0 || !energy.is_finite() {
                 continue;
+            }
+            let limit = n.min(xy.len() / 2);
+            if has_weights && weights.len() < limit {
+                return Err(format!(
+                    "beam {number}: meterset weights do not match the spot count"
+                ));
             }
             if in_shifters.len() > 1 {
                 return Err(format!(
@@ -948,7 +978,7 @@ fn read_plan(elems: &[Elem], frame: String) -> Result<Plan, String> {
                 ),
                 None => (String::new(), 0.0, f32::NAN),
             };
-            for i in 0..n.min(xy.len() / 2) {
+            for i in 0..limit {
                 let mu = weights.get(i).copied().unwrap_or(0.0) * meterset / final_weight;
                 if mu > 0.0 {
                     spots.push(Spot {
@@ -963,6 +993,11 @@ fn read_plan(elems: &[Elem], frame: String) -> Result<Plan, String> {
                     });
                 }
             }
+        }
+        if !gantry_seen || !couch_seen || !iso_seen {
+            return Err(format!(
+                "beam {number} has no isocenter or gantry/couch angle"
+            ));
         }
         beams.push(Beam {
             number,
@@ -1260,6 +1295,11 @@ fn parse_dataset_mode(bytes: &[u8], implicit: bool, depth: u32) -> Result<Vec<El
             bytes: if seq { Vec::new() } else { value.to_vec() },
         });
         cursor = end;
+    }
+    // A cut mid-header leaves trailing bytes the loop never reads — NUL
+    // padding is still tolerated, but a truncated tag is not silently dropped.
+    if bytes[cursor..].iter().any(|byte| *byte != 0) {
+        return Err("the dataset ends inside an element header".into());
     }
     Ok(elems)
 }
@@ -2073,6 +2113,8 @@ mod tests {
         iv_sq(&mut group, 0x300C, 0x0004, &[ref_beam]);
         let mut cp = Vec::new();
         iv(&mut cp, 0x300A, 0x0114, &even("100"));
+        iv(&mut cp, 0x300A, 0x011E, &even("0"));
+        iv(&mut cp, 0x300A, 0x0122, &even("0"));
         iv(&mut cp, 0x300A, 0x012C, &even("0\\0\\0"));
         iv(&mut cp, 0x300A, 0x0392, &even("1"));
         // Spot position and weight arrays ride as raw f32 (OF) in real plans.
@@ -2382,6 +2424,8 @@ mod tests {
         }
         let mut cp = Vec::new();
         ds(&mut cp, 0x300A, 0x0114, &[100.0]).unwrap();
+        ds(&mut cp, 0x300A, 0x011E, &[0.0]).unwrap();
+        ds(&mut cp, 0x300A, 0x0122, &[0.0]).unwrap();
         ds(&mut cp, 0x300A, 0x012C, &[0.0, 0.0, 0.0]).unwrap();
         sq(&mut cp, 0x300A, 0x0360, &setting_items).unwrap();
         is(&mut cp, 0x300A, 0x0392, 1).unwrap();
@@ -2411,6 +2455,10 @@ mod tests {
     }
 
     fn plan_with_spot_count(declared: i32, pairs: usize) -> Vec<Elem> {
+        plan_with_weights(declared, pairs, declared.max(0) as usize)
+    }
+
+    fn plan_with_weights(declared: i32, pairs: usize, nweights: usize) -> Vec<Elem> {
         let mut ref_beam = Vec::new();
         is(&mut ref_beam, 0x300C, 0x0006, 1).unwrap();
         ds(&mut ref_beam, 0x300A, 0x0086, &[10.0]).unwrap();
@@ -2427,13 +2475,7 @@ mod tests {
             .flat_map(|i| [(i + 1) as f32, -((i + 1) as f32)])
             .collect();
         ds(&mut cp, 0x300A, 0x0394, &xy).unwrap();
-        ds(
-            &mut cp,
-            0x300A,
-            0x0396,
-            &vec![1.0; declared.max(0) as usize],
-        )
-        .unwrap();
+        ds(&mut cp, 0x300A, 0x0396, &vec![1.0; nweights]).unwrap();
         let mut beam = Vec::new();
         is(&mut beam, 0x300A, 0x00C0, 1).unwrap();
         ds(&mut beam, 0x300A, 0x010E, &[1.0]).unwrap();
@@ -2703,5 +2745,89 @@ mod tests {
                 < find(&structures, [0x06, 0x30, 0x84, 0x00])
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_weight_map_short_of_the_spot_limit_is_an_error() {
+        // 3 declared spots with a single weight would silently zero weights
+        // 2 and 3 — the export must be rejected instead.
+        assert!(read_plan(&plan_with_weights(3, 3, 1), "f".into()).is_err());
+        assert!(read_plan(&plan_with_weights(3, 3, 3), "f".into()).is_ok());
+    }
+
+    #[test]
+    fn a_beam_without_beam_geometry_is_an_error() {
+        // Gantry/couch/isocenter are Type 1 in the control point; a plan that
+        // omits all of them must not ship zeroed origin geometry.
+        let mut cp = Vec::new();
+        ds(&mut cp, 0x300A, 0x0114, &[100.0]).unwrap();
+        is(&mut cp, 0x300A, 0x0392, 1).unwrap();
+        ds(&mut cp, 0x300A, 0x0394, &[1.0, -2.0]).unwrap();
+        ds(&mut cp, 0x300A, 0x0396, &[1.0]).unwrap();
+        let mut beam = Vec::new();
+        is(&mut beam, 0x300A, 0x00C0, 1).unwrap();
+        ds(&mut beam, 0x300A, 0x010E, &[1.0]).unwrap();
+        sq(&mut beam, 0x300A, 0x03A8, &[cp]).unwrap();
+        let mut plan = Vec::new();
+        sq(&mut plan, 0x300A, 0x03A2, &[beam]).unwrap();
+        assert!(read_plan(&parse_dataset(&plan).unwrap(), "f".into()).is_err());
+    }
+
+    #[test]
+    fn a_nan_energy_does_not_poison_the_next_control_point() {
+        // A corrupt NaN energy must not carry forward and silently drop the
+        // following control point's spots.
+        let mut cp0 = Vec::new();
+        ds(&mut cp0, 0x300A, 0x0114, &[100.0]).unwrap();
+        is(&mut cp0, 0x300A, 0x0392, 1).unwrap();
+        ds(&mut cp0, 0x300A, 0x0394, &[1.0, 2.0]).unwrap();
+        ds(&mut cp0, 0x300A, 0x0396, &[0.5]).unwrap();
+        let mut cp1 = Vec::new();
+        push_elem(&mut cp1, 0x300A, 0x0114, b"DS", b"nan").unwrap();
+        is(&mut cp1, 0x300A, 0x0392, 1).unwrap();
+        ds(&mut cp1, 0x300A, 0x0394, &[3.0, 4.0]).unwrap();
+        ds(&mut cp1, 0x300A, 0x0396, &[0.25]).unwrap();
+        let mut cp2 = Vec::new();
+        is(&mut cp2, 0x300A, 0x0392, 1).unwrap();
+        ds(&mut cp2, 0x300A, 0x0394, &[5.0, 6.0]).unwrap();
+        ds(&mut cp2, 0x300A, 0x0396, &[0.25]).unwrap();
+        let mut beam = Vec::new();
+        sq(&mut beam, 0x300A, 0x03A8, &[cp0, cp1, cp2]).unwrap();
+        let mut bytes = preamble();
+        ui(&mut bytes, 0x0008, 0x0016, "1.2.840.10008.5.1.4.1.1.481.8").unwrap();
+        sq(&mut bytes, 0x300A, 0x03A2, &[beam]).unwrap();
+        let path = std::env::temp_dir().join(format!("scan-kit-nan-{}.dcm", std::process::id()));
+        std::fs::write(&path, bytes).unwrap();
+        let plan = read_ion_plan(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        // The NaN control point keeps the previous 100 MeV rather than
+        // poisoning itself and cp2 with a NaN carry-forward.
+        assert_eq!(plan.spots.len(), 3);
+    }
+
+    #[test]
+    fn a_dose_without_grid_scaling_is_an_error() {
+        // DoseGridScaling is Type 1 — without it the raw stored counts would
+        // be read as Gy, off by the scale's ~1e-5.
+        let root = std::env::temp_dir().join(format!("scan-kit-noscale-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut bytes = preamble();
+        ui(&mut bytes, 0x0008, 0x0016, "1.2.840.10008.5.1.4.1.1.481.2").unwrap();
+        std::fs::write(root.join("dose.dcm"), bytes).unwrap();
+        assert!(load_study(&root).is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_trailing_partial_element_is_an_error() {
+        let mut bytes = Vec::new();
+        iv(&mut bytes, 0x0008, 0x0016, &even("1.2"));
+        let mut junk = bytes.clone();
+        junk.extend_from_slice(&[0x10, 0x00, 0x20]);
+        assert!(parse_dataset_mode(&junk, true, 0).is_err());
+        // Zero padding after the last element is tolerated.
+        let mut padded = bytes;
+        padded.extend_from_slice(&[0; 5]);
+        assert!(parse_dataset_mode(&padded, true, 0).is_ok());
     }
 }

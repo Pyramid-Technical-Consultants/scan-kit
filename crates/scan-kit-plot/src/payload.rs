@@ -290,6 +290,7 @@ pub fn encode_plot_reusing(
 fn read_sessions(
     reader: &mut Reader<'_>,
     count: u32,
+    voxel_budget: &mut usize,
 ) -> Result<Vec<scan_kit_core::SessionDose>, String> {
     let mut doses = Vec::new();
     for _ in 0..count {
@@ -305,6 +306,11 @@ fn read_sessions(
         ];
         let voxel = f32::from_le_bytes(reader.take(4)?.try_into().unwrap());
         let n = u32::from_le_bytes(reader.take(4)?.try_into().unwrap()) as usize;
+        // Each ~40-byte record can demand a ~1 GiB alloc — bound the
+        // cumulative total, not just each cube.
+        *voxel_budget = voxel_budget
+            .checked_sub(n)
+            .ok_or("plot payload volume is too large")?;
         let values = read_cube(reader, n)?;
         doses.push(scan_kit_core::SessionDose {
             values,
@@ -675,9 +681,20 @@ pub(crate) fn decode_plot(
             ],
         )?);
     }
-    volume.sessions = read_sessions(&mut reader, header.volume_sessions)?;
-    volume.plans = read_sessions(&mut reader, header.volume_plans)?;
-    volume.companions = read_sessions(&mut reader, header.volume_companions)?;
+    // Real scenes ship a handful of session cubes; a crafted count is a
+    // ~40-byte-per-GiB allocation amplifier.
+    if header
+        .volume_sessions
+        .saturating_add(header.volume_plans)
+        .saturating_add(header.volume_companions)
+        > 64
+    {
+        return Err("plot payload session count out of range".into());
+    }
+    let mut voxel_budget = 1usize << 30;
+    volume.sessions = read_sessions(&mut reader, header.volume_sessions, &mut voxel_budget)?;
+    volume.plans = read_sessions(&mut reader, header.volume_plans, &mut voxel_budget)?;
+    volume.companions = read_sessions(&mut reader, header.volume_companions, &mut voxel_budget)?;
     Ok((
         header,
         marks,
@@ -1262,5 +1279,30 @@ mod tests {
         out.extend(&json);
         out.extend(&bytes[4 + json_len..]);
         assert!(decode_plot(&out).is_err());
+    }
+
+    #[test]
+    fn session_cubes_share_a_voxel_budget() {
+        // Two small records can each demand a ~0.5 GiB cube — individually
+        // legal, but the cumulative budget must stop the second one.
+        let mut bytes = Vec::new();
+        for n in [1u32, 1 << 29] {
+            for value in [1u32, 1, 1] {
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+            for value in [0f32, 0.0, 0.0] {
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+            bytes.extend_from_slice(&1f32.to_le_bytes());
+            bytes.extend_from_slice(&n.to_le_bytes());
+            bytes.extend_from_slice(&n.to_le_bytes()); // zeros run
+            bytes.extend_from_slice(&0u32.to_le_bytes()); // literal run
+        }
+        let mut reader = Reader {
+            bytes: &bytes,
+            at: 0,
+        };
+        let mut budget = 1usize << 20;
+        assert!(read_sessions(&mut reader, 2, &mut budget).is_err());
     }
 }
