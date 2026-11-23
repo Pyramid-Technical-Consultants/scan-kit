@@ -46,7 +46,7 @@ import {
 import { usePageLoad } from "@/page-load";
 import { sessionColor, shownSessionIds } from "@/session-colors";
 import { acceptReport, bytesOf, driveTask, parsePoll, type Report } from "@/task-client";
-import { dismissNotice, notifyError, notifySaved } from "@/notify";
+import { dismissNotice, logError, notifyError, notifySaved } from "@/notify";
 import { ScrubBar, useScrub, type Scrub } from "@/scrub-bar";
 import { DoseBoard } from "@/DoseBoard";
 import { SidePane } from "@/SidePane";
@@ -486,9 +486,11 @@ export function AnalysisView({
           );
         }
       })
-      .catch(() => {
+      .catch((reason: unknown) => {
         if (live) {
-          setScanners((prev) => (prev.length === 0 ? prev : []));
+          // A store failure is not an empty registry - keep the loaded list
+          // and log the error instead of silently dropping custom scanners.
+          logError(reason);
         }
       });
     return () => {

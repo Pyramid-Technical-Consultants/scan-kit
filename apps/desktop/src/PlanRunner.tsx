@@ -302,6 +302,10 @@ export function PlanRunner() {
     try {
       const mine = {};
       copyToken.current = mine;
+      // The backend trims dest and reports capture warnings in the payload -
+      // the toast must point at the file it actually wrote.
+      let savedPath: string | null = null;
+      let savedMessage: string | null = null;
       await driveTask(
         {
           view: "runner_copy",
@@ -312,9 +316,21 @@ export function PlanRunner() {
           foreground: [],
           palette: [],
         },
-        (report) => {
+        (report, payload) => {
           if (copyToken.current === mine) {
             setCopyReport(report.finished ? null : report);
+            if (report.finished && payload != null) {
+              try {
+                const done = JSON.parse(new TextDecoder().decode(payload)) as {
+                  path?: string;
+                  message?: string;
+                };
+                savedPath = typeof done.path === "string" ? done.path : null;
+                savedMessage = typeof done.message === "string" ? done.message : null;
+              } catch {
+                // Fall through to the local dest on an unreadable payload.
+              }
+            }
           }
         },
         () => copyToken.current !== mine,
@@ -328,7 +344,10 @@ export function PlanRunner() {
       if (copyToken.current !== mine) {
         return;
       }
-      notifySaved(dest, { title: "Session saved" });
+      notifySaved(savedPath ?? dest, {
+        title: "Session saved",
+        description: savedMessage ?? undefined,
+      });
     } catch (reason: unknown) {
       notifyError(reason);
     } finally {
@@ -647,6 +666,11 @@ function Metric({
 function parentDir(path: string): string | null {
   const trimmed = path.replace(/[\\/]+$/, "");
   const index = Math.max(trimmed.lastIndexOf("/"), trimmed.lastIndexOf("\\"));
+  // A drive-root child has its separator at index 1 - the parent is
+  // "C:\", not the drive-relative "C:".
+  if (index === 1 && trimmed[1] === ":") {
+    return trimmed.slice(0, 2) + "\\";
+  }
   return index > 0 ? trimmed.slice(0, index) : null;
 }
 

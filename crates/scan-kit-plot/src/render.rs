@@ -1917,19 +1917,24 @@ impl Plot {
         let (second, third, integral, atlas_slice, ct_on) = if plane == 3 {
             (self.azimuth, self.elevation, 0.0, 0.0, 0.0)
         } else {
-            let (full, full_n, atlas_n, shown) = match plane {
-                1 => (self.cursor[1], grid.volume.shape[1], ny, march_shape[1]),
-                2 => (self.cursor[0], grid.volume.shape[0], nx, march_shape[0]),
-                _ => (self.cursor[2], grid.volume.shape[2], nz, march_shape[2]),
+            let (full, full_n, atlas_n, shown, axis) = match plane {
+                1 => (self.cursor[1], grid.volume.shape[1], ny, march_shape[1], 1),
+                2 => (self.cursor[0], grid.volume.shape[0], nx, march_shape[0], 0),
+                _ => (self.cursor[2], grid.volume.shape[2], nz, march_shape[2], 2),
             };
             let shown_n = shown.round().max(0.0) as usize;
             let lattice = if shown_n == full_n || shown_n == 0 {
                 full as f32
             } else {
-                // Source voxel  lives in pooled cell full/factor - a
-                // proportional scale lands off by one when factor does not
-                // divide full_n.
-                let factor = full_n.div_ceil(shown_n);
+                // Source voxel lives in pooled cell full/factor. The factor
+                // is the pooled-to-source spacing ratio - div_ceil(shown) is
+                // off by one when it does not divide the source dimension.
+                let spacing = self
+                    .volume_draw
+                    .as_ref()
+                    .map(|draw| draw.spacing)
+                    .unwrap_or(grid.volume.spacing);
+                let factor = (spacing[axis] / grid.volume.spacing[axis]).round().max(1.0) as usize;
                 (full / factor).min(shown_n - 1) as f32
             };
             let atlas_slice = if full_n == atlas_n {
@@ -6867,7 +6872,29 @@ fn labels_for(
     };
     let (x_range, y_range) = match slice {
         Some((b, _)) if swapped => ([b[2], b[3]], [b[0], b[1]]),
-        _ => ([camera.xmin, camera.xmax], [camera.ymin, camera.ymax]),
+        Some((b, t)) => {
+            // The window is display mm; source_mm un-mirrors it so ticks
+            // cover the same span in source coordinates.
+            let edge =
+                |x: f32, y: f32, axis: usize| crate::dose::source_mm(x, y, b, t).map(|p| p[axis]);
+            let span = |pair: (Option<f32>, Option<f32>), lo: f32, hi: f32| match pair {
+                (Some(a), Some(c)) => [a.min(c), a.max(c)],
+                _ => [lo, hi],
+            };
+            (
+                span(
+                    (edge(camera.xmin, 0.0, 0), edge(camera.xmax, 0.0, 0)),
+                    camera.xmin,
+                    camera.xmax,
+                ),
+                span(
+                    (edge(0.0, camera.ymin, 1), edge(0.0, camera.ymax, 1)),
+                    camera.ymin,
+                    camera.ymax,
+                ),
+            )
+        }
+        None => ([camera.xmin, camera.xmax], [camera.ymin, camera.ymax]),
     };
     let x_at = |v: f32| match slice {
         Some((b, t)) if swapped => crate::dose::display_mm(0.0, v, b, t)[0],
