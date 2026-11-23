@@ -1150,13 +1150,15 @@ fn march_color(uv: vec2<f32>, plot_h: f32) -> vec4<f32> {
     let reach = distance + length(box_e);
     let shell = max(6.0, 1.5 * world_per_pixel(reach, fy, plot_h));
     let wide = clip_box(eye, dir, box_o - vec3<f32>(shell), bmax + vec3<f32>(shell));
-    if (wide.z < 0.5 || wide.y < 0.0) { return zero_color(); }
+    // A ray with nothing to show is transparent on the CPU path - the panel
+    // background must show through here too, not the ramp's zero color.
+    if (wide.z < 0.5 || wide.y < 0.0) { return vec4<f32>(0.0); }
     let clip = clip_box(eye, dir, box_o, bmax);
     let t0 = max(clip.x, 0.0);
     let t1 = clip.y;
     let dist = t1 - t0;
     if (clip.z < 0.5 || dist < 0.001) {
-        return over_guides(zero_color(), cam, origin, extent, wide.y);
+        return over_guides(vec4<f32>(0.0), cam, origin, extent, wide.y);
     }
     let nstep = i32(clamp(ceil(dist / voxel), 1.0, 1024.0));
     let entry = eye + dir * t0;
@@ -1185,7 +1187,10 @@ fn march_color(uv: vec2<f32>, plot_h: f32) -> vec4<f32> {
         }
         let cell = (q - origin) / spacing;
         let occupancy = brick_of(cell);
-        if (occupancy <= 0.0 || (mode == 1u && occupancy <= peak)) {
+        // Cubic reconstruction overshoots the stored voxel max - the CPU
+        // march refuses the peak shortcut for it, so must the GPU.
+        if (occupancy <= 0.0
+            || (mode == 1u && u32(u.dose3.y + 0.5) != 2u && occupancy <= peak)) {
             i = i + steps_to_leave(cell, step_dir, spacing, voxel);
         } else {
             let dose = vol_sample(q);
@@ -1222,7 +1227,7 @@ fn march_color(uv: vec2<f32>, plot_h: f32) -> vec4<f32> {
         hit_t = wpos / wsum;
     }
     let opacity = clamp(u.dose2.w, 0.0, 1.0);
-    var color = zero_color();
+    var color = vec4<f32>(0.0);
     if (mode == 2u) {
         let covered = 1.0 - trans;
         if (covered >= 0.02) {
