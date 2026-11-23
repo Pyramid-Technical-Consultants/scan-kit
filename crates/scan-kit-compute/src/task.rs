@@ -202,18 +202,16 @@ pub fn start_task(
     let mut driver = lock();
     // This start ran its retarget off-lock; if a newer start claimed the slot
     // meanwhile it owns the slot — report it rather than evicting it.
-    if checked_id.is_some() {
-        if let Some(owner) = driver.plot.filter(|o| checked_id != Some(*o)) {
-            // This ticket belongs to a different view — mark it so the
-            // caller can tell its own request was superseded. A fabricated
-            // zero ticket: handing back the winner's live ticket would let
-            // a client that ignores the flag poll or cancel that task.
-            return Ok(json!({
-                "task": 0,
-                "generation": 0,
-                "superseded": true,
-            }));
-        }
+    if checked_id.is_some() && driver.plot.is_some_and(|o| checked_id != Some(o)) {
+        // This ticket belongs to a different view — mark it so the
+        // caller can tell its own request was superseded. A fabricated
+        // zero ticket: handing back the winner's live ticket would let
+        // a client that ignores the flag poll or cancel that task.
+        return Ok(json!({
+            "task": 0,
+            "generation": 0,
+            "superseded": true,
+        }));
     }
     let replaced = driver.take(&slot);
     let mut stage = build_stage(
