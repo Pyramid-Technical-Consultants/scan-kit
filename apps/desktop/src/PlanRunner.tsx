@@ -183,7 +183,9 @@ export function PlanRunner() {
             if (statusFailures.current >= 3) {
               setView((current) => ({ ...current, connected: false }));
             }
-            notifyError(reason, "runner-status");
+            // Toast the transitions (lost contact, went offline) — a
+            // persistent failure logs without re-toasting every interval.
+            notifyError(reason, "runner-status", statusFailures.current <= 3);
           }
         })
         .finally(() => {

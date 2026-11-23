@@ -69,10 +69,11 @@ pub fn catalog(db: &Path) -> Value {
     if connected {
         match read_status(false, "") {
             Ok(view) => {
+                // A dead socket is not "connected" even while live() still
+                // lists it - the view carries the real flag.
+                body["connected"] = json!(view["connected"].as_bool().unwrap_or(false));
                 body["view"] = view;
-                body["connected"] = json!(true);
             }
-            // A dead socket is not "connected" even while live() still lists it.
             Err(_) => body["connected"] = json!(false),
         }
     }
@@ -111,13 +112,16 @@ pub fn connect(db: &Path, host: &str) -> Result<Value, String> {
     let host = parse_host(host)?;
     disconnect();
     let generation = DISCONNECTS.load(Ordering::Acquire);
-    let mut socket = open_socket(&host)?;
-    send(&mut socket, "config", Some(config_body()))?;
-    let status = read_paths(&mut socket, STATUS_PATHS, Duration::from_secs(8))?;
+    let mut socket =
+        open_socket(&host).map_err(|err| format!("Could not connect to {host}: {err}"))?;
+    send(&mut socket, "config", Some(config_body()))
+        .map_err(|err| format!("{host} did not answer: {err}"))?;
+    let status = read_paths(&mut socket, STATUS_PATHS, Duration::from_secs(8))
+        .map_err(|err| format!("{host} did not answer: {err}"))?;
     // Each phase can stall on a trickling peer for a full read deadline —
     // a disconnect between phases must still be able to abort the connect.
     if DISCONNECTS.load(Ordering::Acquire) != generation {
-        return Err("connection changed".into());
+        return Err("The device reconnected during the action - please retry.".into());
     }
     let version = http_json(&host, "admin/version").unwrap_or(Value::Null);
     let device_type = http_json(&host, "admin/device_type").unwrap_or(Value::Null);
@@ -126,7 +130,7 @@ pub fn connect(db: &Path, host: &str) -> Result<Value, String> {
         .unwrap_or_else(|| DEFAULT_SESSION_ROOT.into());
     let session_id = session_capture::live_session_id(&host).unwrap_or_default();
     if DISCONNECTS.load(Ordering::Acquire) != generation {
-        return Err("connection changed".into());
+        return Err("The device reconnected during the action - please retry.".into());
     }
     let plan_path = with_store(db, |conn| store::runner_plan_path(conn))
         .ok()
@@ -138,7 +142,7 @@ pub fn connect(db: &Path, host: &str) -> Result<Value, String> {
         // A disconnect (or a queued connect's own disconnect) ran during the
         // open phase — it must not be overwritten by this install.
         if DISCONNECTS.load(Ordering::Acquire) != generation {
-            return Err("connection changed".into());
+            return Err("The device reconnected during the action - please retry.".into());
         }
         *guard = Some(Live {
             epoch: EPOCH.fetch_add(1, Ordering::Relaxed) + 1,
@@ -178,18 +182,35 @@ pub fn read_status(has_plan: bool, dest: &str) -> Result<Value, String> {
     // otherwise block even disconnecting for the full request timeout.
     let host = {
         let guard = lock();
-        guard.as_ref().ok_or("not connected")?.host.clone()
+        match guard.as_ref() {
+            Some(live) => live.host.clone(),
+            // Offline is a status answer, not an error — the UI polls this
+            // every few seconds before any device exists, and an error only
+            // surfaces as a bare "not connected" toast.
+            None => return Ok(runner_view(&json!({}), false, has_plan)),
+        }
     };
     let session_id = session_capture::live_session_id(&host);
     let mut guard = lock();
-    let live = guard.as_mut().ok_or("not connected")?;
+    let live = guard
+        .as_mut()
+        .ok_or("Not connected - connect to a device first.")?;
     // A disconnect/reconnect between the two locks could change the device.
     if live.host == host {
         if let Some(id) = session_id {
             live.session_id = id;
         }
     }
-    refresh(live, Duration::from_millis(500))?;
+    if let Err(err) = refresh(live, Duration::from_millis(500)) {
+        // refresh only fails on a dead socket (poll timeouts return Ok) —
+        // evict it so the next poll reports the disconnected state instead
+        // of re-toasting the same socket error every interval.
+        let host = live.host.clone();
+        if let Some(mut dead) = guard.take() {
+            let _ = dead.socket.close(None);
+        }
+        return Err(format!("Lost contact with {host}: {err}"));
+    }
     Ok(view_of(live, has_plan, dest))
 }
 
@@ -213,7 +234,9 @@ pub fn upload(db: &Path, csv_path: &Path) -> Result<Value, String> {
     // control actions for up to ~40s.
     let (host, epoch, target) = {
         let mut guard = lock();
-        let live = guard.as_mut().ok_or("not connected")?;
+        let live = guard
+            .as_mut()
+            .ok_or("Not connected - connect to a device first.")?;
         let epoch = live.epoch;
         set_field(
             &mut live.socket,
@@ -228,7 +251,7 @@ pub fn upload(db: &Path, csv_path: &Path) -> Result<Value, String> {
         let live = guard
             .as_mut()
             .filter(|live| live.epoch == epoch)
-            .ok_or("connection changed")?;
+            .ok_or("The device reconnected during the action - please retry.")?;
         let read = read_one(
             &mut live.socket,
             POINTS_UPLOAD_TARGET,
@@ -250,7 +273,7 @@ pub fn upload(db: &Path, csv_path: &Path) -> Result<Value, String> {
         let live = guard
             .as_mut()
             .filter(|live| live.epoch == epoch)
-            .ok_or("connection changed")?;
+            .ok_or("The device reconnected during the action - please retry.")?;
         set_field(&mut live.socket, POINTS_UPLOAD, &json!(true))?;
     }
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -260,7 +283,7 @@ pub fn upload(db: &Path, csv_path: &Path) -> Result<Value, String> {
             let live = guard
                 .as_mut()
                 .filter(|live| live.epoch == epoch)
-                .ok_or("connection changed")?;
+                .ok_or("The device reconnected during the action - please retry.")?;
             let state = read_one(&mut live.socket, POINTS_LOAD_STATE, Duration::from_secs(2))?;
             io_number(&state).map(|value| value as i64)
         };
@@ -282,7 +305,7 @@ pub fn upload(db: &Path, csv_path: &Path) -> Result<Value, String> {
         let live = guard
             .as_mut()
             .filter(|live| live.epoch == epoch)
-            .ok_or("connection changed")?;
+            .ok_or("The device reconnected during the action - please retry.")?;
         let valid = read_one(&mut live.socket, POINTS_VALID, Duration::from_secs(8))?;
         subscribe_status(&mut live.socket)?;
         if !io_bool(&valid) {
@@ -304,7 +327,7 @@ pub fn upload(db: &Path, csv_path: &Path) -> Result<Value, String> {
     // A reconnect during read_status would attach "Plan uploaded" to the new
     // device's view — the epoch check must run after the final HTTP window.
     if lock().as_ref().map(|live| live.epoch) != Some(epoch) {
-        return Err("connection changed".into());
+        return Err("The device reconnected during the action - please retry.".into());
     }
     body["target"] = json!(target);
     body["message"] = json!(format!("Plan uploaded to {target}."));
@@ -315,7 +338,9 @@ pub fn control(action: &str) -> Result<Value, String> {
     let button = control_button(action)?;
     let epoch = {
         let mut guard = lock();
-        let live = guard.as_mut().ok_or("not connected")?;
+        let live = guard
+            .as_mut()
+            .ok_or("Not connected - connect to a device first.")?;
         set_field(&mut live.socket, button, &json!(true))?;
         live.epoch
     };
@@ -323,13 +348,13 @@ pub fn control(action: &str) -> Result<Value, String> {
     // and the status read would report a different connection's state as the
     // actuation's result.
     if lock().as_ref().map(|live| live.epoch) != Some(epoch) {
-        return Err("connection changed".into());
+        return Err("The device reconnected during the action - please retry.".into());
     }
     let view = read_status(true, "")?;
     // read_status re-locks across its HTTP call - a reconnect inside that
     // window would report the new device's state as the actuation's result.
     if lock().as_ref().map(|live| live.epoch) != Some(epoch) {
-        return Err("connection changed".into());
+        return Err("The device reconnected during the action - please retry.".into());
     }
     Ok(view)
 }
@@ -350,7 +375,9 @@ pub fn download_with(
 ) -> Result<Value, String> {
     let (host, status, plan_path) = {
         let guard = lock();
-        let live = guard.as_ref().ok_or("not connected")?;
+        let live = guard
+            .as_ref()
+            .ok_or("Not connected - connect to a device first.")?;
         (
             live.host.clone(),
             live.status.clone(),
@@ -771,7 +798,7 @@ fn recv(
             }
             Ok(Some(value))
         }
-        Ok(Message::Close(_)) => Err("connection closed".into()),
+        Ok(Message::Close(_)) => Err("The device closed the connection.".into()),
         Ok(_) => Ok(None),
         Err(tungstenite::Error::Io(err))
             if err.kind() == std::io::ErrorKind::TimedOut
@@ -1878,5 +1905,50 @@ mod tests {
         assert_eq!(verified, 10);
         let body = b"5\r\nhello\r\n0\r\n\r\n";
         assert!(chunked_complete(body, &mut verified));
+    }
+
+    #[test]
+    fn a_dead_status_socket_is_evicted_and_the_next_poll_reports_disconnected() {
+        use std::net::TcpListener;
+        // Answer the upgrade then close — the status read must see a dead
+        // socket. The listener keeps accepting so the HTTP session-id probe
+        // fails fast instead of timing out.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        thread::spawn(move || {
+            let Ok((stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut socket = accept_mpack(stream);
+            let _ = socket.close(None);
+            while let Ok((stream, _)) = listener.accept() {
+                drop(stream);
+            }
+        });
+        let host = format!("127.0.0.1:{port}");
+        let socket = dial(&host).unwrap();
+        *lock() = Some(Live {
+            epoch: 1,
+            host: host.clone(),
+            socket,
+            status: Map::new(),
+            version: Value::Null,
+            device_type: Value::Null,
+            session_directory: String::new(),
+            session_id: String::new(),
+            plan_path: None,
+        });
+        // A parallel test's disconnect() can legitimately take the Live first
+        // — every interleaving must still end in the quiet disconnected
+        // state rather than a repeating socket error.
+        match read_status(false, "") {
+            Err(err) => assert!(
+                err.contains("Lost contact") || err.contains("Not connected"),
+                "{err}"
+            ),
+            Ok(view) => assert_eq!(view["connected"], json!(false)),
+        }
+        assert!(!live());
+        assert_eq!(read_status(false, "").unwrap()["connected"], json!(false));
     }
 }

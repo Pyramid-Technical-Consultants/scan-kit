@@ -67,13 +67,13 @@ pub fn field_subscribe_key(io_path: &str) -> String {
 pub fn parse_host(host: &str) -> Result<String, String> {
     let text = host.trim();
     if text.is_empty() {
-        return Err("host is required".into());
+        return Err("Enter an IP address or hostname.".into());
     }
     let authority = if let Some((_, rest)) = text.split_once("://") {
         let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
         if authority.is_empty() {
             // Never echo the input — it may carry user:password@ userinfo.
-            return Err("invalid host".into());
+            return Err("Invalid host - enter an IP address or hostname.".into());
         }
         authority.rsplit('@').next().unwrap_or(authority)
     } else {
@@ -90,7 +90,7 @@ pub fn parse_host(host: &str) -> Result<String, String> {
             .bytes()
             .any(|byte| byte.is_ascii_control() || byte == b' ')
     {
-        return Err("invalid host".into());
+        return Err("Invalid host - enter an IP address or hostname.".into());
     }
     Ok(authority.to_owned())
 }
