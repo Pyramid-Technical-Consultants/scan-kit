@@ -169,13 +169,17 @@ pub(crate) fn histogram_panel(
 
 fn uniform_edges(lo: f32, hi: f32, bins: usize) -> Vec<f32> {
     let bins = bins.max(1);
-    let (lo, hi) = if !lo.is_finite() || !hi.is_finite() || (hi - lo).abs() < 1e-12 {
+    // The span subtracts in f64 — a finite range wider than f32::MAX would
+    // otherwise overflow to +inf and NaN the first edge.
+    let span = f64::from(hi) - f64::from(lo);
+    let (lo, hi) = if !lo.is_finite() || !hi.is_finite() || span.abs() < 1e-12 {
         (lo - 0.5, (lo - 0.5) + 1.0)
     } else {
         (lo, hi)
     };
+    let span = f64::from(hi) - f64::from(lo);
     (0..=bins)
-        .map(|step| lo + (hi - lo) * step as f32 / bins as f32)
+        .map(|step| (f64::from(lo) + span * step as f64 / bins as f64) as f32)
         .collect()
 }
 
@@ -187,16 +191,16 @@ fn count_bins(edges: &[f32], values: &[f32]) -> Vec<f32> {
     }
     let lo = edges[0];
     let hi = edges[bins];
-    let span = hi - lo;
+    let span = f64::from(hi) - f64::from(lo);
     if !span.is_finite() || span <= 0.0 {
         return counts;
     }
-    let scale = bins as f32 / span;
+    let scale = bins as f64 / span;
     for value in values {
         if !value.is_finite() || *value < lo || *value > hi {
             continue;
         }
-        let mut index = ((*value - lo) * scale) as usize;
+        let mut index = ((f64::from(*value) - f64::from(lo)) * scale) as usize;
         if index >= bins {
             index = bins - 1;
         }
@@ -233,6 +237,15 @@ fn bar_outline(edges: &[f32], counts: &[f32]) -> Series {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_range_wider_than_f32_still_bins() {
+        let edges = uniform_edges(-2.0e38, 2.0e38, 4);
+        assert!(edges.iter().all(|edge| edge.is_finite()), "{edges:?}");
+        assert!(edges.windows(2).all(|w| w[0] <= w[1]), "{edges:?}");
+        let counts = count_bins(&edges, &[-2.0e38, 0.0, 2.0e38]);
+        assert_eq!(counts.iter().sum::<f32>(), 3.0, "{counts:?}");
+    }
 
     #[test]
     fn outlined_histogram_strokes_each_session_on_shared_edges() {
