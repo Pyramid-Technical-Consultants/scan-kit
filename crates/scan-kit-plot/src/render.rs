@@ -1548,6 +1548,11 @@ pub struct Plot {
     pan: [f32; 3],
     /// Float dose and dilated bricks for the 3D march. Absent until the first draw.
     volume_draw: Option<VolumeDraw>,
+    // Dose-plane guide ranges captured after a spliced line buffer is whole.
+    pending_guides: Vec<(usize, usize, usize)>,
+    // A deterministic volume-upload failure message — retrying allocates the
+    // same too-large textures every frame.
+    volume_failed: Option<String>,
     turns: Vec<u8>,
     /// Field outlines in slice millimetres. Drawn on the film, so they track the picture.
     guides: Vec<Vec<LineRec>>,
@@ -1660,6 +1665,8 @@ impl Plot {
             persp_fov: scan_kit_core::FOV_Y,
             pan: [0.0; 3],
             volume_draw: None,
+            pending_guides: Vec::new(),
+            volume_failed: None,
             turns: vec![0; panel_count],
             guides: vec![Vec::new(); panel_count],
             integral: vec![false; panel_count],
@@ -1720,6 +1727,10 @@ impl Plot {
     }
 
     pub(crate) fn attach_parts(&mut self, parts: DoseParts) {
+        // Uploaded marks/index tables describe the pre-attach buffers.
+        self.gpu = None;
+        self.kept_heats = None;
+        self.kept_line_buf = None;
         let DoseParts {
             grid,
             atlas: pixels,
@@ -1735,12 +1746,18 @@ impl Plot {
             if dose_plane(&title).is_some_and(|plane| plane < 3) {
                 let start = self.marks.panels[index].line_start as usize;
                 let count = self.marks.panels[index].line_count as usize;
-                self.guides[index] = self
-                    .marks
-                    .lines
-                    .get(start..start + count)
-                    .map(<[LineRec]>::to_vec)
-                    .unwrap_or_default();
+                if self.reuse_lines {
+                    // marks.lines holds only the decoded suffix — the batch
+                    // indices address the full buffer the splice restores.
+                    self.pending_guides.push((index, start, count));
+                } else {
+                    self.guides[index] = self
+                        .marks
+                        .lines
+                        .get(start..start + count)
+                        .map(<[LineRec]>::to_vec)
+                        .unwrap_or_default();
+                }
                 self.marks.panels[index].line_count = 0;
                 self.marks.panels[index].line_runs.clear();
             }
@@ -1766,6 +1783,7 @@ impl Plot {
         self.dose_atlas = Some(atlas);
         self.ramp_dirty = false;
         self.volume_draw = None;
+        self.volume_failed = None;
         self.atlas_stamp = self.atlas_stamp.wrapping_add(1);
         self.heat_revision = self.heat_revision.wrapping_add(1);
         if let Some(encoded) = self.encoded.as_mut() {
@@ -3923,7 +3941,11 @@ impl Plot {
     /// Keep heatmap textures when the pixels did not change.
     #[cfg(target_arch = "wasm32")]
     pub(crate) fn keep_heatmaps(&mut self, mut previous: Plot) {
-        if previous.marks.heatmaps != self.marks.heatmaps {
+        if previous.marks.heatmaps != self.marks.heatmaps
+            || previous.marks.heatmap_size != self.marks.heatmap_size
+            || previous.heat_revision != previous.heat_uploaded
+            || previous.ramp_dirty
+        {
             return;
         }
         if let Some(gpu) = previous.gpu.take() {
@@ -4008,6 +4030,19 @@ impl Plot {
         lines.truncate(prefix);
         lines.extend(suffix);
         self.marks.lines = lines;
+        if self.dose.is_some() && !self.pending_guides.is_empty() {
+            for (index, start, count) in std::mem::take(&mut self.pending_guides) {
+                if let Some(guides) = self.guides.get_mut(index) {
+                    *guides = self
+                        .marks
+                        .lines
+                        .get(start..start + count)
+                        .map(<[LineRec]>::to_vec)
+                        .unwrap_or_default();
+                }
+            }
+            self.refresh_dose_overlay();
+        }
     }
 
     fn flush_ramp(&mut self, queue: &wgpu::Queue) {
@@ -4093,6 +4128,17 @@ impl Plot {
     }
 
     fn ensure_volume(&mut self, gpu: &PlotGpu) -> Result<(), GpuError> {
+        if let Some(message) = &self.volume_failed {
+            return Err(GpuError::Message(message.clone()));
+        }
+        let result = self.ensure_volume_inner(gpu);
+        if let Err(GpuError::Message(message)) = &result {
+            self.volume_failed = Some(message.clone());
+        }
+        result
+    }
+
+    fn ensure_volume_inner(&mut self, gpu: &PlotGpu) -> Result<(), GpuError> {
         if self.volume_draw.is_some() || self.dose.is_none() {
             return Ok(());
         }
@@ -4105,6 +4151,19 @@ impl Plot {
             .saturating_sub(4)
             .max(1);
         let grid = self.dose.as_ref().unwrap();
+        // integral_planes is quadratic in the ORIGINAL shape (the pooled
+        // downsample below doesn't shrink it) — check the 2D limit before
+        // allocating the 3D textures, or a too-wide grid retries the whole
+        // upload every frame.
+        {
+            let [nx, ny, nz] = grid.volume.shape;
+            let limit = gpu.device.limits().max_texture_dimension_2d as usize;
+            if nx.max(ny) > limit || ny + nz + nz > limit {
+                return Err(GpuError::Message(
+                    "the integral plane layout exceeds the 2D texture limit".into(),
+                ));
+            }
+        }
         let max_axis = grid.volume.shape.iter().copied().max().unwrap_or(1);
         let (dose_tex, brick_tex, origin, spacing, line_scale, shape) = if max_axis
             <= limit as usize
@@ -4154,18 +4213,6 @@ impl Plot {
                 ],
             )
         };
-        // integral_planes is quadratic in the ORIGINAL shape (the pooled
-        // downsample above doesn't shrink it) — check the 2D limit before
-        // allocating the plane image, not after inside upload_r32_2d.
-        {
-            let [nx, ny, nz] = grid.volume.shape;
-            let limit = gpu.device.limits().max_texture_dimension_2d as usize;
-            if nx.max(ny) > limit || ny + nz + nz > limit {
-                return Err(GpuError::Message(
-                    "the integral plane layout exceeds the 2D texture limit".into(),
-                ));
-            }
-        }
         let (planes, plane_w, plane_h) = integral_planes(grid);
         let integral_tex = upload_r32_2d(&gpu.device, &gpu.queue, &planes, plane_w, plane_h)?;
         let group = volume_group(
@@ -10030,6 +10077,40 @@ mod tests {
         scene.volume.origin = [0.0, 0.0, -16.0];
         scene.volume.gantry = gantry;
         scene
+    }
+
+    #[test]
+    fn a_reuse_lines_payload_defers_slice_guides_until_the_splice() {
+        // Dose-plane guide ranges index the full line buffer — on a
+        // reuse_lines payload marks.lines is suffix-only at attach_parts
+        // time, so the capture must run after the splice.
+        let mut scene = dose_scene(2, vec![0.0; 8], 1, 0);
+        scene.panels[0].series.push(Series::Polyline {
+            xs: vec![0.0, 1.0],
+            ys: vec![0.0, 1.0],
+            color: [1.0; 4],
+            thickness: 1.0,
+        });
+        scene.panels[1].series.push(Series::Polyline {
+            xs: vec![5.0, 6.0],
+            ys: vec![5.0, 6.0],
+            color: [1.0; 4],
+            thickness: 1.0,
+        });
+        let bytes = crate::encode_plot(&scene, [0.0; 4], [1.0; 4]).unwrap();
+        let mut previous = Plot::from_payload(&bytes).unwrap();
+        let token = previous.line_token.to_string();
+        let again =
+            crate::encode_plot_reusing(&scene, [0.0; 4], [1.0; 4], "final", Some(&token)).unwrap();
+        let mut plot = Plot::from_payload(&again).unwrap();
+        assert!(plot.reuse_lines);
+        plot.splice_cached_lines(&mut previous);
+        assert_eq!(
+            plot.guides[0].len(),
+            1,
+            "the axial guide captured on splice"
+        );
+        assert!(plot.pending_guides.is_empty());
     }
 
     #[test]
