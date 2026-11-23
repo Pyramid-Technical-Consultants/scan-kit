@@ -66,7 +66,9 @@ pub fn load_timeslice_columns(root: &Path, session_id: &str) -> Value {
     json!({
         "session_id": session_id,
         "columns": listed,
-        "energy_layers": energy.len(),
+        // The energy column has one row per spot - layers are the distinct
+        // energies, not the row count.
+        "energy_layers": energy.iter().map(|e| e.to_bits()).collect::<std::collections::BTreeSet<_>>().len(),
     })
 }
 

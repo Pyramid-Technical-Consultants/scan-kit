@@ -200,6 +200,11 @@ fn tune_sigma(
     session_label: &str,
 ) -> Result<(String, Vec<String>, Vec<String>, Vec<Vec<Value>>, bool), String> {
     let tolerance = number(params, "sigma_tolerance_percent", 20.0)?.max(0.0);
+    // At >=100 the band degenerates to [0, inf) - coverage reads 100% green
+    // for any sigma and the tune means nothing.
+    if tolerance >= 100.0 {
+        return Err("sigma tolerance must be below 100%".into());
+    }
     let headroom = number(params, "sigma_lower_headroom_percent", 1.0)?.max(0.0);
     let mut warnings = Vec::new();
     let mut rows = Vec::new();
@@ -227,6 +232,7 @@ fn tune_sigma(
                 .filter(|(_, child)| is_sigma_band(child))
                 .map(|(index, _)| index)
                 .collect();
+            let mut claimed = vec![false; spots.energy.len()];
             for band_index in bands {
                 let band = &chamber.children[band_index];
                 let (min_e, max_e, k1, k2, k3, old) = match band_coeffs(band) {
@@ -236,7 +242,7 @@ fn tune_sigma(
                 if k1.abs() > 1e-12 || k2.abs() > 1e-12 || k3.abs() > 1e-12 {
                     continue;
                 }
-                let samples = paired(&spots.energy, sigmas, min_e, max_e);
+                let samples = paired(&spots.energy, sigmas, min_e, max_e, &mut claimed);
                 if samples.is_empty() {
                     continue;
                 }
@@ -1138,14 +1144,30 @@ fn band_coeffs(elem: &Elem) -> Option<(f64, f64, f64, f64, f64, f64)> {
     ))
 }
 
-fn paired(energy: &[f64], values: &[f64], min_e: f64, max_e: f64) -> Vec<f64> {
+fn paired(
+    energy: &[f64],
+    values: &[f64],
+    min_e: f64,
+    max_e: f64,
+    claimed: &mut [bool],
+) -> Vec<f64> {
+    // expected_mm resolves a spot to the FIRST band containing it - a spot
+    // on a shared boundary must not sample for both sides.
     energy
         .iter()
         .zip(values)
-        .filter(|(energy, value)| {
-            energy.is_finite() && value.is_finite() && **energy >= min_e && **energy <= max_e
+        .zip(claimed.iter_mut())
+        .filter(|((energy, value), used)| {
+            !**used
+                && energy.is_finite()
+                && value.is_finite()
+                && **energy >= min_e
+                && **energy <= max_e
         })
-        .map(|(_, value)| *value)
+        .map(|((_, value), used)| {
+            *used = true;
+            *value
+        })
         .collect()
 }
 
@@ -1177,8 +1199,10 @@ fn inside_fraction(sigmas: &[f64], k0: f64, tolerance: f64) -> f64 {
     if !k0.is_finite() || k0 == 0.0 {
         return f64::NAN;
     }
-    let lower = (k0 * (1.0 - tolerance / 100.0)).max(0.0);
-    let upper = (k0 * (1.0 + tolerance / 100.0)).max(0.0);
+    // band_k0 derives k0 as adjusted/(1-f); recomputing k0*(1-f) can round
+    // the edge one ulp past the sample that anchored it - absorb that ulp.
+    let lower = (k0 * (1.0 - tolerance / 100.0)).max(0.0).next_down();
+    let upper = (k0 * (1.0 + tolerance / 100.0)).max(0.0).next_up();
     let mut inside = 0usize;
     let mut total = 0usize;
     for sigma in sigmas {

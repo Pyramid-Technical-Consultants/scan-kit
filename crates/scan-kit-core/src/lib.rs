@@ -198,10 +198,18 @@ pub fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> 
                                 let _ = std::fs::remove_file(&bak);
                                 Ok(())
                             }
-                            Err(err) => {
-                                let _ = std::fs::rename(&bak, path);
-                                Err(err)
-                            }
+                            Err(err) => match std::fs::rename(&bak, path) {
+                                Ok(()) => Err(err),
+                                // The old file must not vanish silently - name
+                                // the .bak path so it stays recoverable.
+                                Err(restore) => Err(std::io::Error::new(
+                                    restore.kind(),
+                                    format!(
+                                        "{err}; restore failed, previous file kept at {}",
+                                        bak.display()
+                                    ),
+                                )),
+                            },
                         }
                     })
                     .inspect_err(|_| {

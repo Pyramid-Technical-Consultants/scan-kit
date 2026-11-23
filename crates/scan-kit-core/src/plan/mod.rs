@@ -329,7 +329,8 @@ pub fn validate_plan(template: &str, params: &Value) -> Vec<String> {
             errors
         }
         "iba_pld_plan" => {
-            let mut errors = validate_positive_float(params.get("beam_size_mm"), "Beam Size (mm)");
+            let mut errors =
+                validate_bounded_float(params.get("beam_size_mm"), "Beam Size (mm)", 0.001, 500.0);
             errors.extend(validate_spot_order(params));
             errors
         }
