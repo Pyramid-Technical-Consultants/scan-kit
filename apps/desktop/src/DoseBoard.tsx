@@ -161,6 +161,10 @@ function DoseCell({
       inputRef.current(panel);
     };
     const onKey = (event: KeyboardEvent) => {
+      // Ctrl+1/6 are the app's tab chords — the camera must not claim them.
+      if (event.ctrlKey && (event.key === "1" || event.key === "6")) {
+        return;
+      }
       const used = plots.current[panel]?.dose_key(event.key, event.ctrlKey) ?? false;
       if (!used) {
         return;

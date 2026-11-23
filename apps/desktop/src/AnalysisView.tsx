@@ -183,7 +183,7 @@ function NumberField({
         }}
         onBlur={(event) => commit(event.target.value)}
         onKeyDown={(event) => {
-          if (event.key === "Enter") {
+          if (event.key === "Enter" && !event.nativeEvent.isComposing) {
             commit(event.currentTarget.value);
           }
         }}
@@ -382,6 +382,7 @@ export function AnalysisView({
   const payload = useRef<Uint8Array | null>(null);
   const hold = useRef(0);
   const taskId = useRef(0);
+  const taskGen = useRef(0);
   const [taskReport, setTaskReport] = useState<Report | null>(null);
   const [exportBusy, setExportBusy] = useState(false);
   const [exportReport, setExportReport] = useState<Report | null>(null);
@@ -840,6 +841,7 @@ export function AnalysisView({
       }
       setPlotError(null);
       let polledTask: number | undefined;
+      let polledGeneration: number | undefined;
       void (async () => {
         issuedSeq.current = ticket;
         const run = () =>
@@ -876,7 +878,9 @@ export function AnalysisView({
           return;
         }
         taskId.current = started.task;
+        taskGen.current = started.generation;
         polledTask = started.task;
+        polledGeneration = started.generation;
         let misses = 0;
         for (;;) {
           if (stop || openSeq.current !== ticket) {
@@ -976,7 +980,10 @@ export function AnalysisView({
         // slot reuses task ids on retarget, so a superseded ticket's cancel
         // would kill its successor's live task.
         if (polledTask != null && openSeq.current === ticket) {
-          void invoke("scan_kit_cancel", { task: polledTask }).catch(() => {});
+          void invoke("scan_kit_cancel", {
+            task: polledTask,
+            generation: polledGeneration,
+          }).catch(() => {});
         }
         if (openSeq.current === ticket) {
           const message = messageOf(reason);
@@ -994,7 +1001,10 @@ export function AnalysisView({
       queueMicrotask(() => {
         if (hold.current === mine && id !== 0) {
           taskId.current = 0;
-          void invoke("scan_kit_cancel", { task: id }).catch(() => {});
+          // Pass the generation — the id can already be a retargeted
+          // successor's, and a ticket-less cancel would kill it.
+          void invoke("scan_kit_cancel", { task: id, generation: taskGen.current }).catch(() => {});
+          taskGen.current = 0;
         }
       });
     };
@@ -1057,6 +1067,10 @@ export function AnalysisView({
       requestDraw();
     };
     const onKey = (event: KeyboardEvent) => {
+      // Ctrl+1/6 are the app's tab chords — the camera must not claim them.
+      if (event.ctrlKey && (event.key === "1" || event.key === "6")) {
+        return;
+      }
       const used = plotter.current?.dose_key(event.key, event.ctrlKey) ?? false;
       if (!used) {
         return;
