@@ -5,7 +5,7 @@ use super::{bool_param, number, text, Draft, WEIGHT_SCALE};
 
 pub(super) fn spot_weights(rows: &[Draft], params: &Value) -> Result<Vec<f64>, String> {
     let method = text(params, "spot_weight_method", "fixed");
-    match method.as_str() {
+    let weights = match method.as_str() {
         "fixed" => {
             let weight = round4(number(params, "spot_weight_mu", 0.02));
             Ok(vec![weight; rows.len()])
@@ -31,7 +31,13 @@ pub(super) fn spot_weights(rows: &[Draft], params: &Value) -> Result<Vec<f64>, S
             number(params, "spot_weight_variance_pct", 10.0),
         ),
         _ => Err("Select a spot weight method.".into()),
+    }?;
+    // round4 can turn a huge-but-finite MU into inf and a tiny one into 0 —
+    // a device CSV must never carry either literal.
+    if weights.iter().any(|w| !(w.is_finite() && *w > 0.0)) {
+        return Err("Spot weights must be finite and positive.".into());
     }
+    Ok(weights)
 }
 
 pub(super) fn layer_even(rows: &[Draft], min_mu: f64, max_mu: f64, shuffle: bool) -> Vec<f64> {

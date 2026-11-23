@@ -305,8 +305,11 @@ pub fn validate_plan(template: &str, params: &Value) -> Vec<String> {
                 errors
                     .push("Layer transition must be Reset to Corner or Continue from End.".into());
             }
-            let per_layer = params.get("spots_x").and_then(as_int).unwrap_or(0)
-                * params.get("spots_y").and_then(as_int).unwrap_or(0);
+            let per_layer = params
+                .get("spots_x")
+                .and_then(as_int)
+                .unwrap_or(0)
+                .saturating_mul(params.get("spots_y").and_then(as_int).unwrap_or(0));
             errors.extend(validate_spot_budget(params, per_layer));
             errors.extend(validate_weights(params));
             errors
@@ -320,9 +323,11 @@ pub fn validate_plan(template: &str, params: &Value) -> Vec<String> {
                 errors.push("use_dicom_beam_size must be a boolean".to_owned());
             }
             if !bool_param(params, "use_dicom_beam_size", true) {
-                errors.extend(validate_positive_float(
+                errors.extend(validate_bounded_float(
                     params.get("beam_size_override_mm"),
                     "Beam Size (mm)",
+                    0.001,
+                    500.0,
                 ));
             }
             errors.extend(validate_spot_order(params));
@@ -345,8 +350,8 @@ pub fn dicom_beam_size(size_x: f64, size_y: f64, fallback: f64, use_dicom: bool)
         && size_y.is_finite()
         && size_x > 0.0
         && size_y > 0.0
-        && size_x < 500.0
-        && size_y < 500.0
+        && size_x <= 500.0
+        && size_y <= 500.0
     {
         (size_x + size_y) / 2.0
     } else {
@@ -623,15 +628,17 @@ fn validate_energies(params: &Value) -> Vec<String> {
 fn validate_weights(params: &Value) -> Vec<String> {
     let method = text(params, "spot_weight_method", "fixed");
     match method.as_str() {
-        "fixed" => validate_positive_float(params.get("spot_weight_mu"), "Spot Weight (MU)"),
-        "even_total" => validate_positive_float(
+        "fixed" => validate_min_float(params.get("spot_weight_mu"), "Spot Weight (MU)", 0.0001),
+        "even_total" => validate_min_float(
             params.get("spot_weight_total_mu"),
             "Target Total Weight (MU)",
+            0.0001,
         ),
         "random_total_variance" => {
-            let mut errors = validate_positive_float(
+            let mut errors = validate_min_float(
                 params.get("spot_weight_total_mu"),
                 "Target Total Weight (MU)",
+                0.0001,
             );
             if !errors.is_empty() {
                 return errors;
@@ -639,17 +646,31 @@ fn validate_weights(params: &Value) -> Vec<String> {
             errors.extend(validate_variance(params.get("spot_weight_variance_pct")));
             errors
         }
-        "random_range" | "layer_even_range" => validate_weight_range(params),
+        "random_range" => validate_weight_range(params),
+        "layer_even_range" => {
+            let mut errors = validate_weight_range(params);
+            if params
+                .get("spot_weight_layer_shuffle")
+                .is_some_and(|value| !value.is_boolean() && !value.is_null())
+            {
+                errors.push("Shuffle Order per Layer must be a boolean.".into());
+            }
+            errors
+        }
         _ => vec!["Select a spot weight method.".into()],
     }
 }
 
 fn validate_weight_range(params: &Value) -> Vec<String> {
-    let mut errors =
-        validate_positive_float(params.get("spot_weight_min_mu"), "Minimum Weight (MU)");
-    errors.extend(validate_positive_float(
+    let mut errors = validate_min_float(
+        params.get("spot_weight_min_mu"),
+        "Minimum Weight (MU)",
+        0.0001,
+    );
+    errors.extend(validate_min_float(
         params.get("spot_weight_max_mu"),
         "Maximum Weight (MU)",
+        0.0001,
     ));
     if !errors.is_empty() {
         return errors;
@@ -694,6 +715,10 @@ fn validate_spot_order(params: &Value) -> Vec<String> {
 }
 
 fn validate_bounded_float(value: Option<&Value>, label: &str, min: f64, max: f64) -> Vec<String> {
+    // The consumer defaults null the same as the bool fields do.
+    if value.is_some_and(Value::is_null) {
+        return Vec::new();
+    }
     let Some(number) = value.and_then(Value::as_f64) else {
         return vec![format!("{label} must be a number.")];
     };
@@ -708,15 +733,18 @@ fn validate_bounded_float(value: Option<&Value>, label: &str, min: f64, max: f64
     Vec::new()
 }
 
-fn validate_positive_float(value: Option<&Value>, label: &str) -> Vec<String> {
+fn validate_min_float(value: Option<&Value>, label: &str, min: f64) -> Vec<String> {
+    if value.is_some_and(Value::is_null) {
+        return Vec::new();
+    }
     let Some(number) = value.and_then(Value::as_f64) else {
         return vec![format!("{label} must be a number.")];
     };
     if !number.is_finite() {
         return vec![format!("{label} must be a finite number.")];
     }
-    if number <= 0.0 {
-        return vec![format!("{label} must be greater than zero.")];
+    if number < min {
+        return vec![format!("{label} must be at least {min}.")];
     }
     Vec::new()
 }
@@ -736,6 +764,9 @@ fn validate_spot_budget(params: &Value, per_layer: i64) -> Vec<String> {
 }
 
 fn validate_positive_int(value: Option<&Value>, label: &str, max: i64) -> Vec<String> {
+    if value.is_some_and(Value::is_null) {
+        return Vec::new();
+    }
     let Some(number) = value.and_then(as_int) else {
         return vec![format!("{label} must be an integer.")];
     };
@@ -1773,5 +1804,56 @@ Element,10,0,5,0.0
     fn sixty_seconds_rounds_to_an_hour_not_sixty_minutes() {
         assert_eq!(format_delivery(3599.9), "1 h");
         assert_eq!(format_delivery(3599.4), "59 min 59 s");
+    }
+
+    #[test]
+    fn a_weight_below_the_declared_minimum_is_rejected() {
+        // 4e-5 MU passes a plain >0 check but round4 quantizes it to a
+        // literal 0 CHARGE_REQ.
+        let errors = validate_plan(
+            "zero_field",
+            &json!({
+                "selected_energies": [250.0],
+                "spots_per_layer": 2,
+                "spot_weight_method": "fixed",
+                "spot_weight_mu": 0.00004
+            }),
+        );
+        assert!(errors.iter().any(|e| e.contains("at least")), "{errors:?}");
+    }
+
+    #[test]
+    fn a_huge_weight_errors_instead_of_writing_inf() {
+        // 1e306 validates as positive+finite but round4 overflows to inf.
+        let built = build_plan(
+            "zero_field",
+            &json!({
+                "selected_energies": [250.0],
+                "spots_per_layer": 2,
+                "spot_weight_method": "fixed",
+                "spot_weight_mu": 1e306
+            }),
+            PlanSource::Generate,
+            None,
+        );
+        assert!(built.is_err(), "an inf CHARGE_REQ must not be written");
+    }
+
+    #[test]
+    fn beam_size_override_obeys_its_declared_bounds() {
+        for size in [900.0, 0.0001] {
+            let errors = validate_plan(
+                "dicom_rt_plan",
+                &json!({
+                    "dicom_path": "x",
+                    "use_dicom_beam_size": false,
+                    "beam_size_override_mm": size
+                }),
+            );
+            assert!(
+                errors.iter().any(|e| e.contains("Beam Size")),
+                "{size}: {errors:?}"
+            );
+        }
     }
 }

@@ -535,9 +535,9 @@ pub fn splat_gaussians(
         for dz in -rz..=rz {
             for dy in -ry..=ry {
                 for dx in -rx..=rx {
-                    let ix = cx + dx;
-                    let iy = cy + dy;
-                    let iz = cz + dz;
+                    let ix = cx.saturating_add(dx);
+                    let iy = cy.saturating_add(dy);
+                    let iz = cz.saturating_add(dz);
                     if ix < 0
                         || iy < 0
                         || iz < 0
