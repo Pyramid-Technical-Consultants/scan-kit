@@ -286,7 +286,11 @@ mod tests {
 
     #[test]
     fn a_non_string_csv_is_an_error_not_a_generate() {
-        let err = synthesize(&serde_json::json!({"template": "csv_plan", "csv": 3}), Path::new("x")).unwrap_err();
+        let err = synthesize(
+            &serde_json::json!({"template": "csv_plan", "csv": 3}),
+            Path::new("x"),
+        )
+        .unwrap_err();
         assert!(err.contains("csv must be a string"), "{err}");
     }
 }
