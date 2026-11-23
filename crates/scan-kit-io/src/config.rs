@@ -138,7 +138,13 @@ pub fn save_folder(
         if !xml.trim_start().starts_with('<') {
             return Err(format!("{rel} is not XML"));
         }
-        under(dest, rel)?;
+        // Reject what would fail mid-write after earlier files already
+        // persisted — a directory at the rel path (also covers empty rel,
+        // which resolves to dest itself).
+        let target = under(dest, rel)?;
+        if target.is_dir() {
+            return Err(format!("{rel} is a directory at the destination"));
+        }
         writes.push((rel, xml));
     }
     let source_key = folder_key(source);
@@ -156,10 +162,13 @@ pub fn save_folder(
         // Without this the copy merges into whatever is already at dest —
         // stale configs survive with fresh sidecars. The removal runs after
         // the copy succeeds so a copy failure never deletes destination files.
-        let stale = list_xml(dest).unwrap_or_default();
+        // Stale/kept must cover every copied file, not just .xml — a
+        // removed non-XML file or an orphan .md5 sidecar would otherwise
+        // survive every save.
+        let stale = list_tree(dest).unwrap_or_default();
         // A failed source list would empty `kept` and delete every file at
         // dest — fail the save instead.
-        let kept: std::collections::HashSet<String> = list_xml(source)?.into_iter().collect();
+        let kept: std::collections::HashSet<String> = list_tree(source)?.into_iter().collect();
         copy_tree(source, dest, 0)?;
         for rel in stale.iter().filter(|rel| !kept.contains(*rel)) {
             if let Ok(stale) = under(dest, rel) {
@@ -293,6 +302,20 @@ pub fn diff(input: &Value) -> Result<Value, String> {
             if let Some(form) = input.get("form") {
                 text = apply_form(&text, form)?;
             }
+            // file_rel must normalize like the walked keys — a
+            // backslash/dot-dot spelling would land as a phantom "added"
+            // rel while the real file diffs stale bytes unflagged.
+            let mut parts = Vec::new();
+            for component in std::path::Path::new(file_rel).components() {
+                let std::path::Component::Normal(part) = component else {
+                    return Err(format!("file {file_rel:?} is not inside the config tree"));
+                };
+                parts.push(part.to_string_lossy().into_owned());
+            }
+            if parts.is_empty() {
+                return Err("file must name a config file".to_owned());
+            }
+            let file_rel = parts.join("/");
             let rel = match loaded_dir.strip_prefix(&base_root) {
                 Ok(sub) if !sub.as_os_str().is_empty() => {
                     format!("{}/{file_rel}", relative(&base_root, loaded_dir))
@@ -312,7 +335,11 @@ pub fn diff(input: &Value) -> Result<Value, String> {
     for session_id in &found {
         let session_root = discover::session_directory(root, session_id).join("config");
         // With pending edits the self column still shows the unsaved changes.
-        if edited.is_empty() && session_root.is_dir() && folder_key(&session_root) == base_key {
+        if edited.is_empty()
+            && session_root.is_dir()
+            && !session_root.is_symlink()
+            && folder_key(&session_root) == base_key
+        {
             sessions.push(json!({
                 "id": session_id,
                 "self": true,
@@ -321,7 +348,7 @@ pub fn diff(input: &Value) -> Result<Value, String> {
             summary_parts.push(format!("{session_id}: its own config"));
             continue;
         }
-        if !session_root.is_dir() {
+        if !session_root.is_dir() || session_root.is_symlink() {
             sessions.push(json!({
                 "id": session_id,
                 "warning": format!("No config/ tree in session {session_id}."),
@@ -397,9 +424,7 @@ fn walk_files_at(
     }
     for entry in fs::read_dir(dir).map_err(|err| err.to_string())? {
         let entry = entry.map_err(|err| err.to_string())?;
-        let Ok(kind) = entry.file_type() else {
-            continue;
-        };
+        let kind = entry.file_type().map_err(|err| err.to_string())?;
         // file_type() does not follow symlinks — a linked directory would pull
         // files from outside the config tree into the diff.
         if kind.is_symlink() {
@@ -408,6 +433,11 @@ fn walk_files_at(
         let path = entry.path();
         if kind.is_dir() {
             walk_files_at(root, &path, depth + 1, files, total)?;
+            continue;
+        }
+        if !kind.is_file() {
+            // A FIFO/socket/device is not a config file — reading one can
+            // block the walk.
             continue;
         }
         let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
@@ -419,9 +449,14 @@ fn walk_files_at(
             .map(|meta| meta.len() > MAX_FILE_BYTES)
             .unwrap_or(false);
         if over {
-            continue;
+            // Present-but-unreadable must not diffs as absent.
+            return Err(format!(
+                "config file {} exceeds the file cap",
+                path.display()
+            ));
         }
-        if let Ok(bytes) = fs::read(&path) {
+        {
+            let bytes = fs::read(&path).map_err(|err| err.to_string())?;
             *total = total.saturating_add(bytes.len() as u64);
             if *total > MAX_WALK_BYTES {
                 return Err(format!(
@@ -505,10 +540,14 @@ fn whole_file(bytes: &[u8], kind: &str) -> Vec<Value> {
     let Some(text) = text_lines(bytes) else {
         return Vec::new();
     };
+    let total = text.lines().count();
     let mut lines = Vec::new();
     for (index, text) in text.lines().enumerate() {
         if index >= DIFF_MAX_LINES {
-            return Vec::new();
+            // Truncating to zero rows read as an empty file — fold the
+            // remainder into a gap like the hunk path does.
+            lines.push(json!({ "kind": "gap", "count": total - index }));
+            break;
         }
         let no = index + 1;
         lines.push(if kind == "add" {
@@ -815,7 +854,7 @@ fn session_config_dir(data_dir: &str, session_id: &str) -> Option<PathBuf> {
     let dir = discover::session_directory(Path::new(data_dir), session_id)
         .join("config")
         .join("map2map");
-    dir.is_dir().then_some(dir)
+    (dir.is_dir() && !dir.is_symlink()).then_some(dir)
 }
 
 fn session_present(root: &Path, session_id: &str) -> bool {
@@ -846,9 +885,7 @@ fn walk_xml(root: &Path, dir: &Path, depth: usize, files: &mut Vec<String>) -> R
     }
     for entry in fs::read_dir(dir).map_err(|err| err.to_string())? {
         let entry = entry.map_err(|err| err.to_string())?;
-        let Ok(kind) = entry.file_type() else {
-            continue;
-        };
+        let kind = entry.file_type().map_err(|err| err.to_string())?;
         // file_type() does not follow symlinks — a linked directory could also
         // loop the walk or list files from outside the config tree.
         if kind.is_symlink() {
@@ -860,11 +897,45 @@ fn walk_xml(root: &Path, dir: &Path, depth: usize, files: &mut Vec<String>) -> R
             continue;
         }
         let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
-        if name.ends_with(".xml") && !name.ends_with(".xml.md5") {
+        if kind.is_file() && name.ends_with(".xml") {
             files.push(relative(root, &path));
         }
     }
     Ok(())
+}
+
+/// Every regular file under `dir`, rel-keyed like [`walk_xml`] but without
+/// the `.xml` filter — save cleanup needs the non-XML and sidecar view too.
+fn walk_list(root: &Path, dir: &Path, depth: usize, files: &mut Vec<String>) -> Result<(), String> {
+    if depth > MAX_WALK_DEPTH {
+        return Err(format!(
+            "config tree is deeper than {} levels under {}",
+            MAX_WALK_DEPTH,
+            root.display()
+        ));
+    }
+    for entry in fs::read_dir(dir).map_err(|err| err.to_string())? {
+        let entry = entry.map_err(|err| err.to_string())?;
+        let kind = entry.file_type().map_err(|err| err.to_string())?;
+        if kind.is_symlink() {
+            continue;
+        }
+        let path = entry.path();
+        if kind.is_dir() {
+            walk_list(root, &path, depth + 1, files)?;
+            continue;
+        }
+        if kind.is_file() {
+            files.push(relative(root, &path));
+        }
+    }
+    Ok(())
+}
+
+fn list_tree(root: &Path) -> Result<Vec<String>, String> {
+    let mut files = Vec::new();
+    walk_list(root, root, 0, &mut files)?;
+    Ok(files)
 }
 
 fn commit_integrity(root: &Path) -> Result<usize, String> {
@@ -1070,9 +1141,7 @@ fn copy_tree(source: &Path, dest: &Path, depth: usize) -> Result<(), String> {
     fs::create_dir_all(dest).map_err(|err| err.to_string())?;
     for entry in fs::read_dir(source).map_err(|err| err.to_string())? {
         let entry = entry.map_err(|err| err.to_string())?;
-        let Ok(kind) = entry.file_type() else {
-            continue;
-        };
+        let kind = entry.file_type().map_err(|err| err.to_string())?;
         // file_type() does not follow symlinks — copying a link's target would
         // pull outside content into the saved tree and a link loop recurses.
         if kind.is_symlink() {
@@ -1082,7 +1151,7 @@ fn copy_tree(source: &Path, dest: &Path, depth: usize) -> Result<(), String> {
         let to = dest.join(entry.file_name());
         if kind.is_dir() {
             copy_tree(&from, &to, depth + 1)?;
-        } else {
+        } else if kind.is_file() {
             fs::copy(&from, &to)
                 .map_err(|err| format!("Could not copy {}: {err}", from.display()))?;
         }
@@ -1596,6 +1665,51 @@ mod tests {
             .unwrap()
             .parse()
             .unwrap()
+    }
+
+    #[test]
+    fn an_oversized_whole_file_folds_into_a_gap_row() {
+        let text = "line\n".repeat(3000);
+        let rows = whole_file(text.as_bytes(), "add");
+        assert_eq!(rows.len(), DIFF_MAX_LINES + 1);
+        assert_eq!(rows[DIFF_MAX_LINES]["kind"], "gap");
+        assert_eq!(rows[DIFF_MAX_LINES]["count"], 1000);
+    }
+
+    #[test]
+    fn a_save_removes_stale_non_xml_files_and_orphan_sidecars() {
+        let dir = std::env::temp_dir().join(format!("sk_r24_stale_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let source = dir.join("src");
+        let dest = dir.join("dst");
+        std::fs::create_dir_all(source.join("nozzle")).unwrap();
+        std::fs::create_dir_all(dest.join("nozzle")).unwrap();
+        std::fs::write(source.join("a.xml"), "<a/>").unwrap();
+        std::fs::write(dest.join("nozzle/old.json"), "{}").unwrap();
+        std::fs::write(dest.join("gone.xml.md5"), "deadbeef").unwrap();
+        let files = json!([{ "rel": "a.xml", "xml": "<a/>" }]);
+        save_folder(&dir.join("db.sqlite"), &source, &dest, &files, None).unwrap();
+        assert!(!dest.join("nozzle/old.json").exists());
+        assert!(!dest.join("gone.xml.md5").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_write_naming_a_directory_fails_before_any_file_lands() {
+        let dir = std::env::temp_dir().join(format!("sk_r24_dir_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let source = dir.join("src");
+        let dest = dir.join("dst");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(dest.join("sub")).unwrap();
+        let files = json!([
+            { "rel": "sub", "xml": "<x/>" },
+            { "rel": "other.xml", "xml": "<y/>" }
+        ]);
+        assert!(save_folder(&dir.join("db.sqlite"), &source, &dest, &files, None).is_err());
+        // The invalid target must be caught before any write persists.
+        assert!(!dest.join("other.xml").exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -143,6 +143,13 @@ pub fn volumetric(
         _ => Quantity::Dose,
     };
     let model = pick(options, "model", "analytic", MODEL);
+    // The MC engine scores physical dose — under model=mc a MU/protons
+    // quantity would label Gy values with the wrong unit.
+    let quantity = if model == "mc" {
+        Quantity::Dose
+    } else {
+        quantity
+    };
     let histories = pick(options, "histories", "10000000", HISTORIES)
         .parse::<u32>()
         .unwrap_or(10_000_000);
@@ -1569,7 +1576,13 @@ pub(crate) fn iso_positions(
     let x1 = col(table, "ic1_x");
     let y2 = col(table, "ic2_y");
     let y1 = col(table, "ic1_y");
-    if x1.is_empty() || x2.is_empty() {
+    // Present-but-all-NaN is as missing as absent — otherwise the combined
+    // ray produces NaN positions and the view reports "No spots".
+    if x1.is_empty()
+        || x2.is_empty()
+        || !x1.iter().any(|v| v.is_finite())
+        || !x2.iter().any(|v| v.is_finite())
+    {
         return (or_plan(table, "ic1_x"), or_plan_y(table, "ic1_y"));
     }
     let z = iso_plane_z(table);
@@ -1652,7 +1665,12 @@ fn attr<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
 
 fn difference(measured: &Volume, plan: &Volume) -> Volume {
     if measured.shape != plan.shape || measured.values.len() != plan.values.len() {
-        return measured.clone();
+        // No plan to subtract — a flat field, not the measured cube drawn
+        // under the divergent wash as if it were a difference.
+        return Volume {
+            values: vec![0.0; measured.values.len()],
+            ..measured.clone()
+        };
     }
     let mut values = measured.values.clone();
     for (slot, plan) in values.iter_mut().zip(&plan.values) {
@@ -1852,7 +1870,39 @@ fn y_name(quantity: Quantity) -> &'static str {
 mod tests {
     use scan_kit_core::{dose_frame, water, McResult, Pencil, Quantity, Volume};
 
-    use super::{lattice_planes, next_preview_voxel};
+    use super::{difference, iso_positions, lattice_planes, next_preview_voxel};
+
+    #[test]
+    fn an_all_nan_chamber_falls_back_like_a_missing_one() {
+        let mut table = std::collections::BTreeMap::new();
+        table.insert("ic1_x".to_owned(), vec![f32::NAN, f32::NAN]);
+        table.insert("ic2_x".to_owned(), vec![1.0, 2.0]);
+        table.insert("ic1_y".to_owned(), vec![f32::NAN, f32::NAN]);
+        table.insert("ic2_y".to_owned(), vec![0.5, 0.5]);
+        table.insert("ic1_x_plan".to_owned(), vec![9.0, 9.0]);
+        let (x, _y) = iso_positions(&table);
+        // Combined mode used to propagate the NaN into every position and
+        // empty the cloud — the plan fallback must keep the session.
+        assert!(x.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn a_missing_plan_difference_is_a_flat_field_not_the_measurement() {
+        let measured = Volume {
+            origin: [0.0; 3],
+            shape: [2, 1, 1],
+            spacing: [1.0; 3],
+            values: vec![3.0, 4.0],
+        };
+        let plan = Volume {
+            origin: [0.0; 3],
+            shape: [0, 0, 0],
+            spacing: [1.0; 3],
+            values: Vec::new(),
+        };
+        let diff = difference(&measured, &plan);
+        assert!(diff.values.iter().all(|v| *v == 0.0));
+    }
 
     #[test]
     fn a_heavy_field_is_still_the_full_lattice() {
