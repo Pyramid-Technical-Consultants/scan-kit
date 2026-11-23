@@ -1817,7 +1817,12 @@ fn spot_positions<'a>(
     (mask, finite, mm)
 }
 
+/// Channels are 1-indexed 1..=128 — a stuck 0 or garbage 200 is an invalid
+/// reading, not a position two millimetres past the physical edge.
 fn g3_strip_mm(raw: f32, axis: usize) -> f32 {
+    if !(1.0..=128.0).contains(&raw) {
+        return f32::NAN;
+    }
     if AXIS_REVERSED[axis] {
         remap_g3_raw_reversed(raw)
     } else {
@@ -1828,12 +1833,16 @@ fn g3_strip_mm(raw: f32, axis: usize) -> f32 {
 fn g3_mm(raw: &[f32], reversed: bool) -> Vec<f32> {
     // G3 strips are 1-indexed at a 2 mm pitch — the ±128 map is the G2
     // calibration and reads ~0.8% long everywhere (a full mm at the edges).
-    let map = if reversed {
-        remap_g3_raw_reversed
-    } else {
-        remap_g3_raw
-    };
-    raw.iter().copied().map(map).collect()
+    raw.iter()
+        .copied()
+        .map(|value| {
+            if (1.0..=128.0).contains(&value) {
+                map(value)
+            } else {
+                f32::NAN
+            }
+        })
+        .collect()
 }
 
 fn spot_sigma(spot: &Sheet, prefer_raw: bool, n: usize) -> Vec<(&'static str, &[f32])> {
@@ -5731,6 +5740,10 @@ mod tests {
         assert_eq!(g3_mm(&[1.0, 128.0], true), vec![127.0, -127.0]);
         assert_eq!(g3_strip_mm(1.0, 1), 127.0); // ic1_y runs reversed
         assert_eq!(g3_strip_mm(1.0, 0), -127.0);
+        // Channels are 1-indexed — a stuck 0 or a garbage 200 is a missing
+        // reading, not a position past the physical edge.
+        assert!(g3_mm(&[0.0, 200.0], false).iter().all(|v| v.is_nan()));
+        assert!(g3_strip_mm(0.0, 0).is_nan());
     }
     #[test]
     fn a_negative_one_millimetre_spot_is_real() {
