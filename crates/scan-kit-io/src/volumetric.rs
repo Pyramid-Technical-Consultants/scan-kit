@@ -606,8 +606,8 @@ pub fn volumetric(
                 mode,
                 filter,
                 y_label: match compare {
-                    "gamma" => "γ".into(),
-                    "difference" => format!("Δ {}", y_name(quantity)),
+                    "gamma" => "gamma index".into(),
+                    "difference" => format!("{} difference", y_name(quantity)),
                     _ => y_name(quantity).into(),
                 },
                 dvh: dvh_lines,
@@ -1680,6 +1680,10 @@ pub(crate) fn iso_positions(
         || x2.is_empty()
         || !x1.iter().any(|v| v.is_finite())
         || !x2.iter().any(|v| v.is_finite())
+        || y1.is_empty()
+        || y2.is_empty()
+        || !y1.iter().any(|v| v.is_finite())
+        || !y2.iter().any(|v| v.is_finite())
     {
         return or_plan(table, "ic1_x", "ic1_y");
     }
@@ -1784,7 +1788,14 @@ fn attr<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
 }
 
 fn difference(measured: &Volume, plan: &Volume) -> Volume {
-    if measured.shape != plan.shape || measured.values.len() != plan.values.len() {
+    // Same geometry guard gamma_with enforces — a plan on a shifted or
+    // rescaled lattice with matching dims would subtract the wrong voxels
+    // and still paint a plausible difference field.
+    if measured.shape != plan.shape
+        || measured.values.len() != plan.values.len()
+        || measured.origin != plan.origin
+        || measured.spacing != plan.spacing
+    {
         // No plan to subtract — a flat field, not the measured cube drawn
         // under the divergent wash as if it were a difference.
         return Volume {
@@ -1975,7 +1986,7 @@ fn depth_axis_title(medium_key: &str) -> String {
 
 fn volume_unit(quantity: Quantity, mode: u8, compare: &str) -> &'static str {
     if compare == "gamma" {
-        return "γ";
+        return "gamma index";
     }
     match quantity {
         Quantity::Dose if mode == 0 => "Gy·mm",
@@ -2011,6 +2022,21 @@ mod tests {
         // Combined mode used to propagate the NaN into every position and
         // empty the cloud — the plan fallback must keep the session.
         assert!(x.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn missing_ic_y_columns_fall_back_to_the_plan_pair() {
+        // ic x columns alone used to pass the guard — the combined ray
+        // then produced no y at all and every pencil dropped as "No
+        // spots". A missing axis falls back pairwise like or_plan does.
+        let mut table = std::collections::BTreeMap::new();
+        table.insert("ic1_x".to_owned(), vec![1.0]);
+        table.insert("ic2_x".to_owned(), vec![2.0]);
+        table.insert("plan_x".to_owned(), vec![9.0]);
+        table.insert("plan_y".to_owned(), vec![7.0]);
+        let (x, y) = iso_positions(&table);
+        assert_eq!(x, vec![9.0]);
+        assert_eq!(y, vec![7.0]);
     }
 
     #[test]
@@ -2128,6 +2154,23 @@ mod tests {
             spacing: [1.0; 3],
             values: Vec::new(),
         };
+        let diff = difference(&measured, &plan);
+        assert!(diff.values.iter().all(|v| *v == 0.0));
+    }
+
+    #[test]
+    fn a_shifted_plan_lattice_is_a_flat_difference() {
+        // Same shape/len but a different origin — gamma_with refuses the
+        // same pair; the difference must not paint a plausible-but-wrong
+        // subtracted field either.
+        let measured = Volume {
+            origin: [0.0; 3],
+            shape: [2, 1, 1],
+            spacing: [1.0; 3],
+            values: vec![3.0, 4.0],
+        };
+        let mut plan = measured.clone();
+        plan.origin[0] = 4.0;
         let diff = difference(&measured, &plan);
         assert!(diff.values.iter().all(|v| *v == 0.0));
     }

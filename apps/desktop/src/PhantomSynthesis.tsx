@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 
@@ -43,6 +43,11 @@ export function PhantomSynthesis() {
   const [busy, setBusy] = useState(false);
   const [waiting, setWaiting] = useState(true);
   const [previewing, setPreviewing] = useState(false);
+  const writeBusy = useRef(false);
+  const paramsRef = useRef(params);
+  useEffect(() => {
+    paramsRef.current = params;
+  }, [params]);
   usePageLoad(waiting || busy || previewing);
 
   useEffect(() => {
@@ -112,9 +117,12 @@ export function PhantomSynthesis() {
   const selected = params.energies;
 
   async function writeStudy() {
-    if (params == null) {
+    // The dialog resolves before busy arms — without this a double-click
+    // opens two dialogs and writes the study twice.
+    if (writeBusy.current || params == null) {
       return;
     }
+    writeBusy.current = true;
     const selectedDir = await open({
       directory: true,
       title: "Folder for the synthetic study",
@@ -124,19 +132,23 @@ export function PhantomSynthesis() {
       return null;
     });
     if (typeof selectedDir !== "string") {
+      writeBusy.current = false;
       return;
     }
     setBusy(true);
     try {
+      // Field edits can land while the native dialog is open — write the
+      // freshest params, not the pre-dialog snapshot.
       const written = await invoke<{ status: string; folder: string }>("scan_kit_write_phantom", {
         parent: selectedDir,
-        params,
+        params: paramsRef.current,
       });
       setStatus(written.status);
       notifySaved(written.folder, { title: "Study written", folder: true });
     } catch (reason: unknown) {
       notifyError(reason);
     } finally {
+      writeBusy.current = false;
       setBusy(false);
     }
   }

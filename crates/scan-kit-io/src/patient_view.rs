@@ -1629,7 +1629,10 @@ fn parse_metric(text: &str) -> Option<GoalMetric> {
     if low.is_empty() {
         return None;
     }
-    let (kind, rest) = low.split_at(1);
+    // get(..1) refuses a mid-char split — a metric starting with a
+    // multi-byte char can never match d*/v* anyway.
+    let kind = low.get(..1)?;
+    let rest = &low[kind.len()..];
     let end = rest
         .find(|c: char| !(c.is_ascii_digit() || c == '.'))
         .unwrap_or(rest.len());
@@ -1789,6 +1792,15 @@ mod tests {
         assert!(Goal::parse("PTV: V20Gy < 30 Gy").is_err());
         assert!(Goal::parse("PTV: Dmax < 45 cc").is_err());
         assert!(Goal::parse("no goal here").is_err());
+    }
+
+    #[test]
+    fn a_non_ascii_metric_does_not_panic() {
+        // Goals are user-editable text — a metric starting with a
+        // multi-byte char panicked on split_at(1) and unwound through
+        // the scene render. It must fail the grammar instead.
+        assert!(Goal::parse("PTV: Δ95% >= 95%").is_err());
+        assert!(Goal::parse("PTV: µ5% >= 95%").is_err());
     }
 
     #[test]

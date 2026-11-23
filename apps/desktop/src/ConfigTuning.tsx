@@ -187,13 +187,15 @@ export function ConfigTuning({
     // resolves, so edits made during the load would be silently discarded.
     busyRef.current = busy || opening;
   });
-  const sessionKey = selectedIds.join("|");
   const workflow = catalog?.workflows.find((item) => item.id === workflowId) ?? catalog?.workflows[0];
   const picksSessions = workflow?.sessions === true;
   const sessionIds = useMemo(
     () => selectedIds.filter((id) => !excluded.includes(id)),
     [excluded, selectedIds],
   );
+  // Only the anchor decides which config opens — the array identity
+  // changes on every exclusion click and would re-fire the open.
+  const anchorId = sessionIds[0] ?? "";
   const needsSessions = picksSessions && sessionIds.length === 0;
   // G2 configurations have no IC_3 ion chamber, so IC3 cannot be the primary.
   const hasIc3 = useMemo(() => /name\s*=\s*"IC_3/i.test(xml), [xml]);
@@ -271,7 +273,7 @@ export function ConfigTuning({
     let cancel = false;
     // Open the config for a session actually in the run — an excluded
     // first pick would edit a file the tune ignores.
-    const sessionId = sessionIds[0] ?? "";
+    const sessionId = anchorId;
     void (async () => {
       if (dirtyRef.current && !window.confirm("Discard unsaved edits in this file?")) {
         // The seq bump already superseded any in-flight loadFile, whose
@@ -310,7 +312,7 @@ export function ConfigTuning({
     return () => {
       cancel = true;
     };
-  }, [folder, sessionKey, sessionIds]);
+  }, [folder, anchorId]);
 
   useEffect(() => {
     const mine = previewGen.current + 1;
@@ -510,16 +512,16 @@ export function ConfigTuning({
     notify(matched.summary);
   }
 
+  const savingRef = useRef(false);
+
   async function save() {
-    if (configDir.length === 0 || file.length === 0) {
+    // busy only arms after the folder dialog — a second click during it
+    // would open another dialog and its save would orphan the first's
+    // post-state (configDir/dirty) via the seq bump.
+    if (savingRef.current || configDir.length === 0 || file.length === 0) {
       return;
     }
-    // A loadFile already in flight would resolve under the new configDir and
-    // restore the previous folder's XML — it must not outlive this save. A
-    // later browse bumps the seq again, so this save's late setters must also
-    // defer to it or configDir/file/xml can land from mismatched folders.
-    const seq = ++openSeq.current;
-    setOpening(false);
+    savingRef.current = true;
     const selected = await open({
       directory: true,
       multiple: false,
@@ -530,10 +532,24 @@ export function ConfigTuning({
       return null;
     });
     if (typeof selected !== "string") {
+      savingRef.current = false;
       return;
     }
+    // A loadFile already in flight would resolve under the new configDir and
+    // restore the previous folder's XML — it must not outlive this save. A
+    // later browse bumps the seq again, so this save's late setters must also
+    // defer to it or configDir/file/xml can land from mismatched folders.
+    const seq = ++openSeq.current;
+    setOpening(false);
     setBusy(true);
     try {
+      // An edit landing while the native folder dialog was open is not in
+      // the captured form — saving would write stale xml and clear its
+      // dirty flag.
+      if (dirtyRef.current !== dirty) {
+        notify("The file changed while the save dialog was open — review and save again.");
+        return;
+      }
       let nextXml = xml;
       let nextForm = form;
       if (dirty && form != null) {
@@ -579,6 +595,7 @@ export function ConfigTuning({
     } catch (caught) {
       notifyError(caught);
     } finally {
+      savingRef.current = false;
       setBusy(false);
     }
   }

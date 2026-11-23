@@ -870,11 +870,13 @@ impl Live {
                 }
                 Ok(Err(err)) => {
                     self.pending_read = None;
+                    gpu_lost(&self.gpu);
                     return Err(ComputeError::Message(err.to_string()));
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {}
                 Err(err) => {
                     self.pending_read = None;
+                    gpu_lost(&self.gpu);
                     return Err(ComputeError::Message(err.to_string()));
                 }
             }
@@ -1020,9 +1022,7 @@ impl Live {
                 Ok(_) => return Ok(started.elapsed()),
                 Err(wgpu::PollError::Timeout) => continue,
                 Err(err) => {
-                    if !matches!(err, wgpu::PollError::WrongSubmissionIndex(..)) {
-                        gpu_lost(&self.gpu);
-                    }
+                    gpu_lost(&self.gpu);
                     return Err(ComputeError::Message(err.to_string()));
                 }
             }
@@ -1117,19 +1117,23 @@ impl Live {
             }) {
                 Ok(_) | Err(wgpu::PollError::Timeout) => {}
                 Err(err) => {
-                    if !matches!(err, wgpu::PollError::WrongSubmissionIndex(..)) {
-                        gpu_lost(&self.gpu);
-                    }
+                    gpu_lost(&self.gpu);
                     return Err(ComputeError::Message(err.to_string()));
                 }
             }
             match ticket.receiver.try_recv() {
                 Ok(result) => {
-                    result.map_err(|err| ComputeError::Message(err.to_string()))?;
+                    if let Err(err) = result {
+                        gpu_lost(&self.gpu);
+                        return Err(ComputeError::Message(err.to_string()));
+                    }
                     break;
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => continue,
-                Err(err) => return Err(ComputeError::Message(err.to_string())),
+                Err(err) => {
+                    gpu_lost(&self.gpu);
+                    return Err(ComputeError::Message(err.to_string()));
+                }
             }
         }
         self.unpack_read(ticket)
@@ -1138,11 +1142,10 @@ impl Live {
     /// The mapped staging buffer becomes the result: dose cube, uncertainty,
     /// ledger, LET — then unmapped. Only called after the map has landed.
     fn unpack_read(&self, ticket: &ReadTicket) -> Result<McResult, ComputeError> {
-        let mapped = ticket
-            .staging
-            .slice(..)
-            .get_mapped_range()
-            .map_err(|err| ComputeError::Message(err.to_string()))?;
+        let mapped = ticket.staging.slice(..).get_mapped_range().map_err(|err| {
+            gpu_lost(&self.gpu);
+            ComputeError::Message(err.to_string())
+        })?;
         let nvox4 = self.nvox * 4;
         let dose: Vec<f32> = mapped[..nvox4]
             .as_chunks::<4>()
@@ -1195,6 +1198,9 @@ impl Live {
     }
 
     fn finish(&mut self, cancel: &Cancel) -> Result<McResult, ComputeError> {
+        // A preview parked by an earlier step() is stale the moment the
+        // final fold starts — an extend() after drain() must not publish it.
+        self.pending_read = None;
         let ticket = self.begin_read(
             1,
             1.0 / (self.histories.max(1) as f32),

@@ -354,8 +354,8 @@ pub(crate) fn field_extent(volume: &Volume, fraction: f32, per_slice: bool) -> O
     if nx == 0 || ny == 0 || nz == 0 {
         return None;
     }
-    let plane = nx * ny;
-    let values = volume.values.get(..plane * nz)?;
+    let plane = nx.checked_mul(ny)?;
+    let values = volume.values.get(..plane.checked_mul(nz)?)?;
     let mut x0 = nx;
     let mut x1 = 0usize;
     let mut y0 = ny;
@@ -899,5 +899,18 @@ mod tests {
             ..volume
         };
         assert_eq!(field_extent(&short, 0.5, true), None);
+    }
+
+    #[test]
+    fn a_hostile_shape_does_not_overflow_the_extent_math() {
+        // shape/values are pub — an inconsistent volume must return None,
+        // not overflow nx*ny into a panic or a wrapped slice range.
+        let volume = Volume {
+            origin: [0.0; 3],
+            shape: [usize::MAX, usize::MAX, 1],
+            spacing: [1.0; 3],
+            values: vec![1.0],
+        };
+        assert_eq!(field_extent(&volume, 0.5, true), None);
     }
 }

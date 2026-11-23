@@ -300,8 +300,10 @@ fn blocks(sheet: &Sheet, layer_of: &mut HashMap<String, usize>) -> Vec<Block> {
     let mut out = Vec::new();
     let mut start = 0usize;
     // prev_eff is the open run's effective id — a ragged row inherits it
-    // rather than the previous row's raw (possibly absent) cell.
-    let mut prev_eff: Option<&str> = None;
+    // rather than the previous row's raw (possibly absent) cell. Ids are
+    // join_key-normalized like every other layer key: "1" and "1.0" across
+    // differently-formatted tables are one physical layer, not two.
+    let mut prev_eff: Option<String> = None;
     for row in 0..=sheet.rows.len() {
         let cell = sheet
             .rows
@@ -309,14 +311,14 @@ fn blocks(sheet: &Sheet, layer_of: &mut HashMap<String, usize>) -> Vec<Block> {
             .and_then(|cells| cells.get(column))
             .map(String::as_str);
         let id = if row < sheet.rows.len() && cell.is_none_or(|id| id.is_empty()) {
-            prev_eff
+            prev_eff.clone()
         } else {
-            cell
+            cell.map(join_key)
         };
         if row > 0 && (row == sheet.rows.len() || id != prev_eff) {
             // A leading ragged run has no previous id — it belongs to the
             // layer that opens it, not a phantom "" layer.
-            let prev_id = prev_eff.or(id).unwrap_or("").to_owned();
+            let prev_id = prev_eff.clone().or_else(|| id.clone()).unwrap_or_default();
             let next = layer_of.len();
             let layer = *layer_of.entry(prev_id.clone()).or_insert(next);
             let run = runs_of.entry(prev_id).or_insert(0);
@@ -464,6 +466,15 @@ pub fn capture(
             rci_host
         ));
     }
+    // A run boundary between the meta read and the table fetches would
+    // label session B's CSVs with session A's id — re-check.
+    if let Ok(Some(later)) = self::session_id(&devices, &mut warnings, keep) {
+        if later != session_id {
+            warnings.push(format!(
+                "session rolled from {session_id} to {later} mid-capture — the tables may be mixed"
+            ));
+        }
+    }
 
     // Per layer/run folder: each device's spot rows (RCI's also as RCI_map.csv)
     // plus the wide timeslice join.
@@ -515,7 +526,10 @@ pub fn capture(
         count += 1;
         tick(count, keep)?;
     }
-    count += write_input_map(rci_host, plan_path, spots.first().map(|(_, s)| s), dir)?;
+    // The first fetched sheet is only the RCI's when its fetch succeeded —
+    // a failed RCI table must not substitute another device's columns.
+    let rci_spots = spots.iter().find(|(d, _)| d.name == "RCI").map(|(_, s)| s);
+    count += write_input_map(rci_host, plan_path, rci_spots, dir)?;
     tick(count, keep)?;
 
     let last = hits.keys().last().copied().unwrap_or((0, 0));
@@ -1081,6 +1095,9 @@ fn write_session_meta(
 
 /// Number of seconds, trimmed like the G3 writer (`319.494`, not `319.494000`).
 fn num_text(value: f64) -> String {
+    if !value.is_finite() {
+        return "n/a".into();
+    }
     let text = format!("{value:.6}");
     let trimmed = text.trim_end_matches('0').trim_end_matches('.');
     if trimmed.is_empty() || trimmed == "-" || trimmed == "-0" {
@@ -1188,7 +1205,7 @@ fn write_termination(
                 .unwrap_or(0.0)
                 > 0.0;
             if let (Some(t), Some(p)) = (t, prev) {
-                if on {
+                if on && t > p {
                     ms += t - p;
                 }
             }
@@ -1360,6 +1377,9 @@ fn fetch_aux(
     keep: &mut dyn FnMut(u64, u64) -> bool,
 ) -> Result<usize, String> {
     let mut count = 0;
+    // dcs channel-map names come from the target basename — two devices can
+    // share it; the second write would replace the first's XML silently.
+    let mut dcs_names = std::collections::HashSet::new();
     for device in devices {
         let nozzle = dir.join("config").join("nozzle").join(&device.name);
         for file in NOZZLE_FILES {
@@ -1410,12 +1430,19 @@ fn fetch_aux(
             if let Ok(url) = device_file_url(rci_host, &device.config_target) {
                 if let Ok(bytes) = runner::http(&url, "GET", None) {
                     if !bytes.is_empty() {
-                        let name = PathBuf::from(&device.config_target)
+                        let base = PathBuf::from(&device.config_target)
                             .file_name()
                             .and_then(|name| name.to_str())
                             .filter(|name| *name != "." && *name != "..")
                             .unwrap_or(&device.name)
                             .to_owned();
+                        let name = if dcs_names.insert(base.clone()) {
+                            base
+                        } else {
+                            let name = format!("{}_{base}", device.name);
+                            dcs_names.insert(name.clone());
+                            name
+                        };
                         write_bytes(&dir.join("config").join("dcs").join(name), &bytes)?;
                         count += 1;
                     }
@@ -1521,6 +1548,26 @@ mod tests {
             vec![(0, 0, 0, 2), (1, 0, 2, 3), (0, 1, 3, 4)]
         );
         assert!(blocks(&sheet("spot_no\n1\n"), &mut HashMap::new()).is_empty());
+    }
+
+    #[test]
+    fn blocks_join_numeric_layer_ids_across_formats() {
+        // "1" and "1.0" are one layer — joining must happen on the
+        // normalized key or a format difference splits one run in two.
+        let table = sheet(
+            "spot_no,layer_id
+1,1
+2,1.0
+3,2
+",
+        );
+        let got = blocks(&table, &mut HashMap::new());
+        assert_eq!(
+            got.iter()
+                .map(|block| (block.layer, block.run, block.start, block.end))
+                .collect::<Vec<_>>(),
+            vec![(0, 0, 0, 2), (1, 0, 2, 3)]
+        );
     }
 
     #[test]
@@ -1876,6 +1923,15 @@ mod tests {
         // back as an extra row.
         assert_eq!(line.lines().count(), 1);
         assert_eq!(quoted("x\ny"), "x y");
+    }
+
+    #[test]
+    fn num_text_refuses_non_finite_values() {
+        // A computed NaN/inf (divided doses, empty windows) writes "n/a",
+        // not a value the CSV reader parses back as a number.
+        assert_eq!(num_text(f64::NAN), "n/a");
+        assert_eq!(num_text(f64::INFINITY), "n/a");
+        assert_eq!(num_text(f64::NEG_INFINITY), "n/a");
     }
 
     #[test]
