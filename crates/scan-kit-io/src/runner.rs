@@ -1002,7 +1002,7 @@ pub(crate) fn http_tuned(
     // alone lets a peer trickling one byte per interval stay open forever.
     let deadline = Instant::now() + read_timeout * 4;
     for bytes in [head.as_bytes(), body.unwrap_or_default()] {
-        let mut rest = &bytes[..];
+        let mut rest = bytes;
         while !rest.is_empty() {
             let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
                 return Err("the device write deadline elapsed".into());
