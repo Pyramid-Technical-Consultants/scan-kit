@@ -3326,7 +3326,7 @@ fn first_named(dir: &Path, pred: impl Fn(&str) -> bool) -> Option<PathBuf> {
     walk(dir, &pred, 0)
 }
 
-/// Every file matching `pred` under `dir` (depth ≤ 4) plus every directory
+/// Every file matching `pred` under `dir` (depth ≤ 6) plus every directory
 /// visited — callers watch the dirs so a file landing later invalidates.
 fn named_files(dir: &Path, pred: &impl Fn(&str) -> bool) -> (Vec<PathBuf>, Vec<PathBuf>) {
     fn walk(

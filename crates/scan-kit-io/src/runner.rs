@@ -325,7 +325,13 @@ pub fn control(action: &str) -> Result<Value, String> {
     if lock().as_ref().map(|live| live.epoch) != Some(epoch) {
         return Err("connection changed".into());
     }
-    read_status(true, "")
+    let view = read_status(true, "")?;
+    // read_status re-locks across its HTTP call - a reconnect inside that
+    // window would report the new device's state as the actuation's result.
+    if lock().as_ref().map(|live| live.epoch) != Some(epoch) {
+        return Err("connection changed".into());
+    }
+    Ok(view)
 }
 
 pub fn remember_dir(db: &Path, dir: &str) -> Result<Value, String> {

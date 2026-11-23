@@ -483,8 +483,10 @@ pub fn read_timeslice_frames(storage: &Path) -> Vec<(i64, Vec<u8>)> {
     members
         .into_iter()
         .map(|(name, bytes)| {
-            let index = if name.contains("layer-") {
-                number_after(&name, "layer-")
+            let dir_end = name.rfind(['/', '\\']).map(|i| i + 1).unwrap_or(0);
+            let dir = &name[..dir_end];
+            let index = if dir.contains("layer-") {
+                number_after(dir, "layer-")
             } else {
                 -1
             };
@@ -815,8 +817,10 @@ fn refresh_slice(storage: &Path) -> u128 {
     let paths = found
         .iter()
         .map(|(name, path, _)| {
-            let index = if name.contains("layer-") {
-                number_after(name, "layer-")
+            let dir_end = name.rfind(['/', '\\']).map(|i| i + 1).unwrap_or(0);
+            let dir = &name[..dir_end];
+            let index = if dir.contains("layer-") {
+                number_after(dir, "layer-")
             } else {
                 -1
             };

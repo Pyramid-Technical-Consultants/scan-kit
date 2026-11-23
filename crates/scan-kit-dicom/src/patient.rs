@@ -1307,7 +1307,12 @@ pub fn inside_structure(
 fn sign_extend(word: i64, high_bit: i64) -> i64 {
     // Bits above High Bit are sender-defined - mask them off first or a
     // sign-replicated writer (0xFFFF for 12-bit -1) reads as a huge positive.
-    let word = word & ((1_i64 << (high_bit + 1)) - 1);
+    let word = word
+        & if high_bit >= 62 {
+            i64::MAX
+        } else {
+            (1_i64 << (high_bit + 1)) - 1
+        };
     if word & (1_i64 << high_bit) != 0 {
         word - (1_i64 << (high_bit + 1))
     } else {

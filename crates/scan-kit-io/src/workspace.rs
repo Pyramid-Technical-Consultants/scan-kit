@@ -663,6 +663,7 @@ pub(crate) fn overlay_sessions(
         // No gamma metric (analytic run, no TPS dose, beam filter) - the
         // second default cell would otherwise be a permanently blank panel.
         panel.series = profile_series(PlotKind::Lateral, volumes.iter(), at);
+        panel.title = "Lateral".into();
         fit_panel(panel);
     } else if title.starts_with("gamma") {
         panel.series = gamma_lines(gamma);
