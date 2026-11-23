@@ -970,6 +970,10 @@ pub(crate) fn bins(root: &Path, session_ids: &[String], options: &Value) -> Plot
         }
     });
 
+    // interlock_ok gated the toggle on the requested x — the grain fallback
+    // may have swapped it for "energy", which would leave an On toggle over
+    // guides that can never draw.
+    interlock = interlock && interlock_ok(group.id, &prepared.x_column, glyph);
     let pairs = if corr && !prepared.series.is_empty() {
         let shown: Vec<&YSeries> = prepared
             .series
@@ -1019,7 +1023,9 @@ pub(crate) fn bins(root: &Path, session_ids: &[String], options: &Value) -> Plot
                 ));
             }
             if let Some((left, right)) = pairs.get(index) {
-                panels.push(corr_panel(left, right, &prepared.tables, group.label));
+                if let Some(panel) = corr_panel(left, right, &prepared.tables, group.label) {
+                    panels.push(panel);
+                }
             }
         }
     }
@@ -1270,7 +1276,7 @@ fn x_span(
     categories: &[f32],
     raw_x: bool,
     x_column: &str,
-    _series: usize,
+    sessions: usize,
 ) -> (f32, f32) {
     if raw_x {
         let values: Vec<f32> = tables
@@ -1287,7 +1293,11 @@ fn x_span(
     if categories.is_empty() {
         return (-0.5, 0.5);
     }
-    (-0.6, categories.len() as f32 - 0.4)
+    // Dodged marks spread (sessions - 1) * OFFSET either side of a tick and
+    // box/mean half-widths ride on top — a fixed 0.6 margin clips them at
+    // four or more sessions.
+    let over = (sessions as f32 - 1.0).max(0.0) * OFFSET + BOX_WIDTH * 0.5;
+    (-0.6 - over, categories.len() as f32 - 0.4 + over)
 }
 
 fn x_label(column: &str) -> &'static str {
@@ -1662,7 +1672,7 @@ mod tests {
 
     use super::{
         assign_x, axis_label, binned_trend, bins, dose_rate_table, plotted_columns, scatter_series,
-        violin_series, BinChoice, Trend,
+        violin_series, x_span, BinChoice, Trend,
     };
 
     #[test]
@@ -3057,5 +3067,13 @@ mod tests {
                 _ => true,
             }));
         }
+    }
+
+    #[test]
+    fn dodged_marks_widen_the_category_axis() {
+        // Five sessions dodge +/-0.7 around each tick plus the mark half
+        // width — a fixed 0.6 margin clipped the outer boxes and means.
+        let (lo, _) = x_span(&[], &[0.0, 1.0], false, "energy", 5);
+        assert!(lo < -1.0, "{lo}");
     }
 }

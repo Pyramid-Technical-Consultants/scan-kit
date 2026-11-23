@@ -457,8 +457,14 @@ pub(super) fn hv_transient(root: &Path, session_ids: &[String]) -> PlotScene {
                 current,
                 MARK,
             ));
-            let mut counts = measured.iter().copied().collect::<Vec<_>>();
-            if let Some(expected) = expected {
+            // A subnormal voltage step or a huge expected value computes
+            // inf — an inf count makes ymax inf and sinks the panel.
+            let mut counts: Vec<f32> = measured
+                .iter()
+                .copied()
+                .filter(|value| value.is_finite())
+                .collect();
+            if let Some(expected) = expected.filter(|value| value.is_finite()) {
                 counts.push(expected);
             }
             let edges: Vec<f32> = (0..=counts.len()).map(|i| i as f32).collect();

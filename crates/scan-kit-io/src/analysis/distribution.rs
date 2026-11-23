@@ -363,8 +363,13 @@ fn padded_span(values: &[f32]) -> (f32, f32) {
             hi = hi.max(*value);
         }
     }
-    if !lo.is_finite() || hi <= lo {
+    if !lo.is_finite() {
         return (0.0, 1.0);
+    }
+    // A constant column has no span to pad — pad around the value like
+    // density_range, or every density/contour sample falls off-grid.
+    if hi <= lo {
+        return ((lo - 0.5).max(-f32::MAX), (hi + 0.5).min(f32::MAX));
     }
     let pad = ((hi - lo) * 0.04).max(1e-4);
     ((lo - pad).max(-f32::MAX), (hi + pad).min(f32::MAX))
@@ -970,5 +975,12 @@ mod tests {
         assert_eq!(ox.len(), 4);
         assert_eq!(ot.len(), 4);
         assert!((ot[3] - 0.003).abs() < 1e-6, "{}", ot[3]);
+    }
+
+    #[test]
+    fn a_constant_column_still_spans_its_value() {
+        // Density/contour panels drop samples outside the frame — collapsing
+        // a constant column to (0, 1) blanks the panel wherever data lives.
+        assert_eq!(padded_span(&[100.0; 4]), (99.5, 100.5));
     }
 }

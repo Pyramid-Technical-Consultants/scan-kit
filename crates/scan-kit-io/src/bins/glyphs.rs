@@ -579,7 +579,7 @@ pub(super) fn corr_panel(
     b: &YSeries,
     tables: &[BTreeMap<String, Vec<f32>>],
     group_label: &str,
-) -> Panel {
+) -> Option<Panel> {
     let mut series = Vec::new();
     let mut all_x = Vec::new();
     let mut all_y = Vec::new();
@@ -619,6 +619,11 @@ pub(super) fn corr_panel(
             });
         }
     }
+    // Each key can exist in a different table — no co-occurring pair means
+    // the panel would hold nothing but the diagonal guide.
+    if all_x.is_empty() {
+        return None;
+    }
     let (xmin, xmax) = span(&all_x);
     let (ymin, ymax) = span(&all_y);
     let lo = xmin.min(ymin);
@@ -629,7 +634,7 @@ pub(super) fn corr_panel(
         color: [0.6, 0.6, 0.6, 0.8],
         thickness: 1.0,
     });
-    Panel {
+    Some(Panel {
         title: String::new(),
         y_label: axis_label(b.label, group_label),
         x_label: axis_label(a.label, group_label),
@@ -640,7 +645,7 @@ pub(super) fn corr_panel(
         series,
         x_labels: Vec::new(),
         equal: false,
-    }
+    })
 }
 
 pub(super) fn interlock_guides(
@@ -986,5 +991,22 @@ mod tests {
         let json = serde_json::to_value(&series).unwrap();
         let text = json.to_string();
         assert!(!text.contains("inf") && !text.contains("NaN"), "{text}");
+    }
+
+    #[test]
+    fn a_correlation_pair_with_no_shared_table_draws_no_panel() {
+        // Either key can exist in a different session's table — the pair
+        // would otherwise emit a diagonal guide over an empty plot.
+        let a = YSeries {
+            key: "ic1_x_err",
+            label: "IC1",
+        };
+        let b = YSeries {
+            key: "ic2_x_err",
+            label: "IC2",
+        };
+        let mut table = std::collections::BTreeMap::new();
+        table.insert("ic1_x_err".to_string(), vec![1.0, 2.0]);
+        assert!(corr_panel(&a, &b, &[table], "Position").is_none());
     }
 }
