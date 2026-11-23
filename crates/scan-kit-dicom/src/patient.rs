@@ -1920,7 +1920,7 @@ pub fn write_rtdose(
         ));
     }
     if ct.frame.is_empty() {
-        return Err("the dose grid and CT are in different frames of reference".into());
+        return Err("the CT has no frame of reference".into());
     }
     let peak = dose.iter().fold(0.0f64, |peak, &v| {
         peak.max(if v.is_nan() { 0.0 } else { v as f64 })

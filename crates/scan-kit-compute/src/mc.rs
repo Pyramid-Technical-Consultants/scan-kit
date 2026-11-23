@@ -438,9 +438,9 @@ fn patient_launch(request: &PatientRequest) -> Result<Launch, ComputeError> {
             "density must be finite and positive".into(),
         ));
     }
-    // smx/smy are divisors in the shader — a zero is finite but produces a
-    // NaN particle whose voxel index is indeterminate, depositing into a
-    // real voxel with no error.
+    // smx/smy are divisors in the shader — zero produces a NaN particle
+    // whose voxel index is indeterminate, and a negative one mirrors the
+    // beam frame: finite, silently wrong deposits.
     if !request.beams.len().is_multiple_of(16)
         || !request.beams.iter().all(|value| value.is_finite())
         || request
@@ -448,7 +448,7 @@ fn patient_launch(request: &PatientRequest) -> Result<Launch, ComputeError> {
             .as_chunks::<16>()
             .0
             .iter()
-            .any(|r| r[13] == 0.0 || r[14] == 0.0)
+            .any(|r| r[13] <= 0.0 || r[14] <= 0.0)
     {
         return Err(ComputeError::Message(
             "beams must be whole finite 16-float records".into(),
@@ -1648,8 +1648,8 @@ mod tests {
     fn a_zero_source_sigma_beam_is_rejected() {
         let spot = scan_kit_io::spot_record(100.0, 0.0, 0.0, 0.0, 0.0, f32::NAN).expect("spot");
         let mut beam = scan_kit_io::beam_record(0.0, 0.0, "HFS", [0.0, 0.0, 0.0]).expect("beam");
-        // smx is a divisor in the shader — a zero is finite but produces a
-        // NaN particle that deposits into an indeterminate voxel.
+        // smx is a divisor in the shader — a non-positive value makes a NaN
+        // or a mirrored-frame particle that still deposits.
         beam[13] = 0.0;
         let shape = [2usize, 2, 2];
         let nvox = 8;
@@ -1668,6 +1668,11 @@ mod tests {
             score_let: false,
             let_water: false,
         };
+        assert!(McRun::open(&McJob::Patient(request.clone())).is_err());
+        // A negative sigma is finite — and produces a mirrored beam frame
+        // whose deposits are finite and silently wrong.
+        let mut request = request;
+        request.beams[13] = -1.0;
         assert!(McRun::open(&McJob::Patient(request)).is_err());
     }
 

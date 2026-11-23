@@ -55,7 +55,11 @@ impl BeamModel {
         if !model.rows.windows(2).all(|pair| pair[1][0] > pair[0][0]) {
             return Err(format!("{path:?} energy rows must be strictly increasing"));
         }
-        if model.nozzle <= 0.0 || model.smx <= 0.0 || model.smy <= 0.0 {
+        // `<= 0.0` alone misses NaN — a literal "NaN" distance must fail too.
+        if [model.nozzle, model.smx, model.smy]
+            .iter()
+            .any(|distance| !distance.is_finite() || *distance <= 0.0)
+        {
             return Err(format!("{path:?} is missing nozzle/SMX/SMY distances"));
         }
         Ok(model)
