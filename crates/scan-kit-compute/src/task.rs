@@ -1165,13 +1165,12 @@ impl McPlotStage {
             &self.root,
             &self.sessions,
             &self.options,
-            Some(&|job| {
+            Some(&|_job| {
                 let at = next.get();
                 next.set(at + 1);
-                results
-                    .get(at)
-                    .cloned()
-                    .map_or_else(|| Ok(blank_result(job)), Ok)
+                // A missing job must fail, not paint a zero-dose cube that
+                // reads as a real result.
+                job_result(results, at)
             }),
         );
         self.pack(&mut scene, quality)
@@ -1238,7 +1237,14 @@ impl McPlotStage {
             .is_some_and(|worker| worker.is_finished())
         {
             if let Some(worker) = self.worker.take() {
-                let _ = worker.join();
+                // A panic unwinds without touching shared.error — keep the
+                // payload so the report says why.
+                if let Err(payload) = worker.join() {
+                    return self.fail(format!(
+                        "monte carlo worker panicked: {}",
+                        panic_note(&payload)
+                    ));
+                }
                 if !self.shared.ready_flag.load(Ordering::Acquire)
                     && locked(&self.shared.error).is_none()
                 {
@@ -1483,6 +1489,23 @@ fn all_histories(jobs: &[McJob]) -> u64 {
     jobs.iter()
         .map(|job| u64::from(job_histories(job).max(1)))
         .sum()
+}
+
+fn job_result(results: &[McResult], at: usize) -> Result<McResult, String> {
+    results.get(at).cloned().ok_or_else(|| {
+        format!(
+            "the scene asked for job {at} past {} results",
+            results.len()
+        )
+    })
+}
+
+fn panic_note(payload: &dyn std::any::Any) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|text| (*text).to_owned())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "unknown panic".to_owned())
 }
 
 fn blank_result(job: &McJob) -> McResult {
@@ -2027,6 +2050,25 @@ fn file_stamp(path: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_missing_job_result_errors_instead_of_painting_a_blank() {
+        // results[0] gone used to substitute a zero-dose cube.
+        let err = super::job_result(&[], 0).unwrap_err();
+        assert!(err.contains("job 0"), "{err}");
+    }
+
+    #[test]
+    fn a_worker_panic_keeps_its_message() {
+        let payload = std::thread::spawn(|| panic!("probe panic"))
+            .join()
+            .unwrap_err();
+        assert_eq!(super::panic_note(&*payload), "probe panic");
+        let payload = std::thread::spawn(|| panic!("{}", "owned"))
+            .join()
+            .unwrap_err();
+        assert_eq!(super::panic_note(&*payload), "owned");
+    }
+
     use super::*;
 
     fn scratch() -> PathBuf {
