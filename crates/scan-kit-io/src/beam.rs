@@ -46,7 +46,7 @@ impl BeamModel {
     /// A BDL `.txt` on disk — the validator's `third_party/MCsquare/BDL` files.
     pub fn read(path: &Path) -> Result<BeamModel, String> {
         let text = std::fs::read_to_string(path).map_err(|err| format!("{path:?}: {err}"))?;
-        let model = BeamModel::parse(&text);
+        let model = BeamModel::parse(&text)?;
         if model.rows.len() < 2 {
             return Err(format!(
                 "{path:?} has fewer than 2 energy rows — not a usable BDL file"
@@ -65,7 +65,7 @@ impl BeamModel {
         Ok(model)
     }
 
-    fn parse(text: &str) -> BeamModel {
+    fn parse(text: &str) -> Result<BeamModel, String> {
         let mut nozzle = 0.0;
         let mut smx = 0.0;
         let mut smy = 0.0;
@@ -74,7 +74,8 @@ impl BeamModel {
         let mut shifter_wet = 0.0;
         let mut rows = Vec::new();
         let mut lines = text.lines();
-        while let Some(line) = lines.next() {
+        let mut pending: Option<&str> = None;
+        while let Some(line) = pending.take().or_else(|| lines.next()) {
             let head = line.trim();
             if head == "Nozzle exit to Isocenter distance" {
                 nozzle = number(lines.next().unwrap_or(""));
@@ -84,8 +85,16 @@ impl BeamModel {
                 smy = number(lines.next().unwrap_or(""));
             } else if head == "Range Shifter parameters" {
                 for line in lines.by_ref() {
-                    if !line.contains('=') {
+                    let trimmed = line.trim();
+                    // A comment inside the block is part of it; a blank
+                    // line or a section header ends it  hand the
+                    // terminator back to the outer dispatch.
+                    if !trimmed.starts_with('#') && !trimmed.contains('=') {
+                        pending = Some(line);
                         break;
+                    }
+                    if trimmed.starts_with('#') {
+                        continue;
                     }
                     let (key, value) = line.split_once('=').unwrap_or(("", ""));
                     let value = value.split('#').next().unwrap_or("").trim();
@@ -100,22 +109,39 @@ impl BeamModel {
                 let _count = lines.next();
                 let _header = lines.next();
                 for line in lines.by_ref() {
-                    let line = line.split('#').next().unwrap_or("");
-                    let values: Vec<f32> = line
-                        .split_whitespace()
-                        .filter_map(|v| v.parse().ok())
-                        .collect();
-                    if values.len() == 18 {
-                        let mut row = [0.0; 18];
-                        row.copy_from_slice(&values);
-                        rows.push(row);
-                    } else if !rows.is_empty() {
-                        break;
+                    let text = line.split('#').next().unwrap_or("").trim();
+                    let parsed: Option<Vec<f32>> =
+                        text.split_whitespace().map(|v| v.parse().ok()).collect();
+                    match parsed {
+                        Some(values) if values.len() == 18 => {
+                            let mut row = [0.0; 18];
+                            row.copy_from_slice(&values);
+                            rows.push(row);
+                        }
+                        _ if text.is_empty() && rows.is_empty() => {}
+                        _ if text.is_empty() => break,
+                        _ if text
+                            .split_whitespace()
+                            .next()
+                            .is_some_and(|first| first.parse::<f32>().is_ok()) =>
+                        {
+                            // Starts with a number but isn't a clean
+                            // 18-column row - corrupt data, not a header.
+                            return Err(format!("malformed energy row in BDL table: {text:?}"));
+                        }
+                        // Non-numeric junk before the first row.
+                        _ if rows.is_empty() => {}
+                        // A section header ends the table  hand it back
+                        // to the outer dispatch.
+                        _ => {
+                            pending = Some(line);
+                            break;
+                        }
                     }
                 }
             }
         }
-        BeamModel {
+        Ok(BeamModel {
             nozzle,
             smx,
             smy,
@@ -123,7 +149,7 @@ impl BeamModel {
             shifter_material,
             shifter_density,
             shifter_wet,
-        }
+        })
     }
 
     /// Kernel beam record: *rotation* takes the beam frame to the volume frame,
@@ -223,8 +249,11 @@ fn fill_spot(
     rec[14..20].copy_from_slice(&g1y);
     rec[20..26].copy_from_slice(&g2);
     rec[26..32].copy_from_slice(&g2y);
-    if wet_mm.is_finite() && wet_mm < 0.0 {
+    if wet_mm < 0.0 {
         return Err(format!("negative range shifter thickness {wet_mm}"));
+    }
+    if wet_mm == f32::INFINITY {
+        return Err("infinite range shifter thickness".to_string());
     }
     if wet_mm > 0.0 || wet_mm.is_nan() {
         let wet = if wet_mm.is_nan() {
@@ -323,7 +352,7 @@ fn check_energy(rows: &[[f32; 18]], energy: f32) -> Result<(), String> {
 }
 
 fn model_of(name: &str) -> BeamModel {
-    BeamModel::parse(bdl_text(name))
+    BeamModel::parse(bdl_text(name)).expect("bundled BDL text parses")
 }
 
 fn number(line: &str) -> f32 {
@@ -397,7 +426,10 @@ mod tests {
         let err = BeamModel::read(&file).err().unwrap();
         assert!(err.contains("energy rows"));
         // column() itself stays safe even on a degenerate model.
-        assert!(BeamModel::parse("").protons_per_mu(100.0).is_err());
+        assert!(BeamModel::parse("")
+            .expect("empty parses")
+            .protons_per_mu(100.0)
+            .is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -420,7 +452,7 @@ mod tests {
         let row = |first: &str| format!("{first} {}", "0 ".repeat(17));
         let geometry = "Nozzle exit to Isocenter distance
 100
-            SMX to Isocenter distance
+ SMX to Isocenter distance
 50
 SMY to Isocenter distance
 50
@@ -486,5 +518,47 @@ h
         assert!(protons_per_mu(f32::NAN).is_err());
         assert!(protons_per_mu(f32::INFINITY).is_err());
         assert!(protons_per_mu(100.0).is_ok());
+    }
+
+    #[test]
+    fn an_infinite_wet_is_rejected_like_a_negative_one() {
+        let model = model_of("un_rs");
+        assert!(model
+            .spot_record(150.0, 0.0, 0.0, 0.0, f32::NEG_INFINITY, 300.0)
+            .is_err());
+        assert!(model
+            .spot_record(150.0, 0.0, 0.0, 0.0, f32::INFINITY, 300.0)
+            .is_err());
+    }
+
+    #[test]
+    fn a_malformed_energy_row_is_an_error_not_a_truncation() {
+        // One corrupt token in a data row must fail loudly rather than
+        // silently drop every row below it.
+        let text = bdl_text("un_rs").replace("95212461.7", "oops");
+        assert!(BeamModel::parse(&text).is_err());
+    }
+
+    #[test]
+    fn a_header_after_the_shifter_block_is_not_eaten() {
+        // No blank line between RS_WET and the next section - the
+        // terminator must be handed back to the outer dispatch.
+        let row = "100.0 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1";
+        let row2 = "200.0 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2";
+        let text = format!(
+            "Range Shifter parameters
+RS_WET = 40
+# comment inside the block
+RS_density = 2.5
+Beam parameters
+2
+h
+{row}
+{row2}
+"
+        );
+        let model = BeamModel::parse(&text).expect("parses");
+        assert_eq!(model.shifter_density, 2.5);
+        assert_eq!(model.rows.len(), 2);
     }
 }
