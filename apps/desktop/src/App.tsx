@@ -630,28 +630,32 @@ export default function App() {
         } else if (active) {
           await persistGeometry();
         }
-        const resized = await win.onResized(save);
-        const moved = await win.onMoved(save);
-        const closing = await win.onCloseRequested(async (event) => {
-          event.preventDefault();
-          window.clearTimeout(timer);
-          try {
-            await persistGeometry();
-          } catch {
-            // A failed geometry write still lets the window close.
-          } finally {
-            await win.destroy().catch(() => {});
-          }
-        });
-        if (active) {
-          unlisten = [resized, moved, closing];
-        } else {
-          resized();
-          moved();
-          closing();
+        // Push each unlisten as its registration lands — a mid-sequence
+        // throw must still undo the ones already wired up.
+        unlisten.push(await win.onResized(save));
+        unlisten.push(await win.onMoved(save));
+        unlisten.push(
+          await win.onCloseRequested(async (event) => {
+            event.preventDefault();
+            window.clearTimeout(timer);
+            try {
+              await persistGeometry();
+            } catch {
+              // A failed geometry write still lets the window close.
+            } finally {
+              await win.destroy().catch(() => {});
+            }
+          }),
+        );
+        if (!active) {
+          unlisten.forEach((fn) => fn());
+          unlisten = [];
         }
       } catch {
-        // Vite in a browser has no window plugin. The menu still renders.
+        // Undo whatever did register before the throw. Vite in a browser
+        // has no window plugin; the menu still renders.
+        unlisten.forEach((fn) => fn());
+        unlisten = [];
       }
     })();
     return () => {

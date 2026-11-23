@@ -39,10 +39,14 @@ export function Splitter({
       handle.removeEventListener("pointermove", onPointerMove);
       handle.removeEventListener("pointerup", onUp);
       handle.removeEventListener("pointercancel", onUp);
+      handle.removeEventListener("lostpointercapture", onUp);
     };
     handle.addEventListener("pointermove", onPointerMove);
     handle.addEventListener("pointerup", onUp);
     handle.addEventListener("pointercancel", onUp);
+    // An implicit capture release (re-parented node, second gesture source)
+    // skips pointerup — the armed move handler must still come down.
+    handle.addEventListener("lostpointercapture", onUp);
   };
   const onKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
     const step =
