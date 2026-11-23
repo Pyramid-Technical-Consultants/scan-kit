@@ -1177,29 +1177,27 @@ pub fn inside_structure(
         ct.origin[1] + y as f32 * ct.spacing[1],
         ct.origin[2] + z as f32 * ct.spacing[2],
     ];
-    let mut on_plane = false;
     // Even-odd parity only composes within one plane — bucket the ray counts
     // per contour z so distinct planes union instead of XOR-cancelling.
     let mut planes: Vec<(f32, i32)> = Vec::new();
+    let mut plane_lo = f32::INFINITY;
+    let mut plane_hi = f32::NEG_INFINITY;
     for contour in &structure.contour {
         let Some(z0) = contour.first().map(|point| point[2]) else {
             continue;
         };
         // A contour whose vertices straddle slices can't rasterize on one
-        // plane — skip it rather than stamping it onto the wrong slice. A
-        // contour lying between slices stamps only its nearest slice —
-        // a distance window would admit it on both, painting a phantom
-        // slice into the mask.
+        // plane — skip it rather than stamping it onto the wrong slice.
         let (z_lo, z_hi) = contour
             .iter()
             .fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), p| {
                 (lo.min(p[2]), hi.max(p[2]))
             });
-        let nearest = ((z0 - ct.origin[2]) / ct.spacing[2]).round() as i64;
-        if !z0.is_finite() || z_hi - z_lo > ct.spacing[2] * 0.1 || nearest != z as i64 {
+        if !z0.is_finite() || z_hi - z_lo > ct.spacing[2] * 0.1 {
             continue;
         }
-        on_plane = true;
+        plane_lo = plane_lo.min(z0);
+        plane_hi = plane_hi.max(z0);
         let n = contour.len();
         let mut hits = 0;
         for i in 0..n {
@@ -1220,7 +1218,28 @@ pub fn inside_structure(
             None => planes.push((z0, hits)),
         }
     }
-    on_plane && planes.iter().any(|(_, hits)| hits % 2 == 1)
+    // A contour stamps the slice its plane rounds to. A contour lying
+    // between slices stamps only its nearest slice — a distance window
+    // would admit it on both, painting a phantom slice into the mask.
+    if planes.iter().any(|(z0, hits)| {
+        ((z0 - ct.origin[2]) / ct.spacing[2]).round() as i64 == z as i64 && hits % 2 == 1
+    }) {
+        return true;
+    }
+    // ponytail: a contour pitch coarser than the slice pitch leaves
+    // interior slices un-stamped — assign them the nearest plane inside
+    // the structure's z extent (nearest-neighbour interpolation, never
+    // extrapolation) or the mask stripes and volume_cc under-counts.
+    // True polygon interpolation is the upgrade if a study needs it.
+    if center[2] >= plane_lo && center[2] <= plane_hi {
+        if let Some((_, hits)) = planes
+            .iter()
+            .min_by(|a, b| (a.0 - center[2]).abs().total_cmp(&(b.0 - center[2]).abs()))
+        {
+            return hits % 2 == 1;
+        }
+    }
+    false
 }
 
 /// Column sign, then row sign, for an axial image. Missing orientation is the
@@ -2236,6 +2255,50 @@ mod tests {
         };
         assert!(inside_structure(&study, &ring, 0, 2, 0));
         assert!(!inside_structure(&study, &ring, 2, 2, 0));
+    }
+
+    #[test]
+    fn sparse_contours_fill_the_slices_between_them() {
+        // A contour pitch above the slice pitch used to leave interior
+        // slices un-stamped — the mask striped and volume under-counted.
+        // Interior slices take the nearest plane; a slice past the
+        // structure's z extent still stays empty (no extrapolation).
+        let study = PatientStudy {
+            frame: String::new(),
+            ct: CtVolume {
+                frame: String::new(),
+                origin: [0.0, 0.0, 0.0],
+                spacing: [1.0, 1.0, 1.0],
+                shape: [4, 4, 5],
+                hu: vec![0.0; 80],
+                position: "HFS".into(),
+                dose_type: String::new(),
+                summation: String::new(),
+                patient_id: String::new(),
+                patient_name: String::new(),
+                study_uid: String::new(),
+                series_uid: String::new(),
+                sop_uids: Vec::new(),
+            },
+            beams: Vec::new(),
+            fractions: 1,
+            structures: Vec::new(),
+            tps: None,
+            prescription: f32::NAN,
+            plan_uid: String::new(),
+            plan_label: String::new(),
+            structures_uid: String::new(),
+        };
+        let square = |z: f32| vec![[0.0, 0.0, z], [4.0, 0.0, z], [4.0, 4.0, z], [0.0, 4.0, z]];
+        let structure = Structure {
+            name: "PTV".into(),
+            contour: vec![square(0.0), square(3.0)],
+        };
+        assert!(inside_structure(&study, &structure, 1, 1, 0));
+        assert!(inside_structure(&study, &structure, 1, 1, 1));
+        assert!(inside_structure(&study, &structure, 1, 1, 2));
+        assert!(inside_structure(&study, &structure, 1, 1, 3));
+        assert!(!inside_structure(&study, &structure, 1, 1, 4));
     }
 
     #[test]
