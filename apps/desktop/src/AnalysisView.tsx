@@ -145,7 +145,8 @@ function NumberField({
   }
   const commit = (raw: string) => {
     const parsed = Number(raw);
-    if (!Number.isFinite(parsed)) {
+    // Number("") is 0 — a blank field must restore, not apply the clamp.
+    if (raw.trim() === "" || !Number.isFinite(parsed)) {
       setDraft(value);
       return;
     }
@@ -315,7 +316,8 @@ function ChoiceSelect({
   onChange: (value: string) => void;
 }) {
   const items = control.options.map((option) => ({ ...option, value: option.label }));
-  const selected = items.find((item) => item.value === value) ?? items[0];
+  // An unmatched value renders the placeholder, never option 0 in disguise.
+  const selected = items.find((item) => item.value === value);
   return (
     <Select
       items={items}

@@ -38,7 +38,8 @@ function label(part: unknown): string {
 
 /** Subnet to scan, derived from the typed host or the IGX default subnet. */
 function defaultSubnet(host: string): string {
-  const match = /^(\d{1,3}\.\d{1,3}\.\d{1,3})\.\d{1,3}/.exec(host.trim());
+  // URL-form hosts ("http://10.4.2.55/io/") have no octet at position 0.
+  const match = /(\d{1,3}\.\d{1,3}\.\d{1,3})\.\d{1,3}/.exec(host.trim());
   return match ? `${match[1]}.0/24` : "192.168.100.0/24";
 }
 

@@ -1527,6 +1527,8 @@ pub struct Plot {
     side: u32,
     /// Gap under the pointer while a divider is dragged. Cleared when the button lifts.
     split_grab: Option<SplitGrab>,
+    /// Gap hit-test already ran for the current drag.
+    split_probed: bool,
     /// Uploaded dose grid. Paging and orbit sample it; they do not replace it.
     dose: Option<crate::dose::DoseGrid>,
     /// Atlas heatmap that holds the dose slices and the ramp row.
@@ -1645,6 +1647,7 @@ impl Plot {
             row_splits,
             side,
             split_grab: None,
+            split_probed: false,
             dose: None,
             dose_atlas: None,
             ramp_dirty: false,
@@ -3023,8 +3026,18 @@ impl Plot {
     }
 
     fn apply_pointer(&mut self, width: u32, height: u32, input: &PlotInput) {
+        // NaN/inf deltas poison orbit, pan, and split state permanently.
+        if !(input.x.is_finite()
+            && input.y.is_finite()
+            && input.dx.is_finite()
+            && input.dy.is_finite()
+            && input.wheel.is_finite())
+        {
+            return;
+        }
         if !input.drag {
             self.split_grab = None;
+            self.split_probed = false;
         }
         if !input.drag && input.wheel == 0.0 {
             return;
@@ -3173,7 +3186,8 @@ impl Plot {
         if !input.drag {
             return false;
         }
-        if self.split_grab.is_none() {
+        if self.split_grab.is_none() && !self.split_probed {
+            self.split_probed = true;
             self.split_grab = hit_split(
                 self.panels.len(),
                 width,
@@ -6412,7 +6426,7 @@ fn axis_ticks(lo: f32, hi: f32) -> Vec<(f32, bool)> {
     let mut ticks = Vec::with_capacity(count + 2);
     for index in 0..count {
         let k = k0 + index as i64;
-        let gap = (k - k0).min(k1 - k);
+        let gap = (k - k0).min(k1.saturating_sub(k));
         let major = index == 0
             || index + 1 == count
             || (k.rem_euclid(every) == 0 && gap as f32 >= 0.6 * every as f32);
@@ -7459,8 +7473,11 @@ fn panel_rects(
     // Extra room on the right so the 1px frame is not cut by the canvas edge.
     let margin_right = 16.0f32;
     let inner_w = width as f32 - margin - margin_right - gap * (cols.saturating_sub(1) as f32);
-    let col_weight = if weights.len() == cols {
-        weights.to_vec()
+    let col_weight: Vec<f32> = if weights.len() == cols {
+        weights
+            .iter()
+            .map(|w| if w.is_finite() { w.max(0.0) } else { 0.0 })
+            .collect()
     } else {
         vec![1.0; cols]
     };
@@ -7570,7 +7587,18 @@ fn side_column(
     let margin_right = 16.0f32;
     let inner_w = width as f32 - margin - margin_right - gap;
     let col_weight = if weights.len() == 2 {
-        [weights[0], weights[1]]
+        [
+            if weights[0].is_finite() {
+                weights[0].max(0.0)
+            } else {
+                0.0
+            },
+            if weights[1].is_finite() {
+                weights[1].max(0.0)
+            } else {
+                0.0
+            },
+        ]
     } else {
         [1.0, 1.0]
     };
@@ -7609,6 +7637,10 @@ fn grid_with_side(
     let margin_right = 16.0f32;
     let bands = cols + 1;
     let inner_w = width as f32 - margin - margin_right - gap * (bands.saturating_sub(1) as f32);
+    let weights: Vec<f32> = weights
+        .iter()
+        .map(|w| if w.is_finite() { w.max(0.0) } else { 0.0 })
+        .collect();
     let weight_sum = weights.iter().sum::<f32>().max(1.0e-6);
     let mut col_x = Vec::with_capacity(bands);
     let mut col_w = Vec::with_capacity(bands);

@@ -225,14 +225,16 @@ pub(super) fn distribution_limits(mode: &str, samples: &[f32]) -> (f32, f32) {
         } else {
             let lo = percentile_at(&mut finite, 0.0005);
             let hi = percentile_at(&mut finite, 0.9995);
-            let mid = 0.5 * (lo + hi);
+            // lo + hi overflows on extreme-but-finite columns — midpoint
+            // and the pad below must survive f32::MAX samples.
+            let mid = lo.midpoint(hi);
             let half = (mid - lo).max(hi - mid).max(0.5);
             (mid - half, mid + half)
         }
     };
     // A little past the spots so they are not drawn on the frame.
     let pad = ((hi - lo) * 0.06).max(1.0e-4);
-    (lo - pad, hi + pad)
+    ((lo - pad).max(-f32::MAX), (hi + pad).min(f32::MAX))
 }
 
 fn on_off(on: bool) -> &'static str {
@@ -355,7 +357,7 @@ fn padded_span(values: &[f32]) -> (f32, f32) {
         return (0.0, 1.0);
     }
     let pad = ((hi - lo) * 0.04).max(1e-4);
-    (lo - pad, hi + pad)
+    ((lo - pad).max(-f32::MAX), (hi + pad).min(f32::MAX))
 }
 
 struct DrawnColumn {
@@ -931,4 +933,18 @@ fn spot_coverage_metrics(
         .map(|(x, y)| x.min(y))
         .filter(|value| value.is_finite())
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extreme_finite_columns_produce_finite_limits() {
+        let samples = vec![-f32::MAX, f32::MAX];
+        let (lo, hi) = distribution_limits("spots", &samples);
+        assert!(lo.is_finite() && hi.is_finite());
+        let (lo, hi) = padded_span(&samples);
+        assert!(lo.is_finite() && hi.is_finite());
+    }
 }

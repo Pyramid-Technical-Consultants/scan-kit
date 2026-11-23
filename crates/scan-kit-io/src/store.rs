@@ -12,7 +12,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use scan_kit_core::{SessionMeta, SummaryDate};
 use serde_json::{json, Value};
 
-use super::discover::{self, Discovered, ExamHit};
+use super::discover::{Discovered, ExamHit};
 
 const SCHEMA_VERSION: i32 = 4;
 const PREF_LAST_DATA_DIR: &str = "session.last_data_dir";
@@ -55,6 +55,14 @@ pub fn with_store<T>(
     let _guard = STORE_LOCK.lock().unwrap_or_else(|err| err.into_inner());
     let mut conn = open_connection(path)?;
     body(&mut conn)
+}
+
+/// Short STORE_LOCK sections on an already-open connection — file and
+/// network IO must run outside the lock, not inside a fresh with_store
+/// per item.
+pub(crate) fn locked<T>(body: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    let _guard = STORE_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+    body()
 }
 
 pub fn open_connection(path: &Path) -> Result<Connection, String> {
@@ -116,9 +124,13 @@ pub fn set_window_geometry(
     x: i32,
     y: i32,
 ) -> Result<(), String> {
-    // Untrusted invoke args — don't persist dimensions a platform can't show.
+    // Untrusted invoke args — don't persist dimensions or positions a
+    // platform can't show (an i32::MIN origin restores fully off-screen).
     if !(1..=32768).contains(&width) || !(1..=32768).contains(&height) {
         return Err(format!("invalid window size {width}x{height}"));
+    }
+    if !(-32768..=32768).contains(&x) || !(-32768..=32768).contains(&y) {
+        return Err(format!("invalid window position {x},{y}"));
     }
     prefs_patch(
         conn,
@@ -302,8 +314,15 @@ pub enum Cache {
     Hydrate,
 }
 
-pub fn sync_entry(conn: &Connection, lib_id: i64, entry: &Discovered) -> Result<Cache, String> {
-    let fingerprint = discover::storage_fingerprint(&entry.storage_path, &entry.session_id);
+/// `fingerprint` comes from `discover::storage_fingerprint` — the caller
+/// computes it BEFORE taking STORE_LOCK because a remote stat is a fresh
+/// connection.
+pub fn sync_entry(
+    conn: &Connection,
+    lib_id: i64,
+    entry: &Discovered,
+    fingerprint: Option<(i64, i64)>,
+) -> Result<Cache, String> {
     let (mtime_ns, size) = match fingerprint {
         Some((mtime, size)) => (Some(mtime), Some(size)),
         None => (None, None),
@@ -376,18 +395,20 @@ pub fn sync_entry(conn: &Connection, lib_id: i64, entry: &Discovered) -> Result<
     Ok(Cache::Hydrate)
 }
 
+/// `fingerprint` comes from `discover::storage_fingerprint` — the caller
+/// computes it before STORE_LOCK; a remote stat is a fresh connection.
 pub fn record_meta(
     conn: &Connection,
     lib_id: i64,
     entry: &Discovered,
     meta: Option<&SessionMeta>,
     checked: bool,
+    fingerprint: Option<(i64, i64)>,
 ) -> Result<(), String> {
     // The UPDATE below leaves size/mtime_ns alone: sync_entry stamps them
     // before hydrate reads any bytes, and restatting now would certify
     // content the row does not hold — a stored fingerprint newer than the
     // hydrated bytes pins stale meta instead of re-reading it.
-    let fingerprint = discover::storage_fingerprint(&entry.storage_path, &entry.session_id);
     let (mtime_ns, size) = match fingerprint {
         Some((mtime, size)) => (Some(mtime), Some(size)),
         None => (None, None),
@@ -1345,7 +1366,7 @@ mod tests {
         };
         // checked=false: the storage was unreachable, so NULL meta is a
         // transient failure, not an absence — the next scan retries.
-        record_meta(&conn, lib_id, &entry, None, false).unwrap();
+        record_meta(&conn, lib_id, &entry, None, false, None).unwrap();
         let checked: i64 = conn
             .query_row(
                 "SELECT map_geom_checked FROM sessions
@@ -1356,7 +1377,7 @@ mod tests {
             .unwrap();
         assert_eq!(checked, 0);
         // checked=true: readable storage without meta — seal so scans skip it.
-        record_meta(&conn, lib_id, &entry, None, true).unwrap();
+        record_meta(&conn, lib_id, &entry, None, true, None).unwrap();
         let checked: i64 = conn
             .query_row(
                 "SELECT map_geom_checked FROM sessions
@@ -1381,13 +1402,13 @@ mod tests {
             storage_path: root.join("keep.zip"),
             kind: "zip",
         };
-        record_meta(&conn, lib_id, &entry, None, true).unwrap();
+        record_meta(&conn, lib_id, &entry, None, true, None).unwrap();
         let entry = Discovered {
             session_id: "drop".to_owned(),
             storage_path: root.join("drop.zip"),
             kind: "zip",
         };
-        record_meta(&conn, lib_id, &entry, None, true).unwrap();
+        record_meta(&conn, lib_id, &entry, None, true, None).unwrap();
         conn.execute(
             "UPDATE libraries SET selected_sessions = ?1 WHERE id = ?2",
             params![r#"["keep","drop"]"#, lib_id],
@@ -1423,5 +1444,15 @@ mod tests {
         forget_data_dir(&conn, "/one").unwrap();
         assert!(data_dirs(&conn).unwrap().is_empty());
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn an_off_screen_window_origin_is_rejected() {
+        let path = temp_db("geompos");
+        let conn = open_connection(&path).unwrap();
+        assert!(set_window_geometry(&conn, 800, 600, i32::MIN, 0).is_err());
+        assert!(set_window_geometry(&conn, 800, 600, 0, i32::MAX).is_err());
+        set_window_geometry(&conn, 800, 600, -100, 100).unwrap();
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 }

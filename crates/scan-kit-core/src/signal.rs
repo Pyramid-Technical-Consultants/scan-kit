@@ -730,13 +730,13 @@ pub fn robust_limits_finite(values: &mut [f32]) -> Option<(f32, f32)> {
     };
     let scale = hi.abs().max(lo.abs());
     let pad = ((hi - lo) * 0.02).max(scale * 0.02).max(1.0e-6);
-    Some((lo - pad, hi + pad))
+    Some(((lo - pad).max(-f32::MAX), (hi + pad).min(f32::MAX)))
 }
 
 /// Time span plus a small margin. The floor is one 1 ms sample, and the start stays at 0.
 pub fn time_window(lo: f32, hi: f32) -> (f32, f32) {
     let pad = ((hi - lo) * 0.02).max(0.001);
-    ((lo - pad).max(0.0), hi + pad)
+    ((lo - pad).max(0.0), (hi + pad).min(f32::MAX))
 }
 
 pub fn median_finite(values: &[f32]) -> Option<f32> {
@@ -1353,5 +1353,14 @@ mod tests {
         let (_, nan_overlap) = welch_psd(&signal, 100.0, 64, f32::NAN);
         assert_eq!(out_of_range, psd);
         assert_eq!(nan_overlap, psd);
+    }
+
+    #[test]
+    fn extreme_finite_samples_stay_finite() {
+        let mut values = vec![-f32::MAX, f32::MAX];
+        let (lo, hi) = robust_limits_finite(&mut values).unwrap();
+        assert!(lo.is_finite() && hi.is_finite());
+        let (wlo, whi) = time_window(-f32::MAX, f32::MAX);
+        assert!(wlo.is_finite() && whi.is_finite());
     }
 }

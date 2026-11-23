@@ -196,7 +196,7 @@ export function PhantomSynthesis() {
             >
               10 MeV
             </Button>
-            <Button type="button" size="sm" variant="outline" onClick={() => setEnergies([140, 130, 120])}>
+            <Button type="button" size="sm" variant="outline" onClick={() => setEnergies([140, 130, 120].filter((energy) => catalog.energies.includes(energy)))}>
               140–120
             </Button>
           </div>

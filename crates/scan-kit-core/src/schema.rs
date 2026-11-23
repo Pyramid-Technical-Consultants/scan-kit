@@ -159,7 +159,9 @@ pub static CONCEPT_ALIASES: &[ConceptAlias] = &[
         concept: "ic1_scan_total_dose",
         names: &[
             "r_ic1_scan_total_dose",
+            "r_ic1_scan_total_dose_raw",
             "ic1_scan_total_dose",
+            "ic1_scan_total_dose_raw",
             "ic1_dose_total",
         ],
     },
@@ -167,7 +169,9 @@ pub static CONCEPT_ALIASES: &[ConceptAlias] = &[
         concept: "ic2_scan_total_dose",
         names: &[
             "r_ic2_scan_total_dose",
+            "r_ic2_scan_total_dose_raw",
             "ic2_scan_total_dose",
+            "ic2_scan_total_dose_raw",
             "ic2_dose_total",
         ],
     },
@@ -176,7 +180,9 @@ pub static CONCEPT_ALIASES: &[ConceptAlias] = &[
         names: &[
             "ic3_dose_total",
             "ic3_scan_total_dose",
+            "ic3_scan_total_dose_raw",
             "r_ic3_scan_total_dose",
+            "r_ic3_scan_total_dose_raw",
             "r_ic3_dose_total",
         ],
     },

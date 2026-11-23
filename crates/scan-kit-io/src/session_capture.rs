@@ -847,13 +847,21 @@ fn join_spot_data(spots: &[(&CaptureDevice, Sheet)]) -> Option<String> {
 /// (G3 destination, device source) column pairs for a device's spot block.
 /// Measured columns land on their `*_raw` names (raw-only mode).
 fn spot_columns(device: &CaptureDevice, sheet: &Sheet) -> (Vec<String>, Vec<String>) {
-    let mut pairs: Vec<(String, String)> = vec![
-        ("spot_no".into(), "spot_no".into()),
-        ("layer_id".into(), "layer_id".into()),
-        ("timesliceNumber".into(), "timeslice_number".into()),
-        ("timestamp".into(), "timeslice_timestamp".into()),
-        ("point_time".into(), "point_time".into()),
-    ];
+    let mut pairs: Vec<(String, String)> = vec![];
+    // A meta column the device lacks lands as an all-empty shadow that
+    // renames the real column in a later block to "timestamp.1" — only emit
+    // what the sheet actually carries.
+    for (dest, src) in [
+        ("spot_no", "spot_no"),
+        ("layer_id", "layer_id"),
+        ("timesliceNumber", "timeslice_number"),
+        ("timestamp", "timeslice_timestamp"),
+        ("point_time", "point_time"),
+    ] {
+        if sheet.column(src).is_some() {
+            pairs.push((dest.into(), src.into()));
+        }
+    }
     if device.name == "RCI" {
         pairs.push(("c_current_rci".into(), "beam_current_command".into()));
     } else if let Some(ic) = ic_prefix(sheet) {
@@ -1076,7 +1084,7 @@ fn column_icase(sheet: &Sheet, name: &str) -> Vec<f64> {
     let index = sheet
         .header
         .iter()
-        .position(|cell| cell.trim().eq_ignore_ascii_case(name));
+        .position(|cell| base_name(cell.trim()).eq_ignore_ascii_case(name));
     index
         .map(|i| {
             sheet
@@ -1107,7 +1115,10 @@ fn write_termination(
     let last_dose = |ic: &str| -> Option<String> {
         let sheet = ic_sheet(ic)?;
         let index = sheet.column("total_dose")?;
-        sheet.rows.last()?.get(index).cloned()
+        let dose: f64 = sheet.rows.last()?.get(index)?.trim().parse().ok()?;
+        // Summary convention is measured units — "Total dose target" below
+        // scales its C targets INTO nC to sit beside this raw nC total.
+        Some(num_text(dose))
     };
     let input_map = std::fs::read(dir.join("input_map.csv"))
         .ok()
@@ -1406,6 +1417,55 @@ mod tests {
         }
     }
 
+    #[test]
+    fn meta_columns_a_device_lacks_do_not_shadow_later_blocks() {
+        // First sheet carries no timeslice_timestamp/point_time — emitting
+        // all-empty destination columns would rename a later block's real
+        // "timestamp" to "timestamp.1".
+        let dev = device("IC");
+        let sheet = sheet("spot_no,total_dose\n1,2.5\n");
+        let (dest, _src) = spot_columns(&dev, &sheet);
+        assert!(!dest.iter().any(|d| d == "timestamp" || d == "point_time"));
+        assert!(dest.iter().any(|d| d == "spot_no"));
+    }
+
+    #[test]
+    fn a_header_with_a_unit_suffix_still_matches_its_base_name() {
+        let sheet = sheet("ENERGY(MeV),total_dose\n70.0,1.0\n");
+        assert_eq!(column_icase(&sheet, "energy"), vec![70.0]);
+    }
+
+    #[test]
+    fn the_termination_summary_keeps_dose_lines_in_measured_units() {
+        // Device logs nC and the summary's target line is scaled INTO nC —
+        // the primary/secondary totals must emit the same unit.
+        let dir = std::env::temp_dir().join(format!("sk_r21_term_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dev = device("IC");
+        let sheet = sheet(
+            "point_dose,total_dose,ic1_total_dose,ic1_dose_target\n1.0e8,1.0e8,1.0e8,0.1\n2.0e8,2.0e8,2.0e8,0.2\n",
+        );
+        let spots = vec![(&dev, sheet)];
+        let status = Map::new();
+        write_termination(&dir, "sess", &status, &spots, &[]).unwrap();
+        let text = std::fs::read_to_string(dir.join("termination_summary.txt")).unwrap();
+        let dose_line = text
+            .lines()
+            .find(|line| line.starts_with("Secondary total dose"))
+            .unwrap_or("");
+        let target_line = text
+            .lines()
+            .find(|line| line.starts_with("Total dose target"))
+            .unwrap_or("");
+        // Both in nC: the raw 2.0e8 total and 0.3 C of targets x 1e9.
+        assert!(dose_line.contains("200000000"), "dose line: {dose_line}");
+        assert!(
+            target_line.contains("3000000"),
+            "target line: {target_line}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     fn refs(parts: &[(CaptureDevice, Sheet)]) -> Vec<(&CaptureDevice, Sheet)> {
         parts
             .iter()
@@ -1544,10 +1604,10 @@ mod tests {
         assert_eq!(rows.len(), 2); // RCI order; spot 2 has no IC row
         assert_eq!(
             rows[0],
-            "1,0,1,10,,9,1,1,0,1,10,5,0.4,3.5,4e-10,11,0.1,12,0.2,1,1,0,1,10,5,-1.8,-1.9,1,,7"
+            "1,0,1,10,9,1,1,0,1,10,5,0.4,3.5,4e-10,11,0.1,12,0.2,1,1,0,1,10,5,-1.8,-1.9,1,,7"
         );
         // Spot 2: IC and TX2 block cells are empty.
-        assert_eq!(rows[1], "2,0,2,20,,8,1,,,,,,,,,,,,,,,,,,,,,,,");
+        assert_eq!(rows[1], "2,0,2,20,8,1,,,,,,,,,,,,,,,,,,,,,,,");
     }
 
     #[test]
@@ -1634,7 +1694,7 @@ mod tests {
         let summary = std::fs::read_to_string(dir.join("termination_summary.txt")).unwrap();
         assert!(summary.contains("Layer delivery: 1/1"), "{summary}");
         assert!(summary.contains("Spot delivery: 2/1"), "{summary}");
-        assert!(summary.contains("Secondary total dose: 7.0"), "{summary}");
+        assert!(summary.contains("Secondary total dose: 7"), "{summary}");
         assert!(
             summary.contains("Energy min: 70\nEnergy max: 70"),
             "{summary}"
