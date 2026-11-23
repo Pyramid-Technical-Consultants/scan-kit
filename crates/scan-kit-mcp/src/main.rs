@@ -95,7 +95,7 @@ impl ScanKit {
         // Nested containers (params.dicom_path, options.study/scanners…) also
         // carry caller-chosen paths, so every string anywhere in the input is
         // checked — enumerating nested keys would just rot again.
-        let remote = Self::remote_in(input);
+        let remote = Self::remote_in(input, name);
         (saves || foreign_db || remote).then_some(name)
     }
 
@@ -127,25 +127,31 @@ impl ScanKit {
 
     /// Walks every string in the input; a JSON-in-JSON value such as
     /// options.scanners (a string carrying an array) is walked too.
-    fn remote_in(value: &Value) -> bool {
-        Self::remote_in_at(value, true)
+    fn remote_in(value: &Value, name: &str) -> bool {
+        Self::remote_in_at(value, true, name)
     }
 
-    fn remote_in_at(value: &Value, top: bool) -> bool {
+    fn remote_in_at(value: &Value, top: bool, name: &str) -> bool {
         match value {
             Value::String(spec) => {
                 Self::remote_spec(spec)
                     || serde_json::from_str::<Value>(spec)
                         .ok()
-                        .is_some_and(|parsed| Self::remote_in_at(&parsed, false))
+                        .is_some_and(|parsed| Self::remote_in_at(&parsed, false, name))
             }
-            Value::Array(items) => items.iter().any(|item| Self::remote_in_at(item, false)),
+            Value::Array(items) => items
+                .iter()
+                .any(|item| Self::remote_in_at(item, false, name)),
             // `note` is the one free-text field in the tool surface — a note
             // that *is* a URL must not trip the path gate. The exemption is
-            // top-level only: a nested `note` key carrying a location would
-            // otherwise walk straight past the gate.
+            // top-level only and scoped to the one tool that takes a note:
+            // a nested `note` key carrying a location would otherwise walk
+            // straight past the gate. Keys are checked too — a remote spec
+            // hiding in a field name must not slip through.
             Value::Object(map) => map.iter().any(|(key, value)| {
-                !(top && key == "note" && value.is_string()) && Self::remote_in_at(value, false)
+                Self::remote_spec(key)
+                    || !(top && name == "scan_kit_set_note" && key == "note" && value.is_string())
+                        && Self::remote_in_at(value, false, name)
             }),
             _ => false,
         }
@@ -261,6 +267,43 @@ impl ServerHandler for ScanKit {
                         None,
                     ));
                 }
+                // The advertised schema is the contract — a typo'd arg
+                // must not silently default (e.g. `db_pth` writes the
+                // default index, `dest` drops a save). db_path is exempt:
+                // dispatch reads it for every store tool regardless of
+                // what the schema lists.
+                if let Some(schema) = schema_for(&name).as_object() {
+                    let args = input.as_object();
+                    if let Some(missing) = schema
+                        .get("required")
+                        .and_then(Value::as_array)
+                        .and_then(|required| {
+                            required
+                                .iter()
+                                .filter_map(Value::as_str)
+                                .find(|key| args.is_none_or(|args| !args.contains_key(*key)))
+                        })
+                    {
+                        return Err(McpError::invalid_params(
+                            format!("{name} requires {missing}"),
+                            None,
+                        ));
+                    }
+                    if let Some(extra) = args.and_then(|args| {
+                        args.keys().find(|key| {
+                            *key != "db_path"
+                                && schema
+                                    .get("properties")
+                                    .and_then(Value::as_object)
+                                    .is_some_and(|props| !props.contains_key(*key))
+                        })
+                    }) {
+                        return Err(McpError::invalid_params(
+                            format!("{name} does not take {extra}"),
+                            None,
+                        ));
+                    }
+                }
                 // dispatch blocks on file IO, remote connect timeouts, and GPU
                 // waits — pinning a tokio worker starves every other request.
                 match tokio::task::spawn_blocking(move || dispatch(&name, &input)).await {
@@ -325,15 +368,38 @@ mod tests {
         // top-level note carrying a structured value, still trips the gate.
         assert!(!ScanKit::remote_in_at(
             &json!({"note": "sftp://device.invalid/data"}),
-            true
+            true,
+            "scan_kit_set_note"
         ));
         assert!(ScanKit::remote_in_at(
             &json!({"args": {"note": "sftp://device.invalid/data"}}),
-            true
+            true,
+            "scan_kit_set_note"
         ));
         assert!(ScanKit::remote_in_at(
             &json!({"note": {"path": "sftp://device.invalid/data"}}),
-            true
+            true,
+            "scan_kit_set_note"
+        ));
+    }
+
+    #[test]
+    fn the_note_exemption_is_scoped_to_set_note() {
+        // Another tool's top-level `note` carrying a location still trips the
+        // gate - only scan_kit_set_note earns the exemption.
+        assert!(ScanKit::remote_in_at(
+            &json!({"note": "sftp://device.invalid/data"}),
+            true,
+            "scan_kit_run_view"
+        ));
+    }
+
+    #[test]
+    fn a_remote_spec_in_a_key_trips_the_gate() {
+        assert!(ScanKit::remote_in_at(
+            &json!({"sftp://host.invalid/share": "x"}),
+            true,
+            "scan_kit_run_view"
         ));
     }
 
@@ -609,9 +675,14 @@ mod tests {
     #[test]
     fn a_nested_note_key_does_not_skip_the_gate() {
         let kit = ScanKit { effects: false };
-        // Top-level `note` is the free-text exemption.
+        // Top-level `note` is the free-text exemption — scoped to the one
+        // tool that takes a note.
         let top = serde_json::json!({ "note": "\\\\filer\\share\\x" });
-        assert_eq!(kit.blocked("scan_kit_run_view", &top), None);
+        assert_eq!(kit.blocked("scan_kit_set_note", &top), None);
+        assert_eq!(
+            kit.blocked("scan_kit_run_view", &top),
+            Some("scan_kit_run_view")
+        );
         // A `note` key at any deeper level is just a string — and must not
         // smuggle a remote spec past the gate.
         let nested = serde_json::json!({ "options": { "note": "\\\\filer\\share\\x" } });

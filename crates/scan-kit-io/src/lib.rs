@@ -418,7 +418,6 @@ pub fn tool_input_schema(name: &str) -> Value {
         "scan_kit_phantom_preview" => json!({
             "type": "object",
             "properties": { "params": { "type": "object" } },
-            "required": ["params"],
             "additionalProperties": false
         }),
         "scan_kit_write_phantom" => json!({
@@ -620,12 +619,38 @@ pub fn invoke(name: &str, input: &Value) -> Result<Value, InvokeError> {
         "scan_kit_load_timeslice" => {
             let path = required_str(input, "path")?;
             let session_id = required_str(input, "session_id")?;
-            Ok(load_timeslice_columns(Path::new(path), session_id))
+            let storage = Path::new(path);
+            // Match load_columns - a bad path or session id is an error,
+            // not a successful empty answer.
+            if !storage.exists() {
+                return Err(InvokeError::Message(format!(
+                    "{} does not exist",
+                    storage.display()
+                )));
+            }
+            if !discover::session_directory(storage, session_id).is_dir() {
+                return Err(InvokeError::Message(format!(
+                    "no session {session_id} under {path}"
+                )));
+            }
+            Ok(load_timeslice_columns(storage, session_id))
         }
         "scan_kit_channel_catalog" => {
             let path = required_str(input, "path")?;
             let session_id = required_str(input, "session_id")?;
-            Ok(json!({ "channels": channel_catalog(Path::new(path), session_id) }))
+            let storage = Path::new(path);
+            if !storage.exists() {
+                return Err(InvokeError::Message(format!(
+                    "{} does not exist",
+                    storage.display()
+                )));
+            }
+            if !discover::session_directory(storage, session_id).is_dir() {
+                return Err(InvokeError::Message(format!(
+                    "no session {session_id} under {path}"
+                )));
+            }
+            Ok(json!({ "channels": channel_catalog(storage, session_id) }))
         }
         "scan_kit_analysis_scene" => {
             let view = required_str(input, "view")?;
@@ -2011,5 +2036,30 @@ Layer delivery: 27/27
         assert_eq!(path, default_db_path());
         let path = database_path(&json!({"db_path": "  "})).unwrap();
         assert_eq!(path, default_db_path());
+    }
+
+    #[test]
+    fn a_missing_library_path_is_an_error_not_an_empty_answer() {
+        for tool in ["scan_kit_load_timeslice", "scan_kit_channel_catalog"] {
+            let result = invoke(
+                tool,
+                &json!({"path": "C:/definitely/not/here", "session_id": "x"}),
+            );
+            assert!(result.is_err(), "{tool} reported success on a bad path");
+        }
+    }
+
+    #[test]
+    fn a_wrong_session_id_is_an_error_not_an_empty_answer() {
+        let root = std::env::temp_dir().join(format!("scan-kit-sess-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        for tool in ["scan_kit_load_timeslice", "scan_kit_channel_catalog"] {
+            let result = invoke(
+                tool,
+                &json!({"path": root.display().to_string(), "session_id": "ghost"}),
+            );
+            assert!(result.is_err(), "{tool} reported success on a bad session");
+        }
+        let _ = fs::remove_dir_all(&root);
     }
 }
