@@ -2966,15 +2966,14 @@ impl Plot {
             &batch.line_runs,
             clip,
         );
+        let line_records = self.marks.lines.len();
         for (start, count) in draws.iter().rev() {
-            let Some(segments) = self
-                .marks
-                .lines
-                .get(*start as usize..(*start + *count) as usize)
-            else {
-                continue;
-            };
-            for line in segments.iter().rev() {
+            // An unadopted reuse_lines payload can claim more records than the
+            // suffix buffer holds — clamp like the GPU pass does, don't drop
+            // the painted tail.
+            let start = (*start as usize).min(line_records);
+            let end = start.saturating_add(*count as usize).min(line_records);
+            for line in self.marks.lines[start..end].iter().rev() {
                 let a = project(matrix, line.a, w, h);
                 let b = project(matrix, line.b, w, h);
                 if segment_distance(a, b, [x, y]) <= line.thickness.max(1.0) * 0.5 + 0.5 {
@@ -2989,7 +2988,7 @@ impl Plot {
             let p1 = project(matrix, [quad.b[0], quad.b[1], 0.0], w, h);
             if let Some(c) = quad.c {
                 let p2 = project(matrix, [c[0], c[1], 0.0], w, h);
-                return point_in_triangle([x, y], p0, p1, p2);
+                return owns_pixel_px([x, y], p0, p1, p2);
             }
             x >= p0[0].min(p1[0])
                 && x <= p0[0].max(p1[0])
@@ -3481,14 +3480,10 @@ impl Plot {
                 }
             }
             for (start, count) in &line_draws[cell.panel] {
-                let Some(segments) = self
-                    .marks
-                    .lines
-                    .get(*start as usize..(*start + *count) as usize)
-                else {
-                    continue;
-                };
-                for line in segments {
+                let line_records = self.marks.lines.len();
+                let start = (*start as usize).min(line_records);
+                let end = start.saturating_add(*count as usize).min(line_records);
+                for line in &self.marks.lines[start..end] {
                     stroke_cpu(&mut frame, width, height, &matrix, line, cell.plot);
                 }
             }
@@ -4344,19 +4339,16 @@ pub(crate) fn header_panels(panels: &[Panel]) -> Vec<Panel> {
         .collect()
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 fn orient_px(a: [f32; 2], b: [f32; 2], p: [f32; 2]) -> f32 {
     (b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0])
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 fn is_top_left_px(a: [f32; 2], b: [f32; 2]) -> bool {
     let dx = b[0] - a[0];
     let dy = b[1] - a[1];
     dy > 0.0 || (dy == 0.0 && dx < 0.0)
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 fn same_side_px(w: f32, area: f32, a: [f32; 2], b: [f32; 2]) -> bool {
     if w * area > 0.0 {
         return true;
@@ -4373,7 +4365,6 @@ fn same_side_px(w: f32, area: f32, a: [f32; 2], b: [f32; 2]) -> bool {
 
 /// Screen y grows down. Matches `owns_pixel` in the plot shader: a shared edge
 /// belongs to one triangle, so a transparent fill is not composited twice.
-#[cfg(not(target_arch = "wasm32"))]
 fn owns_pixel_px(p: [f32; 2], a: [f32; 2], b: [f32; 2], c: [f32; 2]) -> bool {
     let area = orient_px(a, b, c);
     if area == 0.0 {
@@ -4382,28 +4373,6 @@ fn owns_pixel_px(p: [f32; 2], a: [f32; 2], b: [f32; 2], c: [f32; 2]) -> bool {
     same_side_px(orient_px(a, b, p), area, a, b)
         && same_side_px(orient_px(b, c, p), area, b, c)
         && same_side_px(orient_px(c, a, p), area, c, a)
-}
-
-fn point_in_triangle(p: [f32; 2], a: [f32; 2], b: [f32; 2], c: [f32; 2]) -> bool {
-    // Same rejection as owns_pixel_px: a degenerate or NaN quad paints
-    // nothing, so it must not mask the series it hovers above. orient_px is
-    // CPU-only, so the area is computed inline.
-    if !p.iter().all(|v| v.is_finite()) {
-        return false;
-    }
-    let area = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
-    if area == 0.0 || !area.is_finite() {
-        return false;
-    }
-    let sign = |p: [f32; 2], a: [f32; 2], b: [f32; 2]| {
-        (p[0] - b[0]) * (a[1] - b[1]) - (a[0] - b[0]) * (p[1] - b[1])
-    };
-    let d1 = sign(p, a, b);
-    let d2 = sign(p, b, c);
-    let d3 = sign(p, c, a);
-    let has_neg = d1 < 0.0 || d2 < 0.0 || d3 < 0.0;
-    let has_pos = d1 > 0.0 || d2 > 0.0 || d3 > 0.0;
-    !(has_neg && has_pos)
 }
 
 fn segment_distance(a: [f32; 2], b: [f32; 2], p: [f32; 2]) -> f32 {
@@ -12281,6 +12250,69 @@ mod tests {
     }
 
     #[test]
+    fn a_seam_pixel_reports_the_triangle_that_painted_it() {
+        let mut scene = line_scene();
+        scene.panels[0].series = vec![
+            Series::Triangles {
+                xs: vec![0.0, 10.0, 0.0],
+                ys: vec![0.0, 10.0, 10.0],
+                color: [1.0, 0.0, 0.0, 1.0],
+            },
+            Series::Triangles {
+                xs: vec![0.0, 10.0, 10.0],
+                ys: vec![0.0, 0.0, 10.0],
+                color: [0.0, 0.0, 1.0, 1.0],
+            },
+        ];
+        let (width, height) = (180, 140);
+        let mut plot = Plot::new(&scene, [0.0; 4], [1.0; 4]);
+        plot.apply(width, height, &PlotInput::default());
+        let left_id = {
+            let p = plot.project_data(0, 2.0, 7.0, width, height);
+            plot.hover(p[0], p[1]).3.expect("left interior")
+        };
+        let right_id = {
+            let p = plot.project_data(0, 7.0, 2.0, width, height);
+            plot.hover(p[0], p[1]).3.expect("right interior")
+        };
+        assert_ne!(left_id, right_id);
+        // The shared diagonal projects exactly onto its rasterized edge — the
+        // series that owns it under the top-left rule is the only valid hit.
+        let v = |x: f32, y: f32| plot.project_data(0, x, y, width, height);
+        // f32 rounding can push an independently-projected midpoint a hair off
+        // the edge — average the projected endpoints so the pixel sits on it.
+        let (e0, e1) = (v(0.0, 0.0), v(10.0, 10.0));
+        let seam = [(e0[0] + e1[0]) * 0.5, (e0[1] + e1[1]) * 0.5];
+        let left = owns_pixel_px(seam, v(0.0, 0.0), v(10.0, 10.0), v(0.0, 10.0));
+        let right = owns_pixel_px(seam, v(0.0, 0.0), v(10.0, 0.0), v(10.0, 10.0));
+        assert_ne!(left, right, "the rasterizer assigns the seam once");
+        assert_eq!(
+            plot.hover(seam[0], seam[1]).3,
+            Some(if left { left_id } else { right_id })
+        );
+    }
+
+    #[test]
+    fn a_draw_range_past_the_line_buffer_still_hovers_the_painted_tail() {
+        let mut scene = line_scene();
+        scene.panels[0].series = vec![Series::Polyline {
+            xs: vec![1.0, 9.0, 9.0],
+            ys: vec![5.0, 5.0, 1.0],
+            color: [1.0; 4],
+            thickness: 1.5,
+        }];
+        let (width, height) = (180, 140);
+        let mut plot = Plot::new(&scene, [0.0; 4], [1.0; 4]);
+        plot.apply(width, height, &PlotInput::default());
+        // The unadopted reuse_lines state the GPU draw clamps for: the batch
+        // still claims two segments while the buffer holds one.
+        assert_eq!(plot.marks.lines.len(), 2);
+        plot.marks.lines.truncate(1);
+        let on_tail = plot.project_data(0, 5.0, 5.0, width, height);
+        assert_eq!(plot.hover(on_tail[0], on_tail[1]).3, Some(0));
+    }
+
+    #[test]
     fn triangle_seam_stays_the_same_color_as_the_fill() {
         let mut scene = line_scene();
         scene.panels[0].series = vec![Series::Triangles {
@@ -12789,15 +12821,10 @@ mod tests {
     #[test]
     fn a_degenerate_triangle_covers_nothing() {
         let v = [10.0f32, 10.0];
-        assert!(!point_in_triangle(v, v, v, v));
-        assert!(!point_in_triangle(v, v, v, [20.0, 20.0]));
-        assert!(!point_in_triangle(
-            v,
-            [f32::NAN, 0.0],
-            [0.0, 0.0],
-            [1.0, 1.0]
-        ));
-        assert!(point_in_triangle(v, [0.0, 0.0], [20.0, 0.0], [0.0, 20.0]));
+        assert!(!owns_pixel_px(v, v, v, v));
+        assert!(!owns_pixel_px(v, v, v, [20.0, 20.0]));
+        assert!(!owns_pixel_px(v, [f32::NAN, 0.0], [0.0, 0.0], [1.0, 1.0]));
+        assert!(owns_pixel_px(v, [0.0, 0.0], [20.0, 0.0], [0.0, 20.0]));
     }
 
     #[test]

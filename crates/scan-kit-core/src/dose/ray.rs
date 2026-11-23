@@ -284,7 +284,13 @@ fn accumulate_z(values: &[f32], shape: [usize; 3], z0: usize, z1: usize) -> ZPar
                 for x in 0..nx {
                     let value = values[base + x];
                     let mag = value.abs();
-                    abs_peak = abs_peak.max(mag);
+                    // The cursor belongs at the largest deviation — on an
+                    // all-negative difference a positive-only argmax would
+                    // leave it on the corner voxel.
+                    if mag > abs_peak {
+                        abs_peak = mag;
+                        peak_at = [x, y, z];
+                    }
                     along_x += mag;
                     signed_x += value;
                     y_sum[x + nx * (z - z0)] += mag;
@@ -299,7 +305,6 @@ fn accumulate_z(values: &[f32], shape: [usize; 3], z0: usize, z1: usize) -> ZPar
                     }
                     if value > peak {
                         peak = value;
-                        peak_at = [x, y, z];
                     }
                 }
                 x_best = x_best.max(along_x);
@@ -348,7 +353,13 @@ fn scan_axes_serial(values: &[f32], shape: [usize; 3], spacing: [f32; 3]) -> Vol
                 for x in 0..nx {
                     let value = values[base + x];
                     let mag = value.abs();
-                    abs_peak = abs_peak.max(mag);
+                    // The cursor belongs at the largest deviation — on an
+                    // all-negative difference a positive-only argmax would
+                    // leave it on the corner voxel.
+                    if mag > abs_peak {
+                        abs_peak = mag;
+                        peak_at = [x, y, z];
+                    }
                     along_x += mag;
                     signed_x += value;
                     y_sum[x + nx * z] += mag;
@@ -362,7 +373,6 @@ fn scan_axes_serial(values: &[f32], shape: [usize; 3], spacing: [f32; 3]) -> Vol
                     }
                     if value > peak {
                         peak = value;
-                        peak_at = [x, y, z];
                     }
                 }
                 x_best = x_best.max(along_x);
@@ -1239,6 +1249,16 @@ fn catmull(d: f32) -> f32 {
 
 #[cfg(test)]
 mod tests {
+    // A difference volume can be all-negative — the cursor must sit on the
+    // largest |value|, not the corner voxel a positive-only argmax leaves.
+    #[test]
+    fn an_all_negative_scan_points_at_the_largest_deviation() {
+        let mut values = vec![-1.0f32; 8];
+        values[5] = -9.0;
+        let scan = scan_spacing(&values, [2, 2, 2], [1.0; 3]);
+        assert_eq!(scan.peak_at, [1, 0, 1]);
+    }
+
     use super::*;
 
     fn peaked() -> Volume {
