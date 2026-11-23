@@ -906,7 +906,9 @@ fn default_port(scheme: Scheme) -> Option<u16> {
     Some(match scheme {
         Scheme::Sftp => 22,
         Scheme::Ftp => 21,
-        Scheme::Ftps => 990,
+        // The client only does explicit FTPS (AUTH TLS on the cleartext
+        // control channel) — implicit-mode :990 must stay an explicit port.
+        Scheme::Ftps => 21,
         Scheme::Smb => 445,
         Scheme::Http => 80,
         Scheme::Https => 443,
@@ -1004,7 +1006,7 @@ fn split_scheme(text: &str) -> Option<(&str, &str)> {
     Some((&text[..index], &text[index + 3..]))
 }
 
-fn file_uri_path(rest: &str) -> PathBuf {
+pub fn file_uri_path(rest: &str) -> PathBuf {
     let rest = percent_decode(rest);
     if let Some(path) = rest.strip_prefix('/') {
         if path.len() >= 2 && path.as_bytes().get(1) == Some(&b':') {
@@ -1116,7 +1118,7 @@ fn query_of(remote: &Remote) -> String {
     // Longest ancestor wins — HashMap order is arbitrary, and a nested
     // stored root must not lose to a shallower one.
     map.iter()
-        .filter(|(key, _)| remote.canonical.starts_with(&format!("{key}/")))
+        .filter(|(key, _)| under_root(&remote.canonical, key))
         .max_by_key(|(key, _)| key.len())
         .map(|(_, query)| query.clone())
         .unwrap_or_default()
@@ -1151,6 +1153,16 @@ fn catalog() -> &'static Mutex<HashMap<String, CatalogHit>> {
     CATALOG.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// `canonical` sits under `key`: a root-path key already ends in '/', so
+/// `key/` matching would look for a doubled slash that never appears.
+pub(crate) fn under_root(canonical: &str, key: &str) -> bool {
+    if key.ends_with('/') {
+        canonical.starts_with(key)
+    } else {
+        canonical.starts_with(&format!("{key}/"))
+    }
+}
+
 pub(crate) fn password_of(remote: &Remote) -> String {
     let map = passwords().lock().unwrap_or_else(|err| err.into_inner());
     if let Some(password) = map.get(&remote.canonical) {
@@ -1160,7 +1172,7 @@ pub(crate) fn password_of(remote: &Remote) -> String {
     // slot alone would hand sibling libraries each other's credentials.
     map.iter()
         .filter(|(key, _)| key.as_str() != host_key(remote).as_str())
-        .filter(|(key, _)| remote.canonical.starts_with(&format!("{key}/")))
+        .filter(|(key, _)| under_root(&remote.canonical, key))
         .max_by_key(|(key, _)| key.len())
         .map(|(_, password)| password.clone())
         .or_else(|| map.get(&host_key(remote)).cloned())
@@ -1495,6 +1507,17 @@ pub(crate) fn delete_storage(root: &str, paths: &[String]) -> Result<Vec<String>
         for spec in &paths {
             match require_remote(spec) {
                 Ok(child) => {
+                    // Only remove inside the connected root — a stale or
+                    // corrupt recorded spec must not delete elsewhere on
+                    // the server.
+                    let root_path = remote.path.trim_end_matches('/');
+                    if !root_path.is_empty()
+                        && !(child.path == root_path
+                            || child.path.starts_with(&format!("{root_path}/")))
+                    {
+                        errors.push(format!("{spec}: outside the connected root"));
+                        continue;
+                    }
                     if let Err(err) = fs.remove(&child.path) {
                         errors.push(format!("{spec}: {err}"));
                     } else {
@@ -1553,6 +1576,25 @@ fn trash_path(_path: &str) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn an_explicit_ftps_990_port_is_kept() {
+        // FTPS upgrades to TLS on 21 — a bare :990 must survive parsing instead
+        // of being stripped as the "default" and then connected on 21.
+        let remote = super::parse_remote(super::Scheme::Ftps, "archive.example:990/dose")
+            .expect("ftps with an explicit port parses");
+        assert_eq!(remote.port, Some(990));
+    }
+
+    #[test]
+    fn root_keys_match_as_prefixes() {
+        assert!(super::under_root("sftp://h/root/dir", "sftp://h/root/"));
+        assert!(super::under_root("sftp://h/root/", "sftp://h/root/"));
+        assert!(!super::under_root("sftp://h/rootless", "sftp://h/root/"));
+        assert!(super::under_root("a/b", "a/"));
+        assert!(!super::under_root("ab/c", "a/"));
+    }
+
     use super::*;
 
     #[test]

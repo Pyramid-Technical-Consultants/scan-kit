@@ -160,7 +160,8 @@ fn fixture_key(canonical: &str) -> Option<String> {
         return Some(canonical.to_owned());
     }
     map.keys()
-        .find(|key| canonical.starts_with(&format!("{key}/")))
+        .filter(|key| crate::location::under_root(canonical, key))
+        .max_by_key(|key| key.len())
         .cloned()
 }
 

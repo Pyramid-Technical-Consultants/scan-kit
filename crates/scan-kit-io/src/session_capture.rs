@@ -194,11 +194,10 @@ fn devices(
 
 /// Device client key → filename-safe name (`device_ic1_client` → `IC1`).
 fn client_name(client: &str) -> String {
-    let name: String = client
-        .strip_prefix("device_")
-        .unwrap_or(client)
+    let stripped = client.strip_prefix("device_").unwrap_or(client);
+    let name: String = stripped
         .strip_suffix("_client")
-        .unwrap_or(client)
+        .unwrap_or(stripped)
         .to_ascii_uppercase()
         .chars()
         .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '_' || *ch == '-')
