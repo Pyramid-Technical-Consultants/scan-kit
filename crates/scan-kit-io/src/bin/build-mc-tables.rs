@@ -112,10 +112,10 @@ fn tokens(path: &Path) -> Result<Vec<Vec<String>>, String> {
 }
 
 fn f64v(t: &[String], i: usize) -> Result<f64, String> {
-    Ok(t.get(i)
+    t.get(i)
         .ok_or_else(|| format!("expected field {i}: {t:?}"))?
         .parse()
-        .unwrap_or(f64::NAN))
+        .map_err(|_| format!("field {i} is not a number: {t:?}"))
 }
 
 /// MCsquare material name -> label, from `Materials/list.dat`.

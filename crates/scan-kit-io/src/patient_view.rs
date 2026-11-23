@@ -296,7 +296,13 @@ pub fn dose_from_result(inputs: &PatientInputs, ran: Option<McResult>) -> Transp
 
 pub fn transport(inputs: &PatientInputs, mc: Option<McRunner<'_>>) -> Result<Transport, String> {
     let request = patient_request(inputs)?;
-    let ran = mc.and_then(|run| run(&McJob::Patient(request.clone())).ok());
+    // An Err means the transport failed — propagate it rather than painting
+    // an all-zero dose that reads as "delivered nothing". None is the
+    // legitimate "no runner" preview case.
+    let ran = match mc {
+        Some(run) => Some(run(&McJob::Patient(request.clone()))?),
+        None => None,
+    };
     Ok(dose_from_result(inputs, ran))
 }
 

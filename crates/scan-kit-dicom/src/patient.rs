@@ -376,15 +376,20 @@ pub fn read_ion_plan(path: &Path) -> Result<IonPlan, String> {
                 };
                 let index = plan_index;
                 plan_index += 1;
+                let (x, y) = (xy[i * 2], xy[i * 2 + 1]);
+                // Position gets the same finite check as energy — a NaN spot
+                // would reach the transport and the exported plan CSV.
                 if (has_weights && (!mu.is_finite() || mu <= 0.0))
                     || !energy.is_finite()
                     || energy <= 0.0
+                    || !x.is_finite()
+                    || !y.is_finite()
                 {
                     continue;
                 }
                 spots.push(IonPlanSpot {
-                    x: xy[i * 2],
-                    y: xy[i * 2 + 1],
+                    x,
+                    y,
                     energy,
                     charge: mu,
                     size_x,
@@ -1046,11 +1051,15 @@ fn read_plan(elems: &[Elem], frame: String, ct_position: &str) -> Result<Plan, S
             };
             for i in 0..limit {
                 let mu = weights.get(i).copied().unwrap_or(0.0) * meterset / final_weight;
-                if mu > 0.0 {
+                let x = xy.get(i * 2).copied().unwrap_or(f32::NAN);
+                let y = xy.get(i * 2 + 1).copied().unwrap_or(f32::NAN);
+                // A non-finite position reaches the transport and the plan
+                // CSV — reject it like a non-finite energy.
+                if mu > 0.0 && x.is_finite() && y.is_finite() {
                     spots.push(Spot {
                         energy,
-                        x: xy.get(i * 2).copied().unwrap_or(0.0),
-                        y: xy.get(i * 2 + 1).copied().unwrap_or(0.0),
+                        x,
+                        y,
                         mu,
                         shifter: shifter.clone(),
                         wet_mm,
@@ -2606,6 +2615,39 @@ mod tests {
         // A negative count parses as zero spots instead of hanging the load.
         let plan = read_plan(&plan_with_spot_count(-4, 2), "f".into(), "HFS").unwrap();
         assert!(plan.beams[0].spots.is_empty());
+    }
+
+    #[test]
+    fn a_nan_spot_position_is_dropped() {
+        // DS text "nan"/"inf" parses to non-finite f32 — such a spot must not
+        // reach the transport or the exported plan CSV.
+        let mut ref_beam = Vec::new();
+        is(&mut ref_beam, 0x300C, 0x0006, 1).unwrap();
+        ds(&mut ref_beam, 0x300A, 0x0086, &[10.0]).unwrap();
+        let mut group = Vec::new();
+        is(&mut group, 0x300A, 0x0078, 1).unwrap();
+        sq(&mut group, 0x300C, 0x0004, &[ref_beam]).unwrap();
+        let mut cp = Vec::new();
+        ds(&mut cp, 0x300A, 0x0114, &[100.0]).unwrap();
+        ds(&mut cp, 0x300A, 0x011E, &[0.0]).unwrap();
+        ds(&mut cp, 0x300A, 0x0122, &[0.0]).unwrap();
+        ds(&mut cp, 0x300A, 0x012C, &[0.0, 0.0, 0.0]).unwrap();
+        is(&mut cp, 0x300A, 0x0392, 2).unwrap();
+        // Binary FL carries a literal NaN bit pattern — the corrupt-file case.
+        fl(&mut cp, 0x300A, 0x0394, &[f32::NAN, -1.0, 2.0, -2.0]).unwrap();
+        ds(&mut cp, 0x300A, 0x0396, &[1.0, 1.0]).unwrap();
+        let mut beam = Vec::new();
+        is(&mut beam, 0x300A, 0x00C0, 1).unwrap();
+        ds(&mut beam, 0x300A, 0x010E, &[1.0]).unwrap();
+        is(&mut beam, 0x300C, 0x006A, 1).unwrap();
+        sq(&mut beam, 0x300A, 0x03A8, &[cp]).unwrap();
+        let mut plan = Vec::new();
+        sq(&mut plan, 0x300A, 0x0070, &[group]).unwrap();
+        sq(&mut plan, 0x300A, 0x03A2, &[beam]).unwrap();
+        let plan = read_plan(&parse_dataset(&plan).unwrap(), "f".into(), "HFS").unwrap();
+        let spots = &plan.beams[0].spots;
+        assert_eq!(spots.len(), 1);
+        assert!((spots[0].x - 2.0).abs() < 1e-4);
     }
 
     fn plan_with_spot_count(declared: i32, pairs: usize) -> Vec<Elem> {
