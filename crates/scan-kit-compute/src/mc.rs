@@ -374,8 +374,10 @@ fn slab_launch(request: &SlabRequest) -> Result<Launch, ComputeError> {
             spots.extend([
                 x / 10.0,
                 y / 10.0,
-                sx.max(0.0) / 10.0,
-                sy.max(0.0) / 10.0,
+                // Same 0.2 mm floor the analytic deposit uses — a zero
+                // sigma spot must not be pencil-thin here and Gaussian there.
+                sx.max(0.2) / 10.0,
+                sy.max(0.2) / 10.0,
                 energy,
                 request.spread_pct.max(0.0) / 100.0 * energy,
                 0.0,
