@@ -42,6 +42,9 @@ struct Live {
     session_directory: String,
     session_id: String,
     plan_path: Option<PathBuf>,
+    /// Consecutive status-refresh failures — one transient socket error
+    /// must not evict a live connection.
+    poll_errors: u8,
 }
 
 static LIVE: Mutex<Option<Live>> = Mutex::new(None);
@@ -154,6 +157,7 @@ pub fn connect(db: &Path, host: &str) -> Result<Value, String> {
             session_directory: session_directory.clone(),
             session_id: session_id.clone(),
             plan_path,
+            poll_errors: 0,
         });
     }
     let _ = with_store(db, |conn| store::set_runner_host(conn, &host));
@@ -192,9 +196,11 @@ pub fn read_status(has_plan: bool, dest: &str) -> Result<Value, String> {
     };
     let session_id = session_capture::live_session_id(&host);
     let mut guard = lock();
-    let live = guard
-        .as_mut()
-        .ok_or("Not connected - connect to a device first.")?;
+    // Same answer as the first-lock arm — a disconnect that lands mid-probe
+    // is still just the offline state, not an error.
+    let Some(live) = guard.as_mut() else {
+        return Ok(runner_view(&json!({}), false, has_plan));
+    };
     // A disconnect/reconnect between the two locks could change the device.
     if live.host == host {
         if let Some(id) = session_id {
@@ -202,15 +208,21 @@ pub fn read_status(has_plan: bool, dest: &str) -> Result<Value, String> {
         }
     }
     if let Err(err) = refresh(live, Duration::from_millis(500)) {
-        // refresh only fails on a dead socket (poll timeouts return Ok) —
-        // evict it so the next poll reports the disconnected state instead
-        // of re-toasting the same socket error every interval.
+        // A stalled pong write near the deadline can fault a healthy socket
+        // once — only consecutive failures mean it is dead. Evicting then
+        // lets the next poll report the disconnected state instead of
+        // re-toasting the same socket error every interval.
+        live.poll_errors = live.poll_errors.saturating_add(1);
         let host = live.host.clone();
+        if live.poll_errors < 2 {
+            return Err(err);
+        }
         if let Some(mut dead) = guard.take() {
             let _ = dead.socket.close(None);
         }
         return Err(format!("Lost contact with {host}: {err}"));
     }
+    live.poll_errors = 0;
     Ok(view_of(live, has_plan, dest))
 }
 
@@ -1937,16 +1949,21 @@ mod tests {
             session_directory: String::new(),
             session_id: String::new(),
             plan_path: None,
+            poll_errors: 0,
         });
-        // A parallel test's disconnect() can legitimately take the Live first
-        // — every interleaving must still end in the quiet disconnected
-        // state rather than a repeating socket error.
-        match read_status(false, "") {
-            Err(err) => assert!(
-                err.contains("Lost contact") || err.contains("Not connected"),
-                "{err}"
-            ),
-            Ok(view) => assert_eq!(view["connected"], json!(false)),
+        // Two consecutive socket failures evict; a parallel test's
+        // disconnect() can take the Live at any point — every interleaving
+        // must still end evicted and quiet rather than re-erroring forever.
+        for _ in 0..4 {
+            match read_status(false, "") {
+                // A strike — the connection is still held.
+                Err(_) if live() => continue,
+                Err(_) => break,
+                Ok(view) => {
+                    assert_eq!(view["connected"], json!(false));
+                    break;
+                }
+            }
         }
         assert!(!live());
         assert_eq!(read_status(false, "").unwrap()["connected"], json!(false));

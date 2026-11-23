@@ -170,8 +170,10 @@ export function PlanRunner() {
         dest: destRef.current,
       })
         .then((next) => {
+          // A completed invoke means the backend answered even when the
+          // result is stale — the failure streak still resets.
+          statusFailures.current = 0;
           if (!stop && seq === viewSeq.current) {
-            statusFailures.current = 0;
             setView(next);
           }
         })
