@@ -109,87 +109,87 @@ pub fn plan_catalog() -> Value {
             .collect(),
     );
     json!({
-        "templates": [
-            template("zero_field", "Zero Field", "Every spot at (0, 0) for each energy layer.", json!([
-                energy_spec(&energies, &whole, &ten),
-                spec_int("spots_per_layer", "Spots per Layer (spots)", 100, 1, 100_000, "geometry")
-            ])),
-            template("rectangular_field", "Rectangular Field", "Even spot grid per layer with configurable field size.", json!([
-                energy_spec(&energies, &whole, &ten),
-                spec_float("center_x_mm", "Field Center (mm)", "X", 0.0, -500.0, 500.0, "geometry", json!([{"label": "0,0", "values": {"center_x_mm": 0.0, "center_y_mm": 0.0}}])),
-                spec_partner("center_y_mm", "Field Center Y (mm)", "Y", "float", json!(0.0), Some(-500.0), Some(500.0), "center_x_mm", "geometry"),
-                spec_float("field_width_mm", "Field Size (mm)", "W", 100.0, 0.001, 1000.0, "geometry", json!([
-                    {"label": "100", "values": {"field_width_mm": 100.0, "field_height_mm": 100.0}},
-                    {"label": "200", "values": {"field_width_mm": 200.0, "field_height_mm": 200.0}},
-                    {"label": "250", "values": {"field_width_mm": 250.0, "field_height_mm": 250.0}},
-                    {"label": "300", "values": {"field_width_mm": 300.0, "field_height_mm": 300.0}}
-                ])),
-                spec_partner("field_height_mm", "Field Size H (mm)", "H", "float", json!(100.0), Some(0.001), Some(1000.0), "field_width_mm", "geometry"),
-                spec_int_quick("spots_x", "Spot Grid (spots)", "X", 33, 1, 1000, "geometry", json!([
-                    {"label": "3", "values": {"spots_x": 3, "spots_y": 3}},
-                    {"label": "7", "values": {"spots_x": 7, "spots_y": 7}},
-                    {"label": "11", "values": {"spots_x": 11, "spots_y": 11}},
-                    {"label": "33", "values": {"spots_x": 33, "spots_y": 33}}
-                ])),
-                spec_partner("spots_y", "Spot Grid Y", "Y", "int", json!(33), Some(1.0), Some(1000.0), "spots_x", "geometry"),
-                spec_choices("fast_axis", "Fast Axis", "button_group", "x", "geometry", json!([
-                    {"value": "x", "label": "X"},
-                    {"value": "y", "label": "Y"}
-                ]), Value::Null),
-                spec_choices("start_corner", "Start Corner", "button_group", "top_left", "geometry", json!([
-                    {"value": "top_left", "label": "Top Left"},
-                    {"value": "top_right", "label": "Top Right"},
-                    {"value": "bottom_left", "label": "Bottom Left"},
-                    {"value": "bottom_right", "label": "Bottom Right"}
-                ]), Value::Null),
-                spec_choices("layer_transition", "Layer Transition", "button_group", "reset", "geometry", json!([
-                    {"value": "reset", "label": "Reset to Corner"},
-                    {"value": "continue", "label": "Continue from End"}
-                ]), Value::Null)
-            ])),
-            template("dicom_rt_plan", "DICOM RT Plan", "Convert an RT Ion therapy plan (.dcm) into an input map CSV.", json!([
-                spec_file("dicom_path", "RT Plan File", "source"),
-                spec_bool("use_dicom_beam_size", "Use DICOM Scanning Spot Size", true, "geometry", Value::Null),
-                {
-                    "key": "beam_size_override_mm",
-                    "label": "Beam Size",
-                    "kind": "float",
-                    "default": DEFAULT_BEAM_SIZE_MM,
-                    "minimum": 0.001,
-                    "maximum": 500.0,
-                    "decimals": 3,
-                    "step": 0.1,
-                    "suffix": "mm",
-                    "field_set": "geometry",
-                    "visible_when": {"use_dicom_beam_size": [false]}
-                },
-                spec_choices("spot_order", "Spot Order", "button_group", "plan_order", "geometry", spot_order_choices(), Value::Null),
-                spec_choices("fast_axis", "Fast Axis", "button_group", "x", "geometry", json!([
-                    {"value": "x", "label": "X"},
-                    {"value": "y", "label": "Y"}
-                ]), json!({"spot_order": ["minimize_travel"]}))
-            ])),
-            template("iba_pld_plan", "IBA PLD Plan", "Convert an IBA PBS plan (.pld) into an input map CSV.", json!([
-                spec_file("pld_path", "PLD Plan File", "source"),
-                {
-                    "key": "beam_size_mm",
-                    "label": "Beam Size",
-                    "kind": "float",
-                    "default": DEFAULT_BEAM_SIZE_MM,
-                    "minimum": 0.001,
-                    "maximum": 500.0,
-                    "decimals": 3,
-                    "step": 0.1,
-                    "suffix": "mm",
-                    "field_set": "geometry"
-                },
-                spec_choices("spot_order", "Spot Order", "button_group", "plan_order", "geometry", spot_order_choices(), Value::Null),
-                spec_choices("fast_axis", "Fast Axis", "button_group", "x", "geometry", json!([
-                    {"value": "x", "label": "X"},
-                    {"value": "y", "label": "Y"}
-                ]), json!({"spot_order": ["minimize_travel"]}))
-            ]))
-        ]
+    "templates": [
+    template("zero_field", "Zero Field", "Every spot at (0, 0) for each energy layer.", json!([
+    energy_spec(&energies, &whole, &ten),
+    spec_int("spots_per_layer", "Spots per Layer (spots)", 100, 1, 100_000, "geometry")
+    ])),
+    template("rectangular_field", "Rectangular Field", "Even spot grid per layer with configurable field size.", json!([
+    energy_spec(&energies, &whole, &ten),
+    spec_float("center_x_mm", "Field Center (mm)", "X", 0.0, -500.0, 500.0, "geometry", json!([{"label": "0,0", "values": {"center_x_mm": 0.0, "center_y_mm": 0.0}}])),
+    spec_partner("center_y_mm", "Field Center Y (mm)", "Y", "float", json!(0.0), Some(-500.0), Some(500.0), "center_x_mm", "geometry"),
+    spec_float("field_width_mm", "Field Size (mm)", "W", 100.0, 0.001, 1000.0, "geometry", json!([
+    {"label": "100", "values": {"field_width_mm": 100.0, "field_height_mm": 100.0}},
+    {"label": "200", "values": {"field_width_mm": 200.0, "field_height_mm": 200.0}},
+    {"label": "250", "values": {"field_width_mm": 250.0, "field_height_mm": 250.0}},
+    {"label": "300", "values": {"field_width_mm": 300.0, "field_height_mm": 300.0}}
+    ])),
+    spec_partner("field_height_mm", "Field Size H (mm)", "H", "float", json!(100.0), Some(0.001), Some(1000.0), "field_width_mm", "geometry"),
+    spec_int_quick("spots_x", "Spot Grid (spots)", "X", 33, 1, 1000, "geometry", json!([
+    {"label": "3", "values": {"spots_x": 3, "spots_y": 3}},
+    {"label": "7", "values": {"spots_x": 7, "spots_y": 7}},
+    {"label": "11", "values": {"spots_x": 11, "spots_y": 11}},
+    {"label": "33", "values": {"spots_x": 33, "spots_y": 33}}
+    ])),
+    spec_partner("spots_y", "Spot Grid Y", "Y", "int", json!(33), Some(1.0), Some(1000.0), "spots_x", "geometry"),
+    spec_choices("fast_axis", "Fast Axis", "button_group", "x", "geometry", json!([
+    {"value": "x", "label": "X"},
+    {"value": "y", "label": "Y"}
+    ]), Value::Null),
+    spec_choices("start_corner", "Start Corner", "button_group", "top_left", "geometry", json!([
+    {"value": "top_left", "label": "Top Left"},
+    {"value": "top_right", "label": "Top Right"},
+    {"value": "bottom_left", "label": "Bottom Left"},
+    {"value": "bottom_right", "label": "Bottom Right"}
+    ]), Value::Null),
+    spec_choices("layer_transition", "Layer Transition", "button_group", "reset", "geometry", json!([
+    {"value": "reset", "label": "Reset to Corner"},
+    {"value": "continue", "label": "Continue from End"}
+    ]), Value::Null)
+    ])),
+    template("dicom_rt_plan", "DICOM RT Plan", "Convert an RT Ion therapy plan (.dcm) into an input map CSV.", json!([
+    spec_file("dicom_path", "RT Plan File", "source"),
+    spec_bool("use_dicom_beam_size", "Use DICOM Scanning Spot Size", true, "geometry", Value::Null),
+    {
+    "key": "beam_size_override_mm",
+    "label": "Beam Size",
+    "kind": "float",
+    "default": DEFAULT_BEAM_SIZE_MM,
+    "minimum": 0.001,
+    "maximum": 500.0,
+    "decimals": 3,
+    "step": 0.1,
+    "suffix": "mm",
+    "field_set": "geometry",
+    "visible_when": {"use_dicom_beam_size": [false]}
+    },
+    spec_choices("spot_order", "Spot Order", "button_group", "plan_order", "geometry", spot_order_choices(), Value::Null),
+    spec_choices("fast_axis", "Fast Axis", "button_group", "x", "geometry", json!([
+    {"value": "x", "label": "X"},
+    {"value": "y", "label": "Y"}
+    ]), json!({"spot_order": ["minimize_travel"]}))
+    ])),
+    template("iba_pld_plan", "IBA PLD Plan", "Convert an IBA PBS plan (.pld) into an input map CSV.", json!([
+    spec_file("pld_path", "PLD Plan File", "source"),
+    {
+    "key": "beam_size_mm",
+    "label": "Beam Size",
+    "kind": "float",
+    "default": DEFAULT_BEAM_SIZE_MM,
+    "minimum": 0.001,
+    "maximum": 500.0,
+    "decimals": 3,
+    "step": 0.1,
+    "suffix": "mm",
+    "field_set": "geometry"
+    },
+    spec_choices("spot_order", "Spot Order", "button_group", "plan_order", "geometry", spot_order_choices(), Value::Null),
+    spec_choices("fast_axis", "Fast Axis", "button_group", "x", "geometry", json!([
+    {"value": "x", "label": "X"},
+    {"value": "y", "label": "Y"}
+    ]), json!({"spot_order": ["minimize_travel"]}))
+    ]))
+    ]
     })
 }
 
@@ -536,12 +536,10 @@ fn format_delivery(seconds: f64) -> String {
     if seconds < 59.95 {
         return format!("{seconds:.1} s");
     }
-    let total_minutes = (seconds / 60.0).floor() as i64;
+    let rounded = seconds.round() as i64;
+    let total_minutes = rounded / 60;
     if total_minutes < 60 {
-        let rem = (seconds % 60.0).round() as i64;
-        if rem == 60 {
-            return format!("{} min", total_minutes + 1);
-        }
+        let rem = rounded % 60;
         if rem == 0 {
             return format!("{total_minutes} min");
         }
@@ -802,17 +800,17 @@ fn template(id: &str, name: &str, description: &str, mut params: Value) -> Value
 
 fn energy_spec(all: &Value, whole: &Value, ten: &Value) -> Value {
     json!({
-        "key": "selected_energies",
-        "label": "Energy Layers (MeV)",
-        "kind": "energy_multiselect",
-        "default": all,
-        "field_set": "energy",
-        "presets": [
-            {"label": "Select All", "energies": all},
-            {"label": "Whole MeV Steps", "energies": whole},
-            {"label": "10 MeV Steps", "energies": ten},
-            {"label": "Clear All", "energies": []}
-        ]
+    "key": "selected_energies",
+    "label": "Energy Layers (MeV)",
+    "kind": "energy_multiselect",
+    "default": all,
+    "field_set": "energy",
+    "presets": [
+    {"label": "Select All", "energies": all},
+    {"label": "Whole MeV Steps", "energies": whole},
+    {"label": "10 MeV Steps", "energies": ten},
+    {"label": "Clear All", "energies": []}
+    ]
     })
 }
 
@@ -825,11 +823,11 @@ fn weight_specs() -> Vec<Value> {
             "fixed",
             "weight",
             json!([
-                {"value": "fixed", "label": "Fixed"},
-                {"value": "random_range", "label": "Random Range"},
-                {"value": "layer_even_range", "label": "Even per Layer"},
-                {"value": "even_total", "label": "Even Total"},
-                {"value": "random_total_variance", "label": "Random Total"}
+            {"value": "fixed", "label": "Fixed"},
+            {"value": "random_range", "label": "Random Range"},
+            {"value": "layer_even_range", "label": "Even per Layer"},
+            {"value": "even_total", "label": "Even Total"},
+            {"value": "random_total_variance", "label": "Random Total"}
             ]),
             Value::Null,
         ),
@@ -848,41 +846,41 @@ fn weight_specs() -> Vec<Value> {
             json!({"spot_weight_method": ["even_total", "random_total_variance"]}),
         ),
         json!({
-            "key": "spot_weight_variance_pct",
-            "label": "Spot Variance (%)",
-            "kind": "float",
-            "default": 10.0,
-            "minimum": 0.0,
-            "maximum": 100.0,
-            "decimals": 1,
-            "step": 1.0,
-            "field_set": "weight",
-            "visible_when": {"spot_weight_method": ["random_total_variance"]}
+        "key": "spot_weight_variance_pct",
+        "label": "Spot Variance (%)",
+        "kind": "float",
+        "default": 10.0,
+        "minimum": 0.0,
+        "maximum": 100.0,
+        "decimals": 1,
+        "step": 1.0,
+        "field_set": "weight",
+        "visible_when": {"spot_weight_method": ["random_total_variance"]}
         }),
         json!({
-            "key": "spot_weight_min_mu",
-            "label": "Weight Range (MU)",
-            "sub_label": "Min",
-            "kind": "float",
-            "default": 0.002,
-            "minimum": 0.0001,
-            "decimals": 4,
-            "step": 0.001,
-            "field_set": "weight",
-            "visible_when": {"spot_weight_method": ["random_range", "layer_even_range"]}
+        "key": "spot_weight_min_mu",
+        "label": "Weight Range (MU)",
+        "sub_label": "Min",
+        "kind": "float",
+        "default": 0.002,
+        "minimum": 0.0001,
+        "decimals": 4,
+        "step": 0.001,
+        "field_set": "weight",
+        "visible_when": {"spot_weight_method": ["random_range", "layer_even_range"]}
         }),
         json!({
-            "key": "spot_weight_max_mu",
-            "label": "Weight Range (MU)",
-            "sub_label": "Max",
-            "row_partner": "spot_weight_min_mu",
-            "kind": "float",
-            "default": 0.1,
-            "minimum": 0.0001,
-            "decimals": 4,
-            "step": 0.001,
-            "field_set": "weight",
-            "visible_when": {"spot_weight_method": ["random_range", "layer_even_range"]}
+        "key": "spot_weight_max_mu",
+        "label": "Weight Range (MU)",
+        "sub_label": "Max",
+        "row_partner": "spot_weight_min_mu",
+        "kind": "float",
+        "default": 0.1,
+        "minimum": 0.0001,
+        "decimals": 4,
+        "step": 0.001,
+        "field_set": "weight",
+        "visible_when": {"spot_weight_method": ["random_range", "layer_even_range"]}
         }),
         spec_bool(
             "spot_weight_layer_shuffle",
@@ -896,14 +894,14 @@ fn weight_specs() -> Vec<Value> {
 
 fn spec_int(key: &str, label: &str, default: i64, min: i64, max: i64, field: &str) -> Value {
     json!({
-        "key": key,
-        "label": label,
-        "kind": "int",
-        "default": default,
-        "minimum": min,
-        "maximum": max,
-        "step": 1,
-        "field_set": field
+    "key": key,
+    "label": label,
+    "kind": "int",
+    "default": default,
+    "minimum": min,
+    "maximum": max,
+    "step": 1,
+    "field_set": field
     })
 }
 
@@ -918,16 +916,16 @@ fn spec_int_quick(
     quick: Value,
 ) -> Value {
     json!({
-        "key": key,
-        "label": label,
-        "sub_label": sub,
-        "kind": "int",
-        "default": default,
-        "minimum": min,
-        "maximum": max,
-        "step": 1,
-        "field_set": field,
-        "quick_sets": quick
+    "key": key,
+    "label": label,
+    "sub_label": sub,
+    "kind": "int",
+    "default": default,
+    "minimum": min,
+    "maximum": max,
+    "step": 1,
+    "field_set": field,
+    "quick_sets": quick
     })
 }
 
@@ -942,17 +940,17 @@ fn spec_float(
     quick: Value,
 ) -> Value {
     json!({
-        "key": key,
-        "label": label,
-        "sub_label": sub,
-        "kind": "float",
-        "default": default,
-        "minimum": min,
-        "maximum": max,
-        "decimals": 3,
-        "step": 0.1,
-        "field_set": field,
-        "quick_sets": quick
+    "key": key,
+    "label": label,
+    "sub_label": sub,
+    "kind": "float",
+    "default": default,
+    "minimum": min,
+    "maximum": max,
+    "decimals": 3,
+    "step": 0.1,
+    "field_set": field,
+    "quick_sets": quick
     })
 }
 
@@ -968,17 +966,17 @@ fn spec_partner(
     field: &str,
 ) -> Value {
     json!({
-        "key": key,
-        "label": label,
-        "sub_label": sub,
-        "kind": kind,
-        "default": default,
-        "minimum": min,
-        "maximum": max,
-        "decimals": 3,
-        "step": if kind == "int" { json!(1) } else { json!(0.1) },
-        "row_partner": partner,
-        "field_set": field
+    "key": key,
+    "label": label,
+    "sub_label": sub,
+    "kind": kind,
+    "default": default,
+    "minimum": min,
+    "maximum": max,
+    "decimals": 3,
+    "step": if kind == "int" { json!(1) } else { json!(0.1) },
+    "row_partner": partner,
+    "field_set": field
     })
 }
 
@@ -992,12 +990,12 @@ fn spec_choices(
     visible: Value,
 ) -> Value {
     let mut value = json!({
-        "key": key,
-        "label": label,
-        "kind": kind,
-        "default": default,
-        "field_set": field,
-        "choices": choices
+    "key": key,
+    "label": label,
+    "kind": kind,
+    "default": default,
+    "field_set": field,
+    "choices": choices
     });
     if !visible.is_null() {
         value["visible_when"] = visible;
@@ -1007,21 +1005,21 @@ fn spec_choices(
 
 fn spec_file(key: &str, label: &str, field: &str) -> Value {
     json!({
-        "key": key,
-        "label": label,
-        "kind": "file_path",
-        "default": "",
-        "field_set": field
+    "key": key,
+    "label": label,
+    "kind": "file_path",
+    "default": "",
+    "field_set": field
     })
 }
 
 fn spec_bool(key: &str, label: &str, default: bool, field: &str, visible: Value) -> Value {
     let mut value = json!({
-        "key": key,
-        "label": label,
-        "kind": "bool",
-        "default": default,
-        "field_set": field
+    "key": key,
+    "label": label,
+    "kind": "bool",
+    "default": default,
+    "field_set": field
     });
     if !visible.is_null() {
         value["visible_when"] = visible;
@@ -1031,22 +1029,22 @@ fn spec_bool(key: &str, label: &str, default: bool, field: &str, visible: Value)
 
 fn spec_visible_float(key: &str, label: &str, default: f64, min: f64, visible: Value) -> Value {
     json!({
-        "key": key,
-        "label": label,
-        "kind": "float",
-        "default": default,
-        "minimum": min,
-        "decimals": 4,
-        "step": 0.01,
-        "field_set": "weight",
-        "visible_when": visible
+    "key": key,
+    "label": label,
+    "kind": "float",
+    "default": default,
+    "minimum": min,
+    "decimals": 4,
+    "step": 0.01,
+    "field_set": "weight",
+    "visible_when": visible
     })
 }
 
 fn spot_order_choices() -> Value {
     json!([
-        {"value": "plan_order", "label": "Plan Order"},
-        {"value": "minimize_travel", "label": "Minimize Travel"}
+    {"value": "plan_order", "label": "Plan Order"},
+    {"value": "minimize_travel", "label": "Minimize Travel"}
     ])
 }
 
@@ -1065,10 +1063,10 @@ mod tests {
         let built = build_plan(
             "zero_field",
             &params(json!({
-                "selected_energies": [245.0, 250.0, 247.5],
-                "spots_per_layer": 10,
-                "spot_weight_method": "fixed",
-                "spot_weight_mu": 0.02
+            "selected_energies": [245.0, 250.0, 247.5],
+            "spots_per_layer": 10,
+            "spot_weight_method": "fixed",
+            "spot_weight_mu": 0.02
             })),
             PlanSource::Generate,
             None,
@@ -1081,9 +1079,9 @@ mod tests {
         assert!(built.filename.contains("Wfix0.02"));
         let mut lines = built.csv.lines();
         assert_eq!(
-            lines.next().unwrap(),
-            "#NO,ENERGY(MeV),CURRENT(A),BEAM_SIZE(mm),X_POSITION(mm),Y_POSITION(mm),CHARGE_REQ(MU),VELOCITY(mm/s)"
-        );
+ lines.next().unwrap(),
+ "#NO,ENERGY(MeV),CURRENT(A),BEAM_SIZE(mm),X_POSITION(mm),Y_POSITION(mm),CHARGE_REQ(MU),VELOCITY(mm/s)"
+ );
         let first = lines.next().unwrap();
         assert!(first.starts_with("1,250,"));
         assert!(first.contains(",0,0,"));
@@ -1125,18 +1123,18 @@ mod tests {
         let built = build_plan(
             "rectangular_field",
             &json!({
-                "selected_energies": [250.0, 70.0],
-                "center_x_mm": 0.0,
-                "center_y_mm": 0.0,
-                "field_width_mm": 20.0,
-                "field_height_mm": 20.0,
-                "spots_x": 2,
-                "spots_y": 1,
-                "fast_axis": "x",
-                "start_corner": "top_left",
-                "layer_transition": "continue",
-                "spot_weight_method": "fixed",
-                "spot_weight_mu": 0.02
+            "selected_energies": [250.0, 70.0],
+            "center_x_mm": 0.0,
+            "center_y_mm": 0.0,
+            "field_width_mm": 20.0,
+            "field_height_mm": 20.0,
+            "spots_x": 2,
+            "spots_y": 1,
+            "fast_axis": "x",
+            "start_corner": "top_left",
+            "layer_transition": "continue",
+            "spot_weight_method": "fixed",
+            "spot_weight_mu": 0.02
             }),
             PlanSource::Generate,
             None,
@@ -1262,9 +1260,9 @@ mod tests {
         let ranged = spot_weights(
             &rows,
             &json!({
-                "spot_weight_method": "random_range",
-                "spot_weight_min_mu": 0.01,
-                "spot_weight_max_mu": 0.03
+            "spot_weight_method": "random_range",
+            "spot_weight_min_mu": 0.01,
+            "spot_weight_max_mu": 0.03
             }),
         )
         .unwrap();
@@ -1272,10 +1270,10 @@ mod tests {
         let layered = spot_weights(
             &rows,
             &json!({
-                "spot_weight_method": "layer_even_range",
-                "spot_weight_min_mu": 0.01,
-                "spot_weight_max_mu": 0.04,
-                "spot_weight_layer_shuffle": true
+            "spot_weight_method": "layer_even_range",
+            "spot_weight_min_mu": 0.01,
+            "spot_weight_max_mu": 0.04,
+            "spot_weight_layer_shuffle": true
             }),
         )
         .unwrap();
@@ -1297,11 +1295,11 @@ mod tests {
         let errors = validate_plan(
             "zero_field",
             &json!({
-                "selected_energies": [250.0],
-                "spots_per_layer": 2,
-                "spot_weight_method": "random_total_variance",
-                "spot_weight_total_mu": 1.0,
-                "spot_weight_variance_pct": 150.0
+            "selected_energies": [250.0],
+            "spots_per_layer": 2,
+            "spot_weight_method": "random_total_variance",
+            "spot_weight_total_mu": 1.0,
+            "spot_weight_variance_pct": 150.0
             }),
         );
         assert!(errors.iter().any(|error| error.contains("Spot Variance")));
@@ -1312,11 +1310,11 @@ mod tests {
         let errors = validate_plan(
             "zero_field",
             &json!({
-                "selected_energies": [250.0],
-                "spots_per_layer": 2,
-                "spot_weight_method": "random_range",
-                "spot_weight_min_mu": 0.2,
-                "spot_weight_max_mu": 0.1
+            "selected_energies": [250.0],
+            "spots_per_layer": 2,
+            "spot_weight_method": "random_range",
+            "spot_weight_min_mu": 0.2,
+            "spot_weight_max_mu": 0.1
             }),
         );
         assert!(errors
@@ -1422,15 +1420,15 @@ mod tests {
         let name = suggest_filename(
             "rectangular_field",
             &json!({
-                "selected_energies": [200.0],
-                "center_x_mm": 10.0,
-                "center_y_mm": -5.0,
-                "field_width_mm": 100.0,
-                "field_height_mm": 80.0,
-                "spots_x": 33,
-                "spots_y": 33,
-                "spot_weight_method": "even_total",
-                "spot_weight_total_mu": 2.0
+            "selected_energies": [200.0],
+            "center_x_mm": 10.0,
+            "center_y_mm": -5.0,
+            "field_width_mm": 100.0,
+            "field_height_mm": 80.0,
+            "spots_x": 33,
+            "spots_y": 33,
+            "spot_weight_method": "even_total",
+            "spot_weight_total_mu": 2.0
             }),
             None,
             128,
@@ -1488,10 +1486,10 @@ Element,10,0,5,0.0
         let built = build_plan(
             "iba_pld_plan",
             &json!({
-                "pld_path": "minimal.pld",
-                "beam_size_mm": 4.0,
-                "spot_order": "plan_order",
-                "fast_axis": "x"
+            "pld_path": "minimal.pld",
+            "beam_size_mm": 4.0,
+            "spot_order": "plan_order",
+            "fast_axis": "x"
             }),
             PlanSource::Pld(text),
             None,
@@ -1540,10 +1538,10 @@ Element,10,0,5,0.0
         let built = build_plan(
             "dicom_rt_plan",
             &json!({
-                "use_dicom_beam_size": false,
-                "beam_size_override_mm": 3.61,
-                "spot_order": "minimize_travel",
-                "fast_axis": "x"
+            "use_dicom_beam_size": false,
+            "beam_size_override_mm": 3.61,
+            "spot_order": "minimize_travel",
+            "fast_axis": "x"
             }),
             PlanSource::Ion(&spots),
             Some("TESTPLAN"),
@@ -1598,9 +1596,9 @@ Element,10,0,5,0.0
         let built = build_plan(
             "dicom_rt_plan",
             &json!({
-                "use_dicom_beam_size": false,
-                "beam_size_override_mm": 7.5,
-                "spot_order": "plan_order"
+            "use_dicom_beam_size": false,
+            "beam_size_override_mm": 7.5,
+            "spot_order": "plan_order"
             }),
             PlanSource::Ion(&spots),
             None,
@@ -1649,21 +1647,21 @@ Element,10,0,5,0.0
         let errors = validate_plan(
             "zero_field",
             &json!({"selected_energies": all, "spots_per_layer": 100000,
-                    "spot_weight_method": "fixed", "spot_weight_mu": 0.02}),
+ "spot_weight_method": "fixed", "spot_weight_mu": 0.02}),
         );
         assert!(errors.iter().any(|error| error.contains("budget")));
         let grid = validate_plan(
             "rectangular_field",
             &json!({"selected_energies": all, "spots_x": 1000, "spots_y": 1000,
-                    "field_width_mm": 100.0, "field_height_mm": 100.0,
-                    "spot_weight_method": "fixed", "spot_weight_mu": 0.02}),
+ "field_width_mm": 100.0, "field_height_mm": 100.0,
+ "spot_weight_method": "fixed", "spot_weight_mu": 0.02}),
         );
         assert!(grid.iter().any(|error| error.contains("budget")));
         // A sane product still validates.
         let ok = validate_plan(
             "zero_field",
             &json!({"selected_energies": [250.0], "spots_per_layer": 100,
-                    "spot_weight_method": "fixed", "spot_weight_mu": 0.02}),
+ "spot_weight_method": "fixed", "spot_weight_mu": 0.02}),
         );
         assert!(ok.is_empty(), "{ok:?}");
         // Integral floats take the same path the generators accept — the
@@ -1671,8 +1669,8 @@ Element,10,0,5,0.0
         let floats = validate_plan(
             "rectangular_field",
             &json!({"selected_energies": [250.0], "spots_x": 20000.0, "spots_y": 20000.0,
-                    "field_width_mm": 100.0, "field_height_mm": 100.0,
-                    "spot_weight_method": "fixed", "spot_weight_mu": 0.02}),
+ "field_width_mm": 100.0, "field_height_mm": 100.0,
+ "spot_weight_method": "fixed", "spot_weight_mu": 0.02}),
         );
         assert!(floats.iter().any(|error| error.contains("budget")));
     }
@@ -1721,16 +1719,16 @@ Element,10,0,5,0.0
         // The catalog bounds the field at 1000 mm and centers at +/-500 —
         // a 1e308 center used to sail through and write NaN into the CSV.
         let base = json!({
-            "selected_energies": [70.0],
-            "field_width_mm": 100.0,
-            "field_height_mm": 100.0,
-            "spots_x": 2,
-            "spots_y": 2,
-            "fast_axis": "x",
-            "start_corner": "top_left",
-            "layer_transition": "reset",
-            "spot_weight_method": "fixed",
-            "spot_weight_mu": 0.02,
+        "selected_energies": [70.0],
+        "field_width_mm": 100.0,
+        "field_height_mm": 100.0,
+        "spots_x": 2,
+        "spots_y": 2,
+        "fast_axis": "x",
+        "start_corner": "top_left",
+        "layer_transition": "reset",
+        "spot_weight_method": "fixed",
+        "spot_weight_mu": 0.02,
         });
         let mut wide = base.clone();
         wide["field_width_mm"] = json!(2000.0);
@@ -1749,17 +1747,17 @@ Element,10,0,5,0.0
         // -500 and 1000 are the declared spec endpoints — they must pass,
         // and the declared field minimum is 0.001, not "greater than zero".
         let base = json!({
-            "selected_energies": [70.0],
-            "center_x_mm": -500.0,
-            "field_width_mm": 0.001,
-            "field_height_mm": 1000.0,
-            "spots_x": 1,
-            "spots_y": 1,
-            "fast_axis": "x",
-            "start_corner": "top_left",
-            "layer_transition": "reset",
-            "spot_weight_method": "fixed",
-            "spot_weight_mu": 0.02,
+        "selected_energies": [70.0],
+        "center_x_mm": -500.0,
+        "field_width_mm": 0.001,
+        "field_height_mm": 1000.0,
+        "spots_x": 1,
+        "spots_y": 1,
+        "fast_axis": "x",
+        "start_corner": "top_left",
+        "layer_transition": "reset",
+        "spot_weight_method": "fixed",
+        "spot_weight_mu": 0.02,
         });
         assert!(validate_plan("rectangular_field", &base).is_empty());
         let mut under = base.clone();
@@ -1768,5 +1766,11 @@ Element,10,0,5,0.0
         let mut past = base.clone();
         past["center_x_mm"] = json!(-500.1);
         assert!(!validate_plan("rectangular_field", &past).is_empty());
+    }
+
+    #[test]
+    fn sixty_seconds_rounds_to_an_hour_not_sixty_minutes() {
+        assert_eq!(format_delivery(3599.9), "1 h");
+        assert_eq!(format_delivery(3599.4), "59 min 59 s");
     }
 }
