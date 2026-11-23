@@ -305,6 +305,10 @@ export default function App() {
   const catalogEpoch = useRef(0);
   const selectionLive = useRef<string[]>([]);
   const selectionWrites = useRef(0);
+  const rowsRef = useRef(rows);
+  useEffect(() => {
+    rowsRef.current = rows;
+  }, [rows]);
   // The optimistic set during an in-flight write — a separate ref because
   // selectionLive is effect-synced, and effect-touched refs may only be
   // written inside effects.
@@ -775,6 +779,7 @@ export default function App() {
 
   const [trashConfirm, setTrashConfirm] = useState<{
     sessionId: string;
+    folderId?: string;
     library: string;
     remote: boolean;
     paths: string[];
@@ -798,6 +803,7 @@ export default function App() {
         }
         setTrashConfirm({
           sessionId,
+          folderId: row?.folder_id,
           library,
           remote: isRemoteSpec(library),
           paths: result.paths,
@@ -817,10 +823,9 @@ export default function App() {
     trashing.current = true;
     setTrashConfirm(null);
     try {
-      const row = rows.find((item) => item.session_id === pending.sessionId);
       const result = await invoke<{ removed: number; errors: string[] }>(
         "scan_kit_trash_session",
-        { path: pending.library, sessionId: row?.folder_id ?? pending.sessionId },
+        { path: pending.library, sessionId: pending.folderId ?? pending.sessionId },
       );
       if (result.errors.length > 0) {
         // Files remain on disk — the catalog row stays (and keeps its
@@ -829,7 +834,11 @@ export default function App() {
       } else if (result.removed === 0) {
         notify(`No files found for session ${pending.sessionId}`);
       } else {
-        setRows((items) => items.filter((item) => item.session_id !== pending.sessionId));
+        setRows((items) =>
+          items.filter(
+            (item) => item.session_id !== pending.sessionId || item.library !== pending.library,
+          ),
+        );
         setSelectionOrder((ids) => ids.filter((id) => id !== pending.sessionId));
         notify(
           pending.remote
@@ -842,7 +851,7 @@ export default function App() {
     } finally {
       trashing.current = false;
     }
-  }, [trashConfirm, rows, setTrashConfirm]);
+  }, [trashConfirm, setTrashConfirm]);
 
   const commitSelection = useCallback((next: { ids: string[]; capped: boolean }) => {
     if (locations.length === 0) {
@@ -876,12 +885,11 @@ export default function App() {
           if (selectionSeq.current !== write) {
             return;
           }
-          const sessionIds = next.ids.flatMap((id) => {
-            const row = rows.find((item) => item.session_id === id);
-            if ((row?.library ?? locations[0]) !== root) {
+          const sessionIds = rowsRef.current.flatMap((row) => {
+            if (!chosen.has(row.session_id) || (row.library ?? locations[0]) !== root) {
               return [];
             }
-            return [row?.folder_id ?? id];
+            return [row.folder_id ?? row.session_id];
           });
           await invoke("scan_kit_select_sessions", { path: root, sessionIds });
         }
@@ -894,6 +902,13 @@ export default function App() {
         selectionWrites.current -= 1;
         if (selectionWrites.current === 0) {
           selectionPending.current = null;
+          // A pull that landed mid-write may have shrunk the catalog -
+          // drop optimistic ids that no longer list, unless a newer
+          // commit already superseded this one.
+          if (selectionSeq.current === write) {
+            const listed = new Set(rowsRef.current.map((row) => row.session_id));
+            setSelectionOrder((ids) => ids.filter((id) => listed.has(id)));
+          }
         }
       }
     })().catch((error: unknown) => {
@@ -913,7 +928,7 @@ export default function App() {
       }
       notifyError(error);
     });
-  }, [locations, rows, selectionOrder]);
+  }, [locations, selectionOrder]);
 
   const onRowCheck = useCallback(
     (sessionId: string, checked: boolean) => {
@@ -1213,6 +1228,7 @@ export default function App() {
               onChange={(value) => {
                 if (value === "Sessions" || value === "Exams") {
                   setCatalog(value);
+                  setSessionMenu(null);
                 }
               }}
             />
