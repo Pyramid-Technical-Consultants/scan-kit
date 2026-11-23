@@ -153,11 +153,15 @@ pub fn invoke(name: &str, input: &Value) -> Result<Value, String> {
         }
         "scan_kit_clinical_goal" => {
             let dose = f32s(input, "dose")?;
-            let goal = input.get("goal").and_then(Value::as_f64).unwrap_or(0.0) as f32;
-            let min_volume = input
-                .get("min_volume")
+            let goal = input
+                .get("goal")
                 .and_then(Value::as_f64)
-                .unwrap_or(0.95) as f32;
+                .ok_or("goal is required")? as f32;
+            // Optional — but a mistyped value must not silently default.
+            let min_volume = match input.get("min_volume") {
+                Some(value) => value.as_f64().ok_or("min_volume must be a number")? as f32,
+                None => 0.95,
+            };
             let result = clinical_goal(&dose, goal, min_volume);
             Ok(json!(result))
         }
@@ -609,6 +613,23 @@ mod tests {
         .unwrap();
         assert_eq!(opened["entries"].as_array().unwrap().len(), 2);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_clinical_goal_requires_goal_and_typed_min_volume() {
+        // A missing goal silently evaluated every dose against 0% — a
+        // guaranteed pass. Missing must error; so must a mistyped override.
+        assert!(invoke("scan_kit_clinical_goal", &json!({"dose": [1.0]})).is_err());
+        assert!(invoke(
+            "scan_kit_clinical_goal",
+            &json!({"dose": [1.0], "goal": 50.0, "min_volume": "high"})
+        )
+        .is_err());
+        assert!(invoke(
+            "scan_kit_clinical_goal",
+            &json!({"dose": [1.0], "goal": 50.0})
+        )
+        .is_ok());
     }
 
     #[test]
