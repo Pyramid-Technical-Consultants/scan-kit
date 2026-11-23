@@ -520,7 +520,21 @@ mod tests {
             xs[index] = (turn * 0.01).sin();
             ys[index] = (turn * 0.013).cos();
         }
-        assert!(!contour_bands(&xs, &ys, 5.0).is_empty());
+        // A third of the mass lives in the tail, off in its own blob — a
+        // truncated input cannot produce an isoline around it.
+        for index in n - 6_000..n {
+            xs[index] = 5.0 + (index % 7) as f32 * 0.001;
+            ys[index] = 5.0;
+        }
+        let bands = contour_bands(&xs, &ys, 5.0);
+        assert!(!bands.is_empty());
+        let reaches_tail = bands.iter().any(|band| match band {
+            Series::Polyline { xs, .. } | Series::Triangles { xs, .. } => {
+                xs.iter().any(|x| *x > 4.0)
+            }
+            _ => false,
+        });
+        assert!(reaches_tail, "the contour never reached the tail samples");
     }
 
     #[test]

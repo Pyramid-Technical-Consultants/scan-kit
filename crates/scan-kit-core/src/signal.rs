@@ -1344,11 +1344,14 @@ mod tests {
     #[test]
     fn an_out_of_range_overlap_cannot_collapse_the_stride() {
         // overlap >= 1 or NaN would leave step = 1 — a quadratic walk over the
-        // whole signal for every segment.
+        // whole signal for every segment. A clamped stride produces the same
+        // PSD as the healthy overlap; a degenerate one would not complete.
         let signal = vec![1.0f32; 256];
-        let (freqs, psd) = welch_psd(&signal, 100.0, 64, 1.5);
-        assert!(!freqs.is_empty() || psd.is_empty());
-        let (_, psd_nan) = welch_psd(&signal, 100.0, 64, f32::NAN);
-        assert_eq!(psd.len(), psd_nan.len());
+        let (freqs, psd) = welch_psd(&signal, 100.0, 64, 0.5);
+        assert!(!freqs.is_empty() && !psd.is_empty());
+        let (_, out_of_range) = welch_psd(&signal, 100.0, 64, 1.5);
+        let (_, nan_overlap) = welch_psd(&signal, 100.0, 64, f32::NAN);
+        assert_eq!(out_of_range, psd);
+        assert_eq!(nan_overlap, psd);
     }
 }

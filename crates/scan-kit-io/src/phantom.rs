@@ -92,6 +92,8 @@ mod tests {
         let db = parent.join("scan-kit.sqlite");
         let err = write(&parent, &serde_json::json!({ "phantom": "../escape" }), &db).unwrap_err();
         assert!(err.contains("unknown phantom"));
+        // An escaped write lands as a sibling of parent — check that too.
+        assert!(!parent.parent().unwrap().join("escape").exists());
         assert!(
             fs::read_dir(&parent).unwrap().next().is_none()
                 || fs::read_dir(&parent)

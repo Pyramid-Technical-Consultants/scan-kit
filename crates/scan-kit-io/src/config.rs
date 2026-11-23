@@ -1170,7 +1170,9 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    // Needs developer-mode/admin privilege to create symlinks on Windows.
     #[test]
+    #[ignore = "needs symlink privilege on Windows"]
     fn a_config_walk_does_not_follow_symlinked_dirs() {
         let root = std::env::temp_dir().join(format!(
             "scan-kit-cfglink-{}-{}",
@@ -1187,17 +1189,15 @@ mod tests {
         fs::create_dir_all(outside.join("secret")).unwrap();
         fs::write(source.join("map2map/devices.xml"), b"<devices/>\n").unwrap();
         fs::write(outside.join("secret/leak.xml"), b"<leak/>\n").unwrap();
-        // Symlink creation needs extra privilege on Windows; skip when refused.
+        // Symlink creation needs extra privilege on Windows — the test is
+        // #[ignore]'d so a privilege refusal can't masquerade as coverage.
         #[cfg(unix)]
         let linked = std::os::unix::fs::symlink(&outside, source.join("linked"));
         #[cfg(windows)]
         let linked = std::os::windows::fs::symlink_dir(&outside, source.join("linked"));
         #[cfg(not(any(unix, windows)))]
         let linked: std::io::Result<()> = Ok(());
-        let Ok(()) = linked else {
-            let _ = fs::remove_dir_all(&root);
-            return;
-        };
+        linked.expect("symlink privilege is required for this test");
 
         assert_eq!(list_xml(&source).unwrap(), ["map2map/devices.xml"]);
         assert_eq!(walk_files(&source).unwrap().len(), 1);

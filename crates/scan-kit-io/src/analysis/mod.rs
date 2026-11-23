@@ -292,8 +292,26 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         write_session(&root);
         let loaded = load_timeslice_columns(&root, "sess");
-        assert!(loaded["columns"].as_array().unwrap().len() >= 2);
-        assert!(!channel_catalog(&root, "sess").is_empty());
+        let names: Vec<&str> = loaded["columns"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|column| column["name"].as_str().unwrap())
+            .collect();
+        // len() >= 2 would pass on the wrong columns entirely.
+        for expected in [
+            "r_ic1_current_dose",
+            "ic1_peak_amplitude_x",
+            "position_error_x",
+            "field_x",
+            "c_x",
+        ] {
+            assert!(names.contains(&expected), "{names:?}");
+        }
+        let channels = channel_catalog(&root, "sess");
+        for expected in ["ic1_current", "ic1_x_peak", "amp_x"] {
+            assert!(channels.iter().any(|name| name == expected), "{channels:?}");
+        }
         let _ = std::fs::remove_dir_all(&root);
     }
 
