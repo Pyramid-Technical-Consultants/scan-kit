@@ -357,11 +357,19 @@ pub fn invoke(name: &str, input: &Value) -> Result<Value, InvokeError> {
         "scan_kit_calibrate" => {
             let target = f32_array(input, "target")?;
             let delivered = f32_array(input, "delivered")?;
+            // zip() truncates to the shorter side — a ragged pair would
+            // silently score on half the measurement.
+            if target.len() != delivered.len() {
+                return Err(InvokeError::UnexpectedInput);
+            }
             json!({ "factor": calibration_factor(&target, &delivered) })
         }
         "scan_kit_dose_error" => {
             let target = f32_array(input, "target")?;
             let delivered = f32_array(input, "delivered")?;
+            if target.len() != delivered.len() {
+                return Err(InvokeError::UnexpectedInput);
+            }
             json!({ "error_pct": dose_error_pct(&delivered, &target) })
         }
         "scan_kit_beam_mask" => {
@@ -396,6 +404,26 @@ pub fn invoke(name: &str, input: &Value) -> Result<Value, InvokeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ragged_target_and_delivered_arrays_are_an_error() {
+        // zip() would silently score only the shorter side.
+        assert!(invoke(
+            "scan_kit_calibrate",
+            &json!({"target": [1.0, 2.0], "delivered": [1.0]})
+        )
+        .is_err());
+        assert!(invoke(
+            "scan_kit_dose_error",
+            &json!({"target": [1.0], "delivered": [1.0, 2.0]})
+        )
+        .is_err());
+        assert!(invoke(
+            "scan_kit_calibrate",
+            &json!({"target": [1.0], "delivered": [1.0]})
+        )
+        .is_ok());
+    }
 
     #[test]
     fn sk_req_001_version_is_a_single_string() {

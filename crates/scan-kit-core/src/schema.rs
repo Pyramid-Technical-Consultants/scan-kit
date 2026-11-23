@@ -363,9 +363,11 @@ pub fn resolve_column_name<'a>(columns: &'a [String], requested: &str) -> Option
         return Some(found);
     }
     let want = normalize_column_name(requested);
+    // First wins, matching the exact-match path above — silently keeping
+    // the last normalized hit picked a different column order-dependently.
     let mut found = None;
     for column in columns {
-        if normalize_column_name(column) == want {
+        if found.is_none() && normalize_column_name(column) == want {
             found = Some(column.as_str());
         }
     }
@@ -454,6 +456,14 @@ fn position_axis(concept: &str) -> Option<(&'static str, &'static str, bool)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normalized_column_matching_is_first_wins() {
+        // The exact-match path returns the first hit; the normalized path
+        // used to silently keep the last, order-dependent.
+        let columns = vec!["IC1 Dose".to_string(), "ic1_dose".to_string()];
+        assert_eq!(resolve_column_name(&columns, "ic1 dose"), Some("IC1 Dose"));
+    }
 
     #[test]
     fn sk_req_006_g2_alias_and_scale() {

@@ -8631,8 +8631,13 @@ pub(crate) fn f16_lattice(values: &[f32], shape: [usize; 3]) -> Vec<u8> {
     let height = ny + 4;
     let depth = nz + 4;
     let stride = f16_stride(nx);
+    // A zero dim in an unclamped upstream shape must not size this
+    // allocation from the other two dims.
+    if shape.contains(&0) {
+        return Vec::new();
+    }
     let mut padded = vec![0u8; stride * height * depth];
-    if shape[0] > 0 && shape[1] > 0 && shape[2] > 0 {
+    {
         for z in 0..nz {
             for y in 0..ny {
                 let src = nx * (y + ny * z);

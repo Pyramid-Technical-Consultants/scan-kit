@@ -264,6 +264,9 @@ fn write_field(root: &mut Elem, id: &str, value: &str) -> Result<(), String> {
         .at_mut(&path)
         .ok_or_else(|| format!("missing XML node {id}"))?;
     if let Some(attr) = which.strip_prefix('@') {
+        if !valid_name(attr) {
+            return Err(format!("bad field id {id}"));
+        }
         elem.set_attr(attr, value);
     } else if which == "#text" {
         elem.text = value.to_owned();
@@ -273,6 +276,15 @@ fn write_field(root: &mut Elem, id: &str, value: &str) -> Result<(), String> {
         return Err(format!("bad field id {id}"));
     }
     Ok(())
+}
+
+/// XML names admit letters, digits, and `_:.-` — anything else would be
+/// written raw into the attribute position and corrupt the document.
+fn valid_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | ':' | '-' | '.'))
 }
 
 fn write_table(root: &mut Elem, node: &Value) -> Result<(), String> {
@@ -305,6 +317,7 @@ fn write_table(root: &mut Elem, node: &Value) -> Result<(), String> {
             value
                 .get("name")
                 .and_then(Value::as_str)
+                .filter(|name| valid_name(name))
                 .ok_or_else(|| "table column name is required".to_owned())
         })
         .collect::<Result<_, _>>()?;
@@ -743,6 +756,27 @@ fn value_kind(raw: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_form_field_cannot_inject_xml_attribute_names() {
+        // The `@name` suffix lands raw in the emitted document — names
+        // outside the XML charset must be rejected.
+        let xml = "<r><a/></r>";
+        assert!(apply_form(
+            xml,
+            &json!({"nodes":[{"kind":"fields","fields":[
+                {"id": "0@x\" injected=\"y", "value": "1"}
+            ]}]})
+        )
+        .is_err());
+        assert!(apply_form(
+            xml,
+            &json!({"nodes":[{"kind":"fields","fields":[
+                {"id": "0@x", "value": "1"}
+            ]}]})
+        )
+        .is_ok());
+    }
 
     #[test]
     fn labels_match_the_python_catalog() {

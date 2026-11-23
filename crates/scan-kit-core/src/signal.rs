@@ -880,6 +880,9 @@ fn walk_flags(node: &serde_json::Value, scalars: &mut Vec<String>, channels: &mu
                 .filter(|item| item == "pass" || item == "fail")
                 .collect();
             if flags.len() == items.len() && flags.len() > channels.len() {
+                // A displaced shorter list must still count — dropping a
+                // fail here would read as a pass below.
+                scalars.append(channels);
                 *channels = flags;
             } else {
                 for item in items {
@@ -914,11 +917,17 @@ fn walk_delta(node: &serde_json::Value, start: &mut Option<f32>, end: &mut Optio
         return;
     };
     for (key, child) in map {
+        // A non-numeric duplicate key must not erase a reading already
+        // found — only a real value replaces.
         if key.ends_with("hv_transient_test/starting_voltage") {
-            *start = child.as_f64().map(|value| value as f32);
+            if let Some(value) = child.as_f64() {
+                *start = Some(value as f32);
+            }
         }
         if key.ends_with("hv_transient_test/ending_voltage") {
-            *end = child.as_f64().map(|value| value as f32);
+            if let Some(value) = child.as_f64() {
+                *end = Some(value as f32);
+            }
         }
         walk_delta(child, start, end);
     }
@@ -982,6 +991,22 @@ pub fn resample_nearest(source: &[f32], shape: [usize; 3], out_shape: [usize; 3]
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_shorter_flag_list_cannot_hide_a_fail() {
+        // The longer array used to replace channels outright — a fail in
+        // the displaced list read as an overall pass.
+        let (grade, _) = hv_firmware_flags(r#"{"result":{"a":["fail"],"z":["pass","pass"]}}"#);
+        assert_eq!(grade.as_deref(), Some("fail"));
+    }
+
+    #[test]
+    fn a_non_numeric_voltage_key_cannot_clobber_a_reading() {
+        let delta = hv_delta_v(
+            r#"{"a/hv_transient_test/starting_voltage":0,"a/hv_transient_test/ending_voltage":80,"z/hv_transient_test/starting_voltage":"n/a"}"#,
+        );
+        assert_eq!(delta, Some(80.0));
+    }
 
     #[test]
     fn sk_req_035_relative_position_radius_sigma_percent_and_dose_per_mu() {

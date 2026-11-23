@@ -100,13 +100,13 @@ pub fn segments_from(options: &Value, defaults: &[Segment]) -> Vec<Segment> {
 
 fn listed_segments(options: &Value, defaults: &[Segment]) -> Vec<Segment> {
     if let Some(values) = options.get("segments").and_then(Value::as_array) {
+        // A present key is an explicit selection — an empty or
+        // all-malformed list means "no segments", not "the defaults".
         let items: Vec<Segment> = values
             .iter()
             .filter_map(|item| serde_json::from_value(item.clone()).ok())
             .collect();
-        if !items.is_empty() {
-            return without_playhead(items);
-        }
+        return without_playhead(items);
     }
     if let Some(text) = options.get("segments").and_then(Value::as_str) {
         if let Ok(items) = parse_segments(text) {
@@ -166,7 +166,9 @@ pub fn scrub_limits(options: &Value) -> Option<(f32, f32)> {
     if value.get("on").and_then(Value::as_bool) != Some(true) {
         return None;
     }
-    let at = finite_f32(value.get("at")).unwrap_or(0.0).max(0.0);
+    // `on` without a usable playhead is off — fabricating at t=0 would
+    // filter nearly every row with no indication why.
+    let at = finite_f32(value.get("at"))?.max(0.0);
     let before = value.get("window").and_then(Value::as_str) == Some("before");
     let lo = if before { f32::NEG_INFINITY } else { at - 1.0 };
     Some((lo, at))
@@ -527,6 +529,34 @@ fn modified_z(values: &[f32]) -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn an_explicit_empty_segments_list_is_not_the_defaults() {
+        // A present `segments` key is a selection — `[]` and all-malformed
+        // must agree with the string form `"[]"`: nothing, not defaults.
+        let defaults = [Segment::Beam {
+            state: BeamGate::On,
+        }];
+        assert!(segments_from(&json!({"segments": []}), &defaults).is_empty());
+        assert!(segments_from(&json!({"segments": [{"kind": "bogus"}]}), &defaults).is_empty());
+        assert!(segments_from(&json!({"segments": "[]"}), &defaults).is_empty());
+    }
+
+    #[test]
+    fn a_scrubbed_timeline_without_a_playhead_is_off() {
+        // `{"on":true}` used to fabricate at=0 — a [-1, 0] window that
+        // filters every row of a session starting after t=0.
+        assert_eq!(scrub_limits(&json!({"scrub": {"on": true}})), None);
+        assert_eq!(
+            scrub_limits(&json!({"scrub": {"on": true, "at": "soon"}})),
+            None
+        );
+        assert_eq!(
+            scrub_limits(&json!({"scrub": {"on": true, "at": 30.0}})),
+            Some((29.0, 30.0))
+        );
+    }
 
     fn sample() -> BTreeMap<String, Vec<f32>> {
         let values: Vec<f32> = (0..20).map(|value| value as f32).chain([1000.0]).collect();

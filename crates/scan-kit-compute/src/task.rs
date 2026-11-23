@@ -1463,6 +1463,10 @@ fn blank_result(job: &McJob) -> McResult {
             request.spacing_mm.map(|mm| mm.max(0.25)),
         ),
     };
+    // Clamp like empty_result does so product(shape) == values.len() —
+    // a zero dim would otherwise emit an empty-values Volume whose shape
+    // still sizes the renderer's padded lattice.
+    let shape = shape.map(|dim| dim.max(1));
     let count = shape[0].saturating_mul(shape[1]).saturating_mul(shape[2]);
     // The placeholder must not allocate an unbounded request shape.
     let (shape, values) = if count > 1 << 28 {
