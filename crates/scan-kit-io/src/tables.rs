@@ -1914,7 +1914,13 @@ pub(crate) fn point_time_stamp(dir: &Path) -> u128 {
                     .collect()
             })
             .unwrap_or_default();
-        runs.sort();
+        // run-10 sorts before run-2 lexicographically — sort numerically so
+        // many-run sessions can't change which file feeds the lookup.
+        runs.sort_by_key(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| crate::discover::number_after(name, "run-"))
+        });
         for run in runs {
             if let Some(path) = point_time_file(&run) {
                 stamp = stamp.wrapping_add(discover::meta_stamp(&path));
@@ -1953,7 +1959,13 @@ fn layer_point_times(dir: &Path) -> HashMap<(u32, u32), f32> {
                     .is_some_and(|name| name.starts_with("run-"))
             })
             .collect();
-        runs.sort();
+        // run-10 sorts before run-2 lexicographically — sort numerically so
+        // many-run sessions can't change which file feeds the lookup.
+        runs.sort_by_key(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| crate::discover::number_after(name, "run-"))
+        });
         for run in runs {
             if let Some(path) = point_time_file(&run) {
                 if let Ok(bytes) = std::fs::read(&path) {
@@ -5532,10 +5544,12 @@ pub(crate) fn parse_datetime(text: &str) -> Option<f64> {
     let year: i32 = date_parts.next()?.parse().ok()?;
     let month: u32 = date_parts.next()?.parse().ok()?;
     let day: u32 = date_parts.next()?.parse().ok()?;
+    // A garbage time field must read as NaN like a garbage date does —
+    // "30 UTC" silently parsing as 0 drops the seconds.
     let mut clock = time.split(':');
-    let hour: u32 = clock.next().unwrap_or("0").parse().unwrap_or(0);
-    let minute: u32 = clock.next().unwrap_or("0").parse().unwrap_or(0);
-    let second: f64 = clock.next().unwrap_or("0").parse().unwrap_or(0.0);
+    let hour: u32 = clock.next().unwrap_or("0").parse().ok()?;
+    let minute: u32 = clock.next().unwrap_or("0").parse().ok()?;
+    let second: f64 = clock.next().unwrap_or("0").parse().ok()?;
     let days = days_from_civil(year, month, day)?;
     Some(days as f64 * 86400.0 + f64::from(hour) * 3600.0 + f64::from(minute) * 60.0 + second)
 }
@@ -6441,5 +6455,14 @@ mod tests {
     fn a_span_of_extreme_finite_samples_stays_finite() {
         let (lo, hi) = span(&[-f32::MAX, f32::MAX]);
         assert!(lo.is_finite() && hi.is_finite());
+    }
+
+    #[test]
+    fn a_garbage_time_component_reads_as_no_datetime() {
+        // A tz text suffix used to zero the seconds; a garbage field used
+        // to read as midnight. Both must now be no-datetime, like a bad date.
+        assert_eq!(parse_datetime("2024-03-01 junk"), None);
+        assert_eq!(parse_datetime("2024-03-01 10:20:30 UTC"), None);
+        assert!(parse_datetime("2024-03-01 10:20").is_some());
     }
 }
