@@ -756,7 +756,11 @@ mod net {
                 FtpClient::Tls(ftp) => ftp.mlst(Some(path)),
             };
             match listed {
-                Ok(line) => Ok(stat_mlst(&line)),
+                // An unparseable reply is not "file missing" — treating it as
+                // None silently vanishes a real object from stat consumers.
+                Ok(line) => stat_mlst(&line)
+                    .map(Some)
+                    .ok_or_else(|| format!("unparseable MLST reply: {line}")),
                 Err(err) if missing_ftp(&err) => Ok(None),
                 Err(_) => stat_from_list(self, path),
             }
@@ -875,7 +879,7 @@ mod net {
     }
 
     /// `None` for a symlink — not a plain file this connector may read.
-    fn stat_mlst(line: &str) -> Option<Stat> {
+    pub(crate) fn stat_mlst(line: &str) -> Option<Stat> {
         let mut dir = false;
         let mut size = 0u64;
         let mut mtime_ns = 0i64;
@@ -1403,5 +1407,13 @@ mod tests {
         let missing = head_fs.stat("/").unwrap().unwrap();
         assert_eq!(missing.size, 0);
         let _ = fs::remove_dir_all(&dest);
+    }
+
+    #[test]
+    fn a_malformed_mlst_reply_is_an_error_not_a_missing_file() {
+        // stat_mlst returns None for both absent and unparseable — callers
+        // would silently skip a real object.
+        assert!(super::net::stat_mlst("type=file;size=abc; name").is_none());
+        assert!(super::net::stat_mlst("type=file;size=12; name").is_some());
     }
 }
