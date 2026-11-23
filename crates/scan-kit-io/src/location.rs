@@ -1500,19 +1500,27 @@ pub(crate) fn session_storage_paths(root: &str, session_id: &str) -> Result<Vec<
         // filename — `a.zip` holding `b/` re-discovers as `b` after `b` is
         // trashed, so probe archives by identity too. Tars cannot peek
         // cheaply; their identity is the filename stem already covered above.
-        if let Ok(read) = fs::read_dir(base) {
-            for entry in read.flatten() {
-                let path = entry.path();
-                if !path.is_file() {
-                    continue;
-                }
-                let matches =
-                    discover::archive_identity(&path).is_some_and(|(id, _)| id == session_id);
-                let place = path.to_string_lossy().into_owned();
-                if matches && !found.contains(&place) {
-                    found.push(place);
+        // A transient read_dir failure must not fabricate an empty archive
+        // scan - trash would then delete only what it saw and the wrapped
+        // session would resurrect on the next discover.
+        match fs::read_dir(base) {
+            Ok(read) => {
+                for entry in read {
+                    let entry = entry.map_err(|err| err.to_string())?;
+                    let path = entry.path();
+                    if !path.is_file() {
+                        continue;
+                    }
+                    let matches =
+                        discover::archive_identity(&path).is_some_and(|(id, _)| id == session_id);
+                    let place = path.to_string_lossy().into_owned();
+                    if matches && !found.contains(&place) {
+                        found.push(place);
+                    }
                 }
             }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err.to_string()),
         }
     }
     Ok(found)

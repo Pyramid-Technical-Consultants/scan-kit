@@ -22,11 +22,6 @@ pub fn catalog(db: &Path) -> Value {
 }
 
 pub fn synthesize(input: &Value, db: &Path) -> Result<Value, String> {
-    let template = input
-        .get("template")
-        .and_then(Value::as_str)
-        .ok_or("template is required")?;
-    let params = input.get("params").cloned().unwrap_or_else(|| json!({}));
     let path = input
         .get("path")
         .and_then(Value::as_str)
@@ -45,6 +40,11 @@ pub fn synthesize(input: &Value, db: &Path) -> Result<Value, String> {
         return Ok(json!({ "written": path }));
     }
 
+    let template = input
+        .get("template")
+        .and_then(Value::as_str)
+        .ok_or("template is required")?;
+    let params = input.get("params").cloned().unwrap_or_else(|| json!({}));
     let mut errors = scan_kit_core::validate_plan(template, &params);
     if template == "dicom_rt_plan" {
         errors.splice(0..0, dicom_path_errors(&text(&params, "dicom_path")));
@@ -150,7 +150,9 @@ fn write_csv(path: &Path, csv: &str, db: &Path) -> Result<(), String> {
     }
     scan_kit_core::atomic_write(path, csv.as_bytes())?;
     if let Some(parent) = path.parent() {
-        let dir = parent.to_string_lossy().to_string();
+        // Store the resolved directory - a bare "." or a relative parent is
+        // not a usable default location for the next save.
+        let dir = crate::store::canonical_local(parent);
         if !dir.is_empty() {
             let _ = with_store(db, |conn| store::set_last_plan_save_dir(conn, &dir));
         }
@@ -249,7 +251,7 @@ mod tests {
         let catalog = catalog(&db);
         assert_eq!(
             catalog["save_dir"].as_str().unwrap(),
-            out.parent().unwrap().to_string_lossy()
+            crate::store::canonical_local(out.parent().unwrap())
         );
         let _ = fs::remove_dir_all(&root);
     }
