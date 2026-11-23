@@ -246,7 +246,7 @@ export function PlanSynthesis() {
   }, [plan]);
 
   const baseColumns = useMemo<GridColumn[]>(
-    () => (plan?.columns ?? []).map((title) => ({ title, id: title, width: 130 })),
+    () => (plan?.columns ?? []).map((title, index) => ({ title, id: `${title}#${index}`, width: 130 })),
     [plan],
   );
   const { columns, onColumnResize } = useResizableColumns(baseColumns);

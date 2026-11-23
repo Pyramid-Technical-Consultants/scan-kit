@@ -62,6 +62,10 @@ export function ExamTable({
     indexes.sort((left, right) => {
       const a = examValue(rows[left], sort.key);
       const b = examValue(rows[right], sort.key);
+      // Missing values sink last in both directions, like compareRows.
+      if (a === "" || b === "") {
+        return a === "" && b === "" ? 0 : a === "" ? 1 : -1;
+      }
       const compared = typeof a === "number" && typeof b === "number" ? a - b : String(a).localeCompare(String(b));
       return sort.direction === "asc" ? compared : -compared;
     });

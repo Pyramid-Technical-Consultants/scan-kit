@@ -288,6 +288,13 @@ export default function App() {
   const [undo, setUndo] = useState<NoteEdit[]>([]);
   const [redo, setRedo] = useState<NoteEdit[]>([]);
   const [gridSelection, setGridSelection] = useState<GridSelection>(emptyGridSelection);
+  // Positional selection is meaningless across a rows replacement — the
+  // same rule ExamTable applies internally.
+  const [prevRows, setPrevRows] = useState(rows);
+  if (prevRows !== rows) {
+    setPrevRows(rows);
+    setGridSelection(emptyGridSelection);
+  }
   const [theme, setTheme] = useState<Theme | null>(null);
   const [checks, setChecks] = useState<CheckPaint | null>(null);
   const [size, setSize] = useState({ width: 0, height: 0 });

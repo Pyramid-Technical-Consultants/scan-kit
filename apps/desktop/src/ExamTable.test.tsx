@@ -67,3 +67,31 @@ it("sorts exams from the header and reads each column", async () => {
   });
   expect(text([4, 0])).toBe("earlier");
 });
+
+it("sinks exams without a date last in both directions", async () => {
+  const host = document.createElement("div");
+  document.body.append(host);
+  const undated: ExamRow[] = [
+    { exam: "z", patient: "Ann", patient_id: "2", date: "", description: "", files: 1 },
+    { exam: "b", patient: "Ann", patient_id: "2", date: "2020", description: "", files: 2 },
+    { exam: "a", patient: "Bea", patient_id: "1", date: "2021", description: "", files: 10 },
+  ];
+  await act(async () => {
+    root = createRoot(host);
+    root.render(<ExamTable rows={undated} theme={{} as Theme} width={400} height={200} />);
+  });
+  const text = (cell: readonly [number, number]) => {
+    const content = editor?.getCellContent(cell) as { displayData?: string };
+    return content.displayData ?? "";
+  };
+  await act(async () => {
+    editor?.onHeaderClicked(3);
+  });
+  expect(text([3, 0])).toBe("2020");
+  expect(text([3, 2])).toBe("");
+  await act(async () => {
+    editor?.onHeaderClicked(3);
+  });
+  expect(text([3, 0])).toBe("2021");
+  expect(text([3, 2])).toBe("");
+});
