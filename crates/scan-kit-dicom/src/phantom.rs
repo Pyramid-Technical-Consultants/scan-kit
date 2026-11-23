@@ -537,10 +537,14 @@ fn parse(params: &Value) -> Result<Request, String> {
     }
     let fractions = match params.get("fractions") {
         None | Some(Value::Null) => 1,
-        Some(value) => value
-            .as_i64()
-            .or_else(|| value.as_f64().map(|v| v as i64))
-            .ok_or("fractions must be a number")?,
+        // Non-integers must error like the plan params — 2.5 is not 2.
+        Some(value) => match value.as_i64() {
+            Some(n) => n,
+            None => match value.as_f64() {
+                Some(v) if v.fract() == 0.0 && v.abs() < 9.0e15 => v as i64,
+                _ => return Err("fractions must be a whole number".into()),
+            },
+        },
     };
     if !(1..=40).contains(&fractions) {
         return Err("Fractions must be from 1 to 40.".into());
@@ -719,6 +723,19 @@ fn uid() -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_fractional_fraction_count_is_rejected() {
+        // Every other integer param requires a whole number — 2.5 used to
+        // truncate to 2 and write a different plan than requested.
+        let err = match parse(&json!({ "fractions": 2.5 })) {
+            Ok(_) => panic!("2.5 fractions parsed"),
+            Err(err) => err,
+        };
+        assert!(err.contains("whole number"), "{err}");
+        assert!(parse(&json!({ "fractions": 3.0 })).is_ok());
+    }
+
     use super::*;
     use crate::patient::load_study;
     use serde_json::json;

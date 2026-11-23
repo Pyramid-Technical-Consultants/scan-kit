@@ -1110,14 +1110,15 @@ fn steps_to_leave(cell: [f32; 3], dir: [f32; 3], spacing: [f32; 3], step: f32) -
             brick
         };
         let along = (bound - cell[axis]) / dir_i;
-        if along > 1e-4 {
-            delta = delta.min(along);
-        }
+        // along >= 0 inside a brick — the nearest face IS the constraint.
+        // Skipping a ~0 distance let the march jump the very face it was
+        // about to cross, landing in bricks the dilation never covered.
+        delta = delta.min(along);
     }
     let steps = (delta / step).ceil();
-    // delta can stay f32::MAX when every axis is within tolerance of a brick
-    // bound — finite, but saturates `as usize` to usize::MAX and wraps the
-    // caller's `i +=`. Leaving a brick never needs more than the march cap.
+    // delta stays f32::MAX only when every axis direction is negligible —
+    // finite, but saturates `as usize` to usize::MAX and wraps the caller's
+    // `i +=`. Leaving a brick never needs more than the march cap.
     if !steps.is_finite() {
         return 1;
     }
@@ -1708,11 +1709,18 @@ mod tests {
 
     #[test]
     fn steps_to_leave_stays_bounded_at_a_brick_edge() {
-        // Every axis within tolerance of a bound leaves delta = f32::MAX —
-        // finite but usize::MAX after the cast. The march cap bounds it.
+        // About to cross the x face in 6e-5 mm — that face is the binding
+        // constraint, so the march moves one step, not a full cap's worth
+        // through bricks the dilation never covered.
         let steps = steps_to_leave([8.0 - 6e-5, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0; 3], 1.0);
-        assert!(steps <= MAX_STEPS, "{steps}");
-        assert!(steps >= 1);
+        assert_eq!(steps, 1, "{steps}");
+        // Exactly on a low face moving negative: along = 0 must still move
+        // one step (0 would stall the march).
+        let steps = steps_to_leave([8.0, 4.0, 4.0], [-1.0, 0.0, 0.0], [1.0; 3], 1.0);
+        assert_eq!(steps, 1, "{steps}");
+        // Well inside the brick the full distance to the face applies.
+        let steps = steps_to_leave([10.0, 4.0, 4.0], [1.0, 0.0, 0.0], [1.0; 3], 1.0);
+        assert_eq!(steps, 6, "{steps}");
     }
 
     #[test]

@@ -183,9 +183,15 @@ fn walk_local(
         let Ok(kind) = child.file_type() else {
             continue;
         };
+        // A leftover download staging dir holds a bare "session/" tree that
+        // would catalog as a ghost session — it is not real storage.
         if kind.is_symlink()
             || !kind.is_dir()
             || sessions.iter().any(|name| name == &child.file_name())
+            || child
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".session_staging-")
         {
             continue;
         }
@@ -535,14 +541,19 @@ pub fn session_directory(library: &Path, session_id: &str) -> PathBuf {
     if flat_dir && marker_file(&flat.join("input_map.csv")) {
         return flat;
     }
-    if marker_file(&library.join("input_map.csv")) {
-        return library.to_path_buf();
-    }
     if let Some(recorded) = crate::location::recorded_directory(library, session_id) {
         return recorded;
     }
     if let Some(catalog) = crate::location::catalog_directory(library, session_id) {
         return catalog;
+    }
+    // The root resolves only for the session it actually is — a data dir
+    // that is itself a session must not answer every session id with its
+    // files (a foreign id reaching here reads the wrong session's map).
+    if library.file_name().is_some_and(|name| name == session_id)
+        && marker_file(&library.join("input_map.csv"))
+    {
+        return library.to_path_buf();
     }
     flat
 }
@@ -885,11 +896,17 @@ fn read_zip(path: &Path, want: &dyn Fn(&str) -> bool) -> Result<Vec<(String, Vec
     let mut out = Vec::new();
     let mut total = 0u64;
     for index in 0..archive.len() {
-        let mut entry = archive.by_index(index).map_err(|err| err.to_string())?;
+        // One unsupported-compression or undecodable member must not brick
+        // every read — the discovery peek skips them the same way.
+        let Ok(mut entry) = archive.by_index(index) else {
+            continue;
+        };
         if entry.is_dir() {
             continue;
         }
-        let name = entry.name().map_err(|err| err.to_string())?.into_owned();
+        let Ok(name) = entry.name().map(|name| name.into_owned()) else {
+            continue;
+        };
         if !want(&name) {
             continue;
         }
@@ -1052,6 +1069,75 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(ids.contains(&"seen".to_owned()), "{ids:?}");
         assert!(!ids.contains(&"miss".to_owned()), "{ids:?}");
+        let _ = fs::remove_dir_all(&root);
+    }
+    #[test]
+    fn a_staging_dir_does_not_catalog_as_a_ghost_session() {
+        // A leftover download staging dir holds a bare "session/" tree —
+        // without the skip it catalogs a ghost id that can then be trashed.
+        let root = std::env::temp_dir().join(format!(
+            "scan-kit-staging-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let ghost = root.join(".session_staging-123/session");
+        fs::create_dir_all(&ghost).unwrap();
+        fs::write(
+            ghost.join("input_map.csv"),
+            b"energy
+1
+",
+        )
+        .unwrap();
+        fs::create_dir_all(root.join("real")).unwrap();
+        fs::write(
+            root.join("real/input_map.csv"),
+            b"energy
+1
+",
+        )
+        .unwrap();
+        let ids = discover(&root, &mut |_, _| true)
+            .unwrap()
+            .entries
+            .into_iter()
+            .map(|entry| entry.session_id)
+            .collect::<Vec<_>>();
+        assert_eq!(ids, ["real"], "{ids:?}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_session_library_root_answers_only_its_own_id() {
+        // A data dir that is itself a session must not resolve a foreign
+        // valid id to its own input_map.csv.
+        let root = std::env::temp_dir().join(format!(
+            "scan-kit-rootid-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let library = root.join("sess");
+        fs::create_dir_all(&library).unwrap();
+        fs::write(
+            library.join("input_map.csv"),
+            b"energy
+1
+",
+        )
+        .unwrap();
+        assert_eq!(session_directory(&library, "sess"), library);
+        let foreign = session_directory(&library, "other");
+        assert!(
+            foreign != library,
+            "foreign id resolved to the root session"
+        );
         let _ = fs::remove_dir_all(&root);
     }
 

@@ -173,7 +173,14 @@ pub fn save_folder(
         // Stale/kept must cover every copied file, not just .xml — a
         // removed non-XML file or an orphan .md5 sidecar would otherwise
         // survive every save.
-        let stale = list_tree(dest).unwrap_or_default();
+        // A list failure means stale files get fresh sidecars — fail the
+        // save instead of silently merging. A missing destination has no
+        // stale files by definition.
+        let stale = if dest.exists() {
+            list_tree(dest)?
+        } else {
+            Vec::new()
+        };
         // A failed source list would empty `kept` and delete every file at
         // dest — fail the save instead.
         let kept: std::collections::HashSet<String> = list_tree(source)?.into_iter().collect();
@@ -192,7 +199,7 @@ pub fn save_folder(
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent).map_err(|err| err.to_string())?;
         }
-        fs::write(&target, xml)
+        scan_kit_core::atomic_write(&target, xml.as_bytes())
             .map_err(|err| format!("Could not write {}: {err}", target.display()))?;
     }
     let refreshed = commit_integrity(dest)?;
@@ -960,7 +967,7 @@ fn commit_file(path: &Path) -> Result<(), String> {
     let digest = hex_digest(&bytes, salt);
     let mtime = pyramid_mtime(path)?;
     let sidecar = sidecar_path(path);
-    fs::write(&sidecar, pack_sidecar(&digest, salt, mtime)?)
+    scan_kit_core::atomic_write(&sidecar, &pack_sidecar(&digest, salt, mtime)?)
         .map_err(|err| format!("Could not write {}: {err}", sidecar.display()))
 }
 
@@ -1164,7 +1171,9 @@ fn copy_tree(source: &Path, dest: &Path, depth: usize) -> Result<(), String> {
         if kind.is_dir() {
             copy_tree(&from, &to, depth + 1)?;
         } else if kind.is_file() {
-            fs::copy(&from, &to)
+            let bytes = fs::read(&from)
+                .map_err(|err| format!("Could not copy {}: {err}", from.display()))?;
+            scan_kit_core::atomic_write(&to, &bytes)
                 .map_err(|err| format!("Could not copy {}: {err}", from.display()))?;
         }
     }

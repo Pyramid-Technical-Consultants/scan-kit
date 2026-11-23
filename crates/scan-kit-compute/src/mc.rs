@@ -657,8 +657,12 @@ async fn prepare(launch: Launch) -> Result<Live, ComputeError> {
     // The LET buffer binds nvox*16 bytes — a grid whose largest buffer beats
     // the storage binding limit fails create_buffer validation as a panic,
     // so bound it here where the failure is a clean ComputeError.
-    let binding_cap = gpu.device.limits().max_storage_buffer_binding_size as usize;
-    if nvox > binding_cap / 16 {
+    let limits = gpu.device.limits();
+    let binding_cap = limits.max_storage_buffer_binding_size as usize;
+    // The LET buffer binds nvox*16 but readback stages nvox*20+80 — both
+    // caps bind the run, and max_buffer_size can sit near the binding limit.
+    let staging = nvox.saturating_mul(20).saturating_add(80);
+    if nvox > binding_cap / 16 || staging > limits.max_buffer_size as usize {
         return Err(ComputeError::Message(format!(
             "voxel grid {nx}x{ny}x{nz} is too large for this GPU"
         )));
@@ -830,9 +834,12 @@ impl Live {
         // step never waits on it — sibling runs on the shared queue keep
         // submitting while the readback is in flight.
         if self.pending_read.is_some() {
-            self.device
-                .poll(wgpu::PollType::Poll)
-                .map_err(|err| ComputeError::Message(err.to_string()))?;
+            self.device.poll(wgpu::PollType::Poll).map_err(|err| {
+                // Same eviction as wait_fence/collect_read — a dead device
+                // must not hand out on the next shared_gpu open.
+                gpu_lost(&self.gpu);
+                ComputeError::Message(err.to_string())
+            })?;
             match self
                 .pending_read
                 .as_ref()

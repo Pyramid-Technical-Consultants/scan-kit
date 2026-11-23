@@ -2886,9 +2886,22 @@ impl Plot {
         self.apply(width, height, input);
         let (width, height) = self.size;
         let rgba = match crate::native_gpu() {
-            Ok(gpu) => self
-                .paint_offscreen(gpu, width, height)
-                .map_err(|err| err.to_string())?,
+            Ok(gpu) => match self.paint_offscreen(gpu, width, height) {
+                Ok(rgba) => rgba,
+                // A lost device stays cached in the OnceLock and would Err
+                // every later render — degrade to the CPU picture instead.
+                Err(err) => {
+                    // The fallback is silent per frame — log once so a
+                    // persistent GPU failure is still diagnosable.
+                    static WARNED: std::sync::atomic::AtomicBool =
+                        std::sync::atomic::AtomicBool::new(false);
+                    if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        eprintln!("native GPU paint failed, using the CPU picture: {err}");
+                    }
+                    let layout = self.layout(width, height);
+                    self.paint_cpu(width, height, &layout)
+                }
+            },
             Err(_) => {
                 let layout = self.layout(width, height);
                 self.paint_cpu(width, height, &layout)

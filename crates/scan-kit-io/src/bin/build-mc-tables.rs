@@ -112,10 +112,10 @@ fn tokens(path: &Path) -> Result<Vec<Vec<String>>, String> {
 }
 
 fn f64v(t: &[String], i: usize) -> Result<f64, String> {
-    Ok(t.get(i)
+    t.get(i)
         .ok_or_else(|| format!("expected field {i}: {t:?}"))?
         .parse()
-        .unwrap_or(f64::NAN))
+        .map_err(|_| format!("field {i} is not a number: {t:?}"))
 }
 
 /// MCsquare material name -> label, from `Materials/list.dat`.
@@ -231,7 +231,9 @@ fn read_properties(materials: &Path, name: &str) -> Result<Props, String> {
                 };
                 p.components.push((
                     element.clone(),
-                    fraction.parse().unwrap_or(f64::NAN) / 100.0,
+                    fraction.parse::<f64>().map_err(|_| {
+                        format!("{name}: bad Mixture_Component fraction {fraction:?}")
+                    })? / 100.0,
                 ));
             }
             _ => {}
@@ -247,10 +249,14 @@ fn read_stop_pow(materials: &Path, name: &str) -> Result<Vec<f64>, String> {
     for line in text.lines() {
         let parts: Vec<&str> = line.split_whitespace().collect();
         if parts.len() >= 2 {
-            rows.push((
-                parts[0].parse().unwrap_or(0.0),
-                parts[1].parse().unwrap_or(0.0),
-            ));
+            let (e_text, p_text) = (parts[0], parts[1]);
+            let e = e_text
+                .parse()
+                .map_err(|_| format!("{name}: bad G4_Stop_Pow energy {e_text:?}"))?;
+            let p = p_text
+                .parse()
+                .map_err(|_| format!("{name}: bad G4_Stop_Pow value {p_text:?}"))?;
+            rows.push((e, p));
         }
     }
     // MCsquare indexes this table as uniform 0.5 MeV bins from 0.
@@ -353,7 +359,10 @@ fn read_inelastic(materials: &Path, name: &str, a: f64) -> Result<Vec<InelasticR
             }
             "Multiplicity" => {
                 if let Some(r) = records.last_mut() {
-                    if let Some(s) = SPECIES.iter().position(|&x| x == t[1]) {
+                    let species = t
+                        .get(1)
+                        .ok_or_else(|| format!("{name}: short Multiplicity row"))?;
+                    if let Some(s) = SPECIES.iter().position(|&x| x == *species) {
                         r.mult[s] = f64v(t, 2)?;
                     }
                 }

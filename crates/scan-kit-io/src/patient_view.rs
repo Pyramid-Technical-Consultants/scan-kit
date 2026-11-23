@@ -296,7 +296,13 @@ pub fn dose_from_result(inputs: &PatientInputs, ran: Option<McResult>) -> Transp
 
 pub fn transport(inputs: &PatientInputs, mc: Option<McRunner<'_>>) -> Result<Transport, String> {
     let request = patient_request(inputs)?;
-    let ran = mc.and_then(|run| run(&McJob::Patient(request.clone())).ok());
+    // An Err means the transport failed — propagate it rather than painting
+    // an all-zero dose that reads as "delivered nothing". None is the
+    // legitimate "no runner" preview case.
+    let ran = match mc {
+        Some(run) => Some(run(&McJob::Patient(request.clone()))?),
+        None => None,
+    };
     Ok(dose_from_result(inputs, ran))
 }
 
@@ -1806,6 +1812,32 @@ mod tests {
         assert!(one_beam("0").is_ok());
         assert!(one_beam("2").is_err());
         assert!(one_beam("99").is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    #[test]
+    fn a_failed_transport_propagates_instead_of_painting_zeros() {
+        let root = std::env::temp_dir().join(format!(
+            "scan-kit-transporterr-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        scan_kit_dicom::write_water_study(&root).unwrap();
+        let inputs = super::patient_inputs(
+            &root,
+            &[],
+            &serde_json::json!({"study": root.to_string_lossy()}),
+        )
+        .unwrap();
+        let err = super::transport(&inputs, Some(&|_| Err("gpu gone".into())))
+            .map(|_| ())
+            .expect_err("a runner Err must surface");
+        assert!(err.contains("gpu gone"), "{err}");
+        // None is the legitimate preview path — no runner, no error.
+        assert!(super::transport(&inputs, None).is_ok());
         let _ = std::fs::remove_dir_all(&root);
     }
 
