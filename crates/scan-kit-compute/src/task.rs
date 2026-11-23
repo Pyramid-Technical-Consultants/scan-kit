@@ -991,6 +991,8 @@ struct McPlotStage {
     shared: Arc<McLive>,
     worker: Option<JoinHandle<()>>,
     worker_cancel: Cancel,
+    /// Set once the worker joins — `follow` must fail, never restart transport.
+    worker_done: bool,
     /// Preview sequence already painted. 0 means the view has not seen a cube.
     seen: u64,
     report: Report,
@@ -1142,6 +1144,7 @@ impl McPlotStage {
             shared: Arc::new(mc_live()),
             worker: None,
             worker_cancel: Cancel::new(),
+            worker_done: false,
             seen: 0,
             report: report_at(Phase::Chrome, 0, 0),
         }
@@ -1237,6 +1240,7 @@ impl McPlotStage {
             .is_some_and(|worker| worker.is_finished())
         {
             if let Some(worker) = self.worker.take() {
+                self.worker_done = true;
                 // A panic unwinds without touching shared.error — keep the
                 // payload so the report says why.
                 if let Err(payload) = worker.join() {
@@ -1291,6 +1295,11 @@ impl McPlotStage {
         if self.worker.is_some() {
             return self.paint_progress();
         }
+        // A finished worker that somehow left the stage alive must not
+        // silently re-run the whole transport.
+        if self.worker_done {
+            return self.fail("monte carlo worker already finished".into());
+        }
         let (mut scene, jobs) = capture_job(&self.root, &self.sessions, &self.options);
         if jobs.is_empty() {
             return match self.pack(&mut scene, "final") {
@@ -1307,6 +1316,9 @@ impl McPlotStage {
             return self.publish(&results, 1, true);
         }
         let histories = job_histories(&jobs[0]);
+        // `satisfied` is min(delivered) across jobs, so a mixed-histories
+        // scene would never reach this target.
+        debug_assert!(jobs.iter().all(|job| job_histories(job) == histories));
         self.shared
             .total
             .store(all_histories(&jobs), Ordering::Relaxed);
@@ -1706,7 +1718,9 @@ impl Stage for LibraryStage {
                 self.report = report_at(Phase::Done, total as usize, total as usize);
                 Poll::Ready(bytes)
             }
-            Ok(Err(message)) if message == "cancelled" => {
+            Ok(Err(message))
+                if message == "cancelled" && self.shared.stop.load(Ordering::Relaxed) =>
+            {
                 self.report.phase = Phase::Cancelled;
                 Poll::Cancelled
             }
@@ -1821,7 +1835,9 @@ impl Stage for CopyStage {
                 self.report = report_at(Phase::Done, done as usize, done as usize);
                 Poll::Ready(bytes)
             }
-            Ok(Err(message)) if message == "cancelled" => {
+            Ok(Err(message))
+                if message == "cancelled" && self.shared.stop.load(Ordering::Relaxed) =>
+            {
                 self.report.phase = Phase::Cancelled;
                 Poll::Cancelled
             }

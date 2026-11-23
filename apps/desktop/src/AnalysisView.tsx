@@ -595,7 +595,6 @@ export function AnalysisView({
     if (bytes == null) {
       return { painted: "", stop: true };
     }
-    picture.current = bytes;
     try {
       if (index == null || plotWasm == null) {
         plot.load(bytes);
@@ -626,6 +625,9 @@ export function AnalysisView({
         fitCanvas();
       }
       plot.render();
+      // Only a successful paint may become the fallback picture — stashing
+      // bad bytes here re-threw them on every cell's retry.
+      picture.current = bytes;
       payload.current = null;
       return { painted, stop: false };
     } catch (reason) {
@@ -697,7 +699,12 @@ export function AnalysisView({
 
   useEffect(() => {
     if (viewId === "volumetric") {
-      return;
+      // The dose path also schedules requestDraw — never leave a queued
+      // frame to fire on an unmounted view.
+      return () => {
+        cancelAnimationFrame(frame.current);
+        frame.current = 0;
+      };
     }
     const node = canvas.current;
     // The canvas stays in the tree while hidden. A surface created at that

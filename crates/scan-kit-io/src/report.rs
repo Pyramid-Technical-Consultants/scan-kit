@@ -111,8 +111,12 @@ pub fn dvh_csv(curves: &[DvhCurve]) -> String {
     for (row, edge) in first.edges.iter().enumerate() {
         out.push_str(&sig6(*edge as f64));
         for curve in curves {
-            let volume = curve.cumulative.get(row).copied().unwrap_or(0.0);
-            out.push_str(&format!(",{}", sig6(100.0 * volume as f64)));
+            // A shorter curve has no bin here — emit an empty cell, never
+            // a fabricated 0%.
+            out.push(',');
+            if let Some(volume) = curve.cumulative.get(row).copied() {
+                out.push_str(&sig6(100.0 * volume as f64));
+            }
         }
         out.push('\n');
     }
@@ -813,6 +817,41 @@ mod tests {
         // Rounding can move the exponent across the notation boundary.
         assert_eq!(sig6(999999.5), "1e+06");
         assert_eq!(sig6(9.999999e-5), "0.0001");
+    }
+
+    #[test]
+    fn a_short_curve_gets_empty_cells_not_fabricated_zero() {
+        let curves = vec![
+            DvhCurve {
+                name: "PTV".into(),
+                edges: vec![0.0, 1.0, 2.0],
+                cumulative: vec![1.0, 0.5, 0.0],
+            },
+            DvhCurve {
+                name: "short".into(),
+                edges: vec![0.0],
+                cumulative: vec![1.0],
+            },
+        ];
+        let csv = dvh_csv(&curves);
+        // Rows past the short curve's bins stay empty — a fabricated "0"
+        // would report the structure as fully missed at every dose.
+        assert!(
+            csv.contains(
+                "
+1,50,
+"
+            ),
+            "{csv}"
+        );
+        assert!(
+            csv.contains(
+                "
+2,0,
+"
+            ),
+            "{csv}"
+        );
     }
 
     #[test]

@@ -15,8 +15,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use super::discover;
 use scan_kit_core::{
     column_scale_factor, dose_error_pct, dose_per_mu, dose_ratio_pct, finite_minmax, g2_ic2_mm,
-    linear_fit, median_unstable, percentile_linear, radial_mm, remap, remap_g2_raw, remap_g3_raw,
-    remove_mean, scale_column, sigma_error_pct,
+    linear_fit, median_unstable, percentile_linear, radial_mm, remap_g2_raw, remap_g3_raw,
+    remap_g3_raw_reversed, remove_mean, scale_column, sigma_error_pct,
 };
 
 #[derive(Clone)]
@@ -1144,7 +1144,8 @@ fn build_spot(
                 .collect(),
         )
     });
-    let (mask_pos, mm_pos) = spot_positions(&spot, chamber, n, plan_lookup.as_ref(), &strip_mid);
+    let (mask_pos, finite_pos, mm_pos) =
+        spot_positions(&spot, chamber, n, plan_lookup.as_ref(), &strip_mid);
     let sigma = spot_sigma(&spot, raw_sigma || chamber, n);
     let mut mask_cols: Vec<&[f32]> = vec![energy];
     let mut finite_cols: Vec<&[f32]> = Vec::new();
@@ -1166,6 +1167,9 @@ fn build_spot(
     }
     for values in &mask_pos {
         mask_cols.push(*values);
+    }
+    for values in &finite_pos {
+        finite_cols.push(*values);
     }
     // Same row rule as the Python loader: a NaN, -1, or -10000 in sigma drops the spot.
     for (_, values) in &sigma {
@@ -1306,7 +1310,7 @@ fn build_spot(
             map_kept(&values[..n], &keep, |value| value * 2.0),
         );
     }
-    if let Ok(xml) = std::fs::read_to_string(dir.join("config/map2map/devices.xml")) {
+    if let Ok(xml) = capped_text(&dir.join("config/map2map/devices.xml")) {
         add_sigma_error(&mut table, &xml);
     }
     let layer = spot.num.get("layer_id").or_else(|| map.num.get("layer_id"));
@@ -1739,7 +1743,7 @@ fn spot_positions<'a>(
     n: usize,
     plan: Option<&SpotPlan<'_>>,
     strip_mid: &[Option<Vec<f32>>; 4],
-) -> (Vec<&'a [f32]>, [Option<Measured<'a>>; 4]) {
+) -> (Vec<&'a [f32]>, Vec<&'a [f32]>, [Option<Measured<'a>>; 4]) {
     if chamber {
         if let Some(raw) = four_slices(spot, "spot_position_raw", n) {
             let mm = std::array::from_fn(|index| {
@@ -1749,7 +1753,7 @@ fn spot_positions<'a>(
                     index,
                 ))
             });
-            return (raw.to_vec(), mm);
+            return (raw.to_vec(), Vec::new(), mm);
         }
         if let Some(raw) = four_slices(spot, "spot_raw", n) {
             let ic1_x = raw[0].iter().copied().map(remap_g2_raw).collect::<Vec<_>>();
@@ -1758,6 +1762,7 @@ fn spot_positions<'a>(
             let ic2_y = g2_ic2_mm(&ic1_y, raw[3]);
             return (
                 raw.to_vec(),
+                Vec::new(),
                 [
                     Some(Measured::Owned(ic1_x)),
                     Some(Measured::Owned(ic1_y)),
@@ -1768,6 +1773,7 @@ fn spot_positions<'a>(
         }
     }
     let mut mask = Vec::new();
+    let mut finite = Vec::new();
     let mut mm = [None, None, None, None];
     for (index, (ic, axis)) in [("ic1", "x"), ("ic1", "y"), ("ic2", "x"), ("ic2", "y")]
         .into_iter()
@@ -1778,7 +1784,9 @@ fn spot_positions<'a>(
                 continue;
             }
             let values = &values[..n];
-            mask.push(values);
+            // These are millimetres already — the -1/-10000 rule is for raw
+            // device readings; a spot at exactly -1 mm is a real spot.
+            finite.push(values);
             mm[index] = Some(Measured::Same(values));
             continue;
         }
@@ -1806,17 +1814,37 @@ fn spot_positions<'a>(
             mm[index] = Some(axis_measured(&raw[..n], strip_mid[index].as_deref(), index));
         }
     }
-    (mask, mm)
+    (mask, finite, mm)
+}
+
+/// Channels are 1-indexed 1..=128 — a stuck 0 or garbage 200 is an invalid
+/// reading, not a position two millimetres past the physical edge.
+fn g3_strip_mm(raw: f32, axis: usize) -> f32 {
+    if !(1.0..=128.0).contains(&raw) {
+        return f32::NAN;
+    }
+    if AXIS_REVERSED[axis] {
+        remap_g3_raw_reversed(raw)
+    } else {
+        remap_g3_raw(raw)
+    }
 }
 
 fn g3_mm(raw: &[f32], reversed: bool) -> Vec<f32> {
+    // G3 strips are 1-indexed at a 2 mm pitch — the ±128 map is the G2
+    // calibration and reads ~0.8% long everywhere (a full mm at the edges).
+    let map = if reversed {
+        remap_g3_raw_reversed
+    } else {
+        remap_g3_raw
+    };
     raw.iter()
         .copied()
         .map(|value| {
-            if reversed {
-                remap(value, 1.0, 128.0, 128.0, -128.0)
+            if (1.0..=128.0).contains(&value) {
+                map(value)
             } else {
-                remap(value, 1.0, 128.0, -128.0, 128.0)
+                f32::NAN
             }
         })
         .collect()
@@ -1973,7 +2001,12 @@ fn layer_point_times(dir: &Path) -> HashMap<(u32, u32), f32> {
         });
         for run in runs {
             if let Some(path) = point_time_file(&run) {
-                if let Ok(bytes) = std::fs::read(&path) {
+                let bytes = std::fs::File::open(&path)
+                    .map_err(|err| err.to_string())
+                    .and_then(|mut file| {
+                        discover::read_capped(&mut file, "point times", discover::MAX_MEMBER_BYTES)
+                    });
+                if let Ok(bytes) = bytes {
                     insert_point_times(&mut found, &read_sheet(&bytes));
                 }
                 break;
@@ -2642,7 +2675,9 @@ fn sheet_metric(
                 f32::NAN
             } else if chamber {
                 if raw.is_finite() && raw >= 0.0 {
-                    remap_g3_raw(raw)
+                    // Same strips as the spot files — ic1_y and ic2_x run
+                    // reversed there too.
+                    g3_strip_mm(raw, index)
                 } else {
                     f32::NAN
                 }
@@ -2950,11 +2985,10 @@ fn fit_strip_iso(strip: &[f32], iso: &[f32]) -> Option<(f32, f32)> {
 /// Magnification is virtual SAD over source-to-device distance. The sign carries
 /// `reverse_strips`. Missing chambers stay unset so the strip fit can still run.
 fn device_axes(dir: &Path) -> [Option<(f32, f32)>; 4] {
-    let Ok(devices) = std::fs::read_to_string(dir.join("config/map2map/devices.xml")) else {
+    let Ok(devices) = capped_text(&dir.join("config/map2map/devices.xml")) else {
         return [None; 4];
     };
-    let Ok(system) = std::fs::read_to_string(dir.join("config/map2map/scan_dose_system.xml"))
-    else {
+    let Ok(system) = capped_text(&dir.join("config/map2map/scan_dose_system.xml")) else {
         return [None; 4];
     };
     let Some(sad) = tag_float(&system, "source_to_isocenter_distance") else {
@@ -3904,7 +3938,6 @@ pub(crate) fn spot_delivery_ms(timestamp: &[f64], layer: &[f32]) -> Vec<f32> {
     let n = timestamp.len().min(layer.len());
     let mut out = vec![f32::NAN; n];
     let mut groups: BTreeMap<i64, Vec<usize>> = BTreeMap::new();
-    let mut previous: Option<f64> = None;
     for index in 0..n {
         if timestamp[index].is_finite() && layer[index].is_finite() {
             let rounded = layer[index].round();
@@ -3916,15 +3949,24 @@ pub(crate) fn spot_delivery_ms(timestamp: &[f64], layer: &[f32]) -> Vec<f32> {
             groups.entry(rounded as i64).or_default().push(index);
         }
     }
-    for indices in groups.values_mut() {
+    let mut ordered: Vec<Vec<usize>> = groups.into_values().collect();
+    for indices in &mut ordered {
         indices.sort_by(|&a, &b| {
             timestamp[a]
                 .partial_cmp(&timestamp[b])
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
-        if indices.is_empty() {
-            continue;
-        }
+    }
+    // "Previous" is the group delivered before, not the previous layer id —
+    // a re-scanned layer delivers out of id order.
+    ordered.retain(|indices| !indices.is_empty());
+    ordered.sort_by(|a, b| {
+        timestamp[a[0]]
+            .partial_cmp(&timestamp[b[0]])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let mut previous: Option<f64> = None;
+    for indices in ordered {
         let first = timestamp[indices[0]];
         out[indices[0]] = match previous {
             Some(last) => (first - last) as f32,
@@ -4309,6 +4351,18 @@ fn store_sheet(key: SheetKey, sheet: &Arc<Sheet>) {
     cache.insert(key, Arc::clone(sheet));
 }
 
+/// Session XML/CSV files get the archive member cap — a directory source
+/// is not inherently safer than a zip member.
+pub(crate) fn capped_text(path: &Path) -> Result<String, String> {
+    let mut file = std::fs::File::open(path).map_err(|err| err.to_string())?;
+    let bytes = discover::read_capped(
+        &mut file,
+        &path.to_string_lossy(),
+        discover::MAX_MEMBER_BYTES,
+    )?;
+    String::from_utf8(bytes).map_err(|err| err.to_string())
+}
+
 fn read_and_cache(
     path: &Path,
     stamp: u128,
@@ -4323,7 +4377,12 @@ fn read_and_cache(
         (window.bytes, false)
     } else {
         note_disk_read(path);
-        match std::fs::read(path) {
+        match std::fs::File::open(path)
+            .map_err(|err| err.to_string())
+            .and_then(|mut file| {
+                // A directory source gets the archive member cap too.
+                discover::read_capped(&mut file, "session file", discover::MAX_MEMBER_BYTES)
+            }) {
             Ok(bytes) => (Arc::new(bytes), true),
             Err(_) => return None,
         }
@@ -5555,6 +5614,9 @@ pub(crate) fn parse_datetime(text: &str) -> Option<f64> {
     let hour: u32 = clock.next().unwrap_or("0").parse().ok()?;
     let minute: u32 = clock.next().unwrap_or("0").parse().ok()?;
     let second: f64 = clock.next().unwrap_or("0").parse().ok()?;
+    if hour >= 24 || minute >= 60 || !(0.0..62.0).contains(&second) {
+        return None;
+    }
     let days = days_from_civil(year, month, day)?;
     Some(days as f64 * 86400.0 + f64::from(hour) * 3600.0 + f64::from(minute) * 60.0 + second)
 }
@@ -5631,6 +5693,16 @@ mod tests {
     }
 
     #[test]
+    fn a_garbage_clock_reads_as_no_datetime() {
+        // Out-of-range clock fields must fail like a garbage date does —
+        // "25:99:99" is not a timestamp 26 hours late.
+        assert!(parse_datetime("2024-01-01 25:99:99").is_none());
+        assert!(parse_datetime("2024-01-01 10:61:00").is_none());
+        assert!(parse_datetime("2024-01-01 10:00:99").is_none());
+        assert!(parse_datetime("2024-01-01 23:59:59").is_some());
+    }
+
+    #[test]
     fn a_tz_suffixed_datetime_keeps_its_seconds() {
         // Without the strip the suffix corrupts the seconds field to 0.
         let naive = parse_datetime("2024-03-01 10:20:30").unwrap();
@@ -5655,6 +5727,45 @@ mod tests {
     fn first_spot_in_a_layer_keeps_its_timestamp() {
         let ms = spot_delivery_ms(&[1000.0, 1004.0, 1010.0], &[1.0, 1.0, 1.0]);
         assert_eq!(ms, vec![1000.0, 4.0, 6.0]);
+    }
+    #[test]
+    fn a_replayed_layer_is_delivery_ordered_not_id_ordered() {
+        // Layer 2 was delivered before layer 1 (a re-scan) — "previous" is the
+        // group delivered before, so both spots keep a sane clock. Id order
+        // would give layer 2 a negative elapsed time.
+        let ms = spot_delivery_ms(&[2000.0, 1000.0], &[1.0, 2.0]);
+        assert_eq!(ms, vec![1000.0, 1000.0]);
+    }
+    #[test]
+    fn g3_strips_convert_at_the_two_mm_pitch() {
+        // G3 channels are 1-indexed: 64.5 is iso, edges read ±127 mm — the old
+        // ±128 G2-style map read a full millimetre long at the edge.
+        assert_eq!(g3_mm(&[64.5], false), vec![0.0]);
+        assert_eq!(g3_mm(&[1.0, 128.0], false), vec![-127.0, 127.0]);
+        assert_eq!(g3_mm(&[1.0, 128.0], true), vec![127.0, -127.0]);
+        assert_eq!(g3_strip_mm(1.0, 1), 127.0); // ic1_y runs reversed
+        assert_eq!(g3_strip_mm(1.0, 0), -127.0);
+        // Channels are 1-indexed — a stuck 0 or a garbage 200 is a missing
+        // reading, not a position past the physical edge.
+        assert!(g3_mm(&[0.0, 200.0], false).iter().all(|v| v.is_nan()));
+        assert!(g3_strip_mm(0.0, 0).is_nan());
+    }
+    #[test]
+    fn a_negative_one_millimetre_spot_is_real() {
+        // Millimetre spot positions are not raw device readings — -1 mm is a
+        // spot, not the "no reading" sentinel.
+        let mut sheet = empty_sheet();
+        sheet
+            .num
+            .insert("ic1_x_spot_position".to_owned(), vec![-1.0, 2.0, f32::NAN]);
+        let (mask, finite, mm) = spot_positions(&sheet, false, 3, None, &[None, None, None, None]);
+        assert!(mask.is_empty());
+        assert_eq!(finite.len(), 1);
+        let Some(Measured::Same(values)) = mm[0] else {
+            panic!("expected measured millimetres");
+        };
+        assert_eq!(values[..2], [-1.0, 2.0]);
+        assert!(values[2].is_nan());
     }
     #[test]
     fn duplicate_headers_keep_the_first_column() {

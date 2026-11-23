@@ -1748,7 +1748,7 @@ fn col(table: &std::collections::BTreeMap<String, Vec<f32>>, key: &str) -> Vec<f
 
 fn devices_xml(root: &Path, session: &str) -> String {
     let dir = discover::session_directory(root, session);
-    std::fs::read_to_string(dir.join("config/map2map/devices.xml")).unwrap_or_default()
+    crate::tables::capped_text(&dir.join("config/map2map/devices.xml")).unwrap_or_default()
 }
 
 fn read_kmu(root: &Path, session: &str) -> f32 {

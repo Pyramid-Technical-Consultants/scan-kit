@@ -493,6 +493,11 @@ fn parse(params: &Value) -> Result<Request, String> {
     if !(0.0..=100.0).contains(&pixel) || !(0.0..=100.0).contains(&slice) {
         return Err("Pixel spacing and slice thickness must be from 0 to 100 mm.".into());
     }
+    if let Some(value) = params.get("energies") {
+        if !value.is_array() && !value.is_null() {
+            return Err("energies must be an array".into());
+        }
+    }
     let mut energies = match params.get("energies").and_then(Value::as_array) {
         Some(values) if values.is_empty() => {
             return Err("pick at least one energy".into());
@@ -530,16 +535,13 @@ fn parse(params: &Value) -> Result<Request, String> {
     if !(0.001..=10.0).contains(&mu) {
         return Err("MU per spot must be from 0.001 to 10.".into());
     }
-    let fractions = params
-        .get("fractions")
-        .and_then(Value::as_i64)
-        .or_else(|| {
-            params
-                .get("fractions")
-                .and_then(Value::as_f64)
-                .map(|v| v as i64)
-        })
-        .unwrap_or(1);
+    let fractions = match params.get("fractions") {
+        None | Some(Value::Null) => 1,
+        Some(value) => value
+            .as_i64()
+            .or_else(|| value.as_f64().map(|v| v as i64))
+            .ok_or("fractions must be a number")?,
+    };
     if !(1..=40).contains(&fractions) {
         return Err("Fractions must be from 1 to 40.".into());
     }
@@ -694,10 +696,12 @@ fn text(params: &Value, key: &str, default: &str) -> String {
 }
 
 fn number(params: &Value, key: &str, default: f64) -> Result<f64, String> {
-    match params.get(key).and_then(Value::as_f64) {
-        Some(value) if value.is_finite() => Ok(value),
-        Some(_) => Err(format!("{key} must be a finite number")),
-        None => Ok(default),
+    match params.get(key) {
+        None | Some(Value::Null) => Ok(default),
+        Some(value) => value
+            .as_f64()
+            .filter(|v| v.is_finite())
+            .ok_or_else(|| format!("{key} must be a finite number")),
     }
 }
 
@@ -732,6 +736,17 @@ mod tests {
     fn an_empty_energy_list_is_rejected() {
         let err = phantom_summary(&json!({"energies": []})).unwrap_err();
         assert_eq!(err, "pick at least one energy");
+    }
+
+    #[test]
+    fn mistyped_numbers_error_instead_of_defaulting() {
+        // A string where a number belongs must not silently keep the default.
+        assert!(phantom_summary(&json!({"gantry": "90"})).is_err());
+        assert!(phantom_summary(&json!({"energies": "140"})).is_err());
+        assert!(phantom_summary(&json!({"fractions": "three"})).is_err());
+        // Absent and null still default.
+        assert!(phantom_summary(&json!({})).is_ok());
+        assert!(phantom_summary(&json!({"gantry": null})).is_ok());
     }
 
     #[test]

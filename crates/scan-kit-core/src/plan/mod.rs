@@ -290,6 +290,12 @@ pub fn validate_plan(template: &str, params: &Value) -> Vec<String> {
         }
         "dicom_rt_plan" => {
             let mut errors = Vec::new();
+            if params
+                .get("use_dicom_beam_size")
+                .is_some_and(|value| !value.is_boolean() && !value.is_null())
+            {
+                errors.push("use_dicom_beam_size must be a boolean".to_owned());
+            }
             if !bool_param(params, "use_dicom_beam_size", true) {
                 errors.extend(validate_positive_float(
                     params.get("beam_size_override_mm"),
@@ -1236,6 +1242,16 @@ mod tests {
         )
         .unwrap();
         assert_eq!(layered.len(), rows.len());
+    }
+
+    #[test]
+    fn a_string_beam_size_flag_is_rejected() {
+        // "yes" is not a boolean — before, it silently coerced to `true` and
+        // skipped the beam-size-override validation entirely.
+        let errors = validate_plan("dicom_rt_plan", &json!({"use_dicom_beam_size": "yes"}));
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("use_dicom_beam_size")));
     }
 
     #[test]

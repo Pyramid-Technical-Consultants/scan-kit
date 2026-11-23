@@ -887,17 +887,22 @@ fn edge_px(cam: RayCam, a: vec3<f32>, b: vec3<f32>) -> vec2<f32> {
     var db = project_delta(cam, b);
     var pa = a;
     var pb = b;
-    if (da.z < 0.001 && db.z < 0.001) {
-        return vec2<f32>(0.0, 0.0);
-    }
-    if (da.z < 0.001) {
-        let u = (0.001 - da.z) / (db.z - da.z);
-        pa = mix(a, b, u);
-        da = project_delta(cam, pa);
-    } else if (db.z < 0.001) {
-        let u = (0.001 - db.z) / (da.z - db.z);
-        pb = mix(b, a, u);
-        db = project_delta(cam, pb);
+    // The near-plane clip only exists for the perspective divide — ortho
+    // projection is depth-independent, so the clip would hide edges that
+    // still project.
+    if (cam.lens.z <= 0.5) {
+        if (da.z < 0.001 && db.z < 0.001) {
+            return vec2<f32>(0.0, 0.0);
+        }
+        if (da.z < 0.001) {
+            let u = (0.001 - da.z) / (db.z - da.z);
+            pa = mix(a, b, u);
+            da = project_delta(cam, pa);
+        } else if (db.z < 0.001) {
+            let u = (0.001 - db.z) / (da.z - db.z);
+            pb = mix(b, a, u);
+            db = project_delta(cam, pb);
+        }
     }
     let ab = db.xy - da.xy;
     let len2 = max(dot(ab, ab), 0.0001);
@@ -3328,13 +3333,24 @@ impl Plot {
                 };
                 // `chrome` is a band the shell reserved inside one shared canvas.
                 let top = top.max(self.chrome);
-                let mut plot = snap_plot(PlotRect {
-                    x: cell.x + left,
-                    y: cell.y + top,
-                    w: (cell.w - left - right).max(8.0),
-                    h: (cell.h - top - bottom).max(8.0),
-                });
-                if plane.is_some_and(|plane| plane < 3) {
+                let mut plot = if cell.w <= 0.0 || cell.h <= 0.0 {
+                    // A zero-weight cell has no room — a forced 8 px plot
+                    // would smear this panel into the neighbor's gutter.
+                    PlotRect {
+                        x: cell.x,
+                        y: cell.y,
+                        w: 0.0,
+                        h: 0.0,
+                    }
+                } else {
+                    snap_plot(PlotRect {
+                        x: cell.x + left,
+                        y: cell.y + top,
+                        w: (cell.w - left - right).max(8.0),
+                        h: (cell.h - top - bottom).max(8.0),
+                    })
+                };
+                if cell.w > 0.0 && plane.is_some_and(|plane| plane < 3) {
                     let turns = self.turns.get(index).copied().unwrap_or(0);
                     let fitted = fit_domain(camera, &plot, turns);
                     let wider = axis_name_width(&panel.y_label) + y_tick_width(&fitted) + 8.0;
@@ -7542,8 +7558,11 @@ fn panel_rects(
             x += gap;
         }
     }
-    let row_weight = if row_weights.len() == rows {
-        row_weights.to_vec()
+    let row_weight: Vec<f32> = if row_weights.len() == rows {
+        row_weights
+            .iter()
+            .map(|w| if w.is_finite() { w.max(0.0) } else { 0.0 })
+            .collect()
     } else {
         vec![1.0; rows]
     };
@@ -7589,12 +7608,16 @@ fn split_rows(
     let margin = 8.0f32;
     let margin_right = 16.0f32;
     let inner_h = height as f32 - margin * 2.0 - gap * (rows.saturating_sub(1) as f32);
-    let row_sum = row_weights.iter().sum::<f32>().max(1.0e-6);
+    let clean: Vec<f32> = row_weights
+        .iter()
+        .map(|w| if w.is_finite() { w.max(0.0) } else { 0.0 })
+        .collect();
+    let row_sum = clean.iter().sum::<f32>().max(1.0e-6);
     let inner_w = width as f32 - margin - margin_right - gap;
     let mut rects = Vec::with_capacity(count);
     let mut y = margin;
     for row in 0..rows {
-        let cell_h = inner_h * row_weights[row] / row_sum;
+        let cell_h = inner_h * clean[row] / row_sum;
         let left = row_splits[row * 2].max(0.0);
         let right = row_splits[row * 2 + 1].max(0.0);
         let sum = (left + right).max(1.0e-6);
@@ -9362,6 +9385,34 @@ mod cursor_tests {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn garbage_row_weights_cannot_break_the_grid() {
+        // Negative and NaN weights used to place cells billions of pixels
+        // off-canvas or NaN the whole stack.
+        for rects in [
+            split_rows(4, 1000, 800, &[-1.0, 1.0], &[0.5; 4]),
+            split_rows(4, 1000, 800, &[f32::NAN, 1.0], &[0.5; 4]),
+            panel_rects(4, 1000, 800, 2, &[1.0, 1.0], &[-1.0, 1.0], &[], 0),
+        ] {
+            assert_eq!(rects.len(), 4);
+            for rect in &rects {
+                assert!(rect.x.is_finite() && rect.y.is_finite());
+                assert!(rect.w >= 0.0 && rect.h >= 0.0);
+            }
+        }
+    }
+
+    #[test]
+    fn a_zero_weight_column_holds_no_plot() {
+        // The dead column's forced 8 px plot used to paint inside the live
+        // neighbor's axis gutter.
+        let rects = panel_rects(4, 1000, 800, 2, &[0.0, 1.0], &[1.0, 1.0], &[], 0);
+        assert_eq!(rects.len(), 4);
+        assert_eq!(rects[0].w, 0.0);
+        assert_eq!(rects[2].w, 0.0);
+        assert!(rects[1].w > 0.0);
+    }
+
     use super::*;
 
     #[test]
