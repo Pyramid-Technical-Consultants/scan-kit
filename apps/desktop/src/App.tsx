@@ -914,7 +914,7 @@ export default function App() {
         headerWillFill(rows.length, rows.filter((row) => selectedIds.includes(row.session_id)).length),
       ),
     );
-  }, [commitSelection, displayIds, rows.length, selectedIds]);
+  }, [commitSelection, displayIds, rows, selectedIds]);
 
   // Automation surface for scripts/capture-doc-screenshots.mjs (CDP-driven doc shots).
   // The container outlives re-renders; AnalysisView parks its own `view` entry in it.

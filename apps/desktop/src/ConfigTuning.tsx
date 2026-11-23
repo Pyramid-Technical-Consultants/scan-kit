@@ -310,7 +310,7 @@ export function ConfigTuning({
     return () => {
       cancel = true;
     };
-  }, [folder, sessionKey]);
+  }, [folder, sessionKey, sessionIds]);
 
   useEffect(() => {
     const mine = previewGen.current + 1;
