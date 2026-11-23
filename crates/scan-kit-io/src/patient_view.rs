@@ -1814,6 +1814,32 @@ mod tests {
         assert!(one_beam("99").is_err());
         let _ = std::fs::remove_dir_all(&root);
     }
+    #[test]
+    fn a_failed_transport_propagates_instead_of_painting_zeros() {
+        let root = std::env::temp_dir().join(format!(
+            "scan-kit-transporterr-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        scan_kit_dicom::write_water_study(&root).unwrap();
+        let inputs = super::patient_inputs(
+            &root,
+            &[],
+            &serde_json::json!({"study": root.to_string_lossy()}),
+        )
+        .unwrap();
+        let err = super::transport(&inputs, Some(&|_| Err("gpu gone".into())))
+            .map(|_| ())
+            .expect_err("a runner Err must surface");
+        assert!(err.contains("gpu gone"), "{err}");
+        // None is the legitimate preview path — no runner, no error.
+        assert!(super::transport(&inputs, None).is_ok());
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn a_variable_model_weights_each_voxel_by_its_let() {

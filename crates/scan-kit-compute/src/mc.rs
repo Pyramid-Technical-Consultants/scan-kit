@@ -659,9 +659,10 @@ async fn prepare(launch: Launch) -> Result<Live, ComputeError> {
     // so bound it here where the failure is a clean ComputeError.
     let limits = gpu.device.limits();
     let binding_cap = limits.max_storage_buffer_binding_size as usize;
-    // The LET buffer binds nvox*16 but readback stages nvox*20 — both caps
-    // bind the run, and max_buffer_size can sit near the binding limit.
-    if nvox > binding_cap / 16 || nvox > limits.max_buffer_size as usize / 20 {
+    // The LET buffer binds nvox*16 but readback stages nvox*20+80 — both
+    // caps bind the run, and max_buffer_size can sit near the binding limit.
+    let staging = nvox.saturating_mul(20).saturating_add(80);
+    if nvox > binding_cap / 16 || staging > limits.max_buffer_size as usize {
         return Err(ComputeError::Message(format!(
             "voxel grid {nx}x{ny}x{nz} is too large for this GPU"
         )));

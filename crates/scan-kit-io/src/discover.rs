@@ -1071,6 +1071,75 @@ mod tests {
         assert!(!ids.contains(&"miss".to_owned()), "{ids:?}");
         let _ = fs::remove_dir_all(&root);
     }
+    #[test]
+    fn a_staging_dir_does_not_catalog_as_a_ghost_session() {
+        // A leftover download staging dir holds a bare "session/" tree —
+        // without the skip it catalogs a ghost id that can then be trashed.
+        let root = std::env::temp_dir().join(format!(
+            "scan-kit-staging-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let ghost = root.join(".session_staging-123/session");
+        fs::create_dir_all(&ghost).unwrap();
+        fs::write(
+            ghost.join("input_map.csv"),
+            b"energy
+1
+",
+        )
+        .unwrap();
+        fs::create_dir_all(root.join("real")).unwrap();
+        fs::write(
+            root.join("real/input_map.csv"),
+            b"energy
+1
+",
+        )
+        .unwrap();
+        let ids = discover(&root, &mut |_, _| true)
+            .unwrap()
+            .entries
+            .into_iter()
+            .map(|entry| entry.session_id)
+            .collect::<Vec<_>>();
+        assert_eq!(ids, ["real"], "{ids:?}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_session_library_root_answers_only_its_own_id() {
+        // A data dir that is itself a session must not resolve a foreign
+        // valid id to its own input_map.csv.
+        let root = std::env::temp_dir().join(format!(
+            "scan-kit-rootid-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let library = root.join("sess");
+        fs::create_dir_all(&library).unwrap();
+        fs::write(
+            library.join("input_map.csv"),
+            b"energy
+1
+",
+        )
+        .unwrap();
+        assert_eq!(session_directory(&library, "sess"), library);
+        let foreign = session_directory(&library, "other");
+        assert!(
+            foreign != library,
+            "foreign id resolved to the root session"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn a_zip_named_session_takes_the_wrapped_session_id() {

@@ -601,7 +601,7 @@ export function PlanRunner() {
             ) : null}
             <Button
               type="button"
-              disabled={busy || copying || !connected || !dest.toLowerCase().endsWith(".zip")}
+              disabled={busy || copying || !connected || !dest.trim().toLowerCase().endsWith(".zip")}
               onClick={() => void download()}
             >
               <Download />

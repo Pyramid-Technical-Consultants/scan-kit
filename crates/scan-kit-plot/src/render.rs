@@ -2890,7 +2890,14 @@ impl Plot {
                 Ok(rgba) => rgba,
                 // A lost device stays cached in the OnceLock and would Err
                 // every later render — degrade to the CPU picture instead.
-                Err(_) => {
+                Err(err) => {
+                    // The fallback is silent per frame — log once so a
+                    // persistent GPU failure is still diagnosable.
+                    static WARNED: std::sync::atomic::AtomicBool =
+                        std::sync::atomic::AtomicBool::new(false);
+                    if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        eprintln!("native GPU paint failed, using the CPU picture: {err}");
+                    }
                     let layout = self.layout(width, height);
                     self.paint_cpu(width, height, &layout)
                 }

@@ -1407,6 +1407,11 @@ pub(crate) fn session_storage_paths(root: &str, session_id: &str) -> Result<Vec<
             }
             for base in &bases {
                 for name in &names {
+                    // Remote storage matches on names alone — a remote driver
+                    // cannot cheaply dir-check or peek inside a zip the way
+                    // the local branch above does, so a remote `sess.zip`
+                    // wrapping `other/` still counts as sess. The remote
+                    // catalog discovers by filename stem the same way.
                     if fs.stat(&format!("{base}/{name}"))?.is_some() {
                         let rel = match base.strip_prefix(root_path) {
                             Some(rest) if rest.is_empty() || rest.starts_with('/') => {
