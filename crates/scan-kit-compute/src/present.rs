@@ -281,7 +281,7 @@ pub(crate) fn finish_patient_report(
         &title,
         &metrics,
         rbe,
-        dvh_figure(&metrics),
+        dvh_figure(&metrics)?,
         provenance,
     );
     let dest = Path::new(dest);
@@ -313,7 +313,7 @@ pub(crate) fn finish_patient_report(
 /// names each curve's color because the plot has no legend.
 fn dvh_figure(
     metrics: &scan_kit_io::patient_view::PatientMetrics,
-) -> Option<scan_kit_io::report::Figure> {
+) -> Result<Option<scan_kit_io::report::Figure>, String> {
     const COLORS: &[([f32; 4], &str)] = &[
         ([0.12, 0.47, 0.71, 1.0], "blue"),
         ([1.0, 0.50, 0.05, 1.0], "orange"),
@@ -323,7 +323,7 @@ fn dvh_figure(
         ([0.55, 0.34, 0.29, 1.0], "brown"),
     ];
     if metrics.structures.is_empty() {
-        return None;
+        return Ok(None);
     }
     let mut scene = scan_kit_core::PlotScene::empty("DVH");
     let mut series = Vec::new();
@@ -353,14 +353,16 @@ fn dvh_figure(
         x_labels: Vec::new(),
         equal: false,
     });
-    let rgba =
-        crate::render_plot(&scene, 880, 420, [1.0, 1.0, 1.0, 1.0], [0.1, 0.1, 0.1, 1.0]).ok()?;
-    Some(scan_kit_io::report::Figure {
+    // A render failure must fail the export — .ok()? would silently ship a
+    // report missing its DVH panel.
+    let rgba = crate::render_plot(&scene, 880, 420, [1.0, 1.0, 1.0, 1.0], [0.1, 0.1, 0.1, 1.0])
+        .map_err(|err| err.to_string())?;
+    Ok(Some(scan_kit_io::report::Figure {
         rgba,
         width: 880,
         height: 420,
         caption: format!("DVH curves: {}", names.join(", ")),
-    })
+    }))
 }
 
 fn text<'a>(input: &'a Value, key: &str) -> Result<&'a str, String> {
@@ -423,9 +425,11 @@ fn color4(value: Option<&Value>, key: &str, fallback: [f32; 4]) -> Result<[f32; 
         .ok_or_else(|| format!("{key} must be an array"))?;
     let mut out = fallback;
     for (index, item) in items.iter().take(4).enumerate() {
-        if let Some(number) = item.as_f64() {
-            out[index] = number as f32;
-        }
+        // Every sibling arg parser errors on a mistyped element — a bad
+        // channel must not silently keep the fallback color.
+        out[index] = item
+            .as_f64()
+            .ok_or_else(|| format!("{key} must be numbers"))? as f32;
     }
     Ok(out)
 }
@@ -481,6 +485,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn no_structures_is_not_a_render_failure() {
+        // The empty case yields no figure — a GPU error must not be
+        // conflated with it.
+        let metrics = scan_kit_io::patient_view::PatientMetrics {
+            matches: Vec::new(),
+            structures: Vec::new(),
+            gamma: None,
+        };
+        assert!(super::dvh_figure(&metrics).unwrap().is_none());
+    }
+
+    #[test]
     fn mistyped_args_error_instead_of_falling_back() {
         let base = json!({"view": "bins", "path": ".", "session_ids": []});
         for (key, value) in [
@@ -489,7 +505,9 @@ mod tests {
             ("height", json!(true)),
             ("options", json!(5)),
             ("background", json!("red")),
+            ("background", json!([0.11, "x", 0.12, 1])),
             ("palette", json!(7)),
+            ("palette", json!([[0.9, 0.9, 0.9, "x"]])),
         ] {
             let mut input = base.clone();
             input[key] = value;

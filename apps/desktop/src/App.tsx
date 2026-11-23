@@ -677,7 +677,9 @@ export default function App() {
         return;
       }
       const key = event.key.toLowerCase();
-      const ctrl = event.ctrlKey;
+      // Alt/Meta make the chord somebody else's — Ctrl+Alt+Q must not quit,
+      // and AltGr reports ctrlKey+altKey on Windows layouts.
+      const ctrl = event.ctrlKey && !event.altKey && !event.metaKey;
       const typing = typingTarget(event.target);
       if (event.key === "Escape") {
         if (event.repeat || typing) {
@@ -725,7 +727,7 @@ export default function App() {
         event.preventDefault();
         return;
       }
-      if (key === "6") {
+      if (key === "6" && !event.shiftKey) {
         if (!event.repeat) {
           selectTab("Debug");
         }

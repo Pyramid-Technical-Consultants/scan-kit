@@ -36,6 +36,7 @@ pub use location::is_remote_location;
 pub use marks::normalize_options;
 pub use mc_tables::{csda_range_mm, mc_tables, medium_rho};
 pub use store::default_db_path;
+pub use store::strip_verbatim;
 pub use tables::{
     bind_slice, clear_slice, session_pieces, slice_tail_done, SessionPieces, SliceTake, SLICE_ROWS,
 };

@@ -132,6 +132,14 @@ fn document_json(document: &PlanDocument, written: Option<String>) -> Value {
 }
 
 fn write_csv(path: &Path, csv: &str, db: &Path) -> Result<(), String> {
+    // The csv+path pair crosses the invoke boundary — confine the write to
+    // a .csv name or any text becomes an arbitrary file-write primitive.
+    if !path
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("csv"))
+    {
+        return Err("the plan path must end in .csv".into());
+    }
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             fs::create_dir_all(parent).map_err(|err| err.to_string())?;
@@ -239,6 +247,36 @@ mod tests {
             catalog["save_dir"].as_str().unwrap(),
             out.parent().unwrap().to_string_lossy()
         );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_plan_path_must_be_a_csv_name() {
+        // csv+path crosses the invoke boundary — without the extension check
+        // it is an arbitrary file-write primitive.
+        let root = std::env::temp_dir().join(format!("scan-kit-csv-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let db = root.join("store.sqlite");
+        for bad in ["map.txt", "map", "map.csv.exe"] {
+            let target = root.join(bad);
+            let err = synthesize(
+                &json!({
+                    "template": "zero_field",
+                    "params": {
+                        "selected_energies": [70.0],
+                        "spots_per_layer": 1,
+                        "spot_weight_method": "fixed",
+                        "spot_weight_mu": 0.02
+                    },
+                    "path": target,
+                    "db_path": db
+                }),
+                &db,
+            )
+            .unwrap_err();
+            assert!(err.contains(".csv"), "{bad}: {err}");
+            assert!(!target.exists(), "{bad} should not have been written");
+        }
         let _ = fs::remove_dir_all(&root);
     }
 }

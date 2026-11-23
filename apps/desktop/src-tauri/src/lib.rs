@@ -339,16 +339,19 @@ fn reveal_args(path: &std::path::Path) -> Vec<std::ffi::OsString> {
     #[cfg(windows)]
     {
         if path.is_dir() {
-            vec![path.as_os_str().to_os_string()]
+            vec![std::ffi::OsString::from(scan_kit_io::strip_verbatim(path))]
         } else if path.to_string_lossy().contains(',') {
             // explorer parses commas in /select, as item separators — a
             // comma path selects nothing, so open the folder instead.
             let folder = path.parent().unwrap_or(path);
-            vec![folder.as_os_str().to_os_string()]
+            vec![std::ffi::OsString::from(scan_kit_io::strip_verbatim(
+                folder,
+            ))]
         } else {
+            // canonicalize hands back a verbatim path explorer cannot parse.
             vec![std::ffi::OsString::from(format!(
                 "/select,{}",
-                path.display()
+                scan_kit_io::strip_verbatim(path)
             ))]
         }
     }
@@ -485,34 +488,66 @@ mod reveal_tests {
             assert!(!reveal_args(&std::env::temp_dir())[0]
                 .to_string_lossy()
                 .starts_with("/select,"));
+            // canonicalize hands back verbatim paths explorer cannot parse.
+            let verbatim = reveal_args(std::path::Path::new(r"\\?\C:\dir\file.csv"))[0]
+                .to_string_lossy()
+                .into_owned();
+            assert_eq!(verbatim, r"/select,C:\dir\file.csv");
+            for arg in reveal_args(std::path::Path::new(r"\\?\C:\dir\with,comma\file.csv")) {
+                assert!(!arg.to_string_lossy().contains(r"\\?\"));
+            }
         }
     }
 }
 
 #[cfg(test)]
 mod crash_log_tests {
+    // env vars and the panic hook are process-global — serialize and restore
+    // them so a failure cannot leak state into sibling tests.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct Restore {
+        vars: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl Restore {
+        fn save(keys: &[&'static str]) -> Self {
+            Self {
+                vars: keys
+                    .iter()
+                    .map(|key| (*key, std::env::var_os(key)))
+                    .collect(),
+            }
+        }
+    }
+
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            for (key, value) in self.vars.drain(..) {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+
     #[test]
     fn a_panic_is_appended_to_the_crash_log() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let _restore = Restore::save(&["USERPROFILE", "HOME"]);
         let home = std::env::temp_dir().join("scan-kit-crash-log-test");
         let _ = std::fs::remove_dir_all(&home);
-        let saved_userprofile = std::env::var_os("USERPROFILE");
-        let saved_home = std::env::var_os("HOME");
         std::env::set_var("USERPROFILE", &home);
         std::env::set_var("HOME", &home);
+        let previous_hook = std::panic::take_hook();
         super::log_panics();
-        assert!(std::panic::catch_unwind(|| panic!("probe panic")).is_err());
-        let _ = std::panic::take_hook();
+        let probed = std::panic::catch_unwind(|| panic!("probe panic"));
+        std::panic::set_hook(previous_hook);
+        assert!(probed.is_err());
         let text = std::fs::read_to_string(scan_kit_io::crash_log_path()).unwrap();
         assert!(text.contains("probe panic"));
         assert!(text.contains(scan_kit_core::version()));
         let _ = std::fs::remove_dir_all(&home);
-        match saved_userprofile {
-            Some(value) => std::env::set_var("USERPROFILE", value),
-            None => std::env::remove_var("USERPROFILE"),
-        }
-        match saved_home {
-            Some(value) => std::env::set_var("HOME", value),
-            None => std::env::remove_var("HOME"),
-        }
     }
 }

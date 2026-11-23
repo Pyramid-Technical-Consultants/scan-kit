@@ -111,12 +111,22 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 const MC: &str = include_str!("mc_transport.wgsl");
 
 pub fn compile_scientific_shaders() -> Result<(), String> {
-    for source in [SPLAT, RAYMARCH, GAMMA, DVH, RESAMPLE] {
-        compile(source)?;
+    for (name, source) in [
+        ("splat", SPLAT),
+        ("raymarch", RAYMARCH),
+        ("gamma", GAMMA),
+        ("dvh", DVH),
+        ("resample", RESAMPLE),
+        // The transport shader expects the host to prepend `struct Params`.
+        ("mc", MC),
+    ] {
+        compile_kernel(name, source)?;
     }
-    // The transport shader expects the host to prepend `struct Params`.
-    compile(MC)?;
     Ok(())
+}
+
+fn compile_kernel(name: &str, source: &str) -> Result<(), String> {
+    compile(source).map_err(|err| format!("{name}: {err}"))
 }
 
 fn compile(source: &str) -> Result<(), String> {
@@ -136,5 +146,11 @@ mod tests {
     #[test]
     fn sk_req_027_through_031_scientific_shaders_compile() {
         compile_scientific_shaders().unwrap();
+    }
+
+    #[test]
+    fn a_shader_error_names_the_kernel() {
+        let err = compile_kernel("probe", "this is not wgsl").unwrap_err();
+        assert!(err.starts_with("probe:"), "{err}");
     }
 }

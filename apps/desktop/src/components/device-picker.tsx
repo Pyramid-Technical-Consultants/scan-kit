@@ -94,7 +94,7 @@ export function DevicePicker({
           disabled={disabled}
           onChange={(event) => onChange(event.target.value)}
           onKeyDown={(event) => {
-            if (event.key === "Enter" && !busy) {
+            if (event.key === "Enter" && !busy && !event.nativeEvent.isComposing) {
               onConnect();
             }
           }}
@@ -133,7 +133,7 @@ export function DevicePicker({
                 setHits(null);
               }}
               onKeyDown={(event) => {
-                if (event.key === "Enter" && !scanning) {
+                if (event.key === "Enter" && !scanning && !event.nativeEvent.isComposing) {
                   void scan();
                 }
               }}

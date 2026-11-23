@@ -58,13 +58,19 @@ pub async fn request_device() -> Result<(wgpu::Device, wgpu::Queue), GpuError> {
 /// The process-wide offscreen plot device, or `NoAdapter` for the CPU picture.
 #[cfg(not(target_arch = "wasm32"))]
 fn native_gpu() -> Result<&'static render::PlotGpu, GpuError> {
-    static GPU: std::sync::OnceLock<Option<render::PlotGpu>> = std::sync::OnceLock::new();
-    GPU.get_or_init(|| {
-        let (device, queue) = block_on(request_device()).and_then(|result| result.ok())?;
-        render::PlotGpu::new(device, queue, wgpu::TextureFormat::Rgba8Unorm).ok()
-    })
-    .as_ref()
-    .ok_or(GpuError::NoAdapter)
+    // Cache only successes — a transient request_device failure must not be
+    // remembered as NoAdapter for the rest of the process.
+    static GPU: std::sync::OnceLock<render::PlotGpu> = std::sync::OnceLock::new();
+    if let Some(gpu) = GPU.get() {
+        return Ok(gpu);
+    }
+    let gpu = block_on(request_device())
+        .and_then(|result| result.ok())
+        .and_then(|(device, queue)| {
+            render::PlotGpu::new(device, queue, wgpu::TextureFormat::Rgba8Unorm).ok()
+        })
+        .ok_or(GpuError::NoAdapter)?;
+    Ok(GPU.get_or_init(|| gpu))
 }
 
 #[cfg(not(target_arch = "wasm32"))]

@@ -61,8 +61,16 @@ pub(super) fn prepare(
         }
         // amount is always a MU/charge reading — the Protons map needs the
         // energy-dependent proton count like Dose does, not the raw MU.
-        let protons = protons_from_mu(f64::from(pencil.amount), f64::from(energy), gap_mm, k_mu)
-            * f64::from(factor);
+        // The monitor chamber sits upstream of the entrance absorber, so the
+        // charge conversion runs at the INCIDENT energy; `factor` is what
+        // accounts for primaries lost in the absorber (as the MC slab path
+        // does by passing the incident energy to transport).
+        let protons = protons_from_mu(
+            f64::from(pencil.amount),
+            f64::from(pencil.energy),
+            gap_mm,
+            k_mu,
+        ) * f64::from(factor);
         // The Mu deposit weights by amount*factor — the charge conversion is
         // not part of it, so a zero/negative k_mu must not zero the map.
         // For the other quantities protons <= 0 (negative k_mu) would deposit
@@ -1400,6 +1408,27 @@ pub(super) fn scatter_planes(
 mod tests {
     use super::super::{csda_range_mm, Pencil, Quantity, Volume, WATER};
     use super::{analytic_on, analytic_volume, dose_frame, scatter_planes};
+
+    #[test]
+    fn the_proton_weight_uses_the_incident_energy_through_an_absorber() {
+        // The monitor chamber is upstream of the entrance absorber — the
+        // charge conversion must run at the incident energy while `kept`
+        // carries the attenuation. Converting at the residual energy would
+        // undercount protons on top of it.
+        let pencils = [Pencil {
+            x: 0.0,
+            y: 0.0,
+            sx: 3.0,
+            sy: 3.0,
+            energy: 150.0,
+            amount: 1.0,
+        }];
+        let (_, dry) = super::prepare(WATER, &pencils, Quantity::Protons, 1.0, 0.0, 1e-6, 10.0);
+        let (_, wet) = super::prepare(WATER, &pencils, Quantity::Protons, 1.0, 100.0, 1e-6, 10.0);
+        let (_, kept) = super::super::through_wet(150.0, 100.0);
+        let ratio = wet[0].weight / dry[0].weight;
+        assert!((f64::from(ratio) - kept).abs() < 1e-3, "{ratio} vs {kept}");
+    }
 
     #[test]
     fn deposited_peak_sits_on_the_spot() {

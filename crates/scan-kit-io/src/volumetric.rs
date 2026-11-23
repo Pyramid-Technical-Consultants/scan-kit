@@ -331,7 +331,7 @@ pub fn volumetric(
     for (index, cloud) in clouds.iter().enumerate() {
         let runner = if index == focus { mc } else { None };
         let k_mu = k_mus.get(index).copied().unwrap_or(k_mu);
-        let (volume, ran) = fill(
+        let (mut volume, mut ran) = fill(
             mat,
             &cloud.pencils,
             quantity,
@@ -347,17 +347,18 @@ pub fn volumetric(
             grid,
             planes,
         );
-        mc_note = mc_note.or(ran);
-        measured.push(volume);
-        if cloud.companion.is_empty() {
-            companions.push(Volume {
-                origin: [0.0; 3],
-                shape: [0, 0, 0],
-                spacing: [1.0; 3],
-                values: Vec::new(),
-            });
+        let (mut companion, ran_c) = if cloud.companion.is_empty() {
+            (
+                Volume {
+                    origin: [0.0; 3],
+                    shape: [0, 0, 0],
+                    spacing: [1.0; 3],
+                    values: Vec::new(),
+                },
+                None,
+            )
         } else {
-            let (volume, _) = fill(
+            fill(
                 mat,
                 &cloud.companion,
                 quantity,
@@ -372,10 +373,9 @@ pub fn volumetric(
                 runner,
                 grid,
                 planes,
-            );
-            companions.push(volume);
-        }
-        let (volume, _) = fill(
+            )
+        };
+        let (mut plan, ran_p) = fill(
             mat,
             &cloud.plan,
             quantity,
@@ -391,7 +391,83 @@ pub fn volumetric(
             grid,
             planes,
         );
-        plans.push(volume);
+        // A partial MC run leaves one engine per cube — recompute the whole
+        // session analytically rather than compare MC against analytic.
+        if index == focus && model == "mc" {
+            let attempted = [
+                cloud.pencils.is_empty(),
+                cloud.companion.is_empty(),
+                cloud.plan.is_empty(),
+            ]
+            .into_iter()
+            .filter(|empty| !*empty)
+            .count();
+            let succeeded = [
+                (ran.is_some(), !cloud.pencils.is_empty()),
+                (ran_c.is_some(), !cloud.companion.is_empty()),
+                (ran_p.is_some(), !cloud.plan.is_empty()),
+            ]
+            .into_iter()
+            .filter(|(done, tried)| *done && *tried)
+            .count();
+            if succeeded > 0 && succeeded < attempted {
+                (volume, _) = fill(
+                    mat,
+                    &cloud.pencils,
+                    quantity,
+                    spread,
+                    wet_mm,
+                    phantom_mm,
+                    k_mu,
+                    gap_mm,
+                    model,
+                    histories,
+                    medium_key,
+                    None,
+                    grid,
+                    planes,
+                );
+                (plan, _) = fill(
+                    mat,
+                    &cloud.plan,
+                    quantity,
+                    spread,
+                    wet_mm,
+                    phantom_mm,
+                    k_mu,
+                    gap_mm,
+                    model,
+                    histories,
+                    medium_key,
+                    None,
+                    grid,
+                    planes,
+                );
+                if !cloud.companion.is_empty() {
+                    (companion, _) = fill(
+                        mat,
+                        &cloud.companion,
+                        quantity,
+                        spread,
+                        wet_mm,
+                        phantom_mm,
+                        k_mu,
+                        gap_mm,
+                        model,
+                        histories,
+                        medium_key,
+                        None,
+                        grid,
+                        planes,
+                    );
+                }
+                ran = None;
+            }
+        }
+        mc_note = mc_note.or(ran);
+        measured.push(volume);
+        companions.push(companion);
+        plans.push(plan);
     }
 
     let (dd, dta, cutoff) = gamma_criteria(options);
@@ -529,7 +605,11 @@ pub fn volumetric(
                 opacity,
                 mode,
                 filter,
-                y_label: y_name(quantity).into(),
+                y_label: match compare {
+                    "gamma" => "γ".into(),
+                    "difference" => format!("Δ {}", y_name(quantity)),
+                    _ => y_name(quantity).into(),
+                },
                 dvh: dvh_lines,
                 gamma,
             });
@@ -1310,10 +1390,11 @@ fn load_cloud(
     let ic1_dose = col(&table, "ic1_dose");
     let ic2_dose = col(&table, "ic2_dose");
     let xml = devices_xml(root, session);
+    let (ic1_x, ic1_y) = or_plan(&table, "ic1_x", "ic1_y");
     let ic1 = pencils_from(
         &energy,
-        &or_plan(&table, "ic1_x"),
-        &or_plan_y(&table, "ic1_y"),
+        &ic1_x,
+        &ic1_y,
         &col(&table, "ic1_sig_x"),
         &col(&table, "ic1_sig_y"),
         &ic1_dose,
@@ -1367,6 +1448,23 @@ fn load_cloud(
     };
     let (psx, psy) = if plan_sigma == "interlock" {
         (Vec::new(), Vec::new())
+    } else if plan_sigma == "reference" {
+        // The donor is a different session — its spot list can order or
+        // filter differently, so join sigmas on energy, not row index.
+        join_donor_sigmas(
+            &col(&donor, "energy"),
+            &mean_column(
+                &col(&donor, "ic1_sig_x"),
+                &col(&donor, "ic2_sig_x"),
+                usable_sigma,
+            ),
+            &mean_column(
+                &col(&donor, "ic1_sig_y"),
+                &col(&donor, "ic2_sig_y"),
+                usable_sigma,
+            ),
+            &energy,
+        )
     } else {
         (
             mean_column(
@@ -1583,7 +1681,7 @@ pub(crate) fn iso_positions(
         || !x1.iter().any(|v| v.is_finite())
         || !x2.iter().any(|v| v.is_finite())
     {
-        return (or_plan(table, "ic1_x"), or_plan_y(table, "ic1_y"));
+        return or_plan(table, "ic1_x", "ic1_y");
     }
     let z = iso_plane_z(table);
     let t = (z - IC2_Z_MM) / IC_SEP_MM;
@@ -1604,21 +1702,43 @@ pub(crate) fn iso_positions(
     (x, y)
 }
 
-fn or_plan(table: &std::collections::BTreeMap<String, Vec<f32>>, key: &str) -> Vec<f32> {
-    let got = col(table, key);
-    if got.iter().any(|v| v.is_finite()) {
-        got
-    } else {
-        col(table, "plan_x")
+fn join_donor_sigmas(
+    donor_energy: &[f32],
+    donor_x: &[f32],
+    donor_y: &[f32],
+    energy: &[f32],
+) -> (Vec<f32>, Vec<f32>) {
+    let mut psx = Vec::with_capacity(energy.len());
+    let mut psy = Vec::with_capacity(energy.len());
+    for e in energy {
+        let at = donor_energy
+            .iter()
+            .position(|other| (other - e).abs() < 0.01);
+        psx.push(
+            at.and_then(|at| donor_x.get(at).copied())
+                .unwrap_or(f32::NAN),
+        );
+        psy.push(
+            at.and_then(|at| donor_y.get(at).copied())
+                .unwrap_or(f32::NAN),
+        );
     }
+    (psx, psy)
 }
 
-fn or_plan_y(table: &std::collections::BTreeMap<String, Vec<f32>>, key: &str) -> Vec<f32> {
-    let got = col(table, key);
-    if got.iter().any(|v| v.is_finite()) {
-        got
+fn or_plan(
+    table: &std::collections::BTreeMap<String, Vec<f32>>,
+    key_x: &str,
+    key_y: &str,
+) -> (Vec<f32>, Vec<f32>) {
+    let x = col(table, key_x);
+    let y = col(table, key_y);
+    // Fall back as a pair — measured x with planned y fabricates a position
+    // that exists in neither record.
+    if x.iter().any(|v| v.is_finite()) && y.iter().any(|v| v.is_finite()) {
+        (x, y)
     } else {
-        col(table, "plan_y")
+        (col(table, "plan_x"), col(table, "plan_y"))
     }
 }
 
@@ -1884,6 +2004,107 @@ mod tests {
         // Combined mode used to propagate the NaN into every position and
         // empty the cloud — the plan fallback must keep the session.
         assert!(x.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn a_partial_mc_run_rolls_the_whole_session_back_to_analytic() {
+        // One cube falling back used to leave MC measured vs analytic plan —
+        // the gamma comparison then mixed engines. A partial run must be
+        // reported as a fallback, not a clean MC result.
+        let root = std::env::temp_dir().join(format!(
+            "scan-kit-mixed-mc-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let session = root.join("sess");
+        std::fs::create_dir_all(&session).unwrap();
+        std::fs::write(
+            session.join("input_map.csv"),
+            "energy,charge_req,position_x,position_y
+180,0.05,0,0
+",
+        )
+        .unwrap();
+        std::fs::write(
+            session.join("spot_data.csv"),
+            "ic1_total_dose
+0.05
+",
+        )
+        .unwrap();
+        let calls = std::cell::Cell::new(0u32);
+        let scene = super::volumetric(
+            &root,
+            &["sess".into()],
+            &serde_json::json!({ "model": "mc" }),
+            Some(&|job: &scan_kit_core::McJob| {
+                calls.set(calls.get() + 1);
+                if calls.get() > 1 {
+                    return Err("gpu wedged".to_owned());
+                }
+                let scan_kit_core::McJob::Slab(request) = job else {
+                    return Err("expected a slab job".to_owned());
+                };
+                Ok(McResult {
+                    volume: Volume {
+                        origin: request.origin,
+                        shape: request.shape,
+                        spacing: [request.voxel_mm; 3],
+                        values: vec![1.0; request.shape.iter().product()],
+                    },
+                    uncertainty: 0.01,
+                    ledger: [0.0; 6],
+                    let_d: Vec::new(),
+                })
+            }),
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(calls.get() >= 2, "measured and plan both asked: {calls:?}");
+        let depth = scene
+            .panels
+            .iter()
+            .find(|panel| panel.title.starts_with("Depth"))
+            .expect("a depth panel");
+        assert!(
+            depth.y_label.contains("analytic fallback"),
+            "partial MC must not claim a clean run: {}",
+            depth.y_label
+        );
+    }
+
+    #[test]
+    fn donor_sigmas_follow_the_energy_not_the_row() {
+        // A donor whose layers sort differently must not hand its sigma to
+        // the wrong spot.
+        let (x, y) = super::join_donor_sigmas(
+            &[180.0, 70.0],
+            &[3.0, 1.0],
+            &[4.0, 2.0],
+            &[70.0, 180.0, 120.0],
+        );
+        assert_eq!(x[..2], [1.0, 3.0]);
+        assert_eq!(y[..2], [2.0, 4.0]);
+        assert!(x[2].is_nan() && y[2].is_nan(), "no donor layer at 120");
+    }
+
+    #[test]
+    fn the_plan_fallback_keeps_a_coherent_position_pair() {
+        // A measured x with a planned y fabricates a position that exists in
+        // neither record — the axes must fall back together.
+        let mut table = std::collections::BTreeMap::new();
+        table.insert("ic1_x".to_owned(), vec![f32::NAN]);
+        table.insert("ic1_y".to_owned(), vec![4.0]);
+        table.insert("ic2_x".to_owned(), vec![f32::NAN]);
+        table.insert("ic2_y".to_owned(), vec![f32::NAN]);
+        table.insert("plan_x".to_owned(), vec![9.0]);
+        table.insert("plan_y".to_owned(), vec![7.0]);
+        let (x, y) = iso_positions(&table);
+        assert_eq!(x, vec![9.0]);
+        assert_eq!(y, vec![7.0]);
     }
 
     #[test]
