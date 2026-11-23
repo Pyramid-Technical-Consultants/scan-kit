@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 
@@ -45,7 +45,7 @@ export function PhantomSynthesis() {
   const [previewing, setPreviewing] = useState(false);
   const writeBusy = useRef(false);
   const paramsRef = useRef(params);
-  useEffect(() => {
+  useLayoutEffect(() => {
     paramsRef.current = params;
   }, [params]);
   usePageLoad(waiting || busy || previewing);

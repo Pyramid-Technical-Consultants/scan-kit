@@ -75,7 +75,7 @@ export async function driveTask(
         await new Promise((resolve) => window.setTimeout(resolve, 40));
         continue;
       }
-      return;
+      throw new Error("the task was cancelled or superseded");
     }
     misses = 0;
     if (stop()) {
@@ -92,6 +92,9 @@ export async function driveTask(
     if (parsed.report.finished) {
       if (parsed.report.phase === "failed") {
         throw new Error(parsed.report.note.length > 0 ? parsed.report.note : "failed");
+      }
+      if (parsed.report.phase !== "done") {
+        throw new Error(`the task ended ${parsed.report.phase}`);
       }
       return;
     }

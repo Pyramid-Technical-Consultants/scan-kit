@@ -156,10 +156,9 @@ export function PlanRunner() {
   }, [csvPath, dest]);
 
   useEffect(() => {
-    if (!view.connected) {
-      return;
-    }
     let stop = false;
+    // Offline still probes slowly  a transient status failure must
+    // recover on its own, not pin the view to "Offline" forever.
     const id = window.setInterval(() => {
       if (stop || busyRef.current || inflight.current) {
         return;
@@ -190,7 +189,7 @@ export function PlanRunner() {
         .finally(() => {
           inflight.current = false;
         });
-    }, 1000);
+    }, view.connected ? 1000 : 5000);
     return () => {
       stop = true;
       window.clearInterval(id);

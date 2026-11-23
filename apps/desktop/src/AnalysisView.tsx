@@ -46,7 +46,7 @@ import {
 import { usePageLoad } from "@/page-load";
 import { sessionColor, shownSessionIds } from "@/session-colors";
 import { acceptReport, bytesOf, driveTask, parsePoll, type Report } from "@/task-client";
-import { dismissNotice, notifyError } from "@/notify";
+import { dismissNotice, notifyError, notifySaved } from "@/notify";
 import { ScrubBar, useScrub, type Scrub } from "@/scrub-bar";
 import { DoseBoard } from "@/DoseBoard";
 import { SidePane } from "@/SidePane";
@@ -804,6 +804,10 @@ export function AnalysisView({
       (report) => setExportReport(report.finished ? null : report),
       () => false,
     )
+      .then(() => {
+        setExportReport(null);
+        notifySaved(dest, { title: view === "write_dose" ? "Dose exported" : "Report exported" });
+      })
       .catch((reason: unknown) => {
         setExportReport(null);
         notifyError(reason);
