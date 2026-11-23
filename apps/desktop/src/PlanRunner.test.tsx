@@ -265,7 +265,7 @@ it("drops a status poll that resolves after a fresher action", async () => {
     await act(async () => {
       reset?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
-    expect(document.body.textContent).toContain("Reset");
+    expect(document.body.textContent).toContain("Reset.");
 
     // The stale poll resolves last and must be dropped — without the seq
     // guard this would repaint the card LIVE.
@@ -287,7 +287,9 @@ it("drops a status poll that resolves after a fresher action", async () => {
       });
     });
     expect(document.body.textContent).not.toContain("STALE STATUS");
-    expect(document.body.textContent).toContain("Reset");
+    // "Reset" alone is the permanent button label — pin the coach text of
+    // the view the reset actually installed.
+    expect(document.body.textContent).toContain("Reset.");
   } finally {
     vi.useRealTimers();
   }

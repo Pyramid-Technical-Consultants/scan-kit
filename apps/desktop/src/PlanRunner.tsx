@@ -168,7 +168,7 @@ export function PlanRunner() {
           }
         })
         .catch((reason: unknown) => {
-          if (!stop) {
+          if (!stop && seq === viewSeq.current) {
             // One transient status error is not a disconnect — only drop the
             // view after a few consecutive failures.
             statusFailures.current += 1;

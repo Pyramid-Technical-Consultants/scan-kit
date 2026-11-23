@@ -409,6 +409,7 @@ export function AnalysisView({
   const [meta, setMeta] = useState<PlotHeader | null>(null);
   const metaRef = useRef<PlotHeader | null>(null);
   const liveRef = useRef(true);
+  const openingRef = useRef(false);
   useEffect(() => {
     liveRef.current = true;
     return () => {
@@ -754,13 +755,19 @@ export function AnalysisView({
   // Export progress is its own hairline entry — sharing taskReport would let an
   // export overwrite (or erase) the plot task's reported progress.
   usePageLoad(exportBusy, exportReport?.done ?? 0, exportReport?.total ?? 0);
+  const exportBusyRef = useRef(false);
   const runExport = (
     view: "write_dose" | "write_report",
     dest: string,
     extra?: Record<string, string>,
   ) => {
     // Both exports share one backend slot — a second start cancels the first
-    // silently, so the buttons are gated on exportBusy instead.
+    // silently. exportBusy gates the buttons but updates a render late, so a
+    // non-modal dialog can still double-fire; the ref is synchronous.
+    if (exportBusyRef.current) {
+      return;
+    }
+    exportBusyRef.current = true;
     setExportBusy(true);
     void driveTask(
       {
@@ -788,7 +795,10 @@ export function AnalysisView({
         setExportReport(null);
         notifyError(reason);
       })
-      .finally(() => setExportBusy(false));
+      .finally(() => {
+        exportBusyRef.current = false;
+        setExportBusy(false);
+      });
   };
   useEffect(() => {
     optionsRef.current = options;
@@ -1479,12 +1489,16 @@ export function AnalysisView({
                   }),
                 )
                 .then((selected) => {
-                if (typeof selected !== "string" || opening) {
+                // `opening` here is a stale render closure — the dialog is
+                // non-modal, so gate the second click on the ref instead.
+                if (typeof selected !== "string" || openingRef.current) {
                   return;
                 }
+                openingRef.current = true;
                 setOpening(true);
                 void invoke<{ report: string }>("scan_kit_open_study", { path: selected })
                   .then((opened) => {
+                    openingRef.current = false;
                     if (!liveRef.current) {
                       return;
                     }
@@ -1493,6 +1507,7 @@ export function AnalysisView({
                     setOpening(false);
                   })
                   .catch((reason: unknown) => {
+                    openingRef.current = false;
                     if (!liveRef.current) {
                       return;
                     }
@@ -1531,7 +1546,11 @@ export function AnalysisView({
                     "scan_kit_scanners",
                     { action: "add", folder: selected },
                   )
-                    .then((listed) => setScanners(listed.scanners))
+                    .then((listed) => {
+                      if (liveRef.current) {
+                        setScanners(listed.scanners);
+                      }
+                    })
                     .catch((reason: unknown) => notifyError(reason));
                 },
               )
