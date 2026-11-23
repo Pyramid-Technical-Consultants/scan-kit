@@ -211,15 +211,15 @@ pub(super) fn box_series(
         x.push(left);
         bottom.push(stats.q1);
         w.push(BOX_WIDTH);
-        h.push((stats.q3 - stats.q1).max(0.0));
+        h.push(((stats.q3 as f64 - stats.q1 as f64).clamp(0.0, f32::MAX as f64)) as f32);
         x.push(center - 0.01);
         bottom.push(stats.whisker_lo);
         w.push(0.02);
-        h.push((stats.q1 - stats.whisker_lo).max(0.0));
+        h.push(((stats.q1 as f64 - stats.whisker_lo as f64).clamp(0.0, f32::MAX as f64)) as f32);
         x.push(center - 0.01);
         bottom.push(stats.q3);
         w.push(0.02);
-        h.push((stats.whisker_hi - stats.q3).max(0.0));
+        h.push(((stats.whisker_hi as f64 - stats.q3 as f64).clamp(0.0, f32::MAX as f64)) as f32);
         med_x.extend([left, left + BOX_WIDTH]);
         med_y.extend([stats.median, stats.median]);
         med_x.push(f32::NAN);
@@ -613,7 +613,12 @@ pub(super) fn corr_panel(
             let (x0, x1) = span(&xs);
             series.push(Series::Polyline {
                 xs: vec![x0, x1],
-                ys: vec![slope * x0 + intercept, slope * x1 + intercept],
+                ys: [
+                    f64::from(slope) * f64::from(x0) + f64::from(intercept),
+                    f64::from(slope) * f64::from(x1) + f64::from(intercept),
+                ]
+                .map(|y| (y.clamp(-f64::from(f32::MAX), f64::from(f32::MAX))) as f32)
+                .to_vec(),
                 color: [0.8, 0.8, 0.8, 0.0],
                 thickness: 1.5,
             });
