@@ -1221,7 +1221,9 @@ fn session_meta(
     }
 }
 
-fn strip_verbatim(path: &Path) -> String {
+/// `explorer.exe` and shells cannot parse `\?\` verbatim paths — strip
+/// the prefix canonicalize adds on Windows.
+pub fn strip_verbatim(path: &Path) -> String {
     let text = path.to_string_lossy();
     #[cfg(windows)]
     {
