@@ -83,9 +83,9 @@ export type LibraryRow = {
   config: string;
 };
 
-export type NoteEdit = { sessionId: string; before: string; after: string };
+export type NoteEdit = { sessionId: string; library: string; before: string; after: string };
 
-export type SessionMenu = { sessionId: string; x: number; y: number; rowIds: string[] };
+export type SessionMenu = { sessionId: string; library: string; x: number; y: number; rowIds: string[] };
 
 function paintedColor(
   className: string,
@@ -227,7 +227,7 @@ export function LibraryTable({
     selectedVisible,
   );
 
-  const noteEdit = useRef<{ id: string; note: string } | null>(null);
+  const noteEdit = useRef<{ id: string; note: string; library: string } | null>(null);
   const onCellActivated = useCallback(
     (cell: Item) => {
       const [col, rowIndex] = cell;
@@ -237,9 +237,11 @@ export function LibraryTable({
       // in-flight catalog refresh can move a different session into this
       // row before commit, and undo restores `before` verbatim.
       noteEdit.current =
-        clickEditsNote(col) && row != null ? { id: row.session_id, note: row.note } : null;
+        clickEditsNote(col) && row != null
+          ? { id: row.session_id, note: row.note, library: row.library ?? folder ?? "" }
+          : null;
     },
-    [order, rows],
+    [folder, order, rows],
   );
   const onCellEdited = useCallback(
     (cell: Item, newValue: EditableGridCell) => {
@@ -259,6 +261,7 @@ export function LibraryTable({
       if (clickEditsNote(col) && newValue.kind === GridCellKind.Text && newValue.data !== before) {
         onCommitNote({
           sessionId: edit?.id ?? row.session_id,
+          library: edit?.library ?? row.library ?? folder ?? "",
           before,
           after: newValue.data,
         });
@@ -399,6 +402,7 @@ export function LibraryTable({
         }
         onOpenMenu({
           sessionId: row.session_id,
+          library: row.library ?? folder ?? "",
           x: point.x,
           y: point.y,
           rowIds: selectedSessionIds(displayIds, gridSelection, rowIndex),
