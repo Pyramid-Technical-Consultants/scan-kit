@@ -613,7 +613,7 @@ pub(crate) fn decode_plot(
                 // Heats are appended past the batch's solid quads — an index
                 // inside the solid range would draw the quad twice.
                 let solid_end = batch.quad_start as usize + batch.quad_count as usize;
-                (*quad as usize) < solid_end && *quad >= batch.quad_start
+                (*quad as usize) < solid_end
                     || *quad as usize >= marks.quads.len()
                     || *texture >= marks.heatmaps.len()
             })

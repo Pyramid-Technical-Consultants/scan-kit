@@ -353,8 +353,13 @@ pub fn read_ion_plan(path: &Path) -> Result<IonPlan, String> {
                 .unwrap_or(energy);
             let n = int_tag(cp, tag(0x300A, 0x0392)).unwrap_or(0).max(0) as usize;
             let xy = floats_tag(cp, tag(0x300A, 0x0394));
-            if n == 0 || xy.is_empty() {
+            if n == 0 {
                 continue;
+            }
+            if xy.is_empty() {
+                // Declared spots with no usable position map - skipping
+                // would deliver the beam without a whole layer.
+                return Err("scan spot position map is missing or corrupt".into());
             }
             let weights = floats_tag(cp, tag(0x300A, 0x0396));
             let has_weights = elem(cp, tag(0x300A, 0x0396)).is_some();
@@ -1084,6 +1089,13 @@ fn read_plan(elems: &[Elem], frame: String, ct_position: &str) -> Result<Plan, S
                 ));
             }
             let limit = n.min(xy.len() / 2);
+            if limit == 0 {
+                // n > 0 spots declared but no usable positions - a silent
+                // continue would drop the layer from the computed dose.
+                return Err(format!(
+                    "beam {number}: scan spot position map is missing or corrupt"
+                ));
+            }
             if has_weights && weights.len() < limit {
                 return Err(format!(
                     "beam {number}: meterset weights do not match the spot count"
@@ -1293,6 +1305,14 @@ pub fn inside_structure(
 /// whose high bit equals the allocation's top bit extends identically to a
 /// plain signed cast, so the callers use this unconditionally when signed.
 fn sign_extend(word: i64, high_bit: i64) -> i64 {
+    // Bits above High Bit are sender-defined - mask them off first or a
+    // sign-replicated writer (0xFFFF for 12-bit -1) reads as a huge positive.
+    let word = word
+        & if high_bit >= 62 {
+            i64::MAX
+        } else {
+            (1_i64 << (high_bit + 1)) - 1
+        };
     if word & (1_i64 << high_bit) != 0 {
         word - (1_i64 << (high_bit + 1))
     } else {
@@ -1303,6 +1323,11 @@ fn sign_extend(word: i64, high_bit: i64) -> i64 {
 fn axial_signs(elems: &[Elem]) -> Result<(f32, f32), String> {
     let orientation = floats_tag(elems, tag(0x0020, 0x0037));
     if orientation.is_empty() {
+        // Absent means HFS default; present-but-unparseable is a corrupt
+        // orientation - identity would mirror the anatomy silently.
+        if elem(elems, tag(0x0020, 0x0037)).is_some() {
+            return Err("CT orientation is corrupt".into());
+        }
         return Ok((1.0, 1.0));
     }
     if orientation.len() < 6 {

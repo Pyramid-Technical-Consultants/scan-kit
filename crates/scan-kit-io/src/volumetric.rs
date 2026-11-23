@@ -559,9 +559,12 @@ pub fn volumetric(
     let mut volume_mark = scan_kit_core::VolumeMark::default();
     let mut integral_rates: Option<[f32; 3]> = None;
     let mut field_size: Option<String> = None;
-    let session_at = session_at(options, session_ids)
-        .unwrap_or(0)
-        .min(shown.len().saturating_sub(1));
+    let session_at = match session_at(options, session_ids) {
+        Ok(index) => index.min(shown.len().saturating_sub(1)),
+        // A stale persisted session must not render session 0 as the focus -
+        // usize::MAX makes every .get below miss, matching the MC focus.
+        Err(_) => usize::MAX,
+    };
     if has_dose {
         if let Some(volume) = shown.get(session_at) {
             let scan = scan_kit_core::scan_volume(volume);

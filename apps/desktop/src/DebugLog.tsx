@@ -12,7 +12,9 @@ export function DebugLog() {
 
   useEffect(() => {
     const node = view.current;
-    if (node != null) {
+    // Stick to the tail only while the user is already at it - yanking a
+    // mid-scroll read on every line makes a chatty task log unreadable.
+    if (node != null && node.scrollHeight - node.scrollTop - node.clientHeight < 24) {
       node.scrollTop = node.scrollHeight;
     }
   }, [lines]);

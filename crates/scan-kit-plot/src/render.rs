@@ -5249,10 +5249,15 @@ pub(crate) fn line_stamp(panels: &[Panel]) -> LineStamp {
             prefix = prefix.saturating_add(polyline_segments(xs, ys));
         }
     }
+    let reusable = prefix > 0 && polylines_are_prefix(panels);
+    // The cached buffer can only splice a shared polyline prefix when the
+    // previous scene was prefix-ordered too - baking the flag into the
+    // token keeps an interleaved buffer (guides before polylines) from
+    // donating its guide records as the "shared" prefix.
     LineStamp {
-        token: state.max(1),
+        token: mix(state, u64::from(reusable)).max(1),
         prefix,
-        reusable: prefix > 0 && polylines_are_prefix(panels),
+        reusable,
     }
 }
 
@@ -7349,7 +7354,7 @@ fn profile_lines(
                 volume.index_of(2, mm[2]),
             ],
             None => {
-                if index != grid.session_focus {
+                if index != focus {
                     // An empty session has no profile — falling back to home
                     // would draw the focused curve in this session's color.
                     continue;

@@ -501,6 +501,7 @@ export function ConfigTuning({
       // A slower earlier call must not overwrite the newest click.
       if (seq === hideSeq.current) {
         setHideUnused(next);
+        editSeq.current += 1;
       }
     } catch (caught) {
       notifyError(caught);
@@ -517,6 +518,9 @@ export function ConfigTuning({
     setXml(matched.xml);
     setForm(matched.form);
     setDirty(true);
+    // This is an edit save() must notice - without the bump an Apply during
+    // the folder dialog is overwritten by the stale pre-Apply snapshot.
+    editSeq.current += 1;
     notify(matched.summary);
   }
 

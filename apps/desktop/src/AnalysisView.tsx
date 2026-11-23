@@ -886,8 +886,10 @@ export function AnalysisView({
         // cancel either; the owner is still using it.
         if (started.superseded) {
           // The start lost the slot race and has no ticket to poll - settle
-          // or the view sweeps "Loading plot" forever.
+          // or the view sweeps "Loading plot" forever. Releasing useScrub's
+          // pending latch too, or every later commit is silently dropped.
           setArrivedKey(requestKey);
+          setSettled((count) => count + 1);
           return;
         }
         if (stop || openSeq.current !== ticket) {

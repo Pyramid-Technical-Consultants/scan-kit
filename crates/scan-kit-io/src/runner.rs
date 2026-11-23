@@ -59,19 +59,10 @@ pub fn catalog(db: &Path) -> Value {
     let (host, file_dir) = with_store(db, |conn| store::runner_settings(conn))
         .ok()
         .unwrap_or((None, None));
-    let session_id = lock()
-        .as_ref()
-        .map(|live| live.session_id.clone())
-        .unwrap_or_default();
     let connected = live();
     let mut body = json!({
         "host": host,
         "file_dir": file_dir,
-        "dest": scan_kit_core::default_session_zip_path(
-            "",
-            file_dir.as_deref().unwrap_or(""),
-            &session_id,
-        ),
         "connected": connected,
         "view": runner_view(&json!({}), false, false),
     });
@@ -85,6 +76,17 @@ pub fn catalog(db: &Path) -> Value {
             Err(_) => body["connected"] = json!(false),
         }
     }
+    // read_status refreshes live.session_id on a roll - the zip name must
+    // name the session the view reports, not the pre-read one.
+    let session_id = lock()
+        .as_ref()
+        .map(|live| live.session_id.clone())
+        .unwrap_or_default();
+    body["dest"] = json!(scan_kit_core::default_session_zip_path(
+        "",
+        file_dir.as_deref().unwrap_or(""),
+        &session_id,
+    ));
     body
 }
 
@@ -311,12 +313,25 @@ pub fn upload(db: &Path, csv_path: &Path) -> Result<Value, String> {
 
 pub fn control(action: &str) -> Result<Value, String> {
     let button = control_button(action)?;
-    {
+    let epoch = {
         let mut guard = lock();
         let live = guard.as_mut().ok_or("not connected")?;
         set_field(&mut live.socket, button, &json!(true))?;
+        live.epoch
+    };
+    // upload() guards this same gap - a disconnect/connect between the press
+    // and the status read would report a different connection's state as the
+    // actuation's result.
+    if lock().as_ref().map(|live| live.epoch) != Some(epoch) {
+        return Err("connection changed".into());
     }
-    read_status(true, "")
+    let view = read_status(true, "")?;
+    // read_status re-locks across its HTTP call - a reconnect inside that
+    // window would report the new device's state as the actuation's result.
+    if lock().as_ref().map(|live| live.epoch) != Some(epoch) {
+        return Err("connection changed".into());
+    }
+    Ok(view)
 }
 
 pub fn remember_dir(db: &Path, dir: &str) -> Result<Value, String> {
