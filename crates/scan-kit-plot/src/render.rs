@@ -637,7 +637,11 @@ const VIEW_DEPTH_MM: f32 = 8.0;
 const DOSE_FLOOR: f32 = 0.02;
 
 fn vol_at(ix: i32, iy: i32, iz: i32) -> f32 {
-    return textureLoad(dose_vol, vec3<i32>(ix + 2, iy + 2, iz + 2), 0).r;
+    // Cells inside a dilated boundary brick can tap past the lattice — the
+    // brick grid rounds dims up to a multiple of 8, so clamp every texel.
+    let dims = vec3<i32>(textureDimensions(dose_vol));
+    let t = clamp(vec3<i32>(ix + 2, iy + 2, iz + 2), vec3<i32>(0), dims - vec3<i32>(1));
+    return textureLoad(dose_vol, t, 0).r;
 }
 
 fn vol_hw(p: vec3<f32>) -> f32 {
@@ -3852,19 +3856,24 @@ impl Plot {
                     pass.set_vertex_buffer(0, buffer.slice(quad_at * QUAD_STRIDE..));
                     pass.draw(0..6, 0..ground as u32);
                 }
-                if batch.quad_count > 0 {
+                // A stale batch can carry quad ranges past the suffix buffer —
+                // clamp like the line draws instead of tripping vertex-range
+                // validation (an uncaptured error, a panic on native).
+                let quad_records = marks.quads.size() / QUAD_STRIDE;
+                let batch_start = u64::from(batch.quad_start).min(quad_records);
+                let batch_count = u64::from(batch.quad_count).min(quad_records - batch_start);
+                if batch_count > 0 {
                     pass.set_bind_group(1, &gpu.white_group, &[]);
-                    pass.set_vertex_buffer(
-                        0,
-                        marks
-                            .quads
-                            .slice(u64::from(batch.quad_start) * QUAD_STRIDE..),
-                    );
-                    pass.draw(0..6, 0..batch.quad_count);
+                    pass.set_vertex_buffer(0, marks.quads.slice(batch_start * QUAD_STRIDE..));
+                    pass.draw(0..6, 0..batch_count as u32);
                 }
                 for (start, texture) in &batch.heats {
+                    let start = u64::from(*start).min(quad_records.saturating_sub(1));
+                    if quad_records == 0 {
+                        break;
+                    }
                     pass.set_bind_group(1, &marks.heats[*texture].group, &[]);
-                    pass.set_vertex_buffer(0, marks.quads.slice(u64::from(*start) * QUAD_STRIDE..));
+                    pass.set_vertex_buffer(0, marks.quads.slice(start * QUAD_STRIDE..));
                     pass.draw(0..6, 0..1);
                 }
                 let rest = quad_count.saturating_sub(ground);
@@ -5347,8 +5356,13 @@ fn visible_draws(
     runs: &[PointRun],
     window: Option<(f32, f32)>,
 ) -> Vec<(u32, u32)> {
+    // Batches can outlive their mark buffer (an unadopted reuse payload), so
+    // every range is clamped to the records that actually exist.
+    let total = points.len() as u32;
     let mut draws = Vec::new();
     if runs.is_empty() {
+        let start = start.min(total);
+        let count = count.min(total - start);
         if count > 0 {
             draws.push((start, count));
         }
@@ -5374,8 +5388,10 @@ fn visible_draws(
         } else {
             (0usize, run.count)
         };
+        let start = (run.start + offset as u32).min(total);
+        let shown = shown.min(total - start);
         if shown > 0 {
-            draws.push((run.start + offset as u32, shown));
+            draws.push((start, shown));
         }
     }
     draws
@@ -11970,6 +11986,30 @@ mod tests {
             Some((1.5, 2.5)),
         );
         assert_eq!(draws, vec![(1, 1), (2, 1)]);
+    }
+
+    #[test]
+    fn a_stale_draw_range_is_clamped_to_the_point_buffer() {
+        let points: Vec<PointRec> = (0..4)
+            .map(|i| PointRec {
+                p: [i as f32, 0.0, 0.0],
+                radius: 1.0,
+                color: [0.0; 4],
+                id: i as u32,
+                time: 0.0,
+            })
+            .collect();
+        // An unadopted reuse payload can carry ranges past the buffer —
+        // clamp like the line draws instead of tripping vertex validation.
+        assert_eq!(visible_draws(&points, 2, 10, &[], None), vec![(2, 2)]);
+        assert!(visible_draws(&points, 9, 4, &[], None).is_empty());
+        let runs = vec![PointRun {
+            start: 3,
+            count: 6,
+            timed: false,
+            source: false,
+        }];
+        assert_eq!(visible_draws(&points, 0, 0, &runs, None), vec![(3, 1)]);
     }
 
     #[test]

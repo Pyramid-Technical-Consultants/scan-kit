@@ -103,7 +103,9 @@ fn stats_rel(
         workgroupBarrier();
     }
     if (lid == 0u) {
-        let q = u32(red_s[0] * 1e6);
+        // An out-of-range float→u32 cast is a dynamic error — clamp first so a
+        // huge accumulation can't wrap into a valid-looking dose sum.
+        let q = u32(min(red_s[0] * 1e6, 4294967295.0));
         let old = atomicAdd(&stats[1u], q);
         if (old + q < old) { atomicAdd(&stats[2u], 1u); }
         atomicAdd(&stats[3u], red_c[0]);
@@ -436,8 +438,17 @@ fn patient_launch(request: &PatientRequest) -> Result<Launch, ComputeError> {
             "density must be finite and positive".into(),
         ));
     }
+    // smx/smy are divisors in the shader — a zero is finite but produces a
+    // NaN particle whose voxel index is indeterminate, depositing into a
+    // real voxel with no error.
     if !request.beams.len().is_multiple_of(16)
         || !request.beams.iter().all(|value| value.is_finite())
+        || request
+            .beams
+            .as_chunks::<16>()
+            .0
+            .iter()
+            .any(|r| r[13] == 0.0 || r[14] == 0.0)
     {
         return Err(ComputeError::Message(
             "beams must be whole finite 16-float records".into(),
@@ -1633,6 +1644,33 @@ mod tests {
         assert!(McRun::open(&McJob::Slab(request)).is_err());
     }
 
+    #[test]
+    fn a_zero_source_sigma_beam_is_rejected() {
+        let spot = scan_kit_io::spot_record(100.0, 0.0, 0.0, 0.0, 0.0, f32::NAN).expect("spot");
+        let mut beam = scan_kit_io::beam_record(0.0, 0.0, "HFS", [0.0, 0.0, 0.0]).expect("beam");
+        // smx is a divisor in the shader — a zero is finite but produces a
+        // NaN particle that deposits into an indeterminate voxel.
+        beam[13] = 0.0;
+        let shape = [2usize, 2, 2];
+        let nvox = 8;
+        let request = PatientRequest {
+            spots: spot.to_vec(),
+            protons: vec![scan_kit_io::protons_per_mu(100.0).expect("protons")],
+            beams: beam.to_vec(),
+            material: vec![0; nvox],
+            density: vec![1.0; nvox],
+            spacing_mm: [2.0; 3],
+            origin_mm: [-2.0; 3],
+            shape,
+            histories: 4_000,
+            seed: 1,
+            dose_to_water: true,
+            score_let: false,
+            let_water: false,
+        };
+        assert!(McRun::open(&McJob::Patient(request)).is_err());
+    }
+
     fn slab(histories: u32) -> SlabRequest {
         SlabRequest {
             medium: "water".into(),
@@ -1817,7 +1855,11 @@ mod tests {
             PatientRequest {
                 spots: vec![0.0; 40],
                 protons: vec![1.0],
-                beams: vec![0.0; 16],
+                // A real record — an all-zero one is itself invalid (smx/smy
+                // are shader divisors and a zero produces a NaN particle).
+                beams: scan_kit_io::beam_record(0.0, 0.0, "HFS", [0.0, 0.0, 0.0])
+                    .unwrap()
+                    .to_vec(),
                 material: vec![0; 8],
                 density: vec![1.0; 8],
                 spacing_mm: [1.0, 1.0, 1.0],
