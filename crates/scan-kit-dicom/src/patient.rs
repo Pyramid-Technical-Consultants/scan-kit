@@ -1038,6 +1038,13 @@ fn read_structures(elems: &[Elem]) -> Vec<Structure> {
             .unwrap_or_else(|| format!("ROI {number}"));
         let mut contour = Vec::new();
         for item in seq(roi, tag(0x3006, 0x0040)) {
+            // An OPEN_PLANAR item would grow a phantom closing edge in the
+            // even-odd test — only closed rings rasterize. A missing tag
+            // defaults to closed (Type 3, writers commonly omit it).
+            let kind = text_tag(item, tag(0x3006, 0x0042));
+            if !kind.is_empty() && kind.trim() != "CLOSED_PLANAR" {
+                continue;
+            }
             let data = floats_tag(item, tag(0x3006, 0x0050));
             let plane: Vec<[f32; 3]> = data
                 .chunks(3)
@@ -1069,17 +1076,30 @@ pub fn inside_structure(
         ct.origin[1] + y as f32 * ct.spacing[1],
         ct.origin[2] + z as f32 * ct.spacing[2],
     ];
-    let mut hits = 0;
     let mut on_plane = false;
+    // Even-odd parity only composes within one plane — bucket the ray counts
+    // per contour z so distinct planes union instead of XOR-cancelling.
+    let mut planes: Vec<(f32, i32)> = Vec::new();
     for contour in &structure.contour {
         let Some(z0) = contour.first().map(|point| point[2]) else {
             continue;
         };
-        if !z0.is_finite() || (center[2] - z0).abs() > ct.spacing[2] * 0.6 {
+        // A contour whose vertices straddle slices can't rasterize on one
+        // plane — skip it rather than stamping it onto the wrong slice.
+        let (z_lo, z_hi) = contour
+            .iter()
+            .fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), p| {
+                (lo.min(p[2]), hi.max(p[2]))
+            });
+        if !z0.is_finite()
+            || z_hi - z_lo > ct.spacing[2] * 0.1
+            || (center[2] - z0).abs() > ct.spacing[2] * 0.6
+        {
             continue;
         }
         on_plane = true;
         let n = contour.len();
+        let mut hits = 0;
         for i in 0..n {
             let a = contour[i];
             let b = contour[(i + 1) % n];
@@ -1090,8 +1110,15 @@ pub fn inside_structure(
                 }
             }
         }
+        match planes
+            .iter_mut()
+            .find(|(z, _)| (z0 - *z).abs() <= ct.spacing[2] * 0.1)
+        {
+            Some((_, total)) => *total += hits,
+            None => planes.push((z0, hits)),
+        }
     }
-    on_plane && hits % 2 == 1
+    on_plane && planes.iter().any(|(_, hits)| hits % 2 == 1)
 }
 
 /// Column sign, then row sign, for an axial image. Missing orientation is the
