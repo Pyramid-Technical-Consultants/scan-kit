@@ -276,12 +276,13 @@ pub fn poll_task(id: u64) -> Result<Vec<u8>, String> {
     let report = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| stage.report()));
     let (outcome, mut report) = match report {
         Ok(report) => (outcome, report),
-        Err(_) => {
+        Err(report_err) => {
             // A panicking report must end the task — re-parking it would leave
             // stage=None and every later poll would fabricate Pending forever.
             scan_kit_io::clear_slice();
+            let note = panic_note(&*report_err);
             (
-                Poll::Failed("task panicked".into()),
+                Poll::Failed(format!("task panicked: {note}")),
                 ended(id, generation, Phase::Failed, "task panicked"),
             )
         }
@@ -292,6 +293,7 @@ pub fn poll_task(id: u64) -> Result<Vec<u8>, String> {
         Poll::Pending { preview, .. } => (false, preview, false),
         Poll::Ready(bytes) => {
             report.phase = Phase::Done;
+            report.note.clear();
             (true, Some(bytes), true)
         }
         Poll::Cancelled => {
@@ -399,9 +401,9 @@ pub(crate) fn drain_plot(
             Ok(Poll::Failed(message)) => return Err(message),
             Ok(Poll::Cancelled) => return Err("cancelled".into()),
             Ok(Poll::Pending { .. }) => {}
-            Err(_) => {
+            Err(err) => {
                 scan_kit_io::clear_slice();
-                return Err("task panicked".into());
+                return Err(format!("task panicked: {}", panic_note(&*err)));
             }
         }
     }
@@ -1655,9 +1657,9 @@ impl LibraryStage {
 impl Drop for LibraryStage {
     fn drop(&mut self) {
         self.shared.stop.store(true, Ordering::SeqCst);
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
-        }
+        // No join  the worker can be stalled on a dead share for
+        // minutes and its per-entry autocommits are idempotent.
+        self.worker.take();
     }
 }
 
@@ -1669,9 +1671,9 @@ impl Stage for LibraryStage {
     fn poll(&mut self, _budget: Duration, cancel: &Cancel) -> Poll<Vec<u8>> {
         if cancel.is_cancelled() {
             self.shared.stop.store(true, Ordering::SeqCst);
-            if let Some(worker) = self.worker.take() {
-                let _ = worker.join();
-            }
+            // Detach rather than join  a stalled share must not block
+            // the cancel call.
+            self.worker.take();
             self.report.phase = Phase::Cancelled;
             return Poll::Cancelled;
         }
@@ -1786,9 +1788,9 @@ impl CopyStage {
 impl Drop for CopyStage {
     fn drop(&mut self) {
         self.shared.stop.store(true, Ordering::SeqCst);
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
-        }
+        // No join  the worker can be stalled on a dead share for
+        // minutes and the copy keeps a stop check per entry.
+        self.worker.take();
     }
 }
 
@@ -1800,9 +1802,9 @@ impl Stage for CopyStage {
     fn poll(&mut self, _budget: Duration, cancel: &Cancel) -> Poll<Vec<u8>> {
         if cancel.is_cancelled() {
             self.shared.stop.store(true, Ordering::SeqCst);
-            if let Some(worker) = self.worker.take() {
-                let _ = worker.join();
-            }
+            // Detach rather than join  a stalled share must not block
+            // the cancel call.
+            self.worker.take();
             self.report.phase = Phase::Cancelled;
             return Poll::Cancelled;
         }
