@@ -87,14 +87,17 @@ fn scene(title: &str, panels: Vec<Panel>, controls: Vec<Control>) -> PlotScene {
 
 fn panel(title: String, xmin: f32, xmax: f32, ymin: f32, ymax: f32, series: Vec<Series>) -> Panel {
     // Only a truly degenerate axis needs a pad - and it belongs centered on
-    // the data, not glued to the panel edge.
-    let (xmin, xmax) = if xmax <= xmin {
-        (xmin - 0.5, xmax + 0.5)
+    // the data midpoint, not glued to the panel edge (an inverted or NaN
+    // span pads around its midpoint too).
+    let (xmin, xmax) = if xmax <= xmin || xmin.is_nan() || xmax.is_nan() {
+        let mid = (xmin + xmax) / 2.0;
+        (mid - 0.5, mid + 0.5)
     } else {
         (xmin, xmax)
     };
-    let (ymin, ymax) = if ymax <= ymin {
-        (ymin - 0.5, ymax + 0.5)
+    let (ymin, ymax) = if ymax <= ymin || ymin.is_nan() || ymax.is_nan() {
+        let mid = (ymin + ymax) / 2.0;
+        (mid - 0.5, mid + 0.5)
     } else {
         (ymin, ymax)
     };

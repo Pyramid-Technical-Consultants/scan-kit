@@ -760,7 +760,13 @@ mod net {
                 // An unparseable reply is not "file missing" — treating it as
                 // None silently vanishes a real object from stat consumers.
                 // A symlink reply is absent by contract, like sftp.
-                Ok(line) if line.contains("type=OS.unix=slink") || line.contains("type=slink") => {
+                // MLST facts end at the first space - matching inside the
+                // filename would vanish a real file named *type=slink*.
+                Ok(line)
+                    if line.split(' ').next().is_some_and(|facts| {
+                        facts.contains("type=OS.unix=slink") || facts.contains("type=slink")
+                    }) =>
+                {
                     Ok(None)
                 }
                 Ok(line) => stat_mlst(&line)

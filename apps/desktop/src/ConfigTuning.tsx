@@ -575,7 +575,9 @@ export function ConfigTuning({
         files: [{ rel: file, xml: nextXml }],
         hideUnused,
       });
-      if (seq !== openSeq.current) {
+      // Same guard after the awaits — an edit landing during apply/save must
+      // not have its dirty flag cleared by the older snapshot.
+      if (seq !== openSeq.current || editSeq.current !== edits) {
         return;
       }
       setConfigDir(selected);
