@@ -482,8 +482,8 @@ export default function App() {
             break;
           }
         }
-        pendingLocations.current = stopped >= 0 ? roots.slice(stopped + 1) : [];
         if (catalogEpoch.current === epoch) {
+          pendingLocations.current = stopped >= 0 ? roots.slice(stopped + 1) : [];
           try {
             await pullCatalog();
             dismissNotice();
