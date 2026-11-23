@@ -151,10 +151,13 @@ struct Launch {
 pub fn adapter_info() -> String {
     block_on(async {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions::default())
-            .await
-            .ok()?;
+        let adapter = tokio::time::timeout(
+            Duration::from_secs(30),
+            instance.request_adapter(&wgpu::RequestAdapterOptions::default()),
+        )
+        .await
+        .ok()?
+        .ok()?;
         let info = adapter.get_info();
         Some(format!("{} / {:?}", info.name, info.backend))
     })
@@ -185,6 +188,14 @@ impl McRun {
             McJob::Patient(request) => patient_launch(request)?,
         };
         if launch.protons <= 0.0 || launch.spots.is_empty() {
+            // The empty path skips prepare's binding-cap check — bound the
+            // placeholder allocation itself.
+            let nvox = launch.shape[0]
+                .saturating_mul(launch.shape[1])
+                .saturating_mul(launch.shape[2]);
+            if nvox > 1 << 30 {
+                return Err(ComputeError::Message("voxel grid is too large".into()));
+            }
             return Ok(Self {
                 live: None,
                 done: Some(empty_result(&launch)),
@@ -641,6 +652,15 @@ async fn prepare(launch: Launch) -> Result<Live, ComputeError> {
         return Err(ComputeError::Message(format!(
             "voxel grid {nx}x{ny}x{nz} is too large for this GPU"
         )));
+    }
+    // spots/beams bind whole — oversized ones hit create_bind_group
+    // validation as a panic, same class as the nvox guard above.
+    if launch.spots.len().saturating_mul(4) > binding_cap
+        || launch.beams.len().saturating_mul(4) > binding_cap
+    {
+        return Err(ComputeError::Message(
+            "job buffers exceed the GPU binding limit".into(),
+        ));
     }
     let device = gpu.device.clone();
     let queue = gpu.queue.clone();
@@ -1374,26 +1394,34 @@ fn pack_i64(lo: u32, hi: u32) -> i64 {
 
 async fn mc_device() -> Result<(wgpu::Device, wgpu::Queue), ComputeError> {
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
-    let adapter = instance
-        .request_adapter(&wgpu::RequestAdapterOptions::default())
-        .await
-        .map_err(|err| match err {
-            wgpu::RequestAdapterError::NotFound { .. } => ComputeError::NoAdapter,
-            other => ComputeError::Message(other.to_string()),
-        })?;
+    // The only GPU waits with no deadline — a wedged driver would park the
+    // worker thread forever, past cancel and join.
+    let adapter = tokio::time::timeout(
+        Duration::from_secs(30),
+        instance.request_adapter(&wgpu::RequestAdapterOptions::default()),
+    )
+    .await
+    .map_err(|_| ComputeError::Message("the GPU adapter request timed out".into()))?
+    .map_err(|err| match err {
+        wgpu::RequestAdapterError::NotFound { .. } => ComputeError::NoAdapter,
+        other => ComputeError::Message(other.to_string()),
+    })?;
     let limits = adapter.limits();
     if limits.max_storage_buffers_per_shader_stage < 9 {
         return Err(ComputeError::Message(
             "this GPU allows fewer than 9 storage buffers".into(),
         ));
     }
-    adapter
-        .request_device(&wgpu::DeviceDescriptor {
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        adapter.request_device(&wgpu::DeviceDescriptor {
             required_limits: limits,
             ..Default::default()
-        })
-        .await
-        .map_err(|err| ComputeError::Message(err.to_string()))
+        }),
+    )
+    .await
+    .map_err(|_| ComputeError::Message("the GPU device request timed out".into()))?
+    .map_err(|err| ComputeError::Message(err.to_string()))
 }
 
 fn block_on<F: Future>(future: F) -> F::Output {

@@ -1464,12 +1464,18 @@ fn blank_result(job: &McJob) -> McResult {
         ),
     };
     let count = shape[0].saturating_mul(shape[1]).saturating_mul(shape[2]);
+    // The placeholder must not allocate an unbounded request shape.
+    let (shape, values) = if count > 1 << 30 {
+        ([0, 0, 0], Vec::new())
+    } else {
+        (shape, vec![0.0; count])
+    };
     McResult {
         volume: Volume {
             origin,
             shape,
             spacing,
-            values: vec![0.0; count],
+            values,
         },
         uncertainty: 0.0,
         ledger: [0.0; 6],
@@ -3016,5 +3022,31 @@ mod tests {
         assert!(lock().tasks.contains_key(&id), "stale cancel ran");
         cancel_task(id, Some(2));
         assert!(!lock().tasks.contains_key(&id), "owner cancel missed");
+    }
+
+    #[test]
+    fn a_blank_result_bounds_the_placeholder_shape() {
+        // An unchecked request shape must not allocate its product — the
+        // placeholder collapses to empty past the cap.
+        let job = McJob::Slab(scan_kit_core::SlabRequest {
+            medium: "water".into(),
+            x: vec![0.0],
+            y: vec![0.0],
+            sx: vec![3.0],
+            sy: vec![3.0],
+            energy: vec![100.0],
+            protons: vec![1.0e6],
+            histories: 1,
+            seed: 7,
+            spread_pct: 1.0,
+            wet_mm: 0.0,
+            depth_mm: 100.0,
+            voxel_mm: 4.0,
+            origin: [0.0; 3],
+            shape: [1 << 31, 2, 2],
+        });
+        let result = blank_result(&job);
+        assert_eq!(result.volume.shape, [0, 0, 0]);
+        assert!(result.volume.values.is_empty());
     }
 }
