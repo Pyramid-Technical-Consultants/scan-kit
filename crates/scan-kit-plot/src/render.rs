@@ -2886,9 +2886,15 @@ impl Plot {
         self.apply(width, height, input);
         let (width, height) = self.size;
         let rgba = match crate::native_gpu() {
-            Ok(gpu) => self
-                .paint_offscreen(gpu, width, height)
-                .map_err(|err| err.to_string())?,
+            Ok(gpu) => match self.paint_offscreen(gpu, width, height) {
+                Ok(rgba) => rgba,
+                // A lost device stays cached in the OnceLock and would Err
+                // every later render — degrade to the CPU picture instead.
+                Err(_) => {
+                    let layout = self.layout(width, height);
+                    self.paint_cpu(width, height, &layout)
+                }
+            },
             Err(_) => {
                 let layout = self.layout(width, height);
                 self.paint_cpu(width, height, &layout)
