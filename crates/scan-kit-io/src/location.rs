@@ -615,6 +615,9 @@ fn walk_remote(
         if sessions.iter().any(|session| session == name) {
             continue;
         }
+        if skipped.contains(&join_rel(rel, name)) {
+            continue;
+        }
         let child = join_path(path, name);
         let child_rel = join_rel(rel, name);
         let url = join_rel(library_url, &encode_path(&child_rel));
@@ -691,9 +694,11 @@ fn remote_exam(
             return Ok(None);
         }
     }
-    let bytes = fs
-        .read_prefix(&sample, 4 * 1024 * 1024)?
-        .unwrap_or_default();
+    // An unreadable sample is no exam at all - fabricating one from empty
+    // bytes writes a phantom record with the folder name as its uid.
+    let Some(bytes) = fs.read_prefix(&sample, 4 * 1024 * 1024)? else {
+        return Ok(None);
+    };
     let peek = scan_kit_dicom::peek_study(&bytes);
     let study_uid = if peek.study_uid.is_empty() {
         folder_name.to_owned()
@@ -758,8 +763,10 @@ fn is_remote_session(
     name: &str,
 ) -> Result<bool, String> {
     let base = path.trim_end_matches('/');
-    Ok(is_file(fs, &format!("{base}/input_map.csv"))?
-        || is_file(fs, &format!("{base}/{name}/input_map.csv"))?)
+    // Probe the nested marker first like the local resolver - a flat-marker
+    // stat error must not mask a real nested session.
+    Ok(is_file(fs, &format!("{base}/{name}/input_map.csv"))?
+        || is_file(fs, &format!("{base}/input_map.csv"))?)
 }
 
 fn is_file(fs: &mut dyn crate::remote::Fs, path: &str) -> Result<bool, String> {

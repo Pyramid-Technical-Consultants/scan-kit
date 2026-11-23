@@ -330,6 +330,7 @@ mod net {
                 url: location::request_url(remote),
                 username: remote.username.clone(),
                 password: password.to_owned(),
+                own_path: remote.path.clone(),
             })),
             Scheme::Smb => Err("an smb URL opens as a Windows UNC path".into()),
         }
@@ -758,10 +759,23 @@ mod net {
             match listed {
                 // An unparseable reply is not "file missing" — treating it as
                 // None silently vanishes a real object from stat consumers.
+                // A symlink reply is absent by contract, like sftp.
+                Ok(line) if line.contains("type=OS.unix=slink") || line.contains("type=slink") => {
+                    Ok(None)
+                }
                 Ok(line) => stat_mlst(&line)
                     .map(Some)
                     .ok_or_else(|| format!("unparseable MLST reply: {line}")),
-                Err(err) if missing_ftp(&err) => Ok(None),
+                // 550 also means permission denied on common servers — the
+                // list fallback decides: present-but-unstatable is an error,
+                // genuinely absent stays None so rows are not pruned blind.
+                Err(err) if missing_ftp(&err) => stat_from_list(self, path).and_then(|found| {
+                    if found.is_some() {
+                        Err(format!("{path} is present but not statable"))
+                    } else {
+                        Ok(None)
+                    }
+                }),
                 Err(_) => stat_from_list(self, path),
             }
         }
@@ -1044,6 +1058,7 @@ mod net {
         url: String,
         username: String,
         password: String,
+        own_path: String,
     }
 
     impl Fs for HttpFs {
@@ -1056,7 +1071,12 @@ mod net {
             Ok(Some(bytes))
         }
 
-        fn stat(&mut self, _path: &str) -> Result<Option<Stat>, String> {
+        fn stat(&mut self, path: &str) -> Result<Option<Stat>, String> {
+            // The connector can only see its archive URL — answering Some
+            // for a child path fabricates objects that do not exist.
+            if path.trim_end_matches('/') != self.own_path.trim_end_matches('/') {
+                return Ok(None);
+            }
             Ok(Some(http_stat(&self.url, &self.username, &self.password)?))
         }
 
@@ -1389,8 +1409,11 @@ mod tests {
         }
         assert_eq!(fs.read("/").unwrap().unwrap(), b"data");
         assert_eq!(fs.read_prefix("/", 2).unwrap().unwrap(), b"da");
-        let stat = fs.stat("/").unwrap().unwrap();
+        // Only the archive's own path stats - a child probe must not
+        // fabricate an object the server does not hold.
+        let stat = fs.stat("/root").unwrap().unwrap();
         assert!(!stat.dir && stat.size == 4);
+        assert!(fs.stat("/root/sess.zip").unwrap().is_none());
         let dest = std::env::temp_dir().join(format!("scan-kit-http-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dest);
         fs.copy_to("/", &dest.join("nested/archive.bin")).unwrap();
@@ -1404,7 +1427,7 @@ mod tests {
         let head_url = format!("http://127.0.0.1:{head}/archive.bin");
         let head_spec = remote(&head_url, Scheme::Http, "127.0.0.1", Some(head));
         let mut head_fs = connect(&head_spec, "").unwrap();
-        let missing = head_fs.stat("/").unwrap().unwrap();
+        let missing = head_fs.stat("/root").unwrap().unwrap();
         assert_eq!(missing.size, 0);
         let _ = fs::remove_dir_all(&dest);
     }
