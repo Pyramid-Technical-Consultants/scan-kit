@@ -140,10 +140,18 @@ pub fn save_folder(
         }
         // Reject what would fail mid-write after earlier files already
         // persisted — a directory at the rel path (also covers empty rel,
-        // which resolves to dest itself).
+        // which resolves to dest itself), or a regular file where a parent
+        // directory must be created.
         let target = under(dest, rel)?;
         if target.is_dir() {
             return Err(format!("{rel} is a directory at the destination"));
+        }
+        let mut dir = target.parent();
+        while dir.is_some_and(|d| d != dest && d.starts_with(dest)) {
+            if dir.is_some_and(|d| d.is_file()) {
+                return Err(format!("{rel} sits under a file at the destination"));
+            }
+            dir = dir.and_then(|d| d.parent());
         }
         writes.push((rel, xml));
     }
@@ -206,7 +214,7 @@ pub fn tune(input: &Value, _db: &Path) -> Result<Value, String> {
         xml = apply_form(&xml, form)?;
     }
     let data_dir = text(input, "data_dir").unwrap_or("").trim().to_owned();
-    let session_ids = strings(input, "session_ids");
+    let session_ids = strings(input, "session_ids")?;
     if session_ids.is_empty() {
         return Err("Select at least one session.".into());
     }
@@ -264,7 +272,7 @@ pub fn diff(input: &Value) -> Result<Value, String> {
         ));
     }
     let data_dir = text(input, "data_dir").unwrap_or("").trim().to_owned();
-    let session_ids = strings(input, "session_ids");
+    let session_ids = strings(input, "session_ids")?;
     if session_ids.is_empty() {
         return Err("Select at least one session.".into());
     }
@@ -1068,7 +1076,11 @@ fn random_salt() -> i32 {
 }
 
 fn sidecar_path(path: &Path) -> PathBuf {
-    PathBuf::from(format!("{}{}", path.display(), ".md5"))
+    // Append at the OsStr level — `display()` mojibake's non-UTF-8 names and
+    // two distinct files would stamp the same mangled sidecar.
+    let mut name = path.as_os_str().to_os_string();
+    name.push(".md5");
+    PathBuf::from(name)
 }
 
 fn relative(root: &Path, path: &Path) -> String {
@@ -1166,20 +1178,22 @@ fn text<'a>(input: &'a Value, key: &str) -> Result<&'a str, String> {
         .ok_or_else(|| format!("{key} is required"))
 }
 
-fn strings(input: &Value, key: &str) -> Vec<String> {
-    input
-        .get(key)
-        .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(Value::as_str)
-                .map(str::trim)
-                .filter(|item| !item.is_empty())
-                .map(str::to_owned)
-                .collect()
-        })
-        .unwrap_or_default()
+fn strings(input: &Value, key: &str) -> Result<Vec<String>, String> {
+    match input.get(key) {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(value) => value
+            .as_array()
+            .ok_or_else(|| format!("{key} must be an array"))?
+            .iter()
+            .map(|item| {
+                item.as_str()
+                    .map(str::trim)
+                    .map(str::to_owned)
+                    .ok_or_else(|| format!("{key} must be an array of strings"))
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map(|items| items.into_iter().filter(|item| !item.is_empty()).collect()),
+    }
 }
 
 #[cfg(test)]
@@ -1708,6 +1722,25 @@ mod tests {
         ]);
         assert!(save_folder(&dir.join("db.sqlite"), &source, &dest, &files, None).is_err());
         // The invalid target must be caught before any write persists.
+        assert!(!dest.join("other.xml").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_write_under_a_regular_file_fails_before_any_file_lands() {
+        let dir = std::env::temp_dir().join(format!("sk_r29_file_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let source = dir.join("src");
+        let dest = dir.join("dst");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&dest).unwrap();
+        // "sub" is a file at the destination, so sub/x.xml fails mid-write.
+        std::fs::write(dest.join("sub"), "not a dir").unwrap();
+        let files = json!([
+            { "rel": "sub/x.xml", "xml": "<x/>" },
+            { "rel": "other.xml", "xml": "<y/>" }
+        ]);
+        assert!(save_folder(&dir.join("db.sqlite"), &source, &dest, &files, None).is_err());
         assert!(!dest.join("other.xml").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }

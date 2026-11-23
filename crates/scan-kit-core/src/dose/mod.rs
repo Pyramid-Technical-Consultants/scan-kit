@@ -256,7 +256,11 @@ impl Volume {
     }
 
     pub fn get(&self, x: usize, y: usize, z: usize) -> f32 {
-        let [nx, ny, _] = self.shape;
+        let [nx, ny, nz] = self.shape;
+        // Per-axis bounds too — x=nx would read the real voxel (0, y+1, z).
+        if x >= nx || y >= ny || z >= nz {
+            return 0.0;
+        }
         // values can be shorter than shape claims — the fields are pub —
         // and a miss outside the grid is 0. The index math is checked so a
         // huge shape wraps to a wrong in-bounds voxel rather than panicking.
@@ -517,6 +521,27 @@ impl DoseFrame {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn out_of_bounds_reads_return_zero() {
+        let volume = super::Volume {
+            origin: [0.0; 3],
+            shape: [2, 2, 2],
+            spacing: [1.0; 3],
+            values: vec![9.0; 8],
+        };
+        for (x, y, z) in [
+            (2, 0, 0),
+            (0, 2, 0),
+            (0, 0, 2),
+            (usize::MAX, 0, 0),
+            (usize::MAX, usize::MAX, usize::MAX),
+        ] {
+            assert_eq!(volume.get(x, y, z), 0.0, "{x},{y},{z}");
+        }
+        assert_eq!(volume.get(1, 1, 1), 9.0);
+    }
+
     use super::*;
 
     #[test]

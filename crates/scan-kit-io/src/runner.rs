@@ -625,10 +625,10 @@ fn dial(endpoint: &str) -> Result<WebSocket<DeadlineStream>, String> {
         let mut request = format!("ws://{endpoint}")
             .into_client_request()
             .map_err(|err| err.to_string())?;
-        request.headers_mut().insert(
-            "Sec-WebSocket-Protocol",
-            HeaderValue::from_static("mpack.v2, mpack.v1, mpack"),
-        );
+        const OFFERED: &str = "mpack.v2, mpack.v1, mpack";
+        request
+            .headers_mut()
+            .insert("Sec-WebSocket-Protocol", HeaderValue::from_static(OFFERED));
         match client(request, stream) {
             Ok((socket, response)) => {
                 let protocol = response
@@ -636,7 +636,13 @@ fn dial(endpoint: &str) -> Result<WebSocket<DeadlineStream>, String> {
                     .get("sec-websocket-protocol")
                     .and_then(|value| value.to_str().ok())
                     .unwrap_or("");
-                if !protocol.contains("mpack") {
+                // The negotiated token must be one we offered — a substring
+                // match would accept a foreign `notmpack` protocol.
+                if !protocol.split(',').any(|token| {
+                    OFFERED
+                        .split(',')
+                        .any(|offered| token.trim().eq_ignore_ascii_case(offered.trim()))
+                }) {
                     return Err(format!(
                         "device did not accept mpack subprotocol (got '{protocol}')"
                     ));

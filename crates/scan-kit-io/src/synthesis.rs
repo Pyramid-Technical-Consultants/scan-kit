@@ -145,7 +145,7 @@ fn write_csv(path: &Path, csv: &str, db: &Path) -> Result<(), String> {
             fs::create_dir_all(parent).map_err(|err| err.to_string())?;
         }
     }
-    fs::write(path, csv).map_err(|err| err.to_string())?;
+    scan_kit_core::atomic_write(path, csv.as_bytes())?;
     if let Some(parent) = path.parent() {
         let dir = parent.to_string_lossy().to_string();
         if !dir.is_empty() {

@@ -99,17 +99,30 @@ impl ScanKit {
         (saves || foreign_db || remote).then_some(name)
     }
 
+    /// A UNC share is any two leading separators — `//`, `\\`, `\/`,
+    /// `/\` all parse as UNC on Windows.
+    fn unc(spec: &str) -> bool {
+        let mut chars = spec.chars();
+        matches!(chars.next(), Some('\\' | '/')) && matches!(chars.next(), Some('\\' | '/'))
+    }
+
     /// True when a string looks like a network-reachable location: a remote
     /// scheme, a UNC share, or a file://host URI (file:/// is local).
     fn remote_spec(spec: &str) -> bool {
         let spec = spec.trim();
-        if scan_kit_io::is_remote_location(spec) || spec.starts_with("\\") || spec.starts_with("//")
-        {
+        if scan_kit_io::is_remote_location(spec) || spec.starts_with('\\') || Self::unc(spec) {
             return true;
         }
-        spec.get(..7)
+        if spec
+            .get(..7)
             .is_some_and(|head| head.eq_ignore_ascii_case("file://"))
-            && !spec[7..].starts_with('/')
+        {
+            // Decode like the open path does, then re-apply the UNC rules —
+            // file:////host and %2f escapes still reach the network.
+            let path = scan_kit_io::file_uri_path(&spec[7..]);
+            return Self::unc(&path.to_string_lossy());
+        }
+        false
     }
 
     /// Walks every string in the input; a JSON-in-JSON value such as
@@ -288,6 +301,23 @@ mod tests {
     use serde_json::json;
 
     use super::ScanKit;
+
+    #[test]
+    fn unc_like_paths_trip_the_remote_gate() {
+        for spec in [
+            "//nas/share/dose.dcm",
+            r"\\nas\share",
+            r"/\nas\share",
+            r"\/nas/share",
+            "file:////nas/share/dose.dcm",
+            "file:///%2f%2fnas%2fshare",
+        ] {
+            assert!(ScanKit::remote_spec(spec), "{spec}");
+        }
+        for local in ["C:/data/dose.dcm", "file:///C:/data/dose.dcm", "./rel/path"] {
+            assert!(!ScanKit::remote_spec(local), "{local}");
+        }
+    }
 
     #[test]
     fn a_nested_note_does_not_bypass_the_remote_gate() {

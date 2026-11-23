@@ -97,14 +97,21 @@ pub fn parse_host(host: &str) -> Result<String, String> {
 
 pub fn normalize_host(host: &str) -> Result<String, String> {
     let host = parse_host(host)?;
-    if host.matches(':').count() > 1 && !host.starts_with('[') {
+    let bracketed = if host.matches(':').count() > 1 && !host.starts_with('[') {
         // An IPv6 literal needs brackets in a URL authority — one that
         // already wears them must not get a second pair.
-        Ok(format!("[{host}]"))
-    } else if host.contains(':') {
-        Ok(host)
+        format!("[{host}]")
     } else {
-        Ok(format!("{host}:80"))
+        host.to_owned()
+    };
+    // [::1]:8080 keeps its port; a bare [::1] still needs one — every
+    // consumer parses host:port.
+    if bracketed.starts_with('[') && !bracketed.contains("]:") {
+        Ok(format!("{bracketed}:80"))
+    } else if bracketed.contains(':') {
+        Ok(bracketed)
+    } else {
+        Ok(format!("{bracketed}:80"))
     }
 }
 
@@ -534,7 +541,9 @@ mod tests {
 
     #[test]
     fn a_bracketed_ipv6_host_stays_bracketed() {
-        assert_eq!(normalize_host("[::1]").unwrap(), "[::1]");
-        assert_eq!(normalize_host("::1").unwrap(), "[::1]");
+        // Brackets alone are not a usable authority — the port is required.
+        assert_eq!(normalize_host("[::1]").unwrap(), "[::1]:80");
+        assert_eq!(normalize_host("::1").unwrap(), "[::1]:80");
+        assert_eq!(normalize_host("[::1]:8080").unwrap(), "[::1]:8080");
     }
 }

@@ -288,11 +288,13 @@ export default function App() {
   const [undo, setUndo] = useState<NoteEdit[]>([]);
   const [redo, setRedo] = useState<NoteEdit[]>([]);
   const [gridSelection, setGridSelection] = useState<GridSelection>(emptyGridSelection);
-  // Positional selection is meaningless across a rows replacement — the
-  // same rule ExamTable applies internally.
-  const [prevRows, setPrevRows] = useState(rows);
-  if (prevRows !== rows) {
-    setPrevRows(rows);
+  // Positional selection is meaningless when the row set or order changes —
+  // but a rows array rebuilt in place (checkbox toggle, note commit) keeps
+  // positions and must not wipe the highlight.
+  const rowKey = rows.map((row) => row.session_id).join("\0");
+  const [prevKey, setPrevKey] = useState(rowKey);
+  if (prevKey !== rowKey) {
+    setPrevKey(rowKey);
     setGridSelection(emptyGridSelection);
   }
   const [theme, setTheme] = useState<Theme | null>(null);

@@ -173,7 +173,13 @@ function NumberField({
           const parsed = Number(next);
           const previous = Number(draft);
           setDraft(next);
+          // The step-delta shortcut exists for spinner-arrow clicks. Typed
+          // edits carry an inputType; a spinner step does not — without that
+          // guard, typing a digit that lands `step` from the draft commits a
+          // mid-typing value and recomputes the whole task.
+          const typed = event.nativeEvent instanceof InputEvent && event.nativeEvent.inputType != null;
           if (
+            !typed &&
             Number.isFinite(parsed) &&
             Number.isFinite(previous) &&
             Math.abs(Math.abs(parsed - previous) - step) < 1e-4
