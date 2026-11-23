@@ -5044,20 +5044,23 @@ fn fold_window(tail: &mut Tail, chunk: Vec<u8>, pred: fn(&str) -> bool, file_eof
         return;
     }
     tail.joined = None;
-    let (start, end) = if tail.cursor == 0 {
-        header_span(&chunk)
-    } else {
-        (0, 0)
-    };
-    if tail.cursor == 0 && tail.header.is_empty() {
+    let end = if tail.header.is_empty() {
+        // A banner longer than the first window puts the header in a later
+        // chunk - keep scanning until the first data line shows.
+        let (start, end) = header_span(&chunk);
         tail.header = chunk[start..end].to_vec();
-    }
+        end
+    } else {
+        0
+    };
     let len = chunk.len();
     tail.pieces.push(Arc::new(chunk));
     adopt_layout(tail, pred);
     let Some(layout) = tail.layout.clone() else {
         tail.cursor += len;
-        tail.done = true;
+        // No layout yet means no data line has been seen - done only at EOF,
+        // not because the first chunk was all banner.
+        tail.done = file_eof;
         return;
     };
     let stored = tail.pieces.last().unwrap();

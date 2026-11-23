@@ -298,21 +298,6 @@ pub(crate) fn meta_sop_class(bytes: &[u8]) -> Option<String> {
 pub(crate) fn dicom_files(root: &Path) -> Result<Vec<std::path::PathBuf>, String> {
     const MAX_DEPTH: usize = 6;
     fn visit(dir: &Path, depth: usize, out: &mut Vec<std::path::PathBuf>) -> Result<(), String> {
-        if depth == 0 {
-            // A series nested past the cap must not lose tail slices
-            // silently - a geometrically consistent partial volume is worse
-            // than a loud error.
-            let deeper = fs::read_dir(dir)
-                .map(|mut items| {
-                    items.any(|item| item.map(|entry| entry.path().is_dir()).unwrap_or(false))
-                })
-                .unwrap_or(false);
-            return if deeper {
-                Err(format!("{} is nested too deep to scan", dir.display()))
-            } else {
-                Ok(())
-            };
-        }
         // An unreadable directory entry must not silently drop slices from a
         // volume — load_study makes per-file read errors loud for the same
         // reason.
@@ -327,6 +312,12 @@ pub(crate) fn dicom_files(root: &Path) -> Result<Vec<std::path::PathBuf>, String
                 continue;
             }
             if kind.is_dir() {
+                // A series nested past the cap must not lose tail slices
+                // silently - a geometrically consistent partial volume is
+                // worse than a loud error.
+                if depth == 0 {
+                    return Err(format!("{} is nested too deep to scan", path.display()));
+                }
                 visit(&path, depth - 1, out)?;
             } else if kind.is_file() {
                 out.push(path);
@@ -533,7 +524,11 @@ fn looks_like_explicit_element(bytes: &[u8]) -> bool {
     let Some((length, header)) = value_length(vr, &bytes[6..]) else {
         return false;
     };
-    6 + header + length <= bytes.len()
+    // checked like element_span - on wasm32 a u32 length could wrap the add.
+    6usize
+        .checked_add(header)
+        .and_then(|need| need.checked_add(length))
+        .is_some_and(|need| need <= bytes.len())
 }
 
 fn value_length(vr: &[u8], rest: &[u8]) -> Option<(usize, usize)> {

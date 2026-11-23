@@ -787,7 +787,10 @@ fn join_timeslices(
         // path was not a strict weak order (3 < 10 < "2x" < 3) and sort_by
         // may panic on it.
         match (a.parse::<f64>().ok(), b.parse::<f64>().ok()) {
-            (Some(x), Some(y)) => x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal),
+            // total_cmp, not partial_cmp: join_key keeps "nan"/"inf" text
+            // raw and f64::parse accepts it - partial_cmp made NaN Equal to
+            // every key, which is not a strict weak order either.
+            (Some(x), Some(y)) => x.total_cmp(&y),
             (Some(_), None) => std::cmp::Ordering::Less,
             (None, Some(_)) => std::cmp::Ordering::Greater,
             (None, None) => a.cmp(b),
@@ -1082,69 +1085,69 @@ fn write_input_map(
                     "plan file",
                     crate::discover::MAX_MEMBER_BYTES,
                 )
-            })?;
-        if let Some(mut sheet) = parse_sheet(&bytes) {
-            // A truncated plan warns and falls through to control_points.csv
-            // and the RCI columns - every other source degrades this way.
-            let sheet = if sheet.truncated {
+            })
+            .unwrap_or_else(|err| {
+                warnings.push(format!("{}: {err}", path.display()));
+                Vec::new()
+            });
+        if let Some(mut sheet) = parse_sheet(&bytes).filter(|_| !bytes.is_empty()) {
+            // "Truncated" also fires when an authored plan lacks a trailing
+            // newline - warn on real truncation but still prefer it over
+            // the device fallbacks.
+            if sheet.truncated {
                 warnings.push(format!("{}: plan table truncated mid-file", path.display()));
-                None
-            } else {
-                Some(&mut sheet)
-            };
-            if let Some(sheet) = sheet {
-                sheet.header = sheet
-                    .header
-                    .iter()
-                    .map(|name| name.split('(').next().unwrap_or(name).trim().to_owned())
-                    .collect();
-                let extra: Vec<usize> = rci_spot
-                    .map(|spot| {
-                        ["spot_no", "layer_id", "beam_off"]
-                            .iter()
-                            .filter_map(|name| spot.column(name))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                // The join is positional — a shorter RCI table means the device
-                // filtered rows, so every pair from the divergence on is a wrong
-                // label. Emit without the extra columns rather than mislabel.
-                // A longer RCI table still joins the first N rows: re-delivered
-                // spots land at the tail, but a mid-table insert would misalign
-                // the same way — there is no key to compare against, so `>=` is
-                // the reachable middle ground.
-                if let Some(spot) =
-                    rci_spot.filter(|spot| !extra.is_empty() && spot.rows.len() >= sheet.rows.len())
-                {
-                    // Same normalization the other export paths apply — a suffixed
-                    // header would write `spot_no(x)` for a column readers look up
-                    // as `spot_no`.
-                    let names: Vec<String> = extra
+            }
+            sheet.header = sheet
+                .header
+                .iter()
+                .map(|name| name.split('(').next().unwrap_or(name).trim().to_owned())
+                .collect();
+            let extra: Vec<usize> = rci_spot
+                .map(|spot| {
+                    ["spot_no", "layer_id", "beam_off"]
                         .iter()
-                        .map(|i| base_name(&spot.header[*i]).to_owned())
-                        .collect();
-                    // Pad short rows first — flexible parsing leaves them under the
-                    // header length, and pushing the new cells there would land them
-                    // in the wrong columns. Truncate over-long rows the same way.
-                    let columns = sheet.header.len();
-                    sheet.header.extend(names);
-                    for (index, row) in sheet.rows.iter_mut().enumerate() {
-                        row.truncate(columns);
-                        row.resize(columns, String::new());
-                        for col in &extra {
-                            row.push(
-                                spot.rows
-                                    .get(index)
-                                    .and_then(|cells| cells.get(*col))
-                                    .map(|cell| clean(cell).to_owned())
-                                    .unwrap_or_default(),
-                            );
-                        }
+                        .filter_map(|name| spot.column(name))
+                        .collect()
+                })
+                .unwrap_or_default();
+            // The join is positional — a shorter RCI table means the device
+            // filtered rows, so every pair from the divergence on is a wrong
+            // label. Emit without the extra columns rather than mislabel.
+            // A longer RCI table still joins the first N rows: re-delivered
+            // spots land at the tail, but a mid-table insert would misalign
+            // the same way — there is no key to compare against, so `>=` is
+            // the reachable middle ground.
+            if let Some(spot) =
+                rci_spot.filter(|spot| !extra.is_empty() && spot.rows.len() >= sheet.rows.len())
+            {
+                // Same normalization the other export paths apply — a suffixed
+                // header would write `spot_no(x)` for a column readers look up
+                // as `spot_no`.
+                let names: Vec<String> = extra
+                    .iter()
+                    .map(|i| base_name(&spot.header[*i]).to_owned())
+                    .collect();
+                // Pad short rows first — flexible parsing leaves them under the
+                // header length, and pushing the new cells there would land them
+                // in the wrong columns. Truncate over-long rows the same way.
+                let columns = sheet.header.len();
+                sheet.header.extend(names);
+                for (index, row) in sheet.rows.iter_mut().enumerate() {
+                    row.truncate(columns);
+                    row.resize(columns, String::new());
+                    for col in &extra {
+                        row.push(
+                            spot.rows
+                                .get(index)
+                                .and_then(|cells| cells.get(*col))
+                                .map(|cell| clean(cell).to_owned())
+                                .unwrap_or_default(),
+                        );
                     }
                 }
-                write_text(&dest, &csv_text(sheet))?;
-                return Ok(1);
             }
+            write_text(&dest, &csv_text(&sheet))?;
+            return Ok(1);
         }
     }
     if let Ok(url) = device_file_url(rci_host, "/root/config/control/control_points.csv") {

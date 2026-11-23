@@ -668,8 +668,8 @@ function parentDir(path: string): string | null {
   const index = Math.max(trimmed.lastIndexOf("/"), trimmed.lastIndexOf("\\"));
   // A drive-root child has its separator at index 1 - the parent is
   // "C:\", not the drive-relative "C:".
-  if (index === 1 && trimmed[1] === ":") {
-    return trimmed.slice(0, 2) + "\\";
+  if (index === 2 && trimmed[1] === ":") {
+    return trimmed.slice(0, 3);
   }
   return index > 0 ? trimmed.slice(0, index) : null;
 }

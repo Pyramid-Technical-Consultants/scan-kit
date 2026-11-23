@@ -180,7 +180,9 @@ function fileName(path: string): string {
 }
 
 function parentDir(path: string): string {
-  return path.replace(/[/\\][^/\\]+$/, "");
+  const parent = path.replace(/[/\\][^/\\]+$/, "");
+  // "C:\file" leaves the drive-relative "C:" - the parent is the root.
+  return /^[A-Za-z]:$/.test(parent) ? parent + "\\" : parent;
 }
 
 function joinPath(dir: string, name: string): string {
