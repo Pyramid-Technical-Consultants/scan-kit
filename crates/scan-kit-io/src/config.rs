@@ -86,6 +86,9 @@ pub fn set_hide_unused(db: &Path, hide: bool) -> Result<Value, String> {
 
 pub fn read_form(path: &Path) -> Result<Value, String> {
     let _io = FILE_IO.lock().unwrap_or_else(|err| err.into_inner());
+    if fs::metadata(path).map_err(|err| err.to_string())?.len() > MAX_FILE_BYTES {
+        return Err(format!("Config file is too large: {}", path.display()));
+    }
     let xml = fs::read_to_string(path)
         .map_err(|err| format!("Could not read {}: {err}", path.display()))?;
     let form = config_form(&xml)?;
@@ -1208,6 +1211,19 @@ fn strings(input: &Value, key: &str) -> Result<Vec<String>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_oversized_config_file_is_refused() {
+        let dir = std::env::temp_dir().join(format!("sk_cfg_big_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("big.xml");
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(MAX_FILE_BYTES + 1).unwrap();
+        drop(file);
+        assert!(read_form(&path).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn a_sidecar_round_trip_is_52_bytes() {
