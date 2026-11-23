@@ -267,13 +267,13 @@ pub fn validate_plan(template: &str, params: &Value) -> Vec<String> {
             errors.extend(validate_bounded_float(
                 params.get("field_width_mm"),
                 "Field Size (mm) W",
-                0.0,
+                0.001,
                 1000.0,
             ));
             errors.extend(validate_bounded_float(
                 params.get("field_height_mm"),
                 "Field Size (mm) H",
-                0.0,
+                0.001,
                 1000.0,
             ));
             errors.extend(validate_positive_int(
@@ -701,10 +701,10 @@ fn validate_bounded_float(value: Option<&Value>, label: &str, min: f64, max: f64
     if !number.is_finite() {
         return vec![format!("{label} must be a finite number.")];
     }
-    if number <= min || number > max {
-        return vec![format!(
-            "{label} must be greater than {min} and at most {max}."
-        )];
+    // Catalog bounds are inclusive — the spec exposes -500.0 as a valid
+    // center, so the edges themselves must pass.
+    if number < min || number > max {
+        return vec![format!("{label} must be at least {min} and at most {max}.")];
     }
     Vec::new()
 }
@@ -1729,6 +1729,8 @@ Element,10,0,5,0.0
             "fast_axis": "x",
             "start_corner": "top_left",
             "layer_transition": "reset",
+            "spot_weight_method": "fixed",
+            "spot_weight_mu": 0.02,
         });
         let mut wide = base.clone();
         wide["field_width_mm"] = json!(2000.0);
@@ -1740,5 +1742,31 @@ Element,10,0,5,0.0
         assert!(validate_plan("rectangular_field", &far)
             .iter()
             .any(|error| error.contains("Field Center")));
+    }
+
+    #[test]
+    fn the_catalog_bounds_are_inclusive_at_the_edges() {
+        // -500 and 1000 are the declared spec endpoints — they must pass,
+        // and the declared field minimum is 0.001, not "greater than zero".
+        let base = json!({
+            "selected_energies": [70.0],
+            "center_x_mm": -500.0,
+            "field_width_mm": 0.001,
+            "field_height_mm": 1000.0,
+            "spots_x": 1,
+            "spots_y": 1,
+            "fast_axis": "x",
+            "start_corner": "top_left",
+            "layer_transition": "reset",
+            "spot_weight_method": "fixed",
+            "spot_weight_mu": 0.02,
+        });
+        assert!(validate_plan("rectangular_field", &base).is_empty());
+        let mut under = base.clone();
+        under["field_width_mm"] = json!(0.0005);
+        assert!(!validate_plan("rectangular_field", &under).is_empty());
+        let mut past = base.clone();
+        past["center_x_mm"] = json!(-500.1);
+        assert!(!validate_plan("rectangular_field", &past).is_empty());
     }
 }

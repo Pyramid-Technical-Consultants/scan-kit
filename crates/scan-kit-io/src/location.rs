@@ -1358,7 +1358,9 @@ pub(crate) fn session_storage_paths(root: &str, session_id: &str) -> Result<Vec<
     if let Some(place) = recorded(root, session_id) {
         if !is_remote_location(&place) {
             recorded_parent = Path::new(&place).parent().map(|dir| dir.to_path_buf());
-            if Path::new(&place).exists() {
+            // A stale/corrupt recorded binding could point outside the opened
+            // library — delete_storage sends every returned path to trash.
+            if local_under_root(root, &place) && Path::new(&place).exists() {
                 found.push(place);
             }
         }
@@ -1591,6 +1593,13 @@ pub(crate) fn delete_storage(root: &str, paths: &[String]) -> Result<Vec<String>
         return Ok(errors);
     }
     for path in &paths {
+        // Local delete candidates get the same containment rule as remote:
+        // a recorded spec outside the opened root is stale state, not a
+        // delete target.
+        if !is_remote_location(path) && !local_under_root(root, path) {
+            errors.push(format!("{path}: outside the opened root"));
+            continue;
+        }
         if let Err(err) = trash_path(path) {
             errors.push(format!("{path}: {err}"));
         }
@@ -1599,6 +1608,21 @@ pub(crate) fn delete_storage(root: &str, paths: &[String]) -> Result<Vec<String>
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+/// A recorded local path is inside the opened root only when every
+/// component is plain and the root path is a real prefix — `..` segments
+/// pass a string check but escape the library.
+fn local_under_root(root: &str, path: &str) -> bool {
+    let path = Path::new(path);
+    if !path
+        .components()
+        .all(|part| !matches!(part, std::path::Component::ParentDir))
+    {
+        return false;
+    }
+    let root = Path::new(root);
+    path == root || path.starts_with(root)
+}
+
 fn trash_path(path: &str) -> Result<(), String> {
     match trash::delete(path) {
         Ok(()) => Ok(()),
@@ -2057,5 +2081,14 @@ mod tests {
             panic!("C:// must classify as a local path");
         };
         assert_eq!(path, std::path::PathBuf::from("C:/data"));
+    }
+
+    #[test]
+    fn a_recorded_path_outside_the_root_is_not_a_delete_candidate() {
+        // starts_with alone accepts `..` components — the traversal check
+        // must reject them before the prefix test.
+        assert!(local_under_root("C:/lib", "C:/lib/sess"));
+        assert!(!local_under_root("C:/lib", "C:/lib/../victim"));
+        assert!(!local_under_root("C:/lib", "C:/other/sess"));
     }
 }

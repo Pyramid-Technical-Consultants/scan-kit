@@ -41,7 +41,15 @@ export async function driveTask(
   onUpdate: (report: Report, payload: Uint8Array | null) => void,
   stop: () => boolean,
 ): Promise<void> {
-  const started = await invoke<{ task: number; generation: number }>("scan_kit_start", args);
+  const started = await invoke<{ task: number; generation: number; superseded?: boolean }>(
+    "scan_kit_start",
+    args,
+  );
+  // A superseded ticket belongs to another view's task — polling it would
+  // settle this view on unrelated work, and it is not ours to cancel.
+  if (started.superseded) {
+    return;
+  }
   if (stop()) {
     await invoke("scan_kit_cancel", { task: started.task, generation: started.generation });
     return;

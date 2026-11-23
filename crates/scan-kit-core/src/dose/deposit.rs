@@ -347,7 +347,17 @@ pub fn analytic_on(
         )
     } else {
         let (origin, shape) = dose_grid(&spots, voxel_mm, floor);
-        (origin, shape, voxel_mm.clamp(0.25, 10.0))
+        // dose_grid returns an empty shape for NaN, but clamp() would still
+        // pass it into Volume.spacing.
+        (
+            origin,
+            shape,
+            if voxel_mm.is_finite() {
+                voxel_mm.clamp(0.25, 10.0)
+            } else {
+                2.0
+            },
+        )
     };
     let [nx, ny, nz] = shape;
     let dose_mode = quantity == Quantity::Dose;

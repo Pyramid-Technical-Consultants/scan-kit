@@ -870,7 +870,9 @@ pub(crate) fn bins(root: &Path, session_ids: &[String], options: &Value) -> Plot
             .iter()
             .filter(|series| tables.iter().any(|table| has_finite(table.get(series.key))))
             .collect();
-        let (xmin, xmax) = x_span(&tables, &categories, raw_x, x_column, present.len());
+        // The dodge spreads one OFFSET per session (table) — the series
+        // count is unrelated.
+        let (xmin, xmax) = x_span(&tables, &categories, raw_x, x_column, tables.len());
         let x_labels = if raw_x {
             Vec::new()
         } else {

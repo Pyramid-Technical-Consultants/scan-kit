@@ -363,12 +363,13 @@ fn padded_span(values: &[f32]) -> (f32, f32) {
             hi = hi.max(*value);
         }
     }
-    if !lo.is_finite() {
+    // Empty or all-non-finite keeps the fallback — lo is finite MAX there.
+    if lo > hi {
         return (0.0, 1.0);
     }
     // A constant column has no span to pad — pad around the value like
     // density_range, or every density/contour sample falls off-grid.
-    if hi <= lo {
+    if hi == lo {
         return ((lo - 0.5).max(-f32::MAX), (hi + 0.5).min(f32::MAX));
     }
     let pad = ((hi - lo) * 0.04).max(1e-4);
@@ -982,5 +983,13 @@ mod tests {
         // Density/contour panels drop samples outside the frame — collapsing
         // a constant column to (0, 1) blanks the panel wherever data lives.
         assert_eq!(padded_span(&[100.0; 4]), (99.5, 100.5));
+    }
+
+    #[test]
+    fn an_empty_or_non_finite_column_keeps_the_fallback() {
+        // lo starts at finite f32::MAX — a plain !lo.is_finite() check would
+        // fall through and return the reversed (MAX, MIN) span.
+        assert_eq!(padded_span(&[]), (0.0, 1.0));
+        assert_eq!(padded_span(&[f32::NAN, f32::INFINITY]), (0.0, 1.0));
     }
 }
