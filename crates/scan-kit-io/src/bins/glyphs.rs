@@ -652,6 +652,7 @@ pub(super) fn interlock_guides(
     tables: &[BTreeMap<String, Vec<f32>>],
     categories: &[f32],
     metric: &str,
+    series_key: &str,
     x_column: &str,
     glyph: &str,
     xmin: f32,
@@ -688,9 +689,15 @@ pub(super) fn interlock_guides(
         && glyph != "scatter"
         && glyph != "contour"
     {
+        // Each sigma panel draws its own device's band - sigma_error items
+        // share the base device's expected values.
+        let band_key = format!(
+            "expected_sigma_{}",
+            series_key.strip_suffix("_err").unwrap_or(series_key)
+        );
         if let Some(expected) = tables
             .iter()
-            .find_map(|table| table.get("expected_sigma").cloned())
+            .find_map(|table| table.get(&band_key).cloned())
         {
             guides.extend(sigma_bands(&expected, categories, metric == "sigma"));
         }

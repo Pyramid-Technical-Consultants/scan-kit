@@ -2069,7 +2069,6 @@ fn insert_point_times(found: &mut HashMap<(u32, u32), f32>, sheet: &Sheet) {
 fn add_sigma_error(table: &mut BTreeMap<String, Vec<f32>>, xml: &str) {
     let bands = parse_sigma_bands(xml);
     let mut made = Vec::new();
-    let mut pairs = Vec::new();
     for (key, device) in [
         ("ic1_sig_x", "IC_1_X"),
         ("ic1_sig_y", "IC_1_Y"),
@@ -2080,6 +2079,7 @@ fn add_sigma_error(table: &mut BTreeMap<String, Vec<f32>>, xml: &str) {
             continue;
         };
         let mut error = Vec::with_capacity(measured.len());
+        let mut pairs = Vec::new();
         for (sample, energy) in measured.iter().zip(energy) {
             match expected_mm(&bands, device, f64::from(*energy)) {
                 Some(expected) if sample.is_finite() => {
@@ -2090,13 +2090,15 @@ fn add_sigma_error(table: &mut BTreeMap<String, Vec<f32>>, xml: &str) {
                 _ => error.push(f32::NAN),
             }
         }
+        // The expected band is per device - flattening all four into one
+        // column stamped the first device's guides on every sigma panel.
+        if !pairs.is_empty() {
+            table.insert(format!("expected_sigma_{key}"), pairs);
+        }
         made.push((format!("{key}_err"), error));
     }
     for (key, error) in made {
         table.insert(key, error);
-    }
-    if !pairs.is_empty() {
-        table.insert("expected_sigma".to_string(), pairs);
     }
     attach_sigma_percent(table);
 }
@@ -3778,8 +3780,10 @@ fn plateau_mean(values: &[f32], gate: Option<&[f32]>) -> f32 {
     if on.len() < 10 {
         return f32::NAN;
     }
+    // The plateau cut follows the data - a hard nA floor dropped whole
+    // quiet layers from the ratio with no sign they were thresholded out.
     let p95 = percentile(&on, 0.95);
-    let floor = 5.0f32.max(0.75 * p95);
+    let floor = 0.75 * p95;
     let kept: Vec<f32> = on.into_iter().filter(|value| *value >= floor).collect();
     if kept.len() < 3 {
         f32::NAN

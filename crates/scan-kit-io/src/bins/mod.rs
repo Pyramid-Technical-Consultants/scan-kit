@@ -851,7 +851,7 @@ pub(crate) fn bins(root: &Path, session_ids: &[String], options: &Value) -> Plot
         }
         // A menu-offered column the active grain never emits would draw an
         // empty category axis — fall back to the one column every grain has.
-        let x_column = if tables.iter().all(|table| !table.contains_key(x_column)) {
+        let x_column = if tables.iter().all(|table| !has_finite(table.get(x_column))) {
             "energy"
         } else {
             x_column
@@ -1233,6 +1233,7 @@ fn assemble_panel(
             &prepared.tables,
             &prepared.categories,
             group.id,
+            &item.key,
             x_column,
             glyph,
             prepared.xmin,
@@ -1574,13 +1575,18 @@ fn plotted_columns(
         }
     }
     want.extend([
-        "expected_sigma",
         "session_avg_rate",
         "rate_energy",
         "mu_rate",
         "energy",
         "beam_on",
     ]);
+    want.extend(
+        loaded
+            .keys()
+            .filter(|name| name.starts_with("expected_sigma"))
+            .map(String::as_str),
+    );
     let mut table = BTreeMap::new();
     for name in want {
         let Some(values) = loaded.get(name) else {
@@ -1596,8 +1602,9 @@ fn plotted_columns(
         let protect = extra_protect.contains(&name)
             || matches!(
                 name,
-                "beam_on" | "expected_sigma" | "session_avg_rate" | "rate_energy" | "mu_rate"
-            );
+                "beam_on" | "session_avg_rate" | "rate_energy" | "mu_rate"
+            )
+            || name.starts_with("expected_sigma");
         if let Some(mask) = &mask {
             if !protect {
                 for (value, keep) in values.iter_mut().zip(mask.iter()) {

@@ -86,15 +86,17 @@ fn scene(title: &str, panels: Vec<Panel>, controls: Vec<Control>) -> PlotScene {
 }
 
 fn panel(title: String, xmin: f32, xmax: f32, ymin: f32, ymax: f32, series: Vec<Series>) -> Panel {
-    let xmax = if (xmax - xmin).abs() < 1e-3 {
-        xmin + 1.0
+    // Only a truly degenerate axis needs a pad - and it belongs centered on
+    // the data, not glued to the panel edge.
+    let (xmin, xmax) = if xmax <= xmin {
+        (xmin - 0.5, xmax + 0.5)
     } else {
-        xmax
+        (xmin, xmax)
     };
-    let ymax = if (ymax - ymin).abs() < 1e-3 {
-        ymin + 1.0
+    let (ymin, ymax) = if ymax <= ymin {
+        (ymin - 0.5, ymax + 0.5)
     } else {
-        ymax
+        (ymin, ymax)
     };
     Panel {
         title,
