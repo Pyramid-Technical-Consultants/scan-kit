@@ -2353,7 +2353,9 @@ impl Plot {
     /// Draw one panel across the whole canvas. `None` is the grid.
     #[cfg_attr(not(any(test, target_arch = "wasm32")), allow(dead_code))]
     pub(crate) fn set_solo(&mut self, panel: Option<usize>) {
-        self.solo = panel;
+        // An index past the panel count would render nothing — treat it as
+        // no solo rather than a permanently blank canvas.
+        self.solo = panel.filter(|index| *index < self.panels.len());
     }
 
     /// Voxel under the crosshair. Empty when this picture has no dose.
@@ -2393,7 +2395,11 @@ impl Plot {
         if self.dose.is_none() {
             return String::new();
         }
-        let spec: serde_json::Value = serde_json::from_str(spec).unwrap_or(serde_json::Value::Null);
+        // A non-object spec is a caller error — applying auto defaults
+        // would silently reset the user's window/gain settings.
+        let Ok(spec @ serde_json::Value::Object(_)) = serde_json::from_str(spec) else {
+            return String::new();
+        };
         let text = |key: &str| spec.get(key).and_then(|value| value.as_str()).unwrap_or("");
         let level = spec.get("level").and_then(|value| {
             value
@@ -3948,7 +3954,15 @@ impl Plot {
             self.splice_cached_lines(previous);
             return Ok(());
         }
-        if let Some(bytes) = stitched_line_bytes(previous, offset as usize, &suffix) {
+        let stitched = stitched_line_bytes(previous, offset as usize, &suffix).or_else(|| {
+            // The previous adopt may have emptied encoded.lines into
+            // kept_line_buf before its first render — the spliced records
+            // still hold the prefix.
+            let mut bytes = encode_lines(&previous.marks.lines[..prefix]);
+            bytes.extend_from_slice(&suffix);
+            Some(bytes)
+        });
+        if let Some(bytes) = stitched {
             if let Some(encoded) = self.encoded.as_mut() {
                 encoded.lines = bytes;
             }
@@ -9453,6 +9467,26 @@ mod tests {
         assert_eq!(plot.row_weights, weights);
         assert_eq!(plot.cameras[0], home);
         assert_ne!(plot.cameras[4], line);
+    }
+
+    #[test]
+    fn an_out_of_range_solo_index_keeps_every_panel() {
+        // A garbage solo index must not filter every panel away — the canvas
+        // would stay blank forever with no way back.
+        let mut plot = Plot::new(&line_scene(), [0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0, 1.0]);
+        plot.set_solo(Some(usize::MAX));
+        assert!(!plot.layout(600, 480).is_empty());
+    }
+
+    #[test]
+    fn a_non_object_paint_spec_changes_nothing() {
+        // Malformed or non-object JSON must be rejected outright — parsing it
+        // as Null and applying defaults silently resets the scale.
+        let scene = dose_scene(4, vec![1.0; 64], 1, 0);
+        let mut plot = Plot::new(&scene, [0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0, 1.0]);
+        assert!(plot.paint("not json").is_empty());
+        assert!(plot.paint("[1,2]").is_empty());
+        assert!(!plot.paint("{}").is_empty());
     }
 
     #[test]
