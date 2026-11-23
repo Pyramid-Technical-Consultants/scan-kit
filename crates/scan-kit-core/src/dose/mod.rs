@@ -258,9 +258,15 @@ impl Volume {
     pub fn get(&self, x: usize, y: usize, z: usize) -> f32 {
         let [nx, ny, _] = self.shape;
         // values can be shorter than shape claims — the fields are pub —
-        // and a miss outside the grid is 0.
-        self.values
-            .get(x + nx * (y + ny * z))
+        // and a miss outside the grid is 0. The index math is checked so a
+        // huge shape wraps to a wrong in-bounds voxel rather than panicking.
+        let index = ny
+            .checked_mul(z)
+            .and_then(|yz| y.checked_add(yz))
+            .and_then(|yz| nx.checked_mul(yz))
+            .and_then(|xyz| x.checked_add(xyz));
+        index
+            .and_then(|index| self.values.get(index))
             .copied()
             .unwrap_or(0.0)
     }
@@ -291,7 +297,10 @@ impl Volume {
 
     pub fn axial(&self, z: usize) -> Vec<f32> {
         let [nx, ny, _] = self.shape;
-        let mut image = vec![0.0; nx * ny];
+        let Some(len) = nx.checked_mul(ny) else {
+            return Vec::new();
+        };
+        let mut image = vec![0.0; len];
         for y in 0..ny {
             for x in 0..nx {
                 image[x + nx * y] = self.get(x, y, z);
@@ -302,7 +311,10 @@ impl Volume {
 
     pub fn coronal(&self, y: usize) -> Vec<f32> {
         let [nx, _, nz] = self.shape;
-        let mut image = vec![0.0; nx * nz];
+        let Some(len) = nx.checked_mul(nz) else {
+            return Vec::new();
+        };
+        let mut image = vec![0.0; len];
         for z in 0..nz {
             for x in 0..nx {
                 image[x + nx * z] = self.get(x, y, z);
@@ -313,7 +325,10 @@ impl Volume {
 
     pub fn sagittal(&self, x: usize) -> Vec<f32> {
         let [_, ny, nz] = self.shape;
-        let mut image = vec![0.0; ny * nz];
+        let Some(len) = ny.checked_mul(nz) else {
+            return Vec::new();
+        };
+        let mut image = vec![0.0; len];
         for z in 0..nz {
             for y in 0..ny {
                 image[y + ny * z] = self.get(x, y, z);
@@ -328,8 +343,10 @@ impl Volume {
         let nz = self.shape[2];
         let dz = self.axis(2);
         let face = self.origin[2] + nz as f32 * dz;
-        let mut depth = Vec::with_capacity(nz);
-        let mut dose = Vec::with_capacity(nz);
+        // A malformed pub shape can promise more cells than values holds —
+        // cap the reserve at what exists rather than at the claim.
+        let mut depth = Vec::with_capacity(nz.min(self.values.len()));
+        let mut dose = Vec::with_capacity(nz.min(self.values.len()));
         for z in (0..nz).rev() {
             let z_mm = self.origin[2] + (z as f32 + 0.5) * dz;
             depth.push(face - z_mm);
@@ -343,8 +360,8 @@ impl Volume {
         let nx = self.shape[0];
         let dx = self.axis(0);
         let x0 = self.origin[0] + (x as f32 + 0.5) * dx;
-        let mut xs = Vec::with_capacity(nx);
-        let mut dose = Vec::with_capacity(nx);
+        let mut xs = Vec::with_capacity(nx.min(self.values.len()));
+        let mut dose = Vec::with_capacity(nx.min(self.values.len()));
         for column in 0..nx {
             xs.push(self.origin[0] + (column as f32 + 0.5) * dx - x0);
             dose.push(self.get(column, y, z));
@@ -357,8 +374,8 @@ impl Volume {
         let nz = self.shape[2];
         let dz = self.axis(2);
         let z0 = self.origin[2] + (z as f32 + 0.5) * dz;
-        let mut xs = Vec::with_capacity(nz);
-        let mut dose = Vec::with_capacity(nz);
+        let mut xs = Vec::with_capacity(nz.min(self.values.len()));
+        let mut dose = Vec::with_capacity(nz.min(self.values.len()));
         for depth in 0..nz {
             let z_mm = self.origin[2] + (depth as f32 + 0.5) * dz;
             xs.push(z0 - z_mm);
@@ -373,8 +390,8 @@ impl Volume {
         let area = self.axis(0) * self.axis(1);
         let dz = self.axis(2);
         let face = self.origin[2] + nz as f32 * dz;
-        let mut depth = Vec::with_capacity(nz);
-        let mut dose = Vec::with_capacity(nz);
+        let mut depth = Vec::with_capacity(nz.min(self.values.len()));
+        let mut dose = Vec::with_capacity(nz.min(self.values.len()));
         for z in (0..nz).rev() {
             let mut sum = 0.0;
             for x in 0..nx {
@@ -391,8 +408,8 @@ impl Volume {
         let area = self.axis(1) * self.axis(2);
         let dx = self.axis(0);
         let x0 = self.origin[0] + (x as f32 + 0.5) * dx;
-        let mut xs = Vec::with_capacity(nx);
-        let mut dose = Vec::with_capacity(nx);
+        let mut xs = Vec::with_capacity(nx.min(self.values.len()));
+        let mut dose = Vec::with_capacity(nx.min(self.values.len()));
         for column in 0..nx {
             let mut sum = 0.0;
             for y in 0..ny {
@@ -409,7 +426,10 @@ impl Volume {
         let [nx, ny, nz] = self.shape;
         match plane {
             1 => {
-                let mut image = vec![0.0; nx * nz];
+                let mut image = vec![0.0; nx.checked_mul(nz).unwrap_or(0)];
+                if image.len() < nx.saturating_mul(nz) {
+                    return (image, nx, nz);
+                }
                 for z in 0..nz {
                     for x in 0..nx {
                         let mut sum = 0.0;
@@ -422,7 +442,10 @@ impl Volume {
                 (image, nx, nz)
             }
             2 => {
-                let mut image = vec![0.0; ny * nz];
+                let mut image = vec![0.0; ny.checked_mul(nz).unwrap_or(0)];
+                if image.len() < ny.saturating_mul(nz) {
+                    return (image, ny, nz);
+                }
                 for z in 0..nz {
                     for y in 0..ny {
                         let mut sum = 0.0;
@@ -435,7 +458,10 @@ impl Volume {
                 (image, ny, nz)
             }
             _ => {
-                let mut image = vec![0.0; nx * ny];
+                let mut image = vec![0.0; nx.checked_mul(ny).unwrap_or(0)];
+                if image.len() < nx.saturating_mul(ny) {
+                    return (image, nx, ny);
+                }
                 for y in 0..ny {
                     for x in 0..nx {
                         let mut sum = 0.0;

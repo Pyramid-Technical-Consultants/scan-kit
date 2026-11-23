@@ -45,4 +45,4 @@ native-tls = { version = "0.2", features = ["vendored"] }
 ssh2 = { version = "0.9.7", features = ["vendored-openssl"] }
 
 [package.metadata.cargo-machete]
-ignored = ["native-tls"]
+ignored = ["native-tls", "md-5"]

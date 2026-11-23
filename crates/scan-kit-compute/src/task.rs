@@ -248,7 +248,19 @@ pub fn poll_task(id: u64) -> Result<Vec<u8>, String> {
         scan_kit_io::clear_slice();
         Poll::Failed("task panicked".into())
     });
-    let mut report = stage.report();
+    let report = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| stage.report()));
+    let (outcome, mut report) = match report {
+        Ok(report) => (outcome, report),
+        Err(_) => {
+            // A panicking report must end the task — re-parking it would leave
+            // stage=None and every later poll would fabricate Pending forever.
+            scan_kit_io::clear_slice();
+            (
+                Poll::Failed("task panicked".into()),
+                ended(id, generation, Phase::Failed, "task panicked"),
+            )
+        }
+    };
     report.task = id;
     report.generation = generation;
     let (finished, payload, remove) = match outcome {
@@ -280,11 +292,10 @@ pub fn poll_task(id: u64) -> Result<Vec<u8>, String> {
         ));
     };
     if current != generation {
-        if let Some(task) = driver.tasks.get_mut(&id) {
-            task.last_report = Some(report.clone());
-            task.stage = Some(stage);
-        }
         drop(driver);
+        // This poll's stage belongs to the superseded generation — parking it
+        // would clobber the successor's stage and re-publish stale work.
+        drop(stage);
         return Ok(encode_poll(
             &ended(id, generation, Phase::Cancelled, ""),
             None,
@@ -308,15 +319,26 @@ pub fn poll_task(id: u64) -> Result<Vec<u8>, String> {
     Ok(encode_poll(&report, payload.as_deref(), finished))
 }
 
-pub fn cancel_task(id: u64) {
+/// Cancel a task. `generation`, when given, makes a stale caller's cancel a
+/// no-op — retargets reuse the task id, so an id alone cannot distinguish the
+/// superseded ticket from its successor.
+pub fn cancel_task(id: u64, generation: Option<u64>) {
     // Same rule as start_task: the stage drop may join a worker mid-drain.
     let removed = {
         let mut driver = lock();
-        if let Some(task) = driver.tasks.get(&id) {
-            task.cancel.cancel();
+        let stale = driver
+            .tasks
+            .get(&id)
+            .is_some_and(|task| generation.is_some_and(|gen| task.generation != gen));
+        if stale {
+            None
+        } else {
+            if let Some(task) = driver.tasks.get(&id) {
+                task.cancel.cancel();
+            }
+            driver.clear(id);
+            driver.tasks.remove(&id)
         }
-        driver.clear(id);
-        driver.tasks.remove(&id)
     };
     drop(removed);
 }
@@ -2594,7 +2616,7 @@ mod tests {
         );
         let next = second["task"].as_u64().unwrap();
         assert_ne!(next, id);
-        cancel_task(next);
+        cancel_task(next, None);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -2656,7 +2678,7 @@ mod tests {
         assert!(driver.tasks.contains_key(&second["task"].as_u64().unwrap()));
         assert!(driver.plot.is_none());
         drop(driver);
-        cancel_task(second["task"].as_u64().unwrap());
+        cancel_task(second["task"].as_u64().unwrap(), None);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -2813,7 +2835,7 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(100));
         }
-        cancel_task(id);
+        cancel_task(id, None);
     }
 
     #[test]
@@ -2920,5 +2942,79 @@ mod tests {
         remember_stamps(&[second.to_owned()]);
         let seen = seen_stamps().lock().unwrap_or_else(|err| err.into_inner());
         assert_eq!(seen.get(stamp_id(first)), Some(&second.to_owned()));
+    }
+
+    #[test]
+    fn a_panicking_report_ends_the_task_instead_of_parking_it() {
+        // report() runs outside the poll guard in the bugged code — a panic
+        // there left stage=None and every later poll fabricated Pending.
+        struct Panic;
+        impl Stage for Panic {
+            fn poll(&mut self, _budget: Duration, _cancel: &Cancel) -> Poll<Vec<u8>> {
+                Poll::Pending {
+                    report: report_at(Phase::Scene, 0, 1),
+                    preview: None,
+                }
+            }
+            fn report(&self) -> Report {
+                panic!("inside the report");
+            }
+        }
+        let id = {
+            let mut driver = lock();
+            let id = driver.next;
+            driver.next = driver.next.saturating_add(1);
+            driver.tasks.insert(
+                id,
+                Running {
+                    generation: 1,
+                    cancel: Cancel::new(),
+                    stage: Some(Box::new(Panic)),
+                    last_report: None,
+                },
+            );
+            id
+        };
+        let report = poll_report(&poll_task(id).unwrap());
+        assert_eq!(report["phase"], "failed");
+        assert_eq!(report["finished"], true);
+        assert!(!lock().tasks.contains_key(&id));
+    }
+
+    #[test]
+    fn a_stale_generations_cancel_leaves_the_successor() {
+        // Retargets reuse the task id — a superseded ticket's cancel must not
+        // kill the generation it no longer owns.
+        struct Idle;
+        impl Stage for Idle {
+            fn poll(&mut self, _budget: Duration, _cancel: &Cancel) -> Poll<Vec<u8>> {
+                Poll::Pending {
+                    report: report_at(Phase::Scene, 0, 1),
+                    preview: None,
+                }
+            }
+            fn report(&self) -> Report {
+                report_at(Phase::Scene, 0, 1)
+            }
+        }
+        let id = {
+            let mut driver = lock();
+            let id = driver.next;
+            driver.next = driver.next.saturating_add(1);
+            driver.tasks.insert(
+                id,
+                Running {
+                    generation: 2,
+                    cancel: Cancel::new(),
+                    stage: Some(Box::new(Idle)),
+                    last_report: None,
+                },
+            );
+            id
+        };
+        cancel_task(id, Some(1));
+        assert!(lock().tasks.contains_key(&id), "stale cancel ran");
+        cancel_task(id, Some(2));
+        assert!(!lock().tasks.contains_key(&id), "owner cancel missed");
     }
 }

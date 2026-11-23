@@ -304,6 +304,17 @@ pub fn analytic_on(
     );
     let floor = (phantom_mm > 0.0).then_some(-phantom_mm);
     let (origin, shape, v) = if let Some((origin, shape, voxel)) = grid {
+        // A caller grid follows the same volume budget dose_grid's window can
+        // reach — an unrepresentable or oversized product becomes an empty
+        // volume rather than an allocation failure.
+        let cells = shape
+            .iter()
+            .try_fold(1usize, |acc, side| acc.checked_mul(*side));
+        let shape = if cells.is_some_and(|cells| cells <= MAX_CELLS.pow(3)) {
+            shape
+        } else {
+            [0, 0, 0]
+        };
         (origin, shape, voxel.clamp(0.25, 10.0))
     } else {
         let (origin, shape) = dose_grid(&spots, voxel_mm, floor);
@@ -355,7 +366,10 @@ fn deposit_lattice(
     scale: Option<f32>,
 ) -> Vec<f32> {
     let [nx, ny, nz] = shape;
-    let mut values = vec![0.0f32; nx.saturating_mul(ny).saturating_mul(nz)];
+    let Some(cells) = nx.checked_mul(ny).and_then(|n| n.checked_mul(nz)) else {
+        return Vec::new();
+    };
+    let mut values = vec![0.0f32; cells];
     if nx == 0 || ny == 0 || nz == 0 {
         return values;
     }
@@ -1186,6 +1200,12 @@ pub(super) fn accumulate_planes(
     dose_mode: bool,
 ) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
     let [nx, ny, nz] = shape;
+    // The three plane buffers are pair products of a shape the caller picks —
+    // overflow becomes empty planes, not an allocation failure.
+    let products = (nx.checked_mul(ny), nx.checked_mul(nz), ny.checked_mul(nz));
+    let (Some(ax), Some(co), Some(sa)) = products else {
+        return (Vec::new(), Vec::new(), Vec::new());
+    };
     let workers = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1)
@@ -1198,9 +1218,9 @@ pub(super) fn accumulate_planes(
     let size = spots.len().div_ceil(parts);
     let chunks: Vec<_> = spots.chunks(size.max(1)).collect();
     if chunks.len() <= 1 {
-        let mut axial = vec![0.0; nx * ny];
-        let mut coronal = vec![0.0; nx * nz];
-        let mut sagittal = vec![0.0; ny * nz];
+        let mut axial = vec![0.0; ax];
+        let mut coronal = vec![0.0; co];
+        let mut sagittal = vec![0.0; sa];
         paint_planes(
             kernel,
             spots,
@@ -1219,9 +1239,9 @@ pub(super) fn accumulate_planes(
         let mut joins = Vec::with_capacity(chunks.len());
         for chunk in chunks {
             joins.push(scope.spawn(move || {
-                let mut axial = vec![0.0; nx * ny];
-                let mut coronal = vec![0.0; nx * nz];
-                let mut sagittal = vec![0.0; ny * nz];
+                let mut axial = vec![0.0; ax];
+                let mut coronal = vec![0.0; co];
+                let mut sagittal = vec![0.0; sa];
                 paint_planes(
                     kernel,
                     chunk,
@@ -1990,5 +2010,45 @@ mod tests {
     fn scatter_on_a_zero_axis_returns_empty() {
         // values[0] on an empty buffer used to panic.
         assert!(scatter_planes([0, 2, 2], [0, 0, 0], &[], &[], &[]).is_empty());
+    }
+
+    #[test]
+    fn a_caller_grid_past_the_volume_budget_is_empty() {
+        let pencil = Pencil {
+            x: 0.0,
+            y: 0.0,
+            sx: 4.0,
+            sy: 4.0,
+            energy: 160.0,
+            amount: 1.0,
+        };
+        let wide = analytic_on(
+            WATER,
+            &[pencil],
+            Quantity::Dose,
+            1.0,
+            0.0,
+            0.0,
+            1.0,
+            2.0e-8,
+            10.0,
+            Some(([0.0, 0.0, 0.0], [usize::MAX, 2, 2], 1.0)),
+            None,
+        );
+        assert!(wide.values.is_empty());
+        let too_big = analytic_on(
+            WATER,
+            &[pencil],
+            Quantity::Dose,
+            1.0,
+            0.0,
+            0.0,
+            1.0,
+            2.0e-8,
+            10.0,
+            Some(([0.0, 0.0, 0.0], [513, 513, 513], 1.0)),
+            None,
+        );
+        assert!(too_big.values.is_empty());
     }
 }

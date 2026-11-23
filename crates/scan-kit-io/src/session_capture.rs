@@ -481,6 +481,7 @@ pub fn capture(
             )?;
             if device.name == "RCI" {
                 write_text(&run_dir.join("RCI_map.csv"), &csv_text(sheet))?;
+                count += 1;
             }
             count += 1;
         }
@@ -957,13 +958,20 @@ fn write_input_map(
             if let Some(spot) =
                 rci_spot.filter(|spot| !extra.is_empty() && spot.rows.len() >= sheet.rows.len())
             {
-                let names: Vec<String> = extra.iter().map(|i| spot.header[*i].clone()).collect();
+                // Same normalization the other export paths apply — a suffixed
+                // header would write `spot_no(x)` for a column readers look up
+                // as `spot_no`.
+                let names: Vec<String> = extra
+                    .iter()
+                    .map(|i| base_name(&spot.header[*i]).to_owned())
+                    .collect();
                 // Pad short rows first — flexible parsing leaves them under the
                 // header length, and pushing the new cells there would land them
-                // in the wrong columns.
+                // in the wrong columns. Truncate over-long rows the same way.
                 let columns = sheet.header.len();
                 sheet.header.extend(names);
                 for (index, row) in sheet.rows.iter_mut().enumerate() {
+                    row.truncate(columns);
                     row.resize(columns, String::new());
                     for col in &extra {
                         row.push(
@@ -1041,7 +1049,7 @@ fn write_session_meta(
 fn num_text(value: f64) -> String {
     let text = format!("{value:.6}");
     let trimmed = text.trim_end_matches('0').trim_end_matches('.');
-    if trimmed.is_empty() || trimmed == "-" {
+    if trimmed.is_empty() || trimmed == "-" || trimmed == "-0" {
         "0".into()
     } else {
         trimmed.to_owned()
@@ -1346,6 +1354,7 @@ fn fetch_aux(
                 if !bytes.is_empty() {
                     if device.name == "RCI" {
                         write_bytes(&dir.join("SessionLogFile.log"), &bytes)?;
+                        count += 1;
                     }
                     write_bytes(
                         &dir.join("log").join(format!("{}.log", device.name)),
@@ -1778,5 +1787,13 @@ mod tests {
         // back as an extra row.
         assert_eq!(line.lines().count(), 1);
         assert_eq!(quoted("x\ny"), "x y");
+    }
+
+    #[test]
+    fn num_text_never_prints_negative_zero() {
+        // -0.0000004 formats as -0.000000 and trims to -0 — a backward
+        // device timestamp must not write "-0 seconds" into the summary.
+        assert_eq!(num_text(-1e-7), "0");
+        assert_eq!(num_text(319.494), "319.494");
     }
 }

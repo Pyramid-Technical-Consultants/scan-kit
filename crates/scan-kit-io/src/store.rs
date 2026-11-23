@@ -555,17 +555,29 @@ pub fn data_dirs(conn: &Connection) -> Result<Vec<String>, String> {
 }
 
 pub fn forget_data_dir(conn: &Connection, root: &str) -> Result<(), String> {
-    let mut dirs = data_dirs(conn)?;
-    dirs.retain(|dir| dir != root);
-    prefs_set(conn, PREF_DATA_DIRS, &json!(dirs))?;
-    if last_data_dir(conn)?.as_deref() == Some(root) {
-        prefs_set(
-            conn,
-            PREF_LAST_DATA_DIR,
-            &json!(dirs.first().cloned().unwrap_or_default()),
-        )?;
+    // The read-modify-write must hold a write lock across processes — another
+    // process's commit between the read and the prefs_set would be silently
+    // overwritten (a library vanishing from the catalog).
+    conn.execute_batch("BEGIN IMMEDIATE")
+        .map_err(|err| err.to_string())?;
+    let result = (|| {
+        let mut dirs = data_dirs(conn)?;
+        dirs.retain(|dir| dir != root);
+        prefs_set(conn, PREF_DATA_DIRS, &json!(dirs))?;
+        if last_data_dir(conn)?.as_deref() == Some(root) {
+            prefs_set(
+                conn,
+                PREF_LAST_DATA_DIR,
+                &json!(dirs.first().cloned().unwrap_or_default()),
+            )?;
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = conn.execute_batch("ROLLBACK");
+        return result;
     }
-    Ok(())
+    conn.execute_batch("COMMIT").map_err(|err| err.to_string())
 }
 
 fn string_list(value: &Value) -> Vec<String> {
@@ -1394,6 +1406,22 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 0);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn forget_data_dir_commits_the_whole_update() {
+        // The read-modify-write runs under BEGIN IMMEDIATE — the catalog list
+        // and the last-dir pointer must move together.
+        let path = temp_db("forget");
+        let conn = open_connection(&path).unwrap();
+        remember_data_dir(&conn, "/one").unwrap();
+        remember_data_dir(&conn, "/two").unwrap();
+        forget_data_dir(&conn, "/two").unwrap();
+        assert_eq!(data_dirs(&conn).unwrap(), vec!["/one".to_owned()]);
+        assert_eq!(last_data_dir(&conn).unwrap().as_deref(), Some("/one"));
+        forget_data_dir(&conn, "/one").unwrap();
+        assert!(data_dirs(&conn).unwrap().is_empty());
         let _ = std::fs::remove_file(&path);
     }
 }

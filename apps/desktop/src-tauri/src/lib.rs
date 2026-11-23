@@ -150,8 +150,8 @@ async fn scan_kit_poll(task: u64) -> Result<tauri::ipc::Response, String> {
 }
 
 #[tauri::command]
-async fn scan_kit_cancel(task: u64) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || scan_kit_compute::cancel_task(task))
+async fn scan_kit_cancel(task: u64, generation: Option<u64>) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || scan_kit_compute::cancel_task(task, generation))
         .await
         .map_err(|err| err.to_string())
 }

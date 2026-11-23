@@ -20,8 +20,13 @@ pub fn resample_linear(
         if x < 0 || y < 0 || z < 0 || x >= nx as isize || y >= ny as isize || z >= nz as isize {
             return 0.0;
         }
-        values
-            .get(x as usize + nx * (y as usize + ny * z as usize))
+        // The source shape is caller-supplied — a wrapped flat index could
+        // sample the wrong in-bounds voxel, not just miss.
+        ny.checked_mul(z as usize)
+            .and_then(|yz| (y as usize).checked_add(yz))
+            .and_then(|yz| nx.checked_mul(yz))
+            .and_then(|xyz| (x as usize).checked_add(xyz))
+            .and_then(|index| values.get(index))
             .copied()
             .unwrap_or(0.0)
     };
@@ -143,5 +148,24 @@ mod tests {
             [usize::MAX, 2, 2],
         );
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn a_wrapped_source_index_reads_zero_not_a_stray_voxel() {
+        // src_shape is caller-supplied — the flat index can overflow usize and
+        // wrap into a real buffer offset.
+        let out = resample_linear(
+            &[1.0f32; 4],
+            [0.0; 3],
+            [1e-20; 3],
+            [usize::MAX, usize::MAX, 1],
+            [0.0; 3],
+            [1.0; 3],
+            [2, 2, 2],
+        );
+        assert_eq!(out.len(), 8);
+        // Out-of-range samples weigh NaN; the wrapped index must contribute 0,
+        // never a stray in-bounds voxel.
+        assert!(out.iter().all(|v| v.is_nan() || *v == 0.0), "{out:?}");
     }
 }

@@ -166,8 +166,8 @@ pub fn count_grid(
     cols: usize,
     rows: usize,
 ) -> Vec<f32> {
-    let mut counts = vec![0.0f32; cols.saturating_mul(rows)];
-    if cols == 0 || rows == 0 {
+    let mut counts = vec![0.0f32; cols.checked_mul(rows).unwrap_or(0)];
+    if counts.is_empty() {
         return counts;
     }
     let dx = x1 - x0;
@@ -631,5 +631,11 @@ mod tests {
         let ys = vec![0.0f32, 1.0, 2.0];
         let counts = count_grid(&xs, &ys, f32::NEG_INFINITY, f32::INFINITY, 0.0, 1.0, 4, 4);
         assert!(counts.iter().all(|count| *count == 0.0));
+    }
+
+    #[test]
+    fn a_huge_grid_returns_empty_counts() {
+        // cols * rows is caller-chosen — overflow must not allocate or index.
+        assert!(count_grid(&[0.5], &[0.5], 0.0, 1.0, 0.0, 1.0, usize::MAX, 2).is_empty());
     }
 }

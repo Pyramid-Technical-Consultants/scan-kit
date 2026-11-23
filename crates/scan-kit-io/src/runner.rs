@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -46,6 +46,14 @@ struct Live {
 
 static LIVE: Mutex<Option<Live>> = Mutex::new(None);
 static EPOCH: AtomicU64 = AtomicU64::new(0);
+/// One upload at a time — two concurrent uploads PUT to the same device path
+/// and the loser's set_field can command the winner's file.
+static UPLOAD_BUSY: AtomicBool = AtomicBool::new(false);
+/// One connect at a time, and any disconnect during the open phase must land —
+/// the open phase runs unlocked for seconds, so a no-op disconnect that the
+/// install then overwrites leaves a session nobody asked for.
+static CONNECT_BUSY: AtomicBool = AtomicBool::new(false);
+static DISCONNECTS: AtomicU64 = AtomicU64::new(0);
 
 pub fn catalog(db: &Path) -> Value {
     let (host, file_dir) = with_store(db, |conn| store::runner_settings(conn))
@@ -80,9 +88,27 @@ pub fn catalog(db: &Path) -> Value {
     body
 }
 
+/// Releases a busy flag on drop, including the panic path.
+struct BusyFlag(&'static AtomicBool);
+
+impl Drop for BusyFlag {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+fn acquire(flag: &'static AtomicBool, busy: &str) -> Result<BusyFlag, String> {
+    if flag.swap(true, Ordering::Acquire) {
+        return Err(busy.into());
+    }
+    Ok(BusyFlag(flag))
+}
+
 pub fn connect(db: &Path, host: &str) -> Result<Value, String> {
+    let _connect = acquire(&CONNECT_BUSY, "a connect is already in progress")?;
     let host = parse_host(host)?;
     disconnect();
+    let generation = DISCONNECTS.load(Ordering::Acquire);
     let mut socket = open_socket(&host)?;
     send(&mut socket, "config", Some(config_body()))?;
     let status = read_paths(&mut socket, STATUS_PATHS, Duration::from_secs(8))?;
@@ -99,6 +125,11 @@ pub fn connect(db: &Path, host: &str) -> Result<Value, String> {
         .filter(|path| path.is_file());
     {
         let mut guard = lock();
+        // A disconnect (or a queued connect's own disconnect) ran during the
+        // open phase — it must not be overwritten by this install.
+        if DISCONNECTS.load(Ordering::Acquire) != generation {
+            return Err("connection changed".into());
+        }
         *guard = Some(Live {
             epoch: EPOCH.fetch_add(1, Ordering::Relaxed) + 1,
             host: host.clone(),
@@ -122,6 +153,7 @@ pub fn connect(db: &Path, host: &str) -> Result<Value, String> {
 }
 
 pub fn disconnect() {
+    DISCONNECTS.fetch_add(1, Ordering::AcqRel);
     // The close frame can block on a half-dead peer for the write timeout —
     // drop the LIVE guard first or every serialized call stalls behind it.
     let live = lock().take();
@@ -152,6 +184,7 @@ pub fn read_status(has_plan: bool, dest: &str) -> Result<Value, String> {
 }
 
 pub fn upload(db: &Path, csv_path: &Path) -> Result<Value, String> {
+    let _upload = acquire(&UPLOAD_BUSY, "an upload is already in progress")?;
     if !csv_path.is_file() {
         return Err(format!("CSV not found: {}", csv_path.display()));
     }
@@ -237,6 +270,11 @@ pub fn upload(db: &Path, csv_path: &Path) -> Result<Value, String> {
         });
     }
     let mut body = read_status(true, "")?;
+    // A reconnect during read_status would attach "Plan uploaded" to the new
+    // device's view — the epoch check must run after the final HTTP window.
+    if lock().as_ref().map(|live| live.epoch) != Some(epoch) {
+        return Err("connection changed".into());
+    }
     body["target"] = json!(target);
     body["message"] = json!(format!("Plan uploaded to {target}."));
     Ok(body)
@@ -1446,5 +1484,26 @@ mod tests {
         assert_eq!(unpack_blob(Some(1), &[0u8; 10]), None);
         assert_eq!(unpack_blob(Some(2), &[0u8; 10]), None);
         assert_eq!(unpack_blob(Some(1), &[0, 0, 128, 63]), Some(vec![1.0]));
+    }
+
+    #[test]
+    fn busy_flags_reject_a_second_connect_or_upload() {
+        // Two concurrent uploads would PUT to the same device path and both
+        // report success for different files — the flags must single-flight.
+        let upload = acquire(&UPLOAD_BUSY, "an upload is already in progress").unwrap();
+        assert!(acquire(&UPLOAD_BUSY, "an upload is already in progress").is_err());
+        drop(upload);
+        let connect = acquire(&CONNECT_BUSY, "a connect is already in progress").unwrap();
+        assert!(acquire(&CONNECT_BUSY, "a connect is already in progress").is_err());
+        drop(connect);
+    }
+
+    #[test]
+    fn a_disconnect_marks_a_connect_in_flight() {
+        // A disconnect during the open phase must land — the generation the
+        // connect snapshotted at entry can no longer match at install time.
+        let before = DISCONNECTS.load(Ordering::Acquire);
+        disconnect();
+        assert!(DISCONNECTS.load(Ordering::Acquire) > before);
     }
 }

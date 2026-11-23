@@ -223,7 +223,9 @@ it("draws checks and forwards clicks, notes, and the menu", async () => {
     editor?.onCellContextMenu([0, 9], { ...point, bounds: { x: 1, y: 1 }, localEventX: 0, localEventY: 0 });
     editor?.onGridSelectionChange(selection);
   });
-  expect(checks).toContain("s2");
+  // toContain cannot catch a missing justToggled guard — the two dbl-clicks
+  // would each append "s2" again. Pin the exact calls.
+  expect(checks).toEqual(["s2"]);
   expect(notes).toEqual(["next"]);
   expect(menus).toEqual([13]);
   expect(sorts).toEqual(["date"]);

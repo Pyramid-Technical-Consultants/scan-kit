@@ -866,24 +866,52 @@ fn open_library_keep(
     let exams = found.exams;
     let skipped = found.skipped;
     let walk_failed = found.walk_failed;
-    let tx = conn.transaction().map_err(|err| err.to_string())?;
-    let lib_id = prepare_library(&tx, &root)?;
-    let ids = places
-        .iter()
-        .map(|(session_id, _)| session_id.clone())
-        .collect::<HashSet<_>>();
-    if !walk_failed {
-        // A partial listing must not look like every session was deleted.
-        delete_missing(&tx, lib_id, &ids)?;
-    }
     let total = found.entries.len() as u64;
+    let (lib_id, pending) = {
+        // Two phases: the write transaction covers the row-sync decisions only.
+        // hydrate does file/network IO — inside the transaction a remote
+        // library could hold the write lock for minutes and every other
+        // process's write (a note, window geometry) would hit busy_timeout.
+        // record_meta afterwards autocommits per entry, and a checked=0 row
+        // left by a cancel rehydrates on the next sync.
+        let tx = conn.transaction().map_err(|err| err.to_string())?;
+        let lib_id = prepare_library(&tx, &root)?;
+        let ids = places
+            .iter()
+            .map(|(session_id, _)| session_id.clone())
+            .collect::<HashSet<_>>();
+        if !walk_failed {
+            // A partial listing must not look like every session was deleted.
+            delete_missing(&tx, lib_id, &ids)?;
+        }
+        let exam_ids = exams
+            .iter()
+            .map(|exam| exam.study_uid.clone())
+            .collect::<HashSet<_>>();
+        if !walk_failed {
+            delete_missing_exams(&tx, lib_id, &exam_ids)?;
+        }
+        for exam in &exams {
+            upsert_exam(&tx, lib_id, exam)?;
+        }
+        remember_data_dir(&tx, &root)?;
+        backfill_blank_notes(&tx, lib_id, Path::new(&root))?;
+        let mut pending = HashSet::new();
+        for (index, entry) in found.entries.iter().enumerate() {
+            if let Cache::Hydrate = sync_entry(&tx, lib_id, entry)? {
+                pending.insert(index);
+            }
+        }
+        tx.commit().map_err(|err| err.to_string())?;
+        (lib_id, pending)
+    };
     if !keep(0, total, None) {
         return Err("cancelled".into());
     }
-    for (index, entry) in found.entries.into_iter().enumerate() {
-        if let Cache::Hydrate = sync_entry(&tx, lib_id, &entry)? {
-            let (meta, readable) = hydrate(&entry);
-            record_meta(&tx, lib_id, &entry, meta.as_ref(), readable)?;
+    for (index, entry) in found.entries.iter().enumerate() {
+        if pending.contains(&index) {
+            let (meta, readable) = hydrate(entry);
+            record_meta(conn, lib_id, entry, meta.as_ref(), readable)?;
         }
         let done = (index as u64) + 1;
         // library_rows lists everything indexed so far — per entry that is
@@ -892,7 +920,7 @@ fn open_library_keep(
         let preview = if index % 16 == 0 {
             Some(json!({
                 "root": root,
-                "rows": library_rows(&tx, lib_id)?,
+                "rows": library_rows(conn, lib_id)?,
                 "selected": [],
             }))
         } else {
@@ -902,21 +930,8 @@ fn open_library_keep(
             return Err("cancelled".into());
         }
     }
-    let exam_ids = exams
-        .iter()
-        .map(|exam| exam.study_uid.clone())
-        .collect::<HashSet<_>>();
-    if !walk_failed {
-        delete_missing_exams(&tx, lib_id, &exam_ids)?;
-    }
-    for exam in &exams {
-        upsert_exam(&tx, lib_id, exam)?;
-    }
-    remember_data_dir(&tx, &root)?;
-    backfill_blank_notes(&tx, lib_id, Path::new(&root))?;
-    let rows = library_rows(&tx, lib_id)?;
-    let selected = store::selected_session_ids(&tx, lib_id)?;
-    tx.commit().map_err(|err| err.to_string())?;
+    let rows = library_rows(conn, lib_id)?;
+    let selected = store::selected_session_ids(conn, lib_id)?;
     location::replace_sessions(&root, &places);
     publish_catalog(conn)?;
     Ok(

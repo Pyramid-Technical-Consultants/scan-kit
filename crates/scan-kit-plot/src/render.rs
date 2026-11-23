@@ -2689,7 +2689,12 @@ impl Plot {
                             cloud.lo,
                             cloud.hi,
                         );
-                        heat_writes.push((index as usize, pixels));
+                        // heatmap_bytes returns empty for a degenerate
+                        // window — storing it would break the
+                        // len == cols*rows*4 invariant fill_quad_cpu indexes.
+                        if !pixels.is_empty() {
+                            heat_writes.push((index as usize, pixels));
+                        }
                     }
                     CloudStyle::Contour => {
                         let drawn = contour_in_frame(
@@ -2745,7 +2750,7 @@ impl Plot {
         self.panels
             .get(index)
             .is_some_and(|panel| panel.x_label.is_empty())
-            && index + (self.side as usize) < self.panels.len()
+            && index.saturating_add(self.side as usize) < self.panels.len()
     }
 
     #[cfg_attr(not(any(test, target_arch = "wasm32")), allow(dead_code))]
@@ -7863,7 +7868,10 @@ fn stroke_cpu(
             }
         }
         let span = ((d[0].abs().max(d[1].abs())) * (t1 - t0)) as i32;
-        let steps = span.max(1);
+        // An endpoint projecting to ±inf leaves t=[0,1] and span=inf — a
+        // clipped line never needs more samples than the padded box.
+        let limit = ((bx_hi - bx_lo) + (by_hi - by_lo) + 8.0) as i32;
+        let steps = span.clamp(1, limit.max(1));
         for step in 0..=steps {
             let t = t0 + (t1 - t0) * step as f32 / steps as f32;
             disc_cpu(
@@ -12720,5 +12728,22 @@ mod tests {
         assert!(heatmap_bytes(&[1.0], 5000, 1, 0, [1.0; 4], 0.0, 2.0).is_empty());
         assert!(heatmap_bytes(&[1.0], 1, 5000, 0, [1.0; 4], 0.0, 2.0).is_empty());
         assert!(!heatmap_bytes(&[1.0], 1, 1, 0, [1.0; 4], 0.0, 2.0).is_empty());
+    }
+
+    #[test]
+    fn an_infinite_line_endpoint_cannot_walk_the_frame_forever() {
+        // A vertex at ±f32::MAX projects to ±inf — the stroke step count must
+        // be bounded by the clip box, not the projected span.
+        let mut scene = line_scene();
+        scene.panels[0].series = vec![Series::Polyline {
+            xs: vec![-3.0e38, 3.0e38],
+            ys: vec![5.0, 5.0],
+            color: [1.0; 4],
+            thickness: 1.5,
+        }];
+        let mut plot = Plot::new(&scene, [0.0; 4], [1.0; 4]);
+        let layout = plot.layout(320, 240);
+        let frame = plot.paint_cpu(320, 240, &layout);
+        assert_eq!(frame.len(), 320 * 240 * 4);
     }
 }
