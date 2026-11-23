@@ -853,12 +853,14 @@ fn store_growth(
 }
 
 fn extend_columns(base: &mut BTreeMap<String, Vec<f32>>, extra: BTreeMap<String, Vec<f32>>) {
-    let width = base.get("energy").map(Vec::len).unwrap_or(0);
-    let extra_energy = extra.get("energy").map(Vec::len).unwrap_or(0);
+    // The frame widths are the widest columns — merged timeslice frames
+    // carry no canonical "energy" column to key on.
+    let width = base.values().map(Vec::len).max().unwrap_or(0);
+    let extra_width = extra.values().map(Vec::len).max().unwrap_or(0);
     for (key, values) in extra {
         if let Some(have) = base.get_mut(&key) {
             have.extend(values);
-        } else if extra_energy > 0 && values.len() == extra_energy {
+        } else if extra_width > 0 && values.len() == extra_width {
             let mut padded = vec![f32::NAN; width];
             padded.extend(values);
             base.insert(key, padded);
@@ -3028,7 +3030,9 @@ fn chamber_axis(xml: &str, name: &str, sad: f32) -> Option<(f32, f32)> {
         .is_some_and(|text| text != "0" && !text.eq_ignore_ascii_case("false"));
     let sign = if reverse { -1.0 } else { 1.0 };
     let slope = sign * pitch * (sad / sdd);
-    let center = count / 2.0 - 0.5;
+    // Strips are 1-indexed 1..=count like the fitted axes — the center is
+    // (count + 1) / 2, not the 0-indexed midpoint.
+    let center = count / 2.0 + 0.5;
     Some((slope, offset - slope * center))
 }
 
@@ -3871,13 +3875,11 @@ fn header_named<'a>(sheet: &'a Sheet, requested: &str) -> Option<&'a str> {
         return Some(name);
     }
     let want = scan_kit_core::normalize_column_name(requested);
-    let mut found = None;
-    for name in sheet.num.keys() {
-        if scan_kit_core::normalize_column_name(name) == want {
-            found = Some(name.as_str());
-        }
-    }
-    found
+    sheet
+        .num
+        .keys()
+        .find(|name| scan_kit_core::normalize_column_name(name) == want)
+        .map(String::as_str)
 }
 
 pub(crate) fn column<'a>(sheet: &'a Sheet, concept: &str, extra: &[&str]) -> &'a [f32] {
@@ -3890,8 +3892,8 @@ pub(crate) fn column<'a>(sheet: &'a Sheet, concept: &str, extra: &[&str]) -> &'a
 fn column_any<'a>(sheet: &'a Sheet, names: &[&str]) -> Option<&'a [f32]> {
     names
         .iter()
-        .find_map(|name| sheet.num.get(*name))
-        .map(Vec::as_slice)
+        .find_map(|name| num_named(sheet, name))
+        .and_then(|name| sheet.num.get(name).map(Vec::as_slice))
 }
 
 pub(crate) fn same(a: f32, b: f32) -> bool {
@@ -3969,7 +3971,8 @@ pub(crate) fn spot_delivery_ms(timestamp: &[f64], layer: &[f32]) -> Vec<f32> {
     for indices in ordered {
         let first = timestamp[indices[0]];
         out[indices[0]] = match previous {
-            Some(last) => (first - last) as f32,
+            // Interleaved groups can overlap — clamp like overhead_time.
+            Some(last) => (first - last).max(0.0) as f32,
             None => first as f32,
         };
         for pair in indices.windows(2) {
@@ -3994,7 +3997,7 @@ fn parse_sigma_bands(xml: &str) -> Vec<Band> {
     while let Some(start) = rest.find('<') {
         rest = &rest[start + 1..];
         let tag = rest.split('>').next().unwrap_or("");
-        if tag.starts_with("device") {
+        if tag == "device" || tag.starts_with("device ") {
             if let Some(name) = xml_attr(tag, "name") {
                 device = name;
             }
@@ -4047,7 +4050,9 @@ fn expected_mm(bands: &[Band], device: &str, energy: f64) -> Option<f64> {
 }
 
 fn xml_attr(tag: &str, name: &str) -> Option<String> {
-    let key = format!("{name}=");
+    // Attributes are whitespace-separated — without the boundary "name="
+    // matches inside "long_name=".
+    let key = format!(" {name}=");
     let at = tag.find(&key)? + key.len();
     let rest = tag[at..].trim_start();
     let quote = rest.chars().next()?;
@@ -5622,7 +5627,13 @@ pub(crate) fn parse_datetime(text: &str) -> Option<f64> {
 }
 
 pub(crate) fn days_from_civil(mut year: i32, month: u32, day: u32) -> Option<i64> {
-    if !(1..=12).contains(&month) || day == 0 || day > days_in_month(year, month) {
+    // A |year| beyond a million is garbage input — reject it before the
+    // arithmetic, which overflows near i32::MIN.
+    if !(-1_000_000..=1_000_000).contains(&year)
+        || !(1..=12).contains(&month)
+        || day == 0
+        || day > days_in_month(year, month)
+    {
         return None;
     }
     if month <= 2 {
@@ -5665,6 +5676,81 @@ mod tests {
     fn slice_gate() -> &'static Mutex<()> {
         static GATE: OnceLock<Mutex<()>> = OnceLock::new();
         GATE.get_or_init(|| Mutex::new(()))
+    }
+
+    #[test]
+    fn an_extreme_year_is_rejected_before_the_civil_math() {
+        // i32::MIN overflows `year -= 1` — a garbage year must read as no
+        // date, not a panic (debug) or a wrapped day count (release).
+        assert_eq!(days_from_civil(i32::MIN, 1, 1), None);
+        assert_eq!(days_from_civil(-2_000_000_000, 6, 15), None);
+    }
+
+    #[test]
+    fn column_any_normalizes_headers_like_num_col() {
+        // A "(unit)"-suffixed gate header exact-missed while the geometry
+        // table's num_col found it — every sample then reported beam-on.
+        let mut num = BTreeMap::new();
+        num.insert("rci_in_trigger(ch)".to_owned(), vec![0.0, 1.0]);
+        let sheet = Sheet {
+            num,
+            ..empty_sheet()
+        };
+        assert!(column_any(&sheet, &["rci_in_trigger"]).is_some());
+    }
+
+    #[test]
+    fn header_named_and_num_named_agree_on_the_first_match() {
+        // Two stored headers can normalize identically — last-wins here
+        // and first-wins in num_named resolved to different columns.
+        let mut num = BTreeMap::new();
+        num.insert("r_ic1_x (ch)".to_owned(), vec![1.0]);
+        num.insert("r_ic1_x(ch)".to_owned(), vec![2.0]);
+        let sheet = Sheet {
+            num,
+            ..empty_sheet()
+        };
+        assert_eq!(
+            header_named(&sheet, "r_ic1_x"),
+            num_named(&sheet, "r_ic1_x")
+        );
+    }
+
+    #[test]
+    fn extend_columns_keeps_delta_only_columns_without_an_energy_frame() {
+        // merged_timeslice frames carry no "energy" column — the pad gate
+        // keyed on it, so a column first seen in the growth delta was
+        // dropped where a full rebuild keeps it.
+        let mut base = BTreeMap::new();
+        base.insert("ic1".to_owned(), vec![1.0, 2.0]);
+        let mut extra = BTreeMap::new();
+        extra.insert("ic1".to_owned(), vec![3.0]);
+        extra.insert("ic2".to_owned(), vec![4.0]);
+        extend_columns(&mut base, extra);
+        assert_eq!(base["ic1"], vec![1.0, 2.0, 3.0]);
+        let ic2 = &base["ic2"];
+        assert!(
+            ic2[0].is_nan() && ic2[1].is_nan() && ic2[2] == 4.0,
+            "{ic2:?}"
+        );
+    }
+
+    #[test]
+    fn xml_attr_needs_a_word_boundary() {
+        // "name=" bare-matched inside "long_name=" — the chamber key then
+        // never equalled a queried device and every sigma band went NaN.
+        let tag = "device long_name=\"IC One\" name=\"IC_1_X\"";
+        assert_eq!(xml_attr(tag, "name").as_deref(), Some("IC_1_X"));
+        let tag = "beam_sigma_conversions SIGMA_K0=\"9\" K0=\"1\"";
+        assert_eq!(xml_attr(tag, "K0").as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn interleaved_layers_do_not_report_negative_delivery() {
+        // Groups order by first stamp; an overlapping group's handoff
+        // gap used to go negative — a delivery time can't.
+        let got = spot_delivery_ms(&[1000.0, 1500.0, 2000.0], &[1.0, 2.0, 1.0]);
+        assert!(got.iter().all(|v| *v >= 0.0), "{got:?}");
     }
 
     #[test]

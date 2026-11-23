@@ -1433,7 +1433,10 @@ mod tests {
             .get("ic1_sig_x")
             .and_then(|values| values.first())
             .copied();
-        assert!(x.is_some_and(|value| value.abs() < 1e-2), "position {x:?}");
+        assert!(
+            x.is_some_and(|value| (value + 4.0).abs() < 1e-2),
+            "position {x:?}"
+        );
         assert!(
             sigma.is_some_and(|value| (value - 8.0).abs() < 1e-2),
             "sigma {sigma:?}"
