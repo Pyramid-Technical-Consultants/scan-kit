@@ -66,18 +66,19 @@ pub fn sig6(value: f64) -> String {
     if !value.is_finite() {
         return value.to_string();
     }
-    let exponent = value.abs().log10().floor() as i32;
+    // %g picks the notation from the exponent AFTER rounding — 999999.5
+    // rounds to 1e6, so the pre-round log10 can pick the wrong branch.
+    let text = format!("{value:.5e}");
+    let (mantissa, exp_text) = text.split_once('e').unwrap();
+    let exponent: i32 = exp_text.parse().unwrap_or(0);
     // printf %g prints scientific outside [1e-4, 1e6).
     if !(-4..6).contains(&exponent) {
-        let text = format!("{value:.5e}");
-        let (mantissa, exp) = text.split_once('e').unwrap();
-        let exp: i32 = exp.parse().unwrap_or(0);
         // Python %g exponents are signed and at least two digits (e+06/e-05).
         return format!(
             "{}e{}{:02}",
             mantissa.trim_end_matches('0').trim_end_matches('.'),
-            if exp < 0 { '-' } else { '+' },
-            exp.abs()
+            if exponent < 0 { '-' } else { '+' },
+            exponent.abs()
         );
     }
     let decimals = (5 - exponent).max(0) as usize;
@@ -809,6 +810,9 @@ mod tests {
         assert_eq!(sig6(1234567.0), "1.23457e+06");
         assert_eq!(sig6(1e-5), "1e-05");
         assert_eq!(sig6(0.5), "0.5");
+        // Rounding can move the exponent across the notation boundary.
+        assert_eq!(sig6(999999.5), "1e+06");
+        assert_eq!(sig6(9.999999e-5), "0.0001");
     }
 
     #[test]
