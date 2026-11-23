@@ -3855,7 +3855,7 @@ pub(crate) fn span(values: &[f32]) -> (f32, f32) {
         return (lo - 1.0, hi + 1.0);
     }
     let pad = (hi - lo) * 0.05;
-    (lo - pad, hi + pad)
+    ((lo - pad).max(-f32::MAX), (hi + pad).min(f32::MAX))
 }
 
 pub(crate) fn median(values: &[f32]) -> f32 {
@@ -6435,5 +6435,11 @@ mod tests {
         // outlier — the column must stay a delivery gap end to end.
         let ms = spot_delivery_ms(&[1000.0, 1100.0, 5000.0], &[0.0, 0.0, 1.0]);
         assert_eq!(ms, vec![1000.0, 100.0, 3900.0]);
+    }
+
+    #[test]
+    fn a_span_of_extreme_finite_samples_stays_finite() {
+        let (lo, hi) = span(&[-f32::MAX, f32::MAX]);
+        assert!(lo.is_finite() && hi.is_finite());
     }
 }

@@ -259,7 +259,9 @@ pub(super) fn mean_series(
             continue;
         }
         xs.push(index as f32 + dodge(session, sessions));
-        ys.push(samples.iter().sum::<f32>() / samples.len() as f32);
+        // f64 accumulation — 2+ samples near f32::MAX overflow an f32 sum
+        // and hand pchip a NaN slope.
+        ys.push((samples.iter().map(|v| f64::from(*v)).sum::<f64>() / samples.len() as f64) as f32);
     }
     let curve = pchip(&xs, &ys);
     vec![
@@ -864,7 +866,11 @@ pub(super) fn kde(values: &[f32], half: f32) -> Vec<(f32, f32)> {
         .into_iter()
         .enumerate()
         .map(|(step, value)| {
-            let y = lo + (hi - lo) * step as f32 / (STEPS - 1) as f32;
+            // f64 span math like the grid eval above — hi - lo overflows
+            // f32 on mixed-sign extreme samples.
+            let y = (f64::from(lo)
+                + (f64::from(hi) - f64::from(lo)) * step as f64 / (STEPS - 1) as f64)
+                as f32;
             (y, half * (value / peak) as f32)
         })
         .collect()
@@ -949,4 +955,30 @@ pub(super) fn pchip(xs: &[f32], ys: &[f32]) -> (Vec<f32>, Vec<f32>) {
     out_x.push(*xs.last().unwrap_or(&0.0));
     out_y.push(*ys.last().unwrap_or(&0.0));
     (out_x, out_y)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn kde_and_mean_series_survive_extreme_finite_samples() {
+        let curve = kde(&[f32::MAX, -f32::MAX], 1.0);
+        assert!(curve.iter().all(|(y, _)| y.is_finite()));
+        // Two f32::MAX samples overflow an f32 sum — the f64 mean stays
+        // finite instead of handing pchip a NaN.
+        let mut table = BTreeMap::new();
+        table.insert("_bin".to_string(), vec![0.0]);
+        let series = mean_series(
+            &table,
+            &[f32::MAX, f32::MAX],
+            &[0.0, 0.0],
+            0,
+            1,
+            [1.0, 1.0, 1.0, 1.0],
+        );
+        let json = serde_json::to_value(&series).unwrap();
+        let text = json.to_string();
+        assert!(!text.contains("inf") && !text.contains("NaN"), "{text}");
+    }
 }
