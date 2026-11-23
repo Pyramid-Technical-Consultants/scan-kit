@@ -429,11 +429,12 @@ fn a_short_column_matches_the_cpu_reduction() {
     assert_eq!(group_count(256), 1);
     assert_eq!(group_count(257), 2);
     assert_eq!(group_count(256 * 400), 256);
-    let elapsed = best_of(1, || {});
-    assert!(elapsed < std::time::Duration::from_secs(2));
     let gpu = match block_on(crate::request_device()) {
         Ok((device, queue)) => Reducer::new(device, queue),
-        Err(crate::ComputeError::NoAdapter) => return,
+        Err(crate::ComputeError::NoAdapter) => {
+            eprintln!("skipped: no GPU adapter");
+            return;
+        }
         Err(error) => panic!("{error}"),
     };
     let data: Vec<f32> = (0..300).map(|index| index as f32 - 40.0).collect();

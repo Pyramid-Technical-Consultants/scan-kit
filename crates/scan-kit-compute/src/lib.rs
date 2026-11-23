@@ -193,7 +193,9 @@ mod tests {
         compile_shader().expect("shader");
         match block_on(round_trip_add_one(&[1.0, 2.0, 3.0, 4.0])) {
             Ok(values) => assert_eq!(values, vec![2.0, 3.0, 4.0, 5.0]),
-            Err(ComputeError::NoAdapter) => {}
+            Err(ComputeError::NoAdapter) => {
+                eprintln!("skipped: no GPU adapter");
+            }
             Err(error) => panic!("{error}"),
         }
     }

@@ -1472,7 +1472,9 @@ mod tests {
             shape: [24, 24, 55],
         };
         match run_mc(&McJob::Slab(request)) {
-            Err(ComputeError::NoAdapter) => {}
+            Err(ComputeError::NoAdapter) => {
+                eprintln!("skipped: no GPU adapter");
+            }
             Err(err) => panic!("{err}"),
             Ok(result) => {
                 let volume = &result.volume;
@@ -1531,7 +1533,9 @@ mod tests {
             let_water: false,
         };
         match run_mc(&McJob::Patient(request)) {
-            Err(ComputeError::NoAdapter) => {}
+            Err(ComputeError::NoAdapter) => {
+                eprintln!("skipped: no GPU adapter");
+            }
             Err(err) => panic!("{err}"),
             Ok(result) => {
                 let [nx, ny, nz] = result.volume.shape;
@@ -1617,7 +1621,10 @@ mod tests {
         let _gpu = super::hold_gpu();
         let job = McJob::Slab(slab(60_000));
         let one = match run_mc(&job) {
-            Err(ComputeError::NoAdapter) => return,
+            Err(ComputeError::NoAdapter) => {
+                eprintln!("skipped: no GPU adapter");
+                return;
+            }
             Err(err) => panic!("{err}"),
             Ok(result) => result,
         };
@@ -1660,7 +1667,10 @@ mod tests {
     fn raised_target_resumes_a_finished_run() {
         let _gpu = super::hold_gpu();
         let mut run = match McRun::open(&McJob::Slab(slab(30_000))) {
-            Err(ComputeError::NoAdapter) => return,
+            Err(ComputeError::NoAdapter) => {
+                eprintln!("skipped: no GPU adapter");
+                return;
+            }
             Err(err) => panic!("{err}"),
             Ok(run) => run,
         };
@@ -1697,7 +1707,10 @@ mod tests {
     fn cancel_after_a_preview_publishes_nothing_further() {
         let _gpu = super::hold_gpu();
         let mut run = match McRun::open(&McJob::Slab(slab(8_000))) {
-            Err(ComputeError::NoAdapter) => return,
+            Err(ComputeError::NoAdapter) => {
+                eprintln!("skipped: no GPU adapter");
+                return;
+            }
             Err(err) => panic!("{err}"),
             Ok(run) => run,
         };
@@ -1780,9 +1793,14 @@ mod tests {
         let mut bad = request();
         bad.spots[6] = 2.0;
         assert!(patient_launch(&bad).is_err());
+        // Empty beams is legal input — this case errors because spot 0's
+        // beam index references a beam that is not there.
         let mut bad = request();
         bad.beams = Vec::new();
-        assert!(patient_launch(&bad).is_err());
+        assert_eq!(
+            patient_launch(&bad).err().unwrap().to_string(),
+            "spot beam index out of range"
+        );
         let mut bad = request();
         bad.beams = vec![0.0; 8];
         assert!(patient_launch(&bad).is_err());

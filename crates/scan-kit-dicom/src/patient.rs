@@ -114,7 +114,13 @@ pub fn load_study(path: &Path) -> Result<PatientStudy, String> {
     let mut dose_seen = false;
     let mut dose_type = String::new();
     let mut summation = String::new();
-    let mut plan = None;
+    let mut plan_raw = None;
+    // The plan's Patient Setup Sequence is optional; when absent, the CT's
+    // own Patient Position (0018,5100) is the only orientation source —
+    // keyed by series so a merged folder cannot borrow a different
+    // patient's orientation.
+    let mut ct_positions: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
     let mut structures = Vec::new();
     let mut structures_frame = String::new();
     let mut patient_id = String::new();
@@ -169,16 +175,20 @@ pub fn load_study(path: &Path) -> Result<PatientStudy, String> {
                     text_tag(&elems, tag(0x0020, 0x000D)),
                 )
             });
+            let position = text_tag(&elems, tag(0x0018, 0x5100));
+            if !position.is_empty() {
+                ct_positions.entry(uid.clone()).or_insert(position);
+            }
             let (sops, bucket) = ct_by_series.entry(uid).or_default();
             sops.push(text_tag(&elems, tag(0x0008, 0x0018)));
             for slice in image_slices(&elems, 1.0)? {
                 bucket.push((frame.clone(), slice));
             }
         } else if class == "1.2.840.10008.5.1.4.1.1.481.8" {
+            // Parsed after the loop — the CT position fallback is only
+            // known once every file has been seen.
             let sop_uid = text_tag(&elems, tag(0x0008, 0x0018));
-            let mut parsed = read_plan(&elems, frame)?;
-            parsed.sop_uid = sop_uid;
-            plan = Some(parsed);
+            plan_raw = Some((elems, frame, sop_uid, file.clone()));
         } else if class == "1.2.840.10008.5.1.4.1.1.481.3" {
             if structures_uid.is_empty() {
                 structures_uid = text_tag(&elems, tag(0x0008, 0x0018));
@@ -224,6 +234,17 @@ pub fn load_study(path: &Path) -> Result<PatientStudy, String> {
     }
     sop_uids.extend(orphan_sops);
     ct_slices.extend(orphans);
+    let ct_position = ct_positions
+        .remove(&series_uid)
+        .or_else(|| ct_positions.remove(""))
+        .unwrap_or_default();
+    let mut plan = None;
+    if let Some((elems, frame, sop_uid, plan_file)) = plan_raw {
+        let mut parsed = read_plan(&elems, frame, &ct_position)
+            .map_err(|err| format!("{}: {err}", plan_file.display()))?;
+        parsed.sop_uid = sop_uid;
+        plan = Some(parsed);
+    }
     if let Some((id, name, study)) = identities.get(&series_uid) {
         patient_id = id.clone();
         patient_name = name.clone();
@@ -822,7 +843,7 @@ struct Plan {
     label: String,
 }
 
-fn read_plan(elems: &[Elem], frame: String) -> Result<Plan, String> {
+fn read_plan(elems: &[Elem], frame: String, ct_position: &str) -> Result<Plan, String> {
     let mut setups = Vec::new();
     for item in seq(elems, tag(0x300A, 0x0180)) {
         setups.push((
@@ -867,11 +888,15 @@ fn read_plan(elems: &[Elem], frame: String) -> Result<Plan, String> {
             return Err(format!("beam {number} has no meterset"));
         }
         let setup = int_tag(beam, tag(0x300C, 0x006A)).unwrap_or(1);
-        // The setup sequence is optional — but when it exists, an
-        // unresolvable or empty position cannot default to "HFS": the
-        // support matrix would mirror the beam geometry of an FFS patient.
+        // The setup sequence is optional — but an unresolvable or empty
+        // position cannot default to "HFS": the support matrix would mirror
+        // the beam geometry of an FFS patient. With no setup sequence at
+        // all, the CT's own Patient Position is the fallback.
         let position = if setups.is_empty() {
-            "HFS".to_owned()
+            if ct_position.is_empty() {
+                return Err(format!("beam {number} has no patient position"));
+            }
+            ct_position.to_owned()
         } else {
             setups
                 .iter()
@@ -896,10 +921,13 @@ fn read_plan(elems: &[Elem], frame: String) -> Result<Plan, String> {
         let mut energy = f32::NAN;
         let mut gantry = 0.0;
         let mut gantry_seen = false;
+        let mut first_gantry = 0.0;
         let mut couch = 0.0;
         let mut couch_seen = false;
+        let mut first_couch = 0.0;
         let mut iso = [0.0f32; 3];
         let mut iso_seen = false;
+        let mut first_iso = [0.0f32; 3];
         let mut in_shifters: Vec<(i32, f32, f32)> = Vec::new();
         let mut spots = Vec::new();
         for cp in seq(beam, tag(0x300A, 0x03A8)) {
@@ -908,17 +936,46 @@ fn read_plan(elems: &[Elem], frame: String) -> Result<Plan, String> {
             energy = float_tag(cp, tag(0x300A, 0x0114))
                 .filter(|value| value.is_finite())
                 .unwrap_or(energy);
+            // Spots carry only a beam index — every control point shares
+            // this beam's record, so a mid-beam geometry change cannot be
+            // represented. Reject it like the multi-shifter case below.
             if let Some(value) = float_tag(cp, tag(0x300A, 0x011E)).filter(|v| v.is_finite()) {
+                // Anchor to the first reading so slow drift cannot slip past
+                // the tolerance one control point at a time.
+                if gantry_seen && (value - first_gantry).abs() > 1e-3 {
+                    return Err(format!("beam {number} changes gantry angle mid-beam"));
+                }
+                if !gantry_seen {
+                    first_gantry = value;
+                }
                 gantry = value;
                 gantry_seen = true;
             }
             if let Some(value) = float_tag(cp, tag(0x300A, 0x0122)).filter(|v| v.is_finite()) {
+                if couch_seen && (value - first_couch).abs() > 1e-3 {
+                    return Err(format!("beam {number} changes couch angle mid-beam"));
+                }
+                if !couch_seen {
+                    first_couch = value;
+                }
                 couch = value;
                 couch_seen = true;
             }
             let iso_raw = floats_tag(cp, tag(0x300A, 0x012C));
             if iso_raw.len() >= 3 && iso_raw[..3].iter().all(|value| value.is_finite()) {
-                iso = [iso_raw[0], iso_raw[1], iso_raw[2]];
+                let next = [iso_raw[0], iso_raw[1], iso_raw[2]];
+                if iso_seen
+                    && next
+                        .iter()
+                        .zip(first_iso)
+                        .any(|(a, b)| (a - b).abs() > 1e-3)
+                {
+                    return Err(format!("beam {number} changes isocenter mid-beam"));
+                }
+                if !iso_seen {
+                    first_iso = next;
+                }
+                iso = next;
                 iso_seen = true;
             }
             for setting in seq(cp, tag(0x300A, 0x0360)) {
@@ -1010,10 +1067,19 @@ fn read_plan(elems: &[Elem], frame: String) -> Result<Plan, String> {
             spots,
         });
     }
+    // Target Prescription Dose lives in the Dose Reference Sequence's
+    // TARGET item (300A,0026) — the %-of-prescription clinical goals need
+    // it. NaN means the plan did not carry one.
+    let prescription = seq(elems, tag(0x300A, 0x0010))
+        .iter()
+        .find(|item| text_tag(item, tag(0x300A, 0x0020)).eq_ignore_ascii_case("target"))
+        .and_then(|item| float_tag(item, tag(0x300A, 0x0026)))
+        .filter(|dose| dose.is_finite() && *dose > 0.0)
+        .unwrap_or(f32::NAN);
     Ok(Plan {
         beams,
         fractions,
-        prescription: f32::NAN,
+        prescription,
         frame,
         sop_uid: String::new(),
         label: text_tag(elems, tag(0x300A, 0x0002)),
@@ -2165,7 +2231,7 @@ mod tests {
         ui(&mut bytes, 0x0002, 0x0010, "1.2.840.10008.1.2").unwrap();
         iv_sq(&mut bytes, 0x300A, 0x0070, &[group]);
         iv_sq(&mut bytes, 0x300A, 0x03A2, &[treatment, setup]);
-        let plan = read_plan(&parse_file(&bytes).unwrap(), "f".into()).unwrap();
+        let plan = read_plan(&parse_file(&bytes).unwrap(), "f".into(), "HFS").unwrap();
         assert_eq!(plan.beams.len(), 1);
         assert!((plan.beams[0].meterset - 10.0).abs() < 1e-4);
         let spots = &plan.beams[0].spots;
@@ -2263,19 +2329,30 @@ mod tests {
 
     #[test]
     fn an_in_range_shifter_keeps_its_wet_and_a_second_one_fails() {
-        let plan = read_plan(&plan_with_shifter(&[(1, "IN", Some(40.0))]), "f".into()).unwrap();
+        let plan = read_plan(
+            &plan_with_shifter(&[(1, "IN", Some(40.0))]),
+            "f".into(),
+            "HFS",
+        )
+        .unwrap();
         let spot = &plan.beams[0].spots[0];
         assert_eq!(spot.shifter, "RS1");
         assert!((spot.wet_mm - 40.0).abs() < 1e-3);
         assert!((spot.shifter_distance_mm - 300.0).abs() < 1e-3);
-        let bare = read_plan(&plan_with_shifter(&[(1, "IN", None)]), "f".into()).unwrap();
+        let bare = read_plan(&plan_with_shifter(&[(1, "IN", None)]), "f".into(), "HFS").unwrap();
         assert!(bare.beams[0].spots[0].wet_mm.is_nan());
         assert!(read_plan(
             &plan_with_shifter(&[(1, "IN", Some(40.0)), (2, "IN", Some(20.0))]),
-            "f".into()
+            "f".into(),
+            "HFS"
         )
         .is_err());
-        assert!(read_plan(&plan_with_shifter(&[(3, "IN", Some(40.0))]), "f".into()).is_err());
+        assert!(read_plan(
+            &plan_with_shifter(&[(3, "IN", Some(40.0))]),
+            "f".into(),
+            "HFS"
+        )
+        .is_err());
     }
 
     #[test]
@@ -2471,13 +2548,13 @@ mod tests {
 
     #[test]
     fn a_short_position_list_does_not_invent_spots_at_the_origin() {
-        let plan = read_plan(&plan_with_spot_count(3, 2), "f".into()).unwrap();
+        let plan = read_plan(&plan_with_spot_count(3, 2), "f".into(), "HFS").unwrap();
         let spots = &plan.beams[0].spots;
         assert_eq!(spots.len(), 2);
         assert!((spots[0].x - 1.0).abs() < 1e-4);
         assert!((spots[1].x - 2.0).abs() < 1e-4);
         // A negative count parses as zero spots instead of hanging the load.
-        let plan = read_plan(&plan_with_spot_count(-4, 2), "f".into()).unwrap();
+        let plan = read_plan(&plan_with_spot_count(-4, 2), "f".into(), "HFS").unwrap();
         assert!(plan.beams[0].spots.is_empty());
     }
 
@@ -2512,6 +2589,107 @@ mod tests {
         sq(&mut plan, 0x300A, 0x0070, &[group]).unwrap();
         sq(&mut plan, 0x300A, 0x03A2, &[beam]).unwrap();
         parse_dataset(&plan).unwrap()
+    }
+
+    #[test]
+    fn a_target_prescription_dose_is_parsed() {
+        // Clinical goals are %-of-prescription — a plan that carries the
+        // Dose Reference TARGET dose must surface it.
+        let mut item = Vec::new();
+        cs(&mut item, 0x300A, 0x0020, "TARGET").unwrap();
+        ds(&mut item, 0x300A, 0x0026, &[70.0]).unwrap();
+        let mut other = Vec::new();
+        cs(&mut other, 0x300A, 0x0020, "ORGAN_AT_RISK").unwrap();
+        ds(&mut other, 0x300A, 0x0026, &[5.0]).unwrap();
+        // Rebuild the plan bytes with the dose reference sequence appended —
+        // sq() operates on bytes, so regenerate through a tiny plan.
+        let mut ref_beam = Vec::new();
+        is(&mut ref_beam, 0x300C, 0x0006, 1).unwrap();
+        ds(&mut ref_beam, 0x300A, 0x0086, &[10.0]).unwrap();
+        let mut group = Vec::new();
+        is(&mut group, 0x300A, 0x0078, 1).unwrap();
+        sq(&mut group, 0x300C, 0x0004, &[ref_beam]).unwrap();
+        let mut cp = Vec::new();
+        ds(&mut cp, 0x300A, 0x0114, &[100.0]).unwrap();
+        ds(&mut cp, 0x300A, 0x011E, &[0.0]).unwrap();
+        ds(&mut cp, 0x300A, 0x0122, &[0.0]).unwrap();
+        ds(&mut cp, 0x300A, 0x012C, &[0.0, 0.0, 0.0]).unwrap();
+        is(&mut cp, 0x300A, 0x0392, 1).unwrap();
+        ds(&mut cp, 0x300A, 0x0394, &[1.0, -1.0]).unwrap();
+        ds(&mut cp, 0x300A, 0x0396, &[1.0]).unwrap();
+        let mut beam = Vec::new();
+        is(&mut beam, 0x300A, 0x00C0, 1).unwrap();
+        ds(&mut beam, 0x300A, 0x010E, &[1.0]).unwrap();
+        is(&mut beam, 0x300C, 0x006A, 1).unwrap();
+        sq(&mut beam, 0x300A, 0x03A8, &[cp]).unwrap();
+        let mut plan = Vec::new();
+        sq(&mut plan, 0x300A, 0x0070, &[group.clone()]).unwrap();
+        sq(&mut plan, 0x300A, 0x03A2, &[beam.clone()]).unwrap();
+        sq(&mut plan, 0x300A, 0x0010, &[item, other.clone()]).unwrap();
+        let elems = parse_dataset(&plan).unwrap();
+        let parsed = read_plan(&elems, "f".into(), "HFS").unwrap();
+        assert!((parsed.prescription - 70.0).abs() < 1e-4);
+        // No TARGET item means no prescription — not "pick the first".
+        let mut plan = Vec::new();
+        sq(&mut plan, 0x300A, 0x0070, &[group]).unwrap();
+        sq(&mut plan, 0x300A, 0x03A2, &[beam.clone()]).unwrap();
+        sq(&mut plan, 0x300A, 0x0010, &[other]).unwrap();
+        let parsed = read_plan(&parse_dataset(&plan).unwrap(), "f".into(), "HFS").unwrap();
+        assert!(parsed.prescription.is_nan());
+    }
+
+    #[test]
+    fn a_beam_changing_geometry_mid_beam_is_rejected() {
+        // Every control point shares the beam record — a mid-beam gantry or
+        // isocenter change cannot be transported per-spot and must fail
+        // loudly instead of applying the last point's angle to all spots.
+        let cp_with = |gantry: f32| {
+            let mut cp = Vec::new();
+            ds(&mut cp, 0x300A, 0x0114, &[100.0]).unwrap();
+            ds(&mut cp, 0x300A, 0x011E, &[gantry]).unwrap();
+            ds(&mut cp, 0x300A, 0x0122, &[0.0]).unwrap();
+            ds(&mut cp, 0x300A, 0x012C, &[0.0, 0.0, 0.0]).unwrap();
+            is(&mut cp, 0x300A, 0x0392, 1).unwrap();
+            ds(&mut cp, 0x300A, 0x0394, &[1.0, -1.0]).unwrap();
+            ds(&mut cp, 0x300A, 0x0396, &[1.0]).unwrap();
+            cp
+        };
+        let mut ref_beam = Vec::new();
+        is(&mut ref_beam, 0x300C, 0x0006, 1).unwrap();
+        ds(&mut ref_beam, 0x300A, 0x0086, &[10.0]).unwrap();
+        let mut group = Vec::new();
+        is(&mut group, 0x300A, 0x0078, 1).unwrap();
+        sq(&mut group, 0x300C, 0x0004, &[ref_beam]).unwrap();
+        let mut beam = Vec::new();
+        is(&mut beam, 0x300A, 0x00C0, 1).unwrap();
+        ds(&mut beam, 0x300A, 0x010E, &[1.0]).unwrap();
+        is(&mut beam, 0x300C, 0x006A, 1).unwrap();
+        sq(&mut beam, 0x300A, 0x03A8, &[cp_with(0.0), cp_with(45.0)]).unwrap();
+        let mut plan = Vec::new();
+        sq(&mut plan, 0x300A, 0x0070, &[group.clone()]).unwrap();
+        sq(&mut plan, 0x300A, 0x03A2, &[beam]).unwrap();
+        assert!(read_plan(&parse_dataset(&plan).unwrap(), "f".into(), "HFS").is_err());
+        // Identical geometry across control points stays legal.
+        let mut beam = Vec::new();
+        is(&mut beam, 0x300A, 0x00C0, 1).unwrap();
+        ds(&mut beam, 0x300A, 0x010E, &[1.0]).unwrap();
+        is(&mut beam, 0x300C, 0x006A, 1).unwrap();
+        sq(&mut beam, 0x300A, 0x03A8, &[cp_with(0.0), cp_with(0.0)]).unwrap();
+        let mut plan = Vec::new();
+        sq(&mut plan, 0x300A, 0x0070, &[group]).unwrap();
+        sq(&mut plan, 0x300A, 0x03A2, &[beam]).unwrap();
+        assert!(read_plan(&parse_dataset(&plan).unwrap(), "f".into(), "HFS").is_ok());
+    }
+
+    #[test]
+    fn a_plan_without_setups_uses_the_ct_position() {
+        // With no Patient Setup Sequence the CT's (0018,5100) is the only
+        // orientation source — an FFS patient must not parse as HFS.
+        let elems = plan_with_weights(1, 1, 1);
+        let parsed = read_plan(&elems, "f".into(), "FFS").unwrap();
+        assert_eq!(parsed.beams[0].position, "FFS");
+        // And nothing at all is a loud error, not a silent HFS mirror.
+        assert!(read_plan(&elems, "f".into(), "").is_err());
     }
 
     #[test]
@@ -2778,8 +2956,8 @@ mod tests {
     fn a_weight_map_short_of_the_spot_limit_is_an_error() {
         // 3 declared spots with a single weight would silently zero weights
         // 2 and 3 — the export must be rejected instead.
-        assert!(read_plan(&plan_with_weights(3, 3, 1), "f".into()).is_err());
-        assert!(read_plan(&plan_with_weights(3, 3, 3), "f".into()).is_ok());
+        assert!(read_plan(&plan_with_weights(3, 3, 1), "f".into(), "HFS").is_err());
+        assert!(read_plan(&plan_with_weights(3, 3, 3), "f".into(), "HFS").is_ok());
     }
 
     #[test]
@@ -2797,7 +2975,7 @@ mod tests {
         sq(&mut beam, 0x300A, 0x03A8, &[cp]).unwrap();
         let mut plan = Vec::new();
         sq(&mut plan, 0x300A, 0x03A2, &[beam]).unwrap();
-        assert!(read_plan(&parse_dataset(&plan).unwrap(), "f".into()).is_err());
+        assert!(read_plan(&parse_dataset(&plan).unwrap(), "f".into(), "HFS").is_err());
     }
 
     #[test]

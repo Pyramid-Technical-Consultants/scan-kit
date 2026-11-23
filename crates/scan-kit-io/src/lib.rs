@@ -564,8 +564,9 @@ pub fn invoke(name: &str, input: &Value) -> Result<Value, InvokeError> {
                 location::session_storage_paths(&root, session_id).map_err(InvokeError::Message)?;
             let errors = location::delete_storage(&root, &paths).map_err(InvokeError::Message)?;
             // A session whose files are still on disk keeps its row —
-            // note/selection/hidden survive the failed delete.
-            if errors.is_empty() {
+            // note/selection/hidden survive the failed delete. Nothing
+            // found at all is not a successful delete either.
+            if errors.is_empty() && !paths.is_empty() {
                 with_store(&db, |conn| {
                     let lib_id = store::prepare_library(conn, &root)?;
                     store::delete_session(conn, lib_id, session_id)
@@ -629,7 +630,16 @@ pub fn invoke(name: &str, input: &Value) -> Result<Value, InvokeError> {
             let view = required_str(input, "view")?;
             let path = required_str(input, "path")?;
             let session_ids = required_strings(input, "session_ids")?;
-            let options = input.get("options").cloned().unwrap_or_else(|| json!({}));
+            let mut options = match input.get("options") {
+                // null means "defaults" to JSON callers; a scalar does not.
+                Some(value) if value.is_null() => json!({}),
+                Some(value) if !value.is_object() => {
+                    return Err(InvokeError::Message("options must be an object".into()));
+                }
+                Some(value) => value.clone(),
+                None => json!({}),
+            };
+            normalize_options(&mut options);
             let scene = analysis_scene(view, Path::new(path), &session_ids, &options)
                 .map_err(InvokeError::Message)?;
             serde_json::to_value(scene).map_err(|err| InvokeError::Message(err.to_string()))
@@ -666,7 +676,10 @@ pub fn invoke(name: &str, input: &Value) -> Result<Value, InvokeError> {
             let db = database_path(input)?;
             let source = required_str(input, "source")?;
             let dest = required_str(input, "dest")?;
-            let files = input.get("files").cloned().unwrap_or_else(|| json!([]));
+            let files = input
+                .get("files")
+                .cloned()
+                .ok_or_else(|| InvokeError::Message("files is required".into()))?;
             let hide = input.get("hide_unused").and_then(Value::as_bool);
             config::save_folder(&db, Path::new(source), Path::new(dest), &files, hide)
                 .map_err(InvokeError::Message)
@@ -1827,6 +1840,84 @@ Layer delivery: 27/27
         assert_eq!(result["errors"].as_array().unwrap().len(), 0);
         assert!(!root.join("sess").exists());
         assert!(!root.join("sess.zip").exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn analysis_scene_rejects_a_non_object_options_value() {
+        // A scalar options bag used to be silently replaced with defaults —
+        // a typo'd caller could not tell its settings never applied.
+        let error = invoke(
+            "scan_kit_analysis_scene",
+            &json!({
+                "view": "distribution",
+                "path": "/tmp",
+                "session_ids": ["sess"],
+                "options": "wide",
+            }),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("options"), "{error}");
+        // An explicit null still means "defaults", not an error.
+        assert!(invoke(
+            "scan_kit_analysis_scene",
+            &json!({
+                "view": "distribution",
+                "path": "/tmp",
+                "session_ids": ["sess"],
+                "options": null,
+            }),
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn config_save_requires_a_files_list() {
+        // Missing `files` defaulted to [] — a dest-pruning save that writes
+        // nothing, with no signal the argument was dropped.
+        let error = invoke(
+            "scan_kit_config_save",
+            &json!({
+                "db_path": "/tmp/db.sqlite",
+                "source": "/tmp/a",
+                "dest": "/tmp/b",
+            }),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("files"), "{error}");
+    }
+
+    #[test]
+    fn a_session_with_no_files_keeps_its_row_and_note() {
+        // Trashing a session whose files are already gone must not erase the
+        // index row — the note/selection would vanish with it.
+        let root = workspace("trash-missing");
+        let db = root.join("test.sqlite");
+        let root_str = root.to_string_lossy().into_owned();
+        store::with_store(&db, |conn| {
+            store::set_note(conn, &root_str, "sess", "keep me")
+        })
+        .unwrap();
+        let result = invoke(
+            "scan_kit_trash_session",
+            &json!({
+                "path": &root_str,
+                "session_id": "sess",
+                "db_path": db.to_string_lossy(),
+            }),
+        )
+        .unwrap();
+        assert_eq!(result["errors"].as_array().unwrap().len(), 0);
+        let remaining = store::with_store(&db, |conn| {
+            conn.query_row(
+                "SELECT note FROM sessions WHERE session_id = 'sess'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(|err| err.to_string())
+        })
+        .unwrap();
+        assert_eq!(remaining, "keep me");
         let _ = fs::remove_dir_all(&root);
     }
 

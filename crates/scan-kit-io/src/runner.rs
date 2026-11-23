@@ -604,46 +604,53 @@ fn dial(endpoint: &str) -> Result<WebSocket<DeadlineStream>, String> {
     if addrs.is_empty() {
         return Err(format!("invalid host: {endpoint}"));
     }
-    // Every record gets a shot — the first address can be dead while a
-    // sibling A/AAAA record answers.
+    // Every record gets a shot — the first address can be dead or accept
+    // TCP but never complete the upgrade while a sibling record answers.
     let mut last_err = String::new();
-    let mut stream = None;
     for addr in addrs {
-        match TcpStream::connect_timeout(&addr, Duration::from_secs(10)) {
-            Ok(found) => {
-                stream = Some(found);
-                break;
+        let stream = match TcpStream::connect_timeout(&addr, Duration::from_secs(10)) {
+            Ok(stream) => stream,
+            Err(err) => {
+                last_err = err.to_string();
+                continue;
+            }
+        };
+        stream.set_nodelay(true).ok();
+        // The upgrade handshake reads the 101 response on the bare stream —
+        // without a read deadline a peer that accepts but never upgrades
+        // wedges connect() forever. recv() re-arms per call afterward.
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+        let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
+        let stream = DeadlineStream::new(stream, Instant::now() + Duration::from_secs(10));
+        let mut request = format!("ws://{endpoint}")
+            .into_client_request()
+            .map_err(|err| err.to_string())?;
+        request.headers_mut().insert(
+            "Sec-WebSocket-Protocol",
+            HeaderValue::from_static("mpack.v2, mpack.v1, mpack"),
+        );
+        match client(request, stream) {
+            Ok((socket, response)) => {
+                let protocol = response
+                    .headers()
+                    .get("sec-websocket-protocol")
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or("");
+                if !protocol.contains("mpack") {
+                    return Err(format!(
+                        "device did not accept mpack subprotocol (got '{protocol}')"
+                    ));
+                }
+                return Ok(socket);
             }
             Err(err) => last_err = err.to_string(),
         }
     }
-    let stream = stream.ok_or(last_err)?;
-    stream.set_nodelay(true).ok();
-    // The upgrade handshake reads the 101 response on the bare stream —
-    // without a read deadline a peer that accepts but never upgrades
-    // wedges connect() forever. recv() re-arms per call afterward.
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
-    let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
-    let stream = DeadlineStream::new(stream, Instant::now() + Duration::from_secs(10));
-    let mut request = format!("ws://{endpoint}")
-        .into_client_request()
-        .map_err(|err| err.to_string())?;
-    request.headers_mut().insert(
-        "Sec-WebSocket-Protocol",
-        HeaderValue::from_static("mpack.v2, mpack.v1, mpack"),
-    );
-    let (socket, response) = client(request, stream).map_err(|err| err.to_string())?;
-    let protocol = response
-        .headers()
-        .get("sec-websocket-protocol")
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("");
-    if !protocol.contains("mpack") {
-        return Err(format!(
-            "device did not accept mpack subprotocol (got '{protocol}')"
-        ));
-    }
-    Ok(socket)
+    Err(if last_err.is_empty() {
+        format!("could not connect to {endpoint}")
+    } else {
+        last_err
+    })
 }
 
 fn config_body() -> rmpv::Value {
@@ -679,6 +686,11 @@ fn send(
     let mut bytes = Vec::new();
     rmpv::encode::write_value(&mut bytes, &rmpv::Value::Map(pairs))
         .map_err(|err| err.to_string())?;
+    // recv() is the only other place that arms the deadline — a quiet
+    // device leaves it lapsed and every later send fails permanently.
+    socket
+        .get_mut()
+        .set_deadline(Instant::now() + Duration::from_secs(10));
     socket
         .send(Message::Binary(bytes.into()))
         .map_err(|err| err.to_string())
@@ -960,13 +972,20 @@ pub(crate) fn http_tuned(
     let rest = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
     let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
     let path = format!("/{path}");
-    let addr = authority
-        .to_socket_addrs()
-        .map_err(|err| err.to_string())?
-        .next()
-        .ok_or_else(|| format!("invalid host: {authority}"))?;
-    let mut stream =
-        TcpStream::connect_timeout(&addr, connect_timeout).map_err(|err| err.to_string())?;
+    // Try every resolved record like dial does — a dead first address
+    // (stale v6, split-horizon DNS) must not fail the whole fetch.
+    let mut last_err = format!("invalid host: {authority}");
+    let mut stream = None;
+    for addr in authority.to_socket_addrs().map_err(|err| err.to_string())? {
+        match TcpStream::connect_timeout(&addr, connect_timeout) {
+            Ok(tcp) => {
+                stream = Some(tcp);
+                break;
+            }
+            Err(err) => last_err = err.to_string(),
+        }
+    }
+    let mut stream = stream.ok_or(last_err)?;
     stream.set_read_timeout(Some(read_timeout)).ok();
     stream.set_write_timeout(Some(read_timeout)).ok();
     let mut head = format!(
@@ -979,23 +998,40 @@ pub(crate) fn http_tuned(
         ));
     }
     head.push_str("\r\n");
-    stream
-        .write_all(head.as_bytes())
-        .map_err(|err| err.to_string())?;
-    if let Some(body) = body {
-        stream.write_all(body).map_err(|err| err.to_string())?;
+    // The deadline bounds the whole exchange — the per-syscall timeout
+    // alone lets a peer trickling one byte per interval stay open forever.
+    let deadline = Instant::now() + read_timeout * 4;
+    for bytes in [head.as_bytes(), body.unwrap_or_default()] {
+        let mut rest = bytes;
+        while !rest.is_empty() {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                return Err("the device write deadline elapsed".into());
+            };
+            stream
+                .set_write_timeout(Some(remaining.max(Duration::from_millis(1))))
+                .ok();
+            match stream.write(rest) {
+                Ok(n) => rest = &rest[n..],
+                Err(err) => return Err(err.to_string()),
+            }
+        }
     }
     let mut raw = Vec::new();
     let mut chunk = [0u8; 16 * 1024];
-    // read_timeout is per read() — a peer trickling one byte per interval
-    // would otherwise keep the request open for as long as it likes.
-    let deadline = Instant::now() + read_timeout * 4;
     loop {
         if raw.len() > MAX_BODY + 4096 {
             return Err("the device response is larger than 64 MiB".into());
         }
         if Instant::now() >= deadline {
             return Err("the device response did not complete in time".into());
+        }
+        // Cap the next read's syscall timeout to the remaining budget —
+        // a read issued just before the deadline would otherwise block a
+        // full read_timeout past it.
+        if let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+            stream
+                .set_read_timeout(Some(remaining.max(Duration::from_millis(1))))
+                .ok();
         }
         match stream.read(&mut chunk) {
             Ok(0) => break,

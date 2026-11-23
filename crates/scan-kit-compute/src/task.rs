@@ -2862,7 +2862,7 @@ mod tests {
             }),
         )
         .expect_err("a missing study cannot export");
-        assert_ne!(message, "plot did not finish");
+        assert!(message.contains("missing"), "{message}");
     }
 
     #[test]

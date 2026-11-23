@@ -1311,8 +1311,18 @@ pub(crate) fn session_storage_paths(root: &str, session_id: &str) -> Result<Vec<
         return Err(format!("invalid session id {session_id:?}"));
     }
     let mut found = Vec::new();
+    // recorded() is in-memory state from the last scan — a session moved
+    // externally since then leaves a dead spec whose delete error would
+    // keep the row. Local paths are verified here; remote specs are
+    // verified by the stat probes below.
+    let mut recorded_parent = None;
     if let Some(place) = recorded(root, session_id) {
-        found.push(place);
+        if !is_remote_location(&place) {
+            recorded_parent = Path::new(&place).parent().map(|dir| dir.to_path_buf());
+            if Path::new(&place).exists() {
+                found.push(place);
+            }
+        }
     }
     let mut names = vec![session_id.to_string()];
     for (suffix, _) in discover::ARCHIVE_SUFFIXES {
@@ -1322,20 +1332,78 @@ pub(crate) fn session_storage_paths(root: &str, session_id: &str) -> Result<Vec<
         // smb opens as a UNC path — remote::connect errors on it, so storage
         // paths and deletes resolve locally instead.
         Some(remote) if remote.scheme == Scheme::Smb => {
-            connect_smb(&remote)?.to_string_lossy().into_owned()
+            let unc = connect_smb(&remote)?;
+            // A recorded smb spec maps onto the UNC tree the same way the
+            // delete path strips it — verify it and probe its parent for
+            // sibling archives like other remotes do.
+            if let Some(place) = recorded(root, session_id) {
+                if let Ok(child) = require_remote(&place) {
+                    let child_path = child.path.trim_end_matches('/');
+                    let root_path = remote.path.trim_end_matches('/');
+                    let rel = child_path
+                        .strip_prefix(root_path)
+                        .filter(|rest| rest.is_empty() || rest.starts_with('/'));
+                    if let Some(rel) = rel {
+                        let local = unc.join(rel.trim_start_matches('/'));
+                        recorded_parent = local.parent().map(|dir| dir.to_path_buf());
+                        if local.exists() {
+                            found.push(local.to_string_lossy().into_owned());
+                        }
+                    }
+                }
+            }
+            unc.to_string_lossy().into_owned()
         }
         Some(remote) => {
             let mut fs = crate::remote::connect(&remote, &password_of(&remote))?;
-            let base = remote.path.trim_end_matches('/');
-            for name in names {
-                if fs.stat(&format!("{base}/{name}"))?.is_some() {
-                    let place = format!(
-                        "{}/{}",
-                        remote.canonical.trim_end_matches('/'),
-                        encode_path(&name)
-                    );
-                    if !found.contains(&place) {
-                        found.push(place);
+            // Verify a recorded remote spec too — same dead-spec hazard.
+            if let Some(place) = recorded(root, session_id) {
+                if let Some(child) = require_remote(&place).ok().and_then(|child| {
+                    fs.stat(child.path.trim_end_matches('/'))
+                        .ok()
+                        .flatten()
+                        .map(|_| place.clone())
+                }) {
+                    found.push(child);
+                }
+            }
+            // Probe the library root and the recorded spec's parent —
+            // a nested session's archive sibling lives next to it. The
+            // parent must stay inside the root: a recorded spec pointing
+            // elsewhere is stale state, not a delete candidate.
+            let root_path = remote.path.trim_end_matches('/');
+            let mut bases = vec![root_path.to_string()];
+            if let Some(place) = recorded(root, session_id) {
+                if let Ok(child) = require_remote(&place) {
+                    let parent_path = child.path.trim_end_matches('/');
+                    if let Some((parent, _)) = parent_path.rsplit_once('/') {
+                        let inside = parent == root_path
+                            || parent
+                                .strip_prefix(root_path)
+                                .is_some_and(|rest| rest.starts_with('/'));
+                        if inside && !bases.contains(&parent.to_string()) {
+                            bases.push(parent.to_string());
+                        }
+                    }
+                }
+            }
+            for base in &bases {
+                for name in &names {
+                    if fs.stat(&format!("{base}/{name}"))?.is_some() {
+                        let rel = match base.strip_prefix(root_path) {
+                            Some(rest) if rest.is_empty() || rest.starts_with('/') => {
+                                format!("{rest}/{name}")
+                            }
+                            _ => continue,
+                        };
+                        let place = format!(
+                            "{}/{}",
+                            remote.canonical.trim_end_matches('/'),
+                            encode_path(rel.trim_start_matches('/'))
+                        );
+                        if !found.contains(&place) {
+                            found.push(place);
+                        }
                     }
                 }
             }
@@ -1343,17 +1411,24 @@ pub(crate) fn session_storage_paths(root: &str, session_id: &str) -> Result<Vec<
         }
         None => root.to_owned(),
     };
-    let base = Path::new(&root);
-    for name in names {
-        let path = base.join(&name);
-        let hit = if name == session_id {
-            path.exists()
-        } else {
-            path.is_file()
-        };
-        let place = path.to_string_lossy().into_owned();
-        if hit && !found.contains(&place) {
-            found.push(place);
+    let mut bases = vec![Path::new(&root).to_path_buf()];
+    if let Some(parent) = recorded_parent {
+        if parent != bases[0] && parent.starts_with(&bases[0]) {
+            bases.push(parent);
+        }
+    }
+    for base in &bases {
+        for name in &names {
+            let path = base.join(name);
+            let hit = if *name == session_id {
+                path.exists()
+            } else {
+                path.is_file()
+            };
+            let place = path.to_string_lossy().into_owned();
+            if hit && !found.contains(&place) {
+                found.push(place);
+            }
         }
     }
     Ok(found)
@@ -1362,16 +1437,25 @@ pub(crate) fn session_storage_paths(root: &str, session_id: &str) -> Result<Vec<
 /// Remove `paths` — OS trash locally, permanent recursive delete on remote
 /// hosts. Returns per-path errors; empty means everything was removed.
 pub(crate) fn delete_storage(root: &str, paths: &[String]) -> Result<Vec<String>, String> {
+    // Deepest first — a parent delete removes its children, whose own
+    // delete would then error "not found" and keep the row.
+    let mut paths: Vec<String> = paths.to_vec();
+    paths.sort_by_key(|spec| {
+        std::cmp::Reverse(spec.chars().filter(|c| *c == '/' || *c == '\\').count())
+    });
     let mut errors = Vec::new();
     if is_remote_location(root) {
         let remote = require_remote(root)?;
         if remote.scheme == Scheme::Smb {
             // smb opens as a UNC path — remote::connect errors on it.
             let unc = connect_smb(&remote)?;
-            for spec in paths {
+            for spec in &paths {
+                // The remainder must start at a segment boundary —
+                // `\filer\shareX\y` must not strip `\filer\share`.
+                let unc_str = unc.to_string_lossy();
                 let relative = spec
-                    .strip_prefix(remote.canonical.as_str())
-                    .map(|rel| percent_decode(rel.trim_start_matches('/')))
+                    .strip_prefix(unc_str.as_ref())
+                    .and_then(|rel| rel.strip_prefix('\\').or_else(|| rel.strip_prefix('/')))
                     .unwrap_or_default();
                 // Same escape guard as materialize: only plain segments join.
                 let safe = !relative.is_empty()
@@ -1382,7 +1466,7 @@ pub(crate) fn delete_storage(root: &str, paths: &[String]) -> Result<Vec<String>
                     errors.push(format!("{spec}: not under the share root"));
                     continue;
                 }
-                let local = unc.join(&relative);
+                let local = unc.join(relative);
                 if let Err(err) = trash_path(&local.to_string_lossy()) {
                     errors.push(format!("{spec}: {err}"));
                 }
@@ -1390,7 +1474,7 @@ pub(crate) fn delete_storage(root: &str, paths: &[String]) -> Result<Vec<String>
             return Ok(errors);
         }
         let mut fs = crate::remote::connect(&remote, &password_of(&remote))?;
-        for spec in paths {
+        for spec in &paths {
             match require_remote(spec) {
                 Ok(child) => {
                     if let Err(err) = fs.remove(&child.path) {
@@ -1416,7 +1500,7 @@ pub(crate) fn delete_storage(root: &str, paths: &[String]) -> Result<Vec<String>
         }
         return Ok(errors);
     }
-    for path in paths {
+    for path in &paths {
         if let Err(err) = trash_path(path) {
             errors.push(format!("{path}: {err}"));
         }
@@ -1452,6 +1536,52 @@ fn trash_path(_path: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn storage_paths_finds_a_nested_recorded_session_and_sibling_archive() {
+        // A session recorded under a subdirectory keeps its archive next to
+        // it — probing only the library root misses both.
+        let root = std::env::temp_dir().join(format!(
+            "scan-kit-nested-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let nested = root.join("group").join("sess");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(root.join("group").join("sess.zip"), b"zip").unwrap();
+        let root_str = root.to_string_lossy().into_owned();
+        sessions().lock().unwrap().insert(
+            (root_str.clone(), "sess".to_string()),
+            nested.to_string_lossy().into_owned(),
+        );
+        let paths = session_storage_paths(&root_str, "sess").unwrap();
+        sessions()
+            .lock()
+            .unwrap()
+            .remove(&(root_str.clone(), "sess".to_string()));
+        assert_eq!(
+            paths.len(),
+            2,
+            "expected the dir and its sibling archive: {paths:?}"
+        );
+        assert!(paths.iter().any(|p| p.ends_with("sess")));
+        assert!(paths.iter().any(|p| p.ends_with("sess.zip")));
+        // A stale recorded spec points nowhere — it is ignored, not deleted.
+        sessions().lock().unwrap().insert(
+            (root_str.clone(), "gone".to_string()),
+            root.join("missing").to_string_lossy().into_owned(),
+        );
+        let paths = session_storage_paths(&root_str, "gone").unwrap();
+        sessions()
+            .lock()
+            .unwrap()
+            .remove(&(root_str, "gone".to_string()));
+        assert!(paths.is_empty());
+        let _ = fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn urls_classify_and_drop_the_password() {
