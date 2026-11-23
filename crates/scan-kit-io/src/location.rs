@@ -232,9 +232,12 @@ pub(crate) fn remote_fingerprint(session_url: &str, session_id: &str) -> Option<
         candidates.insert(0, format!("{base}/termination_summary.txt"));
         if discover::valid_session_id(session_id) {
             candidates.insert(1, format!("{base}/{session_id}/termination_summary.txt"));
-            // Still-capturing nested sessions have no summary yet — the
-            // inner dir's mtime tracks the capture; the container's froze.
-            candidates.insert(2, format!("{base}/{session_id}"));
+            // Still-capturing sessions have no summary and their inner dir's
+            // mtime freezes once the layer/run dirs exist — input_map.csv
+            // moves on every row write (same probes as remote_stamp).
+            candidates.insert(2, format!("{base}/input_map.csv"));
+            candidates.insert(3, format!("{base}/{session_id}/input_map.csv"));
+            candidates.insert(4, format!("{base}/{session_id}"));
         }
     }
     let mut dir_stat = None;
@@ -1153,7 +1156,15 @@ pub(crate) fn password_of(remote: &Remote) -> String {
     if let Some(password) = map.get(&remote.canonical) {
         return password.clone();
     }
-    map.get(&host_key(remote)).cloned().unwrap_or_default()
+    // Session URLs inherit the longest matching library prefix — the host
+    // slot alone would hand sibling libraries each other's credentials.
+    map.iter()
+        .filter(|(key, _)| key.as_str() != host_key(remote).as_str())
+        .filter(|(key, _)| remote.canonical.starts_with(&format!("{key}/")))
+        .max_by_key(|(key, _)| key.len())
+        .map(|(_, password)| password.clone())
+        .or_else(|| map.get(&host_key(remote)).cloned())
+        .unwrap_or_default()
 }
 
 fn store_password(remote: &Remote, password: &str) {
@@ -1275,8 +1286,13 @@ fn add_windows_connection(share: &str, username: &str, password: &str) -> Result
             0x4,
         )
     };
-    if code == 0 || code == 1219 {
+    if code == 0 {
         return Ok(());
+    }
+    if code == 1219 {
+        return Err(auth_error(
+            "a Windows session to that server already exists under different credentials",
+        ));
     }
     if matches!(code, 5 | 86 | 1323 | 1326 | 2202) {
         return Err(auth_error("the share refused the password"));
@@ -1353,10 +1369,20 @@ pub(crate) fn delete_storage(root: &str, paths: &[String]) -> Result<Vec<String>
             // smb opens as a UNC path — remote::connect errors on it.
             let unc = connect_smb(&remote)?;
             for spec in paths {
-                let local = spec
+                let relative = spec
                     .strip_prefix(remote.canonical.as_str())
-                    .map(|rel| unc.join(percent_decode(rel.trim_start_matches('/'))))
-                    .unwrap_or_else(|| Path::new(spec).to_path_buf());
+                    .map(|rel| percent_decode(rel.trim_start_matches('/')))
+                    .unwrap_or_default();
+                // Same escape guard as materialize: only plain segments join.
+                let safe = !relative.is_empty()
+                    && Path::new(&relative)
+                        .components()
+                        .all(|part| matches!(part, std::path::Component::Normal(_)));
+                if !safe {
+                    errors.push(format!("{spec}: not under the share root"));
+                    continue;
+                }
+                let local = unc.join(&relative);
                 if let Err(err) = trash_path(&local.to_string_lossy()) {
                     errors.push(format!("{spec}: {err}"));
                 }
@@ -1695,5 +1721,20 @@ mod tests {
         assert_eq!((mtime, size), (1_000_000_000, 5)); // "flat\n"
         let remote = require_remote(&canonical).unwrap();
         assert_eq!(remote_stamp(&remote).unwrap(), "1000000000\n5");
+    }
+
+    #[test]
+    fn a_password_matches_the_longest_remote_prefix() {
+        // Passwords are keyed by remote spec; a session nested under a
+        // stored root must pick the deepest matching key, not a sibling.
+        let tag = format!("h{}", std::process::id());
+        // Stored last, so the host slot holds "root-pw" — a naive host-key
+        // lookup would hand it to /a/sess1; the longest prefix must win.
+        remember_password(&format!("sftp://u@{tag}/a"), "a-pw");
+        remember_password(&format!("sftp://u@{tag}"), "root-pw");
+        let nested = require_remote(&format!("sftp://u@{tag}/a/sess1")).unwrap();
+        assert_eq!(password_of(&nested), "a-pw");
+        let sibling = require_remote(&format!("sftp://u@{tag}/b/sess1")).unwrap();
+        assert_eq!(password_of(&sibling), "root-pw");
     }
 }
