@@ -226,7 +226,9 @@ impl McRun {
                 }
                 // A cancel landing inside the drain aborts it — that is a
                 // cancellation, not a failure.
-                Err(_) if cancel.is_cancelled() => Poll::Cancelled,
+                Err(err) if cancel.is_cancelled() && err.to_string() == "cancelled" => {
+                    Poll::Cancelled
+                }
                 Err(err) => Poll::Failed(err.to_string()),
             };
         }
@@ -242,7 +244,7 @@ impl McRun {
             Ok(Slice::Cancelled) => Poll::Cancelled,
             // A cancel landing inside finish()'s read aborts it — same
             // treatment the drain arm gives the identical error.
-            Err(_) if cancel.is_cancelled() => Poll::Cancelled,
+            Err(err) if cancel.is_cancelled() && err.to_string() == "cancelled" => Poll::Cancelled,
             Err(err) => Poll::Failed(err.to_string()),
         }
     }
@@ -826,7 +828,9 @@ impl Live {
         // step never waits on it — sibling runs on the shared queue keep
         // submitting while the readback is in flight.
         if self.pending_read.is_some() {
-            let _ = self.device.poll(wgpu::PollType::Poll);
+            self.device
+                .poll(wgpu::PollType::Poll)
+                .map_err(|err| ComputeError::Message(err.to_string()))?;
             match self
                 .pending_read
                 .as_ref()
@@ -868,7 +872,9 @@ impl Live {
             let result = match self.finish(cancel) {
                 // A cancel landing mid-read is still a cancel, not a failed
                 // run — the task's cancel flag is the truth.
-                Err(_) if cancel.is_cancelled() => return Ok(Slice::Cancelled),
+                Err(err) if cancel.is_cancelled() && err.to_string() == "cancelled" => {
+                    return Ok(Slice::Cancelled);
+                }
                 other => other?,
             };
             self.finished = true;
@@ -976,7 +982,9 @@ impl Live {
                 return Ok(started.elapsed());
             }
             if started.elapsed() > Duration::from_secs(30) {
-                gpu_lost(&self.gpu);
+                // This run's submission retires only after every earlier
+                // submission on the shared queue — sibling backlog is not a
+                // wedged device, so fail the run without evicting it.
                 return Err(ComputeError::Message(
                     "GPU submission did not retire".into(),
                 ));
@@ -992,7 +1000,9 @@ impl Live {
                 Ok(_) => return Ok(started.elapsed()),
                 Err(wgpu::PollError::Timeout) => continue,
                 Err(err) => {
-                    gpu_lost(&self.gpu);
+                    if !matches!(err, wgpu::PollError::WrongSubmissionIndex(..)) {
+                        gpu_lost(&self.gpu);
+                    }
                     return Err(ComputeError::Message(err.to_string()));
                 }
             }
@@ -1074,7 +1084,9 @@ impl Live {
                 return Err(ComputeError::Message("cancelled".into()));
             }
             if started.elapsed() > Duration::from_secs(30) {
-                gpu_lost(&self.gpu);
+                // This run's submission retires only after every earlier
+                // submission on the shared queue — sibling backlog is not a
+                // wedged device, so fail the run without evicting it.
                 return Err(ComputeError::Message(
                     "GPU submission did not retire".into(),
                 ));
@@ -1085,7 +1097,9 @@ impl Live {
             }) {
                 Ok(_) | Err(wgpu::PollError::Timeout) => {}
                 Err(err) => {
-                    gpu_lost(&self.gpu);
+                    if !matches!(err, wgpu::PollError::WrongSubmissionIndex(..)) {
+                        gpu_lost(&self.gpu);
+                    }
                     return Err(ComputeError::Message(err.to_string()));
                 }
             }
