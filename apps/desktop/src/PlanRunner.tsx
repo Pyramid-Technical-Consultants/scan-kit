@@ -100,6 +100,7 @@ export function PlanRunner() {
   const [waiting, setWaiting] = useState(true);
   usePageLoad(waiting || busy || copying, copyReport?.done ?? 0, copyReport?.total ?? 0);
   const copyToken = useRef<object>({});
+  const copyBusyRef = useRef(false);
   const busyRef = useRef(false);
   const inflight = useRef(false);
   const statusFailures = useRef(0);
@@ -291,9 +292,11 @@ export function PlanRunner() {
       notifyError("Choose a local .zip path for the session.");
       return;
     }
-    if (copyBusy) {
+    // State has not flushed for a same-frame second click — check the ref.
+    if (copyBusyRef.current) {
       return;
     }
+    copyBusyRef.current = true;
     setCopyBusy(true);
     try {
       const mine = {};
@@ -330,6 +333,7 @@ export function PlanRunner() {
     } finally {
       // The copy streams over HTTP for minutes — holding busyRef for it
       // would freeze Stop/Pause and skip every status poll.
+      copyBusyRef.current = false;
       setCopyBusy(false);
     }
   }

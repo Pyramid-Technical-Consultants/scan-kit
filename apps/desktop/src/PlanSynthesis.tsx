@@ -198,6 +198,8 @@ export function PlanSynthesis() {
   const [plan, setPlan] = useState<PlanResult | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  // State has not flushed for a same-frame second click — check the ref.
+  const busyRef = useRef(false);
   const [waiting, setWaiting] = useState(true);
   usePageLoad(waiting || busy);
   const [saveDir, setSaveDir] = useState("");
@@ -270,9 +272,10 @@ export function PlanSynthesis() {
   }
 
   async function generate() {
-    if (template == null) {
+    if (template == null || busyRef.current) {
       return;
     }
+    busyRef.current = true;
     setBusy(true);
     setError(null);
     // Inputs stay editable while the invoke is in flight — a late result must
@@ -292,6 +295,7 @@ export function PlanSynthesis() {
         setError(caught instanceof Error ? caught.message : String(caught));
       }
     } finally {
+      busyRef.current = false;
       setBusy(false);
     }
   }
@@ -314,9 +318,10 @@ export function PlanSynthesis() {
   }
 
   async function savePlan() {
-    if (busy || plan == null || template == null) {
+    if (busyRef.current || plan == null || template == null) {
       return;
     }
+    busyRef.current = true;
     setBusy(true);
     try {
       const selected = await save({
@@ -338,6 +343,7 @@ export function PlanSynthesis() {
     } catch (caught) {
       notifyError(caught);
     } finally {
+      busyRef.current = false;
       setBusy(false);
     }
   }
