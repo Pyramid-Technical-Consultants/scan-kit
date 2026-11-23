@@ -258,7 +258,9 @@ fn plot_panel(space: &Workspace, kind: PlotKind) -> Panel {
         PlotKind::Gamma => {
             let (title, series) = gamma_panel(space);
             let y_label = match space.gamma {
-                Some((_, rate)) => format!("Voxels · {rate:.0}% {}", gamma_verdict(rate)),
+                Some((_, rate)) => {
+                    format!("Voxels · {:.0}% {}", rate.floor(), gamma_verdict(rate))
+                }
                 None => "Voxels".into(),
             };
             (title, series, y_label)
@@ -301,7 +303,13 @@ fn gamma_verdict(rate: f32) -> &'static str {
 }
 
 fn gamma_heading(rate: f32) -> String {
-    format!("Gamma Histogram  {rate:.0}% {}", gamma_verdict(rate))
+    // Truncate — 94.6% rounding up to "95" would cross the action boundary
+    // the verdict itself cites.
+    format!(
+        "Gamma Histogram  {:.0}% {}",
+        rate.floor(),
+        gamma_verdict(rate)
+    )
 }
 
 fn gamma_panel(space: &Workspace) -> (String, Vec<Series>) {
@@ -685,6 +693,10 @@ mod tests {
         assert!(gamma_heading(95.0).ends_with("pass"));
         assert!(gamma_heading(90.0).ends_with("action"));
         assert!(gamma_heading(89.9).ends_with("fail"));
+        // The shown rate must not round up past the verdict's boundary.
+        assert!(gamma_heading(94.9).contains("94%"));
+        assert!(gamma_heading(94.9).ends_with("action"));
+        assert!(gamma_heading(89.99).contains("89%"));
     }
 
     #[test]

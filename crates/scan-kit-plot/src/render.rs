@@ -5112,7 +5112,8 @@ fn follow_span(
             if !run.monotonic || run.count == 0 {
                 continue;
             }
-            let Some(series) = lines.get(run.start as usize..(run.start + run.count) as usize)
+            let Some(series) =
+                lines.get(run.start as usize..run.start as usize + run.count as usize)
             else {
                 continue;
             };
@@ -5329,7 +5330,8 @@ fn visible_draws(
             continue;
         }
         let (offset, shown) = if run.timed {
-            let Some(range) = points.get(run.start as usize..(run.start + run.count) as usize)
+            let Some(range) =
+                points.get(run.start as usize..run.start as usize + run.count as usize)
             else {
                 continue;
             };
@@ -5378,7 +5380,8 @@ fn visible_line_draws(
             draws.push((run.start, run.count));
             continue;
         }
-        let Some(series) = lines.get(run.start as usize..(run.start + run.count) as usize) else {
+        let Some(series) = lines.get(run.start as usize..run.start as usize + run.count as usize)
+        else {
             continue;
         };
         let (first, stop) = window_range(series, lo, hi);
@@ -7240,7 +7243,14 @@ fn profile_lines(
                 volume.index_of(1, mm[1]),
                 volume.index_of(2, mm[2]),
             ],
-            None => cursor,
+            None => {
+                if index != grid.session_focus {
+                    // An empty session has no profile — falling back to home
+                    // would draw the focused curve in this session's color.
+                    continue;
+                }
+                cursor
+            }
         };
         let color = grid.session_colors.get(index).copied().unwrap_or(fallback);
         let volume = foreign.unwrap_or(home);
@@ -10558,6 +10568,47 @@ mod tests {
         let orange = lines.iter().find(|line| line.color[0] > 0.5).unwrap();
         assert!((blue.a[1].max(blue.b[1]) - 4.0).abs() < 1e-3);
         assert!((orange.a[1].max(orange.b[1]) - 9.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn an_empty_companion_session_draws_no_profile() {
+        // Only the focused session may borrow the home volume — an empty
+        // companion used to draw the focused curve again in its color.
+        let mut scene = line_scene();
+        scene.panels[0].title = "Depth dose".into();
+        scene.panels[0].series.clear();
+        scene.panels[0].y_label = "Gy".into();
+        scene.volume = scan_kit_core::VolumeMark {
+            values: vec![1.0, 4.0],
+            shape: [1, 1, 2],
+            origin: [0.0; 3],
+            voxel: 1.0,
+            session_colors: vec![[0.1, 0.2, 0.8, 1.0], [0.9, 0.4, 0.1, 1.0]],
+            session_focus: 0,
+            sessions: vec![
+                scan_kit_core::SessionDose {
+                    values: Vec::new(),
+                    shape: [1, 1, 2],
+                    origin: [0.0; 3],
+                    voxel: 1.0,
+                },
+                scan_kit_core::SessionDose {
+                    values: Vec::new(),
+                    shape: [1, 1, 2],
+                    origin: [0.0; 3],
+                    voxel: 1.0,
+                },
+            ],
+            ..scan_kit_core::VolumeMark::default()
+        };
+        let plot = Plot::new(&scene, [0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0, 1.0]);
+        let lines: Vec<_> = plot
+            .live
+            .iter()
+            .filter(|cloud| cloud.panel == 0)
+            .flat_map(|cloud| cloud.lines.iter())
+            .collect();
+        assert_eq!(lines.len(), 1, "focus line only, not one per empty session");
     }
 
     #[test]

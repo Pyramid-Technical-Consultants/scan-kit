@@ -610,7 +610,12 @@ pub(crate) fn decode_plot(
             || !fits(batch.point_start, batch.point_count, marks.points.len())
             || !fits(batch.quad_start, batch.quad_count, marks.quads.len())
             || batch.heats.iter().any(|(quad, texture)| {
-                *quad as usize >= marks.quads.len() || *texture >= marks.heatmaps.len()
+                // Heats are appended past the batch's solid quads — an index
+                // inside the solid range would draw the quad twice.
+                let solid_end = batch.quad_start as usize + batch.quad_count as usize;
+                (*quad as usize) < solid_end && *quad >= batch.quad_start
+                    || *quad as usize >= marks.quads.len()
+                    || *texture >= marks.heatmaps.len()
             })
             || batch
                 .line_runs
@@ -1276,6 +1281,67 @@ mod tests {
         // the GPU would draw past the uploaded buffer.
         header["line_prefix"] = serde_json::json!(1_000_000u64);
         header["batches"][0]["line_start"] = serde_json::json!(u32::MAX - 1);
+        let json = serde_json::to_vec(&header).unwrap();
+        let mut out = (json.len() as u32).to_le_bytes().to_vec();
+        out.extend(&json);
+        out.extend(&bytes[4 + json_len..]);
+        assert!(decode_plot(&out).is_err());
+    }
+
+    #[test]
+    fn a_heat_index_inside_the_solid_quads_is_rejected() {
+        // Heats are appended past the batch's solid quads — an index into
+        // the solid range would draw that quad twice.
+        let scene = PlotScene {
+            title: "t".into(),
+            panels: vec![Panel {
+                title: String::new(),
+                y_label: String::new(),
+                x_label: String::new(),
+                xmin: 0.0,
+                xmax: 4.0,
+                ymin: 0.0,
+                ymax: 4.0,
+                series: vec![
+                    Series::Rects {
+                        x: vec![0.0],
+                        y: vec![0.0],
+                        w: vec![1.0],
+                        h: vec![1.0],
+                        color: [1.0; 4],
+                    },
+                    Series::Heatmap {
+                        values: vec![0.0, 1.0, 1.0, 0.0],
+                        cols: 2,
+                        rows: 2,
+                        ramp: 0,
+                        color: [1.0; 4],
+                        lo: 0.0,
+                        hi: 1.0,
+                    },
+                ],
+                x_labels: Vec::new(),
+                equal: false,
+            }],
+            controls: Vec::new(),
+            table: None,
+            columns: 1,
+            column_weights: vec![1.0],
+            row_weights: vec![1.0],
+            side: 0,
+            row_splits: Vec::new(),
+            volume: scan_kit_core::VolumeMark::default(),
+        };
+        let bytes = encode_plot(&scene, [0.0; 4], [1.0; 4]).unwrap();
+        let json_len = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
+        let mut header: serde_json::Value =
+            serde_json::from_slice(&bytes[4..4 + json_len]).unwrap();
+        let batch = &header["batches"][0];
+        let quad_start = batch["quad_start"].as_u64().unwrap();
+        // The encoded heat points past the solid quads — point it inside.
+        let heat = header["batches"][0]["heats"][0][0].as_u64().unwrap();
+        assert!(heat >= quad_start + batch["quad_count"].as_u64().unwrap());
+        header["batches"][0]["heats"][0][0] = serde_json::json!(quad_start);
         let json = serde_json::to_vec(&header).unwrap();
         let mut out = (json.len() as u32).to_le_bytes().to_vec();
         out.extend(&json);
