@@ -917,7 +917,10 @@ export function AnalysisView({
           if (stop || openSeq.current !== ticket) {
             return;
           }
-          const raw = await invoke<ArrayBuffer | Uint8Array>("scan_kit_poll", { task: started.task });
+          const raw = await invoke<ArrayBuffer | Uint8Array>("scan_kit_poll", {
+            task: started.task,
+            generation: started.generation,
+          });
           if (stop || openSeq.current !== ticket) {
             return;
           }

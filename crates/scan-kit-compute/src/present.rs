@@ -285,6 +285,9 @@ pub(crate) fn finish_patient_report(
         provenance,
     );
     let dest = Path::new(dest);
+    // Build the CSV before writing the PDF - a DVH error must not leave a
+    // fresh PDF beside the report the task calls failed.
+    let csv = scan_kit_io::report::dvh_csv(&curves)?;
     let pdf = scan_kit_io::report::write_pdf(&report, dest)?;
     let csv_path = dest.with_file_name(format!(
         "{}_dvh.csv",
@@ -292,7 +295,6 @@ pub(crate) fn finish_patient_report(
             .and_then(|stem| stem.to_str())
             .unwrap_or("report")
     ));
-    let csv = scan_kit_io::report::dvh_csv(&curves)?;
     let mut out = json!({
         "pdf": pdf.display().to_string(),
         "provenance": report.provenance,
