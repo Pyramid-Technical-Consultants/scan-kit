@@ -49,9 +49,11 @@ export function ButtonSegmentGroup({
   orientation?: "horizontal" | "vertical";
   onChange: (value: string) => void;
 }) {
-  const labels = options.map(optionText);
   const matched = options.find((option) => sameChoice(option, value));
-  const selected = matched == null ? labels[0] : optionText(matched);
+  // A value that matches nothing must show no selection — falling back to
+  // the first option would highlight a choice the state does not hold and
+  // make that option un-clickable (it already looks pressed).
+  const selected = matched == null ? undefined : optionText(matched);
   return (
     <ToggleGroup
       variant="outline"

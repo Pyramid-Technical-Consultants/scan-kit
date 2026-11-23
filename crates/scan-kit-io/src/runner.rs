@@ -203,12 +203,21 @@ pub fn upload(db: &Path, csv_path: &Path) -> Result<Value, String> {
     let (host, epoch, target) = {
         let mut guard = lock();
         let live = guard.as_mut().ok_or("not connected")?;
+        let epoch = live.epoch;
         set_field(
             &mut live.socket,
             POINTS_UPLOAD_TARGET,
             &json!(DEFAULT_CONTROL_POINTS),
         )?;
+        // The settle wait does not need the socket — release LIVE so status
+        // reads and control actions are not frozen behind it.
+        drop(guard);
         thread::sleep(Duration::from_millis(200));
+        let mut guard = lock();
+        let live = guard
+            .as_mut()
+            .filter(|live| live.epoch == epoch)
+            .ok_or("connection changed")?;
         let read = read_one(
             &mut live.socket,
             POINTS_UPLOAD_TARGET,

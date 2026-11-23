@@ -303,7 +303,7 @@ export function ConfigTuning({
         }
       }
     })().catch((caught: unknown) => {
-      if (!cancel) {
+      if (!cancel && seq === openSeq.current) {
         notifyError(caught);
       }
     });

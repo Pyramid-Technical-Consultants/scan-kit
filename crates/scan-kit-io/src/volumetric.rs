@@ -1839,8 +1839,15 @@ fn gamma_with(
 ) -> (Vec<f32>, u32, u32) {
     // A session without a plan has an empty cube. Its gamma stays unscored on
     // the measured lattice, so the image keeps the shape the cells index.
-    if plan.values.len() != measured.values.len() || plan.shape != measured.shape {
-        return (vec![0.0; measured.values.len()], 0, 0);
+    // Shape alone is not enough — a plan on a shifted or rescaled lattice
+    // with the same dims would score voxel-for-voxel against the wrong
+    // geometry and still return a pass rate.
+    if plan.values.len() != measured.values.len()
+        || plan.shape != measured.shape
+        || plan.origin != measured.origin
+        || plan.spacing != measured.spacing
+    {
+        return (vec![f32::NAN; measured.values.len()], 0, 0);
     }
     // A compare, plot, or cell change rebuilds the scene on the same cubes.
     // Matching the cubes exactly is one pass over each, far below a search.
@@ -2287,6 +2294,27 @@ mod tests {
         assert!(changed.1 < first.1, "a new plan reused the old gamma");
         let looser = super::gamma_with(&measured, &far, 5.0, 2.0, 10.0);
         assert_ne!(looser.0, changed.0, "new criteria reused the old gamma");
+    }
+
+    #[test]
+    fn a_shifted_plan_lattice_is_unscored() {
+        let measured = Volume {
+            origin: [0.0; 3],
+            shape: [2, 2, 2],
+            spacing: [2.0; 3],
+            values: vec![1.0; 8],
+        };
+        // Same dims but a moved lattice — voxel-for-voxel scoring would
+        // compare the wrong geometry and still report a pass rate.
+        let mut plan = measured.clone();
+        plan.origin[0] = 4.0;
+        let (gamma, passed, scored) = super::gamma_with(&measured, &plan, 3.0, 2.0, 10.0);
+        assert_eq!((passed, scored), (0, 0));
+        assert!(gamma.iter().all(|v| v.is_nan()));
+        let mut plan = measured.clone();
+        plan.spacing[0] = 4.0;
+        let (_, passed, scored) = super::gamma_with(&measured, &plan, 3.0, 2.0, 10.0);
+        assert_eq!((passed, scored), (0, 0));
     }
 
     #[test]

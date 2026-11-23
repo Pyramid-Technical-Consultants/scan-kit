@@ -83,11 +83,9 @@ function ChoiceControl({
   const text = typeof value === "string" ? value : "";
   const segment = forceSegment || shortChoices(choices);
   if (segment && choices.length > 0) {
-    const current = beside
-      ? choices.some((choice) => choice.value === text)
-        ? text
-        : (choices[0]?.value ?? "")
-      : text;
+    // Beside mode must show the real value too — coercing an unmatched value
+    // to the first choice highlights a selection the param does not have.
+    const current = text;
     const grid = choices.length >= 4;
     const stacked = !beside || grid || choices.some((choice) => choice.label.length > 8);
     const group = (

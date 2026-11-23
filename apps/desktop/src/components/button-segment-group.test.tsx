@@ -38,8 +38,10 @@ it("presses the matching segment", () => {
   expect(pressed(render("Both"))).toContain("Both");
 });
 
-it("presses the first segment when the value is not in the group", () => {
-  expect(pressed(render("missing"))).toContain("Beam on");
+it("presses nothing when the value is not in the group", () => {
+  // Falling back to the first segment would highlight a choice the state
+  // does not hold — and leave it un-clickable since it already looks on.
+  expect(pressed(render("missing"))).toBe("");
 });
 
 it("presses Monte Carlo when the value is the mc id", () => {

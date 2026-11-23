@@ -108,7 +108,9 @@ pub fn gamma_index_norm(
     let [nx, ny, nz] = shape;
     let n = nx.saturating_mul(ny).saturating_mul(nz);
     let len = n.min(reference.len()).min(evaluated.len());
-    let mut gamma = vec![0.0f32; len];
+    // NaN marks an unevaluated voxel — a scored perfect match is 0.0, and the
+    // map's consumers (histogram, image) must tell the two apart.
+    let mut gamma = vec![f32::NAN; len];
     // Scoring samples both operands by `shape` up to n - 1 — a short operand
     // stays unscored rather than index out of bounds. Equal-length operands
     // with a different layout are the caller's contract: shape must describe
@@ -662,6 +664,7 @@ mod tests {
         let (gamma, scored, _) =
             gamma_index(&reference, &evaluated, shape, 3.0, 2.0, [1.0; 3], 10.0);
         assert_eq!(scored, 0);
-        assert!(gamma.iter().all(|v| *v == 0.0));
+        // Unscored voxels are NaN so a scored γ = 0 can be told apart.
+        assert!(gamma.iter().all(|v| v.is_nan()));
     }
 }

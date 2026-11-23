@@ -207,8 +207,10 @@ pub fn load_study(path: &Path) -> Result<PatientStudy, String> {
             // as Gy, off by the scale's ~1e-5.
             let scale =
                 float_tag(&elems, tag(0x3004, 0x000E)).ok_or("dose grid scaling is missing")?;
-            if !scale.is_finite() {
-                return Err("dose grid scaling is not finite".into());
+            // A zero scale decodes the whole grid to all-zero Gy and a
+            // negative one inverts it — finite is not enough.
+            if !scale.is_finite() || scale <= 0.0 {
+                return Err("dose grid scaling is not a positive number".into());
             }
             if dose_type.is_empty() {
                 dose_type = text_tag(&elems, tag(0x3004, 0x0004));
@@ -714,6 +716,11 @@ fn image_slices(elems: &[Elem], scale: f32) -> Result<Vec<Slice>, String> {
     if stored.len() < plane {
         return Err("pixel data is short".into());
     }
+    // A trailing partial frame is a truncated pixel element, not a shorter
+    // volume — error rather than silently dropping it.
+    if !stored.len().is_multiple_of(plane) {
+        return Err("pixel data ends inside a frame".into());
+    }
     let frames = stored.len() / plane;
     // Each frame materializes a Slice + heap Vec — bound the count before
     // the loop so a 1x1-plane crafted file can't amplify ~50x into OOM.
@@ -1004,10 +1011,15 @@ fn read_plan(elems: &[Elem], frame: String, ct_position: &str) -> Result<Plan, S
                         .iter()
                         .find(|(id, _, _)| *id == shifter_number)
                         .copied();
+                    // Some(NaN) would defeat the .or(previous) fallback — a
+                    // corrupt DS must carry the previous setting, not BDL
+                    // defaults downstream.
                     let wet = float_tag(setting, tag(0x300A, 0x0366))
+                        .filter(|v| v.is_finite())
                         .or(previous.map(|(_, wet, _)| wet))
                         .unwrap_or(f32::NAN);
                     let distance = float_tag(setting, tag(0x300A, 0x0364))
+                        .filter(|v| v.is_finite())
                         .or(previous.map(|(_, _, distance)| distance))
                         .unwrap_or(f32::NAN);
                     in_shifters.retain(|(id, _, _)| *id != shifter_number);
@@ -1032,6 +1044,11 @@ fn read_plan(elems: &[Elem], frame: String, ct_position: &str) -> Result<Plan, S
                     "beam {number}: meterset weights do not match the spot count"
                 ));
             }
+            // A modulated beam's weight map is Type 1C — absent, every spot
+            // computes mu = 0 and the beam silently empties.
+            if !has_weights && limit > 0 && text_tag(beam, tag(0x300A, 0x0308)) == "MODULATED" {
+                return Err(format!("beam {number}: meterset weights are missing"));
+            }
             if in_shifters.len() > 1 {
                 return Err(format!(
                     "beam {number}: more than one range shifter IN is not supported"
@@ -1053,9 +1070,9 @@ fn read_plan(elems: &[Elem], frame: String, ct_position: &str) -> Result<Plan, S
                 let mu = weights.get(i).copied().unwrap_or(0.0) * meterset / final_weight;
                 let x = xy.get(i * 2).copied().unwrap_or(f32::NAN);
                 let y = xy.get(i * 2 + 1).copied().unwrap_or(f32::NAN);
-                // A non-finite position reaches the transport and the plan
-                // CSV — reject it like a non-finite energy.
-                if mu > 0.0 && x.is_finite() && y.is_finite() {
+                // A non-finite position or meterset reaches the transport
+                // and the plan CSV — reject it like a non-finite energy.
+                if mu.is_finite() && mu > 0.0 && x.is_finite() && y.is_finite() {
                     spots.push(Spot {
                         energy,
                         x,
@@ -1169,16 +1186,17 @@ pub fn inside_structure(
             continue;
         };
         // A contour whose vertices straddle slices can't rasterize on one
-        // plane — skip it rather than stamping it onto the wrong slice.
+        // plane — skip it rather than stamping it onto the wrong slice. A
+        // contour lying between slices stamps only its nearest slice —
+        // a distance window would admit it on both, painting a phantom
+        // slice into the mask.
         let (z_lo, z_hi) = contour
             .iter()
             .fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), p| {
                 (lo.min(p[2]), hi.max(p[2]))
             });
-        if !z0.is_finite()
-            || z_hi - z_lo > ct.spacing[2] * 0.1
-            || (center[2] - z0).abs() > ct.spacing[2] * 0.6
-        {
+        let nearest = ((z0 - ct.origin[2]) / ct.spacing[2]).round() as i64;
+        if !z0.is_finite() || z_hi - z_lo > ct.spacing[2] * 0.1 || nearest != z as i64 {
             continue;
         }
         on_plane = true;
@@ -1415,9 +1433,17 @@ fn parse_dataset_mode(bytes: &[u8], implicit: bool, depth: u32) -> Result<Vec<El
     Ok(elems)
 }
 
-/// First four bytes of a defined-length sequence value: the FFFE,E000 Item tag.
+/// First eight bytes of a defined-length sequence value: the FFFE,E000 Item
+/// tag plus its declared length. Under implicit VR a binary element can
+/// start with those same four bytes (e.g. two stored values 0xFFFE/0xE000)
+/// — requiring the first item's length to fit inside the value shrinks the
+/// false-positive window to near zero.
 fn looks_like_items(value: &[u8]) -> bool {
-    value.len() >= 8 && value[..4] == [0xFE, 0xFF, 0x00, 0xE0]
+    if value.len() < 8 || value[..4] != [0xFE, 0xFF, 0x00, 0xE0] {
+        return false;
+    }
+    let item_len = u32::from_le_bytes([value[4], value[5], value[6], value[7]]) as usize;
+    item_len == u32::MAX as usize || item_len <= value.len() - 8
 }
 
 fn parse_items(bytes: &[u8], implicit: bool, depth: u32) -> Result<Vec<Vec<Elem>>, String> {
@@ -1454,6 +1480,11 @@ fn parse_items(bytes: &[u8], implicit: bool, depth: u32) -> Result<Vec<Vec<Elem>
         }
         items.push(parse_dataset_mode(&bytes[start..end], implicit, depth)?);
         cursor = end;
+    }
+    // Same tail rule as parse_dataset_mode — a defined-length SQ that ends
+    // mid-item-header drops the remainder silently otherwise.
+    if bytes[cursor..].iter().any(|byte| *byte != 0) {
+        return Err("the sequence ends inside an item header".into());
     }
     Ok(items)
 }
@@ -1709,6 +1740,19 @@ pub(crate) fn fl(
     push_elem(bytes, group, element, b"FL", &raw)
 }
 
+pub(crate) fn fd(
+    bytes: &mut Vec<u8>,
+    group: u16,
+    element: u16,
+    values: &[f64],
+) -> Result<(), String> {
+    let mut raw = Vec::with_capacity(values.len() * 8);
+    for value in values {
+        raw.extend_from_slice(&value.to_le_bytes());
+    }
+    push_elem(bytes, group, element, b"FD", &raw)
+}
+
 pub(crate) fn is(bytes: &mut Vec<u8>, group: u16, element: u16, value: i32) -> Result<(), String> {
     push_elem(bytes, group, element, b"IS", &even(&value.to_string()))
 }
@@ -1876,7 +1920,7 @@ pub fn write_rtdose(
         ));
     }
     if ct.frame.is_empty() {
-        return Err("the dose grid and CT are in different frames of reference".into());
+        return Err("the CT has no frame of reference".into());
     }
     let peak = dose.iter().fold(0.0f64, |peak, &v| {
         peak.max(if v.is_nan() { 0.0 } else { v as f64 })
@@ -2309,7 +2353,10 @@ mod tests {
         assert!(study.tps.is_some());
         assert_eq!(study.ct.frame, "1.2.3.4.5");
         assert_eq!(study.tps.as_ref().unwrap().frame, "1.2.3.4.5");
-        assert!(inside_structure(&study, &study.structures[0], 1, 1, 0));
+        // The fixture contour sits at z=0.5 — midway between slices — and
+        // must stamp exactly its nearest slice, not both.
+        assert!(!inside_structure(&study, &study.structures[0], 1, 1, 0));
+        assert!(inside_structure(&study, &study.structures[0], 1, 1, 1));
         let mut extra = preamble();
         ui(&mut extra, 0x0008, 0x0016, "1.2.840.10008.5.1.4.1.1.2").unwrap();
         ui(&mut extra, 0x0020, 0x0052, "9.9.9").unwrap();
@@ -3092,6 +3139,79 @@ mod tests {
         // 2 and 3 — the export must be rejected instead.
         assert!(read_plan(&plan_with_weights(3, 3, 1), "f".into(), "HFS").is_err());
         assert!(read_plan(&plan_with_weights(3, 3, 3), "f".into(), "HFS").is_ok());
+    }
+
+    #[test]
+    fn a_modulated_beam_without_weights_is_an_error() {
+        // ScanSpotMetersetWeights is Type 1C under MODULATED — absent, every
+        // spot computes mu = 0 and the beam silently empties.
+        let mut ref_beam = Vec::new();
+        is(&mut ref_beam, 0x300C, 0x0006, 1).unwrap();
+        ds(&mut ref_beam, 0x300A, 0x0086, &[10.0]).unwrap();
+        let mut group = Vec::new();
+        is(&mut group, 0x300A, 0x0078, 1).unwrap();
+        sq(&mut group, 0x300C, 0x0004, &[ref_beam]).unwrap();
+        let mut cp = Vec::new();
+        ds(&mut cp, 0x300A, 0x0114, &[100.0]).unwrap();
+        ds(&mut cp, 0x300A, 0x011E, &[0.0]).unwrap();
+        ds(&mut cp, 0x300A, 0x0122, &[0.0]).unwrap();
+        ds(&mut cp, 0x300A, 0x012C, &[0.0, 0.0, 0.0]).unwrap();
+        is(&mut cp, 0x300A, 0x0392, 2).unwrap();
+        ds(&mut cp, 0x300A, 0x0394, &[1.0, -1.0, 2.0, -2.0]).unwrap();
+        let mut beam = Vec::new();
+        is(&mut beam, 0x300A, 0x00C0, 1).unwrap();
+        ds(&mut beam, 0x300A, 0x010E, &[1.0]).unwrap();
+        cs(&mut beam, 0x300A, 0x0308, "MODULATED").unwrap();
+        is(&mut beam, 0x300C, 0x006A, 1).unwrap();
+        sq(&mut beam, 0x300A, 0x03A8, &[cp]).unwrap();
+        let mut plan = Vec::new();
+        sq(&mut plan, 0x300A, 0x0070, &[group]).unwrap();
+        sq(&mut plan, 0x300A, 0x03A2, &[beam]).unwrap();
+        assert!(read_plan(&parse_dataset(&plan).unwrap(), "f".into(), "HFS").is_err());
+    }
+
+    #[test]
+    fn an_oversized_item_length_is_not_a_sequence() {
+        // A binary value can begin with the FFFE,E000 item bytes — the
+        // first item's declared length must still fit inside the value, or
+        // a pair of stored 0xFFFE/0xE000 words would parse as phantom items.
+        let mut value = vec![0xFE, 0xFF, 0x00, 0xE0];
+        value.extend_from_slice(&100u32.to_le_bytes());
+        value.extend_from_slice(&[0; 8]);
+        assert!(!looks_like_items(&value));
+        let mut value = vec![0xFE, 0xFF, 0x00, 0xE0];
+        value.extend_from_slice(&0u32.to_le_bytes());
+        assert!(looks_like_items(&value));
+    }
+
+    #[test]
+    fn a_sequence_ending_mid_item_header_is_an_error() {
+        let mut bytes = vec![0xFE, 0xFF, 0x00, 0xE0];
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&[0xFE, 0xFF, 0x00]); // half an item header
+        assert!(parse_items(&bytes, true, 0).is_err());
+        // An all-zero tail stays tolerated padding.
+        let mut padded = vec![0xFE, 0xFF, 0x00, 0xE0];
+        padded.extend_from_slice(&0u32.to_le_bytes());
+        padded.extend_from_slice(&[0, 0, 0]);
+        assert!(parse_items(&padded, true, 0).is_ok());
+    }
+
+    #[test]
+    fn a_partial_pixel_frame_is_an_error() {
+        let mut bytes = Vec::new();
+        us(&mut bytes, 0x0028, 0x0010, 2).unwrap();
+        us(&mut bytes, 0x0028, 0x0011, 2).unwrap();
+        ds(&mut bytes, 0x0028, 0x0030, &[1.0, 2.0]).unwrap();
+        ds(&mut bytes, 0x0020, 0x0032, &[0.0, 0.0, 10.0]).unwrap();
+        us(&mut bytes, 0x0028, 0x0100, 16).unwrap();
+        us(&mut bytes, 0x0028, 0x0103, 1).unwrap();
+        ds(&mut bytes, 0x0028, 0x1052, &[0.0]).unwrap();
+        ds(&mut bytes, 0x0028, 0x1053, &[1.0]).unwrap();
+        ds(&mut bytes, 0x0018, 0x0050, &[2.5]).unwrap();
+        // A 2x2 plane is 4 words — five ends inside the second frame.
+        ow(&mut bytes, 0x7FE0, 0x0010, &[1, 2, 3, 4, 5]).unwrap();
+        assert!(image_slices(&parse_dataset(&bytes).unwrap(), 1.0).is_err());
     }
 
     #[test]
