@@ -57,7 +57,7 @@ pub struct VolumeScan {
     /// Max |dose|. The slice atlas stores a signed window around this.
     pub abs_peak: f32,
     pub peak_at: [usize; 3],
-    /// Sum through z, y, and x, in dose × mm. Axial, coronal, sagittal.
+    /// Sum through z, y, and x, in dose - mm. Axial, coronal, sagittal.
     pub integrals: [Vec<f32>; 3],
     pub integral_peaks: [f32; 3],
 }
@@ -92,7 +92,7 @@ pub fn brick_grid(volume: &Volume) -> (Vec<f32>, [usize; 3]) {
     (scan.bricks, scan.brick_shape)
 }
 
-/// Brightest axis-aligned line integral, in dose × mm.
+/// Brightest axis-aligned line integral, in dose - mm.
 pub fn line_scale(volume: &Volume) -> f32 {
     scan_volume(volume).line_scale
 }
@@ -116,7 +116,7 @@ fn scan_axes(values: &[f32], shape: [usize; 3], spacing: [f32; 3]) -> VolumeScan
     let pairs = [nx.checked_mul(ny), nx.checked_mul(nz), ny.checked_mul(nz)];
     let voxels = pairs[0]
         .and_then(|plane| plane.checked_mul(nz))
-        .filter(|_| pairs.iter().all(Option::is_some));
+        .filter(|voxels| pairs.iter().all(Option::is_some) && *voxels <= values.len());
     let Some(voxels) = voxels else {
         return VolumeScan {
             bricks: Vec::new(),
@@ -332,6 +332,23 @@ fn accumulate_z(values: &[f32], shape: [usize; 3], z0: usize, z1: usize) -> ZPar
 
 fn scan_axes_serial(values: &[f32], shape: [usize; 3], spacing: [f32; 3]) -> VolumeScan {
     let [nx, ny, nz] = shape;
+    // Same bound as the parallel path - no buffer may exceed `values`.
+    if nx
+        .checked_mul(ny)
+        .and_then(|plane| plane.checked_mul(nz))
+        .is_none_or(|voxels| voxels > values.len())
+    {
+        return VolumeScan {
+            bricks: Vec::new(),
+            brick_shape: [1, 1, 1],
+            line_scale: 1.0,
+            peak: 0.0,
+            abs_peak: 0.0,
+            peak_at: [0, 0, 0],
+            integrals: [Vec::new(), Vec::new(), Vec::new()],
+            integral_peaks: [0.0; 3],
+        };
+    }
     let brick_shape = [
         nx.div_ceil(BRICK).max(1),
         ny.div_ceil(BRICK).max(1),
@@ -535,9 +552,9 @@ pub fn ray_value(
     march(volume, &scan.bricks, scan.brick_shape, view, [u, v]).0
 }
 
-/// Brightest |line integral| on this view, in dose × mm.
+/// Brightest |line integral| on this view, in dose - mm.
 ///
-/// `peak_at` is the voxel `scan_volume` already found. The 16×16 probe can miss
+/// `peak_at` is the voxel `scan_volume` already found. The 16 - 16 probe can miss
 /// that ray, and walking the lattice again to find it costs more than the probe
 /// on a sparse beam.
 ///
@@ -708,7 +725,7 @@ fn march(
             (q[2] - volume.origin[2]) / spacing[2],
         ];
         let occupancy = brick_at(bricks, brick_shape, cell);
-        if occupancy <= 0.0 || (view.mode == 1 && occupancy <= peak) {
+        if occupancy <= 0.0 || (view.mode == 1 && view.filter != 2 && occupancy <= peak) {
             i += steps_to_leave(cell, step_dir, spacing, step).max(1);
             continue;
         }
@@ -1763,5 +1780,15 @@ mod tests {
             values: vec![1.0f32; 8],
         };
         assert!(raymarch(&volume, 0.0, 0.0, 0, 0, usize::MAX, 2).is_empty());
+    }
+
+    #[test]
+    fn a_huge_shape_product_returns_an_empty_scan() {
+        // [1, 1, usize::MAX] overflows nothing yet cannot be allocated -
+        // the shape must be rejected before the vec! buffers.
+        let scan = scan_grid(&[1.0f32; 4], [1, 1, usize::MAX], 1.0);
+        assert!(scan.bricks.is_empty());
+        let serial = scan_axes_serial(&[1.0f32; 4], [1, 1, usize::MAX], [1.0; 3]);
+        assert!(serial.bricks.is_empty());
     }
 }

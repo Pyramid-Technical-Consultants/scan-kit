@@ -44,7 +44,14 @@ pub(super) fn prepare(
     let mut residual = Vec::with_capacity(pencils.len());
     let mut kept = Vec::with_capacity(pencils.len());
     for pencil in pencils {
-        if !pencil.energy.is_finite() || !pencil.amount.is_finite() || pencil.amount == 0.0 {
+        if !pencil.energy.is_finite()
+            || !pencil.amount.is_finite()
+            || pencil.amount == 0.0
+            || !pencil.x.is_finite()
+            || !pencil.y.is_finite()
+            || !pencil.sx.is_finite()
+            || !pencil.sy.is_finite()
+        {
             residual.push(0.0);
             kept.push(0.0);
             continue;
@@ -177,6 +184,11 @@ pub(super) fn dose_grid(
         // off an explicitly requested slab depth.
         lo_i[2] = lo_i[2].max((floor / v).floor());
         hi_i[2] = hi_i[2].max(lo_i[2] + 1.0);
+    }
+    // A finite-but-extreme coordinate still floors/ceils to +/-inf - bail
+    // to the empty grid instead of emitting a non-finite origin.
+    if !lo_i.iter().all(|v| v.is_finite()) || !hi_i.iter().all(|v| v.is_finite()) {
+        return ([0.0, 0.0, 0.0], [1, 1, 1]);
     }
     let mut shape = [1usize; 3];
     for i in 0..3 {
@@ -592,8 +604,8 @@ fn enroll(
 ) -> usize {
     if let Some(&id) = map.get(&key) {
         let shift = voxel_shift(center, groups[id].center, voxel);
-        let rel0 = i0 as isize - shift;
-        let rel1 = i1 as isize - shift;
+        let rel0 = (i0 as isize).saturating_sub(shift);
+        let rel1 = (i1 as isize).saturating_sub(shift);
         let group = &mut groups[id];
         group.rel0 = group.rel0.min(rel0);
         group.rel1 = group.rel1.max(rel1);
@@ -1125,7 +1137,7 @@ pub(super) fn axis_index(coord: f32, origin: f32, voxel: f32, n: usize) -> usize
         return 0;
     }
     let i = ((coord - origin) / voxel).floor() as i32;
-    i.clamp(0, n as i32 - 1) as usize
+    i.clamp(0, i32::try_from(n - 1).unwrap_or(i32::MAX)) as usize
 }
 
 pub(super) fn depth_lateral(
@@ -1229,7 +1241,7 @@ fn fill_normal_edges(center: f32, sigma: f32, origin: f32, i0: isize, voxel: f32
     for (i, slot) in out.iter_mut().enumerate() {
         let edge = i0 + i as isize + 1;
         let next = erf_as((origin + edge as f64 * step - center) / sig);
-        *slot = (0.5 * (next - prev)) as f32;
+        *slot = (0.5 * (next - prev)).max(0.0) as f32;
         prev = next;
     }
 }
@@ -2129,5 +2141,49 @@ mod tests {
             None,
         );
         assert!(too_big.values.is_empty());
+    }
+
+    #[test]
+    fn an_extreme_finite_spot_still_returns_an_empty_grid() {
+        // 3e38 is finite but floors to +inf in voxel units - the grid
+        // must bail rather than emit a non-finite origin.
+        let spot = super::Prepared {
+            x: 3.0e38,
+            y: 0.0,
+            sx: 3.0,
+            sy: 3.0,
+            energy: 150.0,
+            weight: 1.0,
+            z0: 0.0,
+            z1: 10.0,
+            grow: 0.0,
+        };
+        let (origin, shape) = super::dose_grid(&[spot], 0.25, None);
+        assert!(origin.iter().all(|v| v.is_finite()));
+        assert_eq!(shape, [1, 1, 1]);
+    }
+
+    #[test]
+    fn a_nan_spot_width_is_skipped_not_shrunk() {
+        // A NaN sigma used to pass .max(0.2) and deposit a tight pencil.
+        let volume = analytic_volume(
+            WATER,
+            &[Pencil {
+                x: 0.0,
+                y: 0.0,
+                sx: f32::NAN,
+                sy: 3.0,
+                energy: 100.0,
+                amount: 1.0,
+            }],
+            Quantity::Dose,
+            1.0,
+            0.0,
+            0.0,
+            1.0,
+            2.0e-8,
+            10.0,
+        );
+        assert!(volume.values.iter().all(|v| *v == 0.0));
     }
 }

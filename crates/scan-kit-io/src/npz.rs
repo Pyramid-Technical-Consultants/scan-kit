@@ -137,7 +137,7 @@ impl Npy {
 pub fn read_npz(bytes: &[u8]) -> Result<BTreeMap<String, Npy>, String> {
     let mut archive = zip::ZipArchive::new(Cursor::new(bytes)).map_err(|err| err.to_string())?;
     let mut files = BTreeMap::new();
-    // Per-member caps still let a crafted archive request N × 4 GiB —
+    // Per-member caps still let a crafted archive request N - 4 GiB —
     // bound the decompressed total like the session readers do.
     let mut total = 0u64;
     for index in 0..archive.len() {
@@ -158,8 +158,11 @@ pub fn read_npz(bytes: &[u8]) -> Result<BTreeMap<String, Npy>, String> {
         if name.is_empty() {
             continue;
         }
-        let raw =
-            crate::discover::read_capped(&mut file, &name, crate::discover::MAX_MEMBER_BYTES)?;
+        let raw = crate::discover::read_capped(
+            &mut file,
+            &name,
+            crate::discover::MAX_MEMBER_BYTES.saturating_sub(total),
+        )?;
         total = total.saturating_add(raw.len() as u64);
         if total > crate::discover::MAX_MEMBER_BYTES {
             return Err("the npz archive is too large".into());
@@ -279,7 +282,10 @@ fn serialize_npy(entry: &Npy) -> Result<Vec<u8>, String> {
     let header = format!("{header}{:pad$}\n", "", pad = pad);
     let mut out = Vec::with_capacity(10 + header.len() + entry.data.len());
     out.extend_from_slice(b"\x93NUMPY\x01\x00");
-    out.extend_from_slice(&(header.len() as u16).to_le_bytes());
+    // v1 header length is u16 — a longer header must error, not wrap
+    // into a corrupt file (v2 exists for headers that big).
+    let header_len = u16::try_from(header.len()).map_err(|_| "npy header too long")?;
+    out.extend_from_slice(&header_len.to_le_bytes());
     out.extend_from_slice(header.as_bytes());
     out.extend_from_slice(&entry.data);
     Ok(out)
@@ -583,5 +589,17 @@ mod tests {
         bytes.extend_from_slice(&0u32.to_le_bytes());
         let err = parse_npy(&bytes).unwrap_err();
         assert!(err.contains("version"), "{err}");
+    }
+
+    #[test]
+    fn an_oversized_header_is_an_error_not_a_wrap() {
+        // A shape with ~20k dims needs a >64 KiB header - the u16 length
+        // must error rather than wrap into a corrupt .npy.
+        let npy = Npy {
+            descr: "x".repeat(70_000),
+            shape: vec![1],
+            data: Vec::new(),
+        };
+        assert!(serialize_npy(&npy).is_err());
     }
 }

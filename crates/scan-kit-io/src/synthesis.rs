@@ -33,7 +33,10 @@ pub fn synthesize(input: &Value, db: &Path) -> Result<Value, String> {
         .map(str::trim)
         .filter(|path| !path.is_empty())
         .map(str::to_owned);
-    if let Some(csv) = input.get("csv").and_then(Value::as_str) {
+    if let Some(csv_value) = input.get("csv") {
+        let Some(csv) = csv_value.as_str() else {
+            return Err("csv must be a string".into());
+        };
         let path = path.ok_or("path is required")?;
         if !csv.starts_with("#NO,ENERGY(MeV)") {
             return Err("The plan CSV is missing its header.".into());
@@ -122,12 +125,12 @@ pub fn synthesize(input: &Value, db: &Path) -> Result<Value, String> {
 
 fn document_json(document: &PlanDocument, written: Option<String>) -> Value {
     json!({
-        "summary": document.summary,
-        "filename": document.filename,
-        "columns": document.columns,
-        "rows": document.preview,
-        "csv": document.csv,
-        "written": written,
+    "summary": document.summary,
+    "filename": document.filename,
+    "columns": document.columns,
+    "rows": document.preview,
+    "csv": document.csv,
+    "written": written,
     })
 }
 
@@ -190,6 +193,7 @@ fn text(params: &Value, key: &str) -> String {
         .get(key)
         .and_then(Value::as_str)
         .unwrap_or("")
+        .trim()
         .to_owned()
 }
 
@@ -213,32 +217,32 @@ mod tests {
         let out = root.join("out").join("map.csv");
         let missing = synthesize(
             &json!({
-                "template": "dicom_rt_plan",
-                "params": { "dicom_path": "missing.dcm", "use_dicom_beam_size": true, "spot_order": "plan_order" },
-                "db_path": db
+            "template": "dicom_rt_plan",
+            "params": { "dicom_path": "missing.dcm", "use_dicom_beam_size": true, "spot_order": "plan_order" },
+            "db_path": db
             }),
             &db,
         );
         assert!(missing.unwrap_err().contains("not found"));
         let built = synthesize(
             &json!({
-                "template": "zero_field",
-                "params": {
-                    "selected_energies": [250.0, 70.0],
-                    "spots_per_layer": 1,
-                    "spot_weight_method": "fixed",
-                    "spot_weight_mu": 0.02
-                },
-                "path": out,
-                "db_path": db
+            "template": "zero_field",
+            "params": {
+            "selected_energies": [250.0, 70.0],
+            "spots_per_layer": 1,
+            "spot_weight_method": "fixed",
+            "spot_weight_mu": 0.02
+            },
+            "path": out,
+            "db_path": db
             }),
             &db,
         )
         .unwrap();
         let csv = fs::read_to_string(&out).unwrap();
         assert!(csv.starts_with(
-            "#NO,ENERGY(MeV),CURRENT(A),BEAM_SIZE(mm),X_POSITION(mm),Y_POSITION(mm),CHARGE_REQ(MU),VELOCITY(mm/s)\n"
-        ));
+ "#NO,ENERGY(MeV),CURRENT(A),BEAM_SIZE(mm),X_POSITION(mm),Y_POSITION(mm),CHARGE_REQ(MU),VELOCITY(mm/s)\n"
+ ));
         assert!(csv.contains("\n1,250,"));
         assert!(csv.contains("\n2,70,"));
         assert_eq!(built["written"], json!(out.to_string_lossy()));
@@ -261,15 +265,15 @@ mod tests {
             let target = root.join(bad);
             let err = synthesize(
                 &json!({
-                    "template": "zero_field",
-                    "params": {
-                        "selected_energies": [70.0],
-                        "spots_per_layer": 1,
-                        "spot_weight_method": "fixed",
-                        "spot_weight_mu": 0.02
-                    },
-                    "path": target,
-                    "db_path": db
+                "template": "zero_field",
+                "params": {
+                "selected_energies": [70.0],
+                "spots_per_layer": 1,
+                "spot_weight_method": "fixed",
+                "spot_weight_mu": 0.02
+                },
+                "path": target,
+                "db_path": db
                 }),
                 &db,
             )
@@ -278,5 +282,15 @@ mod tests {
             assert!(!target.exists(), "{bad} should not have been written");
         }
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_non_string_csv_is_an_error_not_a_generate() {
+        let err = synthesize(
+            &serde_json::json!({"template": "csv_plan", "csv": 3}),
+            Path::new("x"),
+        )
+        .unwrap_err();
+        assert!(err.contains("csv must be a string"), "{err}");
     }
 }

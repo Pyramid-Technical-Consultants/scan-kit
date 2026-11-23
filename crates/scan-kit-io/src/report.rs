@@ -242,22 +242,34 @@ fn lay_out(report: &Report) -> Result<Vec<Vec<Op>>, String> {
             Section::KeyValues(pairs) => {
                 let key_w = pairs
                     .iter()
-                    .map(|(key, _)| text_width(&format!("{key}  "), 10.0))
+                    .map(|(key, _)| text_width(&format!("{key} "), 10.0))
                     .fold(0.0f32, f32::max)
                     .min(200.0);
                 for (key, value) in pairs {
-                    text(&mut ops, MARGIN, y + 9.0, 10.0, Ink::Faint, key);
-                    for line in wrap(value, 10.0, TEXT_W - key_w - 8.0) {
+                    let row_y = y;
+                    let key_lines = wrap(key, 10.0, key_w);
+                    for (i, line) in key_lines.iter().enumerate() {
+                        text(
+                            &mut ops,
+                            MARGIN,
+                            row_y + 9.0 + i as f32 * 14.0,
+                            10.0,
+                            Ink::Faint,
+                            line,
+                        );
+                    }
+                    let value_lines = wrap(value, 10.0, TEXT_W - key_w - 8.0);
+                    for (i, line) in value_lines.iter().enumerate() {
                         text(
                             &mut ops,
                             MARGIN + key_w + 8.0,
-                            y + 9.0,
+                            row_y + 9.0 + i as f32 * 14.0,
                             10.0,
                             Ink::Body,
-                            &line,
+                            line,
                         );
-                        y += 14.0;
                     }
+                    y += 14.0 * key_lines.len().max(value_lines.len()).max(1) as f32;
                 }
                 y += 4.0;
             }
@@ -285,14 +297,26 @@ fn lay_out(report: &Report) -> Result<Vec<Vec<Op>>, String> {
                 ops.push(Op::Rule { y });
                 for row in rows {
                     let mut x = MARGIN;
+                    let mut height = ROW_H;
                     for (col, cell) in row.iter().enumerate() {
                         if col >= cols {
                             break;
                         }
-                        text(&mut ops, x + 4.0, y + 10.0, 9.0, Ink::Body, cell);
+                        let cell_lines = wrap(cell, 9.0, (widths[col] - 8.0).max(20.0));
+                        height = height.max(ROW_H * cell_lines.len() as f32);
+                        for (line_no, line) in cell_lines.iter().enumerate() {
+                            text(
+                                &mut ops,
+                                x + 4.0,
+                                y + 10.0 + line_no as f32 * ROW_H,
+                                9.0,
+                                Ink::Body,
+                                line,
+                            );
+                        }
                         x += widths[col];
                     }
-                    y += ROW_H;
+                    y += height;
                 }
                 ops.push(Op::Rule { y });
                 y += 8.0;
@@ -328,8 +352,10 @@ fn lay_out(report: &Report) -> Result<Vec<Vec<Op>>, String> {
     y += 20.0;
     let dump = serde_json::to_string_pretty(&report.provenance).unwrap_or_default();
     for line in dump.lines() {
-        text(&mut ops, MARGIN, y + 7.0, 7.5, Ink::Faint, line);
-        y += 11.0;
+        for piece in wrap(line, 7.5, TEXT_W) {
+            text(&mut ops, MARGIN, y + 7.0, 7.5, Ink::Faint, &piece);
+            y += 11.0;
+        }
     }
 
     // Greedy pagination: an op moves to the next page when it no longer fits,

@@ -61,7 +61,19 @@ pub fn normalize_options(options: &mut Value) {
     map.remove("_preview");
     for value in map.values_mut() {
         match value.clone() {
-            Value::Number(number) => *value = Value::String(number.to_string()),
+            Value::Number(number) => {
+                *value = Value::String(match number.as_i64() {
+                    Some(int) => int.to_string(),
+                    // serde_json keeps integral floats as f64  render
+                    // them like ints so flag()/pick() recognize them.
+                    None => match number.as_f64() {
+                        Some(float) if float.fract() == 0.0 && float.abs() < 9.0e15 => {
+                            format!("{}", float as i64)
+                        }
+                        _ => number.to_string(),
+                    },
+                });
+            }
             Value::Bool(flag) => *value = Value::String(flag.to_string()),
             _ => {}
         }
@@ -154,5 +166,16 @@ rci_in_trigger,r_ic1_x_confidence,r_ic1_x_peak_amplitude,c_x,r_xV,r_tx2_probe_x
         assert!(super::flag(&options, "b", false));
         assert!(!super::flag(&options, "c", true));
         assert!(super::flag(&options, "d", false));
+    }
+
+    #[test]
+    fn integral_floats_normalize_like_integers() {
+        // serde_json renders 0.0 as "0.0" - flag()/pick() only know the
+        // integer spellings, so normalize must emit them.
+        let mut options = serde_json::json!({"roi0": 0.0, "histories": 3000000.0, "cut": 0.5});
+        super::normalize_options(&mut options);
+        assert_eq!(options["roi0"], "0");
+        assert_eq!(options["histories"], "3000000");
+        assert_eq!(options["cut"], "0.5");
     }
 }

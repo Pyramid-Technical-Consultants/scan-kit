@@ -68,6 +68,10 @@ pub fn resample_linear(
                                 * if dz == 0 { 1.0 - t[2] } else { t[2] };
                             // `as isize` saturates on absurd coords — the
                             // adds must not overflow in a debug build.
+                            if weight == 0.0 {
+                                continue;
+                            }
+
                             acc += weight
                                 * get(
                                     base[0].saturating_add(dx),
@@ -192,5 +196,22 @@ mod tests {
             [1, 1, 1],
         );
         assert_eq!(out, vec![0.0]);
+    }
+
+    #[test]
+    fn a_zero_weight_nan_neighbor_does_not_poison_the_sample() {
+        // dst x=0 sits exactly on the scored voxel - the NaN neighbor
+        // has zero weight and must not leak into the result.
+        let values = [1.0f32, f32::NAN];
+        let out = resample_linear(
+            &values,
+            [0.0, 0.0, 0.0],
+            [1.0, 1.0, 1.0],
+            [2, 1, 1],
+            [0.0, 0.0, 0.0],
+            [1.0, 1.0, 1.0],
+            [1, 1, 1],
+        );
+        assert_eq!(out, vec![1.0]);
     }
 }
