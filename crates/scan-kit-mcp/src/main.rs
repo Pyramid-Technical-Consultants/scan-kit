@@ -131,9 +131,9 @@ impl ScanKit {
             // that *is* a URL must not trip the path gate. The exemption is
             // top-level only: a nested `note` key carrying a location would
             // otherwise walk straight past the gate.
-            Value::Object(map) => map
-                .iter()
-                .any(|(key, value)| !(top && key == "note") && Self::remote_in_at(value, false)),
+            Value::Object(map) => map.iter().any(|(key, value)| {
+                !(top && key == "note" && value.is_string()) && Self::remote_in_at(value, false)
+            }),
             _ => false,
         }
     }
@@ -288,6 +288,24 @@ mod tests {
     use serde_json::json;
 
     use super::ScanKit;
+
+    #[test]
+    fn a_nested_note_does_not_bypass_the_remote_gate() {
+        // Only a top-level string `note` is exempt — a nested note key, or a
+        // top-level note carrying a structured value, still trips the gate.
+        assert!(!ScanKit::remote_in_at(
+            &json!({"note": "sftp://device.invalid/data"}),
+            true
+        ));
+        assert!(ScanKit::remote_in_at(
+            &json!({"args": {"note": "sftp://device.invalid/data"}}),
+            true
+        ));
+        assert!(ScanKit::remote_in_at(
+            &json!({"note": {"path": "sftp://device.invalid/data"}}),
+            true
+        ));
+    }
 
     #[tokio::test]
     async fn sk_req_002_mcp_lists_and_calls_version_and_health() {

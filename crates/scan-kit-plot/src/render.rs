@@ -6275,6 +6275,9 @@ fn paint_color_axis(
     for y in y0..y1 {
         let t = (1.0 - ((y as f32 + 0.5 - scale.bar.y) / scale.bar.h)).clamp(0.0, 1.0);
         let rgb = scan_kit_core::sample(grid.ramp, t);
+        // The GPU bar bakes grid.opacity into the ramp-row alpha — the
+        // CPU fallback must mirror it.
+        let alpha = grid.opacity.clamp(0.0, 1.0);
         for x in x0..x1 {
             blend(
                 frame,
@@ -6282,7 +6285,7 @@ fn paint_color_axis(
                 height,
                 x,
                 y,
-                [rgb[0], rgb[1], rgb[2], 1.0],
+                [rgb[0], rgb[1], rgb[2], alpha],
                 None,
             );
         }
