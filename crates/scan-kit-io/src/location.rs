@@ -1015,6 +1015,12 @@ pub fn file_uri_path(rest: &str) -> PathBuf {
         return PathBuf::from(format!("/{path}"));
     }
     match rest.split_once('/') {
+        // file://localhost/... names this machine (RFC 8089), not a share.
+        Some((host, path))
+            if host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "[::1]" =>
+        {
+            file_uri_path(&format!("/{path}"))
+        }
         Some((host, path)) if !host.is_empty() => {
             PathBuf::from(format!("\\\\{host}\\{}", path.replace('/', "\\")))
         }
@@ -1433,8 +1439,20 @@ pub(crate) fn session_storage_paths(root: &str, session_id: &str) -> Result<Vec<
         for name in &names {
             let path = base.join(name);
             let hit = if *name == session_id {
-                path.exists()
+                // A stray file carrying the id is not the session folder.
+                path.is_dir()
+            } else if name.ends_with(".zip") {
+                // A readable zip's identity is the folder it wraps — one
+                // wrapping another session is not this session's storage,
+                // and trashing must not destroy it. An unreadable file
+                // carries no wrapped id to contradict its name.
+                path.is_file()
+                    && match discover::archive_identity(&path) {
+                        Some((id, _)) => id == session_id,
+                        None => true,
+                    }
             } else {
+                // Tars cannot peek cheaply — their filename stem IS the id.
                 path.is_file()
             };
             let place = path.to_string_lossy().into_owned();
@@ -1595,6 +1613,14 @@ mod tests {
         assert!(!super::under_root("ab/c", "a/"));
     }
 
+    #[test]
+    fn a_localhost_file_uri_is_not_a_share() {
+        let local = file_uri_path("localhost/C:/data");
+        assert_eq!(local, std::path::PathBuf::from("C:/data"));
+        let remote = file_uri_path("nas/share/dose");
+        assert!(remote.to_string_lossy().starts_with("\\"), "{remote:?}");
+    }
+
     use super::*;
 
     #[test]
@@ -1629,6 +1655,7 @@ mod tests {
         );
         assert!(paths.iter().any(|p| p.ends_with("sess")));
         assert!(paths.iter().any(|p| p.ends_with("sess.zip")));
+
         // A stale recorded spec points nowhere — it is ignored, not deleted.
         sessions().lock().unwrap().insert(
             (root_str.clone(), "gone".to_string()),
@@ -1656,6 +1683,46 @@ mod tests {
             paths.iter().any(|p| p.ends_with("a.zip")),
             "expected a.zip in {paths:?}"
         );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_name_matched_zip_wrapping_another_session_is_not_trashed() {
+        // sess.zip wrapping other/ belongs to session "other" — trashing
+        // "sess" must leave it alone.
+        let root = std::env::temp_dir().join(format!(
+            "scan-kit-foreignzip-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(root.join("sess")).unwrap();
+        fs::write(
+            root.join("sess").join("input_map.csv"),
+            b"energy
+70
+",
+        )
+        .unwrap();
+        discover::write_zip(
+            &root.join("sess.zip"),
+            &[(
+                "other/input_map.csv",
+                b"energy
+70
+",
+            )],
+        )
+        .unwrap();
+        let root_str = root.to_string_lossy().into_owned();
+        let paths = session_storage_paths(&root_str, "sess").unwrap();
+        assert!(
+            paths.iter().all(|p| !p.ends_with("sess.zip")),
+            "foreign zip trashed: {paths:?}"
+        );
+        assert!(paths.iter().any(|p| p.ends_with("sess")));
         let _ = fs::remove_dir_all(&root);
     }
 

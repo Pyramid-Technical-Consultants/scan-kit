@@ -182,6 +182,14 @@ fn devices(
             warnings.push(format!("{client} has no usable device name — skipped"));
             continue;
         }
+        if out.iter().any(|device: &CaptureDevice| device.name == name) {
+            // A second device writing the same filenames would clobber the
+            // first's captures — skip it rather than lose the data silently.
+            warnings.push(format!(
+                "{client} collides on capture name '{name}' — skipped"
+            ));
+            continue;
+        }
         out.push(CaptureDevice {
             name,
             io_root,
