@@ -693,11 +693,14 @@ pub(super) fn interlock_guides(
 
 pub(super) fn dose_gates(categories: &[f32], glyph: &str, xmin: f32, xmax: f32) -> Vec<Series> {
     let samples: Vec<f32> = if glyph == "scatter" || glyph == "contour" {
+        // A non-finite step (xmax = +inf from a degenerate span) would loop
+        // forever — iterate the fixed 41 points the condition produced.
+        let step = (xmax - xmin).max(1e-3) / 40.0;
         let mut values = Vec::new();
-        let mut mu = xmin.max(1e-4);
-        while mu <= xmax {
-            values.push(mu);
-            mu += (xmax - xmin).max(1e-3) / 40.0;
+        if step.is_finite() {
+            for i in 0..=40 {
+                values.push(xmin.max(1e-4) + i as f32 * step);
+            }
         }
         values
     } else {

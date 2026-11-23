@@ -1279,10 +1279,10 @@ fn x_span(
             .filter(|value| value.is_finite())
             .collect();
         let (lo, hi) = span(&values);
-        return (
-            lo - (hi - lo).max(1.0) * 0.05,
-            hi + (hi - lo).max(1.0) * 0.05,
-        );
+        // Padding can overflow to ±inf on extreme-but-finite columns — a
+        // non-finite extent feeds an unbounded sampling loop downstream.
+        let pad = (hi - lo).max(1.0) * 0.05;
+        return ((lo - pad).max(-f32::MAX), (hi + pad).min(f32::MAX));
     }
     if categories.is_empty() {
         return (-0.5, 0.5);
@@ -1767,7 +1767,8 @@ mod tests {
 
     #[test]
     fn sigma_is_twice_the_logged_column() {
-        let root = std::env::temp_dir().join("scan-kit-binned-sigma");
+        let root =
+            std::env::temp_dir().join(format!("scan-kit-binned-sigma-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let session = root.join("sess");
         std::fs::create_dir_all(&session).unwrap();
@@ -1795,7 +1796,8 @@ mod tests {
 
     #[test]
     fn chamber_raw_maps_strip_64_5_to_zero() {
-        let root = std::env::temp_dir().join("scan-kit-binned-chamber");
+        let root =
+            std::env::temp_dir().join(format!("scan-kit-binned-chamber-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let session = root.join("sess");
         std::fs::create_dir_all(&session).unwrap();
@@ -1839,7 +1841,8 @@ mod tests {
 
     #[test]
     fn spot_time_uses_time_s_and_time_ns_when_timestamp_is_absent() {
-        let root = std::env::temp_dir().join("scan-kit-binned-times");
+        let root =
+            std::env::temp_dir().join(format!("scan-kit-binned-times-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let session = root.join("sess");
         std::fs::create_dir_all(&session).unwrap();
@@ -1871,7 +1874,8 @@ mod tests {
 
     #[test]
     fn beam_on_time_comes_from_the_layer_run() {
-        let root = std::env::temp_dir().join("scan-kit-binned-point");
+        let root =
+            std::env::temp_dir().join(format!("scan-kit-binned-point-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let session = root.join("sess");
         std::fs::create_dir_all(session.join("layer-0/run-0")).unwrap();
@@ -1908,7 +1912,10 @@ mod tests {
 
     #[test]
     fn timeslice_sigma_stays_in_millimetres() {
-        let root = std::env::temp_dir().join("scan-kit-binned-slice-sigma");
+        let root = std::env::temp_dir().join(format!(
+            "scan-kit-binned-slice-sigma-{}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&root);
         let session = root.join("sess");
         std::fs::create_dir_all(session.join("layer-0/run-0")).unwrap();
@@ -1937,7 +1944,8 @@ mod tests {
 
     #[test]
     fn timeslice_isocenter_error_uses_the_strip_fit() {
-        let root = std::env::temp_dir().join("scan-kit-binned-slice-pos");
+        let root =
+            std::env::temp_dir().join(format!("scan-kit-binned-slice-pos-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let session = root.join("sess");
         std::fs::create_dir_all(session.join("layer-0/run-0")).unwrap();
@@ -1976,7 +1984,10 @@ mod tests {
 
     #[test]
     fn timeslice_isocenter_error_reads_spot_position() {
-        let root = std::env::temp_dir().join("scan-kit-binned-slice-spot-pos");
+        let root = std::env::temp_dir().join(format!(
+            "scan-kit-binned-slice-spot-pos-{}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&root);
         let session = root.join("sess");
         std::fs::create_dir_all(session.join("layer-0/run-0")).unwrap();
@@ -2015,7 +2026,10 @@ mod tests {
 
     #[test]
     fn timeslice_primary_channel_is_ic_current() {
-        let root = std::env::temp_dir().join("scan-kit-binned-slice-current");
+        let root = std::env::temp_dir().join(format!(
+            "scan-kit-binned-slice-current-{}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&root);
         let session = root.join("sess");
         std::fs::create_dir_all(session.join("layer-0/run-0")).unwrap();
@@ -2047,7 +2061,10 @@ mod tests {
 
     #[test]
     fn timeslice_energy_follows_the_layer_folder() {
-        let root = std::env::temp_dir().join("scan-kit-binned-slice-energy");
+        let root = std::env::temp_dir().join(format!(
+            "scan-kit-binned-slice-energy-{}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&root);
         let session = root.join("sess");
         std::fs::create_dir_all(session.join("layer-0/run-0")).unwrap();
@@ -2095,7 +2112,8 @@ mod tests {
 
     #[test]
     fn timeslice_ic2_uses_its_own_spot_number() {
-        let root = std::env::temp_dir().join("scan-kit-binned-slice-ic2");
+        let root =
+            std::env::temp_dir().join(format!("scan-kit-binned-slice-ic2-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let session = root.join("sess");
         std::fs::create_dir_all(session.join("layer-0/run-0")).unwrap();
@@ -2134,7 +2152,8 @@ mod tests {
 
     #[test]
     fn timeslice_sigma_rejects_low_confidence() {
-        let root = std::env::temp_dir().join("scan-kit-binned-slice-conf");
+        let root =
+            std::env::temp_dir().join(format!("scan-kit-binned-slice-conf-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let session = root.join("sess");
         std::fs::create_dir_all(session.join("layer-0/run-0")).unwrap();
@@ -2167,7 +2186,10 @@ mod tests {
 
     #[test]
     fn timeslice_chamber_reverses_ic2_when_closer() {
-        let root = std::env::temp_dir().join("scan-kit-binned-slice-chamber");
+        let root = std::env::temp_dir().join(format!(
+            "scan-kit-binned-slice-chamber-{}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&root);
         let session = root.join("sess");
         std::fs::create_dir_all(session.join("layer-0/run-0")).unwrap();
@@ -2384,7 +2406,8 @@ mod tests {
 
     #[test]
     fn histograms_keep_each_session_range() {
-        let root = std::env::temp_dir().join("scan-kit-binned-hist");
+        let root =
+            std::env::temp_dir().join(format!("scan-kit-binned-hist-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         for (id, dose) in [("a", "1"), ("b", "2")] {
             let session = root.join(id);
@@ -2428,7 +2451,8 @@ mod tests {
 
     #[test]
     fn page_share_uses_one_range_for_every_histogram() {
-        let root = std::env::temp_dir().join("scan-kit-binned-page");
+        let root =
+            std::env::temp_dir().join(format!("scan-kit-binned-page-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let session = root.join("a");
         std::fs::create_dir_all(&session).unwrap();
@@ -2923,7 +2947,8 @@ mod tests {
 
     #[test]
     fn position_error_correlations_use_session_colors_and_the_four_questions() {
-        let root = std::env::temp_dir().join("scan-kit-binned-corr");
+        let root =
+            std::env::temp_dir().join(format!("scan-kit-binned-corr-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let header = "ic1_total_dose_spot,r_ic1_x_spot_position,r_ic1_y_spot_position,r_ic2_x_spot_position,r_ic2_y_spot_position\n";
         write_position_session(&root, "a", &format!("{header}1,1,0,2,1\n1,2,3,6,4\n"));
@@ -3015,5 +3040,22 @@ mod tests {
             &["energy"],
         );
         assert!(table["energy"].iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn an_infinite_dose_gate_span_is_bounded() {
+        // An xmax that overflowed to +inf must not loop forever growing the
+        // sample list — the gate collapses to empty instead.
+        // The function returns three gate guides regardless; the regression
+        // is that the call returns at all, with bounded points.
+        for guides in [
+            super::glyphs::dose_gates(&[], "scatter", 0.0, f32::INFINITY),
+            super::glyphs::dose_gates(&[], "scatter", f32::MAX, f32::MAX),
+        ] {
+            assert!(guides.iter().all(|s| match s {
+                Series::Guide { xs, .. } => xs.len() <= 41,
+                _ => true,
+            }));
+        }
     }
 }

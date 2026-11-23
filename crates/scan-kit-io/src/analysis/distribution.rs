@@ -896,7 +896,12 @@ fn spot_coverage_metrics(
             if !value.is_finite() {
                 continue;
             }
-            value.round() as i32
+            let rounded = value.round();
+            // Past i32 range the cast saturates — distinct spots would merge.
+            if rounded.abs() >= 2e9 {
+                continue;
+            }
+            rounded as i32
         } else {
             i as i32
         };
