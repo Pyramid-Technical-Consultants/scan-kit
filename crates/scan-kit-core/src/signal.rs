@@ -83,7 +83,7 @@ pub fn dose_ratio_pct(delivered: &[f32], reference: &[f32]) -> Vec<f32> {
         .iter()
         .zip(reference)
         .map(|(d, r)| {
-            if d.is_finite() && r.is_finite() && r.abs() > 1e-15 {
+            if d.is_finite() && r.is_finite() && *r != 0.0 {
                 (d / r - 1.0) * 100.0
             } else {
                 f32::NAN
@@ -98,7 +98,7 @@ pub fn dose_error_pct(delivered: &[f32], target: &[f32]) -> Vec<f32> {
         .iter()
         .zip(target)
         .map(|(d, t)| {
-            if d.is_finite() && t.is_finite() && t.abs() > 1e-15 {
+            if d.is_finite() && t.is_finite() && *t != 0.0 {
                 (d - t) / t * 100.0
             } else {
                 f32::NAN
@@ -113,7 +113,7 @@ pub fn dose_per_mu(delivered: &[f32], target: &[f32]) -> Vec<f32> {
         .iter()
         .zip(target)
         .map(|(d, t)| {
-            if d.is_finite() && t.is_finite() && t.abs() > 1e-15 {
+            if d.is_finite() && t.is_finite() && *t != 0.0 {
                 d / t
             } else {
                 f32::NAN
@@ -173,7 +173,7 @@ pub fn sigma_error_pct(measured: &[f32], error_mm: &[f32]) -> Vec<f32> {
         .map(|(measured, error)| {
             if measured.is_finite() && error.is_finite() {
                 let expected = measured - error;
-                if expected > 1.0e-6 {
+                if expected > 0.0 {
                     error / expected * 100.0
                 } else {
                     f32::NAN
@@ -800,7 +800,19 @@ pub fn hv_step_window(time: &[f32], current: &[f32]) -> Option<(f32, f32)> {
     while hi + 1 < n && (current[hi + 1] - base).abs() > thr {
         hi += 1;
     }
-    Some((time[lo] - 40.0, time[hi] + 40.0))
+    // A NaN/inf edge timestamp silently erases a measurable capacitance -
+    // fall back to the row ends when the excursion edge is not finite.
+    let left = if time[lo].is_finite() {
+        time[lo]
+    } else {
+        time[0]
+    };
+    let right = if time[hi].is_finite() {
+        time[hi]
+    } else {
+        time[n - 1]
+    };
+    Some((left - 40.0, right + 40.0))
 }
 
 /// Capacitance in pF. Current is nA and time is ms, so nA·ms / V = pF.
@@ -1018,6 +1030,13 @@ pub fn resample_nearest(source: &[f32], shape: [usize; 3], out_shape: [usize; 3]
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_non_finite_edge_timestamp_falls_back_to_the_row_ends() {
+        // A NaN inside the excursion must not erase a measurable window.
+        let (lo, hi) = hv_step_window(&[f32::NAN, 1.0, 2.0], &[0.0, 10.0, 0.0]).unwrap();
+        assert!(lo.is_finite() && hi.is_finite());
+    }
 
     #[test]
     fn a_shorter_flag_list_cannot_hide_a_fail() {
