@@ -193,7 +193,7 @@ impl McRun {
             let nvox = launch.shape[0]
                 .saturating_mul(launch.shape[1])
                 .saturating_mul(launch.shape[2]);
-            if nvox > 1 << 30 {
+            if nvox > 1 << 28 {
                 return Err(ComputeError::Message("voxel grid is too large".into()));
             }
             return Ok(Self {

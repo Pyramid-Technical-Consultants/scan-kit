@@ -1465,7 +1465,7 @@ fn blank_result(job: &McJob) -> McResult {
     };
     let count = shape[0].saturating_mul(shape[1]).saturating_mul(shape[2]);
     // The placeholder must not allocate an unbounded request shape.
-    let (shape, values) = if count > 1 << 30 {
+    let (shape, values) = if count > 1 << 28 {
         ([0, 0, 0], Vec::new())
     } else {
         (shape, vec![0.0; count])

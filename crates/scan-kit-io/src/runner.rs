@@ -1052,12 +1052,41 @@ fn response_complete(raw: &[u8]) -> bool {
         .to_ascii_lowercase()
         .contains("transfer-encoding: chunked")
     {
-        body.ends_with(b"0\r\n\r\n")
+        chunked_complete(body)
     } else if let Some(length) = content_length(&header) {
         body.len() >= length
     } else {
         // Close-delimited body — the peer's EOF is the terminator.
         false
+    }
+}
+
+/// True only when the buffered chunks end exactly on the terminal 0-size
+/// chunk — a byte-suffix match can fire early on data ending "0\r\n".
+fn chunked_complete(mut data: &[u8]) -> bool {
+    loop {
+        let Some(end) = data.windows(2).position(|window| window == b"\r\n") else {
+            return false;
+        };
+        let line = std::str::from_utf8(&data[..end]).unwrap_or("");
+        let Ok(size) = usize::from_str_radix(line.split(';').next().unwrap_or("").trim(), 16)
+        else {
+            return false;
+        };
+        let Some(next) = end
+            .checked_add(2)
+            .and_then(|at| at.checked_add(size))
+            .and_then(|at| at.checked_add(2))
+        else {
+            return false;
+        };
+        if data.len() < next {
+            return false;
+        }
+        if size == 0 {
+            return true;
+        }
+        data = &data[next..];
     }
 }
 
@@ -1598,6 +1627,13 @@ mod tests {
             b"3\r\nabc\r\n0\r\n\r\n",
         );
         assert!(response_complete(&closed));
+        // A chunk whose data ends "0\r\n" produces the same byte suffix
+        // as the terminal chunk — the framing scan must not fire early.
+        let trap = header(
+            "HTTP/1.1 200 OK\nTransfer-Encoding: chunked\n\n",
+            b"4\r\na0\r\n\r\n",
+        );
+        assert!(!response_complete(&trap));
         // Close-delimited bodies need EOF, so a bare header is incomplete.
         let bare = header("HTTP/1.1 204 No Content\n\n", b"");
         assert!(!response_complete(&bare));
