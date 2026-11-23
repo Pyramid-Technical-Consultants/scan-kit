@@ -160,6 +160,33 @@ const TOOLS: &[ToolSpec] = &[
 ];
 
 /// The single Rust version string.
+/// Write `bytes` to `path` via a same-directory `.part` sibling and rename —
+/// a crash or mid-write failure leaves nothing or the old file, never a
+/// truncated export that reads as a successful one.
+pub fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
+    // pid + sequence — two writers of the same destination must not share a
+    // part file, in-process (threads) or across processes.
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut part = path.as_os_str().to_os_string();
+    part.push(format!(".{}.{}.part", std::process::id(), seq));
+    let part = std::path::PathBuf::from(part);
+    let write = std::fs::write(&part, bytes).and_then(|()| {
+        // Windows refuses to rename over an existing destination — remove it
+        // and retry; the .part file still holds the payload if that fails.
+        if std::fs::rename(&part, path).is_err() {
+            let _ = std::fs::remove_file(path);
+            std::fs::rename(&part, path)
+        } else {
+            Ok(())
+        }
+    });
+    write.map_err(|err| {
+        let _ = std::fs::remove_file(&part);
+        format!("{}: {err}", path.display())
+    })
+}
+
 pub fn version() -> &'static str {
     VERSION
 }
@@ -219,7 +246,7 @@ fn f32_array(input: &Value, key: &str) -> Result<Vec<f32>, InvokeError> {
     input
         .get(key)
         .and_then(Value::as_array)
-        .ok_or(InvokeError::UnexpectedInput)?
+        .ok_or_else(|| InvokeError::Message(format!("{key} must be an array of numbers")))?
         .iter()
         .map(|value| {
             value
@@ -327,6 +354,7 @@ pub fn scan_kit_about() -> AboutReport {
 pub enum InvokeError {
     UnknownTool { name: String },
     UnexpectedInput,
+    Message(String),
 }
 
 impl std::fmt::Display for InvokeError {
@@ -334,6 +362,7 @@ impl std::fmt::Display for InvokeError {
         match self {
             Self::UnknownTool { name } => write!(f, "unknown tool {name}"),
             Self::UnexpectedInput => write!(f, "this tool takes no arguments"),
+            Self::Message(message) => write!(f, "{message}"),
         }
     }
 }
@@ -360,7 +389,9 @@ pub fn invoke(name: &str, input: &Value) -> Result<Value, InvokeError> {
             // zip() truncates to the shorter side — a ragged pair would
             // silently score on half the measurement.
             if target.len() != delivered.len() {
-                return Err(InvokeError::UnexpectedInput);
+                return Err(InvokeError::Message(
+                    "target and delivered must have the same length".into(),
+                ));
             }
             json!({ "factor": calibration_factor(&target, &delivered) })
         }
@@ -368,7 +399,9 @@ pub fn invoke(name: &str, input: &Value) -> Result<Value, InvokeError> {
             let target = f32_array(input, "target")?;
             let delivered = f32_array(input, "delivered")?;
             if target.len() != delivered.len() {
-                return Err(InvokeError::UnexpectedInput);
+                return Err(InvokeError::Message(
+                    "target and delivered must have the same length".into(),
+                ));
             }
             json!({ "error_pct": dose_error_pct(&delivered, &target) })
         }
@@ -378,12 +411,24 @@ pub fn invoke(name: &str, input: &Value) -> Result<Value, InvokeError> {
         }
         "scan_kit_bin_edges" => {
             let values = f32_array(input, "values")?;
-            let bins = input.get("bins").and_then(Value::as_u64).unwrap_or(8) as usize;
+            let bins = match input.get("bins") {
+                None | Some(Value::Null) => 8,
+                Some(value) => value
+                    .as_u64()
+                    .ok_or_else(|| InvokeError::Message("bins must be an integer".into()))?
+                    as usize,
+            };
             json!({ "edges": quantile_edges(&values, bins) })
         }
         "scan_kit_histogram" => {
             let values = f32_array(input, "values")?;
-            let bins = input.get("bins").and_then(Value::as_u64).unwrap_or(16) as usize;
+            let bins = match input.get("bins") {
+                None | Some(Value::Null) => 16,
+                Some(value) => value
+                    .as_u64()
+                    .ok_or_else(|| InvokeError::Message("bins must be an integer".into()))?
+                    as usize,
+            };
             let (edges, counts) = histogram(&values, bins);
             json!({ "edges": edges, "counts": counts })
         }
@@ -403,6 +448,20 @@ pub fn invoke(name: &str, input: &Value) -> Result<Value, InvokeError> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn atomic_write_leaves_no_part_file_and_replaces() {
+        let dir = std::env::temp_dir().join(format!("sk-atomic-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("out.bin");
+        atomic_write(&dest, b"first").unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"first");
+        atomic_write(&dest, b"second").unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"second");
+        assert!(!dir.join("out.bin.part").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     use super::*;
 
     #[test]

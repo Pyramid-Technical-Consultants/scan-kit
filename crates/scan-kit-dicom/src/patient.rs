@@ -1872,10 +1872,12 @@ pub fn write_rtdose(
     let peak = dose.iter().fold(0.0f64, |peak, &v| {
         peak.max(if v.is_nan() { 0.0 } else { v as f64 })
     });
-    if !peak.is_finite() || dose.contains(&f32::NEG_INFINITY) {
+    if !peak.is_finite() || dose.contains(&f32::NEG_INFINITY) || dose.iter().any(|v| v.is_nan()) {
         // An infinite voxel would quantize every value to 0 and write an
         // "inf" DoseGridScaling the reader itself rejects — and -inf never
-        // raises the peak, so it needs its own check.
+        // raises the peak, so it needs its own check. Neither does NaN:
+        // an unchecked NaN encoded as 0 Gy would turn a broken transport
+        // into a valid-looking all-zero export.
         return Err("the dose contains non-finite values".into());
     }
     let scale = if peak > 0.0 { peak / 4.0e9 } else { 1.0 };
@@ -1990,7 +1992,7 @@ pub fn write_rtdose(
         sq(&mut bytes, 0x300C, 0x0002, &[item])?;
     }
     ow32(&mut bytes, 0x7FE0, 0x0010, &pixels)?;
-    fs::write(path, &bytes).map_err(|err| err.to_string())?;
+    scan_kit_core::atomic_write(path, &bytes)?;
     Ok(path.to_path_buf())
 }
 
@@ -2543,6 +2545,9 @@ mod tests {
         .is_err());
         let out = std::env::temp_dir().join(format!("scan-kit-rtdose-bad-{}", std::process::id()));
         assert!(write_rtdose(&out, &[0.0; 8], &ct, "", "PLAN", "PHYSICAL", "d", "").is_ok());
+        // NaN is non-finite too — an all-NaN transport must not export as a
+        // valid-looking all-zero dose.
+        assert!(write_rtdose(&out, &[f32::NAN; 8], &ct, "", "PLAN", "PHYSICAL", "d", "").is_err());
         let _ = fs::remove_file(&out);
     }
 
@@ -2901,7 +2906,10 @@ mod tests {
 
     #[test]
     fn a_non_finite_or_unencodable_dose_is_refused() {
-        let dir = std::env::temp_dir().join(format!("scan-kit-rtdose-{}", std::process::id()));
+        // Shares no temp path with a_rt_dose_round_trips — parallel tests
+        // writing the same dose.dcm race on the atomic-write part file.
+        let dir =
+            std::env::temp_dir().join(format!("scan-kit-rtdose-refused-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let ct = CtVolume {

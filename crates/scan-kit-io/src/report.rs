@@ -99,6 +99,8 @@ pub fn dvh_csv(curves: &[DvhCurve]) -> String {
     let Some(first) = curves.first() else {
         return String::new();
     };
+    // Row i is indexed positionally against first.edges; shorter curves fill
+    // the remaining cells empty rather than fabricating zeros.
     let mut out = String::from("dose_gy_rbe");
     for curve in curves {
         out.push(',');
@@ -429,7 +431,7 @@ pub fn write_pdf(report: &Report, dest: &Path) -> Result<PathBuf, String> {
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent).map_err(|err| format!("{}: {err}", parent.display()))?;
     }
-    std::fs::write(dest, &pdf).map_err(|err| format!("{}: {err}", dest.display()))?;
+    scan_kit_core::atomic_write(dest, &pdf)?;
     Ok(dest.to_path_buf())
 }
 

@@ -557,7 +557,7 @@ pub fn write_header(
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|err| err.to_string())?;
     }
-    fs::write(path, bytes).map_err(|err| err.to_string())
+    scan_kit_core::atomic_write(path, &bytes)
 }
 
 fn push_ui(bytes: &mut Vec<u8>, group: u16, element: u16, text: &str) -> Result<(), String> {

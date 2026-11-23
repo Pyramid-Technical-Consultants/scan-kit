@@ -300,7 +300,7 @@ pub(crate) fn finish_patient_report(
     if !csv.is_empty() {
         // A failed CSV must not leave the PDF looking like a successful
         // export — the task reports Err either way.
-        if let Err(err) = std::fs::write(&csv_path, csv) {
+        if let Err(err) = scan_kit_core::atomic_write(&csv_path, csv.as_bytes()) {
             let _ = std::fs::remove_file(&pdf);
             return Err(format!("{}: {err}", csv_path.display()));
         }
@@ -411,8 +411,10 @@ fn dim(input: &Value, key: &str, fallback: u32) -> Result<u32, String> {
 fn object_arg(input: &Value, key: &str) -> Result<Value, String> {
     match input.get(key) {
         Some(value) if value.is_object() => Ok(value.clone()),
+        // null means "defaults" to JSON callers — same convention the
+        // analysis tools already accept.
+        Some(Value::Null) | None => Ok(json!({})),
         Some(_) => Err(format!("{key} must be an object")),
-        None => Ok(json!({})),
     }
 }
 
