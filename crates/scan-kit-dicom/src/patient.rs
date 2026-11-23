@@ -381,9 +381,12 @@ pub fn read_ion_plan(path: &Path) -> Result<IonPlan, String> {
                 let (x, y) = (xy[i * 2], xy[i * 2 + 1]);
                 // Position gets the same finite check as energy — a NaN spot
                 // would reach the transport and the exported plan CSV.
+                // A spot-bearing control point before any nominal energy is
+                // corrupt input — silently skipping it drops the whole beam.
+                if !energy.is_finite() || energy <= 0.0 {
+                    return Err("a treatment beam has no nominal energy".into());
+                }
                 if (has_weights && (!mu.is_finite() || mu <= 0.0))
-                    || !energy.is_finite()
-                    || energy <= 0.0
                     || !x.is_finite()
                     || !y.is_finite()
                 {
@@ -641,8 +644,18 @@ fn image_slices(elems: &[Elem], scale: f32) -> Result<Vec<Slice>, String> {
     let cols = int_tag(elems, tag(0x0028, 0x0011)).unwrap_or(0).max(0) as usize;
     let spacing = floats_tag(elems, tag(0x0028, 0x0030));
     let origin = floats_tag(elems, tag(0x0020, 0x0032));
-    let slope = float_tag(elems, tag(0x0028, 0x1053)).unwrap_or(1.0);
-    let intercept = float_tag(elems, tag(0x0028, 0x1052)).unwrap_or(0.0);
+    // An absent rescale tag defaults; a present-but-corrupt one is an error,
+    // not a silent 1.0.
+    let slope = match float_tag(elems, tag(0x0028, 0x1053)) {
+        Some(value) => value,
+        None if elem(elems, tag(0x0028, 0x1053)).is_none() => 1.0,
+        None => return Err("corrupt rescale slope".into()),
+    };
+    let intercept = match float_tag(elems, tag(0x0028, 0x1052)) {
+        Some(value) => value,
+        None if elem(elems, tag(0x0028, 0x1052)).is_none() => 0.0,
+        None => return Err("corrupt rescale intercept".into()),
+    };
     let pixels = elem(elems, tag(0x7FE0, 0x0010)).ok_or("missing pixels")?;
     if rows == 0 || cols == 0 || origin.len() < 3 || spacing.len() < 2 {
         return Err("CT geometry is incomplete".into());
@@ -665,13 +678,20 @@ fn image_slices(elems: &[Elem], scale: f32) -> Result<Vec<Slice>, String> {
     // Pixel Representation 1 stores two's-complement samples. Reading those as
     // unsigned turns a negative HU into a huge positive one.
     let signed = int_tag(elems, tag(0x0028, 0x0103)).unwrap_or(0) == 1;
+    // High Bit marks the sign bit of the stored value — a 12-bit signed
+    // sample in a 16-bit slot reads as a large positive without extension.
+    let high_bit = i64::from(
+        int_tag(elems, tag(0x0028, 0x0102))
+            .unwrap_or(bits - 1)
+            .clamp(0, 62),
+    );
     let stored: Vec<f32> = if bits == 8 {
         pixels
             .bytes
             .iter()
             .map(|byte| {
                 let raw = if signed {
-                    i8::from_le_bytes([*byte]) as f32
+                    sign_extend(i64::from(*byte), high_bit.min(7)) as f32
                 } else {
                     *byte as f32
                 };
@@ -686,7 +706,7 @@ fn image_slices(elems: &[Elem], scale: f32) -> Result<Vec<Slice>, String> {
             .iter()
             .map(|chunk| {
                 let raw = if signed {
-                    i32::from_le_bytes(*chunk) as f64
+                    sign_extend(i64::from(u32::from_le_bytes(*chunk)), high_bit) as f64
                 } else {
                     u32::from_le_bytes(*chunk) as f64
                 };
@@ -701,7 +721,7 @@ fn image_slices(elems: &[Elem], scale: f32) -> Result<Vec<Slice>, String> {
             .iter()
             .map(|chunk| {
                 let raw = if signed {
-                    i16::from_le_bytes(*chunk) as f32
+                    sign_extend(i64::from(u16::from_le_bytes(*chunk)), high_bit) as f32
                 } else {
                     u16::from_le_bytes(*chunk) as f32
                 };
@@ -745,15 +765,29 @@ fn image_slices(elems: &[Elem], scale: f32) -> Result<Vec<Slice>, String> {
         // frame*thickness ones.
         return Err("frame offsets do not match the frame count".into());
     }
-    let thickness = float_tag(elems, tag(0x0018, 0x0050))
-        .filter(|value| value.is_finite() && *value > 0.0)
-        .unwrap_or(1.0);
+    // Same absent-vs-corrupt split for Slice Thickness.
+    let thickness = match float_tag(elems, tag(0x0018, 0x0050)) {
+        Some(value) if value.is_finite() && value > 0.0 => value,
+        None if elem(elems, tag(0x0018, 0x0050)).is_none() => 1.0,
+        _ => return Err("corrupt slice thickness".into()),
+    };
+    // Grid Frame Offsets have two legal encodings: relative to the image
+    // position (first offset zero), or absolute patient z (first offset
+    // equal to the slice origin z with identity orientation). Reading
+    // absolute values as relative shifts every frame by the origin z.
+    let absolute_z = !offsets.is_empty() && offsets[0] != 0.0;
+    if absolute_z && (offsets[0] != origin[2] || column_sign < 0.0 || row_sign < 0.0) {
+        return Err("frame offsets are neither relative nor absolute z".into());
+    }
     let mut slices = Vec::new();
     for frame in 0..frames {
-        let along = offsets
+        let mut along = offsets
             .get(frame)
             .copied()
             .unwrap_or(frame as f32 * thickness);
+        if absolute_z {
+            along -= origin[2];
+        }
         if !along.is_finite() {
             return Err("frame offset is not finite".into());
         }
@@ -1244,6 +1278,17 @@ pub fn inside_structure(
 
 /// Column sign, then row sign, for an axial image. Missing orientation is the
 /// identity used by files written before the tag was filled in.
+/// Two's-complement sign extension from `high_bit` (zero-indexed). A word
+/// whose high bit equals the allocation's top bit extends identically to a
+/// plain signed cast, so the callers use this unconditionally when signed.
+fn sign_extend(word: i64, high_bit: i64) -> i64 {
+    if word & (1_i64 << high_bit) != 0 {
+        word - (1_i64 << (high_bit + 1))
+    } else {
+        word
+    }
+}
+
 fn axial_signs(elems: &[Elem]) -> Result<(f32, f32), String> {
     let orientation = floats_tag(elems, tag(0x0020, 0x0037));
     if orientation.is_empty() {
@@ -3354,5 +3399,59 @@ mod tests {
         let mut padded = bytes;
         padded.extend_from_slice(&[0; 5]);
         assert!(parse_dataset_mode(&padded, true, 0).is_ok());
+    }
+
+    #[test]
+    fn absolute_frame_offsets_are_not_read_as_relative() {
+        // Option (b) of the GFOV spec stores absolute patient z - reading it
+        // as relative shifted every frame by the origin z.
+        let mut bytes = Vec::new();
+        us(&mut bytes, 0x0028, 0x0010, 1).unwrap();
+        us(&mut bytes, 0x0028, 0x0011, 1).unwrap();
+        ds(&mut bytes, 0x0028, 0x0030, &[1.0, 1.0]).unwrap();
+        ds(&mut bytes, 0x0020, 0x0032, &[0.0, 0.0, -50.0]).unwrap();
+        ds(&mut bytes, 0x0020, 0x0037, &[1.0, 0.0, 0.0, 0.0, 1.0, 0.0]).unwrap();
+        ds(&mut bytes, 0x3004, 0x000C, &[-50.0, -48.0]).unwrap();
+        us(&mut bytes, 0x0028, 0x0100, 16).unwrap();
+        ow(&mut bytes, 0x7FE0, 0x0010, &[1, 2]).unwrap();
+        let slices = image_slices(&parse_dataset(&bytes).unwrap(), 1.0).unwrap();
+        assert!((slices[0].origin[2] + 50.0).abs() < 1e-3);
+        assert!((slices[1].origin[2] + 48.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn a_twelve_bit_signed_pixel_is_sign_extended() {
+        // High Bit 11 marks the sign of a 12-bit sample in a 16-bit slot -
+        // 0x0800 is -2048, not +2048.
+        let mut bytes = Vec::new();
+        us(&mut bytes, 0x0028, 0x0010, 1).unwrap();
+        us(&mut bytes, 0x0028, 0x0011, 1).unwrap();
+        ds(&mut bytes, 0x0028, 0x0030, &[1.0, 1.0]).unwrap();
+        ds(&mut bytes, 0x0020, 0x0032, &[0.0, 0.0, 0.0]).unwrap();
+        us(&mut bytes, 0x0028, 0x0100, 16).unwrap();
+        us(&mut bytes, 0x0028, 0x0101, 12).unwrap();
+        us(&mut bytes, 0x0028, 0x0102, 11).unwrap();
+        us(&mut bytes, 0x0028, 0x0103, 1).unwrap();
+        ow(&mut bytes, 0x7FE0, 0x0010, &[0x0800]).unwrap();
+        let slices = image_slices(&parse_dataset(&bytes).unwrap(), 1.0).unwrap();
+        assert!((slices[0].values[0] + 2048.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn a_corrupt_rescale_slope_is_an_error() {
+        let mut bytes = Vec::new();
+        us(&mut bytes, 0x0028, 0x0010, 1).unwrap();
+        us(&mut bytes, 0x0028, 0x0011, 1).unwrap();
+        ds(&mut bytes, 0x0028, 0x0030, &[1.0, 1.0]).unwrap();
+        ds(&mut bytes, 0x0020, 0x0032, &[0.0, 0.0, 0.0]).unwrap();
+        us(&mut bytes, 0x0028, 0x0100, 16).unwrap();
+        let mut slope = Vec::new();
+        slope.extend_from_slice(b"2ad");
+        let header = [0x28u8, 0x00, 0x53, 0x10, b'D', b'S', 0x05, 0x00];
+        bytes.extend_from_slice(&header);
+        bytes.extend_from_slice(b" ");
+        bytes.extend_from_slice(&slope);
+        ow(&mut bytes, 0x7FE0, 0x0010, &[0]).unwrap();
+        assert!(image_slices(&parse_dataset(&bytes).unwrap(), 1.0).is_err());
     }
 }

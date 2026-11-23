@@ -390,13 +390,14 @@ fn write_plan(dir: &Path, request: &Request, study: &str, frame: &str) -> Result
                     0x012C,
                     &[0.0, ((PTV.y0 + PTV.y1) / 2.0) as f32, 0.0],
                 )?;
+                patient::is(&mut cp, 0x300A, 0x0112, cps.len() as i32 + 1)?;
                 patient::ds(&mut cp, 0x300A, 0x0134, &[weight])?;
-                patient::ds(&mut cp, 0x300A, 0x030D, &[300.0])?;
+                patient::fl(&mut cp, 0x300A, 0x030D, &[300.0])?;
                 if request.wet > 0.0 {
                     let mut setting = Vec::new();
-                    patient::cs(&mut setting, 0x300A, 0x0362, "IN")?;
-                    patient::ds(&mut setting, 0x300A, 0x0364, &[300.0])?;
-                    patient::ds(&mut setting, 0x300A, 0x0366, &[request.wet as f32])?;
+                    patient::lo(&mut setting, 0x300A, 0x0362, "IN")?;
+                    patient::fl(&mut setting, 0x300A, 0x0364, &[300.0])?;
+                    patient::fl(&mut setting, 0x300A, 0x0366, &[request.wet as f32])?;
                     patient::is(&mut setting, 0x300C, 0x0100, 1)?;
                     patient::sq(&mut cp, 0x300A, 0x0360, &[setting])?;
                 }
@@ -425,14 +426,17 @@ fn write_plan(dir: &Path, request: &Request, study: &str, frame: &str) -> Result
         patient::sh(&mut item, 0x300A, 0x00B2, "SYNTH")?;
         patient::is(&mut item, 0x300A, 0x00C0, 1)?;
         patient::lo(&mut item, 0x300A, 0x00C2, "B1")?;
+        patient::cs(&mut item, 0x300A, 0x00C4, "STATIC")?;
         patient::cs(&mut item, 0x300A, 0x00C6, "PROTON")?;
         patient::cs(&mut item, 0x300A, 0x00CE, "TREATMENT")?;
         patient::ds(&mut item, 0x300A, 0x010E, &[weight])?;
         patient::is(&mut item, 0x300A, 0x0110, cps.len() as i32)?;
         patient::cs(&mut item, 0x300A, 0x0308, "MODULATED")?;
         patient::fd(&mut item, 0x300A, 0x030A, &[2000.0, 2000.0])?;
+        // Number of Range Shifters is Type 1 — a no-shifter plan still
+        // writes it.
+        patient::is(&mut item, 0x300A, 0x0312, i32::from(request.wet > 0.0))?;
         if request.wet > 0.0 {
-            patient::is(&mut item, 0x300A, 0x0312, 1)?;
             let mut shifter = Vec::new();
             patient::is(&mut shifter, 0x300A, 0x0316, 1)?;
             patient::sh(&mut shifter, 0x300A, 0x0318, "RS1")?;
