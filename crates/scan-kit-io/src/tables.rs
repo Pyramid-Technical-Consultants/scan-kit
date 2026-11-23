@@ -1833,6 +1833,11 @@ fn g3_strip_mm(raw: f32, axis: usize) -> f32 {
 fn g3_mm(raw: &[f32], reversed: bool) -> Vec<f32> {
     // G3 strips are 1-indexed at a 2 mm pitch — the ±128 map is the G2
     // calibration and reads ~0.8% long everywhere (a full mm at the edges).
+    let map = if reversed {
+        remap_g3_raw_reversed
+    } else {
+        remap_g3_raw
+    };
     raw.iter()
         .copied()
         .map(|value| {
