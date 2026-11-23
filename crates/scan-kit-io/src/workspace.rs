@@ -573,7 +573,9 @@ fn profile_series<'a>(
 fn gamma_counts(volume: &Volume) -> [f32; 20] {
     let mut counts = [0.0f32; 20];
     for value in &volume.values {
-        if !value.is_finite() || *value <= 0.0 {
+        // NaN means the voxel was never evaluated — a scored γ = 0 is a
+        // perfect match and belongs in the first bin.
+        if !value.is_finite() || *value < 0.0 {
             continue;
         }
         let bin = ((*value / 2.0) * 20.0).floor() as usize;
@@ -697,6 +699,23 @@ mod tests {
         assert!(gamma_heading(94.9).contains("94%"));
         assert!(gamma_heading(94.9).ends_with("action"));
         assert!(gamma_heading(89.99).contains("89%"));
+    }
+
+    #[test]
+    fn a_zero_gamma_counts_as_a_scored_match() {
+        let volume = Volume {
+            origin: [0.0; 3],
+            shape: [4, 1, 1],
+            spacing: [1.0; 3],
+            values: vec![0.0, 0.5, f32::NAN, 2.5],
+        };
+        let counts = gamma_counts(&volume);
+        // A scored gamma = 0 is a perfect match and belongs in the first
+        // bin — only NaN (never evaluated) is skipped.
+        assert_eq!(counts[0], 1.0);
+        assert_eq!(counts[5], 1.0);
+        assert_eq!(counts[19], 1.0);
+        assert_eq!(counts.iter().sum::<f32>(), 3.0);
     }
 
     #[test]

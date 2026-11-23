@@ -498,19 +498,24 @@ pub fn metrics(inputs: &PatientInputs, run: &Transport, options: &Value) -> Pati
                 (goal, check)
             })
             .collect();
+        // phys/dose.values index 0..nvox — a short volume would panic.
         let let_stats = if let (Some(letd), Some(phys)) = (let_d, run.physical.as_ref()) {
-            let mut dep = 0.0f64;
-            let mut del = 0.0f64;
-            let mut deff = 0.0f64;
-            for index in 0..nvox {
-                if mask[index] {
-                    let d = f64::from(phys[index]);
-                    dep += d;
-                    del += d * f64::from(letd[index]);
-                    deff += f64::from(dose.values[index]);
+            if phys.len() == nvox && dose.values.len() == nvox {
+                let mut dep = 0.0f64;
+                let mut del = 0.0f64;
+                let mut deff = 0.0f64;
+                for index in 0..nvox {
+                    if mask[index] {
+                        let d = f64::from(phys[index]);
+                        dep += d;
+                        del += d * f64::from(letd[index]);
+                        deff += f64::from(dose.values[index]);
+                    }
                 }
+                (dep > 0.0).then_some((del / dep, deff / dep))
+            } else {
+                None
             }
-            (dep > 0.0).then_some((del / dep, deff / dep))
         } else {
             None
         };
