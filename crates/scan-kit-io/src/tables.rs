@@ -1315,15 +1315,19 @@ fn build_spot(
     if let Ok(xml) = capped_text(&dir.join("config/map2map/devices.xml")) {
         add_sigma_error(&mut table, &xml);
     }
-    let layer = spot.num.get("layer_id").or_else(|| map.num.get("layer_id"));
-    let spot_no = spot.num.get("spot_no").filter(|values| values.len() >= n);
+    let layer = num_named(&spot, "layer_id")
+        .and_then(|key| spot.num.get(key))
+        .or_else(|| num_named(&map, "layer_id").and_then(|key| map.num.get(key)));
+    let spot_no = num_named(&spot, "spot_no")
+        .and_then(|key| spot.num.get(key))
+        .filter(|values| values.len() >= n);
     let time_ms = spot_time_ms(&spot, n);
     if let (Some(time), Some(layer)) = (time_ms.as_ref(), layer.filter(|v| v.len() >= n)) {
         let ms = spot_delivery_ms(&take_kept(time, &keep), &take_kept(layer, &keep));
         table.insert("spot_time".to_string(), ms);
         let point = ["point_time(ms)", "point_time_ms", "point_time"]
             .iter()
-            .find_map(|name| spot.num.get(*name))
+            .find_map(|name| num_named(&spot, name).and_then(|key| spot.num.get(key)))
             .filter(|values| values.len() >= n)
             .map(|values| take_kept(values, &keep))
             .or_else(|| {
@@ -1364,7 +1368,10 @@ fn build_spot(
             table.insert("beam_on".to_string(), take_kept(beam, &keep));
         }
     }
-    if let Some(layer) = spot.num.get("layer_id").filter(|values| values.len() >= n) {
+    if let Some(layer) = num_named(&spot, "layer_id")
+        .and_then(|key| spot.num.get(key))
+        .filter(|values| values.len() >= n)
+    {
         let kept = take_kept(layer, &keep);
         if kept.len() == table.get("energy").map(Vec::len).unwrap_or(0) {
             table.insert("layer_id".to_string(), kept);
@@ -1519,8 +1526,8 @@ struct SpotPlan<'a> {
 }
 
 fn spot_plan<'a>(map: &'a Sheet, x: &'a [f32], y: &'a [f32]) -> Option<SpotPlan<'a>> {
-    let spots = map.num.get("spot_no")?;
-    let layers = map.num.get("layer_id")?;
+    let spots = num_named(map, "spot_no").and_then(|key| map.num.get(key))?;
+    let layers = num_named(map, "layer_id").and_then(|key| map.num.get(key))?;
     let rows = spots
         .iter()
         .zip(layers)
@@ -1959,7 +1966,6 @@ pub(crate) fn point_time_stamp(dir: &Path) -> u128 {
         for run in runs {
             if let Some(path) = point_time_file(&run) {
                 stamp = stamp.wrapping_add(discover::meta_stamp(&path));
-                break;
             }
         }
     }
@@ -2009,9 +2015,10 @@ fn layer_point_times(dir: &Path) -> HashMap<(u32, u32), f32> {
                         discover::read_capped(&mut file, "point times", discover::MAX_MEMBER_BYTES)
                     });
                 if let Ok(bytes) = bytes {
+                    // A re-scanned layer delivers spots the first run's file
+                    // never saw - merge every run instead of stopping at one.
                     insert_point_times(&mut found, &read_sheet(&bytes));
                 }
-                break;
             }
         }
     }
@@ -2047,10 +2054,10 @@ fn point_time_file(run: &Path) -> Option<PathBuf> {
 }
 
 fn insert_point_times(found: &mut HashMap<(u32, u32), f32>, sheet: &Sheet) {
-    let Some(spots) = sheet.num.get("spot_no") else {
+    let Some(spots) = column_any(sheet, &["spot_no"]) else {
         return;
     };
-    let Some(layers) = sheet.num.get("layer_id") else {
+    let Some(layers) = column_any(sheet, &["layer_id"]) else {
         return;
     };
     let Some(point) = ["point_time(ms)", "point_time_ms", "point_time"]
@@ -3295,7 +3302,7 @@ fn first_named(dir: &Path, pred: impl Fn(&str) -> bool) -> Option<PathBuf> {
             let path = entry.path();
             if path.is_file() {
                 files.push(path);
-            } else if path.is_dir() && depth < 4 {
+            } else if path.is_dir() && depth < 6 {
                 dirs.push(path);
             }
         }
@@ -3344,7 +3351,7 @@ fn named_files(dir: &Path, pred: &impl Fn(&str) -> bool) -> (Vec<PathBuf>, Vec<P
             let path = entry.path();
             if path.is_file() {
                 found.push(path);
-            } else if path.is_dir() && depth < 4 {
+            } else if path.is_dir() && depth < 6 {
                 children.push(path);
             }
         }
@@ -3675,9 +3682,8 @@ fn timeslice_layer_marks(root: &Path, session: &str) -> Vec<f32> {
     for (index, sheet) in frames.sheets.iter().enumerate() {
         let rows = clock_rows(sheet);
         let folder = frames.layers.get(index).copied().unwrap_or(-1);
-        let column = sheet
-            .num
-            .get("layer_id")
+        let column = num_named(sheet, "layer_id")
+            .and_then(|key| sheet.num.get(key))
             .filter(|values| values.iter().any(|value| value.is_finite()));
         if let Some(ids) = column {
             for row in 0..rows {
@@ -3982,7 +3988,11 @@ pub(crate) fn spot_delivery_ms(timestamp: &[f64], layer: &[f32]) -> Vec<f32> {
         for pair in indices.windows(2) {
             out[pair[1]] = (timestamp[pair[1]] - timestamp[pair[0]]) as f32;
         }
-        previous = indices.last().map(|&last| timestamp[last]);
+        // Interleaved groups can overlap - the next gap measures from the
+        // furthest activity seen, not this group's own end.
+        previous = indices
+            .last()
+            .map(|&last| timestamp[last].max(previous.unwrap_or(f64::MIN)));
     }
     out
 }
@@ -4056,8 +4066,12 @@ fn expected_mm(bands: &[Band], device: &str, energy: f64) -> Option<f64> {
 fn xml_attr(tag: &str, name: &str) -> Option<String> {
     // Attributes are whitespace-separated — without the boundary "name="
     // matches inside "long_name=".
-    let key = format!(" {name}=");
-    let at = tag.find(&key)? + key.len();
+    let key = format!("{name}=");
+    let at = tag
+        .match_indices(&key)
+        .find(|(at, _)| *at > 0 && tag.as_bytes()[at - 1].is_ascii_whitespace())
+        .map(|(at, _)| at)?
+        + key.len();
     let rest = tag[at..].trim_start();
     let quote = rest.chars().next()?;
     if quote != '"' && quote != '\'' {
@@ -5105,9 +5119,10 @@ fn header_schema(
             kinds.push(Kind::Skip);
         } else {
             let key = unique_header(&name, &mut used);
-            let kind = if base == "datetime" {
+            let lower = base.to_ascii_lowercase();
+            let kind = if lower == "datetime" {
                 Kind::Clock
-            } else if matches!(base, "timestamp" | "time_s" | "time_ns") {
+            } else if matches!(lower.as_str(), "timestamp" | "time_s" | "time_ns") {
                 Kind::Wide
             } else {
                 Kind::Num
@@ -5371,11 +5386,13 @@ fn next_cell(line: &str, start: usize) -> Option<(usize, usize, usize)> {
             i += 1;
         }
         let end = i;
-        let next = if i < bytes.len() && bytes[i] == b',' {
-            i + 1
-        } else {
-            i
-        };
+        // Junk between the closing quote and the delimiter is garbage inside
+        // this cell - swallowing it keeps the row aligned; starting a new
+        // cell here shifts every later column right.
+        while i < bytes.len() && bytes[i] != b',' {
+            i += 1;
+        }
+        let next = if i < bytes.len() { i + 1 } else { i };
         return Some((start, end, next));
     }
     let mut i = start;

@@ -652,9 +652,17 @@ fn is_timeslice(name: &str) -> bool {
 }
 
 fn timeslice_key(name: &str) -> (i64, i64, String) {
+    // Markers live in directory components - a filename containing
+    // "layer-9" must not hijack the layer index.
+    let dir_end = name.rfind(['/', '\\']).map(|i| i + 1).unwrap_or(0);
+    let dir = &name[..dir_end];
     (
-        number_after(name, "layer-"),
-        number_after(name, "run-"),
+        if dir.contains("layer-") {
+            number_after(dir, "layer-")
+        } else {
+            -1
+        },
+        number_after(dir, "run-"),
         normalize_member(name),
     )
 }
@@ -663,11 +671,19 @@ pub(crate) fn number_after(path: &str, marker: &str) -> i64 {
     let Some(index) = path.rfind(marker) else {
         return 0;
     };
-    let digits: String = path[index + marker.len()..]
-        .chars()
-        .take_while(|ch| ch.is_ascii_digit())
-        .collect();
-    digits.parse().unwrap_or(0)
+    let tail = &path[index + marker.len()..];
+    let digits: String = tail.chars().take_while(|ch| ch.is_ascii_digit()).collect();
+    // "layer-x" / "layer-2b" / a digit overflow is not a numbered layer -
+    // collapsing it into 0 merges unrelated folders into layer 0.
+    if digits.is_empty()
+        || tail[digits.len()..]
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.is_ascii_alphanumeric())
+    {
+        return -1;
+    }
+    digits.parse().unwrap_or(-1)
 }
 
 fn normalize_member(name: &str) -> String {
