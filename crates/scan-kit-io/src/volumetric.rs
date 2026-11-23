@@ -1788,7 +1788,12 @@ fn attr<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
         if at == 0 || tag.as_bytes()[at - 1].is_ascii_whitespace() {
             let start = at + key.len();
             let rest = &tag[start..];
-            return Some(&rest[..rest.find('"')?]);
+            match rest.find('"') {
+                Some(end) => return Some(&rest[..end]),
+                // An unclosed value keeps looking — a later attribute may
+                // still match cleanly.
+                None => {}
+            }
         }
         offset = at + 1;
     }

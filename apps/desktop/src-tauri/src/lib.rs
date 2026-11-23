@@ -349,18 +349,16 @@ fn reveal_args(path: &std::path::Path) -> Vec<std::ffi::OsString> {
         // explorer treats both `,` and `=` as field separators in EVERY
         // argument, and Command's auto-quoting only covers spaces - the path
         // goes out inside explicit quotes regardless (these args are passed
-        // with raw_arg so the enclosure survives verbatim).
+        // with raw_arg so the enclosure survives verbatim). A trailing
+        // backslash would escape the closing quote in explorer's parser, so
+        // roots like `D:\` go out as `D:`.
+        let cleaned = scan_kit_io::strip_verbatim(path);
+        let cleaned = cleaned.trim_end_matches('\\');
         if path.is_dir() {
-            vec![std::ffi::OsString::from(format!(
-                "\"{}\"",
-                scan_kit_io::strip_verbatim(path)
-            ))]
+            vec![std::ffi::OsString::from(format!("\"{cleaned}\""))]
         } else {
             // canonicalize hands back a verbatim path explorer cannot parse.
-            vec![std::ffi::OsString::from(format!(
-                "/select,\"{}\"",
-                scan_kit_io::strip_verbatim(path)
-            ))]
+            vec![std::ffi::OsString::from(format!("/select,\"{cleaned}\""))]
         }
     }
     #[cfg(target_os = "macos")]
