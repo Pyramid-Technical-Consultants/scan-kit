@@ -157,6 +157,7 @@ it("previews a tune, then applies it after confirmation", async () => {
   vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
   const confirm = vi.fn(() => true);
   window.confirm = confirm;
+
   const host = document.createElement("div");
   document.body.append(host);
   await act(async () => {

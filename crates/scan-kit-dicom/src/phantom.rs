@@ -178,11 +178,13 @@ fn write_struct(
     ct_series: &str,
 ) -> Result<(), String> {
     let mut rois = Vec::new();
+    let mut observations = Vec::new();
     let mut contours = Vec::new();
     let mut number = 1i32;
     let half = BOX_MM / 2.0;
     push_roi(
         &mut rois,
+        &mut observations,
         &mut contours,
         number,
         frame,
@@ -198,6 +200,7 @@ fn write_struct(
     number += 1;
     push_roi(
         &mut rois,
+        &mut observations,
         &mut contours,
         number,
         frame,
@@ -213,6 +216,7 @@ fn write_struct(
     number += 1;
     push_roi(
         &mut rois,
+        &mut observations,
         &mut contours,
         number,
         frame,
@@ -235,6 +239,7 @@ fn write_struct(
         let insert = *insert;
         push_roi(
             &mut rois,
+            &mut observations,
             &mut contours,
             number,
             frame,
@@ -262,6 +267,8 @@ fn write_struct(
     patient::sq(&mut bytes, 0x3006, 0x0010, &[referenced])?;
     patient::sq(&mut bytes, 0x3006, 0x0020, &rois)?;
     patient::sq(&mut bytes, 0x3006, 0x0039, &contours)?;
+    // RT ROI Observations is Type 1 — required for a readable structure set.
+    patient::sq(&mut bytes, 0x3006, 0x0080, &observations)?;
     fs::write(dir.join("RS_synthetic.dcm"), bytes).map_err(|err| err.to_string())
 }
 
@@ -280,6 +287,7 @@ fn referenced_frame(frame: &str, study: &str, ct_series: &str) -> Result<Vec<u8>
 
 fn push_roi(
     rois: &mut Vec<Vec<u8>>,
+    observations: &mut Vec<Vec<u8>>,
     contours: &mut Vec<Vec<u8>>,
     number: i32,
     frame: &str,
@@ -295,8 +303,14 @@ fn push_roi(
     patient::is(&mut roi, 0x3006, 0x0022, number)?;
     patient::ui(&mut roi, 0x3006, 0x0024, frame)?;
     patient::lo(&mut roi, 0x3006, 0x0026, name)?;
-    patient::cs(&mut roi, 0x3006, 0x00A4, kind)?;
+    patient::cs(&mut roi, 0x3006, 0x0036, "SEMIAUTOMATIC")?;
     rois.push(roi);
+    // RT ROI Interpreted Type lives in the Type 1 RT ROI Observations
+    // sequence — inside the Structure Set ROI item no reader looks for it.
+    let mut observation = Vec::new();
+    patient::is(&mut observation, 0x3006, 0x0084, number)?;
+    patient::cs(&mut observation, 0x3006, 0x00A4, kind)?;
+    observations.push(observation);
     let mut drawn = Vec::new();
     for plane in planes {
         for points in plane {

@@ -98,6 +98,9 @@ export function PhantomSynthesis() {
     return () => {
       cancel = true;
       window.clearTimeout(arm);
+      // A cancelled request's finally skips the clear — drop the hairline
+      // during the debounce gap or it stays lit until the next preview ends.
+      setPreviewing(false);
     };
   }, [params]);
 

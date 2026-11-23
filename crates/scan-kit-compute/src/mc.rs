@@ -191,8 +191,9 @@ impl McRun {
             // The empty path skips prepare's binding-cap check — bound the
             // placeholder allocation itself.
             let nvox = launch.shape[0]
-                .saturating_mul(launch.shape[1])
-                .saturating_mul(launch.shape[2]);
+                .max(1)
+                .saturating_mul(launch.shape[1].max(1))
+                .saturating_mul(launch.shape[2].max(1));
             if nvox > 1 << 28 {
                 return Err(ComputeError::Message("voxel grid is too large".into()));
             }
@@ -414,7 +415,10 @@ fn slab_launch(request: &SlabRequest) -> Result<Launch, ComputeError> {
 }
 
 fn patient_launch(request: &PatientRequest) -> Result<Launch, ComputeError> {
-    let [nx, ny, nz] = request.shape;
+    // The shader clamps each axis to >=1 — the material/density check must
+    // read the same shape or a zero axis validates 0-length buffers the GPU
+    // then indexes out of bounds.
+    let [nx, ny, nz] = request.shape.map(|dim| dim.max(1));
     let nvox = nx.saturating_mul(ny).saturating_mul(nz);
     if request.material.len() != nvox || request.density.len() != nvox {
         return Err(ComputeError::Message("material and density differ".into()));
@@ -428,9 +432,11 @@ fn patient_launch(request: &PatientRequest) -> Result<Launch, ComputeError> {
             "density must be finite and positive".into(),
         ));
     }
-    if !request.beams.len().is_multiple_of(16) {
+    if !request.beams.len().is_multiple_of(16)
+        || !request.beams.iter().all(|value| value.is_finite())
+    {
         return Err(ComputeError::Message(
-            "beams must be whole 16-float records".into(),
+            "beams must be whole finite 16-float records".into(),
         ));
     }
     if !request.spots.len().is_multiple_of(40) {
@@ -1194,9 +1200,15 @@ fn write_params(bytes: &mut [u8], launch: &Launch, nspots: usize) {
     write_f32(bytes, 5, launch.spacing_cm[0]);
     write_f32(bytes, 6, launch.spacing_cm[1]);
     write_f32(bytes, 7, launch.spacing_cm[2]);
-    write_i32(bytes, 8, launch.shape[0] as i32);
-    write_i32(bytes, 9, launch.shape[1] as i32);
-    write_i32(bytes, 10, launch.shape[2] as i32);
+    // The shader sees the same clamped dims the buffers were sized with —
+    // a zero dim here makes every voxel_index() call return -1.
+    write_i32(bytes, 8, launch.shape[0].clamp(1, i32::MAX as usize) as i32);
+    write_i32(bytes, 9, launch.shape[1].clamp(1, i32::MAX as usize) as i32);
+    write_i32(
+        bytes,
+        10,
+        launch.shape[2].clamp(1, i32::MAX as usize) as i32,
+    );
     write_f32(bytes, 11, launch.depth_cm);
     write_f32(bytes, 12, launch.wet_cm);
     write_i32(bytes, 13, launch.medium);
@@ -1584,6 +1596,20 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_zero_axis_still_bounds_the_empty_path() {
+        // The empty-path cap used to read the unclamped shape — a zero dim
+        // hid a usize::MAX allocation behind it.
+        let mut request = slab(0);
+        request.protons = Vec::new();
+        request.shape = [0, usize::MAX, usize::MAX];
+        assert!(McRun::open(&McJob::Slab(request)).is_err());
+        let mut request = slab(0);
+        request.protons = Vec::new();
+        request.shape = [0, 50_000, 50_000];
+        assert!(McRun::open(&McJob::Slab(request)).is_err());
+    }
+
     fn slab(histories: u32) -> SlabRequest {
         SlabRequest {
             medium: "water".into(),
@@ -1792,6 +1818,10 @@ mod tests {
         assert!(patient_launch(&bad).is_err());
         let mut bad = request();
         bad.spots[6] = 2.0;
+        assert!(patient_launch(&bad).is_err());
+        // A NaN beam record would poison the GPU-side rotation silently.
+        let mut bad = request();
+        bad.beams[0] = f32::NAN;
         assert!(patient_launch(&bad).is_err());
         // Empty beams is legal input — this case errors because spot 0's
         // beam index references a beam that is not there.

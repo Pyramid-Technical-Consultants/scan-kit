@@ -588,8 +588,17 @@ pub fn write_water_study(dir: &Path) -> Result<(), String> {
         "1.2.840.10008.5.1.4.1.1.481.3",
     )?;
     ui(&mut structures, 0x0020, 0x0052, frame)?;
+    let observation = {
+        let mut item = Vec::new();
+        is(&mut item, 0x3006, 0x0084, 1)?;
+        cs(&mut item, 0x3006, 0x00A4, "PTV")?;
+        item
+    };
     sq(&mut structures, 0x3006, 0x0020, &[roi])?;
     sq(&mut structures, 0x3006, 0x0039, &[roi_contour])?;
+    // RT ROI Observations is Type 1 — without it the set has contours but
+    // no interpreted semantics.
+    sq(&mut structures, 0x3006, 0x0080, &[observation])?;
     fs::write(dir.join("struct.dcm"), structures).map_err(|err| err.to_string())?;
     let mut dose = preamble();
     ui(&mut dose, 0x0008, 0x0016, "1.2.840.10008.5.1.4.1.1.481.2")?;
@@ -1664,9 +1673,13 @@ pub(crate) fn ds(
         .map(|value| format!("{value:.6}"))
         .collect::<Vec<_>>()
         .join("\\");
-    // A DS value is ≤16 bytes of the decimal grammar — "NaN"/"inf"/"e+20"
-    // or an overlong literal is not encodable.
-    if !values.iter().all(|value| value.is_finite()) || text.len() > 16 * values.len() {
+    // A DS component is ≤16 bytes of the decimal grammar — "NaN"/"inf"/
+    // "e+20" or an overlong literal is not encodable. The limit is per
+    // component, not on the joined string.
+    if !values
+        .iter()
+        .all(|value| value.is_finite() && format!("{value:.6}").len() <= 16)
+    {
         return Err(format!("{group:04X},{element:04X} is not encodable as DS"));
     }
     push_elem(bytes, group, element, b"DS", &even(&text))
@@ -1837,11 +1850,20 @@ pub fn write_rtdose(
             "the dose grid {nx}x{ny} does not fit 16-bit rows/columns"
         ));
     }
-    if dose.len() != nx * ny * nz {
+    let Some(voxels) = nx.checked_mul(ny).and_then(|plane| plane.checked_mul(nz)) else {
+        return Err("the dose grid shape overflows".into());
+    };
+    if nx == 0 || ny == 0 || nz == 0 {
+        return Err("the dose grid has an empty axis".into());
+    }
+    if !ct.spacing.iter().all(|s| s.is_finite() && *s > 0.0) {
+        return Err("the dose grid spacing is not positive".into());
+    }
+    if dose.len() != voxels {
         return Err(format!(
             "dose is {} voxels, the grid wants {}",
             dose.len(),
-            nx * ny * nz
+            voxels
         ));
     }
     if ct.frame.is_empty() {
@@ -1926,6 +1948,27 @@ pub fn write_rtdose(
     us(&mut bytes, 0x0028, 0x0102, 31)?;
     us(&mut bytes, 0x0028, 0x0103, 0)?;
     cs(&mut bytes, 0x3004, 0x0002, "GY")?;
+    // Both are Type 1 CS with defined terms — a caller's free text would
+    // land in the file verbatim.
+    if !matches!(dose_type, "PHYSICAL" | "EFFECTIVE" | "ERROR") {
+        return Err(format!("dose type {dose_type:?} is not a defined term"));
+    }
+    if !matches!(
+        summation,
+        "PLAN"
+            | "MULTI_PLAN"
+            | "FRACTION"
+            | "BEAM"
+            | "BRACHY"
+            | "FRACTION_SESSION"
+            | "BEAM_SESSION"
+            | "BRACHY_SESSION"
+            | "CONTROL_POINT"
+    ) {
+        return Err(format!(
+            "summation type {summation:?} is not a defined term"
+        ));
+    }
     cs(&mut bytes, 0x3004, 0x0004, dose_type)?;
     lt(&mut bytes, 0x3004, 0x0006, DOSE_DISCLAIMER)?;
     cs(&mut bytes, 0x3004, 0x000A, summation)?;
@@ -1942,7 +1985,9 @@ pub fn write_rtdose(
         let mut item = Vec::new();
         ui(&mut item, 0x0008, 0x1150, RT_ION_PLAN_CLASS)?;
         ui(&mut item, 0x0008, 0x1155, plan_uid)?;
-        sq(&mut bytes, 0x300C, 0x0060, &[item])?;
+        // Referenced RT Plan Sequence — (300C,0060) is the brachy
+        // application setup sequence, a different attribute entirely.
+        sq(&mut bytes, 0x300C, 0x0002, &[item])?;
     }
     ow32(&mut bytes, 0x7FE0, 0x0010, &pixels)?;
     fs::write(path, &bytes).map_err(|err| err.to_string())?;
@@ -2402,7 +2447,7 @@ mod tests {
         assert_eq!(text_tag(&elems, tag(0x3004, 0x0006)), DOSE_DISCLAIMER);
         assert_eq!(text_tag(&elems, tag(0x0020, 0x4000)), r#"{"beam":"a"}"#);
         assert_eq!(text_tag(&elems, tag(0x0028, 0x0008)), "2");
-        let plan_item = &seq(&elems, tag(0x300C, 0x0060))[0];
+        let plan_item = &seq(&elems, tag(0x300C, 0x0002))[0];
         assert_eq!(text_tag(plan_item, tag(0x0008, 0x1150)), RT_ION_PLAN_CLASS);
         assert_eq!(text_tag(plan_item, tag(0x0008, 0x1155)), "9.8.7.6");
         // The dose reader reconstructs Gy from the scaled u32 pixels.
@@ -2902,6 +2947,41 @@ mod tests {
         .is_err());
         // A peak this small makes DoseGridScaling underflow to 0 on read.
         assert!(write_rtdose(&path, &[1e-40f32; 4], &ct, "", "PLAN", "PHYSICAL", "d", "").is_err());
+        // A zero axis or non-positive spacing writes a file the reader
+        // itself refuses.
+        let flat = CtVolume {
+            shape: [0, 2, 1],
+            ..ct.clone()
+        };
+        assert!(write_rtdose(&path, &[0.0; 4], &flat, "", "PLAN", "PHYSICAL", "d", "").is_err());
+        let sunk = CtVolume {
+            spacing: [-1.0, 1.0, 1.0],
+            ..ct.clone()
+        };
+        assert!(write_rtdose(&path, &[0.0; 4], &sunk, "", "PLAN", "PHYSICAL", "d", "").is_err());
+        // dose_type and summation take defined terms, not free text.
+        assert!(write_rtdose(
+            &path,
+            &[0.0f32, 1.0, 2.0, 3.0],
+            &ct,
+            "",
+            "PLAN",
+            "custom",
+            "d",
+            ""
+        )
+        .is_err());
+        assert!(write_rtdose(
+            &path,
+            &[0.0f32, 1.0, 2.0, 3.0],
+            &ct,
+            "",
+            "custom",
+            "PHYSICAL",
+            "d",
+            ""
+        )
+        .is_err());
         // The sane path still writes.
         assert!(write_rtdose(
             &path,
@@ -2924,6 +3004,10 @@ mod tests {
         assert!(ds(&mut bytes, 0x0018, 0x0050, &[f32::INFINITY]).is_err());
         // 1e10 formats to 18 chars — over the 16-byte DS limit.
         assert!(ds(&mut bytes, 0x0018, 0x0050, &[1e10]).is_err());
+        // The limit is per component — one overlong element is not
+        // diluted by short siblings.
+        assert!(ds(&mut bytes, 0x0018, 0x0050, &[1e10, 1.5]).is_err());
+        assert!(ds(&mut bytes, 0x0018, 0x0050, &[1.5, 2.5]).is_ok());
         assert!(ds(&mut bytes, 0x0018, 0x0050, &[1.5]).is_ok());
     }
 

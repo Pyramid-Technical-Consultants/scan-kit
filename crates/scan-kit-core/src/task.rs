@@ -95,9 +95,10 @@ impl Default for Cancel {
     }
 }
 
-/// A cancelled flag wins over a later `Ready` or preview.
+/// A cancelled flag wins over a later `Ready` or preview — but not over a
+/// real failure, whose message the caller still needs.
 pub fn settle<T>(poll: Poll<T>, cancel: &Cancel) -> Poll<T> {
-    if cancel.is_cancelled() {
+    if cancel.is_cancelled() && !matches!(poll, Poll::Failed(_)) {
         Poll::Cancelled
     } else {
         poll
@@ -158,7 +159,9 @@ pub fn decode_poll(bytes: &[u8]) -> Result<(Value, Option<&[u8]>), String> {
         return Err("task poll is truncated".into());
     }
     let length = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
-    let end = 4 + length;
+    let Some(end) = 4usize.checked_add(length) else {
+        return Err("task poll is truncated".into());
+    };
     if bytes.len() < end {
         return Err("task poll is truncated".into());
     }
@@ -174,6 +177,28 @@ pub fn decode_poll(bytes: &[u8]) -> Result<(Value, Option<&[u8]>), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_failure_survives_a_set_cancel_flag() {
+        // Cancelled wins over Ready/preview, but a real failure's message
+        // must reach the caller.
+        let cancel = Cancel::new();
+        cancel.cancel();
+        assert_eq!(
+            settle(Poll::<u8>::Failed("boom".into()), &cancel),
+            Poll::Failed("boom".into())
+        );
+        assert_eq!(settle(Poll::<u8>::Ready(1), &cancel), Poll::Cancelled);
+    }
+
+    #[test]
+    fn a_max_length_poll_frame_errors_instead_of_wrapping() {
+        // u32::MAX + 4 overflowed usize — checked_add turns it into a
+        // truncation error.
+        let mut bytes = vec![0xff, 0xff, 0xff, 0xff];
+        bytes.extend_from_slice(b"{}");
+        assert!(decode_poll(&bytes).is_err());
+    }
 
     fn report(done: u64, total: u64) -> Report {
         Report {

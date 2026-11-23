@@ -172,7 +172,13 @@ pub fn read_npz(bytes: &[u8]) -> Result<BTreeMap<String, Npy>, String> {
 }
 
 pub fn load_npz(path: &Path) -> Result<BTreeMap<String, Npy>, String> {
-    read_npz(&fs::read(path).map_err(|err| format!("{path:?}: {err}"))?)
+    let mut file = fs::File::open(path).map_err(|err| format!("{path:?}: {err}"))?;
+    let name = path.display().to_string();
+    read_npz(&crate::discover::read_capped(
+        &mut file,
+        &name,
+        crate::discover::MAX_MEMBER_BYTES,
+    )?)
 }
 
 /// Write a deflated `.npz` (`np.savez_compressed` compatible); each pair's

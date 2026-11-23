@@ -241,7 +241,9 @@ fn parse_sheet(bytes: &[u8]) -> Option<Sheet> {
         .iter()
         .enumerate()
         .map(|(index, name)| {
-            let name = name.trim();
+            // A UTF-8 BOM is not whitespace — a BOM'd first header would
+            // be unreachable by name everywhere downstream.
+            let name = name.trim_start_matches('\u{feff}').trim();
             if name.is_empty() {
                 format!("unnamed_{index}")
             } else {
@@ -347,9 +349,18 @@ fn csv_text(sheet: &Sheet) -> String {
 /// row across differently-formatted device tables. Numeric keys normalize;
 /// anything else joins on its text.
 fn join_key(text: &str) -> String {
-    text.parse::<f64>()
-        .map(|value| value.to_string())
-        .unwrap_or_else(|_| text.to_owned())
+    match text.parse::<f64>() {
+        // "-0" and "0"/"0.0" must join; a non-finite cell keeps its raw
+        // text rather than collapsing every NaN into one key.
+        Ok(value) if value.is_finite() => {
+            if value == 0.0 {
+                "0".to_owned()
+            } else {
+                value.to_string()
+            }
+        }
+        _ => text.to_owned(),
+    }
 }
 
 fn join_cells<'a>(cells: impl Iterator<Item = &'a str>) -> String {
@@ -1206,6 +1217,9 @@ fn write_termination(
                     .rows
                     .iter()
                     .filter_map(|row| row.get(index))
+                    // join_key normalizes "1"/"1.0"/"01" — counting raw
+                    // spellings reports phantom extra layers.
+                    .map(|cell| join_key(cell))
                     .collect::<HashSet<_>>()
                     .len()
             })

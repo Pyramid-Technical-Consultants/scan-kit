@@ -388,7 +388,22 @@ pub fn read_session_file(storage: &Path, session_id: &str, filename: &str) -> Op
         }
     }
     // A wrapped archive whose folder name was not picked up as the session id
-    // (tars keep the zip filename) still resolves by the inner path suffix.
+    // (tars keep the zip filename) still resolves by the inner path suffix —
+    // but only when the archive holds one session tree, else the suffix could
+    // serve a sibling session's file under this id.
+    let roots: std::collections::BTreeSet<String> = members
+        .iter()
+        .filter_map(|(name, _)| {
+            normalize_member(name)
+                .split('/')
+                .next()
+                .filter(|root| !root.is_empty())
+                .map(str::to_owned)
+        })
+        .collect();
+    if roots.len() != 1 {
+        return None;
+    }
     members
         .into_iter()
         .find(|(name, _)| normalize_member(name).ends_with(&suffix))
@@ -567,7 +582,7 @@ fn timeslice_key(name: &str) -> (i64, i64, String) {
     )
 }
 
-fn number_after(path: &str, marker: &str) -> i64 {
+pub(crate) fn number_after(path: &str, marker: &str) -> i64 {
     let Some(index) = path.rfind(marker) else {
         return 0;
     };

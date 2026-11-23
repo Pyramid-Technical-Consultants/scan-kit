@@ -38,7 +38,7 @@ vi.mock("@tauri-apps/api/core", () => ({
         version: "2.0.0-dev",
         commit: "",
         third_party: [
-          { name: "MCsquare — data", license: "Apache-2.0", attribution: "© UCLouvain" },
+          { name: "MCsquare — Monte Carlo material, beam, and scanner data", license: "Apache-2.0", attribution: "© UCLouvain" },
         ],
       };
     }
@@ -157,5 +157,5 @@ it("mounts the shell, switches tabs, and opens About", async () => {
     about?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
   });
   expect(document.body.textContent).toContain("Third-party software and data");
-  expect(document.body.textContent).toContain("MCsquare — data");
+  expect(document.body.textContent).toContain("MCsquare — Monte Carlo material, beam, and scanner data");
 });

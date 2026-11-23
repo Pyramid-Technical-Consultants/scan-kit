@@ -515,8 +515,10 @@ export function ConfigTuning({
       return;
     }
     // A loadFile already in flight would resolve under the new configDir and
-    // restore the previous folder's XML — it must not outlive this save.
-    ++openSeq.current;
+    // restore the previous folder's XML — it must not outlive this save. A
+    // later browse bumps the seq again, so this save's late setters must also
+    // defer to it or configDir/file/xml can land from mismatched folders.
+    const seq = ++openSeq.current;
     setOpening(false);
     const selected = await open({
       directory: true,
@@ -548,16 +550,25 @@ export function ConfigTuning({
         files: [{ rel: file, xml: nextXml }],
         hideUnused,
       });
+      if (seq !== openSeq.current) {
+        return;
+      }
       setConfigDir(selected);
       setXml(nextXml);
       setForm(nextForm);
       setDirty(false);
       const opened = await invoke<Opened>("scan_kit_config_open", { path: selected });
+      if (seq !== openSeq.current) {
+        return;
+      }
       setFiles(opened.files);
       if (nextForm != null) {
         const loaded = await invoke<Loaded>("scan_kit_config_form", {
           path: joinPath(selected, file),
         });
+        if (seq !== openSeq.current) {
+          return;
+        }
         setIntegrity(loaded.integrity);
       }
       notifySaved(selected, {

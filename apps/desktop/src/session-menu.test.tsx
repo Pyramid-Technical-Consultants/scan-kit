@@ -87,7 +87,9 @@ it("opens the session menu without throwing", async () => {
   expect(copied).toEqual(["1022244633"]);
   expect(toggled).toEqual([1]);
   expect(tuned).toEqual([1]);
-  expect(closed).toBeGreaterThanOrEqual(3);
+  // Each click fires onClose via the item handler and again via
+  // onOpenChange — pin the real count so extra fires cannot hide.
+  expect(closed).toBe(5);
   await act(async () => {
     root.unmount();
   });

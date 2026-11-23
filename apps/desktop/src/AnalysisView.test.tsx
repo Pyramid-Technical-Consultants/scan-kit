@@ -67,7 +67,7 @@ function pollFrame(payload: Uint8Array): Uint8Array {
 }
 
 vi.mock("@tauri-apps/api/core", () => ({
-  invoke: vi.fn(async (command: string, args?: { view?: string }) => {
+  invoke: vi.fn(async (command: string, _args?: { view?: string }) => {
     if (command === "scan_kit_cancel") {
       return null;
     }
@@ -79,7 +79,7 @@ vi.mock("@tauri-apps/api/core", () => ({
     }
     const starts = vi.mocked(invoke).mock.calls.filter(([name]) => name === "scan_kit_start");
     const started = starts[starts.length - 1]?.[1] as { view?: string } | undefined;
-    const view = started?.view ?? args?.view;
+    const view = started?.view;
     const header =
       view === "volumetric"
         ? {
@@ -1453,5 +1453,38 @@ it("draws each dose cell from one plot module once the canvas has a size", async
     HTMLCanvasElement.prototype.getBoundingClientRect = previousRect;
     Object.defineProperty(window, "devicePixelRatio", { configurable: true, value: previousRatio });
     globalThis.ResizeObserver = PreviousObserver;
+  }
+});
+
+it("keeps a distinct palette color per session under a canvas stub", () => {
+  // parseColor rasterizes fillStyle through a 2-D canvas; happy-dom returns
+  // a null context so every palette entry is the same constant and the
+  // palette-index invariant above could not fail. Stub the context so each
+  // fillStyle maps to a distinct pixel.
+  const real = HTMLCanvasElement.prototype.getContext;
+  HTMLCanvasElement.prototype.getContext = function () {
+    const ctx = {
+      fillStyle: "",
+      fillRect() {},
+      getImageData() {
+        const data = new Uint8ClampedArray(4);
+        for (let i = 0; i < ctx.fillStyle.length && i < 4; i++) {
+          data[i] = ctx.fillStyle.charCodeAt(i + 1) % 256;
+        }
+        data[3] = 255;
+        return { data };
+      },
+    };
+    return ctx as unknown as CanvasRenderingContext2D;
+  } as unknown as typeof HTMLCanvasElement.prototype.getContext;
+  try {
+    const colors = ["#ff0000", "#00ff00"].map((c) => {
+      const ctx = document.createElement("canvas").getContext("2d");
+      ctx!.fillStyle = c;
+      return ctx!.getImageData(0, 0, 1, 1).data[0];
+    });
+    expect(new Set(colors).size).toBe(2);
+  } finally {
+    HTMLCanvasElement.prototype.getContext = real;
   }
 });

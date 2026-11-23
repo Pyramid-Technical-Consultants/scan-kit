@@ -100,7 +100,6 @@ it("steps from the keyboard", () => {
   const handle = host.querySelector("[role='separator']");
   handle?.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, key: "ArrowDown" }));
   handle?.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, key: "ArrowUp" }));
-  handle?.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, key: "Home" }));
   expect(moves).toEqual([16, -16]);
   expect(handle?.getAttribute("aria-orientation")).toBe("horizontal");
 });

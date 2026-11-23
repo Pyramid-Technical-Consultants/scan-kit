@@ -821,9 +821,10 @@ fn session_config_dir(data_dir: &str, session_id: &str) -> Option<PathBuf> {
 fn session_present(root: &Path, session_id: &str) -> bool {
     discover::read_session_file(root, session_id, "input_map.csv").is_some()
         || discover::read_session_file(root, session_id, "spot_data.csv").is_some()
-        || discover::session_directory(root, session_id)
-            .join("timeslice_data_device_units.csv")
-            .is_file()
+        // Timeslice files live under layer-N/run-M/, not the root —
+        // a session holding only nested timeslices is still present.
+        || !discover::list_timeslice_paths(&discover::session_directory(root, session_id))
+            .is_empty()
 }
 
 const MAX_WALK_DEPTH: usize = 32;

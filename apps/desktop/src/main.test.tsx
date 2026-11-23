@@ -29,7 +29,7 @@ vi.mock("@tauri-apps/api/core", () => ({
         version: "2.0.0-dev",
         commit: "",
         third_party: [
-          { name: "MCsquare — data", license: "Apache-2.0", attribution: "© UCLouvain" },
+          { name: "MCsquare — Monte Carlo material, beam, and scanner data", license: "Apache-2.0", attribution: "© UCLouvain" },
         ],
       };
     }
