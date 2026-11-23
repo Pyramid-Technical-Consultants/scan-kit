@@ -843,7 +843,7 @@ function PreviewGrid({ columns, rows }: { columns: string[]; rows: PreviewCell[]
   const theme = useMemo(() => gridTheme(), []);
   const tones = useMemo(() => toneColors(), []);
   const baseColumns = useMemo<GridColumn[]>(
-    () => columns.map((title) => ({ title, id: title, width: 150 })),
+    () => columns.map((title, index) => ({ title, id: `${title}#${index}`, width: 150 })),
     [columns],
   );
   const { columns: gridColumns, onColumnResize } = useResizableColumns(baseColumns);

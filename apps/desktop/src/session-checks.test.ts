@@ -17,6 +17,12 @@ it("selects at most five sessions from the header", () => {
   });
   expect(headerWillFill(6, 5)).toBe(false);
   expect(nextSessionSelection(ids, ["a"], "f", true).capped).toBe(false);
+  // Already-selected ids must not count twice toward the cap — 4 rows with
+  // 3 checked fills all 4 and is not capped.
+  expect(nextSessionSelection(["a", "b", "c", "d"], ["a", "b", "c"], "all", true)).toEqual({
+    ids: ["a", "b", "c", "d"],
+    capped: false,
+  });
   expect(nextSessionSelection(ids, ["a", "b", "c", "d", "e"], "f", true)).toEqual({
     ids: ["a", "b", "c", "d", "e"],
     capped: true,

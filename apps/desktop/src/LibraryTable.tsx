@@ -227,6 +227,20 @@ export function LibraryTable({
     selectedVisible,
   );
 
+  const noteEdit = useRef<{ id: string; note: string } | null>(null);
+  const onCellActivated = useCallback(
+    (cell: Item) => {
+      const [col, rowIndex] = cell;
+      const source = order[rowIndex];
+      const row = source == null ? undefined : rows[source];
+      // Capture the session and its note when the editor opens — an
+      // in-flight catalog refresh can move a different session into this
+      // row before commit, and undo restores `before` verbatim.
+      noteEdit.current =
+        clickEditsNote(col) && row != null ? { id: row.session_id, note: row.note } : null;
+    },
+    [order, rows],
+  );
   const onCellEdited = useCallback(
     (cell: Item, newValue: EditableGridCell) => {
       const [col, rowIndex] = cell;
@@ -235,11 +249,22 @@ export function LibraryTable({
       if (row == null || folder == null) {
         return;
       }
-      if (clickEditsNote(col) && newValue.kind === GridCellKind.Text && newValue.data !== row.note) {
-        onCommitNote({ sessionId: row.session_id, before: row.note, after: newValue.data });
+      if (col === 0 && newValue.kind === GridCellKind.Boolean) {
+        // Keyboard toggling lands here — clicks are handled by onCellClicked.
+        onRowCheck(row.session_id, newValue.data === true);
+        return;
+      }
+      const edit = noteEdit.current;
+      const before = edit?.note ?? row.note;
+      if (clickEditsNote(col) && newValue.kind === GridCellKind.Text && newValue.data !== before) {
+        onCommitNote({
+          sessionId: edit?.id ?? row.session_id,
+          before,
+          after: newValue.data,
+        });
       }
     },
-    [folder, onCommitNote, order, rows],
+    [folder, onCommitNote, onRowCheck, order, rows],
   );
 
   const getCellContent = useCallback(
@@ -257,7 +282,7 @@ export function LibraryTable({
           data: checked,
           allowOverlay: false,
           readonly: true,
-          copyData: checked ? "true" : "false",
+          copyData: "",
           cursor: "pointer",
         };
       }
@@ -334,6 +359,7 @@ export function LibraryTable({
       getCellContent={getCellContent}
       drawCell={drawGridCell}
       drawHeader={drawGridHeader}
+      onCellActivated={onCellActivated}
       onCellEdited={onCellEdited}
       onCellClicked={([col, rowIndex], event) => {
         const source = order[rowIndex];

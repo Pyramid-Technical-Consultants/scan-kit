@@ -779,21 +779,39 @@ fn scanners(db: &Path, action: &str, folder: Option<&str>) -> Result<Value, Stri
             // File IO outside STORE_LOCK — resolve before taking it.
             let calibration = calibration::CtCalibration::resolve(folder)?;
             store::with_store(db, |conn| {
-                let mut list = store::scanners(conn)?;
-                if !list.iter().any(|(_, existing)| existing == folder) {
-                    list.push((calibration.name.clone(), folder.to_owned()));
+                conn.execute_batch("BEGIN IMMEDIATE")
+                    .map_err(|err| err.to_string())?;
+                let result = (|| {
+                    let mut list = store::scanners(conn)?;
+                    if !list.iter().any(|(_, existing)| existing == folder) {
+                        list.push((calibration.name.clone(), folder.to_owned()));
+                    }
+                    store::set_scanners(conn, &list)
+                })();
+                if result.is_err() {
+                    let _ = conn.execute_batch("ROLLBACK");
+                    return result;
                 }
-                store::set_scanners(conn, &list)
+                conn.execute_batch("COMMIT").map_err(|err| err.to_string())
             })?;
         }
         "remove" => {
             let folder = folder.ok_or("scanner folder required")?;
             store::with_store(db, |conn| {
-                let list: Vec<(String, String)> = store::scanners(conn)?
-                    .into_iter()
-                    .filter(|(_, existing)| existing != folder)
-                    .collect();
-                store::set_scanners(conn, &list)
+                conn.execute_batch("BEGIN IMMEDIATE")
+                    .map_err(|err| err.to_string())?;
+                let result = (|| {
+                    let list: Vec<(String, String)> = store::scanners(conn)?
+                        .into_iter()
+                        .filter(|(_, existing)| existing != folder)
+                        .collect();
+                    store::set_scanners(conn, &list)
+                })();
+                if result.is_err() {
+                    let _ = conn.execute_batch("ROLLBACK");
+                    return result;
+                }
+                conn.execute_batch("COMMIT").map_err(|err| err.to_string())
             })?;
         }
         "list" => {}
@@ -898,7 +916,11 @@ pub fn index_library(
         // process's write (a note, window geometry) would hit busy_timeout.
         // record_meta afterwards autocommits per entry, and a checked=0 row
         // left by a cancel rehydrates on the next sync.
-        let tx = conn.transaction().map_err(|err| err.to_string())?;
+        // Immediate like the scanner paths — a future SELECT-first edit must
+        // not reopen the read-modify-write window this transaction closes.
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|err| err.to_string())?;
         let lib_id = prepare_library(&tx, &root)?;
         let ids = places
             .iter()
@@ -936,7 +958,7 @@ pub fn index_library(
         if pending.contains(&index) {
             // hydrate does file/network IO — outside the lock; the write is
             // a short autocommit on the shared connection.
-            let (meta, readable) = hydrate(entry);
+            let (meta, readable) = hydrate(entry, fingerprints[index]);
             store::locked(|| {
                 record_meta(
                     conn,
@@ -1071,7 +1093,7 @@ pub fn remember_password(spec: &str, password: &str) {
     location::remember_password(spec, password);
 }
 
-fn hydrate(entry: &Discovered) -> (Option<SessionMeta>, bool) {
+fn hydrate(entry: &Discovered, stamped: Option<(i64, i64)>) -> (Option<SessionMeta>, bool) {
     let mut meta = discover::read_session_file(
         &entry.storage_path,
         &entry.session_id,
@@ -1088,8 +1110,11 @@ fn hydrate(entry: &Discovered) -> (Option<SessionMeta>, bool) {
     // A None meta is ambiguous: a reachable storage path without a summary is
     // a legitimate absence, but an unreachable one is a transient failure —
     // the fingerprint stat is the same probe sync_entry already pays for.
-    let readable = meta.is_some()
-        || discover::storage_fingerprint(&entry.storage_path, &entry.session_id).is_some();
+    let fresh = discover::storage_fingerprint(&entry.storage_path, &entry.session_id);
+    // Meta hydrated after the fingerprint stat can describe newer bytes than
+    // the row certifies — a moved file stays retryable instead of sealing
+    // stale meta under the old fingerprint.
+    let readable = (meta.is_some() || fresh.is_some()) && fresh == stamped;
     (meta, readable)
 }
 

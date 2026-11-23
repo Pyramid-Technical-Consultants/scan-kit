@@ -292,7 +292,7 @@ function XmlGrid({
     () =>
       shown.map((item) => ({
         title: item.column.label,
-        id: item.column.name,
+        id: `${item.column.name}#${item.index}`,
         width: Math.min(180, Math.max(88, item.column.label.length * 9 + 28)),
       })),
     [shown],

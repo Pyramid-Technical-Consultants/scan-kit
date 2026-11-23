@@ -754,14 +754,16 @@ impl Plot {
             header.foreground,
         );
         plot.encoded = Some(encoded);
-        if let Some(parts) = dose {
-            plot.attach_parts(parts);
-        }
+        // carry_lines must precede attach_parts so guide capture can tell a
+        // suffix-only reuse_lines buffer from a complete one.
         plot.carry_lines(
             header.line_token.parse::<u64>().unwrap_or(0),
             header.reuse_lines,
             header.line_prefix,
         );
+        if let Some(parts) = dose {
+            plot.attach_parts(parts);
+        }
         plot
     }
 }

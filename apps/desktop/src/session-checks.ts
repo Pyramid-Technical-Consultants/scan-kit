@@ -43,7 +43,10 @@ export function nextSessionSelection(
       0,
       MAX_SELECTED,
     );
-    return { ids, capped: selected.length + idsInOrder.length > MAX_SELECTED };
+    return {
+      ids,
+      capped: selected.length + idsInOrder.filter((id) => !selected.includes(id)).length > MAX_SELECTED,
+    };
   }
   if (!checked) {
     return { ids: selected.filter((id) => id !== target), capped: false };

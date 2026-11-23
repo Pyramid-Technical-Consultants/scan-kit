@@ -217,7 +217,7 @@ pub fn quantile_edges(values: &[f32], n_bins: usize) -> Vec<f32> {
     let mut edges = crate::stats::quantiles_at(&mut finite, &qs);
     // Relative epsilon — an absolute 1e-6 swallows every edge in a column
     // whose data lives at a smaller scale (charge integrals, ratios).
-    edges.dedup_by(|a, b| (*a - *b).abs() <= 1e-9 * a.abs().max(*b).max(1e-30));
+    edges.dedup_by(|a, b| (*a - *b).abs() <= 1e-9 * a.abs().max(b.abs()).max(1e-30));
     if edges.len() < 2 {
         let lo = edges.first().copied().unwrap_or(0.0);
         return vec![lo - 0.5, lo + 0.5];
@@ -358,10 +358,9 @@ pub fn welch_psd(
     if !fs.is_finite() || fs <= 0.0 {
         return (Vec::new(), Vec::new());
     }
-    let mean = finite_mean(signal);
     let centered: Vec<f32> = signal
         .iter()
-        .map(|value| if value.is_finite() { value - mean } else { 0.0 })
+        .map(|value| if value.is_finite() { *value } else { 0.0 })
         .collect();
     if centered.len() < seg_len {
         seg_len = centered.len();
@@ -387,11 +386,12 @@ pub fn welch_psd(
     let mut count = 0usize;
     let mut start = 0usize;
     while start + seg_len <= centered.len() {
-        for (out, (sample, weight)) in windowed
-            .iter_mut()
-            .zip(centered[start..start + seg_len].iter().zip(&window))
-        {
-            *out = sample * weight;
+        // Detrend 'constant' per segment like scipy — the global mean lets a
+        // baseline step leak broadband into the lowest bins.
+        let segment = &centered[start..start + seg_len];
+        let seg_mean = finite_mean(segment);
+        for (out, (sample, weight)) in windowed.iter_mut().zip(segment.iter().zip(&window)) {
+            *out = (sample - seg_mean) * weight;
         }
         for (bin, power) in psd.iter_mut().zip(rfft_power(&windowed)) {
             *bin += power;
@@ -611,26 +611,39 @@ pub fn gamma_index(
 }
 /// Least-squares line. `None` when fewer than two finite points share an x span.
 pub fn linear_fit(xs: &[f32], ys: &[f32]) -> Option<(f32, f32)> {
-    let mut n = 0.0f32;
-    let mut sx = 0.0f32;
-    let mut sy = 0.0f32;
-    let mut sxx = 0.0f32;
-    let mut sxy = 0.0f32;
+    // Centered f64 sums — n*sxx - sx*sx in f32 cancels the true denominator
+    // at large x offsets, and an absolute epsilon on den rejects any column
+    // at coulomb scale.
+    let mut n = 0.0f64;
+    let mut sx = 0.0f64;
+    let mut sy = 0.0f64;
     for (x, y) in xs.iter().zip(ys) {
         if x.is_finite() && y.is_finite() {
             n += 1.0;
-            sx += x;
-            sy += y;
-            sxx += x * x;
-            sxy += x * y;
+            sx += f64::from(*x);
+            sy += f64::from(*y);
         }
     }
-    let den = n * sxx - sx * sx;
-    if n < 2.0 || !den.is_finite() || den.abs() < 1e-12 {
+    if n < 2.0 {
         return None;
     }
-    let slope = (n * sxy - sx * sy) / den;
-    let intercept = (sy - slope * sx) / n;
+    let x_bar = sx / n;
+    let y_bar = sy / n;
+    let mut sxx = 0.0f64;
+    let mut sxy = 0.0f64;
+    for (x, y) in xs.iter().zip(ys) {
+        if x.is_finite() && y.is_finite() {
+            let dx = f64::from(*x) - x_bar;
+            sxx += dx * dx;
+            sxy += dx * (f64::from(*y) - y_bar);
+        }
+    }
+    if !sxx.is_finite() || sxx <= f64::MIN_POSITIVE {
+        return None;
+    }
+    let slope = sxy / sxx;
+    let intercept = y_bar - slope * x_bar;
+    let (slope, intercept) = (slope as f32, intercept as f32);
     // A huge y can push the numerator to inf while den stays finite.
     if !slope.is_finite() || !intercept.is_finite() {
         return None;
@@ -758,7 +771,7 @@ pub fn trapz(time: &[f32], values: &[f32]) -> f32 {
     acc
 }
 
-/// Time window around the positive HV step, padded by 40 ms.
+/// Time window around the largest HV excursion, padded by 40 ms.
 pub fn hv_step_window(time: &[f32], current: &[f32]) -> Option<(f32, f32)> {
     let n = time.len().min(current.len());
     if n == 0 {
@@ -766,9 +779,10 @@ pub fn hv_step_window(time: &[f32], current: &[f32]) -> Option<(f32, f32)> {
     }
     let base = median_finite(&current[..n])?;
     let mut peak_i = 0usize;
-    let mut peak = f32::MIN;
+    let mut peak = 0.0f32;
     for (i, value) in current[..n].iter().enumerate() {
-        let delta = value - base;
+        // A down-step is a legal config — its transient is negative.
+        let delta = (value - base).abs();
         if delta.is_finite() && delta > peak {
             peak = delta;
             peak_i = i;
@@ -779,11 +793,11 @@ pub fn hv_step_window(time: &[f32], current: &[f32]) -> Option<(f32, f32)> {
     }
     let thr = peak * 0.10;
     let mut lo = peak_i;
-    while lo > 0 && current[lo - 1] - base > thr {
+    while lo > 0 && (current[lo - 1] - base).abs() > thr {
         lo -= 1;
     }
     let mut hi = peak_i;
-    while hi + 1 < n && current[hi + 1] - base > thr {
+    while hi + 1 < n && (current[hi + 1] - base).abs() > thr {
         hi += 1;
     }
     Some((time[lo] - 40.0, time[hi] + 40.0))
@@ -826,7 +840,9 @@ pub fn hv_capacitance_pf(
     if tt.len() < 2 {
         return None;
     }
-    Some(trapz(&tt, &yy) / delta_v)
+    // delta_v is |b - a| and a down-step integrates a negative transient —
+    // capacitance is unsigned.
+    Some(trapz(&tt, &yy).abs() / delta_v.abs())
 }
 /// Percent of finite metrics at or above each threshold.
 pub fn coverage_percent(metrics: &[f32], thresholds: &[f32]) -> Vec<f32> {
@@ -1327,6 +1343,51 @@ mod tests {
     fn an_infinite_fit_numerator_returns_none() {
         // den stays finite here — only the numerator overflows.
         assert_eq!(linear_fit(&[1.0, 2.0], &[3.4e38, 1.0e-3]), None);
+    }
+
+    #[test]
+    fn a_fit_over_a_huge_x_offset_keeps_the_true_slope() {
+        // n*sxx - sx*sx cancels to rounding noise in f32 — the denominator
+        // must be accumulated centered and in f64.
+        let (slope, intercept) =
+            linear_fit(&[1_000_000.0, 1_000_001.0, 1_000_002.0], &[1.0, 3.0, 5.0]).unwrap();
+        assert!((slope - 2.0).abs() < 1e-4, "{slope}");
+        assert!((intercept + 1_999_999.0).abs() < 1.0, "{intercept}");
+    }
+
+    #[test]
+    fn a_fit_over_tiny_x_values_is_not_rejected() {
+        // An absolute epsilon on the denominator refused coulomb-scale x data.
+        let (slope, _) = linear_fit(&[1e-9, 2e-9, 3e-9], &[0.0, 1.0, 2.0]).unwrap();
+        assert!((slope - 1e9).abs() < 1e6, "{slope}");
+    }
+
+    #[test]
+    fn a_mid_trace_step_does_not_leak_into_the_dc_bin() {
+        // scipy detrends 'constant' per segment — a baseline step's mean must
+        // not leak into the lowest bins.
+        let mut signal = vec![0.0f32; 256];
+        signal[128..].fill(1.0);
+        let (_, psd) = welch_psd(&signal, 100.0, 64, 0.5);
+        assert!(psd[0] < 1e-6, "{}", psd[0]);
+    }
+
+    #[test]
+    fn a_down_step_is_a_valid_hv_excursion() {
+        // ending < starting voltage produces a negative transient — the
+        // window must find it like the positive step.
+        let time: Vec<f32> = (0..40).map(|i| i as f32).collect();
+        let mut current = vec![0.0f32; 40];
+        current[20] = -10.0;
+        assert!(hv_step_window(&time, &current).is_some());
+    }
+
+    #[test]
+    fn a_down_step_reports_unsigned_capacitance() {
+        let time = vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0];
+        let current = vec![0.0, -10.0, -2.0, 0.0, 0.0, 0.0];
+        let pf = hv_capacitance_pf(&time, &current, -1.0, 4.0, 80.0).unwrap();
+        assert!(pf > 0.0, "{pf}");
     }
 
     #[test]

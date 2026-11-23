@@ -923,8 +923,14 @@ mod net {
         let minute: i64 = text[10..12].parse().unwrap_or(0);
         let second: i64 = text[12..14].parse().unwrap_or(0);
         // Out-of-range fields are a malformed reply, not a plausible date.
+        let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+        let days_in_month = match month {
+            2 => 28 + i64::from(leap),
+            4 | 6 | 9 | 11 => 30,
+            _ => 31,
+        };
         if !(1..=12).contains(&month)
-            || !(1..=31).contains(&day)
+            || !(1..=days_in_month).contains(&day)
             || hour > 23
             || minute > 59
             || second > 60
@@ -1244,6 +1250,9 @@ mod net {
             );
             assert_eq!(days_from_civil(1970, 1, 1), 0);
             assert!(days_from_civil(1969, 12, 31) < 0);
+            assert_eq!(modify_ns("20230229120000"), 0);
+            assert_eq!(modify_ns("20230431235959"), 0);
+            assert!(modify_ns("20240229120000") > 0);
             assert_eq!(resolve("127.0.0.1", 9).unwrap()[0].port(), 9);
             assert_eq!(resolve("[::1]", 9).unwrap()[0].port(), 9);
             assert!(tls_config().is_ok());
