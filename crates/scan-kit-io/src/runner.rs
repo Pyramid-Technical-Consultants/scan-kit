@@ -1368,6 +1368,10 @@ fn live() -> bool {
 mod tests {
     use super::*;
 
+    // The busy flags are process statics — tests that acquire them (directly
+    // or via upload()) must not overlap.
+    static FLAG_LOCK: Mutex<()> = Mutex::new(());
+
     #[test]
     fn http_get_reads_a_content_length_body() {
         use std::net::TcpListener;
@@ -1757,6 +1761,7 @@ mod tests {
     fn busy_flags_reject_a_second_connect_or_upload() {
         // Two concurrent uploads would PUT to the same device path and both
         // report success for different files — the flags must single-flight.
+        let _guard = FLAG_LOCK.lock().unwrap();
         let upload = acquire(&UPLOAD_BUSY, "an upload is already in progress").unwrap();
         assert!(acquire(&UPLOAD_BUSY, "an upload is already in progress").is_err());
         drop(upload);
@@ -1812,6 +1817,7 @@ mod tests {
 
     #[test]
     fn an_oversized_upload_is_rejected_before_any_io() {
+        let _guard = FLAG_LOCK.lock().unwrap();
         let dir = std::env::temp_dir().join(format!("sk_r21_up_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let csv = dir.join("big.csv");
