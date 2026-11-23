@@ -354,9 +354,9 @@ pub fn session_zip_dest(dest: &str) -> Option<String> {
     let dest = dest.trim();
     // A bare filename resolves against the process CWD - a saved session
     // must name a real directory or the file lands where nobody looks.
-    let no_dir = std::path::Path::new(dest)
-        .parent()
-        .is_none_or(|parent| parent.as_os_str().is_empty());
+    // Both separator spellings count; Path::parent would read a Windows
+    // path as one filename on a Unix build.
+    let no_dir = !dest.contains('/') && !dest.contains('\\');
     if dest.is_empty()
         || dest.starts_with("/root/")
         || !dest.to_ascii_lowercase().ends_with(".zip")
