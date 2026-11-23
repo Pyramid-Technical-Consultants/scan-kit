@@ -43,7 +43,7 @@ pub(crate) fn pick_in<'a>(
     key: &str,
     pairs: &[(&'a str, &'a str)],
 ) -> Option<&'a str> {
-    let raw = options.get(key).and_then(Value::as_str)?;
+    let raw = options.get(key).and_then(Value::as_str)?.trim();
     pairs
         .iter()
         .find(|(id, label)| *id == raw || *label == raw)
@@ -81,7 +81,7 @@ pub fn normalize_options(options: &mut Value) {
 }
 
 pub(crate) fn flag(options: &Value, key: &str, default_on: bool) -> bool {
-    match text(options, key, if default_on { "On" } else { "Off" }) {
+    match text(options, key, if default_on { "On" } else { "Off" }).trim() {
         // MCP callers hand us "False"/"TRUE" — match case-insensitively
         // rather than silently falling back to the default.
         raw if raw.eq_ignore_ascii_case("off")
@@ -177,5 +177,17 @@ rci_in_trigger,r_ic1_x_confidence,r_ic1_x_peak_amplitude,c_x,r_xV,r_tx2_probe_x
         assert_eq!(options["roi0"], "0");
         assert_eq!(options["histories"], "3000000");
         assert_eq!(options["cut"], "0.5");
+    }
+
+    #[test]
+    fn flag_and_pick_tolerate_padded_values() {
+        // " false " must not fall through to the default - a padded spell
+        // is still a spell.
+        let options = serde_json::json!({"auto": " false ", "compare": " Gamma "});
+        assert!(!super::flag(&options, "auto", true));
+        assert_eq!(
+            super::pick_in(&options, "compare", &[("gamma", "Gamma"), ("dose", "Dose")]),
+            Some("gamma")
+        );
     }
 }

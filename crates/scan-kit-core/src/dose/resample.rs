@@ -16,9 +16,9 @@ pub fn resample_linear(
     dst_shape: [usize; 3],
 ) -> Vec<f32> {
     let [nx, ny, nz] = src_shape;
-    let get = |x: isize, y: isize, z: isize| -> f32 {
+    let at = |x: isize, y: isize, z: isize| -> Option<f32> {
         if x < 0 || y < 0 || z < 0 || x >= nx as isize || y >= ny as isize || z >= nz as isize {
-            return 0.0;
+            return None;
         }
         // The source shape is caller-supplied — a wrapped flat index could
         // sample the wrong in-bounds voxel, not just miss.
@@ -28,7 +28,7 @@ pub fn resample_linear(
             .and_then(|xyz| (x as usize).checked_add(xyz))
             .and_then(|index| values.get(index))
             .copied()
-            .unwrap_or(0.0)
+            .map_or(Some(f32::NAN), Some)
     };
     let Some(len) = dst_shape[0]
         .checked_mul(dst_shape[1])
@@ -50,6 +50,7 @@ pub fn resample_linear(
         for y in 0..dst_shape[1] {
             for x in 0..dst_shape[0] {
                 let mut acc = 0.0f32;
+                let mut wsum = 0.0f32;
                 let patient = [
                     dst_origin[0] + x as f32 * dst_spacing[0],
                     dst_origin[1] + y as f32 * dst_spacing[1],
@@ -72,16 +73,28 @@ pub fn resample_linear(
                                 continue;
                             }
 
-                            acc += weight
-                                * get(
-                                    base[0].saturating_add(dx),
-                                    base[1].saturating_add(dy),
-                                    base[2].saturating_add(dz),
-                                );
+                            match at(
+                                base[0].saturating_add(dx),
+                                base[1].saturating_add(dy),
+                                base[2].saturating_add(dz),
+                            ) {
+                                Some(v) if v.is_finite() => {
+                                    wsum += weight;
+                                    acc += weight * v;
+                                }
+                                // A NaN marks an unscored source voxel — a
+                                // nonzero weight must not poison the blend,
+                                // and it takes no share of the denominator.
+                                Some(_) => {}
+                                // Outside the source the field is zero and
+                                // keeps its weight, so edges stay attenuated.
+                                None => wsum += weight,
+                            }
                         }
                     }
                 }
-                out[x + dst_shape[0] * (y + dst_shape[1] * z)] = acc;
+                out[x + dst_shape[0] * (y + dst_shape[1] * z)] =
+                    if wsum > 0.0 { acc / wsum } else { f32::NAN };
             }
         }
     }
@@ -121,6 +134,38 @@ mod tests {
             [2, 1, 1],
         );
         assert_eq!(out, vec![0.5, 1.5]);
+    }
+
+    #[test]
+    fn a_nan_neighbor_does_not_poison_the_blend() {
+        // An unscored (NaN) source voxel must not take a share — the
+        // destination blends over the finite neighbors only.
+        let values = vec![f32::NAN, 4.0];
+        let out = resample_linear(
+            &values,
+            [0.0, 0.0, 0.0],
+            [1.0, 1.0, 1.0],
+            [2, 1, 1],
+            [0.5, 0.0, 0.0],
+            [1.0, 1.0, 1.0],
+            [1, 1, 1],
+        );
+        assert_eq!(out, vec![4.0]);
+    }
+
+    #[test]
+    fn an_all_nan_neighborhood_stays_unscored() {
+        let values = vec![f32::NAN, f32::NAN];
+        let out = resample_linear(
+            &values,
+            [0.0, 0.0, 0.0],
+            [1.0, 1.0, 1.0],
+            [2, 1, 1],
+            [0.5, 0.0, 0.0],
+            [1.0, 1.0, 1.0],
+            [1, 1, 1],
+        );
+        assert!(out[0].is_nan());
     }
 
     #[test]

@@ -570,6 +570,10 @@ struct McGpu {
     fold_pipe: wgpu::ComputePipeline,
     stats_peak_pipe: wgpu::ComputePipeline,
     stats_rel_pipe: wgpu::ComputePipeline,
+    /// Consecutive 30 s poll timeouts across runs sharing this device.
+    /// Sibling backlog explains one or two; a device whose submissions never
+    /// retire is wedged and must be evicted like a lost one.
+    timeouts: std::sync::atomic::AtomicUsize,
 }
 
 /// One device and one compiled transport for the process. Opening a device and
@@ -653,6 +657,7 @@ async fn open_gpu() -> Result<McGpu, ComputeError> {
         fold_pipe: pipeline(&device, &fold_layout, &fold, "main"),
         stats_peak_pipe: pipeline(&device, &fold_layout, &fold, "stats_peak"),
         stats_rel_pipe: pipeline(&device, &fold_layout, &fold, "stats_rel"),
+        timeouts: std::sync::atomic::AtomicUsize::new(0),
         device,
         queue,
         transport_layout,
@@ -1005,8 +1010,17 @@ impl Live {
             }
             if started.elapsed() > Duration::from_secs(30) {
                 // This run's submission retires only after every earlier
-                // submission on the shared queue — sibling backlog is not a
-                // wedged device, so fail the run without evicting it.
+                // submission on the shared queue - sibling backlog explains a
+                // strike or two, but a device that never retires anything is
+                // wedged and would poison every future run.
+                if self
+                    .gpu
+                    .timeouts
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    >= 2
+                {
+                    gpu_lost(&self.gpu);
+                }
                 return Err(ComputeError::Message(
                     "GPU submission did not retire".into(),
                 ));
@@ -1019,7 +1033,12 @@ impl Live {
                 submission_index: Some(index.clone()),
                 timeout: Some(Duration::from_millis(50)),
             }) {
-                Ok(_) => return Ok(started.elapsed()),
+                Ok(_) => {
+                    self.gpu
+                        .timeouts
+                        .store(0, std::sync::atomic::Ordering::Relaxed);
+                    return Ok(started.elapsed());
+                }
                 Err(wgpu::PollError::Timeout) => continue,
                 Err(err) => {
                     gpu_lost(&self.gpu);
@@ -1105,8 +1124,17 @@ impl Live {
             }
             if started.elapsed() > Duration::from_secs(30) {
                 // This run's submission retires only after every earlier
-                // submission on the shared queue — sibling backlog is not a
-                // wedged device, so fail the run without evicting it.
+                // submission on the shared queue - sibling backlog explains a
+                // strike or two, but a device that never retires anything is
+                // wedged and would poison every future run.
+                if self
+                    .gpu
+                    .timeouts
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    >= 2
+                {
+                    gpu_lost(&self.gpu);
+                }
                 return Err(ComputeError::Message(
                     "GPU submission did not retire".into(),
                 ));
@@ -1127,6 +1155,9 @@ impl Live {
                         gpu_lost(&self.gpu);
                         return Err(ComputeError::Message(err.to_string()));
                     }
+                    self.gpu
+                        .timeouts
+                        .store(0, std::sync::atomic::Ordering::Relaxed);
                     break;
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => continue,

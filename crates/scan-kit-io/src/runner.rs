@@ -291,8 +291,11 @@ pub fn upload(db: &Path, csv_path: &Path) -> Result<Value, String> {
     }
     if let Some(parent) = csv_path.parent() {
         let _ = with_store(db, |conn| {
-            store::set_runner_file_dir(conn, &parent.display().to_string())?;
-            store::set_runner_plan_path(conn, &csv_path.display().to_string())
+            store::set_runner_upload(
+                conn,
+                &parent.display().to_string(),
+                &csv_path.display().to_string(),
+            )
         });
     }
     let mut body = read_status(true, "")?;

@@ -64,17 +64,27 @@ impl CtCalibration {
         {
             return CtCalibration::parse(name, density, material);
         }
+        // Capped like every other file read - a scanner folder on a shared
+        // drive is user-picked, not trusted.
+        const MAX_TABLE_BYTES: u64 = 64 * 1024 * 1024;
         let folder = Path::new(scanner);
-        let density = fs::read_to_string(folder.join("HU_Density_Conversion.txt"))
+        let density = Self::read_table(&folder.join("HU_Density_Conversion.txt"), MAX_TABLE_BYTES)
             .map_err(|err| format!("scanner {scanner}: {err}"))?;
-        let material = fs::read_to_string(folder.join("HU_Material_Conversion.txt"))
-            .map_err(|err| format!("scanner {scanner}: {err}"))?;
+        let material =
+            Self::read_table(&folder.join("HU_Material_Conversion.txt"), MAX_TABLE_BYTES)
+                .map_err(|err| format!("scanner {scanner}: {err}"))?;
         let name = folder
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or(scanner)
             .to_owned();
         CtCalibration::parse(&name, &density, &material)
+    }
+
+    fn read_table(path: &Path, cap: u64) -> Result<String, String> {
+        let mut file = fs::File::open(path).map_err(|err| err.to_string())?;
+        let bytes = crate::discover::read_capped(&mut file, &path.display().to_string(), cap)?;
+        String::from_utf8(bytes).map_err(|err| err.to_string())
     }
 
     /// Parse the two MCsquare conversion tables. Comments are `#`; each row is

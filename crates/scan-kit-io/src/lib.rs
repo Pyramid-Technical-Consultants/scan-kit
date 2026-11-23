@@ -582,8 +582,8 @@ pub fn invoke(name: &str, input: &Value) -> Result<Value, InvokeError> {
             let db = database_path(input)?;
             with_store(&db, |conn| {
                 let root = library_root(path)?;
-                set_selected(conn, &root, &session_ids)?;
-                Ok(json!({ "session_ids": session_ids }))
+                let stored = set_selected(conn, &root, &session_ids)?;
+                Ok(json!({ "session_ids": stored }))
             })
             .map_err(InvokeError::Message)
         }
@@ -1029,6 +1029,16 @@ pub fn index_library(
     })?;
     location::replace_sessions(&root, &places);
     store::locked(|| publish_catalog(conn))?;
+    // Selection echoes only ids that actually resolved - a ghost id must
+    // not read back as if the session still exists.
+    let present: std::collections::HashSet<&str> = rows
+        .iter()
+        .filter_map(|row| row.get("session_id").and_then(Value::as_str))
+        .collect();
+    let selected: Vec<&String> = selected
+        .iter()
+        .filter(|id| present.contains(id.as_str()))
+        .collect();
     Ok(
         json!({ "root": root, "rows": rows, "selected": selected, "skipped": skipped, "walk_failed": walk_failed }),
     )

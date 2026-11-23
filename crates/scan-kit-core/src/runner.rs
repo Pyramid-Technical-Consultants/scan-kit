@@ -352,7 +352,15 @@ pub fn runner_view(status: &Value, connected: bool, has_plan: bool) -> Value {
 /// capture reads live device tables instead of an on-disk session tree.
 pub fn session_zip_dest(dest: &str) -> Option<String> {
     let dest = dest.trim();
-    if dest.is_empty() || dest.starts_with("/root/") || !dest.to_ascii_lowercase().ends_with(".zip")
+    // A bare filename resolves against the process CWD - a saved session
+    // must name a real directory or the file lands where nobody looks.
+    // Both separator spellings count; Path::parent would read a Windows
+    // path as one filename on a Unix build.
+    let no_dir = !dest.contains('/') && !dest.contains('\\');
+    if dest.is_empty()
+        || dest.starts_with("/root/")
+        || !dest.to_ascii_lowercase().ends_with(".zip")
+        || no_dir
     {
         return None;
     }
@@ -537,6 +545,14 @@ mod tests {
             "10.0.0.1:8500"
         );
         assert_eq!(parse_host("user@host").unwrap(), "host");
+    }
+
+    #[test]
+    fn a_bare_filename_is_not_a_zip_dest() {
+        // "session.zip" resolves against the process CWD - the saved file
+        // must name a real directory.
+        assert!(session_zip_dest("session.zip").is_none());
+        assert!(session_zip_dest("D:/out/session.zip").is_some());
     }
 
     #[test]

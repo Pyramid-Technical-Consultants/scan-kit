@@ -310,11 +310,19 @@ async fn scan_kit_reveal(path: String) -> Result<(), String> {
         // xdg-open "" would exit nonzero while spawn() still reports Ok.
         let target = std::fs::canonicalize(&target).unwrap_or(target);
         // explorer.exe often exits nonzero after the window is already open.
-        std::process::Command::new(reveal_program())
-            .args(reveal_args(&target))
-            .spawn()
-            .map(|_| ())
-            .map_err(|err| err.to_string())
+        let mut command = std::process::Command::new(reveal_program());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            // explorer parses its own command line - the args already carry
+            // their quote enclosure, so they must not be re-escaped.
+            for arg in reveal_args(&target) {
+                command.raw_arg(arg);
+            }
+        }
+        #[cfg(not(windows))]
+        command.args(reveal_args(&target));
+        command.spawn().map(|_| ()).map_err(|err| err.to_string())
     })
     .await
     .map_err(|err| err.to_string())?
@@ -338,21 +346,19 @@ fn reveal_program() -> &'static str {
 fn reveal_args(path: &std::path::Path) -> Vec<std::ffi::OsString> {
     #[cfg(windows)]
     {
+        // explorer treats both `,` and `=` as field separators in EVERY
+        // argument, and Command's auto-quoting only covers spaces - the path
+        // goes out inside explicit quotes regardless (these args are passed
+        // with raw_arg so the enclosure survives verbatim). A trailing
+        // backslash would escape the closing quote in explorer's parser, so
+        // roots like `D:\` go out as `D:`.
+        let cleaned = scan_kit_io::strip_verbatim(path);
+        let cleaned = cleaned.trim_end_matches('\\');
         if path.is_dir() {
-            vec![std::ffi::OsString::from(scan_kit_io::strip_verbatim(path))]
-        } else if path.to_string_lossy().contains(',') {
-            // explorer parses commas in /select, as item separators — a
-            // comma path selects nothing, so open the folder instead.
-            let folder = path.parent().unwrap_or(path);
-            vec![std::ffi::OsString::from(scan_kit_io::strip_verbatim(
-                folder,
-            ))]
+            vec![std::ffi::OsString::from(format!("\"{cleaned}\""))]
         } else {
             // canonicalize hands back a verbatim path explorer cannot parse.
-            vec![std::ffi::OsString::from(format!(
-                "/select,{}",
-                scan_kit_io::strip_verbatim(path)
-            ))]
+            vec![std::ffi::OsString::from(format!("/select,\"{cleaned}\""))]
         }
     }
     #[cfg(target_os = "macos")]
@@ -492,7 +498,9 @@ mod reveal_tests {
             let verbatim = reveal_args(std::path::Path::new(r"\\?\C:\dir\file.csv"))[0]
                 .to_string_lossy()
                 .into_owned();
-            assert_eq!(verbatim, r"/select,C:\dir\file.csv");
+            // The path is quoted — commas/equals inside it must not split
+            // explorer's argument parsing.
+            assert_eq!(verbatim, r#"/select,"C:\dir\file.csv""#);
             for arg in reveal_args(std::path::Path::new(r"\\?\C:\dir\with,comma\file.csv")) {
                 assert!(!arg.to_string_lossy().contains(r"\\?\"));
             }

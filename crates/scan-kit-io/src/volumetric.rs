@@ -1617,23 +1617,18 @@ fn finite_median(values: &[f32]) -> f32 {
     }
 }
 
-fn shifted(values: &[f32]) -> Vec<f32> {
-    let offset = finite_median(values);
+fn corrected(values: &[f32], plan: &[f32]) -> Vec<f32> {
+    // The chamber zero offset is median(measured) - median(plan). Subtracting
+    // the measured median alone would also erase a genuinely off-axis field,
+    // fabricating a displacement between the measured and plan clouds.
+    let offset = finite_median(values) - finite_median(plan);
     values.iter().map(|value| value - offset).collect()
 }
 
-/// Plan-crossing isocenter, else the IC1 plane. Chamber medians are removed later.
-fn iso_plane_z(table: &std::collections::BTreeMap<String, Vec<f32>>) -> f32 {
-    let zx = axis_iso_z(
-        &col(table, "ic2_x"),
-        &col(table, "ic1_x"),
-        &col(table, "plan_x"),
-    );
-    let zy = axis_iso_z(
-        &col(table, "ic2_y"),
-        &col(table, "ic1_y"),
-        &col(table, "plan_y"),
-    );
+/// Plan-crossing isocenter, else the IC1 plane.
+fn iso_plane_z(x2: &[f32], x1: &[f32], px: &[f32], y2: &[f32], y1: &[f32], py: &[f32]) -> f32 {
+    let zx = axis_iso_z(x2, x1, px);
+    let zy = axis_iso_z(y2, y1, py);
     match (zx, zy) {
         (Some(x), Some(y)) => finite_median(&[x, y]),
         (Some(z), None) | (None, Some(z)) => z,
@@ -1687,12 +1682,16 @@ pub(crate) fn iso_positions(
     {
         return or_plan(table, "ic1_x", "ic1_y");
     }
-    let z = iso_plane_z(table);
+    let px = col(table, "plan_x");
+    let py = col(table, "plan_y");
+    let x2 = corrected(&x2, &px);
+    let x1 = corrected(&x1, &px);
+    let y2 = corrected(&y2, &py);
+    let y1 = corrected(&y1, &py);
+    // Solve the crossing on the corrected columns — the t that interpolates
+    // them must come from the same frame.
+    let z = iso_plane_z(&x2, &x1, &px, &y2, &y1, &py);
     let t = (z - IC2_Z_MM) / IC_SEP_MM;
-    let x2 = shifted(&x2);
-    let x1 = shifted(&x1);
-    let y2 = shifted(&y2);
-    let y1 = shifted(&y1);
     let x = x2
         .iter()
         .zip(x1.iter().chain(std::iter::repeat(&f32::NAN)))
@@ -1761,19 +1760,18 @@ fn read_kmu(root: &Path, session: &str) -> f32 {
     let mut any = None;
     for chunk in xml.split("<ion_chamber").skip(1) {
         let head = chunk.split('>').next().unwrap_or("");
-        let name = attr(head, "name").unwrap_or_default();
-        if let Some(k) = chunk
-            .split("K_MU=\"")
-            .nth(1)
-            .and_then(|rest| rest.split('"').next())
-        {
-            if let Ok(value) = k.parse::<f32>() {
-                if value.is_finite() && value > 0.0 {
-                    if name.eq_ignore_ascii_case("IC_1_HCC") {
-                        hcc = Some(value);
-                    }
-                    any.get_or_insert(value);
+        // The chamber name sits on a <device name="..."> child in devices.xml,
+        // not on the <ion_chamber> tag itself — search the whole block.
+        let name = attr(head, "name")
+            .or_else(|| attr(chunk, "name"))
+            .unwrap_or_default();
+        let k = attr(chunk, "K_MU").or_else(|| attr(chunk, "k_mu"));
+        if let Some(Ok(value)) = k.map(|raw| raw.parse::<f32>()) {
+            if value.is_finite() && value > 0.0 {
+                if name.eq_ignore_ascii_case("IC_1_HCC") {
+                    hcc = Some(value);
                 }
+                any.get_or_insert(value);
             }
         }
     }
@@ -1782,9 +1780,23 @@ fn read_kmu(root: &Path, session: &str) -> f32 {
 
 fn attr<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
     let key = format!("{name}=\"");
-    let start = tag.find(&key)? + key.len();
-    let rest = &tag[start..];
-    Some(&rest[..rest.find('"')?])
+    let mut offset = 0;
+    while let Some(pos) = tag[offset..].find(&key) {
+        let at = offset + pos;
+        // A whole attribute boundary — `name=` must not match the tail of
+        // `long_name=` or `machine-name=`.
+        if at == 0 || tag.as_bytes()[at - 1].is_ascii_whitespace() {
+            let start = at + key.len();
+            let rest = &tag[start..];
+            // An unclosed value keeps looking — a later attribute may
+            // still match cleanly.
+            if let Some(end) = rest.find('"') {
+                return Some(&rest[..end]);
+            }
+        }
+        offset = at + 1;
+    }
+    None
 }
 
 fn difference(measured: &Volume, plan: &Volume) -> Volume {
@@ -2008,7 +2020,51 @@ fn y_name(quantity: Quantity) -> &'static str {
 mod tests {
     use scan_kit_core::{dose_frame, water, McResult, Pencil, Quantity, Volume};
 
-    use super::{difference, iso_positions, lattice_planes, next_preview_voxel};
+    use super::{difference, iso_positions, lattice_planes, next_preview_voxel, read_kmu};
+
+    #[test]
+    fn an_off_axis_field_keeps_its_offset() {
+        // A delivered field centered at +30 mm with a perfect delivery:
+        // only the chamber zero offset is cancelled — the field offset is
+        // real and must survive, or measured and plan clouds diverge.
+        let mut table = std::collections::BTreeMap::new();
+        table.insert("plan_x".to_owned(), vec![28.0, 30.0, 32.0]);
+        table.insert("plan_y".to_owned(), vec![0.0, 0.0, 0.0]);
+        // ic readings = plan + per-chamber zero offset.
+        table.insert("ic1_x".to_owned(), vec![29.0, 31.0, 33.0]);
+        table.insert("ic2_x".to_owned(), vec![28.5, 30.5, 32.5]);
+        table.insert("ic1_y".to_owned(), vec![2.0, 2.0, 2.0]);
+        table.insert("ic2_y".to_owned(), vec![2.0, 2.0, 2.0]);
+        let (x, y) = iso_positions(&table);
+        for (got, want) in x.iter().zip([28.0, 30.0, 32.0]) {
+            assert!((got - want).abs() < 0.6, "x={got} want {want}");
+        }
+        assert!(y.iter().all(|v| v.abs() < 0.6));
+    }
+
+    #[test]
+    fn the_hcc_chamber_kmu_wins_over_the_first_listed() {
+        // The chamber name lives on a <device> child element — a plain
+        // ion_chamber tag scan can never prefer IC_1_HCC.
+        let root = std::env::temp_dir().join(format!(
+            "scan-kit-kmu-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let dir = root.join("s1").join("config").join("map2map");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("devices.xml"),
+            "<ion_chamber><device name=\"IC_1_X\" k_mu=\"1.5e-8\"/></ion_chamber>\
+             <ion_chamber><device name=\"IC_1_HCC\" k_mu=\"2.5e-8\"/></ion_chamber>",
+        )
+        .unwrap();
+        assert_eq!(read_kmu(&root, "s1"), 2.5e-8);
+        std::fs::remove_dir_all(&root).ok();
+    }
 
     #[test]
     fn an_all_nan_chamber_falls_back_like_a_missing_one() {

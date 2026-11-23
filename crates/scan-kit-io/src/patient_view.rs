@@ -487,6 +487,11 @@ pub fn metrics(inputs: &PatientInputs, run: &Transport, options: &Value) -> Pati
         if !mask.iter().any(|keep| *keep) {
             continue;
         }
+        // The dose result lives on its own lattice — a short volume must not
+        // silently truncate the curve (the LET-stat guard below agrees).
+        if dose.values.len() != nvox {
+            continue;
+        }
         let structure_dvh = Dvh::of(&dose.values, &mask, voxel_cc);
         let rx = study.prescription.is_finite().then_some(study.prescription);
         let goals = goals_text
@@ -730,6 +735,9 @@ pub(crate) fn scene(
             if structure.mask[index] && labels[index] == 0 {
                 labels[index] = mark;
             }
+        }
+        if dose.values.len() != structure.mask.len() {
+            continue;
         }
         let (edges, curve) = dvh(&dose.values, &structure.mask, 16);
         let xs = edges.iter().take(curve.len()).copied().collect();
@@ -1014,12 +1022,13 @@ fn deliveries(root: &Path, sessions: &[String], study: &PatientStudy) -> Vec<Del
             }
             // Measured positions on the IC2 -> IC1 ray at the isocenter plane.
             let (x, y) = super::volumetric::iso_positions(&table);
-            let mu = table
-                .get("ic1_dose")
-                .cloned()
-                .filter(|values| values.iter().any(|value| value.is_finite()))
-                .or_else(|| table.get("ic2_dose").cloned())
-                .unwrap_or_default();
+            // Prefer the chamber with more finite readings — a single live
+            // ic1 value must not suppress a complete ic2 column.
+            let ic1 = table.get("ic1_dose").cloned().unwrap_or_default();
+            let ic2 = table.get("ic2_dose").cloned().unwrap_or_default();
+            let n1 = ic1.iter().filter(|v| v.is_finite()).count();
+            let n2 = ic2.iter().filter(|v| v.is_finite()).count();
+            let mu = if n2 > n1 { ic2 } else { ic1 };
             let beam = pick_beam(&study.beams, &energy, &mu)?;
             let matched = match_delivery(beam, &study.beams[beam], &energy, &x, &y, &mu);
             Some(Delivery { matched })
@@ -1030,7 +1039,13 @@ fn deliveries(root: &Path, sessions: &[String], study: &PatientStudy) -> Vec<Del
 /// The beam whose layers explain the most delivered spots (then the closest
 /// total MU).
 fn pick_beam(beams: &[scan_kit_dicom::Beam], energy: &[f32], mu: &[f32]) -> Option<usize> {
-    let delivered_mu: f32 = mu.iter().filter(|value| value.is_finite()).copied().sum();
+    // match_delivery rejects nonpositive MU — the beam pick must ignore the
+    // same sentinel readings or it can prefer the wrong beam.
+    let delivered_mu: f32 = mu
+        .iter()
+        .filter(|value| value.is_finite() && **value > 0.0)
+        .copied()
+        .sum();
     let mut best: Option<(usize, usize, f32)> = None;
     for (index, beam) in beams.iter().enumerate() {
         let energies = energy_layers(beam);
