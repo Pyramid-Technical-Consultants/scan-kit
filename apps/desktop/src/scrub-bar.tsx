@@ -75,15 +75,6 @@ function scrubText(scrub: Scrub): string {
   });
 }
 
-function samePlay(left: Scrub, right: Scrub): boolean {
-  return (
-    left.on === right.on &&
-    left.speed === right.speed &&
-    left.window === right.window &&
-    Math.abs(left.at - right.at) < 1e-4
-  );
-}
-
 /**
  * Timeline and distribution follow the playhead in the plot. Scatter slices its
  * point buffer. Contour and density count that same slice. Commit when the window
@@ -158,8 +149,15 @@ export function useScrub(
       return;
     }
     if (!cameraFollow) {
-      if (samePlay(lastSent.current, current)) {
-        lastSent.current = { ...lastSent.current, end: current.end };
+      // The backend echoes speed but never consumes it — a pace-only
+      // change must not burn a recompute. Adopt it silently like the
+      // cameraFollow branch does.
+      const sameCommit =
+        lastSent.current.on === current.on &&
+        lastSent.current.window === current.window &&
+        Math.abs(lastSent.current.at - current.at) < 1e-4;
+      if (sameCommit) {
+        lastSent.current = { ...lastSent.current, end: current.end, speed: current.speed };
         return;
       }
       if (pending.current) {
