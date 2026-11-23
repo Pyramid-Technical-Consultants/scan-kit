@@ -87,7 +87,7 @@ pub fn index_study(path: &Path) -> Result<Vec<DicomEntry>, String> {
         return Err(format!("{} is not a directory", path.display()));
     }
     let mut entries = Vec::new();
-    for file in dicom_files(path) {
+    for file in dicom_files(path)? {
         if file
             .extension()
             .and_then(|ext| ext.to_str())
@@ -287,34 +287,37 @@ pub(crate) fn meta_sop_class(bytes: &[u8]) -> Option<String> {
 /// `.dcm` and `DICM` files under `root`, walking the Study/Series nesting
 /// PACS and machine exports use. Symlinks are not followed, and the list is
 /// sorted so "last plan read wins" is deterministic.
-pub(crate) fn dicom_files(root: &Path) -> Vec<std::path::PathBuf> {
+pub(crate) fn dicom_files(root: &Path) -> Result<Vec<std::path::PathBuf>, String> {
     const MAX_DEPTH: usize = 6;
-    fn visit(dir: &Path, depth: usize, out: &mut Vec<std::path::PathBuf>) {
+    fn visit(dir: &Path, depth: usize, out: &mut Vec<std::path::PathBuf>) -> Result<(), String> {
         if depth == 0 {
-            return;
+            return Ok(());
         }
-        let Ok(items) = fs::read_dir(dir) else {
-            return;
-        };
-        for item in items.flatten() {
-            let Ok(kind) = item.file_type() else {
-                continue;
-            };
+        // An unreadable directory entry must not silently drop slices from a
+        // volume — load_study makes per-file read errors loud for the same
+        // reason.
+        let items = fs::read_dir(dir).map_err(|err| format!("{}: {err}", dir.display()))?;
+        for item in items {
+            let item = item.map_err(|err| format!("{}: {err}", dir.display()))?;
+            let path = item.path();
+            let kind = item
+                .file_type()
+                .map_err(|err| format!("{}: {err}", path.display()))?;
             if kind.is_symlink() {
                 continue;
             }
-            let path = item.path();
             if kind.is_dir() {
-                visit(&path, depth - 1, out);
+                visit(&path, depth - 1, out)?;
             } else if kind.is_file() {
                 out.push(path);
             }
         }
+        Ok(())
     }
     let mut out = Vec::new();
-    visit(root, MAX_DEPTH, &mut out);
+    visit(root, MAX_DEPTH, &mut out)?;
     out.sort();
-    out
+    Ok(out)
 }
 
 const PEEK_CAP: usize = 4 * 1024 * 1024;

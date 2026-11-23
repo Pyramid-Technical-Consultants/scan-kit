@@ -68,4 +68,4 @@ scan-kit-plot = { path = "crates/scan-kit-plot" }
 scan-kit-dicom = { path = "crates/scan-kit-dicom" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "io-util", "sync"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "io-util", "sync", "time"] }
