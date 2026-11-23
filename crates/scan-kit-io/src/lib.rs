@@ -631,6 +631,8 @@ pub fn invoke(name: &str, input: &Value) -> Result<Value, InvokeError> {
             let path = required_str(input, "path")?;
             let session_ids = required_strings(input, "session_ids")?;
             let mut options = match input.get("options") {
+                // null means "defaults" to JSON callers; a scalar does not.
+                Some(value) if value.is_null() => json!({}),
                 Some(value) if !value.is_object() => {
                     return Err(InvokeError::Message("options must be an object".into()));
                 }
@@ -1856,6 +1858,17 @@ Layer delivery: 27/27
         )
         .unwrap_err();
         assert!(error.to_string().contains("options"), "{error}");
+        // An explicit null still means "defaults", not an error.
+        assert!(invoke(
+            "scan_kit_analysis_scene",
+            &json!({
+                "view": "distribution",
+                "path": "/tmp",
+                "session_ids": ["sess"],
+                "options": null,
+            }),
+        )
+        .is_ok());
     }
 
     #[test]

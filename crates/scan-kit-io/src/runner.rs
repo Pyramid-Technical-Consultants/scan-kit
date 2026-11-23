@@ -1025,6 +1025,14 @@ pub(crate) fn http_tuned(
         if Instant::now() >= deadline {
             return Err("the device response did not complete in time".into());
         }
+        // Cap the next read's syscall timeout to the remaining budget —
+        // a read issued just before the deadline would otherwise block a
+        // full read_timeout past it.
+        if let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+            stream
+                .set_read_timeout(Some(remaining.max(Duration::from_millis(1))))
+                .ok();
+        }
         match stream.read(&mut chunk) {
             Ok(0) => break,
             Ok(count) => {

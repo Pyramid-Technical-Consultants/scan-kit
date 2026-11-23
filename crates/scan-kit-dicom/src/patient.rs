@@ -116,8 +116,11 @@ pub fn load_study(path: &Path) -> Result<PatientStudy, String> {
     let mut summation = String::new();
     let mut plan_raw = None;
     // The plan's Patient Setup Sequence is optional; when absent, the CT's
-    // own Patient Position (0018,5100) is the only orientation source.
-    let mut ct_position = String::new();
+    // own Patient Position (0018,5100) is the only orientation source —
+    // keyed by series so a merged folder cannot borrow a different
+    // patient's orientation.
+    let mut ct_positions: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
     let mut structures = Vec::new();
     let mut structures_frame = String::new();
     let mut patient_id = String::new();
@@ -172,8 +175,9 @@ pub fn load_study(path: &Path) -> Result<PatientStudy, String> {
                     text_tag(&elems, tag(0x0020, 0x000D)),
                 )
             });
-            if ct_position.is_empty() {
-                ct_position = text_tag(&elems, tag(0x0018, 0x5100));
+            let position = text_tag(&elems, tag(0x0018, 0x5100));
+            if !position.is_empty() {
+                ct_positions.entry(uid.clone()).or_insert(position);
             }
             let (sops, bucket) = ct_by_series.entry(uid).or_default();
             sops.push(text_tag(&elems, tag(0x0008, 0x0018)));
@@ -184,7 +188,7 @@ pub fn load_study(path: &Path) -> Result<PatientStudy, String> {
             // Parsed after the loop — the CT position fallback is only
             // known once every file has been seen.
             let sop_uid = text_tag(&elems, tag(0x0008, 0x0018));
-            plan_raw = Some((elems, frame, sop_uid));
+            plan_raw = Some((elems, frame, sop_uid, file.clone()));
         } else if class == "1.2.840.10008.5.1.4.1.1.481.3" {
             if structures_uid.is_empty() {
                 structures_uid = text_tag(&elems, tag(0x0008, 0x0018));
@@ -215,12 +219,6 @@ pub fn load_study(path: &Path) -> Result<PatientStudy, String> {
             }
         }
     }
-    let mut plan = None;
-    if let Some((elems, frame, sop_uid)) = plan_raw {
-        let mut parsed = read_plan(&elems, frame, &ct_position)?;
-        parsed.sop_uid = sop_uid;
-        plan = Some(parsed);
-    }
     // A CT file without a SeriesInstanceUID cannot be isolated — treat it as
     // part of the chosen series so a frame-of-reference conflict still fails.
     let (orphan_sops, orphans) = ct_by_series.remove("").unwrap_or_default();
@@ -236,6 +234,17 @@ pub fn load_study(path: &Path) -> Result<PatientStudy, String> {
     }
     sop_uids.extend(orphan_sops);
     ct_slices.extend(orphans);
+    let ct_position = ct_positions
+        .remove(&series_uid)
+        .or_else(|| ct_positions.remove(""))
+        .unwrap_or_default();
+    let mut plan = None;
+    if let Some((elems, frame, sop_uid, plan_file)) = plan_raw {
+        let mut parsed = read_plan(&elems, frame, &ct_position)
+            .map_err(|err| format!("{}: {err}", plan_file.display()))?;
+        parsed.sop_uid = sop_uid;
+        plan = Some(parsed);
+    }
     if let Some((id, name, study)) = identities.get(&series_uid) {
         patient_id = id.clone();
         patient_name = name.clone();
@@ -912,10 +921,13 @@ fn read_plan(elems: &[Elem], frame: String, ct_position: &str) -> Result<Plan, S
         let mut energy = f32::NAN;
         let mut gantry = 0.0;
         let mut gantry_seen = false;
+        let mut first_gantry = 0.0;
         let mut couch = 0.0;
         let mut couch_seen = false;
+        let mut first_couch = 0.0;
         let mut iso = [0.0f32; 3];
         let mut iso_seen = false;
+        let mut first_iso = [0.0f32; 3];
         let mut in_shifters: Vec<(i32, f32, f32)> = Vec::new();
         let mut spots = Vec::new();
         for cp in seq(beam, tag(0x300A, 0x03A8)) {
@@ -928,15 +940,23 @@ fn read_plan(elems: &[Elem], frame: String, ct_position: &str) -> Result<Plan, S
             // this beam's record, so a mid-beam geometry change cannot be
             // represented. Reject it like the multi-shifter case below.
             if let Some(value) = float_tag(cp, tag(0x300A, 0x011E)).filter(|v| v.is_finite()) {
-                if gantry_seen && (value - gantry).abs() > 1e-3 {
+                // Anchor to the first reading so slow drift cannot slip past
+                // the tolerance one control point at a time.
+                if gantry_seen && (value - first_gantry).abs() > 1e-3 {
                     return Err(format!("beam {number} changes gantry angle mid-beam"));
+                }
+                if !gantry_seen {
+                    first_gantry = value;
                 }
                 gantry = value;
                 gantry_seen = true;
             }
             if let Some(value) = float_tag(cp, tag(0x300A, 0x0122)).filter(|v| v.is_finite()) {
-                if couch_seen && (value - couch).abs() > 1e-3 {
+                if couch_seen && (value - first_couch).abs() > 1e-3 {
                     return Err(format!("beam {number} changes couch angle mid-beam"));
+                }
+                if !couch_seen {
+                    first_couch = value;
                 }
                 couch = value;
                 couch_seen = true;
@@ -944,8 +964,16 @@ fn read_plan(elems: &[Elem], frame: String, ct_position: &str) -> Result<Plan, S
             let iso_raw = floats_tag(cp, tag(0x300A, 0x012C));
             if iso_raw.len() >= 3 && iso_raw[..3].iter().all(|value| value.is_finite()) {
                 let next = [iso_raw[0], iso_raw[1], iso_raw[2]];
-                if iso_seen && next.iter().zip(iso).any(|(a, b)| (a - b).abs() > 1e-3) {
+                if iso_seen
+                    && next
+                        .iter()
+                        .zip(first_iso)
+                        .any(|(a, b)| (a - b).abs() > 1e-3)
+                {
                     return Err(format!("beam {number} changes isocenter mid-beam"));
+                }
+                if !iso_seen {
+                    first_iso = next;
                 }
                 iso = next;
                 iso_seen = true;

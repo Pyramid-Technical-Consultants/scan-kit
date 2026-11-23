@@ -1332,7 +1332,27 @@ pub(crate) fn session_storage_paths(root: &str, session_id: &str) -> Result<Vec<
         // smb opens as a UNC path — remote::connect errors on it, so storage
         // paths and deletes resolve locally instead.
         Some(remote) if remote.scheme == Scheme::Smb => {
-            connect_smb(&remote)?.to_string_lossy().into_owned()
+            let unc = connect_smb(&remote)?;
+            // A recorded smb spec maps onto the UNC tree the same way the
+            // delete path strips it — verify it and probe its parent for
+            // sibling archives like other remotes do.
+            if let Some(place) = recorded(root, session_id) {
+                if let Ok(child) = require_remote(&place) {
+                    let child_path = child.path.trim_end_matches('/');
+                    let root_path = remote.path.trim_end_matches('/');
+                    let rel = child_path
+                        .strip_prefix(root_path)
+                        .filter(|rest| rest.is_empty() || rest.starts_with('/'));
+                    if let Some(rel) = rel {
+                        let local = unc.join(rel.trim_start_matches('/'));
+                        recorded_parent = local.parent().map(|dir| dir.to_path_buf());
+                        if local.exists() {
+                            found.push(local.to_string_lossy().into_owned());
+                        }
+                    }
+                }
+            }
+            unc.to_string_lossy().into_owned()
         }
         Some(remote) => {
             let mut fs = crate::remote::connect(&remote, &password_of(&remote))?;
@@ -1348,13 +1368,21 @@ pub(crate) fn session_storage_paths(root: &str, session_id: &str) -> Result<Vec<
                 }
             }
             // Probe the library root and the recorded spec's parent —
-            // a nested session's archive sibling lives next to it.
-            let mut bases = vec![remote.path.trim_end_matches('/').to_string()];
+            // a nested session's archive sibling lives next to it. The
+            // parent must stay inside the root: a recorded spec pointing
+            // elsewhere is stale state, not a delete candidate.
+            let root_path = remote.path.trim_end_matches('/');
+            let mut bases = vec![root_path.to_string()];
             if let Some(place) = recorded(root, session_id) {
                 if let Ok(child) = require_remote(&place) {
-                    if let Some(parent) = child.path.trim_end_matches('/').rsplit_once('/') {
-                        if !bases.contains(&parent.0.to_string()) {
-                            bases.push(parent.0.to_string());
+                    let parent_path = child.path.trim_end_matches('/');
+                    if let Some((parent, _)) = parent_path.rsplit_once('/') {
+                        let inside = parent == root_path
+                            || parent
+                                .strip_prefix(root_path)
+                                .is_some_and(|rest| rest.starts_with('/'));
+                        if inside && !bases.contains(&parent.to_string()) {
+                            bases.push(parent.to_string());
                         }
                     }
                 }
@@ -1362,11 +1390,12 @@ pub(crate) fn session_storage_paths(root: &str, session_id: &str) -> Result<Vec<
             for base in &bases {
                 for name in &names {
                     if fs.stat(&format!("{base}/{name}"))?.is_some() {
-                        let rel = format!(
-                            "{}/{}",
-                            base.trim_start_matches(remote.path.trim_end_matches('/')),
-                            name
-                        );
+                        let rel = match base.strip_prefix(root_path) {
+                            Some(rest) if rest.is_empty() || rest.starts_with('/') => {
+                                format!("{rest}/{name}")
+                            }
+                            _ => continue,
+                        };
                         let place = format!(
                             "{}/{}",
                             remote.canonical.trim_end_matches('/'),
@@ -1421,9 +1450,12 @@ pub(crate) fn delete_storage(root: &str, paths: &[String]) -> Result<Vec<String>
             // smb opens as a UNC path — remote::connect errors on it.
             let unc = connect_smb(&remote)?;
             for spec in &paths {
+                // The remainder must start at a segment boundary —
+                // `\filer\shareX\y` must not strip `\filer\share`.
+                let unc_str = unc.to_string_lossy();
                 let relative = spec
-                    .strip_prefix(unc.to_string_lossy().as_ref())
-                    .map(|rel| rel.trim_start_matches(['\\', '/']).to_string())
+                    .strip_prefix(unc_str.as_ref())
+                    .and_then(|rel| rel.strip_prefix('\\').or_else(|| rel.strip_prefix('/')))
                     .unwrap_or_default();
                 // Same escape guard as materialize: only plain segments join.
                 let safe = !relative.is_empty()
@@ -1434,7 +1466,7 @@ pub(crate) fn delete_storage(root: &str, paths: &[String]) -> Result<Vec<String>
                     errors.push(format!("{spec}: not under the share root"));
                     continue;
                 }
-                let local = unc.join(&relative);
+                let local = unc.join(relative);
                 if let Err(err) = trash_path(&local.to_string_lossy()) {
                     errors.push(format!("{spec}: {err}"));
                 }
