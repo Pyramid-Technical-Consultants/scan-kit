@@ -552,6 +552,8 @@ pub fn library_rows(conn: &Connection, lib_id: i64) -> Result<Vec<Value>, String
     Ok(out)
 }
 
+/// Read-modify-write — callers must hold a transaction (the index tx or a
+/// `BEGIN IMMEDIATE`), like `forget_data_dir`, or a concurrent add is lost.
 pub fn remember_data_dir(conn: &Connection, root: &str) -> Result<(), String> {
     let mut dirs = data_dirs(conn)?;
     if !dirs.iter().any(|dir| dir == root) {
@@ -908,7 +910,9 @@ fn import_legacy(conn: &Connection, lib_id: i64, base: &Path) -> Result<(), Stri
                 }
                 conn.execute(
                     "INSERT INTO sessions(library_id, session_id, note) VALUES (?1, ?2, ?3)
-                     ON CONFLICT(library_id, session_id) DO UPDATE SET note = excluded.note",
+                     ON CONFLICT(library_id, session_id) DO UPDATE
+                        SET note = CASE WHEN sessions.note = '' THEN excluded.note
+                                   ELSE sessions.note END",
                     params![lib_id, session_id, text],
                 )
                 .map_err(|err| err.to_string())?;
@@ -975,19 +979,35 @@ fn import_legacy(conn: &Connection, lib_id: i64, base: &Path) -> Result<(), Stri
 }
 
 fn import_app_settings_once(conn: &Connection, db_path: &Path) -> Result<(), String> {
-    // Read the raw value — prefs_get maps corrupt JSON to None, which would
-    // re-import the legacy file and revert every setting on a bad row.
-    let marked: Option<String> = conn
-        .query_row(
-            "SELECT value FROM prefs WHERE key = ?1",
-            params![PREF_APP_SETTINGS_IMPORTED],
-            |row| row.get(0),
-        )
-        .optional()
+    // Check-then-act must hold the write lock across processes — a peer that
+    // read "unmarked" before our commit would otherwise replay the wholesale
+    // prefs_set over keys the user wrote in between (forget_data_dir pattern).
+    conn.execute_batch("BEGIN IMMEDIATE")
         .map_err(|err| err.to_string())?;
-    if marked.is_some() {
-        return Ok(());
+    let result = (|| {
+        // Read the raw value — prefs_get maps corrupt JSON to None, which would
+        // re-import the legacy file and revert every setting on a bad row.
+        let marked: Option<String> = conn
+            .query_row(
+                "SELECT value FROM prefs WHERE key = ?1",
+                params![PREF_APP_SETTINGS_IMPORTED],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|err| err.to_string())?;
+        if marked.is_some() {
+            return Ok(());
+        }
+        import_app_settings_body(conn, db_path)
+    })();
+    if result.is_err() {
+        let _ = conn.execute_batch("ROLLBACK");
+        return result;
     }
+    conn.execute_batch("COMMIT").map_err(|err| err.to_string())
+}
+
+fn import_app_settings_body(conn: &Connection, db_path: &Path) -> Result<(), String> {
     // The legacy file sits beside the database — a custom db imports its own
     // profile, not the default one's.
     let path = db_path
@@ -1224,6 +1244,37 @@ fn normalize_lexically(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_replayed_legacy_import_keeps_a_live_note() {
+        let path = temp_db("legacy_note");
+        let conn = open_connection(&path).unwrap();
+        let base = std::env::temp_dir().join(format!("sk_lib_{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(base.join("settings.json"), "{}").unwrap();
+        std::fs::write(base.join("session_notes.json"), r#"{"s1": "legacy note"}"#).unwrap();
+        let root = base.to_string_lossy().to_string();
+        let lib_id = prepare_library(&conn, &root).unwrap();
+        set_note(&conn, &root, "s1", "user note").unwrap();
+        // A crash before the flag commit replays the import — the upsert must
+        // fill blanks only, never revert a live note to the legacy text.
+        conn.execute(
+            "UPDATE libraries SET notes_imported = 0 WHERE id = ?1",
+            params![lib_id],
+        )
+        .unwrap();
+        set_note(&conn, &root, "s2", "other").unwrap();
+        let note: String = conn
+            .query_row(
+                "SELECT note FROM sessions WHERE library_id = ?1 AND session_id = 's1'",
+                params![lib_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(note, "user note");
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_file(&path);
+    }
 
     fn temp_db(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("sk_store_{tag}_{}", std::process::id()));
