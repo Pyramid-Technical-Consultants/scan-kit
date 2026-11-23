@@ -201,6 +201,38 @@ fn devices(
 }
 
 /// Device client key → filename-safe name (`device_ic1_client` → `IC1`).
+fn dos_reserved(name: &str) -> bool {
+    matches!(
+        name.split('.')
+            .next()
+            .unwrap_or("")
+            .to_ascii_uppercase()
+            .as_str(),
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
+    )
+}
+
 fn client_name(client: &str) -> String {
     let stripped = client.strip_prefix("device_").unwrap_or(client);
     let name: String = stripped
@@ -212,11 +244,10 @@ fn client_name(client: &str) -> String {
         .collect();
     // A bare DOS device stem (`CON.log`, `NUL_spot_data.csv`) fails every
     // write on Windows — the charset filter alone lets it through.
-    match name.as_str() {
-        "CON" | "PRN" | "AUX" | "NUL" | "COM1" | "COM2" | "COM3" | "COM4" | "COM5" | "COM6"
-        | "COM7" | "COM8" | "COM9" | "LPT1" | "LPT2" | "LPT3" | "LPT4" | "LPT5" | "LPT6"
-        | "LPT7" | "LPT8" | "LPT9" => format!("DEVICE_{name}"),
-        _ => name,
+    if dos_reserved(&name) {
+        format!("DEVICE_{name}")
+    } else {
+        name
     }
 }
 
@@ -475,12 +506,13 @@ pub fn capture(
     }
     // A run boundary between the meta read and the table fetches would
     // label session B's CSVs with session A's id — re-check.
-    if let Ok(Some(later)) = self::session_id(&devices, &mut warnings, keep) {
-        if later != session_id {
-            warnings.push(format!(
-                "session rolled from {session_id} to {later} mid-capture — the tables may be mixed"
-            ));
-        }
+    let mut scratch = Vec::new();
+    match self::session_id(&devices, &mut scratch, keep) {
+        Ok(Some(later)) if later != session_id => warnings.push(format!(
+            "session rolled from {session_id} to {later} mid-capture — the tables may be mixed"
+        )),
+        Ok(_) => {}
+        Err(err) => return Err(err),
     }
 
     // Per layer/run folder: each device's spot rows (RCI's also as RCI_map.csv)
@@ -521,7 +553,7 @@ pub fn capture(
             }
             count += 1;
         }
-        if let Some(text) = join_timeslices(ts_parts) {
+        if let Some(text) = join_timeslices(ts_parts, &mut warnings) {
             write_text(&run_dir.join("timeslice_data_device_units.csv"), &text)?;
             count += 1;
         }
@@ -536,7 +568,7 @@ pub fn capture(
     // The first fetched sheet is only the RCI's when its fetch succeeded —
     // a failed RCI table must not substitute another device's columns.
     let rci_spots = spots.iter().find(|(d, _)| d.name == "RCI").map(|(_, s)| s);
-    count += write_input_map(rci_host, plan_path, rci_spots, dir)?;
+    count += write_input_map(rci_host, plan_path, rci_spots, dir, &mut warnings)?;
     tick(count, keep)?;
 
     let last = hits.keys().last().copied().unwrap_or((0, 0));
@@ -544,7 +576,14 @@ pub fn capture(
         .iter()
         .chain(slices.iter())
         .filter_map(|(_, sheet)| sheet.column("layer_id").map(|c| (sheet, c)))
-        .find_map(|(sheet, c)| sheet.rows.last().and_then(|row| row.get(c)).cloned())
+        .find_map(|(sheet, c)| {
+            sheet
+                .rows
+                .last()
+                .and_then(|row| row.get(c))
+                .map(|cell| join_key(clean(cell)))
+                .filter(|cell| !cell.is_empty())
+        })
         .unwrap_or_else(|| "0".into());
     let state = match status
         .get(scan_kit_core::COMBINED_STATE)
@@ -571,6 +610,16 @@ pub fn capture(
     count += write_termination(dir, &session_id, status, &spots, &slices)?;
     count += write_session_meta(dir, &session_id, status, &devices)?;
     count += fetch_aux(rci_host, &devices, dir, keep)?;
+    // The aux phase runs ~13 GETs per device after the last recheck - the
+    // logs it lands are the worst mixed-session artifact.
+    let mut scratch = Vec::new();
+    match self::session_id(&devices, &mut scratch, keep) {
+        Ok(Some(later)) if later != session_id => warnings.push(format!(
+            "session rolled from {session_id} to {later} during aux fetches — logs may be mixed"
+        )),
+        Ok(_) => {}
+        Err(err) => return Err(err),
+    }
     Ok(CaptureResult {
         files: count,
         warnings,
@@ -647,7 +696,10 @@ fn title_case(text: &str) -> String {
 /// `timeslice_data_device_units.csv`: outer join of each device's slice on
 /// `timesliceNumber`. G3 layout repeats `spot_no,layer_id,timesliceNumber,
 /// timestamp` per block and ends each block with `_state`.
-fn join_timeslices(parts: &[(&CaptureDevice, Sheet)]) -> Option<String> {
+fn join_timeslices(
+    parts: &[(&CaptureDevice, Sheet)],
+    warnings: &mut Vec<String>,
+) -> Option<String> {
     struct Part {
         header: Vec<String>,
         rows: HashMap<String, Vec<String>>,
@@ -656,16 +708,25 @@ fn join_timeslices(parts: &[(&CaptureDevice, Sheet)]) -> Option<String> {
     let mut parts_out: Vec<(String, Part)> = Vec::new();
     for (device, sheet) in parts {
         let Some(ts_i) = sheet.column("timesliceNumber") else {
+            warnings.push(format!(
+                "{}: timeslice table has no timesliceNumber column",
+                device.name
+            ));
             continue;
         };
         let meta_idx: Vec<Option<usize>> = META.iter().map(|name| sheet.column(name)).collect();
+        // An all-empty META shadow sorts ahead of another device's real
+        // column - only emit what this sheet carries (spot_columns' fix).
+        let meta_cols: Vec<usize> = (0..META.len())
+            .filter(|index| meta_idx[*index].is_some())
+            .collect();
         let keep: Vec<usize> = (0..sheet.header.len())
             .filter(|index| !META.contains(&base_name(&sheet.header[*index])))
             .collect();
         let mut part = Part {
-            header: META
+            header: meta_cols
                 .iter()
-                .map(|name| (*name).to_owned())
+                .map(|index| META[*index].to_owned())
                 .chain(keep.iter().map(|i| dest_name(&sheet.header[*i])))
                 .collect(),
             rows: HashMap::new(),
@@ -686,10 +747,11 @@ fn join_timeslices(parts: &[(&CaptureDevice, Sheet)]) -> Option<String> {
             }
             part.rows.insert(
                 key.clone(),
-                meta_idx
+                meta_cols
                     .iter()
-                    .map(|idx| {
-                        idx.and_then(|i| row.get(i))
+                    .map(|index| {
+                        meta_idx[*index]
+                            .and_then(|i| row.get(i))
                             .map(|cell| clean(cell))
                             .unwrap_or("")
                             .to_owned()
@@ -721,10 +783,15 @@ fn join_timeslices(parts: &[(&CaptureDevice, Sheet)]) -> Option<String> {
         }
     }
     keys.sort_by(|a, b| {
-        a.parse::<f64>()
-            .and_then(|x| b.parse::<f64>().map(|y| (x, y)))
-            .map(|(x, y)| x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal))
-            .unwrap_or_else(|_| a.cmp(b))
+        // Numeric keys first, then lexicographic - the old mixed-compare
+        // path was not a strict weak order (3 < 10 < "2x" < 3) and sort_by
+        // may panic on it.
+        match (a.parse::<f64>().ok(), b.parse::<f64>().ok()) {
+            (Some(x), Some(y)) => x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => a.cmp(b),
+        }
     });
 
     let mut header = Vec::new();
@@ -818,7 +885,20 @@ fn join_spot_data(spots: &[(&CaptureDevice, Sheet)]) -> Option<String> {
         // occurrence keeps deliveries distinct instead of the last row
         // silently overwriting the first while its state survives.
         let mut occurrences: HashMap<(String, String), usize> = HashMap::new();
-        let mut eff_layer = String::new();
+        // A leading ragged row files under the NEXT layer in blocks() - seed
+        // the same way or it joins under "" and doubles the spot.
+        let mut eff_layer = sheet
+            .rows
+            .iter()
+            .find_map(|row| {
+                let raw = clean(row.get(layer_i).map(String::as_str).unwrap_or_default());
+                if raw.is_empty() {
+                    None
+                } else {
+                    Some(raw.to_owned())
+                }
+            })
+            .unwrap_or_default();
         for row in &sheet.rows {
             // A ragged layer cell inherits the running layer like blocks()
             // does - foldering and joining must agree on the same layer.
@@ -990,6 +1070,7 @@ fn write_input_map(
     plan_path: Option<&Path>,
     rci_spot: Option<&Sheet>,
     dir: &Path,
+    warnings: &mut Vec<String>,
 ) -> Result<usize, String> {
     let dest = dir.join("input_map.csv");
     if let Some(path) = plan_path.filter(|path| path.is_file()) {
@@ -1003,60 +1084,67 @@ fn write_input_map(
                 )
             })?;
         if let Some(mut sheet) = parse_sheet(&bytes) {
-            if sheet.truncated {
-                return Err(format!("{}: plan table truncated mid-file", path.display()));
-            }
-            sheet.header = sheet
-                .header
-                .iter()
-                .map(|name| name.split('(').next().unwrap_or(name).trim().to_owned())
-                .collect();
-            let extra: Vec<usize> = rci_spot
-                .map(|spot| {
-                    ["spot_no", "layer_id", "beam_off"]
-                        .iter()
-                        .filter_map(|name| spot.column(name))
-                        .collect()
-                })
-                .unwrap_or_default();
-            // The join is positional — a shorter RCI table means the device
-            // filtered rows, so every pair from the divergence on is a wrong
-            // label. Emit without the extra columns rather than mislabel.
-            // A longer RCI table still joins the first N rows: re-delivered
-            // spots land at the tail, but a mid-table insert would misalign
-            // the same way — there is no key to compare against, so `>=` is
-            // the reachable middle ground.
-            if let Some(spot) =
-                rci_spot.filter(|spot| !extra.is_empty() && spot.rows.len() >= sheet.rows.len())
-            {
-                // Same normalization the other export paths apply — a suffixed
-                // header would write `spot_no(x)` for a column readers look up
-                // as `spot_no`.
-                let names: Vec<String> = extra
+            // A truncated plan warns and falls through to control_points.csv
+            // and the RCI columns - every other source degrades this way.
+            let sheet = if sheet.truncated {
+                warnings.push(format!("{}: plan table truncated mid-file", path.display()));
+                None
+            } else {
+                Some(&mut sheet)
+            };
+            if let Some(sheet) = sheet {
+                sheet.header = sheet
+                    .header
                     .iter()
-                    .map(|i| base_name(&spot.header[*i]).to_owned())
+                    .map(|name| name.split('(').next().unwrap_or(name).trim().to_owned())
                     .collect();
-                // Pad short rows first — flexible parsing leaves them under the
-                // header length, and pushing the new cells there would land them
-                // in the wrong columns. Truncate over-long rows the same way.
-                let columns = sheet.header.len();
-                sheet.header.extend(names);
-                for (index, row) in sheet.rows.iter_mut().enumerate() {
-                    row.truncate(columns);
-                    row.resize(columns, String::new());
-                    for col in &extra {
-                        row.push(
-                            spot.rows
-                                .get(index)
-                                .and_then(|cells| cells.get(*col))
-                                .map(|cell| clean(cell).to_owned())
-                                .unwrap_or_default(),
-                        );
+                let extra: Vec<usize> = rci_spot
+                    .map(|spot| {
+                        ["spot_no", "layer_id", "beam_off"]
+                            .iter()
+                            .filter_map(|name| spot.column(name))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                // The join is positional — a shorter RCI table means the device
+                // filtered rows, so every pair from the divergence on is a wrong
+                // label. Emit without the extra columns rather than mislabel.
+                // A longer RCI table still joins the first N rows: re-delivered
+                // spots land at the tail, but a mid-table insert would misalign
+                // the same way — there is no key to compare against, so `>=` is
+                // the reachable middle ground.
+                if let Some(spot) =
+                    rci_spot.filter(|spot| !extra.is_empty() && spot.rows.len() >= sheet.rows.len())
+                {
+                    // Same normalization the other export paths apply — a suffixed
+                    // header would write `spot_no(x)` for a column readers look up
+                    // as `spot_no`.
+                    let names: Vec<String> = extra
+                        .iter()
+                        .map(|i| base_name(&spot.header[*i]).to_owned())
+                        .collect();
+                    // Pad short rows first — flexible parsing leaves them under the
+                    // header length, and pushing the new cells there would land them
+                    // in the wrong columns. Truncate over-long rows the same way.
+                    let columns = sheet.header.len();
+                    sheet.header.extend(names);
+                    for (index, row) in sheet.rows.iter_mut().enumerate() {
+                        row.truncate(columns);
+                        row.resize(columns, String::new());
+                        for col in &extra {
+                            row.push(
+                                spot.rows
+                                    .get(index)
+                                    .and_then(|cells| cells.get(*col))
+                                    .map(|cell| clean(cell).to_owned())
+                                    .unwrap_or_default(),
+                            );
+                        }
                     }
                 }
+                write_text(&dest, &csv_text(sheet))?;
+                return Ok(1);
             }
-            write_text(&dest, &csv_text(&sheet))?;
-            return Ok(1);
         }
     }
     if let Ok(url) = device_file_url(rci_host, "/root/config/control/control_points.csv") {
@@ -1460,14 +1548,26 @@ fn fetch_aux(
                             .filter(|name| *name != "." && *name != "..")
                             .unwrap_or(&device.name)
                             .to_owned();
+                        // Remote-supplied text becomes a filename - screen
+                        // DOS device stems like client_name does or every
+                        // write fails on Windows.
+                        let base = if dos_reserved(&base) {
+                            format!("_{base}")
+                        } else {
+                            base
+                        };
                         // The target filesystem is case-insensitive - key the
                         // dedup on the lowercase form or MAP.XML replaces
                         // map.xml while count still credits both writes.
                         let name = if dcs_names.insert(base.to_lowercase()) {
                             base
                         } else {
-                            let name = format!("{}_{base}", device.name);
-                            dcs_names.insert(name.to_lowercase());
+                            let mut name = format!("{}_{base}", device.name);
+                            let mut n = 2;
+                            while !dcs_names.insert(name.to_lowercase()) {
+                                name = format!("{}_{n}_{base}", device.name);
+                                n += 1;
+                            }
                             name
                         };
                         write_bytes(&dir.join("config").join("dcs").join(name), &bytes)?;
@@ -1656,7 +1756,7 @@ mod tests {
             "spot_no,layer_id,timesliceNumber,timestamp(ms),ic1_total_dose_spot(nC),r_ic1_x(ch)\n1,0,1,10,3.5,64.5\n1,0,10,30,4.0,62\n",
         );
         let parts = vec![(device("RCI"), rci), (device("IX256_1"), ic)];
-        let text = join_timeslices(&refs(&parts)).unwrap();
+        let text = join_timeslices(&refs(&parts), &mut Vec::new()).unwrap();
         let mut lines = text.lines();
         let header = lines.next().unwrap();
         // Meta repeats per device, in device-name order, each block ends _state.
