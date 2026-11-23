@@ -139,7 +139,9 @@ pub(crate) fn assemble(space: Workspace) -> (Vec<Panel>, VolumeMark) {
         },
         shape: [nx as u32, ny as u32, nz as u32],
         origin: space.dose.origin,
-        voxel: space.dose.spacing[0],
+        // Panel extents clamp spacing via axis(); the raymarch mark must
+        // agree or a non-positive spacing paints a zero-step volume.
+        voxel: space.dose.spacing[0].max(1e-6),
         spacing: space.dose.spacing,
         ramp: space.ramp,
         lo: space.lo,
@@ -516,6 +518,18 @@ fn span(series: &[Series]) -> (f32, f32, f32, f32) {
                     }
                 }
             }
+            Series::Guide { xs, ys, .. } => {
+                // Guides draw real geometry (the gamma = 1 line) - leaving
+                // them out of the fit clips the guide at the data range.
+                for (x, y) in xs.iter().zip(ys) {
+                    if x.is_finite() && y.is_finite() {
+                        xmin = xmin.min(*x);
+                        xmax = xmax.max(*x);
+                        ymin = ymin.min(*y);
+                        ymax = ymax.max(*y);
+                    }
+                }
+            }
             Series::Bars { edges, counts, .. } => {
                 for edge in edges {
                     xmin = xmin.min(*edge);
@@ -645,7 +659,12 @@ pub(crate) fn overlay_sessions(
     } else if title.starts_with("dvh") {
         panel.series = volumes.iter().map(dvh_line).collect();
         fit_panel(panel);
-    } else if title.starts_with("gamma") && gamma.len() > 1 {
+    } else if title.starts_with("gamma") && gamma.len() <= 1 {
+        // No gamma metric (analytic run, no TPS dose, beam filter) - the
+        // second default cell would otherwise be a permanently blank panel.
+        panel.series = profile_series(PlotKind::Lateral, volumes.iter(), at);
+        fit_panel(panel);
+    } else if title.starts_with("gamma") {
         panel.series = gamma_lines(gamma);
         panel.xmin = 0.0;
         panel.xmax = 2.0;
