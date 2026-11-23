@@ -425,15 +425,14 @@ export function AnalysisView({
     scrubControl?.value,
     settled,
     (text) => {
-      setOptions((current) => {
-        if (current.scrub === text) {
-          // Same text means no task runs to bump settled — release
-          // useScrub's pending here or every later commit is dropped.
-          setSettled((count) => count + 1);
-          return current;
-        }
-        return { ...current, scrub: text };
-      });
+      if (optionsRef.current.scrub === text) {
+        // Same text means no task runs to bump settled — release
+        // useScrub's pending here or every later commit is dropped. The
+        // check lives outside the updater so a re-run cannot double-bump.
+        setSettled((count) => count + 1);
+        return;
+      }
+      setOptions((current) => ({ ...current, scrub: text }));
     },
     viewId === "timeline" || viewId === "distribution",
     (next) => {
@@ -1087,7 +1086,9 @@ export function AnalysisView({
       node.removeEventListener("keydown", onKey);
       node.removeEventListener("contextmenu", onMenu);
     };
-  }, [viewId, shown]);
+    // `shown` is not read here — depending on it rebuilds the listeners
+    // (and resets the local drag flag) mid-gesture on every poll flip.
+  }, [viewId]);
 
   const controls = meta?.controls ?? [];
   const resolved = resolveOptions(controls, options);

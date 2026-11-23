@@ -180,11 +180,14 @@ fn scan_axes(values: &[f32], shape: [usize; 3], spacing: [f32; 3]) -> VolumeScan
     let mut peak_at = [0usize; 3];
     let plane = brick_shape[0] * brick_shape[1];
     for part in parts {
-        if part.peak > peak {
-            peak = part.peak;
+        // peak_at must come from the band that owns the |max| voxel — keying
+        // the adoption on the signed peak strands the cursor at [0,0,0] for
+        // an all-negative difference volume.
+        if part.abs_peak > abs_peak {
+            abs_peak = part.abs_peak;
             peak_at = part.peak_at;
         }
-        abs_peak = abs_peak.max(part.abs_peak);
+        peak = peak.max(part.peak);
         x_best = x_best.max(part.x_best);
         for (slot, value) in axial.iter_mut().zip(&part.axial) {
             *slot += *value;
@@ -284,7 +287,13 @@ fn accumulate_z(values: &[f32], shape: [usize; 3], z0: usize, z1: usize) -> ZPar
                 for x in 0..nx {
                     let value = values[base + x];
                     let mag = value.abs();
-                    abs_peak = abs_peak.max(mag);
+                    // The cursor belongs at the largest deviation — on an
+                    // all-negative difference a positive-only argmax would
+                    // leave it on the corner voxel.
+                    if mag > abs_peak {
+                        abs_peak = mag;
+                        peak_at = [x, y, z];
+                    }
                     along_x += mag;
                     signed_x += value;
                     y_sum[x + nx * (z - z0)] += mag;
@@ -299,7 +308,6 @@ fn accumulate_z(values: &[f32], shape: [usize; 3], z0: usize, z1: usize) -> ZPar
                     }
                     if value > peak {
                         peak = value;
-                        peak_at = [x, y, z];
                     }
                 }
                 x_best = x_best.max(along_x);
@@ -348,7 +356,13 @@ fn scan_axes_serial(values: &[f32], shape: [usize; 3], spacing: [f32; 3]) -> Vol
                 for x in 0..nx {
                     let value = values[base + x];
                     let mag = value.abs();
-                    abs_peak = abs_peak.max(mag);
+                    // The cursor belongs at the largest deviation — on an
+                    // all-negative difference a positive-only argmax would
+                    // leave it on the corner voxel.
+                    if mag > abs_peak {
+                        abs_peak = mag;
+                        peak_at = [x, y, z];
+                    }
                     along_x += mag;
                     signed_x += value;
                     y_sum[x + nx * z] += mag;
@@ -362,7 +376,6 @@ fn scan_axes_serial(values: &[f32], shape: [usize; 3], spacing: [f32; 3]) -> Vol
                     }
                     if value > peak {
                         peak = value;
-                        peak_at = [x, y, z];
                     }
                 }
                 x_best = x_best.max(along_x);
@@ -1239,6 +1252,16 @@ fn catmull(d: f32) -> f32 {
 
 #[cfg(test)]
 mod tests {
+    // A difference volume can be all-negative — the cursor must sit on the
+    // largest |value|, not the corner voxel a positive-only argmax leaves.
+    #[test]
+    fn an_all_negative_scan_points_at_the_largest_deviation() {
+        let mut values = vec![-1.0f32; 8];
+        values[5] = -9.0;
+        let scan = scan_spacing(&values, [2, 2, 2], [1.0; 3]);
+        assert_eq!(scan.peak_at, [1, 0, 1]);
+    }
+
     use super::*;
 
     fn peaked() -> Volume {
@@ -1662,6 +1685,27 @@ mod tests {
         let scale = serial.line_scale.max(1.0e-4);
         assert!((scan.line_scale - serial.line_scale).abs() <= 1.0e-4 * scale);
     }
+    #[test]
+    fn a_large_all_negative_scan_tracks_the_largest_deviation() {
+        // Difference volumes can be all-negative — the parallel merge must
+        // adopt peak_at from the band owning the |max| voxel, not the band
+        // with the largest signed peak (every signed peak stays 0.0 here).
+        let (nx, ny, nz) = (48usize, 40usize, 160usize);
+        let mut values = vec![-1.0f32; nx * ny * nz];
+        let at = [10usize, 20, 140];
+        values[at[0] + nx * (at[1] + ny * at[2])] = -9.0;
+        let volume = Volume {
+            origin: [0.0; 3],
+            shape: [nx, ny, nz],
+            spacing: [1.0; 3],
+            values,
+        };
+        let serial = scan_axes_serial(&volume.values, volume.shape, volume.spacing);
+        let scan = scan_volume(&volume);
+        assert_eq!(serial.peak_at, at);
+        assert_eq!(scan.peak_at, at);
+    }
+
     #[test]
     fn steps_to_leave_stays_bounded_at_a_brick_edge() {
         // Every axis within tolerance of a bound leaves delta = f32::MAX —

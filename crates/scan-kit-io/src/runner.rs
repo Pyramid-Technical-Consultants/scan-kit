@@ -641,6 +641,11 @@ fn dial(endpoint: &str) -> Result<WebSocket<DeadlineStream>, String> {
                         "device did not accept mpack subprotocol (got '{protocol}')"
                     ));
                 }
+                // No extension was requested — a negotiated one would
+                // produce frames this client cannot parse.
+                if response.headers().get("sec-websocket-extensions").is_some() {
+                    return Err("device negotiated an unrequested websocket extension".into());
+                }
                 return Ok(socket);
             }
             Err(err) => last_err = err.to_string(),
@@ -707,9 +712,13 @@ fn recv(
     match socket.read() {
         Ok(Message::Binary(bytes)) => {
             let mut cursor = std::io::Cursor::new(bytes.as_ref());
-            rmpv::decode::read_value(&mut cursor)
-                .map(Some)
-                .map_err(|err| err.to_string())
+            let value = rmpv::decode::read_value(&mut cursor).map_err(|err| err.to_string())?;
+            // One message per frame — trailing bytes or a second value
+            // silently desynchronize the protocol.
+            if cursor.position() != bytes.len() as u64 {
+                return Err("malformed frame: trailing bytes".into());
+            }
+            Ok(Some(value))
         }
         Ok(Message::Close(_)) => Err("connection closed".into()),
         Ok(_) => Ok(None),
@@ -806,7 +815,9 @@ fn history_last(value: &rmpv::Value) -> Option<rmpv::Value> {
         .and_then(|(_, item)| item.as_slice());
     let values = unpack_blob(dtype.and_then(rmpv::Value::as_i64), data?)?;
     let times = times?;
-    if times.len() < values.len() * 8 || values.is_empty() {
+    // A $ts blob that is not exactly values*8 bytes is corrupt, not "long
+    // enough" — a trailing partial timestamp must not pass as a whole one.
+    if times.len() != values.len() * 8 || values.is_empty() {
         return None;
     }
     values.last().copied().map(rmpv::Value::from)
@@ -1052,26 +1063,20 @@ pub(crate) fn http_tuned(
             Err(err) => return Err(err.to_string()),
         }
     }
-    let split = raw
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
-        .ok_or("the device response has no HTTP header")?;
-    let header = String::from_utf8_lossy(&raw[..split]).to_string();
-    let status: u16 = header
-        .split_whitespace()
-        .nth(1)
-        .and_then(|code| code.parse().ok())
-        .unwrap_or(0);
+    let (status, head_at, body_at) =
+        final_response(&raw).ok_or("the device response has no HTTP header")?;
+    let header = String::from_utf8_lossy(&raw[head_at..body_at - 4]).to_string();
     if !(200..300).contains(&status) {
         return Err(format!("HTTP {status} for {path}"));
     }
-    let body = &raw[split + 4..];
-    if header
-        .to_ascii_lowercase()
-        .contains("transfer-encoding: chunked")
-    {
+    // 204 (and any 2xx the grammar forbids a body for) is header-complete.
+    if status == 204 {
+        return Ok(Vec::new());
+    }
+    let body = &raw[body_at..];
+    if transfer_chunked(&header) {
         decode_chunks(body)
-    } else if let Some(length) = content_length(&header) {
+    } else if let Some(length) = content_length(&header)? {
         if body.len() < length {
             return Err(format!(
                 "the device closed {path} after {} of {length} bytes",
@@ -1087,17 +1092,18 @@ pub(crate) fn http_tuned(
 /// True once the headers and the declared body are all in — Content-Length
 /// reached, or a chunked body carrying its empty terminal chunk.
 fn response_complete(raw: &[u8]) -> bool {
-    let Some(split) = raw.windows(4).position(|window| window == b"\r\n\r\n") else {
+    let Some((status, head_at, body_at)) = final_response(raw) else {
         return false;
     };
-    let header = String::from_utf8_lossy(&raw[..split]);
-    let body = &raw[split + 4..];
-    if header
-        .to_ascii_lowercase()
-        .contains("transfer-encoding: chunked")
-    {
+    // 1xx/204/304 responses carry no body by definition.
+    if matches!(status, 204 | 304) {
+        return true;
+    }
+    let header = String::from_utf8_lossy(&raw[head_at..body_at - 4]);
+    let body = &raw[body_at..];
+    if transfer_chunked(&header) {
         chunked_complete(body)
-    } else if let Some(length) = content_length(&header) {
+    } else if let Ok(Some(length)) = content_length(&header) {
         body.len() >= length
     } else {
         // Close-delimited body — the peer's EOF is the terminator.
@@ -1117,6 +1123,14 @@ fn chunked_complete(mut data: &[u8]) -> bool {
         else {
             return false;
         };
+        if size == 0 {
+            // Complete only when the trailer section ends — an immediate
+            // blank line, or trailers closed by one. Bare "0\r\n" is a
+            // truncated response, not a finished one.
+            let rest = &data[end + 2..];
+            return rest.starts_with(b"\r\n")
+                || rest.windows(4).any(|window| window == b"\r\n\r\n");
+        }
         let Some(next) = end
             .checked_add(2)
             .and_then(|at| at.checked_add(size))
@@ -1127,22 +1141,66 @@ fn chunked_complete(mut data: &[u8]) -> bool {
         if data.len() < next {
             return false;
         }
-        if size == 0 {
-            return true;
-        }
         data = &data[next..];
     }
 }
 
-fn content_length(header: &str) -> Option<usize> {
-    header.lines().find_map(|line| {
-        let (name, value) = line.split_once(':')?;
-        if name.eq_ignore_ascii_case("content-length") {
-            value.trim().parse().ok()
-        } else {
-            None
+/// The declared Content-Length, or None when absent. A malformed or
+/// conflicting field is an error — silently dropping it would reframe the
+/// response as close-delimited or truncated.
+fn content_length(header: &str) -> Result<Option<usize>, String> {
+    let mut found = None;
+    for line in header.lines() {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if name.trim().eq_ignore_ascii_case("content-length") {
+            let length: usize = value
+                .trim()
+                .parse()
+                .map_err(|_| "malformed Content-Length".to_owned())?;
+            if let Some(prev) = found.replace(length) {
+                if prev != length {
+                    return Err("conflicting Content-Length fields".into());
+                }
+            }
         }
+    }
+    Ok(found)
+}
+
+/// True only when a Transfer-Encoding field's final coding is chunked —
+/// a raw substring match also fires on X-Transfer-Encoding and misses
+/// "gzip, chunked".
+fn transfer_chunked(header: &str) -> bool {
+    header.lines().any(|line| {
+        line.split_once(':').is_some_and(|(name, value)| {
+            name.trim().eq_ignore_ascii_case("transfer-encoding")
+                && value
+                    .split(',')
+                    .next_back()
+                    .is_some_and(|token| token.trim().eq_ignore_ascii_case("chunked"))
+        })
     })
+}
+
+/// The final response's status and body offset — interim 1xx blocks each
+/// end at their own blank line and carry no body.
+fn final_response(raw: &[u8]) -> Option<(u16, usize, usize)> {
+    let mut at = 0;
+    loop {
+        let split = raw.get(at..)?.windows(4).position(|w| w == b"\r\n\r\n")? + at;
+        let status: u16 = String::from_utf8_lossy(&raw[at..split])
+            .split_whitespace()
+            .nth(1)
+            .and_then(|code| code.parse().ok())
+            .unwrap_or(0);
+        if (100..200).contains(&status) {
+            at = split + 4;
+            continue;
+        }
+        return Some((status, at, split + 4));
+    }
 }
 
 fn decode_chunks(mut data: &[u8]) -> Result<Vec<u8>, String> {
@@ -1157,6 +1215,11 @@ fn decode_chunks(mut data: &[u8]) -> Result<Vec<u8>, String> {
             .map_err(|err| err.to_string())?;
         data = data.get(end + 2..).unwrap_or(&[]);
         if size == 0 {
+            // The trailer section must end — bare EOF after "0\r\n" is
+            // truncation, and junk bytes are not a body.
+            if !(data.starts_with(b"\r\n") || data.windows(4).any(|window| window == b"\r\n\r\n")) {
+                return Err("truncated chunk".into());
+            }
             break;
         }
         // size is attacker-controlled hex — the +2 can overflow usize.
@@ -1447,10 +1510,35 @@ mod tests {
         ]);
         assert_eq!(unwrap_update(&bad_ts), rmpv::Value::Nil);
 
-        assert_eq!(content_length("Host: x\r\nContent-Length: 4\r\n"), Some(4));
-        assert_eq!(content_length("Host: x"), None);
+        assert_eq!(
+            content_length("Host: x\r\nContent-Length: 4\r\n"),
+            Ok(Some(4))
+        );
+        assert_eq!(content_length("Host: x"), Ok(None));
+        // Malformed and conflicting fields are errors, not a silent reframe.
+        assert!(content_length("Host: x\r\nContent-Length: junk\r\n").is_err());
+        assert!(content_length("Host: x\r\nContent-Length: 4\r\nContent-Length: 9\r\n").is_err());
         assert_eq!(decode_chunks(b"5\r\nhello\r\n0\r\n\r\n").unwrap(), b"hello");
         assert!(decode_chunks(b"zz").is_err());
+        // Bare "0\r\n" and junk after it are truncation, not a body — a
+        // trailer section must close with its own blank line.
+        assert!(decode_chunks(b"1\r\nx\r\n0\r\n").is_err());
+        assert!(decode_chunks(b"1\r\nx\r\n0\r\nX").is_err());
+        assert_eq!(
+            decode_chunks(b"1\r\nx\r\n0\r\nDigest: a\r\n\r\n").unwrap(),
+            b"x"
+        );
+        // Field-name matching: X-Transfer-Encoding is not TE, and the
+        // coding list checks its final token.
+        assert!(!transfer_chunked("X-Transfer-Encoding: chunked"));
+        assert!(transfer_chunked("Transfer-Encoding:  chunked"));
+        assert!(transfer_chunked("transfer-encoding: gzip, chunked"));
+        assert!(!transfer_chunked("Transfer-Encoding: chunked, gzip"));
+        // An interim 1xx block is not the final response.
+        let raw = b"HTTP/1.1 103 Early Hints\r\nLink: x\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\nx";
+        let (status, _, body_at) = final_response(raw).unwrap();
+        assert_eq!(status, 200);
+        assert_eq!(&raw[body_at..], b"x");
         assert!(decode_chunks(b"5\r\nhi").is_err());
         assert!(decode_chunks(b"5\r\nhello\r\n\xff\r\n").is_err());
         let port = serve_http(|request| {
@@ -1678,9 +1766,12 @@ mod tests {
             b"4\r\na0\r\n\r\n",
         );
         assert!(!response_complete(&trap));
-        // Close-delimited bodies need EOF, so a bare header is incomplete.
-        let bare = header("HTTP/1.1 204 No Content\n\n", b"");
+        // Close-delimited bodies need EOF, so a bare header is incomplete —
+        // but a no-body status is complete at the header boundary itself.
+        let bare = header("HTTP/1.1 200 OK\n\n", b"");
         assert!(!response_complete(&bare));
+        let no_body = header("HTTP/1.1 204 No Content\n\n", b"");
+        assert!(response_complete(&no_body));
     }
 
     #[test]

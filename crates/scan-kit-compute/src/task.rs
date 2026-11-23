@@ -6,7 +6,7 @@
 //! rest once. `open_plot` drains the same stage with an unlimited budget, so a
 //! one-shot call still returns the scene it returns today.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -70,6 +70,10 @@ struct Driver {
     copy: Option<u64>,
     export: Option<u64>,
     tasks: HashMap<u64, Running>,
+    /// Terminal reports of recently removed tasks — a second poller that
+    /// arrives after the winning poll removed the task replays its real
+    /// phase instead of a fabricated Cancelled at generation 0. Bounded.
+    ended_tasks: VecDeque<Report>,
 }
 
 fn driver() -> &'static Mutex<Driver> {
@@ -123,6 +127,13 @@ impl Driver {
             if *cell == Some(id) {
                 *cell = None;
             }
+        }
+    }
+
+    fn remember(&mut self, report: Report) {
+        self.ended_tasks.push_back(report);
+        while self.ended_tasks.len() > 16 {
+            self.ended_tasks.pop_front();
         }
     }
 
@@ -226,13 +237,21 @@ pub fn poll_task(id: u64) -> Result<Vec<u8>, String> {
     let (mut stage, cancel, generation) = {
         let mut driver = lock();
         let Some(task) = driver.tasks.get_mut(&id) else {
-            return Ok(encode_poll(&ended(id, 0, Phase::Cancelled, ""), None, true));
+            let report = driver
+                .ended_tasks
+                .iter()
+                .find(|report| report.task == id)
+                .cloned()
+                .unwrap_or_else(|| ended(id, 0, Phase::Cancelled, ""));
+            return Ok(encode_poll(&report, None, true));
         };
         let Some(stage) = task.stage.take() else {
-            let report = task
+            let mut report = task
                 .last_report
                 .clone()
                 .unwrap_or_else(|| ended(id, task.generation, Phase::Scene, ""));
+            report.task = id;
+            report.generation = task.generation;
             return Ok(encode_poll(&report, None, false));
         };
         (stage, task.cancel.clone(), task.generation)
@@ -305,6 +324,7 @@ pub fn poll_task(id: u64) -> Result<Vec<u8>, String> {
     if remove {
         driver.tasks.remove(&id);
         driver.clear(id);
+        driver.remember(report.clone());
         drop(driver);
         // The finished stage joins its worker on drop — off the lock, or the
         // GPU drain stalls every other poll and cancel behind it.
@@ -333,8 +353,11 @@ pub fn cancel_task(id: u64, generation: Option<u64>) {
         if stale {
             None
         } else {
-            if let Some(task) = driver.tasks.get(&id) {
+            if let Some(generation) = driver.tasks.get(&id).map(|task| {
                 task.cancel.cancel();
+                task.generation
+            }) {
+                driver.remember(ended(id, generation, Phase::Cancelled, ""));
             }
             driver.clear(id);
             driver.tasks.remove(&id)
@@ -605,7 +628,9 @@ impl SessionStage {
             file.filled = file.chunks;
         } else if file.filled == file.chunks {
             // The file outlived the estimate. Double it instead of adding one
-            // window per poll.
+            // window per poll. The total growth can move the reported
+            // fraction backwards for a poll or two — that is the estimate
+            // correcting itself, not lost work.
             file.chunks = file
                 .chunks
                 .saturating_mul(2)
@@ -1168,7 +1193,13 @@ impl McPlotStage {
 
     fn sync_report(&mut self, phase: Phase) {
         self.report.phase = phase;
-        self.report.done = self.shared.done.load(Ordering::Relaxed);
+        // done/total are stored as a pair per worker iteration — a retarget
+        // can split a read across iterations, so never report done > total.
+        self.report.done = self
+            .shared
+            .done
+            .load(Ordering::Relaxed)
+            .min(self.shared.total.load(Ordering::Relaxed));
         self.report.total = self.shared.total.load(Ordering::Relaxed);
         let note = locked(&self.shared.note).clone();
         if !note.is_empty() {
@@ -1542,7 +1573,7 @@ struct LibraryStage {
     path: PathBuf,
     shared: Arc<Progress>,
     worker: Option<JoinHandle<Result<Vec<u8>, String>>>,
-    sent: u64,
+
     report: Report,
 }
 
@@ -1557,7 +1588,7 @@ impl LibraryStage {
                 preview: Mutex::new(None),
             }),
             worker: None,
-            sent: 0,
+
             report: report_at(Phase::Read, 0, 0),
         }
     }
@@ -1624,8 +1655,8 @@ impl Stage for LibraryStage {
         }
         let finished = self.worker.as_ref().expect("library worker").is_finished();
         if !finished {
-            let done = self.shared.done.load(Ordering::Relaxed);
             let total = self.shared.total.load(Ordering::Relaxed);
+            let done = self.shared.done.load(Ordering::Relaxed).min(total);
             self.report = Report {
                 task: 0,
                 generation: 0,
@@ -1634,16 +1665,12 @@ impl Stage for LibraryStage {
                 total,
                 note: Self::note(done, total),
             };
-            let preview = if done != self.sent {
-                self.sent = done;
-                self.shared
-                    .preview
-                    .lock()
-                    .unwrap_or_else(|err| err.into_inner())
-                    .take()
-            } else {
-                None
-            };
+            let preview = self
+                .shared
+                .preview
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .take();
             return Poll::Pending {
                 report: self.report.clone(),
                 preview,
@@ -1741,8 +1768,8 @@ impl Stage for CopyStage {
         }
         let finished = self.worker.as_ref().expect("copy worker").is_finished();
         if !finished {
-            let done = self.shared.done.load(Ordering::Relaxed);
             let total = self.shared.total.load(Ordering::Relaxed);
+            let done = self.shared.done.load(Ordering::Relaxed).min(total);
             self.report = Report {
                 task: 0,
                 generation: 0,
@@ -2026,6 +2053,64 @@ mod tests {
             "ic1_total_dose,ic2_total_dose,position_x,position_y\n1,1,0,0\n2,2,4,1\n",
         )
         .unwrap();
+    }
+
+    #[test]
+    fn a_replayed_report_stamps_the_current_generation() {
+        // A poll that lands while the stage is checked out replays
+        // last_report — it must carry the CURRENT generation or a superseded
+        // poller's generation check accepts pre-retarget progress.
+        let id = u64::MAX - 1;
+        {
+            let mut driver = lock();
+            driver.tasks.insert(
+                id,
+                Running {
+                    generation: 7,
+                    cancel: Cancel::new(),
+                    stage: None,
+                    last_report: Some(Report {
+                        task: id,
+                        generation: 6,
+                        phase: Phase::Read,
+                        done: 1,
+                        total: 4,
+                        note: String::new(),
+                    }),
+                },
+            );
+        }
+        let bytes = poll_task(id).unwrap();
+        let (report, _) = scan_kit_core::decode_poll(&bytes).unwrap();
+        assert_eq!(report["generation"], 7);
+        assert!(!report["finished"].as_bool().unwrap());
+        lock().tasks.remove(&id);
+    }
+
+    #[test]
+    fn a_removed_task_replays_its_real_terminal_phase() {
+        // The winning poll takes the payload; a racing second poll must see
+        // the real terminal phase — not a fabricated Cancelled at
+        // generation 0.
+        let id = u64::MAX - 2;
+        {
+            let mut driver = lock();
+            driver.tasks.insert(
+                id,
+                Running {
+                    generation: 3,
+                    cancel: Cancel::new(),
+                    stage: None,
+                    last_report: None,
+                },
+            );
+        }
+        cancel_task(id, None);
+        let bytes = poll_task(id).unwrap();
+        let (report, _) = scan_kit_core::decode_poll(&bytes).unwrap();
+        assert_eq!(report["phase"], "cancelled");
+        assert_eq!(report["generation"], 3);
+        assert_eq!(report["finished"], true);
     }
 
     #[test]

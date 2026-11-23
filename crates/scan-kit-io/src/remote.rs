@@ -880,10 +880,12 @@ mod net {
         let mut mtime_ns = 0i64;
         // RFC 3659: "fact=v;…; SP name" — facts end at the first space, so a
         // name containing ";type=dir" must not be parsed as a fact.
-        let head = line
-            .trim_start()
-            .split_once(' ')
-            .map_or(line, |(head, _)| head);
+        // RFC 3659: facts SP pathname — no delimiter or an empty name is a
+        // malformed reply, not a file stat.
+        let (head, name) = line.trim_start().split_once(' ')?;
+        if name.trim().is_empty() {
+            return None;
+        }
         for fact in head.split(';') {
             let Some((key, value)) = fact.split_once('=') else {
                 continue;
@@ -896,7 +898,9 @@ mod net {
                         return None;
                     }
                 }
-                "size" => size = value.trim().parse().unwrap_or(0),
+                // A malformed size is a malformed reply, not a 0-byte file.
+                "size" => size = value.trim().parse().ok()?,
+
                 "modify" => mtime_ns = modify_ns(value.trim()),
                 _ => {}
             }
@@ -913,14 +917,39 @@ mod net {
             return 0;
         }
         let year: i64 = text[0..4].parse().unwrap_or(0);
-        let month: i64 = text[4..6].parse().unwrap_or(1);
-        let day: i64 = text[6..8].parse().unwrap_or(1);
+        let month: i64 = text[4..6].parse().unwrap_or(0);
+        let day: i64 = text[6..8].parse().unwrap_or(0);
         let hour: i64 = text[8..10].parse().unwrap_or(0);
         let minute: i64 = text[10..12].parse().unwrap_or(0);
         let second: i64 = text[12..14].parse().unwrap_or(0);
+        // Out-of-range fields are a malformed reply, not a plausible date.
+        if !(1..=12).contains(&month)
+            || !(1..=31).contains(&day)
+            || hour > 23
+            || minute > 59
+            || second > 60
+        {
+            return 0;
+        }
+        // RFC 3659 permits ".frac" — honor it and reject anything else.
+        let frac_ns: i64 = match text[14..].strip_prefix('.') {
+            Some(digits)
+                if !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()) =>
+            {
+                let mut padded = digits[..digits.len().min(9)].to_owned();
+                while padded.len() < 9 {
+                    padded.push('0');
+                }
+                padded.parse().unwrap_or(0)
+            }
+            None if text.len() == 14 => 0,
+            _ => return 0,
+        };
         let days = days_from_civil(year, month, day);
         // A server-supplied modify year can overflow the nanosecond multiply.
-        (days * 86_400 + hour * 3_600 + minute * 60 + second).saturating_mul(1_000_000_000)
+        (days * 86_400 + hour * 3_600 + minute * 60 + second)
+            .saturating_mul(1_000_000_000)
+            .saturating_add(frac_ns)
     }
 
     fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
@@ -1052,7 +1081,7 @@ mod net {
     }
 
     fn http_get(url: &str, username: &str, password: &str) -> Result<Vec<u8>, String> {
-        let mut response = authed(http_agent()?.get(url), username, password)
+        let mut response = authed(http_agent()?.get(url), username, password)?
             .call()
             .map_err(map_http)?;
         let mut bytes = Vec::new();
@@ -1072,7 +1101,7 @@ mod net {
         // ponytail: a server that rejects HEAD keeps a zero stamp, so the cached
         // archive is reused until the process forgets it. A Content-Length change
         // still downloads again.
-        let response = authed(http_agent()?.head(url), username, password).call();
+        let response = authed(http_agent()?.head(url), username, password)?.call();
         let response = match response {
             Ok(response) => response,
             Err(ureq::Error::StatusCode(405)) => {
@@ -1101,16 +1130,21 @@ mod net {
         request: ureq::RequestBuilder<B>,
         username: &str,
         password: &str,
-    ) -> ureq::RequestBuilder<B> {
+    ) -> Result<ureq::RequestBuilder<B>, String> {
         if username.is_empty() && password.is_empty() {
-            return request;
+            return Ok(request);
         }
-        request.header("Authorization", &basic_auth(username, password))
+        Ok(request.header("Authorization", &basic_auth(username, password)?))
     }
 
-    fn basic_auth(username: &str, password: &str) -> String {
+    fn basic_auth(username: &str, password: &str) -> Result<String, String> {
+        // The first colon is the wire delimiter — a colon-bearing username
+        // silently authenticates as a different pair.
+        if username.contains(':') {
+            return Err("username cannot contain a colon".into());
+        }
         let raw = format!("{username}:{password}");
-        format!("Basic {}", base64(raw.as_bytes()))
+        Ok(format!("Basic {}", base64(raw.as_bytes())))
     }
 
     fn base64(bytes: &[u8]) -> String {
@@ -1216,7 +1250,8 @@ mod net {
             assert_eq!(base64(b"a"), "YQ==");
             assert_eq!(base64(b"ab"), "YWI=");
             assert_eq!(base64(b"abc"), "YWJj");
-            assert!(basic_auth("ada", "secret").starts_with("Basic "));
+            assert!(basic_auth("ada", "secret").unwrap().starts_with("Basic "));
+            assert!(basic_auth("ada:x", "secret").is_err());
         }
     }
 }

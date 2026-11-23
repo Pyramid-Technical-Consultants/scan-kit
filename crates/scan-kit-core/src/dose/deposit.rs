@@ -160,7 +160,9 @@ pub(super) fn dose_grid(
     ];
     let mut hi_i = [(hi[0] / v).ceil(), (hi[1] / v).ceil(), (hi[2] / v).ceil()];
     if let Some(floor) = z_floor {
-        lo_i[2] = lo_i[2].max((floor / v).ceil());
+        // floor() like the x/y extents — ceil() can shave the last voxel
+        // off an explicitly requested slab depth.
+        lo_i[2] = lo_i[2].max((floor / v).floor());
         hi_i[2] = hi_i[2].max(lo_i[2] + 1.0);
     }
     let mut shape = [1usize; 3];
