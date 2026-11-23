@@ -150,8 +150,8 @@ pub fn contour_in_frame(
         return Vec::new();
     }
     let counts = count_grid(xs, ys, x0, x1, y0, y1, CLOUD_BINS, CLOUD_BINS);
-    let dx = (x1 - x0) / CLOUD_BINS as f32;
-    let dy = (y1 - y0) / CLOUD_BINS as f32;
+    let dx = ((f64::from(x1) - f64::from(x0)) / CLOUD_BINS as f64) as f32;
+    let dy = ((f64::from(y1) - f64::from(y0)) / CLOUD_BINS as f64) as f32;
     contour_marks(&counts, CLOUD_BINS, cutoff_pct, x0, y0, dx, dy)
 }
 
@@ -170,8 +170,10 @@ pub fn count_grid(
     if counts.is_empty() {
         return counts;
     }
-    let dx = x1 - x0;
-    let dy = y1 - y0;
+    // f64 spans: a frame wider than f32::MAX (legitimately produced by
+    // density_range on extreme finite data) must still grid, not zero out.
+    let dx = f64::from(x1) - f64::from(x0);
+    let dy = f64::from(y1) - f64::from(y0);
     if !dx.is_finite() || !dy.is_finite() {
         return counts;
     }
@@ -181,8 +183,8 @@ pub fn count_grid(
         if !x.is_finite() || !y.is_finite() || *x < x0 || *x > x1 || *y < y0 || *y > y1 {
             continue;
         }
-        let ix = (((x - x0) / dx) * cols as f32) as usize;
-        let iy = (((y - y0) / dy) * rows as f32) as usize;
+        let ix = ((f64::from(*x) - f64::from(x0)) / dx * cols as f64) as usize;
+        let iy = ((f64::from(*y) - f64::from(y0)) / dy * rows as f64) as usize;
         counts[ix.min(cols - 1) + cols * iy.min(rows - 1)] += 1.0;
     }
     counts
@@ -509,6 +511,21 @@ fn edge_point(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_frame_wider_than_f32_still_grids() {
+        let counts = count_grid(
+            &[-3.0e38, 0.0, 3.0e38],
+            &[-3.0e38, 0.0, 3.0e38],
+            -3.0e38,
+            3.0e38,
+            -3.0e38,
+            3.0e38,
+            4,
+            4,
+        );
+        assert_eq!(counts.iter().sum::<f32>(), 3.0, "{counts:?}");
+    }
 
     #[test]
     fn contour_counts_every_sample() {

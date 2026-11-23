@@ -50,6 +50,13 @@ export function ExamTable({
     direction: "asc",
   });
   const [gridSelection, setGridSelection] = useState(emptyGridSelection);
+  // Positional selection is meaningless across a rows replacement — adjust
+  // state during render rather than cascading an extra pass from an effect.
+  const [prevRows, setPrevRows] = useState(rows);
+  if (prevRows !== rows) {
+    setPrevRows(rows);
+    setGridSelection(emptyGridSelection);
+  }
   const order = useMemo(() => {
     const indexes = rows.map((_, index) => index);
     indexes.sort((left, right) => {

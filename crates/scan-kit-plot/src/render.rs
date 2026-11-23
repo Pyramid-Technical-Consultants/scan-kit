@@ -1315,7 +1315,8 @@ pub(crate) struct PointRec {
     pub radius: f32,
     pub color: [f32; 4],
     pub id: u32,
-    /// Sample time. NaN is drawn in every playhead window.
+    /// Sample time. Non-finite times are dropped at encode, so every record
+    /// that reaches the payload has a finite time.
     pub time: f32,
 }
 
@@ -2672,7 +2673,15 @@ impl Plot {
                 else {
                     continue;
                 };
-                let shown = window_points(points, window);
+                let timed = batch
+                    .point_runs
+                    .iter()
+                    .any(|run| run.source && run.start == cloud.start && run.timed);
+                let shown = if timed {
+                    window_points(points, window)
+                } else {
+                    points
+                };
                 let (xs, ys) = samples_of(shown);
                 match cloud.style {
                     CloudStyle::Density => {
@@ -2913,16 +2922,16 @@ impl Plot {
         let batch = &self.marks.panels[cell.panel];
         let hit = |id: u32| id.checked_sub(1);
         let runs = if batch.point_runs.is_empty() {
-            vec![(batch.point_start, batch.point_count)]
+            vec![(batch.point_start, batch.point_count, false)]
         } else {
             batch
                 .point_runs
                 .iter()
                 .filter(|run| !run.source)
-                .map(|run| (run.start, run.count))
+                .map(|run| (run.start, run.count, run.timed))
                 .collect::<Vec<_>>()
         };
-        for (start, count) in runs.into_iter().rev() {
+        for (start, count, timed) in runs.into_iter().rev() {
             let Some(points) = self
                 .marks
                 .points
@@ -2931,7 +2940,7 @@ impl Plot {
                 continue;
             };
             for point in points.iter().rev() {
-                if !point_shown(point.time, self.time_window) {
+                if timed && !point_shown(point.time, self.time_window) {
                     continue;
                 }
                 let center = project(matrix, point.p, w, h);
@@ -3387,9 +3396,19 @@ impl Plot {
         let (x_lo, y_lo, x_hi, y_hi) = clip_pixels(cell.plot, width, height);
         for y in (top.floor() as i64).max(y_lo)..=(bottom.ceil() as i64).min(y_hi) {
             for x in (left.floor() as i64).max(x_lo)..=(right.ceil() as i64).min(x_hi) {
-                let u = ((x as f32 - left) / span_x).clamp(0.0, 1.0);
-                let v = ((y as f32 - top) / span_y).clamp(0.0, 1.0);
-                let color = crate::dose::shade_uv(grid, &view, prepared.as_ref(), limits, [u, v]);
+                // fs_quad: grown-quad uv + edge feather.
+                let outside = (left - (x as f32 + 0.5))
+                    .max((x as f32 + 0.5) - right)
+                    .max((top - (y as f32 + 0.5)).max((y as f32 + 0.5) - bottom));
+                let coverage = (0.5 - outside).clamp(0.0, 1.0);
+                if coverage <= 0.0 {
+                    continue;
+                }
+                let u = ((x as f32 + 0.5 - left + 1.0) / (span_x + 2.0)).clamp(0.0, 1.0);
+                let v = ((y as f32 + 0.5 - top + 1.0) / (span_y + 2.0)).clamp(0.0, 1.0);
+                let mut color =
+                    crate::dose::shade_uv(grid, &view, prepared.as_ref(), limits, [u, v]);
+                color[3] *= coverage;
                 blend(
                     frame,
                     width,
@@ -3493,16 +3512,16 @@ impl Plot {
                 }
             }
             let runs = if batch.point_runs.is_empty() {
-                vec![(batch.point_start, batch.point_count)]
+                vec![(batch.point_start, batch.point_count, false)]
             } else {
                 batch
                     .point_runs
                     .iter()
                     .filter(|run| !run.source)
-                    .map(|run| (run.start, run.count))
+                    .map(|run| (run.start, run.count, run.timed))
                     .collect::<Vec<_>>()
             };
-            for (start, count) in runs {
+            for (start, count, timed) in runs {
                 let Some(points) = self
                     .marks
                     .points
@@ -3511,7 +3530,7 @@ impl Plot {
                     continue;
                 };
                 for point in points {
-                    if !point_shown(point.time, self.time_window) {
+                    if timed && !point_shown(point.time, self.time_window) {
                         continue;
                     }
                     let px = project(matrix, point.p, width as f32, height as f32);
@@ -4899,7 +4918,7 @@ fn build_marks_inner(panels: &[Panel], skip_polylines: bool) -> Marks {
                     point_runs.push(PointRun {
                         start: before,
                         count,
-                        timed: true,
+                        timed: !times.is_empty(),
                         source: true,
                     });
                     let heatmap = (*style == CloudStyle::Density)
@@ -7770,23 +7789,25 @@ fn fill_quad_cpu(
         for x in (left.floor() as i64).max(x_lo)..=(right.ceil() as i64).min(x_hi) {
             let x = x as i32;
             let y = y as i32;
-            let color = if let Some(index) = quad.heatmap {
-                let u = ((x as f32 - left) / span_x).clamp(0.0, 0.999);
-                let v = ((y as f32 - top) / span_y).clamp(0.0, 0.999);
+            // fs_quad feathers the grown quad's edge the same way.
+            let outside = (left - (x as f32 + 0.5))
+                .max((x as f32 + 0.5) - right)
+                .max((top - (y as f32 + 0.5)).max((y as f32 + 0.5) - bottom));
+            let coverage = (0.5 - outside).clamp(0.0, 1.0);
+            if coverage <= 0.0 {
+                continue;
+            }
+            let mut color = if let Some(index) = quad.heatmap {
+                // uv interpolates the +1px-grown quad — the same mapping the
+                // shader samples mark_tex with.
+                let u = (x as f32 + 0.5 - left + 1.0) / (span_x + 2.0);
+                let v = (y as f32 + 0.5 - top + 1.0) / (span_y + 2.0);
                 let (cols, rows) = marks.heatmap_size[index];
-                let col = ((u * cols as f32) as u32).min(cols.saturating_sub(1));
-                let row = ((v * rows as f32) as u32).min(rows.saturating_sub(1));
-                let texel = (row * cols + col) as usize * 4;
-                let px = &marks.heatmaps[index];
-                [
-                    px[texel] as f32 / 255.0,
-                    px[texel + 1] as f32 / 255.0,
-                    px[texel + 2] as f32 / 255.0,
-                    px[texel + 3] as f32 / 255.0,
-                ]
+                heat_texel(&marks.heatmaps[index], cols, rows, u, v)
             } else {
                 quad.color
             };
+            color[3] *= coverage;
             blend(frame, width, height, x, y, color, Some(plot));
         }
     }
@@ -7854,61 +7875,51 @@ fn stroke_cpu(
     let mut pb = project(*matrix, line.b, width as f32, height as f32);
     snap_hairline(&mut pa, &mut pb);
     let radius = line.thickness.max(1.0) * 0.5;
-    if line.pattern == LINE_SOLID {
-        // Clip to the padded scissor first — a far-offscreen endpoint saturates
-        // project() to i32::MAX and would be a multi-billion-step walk.
-        let (x_lo, y_lo, x_hi, y_hi) = clip_pixels(plot, width, height);
-        let pad = radius + 2.0;
-        let (bx_lo, by_lo) = (x_lo as f32 - pad, y_lo as f32 - pad);
-        let (bx_hi, by_hi) = (x_hi as f32 + pad, y_hi as f32 + pad);
-        let d = [pb[0] - pa[0], pb[1] - pa[1]];
-        let (mut t0, mut t1) = (0.0f32, 1.0f32);
-        for (p, q) in [
-            (-d[0], pa[0] - bx_lo),
-            (d[0], bx_hi - pa[0]),
-            (-d[1], pa[1] - by_lo),
-            (d[1], by_hi - pa[1]),
-        ] {
-            if p == 0.0 {
-                if q < 0.0 {
-                    return;
-                }
-            } else {
-                let r = q / p;
-                if p < 0.0 {
-                    t0 = t0.max(r);
-                } else {
-                    t1 = t1.min(r);
-                }
-                if t0 > t1 {
-                    return;
-                }
-            }
-        }
-        let span = ((d[0].abs().max(d[1].abs())) * (t1 - t0)) as i32;
-        // An endpoint projecting to ±inf leaves t=[0,1] and span=inf — a
-        // clipped line never needs more samples than the padded box.
-        let limit = ((bx_hi - bx_lo) + (by_hi - by_lo) + 8.0) as i32;
-        let steps = span.clamp(1, limit.max(1));
-        for step in 0..=steps {
-            let t = t0 + (t1 - t0) * step as f32 / steps as f32;
-            disc_cpu(
-                frame,
-                width,
-                height,
-                [pa[0] + d[0] * t, pa[1] + d[1] * t],
-                radius,
-                line.color,
-                plot,
-            );
-        }
+    // Clip to the padded scissor first — a far-offscreen endpoint saturates
+    // project() to i32::MAX and the clipped segment is all that can paint.
+    let (x_lo, y_lo, x_hi, y_hi) = clip_pixels(plot, width, height);
+    let pad = radius + 2.0;
+    let (bx_lo, by_lo) = (x_lo as f32 - pad, y_lo as f32 - pad);
+    let (bx_hi, by_hi) = (x_hi as f32 + pad, y_hi as f32 + pad);
+    if !pa[0].is_finite() || !pa[1].is_finite() || !pb[0].is_finite() || !pb[1].is_finite() {
         return;
     }
+    let d = [pb[0] - pa[0], pb[1] - pa[1]];
+    let full_len = d[0].hypot(d[1]);
+    let (mut t0, mut t1) = (0.0f32, 1.0f32);
+    for (p, q) in [
+        (-d[0], pa[0] - bx_lo),
+        (d[0], bx_hi - pa[0]),
+        (-d[1], pa[1] - by_lo),
+        (d[1], by_hi - pa[1]),
+    ] {
+        if p == 0.0 {
+            if q < 0.0 {
+                return;
+            }
+        } else {
+            let r = q / p;
+            if p < 0.0 {
+                t0 = t0.max(r);
+            } else {
+                t1 = t1.min(r);
+            }
+            if t0 > t1 {
+                return;
+            }
+        }
+    }
+    let a = [pa[0] + d[0] * t0, pa[1] + d[1] * t0];
+    let b = [pa[0] + d[0] * t1, pa[1] + d[1] * t1];
+    pa = a;
+    pb = b;
+    // The pattern is stamped along the unclipped segment — a clipped a-side
+    // still phases dashes/dots from the true start, matching fs_line.
+    let phase = line.phase + t0 * full_len;
     let ab = [pb[0] - pa[0], pb[1] - pa[1]];
     let len2 = ab[0] * ab[0] + ab[1] * ab[1];
     let len = len2.sqrt().max(0.001);
     let pad = radius + 1.5;
-    let (x_lo, y_lo, x_hi, y_hi) = clip_pixels(plot, width, height);
     let x0 = ((pa[0].min(pb[0]) - pad).floor() as i64).max(x_lo);
     let y0 = ((pa[1].min(pb[1]) - pad).floor() as i64).max(y_lo);
     let x1 = ((pa[0].max(pb[0]) + pad).ceil() as i64).min(x_hi);
@@ -7923,7 +7934,7 @@ fn stroke_cpu(
             };
             let q = [pa[0] + ab[0] * t, pa[1] + ab[1] * t];
             let dist = (point[0] - q[0]).hypot(point[1] - q[1]);
-            let coverage = pattern_coverage(dist, radius, line.phase + t * len, line.pattern);
+            let coverage = pattern_coverage(dist, radius, phase + t * len, line.pattern);
             if coverage <= 0.0 {
                 continue;
             }
@@ -7979,6 +7990,42 @@ fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
         ((x - edge0) / span).clamp(0.0, 1.0)
     };
     t * t * (3.0 - 2.0 * t)
+}
+
+/// Bilinear fetch matching `mark_samp` (Linear + clamp). uv covers the grown
+/// quad; texel space is `uv * dim - 0.5`.
+#[cfg(not(target_arch = "wasm32"))]
+fn heat_texel(px: &[u8], cols: u32, rows: u32, u: f32, v: f32) -> [f32; 4] {
+    let fx = (u * cols as f32 - 0.5).clamp(0.0, cols as f32 - 1.0);
+    let fy = (v * rows as f32 - 0.5).clamp(0.0, rows as f32 - 1.0);
+    let x0 = fx as u32;
+    let y0 = fy as u32;
+    let x1 = (x0 + 1).min(cols.saturating_sub(1));
+    let y1 = (y0 + 1).min(rows.saturating_sub(1));
+    let tx = fx - x0 as f32;
+    let ty = fy - y0 as f32;
+    let read = |x: u32, y: u32| {
+        let i = (y * cols + x) as usize * 4;
+        [
+            px[i] as f32 / 255.0,
+            px[i + 1] as f32 / 255.0,
+            px[i + 2] as f32 / 255.0,
+            px[i + 3] as f32 / 255.0,
+        ]
+    };
+    let mix4 = |a: [f32; 4], b: [f32; 4], t: f32| {
+        [
+            a[0] + (b[0] - a[0]) * t,
+            a[1] + (b[1] - a[1]) * t,
+            a[2] + (b[2] - a[2]) * t,
+            a[3] + (b[3] - a[3]) * t,
+        ]
+    };
+    mix4(
+        mix4(read(x0, y0), read(x1, y0), tx),
+        mix4(read(x0, y1), read(x1, y1), tx),
+        ty,
+    )
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -8104,13 +8151,21 @@ fn blend(
         return;
     }
     let alpha = color[3].clamp(0.0, 1.0);
+    if alpha < 0.004 {
+        return;
+    }
     let pixel = index * 4;
     for channel in 0..3 {
         let src = color[channel].clamp(0.0, 1.0) * alpha * 255.0;
         let dst = frame[pixel + channel] as f32;
         frame[pixel + channel] = (src + dst * (1.0 - alpha)).round().clamp(0.0, 255.0) as u8;
     }
-    frame[pixel + 3] = 255;
+    // Premultiplied-alpha blending keeps the composited alpha — a transparent
+    // background must not turn opaque wherever a mark touched.
+    let dst_a = frame[pixel + 3] as f32 / 255.0;
+    frame[pixel + 3] = ((alpha + dst_a * (1.0 - alpha)) * 255.0)
+        .round()
+        .clamp(0.0, 255.0) as u8;
 }
 
 // Instance word layouts. Words past the `*_ATTRS` tables (`id`, the heatmap
@@ -11790,6 +11845,69 @@ mod tests {
     }
 
     #[test]
+    fn an_untimed_cloud_survives_a_playhead_move() {
+        // A cloud with no times used to claim timed:true — the first
+        // playhead move partitioned its NaN times to zero and rebinned the
+        // density texture to ramp-minimum.
+        let xs = vec![0.25, 1.25, 1.75, 0.5];
+        let ys = vec![0.25, 1.25, 0.75, 1.5];
+        let scene = PlotScene {
+            title: "density".into(),
+            panels: vec![Panel {
+                title: String::new(),
+                y_label: String::new(),
+                x_label: "x".into(),
+                xmin: 0.0,
+                xmax: 2.0,
+                ymin: 0.0,
+                ymax: 2.0,
+                series: vec![
+                    Series::Heatmap {
+                        values: vec![0.0; 4],
+                        cols: 2,
+                        rows: 2,
+                        ramp: 0,
+                        color: [1.0, 1.0, 1.0, 1.0],
+                        lo: 0.0,
+                        hi: 0.0,
+                    },
+                    Series::Cloud {
+                        xs,
+                        ys,
+                        times: Vec::new(),
+                        x0: 0.0,
+                        x1: 2.0,
+                        y0: 0.0,
+                        y1: 2.0,
+                        style: CloudStyle::Density,
+                        cutoff: 0.0,
+                    },
+                ],
+                x_labels: Vec::new(),
+                equal: false,
+            }],
+            controls: Vec::new(),
+            table: None,
+            columns: 1,
+            column_weights: Vec::new(),
+            row_weights: Vec::new(),
+            side: 0,
+            row_splits: Vec::new(),
+            volume: scan_kit_core::VolumeMark::default(),
+        };
+        let mut plot = Plot::new(&scene, [0.0; 4], [1.0; 4]);
+        let source = plot.marks.panels[0]
+            .point_runs
+            .iter()
+            .find(|run| run.source)
+            .expect("cloud source run");
+        assert!(!source.timed);
+        let initial = plot.marks.heatmaps.clone();
+        plot.follow_time(true, 0.0, 0.5, true);
+        assert_eq!(plot.marks.heatmaps, initial);
+    }
+
+    #[test]
     fn follow_time_draws_the_time_trace_inside_the_playhead() {
         let scene = PlotScene {
             title: "replay".into(),
@@ -12310,6 +12428,107 @@ mod tests {
         plot.marks.lines.truncate(1);
         let on_tail = plot.project_data(0, 5.0, 5.0, width, height);
         assert_eq!(plot.hover(on_tail[0], on_tail[1]).3, Some(0));
+    }
+
+    #[test]
+    fn a_translucent_solid_stroke_paints_once_without_gaps() {
+        let mut scene = line_scene();
+        scene.panels[0].series = vec![Series::Polyline {
+            xs: vec![1.0, 9.0],
+            ys: vec![2.0, 8.0],
+            color: [1.0, 0.0, 0.0, 0.4],
+            thickness: 3.0,
+        }];
+        let (width, height) = (180, 140);
+        let mut plot = Plot::new(&scene, [0.0; 4], [1.0; 4]);
+        plot.apply(width, height, &PlotInput::default());
+        let layout = plot.layout(width, height);
+        let cpu = plot.paint_cpu(width, height, &layout);
+        let a = plot.project_data(0, 1.0, 2.0, width, height);
+        let b = plot.project_data(0, 9.0, 8.0, width, height);
+        for i in 0..=200 {
+            let t = i as f32 / 200.0;
+            let x = (a[0] + (b[0] - a[0]) * t).round() as u32;
+            let y = (a[1] + (b[1] - a[1]) * t).round() as u32;
+            let at = ((y * width + x) * 4) as usize;
+            assert!(cpu[at] > 30, "stamp gap on the spine at t={t}");
+            // One blend of alpha 0.4 is ~102 — overlapping stamps used to
+            // reach ~200, and the alpha channel used to be forced to 255.
+            assert!(cpu[at] < 150, "compounded stamp at t={t}: {}", cpu[at]);
+            assert!(cpu[at + 3] < 200, "alpha must accumulate: {}", cpu[at + 3]);
+        }
+    }
+
+    #[test]
+    fn a_clipped_dash_keeps_the_full_segment_phase() {
+        let mut scene = line_scene();
+        scene.panels[0].series.clear();
+        scene.panels[0].xmin = 0.0;
+        scene.panels[0].xmax = 80.0;
+        scene.panels[0].ymin = 0.0;
+        scene.panels[0].ymax = 24.0;
+        let (width, height) = (160u32, 80u32);
+        let mut plot = Plot::new(&scene, [0.0; 4], [1.0; 4]);
+        plot.apply(width, height, &PlotInput::default());
+        // A dash entering from far offscreen — the pattern phases from the
+        // true segment start, not from the clip boundary, like fs_line.
+        let a_px = plot.project_data(0, -60.0, 12.0, width, height)[0];
+        plot.live.push(LiveCloud {
+            panel: 0,
+            quads: Vec::new(),
+            lines: vec![LineRec {
+                a: [-60.0, 12.0, 0.0],
+                b: [76.0, 12.0, 0.0],
+                color: [0.0, 1.0, 0.0, 1.0],
+                thickness: 2.0,
+                id: 0,
+                pattern: LINE_DASH,
+                phase: 0.0,
+            }],
+            dose: false,
+            crosshair: false,
+        });
+        let layout = plot.layout(width, height);
+        let frame = plot.paint_cpu(width, height, &layout);
+        let b_px = plot.project_data(0, 76.0, 12.0, width, height);
+        let y = b_px[1].round() as u32;
+        let plot_rect = layout[0].plot;
+        let last_x = (b_px[0] - 1.0).min(plot_rect.x + plot_rect.w - 1.0) as u32;
+        for x in (plot_rect.x as u32 + 1)..last_x {
+            let along = (x as f32 + 0.5) - a_px;
+            let coverage = pattern_coverage(0.0, 1.0, along, LINE_DASH);
+            let alpha = frame[((y * width + x) * 4 + 3) as usize];
+            if coverage > 0.9 {
+                assert!(alpha > 64, "dash dropped at x={x} along={along}");
+            } else if coverage <= 0.0 {
+                assert!(alpha <= 4, "dash painted in a gap at x={x} along={along}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_window_does_not_hide_the_untimed_fallback_span() {
+        let mut scene = line_scene();
+        scene.panels[0].series = vec![Series::Points {
+            xs: vec![5.0],
+            ys: vec![5.0],
+            color: [1.0, 0.0, 0.0, 1.0],
+            radius: 4.0,
+            times: vec![7.0],
+        }];
+        let (width, height) = (180, 140);
+        let mut plot = Plot::new(&scene, [0.0; 4], [1.0; 4]);
+        plot.apply(width, height, &PlotInput::default());
+        // A decoded batch with no run records falls back to one untimed span —
+        // the GPU draw ignores the window for it and so must the CPU path.
+        plot.marks.panels[0].point_runs.clear();
+        plot.time_window = Some((100.0, 200.0));
+        let layout = plot.layout(width, height);
+        let cpu = plot.paint_cpu(width, height, &layout);
+        let p = plot.project_data(0, 5.0, 5.0, width, height);
+        let (x, y) = (p[0].round() as u32, p[1].round() as u32);
+        assert!(cpu[((y * width + x) * 4) as usize] > 200);
+        assert_eq!(plot.hover(p[0], p[1]).3, Some(0));
     }
 
     #[test]

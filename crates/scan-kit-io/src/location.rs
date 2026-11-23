@@ -1430,6 +1430,24 @@ pub(crate) fn session_storage_paths(root: &str, session_id: &str) -> Result<Vec<
                 found.push(place);
             }
         }
+        // A zip's session id comes from the folder wrapped inside it, not its
+        // filename — `a.zip` holding `b/` re-discovers as `b` after `b` is
+        // trashed, so probe archives by identity too. Tars cannot peek
+        // cheaply; their identity is the filename stem already covered above.
+        if let Ok(read) = fs::read_dir(base) {
+            for entry in read.flatten() {
+                let path = entry.path();
+                if !path.is_file() {
+                    continue;
+                }
+                let matches =
+                    discover::archive_identity(&path).is_some_and(|(id, _)| id == session_id);
+                let place = path.to_string_lossy().into_owned();
+                if matches && !found.contains(&place) {
+                    found.push(place);
+                }
+            }
+        }
     }
     Ok(found)
 }
@@ -1580,6 +1598,22 @@ mod tests {
             .unwrap()
             .remove(&(root_str, "gone".to_string()));
         assert!(paths.is_empty());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn storage_paths_finds_a_zip_whose_wrapped_id_differs_from_its_name() {
+        // a.zip wrapping b/ re-discovers as session b after b is trashed —
+        // trash must probe archives by inside identity too.
+        let root = std::env::temp_dir().join(format!("scan-kit-zipid-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        discover::write_zip(&root.join("a.zip"), &[("b/input_map.csv", b"energy\n70\n")]).unwrap();
+        let paths = session_storage_paths(&root.to_string_lossy(), "b").unwrap();
+        assert!(
+            paths.iter().any(|p| p.ends_with("a.zip")),
+            "expected a.zip in {paths:?}"
+        );
         let _ = fs::remove_dir_all(&root);
     }
 

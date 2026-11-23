@@ -919,8 +919,8 @@ pub(super) fn pchip(xs: &[f32], ys: &[f32]) -> (Vec<f32>, Vec<f32>) {
     let mut h = vec![0.0f64; n - 1];
     let mut delta = vec![0.0f64; n - 1];
     for i in 0..n - 1 {
-        h[i] = f64::from(xs[i + 1] - xs[i]).max(1e-9);
-        delta[i] = f64::from(ys[i + 1] - ys[i]) / h[i];
+        h[i] = (f64::from(xs[i + 1]) - f64::from(xs[i])).max(1e-9);
+        delta[i] = (f64::from(ys[i + 1]) - f64::from(ys[i])) / h[i];
     }
     let mut slope = vec![0.0f64; n];
     slope[0] = delta[0];
@@ -960,6 +960,12 @@ pub(super) fn pchip(xs: &[f32], ys: &[f32]) -> (Vec<f32>, Vec<f32>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pchip_keeps_opposite_extreme_means_finite() {
+        let (_xs, ys) = pchip(&[0.0, 1.0, 2.0], &[-3.0e38, 0.0, 3.0e38]);
+        assert!(ys.iter().all(|y| y.is_finite()), "{ys:?}");
+    }
 
     #[test]
     fn kde_and_mean_series_survive_extreme_finite_samples() {
