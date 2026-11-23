@@ -291,11 +291,13 @@ fn exam_in(dir: &Path, walk_failed: &mut bool) -> Option<ExamHit> {
         .into_iter()
         .find(|path| scan_kit_dicom::file_is_dicom(path))?;
     let peek = scan_kit_dicom::peek_file(&sample);
-    let study_uid = if peek.study_uid.is_empty() {
-        folder_name.clone()
-    } else {
-        peek.study_uid
-    };
+    // An unreadable or non-DICOM sample is not an exam - a folder-name uid
+    // fabricates a phantom record, and classifying here stops the walk
+    // from ever reaching archives nested under the directory.
+    if peek.study_uid.is_empty() {
+        return None;
+    }
+    let study_uid = peek.study_uid;
     Some(ExamHit {
         study_uid,
         folder_name,

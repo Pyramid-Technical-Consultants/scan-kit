@@ -911,7 +911,11 @@ fn read_plan(elems: &[Elem], frame: String, ct_position: &str) -> Result<Plan, S
     // ponytail: beams in later fraction groups share this fraction count.
     for group in seq(elems, tag(0x300A, 0x0070)) {
         if metersets.is_empty() {
-            fractions = int_tag(group, tag(0x300A, 0x0078)).unwrap_or(1);
+            fractions = match int_tag(group, tag(0x300A, 0x0078)) {
+                Some(value) if value > 0 => value,
+                Some(_) => return Err("a fraction group has a non-positive fraction count".into()),
+                None => 1,
+            };
         }
         for beam in seq(group, tag(0x300C, 0x0004)) {
             metersets.push((
@@ -1069,8 +1073,15 @@ fn read_plan(elems: &[Elem], frame: String, ct_position: &str) -> Result<Plan, S
             let weights = floats_tag(cp, tag(0x300A, 0x0396));
             let has_weights = elem(cp, tag(0x300A, 0x0396)).is_some();
             let spot_size_mm = scanning_spot_mm(cp);
-            if n == 0 || !energy.is_finite() {
+            if n == 0 {
                 continue;
+            }
+            if !energy.is_finite() || energy <= 0.0 {
+                // read_ion_plan errors on the same input - a beam's spots
+                // must not vanish silently in the study path.
+                return Err(format!(
+                    "beam {number}: a treatment beam has no nominal energy"
+                ));
             }
             let limit = n.min(xy.len() / 2);
             if has_weights && weights.len() < limit {
@@ -1529,6 +1540,9 @@ fn parse_items(bytes: &[u8], implicit: bool, depth: u32) -> Result<Vec<Vec<Elem>
             bytes[cursor + 7],
         ]);
         if group == 0xFFFE && element == 0xE0DD {
+            // A defined-length SQ may still carry a delimiter - consume it
+            // or the non-zero tail check below rejects the whole sequence.
+            cursor += 8;
             break;
         }
         if group != 0xFFFE || element != 0xE000 {
@@ -1772,18 +1786,24 @@ pub(crate) fn ds(
     element: u16,
     values: &[f32],
 ) -> Result<(), String> {
-    let text = values
+    let parts: Vec<String> = values
         .iter()
-        .map(|value| format!("{value:.6}"))
-        .collect::<Vec<_>>()
-        .join("\\");
+        .map(|value| {
+            let plain = format!("{value:.6}");
+            // {:.6} collapses small magnitudes to "0.000000" - a declared
+            // zero geometry is worse than an exponential spelling.
+            if *value != 0.0 && plain.parse::<f64>() == Ok(0.0) {
+                format!("{value:.6e}")
+            } else {
+                plain
+            }
+        })
+        .collect();
+    let text = parts.join("\\");
     // A DS component is ≤16 bytes of the decimal grammar — "NaN"/"inf"/
     // "e+20" or an overlong literal is not encodable. The limit is per
     // component, not on the joined string.
-    if !values
-        .iter()
-        .all(|value| value.is_finite() && format!("{value:.6}").len() <= 16)
-    {
+    if !values.iter().all(|value| value.is_finite()) || parts.iter().any(|part| part.len() > 16) {
         return Err(format!("{group:04X},{element:04X} is not encodable as DS"));
     }
     push_elem(bytes, group, element, b"DS", &even(&text))
@@ -1986,6 +2006,11 @@ pub fn write_rtdose(
     if ct.frame.is_empty() {
         return Err("the CT has no frame of reference".into());
     }
+    if ct.study_uid.is_empty() {
+        // Study Instance UID is Type 1 - a zero-length UI does not mean
+        // "unknown" here.
+        return Err("the CT has no study instance uid".into());
+    }
     let peak = dose.iter().fold(0.0f64, |peak, &v| {
         peak.max(if v.is_nan() { 0.0 } else { v as f64 })
     });
@@ -2038,8 +2063,12 @@ pub fn write_rtdose(
         .take(64)
         .collect();
     lo(&mut bytes, 0x0008, 0x103E, &series_description)?;
-    pn(&mut bytes, 0x0010, 0x0010, &ct.patient_name)?;
-    lo(&mut bytes, 0x0010, 0x0020, &ct.patient_id)?;
+    // PN/LO cap at 64 characters - a malformed source CT must not write an
+    // overlong value into the export.
+    let patient_name: String = ct.patient_name.chars().take(64).collect();
+    let patient_id: String = ct.patient_id.chars().take(64).collect();
+    pn(&mut bytes, 0x0010, 0x0010, &patient_name)?;
+    lo(&mut bytes, 0x0010, 0x0020, &patient_id)?;
     ds(&mut bytes, 0x0018, 0x0050, &[ct.spacing[2]])?;
     lo(
         &mut bytes,
@@ -2052,7 +2081,10 @@ pub fn write_rtdose(
     ds(&mut bytes, 0x0020, 0x0032, &ct.origin)?;
     ds(&mut bytes, 0x0020, 0x0037, &[1.0, 0.0, 0.0, 0.0, 1.0, 0.0])?;
     ui(&mut bytes, 0x0020, 0x0052, &ct.frame)?;
-    lt(&mut bytes, 0x0020, 0x4000, comment)?;
+    // LT holds 10240 characters and forbids backslashes; the provenance
+    // JSON carries UIDs and paths that can exceed both.
+    let comment: String = comment.chars().filter(|c| *c != '\\').take(10240).collect();
+    lt(&mut bytes, 0x0020, 0x4000, &comment)?;
     us(&mut bytes, 0x0028, 0x0002, 1)?;
     cs(&mut bytes, 0x0028, 0x0004, "MONOCHROME2")?;
     is(&mut bytes, 0x0028, 0x0008, nz as i32)?;
@@ -2652,7 +2684,7 @@ mod tests {
             summation: String::new(),
             patient_id: String::new(),
             patient_name: String::new(),
-            study_uid: String::new(),
+            study_uid: "1.2.3".into(),
             series_uid: String::new(),
             sop_uids: Vec::new(),
         };
@@ -2692,7 +2724,7 @@ mod tests {
             summation: String::new(),
             patient_id: String::new(),
             patient_name: String::new(),
-            study_uid: String::new(),
+            study_uid: "1.2.3".into(),
             series_uid: String::new(),
             sop_uids: Vec::new(),
         };

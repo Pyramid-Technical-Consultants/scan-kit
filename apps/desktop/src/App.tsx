@@ -786,15 +786,15 @@ export default function App() {
   } | null>(null);
 
   const requestTrash = useCallback(
-    async (sessionId: string) => {
-      const row = rows.find((item) => item.session_id === sessionId);
-      const library = row?.library ?? locations[0];
-      if (library == null) {
+    async (sessionId: string, library: string) => {
+      const row = rows.find((item) => item.session_id === sessionId && item.library === library);
+      const path = row?.library ?? library;
+      if (path == null) {
         return;
       }
       try {
         const result = await invoke<{ paths: string[] }>("scan_kit_session_storage_paths", {
-          path: library,
+          path,
           sessionId: row?.folder_id ?? sessionId,
         });
         if (result.paths.length === 0) {
@@ -812,7 +812,7 @@ export default function App() {
         notifyError(error);
       }
     },
-    [rows, locations, setTrashConfirm],
+    [rows, setTrashConfirm],
   );
 
   const confirmTrash = useCallback(async () => {
@@ -971,21 +971,25 @@ export default function App() {
     });
   }, [openLocation, openAnalysis, selectTab, commitSelection, rows]);
 
-  const writeNote = useCallback(async (sessionId: string, note: string) => {
-    const row = rows.find((item) => item.session_id === sessionId);
-    const path = row?.library ?? locations[0];
+  const writeNote = useCallback(async (sessionId: string, library: string, note: string) => {
+    // session_id is not unique across locations - the note must commit to
+    // the copy the user clicked, not the first catalog match.
+    const row = rows.find((item) => item.session_id === sessionId && item.library === library);
+    const path = row?.library ?? library;
     if (path == null) {
       return;
     }
     await invoke("scan_kit_set_note", { path, sessionId: row?.folder_id ?? sessionId, note });
     setRows((current) =>
-      current.map((item) => (item.session_id === sessionId ? { ...item, note } : item)),
+      current.map((item) =>
+        item.session_id === sessionId && item.library === library ? { ...item, note } : item,
+      ),
     );
-  }, [locations, rows]);
+  }, [rows]);
 
   const commitNote = useCallback(
     (edit: NoteEdit) => {
-      void writeNote(edit.sessionId, edit.after)
+      void writeNote(edit.sessionId, edit.library, edit.after)
         .then(() => {
           setUndo((stack) => [...stack, edit]);
           setRedo([]);
@@ -1020,7 +1024,7 @@ export default function App() {
   }
 
   async function applyNote(edit: NoteEdit, note: string) {
-    await writeNote(edit.sessionId, note);
+    await writeNote(edit.sessionId, edit.library, note);
   }
 
   function undoNote() {
@@ -1295,7 +1299,11 @@ export default function App() {
                   sessionMenu.rowIds.every((id) => selectedIds.includes(id))
                 }
                 remote={isRemoteSpec(
-                  rows.find((item) => item.session_id === sessionMenu.sessionId)?.library ??
+                  rows.find(
+                    (item) =>
+                      item.session_id === sessionMenu.sessionId &&
+                      item.library === sessionMenu.library,
+                  )?.library ??
                     locations[0] ??
                     "",
                 )}
@@ -1315,7 +1323,7 @@ export default function App() {
                 onToggleRows={() => {
                   commitSelection(toggleListedSessions(selectedIds, sessionMenu.rowIds));
                 }}
-                onTrash={() => void requestTrash(sessionMenu.sessionId)}
+                onTrash={() => void requestTrash(sessionMenu.sessionId, sessionMenu.library)}
               />
             ) : null}
           </div>

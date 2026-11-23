@@ -95,10 +95,15 @@ pub fn sig6(value: f64) -> String {
 }
 
 /// `name_dvh.csv`: dose in Gy(RBE), one volume-% column per structure.
-pub fn dvh_csv(curves: &[DvhCurve]) -> String {
+pub fn dvh_csv(curves: &[DvhCurve]) -> Result<String, String> {
     let Some(first) = curves.first() else {
-        return String::new();
+        return Ok(String::new());
     };
+    // Every curve's cumulative[i] is read against first.edges[i] - curves
+    // with different bins would report volumes against the wrong dose.
+    if curves.iter().any(|curve| curve.edges != first.edges) {
+        return Err("dvh curves do not share the same dose bins".into());
+    }
     // Row i is indexed positionally against first.edges; shorter curves fill
     // the remaining cells empty rather than fabricating zeros.
     let mut out = String::from("dose_gy_rbe");
@@ -122,7 +127,7 @@ pub fn dvh_csv(curves: &[DvhCurve]) -> String {
         }
         out.push('\n');
     }
-    out
+    Ok(out)
 }
 
 fn text_width(text: &str, size: f32) -> f32 {
@@ -139,15 +144,36 @@ fn text_width(text: &str, size: f32) -> f32 {
 fn wrap(text: &str, size: f32, width: f32) -> Vec<String> {
     let mut lines = Vec::new();
     let mut line = String::new();
+    // Split over-long tokens by characters first - provenance text (UIDs,
+    // digests, paths) has no spaces to wrap on and would run off the page.
+    let mut pieces: Vec<String> = Vec::new();
     for word in text.split(' ') {
+        if text_width(word, size) <= width {
+            pieces.push(word.to_owned());
+            continue;
+        }
+        let mut chunk = String::new();
+        for c in word.chars() {
+            let mut trial = chunk.clone();
+            trial.push(c);
+            if !chunk.is_empty() && text_width(&trial, size) > width {
+                pieces.push(std::mem::take(&mut chunk));
+            }
+            chunk.push(c);
+        }
+        if !chunk.is_empty() {
+            pieces.push(chunk);
+        }
+    }
+    for word in &pieces {
         let candidate = if line.is_empty() {
-            word.to_owned()
+            word.clone()
         } else {
             format!("{line} {word}")
         };
         if !line.is_empty() && text_width(&candidate, size) > width {
             lines.push(std::mem::take(&mut line));
-            line = word.to_owned();
+            line = word.clone();
         } else {
             line = candidate;
         }
@@ -366,6 +392,11 @@ fn lay_out(report: &Report) -> Result<Vec<Vec<Op>>, String> {
         if !pages.last().unwrap().is_empty() && op.bottom() - offset > PAGE_H - MARGIN {
             offset += PAGE_H - 2.0 * MARGIN;
             pages.push(Vec::new());
+        }
+        // A figure taller than an empty page used to draw mostly off-page
+        // and still report success.
+        if op.bottom() - offset > PAGE_H - MARGIN {
+            return Err("a figure does not fit on a page".into());
         }
         pages.last_mut().unwrap().push(op);
     }
@@ -729,7 +760,8 @@ mod tests {
                 edges: vec![0.0, 1.0, 2.0],
                 cumulative: vec![1.0, 1.0, 0.25],
             },
-        ]);
+        ])
+        .unwrap();
         assert!(csv.starts_with("dose_gy_rbe,PTV volume %,a  b volume %"));
         assert!(csv.contains("\n2,0,25\n"));
         let _ = std::fs::remove_dir_all(&dir);
@@ -830,7 +862,7 @@ mod tests {
             edges: vec![0.0],
             cumulative: vec![100.0],
         }];
-        let csv = dvh_csv(&curves);
+        let csv = dvh_csv(&curves).unwrap();
         // An interior newline would add a bogus column row.
         assert_eq!(csv.lines().count(), 2, "{csv}");
         assert!(csv.starts_with("dose_gy_rbe,PTV Cord volume %"));
@@ -857,11 +889,11 @@ mod tests {
             },
             DvhCurve {
                 name: "short".into(),
-                edges: vec![0.0],
+                edges: vec![0.0, 1.0, 2.0],
                 cumulative: vec![1.0],
             },
         ];
-        let csv = dvh_csv(&curves);
+        let csv = dvh_csv(&curves).unwrap();
         // Rows past the short curve's bins stay empty — a fabricated "0"
         // would report the structure as fully missed at every dose.
         assert!(
@@ -889,7 +921,7 @@ mod tests {
             edges: vec![0.0, 1.0],
             cumulative: vec![100.0, 50.0],
         }];
-        let csv = dvh_csv(&curves);
+        let csv = dvh_csv(&curves).unwrap();
         // A stray quote would open a quoted field on re-parse and swallow the
         // rest of the header line.
         assert_eq!(csv.lines().next().unwrap().split(',').count(), 2, "{csv}");

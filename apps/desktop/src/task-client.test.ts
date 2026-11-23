@@ -68,7 +68,7 @@ it("polls the next slice without waiting for a paint", async () => {
   );
   expect(seen).toEqual([1, 2]);
   expect(polls).toBe(2);
-  expect(invoke).toHaveBeenCalledWith("scan_kit_poll", { task: 1 });
+  expect(invoke).toHaveBeenCalledWith("scan_kit_poll", { task: 1, generation: expect.anything() });
 });
 
 it("cancels the backend task when the stop predicate fires", async () => {

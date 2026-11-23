@@ -479,12 +479,16 @@ export function AnalysisView({
     })
       .then((listed) => {
         if (live) {
-          setScanners(listed.scanners);
+          // A fresh array per resolve would restart the task effect below -
+          // only adopt it when the content actually changed.
+          setScanners((prev) =>
+            JSON.stringify(prev) === JSON.stringify(listed.scanners) ? prev : listed.scanners,
+          );
         }
       })
       .catch(() => {
         if (live) {
-          setScanners([]);
+          setScanners((prev) => (prev.length === 0 ? prev : []));
         }
       });
     return () => {
@@ -881,6 +885,9 @@ export function AnalysisView({
         // would settle this view on unrelated work. It is not ours to
         // cancel either; the owner is still using it.
         if (started.superseded) {
+          // The start lost the slot race and has no ticket to poll - settle
+          // or the view sweeps "Loading plot" forever.
+          setArrivedKey(requestKey);
           return;
         }
         if (stop || openSeq.current !== ticket) {
@@ -910,7 +917,10 @@ export function AnalysisView({
           if (stop || openSeq.current !== ticket) {
             return;
           }
-          const raw = await invoke<ArrayBuffer | Uint8Array>("scan_kit_poll", { task: started.task });
+          const raw = await invoke<ArrayBuffer | Uint8Array>("scan_kit_poll", {
+            task: started.task,
+            generation: started.generation,
+          });
           if (stop || openSeq.current !== ticket) {
             return;
           }

@@ -363,9 +363,14 @@ pub fn download_with(
         if !keep(report.files as u64, report.files as u64) {
             return Err("cancelled".into());
         }
+        let dest_was = Path::new(&zip_path).exists();
         package_zip(&session_dir, Path::new(&zip_path), &report.session_id, keep)?;
         if !keep(report.files as u64, report.files as u64) {
-            let _ = std::fs::remove_file(&zip_path);
+            // A dest that predates this run may hold a replaced artifact the
+            // rename already swapped in — only remove what this run created.
+            if !dest_was {
+                let _ = std::fs::remove_file(&zip_path);
+            }
             return Err("cancelled".into());
         }
         Ok::<(String, session_capture::CaptureResult), String>((zip_path.clone(), report))

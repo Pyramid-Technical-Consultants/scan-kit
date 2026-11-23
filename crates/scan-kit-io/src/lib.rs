@@ -915,11 +915,19 @@ pub fn index_library(
     };
     // Remote fingerprints stat each session over a fresh connection —
     // compute them before STORE_LOCK so the write tx below stays short.
-    let fingerprints: Vec<Option<(i64, i64)>> = found
-        .entries
-        .iter()
-        .map(|entry| discover::storage_fingerprint(&entry.storage_path, &entry.session_id))
-        .collect();
+    let total = found.entries.len() as u64;
+    let mut fingerprints = Vec::with_capacity(found.entries.len());
+    for entry in &found.entries {
+        fingerprints.push(discover::storage_fingerprint(
+            &entry.storage_path,
+            &entry.session_id,
+        ));
+        // A remote fingerprint opens a connection per session - cancel must
+        // land between them, not only after the whole phase.
+        if !keep(fingerprints.len() as u64, total, None) {
+            return Err("cancelled".into());
+        }
+    }
     let conn = &mut store::open_connection(db)?;
     let places = found
         .entries
@@ -934,7 +942,6 @@ pub fn index_library(
     let exams = found.exams;
     let skipped = found.skipped;
     let walk_failed = found.walk_failed;
-    let total = found.entries.len() as u64;
     let (lib_id, pending) = store::locked(|| {
         // Two phases: the write transaction covers the row-sync decisions only.
         // hydrate does file/network IO — inside the transaction a remote
@@ -983,6 +990,11 @@ pub fn index_library(
         backfill_blank_notes(conn, lib_id, Path::new(&root))?;
         Ok((lib_id, pending))
     })?;
+    // Refresh the recorded bindings now, not only after the hydrate loop -
+    // a cancel or error below used to leave new storage_paths committed
+    // while the in-memory maps still resolved the old locations.
+    location::replace_sessions(&root, &places);
+    store::locked(|| publish_catalog(conn))?;
     if !keep(0, total, None) {
         return Err("cancelled".into());
     }
@@ -1027,8 +1039,6 @@ pub fn index_library(
             store::selected_session_ids(conn, lib_id)?,
         ))
     })?;
-    location::replace_sessions(&root, &places);
-    store::locked(|| publish_catalog(conn))?;
     // Selection echoes only ids that actually resolved - a ghost id must
     // not read back as if the session still exists.
     let present: std::collections::HashSet<&str> = rows
@@ -1732,9 +1742,9 @@ Layer delivery: 27/27
         );
         let exam = site_a.join("study");
         fs::create_dir_all(&exam).unwrap();
-        let mut stub = vec![0u8; 132];
-        stub[128..132].copy_from_slice(b"DICM");
-        fs::write(exam.join("1.2.3"), &stub).unwrap();
+        // A real StudyInstanceUID: a bare DICM preamble is correctly skipped
+        // by the exam probe now.
+        scan_kit_dicom::write_header(&exam.join("1.2.3"), "1.2", "CT", "1.2.3", "1.2.4").unwrap();
         let notes = site_a.join("notes").join("deep");
         fs::create_dir_all(&notes).unwrap();
         fs::write(notes.join("readme.txt"), b"not dicom").unwrap();
