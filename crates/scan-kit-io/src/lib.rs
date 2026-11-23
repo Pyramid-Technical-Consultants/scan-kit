@@ -53,10 +53,10 @@ use serde_json::{json, Value};
 use columns::map_geom_from_spots;
 use discover::Discovered;
 use store::{
-    backfill_blank_notes, data_dirs, delete_missing, delete_missing_exams, exam_rows,
-    forget_data_dir, last_main_tab, library_id, library_rows, prepare_library, record_meta,
-    remember_data_dir, set_last_main_tab, set_note, set_selected, sync_entry, upsert_exam,
-    window_geometry, with_store, Cache,
+    backfill_blank_notes, data_dirs, delete_missing, delete_missing_exams, ensure_library,
+    exam_rows, forget_data_dir, import_legacy, last_main_tab, library_id, library_rows,
+    record_meta, remember_data_dir, set_last_main_tab, set_note, set_selected, sync_entry,
+    upsert_exam, window_geometry, with_store, Cache,
 };
 
 const TOOLS: &[ToolSpec] = &[
@@ -922,7 +922,9 @@ pub fn index_library(
         let tx = conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(|err| err.to_string())?;
-        let lib_id = prepare_library(&tx, &root)?;
+        // ensure_library only — import_legacy/backfill read legacy JSON off
+        // disk and must not hold the write lock while a share stalls.
+        let lib_id = ensure_library(&tx, &root)?;
         let ids = places
             .iter()
             .map(|(session_id, _)| session_id.clone())
@@ -942,7 +944,6 @@ pub fn index_library(
             upsert_exam(&tx, lib_id, exam)?;
         }
         remember_data_dir(&tx, &root)?;
-        backfill_blank_notes(&tx, lib_id, Path::new(&root))?;
         let mut pending = HashSet::new();
         for (index, entry) in found.entries.iter().enumerate() {
             if let Cache::Hydrate = sync_entry(&tx, lib_id, entry, fingerprints[index])? {
@@ -950,6 +951,11 @@ pub fn index_library(
             }
         }
         tx.commit().map_err(|err| err.to_string())?;
+        // Both read legacy JSON off disk — autocommit after commit so a
+        // stalled share can't sit inside the write lock. Fill-blanks only,
+        // safe to replay if the next scan finds them half-done.
+        import_legacy(conn, lib_id, Path::new(&root))?;
+        backfill_blank_notes(conn, lib_id, Path::new(&root))?;
         Ok((lib_id, pending))
     })?;
     if !keep(0, total, None) {
