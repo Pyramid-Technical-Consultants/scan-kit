@@ -580,7 +580,12 @@ mod net {
             let local = dest.join(&item.name);
             if item.dir {
                 copy_sftp_dir(fs, &remote, &local, depth + 1, total)?;
-            } else if let Some(bytes) = fs.read(&remote)? {
+            } else {
+                // The listing just proved this file exists - a None read is a
+                // refusal, not absence, and must not stamp a partial copy.
+                let bytes = fs
+                    .read(&remote)?
+                    .ok_or_else(|| format!("{remote} could not be read during copy"))?;
                 *total = total.saturating_add(bytes.len() as u64);
                 if *total > super::MAX_COPY_BYTES {
                     return Err(format!(
@@ -699,8 +704,10 @@ mod net {
             }
             .map_err(map_ftp)?;
             let mut items = Vec::new();
-            for line in lines {
+            let mut failed = 0usize;
+            for line in &lines {
                 let Ok(file) = suppaftp::list::File::try_from(line.as_str()) else {
+                    failed += 1;
                     continue;
                 };
                 if file.is_symlink() {
@@ -722,6 +729,12 @@ mod net {
                         .map(|span| i64::try_from(span.as_nanos()).unwrap_or(i64::MAX))
                         .unwrap_or(0),
                 });
+            }
+            // Every line unparseable means the whole reply format went
+            // unrecognized - an empty Vec would read as an empty directory
+            // and let discovery prune every session row blind.
+            if !lines.is_empty() && failed == lines.len() {
+                return Err(format!("unparseable LIST reply for {path}"));
             }
             Ok(items)
         }
@@ -764,7 +777,11 @@ mod net {
                 // filename would vanish a real file named *type=slink*.
                 Ok(line)
                     if line.split(' ').next().is_some_and(|facts| {
-                        facts.contains("type=OS.unix=slink") || facts.contains("type=slink")
+                        let facts = facts.to_ascii_lowercase();
+                        facts.contains("type=os.unix=slink")
+                            || facts.contains("type=os.unix=symlink")
+                            || facts.contains("type=slink")
+                            || facts.contains("type=link")
                     }) =>
                 {
                     Ok(None)
@@ -857,7 +874,10 @@ mod net {
             let local = dest.join(&item.name);
             if item.dir {
                 copy_ftp_dir(fs, &remote, &local, depth + 1, total)?;
-            } else if let Some(bytes) = fs.read(&remote)? {
+            } else {
+                let bytes = fs
+                    .read(&remote)?
+                    .ok_or_else(|| format!("{remote} could not be read during copy"))?;
                 *total = total.saturating_add(bytes.len() as u64);
                 if *total > super::MAX_COPY_BYTES {
                     return Err(format!(
@@ -886,7 +906,16 @@ mod net {
         }) else {
             return Ok(None);
         };
-        for item in fs.list(parent)? {
+        // LIST<dir> errors conflate missing and denied in one 550 - probe
+        // the parent: genuinely absent is None, anything else is Err.
+        let items = match fs.list(parent) {
+            Ok(items) => items,
+            Err(err) => match fs.stat(parent) {
+                Ok(None) => return Ok(None),
+                _ => return Err(err),
+            },
+        };
+        for item in items {
             if item.name == name {
                 return Ok(Some(Stat {
                     dir: item.dir,
@@ -1025,7 +1054,7 @@ mod net {
             // 421 is "service not available" (a busy/restarting server), not a
             // credential failure — mapping it to an auth prompt can never win.
             suppaftp::FtpError::UnexpectedResponse(response) => {
-                matches!(response.status as u32, 332 | 530)
+                matches!(response.status as u32, 332 | 430 | 530)
             }
             _ => {
                 let text = err.to_string().to_ascii_lowercase();
@@ -1141,7 +1170,7 @@ mod net {
         let response = authed(http_agent()?.head(url), username, password)?.call();
         let response = match response {
             Ok(response) => response,
-            Err(ureq::Error::StatusCode(405)) => {
+            Err(ureq::Error::StatusCode(405)) | Err(ureq::Error::StatusCode(501)) => {
                 return Ok(Stat {
                     dir: false,
                     size: 0,

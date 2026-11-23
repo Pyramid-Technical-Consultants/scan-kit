@@ -559,6 +559,9 @@ pub fn session_directory(library: &Path, session_id: &str) -> PathBuf {
     if let Some(catalog) = crate::location::catalog_directory(library, session_id) {
         return catalog;
     }
+    if let Some(recorded) = crate::location::recorded_anywhere(session_id) {
+        return recorded;
+    }
     // The root resolves only for the session it actually is — a data dir
     // that is itself a session must not answer every session id with its
     // files (a foreign id reaching here reads the wrong session's map).
