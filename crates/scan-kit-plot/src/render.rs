@@ -7881,7 +7881,11 @@ fn stroke_cpu(
     let pad = radius + 2.0;
     let (bx_lo, by_lo) = (x_lo as f32 - pad, y_lo as f32 - pad);
     let (bx_hi, by_hi) = (x_hi as f32 + pad, y_hi as f32 + pad);
+    if !pa[0].is_finite() || !pa[1].is_finite() || !pb[0].is_finite() || !pb[1].is_finite() {
+        return;
+    }
     let d = [pb[0] - pa[0], pb[1] - pa[1]];
+    let full_len = d[0].hypot(d[1]);
     let (mut t0, mut t1) = (0.0f32, 1.0f32);
     for (p, q) in [
         (-d[0], pa[0] - bx_lo),
@@ -7909,11 +7913,13 @@ fn stroke_cpu(
     let b = [pa[0] + d[0] * t1, pa[1] + d[1] * t1];
     pa = a;
     pb = b;
+    // The pattern is stamped along the unclipped segment — a clipped a-side
+    // still phases dashes/dots from the true start, matching fs_line.
+    let phase = line.phase + t0 * full_len;
     let ab = [pb[0] - pa[0], pb[1] - pa[1]];
     let len2 = ab[0] * ab[0] + ab[1] * ab[1];
     let len = len2.sqrt().max(0.001);
     let pad = radius + 1.5;
-    let (x_lo, y_lo, x_hi, y_hi) = clip_pixels(plot, width, height);
     let x0 = ((pa[0].min(pb[0]) - pad).floor() as i64).max(x_lo);
     let y0 = ((pa[1].min(pb[1]) - pad).floor() as i64).max(y_lo);
     let x1 = ((pa[0].max(pb[0]) + pad).ceil() as i64).min(x_hi);
@@ -7928,7 +7934,7 @@ fn stroke_cpu(
             };
             let q = [pa[0] + ab[0] * t, pa[1] + ab[1] * t];
             let dist = (point[0] - q[0]).hypot(point[1] - q[1]);
-            let coverage = pattern_coverage(dist, radius, line.phase + t * len, line.pattern);
+            let coverage = pattern_coverage(dist, radius, phase + t * len, line.pattern);
             if coverage <= 0.0 {
                 continue;
             }
@@ -12450,6 +12456,53 @@ mod tests {
             // reach ~200, and the alpha channel used to be forced to 255.
             assert!(cpu[at] < 150, "compounded stamp at t={t}: {}", cpu[at]);
             assert!(cpu[at + 3] < 200, "alpha must accumulate: {}", cpu[at + 3]);
+        }
+    }
+
+    #[test]
+    fn a_clipped_dash_keeps_the_full_segment_phase() {
+        let mut scene = line_scene();
+        scene.panels[0].series.clear();
+        scene.panels[0].xmin = 0.0;
+        scene.panels[0].xmax = 80.0;
+        scene.panels[0].ymin = 0.0;
+        scene.panels[0].ymax = 24.0;
+        let (width, height) = (160u32, 80u32);
+        let mut plot = Plot::new(&scene, [0.0; 4], [1.0; 4]);
+        plot.apply(width, height, &PlotInput::default());
+        // A dash entering from far offscreen — the pattern phases from the
+        // true segment start, not from the clip boundary, like fs_line.
+        let a_px = plot.project_data(0, -60.0, 12.0, width, height)[0];
+        plot.live.push(LiveCloud {
+            panel: 0,
+            quads: Vec::new(),
+            lines: vec![LineRec {
+                a: [-60.0, 12.0, 0.0],
+                b: [76.0, 12.0, 0.0],
+                color: [0.0, 1.0, 0.0, 1.0],
+                thickness: 2.0,
+                id: 0,
+                pattern: LINE_DASH,
+                phase: 0.0,
+            }],
+            dose: false,
+            crosshair: false,
+        });
+        let layout = plot.layout(width, height);
+        let frame = plot.paint_cpu(width, height, &layout);
+        let b_px = plot.project_data(0, 76.0, 12.0, width, height);
+        let y = b_px[1].round() as u32;
+        let plot_rect = layout[0].plot;
+        let last_x = (b_px[0] - 1.0).min(plot_rect.x + plot_rect.w - 1.0) as u32;
+        for x in (plot_rect.x as u32 + 1)..last_x {
+            let along = (x as f32 + 0.5) - a_px;
+            let coverage = pattern_coverage(0.0, 1.0, along, LINE_DASH);
+            let alpha = frame[((y * width + x) * 4 + 3) as usize];
+            if coverage > 0.9 {
+                assert!(alpha > 64, "dash dropped at x={x} along={along}");
+            } else if coverage <= 0.0 {
+                assert!(alpha <= 4, "dash painted in a gap at x={x} along={along}");
+            }
         }
     }
 

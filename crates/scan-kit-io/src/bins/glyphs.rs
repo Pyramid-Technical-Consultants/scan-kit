@@ -919,7 +919,7 @@ pub(super) fn pchip(xs: &[f32], ys: &[f32]) -> (Vec<f32>, Vec<f32>) {
     let mut h = vec![0.0f64; n - 1];
     let mut delta = vec![0.0f64; n - 1];
     for i in 0..n - 1 {
-        h[i] = f64::from(xs[i + 1] - xs[i]).max(1e-9);
+        h[i] = (f64::from(xs[i + 1]) - f64::from(xs[i])).max(1e-9);
         delta[i] = (f64::from(ys[i + 1]) - f64::from(ys[i])) / h[i];
     }
     let mut slope = vec![0.0f64; n];
