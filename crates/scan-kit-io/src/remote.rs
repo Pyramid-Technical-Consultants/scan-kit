@@ -706,6 +706,25 @@ mod net {
             let mut items = Vec::new();
             let mut failed = 0usize;
             for line in &lines {
+                // File::try_from's mlsx fallback accepts almost any string as
+                // a name - a banner or "total N" line would become a phantom
+                // entry whose read then fails mid-copy. Only feed the parser
+                // lines shaped like a posix `ls -l` or DOS LIST row.
+                let bytes = line.as_bytes();
+                let posix = bytes.len() >= 10
+                    && matches!(bytes[0], b'-' | b'b' | b'c' | b'd' | b'l' | b'p' | b's')
+                    && bytes[1..10].iter().all(|b| {
+                        matches!(b, b'r' | b'w' | b'x' | b's' | b'S' | b't' | b'T' | b'-')
+                    });
+                let dos = line.len() >= 8
+                    && line.bytes().take(8).enumerate().all(|(i, b)| match i {
+                        2 | 5 => b == b'-',
+                        _ => b.is_ascii_digit(),
+                    });
+                if !posix && !dos {
+                    failed += 1;
+                    continue;
+                }
                 let Ok(file) = suppaftp::list::File::try_from(line.as_str()) else {
                     failed += 1;
                     continue;
