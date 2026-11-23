@@ -7170,8 +7170,10 @@ fn fold_cube(volume: &scan_kit_core::Volume, kind: u8, lo: &mut f32, hi: &mut f3
     if nx == 0 || ny == 0 || nz == 0 {
         return;
     }
-    let along_x = volume.axis(1) * volume.axis(2);
-    let along_y = volume.axis(0) * volume.axis(2);
+    // The sum carries (summed-axis spacing) × (fixed-axis spacing):
+    // depth_integral uses dx·dy for Σx lines, lateral dy·dz for Σy.
+    let along_x = volume.axis(0) * volume.axis(1);
+    let along_y = volume.axis(1) * volume.axis(2);
     let mut touch = |sum: f32| {
         if !sum.is_finite() {
             return;
@@ -9385,6 +9387,24 @@ mod cursor_tests {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn fold_cube_uses_the_summed_axis_spacing() {
+        // dx=dy=1, dz=2.5: a Σx line carries dx·dy, a Σy line dy·dz.
+        let volume = scan_kit_core::Volume {
+            origin: [0.0; 3],
+            shape: [4, 2, 3],
+            spacing: [1.0, 1.0, 2.5],
+            values: vec![1.0; 24],
+        };
+        let (mut lo, mut hi, mut any) = (0.0f32, 0.0f32, false);
+        fold_cube(&volume, 0, &mut lo, &mut hi, &mut any);
+        assert!(any && (hi - 4.0).abs() < 0.5, "Σx·dx·dy: {hi}");
+        let (mut lo2, mut hi2, mut any2) = (0.0f32, 0.0f32, false);
+        fold_cube(&volume, 1, &mut lo2, &mut hi2, &mut any2);
+        assert!(any2 && (hi2 - 5.0).abs() < 0.5, "Σy·dy·dz: {hi2}");
+    }
+
     #[test]
     fn garbage_row_weights_cannot_break_the_grid() {
         // Negative and NaN weights used to place cells billions of pixels
