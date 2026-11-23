@@ -171,7 +171,7 @@ pub fn save_folder(
         // and the write still fails mid-save with a half-copied dest.
         let src = under(source, rel)?;
         if src.is_dir() || target.is_dir() {
-            return Err(format!("{rel} is a directory at the destination"));
+            return Err(format!("{rel} is a directory in the save"));
         }
         for base in [source, dest] {
             let target = under(base, rel)?;

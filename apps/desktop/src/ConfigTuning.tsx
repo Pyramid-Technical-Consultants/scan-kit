@@ -543,6 +543,13 @@ export function ConfigTuning({
     setOpening(false);
     setBusy(true);
     try {
+      // An edit landing while the native folder dialog was open is not in
+      // the captured form — saving would write stale xml and clear its
+      // dirty flag.
+      if (dirtyRef.current !== dirty) {
+        notify("The file changed while the save dialog was open — review and save again.");
+        return;
+      }
       let nextXml = xml;
       let nextForm = form;
       if (dirty && form != null) {

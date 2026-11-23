@@ -44,6 +44,10 @@ export function PhantomSynthesis() {
   const [waiting, setWaiting] = useState(true);
   const [previewing, setPreviewing] = useState(false);
   const writeBusy = useRef(false);
+  const paramsRef = useRef(params);
+  useEffect(() => {
+    paramsRef.current = params;
+  }, [params]);
   usePageLoad(waiting || busy || previewing);
 
   useEffect(() => {
@@ -133,9 +137,11 @@ export function PhantomSynthesis() {
     }
     setBusy(true);
     try {
+      // Field edits can land while the native dialog is open — write the
+      // freshest params, not the pre-dialog snapshot.
       const written = await invoke<{ status: string; folder: string }>("scan_kit_write_phantom", {
         parent: selectedDir,
-        params,
+        params: paramsRef.current,
       });
       setStatus(written.status);
       notifySaved(written.folder, { title: "Study written", folder: true });

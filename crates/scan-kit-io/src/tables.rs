@@ -1896,8 +1896,8 @@ fn column_suffix<'a>(
     for suffix in suffixes {
         let with_r = format!("r_{ic}_{axis}_{suffix}");
         let plain = format!("{ic}_{axis}_{suffix}");
-        if let Some(values) = spot.num.get(&with_r).or_else(|| spot.num.get(&plain)) {
-            return Some(values);
+        if let Some(name) = num_named(spot, &with_r).or_else(|| num_named(spot, &plain)) {
+            return spot.num.get(name).map(Vec::as_slice);
         }
     }
     None
@@ -3022,7 +3022,7 @@ fn chamber_axis(xml: &str, name: &str, sad: f32) -> Option<(f32, f32)> {
     if sdd.abs() <= 1.0e-4 || count <= 0.0 {
         return None;
     }
-    if pitch < 0.1 {
+    if pitch.abs() < 0.1 {
         pitch = 1.0;
     }
     let offset = tag_float(body, "zero_offset_at_iso_mm").unwrap_or(0.0);

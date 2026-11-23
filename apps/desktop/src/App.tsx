@@ -288,15 +288,6 @@ export default function App() {
   const [undo, setUndo] = useState<NoteEdit[]>([]);
   const [redo, setRedo] = useState<NoteEdit[]>([]);
   const [gridSelection, setGridSelection] = useState<GridSelection>(emptyGridSelection);
-  // Positional selection is meaningless when the row set or order changes —
-  // but a rows array rebuilt in place (checkbox toggle, note commit) keeps
-  // positions and must not wipe the highlight.
-  const rowKey = rows.map((row) => row.session_id).join("\0");
-  const [prevKey, setPrevKey] = useState(rowKey);
-  if (prevKey !== rowKey) {
-    setPrevKey(rowKey);
-    setGridSelection(emptyGridSelection);
-  }
   const [theme, setTheme] = useState<Theme | null>(null);
   const [checks, setChecks] = useState<CheckPaint | null>(null);
   const [size, setSize] = useState({ width: 0, height: 0 });
@@ -348,6 +339,17 @@ export default function App() {
       }),
     [order, rows],
   );
+
+  // Positional selection is meaningless when the displayed order changes —
+  // a re-sort permutes order without touching rows, so key on displayIds.
+  // A rows array rebuilt in place (checkbox toggle, note commit) keeps the
+  // sequence and must not wipe the highlight.
+  const rowKey = displayIds.join("\0");
+  const [prevKey, setPrevKey] = useState(rowKey);
+  if (prevKey !== rowKey) {
+    setPrevKey(rowKey);
+    setGridSelection(emptyGridSelection);
+  }
 
   const beginCatalogLoad = useCallback(() => {
     loadDepth.current += 1;
