@@ -199,8 +199,8 @@ fn tune_sigma(
     params: &Value,
     session_label: &str,
 ) -> Result<(String, Vec<String>, Vec<String>, Vec<Vec<Value>>, bool), String> {
-    let tolerance = number(params, "sigma_tolerance_percent", 20.0).max(0.0);
-    let headroom = number(params, "sigma_lower_headroom_percent", 1.0).max(0.0);
+    let tolerance = number(params, "sigma_tolerance_percent", 20.0)?.max(0.0);
+    let headroom = number(params, "sigma_lower_headroom_percent", 1.0)?.max(0.0);
     let mut warnings = Vec::new();
     let mut rows = Vec::new();
     let mut updates = 0;
@@ -758,8 +758,8 @@ fn tune_kmu(
         _ => 0,
     };
     let mode = text(params, "primary_mode", "unchanged");
-    let known = number(params, "known_mu", f64::NAN);
-    let percent = number(params, "percent", 0.0);
+    let known = number(params, "known_mu", f64::NAN)?;
+    let percent = number(params, "percent", 0.0)?;
     let mut warnings = Vec::new();
     let primary_mu = &spots.mu[primary];
     if primary_mu
@@ -1530,12 +1530,14 @@ fn format_distance(value: f64) -> String {
     }
 }
 
-fn number(params: &Value, key: &str, fallback: f64) -> f64 {
-    params
-        .get(key)
-        .and_then(Value::as_f64)
-        .filter(|value| value.is_finite())
-        .unwrap_or(fallback)
+fn number(params: &Value, key: &str, fallback: f64) -> Result<f64, String> {
+    match params.get(key) {
+        None | Some(Value::Null) => Ok(fallback),
+        Some(value) => value
+            .as_f64()
+            .filter(|v| v.is_finite())
+            .ok_or_else(|| format!("{key} must be a finite number")),
+    }
 }
 
 fn text(params: &Value, key: &str, fallback: &str) -> String {
@@ -1549,6 +1551,16 @@ fn text(params: &Value, key: &str, fallback: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_mistyped_number_errors_instead_of_defaulting() {
+        assert!(number(&serde_json::json!({"k": "soon"}), "k", 1.0).is_err());
+        assert_eq!(number(&serde_json::json!({}), "k", 2.0).unwrap(), 2.0);
+        assert_eq!(
+            number(&serde_json::json!({"k": null}), "k", 2.0).unwrap(),
+            2.0
+        );
+    }
 
     #[test]
     fn sigma_k0_sits_above_the_smallest_spot() {

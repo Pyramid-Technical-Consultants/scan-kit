@@ -114,13 +114,13 @@ fn listed_segments(options: &Value, defaults: &[Segment]) -> Vec<Segment> {
         }
         // One malformed item must not discard the whole list.
         if let Ok(values) = serde_json::from_str::<Vec<Value>>(text) {
+            // Same contract as the array form: a parsed list is an explicit
+            // selection — all-malformed means "no segments", not defaults.
             let items: Vec<Segment> = values
                 .iter()
                 .filter_map(|item| serde_json::from_value(item.clone()).ok())
                 .collect();
-            if !items.is_empty() {
-                return without_playhead(items);
-            }
+            return without_playhead(items);
         }
     }
     let beam = options.get("beam").and_then(Value::as_str);
@@ -541,6 +541,10 @@ mod tests {
         assert!(segments_from(&json!({"segments": []}), &defaults).is_empty());
         assert!(segments_from(&json!({"segments": [{"kind": "bogus"}]}), &defaults).is_empty());
         assert!(segments_from(&json!({"segments": "[]"}), &defaults).is_empty());
+        // An all-malformed string list is the same explicit selection.
+        assert!(
+            segments_from(&json!({"segments": "[{\"kind\": \"bogus\"}]"}), &defaults).is_empty()
+        );
     }
 
     #[test]
