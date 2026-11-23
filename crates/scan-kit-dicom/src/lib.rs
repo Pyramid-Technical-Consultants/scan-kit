@@ -550,21 +550,27 @@ pub fn write_header(
 ) -> Result<(), String> {
     let mut bytes = vec![0u8; 128];
     bytes.extend_from_slice(b"DICM");
-    push_ui(&mut bytes, 0x0008, 0x0016, sop_class);
-    push_vr(&mut bytes, 0x0008, 0x0060, b"CS", modality);
-    push_ui(&mut bytes, 0x0020, 0x000D, study);
-    push_ui(&mut bytes, 0x0020, 0x000E, series);
+    push_ui(&mut bytes, 0x0008, 0x0016, sop_class)?;
+    push_vr(&mut bytes, 0x0008, 0x0060, b"CS", modality)?;
+    push_ui(&mut bytes, 0x0020, 0x000D, study)?;
+    push_ui(&mut bytes, 0x0020, 0x000E, series)?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|err| err.to_string())?;
     }
     fs::write(path, bytes).map_err(|err| err.to_string())
 }
 
-fn push_ui(bytes: &mut Vec<u8>, group: u16, element: u16, text: &str) {
-    push_vr(bytes, group, element, b"UI", text);
+fn push_ui(bytes: &mut Vec<u8>, group: u16, element: u16, text: &str) -> Result<(), String> {
+    push_vr(bytes, group, element, b"UI", text)
 }
 
-fn push_vr(bytes: &mut Vec<u8>, group: u16, element: u16, vr: &[u8; 2], text: &str) {
+fn push_vr(
+    bytes: &mut Vec<u8>,
+    group: u16,
+    element: u16,
+    vr: &[u8; 2],
+    text: &str,
+) -> Result<(), String> {
     let mut value = text.as_bytes().to_vec();
     if value.len() % 2 == 1 {
         // UI pads with NUL; text VRs pad with a space.
@@ -575,10 +581,11 @@ fn push_vr(bytes: &mut Vec<u8>, group: u16, element: u16, vr: &[u8; 2], text: &s
     bytes.extend_from_slice(vr);
     bytes.extend_from_slice(
         &u16::try_from(value.len())
-            .expect("value exceeds the 16-bit length field")
+            .map_err(|_| "value exceeds the 16-bit length field".to_owned())?
             .to_le_bytes(),
     );
     bytes.extend(value);
+    Ok(())
 }
 
 #[cfg(test)]
