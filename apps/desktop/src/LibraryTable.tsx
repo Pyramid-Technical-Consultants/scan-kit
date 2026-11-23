@@ -354,6 +354,10 @@ export function LibraryTable({
         if (shouldToggleRow(col, event.isDoubleClick === true, justToggled)) {
           lastRowToggle.current = { row: row.session_id, at: performance.now() };
           onRowCheck(row.session_id, !selectedIds.includes(row.session_id));
+        } else if (event.isDoubleClick !== true) {
+          // A non-toggling click provably opens a new gesture — the next
+          // dblclick tail must not be deduped against the stale record.
+          lastRowToggle.current = null;
         }
       }}
       onCellContextMenu={([, rowIndex], event) => {

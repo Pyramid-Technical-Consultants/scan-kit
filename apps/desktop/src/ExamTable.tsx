@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   DataEditor,
   emptyGridSelection,
@@ -50,6 +50,9 @@ export function ExamTable({
     direction: "asc",
   });
   const [gridSelection, setGridSelection] = useState(emptyGridSelection);
+  useEffect(() => {
+    setGridSelection(emptyGridSelection);
+  }, [rows]);
   const order = useMemo(() => {
     const indexes = rows.map((_, index) => index);
     indexes.sort((left, right) => {

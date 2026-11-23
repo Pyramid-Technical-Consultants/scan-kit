@@ -94,8 +94,9 @@ export function PlanRunner() {
   const [dest, setDest] = useState("");
   const [view, setView] = useState<RunnerView>(IDLE);
   const [busy, setBusy] = useState(false);
+  const [copyBusy, setCopyBusy] = useState(false);
   const [copyReport, setCopyReport] = useState<Report | null>(null);
-  const copying = copyReport != null && !copyReport.finished;
+  const copying = copyBusy || (copyReport != null && !copyReport.finished);
   const [waiting, setWaiting] = useState(true);
   usePageLoad(waiting || busy || copying, copyReport?.done ?? 0, copyReport?.total ?? 0);
   const copyToken = useRef<object>({});
@@ -116,9 +117,16 @@ export function PlanRunner() {
 
   useEffect(() => {
     let live = true;
+    // A Connect landing before the catalog resolves must not be stomped back
+    // to the Offline view — gate the remembered state on the poll sequence.
+    const seq = viewSeq.current;
     void invoke<Catalog>("scan_kit_runner_catalog")
       .then((next) => {
         if (!live) {
+          return;
+        }
+        setWaiting(false);
+        if (viewSeq.current !== seq) {
           return;
         }
         setHost(next.host ?? "");
@@ -127,7 +135,6 @@ export function PlanRunner() {
           setDest(next.dest);
         }
         setView(next.view);
-        setWaiting(false);
       })
       .catch((reason: unknown) => {
         if (!live) {
@@ -136,6 +143,7 @@ export function PlanRunner() {
         setWaiting(false);
         notifyError(reason);
       });
+
     return () => {
       live = false;
     };
@@ -283,7 +291,11 @@ export function PlanRunner() {
       notifyError("Choose a local .zip path for the session.");
       return;
     }
-    await run(async () => {
+    if (copyBusy) {
+      return;
+    }
+    setCopyBusy(true);
+    try {
       const mine = {};
       copyToken.current = mine;
       await driveTask(
@@ -313,7 +325,13 @@ export function PlanRunner() {
         return;
       }
       notifySaved(dest, { title: "Session saved" });
-    });
+    } catch (reason: unknown) {
+      notifyError(reason);
+    } finally {
+      // The copy streams over HTTP for minutes — holding busyRef for it
+      // would freeze Stop/Pause and skip every status poll.
+      setCopyBusy(false);
+    }
   }
 
   async function run(action: () => Promise<void>) {
@@ -557,7 +575,10 @@ export function PlanRunner() {
                   onChange={(event) => setDest(event.target.value)}
                 />
                 <InputGroupAddon align="inline-end">
-                  <InputGroupButton onClick={() => void browseZip()} disabled={busy}>
+                  <InputGroupButton
+                    onClick={() => void browseZip()}
+                    disabled={busy || copying}
+                  >
                     Browse
                   </InputGroupButton>
                 </InputGroupAddon>
@@ -574,8 +595,8 @@ export function PlanRunner() {
             ) : null}
             <Button
               type="button"
+              disabled={busy || copying || !connected || !dest.toLowerCase().endsWith(".zip")}
               onClick={() => void download()}
-              disabled={busy || !connected || !dest.toLowerCase().endsWith(".zip")}
             >
               <Download />
               Download
