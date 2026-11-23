@@ -106,7 +106,9 @@ impl BeamModel {
                     }
                 }
             } else if head == "Beam parameters" {
-                let _count = lines.next();
+                let declared = lines
+                    .next()
+                    .and_then(|line| line.split_whitespace().next()?.parse::<usize>().ok());
                 let _header = lines.next();
                 for line in lines.by_ref() {
                     let text = line.split('#').next().unwrap_or("").trim();
@@ -138,6 +140,14 @@ impl BeamModel {
                             break;
                         }
                     }
+                }
+                // The declared count bounds the table  a corrupted row
+                // must not silently truncate it.
+                if declared.is_some_and(|n| n != rows.len()) {
+                    return Err(format!(
+                        "BDL declares {declared:?} energies but only {} parsed",
+                        rows.len()
+                    ));
                 }
             }
         }

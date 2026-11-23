@@ -204,12 +204,13 @@ pub fn start_task(
     // meanwhile it owns the slot — report it rather than evicting it.
     if checked_id.is_some() {
         if let Some(owner) = driver.plot.filter(|o| checked_id != Some(*o)) {
-            let generation = driver.tasks.get(&owner).map(|t| t.generation).unwrap_or(0);
             // This ticket belongs to a different view — mark it so the
-            // caller can tell its own request was superseded.
+            // caller can tell its own request was superseded. A fabricated
+            // zero ticket: handing back the winner's live ticket would let
+            // a client that ignores the flag poll or cancel that task.
             return Ok(json!({
-                "task": owner,
-                "generation": generation,
+                "task": 0,
+                "generation": 0,
                 "superseded": true,
             }));
         }
@@ -267,11 +268,11 @@ pub fn poll_task(id: u64) -> Result<Vec<u8>, String> {
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         stage.poll(POLL_BUDGET, &cancel)
     }))
-    .unwrap_or_else(|_| {
+    .unwrap_or_else(|err| {
         // The unwind skipped clear_slice — drop the stale binding or this pool
         // thread keeps truncating same-named tables under other roots.
         scan_kit_io::clear_slice();
-        Poll::Failed("task panicked".into())
+        Poll::Failed(format!("task panicked: {}", panic_note(&*err)))
     });
     let report = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| stage.report()));
     let (outcome, mut report) = match report {
