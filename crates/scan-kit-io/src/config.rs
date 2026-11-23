@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -86,11 +87,21 @@ pub fn set_hide_unused(db: &Path, hide: bool) -> Result<Value, String> {
 
 pub fn read_form(path: &Path) -> Result<Value, String> {
     let _io = FILE_IO.lock().unwrap_or_else(|err| err.into_inner());
-    if fs::metadata(path).map_err(|err| err.to_string())?.len() > MAX_FILE_BYTES {
+    // Stat and read the same open handle: a stat-then-read races a growing
+    // file, and special files (pipes) report len 0 then block the read —
+    // all while FILE_IO is held.
+    let mut file = fs::File::open(path).map_err(|err| err.to_string())?;
+    if file.metadata().map_err(|err| err.to_string())?.len() > MAX_FILE_BYTES {
         return Err(format!("Config file is too large: {}", path.display()));
     }
-    let xml = fs::read_to_string(path)
+    let mut bytes = Vec::new();
+    std::io::Read::take(&mut file, MAX_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
         .map_err(|err| format!("Could not read {}: {err}", path.display()))?;
+    if bytes.len() as u64 > MAX_FILE_BYTES {
+        return Err(format!("Config file is too large: {}", path.display()));
+    }
+    let xml = String::from_utf8(bytes).map_err(|_| format!("{} is not UTF-8", path.display()))?;
     let form = config_form(&xml)?;
     Ok(json!({
         "path": path.to_string_lossy(),
@@ -138,23 +149,39 @@ pub fn save_folder(
             .get("xml")
             .and_then(Value::as_str)
             .ok_or("each file needs xml text")?;
-        if !xml.trim_start().starts_with('<') {
+        // A UTF-8 BOM is not whitespace — BOM-emitting editors produce
+        // files that read fine but could never be saved back.
+        if !xml
+            .trim_start_matches('\u{feff}')
+            .trim_start()
+            .starts_with('<')
+        {
             return Err(format!("{rel} is not XML"));
         }
         // Reject what would fail mid-write after earlier files already
         // persisted — a directory at the rel path (also covers empty rel,
         // which resolves to dest itself), or a regular file where a parent
         // directory must be created.
+        if rel.is_empty() {
+            return Err("a file needs a relative path".into());
+        }
         let target = under(dest, rel)?;
-        if target.is_dir() {
+        // The copy materializes the SOURCE shape into dest before the
+        // writes run — validate against both shapes or the check passes
+        // and the write still fails mid-save with a half-copied dest.
+        let src = under(source, rel)?;
+        if src.is_dir() || target.is_dir() {
             return Err(format!("{rel} is a directory at the destination"));
         }
-        let mut dir = target.parent();
-        while dir.is_some_and(|d| d != dest && d.starts_with(dest)) {
-            if dir.is_some_and(|d| d.is_file()) {
-                return Err(format!("{rel} sits under a file at the destination"));
+        for base in [source, dest] {
+            let target = under(base, rel)?;
+            let mut dir = target.parent();
+            while dir.is_some_and(|d| d != base && d.starts_with(base)) {
+                if dir.is_some_and(|d| d.is_file()) {
+                    return Err(format!("{rel} sits under a file in the save"));
+                }
+                dir = dir.and_then(|d| d.parent());
             }
-            dir = dir.and_then(|d| d.parent());
         }
         writes.push((rel, xml));
     }
@@ -965,7 +992,11 @@ fn commit_integrity(root: &Path) -> Result<usize, String> {
 }
 
 fn commit_file(path: &Path) -> Result<(), String> {
-    let bytes = fs::read(path).map_err(|err| err.to_string())?;
+    // Same cap read_form enforces — an integrity pass on a giant file must
+    // error, not buffer it.
+    let mut file = fs::File::open(path).map_err(|err| err.to_string())?;
+    let bytes =
+        crate::discover::read_capped(&mut file, &path.display().to_string(), MAX_FILE_BYTES)?;
     let salt = random_salt();
     let digest = hex_digest(&bytes, salt);
     let mtime = pyramid_mtime(path)?;
@@ -995,7 +1026,11 @@ fn verify_file(path: &Path) -> (&'static str, String) {
         Ok(parsed) => parsed,
         Err(_) => return ("READ_ERR", "Sidecar unreadable or corrupt".into()),
     };
-    let file = match fs::read(path) {
+    let file = match fs::File::open(path)
+        .map_err(|err| err.to_string())
+        .and_then(|mut file| {
+            crate::discover::read_capped(&mut file, &path.display().to_string(), MAX_FILE_BYTES)
+        }) {
         Ok(bytes) => bytes,
         Err(_) => return ("OPEN_ERR", "Open error".into()),
     };
@@ -1113,6 +1148,46 @@ fn under(root: &Path, rel: &str) -> Result<PathBuf, String> {
     {
         return Err(format!("config path escapes the folder: {rel}"));
     }
+    // A DOS device stem (`con`, `nul.xml`) is a Normal component but the
+    // write resolves to the device — client_name guards device names the
+    // same way.
+    let dos = |stem: &std::ffi::OsStr| {
+        matches!(
+            stem.to_string_lossy().to_ascii_uppercase().as_str(),
+            "CON"
+                | "PRN"
+                | "AUX"
+                | "NUL"
+                | "COM1"
+                | "COM2"
+                | "COM3"
+                | "COM4"
+                | "COM5"
+                | "COM6"
+                | "COM7"
+                | "COM8"
+                | "COM9"
+                | "LPT1"
+                | "LPT2"
+                | "LPT3"
+                | "LPT4"
+                | "LPT5"
+                | "LPT6"
+                | "LPT7"
+                | "LPT8"
+                | "LPT9"
+        )
+    };
+    if path
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(part) => Some(part),
+            _ => None,
+        })
+        .any(|part| dos(Path::new(part).file_stem().unwrap_or(part)))
+    {
+        return Err(format!("config path uses a reserved name: {rel}"));
+    }
     Ok(root.join(path))
 }
 
@@ -1174,8 +1249,14 @@ fn copy_tree(source: &Path, dest: &Path, depth: usize) -> Result<(), String> {
         if kind.is_dir() {
             copy_tree(&from, &to, depth + 1)?;
         } else if kind.is_file() {
-            let bytes = fs::read(&from)
+            let mut file = fs::File::open(&from)
                 .map_err(|err| format!("Could not copy {}: {err}", from.display()))?;
+            let bytes = crate::discover::read_capped(
+                &mut file,
+                &from.display().to_string(),
+                MAX_FILE_BYTES,
+            )
+            .map_err(|err| format!("Could not copy {}: {err}", from.display()))?;
             scan_kit_core::atomic_write(&to, &bytes)
                 .map_err(|err| format!("Could not copy {}: {err}", from.display()))?;
         }
@@ -1783,6 +1864,68 @@ mod tests {
         }
     }
 
+    #[test]
+    fn under_rejects_dos_device_stems() {
+        let root = std::path::Path::new(if cfg!(windows) { "C:\\lib" } else { "/lib" });
+        assert!(under(root, "con.xml").is_err());
+        assert!(under(root, "sub/nul").is_err());
+        assert!(under(root, "COM1.xml").is_err());
+        assert!(under(root, "lpt9.cfg").is_err());
+        assert!(under(root, "console.xml").is_ok());
+        assert!(under(root, "auxiliary.xml").is_ok());
+    }
+
+    #[test]
+    fn a_write_naming_a_source_directory_fails_before_any_file_lands() {
+        // The tree copy materializes the source shape into dest first — a
+        // rel that is a directory in the SOURCE must fail validation before
+        // any file persists, or the write errors mid-save on a half-copied
+        // destination.
+        let dir = std::env::temp_dir().join(format!("sk_r33_src_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let source = dir.join("src");
+        let dest = dir.join("dst");
+        std::fs::create_dir_all(source.join("sub")).unwrap();
+        std::fs::create_dir_all(&dest).unwrap();
+        let files = json!([
+            { "rel": "sub", "xml": "<x/>" },
+            { "rel": "other.xml", "xml": "<y/>" }
+        ]);
+        assert!(save_folder(&dir.join("db.sqlite"), &source, &dest, &files, None).is_err());
+        assert!(!dest.join("other.xml").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_bom_prefixed_xml_file_is_still_xml() {
+        // BOM-emitting editors produce files that read fine — save_folder's
+        // XML check must not refuse to write them back.
+        let dir = std::env::temp_dir().join(format!("sk_r33_bom_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let source = dir.join("src");
+        let dest = dir.join("dst");
+        std::fs::create_dir_all(&source).unwrap();
+        let files = json!([{ "rel": "a.xml", "xml": "\u{feff}<a/>" }]);
+        save_folder(&dir.join("db.sqlite"), &source, &dest, &files, None).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_empty_rel_is_rejected_before_any_file_lands() {
+        let dir = std::env::temp_dir().join(format!("sk_r33_empty_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let source = dir.join("src");
+        let dest = dir.join("dst");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&dest).unwrap();
+        let files = json!([
+            { "rel": "", "xml": "<x/>" },
+            { "rel": "other.xml", "xml": "<y/>" }
+        ]);
+        assert!(save_folder(&dir.join("db.sqlite"), &source, &dest, &files, None).is_err());
+        assert!(!dest.join("other.xml").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     fn form_has(node: &Value, title: &str, collapsible: bool) -> bool {
         let titled = node.get("title").and_then(Value::as_str) == Some(title);
         let folds = node.get("collapsible").and_then(Value::as_bool) == Some(true);
