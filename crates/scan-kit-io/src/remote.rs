@@ -1036,7 +1036,11 @@ mod net {
             .timeout_connect(timeout)
             .timeout_send_request(timeout)
             .timeout_recv_response(timeout)
-            .timeout_recv_body(timeout)
+            // recv_body is a TOTAL budget from response headers — the 20 s
+            // connect timeout can never fit a large archive. per_read keeps
+            // stall detection instead.
+            .timeout_recv_body(None)
+            .timeout_per_read(timeout)
             .tls_config(
                 ureq::tls::TlsConfig::builder()
                     .provider(ureq::tls::TlsProvider::NativeTls)
