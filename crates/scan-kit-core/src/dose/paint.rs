@@ -69,6 +69,9 @@ pub fn wash_of(choice: PaintChoice<'_>) -> Wash {
         ray,
         sample,
     } = choice;
+    // clamp() passes NaN through — a NaN level would write "NaN" into the
+    // level control's JSON and poison every wash that reads it back.
+    let level = level.filter(|v| v.is_finite());
     let mut mode = match ray {
         "maximum" | "Maximum" => 1,
         "transparent" | "Transparent" => 2,
@@ -303,5 +306,25 @@ mod tests {
         assert_eq!(painted_unit("Gy·mm", 1, false), "Gy");
         assert_eq!(painted_unit("γ", 0, true), "γ");
         assert_eq!(painted_unit("MU/mm³", 1, false), "MU/mm³");
+    }
+
+    #[test]
+    fn a_nan_level_falls_back_to_the_window() {
+        // clamp() passes NaN through — a NaN level would write "NaN" into
+        // the control JSON and poison every wash that reads it back.
+        let wash = wash_of(PaintChoice {
+            base_lo: 0.0,
+            base_hi: 4.0,
+            gamma: false,
+            difference: false,
+            scale: "Gray",
+            auto: false,
+            level: Some(f32::NAN),
+            percent: false,
+            ray: "mip",
+            sample: "linear",
+        });
+        assert!(wash.hi.is_finite());
+        assert_eq!(wash.hi, 4.0);
     }
 }

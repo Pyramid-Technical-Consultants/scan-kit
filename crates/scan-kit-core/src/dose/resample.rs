@@ -36,6 +36,15 @@ pub fn resample_linear(
     else {
         return Vec::new();
     };
+    // A zero/NaN spacing makes every sample index ±inf — splat_gaussians
+    // treats non-positive spacing as "no data"; this volume matches.
+    let spacing_ok = src_spacing
+        .iter()
+        .chain(dst_spacing.iter())
+        .all(|v| v.is_finite() && *v > 0.0);
+    if !spacing_ok {
+        return vec![0.0f32; len];
+    }
     let mut out = vec![0.0f32; len];
     for z in 0..dst_shape[2] {
         for y in 0..dst_shape[1] {
@@ -167,5 +176,21 @@ mod tests {
         // Out-of-range samples weigh NaN; the wrapped index must contribute 0,
         // never a stray in-bounds voxel.
         assert!(out.iter().all(|v| v.is_nan() || *v == 0.0), "{out:?}");
+    }
+
+    #[test]
+    fn a_zero_source_spacing_returns_zeros_instead_of_indexing_infinity() {
+        // inf as isize saturates and base + 1 overflows — splat_gaussians
+        // already treats non-positive spacing as "no data".
+        let out = resample_linear(
+            &[1.0; 8],
+            [0.0; 3],
+            [0.0; 3],
+            [2, 2, 2],
+            [10.0; 3],
+            [1.0; 3],
+            [1, 1, 1],
+        );
+        assert_eq!(out, vec![0.0]);
     }
 }

@@ -123,6 +123,11 @@ fn listed_segments(options: &Value, defaults: &[Segment]) -> Vec<Segment> {
             return without_playhead(items);
         }
     }
+    // A present key that is neither list nor string is still an explicit
+    // (malformed) selection — "no segments", not "the defaults".
+    if options.get("segments").is_some() {
+        return without_playhead(Vec::new());
+    }
     let beam = options.get("beam").and_then(Value::as_str);
     let domain = options.get("domain").and_then(Value::as_str);
     if beam.is_none() && domain.is_none() {
@@ -934,5 +939,16 @@ mod tests {
         let options = serde_json::json!({"scrub": {"on": true, "at": 1.5, "end": 2.0}});
         let value = scrub_value(&options).expect("object scrub");
         assert_eq!(value["on"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn a_malformed_non_list_segments_key_is_an_explicit_empty_selection() {
+        // `{"segments": 42}` is a present key — defaults are only for an
+        // absent key.
+        let defaults = [Segment::Beam {
+            state: BeamGate::On,
+        }];
+        assert!(segments_from(&json!({"segments": 42}), &defaults).is_empty());
+        assert!(segments_from(&json!({}), &defaults).len() == 1);
     }
 }
