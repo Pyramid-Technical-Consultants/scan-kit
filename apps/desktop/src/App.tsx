@@ -135,9 +135,9 @@ const LAUNCHER_VIEWS = [
 
 type LauncherView = (typeof LAUNCHER_VIEWS)[number];
 
-/** Mirror of `location::is_remote_location`: URI scheme >1 char, not `file`. */
+/** Mirror of `location::is_remote_location`: URI `scheme://`, >1 char, not `file`. */
 function isRemoteSpec(spec: string): boolean {
-  const match = /^([A-Za-z][A-Za-z0-9+.-]*):/.exec(spec.trim());
+  const match = /^([A-Za-z][A-Za-z0-9+.-]*):\/\//.exec(spec.trim());
   if (match == null) {
     return false;
   }

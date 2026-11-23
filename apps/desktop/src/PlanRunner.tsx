@@ -288,7 +288,9 @@ export function PlanRunner() {
   }
 
   async function download() {
-    if (!dest.toLowerCase().endsWith(".zip")) {
+    // The backend trims before its own check — match it so a pasted
+    // trailing space doesn't disable a valid destination.
+    if (!dest.trim().toLowerCase().endsWith(".zip")) {
       notifyError("Choose a local .zip path for the session.");
       return;
     }
