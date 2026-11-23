@@ -63,7 +63,7 @@ pub(crate) fn discover(
     let mut archives = Vec::new();
     let mut exams = Vec::new();
     let mut walk_failed = false;
-    if is_unpacked_session(root) {
+    if is_unpacked_session(root, &mut walk_failed) {
         if let Some(session_id) = file_name(root) {
             add_directory(
                 &mut entries,
@@ -76,7 +76,7 @@ pub(crate) fn discover(
                 "",
             );
         }
-    } else if let Some(exam) = exam_in(root) {
+    } else if let Some(exam) = exam_in(root, &mut walk_failed) {
         add_exam(&mut exams, &mut skipped, exam, "");
     } else {
         walk_local(
@@ -140,7 +140,7 @@ fn walk_local(
             continue;
         }
         let path = child.path();
-        if !is_unpacked_session(&path) {
+        if !is_unpacked_session(&path, walk_failed) {
             continue;
         }
         let Some(session_id) = file_name(&path) else {
@@ -190,7 +190,7 @@ fn walk_local(
             continue;
         }
         let path = child.path();
-        if let Some(exam) = exam_in(&path) {
+        if let Some(exam) = exam_in(&path, walk_failed) {
             add_exam(exams, skipped, exam, &relative(library, &path));
             continue;
         }
@@ -209,36 +209,58 @@ fn walk_local(
 
 /// True when an unpacked session lives anywhere below `dir` within the
 /// discovery depth — such a directory is a container, never an exam.
-fn holds_session(dir: &Path, depth: u32) -> bool {
+fn holds_session(dir: &Path, depth: u32, walk_failed: &mut bool) -> bool {
     if depth >= crate::location::NEST_DEPTH {
         return false;
     }
-    if is_unpacked_session(dir) {
+    if is_unpacked_session(dir, walk_failed) {
         return true;
     }
     let Ok(read) = fs::read_dir(dir) else {
-        return false;
+        // An unlistable dir might hold a session — never an exam candidate.
+        *walk_failed = true;
+        return true;
     };
-    read.flatten().any(|entry| {
-        entry
-            .file_type()
-            .is_ok_and(|kind| kind.is_dir() && !kind.is_symlink())
-            && holds_session(&entry.path(), depth + 1)
-    })
+    for entry in read {
+        let Ok(entry) = entry else {
+            *walk_failed = true;
+            return true;
+        };
+        let Ok(kind) = entry.file_type() else {
+            *walk_failed = true;
+            return true;
+        };
+        if kind.is_dir()
+            && !kind.is_symlink()
+            && holds_session(&entry.path(), depth + 1, walk_failed)
+        {
+            return true;
+        }
+    }
+    false
 }
 
-fn exam_in(dir: &Path) -> Option<ExamHit> {
+fn exam_in(dir: &Path, walk_failed: &mut bool) -> Option<ExamHit> {
     // A stray .dcm beside session folders does not make this an exam — the
     // walk must keep descending or the nested sessions disappear.
-    if holds_session(dir, 0) {
+    if holds_session(dir, 0, walk_failed) {
         return None;
     }
     let folder_name = file_name(dir)?;
     let mut files = Vec::new();
     let mut count = 0i64;
-    for entry in fs::read_dir(dir).ok()?.flatten() {
+    let Ok(read) = fs::read_dir(dir) else {
+        *walk_failed = true;
+        return None;
+    };
+    for entry in read {
+        let Ok(entry) = entry else {
+            *walk_failed = true;
+            return None;
+        };
         let Ok(kind) = entry.file_type() else {
-            continue;
+            *walk_failed = true;
+            return None;
         };
         if kind.is_symlink() {
             continue;
@@ -341,10 +363,22 @@ pub fn storage_fingerprint(storage: &Path, session_id: &str) -> Option<(i64, i64
         } else {
             storage.join("termination_summary.txt")
         };
+        // The inner dir's mtime freezes once the layer/run dirs exist —
+        // input_map.csv moves on every row write, so probe it too.
+        let outer_rows = storage.join("input_map.csv");
+        let inner_rows = if valid_session_id(session_id) {
+            storage.join(session_id).join("input_map.csv")
+        } else {
+            storage.join("input_map.csv")
+        };
         if outer.is_file() {
             outer
         } else if inner.is_file() {
             inner
+        } else if outer_rows.is_file() {
+            outer_rows
+        } else if inner_rows.is_file() {
+            inner_rows
         } else {
             // Still capturing: the inner session dir changes, the outer does not.
             session_directory(storage, session_id)
@@ -454,13 +488,30 @@ pub(crate) fn unlinked_dir(path: &Path) -> bool {
         .is_ok_and(|meta| meta.is_dir() && !meta.file_type().is_symlink())
 }
 
-fn is_unpacked_session(folder: &Path) -> bool {
+/// Metadata for a walk probe. NotFound is a definitive absence; any other
+/// error flags the walk so delete_missing cannot prune on an unprobed path.
+fn probe_meta(path: &Path, failed: &mut bool) -> Option<std::fs::Metadata> {
+    match path.symlink_metadata() {
+        Ok(meta) => Some(meta),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(_) => {
+            *failed = true;
+            None
+        }
+    }
+}
+
+fn is_unpacked_session(folder: &Path, stat_failed: &mut bool) -> bool {
     let Some(name) = folder.file_name() else {
         return false;
     };
     let nested = folder.join(name);
-    (unlinked_dir(&nested) && marker_file(&nested.join("input_map.csv")))
-        || marker_file(&folder.join("input_map.csv"))
+    let nested_session = probe_meta(&nested, stat_failed)
+        .is_some_and(|meta| meta.is_dir() && !meta.file_type().is_symlink())
+        && probe_meta(&nested.join("input_map.csv"), stat_failed)
+            .is_some_and(|meta| meta.is_file());
+    nested_session
+        || probe_meta(&folder.join("input_map.csv"), stat_failed).is_some_and(|meta| meta.is_file())
 }
 
 /// Directory that holds one session's files.
@@ -481,7 +532,7 @@ pub fn session_directory(library: &Path, session_id: &str) -> PathBuf {
     if flat_dir && unlinked_dir(&nested) && marker_file(&nested.join("input_map.csv")) {
         return nested;
     }
-    if flat_dir {
+    if flat_dir && marker_file(&flat.join("input_map.csv")) {
         return flat;
     }
     if marker_file(&library.join("input_map.csv")) {
@@ -514,7 +565,7 @@ pub(crate) fn archive_kind(name: &str) -> Option<(String, &'static str)> {
     None
 }
 
-fn archive_identity(path: &Path) -> Option<(String, &'static str)> {
+pub(crate) fn archive_identity(path: &Path) -> Option<(String, &'static str)> {
     let (stem, kind) = archive_kind(&file_name(path)?)?;
     // The zip filename is whatever the user typed (`session.zip`); the real
     // session id is the folder wrapped inside. Peeking at a zip's central
@@ -1053,6 +1104,25 @@ mod tests {
             assert_ne!(dir, root);
             assert!(!dir.starts_with(&root) || !dir.is_dir());
         }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_stray_inner_dir_does_not_steal_a_flat_session() {
+        // A flattened session keeps a stray <id>/<id>/ dir — the storage-dir
+        // lookup must not resolve into it and miss input_map.csv.
+        let root = std::env::temp_dir().join(format!("scan-kit-stray-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let sess = root.join("sess");
+        fs::create_dir_all(sess.join("sess")).unwrap();
+        fs::write(
+            sess.join("input_map.csv"),
+            "energy
+70
+",
+        )
+        .unwrap();
+        assert_eq!(session_directory(&sess, "sess"), sess);
         let _ = fs::remove_dir_all(&root);
     }
 
