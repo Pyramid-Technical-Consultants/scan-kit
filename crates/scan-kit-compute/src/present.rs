@@ -431,7 +431,9 @@ fn color4(value: Option<&Value>, key: &str, fallback: [f32; 4]) -> Result<[f32; 
         // channel must not silently keep the fallback color.
         out[index] = item
             .as_f64()
-            .ok_or_else(|| format!("{key} must be numbers"))? as f32;
+            .map(|n| n as f32)
+            .filter(|n| n.is_finite())
+            .ok_or_else(|| format!("{key} must be finite numbers"))?;
     }
     Ok(out)
 }

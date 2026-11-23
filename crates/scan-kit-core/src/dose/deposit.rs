@@ -1377,7 +1377,13 @@ pub(super) fn scatter_planes(
     sagittal: &[f32],
 ) -> Vec<f32> {
     let [nx, ny, nz] = shape;
-    let [fx, fy, fz] = focus;
+    // Callers clamp focus to the shape — clamp again here rather than
+    // trusting the pub(super) signature to keep the panic unreachable.
+    let [fx, fy, fz] = [
+        focus[0].min(nx.saturating_sub(1)),
+        focus[1].min(ny.saturating_sub(1)),
+        focus[2].min(nz.saturating_sub(1)),
+    ];
     let Some(len) = nx
         .checked_mul(ny)
         .and_then(|n| n.checked_mul(nz))
@@ -1499,6 +1505,14 @@ mod tests {
 
     #[test]
     fn planes_match_the_full_deposit_on_the_cross() {
+        // The 2 mm leg pins the 1/v³ density scale on the planes path — at
+        // unit voxels the scale is 1.0 and the comparison is vacuous.
+        for voxel in [1.0f32, 2.0] {
+            planes_match_at_voxel(voxel);
+        }
+    }
+
+    fn planes_match_at_voxel(voxel: f32) {
         let pencil = Pencil {
             x: 5.0,
             y: -3.0,
@@ -1514,7 +1528,7 @@ mod tests {
             1.0,
             0.0,
             0.0,
-            1.0,
+            voxel,
             2.0e-8,
             10.0,
         );
@@ -1527,7 +1541,7 @@ mod tests {
             1.0,
             0.0,
             0.0,
-            1.0,
+            voxel,
             2.0e-8,
             10.0,
             grid,

@@ -171,20 +171,22 @@ pub fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> 
     let mut part = path.as_os_str().to_os_string();
     part.push(format!(".{}.{}.part", std::process::id(), seq));
     let part = std::path::PathBuf::from(part);
-    let write = std::fs::write(&part, bytes).and_then(|()| {
-        // Windows refuses to rename over an existing destination — remove it
-        // and retry; the .part file still holds the payload if that fails.
-        if std::fs::rename(&part, path).is_err() {
-            let _ = std::fs::remove_file(path);
-            std::fs::rename(&part, path)
-        } else {
-            Ok(())
+    let write = std::fs::write(&part, bytes).and_then(|()| match std::fs::rename(&part, path) {
+        Ok(()) => Ok(()),
+        // Windows refuses to rename over an existing destination. A locked
+        // destination fails the same way, but its remove then fails too —
+        // only an exists-but-removable file reaches the retry. If the retry
+        // fails, the .part stays behind with the payload instead of losing
+        // the artifact and the payload both.
+        Err(err)
+            if err.kind() == std::io::ErrorKind::PermissionDenied
+                || err.kind() == std::io::ErrorKind::AlreadyExists =>
+        {
+            std::fs::remove_file(path).and_then(|()| std::fs::rename(&part, path))
         }
+        Err(err) => Err(err),
     });
-    write.map_err(|err| {
-        let _ = std::fs::remove_file(&part);
-        format!("{}: {err}", path.display())
-    })
+    write.map_err(|err| format!("{}: {err}", path.display()))
 }
 
 pub fn version() -> &'static str {
@@ -252,7 +254,12 @@ fn f32_array(input: &Value, key: &str) -> Result<Vec<f32>, InvokeError> {
             value
                 .as_f64()
                 .map(|number| number as f32)
-                .ok_or(InvokeError::UnexpectedInput)
+                // 1e40 is a valid JSON number but inf as an f32 — narrowing
+                // must reject it instead of feeding NaN math downstream.
+                .filter(|number| number.is_finite())
+                .ok_or_else(|| {
+                    InvokeError::Message(format!("{key} must be an array of finite numbers"))
+                })
         })
         .collect()
 }
@@ -458,7 +465,13 @@ mod tests {
         assert_eq!(std::fs::read(&dest).unwrap(), b"first");
         atomic_write(&dest, b"second").unwrap();
         assert_eq!(std::fs::read(&dest).unwrap(), b"second");
-        assert!(!dir.join("out.bin.part").exists());
+        // Part files are uniquely named per call — assert none is left
+        // behind under any name.
+        assert!(std::fs::read_dir(&dir).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .ends_with(".part")));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

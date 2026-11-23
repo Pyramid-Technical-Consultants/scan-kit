@@ -156,10 +156,16 @@ pub fn invoke(name: &str, input: &Value) -> Result<Value, String> {
             let goal = input
                 .get("goal")
                 .and_then(Value::as_f64)
-                .ok_or("goal is required")? as f32;
+                .map(|n| n as f32)
+                .filter(|n| n.is_finite())
+                .ok_or("goal must be a finite number")?;
             // Optional — but a mistyped value must not silently default.
             let min_volume = match input.get("min_volume") {
-                Some(value) => value.as_f64().ok_or("min_volume must be a number")? as f32,
+                Some(value) => value
+                    .as_f64()
+                    .map(|n| n as f32)
+                    .filter(|n| n.is_finite())
+                    .ok_or("min_volume must be a finite number")?,
                 None => 0.95,
             };
             let result = clinical_goal(&dose, goal, min_volume);
@@ -179,7 +185,8 @@ fn f32s(input: &Value, key: &str) -> Result<Vec<f32>, String> {
             value
                 .as_f64()
                 .map(|n| n as f32)
-                .ok_or_else(|| "dose values must be numbers".to_owned())
+                .filter(|n| n.is_finite())
+                .ok_or_else(|| "dose values must be finite numbers".to_owned())
         })
         .collect()
 }
